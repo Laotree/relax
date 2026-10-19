@@ -24,7 +24,7 @@ pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body, block: Option<BlockId>
     let ast = &pf.ast;
     let mut w = L2 {
         prog, tcx, body, ast, stack: Vec::new(), fns: Vec::new(), owner: HashMap::new(), init: HashMap::new(), names: HashMap::new(),
-        inside_call_args: false, reset_block: false, closure: u32::MAX, active: false, env: crate::pattern_analysis::body_cx(prog, tcx, body).typing_env(),
+        inside_call_args: false, reset_block: false, closure: u32::MAX, active: false, skip_if: Default::default(), stmt_like: Default::default(), env: crate::pattern_analysis::body_cx(prog, tcx, body).typing_env(),
     };
     // pre-pass: which closure declares each local, the initialisers of plain bindings
     {
@@ -86,6 +86,10 @@ struct L2<'a> {
     /// the next `block` call is the block of a block expression (statements reset the flag)
     reset_block: bool,
     env: crate::tcx::TypingEnv,
+    /// `if` expressions already examined as part of an `if let` cascade
+    skip_if: std::collections::HashSet<u32>,
+    /// expressions whose parent is a statement, a block (as its tail) or a match arm
+    stmt_like: std::collections::HashSet<u32>,
     /// the closure being walked
     closure: u32,
     /// inside a fn or closure body (rustc `check_fn`; const and static initialisers are not searched)
@@ -115,12 +119,22 @@ impl<'w, 'a> Visitor<'a> for Pre<'w, 'a> {
         }
         ast_visit::walk_pat(self, p);
     }
+    fn arm(&mut self, a: &Arm) {
+        let b = unparen(self.w.ast, a.body);
+        self.w.stmt_like.insert(b.0);
+        ast_visit::walk_arm(self, a);
+    }
     fn stmt(&mut self, s: &Stmt, b: BlockId) {
         if let Stmt::Let(r) = *s {
             let l = *self.w.ast.row(r);
             if let (Pat::Ident { by_ref: false, mutbl: false, sub: None, .. }, Some(init)) = (*self.w.ast.pat(l.pat), l.init) {
                 if let Some(&loc) = self.w.body.pat_local.get(&l.pat.0) { self.w.init.insert(loc, init); }
             }
+        }
+        match *s {
+            Stmt::Expr(e, _) => { let e = unparen(self.w.ast, e); self.w.stmt_like.insert(e.0); }
+            Stmt::Attrs(r) => { let e = unparen(self.w.ast, self.w.ast.row(r).expr); self.w.stmt_like.insert(e.0); }
+            _ => {}
         }
         ast_visit::walk_stmt(self, s);
         let _ = b;
@@ -466,6 +480,7 @@ impl<'a> Visitor<'a> for L2<'a> {
         self.lint_const_mutation(e);
         self.lint_prelude_dot_call(e);
         self.lint_shadowed_into_iter(e);
+        self.lint_if_let_rescope(e);
         if matches!(ast.expr(e).kind, ExprKind::Path(_)) { self.lint_prelude_path(e); }
         match ast.expr(e).kind {
             ExprKind::Call(f, args) => {
@@ -680,5 +695,191 @@ impl<'a> L2<'a> {
             regions: crate::types::RegionArgsId::EMPTY,
         }));
         self.tcx.try_normalize_erasing_regions(self.prog, self.env, proj).ok()
+    }
+}
+
+// ---------------------------------------------------------------- if_let_rescope
+
+pub const IF_LET_RESCOPE: Lint = lint::lint("if_let_rescope", Level::Allow, &[]);
+
+impl<'a> L2<'a> {
+    fn norm(&self, t: TyId) -> TyId { self.tcx.try_normalize_erasing_regions(self.prog, self.env, t).unwrap_or(t) }
+
+    /// `needs_drop_components`: Err = always requires drop.
+    fn needs_drop_components(&self, t: TyId) -> Result<Vec<TyId>, ()> {
+        match self.kind(t) {
+            TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) | TyKind::Never | TyKind::FnDef(..) | TyKind::FnPtr(..) | TyKind::Char
+            | TyKind::Ptr(..) | TyKind::Ref(..) | TyKind::Str | TyKind::Foreign(_) => Ok(Vec::new()),
+            TyKind::Dyn(..) | TyKind::Error => Err(()),
+            TyKind::Slice(e) => self.needs_drop_components(e),
+            TyKind::Array(e, len) => match self.needs_drop_components(e) {
+                Ok(v) if v.is_empty() => Ok(v),
+                res => match len.try_to_target_usize(&self.tcx.tys) {
+                    Some(0) => Ok(Vec::new()),
+                    Some(_) => res,
+                    None => Ok(vec![t]),
+                },
+            },
+            TyKind::Tuple(l) => {
+                let mut acc = Vec::new();
+                for &x in self.tcx.tys.list(l) { acc.extend(self.needs_drop_components(x)?); }
+                Ok(acc)
+            }
+            _ => Ok(vec![t]),
+        }
+    }
+
+    /// `list_significant_drop_tys` (rustc_ty_utils needs_drop.rs, exhaustive) followed by
+    /// `extract_component_raw`'s dedup: the types with a significant destructor `ty` drops.
+    fn significant_drop_tys(&self, ty: TyId) -> Vec<TyId> {
+        let ty = self.norm(ty);
+        let mut out: Vec<TyId> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(ty);
+        let mut stack = vec![(ty, 0u32)];
+        'outer: while let Some((t, level)) = stack.pop() {
+            if level > 128 { out.push(t); continue; }
+            let comps = match self.needs_drop_components(t) { Err(()) => { out.push(t); continue } Ok(c) => c };
+            for c in comps {
+                match self.kind(c) {
+                    TyKind::Closure(..) => {}
+                    _ if self.tcx.is_copy_modulo_regions(self.prog, self.env, c) => {}
+                    TyKind::Adt(d, args, _) => {
+                        let Some(a) = self.tcx.adts.get(&d) else { continue };
+                        let tys: Vec<TyId> = if a.is_manually_drop() {
+                            Vec::new()
+                        } else if has_def_attr(self.prog, d, "rustc_insignificant_dtor") {
+                            self.tcx.tys.list(args).to_vec()
+                        } else if self.tcx.adt_destructor(d).is_some() {
+                            out.push(t);
+                            continue 'outer;
+                        } else if a.is_union {
+                            Vec::new()
+                        } else {
+                            a.variants.iter().flat_map(|v| v.fields.iter()).map(|f| self.tcx.tys.subst(f.ty, self.tcx.tys.list(args))).collect()
+                        };
+                        for r in tys {
+                            let r = self.norm(r);
+                            if seen.insert(r) { stack.push((r, level + 1)); }
+                        }
+                    }
+                    TyKind::Alias(..) | TyKind::Array(..) | TyKind::Placeholder(_) | TyKind::Param(_) => {
+                        if t == c { out.push(c); continue 'outer; }
+                        if seen.insert(c) { stack.push((c, level + 1)); }
+                    }
+                    TyKind::Foreign(_) | TyKind::Dyn(..) => { out.push(t); continue 'outer; }
+                    _ => {}
+                }
+            }
+        }
+        let mut dedup = std::collections::HashSet::new();
+        out.retain(|x| dedup.insert(*x));
+        out
+    }
+
+    /// `Expr::is_place_expr`.
+    fn is_place_expr(&self, e: ExprId) -> bool {
+        let e = unparen(self.ast, e);
+        let allow_from = |b: ExprId| -> bool {
+            // the base has a `Deref` adjustment: a reference or smart pointer
+            self.expr_ty(b).is_some_and(|t| matches!(self.kind(t), TyKind::Ref(..)) || (matches!(self.kind(t), TyKind::Adt(d, ..) if Some(d) == self.lang(LangItem::OwnedBox)) && false))
+                || self.body.ov_derefs.get(&(b.0, 0)).is_some() || self.body.ov_derefs.get(&(e.0, 0)).is_some()
+        };
+        match self.ast.expr(e).kind {
+            ExprKind::Path(_) => match self.body.res.get(&e.0).copied() {
+                Some(Res::Local(_)) | Some(Res::Err) => true,
+                Some(Res::Def(d)) => self.prog.def(d).kind == DefKind::Static,
+                None => true,
+                _ => false,
+            },
+            ExprKind::Unary(UnOp::Deref, _) => true,
+            ExprKind::Field(b, _) | ExprKind::TupleField(b, _) | ExprKind::Index(b, _) => allow_from(b) || self.is_place_expr(b),
+            _ => false,
+        }
+    }
+
+    /// `check_promoted_temp_with_drop`: whether `e` is an rvalue with a significant destructor.
+    fn promoted_temp_with_drop(&self, e: ExprId) -> bool {
+        if self.is_place_expr(e) { return false; }
+        let Some(t) = self.expr_ty(e) else { return false };
+        !self.significant_drop_tys(t).is_empty()
+    }
+
+    /// `FindSignificantDropper::visit_expr`: Break = true.
+    fn find_significant_dropper(&self, e: ExprId) -> bool {
+        let ast = self.ast;
+        let e = unparen(ast, e);
+        match ast.expr(e).kind {
+            ExprKind::AddrOf(_, _, x) => return self.promoted_temp_with_drop(x) || self.find_significant_dropper(x),
+            ExprKind::Index(x, i) => return self.promoted_temp_with_drop(x) || self.find_significant_dropper(x) || self.find_significant_dropper(i),
+            ExprKind::Field(x, _) | ExprKind::TupleField(x, _) => return self.promoted_temp_with_drop(x) || self.find_significant_dropper(x),
+            ExprKind::If(..) | ExprKind::Closure(_) | ExprKind::Async(..) | ExprKind::ConstBlock(_) | ExprKind::Lit(_) | ExprKind::Path(_)
+            | ExprKind::Underscore | ExprKind::Continue(_) | ExprKind::While(_) => return false,
+            ExprKind::Match(s, _) => return self.find_significant_dropper(s),
+            ExprKind::Block(b, _) | ExprKind::Unsafe(b) | ExprKind::Loop(b, _) => {
+                return block_tail(ast, b).is_some_and(|t| self.find_significant_dropper(t));
+            }
+            ExprKind::MethodCall(r, row) => {
+                // the receiver's autoref is a `Borrow` adjustment (a deref first ends the check)
+                if let Some(m) = self.body.methods.get(&e.0) {
+                    if m.derefs == 0 && m.autoref != 0 && self.promoted_temp_with_drop(r) { return true; }
+                }
+                if self.find_significant_dropper(r) { return true; }
+                return ast.list(ast.row(row).args).iter().any(|&a| self.find_significant_dropper(a));
+            }
+            _ => {}
+        }
+        let mut found = false;
+        let mut kids: Vec<ExprId> = Vec::new();
+        match ast.expr(e).kind {
+            ExprKind::Unary(_, x) | ExprKind::Cast(x, _) | ExprKind::Box(x) | ExprKind::Try(x) | ExprKind::Await(x) | ExprKind::Repeat(x, _) => kids.push(x),
+            ExprKind::Binary(_, a, b) | ExprKind::Assign(a, b) | ExprKind::AssignOp(_, a, b) => { kids.push(a); kids.push(b); }
+            ExprKind::Call(f, args) => { kids.push(f); kids.extend_from_slice(ast.list(args)); }
+            ExprKind::Tuple(xs) | ExprKind::Array(xs) => kids.extend_from_slice(ast.list(xs)),
+            ExprKind::Struct(row) => {
+                let s = *ast.row(row);
+                kids.extend(ast.list(s.fields).iter().map(|f| f.expr));
+                if let Some(b) = s.base.get() { kids.push(b); }
+            }
+            ExprKind::Range(a, b, _) => { if let Some(x) = a.get() { kids.push(x); } if let Some(x) = b.get() { kids.push(x); } }
+            ExprKind::For(row) => kids.push(ast.row(row).iter),
+            ExprKind::Let(_, x) => kids.push(x),
+            ExprKind::Break(_, x) | ExprKind::Return(x) | ExprKind::Yield(x) => { if let Some(x) = x.get() { kids.push(x); } }
+            ExprKind::Mac(m) => {
+                let m = *ast.row(m);
+                if m.args != NO_MAC_ARGS { kids.extend_from_slice(ast.list(ast.mac_arg(m.args).exprs)); }
+            }
+            _ => {}
+        }
+        for k in kids { found |= self.find_significant_dropper(k); if found { break; } }
+        found
+    }
+
+    /// `IfLetRescope::check_expr` / `probe_if_cascade`.
+    fn lint_if_let_rescope(&mut self, e: ExprId) {
+        if self.edition() >= 2024 { return; }
+        let ast = self.ast;
+        if !matches!(ast.expr(e).kind, ExprKind::If(..)) { return; }
+        if self.skip_if.contains(&e.0) { return; }
+        if self.stmt_like.contains(&e.0) && matches!(ast.expr(e).kind, ExprKind::If(_, _, els) if els.get().is_none()) { return; }
+        let mut cur = e;
+        let mut first: Option<u32> = None;
+        loop {
+            let ExprKind::If(cond, _, alt) = ast.expr(cur).kind else { break };
+            self.skip_if.insert(cur.0);
+            let cond = unparen(ast, cond);
+            if let ExprKind::Let(_, init) = ast.expr(cond).kind {
+                if first.is_none() && (self.promoted_temp_with_drop(init) || self.find_significant_dropper(init)) {
+                    first = Some(ast.expr(cond).lo);
+                }
+            }
+            match alt.get() {
+                Some(a) => { let a = unparen(ast, a); if matches!(ast.expr(a).kind, ExprKind::If(..)) { cur = a; } else { break } }
+                None => break,
+            }
+        }
+        if let Some(pos) = first {
+            self.emit(&IF_LET_RESCOPE, pos, "`if let` assigns a shorter lifetime since Edition 2024");
+        }
     }
 }

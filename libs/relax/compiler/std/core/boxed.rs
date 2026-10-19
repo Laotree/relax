@@ -22,6 +22,7 @@ use crate::vec::Vec;
 #[fundamental]
 #[rustc_diagnostic_item = "Box"]
 #[cfg_attr(not(relax_check), lang = "owned_box")]
+#[rustc_insignificant_dtor]
 pub struct Box<T: ?Sized> {
     ptr: crate::ptr::NonNull<T>,
 }

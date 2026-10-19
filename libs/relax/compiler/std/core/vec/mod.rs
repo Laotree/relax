@@ -37,6 +37,7 @@ impl Cap {
 }
 
 #[rustc_diagnostic_item = "Vec"]
+#[rustc_insignificant_dtor]
 pub struct Vec<T> {
     ptr: crate::ptr::NonNull<T>,
     cap: Cap,

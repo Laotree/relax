@@ -35,6 +35,7 @@ fn weak_ptr(h: *mut Header) -> *mut usize {
     unsafe { &mut (*h).weak as *mut usize }
 }
 
+#[rustc_insignificant_dtor]
 pub struct Arc<T: ?Sized> {
     ptr: crate::ptr::NonNull<T>,
 }

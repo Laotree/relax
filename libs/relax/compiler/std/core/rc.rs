@@ -113,6 +113,7 @@ pub(crate) unsafe fn free_block(h: *mut Header) {
 
 // ---------------------------------------------------------------- Rc
 
+#[rustc_insignificant_dtor]
 pub struct Rc<T: ?Sized> {
     ptr: crate::ptr::NonNull<T>,
 }
