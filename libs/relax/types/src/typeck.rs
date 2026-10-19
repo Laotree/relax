@@ -3888,8 +3888,22 @@ impl<'a> Fcx<'a> {
             return None;
         }
         let t = self.shallow(t);
+        // a variable that is an opaque's hidden type in its defining scope derefs through the
+        // opaque's item bounds (autoderef.rs overloaded_deref_ty on a pending `?h: Deref`)
+        let hidden_of_opaque = matches!(self.tcx.tys.kind(t), TyKind::Infer(v) if self.infcx.has_opaques_with_sub_unified_hidden_type(*v));
         match self.tcx.tys.kind(t).clone() {
             TyKind::Ref(_, i, _) | TyKind::Ptr(_, i) => Some(self.shallow(i)),
+            TyKind::Infer(_) if hidden_of_opaque => {
+                let td = self.tcx.lang_items.get(crate::lang_items::LangItem::Deref)?;
+                let dt = self.infcx.deeply_resolve_ignoring_regions(t);
+                self.select_trait(td, dt, &[]).ok()?;
+                let target = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Target")?)?;
+                let proj = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: target }, args: self.tcx.tys.mk_list(&[dt]), regions: crate::types::RegionArgsId::EMPTY }));
+                let r = self.norm(proj);
+                let m = self.trait_fn(td, "deref")?;
+                self.b.ov_derefs.insert((e, step), (m, self.tcx.tys.mk_list(&[dt])));
+                Some(r)
+            }
             // (a param / rigid projection with a Deref bound derefs to its `Target` binding,
             // `D: DerefMut<Target = DrawVars>`)
             // (an opaque type derefs through its item bounds: `impl Deref<Target = Path>`,
