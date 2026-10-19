@@ -133,6 +133,23 @@ impl Builder<'_> {
     ) -> BuildResult<BlockAnd<()>> {
         self.not_yet("break_scope")
     }
+    /// scope.rs:`local_scope`: the region scope of the innermost open scope.
+    pub fn local_scope(&self) -> BuildResult<ScopeId> {
+        match self.scopes.scopes.last() {
+            Some(scope) => Ok(scope.region_scope),
+            None => self.not_yet("local_scope without an open scope"),
+        }
+    }
+    /// scope.rs:`diverge_from`: `start` ends in a terminator that can unwind (call, drop, assert):
+    /// register its unwind edge.
+    pub fn diverge_from(&mut self, _start: BasicBlock) -> BuildResult<()> {
+        self.not_yet("diverge_from")
+    }
+    /// scope.rs:`clear_match_arm_and_guard_scopes`: forget the drops scheduled in the arm and guard
+    /// scopes (the two innermost), for all but the last sub-branch of an or-pattern arm with a guard.
+    pub fn clear_match_arm_and_guard_scopes(&mut self, _region_scope: ScopeId) -> BuildResult<()> {
+        self.not_yet("clear_match_arm_and_guard_scopes")
+    }
     /// scope.rs:`schedule_drop`.
     pub fn schedule_drop(&mut self, _span: Span, _region_scope: ScopeId, _local: Local, _drop_kind: DropKind) -> BuildResult<()> {
         self.not_yet("schedule_drop")

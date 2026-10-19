@@ -21,7 +21,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 mod const_to_pat;
-mod range;
+pub(crate) mod range;
 mod span;
 #[cfg(test)]
 pub(crate) mod tests;
