@@ -112,6 +112,9 @@ pub trait RegionDriverOps: BorrowckTypeOps {
     fn region_var_info(&self, vid: RegionVid) -> (NllRegionVariableOrigin, UniverseIndex);
     /// `renumber_mir`: every free region of the body and of its promoted bodies becomes a fresh variable.
     fn renumber(&mut self, body: &mut Body);
+    /// Called with the renumbered body before the type check: location-aware ops read its numbering,
+    /// spans and allocations through the context, not through a reference to the body.
+    fn observe_body(&mut self, _body: &Body) {}
     /// The universal regions and the region-bound pairs (`T: 'r` facts) that location-aware type ops convert against.
     fn install_universals(&mut self, universals: &UniversalRegions, region_bound_pairs: &[(TyId, RegionId)]);
     /// `mir_borrowck_implied_outlives_bounds` of the declaration (implied_bounds.rs:27-118): the implied
@@ -256,6 +259,7 @@ pub fn type_check_body(tcx: &Tcx, prog: &Program, infcx: &mut dyn RegionDriverOp
     }) } else { vec![] };
 
     infcx.renumber(body);
+    infcx.observe_body(body);
     let results = type_check::type_check(tcx, prog, infcx, body, TypeckInputs {
         normalized_inputs_and_output: &normalized_inputs_and_output, universal_yield_resume,
         universals: &universals, moves: input.moves, has_loans: input.has_loans, constraints });
@@ -288,6 +292,7 @@ impl RegionDriverOps for super::infer_ctxt::BorrowckInferCtxt<'_> {
         super::renumber::renumber_mir(self, body, &mut promoted);
         body.promoted = promoted;
     }
+    fn observe_body(&mut self, body: &Body) { super::infer_ctxt::BorrowckInferCtxt::observe_body(self, body); }
     fn install_universals(&mut self, universals: &UniversalRegions, region_bound_pairs: &[(TyId, RegionId)]) {
         self.universal_regions = Some(universals.clone());
         self.region_bound_pairs = region_bound_pairs.to_vec();

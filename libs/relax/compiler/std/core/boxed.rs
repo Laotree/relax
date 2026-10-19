@@ -16,6 +16,7 @@ use crate::pin::PinSafePointer;
 // library/alloc/src/boxed.rs:2384,2390 @8d1a764
 unsafe impl<T: ?Sized> PinSafePointer for Box<T> {}
 impl<T: ?Sized + Unsize<U>, U: ?Sized> DispatchFromDyn<Box<U>> for Box<T> {}
+impl<T: ?Sized + Unsize<U>, U: ?Sized> crate::ops::CoerceUnsized<Box<U>> for Box<T> {}
 use crate::string::String;
 use crate::vec::Vec;
 

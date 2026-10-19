@@ -57,6 +57,9 @@ pub struct Cell<T: ?Sized> {
 }
 
 unsafe impl<T: ?Sized + Send> Send for Cell<T> {}
+impl<T: crate::ops::CoerceUnsized<U>, U> crate::ops::CoerceUnsized<Cell<U>> for Cell<T> {}
+impl<T: crate::ops::CoerceUnsized<U>, U> crate::ops::CoerceUnsized<UnsafeCell<U>> for UnsafeCell<T> {}
+impl<T: crate::ops::CoerceUnsized<U>, U> crate::ops::CoerceUnsized<RefCell<U>> for RefCell<T> {}
 
 impl<T> Cell<T> {
     pub const fn new(value: T) -> Cell<T> {
