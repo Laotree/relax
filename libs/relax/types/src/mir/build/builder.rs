@@ -33,6 +33,17 @@ pub enum ForGuard {
     RefWithinGuard,
     OutsideGuard,
 }
+/// builder/mod.rs:`BlockFrame`: what the innermost block being lowered is for (statement-expression
+/// results, tail expressions and sub-expressions).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockFrame {
+    /// Evaluating a statement; the result is ignored when `ignores_expr_result`.
+    Statement { ignores_expr_result: bool },
+    /// Evaluating the tail expression of a block.
+    TailExpr { tail_result_is_ignored: bool, span: Span },
+    /// Generic sub-expression.
+    SubExpr,
+}
 /// How a closure body reaches its captures: the environment local `_1`, a reference when the closure is
 /// `Fn`/`FnMut`.
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +71,7 @@ pub struct Builder<'a> {
     pub source_scopes: Vec<SourceScopeData>,
     pub source_scope: SourceScope,
     pub guard_context: Vec<GuardFrame>,
+    pub block_context: Vec<BlockFrame>,
     /// Temporaries created for an expression evaluated twice (match guards), keyed by THIR expr.
     pub fixed_temps: HashMap<super::thir::ExprId, Local>,
     pub fixed_temps_scope: Option<ScopeId>,

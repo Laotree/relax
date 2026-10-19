@@ -1,6 +1,6 @@
 //! rustc_mir_build/src/builder/cfg.rs: the control-flow graph under construction.
 use crate::mir::{
-    BasicBlock, BasicBlockData, FakeReadCause, Local, Operand, Place, Rvalue, SourceInfo, Statement, StatementKind,
+    BasicBlock, BasicBlockData, FakeReadCause, Local, Operand, Place, Rvalue, SourceInfo, Span, Statement, StatementKind,
     Terminator, TerminatorKind,
 };
 
@@ -50,7 +50,12 @@ impl Cfg {
         self.push(block, Statement { source_info, kind: StatementKind::Assign(place, rvalue) });
     }
     /// cfg.rs:83 push_assign_unit: `place = ()`.
-    pub fn push_assign_unit(&mut self, block: BasicBlock, source_info: SourceInfo, place: Place, unit: Operand) {
+    pub fn push_assign_unit(&mut self, block: BasicBlock, source_info: SourceInfo, place: Place, unit_ty: crate::types::TyId) {
+        let unit = Operand::Constant(Box::new(crate::mir::ConstOperand {
+            span: Span::default(),
+            user_ty: None,
+            const_: crate::mir::Const::Val(crate::mir::ConstValue::ZeroSized, unit_ty),
+        }));
         self.push_assign(block, source_info, place, Rvalue::Use(unit));
     }
     pub fn push_fake_read(&mut self, block: BasicBlock, source_info: SourceInfo, cause: FakeReadCause, place: Place) {
@@ -69,5 +74,19 @@ impl Cfg {
     }
     pub fn goto(&mut self, origin: BasicBlock, source_info: SourceInfo, target: BasicBlock) {
         self.terminate(origin, source_info, TerminatorKind::Goto { target });
+    }
+}
+impl Cfg {
+    pub fn terminator_mut(&mut self, block: BasicBlock) -> &mut Terminator {
+        self.block_data_mut(block).terminator.as_mut().expect("block without terminator")
+    }
+    pub fn terminator(&self, block: BasicBlock) -> &Terminator {
+        self.block_data(block).terminator.as_ref().expect("block without terminator")
+    }
+}
+impl BlockAnd<()> {
+    /// rustc `BlockAnd<()>::into_block`.
+    pub fn into_block(self) -> BasicBlock {
+        self.0
     }
 }

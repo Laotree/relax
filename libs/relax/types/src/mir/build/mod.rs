@@ -57,6 +57,8 @@ pub enum UnsupportedReason {
     UnresolvedFact(&'static str),
     /// Not built yet in the current step (skeleton): names the construct.
     NotYetBuilt(&'static str),
+    /// An invariant of the builder was violated (rustc `span_bug!`/`bug!`): the body is left unchecked.
+    Internal(&'static str),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

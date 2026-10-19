@@ -48,3 +48,29 @@ fn pat_walk_visits_subpatterns_and_bindings() {
     let never = Pat { ty: t, span: sp, extra: None, kind: PatKind::Or { pats: vec![Pat { ty: t, span: sp, extra: None, kind: PatKind::Never }].into() } };
     assert!(never.is_never_pattern() && !leaf.is_never_pattern());
 }
+
+#[test]
+fn drop_tree_links_exits_through_shared_drops() {
+    use super::scope::{DropData, DropKind, DropTree, ExitScopes, ROOT_NODE};
+    let mut cfg = Cfg::default();
+    let (a, b, root) = (cfg.start_new_block(), cfg.start_new_block(), cfg.start_new_block());
+    let info = SourceInfo::default();
+    for blk in [a, b] {
+        cfg.terminate(blk, info, TerminatorKind::UnwindResume);
+    }
+    let mut tree = DropTree::new();
+    let value = DropData { source_info: info, local: Local(2), kind: DropKind::Value };
+    let storage = DropData { source_info: info, local: Local(3), kind: DropKind::Storage };
+    let d1 = tree.add_drop(value, ROOT_NODE);
+    assert_eq!(tree.add_drop(value, ROOT_NODE), d1, "identical (next, local) nodes are shared");
+    let d2 = tree.add_drop(storage, d1);
+    tree.add_entry_point(a, d2); // a: StorageDead(_3) then Drop(_2)
+    tree.add_entry_point(b, d1); // b: Drop(_2) only
+    let blocks = tree.build_mir::<ExitScopes>(&mut cfg, Some(root)).unwrap();
+    let (blk2, blk1) = (blocks[d2].unwrap(), blocks[d1].unwrap());
+    assert!(matches!(cfg.terminator(a).kind, TerminatorKind::Goto { target } if target == blk2));
+    assert!(matches!(cfg.terminator(b).kind, TerminatorKind::Goto { target } if target == blk1));
+    assert!(matches!(cfg.terminator(blk1).kind, TerminatorKind::Drop { target, .. } if target == root));
+    assert!(matches!(cfg.terminator(blk2).kind, TerminatorKind::Goto { target } if target == blk1));
+    assert!(matches!(cfg.block_data(blk2).statements[0].kind, crate::mir::StatementKind::StorageDead(Local(3))));
+}
