@@ -1552,6 +1552,9 @@ impl Tcx {
             errors.extend(crate::item_checks::duplicate_generic_params(prog, did));
             errors.extend(crate::item_checks::repr_checks(prog, self, did));
             errors.extend(crate::item_checks::attribute_safety(prog, did));
+            if def.kind == DefKind::AssocFn && self.validates(prog, def.file) && errors.is_empty() {
+                errors.extend(self.check_method_receiver(prog, did));
+            }
         }
         // predicates_of: the bounds and where-clauses of every item are lowered, used or not
         if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
@@ -2548,6 +2551,14 @@ impl Tcx {
                 let trait_ref = crate::next_solver::TraitRef { def_id: td, args: self.generic_indices_of(prog, td).identity_args(&self.tys) };
                 if let Some(t) = self.assoc_projection(prog, trait_ref, name) {
                     return self.lower_generic_args_of_assoc_item(cx, prog, file, module, env, p, t, source_ty);
+                }
+                // an item of another trait `Self` is bounded by (`where Self: TryInto<T>` on a method)
+                if let Some(TyKind::Param(pi)) = env.self_ty.map(|t| self.tys.kind(t).clone()) {
+                    if env.regions.owner.is_some() {
+                        if let Some(t) = self.param_assoc(cx, prog, module, env, pi, name) {
+                            return self.lower_generic_args_of_assoc_item(cx, prog, file, module, env, p, t, source_ty);
+                        }
+                    }
                 }
             }
         }

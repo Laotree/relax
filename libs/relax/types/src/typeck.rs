@@ -17,7 +17,7 @@ use crate::tcx::{ty_key, FnSigT, GenEnv, Tcx, TyKey};
 use crate::types::{Abi, FnHeader, Safety, TyId, TyKind};
 use crate::fxhash::HashMap;
 
-mod probe;
+pub(crate) mod probe;
 mod closure;
 mod writeback;
 mod opaque_types;
@@ -4970,7 +4970,18 @@ impl<'a> Fcx<'a> {
                 }
                 if let Some(bx) = base {
                     let t = self.check_expr(bx, Some(adt_ty));
-                    self.eq(t, adt_ty);
+                    // expr.rs check_expr_struct_fields: a base of the same ADT with other
+                    // generic arguments is the unstable type_changing_struct_update
+                    let (bt, at) = (self.shallow(t), self.shallow(adt_ty));
+                    if let (TyKind::Adt(bd, ..), TyKind::Adt(ad, ..)) = (self.tcx.tys.kind(bt).clone(), self.tcx.tys.kind(at).clone()) {
+                        let krate = self.prog.def(self.b.def).krate;
+                        if bd == ad && !self.can_eq(bt, at) && !self.prog.crates[krate as usize].features(self.prog).has("type_changing_struct_update") {
+                            let pos = self.ast().expr(bx).lo;
+                            self.err(pos, "E0658: type changing struct updating is experimental".to_string());
+                        }
+                    }
+                    let pos = self.ast().expr(bx).lo;
+                    self.coerce_or_unify(t, adt_ty, Some(bx), pos);
                 }
                 if *rest {
                     self.struct_defaults(e, d, adt_ty, vi, &given, lo);
