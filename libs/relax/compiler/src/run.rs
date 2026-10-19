@@ -1212,6 +1212,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                     verbose!("makepad-run cache: startup manifest stale: {} of its {} slots' entries are gone", c.manifest_missing, c.manifest.len());
                 }
                 verbose!("makepad-run cache: {:?}, {} packs ({} rejected), {} code stores, {} entries, opened in {:.1} ms (interfaces {:.1} ms)", mode, c.stats.packs, c.stats.packs_rejected, c.stats.code_stores, c.stats.index_entries, c.stats.open_ns as f64 / 1e6, c.stats.iface_ns as f64 / 1e6);
+                if std::env::var_os("MAKEPAD_RUN_CACHE_OPEN_EXIT").is_some() { std::process::exit(0); }
                 // warm: this program ran with this cache before (its startup manifest, recorded
                 // after an earlier run reached main); entries other processes of this launch wrote
                 // (build scripts, the proc-macro host) do not make a first run warm

@@ -629,12 +629,9 @@ impl Cache {
             cfgh.u8(b as u8);
         }
         cfgh.u8(u.tier1.is_some() as u8);
-        // which crates are bound to the loader's rustc build (provided.rs): their callers'
-        // code differs (bridge calls) from a run that compiles them (off switch, source differs)
-        for (_, pc) in &u.provided {
-            cfgh.str(&pc.name);
-            cfgh.u64(pc.source);
-        }
+        // which crates are bound to the loader's rustc build (provided.rs) is in the interface
+        // fingerprint of each bound crate (items::crate_ifaces), so only the code that can reach
+        // one is keyed by it
         cfgh.u128(u.prog.session.options.fingerprint());
         let mut c = Cache {
             verbose,
@@ -733,7 +730,8 @@ impl Cache {
             }
             None => {
                 c.digests = items::file_digests(prog);
-                c.iface = items::crate_ifaces(prog, &c.fps, &c.digests);
+                let provided: Vec<(u32, u64)> = u.provided.iter().map(|(k, pc)| (*k, pc.source)).collect();
+                c.iface = items::crate_ifaces(prog, &c.fps, &c.digests, &provided);
                 c.iface.truncate(ncr);
             }
         }

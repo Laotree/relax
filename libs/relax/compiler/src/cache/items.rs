@@ -279,13 +279,23 @@ pub(crate) fn pos_digest(pf: &ParsedFile, d: &FileDigest, item: ItemId) -> u128 
 /// Per crate: its interface fingerprint -- its own files' interface hashes and its
 /// dependencies' interface fingerprints. A proc-macro crate's whole fingerprint (its fn bodies
 /// make the expansions of every crate that uses it).
-pub(crate) fn crate_ifaces(prog: &crate::program::Program, fps: &[u128], digests: &[Option<std::sync::Arc<FileDigest>>]) -> Vec<u128> {
+///
+/// `provided` names the crates the loader binds instead of compiling (crate index, source
+/// identity): whether a crate is bound changes the code of every caller (bridge calls instead of
+/// compiled callees), and the interface fingerprint of a caller covers its dependencies', so the
+/// marker lives in the bound crate's own interface and reaches exactly the code that can depend on it
+/// (a program that does not contain a bound crate, or whose code cannot reach it, is not told).
+pub(crate) fn crate_ifaces(prog: &crate::program::Program, fps: &[u128], digests: &[Option<std::sync::Arc<FileDigest>>], provided: &[(u32, u64)]) -> Vec<u128> {
     let nc = prog.crates.len();
     let mut per: Vec<Sip128> = (0..nc)
         .map(|c| {
             let ci = &prog.crates[c];
             let mut h = crate::crate_image::fingerprint_head(prog.syms.str(ci.name), ci.root_path(), ci.edition, ci.proc_macro, &ci.cfg.set);
             h.str("iface");
+            if let Some((_, source)) = provided.iter().find(|(k, _)| *k as usize == c) {
+                h.str("provided");
+                h.u64(*source);
+            }
             if ci.proc_macro {
                 h.u128(fps.get(c).copied().unwrap_or(0));
             }
