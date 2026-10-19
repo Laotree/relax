@@ -58,8 +58,17 @@ impl crate::mir::transform::qualifs::ConstQualifsProvider for BuildProvider<'_> 
         // In progress: a cycle blocks.
         self.memo.borrow_mut().insert(def, Err(Blocked("constant qualification cycle")));
         let result = (|| {
-            let owner = CheckedBody::item(self.prog, def).ok_or(Blocked("not a body owner"))?;
-            let typeck_body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.tcx.typeck(self.prog, def))).map_err(|_| Blocked("typeck panicked"))?;
+            // An inline const is a body of its own, typeck'd with the item that contains it.
+            let (owner, root_def) = match self.prog.def_id_to_node_id.get(&def) {
+                Some((_, relax_front::def_collector::NodeId::InlineConst(e))) => {
+                    let mut root = self.prog.def(def).parent;
+                    while root != crate::program::NO_DEF && CheckedBody::item(self.prog, root).is_none() { root = self.prog.def(root).parent; }
+                    if root == crate::program::NO_DEF { return Err(Blocked("inline const outside an item")); }
+                    (CheckedBody { owner: root, kind: crate::borrowck::body::BodyKind::InlineConst(*e) }, root)
+                }
+                _ => (CheckedBody::item(self.prog, def).ok_or(Blocked("not a body owner"))?, def),
+            };
+            let typeck_body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.tcx.typeck(self.prog, root_def))).map_err(|_| Blocked("typeck panicked"))?;
             if !typeck_body.errors.is_empty() {
                 return Err(Blocked("typeck errors"));
             }

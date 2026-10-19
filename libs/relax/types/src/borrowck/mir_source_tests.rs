@@ -303,3 +303,13 @@ fn an_array_indexed_by_a_user_type_through_the_slice_impl() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn a_static_array_of_inline_const_atomics() {
+    let (errors, unchecked) = borrowck_source("
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static FRAMES: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+        pub fn f(i: usize) -> usize { FRAMES[i].load(Ordering::Relaxed) }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
