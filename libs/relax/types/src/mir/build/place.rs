@@ -55,6 +55,10 @@ impl PlaceBuilder {
     pub fn index(self, index: Local) -> Self {
         self.project(PlaceElem::Index(index))
     }
+    /// as_place.rs:`clone_project`.
+    pub fn clone_project(&self, elem: PlaceElem) -> Self {
+        self.clone().project(elem)
+    }
     pub fn project(mut self, elem: PlaceElem) -> Self {
         self.projection.push(elem);
         self
@@ -64,7 +68,9 @@ impl PlaceBuilder {
     /// base is not an upvar (or no capture covers it).
     pub fn resolve_upvar(&self, cx: &Builder<'_>) -> Option<PlaceBuilder> {
         let PlaceBase::Upvar { var } = self.base else { return None };
-        let (index, capture, covered) = find_capture_matching_projections(&cx.upvars, var, &self.projection)?;
+        // OpaqueCast projections are not part of a capture path (as_place.rs:strip_prefix).
+        let projection: Vec<PlaceElem> = self.projection.iter().filter(|elem| !matches!(elem, PlaceElem::OpaqueCast(_))).cloned().collect();
+        let (index, capture, covered) = find_capture_matching_projections(&cx.upvars, var, &projection)?;
         let env = cx.upvar_env.as_ref()?;
         let mut builder = PlaceBuilder::from(env.local);
         if env.by_ref {
@@ -81,7 +87,7 @@ impl PlaceBuilder {
         if capture.is_by_ref() {
             builder = builder.deref();
         }
-        builder.projection.extend_from_slice(&self.projection[covered..]);
+        builder.projection.extend_from_slice(&projection[covered..]);
         Some(builder)
     }
 

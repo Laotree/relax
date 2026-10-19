@@ -5,7 +5,7 @@ use super::{BuildError, BuildResult, BuildRoot, Cfg, UnsupportedReason};
 use crate::borrowck::body::CheckedBody;
 use crate::fxhash::HashMap;
 use crate::mir::{
-    AllocMap, Body, CanonicalUserTypeAnnotation, CapturedPlace, CoroutineInfo, Local, LocalDecl, LocalInfo, LocalKind,
+    AllocMap, Body, BlockTailInfo, CanonicalUserTypeAnnotation, CapturedPlace, CoroutineInfo, Local, LocalDecl, LocalInfo, LocalKind,
     MirSource, Mutability, Place, SourceInfo, SourceScope, SourceScopeData, Span, VarDebugInfo,
 };
 use crate::region_scope::ScopeId;
@@ -40,7 +40,7 @@ pub enum BlockFrame {
     /// Evaluating a statement; the result is ignored when `ignores_expr_result`.
     Statement { ignores_expr_result: bool },
     /// Evaluating the tail expression of a block.
-    TailExpr { tail_result_is_ignored: bool, span: Span },
+    TailExpr { info: BlockTailInfo },
     /// Generic sub-expression.
     SubExpr,
 }
@@ -92,6 +92,26 @@ impl<'a> Builder<'a> {
         Err(BuildError::new(owner, Span::default(), UnsupportedReason::NotYetBuilt("builder")))
     }
 
+    /// builder/mod.rs:`BlockContext::currently_in_block_tail`.
+    pub fn currently_in_block_tail(&self) -> Option<BlockTailInfo> {
+        for frame in self.block_context.iter().rev() {
+            match frame {
+                BlockFrame::SubExpr => continue,
+                BlockFrame::Statement { .. } => break,
+                &BlockFrame::TailExpr { info } => return Some(info),
+            }
+        }
+        None
+    }
+    /// builder/mod.rs:`BlockContext::currently_ignores_tail_results`: whether the block result itself is
+    /// discarded (does not skip `SubExpr` frames).
+    pub fn currently_ignores_tail_results(&self) -> bool {
+        match self.block_context.last() {
+            None | Some(BlockFrame::SubExpr) => false,
+            Some(BlockFrame::TailExpr { info: BlockTailInfo { tail_result_is_ignored, .. } }) => *tail_result_is_ignored,
+            Some(BlockFrame::Statement { ignores_expr_result }) => *ignores_expr_result,
+        }
+    }
     pub fn error(&self, span: Span, reason: UnsupportedReason) -> BuildError {
         BuildError::new(self.owner, span, reason)
     }

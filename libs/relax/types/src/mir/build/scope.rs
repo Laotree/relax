@@ -541,21 +541,31 @@ impl Builder<'_> {
         Ok(())
     }
 
-    /// Returns the [`SourceInfo`] for the end of a region scope's span, the position drops are attributed to.
-    fn scope_end_info(&self, region_scope: ScopeId, source_scope: SourceScope) -> SourceInfo {
+    /// `region::Scope::span`: the source span of a region scope's node (the body span when the node has none).
+    pub fn region_scope_span(&self, region_scope: ScopeId) -> Span {
         let file = self.root.typeck.file;
         let ast = &self.root.cx.prog.files[file as usize].ast;
-        let node = self.root.scope_tree.scopes[region_scope.0 as usize].node;
-        let hi = match node {
-            crate::region_scope::Node::Expr(e) => Some(ast.expr(crate::ast::ExprId(e)).hi),
-            crate::region_scope::Node::Block(b) => Some(ast.block(crate::ast::BlockId(b)).hi),
+        let range = match self.root.scope_tree.scopes[region_scope.0 as usize].node {
+            crate::region_scope::Node::Expr(e) => {
+                let e = ast.expr(crate::ast::ExprId(e));
+                Some((e.lo, e.hi))
+            }
+            crate::region_scope::Node::Block(b) => {
+                let b = ast.block(crate::ast::BlockId(b));
+                Some((b.lo, b.hi))
+            }
             _ => None,
         };
-        let span = match hi {
-            Some(hi) => Span { file, lo: hi.saturating_sub(1), hi },
-            None => Span { file, lo: self.body_span.hi.saturating_sub(1), hi: self.body_span.hi },
-        };
-        SourceInfo { span, scope: source_scope }
+        match range {
+            Some((lo, hi)) => Span { file, lo, hi },
+            None => self.body_span,
+        }
+    }
+
+    /// The [`SourceInfo`] for the end of a region scope's span, the position drops are attributed to.
+    fn scope_end_info(&self, region_scope: ScopeId, source_scope: SourceScope) -> SourceInfo {
+        let span = self.region_scope_span(region_scope);
+        SourceInfo { span: Span { file: span.file, lo: span.hi.saturating_sub(1), hi: span.hi }, scope: source_scope }
     }
 
     // Finding scopes

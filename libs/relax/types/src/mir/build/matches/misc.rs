@@ -44,7 +44,7 @@ impl Builder<'_> {
     }
 
     /// The type of `place`: its local's type under the projection (fields carry their types).
-    pub(super) fn place_ty(&self, place: &Place) -> BuildResult<PlaceTy> {
+    pub(crate) fn place_ty(&self, place: &Place) -> BuildResult<PlaceTy> {
         let tcx = self.root.cx.tcx;
         let mut ty = PlaceTy::from_ty(self.local_decls[place.local.0 as usize].ty);
         for elem in &place.projection {
@@ -68,7 +68,7 @@ impl Builder<'_> {
     }
 
     /// as_place.rs:`len_of_slice_or_array`.
-    pub(super) fn len_of_slice_or_array(&mut self, block: BasicBlock, place: Place, span: Span, source_info: SourceInfo) -> BuildResult<Operand> {
+    pub(crate) fn len_of_slice_or_array(&mut self, block: BasicBlock, place: Place, span: Span, source_info: SourceInfo) -> BuildResult<Operand> {
         let tcx = self.root.cx.tcx;
         let place_ty = self.place_ty(&place)?.ty;
         match *tcx.tys.kind(place_ty) {
