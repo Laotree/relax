@@ -56,12 +56,17 @@ struct FileTokens {
     idents: Vec<Ident>,
     /// the first path segment of every `use` item, with its site
     use_firsts: Vec<(u32, String)>,
+    /// (segment before, name) of every path written inside a `use` item
+    use_pairs: Vec<(u32, String, String)>,
 }
 
 fn scan_tokens(prog: &Program, file: u32) -> FileTokens {
     let pf = &prog.files[file as usize];
     let mut idents = Vec::new();
     let mut use_firsts = Vec::new();
+    let mut use_pairs: Vec<(u32, String, String)> = Vec::new();
+    let mut use_site = 0u32;
+    let mut group_prefix: Vec<Option<String>> = Vec::new();
     let mut kinds: Vec<(T, u32, u32)> = Vec::new();
     let mut i = 0u32;
     loop {
@@ -72,15 +77,43 @@ fn scan_tokens(prog: &Program, file: u32) -> FileTokens {
     }
     let text = |k: usize| String::from_utf8_lossy(pf.bytes(kinds[k].1, kinds[k].2)).into_owned();
     let mut in_use = false;
+    // the token index a macro call's arguments end at: names there may be pasted into paths
+    let mut mac_end = 0usize;
     for k in 0..kinds.len() {
+        if k >= mac_end && matches!(kinds[k].0, T::Ident | T::RawIdent) && k + 2 < kinds.len() && kinds[k + 1].0 == T::Not && matches!(kinds[k + 2].0, T::OpenParen | T::OpenBracket | T::OpenBrace) {
+            let mut depth = 0i32;
+            let mut e = k + 2;
+            while e < kinds.len() {
+                match kinds[e].0 { T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1, T::CloseParen | T::CloseBracket | T::CloseBrace => { depth -= 1; if depth == 0 { break; } } _ => {} }
+                e += 1;
+            }
+            mac_end = e;
+        }
         let (kind, lo, _) = kinds[k];
         if in_use {
-            if kind == T::Semi { in_use = false; }
+            match kind {
+                T::Semi => { in_use = false; group_prefix.clear(); }
+                T::OpenBrace => {
+                    // `a::b::{..}`: the group's prefix is `b`
+                    let p = if k >= 2 && kinds[k - 1].0 == T::PathSep { Some(text(k - 2)) } else { None };
+                    group_prefix.push(p);
+                }
+                T::CloseBrace => { group_prefix.pop(); }
+                T::Ident | T::RawIdent | T::KwSelfValue | T::KwSuper | T::KwCrate => {
+                    let prev = kinds[k - 1].0;
+                    let prefix = if prev == T::PathSep && k >= 2 { Some(text(k - 2)) }
+                        else if matches!(prev, T::OpenBrace | T::Comma) { group_prefix.last().cloned().flatten() }
+                        else { None };
+                    if let Some(p) = prefix { use_pairs.push((use_site, p, text(k))); }
+                }
+                _ => {}
+            }
             continue;
         }
         match kind {
             T::KwUse => {
                 in_use = true;
+                use_site = pf.diagnostic_pos(lo);
                 // `use a::b` / `use ::a::b` / `use {a, b}`: the first segment
                 let mut j = k + 1;
                 if j < kinds.len() && kinds[j].0 == T::PathSep { j += 1; }
@@ -90,17 +123,43 @@ fn scan_tokens(prog: &Program, file: u32) -> FileTokens {
             }
             T::Ident | T::RawIdent | T::KwSelfValue | T::KwSuper | T::KwCrate => {
                 let prev = if k > 0 { Some(kinds[k - 1].0) } else { None };
-                if prev == Some(T::Dot) { continue; }
+                if prev == Some(T::Dot) && k >= mac_end { continue; }
                 let name = text(k);
                 let name = name.strip_prefix("r#").map(str::to_string).unwrap_or(name);
                 let prefix = if prev == Some(T::PathSep) && k >= 2 { Some(text(k - 2)) } else { None };
                 idents.push(Ident { site: pf.diagnostic_pos(lo), name, prefix });
             }
+            T::RawBody => {
+                // the unparsed body of a macro: its words are names written at the call
+                let site = pf.diagnostic_pos(lo);
+                let bytes = pf.bytes(kinds[k].1, kinds[k].2).to_vec();
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+                        let s = i;
+                        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') { i += 1; }
+                        let mut p = s;
+                        while p > 0 && bytes[p - 1].is_ascii_whitespace() { p -= 1; }
+                        // a method or field name is no path
+                        if p > 0 && bytes[p - 1] == b'.' { continue; }
+                        let prefix = if p >= 2 && &bytes[p - 2..p] == b"::" {
+                            let mut e = p - 2;
+                            while e > 0 && bytes[e - 1].is_ascii_whitespace() { e -= 1; }
+                            let mut b = e;
+                            while b > 0 && (bytes[b - 1].is_ascii_alphanumeric() || bytes[b - 1] == b'_') { b -= 1; }
+                            Some(String::from_utf8_lossy(&bytes[b..e]).into_owned())
+                        } else { None };
+                        idents.push(Ident { site, name: String::from_utf8_lossy(&bytes[s..i]).into_owned(), prefix });
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
             _ => {}
         }
     }
     idents.sort_by_key(|i| i.site);
-    FileTokens { idents, use_firsts }
+    FileTokens { idents, use_firsts, use_pairs }
 }
 
 /// A leaf of a use tree: what it imports and the source range of the tree node.
@@ -158,6 +217,11 @@ fn leaves(prog: &Program, file: u32, ast: &Ast, t: &UseTree, start: u32, item_hi
     }
 }
 
+fn ast_item_lo(prog: &Program, d: DefId) -> u32 {
+    let def = prog.def(d);
+    prog.files[def.file as usize].ast.item(def.item).lo
+}
+
 fn first_pos(ast: &Ast, t: &UseTree) -> Option<u32> {
     match *t {
         UseTree::Name(seg, _) | UseTree::Path(seg, _) => Some(seg.name.lo),
@@ -179,7 +243,7 @@ struct Scope<'a> {
     ast: &'a Ast,
 }
 
-pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::Reach) {
+pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::Reach, module_used: &HashMap<u32, HashSet<DefId>>) {
     if !lint::enabled() { return; }
     let traits = METHOD_TRAITS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     let mut scopes: Vec<Scope> = Vec::new();
@@ -189,6 +253,9 @@ pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::
         let (file, items) = crate::lint_dead::module_items(prog, m as u32);
         let ast = &prog.files[file as usize].ast;
         let mut ranges = Vec::new();
+        // each kept item's range reaches back to the end of the one before it: its attributes
+        // (`#[derive(Widget)]`) and doc comments are part of the scope
+        let mut prev_hi = if md.parent_mod.is_none() { 0 } else { ast_item_lo(prog, md.def) };
         for &it in &items {
             let item = ast.item(it);
             match item.kind {
@@ -196,8 +263,9 @@ pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::
                 ItemKind::Mod(_) | ItemKind::Use(_) => {}
                 // a `#[test]` fn is not part of the program outside a test build
                 ItemKind::Fn(..) if lint::has_attr(prog, file, ast.list(item.attrs), "test") => {}
-                _ => ranges.push((item.lo, item.hi)),
+                _ => ranges.push((prev_hi.min(item.lo), item.hi)),
             }
+            prev_hi = item.hi;
         }
         scopes.push(Scope { def: md.def, module: m as u32, block: false, file, ranges, items, ast });
     }
@@ -231,9 +299,38 @@ pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::
         }
         written.push(names);
     }
-    let mut qualified: HashSet<(String, String)> = HashSet::new();
-    for toks in tokens.values() {
-        for id in &toks.idents { if let Some(p) = &id.prefix { qualified.insert((p.clone(), id.name.clone())); } }
+    // names written after `m::`, `self::`, `super::`, `crate::` (in paths and in `use` items): by
+    // the module they name (and the `use` item that wrote them: it does not use its own import)
+    let mut by_name: HashSet<(String, String)> = HashSet::new();
+    let mut resolved: Vec<(u32, String, u32)> = Vec::new();
+    for (si, sc) in scopes.iter().enumerate() {
+        let _ = si;
+        let toks = &tokens[&sc.file];
+        let md = &prog.mods[sc.module as usize];
+        let normal = md.normal;
+        let mut add = |p: &str, n: &str, src: u32| {
+            let target = match p {
+                "self" => Some(normal),
+                "super" => prog.mods[normal as usize].parent_mod,
+                "crate" => Some(prog.crates[md.krate as usize].root_mod),
+                _ => { by_name.insert((p.to_string(), n.to_string())); None }
+            };
+            if let Some(t) = target { resolved.push((t, n.to_string(), src)); }
+        };
+        for &(lo, hi) in &sc.ranges {
+            let a = toks.idents.partition_point(|i| i.site < lo);
+            for id in &toks.idents[a..] {
+                if id.site >= hi { break; }
+                if let Some(p) = &id.prefix { add(p, &id.name, u32::MAX); }
+            }
+        }
+        for &it in &sc.items {
+            let item = sc.ast.item(it);
+            if !matches!(item.kind, ItemKind::Use(_)) { continue; }
+            for (site, p, n) in &toks.use_pairs {
+                if *site >= item.lo && *site < item.hi { add(p, n, item.lo); }
+            }
+        }
     }
     // module -> modules that glob-import it
     let mut globbed_by: HashMap<DefId, Vec<u32>> = HashMap::new();
@@ -253,7 +350,7 @@ pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::
             let mut ls = Vec::new();
             let start = first_pos(sc.ast, &u.tree).unwrap_or(item.lo);
             leaves(prog, sc.file, sc.ast, &u.tree, start, item.hi, &mut Vec::new(), &mut ls);
-            let ctx = Ctx { prog, sc, toks, names, traits: &traits, qualified: &qualified, globbed_by: &globbed_by, scopes: &scopes, written: &written, scope_of_module: &scope_of_module, private: matches!(item.vis, Vis::Private) || sc.block };
+            let ctx = Ctx { prog, sc, toks, names, traits: &traits, by_name: &by_name, resolved: &resolved, globbed_by: &globbed_by, scopes: &scopes, written: &written, scope_of_module: &scope_of_module, module_used, private: matches!(item.vis, Vis::Private) || sc.block, item: (item.lo, item.hi) };
             let mut unused: Vec<(u32, u32)> = Vec::new();
             // `pub use` that leaves the crate cannot be judged (a glob of nothing exports nothing)
             let exported = matches!(item.vis, Vis::Pub) && reach.defs.contains(&sc.def);
@@ -332,13 +429,17 @@ struct Ctx<'a, 'b> {
     toks: &'b FileTokens,
     names: &'b HashSet<String>,
     traits: &'b HashSet<DefId>,
-    qualified: &'b HashSet<(String, String)>,
+    by_name: &'b HashSet<(String, String)>,
+    resolved: &'b Vec<(u32, String, u32)>,
     globbed_by: &'b HashMap<DefId, Vec<u32>>,
     scopes: &'b [Scope<'a>],
     written: &'b [HashSet<String>],
     scope_of_module: &'b HashMap<u32, usize>,
+    module_used: &'b HashMap<u32, HashSet<DefId>>,
     /// a plain `use` is visible in its own module only
     private: bool,
+    /// the byte range of the `use` item being judged
+    item: (u32, u32),
 }
 
 impl Ctx<'_, '_> {
@@ -352,10 +453,12 @@ impl Ctx<'_, '_> {
     }
 
     /// An import other modules can name: `m::N` anywhere, or a glob of this module that uses `N`.
-    fn used_outside(&self, n: &str) -> bool {
-        let mname = if self.sc.module != u32::MAX { self.prog.name(self.prog.mods[self.sc.module as usize].def) } else { "" };
-        if self.qualified.contains(&(mname.to_string(), n.to_string())) { return true; }
-        for p in ["self", "super", "crate"] { if self.qualified.contains(&(p.to_string(), n.to_string())) && !self.private { return true; } }
+    fn used_outside(&self, n: &str, _item_lo: u32) -> bool {
+        // a block's imports are named by nothing outside it
+        if self.sc.block || self.sc.module == u32::MAX { return false; }
+        let mname = self.prog.name(self.prog.mods[self.sc.module as usize].def);
+        if self.by_name.contains(&(mname.to_string(), n.to_string())) { return true; }
+        if self.resolved.iter().any(|(m, name, src)| *m == self.sc.module && name == n && *src != self.item.0) { return true; }
         let mdef = self.prog.mods[self.sc.module as usize].def;
         if let Some(gs) = self.globbed_by.get(&mdef) {
             for g in gs {
@@ -395,6 +498,38 @@ impl Ctx<'_, '_> {
         !(m.types.values().any(|&d| visible(d)) || m.values.values().any(|&d| visible(d)) || m.macros.values().any(|&d| visible(d)) || m.globs.iter().any(|_| true))
     }
 
+    /// The definitions the leaf imports (a name has one per namespace).
+    fn leaf_targets(&self, l: &Leaf) -> Vec<DefId> {
+        let prog = self.prog;
+        if self.sc.module == u32::MAX { return Vec::new(); }
+        let pf = &prog.files[self.sc.file as usize];
+        let mut segs: Vec<(SegKind, crate::program::Sym)> = l.segs.iter().map(|s| (s.kind(), prog.syms.intern_late(pf.text(s.name)))).collect();
+        let mut out = Vec::new();
+        if segs.last().is_some_and(|s| s.0 == SegKind::SelfValue) {
+            segs.pop();
+            for global in [false, true] {
+                if let Some(d) = prog.resolve_mod_path(self.sc.module, global, &segs, false, true) { out.push(d); break; }
+            }
+            return out;
+        }
+        let Some(last) = segs.pop() else { return out };
+        for global in [false, true] {
+            let parent = if segs.is_empty() { None } else { prog.resolve_mod_path(self.sc.module, global, &segs, false, true) };
+            if let Some(p) = parent {
+                for ns in [true, false] { if let Some(d) = prog.lookup_in_container(p, last.1, ns) { out.push(d); } }
+                break;
+            }
+        }
+        if out.is_empty() && segs.len() <= 1 {
+            for ns in [true, false] { if let Some(d) = prog.lookup_in_scope(self.sc.module, last.1, ns) { out.push(d); } }
+        }
+        out
+    }
+
+    fn mentioned(&self, d: DefId) -> bool {
+        self.module_used.get(&self.sc.module).is_some_and(|s| s.contains(&d))
+    }
+
     fn leaf_used(&self, l: &Leaf, item_lo: u32) -> bool {
         let prog = self.prog;
         let sc = self.sc;
@@ -406,6 +541,8 @@ impl Ctx<'_, '_> {
             if sc.module == u32::MAX { return true; }
             let Some(target) = prog.resolve_mod_path(sc.module, false, &segs, false, true).or_else(|| prog.resolve_mod_path(sc.module, true, &segs, false, true)) else { return true };
             let td = prog.def(target);
+            // a proc-macro crate's macros are not bindings Relax lists: its glob cannot be judged
+            if prog.crates.get(td.krate as usize).is_some_and(|c| c.proc_macro) { return true; }
             let mut bound: Vec<String> = Vec::new();
             match td.kind {
                 DefKind::Mod => {
@@ -416,6 +553,7 @@ impl Ctx<'_, '_> {
                         if !seen.insert(mi) { continue; }
                         let m = &prog.mods[mi as usize];
                         for k in m.types.keys().chain(m.values.keys()).chain(m.macros.keys()) { bound.push(prog.syms.str(*k).to_string()); }
+                        if m.types.values().chain(m.values.values()).any(|&d| self.mentioned(d)) { return true; }
                         for (_, &d) in m.types.iter() {
                             if prog.def(d).kind == DefKind::Trait && self.traits.contains(&d) { return true; }
                         }
@@ -428,12 +566,13 @@ impl Ctx<'_, '_> {
                 }
                 _ => return true,
             }
-            return bound.iter().any(|n| names.contains(n) || self.used_by_use(n, item_lo) || (!self.private && self.used_outside(n)));
+            return bound.iter().any(|n| names.contains(n) || self.used_by_use(n, item_lo) || self.used_outside(n, item_lo));
         }
         if l.empty { return false; }
         let Some(name) = l.name.as_deref() else { return true };
+        if self.leaf_targets(l).iter().any(|&d| self.mentioned(d)) { return true; }
         if names.contains(name) || (self.has_type_ns(l) && self.used_by_use(name, item_lo)) { return true; }
-        if !self.private && self.used_outside(name) { return true; }
+        if self.used_outside(name, item_lo) { return true; }
         // a trait is used by calling its methods
         if sc.module == u32::MAX { return false; }
         for ns in [true, false] {

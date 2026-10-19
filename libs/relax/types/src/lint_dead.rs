@@ -310,6 +310,11 @@ impl<'a> TypeWalker<'a> {
 /// The references an item's declaration makes (its signature, fields, header); the body of a fn,
 /// const or static is collected while it is type-checked.
 fn item_refs(prog: &Program, d: DefId) -> Vec<Ref> {
+    item_refs_in(prog, d, false)
+}
+
+/// `pub_only`: only what the item exposes (the `pub` fields of a struct).
+fn item_refs_in(prog: &Program, d: DefId, pub_only: bool) -> Vec<Ref> {
     let def = prog.def(d);
     let ast = &prog.files[def.file as usize].ast;
     if matches!(def.kind, DefKind::Mod | DefKind::Variant | DefKind::Closure | DefKind::AnonConst | DefKind::Field | DefKind::MacroRules | DefKind::Prim(_) | DefKind::OpaqueTy) { return Vec::new(); }
@@ -330,12 +335,12 @@ fn item_refs(prog: &Program, d: DefId) -> Vec<Ref> {
         }
         ItemKind::Struct(r) => {
             let s = *ast.row(r);
-            if let VariantData::Struct(l) | VariantData::Tuple(l) = s.data { fields(&mut w, ast, l); }
+            if let VariantData::Struct(l) | VariantData::Tuple(l) = s.data { fields(&mut w, ast, l, pub_only); }
         }
-        ItemKind::Union(r) => fields(&mut w, ast, ast.row(r).fields),
+        ItemKind::Union(r) => fields(&mut w, ast, ast.row(r).fields, pub_only),
         ItemKind::Enum(r) => {
             for v in ast.list(ast.row(r).variants) {
-                if let VariantData::Struct(l) | VariantData::Tuple(l) = v.data { fields(&mut w, ast, l); }
+                if let VariantData::Struct(l) | VariantData::Tuple(l) = v.data { fields(&mut w, ast, l, false); }
                 if let Some(e) = v.disc { w.const_expr(e); }
             }
         }
@@ -363,8 +368,9 @@ fn item_refs(prog: &Program, d: DefId) -> Vec<Ref> {
     w.out
 }
 
-fn fields(w: &mut TypeWalker, ast: &Ast, l: List<FieldDef>) {
+fn fields(w: &mut TypeWalker, ast: &Ast, l: List<FieldDef>, pub_only: bool) {
     for f in ast.list(l) {
+        if pub_only && !matches!(f.vis, Vis::Pub) { continue; }
         w.ty(f.ty);
         if let Some(e) = f.default { w.const_expr(e); }
     }
@@ -480,9 +486,24 @@ impl<'a> BodyRefs<'a> {
     fn field_ref(&mut self, e: ExprId, base: ExprId) {
         let Some(&(derefs, idx)) = self.body.field_idx.get(&e.0) else { return };
         let bi = self.body.expr_ix(base);
-        if bi >= self.body.expr_ty.len() { return; }
-        let Some(adt) = self.adt_of_ty(self.body.expr_ty[bi], derefs) else { return };
-        self.out.push(Ref::Field((adt, 0, idx)));
+        if bi < self.body.expr_ty.len() {
+            if let Some(adt) = self.adt_of_ty(self.body.expr_ty[bi], derefs) {
+                self.out.push(Ref::Field((adt, 0, idx)));
+                return;
+            }
+        }
+        // through an overloaded dereference (`Pin<&mut S>`, a guard): the struct the body names
+        // a field of with this index and name
+        let name = match self.ast.expr(e).kind {
+            ExprKind::Field(_, n) => Some(self.prog.files[self.body.file as usize].text(n).to_string()),
+            _ => None,
+        };
+        for &(adt, fi) in self.body.field_uses.iter() {
+            if fi != idx { continue; }
+            let Some(a) = self.tcx.adts.get(&adt) else { continue };
+            let Some(f) = a.variants.first().and_then(|v| v.fields.get(fi as usize)) else { continue };
+            if name.as_deref().map_or(true, |n| self.prog.syms.str(f.name) == n) { self.out.push(Ref::Field((adt, 0, idx))); }
+        }
     }
 
     /// An assignment target: fields written to are not reads (`handle_assign`).
@@ -721,6 +742,7 @@ impl<'a> Visitor<'a> for BodyRefs<'a> {
 /// `pub use`, and what such items expose (variants, `pub` fields, trait items, the `pub` items
 /// of impls of reachable types).
 pub struct Reach {
+    own: Vec<bool>,
     pub defs: HashSet<DefId>,
     pub fields: HashSet<FieldKey>,
 }
@@ -756,7 +778,7 @@ fn use_leaves(ast: &Ast, t: &UseTree, prefix: &mut Vec<PathSeg>, out: &mut Vec<(
 
 impl Reach {
     fn compute(prog: &Program, tcx: &Tcx, own: &[bool]) -> Reach {
-        let mut r = Reach { defs: HashSet::new(), fields: HashSet::new() };
+        let mut r = Reach { own: own.to_vec(), defs: HashSet::new(), fields: HashSet::new() };
         let mut done: HashSet<u32> = HashSet::new();
         for (k, c) in prog.crates.iter().enumerate() {
             if own.get(k).copied().unwrap_or(false) { r.module(prog, c.root_mod, &mut done); }
@@ -786,6 +808,23 @@ impl Reach {
                     if trait_reach.is_some() || matches!(ast.item(it).vis, Vis::Pub) { r.defs.insert(cd); }
                 }
             }
+        }
+        // the types a reachable item mentions in its interface are reachable too
+        let mut done2: HashSet<u32> = HashSet::new();
+        loop {
+            let mut found: Vec<DefId> = Vec::new();
+            for &d in r.defs.iter() {
+                let k = prog.def(d).kind;
+                if !matches!(k, DefKind::Fn | DefKind::AssocFn | DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::Trait | DefKind::TypeAlias | DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::AssocTy | DefKind::Impl | DefKind::ForeignFn | DefKind::ForeignStatic) { continue; }
+                for u in item_refs_in(prog, d, true) {
+                    if let Ref::Use(t) = u {
+                        let tk = prog.def(t).kind;
+                        if own.get(prog.def(t).krate as usize).copied().unwrap_or(false) && matches!(tk, DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::Trait | DefKind::TypeAlias) && !r.defs.contains(&t) { found.push(t); }
+                    }
+                }
+            }
+            if found.is_empty() { break; }
+            for t in found { let td = prog.def(t); r.mark_item(prog, td.file, td.item, t, &mut done2); }
         }
         r
     }
@@ -829,6 +868,8 @@ impl Reach {
     /// Reachable by name: a re-exported definition and what lies inside it.
     fn mark_def(&mut self, prog: &Program, d: DefId, done: &mut HashSet<u32>) {
         let def = prog.def(d);
+        // another crate's items are not ours to judge
+        if !self.own.get(def.krate as usize).copied().unwrap_or(false) { return; }
         let ast = &prog.files[def.file as usize].ast;
         if def.kind == DefKind::Variant {
             self.defs.insert(d);
@@ -1168,7 +1209,27 @@ pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32) {
     let rep = Reporter { s: &s, reach: &reach };
     if executable { rep.run(&DEAD_CODE_PUB_IN_BINARY, &pre_live, true, &all); }
     rep.run(&DEAD_CODE, &s.live, false, &all);
-    crate::lint_imports::check(prog, tcx, own, &reach);
+    // what each module's items and bodies mention (an import used through a macro expansion
+    // is seen here by what typeck resolved)
+    let mut module_used: HashMap<u32, HashSet<DefId>> = HashMap::new();
+    for i in 0..prog.defs.len() {
+        let d = DefId(i as u32);
+        if !s.local(d) { continue; }
+        let def = prog.def(d);
+        if matches!(def.kind, DefKind::Field | DefKind::Prim(_) | DefKind::MacroRules) { continue; }
+        let mut refs = item_refs(prog, d);
+        if let Some(b) = s.refs.get(&d) { refs.extend_from_slice(&b.refs); }
+        if refs.is_empty() { continue; }
+        let mut m = def.scope;
+        let mut guard = 0;
+        loop {
+            let set = module_used.entry(m).or_default();
+            for r in &refs { if let Ref::Use(x) | Ref::Live(x) = r { set.insert(*x); } }
+            guard += 1;
+            match prog.mods.get(m as usize).and_then(|md| md.lexical_parent) { Some(p) if guard < 64 => m = p, _ => break }
+        }
+    }
+    crate::lint_imports::check(prog, tcx, own, &reach, &module_used);
 }
 
 fn is_executable(prog: &Program, root: u32) -> bool {
