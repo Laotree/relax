@@ -5702,6 +5702,28 @@ mod data_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn bound_crates_mark_only_the_interfaces_that_reach_them() {
+        isolated_test!(bound_crates_mark_only_the_interfaces_that_reach_them);
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let (root, prog, _) = front_fixture(sess, "bound-ifaces");
+        let digests = items::file_digests(&prog);
+        let fps = crate::stable::crate_fingerprints(&prog);
+        let plain = items::crate_ifaces(&prog, &fps, &digests, &[]);
+        // crate 1 bound: it and what depends on it (crate 2) change; crate 0, below it, does not
+        let bound1 = items::crate_ifaces(&prog, &fps, &digests, &[(1, 99)]);
+        assert_eq!(plain[0], bound1[0]);
+        assert_ne!(plain[1], bound1[1]);
+        assert_ne!(plain[2], bound1[2]);
+        // crate 2 bound: only itself
+        let bound2 = items::crate_ifaces(&prog, &fps, &digests, &[(2, 99)]);
+        assert_eq!((plain[0], plain[1]), (bound2[0], bound2[1]));
+        assert_ne!(plain[2], bound2[2]);
+        // the binding is part of the identity: another source identity of the bound crate differs
+        assert_ne!(bound1[2], items::crate_ifaces(&prog, &fps, &digests, &[(1, 100)])[2]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn front_fixture(sess: &std::sync::Arc<crate::Session>, tag: &str) -> (PathBuf, crate::program::Program, Vec<crate::preload::PreCrate>) {
         let root = std::env::temp_dir().join(format!("relax-front-{tag}-{}-{}", std::process::id(), crate::clock::wall_ns()));
         std::fs::create_dir_all(&root).unwrap();
