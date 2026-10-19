@@ -52,7 +52,7 @@ impl Fcx<'_> {
     /// that `Vec::<_>::new` keeps its hole. `node` is an expression id, or a pattern id | PAT_KEY;
     /// u32::MAX is a name-resolution probe with no node.
     pub(super) fn write_user_type_annotation_from_args(&mut self, node: u32, def: DefId, args: &[GenericArg], user_self_ty: Option<UserSelfTy>) {
-        if node == u32::MAX { return; }
+        if node == u32::MAX || !self.keep_user_types { return; }
         let can_contain = args.iter().any(|&arg| self.arg_can_contain_user_lifetime_bounds(arg))
             || user_self_ty.is_some_and(|s| self.can_contain_user_lifetime_bounds(self.tcx.tys.flags(s.self_ty)));
         if !can_contain { return; }
@@ -111,7 +111,7 @@ impl Fcx<'_> {
         let parent = self.tcx.generic_indices_of(self.prog, self.prog.def(def).parent);
         let parent_count = parent.lifetimes.len() + parent.types_consts.len();
         // `!args.is_empty() && !generics.is_own_empty()`
-        if args.len() <= parent_count { return; }
+        if args.len() <= parent_count || !self.keep_user_types { return; }
         let snapshot = self.start_snapshot();
         let mut user_args = args.to_vec();
         for arg in &mut user_args[..parent_count.min(args.len())] {
@@ -133,7 +133,7 @@ impl Fcx<'_> {
     /// step, so the saved type is the lowered one.
     pub(super) fn lower_ty_saving_user_provided_ty(&mut self, syntax: crate::ast::TyId) -> TyId {
         let ty = self.lower_ty(syntax);
-        if self.can_contain_user_lifetime_bounds(self.tcx.tys.flags(ty)) {
+        if self.keep_user_types && self.can_contain_user_lifetime_bounds(self.tcx.tys.flags(ty)) {
             let user = UserType::new(UserTypeKind::Ty(ty));
             let canonical = canonicalize_user_type_response(&self.infcx, &user);
             self.b.user_provided_types.insert(UserTypeKey::Type(syntax.0), std::sync::Arc::new(canonical));
@@ -147,7 +147,7 @@ impl Fcx<'_> {
     /// (`collect_impl_trait_clauses_from_hir_ty`) do not exist in Relax.
     pub(super) fn lower_let_ty_saving_user_provided_ty(&mut self, syntax: crate::ast::TyId) -> TyId {
         let ty = self.lower_ty(syntax);
-        self.write_user_type_annotation(UserTypeKey::Type(syntax.0), UserType::new(UserTypeKind::Ty(ty)));
+        if self.keep_user_types { self.write_user_type_annotation(UserTypeKey::Type(syntax.0), UserType::new(UserTypeKind::Ty(ty))); }
         ty
     }
 }
@@ -158,6 +158,7 @@ mod tests {
     use crate::typeck::solve::program;
 
     fn body_of(src: &str, name: &str) -> (Program, Tcx, std::sync::Arc<Body>) {
+        crate::borrowck::event::FORCE_USER_TYPES.with(|f| f.set(Some(true)));
         let (prog, tcx) = program(src);
         let def = prog.defs.iter().enumerate().find(|(_, d)| prog.syms.str(d.name) == name).map(|(i, _)| DefId(i as u32)).unwrap();
         let body = tcx.typeck(&prog, def);
@@ -299,5 +300,17 @@ mod tests {
         let UserTypeKind::Ty(ty) = all[0].1.value.kind else { panic!() };
         assert!(matches!(tcx.tys.kind(ty), TyKind::Alias(..)), "kept as the projection");
         assert!(tcx.tys.flags(ty).intersects(crate::types::TypeFlags::HAS_FREE_REGIONS), "with its 'a");
+    }
+
+    #[test]
+    fn crates_that_are_not_borrow_checked_keep_no_user_types() {
+        // the run-path rule: nothing is canonicalized for std / framework crates
+        crate::borrowck::event::FORCE_USER_TYPES.with(|f| f.set(Some(false)));
+        let (prog, tcx) = program("#![no_std]\nfn id<T>(x: T) -> T { x } fn f<'a>(x: &'a u8) { let _y: &'a u8 = x; let _z = id::<&'a u8>(x); let _c = |a: &u8| *a; }");
+        let def = prog.defs.iter().enumerate().find(|(_, d)| prog.syms.str(d.name) == "f").map(|(i, _)| DefId(i as u32)).unwrap();
+        let body = tcx.typeck(&prog, def);
+        assert!(body.errors.is_empty(), "{:?}", body.errors);
+        assert!(body.user_provided_types.is_empty() && body.user_provided_sigs.is_empty());
+        crate::borrowck::event::FORCE_USER_TYPES.with(|f| f.set(None));
     }
 }
