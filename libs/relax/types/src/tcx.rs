@@ -2582,9 +2582,6 @@ impl Tcx {
             let seg = &prog.files[file as usize].ast.segs(p.segs)[0];
             if seg.kind() == SegKind::SelfType {
                 if source_ty.is_some() && self.prohibit_args_on(cx, prog, file, seg, "self type", "Self") { return self.tys.error; }
-                if env.self_ty.is_none() && env.impl_def.is_none() && env.trait_def.is_none() {
-                    self.err(cx, prog, file, p.lo, "E0411: cannot find type `Self` in this scope".to_string());
-                }
                 return env.self_ty.unwrap_or(self.tys.error);
             }
             let name = f.text(seg.name);
@@ -2594,10 +2591,6 @@ impl Tcx {
                     if *n == s && !env.consts.iter().any(|c| c.0 as usize == i) {
                         // a type parameter takes no generic arguments (E0109), no constraints (E0229)
                         if source_ty.is_some() && self.prohibit_args_on(cx, prog, file, seg, "type parameter", name) { return self.tys.error; }
-                    if *n == s {
-                        if env.consts.iter().any(|c| c.0 as usize == i) {
-                            self.err(cx, prog, file, p.lo, format!("E0573: expected type, found const parameter `{}`", name));
-                        }
                         return self.tys.intern(TyKind::Param(i as u32));
                     }
                 }

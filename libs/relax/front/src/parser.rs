@@ -1977,10 +1977,6 @@ impl<'a> Parser<'a> {
         let mut stage = 0;
         loop {
             let this = match self.kind() {
-        // (rustc_parse parse_fn_front_matter: `const async unsafe|safe extern "abi" fn`, in this order)
-        let mut stage = 0;
-        loop {
-            let at = match self.kind() {
                 T::KwConst => 1,
                 T::KwAsync => 2,
                 T::KwUnsafe => 3,
@@ -2005,28 +2001,10 @@ impl<'a> Parser<'a> {
                 2 => asyncness = true,
                 3 => if self.kind() == T::KwUnsafe { unsafe_ = true },
                 _ => {
-            if at <= stage {
-                let t = self.tok();
-                let found = String::from_utf8_lossy(self.tok_text(t)).into_owned();
-                let expect = match stage {
-                    1 => "`async`, `safe`, `unsafe`, `extern`, or `fn`",
-                    2 => "`safe`, `unsafe`, `extern`, or `fn`",
-                    3 => "`extern` or `fn`",
-                    _ => "`fn`",
-                };
-                return Err(PErr { pos: t.lo, msg: format!("expected one of {expect}, found keyword `{found}`") });
-            }
-            stage = at;
-            match self.kind() {
-                T::KwConst => konst = true,
-                T::KwAsync => asyncness = true,
-                T::KwUnsafe => unsafe_ = true,
-                T::KwExtern => {
                     self.pos += 1;
                     abi = Some(self.abi());
                     continue;
                 }
-                _ => {}
             }
             self.pos += 1;
         }
