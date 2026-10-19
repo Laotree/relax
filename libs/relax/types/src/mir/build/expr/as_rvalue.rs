@@ -41,7 +41,13 @@ impl Builder<'_> {
                 } else {
                     let BlockAnd(b, value_operand) = self.as_operand(block, scope, value, LocalInfo::Boring, false)?;
                     block = b;
-                    Ok(block.and(Rvalue::Repeat(value_operand, Const::Ty(tcx.tys.usize_, count))))
+                    // The count as a scalar when it is known (the checker's array-length reader takes values and
+                    // unevaluated constants); a generic count stays a type-level constant.
+                    let count = match self.const_usize(count) {
+                        Some(n) => Const::Val(ConstValue::Scalar(Scalar::Int { bits: n, size: 8 }), tcx.tys.usize_),
+                        None => Const::Ty(tcx.tys.usize_, count),
+                    };
+                    Ok(block.and(Rvalue::Repeat(value_operand, count)))
                 }
             }
             ExprKind::Binary { op, lhs, rhs } => {
