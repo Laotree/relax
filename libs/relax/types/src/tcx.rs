@@ -282,10 +282,10 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
     const CHUNK: usize = 64;
-    let mut parts: Vec<(usize, Vec<R>)> = std::thread::scope(|sc| {
+    let mut parts: Vec<(usize, Vec<R>)> = crate::pool::scope(|sc| {
         let hs: Vec<_> = (0..jobs)
             .map(|_| {
-                sc.spawn(|| { let _z = crate::zone_alloc::compiler_thread();
+                sc.spawn(|| {
                     let mut out = Vec::new();
                     loop {
                         let k = next.fetch_add(CHUNK, std::sync::atomic::Ordering::Relaxed);

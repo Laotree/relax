@@ -12295,9 +12295,9 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
     let work_cells: Vec<relax_session::sync::Mutex<Option<(u32, Front, String)>>> = work.into_iter().map(|w| relax_session::sync::Mutex::new(Some(w))).collect();
     let finished = std::sync::atomic::AtomicUsize::new(0);
     let helpers = threads.max(1).min(work_cells.len().max(1));
-    std::thread::scope(|sc| {
+    crate::pool::scope(|sc| {
         for _ in 0..helpers {
-            sc.spawn(|| { let _z = crate::zone_alloc::compiler_thread();
+            sc.spawn(|| {
                 // counted when this helper is done, also if it panics (the owner waits for all)
                 struct Done<'a>(&'a std::sync::atomic::AtomicUsize);
                 impl Drop for Done<'_> {
