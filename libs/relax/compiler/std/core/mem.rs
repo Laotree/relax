@@ -46,14 +46,16 @@ pub const fn swap<T>(x: &mut T, y: &mut T) {
 pub fn take<T: Default>(dest: &mut T) -> T {
     replace(dest, T::default())
 }
-/// rustc library/core/src/mem/mod.rs `uninitialized` (deprecated since 1.39).
-#[deprecated(since = "1.39.0", note = "use `mem::MaybeUninit` instead")]
-pub unsafe fn uninitialized<T>() -> T {
-    MaybeUninit::<T>::uninit().assume_init()
-}
+#[rustc_diagnostic_item = "mem_zeroed"]
 pub const unsafe fn zeroed<T>() -> T {
     im::zeroed::<T>()
 }
+#[deprecated(since = "1.39.0", note = "use `mem::MaybeUninit` instead")]
+#[rustc_diagnostic_item = "mem_uninitialized"]
+pub unsafe fn uninitialized<T>() -> T {
+    MaybeUninit::<T>::uninit().assume_init()
+}
+#[rustc_diagnostic_item = "transmute"]
 pub const unsafe fn transmute<T, U>(e: T) -> U {
     im::transmute::<T, U>(e)
 }
@@ -96,11 +98,12 @@ impl<T> crate::fmt::Debug for Discriminant<T> {
 
 // ---------------------------------------------------------------- ManuallyDrop
 
-/// Inhibits the compiler from calling `T`'s destructor: a union, whose fields never get drop
-/// glue (so the compiler needs no special case).
-#[repr(C)]
+/// Inhibits the compiler from calling `T`'s destructor (the lang item has no drop glue); like real core a
+/// struct, so `ManuallyDrop<dyn Trait>` is a dynamically sized type.
+#[repr(transparent)]
+#[cfg_attr(not(relax_check), lang = "manually_drop")]
 #[rustc_diagnostic_item = "ManuallyDrop"]
-pub union ManuallyDrop<T: ?Sized> {
+pub struct ManuallyDrop<T: ?Sized> {
     value: T,
 }
 
@@ -180,9 +183,11 @@ impl<T> MaybeUninit<T> {
     pub const fn new(val: T) -> MaybeUninit<T> {
         MaybeUninit { value: ManuallyDrop::new(val) }
     }
+    #[rustc_diagnostic_item = "maybe_uninit_uninit"]
     pub const fn uninit() -> MaybeUninit<T> {
         MaybeUninit { uninit: () }
     }
+    #[rustc_diagnostic_item = "maybe_uninit_zeroed"]
     pub const fn zeroed() -> MaybeUninit<T> {
         let mut u = MaybeUninit::<T>::uninit();
         unsafe { im::write_bytes(u.as_mut_ptr(), 0, 1) };
@@ -194,12 +199,15 @@ impl<T> MaybeUninit<T> {
             &mut *self.as_mut_ptr()
         }
     }
+    #[rustc_as_ptr]
     pub const fn as_ptr(&self) -> *const T {
         self as *const MaybeUninit<T> as *const T
     }
+    #[rustc_as_ptr]
     pub const fn as_mut_ptr(&mut self) -> *mut T {
         self as *mut MaybeUninit<T> as *mut T
     }
+    #[rustc_diagnostic_item = "assume_init"]
     pub const unsafe fn assume_init(self) -> T {
         ManuallyDrop::into_inner(self.value)
     }

@@ -77,6 +77,8 @@ pub struct Parser<'a> {
     /// opaque macro fragments a transcription forwarded (start of the first token -> end of the
     /// last): a `$t:tt` matches one whole (rustc's interpolated nonterminal tokens)
     pub frag_groups: crate::fxhash::HashMap<u32, u32>,
+    /// starts of the `$t:ty` substitutions of expansion text (not a trait where a bound is expected)
+    ty_frags: crate::fxhash::HashSet<u32>,
     /// file context for built-in macros (file!, module_path!, env!, cfg of derive inputs)
     pub bctx: Option<std::rc::Rc<crate::builtins::FileCtx>>,
     /// names of the inline `mod x { }` blocks being parsed (module_path!)
@@ -96,7 +98,7 @@ pub struct Parser<'a> {
     /// inside a cfg'd-out item (parse_cfg_out): nothing is generated
     cfg_out: u32,
     /// attributes whose shape is checked once their item is known to be configured in (check only)
-    pending_shape: Vec<TokRange>,
+    pending_shape: Vec<(TokRange, Option<PErr>)>,
 }
 
 // precedence levels
@@ -140,6 +142,7 @@ impl<'a> Parser<'a> {
             body_origin: Default::default(),
             tok_undo: Vec::new(),
             frag_groups: Default::default(),
+            ty_frags: Default::default(),
             bctx: None,
             mod_stack: Vec::new(),
             interp: Default::default(),
@@ -769,13 +772,16 @@ impl<'a> Parser<'a> {
         if first == b"cfg" || first == b"cfg_attr" {
             return self.check_attr_shape(toks);
         }
-        self.pending_shape.push(toks);
+        self.pending_shape.push((toks, None));
         Ok(())
     }
 
     fn check_pending_attrs(&mut self) -> PResult<()> {
         let pending = std::mem::take(&mut self.pending_shape);
-        for toks in pending {
+        for (toks, err) in pending {
+            if let Some(e) = err {
+                return Err(e);
+            }
             self.check_attr_shape(toks)?;
         }
         Ok(())
@@ -849,6 +855,18 @@ impl<'a> Parser<'a> {
     fn cfg_entry(&self, i: &mut usize, end: usize) -> Result<(), String> {
         let k = if *i < end { self.toks.at(*i).kind } else { T::Eof };
         match k {
+            // an `$e:expr` fragment is substituted in parentheses (an interpolated expression is one
+            // meta item to rustc); such a paren pair only exists in macro expansion text
+            T::OpenParen if (self.toks.at(*i).lo as usize) >= self.src.len() => {
+                *i += 1;
+                self.cfg_entry(i, end)?;
+                if *i < end && self.toks.at(*i).kind == T::CloseParen {
+                    *i += 1;
+                    Ok(())
+                } else {
+                    Err("expected `)`".into())
+                }
+            }
             T::KwTrue | T::KwFalse => {
                 *i += 1;
                 Ok(())
@@ -1247,7 +1265,10 @@ impl<'a> Parser<'a> {
             self.tok_origin.push((base + off, o, n));
         }
         for (a, b) in groups {
-            self.frag_groups.insert(base + a, base + b);
+            if b & crate::macros::TY_FRAG != 0 {
+                self.ty_frags.insert(base + a);
+            }
+            self.frag_groups.insert(base + a, base + (b & !crate::macros::TY_FRAG));
         }
         let here = self.bctx.as_ref().map(|c| c.path.as_str()).unwrap_or("");
         let same_file = !def.def_file.is_empty() && def.def_file == here;
@@ -1419,8 +1440,12 @@ impl<'a> Parser<'a> {
             Some(mut v) => {
                 let had_semi = self.pos > 0 && self.toks.at(self.pos - 1).kind == T::Semi;
                 if had_semi {
-                    if let Some(Stmt::Expr(_, semi)) = v.last_mut() {
-                        *semi = true;
+                    match v.last_mut() {
+                        Some(Stmt::Expr(_, semi)) => *semi = true,
+                        // rustc_expand `flat_map_stmt`: a call with a trailing `;` that expands to
+                        // nothing leaves an empty statement (a block's tail stays what it was)
+                        None => v.push(Stmt::Empty),
+                        _ => {}
                     }
                 }
                 stmts.extend(v);
@@ -1959,8 +1984,12 @@ impl<'a> Parser<'a> {
             T::Ident | T::PathSep | T::KwSelfValue | T::KwSuper | T::KwCrate
                 if self.mac_ahead() =>
             {
+                let path_lo = self.lo();
                 let path = self.path(true)?;
                 self.expect(T::Not)?;
+                if !matches!(vis, Vis::Private) {
+                    return Err(PErr { pos: path_lo, msg: "can't qualify macro invocation with `pub`".into() });
+                }
                 // `name! ident { }` (macro 2.0 style) not supported
                 let (delim, toks) = self.delim_tt()?;
                 if delim != b'{' {
@@ -2359,6 +2388,24 @@ impl<'a> Parser<'a> {
         self.in_assoc -= 1;
         let items = items?;
         self.expect(T::CloseBrace)?;
+        // rustc_ast_passes `check_item_in_assoc_context`: only fns, consts and types are members
+        // (a `static` is a member of an `extern` block, not of an impl or a trait)
+        for &id in &items {
+            let what = match self.ast.item(id).kind {
+                ItemKind::Struct(_) => "struct",
+                ItemKind::Enum(_) => "enum",
+                ItemKind::Union(_) => "union",
+                ItemKind::Trait(_) => "trait",
+                ItemKind::Impl(_) => "implementation",
+                ItemKind::Mod(_) => "module",
+                ItemKind::Use(_) => "`use` import",
+                ItemKind::ExternCrate(_) => "extern crate",
+                ItemKind::Static(..) if self.foreign_abi.is_none() => "static",
+                _ => continue,
+            };
+            let lo = self.ast.item(id).lo;
+            return Err(PErr { pos: lo, msg: format!("{what} is not supported in `trait`s or `impl`s") });
+        }
         // (after the member items, which are items of their own)
         self.pending_inner.extend(inner);
         Ok(self.ast.push_list(items))
@@ -2371,7 +2418,15 @@ impl<'a> Parser<'a> {
         self.foreign_abi = Some(abi);
         let items = self.assoc_items();
         self.foreign_abi = saved;
-        items
+        let items = items?;
+        // rustc_parse `parse_item_kind` in an extern block: `const` is not a foreign item
+        for &id in self.ast.list(items) {
+            let it = self.ast.item(id);
+            if matches!(it.kind, ItemKind::Const(..)) {
+                return Err(PErr { pos: it.lo, msg: "extern items cannot be `const`".into() });
+            }
+        }
+        Ok(items)
     }
 
     fn impl_generics_ahead(&self) -> bool {
@@ -2622,6 +2677,9 @@ impl<'a> Parser<'a> {
         let async_ = self.eat(T::KwAsync);
         let maybe = self.eat(T::Question);
         let hrtb = self.hrtb()?;
+        if !self.ty_frags.is_empty() && self.ty_frags.contains(&{ self.tok().lo }) {
+            return self.err("expected a trait, found type");
+        }
         let path = self.path(false)?;
         if paren {
             self.expect(T::CloseParen)?;
@@ -2750,6 +2808,17 @@ impl<'a> Parser<'a> {
                 }
                 _ => GenericArg::Type(self.ty_plus()?),
             };
+            // rustc_ast_passes: generic arguments come before the first constraint
+            if crate::lexer::validation_enabled()
+                && !matches!(arg, GenericArg::Binding(..) | GenericArg::Constraint(..))
+                && v.iter().any(|a| matches!(a, GenericArg::Binding(..) | GenericArg::Constraint(..)))
+            {
+                // an AST validation error: only reported once the enclosing item is configured in
+                if self.cfg_out == 0 {
+                    let e = self.err::<()>("generic arguments must come before the first constraint").unwrap_err();
+                    self.pending_shape.push((TokRange { lo: 0, hi: 0 }, Some(e)));
+                }
+            }
             v.push(arg);
             if !self.eat(T::Comma) {
                 self.expect_gt()?;
@@ -4064,15 +4133,25 @@ impl<'a> Parser<'a> {
         Ok(self.mk_expr(ExprKind::If(cond, then, OptExprId::from(els)), lo))
     }
 
+    /// rustc parse_expr_loop: a loop takes no `else`.
+    fn no_loop_else(&mut self, what: &str) -> PResult<()> {
+        if self.kind() == T::KwElse {
+            return self.err(&format!("`{}...else` loops are not supported", what));
+        }
+        Ok(())
+    }
+
     fn loop_expr(&mut self, label: Option<Ident>, lo: u32) -> PResult<ExprId> {
         self.expect(T::KwLoop)?;
         let b = self.block()?;
+        self.no_loop_else("loop")?;
         Ok(self.mk_expr(ExprKind::Loop(b, OptIdent::from(label)), lo))
     }
     fn while_expr(&mut self, label: Option<Ident>, lo: u32) -> PResult<ExprId> {
         self.expect(T::KwWhile)?;
         let c = self.expr_ns()?;
         let b = self.block()?;
+        self.no_loop_else("while")?;
         let row = self.ast.push_row(WhileRow { cond: c, body: b, label });
         Ok(self.mk_expr(ExprKind::While(row), lo))
     }
@@ -4082,6 +4161,7 @@ impl<'a> Parser<'a> {
         self.expect(T::KwIn)?;
         let it = self.expr_ns()?;
         let b = self.block()?;
+        self.no_loop_else("for")?;
         let row = self.ast.push_row(ForRow { pat: p, iter: it, body: b, label });
         Ok(self.mk_expr(ExprKind::For(row), lo))
     }
