@@ -292,3 +292,14 @@ fn a_promoted_closure_is_not_a_missing_nested_body() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn an_array_indexed_by_a_user_type_through_the_slice_impl() {
+    let (errors, unchecked) = borrowck_source("
+        #[derive(Clone, Copy)] pub enum T { A, B }
+        impl<V> core::ops::Index<T> for [V] { type Output = V; fn index(&self, t: T) -> &V { &self[t as usize] } }
+        pub struct M { found: [bool; 2] }
+        impl M { pub fn found_script(&self, t: T) -> bool { self.found[t] } }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
