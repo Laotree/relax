@@ -36,12 +36,15 @@ struct Cx<'a> {
     div: Div,
     breakables: Vec<Breakable>,
     stack: Vec<Attr>,
+    /// the current divergence comes from a call of an uninhabited type (`uninhabited_call`):
+    /// rustc's MIR lint names the next code "expression" and does not look at macros
+    unin: bool,
 }
 
 pub fn check(prog: &Program, tcx: &Tcx, body: &Body, block: Option<BlockId>, expr: Option<ExprId>) {
     if !lint::enabled() { return; }
     let ast = &prog.files[body.file as usize].ast;
-    let mut cx = Cx { prog, tcx, body, ast, div: Div::Maybe, breakables: Vec::new(), stack: Vec::new() };
+    let mut cx = Cx { prog, tcx, body, ast, div: Div::Maybe, breakables: Vec::new(), stack: Vec::new(), unin: false };
     if let Some(b) = block { cx.block(b); }
     if let Some(e) = expr { cx.expr(e); }
 }
@@ -50,13 +53,31 @@ impl<'a> Cx<'a> {
     fn warn(&mut self, pos: u32, kind: &str) {
         if self.div != Div::Always { return; }
         self.div = Div::Warned;
+        let unin = std::mem::take(&mut self.unin);
         // a statement that is a macro call reports at the call (rustc: the statement's span is the call's)
-        if kind != "statement" && lint::external(self.prog, self.body.file, pos) { return; }
+        if kind != "statement" && !unin && lint::external(self.prog, self.body.file, pos) { return; }
+        let kind = if unin && kind == "statement" { "expression" } else { kind };
         lint::emit_in(self.prog, self.body.def, &self.stack, &lint::UNREACHABLE_CODE, self.body.file, pos, &format!("unreachable {}", kind));
     }
 
     fn enter(&mut self, attrs: List<Attr>) { crate::ast_visit::push_attrs(&mut self.stack, self.ast, attrs); }
     fn leave(&mut self, attrs: List<Attr>) { crate::ast_visit::pop_attrs(&mut self.stack, self.ast, attrs); }
+
+    /// rustc_mir_build builder/mod.rs (`UnreachableDueToUninhabited`): a call whose result type has
+    /// no values (not `!`: typeck handles that), in a fn whose own return type has some, makes
+    /// what follows unreachable.
+    fn uninhabited_call(&mut self, e: ExprId) -> bool {
+        let b = self.body;
+        let i = b.expr_ix(e);
+        if i >= b.expr_ty.len() || !b.expr_typed.get(i) { return false; }
+        let ty = b.expr_ty[i];
+        if !matches!(self.tcx.tys.kind(ty), TyKind::Adt(..)) { return false; }
+        if !matches!(self.prog.def(b.def).kind, crate::program::DefKind::Fn | crate::program::DefKind::AssocFn) { return false; }
+        let Some(sig) = self.tcx.fn_sig(self.prog, b.def) else { return false };
+        let ret = sig.ret;
+        let cx = crate::pattern_analysis::body_cx(self.prog, self.tcx, b);
+        cx.is_uninhabited(ty) && !cx.is_uninhabited(ret)
+    }
 
     fn is_never(&self, e: ExprId) -> bool {
         let i = self.body.expr_ix(e);
@@ -192,6 +213,9 @@ impl<'a> Cx<'a> {
             _ => self.warn(ex.lo, "expression"),
         }
         if self.is_never(e) && !self.not_a_read(e) {
+            self.div = self.div.max(Div::Always);
+        } else if matches!(ex.kind, ExprKind::Call(..) | ExprKind::MethodCall(..)) && self.uninhabited_call(e) {
+            if self.div != Div::Always { self.unin = true; }
             self.div = self.div.max(Div::Always);
         }
         self.div = self.div.max(old);
