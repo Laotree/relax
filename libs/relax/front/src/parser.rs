@@ -4290,6 +4290,15 @@ impl ParsedFile {
         let s = std::str::from_utf8(self.bytes(id.lo, id.hi)).unwrap_or("?");
         s.strip_prefix("r#").unwrap_or(s)
     }
+    /// A lifetime's name: a raw lifetime `'r#a` names `'a` (rustc_ast Ident: the raw flag is not part
+    /// of the name; `'r#static` is `'static`).
+    pub fn lifetime_text(&self, id: Ident) -> std::borrow::Cow<'_, str> {
+        let s = std::str::from_utf8(self.bytes(id.lo, id.hi)).unwrap_or("?");
+        match s.strip_prefix("'r#") {
+            Some(rest) => std::borrow::Cow::Owned(format!("'{}", rest)),
+            None => std::borrow::Cow::Borrowed(s),
+        }
+    }
     pub fn tok_text(&self, i: u32) -> &str {
         let t = self.tok(i);
         std::str::from_utf8(self.bytes(t.lo, t.hi)).unwrap_or("?")
