@@ -1188,6 +1188,17 @@ impl Tcx {
                 env.self_ty = Some(self.tys.intern(TyKind::Adt(d, self.tys.mk_list(&indices.identity_types_consts(&self.tys)), self.tys.intern_region_args(&regions))));
             }
             ItemKind::TypeAlias(r) => push_generics(prog, def.file, &ast.row(*r).generics, &mut env),
+            ItemKind::Trait(_) => {
+                // generics_of a trait: `Self` first, then its parameters (so a default can name an
+                // earlier parameter: `trait Tr<const N: u8 = 1, const M: u8 = N>`)
+                if let Some(TraitItem { generics, .. }) = ast.as_trait(&it.kind) {
+                    env.names.push(prog.syms.get("Self").unwrap_or(u32::MAX));
+                    env.regions.next_param += 1;
+                    push_generics(prog, def.file, generics, &mut env);
+                    env.self_ty = Some(self.tys.intern(TyKind::Param(0)));
+                    env.trait_def = Some(d);
+                }
+            }
             ItemKind::Impl(r) => {
                 // collect/generics_of.rs: impl parameters are available while
                 // lowering the impl header, before its self type is collected.
