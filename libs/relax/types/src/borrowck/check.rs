@@ -415,6 +415,8 @@ impl MirBorrowckCtxt<'_> {
                 if outcome.accepted {
                     if self.fv.as_ref().is_some_and(|f| f.views.relaxed) {
                         if !self.result.fv_only.contains(&error) { self.result.fv_only.push(error); }
+                        // As for a reported reservation conflict: its activation is the same finding.
+                        if matches!(access, Reservation(_)) && !self.reservation_errors.contains(place) { self.reservation_errors.push(place.clone()); }
                         continue;
                     }
                 }
