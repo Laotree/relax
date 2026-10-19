@@ -72,6 +72,10 @@ impl<'a> Cx<'a> {
         if i >= b.expr_ty.len() || !b.expr_typed.get(i) { return false; }
         let ty = b.expr_ty[i];
         if !matches!(self.tcx.tys.kind(ty), TyKind::Adt(..)) { return false; }
+        // a tuple-struct or variant constructor is an aggregate, not a call
+        if let ExprKind::Call(f, _) = self.ast.expr(e).kind {
+            if matches!(self.body.res.get(&f.0), Some(crate::typeck::Res::Def(d)) if matches!(self.prog.def(*d).kind, crate::program::DefKind::Struct | crate::program::DefKind::Variant)) { return false; }
+        }
         if !matches!(self.prog.def(b.def).kind, crate::program::DefKind::Fn | crate::program::DefKind::AssocFn) { return false; }
         let Some(sig) = self.tcx.fn_sig(self.prog, b.def) else { return false };
         let ret = sig.ret;
