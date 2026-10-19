@@ -25,6 +25,13 @@
 //!   malloc, provided crates, runtime helpers). Same size-class chunks as burst, plus a list of
 //!   chunks with free slots so a long-lived heap reuses what it frees.
 //!
+//! The compiler arena (and a domain heap) allocates through thread-owned chunks: a chunk is the
+//! current chunk of at most one thread per size class, and that thread allocates from it and
+//! frees its own blocks with plain loads and stores. A free from another thread pushes the block
+//! onto the chunk's lock-free remote list, which the owner drains when its free list runs dry; the
+//! chunk lock is only taken to attach a chunk, hand it back (the thread ends, the chunk is full or
+//! empty, the generation moved on) or to free into a chunk nobody owns. Accounting is per chunk.
+//!
 //! Routing is by a per-thread phase: `compiler()` opts a thread (or a stretch of one) in; the
 //! default, `kept`, is the system heap. A free is decided by the block's address, never by the
 //! phase, so a block can be freed from any thread in any phase. A realloc moves a compiler block
@@ -153,6 +160,13 @@ pub fn compiler_detail() -> (usize, usize, usize, usize) {
 /// and partial locks, yields while waiting, chunk commits, decommits, partial-list pushes and pops.
 pub fn compiler_events() -> [usize; 9] {
     compiler::events()
+}
+
+/// The calling thread gives its current compiler-arena chunks back to the shared lists (a worker
+/// that stays alive between tasks: what it left free is then reusable by any thread, and a chunk
+/// it emptied is released, as when a thread ends).
+pub fn compiler_hand_back() {
+    compiler::detach_thread()
 }
 
 /// Decommits the compiler arena's warm chunks (settle's heap trim).
@@ -526,13 +540,15 @@ unsafe impl GlobalAlloc for RelaxAlloc {
     }
     #[inline]
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        // The compiler arena first: one address-range test decides the common free. The arenas
+        // reserve disjoint ranges, so the order among them does not change who owns a block.
+        if compiler::owns(p) {
+            return compiler::dealloc(p, l);
+        }
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
         if domain::dealloc_layout(p, l) { return; }
         if burst::owns(p) {
             return burst::dealloc(p, l);
-        }
-        if compiler::owns(p) {
-            return compiler::dealloc(p, l);
         }
         #[cfg(target_os = "macos")]
         if OWN_ZONE.load(Ordering::Relaxed) {
@@ -636,6 +652,7 @@ mod routing_tests {
     }
 
     include!("zone_alloc/generation_tests.rs");
+    include!("zone_alloc/stress_tests.rs");
 
     #[test]
     fn realloc_stays_in_place_in_a_class_and_moves_to_the_phase_heap() {
