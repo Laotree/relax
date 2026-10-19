@@ -163,6 +163,8 @@ pub struct Body {
     pub pat_discriminant_reads: SideTable<u32, ()>,
     /// casts that are coercions (rustc `set_coercion_cast`); recorded only while the lint sink is on
     pub coercion_casts: SideTable<u32, ()>,
+    /// type-relative value paths (`Ty::item`, `<Ty>::item`) that resolved to an item of a trait, not an inherent one; recorded only while the lint sink is on (prelude collision lints)
+    pub trait_item_paths: SideTable<u32, DefId>,
     /// The two lang-item calls of the `?` desugaring, with their inferred types.
     pub try_branch: SideTable<u32, (DefId, crate::types::TyList, TyId)>,
     pub try_from_residual: SideTable<u32, (DefId, crate::types::TyList)>,
@@ -236,6 +238,7 @@ impl Body {
             pat_bind_ref: SideTable::new(),
             pat_discriminant_reads: SideTable::new(),
             coercion_casts: SideTable::new(),
+            trait_item_paths: SideTable::new(),
             try_branch: SideTable::new(),
             try_from_residual: SideTable::new(),
             locals: ThinVec::new(),
@@ -493,11 +496,16 @@ pub struct Fcx<'a> {
 /// as rustc_codegen_ssa::mir::FunctionCx::monomorphize does. Analysis consumers
 /// requesting fully normalized tables use instantiate_body instead.
 pub fn codegen_body(prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> std::sync::Arc<Body> {
+    try_codegen_body(prog, tcx, def, args).expect("failed to normalize body for codegen")
+}
+
+/// codegen_body for a caller that has a fallback: an instance whose types do not normalize
+/// (an ill-formed program, e.g. `bop::<dyn Bop>` with a `Self: Sized` associated type) is None.
+pub fn try_codegen_body(prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Option<std::sync::Arc<Body>> {
     let _cost_typeck = crate::fncost::phase(1);
     let _mem = crate::memstat::tag(crate::memstat::Tag::Typeck);
     let body = tcx.typeck(prog, def);
-    instantiate::try_instantiate_mir_and_normalize_erasing_regions(prog, tcx, body, args)
-        .expect("failed to normalize body for codegen")
+    instantiate::try_instantiate_mir_and_normalize_erasing_regions(prog, tcx, body, args).ok()
 }
 
 pub fn instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Body {
@@ -658,6 +666,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             pat_bind_ref: SideTable::new(),
             pat_discriminant_reads: SideTable::new(),
             coercion_casts: SideTable::new(),
+            trait_item_paths: SideTable::new(),
             locals: ThinVec::new(),
             param_pats: ThinVec::new(),
             ret: error,
@@ -3283,6 +3292,7 @@ impl<'a> Fcx<'a> {
             let imp = if ambiguous { crate::program::NO_DEF } else { imp };
             let offset = self.tcx.fn_sig(self.prog, item).map_or(0, |s| s.n_parent_generics) as usize;
             let given = self.explicit_args(path, item, offset).unwrap_or_default();
+            if crate::lint::enabled() { self.b.trait_item_paths.insert(key, item); }
             let args = self.trait_call_args(item, imp, st, &given);
             let t = self.value_def_ty(item, Some(args), key);
             return (Res::Def(item), t);
@@ -3408,6 +3418,8 @@ impl<'a> Fcx<'a> {
                 let sub = Path { segs: path.segs.prefix(path.segs.len() - 1), lo: path.lo };
                 let env = self.env.clone();
                 let t = self.tcx.lower_path_ty(&self.cx.with_infcx(&self.infcx), prog, self.file, self.module, &env, &sub, None);
+                // (a written qualified self type must be well formed, like any written type)
+                if self.tcx.validates(self.prog, self.file) && !self.tcx.tys.has_error(t) { self.register_wf(t, path.lo); }
                 let t = self.norm(t);
                 if matches!(self.tcx.tys.kind(t), TyKind::Error) {
                     return (Res::Err, error);
@@ -3645,6 +3657,7 @@ impl<'a> Fcx<'a> {
                 for i in 0..own as usize {
                     args.push(if i < la.len() { la[i] } else { self.fresh_arg(item, args.len()) });
                 }
+                if crate::lint::enabled() { self.b.trait_item_paths.insert(key, item); }
                 let t = self.value_def_ty(item, Some(args), key);
                 return (Res::Def(item), t);
             }
@@ -3681,6 +3694,7 @@ impl<'a> Fcx<'a> {
                     // Box..): leave the trait args open; the impl is chosen once they are known
                     let ambiguous = cands.iter().filter(|c| c.0 == item).count() > 1;
                     let imp = if ambiguous { crate::program::NO_DEF } else { imp };
+                    if crate::lint::enabled() { self.b.trait_item_paths.insert(key, item); }
                     let args = self.trait_call_args(item, imp, self_ty, &la);
                     let t = self.value_def_ty(item, Some(args), key);
                     return (Res::Def(item), t);
@@ -3952,7 +3966,7 @@ impl<'a> Fcx<'a> {
     /// `Deref` for other types. Records overloaded steps under (expr, step).
     fn deref_step(&mut self, e: u32, step: usize, t: TyId) -> Option<TyId> {
         // rustc autoderef.rs: the recursion limit ends the walk with E0055
-        if step >= 128 && e != u32::MAX - 1 {
+        if step >= self.infcx.recursion_limit(self.prog) && e != u32::MAX - 1 {
             let ts = self.ty_str(t);
             self.err(self.last_lo, format!("E0055: reached the recursion limit while auto-dereferencing `{}`", ts));
             return None;
