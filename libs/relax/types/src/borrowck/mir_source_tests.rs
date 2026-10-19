@@ -453,3 +453,13 @@ fn an_async_fn_body_is_ordered_among_its_closures_by_its_block() {
         pub async fn f(v: Vec<String>) -> usize { v.into_iter().map(|s| s.len()).sum() }");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn a_type_test_in_a_closure_is_promoted_to_the_lowest_universal_region_of_its_class() {
+    let (errors, unchecked) = borrowck_source("
+        use std::any::Any;
+        type B = Box<dyn for<'a> Fn(&(dyn Any + 'a)) -> Box<dyn Any + 'a>>;
+        pub fn foo<E>() -> B { Box::new(|e| Box::new(e.is::<E>())) }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0310"), "{errors:?}");
+}

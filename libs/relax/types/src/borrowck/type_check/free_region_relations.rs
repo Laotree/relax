@@ -20,14 +20,16 @@ impl UniversalRegionRelations {
         for (i,&r) in indices.iter().enumerate() { index[r] = Some(i); }
         let at = |r: RegionVid| index[r].expect("relation on non-universal region");
         let n = indices.len();
+        // Insertion order is the elements' index order (`minimal_scc_representative` picks the lowest):
+        // the universal regions in their own order come first, then the facts known from bounds.
         let mut edges = vec![];
-        for &(a,b) in known {
-            if let (Some(a),Some(b)) = (index[a],index[b]) { edges.push((a,b)); }
-        }
         for &fr in &indices {
             edges.push((at(fr),at(fr)));
             edges.push((at(universal_regions.fr_static),at(fr)));
             if let Some(body) = universal_regions.fr_fn_body { edges.push((at(fr),at(body))); }
+        }
+        for &(a,b) in known {
+            if let (Some(a),Some(b)) = (index[a],index[b]) { edges.push((a,b)); }
         }
         let mut outlives_order = vec![];
         let mut inverse_order = vec![];
