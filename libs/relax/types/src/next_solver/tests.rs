@@ -931,22 +931,10 @@ fn round26_borrowck_const_param_env_copy() {
     assert!(body.errors.is_empty(), "{:?}", body.errors);
     let env = crate::tcx::TypingEnv { limit: Default::default(), param_env: body.param_env.unwrap(), mode: TypingMode::borrowck(&t, &p, d) };
     let state = crate::tcx::EvalState::new();
-    let tx = crate::borrowck::tyx::Tx::new(&p, &t, env, &state);
+    let cx = crate::tcx::EvalCx::new(&p, &t, env, &state);
     let n = t.tys.intern_const(crate::consts::ConstKind::Param(crate::consts::ParamConst { index: 0 }));
-    assert!(tx.is_copy(t.tys.mk_array(t.tys.u8_, n)));
-    assert!(!tx.is_copy(t.tys.mk_array(t.tys.str_, n)));
-}
-
-#[test]
-fn round26_callee_signature_uses_its_const_param_env() {
-    let (p, t) = program("struct Buf<const N: usize>; trait Array { type A; } impl<const N: usize> Array for Buf<N> { type A = [u8; N]; } fn callee<const N: usize>(x: &<Buf<N> as Array>::A) {} fn caller() {}", "callee_const_env");
-    let def = named(&p, "callee");
-    let state = crate::tcx::EvalState::new();
-    let env = crate::tcx::TypingEnv { limit: Default::default(), param_env: Default::default(), mode: crate::tcx::TypingMode::borrowck(&t, &p, named(&p, "caller")) };
-    let tx = crate::borrowck::tyx::Tx::new(&p, &t, env, &state);
-    let rty = crate::borrowck::rty::Rty::new(&tx);
-    let sig = crate::borrowck::rty::signature::signature_template(&rty, def, &[t.tys.intern(TyKind::Const(t.tys.const_usize(3)))]);
-    assert_eq!(sig.inputs.len(), 1);
+    assert!(t.type_is_copy_modulo_regions(&p, &cx, d, t.tys.mk_array(t.tys.u8_, n)));
+    assert!(!t.type_is_copy_modulo_regions(&p, &cx, d, t.tys.mk_array(t.tys.str_, n)));
 }
 
 #[test]

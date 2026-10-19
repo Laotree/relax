@@ -1,11 +1,9 @@
 //! Relax's borrow checker (plans/relax-borrowck.md): rustc's move / initialization / borrow
 //! rules on a MIR-like IR (BIR) built from typeck::Body, run lazily.
 
-pub mod bir;
 pub mod driver;
 pub mod borrowck_errors;
 pub mod check;
-pub mod check_consts;
 pub mod diagnostics;
 pub mod field_views;
 pub mod mir_nll;
@@ -27,20 +25,8 @@ pub mod prefixes;
 #[cfg(test)]
 mod places_tests;
 pub mod body;
-pub mod build;
-pub mod capture;
-pub mod diag;
-pub mod export;
-pub mod fv;
 pub mod lazy;
 pub mod event;
-pub mod moves;
-pub mod nll;
-pub mod pat;
-pub mod promote;
-pub mod qualifs;
-pub mod rty;
-pub mod tyx;
 pub mod universal_regions;
 pub mod region_infer;
 pub mod constraints;
@@ -116,70 +102,6 @@ pub fn regions_enabled(options: &crate::options::Options) -> bool {
     options.borrowck != crate::options::Borrowck::Moves
 }
 
-pub(super) fn empty() -> bir::Bir {
-    bir::Bir {
-        checked_body: None,
-        blocks: Vec::new(),
-        locals: Vec::new(),
-        n_args: 0,
-        regions: Vec::new(),
-        known: Vec::new(),
-        outlives: Vec::new(),
-        captures: Vec::new(),
-        closure_kind: None,
-        closures: Vec::new(),
-        unsupported: None,
-        file: 0,
-        name: String::new(),
-        def: None,
-        args: Vec::new(),
-        closure_expr: None,
-        module: 0,
-        user_tys: Vec::new(),
-        rvalue_user_tys: Vec::new(),
-        local_user_tys: Vec::new(),
-        ascriptions: Vec::new(),
-            agg_callee: Vec::new(),
-            hr_args: Vec::new(),
-            ov_results: Vec::new(),
-            owner: None,
-            capture_spans: Vec::new(),
-            guard_locals: Vec::new(),
-            index_fakes: Vec::new(),
-            expected_sig: false,
-            static_temps: Vec::new(),
-            static_callees: Vec::new(),
-            infer_params: Vec::new(),
-            union_inits: Vec::new(),
-            const_uses: Vec::new(),
-            hr_ret: None,
-            move_sites: Vec::new(),
-            call_user_tys: Vec::new(),
-            fn_values: Vec::new(),
-            fn_anns: Vec::new(),
-            wf_annots: Vec::new(),
-    }
-}
-
-/// Text form of a BIR (MAKEPAD_RUN_BIR_DUMP=<name substring>).
-pub fn bir_dump(tx: &tyx::Tx, bir: &bir::Bir) -> String {
-    let mut s = format!("bir {} ({} args)\n", bir.name, bir.n_args);
-    for (i, l) in bir.locals.iter().enumerate() {
-        s.push_str(&format!("  let _{}: {}{}{}\n", i, if l.mutable { "mut " } else { "" }, tx.ty_str(l.ty), l.name.as_ref().map_or(String::new(), |n| format!("  // {}", n))));
-    }
-    for (bi, b) in bir.blocks.iter().enumerate() {
-        s.push_str(&format!("  bb{}:\n", bi));
-        for st in &b.stmts {
-            s.push_str(&format!("    {:?}\n", st.kind));
-        }
-        match &b.term {
-            Some(t) => s.push_str(&format!("    -> {:?}\n", t.kind)),
-            None => s.push_str("    -> (none)\n"),
-        }
-    }
-    s
-}
-
 /// `MAKEPAD_RUN_BORROWCK_ALL=1 makepad check <pkg>`: type-check and borrow-check every fn with a body
 /// in every crate of the graph except Relax's std (generic ones polymorphically); prints the
 /// diagnostics and a summary. The makepad false-positive gate.
@@ -245,8 +167,6 @@ pub fn check_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
     }
     if options.verbose {
         eprintln!("makepad-run borrowck: {} owners ({} failed typeck polymorphically), {} bodies, {} errors; borrowck cpu {:.1} ms, total {:.1} ms", n_fns, n_typeck_fail, n_bodies, errors, bck_ns as f64 / 1e6, (crate::clock::cpu_ns() - t0) as f64 / 1e6);
-        let ph: Vec<String> = nll::PHASE_NS.iter().map(|x| format!("{:.0}", x.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6)).collect();
-        eprintln!("makepad-run borrowck: nll phases ms (constraints, liveness, solve, loans, regions): {}", ph.join(" "));
         for (k, n) in &unchecked {
             eprintln!("makepad-run borrowck: unchecked {:>6}  {}   e.g. {}", n, k, unchecked_ex.get(k).map_or("", |s| s.as_str()));
         }

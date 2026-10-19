@@ -174,31 +174,33 @@ fn region_scope_closure_body_is_separate() {
 /// Compare the actual builder's StorageDead events, not a second copy of its scope rules.
 /// Call destinations identify the temporary independently of local allocation order.
 fn cross_check(source: &str, edition: u16, extended: bool, tail: bool) -> bool {
-    use crate::borrowck::bir::{Callee, StmtKind, TermKind};
+    use crate::mir::{StatementKind, TerminatorKind};
     let (p, tcx, b) = collect(source, edition);
     let tree = region_scope_tree(&p, &b).unwrap();
     let state = EvalState::new();
-    let tx = crate::borrowck::tyx::Tx::new(&p, &tcx, TypingEnv::fully_monomorphized(&p), &state);
-    let mut builder = crate::borrowck::build::Build::new(&tx, &b, "probe".into());
-    builder.build_body();
-    let bir = &builder.out;
-    assert!(bir.unsupported.is_none(), "{:?}", bir.unsupported);
+    let env = TypingEnv::fully_monomorphized(&p);
+    let eval = crate::tcx::EvalCx::new(&p, &tcx, env, &state);
+    let root = crate::mir::build::BuildRoot::new(crate::mir::build::BuildCx { prog: &p, tcx: &tcx, env, eval: &eval }, &b).unwrap();
+    let owner = crate::borrowck::body::CheckedBody::item(&p, b.def).unwrap();
+    let mir = crate::mir::build::build_mir(&root, owner).unwrap_or_else(|e| panic!("{source}: {e:?}"));
     let mut temp = None;
-    for bb in &bir.blocks {
-        if let Some(term) = &bb.term {
-            if let TermKind::Call { callee: Callee::Fn(d, _), dest, .. } = &term.kind {
-                if p.name(*d) == "f" { temp = Some(dest.local); }
+    for bb in &mir.basic_blocks {
+        if let Some(term) = &bb.terminator {
+            if let TerminatorKind::Call { func: crate::mir::Operand::Constant(c), destination, .. } = &term.kind {
+                if let crate::mir::Const::Val(_, ty) = &c.const_ {
+                    if let crate::types::TyKind::FnDef(d, ..) = tcx.tys.kind(*ty) { if p.name(*d) == "f" { temp = Some(destination.local); } }
+                }
             }
         }
     }
     let temp = temp.expect("f call destination");
     let mut endings = Vec::new();
-    for bb in &bir.blocks {
-        for stmt in &bb.stmts {
-            if let StmtKind::StorageDead(l) = stmt.kind { if l == temp { endings.push(stmt.span); } }
+    for bb in &mir.basic_blocks {
+        for stmt in &bb.statements {
+            if let StatementKind::StorageDead(l) = stmt.kind { if l == temp { endings.push(stmt.source_info.span); } }
         }
     }
-    assert_eq!(endings.len(), 1, "{source}: {:?}", bir.blocks);
+    assert_eq!(endings.len(), 1, "{source}: {:?}", mir.basic_blocks);
     let temp_expr = expr(&p, &b, "f()");
     let scope = tree.temporary_scope(temp_expr).unwrap();
     let data = tree.scopes[scope.0 as usize];

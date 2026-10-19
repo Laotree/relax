@@ -217,10 +217,10 @@ fn verdict_states() {
 fn render_matches_old() {
     if child("render_matches_old") { return; }
     let (prog, _) = fixture("app", "fn clean() {}\n"); let def = named(&prog, "clean");
-    let span = super::super::bir::Span { lo: 3, hi: 8 };
-    let mut d = super::super::diag::Diag::new("E0502", "cannot borrow `x`".into(), span);
-    d.label(span, "primary".into(), true); d.note("a note".into()); d.help("a help".into());
-    let e = super::super::diag::to_error(&prog, prog.def(def).file, def, &d);
+    let span = crate::mir::Span { file: prog.def(def).file, lo: 3, hi: 8 };
+    let mut d = super::super::diagnostics::Diag::new("E0502", span, "cannot borrow `x`");
+    d.span_label(span, "primary"); d.note("a note"); d.help("a help");
+    let e = super::super::diagnostics::capture(&prog, def, &d);
     assert_eq!(e.render(), format!("error[E0502]: cannot borrow `x`\n  --> {}:1:4\n  |\n1 | fn clean() {{}}\n  |    ^^^^^ primary\n  |\n  = note: a note\n  = help: a help\n", e.file));
     let json = format!("{{\"severity\":\"error\",\"code\":\"E0502\",\"message\":\"cannot borrow `x`\",\"file\":{},\"line\":1,\"col\":4,\"end_line\":1,\"end_col\":9,\"phase\":\"borrowck\",\"notes\":[\"a note\",\"primary\"],\"suggestion\":{{\"message\":\"a help\",\"replacement\":null}},\"item\":{}}}", crate::diag::quote(&e.file), crate::diag::quote(&e.fn_path));
     assert_eq!(e.to_diagnostic().to_json(), json);
