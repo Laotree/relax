@@ -24,6 +24,9 @@ pub struct PErr {
 pub type PResult<X> = Result<X, PErr>;
 
 const NO_STRUCT: u8 = 1;
+/// rustc `Restrictions::ALLOW_LET`: set for `if`/`while` conditions and match guards, kept across
+/// binary operators and parentheses, cleared by every other primary expression
+const ALLOW_LET: u8 = 2;
 
 #[derive(Clone, Copy)]
 enum BodyOutline {
@@ -3575,6 +3578,10 @@ impl<'a> Parser<'a> {
     fn expr_ns(&mut self) -> PResult<ExprId> {
         self.expr_bp(0, NO_STRUCT)
     }
+    /// An `if`/`while` condition (rustc parse_expr_cond)
+    fn expr_cond(&mut self) -> PResult<ExprId> {
+        self.expr_bp(0, NO_STRUCT | ALLOW_LET)
+    }
 
     fn can_begin_expr(&self, r: u8) -> bool {
         match self.kind() {
@@ -3830,7 +3837,7 @@ impl<'a> Parser<'a> {
         self.expect(T::OpenParen)?;
         let mut v = Vec::new();
         while self.kind() != T::CloseParen {
-            if let Some(e) = self.list_elem()? {
+            if let Some(e) = self.list_elem(0)? {
                 v.push(e);
             }
             if !self.eat(T::Comma) {
@@ -3844,9 +3851,9 @@ impl<'a> Parser<'a> {
     /// An element of an array / tuple / call-argument list: None when a `#[cfg(..)]` on it is false
     /// (the element is removed; Reference expressions.md [expr.attr.restriction] and
     /// conditional-compilation.md [cfg.attr]; rustc_expand config.rs configure_expr).
-    fn list_elem(&mut self) -> PResult<Option<ExprId>> {
+    fn list_elem(&mut self, r: u8) -> PResult<Option<ExprId>> {
         let attrs = if self.kind() == T::Pound && self.nth(1) == T::OpenBracket { self.outer_attrs()? } else { Vec::new() };
-        let e = self.expr()?;
+        let e = self.expr_bp(0, r)?;
         Ok(if attrs.is_empty() || self.cfg_present(&attrs) { Some(e) } else { None })
     }
 
@@ -3862,6 +3869,9 @@ impl<'a> Parser<'a> {
 
     fn primary(&mut self, r: u8) -> PResult<ExprId> {
         let lo = self.lo();
+        // rustc parse_expr_bottom: only `let` and a parenthesised expression see ALLOW_LET
+        let let_ok = r & ALLOW_LET != 0;
+        let r = if matches!(self.kind(), T::KwLet | T::OpenParen) { r } else { r & !ALLOW_LET };
         match self.kind() {
             T::Interp => {
                 let e = self.interp.get(&(self.pos as u32)).copied();
@@ -3879,7 +3889,7 @@ impl<'a> Parser<'a> {
                 if self.eat(T::CloseParen) {
                     return Ok(self.mk_expr(ExprKind::Tuple(List::EMPTY), lo));
                 }
-                let first = self.list_elem()?;
+                let first = self.list_elem(r & ALLOW_LET)?;
                 if let Some(f) = first {
                     if self.eat(T::CloseParen) {
                         return Ok(self.mk_expr(ExprKind::Paren(f), lo));
@@ -3890,7 +3900,7 @@ impl<'a> Parser<'a> {
                     if self.kind() == T::CloseParen {
                         break;
                     }
-                    if let Some(e) = self.list_elem()? {
+                    if let Some(e) = self.list_elem(r & ALLOW_LET)? {
                         v.push(e);
                     }
                 }
@@ -3903,7 +3913,7 @@ impl<'a> Parser<'a> {
                 if self.eat(T::CloseBracket) {
                     return Ok(self.mk_expr(ExprKind::Array(List::EMPTY), lo));
                 }
-                let first = self.list_elem()?;
+                let first = self.list_elem(0)?;
                 if let Some(f) = first {
                     if self.eat(T::Semi) {
                         let n = self.expr()?;
@@ -3916,7 +3926,7 @@ impl<'a> Parser<'a> {
                     if self.kind() == T::CloseBracket {
                         break;
                     }
-                    if let Some(e) = self.list_elem()? {
+                    if let Some(e) = self.list_elem(0)? {
                         v.push(e);
                     }
                 }
@@ -3973,7 +3983,7 @@ impl<'a> Parser<'a> {
                 while self.kind() != T::CloseBrace {
                     let attrs = self.outer_attrs()?;
                     let pat = self.pat_top()?;
-                    let guard = if self.eat(T::KwIf) { Some(self.expr()?) } else { None };
+                    let guard = if self.eat(T::KwIf) { Some(self.expr_bp(0, ALLOW_LET)?) } else { None };
                     self.expect(T::FatArrow)?;
                     let blo = self.lo();
                     let body;
@@ -4003,10 +4013,13 @@ impl<'a> Parser<'a> {
                 Ok(self.mk_expr(ExprKind::Match(scrut, arms), lo))
             }
             T::KwLet => {
+                if !let_ok {
+                    return self.err("expected expression, found `let` statement");
+                }
                 self.pos += 1;
                 let pat = self.pat_top()?;
                 self.expect(T::Eq)?;
-                let e = self.expr_bp(P_CMP, r | NO_STRUCT & r)?;
+                let e = self.expr_bp(P_CMP, r & NO_STRUCT)?;
                 Ok(self.mk_expr(ExprKind::Let(pat, e), lo))
             }
             T::KwReturn => {
@@ -4195,7 +4208,7 @@ impl<'a> Parser<'a> {
 
     fn if_expr(&mut self, lo: u32) -> PResult<ExprId> {
         self.expect(T::KwIf)?;
-        let cond = self.expr_ns()?;
+        let cond = self.expr_cond()?;
         let then = self.block()?;
         let els = if self.eat(T::KwElse) {
             let elo = self.lo();
@@ -4227,7 +4240,7 @@ impl<'a> Parser<'a> {
     }
     fn while_expr(&mut self, label: Option<Ident>, lo: u32) -> PResult<ExprId> {
         self.expect(T::KwWhile)?;
-        let c = self.expr_ns()?;
+        let c = self.expr_cond()?;
         let b = self.block()?;
         self.no_loop_else("while")?;
         let row = self.ast.push_row(WhileRow { cond: c, body: b, label });
