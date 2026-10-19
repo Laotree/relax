@@ -1726,7 +1726,8 @@ impl Tcx {
         };
         // `async fn f() -> T` returns `impl Future<Output = T>` (rustc's async fn desugaring;
         // the hidden type is the body's coroutine)
-        let ret = if sig.asyncness { self.async_opaque(prog, d, ret) } else { ret };
+        // (a foreign fn's `async` is rejected by ast validation and ignored by lowering: no opaque)
+        let ret = if sig.asyncness && prog.def(d).kind != DefKind::ForeignFn { self.async_opaque(prog, d, ret) } else { ret };
         let mut callable_signatures = Vec::new();
         self.collect_callable_signatures(cx, prog, file, module, &env, &sig.generics, n_parent, &mut callable_signatures);
         // Associated items inherit their parent's predicates, including callable
@@ -2445,7 +2446,9 @@ impl Tcx {
                     for g in f.ast.list(*v) {
                         match g {
                             GenericArg::Type(t) => {
-                                args.push(self.type_or_const_arg(cx, prog, file, module, env, *t));
+                                let arg = self.type_or_const_arg(cx, prog, file, module, env, *t);
+                                let expected_const = self.declaration_env(prog, td).consts.iter().any(|c| c.0 as usize == args.len() + 1);
+                                args.push(self.arg_of_param_kind(cx, prog, file, path.lo, expected_const, arg));
                             },
                             GenericArg::Const(e) => {
                                 let declaration = self.declaration_env(prog, td);
@@ -2878,6 +2881,21 @@ impl Tcx {
         *args = fitted;
     }
 
+    /// hir_ty_lowering/generics.rs provided_kind: a type written for a const parameter, or a
+    /// constant for a type parameter, is E0747 and lowers to the error term of the parameter's
+    /// kind.
+    pub(crate) fn arg_of_param_kind(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, lo: u32, expected_const: bool, arg: TyId) -> TyId {
+        let is_const = matches!(self.tys.kind(arg), TyKind::Const(_));
+        if is_const == expected_const { return arg; }
+        let message = match (expected_const, self.tys.has_error(arg)) {
+            (true, true) => "E0747: unresolved item provided when a constant was expected",
+            (true, false) => "E0747: type provided when a constant was expected",
+            (false, _) => "E0747: constant provided when a type was expected",
+        };
+        self.err(cx, prog, file, lo, message.into());
+        if expected_const { self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))) } else { self.tys.error }
+    }
+
     pub fn lower_generic_args(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, module: u32, env: &GenEnv, p: &ast::Path) -> Vec<TyId> {
         self.lower_generic_args_of_item(cx, prog, file, module, env, p, self.resolve_type_path_def(prog, file, module, p))
     }
@@ -2930,11 +2948,13 @@ impl Tcx {
                                     out.push(ty); continue;
                                 }
                             }
-                            let arg = self.type_or_const_arg(cx, prog, file, module, env, *t);
+                            let mut arg = self.type_or_const_arg(cx, prog, file, module, env, *t);
                             // rustc hir_ty_lowering generic_arg_mismatch_err (E0747): an argument of
                             // the other kind than its parameter is an error, recovered as an error value
                             if let Some((_, declaration)) = &declaration {
                                 let wants_const = declaration.consts.iter().any(|c| c.0 as usize == index);
+                                // a parenthesized `_` is an inference variable of the parameter's kind
+                                if wants_const && matches!(self.tys.kind(arg), TyKind::Infer(_)) && cx.infcx.is_some() { arg = self.tys.intern(TyKind::Const(cx.infcx.unwrap().next_const_var())); }
                                 let is_const = matches!(self.tys.kind(arg), TyKind::Const(_));
                                 if wants_const && !is_const && index < declaration.names.len() {
                                     self.err(cx, prog, file, p.lo, "E0747: type provided when a constant was expected".into());

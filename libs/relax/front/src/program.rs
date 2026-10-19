@@ -2589,6 +2589,7 @@ impl Program {
                             continue;
                         }
                         self.reject_specialization(file, si, None, true);
+                        self.validate_foreign_fn(file, si);
         let n = self.files[file as usize].ast.item(si).name;
                         let sn = self.ident(file, n);
                         let ip = !matches!(self.files[file as usize].ast.item(si).vis, Vis::Private);
@@ -2676,6 +2677,21 @@ impl Program {
             }
         }
         Ok(())
+    }
+
+    /// rustc_ast_passes ast_validation.rs:1486-1491 (visit_foreign_item): an `fn` in an
+    /// `extern` block has no body (check_foreign_fn_bodyless) and no qualifiers
+    /// (check_foreign_fn_headerless: async, const; the block's ABI is copied into each fn, so an own `extern` is not told apart).
+    fn validate_foreign_fn(&mut self, file: u32, item: ItemId) {
+        let ast = &self.files[file as usize].ast;
+        let it = ast.item(item);
+        let ItemKind::Fn(sig, body, _) = &it.kind else { return; };
+        let sig = ast.fn_sig(*sig);
+        let lo = it.lo;
+        let mut messages = Vec::new();
+        if body.is_some() || sig.lazy_body.is_some() { messages.push("incorrect function inside `extern` block"); }
+        if sig.asyncness || sig.konst { messages.push("functions in `extern` blocks cannot have qualifiers"); }
+        for message in messages { self.errors.push(self.record_error(file, lo, "collect", message.to_string())); }
     }
 
     /// rustc_ast_passes/src/feature_gate.rs:168,374 @8d1a764. The stable
