@@ -130,6 +130,8 @@ pub(super) fn program(source: &str) -> (Program, Tcx) {
     let mut prog = Program::new(&std::sync::Arc::new(crate::Session::default()));
     let cfg = crate::cfg::CfgSet::host(&prog.session, &[]);
     prog.load_crate("native_fcx", path.to_str().unwrap(), 2021, cfg, vec![]).unwrap();
+    // the checks that report only in a checked crate (casts, ...) run in this crate
+    for c in prog.crates.iter_mut() { c.validate = true; }
     let mut tcx = Tcx::new(); tcx.collect(&prog);
     assert!(prog.errors.is_empty(), "{:?}", prog.errors);
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);

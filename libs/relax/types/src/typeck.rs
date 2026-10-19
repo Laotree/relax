@@ -4826,12 +4826,13 @@ impl<'a> Fcx<'a> {
                             // (a generic index of a polymorphic body -- `I: SliceIndex<[T]>` --
                             // goes through std's `impl<T, I: SliceIndex<[T]>> Index<I> for [T]`:
                             // the result is `<I as SliceIndex<[T]>>::Output`)
-                            let std_range = match self.tcx.tys.kind(tis) {
-                                TyKind::Adt(d, _, _) => matches!(self.prog.name(*d), "Range" | "RangeFrom" | "RangeTo" | "RangeFull" | "RangeInclusive" | "RangeToInclusive"),
-                                TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) => false,
+                            // only a `usize` index is builtin; every other index (std ranges
+                            // included) is the overloaded `Index` of the std impls
+                            let builtin = match self.tcx.tys.kind(tis) {
+                                TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..) => false,
                                 _ => true,
                             };
-                            if !std_range {
+                            if !builtin {
                                 if let Some(td) = self.lang_item(&["ops", "Index"]) {
                                     let ti2 = self.infcx.deeply_resolve_ignoring_regions(ti);
                                     let slice = self.tcx.tys.intern(TyKind::Slice(el));
@@ -4858,6 +4859,17 @@ impl<'a> Fcx<'a> {
                         }
                         TyKind::Str if idx_is_range => {
                             self.set_operand_derefs(e.0, derefs);
+                            if let Some(td) = self.lang_item(&["ops", "Index"]) {
+                                let ti2 = self.infcx.deeply_resolve_ignoring_regions(ti);
+                                let ds = self.infcx.deeply_resolve_ignoring_regions(cur);
+                                if !matches!(self.select_trait(td, ds, &[ti2]), Err(_)) {
+                                    let m = self.trait_fn(td, "index").unwrap();
+                                    self.b.ov_index.insert(e.0, (m, self.tcx.tys.mk_list(&[ds, ti2])));
+                                    let out = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Output").unwrap()).unwrap();
+                                    let r = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: out }, args: self.tcx.tys.mk_list(&[ds, ti2]), regions: crate::types::RegionArgsId::EMPTY }));
+                                    return self.norm_keep(r);
+                                }
+                            }
                             return self.tcx.tys.str_;
                         }
                         TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) => {

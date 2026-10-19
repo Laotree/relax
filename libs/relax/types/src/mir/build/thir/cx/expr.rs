@@ -338,17 +338,11 @@ impl Cx<'_> {
                 }
                 let base = self.mirror_expr(lhs)?;
                 let base = self.apply_operand_adjustments_id(e, base)?;
-                // builtin indexing is `usize` into an array or slice; typeck leaves ranges (and the
-                // like) on arrays, slices and `str` to the std `Index` impls without recording them
+                // builtin indexing is `usize` into an array or slice; typeck records every other
+                // index as the overloaded `Index`
                 let base_ty = self.thir.exprs[base.0 as usize].ty;
-                let index_ty = self.ety_adjusted(index)?;
-                let builtin = matches!(tcx.tys.kind(base_ty), TyKind::Array(..) | TyKind::Slice(_)) && index_ty == tcx.tys.usize_;
-                if !builtin {
-                    let Some(def) = self.trait_method(LangItem::Index, "index") else { return self.unresolved(span, "Index lang item") };
-                    let base = self.autoref(e, base, false);
-                    let index = self.mirror_expr(index)?;
-                    let callee_ty = self.fn_def_ty(def, &[base_ty, index_ty]);
-                    return self.overloaded_place(e, self.temp_scope(e), expr_ty, callee_ty, Box::new([base, index]), span);
+                if !(matches!(tcx.tys.kind(base_ty), TyKind::Array(..) | TyKind::Slice(_)) && self.ety_adjusted(index)? == tcx.tys.usize_) {
+                    return self.unresolved(span, "non-builtin index without an Index impl");
                 }
                 ExprKind::Index { lhs: base, index: self.mirror_expr(index)? }
             }
