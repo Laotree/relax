@@ -17,7 +17,7 @@
 //! `box`, default field values, asm. They match what the BIR checker leaves unchecked.
 use super::{
     Arm, ArmId, Block, BlockId, BlockSafety, ClosureExpr, ClosureExprKind, Expr, ExprId, ExprKind, LocalVarId, Param, ParamId, Pat, PatKind, Stmt, StmtId, StmtKind,
-    Thir, ThirBody,
+    Thir, ThirBody, BodyTy,
 };
 use crate::ast;
 use crate::borrowck::body::{BodyKind as OwnerKind, CheckedBody};
@@ -70,7 +70,7 @@ impl<'a> Cx<'a> {
     pub fn error(&self, span: Span, reason: UnsupportedReason) -> BuildError {
         BuildError::new(self.owner, span, reason)
     }
-    pub(super) fn unresolved<T>(&self, span: Span, what: &'static str) -> BuildResult<T> {
+    pub(crate) fn unresolved<T>(&self, span: Span, what: &'static str) -> BuildResult<T> {
         Err(self.error(span, UnsupportedReason::UnresolvedFact(what)))
     }
     pub(super) fn not_built<T>(&self, span: Span, what: &'static str) -> BuildResult<T> {
@@ -87,7 +87,7 @@ impl<'a> Cx<'a> {
     pub(super) fn tcx(&self) -> &'a Tcx {
         self.root.cx.tcx
     }
-    pub(super) fn ast(&self) -> &'a ast::Ast {
+    pub(crate) fn ast(&self) -> &'a ast::Ast {
         &self.prog().files[self.tb().file as usize].ast
     }
     pub(super) fn file(&self) -> &'a crate::parser::ParsedFile {
@@ -217,27 +217,40 @@ impl<'a> Cx<'a> {
     pub fn thir_body(mut self) -> BuildResult<ThirBody> {
         let tb = self.tb();
         let (prog, ast) = (self.prog(), self.ast());
+        let tcx = self.tcx();
         let def = prog.def(self.owner.owner);
+        let item = ast.item(def.item);
+        let item_span = self.span(item.lo, item.hi);
         let span = self.span(0, 0);
         if !tb.errors.is_empty() {
             return Err(self.error(span, UnsupportedReason::TypeckTainted));
         }
-        let (params, expr) = match self.owner.kind {
+        let fn_scopes = |this: &Self, node: Node, at: Span| -> BuildResult<Option<(ScopeId, ScopeId)>> {
+            let call_site = this.scope_of(node, ScopeData::CallSite);
+            let arguments = this.scope_of(node, ScopeData::Arguments);
+            match (call_site, arguments) {
+                (Some(c), Some(a)) => Ok(Some((c, a))),
+                _ => this.unresolved(at, "function region scopes"),
+            }
+        };
+        let (params, expr, body_ty, body_span, ret_span, scopes) = match self.owner.kind {
             OwnerKind::Function => {
-                let ast::ItemKind::Fn(sig, _, _) = ast.item(def.item).kind else { return self.unresolved(span, "function item") };
+                let ast::ItemKind::Fn(sig, _, _) = item.kind else { return self.unresolved(span, "function item") };
                 let sig = ast.fn_sig(sig);
                 if sig.asyncness {
-                    return self.not_built(span, "async fn");
+                    return self.not_built(item_span, "async fn");
                 }
-                let params = self.fn_params(sig)?;
-                let Some(body) = tb.body else { return self.unresolved(span, "function body") };
-                let block = self.mirror_block(body)?;
+                let Some(body) = tb.body else { return self.unresolved(item_span, "function body") };
                 let b = ast.block(body);
+                let params = self.fn_params(sig, item.lo)?;
+                let block = self.mirror_block(body)?;
                 let root = Expr { kind: ExprKind::Block { block }, ty: tb.ret, temp_scope: None, span: self.span(b.lo, b.hi) };
-                (params, self.push(root))
+                let scopes = fn_scopes(&self, Node::Block(body.0), item_span)?;
+                let rust_call = false;
+                (params, self.push(root), BodyTy::Fn { output: tb.ret, rust_call }, item_span, self.span(b.lo, b.lo), scopes)
             }
             OwnerKind::Const | OwnerKind::Static | OwnerKind::AssocConst => {
-                let init = match &ast.item(def.item).kind {
+                let init = match &item.kind {
                     ast::ItemKind::Const(_, init) | ast::ItemKind::Static(_, _, init) => init.get(),
                     _ => None,
                 };
@@ -245,37 +258,48 @@ impl<'a> Cx<'a> {
                     Ok(Some(e)) => e,
                     _ => match init {
                         Some(e) => e,
-                        None => return self.unresolved(span, "initializer"),
+                        None => return self.unresolved(item_span, "initializer"),
                     },
                 };
-                (Vec::new(), self.mirror_expr(init)?)
+                let expr = self.mirror_expr(init)?;
+                (Vec::new(), expr, BodyTy::Const(tb.ret), item_span, self.espan(init), None)
             }
-            OwnerKind::AnonConst(e) => (Vec::new(), self.mirror_expr(e)?),
+            OwnerKind::AnonConst(e) => {
+                let ty = self.ety(e)?;
+                let expr = self.mirror_expr(e)?;
+                (Vec::new(), expr, BodyTy::Const(ty), self.espan(e), self.espan(e), None)
+            }
             OwnerKind::InlineConst(e) => {
                 let ast::ExprKind::ConstBlock(b) = ast.expr(e).kind else { return self.unresolved(self.espan(e), "inline const block") };
                 let Some(&ty) = tb.inline_const_types.get(&e.0) else { return self.unresolved(self.espan(e), "inline const type") };
                 let block = self.mirror_block(b)?;
                 let blk = ast.block(b);
                 let root = Expr { kind: ExprKind::Block { block }, ty, temp_scope: None, span: self.span(blk.lo, blk.hi) };
-                (Vec::new(), self.push(root))
+                (Vec::new(), self.push(root), BodyTy::Const(ty), self.espan(e), self.espan(e), None)
             }
             OwnerKind::Closure(ce) => {
                 let ast::ExprKind::Closure(row) = ast.expr(ce).kind else { return self.not_built(self.espan(ce), "coroutine body") };
                 let row = *ast.row(row);
+                let ce_span = self.espan(ce);
                 if row.is_async {
-                    return self.not_built(self.espan(ce), "async closure");
+                    return self.not_built(ce_span, "async closure");
                 }
+                let Some(sigs) = tb.closure_sigs.get(&ce.0) else { return self.unresolved(ce_span, "closure signature") };
+                let TyKind::FnPtr(inputs, output, _, _) = *tcx.tys.kind(sigs.liberated) else { return self.unresolved(ce_span, "closure signature type") };
+                let inputs: Vec<TyId> = tcx.tys.list(inputs).to_vec();
                 let mut params = vec![self.closure_env_param(ce)?];
-                for p in ast.list(row.params) {
-                    self.pat_hint = ast.expr(ce).lo;
+                for (i, p) in ast.list(row.params).iter().enumerate() {
+                    self.pat_hint = ce_span.lo;
                     let pat = self.lower_pattern(p.pat)?;
-                    let ty = pat.ty;
+                    let ty = inputs.get(i).copied().unwrap_or(pat.ty);
                     params.push(self.thir.alloc_param(Param { pat: Some(Box::new(pat)), ty, ty_span: None, self_kind: None, node: Some(p.pat.0) }));
                 }
-                (params, self.mirror_expr(row.body)?)
+                let expr = self.mirror_expr(row.body)?;
+                let scopes = fn_scopes(&self, Node::Expr(row.body.0), ce_span)?;
+                (params, expr, BodyTy::Fn { output, rust_call: false }, ce_span, self.espan(row.body), scopes)
             }
         };
-        Ok(ThirBody { thir: self.thir, params, expr })
+        Ok(ThirBody { thir: self.thir, params, expr, body_ty, span: body_span, ret_span, coroutine: None, fn_scopes: scopes })
     }
 
     /// The env parameter of a closure body: the closure by reference or by value, per its kind.
@@ -292,7 +316,7 @@ impl<'a> Cx<'a> {
     }
 
     /// The parameters of a function: `self` (if any) and the declared patterns.
-    fn fn_params(&mut self, sig: &ast::FnSig) -> BuildResult<Vec<ParamId>> {
+    fn fn_params(&mut self, sig: &ast::FnSig, hint: u32) -> BuildResult<Vec<ParamId>> {
         let (tb, ast) = (self.tb(), self.ast());
         let mut out = Vec::new();
         let mut next_param = 0usize;
@@ -320,7 +344,7 @@ impl<'a> Cx<'a> {
         }
         let _ = next_param;
         for p in ast.list(sig.params) {
-            self.pat_hint = ast.expr_hint_for_pat(p.pat);
+            self.pat_hint = hint;
             let pat = self.lower_pattern(p.pat)?;
             let ty = pat.ty;
             out.push(self.thir.alloc_param(Param { pat: Some(Box::new(pat)), ty, ty_span: None, self_kind: None, node: Some(p.pat.0) }));
@@ -361,3 +385,11 @@ impl<'a> Cx<'a> {
 
 #[allow(dead_code)]
 fn _unused(_: (ArmId, Arm, Block, BlockId, BlockSafety, ClosureExpr, Stmt, StmtId, StmtKind, DefKind)) {}
+
+/// `e` without its parentheses.
+pub(super) fn strip_paren(ast: &ast::Ast, mut e: ast::ExprId) -> ast::ExprId {
+    while let ast::ExprKind::Paren(x) = &ast.expr(e).kind {
+        e = *x;
+    }
+    e
+}

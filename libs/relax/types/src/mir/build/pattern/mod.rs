@@ -9,7 +9,7 @@
 //!   alternative of an or-pattern; the primary binding is the one whose pattern id is `Local.pat`.
 //! - `Body.pat_bind_ref[p]` is a binding made by-reference through the default binding mode.
 //! - The `Pat::Ident` of a unit struct / variant / const is a path pattern (`Body.pat_res`).
-use crate::ast::{Ast, ExprId, Pat as AstPat, PatId};
+use crate::ast::{ExprId, Pat as AstPat, PatId};
 use crate::consts::{GenericArg, Value};
 use crate::mir::build::thir::{Ascription, Cx, DerefPatBorrowMode, ErrorGuaranteed, FieldPat, LocalVarId, Pat, PatKind, PatRange, PatRangeBoundary, Pinnedness, RangeEnd};
 use crate::mir::build::{BuildResult, UnsupportedReason};
@@ -30,10 +30,6 @@ pub(crate) mod tests;
 
 
 impl<'a> Cx<'a> {
-    fn ast(&self) -> &'a Ast {
-        &self.root.cx.prog.files[self.root.typeck.file as usize].ast
-    }
-
     fn pat_unresolved<T>(&self, span: Span, what: &'static str) -> BuildResult<T> {
         Err(self.error(span, UnsupportedReason::UnresolvedFact(what)))
     }
@@ -147,7 +143,7 @@ impl<'a> Cx<'a> {
         Ok(out)
     }
 
-    fn field_index(&self, adt: DefId, variant: u32, name: crate::ast::Ident) -> Option<u32> {
+    pub(crate) fn field_index(&self, adt: DefId, variant: u32, name: crate::ast::Ident) -> Option<u32> {
         let prog = self.root.cx.prog;
         let pf = &prog.files[self.root.typeck.file as usize];
         let text = std::str::from_utf8(pf.bytes(name.lo, name.hi)).ok()?;

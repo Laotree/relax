@@ -1,7 +1,7 @@
 //! rustc_mir_build/src/thir/cx/expr.rs: expressions, with their adjustments made explicit.
 use super::{Cx, ExprKind};
 use crate::ast::{self, ExprKind as A, OptExprId};
-use crate::consts::{GenericArg, ScalarInt};
+use crate::consts::ScalarInt;
 use crate::lang_items::LangItem;
 use crate::mir::build::thir::{AdtExpr, AdtExprBase, AssignOp, ClosureExpr, Expr, ExprId, FieldExpr, FruInfo, LocalVarId, LogicalOp, MatchSource, Arm, ArmId};
 use crate::mir::build::{BuildResult, UnsupportedReason};
@@ -10,7 +10,7 @@ use crate::program::{DefId, DefKind};
 use crate::region_scope::{Node, ScopeData};
 use crate::typeck::adjustments::{Adjust, Adjustment};
 use crate::typeck::user_types::UserTypeKey;
-use crate::typeck::{Coerce, Res, PAT_KEY};
+use crate::typeck::{Coerce, Res};
 use crate::types::user_type::{CanonicalUserType, UserTypeKind};
 use crate::types::{Safety, TyId, TyKind};
 
@@ -290,7 +290,7 @@ impl Cx<'_> {
                     let arg = self.mirror_expr(x)?;
                     return self.overloaded_operator(e, m, Box::new([arg]), expr_ty);
                 }
-                let xe = ast::strip_paren_ref(ast, x);
+                let xe = super::strip_paren(ast, x);
                 match (op, ast.expr(xe).kind) {
                     (ast::UnOp::Neg, A::Lit(_)) => ExprKind::Literal { expr: xe, neg: true },
                     (ast::UnOp::Not, _) => ExprKind::Unary { op: MUnOp::Not, arg: self.mirror_expr(x)? },
@@ -507,7 +507,7 @@ impl Cx<'_> {
                     }
                 };
                 let ptr_ty = if mutable { tcx.tys.intern(TyKind::Ptr(true, expr_ty)) } else { self.ref_ty(false, expr_ty) };
-                let inner = if super::super::super::super::mir::transform::promote_consts::is_thread_local_static_def(prog, def) {
+                let inner = if crate::mir::transform::promote_consts::is_thread_local_static(prog, def) {
                     ExprKind::ThreadLocalRef(def)
                 } else {
                     ExprKind::StaticRef { def, ty: ptr_ty }
@@ -589,7 +589,7 @@ impl Cx<'_> {
             None => args,
         };
         // Tuple-like ADTs are represented as `ExprKind::Call`; we convert them here.
-        let callee_expr = ast::strip_paren_ref(ast, fun);
+        let callee_expr = super::strip_paren(ast, fun);
         if let (A::Path(_), Some(Res::Def(d))) = (ast.expr(callee_expr).kind, tb.res.get(&callee_expr.0).copied()) {
             if matches!(prog.def(d).kind, DefKind::Variant | DefKind::Struct) && matches!(tcx.tys.kind(expr_ty), TyKind::Adt(..)) {
                 let (adt, adt_args) = self.adt_args(expr_ty, span)?;
@@ -804,7 +804,7 @@ impl Cx<'_> {
             ExprKind::PointerCoercion { source: mirrored, cast: PointerCoercion::ArrayToPointer, is_from_as_cast: true }
         } else {
             // casting an enum variant's discriminant
-            let src = ast::strip_paren_ref(ast, source);
+            let src = super::strip_paren(ast, source);
             let discr = match (ast.expr(src).kind, tb.res.get(&src.0).copied(), tcx.tys.kind(source_ty)) {
                 (A::Path(_), Some(Res::Def(d)), TyKind::Adt(adt, _, _)) if prog.def(d).kind == DefKind::Variant => {
                     let idx = prog.def(d).sub;
@@ -834,6 +834,3 @@ impl Cx<'_> {
         }
     }
 }
-
-#[allow(dead_code)]
-fn _unused(_: PAT_KEY) {}

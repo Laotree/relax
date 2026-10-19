@@ -8,7 +8,7 @@ use super::range::{leaf_bits, scalar_size};
 use crate::ast::{ExprId, ExprKind, LitKind, UnOp};
 use crate::consts::{self, GenericArg, ScalarInt, ValTree, Value};
 use crate::mir::build::thir::{Cx, ErrorGuaranteed, FieldPat, Pat, PatKind, Pinnedness};
-use crate::mir::build::{BuildResult, UnsupportedReason};
+use crate::mir::build::BuildResult;
 use crate::mir::{FieldIdx, Span, VariantIdx};
 use crate::program::{DefId, Prim};
 use crate::tcx::{TypingEnv, TypingMode};
@@ -16,10 +16,6 @@ use crate::typeck::PAT_KEY;
 use crate::types::{TyId, TyKind, TypeFlags};
 
 impl Cx<'_> {
-    fn unresolved<T>(&self, span: Span, what: &'static str) -> BuildResult<T> {
-        Err(self.error(span, UnsupportedReason::UnresolvedFact(what)))
-    }
-
     /// Generic arguments of an ADT type's argument list (types and consts; lifetimes are region slots).
     pub(crate) fn generic_args_of(&self, args: crate::types::TyList) -> Vec<GenericArg> {
         let tys = &self.root.cx.tcx.tys;
