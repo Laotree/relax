@@ -74,6 +74,9 @@ pub struct Parser<'a> {
     pub body_origin: OSeg<'a, Maps>,
     /// tokens split by `eat_gt` (`>>` -> `>`), with their old value
     pub tok_undo: Vec<(u32, Tok)>,
+    /// opaque macro fragments a transcription forwarded (start of the first token -> end of the
+    /// last): a `$t:tt` matches one whole (rustc's interpolated nonterminal tokens)
+    pub frag_groups: crate::fxhash::HashMap<u32, u32>,
     /// file context for built-in macros (file!, module_path!, env!, cfg of derive inputs)
     pub bctx: Option<std::rc::Rc<crate::builtins::FileCtx>>,
     /// names of the inline `mod x { }` blocks being parsed (module_path!)
@@ -134,6 +137,7 @@ impl<'a> Parser<'a> {
             rules_exp: Default::default(),
             body_origin: Default::default(),
             tok_undo: Vec::new(),
+            frag_groups: Default::default(),
             bctx: None,
             mod_stack: Vec::new(),
             interp: Default::default(),
@@ -926,7 +930,7 @@ impl<'a> Parser<'a> {
             };
             match def {
                 Some(d) => {
-                    let (text, _, _) = self.expand_rules(&d, i + 2, z - 1).map_err(|m| PErr { pos: self.toks.at(a).lo, msg: m })?;
+                    let (text, _, _, _) = self.expand_rules(&d, i + 2, z - 1).map_err(|m| PErr { pos: self.toks.at(a).lo, msg: m })?;
                     // its own output may hold more calls: concat! re-expands it as an argument
                     out.push(if name == "concat" { text } else { format!("concat!({text})") });
                     any = true;
@@ -987,7 +991,7 @@ impl<'a> Parser<'a> {
         }
         let _profile = crate::load_profile::span(self.session.runtime.profile, "macro-rules-output", &def.name);
         let key = crate::parse_work::rules_key(self, def, call_lo, self.toks.at(toks.hi as usize).hi);
-        let (text, origins, bodies) = if let Some(x) = crate::parse_work::get_rules(&key) { x } else {
+        let (text, origins, bodies, groups) = if let Some(x) = crate::parse_work::get_rules(&key) { x } else {
             let x = crate::preload::timed_named(2, &def.name, || self.expand_rules(def, toks.lo as usize, toks.hi as usize)).map_err(|m| PErr { pos: call_lo, msg: m })?;
             crate::parse_work::put_rules(key, &x);
             x
@@ -998,6 +1002,9 @@ impl<'a> Parser<'a> {
         let base = (self.src.len() + self.ext.len()) as u32;
         for (off, o, n) in origins {
             self.tok_origin.push((base + off, o, n));
+        }
+        for (a, b) in groups {
+            self.frag_groups.insert(base + a, base + b);
         }
         let here = self.bctx.as_ref().map(|c| c.path.as_str()).unwrap_or("");
         let same_file = !def.def_file.is_empty() && def.def_file == here;
@@ -1182,6 +1189,7 @@ impl<'a> Parser<'a> {
 
     /// A `$s:stmt` fragment (no trailing `;` required).
     pub fn stmt_fragment(&mut self) -> PResult<()> {
+        let attrs = self.outer_attrs()?;
         if self.kind() == T::KwLet {
             self.pos += 1;
             self.pat_top()?;
@@ -1190,11 +1198,13 @@ impl<'a> Parser<'a> {
             }
             if self.eat(T::Eq) {
                 self.expr()?;
+                if self.eat(T::KwElse) {
+                    self.block()?;
+                }
             }
             return Ok(());
         }
         if self.at_item_start() {
-            let attrs = self.outer_attrs()?;
             self.item(attrs)?;
             self.extra_items.clear();
             return Ok(());
@@ -2980,10 +2990,10 @@ impl<'a> Parser<'a> {
         // `#[cfg(false)] try { .. }`: try blocks (unstable, `try_blocks`) parse only where cfg
         // stripping removes them (rustc_parse `parse_try_block`)
         if self.kind() == T::KwTry && self.nth(1) == T::OpenBrace && !attrs.is_empty() && !self.cfg_active(&attrs) {
-            self.parse_stripped(|p| p.stmt_after_attrs(attrs))?;
+            self.parse_stripped(|p| p.stmt_after_attrs(attrs, item_tok))?;
             return Ok(Stmt::Empty);
         }
-        let s = self.stmt_after_attrs(attrs.clone())?;
+        let s = self.stmt_after_attrs(attrs.clone(), item_tok)?;
         if matches!(s, Stmt::Item(_)) {
             let items = self.hosted_derives(&attrs, item_tok)?;
             self.extra_items.extend(items);
@@ -2999,7 +3009,8 @@ impl<'a> Parser<'a> {
         Ok(s)
     }
 
-    fn stmt_after_attrs(&mut self, attrs: Vec<Attr>) -> PResult<Stmt> {
+    /// `start`: the token the statement's attributes began at.
+    fn stmt_after_attrs(&mut self, attrs: Vec<Attr>, start: usize) -> PResult<Stmt> {
         if self.kind() == T::KwLet {
             self.pos += 1;
             let pat = self.pat_top()?;
@@ -3011,7 +3022,12 @@ impl<'a> Parser<'a> {
             } else {
                 (None, None)
             };
-            self.expect(T::Semi)?;
+            // a `$s:stmt` fragment forwarded into a block is a whole statement, its `;` not part of it
+            let start_lo = self.toks.at(start).lo;
+            let interpolated = self.frag_groups.get(&start_lo).is_some_and(|&end| end == self.prev_hi());
+            if !interpolated {
+                self.expect(T::Semi)?;
+            }
             let attrs = self.ast.push_list(attrs);
             let r = self.ast.push_row(LetStmt { attrs, pat, ty, init, else_ });
             return Ok(Stmt::Let(r));
@@ -4030,6 +4046,21 @@ impl ParsedFile {
         SourceSpan { file: 0, lo, hi }
     }
 
+    /// The path of the file whose text the tokens at `pos` were authored in, when that is not
+    /// this file's own (an `include!`d file's items), else None.
+    pub fn authored_path(&self, pos: u32) -> Option<String> {
+        let sources = self.sources.as_ref()?;
+        let span = source_origin(pos, true, self.src_len, |pos| {
+            let (to, em) = self.tables(pos);
+            let origins = if pos as usize >= self.src.len() {
+                self.part_at(pos).map_or(&self.token_origins, |p| &p.token_origins)
+            } else { &self.token_origins };
+            (to.into(), em.into(), origins.into())
+        }).ok()?;
+        if span.file == 0 { return None; }
+        sources.get(span.file).ok().map(|s| s.path.clone())
+    }
+
     /// Warm images use private source IDs until publication into their Program's registry.
     pub fn bind_sources(&mut self, path: &str, sources: &std::sync::Arc<SourceRegistry>) -> Result<(), String> {
         let Some(old) = &self.sources else { return Ok(()); };
@@ -4404,10 +4435,27 @@ pub fn parse_token_input(input: crate::builtins::Expansion, path: &str, edition:
     parse_owned_input(&ctx.cfg.session, own.src.to_vec(), None, edition, macros, &ctx.krate, Some(ctx.clone()), lazy, Some(input), Some(sources))
 }
 
-pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: Vec<u8>, pre: Option<Vec<Tok>>, edition: u16, macros: Option<crate::macros::MacroScope>, krate: &str, bctx: Option<std::rc::Rc<crate::builtins::FileCtx>>, lazy: bool,
+pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: Vec<u8>, mut pre: Option<Vec<Tok>>, edition: u16, macros: Option<crate::macros::MacroScope>, krate: &str, bctx: Option<std::rc::Rc<crate::builtins::FileCtx>>, lazy: bool,
     input: Option<crate::builtins::Expansion>, sources: Option<std::sync::Arc<SourceRegistry>>,
 ) -> Result<(ParsedFile, Option<crate::macros::MacroUse>), (SourceSpan, String)> {
     let sources = Some(sources.unwrap_or_default());
+    // identifiers are compared in NFC (rustc_parse lexer nfc_normalize) and a raw lifetime is its
+    // plain one: a file that spells one otherwise is parsed with it rewritten, its tokens moved
+    // along
+    if input.is_none() {
+        let mut toks = match pre.take() {
+            Some(t) => t,
+            None => {
+                let mut toks = Vec::with_capacity(src.len() / 4);
+                crate::lexer::lex(&src, edition, &mut toks).map_err(|e| (SourceSpan { file: 0, lo: e.pos, hi: e.pos }, e.msg.to_string()))?;
+                toks
+            }
+        };
+        if let Some(normal) = crate::nfc::normalize_identifiers(&src, &mut toks) {
+            src = normal;
+        }
+        pre = Some(toks);
+    }
     let src_len = src.len() as u32;
     let token_input = input.is_some();
     let (toks, ast, ext, exp_map, tok_origin, token_origins, rules_exp, body_origin, used, lazy) = {

@@ -514,6 +514,10 @@ pub struct Program {
     pub demand_plan: Option<std::sync::Arc<crate::preload::DemandPlan>>,
     pub load_recipe: Vec<crate::preload::PreCrate>,
     pub module_probes: Vec<(String, bool)>,
+    /// per module being collected: the folder its `mod x;` items resolve in and whether that
+    /// folder is the module file's own (rustc ModuleData::dir_path / DirOwnership); the modules
+    /// of a fn body's blocks take their enclosing module's
+    mod_dirs: crate::fxhash::HashMap<u32, (String, bool)>,
     source_versions: HashMap<u32, std::sync::Arc<crate::source_context::Context>>,
     /// Files committed by a live edit (commit_version). Their parse is eager (ParseSnapshot::
     /// parse_full), so their expression and block ids differ from a boot parse of the same
@@ -745,6 +749,7 @@ impl Program {
             demand_plan: None,
             load_recipe: Vec::new(),
             module_probes: Vec::new(),
+            mod_dirs: Default::default(),
             source_versions: Default::default(),
             edit_versions: Vec::new(),
             check_files: None,
@@ -2375,6 +2380,7 @@ impl Program {
         let _profile = crate::load_profile::span(self.session.runtime.profile, "scope-collect", &self.file_paths[file as usize]);
         let krate = self.mods[module as usize].krate;
         let mod_def = self.mods[module as usize].def;
+        self.mod_dirs.insert(module, (dir.to_string(), mod_rs));
         for &iid in items {
             let (attrs_active, kind_tag) = {
                 let it = self.files[file as usize].ast.item(iid);
@@ -2511,9 +2517,25 @@ impl Program {
                         ItemKind::Mod(Some(items)) => Some(self.files[file as usize].ast.list(*items).to_vec()),
                         _ => None,
                     };
+                    // rustc_builtin_macros source_util.rs `include!`: the items of an included file
+                    // resolve their `mod x;` in that file's folder (the module's relative
+                    // ownership is kept)
+                    let included;
+                    let dir = match self.files[file as usize].authored_path(self.files[file as usize].ast.item(iid).lo) {
+                        Some(p) if p != self.file_paths[file as usize] => {
+                            included = if mod_rs { dir_of(&p).to_string() } else { format!("{}/{}", dir_of(&p), dir.rsplit('/').next().unwrap_or("")) };
+                            included.as_str()
+                        }
+                        _ => dir,
+                    };
                     match inline {
                         Some(inner) => {
-                            let d2 = if !path_attr.is_empty() { crate::crates::join_path(dir, &path_attr[0]) } else { format!("{}/{}", dir, sname) };
+                            // rustc_expand module.rs mod_dir_path: an inline module's `#[path]` is a folder
+                            // relative to the module file's own folder
+                            let d2 = if !path_attr.is_empty() {
+                                let fdir = if mod_rs { dir.to_string() } else { dir_of(&self.file_paths[file as usize]).to_string() };
+                                crate::crates::join_path(&fdir, &path_attr[0])
+                            } else { format!("{}/{}", dir, sname) };
                             self.collect_items(file, &inner, m, &d2, true)?;
                         }
                         None => {
@@ -2756,7 +2778,8 @@ impl Program {
             if let Some(o) = owner {
                 self.block_owner.insert(inner, o);
             }
-            self.collect_items(file, &items, inner, ".", true)?;
+            let (dir, mod_rs) = self.mod_dirs.get(&module).cloned().unwrap_or_else(|| (".".to_string(), true));
+            self.collect_items(file, &items, inner, &dir, mod_rs)?;
         }
         for sb in subs {
             self.collect_block_items(file, sb, inner, owner)?;

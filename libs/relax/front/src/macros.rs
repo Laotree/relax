@@ -1967,7 +1967,8 @@ pub enum Bind {
     /// a matched fragment: token index range in the parser's token list
     /// token index range; the source span of a leading part of the token at the range's end that
     /// the fragment consumed (`>` of a `>>` it split: rustc break_and_eat)
-    One(usize, usize, Frag, Option<(u32, u32)>),
+    /// The last: transcribed without parentheses (an expression that is complete as a statement).
+    One(usize, usize, Frag, Option<(u32, u32)>, bool),
     Seq(Vec<Bind>),
 }
 
@@ -2023,7 +2024,7 @@ impl<'a> Parser<'a> {
     }
 
     /// One fragment at token `i` (ending by `end`): its end index.
-    fn match_frag(&mut self, f: Frag, i: usize, end: usize) -> Option<(usize, Option<(u32, u32)>)> {
+    fn match_frag(&mut self, f: Frag, i: usize, end: usize) -> Option<(usize, Option<(u32, u32)>, bool)> {
         if i > end {
             return None;
         }
@@ -2031,19 +2032,19 @@ impl<'a> Parser<'a> {
         match f {
             Frag::Ident => {
                 if i < end && (matches!(k, T::Ident | T::RawIdent) || (T::KwAs as u8..=T::KwTry as u8).contains(&(k as u8))) && self.tok_text(self.toks.at(i)) != b"_" {
-                    Some((i + 1, None))
+                    Some((i + 1, None, false))
                 } else {
                     None
                 }
             }
-            Frag::Lifetime => (i < end && k == T::Lifetime).then_some((i + 1, None)),
+            Frag::Lifetime => (i < end && k == T::Lifetime).then_some((i + 1, None, false)),
             Frag::Literal => {
                 let mut j = i;
                 if j < end && self.toks.at(j).kind == T::Minus {
                     j += 1;
                 }
                 if j < end && matches!(self.toks.at(j).kind, T::Int | T::Float | T::Str | T::ByteStr | T::CStr | T::RawStr | T::Char | T::Byte | T::KwTrue | T::KwFalse) {
-                    Some((j + 1, None))
+                    Some((j + 1, None, false))
                 } else {
                     None
                 }
@@ -2052,17 +2053,21 @@ impl<'a> Parser<'a> {
                 if i >= end {
                     return None;
                 }
+                let tok_lo = self.toks.at(i).lo;
+                if let Some(&group_end) = self.frag_groups.get(&tok_lo) {
+                    return (i..end).find(|&j| self.toks.at(j).hi == group_end).map(|j| (j + 1, None, false));
+                }
                 if is_open(k) {
-                    self.tok_close_of(i, end).map(|c| (c + 1, None))
+                    self.tok_close_of(i, end).map(|c| (c + 1, None, false))
                 } else if is_close(k) {
                     None
                 } else {
-                    Some((i + 1, None))
+                    Some((i + 1, None, false))
                 }
             }
             Frag::Block => {
                 if i < end && k == T::OpenBrace {
-                    self.tok_close_of(i, end).map(|c| (c + 1, None))
+                    self.tok_close_of(i, end).map(|c| (c + 1, None, false))
                 } else {
                     None
                 }
@@ -2070,11 +2075,11 @@ impl<'a> Parser<'a> {
             Frag::Vis => {
                 if i < end && k == T::KwPub {
                     if i + 1 < end && self.toks.at(i + 1).kind == T::OpenParen {
-                        return self.tok_close_of(i + 1, end).map(|c| (c + 1, None));
+                        return self.tok_close_of(i + 1, end).map(|c| (c + 1, None, false));
                     }
-                    return Some((i + 1, None));
+                    return Some((i + 1, None, false));
                 }
-                Some((i, None))
+                Some((i, None, false))
             }
             _ => {
                 if i >= end {
@@ -2086,8 +2091,15 @@ impl<'a> Parser<'a> {
                 // a fragment match only checks syntax: macro calls inside it are not expanded
                 // (rustc_expand mbe/macro_parser.rs parses nonterminals without expanding)
                 let macros = self.macros.take();
+                let mut bare = false;
                 let r: PResult<()> = match f {
-                    Frag::Expr => self.expr().map(|_| ()),
+                    Frag::Expr => self.expr().map(|id| {
+                        // rustc_ast classify::expr_requires_semi_to_be_stmt: such an expression
+                        // is its own statement where the fragment starts one
+                        { use crate::ast::ExprKind as K; bare = matches!(self.ast.expr(id).kind, K::If(..) | K::Match(..) | K::Block(..) | K::Unsafe(..) | K::ConstBlock(..) | K::While(..) | K::Loop(..) | K::For(..)); }
+                    }),
+                    // `...` is no type start (rustc Token::can_begin_type): only a C-variadic parameter
+                    Frag::Ty if k == T::DotDotDot => Err(crate::parser::PErr { pos: self.toks.at(i).lo, msg: "expected a type".to_string() }),
                     Frag::Ty => self.ty().map(|_| ()),
                     Frag::Pat => self.pat_top().map(|_| ()),
                     Frag::PatParam => self.pat_no_or().map(|_| ()),
@@ -2115,9 +2127,20 @@ impl<'a> Parser<'a> {
                         taken = Some((t.lo, self.toks.at(e).lo));
                     }
                 }
-                if ok { Some((e, taken.map(|(a, b)| (a, b)))) } else { None }
+                if ok { Some((e, taken, bare || (f == Frag::Expr && self.is_macro_call(i, e)))) } else { None }
             }
         }
+    }
+
+    /// Are tokens `[lo, hi)` one macro call `path ! (..)`?
+    fn is_macro_call(&self, lo: usize, hi: usize) -> bool {
+        let mut i = lo;
+        if i < hi && self.toks.at(i).kind == T::PathSep { i += 1; }
+        while i < hi && matches!(self.toks.at(i).kind, T::Ident | T::RawIdent | T::KwCrate | T::KwSelfValue | T::KwSuper) {
+            i += 1;
+            if i < hi && self.toks.at(i).kind == T::PathSep { i += 1; } else { break; }
+        }
+        i < hi && self.toks.at(i).kind == T::Not && i + 1 < hi && is_open(self.toks.at(i + 1).kind) && self.tok_close_of(i + 1, hi) == Some(hi - 1)
     }
 
     fn match_seq(&mut self, nodes: &[MNode], i: &mut usize, end: usize, binds: &mut HashMap<String, Bind>) -> bool {
@@ -2144,8 +2167,8 @@ impl<'a> Parser<'a> {
                     *i = c + 1;
                 }
                 MNode::Var(name, f) => match self.match_frag(*f, *i, end) {
-                    Some((e, taken)) => {
-                        binds.insert(name.clone(), Bind::One(*i, e, *f, taken));
+                    Some((e, taken, bare)) => {
+                        binds.insert(name.clone(), Bind::One(*i, e, *f, taken, bare));
                         *i = e;
                     }
                     None => return false,
@@ -2210,17 +2233,24 @@ impl<'a> Parser<'a> {
                     out.push(&c.text, None, c.pos);
                 }
                 TNode::Var(v) => match Self::lookup_bind(binds, v, idx) {
-                    Some(Bind::One(lo, hi, f, taken)) => {
-                        let wrap = *f == Frag::Expr && hi - lo + usize::from(taken.is_some()) > 1;
+                    Some(Bind::One(lo, hi, f, taken, bare)) => {
+                        let wrap = *f == Frag::Expr && hi - lo + usize::from(taken.is_some()) > 1 && !*bare;
                         if wrap {
                             out.push("(", None, u32::MAX);
                         }
+                        let group_start = out.s.len() + 1;
                         for k in *lo..*hi {
                             let t = self.toks.at(k);
                             out.push(&String::from_utf8_lossy(self.tok_text(t)), Some(t.lo), u32::MAX);
                         }
                         if let Some((a, b)) = *taken {
                             out.push(&String::from_utf8_lossy(self.bytes(a, b)), Some(a), u32::MAX);
+                        }
+                        // a fragment of one of these kinds stays one token tree where the
+                        // expansion is matched again (`$i:item` forwarded to `$t:tt`)
+                        let opaque = !wrap && !matches!(f, Frag::Ident | Frag::Lifetime | Frag::Tt);
+                        if opaque && out.s.len() > group_start && hi - lo + usize::from(taken.is_some()) > 1 {
+                            out.groups.push((group_start as u32, out.s.len() as u32));
                         }
                         if wrap {
                             out.push(")", None, u32::MAX);
@@ -2323,7 +2353,7 @@ impl<'a> Parser<'a> {
     /// Expands a call of macro `def` with arguments in tokens [lo, hi): the expansion text
     /// (tokens joined by spaces) and, per token substituted from a fragment, (offset in the
     /// text, the fragment token's position) -- or an error naming the macro.
-    pub fn expand_rules(&mut self, def: &MacroDef, lo: usize, hi: usize) -> Result<(String, Vec<(u32, u32, u32)>, Vec<(u32, u32, u32)>), String> {
+    pub fn expand_rules(&mut self, def: &MacroDef, lo: usize, hi: usize) -> Result<crate::parse_work::Rules, String> {
         let _profile = crate::load_profile::span(self.session.runtime.profile, "macro-rules", &def.name);
         let (lo, hi) = self.desugar_doc_comments(lo, hi);
         for (matcher, body) in &def.arms {
@@ -2336,7 +2366,7 @@ impl<'a> Parser<'a> {
                 let mut out = Transcript::default();
                 self.transcribe(body, &binds, &mut Vec::new(), &krate_path, &mut out)?;
                 out.s.push(' ');
-                return Ok((out.s, out.origins, out.bodies));
+                return Ok((out.s, out.origins, out.bodies, out.groups));
             }
         }
         Err(format!("no rule of `{}!` matches these arguments -- check the macro's patterns", def.name))
@@ -2351,6 +2381,7 @@ struct Transcript {
     s: String,
     origins: Vec<(u32, u32, u32)>,
     bodies: Vec<(u32, u32, u32)>,
+    groups: Vec<(u32, u32)>,
 }
 
 impl Transcript {
