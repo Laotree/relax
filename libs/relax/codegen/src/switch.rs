@@ -275,6 +275,25 @@ impl Emit<'_> {
     fn reg(&mut self) -> VReg {
         self.f.vreg(Cls::I)
     }
+    /// `c = x <cond> k`: an immediate form where the back ends encode `k` (a signed 32-bit
+    /// immediate), else against a constant register.
+    fn cmp_k(&mut self, b: u32, cond: Cond, signed: bool, c: VReg, x: VReg, k: i64) {
+        if k as i32 as i64 == k {
+            self.int(b, Inst::ICmpI(cond, signed, c, x, k));
+        } else {
+            let kr = self.iconst(b, k);
+            self.int(b, Inst::ICmp(cond, signed, c, x, kr));
+        }
+    }
+    /// `d = x - k` (64-bit), as `cmp_k`.
+    fn sub_k(&mut self, b: u32, d: VReg, x: VReg, k: i64) {
+        if k as i32 as i64 == k {
+            self.int(b, Inst::IBinI(IOp::Sub, U64, d, x, k));
+        } else {
+            let kr = self.iconst(b, k);
+            self.int(b, Inst::IBin(IOp::Sub, U64, d, x, kr));
+        }
+    }
     fn iconst(&mut self, b: u32, k: i64) -> VReg {
         let r = self.reg();
         self.int(b, Inst::Iconst(r, k));
@@ -303,15 +322,15 @@ impl Emit<'_> {
                 let x = self.x;
                 let (rl, rh) = (dec(lo, signed), dec(hi, signed));
                 if lo == hi {
-                    self.int(b, Inst::ICmpI(Cond::Eq, false, c, x, rl));
+                    self.cmp_k(b, Cond::Eq, false, c, x, rl);
                 } else if lo == 0 {
-                    self.int(b, Inst::ICmpI(Cond::Le, signed, c, x, rh));
+                    self.cmp_k(b, Cond::Le, signed, c, x, rh);
                 } else if hi == u64::MAX {
-                    self.int(b, Inst::ICmpI(Cond::Ge, signed, c, x, rl));
+                    self.cmp_k(b, Cond::Ge, signed, c, x, rl);
                 } else {
                     let t = self.reg();
-                    self.int(b, Inst::IBinI(IOp::Sub, U64, t, x, rl));
-                    self.int(b, Inst::ICmpI(Cond::Le, false, c, t, hi.wrapping_sub(lo) as i64));
+                    self.sub_k(b, t, x, rl);
+                    self.cmp_k(b, Cond::Le, false, c, t, hi.wrapping_sub(lo) as i64);
                 }
                 self.f.blocks[b as usize].term = Term::Branch(c, to, no);
             }
@@ -320,16 +339,16 @@ impl Emit<'_> {
                 let ge = self.block_for(*ge);
                 let c = self.reg();
                 let x = self.x;
-                self.int(b, Inst::ICmpI(Cond::Lt, signed, c, x, dec(pivot, signed)));
+                self.cmp_k(b, Cond::Lt, signed, c, x, dec(pivot, signed));
                 self.f.blocks[b as usize].term = Term::Branch(c, lt, ge);
             }
             Node::Bits { lo, span, groups, default } => {
                 // t = x - lo; if t > span - 1 { default }; then per target: (mask >> t) & 1
                 let x = self.x;
                 let t = self.reg();
-                self.int(b, Inst::IBinI(IOp::Sub, U64, t, x, dec(lo, signed)));
+                self.sub_k(b, t, x, dec(lo, signed));
                 let inr = self.reg();
-                self.int(b, Inst::ICmpI(Cond::Le, false, inr, t, span as i64 - 1));
+                self.cmp_k(b, Cond::Le, false, inr, t, span as i64 - 1);
                 let n = groups.len();
                 let blocks: Vec<u32> = groups
                     .iter()

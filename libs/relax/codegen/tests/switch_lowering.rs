@@ -129,7 +129,15 @@ fn build(arms: &[Vec<Vec<T>>]) -> Func {
 
 fn rand_arms(r: &mut Rng, span: u64, signed: bool) -> Vec<Vec<Vec<T>>> {
     let n = 2 + r.below(14) as usize;
-    let base = if r.below(3) == 0 { -(span as i64) / 2 } else { r.below(300) as i64 };
+    // small values, negative ones, and ones around the 32-bit immediate limits of the back ends
+    let base = match r.below(6) {
+        0 => -(span as i64) / 2,
+        1 => 0x7fff_ff00 + r.below(200) as i64 - 100,
+        2 => 0xffff_ff00u32 as i64 + r.below(200) as i64 - 100,
+        3 => -0x8000_0000 - r.below(100) as i64,
+        4 => i64::MAX - r.below(200) as i64 - span as i64,
+        _ => r.below(300) as i64,
+    };
     let mut arms = Vec::new();
     for _ in 0..n {
         let nalt = 1 + r.below(3) as usize;
@@ -175,6 +183,21 @@ fn switch_lowering_matches_the_compare_chain() {
         let mut xs: Vec<u64> = vec![0, 1, u64::MAX, u64::MAX - 1, i64::MAX as u64, i64::MIN as u64, (i64::MIN as u64) + 1, 1 << 32, (1 << 32) - 1];
         for v in -400i64..4200 {
             xs.push(v as u64);
+        }
+        for alts in &arms {
+            for alt in alts {
+                for t in alt {
+                    for d in -2i64..=2 {
+                        xs.push(t.k.wrapping_add(d) as u64);
+                    }
+                }
+            }
+        }
+        for t in arms.iter().flatten().flatten() {
+            for off in 0..40i64 {
+                xs.push(t.k.wrapping_add(off) as u64);
+                xs.push(t.k.wrapping_sub(off) as u64);
+            }
         }
         for regs in [false, true] {
             let code = Code::new(&compile(&options, &f, regs)).unwrap();
