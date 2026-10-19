@@ -211,14 +211,14 @@ fn cross_check(source: &str, edition: u16, extended: bool, tail: bool) -> bool {
         return endings[0].lo == pf.ast.block(BlockId(id)).hi - 1;
     } else if tail && edition == 2024 {
         assert_eq!(data.node, Node::Expr(expr(&p, &b, "f().0").0));
-        // Tail cleanup happens under the tail's source span.
+        // rustc's cleanup span is the end point of the scope's node (builder/scope.rs `end_point`).
         let e = pf.ast.expr(temp_expr);
-        assert!(endings[0].lo <= e.lo && endings[0].hi >= e.hi, "{:?}", endings);
+        assert!(endings[0].lo >= e.hi - 1, "{:?}", endings);
     } else {
         assert!(matches!(data.node, Node::Statement(_)), "{data:?}");
-        // The builder retains the whole statement's expression span for this cleanup.
+        // rustc's cleanup span is the end point of the statement (its `;`).
         let e = pf.ast.expr(temp_expr);
-        assert!(endings[0].lo <= e.lo && endings[0].hi >= e.hi, "{:?}", endings);
+        assert!(endings[0].lo >= e.hi - 1, "{:?}", endings);
     }
     true
 }
@@ -235,10 +235,10 @@ fn region_scope_builder_cross_check() {
 }
 #[test]
 fn region_scope_builder_explicit_ref_projection_disagreement() {
-    // rustc check/region.rs:521,702 extends the whole ET chain. The old builder's
-    // !is_place_expr guard (build.rs:950) misses a projected rvalue here.
+    // rustc check/region.rs:521,702 extends the whole ET chain. The MIR builder follows rustc, so
+    // the scope tree and the builder agree (the deleted BIR builder's guard missed this case).
     for ed in [2021, 2024] {
-        assert!(!cross_check("fn f() -> (u32,) { (1,) } fn probe() { let ref x = f().0; }", ed, true, false));
+        assert!(cross_check("fn f() -> (u32,) { (1,) } fn probe() { let ref x = f().0; }", ed, true, false));
     }
 }
 #[test]

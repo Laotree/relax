@@ -1353,7 +1353,7 @@ fn round41_preempted_typeck_can_be_checked_later() {
 
 #[test]
 fn round42_borrowck_forwards_preemption_after_typeck() {
-    let (prog, mut tcx) = program("#[lang = \"copy\"] trait Copy {} fn target<T>(x: T) { let y = x; }", "borrowck_preempt");
+    let (prog, mut tcx) = program("#[lang = \"sized\"] trait Sized {} #[lang = \"copy\"] trait Copy {} fn target<T>(x: T) { let y = x; }", "borrowck_preempt");
     tcx.copy_trait = Some(named(&prog, "Copy"));
     let def = named(&prog, "target");
     let body = tcx.typeck(&prog, def);

@@ -25,6 +25,8 @@ use crate::mir::build::{build_mir, BuildCx, BuildRoot};
 use crate::mir::move_paths::MoveData;
 use crate::mir::transform::{mir_promoted, qualifs::ConstQualifsProvider, qualifs::{Blocked, ConstQualifs}};
 use crate::mir::{Body, BodyKind, ClosureId, Span};
+// has_loans: rustc passes `borrow_set.len() != 0`, built from the renumbered body; type_check_body renumbers
+// inside, so the driver passes `true` (always compute liveness for loans) -- a perf difference, not a verdict one.
 use crate::program::{DefId, Program};
 use crate::tcx::{EvalCx, Tcx, TypingEnv};
 use crate::typeck;
@@ -36,7 +38,7 @@ struct Prepared<'a> {
     owner: CheckedBody,
     key: ClauseOwner,
     nested: bool,
-    mir: Body,
+    mir: Box<Body>,
     moves: MoveData,
     sig: SignatureRegions,
     infcx: BorrowckInferCtxt<'a>,
@@ -99,7 +101,7 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
     let children = body::const_children(prog, tcx, typeck);
 
     // S3/S4 build, S5 promote. Any stop unchecks the root (see the module doc).
-    let mut built: Vec<(CheckedBody, Body)> = Vec::new();
+    let mut built: Vec<(CheckedBody, Box<Body>)> = Vec::new();
     for &owner in owners.iter().chain(children.iter()) {
         crate::preempt::point();
         let mir = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_mir(&root, owner))) {
@@ -111,11 +113,11 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
                 return v;
             }
         };
-        built.push((owner, mir));
+        built.push((owner, Box::new(mir)));
     }
     let provider = ConstProvider;
     for (owner, mir) in &mut built {
-        match mir_promoted(prog, tcx, env, &provider, mir) {
+        match mir_promoted(prog, tcx, env, &provider, &mut **mir) {
             Ok(pre) => {
                 for e in pre.const_errors {
                     let mut d = diagnostics::Diag::new(e.code, e.span, e.message);
@@ -132,7 +134,6 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
     built.truncate(n_checked);
 
     // MoveData, signature regions, inference contexts, MIR type check.
-    let copy = |ty: TyId| !tcx.type_is_copy_modulo_regions(prog, &eval, typeck.def, ty);
     let mut prepared: Vec<Prepared<'_>> = Vec::new();
     let mut parents: Vec<(u32, SignatureRegions)> = Vec::new();
     let item_sig = match SignatureRegions::function(tcx, prog, typeck.def) {
@@ -159,11 +160,10 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
             }
             _ => (item_sig.clone(), ClauseOwner::Def(typeck.def), false),
         };
-        let moves = MoveData::gather_moves(&mir, prog, tcx, env, &copy);
+        let moves = MoveData::gather_moves(&mir, prog, tcx, env, &|_| true);
         let mut infcx = BorrowckInferCtxt::new(tcx, prog, typeck.def, typeck.def, &typeck.args);
-        let borrow_count = BorrowSet::build(tcx, &mir, matches!(mir.source.kind, BodyKind::Fn | BodyKind::Closure(_)), &moves).len();
-        let input = MirNllInput { sig: &sig, nested, def_span: mir.span, moves: &moves, has_loans: borrow_count != 0 };
-        let tc = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| type_check_body(tcx, prog, &mut infcx, &mut mir, &input))) {
+        let input = MirNllInput { sig: &sig, nested, def_span: mir.span, moves: &moves, has_loans: true };
+        let tc = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| type_check_body(tcx, prog, &mut infcx, &mut *mir, &input))) {
             Ok(tc) => tc,
             Err(p) => {
                 if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); }

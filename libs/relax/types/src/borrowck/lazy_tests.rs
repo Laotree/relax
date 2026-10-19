@@ -3,7 +3,7 @@ use super::super::event::{admit, app_crate, set_app_scope};
 use std::sync::Barrier;
 use std::time::Duration;
 
-const SOURCE: &str = "fn a(x: &mut i32) { let p = &mut *x; let q = &mut *x; *p = 1; *q = 2; }\nfn b(x: &mut i32) { let p = &mut *x; let q = &mut *x; *p = 1; *q = 2; }\nfn c(x: &mut i32) { let p = &mut *x; let q = &mut *x; *p = 1; *q = 2; }\nfn clean() {}\nfn bad(x: &mut i32) { let p = &*x; let q = &mut *x; let z = *p; *q = z; }\nfn typefail() { let n: i32 = false; }\n";
+const SOURCE: &str = "#[lang = \"sized\"] trait Sized {} #[lang = \"copy\"] trait Copy {} impl Copy for i32 {} impl Copy for bool {} fn a(x: &mut i32) { let p = &mut *x; let q = &mut *x; *p = 1; *q = 2; }\nfn b(x: &mut i32) { let p = &mut *x; let q = &mut *x; *p = 1; *q = 2; }\nfn c(x: &mut i32) { let p = &mut *x; let q = &mut *x; *p = 1; *q = 2; }\nfn clean() {}\nfn bad(x: &mut i32) { let p = &*x; let q = &mut *x; let z = *p; *q = z; }\nfn typefail() { let n: i32 = false; }\n";
 
 // The worker and event bus are process-wide, as in the compiler's settle harness.
 fn child(name: &str) -> bool {
@@ -88,7 +88,7 @@ fn events_arrive_per_fn_before_queue_drains() {
         let def = named(&front.prog, name);
         assert_eq!(ev.error.fn_path, front.prog.def_path(def));
         assert_eq!(ev.error.file, front.prog.file_paths[front.prog.def(def).file as usize]);
-        assert_eq!((ev.error.line, ev.error.col, ev.error.code), (i as u32 + 1, 46, "E0499"));
+        assert_eq!((ev.error.line, ev.error.col, ev.error.code), (i as u32 + 1, if i == 0 { 153 } else { 46 }, "E0499"));
         assert_eq!(ev.origin, Origin::Background);
     }
     front.entered.wait();
