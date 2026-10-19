@@ -847,7 +847,8 @@ pub mod obligations {
         state.errors.replace(Some(Vec::new()));
         let cx = crate::tcx::EvalCx::new(w.prog, w.tcx, crate::tcx::TypingEnv::fully_monomorphized(w.prog), &state);
         let mut any = false;
-        let mut k = 0usize;
+        // (a trait's first type slot is `Self`)
+        let mut k = usize::from(def.kind == DefKind::Trait);
         for p in ast.list(generics.params) {
             match p.kind {
                 ast::GenericParamKind::Lifetime(_) => continue,
@@ -870,11 +871,28 @@ pub mod obligations {
             let flags = q.flags(&w.tcx.tys);
             // a clause with several parameters or any region is not checked (the other params may be given)
             if flags & TypeFlags::HAS_RE_PARAM.bits() != 0 || flags & TypeFlags::HAS_RE_BOUND.bits() != 0 { continue; }
+            // several parameters in one clause: the others may be given, so it is not checked
+            if count_params(&w.tcx.tys, q) > 1 { continue; }
             let inst = w.tcx.instantiate_predicate(w.prog, w.def, &args, q);
             if inst.flags(&w.tcx.tys) & (TypeFlags::HAS_PARAM.bits() | TypeFlags::HAS_BOUND_VARS.bits() | TypeFlags::HAS_ANY_INFER.bits()) != 0 { continue; }
             if own.iter().any(|o| *o == inst) { continue; }
             if !matches!(inst.kind, PredicateKind::Clause(ClauseKind::Trait(_))) { continue; }
             w.register(Goal { param_env: w.env.clone(), predicate: inst }, item.lo);
         }
+    }
+
+    /// The number of distinct type / const parameters a clause mentions.
+    fn count_params(tys: &crate::types::Types, p: &Predicate) -> usize {
+        use crate::types::fold::{TypeFolder, super_fold_ty}; use crate::next_solver::fold::fold_predicate;
+        struct C(std::collections::HashSet<u32>);
+        impl TypeFolder for C {
+            fn fold_ty(&mut self, tys: &crate::types::Types, t: TyId, depth: u32) -> TyId {
+                if let TyKind::Param(i) = tys.kind(t) { self.0.insert(*i); }
+                super_fold_ty(tys, t, self, depth)
+            }
+        }
+        let mut c = C(Default::default());
+        fold_predicate(tys, p, &mut c);
+        c.0.len()
     }
 }
