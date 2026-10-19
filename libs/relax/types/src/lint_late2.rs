@@ -356,6 +356,83 @@ impl<'a> L2<'a> {
     }
 }
 
+// ---------------------------------------------------------------- const_item_mutation
+
+impl<'a> L2<'a> {
+    /// The root of a place expression that is mutably used, when it is a `const` item (or a
+    /// const parameter) reached by field / builtin index projections only: (the const's path
+    /// expression, whether a projection is overloaded `IndexMut`). None: a dereference
+    /// is involved (the mutation goes through a pointer), or the root is no constant.
+    fn const_place_root(&self, e: ExprId) -> Option<(ExprId, bool)> {
+        let e = unparen(self.ast, e);
+        match self.ast.expr(e).kind {
+            ExprKind::Path(_) => match self.body.res.get(&e.0).copied() {
+                Some(Res::Def(d)) if matches!(self.prog.def(d).kind, DefKind::Const | DefKind::AssocConst) => Some((e, false)),
+                Some(Res::ConstParam(_)) => Some((e, false)),
+                _ => None,
+            },
+            ExprKind::Field(b, _) | ExprKind::TupleField(b, _) => {
+                // a field of a reference or a smart pointer is reached through a dereference
+                let t = self.expr_ty(b)?;
+                if !matches!(self.kind(t), TyKind::Adt(..) | TyKind::Tuple(_)) { return None; }
+                if self.body.ov_derefs.get(&(b.0, 0)).is_some() || self.body.ov_derefs.get(&(e.0, 0)).is_some() { return None; }
+                self.const_place_root(b)
+            }
+            ExprKind::Index(b, _) => {
+                if self.body.ov_index.get(&e.0).is_some() {
+                    return self.const_place_root(b).map(|(r, _)| (r, true));
+                }
+                let t = self.expr_ty(b)?;
+                if !matches!(self.kind(t), TyKind::Array(..)) { return None; }
+                self.const_place_root(b)
+            }
+            _ => None,
+        }
+    }
+
+    fn const_has_dtor(&self, root: ExprId) -> bool {
+        let Some(Res::Def(d)) = self.body.res.get(&root.0).copied() else { return false };
+        let Some(t) = self.tcx.const_ty(self.prog, d) else { return false };
+        match self.kind(t) {
+            TyKind::Adt(a, ..) => self.tcx.adt_destructor(a).is_some(),
+            _ => false,
+        }
+    }
+
+    fn lint_const_mutation(&self, e: ExprId) {
+        const MODIFY: &str = "attempting to modify a `const` item";
+        const BORROW: &str = "taking a mutable reference to a `const` item";
+        let ast = self.ast;
+        let pos = ast.expr(e).lo;
+        match ast.expr(e).kind {
+            ExprKind::Assign(l, _) | ExprKind::AssignOp(_, l, _) => {
+                let overloaded_op = matches!(ast.expr(e).kind, ExprKind::AssignOp(..)) && self.body.binops.get(&e.0).is_some();
+                let Some((root, over)) = self.const_place_root(l) else { return };
+                if overloaded_op {
+                    self.emit(&CONST_ITEM_MUTATION, pos, BORROW);
+                } else if over {
+                    self.emit(&CONST_ITEM_MUTATION, pos, BORROW);
+                } else if unparen(ast, l) != root && !self.const_has_dtor(root) {
+                    self.emit(&CONST_ITEM_MUTATION, pos, MODIFY);
+                }
+            }
+            ExprKind::AddrOf(false, true, x) => {
+                if self.const_place_root(x).is_some() { self.emit(&CONST_ITEM_MUTATION, pos, BORROW); }
+            }
+            ExprKind::MethodCall(r, _) => {
+                let Some(m) = self.body.methods.get(&e.0) else { return };
+                if m.autoref != 2 { return; }
+                if m.derefs > 0 {
+                    let overloaded = [e.0, r.0, unparen(ast, r).0].iter().any(|k| self.body.ov_derefs.get(&(*k, 0)).is_some());
+                    if !overloaded { return; }
+                }
+                if self.const_place_root(r).is_some() { self.emit(&CONST_ITEM_MUTATION, pos, BORROW); }
+            }
+            _ => {}
+        }
+    }
+}
+
 impl<'a> Visitor<'a> for L2<'a> {
     fn ast(&self) -> &'a Ast { self.ast }
     fn enter_attrs(&mut self, attrs: List<Attr>) { self.stack.extend_from_slice(self.ast.list(attrs)); }
@@ -385,6 +462,7 @@ impl<'a> Visitor<'a> for L2<'a> {
     fn expr(&mut self, e: ExprId) {
         let ast = self.ast;
         if self.active && !self.inside_call_args { self.lint_temporary(e); }
+        self.lint_const_mutation(e);
         match ast.expr(e).kind {
             ExprKind::Call(f, args) => {
                 self.expr(f);
