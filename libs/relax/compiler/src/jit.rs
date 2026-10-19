@@ -13167,7 +13167,8 @@ fn lower_ahead(f: &FrontShared, id: u32) {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         LOWERING_AHEAD.with(|a| a.set(true));
         let _guard = LowerAheadGuard;
-        let body = crate::typeck::codegen_body(&u.prog, &u.tcx, d, &key.1);
+        // an instance that does not normalize is the locked build's to report
+        let Some(body) = crate::typeck::try_codegen_body(&u.prog, &u.tcx, d, &key.1) else { return Err("body does not normalize".to_string()) };
         let (func, closures) = lower_checked_body(u, id, &fn_key, &body)?;
         let callees = LOWER_AHEAD_IDS.with(|a| std::mem::take(&mut a.borrow_mut().keys));
         Ok::<_, String>(LoweredAhead { epoch, file: body.file, func, body: closures.then_some(body), callees })
