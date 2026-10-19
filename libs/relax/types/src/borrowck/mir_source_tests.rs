@@ -421,3 +421,27 @@ fn a_tuple_constructor_item_is_invariant_in_its_arguments() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.len() == 1 && errors[0].starts_with("E0597"), "{errors:?}");
 }
+
+#[test]
+fn an_opaque_with_a_static_bound_keeps_the_regions_it_captures_dead() {
+    let (errors, unchecked) = borrowck_source("
+        pub trait Captures<'a> {}
+        impl<T> Captures<'_> for T {}
+        pub fn foo(x: &mut i32) -> impl Sized + Captures<'_> + 'static {}
+        pub fn overlapping_mut() { let i = &mut 1; let _x = foo(i); let _y = foo(i); }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn an_opaque_outliving_every_lifetime_captures_no_live_region() {
+    let (errors, unchecked) = borrowck_source("
+        pub trait Captures<'a> {}
+        impl<T> Captures<'_> for T {}
+        pub trait Outlives<'a>: 'a {}
+        impl<'a, T: 'a> Outlives<'a> for T {}
+        pub fn test<'o>(v: &'o Vec<i32>) -> impl Captures<'o> + for<'a> Outlives<'a> {}
+        pub fn opaque_doesnt_use_temporary() { let _a = test(&vec![]); }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
