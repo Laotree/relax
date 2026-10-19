@@ -1037,9 +1037,8 @@ impl<'a> Fcx<'a> {
     /// or one of its ancestors)?
     fn item_visible(&self, d: DefId) -> bool {
         let def = self.prog.def(d);
-        if def.krate != self.prog.def(self.b.def).krate {
-            return true;
-        }
+        // (another crate's private item is never visible: its home module is not an ancestor here;
+        // rustc probe.rs keeps such candidates for diagnostics only, so an accessible trait item wins)
         if def.is_pub {
             // `pub`, `pub(super)`, `pub(in path)`: inside that module only
             let vis = &self.prog.files[def.file as usize].ast.item(def.item).vis;
@@ -4049,7 +4048,7 @@ impl<'a> Fcx<'a> {
         let key = ty_key(&self.tcx.tys, ty);
         let mut found = None;
         for &imp in self.tcx.inherent.get(&key)? {
-            if !self.prog.impls[self.prog.def(imp).sub as usize].items.iter().any(|&item| self.prog.def(item).name == name) { continue; }
+            if !self.prog.impls[self.prog.def(imp).sub as usize].items.iter().any(|&item| self.prog.def(item).name == name && self.item_visible(item)) { continue; }
             let applicable = self.infcx.probe(|_| {
                 let full = self.infcx.fresh_args_for_item(self.prog, imp);
                 let self_ty = self.tcx.instantiate_ty(self.prog, imp, &full, self.tcx.impl_self[&imp]);
@@ -4062,7 +4061,7 @@ impl<'a> Fcx<'a> {
             });
             if !applicable { continue; }
             for &item in &self.prog.impls[self.prog.def(imp).sub as usize].items {
-                if self.prog.def(item).name == name {
+                if self.prog.def(item).name == name && self.item_visible(item) {
                     if found.is_some() { self.err(self.last_lo, "E0034: multiple applicable items in scope".into()); return None; }
                     found = Some((item, imp));
                 }

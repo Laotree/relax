@@ -1455,9 +1455,9 @@ impl Names {
         let work: Vec<relax_session::sync::Mutex<Option<(NamespaceDelta, Vec<usize>)>>> = images.into_iter().zip(entries).map(|w| relax_session::sync::Mutex::new(Some(w))).collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
         let out: Vec<relax_session::sync::Mutex<(Vec<u8>, u128)>> = (0..work.len()).map(|_| Default::default()).collect();
-        std::thread::scope(|scope| {
+        crate::pool::scope(|scope| {
             for _ in 0..crate::preload::jobs().clamp(1, work.len().max(1)) {
-                scope.spawn(|| { let _z = crate::zone_alloc::compiler_thread(); let _mem = crate::memstat::tag(crate::memstat::Tag::Planner); loop {
+                scope.spawn(|| { let _mem = crate::memstat::tag(crate::memstat::Tag::Planner); loop {
                     let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(cell) = work.get(k) else { break };
                     let (mut image, entries) = cell.lock().unwrap().take().unwrap();

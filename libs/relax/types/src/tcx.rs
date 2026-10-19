@@ -282,10 +282,10 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
     const CHUNK: usize = 64;
-    let mut parts: Vec<(usize, Vec<R>)> = std::thread::scope(|sc| {
+    let mut parts: Vec<(usize, Vec<R>)> = crate::pool::scope(|sc| {
         let hs: Vec<_> = (0..jobs)
             .map(|_| {
-                sc.spawn(|| { let _z = crate::zone_alloc::compiler_thread();
+                sc.spawn(|| {
                     let mut out = Vec::new();
                     loop {
                         let k = next.fetch_add(CHUNK, std::sync::atomic::Ordering::Relaxed);
@@ -1596,6 +1596,9 @@ impl Tcx {
         }
         if def.kind == DefKind::TypeAlias && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             for e in self.check_type_alias(prog, did) { if !errors.contains(&e) { errors.push(e); } }
+        }
+        if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
+            errors.extend(crate::item_checks::bound_assoc_cycles(prog, self, did));
         }
         if def.kind == DefKind::Trait && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             errors.extend(crate::item_checks::supertrait_cycles(prog, self, did));
