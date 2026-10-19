@@ -311,8 +311,8 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     let checked = seeds.len();
     // the feature gates (E0658 and friends): items and signatures, then the loaded bodies
     for &k in crates {
-        errors.extend(relax_types::feature_gate::check_crate(unsafe { &(*up).prog }, k));
-        errors.extend(relax_types::feature_gate::check_bodies(unsafe { &(*up).prog }, k));
+        errors.extend(relax_types::feature_gate::check_crate(unsafe { &(*up).prog }, unsafe { &(*up).tcx }, k));
+        errors.extend(relax_types::feature_gate::check_bodies(unsafe { &(*up).prog }, unsafe { &(*up).tcx }, k));
     }
     // rustc_hir_analysis check_crate: every static and every non-generic, non-associated const
     // item of the checked crates is evaluated, used or not; one that cannot be evaluated is an

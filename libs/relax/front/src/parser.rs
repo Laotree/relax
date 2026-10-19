@@ -2267,14 +2267,14 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             konst = true;
         }
-        self.eat(T::KwAsync);
+        let async_ = self.eat(T::KwAsync);
         let maybe = self.eat(T::Question);
         let hrtb = self.hrtb()?;
         let path = self.path(false)?;
         if paren {
             self.expect(T::CloseParen)?;
         }
-        Ok(Bound::Trait { hrtb, maybe, konst, path })
+        Ok(Bound::Trait { hrtb, maybe, konst, async_, path })
     }
 
     // ------------------------------------------------------------ paths
@@ -2540,7 +2540,7 @@ impl<'a> Parser<'a> {
                     self.fn_ptr_ty(hrtb)?
                 } else {
                     let path = self.path(false)?;
-                    let mut b = vec![Bound::Trait { hrtb, maybe: false, konst: false, path }];
+                    let mut b = vec![Bound::Trait { hrtb, maybe: false, konst: false, async_: false, path }];
                     while self.eat(T::Plus) {
                         if !self.at_bound_start() {
                             break;
@@ -2591,7 +2591,7 @@ impl<'a> Parser<'a> {
                     let path = self.path(false)?;
                     if plus && self.kind() == T::Plus && matches!(self.nth(1), T::Lifetime | T::Ident | T::PathSep | T::Question) {
                         // bare trait object `Trait + Send` (pre-2021)
-                        let mut b = vec![Bound::Trait { hrtb: List::EMPTY, maybe: false, konst: false, path }];
+                        let mut b = vec![Bound::Trait { hrtb: List::EMPTY, maybe: false, konst: false, async_: false, path }];
                         while self.eat(T::Plus) {
                             if !self.at_bound_start() {
                                 break;

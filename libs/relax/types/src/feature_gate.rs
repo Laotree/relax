@@ -25,11 +25,11 @@ enum Ctx {
     Foreign,
 }
 
-pub fn check_crate(prog: &Program, krate: u32) -> Vec<String> {
+pub fn check_crate(prog: &Program, tcx: &crate::tcx::Tcx, krate: u32) -> Vec<String> {
     let info = &prog.crates[krate as usize];
     let feats = info.features(prog);
     let root_file = prog.mods[info.root_mod as usize].file;
-    let mut w = Gates::new(prog, krate, root_file, feats);
+    let mut w = Gates::new(prog, tcx, krate, root_file, feats);
     w.crate_features();
     w.cfg_scan();
     w.root_attrs();
@@ -41,6 +41,9 @@ pub fn check_crate(prog: &Program, krate: u32) -> Vec<String> {
 
 struct Gates<'a> {
     prog: &'a Program,
+    tcx: &'a crate::tcx::Tcx,
+    /// the module whose scope resolves the names of the item being walked
+    scope: u32,
     krate: u32,
     file: u32,
     pf: &'a crate::parser::ParsedFile,
@@ -54,14 +57,14 @@ struct Gates<'a> {
 }
 
 impl<'a> Gates<'a> {
-    fn new(prog: &'a Program, krate: u32, file: u32, feats: &'a Features) -> Gates<'a> {
+    fn new(prog: &'a Program, tcx: &'a crate::tcx::Tcx, krate: u32, file: u32, feats: &'a Features) -> Gates<'a> {
         let pf = &*prog.files[file as usize];
-        Gates { prog, krate, file, pf, ast: &pf.ast, src: prog.src(file), cfg: &prog.crates[krate as usize].cfg, feats, cur_pos: 0, errors: Vec::new() }
+        Gates { prog, tcx, scope: prog.crates[krate as usize].root_mod, krate, file, pf, ast: &pf.ast, src: prog.src(file), cfg: &prog.crates[krate as usize].cfg, feats, cur_pos: 0, errors: Vec::new() }
     }
 
     /// A walker over another file of the crate (an out-of-line module), sharing nothing.
     fn in_file(&self, file: u32) -> Gates<'a> {
-        Gates::new(self.prog, self.krate, file, self.feats)
+        Gates::new(self.prog, self.tcx, self.krate, file, self.feats)
     }
 
     /// Tokens the crate's author wrote: the file's text, fragments substituted from it, and the
@@ -388,8 +391,11 @@ impl<'a> Gates<'a> {
         let Some(attrs) = self.attrs(item.attrs) else { return };
         let pos = item.lo;
         let outer = std::mem::replace(&mut self.cur_pos, pos);
+        let outer_scope = self.scope;
+        if let Some(&d) = self.prog.item_defs.get(&(self.file, id.0)) { self.scope = self.prog.def(d).scope; }
         self.item_kind(id, &item, &attrs, ctx);
         self.cur_pos = outer;
+        self.scope = outer_scope;
     }
 
     fn item_kind(&mut self, id: ItemId, item: &Item, attrs: &[Attr], ctx: Ctx) {
@@ -482,7 +488,10 @@ impl<'a> Gates<'a> {
                     }
                 }
                 self.generics(&im.generics);
-                if let Some(p) = im.trait_ { self.path(&p); }
+                if let Some(p) = im.trait_ {
+                    self.trait_path_sugar(&p);
+                    self.path(&p);
+                }
                 self.ty(im.self_ty);
                 let items = ast.list(im.items).to_vec();
                 self.items(&items, Ctx::Impl);
@@ -671,10 +680,33 @@ impl<'a> Gates<'a> {
 
     fn bounds(&mut self, b: List<Bound>) {
         for bound in self.ast.list(b).to_vec() {
-            if let Bound::Trait { hrtb, path, .. } = bound {
+            if let Bound::Trait { hrtb, path, async_, konst, .. } = bound {
+                if async_ { self.gate("async_trait_bounds", path.lo, "`async` trait bounds are unstable"); }
+                if konst { self.gate("const_trait_impl", path.lo, "const trait impls are experimental"); }
                 self.late_bound_defs(hrtb);
+                self.trait_path_sugar(&path);
                 self.path(&path);
             }
+        }
+    }
+
+    /// hir_ty_lowering `lower_generic_args_of_path`: `Foo(A) -> B` is `Fn`-family sugar, and
+    /// the `Fn`-family's own `<Args>` form is unstable (`unboxed_closures`).
+    fn trait_path_sugar(&mut self, path: &Path) {
+        let ast = self.ast;
+        let Some(last) = ast.segs(path.segs).last().copied() else { return };
+        let paren = match ast.gargs(last.args()) {
+            Some(GenericArgs::Paren(..)) => true,
+            Some(GenericArgs::Angle(_)) => false,
+            None => return,
+        };
+        let Some(td) = self.tcx.resolve_type_path_def(self.prog, self.file, self.scope, path) else { return };
+        if self.prog.def(td).kind != DefKind::Trait { return; }
+        let callable = self.tcx.callable_output(td).is_some();
+        if paren && !callable {
+            self.gate("unboxed_closures", path.lo, "parenthetical notation is only stable when used with `Fn`-family traits");
+        } else if !paren && callable {
+            self.gate("unboxed_closures", path.lo, "the precise format of `Fn`-family traits' type parameters is subject to change");
         }
     }
 
@@ -950,7 +982,7 @@ impl<'a> Gates<'a> {
 
 /// The bodies of a checked crate's owners (fn bodies and const / static initializers) and the
 /// items nested in them, once the bodies are loaded.
-pub fn check_bodies(prog: &Program, krate: u32) -> Vec<String> {
+pub fn check_bodies(prog: &Program, tcx: &crate::tcx::Tcx, krate: u32) -> Vec<String> {
     let info = &prog.crates[krate as usize];
     let feats = info.features(prog);
     let mut out = Vec::new();
@@ -959,7 +991,8 @@ pub fn check_bodies(prog: &Program, krate: u32) -> Vec<String> {
         let def = prog.def(d);
         if def.krate != krate || !matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::Const | DefKind::Static | DefKind::AssocConst) { continue; }
         if prog.item_defs.get(&(def.file, def.item.0)) != Some(&d) { continue; }
-        let mut w = Gates::new(prog, krate, def.file, feats);
+        let mut w = Gates::new(prog, tcx, krate, def.file, feats);
+        w.scope = def.scope;
         w.body(d);
         out.append(&mut w.errors);
     }

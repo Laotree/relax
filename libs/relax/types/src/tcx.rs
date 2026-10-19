@@ -2654,7 +2654,7 @@ impl Tcx {
             // a bare trait in a type (`&mut FnMut(&mut [u8])`): edition 2015's trait object
             // (rustc: `dyn` is implied there; later editions reject it, E0782)
             DefKind::Trait if prog.crates[prog.mods[module as usize].krate as usize].edition == 2015 => {
-                let b = ast::Bound::Trait { hrtb: ast::List::EMPTY, maybe: false, konst: false, path: p.clone() };
+                let b = ast::Bound::Trait { hrtb: ast::List::EMPTY, maybe: false, konst: false, async_: false, path: p.clone() };
                 self.lower_dyn(cx, prog, file, module, env, &[b], p.lo, source_ty)
             }
             _ => {

@@ -829,6 +829,8 @@ pub enum Bound {
         hrtb: List<GenericParam>,
         maybe: bool,
         konst: bool,
+        /// `async Fn()` (async_trait_bounds)
+        async_: bool,
         path: Path,
     },
     /// `use<'a, T>` precise capture
