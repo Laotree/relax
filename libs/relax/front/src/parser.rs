@@ -1086,7 +1086,16 @@ impl<'a> Parser<'a> {
         let module = self.cur_module();
         let qual = mpath.iter().find(|x| !x.is_empty()).cloned();
         let qual = qual.map(|q| q.strip_prefix("__relax_crate_").map(|x| x.to_string()).unwrap_or(q));
-        let r = m.lookup(&name, &self.krate, &mpath, &module);
+        let mut r = m.lookup(&name, &self.krate, &mpath, &module);
+        // textual scope (`macro_rules!` is visible only after its definition): a plain-name call of a
+        // macro this file defines further down is not in scope (check only; the call must be written
+        // code, not an expansion)
+        if let Some(d) = &r {
+            if qual.is_none() && d.builtin == 0 && !d.exported && crate::lexer::validation_enabled() && (seg.name.lo as usize) < self.src.len()
+                && self.bctx.as_ref().is_some_and(|c| c.path == d.def_file) && seg.name.lo < d.def_pos {
+                r = None;
+            }
+        }
         // Relax's built-in macros (builtins.rs) when no macro_rules! of that name is visible
         match r {
             Some(d) => Some(crate::builtins::override_rules(&self.session.options, d)),
@@ -1898,6 +1907,10 @@ impl<'a> Parser<'a> {
                 let bounds = if self.eat(T::Colon) { self.bounds()? } else { List::EMPTY };
                 self.where_clause(&mut generics)?;
                 let ty = if self.eat(T::Eq) { Some(self.ty_plus()?) } else { None };
+                // (a free alias takes its where clause before the `=`; only associated types may put it after)
+                if ty.is_some() && self.in_assoc == 0 && self.foreign_abi.is_none() && self.kind() == T::KwWhere {
+                    return self.err("where clauses are not allowed after the type for type aliases");
+                }
                 self.where_clause(&mut generics)?;
                 self.expect(T::Semi)?;
                 ItemKind::TypeAlias(self.ast.push_row(TypeAliasItem { generics, bounds, ty }))
@@ -3405,6 +3418,10 @@ impl<'a> Parser<'a> {
             let ty = if self.eat(T::Colon) { Some(self.ty()?) } else { None };
             let (init, else_) = if self.eat(T::Eq) {
                 let e = self.expr()?;
+                // rustc_parse `parse_local_mk`: the initializer of a `let .. else` does not end in `}`
+                if self.kind() == T::KwElse && self.pos > 0 && self.toks.at(self.pos - 1).kind == T::CloseBrace {
+                    return self.err("right curly brace `}` before `else` in a `let...else` statement not allowed");
+                }
                 let el = if self.eat(T::KwElse) { Some(self.block()?) } else { None };
                 (Some(e), el)
             } else {
