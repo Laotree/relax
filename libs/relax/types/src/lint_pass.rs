@@ -193,6 +193,8 @@ fn nonstandard_style_item(prog: &Program, d: DefId) {
     let kind = def.kind;
     if !matches!(kind, DefKind::Mod | DefKind::Fn | DefKind::AssocFn | DefKind::Struct | DefKind::Union | DefKind::Enum
         | DefKind::TypeAlias | DefKind::Trait | DefKind::Static | DefKind::Const | DefKind::AssocConst | DefKind::AssocTy | DefKind::Impl) { return; }
+    // the crate root module has no item of its own
+    if kind == DefKind::Mod && def.parent == NO_DEF { return; }
     let file = def.file;
     let ast = &prog.files[file as usize].ast;
     let item = *ast.item(def.item);

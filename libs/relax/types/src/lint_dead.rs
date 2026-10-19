@@ -44,9 +44,18 @@ struct BodyInfo {
     notes: Vec<(u32, String, Vec<Attr>)>,
 }
 
+/// Positions (file, site) of the names patterns bind (they are definitions, not uses).
+static BINDING_SITES: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
+
+pub fn is_binding_site(file: u32, pos: u32) -> bool {
+    BINDING_SITES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&(file, pos)))
+}
+
 static BODY_REFS: Mutex<Option<HashMap<DefId, BodyInfo>>> = Mutex::new(None);
 
 pub fn reset() {
+    *BINDING_SITES.lock().unwrap_or_else(|e| e.into_inner()) = Some(HashSet::new());
+    crate::lint_imports::reset();
     *BODY_REFS.lock().unwrap_or_else(|e| e.into_inner()) = Some(HashMap::new());
 }
 
@@ -553,6 +562,7 @@ impl<'a> BodyRefs<'a> {
         match self.body.res.get(&e.0) {
             Some(Res::Def(d)) => {
                 let d = *d;
+                crate::lint_imports::note_method(self.prog, self.tcx, d);
                 self.handle_res(d);
                 // a trait impl's item stands for the trait's
                 if let Some(t) = self.trait_item_of(d) { self.use_def(t); }
@@ -631,7 +641,11 @@ impl<'a> Visitor<'a> for BodyRefs<'a> {
                     self.handle_res(d);
                 }
             }
-            Pat::Ident { .. } => {
+            Pat::Ident { name, .. } => {
+                if self.body.pat_local.get(&p.0).is_some() && self.body.pat_res.get(&p.0).is_none() {
+                    let site = self.prog.files[self.body.file as usize].diagnostic_pos(name.lo);
+                    BINDING_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new).insert((self.body.file, site));
+                }
                 if let Some(Res::Def(d)) = self.body.pat_res.get(&p.0).copied() {
                     let pi = self.body.pat_ix(p);
                     if pi < self.body.pat_ty.len() {
@@ -656,6 +670,7 @@ impl<'a> Visitor<'a> for BodyRefs<'a> {
                 self.tw.generic_args(r.turbofish);
                 if let Some(m) = self.body.methods.get(&e.0) {
                     let d = m.def;
+                    crate::lint_imports::note_method(self.prog, self.tcx, d);
                     self.use_def(d);
                     if let Some(t) = self.trait_item_of(d) { self.use_def(t); }
                 }
@@ -705,12 +720,12 @@ impl<'a> Visitor<'a> for BodyRefs<'a> {
 /// The items reachable from outside the crate: `pub` along the module path, re-exported by a
 /// `pub use`, and what such items expose (variants, `pub` fields, trait items, the `pub` items
 /// of impls of reachable types).
-struct Reach {
-    defs: HashSet<DefId>,
-    fields: HashSet<FieldKey>,
+pub struct Reach {
+    pub defs: HashSet<DefId>,
+    pub fields: HashSet<FieldKey>,
 }
 
-fn module_items(prog: &Program, m: u32) -> (u32, Vec<ItemId>) {
+pub fn module_items(prog: &Program, m: u32) -> (u32, Vec<ItemId>) {
     let md = &prog.mods[m as usize];
     if md.parent_mod.is_none() { return (md.file, prog.files[md.file as usize].ast.root_items.iter().copied().collect()); }
     let d = prog.def(md.def);
@@ -1153,6 +1168,7 @@ pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32) {
     let rep = Reporter { s: &s, reach: &reach };
     if executable { rep.run(&DEAD_CODE_PUB_IN_BINARY, &pre_live, true, &all); }
     rep.run(&DEAD_CODE, &s.live, false, &all);
+    crate::lint_imports::check(prog, tcx, own, &reach);
 }
 
 fn is_executable(prog: &Program, root: u32) -> bool {
