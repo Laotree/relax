@@ -213,9 +213,9 @@ fn check_root(prog: &Program, tcx: &Tcx, owner: CheckedBody, tb: &crate::typeck:
                 sig.with_closure_env(tcx, tb.def, e.0, mir.local_decls[1].ty)
             }
         };
-        let is_copy = |ty| tcx.is_copy_modulo_regions(prog, env, ty);
-        let moves = MoveData::gather_moves(&mir, prog, tcx, env, &|ty| !is_copy(ty));
-        let has_loans = crate::borrowck::borrow_set::BorrowSet::build(tcx, &mir, false, &moves).len() != 0;
+        // rustc_borrowck: `MoveData::gather_moves(body, tcx, |_| true)`.
+        let moves = MoveData::gather_moves(&mir, prog, tcx, env, &|_| true);
+        let has_loans = mir.basic_blocks.iter().flat_map(|b| &b.statements).any(|s| matches!(&s.kind, crate::mir::StatementKind::Assign(_, crate::mir::Rvalue::Ref(..))));
         // SAFETY: the inference context borrows only the program and type context, which outlive this function;
         // the 'static is a lifetime erasure for the Vec below.
         let (prog_s, tcx_s): (&'static Program, &'static Tcx) = unsafe { (std::mem::transmute(prog), std::mem::transmute(tcx)) };
