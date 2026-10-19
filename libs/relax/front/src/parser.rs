@@ -1510,13 +1510,13 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 let abi = self.abi();
                 let items = self.foreign_items(abi)?;
-                ItemKind::ForeignMod(self.ast.push_row(ForeignModItem { abi, items }))
+                ItemKind::ForeignMod(self.ast.push_row(ForeignModItem { abi, items, unsafe_: 0 }))
             }
             T::KwUnsafe if self.nth(1) == T::KwExtern && (self.nth(2) == T::OpenBrace || (is_str(self.nth(2)) && self.nth(3) == T::OpenBrace)) => {
                 self.pos += 2;
                 let abi = self.abi();
                 let items = self.foreign_items(abi)?;
-                ItemKind::ForeignMod(self.ast.push_row(ForeignModItem { abi, items }))
+                ItemKind::ForeignMod(self.ast.push_row(ForeignModItem { abi, items, unsafe_: 1 }))
             }
             T::KwFn | T::KwConst | T::KwAsync | T::KwUnsafe | T::KwExtern
                 if self.fn_ahead() =>

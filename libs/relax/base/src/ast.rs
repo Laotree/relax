@@ -1353,6 +1353,8 @@ pub struct ImplItem {
 pub struct ForeignModItem {
     pub abi: Option<Ident>,
     pub items: List<ItemId>,
+    /// `unsafe extern { .. }` (a u32 keeps the row free of padding: it is a Pod image row)
+    pub unsafe_: u32,
 }
 
 /// An item's kind in 16 bytes: the kinds with generics or other big payloads keep them in a row

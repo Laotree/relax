@@ -321,3 +321,41 @@ pub fn duplicate_generic_params(prog: &Program, d: DefId) -> Vec<String> {
     }
     errors
 }
+
+/// rustc_ast_passes `extern` block validation and the lints on them: `unsafe extern` blocks
+/// (`unsafe_code`), plain `extern` blocks (`missing_unsafe_on_extern`, an error from edition
+/// 2024), and a safety qualifier on an item of a plain block.
+pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
+    use crate::ast::ItemKind;
+    let mut errors = Vec::new();
+    let mut scope: crate::fxhash::HashMap<u32, DefId> = Default::default();
+    for (i, d) in prog.defs.iter().enumerate() {
+        if own.get(d.krate as usize).copied().unwrap_or(false) { scope.entry(d.file).or_insert(DefId(i as u32)); }
+    }
+    for (&file, &def) in &scope {
+        let pf = &prog.files[file as usize];
+        let ast = &pf.ast;
+        for item in ast.items.iter() {
+            let ItemKind::ForeignMod(r) = item.kind else { continue };
+            let fm = ast.row(r);
+            let attrs: Vec<crate::ast::Attr> = ast.list(item.attrs).to_vec();
+            if fm.unsafe_ != 0 {
+                crate::lint::emit_in(prog, def, &attrs, &crate::lint::UNSAFE_CODE, file, item.lo, "usage of an `unsafe extern` block");
+                continue;
+            }
+            if pf.edition >= 2024 {
+                errors.push(prog.record_uncoded_error(file, item.lo, "typeck", "extern blocks must be unsafe".to_string()));
+            } else {
+                crate::lint::emit_in(prog, def, &attrs, &crate::lint::MISSING_UNSAFE_ON_EXTERN, file, item.lo, "extern blocks should be unsafe");
+            }
+            for &it in ast.list(fm.items) {
+                if let ItemKind::Fn(sig, _, _) = ast.item(it).kind {
+                    if ast.fn_sig(sig).unsafe_ {
+                        errors.push(prog.record_uncoded_error(file, ast.item(it).lo, "typeck", "items in `extern` blocks without an `unsafe` qualifier cannot have safety qualifiers".to_string()));
+                    }
+                }
+            }
+        }
+    }
+    errors
+}
