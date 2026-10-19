@@ -3741,7 +3741,15 @@ impl<'a> Fcx<'a> {
         if imp == crate::program::NO_DEF {
             // trait object receiver: [dyn, the principal's args when the method is its own, own..]
             let mut args = vec![t];
-            if let TyKind::Dyn(td, targs, _, _, _, _, _) = self.tcx.tys.kind(t).clone() {
+            let np_known = self.tcx.fn_sig(self.prog, item).map_or(1, |s| s.n_parent_generics) as usize;
+            if let (Some(full), TyKind::Dyn(..)) = (&self.known_method_args, self.tcx.tys.kind(t)) {
+                // confirm.rs ObjectPick: the principal's trait ref with its binder instantiated
+                // by the pick (the object's own arguments still hold the bound regions)
+                let indices = self.tcx.generic_indices_of(self.prog, item);
+                for &idx in &indices.types_consts[1..np_known] {
+                    args.push(match full[idx as usize] { crate::consts::GenericArg::Type(t) => t, crate::consts::GenericArg::Const(c) => self.tcx.tys.intern(TyKind::Const(c)), _ => unreachable!() });
+                }
+            } else if let TyKind::Dyn(td, targs, _, _, _, _, _) = self.tcx.tys.kind(t).clone() {
                 let parent = self.prog.def(item).parent;
                 if parent == td {
                     args.extend(self.tcx.tys.list(targs).iter().copied());
