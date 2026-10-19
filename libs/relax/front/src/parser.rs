@@ -1981,8 +1981,12 @@ impl<'a> Parser<'a> {
             T::Ident | T::PathSep | T::KwSelfValue | T::KwSuper | T::KwCrate
                 if self.mac_ahead() =>
             {
+                let path_lo = self.lo();
                 let path = self.path(true)?;
                 self.expect(T::Not)?;
+                if !matches!(vis, Vis::Private) {
+                    return Err(PErr { pos: path_lo, msg: "can't qualify macro invocation with `pub`".into() });
+                }
                 // `name! ident { }` (macro 2.0 style) not supported
                 let (delim, toks) = self.delim_tt()?;
                 if delim != b'{' {
@@ -2381,6 +2385,24 @@ impl<'a> Parser<'a> {
         self.in_assoc -= 1;
         let items = items?;
         self.expect(T::CloseBrace)?;
+        // rustc_ast_passes `check_item_in_assoc_context`: only fns, consts and types are members
+        // (a `static` is a member of an `extern` block, not of an impl or a trait)
+        for &id in &items {
+            let what = match self.ast.item(id).kind {
+                ItemKind::Struct(_) => "struct",
+                ItemKind::Enum(_) => "enum",
+                ItemKind::Union(_) => "union",
+                ItemKind::Trait(_) => "trait",
+                ItemKind::Impl(_) => "implementation",
+                ItemKind::Mod(_) => "module",
+                ItemKind::Use(_) => "`use` import",
+                ItemKind::ExternCrate(_) => "extern crate",
+                ItemKind::Static(..) if self.foreign_abi.is_none() => "static",
+                _ => continue,
+            };
+            let lo = self.ast.item(id).lo;
+            return Err(PErr { pos: lo, msg: format!("{what} is not supported in `trait`s or `impl`s") });
+        }
         // (after the member items, which are items of their own)
         self.pending_inner.extend(inner);
         Ok(self.ast.push_list(items))
@@ -2393,7 +2415,15 @@ impl<'a> Parser<'a> {
         self.foreign_abi = Some(abi);
         let items = self.assoc_items();
         self.foreign_abi = saved;
-        items
+        let items = items?;
+        // rustc_parse `parse_item_kind` in an extern block: `const` is not a foreign item
+        for &id in self.ast.list(items) {
+            let it = self.ast.item(id);
+            if matches!(it.kind, ItemKind::Const(..)) {
+                return Err(PErr { pos: it.lo, msg: "extern items cannot be `const`".into() });
+            }
+        }
+        Ok(items)
     }
 
     fn impl_generics_ahead(&self) -> bool {
