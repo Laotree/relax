@@ -3014,6 +3014,23 @@ impl<'a> Fcx<'a> {
                 return Res::Def(*ad);
             }
         }
+        // `Alias::Variant { .. }`: the variant of the enum a type alias names (rustc resolves the
+        // alias path as a type, then the variant type-relatively)
+        if path.segs.len() == 2 && !path.has_qself() {
+            let segs = crate::program::path_segs(prog, self.file, path);
+            if segs[0].0 == SegKind::Ident {
+                if let Some(alias) = prog.lookup_in_scope(self.module, segs[0].1, true).filter(|a| prog.def(*a).kind == DefKind::TypeAlias) {
+                    let at = self.tcx.alias_ty(&self.cx.with_infcx(&self.infcx), prog, alias);
+                    if let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(at) {
+                        if prog.def(*ad).kind == DefKind::Enum {
+                            if let Some(v) = prog.lookup_in_container(*ad, segs[1].1, false).filter(|v| prog.def(*v).kind == DefKind::Variant) {
+                                return Res::Def(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let (r, _) = self.resolve_value_path(path, u32::MAX, false);
         // rustc_resolve E0574: only a struct, variant or union names a struct literal / pattern
         if let Res::Def(d) = r {
