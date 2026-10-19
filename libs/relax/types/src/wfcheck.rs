@@ -686,6 +686,16 @@ pub mod obligations {
                 if let Some(d) = def {
                     let ix = self.tcx.generic_indices_of(self.prog, d);
                     if ix.types_consts.len() != n || ix.lifetimes.len() != r { self.ok = false; return t; }
+                    // each slot's kind (type or const) must match the declaration's
+                    let args = match tys.kind(t) { TyKind::Adt(_, a, _) | TyKind::FnDef(_, a, _) => Some(*a), TyKind::Alias(_, a) => Some(a.args), _ => None };
+                    if let Some(a) = args {
+                        let decl = self.tcx.declaration_env(self.prog, d);
+                        let off = if matches!(tys.kind(t), TyKind::Alias(..)) { 0 } else { 0 };
+                        for (i, &arg) in tys.list(a).iter().enumerate() {
+                            let want_const = decl.consts.iter().any(|c| c.0 as usize == i + off);
+                            if want_const != matches!(tys.kind(arg), TyKind::Const(_)) { self.ok = false; return t; }
+                        }
+                    }
                 }
                 super_fold_ty(tys, t, self, depth)
             }
