@@ -2056,7 +2056,7 @@ impl<'a> Fcx<'a> {
     fn pat_bindings(&mut self, p: PatId, report: bool) -> Vec<(Sym, u32)> {
         let ast = self.ast();
         let mut out: Vec<(Sym, u32)> = Vec::new();
-        let mut add = |this: &mut Self, out: &mut Vec<(Sym, u32)>, more: Vec<(Sym, u32)>| {
+        let add = |this: &mut Self, out: &mut Vec<(Sym, u32)>, more: Vec<(Sym, u32)>| {
             for (n, pos) in more {
                 if out.iter().any(|(m, _)| *m == n) {
                     if report {

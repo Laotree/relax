@@ -3392,11 +3392,8 @@ impl Program {
     fn import_reportable(&self, i: usize, macro_binds: &mut Option<crate::fxhash::HashSet<Sym>>) -> bool {
         let im = &self.imports[i];
         // bound in one namespace while waiting for the other: resolved
-        if let Some(b) = im.bind {
-            let m = &self.mods[im.module as usize];
-            if m.types.contains_key(&b) || m.values.contains_key(&b) {
-                return false;
-            }
+        if im.bound & 3 != 0 {
+            return false;
         }
         // `use std::eprintln;` / `use alloc::format;`: built-in macros need no import
         if !im.glob {
