@@ -427,6 +427,8 @@ pub struct Fcx<'a> {
     closure_depth: Vec<(u32, usize)>, // (closure expr, scope depth at entry)
     /// checking a const / static initializer or an anonymous constant (no `return` outside a closure)
     in_const: bool,
+    /// checking an anonymous constant that is a typeck root of its own (array length, const argument)
+    in_anon_const: bool,
     /// > 0 inside an async block or async fn body (where `.await` is allowed); a closure
     /// inside resets it
     async_depth: u32,
@@ -687,6 +689,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         ret_stack: Vec::new(),
         closure_depth: Vec::new(),
         in_const: false,
+        in_anon_const: false,
         async_depth: 0,
         await_count: 0,
         cur_binop: 0,
@@ -750,6 +753,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         fcx.b.ret = ct;
         fcx.ret_stack.push(ct);
         fcx.in_const = true;
+        fcx.in_anon_const = true;
         let t = fcx.check_expr(init, Some(ct));
         fcx.coerce_or_unify(t, ct, Some(init), ast.expr(init).lo);
         fcx.finish();
@@ -3323,6 +3327,19 @@ impl<'a> Fcx<'a> {
         }
         let segs = crate::program::path_segs(prog, self.file, path);
         let error = self.tcx.tys.error;
+        // an anonymous constant cannot name a generic `Self`
+        if self.in_anon_const && self.tcx.validates(prog, self.file) && segs.first().is_some_and(|s| s.0 == SegKind::SelfType) {
+            if let Some(st) = self.env.self_ty {
+                let generic = match self.tcx.tys.kind(st) {
+                    TyKind::Adt(_, args, regions) => !self.tcx.tys.list(*args).is_empty() || !self.tcx.tys.region_args(*regions).is_empty(),
+                    _ => self.tcx.tys.flags(st).contains(crate::types::TypeFlags::HAS_TY_PARAM),
+                };
+                if generic {
+                    self.err(path.lo, "generic `Self` types are currently not permitted in anonymous constants".to_string());
+                    return (Res::Err, error);
+                }
+            }
+        }
         if self.tcx.validates(prog, self.file) && segs.len() == 1 && path.no_qself() && !path.global() && segs[0].0 == SegKind::Ident && !self.scopes.iter().any(|(sy, _)| *sy == segs[0].1) && !self.env.names.contains(&segs[0].1) {
             if let Some(e) = prog.name_ambiguity(self.module, segs[0].1, false, false) {
                 self.err(path.lo, prog.privacy_message(&e));
