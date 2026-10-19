@@ -264,6 +264,14 @@ pub struct Def {
 
 pub const IMPORT_PUB: u8 = 1;
 pub const IMPORT_EXTERN: u8 = 2;
+/// `Import::bound`: the namespaces this import bound, the injected prelude crate, an empty `{}` group
+pub const BOUND_TYPES: u8 = 1;
+pub const BOUND_VALUES: u8 = 2;
+pub const BOUND_INJECTED: u8 = 4;
+pub const BOUND_PREFIX_ONLY: u8 = 8;
+/// the clash of this import with an earlier binding was reported (per namespace)
+pub const CLASH_TYPES: u8 = 16;
+pub const CLASH_VALUES: u8 = 32;
 
 pub struct Module {
     pub def: DefId,
@@ -368,7 +376,8 @@ pub struct UseUndo {
     bind: Option<Sym>,
     done: bool,
     glob: bool,
-    gone: Vec<(bool, Sym, DefId)>,
+    bound: u8,
+    gone: Vec<(bool, Sym, DefId, u8)>,
 }
 
 pub struct Import {
@@ -1224,7 +1233,7 @@ impl Program {
             let inj = self.syms.intern(if no_std { "core" } else { "std" });
             let bound = self.mods[root_mod as usize].types.contains_key(&inj) || self.imports.iter().any(|i| i.module == root_mod && i.bind == Some(inj));
             if !bound && self.crates[krate as usize].deps.iter().any(|x| x.0 == inj) {
-                self.imports.push(Import { module: root_mod, global: true, segs: vec![(SegKind::Ident, inj)], bind: Some(inj), glob: false, is_pub: false, done: false, file, pos: 0, ext: true, bound: 4 });
+                self.imports.push(Import { module: root_mod, global: true, segs: vec![(SegKind::Ident, inj)], bind: Some(inj), glob: false, is_pub: false, done: false, file, pos: 0, ext: true, bound: BOUND_INJECTED });
             }
         }
         // files no module loads (cfg'd out in ways the scan does not see)
@@ -2099,7 +2108,7 @@ impl Program {
         }
         for m in &mut self.mods { m.globs.clear(); m.anon_traits.clear(); m.import_pub.clear(); }
         self.imports.retain(|i| self.mods[i.module as usize].krate != krate);
-        for i in &mut self.imports { i.done = false; }
+        for i in &mut self.imports { i.done = false; i.bound &= BOUND_INJECTED | BOUND_PREFIX_ONLY; }
         let old: Vec<_> = self.defs.iter().enumerate().filter(|(_, d)| d.krate == krate).map(|(i, _)| DefId(i as u32)).collect();
         self.unbind_defs(&old);
         self.impls.retain(|i| self.defs[i.def.0 as usize].krate != krate);
@@ -2147,7 +2156,7 @@ impl Program {
             let inj = self.syms.intern(if no_std { "core" } else { "std" });
             let bound = self.mods[root as usize].types.contains_key(&inj) || self.imports.iter().any(|i| i.module == root && i.bind == Some(inj));
             if !bound && self.crates[krate as usize].deps.iter().any(|x| x.0 == inj) {
-                self.imports.push(Import { module: root, global: true, segs: vec![(SegKind::Ident, inj)], bind: Some(inj), glob: false, is_pub: false, done: false, file, pos: 0, ext: true, bound: 4 });
+                self.imports.push(Import { module: root, global: true, segs: vec![(SegKind::Ident, inj)], bind: Some(inj), glob: false, is_pub: false, done: false, file, pos: 0, ext: true, bound: BOUND_INJECTED });
             }
         }
         self.expand_pending(krate, self.crates[krate as usize].edition);
@@ -2195,19 +2204,19 @@ impl Program {
             if im.file != file || im.pos != pos {
                 continue;
             }
-            let (m, bind, done, glob) = (im.module, im.bind, im.done, im.glob);
+            let (m, bind, done, glob, bound) = (im.module, im.bind, im.done, im.glob, im.bound);
             let mut gone = Vec::new();
+            // the bindings this import made (an item's own binding, or another import's, stays)
             if let (true, Some(name)) = (done, bind) {
-                let md = &self.mods[m as usize];
-                let tv: Vec<(bool, DefId)> = [(true, md.types.get(&name).copied()), (false, md.values.get(&name).copied())].into_iter().filter_map(|(t, d)| d.map(|d| (t, d))).collect();
-                for (is_type, d) in tv {
-                    if self.defs[d.0 as usize].scope != m {
-                        if is_type {
-                            self.mods[m as usize].types.remove(&name);
-                        } else {
-                            self.mods[m as usize].values.remove(&name);
-                        }
-                        gone.push((is_type, name, d));
+                for (is_type, bit) in [(true, BOUND_TYPES), (false, BOUND_VALUES)] {
+                    if bound & bit == 0 {
+                        continue;
+                    }
+                    let md = &mut self.mods[m as usize];
+                    let d = if is_type { md.types.remove(&name) } else { md.values.remove(&name) };
+                    let flags = md.import_pub.remove(&(name, is_type)).unwrap_or(0);
+                    if let Some(d) = d {
+                        gone.push((is_type, name, d, flags));
                     }
                 }
             }
@@ -2216,7 +2225,8 @@ impl Program {
             self.imports[i].done = true;
             self.imports[i].bind = None;
             self.imports[i].glob = false;
-            out.push(UseUndo { index: i, module: m, bind, done, glob, gone });
+            self.imports[i].bound &= !(BOUND_TYPES | BOUND_VALUES);
+            out.push(UseUndo { index: i, module: m, bind, done, glob, bound, gone });
         }
         self.scope_cache.clear();
         self.glob_cache.clear();
@@ -2230,12 +2240,11 @@ impl Program {
             im.bind = u.bind;
             im.done = u.done;
             im.glob = u.glob;
-            for (is_type, name, d) in u.gone {
-                if is_type {
-                    self.mods[u.module as usize].types.insert(name, d);
-                } else {
-                    self.mods[u.module as usize].values.insert(name, d);
-                }
+            im.bound = u.bound;
+            for (is_type, name, d, flags) in u.gone {
+                let md = &mut self.mods[u.module as usize];
+                if is_type { md.types.insert(name, d); } else { md.values.insert(name, d); }
+                md.import_pub.insert((name, is_type), flags);
             }
         }
         self.scope_cache.clear();
@@ -2249,15 +2258,17 @@ impl Program {
         if i0 >= self.imports.len() {
             return;
         }
-        let gone: Vec<(u32, Sym)> = self.imports.iter().skip(i0).filter(|im| im.done).filter_map(|im| im.bind.map(|b| (im.module, b))).collect();
+        let gone: Vec<(u32, Sym, u8)> = self.imports.iter().skip(i0).filter(|im| im.done).filter_map(|im| im.bind.map(|b| (im.module, b, im.bound))).collect();
         self.imports.truncate(i0);
-        for (m, name) in gone {
-            let imported = |p: &Program, d: Option<&DefId>| d.map_or(false, |d| p.defs[d.0 as usize].scope != m);
-            if imported(self, self.mods[m as usize].values.get(&name)) {
-                self.mods[m as usize].values.remove(&name);
+        for (m, name, bound) in gone {
+            let md = &mut self.mods[m as usize];
+            if bound & BOUND_VALUES != 0 {
+                md.values.remove(&name);
+                md.import_pub.remove(&(name, false));
             }
-            if imported(self, self.mods[m as usize].types.get(&name)) {
-                self.mods[m as usize].types.remove(&name);
+            if bound & BOUND_TYPES != 0 {
+                md.types.remove(&name);
+                md.import_pub.remove(&(name, true));
             }
         }
         self.imports_of_module.clear();
@@ -2831,7 +2842,7 @@ impl Program {
             UseTree::Group(v) => {
                 // `use a::b::{};` imports nothing, but its prefix is resolved (and privacy-checked)
                 if v.is_empty() && !prefix.is_empty() {
-                    self.imports.push(Import { module, global, segs: prefix.clone(), bind: None, glob: true, is_pub: false, done: false, file, pos, ext: false, bound: 8 });
+                    self.imports.push(Import { module, global, segs: prefix.clone(), bind: None, glob: true, is_pub: false, done: false, file, pos, ext: false, bound: BOUND_PREFIX_ONLY });
                 }
                 for x in self.files[file as usize].ast.list(*v).to_vec() {
                     self.flatten_use(file, module, global, &x, prefix, is_pub, pos);
@@ -3414,7 +3425,7 @@ impl Program {
     fn import_reportable(&self, i: usize, macro_binds: &mut Option<crate::fxhash::HashSet<Sym>>) -> bool {
         let im = &self.imports[i];
         // bound in one namespace while waiting for the other: resolved
-        if im.bound & 3 != 0 {
+        if im.bound & (BOUND_TYPES | BOUND_VALUES) != 0 {
             return false;
         }
         // `use std::eprintln;` / `use alloc::format;`: built-in macros need no import
@@ -3513,7 +3524,7 @@ impl Program {
                 return true;
             }
             // (a prefix of an empty group: resolved, binds nothing)
-            if self.imports[i].bound & 8 != 0 {
+            if self.imports[i].bound & BOUND_PREFIX_ONLY != 0 {
                 return true;
             }
             let is_pub = self.imports[i].is_pub;
@@ -3617,11 +3628,11 @@ impl Program {
         if self.imports_done && (tdef.is_some() || vdef.is_some()) {
             self.scope_cache.clear();
         }
-        let (ext, ipos, ifile, injected) = (self.imports[i].ext, self.imports[i].pos, self.imports[i].file, self.imports[i].bound & 4 != 0);
+        let (ext, ipos, ifile, injected) = (self.imports[i].ext, self.imports[i].pos, self.imports[i].file, self.imports[i].bound & BOUND_INJECTED != 0);
         let flags = is_pub as u8 | if ext { IMPORT_EXTERN } else { 0 };
         for (ns_type, found) in [(true, tdef), (false, vdef)] {
             let Some(d) = found else { continue };
-            let bit = if ns_type { 1 } else { 2 };
+            let (bit, clash) = if ns_type { (BOUND_TYPES, CLASH_TYPES) } else { (BOUND_VALUES, CLASH_VALUES) };
             let m = &mut self.mods[module as usize];
             let taken = if ns_type { m.types.get(&bind).copied() } else { m.values.get(&bind).copied() };
             match taken {
@@ -3632,9 +3643,9 @@ impl Program {
                 }
                 Some(old) => {
                     // the name is bound twice (rustc_resolve diagnostics.rs `report_conflict`)
-                    if self.imports[i].bound & bit == 0 && !injected {
+                    if self.imports[i].bound & clash == 0 && !injected {
                         let old_flags = m.import_pub.get(&(bind, ns_type)).copied();
-                        self.imports[i].bound |= bit;
+                        self.imports[i].bound |= clash;
                         self.report_name_clash(bind, ns_type, old, old_flags, (ext, ipos, ifile));
                     }
                 }
