@@ -424,8 +424,10 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     unsafe {
         // a delayed bug no error explains (rustc: an ICE at session end) is one internal failure
         // of the check, never the end of it
+        // (rustc flushes delayed bugs only when no error was emitted anywhere: an error explains them)
+        let explained = !errors.is_empty() || !borrow_diagnostics.is_empty() || (*up).query_errors.has_errors();
         for bug in (*up).query_errors.take_delayed() {
-            errors.push(format!("internal: delayed bug at the end of the check: {}", bug));
+            if !explained { errors.push(format!("internal: delayed bug at the end of the check: {}", bug)); }
         }
         if !errors.is_empty() { (*up).query_errors.note_reported_error(); }
         (*up).flush_query_errors(true);
