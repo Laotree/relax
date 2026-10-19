@@ -4753,19 +4753,6 @@ pub fn blocks_in_expr(ast: &Ast, e: ExprId, out: &mut Vec<BlockId>) {
                 blocks_in_expr(ast, b, out);
             }
         }
-        // rustc_ast/src/visit.rs walk_path_segment: the blocks of const generic arguments
-        // (`Example::<{ const X: usize = 1; X }>`) are lexical blocks of the body
-        ExprKind::Path(path) => {
-            for seg in ast.segs(path.segs) {
-                if let Some(GenericArgs::Angle(v)) = ast.gargs(seg.args()) {
-                    for g in ast.list(*v) {
-                        if let GenericArg::Const(e) = g {
-                            blocks_in_expr(ast, *e, out);
-                        }
-                    }
-                }
-            }
-        }
         _ => {}
     }
 }

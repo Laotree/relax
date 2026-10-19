@@ -4740,7 +4740,7 @@ pub fn parse_owned(sess: &std::sync::Arc<crate::Session>, src: Vec<u8>, edition:
 /// Parses `src` (with its tokens when lexed already). With a macro scope, `macro_rules!` and
 /// the built-in macros expand (the file context `bctx` is what built-ins need, builtins.rs);
 /// the scope's definitions and lookups come back with the file.
-pub fn parse_owned_ctx(sess: &std::sync::Arc<crate::Session>, mut src: Vec<u8>, pre: Option<Vec<Tok>>, edition: u16, macros: Option<crate::macros::MacroScope>, krate: &str, bctx: Option<std::rc::Rc<crate::builtins::FileCtx>>, lazy: bool) -> Result<(ParsedFile, Option<crate::macros::MacroUse>), (u32, String)> {
+pub fn parse_owned_ctx(sess: &std::sync::Arc<crate::Session>, src: Vec<u8>, pre: Option<Vec<Tok>>, edition: u16, macros: Option<crate::macros::MacroScope>, krate: &str, bctx: Option<std::rc::Rc<crate::builtins::FileCtx>>, lazy: bool) -> Result<(ParsedFile, Option<crate::macros::MacroUse>), (u32, String)> {
     parse_owned_input(sess, src, pre, edition, macros, krate, bctx, lazy, None, None).map_err(|(s, m)| (s.lo, m))
 }
 
