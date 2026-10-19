@@ -2492,7 +2492,15 @@ impl<'a> Parser<'a> {
         self.foreign_abi = Some(abi);
         let items = self.assoc_items();
         self.foreign_abi = saved;
-        items
+        let items = items?;
+        // rustc_parse `parse_item_kind` in an extern block: `const` is not a foreign item
+        for &id in self.ast.list(items) {
+            let it = self.ast.item(id);
+            if matches!(it.kind, ItemKind::Const(..)) {
+                return Err(PErr { pos: it.lo, msg: "extern items cannot be `const`".into() });
+            }
+        }
+        Ok(items)
     }
 
     fn impl_generics_ahead(&self) -> bool {
