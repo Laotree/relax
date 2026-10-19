@@ -2279,13 +2279,11 @@ impl<'a> Fcx<'a> {
                 self.coerce_or_unify(t, expected, Some(*e), ast.expr(*e).lo);
             }
             Pat::Range(a, b, _) => {
-                if let Some(a) = a {
-                    let t = self.check_expr(*a, Some(expected));
-                    self.eq(t, expected);
-                }
-                if let Some(b) = b {
-                    let t = self.check_expr(*b, Some(expected));
-                    self.eq(t, expected);
+                // rustc pat.rs check_pat_range: each end has the scrutinee's type (demand_eqtype_pat)
+                for end in [a, b].into_iter().flatten() {
+                    let t = self.check_expr(*end, Some(expected));
+                    let pos = self.ast().expr(*end).lo;
+                    self.demand_eq(expected, t, pos);
                 }
             }
             Pat::Tuple(v) => {
@@ -2531,7 +2529,7 @@ impl<'a> Fcx<'a> {
                         }
                         let v: Vec<TyId> = self.ast().list(elems).iter().map(|_| self.fresh(0)).collect();
                         let tt = self.tcx.tys.intern(TyKind::Tuple(self.tcx.tys.mk_list(&v)));
-                        self.eq(st, tt);
+                        self.demand_eq(st, tt, lo);
                         v
                     }
                 };
@@ -4933,7 +4931,9 @@ impl<'a> Fcx<'a> {
                     if self.loops[i].is_loop {
                         match self.loops[i].break_ty {
                             Some(prev) => {
-                                self.eq(prev, bt);
+                                // rustc check_expr_break: every `break` coerces to the loop's type
+                                let bpos = match x.get() { Some(v) => self.ast().expr(v).lo, None => lo };
+                                self.demand_eq(prev, bt, bpos);
                             }
                             None => self.loops[i].break_ty = Some(bt),
                         }
