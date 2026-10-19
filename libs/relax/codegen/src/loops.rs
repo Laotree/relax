@@ -1465,16 +1465,39 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
     let mut budget = 800usize;
     // innermost first (natural_loops sorts by size); loops nested in a changed one are skipped
     let mut touched = vec![false; f.blocks.len()];
-    'next: for (h, m) in &loops {
+    'next: for (h, m0) in &loops {
         let h = *h;
-        let members: Vec<u32> = (0..m.len() as u32).filter(|b| m[*b as usize]).collect();
-        if members.iter().any(|b| touched[*b as usize]) {
+        let core: Vec<u32> = (0..m0.len() as u32).filter(|b| m0[*b as usize]).collect();
+        if core.iter().any(|b| touched[*b as usize]) {
             continue;
         }
         // innermost: no other loop's header inside
-        if loops.iter().any(|(h2, _)| *h2 != h && m[*h2 as usize]) {
+        if loops.iter().any(|(h2, _)| *h2 != h && m0[*h2 as usize]) {
             continue;
         }
+        // The loop's panic exits (a bounds check's failing edge: a small block that calls the panic
+        // routine and never returns, entered only from the loop) travel with its copies: each copy
+        // has its own, reading its own counter, and once the copy's checks fold (constant index
+        // against a known length) they are dead. They are not early exits.
+        let mut mm = m0.clone();
+        let mut tails: Vec<u32> = Vec::new();
+        for &b in &core {
+            for sc in f.blocks[b as usize].term.succs() {
+                let sb = &f.blocks[sc as usize];
+                if !mm[sc as usize] && matches!(sb.term, Term::Unreachable) && sb.insts.len() <= 8 && !sb.insts.is_empty()
+                    && preds[sc as usize].len() == 1
+                    && m0[preds[sc as usize][0] as usize]
+                    && !loops.iter().any(|(h2, _)| *h2 == sc)
+                {
+                    mm[sc as usize] = true;
+                    tails.push(sc);
+                }
+            }
+        }
+        let m = &mm;
+        let mut members = core.clone();
+        members.extend(tails.iter().copied());
+        members.sort_unstable();
         let size: usize = members.iter().map(|b| f.blocks[*b as usize].insts.len() + 1).sum();
         if tr {
             eprintln!("full-unroll {}: loop b{} {} blocks {} insts", f.name, h, members.len(), size);
@@ -1483,7 +1506,7 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         if size > 160 {
             continue;
         }
-        if members.iter().any(|b| f.blocks[*b as usize].insts.iter().any(|i| matches!(i, Inst::Call(..))) || matches!(f.blocks[*b as usize].term, Term::Invoke(..) | Term::Resume)) {
+        if core.iter().any(|b| f.blocks[*b as usize].insts.iter().any(|i| matches!(i, Inst::Call(..))) || matches!(f.blocks[*b as usize].term, Term::Invoke(..) | Term::Resume)) {
             continue;
         }
         let latches: Vec<u32> = members.iter().copied().filter(|b| f.blocks[*b as usize].term.succs().any(|s| s == h)).collect();
