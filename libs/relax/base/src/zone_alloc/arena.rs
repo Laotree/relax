@@ -88,6 +88,9 @@ static CHECK: AtomicU8 = AtomicU8::new(0);
 const WARM_MAX: usize = 256;
 const WARM_TOUCHED_MAX: usize = 256 << 10;
 const WARM_BYTES_MAX: usize = 32 << 20;
+/// An emptied chunk of a thread that was carved beyond this goes back to the shared state at once
+/// (the warm list or the OS); a lighter one stays the thread's for its next block.
+const OWNED_KEEP_MAX: usize = 32 << 10;
 struct Warm {
     runs: [(usize, usize); WARM_MAX], // (chunk index, touched bytes)
     len: usize,
@@ -1157,7 +1160,7 @@ impl Arena {
                 h.account.store(h.account.load(Ordering::Relaxed).wrapping_sub(requested), Ordering::Relaxed);
                 // An emptied chunk that has been carved far goes back at once (its pages are
                 // released as before); a lightly used one stays the thread's, ready for its next block.
-                if live == 0 && o.bump.load(Ordering::Relaxed) > WARM_TOUCHED_MAX {
+                if live == 0 && o.bump.load(Ordering::Relaxed) > OWNED_KEEP_MAX {
                     self.release_emptied(index, self.class_idx(need, l.align()));
                 }
                 return;
