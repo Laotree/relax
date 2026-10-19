@@ -1312,6 +1312,7 @@ impl MacroScope {
                 && d.input.as_ref().is_some_and(|input| input.local_inner == local_inner && input.tokens == tokens)
         }).cloned();
         if let Some(d) = same {
+            uses::defined(&d);
             self.local.push(d);
             *self.memo.get_mut() = LookupMemo::default();
         } else {
@@ -1338,6 +1339,7 @@ impl MacroScope {
     /// one equal to a registered one is that same definition (its identity is what `replays`
     /// compares).
     pub fn define(&mut self, d: MacroDef) {
+        uses::defined(&d);
         let same = self.table.defs.get(&d.name).and_then(|v| {
             v.iter().rev().find(|x| x.krate == d.krate && x.exported == d.exported && x.builtin == d.builtin && x.arms == d.arms && x.def_file == d.def_file && x.def_pos == d.def_pos).cloned()
         });
@@ -1769,6 +1771,74 @@ fn same_expansion(a: &MacroDef, b: &MacroDef) -> bool {
             })
     }
     a.name == b.name && a.krate == b.krate && a.builtin == b.builtin && a.arms.len() == b.arms.len() && a.arms.iter().zip(&b.arms).all(|(x, y)| m(&x.0, &y.0) && t(&x.1, &y.1))
+}
+
+
+/// The `macro_rules!` definitions and uses a `makepad check` records for the `unused_macros` and
+/// `unused_macro_rules` lints (rustc_resolve: a macro is used when an invocation resolves to it,
+/// a rule when an expansion matched it).
+pub mod uses {
+    use super::{close_of, is_open, MTok, MacroDef};
+    use crate::lexer::T;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    /// A definition: where it is written, and for each rule the position of its matcher and
+    /// whether its transcriber holds a `compile_error!` (such a rule is never reported).
+    pub struct Defined {
+        pub file: String,
+        pub pos: u32,
+        pub name: String,
+        pub exported: bool,
+        pub rules: Vec<(u32, bool)>,
+    }
+
+    /// An invocation that resolved to a definition without matching any rule.
+    pub const RESOLVED: u32 = u32::MAX;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static DEFS: Mutex<Vec<Defined>> = Mutex::new(Vec::new());
+    static USED: Mutex<Option<HashSet<(String, u32, u32)>>> = Mutex::new(None);
+
+    pub fn record(on: bool) { ON.store(on, Ordering::Relaxed); }
+    pub fn recording() -> bool { ON.load(Ordering::Relaxed) }
+
+    pub(super) fn defined(d: &MacroDef) {
+        if !recording() || d.builtin != 0 { return; }
+        let Some(input) = &d.input else { return };
+        let toks: &[MTok] = &input.tokens;
+        let mut rules = Vec::new();
+        let mut i = 0;
+        while i < toks.len() {
+            if toks[i].kind == T::Semi { i += 1; continue; }
+            if !is_open(toks[i].kind) { break; }
+            let mc = close_of(toks, i);
+            let pos = toks[i].pos;
+            i = mc + 1;
+            if i >= toks.len() || toks[i].kind != T::FatArrow { break; }
+            i += 1;
+            if i >= toks.len() || !is_open(toks[i].kind) { break; }
+            let bc = close_of(toks, i);
+            let compile_error = toks[i..bc].windows(3).any(|w| w[0].text == "compile_error" && w[1].kind == T::Not && is_open(w[2].kind));
+            rules.push((pos, compile_error));
+            i = bc + 1;
+        }
+        let mut defs = DEFS.lock().unwrap_or_else(|e| e.into_inner());
+        if !defs.iter().any(|x| x.file == d.def_file && x.pos == d.def_pos) {
+            defs.push(Defined { file: d.def_file.clone(), pos: d.def_pos, name: d.name.clone(), exported: d.exported, rules });
+        }
+    }
+
+    pub(super) fn used(d: &MacroDef, arm: u32) {
+        if !recording() || d.builtin != 0 { return; }
+        USED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((d.def_file.clone(), d.def_pos, arm));
+    }
+
+    /// The recorded definitions and uses (file, definition position, rule or `RESOLVED`).
+    pub fn take() -> (Vec<Defined>, HashSet<(String, u32, u32)>) {
+        (std::mem::take(&mut *DEFS.lock().unwrap_or_else(|e| e.into_inner())), USED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default())
+    }
 }
 
 fn is_open(k: T) -> bool {
@@ -2312,10 +2382,12 @@ impl<'a> Parser<'a> {
     pub fn expand_rules(&mut self, def: &MacroDef, lo: usize, hi: usize) -> Result<(String, Vec<(u32, u32, u32)>, Vec<(u32, u32, u32)>), String> {
         let _profile = crate::load_profile::span(self.session.runtime.profile, "macro-rules", &def.name);
         let (lo, hi) = self.desugar_doc_comments(lo, hi);
-        for (matcher, body) in &def.arms {
+        uses::used(def, uses::RESOLVED);
+        for (arm, (matcher, body)) in def.arms.iter().enumerate() {
             let mut binds = HashMap::default();
             let mut i = lo;
             if self.match_seq(matcher, &mut i, hi, &mut binds) && i == hi {
+                uses::used(def, arm as u32);
                 // `$crate` names the defining crate itself, even where the caller reaches the macro
                 // only through a re-export (no dependency of that name)
                 let krate_path = if def.krate == self.krate { "crate".to_string() } else { format!("::__relax_crate_{}", def.krate) };

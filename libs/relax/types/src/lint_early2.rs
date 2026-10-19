@@ -890,3 +890,41 @@ fn back_kw_pos(pf: &crate::parser::ParsedFile, at: u32, kw: &str) -> u32 {
     let n = kw.len() as u32;
     if j >= n && pf.bytes(j - n, j) == kw.as_bytes() { j - n } else { at }
 }
+
+// ---------------------------------------------------------------- unused_macros / unused_macro_rules
+
+pub const UNUSED_MACROS: Lint = lint::lint("unused_macros", Level::Warn, &["unused"]);
+pub const UNUSED_MACRO_RULES: Lint = lint::lint("unused_macro_rules", Level::Allow, &["unused"]);
+
+/// rustc_resolve `check_unused_macros`, after the checked crates' bodies are all expanded: a
+/// private `macro_rules!` no invocation resolved to, and the rules of the others that no
+/// expansion matched.
+pub fn finish(prog: &Program, own: &[bool]) {
+    if !lint::enabled() { return; }
+    let (defs, used) = crate::macros::uses::take();
+    if defs.is_empty() { return; }
+    for d in defs {
+        if d.exported || d.file.is_empty() || d.name.starts_with('_') { continue; }
+        let Some(file) = prog.file_paths.iter().position(|p| *p == d.file) else { continue };
+        let krate = prog.file_crate.get(file).copied().unwrap_or(u32::MAX);
+        if !own.get(krate as usize).copied().unwrap_or(false) { continue; }
+        let pf = &prog.files[file];
+        // the definition's own node gives the lint level (a macro written by a macro has none:
+        // the enclosing definition does)
+        let def = (0..prog.defs.len()).map(|i| DefId(i as u32)).find(|&i| {
+            let x = prog.def(i);
+            x.kind == DefKind::MacroRules && x.file == file as u32 && pf.ast.item(x.item).name.lo == d.pos
+        }).unwrap_or_else(|| crate::lint_early::enclosing_def(prog, file as u32, d.pos, krate));
+        let resolved = used.contains(&(d.file.clone(), d.pos, crate::macros::uses::RESOLVED));
+        let any_rule = (0..d.rules.len() as u32).any(|i| used.contains(&(d.file.clone(), d.pos, i)));
+        if !resolved && !any_rule {
+            if pf.expansion_kind(d.pos) == crate::parser::ExpnKind::ExternalRules { continue; }
+            emit(prog, def, &UNUSED_MACROS, file as u32, d.pos, &format!("unused macro definition: `{}`", d.name));
+            continue;
+        }
+        for (i, (pos, compile_error)) in d.rules.iter().enumerate() {
+            if *compile_error || used.contains(&(d.file.clone(), d.pos, i as u32)) { continue; }
+            emit(prog, def, &UNUSED_MACRO_RULES, file as u32, *pos, &format!("rule #{} of macro `{}` is never used", i + 1, d.name));
+        }
+    }
+}

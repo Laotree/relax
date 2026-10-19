@@ -320,6 +320,16 @@ fn tk(pf: &ParsedFile, i: usize) -> crate::lexer::Tok {
     pf.toks.get(i).unwrap_or(crate::lexer::Tok { kind: crate::lexer::T::Eof, lo: u32::MAX, hi: u32::MAX })
 }
 
+/// The innermost definition whose item contains `pos` of `file` (the crate root: none does).
+pub(crate) fn enclosing_def(prog: &Program, file: u32, pos: u32, krate: u32) -> DefId {
+    let mut best = crate_root(prog, krate);
+    let mut size = u32::MAX;
+    for (lo, hi, d) in def_spans(prog, file) {
+        if lo <= pos && pos < hi && hi - lo < size { size = hi - lo; best = d; }
+    }
+    best
+}
+
 fn crate_root(prog: &Program, krate: u32) -> DefId {
     DefId((0..prog.defs.len()).find(|&i| { let d = prog.defs[i]; d.kind == DefKind::Mod && d.parent == crate::program::NO_DEF && d.krate == krate }).unwrap_or(0) as u32)
 }
