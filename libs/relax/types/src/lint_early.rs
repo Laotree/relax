@@ -21,6 +21,7 @@ use std::collections::HashMap;
 
 pub const UNUSED_IMPORT_BRACES: Lint = lint::lint("unused_import_braces");
 pub const BREAK_WITH_LABEL_AND_LOOP: Lint = lint::lint("break_with_label_and_loop");
+pub const AMBIGUOUS_NEGATIVE_LITERALS: Lint = lint::lint("ambiguous_negative_literals");
 pub const UNUSED_PARENS: Lint = lint::lint("unused_parens");
 pub const UNUSED_BRACES: Lint = lint::lint("unused_braces");
 pub const WHILE_TRUE: Lint = lint::lint("while_true");
@@ -843,10 +844,26 @@ impl<'a> W<'a> {
 
     // ------------------------------------------------------------ expressions
 
+    /// rustc `Precedence`: `-1i32.abs()` negates the method call's result.
+    fn ambiguous_negative_literal(&self, _e: ExprId, ex: Expr, operand: ExprId) {
+        let mut arg = operand;
+        let mut at_least_one = false;
+        while let ExprKind::MethodCall(recv, _) = self.kind(arg) {
+            at_least_one = true;
+            arg = recv;
+        }
+        if at_least_one {
+            if let ExprKind::Lit(LitKind::Int | LitKind::Float) = self.kind(arg) {
+                self.emit(&AMBIGUOUS_NEGATIVE_LITERALS, ex.lo, "`-` has lower precedence than method calls, which might be unexpected");
+            }
+        }
+    }
+
     fn expr(&mut self, e: ExprId) {
         let ast = self.ast;
         let ex = *ast.expr(e);
         self.cur = ex.lo;
+        if let ExprKind::Unary(UnOp::Neg, operand) = ex.kind { self.ambiguous_negative_literal(e, ex, operand); }
         let cast_lt = self.cast_followed_by_lt(e);
         if let Some(t) = cast_lt { self.cast_lt.push(t); }
         self.expr_pre(e, ex);

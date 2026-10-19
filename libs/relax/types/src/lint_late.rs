@@ -13,6 +13,7 @@ use crate::typeck::{Body, Res};
 use crate::types::{AliasTyKind, TyId, TyKind};
 
 pub const NON_SHORTHAND_FIELD_PATTERNS: Lint = lint::lint("non_shorthand_field_patterns");
+pub const FUNCTION_CASTS_AS_INTEGER: Lint = lint::lint("function_casts_as_integer");
 pub const UNUSED_MUST_USE: Lint = lint::lint("unused_must_use");
 pub const UNUSED_RESULTS: Lint = lint::lint("unused_results");
 pub const PATH_STATEMENTS: Lint = lint::lint("path_statements");
@@ -432,7 +433,7 @@ impl<'a> Late<'a> {
                 self.check_atomic_load_store(e);
                 self.check_atomic_compare_exchange(e);
             }
-            ExprKind::Cast(x, _) => self.check_trivial_cast(e, x),
+            ExprKind::Cast(x, _) => { self.check_trivial_cast(e, x); self.check_function_cast(e, x); }
             ExprKind::AddrOf(true, _, x) => self.raw_operand = Some(unparen(self.ast, x)),
             ExprKind::Unary(UnOp::Deref, x) => self.check_deref_nullptr(e, x),
             ExprKind::For(row) => self.check_for_loop_fallible(*self.ast.row(row)),
@@ -777,6 +778,15 @@ impl<'a> Late<'a> {
             if self.raw_operand != Some(e) {
                 self.emit(&DEREF_NULLPTR, self.ast.expr(e).lo, "dereferencing a null pointer");
             }
+        }
+    }
+
+    /// rustc function_cast_as_integer.rs: `foo as usize` casts a function item to an integer.
+    fn check_function_cast(&self, e: ExprId, x: ExprId) {
+        let (Some(to), Some(from)) = (self.expr_ty(e), self.expr_ty(x)) else { return };
+        if matches!(self.kind(to), TyKind::FnDef(..) | TyKind::FnPtr(..) | TyKind::Ptr(..)) { return; }
+        if matches!(self.kind(from), TyKind::FnDef(..)) {
+            self.emit(&FUNCTION_CASTS_AS_INTEGER, self.ast.expr(x).hi + 1, "direct cast of function item into an integer");
         }
     }
 
