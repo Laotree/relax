@@ -330,6 +330,8 @@ pub(crate) fn enclosing_def(prog: &Program, file: u32, pos: u32, krate: u32) -> 
     best
 }
 
+pub(crate) fn crate_root_def(prog: &Program, krate: u32) -> DefId { crate_root(prog, krate) }
+
 fn crate_root(prog: &Program, krate: u32) -> DefId {
     DefId((0..prog.defs.len()).find(|&i| { let d = prog.defs[i]; d.kind == DefKind::Mod && d.parent == crate::program::NO_DEF && d.krate == krate }).unwrap_or(0) as u32)
 }
@@ -1108,7 +1110,13 @@ impl<'a> W<'a> {
                 self.expr(a.expr);
                 self.leave(a.attrs);
             }
-            Stmt::Item(_) | Stmt::Empty => {}
+            Stmt::Item(it) => {
+                let item = *ast.item(it);
+                if matches!(item.kind, ItemKind::Use(_)) && self.lt.is_none() {
+                    crate::lint_early2::absolute_use_paths(self.prog, self.def, self.file, &item, &ast.list(item.attrs).to_vec());
+                }
+            }
+            Stmt::Empty => {}
         }
     }
 
@@ -1384,11 +1392,16 @@ impl<'a> W<'a> {
         if p.has_qself() {
             if let Some(q) = ast.qself(p) {
                 self.ty(q.ty);
-                if let Some(tp) = q.trait_path { self.path(&tp); }
+                if let Some(tp) = q.trait_path {
+                    self.path(&tp);
+                    // rustc resolves the trait part of a qualified path twice
+                    if self.lt.is_none() { crate::lint_early2::absolute_path(self.prog, self.def, &self.stack, self.file, &tp, 1); }
+                }
             }
         }
         for seg in ast.segs(p.segs) { self.generic_args(seg.args()); }
         self.hidden_lifetimes(p);
+        if lint::enabled() && self.lt.is_none() { crate::lint_early2::absolute_path(self.prog, self.def, &self.stack, self.file, p, 1); }
     }
 
     /// rustc_resolve `resolve_elided_lifetimes_in_path`: `elided_lifetimes_in_paths` for each

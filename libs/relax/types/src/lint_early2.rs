@@ -647,8 +647,9 @@ pub fn check_module_items(prog: &Program, own: &[bool]) {
             let item = ast.item(it);
             if !matches!(item.kind, ItemKind::Use(_) | ItemKind::ExternCrate(_)) { continue; }
             let attrs: Vec<(u32, Attr)> = ast.list(item.attrs).iter().map(|a| (file, *a)).collect();
-            if attrs.is_empty() { continue; }
             let own_attrs: Vec<Attr> = ast.list(item.attrs).to_vec();
+            if matches!(item.kind, ItemKind::Use(_)) { absolute_use_paths(prog, d, file, item, &own_attrs); }
+            if attrs.is_empty() { continue; }
             attr_checks(prog, &AttrNode { d, inner: &own_attrs, attrs: &attrs, is_crate: false, macro_use_target: matches!(item.kind, ItemKind::ExternCrate(_)) });
         }
     }
@@ -925,6 +926,118 @@ pub fn finish(prog: &Program, own: &[bool]) {
         for (i, (pos, compile_error)) in d.rules.iter().enumerate() {
             if *compile_error || used.contains(&(d.file.clone(), d.pos, i as u32)) { continue; }
             emit(prog, def, &UNUSED_MACRO_RULES, file as u32, *pos, &format!("rule #{} of macro `{}` is never used", i + 1, d.name));
+        }
+    }
+}
+
+// ---------------------------------------------------------------- absolute_paths_not_starting_with_crate
+
+pub const ABSOLUTE_PATHS_NOT_STARTING_WITH_CRATE: Lint = lint::lint("absolute_paths_not_starting_with_crate", Level::Allow, &["rust_2018_compatibility"]);
+const ABSOLUTE_PATHS_MSG: &str = "absolute paths must start with `self`, `super`, `crate`, or an external crate name in the 2018 edition";
+
+/// The crate root's `extern crate name;` items that keep their name (and the crate the compiler
+/// injects): a path through one of them is already fine in the 2018 edition.
+fn root_extern_crates(prog: &Program, krate: u32) -> Vec<String> {
+    let rm = prog.crates[krate as usize].root_mod;
+    let file = prog.mods[rm as usize].file;
+    let pf = &prog.files[file as usize];
+    let ast = &pf.ast;
+    let mut out = vec!["std".to_string(), "core".to_string()];
+    for it in ast.root_items.iter() {
+        let item = ast.item(*it);
+        if let ItemKind::ExternCrate(None) = item.kind { out.push(pf.text(item.name).to_string()); }
+    }
+    out
+}
+
+/// rustc_resolve `lint_if_path_starts_with_module` for a path written with a leading `::` in a
+/// 2015 crate (expression, pattern and type paths): `::name::..` where `name` is no extern crate.
+pub(crate) fn absolute_path(prog: &Program, d: DefId, inner: &[Attr], file: u32, p: &Path, times: usize) {
+    let pf = &prog.files[file as usize];
+    if pf.edition != 2015 || !p.global() { return; }
+    let ast = &pf.ast;
+    let segs = ast.segs(p.segs);
+    let Some(second) = segs.first() else { return };
+    // the path's first segment is the one after the `::`; the lint needs one more behind it
+    if segs.len() < 1 || second.kind() != SegKind::Ident { return; }
+    let krate = prog.def(d).krate;
+    let name = pf.text(second.name);
+    if root_extern_crates(prog, krate).iter().any(|c| c == name) { return; }
+    for _ in 0..times {
+        if !lint::external(prog, file, p.lo) {
+            emit_in(prog, d, inner, &ABSOLUTE_PATHS_NOT_STARTING_WITH_CRATE, file, p.lo, ABSOLUTE_PATHS_MSG);
+        }
+    }
+}
+
+/// The same lint on a `use` item of a 2015 crate: its path implicitly starts at the crate root.
+pub(crate) fn absolute_use_paths(prog: &Program, d: DefId, file: u32, item: &Item, attrs: &[Attr]) {
+    let pf = &prog.files[file as usize];
+    if pf.edition != 2015 { return; }
+    let ast = &pf.ast;
+    let ItemKind::Use(r) = item.kind else { return };
+    let u = *ast.row(r);
+    let krate = prog.def(d).krate;
+    // where the use tree starts: the token after `use`
+    let mut at = item.lo;
+    let mut i = pf.toks.partition_point(|t| t.lo < item.lo);
+    while let Some(t) = pf.toks.get(i) {
+        if pf.bytes(t.lo, t.hi) == b"use" { at = pf.toks.get(i + 1).map_or(item.lo, |n| n.lo); break; }
+        i += 1;
+        if i > pf.toks.partition_point(|t| t.lo < item.lo) + 12 { break; }
+    }
+    struct Leaf { module: Vec<Ident>, ident: Option<Ident>, glob: bool }
+    fn collect(ast: &Ast, tree: UseTree, prefix: &mut Vec<(Ident, SegKind)>, out: &mut Vec<(Vec<(Ident, SegKind)>, Option<(Ident, SegKind)>, bool)>) {
+        match tree {
+            UseTree::Path(seg, rest) => {
+                prefix.push((seg.name, seg.kind()));
+                collect(ast, *ast.use_tree(rest), prefix, out);
+                prefix.pop();
+            }
+            UseTree::Name(seg, _) => {
+                if seg.kind() == SegKind::SelfValue {
+                    // `foo::{self}` imports `foo`
+                    if let Some(&last) = prefix.last() { out.push((prefix[..prefix.len() - 1].to_vec(), Some(last), false)); }
+                } else {
+                    out.push((prefix.clone(), Some((seg.name, seg.kind())), false));
+                }
+            }
+            UseTree::Glob => out.push((prefix.clone(), None, true)),
+            UseTree::Group(l) => {
+                if ast.list(l).is_empty() {
+                    // an empty group imports its prefix
+                    if let Some(&last) = prefix.last() { out.push((prefix[..prefix.len() - 1].to_vec(), Some(last), false)); }
+                }
+                for t in ast.list(l) { collect(ast, *t, prefix, out); }
+            }
+        }
+    }
+    let mut leaves = Vec::new();
+    collect(ast, u.tree, &mut Vec::new(), &mut leaves);
+    let externs = root_extern_crates(prog, krate);
+    let root = crate::lint_early::crate_root_def(prog, krate);
+    for (module, ident, glob) in leaves {
+        // the first segment of the full path: a keyword segment is not made absolute
+        let first = module.first().map(|m| m.1).or(ident.map(|i| i.1));
+        if !u.global && !matches!(first, Some(SegKind::Ident)) { continue; }
+        let _ = Leaf { module: Vec::new(), ident: None, glob: false };
+        let count = if let Some(second) = module.first() {
+            // `use a::b::c`: the path resolved up to its module part, once
+            let n = pf.text(second.0);
+            if externs.iter().any(|c| c == n) { 0 } else { 1 }
+        } else if glob || ident.is_none() {
+            1
+        } else {
+            // `use a;`: once for each namespace `a` is bound in at the root
+            let (id, _) = ident.unwrap();
+            let name = pf.text(id);
+            if externs.iter().any(|c| c == name) { 0 } else {
+                let sym = prog.syms.intern_late(name);
+                [true, false].iter().filter(|&&ns| prog.lookup_in_container(root, sym, ns).is_some()).count()
+            }
+        };
+        for _ in 0..count {
+            if !lint::external(prog, file, at) { emit_in(prog, d, attrs, &ABSOLUTE_PATHS_NOT_STARTING_WITH_CRATE, file, at, ABSOLUTE_PATHS_MSG); }
         }
     }
 }
