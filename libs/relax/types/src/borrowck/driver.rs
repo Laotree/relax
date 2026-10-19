@@ -87,7 +87,8 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
         owners.push(CheckedBody { owner: typeck.def, kind: OwnerKind::Closure(crate::ast::ExprId(c)) });
     }
     let Some(item) = CheckedBody::item(prog, typeck.def) else {
-        v.unchecked.push(format!("{name}: not a body owner"));
+        let d = prog.def(typeck.def);
+        v.unchecked.push(format!("{name}: not a body owner ({:?}, item kind {})", d.kind, match &prog.files[d.file as usize].ast.item(d.item).kind { crate::ast::ItemKind::Static(_, _, init) => format!("static init={}", init.is_some()), _ => "other".into() }));
         return v;
     };
     owners.push(item);
