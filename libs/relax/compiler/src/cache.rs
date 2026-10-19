@@ -67,13 +67,15 @@ const COHERENCE_VERSION: u32 = 1;
 pub struct OwnerVerdicts {
     cfg: u128,
     fps: Vec<u128>,
+    /// interface fingerprints: they carry which crates the loader binds (items::crate_ifaces)
+    ifaces: Vec<u128>,
     epoch: u64,
     store: Option<std::sync::Arc<Store>>,
 }
 
 impl OwnerVerdicts {
-    fn new(cfg: u128, fps: Vec<u128>, epoch: u64, store: Option<std::sync::Arc<Store>>) -> Self {
-        Self { cfg, fps, epoch, store }
+    fn new(cfg: u128, fps: Vec<u128>, ifaces: Vec<u128>, epoch: u64, store: Option<std::sync::Arc<Store>>) -> Self {
+        Self { cfg, fps, ifaces, epoch, store }
     }
     pub fn lookup(&self, prog: &crate::program::Program, def: DefId, epoch: u64) -> (Option<u128>, Option<StoredVerdict>) {
         // Startup fingerprints cannot validate live edits or subsequently loaded modules: a
@@ -83,12 +85,13 @@ impl OwnerVerdicts {
         let krate = prog.def(def).krate;
         let edited = crate::reload::edited_crates();
         if !edited.is_empty() && reaches_edited(prog, krate, &edited) { return (None, None); }
-        let Some(fp) = self.fps.get(krate as usize) else { return (None, None) };
+        let (Some(fp), Some(iface)) = (self.fps.get(krate as usize), self.ifaces.get(krate as usize)) else { return (None, None) };
         let mut h = Sip128::new();
         h.str("borrowck-owner");
         h.u32(BORROWCK_VERSION);
         h.u128(self.cfg);
         h.u128(*fp); // includes the crate's transitive dependencies
+        h.u128(*iface); // ... and which of them the loader binds
         crate::stable::def_ident(prog, def, &mut h);
         let key = h.finish128();
         let stored = match self.store.as_ref().and_then(|st| st.get(key)) {
@@ -1923,7 +1926,7 @@ impl Cache {
 
     pub fn owner_verdicts(&self, epoch: u64) -> OwnerVerdicts {
         let store = self.code_path.first().and_then(|p| self.stores.iter().find(|st| st.path == *p)).cloned();
-        OwnerVerdicts::new(self.cfg, self.fps.clone(), epoch, store)
+        OwnerVerdicts::new(self.cfg, self.fps.clone(), self.iface.clone(), epoch, store)
     }
 
     /// Records a completed verdict (written with the next flush).
@@ -5661,7 +5664,7 @@ mod data_tests {
         let sess = &std::sync::Arc::new(crate::Session::default());
         let (root, mut prog, _) = front_fixture(sess, "owner-verdict");
         let owner = DefId(prog.defs.iter().position(|d| d.krate == 2 && d.kind == DefKind::Fn).unwrap() as u32);
-        let snapshot = OwnerVerdicts::new(42, crate::stable::crate_fingerprints(&prog), 0, None);
+        let snapshot = OwnerVerdicts::new(42, crate::stable::crate_fingerprints(&prog), vec![0; prog.crates.len()], 0, None);
         let (key, stored) = snapshot.lookup(&prog, owner, 0);
         assert_eq!(stored, None);
         let key = key.unwrap();
@@ -5671,27 +5674,27 @@ mod data_tests {
         let upath = root.join("unchecked.rcs");
         crate::store::append(&upath, vec![NewEntry { key, kind: KIND_BORROWCK, payload: enc_verdict(&unchecked) }], true).unwrap();
         let ustores = vec![std::sync::Arc::new(Store::open(&upath).unwrap())];
-        let snapshot = OwnerVerdicts::new(42, crate::stable::crate_fingerprints(&prog), 0, ustores.first().cloned());
+        let snapshot = OwnerVerdicts::new(42, crate::stable::crate_fingerprints(&prog), vec![0; prog.crates.len()], 0, ustores.first().cloned());
         assert_eq!(snapshot.lookup(&prog, owner, 0), (Some(key), Some(unchecked)));
         drop(ustores);
         crate::store::append(&path, vec![NewEntry { key, kind: KIND_BORROWCK, payload: enc_verdict(&StoredVerdict::Clean) }], true).unwrap();
         let stores = vec![std::sync::Arc::new(Store::open(&path).unwrap())];
-        let snapshot = OwnerVerdicts::new(42, crate::stable::crate_fingerprints(&prog), 0, stores.first().cloned());
+        let snapshot = OwnerVerdicts::new(42, crate::stable::crate_fingerprints(&prog), vec![0; prog.crates.len()], 0, stores.first().cloned());
         assert_eq!(snapshot.lookup(&prog, owner, 0), (Some(key), Some(StoredVerdict::Clean)));
         // another epoch (the program was collected again) or another compiler build never reuses it
         assert_eq!(snapshot.lookup(&prog, owner, 1), (None, None));
-        assert_eq!(OwnerVerdicts::new(43, crate::stable::crate_fingerprints(&prog), 0, stores.first().cloned()).lookup(&prog, owner, 0).1, None);
+        assert_eq!(OwnerVerdicts::new(43, crate::stable::crate_fingerprints(&prog), vec![0; prog.crates.len()], 0, stores.first().cloned()).lookup(&prog, owner, 0).1, None);
         // Change a dependency body while preserving all paths and definition ids.
         let file = prog.defs.iter().find(|d| d.krate == 0 && d.kind == DefKind::Fn).unwrap().file as usize;
         prog.files[file] = std::sync::Arc::new(crate::parser::parse_owned(sess, b"pub fn value() -> u32 { 9 }".to_vec(), 2021).unwrap());
-        let snapshot = OwnerVerdicts::new(42, crate::stable::crate_fingerprints(&prog), 0, stores.first().cloned());
+        let snapshot = OwnerVerdicts::new(42, crate::stable::crate_fingerprints(&prog), vec![0; prog.crates.len()], 0, stores.first().cloned());
         let (changed, stored) = snapshot.lookup(&prog, owner, 0);
         assert_ne!(changed, Some(key));
         assert_eq!(stored, None);
         // An edit to the owner itself also invalidates the verdict.
         let file = prog.def(owner).file as usize;
         prog.files[file] = std::sync::Arc::new(crate::parser::parse_owned(sess, b"pub fn value() -> u32 { 11 }".to_vec(), 2021).unwrap());
-        let snapshot = OwnerVerdicts::new(42, crate::stable::crate_fingerprints(&prog), 0, stores.first().cloned());
+        let snapshot = OwnerVerdicts::new(42, crate::stable::crate_fingerprints(&prog), vec![0; prog.crates.len()], 0, stores.first().cloned());
         let (edited, stored) = snapshot.lookup(&prog, owner, 0);
         assert_ne!(edited, changed);
         assert_eq!(stored, None);
@@ -6655,7 +6658,7 @@ impl Cache {
         h.str("const-value");
         h.u128(self.cfg);
         h.write(&e.0);
-        for &c in &crates { h.u128(*self.fps.get(c as usize)?); }
+        for &c in &crates { h.u128(*self.fps.get(c as usize)?); h.u128(*self.iface.get(c as usize)?); }
         Some((h.finish128(), self.dominant(&crates)))
     }
 
