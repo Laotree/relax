@@ -4862,7 +4862,7 @@ mod cold_tests {
         assert_eq!(proof.ifaces, cache.iface_plain);
         // the stored interfaces are bound-set free: run, check and check --boundary of one program bind
         // different sets and take the same image, folding their own set in (apply_bound)
-        let bound = [(1u32, 7u64)];
+        let bound = [(0u32, 7u64)];
         assert_ne!(items::apply_bound(&saved, &proof.ifaces, &bound), proof.ifaces);
         assert_eq!(items::apply_bound(&saved, &proof.ifaces, &bound), items::apply_bound(&unit.prog, &cache.iface_plain, &bound));
         assert_eq!(items::apply_bound(&saved, &proof.ifaces, &[]), proof.ifaces);
