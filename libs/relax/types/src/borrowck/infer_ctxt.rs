@@ -89,7 +89,7 @@ use crate::lang_items::LangItem;
 use crate::types::{UniverseIndex, AliasTyKind};
 use crate::types::variance::V;
 use crate::next_solver::{Goal, Predicate, PredicateKind, ClauseKind, Term};
-use crate::next_solver::type_op::{Normalize, ProvePredicate, CustomTypeOp};
+use crate::next_solver::type_op::{Normalize, ProvePredicate, CustomTypeOp, AscribeUserType};
 
 impl<'tcx> BorrowckInferCtxt<'tcx> {
     /// type_check/mod.rs: the driver supplies the renumbered body's universal
@@ -113,11 +113,15 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
     fn fully_perform_op<Op: TypeOp>(&self, out: &mut MirTypeckRegionConstraints, locations: Locations, category: ConstraintCategory, op: Op) -> Result<Op::Output, NoSolution> {
         let span = match locations { Locations::All(s) => s, Locations::Single(_) => locations.span(self.mir_body.expect("MIR type ops require configure_mir")) };
         let before = self.infcx.universe();
+        let input = op.input();
         let result = super::type_check::canonical::fully_perform_op_raw(self,
             self.universal_regions.as_ref().expect("MIR type ops require universal regions"), &self.region_bound_pairs,
             &self.param_env.clauses, out, locations, span, category, op);
         if result.is_err() { self.tainted_by_errors.set(true); }
-        for u in before.0 + 1..=self.infcx.universe().0 { out.universe_causes.push((UniverseIndex(u), super::type_check::UniverseInfo::TypeOp)); }
+        if self.infcx.universe().0 > before.0 {
+            let info = std::sync::Arc::new(super::type_check::TypeOpErrorInfo { base_universe: before, input });
+            for u in before.0 + 1..=self.infcx.universe().0 { out.universe_causes.push((UniverseIndex(u), super::type_check::UniverseInfo::TypeOp(info.clone()))); }
+        }
         result
     }
 
@@ -162,12 +166,11 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
         self.tcx.tys.intern(TyKind::Closure(id.file, id.expr, closure_args))
     }
 
-    fn operand_ty(&self, body: &Body, operand: &mir::Operand) -> TyId {
+    pub(crate) fn operand_ty(&self, body: &Body, operand: &mir::Operand) -> TyId {
         match operand {
             mir::Operand::Copy(p) | mir::Operand::Move(p) => p.ty(body, self.tcx).expect("typed MIR place").ty,
             mir::Operand::Constant(c) => match &c.const_ {
-                mir::Const::Val(_, ty) | mir::Const::Ty(ty, _) => *ty,
-                mir::Const::Unevaluated { def, args, .. } => BorrowckTypeOps::unevaluated_const_ty(self, *def, args),
+                mir::Const::Val(_, ty) | mir::Const::Ty(ty, _) | mir::Const::Unevaluated { ty, .. } => *ty,
             },
             mir::Operand::RuntimeChecks(_) => self.tcx.tys.bool_,
         }
@@ -248,15 +251,40 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
             crate::typeck::ty_to_string(false, self.prog, self.tcx, ty), suggested));
         self.tainted_by_errors.set(true); self.tcx.tys.error
     }
-    fn instantiate_canonical_user_type(&mut self, _: Span, _: &crate::types::user_type::CanonicalUserType) -> UserType { panic!("M2b: canonical user-type annotations on MIR Body") }
-    fn ascribe_user_type(&mut self, _: &mut MirTypeckRegionConstraints, _: TyId, _: UserType, _: Span) { panic!("M2b: canonical user-type annotations on MIR Body") }
+    /// type_check/mod.rs check_user_type_annotations: `instantiate_canonical` -- every canonical
+    /// variable becomes a fresh inference variable (regions are `Misc` variables, which
+    /// the region driver reads as existential).
+    fn instantiate_canonical_user_type(&mut self, _: Span, user: &crate::types::user_type::CanonicalUserType) -> UserType {
+        crate::next_solver::canonical::user_type::instantiate_user_type(&self.infcx, user)
+    }
+    /// type_check/mod.rs ascribe_user_type: the `AscribeUserType` type op at `Locations::All(span)`.
+    fn ascribe_user_type(&mut self, out: &mut MirTypeckRegionConstraints, inferred: TyId, user: UserType, span: Span) {
+        let op = ParamEnvAnd { param_env: self.param_env_id(), value: AscribeUserType { mir_ty: inferred, user_ty: user } };
+        let _ = self.fully_perform_op(out, Locations::All(span), ConstraintCategory::Boring, op);
+    }
     fn ascribe_user_type_skip_wf(&mut self, out: &mut MirTypeckRegionConstraints, inferred: TyId, user: TyId, span: Span) {
         let env = self.param_env_id();
         let _ = self.fully_perform_op(out, Locations::All(span), ConstraintCategory::Boring, CustomTypeOp::new(|ocx: &mut crate::next_solver::fulfill::ObligationCtxt<'_, '_>| {
             let user = ocx.normalize_ty(&env, user); ocx.eq(&env, user, inferred)
         }));
     }
-    fn closure_user_provided_sig(&mut self, _: &Body) -> Option<FnSig> { panic!("M2b: canonical closure user-provided signatures") }
+    /// input_output.rs:42-56: the closure's written signature, canonical variables and the
+    /// `FnPtr` binder instantiated with fresh variables.
+    fn closure_user_provided_sig(&mut self, body: &Body) -> Option<FnSig> {
+        let mir::BodyKind::Closure(expr) = body.source.kind else { return None };
+        let typeck = self.tcx.typeck(self.prog, self.root_def_id);
+        let canonical = typeck.user_provided_sigs.get(&expr)?.clone();
+        let sig = crate::next_solver::canonical::user_type::instantiate_user_signature(&self.infcx, &canonical);
+        let TyKind::FnPtr(inputs, output, header, bound) = *self.tcx.tys.kind(sig) else { unreachable!("closure signature is a FnPtr") };
+        let regions: Vec<_> = (0..bound).map(|_| self.infcx.next_region_var()).collect();
+        let replace = |r: RegionId, depth| match self.tcx.tys.region_kind(r) {
+            RegionKind::ReBound(d, var) if d == depth => regions[var.0 as usize],
+            RegionKind::ReBound(d, var) if d > depth => self.tcx.tys.intern_region(RegionKind::ReBound(d - 1, var)),
+            _ => r,
+        };
+        let inputs = self.tcx.tys.list(inputs).iter().map(|&t| self.tcx.tys.map_regions(t, &replace, 0)).collect();
+        Some(FnSig { inputs, output: self.tcx.tys.map_regions(output, &replace, 0), header })
+    }
     fn fn_def_sig(&self, def: DefId, args: &[TyId], regions: crate::types::RegionArgsId) -> PolyFnSig {
         let args = self.tcx.complete_args(self.prog, def, args, regions);
         let sig = self.tcx.fn_item_sig(self.prog, def).expect("FnDef signature");
@@ -384,14 +412,9 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
         let ty = self.tcx.type_of(self.prog, def).expect("constant declaration type");
         self.tcx.instantiate_ty(self.prog, def, args, ty)
     }
+    /// `ConstOperand::check_static_ptr` over the body's allocation table.
     fn static_ptr(&self, constant: &ConstOperand) -> Option<DefId> {
-        match &constant.const_ {
-            // Round 29 D8: M2b owns GlobalAlloc identity, alongside user type
-            // annotations and closure signatures in the round-19 typed-MIR input list.
-            mir::Const::Val(mir::ConstValue::Scalar(mir::Scalar::Ptr { .. }), _) =>
-                panic!("M2b: GlobalAlloc static identity for MIR pointer constants"),
-            _ => None,
-        }
+        constant.const_.check_static_ptr(&self.mir_body.expect("MIR type ops require configure_mir").allocs)
     }
     fn static_ty(&mut self, out: &mut MirTypeckRegionConstraints, def: DefId, locations: Locations) -> TyId {
         let ty = self.tcx.const_ty(self.prog, def).expect("static declaration type");
@@ -455,5 +478,95 @@ mod round33_tests {
         // five: iteration 5 is past the limit before it sees the tail (Limit::value_within_limit)
         assert_eq!(BorrowckTypeOps::struct_tail(&mut infcx, &mut out, nest(5), at), tcx.tys.error);
         assert!(infcx.tainted_by_errors.get(), "reaching the limit is a reported error");
+    }
+}
+
+// N01's context for liveness (type_check/liveness/trace.rs, for_liveness.rs).
+impl super::type_check::liveness::LivenessOps for BorrowckInferCtxt<'_> {
+    /// trace.rs compute_drop_data: the `DropckOutlives` type op in the body's environment. A failing
+    /// query reports and yields no kinds and no constraints.
+    fn dropck_outlives(&mut self, ty: TyId, span: Span) -> super::type_check::liveness::DropckData {
+        use crate::next_solver::dropck_outlives::DropckOutlives;
+        let op = ParamEnvAnd { param_env: self.param_env_id(), value: DropckOutlives { dropped_ty: ty } };
+        match op.fully_perform(&self.infcx, self.prog) {
+            Ok(TypeOpOutput { output, constraints }) => super::type_check::liveness::DropckData { kinds: output.kinds, overflows: output.overflows, region_constraint_data: constraints },
+            Err(_) => {
+                let _ = span;
+                self.errors.report(self.cause, format!("failed to compute the drop requirements of `{}`", crate::typeck::ty_to_string(false, self.prog, self.tcx, ty)));
+                self.tainted_by_errors.set(true);
+                Default::default()
+            }
+        }
+    }
+    /// for_liveness.rs FreeRegionsVisitor: free regions that must be live, except that an alias
+    /// with a unique outlives bound in its item bounds or the environment needs only that
+    /// region, one with a `'static` bound none, and otherwise its non-bivariant arguments.
+    fn free_regions_for_liveness(&mut self, value: GenericArg) -> Vec<RegionId> {
+        use crate::types::fold::TypeFolder;
+        let tys = &self.tcx.tys;
+        let mut visitor = FreeRegionsVisitor { cx: &*self, found: Vec::new() };
+        match value {
+            GenericArg::Lifetime(r) => visitor.region(r),
+            GenericArg::Type(ty) => { visitor.fold_ty(tys, ty, 0); }
+            GenericArg::Const(c) => { visitor.fold_const(tys, c, 0); }
+        }
+        visitor.found
+    }
+    fn push_region_constraints(&mut self, out: &mut MirTypeckRegionConstraints, locations: Locations, span: Span, category: ConstraintCategory,
+        data: &crate::next_solver::type_op::QueryRegionConstraints) {
+        let universals = self.universal_regions.as_ref().expect("MIR type ops require universal regions");
+        super::type_check::constraint_conversion::ConstraintConversion::new(self, universals, &self.region_bound_pairs, &self.param_env.clauses,
+            locations, span, category, out).convert_all(data);
+    }
+}
+
+struct FreeRegionsVisitor<'a, 'tcx> { cx: &'a BorrowckInferCtxt<'tcx>, found: Vec<RegionId> }
+impl FreeRegionsVisitor<'_, '_> {
+    fn region(&mut self, r: RegionId) {
+        // ignore bound regions, keep visiting
+        if !matches!(self.cx.tcx.tys.region_kind(r), RegionKind::ReBound(..)) { self.found.push(r); }
+    }
+}
+impl crate::types::fold::TypeFolder for FreeRegionsVisitor<'_, '_> {
+    fn fold_flags(&self) -> Option<crate::types::TypeFlags> { Some(crate::types::TypeFlags::HAS_FREE_REGIONS) }
+    fn fold_region(&mut self, _: &crate::types::Types, r: RegionId, depth: u32) -> RegionId {
+        if !matches!(self.cx.tcx.tys.region_kind(r), RegionKind::ReBound(d, _) if d >= depth) { self.region(r); }
+        r
+    }
+    fn fold_ty(&mut self, tys: &crate::types::Types, ty: TyId, depth: u32) -> TyId {
+        if !tys.flags(ty).intersects(crate::types::TypeFlags::HAS_FREE_REGIONS) { return ty; }
+        // (#117455: alias bounds are not considered on types with escaping bound vars)
+        if tys.has_vars_bound_at_or_above(ty, depth) { return crate::types::fold::super_fold_ty(tys, ty, self, depth); }
+        let TyKind::Alias(_, alias) = *tys.kind(ty) else { return crate::types::fold::super_fold_ty(tys, ty, self, depth); };
+        let (tcx, prog) = (self.cx.tcx, self.cx.prog);
+        let def = alias.kind.def_id();
+        let args = tcx.complete_args(prog, def, tys.list(alias.args), alias.regions);
+        let mut bounds = Vec::new();
+        let from_item = tcx.item_bounds(prog, def).iter().map(|p| tcx.instantiate_predicate(prog, def, &args, p)).collect::<Vec<_>>();
+        for clause in from_item.iter().chain(self.cx.param_env.clauses.iter()) {
+            let PredicateKind::Clause(ClauseKind::TypeOutlives(subject, bound)) = clause.kind else { continue };
+            if !clause.has_bound_vars(tys) {
+                if subject == ty { bounds.push(bound); }
+            } else if let Some(r) = crate::infer::outlives::test_type_match::extract_verify_if_eq(tcx, prog, clause, ty) {
+                bounds.push(r);
+            }
+        }
+        let static_ = tys.intern_region(RegionKind::ReStatic);
+        if bounds.contains(&static_) {
+            // the alias captures no regions
+        } else if let Some(&r) = bounds.first().filter(|r| bounds[1..].iter().all(|o| o == *r)) {
+            self.region(r);
+        } else {
+            let variances = tcx.opt_alias_variances(prog, alias.kind);
+            for (idx, arg) in args.iter().enumerate() {
+                if variances.as_ref().map(|v| v[idx]) == Some(crate::types::variance::V::Bi) { continue; }
+                match *arg {
+                    GenericArg::Lifetime(r) => { crate::types::fold::TypeFolder::fold_region(self, tys, r, depth); }
+                    GenericArg::Type(t) => { self.fold_ty(tys, t, depth); }
+                    GenericArg::Const(c) => { self.fold_const(tys, c, depth); }
+                }
+            }
+        }
+        ty
     }
 }
