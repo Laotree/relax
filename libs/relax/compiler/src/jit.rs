@@ -192,6 +192,8 @@ pub struct Rt {
 /// `Rt` as symbols (syms.rs): what lowering and glue put into RIR.
 #[derive(Clone, Copy)]
 pub struct RtSyms {
+    /// the start of every thread's thread-local block (offset 0): `Inst::TlsAddr` of it is the block's address
+    pub tls_base: crate::rir::Sym,
     pub fmt_str: crate::rir::Sym,
     pub fmt_int: crate::rir::Sym,
     pub fmt_float: crate::rir::Sym,
@@ -2309,7 +2311,7 @@ impl Unit {
             static_spans: Default::default(),
             sites: Default::default(),
             site_ix: Default::default(),
-            rs: RtSyms { fmt_str: crate::rir::Sym::new(0), fmt_int: crate::rir::Sym::new(0), fmt_float: crate::rir::Sym::new(0), fmt_print: crate::rir::Sym::new(0), panic_site: crate::rir::Sym::new(0), panic_bounds: crate::rir::Sym::new(0), str_eq: crate::rir::Sym::new(0), fmod: crate::rir::Sym::new(0), fmodf: crate::rir::Sym::new(0), panic_impl: crate::rir::Sym::new(0), thread_run: crate::rir::Sym::new(0), catch_panic: crate::rir::Sym::new(0), args: crate::rir::Sym::new(0), memcpy: crate::rir::Sym::new(0), memmove: crate::rir::Sym::new(0), memset: crate::rir::Sym::new(0), fmt_push: crate::rir::Sym::new(0), fmt_pop: crate::rir::Sym::new(0), resume: crate::rir::Sym::new(0), land: crate::rir::Sym::new(0), panicking: crate::rir::Sym::new(0), rethrow: crate::rir::Sym::new(0) },
+            rs: RtSyms { tls_base: crate::rir::Sym::new(0), fmt_str: crate::rir::Sym::new(0), fmt_int: crate::rir::Sym::new(0), fmt_float: crate::rir::Sym::new(0), fmt_print: crate::rir::Sym::new(0), panic_site: crate::rir::Sym::new(0), panic_bounds: crate::rir::Sym::new(0), str_eq: crate::rir::Sym::new(0), fmod: crate::rir::Sym::new(0), fmodf: crate::rir::Sym::new(0), panic_impl: crate::rir::Sym::new(0), thread_run: crate::rir::Sym::new(0), catch_panic: crate::rir::Sym::new(0), args: crate::rir::Sym::new(0), memcpy: crate::rir::Sym::new(0), memmove: crate::rir::Sym::new(0), memset: crate::rir::Sym::new(0), fmt_push: crate::rir::Sym::new(0), fmt_pop: crate::rir::Sym::new(0), resume: crate::rir::Sym::new(0), land: crate::rir::Sym::new(0), panicking: crate::rir::Sym::new(0), rethrow: crate::rir::Sym::new(0) },
             syms: crate::syms::Syms::new(syms_base, rw_base),
             cache: None,
             pending_cache_records: Vec::new(),
@@ -2453,6 +2455,7 @@ impl Unit {
             fmod: u.syms.intern(crate::syms::SymKind::Rt("fmod"), u.rt.fmod),
             fmodf: u.syms.intern(crate::syms::SymKind::Rt("fmodf"), u.rt.fmodf),
             panic_impl: u.syms.intern(crate::syms::SymKind::Rt("panic_impl"), u.rt.panic_impl),
+            tls_base: u.syms.intern(crate::syms::SymKind::Rt("tls_base"), 0),
             thread_run: u.syms.intern(crate::syms::SymKind::Rt("thread_run"), u.rt.thread_run),
             catch_panic: u.syms.intern(crate::syms::SymKind::Rt("catch_panic"), u.rt.catch_panic),
             args: u.syms.intern(crate::syms::SymKind::Rt("args"), u.rt.args),
