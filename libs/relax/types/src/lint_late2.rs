@@ -485,6 +485,7 @@ impl<'a> Visitor<'a> for L2<'a> {
         self.lint_ptr_nulls(e);
         self.lint_transmutes(e);
         self.lint_unsafe_block(e);
+        self.lint_invalid_value(e);
         self.lint_closure_returning_async_block(e);
         if matches!(ast.expr(e).kind, ExprKind::Path(_)) { self.lint_prelude_path(e); }
         match ast.expr(e).kind {
@@ -1478,6 +1479,130 @@ pub fn check_signature_deprecations(prog: &Program, tcx: &Tcx, own: &[bool]) {
             if let Some((future, msg)) = dp.message(target, DefId(i as u32)) {
                 lint::emit(prog, DefId(i as u32), if future { &crate::lint_late::DEPRECATED_IN_FUTURE } else { &crate::lint_late::DEPRECATED }, d.file, pos, &msg);
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- invalid_value (rustc_lint builtin.rs InvalidValue)
+
+pub const INVALID_VALUE: Lint = lint::lint("invalid_value", Level::Warn, &[]);
+
+#[derive(Clone, Copy, PartialEq)]
+enum InitKind { Zeroed, Uninit }
+
+impl<'a> L2<'a> {
+    fn is_zero_expr(&self, e: ExprId) -> bool {
+        let e = unparen(self.ast, e);
+        match self.ast.expr(e).kind {
+            ExprKind::Lit(LitKind::Int) => {
+                let x = self.ast.expr(e);
+                let t = std::str::from_utf8(self.prog.files[self.body.file as usize].bytes(x.lo, x.hi)).unwrap_or("");
+                crate::const_fold::parse_int_lit(t) == Some(0)
+            }
+            ExprKind::Tuple(xs) => self.ast.list(xs).iter().all(|&x| self.is_zero_expr(x)),
+            _ => false,
+        }
+    }
+
+    fn dangerous_init(&self, e: ExprId) -> Option<InitKind> {
+        let ast = self.ast;
+        match ast.expr(e).kind {
+            ExprKind::Call(f, args) => {
+                let d = self.call_def(f)?;
+                match diag_name(self.prog, d).as_deref() {
+                    Some("mem_zeroed") => Some(InitKind::Zeroed),
+                    Some("mem_uninitialized") => Some(InitKind::Uninit),
+                    Some("transmute") if ast.list(args).first().is_some_and(|&a| self.is_zero_expr(a)) => Some(InitKind::Zeroed),
+                    _ => None,
+                }
+            }
+            ExprKind::MethodCall(recv, _) => {
+                let m = self.body.methods.get(&e.0)?;
+                if diag_name(self.prog, m.def).as_deref() != Some("assume_init") { return None; }
+                let ExprKind::Call(f, _) = ast.expr(unparen(ast, recv)).kind else { return None };
+                let d = self.call_def(f)?;
+                match diag_name(self.prog, d).as_deref() {
+                    Some("maybe_uninit_zeroed") => Some(InitKind::Zeroed),
+                    Some("maybe_uninit_uninit") => Some(InitKind::Uninit),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `variant_find_init_error` for a struct / a variant; the message of the first problem.
+    fn variant_init_error(&self, ty: TyId, d: DefId, vi: usize, args: crate::types::TyList, init: InitKind, depth: u32) -> Option<String> {
+        let a = self.tcx.adts.get(&d)?;
+        let var = a.variants.get(vi)?;
+        let mut field_err = None;
+        for f in &var.fields {
+            let ft = self.tcx.tys.subst(f.ty, self.tcx.tys.list(args));
+            if let Some(m) = self.ty_init_error(ft, init, depth + 1) { field_err = Some(m); break; }
+        }
+        // a constrained layout (NonNull, NonZero ...)
+        if a.valid_start.is_some() || a.valid_end.is_some() {
+            let non_null = a.valid_start.is_some_and(|s| s > 0);
+            let msg = if non_null { "must be non-null" } else if init == InitKind::Uninit { "must be initialized inside its custom valid range" } else { return field_err };
+            let _ = ty;
+            return Some(format!("`{}` {}", crate::typeck::ty_to_string(false, self.prog, self.tcx, ty), msg));
+        }
+        field_err
+    }
+
+    /// `ty_find_init_error`: Some only when the type definitely does not allow the init.
+    fn ty_init_error(&self, ty: TyId, init: InitKind, depth: u32) -> Option<String> {
+        if depth > 16 { return None; }
+        let ty = self.norm(ty);
+        match self.kind(ty) {
+            TyKind::Ref(..) => Some("references must be non-null".into()),
+            TyKind::Adt(d, ..) if Some(d) == self.lang(LangItem::OwnedBox) => Some("`Box` must be non-null".into()),
+            TyKind::FnPtr(..) => Some("function pointers must be non-null".into()),
+            TyKind::Never => Some("the `!` type has no valid value".into()),
+            TyKind::Ptr(_, i) if matches!(self.kind(i), TyKind::Dyn(..)) => Some("the vtable of a wide raw pointer must be non-null".into()),
+            TyKind::Bool if init == InitKind::Uninit => Some("booleans must be either `true` or `false`".into()),
+            TyKind::Char if init == InitKind::Uninit => Some("characters must be a valid Unicode codepoint".into()),
+            TyKind::Int(_) if init == InitKind::Uninit => Some("integers must be initialized".into()),
+            TyKind::Float(_) if init == InitKind::Uninit => Some("floats must be initialized".into()),
+            TyKind::Ptr(..) if init == InitKind::Uninit => Some("raw pointers must be initialized".into()),
+            TyKind::Adt(d, args, _) => {
+                let a = self.tcx.adts.get(&d)?;
+                if a.is_union { return None; }
+                if !a.is_enum { return self.variant_init_error(ty, d, 0, args, init, depth); }
+                // enums: skip the uninhabited variants
+                let inhabited: Vec<(usize, bool)> = (0..a.variants.len()).filter_map(|vi| {
+                    let tys: Vec<TyId> = a.variants[vi].fields.iter().map(|f| self.tcx.tys.subst(f.ty, self.tcx.tys.list(args))).collect();
+                    if tys.iter().any(|&t| self.pcx_uninhabited(t)) { None } else { Some((vi, true)) }
+                }).collect();
+                match inhabited.len() {
+                    0 => Some("enums with no inhabited variants have no valid value".into()),
+                    1 => self.variant_init_error(ty, d, inhabited[0].0, args, init, depth),
+                    n => if init == InitKind::Uninit && n > 1 { Some("enums with multiple inhabited variants have to be initialized to a variant".into()) } else { None },
+                }
+            }
+            TyKind::Tuple(l) => self.tcx.tys.list(l).iter().find_map(|&f| self.ty_init_error(f, init, depth + 1)),
+            TyKind::Array(e, n) => match n.try_to_target_usize(&self.tcx.tys) {
+                Some(v) if v > 0 => self.ty_init_error(e, init, depth + 1),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn pcx_uninhabited(&self, t: TyId) -> bool {
+        crate::pattern_analysis::body_cx(self.prog, self.tcx, self.body).is_uninhabited(t)
+    }
+
+    fn lint_invalid_value(&self, e: ExprId) {
+        let Some(init) = self.dangerous_init(e) else { return };
+        let Some(ty) = self.expr_ty(e) else { return };
+        if self.ty_init_error(ty, init, 0).is_some() {
+            let ts = crate::typeck::ty_to_string(false, self.prog, self.tcx, ty);
+            let msg = match init {
+                InitKind::Zeroed => format!("the type `{}` does not permit zero-initialization", ts),
+                InitKind::Uninit => format!("the type `{}` does not permit being left uninitialized", ts),
+            };
+            self.emit(&INVALID_VALUE, self.ast.expr(e).lo, &msg);
         }
     }
 }
