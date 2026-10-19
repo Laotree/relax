@@ -28,6 +28,8 @@ pub struct BorrowckInferCtxt<'tcx> {
     pub region_bound_pairs: Vec<(TyId, RegionId)>,
     /// What location-aware type ops need of the body being checked, recorded by `observe_body`.
     pub mir_view: Option<MirView>,
+    /// The views of the bodies being checked around the current one (a promoted's parent).
+    mir_views_outer: Vec<Option<MirView>>,
     pub reg_var_to_origin: RefCell<HashMap<RegionVid, RegionCtxt>>,
 }
 
@@ -50,7 +52,7 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
         for p in &*result.clauses { clauses.push(tcx.instantiate_predicate(prog, def_id, &full, p)); }
         let param_env = ParamEnv { clauses: clauses.into() };
         let param_env_id = std::cell::OnceCell::new();
-        BorrowckInferCtxt { infcx, prog, root_def_id, param_env, param_env_id, tainted_by_errors: std::cell::Cell::new(false), encountered_re_error: std::cell::Cell::new(false), universal_regions: None, region_bound_pairs: Vec::new(), mir_view: None, reg_var_to_origin: RefCell::new(HashMap::default()) }
+        BorrowckInferCtxt { infcx, prog, root_def_id, param_env, param_env_id, tainted_by_errors: std::cell::Cell::new(false), encountered_re_error: std::cell::Cell::new(false), universal_regions: None, region_bound_pairs: Vec::new(), mir_view: None, mir_views_outer: Vec::new(), reg_var_to_origin: RefCell::new(HashMap::default()) }
     }
 
     pub(crate) fn param_env_id(&self) -> crate::tcx::ParamEnvId {
@@ -457,6 +459,12 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
         let parent = args[..identity.len()].to_vec(); (identity, parent)
     }
     fn unsized_fn_params(&self) -> bool { false } // DEBLOAT: unstable unsized_fn_params.
+    fn enter_body(&mut self, body: &Body) {
+        let outer = self.mir_view.take();
+        self.mir_views_outer.push(outer);
+        self.observe_body(body);
+    }
+    fn leave_body(&mut self) { self.mir_view = self.mir_views_outer.pop().expect("leave_body matches enter_body"); }
     fn is_inline_const(&self, def: DefId) -> bool { matches!(self.prog.def_id_to_node_id.get(&def), Some((_, relax_front::def_collector::NodeId::InlineConst(_)))) }
 }
 

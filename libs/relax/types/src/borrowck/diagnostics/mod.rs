@@ -113,15 +113,9 @@ pub fn render_fv_only(cx: &DiagCx<'_>, result: &MirBorrowckResult) -> Vec<Borrow
     result.fv_only.iter().map(|e| capture(cx.prog, cx.owner, &render_error(cx, e))).collect()
 }
 
-/// The export records (source text of the field-level borrows) of one body, for
-/// `borrowck::export::rewrite`.
-pub fn render_fv_records(cx: &DiagCx<'_>, result: &MirBorrowckResult) -> Vec<super::export::FvRecord> {
-    let sp = |s: Span| super::bir::Span { lo: s.lo, hi: s.hi };
-    result.fv_records.iter().map(|r| super::export::FvRecord {
-        file: r.span.file, span: sp(r.span),
-        place: r.place.as_ref().and_then(|p| cx.describe_place(p)).unwrap_or_default(),
-        default: r.default, access: sp(r.access), hoist: r.hoist.as_ref().map(|h| h.iter().map(|s| sp(*s)).collect()),
-    }).collect()
+/// The export to rustc of one body's field-view acceptances as typed edits.
+pub fn render_fv_rewrites(cx: &DiagCx<'_>, result: &MirBorrowckResult) -> Vec<super::field_views::edit::PlannedRewrite> {
+    super::field_views::edit::plan(cx.prog, &result.fv_records)
 }
 
 /// What the callees of a narrowed borrow touch: "`m` uses mutably `a` and shared `b`".

@@ -133,6 +133,10 @@ pub trait BorrowckTypeOps: liveness::LivenessOps {
     fn unsized_fn_params(&self) -> bool;
     /// `def_kind == AnonConst && anon_const_kind == NonTypeSystemInline`.
     fn is_inline_const(&self, def: DefId) -> bool;
+    /// A promoted body is type checked in its parent's context: location-aware ops number points and
+    /// read spans in the body being checked, so the context follows `enter_body`/`leave_body`.
+    fn enter_body(&mut self, _body: &Body) {}
+    fn leave_body(&mut self) {}
 }
 
 /// Where region constraints are required to hold (mod.rs:346).
@@ -343,7 +347,9 @@ impl<'a> TypeChecker<'a> {
             std::mem::swap(&mut this.deferred_closure_requirements, d);
         };
         swap(self, &mut constraints, &mut liveness_constraints, &mut deferred);
+        self.infcx.enter_body(promoted_body);
         self.visit_body(promoted_body);
+        self.infcx.leave_body();
         self.body = parent_body;
         self.location_map = parent_map;
         swap(self, &mut constraints, &mut liveness_constraints, &mut deferred);
@@ -1060,6 +1066,9 @@ impl<'a> TypeChecker<'a> {
                         self.mirbug(format!("bad promoted type ({ty:?}: {promoted_ty:?}): {terr:?}"));
                     }
                 }
+                // An anonymous constant (array length, inline const) has no declared type: its type is the one
+                // typeck inferred for its body, which is `ty` itself, so there is nothing to relate.
+                Const::Unevaluated { def, promoted: None, .. } if self.prog.def(*def).kind == crate::program::DefKind::AnonConst => {}
                 Const::Unevaluated { def, args, promoted: None, .. } => {
                     let span = locations.span(self.body);
                     self.infcx.ascribe_user_type(&mut self.constraints, ty, UserType::new(UserTypeKind::TypeOf(*def, UserArgs { args: args.clone(), user_self_ty: None })), span);

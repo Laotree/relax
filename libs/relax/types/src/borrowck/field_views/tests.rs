@@ -274,7 +274,7 @@ fn extended_two_phase_borrows_accept_a_reborrow_before_the_call() {
 
 #[test]
 fn rendered_notes_and_export_records_name_the_places() {
-    use crate::borrowck::diagnostics::{region_name::UniversalNames, render_fv_only, render_fv_records, DiagCx};
+    use crate::borrowck::diagnostics::{region_name::UniversalNames, render_fv_only, DiagCx};
     let f = fx();
     let mut b = overlap_body(&f);
     b.var_debug_info.push(VarDebugInfo { name: "s".into(), source_info: SourceInfo::default(), place: p(1) });
@@ -289,8 +289,4 @@ fn rendered_notes_and_export_records_name_the_places() {
     assert_eq!(only.len(), 1);
     assert!(only[0].fv_only);
     assert!(only[0].notes.iter().any(|n| n == "accepted with field views (relaxed Rust): `bump` uses mutably `s.b`"), "{:?}", only[0].notes);
-    let recs = render_fv_records(&cx, &r);
-    assert_eq!(recs.len(), 1);
-    assert_eq!(recs[0].place, "s.a");
-    let _ = OutlivesConstraintSet::default();
 }

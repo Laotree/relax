@@ -43,7 +43,6 @@ use crate::program::DefId;
 use crate::tcx::{Tcx, outlives::RegionContract};
 use crate::types::{TyId, TyKind, RegionId, RegionKind, RegionScope, LateParamKind, BoundVar};
 use crate::types::fold::{BoundVarReplacer, TypeFolder};
-use crate::borrowck::rty::Rty;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Identity { Static, Region(RegionScope, RegionId), FnBody(RegionScope) }
@@ -58,27 +57,7 @@ pub struct SignatureRegions {
     pub contract: RegionContract, pub fr_static: usize, pub fr_fn_body: usize,
     pub query_placeholders: Vec<RegionId>,
 }
-/// Selection may erase an ADT's entire lifetime argument list. Restore its
-/// declared arity before enumerating free regions, so signature projection and
-/// the BIR layout visit the same slots. Each erased occurrence is subsequently
-/// instantiated independently, as in nightly's closure argument renumbering.
-pub fn with_erased_adt_regions(tcx: &Tcx, ty: TyId) -> TyId {
-    struct Restore<'a>(&'a Tcx);
-    impl TypeFolder for Restore<'_> {
-        fn fold_ty(&mut self, tys: &crate::types::Types, ty: TyId, depth: u32) -> TyId {
-            let ty = crate::types::fold::super_fold_ty(tys, ty, self, depth);
-            if let TyKind::Adt(d, args, rs) = tys.kind(ty) {
-                let n = self.0.adts.get(d).map_or(0, |adt| adt.generic_indices.lifetimes.len());
-                if *rs == crate::types::RegionArgsId::EMPTY && n != 0 {
-                    return tys.intern(TyKind::Adt(*d, args.clone(), tys.intern_region_args(&vec![RegionId::ERASED; n])));
-                }
-            }
-            ty
-        }
-    }
-    Restore(tcx).fold_ty(&tcx.tys, ty, 0)
-}
-enum DefiningTy { FnDef(DefId, bool), Const(DefId), Closure { owner: DefId, expr: u32, signature: TyId, bound: TyId, annotation_eq: bool } }
+enum DefiningTy { FnDef(DefId, bool), Const(DefId), AnonConst(DefId), Closure { owner: DefId, expr: u32, signature: TyId, bound: TyId, annotation_eq: bool } }
 impl DefiningTy {
     fn inputs_and_output(&self, tcx: &Tcx, prog: &Program) -> (Vec<TyId>, TyId, u32) {
         match *self {
@@ -96,6 +75,7 @@ impl DefiningTy {
                 (inputs, sig.ret, bound_regions)
             }
             Self::Const(d) => (vec![],tcx.const_ty(prog, d).unwrap(),0),
+            Self::AnonConst(_) => (vec![],tcx.tys.usize_,0),
             Self::Closure { signature, bound, .. } => {
                 let TyKind::FnPtr(ins,out,_,_) = tcx.tys.kind(signature) else { unreachable!() };
                 let TyKind::FnPtr(_,_,_,n) = tcx.tys.kind(bound) else { unreachable!() };
@@ -104,7 +84,7 @@ impl DefiningTy {
         }
     }
     fn scope(&self) -> RegionScope {
-        match *self { Self::FnDef(d, _) | Self::Const(d) => RegionScope::Item(d), Self::Closure { owner,expr,.. } => RegionScope::Closure { owner,expr } }
+        match *self { Self::FnDef(d, _) | Self::Const(d) | Self::AnonConst(d) => RegionScope::Item(d), Self::Closure { owner,expr,.. } => RegionScope::Closure { owner,expr } }
     }
 }
 struct UniversalRegionIndices { regions: Vec<UniversalRegion> }
@@ -209,18 +189,9 @@ impl SignatureRegions {
             (DefiningTy::Const(owner),tcx.const_region_contract(prog, owner).cloned().unwrap_or_default()) };
         Some(UniversalRegionsBuilder { tcx,prog,defining_ty,parent:None,contract }.build())
     }
-    /// The BIR adapter's closure entry: parents come from the skeleton builder. Selection erased
-    /// the lifetime arguments of the BIR types' ADTs, whose slot layout needs every declared
-    /// position (`with_erased_adt_regions`, deleted with the BIR); the MIR path keeps them.
-    pub fn closure(rty: &Rty<'_>, owner: DefId, expr: u32) -> Option<Self> {
-        let tcx = rty.tx.tcx;
-        let mut sig = *rty.closure_signatures.borrow().get(&expr)?;
-        sig.liberated = with_erased_adt_regions(tcx, sig.liberated);
-        sig.annotation_eq = sig.annotation_eq.map(|(a, b)| (a, with_erased_adt_regions(tcx, b)));
-        let parent = match rty.closure_parents.borrow().get(&expr).copied().flatten() {
-            Some(p) => Self::closure(rty,owner,p)?, None => Self::function(tcx,rty.tx.prog,owner)?,
-        };
-        Self::closure_in(tcx, rty.tx.prog, owner, expr, &sig, parent)
+    /// An array-length anonymous constant: its own root, no inputs, output `usize`, no lifetime parameters in scope.
+    pub fn anon_const(tcx: &Tcx, prog: &Program, owner: DefId) -> Self {
+        UniversalRegionsBuilder { tcx,prog,defining_ty:DefiningTy::AnonConst(owner),parent:None,contract:Default::default() }.build()
     }
     /// A closure's universal regions (universal_regions.rs `DefiningTy::Closure`): its parent's
     /// are external, its own signature's are local. The signature is the typeck result's, with

@@ -909,7 +909,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
                 }
                 owner::call(owner::Class::Background, || {
                     for &id in chunk {
-                        (&mut *up).note_first_borrowck(id);
+                        (&mut *up).note_first_borrowck(id, None);
                     }
                 });
             }
@@ -4512,9 +4512,11 @@ impl Unit {
             f.patch_gen = gen;
             crate::zone_alloc::kept_with(|| self.patch_log.push((id, gen)));
         }
-        // borrowck lane: a fn instance's first code is checked lazily in the background
-        if first && gen == 0 && crate::borrowck::lazy::gandalf_enabled(options) {
-            self.note_first_borrowck(id);
+        // borrowck lane: a fn instance's first code, and every live-patched version of it, is checked
+        // lazily in the background (D3: a patch is never refused synchronously unless --check-first;
+        // its verdict arrives as a Gandalf event, at the front of the queue)
+        if (first && gen == 0 || gen > 0) && crate::borrowck::lazy::gandalf_enabled(options) {
+            self.note_first_borrowck(id, (gen > 0).then_some(0));
         }
         unsafe {
             let slot = self.slots.table(id) as *const AtomicU64;
@@ -4540,7 +4542,7 @@ impl Unit {
 
     /// borrowck lane: slot `id`'s first code (a fn instance) is checked lazily in the background,
     /// unless the disk cache has a verdict for its body.
-    pub(crate) fn note_first_borrowck(&mut self, id: u32) {
+    pub(crate) fn note_first_borrowck(&mut self, id: u32, rank: Option<u32>) {
         let options = &self.prog.session.clone().options;
         // only the running app's own crates are checked in the background (event::admit,
         // the app-crate rule of the live-edit gate): framework, dependency and std
@@ -4568,7 +4570,7 @@ impl Unit {
             let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
             crate::borrowck::lazy::note_program(options, &src, epoch);
             crate::borrowck::lazy::note_compiled(options, &src, crate::borrowck::lazy::NoteFn {
-                def: d, args: a, cache_key: key, epoch, rank: None, cached,
+                def: d, args: a, cache_key: key, epoch, rank, cached,
             });
         }
     }

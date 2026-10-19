@@ -71,7 +71,10 @@ impl BorrowCheckRootCtxt<'_> {
     /// non-defining uses in a nested body may rely on the defining uses in the parent. Requirements
     /// are therefore applied twice for bodies that depend on opaques: modulo opaques, and after.
     /// Bodies that do not depend on opaque types are checked eagerly.
-    pub fn do_mir_borrowck(&self, bodies: Vec<RootBody<'_>>) -> RootResult {
+    pub fn do_mir_borrowck(&self, bodies: Vec<RootBody<'_>>) -> RootResult { self.do_mir_borrowck_fv(bodies, None) }
+
+    /// `do_mir_borrowck` with relaxed-Rust field views (S15) applied to every body's conflict check.
+    pub fn do_mir_borrowck_fv(&self, bodies: Vec<RootBody<'_>>, fv: Option<&super::field_views::FieldViews<'_>>) -> RootResult {
         let n = bodies.len();
         let info: Vec<NestedInfo> = bodies.iter().map(|b| NestedInfo { universals: b.typeck.universals.clone(), closure_slots: b.typeck.closure_slots.clone() }).collect();
         let keys: Vec<ClauseOwner> = bodies.iter().map(|b| b.key).collect();
@@ -102,7 +105,9 @@ impl BorrowCheckRootCtxt<'_> {
             let mut depends_on_opaques = body.infcx.has_opaque_types_in_storage();
             let mut kept = vec![];
             for use_ in std::mem::take(&mut body.typeck.summary.deferred_closure_requirements) {
-                let j = keys.iter().position(|k| *k == use_.def).expect("a nested body is checked with its root");
+                // An inline constant the driver has not built as a body of its own imposes no requirement here
+                // (rustc checks it as a nested body; the driver does not yet).
+                let Some(j) = keys.iter().position(|k| *k == use_.def) else { continue };
                 assert!(j < i, "nested MIR bodies must precede their parent");
                 let requirements = match &finished[j] {
                     Some(done) => done.requirements.clone(),
@@ -122,7 +127,7 @@ impl BorrowCheckRootCtxt<'_> {
                 bodies[i] = Some(body);
             } else {
                 assert!(body.typeck.summary.deferred_closure_requirements.is_empty());
-                { let nested = nested_info(i, &finished); finished[i] = Some(self.check_region_constraints(body, vec![], nested)); }
+                { let nested = nested_info(i, &finished); finished[i] = Some(self.check_region_constraints(body, vec![], nested, fv)); }
             }
         }
 
@@ -157,11 +162,11 @@ impl BorrowCheckRootCtxt<'_> {
         for i in 0..n {
             let Some(mut body) = bodies[i].take() else { continue };
             for use_ in std::mem::take(&mut body.typeck.summary.deferred_closure_requirements) {
-                let j = keys.iter().position(|k| *k == use_.def).expect("a nested body is checked with its root");
+                let Some(j) = keys.iter().position(|k| *k == use_.def) else { continue };
                 let requirements = finished[j].as_ref().expect("nested bodies are finished before their parent").requirements.clone();
                 self.apply_closure_requirements(&mut body, &info[j], requirements.as_ref(), &use_);
             }
-            { let nested = nested_info(i, &finished); finished[i] = Some(self.check_region_constraints(body, std::mem::take(&mut deferred_errors[i]), nested)); }
+            { let nested = nested_info(i, &finished); finished[i] = Some(self.check_region_constraints(body, std::mem::take(&mut deferred_errors[i]), nested, fv)); }
         }
 
         let mut bodies: Vec<CheckedBody> = finished.into_iter().map(|b| b.expect("every body is checked")).collect();
@@ -183,12 +188,12 @@ impl BorrowCheckRootCtxt<'_> {
 
     /// `borrowck_check_region_constraints`: solve the regions and check the body.
     fn check_region_constraints(&self, body: RootBody<'_>, deferred_opaque_type_errors: Vec<DeferredOpaqueTypeError>,
-        (nested_used_mut, coroutine_kinds): (NestedUsedMut, Vec<(u32, crate::mir::CoroutineKind)>)) -> CheckedBody {
+        (nested_used_mut, coroutine_kinds): (NestedUsedMut, Vec<(u32, crate::mir::CoroutineKind)>), fv: Option<&super::field_views::FieldViews<'_>>) -> CheckedBody {
         assert!(body.typeck.summary.deferred_closure_requirements.is_empty());
         let RootBody { body: mir, moves, infcx, typeck, nested, .. } = body;
         let input = typeck.into_region_input(&*infcx);
         let mut regions = compute_regions(self.tcx, self.prog, mir, input, nested);
-        let mut result = mir_borrowck_nested(self.tcx, self.prog, mir, &mut regions, moves, None, &nested_used_mut);
+        let mut result = mir_borrowck_nested(self.tcx, self.prog, mir, &mut regions, moves, fv, &nested_used_mut);
         if regions.regioncx.errors.is_empty() && !deferred_opaque_type_errors.is_empty() { result.tainted_by_errors = true; }
         let requirements = requirements_of(&regions);
         CheckedBody { regions, result, requirements, deferred_opaque_type_errors, coroutine_kinds }
@@ -246,8 +251,16 @@ impl BorrowCheckRootCtxt<'_> {
                 .unwrap_or_else(|| panic!("external region {vid} of a nested body has no identity"));
             if tys.region_kind(identity) == RegionKind::ReStatic { return universals.fr_static; }
             if let Some(&(_, parent_vid)) = universals.indices.iter().find(|(r, _)| *r == identity) { return parent_vid; }
+            // A region erased in the closure's signature stands for the signature's k-th erased region
+            // (`replace_erased_regions_with_placeholders` numbers them in order); the creator's closure type
+            // has a variable at that position.
+            let erased_slot = match tys.region_kind(identity) {
+                RegionKind::RePlaceholder { var, .. } => child.closure_slots.iter().enumerate().filter(|(_, r)| **r == RegionId::ERASED).nth(var.0 as usize).map(|(i, _)| i),
+                _ => None,
+            };
+            if let Some(slot) = erased_slot { return instantiated[slot]; }
             let slot = child.closure_slots.iter().position(|r| *r == identity)
-                .unwrap_or_else(|| panic!("external region {identity:?} of a nested body is neither the parent's nor in its closure type"));
+                .unwrap_or_else(|| panic!("external region {identity:?} = {:?} of a nested body is neither the parent's nor in its closure type (parent regions {:?}, closure slots {:?})", tys.region_kind(identity), universals.indices.iter().map(|(r, _)| tys.region_kind(*r)).collect::<Vec<_>>(), child.closure_slots.iter().map(|r| tys.region_kind(*r)).collect::<Vec<_>>()));
             instantiated[slot]
         }).collect()
     }
