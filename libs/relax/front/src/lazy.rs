@@ -825,6 +825,15 @@ impl Plan {
             hash.u8(self.reached.contains(key) as u8);
         }
         self.selection = hashes.into_iter().map(|h| h.map_or(0, |h| h.finish128())).collect();
+        // A crate whose indexed files are all reached loads exactly what an eager crate loads: its
+        // identity is the eager one. Otherwise the same crate would carry an identity that depends
+        // on whether the early prefix had reached it when its image was recorded or looked up (a
+        // timing accident), and no two programs could share its image or its fingerprint.
+        for ci in 0..self.selection.len() {
+            if self.selection[ci] != 0 && self.indexed.range((ci, String::new())..(ci + 1, String::new())).all(|k| self.reached.contains(k)) {
+                self.selection[ci] = 0;
+            }
+        }
         for (context, &identity) in self.contexts.iter().zip(&self.selection) {
             if identity != 0 { context.set_demand_identity(identity); }
         }

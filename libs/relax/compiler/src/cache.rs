@@ -7,7 +7,9 @@
 //! content hashes: the Relax build, the codegen configuration, the function instance, the
 //! interface fingerprints of every crate the instance can depend on (its definition's crate and
 //! the crates of its type arguments, with their dependencies; cache/items.rs), and its own
-//! body and position. Never timestamps. An entry also names the slots whose RIR its code took
+//! body and position (a bound provided crate marks its own interface fingerprint, so only the code
+//! that can reach it is keyed by it: another app with more or fewer bound crates shares the rest).
+//! Never timestamps. An entry also names the slots whose RIR its code took
 //! in (inlined bodies, nounwind answers, transitively) with their keys: it links only while
 //! those keys are unchanged. So an edit of one fn body recompiles that fn and the code that
 //! inlined it, not its crate and every crate above it. Code entries live in per-crate code
