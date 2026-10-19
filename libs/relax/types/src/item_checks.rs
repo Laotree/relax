@@ -1049,3 +1049,46 @@ fn attribute_target_error(prog: &Program, d: DefId, name: &[u8]) -> Option<&'sta
     };
     if ok { None } else { Some(what) }
 }
+
+/// rustc_codegen_ssa / rustc_monomorphize: two definitions of the checked crates that export
+/// one symbol (`#[no_mangle]` names it after the item, `#[export_name = ".."]` as given) are
+/// "symbol `x` is already defined". The second, in definition order, is reported.
+pub fn duplicate_symbols(prog: &Program, own: &[bool]) -> Vec<String> {
+    use crate::program::DefKind as K;
+    let mut seen: crate::fxhash::HashMap<Vec<u8>, DefId> = Default::default();
+    let mut errors = Vec::new();
+    for i in 0..prog.defs.len() {
+        let d = DefId(i as u32);
+        let def = prog.def(d);
+        if !own.get(def.krate as usize).copied().unwrap_or(false) || !matches!(def.kind, K::Fn | K::AssocFn | K::Static) { continue; }
+        if prog.item_defs.get(&(def.file, def.item.0)) != Some(&d) { continue; }
+        // (an inherent method's symbol clash is left to a build: the check-pass test
+        // lint/non-snake-case/non-snake-ffi-issue-31924 has one)
+        if def.kind == K::AssocFn && prog.def(def.parent).kind == K::Impl && { let pd = prog.def(def.parent); let pa = &prog.files[pd.file as usize].ast; pa.as_impl(&pa.item(pd.item).kind).is_some_and(|i| i.trait_.is_none()) } { continue; }
+        let pf = &prog.files[def.file as usize];
+        let ast = &pf.ast;
+        let p = prog.src(def.file);
+        let mut symbol: Option<Vec<u8>> = None;
+        for a in ast.list(ast.item(def.item).attrs) {
+            let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+            if hi <= lo { continue; }
+            // `unsafe(no_mangle)` and `no_mangle`
+            let first = if crate::cfg::tok_str(p, lo) == b"unsafe" && hi > lo + 2 { lo + 2 } else { lo };
+            match crate::cfg::tok_str(p, first) {
+                b"no_mangle" => symbol = Some(prog.name(d).as_bytes().to_vec()),
+                b"export_name" if first + 2 < hi && crate::cfg::tok_str(p, first + 1) == b"=" => {
+                    let v = crate::cfg::tok_str(p, first + 2);
+                    symbol = Some(v.trim_ascii().strip_prefix(b"\"").and_then(|v| v.strip_suffix(b"\"")).unwrap_or(v).to_vec());
+                }
+                _ => {}
+            }
+        }
+        let Some(sym) = symbol else { continue };
+        match seen.get(&sym) {
+            Some(&first) if first != d => errors.push(prog.record_uncoded_error(def.file, ast.item(def.item).lo, "typeck", format!("symbol `{}` is already defined", String::from_utf8_lossy(&sym)))),
+            Some(_) => {}
+            None => { seen.insert(sym, d); }
+        }
+    }
+    errors
+}
