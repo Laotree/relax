@@ -544,7 +544,7 @@ impl<'a> Cx<'a> {
     fn not_structural(&mut self, t: TyId, pos: Option<u32>) {
         let Some(lo) = pos else { return };
         let name = crate::typeck::ty_to_string(false, self.prog, self.tcx, t);
-        let e = self.prog.record_error(self.body.file, lo, "typeck", format!("constant of non-structural type `{}` in a pattern", name));
+        let e = self.prog.record_uncoded_error(self.body.file, lo, "typeck", format!("constant of non-structural type `{}` in a pattern", name));
         self.const_errors.push(e);
     }
 

@@ -520,7 +520,8 @@ fn is_internal(u: &Unit, own: &[bool], e: &str) -> bool {
         return true;
     }
     let rest = rest.trim_start();
-    let coded = rest.len() > 5 && rest.starts_with('E') && rest[1..5].bytes().all(|b| b.is_ascii_digit());
+    // (an error rustc words without a code: Program::record_uncoded_error)
+    let coded = rest.starts_with(relax_front::diagnostics::UNCODED_PREFIX) || (rest.len() > 5 && rest.starts_with('E') && rest[1..5].bytes().all(|b| b.is_ascii_digit()));
     if !coded {
         return true;
     }
