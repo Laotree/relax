@@ -291,9 +291,6 @@ impl RegionDriverOps for super::infer_ctxt::BorrowckInferCtxt<'_> {
         let mut promoted = std::mem::take(&mut body.promoted);
         super::renumber::renumber_mir(self, body, &mut promoted);
         body.promoted = promoted;
-        // S11 draft: the type ops read the body through `mir_body` (configure_mir). The driver keeps the
-        // body in a Box that outlives this context and does not touch it until the type check is done.
-        self.mir_body = Some(unsafe { &*(body as *const Body) });
     }
     fn observe_body(&mut self, body: &Body) { super::infer_ctxt::BorrowckInferCtxt::observe_body(self, body); }
     fn install_universals(&mut self, universals: &UniversalRegions, region_bound_pairs: &[(TyId, RegionId)]) {
