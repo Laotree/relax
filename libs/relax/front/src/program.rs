@@ -3617,6 +3617,19 @@ impl Program {
             } else {
                 tdef = self.lookup_in_container(parent, last, true);
                 vdef = self.lookup_in_container(parent, last, false);
+                // rustc ignores a namespace whose binding this module cannot see when the other
+                // namespace is accessible (`use validate::validate;` where `validate` also holds
+                // a private glob-imported module of that name); with neither accessible the
+                // privacy error is reported
+                if self.def(parent).kind == DefKind::Mod && tdef.is_some() && vdef.is_some() {
+                    let sub = self.def(parent).sub;
+                    let seen = |p: &Program, ns: bool| {
+                        let mut q = GlobQuery { precise: true, ..Default::default() };
+                        p.lookup_in_module_vis(sub, last, ns, &mut q).map_or(true, |(_, v)| p.vis_visible(v, module))
+                    };
+                    let (tv, vv) = (seen(self, true), seen(self, false));
+                    if tv && !vv { vdef = None; } else if vv && !tv { tdef = None; }
+                }
             }
             if tdef.is_none() && vdef.is_none() {
                 // macros only (e.g. `use crate::log;` for macro_rules) count as resolved
