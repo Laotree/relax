@@ -4013,6 +4013,19 @@ impl<'a> Fcx<'a> {
 
     // ------------------------------------------------------------ blocks
 
+    /// rustc_hir_typeck check_block_no_value: a loop body has type `()` (a `!` body coerces to it);
+    /// the tail expression is a coercion site for the unit expectation.
+    fn check_block_no_value(&mut self, b: BlockId) {
+        let unit = self.tcx.tys.unit;
+        let ty = self.check_block(b, Some(unit));
+        let st = self.shallow(ty);
+        if matches!(self.tcx.tys.kind(st), TyKind::Never) { return; }
+        let blk = self.ast().block(b);
+        let tail = match self.ast().list(blk.stmts).last() { Some(Stmt::Expr(e, false)) => Some(*e), _ => None };
+        let pos = match tail { Some(e) => self.ast().expr(e).lo, None => blk.lo };
+        self.coerce_or_unify(ty, unit, tail, pos);
+    }
+
     fn check_block(&mut self, b: BlockId, expected: Option<TyId>) -> TyId {
         let ast = self.ast();
         let blk = ast.block(b);
@@ -4470,11 +4483,7 @@ impl<'a> Fcx<'a> {
                 self.check_expr(*c, Some(bool_));
                 self.in_loop_condition = false;
                 // a loop body has type `()`: an open tail type is unit (`for _ in r { zeroed() }`)
-                let bt = self.check_block(*b, Some(unit));
-                let sb = self.shallow(bt);
-                if matches!(self.tcx.tys.kind(sb), TyKind::Infer(_)) {
-                    self.eq(sb, unit);
-                }
+                self.check_block_no_value(*b);
                 self.loops.pop();
                 self.in_loop_condition = was_in_condition;
                 self.scopes.truncate(saved);
@@ -4486,11 +4495,7 @@ impl<'a> Fcx<'a> {
                 self.loops.push(Loop { label: l, break_ty: None, is_loop: true });
                 let was_in_condition = std::mem::replace(&mut self.in_loop_condition, false);
                 // a loop body has type `()`: an open tail type is unit (`for _ in r { zeroed() }`)
-                let bt = self.check_block(*b, Some(unit));
-                let sb = self.shallow(bt);
-                if matches!(self.tcx.tys.kind(sb), TyKind::Infer(_)) {
-                    self.eq(sb, unit);
-                }
+                self.check_block_no_value(*b);
                 let lp = self.loops.pop().unwrap();
                 self.in_loop_condition = was_in_condition;
                 match lp.break_ty {
@@ -4519,11 +4524,7 @@ impl<'a> Fcx<'a> {
                 self.loops.push(Loop { label: l, break_ty: None, is_loop: false });
                 let was_in_condition = std::mem::replace(&mut self.in_loop_condition, false);
                 // a loop body has type `()`: an open tail type is unit (`for _ in r { zeroed() }`)
-                let bt = self.check_block(*b, Some(unit));
-                let sb = self.shallow(bt);
-                if matches!(self.tcx.tys.kind(sb), TyKind::Infer(_)) {
-                    self.eq(sb, unit);
-                }
+                self.check_block_no_value(*b);
                 self.loops.pop();
                 self.in_loop_condition = was_in_condition;
                 self.scopes.truncate(saved);
