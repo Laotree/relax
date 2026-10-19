@@ -293,9 +293,12 @@ pub fn compiler_thread() -> ThreadGuard {
 /// is safe to touch from a thread's first statement.
 mod live {
     use std::cell::UnsafeCell;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const N: usize = 512;
+    /// Threads that found the table full: counted, and listed as "<untracked>" so the swap sees
+    /// them as unexpected threads (it waits) instead of missing them.
+    static OVERFLOW: AtomicUsize = AtomicUsize::new(0);
     const NAME: usize = 24;
     struct Table {
         lock: AtomicBool,
@@ -326,22 +329,29 @@ mod live {
                 t[i] = (true, name);
                 i
             }
-            None => usize::MAX,
+            None => {
+                OVERFLOW.fetch_add(1, Ordering::Relaxed);
+                usize::MAX
+            }
         })
     }
 
     pub fn leave(i: usize) {
         if i != usize::MAX {
             with(|t| t[i].0 = false);
+        } else {
+            OVERFLOW.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     pub fn list() -> Vec<String> {
         let names: Vec<[u8; NAME]> = with(|t| t.iter().filter(|s| s.0).map(|s| s.1).collect());
-        names.into_iter().map(|n| {
+        let mut v: Vec<String> = names.into_iter().map(|n| {
             let k = n.iter().position(|b| *b == 0).unwrap_or(NAME);
             String::from_utf8_lossy(&n[..k]).into_owned()
-        }).collect()
+        }).collect();
+        v.extend((0..OVERFLOW.load(Ordering::Relaxed)).map(|_| "<untracked>".to_string()));
+        v
     }
 }
 
