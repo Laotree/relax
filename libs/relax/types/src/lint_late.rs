@@ -1453,6 +1453,35 @@ impl<'a> Kp<'a> {
         }
     }
 
+    /// Whether evaluating constant `d` cannot loop: its initializer is arithmetic over literals
+    /// and other such constants (no cycles, no calls).
+    fn const_terminates(&self, d: DefId, visited: &mut Vec<DefId>) -> bool {
+        if visited.contains(&d) || visited.len() > 24 { return false; }
+        visited.push(d);
+        let def = self.prog.def(d);
+        let ast = &self.prog.files[def.file as usize].ast;
+        let Ok(Some(init)) = self.prog.const_body(def.file, def.item) else { return false };
+        let body = self.tcx.typeck(self.prog, d);
+        if !body.errors.is_empty() { return false; }
+        fn simple(k: &Kp, ast: &Ast, body: &Body, e: ExprId, visited: &mut Vec<DefId>) -> bool {
+            match ast.expr(e).kind {
+                ExprKind::Lit(_) => true,
+                ExprKind::Paren(x) | ExprKind::Unary(_, x) | ExprKind::Cast(x, _) => simple(k, ast, body, x, visited),
+                ExprKind::Binary(_, a, b) => simple(k, ast, body, a, visited) && simple(k, ast, body, b, visited),
+                ExprKind::Path(_) => match body.res.get(&e.0) {
+                    Some(crate::typeck::Res::Def(c)) if matches!(k.prog.def(*c).kind, DefKind::Const | DefKind::AssocConst | DefKind::Variant) => {
+                        k.prog.def(*c).kind == DefKind::Variant || k.const_terminates(*c, visited)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+        let r = simple(self, ast, &body, init, visited);
+        visited.pop();
+        r
+    }
+
     fn eval_const(&self, e: ExprId, d: DefId) -> V {
         let Some((bytes, signed)) = self.int_of(e) else { return V::Unknown };
         let args: Vec<crate::consts::GenericArg> = match self.body.res_args.get(&e.0) {
@@ -1469,6 +1498,8 @@ impl<'a> Kp<'a> {
             }
             None => Vec::new(),
         };
+        // a constant whose value depends on itself (or on code) is left to the evaluator proper
+        if !self.const_terminates(d, &mut Vec::new()) { return V::Unknown; }
         let env = crate::tcx::TypingEnv::fully_monomorphized(self.prog);
         match self.tcx.const_eval_resolve(self.prog, env, d, &args) {
             Ok(v) => match v.try_to_leaf() {
