@@ -431,6 +431,54 @@ pub fn duplicate_generic_params(prog: &Program, d: DefId) -> Vec<String> {
     errors
 }
 
+/// rustc_ast_passes ast_validation validate_generic_param_order and the default rules: lifetime
+/// parameters come before type and const parameters; defaults of type and const parameters are
+/// trailing (structs, enums, unions, aliases, traits) and absent on fns and impls.
+pub fn generic_param_rules(prog: &Program, d: DefId) -> Vec<String> {
+    use crate::ast::{GenericParamKind, ItemKind};
+    let def = prog.def(d);
+    let ast = &prog.files[def.file as usize].ast;
+    let item = ast.item(def.item);
+    let Some(g) = ast.kind_generics(&item.kind) else { return Vec::new() };
+    let params = ast.list(g.params);
+    let mut errors = Vec::new();
+    let mut seen_non_lifetime = false;
+    let mut order_reported = false;
+    for p in params {
+        match p.kind {
+            GenericParamKind::Lifetime(_) => {
+                if seen_non_lifetime && !order_reported {
+                    errors.push(prog.record_error(def.file, p.name.lo, "parse", "lifetime parameters must be declared prior to type and const parameters".to_string()));
+                    order_reported = true;
+                }
+            }
+            _ => seen_non_lifetime = true,
+        }
+    }
+    let has_default = |p: &crate::ast::GenericParam| matches!(p.kind, GenericParamKind::Type(_, Some(_)) | GenericParamKind::Const(_, Some(_)));
+    if matches!(item.kind, ItemKind::Fn(..) | ItemKind::Impl(..)) {
+        for p in params {
+            if has_default(p) {
+                errors.push(prog.record_error(def.file, p.name.lo, "parse", "defaults for generic parameters are not allowed here".to_string()));
+            }
+        }
+    } else {
+        let mut trailing_from = params.len();
+        for (i, p) in params.iter().enumerate().rev() {
+            if matches!(p.kind, GenericParamKind::Lifetime(_)) { continue; }
+            if has_default(p) { trailing_from = i; } else { break; }
+        }
+        let mut reported = false;
+        for (i, p) in params.iter().enumerate() {
+            if has_default(p) && i < trailing_from && !reported && params[i + 1..].iter().any(|q| !matches!(q.kind, GenericParamKind::Lifetime(_)) && !has_default(q)) {
+                errors.push(prog.record_error(def.file, p.name.lo, "parse", "generic parameters with a default must be trailing".to_string()));
+                reported = true;
+            }
+        }
+    }
+    errors
+}
+
 /// rustc_ast_passes `extern` block validation and the lints on them: `unsafe extern` blocks
 /// (`unsafe_code`), plain `extern` blocks (`missing_unsafe_on_extern`, an error from edition
 /// 2024), and a safety qualifier on an item of a plain block.
