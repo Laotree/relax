@@ -37,6 +37,43 @@ fn line_of(prog: &Program, file: u32, pos: u32) -> usize {
     1 + src[..(pos as usize).min(src.len())].iter().filter(|&&c| c == b'\n').count()
 }
 
+/// `mir_const_qualif` of another constant's value (S11: use this as the `ConstQualifsProvider`, construct with `Default` memo): build its MIR and const-check it (memoised; a cycle blocks).
+pub struct BuildProvider<'a> {
+    pub prog: &'a Program,
+    pub tcx: &'a Tcx,
+    pub memo: std::cell::RefCell<std::collections::HashMap<crate::program::DefId, Result<crate::mir::transform::qualifs::ConstQualifs, crate::mir::transform::qualifs::Blocked>>>,
+}
+impl crate::mir::transform::qualifs::ConstQualifsProvider for BuildProvider<'_> {
+    fn mir_const_qualif(&self, def: crate::program::DefId) -> Result<crate::mir::transform::qualifs::ConstQualifs, crate::mir::transform::qualifs::Blocked> {
+        use crate::mir::transform::qualifs::Blocked;
+        if let Some(r) = self.memo.borrow().get(&def) {
+            return r.clone();
+        }
+        // In progress: a cycle blocks.
+        self.memo.borrow_mut().insert(def, Err(Blocked("constant qualification cycle")));
+        let result = (|| {
+            let owner = CheckedBody::item(self.prog, def).ok_or(Blocked("not a body owner"))?;
+            let typeck_body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.tcx.typeck(self.prog, def))).map_err(|_| Blocked("typeck panicked"))?;
+            if !typeck_body.errors.is_empty() {
+                return Err(Blocked("typeck errors"));
+            }
+            let env = TypingEnv {
+                limit: RecursionLimit::for_item(self.prog, typeck_body.def),
+                param_env: typeck_body.param_env.unwrap_or_default(),
+                mode: TypingMode::borrowck(self.tcx, self.prog, typeck_body.def),
+            };
+            let state = EvalState::new();
+            let eval = EvalCx::new(self.prog, self.tcx, env, &state);
+            let root = BuildRoot::new(BuildCx { prog: self.prog, tcx: self.tcx, env, eval: &eval }, &typeck_body).map_err(|_| Blocked("no scope tree"))?;
+            let mir = build_mir(&root, owner).map_err(|_| Blocked("constant body not built"))?;
+            let ccx = crate::mir::transform::const_check::ConstCx::new(self.prog, self.tcx, env, &mir, self);
+            crate::mir::transform::const_check::mir_const_qualif(&ccx).map(|c| c.qualifs)
+        })();
+        self.memo.borrow_mut().insert(def, result.clone());
+        result
+    }
+}
+
 #[derive(Default)]
 struct Histogram {
     counts: BTreeMap<String, usize>,
@@ -68,6 +105,11 @@ pub fn build_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
     let mut unbuilt = Histogram::default();
     let mut invalid = Histogram::default();
     let mut panicked = Histogram::default();
+    let mut blocked = Histogram::default();
+    let mut const_errors = Histogram::default();
+    let (mut promoted_ok, mut promoted_invalid, mut n_promoted) = (0usize, 0usize, 0usize);
+    let provider = BuildProvider { prog, tcx, memo: Default::default() };
+    let passes = std::env::var_os("MAKEPAD_RUN_MIR_BUILD_NO_PASSES").is_none();
     let mut by_kind: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
     let t0 = crate::clock::cpu_ns();
     for owner in body::owners(prog) {
@@ -131,6 +173,32 @@ pub fn build_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
                         validate_fail += 1;
                         invalid.note(format!("{} (bb{:?} stmt{:?})", first.message, first.bb.map(|b| b.0), first.statement_index), format!("{at}{loc}"));
                     }
+                    if passes {
+                        // mir_const_qualif + mir_promoted (S5): const checking, promotion, simplify.
+                        let mut promoted = mir.clone();
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::mir::transform::mir_promoted(prog, tcx, env, &provider, &mut promoted))) {
+                            Ok(Ok(pre)) => {
+                                promoted_ok += 1;
+                                n_promoted += promoted.promoted.len();
+                                for e in &pre.const_errors {
+                                    const_errors.note(format!("{}: {}", e.code, e.message.lines().next().unwrap_or("")), format!("{at}{loc}"));
+                                }
+                                if let Some(first) = crate::mir::validate::validate(&promoted, tcx).first() {
+                                    promoted_invalid += 1;
+                                    invalid.note(format!("after mir_promoted: {}", first.message), format!("{at}{loc}"));
+                                }
+                            }
+                            Ok(Err(why)) => blocked.note(why.0.to_string(), format!("{at}{loc}")),
+                            Err(p) => {
+                                if crate::preempt::is_cancelled(&*p) {
+                                    std::panic::resume_unwind(p);
+                                }
+                                let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "panic".into());
+                                panicked.note(format!("mir_promoted: {}", msg.split(": ").next().unwrap_or("")), format!("{at}{loc} [{msg}]"));
+                                panics += 1;
+                            }
+                        }
+                    }
                 }
                 Ok(Err(err)) => {
                     let line = line_of(prog, err.span.file, err.span.lo);
@@ -142,7 +210,8 @@ pub fn build_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
                     }
                     panics += 1;
                     let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "panic".into());
-                    panicked.note(msg, format!("{at}{loc}"));
+                    let (key, detail) = match msg.split_once(": ") { Some((k, v)) => (k.to_string(), format!(" [{v}]")), None => (msg.clone(), String::new()) };
+                    panicked.note(key, format!("{at}{loc}{detail}"));
                 }
             }
         }
@@ -152,10 +221,13 @@ pub fn build_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
         unbuilt.counts.values().sum::<usize>(),
         (crate::clock::cpu_ns() - t0) as f64 / 1e6
     );
+    if passes {
+        eprintln!("makepad-run mir-build: mir_promoted: {promoted_ok} bodies ok ({promoted_invalid} invalid afterwards), {n_promoted} promoted bodies, {} blocked, {} const-check errors", blocked.counts.values().sum::<usize>(), const_errors.counts.values().sum::<usize>());
+    }
     for (kind, (all, ok)) in &by_kind {
         eprintln!("makepad-run mir-build: {kind:>12}: {ok}/{all} built");
     }
-    for (title, h) in [("not built", &unbuilt), ("INVALID", &invalid), ("PANIC", &panicked)] {
+    for (title, h) in [("not built", &unbuilt), ("INVALID", &invalid), ("PANIC", &panicked), ("BLOCKED", &blocked), ("CONST ERROR", &const_errors)] {
         let mut rows: Vec<_> = h.counts.iter().collect();
         rows.sort_by(|a, b| b.1.cmp(a.1));
         for (reason, n) in rows {

@@ -30,6 +30,7 @@ macro_rules! unpack {
 pub mod block;
 pub mod builder;
 pub mod driver;
+pub mod driver_borrowck;
 pub mod cfg;
 pub mod expr;
 pub mod matches;
