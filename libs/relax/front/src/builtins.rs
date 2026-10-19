@@ -1306,7 +1306,11 @@ fn item_location(p: &crate::parser::Parser, mut origin: u32) -> (usize,usize) {
     if origin >= p.src.len() as u32 {
         if let Some(span) = p.input_span(origin, origin + 1) { return (span.start.line as usize, span.start.column as usize); }
     }
-    crate::lexer::line_col(p.src,origin)
+    // the file's line starts are worked out once (FileCtx), not by counting from byte 0 per item
+    match &p.bctx {
+        Some(c) => c.byte_line_col(p.src, origin),
+        None => crate::lexer::line_col(p.src, origin),
+    }
 }
 
 /// Derives of one item, from its source bytes (`item_lo`: its position, for diagnostics).
