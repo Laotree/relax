@@ -2528,7 +2528,7 @@ impl Tcx {
                 // an associated type of a bound the item's where clauses put on `Self`
                 // (`where Self: TryInto<T>` makes `Self::Error`; Self is param 0 of a trait)
                 if let Some(t) = self.param_assoc(cx, prog, module, env, 0, name) {
-                    return self.lower_generic_args_of_assoc_item(cx, prog, file, module, env, p, t);
+                    return self.lower_generic_args_of_assoc_item(cx, prog, file, module, env, p, t, source_ty);
                 }
             }
         }
@@ -2942,7 +2942,7 @@ impl Tcx {
         if !self.validates(prog, file) { return false; }
         let ast = &prog.files[file as usize].ast;
         if let Some(GenericArgs::Angle(v)) = ast.gargs(args) {
-            if let Some(c) = ast.list(*v).iter().find_map(|a| match a { GenericArg::Binding(n, _, _) | GenericArg::Constraint(n, _) => Some(*n), _ => None }) {
+            if let Some(c) = ast.list(*v).iter().find_map(|a| match a { GenericArg::Binding(n, _, _) | GenericArg::Constraint(n, _, _) => Some(*n), _ => None }) {
                 self.err(cx, prog, file, c.lo, "E0229: associated item constraints are not allowed here".to_string());
                 return true;
             }
