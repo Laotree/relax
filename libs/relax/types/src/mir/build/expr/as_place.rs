@@ -199,6 +199,11 @@ impl Builder<'_> {
 
         // Making this a *fresh* temporary means we do not have to worry about the index changing later: Nothing
         // will ever change this temporary. The "retagging" transformation (for Stacked Borrows) relies on this.
+        // THIR contract: a builtin `Index` has a `usize` index (everything else is an overloaded `Index::index`
+        // call); a body that breaks it is unchecked, not a source of false MIR bugs.
+        if self.thir.thir[index].ty != self.root.cx.tcx.tys.usize_ {
+            return Err(self.error(expr_span, crate::mir::build::UnsupportedReason::UnresolvedFact("builtin index with a non-usize index")));
+        }
         let index_lifetime = self.expr_temp_lifetime(index);
         let idx = unpack!(block = self.as_temp(block, index_lifetime, index, Mutability::Not));
 
