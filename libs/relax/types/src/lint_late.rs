@@ -12,6 +12,7 @@ use crate::tcx::Tcx;
 use crate::typeck::{Body, Res};
 use crate::types::{AliasTyKind, TyId, TyKind};
 
+pub const NON_SHORTHAND_FIELD_PATTERNS: Lint = lint::lint("non_shorthand_field_patterns");
 pub const UNUSED_MUST_USE: Lint = lint::lint("unused_must_use");
 pub const UNUSED_RESULTS: Lint = lint::lint("unused_results");
 pub const PATH_STATEMENTS: Lint = lint::lint("path_statements");
@@ -811,6 +812,18 @@ impl<'a> Visitor<'a> for Late<'a> {
                 if let Some(Res::Def(d)) = self.body.pat_res.get(&p.0) { self.check_deprecated(*d, path.lo); }
             }
             _ => {}
+        }
+        // rustc NonShorthandFieldPatterns: `field: field` (any binding mode) can be `field`
+        if let Pat::Struct(_, fs, _) = *self.ast.pat(p) {
+            let pf = &self.prog.files[self.body.file as usize];
+            for f in self.ast.list(fs) {
+                if f.shorthand { continue; }
+                if let Pat::Ident { name, sub: None, .. } = *self.ast.pat(f.pat) {
+                    if self.body.pat_local.contains_key(&f.pat.0) && pf.text(name) == pf.text(f.name) {
+                        self.emit(&NON_SHORTHAND_FIELD_PATTERNS, f.name.lo, &format!("the `{}:` in this pattern is redundant", pf.text(f.name)));
+                    }
+                }
+            }
         }
         ast_visit::walk_pat(self, p);
     }
