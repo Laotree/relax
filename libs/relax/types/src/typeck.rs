@@ -1979,6 +1979,12 @@ impl<'a> Fcx<'a> {
             }
         }
         self.detect_opaque_types_added_during_writeback();
+        // (NLL type-check: a placeholder that must outlive a region of an outer universe is a
+        // higher-ranked subtype error)
+        if self.tcx.validates(self.prog, self.file) && self.infcx.leak_check(crate::types::UniverseIndex::ROOT, None).is_err() {
+            let pos = self.last_lo;
+            self.err(pos, "E0308: mismatched types: one type is more general than the other".to_string());
+        }
     }
 
     // ------------------------------------------------------------ scopes
