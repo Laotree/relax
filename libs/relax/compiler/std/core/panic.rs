@@ -4,13 +4,20 @@
 use crate::fmt;
 
 /// A source location, as `#[track_caller]` / `Location::caller()` report it.
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+// (Eq / Ord / Hash over the bytes with the nul order exactly as over `file()`)
+#[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(not(relax_check), lang = "panic_location")]
 pub struct Location<'a> {
     // the file name and its terminating nul (rustc Location::file_bytes_with_nul)
     file_bytes_with_nul: &'a [u8],
     line: u32,
     col: u32,
+}
+
+impl fmt::Debug for Location<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Location").field("file", &self.file()).field("line", &self.line).field("col", &self.col).finish()
+    }
 }
 
 impl<'a> Location<'a> {
@@ -25,7 +32,7 @@ impl<'a> Location<'a> {
     }
     pub const fn file(&self) -> &'a str {
         let bytes = self.file_bytes_with_nul;
-        unsafe { crate::str::from_utf8_unchecked(crate::slice::from_raw_parts(bytes.as_ptr(), bytes.len() - 1)) }
+        unsafe { crate::str::from_utf8_unchecked(crate::slice::from_raw_parts(bytes.as_ptr(), bytes.len().saturating_sub(1))) }
     }
     pub const fn file_as_c_str(&self) -> &'a crate::ffi::CStr {
         unsafe { crate::ffi::CStr::from_bytes_with_nul_unchecked(self.file_bytes_with_nul) }
