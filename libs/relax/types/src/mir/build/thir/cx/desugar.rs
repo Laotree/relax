@@ -35,7 +35,7 @@ impl Cx<'_> {
     fn method_output(&self, def: DefId, args: &[TyId], span: Span) -> BuildResult<TyId> {
         let tcx = self.tcx();
         let Some(sig) = tcx.fn_sig(self.prog(), def) else { return self.unresolved(span, "method signature") };
-        Ok(self.normalize(tcx.tys.subst(sig.ret, args)))
+        Ok(tcx.tys.erase_regions(self.normalize(tcx.tys.subst(sig.ret, args))))
     }
 
     /// The index of an enum's variant that is the lang item `item`.
@@ -106,7 +106,7 @@ impl Cx<'_> {
         let into_ty = self.fn_def_ty(into_def, tcx.tys.list(into_args));
         let fun = self.push(Expr { kind: ExprKind::ZstLiteral { user_ty: None }, ty: into_ty, temp_scope: Some(for_match), span: head_span });
         let into_call = self.push(Expr {
-            kind: ExprKind::Call { ty: into_ty, fun, args: Box::new([head]), from_hir_call: false, fn_span: head_span },
+            kind: ExprKind::Call { ty: into_ty, fun, args: Box::new([head]), from_hir_call: true, fn_span: head_span },
             ty: iter_ty,
             temp_scope: Some(for_match),
             span: head_span,
@@ -124,7 +124,7 @@ impl Cx<'_> {
         let borrow = self.push(Expr { kind: ExprKind::Borrow { borrow_kind: BorrowKind::Mut { kind: MutBorrowKind::Default }, arg: iter_ref }, ty: ref_mut, temp_scope: Some(for_body_stmt), span: head_span });
         let next_fun = self.push(Expr { kind: ExprKind::ZstLiteral { user_ty: None }, ty: next_ty, temp_scope: Some(for_body_stmt), span: head_span });
         let next_call = self.push(Expr {
-            kind: ExprKind::Call { ty: next_ty, fun: next_fun, args: Box::new([borrow]), from_hir_call: false, fn_span: head_span },
+            kind: ExprKind::Call { ty: next_ty, fun: next_fun, args: Box::new([borrow]), from_hir_call: true, fn_span: head_span },
             ty: opt_ty,
             temp_scope: Some(for_body_stmt),
             span: head_span,
@@ -196,7 +196,7 @@ impl Cx<'_> {
         let arg = self.mirror_expr(x)?;
         let branch_ty = self.fn_def_ty(branch_def, tcx.tys.list(branch_args));
         let fun = self.push(self.mk(e, ExprKind::ZstLiteral { user_ty: None }, branch_ty));
-        let scrutinee = self.push(self.mk(e, ExprKind::Call { ty: branch_ty, fun, args: Box::new([arg]), from_hir_call: false, fn_span: span }, flow));
+        let scrutinee = self.push(self.mk(e, ExprKind::Call { ty: branch_ty, fun, args: Box::new([arg]), from_hir_call: true, fn_span: span }, flow));
 
         // `Continue(val) => val`
         let val_var = self.synthetic_binding(scope);
@@ -213,7 +213,7 @@ impl Cx<'_> {
         let from_ty = self.fn_def_ty(from_def, tcx.tys.list(from_args));
         let from_ret = self.method_output(from_def, tcx.tys.list(from_args), span)?;
         let from_fun = self.push(self.mk(e, ExprKind::ZstLiteral { user_ty: None }, from_ty));
-        let from_call = self.push(self.mk(e, ExprKind::Call { ty: from_ty, fun: from_fun, args: Box::new([residual]), from_hir_call: false, fn_span: span }, from_ret));
+        let from_call = self.push(self.mk(e, ExprKind::Call { ty: from_ty, fun: from_fun, args: Box::new([residual]), from_hir_call: true, fn_span: span }, from_ret));
         let ret = self.push(self.mk(e, ExprKind::Return { value: Some(from_call) }, never));
         let ret_any = self.push(self.mk(e, ExprKind::NeverToAny { source: ret }, expr_ty));
         let break_arm = self.thir.alloc_arm(Arm { pattern: Box::new(break_pat), guard: None, body: ret_any, node: e.0, scope, span });
@@ -369,6 +369,122 @@ impl Cx<'_> {
     fn field_type(&self, adt: DefId, variant: u32, field: u32, gargs: crate::types::TyList) -> TyId {
         let tcx = self.tcx();
         self.normalize(tcx.field_ty(self.prog(), self.root.cx.env, adt, variant, field, tcx.tys.list(gargs)))
+    }
+
+    // ---------------------------------------------------------------- await
+
+    /// `x.await` (rustc_ast_lowering lower_expr_await):
+    /// ```text
+    /// match IntoFuture::into_future(<x>) {
+    ///     mut __awaitee => loop {
+    ///         match unsafe { Future::poll(Pin::new_unchecked(&mut __awaitee), get_context(task_context)) } {
+    ///             Poll::Ready(result) => break result,
+    ///             Poll::Pending => {}
+    ///         }
+    ///         task_context = yield ();
+    ///     }
+    /// }
+    /// ```
+    /// (the `unsafe` block carries no scope in Relax's tree and no safety checking runs on THIR).
+    pub(super) fn await_expr(&mut self, e: ast::ExprId, x: ast::ExprId, expr_ty: TyId) -> BuildResult<Expr> {
+        let tcx = self.tcx();
+        let span = self.espan(e);
+        let (unit, never) = (self.unit_ty(), tcx.tys.never);
+        let Some(task_context) = self.task_context else { return self.unresolved(span, "await outside a coroutine") };
+        let resume_ty = self.resume_ty(span)?;
+        let item = |this: &Self, item: LangItem| match tcx.lang_items.get(item) {
+            Some(def) => Ok(def),
+            None => this.unresolved(span, "await lang item"),
+        };
+        let (into_future, poll, new_unchecked, get_context) = (
+            item(self, LangItem::IntoFutureIntoFuture)?,
+            item(self, LangItem::FuturePoll)?,
+            item(self, LangItem::PinNewUnchecked)?,
+            item(self, LangItem::GetContext)?,
+        );
+        let arm_scope = self.synthetic_scope(e, Synthetic::AwaitArm, ScopeData::Node, span)?;
+        let loop_scope = self.synthetic_scope(e, Synthetic::AwaitLoop, ScopeData::Node, span)?;
+        let body_scope = self.synthetic_scope(e, Synthetic::AwaitBody, ScopeData::Node, span)?;
+        let poll_scope = self.synthetic_scope(e, Synthetic::AwaitPoll, ScopeData::Node, span)?;
+        let ready_scope = self.synthetic_scope(e, Synthetic::AwaitReady, ScopeData::Node, span)?;
+        let pending_scope = self.synthetic_scope(e, Synthetic::AwaitPending, ScopeData::Node, span)?;
+        let yield_scope = self.synthetic_scope(e, Synthetic::AwaitYield, ScopeData::Node, span)?;
+
+        // `IntoFuture::into_future(<x>)`
+        let operand_ty = self.ety_adjusted(x)?;
+        let operand = self.mirror_expr(x)?;
+        let into_ty = self.fn_def_ty(into_future, &[operand_ty]);
+        let awaitee_ty = self.method_output(into_future, &[operand_ty], span)?;
+        let outer_temp = self.temp_scope(e);
+        let fun = self.push(Expr { kind: ExprKind::ZstLiteral { user_ty: None }, ty: into_ty, temp_scope: outer_temp, span });
+        let scrutinee = self.push(Expr {
+            kind: ExprKind::Call { ty: into_ty, fun, args: Box::new([operand]), from_hir_call: true, fn_span: span },
+            ty: awaitee_ty,
+            temp_scope: outer_temp,
+            span,
+        });
+
+        // `mut __awaitee`
+        let awaitee = self.synthetic_binding(arm_scope);
+        let awaitee_pat = self.binding_pat(awaitee, "__awaitee", awaitee_ty, true, span);
+
+        // `Future::poll(Pin::new_unchecked(&mut __awaitee), get_context(task_context))`
+        let at = Some(poll_scope);
+        let ref_mut = self.ref_ty(true, awaitee_ty);
+        let awaitee_ref = self.push(Expr { kind: ExprKind::VarRef { id: awaitee }, ty: awaitee_ty, temp_scope: at, span });
+        let borrow = self.push(Expr { kind: ExprKind::Borrow { borrow_kind: BorrowKind::Mut { kind: MutBorrowKind::Default }, arg: awaitee_ref }, ty: ref_mut, temp_scope: at, span });
+        let new_ty = self.fn_def_ty(new_unchecked, &[ref_mut]);
+        let pinned_ty = self.method_output(new_unchecked, &[ref_mut], span)?;
+        let new_fun = self.push(Expr { kind: ExprKind::ZstLiteral { user_ty: None }, ty: new_ty, temp_scope: at, span });
+        let pinned = self.push(Expr { kind: ExprKind::Call { ty: new_ty, fun: new_fun, args: Box::new([borrow]), from_hir_call: true, fn_span: span }, ty: pinned_ty, temp_scope: at, span });
+        let ctx_arg = self.push(Expr { kind: ExprKind::VarRef { id: task_context }, ty: resume_ty, temp_scope: at, span });
+        let ctx_ty = self.fn_def_ty(get_context, &[]);
+        let context_ty = self.method_output(get_context, &[], span)?;
+        let ctx_fun = self.push(Expr { kind: ExprKind::ZstLiteral { user_ty: None }, ty: ctx_ty, temp_scope: at, span });
+        let context = self.push(Expr { kind: ExprKind::Call { ty: ctx_ty, fun: ctx_fun, args: Box::new([ctx_arg]), from_hir_call: true, fn_span: span }, ty: context_ty, temp_scope: at, span });
+        let poll_ty = self.fn_def_ty(poll, &[awaitee_ty]);
+        let poll_result_ty = self.method_output(poll, &[awaitee_ty], span)?;
+        let poll_fun = self.push(Expr { kind: ExprKind::ZstLiteral { user_ty: None }, ty: poll_ty, temp_scope: at, span });
+        let poll_call = self.push(Expr { kind: ExprKind::Call { ty: poll_ty, fun: poll_fun, args: Box::new([pinned, context]), from_hir_call: true, fn_span: span }, ty: poll_result_ty, temp_scope: at, span });
+
+        // `Poll::Ready(result) => break result`, `Poll::Pending => {}`
+        let ready_idx = self.lang_variant(DefId(0), LangItem::PollReady, span)?;
+        let pending_idx = self.lang_variant(DefId(0), LangItem::PollPending, span)?;
+        let result = self.synthetic_binding(ready_scope);
+        let result_pat = self.binding_pat(result, "result", expr_ty, false, span);
+        let ready_pat = self.variant_pat(poll_result_ty, ready_idx, vec![FieldPat { field: FieldIdx(0), pattern: result_pat }], span)?;
+        let result_ref = self.push(Expr { kind: ExprKind::VarRef { id: result }, ty: expr_ty, temp_scope: Some(ready_scope), span });
+        let brk = self.push(Expr { kind: ExprKind::Break { label: loop_scope, value: Some(result_ref) }, ty: never, temp_scope: Some(ready_scope), span });
+        let ready_body = self.push(Expr { kind: ExprKind::NeverToAny { source: brk }, ty: unit, temp_scope: Some(ready_scope), span });
+        let ready_arm = self.thir.alloc_arm(Arm { pattern: Box::new(ready_pat), guard: None, body: ready_body, node: e.0, scope: ready_scope, span });
+        let pending_pat = self.variant_pat(poll_result_ty, pending_idx, Vec::new(), span)?;
+        let pending_body = self.push(Expr { kind: ExprKind::Tuple { fields: Box::new([]) }, ty: unit, temp_scope: Some(pending_scope), span });
+        let pending_arm = self.thir.alloc_arm(Arm { pattern: Box::new(pending_pat), guard: None, body: pending_body, node: e.0, scope: pending_scope, span });
+        let inner_match = self.push(Expr {
+            kind: ExprKind::Match { scrutinee: poll_call, arms: Box::new([ready_arm, pending_arm]), match_source: MatchSource::AwaitDesugar },
+            ty: unit,
+            temp_scope: at,
+            span,
+        });
+        let poll_stmt = self.thir.alloc_stmt(Stmt { kind: StmtKind::Expr { scope: poll_scope, expr: inner_match } });
+
+        // `task_context = yield ();`
+        let yt = Some(yield_scope);
+        let unit_value = self.push(Expr { kind: ExprKind::Tuple { fields: Box::new([]) }, ty: unit, temp_scope: yt, span });
+        let yielded = self.push(Expr { kind: ExprKind::Yield { value: unit_value }, ty: resume_ty, temp_scope: yt, span });
+        let target = self.push(Expr { kind: ExprKind::VarRef { id: task_context }, ty: resume_ty, temp_scope: yt, span });
+        let assign = self.push(Expr { kind: ExprKind::Assign { lhs: target, rhs: yielded }, ty: unit, temp_scope: yt, span });
+        let yield_stmt = self.thir.alloc_stmt(Stmt { kind: StmtKind::Expr { scope: yield_scope, expr: assign } });
+
+        // `loop { .. }`
+        let block = self.thir.alloc_block(Block { targeted_by_break: false, region_scope: body_scope, span, stmts: Box::new([poll_stmt, yield_stmt]), expr: None, safety_mode: BlockSafety::Safe });
+        let loop_body = self.push(Expr { kind: ExprKind::Block { block }, ty: unit, temp_scope: Some(loop_scope), span });
+        let loop_expr = self.push(Expr { kind: ExprKind::Loop { body: loop_body }, ty: expr_ty, temp_scope: Some(loop_scope), span });
+        let loop_scoped = self.push(Expr { kind: ExprKind::Scope { region_scope: loop_scope, node: e.0, value: loop_expr }, ty: expr_ty, temp_scope: Some(arm_scope), span });
+
+        // `mut __awaitee => loop { .. }`
+        let awaitee_arm = self.thir.alloc_arm(Arm { pattern: Box::new(awaitee_pat), guard: None, body: loop_scoped, node: e.0, scope: arm_scope, span });
+        Ok(self.mk(e, ExprKind::Match { scrutinee, arms: Box::new([awaitee_arm]), match_source: MatchSource::AwaitDesugar }, expr_ty))
     }
 
     // ---------------------------------------------------------------- builtin macros

@@ -14,7 +14,7 @@ pub enum Node {
     Synthetic(u32, Synthetic),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Synthetic { Iteration, ForMatch, ForArm, ForBody, AwaitArm, AwaitLoop, MacroArm, MacroBranch, MacroStatement, DebugBranch, AssignBlock, AssignLet, Assignment }
+pub enum Synthetic { Iteration, ForMatch, ForArm, ForBody, AwaitArm, AwaitLoop, AwaitBody, AwaitPoll, AwaitReady, AwaitPending, AwaitYield, MacroArm, MacroBranch, MacroStatement, DebugBranch, AssignBlock, AssignLet, Assignment }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScopeData { Node, CallSite, Arguments, Destruction, IfThen, IfThenRescope, MatchGuard, Remainder(u32) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -329,7 +329,20 @@ impl Resolve<'_> {
                 self.expr(x, false);
                 let future_scope = self.node(Node::Synthetic(e.0, Synthetic::AwaitArm), true);
                 self.node(Node::Synthetic(e.0, Synthetic::AwaitLoop), true);
+                // loop { match poll(..) { Ready(result) => break result, Pending => {} } task_context = yield (); }
+                let loop_cx = self.cx;
+                self.node(Node::Synthetic(e.0, Synthetic::AwaitBody), true);
+                let body_cx = self.cx;
+                self.node(Node::Synthetic(e.0, Synthetic::AwaitPoll), true);
+                let poll_cx = self.cx;
+                for arm in [Synthetic::AwaitReady, Synthetic::AwaitPending] {
+                    self.node(Node::Synthetic(e.0, arm), true);
+                    self.cx = poll_cx;
+                }
+                self.cx = body_cx;
+                self.node(Node::Synthetic(e.0, Synthetic::AwaitYield), true);
                 self.suspension(e, YieldKind::Await { operand: x, future_scope });
+                self.cx = loop_cx;
             }
             ExprKind::Yield(x) => { if let Some(x) = x.get() { self.expr(x, false); } self.suspension(e, YieldKind::Yield); }
             ExprKind::Tuple(xs) | ExprKind::Array(xs) => for x in ast.list(xs) { self.expr(*x, false); },

@@ -365,8 +365,8 @@ impl Cx<'_> {
             A::Tuple(fields) => ExprKind::Tuple { fields: self.mirror_exprs(ast.list(fields))? },
             A::Array(fields) => ExprKind::Array { fields: self.mirror_exprs(ast.list(fields))? },
             A::Range(a, b, inclusive) => return self.range_expr(e, a, b, inclusive, expr_ty),
-            A::Async(..) => return self.not_built(span, "async block"),
-            A::Await(_) => return self.not_built(span, ".await"),
+            A::Async(..) => return self.closure_aggregate(e, expr_ty, Some(crate::mir::Movability::Static)),
+            A::Await(x) => return self.await_expr(e, x, expr_ty),
             A::Yield(_) => return self.not_built(span, "yield"),
             A::Box(_) => return self.not_built(span, "box expression"),
             A::Underscore => return self.unresolved(span, "`_` expression"),
@@ -739,11 +739,17 @@ impl Cx<'_> {
 
     /// thir/cx/expr.rs `Closure`: the captured places as expressions in the creating body.
     fn closure_expr(&mut self, e: ast::ExprId, row: ast::ClosureRow, expr_ty: TyId) -> BuildResult<Expr> {
-        let (tb, tcx) = (self.tb(), self.tcx());
         let span = self.espan(e);
         if row.is_async {
             return self.not_built(span, "async closure");
         }
+        self.closure_aggregate(e, expr_ty, None)
+    }
+
+    /// The aggregate of a closure or coroutine: the captured places (by value or borrowed).
+    fn closure_aggregate(&mut self, e: ast::ExprId, expr_ty: TyId, movability: Option<crate::mir::Movability>) -> BuildResult<Expr> {
+        let (tb, tcx) = (self.tb(), self.tcx());
+        let span = self.espan(e);
         let (closure, args, kind, tupled) = self.closure_parts(expr_ty, span)?;
         let Some(caps) = tb.min_captures.get(&e.0) else { return self.unresolved(span, "closure captures") };
         let upvar_tys: Vec<TyId> = match *tcx.tys.kind(tupled) {
@@ -777,7 +783,7 @@ impl Cx<'_> {
             };
             fake_reads.push((self.push(expr), cause, *node));
         }
-        Ok(self.mk(e, ExprKind::Closure(Box::new(ClosureExpr { closure, args, upvars: upvars.into_boxed_slice(), movability: None, fake_reads, kind })), expr_ty))
+        Ok(self.mk(e, ExprKind::Closure(Box::new(ClosureExpr { closure, args, upvars: upvars.into_boxed_slice(), movability, fake_reads, kind })), expr_ty))
     }
 
     /// The place a closure captures, as an expression of the creating body (starting from the

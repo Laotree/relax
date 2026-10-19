@@ -121,3 +121,105 @@ fn default_field_values() {
     let k = kinds("pub struct S { a: u8 = 7, c: u8 } pub fn f() -> S { S { c: 1, .. } }", "f");
     has(&k, &["Adt", "NamedConst"]);
 }
+
+/// A program of `source` linked against the real `core`, for the desugarings that need lang items.
+fn core_program(source: &str) -> (crate::program::Program, crate::tcx::Tcx) {
+    let sess = &std::sync::Arc::new(crate::Session::default());
+    let mut prog = crate::program::Program::new(sess);
+    let core_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../compiler/std/core/lib.rs");
+    prog.load_crate("core", core_root, 2021, crate::cfg::CfgSet::host(sess, &[]), Vec::new()).unwrap();
+    let core = prog.syms.intern("core");
+    let dir = std::env::temp_dir().join(format!("relax-thir-cx-{}-{}", std::process::id(), crate::unique_test_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("lib.rs");
+    std::fs::write(&path, source).unwrap();
+    prog.load_crate("thir_cx", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(sess, &[]), vec![(core, 0)]).unwrap();
+    prog.prelude_crate = Some(0);
+    prog.resolve_imports();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir(&dir).unwrap();
+    assert!(prog.errors.is_empty(), "{:?}", prog.errors);
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    (prog, tcx)
+}
+
+/// `thir_body` of `owner` (a function, or the closure/async block `kind`) in a program with core.
+fn core_thir<R>(source: &str, name: &str, kind: impl FnOnce(&crate::typeck::Body, &crate::program::Program) -> BodyKind, f: impl FnOnce(BuildResult<ThirBody>) -> R) -> R {
+    let (prog, tcx) = core_program(source);
+    let def = named(&prog, name);
+    let body = tcx.typeck(&prog, def);
+    assert!(body.errors.is_empty(), "{:?}", body.errors);
+    let env = TypingEnv::fully_monomorphized(&prog);
+    let state = EvalState::new();
+    let eval = EvalCx::new(&prog, &tcx, env, &state);
+    let root = BuildRoot::new(BuildCx { prog: &prog, tcx: &tcx, env, eval: &eval }, &body).unwrap();
+    let kind = kind(&body, &prog);
+    let cx = Cx::new(&root, CheckedBody { owner: def, kind });
+    f(cx.thir_body())
+}
+
+fn core_kinds(source: &str, name: &str) -> Vec<String> {
+    core_thir(source, name, |_, _| BodyKind::Function, |r| {
+        let t = r.unwrap_or_else(|e| panic!("{e:?}"));
+        let mut out: Vec<String> = t.thir.exprs.iter().map(|e| format!("{:?}", e.kind).split(|c: char| !c.is_alphanumeric()).next().unwrap().to_string()).collect();
+        out.sort();
+        out.dedup();
+        out
+    })
+}
+
+#[test]
+fn for_loop_desugars_to_into_iter_and_next() {
+    let k = core_kinds("pub fn thir_cx_probe(v: [u8; 3]) -> u8 { let mut s = 0; for x in v { s += x; } s }", "thir_cx_probe");
+    has(&k, &["Match", "Loop", "Call", "Borrow", "Break"]);
+}
+
+#[test]
+fn question_mark_desugars_to_branch_and_from_residual() {
+    let k = core_kinds("pub fn thir_cx_probe(x: Option<u8>) -> Option<u8> { let y = x?; Some(y) }", "thir_cx_probe");
+    has(&k, &["Match", "Return", "Call"]);
+}
+
+#[test]
+fn matches_and_asserts() {
+    let k = core_kinds("pub fn thir_cx_probe(x: Option<u8>) -> bool { assert!(true); matches!(x, Some(n) if n > 1) }", "thir_cx_probe");
+    has(&k, &["Match", "If"]);
+}
+
+#[test]
+fn async_block_aggregate() {
+    let k = core_kinds("pub fn thir_cx_probe(x: u8) { let _g = async move { x }; }", "thir_cx_probe");
+    has(&k, &["Closure"]);
+}
+
+fn async_block(source: &str) -> BuildResult<ThirBody> {
+    core_thir(
+        source,
+        "thir_cx_probe",
+        |body, prog| {
+            let ast = &prog.files[body.file as usize].ast;
+            let e = (0..body.expr_ty.len()).map(|i| body.expr_at(i)).find(|&e| matches!(ast.expr(e).kind, crate::ast::ExprKind::Async(..))).expect("an async block");
+            BodyKind::Closure(e)
+        },
+        |r| r,
+    )
+}
+
+#[test]
+fn async_block_body_is_a_coroutine_with_a_resume_argument() {
+    let t = async_block("pub fn thir_cx_probe(x: u8) { let _g = async move { x }; }").unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(t.params.len(), 2);
+    let c = t.coroutine.expect("coroutine info");
+    assert!(matches!(c.kind, crate::mir::CoroutineKind::Desugared(crate::mir::CoroutineDesugaring::Async, crate::mir::CoroutineSource::Block)));
+    assert!(t.fn_scopes.is_some());
+}
+
+#[test]
+fn await_polls_in_a_loop_and_yields() {
+    let t = async_block("pub async fn g() -> u8 { 1 } pub fn thir_cx_probe() { let _g = async move { g().await }; }").unwrap_or_else(|e| panic!("{e:?}"));
+    let k: Vec<String> = t.thir.exprs.iter().map(|e| format!("{:?}", e.kind).split(|c: char| !c.is_alphanumeric()).next().unwrap().to_string()).collect();
+    for n in ["Yield", "Loop", "Match", "Break", "Call"] {
+        assert!(k.iter().any(|x| x == n), "missing {n}");
+    }
+}
