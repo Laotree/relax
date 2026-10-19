@@ -95,6 +95,8 @@ pub struct Parser<'a> {
     foreign_abi: Option<Option<Ident>>,
     /// inside a cfg'd-out item (parse_cfg_out): nothing is generated
     cfg_out: u32,
+    /// attributes whose shape is checked once their item is known to be configured in (check only)
+    pending_shape: Vec<TokRange>,
 }
 
 // precedence levels
@@ -147,6 +149,7 @@ impl<'a> Parser<'a> {
             in_assoc: 0,
             foreign_abi: None,
             cfg_out: 0,
+            pending_shape: Vec::new(),
         }
     }
 
@@ -248,7 +251,8 @@ impl<'a> Parser<'a> {
         let text = self.tok_text(t);
         let reserved = match text {
             b"abstract" | b"become" | b"do" | b"final" | b"macro" | b"override" | b"priv" | b"typeof" | b"unsized" | b"virtual" => true,
-            b"gen" => self.edition >= 2024,
+            // (text a macro expanded keeps the edition of the macro's crate, which is not known here)
+            b"gen" => self.edition >= 2024 && (t.lo as usize) < self.src.len(),
             _ => false,
         };
         if reserved {
@@ -749,7 +753,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             let (_, toks) = self.delim_tt()?;
             self.unraw_attr(toks);
-            self.check_attr_shape(toks)?;
+            if crate::lexer::validation_enabled() { self.attr_shape_now_or_later(toks)?; }
             v.push(Attr { inner: false, toks });
         }
         Ok(self.expand_cfg_attrs(v))
@@ -758,6 +762,25 @@ impl<'a> Parser<'a> {
     /// The shape of `cfg`, `cfg_attr` and `derive` attributes (rustc_attr_parsing cfg.rs
     /// `parse_cfg_entry`, `parse_cfg_attr`): a cfg predicate is `name`, `name = "str"`,
     /// `all(..)`, `any(..)`, `not(..)` or a boolean.
+    /// `cfg` / `cfg_attr` are read (and so checked) while the configuration is evaluated; the other
+    /// attributes only once their item is known to be configured in.
+    fn attr_shape_now_or_later(&mut self, toks: TokRange) -> PResult<()> {
+        let first = if (toks.lo as usize) < self.toks.len() { self.tok_text(self.toks.at(toks.lo as usize)) } else { b"" };
+        if first == b"cfg" || first == b"cfg_attr" {
+            return self.check_attr_shape(toks);
+        }
+        self.pending_shape.push(toks);
+        Ok(())
+    }
+
+    fn check_pending_attrs(&mut self) -> PResult<()> {
+        let pending = std::mem::take(&mut self.pending_shape);
+        for toks in pending {
+            self.check_attr_shape(toks)?;
+        }
+        Ok(())
+    }
+
     fn check_attr_shape(&self, toks: TokRange) -> PResult<()> {
         let (lo, hi) = (toks.lo as usize, toks.hi as usize);
         if hi <= lo || hi > self.toks.len() || self.toks.at(lo).kind != T::Ident {
@@ -790,9 +813,6 @@ impl<'a> Parser<'a> {
         }
         self.cfg_entry(&mut i, close).or_else(|m| bad(self, i, &m))?;
         if which == 0 {
-            if kind(i) == T::Comma && i + 1 < close || (kind(i) == T::Comma && i + 1 == close && false) {
-                return bad(self, i, "expected a single argument here");
-            }
             if i < close && !(kind(i) == T::Comma && i + 1 == close) {
                 return bad(self, i, "expected a single argument here");
             }
@@ -892,7 +912,7 @@ impl<'a> Parser<'a> {
             self.pos += 2;
             let (_, toks) = self.delim_tt()?;
             self.unraw_attr(toks);
-            self.check_attr_shape(toks)?;
+            if crate::lexer::validation_enabled() { self.attr_shape_now_or_later(toks)?; }
             new.push(Attr { inner: true, toks });
         }
         v.extend(self.expand_cfg_attrs(new));
@@ -929,6 +949,7 @@ impl<'a> Parser<'a> {
         self.ast.root_attrs = attrs.into();
         let items = self.items_until(T::Eof)?;
         self.ast.root_items = items.into();
+        self.check_pending_attrs()?;
         Ok(())
     }
 
@@ -947,8 +968,10 @@ impl<'a> Parser<'a> {
         let scope = self.macros.as_mut().unwrap();
         scope.define_tokens(&n, &self.krate, self.edition, file, name.lo, exported, local_inner, &mt)
             .map_err(|msg| PErr { pos: name.lo, msg })?;
-        if let Some(d) = scope.local.last() {
-            crate::macros::check_rules(d, edition).map_err(|msg| PErr { pos: name.lo, msg })?;
+        if crate::lexer::validation_enabled() {
+            if let Some(d) = scope.local.last() {
+                crate::macros::check_rules(d, edition).map_err(|msg| PErr { pos: name.lo, msg })?;
+            }
         }
         Ok(())
     }
@@ -1477,6 +1500,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let item_tok = self.pos;
+            let pend0 = self.pending_shape.len();
             let attrs = self.outer_attrs()?;
             if self.kind() == end && !attrs.is_empty() {
                 // trailing attrs (e.g. cfg'd out tail) are not valid Rust; be strict
@@ -1488,8 +1512,10 @@ impl<'a> Parser<'a> {
             // parsed with no expansion, derives or macro definitions, and then dropped.
             if !attrs.is_empty() && !self.cfg_active(&attrs) {
                 self.parse_cfg_out(attrs)?;
+                self.pending_shape.truncate(pend0);
                 continue;
             }
+            if !self.pending_shape.is_empty() { self.check_pending_attrs()?; }
             if let Some(v) = self.try_expand_rules(|p, _| p.items_until(T::Eof))? {
                 items.extend(v);
                 continue;
@@ -3260,9 +3286,11 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::Empty);
         }
         let item_tok = self.pos;
+        let pend0 = self.pending_shape.len();
         let attrs = self.outer_attrs()?;
         if self.at_item_start() && !attrs.is_empty() && !self.cfg_active(&attrs) {
             self.parse_cfg_out(attrs)?;
+            self.pending_shape.truncate(pend0);
             return Ok(Stmt::Empty);
         }
         // `#[cfg(false)] try { .. }`: try blocks (unstable, `try_blocks`) parse only where cfg
@@ -3271,6 +3299,7 @@ impl<'a> Parser<'a> {
             self.parse_stripped(|p| p.stmt_after_attrs(attrs, item_tok))?;
             return Ok(Stmt::Empty);
         }
+        if !self.pending_shape.is_empty() { self.check_pending_attrs()?; }
         let s = self.stmt_after_attrs(attrs.clone(), item_tok)?;
         if matches!(s, Stmt::Item(_)) {
             let items = self.hosted_derives(&attrs, item_tok)?;

@@ -25,6 +25,8 @@ pub struct MutexGuard<'a, T: ?Sized + 'a> {
 }
 
 unsafe impl<'a, T: ?Sized + Sync> Sync for MutexGuard<'a, T> {}
+// library/std/src/sync/poison/mutex.rs:289
+impl<T: ?Sized> !Send for MutexGuard<'_, T> {}
 
 impl<T: ?Sized> Mutex<T> {
     pub const fn new(t: T) -> Mutex<T> where T: Sized {

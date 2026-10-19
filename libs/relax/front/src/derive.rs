@@ -161,9 +161,8 @@ impl<'a> Parser<'a> {
                 }
                 let n = self.tok_text(t);
                 if let Some(e) = EXPANDED.iter().find(|x| x.as_bytes() == n) {
-                    if !wanted.contains(e) {
-                        wanted.push(e);
-                    }
+                    // (written twice, a derive is expanded twice: the impls then conflict, E0119)
+                    wanted.push(e);
                 }
             }
         }

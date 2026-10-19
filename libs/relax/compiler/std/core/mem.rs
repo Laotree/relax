@@ -97,7 +97,7 @@ impl<T> crate::fmt::Debug for Discriminant<T> {
 /// Inhibits the compiler from calling `T`'s destructor: a union, whose fields never get drop
 /// glue (so the compiler needs no special case).
 #[repr(C)]
-pub union ManuallyDrop<T> {
+pub union ManuallyDrop<T: ?Sized> {
     value: T,
 }
 

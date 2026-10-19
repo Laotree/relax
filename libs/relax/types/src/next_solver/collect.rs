@@ -276,6 +276,10 @@ impl Tcx {
                     binder.regions = env.regions.with_binder(Some(BinderId::Where(generics.where_.lo + where_index as u32)));
                     let ty = self.lower_ty(&cx, prog, def.file, def.scope, &binder, ty);
                     self.lower_bounds(&cx, def_id, &binder, ty, bounds, false, PredicateFilter::All, &mut out);
+                    // `where T:` (no bounds) is the clause "T is well formed" (rustc lowers it so)
+                    if bounds.is_empty() && !self.tys.has_error(ty) && crate::wfcheck::obligations::arity_ok(self, prog, ty) {
+                        out.push(Predicate { kind: PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(ty))), bound_vars: binder.regions.bound_vars().into() });
+                    }
                 }
             }
         }

@@ -85,9 +85,21 @@ pub auto trait RefUnwindSafe {}
 
 pub struct AssertUnwindSafe<T>(pub T);
 
+// library/core/src/panic/unwind_safe.rs:58-84: shared references, raw pointers and NonNull are unwind
+// safe when their target is RefUnwindSafe; a mutable reference never is.
+impl<T: crate::marker::PointeeSized> !UnwindSafe for &mut T {}
+impl<T: RefUnwindSafe + crate::marker::PointeeSized> UnwindSafe for &T {}
+impl<T: RefUnwindSafe + crate::marker::PointeeSized> UnwindSafe for *const T {}
+impl<T: RefUnwindSafe + crate::marker::PointeeSized> UnwindSafe for *mut T {}
+impl<T: RefUnwindSafe + crate::marker::PointeeSized> UnwindSafe for crate::ptr::NonNull<T> {}
+
 // library/core/src/panic/unwind_safe.rs:194,203.
 impl<T> UnwindSafe for AssertUnwindSafe<T> {}
 impl<T> RefUnwindSafe for AssertUnwindSafe<T> {}
+// library/core/src/panic/unwind_safe.rs:215-247: atomics are interior mutability that is safe across unwinds.
+impl<T: crate::sync::atomic::AtomicPrimitive> RefUnwindSafe for crate::sync::atomic::Atomic<T> {}
+impl RefUnwindSafe for crate::sync::atomic::AtomicBool {}
+impl<T> RefUnwindSafe for crate::sync::atomic::AtomicPtr<T> {}
 
 impl<T> crate::ops::Deref for AssertUnwindSafe<T> {
     type Target = T;

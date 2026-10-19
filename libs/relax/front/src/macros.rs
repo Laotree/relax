@@ -1876,7 +1876,7 @@ fn parse_matcher(toks: &[MTok], edition: u16) -> Result<Vec<MNode>, String> {
                     i += 4;
                     continue;
                 }
-                if matches!(n.kind, T::Ident | T::RawIdent) {
+                if matches!(n.kind, T::Ident | T::RawIdent) && crate::lexer::validation_enabled() {
                     return Err(format!("missing fragment specifier for `${}`", n.text));
                 }
             }
