@@ -510,6 +510,10 @@ impl Builder<'_> {
             (Some(Ct::Int), Some(Ct::Float)) => CastKind::IntToFloat,
             (Some(Ct::Float), Some(Ct::Float)) => CastKind::FloatToFloat,
             (Some(Ct::Ptr), Some(Ct::Ptr)) => CastKind::PtrToPtr,
+            // Neither side is a primitive cast type: the cast is the unsizing coercion typeck found
+            // (`Box::new(x) as Box<dyn Tr>`) whose recorded target differs from the written one only
+            // in erased regions, so the THIR builder did not take it for a plain coercion.
+            (None, None) => CastKind::PointerCoercion(crate::mir::PointerCoercion::Unsize, CoercionSource::AsCast),
             _ => return Err(self.error(span, UnsupportedReason::UnresolvedFact("cast between non-castable types"))),
         })
     }
