@@ -1406,6 +1406,41 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A static whose array length is a named constant (`[u8; N]`) is laid out and captured at its
+    /// full size: a domain created afterwards starts from all N bytes of the initial image (the
+    /// image was once sized by an unnormalized type, so a domain saw the first byte only).
+    #[test]
+    fn static_array_with_const_length_keeps_its_image_in_a_domain() {
+        isolated_test!(static_array_with_const_length_keeps_its_image_in_a_domain);
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let root = std::env::temp_dir().join(format!("relax-domains-arr-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("fixture.rs");
+        std::fs::write(&source, r#"
+            const N: usize = 5;
+            static TABLE: [u8; N] = [3, 1, 4, 1, 5];
+            fn sum(out: *mut u64) { let mut s = 0u64; for i in 0..N { s = s * 10 + TABLE[i] as u64; } unsafe { *out = s; } }
+        "#).unwrap();
+        let mut prog = crate::program::Program::new(sess);
+        prog.load_crate("fixture", source.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(sess, &[]), Vec::new()).unwrap();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let def = |u: &Unit, name: &str| DefId(u.prog.defs.iter().position(|d| u.prog.syms.str(d.name) == name).unwrap() as u32);
+        let (sum, table) = (def(&u, "sum"), def(&u, "TABLE"));
+        let up = &mut *u as *mut Unit;
+        let _ = u.static_sym(table);
+        let id = u.fn_id(FnKey::Inst(sum, Vec::new()));
+        let entry = u.entry(id);
+        let b = create(&u);
+        let mut out = 0u64;
+        unsafe { crate::jit::call_jit_in(up, b, entry, &mut out as *mut u64 as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
+        assert_eq!(out, 31415);
+        destroy(b);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// A constant pointing at a static (directly or through data it points to) is per domain:
     /// each domain's copy points at its own static; a constant that reaches no static stays shared.
     #[test]
