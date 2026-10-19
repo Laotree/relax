@@ -23,7 +23,7 @@ fn empty_body(tcx: &Tcx) -> Body {
     let block = BasicBlockData { statements: vec![], terminator: Some(Terminator { kind: TerminatorKind::Return, source_info: SourceInfo { span: span(99), ..SourceInfo::default() } }), is_cleanup: false };
     Body { phase: MirPhase::Analysis(AnalysisPhase::Initial), source: MirSource { owner: DefId(0), kind: BodyKind::Fn }, basic_blocks: vec![block],
         local_decls: vec![LocalDecl { ty: tcx.tys.unit, mutability: Mutability::Mut, source_info: SourceInfo::default(), user_ty: vec![], local_info: LocalInfo::Boring, kind: LocalKind::Return }],
-        source_scopes: vec![SourceScopeData { span: Span::default(), parent_scope: None }], user_type_annotations: vec![], var_debug_info: vec![],
+        source_scopes: vec![SourceScopeData { span: Span::default(), parent_scope: None }], user_type_annotations: vec![], var_debug_info: vec![], span: Span::default(), upvars: Vec::new(), allocs: AllocMap::default(),
         arg_count: 0, spread_arg: None, promoted: vec![], coroutine: None }
 }
 fn region(tcx: &Tcx, i: u32) -> RegionId { tcx.tys.intern_region(RegionKind::ReEarlyParam(i)) }

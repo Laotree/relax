@@ -367,13 +367,9 @@ impl<'a> TypeChecker<'a> {
             Operand::RuntimeChecks(_) => self.tcx.tys.bool_,
         }
     }
-    fn const_ty(&self, c: &ConstOperand) -> TyId {
-        match &c.const_ {
-            Const::Val(_, ty) | Const::Ty(ty, _) => *ty,
-            Const::Unevaluated { promoted: Some(p), .. } => self.promoted[p.0 as usize].local_decls[0].ty,
-            Const::Unevaluated { def, args, promoted: None, .. } => self.infcx.unevaluated_const_ty(*def, args),
-        }
-    }
+    /// `constant.const_.ty()` (mod.rs:1733): the type the constant is used at; for a promoted it is
+    /// the use site's, not the promoted body's return type, which is related to it below.
+    fn const_ty(&self, c: &ConstOperand) -> TyId { c.const_.ty(&self.tcx.tys) }
     fn place_ty(&self, place: &Place) -> PlaceTy {
         place.ty(self.body, self.tcx).expect("ill-formed MIR place")
     }
@@ -1061,8 +1057,12 @@ impl<'a> TypeChecker<'a> {
                     let span = locations.span(self.body);
                     self.infcx.ascribe_user_type(&mut self.constraints, ty, UserType::new(UserTypeKind::TypeOf(*def, UserArgs { args: args.clone(), user_self_ty: None })), span);
                 }
-                // Const generic parameters are ascribed below.
-                Const::Ty(..) => {}
+                // mod.rs:1761-1766: an unevaluated type-system constant is ascribed TypeOf(def, args);
+                // a const parameter or a value gets nothing.
+                Const::Ty(_, ct) => if let crate::consts::ConstKind::Alias(_, alias) = self.tcx.tys.const_kind(*ct) {
+                    let span = locations.span(self.body);
+                    self.infcx.ascribe_user_type(&mut self.constraints, ty, UserType::new(UserTypeKind::TypeOf(alias.kind.def_id(), UserArgs { args: alias.args.to_vec(), user_self_ty: None })), span);
+                },
                 Const::Val(..) => {
                     if let Some(static_def) = self.infcx.static_ptr(constant) {
                         let normalized_ty = self.infcx.static_ty(&mut self.constraints, static_def, locations);

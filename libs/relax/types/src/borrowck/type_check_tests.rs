@@ -505,7 +505,7 @@ fn promoted_constraints_move_to_the_use_location() {
     let mut promoted = body(&[promoted_ty, t, rf(&tcx, re(&tcx, 6), t, false)], vec![block(vec![StatementKind::Nop, assign(0, copy(2))], TerminatorKind::Return)]);
     promoted.arg_count = 0; promoted.source.kind = BodyKind::Promoted(DefId(0), PromotedId(0));
     let use_promoted = Operand::Constant(Box::new(ConstOperand { span: span(30), user_ty: None,
-        const_: Const::Unevaluated { def: DefId(0), args: vec![], promoted: Some(PromotedId(0)), ty: t } }));
+        const_: Const::Unevaluated { def: DefId(0), args: vec![], promoted: Some(PromotedId(0)), ty: promoted_ty } }));
     let mut b = body(&[tcx.tys.unit, t, rf(&tcx, re(&tcx, 2), t, false)], vec![block(vec![StatementKind::Nop, StatementKind::Nop, assign(2, Rvalue::Use(use_promoted))], TerminatorKind::Return)]);
     b.promoted = vec![promoted];
     let mut fake = Fake::new(&tcx, 7);
@@ -790,13 +790,12 @@ fn dead_annotations_are_still_ascribed_and_projections_follow_fields() {
     // projected through field 0 of the annotated pair `(&'4 i32, i32)`.
     let (dead, live) = (rf(&tcx, re(&tcx, 3), t, false), tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[rf(&tcx, re(&tcx, 4), t, false), t]))));
     let mut b = body(&[tcx.tys.unit, t, rf(&tcx, re(&tcx, 2), t, false)], vec![block(vec![StatementKind::AscribeUserType(p(2),
-        UserTypeProjection { base: UserTypeAnnotationIndex(1), projection: vec![PlaceElem::Field(FieldIdx(0), rf(&tcx, re(&tcx, 4), t, false))] }, Variance::Covariant)], TerminatorKind::Return)]);
-    b.user_type_annotations = vec![UserTypeId(0), UserTypeId(1)];
+        UserTypeProjection { base: UserTypeAnnotationIndex(1), projection: vec![UserTypeProjectionElem::Field(FieldIdx(0))] }, Variance::Covariant)], TerminatorKind::Return)]);
+    b.user_type_annotations = vec![CanonicalUserTypeAnnotation::for_test(dead, span(40)), CanonicalUserTypeAnnotation::for_test(live, span(41))];
     let mut fake = Fake::new(&tcx, 5);
-    fake.annotations = vec![(span(40), dead), (span(41), live)];
     fake.fields = vec![rf(&tcx, re(&tcx, 4), t, false), t];
     let r = check(&tcx, &mut fake, &b); clean(&r);
-    assert_eq!(fake.ops[..2], [Op::Ascribe(dead, UserType::Annotation(UserTypeId(0)), span(40)), Op::Ascribe(live, UserType::Annotation(UserTypeId(1)), span(41))]);
+    assert_eq!(fake.ops[..2], [Op::Ascribe(dead, annotation_value(dead), span(40)), Op::Ascribe(live, annotation_value(live), span(41))]);
     // `_2 <: field 0` of the live annotation: '2: '4 at the statement span, everywhere.
     let asc = Cat::TypeAnnotation(AnnotationSource::Ascription);
     let all: Vec<_> = r.constraints.outlives_constraints.outlives.iter().filter(|c| c.category != Cat::BoringNoLocation).map(|c| (c.sup, c.sub, c.location, c.category)).collect();
@@ -810,7 +809,7 @@ fn promoted_uses_at_two_parent_locations_get_their_own_points() {
     let mut promoted = body(&[promoted_ty, t, rf(&tcx, re(&tcx, 6), t, false)], vec![block(vec![StatementKind::Nop], TerminatorKind::Return)]);
     promoted.arg_count = 0; promoted.source.kind = BodyKind::Promoted(DefId(0), PromotedId(0));
     promoted.basic_blocks[0].statements = vec![Statement { kind: assign(0, copy(2)), source_info: SourceInfo { span: span(7), ..SourceInfo::default() } }];
-    let uses = || Operand::Constant(Box::new(ConstOperand { span: span(30), user_ty: None, const_: Const::Unevaluated { def: DefId(0), args: vec![], promoted: Some(PromotedId(0)) } }));
+    let uses = || Operand::Constant(Box::new(ConstOperand { span: span(30), user_ty: None, const_: Const::Unevaluated { def: DefId(0), args: vec![], promoted: Some(PromotedId(0)), ty: promoted_ty } }));
     let mut b = body(&[tcx.tys.unit, t, rf(&tcx, re(&tcx, 2), t, false), rf(&tcx, re(&tcx, 3), t, false)],
         vec![block(vec![assign(2, Rvalue::Use(uses())), assign(3, Rvalue::Use(uses()))], TerminatorKind::Return)]);
     b.promoted = vec![promoted];
