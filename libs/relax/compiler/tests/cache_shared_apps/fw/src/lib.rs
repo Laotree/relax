@@ -40,3 +40,20 @@ pub fn uses_unrelated() -> u32 { unrelated() + 1 }
 pub fn sum_to(n: u32) -> u32 { (1..=n).sum() }
 
 pub fn pow_std(a: u32) -> u32 { a.pow(3) }
+
+pub fn flavor() -> u32 {
+    #[cfg(flavor_b)]
+    { 2 }
+    #[cfg(not(flavor_b))]
+    { 1 }
+}
+
+pub fn envv() -> usize { option_env!("SC_ENVV").unwrap_or("none").len() } // EDIT envv
+
+pub fn data() -> usize { include_str!("../data.txt").len() }
+
+#[path = "alt.rs"]
+mod alt;
+pub fn alt_val() -> u32 { alt::val() + 1 }
+
+pub fn wrap<T: Default + std::fmt::Debug>() -> usize { format!("{:?}", T::default()).len() }

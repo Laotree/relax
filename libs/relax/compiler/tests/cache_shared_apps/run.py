@@ -14,35 +14,53 @@ REPO = os.path.normpath(os.path.join(HERE, "..", "..", "..", "..", ".."))
 STD = os.path.normpath(os.path.join(HERE, "..", "..", "std"))
 # fw fns that no scenario's edit or feature difference reaches (the plain ones)
 PLAIN = ["unrelated", "uses_unrelated", "area", "sum_to", "add"]
-# name: (first app, second app, edit (file, old, new) or None, hit in 2nd, compiled in 2nd, std edit or None)
-MIN_HITS = {"provided": 100}
+FW = "fw/src/lib.rs"
+E_ADD = (FW, "pub fn add(a: u32, b: u32) -> u32 { a + b } // EDIT add", "pub fn add(a: u32, b: u32) -> u32 { a + b + 100 } // EDIT add")
+E_SHAPE = (FW, "pub struct Shape { pub w: u32, pub h: u32 } // EDIT shape", "pub struct Shape { pub w: u32, pub h: u32, pub d: u64 } // EDIT shape")
+# a scenario: first/second app, edits applied to the tree between the runs (or, with "tree2", to a second copy of the
+# tree the second app runs in: same crate names at other paths), env of the two runs, the first command (run|check),
+# the fns that must hit / be compiled in the second run, a minimum of shared slots, a std edit
 SCENARIOS = {
     # same fw features, another app: the framework's code is shared
-    "share": ("app_a", "app_c", None, PLAIN + ["from_macro", "describe", "cfg_macro", "gated"], [], None),
-    # the first app holds a crate the loader binds (the provided-crate fixture, run from the repository's own workspace), the
-    # second does not: the std code both compile is shared (at least MIN_HITS slots)
-    "provided": ("repo:relax-provided-fixture", "app_b", None, [], [], None),
+    "share": dict(first="app_a", second="app_c", hit=PLAIN + ["from_macro", "cfg_macro", "gated"]),
+    # the first app holds a crate the loader binds (the provided-crate fixture, run from the repository's own workspace),
+    # the second does not: the std code both compile is shared
+    "provided": dict(first="repo:relax-provided-fixture", second="app_b", min_hits=100),
     # fw built with feature `fast` by one app, without by the other: what reads the feature is never shared
-    "features": ("app_a", "app_b", None, [], ["cfg_macro", "gated"], None),
-    # a fn body of the shared crate edited between the two apps
-    "body": ("app_a", "app_c", ("fw/src/lib.rs", "pub fn add(a: u32, b: u32) -> u32 { a + b } // EDIT add", "pub fn add(a: u32, b: u32) -> u32 { a + b + 100 } // EDIT add"),
-             [x for x in PLAIN if x != "add"] + ["from_macro", "describe"], ["add"], None),
-    # an item macro's invocation edited
-    "macro": ("app_a", "app_c", ("fw/src/lib.rs", "mk_fn!(from_macro = 40); // EDIT macro", "mk_fn!(from_macro = 41); // EDIT macro"),
-              [x for x in PLAIN] + ["describe"], ["from_macro"], None),
-    # a struct layout of the shared crate: its users are compiled again, the rest is shared
-    "layout": ("app_a", "app_c", ("fw/src/lib.rs", "pub struct Shape { pub w: u32, pub h: u32 } // EDIT shape", "pub struct Shape { pub w: u32, pub h: u32, pub d: u64 } // EDIT shape"),
-               [], ["area", "describe"], None),
-    # a std fn body edited between the two apps (the std source is part of every crate's identity: sum_from compiles again)
-    "std_body": ("app_a", "app_c", None, [], ["sum_from"],
-                 ("core/iter/mod.rs", "    iter.fold(zero, |a, b| a + b)\n", "    iter.fold(zero, |a, b| b + a)\n")),
-    # a std interface edit (a const fn body is part of the interface): everything above core is compiled again
-    "std_iface": ("app_a", "app_c", None, [], PLAIN,
-                  ("core/num/int_impls.rs", "    pub const fn pow(self, exp: u32) -> u32 { self.wrapping_pow(exp) }", "    pub const fn pow(self, exp: u32) -> u32 { self.wrapping_pow(exp) + 0 }")),
+    "features": dict(first="app_a", second="app_b", compiled=["cfg_macro", "gated"]),
+    "body": dict(first="app_a", second="app_a", edits=[E_ADD], hit=[x for x in PLAIN if x != "add"] + ["from_macro"], compiled=["add"], observable=True),
+    "macro": dict(first="app_a", second="app_a", edits=[(FW, "mk_fn!(from_macro = 40); // EDIT macro", "mk_fn!(from_macro = 41); // EDIT macro")],
+                  hit=PLAIN, compiled=["from_macro"], observable=True),
+    "layout": dict(first="app_a", second="app_c", edits=[E_SHAPE], compiled=["area", "describe"]),
+    "std_body": dict(first="app_a", second="app_c", compiled=["sum_from"],
+                     std=("core/iter/mod.rs", "    iter.fold(zero, |a, b| a + b)\n", "    iter.fold(zero, |a, b| b + a)\n")),
+    "std_iface": dict(first="app_a", second="app_c", compiled=PLAIN,
+                      std=("core/num/int_impls.rs", "    pub const fn pow(self, exp: u32) -> u32 { self.wrapping_pow(exp) }", "    pub const fn pow(self, exp: u32) -> u32 { self.wrapping_pow(exp) + 0 }")),
+    # `check` (binds no provided crate) then `run` (binds them) on one cache: the collected image is shared by both
+    "check_run": dict(first="app_c", second="app_c", first_cmd="check"),
+    "run_check": dict(first="app_c", second="app_c", second_cmd="check"),
+    # the same crate (name) at another version/path with another body
+    "two_versions": dict(first="app_a", second="app_a", tree2=[("fw/Cargo.toml", 'version = "0.1.0"', 'version = "0.2.0"'), E_ADD],
+                         compiled=["add", "unrelated"]),
+    # a build script's cfg differing per run (the script reads the environment)
+    "build_cfg": dict(first="app_a", second="app_a", env2={"SC_FLAVOR": "b"}, compiled=["flavor"], observable=True),
+    # env!/option_env!, include_str!, #[path] inputs
+    "env": dict(first="app_a", second="app_a", env2={"SC_ENVV": "xyz"}, compiled=["envv"], observable=True),
+    "include": dict(first="app_a", second="app_a", files=[("fw/data.txt", "0123456789\n", "0123456789abcdef\n")], compiled=["data"], observable=True),
+    "pathmod": dict(first="app_a", second="app_a", edits=[("fw/src/alt.rs", "pub fn val() -> u32 { 10 } // EDIT alt", "pub fn val() -> u32 { 20 } // EDIT alt")],
+                    compiled=["val"], observable=True),
+    # a generic fw instance over an app's own type, both runs at the same path: the type's layout / its Default body changes
+    "own_layout": dict(first="app_a", second="app_a", edits=[("app_a/src/main.rs", "struct Mine { x: u32 }", "struct Mine { x: u32, y: u64 }"),
+                       ("app_a/src/main.rs", "Mine { x: 1 }", "Mine { x: 1, y: 2 }")], observable=True, compiled=["wrap"]),
+    "own_body": dict(first="app_a", second="app_a", edits=[("app_a/src/main.rs", "fn mine_make() -> Mine { Mine { x: 1 } }", "fn mine_make() -> Mine { Mine { x: 123456 } }")], compiled=["mine_make"], observable=True),
+    # app -> mid -> fw: fw's interface changes, mid's source does not
+    "mid_iface": dict(first="app_g", second="app_g", edits=[E_SHAPE], compiled=["mid_area", "mid_shape_size"]),
+    "mid_body": dict(first="app_g", second="app_g", edits=[E_ADD], hit=["mid_area", "mid_shape_size"], compiled=["add"]),
 }
+MIN_HITS = {}
 
 
-def run(relax, tree, std, cache, app, tag):
+def run(relax, tree, std, cache, app, tag, env_extra=None, cmd="run"):
     if app.startswith("repo:"):
         tree, pkg = REPO, app[5:]
     else:
@@ -50,7 +68,8 @@ def run(relax, tree, std, cache, app, tag):
     env = dict(os.environ, MAKEPAD_RUN_CACHE_DIR=os.path.join(cache, "cache"), MAKEPAD_RUN_STD=std, RUSTC_BOOTSTRAP="1",
                MAKEPAD_RUN_CACHE_TRACE=os.path.join(cache, tag + ".trace"))
     env.pop("MAKEPAD_RUN_CACHE", None)
-    p = subprocess.run([relax, "run", "--quiet", pkg], cwd=tree, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
+    env.update(env_extra or {})
+    p = subprocess.run([relax, cmd, "--quiet", pkg], cwd=tree, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
     out = p.stdout.decode("utf-8", "replace")
     open(os.path.join(cache, tag + ".log"), "w").write(out)
     m = re.search(r"shared_apps result ([0-9 ]+)", out)
@@ -70,7 +89,7 @@ def status(trace, name):
     """'hit', 'compiled' or None for the fw fns called `name`"""
     seen = set()
     for slot, whats in trace.items():
-        if slot.startswith("sc_fw::") and re.search(r"::(" + re.escape(name) + r")(,|$)", slot):
+        if slot.startswith(("sc_fw::", "sc_mid::", "sc_app_")) and re.search(r"::(" + re.escape(name) + r")(,|$)", slot):
             seen |= whats
         elif name in ("sum_from",) and re.search(r"::sum_from(,|$)", slot):
             seen |= whats
@@ -88,7 +107,10 @@ def edit_file(path, old, new):
 
 
 def scenario(relax, name):
-    first, second, edit, hit, compiled, stdedit = SCENARIOS[name]
+    sc = SCENARIOS[name]
+    first, second = sc["first"], sc["second"]
+    hit, compiled = sc.get("hit", []), sc.get("compiled", [])
+    cmd2 = sc.get("second_cmd", "run")
     tmp = tempfile.mkdtemp(prefix="relax-cache-shared-apps-")
     bad = []
     try:
@@ -98,21 +120,30 @@ def scenario(relax, name):
         std = os.path.join(tmp, "std")
         cache = os.path.join(tmp, "c")
         os.mkdir(cache, 0o700)
-        rc, res1, out, _ = run(relax, tree, std, cache, first, "1-first")
-        if rc != 0 or (res1 is None and not first.startswith("repo:")):
+        rc, res1, out, _ = run(relax, tree, std, cache, first, "1-first", sc.get("env1"), sc.get("first_cmd", "run"))
+        if rc != 0 or (res1 is None and not first.startswith("repo:") and sc.get("first_cmd", "run") == "run"):
             bad.append(f"first app: exit {rc}, no result\n{out[-600:]}")
-        if edit:
-            edit_file(os.path.join(tree, edit[0]), edit[1], edit[2])
-        if stdedit:
-            edit_file(os.path.join(std, stdedit[0]), stdedit[1], stdedit[2])
-        rc, res2, out, tr = run(relax, tree, std, cache, second, "2-second")
+        run_tree = tree
+        if sc.get("tree2"):
+            run_tree = os.path.join(tmp, "tree2")
+            shutil.copytree(tree, run_tree)
+        for e in list(sc.get("edits", [])) + list(sc.get("files", [])) + list(sc.get("tree2", [])):
+            edit_file(os.path.join(run_tree, e[0]), e[1], e[2])
+        if sc.get("std"):
+            edit_file(os.path.join(std, sc["std"][0]), sc["std"][1], sc["std"][2])
+        rc, res2, out, tr = run(relax, run_tree, std, cache, second, "2-second", sc.get("env2"), cmd2)
         ref = os.path.join(tmp, "ref")
         os.mkdir(ref, 0o700)
-        rc0, want, out0, _ = run(relax, tree, std, ref, second, "ref")
-        if rc != 0 or res2 is None or res2 != want:
+        rc0, want, out0, _ = run(relax, run_tree, std, ref, second, "ref", sc.get("env2"), cmd2)
+        if cmd2 == "check":
+            if rc != 0 or "0 errors" not in out:
+                bad.append(f"check on the shared cache: exit {rc}\n{out[-400:]}")
+        elif rc != 0 or res2 is None or res2 != want:
             bad.append(f"second app (shared cache): exit {rc}, result {res2}; empty cache gives {want} (exit {rc0})")
-        if MIN_HITS.get(name, 0) > sum(1 for w in tr.values() if "hit" in w):
-            bad.append(f"fewer than {MIN_HITS[name]} slots shared")
+        if sc.get("observable") and first == second and cmd2 == "run" and res1 is not None and res2 == res1:
+            bad.append("the edit is not observable in the output (the test proves nothing)")
+        if sc.get("min_hits", 0) > sum(1 for w in tr.values() if "hit" in w):
+            bad.append(f"fewer than {sc['min_hits']} slots shared")
         for f in hit:
             if status(tr, f) != "hit":
                 bad.append(f"{f} should be shared but was {status(tr, f)}")

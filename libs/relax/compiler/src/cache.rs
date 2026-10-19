@@ -7,8 +7,10 @@
 //! content hashes: the Relax build, the codegen configuration, the function instance, the
 //! interface fingerprints of every crate the instance can depend on (its definition's crate and
 //! the crates of its type arguments, with their dependencies; cache/items.rs), and its own
-//! body and position (a bound provided crate marks its own interface fingerprint, so only the code
-//! that can reach it is keyed by it: another app with more or fewer bound crates shares the rest).
+//! body and position. The interface fingerprints carry the bound crates that crate can reach and
+//! the bound crates depending on those (items::apply_bound): code that cannot reach a bound crate
+//! (std ...) is shared by programs binding other sets; whatever can reach one is shared only by
+//! programs with the same view.
 //! Never timestamps. An entry also names the slots whose RIR its code took
 //! in (inlined bodies, nounwind answers, transitively) with their keys: it links only while
 //! those keys are unchanged. So an edit of one fn body recompiles that fn and the code that
@@ -380,8 +382,12 @@ pub struct Cache {
     mapped_index: Option<collected::MappedIndexes>,
     /// crate fingerprints (stable.rs), per crate index
     fps: Vec<u128>,
-    /// interface fingerprints (cache/items.rs), per crate index: what code keys name
+    /// interface fingerprints (cache/items.rs), per crate index: what code keys name; the bound
+    /// crates of this program folded in (items::apply_bound)
     iface: Vec<u128>,
+    /// the same without the bound crates: what a collected image stores (run, check and
+    /// check --boundary of one program bind different sets, the image is shared by all)
+    iface_plain: Vec<u128>,
     /// per file: its interface hash and the fn bodies outside it
     digests: Vec<Option<std::sync::Arc<items::FileDigest>>>,
     /// per definition: its body (when a hole) and position digest, hashed (code keys)
@@ -635,8 +641,7 @@ impl Cache {
         }
         cfgh.u8(u.tier1.is_some() as u8);
         // which crates are bound to the loader's rustc build (provided.rs) is in the interface
-        // fingerprint of each bound crate (items::crate_ifaces), so only the code that can reach
-        // one is keyed by it
+        // fingerprints (items::apply_bound), so only the code that can reach a bound crate is keyed by it
         cfgh.u128(u.prog.session.options.fingerprint());
         let mut c = Cache {
             verbose,
@@ -652,6 +657,7 @@ impl Cache {
             mapped_index: None,
             fps,
             iface: Vec::new(),
+            iface_plain: Vec::new(),
             digests: Vec::new(),
             def_bodies: HashMap::new(),
             code_path: Vec::new(),
@@ -731,15 +737,16 @@ impl Cache {
         match collected.filter(|c| c.ifaces.len() == ncr && std::env::var_os("MAKEPAD_RUN_CACHE_IFACE").is_none()) {
             Some(cc) => {
                 c.digests = vec![None; prog.files.len()];
-                c.iface = cc.ifaces.clone();
+                c.iface_plain = cc.ifaces.clone();
             }
             None => {
                 c.digests = items::file_digests(prog);
-                let provided: Vec<(u32, u64)> = u.provided.iter().map(|(k, pc)| (*k, pc.source)).collect();
-                c.iface = items::crate_ifaces(prog, &c.fps, &c.digests, &provided);
-                c.iface.truncate(ncr);
+                c.iface_plain = items::crate_ifaces(prog, &c.fps, &c.digests);
+                c.iface_plain.truncate(ncr);
             }
         }
+        let provided: Vec<(u32, u64)> = u.provided.iter().map(|(k, pc)| (*k, pc.source)).collect();
+        c.iface = items::apply_bound(prog, &c.iface_plain, &provided);
         c.stats.iface_ns = t_if.elapsed().as_nanos() as u64;
         // MAKEPAD_RUN_CACHE_IFACE=<file>: every file's interface hash and crate's interface
         // fingerprint (which file made an edit's crate recompile)
@@ -4852,7 +4859,13 @@ mod cold_tests {
         assert_eq!(saved.boot_files, boot_files.len());
         assert!(saved.skipped_files.contains_key(&deferred));
         let proof = proof.expect("complete boot certificate");
-        assert_eq!(proof.ifaces, cache.iface);
+        assert_eq!(proof.ifaces, cache.iface_plain);
+        // the stored interfaces are bound-set free: run, check and check --boundary of one program bind
+        // different sets and take the same image, folding their own set in (apply_bound)
+        let bound = [(1u32, 7u64)];
+        assert_ne!(items::apply_bound(&saved, &proof.ifaces, &bound), proof.ifaces);
+        assert_eq!(items::apply_bound(&saved, &proof.ifaces, &bound), items::apply_bound(&unit.prog, &cache.iface_plain, &bound));
+        assert_eq!(items::apply_bound(&saved, &proof.ifaces, &[]), proof.ifaces);
         assert_eq!(proof.indexes.as_ref().unwrap().stores.len(), pre.len());
         assert!(cache.restore_collected_definitions(&saved, proof.definitions));
         let definitions = cache.mapped_definitions.as_ref().unwrap();
@@ -5681,6 +5694,12 @@ mod data_tests {
         let stores = vec![std::sync::Arc::new(Store::open(&path).unwrap())];
         let snapshot = OwnerVerdicts::new(42, crate::stable::crate_fingerprints(&prog), vec![0; prog.crates.len()], 0, stores.first().cloned());
         assert_eq!(snapshot.lookup(&prog, owner, 0), (Some(key), Some(StoredVerdict::Clean)));
+        // a changed interface fingerprint (e.g. another set of bound crates under the owner's crate) never reuses it
+        let mut other = vec![0u128; prog.crates.len()];
+        other[2] = 1;
+        let (k2, v2) = OwnerVerdicts::new(42, crate::stable::crate_fingerprints(&prog), other, 0, stores.first().cloned()).lookup(&prog, owner, 0);
+        assert_ne!(k2, Some(key));
+        assert_eq!(v2, None);
         // another epoch (the program was collected again) or another compiler build never reuses it
         assert_eq!(snapshot.lookup(&prog, owner, 1), (None, None));
         assert_eq!(OwnerVerdicts::new(43, crate::stable::crate_fingerprints(&prog), vec![0; prog.crates.len()], 0, stores.first().cloned()).lookup(&prog, owner, 0).1, None);
@@ -5706,21 +5725,35 @@ mod data_tests {
     fn bound_crates_mark_only_the_interfaces_that_reach_them() {
         isolated_test!(bound_crates_mark_only_the_interfaces_that_reach_them);
         let sess = &std::sync::Arc::new(crate::Session::default());
+        // crates: 0 macro_impl <- 1 mac <- 2 dependent (each depends on the one before)
         let (root, prog, _) = front_fixture(sess, "bound-ifaces");
         let digests = items::file_digests(&prog);
         let fps = crate::stable::crate_fingerprints(&prog);
-        let plain = items::crate_ifaces(&prog, &fps, &digests, &[]);
+        let plain = items::crate_ifaces(&prog, &fps, &digests);
+        let with = |b: &[(u32, u64)]| items::apply_bound(&prog, &plain, b);
+        assert_eq!(with(&[]), plain);
         // crate 1 bound: it and what depends on it (crate 2) change; crate 0, below it, does not
-        let bound1 = items::crate_ifaces(&prog, &fps, &digests, &[(1, 99)]);
-        assert_eq!(plain[0], bound1[0]);
-        assert_ne!(plain[1], bound1[1]);
-        assert_ne!(plain[2], bound1[2]);
+        let b1 = with(&[(1, 99)]);
+        assert_eq!(b1[0], plain[0]);
+        assert_ne!(b1[1], plain[1]);
+        assert_ne!(b1[2], plain[2]);
         // crate 2 bound: only itself
-        let bound2 = items::crate_ifaces(&prog, &fps, &digests, &[(2, 99)]);
-        assert_eq!((plain[0], plain[1]), (bound2[0], bound2[1]));
-        assert_ne!(plain[2], bound2[2]);
-        // the binding is part of the identity: another source identity of the bound crate differs
-        assert_ne!(bound1[2], items::crate_ifaces(&prog, &fps, &digests, &[(1, 100)])[2]);
+        let b2 = with(&[(2, 99)]);
+        assert_eq!((b2[0], b2[1]), (plain[0], plain[1]));
+        assert_ne!(b2[2], plain[2]);
+        // another source identity of the bound crate differs
+        assert_ne!(with(&[(1, 100)])[2], b1[2]);
+        // the boundary-crossing set is global: crate 1 bound in two programs, crate 2 (which depends on
+        // it) bound in only one of them -- crate 1's types cross or not depending on crate 2's fns, so
+        // crate 1's fingerprint (and everything above it) must differ, while crate 0 below stays shared
+        let (only1, both) = (with(&[(1, 99)]), with(&[(1, 99), (2, 5)]));
+        assert_eq!(only1[0], both[0]);
+        assert_ne!(only1[1], both[1], "a bound crate depending on another changes that one's view");
+        assert_ne!(only1[2], both[2]);
+        // order of the list does not matter
+        assert_eq!(with(&[(1, 99), (2, 5)]), with(&[(2, 5), (1, 99)]));
+        // a bound crate that nothing reaches does not touch an unrelated crate: crate 0 is below all
+        assert_eq!(with(&[(2, 5)])[0], plain[0]);
         std::fs::remove_dir_all(root).unwrap();
     }
 
