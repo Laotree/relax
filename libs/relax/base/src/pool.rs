@@ -38,17 +38,29 @@ enum Slot {
 struct Worker {
     slot: Mutex<Slot>,
     wake: Condvar,
+    /// Set by the spawner right after the thread starts; taken to join the worker when it retires
+    /// (a native join also waits for the thread's TLS destructors, which walk the caches of the
+    /// generation it last ran in).
+    handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+thread_local! {
+    /// The task that just ran on this worker panicked: the worker does not take another task, so
+    /// no thread-local state of a half-run task (a flag set without a restoring guard) carries over.
+    static TASK_PANICKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 struct Pool {
     /// Workers waiting for a task, most recently idle last. Only touched in the kept phase: the
     /// list outlives every compiler generation.
     idle: Mutex<Vec<Arc<Worker>>>,
+    /// Workers that ended after a panicking task, not yet joined (`retire_idle` joins them).
+    dying: Mutex<Vec<Arc<Worker>>>,
     started: AtomicUsize,
     alive: AtomicUsize,
 }
 
-static POOL: Pool = Pool { idle: Mutex::new(Vec::new()), started: AtomicUsize::new(0), alive: AtomicUsize::new(0) };
+static POOL: Pool = Pool { idle: Mutex::new(Vec::new()), dying: Mutex::new(Vec::new()), started: AtomicUsize::new(0), alive: AtomicUsize::new(0) };
 
 /// (workers started, workers alive) so far.
 pub fn stats() -> (usize, usize) {
@@ -76,8 +88,15 @@ fn worker_main(w: Arc<Worker>) {
             }
         };
         let Some(task) = task else { break };
-        // the task catches its own panics
-        task();
+        // the task catches its own panics; a panic that escapes it (a result dropped in the task
+        // itself) is handled the same way
+        let escaped = std::panic::catch_unwind(AssertUnwindSafe(task)).is_err();
+        if escaped || TASK_PANICKED.with(|p| p.replace(false)) {
+            // end this worker: a fresh thread has none of the half-run task's thread-local state
+            let _k = zone_alloc::kept();
+            POOL.dying.lock().unwrap_or_else(|e| e.into_inner()).push(w.clone());
+            break;
+        }
         // what the worker left in its chunks is for every thread to reuse, not held for its next task
         zone_alloc::compiler_hand_back();
         let _k = zone_alloc::kept();
@@ -86,47 +105,78 @@ fn worker_main(w: Arc<Worker>) {
     POOL.alive.fetch_sub(1, Ordering::Relaxed);
 }
 
-fn dispatch(task: Task) {
+fn dispatch(task: Task) -> Result<(), (Task, std::io::Error)> {
     let idle = {
         let _k = zone_alloc::kept();
         POOL.idle.lock().unwrap_or_else(|e| e.into_inner()).pop()
     };
     if let Some(w) = idle {
         w.give(Slot::Task(task));
-        return;
+        return Ok(());
     }
     // no idle worker: a new one, which starts with the task
+    let _k = zone_alloc::kept();
     let (w, spawned) = {
-        let _k = zone_alloc::kept();
-        let w = Arc::new(Worker { slot: Mutex::new(Slot::Task(task)), wake: Condvar::new() });
+        let w = Arc::new(Worker { slot: Mutex::new(Slot::Task(task)), wake: Condvar::new(), handle: Mutex::new(None) });
         let id = POOL.started.fetch_add(1, Ordering::Relaxed);
         POOL.alive.fetch_add(1, Ordering::Relaxed);
         let w2 = w.clone();
         let spawned = std::thread::Builder::new().name(format!("run-pool-{id}")).spawn(move || worker_main(w2));
         (w, spawned)
     };
-    if spawned.is_err() {
-        // the OS refused a thread: the caller runs the task itself
-        POOL.alive.fetch_sub(1, Ordering::Relaxed);
-        let task = match std::mem::replace(&mut *w.slot.lock().unwrap_or_else(|e| e.into_inner()), Slot::Idle) {
-            Slot::Task(t) => t,
-            _ => unreachable!("the new worker never started"),
-        };
-        task();
+    match spawned {
+        Ok(h) => {
+            *w.handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+            Ok(())
+        }
+        Err(e) => {
+            POOL.alive.fetch_sub(1, Ordering::Relaxed);
+            let task = match std::mem::replace(&mut *w.slot.lock().unwrap_or_else(|e| e.into_inner()), Slot::Idle) {
+                Slot::Task(t) => t,
+                _ => unreachable!("the new worker never started"),
+            };
+            Err((task, e))
+        }
     }
 }
 
-/// Ends the workers that are idle now (each hands its arena chunks back as it goes). A worker
-/// that is running a task idles afterwards: call again. Returns how many were told to end.
+/// Waits for a worker's thread to end completely (TLS destructors included).
+fn join_worker(w: &Worker) {
+    let _k = zone_alloc::kept();
+    loop {
+        let h = w.handle.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match h {
+            Some(h) => {
+                let _ = h.join();
+                return;
+            }
+            // the spawner has not stored the handle yet (it does so right after the spawn)
+            None => std::thread::yield_now(),
+        }
+    }
+}
+
+/// Ends the workers that are idle now and joins them, and the ones that ended after a panic: when
+/// this returns they are gone, TLS destructors included (each hands its arena chunks back as it
+/// goes). A worker that is running a task idles afterwards: call again. Returns how many ended.
 pub fn retire_idle() -> usize {
-    let idle = {
+    let (idle, dying) = {
         let _k = zone_alloc::kept();
-        std::mem::take(&mut *POOL.idle.lock().unwrap_or_else(|e| e.into_inner()))
+        (
+            std::mem::take(&mut *POOL.idle.lock().unwrap_or_else(|e| e.into_inner())),
+            std::mem::take(&mut *POOL.dying.lock().unwrap_or_else(|e| e.into_inner())),
+        )
     };
-    let n = idle.len();
-    for w in idle {
+    let n = idle.len() + dying.len();
+    for w in &idle {
         w.give(Slot::Retire);
     }
+    for w in idle.iter().chain(dying.iter()) {
+        join_worker(w);
+    }
+    let _k = zone_alloc::kept();
+    drop(idle);
+    drop(dying);
     n
 }
 
@@ -218,19 +268,34 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         self.data.pending.fetch_add(1, Ordering::Relaxed);
         let (p, data) = (packet.clone(), self.data.clone());
         let main = move || {
+            // finishes the task whatever happens below, also when dropping a result panics
+            struct Finish(Arc<ScopeData>);
+            impl Drop for Finish {
+                fn drop(&mut self) {
+                    self.0.finish_one();
+                }
+            }
+            let _finish = Finish(data);
             let r = catch_unwind(AssertUnwindSafe(f));
+            if r.is_err() {
+                TASK_PANICKED.with(|t| t.set(true));
+            }
             *p.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
             p.ready.notify_all();
             // everything the task borrowed or returned is released before the scope may end
             drop(p);
-            data.finish_one();
         };
         let boxed: Box<dyn FnOnce() + Send + 'scope> = Box::new(main);
         // SAFETY: `scope` waits for `pending` to reach zero before it returns, also on a panic of
         // its closure, and `main` decrements it only after it dropped `f`'s result handle; the
         // erased lifetime is never used past that point.
         let task: Task = unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + 'scope>, Task>(boxed) };
-        dispatch(task);
+        if let Err((task, e)) = dispatch(task) {
+            // like std::thread::scope: no thread, no task; the section must not wait for it
+            drop(task);
+            self.data.pending.fetch_sub(1, Ordering::Relaxed);
+            panic!("failed to spawn thread: {e}");
+        }
         ScopedJoinHandle { packet, scope: PhantomData }
     }
 }
@@ -405,5 +470,30 @@ mod tests {
             }
         });
         assert_eq!(ran.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn a_worker_that_ran_a_panicking_task_ends_and_retire_joins_it() {
+        thread_local! { static MARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+        let survived = AtomicUsize::new(0);
+        for _ in 0..20 {
+            scope(|s| {
+                let h = s.spawn(|| {
+                    MARK.with(|m| m.set(true));
+                    panic!("boom");
+                });
+                let _ = h.join();
+            });
+            // later tasks never see the mark of the panicked one
+            scope(|s| {
+                s.spawn(|| {
+                    if MARK.with(|m| m.get()) {
+                        survived.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            });
+        }
+        assert_eq!(survived.load(Ordering::Relaxed), 0);
+        retire_idle();
     }
 }
