@@ -2608,6 +2608,12 @@ impl Tcx {
                 return self.tys.error;
             }
         };
+        if p.segs.len() >= 2 && p.no_qself() {
+            let segs = crate::program::path_segs(prog, file, p);
+            if let Some(e) = prog.path_privacy(module, p.global(), &segs, Some(true), false, false) {
+                self.err(cx, prog, file, p.lo, prog.privacy_message(&e));
+            }
+        }
         let regions = self.lower_region_args(cx.infcx, prog, file, module, env, p);
         let mut args = self.lower_generic_args(cx, prog, file, module, env, p);
         let def = prog.def(d);

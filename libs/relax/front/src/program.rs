@@ -9,6 +9,7 @@ use crate::parser::ParsedFile;
 use crate::fxhash::HashMap;
 
 mod collected;
+mod privacy;
 
 pub type Sym = u32;
 
@@ -533,6 +534,8 @@ pub struct Program {
     pub prelexed: HashMap<String, (Vec<u8>, Vec<crate::lexer::Tok>)>,
     /// glob lookups after import resolution: (module, name, type ns) -> result
     pub glob_cache: crate::conc::MemoMap<(u32, Sym, bool), Option<(DefId, BindVis)>>,
+    /// the crates being checked (`makepad check`): the only ones whose paths are privacy-checked
+    pub own_crates: Vec<bool>,
     /// lexical lookups (`lookup_in_scope`) once imports are resolved: (module, name, ns_type);
     /// cleared whenever a binding is defined or imports are resolved again
     scope_cache: crate::conc::MemoMap<(u32, Sym, bool), Option<DefId>>,
@@ -799,6 +802,7 @@ impl Program {
             errors: Vec::new(),
             macros: Default::default(),
             glob_cache: Default::default(),
+            own_crates: Vec::new(),
             scope_cache: Default::default(),
             body_memos: Default::default(),
             path_seg_cache: Default::default(),
@@ -4048,7 +4052,7 @@ impl Program {
             let r = self.lookup_in_module_pass(m, name, ns_type, q);
             let stale = q.hits.iter().any(|(x, given)| q.memo.get(x).map_or(false, |fin| fin != given));
             if !stale || pass > q.prev.len() + 1 {
-                if self.imports_done && !self.mods[m as usize].globs.is_empty()
+                if self.imports_done && !q.precise && !self.mods[m as usize].globs.is_empty()
                     && !self.mods[m as usize].values.contains_key(&name) && !self.mods[m as usize].types.contains_key(&name) {
                     self.glob_cache.insert((m, name, ns_type), r);
                 }
@@ -4063,7 +4067,7 @@ impl Program {
         let md = &self.mods[m as usize];
         let direct = if ns_type { md.types.get(&name) } else { md.values.get(&name) };
         if let Some(&d) = direct {
-            return Some((d, self.binding_vis(m, name, ns_type, d)));
+            return Some((d, if q.precise { self.precise_vis(m, name, ns_type, d) } else { self.binding_vis(m, name, ns_type, d) }));
         }
         if md.globs.is_empty() {
             return None;
@@ -4077,7 +4081,7 @@ impl Program {
             return *r;
         }
         // through globs: converged answers of earlier queries (glob graphs are wide and deep)
-        if self.imports_done {
+        if self.imports_done && !q.precise {
             if let Some(r) = self.glob_cache.get(&(m, name, ns_type)) {
                 return r;
             }
@@ -5056,6 +5060,8 @@ fn path_segs_uncached(prog: &Program, file: u32, p: &Path) -> Vec<(SegKind, Sym)
 /// One lookup through glob imports (a fixpoint over glob cycles, see lookup_in_module_vis).
 #[derive(Default)]
 struct GlobQuery {
+    /// bindings carry their written visibility (`pub(crate)`, `pub(super)`, ..) -- privacy checks
+    precise: bool,
     memo: HashMap<u32, Option<(DefId, BindVis)>>,
     /// the previous pass's answers (what a module still being looked through answers)
     prev: HashMap<u32, Option<(DefId, BindVis)>>,

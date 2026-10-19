@@ -3199,6 +3199,11 @@ impl<'a> Fcx<'a> {
                 return (Res::Def(d), t);
             }
         }
+        if path.no_qself() {
+            if let Some(e) = prog.path_privacy(self.module, path.global(), &segs, Some(false), false, false) {
+                self.err(path.lo, prog.privacy_message(&e));
+            }
+        }
         // container path (module / enum / trait)
         let parent = if segs[0].0 == SegKind::SelfType && n == 2 {
             None

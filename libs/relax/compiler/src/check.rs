@@ -110,6 +110,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         own[k as usize] = true;
         u.prog.crates[k as usize].validate = true;
     }
+    u.prog.own_crates = own.clone();
     // every checked definition's signature, on MAKEPAD_RUN_JOBS threads (queries over the shared
     // context); errors in definition order
     {
@@ -126,6 +127,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     }
     errors.extend(relax_types::item_checks::duplicate_items(&u.prog, &own));
     errors.extend(relax_types::item_checks::foreign_blocks(&u.prog, &own));
+    errors.extend(u.prog.import_privacy_errors(&own));
     let options = &u.prog.session.clone().options;
     crate::borrowck::lazy::disable_gandalf();
     if options.borrowck_all != crate::options::BorrowckAll::Default {
