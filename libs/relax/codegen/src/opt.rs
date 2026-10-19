@@ -1830,21 +1830,6 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                 continue;
             }
             for i in &b.insts {
-                if let Inst::Iconst(d, v) = i {
-                    same_k[d.0 as usize] = match same_k[d.0 as usize] {
-                        None => Some((*v, 1)),
-                        Some((w, n)) if w == *v && n != u32::MAX => Some((w, n + 1)),
-                        // two different constants: never known
-                        Some(_) => Some((0, u32::MAX)),
-                    };
-                }
-            }
-        }
-        for (bi, b) in f.blocks.iter().enumerate() {
-            if !reach[bi] {
-                continue;
-            }
-            for i in &b.insts {
                 match i {
                     Inst::Iconst(d, v) if single(*d, &ndef) || matches!(same_k[d.0 as usize], Some((w, n)) if w == *v && n == ndef[d.0 as usize]) => kn[d.0 as usize] = Some(K::I(*v)),
                     Inst::Fconst(d, v, w) if single(*d, &ndef) => kn[d.0 as usize] = Some(K::F(*v, *w)),
