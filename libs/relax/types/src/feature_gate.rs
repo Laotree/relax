@@ -1,7 +1,7 @@
 //! Feature gates of a checked crate on a stable compiler (rustc 1.97.1): E0658 for unstable
 //! syntax and attributes used without `#![feature(..)]` (rustc_ast_passes/src/feature_gate.rs
 //! `PostExpansionVisitor`, rustc_feature builtin_attrs.rs, the `cfg` gates of
-//! rustc_attr_parsing/src/attributes/cfg.rs), E0554 (`#![feature]` on a stable compiler), E0557
+//! rustc_attr_parsing/src/attributes/cfg.rs), E0557
 //! (a removed feature), E0734 (stability attributes outside the standard library).
 //!
 //! A check-time diagnostic only: `check_crate` runs for the crates whose errors are reported
@@ -103,16 +103,13 @@ impl<'a> Gates<'a> {
 
     // ---------------------------------------------------------------- the crate
 
-    /// rustc_expand config.rs `features` (E0557) and feature_gate.rs `maybe_stage_features`
-    /// (E0554: this is a stable compiler).
+    /// rustc_expand config.rs `features`: E0557 for a removed feature. (E0554, `#![feature]`
+    /// on a stable channel, is not reported: the suite's tests run with unstable features
+    /// allowed -- RUSTC_BOOTSTRAP -- and Relax has no release channel.)
     fn crate_features(&mut self) {
-        let Some(first) = self.feats.first_attr else { return };
         let removed: Vec<(u32, String)> = self.feats.declared.iter().filter(|d| d.removed).map(|d| (d.pos, d.name.clone())).collect();
         for (pos, name) in removed {
             self.coded("E0557", pos, &format!("feature has been removed: `{}`", name));
-        }
-        if self.feats.declared.iter().any(|d| !d.removed) || !self.feats.declared.is_empty() {
-            self.coded("E0554", first, "`#![feature]` may not be used on the stable release channel");
         }
     }
 
@@ -886,8 +883,11 @@ impl<'a> Gates<'a> {
             ExprKind::Lit(k) => {
                 if matches!(k, LitKind::Int | LitKind::Float) {
                     let text = self.pf.bytes(ex.lo, ex.hi);
-                    if text.ends_with(b"f16") { self.gate("f16", ex.lo, "the type `f16` is unstable"); }
-                    if text.ends_with(b"f128") { self.gate("f128", ex.lo, "the type `f128` is unstable"); }
+                    // (`0x1f16` is hex digits: a hex literal has no float suffix)
+                    if !(text.starts_with(b"0x") || text.starts_with(b"0X")) {
+                        if text.ends_with(b"f16") { self.gate("f16", ex.lo, "the type `f16` is unstable"); }
+                        if text.ends_with(b"f128") { self.gate("f128", ex.lo, "the type `f128` is unstable"); }
+                    }
                 }
             }
             ExprKind::Path(p) => self.path(&p),
@@ -953,6 +953,7 @@ impl<'a> Gates<'a> {
             ExprKind::Continue(_) | ExprKind::Underscore => {}
             ExprKind::Closure(r) => {
                 let c = *ast.row(r);
+                if c.is_static { self.gate("coroutines", ex.lo, "coroutine syntax is experimental"); }
                 for p in ast.list(c.params).to_vec() {
                     if self.attrs(p.attrs).is_none() { continue; }
                     self.pat(p.pat);

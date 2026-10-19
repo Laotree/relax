@@ -1439,6 +1439,10 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             default_ = true;
         }
+        // `safe static X: T;` in an `unsafe extern` block (`safe fn` is below)
+        if self.foreign_abi.is_some() && self.is_word(0, b"safe") && self.nth(1) == T::KwStatic {
+            self.pos += 1;
+        }
         let kind = match self.kind() {
             T::KwUse => {
                 let use_lo = self.lo();
@@ -3433,10 +3437,10 @@ impl<'a> Parser<'a> {
                 };
                 Ok(self.mk_expr(ExprKind::Continue(OptIdent::from(label)), lo))
             }
-            T::Or | T::OrOr | T::KwMove => self.closure(false, r, lo),
+            T::Or | T::OrOr | T::KwMove => self.closure(false, false, r, lo),
             T::KwStatic if matches!(self.nth(1), T::Or | T::OrOr | T::KwMove) => {
                 self.pos += 1;
-                self.closure(false, r, lo)
+                self.closure(false, true, r, lo)
             }
             T::KwAsync => {
                 self.pos += 1;
@@ -3449,7 +3453,7 @@ impl<'a> Parser<'a> {
                     let b = self.block()?;
                     return Ok(self.mk_expr(ExprKind::Async(crate::ast::ASYNC_MOVE, b), lo));
                 }
-                self.closure(true, r, lo)
+                self.closure(true, false, r, lo)
             }
             T::Ident if self.is_word(0, b"_") => {
                 self.pos += 1;
@@ -3524,7 +3528,7 @@ impl<'a> Parser<'a> {
         Ok(self.mk_expr(ExprKind::Struct(row), lo))
     }
 
-    fn closure(&mut self, is_async: bool, r: u8, lo: u32) -> PResult<ExprId> {
+    fn closure(&mut self, is_async: bool, is_static: bool, r: u8, lo: u32) -> PResult<ExprId> {
         let is_move = self.eat(T::KwMove);
         let mut params = Vec::new();
         if !self.eat(T::OrOr) {
@@ -3576,11 +3580,11 @@ impl<'a> Parser<'a> {
             let b = BlockId(self.ast.base[3] + self.ast.blocks.len() as u32 - 1);
             let fut = self.mk_expr(ExprKind::Async(crate::ast::ASYNC_CLOSURE_BODY, b), blo);
             let params = self.ast.push_list(params);
-            let row = self.ast.push_row(ClosureRow { is_move, is_async, params, ret: None, body: fut });
+            let row = self.ast.push_row(ClosureRow { is_move, is_async, is_static, params, ret: None, body: fut });
             return Ok(self.mk_expr(ExprKind::Closure(row), lo));
         }
         let params = self.ast.push_list(params);
-        let row = self.ast.push_row(ClosureRow { is_move, is_async, params, ret, body });
+        let row = self.ast.push_row(ClosureRow { is_move, is_async, is_static, params, ret, body });
         Ok(self.mk_expr(ExprKind::Closure(row), lo))
     }
 

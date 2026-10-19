@@ -805,6 +805,12 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
                         j += 1;
                     }
                     let k = keyword(&src[i..j], edition).unwrap_or(T::Ident);
+                    // rustc_lexer `ident_or_unknown_prefix`: an identifier right before `#`, `"` or
+                    // `'` is a reserved prefix, an error from edition 2021 (the known prefixes
+                    // `b`, `br`, `c`, `cr`, `r` were taken above)
+                    if VALIDATE && edition >= 2021 && j < n && matches!(src[j], b'#' | b'"' | b'\'') {
+                        return Err(err(i, "prefix is unknown"));
+                    }
                     if k == T::Ident && is_raw_body(&src[i..j]) {
                         // `name! {` of a registered raw-body macro: hand the body over untokenised
                         let mut m = j;

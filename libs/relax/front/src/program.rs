@@ -3351,17 +3351,7 @@ impl Program {
         let invalid = graph.glob_closure(changed);
         // Scope/trait-scope also read the implicit prelude. A changed prelude
         // therefore invalidates those scopes even without an explicit glob edge.
-        let prelude_changed = self
-            .prelude_crate
-            .and_then(|pc| {
-                let root = self.crates[pc as usize].root_mod;
-                self.syms
-                    .get("prelude")
-                    .and_then(|n| self.mods[root as usize].types.get(&n))
-                    .map(|d| self.def(*d))
-                    .filter(|d| d.kind == DefKind::Mod)
-            })
-            .is_some_and(|d| invalid.contains(&d.sub));
+        let prelude_changed = self.prelude_modules().iter().any(|m| invalid.contains(m));
         let files: crate::fxhash::HashSet<u32> = invalid.iter().map(|&m| self.mods[m as usize].file).collect();
         let scope = retain_load_memos(&mut self.scope_cache, |(m, _, _), v| !prelude_changed && !invalid.contains(m) && v.is_some());
         let glob = retain_load_memos(&mut self.glob_cache, |(m, _, _), v| !invalid.contains(m) && v.is_some());
@@ -4127,16 +4117,8 @@ impl Program {
                 None => break,
             }
         }
-        if let Some(pc) = self.prelude_crate {
-            let root = self.crates[pc as usize].root_mod;
-            if let Some(pn) = self.syms.get("prelude") {
-                if let Some(pm) = self.mods[root as usize].types.get(&pn) {
-                    let pmd = self.def(*pm);
-                    if pmd.kind == DefKind::Mod {
-                        self.module_traits(pmd.sub, &mut set, &mut visiting);
-                    }
-                }
-            }
+        if let Some(pm) = self.edition_prelude(module) {
+            self.module_traits(pm, &mut set, &mut visiting);
         }
         let a = std::sync::Arc::new(set);
         self.trait_scope.insert(module, a.clone());
@@ -4293,6 +4275,34 @@ impl Program {
         r
     }
 
+    /// The std prelude module (`prelude` of the prelude crate) and its per-edition modules
+    /// (`rust_2015` .. `rust_2024`).
+    fn prelude_modules(&self) -> Vec<u32> {
+        let Some(pc) = self.prelude_crate else { return Vec::new() };
+        let root = self.crates[pc as usize].root_mod;
+        let Some(pm) = self.syms.get("prelude").and_then(|n| self.mods[root as usize].types.get(&n)) else { return Vec::new() };
+        let pmd = self.def(*pm);
+        if pmd.kind != DefKind::Mod { return Vec::new(); }
+        let mut out = vec![pmd.sub];
+        for ed in ["rust_2015", "rust_2018", "rust_2021", "rust_2024"] {
+            if let Some(d) = self.syms.get(ed).and_then(|n| self.mods[pmd.sub as usize].types.get(&n)) {
+                if self.def(*d).kind == DefKind::Mod { out.push(self.def(*d).sub); }
+            }
+        }
+        out
+    }
+
+    /// The prelude the edition of `module`'s crate injects (rustc: `std::prelude::rust_20NN`);
+    /// the plain `prelude` module when the prelude crate has none for that edition.
+    fn edition_prelude(&self, module: u32) -> Option<u32> {
+        let all = self.prelude_modules();
+        let base = *all.first()?;
+        let edition = self.crates[self.mods[module as usize].krate as usize].edition;
+        let name = format!("rust_{}", edition);
+        let sub = self.syms.get(&name).and_then(|n| self.mods[base as usize].types.get(&n)).map(|d| self.def(*d)).filter(|d| d.kind == DefKind::Mod).map(|d| d.sub);
+        Some(sub.unwrap_or(base))
+    }
+
     /// The extern prelude, std prelude and primitive types (lookup_in_scope after the
     /// lexical modules).
     fn lookup_in_scope_outside(&self, module: u32, name: Sym, ns_type: bool) -> Option<DefId> {
@@ -4301,17 +4311,9 @@ impl Program {
                 return Some(self.mods[self.crates[c as usize].root_mod as usize].def);
             }
         }
-        if let Some(pc) = self.prelude_crate {
-            let root = self.crates[pc as usize].root_mod;
-            if let Some(pn) = self.syms.get("prelude") {
-                if let Some(pm) = self.mods[root as usize].types.get(&pn) {
-                    let pmd = self.def(*pm);
-                    if pmd.kind == DefKind::Mod {
-                        if let Some(d) = self.lookup_in_module(pmd.sub, name, ns_type, &mut Vec::new()) {
-                            return Some(d);
-                        }
-                    }
-                }
+        if let Some(pm) = self.edition_prelude(module) {
+            if let Some(d) = self.lookup_in_module(pm, name, ns_type, &mut Vec::new()) {
+                return Some(d);
             }
         }
         if ns_type {

@@ -1099,6 +1099,8 @@ pub struct ForRow {
 pub struct ClosureRow {
     pub is_move: bool,
     pub is_async: bool,
+    /// `static || ..` (coroutine syntax)
+    pub is_static: bool,
     pub params: List<ClosureParam>,
     pub ret: Option<TyId>,
     pub body: ExprId,
