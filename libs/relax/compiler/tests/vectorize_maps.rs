@@ -135,6 +135,67 @@ fn up_defilter_ref(prev_row: &[u8], raw: &[u8], current: &mut [u8]) {
     }
 }
 
+/// eight lane accumulators over chunks (the array version of a SIMD dot product)
+#[inline(never)]
+fn dot_lanes(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    for (x, y) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
+        for l in 0..8 {
+            acc[l] += x[l] * y[l];
+        }
+    }
+    ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]))
+}
+#[inline(never)]
+fn dot_lanes_ref(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let n = a.len().min(b.len()) / 8 * 8;
+    let mut i = 0;
+    while i < n {
+        for l in 0..8 {
+            let t = black_box(a[i + l] * b[i + l]);
+            acc[l] = acc[l] + t;
+        }
+        i += 8;
+    }
+    ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]))
+}
+/// lane accumulators with an early exit and a subtract
+#[inline(never)]
+fn diff_lanes(a: &[f32], b: &[f32], limit: f32) -> (f32, f32) {
+    let mut acc = [1.0f32; 4];
+    let mut rounds = 0.0f32;
+    for (x, y) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        for l in 0..4 {
+            acc[l] -= x[l] * y[l];
+        }
+        rounds += 1.0;
+        if acc[0] < limit {
+            break;
+        }
+    }
+    (acc[0] + acc[1] + acc[2] + acc[3], rounds)
+}
+#[inline(never)]
+fn diff_lanes_ref(a: &[f32], b: &[f32], limit: f32) -> (f32, f32) {
+    let mut acc = [1.0f32; 4];
+    let mut rounds = 0.0f32;
+    let n = a.len().min(b.len()) / 4 * 4;
+    let mut i = 0;
+    while i < n {
+        for l in 0..4 {
+            let t = black_box(a[i + l] * b[i + l]);
+            acc[l] = acc[l] - t;
+        }
+        rounds += 1.0;
+        i += 4;
+        if acc[0] < limit {
+            break;
+        }
+    }
+    (acc[0] + acc[1] + acc[2] + acc[3], rounds)
+}
+
 fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
@@ -188,6 +249,21 @@ fn vectorized_maps() {
                 carry_up(&mut a1[lo..hi]);
                 carry_up_ref(&mut a2[lo..hi]);
                 fails += (a1 != a2) as u32;
+            }
+            {
+                let mut fa: Vec<f32> = (0..64).map(|i| ((i * 37 + rep as usize) % 101) as f32 * 0.31 - 12.0).collect();
+                let fb: Vec<f32> = (0..64).map(|i| ((i * 11 + 5) % 89) as f32 * 0.17 - 7.0).collect();
+                if rep % 7 == 0 {
+                    fa[(rep as usize) % 64] = f32::NAN;
+                }
+                if rep % 11 == 0 {
+                    fa[(rep as usize * 3) % 64] = f32::INFINITY;
+                }
+                fails += (dot_lanes(&fa[..n], &fb).to_bits() != dot_lanes_ref(&fa[..n], &fb).to_bits()) as u32;
+                let lim = -((rep % 50) as f32) * 3.0;
+                let (s1, r1) = diff_lanes(&fa[..n], &fb, lim);
+                let (s2, r2) = diff_lanes_ref(&fa[..n], &fb, lim);
+                fails += (s1.to_bits() != s2.to_bits() || r1 != r2) as u32;
             }
             {
                 let a: Vec<u8> = (0..64u32).map(|i| (i * 37 + rep) as u8).collect();

@@ -878,6 +878,7 @@ pub fn vectorize_reductions(options: &relax_session::Options, f: &mut Func) -> b
         return false;
     }
     let mut changed = vectorize_stream_maps(f);
+    changed |= vectorize_lane_accumulators(options, f);
     let nb0 = f.blocks.len();
     let mut ndef = vec![0u32; f.vregs.len()];
     let mut nuse = vec![0u32; f.vregs.len()];
@@ -1225,6 +1226,434 @@ pub fn flatten_step_chains(f: &mut Func) -> bool {
         }
     }
     changed
+}
+
+/// One lane of a straight-line vector group: the expression an f32 lane computes, with its loads
+/// at addresses `root + disp`.
+#[derive(Clone, PartialEq, Debug)]
+enum LNode {
+    Load { root: VReg, disp: i64 },
+    Bin(FOp, Box<LNode>, Box<LNode>),
+    Un(FUn, Box<LNode>),
+    /// a value the same in every lane (read as it is at the group)
+    Inv(VReg),
+    /// an f32 constant (bits)
+    K(u64),
+}
+
+struct LaneBlock<'a> {
+    b: &'a Block,
+    ndef: &'a [u32],
+    nuse: &'a [u32],
+}
+
+impl LaneBlock<'_> {
+    /// the last instruction before `before` that defines `v`
+    fn def_before(&self, v: VReg, before: usize) -> Option<usize> {
+        (0..before).rev().find(|k| {
+            let mut d = false;
+            for_defs(&self.b.insts[*k], |x| d |= x == v);
+            d
+        })
+    }
+    fn defined_in(&self, v: VReg, from: usize, to: usize) -> bool {
+        (from..to.min(self.b.insts.len())).any(|k| {
+            let mut d = false;
+            for_defs(&self.b.insts[k], |x| d |= x == v);
+            d
+        })
+    }
+    /// the address `p + off` read at `at` as (root, offset): moves and constant steps of
+    /// single-definition values are followed to the vreg the group's other addresses share
+    fn address(&self, mut p: VReg, mut off: i64, at: usize) -> (VReg, i64) {
+        let mut at = at;
+        for _ in 0..8 {
+            let Some(k) = self.def_before(p, at) else { break };
+            if self.ndef[p.0 as usize] != 1 {
+                break;
+            }
+            let (x, step) = match self.b.insts[k] {
+                Inst::IBinI(IOp::Add, it, _, x, c) if it.bits == 64 => (x, c),
+                Inst::IBinI(IOp::Sub, it, _, x, c) if it.bits == 64 => (x, -c),
+                Inst::Mov(_, x) => (x, 0),
+                _ => break,
+            };
+            // x must hold the same value at `at` as it did at the step
+            if self.defined_in(x, k + 1, at) {
+                break;
+            }
+            let Some(o) = off.checked_add(step) else { break };
+            p = x;
+            off = o;
+            at = k;
+        }
+        (p, off)
+    }
+    /// The expression computing `v` as read at position `at`, and the positions of the
+    /// instructions only it uses (they go when the group is vectorised).
+    fn tree(&self, v: VReg, at: usize, used: &mut Vec<usize>, depth: u32) -> Option<LNode> {
+        if depth > 6 {
+            return None;
+        }
+        let leaf = |v: VReg| Some(LNode::Inv(v));
+        let Some(k) = self.def_before(v, at) else { return leaf(v) };
+        if self.ndef[v.0 as usize] != 1 || self.nuse[v.0 as usize] != 1 {
+            return leaf(v);
+        }
+        let node = match self.b.insts[k] {
+            Inst::Load(Mem::F32, _, p, off) => {
+                let (root, disp) = self.address(p, off as i64, k);
+                LNode::Load { root, disp }
+            }
+            Inst::Fconst(_, bits, false) => LNode::K(bits),
+            Inst::FBin(op, false, _, a, b2) => {
+                if !matches!(op, FOp::Add | FOp::Sub | FOp::Mul | FOp::Div | FOp::MinLt | FOp::MaxGt) {
+                    return leaf(v);
+                }
+                let x = self.tree(a, k, used, depth + 1)?;
+                let y = self.tree(b2, k, used, depth + 1)?;
+                LNode::Bin(op, Box::new(x), Box::new(y))
+            }
+            Inst::FUnary(op, false, _, a) => {
+                if !matches!(op, FUn::Neg | FUn::Abs | FUn::Sqrt) {
+                    return leaf(v);
+                }
+                let x = self.tree(a, k, used, depth + 1)?;
+                LNode::Un(op, Box::new(x))
+            }
+            _ => return leaf(v),
+        };
+        used.push(k);
+        Some(node)
+    }
+}
+
+/// `b` is lane `k` of the lane-0 expression `a`: the same operations and invariants, loads
+/// `4k` bytes further on.
+fn lane_of(a: &LNode, b: &LNode, k: i64) -> bool {
+    match (a, b) {
+        (LNode::Load { root: r0, disp: d0 }, LNode::Load { root: r1, disp: d1 }) => r0 == r1 && *d1 == d0 + 4 * k,
+        (LNode::Bin(o0, x0, y0), LNode::Bin(o1, x1, y1)) => o0 == o1 && lane_of(x0, x1, k) && lane_of(y0, y1, k),
+        (LNode::Un(o0, x0), LNode::Un(o1, x1)) => o0 == o1 && lane_of(x0, x1, k),
+        (LNode::Inv(v0), LNode::Inv(v1)) => v0 == v1,
+        (LNode::K(c0), LNode::K(c1)) => c0 == c1,
+        _ => false,
+    }
+}
+
+fn first_disp(n: &LNode) -> Option<(VReg, i64)> {
+    match n {
+        LNode::Load { root, disp } => Some((*root, *disp)),
+        LNode::Bin(_, x, y) => first_disp(x).or_else(|| first_disp(y)),
+        LNode::Un(_, x) => first_disp(x),
+        _ => None,
+    }
+}
+
+fn node_vregs(n: &LNode, out: &mut Vec<VReg>) {
+    match n {
+        LNode::Load { root, .. } => out.push(*root),
+        LNode::Inv(v) => out.push(*v),
+        LNode::Bin(_, x, y) => {
+            node_vregs(x, out);
+            node_vregs(y, out);
+        }
+        LNode::Un(_, x) => node_vregs(x, out),
+        LNode::K(_) => {}
+    }
+}
+
+/// The vector for a lane-0 expression, its instructions pushed on `ins`: loads of 16 bytes at the
+/// lane-0 address, invariants and constants splat. Returns the vreg holding the result.
+fn emit_lanes(f: &mut Func, n: &LNode, ins: &mut Vec<Inst>) -> VReg {
+    let v = f.vreg(Cls::V128);
+    match n {
+        LNode::Load { root, disp } => ins.push(Inst::VLoad(v, *root, *disp as i32)),
+        LNode::Inv(s) => ins.push(Inst::VSplat(v, *s)),
+        LNode::K(bits) => ins.push(Inst::VConst(v, *bits as u32)),
+        LNode::Bin(op, x, y) => {
+            let a = emit_lanes(f, x, ins);
+            let b = emit_lanes(f, y, ins);
+            let o = match op {
+                FOp::Add => VOp::FAdd,
+                FOp::Sub => VOp::FSub,
+                FOp::Mul => VOp::FMul,
+                FOp::Div => VOp::FDiv,
+                FOp::MinLt => VOp::FMinLt,
+                _ => VOp::FMaxGt,
+            };
+            ins.push(Inst::VBin(o, v, a, b));
+        }
+        LNode::Un(op, x) => {
+            let a = emit_lanes(f, x, ins);
+            let o = match op {
+                FUn::Neg => VUn::FNeg,
+                FUn::Abs => VUn::FAbs,
+                _ => VUn::FSqrt,
+            };
+            ins.push(Inst::VUn(o, v, a));
+        }
+    }
+    v
+}
+
+/// Lane accumulators: in a loop, four f32 accumulators updated by one lane-wise expression each
+/// (`acc[l] += x[l] * y[l]` for l in 0..4: the array, unrolled, lives in registers) become one
+/// vector accumulator updated by the vector expression. Each lane keeps its own sequence of
+/// operations in its own order, so the result is bit-identical. The accumulators enter the vector
+/// where the loop is entered and leave it on every edge that exits the loop.
+pub fn vectorize_lane_accumulators(options: &relax_session::Options, f: &mut Func) -> bool {
+    if !vectorize_on(options) {
+        return false;
+    }
+    let mut changed = false;
+    // a bounded number of groups per function, one rewrite at a time (the CFG changes)
+    for _ in 0..8 {
+        if !lane_accumulators_once(f) {
+            break;
+        }
+        changed = true;
+    }
+    changed
+}
+
+fn lane_accumulators_once(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    let reach = crate::regalloc::reachable(f);
+    let mut ndef = vec![0u32; nv];
+    let mut nuse = vec![0u32; nv];
+    let mut any_f32_add = false;
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for (bi, b) in f.blocks.iter().enumerate() {
+        if !reach[bi] {
+            continue;
+        }
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            for_uses(i, |u| nuse[u.0 as usize] += 1);
+            any_f32_add |= matches!(i, Inst::FBin(FOp::Add | FOp::Sub | FOp::Mul, false, ..));
+        }
+        let mut tu = Vec::new();
+        crate::regalloc::term_uses(&b.term, &mut tu);
+        for u in tu {
+            nuse[u.0 as usize] += 1;
+        }
+    }
+    if !any_f32_add {
+        return false;
+    }
+    let preds = crate::regalloc::preds_of(f, &reach);
+    let loops = crate::regalloc::natural_loops(f, &reach, &preds, false);
+    for (head, members) in &loops {
+        // straight-line loops: no calls, stores or exceptional edges anywhere in them
+        let ok = members.iter().enumerate().all(|(bi, m)| {
+            !*m || (!matches!(f.blocks[bi].term, Term::Invoke(..) | Term::Resume)
+                && f.blocks[bi].insts.iter().all(|i| !crate::opt::is_mem_effect_pub(i)))
+        });
+        if !ok {
+            continue;
+        }
+        for (bi, m) in members.iter().enumerate() {
+            if !*m {
+                continue;
+            }
+            if let Some(plan) = lane_group(f, bi, &ndef, &nuse, members) {
+                apply_lane_group(f, *head, members, &preds, bi, plan);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+struct LaneGroup {
+    /// the four accumulators, lane 0 first
+    accs: [VReg; 4],
+    op: FOp,
+    acc_left: bool,
+    tree: LNode,
+    /// instructions to remove from the block, ascending
+    gone: Vec<usize>,
+}
+
+fn lane_group(f: &Func, bi: usize, ndef: &[u32], nuse: &[u32], members: &[bool]) -> Option<LaneGroup> {
+    let b = &f.blocks[bi];
+    let lb = LaneBlock { b, ndef, nuse };
+    // candidates: acc = acc op expr (through a temporary and a move, or directly)
+    struct Cand {
+        acc: VReg,
+        op: FOp,
+        acc_left: bool,
+        tree: LNode,
+        gone: Vec<usize>,
+    }
+    let mut cands: Vec<Cand> = Vec::new();
+    for (i, ins) in b.insts.iter().enumerate() {
+        let Inst::FBin(op @ (FOp::Add | FOp::Sub | FOp::Mul), false, t, x, y) = *ins else { continue };
+        if f.vregs[t.0 as usize] != Cls::F32 {
+            continue;
+        }
+        // the accumulator: an operand defined more than once whose update this is
+        for (acc, other, acc_left) in [(x, y, true), (y, x, false)] {
+            if ndef[acc.0 as usize] < 2 || acc == other {
+                continue;
+            }
+            let mut gone = vec![i];
+            if t == acc {
+                // direct
+            } else {
+                if ndef[t.0 as usize] != 1 || nuse[t.0 as usize] != 1 {
+                    continue;
+                }
+                let Some(mk) = (i + 1..b.insts.len()).find(|k| matches!(b.insts[*k], Inst::Mov(d, s) if d == acc && s == t)) else { continue };
+                gone.push(mk);
+            }
+            let mut used = Vec::new();
+            let Some(tree) = lb.tree(other, i, &mut used, 0) else { continue };
+            // the expression must read memory (a load); a plain scalar recurrence stays scalar
+            if first_disp(&tree).is_none() {
+                continue;
+            }
+            let mut vs = Vec::new();
+            node_vregs(&tree, &mut vs);
+            if vs.contains(&acc) {
+                continue;
+            }
+            gone.extend(used);
+            gone.sort_unstable();
+            gone.dedup();
+            cands.push(Cand { acc, op, acc_left, tree, gone });
+            break;
+        }
+        if cands.len() > 32 {
+            return None;
+        }
+    }
+    // four candidates that are lanes 0..3 of one expression
+    'lead: for c0 in &cands {
+        let Some((root0, d0)) = first_disp(&c0.tree) else { continue };
+        let _ = (root0, d0);
+        let mut lanes: Vec<&Cand> = vec![c0];
+        for k in 1..4i64 {
+            let next = cands.iter().find(|c| !lanes.iter().any(|l| std::ptr::eq(*l, *c)) && c.op == c0.op && c.acc_left == c0.acc_left && lane_of(&c0.tree, &c.tree, k));
+            match next {
+                Some(c) => lanes.push(c),
+                None => continue 'lead,
+            }
+        }
+        // distinct accumulators
+        let accs = [lanes[0].acc, lanes[1].acc, lanes[2].acc, lanes[3].acc];
+        if (0..4).any(|i| (0..i).any(|j| accs[i] == accs[j])) {
+            continue;
+        }
+        let mut gone: Vec<usize> = lanes.iter().flat_map(|l| l.gone.iter().copied()).collect();
+        gone.sort_unstable();
+        gone.dedup();
+        if gone.len() != lanes.iter().map(|l| l.gone.len()).sum::<usize>() {
+            continue;
+        }
+        let first = gone[0];
+        let last = *gone.last().unwrap();
+        // the vector goes where the last lane finishes: nothing between may write memory or
+        // redefine a value the group reads
+        let mut vs = Vec::new();
+        node_vregs(&c0.tree, &mut vs);
+        if vs.iter().any(|v| lb.defined_in(*v, first, last + 1)) {
+            continue;
+        }
+        // the accumulators are touched in the loop only by their updates
+        let mut touched = false;
+        for (mi, m) in members.iter().enumerate() {
+            if !*m {
+                continue;
+            }
+            for (k, ins) in f.blocks[mi].insts.iter().enumerate() {
+                let in_group = mi == bi && gone.binary_search(&k).is_ok();
+                let mut u = 0;
+                let mut d = 0;
+                for_uses(ins, |x| u += accs.contains(&x) as u32);
+                for_defs(ins, |x| d += accs.contains(&x) as u32);
+                if !in_group && (u > 0 || d > 0) {
+                    touched = true;
+                }
+            }
+            let mut tu = Vec::new();
+            crate::regalloc::term_uses(&f.blocks[mi].term, &mut tu);
+            touched |= tu.iter().any(|x| accs.contains(x));
+        }
+        if touched || accs.iter().any(|a| f.vregs[a.0 as usize] != Cls::F32) {
+            continue;
+        }
+        return Some(LaneGroup { accs, op: c0.op, acc_left: c0.acc_left, tree: c0.tree.clone(), gone });
+    }
+    None
+}
+
+fn apply_lane_group(f: &mut Func, head: u32, members: &[bool], preds: &[Vec<u32>], bi: usize, g: LaneGroup) {
+    let pos = f.blocks[bi].pos[*g.gone.last().unwrap()];
+    // the vector accumulator and the vector the group adds
+    let va = f.vreg(Cls::V128);
+    let mut ins: Vec<Inst> = Vec::new();
+    let x = emit_lanes(f, &g.tree, &mut ins);
+    let o = match g.op {
+        FOp::Add => VOp::FAdd,
+        FOp::Sub => VOp::FSub,
+        _ => VOp::FMul,
+    };
+    ins.push(if g.acc_left { Inst::VBin(o, va, va, x) } else { Inst::VBin(o, va, x, va) });
+    // remove the scalar lanes, add the vector at the last one's place
+    let at = *g.gone.last().unwrap();
+    let b = &mut f.blocks[bi];
+    let mut keep_insts = Vec::with_capacity(b.insts.len());
+    let mut keep_pos = Vec::with_capacity(b.insts.len());
+    for (k, (i, p)) in b.insts.iter().zip(b.pos.iter()).enumerate() {
+        if k == at {
+            for v in ins.drain(..) {
+                keep_insts.push(v);
+                keep_pos.push(pos);
+            }
+        }
+        if g.gone.binary_search(&k).is_err() {
+            keep_insts.push(i.clone());
+            keep_pos.push(*p);
+        }
+    }
+    b.insts = keep_insts;
+    b.pos = keep_pos;
+    // entering the loop: the accumulators into the vector
+    let mut enter = vec![Inst::VSplat(va, g.accs[0])];
+    for (l, a) in g.accs.iter().enumerate().skip(1) {
+        enter.push(Inst::VInsert(va, va, l as u8, *a));
+    }
+    for &p in &preds[head as usize] {
+        if members[p as usize] {
+            continue;
+        }
+        let nb = f.blocks.len() as u32;
+        let tp = f.blocks[head as usize].term_pos;
+        f.blocks.push(Block { insts: enter.clone(), pos: vec![tp; enter.len()], term: Term::Jump(head), term_pos: tp });
+        f.blocks[p as usize].term.map_succs(|s| if s == head { nb } else { s });
+    }
+    // leaving it: back out of the vector on every exit edge
+    let mut leave: Vec<Inst> = Vec::new();
+    for (l, a) in g.accs.iter().enumerate() {
+        leave.push(Inst::VExtract(*a, va, l as u8));
+    }
+    let nbl = members.len();
+    for u in 0..nbl {
+        if !members[u] {
+            continue;
+        }
+        let exits: Vec<u32> = f.blocks[u].term.succs().filter(|s| !members.get(*s as usize).copied().unwrap_or(false)).collect();
+        for x in exits {
+            let nb = f.blocks.len() as u32;
+            let tp = f.blocks[u].term_pos;
+            f.blocks.push(Block { insts: leave.clone(), pos: vec![tp; leave.len()], term: Term::Jump(x), term_pos: tp });
+            f.blocks[u].term.map_succs(|s| if s == x { nb } else { s });
+        }
+    }
 }
 
 fn merge_stores_on(options: &relax_session::Options) -> bool {
