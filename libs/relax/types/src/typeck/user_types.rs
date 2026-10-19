@@ -261,6 +261,14 @@ mod tests {
         assert!(!calls.is_empty(), "{:?}", annotations(&body));
     }
 
+    /// A call-form assignee `T::<&'a u8>(a, ..) = t` is annotated like the constructor path of a
+    /// tuple-struct expression (rustc lowers it to a pattern with the written path).
+    #[test]
+    fn call_form_assignee_saves_the_constructor_annotation() {
+        let (_, _, body) = body_of("#![no_std]\nstruct T<X>(X, u8); fn f<'a>(t: T<&'a u8>, mut a: &'a u8) { T::<&'a u8>(a, ..) = t; }", "f");
+        assert!(annotations(&body).iter().any(|(k, _)| matches!(k, UserTypeKey::Expr(_))), "{:?}", annotations(&body));
+    }
+
     #[test]
     fn closure_signature_is_saved_before_merging() {
         let (_, _, body) = body_of("#![no_std]\nfn f() { let _c = |x: &u8| *x; }", "f");
