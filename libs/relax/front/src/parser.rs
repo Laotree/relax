@@ -1504,13 +1504,13 @@ impl<'a> Parser<'a> {
             }
             T::KwExtern if matches!(self.nth(1), T::OpenBrace) || (self.nth(2) == T::OpenBrace && is_str(self.nth(1))) => {
                 self.pos += 1;
-                let abi = self.abi();
+                let abi = self.abi()?;
                 let items = self.foreign_items(abi)?;
                 ItemKind::ForeignMod(self.ast.push_row(ForeignModItem { abi, items }))
             }
             T::KwUnsafe if self.nth(1) == T::KwExtern && (self.nth(2) == T::OpenBrace || (is_str(self.nth(2)) && self.nth(3) == T::OpenBrace)) => {
                 self.pos += 2;
-                let abi = self.abi();
+                let abi = self.abi()?;
                 let items = self.foreign_items(abi)?;
                 ItemKind::ForeignMod(self.ast.push_row(ForeignModItem { abi, items }))
             }
@@ -1734,13 +1734,20 @@ impl<'a> Parser<'a> {
         self.ident_tok()
     }
 
-    fn abi(&mut self) -> Option<Ident> {
-        if is_str(self.kind()) {
-            let t = self.bump();
-            Some(Ident { lo: t.lo, hi: t.hi })
-        } else {
-            None
+    /// The optional ABI string literal after `extern` (rustc_parse `parse_abi`: a string literal
+    /// without a suffix).
+    fn abi(&mut self) -> PResult<Option<Ident>> {
+        if !is_str(self.kind()) {
+            return Ok(None);
         }
+        let t = self.bump();
+        let text = self.bytes(t.lo, t.hi);
+        let hashes = if t.kind == T::RawStr { text[1..].iter().take_while(|&&c| c == b'#').count() } else { 0 };
+        let closed = text.len() > hashes && text[text.len() - hashes..].iter().all(|&c| c == b'#') && text[text.len() - hashes - 1] == b'"';
+        if !closed {
+            return Err(PErr { pos: t.lo, msg: "suffixes on string literals are invalid".to_string() });
+        }
+        Ok(Some(Ident { lo: t.lo, hi: t.hi }))
     }
 
     /// path `!` delimiter (item- or statement-level macro call)
@@ -1797,7 +1804,7 @@ impl<'a> Parser<'a> {
                 T::Ident if self.is_word(0, b"safe") => {}
                 T::KwExtern => {
                     self.pos += 1;
-                    abi = Some(self.abi());
+                    abi = Some(self.abi()?);
                     continue;
                 }
                 T::KwFn => break,
@@ -2685,7 +2692,7 @@ impl<'a> Parser<'a> {
 
     fn fn_ptr_ty(&mut self, hrtb: List<GenericParam>) -> PResult<Ty> {
         let unsafe_ = self.eat(T::KwUnsafe);
-        let abi = if self.eat(T::KwExtern) { Some(self.abi()) } else { None };
+        let abi = if self.eat(T::KwExtern) { Some(self.abi()?) } else { None };
         self.expect(T::KwFn)?;
         self.expect(T::OpenParen)?;
         let mut params = Vec::new();
