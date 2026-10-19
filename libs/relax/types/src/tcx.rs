@@ -2474,9 +2474,17 @@ impl Tcx {
                                 drop(cycle);
                                 args.push(self.tys.intern(TyKind::Const(self.lower_const_arg(prog, file, env, *e, expected))));
                             },
-                            GenericArg::Binding(n, _, t) => {
+                            GenericArg::Binding(n, bargs, t) => {
                                 let sym = prog.syms.get(f.text(*n)).unwrap_or(u32::MAX);
                                 if let Some(ad) = self.trait_assoc(prog, td, sym) {
+                                    // the binding's own arguments against the associated type's (`Y<1> = ..`)
+                                    if self.validates(prog, file) {
+                                        let errs = self.check_generic_arg_count(prog, ad, f.ast.gargs(*bargs), &f.ast, self.own_generic_counts(prog, ad, None), arg_count::ArgPosition::AssocType, false, false);
+                                        if !errs.is_empty() || self.prohibit_constraints(cx, prog, file, *bargs) {
+                                            for e in errs { self.err(cx, prog, file, n.lo, e); }
+                                            return self.tys.error;
+                                        }
+                                    }
                                     let bt = self.lower_ty(cx, prog, file, module, env, *t);
                                     binds.push((ad, bt, 0));
                                 } else {
@@ -2567,6 +2575,38 @@ impl Tcx {
                         return self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: self.tys.mk_list(&args), regions: self.tys.intern_region_args(&rs) }));
                     }
                 }
+            }
+            // `<T>::Name`: the same lookup as `T::Name`
+            if q.trait_path.is_none() {
+                let ast = &prog.files[file as usize].ast;
+                let name = prog.syms.get(f.text(ast.segs(p.segs)[p.segs.len() - 1].name)).unwrap_or(u32::MAX);
+                if let TyKind::Param(pi) = self.tys.kind(self_t).clone() {
+                    let in_trait_self = pi == 0 && env.trait_def.is_some() && env.names.first().is_some_and(|n| prog.syms.str(*n) == "Self");
+                    let found = if in_trait_self {
+                        let td = env.trait_def.unwrap();
+                        let trait_ref = crate::next_solver::TraitRef { def_id: td, args: self.generic_indices_of(prog, td).identity_args(&self.tys) };
+                        self.assoc_projection(prog, trait_ref, name)
+                    } else { self.param_assoc(cx, prog, module, env, pi, name) };
+                    if let Some(t) = found {
+                        return self.lower_generic_args_of_assoc_item(cx, prog, file, module, env, p, t, source_ty);
+                    }
+                    self.err(cx, prog, file, p.lo, format!("E0220: associated type `{}` not found for `{}`", prog.syms.str(name), crate::typeck::ty_to_string(false, prog, self, self_t)));
+                    return self.tys.error;
+                }
+                // `<Self>::Name` in an impl
+                if let (Some(imp), true) = (env.impl_def, env.self_ty == Some(self_t)) {
+                    if self.impl_trait.contains_key(&imp) {
+                        let args = self.generic_indices_of(prog, imp).identity_args(&self.tys);
+                        let trait_ref = self.impl_trait_ref(prog, imp, &args);
+                        if let Some(t) = self.assoc_projection(prog, trait_ref, name) {
+                            return self.lower_generic_args_of_assoc_item(cx, prog, file, module, env, p, t, source_ty);
+                        }
+                    } else if let Some(t) = self.impl_assoc_ty(cx, prog, imp, name) { return t; }
+                }
+                if !self.tys.has_error(self_t) {
+                    self.err(cx, prog, file, p.lo, "E0223: ambiguous associated type".to_string());
+                }
+                return self.tys.error;
             }
             self.err(cx, prog, file, p.lo, "unsupported qualified type path".to_string());
             return self.tys.error;
