@@ -553,9 +553,11 @@ impl<'a> Cx<'a> {
                         None => Some(self.opaque(t, pos)),
                     }
                 }
-                // (no value tree to walk: only the type is judged)
+                // (no value tree to walk: the type is judged -- structural ADTs, no function pointers)
                 None => {
-                    self.const_type_structural(t, pos, 0);
+                    let mut seen = Vec::new();
+                    self.const_pattern_type_walk(t, pos, 0, &mut seen);
+                    self.const_pattern_partial_eq(t, pos);
                     Some(self.opaque(t, pos))
                 }
             },
@@ -579,39 +581,40 @@ impl<'a> Cx<'a> {
         let before = self.const_errors.len();
         self.structural_walk(v, t, pos, 0);
         // the whole constant needs a `PartialEq` impl (type_has_partial_eq_impl)
-        if self.const_errors.len() == before && matches!(self.kind(t), TyKind::Adt(..)) {
-            let t = self.tcx.tys.erase_all_regions(t);
-            if let Some(pe) = self.tcx.lang_items.get(crate::lang_items::LangItem::PartialEq) {
-                let infcx = crate::infer::InferCtxt::new(self.tcx, crate::tcx::TypingMode::non_body_analysis(), self.env.limit);
-                let goal = crate::next_solver::Goal { param_env: self.env.param_env, predicate: crate::next_solver::collect::trait_predicate(pe, vec![crate::consts::GenericArg::Type(t), crate::consts::GenericArg::Type(t)]) };
-                if !infcx.evaluate_obligation(self.prog, goal).may_apply() { self.not_structural(t, pos); }
-            }
+        if self.const_errors.len() == before { self.const_pattern_partial_eq(t, pos); }
+    }
+
+    fn const_pattern_partial_eq(&mut self, t: TyId, pos: Option<u32>) {
+        if !matches!(self.kind(t), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Slice(_) | TyKind::Array(..) | TyKind::Tuple(_)) { return; }
+        let t = self.tcx.tys.erase_all_regions(t);
+        if let Some(pe) = self.tcx.lang_items.get(crate::lang_items::LangItem::PartialEq) {
+            let infcx = crate::infer::InferCtxt::new(self.tcx, crate::tcx::TypingMode::non_body_analysis(), self.env.limit);
+            let goal = crate::next_solver::Goal { param_env: self.env.param_env, predicate: crate::next_solver::collect::trait_predicate(pe, vec![crate::consts::GenericArg::Type(t), crate::consts::GenericArg::Type(t)]) };
+            if !infcx.evaluate_obligation(self.prog, goal).may_apply() { self.not_structural(t, pos); }
         }
     }
 
-    /// A constant whose type has no value tree here (it holds raw pointers, as `String` and `Vec`
-    /// do): the walk of const_to_pat's valtree_to_pat over the type alone. An ADT of the type
-    /// that is not structural is the error, a fn pointer is a `PointerPattern`.
-    fn const_type_structural(&mut self, t: TyId, pos: Option<u32>, depth: u32) {
-        if depth > 8 { return; }
+    /// const_to_pat for a constant whose value is not known here: the type alone is judged -- an ADT
+    /// without the derived `StructuralPartialEq`, or a function pointer, cannot be matched on.
+    fn const_pattern_type_walk(&mut self, t: TyId, pos: Option<u32>, depth: u32, seen: &mut Vec<TyId>) {
+        if depth > 8 || seen.contains(&t) { return; }
+        seen.push(t);
         match self.kind(t) {
-            TyKind::Adt(d, args, _) => {
-                if !self.type_marked_structural(t) { self.not_structural(t, pos); return; }
-                let Some(a) = self.tcx.adts.get(&d) else { return };
-                if a.is_union { return; }
-                // (the variant of an enum value is unknown here: only a struct's fields are judged)
-                if a.variants.len() == 1 && !a.is_enum {
-                    for ft in self.variant_field_tys(d, 0, args) { self.const_type_structural(ft, pos, depth + 1); }
+            TyKind::FnPtr(..) => {
+                if let Some(lo) = pos {
+                    let e = self.prog.record_uncoded_error(self.body.file, lo, "typeck", "function pointers and raw pointers not derived from integers in patterns behave unpredictably and should not be relied upon. See https://github.com/rust-lang/rust/issues/70861 for details.".to_string());
+                    self.const_errors.push(e);
                 }
             }
-            TyKind::Ref(_, i, _) => { let i = self.reveal(i); self.const_type_structural(i, pos, depth + 1) }
-            TyKind::Array(e, _) | TyKind::Slice(e) => self.const_type_structural(e, pos, depth + 1),
-            TyKind::Tuple(l) => { for x in self.tcx.tys.list(l).to_vec() { self.const_type_structural(x, pos, depth + 1); } }
-            TyKind::FnPtr(..) => {
-                let Some(lo) = pos else { return };
-                let e = self.prog.record_uncoded_error(self.body.file, lo, "typeck", "function pointers and raw pointers not derived from integers in patterns behave unpredictably and should not be relied upon".to_string());
-                self.const_errors.push(e);
+            TyKind::Adt(d, args, _) => {
+                if !self.type_marked_structural(t) { self.not_structural(t, pos); return; }
+                // (an ADT's fields are not walked: only the value's own variant would matter, and with
+                // no value tree the marker and the PartialEq check are all that can be judged)
+                let _ = (d, args);
             }
+            TyKind::Ref(_, inner, _) => { let inner = self.reveal(inner); self.const_pattern_type_walk(inner, pos, depth + 1, seen) }
+            TyKind::Tuple(l) => for ft in self.tcx.tys.list(l).to_vec() { self.const_pattern_type_walk(ft, pos, depth + 1, seen); },
+            TyKind::Array(e, _) | TyKind::Slice(e) => self.const_pattern_type_walk(e, pos, depth + 1, seen),
             _ => {}
         }
     }
