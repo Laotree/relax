@@ -1554,8 +1554,11 @@ impl Tcx {
         errors.extend_from_slice(self.signature_errors(prog, did));
         if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             errors.extend(crate::item_checks::duplicate_generic_params(prog, did));
+            if self.validates(prog, def.file) { errors.extend(crate::item_checks::generic_param_rules(prog, did)); }
             errors.extend(crate::item_checks::repr_checks(prog, self, did));
+            errors.extend(crate::item_checks::assoc_const_elision(prog, did));
             errors.extend(crate::item_checks::attribute_safety(prog, did));
+            errors.extend(crate::item_checks::attribute_shapes(prog, did));
             if def.kind == DefKind::AssocFn && self.validates(prog, def.file) && errors.is_empty() {
                 errors.extend(self.check_method_receiver(prog, did));
             }
@@ -1570,6 +1573,12 @@ impl Tcx {
                     if !errors.contains(&e) { errors.push(e); }
                 }
             }
+        }
+        // rustc_hir_analysis check_main_fn_ty: the crate's `main` takes no generic parameters
+        if def.kind == DefKind::Fn && prog.name(did) == "main" && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did)
+            && def.parent == prog.mods[prog.crates[def.krate as usize].root_mod as usize].def
+            && !self.generic_indices_of(prog, did).types_consts.is_empty() {
+            errors.push(prog.record_error(def.file, prog.files[def.file as usize].ast.item(def.item).lo, "signature", "E0131: `main` function is not allowed to have generic parameters".into()));
         }
         if def.kind == DefKind::AssocFn && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             // rustc_ast_passes ast_validation check_trait_fn_not_const (E0379)
@@ -2300,9 +2309,11 @@ impl Tcx {
         for b in bs {
             let path = match b {
                 ast::Bound::Trait { path, maybe: false, .. } => path,
+                // (a relaxed bound names a trait too: unknown ones are E0405)
+                ast::Bound::Trait { path, maybe: true, .. } => { if self.validates(prog, file) { self.resolve_trait_path(cx, prog, file, module, env, path); } continue; }
                 _ => continue,
             };
-            let td = match self.resolve_type_path_def(prog, file, module, path) {
+            let td = match self.resolve_trait_path(cx, prog, file, module, env, path) {
                 Some(d) if prog.def(d).kind == DefKind::Trait => d,
                 _ => continue,
             };
@@ -2411,6 +2422,12 @@ impl Tcx {
         // hir_ty_lowering/dyn_trait.rs: at most one non-auto trait (E0225)
         let mut principals = 0;
         for b in bounds {
+            if let ast::Bound::Trait { path, maybe: true, .. } = b {
+                if self.validates(prog, file) {
+                    self.resolve_trait_path(cx, prog, file, module, env, path);
+                    self.err(cx, prog, file, path.lo, format!("{}relaxed bounds are not permitted in trait object types", relax_front::diagnostics::UNCODED_PREFIX));
+                }
+            }
             if let ast::Bound::Trait { path, maybe: false, .. } = b {
                 let Some(td) = self.resolve_trait_path(cx, prog, file, module, env, path) else { continue };
                 if autos.contains(&td) { continue; }
@@ -2531,7 +2548,13 @@ impl Tcx {
             }
             // an argument list of the wrong length is E0107 / E0393; the object type still
             // carries one argument per declared parameter (error for the missing, none extra)
-            args.resize(n, self.tys.error);
+            // (a missing const argument is a const error, not a type: the object type's arguments keep
+            // their parameters' kinds)
+            let declaration = self.declaration_env(prog, td);
+            while args.len() < n {
+                let i = args.len() + 1;
+                args.push(if declaration.consts.iter().any(|c| c.0 as usize == i) { self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))) } else { self.tys.error });
+            }
             let bound = u16::try_from(bound).expect("dyn principal bound-region count");
             return self.tys.intern(TyKind::Dyn(td, self.tys.mk_list(&args), self.tys.mk_list(&binds), regions, region, bound, self.tys.mk_list(&autos)));
         }
@@ -3164,7 +3187,7 @@ impl Tcx {
         let k = prog.def(td).kind;
         if matches!(k, DefKind::Trait) { return Some(td); }
         // (a name another namespace or a misresolved module holds is left alone)
-        if matches!(k, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias | DefKind::AssocTy | DefKind::Prim(_) | DefKind::Mod) {
+        if matches!(k, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias | DefKind::AssocTy | DefKind::AssocFn | DefKind::AssocConst | DefKind::Fn | DefKind::Const | DefKind::Static | DefKind::Prim(_) | DefKind::Mod) {
             self.err(cx, prog, file, p.lo, format!("E0404: expected trait, found {} `{}`", def_kind_descr(k), path_str(prog, file, p)));
         }
         None
@@ -3420,7 +3443,7 @@ impl Tcx {
                     Ok(g) => g,
                     Err(()) => {
                         self.err(cx, prog, pd.file, ast.item(pd.item).lo, format!("E0391: cycle detected when computing type of `{}::{}`", prog.def_path(td), prog.files[pd.file as usize].text(g.name)));
-                        out.push(self.tys.error);
+                        out.push(if cdef.is_some() { self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))) } else { self.tys.error });
                         k += 1;
                         continue;
                     }

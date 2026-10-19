@@ -774,7 +774,7 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
             }
         });
     }
-    crate::owner::call(crate::owner::Class::App, || {
+    let code = crate::owner::call(crate::owner::Class::App, || {
         println!(
             "test result: {} passed; {} failed. compiled {} fns ({} bytes, {} RIR insts): typeck {:.2} ms, lower {:.2} ms, opt {:.2} ms, codegen {:.2} ms",
             passed,
@@ -809,7 +809,11 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         } else {
             0
         }
-    })
+    });
+    // the caller ends the process: tearing the unit down would wait on state a contained fault
+    // (a stack overflow in the compiler) left locked
+    std::mem::forget(u);
+    code
 }
 
 /// M2: loads every crate of the unit graph with Relax's core/std and resolves all imports.
@@ -843,6 +847,7 @@ fn cmd_resolve(sess: &std::sync::Arc<crate::Session>, units_path: &str) {
         match prog.load_crate_deferred(&c.name, &c.src_path, c.edition, cs, deps) {
             Ok(k) => {
                 prog.crates[k as usize].proc_macro = c.proc_macro;
+                prog.crates[k as usize].is_bin = c.bin;
                 crate_of[ci] = k;
             }
             Err(e) => {
