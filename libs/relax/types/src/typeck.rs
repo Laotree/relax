@@ -1051,7 +1051,18 @@ impl<'a> Fcx<'a> {
             _ => return false,
         };
         let (a, d) = (self.shallow(a), self.shallow(d));
-        matches!(self.tcx.tys.kind(a), TyKind::Infer(_)) && matches!(self.tcx.tys.kind(d), TyKind::Dyn(..))
+        matches!(self.tcx.tys.kind(a), TyKind::Infer(_)) && matches!(self.tcx.tys.kind(d), TyKind::Dyn(..)) && self.type_var_is_sized(a)
+    }
+
+    /// coercion.rs type_var_is_sized: a `$0: Sized` obligation is pending. Only then is `$0: Unsize<dyn
+    /// Trait>` pending too; a bare variable (`ptr as *mut _`) is unified with the pointee instead.
+    fn type_var_is_sized(&mut self, var: TyId) -> bool {
+        let Some(sized) = self.tcx.lang_items.get(crate::lang_items::LangItem::Sized) else { return true };
+        let v = self.shallow(var);
+        self.fulfillment_cx.pending_obligations().iter().any(|o| {
+            matches!(&o.goal.predicate.kind, PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(t))
+                if t.trait_ref.def_id == sized && matches!(t.trait_ref.args.first(), Some(crate::consts::GenericArg::Type(a)) if self.infcx.shallow_resolve(*a) == v))
+        })
     }
 
     /// Is item `d` visible from this body's module (`pub`, or private and defined in this module
