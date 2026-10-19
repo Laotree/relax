@@ -91,11 +91,6 @@ impl<'a> Gates<'a> {
         self.errors.push(self.prog.record_error(self.file, pos, "typeck", format!("E0658: {}", msg)));
     }
 
-    fn uncoded(&mut self, pos: u32, msg: &str) {
-        if !self.is_source(pos) { return; }
-        self.errors.push(self.prog.record_uncoded_error(self.file, pos, "typeck", msg.to_string()));
-    }
-
     fn coded(&mut self, code: &str, pos: u32, msg: &str) {
         if !self.is_source(pos) { return; }
         self.errors.push(self.prog.record_error(self.file, pos, "typeck", format!("{}: {}", code, msg)));
