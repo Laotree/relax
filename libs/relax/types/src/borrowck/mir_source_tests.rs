@@ -366,3 +366,40 @@ fn closures_in_a_promoted_constant_use_the_parents_user_type_annotations() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn lifetimes_written_on_a_constructor_pattern_path_are_a_user_type_annotation() {
+    for (decl, pat) in [
+        ("struct Foo<'a>(&'a u32);", "Foo::<'static>(_z)"),
+        ("struct Foo<'a> { field: &'a u32 }", "Foo::<'static> { field: _z }"),
+        ("enum Foo<'a> { Bar(&'a u32) }", "Foo::Bar::<'static>(_z)"),
+        ("enum Foo<'a> { Bar(&'a u32) }", "Foo::<'static>::Bar(_z)"),
+        ("enum Foo<'a> { Bar { field: &'a u32 } }", "Foo::Bar::<'static> { field: _z }"),
+    ] {
+        let make = if decl.contains("field") { if decl.contains("enum") { "Foo::Bar { field: &y }" } else { "Foo { field: &y }" } }
+            else if decl.contains("enum") { "Foo::Bar(&y)" } else { "Foo(&y)" };
+        let (errors, unchecked) = borrowck_source(&format!("{decl} pub fn f() {{ let y = 22; let foo = {make}; let {pat} = foo; }}"));
+        assert!(unchecked.is_empty(), "{pat}: {unchecked:?}");
+        assert!(errors.len() == 1 && errors[0].starts_with("E0597"), "{pat}: {errors:?}");
+    }
+}
+
+#[test]
+fn lifetimes_written_on_the_self_type_of_an_inherent_path_are_kept() {
+    let (errors, unchecked) = borrowck_source("
+        pub struct A<'a> { x: &'a u32 }
+        impl<'a> A<'a> { fn new<'b, T>(x: &'a u32, _y: T) -> Self { Self { x } } }
+        pub fn foo<'a>() { let v = 22; let _x = A::<'a>::new(&v, 22); }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0597"), "{errors:?}");
+}
+
+#[test]
+fn lifetimes_written_on_the_trait_of_a_qualified_path_are_kept() {
+    let (errors, unchecked) = borrowck_source("
+        pub trait Foo<'a> { const C: &'a u32; }
+        impl<'a, T> Foo<'a> for T { const C: &'a u32 = &22; }
+        pub fn foo<'a>(_: &'a u32) -> &'static u32 { <() as Foo<'a>>::C }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].contains("lifetime may not live long enough"), "{errors:?}");
+}

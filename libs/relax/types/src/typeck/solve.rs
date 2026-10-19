@@ -119,6 +119,7 @@ fn context<'a>(prog: &'a Program, tcx: &'a Tcx, state: &'a crate::tcx::EvalState
         last_lo: 0,
         known_method_args: None,
         value_path_lifetimes: Vec::new(),
+        value_path_enum_lifetimes: Vec::new(),
         value_path_parent_regions: Vec::new(),
         deferred_repeats: Vec::new(),
         forced_autoref: None,
