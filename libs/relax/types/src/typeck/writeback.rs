@@ -56,7 +56,7 @@ impl Fcx<'_> {
         for local in &mut body.locals { wbcx.resolve(&mut local.ty); }
         for args in body.res_args.values_mut() { wbcx.resolve_list(args); }
         for method in body.methods.values_mut().chain(body.binops.values_mut()) { wbcx.resolve_list(&mut method.args); }
-        for (_, args) in body.ov_index.values_mut().chain(body.mutable_index.values_mut()).chain(body.for_next.values_mut()) { wbcx.resolve_list(args); }
+        for (_, args) in body.ov_index.values_mut().chain(body.mutable_index.values_mut()).chain(body.std_index.values_mut()).chain(body.for_next.values_mut()) { wbcx.resolve_list(args); }
         for (_, args, ty) in body.for_into.values_mut() { wbcx.resolve_list(args); wbcx.resolve(ty); }
         for (_, args, ty) in body.try_branch.values_mut() { wbcx.resolve_list(args); wbcx.resolve(ty); }
         for (_, args) in body.try_from_residual.values_mut() { wbcx.resolve_list(args); }
