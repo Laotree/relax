@@ -480,6 +480,209 @@ impl ToArgRegionsFolder<'_, '_> {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The operations on N01's inference context. Opaque storage and equality are the context's own;
+// the defining-use validation and the remapping to declaration parameters are
+// rustc_trait_selection/src/opaque_types.rs and rustc_middle/src/ty/{opaque_types,mod}.rs.
+// ---------------------------------------------------------------------------------------------
+use crate::borrowck::infer_ctxt::BorrowckInferCtxt;
+
+impl OpaqueOps for BorrowckInferCtxt<'_> {
+    fn has_opaque_types_in_storage(&mut self) -> bool { !self.infcx.inner.borrow_mut().opaque_types().is_empty() }
+    fn opaque_storage_entries(&mut self) -> OpaqueTypeStorageEntries { self.infcx.inner.borrow_mut().opaque_types().num_entries() }
+    fn clone_opaque_types(&mut self) -> Vec<(OpaqueTypeKey, ProvisionalHiddenType)> {
+        let mut inner = self.infcx.inner.borrow_mut();
+        let storage = inner.opaque_types();
+        let mut values = storage.iter_lookup_table().to_vec();
+        values.extend_from_slice(storage.iter_duplicate_entries());
+        values
+    }
+    fn opaque_types_added_since(&mut self, entries: OpaqueTypeStorageEntries) -> Vec<(OpaqueTypeKey, ProvisionalHiddenType)> {
+        self.infcx.inner.borrow_mut().opaque_types().opaque_types_added_since(entries)
+    }
+    fn resolve_vars_if_possible(&mut self, ty: TyId) -> TyId { self.infcx.deeply_resolve_ignoring_regions(ty) }
+
+    /// rustc_trait_selection/src/opaque_types.rs `opaque_type_has_defining_use_args`: the opaque
+    /// type parameter validity check. With the new solver, uses which fail it are simply
+    /// non-defining, and an error is only emitted if no defining use exists. (The
+    /// "already malformed in HIR typeck" taint check is typeck's own result and not repeated.)
+    fn opaque_type_has_defining_use_args(&mut self, key: &OpaqueTypeKey) -> Result<(), NonDefiningUseReason> {
+        let (tcx, prog) = (self.tcx, self.prog);
+        let tys = &tcx.tys;
+        let variances = tcx.variances_of(prog, key.def_id);
+        // Computed lazily: most uses never need the environment.
+        struct Lazy<'a> { tcx: &'a Tcx, prog: &'a Program, def: DefId, args: Option<Vec<GenericArg>> }
+        impl Lazy<'_> { fn get(&mut self) -> &Vec<GenericArg> { self.args.get_or_insert_with(|| canonical_opaque_args(self.tcx, self.prog, self.def)) } }
+        let mut canonical = Lazy { tcx, prog, def: key.def_id, args: None };
+        let mut seen_params: Vec<(GenericArg, Vec<usize>)> = vec![];
+        for (i, arg) in iter_captured_args(&variances, key) {
+            let arg_is_param = match arg {
+                GenericArg::Lifetime(lt) => matches!(tys.region_kind(lt), RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(..))
+                    || (tys.region_kind(lt) == RegionKind::ReStatic && matches!(canonical.get()[i], GenericArg::Lifetime(r) if tys.region_kind(r) == RegionKind::ReStatic)),
+                GenericArg::Type(t) => matches!(tys.kind(t), TyKind::Param(_)),
+                GenericArg::Const(c) => matches!(tys.const_kind(c), crate::consts::ConstKind::Param(_)),
+            };
+            if arg_is_param {
+                // The same lifetime may appear multiple times in the generic args, unless the opaque
+                // type requires the lifetimes to be equal ("an exception to the uniqueness rule").
+                let at = match seen_params.iter().position(|(a, _)| *a == arg) { Some(at) => at, None => { seen_params.push((arg, vec![])); seen_params.len() - 1 } };
+                let first = seen_params[at].1.first().copied();
+                if !first.is_some_and(|prev| { let c = canonical.get(); c[i] == c[prev] }) { seen_params[at].1.push(i); }
+            } else {
+                // Prevent `fn foo() -> Foo<u32>` from being defining.
+                if matches!(canonical.get()[i], GenericArg::Lifetime(r) if tys.region_kind(r) == RegionKind::ReError) { return Err(NonDefiningUseReason::Tainted); }
+                return Err(NonDefiningUseReason::NotAParam { opaque_type_key: key.clone(), param_index: i });
+            }
+        }
+        for (_, param_indices) in seen_params {
+            if param_indices.len() > 1 { return Err(NonDefiningUseReason::DuplicateParam { opaque_type_key: key.clone(), param_indices }); }
+        }
+        Ok(())
+    }
+
+    /// rustc_middle/src/ty/mod.rs `remap_generic_params_to_declaration_params` (MirBorrowck): the
+    /// type outside the function, in the context of the opaque.
+    fn remap_generic_params_to_declaration_params(&mut self, key: &OpaqueTypeKey, ty: TyId) -> TyId {
+        let (tcx, prog) = (self.tcx, self.prog);
+        // Use the key to build a reverse map from regions to their identity mappings: `impl Trait`
+        // lifetimes are computed by replacing existing lifetimes with 'static and remapping only those
+        // used in the return type, so the parameters shift. The same lifetime may be paired with several
+        // identity lifetimes; the last one is the one introduced by the desugaring.
+        let identity = tcx.generic_indices_of(prog, key.def_id).identity_args(&tcx.tys);
+        let mut map: Vec<(GenericArg, GenericArg)> = vec![];
+        for (from, to) in key.args.iter().copied().zip(identity) {
+            match map.iter_mut().find(|(f, _)| *f == from) { Some(entry) => entry.1 = to, None => map.push((from, to)) }
+        }
+        let mut mapper = ReverseMapper { tcx, map, do_not_error: false, def: key.def_id };
+        crate::types::fold::TypeFolder::fold_ty(&mut mapper, &tcx.tys, ty, 0)
+    }
+
+    fn equate_hidden_types(&mut self, out: &mut MirTypeckRegionConstraints, actual: TyId, expected: TyId) -> Result<(), ()> {
+        use crate::next_solver::type_op::CustomTypeOp;
+        let env = self.param_env_id();
+        let span = crate::mir::Span::default();
+        let universals = self.universal_regions.as_ref().expect("opaque handling follows the type check");
+        // The types are normalized before they are equated.
+        let op = CustomTypeOp::new(|ocx: &mut crate::next_solver::fulfill::ObligationCtxt<'_, '_>| {
+            let actual = ocx.normalize_ty(&env, actual);
+            let expected = ocx.normalize_ty(&env, expected);
+            ocx.eq(&env, actual, expected)
+        });
+        crate::borrowck::type_check::canonical::fully_perform_op_raw(self, universals, &self.region_bound_pairs, &self.param_env.clauses, out,
+            crate::borrowck::type_check::Locations::All(span), span, crate::borrowck::constraints::ConstraintCategory::OpaqueType, op)
+            .map_err(|_| self.tainted_by_errors.set(true))
+    }
+}
+
+/// rustc_trait_selection/src/opaque_types.rs `LazyOpaqueTyEnv::get_canonical_args`: the opaque's
+/// identity arguments where lifetimes that its explicit and implied bounds make equal (to each
+/// other or to 'static) have the same name. Example: `type Opaque<'a: 'static, 'b: 'c, 'c: 'b> = impl Sized;`
+/// has identity args `['a, 'b, 'c]` and canonical args `['static, 'b, 'b]`.
+fn canonical_opaque_args(tcx: &Tcx, prog: &Program, opaque: DefId) -> Vec<GenericArg> {
+    let tys = &tcx.tys;
+    let parent = prog.opaque_owner(opaque);
+    // The parent's identity arguments, extended with the parent lifetime each lifetime captured by
+    // the opaque stands for.
+    let mut args = tcx.generic_indices_of(prog, opaque).identity_args(tys);
+    let generics = tcx.opaque_generics(prog, opaque);
+    let n_parent_lifetimes = generics.parent.lifetimes.len();
+    let indices = tcx.generic_indices_of(prog, opaque);
+    for (k, &index) in indices.lifetimes.iter().enumerate().skip(n_parent_lifetimes) {
+        let position = indices.lifetimes.iter().position(|&i| i == index).unwrap();
+        args[indices.lifetimes[position] as usize] = GenericArg::Lifetime(generics.captured_lifetimes[k - n_parent_lifetimes]);
+    }
+    // The free region relations of the parent's environment: declared bounds and the bounds its
+    // signature implies.
+    let mut edges = vec![];
+    if let Some(sig) = crate::borrowck::universal_regions::SignatureRegions::function(tcx, prog, parent) {
+        let raw: Vec<TyId> = sig.inputs.iter().copied().chain([sig.output]).collect();
+        let implied = crate::borrowck::implied_bounds::ImpliedBounds::create(tcx, prog, &sig.contract.predicates, &raw, &[], vec![]);
+        // `(sup, sub)`: `sub <= sup`.
+        edges.extend(implied.outlives.iter().map(|&(sup, sub)| (sub, sup)));
+    }
+    let free_regions = crate::infer::free_regions::FreeRegionMap::new(&edges);
+    let mut seen = vec![tys.intern_region(RegionKind::ReStatic)];
+    args.into_iter().map(|arg| match arg {
+        GenericArg::Lifetime(r1) if tys.region_kind(r1) != RegionKind::ReError => {
+            match seen.iter().copied().find(|&r2| free_regions.sub_free_regions(tys, r1, r2) && free_regions.sub_free_regions(tys, r2, r1)) {
+                Some(r2) => GenericArg::Lifetime(r2),
+                None => { seen.push(r1); arg }
+            }
+        }
+        _ => arg,
+    }).collect()
+}
+
+/// rustc_middle/src/ty/opaque_types.rs `ReverseMapper`: converts the generic parameters of a type
+/// from the defining item's generics to the opaque type's own.
+struct ReverseMapper<'a> { tcx: &'a Tcx, map: Vec<(GenericArg, GenericArg)>, do_not_error: bool, def: DefId }
+impl ReverseMapper<'_> {
+    fn error(&self, message: String) {
+        self.tcx.dcx.report(crate::next_solver::fulfill::ObligationCause { span: 0, body_id: self.def }, message);
+    }
+    /// A closure's types include all the lifetime parameters of the enclosing function, even unused ones;
+    /// those in the parent arguments are not an error when missing from the reverse map.
+    fn fold_closure_args(&mut self, tys: &crate::types::Types, args: &crate::types::ClosureArgs) -> crate::types::ClosureArgs {
+        use crate::types::fold::TypeFolder;
+        assert!(!self.do_not_error);
+        self.do_not_error = true;
+        let parent_args = self.fold_ty(tys, args.parent_args, 0);
+        self.do_not_error = false;
+        crate::types::ClosureArgs { parent_args, closure_kind_ty: self.fold_ty(tys, args.closure_kind_ty, 0),
+            closure_sig_as_fn_ptr_ty: self.fold_ty(tys, args.closure_sig_as_fn_ptr_ty, 0), tupled_upvars_ty: self.fold_ty(tys, args.tupled_upvars_ty, 0) }
+    }
+}
+impl crate::types::fold::TypeFolder for ReverseMapper<'_> {
+    fn fold_region(&mut self, tys: &crate::types::Types, r: RegionId, depth: u32) -> RegionId {
+        match tys.region_kind(r) {
+            // Bound regions and 'static need no remapping: `'r` in `for<'r> fn(&'r u32)` is ignored. Erased
+            // regions are not unerased, and error regions stay.
+            RegionKind::ReBound(..) | RegionKind::ReStatic | RegionKind::ReErased | RegionKind::ReError => return r,
+            // The regions expected from borrow checking.
+            RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(..) => {}
+            // All of the regions should be erased by writeback or mapped back to named regions by borrowck.
+            kind => panic!("unexpected region kind in opaque type: {kind:?}"),
+        }
+        let _ = depth;
+        match self.map.iter().find(|(from, _)| *from == GenericArg::Lifetime(r)).map(|x| x.1) {
+            Some(GenericArg::Lifetime(r1)) => r1,
+            Some(other) => panic!("region mapped to unexpected kind: {other:?}"),
+            None if self.do_not_error => tys.intern_region(RegionKind::ReStatic),
+            None => {
+                self.error(format!("non-defining opaque type use in defining scope: lifetime `{:?}` is part of concrete type but not used in parameter list of the `impl Trait` type alias", tys.region_kind(r)));
+                tys.intern_region(RegionKind::ReError)
+            }
+        }
+    }
+    fn fold_ty(&mut self, tys: &crate::types::Types, ty: TyId, depth: u32) -> TyId {
+        match tys.kind(ty).clone() {
+            TyKind::Closure(file, expr, args) => { let args = self.fold_closure_args(tys, &args); tys.intern(TyKind::Closure(file, expr, args)) }
+            TyKind::Param(_) => match self.map.iter().find(|(from, _)| *from == GenericArg::Type(ty)).map(|x| x.1) {
+                Some(GenericArg::Type(t1)) => t1,
+                Some(other) => panic!("type mapped to unexpected kind: {other:?}"),
+                None => {
+                    self.error("type parameter is part of concrete type but not used in parameter list for the `impl Trait` type alias".into());
+                    tys.error
+                }
+            },
+            _ => crate::types::fold::super_fold_ty(tys, ty, self, depth),
+        }
+    }
+    fn fold_const(&mut self, tys: &crate::types::Types, ct: crate::consts::Const, _: u32) -> crate::consts::Const {
+        if matches!(tys.const_kind(ct), crate::consts::ConstKind::Param(..)) {
+            return match self.map.iter().find(|(from, _)| *from == GenericArg::Const(ct)).map(|x| x.1) {
+                Some(GenericArg::Const(c1)) => c1,
+                Some(other) => panic!("const mapped to unexpected kind: {other:?}"),
+                None => {
+                    self.error("const parameter is part of concrete type but not used in parameter list for the `impl Trait` type alias".into());
+                    tys.intern_const(crate::consts::ConstKind::Error)
+                }
+            };
+        }
+        ct
+    }
+}
+
 /// A key without arguments, for fixtures of prevalidated defining uses.
 #[cfg(test)]
 pub(super) fn test_key(def_id: DefId) -> OpaqueTypeKey { OpaqueTypeKey { def_id, args: Vec::new().into() } }
