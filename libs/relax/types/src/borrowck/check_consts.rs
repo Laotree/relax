@@ -283,8 +283,6 @@ impl<Q: Queries> Checker<'_, '_, Q> {
                 } || matches!(callee, Callee::Virtual(..));
                 let non_const = if through_trait {
                     !self.const_traits
-                } else if tx.is_std_def(*d) {
-                    false
                 } else {
                     def.kind == DefKind::ForeignFn || !tx.tcx.fn_sig(tx.prog, *d).map_or(true, |s| s.is_const)
                 };

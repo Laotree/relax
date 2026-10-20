@@ -42,19 +42,18 @@ impl Fcx<'_> {
             (TyKind::Ref(false, ..), TyKind::Ref(true, ..) | TyKind::Ptr(true, _)) => return None,
             _ => {}
         }
-        // (the inference snapshot only: the pending obligations stay visible to the visitor)
-        let snapshot = self.infcx.start_snapshot();
+        let snapshot = self.start_snapshot();
         // The `CoerceUnsized` target is a fresh variable related to the expected type.
         let coerce_target = self.fresh(0);
-        if !self.eq(coerce_target, target) { self.infcx.rollback_to(snapshot); return None; }
+        if !self.eq(coerce_target, target) { self.rollback_to(snapshot); return None; }
         let goal = self.trait_goal(coerce_unsized, source, &[coerce_target]);
         let mut visitor = CoerceVisitor { errored: false };
         if self.visit_coerce_goal(&mut visitor, goal.clone(), 0, unsize, coerce_unsized) {
-            self.infcx.rollback_to(snapshot);
+            self.rollback_to(snapshot);
             return None;
         }
         let lo = self.last_lo;
-        self.infcx.commit_from(snapshot);
+        self.commit_from(snapshot);
         self.register_goal(goal, lo);
         Some(self.unsize_kind(source, target))
     }
@@ -83,9 +82,11 @@ impl Fcx<'_> {
             TyKind::Dyn(..) => true,
             TyKind::Slice(_) => matches!(self.tcx.tys.kind(a), TyKind::Array(..) | TyKind::Adt(..) | TyKind::Infer(_)),
             TyKind::Adt(d2, ys, _) => match self.tcx.tys.kind(a).clone() {
+                // a struct unsizes through its last field, whatever that field's type is
+                // (`Foo<i32, Count<N>>` to `Foo<u32, ()>` when the field type does)
                 TyKind::Adt(d1, xs, _) if d1 == d2 && self.prog.def(d1).kind == DefKind::Struct && self.tcx.tys.list(xs).len() == self.tcx.tys.list(ys).len() => {
                     let (xs, ys) = (self.tcx.tys.list(xs).to_vec(), self.tcx.tys.list(ys).to_vec());
-                    (0..xs.len()).any(|i| { let (x, y) = (self.shallow(xs[i]), self.shallow(ys[i])); x != y && self.pointee_pair_could_unsize(x, y) })
+                    (0..xs.len()).any(|i| self.shallow(xs[i]) != self.shallow(ys[i]))
                 }
                 _ => false,
             },
