@@ -11,6 +11,8 @@ use crate::fxhash::HashMap;
 mod collected;
 mod privacy;
 pub use privacy::PrivacyError;
+mod rsim;
+pub use rsim::{SimDiag, SimKind};
 mod attrs;
 mod validate;
 
@@ -539,7 +541,6 @@ pub struct Program {
     pub module_probes: Vec<(String, bool)>,
     /// `mod name;` without `#[path]` that found `name.rs`: (file, item position, krate, the `name/mod.rs` alternative)
     /// -- a check reports E0761 when that exists too (rustc default_submod_path)
-    pub module_file_alternatives: Vec<(u32, u32, u32, String)>,
     /// per module being collected: the folder its `mod x;` items resolve in and whether that
     /// folder is the module file's own (rustc ModuleData::dir_path / DirOwnership); the modules
     /// of a fn body's blocks take their enclosing module's
@@ -563,6 +564,11 @@ pub struct Program {
     pub glob_prec_cache: crate::conc::MemoMap<(u32, Sym, bool), Option<(DefId, BindVis)>>,
     /// the crates being checked (`makepad check`): the only ones whose paths are privacy-checked
     pub own_crates: Vec<bool>,
+    /// rustc's glob ambiguities in the checked crates (the import replay, program/rsim.rs):
+    /// (module, name, type namespace) -> 1 an error, 2 the lint `ambiguous_glob_imports`
+    pub sim_ambiguity: Option<HashMap<(u32, Sym, bool), u8>>,
+    /// what the replay reported, until the check emits it
+    pub sim_diags: Option<Vec<SimDiag>>,
     /// lexical lookups (`lookup_in_scope`) once imports are resolved: (module, name, ns_type);
     /// cleared whenever a binding is defined or imports are resolved again
     scope_cache: crate::conc::MemoMap<(u32, Sym, bool), Option<DefId>>,
@@ -822,7 +828,6 @@ impl Program {
             demand_plan: None,
             load_recipe: Vec::new(),
             module_probes: Vec::new(),
-            module_file_alternatives: Vec::new(),
             mod_dirs: Default::default(),
             source_versions: Default::default(),
             edit_versions: Vec::new(),
@@ -873,6 +878,8 @@ impl Program {
             glob_amb_cache: Default::default(),
             glob_prec_cache: Default::default(),
             own_crates: Vec::new(),
+            sim_ambiguity: None,
+            sim_diags: None,
             scope_cache: Default::default(),
             import_used: Default::default(),
             glob_used: Default::default(),
@@ -1868,17 +1875,34 @@ impl Program {
     /// (macros.rs); these imports name nothing in the type / value namespaces.
     fn macro_import_binds(&self) -> crate::fxhash::HashSet<Sym> {
         let mut set: crate::fxhash::HashSet<Sym> = crate::fxhash::HashSet::default();
+        // (module, name) bindings known to be macros
+        let mut bound: crate::fxhash::HashSet<(u32, Sym)> = crate::fxhash::HashSet::default();
         loop {
             let mut grew = false;
             for im in &self.imports {
                 let (Some(b), Some((_, last))) = (im.bind, im.segs.last()) else { continue };
-                if im.glob || set.contains(&b) {
+                if im.glob || bound.contains(&(im.module, b)) {
                     continue;
                 }
-                if set.contains(last) || self.macros.defs.contains_key(self.syms.str(*last)) {
-                    set.insert(b);
-                    grew = true;
+                if !(set.contains(last) || self.macros.defs.contains_key(self.syms.str(*last))) {
+                    continue;
                 }
+                // a path through a module of a crate (not its root) names a macro only when that
+                // module has an import binding it (a macro is not an item of the module it is
+                // written in): `pub use self::nu;` in `mod m` finds nothing
+                if im.segs.len() > 1 {
+                    let krate = self.mods[im.module as usize].krate;
+                    let edition = self.crates[krate as usize].edition;
+                    if let Some(parent) = self.resolve_mod_path(im.module, im.global, &im.segs[..im.segs.len() - 1], edition < 2018, true) {
+                        let pd = self.def(parent);
+                        if pd.kind == DefKind::Mod && self.crates[pd.krate as usize].root_mod != pd.sub && !bound.contains(&(pd.sub, *last)) {
+                            continue;
+                        }
+                    }
+                }
+                bound.insert((im.module, b));
+                set.insert(b);
+                grew = true;
             }
             if !grew {
                 return set;
@@ -2672,9 +2696,20 @@ impl Program {
                                     self.front_probes[krate as usize].push((c.clone(), exists));
                                 }
                                 if exists {
-                                    if path_attr.is_empty() && c == &cands[0] {
-                                        let pos = self.files[file as usize].ast.item(iid).lo;
-                                        self.module_file_alternatives.push((file, pos, krate, cands[1].clone()));
+                                    // rustc_expand module.rs `default_submod_path`: both `x.rs` and `x/mod.rs` exist
+                                    if path_attr.is_empty() && cands.len() == 2 && *c == cands[0] && crate::lexer::validation_enabled() {
+                                        let other = &cands[1];
+                                        let other_exists = self.check_files.as_ref().map_or(false, |m| m.contains_key(other)) || self.crates[krate as usize].context.exists(other);
+                                        self.module_probes.push((other.clone(), other_exists));
+                                        if self.record_front && !self.cur_image {
+                                            self.front_probes[krate as usize].push((other.clone(), other_exists));
+                                        }
+                                        if other_exists {
+                                            let lo = self.files[file as usize].ast.item(iid).lo;
+                                            self.errors.push(self.record_error(file, lo, "resolve", format!("E0761: file for module `{}` found at both \"{}\" and \"{}\"", sname, c, other)));
+                                            loaded = true;
+                                            break;
+                                        }
                                     }
                                     if self.demand_plan.as_ref().is_some_and(|p| p.skips(self.crates[krate as usize].root_path(), c)) {
                                         let is_mod_rs = child_mod_rs || c.ends_with("/mod.rs");
@@ -2810,7 +2845,15 @@ impl Program {
                 }
                 Tag::MacroRules => {
                     let d = self.add_def(mk(DefKind::MacroRules));
-                    self.mods[module as usize].macros.insert(name, d);
+                    // a path names a `macro_rules!` macro only at the crate root, and only when it
+                    // is `#[macro_export]`ed (rustc_resolve define_macro: the exported macro is a
+                    // root binding; a textual macro has no module path unless a `use` re-exports it)
+                    let f = &self.files[file as usize];
+                    let exported = f.ast.list(f.ast.item(iid).attrs).iter().any(|a| a.toks.hi > a.toks.lo && f.tok_text(a.toks.lo) == "macro_export");
+                    if exported {
+                        let root = self.crates[self.mods[module as usize].krate as usize].root_mod;
+                        self.mods[root as usize].macros.insert(name, d);
+                    }
                 }
                 Tag::Other => {
                     // an item-level `compile_error!("msg")` (a failed derive or built-in macro

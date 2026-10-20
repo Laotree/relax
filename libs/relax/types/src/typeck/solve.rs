@@ -131,6 +131,7 @@ fn context<'a>(prog: &'a Program, tcx: &'a Tcx, state: &'a crate::tcx::EvalState
         stalled_coroutine_goals: Vec::new(),
         forced_autoref: None,
         method_expected: None,
+        arm_attrs: Vec::new(),
     }
 }
 

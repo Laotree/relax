@@ -2263,7 +2263,17 @@ impl Tcx {
             ast::Ty::Array(x, n) => {
                 let inner = self.lower_ty(cx, prog, file, module, env, *x);
                 if is_infer_len(ast, *n) {
-                    let length = match cx.infcx { Some(infcx) => infcx.next_const_var(), None => self.tys.intern_const(crate::consts::ConstKind::Error) };
+                    let length = match cx.infcx {
+                        Some(infcx) => infcx.next_const_var(),
+                        None => {
+                            // ItemCtxt::ct_infer: no `_` length in an item's signature either
+                            if self.validates(prog, file) {
+                                let pos = env.owner.filter(|o| prog.def(*o).file == file).map_or(0, |o| ast.item(prog.def(o).item).lo);
+                                self.err(cx, prog, file, pos, "E0121: the placeholder `_` is not allowed within types on item signatures".to_string());
+                            }
+                            self.tys.intern_const(crate::consts::ConstKind::Error)
+                        }
+                    };
                     return self.tys.mk_array(inner, length);
                 }
                 let lt = self.lower_const_arg(prog, file, env, *n, self.tys.usize_);
@@ -3342,6 +3352,13 @@ impl Tcx {
                     let last = prog.files[file as usize].text(ast.segs(p.segs)[p.segs.len() - 1].name);
                     let parent = prog.files[file as usize].text(ast.segs(p.segs)[p.segs.len() - 2].name);
                     self.err(cx, prog, file, p.lo, format!("E0405: cannot find trait `{}` in `{}`", last, parent));
+                } else if ast.segs(p.segs)[0].kind() == SegKind::Ident {
+                    // the path starts with a name that is nothing in scope: no module, no crate
+                    let first = prog.files[file as usize].text(ast.segs(p.segs)[0].name);
+                    let known = prog.syms.get(first).is_some_and(|s| env.names.contains(&s) || prog.lookup_in_scope(module, s, true).is_some() || prog.lookup_in_scope(module, s, false).is_some() || prog.crates[prog.mods[module as usize].krate as usize].deps.iter().any(|d| d.0 == s));
+                    if !known {
+                        self.err(cx, prog, file, p.lo, format!("E0433: failed to resolve: use of unresolved module or unlinked crate `{}`", first));
+                    }
                 }
             }
             return None;

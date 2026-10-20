@@ -112,6 +112,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     }
     u.prog.own_crates = own.clone();
     errors.extend(u.prog.strict_import_errors(&own));
+    errors.extend(relax_types::lint::import_resolution_diags(&mut u.prog, &own));
     // every checked definition's signature, on MAKEPAD_RUN_JOBS threads (queries over the shared
     // context); errors in definition order
     {
@@ -128,7 +129,6 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     }
     errors.extend(relax_types::item_checks::duplicate_items(&u.prog, &own));
     errors.extend(relax_types::item_checks::duplicate_exported_macros(&u.prog, &own));
-    errors.extend(relax_types::item_checks::ambiguous_module_files(&u.prog, &own));
     errors.extend(relax_types::item_checks::super_paths(&u.prog, &own));
     errors.extend(relax_types::item_checks::impl_trait_path_privacy(&u.prog, &u.tcx, &own));
     errors.extend(relax_types::item_checks::private_assoc_types(&u.prog, &u.tcx, &own));
@@ -511,8 +511,8 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     unsafe { crate::jit::backend_bench(up) };
     if std::env::var("MAKEPAD_RUN_PASS_TIMES").is_ok() || std::env::var("MAKEPAD_RUN_OPT_HIST").is_ok() {
         let mut passes = String::new();
-        for i in 0..crate::opt::PASS_NAMES.len() {
-            passes.push_str(&format!("{} {:.0}  ", crate::opt::PASS_NAMES[i], crate::opt::PASS_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6));
+        for i in 0..relax_backend::stats::PASS_NAMES.len() {
+            passes.push_str(&format!("{} {:.0}  ", relax_backend::stats::PASS_NAMES[i], relax_backend::stats::PASS_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6));
         }
         eprintln!("makepad check: passes (cpu ms): {}", passes);
         eprintln!("makepad check: opt ms by size (<16,<64,<256,<1k,<4k,more) {:?} fns {:?}", crate::opt::HIST[..6].iter().map(|x| x.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000).collect::<Vec<_>>(), crate::opt::HIST[6..].iter().map(|x| x.load(std::sync::atomic::Ordering::Relaxed)).collect::<Vec<_>>());
@@ -860,7 +860,7 @@ fn mono_check(up: *mut Unit, own: &[bool], root: u32) {
                 for b in &f.blocks {
                     for i in &b.insts {
                         match i {
-                            crate::rir::Inst::Call(crate::rir::Callee::Fn(c) | crate::rir::Callee::CFn(c, _), _, _) => out.push(*c),
+                            relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c) | relax_backend::rir::Callee::CFn(c, _), _, _) => out.push(*c),
                             _ => {}
                         }
                     }
