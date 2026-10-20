@@ -483,8 +483,8 @@ impl Tcx {
                         Err(proper) => match self.orphan_check_impl(prog, im.def, OrphanCheckMode::Compat) {
                             Ok(()) => {
                                 assert!(matches!(proper, OrphanCheckErr::UncoveredTyParams { .. }), "orphanck: non-local input types in compat mode");
-                                self.dcx.warn(crate::next_solver::fulfill::ObligationCause { body_id: im.def, span: pos },
-                                    format!("type parameter covered only by a projection in an impl of `{}` (uncovered_param_in_projection, future incompatible)", prog.def_path(td)));
+                                crate::lint::emit(prog, im.def, &crate::lint::UNCOVERED_PARAM_IN_PROJECTION, prog.def(im.def).file, pos,
+                                    &format!("type parameter covered only by a projection in an impl of `{}`", prog.def_path(td)));
                                 Ok(())
                             }
                             Err(compat) => Err(compat),
