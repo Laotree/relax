@@ -9,6 +9,11 @@ pub(super) fn borrowck_source(source: &str) -> (Vec<String>, Vec<String>) {
 }
 
 pub(super) fn borrowck_source_in(source: &str, edition: u16) -> (Vec<String>, Vec<String>) {
+    borrowck_source_named(source, edition, "repro")
+}
+
+/// `borrowck_source_in` for a crate of the given name (`#![crate_name]` in rustc's tests).
+pub(super) fn borrowck_source_named(source: &str, edition: u16, crate_name: &str) -> (Vec<String>, Vec<String>) {
     crate::borrowck::event::FORCE_USER_TYPES.with(|f| f.set(Some(true)));
     let sess = &std::sync::Arc::new(crate::Session::default());
     let mut prog = Program::new(sess);
@@ -24,7 +29,7 @@ pub(super) fn borrowck_source_in(source: &str, edition: u16) -> (Vec<String>, Ve
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("lib.rs");
     std::fs::write(&path, source).unwrap();
-    let user = prog.load_crate("repro", path.to_str().unwrap(), edition, crate::cfg::CfgSet::host(sess, &[]), vec![(core, 0), (alloc_name, alloc), (std_name, std)]).unwrap();
+    let user = prog.load_crate(crate_name, path.to_str().unwrap(), edition, crate::cfg::CfgSet::host(sess, &[]), vec![(core, 0), (alloc_name, alloc), (std_name, std)]).unwrap();
     std::fs::remove_file(&path).unwrap(); std::fs::remove_dir(&dir).unwrap();
     prog.prelude_crate = Some(0);
     prog.resolve_imports();
@@ -733,4 +738,25 @@ fn an_async_closure_cannot_move_out_of_a_shared_reference() {
         pub fn hello(x: &Ty) { let _c = async || { *x; }; }", 2021);
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.iter().any(|e| e.starts_with("E0507")), "{errors:?}");
+}
+
+#[test]
+fn bevys_param_set_takes_the_outlives_its_normalization_registers_as_implied_bounds() {
+    // `ParamSet<Query<&'a u8>>` is well-formed only where `'a: 'static` (the impl's `Q: 'static`); rustc keeps
+    // accepting bevy_ecs's use of it by assuming the region obligations normalizing its where clauses registers.
+    let source = "
+        pub trait WorldQuery {}
+        impl WorldQuery for &u8 {}
+        pub struct Query<Q: WorldQuery>(Q);
+        pub trait SystemParam { type State; }
+        impl<Q: WorldQuery + 'static> SystemParam for Query<Q> { type State = (); }
+        pub struct ParamSet<T: SystemParam>(T) where T::State: Sized;
+        fn handler<'a>(x: ParamSet<Query<&'a u8>>) { let _: ParamSet<_> = x; }
+        fn ref_handler<'a>(_: &ParamSet<Query<&'a u8>>) {}";
+    let (errors, unchecked) = borrowck_source_named(source, 2021, "bevy_ecs");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+    // another crate's ParamSet gets no such allowance
+    let (errors, _) = borrowck_source_named(source, 2021, "other_crate");
+    assert!(!errors.is_empty(), "{errors:?}");
 }
