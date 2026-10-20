@@ -522,8 +522,8 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
             record(item.key, FnVerdict::Unchecked("stale".into()));
             continue;
         }
-        let _cost = crate::fncost::Record::new(u32::MAX, 0, "gandalf");
-        let t0 = crate::clock::cpu_ns();
+        let _cost = relax_codegen::fncost::Record::new(u32::MAX, 0, "gandalf");
+        let t0 = relax_backend::cpu_ns();
         let mut stale = false;
         let mut discovery_next = None;
         let mut reused_owner = false;
@@ -632,7 +632,7 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
             phase.set("finish");
             finish_verdict(prog, *identity, *epoch, *def, args, result, Origin::Background);
         });
-        CHECK_NS.fetch_add(crate::clock::cpu_ns() - t0, Ordering::Relaxed);
+        CHECK_NS.fetch_add(relax_backend::cpu_ns() - t0, Ordering::Relaxed);
         // An exit cancels the whole attempt, including constant deferrals/discovery.
         // Only a front writer's temporary preemption is queued again below.
         if crate::preempt::is_stopped() { return; }
@@ -711,7 +711,7 @@ pub fn check_before_run(prog: &Program, tcx: &Tcx, src: &Arc<dyn FrontSource>, d
     if let Some(v) = stored { v.reuse(key); return Vec::new(); }
     let Some(owner) = super::body::CheckedBody::item(prog, def) else { record(key, FnVerdict::Unchecked("no body".into())); return Vec::new(); };
     let args = owner.identity_args(prog, tcx);
-    let t0 = crate::clock::cpu_ns();
+    let t0 = relax_backend::cpu_ns();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let state = crate::tcx::EvalState::new();
         let cx = crate::tcx::EvalCx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &state);
@@ -719,7 +719,7 @@ pub fn check_before_run(prog: &Program, tcx: &Tcx, src: &Arc<dyn FrontSource>, d
         if !body.errors.is_empty() { return None; }
         Some(super::check_body(&cx, prog, tcx, &body))
     })).map_err(|e| panic_message(&e));
-    CHECK_NS.fetch_add(crate::clock::cpu_ns() - t0, Ordering::Relaxed);
+    CHECK_NS.fetch_add(relax_backend::cpu_ns() - t0, Ordering::Relaxed);
     CHECKED.fetch_add(1, Ordering::Relaxed);
     if let Err(msg) = &result {
         PANICS.fetch_add(1, Ordering::Relaxed);
