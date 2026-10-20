@@ -26,6 +26,12 @@ pub struct TokBuf {
     pub origins: Vec<(u32, u32, u32)>,
 }
 
+/// A verification failure: a panic in a macro worker is swallowed and hangs the run, so say it and stop.
+pub fn verify_fail(msg: &str) -> ! {
+    eprintln!("MAKEPAD_RUN_VERIFY_TOKENS: {}", msg);
+    std::process::abort();
+}
+
 /// Paths in generated code: crates by identity (resolve from any crate, including core itself).
 pub const CORE: &str = "__relax_crate_core";
 pub const STD: &str = "__relax_crate_std";
@@ -154,6 +160,8 @@ impl TokBuf {
     pub fn lit(&mut self, text: &str) {
         let b = text.as_bytes();
         let kind = match b[0] {
+            _ if text == "true" => T::KwTrue,
+            _ if text == "false" => T::KwFalse,
             b'"' => T::Str,
             b'\'' => T::Char,
             b'b' if b.get(1) == Some(&b'"') => T::ByteStr,
@@ -237,6 +245,7 @@ impl TokBuf {
 
     /// Appends another buffer's tokens (and spliced expressions).
     pub fn append(&mut self, other: &TokBuf) {
+        self.s.push(' ');
         let base = self.s.len() as u32;
         let first = self.toks.len() as u32;
         self.s.push_str(&other.s);
@@ -256,7 +265,9 @@ impl TokBuf {
         if !same {
             let at = lexed.iter().zip(&self.toks).position(|(a, b)| !(a.lo == b.lo && a.hi == b.hi && a.kind == b.kind)).unwrap_or(lexed.len().min(self.toks.len()));
             let near = |t: Option<&Tok>| t.map(|t| (t.kind, t.lo, t.hi));
-            panic!("generated tokens of `{}` differ from the lexed text at token {} (lexed {} tokens, generated {}): lexed {:?} generated {:?} in `{}`", what, at, lexed.len(), self.toks.len(), near(lexed.get(at)), near(self.toks.get(at)), self.s);
+            // (a panic in a macro worker is swallowed and hangs the run: say it and stop)
+            eprintln!("MAKEPAD_RUN_VERIFY_TOKENS: generated tokens of `{}` differ from the lexed text at token {} (lexed {} tokens, generated {}): lexed {:?} generated {:?} in `{}`", what, at, lexed.len(), self.toks.len(), near(lexed.get(at)), near(self.toks.get(at)), self.s);
+            std::process::abort();
         }
     }
 }

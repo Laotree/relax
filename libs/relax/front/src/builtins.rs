@@ -1368,7 +1368,7 @@ fn expand_item(sess: &std::sync::Arc<crate::Session>, path: &str, item: &[u8], f
     if crate::parser::verify_tokens() {
         let mut lexed = Vec::new();
         if crate::lexer::lex(item, 2021, &mut lexed).is_err() || !same_tokens(&lexed, &fresh) {
-            panic!("derive input tokens differ from the lexed item text at {item_lo}: lexed {:?} given {:?} in `{}`", lexed.iter().map(|t| (t.kind, t.lo, t.hi)).collect::<Vec<_>>(), fresh.iter().map(|t| (t.kind, t.lo, t.hi)).collect::<Vec<_>>(), String::from_utf8_lossy(item));
+            crate::tokbuf::verify_fail(&format!("derive input tokens differ from the lexed item text at {item_lo}: lexed {:?} given {:?} in `{}`", lexed.iter().map(|t| (t.kind, t.lo, t.hi)).collect::<Vec<_>>(), fresh.iter().map(|t| (t.kind, t.lo, t.hi)).collect::<Vec<_>>(), String::from_utf8_lossy(item)));
         }
     }
     let input = match to_stream_buf(Buf::plain(item), &fresh, 0, fresh.len(), &span_of) {
@@ -1652,8 +1652,20 @@ fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo:
     // MAKEPAD_RUN_REUSE_VERIFY=1: every reused derive expansion is recomputed and must be identical.
     if reused.is_some() && std::env::var_os("MAKEPAD_RUN_REUSE_VERIFY").is_none() { return Ok(reused); }
     crate::macro_reg::add_pre(false);
+    // an item of expansion text has its tokens (as the source spelled them); an authored item's
+    // tokens are the source's own (the parser's are the configured view: `#[cfg_attr]` expanded,
+    // disabled items gone, synthetic `#[`)
+    let fresh = if item_lo >= p.src.len() as u32 {
+        item_tokens(p, &buf, lo, hi, item_lo)
+    } else {
+        let mut v = Vec::new();
+        if crate::lexer::lex(buf.get(item_lo, item_hi), 2021, &mut v).is_err() {
+            return Err((item_lo, "derive input does not lex".to_string()));
+        }
+        v
+    };
     let cfg = p.bctx.as_ref().map(|c| &c.cfg);
-    let r = expand_item(sess, p.bctx.as_ref().map_or("", |c| c.path.as_str()), buf.get(item_lo, item_hi), item_tokens(p, &buf, lo, hi, item_lo), item_lo, item_location(p,item_lo), cfg, p.edition, Some(&|lo, hi| p.input_span(lo, hi)));
+    let r = expand_item(sess, p.bctx.as_ref().map_or("", |c| c.path.as_str()), buf.get(item_lo, item_hi), fresh, item_lo, item_location(p,item_lo), cfg, p.edition, Some(&|lo, hi| p.input_span(lo, hi)));
     match r? {
         ItemOut::Done(x) => {
             if let Some(reused) = reused {
