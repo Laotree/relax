@@ -5983,7 +5983,8 @@ fn slot_bytes(f: &relax_backend::rir::Func) -> u32 {
 pub static FRAME_SLOTS: relax_session::sync::Mutex<Vec<(u32, u32)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// MAKEPAD_RUN_CODE_SIG=<file>: one line per compiled function (its stable name -- instance type
-/// arguments included, syms::stable_fn_name --, ` [O3]` after it for an O3 build, code bytes,
+/// arguments included, syms::stable_fn_name --, ` [O3]` / ` [baseline]` after it for an O3 /
+/// baseline-tier build, code bytes,
 /// RIR hash + allocation signature):
 /// back-end refactors compare these between builds for equal output, and two runs of one
 /// program compare them for build-order independence (tools/hrcheck/fe/sigcmp.py).
@@ -6049,6 +6050,8 @@ fn code_sig(id: u32, f: &relax_backend::rir::Func, code: &[u8], alloc: u64, o3: 
         };
         if o3 {
             name.push_str(" [O3]");
+        } else if f.baseline {
+            name.push_str(" [baseline]");
         }
         // MAKEPAD_RUN_CODE_SIG_DIR=<dir>: each signed RIR too, as <dir>/<name hash>-<RIR hash>.rir (first line
         // the stable name): two runs' dirs diff function by function
