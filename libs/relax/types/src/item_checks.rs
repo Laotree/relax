@@ -1263,17 +1263,24 @@ fn entry_main(prog: &Program, root: u32) -> Option<DefId> {
     (prog.def(d).kind == DefKind::Fn).then_some(d)
 }
 
-/// rustc_expand `maybe_emit_expr_attr_err`: an attribute on an expression that is no statement
-/// is the unstable `stmt_expr_attributes` (E0658). Text a macro expanded is not judged.
-pub fn expression_attribute_gate(prog: &Program, own: &[bool]) -> Vec<String> {
+/// rustc_ast_passes feature_gate `gate_all`: syntax the parser recorded (ParseSess::gated_spans)
+/// whose feature the crate does not enable is E0658. Text a macro expanded is not judged.
+pub fn gated_syntax(prog: &Program, own: &[bool]) -> Vec<String> {
     let mut errors = Vec::new();
     for (f, pf) in prog.files.iter().enumerate() {
-        if pf.ast.expr_attrs.is_empty() { continue; }
+        if pf.ast.gated_syntax.is_empty() { continue; }
         let krate = prog.file_crate.get(f).copied().unwrap_or(u32::MAX);
         if !own.get(krate as usize).copied().unwrap_or(false) { continue; }
-        if prog.crates[krate as usize].features(prog).has("stmt_expr_attributes") { continue; }
-        for &pos in &pf.ast.expr_attrs {
-            if pos < pf.src_len { errors.push(prog.record_error(f as u32, pos, "typeck", "E0658: attributes on expressions are experimental".to_string())); }
+        let features = prog.crates[krate as usize].features(prog);
+        for &(feature, pos) in &pf.ast.gated_syntax {
+            if pos >= pf.src_len || features.has(feature) { continue; }
+            let msg = match feature {
+                "stmt_expr_attributes" => "attributes on expressions are experimental",
+                "coroutines" => "coroutine syntax is experimental",
+                "async_trait_bounds" => "`async` trait bounds are unstable",
+                _ => continue,
+            };
+            errors.push(prog.record_error(f as u32, pos, "typeck", format!("E0658: {msg}")));
         }
     }
     errors

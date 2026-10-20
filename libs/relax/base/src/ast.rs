@@ -1486,9 +1486,9 @@ pub struct Ast {
     /// lint-level attributes (`#[allow(..)]` ..) of expression statements: cfg stripping drops the
     /// statement wrapper, this keeps the attributes for the lint passes (expression -> attributes)
     pub stmt_attrs: Vec<(ExprId, List<Attr>)>,
-    /// positions (`#`) of attributes written on an expression that is no statement (`let _ = #[a] e`):
-    /// gated by `stmt_expr_attributes`
-    pub expr_attrs: Vec<u32>,
+    /// syntax the parser met that a feature gates, wherever it is written (cfg'd-out code and
+    /// macro arguments included; rustc ParseSess::gated_spans): (feature, position)
+    pub gated_syntax: Vec<(&'static str, u32)>,
     /// first id of each arena (in `ends` order): 0 for a file's tree; a file's lazily parsed
     /// fn bodies (`part`) continue its ids
     pub base: Bases,

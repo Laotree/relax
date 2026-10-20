@@ -2765,7 +2765,9 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             konst = true;
         }
+        let async_pos = self.tok().lo;
         let async_ = self.eat(T::KwAsync);
+        if async_ { self.ast.gated_syntax.push(("async_trait_bounds", async_pos)); }
         let maybe = self.eat(T::Question);
         let hrtb = self.hrtb()?;
         if !self.ty_frags.is_empty() && self.ty_frags.contains(&{ self.tok().lo }) {
@@ -3621,7 +3623,7 @@ impl<'a> Parser<'a> {
         // attributes on expressions
         if self.kind() == T::Pound {
             let at = self.tok().lo;
-            if !self.outer_attrs()?.is_empty() { self.ast.expr_attrs.push(at); }
+            if !self.outer_attrs()?.is_empty() { self.ast.gated_syntax.push(("stmt_expr_attributes", at)); }
         }
         let lhs = self.unary(r)?;
         self.expr_continue(lhs, min, r, lo)
@@ -4132,6 +4134,7 @@ impl<'a> Parser<'a> {
             }
             T::Or | T::OrOr | T::KwMove => self.closure(false, false, r, lo),
             T::KwStatic if matches!(self.nth(1), T::Or | T::OrOr | T::KwMove) => {
+                self.ast.gated_syntax.push(("coroutines", self.tok().lo));
                 self.pos += 1;
                 self.closure(false, true, r, lo)
             }
