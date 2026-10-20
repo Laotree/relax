@@ -7336,6 +7336,8 @@ impl<'a> Fcx<'a> {
     /// borrow checker of this body.
     fn record_stalled_coroutine_goals(&mut self) {
         if self.stalled_coroutine_goals.is_empty() { return; }
+        // (only a checked crate's body is proven later: `makepad run` has no use for the verdict)
+        if !self.tcx.validates(self.prog, self.file) { self.stalled_coroutine_goals.clear(); return; }
         let mut resolver = crate::infer::resolve::DeepVariableResolver::new(&self.infcx);
         let mut goals = Vec::new();
         for obligation in std::mem::take(&mut self.stalled_coroutine_goals) {
