@@ -374,10 +374,11 @@ pub fn const_inst(d: VReg, k: K) -> Inst {
 /// `ro` answers constant loads (symbol + offset) from immutable data: they fold to their value,
 /// or to a symbolic address for a pointer word (`RoReader`).
 /// Narrow integer results whose upper register bits nobody reads: per vreg, whether it has one
-/// definition by a narrow (< 64-bit) Add / Sub / Mul / Neg / Not / shift-left or integer cast,
-/// and every use reads only its low `bits`: a store of at most that width, a narrow wrapping
-/// operation (add, sub, mul, and, or, xor, neg, not) of at most that width -- whose result's low
-/// bits depend only on its operands' low bits --, a cast to at most that width, or (with at least 8
+/// definition by a narrow (< 64-bit) Add / Sub / Mul / And / Or / Xor / Neg / Not / shift-left or
+/// integer cast, and every use reads only its low `bits`: a store of at most that width, a narrow
+/// wrapping operation (add, sub, mul, neg, not -- re-extended -- or an and / or / xor whose own
+/// result reads only its low bits) of at most that width -- whose result's low bits depend only
+/// on its operands' low bits --, a cast to at most that width, or (with at least 8
 /// bits) the count of a 64-bit shift (the hardware reads the count's low 6 bits). The backends then skip the
 /// result's re-extension (movzx / sxtw after every u8 / i32 operation): the bit reader's
 /// `bits_left -= n` (u8, stored back as a byte) and its `entry as u8` (a shift count).
@@ -396,42 +397,53 @@ pub fn low_bits_only(options: &relax_session::Options, f: &Func) -> Vec<bool> {
         for i in &b.insts {
             crate::regalloc::for_defs(i, |d| ndef[d.0 as usize] += 1);
             match *i {
-                Inst::IBin(IOp::Add | IOp::Sub | IOp::Mul | IOp::Shl, it, d, _, _) | Inst::IBinI(IOp::Add | IOp::Sub | IOp::Mul | IOp::Shl, it, d, _, _) | Inst::INeg(it, d, _) | Inst::INot(it, d, _) | Inst::Conv(Conv::IntToInt(it), d, _) if it.bits < 64 => bits[d.0 as usize] = it.bits,
+                Inst::IBin(IOp::Add | IOp::Sub | IOp::Mul | IOp::Shl | IOp::And | IOp::Or | IOp::Xor, it, d, _, _) | Inst::IBinI(IOp::Add | IOp::Sub | IOp::Mul | IOp::Shl | IOp::And | IOp::Or | IOp::Xor, it, d, _, _) | Inst::INeg(it, d, _) | Inst::INot(it, d, _) | Inst::Conv(Conv::IntToInt(it), d, _) if it.bits < 64 => bits[d.0 as usize] = it.bits,
                 _ => {}
             }
         }
     }
     let mut ok: Vec<bool> = (0..nv).map(|v| bits[v] != 0 && ndef[v] == 1 && f.vregs[v] == Cls::I).collect();
-    let narrow_wrap = |op: IOp| matches!(op, IOp::Add | IOp::Sub | IOp::Mul | IOp::And | IOp::Or | IOp::Xor);
+    let narrow_wrap = |op: IOp| matches!(op, IOp::Add | IOp::Sub | IOp::Mul);
+    // And / Or / Xor results are never re-extended (their operands' upper bits pass through to
+    // the result: 64-bit forms on x64): an operand of one reads only its low bits when the result
+    // does -- a fixed point, since clearing one result can clear its operands
+    let bitwise = |op: IOp| matches!(op, IOp::And | IOp::Or | IOp::Xor);
     let mut tu = Vec::new();
-    for b in &f.blocks {
-        for i in &b.insts {
-            // the uses that read only low bits: (vreg, how many)
-            let mut low: [(u32, u8); 2] = [(u32::MAX, 0); 2];
-            match *i {
-                Inst::Store(Mem::Int(n, _), base, _, v) if base != v => low[0] = (v.0, 8 * n),
-                Inst::StoreX(Mem::Int(n, _), base, idx, _, _, v) if base != v && idx != v => low[0] = (v.0, 8 * n),
-                Inst::IBin(op, it, _, x, y) if narrow_wrap(op) && it.bits < 64 => {
-                    low[0] = (x.0, it.bits);
-                    low[1] = (y.0, it.bits);
+    loop {
+        let mut changed = false;
+        for b in &f.blocks {
+            for i in &b.insts {
+                // the uses that read only low bits: (vreg, how many)
+                let mut low: [(u32, u8); 2] = [(u32::MAX, 0); 2];
+                match *i {
+                    Inst::Store(Mem::Int(n, _), base, _, v) if base != v => low[0] = (v.0, 8 * n),
+                    Inst::StoreX(Mem::Int(n, _), base, idx, _, _, v) if base != v && idx != v => low[0] = (v.0, 8 * n),
+                    Inst::IBin(op, it, d, x, y) if it.bits < 64 && (narrow_wrap(op) || bitwise(op) && ok[d.0 as usize]) => {
+                        low[0] = (x.0, it.bits);
+                        low[1] = (y.0, it.bits);
+                    }
+                    Inst::IBinI(op, it, d, x, _) if it.bits < 64 && (narrow_wrap(op) || bitwise(op) && ok[d.0 as usize]) => low[0] = (x.0, it.bits),
+                    Inst::INeg(it, _, x) | Inst::INot(it, _, x) if it.bits < 64 => low[0] = (x.0, it.bits),
+                    Inst::Conv(Conv::IntToInt(it), _, x) => low[0] = (x.0, it.bits),
+                    // a 64-bit shift's count: the hardware reads its low 6 bits
+                    Inst::IBin(IOp::Shl | IOp::Shr, IntTy { bits: 64, .. }, _, x, y) if x != y => low[0] = (y.0, 8),
+                    _ => {}
                 }
-                Inst::IBinI(op, it, _, x, _) if narrow_wrap(op) && it.bits < 64 => low[0] = (x.0, it.bits),
-                Inst::INeg(it, _, x) | Inst::INot(it, _, x) if it.bits < 64 => low[0] = (x.0, it.bits),
-                Inst::Conv(Conv::IntToInt(it), _, x) => low[0] = (x.0, it.bits),
-                // a 64-bit shift's count: the hardware reads its low 6 bits
-                Inst::IBin(IOp::Shl | IOp::Shr, IntTy { bits: 64, .. }, _, x, y) if x != y => low[0] = (y.0, 8),
-                _ => {}
+                crate::regalloc::for_uses(i, |u| {
+                    let u = u.0 as usize;
+                    if ok[u] && !low.iter().any(|&(v, n)| v as usize == u && n > 0 && n <= bits[u]) {
+                        ok[u] = false;
+                        changed = true;
+                    }
+                });
             }
-            crate::regalloc::for_uses(i, |u| {
-                let u = u.0 as usize;
-                if !low.iter().any(|&(v, n)| v as usize == u && n > 0 && n <= bits[u]) {
-                    ok[u] = false;
-                }
-            });
+            crate::regalloc::term_uses(&b.term, &mut tu);
+            for u in &tu {
+                ok[u.0 as usize] = false;
+            }
         }
-        crate::regalloc::term_uses(&b.term, &mut tu);
-        for u in &tu {
-            ok[u.0 as usize] = false;
+        if !changed {
+            break;
         }
     }
     ok

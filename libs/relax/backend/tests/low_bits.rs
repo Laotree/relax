@@ -69,3 +69,51 @@ fn narrow_results_read_only_low_bits() {
         assert_eq!(got, want, "x {:#x} n {:#x}", x, n);
     }
 }
+
+/// g(p, x, y): a = x as i8 - y as i8; b = a ^ 0x55 (i8); r = b as i64 (reads b's full register);
+/// c = x as i16 + y as i16; d = c | (y as i16); p[0] = d as a byte (only low bits read);
+/// returns r. An And / Or / Xor result is never re-extended, so its operands keep theirs unless
+/// the result itself reads only low bits (x64 runs these ops in 64-bit forms).
+fn build_bitwise() -> Func {
+    let i8t = IntTy { bits: 8, signed: true };
+    let i16t = IntTy { bits: 16, signed: true };
+    let w = IntTy { bits: 64, signed: true };
+    let mut f = Func::new("low_bits_bitwise".into(), 0);
+    let (p, x, y) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+    f.params = vec![p, x, y];
+    f.rets = vec![Cls::I];
+    let b = f.block();
+    let v: Vec<VReg> = (0..10).map(|_| f.vreg(Cls::I)).collect();
+    push(&mut f, b, Inst::Conv(Conv::IntToInt(i8t), v[0], x));
+    push(&mut f, b, Inst::Conv(Conv::IntToInt(i8t), v[1], y));
+    push(&mut f, b, Inst::IBin(IOp::Sub, i8t, v[2], v[0], v[1]));
+    push(&mut f, b, Inst::IBinI(IOp::Xor, i8t, v[3], v[2], 0x55));
+    push(&mut f, b, Inst::Conv(Conv::IntToInt(w), v[4], v[3]));
+    push(&mut f, b, Inst::Conv(Conv::IntToInt(i16t), v[5], x));
+    push(&mut f, b, Inst::Conv(Conv::IntToInt(i16t), v[6], y));
+    push(&mut f, b, Inst::IBin(IOp::Add, i16t, v[7], v[5], v[6]));
+    push(&mut f, b, Inst::IBin(IOp::Or, i16t, v[8], v[7], v[6]));
+    push(&mut f, b, Inst::Store(Mem::Int(1, false), p, 0, v[8]));
+    f.blocks[b as usize].term = Term::Ret(vec![v[4]]);
+    f.verify().unwrap();
+    f
+}
+
+#[test]
+fn bitwise_results_keep_operand_extension() {
+    let code = Code::new(&compile(&build_bitwise())).unwrap();
+    let run: extern "C" fn(*mut u8, i64, i64) -> i64 = unsafe { std::mem::transmute(code.ptr()) };
+    let mut s = 0x2545f4914f6cdd1du64;
+    for _ in 0..4000 {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        let (x, y) = (s as i64, s.rotate_left(23) as i64);
+        let mut byte = 0u8;
+        let got = run(&mut byte, x, y);
+        let want = ((x as i8).wrapping_sub(y as i8) ^ 0x55) as i64;
+        let c = (x as i16).wrapping_add(y as i16) | (y as i16);
+        assert_eq!(byte, c as u8);
+        assert_eq!(got, want, "x {:#x} y {:#x}", x, y);
+    }
+}
