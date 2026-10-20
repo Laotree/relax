@@ -586,3 +586,17 @@ fn the_region_bound_pairs_of_a_closure_name_the_universal_regions_of_its_type() 
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn an_opaque_types_implied_bounds_follow_its_lifetime_parameters_by_index() {
+    // The late-bound `'c` is in the opaque's contract but not among its lifetime arguments: the where
+    // clauses of `'d`/`'e` must not swap, or `'b: 'd` is assumed and the member constraint picks neither.
+    let (errors, unchecked) = borrowck_source("
+        trait Trait<'a, 'b> {}
+        impl<T> Trait<'_, '_> for T {}
+        struct Ordinary<'a>(&'a u8);
+        fn upper_bounds<'a, 'b, 'c, 'd, 'e>(a: Ordinary<'a>, b: Ordinary<'b>) -> impl Trait<'d, 'e>
+        where 'a: 'e, 'b: 'e, 'a: 'd { let p = if true { a } else { b }; p }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}

@@ -175,7 +175,9 @@ impl ImpliedBounds {
             }
             TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, args, regions: rs }) => {
                 if let Some(decl) = tcx.opaques.get(d) {
-                    let params: Vec<_> = decl.region_contract.regions.iter().map(|p| p.1).collect();
+                    // The alias's region arguments are the opaque's lifetime parameters by index (the
+                    // parent's, then the captured ones); the contract also lists late-bound ones.
+                    let params: Vec<_> = tcx.generic_indices_of(prog, *d).lifetimes.iter().map(|&i| tcx.tys.intern_region(RegionKind::ReEarlyParam(i))).collect();
                     self.nominal(tcx,&decl.region_contract,tcx.tys.list(*args),&params,*rs);
                 }
                 wf_args.extend(tcx.tys.list(*args));
