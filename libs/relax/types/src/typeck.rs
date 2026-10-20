@@ -4321,7 +4321,7 @@ impl<'a> Fcx<'a> {
 
     /// hir_ty_lowering check_generic_arg_count of a written segment against `def`'s own generics.
     /// False (reported) when the number of arguments is wrong.
-    fn check_seg_arg_count(&mut self, args: GenericArgsId, def: DefId, lo: u32) -> bool {
+    fn check_seg_arg_count(&mut self, args: GenericArgsId, def: DefId, lo: u32, method_call: bool) -> bool {
         use crate::tcx::arg_count::ArgPosition;
         let prog = self.prog;
         // (only a crate whose errors are reported validates; a call without written arguments has nothing to count)
@@ -4345,6 +4345,16 @@ impl<'a> Fcx<'a> {
         let counts = self.tcx.own_generic_counts(prog, def, early);
         let errs = self.tcx.check_generic_arg_count(prog, def, ast.gargs(args), ast, counts, pos, !matches!(ast.gargs(args), Some(GenericArgs::Angle(_))), late_bound);
         for e in &errs { self.err(lo, e.clone()); }
+        // generics.rs prohibit_explicit_late_bound_lifetimes: explicit lifetime arguments next to late-bound lifetime
+        // parameters are an error in a path (E0794) unless they name every lifetime parameter, a lint in a method call
+        if late_bound && !method_call {
+            if let Some(GenericArgs::Angle(v)) = ast.gargs(args) {
+                let written = ast.list(*v).iter().filter(|a| matches!(a, GenericArg::Lifetime(_))).count();
+                if written > 0 && Some(written) != early {
+                    self.err(lo, "E0794: cannot specify lifetime arguments explicitly if late bound lifetime parameters are present".to_string());
+                }
+            }
+        }
         let mut ok = errs.is_empty();
         // associated item constraints belong to trait paths only
         if let Some(GenericArgs::Angle(v)) = ast.gargs(args) {
@@ -4360,7 +4370,7 @@ impl<'a> Fcx<'a> {
         let seg = self.ast().segs(path.segs).get(i)?;
         let a = self.ast().gargs(seg.args())?;
         let (args_id, lo) = (seg.args(), seg.name.lo);
-        if !self.check_seg_arg_count(args_id, def, lo) { return None; }
+        if !self.check_seg_arg_count(args_id, def, lo, false) { return None; }
         let mut out = Vec::new();
         if let GenericArgs::Angle(v) = a {
             // hir_ty_lowering/generics.rs: arguments beyond the declared parameters are not
@@ -5554,6 +5564,10 @@ impl<'a> Fcx<'a> {
                 };
                 let t = self.check_expr(*x, exp_inner);
                 if *raw {
+                    // expr.rs check_named_place_expr: `&raw const <temporary>` (E0745)
+                    if self.tcx.validates(self.prog, self.file) && !self.is_named_place(*x) {
+                        self.err(self.ast().expr(*x).lo, "E0745: cannot take address of a temporary".to_string());
+                    }
                     self.tcx.tys.intern(TyKind::Ptr(*m, t))
                 } else {
                     self.tcx.tys.intern(TyKind::Ref(*m, t, self.fresh_region()))
@@ -6673,7 +6687,7 @@ impl<'a> Fcx<'a> {
         for arg in &impl_full { match *arg { crate::consts::GenericArg::Type(t) => gargs.push(t), crate::consts::GenericArg::Const(c) => gargs.push(self.tcx.tys.intern(TyKind::Const(c))), _ => {} } }
         let own = sig.n_generics - sig.n_parent_generics;
         let mut tf = Vec::new();
-        let turbofish_ok = self.check_seg_arg_count(turbofish, item, lo);
+        let turbofish_ok = self.check_seg_arg_count(turbofish, item, lo, true);
         if let (true, Some(GenericArgs::Angle(v))) = (turbofish_ok, self.ast().gargs(turbofish)) {
             for g in self.ast().list(*v) {
                 if let Some(lt) = self.generic_arg(g, item, self.tcx.fn_sig(self.prog, item).unwrap().n_parent_generics as usize + tf.len()) {
@@ -6966,7 +6980,7 @@ impl<'a> Fcx<'a> {
     fn check_trait_method_call(&mut self, e: ExprId, item: DefId, imp: DefId, self_ty: TyId, derefs: usize, turbofish: GenericArgsId, args: &[ExprId], lo: u32, method_expected: Option<TyId>) -> TyId {
         let error = self.tcx.tys.error;
         let mut tf = Vec::new();
-        let turbofish_ok = self.check_seg_arg_count(turbofish, item, lo);
+        let turbofish_ok = self.check_seg_arg_count(turbofish, item, lo, true);
         if let (true, Some(GenericArgs::Angle(v))) = (turbofish_ok, self.ast().gargs(turbofish)) {
             for g in self.ast().list(*v) {
                 if let Some(lt) = self.generic_arg(g, item, self.tcx.fn_sig(self.prog, item).unwrap().n_parent_generics as usize + tf.len()) {
@@ -7227,6 +7241,23 @@ impl<'a> Fcx<'a> {
         if let Err(code) = entry(p, lo_tok, hi_tok, &split, 0) {
             let what = match code { "E0805" => "malformed `cfg` macro input", "E0537" => "invalid predicate", _ => "malformed `cfg` macro input" };
             self.err(pos, format!("{}: {}", code, what));
+        }
+    }
+
+    /// rustc_hir `Expr::is_place_expr` with `check_named_place_expr`'s projection rule: a place based on a local or
+    /// static, or containing a dereference.
+    fn is_named_place(&self, e: ExprId) -> bool {
+        match self.ast().expr(e).kind {
+            ExprKind::Paren(x) => self.is_named_place(x),
+            ExprKind::Path(_) => match self.b.res.get(&e.0) {
+                Some(Res::Local(_)) | Some(Res::Err) | None => true,
+                Some(Res::Def(d)) => matches!(self.prog.def(*d).kind, DefKind::Static | DefKind::ForeignStatic),
+                Some(Res::ConstParam(_)) => false,
+            },
+            ExprKind::Unary(UnOp::Deref, _) => true,
+            ExprKind::Field(b, _) | ExprKind::TupleField(b, _) => self.b.field_idx.get(&e.0).is_some_and(|f| f.0 > 0) || self.is_named_place(b),
+            ExprKind::Index(b, _) => self.is_named_place(b),
+            _ => false,
         }
     }
 
