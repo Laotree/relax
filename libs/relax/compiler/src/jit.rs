@@ -192,6 +192,8 @@ pub struct Rt {
 /// `Rt` as symbols (syms.rs): what lowering and glue put into RIR.
 #[derive(Clone, Copy)]
 pub struct RtSyms {
+    /// the start of every thread's thread-local block (offset 0): `Inst::TlsAddr` of it is the block's address
+    pub tls_base: crate::rir::Sym,
     pub fmt_str: crate::rir::Sym,
     pub fmt_int: crate::rir::Sym,
     pub fmt_float: crate::rir::Sym,
@@ -1096,6 +1098,9 @@ fn install_ice_hook() {
             }
             return;
         }
+        // speculative work on an ahead helper: its panics are caught and the locked build redoes
+        // (and reports) that body, so they are not diagnostics
+        if std::thread::current().name().is_some_and(|n| n.starts_with("run-ahead")) { return; }
         prev(info);
     }));
 }
@@ -2382,7 +2387,7 @@ impl Unit {
             static_spans: Default::default(),
             sites: Default::default(),
             site_ix: Default::default(),
-            rs: RtSyms { fmt_str: crate::rir::Sym::new(0), fmt_int: crate::rir::Sym::new(0), fmt_float: crate::rir::Sym::new(0), fmt_print: crate::rir::Sym::new(0), panic_site: crate::rir::Sym::new(0), panic_bounds: crate::rir::Sym::new(0), str_eq: crate::rir::Sym::new(0), fmod: crate::rir::Sym::new(0), fmodf: crate::rir::Sym::new(0), panic_impl: crate::rir::Sym::new(0), thread_run: crate::rir::Sym::new(0), catch_panic: crate::rir::Sym::new(0), args: crate::rir::Sym::new(0), memcpy: crate::rir::Sym::new(0), memmove: crate::rir::Sym::new(0), memset: crate::rir::Sym::new(0), fmt_push: crate::rir::Sym::new(0), fmt_pop: crate::rir::Sym::new(0), resume: crate::rir::Sym::new(0), land: crate::rir::Sym::new(0), panicking: crate::rir::Sym::new(0), rethrow: crate::rir::Sym::new(0) },
+            rs: RtSyms { tls_base: crate::rir::Sym::new(0), fmt_str: crate::rir::Sym::new(0), fmt_int: crate::rir::Sym::new(0), fmt_float: crate::rir::Sym::new(0), fmt_print: crate::rir::Sym::new(0), panic_site: crate::rir::Sym::new(0), panic_bounds: crate::rir::Sym::new(0), str_eq: crate::rir::Sym::new(0), fmod: crate::rir::Sym::new(0), fmodf: crate::rir::Sym::new(0), panic_impl: crate::rir::Sym::new(0), thread_run: crate::rir::Sym::new(0), catch_panic: crate::rir::Sym::new(0), args: crate::rir::Sym::new(0), memcpy: crate::rir::Sym::new(0), memmove: crate::rir::Sym::new(0), memset: crate::rir::Sym::new(0), fmt_push: crate::rir::Sym::new(0), fmt_pop: crate::rir::Sym::new(0), resume: crate::rir::Sym::new(0), land: crate::rir::Sym::new(0), panicking: crate::rir::Sym::new(0), rethrow: crate::rir::Sym::new(0) },
             syms: crate::syms::Syms::new(syms_base, rw_base),
             cache: None,
             pending_cache_records: Vec::new(),
@@ -2526,6 +2531,7 @@ impl Unit {
             fmod: u.syms.intern(crate::syms::SymKind::Rt("fmod"), u.rt.fmod),
             fmodf: u.syms.intern(crate::syms::SymKind::Rt("fmodf"), u.rt.fmodf),
             panic_impl: u.syms.intern(crate::syms::SymKind::Rt("panic_impl"), u.rt.panic_impl),
+            tls_base: u.syms.intern(crate::syms::SymKind::Rt("tls_base"), 0),
             thread_run: u.syms.intern(crate::syms::SymKind::Rt("thread_run"), u.rt.thread_run),
             catch_panic: u.syms.intern(crate::syms::SymKind::Rt("catch_panic"), u.rt.catch_panic),
             args: u.syms.intern(crate::syms::SymKind::Rt("args"), u.rt.args),
@@ -2794,7 +2800,58 @@ impl Unit {
         let k = if missing { crate::syms::SymKind::Missing(name) } else { crate::syms::SymKind::Foreign(name) };
         let s = self.syms.intern(k, a);
         crate::zone_alloc::kept_with(|| { self.syms.foreign_defs.lock().unwrap_or_else(|e| e.into_inner()).entry(s.id).or_insert(d); });
+        if !missing {
+            self.note_sincos(&self.link_name(d));
+        }
         Some(s)
+    }
+
+    /// On a target whose libm has a combined `sincos` routine (Darwin arm64), registers it with the
+    /// optimiser once the program names both `sinf` and `cosf` (or `sin` and `cos`): rustc's LLVM
+    /// calls it for a sin and a cos of the same value in one block (opt::fuse_sincos).
+    fn note_sincos(&self, name: &str) {
+        if !cfg!(all(target_vendor = "apple", target_arch = "aarch64")) {
+            return;
+        }
+        let (sin, cos, both, wide) = match name {
+            "sinf" | "cosf" => ("sinf", "cosf", "__sincosf_stret", false),
+            "sin" | "cos" => ("sin", "cos", "__sincos_stret", true),
+            _ => return,
+        };
+        let (Some(sn), Some(cs)) = (self.syms.find_foreign(sin), self.syms.find_foreign(cos)) else { return };
+        let p = unsafe { os::proc::find(format!("{}\0", both).as_ptr()) };
+        if p.is_null() {
+            return;
+        }
+        crate::opt::set_sincos(wide, sn, cs, self.syms.intern(crate::syms::SymKind::Foreign(both.to_string()), p as u64));
+    }
+
+    /// Whether `func` calls std's `sin` and `cos` methods (before inlining): such a function is
+    /// optimised from its first compile, because only the optimiser pairs the calls like rustc's
+    /// LLVM, and a baseline version would compute other bits than the optimised one.
+    fn pairs_sincos(&self, func: &crate::rir::Func) -> bool {
+        if !cfg!(all(target_vendor = "apple", target_arch = "aarch64")) {
+            return false;
+        }
+        let (mut sin, mut cos) = (false, false);
+        for b in &func.blocks {
+            for i in &b.insts {
+                let crate::rir::Inst::Call(crate::rir::Callee::Fn(c), a, r) = i else { continue };
+                if a.len() != 1 || r.len() != 1 {
+                    continue;
+                }
+                let FnKey::Inst(d, _) = &self.fns[*c as usize].key else { continue };
+                if self.prog.def(*d).krate != self.core_crate {
+                    continue;
+                }
+                match self.prog.name(*d) {
+                    "sin" => sin = true,
+                    "cos" => cos = true,
+                    _ => {}
+                }
+            }
+        }
+        sin && cos
     }
 
     /// The slot whose thunk is at `addr`.
@@ -4000,6 +4057,16 @@ impl Unit {
             let def = self.prog.def(d);
             let at = self.pos_str(def.file, self.prog.files[def.file as usize].ast.item(def.item).lo);
             self.note_error(format!("{}: E0391: cycle detected when evaluating the initializer of `{}`", at, self.prog.def_path(d)));
+            self.const_failed.insert((d, args));
+            return None;
+        }
+        // rustc's query depth limit (#![recursion_limit], 128 by default): a constant whose
+        // evaluation needs the same item at ever deeper arguments
+        let limit = self.prog.crates[self.prog.def(d).krate as usize].recursion_limit as usize;
+        if CONST_STACK.try_with(|s| s.borrow().len()).unwrap_or(0) > limit {
+            let def = self.prog.def(d);
+            let at = self.pos_str(def.file, self.prog.files[def.file as usize].ast.item(def.item).lo);
+            self.note_error(format!("{}: queries overflow the depth limit! [in {}]", at, self.prog.def_path(d)));
             self.const_failed.insert((d, args));
             return None;
         }
@@ -7083,6 +7150,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
         }
     }
     let u = &mut *up;
+    let baseline = baseline && !u.pairs_sincos(&func);
     func.baseline = baseline;
     // O2: a `#[relax(O2)]` fn built by the O2 worker (o2_thread) compiles as O1 does without
     // O3; its on-demand builds on the program's threads stay O1
@@ -7648,6 +7716,9 @@ fn baseline_rir(options: &crate::options::Options, func: &mut crate::rir::Func, 
 fn tier0_codegen_rir<'a>(options: &crate::options::Options, rir: &'a crate::rir::Func, fold: bool, rotate: bool) -> std::borrow::Cow<'a, crate::rir::Func> {
     if rir.baseline { return std::borrow::Cow::Borrowed(rir); }
     let mut cg = rir.clone();
+    // field promotion belongs to the code made from the RIR, not to the RIR callers inline: it
+    // makes a function bigger, and the inliner reads sizes
+    if fold && !crate::opt::opt_off(options, "-promote") { crate::opt::promote_loop_memory(&mut cg); }
     if fold { crate::opt::addr_modes(&mut cg); }
     if rotate && layout_for(options, &cg.name) { crate::opt::rotate_loops(&mut cg); }
     std::borrow::Cow::Owned(cg)
@@ -8776,6 +8847,9 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
         verify_pass(func, "vector slot cleanup");
     }
     crate::opt::compact_slots(func);
+    if cfg.licm && !crate::opt::opt_off(options, "-promote") && crate::opt::promote_loop_memory(func) {
+        verify_pass(func, "promote_loop_memory");
+    }
     if cfg.layout && layout_for(options, name) {
         crate::opt::rotate_loops(func);
     }
@@ -9133,6 +9207,25 @@ fn profile_write() {
     }
 }
 
+/// MAKEPAD_RUN_O3_PROGRESS=<path>: the O3 state as one line `pending installs` rewritten every 100 ms,
+/// for a benchmark that times only once the optimised code has settled: `pending` = builds queued or
+/// running, plus one while the startup phase holds the workers; `installs` = O3 installs so far.
+/// The file exists from the first write on; a program that never reads it pays nothing.
+fn o3_progress_write(last: &mut std::time::Instant) {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_O3_PROGRESS").ok().filter(|s| !s.is_empty()))) else { return };
+    if last.elapsed() < std::time::Duration::from_millis(100) {
+        return;
+    }
+    *last = std::time::Instant::now();
+    let pending = TIER_QUEUE.lock().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len()) + usize::from(startup_holds_tier1());
+    let line = format!("{} {}\n", pending, TIER1_INSTALLS.load(Ordering::Relaxed));
+    let tmp = format!("{}.tmp", path);
+    if std::fs::write(&tmp, line).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 fn sampler_thread() {
     // macOS coalesces the timers of background-QoS threads (a process started from a
     // daemon or a script): a 2 ms sleep then lasts tens of ms and loops never get enough
@@ -9145,6 +9238,7 @@ fn sampler_thread() {
     let mut selfs: Vec<os::sample::Sample> = Vec::with_capacity(1024);
     let mut last = std::time::Instant::now();
     let mut last_write = std::time::Instant::now();
+    let mut last_progress = std::time::Instant::now();
     let periods = sample_periods();
     let mut period_index = 0;
     loop {
@@ -9155,6 +9249,7 @@ fn sampler_thread() {
         let sleep_ms = if cfg!(target_os = "linux") && periods.len() > 1 { period.min(32) } else { period };
         wait.sleep(sleep_ms);
         if TIER_STOP.load(Ordering::SeqCst) { break; }
+        o3_progress_write(&mut last_progress);
         // Direct-PC samplers use the time since the previous wake. Linux's ring
         // supplies each observation's own period instead. A sleep the OS stretched
         // (timer coalescing of low-QoS / nice'd processes: 2 ms became ~18 ms on the bench
