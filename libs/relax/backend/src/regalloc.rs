@@ -1718,6 +1718,8 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
             bad[p.0 as usize] = true;
         }
         let mut cand: Vec<(u32, Remat)> = Vec::new();
+        // per vreg: (constant, number of Iconst definitions, all the same constant)
+        let mut kdefs: Vec<(i64, u32, bool)> = vec![(0, 0, true); nv];
         let mut movs: Vec<(u32, u32)> = Vec::new();
         // call arguments and returned values (no Remat::Offset for them)
         let mut argret = vec![false; nv];
@@ -1728,7 +1730,16 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
             for i in &b.insts {
                 for_defs(i, |d| ndef[d.0 as usize] += 1);
                 match i {
-                    Inst::Iconst(d, k) => cand.push((d.0, Remat::Const(*k))),
+                    Inst::Iconst(d, k) => {
+                        cand.push((d.0, Remat::Const(*k)));
+                        let e = &mut kdefs[d.0 as usize];
+                        if e.1 == 0 {
+                            e.0 = *k;
+                        } else if e.0 != *k {
+                            e.2 = false;
+                        }
+                        e.1 += 1;
+                    }
                     Inst::SlotAddr(d, n) => cand.push((d.0, Remat::Slot(*n))),
                     Inst::Addr(d, a) if crate::rir::SymClass::of(cfg.sym_class, a.id) != crate::rir::SymClass::Domain => cand.push((d.0, Remat::Addr(*a))),
                     Inst::FnAddr(d, n) => cand.push((d.0, Remat::FnAddr(*n))),
@@ -1800,7 +1811,9 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
                     continue;
                 }
             }
-            if ndef[d] == 1 && !bad[d] && f.vregs[d] == Cls::I {
+            // one definition, or every definition the same constant (built on several paths)
+            let same_const = matches!(i, Remat::Const(_)) && kdefs[d].2 && kdefs[d].1 == ndef[d];
+            if (ndef[d] == 1 || same_const) && !bad[d] && f.vregs[d] == Cls::I {
                 base_only[d] = !nonbase[d] && matches!(i, Remat::Slot(..));
                 remat[d] = i;
             }
