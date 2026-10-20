@@ -452,6 +452,12 @@ impl Tcx {
                 continue;
             }
             let Some(&st) = self.impl_self.get(&im.def) else { continue };
+            // inherent_impls.rs check_item: an inherent impl names a nominal type, not a projection, an opaque or a parameter
+            if !self.impl_trait.contains_key(&im.def) && !prog.files[im.file as usize].ast.as_impl(&prog.files[im.file as usize].ast.item(im.item).kind).is_some_and(|i| i.trait_.is_some())
+                && matches!(self.tys.kind(st), TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. } | AliasTyKind::Opaque { .. }, .. })) {
+                errors.push((im.def, prog.files[im.file as usize].ast.item(im.item).lo, "E0118: no nominal type found for inherent implementation -- implement a trait or new type instead".to_string()));
+                continue;
+            }
             // (a projection self type is checked as what it normalizes to)
             let st = if self.tys.has_assoc(st) { self.try_normalize_erasing_regions(prog, typing_env, st).unwrap_or(st) } else { st };
             let item = prog.files[im.file as usize].ast.item(im.item);
