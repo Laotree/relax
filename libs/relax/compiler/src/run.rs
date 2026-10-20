@@ -1000,7 +1000,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // declaration collection lowers: the crates are marked before it runs (a run marks none).
     if check {
         let checked = if watch || root_only || session.is_some() { vec![root] } else if selftest || workspace_check { crate::check::workspace_crates(&prog, root) } else { crate::check::app_crates(&prog, root) };
-        for k in checked { prog.crates[k as usize].validate = true; }
+        let mut own = vec![false; prog.crates.len()];
+        for k in checked { prog.crates[k as usize].validate = true; own[k as usize] = true; }
+        // rustc's import resolution replayed over the checked crates: the glob ambiguities it finds
+        // answer the name lookups of the declarations collected next
+        prog.own_crates = own.clone();
+        relax_types::lint::enable();
+        prog.run_import_sim(&own);
     }
     let mut tcx = collected_tcx.take().unwrap_or_else(crate::tcx::Tcx::new);
     // MAKEPAD_RUN_PERTURB: type ids shift (code must not depend on them; syms.rs reloc_sig)
@@ -3039,8 +3045,8 @@ fn summary_inner(why: &str) {
     if !SILENT.load(Ordering::Relaxed) {     verbose!("makepad-run: compile timeline (100 ms buckets):{}", tl); }
         if std::env::var("MAKEPAD_RUN_PASS_TIMES").is_ok() {
             let mut passes = String::new();
-            for i in 0..crate::opt::PASS_NAMES.len() {
-                passes.push_str(&format!("{} {:.0}  ", crate::opt::PASS_NAMES[i], crate::opt::PASS_NS[i].load(Ordering::Relaxed) as f64 / 1e6));
+            for i in 0..relax_backend::stats::PASS_NAMES.len() {
+                passes.push_str(&format!("{} {:.0}  ", relax_backend::stats::PASS_NAMES[i], relax_backend::stats::PASS_NS[i].load(Ordering::Relaxed) as f64 / 1e6));
             }
     if !SILENT.load(Ordering::Relaxed) {         verbose!("makepad-run: opt passes (cpu ms): {}", passes); }
             verbose!("makepad-run: invokes {} seen, {} made plain calls", crate::opt::INVOKES_SEEN.load(Ordering::Relaxed), crate::opt::INVOKES_DEMOTED.load(Ordering::Relaxed));
