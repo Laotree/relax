@@ -72,7 +72,6 @@ pub mod surface;
 pub mod bitflags_native;
 pub mod source_context;
 pub mod rs_index;
-pub mod rs_index_old; // TEMPORARY (verification oracle, deleted before the hand-in)
 pub mod rs_outline;
 
 pub mod parse_work;

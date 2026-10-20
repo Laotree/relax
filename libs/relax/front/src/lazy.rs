@@ -851,7 +851,10 @@ impl Plan {
                 let active = crate::preload::configured_tokens(&source.src, &tokens, cfg);
                 // Independent full token-tree indexing checks that skipping body
                 // groups did not erase a module, import, impl head or declaration.
-                let eager = crate::rs_index::of_tokens(&source.src, &active).ok_or_else(|| format!("{path}: unbalanced delimiters"))?;
+                let stream = crate::pm_tokens::from_toks(&source.src, &active, &|lo, hi| crate::pm_tokens::Span {
+                    lo, hi, ..crate::pm_tokens::Span::DUMMY
+                }).map_err(|e| e.to_string())?;
+                let eager = crate::rs_index::of_tokens(&stream);
                 if outline.index != eager { return Err(format!("MAKEPAD_RUN_LAZY_VERIFY: Rust outline differs: {path}")); }
             }
         }
@@ -1152,7 +1155,8 @@ fn unindexed_items(src: &[u8], toks: &[Tok], names: &Names, ci: usize, module: &
             && matches!(toks[i - 1].kind, T::OpenBrace | T::Semi | T::CloseBrace | T::CloseBracket) {
             let Some(open) = (i + 1..toks.len()).find(|&at| toks[at].kind == T::OpenBrace) else { return true; };
             let end = demand::close(toks, open);
-            let local = crate::rs_index::of_tokens(src, &toks[i..=end])
+            let local = crate::pm_tokens::from_toks(src, &toks[i..=end], &|_, _| crate::pm_tokens::Span::DUMMY).ok()
+                .map(|tokens| crate::rs_index::of_tokens(&tokens))
                 .is_some_and(|index| index.impls.len() == 1 && local_types.iter().any(|(_, name)|
                     index.impls[0].self_path.split('<').next().is_some_and(|head| head.trim() == name)));
             // An impl of a type declared in this body cannot be observed until

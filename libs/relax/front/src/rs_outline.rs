@@ -53,7 +53,25 @@ fn verify_elision(src: &[u8], tokens: &[Tok], got: &NameIndex) {
 }
 
 fn index(src: &[u8], tokens: &[Tok]) -> Option<NameIndex> {
-    crate::rs_index::of_tokens(src, tokens)
+    // The name index reads no doc comments (an explicit #[doc = ...] attribute is a
+    // token, not a comment): blank every comment between tokens and drop doc-comment
+    // tokens, so building the token trees does not turn each doc line into an
+    // attribute (positions are unchanged).
+    let kept;
+    let tokens = if tokens.iter().any(|t| t.kind == T::DocComment) {
+        kept = tokens.iter().copied().filter(|t| t.kind != T::DocComment).collect::<Vec<_>>();
+        &kept[..]
+    } else { tokens };
+    let mut copy = None::<Vec<u8>>;
+    for w in tokens.windows(2) {
+        let (lo, hi) = (w[0].hi as usize, w[1].lo as usize);
+        if lo < hi && src[lo..hi].contains(&b'/') { copy.get_or_insert_with(|| src.to_vec())[lo..hi].fill(b' '); }
+    }
+    let src = copy.as_deref().unwrap_or(src);
+    let stream = crate::pm_tokens::from_toks(src, tokens, &|lo, hi| crate::pm_tokens::Span {
+        lo, hi, ..crate::pm_tokens::Span::DUMMY
+    }).ok()?;
+    Some(crate::rs_index::of_tokens(&stream))
 }
 
 /// The closing index of each opening delimiter (u32: a file's token indexes fit), None when the

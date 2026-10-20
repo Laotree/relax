@@ -660,7 +660,8 @@ impl Names {
             if tokens[at].kind == T::KwImpl {
                 let Some(open) = (at + 1..tokens.len()).find(|&i| tokens[i].kind == T::OpenBrace) else { return None; };
                 let end = close(&tokens, open);
-                let Some(index) = crate::rs_index::of_tokens(bytes, &tokens[at..=end]) else { return None; };
+                let Ok(stream) = crate::pm_tokens::from_toks(bytes, &tokens[at..=end], &|_, _| crate::pm_tokens::Span::DUMMY) else { return None; };
+                let index = crate::rs_index::of_tokens(&stream);
                 if index.impls.len() != 1 || !self.type_symbols.contains(&format!("{module}::{}", index.impls[0].self_path)) { return None; }
                 at = end + 1;
                 continue;
