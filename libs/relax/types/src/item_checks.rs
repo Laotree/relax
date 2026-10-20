@@ -129,10 +129,12 @@ pub fn private_assoc_types(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<Strin
         }
     }
     let mut errors = Vec::new();
+    // (a definition an expansion wrote has no visibility the AST states: its checks are skipped)
+    let written = |d: DefId| { let def = prog.def(d); def.item.0 != u32::MAX && prog.files.get(def.file as usize).is_some_and(|f| f.ast.items.get(def.item.0 as usize).is_some_and(|it| it.lo < f.src_len)) };
     for i in 0..prog.defs.len() {
         let imp = DefId(i as u32);
         let idef = prog.def(imp);
-        if idef.kind != DefKind::Impl || !own.get(idef.krate as usize).copied().unwrap_or(false) { continue; }
+        if idef.kind != DefKind::Impl || !own.get(idef.krate as usize).copied().unwrap_or(false) || !written(imp) { continue; }
         let Some(&tr) = tcx.impl_trait.get(&imp) else { continue };
         if !own.get(prog.def(tr).krate as usize).copied().unwrap_or(false) && prog.def(tr).krate != idef.krate { /* foreign trait: its vis is public */ }
         // the impl's visibility
@@ -143,9 +145,14 @@ pub fn private_assoc_types(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<Strin
         for a in tcx.impl_trait_ref(prog, imp, &args).args.iter() {
             if let crate::consts::GenericArg::Type(t) = a { adts(tcx, *t, &mut tys, 0); }
         }
+        let mut known = written(tr) || !own.get(prog.def(tr).krate as usize).copied().unwrap_or(false);
         for d in tys {
-            if own.get(prog.def(d).krate as usize).copied().unwrap_or(false) { vis = prog.vis_min(vis, prog.def_item_vis(d)); }
+            if own.get(prog.def(d).krate as usize).copied().unwrap_or(false) {
+                known &= written(d);
+                vis = prog.vis_min(vis, prog.def_item_vis(d));
+            }
         }
+        if !known { continue; }
         for j in 0..prog.defs.len() {
             let ad = DefId(j as u32);
             let adef = prog.def(ad);
@@ -154,7 +161,7 @@ pub fn private_assoc_types(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<Strin
             let mut used = Vec::new();
             adts(tcx, t, &mut used, 0);
             for u in used {
-                if !own.get(prog.def(u).krate as usize).copied().unwrap_or(false) { continue; }
+                if !own.get(prog.def(u).krate as usize).copied().unwrap_or(false) || !written(u) { continue; }
                 if prog.vis_wider(vis, prog.def_item_vis(u)) {
                     let pos = prog.files[adef.file as usize].ast.item(adef.item).name.lo;
                     errors.push(prog.record_error(adef.file, pos, "typeck", format!("E0446: private type `{}` in public interface", prog.syms.str(prog.def(u).name))));
