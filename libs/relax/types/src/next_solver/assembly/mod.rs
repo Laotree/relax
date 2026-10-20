@@ -228,16 +228,10 @@ impl EvalCtxt<'_, '_> {
         for (i, c) in candidates.iter().enumerate() {
             if c.result.value.certainty.is_yes() && has_no_inference_or_external_constraints(&self.delegate.tcx.tys, &c.result) { return Some((c.result.clone(), Some(i))); }
         }
+        // rustc try_merge_candidates: equal responses, region constraints included (two
+        // where-clauses differing only in a lifetime stay ambiguous)
         let one = candidates.first()?;
-        let mut one_no_regions = one.result.clone(); one_no_regions.value.external_constraints.region_constraints.clear();
-        let mut equal_regions = true;
-        for c in &candidates[1..] {
-            let mut no_regions = c.result.clone(); no_regions.value.external_constraints.region_constraints.clear();
-            if no_regions != one_no_regions { return None; }
-            equal_regions &= c.result.value.external_constraints.region_constraints == one.result.value.external_constraints.region_constraints;
-        }
-        if equal_regions { return Some((one.result.clone(), None)); }
-        for c in candidates { if c.result.value.external_constraints.region_constraints.is_empty() { return Some((c.result.clone(), None)); } }
+        if candidates[1..].iter().all(|c| c.result == one.result) { return Some((one.result.clone(), None)); }
         None
     }
     pub(super) fn flounder(&self, candidates: &[Candidate]) -> QueryResultOrRerunNonErased {

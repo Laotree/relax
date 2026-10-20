@@ -121,11 +121,13 @@ impl TypeFolder for ReplaceProjectionWith<'_, '_, '_> {
     fn fold_ty(&mut self, tys: &Types, ty: TyId, depth: u32) -> TyId {
         if let TyKind::Alias(_, a) = tys.kind(ty) {
             if matches!(a.kind, AliasTyKind::Projection { .. }) && tys.list(a.args)[0] == self.self_ty {
-                let mut matching = None; let target = self.ecx.alias_args(&AliasTerm::Ty(ty)); let mut found_def = false;
+                // rustc ReplaceProjectionWith::try_eagerly_replace_alias: the projection bounds of
+                // the object that may match the alias; two are ambiguous, one replaces it. (A
+                // projection no bound matches is left alone: the object type is already in error.)
+                let mut matching = None; let target = self.ecx.alias_args(&AliasTerm::Ty(ty));
                 for p in self.mapping {
                     let PredicateKind::Clause(ClauseKind::Projection(source)) = &p.kind else { continue; };
                     if self.ecx.alias_args(&source.projection_term).0 != target.0 { continue; }
-                    found_def = true;
                     let result = self.ecx.probe().enter_without_propagated_nested_goals(|ecx| {
                         let PredicateKind::Clause(ClauseKind::Projection(p)) = ecx.delegate.instantiate_predicate_binder_with_infer(p) else { unreachable!() };
                         ecx.eq_args(self.env, &ecx.alias_args(&p.projection_term).1, &target.1)?;
@@ -133,8 +135,7 @@ impl TypeFolder for ReplaceProjectionWith<'_, '_, '_> {
                     });
                     if result.is_ok() { if matching.is_some() { self.ambiguous = true; return ty; } matching = Some(p); }
                 }
-                if found_def {
-                    let p = matching.expect("object projection replacement");
+                if let Some(p) = matching {
                     let PredicateKind::Clause(ClauseKind::Projection(p)) = self.ecx.delegate.instantiate_predicate_binder_with_infer(p) else { unreachable!() };
                     if self.ecx.eq_args(self.env, &self.ecx.alias_args(&p.projection_term).1, &target.1).is_err() { self.failed = true; return ty; }
                     let Term::Ty(value) = p.term else { unreachable!() }; return value;
