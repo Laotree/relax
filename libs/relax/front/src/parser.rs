@@ -3225,6 +3225,10 @@ impl<'a> Parser<'a> {
     fn maybe_range_pat(&mut self, start: ExprId) -> PResult<Option<Pat>> {
         match self.kind() {
             T::DotDotEq | T::DotDotDot => {
+                // rustc_parse: `...` is a hard error in range patterns from edition 2021 (the edition of the written token)
+                if self.kind() == T::DotDotDot && self.edition >= 2021 && (self.toks.at(self.pos).lo as usize) < self.src.len() {
+                    return self.err("E0783: `...` range patterns are deprecated");
+                }
                 self.pos += 1;
                 let end = self.pat_range_end()?;
                 Ok(Some(Pat::Range(Some(start), Some(end), true)))

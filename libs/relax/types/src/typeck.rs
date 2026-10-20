@@ -4740,6 +4740,14 @@ impl<'a> Fcx<'a> {
             ExprKind::Path(path) => {
                 let (r, t) = self.resolve_value_path(path, e.0, false);
                 self.b.res.insert(e.0, r);
+                // expr.rs check_expr_path: a struct-like variant is no value (E0533); a struct is one for resolve (E0423)
+                if let Res::Def(d) = r {
+                    if self.tcx.validates(self.prog, self.file) && matches!(self.value_ctor_shape(d), Some(s) if s > 1) {
+                        let what = if self.prog.def(d).kind == DefKind::Variant { ("E0533", "struct variant") } else { ("E0423", "struct") };
+                        self.err(lo, format!("{}: expected value, found {} `{}`", what.0, what.1, crate::tcx::path_str(self.prog, self.file, path)));
+                        return error;
+                    }
+                }
                 t
             }
             ExprKind::Paren(x) => self.check_expr(*x, expected),

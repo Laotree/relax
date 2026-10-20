@@ -1080,6 +1080,19 @@ pub fn repr_checks(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
     if let (ItemKind::Enum(r), Some(pos)) = (item.kind, first_repr) {
         if ast.list(ast.row(r).variants).is_empty() { err(pos, "E0084: unsupported representation for zero-variant enum".to_string()); }
     }
+    // check_enum: explicit discriminants next to non-unit variants need a primitive representation (E0732)
+    if let ItemKind::Enum(r) = item.kind {
+        if ints.is_empty() {
+            let vs = ast.list(ast.row(r).variants);
+            let unit = |v: &crate::ast::Variant| matches!(v.data, crate::ast::VariantData::Unit);
+            let non_unit = vs.iter().any(|v| !unit(v));
+            let disr_non_unit = vs.iter().any(|v| !unit(v) && v.disc.is_some());
+            let disr_unit = vs.iter().any(|v| unit(v) && v.disc.is_some());
+            if disr_non_unit || (disr_unit && non_unit) {
+                err(item.name.lo, "E0732: `#[repr(inttype)]` must be specified for enums with explicit discriminants and non-unit variants".to_string());
+            }
+        }
+    }
     if transparent && (c || !packed.is_empty() || aligned || !ints.is_empty()) {
         err(first_pos, "E0692: transparent struct cannot have other repr hints".to_string());
     }
