@@ -10,6 +10,7 @@ use crate::fxhash::HashMap;
 
 mod collected;
 mod privacy;
+pub use privacy::PrivacyError;
 mod attrs;
 mod validate;
 

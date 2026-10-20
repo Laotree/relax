@@ -11,6 +11,9 @@ pub struct PrivacyError {
     pub ext: bool,
     /// not private but ambiguous (E0659): two glob imports bring different items
     pub ambiguous: bool,
+    /// the ambiguity is inherited through a glob whose own module is ambiguous: the lint
+    /// `ambiguous_glob_imports` (deny by default), not a hard error
+    pub lint: bool,
 }
 
 impl Program {
@@ -75,15 +78,16 @@ impl Program {
             }
             if visible {
                 for &ns in nss {
-                    if self.glob_ambiguous(m, name, ns, from, false) {
-                        return Some(PrivacyError { name, def: next.unwrap_or(cur), import: true, ext: false, ambiguous: true });
+                    let ambig = self.glob_ambiguity(m, name, ns, from, false);
+                    if ambig != 0 {
+                        return Some(PrivacyError { name, def: next.unwrap_or(cur), import: true, ext: false, ambiguous: true, lint: ambig == 2 });
                     }
                 }
             }
             if !visible {
                 if let Some((fd, ns)) = hidden {
                     let flags = self.mods[m as usize].import_pub.get(&(name, ns)).copied();
-                    return Some(PrivacyError { name, def: fd, import: flags.is_some(), ext: flags.map_or(false, |f| f & IMPORT_EXTERN != 0), ambiguous: false });
+                    return Some(PrivacyError { name, def: fd, import: flags.is_some(), ext: flags.map_or(false, |f| f & IMPORT_EXTERN != 0), ambiguous: false, lint: false });
                 }
             }
             cur = next?;
@@ -95,27 +99,33 @@ impl Program {
     /// items (rustc_resolve: a glob binding that conflicts with another glob's is ambiguous
     /// when used; E0659). `from`: the module the name is used from.
     pub fn glob_ambiguous(&self, m: u32, name: Sym, ns_type: bool, from: u32, skip_direct: bool) -> bool {
-        self.glob_ambiguous_in(m, name, ns_type, from, skip_direct, &mut Vec::new())
+        self.glob_ambiguity(m, name, ns_type, from, skip_direct) != 0
     }
 
-    /// `glob_ambiguous`, also true when a glob's module is itself ambiguous for `name` (its
-    /// glob imports clash: the binding the outer glob re-exports is ambiguous too).
-    fn glob_ambiguous_in(&self, m: u32, name: Sym, ns_type: bool, from: u32, skip_direct: bool, seen: &mut Vec<u32>) -> bool {
+    /// 0: not ambiguous; 1: two globs of `m` bring different items; 2: only inherited through a
+    /// glob whose module is itself ambiguous for `name`.
+    pub fn glob_ambiguity(&self, m: u32, name: Sym, ns_type: bool, from: u32, skip_direct: bool) -> u8 {
+        self.glob_ambiguity_in(m, name, ns_type, from, skip_direct, &mut crate::fxhash::HashMap::default())
+    }
+
+    fn glob_ambiguity_in(&self, m: u32, name: Sym, ns_type: bool, from: u32, skip_direct: bool, seen: &mut crate::fxhash::HashMap<u32, u8>) -> u8 {
         let md = &self.mods[m as usize];
         if md.globs.is_empty() || (!skip_direct && (if ns_type { md.types.contains_key(&name) } else { md.values.contains_key(&name) })) {
-            return false;
+            return 0;
         }
-        if seen.contains(&m) { return false; }
-        seen.push(m);
+        // each module is judged once per query (the glob graph is a DAG with cycles, and a walk
+        // of all paths is exponential); a module still being judged answers 0
+        if let Some(&r) = seen.get(&m) { return r; }
+        seen.insert(m, 0);
         let mut found: Option<DefId> = None;
-        let mut ambiguous = false;
+        let mut out = 0u8;
         for &(g, _) in &md.globs {
             let gd = self.def(g);
             let r = match gd.kind {
                 DefKind::Mod => {
                     let mut q = GlobQuery { precise: true, ..Default::default() };
                     let r = self.lookup_in_module_vis(gd.sub, name, ns_type, &mut q);
-                    if r.is_some() && self.glob_ambiguous_in(gd.sub, name, ns_type, from, false, seen) { ambiguous = true; }
+                    if r.is_some() && self.glob_ambiguity_in(gd.sub, name, ns_type, from, false, seen) != 0 { out = out.max(2); }
                     r
                 }
                 DefKind::Enum => self.lookup_in_container(g, name, false).map(|d| (d, None)),
@@ -127,13 +137,13 @@ impl Program {
                 }
                 match found {
                     None => found = Some(d),
-                    Some(f) if f != d => ambiguous = true,
+                    Some(f) if f != d => out = 1,
                     _ => {}
                 }
             }
         }
-        seen.pop();
-        ambiguous
+        seen.insert(m, out);
+        out
     }
 
     /// A name used on its own: ambiguous when the scope it is found in binds it through globs only.
@@ -147,9 +157,10 @@ impl Program {
             if !skip_direct && if ns_type { md.types.contains_key(&name) } else { md.values.contains_key(&name) } {
                 return None;
             }
-            if self.glob_ambiguous(m, name, ns_type, from, skip_direct) {
+            let ambig = self.glob_ambiguity(m, name, ns_type, from, skip_direct);
+            if ambig != 0 {
                 let def = self.lookup_in_module(m, name, ns_type, &mut Vec::new())?;
-                return Some(PrivacyError { name, def, import: true, ext: false, ambiguous: true });
+                return Some(PrivacyError { name, def, import: true, ext: false, ambiguous: true, lint: ambig == 2 });
             }
             match md.lexical_parent {
                 Some(p) => m = p,
@@ -212,7 +223,7 @@ impl Program {
             } else {
                 None
             };
-            if let Some(e) = single.or_else(|| self.path_privacy(im.module, im.global, segs, ns, edition < 2018, true)) {
+            if let Some(e) = single.or_else(|| self.path_privacy(im.module, im.global, segs, ns, edition < 2018, true)).filter(|e| !e.lint) {
                 out.push(self.record_error(im.file, im.pos, "resolve", self.privacy_message(&e)));
             } else if im.glob && im.bound & BOUND_PREFIX_ONLY == 0 && self.glob_of_own_module(im, segs, edition) {
                 out.push(self.record_error(im.file, im.pos, "resolve", "E0432: unresolved import -- cannot glob-import a module into itself".to_string()));
