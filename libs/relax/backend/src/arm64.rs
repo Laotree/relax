@@ -629,6 +629,8 @@ struct Gen<'a> {
     /// bytes of callee-saved registers below fp
     saved: i64,
     slot_off: Vec<i64>,
+    /// per value: its frame position when it is a slot address (frame::slot_addr_positions)
+    slot_pos: Vec<i64>,
     block_pos: Vec<usize>,
     next_block: Vec<u32>,
     fixups: Vec<(usize, u32)>,
@@ -855,6 +857,7 @@ impl<'a> Gen<'a> {
         // the Splash VM's O3 opcode() had 1749 slots, 515 in use); slots whose lifetimes cannot
         // overlap share it (frame::slot_layout)
         let (slot_fp, mut off) = crate::frame::slot_layout(self.f, self.saved + self.al.spill_bytes as i64, !crate::stats::opt_off(options, "-slotcolor"));
+        self.slot_pos = crate::frame::slot_addr_positions(self.f, &slot_fp);
         // C ABI body: buffers that rebuild aggregate params from their registers, and the
         // buffer an aggregate result is written to before Ret loads it into registers
         let mut cbuf_fp: Vec<i64> = Vec::new();
@@ -2922,6 +2925,8 @@ impl<'a> Gen<'a> {
                 self.fin_i(*d, rd);
             }
             Inst::Call(c, args, rets) => self.call(c, args, rets),
+            // a slot copied onto its own storage (frame::slot_addr_positions): nothing moves
+            Inst::Copy(dst, src, _) if self.slot_pos[dst.0 as usize] != i64::MIN && self.slot_pos[dst.0 as usize] == self.slot_pos[src.0 as usize] => {}
             Inst::Copy(dst, src, size) if *size > 256 => {
                 // x8 = dst, x17 = src, x16 = 16-byte chunks: ldp/stp post-index loop
                 let rd = self.use_i(*dst, S0);
@@ -3435,6 +3440,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         frame: 0,
         saved: 0,
         slot_off: Vec::new(),
+        slot_pos: Vec::new(),
         block_pos: Vec::new(),
         next_block: Vec::new(),
         fixups: Vec::new(),

@@ -655,6 +655,8 @@ struct Gen<'a> {
     /// rbp offset base for spills/slots: [rbp - (saved + x)]
     saved: i32,
     slot_off: Vec<i32>,
+    /// per value: its frame position when it is a slot address (frame::slot_addr_positions)
+    slot_pos: Vec<i64>,
     block_pos: Vec<usize>,
     fixups: Vec<(usize, u32)>,
     pc_map: Vec<(u32, u64)>,
@@ -922,6 +924,7 @@ impl<'a> Gen<'a> {
         // it (frame::slot_layout)
         let (at, end) = crate::frame::slot_layout(self.f, self.al.spill_bytes as i64, !crate::stats::opt_off(options, "-slotcolor"));
         self.slot_off.extend(at.iter().map(|&x| x as i32));
+        self.slot_pos = crate::frame::slot_addr_positions(self.f, &at);
         let mut off = end as i32;
         off = (off + 7) / 8 * 8;
         // C ABI body: buffers rebuilding aggregate params from registers, the result buffer
@@ -2613,6 +2616,11 @@ impl<'a> Gen<'a> {
             }
             Inst::Call(c, args, rets) => self.call(options, c, args, rets),
             Inst::Copy(dst, src, size) => {
+                // a slot copied onto its own storage (frame::slot_addr_positions): nothing moves
+                let p = self.slot_pos[dst.0 as usize];
+                if p != i64::MIN && p == self.slot_pos[src.0 as usize] {
+                    return;
+                }
                 let rd = self.use_i(options, *dst, R10);
                 let rs = self.use_i(options, *src, R11);
                 if *size >= 32 && *size <= 512 {
@@ -4320,6 +4328,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         al,
         saved: 0,
         slot_off: Vec::new(),
+        slot_pos: Vec::new(),
         block_pos: Vec::new(),
         fixups: Vec::new(),
         pc_map: Vec::new(),
