@@ -3881,7 +3881,7 @@ impl Program {
 
     /// The more restrictive of two visibilities (rustc: a glob import's binding has
     /// min(glob visibility, imported binding's visibility)).
-    fn vis_min(&self, a: BindVis, b: BindVis) -> BindVis {
+    pub fn vis_min(&self, a: BindVis, b: BindVis) -> BindVis {
         match (a, b) {
             (None, x) | (x, None) => x,
             (Some(x), Some(y)) => {
@@ -4312,7 +4312,7 @@ impl Program {
     }
 
     /// Whether visibility `a` is wider than `b`.
-    fn vis_wider(&self, a: BindVis, b: BindVis) -> bool {
+    pub fn vis_wider(&self, a: BindVis, b: BindVis) -> bool {
         match (a, b) {
             (None, Some(_)) => true,
             (Some(x), Some(y)) => x != y && self.in_module(y, x),

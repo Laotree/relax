@@ -110,6 +110,62 @@ pub fn duplicate_exported_macros(prog: &Program, own: &[bool]) -> Vec<String> {
     errors
 }
 
+/// E0446 (rustc_privacy `check_assoc_item` with `hard_error` for associated types): the type of an
+/// associated type of a trait impl is no less visible than the impl itself (the least visible of
+/// the trait and the types of its trait reference).
+pub fn private_assoc_types(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<String> {
+    fn adts(tcx: &Tcx, t: TyId, out: &mut Vec<DefId>, depth: u32) {
+        if depth > 24 { return; }
+        match tcx.tys.kind(t).clone() {
+            TyKind::Adt(d, args, _) => { out.push(d); for &a in tcx.tys.list(args) { adts(tcx, a, out, depth + 1); } }
+            TyKind::Dyn(td, args, binds, ..) => {
+                out.push(td);
+                for &a in tcx.tys.list(args) { adts(tcx, a, out, depth + 1); }
+                for b in tcx.tys.list(binds) { adts(tcx, b.1, out, depth + 1); }
+            }
+            TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) | TyKind::Slice(x) | TyKind::Array(x, _) => adts(tcx, x, out, depth + 1),
+            TyKind::Tuple(l) => for &x in tcx.tys.list(l) { adts(tcx, x, out, depth + 1); },
+            _ => {}
+        }
+    }
+    let mut errors = Vec::new();
+    for i in 0..prog.defs.len() {
+        let imp = DefId(i as u32);
+        let idef = prog.def(imp);
+        if idef.kind != DefKind::Impl || !own.get(idef.krate as usize).copied().unwrap_or(false) { continue; }
+        let Some(&tr) = tcx.impl_trait.get(&imp) else { continue };
+        if !own.get(prog.def(tr).krate as usize).copied().unwrap_or(false) && prog.def(tr).krate != idef.krate { /* foreign trait: its vis is public */ }
+        // the impl's visibility
+        let mut vis = prog.def_item_vis(tr);
+        if !own.get(prog.def(tr).krate as usize).copied().unwrap_or(false) { vis = None; }
+        let mut tys: Vec<DefId> = Vec::new();
+        let args = tcx.generic_indices_of(prog, imp).identity_args(&tcx.tys);
+        for a in tcx.impl_trait_ref(prog, imp, &args).args.iter() {
+            if let crate::consts::GenericArg::Type(t) = a { adts(tcx, *t, &mut tys, 0); }
+        }
+        for d in tys {
+            if own.get(prog.def(d).krate as usize).copied().unwrap_or(false) { vis = prog.vis_min(vis, prog.def_item_vis(d)); }
+        }
+        for j in 0..prog.defs.len() {
+            let ad = DefId(j as u32);
+            let adef = prog.def(ad);
+            if adef.kind != DefKind::AssocTy || adef.parent != imp { continue; }
+            let Ok(t) = tcx.type_of(prog, ad) else { continue };
+            let mut used = Vec::new();
+            adts(tcx, t, &mut used, 0);
+            for u in used {
+                if !own.get(prog.def(u).krate as usize).copied().unwrap_or(false) { continue; }
+                if prog.vis_wider(vis, prog.def_item_vis(u)) {
+                    let pos = prog.files[adef.file as usize].ast.item(adef.item).name.lo;
+                    errors.push(prog.record_error(adef.file, pos, "typeck", format!("E0446: private type `{}` in public interface", prog.syms.str(prog.def(u).name))));
+                    break;
+                }
+            }
+        }
+    }
+    errors
+}
+
 /// A query of rustc_ty_utils/src/representability.rs, the nodes of its cycle detection.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum ReprKey {
