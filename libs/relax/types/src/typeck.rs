@@ -662,6 +662,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             n_parent_generics: 0,
             is_const: false,
             rustc_promotable: false,
+            rustc_intrinsic: false,
             header: FnHeader::RUST,
             track_caller: false,
             target_features: Vec::new(),
@@ -1213,7 +1214,7 @@ impl<'a> Fcx<'a> {
             TyKind::FnDef(d, args, regions) => {
                 let sig = self.tcx.fn_item_sig(self.prog, d).cloned()?;
                 // coercion.rs:1259-1264: intrinsics have no addressable body.
-                if sig.header.abi == Abi::RelaxIntrinsic { return None; }
+                if sig.header.abi == Abi::RelaxIntrinsic || sig.rustc_intrinsic { return None; }
                 // coercion.rs:1270-1282 sig_for_fn_def_coercion: a safe #[target_feature] fn is a safe
                 // signature where the body has its features
                 let mut header = sig.header;

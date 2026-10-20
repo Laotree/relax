@@ -57,6 +57,8 @@ pub struct FnSigT {
     pub is_const: bool,
     /// Explicit promotion permission, from the resolved definition's attribute.
     pub rustc_promotable: bool,
+    /// `#[rustc_intrinsic]` (rustc `tcx.intrinsic(def_id)`): not coercible to a function pointer
+    pub rustc_intrinsic: bool,
     pub header: FnHeader,
     /// `#[track_caller]`: takes the caller's `&'static Location` as an implicit last argument
     /// (rustc's implicit caller-location parameter)
@@ -1401,6 +1403,7 @@ impl Tcx {
                         n_parent_generics: if adt.is_enum { n } else { 0 },
                         is_const: false,
                         rustc_promotable: false,
+                        rustc_intrinsic: false,
                         header: FnHeader::RUST,
                         track_caller: false,
                         target_features: Vec::new(),
@@ -1974,6 +1977,9 @@ impl Tcx {
                 is_const: sig.konst,
                 rustc_promotable: sig.konst && ast.list(ast.item(def.item).attrs).iter().any(|a| {
                     a.toks.hi > a.toks.lo && crate::cfg::tok_str(prog.src(file), a.toks.lo as usize) == b"rustc_promotable"
+                }),
+                rustc_intrinsic: ast.list(ast.item(def.item).attrs).iter().any(|a| {
+                    a.toks.hi > a.toks.lo && crate::cfg::tok_str(prog.src(file), a.toks.lo as usize) == b"rustc_intrinsic"
                 }),
                 header,
                 track_caller: {
