@@ -75,6 +75,13 @@ fn type_param_decl_index(tcx: &Tcx, prog: &Program, imp: DefId, compact: u32) ->
 /// rustc_traits/src/dropck_outlives.rs:34 adt_dtorck_constraint, over the ADT's identity
 /// parameters.
 pub fn adt_dtorck_constraint(tcx: &Tcx, prog: &Program, def: DefId, limit: usize) -> DropckConstraint {
+    if let Some(done) = tcx.dtorck_constraints.lock().unwrap().get(&(def, limit)) { return (**done).clone(); }
+    let result = adt_dtorck_constraint_uncached(tcx, prog, def, limit);
+    tcx.dtorck_constraints.lock().unwrap().insert((def, limit), std::sync::Arc::new(result.clone()));
+    result
+}
+
+fn adt_dtorck_constraint_uncached(tcx: &Tcx, prog: &Program, def: DefId, limit: usize) -> DropckConstraint {
     let adt = &tcx.adts[&def];
     let identity = tcx.generic_indices_of(prog, def).identity_args(&tcx.tys);
     if adt.is_phantom_data() {
