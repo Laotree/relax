@@ -37,6 +37,12 @@ struct SlotState {
 }
 
 static SLOTS: Mutex<Option<HashMap<u32, SlotState>>> = Mutex::new(None);
+/// how many slots SLOTS holds (every install asks `replaced`: one load when nothing is instrumented)
+static INSTRUMENTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn count_slots(m: &HashMap<u32, SlotState>) {
+    INSTRUMENTED.store(m.len(), std::sync::atomic::Ordering::Release);
+}
 
 pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
     let Ok(g) = SLOTS.try_lock() else { return };
@@ -61,6 +67,77 @@ pub fn active(id: u32) -> bool {
     SLOTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.contains_key(&id))
 }
 
+thread_local! {
+    /// this thread is installing an instrumented build (rebuild): not a replacement
+    static INSTRUMENTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Slots whose instrumented code was replaced (or that got code while their twin is
+/// instrumented): (slot, the slot whose edits it takes), waiting for the owner.
+static REPLACED: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+
+/// Unit::install (and rollback): slot `id` gets code that is not an instrumented build. When it
+/// has instruments, they go into the new code again (posted to the owner: the installer may hold
+/// the unit). Cheap when nothing is instrumented.
+pub fn replaced(id: u32, sibling: Option<u32>) {
+    if INSTRUMENTED.load(std::sync::atomic::Ordering::Acquire) == 0 || INSTRUMENTING.try_with(|c| c.get()).unwrap_or(false) {
+        return;
+    }
+    let from = if active(id) {
+        id
+    } else {
+        match sibling.filter(|&s| active(s)) {
+            Some(s) => s,
+            None => return,
+        }
+    };
+    let _k = crate::zone_alloc::kept();
+    let first = {
+        let mut r = REPLACED.lock().unwrap_or_else(|e| e.into_inner());
+        let first = r.is_empty();
+        if !r.iter().any(|x| x.0 == id) {
+            r.push((id, from));
+        }
+        first
+    };
+    if first {
+        crate::owner::post(crate::owner::Class::App, || {
+            let up = crate::jit::current_unit();
+            if !up.is_null() {
+                unsafe { reinstrument_replaced(up) };
+            }
+        });
+    }
+}
+
+/// The owner: every replaced instrumented slot is rebuilt from its current RIR (the new body)
+/// with its edits; `rm` then restores the code that replaced the old instrumented build.
+unsafe fn reinstrument_replaced(up: *mut crate::jit::Unit) {
+    let _kept = crate::zone_alloc::kept();
+    let ids: Vec<(u32, u32)> = std::mem::take(&mut *REPLACED.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut g = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = g.as_mut() else { return };
+    for (id, from) in ids {
+        // a twin takes its sibling's edits, except by-name probes (their points name a slot)
+        let Some(edits) = m.get(&from).map(|s| s.edits.iter().filter(|e| from == id || !matches!(e.1, Edit::ProbeLocals { .. })).cloned().collect::<Vec<_>>()) else { continue };
+        if edits.is_empty() {
+            continue;
+        }
+        match rebuild(up, id, &edits) {
+            Ok((gen, _)) => {
+                let first_gen = if from == id { gen } else { m.get(&id).map_or(gen, |s| s.first_gen) };
+                m.insert(id, SlotState { first_gen, edits });
+                count_slots(m);
+                let why = if from == id { "its code was replaced (live patch, verdict rebuild or rollback): the counters and probes are in the new code".to_string() } else { format!("it runs the same fn as instrumented slot {} (its SPEC-V twin or base) and got code: it counts into the same sites", from) };
+                super::events::emit("probe", &format!("reinstrumented {} {}", id, gen), &format!("\"slot\":{},\"reinstrumented\":true,\"why\":{}", id, super::json_str(&why)));
+            }
+            Err(e) => {
+                super::events::emit("probe", &format!("reinstrument failed {}", id), &format!("\"slot\":{},\"reinstrumented\":false,\"error\":{}", id, super::json_str(&e)));
+            }
+        }
+    }
+}
+
 /// Applies one edit to `f`; true when it found its place (a line that is in the code).
 fn apply_edit(f: &mut relax_backend::rir::Func, u: &crate::jit::Unit, slot: u32, e: Edit) -> bool {
     match e {
@@ -78,6 +155,14 @@ unsafe fn rebuild(up: *mut crate::jit::Unit, id: u32, edits: &[(Owner, Edit)]) -
     // the build is compile work (the compiler arena, like any compile on the owner); the edits'
     // records it reads stay kept (SLOTS, the sites)
     let _compile = crate::zone_alloc::compiler();
+    struct Flag;
+    impl Drop for Flag {
+        fn drop(&mut self) {
+            let _ = INSTRUMENTING.try_with(|c| c.set(false));
+        }
+    }
+    let _ = INSTRUMENTING.try_with(|c| c.set(true));
+    let _flag = Flag;
     let u = &mut *up;
     let gen = u.begin_patch();
     let mut hits = vec![false; edits.len()];
@@ -123,6 +208,7 @@ pub unsafe fn add(up: *mut crate::jit::Unit, id: u32, owner: Owner, edit: Edit) 
     }
     let first = m.get(&id).map_or(gen, |s| s.first_gen);
     m.insert(id, SlotState { first_gen: first, edits });
+    count_slots(m);
     Ok(true)
 }
 
@@ -137,6 +223,7 @@ unsafe fn restore_or_rebuild(up: *mut crate::jit::Unit, id: u32, m: &mut HashMap
         let _ = rebuild(up, id, &edits);
         m.insert(id, SlotState { first_gen: first, edits });
     }
+    count_slots(m);
 }
 
 /// Removes every edit of `owner`; the slots it touched are rebuilt or restored.
