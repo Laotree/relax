@@ -1685,6 +1685,14 @@ impl<'a> Fcx<'a> {
                     }
                 }
             }
+            // rustc coerce_borrowed_pointer: a cast of a reference place to a reference type reborrows (and
+            // then unsizes), so a `&mut` place is not moved out by `place as &mut dyn Trait`.
+            TyKind::Ref(tm, _, _) if sm || !tm => {
+                if sm || self.b.coerce(e.0).is_some() {
+                    let b = self.borrow_target(source, tm);
+                    self.set_reborrow(e.0, tm, b);
+                }
+            }
             _ => {}
         }
     }
