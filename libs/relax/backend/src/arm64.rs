@@ -91,6 +91,7 @@ pub fn reg_config() -> RegConfig {
         slot_index_free: false,
         clobbers: None,
         sym_class: 0,
+        store_imm: |k| k == 0,
     }
 }
 
@@ -701,6 +702,7 @@ impl<'a> Gen<'a> {
             // recomputed at each use (Alloc::remat)
             _ => match self.al.remat[v.0 as usize] {
                 Remat::No => ZR,
+                _ if self.win_reg(v).is_some() => self.win_reg(v).unwrap(),
                 Remat::Offset(b, k) => {
                     let (b, o) = self.resolve_off(b, k as i64);
                     let (rb, o) = match self.slot_base(b) {
@@ -715,6 +717,19 @@ impl<'a> Gen<'a> {
                     scratch
                 }
             },
+        }
+    }
+    /// The register of a window (Alloc::windows) holding v at the current position.
+    fn win_reg(&self, v: VReg) -> Option<u8> {
+        let p = self.cur_pos;
+        self.win.get(&v.0)?.iter().find(|(a, z, _)| *a <= p && p <= *z).map(|w| w.2)
+    }
+    /// A store's integer value: a recomputed 0 outside a window is xzr (register 31 is xzr as
+    /// a store's source).
+    fn use_stored(&mut self, v: VReg, scratch: u8) -> u8 {
+        match (self.al.loc[v.0 as usize], self.al.remat[v.0 as usize]) {
+            (Loc::None, Remat::Const(0)) if self.win_reg(v).is_none() => ZR,
+            _ => self.use_i(v, scratch),
         }
     }
     /// A memory base and offset with base + k values that have no register (Alloc::remat)
@@ -1033,6 +1048,8 @@ impl<'a> Gen<'a> {
                         if let Loc::Stack(o) = self.al.loc[v as usize] {
                             let off = self.spill_sp(o);
                             self.a.ldst(LDRX, 8, r, SP, off);
+                        } else {
+                            self.remat_into(r, VReg(v));
                         }
                     }
                 }
@@ -2891,7 +2908,7 @@ impl<'a> Gen<'a> {
                 // metal draw_pass wrote paint_dirty through a stack offset)
                 let (op, size) = mem_op(*m, false);
                 let rs = match m {
-                    Mem::Int(..) => self.use_i(*src, S0),
+                    Mem::Int(..) => self.use_stored(*src, S0),
                     _ => self.use_f(*src, FS0),
                 };
                 let ri = self.use_i(*idx, IP0);
@@ -2927,7 +2944,7 @@ impl<'a> Gen<'a> {
                 let (op, size) = mem_op(*m, false);
                 match m {
                     Mem::Int(..) => {
-                        let rs = self.use_i(*src, S0);
+                        let rs = self.use_stored(*src, S0);
                         self.a.ldst(op, size, rs, rb, *off as i64);
                     }
                     _ => {

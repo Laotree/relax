@@ -381,6 +381,23 @@ impl Asm {
             _ => self.load64(dst, base, disp),
         }
     }
+    /// mov [base + disp], imm (imm32 sign-extended for 8 bytes)
+    fn store_imm(&mut self, base: u8, disp: i32, k: i64, bytes: u8) {
+        if bytes == 2 {
+            self.byte(0x66);
+        }
+        self.rex(bytes == 8, 0, 0, base, false);
+        self.byte(if bytes == 1 { 0xc6 } else { 0xc7 });
+        self.modrm_mem(0, base, disp);
+        match bytes {
+            1 => self.byte(k as u8),
+            2 => {
+                self.byte(k as u8);
+                self.byte((k >> 8) as u8);
+            }
+            _ => self.u32(k as i32 as u32),
+        }
+    }
     fn store_n(&mut self, base: u8, disp: i32, src: u8, bytes: u8) {
         match bytes {
             1 => {
@@ -643,7 +660,7 @@ pub fn reg_config(options: &relax_session::Options) -> RegConfig {
         int_caller.push(RCX);
         int_caller.push(RDX);
     }
-    RegConfig { int_caller, int_callee: CALLEE_SAVED.to_vec(), flt_caller: flt, flt_callee: Vec::new(), slot_index_free: true, clobbers: Some(x64_clobbers), sym_class: 0 }
+    RegConfig { int_caller, int_callee: CALLEE_SAVED.to_vec(), flt_caller: flt, flt_callee: Vec::new(), slot_index_free: true, clobbers: Some(x64_clobbers), sym_class: 0, store_imm: |k| k == k as i32 as i64 }
 }
 
 // ------------------------------------------------------------ code generation
@@ -799,6 +816,9 @@ impl<'a> Gen<'a> {
                 scratch
             }
             _ => {
+                if let Some(r) = self.win_reg(v) {
+                    return r;
+                }
                 if let Remat::Offset(b, k) = self.al.remat[v.0 as usize] {
                     let (rb, d) = self.base_disp(options, b, scratch, k);
                     self.a.lea(scratch, rb, d);
@@ -807,6 +827,18 @@ impl<'a> Gen<'a> {
                 }
                 scratch
             }
+        }
+    }
+    /// The register of a window (Alloc::windows) holding v at the current position.
+    fn win_reg(&self, v: VReg) -> Option<u8> {
+        let p = self.cur_pos;
+        self.win.get(&v.0)?.iter().find(|(a, z, _)| *a <= p && p <= *z).map(|w| w.2)
+    }
+    /// A store's value that is a recomputed constant the store can write as an immediate.
+    fn store_const(&self, v: VReg) -> Option<i64> {
+        match (self.al.loc[v.0 as usize], self.al.remat[v.0 as usize]) {
+            (Loc::None, Remat::Const(k)) if k == k as i32 as i64 && self.win_reg(v).is_none() => Some(k),
+            _ => None,
         }
     }
     /// Recomputes a value without a location (Alloc::remat) into r, flags-preserving: a fused
@@ -1138,6 +1170,8 @@ impl<'a> Gen<'a> {
                         if let Loc::Stack(o) = self.al.loc[v as usize] {
                             let d = self.spill_disp(o);
                             self.load_spill(r, d);
+                        } else {
+                            self.remat_into(r, VReg(v));
                         }
                     }
                 }
@@ -2578,9 +2612,14 @@ impl<'a> Gen<'a> {
                 let (rb, off) = self.base_disp(options, *base, R11, *off);
                 match m {
                     Mem::Int(n, _) => {
-                        let rs = self.use_i(options, *src, R10);
-                        self.a.sib = Some((ri, *sh));
-                        self.a.store_n(rb, off, rs, *n);
+                        if let Some(k) = self.store_const(*src) {
+                            self.a.sib = Some((ri, *sh));
+                            self.a.store_imm(rb, off, k, *n);
+                        } else {
+                            let rs = self.use_i(options, *src, R10);
+                            self.a.sib = Some((ri, *sh));
+                            self.a.store_n(rb, off, rs, *n);
+                        }
                     }
                     Mem::F32 | Mem::F64 => {
                         let xs = self.use_f(*src, XS);
@@ -2608,8 +2647,12 @@ impl<'a> Gen<'a> {
                 let (rb, off) = self.base_disp(options, *base, R11, *off);
                 match m {
                     Mem::Int(n, _) => {
-                        let rs = self.use_i(options, *src, R10);
-                        self.a.store_n(rb, off, rs, *n);
+                        if let Some(k) = self.store_const(*src) {
+                            self.a.store_imm(rb, off, k, *n);
+                        } else {
+                            let rs = self.use_i(options, *src, R10);
+                            self.a.store_n(rb, off, rs, *n);
+                        }
                     }
                     Mem::F32 | Mem::F64 => {
                         let xs = self.use_f(*src, XS);

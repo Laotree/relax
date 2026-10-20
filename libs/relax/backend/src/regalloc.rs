@@ -26,6 +26,9 @@ pub struct RegConfig {
     /// `Env::sym_class` (0: none): an address of a domain symbol is a thread-local block read
     /// and an add, not a constant, so it is never rematerialised
     pub sym_class: u64,
+    /// which recomputed constants a store writes straight from the instruction (x64: imm32,
+    /// sign-extended for 8 bytes; arm64: 0 from xzr): such stores need no register for them
+    pub store_imm: fn(i64) -> bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1297,7 +1300,9 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         }
     }
     // spill windows (O3): a spilled int value's runs of >= 2 uses inside a block take a
-    // register free over the run in the final occupancy -- one load instead of one per use
+    // register free over the run in the final occupancy -- one load instead of one per use.
+    // Recomputed constants and addresses too (one recomputation instead of one per use), except
+    // as the value of a store that writes the constant directly (RegConfig::store_imm)
     let mut windows: Vec<(u32, u32, u32, u8)> = Vec::new();
     if thorough && windows_on(options) {
         let regs: Vec<u8> = cfg.int_caller.iter().chain(used_callee_int.iter()).copied().collect();
@@ -1327,9 +1332,17 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                 let mut ds = Vec::new();
                 for_defs(i, |d| ds.push(d.0));
                 if simple(i) {
+                    let stored = match i {
+                        Inst::Store(_, _, _, s2) | Inst::StoreX(_, _, _, _, _, s2) => match remat[s2.0 as usize] {
+                            Remat::Const(k) if loc[s2.0 as usize] == Loc::None && (cfg.store_imm)(k) => Some(s2.0),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
                     for_uses(i, |u| {
                         let uv = u.0 as usize;
-                        if matches!(loc[uv], Loc::Stack(_)) && f.vregs[uv] == Cls::I && !ds.contains(&u.0) {
+                        let rm = loc[uv] == Loc::None && matches!(remat[uv], Remat::Const(_) | Remat::Addr(_) | Remat::FnAddr(_)) && stored != Some(u.0);
+                        if (matches!(loc[uv], Loc::Stack(_)) || rm) && f.vregs[uv] == Cls::I && !ds.contains(&u.0) {
                             let e = runs.entry(u.0).or_default();
                             if e.last() != Some(&ii) {
                                 e.push(ii);
