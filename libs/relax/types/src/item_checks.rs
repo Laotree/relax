@@ -1396,7 +1396,9 @@ pub fn assoc_const_elision(prog: &Program, d: DefId) -> Vec<String> {
     }
     let itext = |i: crate::ast::Ident| -> &str { std::str::from_utf8(prog.files[imp.file as usize].bytes(i.lo, i.hi)).unwrap_or("") };
     let ctext = |i: crate::ast::Ident| -> &str { std::str::from_utf8(pf.bytes(i.lo, i.hi)).unwrap_or("") };
-    let header = anon(iast, &itext, im.self_ty, false, 0)
+    // a lifetime is in scope: one the impl declares (`impl<'a>`), or an anonymous one its header names
+    let declared = iast.list(im.generics.params).iter().any(|p| matches!(p.kind, crate::ast::GenericParamKind::Lifetime(_)));
+    let header = declared || anon(iast, &itext, im.self_ty, false, 0)
         || im.trait_.as_ref().is_some_and(|p| iast.segs(p.segs).iter().any(|s| match iast.gargs(s.args()) {
             Some(GenericArgs::Angle(v)) => iast.list(*v).iter().any(|a| matches!(a, GenericArg::Lifetime(l) if itext(*l) == "'_")),
             _ => false,

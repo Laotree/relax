@@ -2326,16 +2326,36 @@ fn sig_lifetime_variances(prog: &Program, tcx: &Tcx, d: DefId, nm: &LifetimeReso
     if let ItemKind::Fn(sig, _, _) = ast.item(def.item).kind {
         let sig = *ast.fn_sig(sig);
         for p in ast.list(sig.params) { cx.walk(p.ty, V::Contra); }
+        // the type `Self` stands for in an inherent or trait impl: its lifetimes occur in the receiver
+        let mut self_ty: Option<(TyId, std::sync::Arc<LifetimeResolution>, DefId)> = None;
+        if def.kind == DefKind::AssocFn {
+            let parent = prog.def(def.parent);
+            let past = &prog.files[parent.file as usize].ast;
+            if let ItemKind::Impl(r) = past.item(parent.item).kind {
+                self_ty = Some((past.row(r).self_ty, names(prog, tcx, def.parent), def.parent));
+            }
+        }
+        let mut receiver: Vec<(TyId, V)> = Vec::new();
         match sig.self_param {
             Some(SelfParam::Ref(lt, m)) => {
                 let r = match lt { Some(l) => nm.named(l.lo, l.hi), None => nm.self_reference() };
-                let _ = m;
                 cx.record(r, V::Contra);
+                if let Some((t, _, _)) = &self_ty { receiver.push((*t, xform(V::Contra, if m { V::Inv } else { V::Co }))); }
             }
             Some(SelfParam::Typed(_, t)) => cx.walk(t, V::Contra),
+            Some(SelfParam::Value(..)) => if let Some((t, _, _)) = &self_ty { receiver.push((*t, V::Contra)); },
             _ => {}
         }
         if let Some(r) = sig.ret { cx.walk(r, V::Co); }
+        let mut out = std::mem::take(&mut cx.out);
+        if let Some((_, pn, pd)) = &self_ty {
+            let parent = prog.def(*pd);
+            let ppf = &prog.files[parent.file as usize];
+            let mut pcx = Cx { prog, tcx, module: tcx.item_module(prog, *pd), ast: &ppf.ast, pf: ppf, nm: pn, captured, out: HashMap::new() };
+            for (t, v) in receiver { pcx.walk(t, v); }
+            for (id, v) in pcx.out { let e = out.entry(id).or_insert(V::Bi); *e = join(*e, v); }
+        }
+        return out;
     }
     cx.out
 }
@@ -2355,7 +2375,9 @@ fn impl_trait_overcaptures(prog: &Program, tcx: &Tcx, d: DefId) {
     let ItemKind::Fn(sig, _, _) = item.kind else { return };
     let sig = *ast.fn_sig(sig);
     let Some(ret) = sig.ret else { return };
-    if !ty_has_impl_trait(ast, ret) { return; }
+    let mut opaques = Vec::new();
+    opaque_types(ast, ret, &mut opaques);
+    if opaques.is_empty() { return; }
     let nm = names(prog, tcx, d);
     let rbv = tcx.resolve_bound_vars(prog, d);
     // a captured lifetime of an opaque is a copy of a lifetime of the enclosing scope: map copies back
