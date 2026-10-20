@@ -187,6 +187,43 @@ pub fn impl_trait_path_privacy(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<S
     errors
 }
 
+/// E0433 `too many leading `super` keywords`: a `pub(super)` / `pub(in super::super)` visibility
+/// (also one a macro expansion wrote) with fewer enclosing modules than `super`s; and a global
+/// `::super::x` path in a `use` (rustc_resolve: global paths cannot start with `super`).
+pub fn super_paths(prog: &Program, own: &[bool]) -> Vec<String> {
+    use crate::ast::{SegKind, Vis};
+    let mut errors = Vec::new();
+    for i in 0..prog.defs.len() {
+        let d = DefId(i as u32);
+        let def = prog.def(d);
+        if !own.get(def.krate as usize).copied().unwrap_or(false) || def.item.0 == u32::MAX { continue; }
+        if prog.item_defs.get(&(def.file, def.item.0)) != Some(&d) { continue; }
+        let ast = &prog.files[def.file as usize].ast;
+        let item = ast.item(def.item);
+        let depth = |m: u32| { let mut n = 0; let mut cur = prog.mods[prog.mods[m as usize].normal as usize].parent_mod; while let Some(p) = cur { n += 1; cur = prog.mods[p as usize].parent_mod; } n };
+        let scope = if matches!(def.kind, DefKind::AssocFn | DefKind::AssocConst | DefKind::AssocTy) { prog.def(def.parent).scope } else { def.scope };
+        let too_many = match item.vis {
+            Vis::Super => depth(scope) == 0,
+            Vis::In(p) => {
+                let p = ast.row(p);
+                let supers = ast.segs(p.segs).iter().take_while(|s| s.kind() == SegKind::Super).count();
+                supers > depth(scope)
+            }
+            _ => false,
+        };
+        if too_many {
+            errors.push(prog.record_error(def.file, item.lo, "resolve", "E0433: failed to resolve: too many leading `super` keywords".to_string()));
+        }
+    }
+    for im in prog.imports_iter() {
+        let krate = prog.mods[im.module as usize].krate;
+        if !own.get(krate as usize).copied().unwrap_or(false) || im.ext || !im.global || im.segs.first().map(|s| s.0) != Some(SegKind::Super) { continue; }
+        if im.pos >= prog.files[im.file as usize].src_len { continue; }
+        errors.push(prog.record_error(im.file, im.pos, "resolve", "E0433: failed to resolve: global paths cannot start with `super`".to_string()));
+    }
+    errors
+}
+
 /// A query of rustc_ty_utils/src/representability.rs, the nodes of its cycle detection.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum ReprKey {

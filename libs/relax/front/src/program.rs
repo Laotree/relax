@@ -3914,6 +3914,9 @@ impl Program {
         u.contains(&(m, name, true)) || u.contains(&(m, name, false))
     }
 
+    /// The imports of the program (use items and `extern crate`).
+    pub fn imports_iter(&self) -> impl Iterator<Item = &Import> { self.imports.iter() }
+
     /// Imports of the checked crates that name nothing rustc would resolve but Relax's lenient
     /// resolution accepts: a path through `alloc` without `extern crate alloc;` (not in the extern
     /// prelude), and a macro-named import through a module that does not exist. Run once the
