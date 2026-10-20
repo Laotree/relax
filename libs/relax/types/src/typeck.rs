@@ -472,6 +472,10 @@ pub struct Fcx<'a> {
     pat_decl_irrefutable: bool,
     checked_opaque_types_storage_entries: Option<crate::infer::opaque_types::OpaqueTypeStorageEntries>,
     expected_closure_kinds: HashMap<u32, crate::upvar::ClosureKind>,
+    /// an async closure's deduced `AsyncFnOnce::Output` term as a signature (bound), set by deduction
+    async_expected_inner: Option<TyId>,
+    /// async closure expr -> its coroutine's liberated expected return type (rustc coroutine-closure `return_ty`)
+    async_body_expected: HashMap<u32, TyId>,
     /// the expectation of the expression checked next is a mere hint (the other branch's type),
     /// not a coercion target (rustc Expectation::ExpectHasType vs. an if/match's derived hint)
     soft: bool,
@@ -735,6 +739,8 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         pat_decl_irrefutable: false,
         checked_opaque_types_storage_entries: None,
         expected_closure_kinds: HashMap::default(),
+        async_expected_inner: None,
+        async_body_expected: HashMap::default(),
         soft: false,
         last_lo: 0,
         known_method_args: None,
@@ -1063,6 +1069,9 @@ impl<'a> Fcx<'a> {
                     Some(i) => i,
                     None => return false,
                 };
+                // the solver's last-field rule: the parameter may not be mentioned by another
+                // field (`Foo<T: ?Sized>(Box<T>, T)` does not unsize `Foo<[u8; 1]>`)
+                if !matches!(self.tcx.lang_items.get(crate::lang_items::LangItem::Unsize), Some(unsize) if matches!(self.select_trait(unsize, a, &[d]), Ok(Some(_)))) { return false; }
                 (0..xs.len()).all(|j| j == i || self.eq(xs[j], ys[j])) && self.array_to_slice(xs[i], ys[i])
             }
             _ => false,
@@ -4321,7 +4330,7 @@ impl<'a> Fcx<'a> {
 
     /// hir_ty_lowering check_generic_arg_count of a written segment against `def`'s own generics.
     /// False (reported) when the number of arguments is wrong.
-    fn check_seg_arg_count(&mut self, args: GenericArgsId, def: DefId, lo: u32, method_call: bool) -> bool {
+    fn check_seg_arg_count(&mut self, args: GenericArgsId, def: DefId, lo: u32, method: bool) -> bool {
         use crate::tcx::arg_count::ArgPosition;
         let prog = self.prog;
         // (only a crate whose errors are reported validates; a call without written arguments has nothing to count)
@@ -4342,19 +4351,23 @@ impl<'a> Fcx<'a> {
             _ => return true,
         };
         let ast = self.ast();
-        let counts = self.tcx.own_generic_counts(prog, def, early);
-        let errs = self.tcx.check_generic_arg_count(prog, def, ast.gargs(args), ast, counts, pos, !matches!(ast.gargs(args), Some(GenericArgs::Angle(_))), late_bound);
-        for e in &errs { self.err(lo, e.clone()); }
-        // generics.rs prohibit_explicit_late_bound_lifetimes: explicit lifetime arguments next to late-bound lifetime
-        // parameters are an error in a path (E0794) unless they name every lifetime parameter, a lint in a method call
-        if late_bound && !method_call {
+        // prohibit_explicit_late_bound_lifetimes
+        if late_bound {
             if let Some(GenericArgs::Angle(v)) = ast.gargs(args) {
-                let written = ast.list(*v).iter().filter(|a| matches!(a, GenericArg::Lifetime(_))).count();
-                if written > 0 && Some(written) != early {
-                    self.err(lo, "E0794: cannot specify lifetime arguments explicitly if late bound lifetime parameters are present".to_string());
+                let lts: Vec<Ident> = ast.list(*v).iter().filter_map(|a| if let GenericArg::Lifetime(l) = *a { Some(l) } else { None }).collect();
+                if let Some(first) = lts.first() {
+                    let msg = "cannot specify lifetime arguments explicitly if late bound lifetime parameters are present";
+                    if !method && Some(lts.len()) != early {
+                        self.err(first.lo, format!("E0794: {}", msg));
+                    } else {
+                        crate::lint::emit(self.prog, self.b.def, &crate::lint::LATE_BOUND_LIFETIME_ARGUMENTS, self.file, first.lo, msg);
+                    }
                 }
             }
         }
+        let counts = self.tcx.own_generic_counts(prog, def, early);
+        let errs = self.tcx.check_generic_arg_count(prog, def, ast.gargs(args), ast, counts, pos, !matches!(ast.gargs(args), Some(GenericArgs::Angle(_))), late_bound);
+        for e in &errs { self.err(lo, e.clone()); }
         let mut ok = errs.is_empty();
         // associated item constraints belong to trait paths only
         if let Some(GenericArgs::Angle(v)) = ast.gargs(args) {
@@ -6050,7 +6063,11 @@ impl<'a> Fcx<'a> {
                 // a parameter or alias left operand is an operator trait call even when an
                 // instance is primitive (rustc op.rs is_builtin_binop): `p * 2.0` with
                 // `P: Mul<f32, Output = P>` is `<P as Mul<f32>>::mul`, not `P == f32`
-                if matches!(self.tcx.tys.kind(sa0), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Param(_) | TyKind::Alias(..)) {
+                // a type-variable left operand is an operator trait call too (rustc op.rs:41 takes
+                // the builtin path only when neither operand is a type variable): `?S: Add<?R>`
+                // stays ambiguous, it is not `?S == {integer}`
+                let sa0 = if matches!(self.tcx.tys.kind(sa0), TyKind::Infer(_)) { self.retry_goals(false); self.shallow(sa0) } else { sa0 };
+                if matches!(self.tcx.tys.kind(sa0), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Param(_) | TyKind::Alias(..) | TyKind::Infer(_)) {
                     self.cur_binop = e.0;
                     return self.check_op_trait(op, sa0, b, lo, false);
                 }
@@ -6429,8 +6446,11 @@ impl<'a> Fcx<'a> {
         let is_move = mode == crate::ast::ASYNC_MOVE;
         let _ = self.tcx.future_defs(self.prog);
         let saved = self.scopes.len();
+        let expected_out = if mode == crate::ast::ASYNC_CLOSURE_BODY {
+            self.closure_depth.last().and_then(|(parent, _)| self.async_body_expected.get(parent).copied())
+        } else { None };
         self.closure_depth.push((e.0, saved));
-        let out = self.fresh(0);
+        let out = expected_out.unwrap_or_else(|| self.fresh(0));
         self.ret_stack.push(out);
         self.async_depth += 1;
         let save_awaits = std::mem::take(&mut self.await_count);
@@ -6442,6 +6462,13 @@ impl<'a> Fcx<'a> {
         let points = std::mem::replace(&mut self.await_count, save_awaits);
         if !self.diverges {
             self.coerce_or_unify(bt, out, None, self.ast().block(b).hi);
+        } else {
+            // a body that only diverges (`async { todo!() }`): the return type's still-open
+            // variable falls back like any variable a `!` flowed into
+            let so = self.shallow(out);
+            if matches!(self.tcx.tys.kind(so), TyKind::Infer(_)) {
+                self.diverging.push(so);
+            }
         }
         self.async_depth -= 1;
         self.ret_stack.pop();
@@ -6582,7 +6609,7 @@ impl<'a> Fcx<'a> {
         self.scopes.truncate(saved);
         self.diverges = false;
         self.b.closures.push(e.0);
-        let sig = self.b.closure_sigs[&e.0].bound;
+        let sig = self.async_closure_bound_signature(e);
         let is_move = matches!(self.ast().expr(e).kind, ExprKind::Closure(row) if self.ast().row(row).is_move);
         let up = self.fresh(0);
         let kind = match self.expected_closure_kinds.get(&e.0).copied() {

@@ -1379,6 +1379,9 @@ impl<'a> Parser<'a> {
             eprintln!("expand {}! => {}", def.name, text);
         }
         let base = (self.src.len() + self.ext.len()) as u32;
+        if crate::macros::uses::recording() {
+            crate::macros::uses::synth_flush(self.bctx.as_ref().map_or("", |c| c.path.as_str()), base);
+        }
         for (off, o, n) in origins {
             self.tok_origin.push((base + off, o, n));
         }
@@ -1470,9 +1473,23 @@ impl<'a> Parser<'a> {
             self.pos = save;
             return Ok(None);
         }
+        let trailing = delim != b'{' && matches!(self.kind(), T::CloseBrace | T::Eof);
         self.eat(T::Semi);
         let start = self.expand_call(&def, toks, lo)?;
         let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
+        if trailing && def.builtin == 0 && crate::macros::uses::recording() {
+            // a macro call ending a block is an expression (rustc_expand flat_map_stmt
+            // `is_trailing_mac`): its expansion's `;` after the one expression is linted
+            let save = self.pos;
+            self.pos = start;
+            let one_expr = self.outer_attrs().is_ok() && self.expr().is_ok() && self.kind() == T::Semi && self.nth(1) == T::Eof;
+            let semi = self.lo();
+            self.pos = save;
+            if one_expr {
+                let file = self.bctx.as_ref().map_or("", |c| c.path.as_str()).to_string();
+                crate::macros::uses::trailing_semi(&file, semi, lo, &def.def_file);
+            }
+        }
         Ok(Some(self.in_expansion(start, |p| f(p, include))?))
     }
 
@@ -3342,7 +3359,8 @@ impl<'a> Parser<'a> {
                     trailing = true;
                 }
                 self.expect(T::CloseParen)?;
-                if v.len() == 1 && !trailing {
+                // rustc parse_pat_tuple_or_parens: `(..)` is a tuple pattern (a lone rest pattern)
+                if v.len() == 1 && !trailing && !matches!(self.ast.pat(v[0]), Pat::Rest) {
                     Pat::Paren(v[0])
                 } else {
                     Pat::Tuple(self.ast.push_list(v))
@@ -4231,6 +4249,10 @@ impl<'a> Parser<'a> {
                         let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
                         return self.in_expansion(start, |p| {
                             let e = p.expr()?;
+                            if p.kind() == T::Semi && def.builtin == 0 && crate::macros::uses::recording() {
+                                let file = p.bctx.as_ref().map_or("", |c| c.path.as_str()).to_string();
+                                crate::macros::uses::trailing_semi(&file, p.lo(), lo, &def.def_file);
+                            }
                             p.eat(T::Semi);
                             if include { p.skip_to_eof(); }
                             Ok(e)
