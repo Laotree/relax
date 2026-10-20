@@ -256,6 +256,9 @@ impl BorrowCheckRootCtxt<'_> {
             // has a variable at that position.
             let erased_slot = match tys.region_kind(identity) {
                 RegionKind::RePlaceholder { var, .. } => child.closure_slots.iter().enumerate().filter(|(_, r)| **r == RegionId::ERASED).nth(var.0 as usize).map(|(i, _)| i),
+                // an erased region of the environment type (`SignatureRegions::with_closure_env`)
+                RegionKind::ReLateParam(_, crate::types::LateParamKind::Anon(n)) if n >= super::universal_regions::ENV_ERASED_BASE =>
+                    child.closure_slots.iter().enumerate().filter(|(_, r)| **r == RegionId::ERASED).nth((n - super::universal_regions::ENV_ERASED_BASE) as usize).map(|(i, _)| i),
                 _ => None,
             };
             if let Some(slot) = erased_slot { return instantiated[slot]; }

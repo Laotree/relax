@@ -178,6 +178,9 @@ impl UniversalRegionsBuilder<'_> {
         UniversalRegionIndices { regions }
     }
 }
+/// `LateParamKind::Anon` numbers from here name the erased regions of a closure's environment type.
+pub const ENV_ERASED_BASE: u32 = 0x4000_0000;
+
 impl SignatureRegions {
     pub fn function(tcx: &Tcx, prog: &Program, owner: DefId) -> Option<Self> { Self::function_signature(tcx,prog,owner,true) }
     /// Calling a C-variadic function does not pass the body's implicit VaList.
@@ -214,12 +217,14 @@ impl SignatureRegions {
         let closure_ty = match tcx.tys.kind(env) { TyKind::Ref(_, ct, _) => *ct, _ => env };
         // rustc's `replace_free_regions_with_nll_infer_vars` makes every region of the defining type,
         // erased ones included, a universal region of its own: each erased occurrence takes a distinct
-        // placeholder identity, numbered in order (the nested use finds its slot by that number).
+        // identity, scoped to this closure (a nested closure inherits its creator's universal regions,
+        // which must stay different) and numbered in order (the creator finds the slot by that number).
         let erased = std::cell::Cell::new(0u32);
+        let closure_scope = RegionScope::Closure { owner, expr };
         let closure_ty = tcx.tys.map_regions(closure_ty, &|r, depth| match tcx.tys.region_kind(r) {
             RegionKind::ReErased => {
-                let var = BoundVar(erased.get()); erased.set(var.0 + 1);
-                tcx.tys.intern_region(RegionKind::RePlaceholder { universe: crate::types::UniverseIndex::ROOT, var })
+                let n = erased.get(); erased.set(n + 1);
+                tcx.tys.intern_region(RegionKind::ReLateParam(closure_scope, LateParamKind::Anon(ENV_ERASED_BASE + n)))
             }
             RegionKind::ReBound(d, _) if d < depth => r,
             _ => r,
