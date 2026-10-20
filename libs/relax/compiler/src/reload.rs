@@ -4070,10 +4070,10 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
         // the changed files keep their stamps for a full filesystem polling window. A
         // checkout spanning several writes must not be split into individual patches.
         let mut last: Vec<Option<(std::time::SystemTime, u64)>> = changed.iter().map(|&k| stamp(&files[k].0)).collect();
-        // (native notifications arrive at once: a quiet window of two polls ends the settle; the stat
+        // (native notifications arrive at once: a quiet window of 10 ms ends the settle; the stat
         // fallback needs a full filesystem polling window)
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(if events.is_some() { 20 } else { 100 }));
+            std::thread::sleep(std::time::Duration::from_millis(if events.is_some() { 10 } else { 100 }));
             let now: Vec<_> = changed.iter().map(|&k| stamp(&files[k].0)).collect();
             let mut more = false;
             let candidates = match events.as_mut().map(|w| w.changed()) {
