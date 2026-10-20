@@ -200,6 +200,9 @@ pub struct OpaqueDecl {
 
 pub struct Tcx {
     pub dcx: crate::infer::diagnostics::DiagCtxt,
+    /// `adt_dtorck_constraint` per (ADT, recursion limit): a query in rustc; uncached, a chain of
+    /// ADTs that each hold the previous one several times is exponential
+    pub(crate) dtorck_constraints: std::sync::Mutex<crate::fxhash::HashMap<(DefId, usize), std::sync::Arc<crate::next_solver::dropck_outlives::DropckConstraint>>>,
     pub tys: Types,
     envs: env::Envs,
     /// Immutable entries; each declaration is lowered once by its first reader.
@@ -239,6 +242,9 @@ pub struct Tcx {
     /// closure types that are coroutines -- they implement Future<Output = sig's return>; their
     /// storage record holds the state word and is extended by saved locals (coro_frames).
     pub coroutines: crate::conc::MemoMap<(u32, u32), ()>,
+    /// `mir_coroutine_witnesses` reduced to what dropck asks (whether any local live across a suspension
+    /// point needs drop), per coroutine (file, expr), set when borrowck has built the coroutine's MIR.
+    pub coroutine_witness_needs_drop: crate::conc::MemoMap<(u32, u32), bool>,
     /// a coroutine type's saved locals after its upvars: (end offset, alignment), made when its
     /// poll function is lowered (coroutine_transform)
     pub coro_frames: crate::conc::MemoMap<TyId, (u32, u32)>,
@@ -254,6 +260,9 @@ pub struct Tcx {
     future_defs: std::sync::OnceLock<Option<(DefId, DefId)>>,
     /// Return-position `impl Trait` declarations keyed by their opaque DefId.
     pub opaques: crate::conc::ShardMap<DefId, OpaqueDecl>,
+    /// rustc `inferred_outlives_of` (a query there): the outlives requirements an ADT's fields put on its own
+    /// parameters, computed once per ADT; cleared whenever declarations change.
+    pub inferred_outlives: crate::conc::ShardMap<DefId, std::sync::Arc<Vec<outlives::OutlivesPredicate>>>,
     /// each trait with its supertraits, transitively (a trait object implements all of them)
     pub trait_closure: ImageMap<DefId, Vec<DefId>>,
     pub queries: crate::type_queries::QueryCx,
@@ -380,6 +389,7 @@ impl Tcx {
         Tcx {
             tys,
             dcx: Default::default(),
+            dtorck_constraints: Default::default(),
             envs: env::Envs::new(),
             sigs: Default::default(),
             ctor_sigs: Default::default(),
@@ -404,12 +414,14 @@ impl Tcx {
             adt_destructors: Default::default(),
             destructor_impls: Default::default(),
             coroutines: crate::conc::MemoMap::with_bits(10),
+            coroutine_witness_needs_drop: crate::conc::MemoMap::with_bits(10),
             coro_frames: Default::default(),
             coro_shapes: Default::default(),
             coro_slot_ty: Default::default(),
             async_fns: crate::conc::MemoMap::with_bits(10),
             future_defs: Default::default(),
             opaques: Default::default(),
+            inferred_outlives: Default::default(),
             trait_closure: Default::default(),
             queries: crate::type_queries::QueryCx::new(),
             collect_epoch: Default::default(),
@@ -452,6 +464,13 @@ impl Tcx {
                 continue;
             }
             let Some(&st) = self.impl_self.get(&im.def) else { continue };
+            let raw_st = st;
+            // inherent_impls.rs check_item: an inherent impl names a nominal type, not a projection, an opaque or a parameter
+            if !self.impl_trait.contains_key(&im.def) && !prog.files[im.file as usize].ast.as_impl(&prog.files[im.file as usize].ast.item(im.item).kind).is_some_and(|i| i.trait_.is_some())
+                && matches!(self.tys.kind(st), TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. } | AliasTyKind::Opaque { .. }, .. })) {
+                errors.push((im.def, prog.files[im.file as usize].ast.item(im.item).lo, "E0118: no nominal type found for inherent implementation -- implement a trait or new type instead".to_string()));
+                continue;
+            }
             // (a projection self type is checked as what it normalizes to)
             let st = if self.tys.has_assoc(st) { self.try_normalize_erasing_regions(prog, typing_env, st).unwrap_or(st) } else { st };
             let item = prog.files[im.file as usize].ast.item(im.item);
@@ -472,6 +491,7 @@ impl Tcx {
                     }
                 }
                 Some(&td) => {
+                    self.header_coherence_errors(prog, im.def, krate, td, raw_st, pos, &mut errors);
                     if prog.def(td).krate == krate {
                         continue;
                     }
@@ -499,6 +519,53 @@ impl Tcx {
             }
         }
         errors
+    }
+
+    /// coherence/mod.rs check_object_overlap (E0371) and coherence/orphan.rs `trait_is_auto` (E0321) of one trait impl.
+    fn header_coherence_errors(&self, prog: &Program, imp: DefId, krate: u32, td: DefId, st: TyId, pos: u32, errors: &mut Vec<(DefId, u32, String)>) {
+        use crate::next_solver::eval_ctxt::trait_is_auto;
+        let shown = || crate::typeck::ty_to_string(false, prog, self, st);
+        if let TyKind::Dyn(principal, _, _, _, _, _, autos) = self.tys.kind(st).clone() {
+            let mut components = vec![principal];
+            components.extend(self.tys.list(autos).iter().copied());
+            for c in components {
+                if !self.dyn_compatibility_violations(prog, c).is_empty() { continue; }
+                // the trait and its supertraits (elaborate::supertrait_def_ids)
+                let (mut seen, mut stack) = (vec![c], vec![c]);
+                while let Some(t) = stack.pop() {
+                    for s in self.trait_supers(prog, t) { if !seen.contains(&s) { seen.push(s); stack.push(s); } }
+                }
+                if seen.contains(&td) {
+                    errors.push((imp, pos, format!("E0371: the object type `{}` automatically implements the trait `{}`", shown(), prog.def_path(td))));
+                    return;
+                }
+            }
+        }
+        if !trait_is_auto(prog, td) { return; }
+        // (local ok, non-local ok, what is problematic for a local trait)
+        let local_trait = prog.def(td).krate == krate;
+        let (disallow_local, nonlocal_ok, nonlocal_defined): (Option<&str>, bool, bool) = match self.tys.kind(st).clone() {
+            TyKind::Adt(d, ..) | TyKind::Foreign(d) => { let own = prog.def(d).krate == krate; (None, own, !own) }
+            TyKind::Dyn(..) => (Some("trait object"), false, false),
+            TyKind::Param(i) => {
+                let sized = self.impl_generics(prog, imp).map_or(true, |e| e.sized_params.contains(&i));
+                (if sized { None } else { Some("generic type") }, false, false)
+            }
+            TyKind::Alias(_, a) => (Some(match a.kind { AliasTyKind::Projection { .. } => "associated type", AliasTyKind::Opaque { .. } => "opaque type", _ => "type alias" }), false, false),
+            TyKind::Error => (None, true, false),
+            _ => (None, false, false),
+        };
+        if local_trait {
+            if let Some(kind) = disallow_local {
+                errors.push((imp, pos, format!("E0321: traits with a default impl, like `{}`, cannot be implemented for {} `{}`", prog.def_path(td), kind, shown())));
+            }
+        } else if !nonlocal_ok {
+            if nonlocal_defined {
+                errors.push((imp, pos, format!("E0321: cross-crate traits with a default impl, like `{}`, can only be implemented for a struct/enum type defined in the current crate", prog.def_path(td))));
+            } else {
+                errors.push((imp, pos, format!("E0321: cross-crate traits with a default impl, like `{}`, can only be implemented for a struct/enum type, not `{}`", prog.def_path(td), shown())));
+            }
+        }
     }
 
     /// Coherence (N:rustc_hir_analysis/src/coherence/mod.rs:126-170 coherent_trait: orphan
@@ -582,7 +649,12 @@ impl Tcx {
                     abi
                 }
                 None => {
-                    self.err(cx, prog, file, a.lo, format!("unsupported function ABI {}", prog.files[file as usize].text(a)));
+                    let written = crate::lit::unescape_str(prog.files[file as usize].text(a));
+                    if Abi::is_rustc_name(&written) {
+                        self.err(cx, prog, file, a.lo, format!("unsupported function ABI {}", prog.files[file as usize].text(a)));
+                    } else {
+                        self.err(cx, prog, file, a.lo, format!("E0703: invalid ABI: found `{}`", written));
+                    }
                     Abi::Rust
                 }
             },
@@ -1005,6 +1077,7 @@ impl Tcx {
     pub fn invalidate_check(&mut self, gone: &[DefId]) {
         self.declarations.invalidate(gone);
         self.alias_tys.clear();
+        self.inferred_outlives.clear();
         if gone.is_empty() { self.publish_collected(); return; }
         let gone: crate::fxhash::HashSet<_> = gone.iter().copied().collect();
         self.sigs.retain(|d, _| !gone.contains(d));
@@ -1559,6 +1632,7 @@ impl Tcx {
             errors.extend(crate::item_checks::assoc_const_elision(prog, did));
             errors.extend(crate::item_checks::attribute_safety(prog, did));
             errors.extend(crate::item_checks::attribute_shapes(prog, did));
+            if self.validates(prog, def.file) { errors.extend(crate::item_checks::precise_capture_params(prog, self, did)); }
             if def.kind == DefKind::AssocFn && self.validates(prog, def.file) && errors.is_empty() {
                 errors.extend(self.check_method_receiver(prog, did));
             }
@@ -2525,6 +2599,10 @@ impl Tcx {
                                             return self.tys.error;
                                         }
                                     }
+                                    // lower_assoc_item_constraint: an object type binds each associated item once (E0719)
+                                    if binds.iter().any(|b| b.0 == ad) && self.validates(prog, file) {
+                                        self.err(cx, prog, file, n.lo, format!("E0719: the value of the associated type `{}` in trait `{}` is already specified", f.text(*n), prog.def_path(prog.def(ad).parent)));
+                                    }
                                     let bt = self.lower_ty(cx, prog, file, module, env, *t);
                                     binds.push((ad, bt, 0));
                                 } else {
@@ -2678,6 +2756,20 @@ impl Tcx {
             }
             if let Some(td) = env.trait_def {
                 let trait_ref = crate::next_solver::TraitRef { def_id: td, args: self.generic_indices_of(prog, td).identity_args(&self.tys) };
+                // `Self::Name` in a trait: the trait and its supertraits that declare `Name` (more than one: E0221)
+                if self.validates(prog, file) {
+                    let predicate = crate::next_solver::Predicate::dummy(crate::next_solver::PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(
+                        crate::next_solver::TraitClause { trait_ref: trait_ref.clone(), polarity: crate::next_solver::ClausePolarity::Positive })));
+                    let mut declaring = self.transitive_bounds_that_define_assoc_item(prog, vec![predicate], name);
+                    // (the same trait ref reached under different binders is one candidate: anonymize_bound_vars)
+                    let mut kinds: Vec<crate::next_solver::PredicateKind> = Vec::new();
+                    declaring.retain(|(_, p)| { if kinds.contains(&p.kind) { false } else { kinds.push(p.kind.clone()); true } });
+                    if declaring.len() > 1 {
+                        let traits: Vec<&str> = declaring.iter().map(|(item, _)| prog.name(prog.def(*item).parent)).collect();
+                        self.err(cx, prog, file, p.lo, format!("E0221: ambiguous associated type `{}` in bounds of `Self` (from {})", prog.syms.str(name), traits.join(", ")));
+                        return self.tys.error;
+                    }
+                }
                 if let Some(t) = self.assoc_projection(prog, trait_ref, name) {
                     return self.lower_generic_args_of_assoc_item(cx, prog, file, module, env, p, t, source_ty);
                 }
@@ -2704,6 +2796,9 @@ impl Tcx {
             let seg = &prog.files[file as usize].ast.segs(p.segs)[0];
             if seg.kind() == SegKind::SelfType {
                 if source_ty.is_some() && self.prohibit_args_on(cx, prog, file, seg, "self type", "Self") { return self.tys.error; }
+                if env.self_ty.is_none() && self.validates(prog, file) {
+                    self.err(cx, prog, file, p.lo, "E0411: cannot find type `Self` in this scope".to_string());
+                }
                 return env.self_ty.unwrap_or(self.tys.error);
             }
             let name = f.text(seg.name);
@@ -3072,6 +3167,28 @@ impl Tcx {
                 }
             }
             if let Some(GenericArgs::Angle(v)) = ast.gargs(last.args()) {
+                // generics.rs generic_arg_mismatch_err: a type, placeholder or constant written before a lifetime
+                // argument is provided where the lifetime parameter (they come first) was expected
+                if self.validates(prog, file) {
+                    let mut first_other: Option<&'static str> = None;
+                    for g in ast.list(*v) {
+                        match g {
+                            GenericArg::Type(t) => {
+                                let mut t = t;
+                                while let ast::Ty::Paren(inner) = ast.ty(*t) { t = inner; }
+                                first_other.get_or_insert(if matches!(ast.ty(*t), ast::Ty::Infer) { "placeholder" } else { "type" });
+                            }
+                            GenericArg::Const(_) => { first_other.get_or_insert("constant"); }
+                            GenericArg::Lifetime(_) => {
+                                if let Some(what) = first_other {
+                                    self.err(cx, prog, file, p.lo, format!("E0747: {} provided when a lifetime was expected", what));
+                                }
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 for g in ast.list(*v) {
                     let index = out.len() + declaration.as_ref().map_or(0, |(d, _)| self.inherited_arg_count(prog, *d));
                     match g {
@@ -3150,7 +3267,10 @@ impl Tcx {
         if let ast::Ty::Path(p) = ast.ty(t) {
             if p.no_qself() && p.segs.len() == 1 && prog.files[file as usize].ast.segs(p.segs)[0].args().is_none() {
                 let name = prog.syms.get(prog.files[file as usize].text(prog.files[file as usize].ast.segs(p.segs)[0].name)).unwrap_or(u32::MAX);
-                for &(index, _, _) in &env.consts {
+                // late.rs: a name that is a type in scope is a type argument, whatever const parameter shares it
+                let type_item = prog.lookup_in_scope(module, name, true).is_some()
+                    && !env.names.iter().enumerate().any(|(i, n)| *n == name && !env.consts.iter().any(|c| c.0 as usize == i));
+                for &(index, _, _) in env.consts.iter().filter(|_| !type_item) {
                     if env.names.get(index as usize) == Some(&name) {
                         let ct = self.tys.intern_const(crate::consts::ConstKind::Param(crate::consts::ParamConst { index }));
                         return self.tys.intern(TyKind::Const(ct));
@@ -3239,6 +3359,14 @@ impl Tcx {
     pub fn prohibit_module_args(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, module: u32, p: &ast::Path) -> bool {
         if p.segs.len() < 2 || !p.no_qself() { return false; }
         let ast = &prog.files[file as usize].ast;
+        // rustc_ast_lowering lower_qpath: parenthesized sugar belongs to the last segment of a trait path
+        if self.validates(prog, file) {
+            let segs = ast.segs(p.segs);
+            if let Some(seg) = segs[..segs.len() - 1].iter().find(|s| matches!(ast.gargs(s.args()), Some(GenericArgs::Paren(..)))) {
+                self.err(cx, prog, file, seg.name.lo, "E0214: parenthesized type parameters may only be used with a `Fn` trait".to_string());
+                return true;
+            }
+        }
         let written = |seg: &ast::PathSeg| matches!(ast.gargs(seg.args()), Some(GenericArgs::Angle(v)) if ast.list(*v).iter().any(|a| matches!(a, GenericArg::Lifetime(_) | GenericArg::Type(_) | GenericArg::Const(_))));
         let segs = ast.segs(p.segs);
         if !segs[..segs.len() - 1].iter().any(written) || !self.validates(prog, file) { return false; }

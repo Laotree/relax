@@ -504,6 +504,8 @@ pub mod obligations {
                     NextSolverError::Overflow(o) => ("E0275", o),
                     NextSolverError::Ambiguity(o) => ("E0283", o),
                 };
+                // (an obligation that mentions an error type is a consequence of that error)
+                if predicate_mentions_error(self.infcx, &o.goal.predicate) { continue; }
                 let Some(msg) = self.message(code, &o) else { continue };
                 if !seen.insert((o.cause.span, msg.clone())) { continue; }
                 out.push(self.prog.record_error(file, o.cause.span, "typeck", msg));
@@ -514,6 +516,26 @@ pub mod obligations {
         fn message(&self, code: &str, o: &PredicateObligation) -> Option<String> {
             fulfillment_message(self.infcx, self.prog, code, &o.goal)
         }
+    }
+
+    /// rustc `references_error()`: a predicate that mentions an error type or constant (once its
+    /// inference variables are resolved) is the consequence of an error already reported.
+    pub(crate) fn predicate_mentions_error(infcx: &crate::infer::InferCtxt<'_>, pred: &Predicate) -> bool {
+        struct HasError<'t, 'u>(&'t crate::types::Types, bool, &'t crate::infer::InferCtxt<'u>);
+        impl crate::types::fold::TypeFolder for HasError<'_, '_> {
+            fn fold_ty(&mut self, tys: &crate::types::Types, ty: TyId, depth: u32) -> TyId {
+                let ty = self.2.deeply_resolve_ignoring_regions(ty);
+                if self.0.has_error(ty) { self.1 = true; return ty; }
+                crate::types::fold::super_fold_ty(tys, ty, self, depth)
+            }
+            fn fold_const(&mut self, tys: &crate::types::Types, ct: crate::consts::Const, depth: u32) -> crate::consts::Const {
+                if matches!(tys.const_kind(ct), crate::consts::ConstKind::Error) { self.1 = true; return ct; }
+                crate::types::fold::super_fold_const(tys, ct, self, depth)
+            }
+        }
+        let mut h = HasError(&infcx.tcx.tys, false, infcx);
+        crate::next_solver::fold::fold_predicate(&infcx.tcx.tys, pred, &mut h);
+        h.1
     }
 
     /// The failing leaf of a well-formedness goal: `WellFormed(T)` stands for the obligations of
@@ -573,6 +595,7 @@ pub mod obligations {
             DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => {
                 let mut errors = with_wfcx(prog, tcx, did, |w| check_fn(w, ast, item));
                 if def.kind != DefKind::ForeignFn { errors.extend(check_opaque_cycles(prog, tcx, did, item.lo)); }
+                if matches!(item.kind, ItemKind::Fn(sig, _, _) if ast.fn_sig(sig).asyncness) { errors.extend(check_async_recursion(prog, tcx, did, item.lo)); }
                 errors
             }
             DefKind::Impl => {
@@ -1040,6 +1063,60 @@ pub mod obligations {
     /// rustc_hir_analysis/src/check/check.rs check_opaque_for_cycles + rustc_middle/src/ty/util.rs
     /// OpaqueTypeExpander: expanding the hidden type of an opaque the fn defines must not reach the
     /// opaque again (E0720).
+    /// rustc_query_impl handle_cycle_error.rs layout_of: the layout of a coroutine that holds the
+    /// future it awaits (a recursive `async fn` call not behind a pointer) needs itself: E0733.
+    /// The edges are the awaited operands, which are live across their suspension point.
+    fn check_async_recursion(prog: &Program, tcx: &Tcx, owner: DefId, pos: u32) -> Vec<String> {
+        fn coroutines_in(prog: &Program, tcx: &Tcx, t: TyId, depth: u32, out: &mut Vec<(u32, u32, DefId)>) {
+            if depth > 24 { return; }
+            match tcx.tys.kind(t).clone() {
+                TyKind::Closure(file, ce, args) if tcx.coroutines.contains(&(file, ce)) => {
+                    if let TyKind::FnDef(owner, ..) = tcx.tys.kind(args.parent_args) { if !out.contains(&(file, ce, *owner)) { out.push((file, ce, *owner)); } }
+                }
+                TyKind::Alias(_, a) => if let crate::types::AliasTyKind::Opaque { def_id } = a.kind {
+                    let Ok(hidden) = tcx.type_of(prog, def_id) else { return };
+                    let targs: Vec<TyId> = tcx.tys.list(a.args).to_vec();
+                    let args = tcx.complete_args(prog, def_id, &targs, a.regions);
+                    coroutines_in(prog, tcx, tcx.instantiate_ty(prog, def_id, &args, hidden), depth + 1, out);
+                },
+                TyKind::Tuple(v) => for &x in tcx.tys.list(v) { coroutines_in(prog, tcx, x, depth + 1, out); },
+                TyKind::Array(e, _) => coroutines_in(prog, tcx, e, depth + 1, out),
+                TyKind::Adt(d, a, r) => if let Some(adt) = tcx.adts.get(&d) {
+                    if prog.def(d).kind != DefKind::Struct && !adt.is_enum { return; }
+                    let args = tcx.complete_args(prog, d, tcx.tys.list(a), r);
+                    for v in &adt.variants { for f in &v.fields { coroutines_in(prog, tcx, tcx.instantiate_ty(prog, d, &args, f.ty), depth + 1, out); } }
+                },
+                _ => {}
+            }
+        }
+        let body = tcx.typeck(prog, owner);
+        if !body.errors.is_empty() { return Vec::new(); }
+        let file = prog.def(owner).file;
+        let starts: Vec<u32> = body.closures.iter().copied().filter(|ce| tcx.coroutines.contains(&(file, *ce))).collect();
+        for start in starts {
+            // depth-first over "awaits a future holding coroutine"
+            let mut seen: Vec<(u32, u32)> = Vec::new();
+            let mut stack = vec![(file, start, owner)];
+            while let Some((f, ce, o)) = stack.pop() {
+                let b = tcx.typeck(prog, o);
+                if !b.errors.is_empty() { continue; }
+                for &(c, t, _) in b.awaits.iter() {
+                    if c != ce { continue; }
+                    let mut found = Vec::new();
+                    coroutines_in(prog, tcx, t, 0, &mut found);
+                    for (nf, nce, no) in found {
+                        if nf == file && nce == start && no == owner {
+                            return vec![prog.record_error(file, pos, "typeck", "E0733: recursion in an async fn requires boxing".to_string())];
+                        }
+                        if !seen.contains(&(nf, nce)) { seen.push((nf, nce)); stack.push((nf, nce, no)); }
+                    }
+                }
+                let _ = f;
+            }
+        }
+        Vec::new()
+    }
+
     fn check_opaque_cycles(prog: &Program, tcx: &Tcx, owner: DefId, pos: u32) -> Vec<String> {
         use crate::types::fold::{TypeFolder, super_fold_ty};
         use crate::types::{AliasTyKind, Types};
