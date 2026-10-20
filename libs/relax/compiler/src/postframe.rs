@@ -87,10 +87,10 @@ pub fn ahead_progress() -> (u64, u64) {
     (AHEAD_DONE.load(Relaxed), crate::jit::ahead_queued() + AHEAD_RUNNING.load(Relaxed))
 }
 
-/// The app is ready after its first present: the UI thread has not waited on the JIT for
+/// The app is ready after its first present (false before it): the UI thread has not waited on the JIT for
 /// `quiet_ns` and nothing is left to build ahead.
 pub fn ready(quiet_ns: u64) -> bool {
-    ui_idle_ns() >= quiet_ns && ahead_progress().1 == 0
+    present_ns() != 0 && ui_idle_ns() >= quiet_ns && ahead_progress().1 == 0
 }
 
 fn present_ns() -> u64 {
