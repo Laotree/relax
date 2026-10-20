@@ -1205,7 +1205,7 @@ pub fn start_in_run(spec: AppSpec) -> Result<DomainId, Vec<String>> {
 unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize], cfgs: &[crate::cfg::CfgSet], idents: &[u64], id: DomainId, reread: bool) -> Result<(u32, usize, Vec<String>, usize), Vec<String>> {
     use crate::modules::{Dep, NewCrate};
     let u = &mut *up;
-    let std_count = crate::std_pre_crates(&u.prog.session.clone()).len();
+    let std_count = crate::std_pre_crates(&u.prog.session.clone(), u.prog.std_simd).len();
     let std_deps: Vec<(String, Dep)> = (0..std_count).map(|k| (u.prog.syms.str(u.prog.crates[k].name).to_string(), Dep::Existing(k as u32))).collect();
     let mut crate_of = vec![u32::MAX; g.crates.len()];
     let mut batch_of = vec![usize::MAX; g.crates.len()];
@@ -1231,12 +1231,25 @@ unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize]
                 if let Some(path) = u.prog.file_paths.get(file) { current.insert((krate, path), file); }
             }
         }
+        // every changed file, with the bytes on disk now: the program's source registry keeps the
+        // first snapshot of a path for good (source ids name paths across revisions), so the new
+        // revision reads these through an overlay -- without it a second relaunch after an edit
+        // loaded the first relaunch's text again
+        let mut fresh: Vec<(String, Vec<u8>)> = Vec::new();
         for ((krate, path), file) in current {
-            if path.is_empty() || changed.contains(&krate) { continue; }
+            if path.is_empty() { continue; }
             let pf = &u.prog.files[file];
-            if !crate::vfs::read(path).is_ok_and(|src| src.as_slice() == &pf.src[..pf.src_len as usize]) {
-                changed.insert(krate);
+            match crate::vfs::read(path) {
+                Ok(src) if src.as_slice() == &pf.src[..pf.src_len as usize] => {}
+                Ok(src) => {
+                    changed.insert(krate);
+                    if !fresh.iter().any(|f| &f.0 == path) { fresh.push((path.clone(), src)); }
+                }
+                Err(_) => { changed.insert(krate); }
             }
+        }
+        for (path, src) in fresh {
+            u.prog.sources = std::sync::Arc::new(u.prog.sources.overlay(&path, src.into()));
         }
     }
     for &ci in order {
