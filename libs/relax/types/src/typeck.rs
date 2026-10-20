@@ -3671,6 +3671,15 @@ impl<'a> Fcx<'a> {
                 return (Res::Err, error);
             }
         };
+        // (rustc probe_for_name / resolve_fully_qualified_call: the self type is structurally resolved --
+        // an alias such as `type Foo<T> = <Option<T> as Mirror>::Assoc` names the type it normalizes to)
+        let self_ty = self.shallow(self_ty);
+        // the next solver proves the self type well formed before the lookup (its WF goal may constrain the
+        // inference variables the written type mentions: `Alias::foo()` with `Foo<?t, <() as Constrain<?t>>::Assoc>`)
+        if self.tcx.tys.has_infer(self.infcx.deeply_resolve_ignoring_regions(self_ty)) {
+            self.register_wf(self_ty, path.lo);
+            self.retry_goals(false);
+        }
         let name = segs[n - 1].1;
         // enum variant through a type alias / Self
         if let TyKind::Adt(ad, aargs, _) = self.tcx.tys.kind(self_ty).clone() {
