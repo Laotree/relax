@@ -110,8 +110,7 @@ impl Fcx<'_> {
     fn cast_is_coercion(&mut self, e: ExprId, from: TyId, to: TyId) -> bool {
         let snap = self.start_snapshot();
         let n_dd = self.deferred_dyn.len();
-        let old = self.b.coerce.get(&e.0).copied();
-        let old_reborrow = self.b.reborrows.get(&e.0).copied();
+        let old = self.save_value_adjustments(e.0);
         let mut ok = self.coerce(from, to, Some(e), self.last_lo, false).is_some();
         if !ok {
             // the object and unsizing coercions the `Cast` arm applies on its own
@@ -121,8 +120,7 @@ impl Fcx<'_> {
         }
         self.rollback_to(snap);
         self.deferred_dyn.truncate(n_dd);
-        match old_reborrow { Some(v) => { self.b.reborrows.insert(e.0, v); } None => { self.b.reborrows.remove(&e.0); } }
-        match old { Some(c) => { self.b.coerce.insert(e.0, c); } None => { self.b.coerce.remove(&e.0); } }
+        self.restore_value_adjustments(e.0, old);
         ok
     }
 
@@ -149,6 +147,14 @@ impl Fcx<'_> {
     pub(super) fn check_cast_final(&mut self, e: ExprId, expr_ty: TyId, cast_ty: TyId, lo: u32) {
         let expr_ty = self.deeply_resolve_ignoring_regions_with_obligations(expr_ty);
         let cast_ty = self.deeply_resolve_ignoring_regions_with_obligations(cast_ty);
+        // rustc CastCheck::check: both types are structurally resolved first (E0282 at the
+        // offending subexpression / the cast target)
+        for (t, span) in [(expr_ty, self.ast().expr(e).lo), (cast_ty, lo)] {
+            if matches!(self.tcx.tys.kind(self.shallow(t)), TyKind::Infer(_)) {
+                if !self.infcx.tainted_by_errors() { self.err(span, "E0282: type annotations needed".into()); }
+                return;
+            }
+        }
         if self.tcx.tys.has_error(expr_ty) || self.tcx.tys.has_error(cast_ty) { return; }
         let (es, cs) = (self.cast_ty_str(expr_ty), self.cast_ty_str(cast_ty));
         if !self.type_is_sized_modulo_regions(cast_ty) && !self.tcx.tys.has_infer(cast_ty) {

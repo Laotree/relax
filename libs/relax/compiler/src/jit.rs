@@ -911,7 +911,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
                 }
                 owner::call(owner::Class::Background, || {
                     for &id in chunk {
-                        (&mut *up).note_first_borrowck(id);
+                        (&mut *up).note_first_borrowck(id, None);
                     }
                 });
             }
@@ -1063,7 +1063,8 @@ thread_local! {
     /// saved host context of this thread's innermost `enter` (sp); 0 = no recovery point
     static CTX: std::cell::UnsafeCell<[u64; 2]> = const { std::cell::UnsafeCell::new([0; 2]) };
     /// stack of format buffers: format!/write! to non-Formatter targets push one
-    static FMT: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(vec![String::new()]);
+    // (the outer buffer is kept-heap: a thread-local past the compiler generations)
+    static FMT: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(crate::zone_alloc::kept_with(|| vec![String::new()]));
     /// the last popped buffer (valid until the next pop)
     static FMT_POPPED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     static PANIC: std::cell::RefCell<Option<PanicInfo>> = const { std::cell::RefCell::new(None) };
@@ -1106,6 +1107,19 @@ fn install_ice_hook() {
 }
 
 /// " (at src/file.rs:line)" of the last panic caught inside the compiler, once.
+/// A fatal message raised without a source position (a constant that exhausts static memory)
+/// gets the position of the item being evaluated, as every other diagnostic carries one.
+fn positioned_fatal(u: &Unit, id: u32, msg: &str) -> String {
+    if msg.starts_with("E0080: tried to allocate") {
+        if let FnKey::Inst(d, _) = &u.fns[id as usize].key {
+            let def = u.prog.def(*d);
+            let lo = u.prog.files[def.file as usize].ast.item(def.item).lo;
+            u.tcx.dcx.report(relax_types::next_solver::fulfill::ObligationCause { span: lo, body_id: *d }, msg.to_string());
+        }
+    }
+    msg.to_string()
+}
+
 pub fn take_ice_location() -> String {
     ICE_LOC.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
@@ -1336,7 +1350,7 @@ fn fmt_take_top() -> String {
 
 rt_fn! {
 fn rt_fmt_push() {
-    FMT.with(|f| f.borrow_mut().push(String::new()));
+    FMT.with(|f| { let _k = crate::zone_alloc::kept(); f.borrow_mut().push(String::new()) });
 }
 }
 
@@ -2045,6 +2059,21 @@ fn note_tombstone_fault(f: &os::fault::Fault) {
     if std::env::var_os("MAKEPAD_RUN_ZONE_TRACE").is_some() {
         let sym = os::proc::symbol_at(f.pc).map_or_else(|| "?".to_string(), |s| s.0);
         eprintln!("makepad-run zone: fault: {} at {:#x}, pc {:#x} in {}, thread `{}`\n", f.label(), f.addr, f.pc, sym, std::thread::current().name().unwrap_or("?"));
+        // the frame-pointer chain of the faulting thread (same stack, bounded by the sp)
+        let (mut fp, lo) = (f.fp, f.sp);
+        for _ in 0..24 {
+            if fp % 16 != 0 || fp < lo || fp - lo > (64 << 20) {
+                break;
+            }
+            let ret = unsafe { *((fp + 8) as *const u64) };
+            let name = os::proc::symbol_at(ret).map_or_else(|| "?".to_string(), |s| s.0);
+            eprintln!("makepad-run zone:   frame {:#x} in {}", ret, name);
+            let next = unsafe { *(fp as *const u64) };
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
     }
     if let Some(g) = crate::zone_alloc::compiler_tombstone_of(f.addr as usize) {
         eprintln!("makepad: use after compiler-zone destroy (generation {g}): {} at {:#x}, pc {:#x}", f.label(), f.addr, f.pc);
@@ -4579,9 +4608,11 @@ impl Unit {
             f.patch_gen = gen;
             crate::zone_alloc::kept_with(|| self.patch_log.push((id, gen)));
         }
-        // borrowck lane: a fn instance's first code is checked lazily in the background
-        if first && gen == 0 && crate::borrowck::lazy::gandalf_enabled(options) {
-            self.note_first_borrowck(id);
+        // borrowck lane: a fn instance's first code, and every live-patched version of it, is checked
+        // lazily in the background (D3: a patch is never refused synchronously unless --check-first;
+        // its verdict arrives as a Gandalf event, at the front of the queue).
+        if (first && gen == 0 || gen > 0) && crate::borrowck::lazy::gandalf_enabled(options) {
+            self.note_first_borrowck(id, (gen > 0).then_some(0));
         }
         unsafe {
             let slot = self.slots.table(id) as *const AtomicU64;
@@ -4607,7 +4638,7 @@ impl Unit {
 
     /// borrowck lane: slot `id`'s first code (a fn instance) is checked lazily in the background,
     /// unless the disk cache has a verdict for its body.
-    pub(crate) fn note_first_borrowck(&mut self, id: u32) {
+    pub(crate) fn note_first_borrowck(&mut self, id: u32, rank: Option<u32>) {
         let options = &self.prog.session.clone().options;
         // only the running app's own crates are checked in the background (event::admit,
         // the app-crate rule of the live-edit gate): framework, dependency and std
@@ -4635,7 +4666,7 @@ impl Unit {
             let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
             crate::borrowck::lazy::note_program(options, &src, epoch);
             crate::borrowck::lazy::note_compiled(options, &src, crate::borrowck::lazy::NoteFn {
-                def: d, args: a, cache_key: key, epoch, rank: None, cached,
+                def: d, args: a, cache_key: key, epoch, rank, cached,
             });
         }
     }
@@ -4926,6 +4957,8 @@ pub fn reclaim_generation() -> u64 {
     COMPILED_FNS.load(Ordering::Relaxed) + TIER1_INSTALLS.load(Ordering::Relaxed)
         + TIER1_FINISHED.load(Ordering::Relaxed) + BUILD_GEN.load(Ordering::Relaxed)
 }
+/// The disk cache opened with no code store: no code entry can be linked in this run (run.rs).
+pub static CODE_CACHE_EMPTY: AtomicBool = AtomicBool::new(false);
 pub static MAIN_COMPILES: relax_session::sync::Mutex<Vec<MainCompile>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// One compile the main thread waited for (MAKEPAD_RUN_MAIN_COMPILE_LOG): wall interval, the slot,
@@ -5078,7 +5111,10 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
     // keep compiling meanwhile. Code linked ahead or found in the disk cache needs no front end:
     // that is tried first (in a unit call: a check without it saw no cache and type-checked
     // bodies -- parsing whole files' lazy bodies -- for code the cache had).
-    {
+    // (a cold start's cache has no code store and no speculative result exists before the first
+    // present: the probe could only miss, and it costs the main thread an owner round trip per
+    // slot; the front's own lookup follows anyway)
+    if !(CODE_CACHE_EMPTY.load(Ordering::Relaxed) && startup_phase()) {
         let r = owner::call(class, || {
             if (*up).cache.is_none() {
                 return None;
@@ -5202,8 +5238,10 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
             return Some(install_compiled(up, id, &code, map, &relocs, false));
         }
     }
-    // the disk cache (cache.rs): linked code from an earlier run, no front end or back end
-    let cached = cache_lookup(up, id);
+    // the disk cache (cache.rs): linked code from an earlier run, no front end or back end. A cold
+    // start's cache opened with no code store: the lookup could only miss, and it computes the
+    // slot's cache key on the main thread's path; the key is made when the entry is recorded
+    let cached = if CODE_CACHE_EMPTY.load(Ordering::Relaxed) && startup_phase() { None } else { cache_lookup(up, id) };
     // A relocation may install this slot recursively even if a later relocation
     // fails. Reuse that installation regardless of the outer lookup's result.
     if u.fns[id as usize].compiled { return Some(u.fns[id as usize].code); }
@@ -5322,7 +5360,7 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
             };
             end_build(up, id);
             let u = &mut *up;
-            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() { fatal.0.clone() } else { format!("internal compiler error in {}: {}{}", u.fns[id as usize].name, msg, take_ice_location()) })
+            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() { positioned_fatal(u, id, &fatal.0) } else { format!("internal compiler error in {}: {}{}", u.fns[id as usize].name, msg, take_ice_location()) })
         }
     };
     Compiled::Code(match r {
@@ -6553,9 +6591,19 @@ fn marked_hot(u: &Unit, id: u32) -> bool {
 /// Source-size bound (tokens) of baseline inline candidates.
 const BASE_INLINE_SRC_TOKS: u32 = 40;
 
+/// Baseline code inlines tiny drop glue (the optimiser's free-inline size rule decides which): each
+/// glue instance is a slot a cold start's main thread compiles on its first call (1.6 k of 21 k
+/// before the first present in Calculator) and most are a few instructions.
+/// MAKEPAD_RUN_BASE_GLUE=0: glue stays a call.
+fn base_glue() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MAKEPAD_RUN_BASE_GLUE").map_or(true, |v| v != "0"))
+}
+
 /// A callee a baseline caller may inline: a Relax core fn instance small in source.
 fn base_inline_wanted(u: &Unit, c: u32) -> bool {
     match &u.fns[c as usize].key {
+        FnKey::Glue(..) => base_glue(),
         FnKey::Inst(d, _) => u.prog.def(*d).krate == u.core_crate && src_size(u, c) <= BASE_INLINE_SRC_TOKS,
         _ => false,
     }
@@ -7036,7 +7084,7 @@ unsafe fn build_rir_mode(up: *mut Unit, id: u32, mode: RirMode) -> Result<(), St
             };
             let u = &mut *up;
             let at = ICE_AT.lock().map(|g| g.clone()).unwrap_or_default();
-            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() { fatal.0.clone() } else { format!("internal compiler error in {} (makepad run {}): {} -- makepad run bug, report it", u.fns[id as usize].name, at, msg) })
+            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() { positioned_fatal(u, id, &fatal.0) } else { format!("internal compiler error in {} (makepad run {}): {} -- makepad run bug, report it", u.fns[id as usize].name, at, msg) })
         }
     }
 }
@@ -7270,7 +7318,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             }
             // refused callees (#[inline(never)], sandboxed, user code without inline_all,
             // MAKEPAD_RUN_NOINL) are not built for inlining: decided before the build, not after
-            let want = inline_source_wanted(u, *c, full)
+            let want = (baseline && matches!(u.fns[*c as usize].key, FnKey::Glue(..)) || inline_source_wanted(u, *c, full))
                 && callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint).is_some()
                 && !noinl_callee.is_some_and(|p| name_matches(&u.fns[*c as usize].name, p));
             if want && O2_SNAPSHOT.try_with(|c| c.get()).unwrap_or(false) {
@@ -11242,6 +11290,12 @@ extern "C" fn relax_first_present() {
     }
 }
 
+/// Records encoded per owner request of the work that follows the first
+/// present: a request is not interrupted, so the main thread's next lazy compile waits for the batch
+/// that is running (256 records took 50-100 ms: a hitch in the first frames); the batches are small
+/// and the owner serves the program's requests between them.
+const POST_PRESENT_BATCH: usize = 24;
+
 /// Releases speculation, O1 inline candidates and O3 at the first present, never on wall
 /// time (Stage needs 40-58 s from main to present; a clock released speculation in the middle
 /// of startup, and main then waited seconds on the unit lock behind speculative builds). A
@@ -11285,7 +11339,7 @@ pub fn startup_main(runtime: &crate::options::RuntimeOptions) {
             let _job = compile_job();
             let more = owner::call(owner::Class::Background, || {
                 let up = SPEC_UNIT.load(Ordering::Acquire);
-                !SPEC_STOP.load(Ordering::SeqCst) && !up.is_null() && unsafe { (&mut *up).record_cache_batch(256) }
+                !SPEC_STOP.load(Ordering::SeqCst) && !up.is_null() && unsafe { (&mut *up).record_cache_batch(POST_PRESENT_BATCH) }
             });
             if !more { break; }
             std::thread::yield_now();
@@ -12271,9 +12325,12 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
     }
 }
 
-thread_local! {
+crate::gen_local! {
     /// the constants (and their arguments) whose initializers this thread is evaluating, outermost first
-    static CONST_STACK: std::cell::RefCell<Vec<(DefId, Vec<TyId>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// (compiler TLS: the buffer is a generation's block, the settle swap must forget it)
+    static CONST_STACK: std::cell::RefCell<Vec<(DefId, Vec<TyId>)>>;
+}
+thread_local! {
     /// const/static initializers this thread is evaluating (run_init_code)
     static CONST_EVAL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// guarded run-time module calls this thread is inside (std::relax::guard)
@@ -12548,7 +12605,7 @@ unsafe fn split_front(up: *mut Unit, id: u32) -> Result<Front, String> {
         Err(p) if p.is::<crate::preempt::OwnerBusy>() => std::panic::resume_unwind(p),
         Err(p) => {
             let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".to_string());
-            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() { fatal.0.clone() } else { format!("internal compiler error in {}: {}{}", u.fns[id as usize].name, msg, take_ice_location()) })
+            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() { positioned_fatal(u, id, &fatal.0) } else { format!("internal compiler error in {}: {}{}", u.fns[id as usize].name, msg, take_ice_location()) })
         }
     }
 }
@@ -13639,8 +13696,8 @@ pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body, warm_only: bool,
     for (k, m) in b.methods.iter().chain(b.binops.iter()) {
         add(*k, m.def, tcx.tys.list(m.args));
     }
-    for ((k, _), (d, a)) in &b.ov_derefs {
-        add(*k, *d, tcx.tys.list(*a));
+    for (k, _, (d, a)) in b.overloaded_derefs() {
+        add(k, d, tcx.tys.list(a));
     }
     for (k, (d, a)) in b.ov_index.iter().chain(b.for_next.iter()) {
         add(*k, *d, tcx.tys.list(*a));
@@ -13659,7 +13716,9 @@ fn bump(next: &AtomicU64, size: u64, align: u64, end: u64, full: &str) -> u64 {
     loop {
         let at = (cur + a - 1) / a * a;
         if at + size > end {
-            panic!("{}", full);
+            // (a constant that asks for more memory than the compiler has is a constant-evaluation
+            // error, not a compiler bug: rustc's `MemoryExhausted`)
+            std::panic::resume_unwind(Box::new(crate::infer::diagnostics::FatalError(format!("E0080: tried to allocate more memory than available to compiler ({full})"))));
         }
         match next.compare_exchange_weak(cur, at + size, Ordering::AcqRel, Ordering::Relaxed) {
             Ok(_) => {
