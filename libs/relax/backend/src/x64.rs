@@ -2633,10 +2633,17 @@ impl<'a> Gen<'a> {
                         self.a.sse_rm(0, 0x11, XS, rd, o);
                         o += 16;
                     }
-                    if o < size {
-                        // the tail as one overlapping 16-byte move
-                        self.a.sse_rm(0, 0x10, XS, rs, size - 16);
-                        self.a.sse_rm(0, 0x11, XS, rd, size - 16);
+                    // the tail in 8/4/2/1-byte pieces, not one overlapping 16-byte move: a value
+                    // moved through several temporaries is copied with the same pieces each
+                    // time, so every load reads exactly one earlier store (an overlapping tail
+                    // made the next copy's [n-32, n-16) load span two stores: a failed store
+                    // forward per chained copy)
+                    for w in [8i32, 4, 2, 1] {
+                        while o + w <= size {
+                            self.a.load_ext(RAX, rs, o, w as u8, false);
+                            self.a.store_n(rd, o, RAX, w as u8);
+                            o += w;
+                        }
                     }
                     return;
                 }
