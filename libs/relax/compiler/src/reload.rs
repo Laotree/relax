@@ -2922,7 +2922,11 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let mut pre_n = 0usize;
     if errs.is_empty() {
         for &id in slots.iter().chain(fresh.iter()) {
+            // SPEC-V: the edited bodies have no verdict for their new text yet: flagged before any
+            // caller of this batch looks at them (unverified code is not inlined)
+            let unverified = !u.verdict_clean(id);
             let f = &mut u.fns[id as usize];
+            f.unverified.store(unverified, Ordering::Relaxed);
             f.rir = None;
             if let Some(h) = &mut f.history { h.inlined_into.clear(); }
             f.build_err = None;
