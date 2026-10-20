@@ -117,9 +117,10 @@ fn forget_mapping(start: usize) {
 /// maps up to 16 neighbouring page-cache pages per fault), and they stay counted in RSS/PSS for
 /// the rest of the run though few are read again. The mappings are read-only file pages, so
 /// nothing is lost: a later read faults the page back from the page cache (a minor fault).
-/// Linux/Android only; macOS does not count clean file pages in the footprint. Returns bytes advised.
+/// macOS does not count clean file pages in the footprint, but they are in the resident size.
+/// Returns bytes advised.
 pub fn release_resident() -> usize {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     {
         extern "C" {
             fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
