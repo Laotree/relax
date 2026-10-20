@@ -4630,7 +4630,18 @@ impl<'a> Fcx<'a> {
                 while a.len() < need {
                     a.push(self.fresh_arg(d, a.len()));
                 }
-                Some(self.tcx.tys.subst(t, &a))
+                let t = self.tcx.tys.subst(t, &a);
+                // the alias's lifetime parameters: the ones written on the segment, else inferred
+                // (`S2::shl` for `type S2<'a> = S<'a, 'a>`)
+                let params = self.tcx.generic_indices_of(prog, d).lifetimes.clone();
+                if params.is_empty() { return Some(t); }
+                let written = self.seg_lifetimes(path, n - 1);
+                let regions: Vec<crate::types::RegionId> = if written.len() == params.len() { written } else { params.iter().map(|_| self.fresh_region()).collect() };
+                Some(self.tcx.tys.map_regions(t, &|r, depth| match self.tcx.tys.region_kind(r) {
+                    crate::types::RegionKind::ReBound(b, _) if b < depth => r,
+                    crate::types::RegionKind::ReEarlyParam(i) => params.iter().position(|&p| p == i).map_or(r, |k| regions[k]),
+                    _ => r,
+                }, 0))
             }
             _ => None,
         }

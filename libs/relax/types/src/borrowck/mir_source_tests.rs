@@ -665,3 +665,16 @@ fn a_trait_objects_supertrait_projection_implies_the_outlives_of_its_term() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn a_type_alias_prefix_of_a_path_instantiates_the_aliass_lifetimes() {
+    // `S2::shl` for `type S2<'a> = S<'a, 'a>`: the user self type has inference regions, not the alias's own parameter.
+    let (errors, unchecked) = borrowck_source_in("
+        use std::ops::Shl;
+        pub struct S<'a, 'b: 'a>(&'a &'b u32);
+        type S2<'a> = S<'a, 'a>;
+        impl<'a, 'b> Shl<&'b u32> for S<'a, 'b> { type Output = &'a u32; fn shl(self, t: &'b u32) -> &'a u32 { t } }
+        pub fn f(s: S2) -> &u32 { S2::shl(s, &mut 3) }", 2015);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0716"), "{errors:?}");
+}
