@@ -185,7 +185,6 @@ fn collect_defining_uses(tcx: &Tcx, prog: &Program, infcx: &mut dyn OpaqueOps, r
             }
         });
         if let Err(err) = infcx.opaque_type_has_defining_use_args(&non_nll_key) {
-            if std::env::var_os("GDUMP").is_some() { eprintln!("NONDEF key {:?} nll {:?} err {:?}", non_nll_key, key, err); }
             // A non-defining use. With the next solver this is not an error by itself: it is
             // ignored, and only reported if no defining use exists.
             if err == NonDefiningUseReason::Tainted {
@@ -536,7 +535,7 @@ impl OpaqueOps for BorrowckInferCtxt<'_> {
             }
         }
         for (_, param_indices) in seen_params {
-            if param_indices.len() > 1 { if std::env::var_os("GDUMP").is_some() { eprintln!("CANON {:?} edges", canonical.get().iter().map(|a| match a { GenericArg::Lifetime(r) => format!("{:?}", tys.region_kind(*r)), o => format!("{o:?}") }).collect::<Vec<_>>()); } return Err(NonDefiningUseReason::DuplicateParam { opaque_type_key: key.clone(), param_indices }); }
+            if param_indices.len() > 1 { return Err(NonDefiningUseReason::DuplicateParam { opaque_type_key: key.clone(), param_indices }); }
         }
         Ok(())
     }

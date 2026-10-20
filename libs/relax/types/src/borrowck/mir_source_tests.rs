@@ -556,3 +556,11 @@ fn a_nested_opaque_captures_the_items_lifetimes_through_the_enclosing_opaque() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn a_closure_cast_to_a_higher_ranked_fn_pointer_takes_the_signature_from_the_target() {
+    let (errors, unchecked) = borrowck_source("
+        pub fn foo() -> impl Into<for<'a> fn(&'a ())> { (|_| {}) as for<'a> fn(&'a ()) }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
