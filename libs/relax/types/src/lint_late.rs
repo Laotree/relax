@@ -2419,6 +2419,52 @@ impl<'a> Dp<'a> {
     }
 }
 
+pub const VARIANT_SIZE_DIFFERENCES: Lint = lint::lint("variant_size_differences");
+
+/// rustc_lint types.rs `VariantSizeDifferences`: a tagged enum whose largest variant is more than
+/// three times larger than the second largest (sizes without the tag).
+pub fn variant_size_differences(prog: &Program, tcx: &Tcx, own: &[bool]) {
+    if !lint::enabled() { return; }
+    for i in 0..prog.defs.len() {
+        let d = DefId(i as u32);
+        let def = prog.def(d);
+        if def.kind != DefKind::Enum || !own.get(def.krate as usize).copied().unwrap_or(false) || lint::generated(prog, d) { continue; }
+        let Some(adt) = tcx.adts.get(&d) else { continue };
+        if adt.n_generics != 0 || adt.variants.len() < 2 { continue; }
+        let bad = crate::types::TypeFlags::HAS_PARAM | crate::types::TypeFlags::HAS_ALIAS | crate::types::TypeFlags::HAS_ERROR | crate::types::TypeFlags::HAS_INFER;
+        if adt.variants.iter().any(|v| v.fields.iter().any(|f| tcx.tys.flags(f.ty).intersects(bad))) { continue; }
+        let ty = tcx.tys.intern(TyKind::Adt(d, tcx.tys.mk_list(&[]), adt.region_params));
+        let lcx = crate::layout::LayoutCx::new(prog);
+        let lay = crate::layout::Layouts::new();
+        let l = lay.of(&lcx, tcx, ty);
+        let (Some((_, mem)), crate::layout::TagEnc::Direct) = (l.tag, l.enc) else { continue };
+        let tag_size = match mem { crate::rir::Mem::Int(b, _) => b as u32, crate::rir::Mem::F32 => 4, crate::rir::Mem::F64 => 8 };
+        if l.variant_fields.len() != adt.variants.len() { continue; }
+        let (mut largest, mut slargest, mut li) = (0u32, 0u32, 0usize);
+        for (vi, v) in adt.variants.iter().enumerate() {
+            let (mut end, mut align) = (tag_size, tag_size.max(1));
+            for (fi, f) in v.fields.iter().enumerate() {
+                let fl = lay.of(&lcx, tcx, f.ty);
+                let off = l.variant_fields[vi].get(fi).copied().unwrap_or(0);
+                if off == u32::MAX { continue; }
+                end = end.max(off + fl.size);
+                align = align.max(fl.align);
+            }
+            let size = crate::layout::round_up(end, align);
+            let bytes = size.saturating_sub(tag_size);
+            if bytes > largest { slargest = largest; largest = bytes; li = vi; }
+            else if bytes > slargest { slargest = bytes; }
+        }
+        if largest > slargest * 3 && slargest > 0 {
+            let ast = &prog.files[def.file as usize].ast;
+            let ItemKind::Enum(r) = ast.item(def.item).kind else { continue };
+            let Some(v) = ast.list(ast.row(r).variants).get(li) else { continue };
+            if lint::external(prog, def.file, v.name.lo) { continue; }
+            lint::emit(prog, d, &VARIANT_SIZE_DIFFERENCES, def.file, v.name.lo, &format!("enum variant is more than three times larger ({} bytes) than the next largest", largest));
+        }
+    }
+}
+
 /// rustc builtin.rs `MissingCopyImplementations`: a reachable, non-generic ADT with no
 /// destructor, no raw pointer field, no `Iterator` impl, at most 256 bytes and only `Copy`
 /// fields could implement `Copy`.

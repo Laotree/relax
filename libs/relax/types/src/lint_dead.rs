@@ -1220,6 +1220,7 @@ pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32) {
     if executable { rep.run(&DEAD_CODE_PUB_IN_BINARY, &pre_live, true, &all); }
     rep.run(&DEAD_CODE, &s.live, false, &all);
     crate::lint_late::missing_copy_implementations(prog, tcx, own, &reach);
+    crate::lint_late::variant_size_differences(prog, tcx, own);
     crate::lint_imports::check(prog, tcx, own, &reach);
 }
 

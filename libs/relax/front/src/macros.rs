@@ -1871,6 +1871,10 @@ pub mod uses {
         SYNTH.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&(file.to_string(), pos)))
     }
 
+    static CFG_ATTR_EMPTY: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+    pub fn cfg_attr_empty(file: &str, pos: u32) { CFG_ATTR_EMPTY.lock().unwrap_or_else(|e| e.into_inner()).push((file.to_string(), pos)); }
+    pub fn take_cfg_attr_empty() -> Vec<(String, u32)> { std::mem::take(&mut *CFG_ATTR_EMPTY.lock().unwrap_or_else(|e| e.into_inner())) }
+
     /// A `;` that ends a macro_rules expansion parsed as an expression (rustc_expand
     /// ParserAnyMacro::make, semicolon_in_expressions_from_macros): the expansion's file, the
     /// `;` token's position, the call's position and the file of the macro's definition.
