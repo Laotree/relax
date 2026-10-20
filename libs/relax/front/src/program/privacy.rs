@@ -95,17 +95,28 @@ impl Program {
     /// items (rustc_resolve: a glob binding that conflicts with another glob's is ambiguous
     /// when used; E0659). `from`: the module the name is used from.
     pub fn glob_ambiguous(&self, m: u32, name: Sym, ns_type: bool, from: u32, skip_direct: bool) -> bool {
+        self.glob_ambiguous_in(m, name, ns_type, from, skip_direct, &mut Vec::new())
+    }
+
+    /// `glob_ambiguous`, also true when a glob's module is itself ambiguous for `name` (its
+    /// glob imports clash: the binding the outer glob re-exports is ambiguous too).
+    fn glob_ambiguous_in(&self, m: u32, name: Sym, ns_type: bool, from: u32, skip_direct: bool, seen: &mut Vec<u32>) -> bool {
         let md = &self.mods[m as usize];
-        if md.globs.len() < 2 || (!skip_direct && (if ns_type { md.types.contains_key(&name) } else { md.values.contains_key(&name) })) {
+        if md.globs.is_empty() || (!skip_direct && (if ns_type { md.types.contains_key(&name) } else { md.values.contains_key(&name) })) {
             return false;
         }
+        if seen.contains(&m) { return false; }
+        seen.push(m);
         let mut found: Option<DefId> = None;
+        let mut ambiguous = false;
         for &(g, _) in &md.globs {
             let gd = self.def(g);
             let r = match gd.kind {
                 DefKind::Mod => {
                     let mut q = GlobQuery { precise: true, ..Default::default() };
-                    self.lookup_in_module_vis(gd.sub, name, ns_type, &mut q)
+                    let r = self.lookup_in_module_vis(gd.sub, name, ns_type, &mut q);
+                    if r.is_some() && self.glob_ambiguous_in(gd.sub, name, ns_type, from, false, seen) { ambiguous = true; }
+                    r
                 }
                 DefKind::Enum => self.lookup_in_container(g, name, false).map(|d| (d, None)),
                 _ => None,
@@ -116,12 +127,13 @@ impl Program {
                 }
                 match found {
                     None => found = Some(d),
-                    Some(f) if f != d => return true,
+                    Some(f) if f != d => ambiguous = true,
                     _ => {}
                 }
             }
         }
-        false
+        seen.pop();
+        ambiguous
     }
 
     /// A name used on its own: ambiguous when the scope it is found in binds it through globs only.
