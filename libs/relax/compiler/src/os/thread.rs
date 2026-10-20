@@ -55,7 +55,6 @@ mod unix {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp {
     pub use super::unix::{current, exit_now, fork, kick, name};
-    use super::unix::pthread_self;
 
     pub fn lower_priority(_utility: bool) {
         extern "C" {
