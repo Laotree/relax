@@ -845,6 +845,13 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             fcx.b.ret = ct;
             fcx.ret_stack.push(ct);
             fcx.in_const = true;
+            // rustc_builtin_macros global_allocator: the static's methods are called as `GlobalAlloc`'s
+            if d.kind == DefKind::Static && tcx.validates(prog, file) && crate::lang_items::has_attr(prog, file, ast.list(ast.item(d.item).attrs), "global_allocator") {
+                if let Some(alloc) = fcx.lang_item(&["alloc", "GlobalAlloc"]) {
+                    let goal = fcx.trait_goal(alloc, ct, &[]);
+                    fcx.register_goal(goal, ast.expr(*init).lo);
+                }
+            }
             let t = fcx.check_expr(*init, Some(ct));
             fcx.coerce_or_unify(t, ct, Some(*init), ast.expr(*init).lo);
             fcx.finish();
