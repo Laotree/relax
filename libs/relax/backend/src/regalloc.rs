@@ -862,10 +862,30 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     let wts = block_weights(options, f, &reach, freq);
     let aff = affinities(f, &reach, &block_start, &ranges, &wts);
     let (mut remat, base_only) = remat_values(options, f, &reach, cfg);
-    // base + k is recomputed only where the base is live (holds its one value)
-    for v in 0..nv as usize {
-        if let Remat::Offset(b, _) = remat[v] {
-            if !ranges_cover(ranges.of(b.0), ranges.of(v as u32)) {
+    // base + k is recomputed at its uses: the base must be live (hold its one value) at each of
+    // them -- not over the whole range of the value (the cold-call split leaves the base a hole
+    // at a call the value lives across)
+    if remat.iter().any(|r| matches!(r, Remat::Offset(..))) {
+        let mut ok = vec![true; nv as usize];
+        let live_at = |b: u32, p: u32| ranges.of(b).iter().any(|&(a, z)| a <= p && p <= z);
+        for (bi, b) in f.blocks.iter().enumerate() {
+            if !reach[bi] {
+                continue;
+            }
+            let k0 = tab.first[bi] as usize;
+            for k in 0..=b.insts.len() {
+                let p = if k < b.insts.len() { block_start[bi] + 2 * k as u32 + 1 } else { block_end[bi] - 1 };
+                for &u in tab.uses(k0 + k) {
+                    if let Remat::Offset(base, _) = remat[u as usize] {
+                        if !live_at(base.0, p) {
+                            ok[u as usize] = false;
+                        }
+                    }
+                }
+            }
+        }
+        for v in 0..nv as usize {
+            if !ok[v] {
                 remat[v] = Remat::No;
             }
         }
@@ -3201,20 +3221,6 @@ fn split_loops(f: &mut Func, spilled: &[bool], inreg: Option<&[bool]>, hot: Opti
 
 fn coalesce_on(options: &relax_session::Options) -> bool {
     !options.no_coalesce
-}
-
-/// Is every position of `inner` inside `outer` (sorted, disjoint, merged range lists)?
-fn ranges_cover(outer: &[(u32, u32)], inner: &[(u32, u32)]) -> bool {
-    let mut k = 0;
-    for &(a, b) in inner {
-        while k < outer.len() && outer[k].1 < a {
-            k += 1;
-        }
-        if k == outer.len() || outer[k].0 > a || outer[k].1 < b {
-            return false;
-        }
-    }
-    true
 }
 
 /// Do two sorted, disjoint range lists share a position?
