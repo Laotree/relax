@@ -35,6 +35,50 @@ static SUMMARY_DONE: AtomicBool = AtomicBool::new(false);
 static SERVED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static SERVED_BLOCKING: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
+// ------------------------------------------------------------ readiness (the warm-up veil)
+
+/// UI-thread JIT waits open now (a lazy compile, an owner request; nested ones count once each)
+static UI_WAITING: AtomicU64 = AtomicU64::new(0);
+/// wall ns the last UI-thread JIT wait ended
+static UI_WAIT_END: AtomicU64 = AtomicU64::new(0);
+/// builds ahead (speculative / prepared) finished after the first present, and running now
+pub(crate) static AHEAD_DONE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static AHEAD_RUNNING: AtomicU64 = AtomicU64::new(0);
+
+/// The UI (main) thread begins / ends a wait on the JIT (jit.rs lazy compiles, owner.rs requests).
+pub(crate) fn ui_wait_begin() {
+    UI_WAITING.fetch_add(1, Relaxed);
+}
+pub(crate) fn ui_wait_end() {
+    UI_WAIT_END.store(wall_ns(), Relaxed);
+    UI_WAITING.fetch_sub(1, Relaxed);
+}
+
+/// ns since the UI thread last waited on the JIT: 0 while it waits, u64::MAX before the first
+/// present. Atomics only.
+pub fn ui_idle_ns() -> u64 {
+    let fp = present_ns();
+    if fp == 0 {
+        return u64::MAX;
+    }
+    if UI_WAITING.load(Relaxed) > 0 {
+        return 0;
+    }
+    wall_ns().saturating_sub(UI_WAIT_END.load(Relaxed).max(fp))
+}
+
+/// Functions built ahead since the first present, and those still queued or building (the
+/// speculative / prepare queue; a queue being changed right now reads as 1 more).
+pub fn ahead_progress() -> (u64, u64) {
+    (AHEAD_DONE.load(Relaxed), crate::jit::ahead_queued() + AHEAD_RUNNING.load(Relaxed))
+}
+
+/// The app is ready after its first present: the UI thread has not waited on the JIT for
+/// `quiet_ns` and nothing is left to build ahead.
+pub fn ready(quiet_ns: u64) -> bool {
+    ui_idle_ns() >= quiet_ns && ahead_progress().1 == 0
+}
+
 fn present_ns() -> u64 {
     FIRST_PRESENT_NS.load(Relaxed)
 }

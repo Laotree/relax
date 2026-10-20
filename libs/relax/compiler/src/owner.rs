@@ -363,6 +363,9 @@ fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f
     let t_req = std::time::Instant::now();
     let t0 = if main_wait { crate::jit::wall_ns() } else { 0 };
     in_call_add(1);
+    if req.t_push != 0 {
+        crate::postframe::ui_wait_begin();
+    }
     push(&req as *const Req as usize, class);
     let withdrawn = {
         let _w = crate::waits::begin(crate::waits::Kind::Owner, class as u64, OWNER_TID.load(Ordering::Relaxed), CLASS_NAMES[class as usize]);
@@ -370,6 +373,7 @@ fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f
     };
     in_call_add(-1);
     if req.t_push != 0 {
+        crate::postframe::ui_wait_end();
         let now = crate::jit::wall_ns();
         let w = now.saturating_sub(req.t_push);
         let done = req.t_done.load(Ordering::Relaxed);
@@ -713,6 +717,8 @@ fn pump_wait_for(runner: u64, done: &dyn Fn() -> bool) {
     }
     let _w = crate::waits::begin(crate::waits::Kind::Pump, 0, runner, "pump");
     if !is_owner() || CHILD.load(Ordering::Relaxed) {
+        // a job waiting for another thread is not running meanwhile (jit::job_sleep's reason)
+        let _idle = (!CHILD.load(Ordering::Relaxed)).then(crate::jit::JobIdle::enter);
         let t0 = std::time::Instant::now();
         while !done() {
             if CHILD.load(Ordering::Relaxed) && t0.elapsed().as_secs() >= 10 {

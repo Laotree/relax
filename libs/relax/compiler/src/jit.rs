@@ -5288,8 +5288,12 @@ unsafe fn compile_slot_on_stack_rt(up: *mut Unit, id: u32) -> u64 {
         }
         MAIN_REC.with(|c| c.set(Some(rec)));
     }
+    if on_main {
+        crate::postframe::ui_wait_begin();
+    }
     let r = compile_slot_on_stack_inner(up, id);
     if on_main {
+        crate::postframe::ui_wait_end();
         if let Some(mut rec) = MAIN_REC.with(|c| c.take()) {
             rec.end = wall_ns();
             crate::postframe::main_compile(&(&*up).fns[id as usize].name, &rec);
@@ -10834,7 +10838,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let (needs, key, front) = owner::call(owner::Class::Background, || (needs_rir(up), (&*up).fns[id as usize].key.clone(), (&*up).front.clone()));
     if needs && !t1prof_replay(options) && !owner::is_owner() {
         while !tier1_quiet() {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            job_sleep(std::time::Duration::from_millis(50));
         }
         // its type check runs first, off the unit (the build takes the checked body): one
         // solver search there took seconds, and every thread needing a lazy compile -- the UI
@@ -11855,6 +11859,11 @@ const YIELDED: &str = "(background build gave way)";
 /// relock wait, waits for in-flight builds]; and the same front/back cpu on workers
 pub static SPLIT_NS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
+/// Slots queued to be built ahead (postframe::ahead_progress; 1 while the queue is locked).
+pub(crate) fn ahead_queued() -> u64 {
+    SPEC_Q.try_lock().map_or(1, |q| q.len() as u64)
+}
+
 /// Queues the not-inlined direct callees of slot `id` (lock held), one level deeper.
 unsafe fn spec_enqueue(up: *mut Unit, id: u32, depth: u8) {
     if pipelined() && defer_startup_root(up, id, depth) { return; }
@@ -12337,7 +12346,12 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions, options: &crate::option
         if !unsafe { (&*up).spec_cached.contains(&id) } {
             unsafe { typeck_ahead_slot(up, id) };
         }
+        crate::postframe::AHEAD_RUNNING.fetch_add(1, Ordering::Relaxed);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { spec_build(up, id) }));
+        crate::postframe::AHEAD_RUNNING.fetch_sub(1, Ordering::Relaxed);
+        if FIRST_PRESENT.load(Ordering::Relaxed) && matches!(r, Ok(true)) {
+            crate::postframe::AHEAD_DONE.fetch_add(1, Ordering::Relaxed);
+        }
         match r {
             // gave way to a program thread: first in line again
             Ok(false) => SPEC_Q.lock().unwrap().push_front(id),
@@ -12507,6 +12521,15 @@ impl Drop for JobIdle {
             BG_IDLE.fetch_sub(1, Ordering::SeqCst);
         }
     }
+}
+
+/// A compile job's sleep that waits for no owner request (a poll): the job is not running meanwhile
+/// (JobIdle), so an allocator swap or a fork never waits for it -- what the poll waits for may be
+/// held up by that very swap (a job polling for quiet compiles, while the jobs the swap parked keep
+/// their startup-compile counts, waited for the swap's whole length: the swap for it, forever).
+pub(crate) fn job_sleep(d: std::time::Duration) {
+    let _idle = JobIdle::enter();
+    std::thread::sleep(d);
 }
 
 /// The thread compile jobs are paused for (an allocator swap, a fork), 0: none.
