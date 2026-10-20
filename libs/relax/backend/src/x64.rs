@@ -5017,7 +5017,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         last_spill: None,
         win,
         win_start,
-        low_only: crate::passes::low_bits_only(f),
+        low_only: crate::passes::low_bits_only(options, f),
         zero_above: Vec::new(),
         fconsts: {
             let mut nd: std::collections::HashMap<u32, (u32, u64, bool)> = std::collections::HashMap::new();
@@ -5060,7 +5060,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         pads: Vec::new(),
         unwind_tab: Vec::new(),
     };
-    g.zero_above = crate::passes::zero_above(g.f, &g.low_only);
+    g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
     g.gen(options);
     // unwind info for the runtime's frame walk (rir::unwind_info_words), 4-byte aligned
     while g.a.b.len() % 4 != 0 {

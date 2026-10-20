@@ -373,10 +373,6 @@ pub fn const_inst(d: VReg, k: K) -> Inst {
 /// Folding, copy propagation, immediates, branch folding and DCE.
 /// `ro` answers constant loads (symbol + offset) from immutable data: they fold to their value,
 /// or to a symbolic address for a pointer word (`RoReader`).
-/// Renumbers the vregs a function still mentions densely (0..n): lowering allocates many that
-/// later passes delete, and every pass sizes its per-vreg tables by `f.vregs.len()` -- at
-/// twice the instruction count that table work dominated the optimiser.
-#[inline(never)]
 /// Narrow integer results whose upper register bits nobody reads: per vreg, whether it has one
 /// definition by a narrow (< 64-bit) Add / Sub / Mul / Neg / Not / shift-left or integer cast,
 /// and every use reads only its low `bits`: a store of at most that width, a narrow wrapping
@@ -385,8 +381,12 @@ pub fn const_inst(d: VReg, k: K) -> Inst {
 /// bits) the count of a 64-bit shift (the hardware reads the count's low 6 bits). The backends then skip the
 /// result's re-extension (movzx / sxtw after every u8 / i32 operation): the bit reader's
 /// `bits_left -= n` (u8, stored back as a byte) and its `entry as u8` (a shift count).
-pub fn low_bits_only(f: &Func) -> Vec<bool> {
+/// MAKEPAD_RUN_OPT=-lowbits: none (bisection).
+pub fn low_bits_only(options: &relax_session::Options, f: &Func) -> Vec<bool> {
     let nv = f.vregs.len();
+    if crate::stats::opt_off(options, "-lowbits") {
+        return vec![false; nv];
+    }
     let mut bits = vec![0u8; nv];
     let mut ndef = vec![0u32; nv];
     for p in &f.params {
@@ -443,8 +443,12 @@ pub fn low_bits_only(f: &Func) -> Vec<bool> {
 /// upper bits as they were). A cast of such a value to a wider type is a plain move: zero- and
 /// sign-extension of a value whose upper bits are zero are the value itself (Paeth's
 /// `i32::from(u8)` was ldrb + sxtw per pixel byte).
-pub fn zero_above(f: &Func, low: &[bool]) -> Vec<u8> {
+/// MAKEPAD_RUN_OPT=-zeroabove: none (bisection).
+pub fn zero_above(options: &relax_session::Options, f: &Func, low: &[bool]) -> Vec<u8> {
     let nv = f.vregs.len();
+    if crate::stats::opt_off(options, "-zeroabove") {
+        return vec![0; nv];
+    }
     let mut ndef = vec![0u32; nv];
     for p in &f.params {
         ndef[p.0 as usize] += 2;
@@ -469,6 +473,10 @@ pub fn zero_above(f: &Func, low: &[bool]) -> Vec<u8> {
     z
 }
 
+/// Renumbers the vregs a function still mentions densely (0..n): lowering allocates many that
+/// later passes delete, and every pass sizes its per-vreg tables by `f.vregs.len()` -- at
+/// twice the instruction count that table work dominated the optimiser.
+#[inline(never)]
 pub fn compact_vregs(f: &mut Func) {
     let nv = f.vregs.len();
     const NONE: u32 = u32::MAX;

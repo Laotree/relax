@@ -3703,7 +3703,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
             }
             w
         },
-        low_only: crate::passes::low_bits_only(f),
+        low_only: crate::passes::low_bits_only(options, f),
         zero_above: Vec::new(),
         win_start: {
             let mut ws: std::collections::HashMap<u32, Vec<(u32, u8)>> = std::collections::HashMap::new();
@@ -3738,7 +3738,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         pads: Vec::new(),
         long,
     };
-    g.zero_above = crate::passes::zero_above(g.f, &g.low_only);
+    g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
     BRANCH_RANGE.with(|c| c.set(false));
     g.gen(options);
     if BRANCH_RANGE.with(|c| c.replace(false)) {
