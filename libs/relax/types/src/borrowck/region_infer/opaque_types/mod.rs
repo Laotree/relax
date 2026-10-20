@@ -190,7 +190,12 @@ fn collect_defining_uses(tcx: &Tcx, prog: &Program, infcx: &mut dyn OpaqueOps, r
         if let Err(err) = infcx.opaque_type_has_defining_use_args(&non_nll_key) {
             // A non-defining use is a hard error on stable (`use_typing_mode_borrowck()` is false; it is ignored
             // with the next solver's typing mode).
-            errors.push(DeferredOpaqueTypeError::InvalidOpaqueTypeArgs(err, hidden_type.span));
+            // (Relax's typeck, unlike rustc's, resolves the type of a call to a function of the defining scope to
+            // the hidden type: a use at an inference region is then no use the program wrote down, and is ignored
+            // as the next solver does.)
+            let inferred_lifetime = matches!(&err, NonDefiningUseReason::NotAParam { opaque_type_key, param_index }
+                if matches!(opaque_type_key.args[*param_index], GenericArg::Lifetime(r) if matches!(tys.region_kind(r), RegionKind::ReVar(_))));
+            if !inferred_lifetime { errors.push(DeferredOpaqueTypeError::InvalidOpaqueTypeArgs(err, hidden_type.span)); }
             continue;
         }
         // The original key, with its NLL variables, supplies the arg regions.
