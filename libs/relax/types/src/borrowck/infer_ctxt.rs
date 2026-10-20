@@ -248,6 +248,11 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
     }
     fn normalize_and_prove_instantiated_clauses(&mut self, out: &mut MirTypeckRegionConstraints, owner: ClauseOwner, args: &[GenericArg], locations: Locations) {
         let def = self.clause_owner(owner); let env = self.param_env_id();
+        // (proving clauses never defines an opaque type: see `NormalizeSignature`)
+        let mode = self.infcx.typing_mode.get();
+        if matches!(mode, crate::tcx::TypingMode::PostTypeckUntilBorrowck { .. }) {
+            self.infcx.typing_mode.set(crate::tcx::TypingMode::PostTypeckUntilBorrowck { defining_opaque_types: Default::default() });
+        }
         let _ = self.fully_perform_op(out, locations, ConstraintCategory::Predicate(self.locations_span(locations), def), CustomTypeOp::new(|ocx: &mut crate::next_solver::fulfill::ObligationCtxt<'_, '_>| {
             for p in ocx.infcx.tcx.clauses_of(ocx.prog, def) {
                 let p = ocx.infcx.tcx.instantiate_predicate(ocx.prog, def, args, &p);
@@ -256,13 +261,14 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
             }
             Ok(())
         }));
+        self.infcx.typing_mode.set(mode);
     }
     fn normalize(&mut self, out: &mut MirTypeckRegionConstraints, ty: TyId, locations: Locations) -> TyId {
         self.fully_perform_op(out, locations, ConstraintCategory::Boring, ParamEnvAnd { param_env: self.param_env_id(), value: Normalize { value: ty } }).unwrap_or(ty)
     }
     fn deeply_normalize_sig(&mut self, out: &mut MirTypeckRegionConstraints, sig: &FnSig, at: Location) -> Result<FnSig, ()> {
         let value = self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&sig.inputs), sig.output, sig.header, 0));
-        let ty = self.fully_perform_op(out, Locations::Single(at), ConstraintCategory::Boring, ParamEnvAnd { param_env: self.param_env_id(), value: Normalize { value } }).map_err(|_| ())?;
+        let ty = self.fully_perform_op(out, Locations::Single(at), ConstraintCategory::Boring, ParamEnvAnd { param_env: self.param_env_id(), value: crate::next_solver::type_op::NormalizeSignature { value } }).map_err(|_| ())?;
         let TyKind::FnPtr(inputs, output, header, _) = self.tcx.tys.kind(ty) else { unreachable!() };
         Ok(FnSig { inputs: self.tcx.tys.list(*inputs).to_vec(), output: *output, header: *header })
     }

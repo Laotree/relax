@@ -795,3 +795,29 @@ fn an_async_closure_returned_as_a_trait_object_references_a_local() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.len() == 1 && errors[0].starts_with("E0515"), "{errors:?}");
 }
+
+#[test]
+fn a_local_borrowed_by_a_returned_closure_or_async_block_is_e0373() {
+    // The returned value's region is boring (it outlives the `impl Trait` argument's universal region), so
+    // the borrow is explained by the constraint that returns it: a closure that escapes (E0373), not the
+    // generic "borrowed value does not live long enough".
+    let (errors, unchecked) = borrowck_source_in("
+        pub fn boxed() -> Box<impl Fn() -> u32> { let x = 0u32; Box::new(|| x) }
+        pub fn by_ref(x: &u32) -> impl Fn() -> u32 + '_ { || *x }
+        pub async fn late() {}
+        pub fn block(x: &u32) -> impl std::future::Future<Output = u32> + '_ { async { *x } }", 2018);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert_eq!(errors.iter().filter(|e| e.starts_with("E0373")).count(), 3, "{errors:?}");
+    assert_eq!(errors.len(), 3, "{errors:?}");
+}
+
+#[test]
+fn calling_a_function_that_returns_an_opaque_type_is_no_defining_use() {
+    // rustc's default solver does not define an opaque type while normalizing a callee's signature
+    // (impl-trait/member-constraints/incomplete-constraint.rs).
+    let (errors, unchecked) = borrowck_source_in("
+        fn new_defining_use<F: FnOnce(T) -> R, T, R>(_: F) {}
+        pub fn rpit1<'a, 'b: 'b>(x: &'b ()) -> impl Sized + use<'a, 'b> { new_defining_use(rpit1::<'a, 'b>); x }", 2021);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}

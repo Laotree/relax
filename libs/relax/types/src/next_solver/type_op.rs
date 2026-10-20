@@ -67,6 +67,11 @@ pub enum TypeOpInput {
 pub struct ParamEnvAnd<Q> { pub param_env: ParamEnvId, pub value: Q }
 #[derive(Clone, Copy, Debug)]
 pub struct Normalize { pub value: TyId }
+/// `Normalize` of a signature: the opaque types the body may define stay rigid aliases. The default solver
+/// never touches an opaque type when it normalizes; only relating one to its hidden type (`relate_opaque`)
+/// defines it, so a callee's `impl Trait` output or the body's own signature is no defining use.
+#[derive(Clone, Copy, Debug)]
+pub struct NormalizeSignature { pub value: TyId }
 #[derive(Clone, Debug)]
 pub struct ProvePredicate { pub predicate: Predicate }
 
@@ -82,15 +87,34 @@ impl TypeOp for ParamEnvAnd<Normalize> {
     }
     fn input(&self) -> TypeOpInput { TypeOpInput::Normalize(self.param_env, self.value.value) }
 }
+impl TypeOp for ParamEnvAnd<NormalizeSignature> {
+    type Output = TyId;
+    fn fully_perform(self, infcx: &InferCtxt<'_>, prog: &Program) -> Result<TypeOpOutput<TyId>, NoSolution> {
+        let mode = infcx.typing_mode.get();
+        if !matches!(mode, crate::tcx::TypingMode::PostTypeckUntilBorrowck { .. }) { return ParamEnvAnd { param_env: self.param_env, value: Normalize { value: self.value.value } }.fully_perform(infcx, prog); }
+        infcx.typing_mode.set(crate::tcx::TypingMode::PostTypeckUntilBorrowck { defining_opaque_types: Default::default() });
+        let result = ParamEnvAnd { param_env: self.param_env, value: Normalize { value: self.value.value } }.fully_perform(infcx, prog);
+        infcx.typing_mode.set(mode);
+        result
+    }
+    fn input(&self) -> TypeOpInput { TypeOpInput::Normalize(self.param_env, self.value.value) }
+}
 /// prove_predicate.rs:10 (the WF fast path; sizedness has no Relax fast path here) and
 /// type_op_prove_predicate_with_cause.
 impl TypeOp for ParamEnvAnd<ProvePredicate> {
     type Output = ();
     fn fully_perform(self, infcx: &InferCtxt<'_>, prog: &Program) -> Result<TypeOpOutput<()>, NoSolution> {
-        scrape_region_constraints(infcx, prog, |ocx| {
+        // (proving a predicate never defines an opaque type either: see `NormalizeSignature`)
+        let mode = infcx.typing_mode.get();
+        if matches!(mode, crate::tcx::TypingMode::PostTypeckUntilBorrowck { .. }) {
+            infcx.typing_mode.set(crate::tcx::TypingMode::PostTypeckUntilBorrowck { defining_opaque_types: Default::default() });
+        }
+        let result = scrape_region_constraints(infcx, prog, |ocx| {
             ocx.register_obligation(Goal { param_env: self.param_env.clone(), predicate: self.value.predicate.clone() });
             Ok(())
-        })
+        });
+        infcx.typing_mode.set(mode);
+        result
     }
     fn input(&self) -> TypeOpInput { TypeOpInput::ProvePredicate(self.param_env, self.value.predicate.clone()) }
 }
@@ -239,3 +263,4 @@ pub fn make_query_region_constraints(outlives_obligations: Vec<(TyId, RegionId)>
     }
     QueryRegionConstraints { constraints }
 }
+
