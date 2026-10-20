@@ -5955,7 +5955,11 @@ impl<'a> Fcx<'a> {
                 // a parameter or alias left operand is an operator trait call even when an
                 // instance is primitive (rustc op.rs is_builtin_binop): `p * 2.0` with
                 // `P: Mul<f32, Output = P>` is `<P as Mul<f32>>::mul`, not `P == f32`
-                if matches!(self.tcx.tys.kind(sa0), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Param(_) | TyKind::Alias(..)) {
+                // a type-variable left operand is an operator trait call too (rustc op.rs:41 takes
+                // the builtin path only when neither operand is a type variable): `?S: Add<?R>`
+                // stays ambiguous, it is not `?S == {integer}`
+                let sa0 = if matches!(self.tcx.tys.kind(sa0), TyKind::Infer(_)) { self.retry_goals(false); self.shallow(sa0) } else { sa0 };
+                if matches!(self.tcx.tys.kind(sa0), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Param(_) | TyKind::Alias(..) | TyKind::Infer(_)) {
                     self.cur_binop = e.0;
                     return self.check_op_trait(op, sa0, b, lo, false);
                 }
