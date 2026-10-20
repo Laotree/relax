@@ -71,6 +71,8 @@ pub fn start(app: &str) {
     let endpoint = makepad_remote::Endpoint::new(app);
     endpoint.set_hooks(makepad_remote::Hooks { enter: server_thread_enter, exit: server_thread_exit });
     endpoint.register_cmd(dispatch);
+    // SPEC-V: every answer says whether the code it observed has its borrow-check verdict
+    endpoint.set_end_fields(|s| s.push_str(if crate::reload::observations_verified() { ",\"verified\":true" } else { ",\"verified\":false" }));
     let _ = WATCH.set(endpoint.register_watch_with(events::remote_watcher_opened, events::remote_watcher_closed));
     serve_first_services(&endpoint);
     *ENDPOINT.lock().unwrap_or_else(|e| e.into_inner()) = Some(endpoint.clone());
