@@ -526,6 +526,29 @@ impl Asm {
         self.byte(op);
         self.modrm_rr(reg, rm);
     }
+    /// VEX (3-byte) register form with the vector length: `y` = 256-bit (L = 1)
+    fn vex_l(&mut self, pp: u8, map: u8, w: bool, y: bool, op: u8, reg: u8, vvvv: u8, rm: u8) {
+        self.byte(0xc4);
+        self.byte(((!(reg >> 3) & 1) << 7) | (1 << 6) | ((!(rm >> 3) & 1) << 5) | map);
+        self.byte(((w as u8) << 7) | ((!vvvv & 15) << 3) | ((y as u8) << 2) | pp);
+        self.byte(op);
+        self.modrm_rr(reg, rm);
+    }
+    /// VEX (3-byte) [base + disp] form with the vector length (an index from `sib` too)
+    fn vex_lm(&mut self, pp: u8, map: u8, w: bool, y: bool, op: u8, reg: u8, vvvv: u8, base: u8, disp: i32) {
+        let x = self.sib.map_or(0, |s| s.0);
+        self.byte(0xc4);
+        self.byte(((!(reg >> 3) & 1) << 7) | ((!(x >> 3) & 1) << 6) | ((!(base >> 3) & 1) << 5) | map);
+        self.byte(((w as u8) << 7) | ((!vvvv & 15) << 3) | ((y as u8) << 2) | pp);
+        self.byte(op);
+        self.modrm_mem(reg, base, disp);
+    }
+    /// vzeroupper: no dirty upper ymm state into code using legacy SSE (callees, callers)
+    fn vzeroupper(&mut self) {
+        self.byte(0xc5);
+        self.byte(0xf8);
+        self.byte(0x77);
+    }
     /// VEX (3-byte) [rip + disp32] form, 128-bit; returns the disp32 patch position
     fn vex_rip(&mut self, pp: u8, map: u8, w: bool, op: u8, reg: u8, vvvv: u8) -> usize {
         self.byte(0xc4);
@@ -649,6 +672,8 @@ pub fn reg_config(options: &relax_session::Options) -> RegConfig {
 // ------------------------------------------------------------ code generation
 
 struct Gen<'a> {
+    /// the function has 256-bit vectors (vzeroupper before calls and returns)
+    ymm: bool,
     a: Asm,
     f: &'a Func,
     al: Alloc,
@@ -663,7 +688,7 @@ struct Gen<'a> {
     /// float constant pool: (patch offset, bits)
     fpool: Vec<(usize, u64)>,
     /// splatted 32-bit vector constants: (patch offset, lane bits), 16-byte entries
-    vpool: Vec<(usize, u32)>,
+    vpool: Vec<(usize, u128)>,
     /// address pool: (disp32 patch offset, relocated value), 8-byte entries
     apool: Vec<(usize, Reloc)>,
     /// `Env::sym_class`: how each symbol is encoded (SymClass::Domain: an offset in the domain block)
@@ -737,6 +762,13 @@ impl<'a> Gen<'a> {
     /// Saves (or restores) a caller-saved register's value around a call: 16 bytes for a vector.
     fn save_restore(&mut self, v: VReg, slot: i32, save: bool) {
         let d = self.spill_disp(slot);
+        if self.f.vregs[v.0 as usize] == Cls::V256 {
+            if let Loc::Flt(x) = self.al.loc[v.0 as usize] {
+                // vmovups [rbp+d], ymm / vmovups ymm, [rbp+d]
+                self.a.vex_lm(0, 1, false, true, if save { 0x11 } else { 0x10 }, x, 0, RBP, d);
+            }
+            return;
+        }
         if self.f.vregs[v.0 as usize] == Cls::V128 {
             if let Loc::Flt(x) = self.al.loc[v.0 as usize] {
                 // movups [rbp+d], x / movups x, [rbp+d]
@@ -854,6 +886,11 @@ impl<'a> Gen<'a> {
     fn use_f(&mut self, v: VReg, scratch: u8) -> u8 {
         match self.al.loc[v.0 as usize] {
             Loc::Flt(x) => x,
+            Loc::Stack(o) if self.f.vregs[v.0 as usize] == Cls::V256 => {
+                let d = self.spill_disp(o);
+                self.a.vex_lm(0, 1, false, true, 0x10, scratch, 0, RBP, d); // vmovups ymm
+                scratch
+            }
             Loc::Stack(o) if self.f.vregs[v.0 as usize] == Cls::V128 => {
                 let d = self.spill_disp(o);
                 self.a.sse_rm(0, 0x10, scratch, RBP, d); // movups
@@ -877,6 +914,10 @@ impl<'a> Gen<'a> {
     fn fin_f(&mut self, v: VReg, x: u8) {
         if let Loc::Stack(o) = self.al.loc[v.0 as usize] {
             let d = self.spill_disp(o);
+            if self.f.vregs[v.0 as usize] == Cls::V256 {
+                self.a.vex_lm(0, 1, false, true, 0x11, x, 0, RBP, d); // vmovups ymm
+                return;
+            }
             if self.f.vregs[v.0 as usize] == Cls::V128 {
                 self.a.sse_rm(0, 0x11, x, RBP, d); // movups
                 return;
@@ -1289,14 +1330,14 @@ impl<'a> Gen<'a> {
             while self.a.pos() % 16 != 0 {
                 self.a.byte(0xcc);
             }
-            let mut placed: Vec<(u32, usize)> = Vec::new();
+            let mut placed: Vec<(u128, usize)> = Vec::new();
             for (at, bits) in std::mem::take(&mut self.vpool) {
                 let addr = match placed.iter().find(|(b2, _)| *b2 == bits) {
                     Some((_, a2)) => *a2,
                     None => {
                         let a2 = self.a.pos();
-                        for _ in 0..4 {
-                            self.a.u32(bits);
+                        for k in 0..4 {
+                            self.a.u32((bits >> (32 * k)) as u32);
                         }
                         placed.push((bits, a2));
                         a2
@@ -1559,6 +1600,9 @@ impl<'a> Gen<'a> {
         }
         for (d, s2) in regalloc::seq_moves(&moves, R10, XS) {
             self.mv(d, s2);
+        }
+        if self.ymm {
+            self.a.vzeroupper();
         }
         match c {
             Callee::CFn(id, _) => {
@@ -1928,6 +1972,9 @@ impl<'a> Gen<'a> {
             self.a.pop(saved[i]);
         }
         self.a.pop(RBP);
+        if self.ymm {
+            self.a.vzeroupper();
+        }
         self.a.ret();
     }
 
@@ -2241,7 +2288,29 @@ impl<'a> Gen<'a> {
             // recomputed at each use (Alloc::remat)
             Inst::Iconst(d, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::Mov(d, _) if self.al.remat[d.0 as usize].is_some() => {}
             Inst::Sel(d, c, a, b) => self.sel(options, *d, *c, *a, *b),
-            Inst::VSel(..) | Inst::VFma(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) | Inst::VLoad(..) | Inst::VStore(..) | Inst::VAny(..) | Inst::VGather(..) | Inst::VConst(..) => self.vinst(options, i),
+            _ if self.ymm && y_inst(self.f, i) => self.y(options, i),
+            Inst::VShuffle(..) | Inst::VSel(..) | Inst::VFma(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) | Inst::VLoad(..) | Inst::VStore(..) | Inst::VAny(..) | Inst::VGather(..) | Inst::VConst(..) => self.vinst(options, i),
+            Inst::VLoadX(d, base, idx, sh, off) => {
+                let (ri, rb, off) = self.index_operands(options, *base, *idx, *off);
+                let xd = self.def_f(*d, XS);
+                self.a.sib = Some((ri, *sh));
+                if self.f.vregs[d.0 as usize] == Cls::V256 {
+                    self.a.vex_lm(0, 1, false, true, 0x10, xd, 0, rb, off); // vmovups ymm
+                } else {
+                    self.a.sse_rm(0, 0x10, xd, rb, off); // movups
+                }
+                self.fin_f(*d, xd);
+            }
+            Inst::VStoreX(base, idx, sh, off, v) => {
+                let xv = self.use_f(*v, XS);
+                let (ri, rb, off) = self.index_operands(options, *base, *idx, *off);
+                self.a.sib = Some((ri, *sh));
+                if self.f.vregs[v.0 as usize] == Cls::V256 {
+                    self.a.vex_lm(0, 1, false, true, 0x11, xv, 0, rb, off);
+                } else {
+                    self.a.sse_rm(0, 0x11, xv, rb, off);
+                }
+            }
             Inst::VX(op, d, a, b) => self.vx(options, *op, *d, *a, *b),
             Inst::VX3(op, d, a, b, c) => self.vx3(*op, *d, *a, *b, *c),
             Inst::FMulAdd(np, na, w, d, a, b, c) => self.fma(*np, *na, *w, *d, *a, *b, *c),
@@ -2302,6 +2371,14 @@ impl<'a> Gen<'a> {
                         self.fin_i(*d, rd);
                     }
                 },
+                Cls::V256 => {
+                    let xs = self.use_f(*s, XS);
+                    let xd = self.def_f(*d, XS);
+                    if xd != xs {
+                        self.a.vex_l(0, 1, false, true, 0x28, xd, 0, xs); // vmovaps ymm
+                    }
+                    self.fin_f(*d, xd);
+                }
                 c => {
                     let xs = self.use_f(*s, XS);
                     let xd = self.def_f(*d, XS);
@@ -2704,7 +2781,7 @@ impl<'a> Gen<'a> {
         self.a.byte(((x & 7) << 3) | 5);
         let at = self.a.pos();
         self.a.u32(0);
-        self.vpool.push((at, bits));
+        self.vpool.push((at, bits as u128 * 0x0000_0001_0000_0001_0000_0001_0000_0001));
     }
 
     /// `op dst, src` two-address on a vector: d = a op b with aliasing handled.
@@ -2899,8 +2976,284 @@ impl<'a> Gen<'a> {
         true
     }
 
+    /// xmm `x` = the 128-bit constant `v` (pool entry)
+    fn vconst128(&mut self, x: u8, v: u128) {
+        // movups x, [rip + 16-byte pool entry]
+        self.a.rex(false, x, 0, 0, false);
+        self.a.byte(0x0f);
+        self.a.byte(0x10);
+        self.a.byte(((x & 7) << 3) | 5);
+        let at = self.a.pos();
+        self.a.u32(0);
+        self.vpool.push((at, v));
+    }
+
+    /// the sign bit of every lane of width `w`
+    fn lane_signs(w: VW) -> u128 {
+        let one: u128 = 1 << (w.bits() - 1);
+        (0..128 / w.bits()).fold(0, |m, k| m | one << (k * w.bits()))
+    }
+
+    /// d byte i = (a ++ b) byte idx[i] (>= 32: 0): pshufb of each source with constant masks
+    fn vshuffle(&mut self, d: VReg, a: VReg, b: VReg, idx: [u8; 16]) {
+        let (mut ma, mut mb) = (0u128, 0u128);
+        for (i, &k) in idx.iter().enumerate() {
+            let (ka, kb) = match k {
+                0..=15 => (k, 0x80),
+                16..=31 => (0x80, k - 16),
+                _ => (0x80, 0x80),
+            };
+            ma |= (ka as u128) << (8 * i);
+            mb |= (kb as u128) << (8 * i);
+        }
+        let from_b = idx.iter().any(|&k| (16..32).contains(&k));
+        if from_b {
+            let xb = self.use_f(b, XS2);
+            self.a.movf_rr(true, 0, xb);
+            self.vconst128(XS2, mb);
+            self.a.sse_ext(0x66, 0x38, 0x00, 0, XS2); // pshufb
+        }
+        let xa = self.use_f(a, XS);
+        self.a.movf_rr(true, 1, xa);
+        self.vconst128(XS2, ma);
+        self.a.sse_ext(0x66, 0x38, 0x00, 1, XS2);
+        if from_b {
+            self.a.sse_rr(0x66, 0xeb, 1, 0, false); // por
+        }
+        let xd = self.def_f(d, XS);
+        self.a.movf_rr(true, xd, 1);
+        self.fin_f(d, xd);
+    }
+
+    /// The lane-wise ops of widths other than the 32-bit ones `vx_lanes` encodes, unsigned
+    /// compares, minNum/maxNum, narrowing, f32/f64 conversion and lane masks (`vx_native`);
+    /// false for other ops. Scratch xmm0/xmm1 (never allocated) and XS/XS2 once the operands
+    /// are copied (a spilled operand is reloaded by `use_f`).
+    fn vx_wide(&mut self, options: &relax_session::Options, op: VX, d: VReg, a: VReg, b: VReg) -> bool {
+        use VW::*;
+        match op {
+            VX::FAdd(D, NanBits::Host | NanBits::Intel) => self.v3(d, a, b, 1, 1, 0x58, None),
+            VX::FSub(D, NanBits::Host | NanBits::Intel) => self.v3(d, a, b, 1, 1, 0x5c, None),
+            VX::FMul(D, NanBits::Host | NanBits::Intel) => self.v3(d, a, b, 1, 1, 0x59, None),
+            VX::FDiv(D, NanBits::Host | NanBits::Intel) => self.v3(d, a, b, 1, 1, 0x5e, None),
+            VX::FMinLt(D) => self.v3(d, a, b, 1, 1, 0x5d, None),
+            VX::FMaxGt(D) => self.v3(d, a, b, 1, 1, 0x5f, None),
+            VX::FCmp(c, D) => {
+                let (x, y, pred) = match c {
+                    Cond::Lt => (a, b, 1),
+                    Cond::Le => (a, b, 2),
+                    Cond::Gt => (b, a, 1),
+                    Cond::Ge => (b, a, 2),
+                    Cond::Eq => (a, b, 0),
+                    Cond::Ne => (a, b, 4),
+                };
+                self.v3(d, x, y, 1, 1, 0xc2, Some(pred));
+            }
+            VX::FMinNum(w) | VX::FMaxNum(w) => {
+                // IEEE minimumNumber: min(a, b) gives b when either is NaN; where b is NaN,
+                // take a (both NaN: a, a NaN)
+                let pd = if w == D { 0x66 } else { 0 };
+                let xa = self.use_f(a, XS);
+                let xb = self.use_f(b, XS2);
+                self.a.movf_rr(true, 1, xa);
+                self.a.sse_rr(pd, if let VX::FMinNum(_) = op { 0x5d } else { 0x5f }, 1, xb, false);
+                self.a.movf_rr(true, 0, xb);
+                self.a.sse_rr(pd, 0xc2, 0, 0, false);
+                self.a.byte(3); // unord: b is NaN
+                self.a.sse_ext(0x66, 0x38, if w == D { 0x15 } else { 0x14 }, 1, xa); // blendvp{s,d}, mask xmm0
+                let xd = self.def_f(d, XS);
+                self.a.movf_rr(true, xd, 1);
+                self.fin_f(d, xd);
+            }
+            VX::FNeg(D) | VX::FAbs(D) | VX::FSqrt(D, NanBits::Host | NanBits::Intel) | VX::FRound(D, _) => {
+                let xa = self.use_f(a, XS);
+                match op {
+                    VX::FNeg(_) | VX::FAbs(_) => {
+                        let neg = op == VX::FNeg(D);
+                        self.vconst128(1, if neg { Self::lane_signs(D) } else { !Self::lane_signs(D) });
+                        self.a.sse_rr(0x66, if neg { 0x57 } else { 0x54 }, 1, xa, false);
+                    }
+                    VX::FSqrt(..) => self.a.sse_rr(0x66, 0x51, 1, xa, false),
+                    VX::FRound(_, RoundTo::Away) => {
+                        // trunc(x + copysign(0.5 - ulp/2, x))
+                        self.vconst128(1, Self::lane_signs(D));
+                        self.a.sse_rr(0x66, 0x54, 1, xa, false);
+                        let h = 0.49999999999999994f64.to_bits() as u128;
+                        self.vconst128(0, h | h << 64);
+                        self.a.sse_rr(0x66, 0x56, 1, 0, false);
+                        self.a.sse_rr(0x66, 0x58, 1, xa, false);
+                        self.a.sse_ext(0x66, 0x3a, 0x09, 1, 1); // roundpd
+                        self.a.byte(11);
+                    }
+                    VX::FRound(_, t) => {
+                        self.a.sse_ext(0x66, 0x3a, 0x09, 1, xa);
+                        self.a.byte(match t {
+                            RoundTo::Floor => 9,
+                            RoundTo::Ceil => 10,
+                            _ => 11,
+                        });
+                    }
+                    _ => unreachable!(),
+                }
+                let xd = self.def_f(d, XS);
+                self.a.movf_rr(true, xd, 1);
+                self.fin_f(d, xd);
+            }
+            VX::FCvtLo | VX::FCvtNarrow => {
+                let xa = self.use_f(a, XS);
+                if op == VX::FCvtLo {
+                    self.a.sse_rr(0, 0x5a, 1, xa, false); // cvtps2pd
+                } else {
+                    let xb = self.use_f(b, XS2);
+                    self.a.sse_rr(0x66, 0x5a, 0, xb, false); // cvtpd2ps
+                    let xa = self.use_f(a, XS);
+                    self.a.sse_rr(0x66, 0x5a, 1, xa, false);
+                    self.a.sse_rr(0x66, 0x14, 1, 0, false); // unpcklpd
+                }
+                let xd = self.def_f(d, XS);
+                self.a.movf_rr(true, xd, 1);
+                self.fin_f(d, xd);
+            }
+            VX::ICmp(c, w) | VX::UCmp(c, w) if w != S || matches!(op, VX::UCmp(..)) => {
+                let (x, y, gt, not) = match c {
+                    Cond::Eq => (a, b, false, false),
+                    Cond::Ne => (a, b, false, true),
+                    Cond::Gt => (a, b, true, false),
+                    Cond::Lt => (b, a, true, false),
+                    Cond::Le => (a, b, true, true),
+                    Cond::Ge => (b, a, true, true),
+                };
+                let xy = self.use_f(y, XS2);
+                self.a.movf_rr(true, 1, xy);
+                let xx = self.use_f(x, XS);
+                self.a.movf_rr(true, 0, xx);
+                if gt && matches!(op, VX::UCmp(..)) {
+                    // unsigned order = signed order with the sign bits flipped
+                    self.vconst128(XS2, Self::lane_signs(w));
+                    self.a.sse_rr(0x66, 0xef, 0, XS2, false);
+                    self.a.sse_rr(0x66, 0xef, 1, XS2, false);
+                }
+                match (gt, w) {
+                    (true, D) => self.a.sse_ext(0x66, 0x38, 0x37, 0, 1),
+                    (false, D) => self.a.sse_ext(0x66, 0x38, 0x29, 0, 1),
+                    (true, _) => self.a.sse_rr(0x66, [0x64, 0x65, 0x66][w as usize], 0, 1, false),
+                    (false, _) => self.a.sse_rr(0x66, [0x74, 0x75, 0x76][w as usize], 0, 1, false),
+                }
+                if not {
+                    self.a.sse_rr(0x66, 0x76, 1, 1, false); // all ones
+                    self.a.sse_rr(0x66, 0xef, 0, 1, false);
+                }
+                let xd = self.def_f(d, XS);
+                self.a.movf_rr(true, xd, 0);
+                self.fin_f(d, xd);
+            }
+            VX::MinS(D) | VX::MaxS(D) | VX::MinU(D) | VX::MaxU(D) => {
+                // mask = a > b (pcmpgtq, sign-flipped for unsigned), blendvpd picks by xmm0
+                let xb = self.use_f(b, XS2);
+                self.a.movf_rr(true, 1, xb);
+                let xa = self.use_f(a, XS);
+                self.a.movf_rr(true, 0, xa);
+                if matches!(op, VX::MinU(_) | VX::MaxU(_)) {
+                    self.vconst128(XS2, Self::lane_signs(D));
+                    self.a.sse_rr(0x66, 0xef, 0, XS2, false);
+                    self.a.sse_rr(0x66, 0xef, 1, XS2, false);
+                }
+                self.a.sse_ext(0x66, 0x38, 0x37, 0, 1);
+                let min = matches!(op, VX::MinS(_) | VX::MinU(_));
+                // min: a > b ? b : a; max: a > b ? a : b
+                let (first, then) = if min { (a, b) } else { (b, a) };
+                let x1 = self.use_f(first, XS);
+                self.a.movf_rr(true, 1, x1);
+                let x2 = self.use_f(then, XS2);
+                self.a.sse_ext(0x66, 0x38, 0x15, 1, x2);
+                let xd = self.def_f(d, XS);
+                self.a.movf_rr(true, xd, 1);
+                self.fin_f(d, xd);
+            }
+            VX::MulLo(D) => {
+                // lo(a) * lo(b) + ((hi(a) * lo(b) + lo(a) * hi(b)) << 32), pmuludq
+                let xa = self.use_f(a, XS);
+                self.a.movf_rr(true, 0, xa);
+                self.a.sse_grp_imm(0x73, 2, 0, 32); // hi(a)
+                let xb = self.use_f(b, XS2);
+                self.a.sse_rr(0x66, 0xf4, 0, xb, false);
+                self.a.movf_rr(true, 1, xb);
+                self.a.sse_grp_imm(0x73, 2, 1, 32); // hi(b)
+                let xa = self.use_f(a, XS);
+                self.a.sse_rr(0x66, 0xf4, 1, xa, false);
+                self.a.sse_rr(0x66, 0xd4, 0, 1, false);
+                self.a.sse_grp_imm(0x73, 6, 0, 32);
+                self.a.movf_rr(true, 1, xa);
+                let xb = self.use_f(b, XS2);
+                self.a.sse_rr(0x66, 0xf4, 1, xb, false);
+                self.a.sse_rr(0x66, 0xd4, 0, 1, false);
+                let xd = self.def_f(d, XS);
+                self.a.movf_rr(true, xd, 0);
+                self.fin_f(d, xd);
+            }
+            VX::Abs(D) => {
+                // m = 0 > a; (a ^ m) - m
+                let xa = self.use_f(a, XS);
+                self.a.sse_rr(0x66, 0xef, 0, 0, false);
+                self.a.sse_ext(0x66, 0x38, 0x37, 0, xa);
+                self.a.movf_rr(true, 1, xa);
+                self.a.sse_rr(0x66, 0xef, 1, 0, false);
+                self.a.sse_rr(0x66, 0xfb, 1, 0, false);
+                let xd = self.def_f(d, XS);
+                self.a.movf_rr(true, xd, 1);
+                self.fin_f(d, xd);
+            }
+            VX::Neg(w) if w != S => {
+                let xa = self.use_f(a, XS);
+                self.a.sse_rr(0x66, 0xef, 0, 0, false);
+                self.a.sse_rr(0x66, [0xf8, 0xf9, 0xfa, 0xfb][w as usize], 0, xa, false);
+                let xd = self.def_f(d, XS);
+                self.a.movf_rr(true, xd, 0);
+                self.fin_f(d, xd);
+            }
+            VX::ShlV(D) | VX::ShrUV(D) => {
+                let xa = self.use_f(a, XS);
+                let xb = self.use_f(b, XS2);
+                let xd = self.def_f(d, XS);
+                self.a.vex_rr(1, 2, true, if op == VX::ShlV(D) { 0x47 } else { 0x45 }, xd, xa, xb); // vps{ll,rl}vq
+                self.fin_f(d, xd);
+            }
+            VX::Narrow(w) if w != B => {
+                // the low half of every lane, a's lanes then b's: a byte shuffle
+                let (n, h) = (w.bits() as usize / 8, w.bits() as usize / 16);
+                let lanes = 16 / n;
+                let mut idx = [0u8; 16];
+                for j in 0..2 * lanes {
+                    for k in 0..h {
+                        idx[j * h + k] = (j * n + k) as u8; // b's bytes are 16..31
+                    }
+                }
+                self.vshuffle(d, a, b, idx);
+            }
+            VX::MoveMask(w) => {
+                let xa = self.use_f(a, XS);
+                let rd = self.def_i(d, R10);
+                match w {
+                    S => self.a.sse_rr(0, 0x50, rd, xa, false), // movmskps
+                    D => self.a.sse_rr(0x66, 0x50, rd, xa, false), // movmskpd
+                    B => self.a.sse_w(0, 0xd7, rd, xa, false), // pmovmskb
+                    H => {
+                        self.a.movf_rr(true, 0, xa);
+                        self.a.sse_rr(0x66, 0x63, 0, 0, false); // packsswb: lanes to bytes, sign kept
+                        self.a.sse_w(0, 0xd7, rd, 0, false);
+                        self.a.extend(rd, 8, false);
+                    }
+                }
+                self.fin_i(d, rd);
+            }
+            _ => return false,
+        }
+        let _ = options;
+        true
+    }
+
     fn vx(&mut self, options: &relax_session::Options, op: VX, d: VReg, a: VReg, b: VReg) {
-        if self.vx_lanes(op, d, a, b) {
+        if self.vx_wide(options, op, d, a, b) || self.vx_lanes(op, d, a, b) {
             return;
         }
         // SHA-NI has legacy SSE encodings only, with NO mandatory 66 prefix.
@@ -3264,8 +3617,163 @@ impl<'a> Gen<'a> {
     }
 
     /// 128-bit vector instructions (SSE4.1; AVX2 for per-lane shifts, FMA3 for VFma).
+    /// The index and base registers (and displacement) of an indexed access, as LoadX takes them:
+    /// a spilled index in rax (r10 is the base's scratch).
+    fn index_operands(&mut self, options: &relax_session::Options, base: VReg, idx: VReg, off: i32) -> (u8, u8, i32) {
+        let ri = self.use_i(options, idx, R10);
+        let ri = if ri == R10 {
+            self.a.mov_rr(RAX, R10);
+            RAX
+        } else {
+            ri
+        };
+        let (rb, off) = self.base_disp(options, base, R11, off);
+        (ri, rb, off)
+    }
+
+    /// A 256-bit vector instruction (`pair256`): VEX.256 forms, three-operand.
+    fn y(&mut self, options: &relax_session::Options, i: &Inst) {
+        match *i {
+            Inst::Mov(d, s) => {
+                if matches!(self.al.loc[d.0 as usize], Loc::Stack(_)) && self.al.loc[d.0 as usize] == self.al.loc[s.0 as usize] {
+                    return;
+                }
+                let xs = self.use_f(s, XS);
+                let xd = self.def_f(d, XS);
+                if xd != xs {
+                    self.a.vex_l(0, 1, false, true, 0x28, xd, 0, xs); // vmovaps ymm
+                }
+                self.fin_f(d, xd);
+            }
+            Inst::VLoad(d, base, off) => {
+                let rb = self.use_i(options, base, R11);
+                let xd = self.def_f(d, XS);
+                self.a.vex_lm(0, 1, false, true, 0x10, xd, 0, rb, off); // vmovups ymm, [b + off]
+                self.fin_f(d, xd);
+            }
+            Inst::VStore(base, off, v) => {
+                let rb = self.use_i(options, base, R11);
+                let xv = self.use_f(v, XS);
+                self.a.vex_lm(0, 1, false, true, 0x11, xv, 0, rb, off); // vmovups [b + off], ymm
+            }
+            Inst::VSplat(d, s) => {
+                let xs = if self.f.vregs[s.0 as usize] == Cls::I {
+                    let rs = self.use_i(options, s, R10);
+                    self.a.sse_rr(0x66, 0x6e, 0, rs, false); // movd xmm0, r32
+                    0
+                } else {
+                    self.use_f(s, XS2)
+                };
+                let xd = self.def_f(d, XS);
+                self.a.vex_l(1, 2, false, true, 0x18, xd, 0, xs); // vbroadcastss ymm, xmm
+                self.fin_f(d, xd);
+            }
+            Inst::VConst(d, bits) => {
+                let xd = self.def_f(d, XS);
+                if bits == 0 {
+                    self.a.vex_l(0, 1, false, true, 0x57, xd, xd, xd); // vxorps
+                } else {
+                    // vbroadcastss ymm, [rip + entry]
+                    self.a.byte(0xc4);
+                    self.a.byte(((!(xd >> 3) & 1) << 7) | (1 << 6) | (1 << 5) | 2);
+                    self.a.byte((15 << 3) | (1 << 2) | 1);
+                    self.a.byte(0x18);
+                    self.a.byte(((xd & 7) << 3) | 5);
+                    let at = self.a.pos();
+                    self.a.u32(0);
+                    self.vpool.push((at, bits as u128 * 0x0000_0001_0000_0001_0000_0001_0000_0001));
+                }
+                self.fin_f(d, xd);
+            }
+            Inst::VFma(np, na, d, a, b, c) => {
+                let xa = self.use_f(a, XS);
+                let xb = self.use_f(b, XS2);
+                let xc = self.use_f(c, 1);
+                let xd = self.def_f(d, XS);
+                let k = match (np, na) {
+                    (false, false) => 0,
+                    (false, true) => 2,
+                    (true, false) => 4,
+                    (true, true) => 6,
+                };
+                if xd != xa && xd != xb {
+                    // d = c; d (+-)= a*b: vf..231ps
+                    if xd != xc {
+                        self.a.vex_l(0, 1, false, true, 0x28, xd, 0, xc);
+                    }
+                    self.a.vex_l(1, 2, false, true, 0xb8 + k, xd, xa, xb);
+                } else if xd != xc {
+                    // d is a factor: vf..213ps d, other, c (d = d*other +- c)
+                    let other = if xd == xa { xb } else { xa };
+                    self.a.vex_l(1, 2, false, true, 0xa8 + k, xd, other, xc);
+                } else {
+                    self.a.vex_l(0, 1, false, true, 0x28, 0, 0, xc);
+                    self.a.vex_l(1, 2, false, true, 0xb8 + k, 0, xa, xb);
+                    self.a.vex_l(0, 1, false, true, 0x28, xd, 0, 0);
+                }
+                self.fin_f(d, xd);
+            }
+            Inst::VX(VX::Half(hi), d, a, _) => {
+                let xa = self.use_f(a, XS);
+                let xd = self.def_f(d, XS2);
+                if hi {
+                    self.a.vex_l(1, 3, false, true, 0x19, xa, 0, xd); // vextractf128 xd, ya, 1
+                    self.a.byte(1);
+                } else if xd != xa {
+                    self.a.vex_l(0, 1, false, false, 0x28, xd, 0, xa); // vmovaps xmm
+                }
+                self.fin_f(d, xd);
+            }
+            Inst::VX(VX::Join, d, a, b) => {
+                let xa = self.use_f(a, XS);
+                let xb = self.use_f(b, XS2);
+                let xd = self.def_f(d, XS);
+                self.a.vex_l(1, 3, false, true, 0x18, xd, xa, xb); // vinsertf128 yd, ya, xb, 1
+                self.a.byte(1);
+                self.fin_f(d, xd);
+            }
+            Inst::VX(op, d, a, b) => {
+                let (pp, opc, x, y, imm) = match op {
+                    VX::FAdd(w, _) => (pd(w), 0x58, a, b, None),
+                    VX::FSub(w, _) => (pd(w), 0x5c, a, b, None),
+                    VX::FMul(w, _) => (pd(w), 0x59, a, b, None),
+                    VX::FDiv(w, _) => (pd(w), 0x5e, a, b, None),
+                    VX::FMinLt(w) => (pd(w), 0x5d, a, b, None),
+                    VX::FMaxGt(w) => (pd(w), 0x5f, a, b, None),
+                    VX::And => (0, 0x54, a, b, None),
+                    VX::Or => (0, 0x56, a, b, None),
+                    VX::Xor => (0, 0x57, a, b, None),
+                    // a & !b = andn(b, a)
+                    VX::AndNot => (0, 0x55, b, a, None),
+                    VX::FCmp(c, w) => {
+                        let (x, y, pred) = match c {
+                            Cond::Lt => (a, b, 1),
+                            Cond::Le => (a, b, 2),
+                            Cond::Gt => (b, a, 1),
+                            Cond::Ge => (b, a, 2),
+                            Cond::Eq => (a, b, 0),
+                            Cond::Ne => (a, b, 4),
+                        };
+                        (pd(w), 0xc2, x, y, Some(pred))
+                    }
+                    _ => unreachable!("pair256 made a 256-bit {op:?}"),
+                };
+                let xx = self.use_f(x, XS);
+                let xy = self.use_f(y, XS2);
+                let xd = self.def_f(d, XS);
+                self.a.vex_l(pp, 1, false, true, opc, xd, xx, xy);
+                if let Some(p) = imm {
+                    self.a.byte(p);
+                }
+                self.fin_f(d, xd);
+            }
+            _ => unreachable!("not a 256-bit instruction"),
+        }
+    }
+
     fn vinst(&mut self, options: &relax_session::Options, i: &Inst) {
         match *i {
+            Inst::VShuffle(d, a, b, idx) => self.vshuffle(d, a, b, idx),
             Inst::VSel(d, m, a, b) => {
                 if self.avx && self.byte_masks[m.0 as usize] {
                     let xm = self.use_f(m, 0);
@@ -3374,6 +3882,11 @@ impl<'a> Gen<'a> {
                 let xv = self.use_f(v, XS);
                 self.a.sse_rm(0, 0x11, xv, rb, off);
             }
+            Inst::VConst(d, 0) => {
+                let xd = self.def_f(d, XS);
+                self.a.sse_rr(0, 0x57, xd, xd, false); // xorps xd, xd
+                self.fin_f(d, xd);
+            }
             Inst::VConst(d, bits) => {
                 // movups xd, [rip + entry]
                 let xd = self.def_f(d, XS);
@@ -3383,7 +3896,7 @@ impl<'a> Gen<'a> {
                 self.a.byte(((xd & 7) << 3) | 5);
                 let at = self.a.pos();
                 self.a.u32(0);
-                self.vpool.push((at, bits));
+                self.vpool.push((at, bits as u128 * 0x0000_0001_0000_0001_0000_0001_0000_0001));
                 self.fin_f(d, xd);
             }
             Inst::VGather(d, base, idx) if !use_gather(options) => {
@@ -3575,20 +4088,23 @@ impl<'a> Gen<'a> {
         let xa = self.use_f(a, XS);
         let xb = self.use_f(b, XS2);
         let xc = self.use_f(c, 1);
-        self.a.movf_rr(true, 0, xc);
+        // the C library's operand placement (glibc fma/fmaf: vfmadd213 with x in the destination,
+        // y in vvvv, z in r/m), what rustc's code calls without the fma target feature: a NaN
+        // result takes the first NaN of vvvv, the destination, then r/m -- b, a, c
+        self.a.movf_rr(true, 0, xa);
         let op = match (neg_prod, neg_add) {
-            (false, false) => 0xb9, // vfmadd231
-            (false, true) => 0xbb,  // vfmsub231
-            (true, false) => 0xbd,  // vfnmadd231
-            (true, true) => 0xbf,   // vfnmsub231
+            (false, false) => 0xa9, // vfmadd213
+            (false, true) => 0xab,  // vfmsub213
+            (true, false) => 0xad,  // vfnmadd213
+            (true, true) => 0xaf,   // vfnmsub213
         };
-        // VEX.LIG.66.0F38.W{0,1} op /r: reg = xmm0, vvvv = xa, rm = xb
+        // VEX.LIG.66.0F38.W{0,1} op /r: reg = xmm0 (a), vvvv = xb, rm = xc
         let r = 0u8;
         self.a.byte(0xc4);
-        self.a.byte(((!(r >> 3) & 1) << 7) | (1 << 6) | ((!(xb >> 3) & 1) << 5) | 0b00010);
-        self.a.byte(((w as u8) << 7) | ((!xa & 15) << 3) | 0b01);
+        self.a.byte(((!(r >> 3) & 1) << 7) | (1 << 6) | ((!(xc >> 3) & 1) << 5) | 0b00010);
+        self.a.byte(((w as u8) << 7) | ((!xb & 15) << 3) | 0b01);
         self.a.byte(op);
-        self.a.modrm_rr(r, xb);
+        self.a.modrm_rr(r, xc);
         let xd = self.def_f(d, XS);
         self.a.movf_rr(true, xd, 0);
         self.fin_f(d, xd);
@@ -4036,6 +4552,9 @@ impl<'a> Gen<'a> {
         for (d, s2) in regalloc::seq_moves(&moves, R10, XS) {
             self.mv(d, s2);
         }
+        if self.ymm {
+            self.a.vzeroupper();
+        }
         match c {
             Callee::Fn(id) => {
                 self.mov_reloc(RAX, Reloc::Slot(*id));
@@ -4253,6 +4772,45 @@ fn scalar_minmax(i: &Inst, a: VReg, b: VReg) -> Option<(bool, u8)> {
     }
 }
 
+/// VEX pp of a float op's lane width: none (ps) or 66 (pd)
+fn pd(w: VW) -> u8 {
+    if w == VW::D { 1 } else { 0 }
+}
+
+/// An instruction on 256-bit vectors (its result or stored value is a V256, or a half of one).
+fn y_inst(f: &Func, i: &Inst) -> bool {
+    let y = |v: &VReg| f.vregs[v.0 as usize] == Cls::V256;
+    match i {
+        Inst::VX(VX::Half(_), ..) => true,
+        Inst::VX(_, d, ..) | Inst::VLoad(d, ..) | Inst::VFma(_, _, d, ..) | Inst::VSplat(d, _) | Inst::VConst(d, _) | Inst::Mov(d, _) => y(d),
+        Inst::VStore(_, _, v) => y(v),
+        _ => false,
+    }
+}
+
+/// Whether the emitter encodes `op` (the legaliser expands the lane-wise ops it does not).
+pub fn vx_native(options: &relax_session::Options, op: VX) -> bool {
+    use VW::*;
+    let avx2 = options.cpu.avx2;
+    match op {
+        VX::Add(_) | VX::Sub(_) | VX::CmpEq(_) | VX::CmpGtS(_) | VX::And | VX::Or | VX::Xor | VX::AndNot => true,
+        VX::MulLo(w) => w != B,
+        VX::MinS(_) | VX::MaxS(_) | VX::MinU(_) | VX::MaxU(_) | VX::Abs(_) | VX::Neg(_) | VX::ICmp(..) | VX::UCmp(..) => true,
+        VX::AddSatU(w) | VX::SubSatU(w) | VX::AddSatS(w) | VX::SubSatS(w) | VX::AvgU(w) => matches!(w, B | H),
+        VX::ShlI(..) | VX::ShrUI(..) | VX::ShrSI(..) => true,
+        VX::ShlV(w) | VX::ShrUV(w) => matches!(w, S | D) && avx2,
+        VX::ShrSV(w) => w == S && avx2,
+        VX::FAdd(w, n) | VX::FSub(w, n) | VX::FMul(w, n) | VX::FDiv(w, n) | VX::FSqrt(w, n) => w == S || (w == D && n != NanBits::Neon),
+        VX::FMinLt(w) | VX::FMaxGt(w) | VX::FMinNum(w) | VX::FMaxNum(w) | VX::FCmp(_, w) => matches!(w, S | D),
+        VX::FMinNeon(w) | VX::FMaxNeon(w) => w == S,
+        VX::FNeg(w) | VX::FAbs(w) | VX::FRound(w, _) => matches!(w, S | D),
+        VX::FToI(w) | VX::IToF(w) => w == S,
+        VX::Narrow(w) => w != B,
+        VX::FCvtNarrow | VX::FCvtLo | VX::MoveMask(_) => true,
+        _ => true,
+    }
+}
+
 /// Does this CPU (and the environment: MAKEPAD_RUN_NO_AVX) allow VEX-encoded AVX instructions?
 pub fn host_avx(options: &relax_session::Options) -> bool {
     options.cpu.avx
@@ -4305,6 +4863,32 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     } else {
         f
     };
+    // vector ops without an instruction sequence here: per-lane scalar code
+    let legal;
+    // (MAKEPAD_RUN_OPT=-vxnative: every expandable op, the legaliser's reference meaning)
+    let all = crate::stats::opt_off(options, "-vxnative");
+    let native = |op| !all && vx_native(options, op);
+    let f = if crate::legal::needed(f, &native, !all) {
+        let mut g = f.clone();
+        crate::legal::legalize(&mut g, &native, !all);
+        legal = g;
+        &legal
+    } else {
+        f
+    };
+    // 256-bit vectors from pairs of 128-bit halves (AVX, optimised tiers)
+    let paired;
+    let f = if host_avx(options) && (env.opt_regs || f.full) && f.vregs.contains(&Cls::V128) && !crate::stats::opt_off(options, "-pair256") {
+        let mut g = f.clone();
+        if crate::pair256::pair256(&mut g, crate::pair256::Caps { avx2: options.cpu.avx2, fma: options.cpu.fma }) {
+            paired = g;
+            &paired
+        } else {
+            f
+        }
+    } else {
+        f
+    };
     // chains of compares of one value against constants: jump tables, bit tests, binary search
     let switched = crate::switch::lower_switches(options, f);
     let (f, freq_sw) = match &switched {
@@ -4315,7 +4899,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // constants used in loops defined once at the entry (the allocator keeps them in registers
     // or recomputes them); constant operands that fit an imm32 become immediates
     // (hot code only: the rewrite copies the function, +15% back-end time at O1)
-    let hoisted = if env.opt_regs || f.full { regalloc::hoist_loop_consts(f, &imm_fits) } else { None };
+    let hoisted = if env.opt_regs || f.full { regalloc::hoist_loop_consts(f, &imm_fits, false) } else { None };
     let f = hoisted.as_ref().unwrap_or(f);
     // compares next to the selects that read them (the cmov takes the flags)
     let sunk = if env.opt_regs || f.full { regalloc::sink_compares(f) } else { None };
@@ -4403,6 +4987,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         cret_ptr: 0,
         stage: 0,
         last_call_ret: 0,
+        ymm: f.vregs.iter().any(|c| *c == Cls::V256),
         pads: Vec::new(),
         unwind_tab: Vec::new(),
     };
@@ -4749,6 +5334,7 @@ pub fn detect_cpu(options: &relax_session::Options) -> relax_session::options::C
         cpu.lzcnt = !options.no_bitops && std::is_x86_feature_detected!("lzcnt");
         cpu.bmi1 = !options.no_bitops && std::is_x86_feature_detected!("bmi1");
         cpu.fma = cpu.avx && std::is_x86_feature_detected!("fma");
+        cpu.avx2 = cpu.avx && std::is_x86_feature_detected!("avx2");
         cpu
     }
     #[cfg(not(target_arch = "x86_64"))]

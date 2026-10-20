@@ -11,6 +11,8 @@ pub mod cabi;
 pub mod dom;
 pub mod exec;
 pub mod frame;
+pub mod legal;
+pub mod pair256;
 pub mod passes;
 pub mod probe;
 pub mod regalloc;
