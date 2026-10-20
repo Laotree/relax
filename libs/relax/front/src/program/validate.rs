@@ -61,6 +61,10 @@ impl Program {
             match def.kind {
                 DefKind::Impl => {
                     let Some(imp) = ast.as_impl(&it.kind) else { continue };
+                    // type_of: `Self` is no type of the impl's own header
+                    if self.ty_has_self(ast, imp.self_ty, 0) {
+                        err(it.lo, "`Self` is not valid in the self type of an impl block".into());
+                    }
                     if not_permitted(&it.vis) {
                         err(it.lo, "E0449: visibility qualifiers are not permitted here -- note: place qualifiers on individual impl items instead".into());
                     }
@@ -267,6 +271,44 @@ impl Program {
                 _ => err(it.lo, "E0642: patterns aren't allowed in functions without bodies".into()),
             }
         }
+    }
+
+    /// Does a type name `Self` anywhere (rustc_hir `find_self_aliases`)?
+    fn ty_has_self(&self, ast: &Ast, t: TyId, depth: u32) -> bool {
+        if depth > 32 { return false; }
+        let segs = |segs: SegList, depth: u32| -> bool {
+            ast.segs(segs).iter().any(|s| match ast.gargs(s.args()) {
+                Some(GenericArgs::Angle(v)) => ast.list(*v).iter().any(|a| match a {
+                    GenericArg::Type(x) | GenericArg::Binding(_, _, x) => self.ty_has_self(ast, *x, depth + 1),
+                    GenericArg::Constraint(_, _, bs) => self.bounds_have_self(ast, *bs, depth + 1),
+                    _ => false,
+                }),
+                Some(GenericArgs::Paren(ins, out)) => ast.list(*ins).iter().any(|x| self.ty_has_self(ast, *x, depth + 1)) || out.is_some_and(|o| self.ty_has_self(ast, o, depth + 1)),
+                None => false,
+            })
+        };
+        match ast.ty(t) {
+            Ty::Path(p) => {
+                if let Some(q) = ast.qself(p) { if self.ty_has_self(ast, q.ty, depth + 1) { return true; } }
+                ast.segs(p.segs).first().is_some_and(|s| s.kind() == SegKind::SelfType) || segs(p.segs, depth)
+            }
+            Ty::Ref(_, _, x) | Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Paren(x) => self.ty_has_self(ast, *x, depth + 1),
+            Ty::Tuple(l) => ast.list(*l).iter().any(|x| self.ty_has_self(ast, *x, depth + 1)),
+            Ty::Fn(f) => { let f = ast.fn_ptr(*f); ast.list(f.params).iter().any(|x| self.ty_has_self(ast, *x, depth + 1)) || f.ret.is_some_and(|r| self.ty_has_self(ast, r, depth + 1)) }
+            Ty::ImplTrait(bs) | Ty::DynTrait(bs, _) => self.bounds_have_self(ast, *bs, depth + 1),
+            _ => false,
+        }
+    }
+
+    fn bounds_have_self(&self, ast: &Ast, bs: List<Bound>, depth: u32) -> bool {
+        ast.list(bs).iter().any(|b| match b {
+            Bound::Trait { path, .. } => ast.segs(path.segs).iter().any(|s| match ast.gargs(s.args()) {
+                Some(GenericArgs::Angle(v)) => ast.list(*v).iter().any(|a| matches!(a, GenericArg::Type(x) | GenericArg::Binding(_, _, x) if self.ty_has_self(ast, *x, depth + 1))),
+                Some(GenericArgs::Paren(ins, out)) => ast.list(*ins).iter().any(|x| self.ty_has_self(ast, *x, depth + 1)) || out.is_some_and(|o| self.ty_has_self(ast, o, depth + 1)),
+                None => false,
+            }),
+            _ => false,
+        })
     }
 
     /// `const _` is only an item of a module or block (ast_validation `check_item_named`).

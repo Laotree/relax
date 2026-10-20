@@ -2708,6 +2708,9 @@ impl Tcx {
             let seg = &prog.files[file as usize].ast.segs(p.segs)[0];
             if seg.kind() == SegKind::SelfType {
                 if source_ty.is_some() && self.prohibit_args_on(cx, prog, file, seg, "self type", "Self") { return self.tys.error; }
+                if env.self_ty.is_none() && self.validates(prog, file) {
+                    self.err(cx, prog, file, p.lo, "E0411: cannot find type `Self` in this scope".to_string());
+                }
                 return env.self_ty.unwrap_or(self.tys.error);
             }
             let name = f.text(seg.name);
