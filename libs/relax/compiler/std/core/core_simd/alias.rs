@@ -21,7 +21,7 @@ macro_rules! alias {
     } => {
         $(
             $(
-            #[doc = concat!("A SIMD vector with ", number!($num_elements), " element", plural!($num_elements), " of type [`", stringify!($element_ty), "`].")]
+            // Relax: the generated doc attributes (concat! of number!/plural!) are left out
             #[allow(non_camel_case_types)]
             pub type $alias = $crate::simd::Simd<$element_ty, $num_elements>;
             )*
@@ -39,12 +39,6 @@ macro_rules! mask_alias {
     } => {
         $(
             $(
-            #[doc = concat!("A SIMD mask with ", number!($num_elements), " element", plural!($num_elements), " for vectors with ", $size, " element types.")]
-            ///
-            #[doc = concat!(
-                "The layout of this type is unspecified, and may change between platforms and/or Rust versions, and code should not assume that it is equivalent to `[",
-                stringify!($element_ty), "; ", $num_elements, "]`."
-            )]
             #[allow(non_camel_case_types)]
             pub type $alias = $crate::simd::Mask<$element_ty, $num_elements>;
             )*
