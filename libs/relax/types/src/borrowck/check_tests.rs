@@ -40,7 +40,7 @@ fn input(body: &Body, scopes: &[Vec<Location>]) -> RegionInput {
     let mut liveness = LivenessValues::new(definitions.len(), map.num_points());
     liveness.add_all_points(0);
     for (r, points) in scopes.iter().enumerate() { for &at in points { liveness.add_point(r + 1, map.point(at)); } }
-    RegionInput { polonius: Default::default(), tainted_by_errors:false, relations: UniversalRegionRelations::create(UniversalRegions::new(0, None, vec![(0, Class::Global)]), definitions.len(), &[]),
+    RegionInput { universe_causes: vec![], polonius: Default::default(), tainted_by_errors:false, relations: UniversalRegionRelations::create(UniversalRegions::new(0, None, vec![(0, Class::Global)]), definitions.len(), &[]),
         definitions, outlives: OutlivesConstraintSet::default(), liveness, type_tests: vec![] }
 }
 fn gather(tcx: &Tcx, body: &Body) -> MoveData {
@@ -302,7 +302,7 @@ fn solved_outlives_constraints_extend_borrow_regions() {
 }
 fn external_input(b: &Body) -> RegionInput {
     let definitions=vec![RegionDefinition {origin:Origin::FreeRegion,universe:UniverseIndex(0),external_name:None};3];
-    RegionInput { polonius: Default::default(), tainted_by_errors:false, definitions, outlives:OutlivesConstraintSet::default(),
+    RegionInput { universe_causes: vec![], polonius: Default::default(), tainted_by_errors:false, definitions, outlives:OutlivesConstraintSet::default(),
         relations:UniversalRegionRelations::create(UniversalRegions::new(0,None,vec![(0,Class::Global),(1,Class::External),(2,Class::External)]),3,&[]),
         liveness:LivenessValues::new(3,LocationMap::new(b).num_points()),type_tests:vec![] }
 }

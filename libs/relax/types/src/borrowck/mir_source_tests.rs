@@ -500,3 +500,14 @@ fn a_nested_closure_returning_a_captured_reference_keeps_the_borrow_alive() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.len() == 1 && errors[0].starts_with("E0506"), "{errors:?}");
 }
+
+#[test]
+fn a_higher_ranked_mismatch_is_e0308_one_type_is_more_general() {
+    let (errors, unchecked) = borrowck_source("
+        pub struct Inv<T>(*mut T);
+        pub type A = for<'a, 'b> fn(Inv<&'a &'b ()>, Inv<&'b &'a ()>, Inv<&'a ()>);
+        pub type B = for<'a, 'b> fn(Inv<&'a &'b ()>, Inv<&'b &'a ()>, Inv<&'b ()>);
+        pub fn f(x: A) { let _y: B = x; }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(!errors.is_empty() && errors.iter().all(|e| e.starts_with("E0308 mismatched types")), "{errors:?}");
+}

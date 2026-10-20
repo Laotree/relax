@@ -62,6 +62,8 @@ pub struct RegionInput {
     pub relations: UniversalRegionRelations,
     pub liveness: LivenessValues,
     pub type_tests: Vec<TypeTest>,
+    /// Why each universe was created (diagnostics of placeholder errors).
+    pub universe_causes: Vec<(UniverseIndex, super::type_check::UniverseInfo)>,
 }
 pub struct MirRegionResult {
     pub polonius: super::polonius::PoloniusContext,
@@ -70,6 +72,7 @@ pub struct MirRegionResult {
     pub regioncx: RegionInferenceContext,
     pub locations: LocationMap,
     pub type_tests: Vec<TypeTest>,
+    pub universe_causes: Vec<(UniverseIndex, super::type_check::UniverseInfo)>,
 }
 impl RegionScope for MirRegionResult {
     fn is_loan_live_at(&self, loan: usize, at: Location) -> Option<bool> {
@@ -85,7 +88,7 @@ pub fn compute_regions(tcx: &Tcx, prog: &Program, body: &Body, input: RegionInpu
         input.definitions, input.outlives, input.relations.universal_regions.fr_static);
     let regioncx = RegionInferenceContext::solve(tcx, prog, lowered, input.relations, input.liveness,
         locations.num_points(), &input.type_tests, nested);
-    MirRegionResult { polonius: input.polonius, nested, tainted_by_errors: input.tainted_by_errors, regioncx, locations, type_tests: input.type_tests }
+    MirRegionResult { polonius: input.polonius, nested, tainted_by_errors: input.tainted_by_errors, regioncx, locations, type_tests: input.type_tests, universe_causes: input.universe_causes }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -188,9 +191,9 @@ impl MirTypeck {
     pub fn into_region_input(self, infcx: &dyn RegionDriverOps) -> RegionInput {
         let definitions = self.definitions(infcx);
         let relations = self.relations(definitions.len());
-        let MirTypeckRegionConstraints { outlives_constraints, liveness_constraints, type_tests, .. } = self.constraints;
+        let MirTypeckRegionConstraints { outlives_constraints, liveness_constraints, type_tests, universe_causes, .. } = self.constraints;
         RegionInput { polonius: self.polonius, tainted_by_errors: self.tainted_by_errors, definitions, outlives: outlives_constraints,
-            relations, liveness: liveness_constraints, type_tests }
+            relations, liveness: liveness_constraints, type_tests, universe_causes }
     }
 }
 

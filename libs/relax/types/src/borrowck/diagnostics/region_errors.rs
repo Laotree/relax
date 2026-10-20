@@ -55,8 +55,11 @@ pub fn report_region_errors(cx: &DiagCx<'_>, errors: &[RegionErrorKind]) -> Vec<
             RegionErrorKind::TypeTest { test } => {
                 if let Some(d) = report_type_test(cx, *test) { out.push(d); }
             }
-            RegionErrorKind::PlaceholderOutlivesIllegalRegion { longer_fr, illegally_outlived_r } =>
-                out.push(report_erroneous_rvid_reaches_placeholder(cx, *longer_fr, *illegally_outlived_r)),
+            RegionErrorKind::PlaceholderOutlivesIllegalRegion { longer_fr, illegally_outlived_r } => {
+                // (rustc's buffered errors are deduplicated: the same mismatch is reached once per placeholder)
+                let d = report_erroneous_rvid_reaches_placeholder(cx, *longer_fr, *illegally_outlived_r);
+                if !out.iter().any(|o: &Diag| o.code == d.code && o.message == d.message && o.span == d.span && o.notes == d.notes) { out.push(d); }
+            }
             RegionErrorKind::RegionError { longer_fr, shorter_fr, is_reported } => {
                 // Only the first error of each longer region is reported.
                 if *is_reported { out.push(report_region_error(cx, *longer_fr, *shorter_fr)); }
@@ -194,11 +197,30 @@ fn try_report_named_anon_conflict(cx: &DiagCx<'_>, fr: RegionVid, outlived_fr: R
     Some(diag)
 }
 
-/// report_erroneous_rvid_reaches_placeholder: a higher-ranked region would have to outlive
-/// a region it cannot name. The universe's cause is not tracked, so the generic message.
+/// report_erroneous_rvid_reaches_placeholder: `longer_fr`, a placeholder, would have to outlive
+/// `error_vid`. The universe's cause says what to report (bound_region_errors.rs
+/// `UniverseInfo::report_erroneous_element`).
 fn report_erroneous_rvid_reaches_placeholder(cx: &DiagCx<'_>, longer_fr: RegionVid, error_vid: RegionVid) -> Diag {
+    use crate::borrowck::type_check::UniverseInfo;
     let (_, span, _, _) = blame(cx, longer_fr, error_vid);
-    Diag::new("", span, "higher-ranked lifetime error")
+    let universe = match cx.regions.regioncx.definitions[longer_fr].origin {
+        crate::borrowck::region_infer::NllRegionVariableOrigin::Placeholder(p) => match cx.tcx.tys.region_kind(p) {
+            RegionKind::RePlaceholder { universe, .. } => Some(universe),
+            _ => None,
+        },
+        _ => None,
+    };
+    let info = universe.and_then(|u| cx.regions.universe_causes.iter().rev().find(|(x, _)| *x == u)).map(|(_, i)| i);
+    match info {
+        // RegionsPlaceholderMismatch
+        Some(UniverseInfo::RelateTys { expected, found }) => {
+            let mut diag = Diag::new("E0308", span, "mismatched types");
+            diag.span_label(span, "one type is more general than the other");
+            diag.note(format!("expected `{}`\n   found `{}`", cx.ty_string(*expected), cx.ty_string(*found)));
+            diag
+        }
+        _ => Diag::new("", span, "higher-ranked lifetime error"),
+    }
 }
 
 /// construct_generic_bound_failure (E0309, E0310, E0311) for a type test.
