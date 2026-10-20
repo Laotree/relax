@@ -1760,9 +1760,26 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
             }
         }
         let is_param = |v: VReg| f.params.contains(&v);
+        // round trips `t = v .. v = t` (t defined once, by that copy: the cold-call and loop
+        // splits' save / restore pairs) give v back the value it had: per v, how many such defs
+        let mut copy_of = vec![u32::MAX; nv];
+        for &(d, s2) in &movs {
+            if ndef[d as usize] == 1 {
+                copy_of[d as usize] = s2;
+            }
+        }
+        let mut round = vec![0u32; nv];
+        for &(d, s2) in &movs {
+            if copy_of[s2 as usize] == d {
+                round[d as usize] += 1;
+            }
+        }
         // an Offset base holds one value for the whole function: a parameter no instruction
-        // redefines, or a value with one definition
-        let fixed = |v: VReg| f.vregs[v.0 as usize] == Cls::I && if is_param(v) { ndef[v.0 as usize] == 0 } else { ndef[v.0 as usize] == 1 };
+        // redefines, or a value with one definition (round trips aside)
+        let fixed = |v: VReg| {
+            let n = ndef[v.0 as usize] - round[v.0 as usize];
+            f.vregs[v.0 as usize] == Cls::I && if is_param(v) { n == 0 } else { n == 1 }
+        };
         for (d, i) in cand {
             let d = d as usize;
             if let Remat::Offset(b2, _) = i {
