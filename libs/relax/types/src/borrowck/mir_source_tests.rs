@@ -654,3 +654,14 @@ fn a_late_bound_lifetime_equal_to_static_by_implied_bounds_is_a_defining_use_arg
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn a_trait_objects_supertrait_projection_implies_the_outlives_of_its_term() {
+    let (errors, unchecked) = borrowck_source("
+        trait Trait { type Assoc; } trait Bar { type Assoc; }
+        trait Foo<'a, T: 'a>: Bar<Assoc = &'a T> {}
+        fn outlives<'a, T: 'a>() {}
+        pub fn implied_outlives<'a, T: Trait>(x: &dyn Foo<'a, T::Assoc>) { outlives::<'a, T::Assoc>(); }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
