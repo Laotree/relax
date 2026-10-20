@@ -635,3 +635,14 @@ fn nested_or_patterns_bind_one_variable_across_all_alternatives() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn an_async_fn_in_a_generic_impl_maps_the_signatures_erased_regions_after_its_parents() {
+    // The coroutine's hidden type has the parent's `'a` slot erased too: the signature's first erased region
+    // is not the first erased slot of the closure type.
+    let (errors, unchecked) = borrowck_source_in("
+        pub struct S<'a> { x: &'a u32 }
+        impl<'a> S<'a> { pub async fn t(f: &u32) -> &u32 { f } pub async fn u(self, f: &u32) -> &u32 { f } }", 2018);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
