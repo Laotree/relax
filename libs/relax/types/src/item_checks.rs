@@ -85,6 +85,10 @@ struct Representability<'a> {
     done: crate::fxhash::HashSet<ReprKey>,
     /// the first cycle met: its queries, outermost first
     cycle: Option<Vec<ReprKey>>,
+    /// `params_in_repr` results that no cycle cut short (rustc caches the query)
+    params_memo: std::cell::RefCell<crate::fxhash::HashMap<DefId, crate::fxhash::HashSet<u32>>>,
+    /// a cycle cut the `params_in_repr` computation now running
+    truncated: std::cell::Cell<bool>,
 }
 
 impl Representability<'_> {
@@ -149,7 +153,9 @@ impl Representability<'_> {
     /// `params_in_repr`: the type parameters (by compact index) an ADT's fields hold by value.
     fn params_in_repr(&self, d: DefId, visiting: &mut Vec<DefId>) -> crate::fxhash::HashSet<u32> {
         let mut out = crate::fxhash::HashSet::default();
-        if visiting.contains(&d) { return out; }
+        if visiting.contains(&d) { self.truncated.set(true); return out; }
+        if let Some(done) = self.params_memo.borrow().get(&d) { return done.clone(); }
+        let outer = self.truncated.replace(false);
         visiting.push(d);
         if let Some(adt) = self.tcx.adts.get(&d) {
             for v in &adt.variants {
@@ -157,6 +163,8 @@ impl Representability<'_> {
             }
         }
         visiting.pop();
+        if !self.truncated.get() { self.params_memo.borrow_mut().insert(d, out.clone()); }
+        self.truncated.set(outer || self.truncated.get());
         out
     }
 
@@ -181,7 +189,7 @@ impl Representability<'_> {
 /// representability.rs: a cycle among its queries; rustc_middle values.rs reports the ADTs of
 /// the cycle once, at the first). The cycle is reported by the first of its ADTs.
 pub fn representability(prog: &Program, tcx: &Tcx, d: DefId) -> Option<String> {
-    let mut r = Representability { tcx, active: Vec::new(), done: Default::default(), cycle: None };
+    let mut r = Representability { tcx, active: Vec::new(), done: Default::default(), cycle: None, params_memo: Default::default(), truncated: Default::default() };
     r.check_adt(d);
     let cycle = r.cycle?;
     let mut items: Vec<DefId> = Vec::new();
