@@ -2024,6 +2024,15 @@ rt_fn! {
     }
 }
 
+/// (exec, data, rw, syms, end) bases of the program unit's reservation (diagnostics: inspect memory).
+pub(crate) fn unit_areas() -> Option<[u64; 5]> {
+    unsafe {
+        if UNIT.is_null() { return None; }
+        let u = &*UNIT;
+        Some([u.exec_base, u.ro_base, u.rw_end - UNIT_RW_SIZE, u.syms.dom0(), u.rw_end + (crate::syms::SYM_CAP * 8) as u64])
+    }
+}
+
 /// Is `pc` in the unit's code memory (functions, stubs, glue)? Lock-free: the bounds are fixed
 /// once the unit exists (os::fault's Windows handler asks before anything else).
 pub(crate) fn in_jit_code(pc: u64) -> bool {

@@ -217,9 +217,33 @@ fn os_regions(s: &mut Snap) {
         addr += size;
     }
     if list {
+        if let Some(a) = crate::jit::unit_areas() {
+            extern "C" { fn mincore(addr: *mut u8, len: usize, vec: *mut u8) -> i32; }
+            let names = ["exec", "ro data", "rw", "syms"];
+            for k in 0..4 {
+                let (lo, hi) = match k { 0 => (a[0], a[1]), 1 => (a[1], a[2]), 2 => (a[2], a[2] + crate::jit::UNIT_RW_SIZE), _ => (a[2] + crate::jit::UNIT_RW_SIZE, a[4]) };
+                let pages = ((hi - lo) / page) as usize;
+                let mut v = vec![0u8; pages];
+                let mut res = 0usize;
+                for chunk in 0..(pages + 4095) / 4096 {
+                    let (c0, c1) = (chunk * 4096, ((chunk + 1) * 4096).min(pages));
+                    if unsafe { mincore((lo + c0 as u64 * page) as *mut u8, (c1 - c0) * page as usize, v.as_mut_ptr().add(c0)) } == 0 {
+                        res += v[c0..c1].iter().filter(|b| **b & 1 != 0).count();
+                    }
+                }
+                eprintln!("makepad-run mem unit {}: {:#x}..{:#x} ({:.0} MB) resident {:.1} MB", names[k], lo, hi, (hi - lo) as f64 / 1048576.0, res as f64 * page as f64 / 1048576.0);
+            }
+        }
         big.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         for (res, a, size, dirty, tag, share, prot) in big.into_iter().take(14) {
-            eprintln!("makepad-run mem region: {:#x} size {:.1} MB resident {:.1} MB dirtied {:.1} MB tag {} share {} prot {}", a, size as f64 / 1048576.0, res as f64 / 1048576.0, dirty as f64 / 1048576.0, tag, share, prot);
+            extern "C" {
+                fn proc_regionfilename(pid: i32, address: u64, buffer: *mut u8, size: u32) -> i32;
+                fn getpid() -> i32;
+            }
+            let mut buf = [0u8; 1024];
+            let n = unsafe { proc_regionfilename(getpid(), a, buf.as_mut_ptr(), buf.len() as u32) };
+            let file = if n > 0 { String::from_utf8_lossy(&buf[..n as usize]).into_owned() } else { String::new() };
+            eprintln!("makepad-run mem region: {:#x} size {:.1} MB resident {:.1} MB dirtied {:.1} MB tag {} share {} prot {} file {}", a, size as f64 / 1048576.0, res as f64 / 1048576.0, dirty as f64 / 1048576.0, tag, share, prot, file);
         }
     }
 }
