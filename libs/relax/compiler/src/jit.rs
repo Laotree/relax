@@ -380,8 +380,6 @@ pub struct Unit {
     /// one to encode. Whatever reads or replaces the cache's entries, or changes the sources
     /// the keys come from, drains them first (flush_cache_records).
     pending_cache_records: Vec<Option<crate::cache::PendingRecord>>,
-    /// slots installed before the first present whose background borrow check is queued after it
-    pending_borrowck: Vec<u32>,
     pending_cache_cursor: usize,
     /// slots installed in the first seconds after main, in order (the disk cache's startup
     /// manifest for the next run)
@@ -2409,7 +2407,6 @@ impl Unit {
             syms: crate::syms::Syms::new(syms_base, rw_base),
             cache: None,
             pending_cache_records: Vec::new(),
-            pending_borrowck: Vec::new(),
             pending_cache_cursor: 0,
             start_order: Vec::new(),
             rt: Rt { fmt_str: 0, fmt_int: 0, fmt_float: 0, fmt_print: 0, panic_site: 0, panic_bounds: 0, str_eq: 0, fmod: 0, fmodf: 0, panic_impl: 0, thread_run: 0, catch_panic: 0, args: 0, memcpy: 0, memmove: 0, memset: 0, fmt_push: 0, fmt_pop: 0, resume: 0, land: 0, panicking: 0, rethrow: 0 },
@@ -4600,14 +4597,9 @@ impl Unit {
         }
         // borrowck lane: a fn instance's first code, and every live-patched version of it, is checked
         // lazily in the background (D3: a patch is never refused synchronously unless --check-first;
-        // its verdict arrives as a Gandalf event, at the front of the queue). The first code of slots
-        // the main thread installs before the first present is queued after it (flush_borrowck_notes).
+        // its verdict arrives as a Gandalf event, at the front of the queue).
         if (first && gen == 0 || gen > 0) && crate::borrowck::lazy::gandalf_enabled(options) {
-            if gen == 0 && startup_phase() && !FIRST_PRESENT.load(Ordering::Acquire) && owner::for_main() {
-                crate::zone_alloc::kept_with(|| self.pending_borrowck.push(id));
-            } else {
-                self.note_first_borrowck(id, (gen > 0).then_some(0));
-            }
+            self.note_first_borrowck(id, (gen > 0).then_some(0));
         }
         unsafe {
             let slot = self.slots.table(id) as *const AtomicU64;
@@ -5374,17 +5366,6 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
 }
 
 impl Unit {
-    /// Queues the background borrow checks of slots installed before the first present (owner
-    /// thread); true: more are left.
-    fn flush_borrowck_notes(&mut self, count: usize) -> bool {
-        let n = count.min(self.pending_borrowck.len());
-        let ids: Vec<u32> = self.pending_borrowck.drain(..n).collect();
-        for id in ids {
-            self.note_first_borrowck(id, None);
-        }
-        !self.pending_borrowck.is_empty()
-    }
-
     /// Encodes every deferred cache record (owner thread).
     pub(crate) fn flush_cache_records(&mut self) {
         self.record_cache_batch(usize::MAX);
@@ -11296,7 +11277,7 @@ extern "C" fn relax_first_present() {
     }
 }
 
-/// Records encoded (or borrow checks queued) per owner request of the work that follows the first
+/// Records encoded per owner request of the work that follows the first
 /// present: a request is not interrupted, so the main thread's next lazy compile waits for the batch
 /// that is running (256 records took 50-100 ms: a hitch in the first frames); the batches are small
 /// and the owner serves the program's requests between them.
@@ -11346,16 +11327,6 @@ pub fn startup_main(runtime: &crate::options::RuntimeOptions) {
             let more = owner::call(owner::Class::Background, || {
                 let up = SPEC_UNIT.load(Ordering::Acquire);
                 !SPEC_STOP.load(Ordering::SeqCst) && !up.is_null() && unsafe { (&mut *up).record_cache_batch(POST_PRESENT_BATCH) }
-            });
-            if !more { break; }
-            std::thread::yield_now();
-        }
-        // the background borrow checks of what the main thread's installs made before the present
-        loop {
-            let _job = compile_job();
-            let more = owner::call(owner::Class::Background, || {
-                let up = SPEC_UNIT.load(Ordering::Acquire);
-                !SPEC_STOP.load(Ordering::SeqCst) && !up.is_null() && unsafe { (&mut *up).flush_borrowck_notes(POST_PRESENT_BATCH / 2) }
             });
             if !more { break; }
             std::thread::yield_now();
