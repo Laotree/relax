@@ -3500,6 +3500,12 @@ impl<'a> Parser<'a> {
                 if self.kind() == T::KwElse && self.pos > 0 && self.toks.at(self.pos - 1).kind == T::CloseBrace {
                     return self.err("right curly brace `}` before `else` in a `let...else` statement not allowed");
                 }
+                // check_let_else_init_bool_expr: a lazy boolean operator is not the whole initializer
+                if self.kind() == T::KwElse {
+                    if let ExprKind::Binary(op @ (BinOp::And | BinOp::Or), ..) = self.ast.expr(e).kind {
+                        return self.err(if op == BinOp::And { "a `&&` expression cannot be directly assigned in `let...else`" } else { "a `||` expression cannot be directly assigned in `let...else`" });
+                    }
+                }
                 let el = if self.eat(T::KwElse) { Some(self.block()?) } else { None };
                 (Some(e), el)
             } else {

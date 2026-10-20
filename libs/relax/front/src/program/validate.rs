@@ -68,6 +68,7 @@ impl Program {
                     let Some(tr) = ast.as_trait(&it.kind) else { continue };
                     for &c in ast.list(tr.items) {
                         let ci = ast.item(c);
+                        self.patterns_in_bodiless(ast, &mut err, ci);
                         if not_permitted(&ci.vis) {
                             err(ci.lo, "E0449: visibility qualifiers are not permitted here -- note: trait items always share the visibility of their trait".into());
                         }
@@ -82,6 +83,7 @@ impl Program {
                 }
                 DefKind::Union => {
                     if let Some(u) = ast.as_union(&it.kind) {
+                        if ast.list(u.fields).is_empty() { err(it.lo, "unions cannot have zero fields".into()); }
                         self.duplicate_fields(&mut err, ast, f, VariantData::Struct(u.fields));
                     }
                 }
@@ -149,6 +151,7 @@ impl Program {
             Ty::Path(p) => self.check_nested_in_segs(err, ast, ast.segs(p.segs), in_impl, fn_ret_ok, pos),
             Ty::ImplTrait(bs) => {
                 if in_impl { err(pos, "E0666: nested `impl Trait` is not allowed".into()); }
+                if !ast.list(*bs).iter().any(|b| matches!(b, Bound::Trait { .. })) { err(pos, "at least one trait must be specified".into()); }
                 self.check_nested_in_bounds(err, ast, *bs, true, fn_ret_ok, pos);
             }
             Ty::DynTrait(bs, _) => self.check_nested_in_bounds(err, ast, *bs, in_impl, fn_ret_ok, pos),
@@ -240,6 +243,20 @@ impl Program {
             return;
         }
         err(it.lo, format!("cannot find macro `{name}` in this scope"));
+    }
+
+    /// ast_validation check_decl_no_pat: a trait method without a body takes only plain identifier and `_`
+    /// patterns (a `mut` identifier is the lint `patterns_in_fns_without_body`).
+    fn patterns_in_bodiless(&self, ast: &Ast, err: &mut impl FnMut(u32, String), it: &Item) {
+        let ItemKind::Fn(sig, None, _) = it.kind else { return };
+        let sig = ast.fn_sig(sig);
+        if sig.lazy_body.is_some() { return; }
+        for prm in ast.list(sig.params) {
+            match ast.pat(prm.pat) {
+                Pat::Wild | Pat::Ident { by_ref: false, sub: None, .. } => {}
+                _ => err(it.lo, "E0642: patterns aren't allowed in functions without bodies".into()),
+            }
+        }
     }
 
     /// `const _` is only an item of a module or block (ast_validation `check_item_named`).

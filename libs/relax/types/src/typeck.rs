@@ -7153,6 +7153,75 @@ impl<'a> Fcx<'a> {
 
     // ------------------------------------------------------------ macros
 
+    /// rustc_builtin_macros cfg.rs parse_cfg + rustc_attr_parsing cfg.rs parse_cfg_entry: the argument of `cfg!`
+    /// is one cfg predicate (`name`, `name = "str"`, `not(p)`, `any(..)`, `all(..)`, `version(..)`, `target(..)`).
+    fn check_cfg_macro(&mut self, lo_tok: usize, hi_tok: usize, pos: u32) {
+        use crate::lexer::T;
+        let p = self.prog.src(self.file);
+        let kind = |i: usize| p.tok(i).kind;
+        // the top-level comma-separated runs of lo..hi
+        let split = |lo: usize, hi: usize| -> Vec<(usize, usize)> {
+            let (mut v, mut depth, mut start) = (Vec::new(), 0i32, lo);
+            for i in lo..hi {
+                match kind(i) {
+                    T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
+                    T::CloseParen | T::CloseBracket | T::CloseBrace => depth -= 1,
+                    T::Comma if depth == 0 => { v.push((start, i)); start = i + 1; }
+                    _ => {}
+                }
+            }
+            if start < hi { v.push((start, hi)); }
+            v
+        };
+        // Err(code) for a malformed predicate in lo..hi
+        fn entry(p: crate::cfg::Src<'_>, lo: usize, hi: usize, split: &dyn Fn(usize, usize) -> Vec<(usize, usize)>, depth: u32) -> Result<(), &'static str> {
+            use crate::lexer::T;
+            if depth > 64 { return Ok(()); }
+            if lo >= hi { return Err("E0539"); }
+            let first = p.tok(lo).kind;
+            // a bare literal is no meta item
+            if matches!(first, T::Str | T::RawStr | T::Int | T::Float | T::Char | T::Byte | T::ByteStr | T::CStr) { return Err("E0539"); }
+            let name = crate::cfg::tok_str(p, lo);
+            if lo + 1 == hi { return Ok(()); }
+            match p.tok(lo + 1).kind {
+                T::Eq => {
+                    // `name = "value"`
+                    if hi == lo + 3 && matches!(p.tok(lo + 2).kind, T::Str | T::RawStr) { Ok(()) } else { Err("E0539") }
+                }
+                T::OpenParen if p.tok(hi - 1).kind == T::CloseParen => {
+                    let args = split(lo + 2, hi - 1);
+                    match name {
+                        b"not" => {
+                            if args.len() != 1 { return Err("E0805"); }
+                            entry(p, args[0].0, args[0].1, split, depth + 1)
+                        }
+                        b"any" | b"all" => {
+                            for (a, b) in args { entry(p, a, b, split, depth + 1)?; }
+                            Ok(())
+                        }
+                        b"version" | b"target" => Ok(()),
+                        _ => Err("E0537"),
+                    }
+                }
+                _ => Err("E0539"),
+            }
+        }
+        if lo_tok >= hi_tok {
+            self.err(pos, "macro requires a cfg-pattern as an argument".to_string());
+            return;
+        }
+        let runs = split(lo_tok, hi_tok);
+        if runs.len() > 1 {
+            // `cfg!(false, false)`: one pattern (a trailing comma is allowed)
+            self.err(pos, "expected 1 cfg-pattern".to_string());
+            return;
+        }
+        if let Err(code) = entry(p, lo_tok, hi_tok, &split, 0) {
+            let what = match code { "E0805" => "malformed `cfg` macro input", "E0537" => "invalid predicate", _ => "malformed `cfg` macro input" };
+            self.err(pos, format!("{}: {}", code, what));
+        }
+    }
+
     fn check_mac(&mut self, e: ExprId, m: &MacCall, expected: Option<TyId>, lo: u32) -> TyId {
         let ast = self.ast();
         let name = match ast.segs(m.path.segs).last() {
@@ -7163,6 +7232,9 @@ impl<'a> Fcx<'a> {
         let never = self.tcx.tys.never;
         let bool_ = self.tcx.tys.bool_;
         if name == "cfg" {
+            if self.tcx.validates(self.prog, self.file) && m.toks.hi >= m.toks.lo {
+                self.check_cfg_macro(m.toks.lo as usize, m.toks.hi as usize, lo);
+            }
             return bool_;
         }
         // `compile_error!("msg")` (what a failed built-in or derive leaves at its call): the
