@@ -869,6 +869,11 @@ impl<'a> Parser<'a> {
         let kind = |i: usize| if i < hi { self.toks.at(i).kind } else { T::Eof };
         if kind(lo + 1) != T::Eq || kind(lo + 2) != T::Ident || kind(lo + 3) != T::Not { return Ok(()); }
         match self.tok_text(self.toks.at(lo + 2)) {
+            // the macro's own message is the error
+            b"compile_error" if kind(lo + 5) == T::Str => {
+                let msg = crate::lit::unescape_str(&String::from_utf8_lossy(self.tok_text(self.toks.at(lo + 5))));
+                return Err(PErr { pos: self.toks.at(lo + 2).lo, msg });
+            }
             b"include_str" | b"include_bytes" | b"concat" | b"env" | b"stringify" => {}
             _ => return Ok(()),
         }
@@ -2199,6 +2204,9 @@ impl<'a> Parser<'a> {
                 }
             }
             T::Ident if self.is_word(0, b"macro_rules") && self.nth(1) == T::Not => {
+                if !matches!(vis, Vis::Private) {
+                    return Err(PErr { pos: self.tok().lo, msg: "can't qualify macro_rules invocation with `pub`".into() });
+                }
                 self.pos += 2;
                 name = self.ident_tok()?;
                 let (d, toks) = self.delim_tt()?;
