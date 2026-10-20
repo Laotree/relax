@@ -452,6 +452,7 @@ impl Tcx {
                 continue;
             }
             let Some(&st) = self.impl_self.get(&im.def) else { continue };
+            let raw_st = st;
             // inherent_impls.rs check_item: an inherent impl names a nominal type, not a projection, an opaque or a parameter
             if !self.impl_trait.contains_key(&im.def) && !prog.files[im.file as usize].ast.as_impl(&prog.files[im.file as usize].ast.item(im.item).kind).is_some_and(|i| i.trait_.is_some())
                 && matches!(self.tys.kind(st), TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. } | AliasTyKind::Opaque { .. }, .. })) {
@@ -478,7 +479,7 @@ impl Tcx {
                     }
                 }
                 Some(&td) => {
-                    self.header_coherence_errors(prog, im.def, krate, td, st, pos, &mut errors);
+                    self.header_coherence_errors(prog, im.def, krate, td, raw_st, pos, &mut errors);
                     if prog.def(td).krate == krate {
                         continue;
                     }
@@ -2740,7 +2741,10 @@ impl Tcx {
                 if self.validates(prog, file) {
                     let predicate = crate::next_solver::Predicate::dummy(crate::next_solver::PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(
                         crate::next_solver::TraitClause { trait_ref: trait_ref.clone(), polarity: crate::next_solver::ClausePolarity::Positive })));
-                    let declaring = self.transitive_bounds_that_define_assoc_item(prog, vec![predicate], name);
+                    let mut declaring = self.transitive_bounds_that_define_assoc_item(prog, vec![predicate], name);
+                    // (the same trait ref reached under different binders is one candidate: anonymize_bound_vars)
+                    let mut kinds: Vec<crate::next_solver::PredicateKind> = Vec::new();
+                    declaring.retain(|(_, p)| { if kinds.contains(&p.kind) { false } else { kinds.push(p.kind.clone()); true } });
                     if declaring.len() > 1 {
                         let traits: Vec<&str> = declaring.iter().map(|(item, _)| prog.name(prog.def(*item).parent)).collect();
                         self.err(cx, prog, file, p.lo, format!("E0221: ambiguous associated type `{}` in bounds of `Self` (from {})", prog.syms.str(name), traits.join(", ")));
