@@ -566,6 +566,8 @@ pub struct Program {
     /// while `record_import_uses` is on (`makepad check`)
     import_used: relax_session::sync::Mutex<crate::fxhash::HashSet<(u32, Sym, bool)>>,
     glob_used: relax_session::sync::Mutex<crate::fxhash::HashSet<(u32, DefId)>>,
+    /// extern prelude entries (crate, name) a path resolved through (recorded like `import_used`)
+    extern_used: relax_session::sync::Mutex<crate::fxhash::HashSet<(u32, Sym)>>,
     /// the per-occurrence memo tables (scope lookups, path segments) are filled only once
     /// bodies are being checked: during collection nearly every lookup is unique, and a memo
     /// would cost more than it saves (set by jit::Unit::new)
@@ -736,8 +738,14 @@ impl DeclarationState {
     fn save(prog: &Program, file: u32, body_only: bool, visible: Option<&[bool]>) -> Self {
         let sees = |d: DefId| visible.map_or(true, |v| v.get(prog.def(d).krate as usize).copied().unwrap_or(true));
         let mut legacy = HashMap::default();
-        for (&owner, result) in &prog.legacy_const_args {
-            if if body_only { prog.def(owner).file == file } else { sees(owner) } { legacy.insert(owner, result.clone()); }
+        if body_only {
+            for &d in prog.defs_in_file(file) {
+                if let Some(result) = prog.legacy_const_args.get(&DefId(d)) { legacy.insert(DefId(d), result.clone()); }
+            }
+        } else {
+            for (&owner, result) in &prog.legacy_const_args {
+                if sees(owner) { legacy.insert(owner, result.clone()); }
+            }
         }
         let environment = if body_only { None } else { Some((prog.legacy_const_attrs.clone(), AssocState {
             rpitit: prog.impl_trait_in_trait_data.iter().map(|(k, v)| (*k, v.clone())).collect(), associated: prog.associated_types_for_impl_traits.iter().map(|(k, v)| (*k, v.clone())).collect(),
@@ -838,6 +846,7 @@ impl Program {
             scope_cache: Default::default(),
             import_used: Default::default(),
             glob_used: Default::default(),
+            extern_used: Default::default(),
             body_memos: Default::default(),
             path_seg_cache: Default::default(),
             trait_bind_cache: Default::default(),
@@ -1973,12 +1982,18 @@ impl Program {
             self.node_id_to_def_id.retain(|(f, _), _| *f != file);
             self.def_id_to_node_id.retain(|_, (f, _)| *f != file);
         }
-        self.collected_definitions.retain(|d| self.defs[d.0 as usize].file != file);
-        self.legacy_call_names.retain(|d, _| self.defs[d.0 as usize].file != file);
-        self.repeat_expr_counts.retain(|d| self.defs[d.0 as usize].file != file);
+        // (the file's defs from the per-file index: no scan of the program's tables)
+        for d in self.defs_in_file(file).to_vec() {
+            let d = DefId(d);
+            self.collected_definitions.remove(&d);
+            self.legacy_call_names.remove(&d);
+            self.repeat_expr_counts.remove(&d);
+        }
         self.def_disambiguators.retain(|(d, _, _), _| self.defs[d.0 as usize].file != file);
         let mut owners = Vec::new();
-        for (&(f, item), &def) in &self.item_defs { if f == file { owners.push((item, def)); } }
+        for item in 0..self.files[file as usize].ast.items.len() as u32 {
+            if let Some(&def) = self.item_defs.get(&(file, item)) { owners.push((item, def)); }
+        }
         owners.sort_unstable_by_key(|(item, _)| *item);
         for (_, def) in owners {
             // Variant owners must exist before collecting their fields/discriminants.
@@ -2020,10 +2035,13 @@ impl Program {
 
     /// Called once after all body-only versions have been committed under the
     /// front write lock. Unchanged owners retain their resolution results.
-    pub fn lower_body_declarations(&mut self, changed: &[DefId]) -> usize {
-        let owners: Vec<DefId> = self.legacy_const_args.keys().copied().collect();
+    /// `files`: the versions the transaction committed. Only the owners defined in them moved to
+    /// another file; every other owner's result already describes its file.
+    pub fn lower_body_declarations(&mut self, changed: &[DefId], files: &[u32]) -> usize {
+        let owners: Vec<DefId> = files.iter().flat_map(|&f| self.defs_in_file(f).iter().map(|&d| DefId(d)))
+            .filter(|d| self.legacy_const_args.contains_key(d) && !changed.contains(d)).collect();
         for owner in owners {
-            if !changed.contains(&owner) { crate::def_collector::retarget_legacy_owner(self, owner); }
+            crate::def_collector::retarget_legacy_owner(self, owner);
         }
         crate::def_collector::lower_legacy_const_owners(self, changed)
     }
@@ -3907,6 +3925,11 @@ impl Program {
         u.contains(&(m, name, true)) || u.contains(&(m, name, false))
     }
 
+    /// Whether a path resolved through the extern prelude entry `name` of crate `krate`.
+    pub fn extern_prelude_used(&self, krate: u32, name: Sym) -> bool {
+        self.extern_used.lock().unwrap_or_else(|e| e.into_inner()).contains(&(krate, name))
+    }
+
     /// Whether a resolution went through the glob import of `target` in module `m`.
     pub fn glob_import_used(&self, m: u32, target: DefId) -> bool {
         self.glob_used.lock().unwrap_or_else(|e| e.into_inner()).contains(&(m, target))
@@ -4038,6 +4061,7 @@ impl Program {
         let krate = self.mods[module as usize].krate;
         for (n, c) in &self.crates[krate as usize].deps {
             if *n == name {
+                if record_import_uses() { self.extern_used.lock().unwrap_or_else(|e| e.into_inner()).insert((krate, name)); }
                 return Some(*c);
             }
         }
@@ -4544,7 +4568,7 @@ impl Program {
 
     /// The extern prelude, std prelude and primitive types (lookup_in_scope after the
     /// lexical modules).
-    fn lookup_in_scope_outside(&self, module: u32, name: Sym, ns_type: bool) -> Option<DefId> {
+    pub fn lookup_in_scope_outside(&self, module: u32, name: Sym, ns_type: bool) -> Option<DefId> {
         if ns_type {
             if let Some(c) = self.extern_crate(module, name) {
                 return Some(self.mods[self.crates[c as usize].root_mod as usize].def);

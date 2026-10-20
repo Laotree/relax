@@ -22,6 +22,8 @@ use crate::typeck::{Body, Coerce, Res};
 use crate::types::{TyId, TyKind};
 use crate::fxhash::HashMap;
 
+mod match_tree;
+
 /// vtable layout: [drop_in_place (0 when no drop), size, align, methods...]
 pub const VT_DROP: u32 = 0;
 pub const VT_SIZE: u32 = 1;
@@ -1455,7 +1457,7 @@ impl<'a> Lcx<'a> {
                 ExprKind::Call(f, _) if matches!(self.kind_ref(b.ty(*f)), TyKind::Closure(..)) => self.mark_root(*f),
                 // overloaded index / deref take `&self` / `&mut self` of the base
                 ExprKind::Index(x, _) if b.ov_index.contains_key(&e.0) => self.mark_root(*x),
-                ExprKind::Unary(UnOp::Deref, x) if b.ov_derefs.contains_key(&(e.0, 0)) => self.mark_root(*x),
+                ExprKind::Unary(UnOp::Deref, x) if b.ov_deref(e.0, 0).is_some() => self.mark_root(*x),
                 _ => {}
             }
         }
@@ -2618,7 +2620,7 @@ impl<'a> Lcx<'a> {
                         Some(e)
                             if else_.is_none()
                                 && !matches!(ast.pat(*pat), Pat::Wild | Pat::Ident { sub: None, .. })
-                                && !self.b.coerce.contains_key(&e.0)
+                                && !self.b.coerce(e.0).is_some()
                                 && self.field_move_path(*e).is_some() =>
                         {
                             // `let S { a, .. } = local(.f)*;` binds in place: what is moved out
@@ -2636,7 +2638,7 @@ impl<'a> Lcx<'a> {
                         Some(e)
                             if else_.is_none()
                                 && !matches!(ast.pat(*pat), Pat::Wild | Pat::Ident { sub: None, by_ref: false, .. })
-                                && !self.b.coerce.contains_key(&e.0)
+                                && !self.b.coerce(e.0).is_some()
                                 && self.is_place_expr(*e)
                                 && (self.pat_binds_by_ref(*pat) || !self.pat_moves_droppable(*pat)) =>
                         {
@@ -2894,7 +2896,7 @@ impl<'a> Lcx<'a> {
     /// references/pointers, a `Deref::deref` (or `deref_mut` in a mutable context) call
     /// for overloaded steps.
     fn deref_place(&mut self, e: u32, k: usize, pl: Place, pt: TyId) -> (Place, TyId) {
-        if let Some((m, args)) = self.b.ov_derefs.get(&(e, k)).cloned() {
+        if let Some((m, args)) = self.b.ov_deref(e, k) {
             let args = self.mono_list(args);
             return self.overloaded_deref(m, args, pl, pt);
         }
@@ -3057,7 +3059,7 @@ impl<'a> Lcx<'a> {
         // (an index coerced to the impl's index type -- `S[bar]` with `impl Index<fn()>`,
         // `v[&string]` with `Index<&str>` -- passes the coerced value)
         let it = match args.get(1) {
-            Some(&ia) if self.b.coerce.contains_key(&i.0) => ia,
+            Some(&ia) if self.b.coerce(i.0).is_some() => ia,
             _ => self.body_ty(i),
         };
         let iv = self.lower_expr_coerced(i, it);
@@ -4052,6 +4054,11 @@ impl<'a> Lcx<'a> {
             Pat::Or(alts) => {
                 // bind the alternative that matched (rustc: each alternative binds the same names)
                 let alts = alts.clone();
+                let mut bound = Vec::new();
+                self.pat_binding_locals(p, &mut bound);
+                if bound.is_empty() {
+                    return;
+                }
                 let sel = match self.or_sel.get(&p.0) {
                     Some(r) => *r,
                     None => {
@@ -4717,18 +4724,24 @@ impl<'a> Lcx<'a> {
             }
             Pat::Or(alts) => {
                 let ok = self.f.block();
+                // which alternative matched is only needed to bind its names
+                let mut bound = Vec::new();
+                self.pat_binding_locals(p, &mut bound);
                 let sel = match self.or_sel.get(&p.0) {
-                    Some(r) => *r,
+                    Some(r) => Some(*r),
+                    None if bound.is_empty() => None,
                     None => {
                         let r = self.f.vreg(Cls::I);
                         self.or_sel.insert(p.0, r);
-                        r
+                        Some(r)
                     }
                 };
                 for (i, a) in ast.list(*alts).iter().enumerate() {
                     let next = if i + 1 == alts.len() { fail } else { self.f.block() };
                     self.test_pat(*a, place, t, next);
-                    self.emit(Inst::Iconst(sel, i as i64));
+                    if let Some(sel) = sel {
+                        self.emit(Inst::Iconst(sel, i as i64));
+                    }
                     self.goto(ok);
                     if i + 1 < alts.len() {
                         self.switch(next);
@@ -4990,27 +5003,11 @@ impl<'a> Lcx<'a> {
         }
     }
 
-    fn test_tag(&mut self, place: &Place, t: TyId, vi: u32, fail: u32) {
+    /// The discriminant of the enum value at `place: t`, decoded (one vreg, two for a 128-bit tag).
+    fn read_tag(&mut self, place: &Place, t: TyId) -> Option<Vec<VReg>> {
         let l = self.layout(t);
-        let adt = match self.kind_ref(t) {
-            TyKind::Adt(d, _, _) => self.u.tcx.adts.get(d),
-            _ => None,
-        };
-        let adt = match adt {
-            Some(a) => a,
-            None => return,
-        };
-        if adt.variants.len() <= 1 {
-            return;
-        }
-        let Some(discr) = adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi) else { return; };
-        let disc128 = discr.signed_value();
-        let disc = disc128 as i64;
-        let tag = match place {
-            Place::Mem(b, o) => match self.load_disc(*b, *o, t) {
-                Some(d) => d,
-                None => return,
-            },
+        match place {
+            Place::Mem(b, o) => self.load_disc(*b, *o, t),
             Place::Regs(r) if !r.is_empty() => {
                 let raw = match (l.tag, &l.leaves) {
                     (Some((toff, Mem::Int(bytes, _))), Some(lv)) => {
@@ -5027,16 +5024,31 @@ impl<'a> Lcx<'a> {
                     Some(adt) => {
                         let pos = ((self.b.file as u64) << 32) | self.pos as u64;
                         let cur = self.cur;
-                        match emit_decode_tag(self.u, &mut self.f, cur, pos, raw, &l, &adt) {
-                            Some(tag) => tag,
-                            None => return,
-                        }
+                        emit_decode_tag(self.u, &mut self.f, cur, pos, raw, &l, &adt)
                     }
-                    None => raw,
+                    None => Some(raw),
                 }
             }
-            _ => return,
+            _ => None,
+        }
+    }
+
+    fn test_tag(&mut self, place: &Place, t: TyId, vi: u32, fail: u32) {
+        let adt = match self.kind_ref(t) {
+            TyKind::Adt(d, _, _) => self.u.tcx.adts.get(d),
+            _ => None,
         };
+        let adt = match adt {
+            Some(a) => a,
+            None => return,
+        };
+        if adt.variants.len() <= 1 {
+            return;
+        }
+        let Some(discr) = adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi) else { return; };
+        let disc128 = discr.signed_value();
+        let disc = disc128 as i64;
+        let Some(tag) = self.read_tag(place, t) else { return; };
         let k = self.iconst(disc);
         let c = if tag.len() == 2 {
             let hi = self.iconst((disc128 as u128 >> 64) as i64);
@@ -5620,7 +5632,7 @@ impl<'a> Lcx<'a> {
     }
 
     fn apply_coercion(&mut self, e: ExprId, v: Val, target: TyId) -> Val {
-        match self.b.coerce.get(&e.0).copied() {
+        match self.b.coerce(e.0) {
             None | Some(Coerce::MutToConst | Coerce::RefToRaw(_)) => v,
             Some(Coerce::Never) => {
                 // a `!` value used as another type (`fn f(x: !) -> T { x }`): control never gets
@@ -5869,7 +5881,7 @@ impl<'a> Lcx<'a> {
                         }
                         v
                     }
-                    UnOp::Deref if self.b.ov_derefs.contains_key(&(e.0, 0)) || self.box_inner(xt).is_some() => {
+                    UnOp::Deref if self.b.ov_deref(e.0, 0).is_some() || self.box_inner(xt).is_some() => {
                         let (pl, pt) = self.lower_place(e);
                         let v = self.read_place(&pl, pt);
                         // moving out of `*b` (a Box local): the box is freed without dropping
@@ -5995,7 +6007,7 @@ impl<'a> Lcx<'a> {
             }
             ExprKind::Cast(x, _) => {
                 let xt = self.body_ty(*x);
-                if let Some(Coerce::ToDyn(..) | Coerce::Upcast(..) | Coerce::Unsize | Coerce::DerefRef(_) | Coerce::ReifyFn | Coerce::ClosureFn | Coerce::UnsafeFn | Coerce::RefToRaw(_)) = self.b.coerce.get(&x.0) {
+                if let Some(Coerce::ToDyn(..) | Coerce::Upcast(..) | Coerce::Unsize | Coerce::DerefRef(_) | Coerce::ReifyFn | Coerce::ClosureFn | Coerce::UnsafeFn | Coerce::RefToRaw(_)) = self.b.coerce(x.0) {
                     return self.lower_expr_coerced(*x, t);
                 }
                 if matches!(self.kind_ref(t), TyKind::Adt(..) | TyKind::Tuple(_) | TyKind::Array(..)) {
@@ -6899,7 +6911,7 @@ impl<'a> Lcx<'a> {
                     (self.temp_place(e, v, t), t)
                 }
             },
-            ExprKind::Unary(UnOp::Deref, x) if self.b.ov_derefs.contains_key(&(e.0, 0)) => {
+            ExprKind::Unary(UnOp::Deref, x) if self.b.ov_deref(e.0, 0).is_some() => {
                 let (pl, pt) = self.lower_place(*x);
                 self.deref_place(e.0, 0, pl, pt)
             }
@@ -6937,7 +6949,7 @@ impl<'a> Lcx<'a> {
                 (self.val_to_place(v), t)
             }
             ExprKind::Index(a, i) => {
-                let derefs = self.b.index_derefs.get(&e.0).copied().unwrap_or(0);
+                let derefs = self.b.index_derefs(e.0);
                 let (mut pl, mut pt) = self.lower_place(*a);
                 for k in 0..derefs {
                     let (a2, b2) = self.deref_place(e.0, k, pl, pt);
@@ -7048,7 +7060,7 @@ impl<'a> Lcx<'a> {
         let at = self.body_ty(a);
         let (mut pl, mut pt) = self.lower_place(a);
         // autoderef recorded by type checking (Vec<T> -> [T], String -> str, &&[T] ..)
-        let derefs = self.b.index_derefs.get(&e.0).copied().unwrap_or(0);
+        let derefs = self.b.index_derefs(e.0);
         for k in 0..derefs {
             let (a2, b2) = self.deref_place(e.0, k, pl, pt);
             pl = a2;
@@ -8680,18 +8692,62 @@ impl<'a> Lcx<'a> {
         }
         let join = self.f.block();
         let res = self.result_place(t);
-        for arm in arms {
-            if !self.active(arm.attrs) {
-                continue;
+        let live: Vec<Arm> = arms.iter().filter(|a| self.active(a.attrs)).copied().collect();
+        // the or-alternative combinations of each guarded arm (see below)
+        let combos: Vec<Option<Vec<Vec<(u32, usize)>>>> = live.iter().map(|a| if a.guard.is_some() { self.or_combos(a.pat, 1024) } else { None }).collect();
+        let forced: Vec<bool> = live.iter().zip(&combos).map(|(a, c)| a.guard.is_some() && c.is_some()).collect();
+        // the arms' tests as a decision tree (match_tree.rs): each arm is then entered where the
+        // tree leaves it, and tested in order only after a failed guard or an undecided pattern
+        let mut tree: Option<match_tree::Tree> = None;
+        if live.len() >= 3 {
+            let e: Vec<u32> = (0..=live.len()).map(|_| self.f.block()).collect();
+            let post: Vec<u32> = (0..live.len()).map(|_| self.f.block()).collect();
+            let mut tr = match_tree::Tree::new(e, post);
+            let pats: Vec<PatId> = live.iter().map(|a| a.pat).collect();
+            if let Some(root) = self.match_tree(&pats, &forced, &mut tr, &place, pt) {
+                self.goto(root);
+                tree = Some(tr);
             }
-            let next = self.f.block();
+        }
+        // which entries the tree (and the arms that fall through to later ones) reach
+        let (mut need_e, mut need_post) = (vec![true; live.len()], vec![true; live.len()]);
+        if let Some(tr) = &tree {
+            need_e = tr.used_e.clone();
+            need_post = tr.used_post.clone();
+            for k in 0..live.len() {
+                if k > 0 && (need_e[k - 1] || (live[k - 1].guard.is_some() && need_post[k - 1])) {
+                    need_e[k] = true;
+                }
+                if need_e[k] && !forced[k] {
+                    need_post[k] = true;
+                }
+            }
+        }
+        for (k, arm) in live.iter().enumerate() {
+            let tree_mode = tree.is_some();
+            let combos_path = forced[k];
+            let next = match &tree {
+                Some(tr) => tr.e[k + 1],
+                None => self.f.block(),
+            };
+            if let Some(tr) = &tree {
+                if !need_e[k] && !need_post[k] {
+                    continue;
+                }
+                if need_e[k] {
+                    self.switch(tr.e[k]);
+                    if !combos_path {
+                        self.test_pat(arm.pat, &place, pt, next);
+                        self.goto(tr.post[k]);
+                    }
+                }
+                if !combos_path {
+                    self.switch(tr.post[k]);
+                }
+            }
             // the guard's temporaries (if-let guards) belong to the arm
             let gmark = self.stmt_temps.len();
-            let combos = match arm.guard {
-                Some(_) => self.or_combos(arm.pat, 1024),
-                None => None,
-            };
-            if let (Some(g), Some(combos)) = (arm.guard, combos) {
+            if let (Some(g), Some(combos)) = (arm.guard, combos[k].clone()) {
                 // a guarded arm (rustc match lowering): each or-alternative combination is a
                 // candidate of its own -- test it, bind (moves deferred), run the guard; a
                 // failing guard tries the next alternative, then the next arm, with the
@@ -8759,7 +8815,9 @@ impl<'a> Lcx<'a> {
                 }
                 self.switch(body);
             } else {
-                self.test_pat(arm.pat, &place, pt, next);
+                if !tree_mode {
+                    self.test_pat(arm.pat, &place, pt, next);
+                }
                 let arm_depth = self.scopes.len();
                 self.push_scope();
                 let saved = (self.match_root, self.pat_path.take());
@@ -8806,9 +8864,14 @@ impl<'a> Lcx<'a> {
             self.drop_stmt_temps_from(gmark);
             self.pop_scope();
             self.goto(join);
-            self.switch(next);
+            if !tree_mode {
+                self.switch(next);
+            }
         }
         // no arm matched: unreachable for exhaustive matches
+        if let Some(tr) = &tree {
+            self.switch(tr.e[live.len()]);
+        }
         self.term(Term::Unreachable);
         self.switch(join);
         if self.is_never(t) {
@@ -9106,7 +9169,7 @@ impl<'a> Lcx<'a> {
         // a callable reached as a place (behind references / smart pointers, or a `dyn Fn`
         // place however it was reached: `(*raw_ptr)(..)`, `(*boxed)(..)`) is called through
         // the place (rustc: the overloaded call takes the callee place by reference)
-        let call_derefs = self.b.call_derefs.get(&e.0).copied().or_else(|| if matches!(self.kind_ref(ft), TyKind::Dyn(..)) { Some(0) } else { None });
+        let call_derefs = self.b.call_derefs(e.0).or_else(|| if matches!(self.kind_ref(ft), TyKind::Dyn(..)) { Some(0) } else { None });
         if let Some(n) = call_derefs {
             let (mut pl, mut pt) = self.lower_place(f);
             for k in 0..n {

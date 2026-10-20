@@ -199,7 +199,7 @@ pub fn rustc_inline_cost(callee: &Func, _callee_id: u32) -> usize {
             }
         }
         match block.term {
-            Term::Branch(..) => penalty += INSTR_COST,
+            Term::Branch(..) | Term::Switch(..) => penalty += INSTR_COST,
             Term::Resume => penalty += RESUME_PENALTY,
             Term::Unreachable => bonus += INSTR_COST,
             Term::Jump(..) | Term::Ret(..) | Term::Invoke(..) => {}
@@ -738,6 +738,7 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
                 Term::Jump(cont)
             }
             Term::Unreachable => Term::Unreachable,
+            Term::Switch(..) => unreachable!("Switch is made after optimisation"),
             Term::Invoke(t, e) => Term::Invoke(t + boff, e + boff),
             // the callee's cleanup is done: unwinding goes on in the caller, at the
             // invoke's pad if the call was invoked
@@ -1507,10 +1508,9 @@ fn loop_headers(f: &Func, depth: &[u32]) -> Vec<bool> {
             _ => {
                 state[b] = 1;
                 work.push((b, true));
-                let mut succs = f.blocks[b].term.succs();
-                for s in [succs.next(), succs.next()].into_iter().rev().flatten() {
-                    work.push((s as usize, false));
-                }
+                let at = work.len();
+                work.extend(f.blocks[b].term.succs().map(|s| (s as usize, false)));
+                work[at..].reverse();
             }
         }
     }
@@ -2370,7 +2370,7 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
 /// `__sincosf_stret` / `__sincos_stret` (a two-float HFA on arm64), and its results are not always
 /// those of separate `sinf`/`cosf` calls (1 ulp in 127 of 4000 arguments), so a program's floats
 /// only match a rustc build's if we combine them too.
-static SINCOS: std::sync::Mutex<[Option<(u32, u32, Sym)>; 2]> = std::sync::Mutex::new([None, None]);
+static SINCOS: relax_session::sync::Mutex<[Option<(u32, u32, Sym)>; 2]> = relax_session::sync::Mutex::new([None, None]);
 
 pub fn set_sincos(wide: bool, sin: Sym, cos: Sym, both: Sym) {
     SINCOS.lock().unwrap_or_else(|e| e.into_inner())[wide as usize] = Some((sin.id, cos.id, both));
@@ -3520,9 +3520,14 @@ fn thread_jumps(f: &mut Func) {
 /// Reorders reachable blocks so a block's jump/false-branch target follows it, drops
 /// unreachable blocks and puts panic paths (blocks ending in `Unreachable`) last.
 pub fn relayout(f: &mut Func) {
+    relayout_order(f);
+}
+
+/// `relayout`, returning the new order: per new block, the block it was.
+pub fn relayout_order(f: &mut Func) -> Vec<u32> {
     let n = f.blocks.len();
     if n <= 1 {
-        return;
+        return (0..n as u32).collect();
     }
     let reach = reachable(f);
     // blocks only reachable through unwind edges (cleanup pads) are cold
@@ -3591,6 +3596,7 @@ pub fn relayout(f: &mut Func) {
         blk.term.map_succs(|t| map[t as usize]);
         f.blocks.push(blk);
     }
+    order
 }
 
 pub fn inst_count(f: &Func) -> usize {
@@ -4593,6 +4599,7 @@ fn local_copy_prop(f: &mut Func) -> bool {
 
 /// Immediate dominators (Cooper/Harvey/Kennedy) over reachable blocks; entry's idom is itself.
 pub fn idoms(f: &Func) -> Vec<u32> {
+    let succs_of = |b: u32| f.blocks[b as usize].term.succs();
     let n = f.blocks.len();
     if n == 1 {
         return vec![0];
@@ -4610,11 +4617,8 @@ pub fn idoms(f: &Func) -> Vec<u32> {
             seen[b as usize] = true;
             stack.push((b, 1));
             // pushed in reverse: the first successor is visited first
-            let succ: [Option<u32>; 2] = {
-                let mut it = f.blocks[b as usize].term.succs();
-                [it.next(), it.next()]
-            };
-            for t in succ.iter().rev().flatten() {
+            let succ: Vec<u32> = succs_of(b).collect();
+            for t in succ.iter().rev() {
                 stack.push((*t, 0));
             }
         } else {
@@ -4629,7 +4633,7 @@ pub fn idoms(f: &Func) -> Vec<u32> {
     // predecessors in reverse postorder, flat (pred_off[b]..pred_off[b + 1])
     let mut pred_off = vec![0u32; n + 1];
     for &b in &rpo {
-        for t in f.blocks[b as usize].term.succs() {
+        for t in succs_of(b) {
             pred_off[t as usize + 1] += 1;
         }
     }
@@ -4639,7 +4643,7 @@ pub fn idoms(f: &Func) -> Vec<u32> {
     let mut fill = pred_off.clone();
     let mut preds = vec![0u32; pred_off[n] as usize];
     for &b in &rpo {
-        for t in f.blocks[b as usize].term.succs() {
+        for t in succs_of(b) {
             preds[fill[t as usize] as usize] = b;
             fill[t as usize] += 1;
         }
@@ -9316,7 +9320,7 @@ fn slot_linear_positions(f: &Func) -> Option<Vec<u32>> {
         match f.blocks[b].term {
             Term::Jump(next) => b = next as usize,
             Term::Ret(_) | Term::Unreachable | Term::Resume => return (seen == f.blocks.len()).then_some(positions),
-            Term::Branch(..) | Term::Invoke(..) => return None,
+            Term::Branch(..) | Term::Switch(..) | Term::Invoke(..) => return None,
         }
     }
 }
