@@ -882,3 +882,18 @@ fn a_use_of_an_opaque_type_with_non_parameter_arguments_is_e0792() {
     assert!(errors.iter().any(|e| e.starts_with("E0792") && e.contains("expected generic lifetime parameter, found `'static`")), "{errors:?}");
     assert!(errors.iter().any(|e| e.contains("non-defining opaque type use in defining scope")), "{errors:?}");
 }
+
+#[test]
+fn a_region_inferred_in_a_closure_signature_is_an_external_region_of_the_closure() {
+    // type-alias-impl-trait/implied_bounds_closure.rs: `T`'s region comes from the closure body, so it is erased by writeback
+    // and is a universal region of the closure that the creator maps to its own variable (here `'static`, from `T: 'static`).
+    let (errors, unchecked) = borrowck_source("
+        trait StaticDefaultRef: 'static { fn default_ref() -> &'static Self; }
+        impl StaticDefaultRef for str { fn default_ref() -> &'static str { \"\" } }
+        fn into_impl(x: &str) -> &(impl ?Sized + AsRef<str> + StaticDefaultRef + '_) { x }
+        fn extend_lifetime<'a>(x: &'a str) -> &'static str { let t = into_impl(x); helper(|_| t) }
+        fn helper<T: ?Sized + AsRef<str> + StaticDefaultRef>(f: impl FnOnce(&T) -> &T) -> &'static str { f(T::default_ref()).as_ref() }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("lifetime may not live long enough"), "{errors:?}");
+}
