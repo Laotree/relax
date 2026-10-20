@@ -382,7 +382,10 @@ pub fn take() -> (Vec<String>, Vec<String>) {
     let all = std::mem::take(&mut *SINK.lock().unwrap_or_else(|e| e.into_inner()));
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
+    // (a diagnostic reported twice -- a body checked again by the second borrowck -- is one)
+    let mut seen = std::collections::HashSet::new();
     for (l, s) in all {
+        if !seen.insert(s.clone()) { continue; }
         if l >= Level::Deny { errors.push(s) } else { warnings.push(s) }
     }
     (errors, warnings)
