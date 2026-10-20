@@ -678,3 +678,16 @@ fn a_type_alias_prefix_of_a_path_instantiates_the_aliass_lifetimes() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.len() == 1 && errors[0].starts_with("E0716"), "{errors:?}");
 }
+
+#[test]
+fn owning_pointers_own_their_pointee_for_dropck() {
+    // `Box`/`Rc`/`Arc`/`Vec` drop their `T`: a `Drop` type behind them keeps what it borrows live at their drop.
+    for owner in ["Box::new(Foo(&x))", "std::rc::Rc::new(Foo(&x))", "std::sync::Arc::new(Foo(&x))", "vec![Foo(&x)]"] {
+        let (errors, unchecked) = borrowck_source_in(&format!("
+            struct Foo<'a>(&'a String);
+            impl<'a> Drop for Foo<'a> {{ fn drop(&mut self) {{}} }}
+            pub fn main() {{ let y; let x = String::new(); y = {owner}; }}"), 2018);
+        assert!(unchecked.is_empty(), "{owner}: {unchecked:?}");
+        assert!(errors.len() == 1 && errors[0].starts_with("E0597"), "{owner}: {errors:?}");
+    }
+}
