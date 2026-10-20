@@ -40,7 +40,7 @@ pub fn check_transmute(prog: &Program, tcx: &Tcx, env: TypingEnv, from: TyId, to
         if tcx.tys.has_error(t) || tcx.tys.has_infer(t) || tcx.tys.has_opaque(t) { return None; }
     }
     if from == to { return None; }
-    let cx = Cx { prog, tcx, env, lay: Layouts::new(), gave_up: Default::default() };
+    let cx = Cx { prog, tcx, env, lay: Layouts::erased_generics(), gave_up: Default::default() };
     let (a, b) = (cx.skeleton(from, 0), cx.skeleton(to, 0));
     if cx.gave_up.get() { return None; }
     if let (Some(a), Some(b)) = (a, b) {
