@@ -110,6 +110,17 @@ pub fn duplicate_exported_macros(prog: &Program, own: &[bool]) -> Vec<String> {
     errors
 }
 
+/// E0761 (rustc_expand module.rs default_submod_path): `mod name;` finds both `name.rs` and `name/mod.rs`.
+pub fn ambiguous_module_files(prog: &Program, own: &[bool]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (file, pos, krate, alt) in &prog.module_file_alternatives {
+        if !own.get(*krate as usize).copied().unwrap_or(false) { continue; }
+        if !prog.crates[*krate as usize].context.exists(alt) { continue; }
+        errors.push(prog.record_error(*file, *pos, "resolve", format!("E0761: file for module found at both `name.rs` and `{}`", alt)));
+    }
+    errors
+}
+
 /// E0446 (rustc_privacy `check_assoc_item` with `hard_error` for associated types): the type of an
 /// associated type of a trait impl is no less visible than the impl itself (the least visible of
 /// the trait and the types of its trait reference).

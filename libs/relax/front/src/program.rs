@@ -537,6 +537,9 @@ pub struct Program {
     pub demand_plan: Option<std::sync::Arc<crate::preload::DemandPlan>>,
     pub load_recipe: Vec<crate::preload::PreCrate>,
     pub module_probes: Vec<(String, bool)>,
+    /// `mod name;` without `#[path]` that found `name.rs`: (file, item position, krate, the `name/mod.rs` alternative)
+    /// -- a check reports E0761 when that exists too (rustc default_submod_path)
+    pub module_file_alternatives: Vec<(u32, u32, u32, String)>,
     /// per module being collected: the folder its `mod x;` items resolve in and whether that
     /// folder is the module file's own (rustc ModuleData::dir_path / DirOwnership); the modules
     /// of a fn body's blocks take their enclosing module's
@@ -819,6 +822,7 @@ impl Program {
             demand_plan: None,
             load_recipe: Vec::new(),
             module_probes: Vec::new(),
+            module_file_alternatives: Vec::new(),
             mod_dirs: Default::default(),
             source_versions: Default::default(),
             edit_versions: Vec::new(),
@@ -2668,6 +2672,10 @@ impl Program {
                                     self.front_probes[krate as usize].push((c.clone(), exists));
                                 }
                                 if exists {
+                                    if path_attr.is_empty() && c == &cands[0] {
+                                        let pos = self.files[file as usize].ast.item(iid).lo;
+                                        self.module_file_alternatives.push((file, pos, krate, cands[1].clone()));
+                                    }
                                     if self.demand_plan.as_ref().is_some_and(|p| p.skips(self.crates[krate as usize].root_path(), c)) {
                                         let is_mod_rs = child_mod_rs || c.ends_with("/mod.rs");
                                         let cdir = if is_mod_rs { dir_of(c).to_string() } else { format!("{}/{}", dir_of(c), stem_of(c)) };

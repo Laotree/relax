@@ -128,6 +128,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     }
     errors.extend(relax_types::item_checks::duplicate_items(&u.prog, &own));
     errors.extend(relax_types::item_checks::duplicate_exported_macros(&u.prog, &own));
+    errors.extend(relax_types::item_checks::ambiguous_module_files(&u.prog, &own));
     errors.extend(relax_types::item_checks::super_paths(&u.prog, &own));
     errors.extend(relax_types::item_checks::impl_trait_path_privacy(&u.prog, &u.tcx, &own));
     errors.extend(relax_types::item_checks::private_assoc_types(&u.prog, &u.tcx, &own));
