@@ -2467,8 +2467,11 @@ impl<'a> Fcx<'a> {
                         if let Some(&(_, l0)) = first.iter().find(|b| b.0 == s) {
                             let (t0, t1) = (self.b.locals[l0 as usize].ty, self.b.locals[li as usize].ty);
                             self.eq(t1, t0);
+                            // every binding that resolved to this alternative's local (a nested or-pattern's
+                            // other alternatives did) is the first alternative's variable
                             let pp = self.b.locals[li as usize].pat;
                             self.b.pat_local.insert(pp, l0);
+                            for v in self.b.pat_local.values_mut() { if *v == li { *v = l0; } }
                         }
                     }
                 }

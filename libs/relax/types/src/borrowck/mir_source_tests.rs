@@ -627,3 +627,11 @@ fn a_coroutine_whose_witness_needs_drop_keeps_all_its_upvars_live_at_its_drop() 
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.len() == 1 && errors[0].starts_with("E0505"), "{errors:?}");
 }
+
+#[test]
+fn nested_or_patterns_bind_one_variable_across_all_alternatives() {
+    let (errors, unchecked) = borrowck_source_in("
+        pub fn f() { let (Ok((Ok(a) | Err(a), b)) | Err(Ok((a, b)) | Err((a, b)))): Result<(Result<i32, i32>, i32), Result<(i32, i32), (i32, i32)>> = Ok((Ok(1), 1)); let _ = (a, b); }", 2018);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
