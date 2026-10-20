@@ -600,3 +600,30 @@ fn an_opaque_types_implied_bounds_follow_its_lifetime_parameters_by_index() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn a_coroutine_whose_witness_needs_no_drop_needs_only_its_upvars_drop_live() {
+    // rust-lang/rust#116242: the locals saved across the await (`&String`, `Ready<()>`) have no drop glue,
+    // so the future's drop needs the captured borrow of `s` only if the borrowed type itself has drop glue.
+    let (errors, unchecked) = borrowck_source_in("
+        pub fn f() {
+            let s = String::new();
+            let fut = async { let r = &s; core::future::ready(()).await; let _x = r.len(); };
+            drop(s);
+        }", 2018);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_coroutine_whose_witness_needs_drop_keeps_all_its_upvars_live_at_its_drop() {
+    // The `String` is saved across the await and has drop glue: the captured borrow of `s` is live at the drop.
+    let (errors, unchecked) = borrowck_source_in("
+        pub fn f() {
+            let s = String::new();
+            let fut = async { let r = &s; let t = String::new(); core::future::ready(()).await; let _x = (r.len(), t.len()); };
+            drop(s);
+        }", 2018);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0505"), "{errors:?}");
+}

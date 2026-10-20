@@ -169,6 +169,16 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
         }
     }
 
+    // `mir_coroutine_witnesses` of the coroutines of this root, for the dropck of their creators.
+    for (owner, mir) in &built {
+        let (OwnerKind::Closure(e), true) = (owner.kind, mir.coroutine.is_some()) else { continue };
+        let needs_drop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::mir::transform::coroutine::coroutine_witness_needs_drop(tcx, prog, env, mir)));
+        match needs_drop {
+            Ok(needs_drop) => tcx.coroutine_witness_needs_drop.insert((typeck.file, e.0), needs_drop),
+            Err(p) => { if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); } }
+        }
+    }
+
     // MoveData, signature regions, inference contexts, MIR type check.
     let mut prepared: Vec<Prepared<'_>> = Vec::new();
     let item_sig = if anon_const { Some(SignatureRegions::anon_const(tcx, prog, typeck.def)) } else { SignatureRegions::function(tcx, prog, typeck.def) };
