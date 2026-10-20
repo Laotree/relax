@@ -59,6 +59,9 @@ impl<'a> MirBorrowckCtxt<'a> {
             (Some(a), Some(b)) => a.base == b.base && (a.off - b.off).unsigned_abs() < 1 << 31,
             _ => false,
         };
+        // a run-time check is lowered into the body's code; coroutine bodies keep their slots in the
+        // coroutine's state, so they get no checks (only proven pairs are accepted there)
+        if !proven && self.body.coroutine.is_some() { return None; }
         let index1 = self.index_expr(first.2)?;
         let index2 = self.index_expr(second.2)?;
         Some(DisjointOutcome { record: DisjointRecord { owner: self.body.source.owner, first: index1, second: index2, proven, both_mut,
