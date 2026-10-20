@@ -818,7 +818,7 @@ mod tests {
     use crate::types::RegionArgsId;
 
     fn program(source: &[u8]) -> (Program, Tcx) {
-        let dir = std::env::temp_dir().join(format!("relax-type-queries-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = std::env::temp_dir().join(format!("relax-type-queries-{}-{}", std::process::id(), crate::unique_test_suffix()));
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("lib.rs");
         std::fs::write(&path, source).unwrap();
@@ -1169,7 +1169,8 @@ impl Tcx {
     }
     /// The dyn_compatibility_violations query (provider: dyn_compatibility_violations_uncached).
     pub fn dyn_compatibility_violations(&self, prog: &Program, def: DefId) -> Vec<DefId> {
-        Providers { tcx: self, prog }.dyn_compatibility_violations(def).expect("dyn_compatibility_violations query")
+        // a cycle (the trait's own bounds name `dyn` of itself) leaves the trait compatible here; rustc reports E0391
+        Providers { tcx: self, prog }.dyn_compatibility_violations(def).unwrap_or_default()
     }
     /// The own_existential_vtable_entries query (provider: own_existential_vtable_entries_uncached).
     pub fn own_existential_vtable_entries(&self, prog: &Program, def: DefId) -> Vec<DefId> {

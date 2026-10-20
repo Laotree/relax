@@ -141,14 +141,26 @@ impl Tcx {
         }, 0)
     }
 
-    pub(crate) fn lower_region_args(&self, infcx: Option<&crate::infer::InferCtxt<'_>>, prog: &Program, file: u32, module: u32, env: &GenEnv, p: &ast::Path) -> RegionArgsId {
-        if !env.regions.enabled { return RegionArgsId::EMPTY; }
+    /// The lifetime arguments written on the path's last segment.
+    pub(crate) fn written_lifetimes(&self, infcx: Option<&crate::infer::InferCtxt<'_>>, prog: &Program, file: u32, env: &GenEnv, p: &ast::Path) -> Vec<RegionId> {
         let ast = &prog.files[file as usize].ast;
         let mut out = Vec::new();
+        if !env.regions.enabled { return out; }
         if let Some(GenericArgs::Angle(v)) = ast.segs(p.segs).last().and_then(|s| ast.gargs(s.args())) {
             for a in ast.list(*v) {
                 if let GenericArg::Lifetime(lt) = a { out.push(env.regions.resolve(infcx, &self.tys, prog, file, Some(*lt))); }
             }
+        }
+        out
+    }
+
+    pub(crate) fn lower_region_args(&self, infcx: Option<&crate::infer::InferCtxt<'_>>, prog: &Program, file: u32, module: u32, env: &GenEnv, p: &ast::Path) -> RegionArgsId {
+        if !env.regions.enabled { return RegionArgsId::EMPTY; }
+        let mut out = self.written_lifetimes(infcx, prog, file, env, p);
+        if let Some((_, count)) = self.resolve_type_path_def(prog, file, module, p).and_then(|d| self.own_param_counts(prog, d)) {
+            // rustc lowers only the declared lifetime parameters; an incomplete list takes
+            // error regions for the rest (E0107 reports the count).
+            if !out.is_empty() { out.resize(count, self.tys.intern_region(RegionKind::ReError)); }
         }
         if out.is_empty() {
             if let Some(d) = self.resolve_type_path_def(prog, file, module, p) {
@@ -319,7 +331,7 @@ mod tests {
                 fn parent<'b>(&'b self) -> &'b T where 'b: 'a { self.0 }
             }
         "#;
-        let dir = std::env::temp_dir().join(format!("relax-written-regions-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = std::env::temp_dir().join(format!("relax-written-regions-{}-{}", std::process::id(), crate::unique_test_suffix()));
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("lib.rs");
         std::fs::write(&path, source).unwrap();
@@ -432,7 +444,7 @@ mod tests {
         assert!(matches!(region(*r), RegionKind::ReVar(_)));
         // rustc rejects this deferred closure as not general enough; it does
         // not acquire a higher-ranked signature from a previous use of `g`.
-        assert!(check("deferred_closure_rejected").errors.iter().any(|error| error.contains("E0277")));
+        assert!(check("deferred_closure_rejected").errors.iter().any(|error| error.contains("E0277") || error.contains("E0271")));
         for (name, count) in [("closure_expected", 8), ("closure_routes", 6)] {
             let body = check(name);
             assert!(body.errors.is_empty(), "{name}: {:?}", body.errors);

@@ -197,6 +197,18 @@ fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body
     }
     let query_store = qualifs::Store::default();
     let queries = qualifs::Provider::new(tx, body, &query_store);
+    // rustc_const_eval check_consts: const contexts among the body and its const children, on the MIR
+    // before promotion (mir_const_qualif runs on mir_const: a promoted `&mut []` is still E0764)
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check_consts::check(tx, &queries, &all))) {
+        Ok(Ok(diags)) => {
+            for d in diags { v.errors.push(diag::to_error(prog, all[0].file, body.def, &d)); }
+        }
+        Ok(Err(why)) => v.unchecked.push(format!("{}: const check blocked: {}", prog.def_path(body.def), why.0)),
+        Err(p) => {
+            if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); }
+            v.unchecked.push(format!("{}: internal error in the const checker", prog.def_path(body.def)));
+        }
+    }
     let mut promoteds = Vec::with_capacity(all.len());
     for bir in &mut all {
         crate::preempt::point();
@@ -210,17 +222,6 @@ fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body
             }
         }
     }
-    // rustc_const_eval check_consts: const contexts among the body and its const children
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check_consts::check(tx, &queries, &all))) {
-        Ok(Ok(diags)) => {
-            for d in diags { v.errors.push(diag::to_error(prog, all[0].file, body.def, &d)); }
-        }
-        Ok(Err(why)) => v.unchecked.push(format!("{}: const check blocked: {}", prog.def_path(body.def), why.0)),
-        Err(p) => {
-            if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); }
-            v.unchecked.push(format!("{}: internal error in the const checker", prog.def_path(body.def)));
-        }
-    }
     let regions = regions_enabled(options);
     let relaxed = fv::relaxed(prog, body.def);
     // field views of closure captures (what each closure does through a captured reference)
@@ -231,6 +232,8 @@ fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body
         }
     }
     let mut reqs: crate::fxhash::HashMap<u32, Vec<nll::ClosureOutlivesRequirement>> = Default::default();
+    // the by-value captures each checked closure body mutates (rustc used_mut_upvars)
+    let mut upvars: crate::fxhash::HashMap<u32, Vec<u32>> = Default::default();
     // nested closures first (they follow their parent in the list), the fn body last
     let mut order: Vec<usize> = (1..all.len()).rev().collect();
     order.push(0);
@@ -252,8 +255,10 @@ fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body
             let order = moves::rpo(bir);
             let flow = moves::init_flow(&md, bir, &order);
             let mut mc = moves::MoveCheck::new(tx, bir, &md);
+            mc.closure_upvars = Some(&upvars);
             mc.run(&flow, &order);
-            if crate::lint::enabled() && mc.diags.is_empty() && bir.closure_kind.is_none() && i == 0 {
+            let own_upvars = mc.used_mut_upvars.clone();
+            if crate::lint::enabled() && mc.diags.is_empty() {
                 // rustc gather_used_muts: a `mut` local no reachable code assigns (declared in
                 // dead code, or never initialized) counts as used
                 let mut used = mc.used_mut.clone();
@@ -283,10 +288,11 @@ fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body
                 fvo = o.fv_only;
                 fvr = o.fv_records;
             }
-            (diags, req, fvo, fvr)
+            (diags, req, fvo, fvr, own_upvars)
         }));
         match r {
-            Ok((diags, req, fvo, fvr)) => {
+            Ok((diags, req, fvo, fvr, own_upvars)) => {
+                if let Some(ce) = closure_expr_of(&all, bir) { if bir.closure_kind.is_some() { upvars.insert(ce, own_upvars); } }
                 for (sp, t, dflt, access, hoist) in fvr {
                     v.fv_records.push(export::FvRecord { file: bir.file, span: sp, place: t, default: dflt, access, hoist });
                 }
@@ -579,7 +585,8 @@ fn lint_unused_mut(prog: &Program, owner: crate::program::DefId, bir: &bir::Bir,
             && (j + name.len() >= src.len() || !(src[j + name.len()] == b'_' || src[j + name.len()].is_ascii_alphanumeric()));
         let Some(pos) = (lo..hi).find(|&j| word(j)) else { continue };
         if pos < 4 || &src[pos - 4..pos] != b"mut " { continue; }
-        crate::lint::emit(prog, owner, &crate::lint::UNUSED_MUT, bir.file, (pos - 4) as u32,
+        let inner = crate::lint::attrs_at_binding(prog, owner, pos as u32);
+        crate::lint::emit_in(prog, owner, &inner, &crate::lint::UNUSED_MUT, bir.file, (pos - 4) as u32,
             &format!("variable does not need to be mutable -- help: remove this `mut` (`{}`)", name));
     }
 }

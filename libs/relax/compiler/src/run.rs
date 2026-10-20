@@ -500,6 +500,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // the boot progress line (tui.rs): a terminal run of a program, with nothing asking for plain output
     unsafe { std::env::remove_var("MAKEPAD_RUN_PROGRESS") };
     let hosted = !entries.is_empty() || !export_names.is_empty();
+    // the `unused_macros` lints need the macro uses of the whole load
+    if check { relax_types::macros::uses::record(true); relax_front::program::set_record_import_uses(true); }
     if !check && !watch && session.is_none() && !hosted {
         crate::tui::start(!driver_options.verbose && !QUIET.load(Ordering::Relaxed) && !crate::diag::enabled());
     }
@@ -792,6 +794,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             match prog.load_crate_deferred(&c.name, &c.src_path, c.edition, cfgs[ci].clone(), deps) {
                 Ok(kk) => {
                     prog.crates[kk as usize].proc_macro = c.proc_macro;
+                    prog.crates[kk as usize].is_bin = c.bin;
                     crate_of[ci] = kk;
                     cold_front.loaded(&mut prog, kk);
 
@@ -963,6 +966,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mem_g = crate::memstat::tag(crate::memstat::Tag::Sigs);
     // ---- signatures, layouts, impl tables
     let t = Instant::now();
+    // A check reports validation errors of its crates' impl headers and field types, which
+    // declaration collection lowers: the crates are marked before it runs (a run marks none).
+    if check {
+        let checked = if watch || root_only || session.is_some() { vec![root] } else if selftest || workspace_check { crate::check::workspace_crates(&prog, root) } else { crate::check::app_crates(&prog, root) };
+        for k in checked { prog.crates[k as usize].validate = true; }
+    }
     let mut tcx = collected_tcx.take().unwrap_or_else(crate::tcx::Tcx::new);
     // MAKEPAD_RUN_PERTURB: type ids shift (code must not depend on them; syms.rs reloc_sig)
     for i in 0..crate::syms::perturb(options) {
@@ -1014,16 +1023,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         pre.extend(watch_load_errors);
         // the watch session reports its root crate's; a one-shot check every workspace crate's
         let checked = if watch || root_only || session.is_some() { vec![root] } else if selftest || workspace_check { crate::check::workspace_crates(&prog, root) } else { crate::check::app_crates(&prog, root) };
-        // A run checks coherence in the background; a check needs its errors now: the app
-        // check its own crates' impls (cargo check), every other check all of them.
-        let t = Instant::now();
-        if selftest || watch || root_only || session.is_some() { tcx.check_coherence(&prog); }
-        else { tcx.check_coherence_of(&prog, Some(&checked)); }
-        phase("coherence", t);
-        for k in checked {
-            pre.extend(crate::check::own_errors(&prog, k, &prog.errors, "resolve"));
-            pre.extend(crate::check::own_errors(&prog, k, &tcx.errors, "typeck"));
-        }
         crate::jit::compile_watch(Some(("check: unit", 0)));
         let t = Instant::now();
         let mut u = Unit::new(prog, tcx, core);
@@ -1031,6 +1030,17 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // auxiliary unit -- the proc-macro world -- never takes it over)
         crate::syms::set_unit(&mut *u as *mut Unit);
         phase("unit", t);
+        // Coherence evaluates the constants of impl headers, which needs the unit's evaluator (the
+        // provider Unit::new registers). A run checks coherence in the background; a check needs its errors now: the app
+        // check its own crates' impls (cargo check), every other check all of them.
+        let t = Instant::now();
+        if selftest || watch || root_only || session.is_some() { u.tcx.check_coherence(&u.prog); }
+        else { u.tcx.check_coherence_of(&u.prog, Some(&checked)); }
+        phase("coherence", t);
+        for k in checked {
+            pre.extend(crate::check::own_errors(&u.prog, k, &u.prog.errors, "resolve"));
+            pre.extend(crate::check::own_errors(&u.prog, k, &u.tcx.errors, "typeck"));
+        }
         // every body is checked, so the files the selection skipped load first: all of them for
         // selftest, a watch session or --root-only; the checked (app) crates' for the app check
         let t = Instant::now();
@@ -2935,6 +2945,10 @@ fn summary_inner(why: &str) {
         let ah = |i: usize| jit::AHEAD_STATS[i].load(Ordering::Relaxed);
         if ah(0) + ah(2) > 0 && !SILENT.load(Ordering::Relaxed) {
             verbose!("makepad-run: type checks ahead (off the lock): {} bodies ({} taken by builds, {} with errors), cpu callers {:.0} ms, workers {:.0} ms", ah(0), ah(1), ah(2), ah(3) as f64 / 1e6, ah(4) as f64 / 1e6);
+        }
+        if ah(0) > 0 && !SILENT.load(Ordering::Relaxed) {
+            let p = |i: usize| jit::AHEAD_AT_PRESENT[i].load(Ordering::Relaxed);
+            verbose!("makepad-run: ahead until the first present: {} bodies checked, workers cpu {:.0} ms; {} lowered ({} taken by builds), cpu {:.0} ms", p(0), p(4) as f64 / 1e6, p(5), p(6), p(7) as f64 / 1e6);
         }
         if s.ctfe_data + s.ctfe_code > 0 && !SILENT.load(Ordering::Relaxed) {
             verbose!("makepad-run: constant initializers: {} evaluated to data, {} compiled and run; evaluation cpu {:.1} ms", s.ctfe_data, s.ctfe_code, s.ctfe_ns as f64 / 1e6);

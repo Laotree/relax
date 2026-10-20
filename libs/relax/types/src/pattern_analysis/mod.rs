@@ -325,6 +325,69 @@ impl<'a> Cx<'a> {
         Some(cur)
     }
 
+    /// The pattern a destructuring assignment's assignee stands for (rustc lowers `(a, Some(b)) = v`
+    /// to `let (lhs0, Some(lhs1)) = v; a = lhs0; ..`): constructors where the assignee names
+    /// them, a wildcard for every place.
+    fn lower_assignee(&mut self, e: ExprId, t: TyId, depth: u32) -> Option<PIx> {
+        let ast = self.ast();
+        let pos = Some(ast.expr(e).lo);
+        let wild = |cx: &mut Self| Some(cx.push(Ctor::Wildcard, Vec::new(), 0, t, pos));
+        if depth > 32 { return wild(self); }
+        let is_rest = |x: ExprId| matches!(ast.expr(x).kind, ExprKind::Range(crate::ast::OptExprId::NONE, crate::ast::OptExprId::NONE, false));
+        // the fields of a positional list with an optional `..`
+        let positional = |cx: &mut Self, elems: &[ExprId], ctor: &Ctor, arity: usize| -> Option<Vec<(usize, PIx)>> {
+            let tys = cx.ctor_sub_tys(ctor, t);
+            let rest = elems.iter().position(|x| is_rest(*x) || matches!(ast.expr(*x).kind, ExprKind::Paren(i) if is_rest(i)));
+            let n = elems.len();
+            let mut out = Vec::new();
+            for (i, x) in elems.iter().enumerate() {
+                if Some(i) == rest { continue; }
+                let idx = match rest { Some(r) if i > r => (arity + i).checked_sub(n)?, _ => i };
+                if idx >= arity { return None; }
+                let (ft, _) = *tys.get(idx)?;
+                out.push((idx, cx.lower_assignee(*x, ft, depth + 1)?));
+            }
+            Some(out)
+        };
+        match ast.expr(e).kind {
+            ExprKind::Paren(x) => self.lower_assignee(x, t, depth + 1),
+            ExprKind::Tuple(elems) => {
+                let TyKind::Tuple(l) = self.kind(t) else { return wild(self) };
+                let arity = self.tcx.tys.list(l).len();
+                let fields = positional(self, ast.list(elems), &Ctor::Struct, arity)?;
+                Some(self.push(Ctor::Struct, fields, arity, t, pos))
+            }
+            ExprKind::Call(f, args) if matches!(ast.expr(f).kind, ExprKind::Path(_)) => {
+                let Some(Res::Def(d)) = self.body.res.get(&e.0).copied() else { return wild(self) };
+                let Some((ctor, arity)) = self.adt_ctor(t, d) else { return wild(self) };
+                let fields = positional(self, ast.list(args), &ctor, arity)?;
+                Some(self.push(ctor, fields, arity, t, pos))
+            }
+            ExprKind::Struct(row) => {
+                let Some(Res::Def(d)) = self.body.res.get(&e.0).copied() else { return wild(self) };
+                let Some((ctor, arity)) = self.adt_ctor(t, d) else { return wild(self) };
+                let TyKind::Adt(ad, _, _) = self.kind(t) else { return wild(self) };
+                let vi = if let Ctor::Variant(i) = ctor { i } else { 0 };
+                let tys = self.ctor_sub_tys(&ctor, t);
+                let mut fields = Vec::new();
+                for fe in ast.list(ast.row(row).fields) {
+                    let idx = self.field_index(ad, vi, fe.name)?;
+                    let (ft, _) = *tys.get(idx)?;
+                    fields.push((idx, self.lower_assignee(fe.expr, ft, depth + 1)?));
+                }
+                Some(self.push(ctor, fields, arity, t, pos))
+            }
+            ExprKind::Path(_) => match self.body.res.get(&e.0).copied() {
+                Some(Res::Def(d)) if matches!(self.prog.def(d).kind, DefKind::Variant | DefKind::Struct) => {
+                    let (ctor, arity) = self.adt_ctor(t, d)?;
+                    Some(self.push(ctor, Vec::new(), arity, t, pos))
+                }
+                _ => wild(self),
+            },
+            _ => wild(self),
+        }
+    }
+
     fn lower_inner(&mut self, p: PatId, t: TyId, pos: Option<u32>) -> Option<PIx> {
         let ast = self.ast();
         match *ast.pat(p) {
@@ -490,8 +553,13 @@ impl<'a> Cx<'a> {
                         None => Some(self.opaque(t, pos)),
                     }
                 }
-                // (no value tree to walk: nothing is judged)
-                None => Some(self.opaque(t, pos)),
+                // (no value tree to walk: the type is judged -- structural ADTs, no function pointers)
+                None => {
+                    let mut seen = Vec::new();
+                    self.const_pattern_type_walk(t, pos, 0, &mut seen);
+                    self.const_pattern_partial_eq(t, pos);
+                    Some(self.opaque(t, pos))
+                }
             },
             _ => None,
         }
@@ -513,13 +581,41 @@ impl<'a> Cx<'a> {
         let before = self.const_errors.len();
         self.structural_walk(v, t, pos, 0);
         // the whole constant needs a `PartialEq` impl (type_has_partial_eq_impl)
-        if self.const_errors.len() == before && matches!(self.kind(t), TyKind::Adt(..)) {
-            let t = self.tcx.tys.erase_all_regions(t);
-            if let Some(pe) = self.tcx.lang_items.get(crate::lang_items::LangItem::PartialEq) {
-                let infcx = crate::infer::InferCtxt::new(self.tcx, crate::tcx::TypingMode::non_body_analysis(), self.env.limit);
-                let goal = crate::next_solver::Goal { param_env: self.env.param_env, predicate: crate::next_solver::collect::trait_predicate(pe, vec![crate::consts::GenericArg::Type(t), crate::consts::GenericArg::Type(t)]) };
-                if !infcx.evaluate_obligation(self.prog, goal).may_apply() { self.not_structural(t, pos); }
+        if self.const_errors.len() == before { self.const_pattern_partial_eq(t, pos); }
+    }
+
+    fn const_pattern_partial_eq(&mut self, t: TyId, pos: Option<u32>) {
+        if !matches!(self.kind(t), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Slice(_) | TyKind::Array(..) | TyKind::Tuple(_)) { return; }
+        let t = self.tcx.tys.erase_all_regions(t);
+        if let Some(pe) = self.tcx.lang_items.get(crate::lang_items::LangItem::PartialEq) {
+            let infcx = crate::infer::InferCtxt::new(self.tcx, crate::tcx::TypingMode::non_body_analysis(), self.env.limit);
+            let goal = crate::next_solver::Goal { param_env: self.env.param_env, predicate: crate::next_solver::collect::trait_predicate(pe, vec![crate::consts::GenericArg::Type(t), crate::consts::GenericArg::Type(t)]) };
+            if !infcx.evaluate_obligation(self.prog, goal).may_apply() { self.not_structural(t, pos); }
+        }
+    }
+
+    /// const_to_pat for a constant whose value is not known here: the type alone is judged -- an ADT
+    /// without the derived `StructuralPartialEq`, or a function pointer, cannot be matched on.
+    fn const_pattern_type_walk(&mut self, t: TyId, pos: Option<u32>, depth: u32, seen: &mut Vec<TyId>) {
+        if depth > 8 || seen.contains(&t) { return; }
+        seen.push(t);
+        match self.kind(t) {
+            TyKind::FnPtr(..) => {
+                if let Some(lo) = pos {
+                    let e = self.prog.record_uncoded_error(self.body.file, lo, "typeck", "function pointers and raw pointers not derived from integers in patterns behave unpredictably and should not be relied upon. See https://github.com/rust-lang/rust/issues/70861 for details.".to_string());
+                    self.const_errors.push(e);
+                }
             }
+            TyKind::Adt(d, args, _) => {
+                if !self.type_marked_structural(t) { self.not_structural(t, pos); return; }
+                // (an ADT's fields are not walked: only the value's own variant would matter, and with
+                // no value tree the marker and the PartialEq check are all that can be judged)
+                let _ = (d, args);
+            }
+            TyKind::Ref(_, inner, _) => { let inner = self.reveal(inner); self.const_pattern_type_walk(inner, pos, depth + 1, seen) }
+            TyKind::Tuple(l) => for ft in self.tcx.tys.list(l).to_vec() { self.const_pattern_type_walk(ft, pos, depth + 1, seen); },
+            TyKind::Array(e, _) | TyKind::Slice(e) => self.const_pattern_type_walk(e, pos, depth + 1, seen),
+            _ => {}
         }
     }
 
@@ -547,6 +643,18 @@ impl<'a> Cx<'a> {
                 } else { (0, &branches[..]) };
                 let tys = self.variant_field_tys(d, vi as u32, args);
                 for (f, ft) in fields.iter().zip(tys) { self.structural_walk(&f.valtree, ft, pos, depth + 1); }
+            }
+            // NaN equals nothing: no pattern (const_to_pat NaNPattern)
+            TyKind::Float(p) => {
+                if let Some(l) = v.try_to_leaf() {
+                    let bits = l.to_bits(l.size());
+                    let nan = if p == Prim::F32 { f32::from_bits(bits as u32).is_nan() } else if p == Prim::F64 { f64::from_bits(bits as u64).is_nan() } else { false };
+                    if nan {
+                        let Some(lo) = pos else { return };
+                        let e = self.prog.record_uncoded_error(self.body.file, lo, "typeck", "cannot use NaN in patterns".to_string());
+                        self.const_errors.push(e);
+                    }
+                }
             }
             TyKind::Ref(_, inner, _) => { let inner = self.reveal(inner); self.structural_walk(v, inner, pos, depth + 1) }
             TyKind::Tuple(l) => {
@@ -607,7 +715,7 @@ impl<'a> Cx<'a> {
             return false;
         }
         match self.kind(t) {
-            TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Str => true,
+            TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Float(_) | TyKind::Str => true,
             TyKind::Ref(_, i, _) => self.valtree_type(i, depth + 1),
             TyKind::Array(e, _) | TyKind::Slice(e) => self.valtree_type(e, depth + 1),
             TyKind::Tuple(l) => self.tcx.tys.list(l).iter().all(|x| self.valtree_type(*x, depth + 1)),
@@ -747,6 +855,16 @@ impl<'a> Cx<'a> {
                 text.parse::<f64>().ok()
             }
             ExprKind::Unary(UnOp::Neg, x) => Some(-self.float_expr(x)?),
+            // a named float constant
+            ExprKind::Path(_) => {
+                let Some(Res::Def(d)) = self.body.res.get(&e.0).copied() else { return None };
+                if !matches!(self.prog.def(d).kind, DefKind::Const | DefKind::AssocConst) { return None; }
+                let t = self.tcx.type_of(self.prog, d).ok()?;
+                let TyKind::Float(p) = self.kind(t) else { return None };
+                let leaf = self.const_value(d, e.0, t)?.try_to_leaf()?;
+                let bits = leaf.to_bits(leaf.size());
+                match p { Prim::F32 => Some(f32::from_bits(bits as u32) as f64), Prim::F64 => Some(f64::from_bits(bits as u64)), _ => None }
+            }
             _ => None,
         }
     }
@@ -801,6 +919,14 @@ impl<'a> Cx<'a> {
             TyKind::Float(_) => {
                 let lo = match a { Some(e) => self.float_expr(e), None => Some(f64::NEG_INFINITY) };
                 let hi = match b { Some(e) => self.float_expr(e), None => Some(f64::INFINITY) };
+                if lo.is_some_and(f64::is_nan) || hi.is_some_and(f64::is_nan) {
+                    // (a NaN endpoint: const_to_pat NaNPattern)
+                    if let Some(p) = pos {
+                        let e = self.prog.record_uncoded_error(self.body.file, p, "typeck", "cannot use NaN in patterns".to_string());
+                        self.const_errors.push(e);
+                    }
+                    return Some(self.opaque(t, pos));
+                }
                 match (lo, hi) {
                     (Some(lo), Some(hi)) => Some(Ctor::FloatRange(lo, hi, end)),
                     _ => None,
@@ -1064,6 +1190,17 @@ enum LetSource {
     Chain,
 }
 
+/// The analysis context of a body (also the lint passes' inhabitedness queries).
+pub fn body_cx<'a>(prog: &'a Program, tcx: &'a Tcx, body: &'a Body) -> Cx<'a> {
+    let d = prog.def(body.def);
+    let env = TypingEnv { limit: crate::tcx::RecursionLimit::for_item(prog, body.def), param_env: body.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::non_body_analysis() };
+    Cx { prog, tcx, body, env, module: d.scope, krate: d.krate, pats: Vec::new(), next_opaque: 0, inhabited: RefCell::new(HashMap::new()), const_errors: Vec::new() }
+}
+
+impl Cx<'_> {
+    pub fn typing_env(&self) -> TypingEnv { self.env }
+}
+
 struct Checker<'a> {
     cx: Cx<'a>,
     errors: Vec<String>,
@@ -1072,9 +1209,7 @@ struct Checker<'a> {
 /// Checks the matches, lets and parameters of a type-checked body: the errors (E0004 /
 /// E0005, located); lints go to the lint sink.
 pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) -> Vec<String> {
-    let d = prog.def(body.def);
-    let env = TypingEnv { limit: crate::tcx::RecursionLimit::for_item(prog, body.def), param_env: body.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::non_body_analysis() };
-    let cx = Cx { prog, tcx, body, env, module: d.scope, krate: d.krate, pats: Vec::new(), next_opaque: 0, inhabited: RefCell::new(HashMap::new()), const_errors: Vec::new() };
+    let cx = body_cx(prog, tcx, body);
     let mut ck = Checker { cx, errors: Vec::new() };
     ck.run();
     let mut const_errors = std::mem::take(&mut ck.cx.const_errors);
@@ -1115,6 +1250,11 @@ impl<'a> Checker<'a> {
                 ExprKind::For(row) => blocks.push(ast.row(row).body),
                 _ => {}
             }
+        }
+        for i in 0..n {
+            if !typed(i) { continue; }
+            let e = body.expr_at(i);
+            if let ExprKind::Assign(l, r) = ast.expr(e).kind { self.check_assignment_is_irrefutable(l, r); }
         }
         let fn_arg = if self.cx.prog.def(body.def).kind == DefKind::Closure { "closure argument" } else { "function argument" };
         let item_lo = ast.item(self.cx.prog.def(body.def).item).lo;
@@ -1316,6 +1456,25 @@ impl<'a> Checker<'a> {
     }
 
     /// A refutable binding's analysis: (witnesses), None when it is not analysed.
+    /// E0005 for a destructuring assignment `lhs = rhs` whose assignee is refutable.
+    fn check_assignment_is_irrefutable(&mut self, lhs: ExprId, rhs: ExprId) {
+        let ast = self.ast();
+        let destructuring = |e: ExprId| matches!(ast.expr(e).kind, ExprKind::Tuple(_) | ExprKind::Call(..) | ExprKind::Struct(_) | ExprKind::Path(_) | ExprKind::Paren(_));
+        if !destructuring(lhs) { return; }
+        let t = self.cx.body.ty(rhs);
+        if self.cx.tcx.tys.flags(t).intersects(TypeFlags::HAS_ERROR | TypeFlags::HAS_NON_REGION_INFER) { return; }
+        let t = self.cx.reveal(t);
+        let Some(pat) = self.cx.lower_assignee(lhs, t, 0) else { return };
+        let validity = if self.is_known_valid_scrutinee(rhs) { PlaceValidity::ValidOnly } else { PlaceValidity::MaybeInvalid };
+        let Some(report) = usefulness::compute_match_usefulness(&self.cx, &[MatchArm { pat, has_guard: false }], t, validity) else { return };
+        let witnesses = &report.non_exhaustiveness_witnesses;
+        if witnesses.is_empty() { return; }
+        let ty = self.cx.ty_str(t);
+        let joined = self.cx.joined_uncovered_patterns(witnesses);
+        let msg = format!("E0005: refutable pattern in local binding -- pattern{} {} not covered; the matched value is of type `{}`", if witnesses.len() == 1 { "" } else { "s" }, joined, ty);
+        self.errors.push(self.cx.prog.record_error(self.cx.body.file, ast.expr(lhs).lo, "typeck", msg));
+    }
+
     fn analyze_binding(&mut self, p: PatId, scrut: Option<ExprId>, fallback: u32) -> Option<(PIx, usefulness::UsefulnessReport)> {
         let pat = self.cx.lower(p)?;
         let ty = self.cx.pat(pat).ty;

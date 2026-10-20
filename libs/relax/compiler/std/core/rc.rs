@@ -113,6 +113,7 @@ pub(crate) unsafe fn free_block(h: *mut Header) {
 
 // ---------------------------------------------------------------- Rc
 
+#[rustc_insignificant_dtor]
 pub struct Rc<T: ?Sized> {
     ptr: crate::ptr::NonNull<T>,
 }
@@ -239,6 +240,7 @@ impl<T: Clone> Rc<T> {
 }
 
 impl<T: ?Sized> Rc<T> {
+    #[rustc_never_returns_null_ptr]
     pub fn as_ptr(this: &Rc<T>) -> *const T {
         this.ptr.as_ptr() as *const T
     }
@@ -312,6 +314,7 @@ impl<T: ?Sized> Drop for Rc<T> {
     }
 }
 
+impl<T: ?Sized> crate::ops::LegacyReceiver for Rc<T> {}
 impl<T: ?Sized> Deref for Rc<T> {
     type Target = T;
     fn deref(&self) -> &T {
@@ -420,6 +423,19 @@ impl<T, const N: usize> From<[T; N]> for Rc<[T]> {
             ptr::copy_nonoverlapping(&v as *const [T; N] as *const T, p, N);
             crate::mem::forget(v);
             Rc::from_parts(ptr::slice_from_raw_parts_mut(p, N))
+        }
+    }
+}
+
+/// `Rc<[T]>` of exactly N elements as `Rc<[T; N]>`, else the pointer back (alloc/src/rc.rs).
+impl<T, const N: usize> crate::convert::TryFrom<Rc<[T]>> for Rc<[T; N]> {
+    type Error = Rc<[T]>;
+    fn try_from(boxed_slice: Rc<[T]>) -> Result<Rc<[T; N]>, Rc<[T]>> {
+        if boxed_slice.len() == N {
+            let ptr = Rc::into_raw(boxed_slice) as *mut [T; N];
+            Ok(unsafe { Rc::from_raw(ptr) })
+        } else {
+            Err(boxed_slice)
         }
     }
 }
@@ -546,6 +562,7 @@ impl<T: ?Sized> Weak<T> {
         self.ptr.as_ptr() as *const u8 == other.ptr.as_ptr() as *const u8
     }
 
+    #[rustc_never_returns_null_ptr]
     pub fn as_ptr(&self) -> *const T {
         self.ptr.as_ptr() as *const T
     }

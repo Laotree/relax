@@ -621,6 +621,8 @@ struct Gen<'a> {
     sym_class: u64,
     /// sp offset of the frame word holding the domain base (-1: the function names no domain symbol)
     dom_slot: i64,
+    /// the block whose start reads the domain base into that slot (usize::MAX: none; 0: the prologue)
+    dom_block: usize,
     relocs: Vec<RelocAt>,
     text_words: usize,
     pc_map: Vec<(u32, u64)>,
@@ -886,8 +888,11 @@ impl<'a> Gen<'a> {
         }
         off += 8 * cells;
         let stage_fp = off;
-        // the domain base, read once in the prologue when the function names a domain static
-        let dom_fp = if uses_domain(self.f, self.sym_class) {
+        // the domain base, read once (where regalloc::domain_base_block puts it) when the function
+        // names a domain static
+        let reach = regalloc::reachable(self.f);
+        let dom_fp = if let Some(b) = regalloc::domain_base_block(self.f, self.sym_class, &reach) {
+            self.dom_block = b;
             off += 8;
             off
         } else {
@@ -913,8 +918,8 @@ impl<'a> Gen<'a> {
         self.stack_probe(frame);
         self.a.add_any(SP, SP, -frame);
         self.callee_saves(true);
-        if self.dom_slot >= 0 {
-            self.dom_base_prologue();
+        if self.dom_block == 0 {
+            self.dom_base();
         }
         if self.cplan.is_some() {
             self.c_prologue();
@@ -924,7 +929,6 @@ impl<'a> Gen<'a> {
 
         let nb = self.f.blocks.len();
         self.block_pos = vec![0; nb];
-        let reach = regalloc::reachable(self.f);
         self.next_block = vec![u32::MAX; nb];
         let mut prev: Option<usize> = None;
         for bi in 0..nb {
@@ -939,6 +943,9 @@ impl<'a> Gen<'a> {
             self.block_pos[bi] = self.a.pos();
             if !reach[bi] {
                 continue;
+            }
+            if bi == self.dom_block && bi != 0 {
+                self.dom_base();
             }
             let b = &self.f.blocks[bi];
             let n = b.insts.len();
@@ -1656,12 +1663,10 @@ impl<'a> Gen<'a> {
         self.fin_i(d, rd);
     }
 
-    /// Prologue of a function that names domain statics: the running thread's domain base
-    /// (slot 0 of its thread-local block) into the frame's domain slot, read once per call.
-    fn dom_base_prologue(&mut self) {
-        // the shared TLS routine (fast path inside), not the inline sequence: one call per entry
-        self.ldr_reloc(IP1, Reloc::TlsSlow);
-        self.a.blr(IP1);
+    /// The running thread's domain base (slot 0 of its thread-local block) into the frame's domain
+    /// slot: the inline TLS read, the shared routine only for a thread that has no block yet.
+    fn dom_base(&mut self) {
+        self.tls_block_ip0();
         // ldr x16, [x16]: the domain base
         self.a.e(0xF940_0000 | (IP0 as u32) << 5 | IP0 as u32);
         self.a.ldst(STRX, 8, IP0, SP, self.dom_slot);
@@ -2961,6 +2966,27 @@ impl<'a> Gen<'a> {
                 let rs = self.use_i(*src, S1);
                 let size = *size as i64;
                 let mut o = 0i64;
+                if size >= 32 {
+                    // 16-byte vector moves through the float scratch (an `ldp`/`stp` pair moves 32
+                    // bytes in two instructions), the tail as one overlapping 16-byte move: a
+                    // 160-byte struct move is 10 instructions, not 40
+                    let pair = |o: i64| o <= 1008;
+                    while o + 32 <= size && pair(o) {
+                        self.a.e(0xAD40_0000 | (((o / 16) as u32) & 0x7f) << 15 | (FS1 as u32) << 10 | (rs as u32) << 5 | FS0 as u32);
+                        self.a.e(0xAD00_0000 | (((o / 16) as u32) & 0x7f) << 15 | (FS1 as u32) << 10 | (rd as u32) << 5 | FS0 as u32);
+                        o += 32;
+                    }
+                    while o + 16 <= size {
+                        self.vldst(true, FS0, rs, o);
+                        self.vldst(false, FS0, rd, o);
+                        o += 16;
+                    }
+                    if o < size {
+                        self.vldst(true, FS0, rs, size - 16);
+                        self.vldst(false, FS0, rd, size - 16);
+                    }
+                    return;
+                }
                 while o + 8 <= size {
                     self.a.ldst(LDRX, 8, IP0, rs, o);
                     self.a.ldst(STRX, 8, IP0, rd, o);
@@ -3452,6 +3478,7 @@ fn compile_freq_inner(options: &relax_session::Options, f: &Func, env: &Env, fre
         apool: Vec::new(),
         sym_class: env.sym_class,
         dom_slot: -1,
+        dom_block: usize::MAX,
         relocs: Vec::new(),
         text_words: 0,
         pc_map: Vec::new(),
@@ -3704,13 +3731,6 @@ pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
     a.ldp_post(FP, LR, SP, 16);
     a.ret();
     words_to_bytes(&a.w)
-}
-
-/// `read_tsd(key) -> value`: this thread's TSD slot through tpidrro_el0, exactly the
-/// sequence `tls_addr` inlines (checked against pthread_getspecific at startup).
-/// Whether `f` takes the address of a domain symbol (a static: its code reads the domain base).
-fn uses_domain(f: &Func, sym_class: u64) -> bool {
-    sym_class != 0 && f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Addr(_, s) if SymClass::of(sym_class, s.id) == SymClass::Domain)))
 }
 
 /// `mrs xN, <register holding the thread's slot array>` (N or-ed in). macOS: tpidrro_el0 (the
