@@ -12,9 +12,10 @@ fn namespaces(prog: &Program, d: DefId) -> (bool, bool) {
     let def = prog.def(d);
     match def.kind {
         DefKind::Mod | DefKind::Enum | DefKind::Union | DefKind::Trait | DefKind::TypeAlias => (true, false),
-        // (foreign items are left out: an `extern` block inside a fn body is collected into the
-        // enclosing module, not the body's block, so two bodies' declarations would collide)
-        DefKind::Fn | DefKind::Const | DefKind::Static => (false, true),
+        // (foreign items count only in an `extern` block written at module level: one inside a fn
+        // body is collected into the enclosing module, not the body's block, so two bodies'
+        // declarations would collide)
+        DefKind::Fn | DefKind::Const | DefKind::Static | DefKind::ForeignFn | DefKind::ForeignStatic => (false, true),
         // the items of a trait (`duplicate_items` only asks for those of traits)
         DefKind::AssocFn | DefKind::AssocConst => (false, true),
         DefKind::AssocTy => (true, false),
@@ -33,6 +34,17 @@ fn namespaces(prog: &Program, d: DefId) -> (bool, bool) {
 pub fn duplicate_items(prog: &Program, own: &[bool]) -> Vec<String> {
     let mut seen: crate::fxhash::HashMap<(DefId, bool, u32), DefId> = Default::default();
     let mut errors = Vec::new();
+    let mut top_foreign: crate::fxhash::HashSet<(u32, u32)> = Default::default();
+    for (m, md) in prog.mods.iter().enumerate() {
+        if !own.get(md.krate as usize).copied().unwrap_or(false) || md.lexical_parent.is_some() { continue; }
+        let (file, items) = crate::lint_dead::module_items(prog, m as u32);
+        let ast = &prog.files[file as usize].ast;
+        for it in items {
+            if let ast::ItemKind::ForeignMod(r) = ast.item(it).kind {
+                for &c in ast.list(ast.row(r).items) { top_foreign.insert((file, c.0)); }
+            }
+        }
+    }
     for i in 0..prog.defs.len() {
         let d = DefId(i as u32);
         let def = prog.def(d);
@@ -42,6 +54,8 @@ pub fn duplicate_items(prog: &Program, own: &[bool]) -> Vec<String> {
         if prog.item_defs.get(&(def.file, def.item.0)) != Some(&d) { continue; }
         let name = prog.syms.str(def.name);
         if name == "_" || name.is_empty() { continue; }
+        let foreign = matches!(def.kind, DefKind::ForeignFn | DefKind::ForeignStatic);
+        if foreign && !top_foreign.contains(&(def.file, def.item.0)) { continue; }
         // a module file configured away by its own inner `#![cfg]` defines nothing
         if def.kind == DefKind::Mod {
             let m = &prog.mods[def.sub as usize];
@@ -54,7 +68,7 @@ pub fn duplicate_items(prog: &Program, own: &[bool]) -> Vec<String> {
             match seen.get(&(def.parent, ns, def.name)) {
                 Some(&first) if first != d => {
                     let ast = &prog.files[def.file as usize].ast;
-                    let pos = ast.item(def.item).name.lo;
+                    let pos = if foreign { ast.item(def.item).lo } else { ast.item(def.item).name.lo };
                     let ns_name = if ns { "type" } else { "value" };
                     let module = if prog.def(def.parent).kind == DefKind::Trait { "this trait" } else if prog.block_owner.get(&prog.def(def.parent).sub).is_some() { "this block" } else { "this module" };
                     errors.push(prog.record_error(def.file, pos, "resolve", format!(
@@ -65,6 +79,32 @@ pub fn duplicate_items(prog: &Program, own: &[bool]) -> Vec<String> {
                 Some(_) => {}
                 None => { seen.insert((def.parent, ns, def.name), d); }
             }
+        }
+    }
+    errors
+}
+
+/// E0428 for `#[macro_export]` macros: two exported `macro_rules!` of one name in a crate share the
+/// crate root's macro namespace (rustc_resolve build_reduced_graph define). The later one, in
+/// source order, is reported; a macro the definition of which another crate wrote is not ours.
+pub fn duplicate_exported_macros(prog: &Program, own: &[bool]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (name, defs) in prog.macros.defs.iter() {
+        let mut seen: Vec<(u32, u32, u32)> = Vec::new(); // (krate, file, pos)
+        let mut mine: Vec<&crate::macros::MacroDef> = defs.iter().map(|d| &**d).filter(|d| d.exported && d.builtin == 0 && !d.def_file.is_empty()).collect();
+        // (source order: a macro an expansion defines counts at its call)
+        let key = |d: &crate::macros::MacroDef| prog.file_paths.iter().position(|p| *p == d.def_file).map_or(d.def_pos, |f| prog.files[f].diagnostic_pos(d.def_pos));
+        mine.sort_by(|a, b| (a.def_file.as_str(), key(a)).cmp(&(b.def_file.as_str(), key(b))));
+        for d in mine {
+            let Some(file) = prog.file_paths.iter().position(|p| *p == d.def_file) else { continue };
+            let krate = prog.file_crate.get(file).copied().unwrap_or(u32::MAX);
+            if !own.get(krate as usize).copied().unwrap_or(false) || d.def_pos >= prog.files[file].src_len { continue; }
+            let kpos = key(d);
+            if d.def_pos < prog.files[file].src_len && seen.iter().any(|&(k, f, p)| k == krate && !(f == file as u32 && p == kpos)) {
+                errors.push(prog.record_error(file as u32, d.def_pos, "resolve", format!(
+                    "E0428: the name `{}` is defined multiple times -- note: `{}` must be defined only once in the macro namespace of this module", name, name)));
+            }
+            seen.push((krate, file as u32, kpos));
         }
     }
     errors
