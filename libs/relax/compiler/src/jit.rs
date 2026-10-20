@@ -4825,13 +4825,18 @@ impl Unit {
 
     /// SPEC-V: the verdict an earlier run stored for owner `d` under the current sources (cache.rs
     /// OwnerVerdicts: the crate fingerprints and the definition), if any.
+    /// Looked up once per owner and epoch (sweep_verdicts asks again for every waiting slot).
     fn stored_owner_verdict(&self, d: DefId, epoch: u64) -> Option<crate::borrowck::lazy::StoredVerdict> {
+        if let Some(v) = self.front.stored_owner.get(&(epoch, d)) {
+            return v;
+        }
         let c = self.cache.as_ref()?;
         let v = match self.front.owner_verdicts.get(&epoch) {
             Some(v) => v,
             None => crate::zone_alloc::kept_with(|| self.front.owner_verdicts.insert_first(epoch, std::sync::Arc::new(c.owner_verdicts(epoch)))),
         };
-        v.lookup(&self.prog, d, epoch).1
+        let found = v.lookup(&self.prog, d, epoch).1;
+        crate::zone_alloc::kept_with(|| self.front.stored_owner.insert_first((epoch, d), found))
     }
 
     /// Relaxed Rust D3: the run-time disjoint-index checks slot `id`'s clean verdict asks its code
@@ -13451,6 +13456,8 @@ pub struct FrontShared {
     alive: AtomicBool,
     pub(crate) warm_cache: AtomicBool,
     owner_verdicts: crate::conc::MemoMap<u64, std::sync::Arc<crate::cache::OwnerVerdicts>>,
+    /// SPEC-V: the stored owner verdicts looked up so far, by (epoch, owner) (Unit::stored_owner_verdict)
+    stored_owner: crate::conc::MemoMap<(u64, DefId), Option<crate::borrowck::lazy::StoredVerdict>>,
     /// slot -> key (the fns table moves when it grows)
     slot_keys: crate::conc::MemoMap<u32, FnKey>,
     /// checked bodies with the collect epoch they were checked at
@@ -13492,6 +13499,7 @@ impl FrontShared {
             alive: AtomicBool::new(false),
             warm_cache: AtomicBool::new(false),
             owner_verdicts: Default::default(),
+            stored_owner: Default::default(),
             slot_keys: crate::conc::MemoMap::with_bits(16),
             ahead: Default::default(),
             inprog: Default::default(),
