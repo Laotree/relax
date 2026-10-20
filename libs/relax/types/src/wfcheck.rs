@@ -381,15 +381,12 @@ pub mod obligations {
         ocx: ObligationCtxt<'a, 'tcx>,
         env: ParamEnvId,
         def: DefId,
-        /// only dyn-compatibility goals are kept (a trait definition: its environment is not built)
-        only_dyn: bool,
         /// errors of checks that are not obligations (region outlives)
         extra: Vec<String>,
     }
 
     impl<'a, 'tcx> Wfcx<'a, 'tcx> {
         fn register(&mut self, goal: Goal, pos: u32) {
-            if self.only_dyn && !matches!(goal.predicate.kind, PredicateKind::DynCompatible(_)) { return; }
             self.ocx.engine.register_predicate_obligation(self.infcx, PredicateObligation { goal, recursion_depth: 0, cause: ObligationCause { span: pos, body_id: self.def } });
         }
 
@@ -555,17 +552,10 @@ pub mod obligations {
         }
     }
 
-    fn with_wfcx_env(prog: &Program, tcx: &Tcx, def: DefId, env: ParamEnvId, f: impl FnOnce(&mut Wfcx<'_, '_>)) -> Vec<String> {
-        let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), def);
-        let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env, def, only_dyn: false , extra: Vec::new()};
-        f(&mut w);
-        w.finish(prog.def(def).file)
-    }
-
     fn with_wfcx(prog: &Program, tcx: &Tcx, def: DefId, f: impl FnOnce(&mut Wfcx<'_, '_>)) -> Vec<String> {
         let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), def);
         let env = tcx.param_env_id(prog, def);
-        let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env, def, only_dyn: false , extra: Vec::new()};
+        let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env, def, extra: Vec::new()};
         w.check_false_global_bounds();
         f(&mut w);
         w.finish(prog.def(def).file)
