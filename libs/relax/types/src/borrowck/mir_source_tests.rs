@@ -785,3 +785,13 @@ fn a_returned_reference_to_a_local_in_an_impl_trait_function_is_e0515() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.len() == 1 && errors[0].starts_with("E0515"), "{errors:?}");
 }
+
+#[test]
+fn an_async_closure_returned_as_a_trait_object_references_a_local() {
+    // `(async || x)()` borrows `x` through a coroutine-closure, which is neither a closure nor a coroutine
+    // for the E0373 explanation: the error is E0515.
+    let (errors, unchecked) = borrowck_source_in("
+        pub fn foo() -> Box<dyn std::future::Future<Output = u32>> { let x = 0u32; Box::new((async || x)()) }", 2018);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0515"), "{errors:?}");
+}
