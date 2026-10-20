@@ -878,6 +878,8 @@ fn expand_buf(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: 
             let src = view.src();
             let kind = |i: usize| toks.at(i).kind;
             let mut i = lo;
+            let mut selected: Option<TokBuf> = None;
+            p.cfg_select_rest.borrow_mut().clear();
             while i < hi {
                 let pred_lo = i;
                 while i < hi && kind(i) != T::FatArrow {
@@ -929,11 +931,17 @@ fn expand_buf(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: 
                     i += 1;
                 }
                 let wildcard = pred_hi == pred_lo + 1 && buf.get(toks.at(pred_lo).lo, toks.at(pred_lo).hi) == b"_";
-                if wildcard || crate::cfg::eval_tokens(src, pred_lo, pred_hi, &ctx.cfg) {
+                if selected.is_none() && (wildcard || crate::cfg::eval_tokens(src, pred_lo, pred_hi, &ctx.cfg)) {
                     let mut g = TokBuf::new(p.edition);
                     p.copy_toks(&mut g, body_lo, body_hi);
-                    return Ok(g);
+                    selected = Some(g);
+                } else {
+                    // rustc cfg_select.rs `CfgSelectResult`: the branches not chosen are parsed too (their errors count)
+                    p.cfg_select_rest.borrow_mut().push((body_lo, body_hi));
                 }
+            }
+            if let Some(g) = selected {
+                return Ok(g);
             }
             return Err("none of the predicates in this `cfg_select` evaluated to true".to_string());
         }

@@ -150,6 +150,8 @@ pub struct Parser<'a> {
     in_trait: bool,
     /// a statement macro call is being resolved (`include!` there is an expression)
     stmt_ctx: bool,
+    /// the token ranges of the `cfg_select!` arms the last expansion did not choose (check only)
+    pub cfg_select_rest: std::cell::RefCell<Vec<(usize, usize)>>,
     /// the `include!` being expanded is an expression or statement: its file keeps a leading `#!`
     pub include_as_expr: bool,
     foreign_abi: Option<Option<Ident>>,
@@ -217,6 +219,7 @@ impl<'a> Parser<'a> {
             in_assoc: 0,
             in_trait: false,
             stmt_ctx: false,
+            cfg_select_rest: Default::default(),
             include_as_expr: false,
             foreign_abi: None,
             cfg_out: 0,
@@ -1405,6 +1408,27 @@ impl<'a> Parser<'a> {
             && !self.name_imported(&name)
     }
 
+    /// The arms of a `cfg_select!` that were not chosen are parsed as the chosen one is (rustc cfg_select.rs):
+    /// their syntax errors are reported. `how`: 0 an expression, 1 statements, 2 items.
+    fn parse_cfg_select_rest(&mut self, rest: Vec<(usize, usize)>, how: u8) -> PResult<()> {
+        if rest.is_empty() || !crate::lexer::validation_enabled() || self.cfg_out > 0 { return Ok(()); }
+        for (lo, hi) in rest {
+            let save = self.pos;
+            self.pos = lo;
+            let r = self.parse_stripped(|p| {
+                match how {
+                    0 => { p.expr()?; }
+                    1 => { let mut v = Vec::new(); while p.pos < hi { p.block_stmts_step(&mut v)?; } }
+                    _ => { p.items_until(T::CloseBrace)?; }
+                }
+                Ok(())
+            });
+            self.pos = save;
+            r?;
+        }
+        Ok(())
+    }
+
     fn push_rules_scope(&mut self) -> u32 {
         let id = self.next_scope;
         self.next_scope += 1;
@@ -1806,9 +1830,11 @@ impl<'a> Parser<'a> {
         let tail_expr = delim != b'{' && self.kind() == T::CloseBrace && def.builtin == 0 && crate::lexer::validation_enabled() && (lo as usize) < self.src.len();
         self.eat(T::Semi);
         self.include_as_expr = as_expr;
+        self.cfg_select_rest.borrow_mut().clear();
         let start = self.expand_call(&def, toks, lo);
         self.include_as_expr = false;
         let start = start?;
+        let rest = std::mem::take(&mut *self.cfg_select_rest.borrow_mut());
         let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
         if trailing && def.builtin == 0 && crate::macros::uses::recording() {
             // a macro call ending a block is an expression (rustc_expand flat_map_stmt
@@ -1823,7 +1849,9 @@ impl<'a> Parser<'a> {
                 crate::macros::uses::trailing_semi(&file, semi, lo, &def.def_file);
             }
         }
-        Ok(Some(self.in_expansion(start, |p| f(p, include, tail_expr))?))
+        let r = self.in_expansion(start, |p| f(p, include, tail_expr))?;
+        self.parse_cfg_select_rest(rest, if as_expr { 1 } else { 2 })?;
+        Ok(Some(r))
     }
 
     /// Moves to the end of the current macro expansion's tokens.
@@ -4759,11 +4787,13 @@ impl<'a> Parser<'a> {
                     let (delim, toks) = self.delim_tt()?;
                     if let Some(def) = self.rules_macro(&path) {
                         self.include_as_expr = true;
+                        self.cfg_select_rest.borrow_mut().clear();
                         let start = self.expand_call(&def, toks, lo);
                         self.include_as_expr = false;
                         let start = start?;
+                        let rest = std::mem::take(&mut *self.cfg_select_rest.borrow_mut());
                         let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
-                        return self.in_expansion(start, |p| {
+                        let e = self.in_expansion(start, |p| {
                             let e = p.expr()?;
                             if p.kind() == T::Semi && def.builtin == 0 && crate::macros::uses::recording() {
                                 let file = p.bctx.as_ref().map_or("", |c| c.path.as_str()).to_string();
@@ -4772,7 +4802,9 @@ impl<'a> Parser<'a> {
                             p.eat(T::Semi);
                             if include { p.skip_to_eof(); }
                             Ok(e)
-                        });
+                        })?;
+                        self.parse_cfg_select_rest(rest, 0)?;
+                        return Ok(e);
                     }
                     if let Some(e) = self.builtin_mac_expr(&path, toks, lo)? {
                         return Ok(e);
