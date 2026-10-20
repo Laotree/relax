@@ -48,6 +48,7 @@ pub const unsafe fn write_unaligned<T>(dst: *mut T, src: T) {
     let tmp = crate::mem::ManuallyDrop::new(src);
     im::copy_nonoverlapping(&*tmp as *const T as *const u8, dst as *mut u8, im::size_of::<T>());
 }
+#[rustc_diagnostic_item = "ptr_write_volatile"]
 pub unsafe fn write_volatile<T>(dst: *mut T, src: T) {
     im::volatile_store(dst, src)
 }
@@ -132,6 +133,7 @@ pub struct NonNull<T: crate::marker::PointeeSized> {
     pointer: *const T,
 }
 
+impl<T: crate::marker::PointeeSized + crate::marker::Unsize<U>, U: crate::marker::PointeeSized> crate::ops::CoerceUnsized<NonNull<U>> for NonNull<T> {}
 impl<T> NonNull<T> {
     pub const fn dangling() -> NonNull<T> {
         NonNull { pointer: dangling::<T>() }

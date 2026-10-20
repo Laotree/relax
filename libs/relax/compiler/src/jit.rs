@@ -913,7 +913,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
                 }
                 owner::call(owner::Class::Background, || {
                     for &id in chunk {
-                        (&mut *up).note_first_borrowck(id);
+                        (&mut *up).note_first_borrowck(id, None);
                     }
                 });
             }
@@ -1065,7 +1065,8 @@ thread_local! {
     /// saved host context of this thread's innermost `enter` (sp); 0 = no recovery point
     static CTX: std::cell::UnsafeCell<[u64; 2]> = const { std::cell::UnsafeCell::new([0; 2]) };
     /// stack of format buffers: format!/write! to non-Formatter targets push one
-    static FMT: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(vec![String::new()]);
+    // (the outer buffer is kept-heap: a thread-local past the compiler generations)
+    static FMT: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(crate::zone_alloc::kept_with(|| vec![String::new()]));
     /// the last popped buffer (valid until the next pop)
     static FMT_POPPED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     static PANIC: std::cell::RefCell<Option<PanicInfo>> = const { std::cell::RefCell::new(None) };
@@ -1338,7 +1339,7 @@ fn fmt_take_top() -> String {
 
 rt_fn! {
 fn rt_fmt_push() {
-    FMT.with(|f| f.borrow_mut().push(String::new()));
+    FMT.with(|f| { let _k = crate::zone_alloc::kept(); f.borrow_mut().push(String::new()) });
 }
 }
 
@@ -2047,6 +2048,21 @@ fn note_tombstone_fault(f: &os::fault::Fault) {
     if std::env::var_os("MAKEPAD_RUN_ZONE_TRACE").is_some() {
         let sym = os::proc::symbol_at(f.pc).map_or_else(|| "?".to_string(), |s| s.0);
         eprintln!("makepad-run zone: fault: {} at {:#x}, pc {:#x} in {}, thread `{}`\n", f.label(), f.addr, f.pc, sym, std::thread::current().name().unwrap_or("?"));
+        // the frame-pointer chain of the faulting thread (same stack, bounded by the sp)
+        let (mut fp, lo) = (f.fp, f.sp);
+        for _ in 0..24 {
+            if fp % 16 != 0 || fp < lo || fp - lo > (64 << 20) {
+                break;
+            }
+            let ret = unsafe { *((fp + 8) as *const u64) };
+            let name = os::proc::symbol_at(ret).map_or_else(|| "?".to_string(), |s| s.0);
+            eprintln!("makepad-run zone:   frame {:#x} in {}", ret, name);
+            let next = unsafe { *(fp as *const u64) };
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
     }
     if let Some(g) = crate::zone_alloc::compiler_tombstone_of(f.addr as usize) {
         eprintln!("makepad: use after compiler-zone destroy (generation {g}): {} at {:#x}, pc {:#x}", f.label(), f.addr, f.pc);
@@ -4582,12 +4598,15 @@ impl Unit {
             f.patch_gen = gen;
             crate::zone_alloc::kept_with(|| self.patch_log.push((id, gen)));
         }
-        // borrowck lane: a fn instance's first code is checked lazily in the background
-        if first && gen == 0 && crate::borrowck::lazy::gandalf_enabled(options) {
-            if startup_phase() && !FIRST_PRESENT.load(Ordering::Acquire) && owner::for_main() {
+        // borrowck lane: a fn instance's first code, and every live-patched version of it, is checked
+        // lazily in the background (D3: a patch is never refused synchronously unless --check-first;
+        // its verdict arrives as a Gandalf event, at the front of the queue). The first code of slots
+        // the main thread installs before the first present is queued after it (flush_borrowck_notes).
+        if (first && gen == 0 || gen > 0) && crate::borrowck::lazy::gandalf_enabled(options) {
+            if gen == 0 && startup_phase() && !FIRST_PRESENT.load(Ordering::Acquire) && owner::for_main() {
                 crate::zone_alloc::kept_with(|| self.pending_borrowck.push(id));
             } else {
-                self.note_first_borrowck(id);
+                self.note_first_borrowck(id, (gen > 0).then_some(0));
             }
         }
         unsafe {
@@ -4614,7 +4633,7 @@ impl Unit {
 
     /// borrowck lane: slot `id`'s first code (a fn instance) is checked lazily in the background,
     /// unless the disk cache has a verdict for its body.
-    pub(crate) fn note_first_borrowck(&mut self, id: u32) {
+    pub(crate) fn note_first_borrowck(&mut self, id: u32, rank: Option<u32>) {
         let options = &self.prog.session.clone().options;
         // only the running app's own crates are checked in the background (event::admit,
         // the app-crate rule of the live-edit gate): framework, dependency and std
@@ -4642,7 +4661,7 @@ impl Unit {
             let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
             crate::borrowck::lazy::note_program(options, &src, epoch);
             crate::borrowck::lazy::note_compiled(options, &src, crate::borrowck::lazy::NoteFn {
-                def: d, args: a, cache_key: key, epoch, rank: None, cached,
+                def: d, args: a, cache_key: key, epoch, rank, cached,
             });
         }
     }
@@ -5361,7 +5380,7 @@ impl Unit {
         let n = count.min(self.pending_borrowck.len());
         let ids: Vec<u32> = self.pending_borrowck.drain(..n).collect();
         for id in ids {
-            self.note_first_borrowck(id);
+            self.note_first_borrowck(id, None);
         }
         !self.pending_borrowck.is_empty()
     }
@@ -12322,9 +12341,12 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
     }
 }
 
-thread_local! {
+crate::gen_local! {
     /// the constants (and their arguments) whose initializers this thread is evaluating, outermost first
-    static CONST_STACK: std::cell::RefCell<Vec<(DefId, Vec<TyId>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// (compiler TLS: the buffer is a generation's block, the settle swap must forget it)
+    static CONST_STACK: std::cell::RefCell<Vec<(DefId, Vec<TyId>)>>;
+}
+thread_local! {
     /// const/static initializers this thread is evaluating (run_init_code)
     static CONST_EVAL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// guarded run-time module calls this thread is inside (std::relax::guard)
@@ -13690,8 +13712,8 @@ pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body, warm_only: bool,
     for (k, m) in b.methods.iter().chain(b.binops.iter()) {
         add(*k, m.def, tcx.tys.list(m.args));
     }
-    for ((k, _), (d, a)) in &b.ov_derefs {
-        add(*k, *d, tcx.tys.list(*a));
+    for (k, _, (d, a)) in b.overloaded_derefs() {
+        add(k, d, tcx.tys.list(a));
     }
     for (k, (d, a)) in b.ov_index.iter().chain(b.for_next.iter()) {
         add(*k, *d, tcx.tys.list(*a));
@@ -13710,7 +13732,9 @@ fn bump(next: &AtomicU64, size: u64, align: u64, end: u64, full: &str) -> u64 {
     loop {
         let at = (cur + a - 1) / a * a;
         if at + size > end {
-            panic!("{}", full);
+            // (a constant that asks for more memory than the compiler has is a constant-evaluation
+            // error, not a compiler bug: rustc's `MemoryExhausted`)
+            std::panic::resume_unwind(Box::new(crate::infer::diagnostics::FatalError(format!("E0080: tried to allocate more memory than available to compiler ({full})"))));
         }
         match next.compare_exchange_weak(cur, at + size, Ordering::AcqRel, Ordering::Relaxed) {
             Ok(_) => {

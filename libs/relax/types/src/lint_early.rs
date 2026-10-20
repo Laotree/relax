@@ -748,7 +748,13 @@ impl<'a> W<'a> {
     }
 
     /// rustc `UnusedDelimLint::check_unused_delims_expr` of UnusedParens (`parens`) or UnusedBraces.
-    fn delims(&self, parens: bool, value: ExprId, ctx: Ctx, followed_by_block: bool) {
+    fn delims(&self, parens: bool, mut value: ExprId, ctx: Ctx, followed_by_block: bool) {
+        // the parens a macro transcription adds around an `$e:expr` fragment are no node of
+        // rustc's (the fragment is one interpolated expression)
+        while let ExprKind::Paren(inner) = self.kind(value) {
+            if !crate::macros::uses::is_synth_paren(&self.prog.file_paths[self.file as usize], self.ast.expr(value).lo) { break; }
+            value = inner;
+        }
         let v = *self.ast.expr(value);
         if parens {
             match v.kind {
@@ -2065,13 +2071,329 @@ fn mismatched_lifetime_syntaxes(prog: &Program, tcx: &Tcx, d: DefId) {
     }
 }
 
+// ---------------------------------------------------------------- impl_trait_redundant_captures
+
+pub const IMPL_TRAIT_REDUNDANT_CAPTURES: Lint = lint::lint("impl_trait_redundant_captures");
+
+/// The `impl Trait` types written in `t` (outermost first), with the bounds each holds.
+fn opaque_types(ast: &Ast, t: TyId, out: &mut Vec<TyId>) {
+    fn bounds(ast: &Ast, l: List<Bound>, out: &mut Vec<TyId>) {
+        for b in ast.list(l) {
+            if let Bound::Trait { path, .. } = *b { path_args(ast, &path, out); }
+        }
+    }
+    fn path_args(ast: &Ast, p: &Path, out: &mut Vec<TyId>) {
+        if p.has_qself() {
+            if let Some(q) = ast.qself(p) {
+                opaque_types(ast, q.ty, out);
+                if let Some(tp) = q.trait_path { path_args(ast, &tp, out); }
+            }
+        }
+        for seg in ast.segs(p.segs) {
+            match ast.gargs(seg.args()) {
+                Some(GenericArgs::Angle(l)) => {
+                    for a in ast.list(*l) {
+                        match *a {
+                            GenericArg::Type(t) | GenericArg::Binding(_, _, t) => opaque_types(ast, t, out),
+                            GenericArg::Constraint(_, _, b) => bounds(ast, b, out),
+                            _ => {}
+                        }
+                    }
+                }
+                Some(GenericArgs::Paren(tys, ret)) => {
+                    for &t in ast.list(*tys) { opaque_types(ast, t, out); }
+                    if let Some(r) = ret { opaque_types(ast, *r, out); }
+                }
+                None => {}
+            }
+        }
+    }
+    match *ast.ty(t) {
+        Ty::Ref(_, _, x) | Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Paren(x) => opaque_types(ast, x, out),
+        Ty::Tuple(l) => for &x in ast.list(l) { opaque_types(ast, x, out); },
+        Ty::Fn(f) => {
+            let f = *ast.fn_ptr(f);
+            for &x in ast.list(f.params) { opaque_types(ast, x, out); }
+            if let Some(r) = f.ret { opaque_types(ast, r, out); }
+        }
+        Ty::Path(p) => path_args(ast, &p, out),
+        Ty::ImplTrait(b) => { out.push(t); bounds(ast, b, out); }
+        Ty::DynTrait(b, _) => bounds(ast, b, out),
+        _ => {}
+    }
+}
+
+/// rustc_lint impl_trait_overcaptures.rs `check_fn`, the `use<..>` redundancy: in edition 2024 an
+/// opaque type in a fn's return type whose `use<..>` names every generic parameter and lifetime in
+/// scope (a parameter-position `impl Trait` is one that cannot be named).
+fn impl_trait_redundant_captures(prog: &Program, tcx: &Tcx, d: DefId) {
+    let def = prog.def(d);
+    let pf = &prog.files[def.file as usize];
+    if pf.edition < 2024 { return; }
+    let ast = &pf.ast;
+    let item = *ast.item(def.item);
+    let ItemKind::Fn(sig, _, _) = item.kind else { return };
+    let sig = *ast.fn_sig(sig);
+    let Some(ret) = sig.ret else { return };
+    let mut opaques = Vec::new();
+    opaque_types(ast, ret, &mut opaques);
+    if !opaques.iter().any(|&t| matches!(*ast.ty(t), Ty::ImplTrait(b) if ast.list(b).iter().any(|x| matches!(x, Bound::Use(_))))) { return; }
+    // a parameter-position `impl Trait` is a generic parameter nothing can capture by name
+    if ast.list(sig.params).iter().any(|p| ty_has_impl_trait(ast, p.ty)) { return; }
+    if let Some(SelfParam::Typed(_, t)) = sig.self_param { if ty_has_impl_trait(ast, t) { return; } }
+    // the type and const parameters in scope, by name; `Self` in a trait
+    let mut params: Vec<String> = Vec::new();
+    fn add(params: &mut Vec<String>, ast: &Ast, pf: &ParsedFile, g: Generics) {
+        for p in ast.list(g.params) {
+            if !matches!(p.kind, GenericParamKind::Lifetime(_)) { params.push(pf.text(p.name).to_string()); }
+        }
+    }
+    add(&mut params, ast, pf, sig.generics);
+    if def.kind == DefKind::AssocFn {
+        let parent = prog.def(def.parent);
+        let ppf = &prog.files[parent.file as usize];
+        let past = &ppf.ast;
+        match past.item(parent.item).kind {
+            ItemKind::Impl(r) => add(&mut params, past, ppf, past.row(r).generics),
+            ItemKind::Trait(r) => { params.push("Self".to_string()); add(&mut params, past, ppf, past.row(r).generics) }
+            _ => {}
+        }
+    }
+    let names = names(prog, tcx, d);
+    let scope: Vec<crate::tcx::resolve_bound_vars::LifetimeId> = names.in_scope_lifetimes();
+    let w = W::new(prog, def.file, d);
+    for t in opaques {
+        let Ty::ImplTrait(b) = *ast.ty(t) else { continue };
+        let Some(args) = ast.list(b).iter().find_map(|x| if let Bound::Use(a) = *x { Some(a) } else { None }) else { continue };
+        let Some(GenericArgs::Angle(l)) = ast.gargs(args) else { continue };
+        let mut lifetimes = Vec::new();
+        let mut named: Vec<String> = Vec::new();
+        for a in ast.list(*l) {
+            match *a {
+                GenericArg::Lifetime(lt) => if let Some(LifetimeRes::Param(id)) = names.named(lt.lo, lt.hi) { lifetimes.push(id) },
+                GenericArg::Type(ty) => if let Ty::Path(p) = *ast.ty(ty) {
+                    if let Some(sg) = ast.segs(p.segs).last() { named.push(pf.text(sg.name).to_string()); }
+                },
+                GenericArg::Const(e) => if let ExprKind::Path(p) = ast.expr(e).kind {
+                    if let Some(sg) = ast.segs(p.segs).last() { named.push(pf.text(sg.name).to_string()); }
+                },
+                _ => {}
+            }
+        }
+        if scope.iter().all(|id| lifetimes.contains(id)) && params.iter().all(|p| named.contains(p)) {
+            let pos = w.ty_start(t).unwrap_or(item.lo);
+            if lint::external(prog, def.file, pos) { continue; }
+            emit(prog, d, &IMPL_TRAIT_REDUNDANT_CAPTURES, def.file, pos, "all possible in-scope parameters are already captured, so `use<...>` syntax is redundant");
+        }
+    }
+}
+
+// ---------------------------------------------------------------- redundant_lifetimes
+
+pub const REDUNDANT_LIFETIMES: Lint = lint::lint("redundant_lifetimes");
+
+/// The regions written in a type (references, explicit and hidden path arguments).
+fn ty_regions(ast: &Ast, names: &LifetimeResolution, t: TyId, out: &mut Vec<LifetimeRes>) {
+    match *ast.ty(t) {
+        Ty::Ref(lt, _, x) => {
+            let r = match lt { Some(l) => names.named(l.lo, l.hi), None => names.reference(t.0) };
+            if let Some(r) = r { out.push(r); }
+            ty_regions(ast, names, x, out);
+        }
+        Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Paren(x) => ty_regions(ast, names, x, out),
+        Ty::Tuple(l) => for &x in ast.list(l) { ty_regions(ast, names, x, out); },
+        Ty::Path(p) => {
+            for (i, seg) in ast.segs(p.segs).iter().enumerate() {
+                let mut k = 0;
+                while let Some(r) = names.path(p.segs.lo + i as u32, k) { out.push(r); k += 1; }
+                if let Some(GenericArgs::Angle(l)) = ast.gargs(seg.args()) {
+                    for a in ast.list(*l) {
+                        match *a {
+                            GenericArg::Lifetime(lt) => if let Some(r) = names.named(lt.lo, lt.hi) { out.push(r) },
+                            GenericArg::Type(t) => ty_regions(ast, names, t, out),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What the well-formedness of `t` implies: for each `&'r X`, the regions of `X` outlive `'r`.
+fn wf_edges(cx: &(&Program, u32, u32), names: &LifetimeResolution, t: TyId, edges: &mut Vec<(LifetimeRes, LifetimeRes)>) {
+    let ast = &cx.0.files[cx.2 as usize].ast;
+    match *ast.ty(t) {
+        Ty::Ref(lt, _, x) => {
+            let r = match lt { Some(l) => names.named(l.lo, l.hi), None => names.reference(t.0) };
+            if let Some(r) = r {
+                let mut inner = Vec::new();
+                ty_regions(ast, names, x, &mut inner);
+                for i in inner { edges.push((i, r)); }
+            }
+            wf_edges(cx, names, x, edges);
+        }
+        Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Paren(x) => wf_edges(cx, names, x, edges),
+        Ty::Tuple(l) => for &x in ast.list(l) { wf_edges(cx, names, x, edges); },
+        Ty::Path(p) => {
+            // `Adt<X>` with `T: 'static` on the ADT's parameter: the regions of X outlive 'static
+            let segs = ast.segs(p.segs);
+            if let ([seg], false) = (segs, p.has_qself()) {
+                let (prog, module, file) = *cx;
+                if let Some(GenericArgs::Angle(l)) = ast.gargs(seg.args()) {
+                    let name = prog.syms.intern_late(prog.files[file as usize].text(seg.name));
+                    if let Some(a) = prog.lookup_in_scope(module, name, true) {
+                        let adef = prog.def(a);
+                        if matches!(adef.kind, DefKind::Struct | DefKind::Enum | DefKind::Union) {
+                            let aast = &prog.files[adef.file as usize].ast;
+                            let g = match aast.item(adef.item).kind {
+                                ItemKind::Struct(r) => Some(aast.row(r).generics),
+                                ItemKind::Enum(r) => Some(aast.row(r).generics),
+                                ItemKind::Union(r) => Some(aast.row(r).generics),
+                                _ => None,
+                            };
+                            if let Some(g) = g {
+                                let targs: Vec<TyId> = ast.list(*l).iter().filter_map(|a| if let GenericArg::Type(t) = *a { Some(t) } else { None }).collect();
+                                let tparams: Vec<&GenericParam> = aast.list(g.params).iter().filter(|p| matches!(p.kind, GenericParamKind::Type(..))).collect();
+                                let apf = &prog.files[adef.file as usize];
+                                for (t, p) in targs.iter().zip(tparams) {
+                                    if let GenericParamKind::Type(bounds, _) = p.kind {
+                                        if aast.list(bounds).iter().any(|b| matches!(*b, Bound::Lifetime(lt) if apf.text(lt) == "'static")) {
+                                            let mut rs = Vec::new();
+                                            ty_regions(ast, names, *t, &mut rs);
+                                            for r in rs { edges.push((r, LifetimeRes::Static)); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for seg in segs {
+                if let Some(GenericArgs::Angle(l)) = ast.gargs(seg.args()) {
+                    for a in ast.list(*l) { if let GenericArg::Type(t) = *a { wf_edges(cx, names, t, edges); } }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The `'a: 'b` bounds of a generics list.
+fn declared_edges(ast: &Ast, names: &LifetimeResolution, g: Generics, edges: &mut Vec<(LifetimeRes, LifetimeRes)>) {
+    let mut add = |a: Ident, bounds: List<Ident>| {
+        if let Some(a) = names.named(a.lo, a.hi) {
+            for &b in ast.list(bounds) { if let Some(b) = names.named(b.lo, b.hi) { edges.push((a, b)); } }
+        }
+    };
+    for p in ast.list(g.params) { if let GenericParamKind::Lifetime(bounds) = p.kind { add(p.name, bounds); } }
+    for w in ast.list(g.where_) { if let WherePred::Lifetime(a, bounds) = *w { add(a, bounds); } }
+}
+
+/// rustc_hir_analysis wfcheck `lint_redundant_lifetimes`: a lifetime parameter of the item that
+/// provably equals an earlier one (or `'static`). The outlives relation is the declared bounds
+/// plus what the well-formedness of the signature's reference types implies; where the walk
+/// cannot follow a type it adds no fact, so it can only report fewer lifetimes than rustc.
+fn redundant_lifetimes(prog: &Program, tcx: &Tcx, d: DefId) {
+    let def = prog.def(d);
+    match def.kind {
+        DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::Trait | DefKind::Fn | DefKind::Const | DefKind::Impl => {}
+        DefKind::AssocFn | DefKind::AssocTy | DefKind::AssocConst => {
+            let p = prog.def(def.parent);
+            if p.kind == DefKind::Impl && tcx.impl_trait.contains_key(&def.parent) { return; }
+        }
+        _ => return,
+    }
+    let pf = &prog.files[def.file as usize];
+    let ast = &pf.ast;
+    let nm = names(prog, tcx, d);
+    let scope = nm.named_in_scope();
+    if !scope.iter().any(|s| s.3) { return; }
+    let mut edges: Vec<(LifetimeRes, LifetimeRes)> = Vec::new();
+    let item = *ast.item(def.item);
+    let mut impl_self: Option<(TyId, std::sync::Arc<LifetimeResolution>)> = None;
+    if matches!(def.kind, DefKind::AssocFn | DefKind::AssocTy | DefKind::AssocConst) {
+        let parent = prog.def(def.parent);
+        let past = &prog.files[parent.file as usize].ast;
+        let pn = names(prog, tcx, def.parent);
+        match past.item(parent.item).kind {
+            ItemKind::Impl(r) => {
+                let im = past.row(r);
+                declared_edges(past, &pn, im.generics, &mut edges);
+                wf_edges(&(prog, tcx.item_module(prog, def.parent), parent.file), &pn, im.self_ty, &mut edges);
+                impl_self = Some((im.self_ty, pn));
+            }
+            ItemKind::Trait(r) => declared_edges(past, &pn, past.row(r).generics, &mut edges),
+            _ => {}
+        }
+    }
+    match item.kind {
+        ItemKind::Fn(sig, _, _) => {
+            let sig = *ast.fn_sig(sig);
+            declared_edges(ast, &nm, sig.generics, &mut edges);
+            let cx = (prog, tcx.item_module(prog, d), def.file);
+            for p in ast.list(sig.params) { wf_edges(&cx, &nm, p.ty, &mut edges); }
+            if let Some(r) = sig.ret { wf_edges(&cx, &nm, r, &mut edges); }
+            match sig.self_param {
+                Some(SelfParam::Ref(lt, _)) => {
+                    let r = match lt { Some(l) => nm.named(l.lo, l.hi), None => nm.self_reference() };
+                    if let (Some(r), Some((st, pn))) = (r, &impl_self) {
+                        let pa = &prog.files[prog.def(def.parent).file as usize].ast;
+                        let mut inner = Vec::new();
+                        ty_regions(pa, pn, *st, &mut inner);
+                        for i in inner { edges.push((i, r)); }
+                    }
+                }
+                Some(SelfParam::Typed(_, t)) => wf_edges(&cx, &nm, t, &mut edges),
+                _ => {}
+            }
+        }
+        ItemKind::Struct(r) => declared_edges(ast, &nm, ast.row(r).generics, &mut edges),
+        ItemKind::Union(r) => declared_edges(ast, &nm, ast.row(r).generics, &mut edges),
+        ItemKind::Enum(r) => declared_edges(ast, &nm, ast.row(r).generics, &mut edges),
+        ItemKind::Trait(r) => declared_edges(ast, &nm, ast.row(r).generics, &mut edges),
+        ItemKind::Impl(r) => {
+            let im = ast.row(r);
+            declared_edges(ast, &nm, im.generics, &mut edges);
+            wf_edges(&(prog, tcx.item_module(prog, d), def.file), &nm, im.self_ty, &mut edges);
+        }
+        _ => {}
+    }
+    // the candidates: 'static, then the named lifetimes in scope
+    let mut all: Vec<LifetimeRes> = vec![LifetimeRes::Static];
+    all.extend(scope.iter().map(|s| LifetimeRes::Param(s.0)));
+    let n = all.len();
+    let idx = |r: LifetimeRes| all.iter().position(|x| *x == r);
+    let mut reach = vec![vec![false; n]; n];
+    for i in 0..n { reach[i][i] = true; reach[0][i] = true; }
+    for (a, b) in edges {
+        if let (Some(a), Some(b)) = (idx(a), idx(b)) { reach[a][b] = true; }
+    }
+    for k in 0..n { for i in 0..n { if reach[i][k] { for j in 0..n { if reach[k][j] { reach[i][j] = true; } } } } }
+    let mut shadowed = vec![false; n];
+    for c in 0..n {
+        if shadowed[c] { continue; }
+        for v in (c + 1)..n {
+            let (id, ref name, span, own) = scope[v - 1];
+            let _ = id;
+            if !own || !(reach[c][v] && reach[v][c]) { continue; }
+            shadowed[v] = true;
+            if lint::external(prog, def.file, span) { continue; }
+            emit(prog, d, &REDUNDANT_LIFETIMES, def.file, span, &format!("unnecessary lifetime parameter `{}`", name));
+        }
+    }
+}
+
 // ---------------------------------------------------------------- entry points
 
 /// The definition-level passes of this file over one definition.
 pub fn check_def_item(prog: &Program, tcx: &Tcx, d: DefId) {
     match prog.def(d).kind {
-        DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => mismatched_lifetime_syntaxes(prog, tcx, d),
-        DefKind::Struct | DefKind::Union | DefKind::Enum => explicit_outlives_requirements(prog, d),
+        DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => { mismatched_lifetime_syntaxes(prog, tcx, d); impl_trait_redundant_captures(prog, tcx, d); redundant_lifetimes(prog, tcx, d); }
+        DefKind::Struct | DefKind::Union | DefKind::Enum => { explicit_outlives_requirements(prog, d); redundant_lifetimes(prog, tcx, d); }
+        DefKind::Trait | DefKind::Impl | DefKind::Const => redundant_lifetimes(prog, tcx, d),
         _ => {}
     }
 }
@@ -2156,7 +2478,7 @@ fn parse_meta_items(pf: &crate::parser::ParsedFile, lo: usize, hi: usize) -> Vec
 }
 
 /// A string literal token's value; None when the token is no string.
-fn string_value(t: &[u8]) -> Option<String> {
+pub(crate) fn string_value(t: &[u8]) -> Option<String> {
     let (body, raw) = match t {
         [b'"', rest @ .., b'"'] => (rest, false),
         [b'r', rest @ ..] => {
@@ -2387,6 +2709,8 @@ fn doc_attr(prog: &Program, n: &AttrNode, file: u32, apos: u32, args: &Args, emi
                 }
                 if alias.starts_with(' ') || alias.ends_with(' ') { hard(pos, "`#[doc(alias = \"...\")]` cannot start or end with ' '"); return; }
                 if n.is_crate { hard(pos, "`#![doc(alias = \"...\")]` isn't allowed as a crate-level attribute"); return; }
+                // check_attr.rs check_doc_alias_value: an alias is not the item's own name
+                if n.inner.is_empty() && prog.syms.str(prog.def(n.d).name) == alias { hard(pos, &format!("`#[doc(alias = \"{}\"]` is the same as the item's name", alias)); return; }
                 if aliases.contains(&alias) { emit(&UNUSED_ATTRIBUTES, pos, "doc alias is duplicated"); }
                 aliases.push(alias);
             };
@@ -2715,6 +3039,28 @@ fn back_kw_pos(pf: &crate::parser::ParsedFile, at: u32, kw: &str) -> u32 {
     if j >= n && pf.bytes(j - n, j) == kw.as_bytes() { j - n } else { at }
 }
 
+// ---------------------------------------------------------------- semicolon_in_expressions_from_macros
+
+pub const SEMICOLON_IN_EXPRESSIONS_FROM_MACROS: Lint = lint::lint("semicolon_in_expressions_from_macros");
+
+/// rustc_expand ParserAnyMacro::make: a local `macro_rules!` expansion parsed as an expression
+/// that ends with a `;`. The parser records the `;` (only under `makepad check`).
+fn trailing_semis(prog: &Program, own: &[bool]) {
+    let mut seen = std::collections::HashSet::new();
+    for t in crate::macros::uses::take_trailing_semis() {
+        let Some(file) = prog.file_paths.iter().position(|p| *p == t.file) else { continue };
+        let krate = prog.file_crate.get(file).copied().unwrap_or(u32::MAX);
+        if !own.get(krate as usize).copied().unwrap_or(false) { continue; }
+        // `is_local`: the macro is defined in the crate that calls it
+        let local = prog.file_paths.iter().position(|p| *p == t.def_file).is_some_and(|f| prog.file_crate.get(f).copied() == Some(krate));
+        if !local { continue; }
+        if !seen.insert((file, t.semi)) { continue; }
+        let pf = &prog.files[file];
+        let def = enclosing_def(prog, file as u32, pf.lint_pos(t.call), krate);
+        emit(prog, def, &SEMICOLON_IN_EXPRESSIONS_FROM_MACROS, file as u32, t.semi, "trailing semicolon in macro used in expression position");
+    }
+}
+
 // ---------------------------------------------------------------- unused_macros / unused_macro_rules
 
 pub const UNUSED_MACROS: Lint = lint::lint("unused_macros");
@@ -2725,6 +3071,7 @@ pub const UNUSED_MACRO_RULES: Lint = lint::lint("unused_macro_rules");
 /// expansion matched.
 pub fn finish(prog: &Program, own: &[bool]) {
     if !lint::enabled() { return; }
+    trailing_semis(prog, own);
     let (defs, used) = crate::macros::uses::take();
     if defs.is_empty() { return; }
     // Bodies nothing demanded are never expanded, so an invocation inside one leaves no record:
