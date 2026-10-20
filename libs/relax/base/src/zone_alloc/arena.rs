@@ -417,40 +417,40 @@ mod os {
         if mprotect(p.cast(), size, 1 | 2) != 0 {
             return false;
         }
+        #[cfg(target_os = "macos")]
+        {
+            madvise(p.cast(), size, 8);
+        } // MADV_FREE_REUSE, balances FREE_REUSABLE
         true
     }
+    /// `zero`: the next commit of this range must read as zeros (macOS only needs work for it:
+    /// MADV_FREE_REUSABLE keeps the old bytes until the kernel reclaims them, so the range is
+    /// replaced by a fresh PROT_NONE mapping, which also drops its pages at once).
     /// Returns the pages to the OS and keeps the mapping readable and writable.
     pub unsafe fn release(p: *mut u8, size: usize) -> bool {
-        // macOS: a fresh read-write mapping drops the pages at once (MADV_FREE_REUSABLE keeps them
-        // in the resident size until the kernel wants them) and stays usable
         #[cfg(target_os = "macos")]
-        {
-            mmap(p.cast(), size, 1 | 2, 2 | ANON | 0x10, -1, 0) as usize == p as usize
-        }
+        const ADVICE: i32 = 7; // MADV_FREE_REUSABLE
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            madvise(p.cast(), size, 4) == 0 // MADV_DONTNEED
-        }
+        const ADVICE: i32 = 4; // MADV_DONTNEED
+        madvise(p.cast(), size, ADVICE) == 0
     }
     pub unsafe fn decommit(p: *mut u8, size: usize, zero: bool) -> bool {
-        // macOS: a fresh PROT_NONE mapping drops the pages at once and zeroes them; MADV_FREE_REUSABLE
-        // would keep them in the resident size until the kernel wants them
         #[cfg(target_os = "macos")]
-        {
-            let _ = zero;
-            // MAP_PRIVATE | MAP_ANON | MAP_FIXED
-            mmap(p.cast(), size, 0, 2 | ANON | 0x10, -1, 0) as usize == p as usize
-        }
+        const ADVICE: i32 = 7; // MADV_FREE_REUSABLE: removed from task footprint now
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            let _ = zero;
-            if madvise(p.cast(), size, 4) != 0 { // MADV_DONTNEED
-                return false;
-            }
-            // Keep the address reservation, and make stale payload access fault.
-            mprotect(p.cast(), size, 0);
-            true
+        const ADVICE: i32 = 4; // MADV_DONTNEED
+        #[cfg(target_os = "macos")]
+        if zero {
+            // MAP_PRIVATE | MAP_ANON | MAP_FIXED
+            return mmap(p.cast(), size, 0, 2 | ANON | 0x10, -1, 0) as usize == p as usize;
         }
+        let _ = zero;
+        if madvise(p.cast(), size, ADVICE) != 0 {
+            return false;
+        }
+        // Keep the address reservation, and make stale payload access fault.
+        mprotect(p.cast(), size, 0);
+        true
     }
 }
 
