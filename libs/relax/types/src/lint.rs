@@ -561,7 +561,7 @@ pub fn attrs_at_call(prog: &Program, owner: DefId, file: u32, call: u32) -> Vec<
         fn expr(&mut self, e: ExprId) {
             if self.found.is_some() { return; }
             let lo = self.ast.expr(e).lo;
-            if self.pf.lint_pos(lo) == self.call { self.found = Some(self.stack.clone()); return; }
+            if lo as usize >= self.pf.src_len as usize && self.pf.diagnostic_pos(lo) == self.call { self.found = Some(self.stack.clone()); return; }
             ast_visit::walk_expr(self, e);
         }
     }
@@ -569,7 +569,7 @@ pub fn attrs_at_call(prog: &Program, owner: DefId, file: u32, call: u32) -> Vec<
     if od.file != file || od.item.0 == u32::MAX { return Vec::new(); }
     let pf = &prog.files[od.file as usize];
     let ast = &pf.ast;
-    let mut f = Find { ast, pf, call, stack: Vec::new(), found: None };
+    let mut f = Find { ast, pf, call: pf.diagnostic_pos(call), stack: Vec::new(), found: None };
     match ast.item(od.item).kind {
         ItemKind::Fn(..) => {
             if let Ok(Some(b)) = prog.fn_body(od.file, od.item) { f.block(b); }

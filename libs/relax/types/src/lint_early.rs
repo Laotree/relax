@@ -3118,7 +3118,7 @@ fn trailing_semis(prog: &Program, own: &[bool]) {
         if !seen.insert((file, t.semi, t.call)) { continue; }
         let pf = &prog.files[file];
         let def = enclosing_def(prog, file as u32, pf.lint_pos(t.call), krate);
-        let attrs = lint::attrs_at_call(prog, def, file as u32, pf.lint_pos(t.call));
+        let attrs = lint::attrs_at_call(prog, def, file as u32, t.call);
         emit_in(prog, def, &attrs, &SEMICOLON_IN_EXPRESSIONS_FROM_MACROS, file as u32, t.semi, "trailing semicolon in macro used in expression position");
     }
 }
