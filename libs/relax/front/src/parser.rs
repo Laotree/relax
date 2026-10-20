@@ -157,6 +157,9 @@ pub struct Parser<'a> {
     foreign_abi: Option<Option<Ident>>,
     /// inside a cfg'd-out item (parse_cfg_out): nothing is generated
     cfg_out: u32,
+    /// the statement macro whose expansion is being parsed was called with a `;` after it: its
+    /// last statement gets that `;` (rustc add_trailing_semicolon), so it is not a trailing macro
+    expansion_semi: bool,
     /// attributes whose shape is checked once their item is known to be configured in (check only)
     pending_shape: Vec<(TokRange, Option<PErr>)>,
 }
@@ -223,6 +226,7 @@ impl<'a> Parser<'a> {
             include_as_expr: false,
             foreign_abi: None,
             cfg_out: 0,
+            expansion_semi: false,
             pending_shape: Vec::new(),
         }
     }
@@ -1226,12 +1230,6 @@ impl<'a> Parser<'a> {
         if crate::lexer::validation_enabled() {
             if let Some(d) = scope.local.last() {
                 crate::macros::check_rules(d, edition).map_err(|msg| PErr { pos: name.lo, msg })?;
-                // (macros an expansion defines were checked in the macro that wrote them)
-                if crate::macros::uses::recording() && (name.lo as usize) < self.src.len() {
-                    for msg in crate::macro_check::lints(d) {
-                        crate::macros::uses::meta_variable_misuse(file, name.lo, msg);
-                    }
-                }
             }
         }
         Ok(())
@@ -1823,12 +1821,11 @@ impl<'a> Parser<'a> {
             self.pos = save;
             return Ok(None);
         }
-        // (an `Eof` after the call ends an enclosing expansion: a statement macro, nothing is linted)
-        let trailing = delim != b'{' && self.kind() == T::CloseBrace;
+        let trailing = delim != b'{' && (self.kind() == T::CloseBrace || (self.kind() == T::Eof && !self.expansion_semi));
         // rustc_parse `parse_stmt_mac`: a call ending its block without `;` is an expression statement,
         // expanded as one expression (an `Eof` after it is the end of an enclosing expansion: a statement)
         let tail_expr = delim != b'{' && self.kind() == T::CloseBrace && def.builtin == 0 && crate::lexer::validation_enabled() && (lo as usize) < self.src.len();
-        self.eat(T::Semi);
+        let had_semi = self.eat(T::Semi);
         self.include_as_expr = as_expr;
         self.cfg_select_rest.borrow_mut().clear();
         let start = self.expand_call(&def, toks, lo);
@@ -1849,7 +1846,10 @@ impl<'a> Parser<'a> {
                 crate::macros::uses::trailing_semi(&file, semi, lo, &def.def_file);
             }
         }
-        let r = self.in_expansion(start, |p| f(p, include, tail_expr))?;
+        let outer = std::mem::replace(&mut self.expansion_semi, had_semi);
+        let r = self.in_expansion(start, |p| f(p, include, tail_expr));
+        self.expansion_semi = outer;
+        let r = r?;
         self.parse_cfg_select_rest(rest, if as_expr { 1 } else { 2 })?;
         Ok(Some(r))
     }
@@ -5420,6 +5420,25 @@ impl ParsedFile {
     }
 
     /// Token `i`: the file's, then its lazily parsed bodies' expansion tokens.
+    /// The position of the `self` receiver token of the function item starting at `item_lo` (the
+    /// item's start when it has none in its parameter list): its hygiene context is the receiver's
+    /// own, which a macro may have passed in from the call site.
+    pub fn self_param_pos(&self, item_lo: u32) -> u32 {
+        let mut i = self.toks.partition_point(|t| t.lo < item_lo) as u32;
+        let mut depth = 0i32;
+        while (i as usize) < self.toks.len() {
+            match self.tok(i).kind {
+                T::OpenParen => depth += 1,
+                T::CloseParen => { depth -= 1; if depth <= 0 { break; } }
+                T::KwSelfValue if depth == 1 => return self.tok(i).lo,
+                T::OpenBrace | T::Semi if depth == 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        item_lo
+    }
+
     pub fn tok(&self, i: u32) -> Tok {
         match self.toks.get(i as usize) {
             Some(t) => t,
@@ -5530,6 +5549,18 @@ impl ParsedFile {
             return ExpnKind::Builtin;
         }
         ExpnKind::Root
+    }
+
+    /// An identity for the expansion whose text holds `pos`: 0 for the file's own text, the start
+    /// of the `macro_rules!` output region for a rules expansion, 1 for derive / attribute /
+    /// built-in output.
+    pub fn expansion_region_id(&self, pos: u32) -> u32 {
+        if pos < self.src_len { return 0; }
+        let rules = self.part_at(pos).map_or(&self.rules_exp, |p| &p.rules_exp);
+        if let Some((_, r)) = OSegRef::from(rules).floor(pos) {
+            if pos < r.1 { return r.0.max(2); }
+        }
+        1
     }
 
     /// Which kind of expansion's text holds position `pos` (not following the origin of a token

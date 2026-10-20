@@ -78,6 +78,12 @@ pub(crate) struct RuleInput {
     local_inner: bool,
 }
 
+impl MacroDef {
+    /// The tokens of the definition's body (`(matcher) => {transcriber};*`) when the macro was
+    /// parsed from source in this process.
+    pub fn input_tokens(&self) -> Option<&[MTok]> { self.input.as_ref().map(|i| &i.tokens[..]) }
+}
+
 pub type MacroRef = std::sync::Arc<MacroDef>;
 
 /// The crate name of a macro-table crate key (`<name>\u{1}lib`: a lib shadowed by its bin).
@@ -1901,11 +1907,6 @@ pub mod uses {
         SEMIS.lock().unwrap_or_else(|e| e.into_inner()).push(TrailingSemi { file: file.to_string(), semi, call, def_file: def_file.to_string() });
     }
 
-    static META_LINTS: Mutex<Vec<(String, u32, String)>> = Mutex::new(Vec::new());
-    /// A `meta_variable_misuse` lint of the `macro_rules!` written at `pos` of `file` (macro_check).
-    pub fn meta_variable_misuse(file: &str, pos: u32, msg: String) { META_LINTS.lock().unwrap_or_else(|e| e.into_inner()).push((file.to_string(), pos, msg)); }
-    pub fn take_meta_variable_misuse() -> Vec<(String, u32, String)> { std::mem::take(&mut *META_LINTS.lock().unwrap_or_else(|e| e.into_inner())) }
-
     pub fn take_trailing_semis() -> Vec<TrailingSemi> {
         std::mem::take(&mut *SEMIS.lock().unwrap_or_else(|e| e.into_inner()))
     }
@@ -1916,7 +1917,7 @@ pub mod uses {
     }
 }
 
-fn is_open(k: T) -> bool {
+pub(crate) fn is_open(k: T) -> bool {
     matches!(k, T::OpenParen | T::OpenBracket | T::OpenBrace)
 }
 fn is_close(k: T) -> bool {
@@ -1924,7 +1925,7 @@ fn is_close(k: T) -> bool {
 }
 
 /// Index of the token closing the group opened at `i`.
-fn close_of(toks: &[MTok], i: usize) -> usize {
+pub(crate) fn close_of(toks: &[MTok], i: usize) -> usize {
     let mut depth = 0i32;
     let mut j = i;
     while j < toks.len() {
@@ -1973,7 +1974,7 @@ fn is_rep_op(t: &MTok) -> Option<u8> {
 }
 
 /// `$( .. )` at `i` (pointing at `$`): returns (inner range, separator, op, next index).
-fn rep_at(toks: &[MTok], i: usize) -> Option<(usize, usize, Option<MTok>, u8, usize)> {
+pub(crate) fn rep_at(toks: &[MTok], i: usize) -> Option<(usize, usize, Option<MTok>, u8, usize)> {
     let open = i + 1;
     let close = close_of(toks, open);
     let mut k = close + 1;
