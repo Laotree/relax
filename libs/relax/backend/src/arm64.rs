@@ -643,8 +643,9 @@ struct Gen<'a> {
     sym_class: u64,
     /// sp offset of the frame word holding the domain base (-1: the function names no domain symbol)
     dom_slot: i64,
-    /// the block whose start reads the domain base into that slot (usize::MAX: none; 0: the prologue)
-    dom_block: usize,
+    /// per block: whether its start reads the domain base into that slot (block 0: the prologue;
+    /// empty: the function names no domain symbol)
+    dom_read: Vec<bool>,
     relocs: Vec<RelocAt>,
     text_words: usize,
     pc_map: Vec<(u32, u64)>,
@@ -960,8 +961,12 @@ impl<'a> Gen<'a> {
         // the domain base, read once (where regalloc::domain_base_block puts it) when the function
         // names a domain static
         let reach = regalloc::reachable(self.f);
-        let dom_fp = if let Some(b) = regalloc::domain_base_block(self.f, self.sym_class, &reach) {
-            self.dom_block = b;
+        let reads = regalloc::domain_base_blocks(self.f, self.sym_class, &reach);
+        let dom_fp = if !reads.is_empty() {
+            self.dom_read = vec![false; self.f.blocks.len()];
+            for b in reads {
+                self.dom_read[b] = true;
+            }
             off += 8;
             off
         } else {
@@ -987,7 +992,7 @@ impl<'a> Gen<'a> {
         self.stack_probe(frame);
         self.a.add_any(SP, SP, -frame);
         self.callee_saves(true);
-        if self.dom_block == 0 {
+        if self.dom_read.first() == Some(&true) {
             self.dom_base();
         }
         if self.cplan.is_some() {
@@ -1013,7 +1018,7 @@ impl<'a> Gen<'a> {
             if !reach[bi] {
                 continue;
             }
-            if bi == self.dom_block && bi != 0 {
+            if bi != 0 && self.dom_read.get(bi) == Some(&true) {
                 self.dom_base();
             }
             let b = &self.f.blocks[bi];
@@ -3499,7 +3504,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         apool: Vec::new(),
         sym_class: env.sym_class,
         dom_slot: -1,
-        dom_block: usize::MAX,
+        dom_read: Vec::new(),
         relocs: Vec::new(),
         text_words: 0,
         pc_map: Vec::new(),

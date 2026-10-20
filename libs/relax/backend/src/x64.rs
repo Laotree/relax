@@ -687,8 +687,9 @@ struct Gen<'a> {
     sym_class: u64,
     /// rbp offset of the frame word holding the domain base (0: the function names no domain symbol)
     dom_slot: i32,
-    /// the block whose start reads the domain base into that slot (usize::MAX: none; 0: the prologue)
-    dom_block: usize,
+    /// per block: whether its start reads the domain base into that slot (block 0: the prologue;
+    /// empty: the function names no domain symbol)
+    dom_read: Vec<bool>,
     relocs: Vec<RelocAt>,
     /// emission order successor of each block (u32::MAX for the last)
     next_block: Vec<u32>,
@@ -1034,10 +1035,14 @@ impl<'a> Gen<'a> {
         self.stage = -(self.saved + off);
         // the domain base, read once (where regalloc::domain_base_block puts it) when the function
         // names a domain static
-        if let Some(b) = regalloc::domain_base_block(self.f, self.sym_class, &reach) {
+        let reads = regalloc::domain_base_blocks(self.f, self.sym_class, &reach);
+        if !reads.is_empty() {
             off += 8;
             self.dom_slot = -(self.saved + off);
-            self.dom_block = b;
+            self.dom_read = vec![false; self.f.blocks.len()];
+            for b in reads {
+                self.dom_read[b] = true;
+            }
         }
         let mut frame = (off + 7) / 8 * 8;
         // keep rsp 16-aligned at calls
@@ -1047,7 +1052,7 @@ impl<'a> Gen<'a> {
         self.frame = frame;
         self.stack_probe(frame);
         self.a.sub_rsp(frame as u32);
-        if self.dom_block == 0 {
+        if self.dom_read.first() == Some(&true) {
             self.dom_base();
         }
         if self.cplan.is_some() {
@@ -1110,7 +1115,7 @@ impl<'a> Gen<'a> {
                 continue;
             }
             self.block_pos[bi] = self.a.pos();
-            if bi == self.dom_block && bi != 0 {
+            if bi != 0 && self.dom_read.get(bi) == Some(&true) {
                 self.dom_base();
             }
             let b = &self.f.blocks[bi];
@@ -1986,7 +1991,7 @@ impl<'a> Gen<'a> {
             let b = &self.f.blocks[bi];
             let Term::Jump(t) = b.term else { continue };
             // the block that reads the domain base is not skipped, whatever else it holds
-            if !reach[bi] || t as usize == bi || bi == self.dom_block {
+            if !reach[bi] || t as usize == bi || self.dom_read.get(bi) == Some(&true) {
                 continue;
             }
             let silent = b.insts.iter().enumerate().all(|(ii, i)| match *i {
@@ -4440,7 +4445,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         apool: Vec::new(),
         sym_class: env.sym_class,
         dom_slot: 0,
-        dom_block: usize::MAX,
+        dom_read: Vec::new(),
         relocs: Vec::new(),
         cplan: None,
         cbuf: Vec::new(),

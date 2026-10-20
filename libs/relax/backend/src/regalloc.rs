@@ -979,6 +979,23 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         order.sort_by(|a, b| weight[*b as usize].partial_cmp(&weight[*a as usize]).unwrap_or(std::cmp::Ordering::Equal).then(first[*a as usize].cmp(&first[*b as usize])));
     }
     call_pos.sort();
+    // weight of each call's block (call_pos order)
+    let call_w: Vec<f32> = call_pos.iter().map(|&p| wts[block_start.partition_point(|&s| s <= p) - 1]).collect();
+    // summed weight of the calls strictly inside a value's ranges
+    let cross_w = |r: &[(u32, u32)]| -> f32 {
+        let mut w = 0.0;
+        for (a, b) in r {
+            let from = call_pos.partition_point(|p| *p <= *a);
+            for k in from..call_pos.len() {
+                if call_pos[k] >= *b {
+                    break;
+                }
+                w += call_w[k];
+            }
+        }
+        w
+    };
+    let entry_w = wts.first().copied().unwrap_or(1.0).max(1e-6);
     let crosses = |r: &[(u32, u32)]| -> bool {
         for (a, b) in r {
             // first call strictly after a
@@ -1041,6 +1058,21 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         let r = rng(v);
         let is_int = f.vregs[v as usize] == Cls::I;
         let crossing = crosses(r);
+        // crossing only calls that run rarely next to the function's entry (error paths of a
+        // `Result` fn, a slow path): a caller-saved register saved around those calls costs less
+        // than a callee-saved one, whose push / pop runs on every call of the function
+        let cold_cross = crossing && cross_w(r) < 0.5 * entry_w;
+        // a recomputed value never pays for a call: no callee-saved register (push / pop on
+        // every entry) and no saves around calls; it is recomputed after them instead
+        if crossing && remat[v as usize].is_some() {
+            loc[v as usize] = Loc::None;
+            if let Some(m) = unit_members(v) {
+                for &u in m {
+                    loc[u as usize] = Loc::None;
+                }
+            }
+            continue;
+        }
         let (caller, callee) = if is_int { (&cfg.int_caller, &cfg.int_callee) } else { (&cfg.flt_caller, &cfg.flt_callee) };
         // a vector crossing a call goes to a caller-saved register (saved/restored around
         // the call in 16 bytes): arm64's callee-saved d8-d15 keep only the low 64 bits
@@ -1072,7 +1104,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                 n_aff += 1;
             }
         }
-        if crossing {
+        if crossing && !cold_cross {
             cands.extend_from_slice(callee);
             cands.extend_from_slice(caller);
         } else {
@@ -1089,14 +1121,14 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         };
         if let Some(u) = ahead {
             let ru = rng(u);
-            if let Some(k) = cands.iter().position(|&c| !overlaps(&occ[base + c as usize], r) && !overlaps(&occ[base + c as usize], ru) && !(crossing && !callee.is_empty() && !callee.contains(&c))) {
+            if let Some(k) = cands.iter().position(|&c| !overlaps(&occ[base + c as usize], r) && !overlaps(&occ[base + c as usize], ru) && !(crossing && !cold_cross && !callee.is_empty() && !callee.contains(&c))) {
                 let c = cands.remove(k);
                 cands.insert(0, c);
             }
         }
         let mut chosen = None;
         for (k, &c) in cands.iter().enumerate() {
-            if k < n_aff && crossing && !callee.contains(&c) && callee.len() > 0 {
+            if k < n_aff && crossing && !cold_cross && !callee.contains(&c) && callee.len() > 0 {
                 // a partner's caller-saved register across a call costs saves; let a free
                 // callee-saved register win
                 let mut callee_free = false;
@@ -1168,6 +1200,24 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             for &u in m {
                 loc[u as usize] = l;
             }
+        }
+    }
+    // MAKEPAD_RUN_RA_TRACE=<fn suffix>: why each value spilled (weight, length, unit) and which
+    // allocated values hold each register over its ranges
+    if trace_on(f) {
+        for v in 0..nv as usize {
+            if !matches!(loc[v], Loc::Stack(_)) || f.vregs[v] != Cls::I {
+                continue;
+            }
+            let r = rng(v as u32);
+            let len: u32 = r.iter().map(|(a, b)| b - a + 1).sum();
+            let unit = unit_members(v as u32).map(|m| m.len()).unwrap_or(0);
+            let mut by: Vec<String> = Vec::new();
+            for &c in cfg.int_caller.iter().chain(cfg.int_callee.iter()) {
+                let hold: Vec<String> = (0..nv as usize).filter(|&u| loc[u] == Loc::Reg(c) && ranges_meet(rng(u as u32), r)).map(|u| format!("v{}({:.3})", u, weight[u])).collect();
+                by.push(format!("r{}:{}", c, hold.join("+")));
+            }
+            eprintln!("ra-spill {} v{} w={:.3} refs={:.2} len={} unit={} ranges={} | {}", f.name, v, weight[v], refs[v], len, unit, r.len(), by.join(" "));
         }
     }
     // spill slots shared along copies: a copy between two spilled values whose live ranges
@@ -3567,15 +3617,17 @@ pub fn sink_compares(f: &Func) -> Option<Func> {
     g
 }
 
-/// The block whose start reads the running thread's domain base for a function that names domain
-/// symbols (`SymClass::Domain`): the nearest block that dominates every use, lifted to the
+/// The blocks whose start reads the running thread's domain base for a function that names domain
+/// symbols (`SymClass::Domain`), in block order: per block that names one, that block lifted to the
 /// shallowest loop depth on its chain of dominators (the base is the same on every iteration, so
-/// it is read outside the loops that hold the uses, and not at all on paths that never get there:
-/// html_parse's `process_entity` names an entity table only after it has seen a `&`, and used to
-/// read the base on every call). None: the function names no domain symbol.
-pub fn domain_base_block(f: &Func, sym_class: u64, reach: &[bool]) -> Option<usize> {
+/// it is read outside the loops that hold the uses), minus those another read dominates. Paths that
+/// never name a domain symbol never read the base: html_parse's `process_entity` names an entity
+/// table only after it has seen a `&`, and a `Result` fn names its error statics only on the
+/// error returns (read_pb_varint read the base on its hot 1-byte path, at the uses' common
+/// dominator). Empty: the function names no domain symbol.
+pub fn domain_base_blocks(f: &Func, sym_class: u64, reach: &[bool]) -> Vec<usize> {
     if sym_class == 0 {
-        return None;
+        return Vec::new();
     }
     let uses: Vec<usize> = f
         .blocks
@@ -3584,7 +3636,9 @@ pub fn domain_base_block(f: &Func, sym_class: u64, reach: &[bool]) -> Option<usi
         .filter(|(bi, b)| reach[*bi] && b.insts.iter().any(|i| matches!(i, Inst::Addr(_, s) if SymClass::of(sym_class, s.id) == SymClass::Domain)))
         .map(|(bi, _)| bi)
         .collect();
-    let first = *uses.first()?;
+    if uses.is_empty() {
+        return Vec::new();
+    }
     let idom = crate::dom::idoms(f);
     // the dominator chain of a block, block first, entry last
     let chain = |mut b: usize| {
@@ -3595,20 +3649,26 @@ pub fn domain_base_block(f: &Func, sym_class: u64, reach: &[bool]) -> Option<usi
         }
         c
     };
-    // nearest common dominator: the longest common suffix of the chains
-    let mut common = chain(first);
-    for &u in &uses[1..] {
-        let c = chain(u);
-        let k = common.iter().rev().zip(c.iter().rev()).take_while(|(a, b)| a == b).count();
-        common.drain(..common.len() - k);
-    }
     let depth = loop_depths(f, reach);
-    // from the common dominator up to the entry: the shallowest loop depth, the latest on a tie
-    let mut best = common[0];
-    for &b in &common {
-        if depth[b] < depth[best] {
-            best = b;
+    let mut reads: Vec<usize> = Vec::new();
+    let mut chains: Vec<Vec<usize>> = Vec::new();
+    for &u in &uses {
+        // from the use's block up to the entry: the shallowest loop depth, the latest on a tie
+        let c = chain(u);
+        let mut best = c[0];
+        for &b in &c {
+            if depth[b] < depth[best] {
+                best = b;
+            }
+        }
+        if !reads.contains(&best) {
+            reads.push(best);
+            chains.push(chain(best));
         }
     }
-    Some(best)
+    // a read another read dominates (on its dominator chain) is redundant
+    let keep: Vec<bool> = (0..reads.len()).map(|k| !(0..reads.len()).any(|j| j != k && chains[k][1..].contains(&reads[j]))).collect();
+    let mut out: Vec<usize> = reads.iter().zip(&keep).filter(|x| *x.1).map(|x| *x.0).collect();
+    out.sort_unstable();
+    out
 }
