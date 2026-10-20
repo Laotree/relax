@@ -110,8 +110,9 @@ impl UniversalRegionsBuilder<'_> {
             // bound by an enclosing callable. Instantiate that outer binder as
             // external query identities before the ordinary erased-region pass.
             let raw: Vec<_> = inputs.iter().copied().chain([output]).collect();
-            let mut replaced = crate::borrowck::implied_bounds::replace_erased_regions_with_placeholders(tcx,&raw);
-            let next = std::cell::Cell::new(crate::borrowck::implied_bounds::implied_bounds_query_var_values(tcx,&replaced,
+            let base = self.parent.as_ref().map_or(0,|p| p.regions.iter().filter(|u| matches!(u.identity,Identity::Region(_,r) if matches!(tcx.tys.region_kind(r),RegionKind::RePlaceholder { .. }))).count() as u32);
+            let mut replaced = crate::borrowck::implied_bounds::replace_erased_regions_with_placeholders(tcx,&raw,base);
+            let next = std::cell::Cell::new(base + crate::borrowck::implied_bounds::implied_bounds_query_var_values(tcx,&replaced,
                 |r| matches!(tcx.tys.region_kind(r),RegionKind::RePlaceholder { .. })).len() as u32);
             let outer = std::cell::RefCell::new(crate::fxhash::HashMap::default());
             replaced = replaced.into_iter().map(|ty| tcx.tys.map_regions(ty,&|r,depth| {

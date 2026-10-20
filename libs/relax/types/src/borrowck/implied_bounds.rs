@@ -461,7 +461,9 @@ pub fn implied_bounds_query_var_values(tcx: &Tcx, inputs_and_output: &[TyId], is
     }
     values.into_inner()
 }
-pub fn replace_erased_regions_with_placeholders(tcx: &Tcx, inputs_and_output: &[TyId]) -> Vec<TyId> {
+/// The placeholders are numbered from `base`: a nested body's are numbered after those it inherits from its creator,
+/// so that its own external regions stay different from the creator's.
+pub fn replace_erased_regions_with_placeholders(tcx: &Tcx, inputs_and_output: &[TyId], base: u32) -> Vec<TyId> {
     use crate::types::fold::TypeFolder;
     struct Replacer { next: u32 }
     impl TypeFolder for Replacer {
@@ -472,6 +474,6 @@ pub fn replace_erased_regions_with_placeholders(tcx: &Tcx, inputs_and_output: &[
             } else { r }
         }
     }
-    let mut replacer = Replacer { next:0 };
+    let mut replacer = Replacer { next:base };
     inputs_and_output.iter().map(|&ty| replacer.fold_ty(&tcx.tys,ty,0)).collect()
 }

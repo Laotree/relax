@@ -970,3 +970,33 @@ fn the_witness_of_another_fns_future_is_made_on_demand() {
         pub fn user() { needs_send(holds()); needs_send(fine()); }", 2021);
     assert_eq!(errors.len(), 1, "{errors:?}");
 }
+
+#[test]
+fn a_nested_closures_erased_signature_regions_are_not_its_creators() {
+    // the inner closure's erased output region is its own external region; it must not be the outer closure's erased input region
+    let (errors, unchecked) = borrowck_source("
+        fn connected(c: &mut u32) -> Option<&mut u32> { Some(c) }
+        fn g(c: &mut u32) -> Option<u32> {
+            connected(c).and_then(|client| {
+                let revisions = vec![*client];
+                let previous = Some(1usize).and_then(|index| revisions.get(index))?;
+                Some(*previous)
+            })
+        }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_closures_higher_ranked_signature_regions_survive_normalization_under_the_binder() {
+    // higher-ranked/trait-bounds/normalize-under-binder/issue-89436.rs
+    let (errors, unchecked) = borrowck_source("
+        trait MiniYokeable<'a> { type Output; }
+        struct Bar<'a> { string_1: &'a str, string_2: &'a str }
+        impl<'a> MiniYokeable<'a> for Bar<'static> { type Output = Bar<'a>; }
+        impl<'a> MiniYokeable<'a> for &'static str { type Output = &'a str; }
+        fn map<Y: for<'a> MiniYokeable<'a>, P: for<'a> MiniYokeable<'a>>(y: Y, f: impl for<'a> FnOnce(<Y as MiniYokeable<'a>>::Output, core::marker::PhantomData<&'a ()>) -> <P as MiniYokeable<'a>>::Output) {}
+        fn demo(bar: Bar<'static>) { map::<_, &'static str>(bar, |bar, _| bar.string_1) }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
