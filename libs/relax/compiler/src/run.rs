@@ -199,6 +199,22 @@ pub(crate) enum ResolveFor {
 /// A package resolved to the crates that make it up: cargo's unit graph (or a saved one), the
 /// substitutions of provided crates, the build scripts run (their cfgs, env and link libraries),
 /// and each crate's cfg set. `makepad run` and `domain::start` build exactly this, then load.
+/// The host window's opening (boot of a hosted run), started by `resolve_package` and joined by
+/// `finish_window`.
+static PENDING_WINDOW: relax_session::sync::Mutex<Option<std::io::Result<std::thread::JoinHandle<Result<(), String>>>>> = relax_session::sync::Mutex::new(None);
+
+/// Waits for the host window the resolve started to open (it opens beside the load, which does not
+/// need it), and says whether the run is hosted (HAL_RUN).
+fn finish_window() -> Result<(), String> {
+    let Some(window) = PENDING_WINDOW.lock().unwrap().take() else { return Ok(()) };
+    let t_window = Instant::now();
+    let opened = window.map_err(|e| format!("opening the host window: {e}"))?.join().map_err(|_| "opening the host window: the thread panicked".to_string())?;
+    opened?;
+    if crate::preload::trace() { eprintln!("boot-trace: host window open, waited {:.1} ms for it after the load", t_window.elapsed().as_secs_f64() * 1e3); }
+    HAL_RUN.store(!MAIN_HOST.get().expect("run host").domain_zero, Ordering::Release);
+    Ok(())
+}
+
 pub(crate) struct Resolved {
     pub units: unitgraph::Units,
     pub g: unitgraph::Graph,
@@ -215,7 +231,21 @@ pub(crate) struct Resolved {
 static HANDOFF: relax_session::sync::Mutex<Option<Resolved>> = relax_session::sync::Mutex::new(None);
 
 pub(crate) fn take_boot_resolved() -> Option<Resolved> {
-    HANDOFF.lock().unwrap_or_else(|e| e.into_inner()).take()
+    let mut g = HANDOFF.lock().unwrap_or_else(|e| e.into_inner());
+    let taken = g.take();
+    clear_dead(&mut g);
+    taken
+}
+
+/// An `Option` taken out of a static keeps its payload bytes (only the discriminant changes):
+/// words in them that point into a compiler generation are dead, but the swap's static scan
+/// (MAKEPAD_RUN_ZONE_CHECK=2) and anyone reading raw memory would take them for roots. Zeroed.
+pub(crate) fn clear_dead<T>(slot: &mut Option<T>) {
+    debug_assert!(slot.is_none());
+    unsafe {
+        std::ptr::write_bytes(slot as *mut Option<T> as *mut u8, 0, std::mem::size_of::<Option<T>>());
+        std::ptr::write(slot, None);
+    }
 }
 
 pub(crate) fn resolve_package(
@@ -344,13 +374,9 @@ pub(crate) fn resolve_package(
         }
         cfgs.push(cs);
     }
-    if let Some(window) = window {
-        let t_window = Instant::now();
-        let opened = window.map_err(|e| format!("opening the host window: {e}"))?.join().map_err(|_| "opening the host window: the thread panicked".to_string())?;
-        opened?;
-        if crate::preload::trace() { eprintln!("boot-trace: host window open, waited {:.1} ms for it at the end of the resolve", t_window.elapsed().as_secs_f64() * 1e3); }
-        HAL_RUN.store(!MAIN_HOST.get().expect("run host").domain_zero, Ordering::Release);
-    }
+    // The window is still opening: the load goes on beside it and `finish_window` joins it where
+    // the run needs the host (before the program starts).
+    if let Some(window) = window { *PENDING_WINDOW.lock().unwrap() = Some(window); }
     Ok(Resolved { units, g, order, cfgs, live_inputs })
 }
 
@@ -1264,6 +1290,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     };
     let up: *mut Unit = &mut *u;
     unsafe { RUN_UNIT = up };
+    if let Err(e) = finish_window() {
+        eprintln!("makepad-run: {e}");
+        return 1;
+    }
     if !HAL_RUN.load(Ordering::Acquire) { crate::domain::register_boot(&package, u.syms.dom0()); }
     start_exit_summary();
     *RUN_DIAGNOSTICS.lock().unwrap() = Some(u.tcx.dcx.clone());
