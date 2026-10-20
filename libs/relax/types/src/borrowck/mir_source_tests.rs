@@ -545,3 +545,14 @@ fn an_async_closure_with_a_macro_body_orders_its_coroutine_before_it() {
     assert!(unchecked.iter().all(|u| u.contains("async closures")), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn a_nested_opaque_captures_the_items_lifetimes_through_the_enclosing_opaque() {
+    // Equal `'a`/`'b` are the same canonical argument of the nested opaque: a defining use, not a duplicate parameter.
+    let (errors, unchecked) = borrowck_source("
+        pub fn test<'a: 'b, 'b: 'a>() -> impl IntoIterator<Item = (&'a u8, impl Into<(&'b u8, &'a u8)>)> {
+            None::<(_, (_, _))>
+        }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}

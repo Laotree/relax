@@ -185,6 +185,7 @@ fn collect_defining_uses(tcx: &Tcx, prog: &Program, infcx: &mut dyn OpaqueOps, r
             }
         });
         if let Err(err) = infcx.opaque_type_has_defining_use_args(&non_nll_key) {
+            if std::env::var_os("GDUMP").is_some() { eprintln!("NONDEF key {:?} nll {:?} err {:?}", non_nll_key, key, err); }
             // A non-defining use. With the next solver this is not an error by itself: it is
             // ignored, and only reported if no defining use exists.
             if err == NonDefiningUseReason::Tainted {
@@ -535,7 +536,7 @@ impl OpaqueOps for BorrowckInferCtxt<'_> {
             }
         }
         for (_, param_indices) in seen_params {
-            if param_indices.len() > 1 { return Err(NonDefiningUseReason::DuplicateParam { opaque_type_key: key.clone(), param_indices }); }
+            if param_indices.len() > 1 { if std::env::var_os("GDUMP").is_some() { eprintln!("CANON {:?} edges", canonical.get().iter().map(|a| match a { GenericArg::Lifetime(r) => format!("{:?}", tys.region_kind(*r)), o => format!("{o:?}") }).collect::<Vec<_>>()); } return Err(NonDefiningUseReason::DuplicateParam { opaque_type_key: key.clone(), param_indices }); }
         }
         Ok(())
     }
@@ -585,11 +586,12 @@ fn canonical_opaque_args(tcx: &Tcx, prog: &Program, opaque: DefId) -> Vec<Generi
     // the opaque stands for.
     let mut args = tcx.generic_indices_of(prog, opaque).identity_args(tys);
     let generics = tcx.opaque_generics(prog, opaque);
+    let captured = tcx.opaque_captured_parent_lifetimes(prog, opaque);
     let n_parent_lifetimes = generics.parent.lifetimes.len();
     let indices = tcx.generic_indices_of(prog, opaque);
     for (k, &index) in indices.lifetimes.iter().enumerate().skip(n_parent_lifetimes) {
         let position = indices.lifetimes.iter().position(|&i| i == index).unwrap();
-        args[indices.lifetimes[position] as usize] = GenericArg::Lifetime(generics.captured_lifetimes[k - n_parent_lifetimes]);
+        args[indices.lifetimes[position] as usize] = GenericArg::Lifetime(captured[k - n_parent_lifetimes]);
     }
     // The free region relations of the parent's environment: declared bounds and the bounds its
     // signature implies.
