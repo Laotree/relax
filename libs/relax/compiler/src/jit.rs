@@ -4594,6 +4594,13 @@ impl Unit {
             if let Some(e) = self.refused_by_check(id) {
                 return Ok(unsafe { install_error(self, id, &e) });
             }
+            // D3: code lowered before the verdict lacks its run-time disjoint-index checks: it runs
+            // as unverified code and is built again with them
+            if !self.fns[id as usize].d3_lowered.load(Ordering::Relaxed) && self.disjoint_checks(id).is_some() {
+                self.fns[id as usize].unverified.store(true, Ordering::Relaxed);
+                self.fns[id as usize].rir = None;
+                tier_push(id, Q_RETIER, 0);
+            }
         }
         self.install_unchecked(id, code, relocs, pc_map, gen)
     }
@@ -4604,13 +4611,22 @@ impl Unit {
     /// checker rejects, whatever the background checker reached. Some(error) refuses it: the
     /// errors are printed here and the slot gets the error stub (the call ends the run).
     fn refused_by_check(&mut self, id: u32) -> Option<String> {
+        let events = self.check_first_events(id);
+        let first = events.first()?;
+        for ev in &events { eprintln!("{}", ev.error.render()); }
+        Some(format!("{} (the borrow checker rejects this body, so makepad run does not execute it)", first.error.one_line()))
+    }
+
+    /// `--check-first`: slot `id`'s owner checked now (or its verdict from this run / the disk cache); the
+    /// errors that refuse it.
+    fn check_first_events(&mut self, id: u32) -> Vec<crate::borrowck::event::GandalfEvent> {
         let options = &self.prog.session.clone().options;
-        if !crate::borrowck::lazy::gandalf_enabled(options) { return None; }
+        if !crate::borrowck::lazy::gandalf_enabled(options) { return Vec::new(); }
         let d = match &self.fns[id as usize].key {
             FnKey::Inst(d, _) if crate::borrowck::event::admit(&self.prog, self.prog.def(*d).krate) => *d,
-            _ => return None,
+            _ => return Vec::new(),
         };
-        crate::borrowck::body::CheckedBody::item(&self.prog, d)?;
+        if crate::borrowck::body::CheckedBody::item(&self.prog, d).is_none() { return Vec::new(); }
         let mut c = self.cache.take();
         let key = c.as_mut().and_then(|c| c.borrowck_key(self, id));
         let cached = match (&c, key) {
@@ -4625,10 +4641,18 @@ impl Unit {
             }
         }
         let src: std::sync::Arc<dyn crate::borrowck::lazy::FrontSource> = std::sync::Arc::new(BorrowckFront(self.front.clone()));
-        let events = crate::borrowck::lazy::check_before_run(&self.prog, &self.tcx, &src, d, epoch, key, cached);
-        let first = events.first()?;
-        for ev in &events { eprintln!("{}", ev.error.render()); }
-        Some(format!("{} (the borrow checker rejects this body, so makepad run does not execute it)", first.error.one_line()))
+        crate::borrowck::lazy::check_before_run(&self.prog, &self.tcx, &src, d, epoch, key, cached)
+    }
+
+    /// `--check-first` in a crate with relaxed Rust's `disjoint-index`: the check runs before the first
+    /// lowering of slot `id`, so its first code makes the verdict's run-time disjoint-index checks (the
+    /// install then takes this verdict).
+    pub(crate) fn check_before_lowering(&mut self, id: u32) {
+        if !CHECK_FIRST.load(Ordering::Relaxed) || self.fns[id as usize].compiled { return; }
+        let FnKey::Inst(d, _) = &self.fns[id as usize].key else { return };
+        let k = self.prog.def(*d).krate as usize;
+        if !self.prog.crates[k].relaxed(&self.prog).iter().any(|f| f == "disjoint-index") { return; }
+        let _ = self.check_first_events(id);
     }
 
     fn install_unchecked(&mut self, id: u32, code: &[u8], relocs: &[crate::rir::RelocAt], pc_map: Vec<(u32, u64)>, gen: u32) -> Result<u64, String> {
@@ -7247,6 +7271,7 @@ unsafe fn build_rir_mode(up: *mut Unit, id: u32, mode: RirMode) -> Result<(), St
 
 unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(), String> {
     let normal = mode == RirMode::Normal;
+    (&mut *up).check_before_lowering(id);
     // SPEC-V: no upgrade of a body without a clean verdict (its RIR stays baseline)
     if normal && !(&*up).refresh_verified(id) {
         return Ok(());

@@ -410,7 +410,7 @@ fn specv_aliased_call_from_unverified_body() {
 fn d3_disjoint_check_lowered_from_the_verdict() {
     const CHILD: &str = "MAKEPAD_RUN_D3_TEST";
     let Ok(case) = std::env::var(CHILD) else {
-        for case in ["relaxed", "strict"] {
+        for case in ["relaxed", "strict", "check-first"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lazy_reload_tests::d3_disjoint_check_lowered_from_the_verdict", "--nocapture", "--test-threads=1", "--format=terse"])
                 .env(CHILD, case).env("MAKEPAD_RUN_GANDALF_ALL", "0")
@@ -420,7 +420,8 @@ fn d3_disjoint_check_lowered_from_the_verdict() {
         return;
     };
     use std::sync::atomic::Ordering;
-    crate::jit::CHECK_FIRST.store(false, Ordering::Relaxed);
+    // `makepad run --check-first`: the check runs before the first lowering, so the first code has the check
+    crate::jit::CHECK_FIRST.store(case == "check-first", Ordering::Relaxed);
     std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::env::temp_dir().join(format!("relax-d3-{}-{}", case, std::process::id()));
     std::fs::create_dir_all(dir.join("app/src")).unwrap();
@@ -433,7 +434,7 @@ fn d3_disjoint_check_lowered_from_the_verdict() {
     std::env::set_var("MAKEPAD_RUN_LIVE_LOG", dir.join("live.jsonl"));
     let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
     let mut session = crate::Session::default();
-    session.options.relaxed = Some(if case == "relaxed" { "disjoint-index" } else { "none" }.to_string());
+    session.options.relaxed = Some(if case == "strict" { "none" } else { "disjoint-index" }.to_string());
     let session = Arc::new(session);
     let (prog, core, app_crate) = crate::load_with_std(&session, &app, "d3_app", false).unwrap();
     let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display(), crate::diag::quote(&app));
@@ -457,6 +458,12 @@ fn d3_disjoint_check_lowered_from_the_verdict() {
         let mut io = [i, j, 0usize];
         unsafe { crate::jit::call_jit(up, entry, &mut io as *mut [usize; 3] as u64) }.map(|_| io[2]).map_err(|p| p.message)
     };
+    if case == "check-first" {
+        assert_eq!(run(0, 1), Ok(116));
+        assert!(u.fns[id as usize].d3_lowered.load(Ordering::Relaxed), "checked before the first lowering");
+        assert!(run(1, 1).expect_err("the first code checks").contains("OverlappingIndices"));
+        continue;
+    }
     // unverified: the code runs as written (an overlap writes the one element twice). (The program's
     // other fns are checked in the background meanwhile: a later fn may have its verdict before
     // its first call, and then its first code is verified code.)
