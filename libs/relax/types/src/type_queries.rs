@@ -609,7 +609,7 @@ impl Providers<'_> {
             // a failure the evaluator already reported (its own "evaluation panicked" ..) is reported
             // once; one it left unreported (an overflow found while lowering) gets the generic E0080
             if let Err(ErrorHandled::Reported(error)) = &value {
-                if crate::infer::diagnostics::DiagCtxt::thread_emitted() == emitted {
+                if matches!(error, crate::const_eval::ValTreeCreationError::ErrorHandled(_)) && crate::infer::diagnostics::DiagCtxt::thread_emitted() == emitted {
                     let d = self.prog.def(key.def);
                     self.tcx.dcx.report(crate::next_solver::fulfill::ObligationCause {
                         body_id: key.def, span: self.prog.files[d.file as usize].ast.item(d.item).lo,
