@@ -13685,6 +13685,9 @@ pub(crate) fn lower_ahead_needs_unit() {
 /// front then only takes the RIR, so lowering runs on the program's threads in parallel, not on
 /// the one owner thread every lazy compile queues for).
 fn lower_ahead(f: &FrontShared, id: u32, own: bool) {
+    // not inside another lowering ahead (a compile its constant evaluation reached): this one's
+    // guard would end the outer one's temporary callee identities under it
+    if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(true) { return; }
     let _r = front_read("lower_ahead");
     if !f.alive.load(Ordering::SeqCst) || !own && !startup_phase() { return; }
     let Some(FnKey::Inst(d, args)) = f.slot_keys.get(&id) else { return; };
