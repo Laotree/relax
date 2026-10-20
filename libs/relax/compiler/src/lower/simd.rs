@@ -338,7 +338,15 @@ impl<'a> Lcx<'a> {
                             let y = self.lane_get(ops[1].0, ops[1].1, l, k);
                             let z = self.lane_get(ops[2].0, ops[2].1, l, k);
                             let d = self.f.vreg(Self::lane_cls(l));
-                            self.emit(Inst::FMulAdd(false, false, l.w() == VW::D, d, x, y, z));
+                            // relaxed_fma may round once or twice: rustc's x86-64 baseline (no FMA)
+                            // multiplies and adds, AArch64 fuses; Relax gives the same bits as rustc
+                            if name == "simd_relaxed_fma" && cfg!(target_arch = "x86_64") {
+                                let p = self.f.vreg(Self::lane_cls(l));
+                                self.emit(Inst::FBin(FOp::Mul, l.w() == VW::D, p, x, y));
+                                self.emit(Inst::FBin(FOp::Add, l.w() == VW::D, d, p, z));
+                            } else {
+                                self.emit(Inst::FMulAdd(false, false, l.w() == VW::D, d, x, y, z));
+                            }
                             d
                         }
                         "simd_round_ties_even" => {
