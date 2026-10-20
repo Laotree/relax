@@ -1913,7 +1913,9 @@ impl Program {
 
     fn commit_version_inner(&mut self, v: FileVersion, pairs: &[(u32, u32)], same_scopes: bool, visible: Option<&[bool]>) -> Result<u32, String> {
         let old = v.old;
+        let t_save = std::time::Instant::now();
         let declarations = DeclarationState::save(self, old, same_scopes, visible);
+        let save_ms = t_save.elapsed().as_secs_f64() * 1e3;
         // Old ASTs stay alive for running frames, but old reuse entries do not.
         self.parse_reuse.remove(&old);
         self.parse_reuse.insert(self.files.len() as u32, v.reuse);
@@ -1970,7 +1972,12 @@ impl Program {
         self.file_blocks.push(v.blocks);
         self.retarget_file(old, new, pairs);
         self.declaration_versions.insert(new, declarations);
-        if let Err(error) = self.collect_version_definitions(new, !same_scopes, true, visible) {
+        let t_collect = std::time::Instant::now();
+        let collected = self.collect_version_definitions(new, !same_scopes, true, visible);
+        if std::env::var_os("MAKEPAD_RUN_COMMIT_TRACE").is_some() {
+            eprintln!("commit-trace: save {:.2} ms, collect definitions {:.2} ms, rest {:.2} ms", save_ms, t_collect.elapsed().as_secs_f64() * 1e3, t_save.elapsed().as_secs_f64() * 1e3 - save_ms - t_collect.elapsed().as_secs_f64() * 1e3);
+        }
+        if let Err(error) = collected {
             self.revert_version(old, new, pairs);
             return Err(error);
         }

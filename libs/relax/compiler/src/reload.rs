@@ -4016,6 +4016,10 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
             if stamp(&f.0) != f.2 { continue; }
             let seen = Instant::now();
             let mut o = apply_mode(up, vec![Edit { file: f.1, path: f.0.clone(), src }], 0, false);
+            if o.rung == Rung::Refuse {
+                // still refused: it was reported when it was saved
+                continue;
+            }
             if o.rung != Rung::Patch {
                 o.lines = refusal_lines(first, std::mem::take(&mut o.lines));
                 log_edit(&f.0, &o, f.2.map(|s| s.0), seen);
@@ -4196,11 +4200,16 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
         if incomplete {
             for (&k, src) in which.iter().zip(originals) { stalled.insert(k, (Instant::now(), src, if o.rung == Rung::Refuse { o.lines.clone() } else { Vec::new() })); }
         }
+        let what = names.join(", ");
         if o.rung == Rung::Refuse {
-            // Diagnostics are emitted only by the stalled-file check above.
+            // reported at once (the AI loop's feedback must not wait); the silence re-check above
+            // stays as a retry and says nothing more while it is still refused
+            log_edit(&what, &o, saved, seen);
+            eprintln!("makepad live: {}: NOT applied (errors below); the app runs the previous code", what);
+            for l in &o.lines { eprintln!("makepad live:   {}", l); }
+            patch_refused_event(&what, true, &o.lines);
             continue;
         }
-        let what = names.join(", ");
         if o.rung == Rung::Restart {
             RESTART_SAVED_MS.store(saved.map_or(0.0, unix_ms) as u64, std::sync::atomic::Ordering::Relaxed);
         }
