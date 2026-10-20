@@ -2215,7 +2215,7 @@ impl<'a> Gen<'a> {
             // recomputed at each use (Alloc::remat)
             Inst::Iconst(d, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::Mov(d, _) if self.al.remat[d.0 as usize].is_some() => {}
             Inst::Sel(d, c, a, b) => self.sel(options, *d, *c, *a, *b),
-            Inst::VSel(..) | Inst::VFma(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) | Inst::VLoad(..) | Inst::VStore(..) | Inst::VAny(..) | Inst::VGather(..) | Inst::VConst(..) => self.vinst(options, i),
+            Inst::VShuffle(..) | Inst::VSel(..) | Inst::VFma(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) | Inst::VLoad(..) | Inst::VStore(..) | Inst::VAny(..) | Inst::VGather(..) | Inst::VConst(..) => self.vinst(options, i),
             Inst::VX(op, d, a, b) => self.vx(options, *op, *d, *a, *b),
             Inst::VX3(op, d, a, b, c) => self.vx3(*op, *d, *a, *b, *c),
             Inst::FMulAdd(np, na, w, d, a, b, c) => self.fma(*np, *na, *w, *d, *a, *b, *c),
@@ -3240,6 +3240,7 @@ impl<'a> Gen<'a> {
     /// 128-bit vector instructions (SSE4.1; AVX2 for per-lane shifts, FMA3 for VFma).
     fn vinst(&mut self, options: &relax_session::Options, i: &Inst) {
         match *i {
+            Inst::VShuffle(..) => unreachable!("vector shuffles are legalised before emission"),
             Inst::VSel(d, m, a, b) => {
                 if self.avx && self.byte_masks[m.0 as usize] {
                     let xm = self.use_f(m, 0);
@@ -4228,6 +4229,25 @@ fn scalar_minmax(i: &Inst, a: VReg, b: VReg) -> Option<(bool, u8)> {
 }
 
 /// Does this CPU (and the environment: MAKEPAD_RUN_NO_AVX) allow VEX-encoded AVX instructions?
+/// Whether the emitter encodes `op` (the legaliser expands the lane-wise ops it does not).
+pub fn vx_native(options: &relax_session::Options, op: VX) -> bool {
+    use VW::*;
+    match op {
+        VX::Add(_) | VX::Sub(_) | VX::CmpEq(_) | VX::CmpGtS(_) | VX::And | VX::Or | VX::Xor | VX::AndNot => true,
+        VX::MulLo(w) => matches!(w, H | S),
+        VX::MinS(w) | VX::MaxS(w) | VX::MinU(w) | VX::MaxU(w) => w != D,
+        VX::AddSatU(w) | VX::SubSatU(w) | VX::AddSatS(w) | VX::SubSatS(w) | VX::AvgU(w) => matches!(w, B | H),
+        VX::Abs(w) => w != D,
+        VX::ShlI(..) | VX::ShrUI(..) | VX::ShrSI(..) => true,
+        VX::ShlV(w) | VX::ShrSV(w) | VX::ShrUV(w) => w == S && options.cpu.avx2,
+        VX::FAdd(w, _) | VX::FSub(w, _) | VX::FMul(w, _) | VX::FDiv(w, _) => w == S,
+        VX::FMinLt(w) | VX::FMaxGt(w) | VX::FMinNeon(w) | VX::FMaxNeon(w) | VX::FCmp(_, w) | VX::ICmp(_, w) => w == S,
+        VX::FNeg(w) | VX::FAbs(w) | VX::FSqrt(w, _) | VX::FRound(w, _) | VX::FToI(w) | VX::IToF(w) | VX::Neg(w) => w == S,
+        VX::UCmp(..) | VX::FMinNum(_) | VX::FMaxNum(_) | VX::Narrow(_) | VX::FCvtNarrow | VX::FCvtLo | VX::MoveMask(_) => false,
+        _ => true,
+    }
+}
+
 pub fn host_avx(options: &relax_session::Options) -> bool {
     options.cpu.avx
 }
@@ -4276,6 +4296,16 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         });
         expanded = g;
         &expanded
+    } else {
+        f
+    };
+    // vector ops without an instruction sequence here: per-lane scalar code
+    let legal;
+    let f = if crate::legal::needed(f, &|op| vx_native(options, op), false) {
+        let mut g = f.clone();
+        crate::legal::legalize(&mut g, &|op| vx_native(options, op), false);
+        legal = g;
+        &legal
     } else {
         f
     };
@@ -4722,6 +4752,7 @@ pub fn detect_cpu(options: &relax_session::Options) -> relax_session::options::C
         cpu.lzcnt = !options.no_bitops && std::is_x86_feature_detected!("lzcnt");
         cpu.bmi1 = !options.no_bitops && std::is_x86_feature_detected!("bmi1");
         cpu.fma = cpu.avx && std::is_x86_feature_detected!("fma");
+        cpu.avx2 = cpu.avx && std::is_x86_feature_detected!("avx2");
         cpu
     }
     #[cfg(not(target_arch = "x86_64"))]

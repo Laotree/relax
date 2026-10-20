@@ -2294,6 +2294,7 @@ impl<'a> Gen<'a> {
     fn vinst(&mut self, i: &Inst) {
         use v4s::*;
         match *i {
+            Inst::VShuffle(..) => unreachable!("vector shuffles are legalised before emission"),
             Inst::VSel(d, m, a, b) => {
                 // bsl works in place on the mask: build it in d's register when a and b
                 // live elsewhere
@@ -3007,7 +3008,7 @@ impl<'a> Gen<'a> {
                 self.a.e(0xD53B_4400 | rd as u32);
                 self.fin_i(*d, rd);
             }
-            Inst::VSel(..) | Inst::VFma(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) | Inst::VLoad(..) | Inst::VStore(..) | Inst::VAny(..) | Inst::VGather(..) | Inst::VConst(..) => self.vinst(i),
+            Inst::VShuffle(..) | Inst::VSel(..) | Inst::VFma(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) | Inst::VLoad(..) | Inst::VStore(..) | Inst::VAny(..) | Inst::VGather(..) | Inst::VConst(..) => self.vinst(i),
             Inst::VX(op, d, a, b) => self.vx(*op, *d, *a, *b),
             Inst::VX3(op, d, a, b, c) => self.vx3(*op, *d, *a, *b, *c),
             Inst::Sel(d, c, a, b) => {
@@ -3367,6 +3368,23 @@ pub fn compile(options: &relax_session::Options, f: &Func, env: &Env) -> Result<
 
 /// `compile` with measured block frequencies of `f` (0..=1 of its hottest block, per block), which
 /// the register allocator weighs uses by instead of loop depth.
+/// Whether the emitter encodes `op` (the legaliser expands the lane-wise ops it does not).
+pub fn vx_native(op: VX) -> bool {
+    use VW::*;
+    match op {
+        VX::Add(_) | VX::Sub(_) | VX::CmpEq(_) | VX::CmpGtS(_) | VX::And | VX::Or | VX::Xor | VX::AndNot => true,
+        VX::AddSatU(_) | VX::SubSatU(_) | VX::AddSatS(_) | VX::SubSatS(_) | VX::Abs(_) => true,
+        VX::MulLo(w) | VX::MinS(w) | VX::MaxS(w) | VX::MinU(w) | VX::MaxU(w) | VX::AvgU(w) => w != D,
+        VX::ShlI(..) | VX::ShrUI(..) | VX::ShrSI(..) => true,
+        VX::ShlV(w) | VX::ShrSV(w) | VX::ShrUV(w) => w == S,
+        VX::FAdd(w, _) | VX::FSub(w, _) | VX::FMul(w, _) | VX::FDiv(w, _) => w == S,
+        VX::FMinLt(w) | VX::FMaxGt(w) | VX::FMinNeon(w) | VX::FMaxNeon(w) | VX::FCmp(_, w) | VX::ICmp(_, w) => w == S,
+        VX::FNeg(w) | VX::FAbs(w) | VX::FSqrt(w, _) | VX::FRound(w, _) | VX::FToI(w) | VX::IToF(w) | VX::Neg(w) => w == S,
+        VX::UCmp(..) | VX::FMinNum(_) | VX::FMaxNum(_) | VX::Narrow(_) | VX::FCvtNarrow | VX::FCvtLo | VX::MoveMask(_) => false,
+        _ => true,
+    }
+}
+
 pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq: Option<&[f32]>) -> Result<Compiled, String> {
     let _warm = crate::probe::backend(&f.name);
     let _cost_codegen = crate::probe::phase(5);
@@ -3384,6 +3402,16 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
             }
         }
     }
+    // vector ops without an instruction sequence here: per-lane scalar code
+    let legal;
+    let f = if crate::legal::needed(f, &vx_native, false) {
+        let mut g = f.clone();
+        crate::legal::legalize(&mut g, &vx_native, false);
+        legal = g;
+        &legal
+    } else {
+        f
+    };
     // chains of compares of one value against constants: jump tables, bit tests, binary search
     let switched = crate::switch::lower_switches(options, f);
     let (f, freq_sw) = match &switched {
