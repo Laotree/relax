@@ -582,7 +582,12 @@ impl Tcx {
                     abi
                 }
                 None => {
-                    self.err(cx, prog, file, a.lo, format!("unsupported function ABI {}", prog.files[file as usize].text(a)));
+                    let written = crate::lit::unescape_str(prog.files[file as usize].text(a));
+                    if Abi::is_rustc_name(&written) {
+                        self.err(cx, prog, file, a.lo, format!("unsupported function ABI {}", prog.files[file as usize].text(a)));
+                    } else {
+                        self.err(cx, prog, file, a.lo, format!("E0703: invalid ABI: found `{}`", written));
+                    }
                     Abi::Rust
                 }
             },

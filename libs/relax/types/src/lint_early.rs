@@ -2156,7 +2156,7 @@ fn parse_meta_items(pf: &crate::parser::ParsedFile, lo: usize, hi: usize) -> Vec
 }
 
 /// A string literal token's value; None when the token is no string.
-fn string_value(t: &[u8]) -> Option<String> {
+pub(crate) fn string_value(t: &[u8]) -> Option<String> {
     let (body, raw) = match t {
         [b'"', rest @ .., b'"'] => (rest, false),
         [b'r', rest @ ..] => {

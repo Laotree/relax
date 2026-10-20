@@ -658,13 +658,73 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
             let ItemKind::ForeignMod(r) = item.kind else { continue };
             let fm = ast.row(r);
             let attrs: Vec<crate::ast::Attr> = ast.list(item.attrs).to_vec();
+            // rustc_ast_lowering lower_abi: the block's ABI string names an ABI
+            if let Some(a) = fm.abi {
+                let text = pf.text(a);
+                if !crate::types::Abi::is_rustc_name(&crate::lit::unescape_str(text)) {
+                    errors.push(prog.record_error(file, a.lo, "typeck", format!("E0703: invalid ABI: found `{}`", crate::lit::unescape_str(text))));
+                }
+            }
             // #[link(name = "..", kind = "..")] (rustc_attr_parsing link_attrs.rs)
             {
                 let sp = prog.src(file);
                 for a in &attrs {
                     let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+                    if hi <= lo { continue; }
+                    let from_source = (sp.tok(lo).lo as usize) < pf.src_len as usize;
+                    // the argument shapes of the attributes on an extern block (`link_name` here is a warning
+                    // target, its malformed form still an error)
+                    if from_source && crate::cfg::tok_str(sp, lo) == b"link_name" {
+                        if let Some(m) = attribute_args_error(sp, lo, hi, b"link_name") {
+                            errors.push(prog.record_error(file, sp.tok(m.0).lo, "typeck", format!("{}: malformed `link_name` attribute input", m.1)));
+                        }
+                    }
+                    if crate::cfg::tok_str(sp, lo) == b"link" && (hi < lo + 3 || crate::cfg::tok_str(sp, lo + 1) != b"(") {
+                        errors.push(prog.record_error(file, sp.tok(lo).lo, "typeck", "E0539: malformed `link` attribute input".to_string()));
+                        continue;
+                    }
                     if hi < lo + 3 || crate::cfg::tok_str(sp, lo) != b"link" || crate::cfg::tok_str(sp, lo + 1) != b"(" { continue; }
                     let pos = sp.tok(lo).lo;
+                    // each key once (E0538); `modifiers` name each modifier once; `framework` only on Apple targets (E0455)
+                    {
+                        let mut seen: Vec<&[u8]> = Vec::new();
+                        let mut i = lo + 2;
+                        let mut depth = 0i32;
+                        while i + 1 < hi {
+                            let t = crate::cfg::tok_str(sp, i);
+                            match t {
+                                b"(" | b"[" | b"{" => depth += 1,
+                                b")" | b"]" | b"}" => depth -= 1,
+                                _ => {}
+                            }
+                            if depth == 0 && crate::cfg::tok_str(sp, i + 1) == b"=" && t.first().is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_') {
+                                if seen.contains(&t) {
+                                    errors.push(prog.record_error(file, sp.tok(lo).lo, "typeck", "E0538: malformed `link` attribute input".to_string()));
+                                }
+                                seen.push(t);
+                                if t == b"modifiers" && i + 2 < hi {
+                                    if let Some(v) = crate::lint_early::string_value(crate::cfg::tok_str(sp, i + 2)) {
+                                        let mut names: Vec<&str> = Vec::new();
+                                        for m in v.split(',') {
+                                            let n = m.trim_start_matches(['+', '-']);
+                                            if names.contains(&n) {
+                                                errors.push(prog.record_uncoded_error(file, sp.tok(i).lo, "typeck", format!("multiple `{}` modifiers in a single `modifiers` argument", n)));
+                                            }
+                                            names.push(n);
+                                        }
+                                    }
+                                }
+                                if t == b"kind" && crate::cfg::tok_str(sp, i + 2) == b"\"framework\"" {
+                                    let target = &prog.session.options.target;
+                                    let apple = if target.is_empty() { cfg!(target_vendor = "apple") } else { target.contains("apple") };
+                                    if !apple {
+                                        errors.push(prog.record_error(file, sp.tok(lo).lo, "typeck", "E0455: link kind `framework` is only supported on Apple targets".to_string()));
+                                    }
+                                }
+                            }
+                            i += 1;
+                        }
+                    }
                     let (mut name, mut kind_bad, mut wasm_module) = (None::<&[u8]>, false, false);
                     let mut i = lo + 2;
                     while i + 2 < hi {
@@ -692,6 +752,17 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
                     errors.push(prog.record_error(file, ast.item(it).lo, "parse", "extern items cannot be `const`".to_string()));
                     if init.is_some() {
                         errors.push(prog.record_error(file, ast.item(it).lo, "parse", "incorrect `static` inside `extern` block".to_string()));
+                    }
+                }
+                {
+                    // `#[track_caller]` on an item of a block whose ABI is not "Rust" (E0737)
+                    let abi = fm.abi.map_or("C".to_string(), |a| crate::lit::unescape_str(pf.text(a)));
+                    let sp = prog.src(file);
+                    for a in ast.list(ast.item(it).attrs) {
+                        let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+                        if hi > lo && crate::cfg::tok_str(sp, lo) == b"track_caller" && abi != "Rust" && matches!(ast.item(it).kind, ItemKind::Fn(..)) {
+                            errors.push(prog.record_error(file, sp.tok(lo).lo, "typeck", "E0737: `#[track_caller]` can only be used with the Rust ABI".to_string()));
+                        }
                     }
                 }
                 if let ItemKind::Fn(sig, body, _) = ast.item(it).kind {
@@ -843,6 +914,27 @@ pub fn attribute_safety(prog: &Program, d: DefId) -> Vec<String> {
         if from_source && name == b"macro_use" && hi > lo + 1 && crate::cfg::tok_str(p, lo + 1) == b"(" && !matches!(ast.item(def.item).kind, crate::ast::ItemKind::ExternCrate(_)) {
             errors.push(prog.record_uncoded_error(def.file, pos, "typeck", "arguments to `macro_use` are not allowed here".to_string()));
         }
+        if from_source && name == b"export_name" && hi > first + 2 && crate::cfg::tok_str(p, first + 1) == b"=" {
+            if let Some(v) = crate::lint_early::string_value(crate::cfg::tok_str(p, first + 2)) {
+                if v.contains('\0') {
+                    errors.push(prog.record_error(def.file, pos, "typeck", "E0648: `export_name` may not contain null characters".to_string()));
+                } else if v.is_empty() {
+                    errors.push(prog.record_uncoded_error(def.file, pos, "typeck", "`export_name` may not be empty".to_string()));
+                }
+            }
+        }
+        // ast_validation check_nomangle_item_asciionly (E0754) and `#[track_caller]` needing the Rust ABI (E0737)
+        if from_source && name == b"no_mangle" && !prog.name(d).is_ascii() {
+            errors.push(prog.record_error(def.file, ast.item(def.item).lo, "typeck", "E0754: `#[no_mangle]` requires ASCII identifier".to_string()));
+        }
+        if from_source && name == b"track_caller" {
+            if let crate::ast::ItemKind::Fn(sig, _, _) = ast.item(def.item).kind {
+                let abi = match ast.fn_sig(sig).abi { None => None, Some(None) => Some("C".to_string()), Some(Some(a)) => Some(crate::lit::unescape_str(pf.text(a))) };
+                if abi.is_some_and(|a| a != "Rust") {
+                    errors.push(prog.record_error(def.file, pos, "typeck", "E0737: `#[track_caller]` can only be used with the Rust ABI".to_string()));
+                }
+            }
+        }
         if from_source {
             if let Some(m) = attribute_args_error(p, lo, hi, &name) {
                 errors.push(prog.record_error(def.file, p.tok(m.0).lo, "typeck", format!("{}: malformed `{}` attribute input", m.1, String::from_utf8_lossy(&name))));
@@ -955,6 +1047,12 @@ pub fn repr_checks(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
                 }
                 b"align" => {
                     aligned = true;
+                    // check_repr: `align` is for structs, enums and unions (fn/static align are feature-gated)
+                    if args.is_empty() && !assign {
+                        err(hpos, "E0589: invalid `repr(align)` attribute: `align` needs an argument".to_string());
+                    } else if !(is_struct || is_enum || is_union) {
+                        err(hpos, "E0517: attribute should be applied to a struct, enum, or union".to_string());
+                    }
                     if assign {
                         err(hpos, "E0693: incorrect `repr(align)` attribute format".to_string());
                     } else if args.len() == 1 {
@@ -971,7 +1069,8 @@ pub fn repr_checks(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
                     if !ints.iter().any(|x| x == n) { ints.push(n.to_vec()); }
                     if !is_enum { err(hpos, "E0517: attribute should be applied to an enum".to_string()); }
                 }
-                b"Rust" | b"simd" => other = other || name == b"simd",
+                b"Rust" => { if !(is_struct || is_enum || is_union) { err(hpos, "E0517: attribute should be applied to a struct, enum, or union".to_string()); } }
+                b"simd" => { other = true; if !is_struct { err(hpos, "E0517: attribute should be applied to a struct".to_string()); } }
                 _ => {}
             }
         }
