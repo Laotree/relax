@@ -83,6 +83,7 @@ pub fn start(app: &str) {
     };
     eprintln!("makepad-remote: pid {} app {} socket {} (makepad inspect {} help)", pid, app, sock.display(), pid);
     events::start();
+    timeline::hitch_init();
     if AGENT.load(Relaxed) {
         timeline::set_frame_watch(true);
     }
@@ -111,7 +112,8 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("break", "<fn>|<file>:<line>", "breakpoint: a hit parks the thread at the call (stack intact) and raises a `break` event K<n>"),
     ("restartable", "<fn>", "a panic through the fn can be resumed with `restart` (the fn runs again from its entry with its original arguments) or `return <value>` (the call returns the value; integer-class returns)"),
     ("probe", "add <fn|file:line> <probe.rs|code> [mutate=1] | list | read P<n> | rm <P<n>|all>", "injected Rust probes: your `fn probe(<the hooked fn's params>)` runs at the hook; std::relax::probe::{emit, count, hist, sample, pause} record for it"),
-    ("probes", "", "installed probes with hits and time, parked breakpoints, pause state"),
+    ("probes", "[since=<seq>]", "installed probes and counts with hits and time, parked breakpoints, pause state; each answer is snapshot <seq>: since=<seq> gives every counter's change, rate and started / stopped since then"),
+    ("hitch", "[ms=<n>|off]", "frames over the threshold (default 50 ms, always on) are `hitch` events with phases, waits, lazy compiles, critical path and probe deltas: `events on=hitch`, `watch on=hitch`"),
     ("rm", "<G<n>|all>", "removes probe groups: the code they replaced comes back (no recompile)"),
     ("continue", "[K<n>|all]", "lets parked breakpoint hits go"),
     ("pause", "", "stops the program's threads (makepad run's and inspect's keep running); stacks work while paused"),
@@ -154,6 +156,7 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "memory" => mem::cmd_memory(req, out),
         "prof" => prof::cmd_prof(req, out),
         "timeline" => timeline::cmd_timeline(req, out),
+        "hitch" => timeline::cmd_hitch(req, out),
         // question-shaped aliases (DESIGN.md §2.1)
         "frame" => timeline::cmd_timeline(&shifted(req, "frame"), out),
         "frames" => timeline::cmd_timeline(&shifted(req, "frames"), out),

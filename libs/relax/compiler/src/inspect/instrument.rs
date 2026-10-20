@@ -48,6 +48,60 @@ static SITES: Mutex<Vec<std::sync::Arc<Site>>> = Mutex::new(Vec::new());
 static GROUPS: Mutex<Vec<(u32, u32, Vec<u32>, String)>> = Mutex::new(Vec::new());
 static NEXT_GROUP: AtomicU64 = AtomicU64::new(1);
 
+/// Are any counters installed (count groups or injected probes)? Cheap: a frame log asks it
+/// at each frame's start.
+pub fn any_counters() -> bool {
+    !GROUPS.lock().unwrap_or_else(|e| e.into_inner()).is_empty() || super::probes::any()
+}
+
+/// Every installed counter: ("<site> <fn>", hits, ns) for count sites, then the probes'.
+pub fn counters() -> Vec<(String, u64, u64)> {
+    let mut out = Vec::new();
+    {
+        let sites = SITES.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, s) in sites.iter().enumerate() {
+            if s.on.load(Relaxed) && s.kind == Kind::Count {
+                out.push((format!("{}{} {}", site_letter(s.kind), i, s.label), s.hits.load(Relaxed), s.ns.load(Relaxed)));
+            }
+        }
+    }
+    super::probes::counters(&mut out);
+    out
+}
+
+/// `probes` snapshots: (seq, wall ns, counters), the newest last (`probes since=<seq>`).
+static SNAPS: Mutex<std::collections::VecDeque<(u64, u64, Vec<(String, u64, u64)>)>> = Mutex::new(std::collections::VecDeque::new());
+static SNAP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// `probes since=<seq>`: each counter's change since snapshot `seq`, per second, and whether it
+/// started or stopped moving compared with the interval before `seq`.
+fn probes_since(since: u64, now: &[(String, u64, u64)], t: u64, out: &mut Out) {
+    let snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(k) = snaps.iter().position(|x| x.0 == since) else {
+        out.err(&format!("no probes snapshot {} (kept: the last 32); `probes` starts a new one", since));
+        return;
+    };
+    let (_, t0, base) = &snaps[k];
+    let prev = if k > 0 { Some(&snaps[k - 1]) } else { None };
+    let secs = (t.saturating_sub(*t0) as f64 / 1e9).max(1e-3);
+    let get = |v: &[(String, u64, u64)], key: &str| v.iter().find(|x| x.0 == key).map(|x| (x.1, x.2));
+    for (key, hits, ns) in now {
+        let (h0, ns0) = get(base, key).unwrap_or((0, 0));
+        let delta = hits.saturating_sub(h0);
+        let before = prev.and_then(|p| get(&p.2, key).map(|x| h0.saturating_sub(x.0)));
+        let change = match (get(base, key).is_some(), before, delta > 0) {
+            (false, _, _) => "new",
+            (true, Some(0), true) => "started",
+            (true, _, true) => "active",
+            (true, Some(b), false) if b > 0 => "stopped",
+            _ => "idle",
+        };
+        let time = if ns.saturating_sub(ns0) > 0 { format!(",\"ms\":{:.3}", ns.saturating_sub(ns0) as f64 / 1e6) } else { String::new() };
+        out.line(&format!("{{\"counter\":{},\"delta\":{},\"per_s\":{:.1},\"change\":\"{}\"{}}}", json_str(&short(key, 160)), delta, delta as f64 / secs, change, time));
+    }
+    out.line(&format!("{{\"interval_s\":{:.2}}}", secs));
+}
+
 /// Is slot `id` instrumented now? (jit.rs: O3 / O2 installs keep its probes)
 pub fn active(id: u32) -> bool {
     super::patches::active(id)
@@ -877,8 +931,22 @@ pub fn cmd(req: &Req, out: &mut Out) {
             }
         }
         "probes" => {
-            let sites = SITES.lock().unwrap_or_else(|e| e.into_inner());
+            // a snapshot per call: `probes since=<seq>` reports the change since one
+            let now = counters();
+            let t = crate::clock::wall_ns();
+            let seq = SNAP_SEQ.fetch_add(1, SeqCst) + 1;
             out.measured("installed probes", "probe counters", &[]);
+            if let Some(since) = req.get("since").and_then(|v| v.parse::<u64>().ok()) {
+                probes_since(since, &now, t, out);
+            }
+            {
+                let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
+                snaps.push_back((seq, t, now));
+                while snaps.len() > 32 {
+                    snaps.pop_front();
+                }
+            }
+            let sites = SITES.lock().unwrap_or_else(|e| e.into_inner());
             for (i, s) in sites.iter().enumerate() {
                 if !s.on.load(Relaxed) {
                     continue;
@@ -892,7 +960,13 @@ pub fn cmd(req: &Req, out: &mut Out) {
             for p in parked.iter() {
                 out.line(&format!("{{\"parked\":\"K{}\",\"site\":\"B{}\",\"tid\":\"T{}\"}}", p.id, p.site, p.os_id));
             }
-            out.line(&format!("{{\"paused\":{}}}", PAUSED.load(Relaxed)));
+            drop(sites);
+            let mut injected = Vec::new();
+            super::probes::counters(&mut injected);
+            for (k, h, ns) in injected.iter().filter(|x| !x.0.contains(" count ")) {
+                out.line(&format!("{{\"probe\":{},\"hits\":{}{}}}", json_str(&short(k, 160)), h, if *ns > 0 { format!(",\"est_ms\":{:.3}", *ns as f64 / 1e6) } else { String::new() }));
+            }
+            out.line(&format!("{{\"paused\":{},\"seq\":{},\"rearm\":\"probes since={}\"}}", PAUSED.load(Relaxed), seq, seq));
         }
         "rm" => {
             let w = req.pos.first().map(String::as_str).unwrap_or("all");

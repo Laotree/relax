@@ -1982,6 +1982,7 @@ fn rt_compile(slot: u64) -> u64 {
     // own OS calls must not change it
     let _keep = os::proc::KeepLastError::new();
     ensure_altstack();
+    let _frame = crate::inspect::timeline::CompileMark::begin();
     unsafe {
         let _exec_call = profile_path().map(|_| crate::exec_profile::call(UNIT as usize, slot as u32));
         if profile_path().is_some() { (&*UNIT).exec_event(slot as u32, "call"); }
@@ -9536,12 +9537,20 @@ fn sampler_thread() {
     let mut last_progress = std::time::Instant::now();
     let periods = sample_periods();
     let mut period_index = 0;
+    // wakes in a row in which no sampled thread was on a CPU (macOS: an idle app); past
+    // IDLE_WAKES the sampler sleeps IDLE_MS between looks instead of SAMPLE_MS (a 500 Hz
+    // suspend / resume of every JIT thread of an idle Stage cost ~8% of a core). A sample's
+    // weight is capped by the thread's CPU time, so the longer sleep does not over-credit it.
+    const IDLE_WAKES: u32 = 50;
+    const IDLE_MS: u64 = 20;
+    let mut idle_wakes = 0u32;
     loop {
         let period = periods[period_index];
         period_index = (period_index + 1) % periods.len();
         // Linux selects irregular observations from its perf stream. Drain
         // often enough to avoid overflowing the ring even for long intervals.
         let sleep_ms = if cfg!(target_os = "linux") && periods.len() > 1 { period.min(32) } else { period };
+        let sleep_ms = if idle_wakes >= IDLE_WAKES { sleep_ms.max(IDLE_MS) } else { sleep_ms };
         wait.sleep(sleep_ms);
         if TIER_STOP.load(Ordering::SeqCst) { break; }
         o3_progress_write(&mut last_progress);
@@ -9556,9 +9565,11 @@ fn sampler_thread() {
         let (lo, hi) = (EXEC_LO.load(Ordering::Relaxed), EXEC_HI.load(Ordering::Relaxed));
         {
             let g = SAMPLED.lock().unwrap();
+            let mut on_cpu = false;
             for (_, _, h) in g.iter() {
-                os::sample::read(h, &mut pcs, &mut selfs, lo, hi, weight);
+                on_cpu |= os::sample::read(h, &mut pcs, &mut selfs, lo, hi, weight);
             }
+            idle_wakes = if on_cpu { 0 } else { idle_wakes.saturating_add(1) };
         }
         if sample_trace() {
             static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();

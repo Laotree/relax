@@ -447,6 +447,25 @@ fn add(hook: &str, src: Vec<u8>, mutate: bool) -> Result<(Arc<Probe>, Vec<String
     r.unwrap_or_else(|| Err(format!("the owner did not take the request in 30 s ({})", crate::owner::serving_note())))
 }
 
+/// Any live injected probe?
+pub fn any() -> bool {
+    PROBES.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.on.load(Relaxed))
+}
+
+/// The live probes' counters: ("P<n> <hook>", hits, ns estimated from the timed hits) and their
+/// `count` keys ("P<n> count <key>", n, 0).
+pub fn counters(out: &mut Vec<(String, u64, u64)>) {
+    let ps: Vec<Arc<Probe>> = PROBES.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|p| p.on.load(Relaxed)).cloned().collect();
+    for p in ps {
+        let (hits, ns, timed) = (p.hits.load(Relaxed), p.ns.load(Relaxed), p.timed.load(Relaxed));
+        out.push((format!("P{} {}", p.id, p.hook), hits, if timed > 0 { ns * hits / timed } else { 0 }));
+        let a = p.agg.lock().unwrap_or_else(|e| e.into_inner());
+        for (k, v) in a.counts.iter() {
+            out.push((format!("P{} count {}", p.id, k), *v, 0));
+        }
+    }
+}
+
 fn remove(id: Option<u32>) -> usize {
     let up = crate::jit::current_unit();
     let take: Vec<Arc<Probe>> = PROBES.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|p| id.map_or(true, |k| k == p.id) && !p.slots.lock().unwrap_or_else(|e| e.into_inner()).is_empty()).cloned().collect();
