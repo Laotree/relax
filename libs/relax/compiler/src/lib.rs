@@ -194,7 +194,7 @@ pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
     if args.get(1).map(String::as_str) == Some("fix") {
         options.relaxed = Some("all".to_string());
     }
-    options.cpu = crate::x64::detect_cpu(&options);
+    options.cpu = relax_backend::x64::detect_cpu(&options);
     options.spec_hot = Some(options.spec_hot.unwrap_or_else(crate::jit::on_battery));
     options.spec_jobs = Some(options.spec_jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(1).clamp(1, 6)));
     options.tier1_profile_data = options.tier1_profile.as_ref().and_then(|p| p.to_str()).and_then(|p| std::fs::read_to_string(p).ok());
@@ -215,7 +215,7 @@ pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
 pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
     registry_net::install();
     if std::env::var_os("MAKEPAD_RUN_CODE_SIG").is_some() {
-        regalloc::SIG_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+        relax_backend::regalloc::SIG_ON.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     // a program's own arguments after `--` may be any bytes (`makepad run p -- $'\xff'`): Relax
     // reads its own options lossily, the program gets the bytes (run.rs)
@@ -794,8 +794,8 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         println!("inlined call sites by rule: {}", rules);
         if std::env::var("MAKEPAD_RUN_PASS_TIMES").is_ok() {
             let mut passes = String::new();
-            for i in 0..crate::opt::PASS_NAMES.len() {
-                passes.push_str(&format!("{} {:.2}  ", opt::PASS_NAMES[i], opt::PASS_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6));
+            for i in 0..relax_backend::stats::PASS_NAMES.len() {
+                passes.push_str(&format!("{} {:.2}  ", relax_backend::stats::PASS_NAMES[i], relax_backend::stats::PASS_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6));
             }
             println!("opt passes (ms): {}", passes);
         }
