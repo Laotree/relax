@@ -264,7 +264,7 @@ fn has_error(tcx: &Tcx, ty: TyId) -> bool { tcx.tys.flags(ty).intersects(crate::
 pub fn apply_definition_site_hidden_types(tcx: &Tcx, prog: &Program, infcx: &mut dyn OpaqueOps, constraints: &mut MirTypeckRegionConstraints,
     hidden_types: &mut HiddenTypes, opaque_types: &[(OpaqueTypeKey, ProvisionalHiddenType)]) -> Vec<DeferredOpaqueTypeError> {
     let tys = &tcx.tys;
-    let mut errors = vec![];
+    let errors = vec![];
     for (key, hidden_type) in opaque_types {
         let Some(&(_, expected)) = hidden_types.iter().find(|(d, _)| *d == key.def_id) else {
             // No defining use: every use was reported as an invalid use (`collect_defining_uses`).
