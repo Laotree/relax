@@ -3741,7 +3741,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// rustc_ast_passes `check_expr_within_pat`: a pattern that is an `$e:expr` fragment is a literal
+    /// (or a negated one); any other expression is "arbitrary" (a path, a call, an or-expression ..).
+    fn expr_fragment_pat(&self) -> PResult<()> {
+        let t = self.tok();
+        let lit = |k: T| matches!(k, T::Int | T::Float | T::Str | T::ByteStr | T::CStr | T::RawStr | T::Char | T::Byte | T::KwTrue | T::KwFalse);
+        let bad = match self.meta_frags.get(&{ t.lo }) {
+            Some(&"expr") => !(lit(t.kind) || (t.kind == T::Minus && lit(self.nth(1)))),
+            _ if t.kind == T::OpenParen && crate::macros::uses::recording()
+                && crate::macros::uses::is_synth_paren(self.bctx.as_ref().map_or("", |c| c.path.as_str()), t.lo) => {
+                // the transcription's parentheses around an expression fragment of several tokens
+                let close = self.tok_close_of(self.pos, self.toks.len());
+                match close {
+                    Some(c) => !((c == self.pos + 2 && lit(self.nth(1))) || (c == self.pos + 3 && self.nth(1) == T::Minus && lit(self.nth(2)))),
+                    None => false,
+                }
+            }
+            _ => false,
+        };
+        if bad && self.cfg_out == 0 {
+            return Err(PErr { pos: t.lo, msg: "arbitrary expressions aren't allowed in patterns".into() });
+        }
+        Ok(())
+    }
+
     pub fn pat_no_or(&mut self) -> PResult<PatId> {
+        if self.exp_depth > 0 && crate::lexer::validation_enabled() && (!self.meta_frags.is_empty() || self.kind() == T::OpenParen) {
+            self.expr_fragment_pat()?;
+        }
         let p = match self.kind() {
             T::Ident if self.is_word(0, b"_") => {
                 self.pos += 1;
