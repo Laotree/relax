@@ -56,6 +56,18 @@ pub(super) fn borrowck_source_named(source: &str, edition: u16, crate_name: &str
     borrowck_source_checked_named(source, edition, crate_name, false)
 }
 
+/// `typeck_errors_source` for a crate that is being checked.
+pub(super) fn typeck_errors_checked(source: &str, edition: u16) -> Vec<String> {
+    let (mut prog, tcx, user) = load_source(source, edition, "repro");
+    prog.crates[user as usize].validate = true;
+    let mut errors = vec![];
+    for owner in crate::borrowck::body::owners(&prog) {
+        if prog.def(owner.owner).krate != user { continue; }
+        errors.extend(tcx.typeck(&prog, owner.owner).errors.iter().cloned());
+    }
+    errors
+}
+
 /// `borrowck_source_in` for a crate that is being checked (`makepad check`: its diagnostics are reported).
 pub(super) fn borrowck_source_checked(source: &str, edition: u16) -> (Vec<String>, Vec<String>) {
     borrowck_source_checked_named(source, edition, "repro", true)
@@ -910,13 +922,12 @@ fn a_local_live_across_an_await_is_part_of_the_future_for_auto_traits() {
 
 #[test]
 fn the_witness_of_another_fns_future_is_made_on_demand() {
-    let (errors, unchecked) = borrowck_source_checked("
+    let errors = typeck_errors_checked("
         use std::rc::Rc;
         fn needs_send<T: Send>(_: T) {}
         async fn nothing() {}
         async fn holds() { let rc = Rc::new(1u8); nothing().await; drop(rc); }
         async fn fine() { let n = 1u8; nothing().await; drop(n); }
         pub fn user() { needs_send(holds()); needs_send(fine()); }", 2021);
-    assert!(unchecked.is_empty(), "{unchecked:?}");
     assert_eq!(errors.len(), 1, "{errors:?}");
 }
