@@ -7328,6 +7328,12 @@ impl<'a> Fcx<'a> {
                 self.err(obligation.cause.span, format!("{code}: {msg}"));
                 continue;
             }
+            // rustc maybe_report_ambiguity: an ambiguous subtype / coercion predicate relates two still unknown
+            // types (the first is named): "type annotations needed" (E0282), not an unsatisfied obligation.
+            if code == "E0283" && matches!(predicate.kind, PredicateKind::Subtype(_) | PredicateKind::Coerce(_)) {
+                self.err(obligation.cause.span, "E0282: type annotations needed".to_string());
+                continue;
+            }
             if let Some(msg) = crate::wfcheck::obligations::fulfillment_message(&self.infcx, self.prog, code, &obligation.goal) {
                 self.err(obligation.cause.span, msg);
                 continue;

@@ -12,8 +12,8 @@ pub(super) fn borrowck_source_in(source: &str, edition: u16) -> (Vec<String>, Ve
     borrowck_source_named(source, edition, "repro")
 }
 
-/// `borrowck_source_in` for a crate of the given name (`#![crate_name]` in rustc's tests).
-pub(super) fn borrowck_source_named(source: &str, edition: u16, crate_name: &str) -> (Vec<String>, Vec<String>) {
+/// The crate `source` (named `crate_name`, as `#![crate_name]` does in rustc's tests) over Relax's core, alloc and std.
+fn load_source(source: &str, edition: u16, crate_name: &str) -> (Program, Tcx, u32) {
     crate::borrowck::event::FORCE_USER_TYPES.with(|f| f.set(Some(true)));
     let sess = &std::sync::Arc::new(crate::Session::default());
     let mut prog = Program::new(sess);
@@ -37,6 +37,23 @@ pub(super) fn borrowck_source_named(source: &str, edition: u16, crate_name: &str
     let mut tcx = Tcx::new();
     tcx.collect(&prog);
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    (prog, tcx, user)
+}
+
+/// The typeck errors of every fn of `source`, as the checker words them.
+pub(super) fn typeck_errors_source(source: &str, edition: u16) -> Vec<String> {
+    let (prog, tcx, user) = load_source(source, edition, "repro");
+    let mut errors = vec![];
+    for owner in crate::borrowck::body::owners(&prog) {
+        if prog.def(owner.owner).krate != user { continue; }
+        errors.extend(tcx.typeck(&prog, owner.owner).errors.iter().cloned());
+    }
+    errors
+}
+
+/// `borrowck_source_in` for a crate of the given name.
+pub(super) fn borrowck_source_named(source: &str, edition: u16, crate_name: &str) -> (Vec<String>, Vec<String>) {
+    let (prog, tcx, user) = load_source(source, edition, crate_name);
     let (mut errors, mut unchecked) = (vec![], vec![]);
     for owner in crate::borrowck::body::owners(&prog) {
         if prog.def(owner.owner).krate != user { continue; }
@@ -779,14 +796,6 @@ fn a_local_without_an_annotation_is_instantiated_by_the_coercion_of_its_initiali
 }
 
 #[test]
-fn a_returned_reference_to_a_local_in_an_impl_trait_function_is_e0515() {
-    let (errors, unchecked) = borrowck_source_in("
-        pub fn b(x: &u32) -> impl Sized + '_ { let y = 5u32; &y }", 2021);
-    assert!(unchecked.is_empty(), "{unchecked:?}");
-    assert!(errors.len() == 1 && errors[0].starts_with("E0515"), "{errors:?}");
-}
-
-#[test]
 fn an_async_closure_returned_as_a_trait_object_references_a_local() {
     // `(async || x)()` borrows `x` through a coroutine-closure, which is neither a closure nor a coroutine
     // for the E0373 explanation: the error is E0515.
@@ -820,4 +829,19 @@ fn calling_a_function_that_returns_an_opaque_type_is_no_defining_use() {
         pub fn rpit1<'a, 'b: 'b>(x: &'b ()) -> impl Sized + use<'a, 'b> { new_defining_use(rpit1::<'a, 'b>); x }", 2021);
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn an_ambiguous_subtype_predicate_is_a_type_annotation_error() {
+    // type/type-check/cannot_infer_local_or_array.rs: the local's variable is related to the array type's.
+    let errors = typeck_errors_source("pub fn main() { let x = []; }", 2021);
+    assert!(errors.iter().any(|e| e.contains("E0282")) && !errors.iter().any(|e| e.contains("E0283")), "{errors:?}");
+}
+
+#[test]
+fn a_returned_reference_to_a_local_in_an_impl_trait_function_is_e0515() {
+    let (errors, unchecked) = borrowck_source_in("
+        pub fn b(x: &u32) -> impl Sized + '_ { let y = 5u32; &y }", 2021);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0515"), "{errors:?}");
 }
