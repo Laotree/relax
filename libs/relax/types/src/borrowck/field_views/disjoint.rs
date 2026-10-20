@@ -8,7 +8,8 @@
 //!    `Vec`'s `IndexMut<usize>`), everything before the index is the same place, and the earlier
 //!    borrow dominates the later one; and
 //!  - the indices are proven distinct (constants, `i` vs `i + c`, through single assignments in one
-//!    straight-line run of blocks), or else the later index is compared at run time with the earlier
+//!    straight-line run of blocks; a loop variable of `for j in i + 1..n` or `for j in m..i` against
+//!    `i`, `range_distinct`), or else the later index is compared at run time with the earlier
 //!    one and an overlap panics as `<[T]>::get_disjoint_mut(..).unwrap()` does (`DisjointCheck`,
 //!    lowered by the JIT from the verdict; SPEC-V keeps the body unverified until then).
 //! Indices proven equal stay an error. Everything else (moves, drops, other places) is untouched.
@@ -58,7 +59,7 @@ impl<'a> MirBorrowckCtxt<'a> {
             (Some(a), Some(b)) if a == b => return None, // the same element: the conflict stands
             (Some(a), Some(b)) => a.base == b.base && (a.off - b.off).unsigned_abs() < 1 << 31,
             _ => false,
-        };
+        } || self.range_distinct(&first.0, first.1, &second.0, second.1) || self.range_distinct(&second.0, second.1, &first.0, first.1);
         // a run-time check is lowered into the body's code; coroutine bodies keep their slots in the
         // coroutine's state, so they get no checks (only proven pairs are accepted there)
         if !proven && self.body.coroutine.is_some() { return None; }
@@ -260,7 +261,269 @@ impl<'a> MirBorrowckCtxt<'a> {
         }
     }
 
-    /// Whether the body borrows or takes the address of `local` (or a part of it): its value can
+    /// Range facts: `j` is the item of a `for` loop over a `Range<usize>` (`for j in a..b`), and `x` is
+    /// below its start (`a` is `x + 1`) or not below its end (`b` is `x`), both read in the loop body's
+    /// straight-line run. Exact because the range's values are in `a..b` (std `Range::next` only raises
+    /// `start`, and the iterator is used by nothing but `next`), `x` keeps the value it had when the
+    /// range was made (no assignment of it can reach the loop body without making the range again),
+    /// and `x + 1` wraps only for `x == usize::MAX`, which no index below `b` equals.
+    fn range_distinct(&mut self, x_op: &Operand, x_at: Location, j_op: &Operand, j_at: Location) -> bool {
+        (|| -> Option<bool> {
+            let (a, b) = if self.cfg.location_dominates(x_at, j_at) { (x_at, j_at) } else { (j_at, x_at) };
+            let run = self.straight_run(a, b)?;
+            // x: a local's value at the run's entry; j: a local the run assigns `(next as Some).0`
+            let x = self.copy_root(&run, x_op, x_at)?;
+            let j = self.copy_root(&run, j_op, j_at)?;
+            if x.1.is_some() { return None; }
+            let (jd, jrv) = j.1?;
+            let Rvalue::Use(Operand::Copy(item) | Operand::Move(item)) = jrv else { return None };
+            let [PlaceElem::Downcast(Some(v), _), PlaceElem::Field(f, _)] = &item.projection[..] else { return None };
+            if self.prog.syms.str(*v) != "Some" || f.0 != 0 { return None; }
+            // item = Iterator::next(&mut it) on a Range<usize> made once, at `made`, from `start..end`
+            let (next_at, next_args) = self.only_call_def(item.local)?;
+            if !self.lang_call(next_at, crate::lang_items::LangItem::IteratorNext)? { return None; }
+            let it = self.mut_borrowed_local(next_args.first()?)?;
+            let (made, start, end) = self.range_made(it)?;
+            // the iterator is used by `next` (through `&mut it` temps) only
+            if !self.only_next_borrows(it) { return None; }
+            // j's assignment reads the item of a `next` call made after the range: once the range is made
+            // again, j is assigned only after another `next`
+            if self.reaches_avoiding(made, jd, next_at) { return None; }
+            // x's value in the run is its value when the range was made: no assignment of x can reach the
+            // run's entry without passing `made` again
+            let entry = Location { block: BasicBlock(run.blocks[0] as u32), statement_index: 0 };
+            if !self.defs_cut_by(x.0, made, entry) { return None; }
+            let atom = |this: &mut Self, op: &Operand| this.sym_at(op, made, made);
+            let xs = atom(self, &Operand::Copy(Place::local(x.0)))?;
+            if let Some(s) = atom(self, &start) { if s.base == xs.base && s.base.is_some() && s.off == xs.off + 1 { return Some(true); } }
+            if let Some(e) = atom(self, &end) { if e.base == xs.base && e.base.is_some() && e.off == xs.off { return Some(true); } }
+            Some(false)
+        })().unwrap_or(false)
+    }
+
+    /// `op` through copies within the run: the local it reads, and that local's latest assignment in the run
+    /// before the read (None: its value when the run is entered).
+    fn copy_root(&mut self, run: &Run, op: &Operand, at: Location) -> Option<(Local, Option<(Location, Rvalue)>)> {
+        let (Operand::Copy(p) | Operand::Move(p)) = op else { return None };
+        if !p.projection.is_empty() { return None; }
+        let (mut local, mut at) = (p.local, at);
+        for _ in 0..16 {
+            if self.address_taken(local) { return None; }
+            let (k_at, s_at) = run.pos(at)?;
+            let mut latest: Option<(Location, Option<Rvalue>)> = None;
+            for (k, &b) in run.blocks.iter().enumerate().take(k_at + 1) {
+                let block = &self.body.basic_blocks[b];
+                let end = if k == k_at { s_at } else { block.statements.len() };
+                for (si, st) in block.statements.iter().enumerate().take(end) {
+                    if let StatementKind::Assign(dst, rv) = &st.kind {
+                        if dst.local == local { latest = Some((Location { block: BasicBlock(b as u32), statement_index: si }, dst.projection.is_empty().then(|| rv.clone()))); }
+                    }
+                }
+                if k < k_at {
+                    if let Some(Terminator { kind: TerminatorKind::Call { destination, .. }, .. }) = &block.terminator {
+                        if destination.local == local { latest = Some((Location { block: BasicBlock(b as u32), statement_index: block.statements.len() }, None)); }
+                    }
+                }
+            }
+            match latest {
+                None => return Some((local, None)),
+                Some((d, Some(Rvalue::Use(Operand::Copy(q) | Operand::Move(q))))) if q.projection.is_empty() => { local = q.local; at = d; }
+                Some((d, Some(rv))) => return Some((local, Some((d, rv)))),
+                Some((_, None)) => return None,
+            }
+        }
+        None
+    }
+
+    /// Every assignment of `local` in the body (statements writing it or a part of it, calls writing it).
+    fn defs_of(&self, local: Local) -> Vec<(Location, bool)> {
+        let mut out = Vec::new();
+        for (b, block) in self.body.basic_blocks.iter().enumerate() {
+            for (si, st) in block.statements.iter().enumerate() {
+                if let StatementKind::Assign(dst, _) = &st.kind {
+                    if dst.local == local { out.push((Location { block: BasicBlock(b as u32), statement_index: si }, dst.projection.is_empty())); }
+                }
+            }
+            if let Some(Terminator { kind: TerminatorKind::Call { destination, .. }, .. }) = &block.terminator {
+                if destination.local == local { out.push((Location { block: BasicBlock(b as u32), statement_index: block.statements.len() }, destination.projection.is_empty())); }
+            }
+        }
+        out
+    }
+
+    /// `local`'s only assignment, when it is a call's whole destination: (the call, its arguments).
+    fn only_call_def(&self, local: Local) -> Option<(Location, Vec<Operand>)> {
+        let [(at, true)] = self.defs_of(local)[..] else { return None };
+        let block = &self.body.basic_blocks[at.block.0 as usize];
+        if at.statement_index != block.statements.len() { return None; }
+        let Some(Terminator { kind: TerminatorKind::Call { args, .. }, .. }) = &block.terminator else { return None };
+        Some((at, args.clone()))
+    }
+
+    /// Whether the call at `at` is lang item `item` (a trait method) on `Range<usize>`.
+    fn lang_call(&self, at: Location, item: crate::lang_items::LangItem) -> Option<bool> {
+        let Some(Terminator { kind: TerminatorKind::Call { func: Operand::Constant(c), .. }, .. }) = &self.body.basic_blocks[at.block.0 as usize].terminator else { return None };
+        let Const::Val(_, fty) = &c.const_ else { return None };
+        let TyKind::FnDef(m, targs, _) = self.tcx.tys.kind(*fty) else { return None };
+        if self.tcx.lang_items.get(item) != Some(*m) { return Some(false); }
+        let self_ty = *self.tcx.tys.list(*targs).first()?;
+        Some(self.is_usize_range(self_ty))
+    }
+
+    fn is_usize_range(&self, t: crate::types::TyId) -> bool {
+        matches!(self.tcx.tys.kind(t), TyKind::Adt(d, a, _) if self.tcx.lang_items.get(crate::lang_items::LangItem::Range) == Some(*d)
+            && self.tcx.tys.list(*a).first().copied() == Some(self.tcx.tys.usize_))
+    }
+
+    /// The local an argument `&mut it` (directly or reborrowed once, through single-assignment temps)
+    /// borrows.
+    fn mut_borrowed_local(&self, arg: &Operand) -> Option<Local> {
+        let Operand::Move(p) = arg else { return None };
+        if !p.projection.is_empty() { return None; }
+        let mut local = p.local;
+        for _ in 0..3 {
+            let [(at, true)] = self.defs_of(local)[..] else { return None };
+            let st = self.body.basic_blocks[at.block.0 as usize].statements.get(at.statement_index)?;
+            let StatementKind::Assign(_, Rvalue::Ref(_, BorrowKind::Mut { .. }, q)) = &st.kind else { return None };
+            match &q.projection[..] {
+                [] => return Some(q.local),
+                [PlaceElem::Deref] => local = q.local,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// The iterator `it` is made once: `it = into_iter(start..end)` of a `Range<usize>` (or the range
+    /// itself), through single-assignment temps. Returns where the range value is built and its bounds.
+    fn range_made(&mut self, it: Local) -> Option<(Location, Operand, Operand)> {
+        if !self.is_usize_range(self.body.local_decls[it.0 as usize].ty) { return None; }
+        let mut local = it;
+        for _ in 0..4 {
+            // the values the iterator is made from are not reachable through pointers
+            if local != it && self.address_taken(local) { return None; }
+            let [(at, true)] = self.defs_of(local)[..] else { return None };
+            let block = &self.body.basic_blocks[at.block.0 as usize];
+            if at.statement_index == block.statements.len() {
+                // `into_iter(range)`: identity for an iterator
+                if !self.lang_call(at, crate::lang_items::LangItem::IntoIterIntoIter)? { return None; }
+                let Some(Terminator { kind: TerminatorKind::Call { args, .. }, .. }) = &block.terminator else { return None };
+                let [Operand::Move(r)] = &args[..] else { return None };
+                if !r.projection.is_empty() { return None; }
+                local = r.local;
+                continue;
+            }
+            let StatementKind::Assign(_, rv) = &block.statements[at.statement_index].kind else { return None };
+            match rv {
+                Rvalue::Use(Operand::Move(q)) if q.projection.is_empty() => local = q.local,
+                Rvalue::Aggregate(kind, ops) if ops.len() == 2 && matches!(&**kind, AggregateKind::Adt(d, v, ..) if v.0 == 0 && self.tcx.lang_items.get(crate::lang_items::LangItem::Range) == Some(*d)) => {
+                    return Some((at, ops[0].clone(), ops[1].clone()));
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// The iterator is mentioned only by its assignment, by `&mut it` borrows that feed `Iterator::next`
+    /// calls (through a reborrow), by reads that do not use its value (`FakeRead`, `PlaceMention`) and by
+    /// its storage markers.
+    fn only_next_borrows(&self, it: Local) -> bool {
+        struct Mentions(Local, Vec<(Location, crate::mir::visit::PlaceContext)>);
+        impl crate::mir::visit::Visitor for Mentions {
+            fn visit_local(&mut self, local: &Local, context: crate::mir::visit::PlaceContext, at: Location) {
+                if *local == self.0 { self.1.push((at, context)); }
+            }
+        }
+        let mut m = Mentions(it, Vec::new());
+        for (b, block) in self.body.basic_blocks.iter().enumerate() {
+            m.visit_basic_block_data(BasicBlock(b as u32), block);
+        }
+        m.1.iter().all(|&(at, cx)| {
+            use crate::mir::visit::{NonUseContext as U, PlaceContext as C};
+            if matches!(cx, C::NonUse(U::StorageLive | U::StorageDead | U::VarDebugInfo)) { return true; }
+            let block = &self.body.basic_blocks[at.block.0 as usize];
+            let Some(st) = block.statements.get(at.statement_index) else { return false };
+            match &st.kind {
+                StatementKind::FakeRead(_, q) | StatementKind::PlaceMention(q) => q.local == it,
+                // its one assignment (range_made checked it is the only one)
+                StatementKind::Assign(dst, _) if dst.local == it && dst.projection.is_empty() => true,
+                StatementKind::Assign(dst, Rvalue::Ref(_, BorrowKind::Mut { .. }, q)) if q.local == it && q.projection.is_empty() => self.feeds_next(dst) == Some(true),
+                _ => false,
+            }
+        })
+    }
+
+    /// A `&mut it` temp: it is reborrowed once and the reborrow is `Iterator::next`'s argument.
+    fn feeds_next(&self, temp: &Place) -> Option<bool> {
+        if !temp.projection.is_empty() { return Some(false); }
+        for (b, block) in self.body.basic_blocks.iter().enumerate() {
+            for st in &block.statements {
+                if let StatementKind::Assign(re, Rvalue::Ref(_, BorrowKind::Mut { .. }, q)) = &st.kind {
+                    if q.local == temp.local && q.projection == [PlaceElem::Deref] {
+                        // the reborrow's one use: next(move re)
+                        let user = self.body.basic_blocks.iter().enumerate().find_map(|(bb, blk)| match &blk.terminator {
+                            Some(Terminator { kind: TerminatorKind::Call { args, .. }, .. }) if args.iter().any(|a| matches!(a, Operand::Move(x) if x == re)) => Some(bb),
+                            _ => None,
+                        })?;
+                        let at = Location { block: BasicBlock(user as u32), statement_index: self.body.basic_blocks[user].statements.len() };
+                        let _ = b;
+                        return self.lang_call(at, crate::lang_items::LangItem::IteratorNext);
+                    }
+                }
+            }
+            if let Some(Terminator { kind: TerminatorKind::Call { args, .. }, .. }) = &block.terminator {
+                if args.iter().any(|a| matches!(a, Operand::Move(x) if x == temp)) {
+                    return self.lang_call(Location { block: BasicBlock(b as u32), statement_index: block.statements.len() }, crate::lang_items::LangItem::IteratorNext);
+                }
+            }
+        }
+        Some(false)
+    }
+
+    /// No assignment of `local` reaches `to` without passing `through` (after leaving `through`).
+    fn defs_cut_by(&mut self, local: Local, through: Location, to: Location) -> bool {
+        if self.address_taken(local) { return false; }
+        self.defs_of(local).iter().all(|&(d, _)| !self.reaches_avoiding(d, to, through))
+    }
+
+    /// A path from just after `from` to `to` that does not pass `avoid`.
+    fn reaches_avoiding(&self, from: Location, to: Location, avoid: Location) -> bool {
+        let n = self.body.basic_blocks.len();
+        let mut seen = BitSet::new_empty(n);
+        let succ = |b: usize| -> Vec<usize> {
+            struct Edges(Vec<usize>);
+            impl crate::mir::visit::Visitor for Edges { fn visit_target(&mut self, t: &BasicBlock, _: bool, _: Location) { self.0.push(t.0 as usize); } }
+            let mut e = Edges(Vec::new());
+            let block = &self.body.basic_blocks[b];
+            e.visit_terminator(block.terminator.as_ref().unwrap(), Location { block: BasicBlock(b as u32), statement_index: block.statements.len() });
+            e.0
+        };
+        // the rest of `from`'s block
+        let in_block = |b: usize, lo: usize| -> (bool, bool) {
+            // (reaches `to` in b from statement lo, passes `avoid` first)
+            let hits_to = to.block.0 as usize == b && to.statement_index >= lo;
+            let hits_avoid = avoid.block.0 as usize == b && avoid.statement_index >= lo;
+            match (hits_to, hits_avoid) {
+                (true, true) => (to.statement_index <= avoid.statement_index, true),
+                (t, a) => (t, a),
+            }
+        };
+        let (t, a) = in_block(from.block.0 as usize, from.statement_index + 1);
+        if t { return true; }
+        if a { return false; }
+        let mut stack = succ(from.block.0 as usize);
+        while let Some(b) = stack.pop() {
+            if !seen.insert(b) { continue; }
+            let (t, a) = in_block(b, 0);
+            if t { return true; }
+            if a { continue; }
+            stack.extend(succ(b));
+        }
+        false
+    }
+
+    /// Whether the body borrows or takes the address of `local`    /// Whether the body borrows or takes the address of `local` (or a part of it): its value can
     /// then change through a pointer.
     fn address_taken(&mut self, local: Local) -> bool {
         if self.d3_taken.is_none() {
