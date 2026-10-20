@@ -578,6 +578,48 @@ mod tests {
         assert!(out.contains("    clear(vm);\n    let first = &vm.a[0];\n    *first"), "{out}");
     }
 
+    const MAPS: &str = "use std::collections::HashMap;\nfn d<'a>(map: &'a mut HashMap<u32, u32>, key: u32) -> &'a mut u32 {\n    match map.get_mut(&key) {\n        Some(v) => v,\n        None => { map.insert(key, 0); map.get_mut(&key).unwrap() }\n    }\n}\nfn e<'a>(map: &'a mut HashMap<u32, u32>, key: u32) -> &'a mut u32 {\n    if let Some(v) = map.get_mut(&key) {\n        return v;\n    }\n    map.insert(key, 0);\n    map.get_mut(&key).unwrap()\n}\nfn k() -> u32 { 0 }\nfn f<'a>(map: &'a mut HashMap<u32, u32>) -> &'a mut u32 {\n    if let Some(v) = map.get_mut(&k()) {\n        return v;\n    }\n    map.get_mut(&1).unwrap()\n}\nfn main() {}\n";
+
+    fn map_prog() -> Program {
+        let session = std::sync::Arc::new(crate::Session::default());
+        let path = std::env::temp_dir().join(format!("relax-relookup-{}-{:?}.rs", std::process::id(), std::thread::current().id()));
+        std::fs::write(&path, MAPS).unwrap();
+        let mut prog = Program::new(&session);
+        prog.load_crate("custom", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), Vec::new()).unwrap();
+        std::fs::remove_file(path).unwrap();
+        prog
+    }
+    /// The relaxed note of a Polonius acceptance whose loan is the lookup `call` (the `nth` occurrence).
+    fn polonius_note(prog: &Program, call: &str, nth: usize) -> crate::relaxed::Note {
+        let file = (prog.files.len() - 1) as u32;
+        let lo = MAPS.match_indices(call).nth(nth).unwrap().0 as u32;
+        let span = Span { file, lo, hi: lo + call.len() as u32 };
+        let rec = super::super::RelaxedRecord::Polonius(super::super::PoloniusRecord { code: "E0499", span, loan: span,
+            lookup: Some(super::super::Lookup { mutable: true, call: span }) });
+        plan_relaxed(prog, &[rec]).pop().unwrap()
+    }
+
+    #[test]
+    fn relookup_rewrites_a_match_and_an_if_let() {
+        let prog = map_prog();
+        let n = polonius_note(&prog, "map.get_mut(&key)", 0);
+        let (_, edits) = n.fix.expect("a match on the lookup is rewritten");
+        let out = String::from_utf8(crate::relaxed::apply(MAPS.as_bytes(), &edits).0).unwrap();
+        assert!(out.contains("    if map.contains_key(&key) { let v = map.get_mut(&key).unwrap(); v } else { map.insert(key, 0); map.get_mut(&key).unwrap() }\n}"), "{out}");
+        let n = polonius_note(&prog, "map.get_mut(&key)", 2);
+        let (_, edits) = n.fix.expect("an if-let on the lookup is rewritten");
+        let out = String::from_utf8(crate::relaxed::apply(MAPS.as_bytes(), &edits).0).unwrap();
+        assert!(out.contains("    if map.contains_key(&key) {\n        let v = map.get_mut(&key).unwrap();\n        return v;\n    }"), "{out}");
+        assert!(n.msg.contains("accepted under Polonius"), "{}", n.msg);
+    }
+
+    #[test]
+    fn relookup_needs_a_side_effect_free_key() {
+        let prog = map_prog();
+        let n = polonius_note(&prog, "map.get_mut(&k())", 0);
+        assert!(n.fix.is_none() && n.msg.contains("no known rewrite") && n.msg.contains("plain place"), "{}", n.msg);
+    }
+
     #[test]
     fn conditional_arguments_are_not_hoisted() {
         let prog = prog();
