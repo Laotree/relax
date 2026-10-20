@@ -39,8 +39,6 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 pub static AGENT: AtomicBool = AtomicBool::new(false);
 /// os id of the inspect threads (not captured: they are the ones asking)
 static SERVER_TIDS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
-/// one capture at a time (the Linux handshake has one slot)
-static CAPTURE: Mutex<()> = Mutex::new(());
 static APP: Mutex<String> = Mutex::new(String::new());
 
 pub use makepad_remote::{json_str, now_ms, Out, Req};
@@ -129,6 +127,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 ];
 
 fn dispatch(req: &Req, out: &mut Out) {
+    let _act = activity::begin(req);
     dispatch_command(req, out);
     // SPEC-V: the client prints the answer's rows, not its end line (which says `verified` too)
     if !crate::reload::observations_verified() && !matches!(req.cmd.as_str(), "help" | "ping" | "events" | "watch") {
@@ -261,16 +260,18 @@ pub struct Captured {
     pub err: Option<&'static str>,
 }
 
-pub fn capture_all(want: &dyn Fn(&threads::Thread) -> bool) -> Vec<Captured> {
+/// The threads `want` picks with their stacks, captured now; Err: another capture holds the lock
+/// longer than a capture takes ("busy: prof since 12 s by T.."), reported instead of waiting.
+pub fn capture_all(want: &dyn Fn(&threads::Thread) -> bool) -> Result<Vec<Captured>, String> {
     cfi::refresh();
-    let _g = CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
-    let skip = SERVER_TIDS.lock().unwrap().clone();
-    let mut out = Vec::new();
-    let mut raw = threads::Raw::new();
     let mut list = threads::list();
     name_handles(&mut list);
+    let skip = SERVER_TIDS.lock().unwrap().clone();
+    let mut out = Vec::with_capacity(list.len());
+    let mut raw = threads::Raw::new();
+    let _g = capture::lock("stacks", 2000)?;
     for t in list {
-        if skip.contains(&t.os_id) || !want(&t) {
+        if is_inspect_thread(&t, &skip) || !want(&t) {
             continue;
         }
         let r = threads::capture(&t, &mut raw);
@@ -280,7 +281,170 @@ pub fn capture_all(want: &dyn Fn(&threads::Thread) -> bool) -> Vec<Captured> {
         }
         out.push(Captured { frames: raw.frames().to_vec(), lr: raw.lr, sp: raw.sp, err: r.err(), t });
     }
-    out
+    Ok(out)
+}
+
+/// Inspect's own threads (the server threads in `skip` = SERVER_TIDS, and by name): never
+/// suspended or signalled by a capture, a profile or a pause. One of them is the caller; another
+/// may be suspending threads itself (two that suspend each other never resume).
+pub fn is_inspect_thread(t: &threads::Thread, skip: &[u64]) -> bool {
+    skip.contains(&t.os_id) || t.name.starts_with("run-inspect") || t.name.starts_with("makepad-remote") || t.os_id == threads::self_os_id()
+}
+
+/// One capture at a time (two capturing threads must not suspend each other's targets in
+/// between; Linux pause and capture share the handshake slots). A try-lock: the holder (thread,
+/// what, since when) is kept so a waiter that gives up says who holds it, and `threads` / `waits`
+/// show it.
+pub mod capture {
+    use std::sync::atomic::{AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release}};
+    static HOLDER: AtomicU64 = AtomicU64::new(0);
+    static SINCE_NS: AtomicU64 = AtomicU64::new(0);
+    static WHAT: AtomicU64 = AtomicU64::new(0);
+
+    pub struct Guard(());
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            WHAT.store(0, Relaxed);
+            HOLDER.store(0, Release);
+        }
+    }
+
+    /// The lock for `what`, waiting at most `wait_ms` (polling 1 ms: holders keep it for one
+    /// capture round, milliseconds).
+    pub fn lock(what: &'static str, wait_ms: u64) -> Result<Guard, String> {
+        let me = super::threads::self_os_id();
+        let t0 = std::time::Instant::now();
+        super::activity::phase("waiting for the capture lock", HOLDER.load(Relaxed));
+        loop {
+            if HOLDER.compare_exchange(0, me, AcqRel, Acquire).is_ok() {
+                SINCE_NS.store(crate::clock::wall_ns(), Relaxed);
+                WHAT.store(super::activity::pack(what), Relaxed);
+                super::activity::phase("running", 0);
+                return Ok(Guard(()));
+            }
+            if t0.elapsed().as_millis() as u64 >= wait_ms {
+                super::activity::phase("running", 0);
+                return Err(format!("busy: {}", holder_note().unwrap_or_else(|| "another capture".into())));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// "prof since 12.0 s by T123 (makepad-remote-cmd: prof s=30 ...)" while the lock is held.
+    pub fn holder_note() -> Option<String> {
+        let h = HOLDER.load(Acquire);
+        if h == 0 {
+            return None;
+        }
+        let ms = crate::clock::wall_ns().saturating_sub(SINCE_NS.load(Relaxed)) / 1_000_000;
+        let doing = super::activity::describe(h).map(|d| format!(": {}", d)).unwrap_or_default();
+        Some(format!("capture lock held for {} by T{} for {:.1} s{}", super::activity::unpack(WHAT.load(Relaxed)), h, ms as f64 / 1000.0, doing))
+    }
+}
+
+/// What each inspect command thread is doing (self-diagnosis: `threads` and `waits` say what a
+/// stuck inspect command waits on). Atomics per slot; the command text under a mutex only inspect
+/// threads take (they are never suspended).
+pub mod activity {
+    use std::sync::atomic::{AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release}};
+    const SLOTS: usize = 32;
+    struct Slot {
+        tid: AtomicU64,
+        since_ns: AtomicU64,
+        phase: AtomicU64,
+        phase_ns: AtomicU64,
+        detail: AtomicU64,
+    }
+    static ACTS: [Slot; SLOTS] = [const { Slot { tid: AtomicU64::new(0), since_ns: AtomicU64::new(0), phase: AtomicU64::new(0), phase_ns: AtomicU64::new(0), detail: AtomicU64::new(0) } }; SLOTS];
+    static CMDS: super::Mutex<Vec<(u64, String)>> = super::Mutex::new(Vec::new());
+    thread_local! {
+        static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    }
+
+    /// A static string packed in a word: pointer (47 bits) and length (16 bits).
+    pub fn pack(s: &'static str) -> u64 {
+        (s.as_ptr() as u64 & ((1 << 47) - 1)) | ((s.len().min(0xffff) as u64) << 48)
+    }
+    pub fn unpack(w: u64) -> &'static str {
+        let (p, n) = (w & ((1 << 47) - 1), (w >> 48) as usize);
+        if p == 0 || n == 0 {
+            return "";
+        }
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p as *const u8, n)) }
+    }
+
+    pub struct Active(usize);
+    impl Drop for Active {
+        fn drop(&mut self) {
+            if self.0 == usize::MAX {
+                return;
+            }
+            let s = &ACTS[self.0];
+            let tid = s.tid.load(Relaxed);
+            CMDS.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.0 != tid);
+            let _ = MINE.try_with(|m| m.set(usize::MAX));
+            s.tid.store(0, Release);
+        }
+    }
+
+    /// The calling inspect thread starts answering `req`.
+    pub fn begin(req: &super::Req) -> Active {
+        let me = super::threads::self_os_id();
+        let Some(k) = ACTS.iter().position(|s| s.tid.compare_exchange(0, me, AcqRel, Acquire).is_ok()) else { return Active(usize::MAX) };
+        let now = crate::clock::wall_ns();
+        let s = &ACTS[k];
+        s.since_ns.store(now, Relaxed);
+        s.phase.store(pack("running"), Relaxed);
+        s.phase_ns.store(now, Relaxed);
+        s.detail.store(0, Relaxed);
+        let mut line = req.cmd.clone();
+        for p in &req.pos {
+            line.push(' ');
+            line.push_str(p);
+        }
+        for (k, v) in &req.kv {
+            line.push_str(&format!(" {}={}", k, v));
+        }
+        CMDS.lock().unwrap_or_else(|e| e.into_inner()).push((me, super::short(&line, 120)));
+        let _ = MINE.try_with(|m| m.set(k));
+        Active(k)
+    }
+
+    /// The calling inspect thread's current step (`detail`: the thread it is on, 0: none).
+    /// Allocation-free: called around suspends.
+    #[inline]
+    pub fn phase(p: &'static str, detail: u64) {
+        let Ok(k) = MINE.try_with(|m| m.get()) else { return };
+        if k == usize::MAX {
+            return;
+        }
+        let s = &ACTS[k];
+        s.phase.store(pack(p), Relaxed);
+        s.detail.store(detail, Relaxed);
+        s.phase_ns.store(crate::clock::wall_ns(), Relaxed);
+    }
+
+    /// "prof s=30 threads=main for 12.3 s; now: suspending T45 for 3 ms" for an inspect thread.
+    pub fn describe(tid: u64) -> Option<String> {
+        let s = ACTS.iter().find(|s| s.tid.load(Acquire) == tid)?;
+        let now = crate::clock::wall_ns();
+        let cmd = CMDS.try_lock().ok().and_then(|c| c.iter().find(|c| c.0 == tid).map(|c| c.1.clone())).unwrap_or_else(|| "?".into());
+        let since = now.saturating_sub(s.since_ns.load(Relaxed)) as f64 / 1e9;
+        let ph = unpack(s.phase.load(Relaxed));
+        let pms = now.saturating_sub(s.phase_ns.load(Relaxed)) / 1_000_000;
+        let d = s.detail.load(Relaxed);
+        let on = if d != 0 { format!(" T{}", d) } else { String::new() };
+        let mut t = format!("{} for {:.1} s; now: {}{} for {} ms", cmd, since, ph, on, pms);
+        if ph == "waiting for the owner" {
+            t.push_str(&format!(" (owner serves {})", crate::owner::serving_note()));
+        }
+        Some(t)
+    }
+
+    /// Every busy inspect thread: (os id, description).
+    pub fn all() -> Vec<(u64, String)> {
+        ACTS.iter().map(|s| s.tid.load(Acquire)).filter(|&t| t != 0).filter_map(|t| describe(t).map(|d| (t, d))).collect()
+    }
 }
 
 /// Fills in the pthread handles the OS listing lacks (Linux) for the threads Relax names by handle:
@@ -370,6 +534,8 @@ fn jit_names(pcs: &[u64], partial: &mut Vec<String>, ms: u64) -> Vec<(String, St
         return pcs.iter().map(|pc| (format!("jit {:#x}", pc), String::new(), "jit".into())).collect();
     }
     let pcs_v = pcs.to_vec();
+    activity::phase("waiting for the owner", 0);
+    let _back = PhaseBack;
     let r = crate::owner::call_within(crate::owner::Class::Job, ms, move || {
         let u = unsafe { &*up };
         pcs_v
@@ -406,6 +572,14 @@ fn jit_names(pcs: &[u64], partial: &mut Vec<String>, ms: u64) -> Vec<(String, St
                 })
                 .collect()
         }
+    }
+}
+
+/// Sets the phase back to running when a step ends (also on unwind).
+struct PhaseBack;
+impl Drop for PhaseBack {
+    fn drop(&mut self) {
+        activity::phase("running", 0);
     }
 }
 
@@ -480,10 +654,13 @@ fn cmd_threads(out: &mut Out) {
     out.measured("threads", "os+registry", &[]);
     for t in &list {
         let w = waits.iter().find(|w| w.thread == t.handle && t.handle != 0);
-        let wait = match w {
+        let mut wait = match w {
             Some(w) => format!(",\"waits\":{}", json_str(&wait_text(w, &list))),
             None => String::new(),
         };
+        if let Some(d) = activity::describe(t.os_id) {
+            wait.push_str(&format!(",\"inspect\":{}", json_str(&d)));
+        }
         out.line(&format!(
             "{{\"id\":\"T{}\",\"name\":{},\"role\":\"{}\",\"state\":\"{}\",\"cpu_ms\":{}{}}}",
             t.os_id,
@@ -519,7 +696,10 @@ fn pick_threads(sel: &str) -> Box<dyn Fn(&threads::Thread) -> bool> {
 fn cmd_stacks(req: &Req, out: &mut Out) {
     let sel = req.get("thread").or(req.pos.first().map(String::as_str)).unwrap_or("all");
     let depth = req.num("depth", 12) as usize;
-    let caps = capture_all(&*pick_threads(sel));
+    let caps = match capture_all(&*pick_threads(sel)) {
+        Ok(c) => c,
+        Err(e) => return out.err(&e),
+    };
     let mut partial = Vec::new();
     let frames: Vec<Vec<u64>> = caps.iter().map(|c| c.frames.iter().copied().take(depth.max(1) + 1).collect()).collect();
     let syms = symbolise(&frames, &mut partial);
@@ -549,6 +729,14 @@ fn cmd_waits(out: &mut Out) {
     name_handles(&mut list);
     let waits = crate::waits::snapshot();
     out.measured("wait registry", "registry (no owner)", &[]);
+    // inspect's own command threads (a stuck command says on what) and the capture lock
+    for (tid, d) in activity::all() {
+        let name = list.iter().find(|t| t.os_id == tid).map(|t| t.name.as_str()).unwrap_or("makepad-remote-cmd");
+        out.line(&format!("{{\"thread\":{},\"inspect\":{}}}", json_str(&format!("{} (T{})", name, tid)), json_str(&d)));
+    }
+    if let Some(h) = capture::holder_note() {
+        out.line(&format!("{{\"capture_lock\":{}}}", json_str(&h)));
+    }
     for w in &waits {
         if w.kind == crate::waits::Kind::None {
             continue;
