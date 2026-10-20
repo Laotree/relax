@@ -5,7 +5,9 @@ use super::*;
 use crate::ast::{self, GenericParamKind, Bound, GenericArgs, WherePred};
 use crate::program::{Program, DefKind};
 use crate::tcx::{Tcx, GenEnv, EvalCx, EvalState, TypingEnv};
-use crate::types::{TyKind, AliasTy, AliasTyKind};
+use crate::types::{TyKind, AliasTy, AliasTyKind, TyId, RegionId, RegionKind};
+use crate::types::fold::TypeFolder;
+use crate::consts::GenericArg;
 use crate::consts::{ConstKind, IsRigid};
 use crate::tcx::resolve_bound_vars::BinderId;
 
@@ -14,6 +16,43 @@ pub(crate) enum PredicateFilter { All, SelfOnly, SelfTraitThatDefines(crate::pro
 
 pub fn trait_predicate(def_id: DefId, args: Vec<GenericArg>) -> Predicate {
     Predicate::dummy(PredicateKind::Clause(ClauseKind::Trait(TraitClause { trait_ref: TraitRef { def_id, args }, polarity: ClausePolarity::Positive })))
+}
+
+
+/// The late-bound regions of the innermost binder (`ReBound(0, _)` at the root) a value mentions; `constrained` skips
+/// what sits under an alias (rustc `LateBoundRegionsCollector`).
+struct LateBoundRegions { out: Vec<u32>, constrained: bool }
+impl crate::types::fold::TypeFolder for LateBoundRegions {
+    fn fold_ty(&mut self, tys: &crate::types::Types, t: TyId, depth: crate::types::DebruijnIndex) -> TyId {
+        if self.constrained && matches!(tys.kind(t), TyKind::Alias(..)) { return t; }
+        crate::types::fold::super_fold_ty(tys, t, self, depth)
+    }
+    fn fold_region(&mut self, tys: &crate::types::Types, r: crate::types::RegionId, depth: crate::types::DebruijnIndex) -> crate::types::RegionId {
+        if let RegionKind::ReBound(d, v) = tys.region_kind(r) { if d == depth && !self.out.contains(&v.0) { self.out.push(v.0); } }
+        r
+    }
+}
+
+impl Tcx {
+    /// hir_ty_lowering/bounds.rs validate_late_bound_regions (E0582): a late-bound region the bound's value mentions
+    /// appears in the trait's input types (not only under a projection).
+    fn validate_late_bound_regions(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, pos: u32, trait_args: &[GenericArg], alias_regions: &[RegionId], value: TyId) {
+        if !self.validates(prog, file) { return; }
+        let mut constrained = LateBoundRegions { out: Vec::new(), constrained: true };
+        for a in trait_args {
+            match a {
+                GenericArg::Type(t) => { constrained.fold_ty(&self.tys, *t, 0); }
+                GenericArg::Lifetime(r) => { constrained.fold_region(&self.tys, *r, 0); }
+                GenericArg::Const(_) => {}
+            }
+        }
+        for r in alias_regions { constrained.fold_region(&self.tys, *r, 0); }
+        let mut referenced = LateBoundRegions { out: Vec::new(), constrained: false };
+        referenced.fold_ty(&self.tys, value, 0);
+        if referenced.out.iter().any(|v| !constrained.out.contains(v)) {
+            self.err(cx, prog, file, pos, "E0582: binding for associated type references a lifetime, which does not appear in the trait input types".to_string());
+        }
+    }
 }
 
 static DECLARATION_ENVS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -53,7 +92,7 @@ impl Tcx {
     }
 
     pub fn explicit_super_predicates_of(&self, prog: &Program, def_id: DefId) -> &[Predicate] {
-        self.declaration_queries(prog, def_id).super_predicates.get_or_init(||
+        self.declaration_queries(prog, def_id).super_predicates.get_or_init_cyclic(||
             self.implied_clauses_with_filter(prog, def_id, PredicateFilter::SelfOnly))
     }
 
@@ -330,6 +369,28 @@ impl Tcx {
             let Some(td) = self.resolve_type_path_def(prog, def.file, def.scope, &path) else { return; };
             if !self.trait_may_define_assoc_item(prog, td, name) { return; }
         }
+        // `?Trait` relaxes Sized only
+        if let Bound::Trait { maybe: true, path, .. } = bound {
+            if self.validates(prog, def.file) {
+                if let Some(td) = self.resolve_trait_path(cx, prog, def.file, def.scope, env, &path) {
+                    if self.lang_items.get(crate::lang_items::LangItem::Sized) != Some(td) {
+                        self.err(cx, prog, def.file, path.lo, format!("{}bound modifier `?` can only be applied to `Sized`", relax_front::diagnostics::UNCODED_PREFIX));
+                    }
+                    let ast = &prog.files[def.file as usize].ast;
+                    if let Some(GenericArgs::Angle(v)) = ast.segs(path.segs).last().and_then(|s| ast.gargs(s.args())) {
+                        for a in ast.list(*v) {
+                            if let ast::GenericArg::Binding(n, _, _) | ast::GenericArg::Constraint(n, _, _) = *a {
+                                let sym = prog.syms.get(prog.files[def.file as usize].text(n)).unwrap_or(u32::MAX);
+                                if self.trait_assoc(prog, td, sym).is_none() {
+                                    self.err(cx, prog, def.file, n.lo, format!("E0220: associated type `{}` not found for `{}`", prog.files[def.file as usize].text(n), prog.name(td)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let Bound::Trait { maybe: false, path, .. } = bound else {
             if let Bound::Lifetime(lt) = bound {
                 let region = env.regions.resolve(cx.infcx, &self.tys, prog, def.file, Some(lt));
@@ -365,6 +426,8 @@ impl Tcx {
             GenericArgs::Paren(..) => {
                 if let Some(ad) = self.callable_output(td) {
                     let value = callable_output.expect("parenthesized callable output");
+                    let input_args: Vec<GenericArg> = compact.iter().map(|t| GenericArg::Type(*t)).collect();
+                    self.validate_late_bound_regions(cx, prog, def.file, path.lo, &input_args, &self.tys.region_args(regions), value);
                     let alias = self.tys.intern(TyKind::Alias(IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: self.tys.mk_list(&compact), regions }));
                     out.push(Predicate { kind: PredicateKind::Clause(ClauseKind::Projection(ProjectionClause { projection_term: AliasTerm::Ty(alias), term: Term::Ty(value) })), bound_vars: vars });
                 }
@@ -393,7 +456,7 @@ impl Tcx {
                     let PredicateKind::Clause(ClauseKind::Trait(c)) = supertrait.kind else { unreachable!() };
                     let mut args = Vec::new();
                     let mut rs = Vec::new();
-                    for a in c.trait_ref.args { match a {
+                    for a in c.trait_ref.args.clone() { match a {
                         GenericArg::Type(t) => args.push(t), GenericArg::Const(c) => args.push(self.tys.intern(TyKind::Const(c))), GenericArg::Lifetime(r) => rs.push(r),
                     } }
                     let vars = supertrait.bound_vars;
@@ -422,6 +485,8 @@ impl Tcx {
                     match *arg {
                         ast::GenericArg::Binding(_, _, value) => {
                             let value = self.lower_ty(cx, prog, def.file, def.scope, &env, value);
+                            let n_pos = match *arg { ast::GenericArg::Binding(n, _, _) | ast::GenericArg::Constraint(n, _, _) => n.lo, _ => 0 };
+                            self.validate_late_bound_regions(cx, prog, def.file, n_pos, &c.trait_ref.args, &rs, value);
                             out.push(Predicate { kind: PredicateKind::Clause(ClauseKind::Projection(ProjectionClause { projection_term: AliasTerm::Ty(alias), term: Term::Ty(value) })), bound_vars: vars.clone() });
                         }
                         ast::GenericArg::Constraint(_, _, bounds) => {

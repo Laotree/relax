@@ -24,12 +24,43 @@ pub struct PErr {
 pub type PResult<X> = Result<X, PErr>;
 
 const NO_STRUCT: u8 = 1;
+/// rustc `Restrictions::ALLOW_LET`: set for `if`/`while` conditions and match guards, kept across
+/// binary operators and parentheses, cleared by every other primary expression
+const ALLOW_LET: u8 = 2;
 
 #[derive(Clone, Copy)]
 enum BodyOutline {
     Deferred(TokRange),
     Eager(u8),
     Mismatched(u32),
+}
+
+/// MAKEPAD_RUN_VERIFY_TOKENS: every macro_rules expansion's transcribed tokens are compared with the
+/// lexed text.
+pub(crate) fn verify_tokens() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("MAKEPAD_RUN_VERIFY_TOKENS").is_some())
+}
+
+/// Text with the tokens over it, built piece by piece (no lexing).
+#[derive(Default)]
+struct TokText {
+    s: String,
+    toks: Vec<Tok>,
+}
+
+impl TokText {
+    fn word(&mut self, kind: T, text: &str) {
+        let lo = self.s.len() as u32;
+        self.s.push_str(text);
+        self.toks.push(Tok { kind, lo, hi: lo + text.len() as u32 });
+    }
+    /// `text` with its tokens (positions relative to it).
+    fn append(&mut self, text: &str, toks: &[Tok]) {
+        let base = self.s.len() as u32;
+        self.s.push_str(text);
+        self.toks.extend(toks.iter().filter(|t| t.kind != T::Eof).map(|t| Tok { kind: t.kind, lo: t.lo + base, hi: t.hi + base }));
+    }
 }
 
 pub struct Parser<'a> {
@@ -66,6 +97,8 @@ pub struct Parser<'a> {
     pub token_input: bool,
     pub sources: Option<std::sync::Arc<SourceRegistry>>,
     exp_depth: u32,
+    /// the file's written `#![recursion_limit]`, read on the first macro call
+    rec_limit: std::cell::Cell<Option<Option<u32>>>,
     /// macro_rules expansions: (text lo, text hi, the macro's definition position in this
     /// file; 0 when defined elsewhere) -- the hygiene marks (ParsedFile::hyg_ctxt)
     pub rules_exp: OSeg<'a, Regions>,
@@ -77,6 +110,8 @@ pub struct Parser<'a> {
     /// opaque macro fragments a transcription forwarded (start of the first token -> end of the
     /// last): a `$t:tt` matches one whole (rustc's interpolated nonterminal tokens)
     pub frag_groups: crate::fxhash::HashMap<u32, u32>,
+    /// starts of the `$t:ty` substitutions of expansion text (not a trait where a bound is expected)
+    ty_frags: crate::fxhash::HashSet<u32>,
     /// file context for built-in macros (file!, module_path!, env!, cfg of derive inputs)
     pub bctx: Option<std::rc::Rc<crate::builtins::FileCtx>>,
     /// names of the inline `mod x { }` blocks being parsed (module_path!)
@@ -96,7 +131,7 @@ pub struct Parser<'a> {
     /// inside a cfg'd-out item (parse_cfg_out): nothing is generated
     cfg_out: u32,
     /// attributes whose shape is checked once their item is known to be configured in (check only)
-    pending_shape: Vec<TokRange>,
+    pending_shape: Vec<(TokRange, Option<PErr>)>,
 }
 
 // precedence levels
@@ -136,10 +171,12 @@ impl<'a> Parser<'a> {
             token_input: false,
             sources: None,
             exp_depth: 0,
+            rec_limit: std::cell::Cell::new(None),
             rules_exp: Default::default(),
             body_origin: Default::default(),
             tok_undo: Vec::new(),
             frag_groups: Default::default(),
+            ty_frags: Default::default(),
             bctx: None,
             mod_stack: Vec::new(),
             interp: Default::default(),
@@ -157,13 +194,13 @@ impl<'a> Parser<'a> {
 
     #[inline]
     fn kind(&self) -> T {
-        self.toks.at(self.pos).kind
+        self.toks.kind_at(self.pos)
     }
     #[inline]
     fn nth(&self, n: usize) -> T {
         let i = self.pos + n;
         if i < self.toks.len() {
-            self.toks.at(i).kind
+            self.toks.kind_at(i)
         } else {
             T::Eof
         }
@@ -240,7 +277,7 @@ impl<'a> Parser<'a> {
     #[inline]
     fn is_word(&self, n: usize, w: &[u8]) -> bool {
         let i = self.pos + n;
-        i < self.toks.len() && self.toks.at(i).kind == T::Ident && self.text_of(self.toks.at(i)) == w
+        i < self.toks.len() && self.toks.kind_at(i) == T::Ident && self.text_of(self.toks.at(i)) == w
     }
     /// rustc_span symbol.rs: the reserved-for-future-use keywords are no identifiers (a raw
     /// identifier is); `_` names nothing but a pattern, a const or a rename.
@@ -266,6 +303,12 @@ impl<'a> Parser<'a> {
         match self.kind() {
             T::Ident | T::RawIdent => {
                 let t = self.tok();
+                // `fn /// doc` ... a doc comment between an item keyword and its name
+                if self.pos > 0 && matches!(self.toks.at(self.pos - 1).kind, T::KwFn | T::KwStruct | T::KwEnum | T::KwTrait | T::KwMod | T::KwType | T::KwStatic | T::KwConst) {
+                    if let Some(pos) = self.doc_before_pos() {
+                        return Err(PErr { pos, msg: "expected identifier, found doc comment".into() });
+                    }
+                }
                 if let Some(m) = self.reserved_ident(t) {
                     return Err(PErr { pos: t.lo, msg: m });
                 }
@@ -283,14 +326,19 @@ impl<'a> Parser<'a> {
     /// current one? Such a comment documents the next item, field or statement; before a closing
     /// brace, a `;`, a `,` or the end of the file it documents nothing (E0584 / E0585).
     fn doc_before(&self) -> bool {
+        self.doc_before_pos().is_some()
+    }
+
+    /// The start of the doc comment `doc_before` found.
+    fn doc_before_pos(&self) -> Option<u32> {
         let cur = self.tok();
         let lo = cur.lo as usize;
         if lo > self.src.len() {
-            return false;
+            return None;
         }
         let prev_hi = if self.pos == 0 { 0 } else { self.toks.at(self.pos - 1).hi as usize };
         if prev_hi > lo {
-            return false;
+            return None;
         }
         let g = &self.src[prev_hi..lo];
         let mut i = 0;
@@ -299,7 +347,7 @@ impl<'a> Parser<'a> {
                 b' ' | b'\t' | b'\n' | b'\r' => i += 1,
                 b'/' if g.get(i + 1) == Some(&b'/') => {
                     if g.get(i + 2) == Some(&b'/') && g.get(i + 3) != Some(&b'/') {
-                        return true;
+                        return Some((prev_hi + i) as u32);
                     }
                     while i < g.len() && g[i] != b'\n' {
                         i += 1;
@@ -307,7 +355,7 @@ impl<'a> Parser<'a> {
                 }
                 b'/' if g.get(i + 1) == Some(&b'*') => {
                     if g.get(i + 2) == Some(&b'*') && !matches!(g.get(i + 3), Some(b'*') | Some(b'/')) {
-                        return true;
+                        return Some((prev_hi + i) as u32);
                     }
                     let mut depth = 0;
                     while i < g.len() {
@@ -325,10 +373,10 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
-                _ => return false,
+                _ => return None,
             }
         }
-        false
+        None
     }
 
     fn is_ident(&self) -> bool {
@@ -463,7 +511,7 @@ impl<'a> Parser<'a> {
         let mut mismatched = None;
         let mut i = self.pos + 1;
         while i < self.toks.len() {
-            let k = self.toks.at(i).kind;
+            let k = self.toks.kind_at(i);
             match k {
                 T::OpenParen | T::OpenBracket | T::OpenBrace => stack.push(k),
                 T::CloseParen | T::CloseBracket | T::CloseBrace => {
@@ -481,15 +529,15 @@ impl<'a> Parser<'a> {
                     }
                 }
                 T::KwFn | T::KwImpl | T::KwStruct | T::KwEnum | T::KwTrait | T::KwMod | T::KwUse | T::KwStatic | T::KwExtern | T::KwType | T::Interp | T::Pound if k != T::Pound || self.toks.get(i + 1).map(|t| t.kind) == Some(T::Not) => return BodyOutline::Eager(if k == T::Interp { 5 } else { 2 }),
-                T::KwConst if i + 2 < self.toks.len() && matches!(self.toks.at(i + 1).kind, T::Ident | T::RawIdent) && self.toks.at(i + 2).kind == T::Colon => return BodyOutline::Eager(2),
-                T::Not if i > 0 && matches!(self.toks.at(i - 1).kind, T::Ident | T::RawIdent) && i + 1 < self.toks.len() && matches!(self.toks.at(i + 1).kind, T::OpenParen | T::OpenBracket | T::OpenBrace) => {
+                T::KwConst if i + 2 < self.toks.len() && matches!(self.toks.kind_at(i + 1), T::Ident | T::RawIdent) && self.toks.kind_at(i + 2) == T::Colon => return BodyOutline::Eager(2),
+                T::Not if i > 0 && matches!(self.toks.kind_at(i - 1), T::Ident | T::RawIdent) && i + 1 < self.toks.len() && matches!(self.toks.kind_at(i + 1), T::OpenParen | T::OpenBracket | T::OpenBrace) => {
                     let t = self.toks.at(i - 1);
                     let name = std::str::from_utf8(self.bytes(t.lo, t.hi)).unwrap_or("").trim_start_matches("r#");
                     // `std::x!` / `core::x!` / `alloc::x!` or a plain name
-                    if i >= 2 && self.toks.at(i - 2).kind == T::PathSep {
+                    if i >= 2 && self.toks.kind_at(i - 2) == T::PathSep {
                         let q = if i >= 3 { self.toks.at(i - 3) } else { return BodyOutline::Eager(6) };
                         let qn = self.bytes(q.lo, q.hi);
-                        if !(matches!(qn, b"std" | b"core" | b"alloc") && (i < 4 || self.toks.at(i - 4).kind != T::PathSep)) {
+                        if !(matches!(qn, b"std" | b"core" | b"alloc") && (i < 4 || self.toks.kind_at(i - 4) != T::PathSep)) {
                             return BodyOutline::Eager(6);
                         }
                     }
@@ -769,13 +817,16 @@ impl<'a> Parser<'a> {
         if first == b"cfg" || first == b"cfg_attr" {
             return self.check_attr_shape(toks);
         }
-        self.pending_shape.push(toks);
+        self.pending_shape.push((toks, None));
         Ok(())
     }
 
     fn check_pending_attrs(&mut self) -> PResult<()> {
         let pending = std::mem::take(&mut self.pending_shape);
-        for toks in pending {
+        for (toks, err) in pending {
+            if let Some(e) = err {
+                return Err(e);
+            }
             self.check_attr_shape(toks)?;
         }
         Ok(())
@@ -783,7 +834,7 @@ impl<'a> Parser<'a> {
 
     fn check_attr_shape(&self, toks: TokRange) -> PResult<()> {
         let (lo, hi) = (toks.lo as usize, toks.hi as usize);
-        if hi <= lo || hi > self.toks.len() || self.toks.at(lo).kind != T::Ident {
+        if hi <= lo || hi > self.toks.len() || self.toks.kind_at(lo) != T::Ident {
             return Ok(());
         }
         let name = self.tok_text(self.toks.at(lo));
@@ -796,12 +847,12 @@ impl<'a> Parser<'a> {
         let bad = |this: &Self, at: usize, what: &str| -> PResult<()> {
             Err(PErr { pos: this.toks.at(at.min(hi - 1)).lo, msg: format!("E0539: malformed `{}` attribute input -- {}", String::from_utf8_lossy(this.tok_text(this.toks.at(lo))), what) })
         };
-        let kind = |i: usize| if i < hi { self.toks.at(i).kind } else { T::Eof };
+        let kind = |i: usize| if i < hi { self.toks.kind_at(i) } else { T::Eof };
         if kind(lo + 1) != T::OpenParen {
             return bad(self, lo, "expected this to be a list");
         }
         let close = hi - 1;
-        if self.toks.at(close).kind != T::CloseParen {
+        if self.toks.kind_at(close) != T::CloseParen {
             return Ok(());
         }
         if which == 2 {
@@ -847,8 +898,20 @@ impl<'a> Parser<'a> {
 
     /// One cfg predicate at `*i` (bounded by `end`); Err is the note.
     fn cfg_entry(&self, i: &mut usize, end: usize) -> Result<(), String> {
-        let k = if *i < end { self.toks.at(*i).kind } else { T::Eof };
+        let k = if *i < end { self.toks.kind_at(*i) } else { T::Eof };
         match k {
+            // an `$e:expr` fragment is substituted in parentheses (an interpolated expression is one
+            // meta item to rustc); such a paren pair only exists in macro expansion text
+            T::OpenParen if (self.toks.at(*i).lo as usize) >= self.src.len() => {
+                *i += 1;
+                self.cfg_entry(i, end)?;
+                if *i < end && self.toks.at(*i).kind == T::CloseParen {
+                    *i += 1;
+                    Ok(())
+                } else {
+                    Err("expected `)`".into())
+                }
+            }
             T::KwTrue | T::KwFalse => {
                 *i += 1;
                 Ok(())
@@ -856,12 +919,12 @@ impl<'a> Parser<'a> {
             T::Ident | T::RawIdent => {
                 let name = self.tok_text(self.toks.at(*i)).to_vec();
                 *i += 1;
-                let next = if *i < end { self.toks.at(*i).kind } else { T::Eof };
+                let next = if *i < end { self.toks.kind_at(*i) } else { T::Eof };
                 match next {
                     T::PathSep => Err("expected a valid identifier here".into()),
                     T::Eq => {
                         *i += 1;
-                        if *i < end && matches!(self.toks.at(*i).kind, T::Str | T::RawStr) {
+                        if *i < end && matches!(self.toks.kind_at(*i), T::Str | T::RawStr) {
                             *i += 1;
                             Ok(())
                         } else {
@@ -871,16 +934,16 @@ impl<'a> Parser<'a> {
                     T::OpenParen if matches!(name.as_slice(), b"all" | b"any" | b"not") => {
                         *i += 1;
                         let mut n = 0;
-                        while *i < end && self.toks.at(*i).kind != T::CloseParen {
+                        while *i < end && self.toks.kind_at(*i) != T::CloseParen {
                             self.cfg_entry(i, end)?;
                             n += 1;
-                            if *i < end && self.toks.at(*i).kind == T::Comma {
+                            if *i < end && self.toks.kind_at(*i) == T::Comma {
                                 *i += 1;
                             } else {
                                 break;
                             }
                         }
-                        if *i >= end || self.toks.at(*i).kind != T::CloseParen {
+                        if *i >= end || self.toks.kind_at(*i) != T::CloseParen {
                             return Err("expected `)`".into());
                         }
                         *i += 1;
@@ -901,7 +964,7 @@ impl<'a> Parser<'a> {
     /// `#[repr(C, packed)]`): every reader compares attribute names by text.
     fn unraw_attr(&mut self, toks: TokRange) {
         for i in toks.lo as usize..(toks.hi as usize).min(self.toks.len()) {
-            if self.toks.at(i).kind == T::RawIdent && self.tok_text(self.toks.at(i)).starts_with(b"r#") {
+            if self.toks.kind_at(i) == T::RawIdent && self.tok_text(self.toks.at(i)).starts_with(b"r#") {
                 self.toks.edit(i, |t| { t.kind = T::Ident; t.lo += 2; });
             }
         }
@@ -1039,6 +1102,22 @@ impl<'a> Parser<'a> {
     }
 
     /// The `macro_rules!` macro a call path names, if any.
+    /// Is `name` mentioned in a `use` item of this file (a macro can be imported by path)? Text scan, only
+    /// reached for a call of a macro defined further down.
+    fn name_imported(&self, name: &str) -> bool {
+        let text = String::from_utf8_lossy(self.src);
+        let mut from = 0;
+        while let Some(i) = text[from..].find(name) {
+            let at = from + i;
+            let line_start = text[..at].rfind('\n').map_or(0, |x| x + 1);
+            if text[line_start..at].contains("use ") || text[..at].rfind("use ").is_some_and(|u| !text[u..at].contains(';')) {
+                return true;
+            }
+            from = at + name.len();
+        }
+        false
+    }
+
     fn rules_macro(&self, path: &Path) -> Option<crate::macros::MacroRef> {
         let m = self.macros.as_ref()?;
         let seg = self.ast.segs(path.segs).last()?;
@@ -1068,7 +1147,16 @@ impl<'a> Parser<'a> {
         let module = self.cur_module();
         let qual = mpath.iter().find(|x| !x.is_empty()).cloned();
         let qual = qual.map(|q| q.strip_prefix("__relax_crate_").map(|x| x.to_string()).unwrap_or(q));
-        let r = m.lookup(&name, &self.krate, &mpath, &module);
+        let mut r = m.lookup(&name, &self.krate, &mpath, &module);
+        // textual scope (`macro_rules!` is visible only after its definition): a plain-name call of a
+        // macro this file defines further down is not in scope (check only; the call must be written
+        // code, not an expansion)
+        if let Some(d) = &r {
+            if qual.is_none() && d.builtin == 0 && !d.exported && crate::lexer::validation_enabled() && (seg.name.lo as usize) < self.src.len()
+                && self.bctx.as_ref().is_some_and(|c| c.path == d.def_file) && seg.name.lo < d.def_pos && (d.def_pos as usize) < self.src.len() && !self.name_imported(&name) {
+                r = None;
+            }
+        }
         // Relax's built-in macros (builtins.rs) when no macro_rules! of that name is visible
         match r {
             Some(d) => Some(crate::builtins::override_rules(&self.session.options, d)),
@@ -1111,14 +1199,14 @@ impl<'a> Parser<'a> {
     /// ...) with every argument that is a `macro_rules!` call replaced by its expansion text,
     /// or None when no argument is one (the built-in then reads the arguments as they are).
     /// rustc expands such arguments eagerly (rustc_builtin_macros `expr_to_spanned_string`).
-    fn builtin_with_rules_expanded(&mut self, name: &str, toks: TokRange) -> PResult<Option<String>> {
+    fn builtin_with_rules_expanded(&mut self, name: &str, toks: TokRange) -> PResult<Option<(String, Vec<Tok>)>> {
         let (lo, hi) = (toks.lo as usize, toks.hi as usize);
         // top-level arguments
         let mut args = Vec::new();
         let mut depth = 0i32;
         let mut s = lo;
         for i in lo..hi {
-            match self.toks.at(i).kind {
+            match self.toks.kind_at(i) {
                 T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
                 T::CloseParen | T::CloseBracket | T::CloseBrace => depth -= 1,
                 T::Comma if depth == 0 => {
@@ -1132,25 +1220,25 @@ impl<'a> Parser<'a> {
             args.push((s, hi));
         }
         let mut any = false;
-        let mut out = Vec::new();
+        let mut out: Vec<(String, Vec<Tok>)> = Vec::new();
         for (a, z) in args {
             // `path ! (..)`: idents and `::` up to the `!`, then one delimited group to the end
             let mut i = a;
-            while i < z && matches!(self.toks.at(i).kind, T::Ident | T::PathSep | T::KwCrate | T::Dollar) {
+            while i < z && matches!(self.toks.kind_at(i), T::Ident | T::PathSep | T::KwCrate | T::Dollar) {
                 i += 1;
             }
-            let call = i > a && i + 2 < z + 1 && self.toks.at(i).kind == T::Not && matches!(self.toks.at(i + 1).kind, T::OpenParen | T::OpenBracket | T::OpenBrace) && matches!(self.toks.at(z - 1).kind, T::CloseParen | T::CloseBracket | T::CloseBrace);
+            let call = i > a && i + 2 < z + 1 && self.toks.kind_at(i) == T::Not && matches!(self.toks.kind_at(i + 1), T::OpenParen | T::OpenBracket | T::OpenBrace) && matches!(self.toks.kind_at(z - 1), T::CloseParen | T::CloseBracket | T::CloseBrace);
             let def = if call {
                 let name = String::from_utf8_lossy(self.tok_text(self.toks.at(i - 1))).trim_start_matches("r#").to_string();
                 let first = String::from_utf8_lossy(self.tok_text(self.toks.at(a))).into_owned();
                 let _ = first;
                 // the path's module part (idents, `crate`, `$crate` spelt `__relax_crate_x`)
                 let mut mpath: Vec<String> = Vec::new();
-                if self.toks.at(a).kind == T::PathSep {
+                if self.toks.kind_at(a) == T::PathSep {
                     mpath.push(String::new());
                 }
                 for k in a..i.saturating_sub(1) {
-                    if matches!(self.toks.at(k).kind, T::Ident | T::KwCrate) {
+                    if matches!(self.toks.kind_at(k), T::Ident | T::KwCrate) {
                         mpath.push(String::from_utf8_lossy(self.tok_text(self.toks.at(k))).trim_start_matches("r#").to_string());
                     }
                 }
@@ -1173,9 +1261,19 @@ impl<'a> Parser<'a> {
             };
             match def {
                 Some(d) => {
-                    let (text, _, _, _) = self.expand_rules(&d, i + 2, z - 1).map_err(|m| PErr { pos: self.toks.at(a).lo, msg: m })?;
+                    let (text, rtoks, _, _, _) = self.expand_rules(&d, i + 2, z - 1).map_err(|m| PErr { pos: self.toks.at(a).lo, msg: m })?;
                     // its own output may hold more calls: concat! re-expands it as an argument
-                    out.push(if name == "concat" { text } else { format!("concat!({text})") });
+                    if name == "concat" {
+                        out.push((text, rtoks));
+                    } else {
+                        let mut w = TokText::default();
+                        w.word(T::Ident, "concat");
+                        w.word(T::Not, "!");
+                        w.word(T::OpenParen, "(");
+                        w.append(&text, &rtoks);
+                        w.word(T::CloseParen, ")");
+                        out.push((w.s, w.toks));
+                    }
                     any = true;
                 }
                 None if nested.is_some() => {
@@ -1183,13 +1281,29 @@ impl<'a> Parser<'a> {
                     any = true;
                 }
                 None => {
-                    let lo = self.toks.at(a).lo as usize;
-                    let hi = self.toks.at(z - 1).hi as usize;
-                    out.push(String::from_utf8_lossy(self.bytes(lo as u32, hi as u32)).into_owned());
+                    let lo = self.toks.at(a).lo;
+                    let hi = self.toks.at(z - 1).hi;
+                    let toks: Vec<Tok> = (a..z).map(|k| { let t = self.toks.at(k); Tok { kind: t.kind, lo: t.lo - lo, hi: t.hi - lo } }).collect();
+                    out.push((String::from_utf8_lossy(self.bytes(lo, hi)).into_owned(), toks));
                 }
             }
         }
-        Ok(if any { Some(format!("{name}!({})", out.join(", "))) } else { None })
+        if !any {
+            return Ok(None);
+        }
+        let mut w = TokText::default();
+        w.word(T::Ident, name);
+        w.word(T::Not, "!");
+        w.word(T::OpenParen, "(");
+        for (k, (text, toks)) in out.iter().enumerate() {
+            if k > 0 {
+                w.word(T::Comma, ",");
+                w.s.push(' ');
+            }
+            w.append(text, toks);
+        }
+        w.word(T::CloseParen, ")");
+        Ok(Some((w.s, w.toks)))
     }
 
     /// Expands a call: appends the expansion's tokens (ending in Eof) and returns their start.
@@ -1197,8 +1311,30 @@ impl<'a> Parser<'a> {
         self.expand_call_inner(def, toks, call_lo)
     }
 
+    /// The `#![recursion_limit = ".."]` of this file's inner attributes.
+    fn written_recursion_limit(&self) -> Option<u32> {
+        if let Some(v) = self.rec_limit.get() { return v; }
+        let v = self.read_recursion_limit();
+        self.rec_limit.set(Some(v));
+        v
+    }
+
+    fn read_recursion_limit(&self) -> Option<u32> {
+        self.ast.root_attrs.iter().find_map(|a| {
+            if a.toks.hi == a.toks.lo + 3 && self.tok_text(self.toks.at(a.toks.lo as usize)) == b"recursion_limit" && self.tok_text(self.toks.at(a.toks.lo as usize + 1)) == b"=" {
+                std::str::from_utf8(self.tok_text(self.toks.at(a.toks.lo as usize + 2))).ok()?.trim_matches('"').parse().ok()
+            } else { None }
+        })
+    }
+
     fn expand_call_inner(&mut self, def: &crate::macros::MacroDef, toks: TokRange, call_lo: u32) -> PResult<usize> {
-        if self.exp_depth > 256 {
+        // rustc_expand expand_invoc: the crate's `#![recursion_limit = ".."]` bounds the expansion depth (a top-level call
+        // is at depth 1); the written limit is the root file's, other files keep the built-in bound
+        if let Some(limit) = self.written_recursion_limit() {
+            if self.exp_depth + 1 > limit {
+                return Err(PErr { pos: call_lo, msg: format!("recursion limit reached while expanding `{}!`", def.name) });
+            }
+        } else if self.exp_depth > 256 {
             return Err(PErr { pos: call_lo, msg: format!("`{}!` expands more than 256 levels deep -- add a base case", def.name) });
         }
         let trace = crate::preload::relax_trace().map_or(false, |t| t.split(',').any(|p| p.strip_prefix("expand:").map_or(false, |n| def.name.contains(n))));
@@ -1206,8 +1342,8 @@ impl<'a> Parser<'a> {
         if def.builtin < crate::builtins::HOSTED && matches!(crate::builtins::from_u8(def.builtin), B::Concat | B::Env | B::OptionEnv | B::Include | B::IncludeStr | B::IncludeBytes) {
             // the arguments are expanded first (rustc expands macro calls among them
             // eagerly: `concat!("{", asset_ref!("x"), "}")` with a user macro_rules)
-            if let Some(text) = self.builtin_with_rules_expanded(&def.name, toks)? {
-                return self.expand_text(&def.name, &text, call_lo);
+            if let Some((text, rtoks)) = self.builtin_with_rules_expanded(&def.name, toks)? {
+                return Ok(self.expand_toks(&text, &rtoks, call_lo));
             }
         }
         if def.builtin != 0 {
@@ -1220,7 +1356,7 @@ impl<'a> Parser<'a> {
                 // that contains it, an item's with the module; the file still loads
                 Err(m) => {
                     let semi = if crate::builtins::is_item_level(b) { ";" } else { "" };
-                    crate::builtins::Expansion::lexed(format!("compile_error!({:?}){}", format!("`{}!`: {}", def.name, m), semi)).map_err(|m| PErr { pos: call_lo, msg: m })?
+                    crate::builtins::Expansion::from_buf(crate::tokbuf::TokBuf::compile_error(self.edition, &format!("`{}!`: {}", def.name, m), !semi.is_empty()))
                 }
             };
             // MAKEPAD_RUN_TRACE=expand:<macro name> prints expansions (debugger-free macro debugging)
@@ -1234,7 +1370,7 @@ impl<'a> Parser<'a> {
         }
         let _profile = crate::load_profile::span(self.session.runtime.profile, "macro-rules-output", &def.name);
         let key = crate::parse_work::rules_key(self, def, call_lo, self.toks.at(toks.hi as usize).hi);
-        let (text, origins, bodies, groups) = if let Some(x) = crate::parse_work::get_rules(&key).filter(|_| !crate::macros::uses::recording()) { x } else {
+        let (text, rtoks, origins, bodies, groups) = if let Some(x) = crate::parse_work::get_rules(&key).filter(|_| !crate::macros::uses::recording()) { x } else {
             let x = crate::preload::timed_named(2, &def.name, || self.expand_rules(def, toks.lo as usize, toks.hi as usize)).map_err(|m| PErr { pos: call_lo, msg: m })?;
             crate::parse_work::put_rules(key, &x);
             x
@@ -1243,11 +1379,17 @@ impl<'a> Parser<'a> {
             eprintln!("expand {}! => {}", def.name, text);
         }
         let base = (self.src.len() + self.ext.len()) as u32;
+        if crate::macros::uses::recording() {
+            crate::macros::uses::synth_flush(self.bctx.as_ref().map_or("", |c| c.path.as_str()), base);
+        }
         for (off, o, n) in origins {
             self.tok_origin.push((base + off, o, n));
         }
         for (a, b) in groups {
-            self.frag_groups.insert(base + a, base + b);
+            if b & crate::macros::TY_FRAG != 0 {
+                self.ty_frags.insert(base + a);
+            }
+            self.frag_groups.insert(base + a, base + (b & !crate::macros::TY_FRAG));
         }
         let here = self.bctx.as_ref().map(|c| c.path.as_str()).unwrap_or("");
         let same_file = !def.def_file.is_empty() && def.def_file == here;
@@ -1260,7 +1402,18 @@ impl<'a> Parser<'a> {
                 self.body_origin.push((base + off, bp, n));
             }
         }
-        self.expand_text(&def.name, &text, call_lo)
+        if verify_tokens() {
+            let mut lexed = Vec::new();
+            let ok = crate::lexer::lex(text.as_bytes(), self.edition, &mut lexed).is_ok();
+            lexed.retain(|t| t.kind != T::Eof);
+            let same = ok && lexed.len() == rtoks.len() && lexed.iter().zip(&rtoks).all(|(a, b)| a.kind == b.kind && a.lo == b.lo && a.hi == b.hi);
+            if !same {
+                let at = lexed.iter().zip(&rtoks).position(|(a, b)| !(a.kind == b.kind && a.lo == b.lo && a.hi == b.hi)).unwrap_or(lexed.len().min(rtoks.len()));
+                panic!("macro_rules tokens differ from the lexed text of `{}!` at token {} (lexed {} tokens, transcribed {}): lexed {:?} transcribed {:?} near `{}`", def.name, at, lexed.len(), rtoks.len(),
+                    lexed.get(at).map(|t| (t.kind, t.lo, t.hi)), rtoks.get(at).map(|t| (t.kind, t.lo, t.hi)), &text[(text.len().min(rtoks.get(at).map_or(0, |t| t.lo as usize))).saturating_sub(30)..text.len().min(rtoks.get(at).map_or(0, |t| t.hi as usize) + 30)]);
+            }
+        }
+        Ok(self.expand_toks(&text, &rtoks, call_lo))
     }
 
     /// Appends an expansion given as tokens over `text` (positions relative to it; a proc
@@ -1276,26 +1429,6 @@ impl<'a> Parser<'a> {
         self.toks.push(Tok { kind: T::Eof, lo: e, hi: e });
         self.exp_map.push((base, e, call_lo));
         start
-    }
-
-    /// Appends expansion text (lexed; ends in Eof) and returns the index of its first token.
-    pub fn expand_text(&mut self, name: &str, text: &str, call_lo: u32) -> PResult<usize> {
-        let base = (self.src.len() + self.ext.len()) as u32;
-        self.ext.extend_from_slice(text.as_bytes());
-        let mut nt = Vec::new();
-        crate::lexer::lex(text.as_bytes(), self.edition, &mut nt).map_err(|e| PErr { pos: call_lo, msg: format!("`{}!` expands to text that does not lex: {}", name, e.msg) })?;
-        let start = self.toks.len();
-        for mut t in nt {
-            t.lo += base;
-            t.hi += base;
-            self.toks.push(t);
-        }
-        if self.toks.last().map_or(true, |t| t.kind != T::Eof) {
-            let e = base + text.len() as u32;
-            self.toks.push(Tok { kind: T::Eof, lo: e, hi: e });
-        }
-        self.exp_map.push((base, base + text.len() as u32, call_lo));
-        Ok(start)
     }
 
     /// Parses an expansion that starts at token `start`; it must consume it all.
@@ -1340,9 +1473,23 @@ impl<'a> Parser<'a> {
             self.pos = save;
             return Ok(None);
         }
+        let trailing = delim != b'{' && matches!(self.kind(), T::CloseBrace | T::Eof);
         self.eat(T::Semi);
         let start = self.expand_call(&def, toks, lo)?;
         let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
+        if trailing && def.builtin == 0 && crate::macros::uses::recording() {
+            // a macro call ending a block is an expression (rustc_expand flat_map_stmt
+            // `is_trailing_mac`): its expansion's `;` after the one expression is linted
+            let save = self.pos;
+            self.pos = start;
+            let one_expr = self.outer_attrs().is_ok() && self.expr().is_ok() && self.kind() == T::Semi && self.nth(1) == T::Eof;
+            let semi = self.lo();
+            self.pos = save;
+            if one_expr {
+                let file = self.bctx.as_ref().map_or("", |c| c.path.as_str()).to_string();
+                crate::macros::uses::trailing_semi(&file, semi, lo, &def.def_file);
+            }
+        }
         Ok(Some(self.in_expansion(start, |p| f(p, include))?))
     }
 
@@ -1417,10 +1564,14 @@ impl<'a> Parser<'a> {
         })?;
         match r {
             Some(mut v) => {
-                let had_semi = self.pos > 0 && self.toks.at(self.pos - 1).kind == T::Semi;
+                let had_semi = self.pos > 0 && self.toks.kind_at(self.pos - 1) == T::Semi;
                 if had_semi {
-                    if let Some(Stmt::Expr(_, semi)) = v.last_mut() {
-                        *semi = true;
+                    match v.last_mut() {
+                        Some(Stmt::Expr(_, semi)) => *semi = true,
+                        // rustc_expand `flat_map_stmt`: a call with a trailing `;` that expands to
+                        // nothing leaves an empty statement (a block's tail stays what it was)
+                        None => v.push(Stmt::Empty),
+                        _ => {}
                     }
                 }
                 stmts.extend(v);
@@ -1491,7 +1642,7 @@ impl<'a> Parser<'a> {
             if self.kind() == T::Semi {
                 // `m! { .. };` : a macro item in braces may be followed by its `;`
                 let after_mac = items.last().map_or(false, |id: &ItemId| matches!(self.ast.item(*id).kind, ItemKind::Mac(_) | ItemKind::MacroRules(_)))
-                    && self.pos > 0 && self.toks.at(self.pos - 1).kind == T::CloseBrace;
+                    && self.pos > 0 && self.toks.kind_at(self.pos - 1) == T::CloseBrace;
                 // (generated text -- derive output -- is not held to the syntax of written code)
                 if !after_mac && (self.tok().lo as usize) < self.src.len() {
                     return self.err("expected item, found `;`");
@@ -1714,7 +1865,7 @@ impl<'a> Parser<'a> {
                 self.derive_after(*id, tok_lo)?;
             }
             if self.cfg_out == 0 && matches!(self.ast.item(*id).kind, ItemKind::Struct(..) | ItemKind::Enum(..)) {
-                self.default_consts(*id)?;
+                self.default_consts(*id, tok_lo)?;
             }
         }
         r
@@ -1873,6 +2024,10 @@ impl<'a> Parser<'a> {
                 let bounds = if self.eat(T::Colon) { self.bounds()? } else { List::EMPTY };
                 self.where_clause(&mut generics)?;
                 let ty = if self.eat(T::Eq) { Some(self.ty_plus()?) } else { None };
+                // (a free alias takes its where clause before the `=`; only associated types may put it after)
+                if ty.is_some() && self.in_assoc == 0 && self.foreign_abi.is_none() && self.kind() == T::KwWhere {
+                    return self.err("where clauses are not allowed after the type for type aliases");
+                }
                 self.where_clause(&mut generics)?;
                 self.expect(T::Semi)?;
                 ItemKind::TypeAlias(self.ast.push_row(TypeAliasItem { generics, bounds, ty }))
@@ -1959,8 +2114,12 @@ impl<'a> Parser<'a> {
             T::Ident | T::PathSep | T::KwSelfValue | T::KwSuper | T::KwCrate
                 if self.mac_ahead() =>
             {
+                let path_lo = self.lo();
                 let path = self.path(true)?;
                 self.expect(T::Not)?;
+                if !matches!(vis, Vis::Private) {
+                    return Err(PErr { pos: path_lo, msg: "can't qualify macro invocation with `pub`".into() });
+                }
                 // `name! ident { }` (macro 2.0 style) not supported
                 let (delim, toks) = self.delim_tt()?;
                 if delim != b'{' {
@@ -2018,18 +2177,18 @@ impl<'a> Parser<'a> {
     /// path `!` delimiter (item- or statement-level macro call)
     fn mac_ahead(&self) -> bool {
         let mut i = self.pos;
-        if self.toks.at(i).kind == T::PathSep {
+        if self.toks.kind_at(i) == T::PathSep {
             i += 1;
         }
         loop {
-            match self.toks.at(i).kind {
+            match self.toks.kind_at(i) {
                 T::Ident | T::RawIdent | T::KwSelfValue | T::KwSuper | T::KwCrate => i += 1,
                 _ => return false,
             }
-            match self.toks.at(i).kind {
+            match self.toks.kind_at(i) {
                 T::PathSep => i += 1,
                 T::Not => {
-                    return matches!(self.toks.at(i + 1).kind, T::OpenParen | T::OpenBracket | T::OpenBrace);
+                    return matches!(self.toks.kind_at(i + 1), T::OpenParen | T::OpenBracket | T::OpenBrace);
                 }
                 _ => return false,
             }
@@ -2359,6 +2518,24 @@ impl<'a> Parser<'a> {
         self.in_assoc -= 1;
         let items = items?;
         self.expect(T::CloseBrace)?;
+        // rustc_ast_passes `check_item_in_assoc_context`: only fns, consts and types are members
+        // (a `static` is a member of an `extern` block, not of an impl or a trait)
+        for &id in &items {
+            let what = match self.ast.item(id).kind {
+                ItemKind::Struct(_) => "struct",
+                ItemKind::Enum(_) => "enum",
+                ItemKind::Union(_) => "union",
+                ItemKind::Trait(_) => "trait",
+                ItemKind::Impl(_) => "implementation",
+                ItemKind::Mod(_) => "module",
+                ItemKind::Use(_) => "`use` import",
+                ItemKind::ExternCrate(_) => "extern crate",
+                ItemKind::Static(..) if self.foreign_abi.is_none() => "static",
+                _ => continue,
+            };
+            let lo = self.ast.item(id).lo;
+            return Err(PErr { pos: lo, msg: format!("{what} is not supported in `trait`s or `impl`s") });
+        }
         // (after the member items, which are items of their own)
         self.pending_inner.extend(inner);
         Ok(self.ast.push_list(items))
@@ -2371,7 +2548,15 @@ impl<'a> Parser<'a> {
         self.foreign_abi = Some(abi);
         let items = self.assoc_items();
         self.foreign_abi = saved;
-        items
+        let items = items?;
+        // rustc_parse `parse_item_kind` in an extern block: `const` is not a foreign item
+        for &id in self.ast.list(items) {
+            let it = self.ast.item(id);
+            if matches!(it.kind, ItemKind::Const(..)) {
+                return Err(PErr { pos: it.lo, msg: "extern items cannot be `const`".into() });
+            }
+        }
+        Ok(items)
     }
 
     fn impl_generics_ahead(&self) -> bool {
@@ -2415,6 +2600,12 @@ impl<'a> Parser<'a> {
     // ------------------------------------------------------------ use trees
 
     fn use_tree(&mut self) -> PResult<UseTree> {
+        self.use_tree_in(None, false)
+    }
+
+    /// `prefix`: the kind of the last segment of the path before this tree; `in_group`: the tree
+    /// is an element of a `{..}` list (rustc_resolve build_reduced_graph: `{self}` names its prefix).
+    fn use_tree_in(&mut self, prefix: Option<SegKind>, in_group: bool) -> PResult<UseTree> {
         match self.kind() {
             T::Star => {
                 self.pos += 1;
@@ -2425,7 +2616,7 @@ impl<'a> Parser<'a> {
                 let mut v = Vec::new();
                 while self.kind() != T::CloseBrace {
                     self.eat(T::PathSep);
-                    v.push(self.use_tree()?);
+                    v.push(self.use_tree_in(prefix, true)?);
                     if !self.eat(T::Comma) {
                         break;
                     }
@@ -2436,10 +2627,18 @@ impl<'a> Parser<'a> {
             _ => {
                 let seg = self.path_seg_name()?;
                 if self.eat(T::PathSep) {
-                    let rest = self.use_tree()?;
+                    let rest = self.use_tree_in(Some(seg.kind()), false)?;
                     Ok(UseTree::Path(seg, self.ast.push_use_tree(rest)))
                 } else {
                     let rename = if self.eat(T::KwAs) { Some(self.ident_or_underscore()?) } else { None };
+                    // rustc_resolve: importing a path keyword without renaming it
+                    if rename.is_none() && crate::lexer::validation_enabled() && self.cfg_out == 0 {
+                        let named = if seg.kind() == SegKind::SelfValue && (in_group || prefix.is_some()) { prefix.unwrap_or(seg.kind()) } else { seg.kind() };
+                        if matches!(named, SegKind::SelfValue | SegKind::Super | SegKind::Crate) {
+                            let e = PErr { pos: seg.name.lo, msg: "imports need to be explicitly named".to_string() };
+                            self.pending_shape.push((TokRange { lo: 0, hi: 0 }, Some(e)));
+                        }
+                    }
                     Ok(UseTree::Name(seg, rename))
                 }
             }
@@ -2611,6 +2810,10 @@ impl<'a> Parser<'a> {
             return Ok(Bound::Use(args));
         }
         let paren = self.eat(T::OpenParen);
+        // rustc_parse parse_trait_bound: the binder, then the modifiers (`for<'a> ?Tr` is an error, as is a
+        // binder after the modifiers)
+        let binder = self.kind() == T::KwFor && self.nth(1) == T::Lt;
+        let hrtb = self.hrtb()?;
         let mut konst = false;
         if self.kind() == T::Tilde && self.nth(1) == T::KwConst {
             self.pos += 2;
@@ -2619,9 +2822,20 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             konst = true;
         }
+        let async_pos = self.tok().lo;
         let async_ = self.eat(T::KwAsync);
+        if async_ { self.ast.gated_syntax.push(("async_trait_bounds", async_pos)); }
         let maybe = self.eat(T::Question);
-        let hrtb = self.hrtb()?;
+        if binder && maybe {
+            return self.err("`for<...>` binder not allowed with `?` trait polarity modifier");
+        }
+        if self.kind() == T::KwFor && self.nth(1) == T::Lt {
+            let _ = self.hrtb()?;
+            return self.err("`for<...>` binder should be placed before trait bound modifiers");
+        }
+        if !self.ty_frags.is_empty() && self.ty_frags.contains(&{ self.tok().lo }) {
+            return self.err("expected a trait, found type");
+        }
         let path = self.path(false)?;
         if paren {
             self.expect(T::CloseParen)?;
@@ -2750,6 +2964,17 @@ impl<'a> Parser<'a> {
                 }
                 _ => GenericArg::Type(self.ty_plus()?),
             };
+            // rustc_ast_passes: generic arguments come before the first constraint
+            if crate::lexer::validation_enabled()
+                && !matches!(arg, GenericArg::Binding(..) | GenericArg::Constraint(..))
+                && v.iter().any(|a| matches!(a, GenericArg::Binding(..) | GenericArg::Constraint(..)))
+            {
+                // an AST validation error: only reported once the enclosing item is configured in
+                if self.cfg_out == 0 {
+                    let e = self.err::<()>("generic arguments must come before the first constraint").unwrap_err();
+                    self.pending_shape.push((TokRange { lo: 0, hi: 0 }, Some(e)));
+                }
+            }
             v.push(arg);
             if !self.eat(T::Comma) {
                 self.expect_gt()?;
@@ -2765,7 +2990,7 @@ impl<'a> Parser<'a> {
         let mut i = self.pos + 1 + usize::from(self.nth(1) == T::PathSep);
         let mut depth = 0i32;
         loop {
-            match self.toks.at(i).kind {
+            match self.toks.kind_at(i) {
                 T::Lt => depth += 1,
                 T::Shl => depth += 2,
                 T::Gt => depth -= 1,
@@ -2777,7 +3002,7 @@ impl<'a> Parser<'a> {
                 T::OpenBrace => {
                     let mut braces = 0i32;
                     loop {
-                        match self.toks.at(i).kind {
+                        match self.toks.kind_at(i) {
                             T::OpenBrace => braces += 1,
                             T::CloseBrace => braces -= 1,
                             T::Eof => return false,
@@ -2794,7 +3019,7 @@ impl<'a> Parser<'a> {
                 return false;
             }
             if depth == 0 {
-                return matches!(self.toks.at(i).kind, T::Eq | T::Colon);
+                return matches!(self.toks.kind_at(i), T::Eq | T::Colon);
             }
         }
     }
@@ -2854,6 +3079,8 @@ impl<'a> Parser<'a> {
                 if self.eat(T::CloseParen) {
                     Ty::Tuple(List::EMPTY)
                 } else {
+                    // a type takes no attributes: a doc comment before a tuple element
+                    if let Some(pos) = self.doc_before_pos() { return Err(PErr { pos, msg: "expected type, found doc comment".into() }); }
                     let first = self.ty_plus()?;
                     if self.eat(T::CloseParen) {
                         Ty::Paren(first)
@@ -2863,6 +3090,7 @@ impl<'a> Parser<'a> {
                             if self.kind() == T::CloseParen {
                                 break;
                             }
+                            if let Some(pos) = self.doc_before_pos() { return Err(PErr { pos, msg: "expected type, found doc comment".into() }); }
                             v.push(self.ty_plus()?);
                         }
                         self.expect(T::CloseParen)?;
@@ -3065,6 +3293,10 @@ impl<'a> Parser<'a> {
     fn maybe_range_pat(&mut self, start: ExprId) -> PResult<Option<Pat>> {
         match self.kind() {
             T::DotDotEq | T::DotDotDot => {
+                // rustc_parse: `...` is a hard error in range patterns from edition 2021 (the edition of the written token)
+                if self.kind() == T::DotDotDot && self.edition >= 2021 && (self.toks.at(self.pos).lo as usize) < self.src.len() {
+                    return self.err("E0783: `...` range patterns are deprecated");
+                }
                 self.pos += 1;
                 let end = self.pat_range_end()?;
                 Ok(Some(Pat::Range(Some(start), Some(end), true)))
@@ -3122,7 +3354,8 @@ impl<'a> Parser<'a> {
                     trailing = true;
                 }
                 self.expect(T::CloseParen)?;
-                if v.len() == 1 && !trailing {
+                // rustc parse_pat_tuple_or_parens: `(..)` is a tuple pattern (a lone rest pattern)
+                if v.len() == 1 && !trailing && !matches!(self.ast.pat(v[0]), Pat::Rest) {
                     Pat::Paren(v[0])
                 } else {
                     Pat::Tuple(self.ast.push_list(v))
@@ -3336,6 +3569,16 @@ impl<'a> Parser<'a> {
             let ty = if self.eat(T::Colon) { Some(self.ty()?) } else { None };
             let (init, else_) = if self.eat(T::Eq) {
                 let e = self.expr()?;
+                // rustc_parse `parse_local_mk`: the initializer of a `let .. else` does not end in `}`
+                if self.kind() == T::KwElse && self.pos > 0 && self.toks.at(self.pos - 1).kind == T::CloseBrace {
+                    return self.err("right curly brace `}` before `else` in a `let...else` statement not allowed");
+                }
+                // check_let_else_init_bool_expr: a lazy boolean operator is not the whole initializer
+                if self.kind() == T::KwElse {
+                    if let ExprKind::Binary(op @ (BinOp::And | BinOp::Or), ..) = self.ast.expr(e).kind {
+                        return self.err(if op == BinOp::And { "a `&&` expression cannot be directly assigned in `let...else`" } else { "a `||` expression cannot be directly assigned in `let...else`" });
+                    }
+                }
                 let el = if self.eat(T::KwElse) { Some(self.block()?) } else { None };
                 (Some(e), el)
             } else {
@@ -3428,6 +3671,16 @@ impl<'a> Parser<'a> {
     fn expr_ns(&mut self) -> PResult<ExprId> {
         self.expr_bp(0, NO_STRUCT)
     }
+    /// A match guard (rustc parse_match_guard_condition: chains always allowed)
+    fn guard_expr(&mut self) -> PResult<ExprId> {
+        let g = self.expr_bp(0, ALLOW_LET)?;
+        self.cond_check(g, false)?;
+        Ok(g)
+    }
+    /// An `if`/`while` condition (rustc parse_expr_cond)
+    fn expr_cond(&mut self) -> PResult<ExprId> {
+        self.expr_bp(0, NO_STRUCT | ALLOW_LET)
+    }
 
     fn can_begin_expr(&self, r: u8) -> bool {
         match self.kind() {
@@ -3446,7 +3699,10 @@ impl<'a> Parser<'a> {
         let lo = self.lo();
         // attributes on expressions
         if self.kind() == T::Pound {
-            let _ = self.outer_attrs()?;
+            let at = self.tok().lo;
+            // (rustc gates these when the expression is configured, not while a macro fragment is matched)
+            let real = self.macros.is_some();
+            if !self.outer_attrs()?.is_empty() && real { self.ast.gated_syntax.push(("stmt_expr_attributes", at)); }
         }
         let lhs = self.unary(r)?;
         self.expr_continue(lhs, min, r, lo)
@@ -3492,10 +3748,6 @@ impl<'a> Parser<'a> {
             if prec < min {
                 break;
             }
-            // a `let` in a condition chains with `&&` only
-            if prec == P_OROR && self.has_let_chain(lhs) {
-                return self.err("`||` operators are not supported in let chain conditions");
-            }
             self.pos += 1;
             if prec == P_ASSIGN {
                 let rhs = self.expr_bp(P_ASSIGN, r)?;
@@ -3526,11 +3778,58 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
-    fn has_let_chain(&self, e: ExprId) -> bool {
-        match self.ast.expr(e).kind {
-            ExprKind::Let(..) => true,
-            ExprKind::Binary(BinOp::And, a, b) => self.has_let_chain(a) || self.has_let_chain(b),
-            _ => false,
+    /// rustc_parse `CondChecker`: after an `if`/`while` condition (edition-dependent chains) or a
+    /// match guard (chains always allowed), a `let` reachable only through `&&` is a chain; one
+    /// below any other operator is forbidden.
+    fn cond_check(&self, e: ExprId, edition_dependent: bool) -> PResult<()> {
+        // cheap exit: the condition holds no `let` operator position at all
+        if !matches!(self.ast.expr(e).kind, ExprKind::Let(..) | ExprKind::Binary(..) | ExprKind::Paren(..) | ExprKind::Unary(..) | ExprKind::AddrOf(..)
+            | ExprKind::Range(..) | ExprKind::Cast(..) | ExprKind::Assign(..) | ExprKind::AssignOp(..) | ExprKind::Field(..) | ExprKind::TupleField(..)
+            | ExprKind::Try(..) | ExprKind::Await(..) | ExprKind::Index(..) | ExprKind::Call(..) | ExprKind::MethodCall(..) | ExprKind::Tuple(..))
+        {
+            return Ok(());
+        }
+        self.cond_visit(e, 0, 1, edition_dependent)
+    }
+
+    // forbid: 0 none, 1 `||`, 2 parentheses, 3 anything else
+    fn cond_visit(&self, e: ExprId, forbid: u8, depth: u32, ed: bool) -> PResult<()> {
+        let x = *self.ast.expr(e);
+        let walk = |s: &Self, f: u8, kids: &[ExprId]| -> PResult<()> {
+            for &k in kids {
+                s.cond_visit(k, f, depth + 1, ed)?;
+            }
+            Ok(())
+        };
+        match x.kind {
+            ExprKind::Let(..) => {
+                if forbid == 1 {
+                    return Err(PErr { pos: x.lo, msg: "`||` operators are not supported in let chain conditions".into() });
+                }
+                if forbid != 0 {
+                    return Err(PErr { pos: x.lo, msg: "expected expression, found `let` statement".into() });
+                }
+                // the edition of the code concerned; text a macro expanded has none known here
+                if depth > 1 && ed && self.edition < 2024 && (x.lo as usize) < self.src.len() {
+                    return Err(PErr { pos: x.lo, msg: "let chains are only allowed in Rust 2024 or later".into() });
+                }
+                Ok(())
+            }
+            ExprKind::Binary(BinOp::And, a, b) => walk(self, forbid, &[a, b]),
+            ExprKind::Binary(BinOp::Or, a, b) if forbid == 0 || forbid == 1 => walk(self, 1, &[a, b]),
+            ExprKind::Paren(a) if forbid == 0 || forbid == 2 => walk(self, 2, &[a]),
+            ExprKind::Assign(a, b) | ExprKind::AssignOp(_, a, b) | ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => walk(self, 3, &[a, b]),
+            ExprKind::Unary(_, a) | ExprKind::Await(a) | ExprKind::Try(a) | ExprKind::AddrOf(_, _, a) | ExprKind::Field(a, _)
+            | ExprKind::TupleField(a, _) | ExprKind::Paren(a) | ExprKind::Cast(a, _) | ExprKind::MethodCall(a, _) | ExprKind::Call(a, _) => walk(self, 3, &[a]),
+            ExprKind::Range(a, b, _) => {
+                let kids: Vec<ExprId> = a.get().into_iter().chain(b.get()).collect();
+                walk(self, 3, &kids)
+            }
+            ExprKind::Tuple(l) => {
+                let kids: Vec<ExprId> = self.ast.list(l).to_vec();
+                walk(self, 3, &kids)
+            }
+            _ => Ok(()),
         }
     }
 
@@ -3600,6 +3899,63 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// rustc `parse_dot_suffix_expr`: the token after `expr.`; the flag says a float ended in
+    /// the next access's dot (`foo.1.`), so another suffix follows at once.
+    fn dot_suffix(&mut self, mut e: ExprId, lo: u32) -> PResult<(ExprId, bool)> {
+        match self.kind() {
+            T::KwAwait => {
+                self.pos += 1;
+                e = self.mk_expr(ExprKind::Await(e), lo);
+            }
+            T::Ident | T::RawIdent => {
+                let name = self.ident_tok()?;
+                let turbofish = if self.kind() == T::PathSep && matches!(self.nth(1), T::Lt | T::Shl | T::LArrow) {
+                    self.pos += 1;
+                    self.generic_args_angle()?
+                } else {
+                    GenericArgsId::NONE
+                };
+                if self.kind() == T::OpenParen {
+                    let args = self.call_args()?;
+                    let args = self.ast.push_list(args);
+                    let row = self.ast.push_row(MethodCallRow { name, turbofish, args });
+                    e = self.mk_expr(ExprKind::MethodCall(e, row), lo);
+                } else {
+                    e = self.mk_expr(ExprKind::Field(e, name), lo);
+                }
+            }
+            T::Int => {
+                let t = self.bump();
+                let n = parse_index(self.text_of(t));
+                e = self.mk_expr(ExprKind::TupleField(e, n), lo);
+            }
+            T::Float => {
+                // break_up_float: `1e2` | `1.` | `1.2` | `1.2e3`
+                let t = self.bump();
+                let s = self.text_of(t).to_vec();
+                let dot = s.iter().position(|&c| c == b'.');
+                match dot {
+                    None => {
+                        let n = parse_index(&s);
+                        e = self.mk_expr(ExprKind::TupleField(e, n), lo);
+                    }
+                    Some(d) => {
+                        let a = parse_index(&s[..d]);
+                        e = self.mk_expr(ExprKind::TupleField(e, a), lo);
+                        if d + 1 < s.len() {
+                            let b = parse_index(&s[d + 1..]);
+                            e = self.mk_expr(ExprKind::TupleField(e, b), lo);
+                        } else {
+                            return Ok((e, true));
+                        }
+                    }
+                }
+            }
+            _ => return self.err("expected field or method"),
+        }
+        Ok((e, false))
+    }
+
     fn postfix(&mut self, mut e: ExprId, lo: u32) -> PResult<ExprId> {
         loop {
             match self.kind() {
@@ -3609,57 +3965,13 @@ impl<'a> Parser<'a> {
                 }
                 T::Dot => {
                     self.pos += 1;
-                    match self.kind() {
-                        T::KwAwait => {
-                            self.pos += 1;
-                            e = self.mk_expr(ExprKind::Await(e), lo);
+                    // `foo.1.` leaves the access's own dot behind: the next token is the next field
+                    loop {
+                        let (ne, trailing) = self.dot_suffix(e, lo)?;
+                        e = ne;
+                        if !trailing {
+                            break;
                         }
-                        T::Ident | T::RawIdent => {
-                            let name = self.ident_tok()?;
-                            let turbofish = if self.kind() == T::PathSep && matches!(self.nth(1), T::Lt | T::Shl | T::LArrow) {
-                                self.pos += 1;
-                                self.generic_args_angle()?
-                            } else {
-                                GenericArgsId::NONE
-                            };
-                            if self.kind() == T::OpenParen {
-                                let args = self.call_args()?;
-                                let args = self.ast.push_list(args);
-                                let row = self.ast.push_row(MethodCallRow { name, turbofish, args });
-                                e = self.mk_expr(ExprKind::MethodCall(e, row), lo);
-                            } else {
-                                e = self.mk_expr(ExprKind::Field(e, name), lo);
-                            }
-                        }
-                        T::Int => {
-                            let t = self.bump();
-                            let n = parse_index(self.text_of(t));
-                            e = self.mk_expr(ExprKind::TupleField(e, n), lo);
-                        }
-                        T::Float => {
-                            // `x.0.1`
-                            let t = self.bump();
-                            let s = self.text_of(t).to_vec();
-                            let mut dot = s.len();
-                            for i in 0..s.len() {
-                                if s[i] == b'.' {
-                                    dot = i;
-                                    break;
-                                }
-                            }
-                            let a = parse_index(&s[..dot]);
-                            e = self.mk_expr(ExprKind::TupleField(e, a), lo);
-                            if dot + 1 < s.len() {
-                                let b = parse_index(&s[dot + 1..]);
-                                e = self.mk_expr(ExprKind::TupleField(e, b), lo);
-                            } else if self.kind() == T::Int {
-                                // `x.0. 0`: the float `0.` ends in the access's dot, the next token is the field
-                                let t = self.bump();
-                                let b = parse_index(self.text_of(t));
-                                e = self.mk_expr(ExprKind::TupleField(e, b), lo);
-                            }
-                        }
-                        _ => return self.err("expected field or method"),
                     }
                 }
                 T::OpenParen => {
@@ -3683,7 +3995,7 @@ impl<'a> Parser<'a> {
         self.expect(T::OpenParen)?;
         let mut v = Vec::new();
         while self.kind() != T::CloseParen {
-            if let Some(e) = self.list_elem()? {
+            if let Some(e) = self.list_elem(0)? {
                 v.push(e);
             }
             if !self.eat(T::Comma) {
@@ -3697,9 +4009,9 @@ impl<'a> Parser<'a> {
     /// An element of an array / tuple / call-argument list: None when a `#[cfg(..)]` on it is false
     /// (the element is removed; Reference expressions.md [expr.attr.restriction] and
     /// conditional-compilation.md [cfg.attr]; rustc_expand config.rs configure_expr).
-    fn list_elem(&mut self) -> PResult<Option<ExprId>> {
+    fn list_elem(&mut self, r: u8) -> PResult<Option<ExprId>> {
         let attrs = if self.kind() == T::Pound && self.nth(1) == T::OpenBracket { self.outer_attrs()? } else { Vec::new() };
-        let e = self.expr()?;
+        let e = self.expr_bp(0, r)?;
         Ok(if attrs.is_empty() || self.cfg_present(&attrs) { Some(e) } else { None })
     }
 
@@ -3715,6 +4027,9 @@ impl<'a> Parser<'a> {
 
     fn primary(&mut self, r: u8) -> PResult<ExprId> {
         let lo = self.lo();
+        // rustc parse_expr_bottom: only `let` and a parenthesised expression see ALLOW_LET
+        let let_ok = r & ALLOW_LET != 0;
+        let r = if matches!(self.kind(), T::KwLet | T::OpenParen) { r } else { r & !ALLOW_LET };
         match self.kind() {
             T::Interp => {
                 let e = self.interp.get(&(self.pos as u32)).copied();
@@ -3732,7 +4047,7 @@ impl<'a> Parser<'a> {
                 if self.eat(T::CloseParen) {
                     return Ok(self.mk_expr(ExprKind::Tuple(List::EMPTY), lo));
                 }
-                let first = self.list_elem()?;
+                let first = self.list_elem(r & ALLOW_LET)?;
                 if let Some(f) = first {
                     if self.eat(T::CloseParen) {
                         return Ok(self.mk_expr(ExprKind::Paren(f), lo));
@@ -3743,7 +4058,7 @@ impl<'a> Parser<'a> {
                     if self.kind() == T::CloseParen {
                         break;
                     }
-                    if let Some(e) = self.list_elem()? {
+                    if let Some(e) = self.list_elem(r & ALLOW_LET)? {
                         v.push(e);
                     }
                 }
@@ -3756,7 +4071,7 @@ impl<'a> Parser<'a> {
                 if self.eat(T::CloseBracket) {
                     return Ok(self.mk_expr(ExprKind::Array(List::EMPTY), lo));
                 }
-                let first = self.list_elem()?;
+                let first = self.list_elem(0)?;
                 if let Some(f) = first {
                     if self.eat(T::Semi) {
                         let n = self.expr()?;
@@ -3769,7 +4084,7 @@ impl<'a> Parser<'a> {
                     if self.kind() == T::CloseBracket {
                         break;
                     }
-                    if let Some(e) = self.list_elem()? {
+                    if let Some(e) = self.list_elem(0)? {
                         v.push(e);
                     }
                 }
@@ -3826,7 +4141,7 @@ impl<'a> Parser<'a> {
                 while self.kind() != T::CloseBrace {
                     let attrs = self.outer_attrs()?;
                     let pat = self.pat_top()?;
-                    let guard = if self.eat(T::KwIf) { Some(self.expr()?) } else { None };
+                    let guard = if self.eat(T::KwIf) { Some(self.guard_expr()?) } else { None };
                     self.expect(T::FatArrow)?;
                     let blo = self.lo();
                     let body;
@@ -3856,10 +4171,13 @@ impl<'a> Parser<'a> {
                 Ok(self.mk_expr(ExprKind::Match(scrut, arms), lo))
             }
             T::KwLet => {
+                if !let_ok {
+                    return self.err("expected expression, found `let` statement");
+                }
                 self.pos += 1;
                 let pat = self.pat_top()?;
                 self.expect(T::Eq)?;
-                let e = self.expr_bp(P_CMP, r | NO_STRUCT & r)?;
+                let e = self.expr_bp(P_CMP, r & NO_STRUCT)?;
                 Ok(self.mk_expr(ExprKind::Let(pat, e), lo))
             }
             T::KwReturn => {
@@ -3895,6 +4213,7 @@ impl<'a> Parser<'a> {
             }
             T::Or | T::OrOr | T::KwMove => self.closure(false, false, r, lo),
             T::KwStatic if matches!(self.nth(1), T::Or | T::OrOr | T::KwMove) => {
+                self.ast.gated_syntax.push(("coroutines", self.tok().lo));
                 self.pos += 1;
                 self.closure(false, true, r, lo)
             }
@@ -3925,6 +4244,10 @@ impl<'a> Parser<'a> {
                         let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
                         return self.in_expansion(start, |p| {
                             let e = p.expr()?;
+                            if p.kind() == T::Semi && def.builtin == 0 && crate::macros::uses::recording() {
+                                let file = p.bctx.as_ref().map_or("", |c| c.path.as_str()).to_string();
+                                crate::macros::uses::trailing_semi(&file, p.lo(), lo, &def.def_file);
+                            }
                             p.eat(T::Semi);
                             if include { p.skip_to_eof(); }
                             Ok(e)
@@ -4048,7 +4371,8 @@ impl<'a> Parser<'a> {
 
     fn if_expr(&mut self, lo: u32) -> PResult<ExprId> {
         self.expect(T::KwIf)?;
-        let cond = self.expr_ns()?;
+        let cond = self.expr_cond()?;
+        self.cond_check(cond, true)?;
         let then = self.block()?;
         let els = if self.eat(T::KwElse) {
             let elo = self.lo();
@@ -4064,15 +4388,26 @@ impl<'a> Parser<'a> {
         Ok(self.mk_expr(ExprKind::If(cond, then, OptExprId::from(els)), lo))
     }
 
+    /// rustc parse_expr_loop: a loop takes no `else`.
+    fn no_loop_else(&mut self, what: &str) -> PResult<()> {
+        if self.kind() == T::KwElse {
+            return self.err(&format!("`{}...else` loops are not supported", what));
+        }
+        Ok(())
+    }
+
     fn loop_expr(&mut self, label: Option<Ident>, lo: u32) -> PResult<ExprId> {
         self.expect(T::KwLoop)?;
         let b = self.block()?;
+        self.no_loop_else("loop")?;
         Ok(self.mk_expr(ExprKind::Loop(b, OptIdent::from(label)), lo))
     }
     fn while_expr(&mut self, label: Option<Ident>, lo: u32) -> PResult<ExprId> {
         self.expect(T::KwWhile)?;
-        let c = self.expr_ns()?;
+        let c = self.expr_cond()?;
+        self.cond_check(c, true)?;
         let b = self.block()?;
+        self.no_loop_else("while")?;
         let row = self.ast.push_row(WhileRow { cond: c, body: b, label });
         Ok(self.mk_expr(ExprKind::While(row), lo))
     }
@@ -4082,6 +4417,7 @@ impl<'a> Parser<'a> {
         self.expect(T::KwIn)?;
         let it = self.expr_ns()?;
         let b = self.block()?;
+        self.no_loop_else("for")?;
         let row = self.ast.push_row(ForRow { pat: p, iter: it, body: b, label });
         Ok(self.mk_expr(ExprKind::For(row), lo))
     }
@@ -4092,16 +4428,14 @@ fn is_str(k: T) -> bool {
     matches!(k, T::Str | T::RawStr)
 }
 
+/// A tuple field index: only the canonical decimal spelling names a field (`.00`, `.001`, `.0_1`
+/// name none, rustc_hir_typeck check_expr_field compares the symbol with `sym::integer(index)`);
+/// any other spelling is `u32::MAX`, which no tuple or struct has.
 fn parse_index(s: &[u8]) -> u32 {
-    let mut n = 0u32;
-    for &c in s {
-        if c.is_ascii_digit() {
-            n = n * 10 + (c - b'0') as u32;
-        } else if c != b'_' {
-            break;
-        }
+    match std::str::from_utf8(s).ok().and_then(crate::ast::tuple_index) {
+        Some(n) => n,
+        None => u32::MAX,
     }
-    n
 }
 
 /// Lex + parse one file.

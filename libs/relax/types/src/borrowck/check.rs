@@ -106,7 +106,7 @@ fn check_with_scopes_fv(prog: &Program, tcx: &Tcx, body: &Body, regions: &MirReg
     let analysis = Borrowck::new(prog, tcx, body, regions, &borrows, moves);
     let results = analysis.iterate_to_fixpoint();
     let mut cursor = results.cursor();
-    let mut cx = MirBorrowckCtxt { tcx, body, moves, borrows: &borrows, cfg: CheckCfg::new(body), result,
+    let mut cx = MirBorrowckCtxt { prog, tcx, body, moves, borrows: &borrows, cfg: CheckCfg::new(body), result,
         access_errors: vec![], reservation_errors: vec![], uninitialized_errors: BitSet::new_empty(body.local_decls.len()),
         move_errors: vec![], buffered_move_errors: vec![], buffered_mut_errors: vec![],
         fv: fv.map(|v| fv_hook::FvRun::new(v, body, &borrows)), fv_own: None, nested };
@@ -203,7 +203,7 @@ impl ReadOrWrite {
 }
 
 struct MirBorrowckCtxt<'a> {
-    tcx: &'a Tcx, body: &'a Body, moves: &'a MoveData, borrows: &'a BorrowSet,
+    prog: &'a Program, tcx: &'a Tcx, body: &'a Body, moves: &'a MoveData, borrows: &'a BorrowSet,
     cfg: CheckCfg, result: MirBorrowckResult,
     access_errors: Vec<(Place, Span)>, reservation_errors: Vec<Place>, uninitialized_errors: BitSet,
     /// lib.rs:779 move_errors: illegal moves, grouped and reported after the walk.
@@ -415,6 +415,8 @@ impl MirBorrowckCtxt<'_> {
                 if outcome.accepted {
                     if self.fv.as_ref().is_some_and(|f| f.views.relaxed) {
                         if !self.result.fv_only.contains(&error) { self.result.fv_only.push(error); }
+                        // As for a reported reservation conflict: its activation is the same finding.
+                        if matches!(access, Reservation(_)) && !self.reservation_errors.contains(place) { self.reservation_errors.push(place.clone()); }
                         continue;
                     }
                 }
@@ -561,11 +563,38 @@ impl MirBorrowckCtxt<'_> {
         };
         let Some(init) = self.first_reaching_init(place.local, state) else { return false; };
         let detail = Detail::Mutability { place: place.clone(), the_place_err: the_place_err.clone(), access: access.access_kind(), location: at, init: Some(init) };
+        let code = if borrow { "E0596" } else if place.projection.is_empty() { "E0384" } else { "E0594" };
+        if self.relaxed_mut(&the_place_err, span, code) { return false; }
         if !borrow {
             self.error_with(if place.projection.is_empty() { Reassigned } else { AssignImmutable }, span, detail);
         } else {
             self.report_mutable_borrow_error(&the_place_err, span, detail);
         }
+        true
+    }
+    /// Relaxed Rust `mut`: a plain by-value user binding that is only missing its `mut` is accepted, and the
+    /// edit that adds it (at the binding, from the MIR's own binding span) is recorded for `makepad fix --to-strict`.
+    /// A `ref` binding, `self`, a closure environment or upvar, and a place behind a reference keep the error.
+    fn relaxed_mut(&self, err: &Place, span: Span, code: &'static str) -> bool {
+        use crate::mir::{BindingForm, ByRef, LocalInfo, LocalKind, VarBindingForm};
+        if !err.projection.is_empty() || err.local.0 == 1 && matches!(self.body.source.kind, BodyKind::Closure(_)) { return false; }
+        let prog = self.prog;
+        let file = span.file as usize;
+        let Some(&k) = prog.file_crate.get(file) else { return false };
+        if !prog.crates[k as usize].relaxed(prog).iter().any(|f| f == "mut") { return false; }
+        let decl = &self.body.local_decls[err.local.0 as usize];
+        if !matches!(decl.kind, LocalKind::UserVar | LocalKind::Arg) { return false; }
+        let LocalInfo::User(BindingForm::Var(VarBindingForm { binding_mode: crate::mir::BindingMode(ByRef::No, Mutability::Not), .. })) = &decl.local_info else { return false };
+        let Some(name) = self.body.var_debug_info.iter().find(|v| v.place.local == err.local && v.place.projection.is_empty()).map(|v| v.name.as_str()) else { return false };
+        if name == "self" { return false; }
+        let pos = decl.source_info.span.lo;
+        if decl.source_info.span.file != span.file { return false; }
+        let at = |p: u32| { let (l, c) = prog.files[file].line_col(p); format!("{}:{}:{}", prog.file_paths[file], l, c) };
+        crate::relaxed::note(crate::relaxed::Note {
+            at: at(span.lo), feature: "mut", code,
+            msg: format!("accepted only with relaxed `mut`: `{name}` is not declared as mutable; will write: `mut {name}` at {}", at(pos)),
+            fix: Some((prog.file_paths[file].clone(), pos, "mut ".to_string())),
+        });
         true
     }
     // diagnostics/mutability_errors.rs:226-250,659: a second mutable borrow of the same

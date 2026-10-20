@@ -401,4 +401,81 @@ mod tests {
         assert!(bl.block_context.is_empty(), "the sub-expression frame is popped");
         let _ = bool_;
     }
+
+    fn unit_tuple(fx: &mut super::super::as_rvalue::tests::Fx) -> ExprId {
+        let unit = fx.builder_parts.1.tys.unit;
+        fx.thir.alloc_expr(Expr { kind: K::Tuple { fields: Vec::new().into() }, ty: unit, temp_scope: None, span: Span::default() })
+    }
+
+    #[test]
+    fn a_loop_jumps_back_to_its_head_and_has_no_normal_exit() {
+        let mut fx = fixture();
+        let unit = fx.builder_parts.1.tys.unit;
+        let body = unit_tuple(&mut fx);
+        let lp = fx.thir.alloc_expr(Expr { kind: K::Loop { body }, ty: unit, temp_scope: None, span: Span::default() });
+        let (mut bl, _) = builder(fx);
+        let dest = bl.temp(unit, Span::default());
+        let start = bl.cfg.start_new_block();
+        let BlockAnd(exit, ()) = bl.expr_into_dest(dest, start, lp).unwrap();
+        // start -> loop head (FalseUnwind to the body) -> body -> loop head.
+        let head = match bl.cfg.block_data(start).terminator.as_ref().unwrap().kind { crate::mir::TerminatorKind::Goto { target } => target, ref k => panic!("{k:?}") };
+        let body_block = match bl.cfg.block_data(head).terminator.as_ref().unwrap().kind { crate::mir::TerminatorKind::FalseUnwind { real_target, .. } => real_target, ref k => panic!("{k:?}") };
+        assert!(matches!(bl.cfg.block_data(body_block).terminator.as_ref().unwrap().kind, crate::mir::TerminatorKind::Goto { target } if target == head), "the body ends by jumping back");
+        assert!(bl.cfg.block_data(exit).terminator.is_none(), "the exit block is only reachable by `break`: nothing jumps to it here");
+    }
+
+    #[test]
+    fn a_call_evaluates_function_and_arguments_then_terminates_with_a_call() {
+        let mut fx = fixture();
+        let i32_ = fx.builder_parts.1.tys.i32_;
+        let unit = fx.builder_parts.1.tys.unit;
+        let fun = fx.thir.alloc_expr(Expr { kind: K::ZstLiteral { user_ty: None }, ty: i32_, temp_scope: None, span: Span::default() });
+        let arg = lit(&mut fx, "42", i32_, false);
+        let call = fx.thir.alloc_expr(Expr { kind: K::Call { ty: i32_, fun, args: vec![arg].into(), from_hir_call: true, fn_span: Span::default() }, ty: unit, temp_scope: None, span: Span::default() });
+        let (mut bl, _) = builder(fx);
+        let dest = bl.temp(unit, Span::default());
+        let start = bl.cfg.start_new_block();
+        let BlockAnd(after, ()) = bl.expr_into_dest(dest.clone(), start, call).unwrap();
+        let term = bl.cfg.block_data(start).terminator.as_ref().unwrap();
+        match &term.kind {
+            crate::mir::TerminatorKind::Call { args, destination, target, call_source, .. } => {
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0], Operand::Constant(_)), "a literal argument is a constant operand");
+                assert_eq!(*destination, dest);
+                assert_eq!(*target, Some(after), "the call returns to the block the lowering continues in");
+                assert!(matches!(call_source, crate::mir::CallSource::Normal));
+            }
+            k => panic!("{k:?}"),
+        }
+    }
+
+    #[test]
+    fn an_adt_expression_orders_operands_by_field_not_by_the_written_order() {
+        let mut fx = fixture();
+        let (prog, tcx) = (fx.builder_parts.0, fx.builder_parts.1);
+        let i32_ = tcx.tys.i32_;
+        let p = (0..prog.defs.len()).map(|i| crate::program::DefId(i as u32)).find(|&d| prog.name(d) == "P").unwrap();
+        let adt_ty = tcx.tys.intern(TyKind::Adt(p, tcx.tys.mk_list(&[]), crate::types::RegionArgsId::EMPTY));
+        let neg = lit(&mut fx, "42", i32_, true);
+        let pos = lit(&mut fx, "42", i32_, false);
+        // `P { b: 42, a: -42 }`
+        let adt = AdtExpr { adt_def: p, variant_index: crate::mir::VariantIdx(0), args: Vec::new(), user_ty: None,
+            fields: vec![crate::mir::build::thir::FieldExpr { name: crate::mir::FieldIdx(1), expr: pos }, crate::mir::build::thir::FieldExpr { name: crate::mir::FieldIdx(0), expr: neg }].into(),
+            base: AdtExprBase::None };
+        let e = fx.thir.alloc_expr(Expr { kind: K::Adt(Box::new(adt)), ty: adt_ty, temp_scope: None, span: Span::default() });
+        let (mut bl, _) = builder(fx);
+        let dest = bl.temp(adt_ty, Span::default());
+        let start = bl.cfg.start_new_block();
+        let BlockAnd(end, ()) = bl.expr_into_dest(dest.clone(), start, e).unwrap();
+        assert_eq!(end, start);
+        match &bl.cfg.block_data(start).statements.last().unwrap().kind {
+            crate::mir::StatementKind::Assign(pl, Rvalue::Aggregate(k, ops)) => {
+                assert_eq!(*pl, dest);
+                assert!(matches!(**k, AggregateKind::Adt(d, v, ..) if d == p && v.0 == 0));
+                let bits = |o: &Operand| match o { Operand::Constant(c) => match &c.const_ { crate::mir::Const::Val(crate::mir::ConstValue::Scalar(crate::mir::Scalar::Int { bits, .. }), _) => *bits, c => panic!("{c:?}") }, o => panic!("{o:?}") };
+                assert_eq!(ops.iter().map(bits).collect::<Vec<_>>(), vec![0xFFFF_FFD6, 42], "field a (written second) comes first");
+            }
+            s => panic!("{s:?}"),
+        }
+    }
 }

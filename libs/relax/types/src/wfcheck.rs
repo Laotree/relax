@@ -381,13 +381,12 @@ pub mod obligations {
         ocx: ObligationCtxt<'a, 'tcx>,
         env: ParamEnvId,
         def: DefId,
-        /// only dyn-compatibility goals are kept (a trait definition: its environment is not built)
-        only_dyn: bool,
+        /// errors of checks that are not obligations (region outlives)
+        extra: Vec<String>,
     }
 
     impl<'a, 'tcx> Wfcx<'a, 'tcx> {
         fn register(&mut self, goal: Goal, pos: u32) {
-            if self.only_dyn && !matches!(goal.predicate.kind, PredicateKind::DynCompatible(_)) { return; }
             self.ocx.engine.register_predicate_obligation(self.infcx, PredicateObligation { goal, recursion_depth: 0, cause: ObligationCause { span: pos, body_id: self.def } });
         }
 
@@ -445,8 +444,6 @@ pub mod obligations {
                             if matches!(&q.kind, PredicateKind::Clause(ClauseKind::Trait(u)) if matches!(u.trait_ref.args.first(), Some(GenericArg::Type(t)) if matches!(self.tcx.tys.kind(*t), TyKind::Alias(..)))) { continue; }
                             let q = self.tcx.instantiate_predicate(self.prog, def, args, &q);
                             if crate::next_solver::wf::predicate_has_escaping_bound_vars(tys, &q) { continue; }
-                            // the trait's `Self: Trait` is the clause itself
-                            if matches!(&q.kind, PredicateKind::Clause(ClauseKind::Trait(u)) if u.trait_ref.def_id == def) { continue; }
                             self.register(Goal { param_env: self.env.clone(), predicate: q }, pos);
                         }
                     }
@@ -498,13 +495,14 @@ pub mod obligations {
         /// Solve what was registered; an obligation that cannot hold is an error. Ambiguity is
         /// left to the rest of the check.
         fn finish(mut self, file: u32) -> Vec<String> {
-            let mut out: Vec<String> = Vec::new();
+            let mut out: Vec<String> = std::mem::take(&mut self.extra);
             let mut seen = std::collections::HashSet::new();
-            for e in self.ocx.try_evaluate_obligations() {
+            // wfcheck.rs: `select_all_or_error` -- an ambiguous obligation is an error (E0283)
+            for e in self.ocx.engine.evaluate_obligations_error_on_ambiguity(self.infcx, self.prog) {
                 let (code, o) = match e {
                     NextSolverError::TrueError(o) => ("E0277", o),
                     NextSolverError::Overflow(o) => ("E0275", o),
-                    NextSolverError::Ambiguity(_) => continue,
+                    NextSolverError::Ambiguity(o) => ("E0283", o),
                 };
                 let Some(msg) = self.message(code, &o) else { continue };
                 if !seen.insert((o.cause.span, msg.clone())) { continue; }
@@ -554,17 +552,10 @@ pub mod obligations {
         }
     }
 
-    fn with_wfcx_env(prog: &Program, tcx: &Tcx, def: DefId, env: ParamEnvId, f: impl FnOnce(&mut Wfcx<'_, '_>)) -> Vec<String> {
-        let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), def);
-        let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env, def, only_dyn: false };
-        f(&mut w);
-        w.finish(prog.def(def).file)
-    }
-
     fn with_wfcx(prog: &Program, tcx: &Tcx, def: DefId, f: impl FnOnce(&mut Wfcx<'_, '_>)) -> Vec<String> {
         let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), def);
         let env = tcx.param_env_id(prog, def);
-        let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env, def, only_dyn: false };
+        let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env, def, extra: Vec::new()};
         w.check_false_global_bounds();
         f(&mut w);
         w.finish(prog.def(def).file)
@@ -579,24 +570,17 @@ pub mod obligations {
         let item = ast.item(def.item);
         match def.kind {
             DefKind::Struct | DefKind::Enum | DefKind::Union => with_wfcx(prog, tcx, did, |w| { check_type_defn(w, ast, item); check_defaults(w, ast, item); }),
-            DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => with_wfcx(prog, tcx, did, |w| check_fn(w, ast, item)),
+            DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => {
+                let mut errors = with_wfcx(prog, tcx, did, |w| check_fn(w, ast, item));
+                if def.kind != DefKind::ForeignFn { errors.extend(check_opaque_cycles(prog, tcx, did, item.lo)); }
+                errors
+            }
             DefKind::Impl => {
                 let mut errors = check_drop_impl(prog, tcx, did, ast, item);
                 errors.extend(with_wfcx(prog, tcx, did, |w| check_impl(w, ast, item)));
                 errors
             }
-            // (a trait's own environment is not built here: `param_env_id` of `trait Qux: Foo + AsRef<Self::Bar>` never
-            // returns -- solver, crash lane)
-            DefKind::Trait => {
-                // the defaults' own well-formedness mentions no parameter: no environment needed
-                let mut errors = with_wfcx_env(prog, tcx, did, ParamEnvId::EMPTY, |w| check_defaults(w, ast, item));
-                // dyn-compatibility of the `dyn` types its bounds mention needs no environment
-                let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), did);
-                let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env: ParamEnvId::EMPTY, def: did, only_dyn: true };
-                w.check_where_clauses(item.lo);
-                errors.extend(w.finish(def.file));
-                errors
-            }
+            DefKind::Trait => with_wfcx(prog, tcx, did, |w| { check_defaults(w, ast, item); w.check_where_clauses(item.lo); }),
             DefKind::Static | DefKind::ForeignStatic => with_wfcx(prog, tcx, did, |w| check_static(w, ast, item)),
             DefKind::AssocConst => with_wfcx(prog, tcx, did, |w| check_assoc_const(w, ast, item)),
             DefKind::AssocTy => with_wfcx(prog, tcx, did, |w| check_assoc_ty(w, ast, item)),
@@ -636,6 +620,81 @@ pub mod obligations {
             }
         }
         w.check_where_clauses(item.lo);
+        for (variant, written) in adt.variants.iter().zip(&fields) {
+            for (i, f) in variant.fields.iter().enumerate() {
+                dyn_object_bounds(w, f.ty, written.get(i).map_or(item.lo, |f| f.ty_span.0));
+            }
+        }
+    }
+
+    /// E0478 for the `dyn Trait<'a> + 'b` types in a type definition's fields: the object lifetime
+    /// bound `'b` must outlive the lifetimes the trait's supertraits require of `Self`
+    /// (rustc wf `object_region_bounds`). Only early-bound parameter regions and `'static` are judged.
+    fn dyn_object_bounds(w: &mut Wfcx<'_, '_>, ty: TyId, pos: u32) {
+        let (prog, tcx) = (w.prog, w.tcx);
+        let mut dyns: Vec<(DefId, Vec<crate::types::RegionId>, crate::types::RegionId)> = Vec::new();
+        fn find(tcx: &Tcx, t: TyId, out: &mut Vec<(DefId, Vec<crate::types::RegionId>, crate::types::RegionId)>, depth: u32) {
+            if depth > 16 { return; }
+            match tcx.tys.kind(t).clone() {
+                TyKind::Ref(_, i, _) | TyKind::Ptr(_, i) | TyKind::Slice(i) | TyKind::Array(i, _) => find(tcx, i, out, depth + 1),
+                TyKind::Tuple(l) => for &x in tcx.tys.list(l) { find(tcx, x, out, depth + 1) },
+                TyKind::Adt(_, ts, _) => for &x in tcx.tys.list(ts) { find(tcx, x, out, depth + 1) },
+                TyKind::Dyn(p, _, _, rs, r, _, _) => out.push((p, tcx.tys.region_args(rs).to_vec(), r)),
+                _ => {}
+            }
+        }
+        find(tcx, ty, &mut dyns, 0);
+        if dyns.is_empty() { return; }
+        let mut known: Vec<(crate::types::RegionId, crate::types::RegionId)> = Vec::new();
+        for q in tcx.clauses_of(prog, w.def) {
+            match &q.kind {
+                PredicateKind::Clause(ClauseKind::RegionOutlives(a, b)) => known.push((*a, *b)),
+                PredicateKind::Clause(ClauseKind::TypeOutlives(..)) => return,
+                _ => {}
+            }
+        }
+        let adt = tcx.adts.get(&w.def);
+        if let Some(adt) = adt {
+            for v in &adt.variants { for f in &v.fields { let mut part = Vec::new(); if wf_region_pairs(tcx, f.ty, &mut part, 0).is_some() { known.extend(part); } } }
+        }
+        let kind = |r: crate::types::RegionId| tcx.tys.region_kind(r);
+        let simple = |r: crate::types::RegionId| matches!(kind(r), crate::types::RegionKind::ReEarlyParam(_) | crate::types::RegionKind::ReStatic);
+        if known.iter().any(|&(a, b)| !simple(a) || !simple(b)) { return; }
+        let holds = |from: crate::types::RegionId, to: crate::types::RegionId| -> bool {
+            if from == to || kind(from) == crate::types::RegionKind::ReStatic { return true; }
+            let mut seen = vec![from];
+            let mut i = 0;
+            while i < seen.len() {
+                let cur = seen[i];
+                i += 1;
+                for &(a, b) in &known {
+                    if a == cur && !seen.contains(&b) {
+                        if b == to { return true; }
+                        seen.push(b);
+                    }
+                }
+            }
+            false
+        };
+        for (principal, rs, obj) in dyns {
+            if !simple(obj) { continue; }
+            for q in tcx.clauses_of(prog, principal) {
+                let PredicateKind::Clause(ClauseKind::TypeOutlives(t, r)) = &q.kind else { continue };
+                if !matches!(tcx.tys.kind(*t), TyKind::Param(0)) { continue; }
+                let required = match kind(*r) {
+                    crate::types::RegionKind::ReStatic => Some(*r),
+                    // (a trait's parameter 0 is `Self`; its lifetimes follow)
+                    crate::types::RegionKind::ReEarlyParam(k) if k >= 1 => rs.get(k as usize - 1).copied(),
+                    _ => None,
+                };
+                let Some(required) = required else { continue };
+                if !simple(required) { continue; }
+                if !holds(obj, required) {
+                    w.extra.push(prog.record_error(prog.def(w.def).file, pos, "typeck", "E0478: lifetime bound not satisfied".to_string()));
+                    return;
+                }
+            }
+        }
     }
 
     /// The fn's signature with its late-bound regions liberated, one component at a time.
@@ -662,6 +721,44 @@ pub mod obligations {
         if has_body { w.sized(ret, ret_pos); }
     }
 
+    /// E0478 for a trait whose supertraits include `'static` (`trait T: 'static`): the impl's self
+    /// type must outlive `'static`, so each region in it must be `'static` or be bounded by
+    /// `'static` in the impl's where-clauses. Type parameters are not judged here.
+    fn impl_static_supertrait(w: &mut Wfcx<'_, '_>, tr: &crate::next_solver::TraitRef, pos: u32) {
+        let (prog, tcx) = (w.prog, w.tcx);
+        let static_super = tcx.clauses_of(prog, tr.def_id).iter().any(|q| matches!(&q.kind, PredicateKind::Clause(ClauseKind::TypeOutlives(t, r))
+            if matches!(tcx.tys.kind(*t), TyKind::Param(0)) && tcx.tys.region_kind(*r) == crate::types::RegionKind::ReStatic));
+        if !static_super { return; }
+        let Some(GenericArg::Type(self_ty)) = tr.args.first().copied() else { return };
+        fn regions(tcx: &Tcx, t: TyId, out: &mut Vec<crate::types::RegionId>, depth: u32) -> bool {
+            if depth > 16 { return false; }
+            match tcx.tys.kind(t).clone() {
+                TyKind::Ref(_, i, r) => { out.push(r); regions(tcx, i, out, depth + 1) }
+                TyKind::Ptr(_, i) | TyKind::Slice(i) | TyKind::Array(i, _) => regions(tcx, i, out, depth + 1),
+                TyKind::Tuple(l) => tcx.tys.list(l).to_vec().into_iter().all(|x| regions(tcx, x, out, depth + 1)),
+                TyKind::Adt(_, ts, rs) => { out.extend(tcx.tys.region_args(rs).iter().copied()); tcx.tys.list(ts).to_vec().into_iter().all(|x| regions(tcx, x, out, depth + 1)) }
+                TyKind::Param(_) | TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Float(_) | TyKind::Str | TyKind::Never => true,
+                _ => false,
+            }
+        }
+        let mut rs = Vec::new();
+        if !regions(tcx, self_ty, &mut rs, 0) { return; }
+        let mut bounded: Vec<crate::types::RegionId> = Vec::new();
+        for q in tcx.clauses_of(prog, w.def) {
+            match &q.kind {
+                PredicateKind::Clause(ClauseKind::RegionOutlives(a, b)) if tcx.tys.region_kind(*b) == crate::types::RegionKind::ReStatic => bounded.push(*a),
+                PredicateKind::Clause(ClauseKind::RegionOutlives(..)) | PredicateKind::Clause(ClauseKind::TypeOutlives(..)) => return,
+                _ => {}
+            }
+        }
+        for r in rs {
+            let k = tcx.tys.region_kind(r);
+            if !matches!(k, crate::types::RegionKind::ReEarlyParam(_)) || bounded.contains(&r) { continue; }
+            w.extra.push(prog.record_error(prog.def(w.def).file, pos, "typeck", "E0478: lifetime bound not satisfied".to_string()));
+            return;
+        }
+    }
+
     fn check_impl(w: &mut Wfcx<'_, '_>, ast: &ast::Ast, item: &ast::Item) {
         let imp = ast.as_impl(&item.kind).unwrap();
         if imp.negative { return; }
@@ -671,6 +768,7 @@ pub mod obligations {
             let trait_ref = w.tcx.impl_trait_ref(w.prog, w.def, &args);
             if trait_ref.args.iter().any(|a| matches!(*a, GenericArg::Type(t) if w.tcx.tys.has_error(t))) { return; }
             let self_pos = ty_pos(ast, imp.self_ty).unwrap_or(item.lo);
+            impl_static_supertrait(w, &trait_ref, self_pos);
             // wf.rs trait_obligations: the trait's own predicates at the impl's arguments, and each
             // argument well formed
             let p = collect::trait_predicate(trait_ref.def_id, trait_ref.args.clone());
@@ -730,6 +828,92 @@ pub mod obligations {
         let Ok(ty) = w.tcx.type_of(w.prog, w.def) else { return };
         let ty = w.normalize(ty);
         w.register_wf(ty, item.name.lo);
+        region_outlives_in_impl_assoc_ty(w, ty, item.name.lo);
+    }
+
+    /// The region facts a type's well-formedness yields (rustc `wf::obligations` /
+    /// `implied_bounds`): for `&'r T`, every region of `T` outlives `'r`. Pairs (longer, shorter);
+    /// None when the type has a part this reduced walk does not follow (aliases, dyn, fn pointers).
+    fn wf_region_pairs(tcx: &Tcx, t: TyId, out: &mut Vec<(crate::types::RegionId, crate::types::RegionId)>, depth: u32) -> Option<()> {
+        if depth > 32 { return None; }
+        fn regions_in(tcx: &Tcx, t: TyId, out: &mut Vec<crate::types::RegionId>, depth: u32) -> Option<()> {
+            if depth > 32 { return None; }
+            match tcx.tys.kind(t).clone() {
+                TyKind::Ref(_, i, r) => { out.push(r); regions_in(tcx, i, out, depth + 1) }
+                TyKind::Ptr(_, i) | TyKind::Slice(i) | TyKind::Array(i, _) => regions_in(tcx, i, out, depth + 1),
+                TyKind::Tuple(l) => { for &x in tcx.tys.list(l) { regions_in(tcx, x, out, depth + 1)?; } Some(()) }
+                TyKind::Adt(_, ts, rs) => {
+                    for &x in tcx.tys.list(ts) { regions_in(tcx, x, out, depth + 1)?; }
+                    out.extend(tcx.tys.region_args(rs).iter().copied());
+                    Some(())
+                }
+                TyKind::Param(_) | TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Float(_) | TyKind::Str | TyKind::Never => Some(()),
+                _ => None,
+            }
+        }
+        match tcx.tys.kind(t).clone() {
+            TyKind::Ref(_, i, r) => {
+                let mut inner = Vec::new();
+                regions_in(tcx, i, &mut inner, depth + 1)?;
+                out.extend(inner.into_iter().map(|x| (x, r)));
+                wf_region_pairs(tcx, i, out, depth + 1)
+            }
+            TyKind::Ptr(_, i) | TyKind::Slice(i) | TyKind::Array(i, _) => wf_region_pairs(tcx, i, out, depth + 1),
+            TyKind::Tuple(l) => { for &x in tcx.tys.list(l) { wf_region_pairs(tcx, x, out, depth + 1)?; } Some(()) }
+            TyKind::Adt(_, ts, _) => { for &x in tcx.tys.list(ts) { wf_region_pairs(tcx, x, out, depth + 1)?; } Some(()) }
+            TyKind::Param(_) | TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Float(_) | TyKind::Str | TyKind::Never => Some(()),
+            _ => None,
+        }
+    }
+
+    /// E0491 for the type of an associated type of a trait impl: a reference `&'r T` needs the
+    /// regions of `T` to outlive `'r`, which the impl's where-clauses and the implied bounds of
+    /// its header must provide (rustc region resolution of the WF obligations). Only early-bound
+    /// parameter regions and `'static` are judged; any part this walk cannot follow skips it.
+    fn region_outlives_in_impl_assoc_ty(w: &mut Wfcx<'_, '_>, ty: TyId, pos: u32) {
+        let (prog, tcx) = (w.prog, w.tcx);
+        let def = prog.def(w.def);
+        let parent = def.parent;
+        if def.kind != DefKind::AssocTy || prog.def(parent).kind != DefKind::Impl || !tcx.impl_trait.contains_key(&parent) { return; }
+        let mut need = Vec::new();
+        if wf_region_pairs(tcx, ty, &mut need, 0).is_none() || need.is_empty() { return; }
+        let indices = tcx.generic_indices_of(prog, parent);
+        let args = indices.identity_args(&tcx.tys);
+        let tr = tcx.impl_trait_ref(prog, parent, &args);
+        let mut known: Vec<(crate::types::RegionId, crate::types::RegionId)> = Vec::new();
+        for a in tr.args.iter() {
+            if let GenericArg::Type(t) = a { let t = w.normalize(*t); if wf_region_pairs(tcx, t, &mut known, 0).is_none() { return; } }
+        }
+        for q in tcx.clauses_of(prog, w.def) {
+            if let PredicateKind::Clause(ClauseKind::RegionOutlives(a, b)) = &q.kind { known.push((*a, *b)); }
+            if matches!(&q.kind, PredicateKind::Clause(ClauseKind::TypeOutlives(..))) { return; }
+        }
+        let kind = |r: crate::types::RegionId| tcx.tys.region_kind(r);
+        let simple = |r: crate::types::RegionId| matches!(kind(r), crate::types::RegionKind::ReEarlyParam(_) | crate::types::RegionKind::ReStatic);
+        if need.iter().any(|&(a, b)| !simple(a) || !simple(b)) || known.iter().any(|&(a, b)| !simple(a) || !simple(b)) { return; }
+        let holds = |from: crate::types::RegionId, to: crate::types::RegionId| -> bool {
+            if from == to || kind(from) == crate::types::RegionKind::ReStatic { return true; }
+            let mut seen = vec![from];
+            let mut i = 0;
+            while i < seen.len() {
+                let cur = seen[i];
+                i += 1;
+                for &(a, b) in &known {
+                    if a == cur && !seen.contains(&b) {
+                        if b == to || false { return true; }
+                        seen.push(b);
+                    }
+                }
+            }
+            false
+        };
+        for &(from, to) in &need {
+            if !holds(from, to) {
+                let shown = crate::typeck::ty_to_string(false, prog, tcx, w.infcx.deeply_resolve_ignoring_regions(ty));
+                w.extra.push(prog.record_error(def.file, pos, "typeck", format!("E0491: in type `{}`, reference has a longer lifetime than the data it references", shown)));
+                return;
+            }
+        }
     }
 
     /// Where a written type starts: types carry no span of their own, a path its position.
@@ -785,12 +969,120 @@ pub mod obligations {
         let def = prog.def(imp);
         match tcx.tys.kind(self_ty) {
             TyKind::Error => Vec::new(),
-            TyKind::Adt(d, _, _) if prog.def(*d).krate == def.krate => Vec::new(),
+            TyKind::Adt(d, args, regions) if prog.def(*d).krate == def.krate => always_applicable(prog, tcx, imp, item, def.file, *d, *args, *regions),
             _ => {
                 let pos = ast.as_impl(&item.kind).and_then(|i| ty_pos(ast, i.self_ty)).unwrap_or(item.lo);
                 vec![prog.record_error(def.file, pos, "typeck", "E0120: the `Drop` trait may only be implemented for local structs, enums, and unions".to_string())]
             }
         }
+    }
+
+    /// rustc_hir_analysis/src/check/always_applicable.rs check_drop_impl: the generic arguments of the
+    /// impl's self type are the impl's own distinct parameters (E0366), and every predicate of the impl
+    /// holds in the environment of the type's definition (E0367).
+    fn always_applicable(prog: &Program, tcx: &Tcx, imp: DefId, item: &ast::Item, file: u32, adt: DefId, args: crate::types::TyList, regions: crate::types::RegionArgsId) -> Vec<String> {
+        use crate::types::RegionKind;
+        let tys = &tcx.tys;
+        // uses_unique_generic_params(adt_to_impl_args, CheckRegions::OnlyParam)
+        let mut seen_tys = Vec::new();
+        let mut unique = true;
+        for &a in tys.list(args) {
+            let ok = match tys.kind(a) {
+                TyKind::Param(..) => true,
+                TyKind::Const(c) => matches!(tys.const_kind(*c), crate::consts::ConstKind::Param(..)),
+                _ => false,
+            };
+            if !ok || seen_tys.contains(&a) { unique = false; }
+            seen_tys.push(a);
+        }
+        let mut seen_regions = Vec::new();
+        for &r in tys.region_args(regions).iter() {
+            if !matches!(tys.region_kind(r), RegionKind::ReEarlyParam(_)) || seen_regions.contains(&r) { unique = false; }
+            seen_regions.push(r);
+        }
+        let trait_name = "Drop";
+        if !unique {
+            return vec![prog.record_error(file, item.lo, "typeck", format!("E0366: `{}` impls cannot be specialized", trait_name))];
+        }
+        if tys.list(args).iter().any(|&t| tys.has_error(t)) { return Vec::new(); }
+        // the predicates of the type, at the impl's arguments
+        let adt_args = tcx.complete_args(prog, adt, tys.list(args), regions);
+        let adt_env = tcx.param_env_id(prog, adt);
+        let clauses: Vec<_> = tcx.param_env_by_id(adt_env).clauses.iter().map(|p| tcx.instantiate_predicate(prog, adt, &adt_args, p)).collect();
+        let env = tcx.intern_param_env(crate::next_solver::ParamEnv { clauses: clauses.into() });
+        let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), imp);
+        let mut ocx = ObligationCtxt::new(&infcx, prog);
+        // the impl's parameters are inference variables, bound by equating its self type with the
+        // type at the impl's own arguments
+        let fresh = infcx.fresh_args_for_item(prog, imp);
+        let fresh_self = tcx.instantiate_ty(prog, imp, &fresh, tcx.impl_self[&imp]);
+        let mut goals = match infcx.at(prog, env.clone()).eq(tcx.impl_self[&imp], fresh_self) {
+            Ok(goals) => goals,
+            Err(_) => return Vec::new(),
+        };
+        for p in tcx.own_clauses_of(prog, imp) {
+            let p = &tcx.instantiate_predicate(prog, imp, &fresh, p);
+            let predicate = ocx.normalize_predicate(&env, p);
+            goals.push(Goal { param_env: env.clone(), predicate });
+        }
+        ocx.register_obligations(goals);
+        let errors = ocx.engine.evaluate_obligations_error_on_ambiguity(&infcx, prog);
+        let msg = |what: String| format!("E0367: `{}` impl requires `{}` but the {} it is implemented for does not", trait_name, what, match prog.def(adt).kind { DefKind::Enum => "enum", DefKind::Union => "union", _ => "struct" });
+        if !errors.is_empty() {
+            return vec![prog.record_error(file, item.lo, "typeck", msg("a predicate".to_string()))];
+        }
+        if !infcx.resolve_regions(prog, env, &[]).is_empty() {
+            return vec![prog.record_error(file, item.lo, "typeck", msg("an outlives bound".to_string()))];
+        }
+        Vec::new()
+    }
+
+    /// rustc_hir_analysis/src/check/check.rs check_opaque_for_cycles + rustc_middle/src/ty/util.rs
+    /// OpaqueTypeExpander: expanding the hidden type of an opaque the fn defines must not reach the
+    /// opaque again (E0720).
+    fn check_opaque_cycles(prog: &Program, tcx: &Tcx, owner: DefId, pos: u32) -> Vec<String> {
+        use crate::types::fold::{TypeFolder, super_fold_ty};
+        use crate::types::{AliasTyKind, Types};
+        struct Expander<'a> { prog: &'a Program, tcx: &'a Tcx, seen: Vec<DefId>, primary: DefId, found_recursion: bool, found_any: bool }
+        impl TypeFolder for Expander<'_> {
+            fn fold_ty(&mut self, tys: &Types, t: TyId, depth: u32) -> TyId {
+                if self.found_any { return t; }
+                if let TyKind::Alias(_, a) = tys.kind(t) {
+                    if let AliasTyKind::Opaque { def_id } = a.kind {
+                        if self.seen.contains(&def_id) {
+                            self.found_any = true;
+                            self.found_recursion = def_id == self.primary;
+                            return t;
+                        }
+                        let Ok(hidden) = self.tcx.type_of(self.prog, def_id) else { return t };
+                        let mut targs = Vec::new();
+                        for &x in tys.list(a.args) { targs.push(self.fold_ty(tys, x, depth)); }
+                        if self.found_any { return t; }
+                        let args = self.tcx.complete_args(self.prog, def_id, &targs, a.regions);
+                        let concrete = self.tcx.instantiate_ty(self.prog, def_id, &args, hidden);
+                        self.seen.push(def_id);
+                        let expanded = self.fold_ty(tys, concrete, 0);
+                        self.seen.pop();
+                        return expanded;
+                    }
+                }
+                if !tys.flags(t).contains(crate::types::TypeFlags::HAS_TY_OPAQUE) { return t; }
+                super_fold_ty(tys, t, self, depth)
+            }
+        }
+        let id = tcx.opaque_types_defined_by(prog, owner);
+        let mut errors = Vec::new();
+        for &o in tcx.defining_opaques(id) {
+            if tcx.typeck(prog, owner).errors.len() > 0 { break; }
+            let indices = tcx.generic_indices_of(prog, o);
+            let tys = &tcx.tys;
+            let regions = tys.intern_region_args(&vec![crate::types::RegionId::ERASED; indices.lifetimes.len()]);
+            let opaque = tys.intern(TyKind::Alias(crate::consts::IsRigid::No, crate::types::AliasTy { kind: AliasTyKind::Opaque { def_id: o }, args: tys.mk_list(&indices.identity_types_consts(tys)), regions }));
+            let mut e = Expander { prog, tcx, seen: Vec::new(), primary: o, found_recursion: false, found_any: false };
+            e.fold_ty(tys, opaque, 0);
+            if e.found_recursion { errors.push(prog.record_error(prog.def(owner).file, pos, "typeck", "E0720: cannot resolve opaque type".to_string())); }
+        }
+        errors
     }
 
     /// Whether every ADT / fn item / alias in `ty` carries as many arguments as its definition has

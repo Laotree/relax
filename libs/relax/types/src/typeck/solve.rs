@@ -94,6 +94,9 @@ fn context<'a>(prog: &'a Program, tcx: &'a Tcx, state: &'a crate::tcx::EvalState
         diverges: false,
         ret_stack: Vec::new(),
         closure_depth: Vec::new(),
+        in_const: false,
+        inline_const_floor: Vec::new(),
+        in_anon_const: false,
         async_depth: 0,
         await_count: 0,
         cur_binop: 0,
@@ -114,6 +117,8 @@ fn context<'a>(prog: &'a Program, tcx: &'a Tcx, state: &'a crate::tcx::EvalState
         item_blocks: Vec::new(),
         checked_opaque_types_storage_entries: None,
         expected_closure_kinds: HashMap::default(),
+        async_expected_inner: None,
+        async_body_expected: HashMap::default(),
         extra_arg: None,
         soft: false,
         last_lo: 0,
@@ -128,8 +133,7 @@ fn context<'a>(prog: &'a Program, tcx: &'a Tcx, state: &'a crate::tcx::EvalState
 }
 
 pub(super) fn program(source: &str) -> (Program, Tcx) {
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let dir = std::env::temp_dir().join(format!("relax-native-fcx-{}-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), crate::unique_test_id()));
+    let dir = std::env::temp_dir().join(format!("relax-native-fcx-{}-{}", std::process::id(), crate::unique_test_suffix()));
     std::fs::create_dir(&dir).unwrap();
     let path = dir.join("lib.rs"); std::fs::write(&path, source).unwrap();
     let mut prog = Program::new(&std::sync::Arc::new(crate::Session::default()));

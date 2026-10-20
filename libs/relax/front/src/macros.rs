@@ -227,6 +227,9 @@ impl Clone for ReplaySnapshot {
 pub struct Name(u32);
 
 /// `GLOB` and `GLOB_SEP`, interned first by every `MacroNames`.
+/// Set on the end of a recorded fragment group that is a `$t:ty` substitution.
+pub(crate) const TY_FRAG: u32 = 1 << 31;
+
 const GLOB_ID: Name = Name(0);
 const GLOB_SEP_ID: Name = Name(1);
 
@@ -1791,7 +1794,7 @@ pub mod uses {
     use crate::lexer::T;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
+    use relax_session::sync::Mutex;
 
     /// A definition: where it is written, and for each rule the position of its matcher and
     /// whether its transcriber holds a `compile_error!` (such a rule is never reported).
@@ -1842,6 +1845,50 @@ pub mod uses {
     pub(super) fn used(d: &MacroDef, arm: u32) {
         if !recording() || d.builtin != 0 { return; }
         USED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((d.def_file.clone(), d.def_pos, arm));
+    }
+
+    // The parentheses a transcription adds around a multi-token `$e:expr` fragment (the AST has
+    // no interpolated-expression node): the lints must see through them.
+    thread_local! { static SYNTH_PENDING: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) }; }
+    static SYNTH: Mutex<Option<HashSet<(String, u32)>>> = Mutex::new(None);
+
+    /// The transcriber added a paren at text offset `off` of the expansion being built.
+    pub(super) fn synth_note(off: u32) {
+        if recording() { SYNTH_PENDING.with(|p| p.borrow_mut().push(off)); }
+    }
+
+    /// The expansion built on this thread starts at `base` of `file`: its added parens are at `base + offset`.
+    pub fn synth_flush(file: &str, base: u32) {
+        let v = SYNTH_PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        if v.is_empty() { return; }
+        let mut g = SYNTH.lock().unwrap_or_else(|e| e.into_inner());
+        let set = g.get_or_insert_with(Default::default);
+        for off in v { set.insert((file.to_string(), base + off)); }
+    }
+
+    /// Whether the `(` at `pos` of `file` was added by a transcription around an expression fragment.
+    pub fn is_synth_paren(file: &str, pos: u32) -> bool {
+        SYNTH.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&(file.to_string(), pos)))
+    }
+
+    /// A `;` that ends a macro_rules expansion parsed as an expression (rustc_expand
+    /// ParserAnyMacro::make, semicolon_in_expressions_from_macros): the expansion's file, the
+    /// `;` token's position, the call's position and the file of the macro's definition.
+    pub struct TrailingSemi {
+        pub file: String,
+        pub semi: u32,
+        pub call: u32,
+        pub def_file: String,
+    }
+
+    static SEMIS: Mutex<Vec<TrailingSemi>> = Mutex::new(Vec::new());
+
+    pub fn trailing_semi(file: &str, semi: u32, call: u32, def_file: &str) {
+        SEMIS.lock().unwrap_or_else(|e| e.into_inner()).push(TrailingSemi { file: file.to_string(), semi, call, def_file: def_file.to_string() });
+    }
+
+    pub fn take_trailing_semis() -> Vec<TrailingSemi> {
+        std::mem::take(&mut *SEMIS.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// The recorded definitions and uses (file, definition position, rule or `RESOLVED`).
@@ -1935,7 +1982,13 @@ fn parse_matcher(toks: &[MTok], edition: u16) -> Result<Vec<MNode>, String> {
             let n = &toks[i + 1];
             if n.kind == T::OpenParen {
                 let (lo, hi, sep, op, next) = rep_at(toks, i).ok_or("bad repetition in macro matcher")?;
-                out.push(MNode::Rep(parse_matcher(&toks[lo..hi], edition)?, sep, op));
+                let inner = parse_matcher(&toks[lo..hi], edition)?;
+                // mbe/macro_rules.rs check_lhs_no_empty_seq: a repetition without separator must not match nothing
+                if sep.is_none() && crate::lexer::validation_enabled()
+                    && inner.iter().all(|n| matches!(n, MNode::Var(_, Frag::Vis) | MNode::Rep(_, _, b'*' | b'?'))) {
+                    return Err("repetition matches empty token tree".to_string());
+                }
+                out.push(MNode::Rep(inner, sep, op));
                 i = next;
                 continue;
             }
@@ -2444,12 +2497,16 @@ impl<'a> Parser<'a> {
     fn transcribe(&self, nodes: &[TNode], binds: &HashMap<String, Bind>, idx: &mut Vec<usize>, krate_path: &str, out: &mut Transcript) -> Result<(), String> {
         for (ni, n) in nodes.iter().enumerate() {
             match n {
-                TNode::Tok(t) => out.push(&t.text, None, t.pos),
-                TNode::Crate => out.push(krate_path, None, u32::MAX),
+                TNode::Tok(t) => out.push(t.kind, &t.text, None, t.pos),
+                // `crate`, or `::__relax_crate_<name>` (two adjacent tokens)
+                TNode::Crate => match krate_path.strip_prefix("::") {
+                    Some(name) => out.push_run(krate_path, &[(T::PathSep, 2), (T::Ident, name.len())]),
+                    None => out.push(T::KwCrate, krate_path, None, u32::MAX),
+                },
                 TNode::Group(o, c, inner) => {
-                    out.push(&o.text, None, o.pos);
+                    out.push(o.kind, &o.text, None, o.pos);
                     self.transcribe(inner, binds, idx, krate_path, out)?;
-                    out.push(&c.text, None, c.pos);
+                    out.push(c.kind, &c.text, None, c.pos);
                 }
                 TNode::Var(v) => match Self::lookup_bind(binds, v, idx) {
                     Some(Bind::One(lo, hi, f, taken, bare)) => {
@@ -2460,31 +2517,36 @@ impl<'a> Parser<'a> {
                         let bare_macro = *f == Frag::Expr && taken.is_none() && ends && self.is_macro_call(*lo, *hi);
                         let wrap = *f == Frag::Expr && hi - lo + usize::from(taken.is_some()) > 1 && !*bare && !bare_macro;
                         if wrap {
-                            out.push("(", None, u32::MAX);
+                            uses::synth_note(out.s.len() as u32 + 1);
+                            out.push(T::OpenParen, "(", None, u32::MAX);
                         }
                         let group_start = out.s.len() + 1;
                         for k in *lo..*hi {
                             let t = self.toks.at(k);
-                            out.push(&String::from_utf8_lossy(self.tok_text(t)), Some(t.lo), u32::MAX);
+                            out.push(t.kind, &String::from_utf8_lossy(self.tok_text(t)), Some(t.lo), u32::MAX);
                         }
                         if let Some((a, b)) = *taken {
-                            out.push(&String::from_utf8_lossy(self.bytes(a, b)), Some(a), u32::MAX);
+                            let part = self.bytes(a, b);
+                            out.push(lexed_kind(part), &String::from_utf8_lossy(part), Some(a), u32::MAX);
                         }
                         // a fragment of one of these kinds stays one token tree where the
                         // expansion is matched again (`$i:item` forwarded to `$t:tt`)
                         let opaque = !wrap && !matches!(f, Frag::Ident | Frag::Lifetime | Frag::Tt);
-                        if opaque && out.s.len() > group_start && hi - lo + usize::from(taken.is_some()) > 1 {
-                            out.groups.push((group_start as u32, out.s.len() as u32));
+                        // (a `$t:ty` is a type nonterminal even when it is one token: where a bound is
+                        // expected, it is not a trait -- rustc `parse_trait_bound`; the end carries TY_FRAG)
+                        let ty_frag = *f == Frag::Ty && !wrap;
+                        if opaque && out.s.len() > group_start && (hi - lo + usize::from(taken.is_some()) > 1 || ty_frag) {
+                            out.groups.push((group_start as u32, out.s.len() as u32 | if ty_frag { TY_FRAG } else { 0 }));
                         }
                         if wrap {
-                            out.push(")", None, u32::MAX);
+                            out.push(T::CloseParen, ")", None, u32::MAX);
                         }
                     }
                     Some(Bind::Seq(_)) => return Err(format!("`${}` is still repeating here -- use it inside `$( .. )*`", v)),
                     // not a macro variable: `$x` literally (rare; keeps the text)
                     None => {
-                        out.push("$", None, u32::MAX);
-                        out.push(v, None, u32::MAX);
+                        out.push(T::Dollar, "$", None, u32::MAX);
+                        out.push(crate::lexer::keyword(v.as_bytes(), self.edition).unwrap_or(T::Ident), v, None, u32::MAX);
                     }
                 },
                 TNode::Rep(inner, sep, _) => {
@@ -2504,7 +2566,7 @@ impl<'a> Parser<'a> {
                     for k in 0..count {
                         if k > 0 {
                             if let Some(s) = sep {
-                                out.push(&s.text, None, s.pos);
+                                out.push(s.kind, &s.text, None, s.pos);
                             }
                         }
                         idx.push(k);
@@ -2589,36 +2651,67 @@ impl<'a> Parser<'a> {
                 // `$crate` names the defining crate itself, even where the caller reaches the macro
                 // only through a re-export (no dependency of that name)
                 let krate_path = if def.krate == self.krate { "crate".to_string() } else { format!("::__relax_crate_{}", def.krate) };
-                let mut out = Transcript::default();
+                let mut out = Transcript { edition: self.edition, ..Default::default() };
                 self.transcribe(body, &binds, &mut Vec::new(), &krate_path, &mut out)?;
                 out.s.push(' ');
-                return Ok((out.s, out.origins, out.bodies, out.groups));
+                return Ok((out.s, out.toks, out.origins, out.bodies, out.groups));
             }
         }
         Err(format!("no rule of `{}!` matches these arguments -- check the macro's patterns", def.name))
     }
 }
 
-/// A transcription being written: the text (each token preceded by a space), per token
-/// substituted from a fragment (offset, its position), per token of the definition body
-/// (offset, its position in the definition).
+/// A transcription being written: the text (each token preceded by a space) with the tokens
+/// over it (kind and position as the definition's and the call's tokens have them, no lexing),
+/// per token substituted from a fragment (offset, its position), per token of the definition
+/// body (offset, its position in the definition).
 #[derive(Default)]
-struct Transcript {
+pub struct Transcript {
+    /// the edition the text is read in: the expanding parser's, whichever edition a token was lexed in
+    edition: u16,
     s: String,
+    toks: Vec<Tok>,
     origins: Vec<(u32, u32, u32)>,
     bodies: Vec<(u32, u32, u32)>,
     groups: Vec<(u32, u32)>,
 }
 
 impl Transcript {
-    fn push(&mut self, t: &str, origin: Option<u32>, bp: u32) {
+    fn push(&mut self, kind: T, t: &str, origin: Option<u32>, bp: u32) {
+        // an identifier or keyword is classified by the edition of the expansion (`dyn`, `async`,
+        // `try` are keywords from 2018), as lexing the text would
+        let kind = if kind == T::Ident || (kind as u8 >= T::KwAs as u8 && kind as u8 <= T::KwTry as u8) {
+            crate::lexer::keyword(t.as_bytes(), self.edition).unwrap_or(T::Ident)
+        } else { kind };
         self.s.push(' ');
+        let at = self.s.len() as u32;
         if let Some(o) = origin {
-            self.origins.push((self.s.len() as u32, o, t.len() as u32));
+            self.origins.push((at, o, t.len() as u32));
         } else if bp != u32::MAX {
-            self.bodies.push((self.s.len() as u32, bp, t.len() as u32));
+            self.bodies.push((at, bp, t.len() as u32));
         }
         self.s.push_str(t);
+        self.toks.push(Tok { kind, lo: at, hi: at + t.len() as u32 });
+    }
+    /// One run of text (one leading space) that is several adjacent tokens: (kind, byte length).
+    fn push_run(&mut self, text: &str, pieces: &[(T, usize)]) {
+        self.s.push(' ');
+        let mut at = self.s.len() as u32;
+        self.s.push_str(text);
+        for &(kind, n) in pieces {
+            self.toks.push(Tok { kind, lo: at, hi: at + n as u32 });
+            at += n as u32;
+        }
+    }
+}
+
+/// The kind of the text of a fragment's split token (a `>>` or `>>=` the fragment broke and took
+/// part of): what lexing that text gives.
+fn lexed_kind(part: &[u8]) -> T {
+    let mut v = Vec::new();
+    match crate::lexer::lex(part, 2021, &mut v) {
+        Ok(()) => v.first().map_or(T::OtherPunct, |t| t.kind),
+        Err(_) => T::OtherPunct,
     }
 }
 

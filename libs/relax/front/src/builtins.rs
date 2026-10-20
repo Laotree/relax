@@ -11,6 +11,8 @@
 
 use crate::cfg::CfgSet;
 use crate::lexer::{Tok, T};
+use crate::tg;
+use crate::tokbuf::TokBuf;
 use crate::parser::lazy_bodies::{SegRef, TokSeq};
 use crate::pm::{Delimiter, Group, LineColumn, Punct, Spacing, Span, TokenStream, TokenTree};
 #[cfg(test)]
@@ -674,10 +676,6 @@ fn orig_pos(p: &crate::parser::Parser, mut pos: u32) -> u32 {
     pos
 }
 
-fn str_lit(s: &str) -> String {
-    format!("{:?}", s)
-}
-
 /// Value of a string literal token's text (`"..."` or `r#"..."#`).
 fn lit_str_value(text: &str) -> Option<String> {
     if text.starts_with('"') {
@@ -739,7 +737,7 @@ pub fn expand(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: 
         }
         return Ok(Expansion { text, toks, origins });
     }
-    Expansion::lexed(expand_text(p, id, lo, hi, call_lo, call_hi)?)
+    Ok(Expansion::from_buf(expand_buf(p, id, lo, hi, call_lo, call_hi)?))
 }
 
 impl Expansion {
@@ -750,12 +748,12 @@ impl Expansion {
         Ok(out)
     }
 
-    /// Source text of an expansion, lexed.
-    pub fn lexed(text: String) -> Result<Expansion, String> {
-        let mut toks = Vec::new();
-        crate::lexer::lex(text.as_bytes(), 2021, &mut toks).map_err(|e| format!("expands to text that does not lex: {}", e.msg))?;
-        toks.retain(|t| t.kind != T::Eof);
-        Ok(Expansion { text, toks, origins: Vec::new() })
+    /// Tokens built by a built-in (no origins: the expansion maps to its call site).
+    pub fn from_buf(g: TokBuf) -> Self {
+        if crate::parser::verify_tokens() {
+            g.verify("built-in macro");
+        }
+        Self { text: g.s, toks: g.toks, origins: Vec::new() }
     }
 }
 
@@ -779,8 +777,10 @@ fn include_input(p: &crate::parser::Parser, lo: usize, hi: usize, call_lo: u32) 
     Ok((path, data))
 }
 
-fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: u32, call_hi: u32) -> Result<String, String> {
+fn expand_buf(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: u32, call_hi: u32) -> Result<TokBuf, String> {
     let b = from_u8(id);
+    let one = |kind: T, text: &str| { let mut g = TokBuf::new(p.edition); g.put(kind, text); g };
+    let one_str = |text: &str| { let mut g = TokBuf::new(p.edition); g.str_lit(text); g };
     let buf = Buf { src: p.src, ext: p.ext.view() };
     let toks = &p.toks;
     let ctx = p.bctx.as_deref();
@@ -788,25 +788,25 @@ fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo:
         Builtin::File => {
             let source = p.source_span(call_lo);
             if source.file != 0 {
-                if let Some(sources) = &p.sources { return Ok(str_lit(&file_macro_path(&sources.get(source.file)?.path))); }
+                if let Some(sources) = &p.sources { return Ok(one_str(&file_macro_path(&sources.get(source.file)?.path))); }
             }
             let f = match ctx {
                 Some(c) => c.file_macro.clone(),
                 None => String::new(),
             };
-            return Ok(str_lit(&f));
+            return Ok(one_str(&f));
         }
         Builtin::Line | Builtin::Column => {
             if let Some(span) = p.input_span(call_lo, call_hi) {
                 let value = if b == Builtin::Line { span.start.line } else { span.start.column };
-                return Ok(format!("{}u32", value));
+                return Ok(one(T::Int, &format!("{}u32", value)));
             }
             let pos = orig_pos(p, call_lo);
             let lc = match ctx {
                 Some(c) => line_col(p.src, c.line_starts(p.src), pos),
                 None => line_col(p.src, &line_starts(p.src), pos),
             };
-            return Ok(if b == Builtin::Line { format!("{}u32", lc.line) } else { format!("{}u32", lc.column) });
+            return Ok(one(T::Int, &if b == Builtin::Line { format!("{}u32", lc.line) } else { format!("{}u32", lc.column) }));
         }
         Builtin::ModulePath => {
             let mut m = match ctx {
@@ -817,23 +817,38 @@ fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo:
                 m.push_str("::");
                 m.push_str(s);
             }
-            return Ok(str_lit(&m));
+            return Ok(one_str(&m));
         }
         Builtin::Stringify => {
-            return Ok(str_lit(&stringify_o(buf, toks, lo, hi, p.tok_origin.view(), p.src.len() as u32)));
+            return Ok(one_str(&stringify_o(buf, toks, lo, hi, p.tok_origin.view(), p.src.len() as u32)));
         }
         Builtin::Env | Builtin::OptionEnv => {
-            let args = lit_args(p, lo, hi)?;
+            // rustc_builtin_macros env.rs: `option_env!` takes one string literal, `env!` one or two
+            let mut args = Vec::new();
+            let runs = split_commas(&p.toks, lo, hi);
+            if b == Builtin::OptionEnv && runs.len() > 1 {
+                return Err("option_env! takes 1 argument".to_string());
+            }
+            if b == Builtin::Env && runs.len() > 2 {
+                return Err("env! takes 1 or 2 arguments".to_string());
+            }
+            for (a, z) in runs {
+                let (v, is_str) = eval_lit(p, a, z)?;
+                if !is_str { return Err("argument must be a string literal".to_string()); }
+                args.push(v);
+            }
             let name = args.first().cloned().ok_or_else(|| "env! takes a variable name -- env!(\"NAME\")".to_string())?;
             let v = env_value(ctx, &name);
             return if b == Builtin::OptionEnv {
-                Ok(match v {
-                    Some(s) => format!("::core::option::Option::Some({})", str_lit(&s)),
-                    None => "::core::option::Option::None::<&'static str>".to_string(),
-                })
+                let mut g = TokBuf::new(p.edition);
+                match v {
+                    Some(s) => tg!(&mut g; :: core :: option :: Option :: Some (#str_lit(&s))),
+                    None => tg!(&mut g; :: core :: option :: Option :: None :: < & 'static str >),
+                }
+                Ok(g)
             } else {
                 match v {
-                    Some(s) => Ok(str_lit(&s)),
+                    Some(s) => Ok(one_str(&s)),
                     None => Err(match args.get(1) {
                         Some(m) => m.clone(),
                         None => format!("environment variable `{}` not defined at compile time -- set it before running makepad run", name),
@@ -843,7 +858,7 @@ fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo:
         }
         Builtin::Concat => {
             let parts = concat_args(p, lo, hi)?;
-            return Ok(str_lit(&parts.concat()));
+            return Ok(one_str(&parts.concat()));
         }
         Builtin::ThreadLocal => {
             let mut v: Vec<(T, &[u8])> = Vec::new();
@@ -851,7 +866,7 @@ fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo:
                 let t = p.toks.at(i);
                 v.push((t.kind, p.tok_text(t)));
             }
-            return crate::thread_local_mac::expand(&v);
+            return crate::thread_local_mac::expand(&v, p.edition);
         }
         Builtin::CfgSelect => {
             // `pred => { tokens }` / `pred => expr,` arms: the first true predicate (`_` is
@@ -914,7 +929,9 @@ fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo:
                 }
                 let wildcard = pred_hi == pred_lo + 1 && buf.get(toks.at(pred_lo).lo, toks.at(pred_lo).hi) == b"_";
                 if wildcard || crate::cfg::eval_tokens(src, pred_lo, pred_hi, &ctx.cfg) {
-                    return Ok(stringify_o(buf, toks, body_lo, body_hi, p.tok_origin.view(), p.src.len() as u32));
+                    let mut g = TokBuf::new(p.edition);
+                    p.copy_toks(&mut g, body_lo, body_hi);
+                    return Ok(g);
                 }
             }
             return Err("none of the predicates in this `cfg_select` evaluated to true".to_string());
@@ -923,12 +940,12 @@ fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo:
             let (path, data) = include_input(p, lo, hi, call_lo)?;
             return if b == Builtin::IncludeStr {
                 let s = String::from_utf8(data).map_err(|_| format!("`{}` is not UTF-8 -- use include_bytes!", path))?;
-                Ok(str_lit(&s))
+                Ok(one_str(&s))
             } else {
                 // the bytes travel as a payload behind a short marker literal (escaping a
                 // font into `b"\x.."` text and lexing / unescaping it again cost ~4 bytes of
                 // work per byte, three times): lower::unescape_bytes resolves the marker
-                Ok(format!("b\"{}{}\"", PAYLOAD_MARK, register_payload(data)))
+                Ok(one(T::ByteStr, &format!("b\"{}{}\"", PAYLOAD_MARK, register_payload(data))))
             };
         }
         _ => {}
@@ -937,8 +954,7 @@ fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo:
     let span_of = |a: u32, z: u32| Span { file: 0, lo: a, hi: z, start: LineColumn { line: 1, column: 1 }, end: LineColumn { line: 1, column: 1 } };
     let input = to_stream_buf(buf, toks, lo, hi, &span_of).ok_or_else(|| "unbalanced delimiters in macro input".to_string())?;
     if b == Builtin::Bitflags {
-        let c = if p.krate == "bitflags" { "crate".to_string() } else { "::__relax_crate_bitflags".to_string() };
-        return crate::bitflags_native::expand(&input, &c, p.bctx.as_ref().map(|x| &x.cfg));
+        return crate::bitflags_native::expand(&input, p.krate == "bitflags", p.bctx.as_ref().map(|x| &x.cfg), p.edition);
     }
     let _ = (call_lo, call_hi);
     Err("not a built-in macro".to_string())
@@ -1227,14 +1243,12 @@ fn eval_lit(p: &crate::parser::Parser, a: usize, z: usize) -> Result<(String, bo
         let name = text(i - 1);
         let b = lookup(&name);
         if b != Builtin::None && z >= i + 3 {
-            let out = expand_text(p, b as u8, i + 2, z - 1, toks.at(a).lo, toks.at(z - 1).hi)?;
-            let mut lt = Vec::new();
-            crate::lexer::lex(out.as_bytes(), 2021, &mut lt).map_err(|_| "nested macro output does not lex".to_string())?;
-            if lt.len() >= 1 {
-                let s = &out[lt[0].lo as usize..lt[0].hi as usize];
-                return match lt[0].kind {
+            let out = expand_buf(p, b as u8, i + 2, z - 1, toks.at(a).lo, toks.at(z - 1).hi)?;
+            if let Some(t0) = out.toks.first() {
+                let s = &out.s[t0.lo as usize..t0.hi as usize];
+                return match t0.kind {
                     T::Str | T::RawStr => Ok((lit_str_value(s).unwrap_or_default(), true)),
-                    T::Int | T::Float => Ok((num_lit_value(s, lt[0].kind == T::Int), false)),
+                    T::Int | T::Float => Ok((num_lit_value(s, t0.kind == T::Int), false)),
                     _ => Ok((s.to_string(), false)),
                 };
             }
@@ -1306,18 +1320,69 @@ fn item_location(p: &crate::parser::Parser, mut origin: u32) -> (usize,usize) {
     if origin >= p.src.len() as u32 {
         if let Some(span) = p.input_span(origin, origin + 1) { return (span.start.line as usize, span.start.column as usize); }
     }
-    crate::lexer::line_col(p.src,origin)
+    // the file's line starts are worked out once (FileCtx), not by counting from byte 0 per item
+    match &p.bctx {
+        Some(c) => c.byte_line_col(p.src, origin),
+        None => crate::lexer::line_col(p.src, origin),
+    }
+}
+
+fn same_tokens(a: &[Tok], b: &[Tok]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.kind == y.kind && x.lo == y.lo && x.hi == y.hi)
+}
+
+/// What a token the parser split in place (`>>` -> `>`, `&&` -> `&`, ..) or unraw'd was in the source.
+const SPLIT_FORMS: [(&[u8], T); 10] = [
+    (b">>", T::Shr), (b">=", T::Ge), (b">>=", T::ShrEq), (b"<<", T::Shl), (b"<=", T::Le),
+    (b"<<=", T::ShlEq), (b"<-", T::LArrow), (b"&&", T::AndAnd), (b"||", T::OrOr), (b"+=", T::PlusEq),
+];
+
+/// The token as the lexer made it: `t` follows a gap that starts at `prev_hi`.
+fn unsplit(buf: &Buf, prev_hi: u32, t: Tok) -> Tok {
+    match t.kind {
+        T::Ident if t.lo >= prev_hi + 2 && buf.get(t.lo - 2, t.lo) == b"r#" => Tok { kind: T::RawIdent, lo: t.lo - 2, hi: t.hi },
+        T::Gt | T::Eq | T::Ge | T::Lt | T::Le | T::Minus | T::And | T::Or => {
+            for n in [2u32, 1] {
+                if t.lo < prev_hi + n {
+                    continue;
+                }
+                let text = buf.get(t.lo - n, t.hi);
+                if let Some(&(_, kind)) = SPLIT_FORMS.iter().find(|(s, _)| *s == text) {
+                    return Tok { kind, lo: t.lo - n, hi: t.hi };
+                }
+            }
+            t
+        }
+        _ => t,
+    }
+}
+
+/// The tokens `lo..hi` of the parser, as the source spelled them, with positions relative to
+/// `item_lo` and a closing Eof (what lexing the item's text gives).
+fn item_tokens(p: &crate::parser::Parser, buf: &Buf, lo: usize, hi: usize, item_lo: u32) -> Vec<Tok> {
+    let mut v = Vec::with_capacity(hi - lo + 1);
+    let mut prev_hi = item_lo;
+    for i in lo..hi {
+        let t = unsplit(buf, prev_hi, p.toks.at(i));
+        prev_hi = t.hi;
+        v.push(Tok { kind: t.kind, lo: t.lo - item_lo, hi: t.hi - item_lo });
+    }
+    let e = prev_hi - item_lo;
+    v.push(Tok { kind: T::Eof, lo: e, hi: e });
+    v
 }
 
 /// Derives of one item, from its source bytes (`item_lo`: its position, for diagnostics).
 /// Linked derives run natively, the rest through the JIT host (pmhost.rs; any thread).
-fn expand_item(sess: &std::sync::Arc<crate::Session>, path: &str, item: &[u8], item_lo: u32, location: (usize, usize), cfg: Option<&CfgSet>, edition: u16, authored: Option<&dyn Fn(u32, u32) -> Option<Span>>) -> Result<ItemOut, (u32, String)> {
+fn expand_item(sess: &std::sync::Arc<crate::Session>, path: &str, item: &[u8], fresh: Vec<Tok>, item_lo: u32, location: (usize, usize), cfg: Option<&CfgSet>, edition: u16, authored: Option<&dyn Fn(u32, u32) -> Option<Span>>) -> Result<ItemOut, (u32, String)> {
     let span_of = |a: u32, z: u32| authored.and_then(|f| f(item_lo + a, item_lo + z)).unwrap_or(Span { file: 0, lo: item_lo + a, hi: item_lo + z, start: LineColumn { line: 1, column: 1 }, end: LineColumn { line: 1, column: 1 } });
-    // lexed from the item's own text: parsing rewrites tokens in place (`>>` closing two
-    // generic lists becomes `>`), so the parser's token list no longer spells the source
-    let mut fresh = Vec::new();
-    if crate::lexer::lex(item, 2021, &mut fresh).is_err() {
-        return Err((item_lo, "derive input does not lex".to_string()));
+    // the item's own tokens (parsing rewrites tokens in place, `>>` closing two generic lists
+    // becomes `>`: callers hand over the tokens as the source spelled them)
+    if crate::parser::verify_tokens() {
+        let mut lexed = Vec::new();
+        if crate::lexer::lex(item, 2021, &mut lexed).is_err() || !same_tokens(&lexed, &fresh) {
+            crate::tokbuf::verify_fail(&format!("derive input tokens differ from the lexed item text at {item_lo}: lexed {:?} given {:?} in `{}`", lexed.iter().map(|t| (t.kind, t.lo, t.hi)).collect::<Vec<_>>(), fresh.iter().map(|t| (t.kind, t.lo, t.hi)).collect::<Vec<_>>(), String::from_utf8_lossy(item)));
+        }
     }
     let input = match to_stream_buf(Buf::plain(item), &fresh, 0, fresh.len(), &span_of) {
         Some(s) => s,
@@ -1352,10 +1417,8 @@ fn expand_item(sess: &std::sync::Arc<crate::Session>, path: &str, item: &[u8], i
                 }
                 let (line,col) = location;
                 crate::macro_reg::derive_failed(path, item_lo, line as u32,col as u32, &name, &m);
-                let e = format!("compile_error!({:?});", format!("derive({}): {}", name, m));
-                let mut et = Vec::new();
-                let _ = crate::lexer::lex(e.as_bytes(), 2021, &mut et);
-                emit_lexed(&e, &et, call.into(), &mut out);
+                let e = TokBuf::compile_error(edition, &format!("derive({}): {}", name, m), true);
+                emit_lexed(&e.s, &e.toks, call.into(), &mut out);
                 continue;
             }
         };
@@ -1500,6 +1563,13 @@ fn emit_tokens(trees: &[TokenTree], edition: u16, out: &mut Expansion, scratch: 
     Ok(())
 }
 
+/// Proc-macro style trees as tokens over their own text (no origins).
+pub fn trees_to_buf(trees: &[TokenTree], edition: u16) -> Result<TokBuf, String> {
+    let mut out = Expansion { text: String::new(), toks: Vec::new(), origins: Vec::new() };
+    emit_tokens(trees, edition, &mut out, &mut Vec::new())?;
+    Ok(TokBuf::from_parts(edition, out.text, out.toks))
+}
+
 fn push_tok(out: &mut Expansion, s: &str, kind: T, source: SourceSpan) {
     let lo = out.text.len() as u32;
     out.text.push_str(s);
@@ -1595,8 +1665,20 @@ fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo:
     // MAKEPAD_RUN_REUSE_VERIFY=1: every reused derive expansion is recomputed and must be identical.
     if reused.is_some() && std::env::var_os("MAKEPAD_RUN_REUSE_VERIFY").is_none() { return Ok(reused); }
     crate::macro_reg::add_pre(false);
+    // an item of expansion text has its tokens (as the source spelled them); an authored item's
+    // tokens are the source's own (the parser's are the configured view: `#[cfg_attr]` expanded,
+    // disabled items gone, synthetic `#[`)
+    let fresh = if item_lo >= p.src.len() as u32 {
+        item_tokens(p, &buf, lo, hi, item_lo)
+    } else {
+        let mut v = Vec::new();
+        if crate::lexer::lex(buf.get(item_lo, item_hi), 2021, &mut v).is_err() {
+            return Err((item_lo, "derive input does not lex".to_string()));
+        }
+        v
+    };
     let cfg = p.bctx.as_ref().map(|c| &c.cfg);
-    let r = expand_item(sess, p.bctx.as_ref().map_or("", |c| c.path.as_str()), buf.get(item_lo, item_hi), item_lo, item_location(p,item_lo), cfg, p.edition, Some(&|lo, hi| p.input_span(lo, hi)));
+    let r = expand_item(sess, p.bctx.as_ref().map_or("", |c| c.path.as_str()), buf.get(item_lo, item_hi), fresh, item_lo, item_location(p,item_lo), cfg, p.edition, Some(&|lo, hi| p.input_span(lo, hi)));
     match r? {
         ItemOut::Done(x) => {
             if let Some(reused) = reused {
@@ -1752,10 +1834,8 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attr: &crate::ast::Attr, lo:
         Err(m) => {
             let (line,col) = item_location(p,item_lo);
             crate::macro_reg::derive_failed(path, item_lo,line as u32,col as u32, &format!("#[{}]", name), &m);
-            let e = format!("compile_error!({:?});", format!("#[{}]: {}", name, m));
-            let mut et = Vec::new();
-            let _ = crate::lexer::lex(e.as_bytes(), 2021, &mut et);
-            emit_lexed(&e, &et, call.into(), &mut out);
+            let e = TokBuf::compile_error(p.edition, &format!("#[{}]: {}", name, m), true);
+            emit_lexed(&e.s, &e.toks, call.into(), &mut out);
         }
     }
     out.text.push('\n');
@@ -1800,7 +1880,7 @@ pub fn pre_expand_derives(files: &[(&str, &[u8], &[Tok])], cfg: &CfgSet, edition
                     }
                     let (fi, lo, hi) = sites[k];
                     let src = files[fi].1;
-                    out.push((k, expand_item(sess, files[fi].0, &src[lo as usize..hi as usize], lo, crate::lexer::line_col_at(&lines[fi], src.len(), lo), Some(cfg), edition, None)));
+                    out.push((k, expand_item(sess, files[fi].0, &src[lo as usize..hi as usize], site_tokens(files[fi].2, lo, hi), lo, crate::lexer::line_col_at(&lines[fi], src.len(), lo), Some(cfg), edition, None)));
                 }
                 out
             }));
@@ -1828,6 +1908,15 @@ pub fn pre_expand_derives(files: &[(&str, &[u8], &[Tok])], cfg: &CfgSet, edition
         }
     });
     crate::macro_reg::add_pre_wall(t_wall.elapsed().as_nanos() as u64);
+}
+
+/// The prescan's tokens of the byte range `lo..hi`, relative to `lo`, with a closing Eof.
+fn site_tokens(toks: &[Tok], lo: u32, hi: u32) -> Vec<Tok> {
+    let a = toks.partition_point(|t| t.lo < lo);
+    let b = toks.partition_point(|t| t.hi <= hi);
+    let mut v: Vec<Tok> = toks[a..b.max(a)].iter().filter(|t| t.kind != T::Eof).map(|t| Tok { kind: t.kind, lo: t.lo - lo, hi: t.hi - lo }).collect();
+    v.push(Tok { kind: T::Eof, lo: hi - lo, hi: hi - lo });
+    v
 }
 
 /// Items carrying a `derive(..)` attribute that names a derive Relax runs (is_derive): `f(item lo, item hi)`
@@ -2287,6 +2376,13 @@ fn prescan_rules(tb: &[u8], krate: &str, cfg: &CfgSet) -> Vec<crate::macros::Mac
 
 #[cfg(test)]
 mod pm_input_tests {
+
+    /// An expansion given as text, lexed here (the parser takes tokens only).
+    fn expand_lexed(p: &mut crate::parser::Parser, text: &str, call_lo: u32) -> usize {
+        let mut toks = Vec::new();
+        assert!(crate::lexer::lex(text.as_bytes(), 2021, &mut toks).is_ok());
+        p.expand_toks(text, &toks, call_lo)
+    }
     use super::*;
 
     #[test]
@@ -2383,7 +2479,7 @@ mod pm_input_tests {
         p.token_input = true;
         p.sources = Some(sources);
         p.bctx = Some(std::rc::Rc::new(FileCtx::new("test", "/fake/module.rs", "test", &CfgSet::host(&sess, &[]))));
-        let start = p.expand_text("forward", "r#type", base).unwrap_or_else(|e| panic!("{}", e.msg));
+        let start = expand_lexed(&mut p, "r#type", base);
         let nested = p.toks.at(start).lo;
         p.tok_origin.push((nested, base, 6));
         for needed in [false, true] {
@@ -2435,19 +2531,19 @@ mod pm_input_tests {
         // expansion index. Deliberately use a single long line, as generated text does.
         p.ext.extend(std::iter::repeat_n(b' ', 2_000_000 - p.ext.len()));
         compare(&p, 0, p.toks.len(), 0, src.len() as u32);
-        let start = p.expand_text("test", "(forwarded >>= 2)", 0).unwrap_or_else(|e| panic!("{}", e.msg));
+        let start = expand_lexed(&mut p, "(forwarded >>= 2)", 0);
         let base = p.toks.at(start).lo;
         p.tok_origin.push((base + 1, 0, 2));
         compare(&p, start, p.toks.len(), base, p.toks.last().unwrap().hi);
         // Nested substitution, resolving a fragment through the preceding expansion.
-        let start = p.expand_text("test", "[forwarded]", base).unwrap_or_else(|e| panic!("{}", e.msg));
+        let start = expand_lexed(&mut p, "[forwarded]", base);
         let nested = p.toks.at(start).lo;
         p.tok_origin.push((nested + 1, base + 1, 2));
         compare(&p, start, p.toks.len(), nested, p.toks.last().unwrap().hi);
         // No call-site mapping: exercise the lazy expansion index, Unicode and EOF.
         p.exp_map.clear();
         p.tok_origin.clear();
-        let start = p.expand_text("test", "\n(\"é中🦀\", x)", u32::MAX).unwrap_or_else(|e| panic!("{}", e.msg));
+        let start = expand_lexed(&mut p, "\n(\"é中🦀\", x)", u32::MAX);
         p.exp_map.clear();
         compare(&p, start, p.toks.len(), p.toks.at(start).lo, p.toks.last().unwrap().hi);
     }

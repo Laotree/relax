@@ -67,12 +67,17 @@ fn closure_extent(ast: &crate::ast::Ast, c: u32) -> (u32, u32) {
     }
 }
 
-/// The enclosing closure of closure `c` (the smallest other closure of `all` whose extent contains it).
-fn enclosing_closure(prog: &Program, body: &typeck::Body, all: &[u32], c: u32) -> Option<u32> {
-    let ast = &prog.files[body.file as usize].ast;
-    let (lo, hi) = closure_extent(ast, c);
-    all.iter().copied().filter(|&o| o != c).filter(|&o| { let x = closure_extent(ast, o); x.0 <= lo && hi <= x.1 })
-        .min_by_key(|&o| { let x = closure_extent(ast, o); x.1 - x.0 })
+/// The closures a body (and its promoted bodies) creates.
+fn created_closures(mir: &Body, out: &mut Vec<u32>) {
+    use crate::mir::{AggregateKind, Rvalue, StatementKind};
+    for block in &mir.basic_blocks {
+        for s in &block.statements {
+            if let StatementKind::Assign(_, Rvalue::Aggregate(k, _)) = &s.kind {
+                if let AggregateKind::Closure(id, _) | AggregateKind::Coroutine(id, _) | AggregateKind::CoroutineClosure(id, _) = &**k { out.push(id.expr); }
+            }
+        }
+    }
+    for p in &mir.promoted { created_closures(p, out); }
 }
 
 /// Check one typeck root. See the module doc.
@@ -108,11 +113,12 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
         owners.push(CheckedBody { owner: typeck.def, kind: OwnerKind::Closure(crate::ast::ExprId(c)) });
     }
     let Some(item) = CheckedBody::item(prog, typeck.def) else {
-        v.unchecked.push(format!("{name}: not a body owner"));
+        let d = prog.def(typeck.def);
+        v.unchecked.push(format!("{name}: not a body owner ({:?}, item kind {})", d.kind, match &prog.files[d.file as usize].ast.item(d.item).kind { crate::ast::ItemKind::Static(_, _, init) => format!("static init={}", init.is_some()), _ => "other".into() }));
         return v;
     };
     owners.push(item);
-    let g = Group { cx, prog, tcx, typeck, env, eval: &eval, root: &root, name: &name, fv_cache, closure_order: &closure_order };
+    let g = Group { cx, prog, tcx, typeck, env, eval: &eval, root: &root, name: &name, fv_cache };
     check_group(&g, &owners, false, &mut v);
     for child in body::const_children(prog, tcx, typeck) {
         check_group(&g, &[child], true, &mut v);
@@ -131,13 +137,12 @@ struct Group<'a, 'b> {
     root: &'b BuildRoot<'b>,
     name: &'a str,
     fv_cache: Option<&'a Rc<SummaryCx>>,
-    closure_order: &'a [u32],
 }
 
 /// Borrow-check a group of bodies together (one inference context each, nested bodies first):
 /// the item with its closures, or one anonymous constant.
 fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &mut Verdict) {
-    let Group { cx, prog, tcx, typeck, env, eval, root, name, fv_cache, closure_order } = *g;
+    let Group { cx, prog, tcx, typeck, env, eval, root, name, fv_cache } = *g;
     let env = env;
     let provider = BuildProvider { prog, tcx, memo: Default::default() };
 
@@ -169,6 +174,18 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
         }
     }
 
+    // Nesting from the MIR itself (which body aggregates which closure), not from source extents: macro
+    // expansions give nested closures equal spans. Inner bodies come first, as do_mir_borrowck requires.
+    let mut creator: crate::fxhash::HashMap<u32, Option<u32>> = Default::default();
+    for (owner, mir) in &built {
+        let by = match owner.kind { OwnerKind::Closure(e) => Some(e.0), _ => None };
+        let mut created = vec![];
+        created_closures(mir, &mut created);
+        for c in created { creator.insert(c, by); }
+    }
+    let depth = |c: u32| { let (mut d, mut at) = (1usize, c); while let Some(Some(p)) = creator.get(&at) { d += 1; at = *p; if d > creator.len() + 1 { break; } } d };
+    built.sort_by_key(|(o, _)| std::cmp::Reverse(match o.kind { OwnerKind::Closure(e) => depth(e.0), _ => 0 }));
+    let closure_order: Vec<u32> = built.iter().filter_map(|(o, _)| match o.kind { OwnerKind::Closure(e) => Some(e.0), _ => None }).collect();
     // `mir_coroutine_witnesses` of the coroutines of this root, for the dropck of their creators.
     for (owner, mir) in &built {
         let (OwnerKind::Closure(e), true) = (owner.kind, mir.coroutine.is_some()) else { continue };
@@ -204,7 +221,7 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
             }
             (None, None) => { v.unchecked.push(format!("{name}: closure without a signature")); return; }
         };
-        let parent = match enclosing_closure(prog, typeck, closure_order, c).and_then(|p| closure_sigs.get(&p)) {
+        let parent = match creator.get(&c).copied().flatten().and_then(|p| closure_sigs.get(&p)) {
             Some(p) => p.clone(),
             None => item_sig.clone(),
         };
@@ -243,7 +260,7 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
         let tc = p.typeck.as_mut().unwrap();
         let errors = std::mem::take(&mut tc.summary.errors);
         for bug in std::mem::take(&mut tc.summary.mir_bugs) {
-            v.unchecked.push(format!("{name}: MIR bug: {}", strip_ids(&bug.message)));
+            v.unchecked.push(format!("{name}: MIR bug: {}", render_ids(prog, tcx, &bug.message)));
         }
         let borrows = BorrowSet::build(tcx, &p.mir, false, &p.moves);
         let regions_stub = None::<()>;
@@ -310,16 +327,17 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
     }
 }
 
-/// A MIR-bug text without interned ids (`TyId(12)` -> `TyId`), so equal bugs group in the burn-down histogram.
-fn strip_ids(text: &str) -> String {
+/// A MIR-bug text with its interned type ids (`TyId(12)`) written out as types, so the unchecked
+/// histogram says which types the failing operation was about.
+fn render_ids(prog: &Program, tcx: &Tcx, text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(i) = rest.find("Id(") {
-        let (head, tail) = rest.split_at(i + 2);
-        out.push_str(head);
-        match tail.find(')') {
-            Some(j) if tail[1..j].bytes().all(|b| b.is_ascii_digit()) => rest = &tail[j + 1..],
-            _ => rest = tail,
+    while let Some(i) = rest.find("TyId(") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + 5..];
+        match tail.find(')').and_then(|j| tail[..j].parse::<u32>().ok().map(|n| (j, n))) {
+            Some((j, n)) => { out.push_str(&crate::typeck::ty_to_string(false, prog, tcx, TyId(n))); rest = &tail[j + 1..]; }
+            None => { out.push_str("TyId("); rest = tail; }
         }
     }
     out.push_str(rest);

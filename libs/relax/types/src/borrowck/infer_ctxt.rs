@@ -136,13 +136,25 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
         let span = self.locations_span(locations);
         let before = self.infcx.universe();
         let input = op.input();
+        let input_dbg = input.clone();
         let opaques_before = self.infcx.inner.borrow_mut().opaque_types().num_entries();
         let result = super::type_check::canonical::fully_perform_op_raw(self,
             self.universal_regions.as_ref().expect("MIR type ops require universal regions"), &self.region_bound_pairs,
             &self.param_env.clauses, out, locations, span, category, op);
         // The uses of opaque types the op registered are at this location.
         self.infcx.inner.borrow_mut().opaque_types().set_span_since(opaques_before, (span.lo, span.hi));
-        if result.is_err() { self.tainted_by_errors.set(true); }
+        if result.is_err() {
+            self.tainted_by_errors.set(true);
+            if std::env::var_os("MAKEPAD_RUN_NOSOLUTION_TRACE").is_some() {
+                let show = |t| crate::typeck::ty_to_string(false, self.prog, &self.tcx, t);
+                let what = match &input_dbg {
+                    crate::next_solver::type_op::TypeOpInput::Normalize(_, t) => format!("normalize {}", show(*t)),
+                    crate::next_solver::type_op::TypeOpInput::ProvePredicate(_, p) => format!("prove {:?}", p.kind),
+                    other => format!("{other:?}"),
+                };
+                eprintln!("NOSOLUTION {} @ {:?}: {what}", self.prog.def_path(self.root_def_id), span);
+            }
+        }
         if self.infcx.universe().0 > before.0 {
             let info = std::sync::Arc::new(super::type_check::TypeOpErrorInfo { base_universe: before, input });
             for u in before.0 + 1..=self.infcx.universe().0 { out.universe_causes.push((UniverseIndex(u), super::type_check::UniverseInfo::TypeOp(info.clone()))); }

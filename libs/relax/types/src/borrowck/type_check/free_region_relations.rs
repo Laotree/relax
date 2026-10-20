@@ -29,7 +29,7 @@ impl UniversalRegionRelations {
         // as rustc's build: the param-env's outlives clauses, then every universal region (reflexive,
         // outlived by 'static, outliving the fn body), then the implied bounds.
         let mut edges = vec![];
-        let mut known_edge = |edges: &mut Vec<(usize, usize)>, &(a, b): &(RegionVid, RegionVid)| if let (Some(a), Some(b)) = (index[a], index[b]) { edges.push((a, b)); };
+        let known_edge = |edges: &mut Vec<(usize, usize)>, &(a, b): &(RegionVid, RegionVid)| if let (Some(a), Some(b)) = (index[a], index[b]) { edges.push((a, b)); };
         for k in &known[..explicit.min(known.len())] { known_edge(&mut edges, k); }
         for &fr in &indices {
             edges.push((at(fr),at(fr)));

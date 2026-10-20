@@ -218,6 +218,7 @@ impl ImpliedBounds {
     /// `visiting` contributes nothing on its way back (rustc iterates to a fixpoint).
     fn inferred_outlives_of(&mut self, tcx: &Tcx, prog: &Program, def: crate::program::DefId, visiting: &mut Vec<crate::program::DefId>) -> Vec<OutlivesPredicate> {
         if let Some(done) = self.inferred.get(&def) { return done.clone(); }
+        if let Some(done) = tcx.inferred_outlives.get(&def) { return (*done).clone(); }
         if visiting.contains(&def) { return vec![]; }
         let Some(adt) = tcx.adts.get(&def) else { return vec![] };
         visiting.push(def);
@@ -231,7 +232,7 @@ impl ImpliedBounds {
             OutlivesPredicate::Region(a, b) => [a, b].iter().all(|&r| matches!(tcx.tys.region_kind(r), RegionKind::ReEarlyParam(_))),
             OutlivesPredicate::Type(t, r) => matches!(tcx.tys.kind(t), TyKind::Param(_)) && matches!(tcx.tys.region_kind(r), RegionKind::ReEarlyParam(_) | RegionKind::ReStatic),
         });
-        if visiting.is_empty() { self.inferred.insert(def, required.clone()); }
+        if visiting.is_empty() { self.inferred.insert(def, required.clone()); tcx.inferred_outlives.insert(def, std::sync::Arc::new(required.clone())); }
         required
     }
     fn required_to_be_wf(&mut self, tcx: &Tcx, prog: &Program, ty: TyId, visiting: &mut Vec<crate::program::DefId>, out: &mut Vec<OutlivesPredicate>) {

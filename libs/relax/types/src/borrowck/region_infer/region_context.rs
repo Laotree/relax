@@ -68,6 +68,8 @@ impl RegionInferenceContext {
     }
     pub fn eval_equal(&self, a: usize, b: usize) -> bool { self.eval_outlives(a,b) && self.eval_outlives(b,a) }
     pub fn eval_outlives(&self, sup: usize, sub: usize) -> bool {
+        let n = self.scc_annotations.len().max(0);
+        let _ = n;
         let a = self.constraint_sccs.scc(sup);
         let b = self.constraint_sccs.scc(sub);
         if a == b { return true; }
@@ -97,10 +99,18 @@ impl RegionInferenceContext {
                     RegionKind::ReBound(..) => *bound,
                     _ => tcx.tys.intern_region(RegionKind::ReVar(self.scc_annotations[self.constraint_sccs.scc(self.to_region_vid(&tcx.tys,*bound))].representative.rvid() as u32)),
                 };
-                extract_verify_if_eq(tcx,prog,ty,bound,generic_ty).is_some_and(|r| self.eval_outlives(self.to_region_vid(&tcx.tys,r),lower))
+                extract_verify_if_eq(tcx,prog,ty,bound,generic_ty).is_some_and(|r| {
+                    let (sup, nvars) = (self.to_region_vid(&tcx.tys,r), self.constraint_sccs.num_vars());
+                    assert!(sup < nvars && lower < nvars, "IfEq verify bound: sup {sup} ({:?}) lower {lower} of {nvars} region variables; generic_ty {generic_ty:?} ty {ty:?} bound {bound:?}", tcx.tys.region_kind(r));
+                    self.eval_outlives(sup,lower)
+                })
             }
             VerifyBound::IsEmpty => self.scc_values.elements_contained_in(self.constraint_sccs.scc(lower)).next().is_none(),
-            VerifyBound::OutlivedBy(r) => self.eval_outlives(*r, lower),
+            VerifyBound::OutlivedBy(r) => {
+                let nvars = self.constraint_sccs.num_vars();
+                assert!(*r < nvars && lower < nvars, "OutlivedBy verify bound: bound region {r} lower {lower} of {nvars} region variables; generic_ty {generic_ty:?}");
+                self.eval_outlives(*r, lower)
+            }
             VerifyBound::AnyBound(bs) => bs.iter().any(|b| self.eval_verify_bound(tcx,prog,generic_ty,lower,b)),
             VerifyBound::AllBounds(bs) => bs.iter().all(|b| self.eval_verify_bound(tcx,prog,generic_ty,lower,b)),
         }

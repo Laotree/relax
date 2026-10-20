@@ -33,6 +33,8 @@ pub struct DPat {
     pub ty: TyId,
     /// the source position diagnostics point at (None: a `_` / `..` with no position of its own)
     pub pos: Option<u32>,
+    /// an exclusive range pattern `lo..hi` (the non_contiguous_range_endpoints lint)
+    pub range_excl: bool,
 }
 
 /// The analysis context of one body: its types, the module it is in, the lowered patterns.
@@ -265,7 +267,7 @@ impl<'a> Cx<'a> {
     }
 
     fn push(&mut self, ctor: Ctor, fields: Vec<(usize, PIx)>, arity: usize, ty: TyId, pos: Option<u32>) -> PIx {
-        self.pats.push(DPat { ctor, fields, arity, ty, pos });
+        self.pats.push(DPat { ctor, fields, arity, ty, pos, range_excl: false });
         self.pats.len() - 1
     }
 
@@ -553,8 +555,13 @@ impl<'a> Cx<'a> {
                         None => Some(self.opaque(t, pos)),
                     }
                 }
-                // (no value tree to walk: nothing is judged)
-                None => Some(self.opaque(t, pos)),
+                // (no value tree to walk: the type is judged -- structural ADTs, no function pointers)
+                None => {
+                    let mut seen = Vec::new();
+                    self.const_pattern_type_walk(t, pos, 0, &mut seen);
+                    self.const_pattern_partial_eq(t, pos);
+                    Some(self.opaque(t, pos))
+                }
             },
             _ => None,
         }
@@ -576,13 +583,41 @@ impl<'a> Cx<'a> {
         let before = self.const_errors.len();
         self.structural_walk(v, t, pos, 0);
         // the whole constant needs a `PartialEq` impl (type_has_partial_eq_impl)
-        if self.const_errors.len() == before && matches!(self.kind(t), TyKind::Adt(..)) {
-            let t = self.tcx.tys.erase_all_regions(t);
-            if let Some(pe) = self.tcx.lang_items.get(crate::lang_items::LangItem::PartialEq) {
-                let infcx = crate::infer::InferCtxt::new(self.tcx, crate::tcx::TypingMode::non_body_analysis(), self.env.limit);
-                let goal = crate::next_solver::Goal { param_env: self.env.param_env, predicate: crate::next_solver::collect::trait_predicate(pe, vec![crate::consts::GenericArg::Type(t), crate::consts::GenericArg::Type(t)]) };
-                if !infcx.evaluate_obligation(self.prog, goal).may_apply() { self.not_structural(t, pos); }
+        if self.const_errors.len() == before { self.const_pattern_partial_eq(t, pos); }
+    }
+
+    fn const_pattern_partial_eq(&mut self, t: TyId, pos: Option<u32>) {
+        if !matches!(self.kind(t), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Slice(_) | TyKind::Array(..) | TyKind::Tuple(_)) { return; }
+        let t = self.tcx.tys.erase_all_regions(t);
+        if let Some(pe) = self.tcx.lang_items.get(crate::lang_items::LangItem::PartialEq) {
+            let infcx = crate::infer::InferCtxt::new(self.tcx, crate::tcx::TypingMode::non_body_analysis(), self.env.limit);
+            let goal = crate::next_solver::Goal { param_env: self.env.param_env, predicate: crate::next_solver::collect::trait_predicate(pe, vec![crate::consts::GenericArg::Type(t), crate::consts::GenericArg::Type(t)]) };
+            if !infcx.evaluate_obligation(self.prog, goal).may_apply() { self.not_structural(t, pos); }
+        }
+    }
+
+    /// const_to_pat for a constant whose value is not known here: the type alone is judged -- an ADT
+    /// without the derived `StructuralPartialEq`, or a function pointer, cannot be matched on.
+    fn const_pattern_type_walk(&mut self, t: TyId, pos: Option<u32>, depth: u32, seen: &mut Vec<TyId>) {
+        if depth > 8 || seen.contains(&t) { return; }
+        seen.push(t);
+        match self.kind(t) {
+            TyKind::FnPtr(..) => {
+                if let Some(lo) = pos {
+                    let e = self.prog.record_uncoded_error(self.body.file, lo, "typeck", "function pointers and raw pointers not derived from integers in patterns behave unpredictably and should not be relied upon. See https://github.com/rust-lang/rust/issues/70861 for details.".to_string());
+                    self.const_errors.push(e);
+                }
             }
+            TyKind::Adt(d, args, _) => {
+                if !self.type_marked_structural(t) { self.not_structural(t, pos); return; }
+                // (an ADT's fields are not walked: only the value's own variant would matter, and with
+                // no value tree the marker and the PartialEq check are all that can be judged)
+                let _ = (d, args);
+            }
+            TyKind::Ref(_, inner, _) => { let inner = self.reveal(inner); self.const_pattern_type_walk(inner, pos, depth + 1, seen) }
+            TyKind::Tuple(l) => for ft in self.tcx.tys.list(l).to_vec() { self.const_pattern_type_walk(ft, pos, depth + 1, seen); },
+            TyKind::Array(e, _) | TyKind::Slice(e) => self.const_pattern_type_walk(e, pos, depth + 1, seen),
+            _ => {}
         }
     }
 
@@ -610,6 +645,18 @@ impl<'a> Cx<'a> {
                 } else { (0, &branches[..]) };
                 let tys = self.variant_field_tys(d, vi as u32, args);
                 for (f, ft) in fields.iter().zip(tys) { self.structural_walk(&f.valtree, ft, pos, depth + 1); }
+            }
+            // NaN equals nothing: no pattern (const_to_pat NaNPattern)
+            TyKind::Float(p) => {
+                if let Some(l) = v.try_to_leaf() {
+                    let bits = l.to_bits(l.size());
+                    let nan = if p == Prim::F32 { f32::from_bits(bits as u32).is_nan() } else if p == Prim::F64 { f64::from_bits(bits as u64).is_nan() } else { false };
+                    if nan {
+                        let Some(lo) = pos else { return };
+                        let e = self.prog.record_uncoded_error(self.body.file, lo, "typeck", "cannot use NaN in patterns".to_string());
+                        self.const_errors.push(e);
+                    }
+                }
             }
             TyKind::Ref(_, inner, _) => { let inner = self.reveal(inner); self.structural_walk(v, inner, pos, depth + 1) }
             TyKind::Tuple(l) => {
@@ -670,7 +717,7 @@ impl<'a> Cx<'a> {
             return false;
         }
         match self.kind(t) {
-            TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Str => true,
+            TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Float(_) | TyKind::Str => true,
             TyKind::Ref(_, i, _) => self.valtree_type(i, depth + 1),
             TyKind::Array(e, _) | TyKind::Slice(e) => self.valtree_type(e, depth + 1),
             TyKind::Tuple(l) => self.tcx.tys.list(l).iter().all(|x| self.valtree_type(*x, depth + 1)),
@@ -810,6 +857,16 @@ impl<'a> Cx<'a> {
                 text.parse::<f64>().ok()
             }
             ExprKind::Unary(UnOp::Neg, x) => Some(-self.float_expr(x)?),
+            // a named float constant
+            ExprKind::Path(_) => {
+                let Some(Res::Def(d)) = self.body.res.get(&e.0).copied() else { return None };
+                if !matches!(self.prog.def(d).kind, DefKind::Const | DefKind::AssocConst) { return None; }
+                let t = self.tcx.type_of(self.prog, d).ok()?;
+                let TyKind::Float(p) = self.kind(t) else { return None };
+                let leaf = self.const_value(d, e.0, t)?.try_to_leaf()?;
+                let bits = leaf.to_bits(leaf.size());
+                match p { Prim::F32 => Some(f32::from_bits(bits as u32) as f64), Prim::F64 => Some(f64::from_bits(bits as u64)), _ => None }
+            }
             _ => None,
         }
     }
@@ -864,6 +921,14 @@ impl<'a> Cx<'a> {
             TyKind::Float(_) => {
                 let lo = match a { Some(e) => self.float_expr(e), None => Some(f64::NEG_INFINITY) };
                 let hi = match b { Some(e) => self.float_expr(e), None => Some(f64::INFINITY) };
+                if lo.is_some_and(f64::is_nan) || hi.is_some_and(f64::is_nan) {
+                    // (a NaN endpoint: const_to_pat NaNPattern)
+                    if let Some(p) = pos {
+                        let e = self.prog.record_uncoded_error(self.body.file, p, "typeck", "cannot use NaN in patterns".to_string());
+                        self.const_errors.push(e);
+                    }
+                    return Some(self.opaque(t, pos));
+                }
                 match (lo, hi) {
                     (Some(lo), Some(hi)) => Some(Ctor::FloatRange(lo, hi, end)),
                     _ => None,
@@ -880,14 +945,29 @@ impl<'a> Cx<'a> {
                     None => (Some(MaybeInfiniteInt::PosInfinity), RangeEnd::Excluded),
                 };
                 match (lo, hi) {
-                    (Some(lo), Some(hi)) => IntRange::from_range(lo, hi, end).map(Ctor::IntRange),
+                    (Some(lo), Some(hi)) => {
+                        let r = IntRange::from_range(lo, hi, end);
+                        // rustc_mir_build lower_pattern_range: an empty range is an error (E0030 / E0579)
+                        if r.is_none() && a.is_some() && b.is_some() {
+                            if let Some(p) = pos {
+                                let msg = if incl { "E0030: lower bound for range pattern must be less than or equal to upper bound" } else { "E0579: lower bound for range pattern must be less than upper bound" };
+                                let e = self.prog.record_error(self.body.file, p, "typeck", msg.to_string());
+                                self.const_errors.push(e);
+                            }
+                        }
+                        r.map(Ctor::IntRange)
+                    }
                     _ => None,
                 }
             }
             _ => None,
         };
         match ctor {
-            Some(c) => Some(self.push(c, Vec::new(), 0, t, pos)),
+            Some(c) => {
+                let p = self.push(c, Vec::new(), 0, t, pos);
+                self.pats[p].range_excl = !incl && b.is_some();
+                Some(p)
+            }
             None => Some(self.opaque(t, pos)),
         }
     }
@@ -1222,7 +1302,8 @@ impl<'a> Checker<'a> {
             match ex.kind {
                 ExprKind::Match(scrut, arms) => {
                     let arms: Vec<(PatId, bool, u32, List<Attr>)> = ast.list(arms).iter().map(|a| (a.pat, a.guard.is_some(), ast.expr(a.body).lo, a.attrs)).collect();
-                    self.check_match(scrut, &arms, false);
+                    let mattrs = ast.list(ast.stmt_attrs(e)).to_vec();
+                    self.check_match(scrut, &arms, false, &mattrs);
                 }
                 ExprKind::Let(pat, init) => {
                     let source = let_source.get(&e.0).copied().unwrap_or(LetSource::Chain);
@@ -1252,7 +1333,7 @@ impl<'a> Checker<'a> {
                     let args = ast.mac_arg(mc.args);
                     // `matches!(e, pat if guard)`: `match e { pat if guard => true, _ => false }`
                     if let (Some(pat), Some(&scrut)) = (args.pat, ast.list(args.exprs).first()) {
-                        self.check_match(scrut, &[(pat, args.guard.is_some(), ex.lo, List::default())], true);
+                        self.check_match(scrut, &[(pat, args.guard.is_some(), ex.lo, List::default())], true, &[]);
                     }
                 }
                 _ => {}
@@ -1321,7 +1402,7 @@ impl<'a> Checker<'a> {
     }
 
     /// arms: (pattern, has guard, fallback position, attributes)
-    fn check_match(&mut self, scrut: ExprId, arms: &[(PatId, bool, u32, List<Attr>)], matches_macro: bool) {
+    fn check_match(&mut self, scrut: ExprId, arms: &[(PatId, bool, u32, List<Attr>)], matches_macro: bool, attrs: &[Attr]) {
         let ast = self.ast();
         let Some(scrut_ty) = self.scrut_ty(scrut) else { return };
         let mut tarms = Vec::new();
@@ -1347,6 +1428,7 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        self.report_range_lints(&report.range_lints, ast.expr(scrut).lo, attrs);
         let witnesses = report.non_exhaustiveness_witnesses;
         if witnesses.is_empty() {
             return;
@@ -1378,6 +1460,40 @@ impl<'a> Checker<'a> {
             format!("E0004: non-exhaustive patterns: {} not covered -- {}; ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern", joined, notes)
         };
         self.errors.push(self.cx.prog.record_error(self.cx.body.file, pos, "typeck", msg));
+    }
+
+    /// rustc.rs lint_overlapping_range_endpoints / lint_non_contiguous_range_endpoints.
+    fn report_range_lints(&self, lints: &[usefulness::RangeLint], fallback: u32, attrs: &[Attr]) {
+        let mut seen: Vec<(PIx, Vec<PIx>, bool)> = Vec::new();
+        for l in lints {
+            match l {
+                usefulness::RangeLint::Overlap { pat, overlaps_with, on } => {
+                    let mut key = overlaps_with.clone();
+                    key.sort_unstable();
+                    if seen.iter().any(|(p, k, o)| *o && p == pat && *k == key) { continue; }
+                    seen.push((*pat, key, true));
+                    let pos = self.cx.pat(*pat).pos.unwrap_or(fallback);
+                    let msg = format!("multiple patterns overlap on their endpoints -- this range overlaps on `{}`", self.cx.print_range(on, self.cx.pat(*pat).ty));
+                    self.lint_in(&crate::lint::OVERLAPPING_RANGE_ENDPOINTS, attrs, pos, &msg);
+                }
+                usefulness::RangeLint::NonContiguous { pat_before, gapped_with, gap } => {
+                    let p = self.cx.pat(*pat_before);
+                    // only an exclusive range `lo..gap`
+                    if !p.range_excl { continue; }
+                    let mut key = gapped_with.clone();
+                    key.sort_unstable();
+                    if seen.iter().any(|(q, k, o)| !*o && q == pat_before && *k == key) { continue; }
+                    seen.push((*pat_before, key, false));
+                    let pos = p.pos.unwrap_or(fallback);
+                    let g = self.cx.print_range(gap, p.ty);
+                    if gapped_with.is_empty() {
+                        self.lint_in(&crate::lint::NON_CONTIGUOUS_RANGE_ENDPOINTS, attrs, pos, &format!("exclusive range missing `{}`", g));
+                    } else {
+                        self.lint_in(&crate::lint::NON_CONTIGUOUS_RANGE_ENDPOINTS, attrs, pos, &format!("multiple ranges are one apart -- this range doesn't match `{}` because `..` is an exclusive range", g));
+                    }
+                }
+            }
+        }
     }
 
     fn report_unreachable(&self, p: PIx, covered_by: &[PIx], fallback: u32, attrs: &[Attr]) {
@@ -1420,6 +1536,7 @@ impl<'a> Checker<'a> {
             _ => PlaceValidity::ValidOnly,
         };
         let report = usefulness::compute_match_usefulness(&self.cx, &[MatchArm { pat, has_guard: false }], ty, validity)?;
+        self.report_range_lints(&report.range_lints, fallback, &[]);
         // (check_match.rs analyze_patterns: the redundant parts of a useful pattern)
         if let Usefulness::Useful(subs) = &report.arm_usefulness[0] {
             for (sp, covered_by) in subs {

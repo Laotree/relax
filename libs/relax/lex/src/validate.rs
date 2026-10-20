@@ -54,8 +54,57 @@ pub fn enabled() -> bool {
     ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// rustc_parse lexer `cook_doc_comment`: a doc comment holds no bare CR (one not followed by LF).
+/// The comments are the gaps between tokens (and after the last one).
+fn doc_comment_crs(src: &[u8], toks: &[Tok]) -> Result<(), VErr> {
+    let mut prev_hi = 0usize;
+    let check = |lo: usize, hi: usize| -> Result<(), VErr> {
+        let hi = hi.min(src.len());
+        let g = &src[lo.min(hi)..hi];
+        let mut i = 0;
+        while i < g.len() {
+            match g[i] {
+                b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+                b'/' if g.get(i + 1) == Some(&b'/') => {
+                    let doc = (g.get(i + 2) == Some(&b'/') && g.get(i + 3) != Some(&b'/')) || g.get(i + 2) == Some(&b'!');
+                    let start = i;
+                    while i < g.len() && g[i] != b'\n' { i += 1; }
+                    if doc {
+                        if let Some(c) = (start..i).find(|&k| g[k] == b'\r' && g.get(k + 1) != Some(&b'\n')) {
+                            return err(lo + c, "bare CR not allowed in doc-comment");
+                        }
+                    }
+                }
+                b'/' if g.get(i + 1) == Some(&b'*') => {
+                    let doc = (g.get(i + 2) == Some(&b'*') && !matches!(g.get(i + 3), Some(b'*') | Some(b'/'))) || g.get(i + 2) == Some(&b'!');
+                    let start = i;
+                    let mut depth = 0;
+                    while i < g.len() {
+                        if g[i] == b'/' && g.get(i + 1) == Some(&b'*') { depth += 1; i += 2; }
+                        else if g[i] == b'*' && g.get(i + 1) == Some(&b'/') { depth -= 1; i += 2; if depth == 0 { break; } }
+                        else { i += 1; }
+                    }
+                    if doc {
+                        if let Some(c) = (start..i.min(g.len())).find(|&k| g[k] == b'\r' && g.get(k + 1) != Some(&b'\n')) {
+                            return err(lo + c, "bare CR not allowed in doc-comment");
+                        }
+                    }
+                }
+                _ => return Ok(()),
+            }
+        }
+        Ok(())
+    };
+    for t in toks {
+        check(prev_hi, t.lo as usize)?;
+        prev_hi = t.hi as usize;
+    }
+    check(prev_hi, src.len())
+}
+
 /// Validates the tokens `toks[from..]` of `src`; the first error is returned.
 pub fn validate(src: &[u8], toks: &[Tok], edition: u16) -> Result<(), VErr> {
+    doc_comment_crs(src, toks)?;
     // Delimiter stack: true inside a macro invocation/definition or an attribute, whose tokens are
     // not literals yet. rustc cooks a literal's value and suffix when the parser consumes it
     // (`report_lit_error`), so those checks are skipped there; the lexer's own (escapes, digits of a
@@ -69,7 +118,11 @@ pub fn validate(src: &[u8], toks: &[Tok], edition: u16) -> Result<(), VErr> {
                 let prev = |n: usize| if k >= n { Some(toks[k - n].kind) } else { None };
                 let bang = prev(1) == Some(T::Not) || (prev(2) == Some(T::Not) && matches!(prev(1), Some(T::Ident)));
                 let attr = t.kind == T::OpenBracket && (prev(1) == Some(T::Pound) || (prev(1) == Some(T::Not) && prev(2) == Some(T::Pound)));
-                stack.push(!parse_level || bang || attr);
+                // (the std macros that parse their arguments as expressions consume the literals)
+                let parsed_args = bang && prev(1) == Some(T::Not) && k >= 2 && toks[k - 2].kind == T::Ident && matches!(&src[toks[k - 2].lo as usize..toks[k - 2].hi as usize],
+                    b"println" | b"print" | b"eprintln" | b"eprint" | b"format" | b"format_args" | b"write" | b"writeln" | b"panic" | b"assert" | b"assert_eq" | b"assert_ne"
+                    | b"debug_assert" | b"debug_assert_eq" | b"debug_assert_ne" | b"vec" | b"unreachable" | b"todo" | b"unimplemented" | b"dbg");
+                stack.push(!parse_level || (bang && !parsed_args) || attr);
             }
             T::CloseParen | T::CloseBracket | T::CloseBrace => {
                 stack.pop();
