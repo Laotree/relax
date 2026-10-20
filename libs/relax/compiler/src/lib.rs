@@ -56,6 +56,7 @@ pub mod domain;
 mod domain_threads;
 pub mod jit;
 pub mod owner;
+pub mod postframe;
 mod nounwind;
 pub mod os;
 pub mod lower;
@@ -96,15 +97,17 @@ pub struct ZoneTaken {
 }
 
 /// Takes this crate's compiler statics while every compiler thread is quiesced.
-pub fn zone_take() -> ZoneTaken {
-    ZoneTaken {
-        owner: owner::zone_take(),
+/// None, taking nothing, when the owner has requests queued.
+pub fn zone_take() -> Option<ZoneTaken> {
+    let owner = owner::zone_take()?;
+    Some(ZoneTaken {
+        owner,
         native_macros: native_macros::zone_take(),
         cache: cache::zone_take(),
         jit: jit::zone_take(),
         run: run::zone_take(),
         tui: tui::zone_take(),
-    }
+    })
 }
 
 /// Restores the statics after an aborted swap, forgetting the new generation's values.
@@ -712,6 +715,9 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
             return 1;
         }
     };
+    // the crate under test is the program's own crate (run.rs): its #![recursion_limit] and
+    // #![type_length_limit] govern monomorphization (TypingEnv::fully_monomorphized)
+    crate::layout::set_root_crate(krate);
     let t1 = Instant::now();
     let mut tcx = tcx::Tcx::new();
     tcx.collect(&prog);

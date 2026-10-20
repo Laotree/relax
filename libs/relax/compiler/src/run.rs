@@ -2654,7 +2654,8 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     let up = unsafe { RUN_UNIT };
     // one unit call: waits for the unit when `wait`, else only if it is free now
     fn unit_call<R>(wait: bool, f: impl FnOnce() -> R) -> Option<R> {
-        if wait { Some(crate::owner::call(crate::owner::Class::App, f)) } else { crate::owner::call_within(crate::owner::Class::Background, 0, f) }
+        // (the writer is a background thread: a program thread's request goes first either way)
+        if wait { Some(crate::owner::call(crate::owner::Class::Background, f)) } else { crate::owner::call_within(crate::owner::Class::Background, 0, f) }
     }
     if up.is_null() {
         return None;
@@ -2830,6 +2831,7 @@ fn summary_inner(why: &str) {
         if why != "stats" {
             let (ms, site) = jit::main_post_present_wait();
             verbose!("makepad-run: main thread's longest unit-call wait after first present: {:.1} ms ({})", ms, site);
+            verbose!("{}", crate::postframe::summary());
         }
         verbose!("makepad-run: startup seeds skipped: {} initializers (demand evaluation required), {} recursive builds", jit::SEED_INITIALIZERS_SKIPPED.load(Ordering::Relaxed), jit::SEED_RECURSIVE_SKIPPED.load(Ordering::Relaxed));
         // borrowck lane: the background checker's summary, with or without the disk cache; checker
