@@ -166,6 +166,27 @@ pub fn private_assoc_types(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<Strin
     errors
 }
 
+/// The path of an impl's trait is privacy-checked like any path (rustc_resolve: E0603 for a
+/// private module or trait on the way).
+pub fn impl_trait_path_privacy(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for i in 0..prog.defs.len() {
+        let d = DefId(i as u32);
+        let def = prog.def(d);
+        if def.kind != DefKind::Impl || !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
+        let ast = &prog.files[def.file as usize].ast;
+        let Some(imp) = ast.as_impl(&ast.item(def.item).kind) else { continue };
+        let Some(p) = imp.trait_ else { continue };
+        if p.segs.len() < 2 || !p.no_qself() || p.lo >= prog.files[def.file as usize].src_len { continue; }
+        let segs = crate::program::path_segs(prog, def.file, &p);
+        let module = tcx.item_module(prog, d);
+        if let Some(e) = prog.path_privacy(module, p.global(), &segs, Some(true), false, false) {
+            if let Some(m) = crate::lint::privacy_diag(prog, def.file, p.lo, &e) { errors.push(prog.record_error(def.file, p.lo, "resolve", m)); }
+        }
+    }
+    errors
+}
+
 /// A query of rustc_ty_utils/src/representability.rs, the nodes of its cycle detection.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum ReprKey {
