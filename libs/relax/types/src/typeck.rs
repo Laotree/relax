@@ -463,6 +463,10 @@ pub struct Fcx<'a> {
     pat_decl_irrefutable: bool,
     checked_opaque_types_storage_entries: Option<crate::infer::opaque_types::OpaqueTypeStorageEntries>,
     expected_closure_kinds: HashMap<u32, crate::upvar::ClosureKind>,
+    /// an async closure's deduced `AsyncFnOnce::Output` term as a signature (bound), set by deduction
+    async_expected_inner: Option<TyId>,
+    /// async closure expr -> its coroutine's liberated expected return type (rustc coroutine-closure `return_ty`)
+    async_body_expected: HashMap<u32, TyId>,
     /// the expectation of the expression checked next is a mere hint (the other branch's type),
     /// not a coercion target (rustc Expectation::ExpectHasType vs. an if/match's derived hint)
     soft: bool,
@@ -726,6 +730,8 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         pat_decl_irrefutable: false,
         checked_opaque_types_storage_entries: None,
         expected_closure_kinds: HashMap::default(),
+        async_expected_inner: None,
+        async_body_expected: HashMap::default(),
         soft: false,
         last_lo: 0,
         known_method_args: None,
@@ -6317,8 +6323,11 @@ impl<'a> Fcx<'a> {
         let is_move = mode == crate::ast::ASYNC_MOVE;
         let _ = self.tcx.future_defs(self.prog);
         let saved = self.scopes.len();
+        let expected_out = if mode == crate::ast::ASYNC_CLOSURE_BODY {
+            self.closure_depth.last().and_then(|(parent, _)| self.async_body_expected.get(parent).copied())
+        } else { None };
         self.closure_depth.push((e.0, saved));
-        let out = self.fresh(0);
+        let out = expected_out.unwrap_or_else(|| self.fresh(0));
         self.ret_stack.push(out);
         self.async_depth += 1;
         let save_awaits = std::mem::take(&mut self.await_count);
@@ -6470,7 +6479,7 @@ impl<'a> Fcx<'a> {
         self.scopes.truncate(saved);
         self.diverges = false;
         self.b.closures.push(e.0);
-        let sig = self.b.closure_sigs[&e.0].bound;
+        let sig = self.async_closure_bound_signature(e);
         let is_move = matches!(self.ast().expr(e).kind, ExprKind::Closure(row) if self.ast().row(row).is_move);
         let up = self.fresh(0);
         let kind = match self.expected_closure_kinds.get(&e.0).copied() {
