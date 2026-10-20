@@ -477,3 +477,26 @@ fn the_anonymous_lifetimes_of_a_bare_fn_trait_object_are_late_bound() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn a_closure_returning_a_captured_reference_requires_the_capture_to_outlive_the_signature() {
+    let (errors, unchecked) = borrowck_source("
+        pub fn foo(_: impl FnOnce(&u32) -> &u32) {}
+        pub fn bar() { let x = 22; foo(|_a| &x) }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0597"), "{errors:?}");
+}
+
+#[test]
+fn a_nested_closure_returning_a_captured_reference_keeps_the_borrow_alive() {
+    let (errors, unchecked) = borrowck_source("
+        pub fn main() {
+            let mut greeting = String::new();
+            let res = (|| (|| &greeting)())();
+            greeting = String::new();
+            drop(greeting);
+            drop(res);
+        }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0506"), "{errors:?}");
+}

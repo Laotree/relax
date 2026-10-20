@@ -212,6 +212,19 @@ impl SignatureRegions {
     /// arguments they are; a nested use maps them to its own instantiation by position.
     pub fn with_closure_env(mut self, tcx: &Tcx, owner: DefId, expr: u32, env: TyId) -> Self {
         let closure_ty = match tcx.tys.kind(env) { TyKind::Ref(_, ct, _) => *ct, _ => env };
+        // rustc's `replace_free_regions_with_nll_infer_vars` makes every region of the defining type,
+        // erased ones included, a universal region of its own: each erased occurrence takes a distinct
+        // placeholder identity, numbered in order (the nested use finds its slot by that number).
+        let erased = std::cell::Cell::new(0u32);
+        let closure_ty = tcx.tys.map_regions(closure_ty, &|r, depth| match tcx.tys.region_kind(r) {
+            RegionKind::ReErased => {
+                let var = BoundVar(erased.get()); erased.set(var.0 + 1);
+                tcx.tys.intern_region(RegionKind::RePlaceholder { universe: crate::types::UniverseIndex::ROOT, var })
+            }
+            RegionKind::ReBound(d, _) if d < depth => r,
+            _ => r,
+        }, 0);
+        let env = match tcx.tys.kind(env) { TyKind::Ref(m, _, r) => tcx.tys.intern(TyKind::Ref(*m, closure_ty, *r)), _ => closure_ty };
         let mut external = vec![];
         for r in crate::borrowck::mir_nll::free_regions_in_order(tcx, closure_ty) {
             if matches!(tcx.tys.region_kind(r), RegionKind::ReErased | RegionKind::ReError | RegionKind::ReStatic) { continue; }
