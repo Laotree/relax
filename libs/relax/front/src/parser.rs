@@ -3620,7 +3620,8 @@ impl<'a> Parser<'a> {
         let lo = self.lo();
         // attributes on expressions
         if self.kind() == T::Pound {
-            let _ = self.outer_attrs()?;
+            let at = self.tok().lo;
+            if !self.outer_attrs()?.is_empty() { self.ast.expr_attrs.push(at); }
         }
         let lhs = self.unary(r)?;
         self.expr_continue(lhs, min, r, lo)

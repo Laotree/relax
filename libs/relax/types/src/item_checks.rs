@@ -1262,3 +1262,19 @@ fn entry_main(prog: &Program, root: u32) -> Option<DefId> {
     let d = prog.lookup_in_module(prog.crates[root as usize].root_mod, sym, false, &mut Vec::new())?;
     (prog.def(d).kind == DefKind::Fn).then_some(d)
 }
+
+/// rustc_expand `maybe_emit_expr_attr_err`: an attribute on an expression that is no statement
+/// is the unstable `stmt_expr_attributes` (E0658). Text a macro expanded is not judged.
+pub fn expression_attribute_gate(prog: &Program, own: &[bool]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (f, pf) in prog.files.iter().enumerate() {
+        if pf.ast.expr_attrs.is_empty() { continue; }
+        let krate = prog.file_crate.get(f).copied().unwrap_or(u32::MAX);
+        if !own.get(krate as usize).copied().unwrap_or(false) { continue; }
+        if prog.crates[krate as usize].features(prog).has("stmt_expr_attributes") { continue; }
+        for &pos in &pf.ast.expr_attrs {
+            if pos < pf.src_len { errors.push(prog.record_error(f as u32, pos, "typeck", "E0658: attributes on expressions are experimental".to_string())); }
+        }
+    }
+    errors
+}
