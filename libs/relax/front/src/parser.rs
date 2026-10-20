@@ -878,12 +878,49 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// `#[name = m!(..)]`: rustc expands the macro of an attribute's value, so `m` must resolve at the
+    /// attribute (a macro_rules! defined further down does not).
+    fn attr_value_macro(&mut self, toks: TokRange) -> PResult<()> {
+        let (lo, hi) = (toks.lo as usize, toks.hi as usize);
+        if self.macros.is_none() || self.lazy_part || !crate::lexer::validation_enabled() || hi <= lo + 3 || hi > self.toks.len() { return Ok(()); }
+        // the path of the attribute (idents and `::`), then `=`, then one identifier and `!`
+        let mut i = lo;
+        while i < hi && matches!(self.toks.at(i).kind, T::Ident | T::RawIdent | T::PathSep) { i += 1; }
+        if i == lo || i + 3 >= hi || self.toks.at(i).kind != T::Eq || self.toks.at(i + 1).kind != T::Ident || self.toks.at(i + 2).kind != T::Not
+            || !matches!(self.toks.at(i + 3).kind, T::OpenParen | T::OpenBracket | T::OpenBrace) || (self.toks.at(i + 1).lo as usize) >= self.src.len() {
+            return Ok(());
+        }
+        let name = String::from_utf8_lossy(self.tok_text(self.toks.at(i + 1))).into_owned();
+        if crate::program::BUILTIN_MACROS.contains(&name.as_str()) || crate::builtins::macro_def(&name).is_some() || crate::macro_reg::has_macro(&name) || fmtmac::is_builtin(name.as_bytes()) {
+            return Ok(());
+        }
+        let (save, err_pos) = (self.pos, self.toks.at(i + 1).lo);
+        self.pos = i + 1;
+        let path = self.path(true);
+        self.pos = save;
+        let path = path?;
+        let Some(def) = self.rules_macro(&path) else {
+            if self.name_imported(&name) { return Ok(()); }
+            return Err(PErr { pos: err_pos, msg: format!("cannot find macro `{name}` in this scope") });
+        };
+        // the call expands now: its arguments must match a rule
+        if def.builtin == 0 {
+            self.pos = i + 3;
+            let group = self.delim_tt();
+            self.pos = save;
+            let (_, args) = group?;
+            self.expand_call(&def, args, err_pos)?;
+        }
+        Ok(())
+    }
+
     fn check_pending_attrs(&mut self) -> PResult<()> {
         let pending = std::mem::take(&mut self.pending_shape);
         for (toks, err) in pending {
             if let Some(e) = err {
                 return Err(e);
             }
+            self.attr_value_macro(toks)?;
             self.check_attr_shape(toks)?;
         }
         Ok(())
@@ -1301,6 +1338,26 @@ impl<'a> Parser<'a> {
         !m.table.defs.get(name).into_iter().flatten().chain(m.local.iter()).any(|x| x.name == name && x.builtin == 0 && !matches!(x.krate.as_str(), "std" | "core" | "alloc"))
     }
 
+    /// A call of one of std's expression-only macros (`todo!`, `format!`, `assert!` ..) by its plain name
+    /// or `std::` / `core::` path, that no `macro_rules!` of the name shadows.
+    fn no_item_macro(&self, path: &Path) -> bool {
+        const EXPR_MACROS: &[&str] = &[
+            "format_args", "format", "print", "println", "eprint", "eprintln", "write", "writeln", "panic", "unreachable", "todo",
+            "unimplemented", "assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne", "vec", "dbg",
+            "matches", "concat", "stringify", "line", "column", "file", "module_path", "env", "option_env", "include_str", "include_bytes", "cfg",
+        ];
+        let segs = self.ast.segs(path.segs);
+        let Some(last) = segs.last() else { return false };
+        let ok_path = match segs.len() {
+            1 => !path.global(),
+            2 => matches!(self.bytes(segs[0].name.lo, segs[0].name.hi), b"std" | b"core" | b"alloc"),
+            _ => false,
+        };
+        let name = String::from_utf8_lossy(self.bytes(last.name.lo, last.name.hi)).trim_start_matches("r#").to_string();
+        ok_path && EXPR_MACROS.contains(&name.as_str()) && self.rules_macro(path).map_or(true, |d| d.builtin != 0)
+            && !self.name_imported(&name)
+    }
+
     fn push_rules_scope(&mut self) -> u32 {
         let id = self.next_scope;
         self.next_scope += 1;
@@ -1668,7 +1725,7 @@ impl<'a> Parser<'a> {
 
     /// At an item / statement start: a `macro_rules!` call (`path!(..)` / `path! { .. }` ending
     /// the item or statement) expanded and parsed with `f`.
-    fn try_expand_rules<X>(&mut self, f: impl FnOnce(&mut Self, bool) -> PResult<X>) -> PResult<Option<X>> {
+    fn try_expand_rules<X>(&mut self, f: impl FnOnce(&mut Self, bool, bool) -> PResult<X>) -> PResult<Option<X>> {
         if self.macros.is_none() || !self.mac_ahead() {
             return Ok(None);
         }
@@ -1690,6 +1747,9 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         let trailing = delim != b'{' && matches!(self.kind(), T::CloseBrace | T::Eof);
+        // rustc_parse `parse_stmt_mac`: a call ending its block without `;` is an expression statement,
+        // expanded as one expression (an `Eof` after it is the end of an enclosing expansion: a statement)
+        let tail_expr = delim != b'{' && self.kind() == T::CloseBrace && def.builtin == 0 && crate::lexer::validation_enabled() && (lo as usize) < self.src.len();
         self.eat(T::Semi);
         let start = self.expand_call(&def, toks, lo)?;
         let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
@@ -1706,7 +1766,7 @@ impl<'a> Parser<'a> {
                 crate::macros::uses::trailing_semi(&file, semi, lo, &def.def_file);
             }
         }
-        Ok(Some(self.in_expansion(start, |p| f(p, include))?))
+        Ok(Some(self.in_expansion(start, |p| f(p, include, tail_expr))?))
     }
 
     /// Moves to the end of the current macro expansion's tokens.
@@ -1763,8 +1823,21 @@ impl<'a> Parser<'a> {
     /// block (a `;` after the call ends a tail expression). False (cursor unspecified) when it
     /// is not one.
     fn stmt_macro(&mut self, stmts: &mut Vec<Stmt>) -> PResult<bool> {
-        let r = self.try_expand_rules(|p, include| {
+        let r = self.try_expand_rules(|p, include, tail_expr| {
             let mut v = Vec::new();
+            if tail_expr {
+                // rustc_expand `ParserAnyMacro::make` / `ensure_complete_parse`: one expression, and a `;` after it
+                if p.kind() == T::Eof {
+                    return Err(PErr { pos: p.lo(), msg: "macro expansion ends with an incomplete expression: expected expression".to_string() });
+                }
+                let e = p.expr()?;
+                p.eat(T::Semi);
+                if p.kind() != T::Eof {
+                    let t = String::from_utf8_lossy(p.tok_text(p.tok())).into_owned();
+                    return Err(PErr { pos: p.lo(), msg: format!("macro expansion ignores `{t}` and any tokens following") });
+                }
+                return Ok(vec![Stmt::Expr(e, false)]);
+            }
             // `include!` in statement position is an expression: its first one, the rest of the
             // file is ignored (rustc_expand base.rs `ExpandInclude::make_expr`, lint incomplete_include)
             if include {
@@ -1883,7 +1956,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if !self.pending_shape.is_empty() { self.check_pending_attrs()?; }
-            if let Some(v) = self.try_expand_rules(|p, _| p.items_until(T::Eof))? {
+            if let Some(v) = self.try_expand_rules(|p, _, _| p.items_until(T::Eof))? {
                 items.extend(v);
                 continue;
             }
@@ -2352,6 +2425,10 @@ impl<'a> Parser<'a> {
                     return Err(PErr { pos: path_lo, msg: "can't qualify macro invocation with `pub`".into() });
                 }
                 // `name! ident { }` (macro 2.0 style) not supported
+                // rustc_expand: an expression macro of the std prelude does not expand to items
+                if self.macros.is_some() && self.cfg_out == 0 && crate::lexer::validation_enabled() && (path_lo as usize) < self.src.len() && self.no_item_macro(&path) {
+                    return Err(PErr { pos: path_lo, msg: "expected one of `!` or `::`, found `(`: this macro does not expand to items".into() });
+                }
                 let (delim, toks) = self.delim_tt()?;
                 if delim != b'{' {
                     self.eat(T::Semi);
@@ -2856,6 +2933,10 @@ impl<'a> Parser<'a> {
                 Ok(UseTree::Group(self.ast.push_list(v)))
             }
             _ => {
+                // `_` only renames (`as _`); as a path segment it is a reserved identifier
+                if self.is_word(0, b"_") {
+                    return self.err("expected identifier, found reserved identifier `_`");
+                }
                 let seg = self.path_seg_name()?;
                 if self.eat(T::PathSep) {
                     let rest = self.use_tree_in(Some(seg.kind()), false)?;
@@ -3853,6 +3934,7 @@ impl<'a> Parser<'a> {
         if self.kind() == T::CloseBrace && !attrs.is_empty() {
             return self.err("attributes without statement");
         }
+        if !attrs.is_empty() { self.closure_attrs(&attrs)?; }
         let lo = self.lo();
         // statement-level brace macro: `m! { }` ends the statement
         if self.mac_ahead() {
@@ -4262,6 +4344,18 @@ impl<'a> Parser<'a> {
     /// Attributes in front of a closure (rustc_attr_parsing AllowedTargets: `#[target_feature]` is not
     /// allowed on closures; `#[track_caller]` is gated).
     fn closure_attrs(&mut self, attrs: &[Attr]) -> PResult<()> {
+        // rustc_builtin_macros test: `#[test]` / `#[bench]` expand only on a free function
+        if self.cfg_out == 0 {
+            for a in attrs {
+                let (alo, ahi) = (a.toks.lo as usize, a.toks.hi as usize);
+                if ahi <= alo || alo >= self.toks.len() { continue; }
+                let single = ahi == alo + 1 || matches!(self.toks.at(alo + 1).kind, T::OpenParen | T::Eq);
+                if single && matches!(self.tok_text(self.toks.at(alo)), b"test" | b"bench") {
+                    let name = String::from_utf8_lossy(self.tok_text(self.toks.at(alo))).into_owned();
+                    return Err(PErr { pos: self.toks.at(alo).lo, msg: format!("the `#[{name}]` attribute may only be used on a free function") });
+                }
+            }
+        }
         let closure = match self.kind() {
             T::Or | T::OrOr | T::KwMove => true,
             T::KwStatic | T::KwAsync => matches!(self.nth(1), T::Or | T::OrOr | T::KwMove),

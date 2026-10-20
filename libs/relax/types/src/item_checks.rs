@@ -1457,6 +1457,7 @@ fn attribute_target_error(prog: &Program, d: DefId, name: &[u8]) -> Option<&'sta
         b"export_name" => static_like && def.kind == K::Static || (fn_like && def.kind != K::ForeignFn && !trait_fn_no_body),
         b"debugger_visualizer" => def.kind == K::Mod,
         b"link_ordinal" => matches!(def.kind, K::ForeignFn | K::ForeignStatic),
+        b"proc_macro" | b"proc_macro_attribute" | b"proc_macro_derive" => def.kind == K::Fn,
         _ => return None,
     };
     if ok { None } else { Some(what) }

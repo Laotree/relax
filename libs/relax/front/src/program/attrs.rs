@@ -12,7 +12,8 @@ impl Program {
     /// Does a derive macro of this name exist anywhere the crates could reach it: Relax's own derives,
     /// a macro of the table, an import binding the name, or a glob import of another crate?
     fn derive_in_scope(&self, name: &str, krate: u32) -> bool {
-        if crate::macro_reg::has_derive(name) || self.macros.defs.contains_key(name) {
+        // (a macro_rules! macro is no derive macro)
+        if crate::macro_reg::has_derive(name) || self.macros.defs.get(name).is_some_and(|v| v.iter().any(|d| d.builtin != 0)) {
             return true;
         }
         self.imports.iter().filter(|im| self.file_crate.get(im.file as usize) == Some(&krate)).any(|im| {
