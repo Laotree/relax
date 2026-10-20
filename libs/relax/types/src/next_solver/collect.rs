@@ -53,7 +53,7 @@ impl Tcx {
     }
 
     pub fn explicit_super_predicates_of(&self, prog: &Program, def_id: DefId) -> &[Predicate] {
-        self.declaration_queries(prog, def_id).super_predicates.get_or_init(||
+        self.declaration_queries(prog, def_id).super_predicates.get_or_init_cyclic(||
             self.implied_clauses_with_filter(prog, def_id, PredicateFilter::SelfOnly))
     }
 
@@ -329,6 +329,28 @@ impl Tcx {
             let Bound::Trait { path, .. } = bound else { return; };
             let Some(td) = self.resolve_type_path_def(prog, def.file, def.scope, &path) else { return; };
             if !self.trait_may_define_assoc_item(prog, td, name) { return; }
+        }
+        // `?Trait` relaxes Sized only
+        if let Bound::Trait { maybe: true, path, .. } = bound {
+            if self.validates(prog, def.file) {
+                if let Some(td) = self.resolve_trait_path(cx, prog, def.file, def.scope, env, &path) {
+                    if self.lang_items.get(crate::lang_items::LangItem::Sized) != Some(td) {
+                        self.err(cx, prog, def.file, path.lo, format!("{}bound modifier `?` can only be applied to `Sized`", relax_front::diagnostics::UNCODED_PREFIX));
+                    }
+                    let ast = &prog.files[def.file as usize].ast;
+                    if let Some(GenericArgs::Angle(v)) = ast.segs(path.segs).last().and_then(|s| ast.gargs(s.args())) {
+                        for a in ast.list(*v) {
+                            if let ast::GenericArg::Binding(n, _, _) | ast::GenericArg::Constraint(n, _, _) = *a {
+                                let sym = prog.syms.get(prog.files[def.file as usize].text(n)).unwrap_or(u32::MAX);
+                                if self.trait_assoc(prog, td, sym).is_none() {
+                                    self.err(cx, prog, def.file, n.lo, format!("E0220: associated type `{}` not found for `{}`", prog.files[def.file as usize].text(n), prog.name(td)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return;
         }
         let Bound::Trait { maybe: false, path, .. } = bound else {
             if let Bound::Lifetime(lt) = bound {

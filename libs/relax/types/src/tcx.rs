@@ -1554,8 +1554,11 @@ impl Tcx {
         errors.extend_from_slice(self.signature_errors(prog, did));
         if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             errors.extend(crate::item_checks::duplicate_generic_params(prog, did));
+            if self.validates(prog, def.file) { errors.extend(crate::item_checks::generic_param_rules(prog, did)); }
             errors.extend(crate::item_checks::repr_checks(prog, self, did));
+            errors.extend(crate::item_checks::assoc_const_elision(prog, did));
             errors.extend(crate::item_checks::attribute_safety(prog, did));
+            errors.extend(crate::item_checks::attribute_shapes(prog, did));
             if def.kind == DefKind::AssocFn && self.validates(prog, def.file) && errors.is_empty() {
                 errors.extend(self.check_method_receiver(prog, did));
             }
@@ -1570,6 +1573,12 @@ impl Tcx {
                     if !errors.contains(&e) { errors.push(e); }
                 }
             }
+        }
+        // rustc_hir_analysis check_main_fn_ty: the crate's `main` takes no generic parameters
+        if def.kind == DefKind::Fn && prog.name(did) == "main" && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did)
+            && def.parent == prog.mods[prog.crates[def.krate as usize].root_mod as usize].def
+            && !self.generic_indices_of(prog, did).types_consts.is_empty() {
+            errors.push(prog.record_error(def.file, prog.files[def.file as usize].ast.item(def.item).lo, "signature", "E0131: `main` function is not allowed to have generic parameters".into()));
         }
         if def.kind == DefKind::AssocFn && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             // rustc_ast_passes ast_validation check_trait_fn_not_const (E0379)
@@ -1607,8 +1616,11 @@ impl Tcx {
             errors.extend(crate::item_checks::supertrait_cycles(prog, self, did));
         }
         if def.kind == DefKind::Impl {
-            errors.extend(self.check_impl_params_constrained(prog, did));
-            errors.extend(self.check_impl_items_against_trait(prog, did));
+            let unconstrained = self.check_impl_params_constrained(prog, did);
+            // (an impl with an unconstrained parameter has no sound item types to compare)
+            let compare = unconstrained.is_empty();
+            errors.extend(unconstrained);
+            if compare { errors.extend(self.check_impl_items_against_trait(prog, did)); }
             errors.extend(crate::item_checks::copy_impl(prog, self, did));
         }
         errors
@@ -2188,7 +2200,17 @@ impl Tcx {
                 self.tys.mk_array(inner, lt)
             }
             ast::Ty::Fn(f) => self.lower_fn_pointer(cx, prog, file, module, env, ast.fn_ptr(*f), resolve_bound_vars::BinderId::FnPointer(t.0)),
-            ast::Ty::Infer => cx.infcx.map_or(self.tys.error, |infcx| infcx.next_ty_var()),
+            ast::Ty::Infer => match cx.infcx {
+                Some(infcx) => infcx.next_ty_var(),
+                None => {
+                    // ItemCtxt::ty_infer: no `_` in an item's signature (types carry no position here: the item's)
+                    if self.validates(prog, file) {
+                        let pos = env.owner.filter(|o| prog.def(*o).file == file).map_or(0, |o| ast.item(prog.def(o).item).lo);
+                        self.err(cx, prog, file, pos, "E0121: the placeholder `_` is not allowed within types on item signatures".to_string());
+                    }
+                    self.tys.error
+                }
+            },
             ast::Ty::Path(p) => self.lower_path_ty(cx, prog, file, module, env, p, Some(t)),
             ast::Ty::DynTrait(bounds, _) => self.lower_dyn(cx, prog, file, module, env, ast.list(*bounds), 0, Some(t)),
             ast::Ty::ImplTrait(_) if env.impl_params.iter().any(|x| x.0 == t.0) => {
@@ -2300,9 +2322,11 @@ impl Tcx {
         for b in bs {
             let path = match b {
                 ast::Bound::Trait { path, maybe: false, .. } => path,
+                // (a relaxed bound names a trait too: unknown ones are E0405)
+                ast::Bound::Trait { path, maybe: true, .. } => { if self.validates(prog, file) { self.resolve_trait_path(cx, prog, file, module, env, path); } continue; }
                 _ => continue,
             };
-            let td = match self.resolve_type_path_def(prog, file, module, path) {
+            let td = match self.resolve_trait_path(cx, prog, file, module, env, path) {
                 Some(d) if prog.def(d).kind == DefKind::Trait => d,
                 _ => continue,
             };
@@ -2411,6 +2435,12 @@ impl Tcx {
         // hir_ty_lowering/dyn_trait.rs: at most one non-auto trait (E0225)
         let mut principals = 0;
         for b in bounds {
+            if let ast::Bound::Trait { path, maybe: true, .. } = b {
+                if self.validates(prog, file) {
+                    self.resolve_trait_path(cx, prog, file, module, env, path);
+                    self.err(cx, prog, file, path.lo, format!("{}relaxed bounds are not permitted in trait object types", relax_front::diagnostics::UNCODED_PREFIX));
+                }
+            }
             if let ast::Bound::Trait { path, maybe: false, .. } = b {
                 let Some(td) = self.resolve_trait_path(cx, prog, file, module, env, path) else { continue };
                 if autos.contains(&td) { continue; }
@@ -2531,7 +2561,13 @@ impl Tcx {
             }
             // an argument list of the wrong length is E0107 / E0393; the object type still
             // carries one argument per declared parameter (error for the missing, none extra)
-            args.resize(n, self.tys.error);
+            // (a missing const argument is a const error, not a type: the object type's arguments keep
+            // their parameters' kinds)
+            let declaration = self.declaration_env(prog, td);
+            while args.len() < n {
+                let i = args.len() + 1;
+                args.push(if declaration.consts.iter().any(|c| c.0 as usize == i) { self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))) } else { self.tys.error });
+            }
             let bound = u16::try_from(bound).expect("dyn principal bound-region count");
             return self.tys.intern(TyKind::Dyn(td, self.tys.mk_list(&args), self.tys.mk_list(&binds), regions, region, bound, self.tys.mk_list(&autos)));
         }
@@ -2708,19 +2744,24 @@ impl Tcx {
         if self.validates(prog, file) && p.segs.len() == 1 && p.no_qself() && !p.global() {
             if let Some(s) = prog.syms.get(prog.files[file as usize].text(prog.files[file as usize].ast.segs(p.segs)[0].name)) {
                 if let Some(e) = prog.name_ambiguity(module, s, true, false) {
-                    self.err(cx, prog, file, p.lo, prog.privacy_message(&e));
+                    if let Some(m) = crate::lint::privacy_diag(prog, file, p.lo, &e) { self.err(cx, prog, file, p.lo, m); }
                 }
             }
         }
         if self.validates(prog, file) && p.segs.len() >= 2 && p.no_qself() {
             let segs = crate::program::path_segs(prog, file, p);
             if let Some(e) = prog.path_privacy(module, p.global(), &segs, Some(true), false, false).filter(|_| p.lo < prog.files[file as usize].src_len) {
-                self.err(cx, prog, file, p.lo, prog.privacy_message(&e));
+                if let Some(m) = crate::lint::privacy_diag(prog, file, p.lo, &e) { self.err(cx, prog, file, p.lo, m); }
             }
         }
+        if source_ty.is_some() && self.prohibit_module_args(cx, prog, file, module, p) { return self.tys.error; }
         let regions = self.lower_region_args(cx.infcx, prog, file, module, env, p);
         let mut args = self.lower_generic_args(cx, prog, file, module, env, p);
         let def = prog.def(d);
+        if source_ty.is_some() && matches!(def.kind, DefKind::Prim(_)) && p.segs.len() == 1 && p.no_qself() {
+            let seg = &prog.files[file as usize].ast.segs(p.segs)[0];
+            if self.prohibit_args_on(cx, prog, file, seg, "builtin type", f.text(seg.name)) { return self.tys.error; }
+        }
         // a module named like a primitive (`use std::str;`, globs re-exporting std's modules)
         // does not hide the primitive type
         if def.kind == DefKind::Mod && p.segs.len() == 1 && p.no_qself() {
@@ -3161,10 +3202,11 @@ impl Tcx {
             }
             return None;
         };
+        if self.prohibit_module_args(cx, prog, file, module, p) { return None; }
         let k = prog.def(td).kind;
         if matches!(k, DefKind::Trait) { return Some(td); }
         // (a name another namespace or a misresolved module holds is left alone)
-        if matches!(k, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias | DefKind::AssocTy | DefKind::Prim(_) | DefKind::Mod) {
+        if matches!(k, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias | DefKind::AssocTy | DefKind::AssocFn | DefKind::AssocConst | DefKind::Fn | DefKind::Const | DefKind::Static | DefKind::Prim(_) | DefKind::Mod) {
             self.err(cx, prog, file, p.lo, format!("E0404: expected trait, found {} `{}`", def_kind_descr(k), path_str(prog, file, p)));
         }
         None
@@ -3172,7 +3214,7 @@ impl Tcx {
 
     /// prohibit_generic_args on a segment that names no generic definition (a type parameter,
     /// `Self`): arguments are E0109, associated item constraints E0229.
-    fn prohibit_args_on(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, seg: &ast::PathSeg, what: &str, name: &str) -> bool {
+    pub(crate) fn prohibit_args_on(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, seg: &ast::PathSeg, what: &str, name: &str) -> bool {
         if !self.validates(prog, file) { return false; }
         let ast = &prog.files[file as usize].ast;
         if let Some(GenericArgs::Angle(v)) = ast.gargs(seg.args()) {
@@ -3184,6 +3226,27 @@ impl Tcx {
             }
         }
         self.prohibit_constraints(cx, prog, file, seg.args())
+    }
+
+    /// prohibit_generic_args on the segments of a path that name modules (`Mod::<i32>::Item`):
+    /// E0109. Only a segment with written arguments is resolved.
+    pub fn prohibit_module_args(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, module: u32, p: &ast::Path) -> bool {
+        if p.segs.len() < 2 || !p.no_qself() { return false; }
+        let ast = &prog.files[file as usize].ast;
+        let written = |seg: &ast::PathSeg| matches!(ast.gargs(seg.args()), Some(GenericArgs::Angle(v)) if ast.list(*v).iter().any(|a| matches!(a, GenericArg::Lifetime(_) | GenericArg::Type(_) | GenericArg::Const(_))));
+        let segs = ast.segs(p.segs);
+        if !segs[..segs.len() - 1].iter().any(written) || !self.validates(prog, file) { return false; }
+        let resolved = crate::program::path_segs(prog, file, p);
+        for (i, seg) in segs[..segs.len() - 1].iter().enumerate() {
+            if !written(seg) { continue; }
+            if let Some(m) = prog.resolve_mod_path(module, p.global(), &resolved[..=i], false, false) {
+                if prog.def(m).kind == DefKind::Mod {
+                    let name = prog.name(m).to_string();
+                    return self.prohibit_args_on(cx, prog, file, seg, "module", &name);
+                }
+            }
+        }
+        false
     }
 
     /// prohibit_assoc_item_constraint: `Foo<Item = T>` where no trait is named (E0229).
@@ -3420,7 +3483,7 @@ impl Tcx {
                     Ok(g) => g,
                     Err(()) => {
                         self.err(cx, prog, pd.file, ast.item(pd.item).lo, format!("E0391: cycle detected when computing type of `{}::{}`", prog.def_path(td), prog.files[pd.file as usize].text(g.name)));
-                        out.push(self.tys.error);
+                        out.push(if cdef.is_some() { self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))) } else { self.tys.error });
                         k += 1;
                         continue;
                     }
