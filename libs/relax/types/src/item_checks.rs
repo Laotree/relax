@@ -1535,6 +1535,11 @@ pub fn global_allocators_and_lang_items(prog: &Program, own: &[bool]) -> Vec<Str
             }
             if let Some(nm) = no_mangle {
                 errors.push(prog.record_uncoded_error(def.file, nm, "typeck", "`#[no_mangle]` cannot be used on internal language items".to_string()));
+            }
+        }
+    }
+    errors
+}
 
 /// rustc_ast_passes feature_gate `gate_all`: syntax the parser recorded (ParseSess::gated_spans)
 /// whose feature the crate does not enable is E0658. Text a macro expanded is not judged.

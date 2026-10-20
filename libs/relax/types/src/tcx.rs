@@ -2736,6 +2736,17 @@ impl Tcx {
             }
             if let Some(td) = env.trait_def {
                 let trait_ref = crate::next_solver::TraitRef { def_id: td, args: self.generic_indices_of(prog, td).identity_args(&self.tys) };
+                // `Self::Name` in a trait: the trait and its supertraits that declare `Name` (more than one: E0221)
+                if self.validates(prog, file) {
+                    let predicate = crate::next_solver::Predicate::dummy(crate::next_solver::PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(
+                        crate::next_solver::TraitClause { trait_ref: trait_ref.clone(), polarity: crate::next_solver::ClausePolarity::Positive })));
+                    let declaring = self.transitive_bounds_that_define_assoc_item(prog, vec![predicate], name);
+                    if declaring.len() > 1 {
+                        let traits: Vec<&str> = declaring.iter().map(|(item, _)| prog.name(prog.def(*item).parent)).collect();
+                        self.err(cx, prog, file, p.lo, format!("E0221: ambiguous associated type `{}` in bounds of `Self` (from {})", prog.syms.str(name), traits.join(", ")));
+                        return self.tys.error;
+                    }
+                }
                 if let Some(t) = self.assoc_projection(prog, trait_ref, name) {
                     return self.lower_generic_args_of_assoc_item(cx, prog, file, module, env, p, t, source_ty);
                 }
