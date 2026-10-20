@@ -760,3 +760,20 @@ fn bevys_param_set_takes_the_outlives_its_normalization_registers_as_implied_bou
     let (errors, _) = borrowck_source_named(source, 2021, "other_crate");
     assert!(!errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn a_local_without_an_annotation_is_instantiated_by_the_coercion_of_its_initializer() {
+    // type-inference/generalize-subtyped-variables.rs: `let y = x` relates two type variables later, so the
+    // first use of `z` generalizes it to the non-higher-ranked `fn(&'0 ())`.
+    let (errors, unchecked) = borrowck_source_in("
+        pub fn main() {
+            let mut x = None;
+            let y = x;
+            let z = Default::default();
+            let mut w = (&mut x, z, z);
+            let a = (&mut None::<fn(&())>, y, None::<fn(&'static ())>);
+            w = a;
+        }", 2021);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}

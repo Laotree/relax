@@ -4737,6 +4737,14 @@ impl<'a> Fcx<'a> {
                                     self.coerce_or_unify(it, v, Some(*e), ast.expr(*e).lo);
                                     v
                                 }
+                                // (and the local's variable is instantiated by the coercion, as a generalization
+                                // of the initializer type, when that has inference variables inside: relating
+                                // the vars of two types is deferred, not unified)
+                                None if self.tcx.tys.has_infer(it) && !matches!(self.tcx.tys.kind(self.shallow(it)), TyKind::Infer(_)) => {
+                                    let v = self.fresh(0);
+                                    self.coerce_or_unify(it, v, Some(*e), ast.expr(*e).lo);
+                                    v
+                                }
                                 None => it,
                             }
                         }
