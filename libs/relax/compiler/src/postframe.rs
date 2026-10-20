@@ -27,6 +27,8 @@ static GAPS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static MAIN_COMPILE_NS: AtomicU64 = AtomicU64::new(0);
 static LAST_FRAME: AtomicU64 = AtomicU64::new(0);
 static LOGGED: AtomicU64 = AtomicU64::new(0);
+/// the window's main-thread compiles by how they were satisfied (jit::MAIN_HOW_NAMES): count, wall ns
+static HOW: [[AtomicU64; 2]; 6] = [const { [const { AtomicU64::new(0) }; 2] }; 6];
 static SUMMARY_DONE: AtomicBool = AtomicBool::new(false);
 /// the owner's service in the window by class (ns), and of it the requests a program thread's
 /// request was queued behind when they ended (ns)
@@ -66,6 +68,10 @@ pub(crate) fn main_compile(name: &str, r: &MainCompile) {
         }
         if dt >= STALL_LOG_NS {
             COMPILES[8].fetch_add(1, Relaxed);
+        }
+        if let Some(h) = HOW.get(r.how as usize) {
+            h[0].fetch_add(1, Relaxed);
+            h[1].fetch_add(dt, Relaxed);
         }
     }
     if dt >= STALL_LOG_NS && may_log() {
@@ -188,7 +194,7 @@ pub fn summary() -> String {
     let c = |i: usize| COMPILES[i].load(Relaxed);
     let g = |i: usize| GAPS[i].load(Relaxed);
     format!(
-        "makepad-run post-present {:.0} s: main thread stalled {:.1} ms in {} lazy compiles ({} of {:.0} ms or more; owner queue {:.1}, typeck ahead {:.1}, front {:.1}, back {:.1}, finish {:.1}, in-flight wait {:.1} ms), {} owner requests waited {:.1} ms in all; real-time threads stalled {:.1} ms in {} lazy compiles; {} frames, {} gaps of {:.0} ms or more ({:.0} ms, longest {:.0} ms); owner served ms {} (with program-thread requests queued at the end: {})",
+        "makepad-run post-present {:.0} s: main thread stalled {:.1} ms in {} lazy compiles ({} of {:.0} ms or more; owner queue {:.1}, typeck ahead {:.1}, front {:.1}, back {:.1}, finish {:.1}, in-flight wait {:.1} ms; by how: {}), {} owner requests waited {:.1} ms in all; real-time threads stalled {:.1} ms in {} lazy compiles; {} frames, {} gaps of {:.0} ms or more ({:.0} ms, longest {:.0} ms); owner served ms {} (with program-thread requests queued at the end: {})",
         WINDOW_NS as f64 / 1e9,
         ms(c(1)),
         c(0),
@@ -200,6 +206,7 @@ pub fn summary() -> String {
         ms(c(5)),
         ms(c(6)),
         ms(c(7)),
+        (0..6).map(|k| format!("{} {} ({:.0} ms)", crate::jit::MAIN_HOW_NAMES[k], HOW[k][0].load(Relaxed), ms(HOW[k][1].load(Relaxed)))).collect::<Vec<_>>().join(", "),
         OWNER[0].load(Relaxed),
         ms(OWNER[1].load(Relaxed)),
         ms(RT[1].load(Relaxed)),
