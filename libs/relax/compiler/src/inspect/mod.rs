@@ -129,6 +129,14 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 ];
 
 fn dispatch(req: &Req, out: &mut Out) {
+    dispatch_command(req, out);
+    // SPEC-V: the client prints the answer's rows, not its end line (which says `verified` too)
+    if !crate::reload::observations_verified() && !matches!(req.cmd.as_str(), "help" | "ping" | "events" | "watch") {
+        out.always("{\"verified\":false,\"why\":\"a patched fn runs before its borrow-check verdict; a failed verdict reverts it and the patchreverted event lists the observations it invalidates\"}");
+    }
+}
+
+fn dispatch_command(req: &Req, out: &mut Out) {
     match req.cmd.as_str() {
         "session" => match req.pos.first().map(String::as_str) {
             Some("relaunch") => match crate::run::relaunch() {
