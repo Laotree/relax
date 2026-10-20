@@ -617,6 +617,26 @@ impl<'a> Parser<'a> {
         self.gen_pieces(g, out, srcs, flo)
     }
 
+    /// Whether the parsed expression `e` has an `.await` or a `yield` in it (a suspension point).
+    fn expr_may_yield(&self, e: ExprId) -> bool {
+        let ex = self.ast.expr(e);
+        let (lo, hi) = (ex.lo, ex.hi);
+        let n = self.toks.len();
+        let (mut a, mut b) = (0, n);
+        while a < b {
+            let mid = (a + b) / 2;
+            if self.toks.at(mid).lo < lo { a = mid + 1 } else { b = mid }
+        }
+        let mut i = a;
+        while i < n {
+            let t = self.toks.at(i);
+            if t.lo >= hi { break; }
+            if matches!(t.kind, T::KwAwait | T::KwYield) { return true; }
+            i += 1;
+        }
+        false
+    }
+
     /// Emits `Arguments::new_const / new_v1 / new_v1_formatted` for resolved pieces
     /// (`Ph` indices are slots into `srcs`).
     fn gen_pieces(&mut self, g: &mut Gen, pieces: Vec<Piece>, srcs: Vec<Src>, _lo: u32) -> PResult<()> {
@@ -659,6 +679,11 @@ impl<'a> Parser<'a> {
         // each slot evaluated once, in slot order: inline when the placeholders use every slot
         // exactly once in order and nothing else refers to them; otherwise bind them first
         let mut inline = !formatted && phs.len() == srcs.len();
+        // rustc ast_lowering format.rs: the arguments of the later slots are evaluated before any `Argument` is
+        // made (`super let args = (&arg0, &arg1)`), so none of them is held across a suspension point in them
+        if inline && srcs.iter().skip(1).any(|s| matches!(s, Src::Expr(e) if self.expr_may_yield(*e))) {
+            inline = false;
+        }
         if inline {
             for (k, (i, _)) in phs.iter().enumerate() {
                 if *i != k {

@@ -137,6 +137,7 @@ fn publish_coroutine_witnesses(prog: &Program, tcx: &Tcx, env: TypingEnv, typeck
         }));
         match witness {
             Ok((tys, needs_drop)) => {
+                if std::env::var_os("RX_DBG").is_some() { eprintln!("witness {}.{}: {:?}", typeck.file, e.0, tys.iter().map(|&t| typeck::ty_to_string(false, prog, tcx, t)).collect::<Vec<_>>()); }
                 tcx.coroutine_witness_needs_drop.insert((typeck.file, e.0), needs_drop);
                 let _k = crate::zone_alloc::kept();
                 tcx.coroutine_hidden_types.insert((typeck.file, e.0), std::sync::Arc::new(tys));

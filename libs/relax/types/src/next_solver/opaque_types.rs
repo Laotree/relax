@@ -34,11 +34,19 @@ impl EvalCtxt<'_, '_> {
             }); }
             let key = OpaqueTypeKey { def_id: def, args: normalized_args.clone().into() };
             let previous = self.delegate.inner.borrow_mut().opaque_types().register(key, ProvisionalHiddenType::new(expected));
-            if let Some(prev) = previous { self.eq(env, p.term, Term::Ty(prev))?; }
+            if let Some(prev) = previous {
+                if std::env::var_os("RX_DBG").is_some() { let sh = |t: TyId| crate::typeck::ty_to_string(false, self.solver.prog, tcx, self.delegate.deeply_resolve_ignoring_regions(t)); if let Term::Ty(t) = p.term { eprintln!("opaque previous: term {} prev {}", sh(t), sh(prev)); } }
+                self.eq(env, p.term, Term::Ty(prev))?;
+            }
             else if matches!(self.delegate.typing_mode.get(), TypingMode::PostTypeckUntilBorrowck { .. }) {
                 let actual = self.type_of(def, &args)?;
                 let actual = FreshErasedRegions(self.delegate).fold_ty(&tcx.tys, actual, 0);
-                let actual = self.normalize_ty(env, actual)?; self.eq(env, p.term, Term::Ty(actual))?;
+                let actual = self.normalize_ty(env, actual)?;
+                if std::env::var_os("RX_DBG").is_some() {
+                    let show = |t: TyId| match tcx.tys.kind(t) { TyKind::Closure(f, e, a) => format!("closure#{f}.{e} parent={} kind={} sig={} up={}", crate::typeck::ty_to_string(false, self.solver.prog, tcx, a.parent_args), crate::typeck::ty_to_string(false, self.solver.prog, tcx, a.closure_kind_ty), crate::typeck::ty_to_string(false, self.solver.prog, tcx, a.closure_sig_as_fn_ptr_ty), crate::typeck::ty_to_string(false, self.solver.prog, tcx, a.tupled_upvars_ty)), _ => crate::typeck::ty_to_string(false, self.solver.prog, tcx, t) };
+                    if let Term::Ty(t) = p.term { eprintln!("opaque eq: term {}\n  actual {}", show(t), show(actual)); }
+                }
+                self.eq(env, p.term, Term::Ty(actual))?;
             }
             self.add_item_bounds_for_hidden_type(env, def, &normalized_args, expected)?;
         } else {
