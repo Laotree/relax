@@ -4228,7 +4228,6 @@ fn scalar_minmax(i: &Inst, a: VReg, b: VReg) -> Option<(bool, u8)> {
     }
 }
 
-/// Does this CPU (and the environment: MAKEPAD_RUN_NO_AVX) allow VEX-encoded AVX instructions?
 /// Whether the emitter encodes `op` (the legaliser expands the lane-wise ops it does not).
 pub fn vx_native(options: &relax_session::Options, op: VX) -> bool {
     use VW::*;
@@ -4248,6 +4247,7 @@ pub fn vx_native(options: &relax_session::Options, op: VX) -> bool {
     }
 }
 
+/// Does this CPU (and the environment: MAKEPAD_RUN_NO_AVX) allow VEX-encoded AVX instructions?
 pub fn host_avx(options: &relax_session::Options) -> bool {
     options.cpu.avx
 }
@@ -4301,9 +4301,12 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     };
     // vector ops without an instruction sequence here: per-lane scalar code
     let legal;
-    let f = if crate::legal::needed(f, &|op| vx_native(options, op), false) {
+    // (MAKEPAD_RUN_OPT=-vxnative: every expandable op, the legaliser's reference meaning)
+    let all = crate::stats::opt_off(options, "-vxnative");
+    let native = |op| !all && vx_native(options, op);
+    let f = if crate::legal::needed(f, &native, false) {
         let mut g = f.clone();
-        crate::legal::legalize(&mut g, &|op| vx_native(options, op), false);
+        crate::legal::legalize(&mut g, &native, false);
         legal = g;
         &legal
     } else {
