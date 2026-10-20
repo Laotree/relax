@@ -636,12 +636,11 @@ pub fn privacy_diag(prog: &Program, file: u32, pos: u32, e: &crate::program::Pri
     None
 }
 
-pub const AMBIGUOUS_PANIC_IMPORTS: Lint = lint("ambiguous_panic_imports");
 pub const AMBIGUOUS_IMPORT_VISIBILITIES: Lint = lint("ambiguous_import_visibilities");
 
 /// What rustc's import resolution reports beyond Relax's own import errors (the replay in
 /// front's program/rsim.rs): errors, and the lints `ambiguous_glob_imports` /
-/// `ambiguous_panic_imports` under the levels in force at the import.
+/// `ambiguous_import_visibilities` under the levels in force at the import.
 pub fn import_resolution_diags(prog: &mut Program, own: &[bool]) -> Vec<String> {
     use relax_front::program::SimKind;
     let mut errors = Vec::new();
@@ -655,7 +654,7 @@ pub fn import_resolution_diags(prog: &mut Program, own: &[bool]) -> Vec<String> 
             SimKind::Lint(name) => {
                 if !enabled() { continue; }
                 let def = def_at(prog, d.file, d.pos);
-                let l = match name { "ambiguous_panic_imports" => AMBIGUOUS_PANIC_IMPORTS, "ambiguous_import_visibilities" => AMBIGUOUS_IMPORT_VISIBILITIES, _ => AMBIGUOUS_GLOB_IMPORTS };
+                let l = match name { "ambiguous_import_visibilities" => AMBIGUOUS_IMPORT_VISIBILITIES, _ => AMBIGUOUS_GLOB_IMPORTS };
                 emit(prog, def, &l, d.file, d.pos, &d.msg);
             }
         }

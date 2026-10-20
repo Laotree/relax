@@ -71,7 +71,6 @@ struct Decl {
     vis_max: Option<DeclId>,
     vis_min: Option<DeclId>,
     exp: u32,
-    parent: u32,
 }
 
 enum IK {
@@ -106,7 +105,7 @@ impl NameRes {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Warn { Glob, Vis, Panic }
+enum Warn { Glob, Vis }
 
 pub enum SimKind { Error, Lint(&'static str) }
 
@@ -187,7 +186,7 @@ impl<'a> Sim<'a> {
             no_prelude: Default::default(), extern_items: Default::default(), dummy: 0, unexpanded: Default::default(),
             indeterminate: Vec::new(), determined: Vec::new(),
         };
-        s.dummy = s.alloc(Decl { def: None, import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0, parent: u32::MAX });
+        s.dummy = s.alloc(Decl { def: None, import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0 });
         s
     }
 
@@ -269,7 +268,7 @@ impl<'a> Sim<'a> {
         if let Some(r) = self.ext_decls.get(&(m, name, ns)) { return *r; }
         let mut q = GlobQuery { precise: true, ..Default::default() };
         let r = self.p.lookup_in_module_vis(m, name, ns_type(ns), &mut q).map(|(d, v)| {
-            self.alloc(Decl { def: Some(d), import: None, ambiguity: None, warn_ambiguity: false, vis: v, vis_max: None, vis_min: None, exp: 0, parent: u32::MAX })
+            self.alloc(Decl { def: Some(d), import: None, ambiguity: None, warn_ambiguity: false, vis: v, vis_max: None, vis_min: None, exp: 0 })
         });
         self.ext_decls.insert((m, name, ns), r);
         r
@@ -277,7 +276,7 @@ impl<'a> Sim<'a> {
 
     fn container_decl(&mut self, c: DefId, name: Sym, ns: usize) -> Option<DeclId> {
         let d = self.p.lookup_in_container(c, name, ns_type(ns))?;
-        Some(self.alloc(Decl { def: Some(d), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0, parent: u32::MAX }))
+        Some(self.alloc(Decl { def: Some(d), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0 }))
     }
 
     fn import_decl_vis_ext(&self, decl: DeclId, imp: u32, min: bool) -> BindVis {
@@ -295,7 +294,7 @@ impl<'a> Sim<'a> {
     fn new_import_decl(&mut self, decl: DeclId, imp: u32) -> DeclId {
         let vis = self.import_decl_vis(decl, imp);
         let im = &self.imps[imp as usize];
-        let (exp, module) = (im.exp, im.module);
+        let exp = im.exp;
         let own_vis = im.vis;
         let update = match im.kind { IK::Glob { max_vis } => Some(max_vis), _ => None };
         if let Some(max) = update {
@@ -303,7 +302,7 @@ impl<'a> Sim<'a> {
                 if let IK::Glob { max_vis } = &mut self.imps[imp as usize].kind { *max_vis = Some(vis); }
             }
         }
-        self.alloc(Decl { def: None, import: Some((imp, decl)), ambiguity: None, warn_ambiguity: false, vis, vis_max: None, vis_min: None, exp, parent: module })
+        self.alloc(Decl { def: None, import: Some((imp, decl)), ambiguity: None, warn_ambiguity: false, vis, vis_max: None, vis_min: None, exp })
     }
 
     fn remove_same_import(&self, d1: DeclId, d2: DeclId) -> (DeclId, DeclId) {
@@ -343,8 +342,6 @@ impl<'a> Sim<'a> {
             old
         }
     }
-
-    fn resolution(&self, key: (u32, Sym, usize)) -> Option<&NameRes> { self.res.get(&key) }
 
     fn resolution_mut(&mut self, key: (u32, Sym, usize)) -> &mut NameRes {
         if !self.res.contains_key(&key) {
@@ -450,7 +447,7 @@ impl<'a> Sim<'a> {
                         if exp != 0 { self.unexpanded.insert(m); }
                         continue;
                     }
-                    let decl = self.alloc(Decl { def: Some(d), import: None, ambiguity: None, warn_ambiguity: false, vis, vis_max: None, vis_min: None, exp, parent: m });
+                    let decl = self.alloc(Decl { def: Some(d), import: None, ambiguity: None, warn_ambiguity: false, vis, vis_max: None, vis_min: None, exp });
                     let _ = self.try_plant(m, name, ns, decl, false);
                 }
             }
@@ -474,7 +471,7 @@ impl<'a> Sim<'a> {
                 let krate = if kind == SegKind::Crate { Some(p.mods[module as usize].krate) } else { p.crates[p.mods[module as usize].krate as usize].deps.iter().find(|x| x.0 == name).map(|x| x.1) };
                 let Some(c) = krate else { continue };
                 let root = p.mods[p.crates[c as usize].root_mod as usize].def;
-                let src = self.alloc(Decl { def: Some(root), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0, parent: u32::MAX });
+                let src = self.alloc(Decl { def: Some(root), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0 });
                 let idx = self.imps.len() as u32;
                 self.imps.push(SImp { pi, module, vis, exp, kind: IK::Single { source: name, target: bind, decls: [Pend::Ready(None), Pend::Ready(None)] }, path: Vec::new(), global: false, imported: None, edition });
                 let d = self.new_import_decl(src, idx);
@@ -503,7 +500,7 @@ impl<'a> Sim<'a> {
                 // `use crate as c;` / `use self as s;` / `use super as p;`: a module, resolved at once
                 if let Some(def) = p.resolve_mod_path(module, im.global, &im.segs, edition < 2018, true) {
                     if p.def(def).kind == DefKind::Mod {
-                        let src = self.alloc(Decl { def: Some(def), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0, parent: u32::MAX });
+                        let src = self.alloc(Decl { def: Some(def), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0 });
                         let idx = self.imps.len() as u32;
                         self.imps.push(SImp { pi, module, vis, exp, kind: IK::Single { source: last, target, decls: [Pend::Ready(None), Pend::Ready(None)] }, path: Vec::new(), global: false, imported: None, edition });
                         let d = self.new_import_decl(src, idx);
@@ -714,7 +711,7 @@ impl<'a> Sim<'a> {
                 match self.p.crates[krate as usize].deps.iter().find(|x| x.0 == name) {
                     Some(&(_, c)) => {
                         let root = self.p.mods[self.p.crates[c as usize].root_mod as usize].def;
-                        let d = self.alloc(Decl { def: Some(root), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0, parent: u32::MAX });
+                        let d = self.alloc(Decl { def: Some(root), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0 });
                         Ok(d)
                     }
                     None => Err(Ctl::Continue(Determined)),
@@ -732,7 +729,7 @@ impl<'a> Sim<'a> {
             Scope::Builtin => {
                 for i in 0..PRIMS.len() {
                     if self.p.syms.get(PRIMS[i].0) == Some(name) {
-                        let d = self.alloc(Decl { def: Some(self.p.prim_defs[i]), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0, parent: u32::MAX });
+                        let d = self.alloc(Decl { def: Some(self.p.prim_defs[i]), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0 });
                         return Ok(d);
                     }
                 }
@@ -1153,11 +1150,7 @@ impl<'a> Sim<'a> {
     /// The ambiguities recorded on the glob declarations of the modules: (module, name, type ns).
     fn ambiguity_table(&self) -> HashMap<(u32, Sym, bool), u8> {
         let mut t = HashMap::default();
-        let trace = std::env::var_os("MAKEPAD_RUN_SIM_TRACE").is_some();
         for (&(m, name, ns), r) in &self.res {
-            if trace && self.p.syms.str(name) != "main" && r.glob.is_some() && self.p.mods[m as usize].krate == self.p.mods[m as usize].krate && self.local(m) {
-                eprintln!("sim: mod {} {} ns{} non_glob={:?} glob={:?} amb={:?} warn={:?}", m, self.p.syms.str(name), ns, r.non_glob, r.glob, r.glob.map(|g| self.chain_ambiguities(g)), r.glob.map(|g| self.decls[g as usize].warn_ambiguity));
-            }
             if r.non_glob.is_some() { continue; }
             if let Some(g) = r.glob {
                 let amb = self.chain_ambiguities(g);
@@ -1231,7 +1224,6 @@ impl<'a> Sim<'a> {
                 None => (SimKind::Error, format!("E0659: `{n}` is ambiguous")),
                 Some(Warn::Glob) => (SimKind::Lint("ambiguous_glob_imports"), format!("`{n}` is ambiguous")),
                 Some(Warn::Vis) => (SimKind::Lint("ambiguous_import_visibilities"), format!("ambiguous import visibility")),
-                Some(Warn::Panic) => (SimKind::Lint("ambiguous_panic_imports"), format!("`{n}` is ambiguous")),
             };
             out.push(SimDiag { file, pos, kind, msg });
         }
@@ -1294,5 +1286,67 @@ impl<'a> Sim<'a> {
                 self.update_local_resolution(m, target, ns, false, |_, r| { r.single_imports.retain(|&x| x != i); });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The diagnostics of the replay over a crate written in `source` (no std: nothing to import from it).
+    fn replay(source: &str, edition: u16) -> Vec<(String, usize)> {
+        let sess = &std::sync::Arc::new(relax_session::Session::default());
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("relax-rsim-{}-{n}.rs", std::process::id()));
+        std::fs::write(&path, source).unwrap();
+        let mut prog = Program::new(sess);
+        let k = prog.load_crate("rsim_test", path.to_str().unwrap(), edition, crate::cfg::CfgSet::host(sess, &[]), vec![]).unwrap();
+        std::fs::remove_file(path).unwrap();
+        prog.resolve_imports();
+        let mut own = vec![false; prog.crates.len()];
+        own[k as usize] = true;
+        prog.own_crates = own.clone();
+        prog.run_import_sim(&own);
+        let diags = prog.sim_diags.take().unwrap();
+        diags.into_iter().map(|d| (match d.kind { SimKind::Error => d.msg, SimKind::Lint(l) => format!("lint {l}: {}", d.msg) }, prog.files[d.file as usize].line_col(d.pos).0)).collect()
+    }
+
+    fn has(v: &[(String, usize)], text: &str, line: usize) -> bool { v.iter().any(|(m, l)| m.contains(text) && *l == line) }
+
+    #[test]
+    fn a_glob_shadowed_by_a_pending_import_cannot_be_determined() {
+        // rustc tests/ui/imports/shadow-glob-module-resolution-1.rs
+        let d = replay("mod a { pub mod b { pub mod c {} } }\nuse a::*;\nuse b::c;\nuse c as b;\nfn main() {}\n", 2015);
+        assert!(has(&d, "cannot determine resolution for the import", 3), "{d:?}");
+        assert!(has(&d, "unresolved import `b::c`", 3), "{d:?}");
+        assert!(!d.iter().any(|(_, l)| *l == 4), "{d:?}");
+    }
+
+    #[test]
+    fn two_globs_of_different_items_are_an_ambiguity_lint() {
+        let d = replay("mod b { pub fn x() {} }\nmod c { pub fn x() {} }\nmod a { pub use super::b::*; pub use super::c::*; }\nmod user { use super::a::*; pub fn f() { x(); } }\nfn main() {}\n", 2018);
+        // (the use site is judged by the checks that read `sim_ambiguity`; the replay itself has no complaint)
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn a_glob_name_against_an_outer_scope_item_is_ambiguous() {
+        // rustc: E0659 "a conflict between a name from a glob import and an outer scope"
+        let d = replay("mod x { pub mod y {} }\nmod a { pub mod x { pub mod y {} } }\nfn main() {\n    use a::*;\n    use x::y;\n}\n", 2018);
+        assert!(has(&d, "E0659: `x` is ambiguous", 5), "{d:?}");
+    }
+
+    #[test]
+    fn plain_imports_report_nothing() {
+        let d = replay("mod m { pub struct S; pub fn f() {} }\nuse m::{S, f};\nuse m::*;\nmod n { pub use crate::m::S as T; }\nfn main() { f(); }\n", 2018);
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn an_import_cycle_through_single_imports_is_reported() {
+        // rustc tests/ui/imports/cycle-import-in-std-1.rs with a module in place of `std`
+        let d = replay("mod m { pub mod collections {} }\nfn main() {\n    use ops::{self as m};\n    use m::collections::{self as ops};\n}\n", 2018);
+        assert!(has(&d, "unresolved import `ops`", 3), "{d:?}");
     }
 }
