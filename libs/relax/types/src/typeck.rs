@@ -6339,6 +6339,13 @@ impl<'a> Fcx<'a> {
         let points = std::mem::replace(&mut self.await_count, save_awaits);
         if !self.diverges {
             self.coerce_or_unify(bt, out, None, self.ast().block(b).hi);
+        } else {
+            // a body that only diverges (`async { todo!() }`): the return type's still-open
+            // variable falls back like any variable a `!` flowed into
+            let so = self.shallow(out);
+            if matches!(self.tcx.tys.kind(so), TyKind::Infer(_)) {
+                self.diverging.push(so);
+            }
         }
         self.async_depth -= 1;
         self.ret_stack.pop();
