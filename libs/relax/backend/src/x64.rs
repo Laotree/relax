@@ -799,20 +799,24 @@ impl<'a> Gen<'a> {
                 scratch
             }
             _ => {
-                // flags-preserving: a fused compare may have set them for the next jcc / cmov
-                match self.al.remat[v.0 as usize] {
-                    Remat::Const(k) => self.a.mov_ri_nf(scratch, k),
-                    Remat::Slot(s) => {
-                        let off = self.slot_off[s as usize];
-                        self.a.lea(scratch, RBP, -(self.saved + off));
-                    }
-                    // mov r, [rip + pool] leaves the flags alone
-                    Remat::Addr(a) => self.mov_reloc(scratch, Reloc::Sym(a)),
-                    Remat::FnAddr(id) => self.mov_reloc(scratch, Reloc::Thunk(id)),
-                    _ => self.a.mov_ri_nf(scratch, 0),
-                }
+                self.remat_into(scratch, v);
                 scratch
             }
+        }
+    }
+    /// Recomputes a value without a location (Alloc::remat) into r, flags-preserving: a fused
+    /// compare may have set them for the next jcc / cmov.
+    fn remat_into(&mut self, r: u8, v: VReg) {
+        match self.al.remat[v.0 as usize] {
+            Remat::Const(k) => self.a.mov_ri_nf(r, k),
+            Remat::Slot(s) => {
+                let off = self.slot_off[s as usize];
+                self.a.lea(r, RBP, -(self.saved + off));
+            }
+            // mov r, [rip + pool] leaves the flags alone
+            Remat::Addr(a) => self.mov_reloc(r, Reloc::Sym(a)),
+            Remat::FnAddr(id) => self.mov_reloc(r, Reloc::Thunk(id)),
+            _ => self.a.mov_ri_nf(r, 0),
         }
     }
     /// A load/store base and displacement: a stack-slot address that has no register (see
@@ -887,6 +891,7 @@ impl<'a> Gen<'a> {
             Loc::Reg(r) => Some(MLoc::R(r)),
             Loc::Flt(x) => Some(MLoc::F(x)),
             Loc::Stack(o) => Some(MLoc::M(self.spill_disp(o))),
+            Loc::None if self.al.remat[v.0 as usize].is_some() => Some(MLoc::K(v.0)),
             Loc::None => None,
         }
     }
@@ -906,6 +911,12 @@ impl<'a> Gen<'a> {
             }
             (MLoc::R(a), MLoc::F(b)) => self.a.movq_rx(a, b, true),
             (MLoc::F(a), MLoc::R(b)) => self.a.movq_xr(a, b, true),
+            (MLoc::R(a), MLoc::K(v)) => self.remat_into(a, VReg(v)),
+            (MLoc::M(o), MLoc::K(v)) => {
+                self.remat_into(R10, VReg(v));
+                self.a.store64(RBP, o, R10);
+            }
+            (MLoc::F(_) | MLoc::K(_), _) | (_, MLoc::K(_)) => unreachable!("move {:?} <- {:?}", d, s),
         }
     }
 
@@ -4001,6 +4012,10 @@ impl<'a> Gen<'a> {
                     Some(MLoc::F(x)) => self.a.storef(true, RSP, 8 * k as i32, x),
                     Some(MLoc::M(o)) => {
                         self.a.load64(R10, RBP, o);
+                        self.a.store64(RSP, 8 * k as i32, R10);
+                    }
+                    Some(MLoc::K(v)) => {
+                        self.remat_into(R10, VReg(v));
                         self.a.store64(RSP, 8 * k as i32, R10);
                     }
                     None => {}

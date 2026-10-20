@@ -699,27 +699,28 @@ impl<'a> Gen<'a> {
                 scratch
             }
             // recomputed at each use (Alloc::remat)
-            _ => match self.al.remat[v.0 as usize] {
-                Remat::Const(k) => {
-                    // never xzr for 0: register 31 is sp in add-immediate and address operands
-                    self.a.mov_imm(scratch, k);
+            _ => {
+                if self.al.remat[v.0 as usize].is_some() {
+                    self.remat_into(scratch, v);
                     scratch
+                } else {
+                    ZR
                 }
-                Remat::Slot(s) => {
-                    let off = self.slot_off[s as usize];
-                    self.a.add_any(scratch, SP, off);
-                    scratch
-                }
-                Remat::Addr(a) => {
-                    self.ldr_reloc(scratch, Reloc::Sym(a));
-                    scratch
-                }
-                Remat::FnAddr(id) => {
-                    self.ldr_reloc(scratch, Reloc::Thunk(id));
-                    scratch
-                }
-                Remat::No => ZR,
-            },
+            }
+        }
+    }
+    /// Recomputes a value without a location (Alloc::remat) into r.
+    fn remat_into(&mut self, r: u8, v: VReg) {
+        match self.al.remat[v.0 as usize] {
+            // never xzr for 0: register 31 is sp in add-immediate and address operands
+            Remat::Const(k) => self.a.mov_imm(r, k),
+            Remat::Slot(s) => {
+                let off = self.slot_off[s as usize];
+                self.a.add_any(r, SP, off);
+            }
+            Remat::Addr(a) => self.ldr_reloc(r, Reloc::Sym(a)),
+            Remat::FnAddr(id) => self.ldr_reloc(r, Reloc::Thunk(id)),
+            Remat::No => self.a.mov_imm(r, 0),
         }
     }
     /// A stack-slot address without a register (Alloc::remat) as a load/store base: sp + its offset.
@@ -821,6 +822,7 @@ impl<'a> Gen<'a> {
             Loc::Reg(r) => MLoc::R(r),
             Loc::Flt(x) => MLoc::F(x),
             Loc::Stack(o) => MLoc::M(self.spill_sp(o) as i32),
+            Loc::None if self.al.remat[v.0 as usize].is_some() => MLoc::K(v.0),
             Loc::None => MLoc::R(ZR),
         }
     }
@@ -843,6 +845,12 @@ impl<'a> Gen<'a> {
                 }
                 (MLoc::R(d), MLoc::F(s)) => self.a.fmov_to_gp(true, d, s),
                 (MLoc::F(d), MLoc::R(s)) => self.a.fmov_from_gp(true, d, s),
+                (MLoc::R(d), MLoc::K(v)) => self.remat_into(d, VReg(v)),
+                (MLoc::M(o), MLoc::K(v)) => {
+                    self.remat_into(S1, VReg(v));
+                    self.a.ldst(STRX, 8, S1, SP, o as i64);
+                }
+                (d @ (MLoc::F(_) | MLoc::K(_)), s) | (d, s @ MLoc::K(_)) => unreachable!("move {:?} <- {:?}", d, s),
             }
         }
     }
@@ -3296,6 +3304,10 @@ impl<'a> Gen<'a> {
                     MLoc::F(x) => self.a.ldst(STRD, 8, x, SP, 8 * k),
                     MLoc::M(o) => {
                         self.a.ldst(LDRX, 8, S1, SP, o as i64);
+                        self.a.ldst(STRX, 8, S1, SP, 8 * k);
+                    }
+                    MLoc::K(v) => {
+                        self.remat_into(S1, VReg(v));
                         self.a.ldst(STRX, 8, S1, SP, 8 * k);
                     }
                 }

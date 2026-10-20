@@ -1667,9 +1667,9 @@ fn allocate_baseline(options: &relax_session::Options, f: &Func, cfg: &RegConfig
     Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows: Vec::new() }
 }
 
-/// Rematerialisable values: one definition by a constant-like instruction, used only as
-/// instruction operands (never as call arguments or returned values, which move through
-/// locations), not parameters. Returns (per vreg its recomputation, whether it is a stack-slot
+/// Rematerialisable values: one definition by a constant-like instruction, not parameters.
+/// Call arguments and returned values among them are recomputed straight into their argument /
+/// result register (MLoc::K). Returns (per vreg its recomputation, whether it is a stack-slot
 /// address used only as a memory base: such a value never takes a register).
 fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg: &RegConfig) -> (Vec<Remat>, Vec<bool>) {
     let nv = f.vregs.len();
@@ -1696,10 +1696,7 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
                     Inst::Addr(d, a) if crate::rir::SymClass::of(cfg.sym_class, a.id) != crate::rir::SymClass::Domain => cand.push((d.0, Remat::Addr(*a))),
                     Inst::FnAddr(d, n) => cand.push((d.0, Remat::FnAddr(*n))),
                     Inst::Mov(d, s2) => movs.push((d.0, s2.0)),
-                    Inst::Call(c, a, _) => {
-                        for v in a {
-                            bad[v.0 as usize] = true;
-                        }
+                    Inst::Call(c, _, _) => {
                         if let Callee::Indirect(v) | Callee::CIndirect(v, _) = c {
                             nonbase[v.0 as usize] = true;
                         }
@@ -1708,7 +1705,8 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
                 }
                 // uses other than as a memory base
                 match i {
-                    Inst::Load(_, _, _, _) | Inst::Call(..) => {}
+                    Inst::Load(_, _, _, _) => {}
+                    Inst::Call(_, a, _) => a.iter().for_each(|v| nonbase[v.0 as usize] = true),
                     Inst::Store(_, _, _, s2) => nonbase[s2.0 as usize] = true,
                     Inst::LoadX(_, _, b2, x, _, _) => {
                         nonbase[x.0 as usize] = true;
@@ -1727,7 +1725,7 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
                 }
             }
             match &b.term {
-                Term::Ret(vs) => vs.iter().for_each(|v| bad[v.0 as usize] = true),
+                Term::Ret(vs) => vs.iter().for_each(|v| nonbase[v.0 as usize] = true),
                 Term::Branch(c, _, _) | Term::Switch(c, _) => nonbase[c.0 as usize] = true,
                 _ => {}
             }
@@ -2054,6 +2052,9 @@ pub enum MLoc {
     F(u8),
     /// memory (spill slot / staging); never a conflict source for register moves
     M(i32),
+    /// (source only) vreg n recomputed into the destination (Alloc::remat): reads no register,
+    /// so it is emitted with the moves from memory, after every register move
+    K(u32),
 }
 
 /// Orders a set of simultaneous moves `(dst, src)` into a sequence, breaking cycles with
@@ -2069,7 +2070,7 @@ pub fn seq_moves(moves: &[(MLoc, MLoc)], int_scratch: u8, flt_scratch: u8) -> Ve
         }
         match (m.0, m.1) {
             (MLoc::M(_), _) => out.push(*m),
-            (_, MLoc::M(_)) => from_mem.push(*m),
+            (_, MLoc::M(_) | MLoc::K(_)) => from_mem.push(*m),
             _ => pending.push(*m),
         }
     }
