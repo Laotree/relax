@@ -146,6 +146,9 @@ pub struct Body {
     /// every struct field the body names, resolved: (ADT, field index) -- a live layout edit's
     /// dependents (reload.rs: the fns using a removed or renamed field, not its name)
     pub field_uses: ThinVec<(DefId, u32)>,
+    /// every `.await` of the body: (the enclosing coroutine's expression, the awaited operand's
+    /// type, position) -- the by-value edges of async recursion (E0733)
+    pub awaits: ThinVec<(u32, TyId, u32)>,
     /// Resolved definitions read while checking; deduplicated by the warm session.
     pub dependencies: ThinVec<DefId>,
     /// overloaded indexing: expr -> `Index::index` with [Self, Idx]
@@ -240,6 +243,7 @@ impl Body {
             hidden_types: SideTable::new(),
             field_idx: SideTable::new(),
             field_uses: ThinVec::new(),
+            awaits: ThinVec::new(),
             dependencies: ThinVec::new(),
             ov_index: SideTable::new(),
             mutable_index: SideTable::new(),
@@ -327,7 +331,7 @@ impl Body {
             field_idx, ov_index, mutable_index, std_index, for_next, for_into, call_traits, legacy_args,
             pat_derefs, pat_bind_ref, pat_discriminant_reads, try_branch, try_from_residual, fmt_named, closure_locals,
             closure_expected_kinds, closure_sigs, inline_const_types, struct_defaults,
-            args, expr_ty, expr_typed, pat_ty, pat_typed, field_uses, dependencies, locals, param_pats, closures, errors);
+            args, expr_ty, expr_typed, pat_ty, pat_typed, field_uses, awaits, dependencies, locals, param_pats, closures, errors);
     }
 
     /// Memory report (MAKEPAD_RUN_MEM_REPORT): per table (entries, heap bytes incl. nested vectors),
@@ -702,6 +706,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             hidden_types: SideTable::new(),
             field_idx: SideTable::new(),
             field_uses: ThinVec::new(),
+            awaits: ThinVec::new(),
             dependencies: ThinVec::new(),
             ov_index: SideTable::new(),
             mutable_index: SideTable::new(),
@@ -6593,6 +6598,7 @@ impl<'a> Fcx<'a> {
             return self.tcx.tys.error;
         }
         self.await_count += 1;
+        if let Some(&(coroutine, _)) = self.closure_depth.last() { self.b.awaits.push((coroutine, t, lo)); }
         // an async block / async fn body: its output is the coroutine's return type, known
         // without selection (rustc: the coroutine's Future::Output, so `A[async { 1 }.await]`
         // keeps the literal open for the index)
