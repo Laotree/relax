@@ -6636,7 +6636,7 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
             });
             if let Some((up, w)) = begin {
                 let done = w.run();
-                owner::call(owner::Class::Finish, || o2_finish(up, done));
+                owner::call(owner::Class::FinishBackground, || o2_finish(up, done));
             }
         }));
         if r.is_err() {
@@ -11335,7 +11335,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let t2 = cpu_ns();
     if let Some(m) = measure.as_mut() { m.phase(2, t2); }
     trace_tier1_phase(id, "built");
-    let ok = owner::call(owner::Class::Finish, || {
+    // (an O3-always first build is a program thread's lazy compile: its finish is foreground)
+    let ok = owner::call(if o3_first() { owner::Class::Finish } else { owner::Class::FinishBackground }, || {
         trace_tier1_phase(id, "install");
         let _cost_install = relax_codegen::fncost::phase(6);
         let u = &mut *up;
@@ -13319,7 +13320,7 @@ unsafe fn spec_build(up: *mut Unit, id: u32) -> bool {
     match b {
         Begin::Back(w) => {
             let d = w.run();
-            owner::call(owner::Class::Finish, || split_finish(up, d));
+            owner::call(owner::Class::FinishBackground, || split_finish(up, d));
             COMPILE_LAST.store(wall_ns(), Ordering::Relaxed);
             true
         }
@@ -13620,7 +13621,7 @@ fn ahead_helper(f: std::sync::Arc<FrontShared>) {
         typeck_ahead(&f, d, args, 1, true, normal);
         AHEAD_STATS[4].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
         if let Some(id) = slot {
-            lower_ahead(&f, id);
+            lower_ahead(&f, id, false);
         }
     }
 }
@@ -13700,9 +13701,13 @@ pub(crate) fn lower_ahead_needs_unit() {
     }
 }
 
-fn lower_ahead(f: &FrontShared, id: u32) {
+/// Lowers slot `id`'s checked body off the unit (its build takes the RIR, take_lowered_ahead): the
+/// startup helpers' work, and after it the thread about to build `id` itself (`own`: the owner's
+/// front then only takes the RIR, so lowering runs on the program's threads in parallel, not on
+/// the one owner thread every lazy compile queues for).
+fn lower_ahead(f: &FrontShared, id: u32, own: bool) {
     let _r = front_read("lower_ahead");
-    if !f.alive.load(Ordering::SeqCst) || !startup_phase() { return; }
+    if !f.alive.load(Ordering::SeqCst) || !own && !startup_phase() { return; }
     let Some(FnKey::Inst(d, args)) = f.slot_keys.get(&id) else { return; };
     let key = (d, args);
     if f.built.contains(&key) { return; }
@@ -13925,6 +13930,8 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
         // a helper is checking this very body: wait for its result rather than check it again
         // under the unit lock (not while holding that lock: a constant evaluation's call)
         if !owner::is_owner() && f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
+            // (a wait for another thread: not a running job meanwhile, job_sleep's reason)
+            let _idle = JobIdle::enter();
             let mut g = AHEAD_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
             while f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) && f.alive.load(Ordering::SeqCst) {
                 g = AHEAD_DONE.1.wait_timeout(g, std::time::Duration::from_millis(5)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
@@ -13932,6 +13939,10 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
         }
         let w = IS_WORKER.try_with(|w| w.get()).unwrap_or(false);
         AHEAD_STATS[if w { 4 } else { 3 }].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
+        // after the startup (its helpers lower then), the thread about to build the slot lowers it
+        if !owner::is_owner() && !startup_phase() && pipelined() {
+            lower_ahead(&f, id, true);
+        }
     }
 }
 

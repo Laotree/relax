@@ -32,8 +32,8 @@ static HOW: [[AtomicU64; 2]; 6] = [const { [const { AtomicU64::new(0) }; 2] }; 6
 static SUMMARY_DONE: AtomicBool = AtomicBool::new(false);
 /// the owner's service in the window by class (ns), and of it the requests a program thread's
 /// request was queued behind when they ended (ns)
-static SERVED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
-static SERVED_BLOCKING: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static SERVED: [AtomicU64; crate::owner::CLASSES] = [const { AtomicU64::new(0) }; crate::owner::CLASSES];
+static SERVED_BLOCKING: [AtomicU64; crate::owner::CLASSES] = [const { AtomicU64::new(0) }; crate::owner::CLASSES];
 
 // ------------------------------------------------------------ readiness (the warm-up veil)
 
@@ -243,8 +243,8 @@ fn summary_due(now: u64) {
     }
 }
 
-fn served(a: &[AtomicU64; 5]) -> String {
-    (0..5).map(|c| format!("{} {:.0}", crate::owner::CLASS_NAMES[c], ms(a[c].load(Relaxed)))).collect::<Vec<_>>().join(", ")
+fn served(a: &[AtomicU64; crate::owner::CLASSES]) -> String {
+    (0..crate::owner::CLASSES).map(|c| format!("{} {:.0}", crate::owner::CLASS_NAMES[c], ms(a[c].load(Relaxed)))).collect::<Vec<_>>().join(", ")
 }
 
 /// The window's sums (one line).

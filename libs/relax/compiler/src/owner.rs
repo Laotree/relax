@@ -30,13 +30,24 @@ pub enum Class {
     Main = 2,
     /// other program threads, patches, the run's own foreground needs
     App = 3,
+    /// a background build's result (speculation, O2, O3 install): never opens a build; served
+    /// inside every pump (a wait for an in-flight slot needs it), at the top only after the
+    /// program threads' requests
+    FinishBackground = 4,
     /// speculation, tiers, seeds, teardown, completion, monitors: only when nothing above waits
-    Background = 4,
+    Background = 5,
 }
-const CLASSES: usize = 5;
-pub const CLASS_NAMES: [&str; CLASSES] = ["job", "finish", "main", "app", "background"];
+pub const CLASSES: usize = 6;
+pub const CLASS_NAMES: [&str; CLASSES] = ["job", "finish", "main", "app", "finish-background", "background"];
 /// makepad inspect's timeline span names of the owner's service, by class
-const SERVE_NAMES: [&str; CLASSES] = ["serve job", "serve finish", "serve main", "serve app", "serve background"];
+const SERVE_NAMES: [&str; CLASSES] = ["serve job", "serve finish", "serve main", "serve app", "serve finish background", "serve background"];
+
+impl Class {
+    /// a back end's result: never refused, served inside pumps
+    pub fn is_finish(self) -> bool {
+        matches!(self, Class::Finish | Class::FinishBackground)
+    }
+}
 
 const QUEUED: u8 = 0;
 const RUNNING: u8 = 1;
@@ -323,7 +334,7 @@ fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f
     }
     // a front reader that must not wait (lowering ahead) gives the work back first; a back
     // end's finish is never refused (its slots stay in flight until it is served)
-    if class != Class::Finish {
+    if !class.is_finish() {
         crate::jit::lower_ahead_needs_unit();
         crate::preempt::point();
     }
@@ -340,7 +351,7 @@ fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f
     // a thread waiting for its work on the owner is not a compile job meanwhile (an allocator
     // swap or fork waits for the jobs running; its work runs on the owner, which serves the
     // pauser): pure jobs (Job class) are, they hold front guards and queries
-    let _idle = (class != Class::Job && class != Class::Finish).then(crate::jit::JobIdle::enter);
+    let _idle = (class != Class::Job && !class.is_finish()).then(crate::jit::JobIdle::enter);
     let req = Req {
         run,
         class,
@@ -547,8 +558,8 @@ fn pick(q: &mut Queue, mode: Mode) -> Option<usize> {
     };
     let helper = EXIT_HELPER.load(Ordering::Acquire);
     for c in 0..CLASSES {
-        if mode == Mode::Pump && c >= Class::Main as usize {
-            break;
+        if mode == Mode::Pump && (c == Class::Main as usize || c == Class::App as usize) {
+            continue;
         }
         if c >= Class::Background as usize && FOREGROUND.load(Ordering::Relaxed) > 0 {
             break;
