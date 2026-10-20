@@ -448,7 +448,18 @@ fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f
 /// Posts `f` to the owner and returns at once (it runs later, in class order).
 #[track_caller]
 pub fn post(class: Class, f: impl FnOnce() + Send + 'static) {
-    if is_owner() || CHILD.load(Ordering::Relaxed) {
+    if is_owner() {
+        f();
+        return;
+    }
+    post_queued(class, f);
+}
+
+/// `post`, but queued also when called on the owner (`post` runs `f` at once there): work the
+/// owner hands itself for later, after the requests waiting now.
+#[track_caller]
+pub fn post_queued(class: Class, f: impl FnOnce() + Send + 'static) {
+    if CHILD.load(Ordering::Relaxed) {
         f();
         return;
     }

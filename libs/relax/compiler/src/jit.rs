@@ -5590,6 +5590,26 @@ impl Unit {
     }
 }
 
+/// A background drain of the deferred cache records is queued (one at a time)
+static RECORD_DRAIN: AtomicBool = AtomicBool::new(false);
+
+/// After the first present: the deferred cache records are encoded in batches of
+/// POST_PRESENT_BATCH, each its own Background request (a program thread's request is served
+/// between two), until none is left.
+fn drain_cache_records() {
+    if RECORD_DRAIN.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    owner::post_queued(owner::Class::Background, || {
+        let up = SPEC_UNIT.load(Ordering::Acquire);
+        let more = !SPEC_STOP.load(Ordering::SeqCst) && !up.is_null() && unsafe { (&mut *up).record_cache_batch(POST_PRESENT_BATCH) };
+        RECORD_DRAIN.store(false, Ordering::Release);
+        if more {
+            drain_cache_records();
+        }
+    });
+}
+
 /// Installs a slot's compiled code (on the owner thread): perf map, O3 counter, and the
 /// speculative builds of its callees.
 /// Links and installs a slot's code (`relocs` are the code's own; `record`: the disk cache
@@ -5621,16 +5641,27 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
             let u = &mut *up;
             if record {
                 if let Some(mut c) = u.cache.take() {
-                    // before the first present the main thread waits for this install: its
-                    // entry (slot keys, dependency certificate) is encoded after the present
-                    let deferred = if startup_phase() && !FIRST_PRESENT.load(Ordering::Acquire) && owner::for_main() {
+                    // a program thread waits for this install (the main thread's before the first
+                    // present, every program thread's after it): its entry (slot keys, dependency
+                    // certificate) is encoded later, in background batches (drain_cache_records)
+                    let foreground = if FIRST_PRESENT.load(Ordering::Acquire) {
+                        matches!(owner::serving().0, owner::Class::Main | owner::Class::App | owner::Class::Finish)
+                    } else {
+                        startup_phase() && owner::for_main()
+                    };
+                    let deferred = if foreground {
                         c.defer_record(u, id, code, relocs, &map)
                     } else {
                         c.record(u, id, code, relocs, &map);
                         None
                     };
                     u.cache = Some(c);
-                    if let Some(p) = deferred { u.pending_cache_records.push(Some(p)); }
+                    if let Some(p) = deferred {
+                        u.pending_cache_records.push(Some(p));
+                        if FIRST_PRESENT.load(Ordering::Acquire) {
+                            drain_cache_records();
+                        }
+                    }
                 }
             }
             let u = &mut *up;
