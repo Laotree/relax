@@ -199,7 +199,7 @@ pub fn rustc_inline_cost(callee: &Func, _callee_id: u32) -> usize {
             }
         }
         match block.term {
-            Term::Branch(..) => penalty += INSTR_COST,
+            Term::Branch(..) | Term::Switch(..) => penalty += INSTR_COST,
             Term::Resume => penalty += RESUME_PENALTY,
             Term::Unreachable => bonus += INSTR_COST,
             Term::Jump(..) | Term::Ret(..) | Term::Invoke(..) => {}
@@ -738,6 +738,7 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
                 Term::Jump(cont)
             }
             Term::Unreachable => Term::Unreachable,
+            Term::Switch(..) => unreachable!("Switch is made after optimisation"),
             Term::Invoke(t, e) => Term::Invoke(t + boff, e + boff),
             // the callee's cleanup is done: unwinding goes on in the caller, at the
             // invoke's pad if the call was invoked
@@ -1346,12 +1347,18 @@ pub fn compact_vregs(f: &mut Func) {
     f.vregs = cls;
 }
 
-// OnceLock cannot be reset through a shared static; see this crate's zone_take.
-pub(crate) static T: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+// OnceLock cannot be reset through a shared static; see this crate's zone_take. The string is
+// leaked in the kept heap: it outlives every compiler generation (a settle swap destroys the
+// compiler phase's allocations).
+pub(crate) static T: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
 
 fn trace_opt(f: &Func, tag: &str) {
-    if let Some(t) = T.get_or_init(|| std::env::var("MAKEPAD_RUN_TRACE_OPT").ok()) {
-        if f.name.contains(t.as_str()) {
+    let t = T.get_or_init(|| {
+        let _k = relax_session::phase::kept();
+        std::env::var("MAKEPAD_RUN_TRACE_OPT").ok().map(|s| &*Box::leak(s.into_boxed_str()))
+    });
+    if let Some(t) = t {
+        if f.name.contains(*t) {
             eprintln!("=== {} {}\n{}", tag, f.name, f.dump());
         }
     }
@@ -1507,10 +1514,9 @@ fn loop_headers(f: &Func, depth: &[u32]) -> Vec<bool> {
             _ => {
                 state[b] = 1;
                 work.push((b, true));
-                let mut succs = f.blocks[b].term.succs();
-                for s in [succs.next(), succs.next()].into_iter().rev().flatten() {
-                    work.push((s as usize, false));
-                }
+                let at = work.len();
+                work.extend(f.blocks[b].term.succs().map(|s| (s as usize, false)));
+                work[at..].reverse();
             }
         }
     }
@@ -3520,9 +3526,14 @@ fn thread_jumps(f: &mut Func) {
 /// Reorders reachable blocks so a block's jump/false-branch target follows it, drops
 /// unreachable blocks and puts panic paths (blocks ending in `Unreachable`) last.
 pub fn relayout(f: &mut Func) {
+    relayout_order(f);
+}
+
+/// `relayout`, returning the new order: per new block, the block it was.
+pub fn relayout_order(f: &mut Func) -> Vec<u32> {
     let n = f.blocks.len();
     if n <= 1 {
-        return;
+        return (0..n as u32).collect();
     }
     let reach = reachable(f);
     // blocks only reachable through unwind edges (cleanup pads) are cold
@@ -3591,6 +3602,7 @@ pub fn relayout(f: &mut Func) {
         blk.term.map_succs(|t| map[t as usize]);
         f.blocks.push(blk);
     }
+    order
 }
 
 pub fn inst_count(f: &Func) -> usize {
@@ -4593,13 +4605,7 @@ fn local_copy_prop(f: &mut Func) -> bool {
 
 /// Immediate dominators (Cooper/Harvey/Kennedy) over reachable blocks; entry's idom is itself.
 pub fn idoms(f: &Func) -> Vec<u32> {
-    idoms_with(f, &std::collections::HashMap::new())
-}
-
-/// `idoms` over the CFG plus `extra` edges (block -> more successors): the table dispatches of
-/// arm64::jump_tables, which enter their case blocks without passing the compare chain.
-pub fn idoms_with(f: &Func, extra: &std::collections::HashMap<u32, Vec<u32>>) -> Vec<u32> {
-    let succs_of = |b: u32| f.blocks[b as usize].term.succs().chain(extra.get(&b).into_iter().flatten().copied());
+    let succs_of = |b: u32| f.blocks[b as usize].term.succs();
     let n = f.blocks.len();
     if n == 1 {
         return vec![0];
@@ -5174,6 +5180,25 @@ fn local_cse(options: &relax_session::Options, f: &mut Func) -> bool {
             None if parent != u32::MAX => {
                 // a join: keep what cannot change on the way from the dominator `parent`
                 let header = is_header[bi];
+                // blocks reachable from a definition block (memoised): a definition that `bi` dominates
+                // still reaches `bi` again when both sit in a loop, so it lies on a path from `parent`
+                let reaches: std::cell::RefCell<std::collections::HashMap<u32, Vec<bool>>> = Default::default();
+                let reaches_bi = |db: u32| -> bool {
+                    let mut memo = reaches.borrow_mut();
+                    let seen = memo.entry(db).or_insert_with(|| {
+                        let blocks = unsafe { &*blocks_ptr };
+                        let mut seen = vec![false; n];
+                        let mut stack: Vec<u32> = blocks[db as usize].term.succs().collect();
+                        while let Some(x) = stack.pop() {
+                            if !seen[x as usize] {
+                                seen[x as usize] = true;
+                                stack.extend(blocks[x as usize].term.succs());
+                            }
+                        }
+                        seen
+                    });
+                    seen[bi]
+                };
                 let stable = |v: VReg| -> bool {
                     if v.0 == u32::MAX || single(v) {
                         return true;
@@ -5189,7 +5214,7 @@ fn local_cse(options: &relax_session::Options, f: &mut Func) -> bool {
                         // a latch that only jumps back to the dominator redefines v before
                         // the next pass through there: the last pass to the join sees no def
                         let latch_to_here = matches!(blocks[db as usize].term, Term::Jump(t) if t == parent);
-                        if !(dominates(db, parent) || dominates(bi as u32, db) || latch_to_here) {
+                        if !(dominates(db, parent) || (dominates(bi as u32, db) && !reaches_bi(db)) || latch_to_here) {
                             return false;
                         }
                     }
@@ -9220,7 +9245,7 @@ fn slot_linear_positions(f: &Func) -> Option<Vec<u32>> {
         match f.blocks[b].term {
             Term::Jump(next) => b = next as usize,
             Term::Ret(_) | Term::Unreachable | Term::Resume => return (seen == f.blocks.len()).then_some(positions),
-            Term::Branch(..) | Term::Invoke(..) => return None,
+            Term::Branch(..) | Term::Switch(..) | Term::Invoke(..) => return None,
         }
     }
 }
