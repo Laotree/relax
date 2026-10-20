@@ -942,7 +942,9 @@ fn a_type_that_must_outlive_a_region_in_a_well_formedness_check_reports_the_boun
         fn f<'a, T>(_: &'a T) {}
         fn main() {}");
     assert_eq!(errors.iter().filter(|e| e.contains("E0310") && e.contains("may not live long enough")).count(), 1, "{errors:?}");
+}
 
+#[test]
 fn a_local_live_across_an_await_is_part_of_the_future_for_auto_traits() {
     // rustc mir_coroutine_witnesses: `Send` of an async block waits for the body's MIR, then asks every type
     // of the locals live across a suspension point.
