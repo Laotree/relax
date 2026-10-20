@@ -2709,6 +2709,21 @@ impl Program {
                     // `extern crate self as name;` names this crate (makepad-draw: derive output
                     // written against `makepad_draw::..` also compiles inside makepad-draw)
                     let this = self.syms.str(name) == "self";
+                    if this && rename.is_none() && pos < self.files[file as usize].src_len {
+                        let e = self.record_uncoded_error(file, pos, "resolve", "`extern crate self;` requires renaming".to_string());
+                        self.errors.push(e);
+                    }
+                    if this && pos < self.files[file as usize].src_len {
+                        let f = &self.files[file as usize];
+                        let attrs: Vec<Attr> = f.ast.list(f.ast.item(iid).attrs).to_vec();
+                        for a in attrs {
+                            if a.toks.hi > a.toks.lo && f.tok_text(a.toks.lo) == "macro_use" {
+                                let at = f.tok(a.toks.lo).lo;
+                                let e = self.record_uncoded_error(file, at, "resolve", "`#[macro_use]` is not supported on `extern crate self`".to_string());
+                                self.errors.push(e);
+                            }
+                        }
+                    }
                     if this {
                         self.imports.push(Import { module, global: false, segs: vec![(SegKind::Crate, name)], bind: Some(bind), glob: false, is_pub, done: false, file, pos, ext: true, bound: 0 });
                     } else {
