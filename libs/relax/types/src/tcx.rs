@@ -2546,7 +2546,11 @@ impl Tcx {
             predicate_env.regions = env.regions.with_binder(Some(resolve_bound_vars::BinderId::Trait(path.segs.lo)));
             let env = &predicate_env;
             let regions = self.lower_region_args(cx.infcx, prog, file, module, env, path);
-            let region = self.object_region_with_bounds(cx.infcx, prog, file, outer_env, bounds, td, regions, source_ty);
+            let mut ambiguous = false;
+            let region = self.object_region_with_bounds(cx.infcx, prog, file, outer_env, bounds, td, regions, source_ty, &mut ambiguous);
+            if ambiguous && self.validates(prog, file) {
+                self.err(cx, prog, file, lo, "E0227: ambiguous lifetime bound, explicit lifetime bound required".to_string());
+            }
             self.report_indeterminate_object_default(cx, prog, file, outer_env, region, source_ty, lo);
             let last = f.ast.segs(path.segs).last().unwrap();
             if !matches!(f.ast.gargs(last.args()), Some(GenericArgs::Paren(..))) {
