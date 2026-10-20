@@ -430,6 +430,8 @@ pub struct Fcx<'a> {
     closure_depth: Vec<(u32, usize)>, // (closure expr, scope depth at entry)
     /// checking a const / static initializer or an anonymous constant (no `return` outside a closure)
     in_const: bool,
+    /// `b.locals.len()` where each enclosing inline `const { }` block began: an outer local is no value there (E0435)
+    inline_const_floor: Vec<u32>,
     /// checking an anonymous constant that is a typeck root of its own (array length, const argument)
     in_anon_const: bool,
     /// > 0 inside an async block or async fn body (where `.await` is allowed); a closure
@@ -703,6 +705,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         ret_stack: Vec::new(),
         closure_depth: Vec::new(),
         in_const: false,
+        inline_const_floor: Vec::new(),
         in_anon_const: false,
         async_depth: 0,
         await_count: 0,
@@ -2279,7 +2282,7 @@ impl<'a> Fcx<'a> {
                         } else if simple {
                             // an identifier pattern naming something ambiguous is an error, not a fresh binding
                             if let Some(e) = self.prog.name_ambiguity(self.module, s, false, false) {
-                                self.err(name.lo, self.prog.privacy_message(&e));
+                                if let Some(m) = crate::lint::privacy_diag(self.prog, self.file, name.lo, &e) { self.err(name.lo, m); }
                             }
                         }
                     }
@@ -3045,6 +3048,9 @@ impl<'a> Fcx<'a> {
                 return Res::Err;
             }
             if let Some(d) = prog.lookup_in_scope(self.module, segs[0].1, true) {
+                if self.tcx.validates(prog, self.file) && segs[0].0 == SegKind::Ident && !path.global() && path.no_qself() {
+                    if let Some(e) = prog.name_ambiguity(self.module, segs[0].1, true, false) { if let Some(m) = crate::lint::privacy_diag(prog, self.file, path.lo, &e) { self.err(path.lo, m); } }
+                }
                 if matches!(prog.def(d).kind, DefKind::Struct | DefKind::Union) {
                     return Res::Def(d);
                 }
@@ -3428,8 +3434,12 @@ impl<'a> Fcx<'a> {
         }
         if self.tcx.validates(prog, self.file) && segs.len() == 1 && path.no_qself() && !path.global() && segs[0].0 == SegKind::Ident && !self.scopes.iter().any(|(sy, _)| *sy == segs[0].1) && !self.env.names.contains(&segs[0].1) {
             if let Some(e) = prog.name_ambiguity(self.module, segs[0].1, false, false) {
-                self.err(path.lo, prog.privacy_message(&e));
+                if let Some(m) = crate::lint::privacy_diag(prog, self.file, path.lo, &e) { self.err(path.lo, m); }
             }
+        }
+        {
+            let cx = self.cx.with_infcx(&self.infcx);
+            if self.tcx.prohibit_module_args(&cx, prog, self.file, self.module, path) { return (Res::Err, error); }
         }
         if let Some(q) = self.ast().qself(path) {
             // `<T as Trait>::item`
@@ -3509,6 +3519,14 @@ impl<'a> Fcx<'a> {
             if k == SegKind::SelfValue || k == SegKind::Ident {
                 if !is_pat {
                     if let Some(li) = self.lookup_local(s, self.ast().segs(path.segs)[0].name.lo) {
+                        // prohibit_generic_args: a local variable takes no arguments (E0109)
+                        let seg = &self.ast().segs(path.segs)[0];
+                        let cx = self.cx.with_infcx(&self.infcx);
+                        if self.tcx.prohibit_args_on(&cx, prog, self.file, seg, "local variable", self.text(seg.name)) { return (Res::Err, error); }
+                        if self.inline_const_floor.last().is_some_and(|&f| li < f) && self.tcx.validates(prog, self.file) {
+                            self.err(path.lo, "E0435: attempt to use a non-constant value in a constant".to_string());
+                            return (Res::Err, error);
+                        }
                         self.note_capture(li, key);
                         let t = self.b.locals[li as usize].ty;
                         return (Res::Local(li), t);
@@ -3536,6 +3554,9 @@ impl<'a> Fcx<'a> {
                 // `Self` as a unit/tuple struct ctor
                 if let Some(st) = self.env.self_ty {
                     if let TyKind::Adt(d, args, _) = self.tcx.tys.kind(st).clone() {
+                        let seg = &self.ast().segs(path.segs)[0];
+                        let cx = self.cx.with_infcx(&self.infcx);
+                        if self.tcx.prohibit_args_on(&cx, prog, self.file, seg, "self constructor", "Self") { return (Res::Err, error); }
                         let t = self.value_def_ty(d, Some(self.tcx.tys.list(args).to_vec()), key);
                         return (Res::Def(d), t);
                     }
@@ -3584,7 +3605,7 @@ impl<'a> Fcx<'a> {
         }
         if self.tcx.validates(prog, self.file) && path.no_qself() {
             if let Some(e) = prog.path_privacy(self.module, path.global(), &segs, Some(false), false, false).filter(|_| path.lo < prog.files[self.file as usize].src_len) {
-                self.err(path.lo, prog.privacy_message(&e));
+                if let Some(m) = crate::lint::privacy_diag(prog, self.file, path.lo, &e) { self.err(path.lo, m); }
             }
         }
         // container path (module / enum / trait)
@@ -4832,7 +4853,9 @@ impl<'a> Fcx<'a> {
             }
             ExprKind::Unsafe(b) => self.check_block_soft(*b, expected, soft),
             ExprKind::ConstBlock(b) => {
+                self.inline_const_floor.push(self.b.locals.len() as u32);
                 let t = self.check_block(*b, expected);
+                self.inline_const_floor.pop();
                 self.b.inline_const_types.insert(e.0, t);
                 t
             },
@@ -5101,7 +5124,10 @@ impl<'a> Fcx<'a> {
                         self.coerce_or_unify(t, rt, Some(*v), lo);
                     }
                     None => {
-                        self.eq(rt, unit);
+                        // coerce_forced_unit: `return;` where the return type is not `()`
+                        if !self.eq(rt, unit) && !self.tcx.tys.has_error(rt) {
+                            self.err(lo, "E0069: `return;` in a function whose return type is not `()`".to_string());
+                        }
                     }
                 }
                 self.tcx.tys.never
@@ -5473,6 +5499,10 @@ impl<'a> Fcx<'a> {
                     let fx = fe.expr;
                     match self.field_ty(adt_ty, vi, fname) {
                         Some((fi, ft)) => {
+                            // rustc check_expr_struct_fields: E0062 for a field given twice
+                            if given.contains(&fi) {
+                                self.err(fe.name.lo, format!("E0062: field `{}` specified more than once", self.text(fe.name)));
+                            }
                             given.push(fi);
                             self.check_field_privacy(adt_ty, vi, fi, fe.name.lo);
                             let t = self.check_expr(fx, Some(ft));
@@ -5486,6 +5516,11 @@ impl<'a> Fcx<'a> {
                     }
                 }
                 if let Some(bx) = base {
+                    // check_expr_struct_fields: `..base` is for structs
+                    if self.prog.def(d).kind == DefKind::Variant && self.tcx.validates(self.prog, self.file) {
+                        let pos = self.ast().expr(bx).lo;
+                        self.err(pos, "E0436: functional record update syntax requires a struct".to_string());
+                    }
                     let t = self.check_expr(bx, Some(adt_ty));
                     // expr.rs check_expr_struct_fields: a base of the same ADT with other
                     // generic arguments is the unstable type_changing_struct_update

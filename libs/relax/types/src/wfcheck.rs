@@ -581,7 +581,11 @@ pub mod obligations {
         let item = ast.item(def.item);
         match def.kind {
             DefKind::Struct | DefKind::Enum | DefKind::Union => with_wfcx(prog, tcx, did, |w| { check_type_defn(w, ast, item); check_defaults(w, ast, item); }),
-            DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => with_wfcx(prog, tcx, did, |w| check_fn(w, ast, item)),
+            DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => {
+                let mut errors = with_wfcx(prog, tcx, did, |w| check_fn(w, ast, item));
+                if def.kind != DefKind::ForeignFn { errors.extend(check_opaque_cycles(prog, tcx, did, item.lo)); }
+                errors
+            }
             DefKind::Impl => {
                 let mut errors = check_drop_impl(prog, tcx, did, ast, item);
                 errors.extend(with_wfcx(prog, tcx, did, |w| check_impl(w, ast, item)));
@@ -739,6 +743,44 @@ pub mod obligations {
         if has_body { w.sized(ret, ret_pos); }
     }
 
+    /// E0478 for a trait whose supertraits include `'static` (`trait T: 'static`): the impl's self
+    /// type must outlive `'static`, so each region in it must be `'static` or be bounded by
+    /// `'static` in the impl's where-clauses. Type parameters are not judged here.
+    fn impl_static_supertrait(w: &mut Wfcx<'_, '_>, tr: &crate::next_solver::TraitRef, pos: u32) {
+        let (prog, tcx) = (w.prog, w.tcx);
+        let static_super = tcx.clauses_of(prog, tr.def_id).iter().any(|q| matches!(&q.kind, PredicateKind::Clause(ClauseKind::TypeOutlives(t, r))
+            if matches!(tcx.tys.kind(*t), TyKind::Param(0)) && tcx.tys.region_kind(*r) == crate::types::RegionKind::ReStatic));
+        if !static_super { return; }
+        let Some(GenericArg::Type(self_ty)) = tr.args.first().copied() else { return };
+        fn regions(tcx: &Tcx, t: TyId, out: &mut Vec<crate::types::RegionId>, depth: u32) -> bool {
+            if depth > 16 { return false; }
+            match tcx.tys.kind(t).clone() {
+                TyKind::Ref(_, i, r) => { out.push(r); regions(tcx, i, out, depth + 1) }
+                TyKind::Ptr(_, i) | TyKind::Slice(i) | TyKind::Array(i, _) => regions(tcx, i, out, depth + 1),
+                TyKind::Tuple(l) => tcx.tys.list(l).to_vec().into_iter().all(|x| regions(tcx, x, out, depth + 1)),
+                TyKind::Adt(_, ts, rs) => { out.extend(tcx.tys.region_args(rs).iter().copied()); tcx.tys.list(ts).to_vec().into_iter().all(|x| regions(tcx, x, out, depth + 1)) }
+                TyKind::Param(_) | TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Float(_) | TyKind::Str | TyKind::Never => true,
+                _ => false,
+            }
+        }
+        let mut rs = Vec::new();
+        if !regions(tcx, self_ty, &mut rs, 0) { return; }
+        let mut bounded: Vec<crate::types::RegionId> = Vec::new();
+        for q in tcx.clauses_of(prog, w.def) {
+            match &q.kind {
+                PredicateKind::Clause(ClauseKind::RegionOutlives(a, b)) if tcx.tys.region_kind(*b) == crate::types::RegionKind::ReStatic => bounded.push(*a),
+                PredicateKind::Clause(ClauseKind::RegionOutlives(..)) | PredicateKind::Clause(ClauseKind::TypeOutlives(..)) => return,
+                _ => {}
+            }
+        }
+        for r in rs {
+            let k = tcx.tys.region_kind(r);
+            if !matches!(k, crate::types::RegionKind::ReEarlyParam(_)) || bounded.contains(&r) { continue; }
+            w.extra.push(prog.record_error(prog.def(w.def).file, pos, "typeck", "E0478: lifetime bound not satisfied".to_string()));
+            return;
+        }
+    }
+
     fn check_impl(w: &mut Wfcx<'_, '_>, ast: &ast::Ast, item: &ast::Item) {
         let imp = ast.as_impl(&item.kind).unwrap();
         if imp.negative { return; }
@@ -748,6 +790,7 @@ pub mod obligations {
             let trait_ref = w.tcx.impl_trait_ref(w.prog, w.def, &args);
             if trait_ref.args.iter().any(|a| matches!(*a, GenericArg::Type(t) if w.tcx.tys.has_error(t))) { return; }
             let self_pos = ty_pos(ast, imp.self_ty).unwrap_or(item.lo);
+            impl_static_supertrait(w, &trait_ref, self_pos);
             // wf.rs trait_obligations: the trait's own predicates at the impl's arguments, and each
             // argument well formed
             let p = collect::trait_predicate(trait_ref.def_id, trait_ref.args.clone());
@@ -861,7 +904,7 @@ pub mod obligations {
         let tr = tcx.impl_trait_ref(prog, parent, &args);
         let mut known: Vec<(crate::types::RegionId, crate::types::RegionId)> = Vec::new();
         for a in tr.args.iter() {
-            if let GenericArg::Type(t) = a { if wf_region_pairs(tcx, *t, &mut known, 0).is_none() { return; } }
+            if let GenericArg::Type(t) = a { let t = w.normalize(*t); if wf_region_pairs(tcx, t, &mut known, 0).is_none() { return; } }
         }
         for q in tcx.clauses_of(prog, w.def) {
             if let PredicateKind::Clause(ClauseKind::RegionOutlives(a, b)) = &q.kind { known.push((*a, *b)); }
@@ -948,12 +991,120 @@ pub mod obligations {
         let def = prog.def(imp);
         match tcx.tys.kind(self_ty) {
             TyKind::Error => Vec::new(),
-            TyKind::Adt(d, _, _) if prog.def(*d).krate == def.krate => Vec::new(),
+            TyKind::Adt(d, args, regions) if prog.def(*d).krate == def.krate => always_applicable(prog, tcx, imp, item, def.file, *d, *args, *regions),
             _ => {
                 let pos = ast.as_impl(&item.kind).and_then(|i| ty_pos(ast, i.self_ty)).unwrap_or(item.lo);
                 vec![prog.record_error(def.file, pos, "typeck", "E0120: the `Drop` trait may only be implemented for local structs, enums, and unions".to_string())]
             }
         }
+    }
+
+    /// rustc_hir_analysis/src/check/always_applicable.rs check_drop_impl: the generic arguments of the
+    /// impl's self type are the impl's own distinct parameters (E0366), and every predicate of the impl
+    /// holds in the environment of the type's definition (E0367).
+    fn always_applicable(prog: &Program, tcx: &Tcx, imp: DefId, item: &ast::Item, file: u32, adt: DefId, args: crate::types::TyList, regions: crate::types::RegionArgsId) -> Vec<String> {
+        use crate::types::RegionKind;
+        let tys = &tcx.tys;
+        // uses_unique_generic_params(adt_to_impl_args, CheckRegions::OnlyParam)
+        let mut seen_tys = Vec::new();
+        let mut unique = true;
+        for &a in tys.list(args) {
+            let ok = match tys.kind(a) {
+                TyKind::Param(..) => true,
+                TyKind::Const(c) => matches!(tys.const_kind(*c), crate::consts::ConstKind::Param(..)),
+                _ => false,
+            };
+            if !ok || seen_tys.contains(&a) { unique = false; }
+            seen_tys.push(a);
+        }
+        let mut seen_regions = Vec::new();
+        for &r in tys.region_args(regions).iter() {
+            if !matches!(tys.region_kind(r), RegionKind::ReEarlyParam(_)) || seen_regions.contains(&r) { unique = false; }
+            seen_regions.push(r);
+        }
+        let trait_name = "Drop";
+        if !unique {
+            return vec![prog.record_error(file, item.lo, "typeck", format!("E0366: `{}` impls cannot be specialized", trait_name))];
+        }
+        if tys.list(args).iter().any(|&t| tys.has_error(t)) { return Vec::new(); }
+        // the predicates of the type, at the impl's arguments
+        let adt_args = tcx.complete_args(prog, adt, tys.list(args), regions);
+        let adt_env = tcx.param_env_id(prog, adt);
+        let clauses: Vec<_> = tcx.param_env_by_id(adt_env).clauses.iter().map(|p| tcx.instantiate_predicate(prog, adt, &adt_args, p)).collect();
+        let env = tcx.intern_param_env(crate::next_solver::ParamEnv { clauses: clauses.into() });
+        let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), imp);
+        let mut ocx = ObligationCtxt::new(&infcx, prog);
+        // the impl's parameters are inference variables, bound by equating its self type with the
+        // type at the impl's own arguments
+        let fresh = infcx.fresh_args_for_item(prog, imp);
+        let fresh_self = tcx.instantiate_ty(prog, imp, &fresh, tcx.impl_self[&imp]);
+        let mut goals = match infcx.at(prog, env.clone()).eq(tcx.impl_self[&imp], fresh_self) {
+            Ok(goals) => goals,
+            Err(_) => return Vec::new(),
+        };
+        for p in tcx.own_clauses_of(prog, imp) {
+            let p = &tcx.instantiate_predicate(prog, imp, &fresh, p);
+            let predicate = ocx.normalize_predicate(&env, p);
+            goals.push(Goal { param_env: env.clone(), predicate });
+        }
+        ocx.register_obligations(goals);
+        let errors = ocx.engine.evaluate_obligations_error_on_ambiguity(&infcx, prog);
+        let msg = |what: String| format!("E0367: `{}` impl requires `{}` but the {} it is implemented for does not", trait_name, what, match prog.def(adt).kind { DefKind::Enum => "enum", DefKind::Union => "union", _ => "struct" });
+        if !errors.is_empty() {
+            return vec![prog.record_error(file, item.lo, "typeck", msg("a predicate".to_string()))];
+        }
+        if !infcx.resolve_regions(prog, env, &[]).is_empty() {
+            return vec![prog.record_error(file, item.lo, "typeck", msg("an outlives bound".to_string()))];
+        }
+        Vec::new()
+    }
+
+    /// rustc_hir_analysis/src/check/check.rs check_opaque_for_cycles + rustc_middle/src/ty/util.rs
+    /// OpaqueTypeExpander: expanding the hidden type of an opaque the fn defines must not reach the
+    /// opaque again (E0720).
+    fn check_opaque_cycles(prog: &Program, tcx: &Tcx, owner: DefId, pos: u32) -> Vec<String> {
+        use crate::types::fold::{TypeFolder, super_fold_ty};
+        use crate::types::{AliasTyKind, Types};
+        struct Expander<'a> { prog: &'a Program, tcx: &'a Tcx, seen: Vec<DefId>, primary: DefId, found_recursion: bool, found_any: bool }
+        impl TypeFolder for Expander<'_> {
+            fn fold_ty(&mut self, tys: &Types, t: TyId, depth: u32) -> TyId {
+                if self.found_any { return t; }
+                if let TyKind::Alias(_, a) = tys.kind(t) {
+                    if let AliasTyKind::Opaque { def_id } = a.kind {
+                        if self.seen.contains(&def_id) {
+                            self.found_any = true;
+                            self.found_recursion = def_id == self.primary;
+                            return t;
+                        }
+                        let Ok(hidden) = self.tcx.type_of(self.prog, def_id) else { return t };
+                        let mut targs = Vec::new();
+                        for &x in tys.list(a.args) { targs.push(self.fold_ty(tys, x, depth)); }
+                        if self.found_any { return t; }
+                        let args = self.tcx.complete_args(self.prog, def_id, &targs, a.regions);
+                        let concrete = self.tcx.instantiate_ty(self.prog, def_id, &args, hidden);
+                        self.seen.push(def_id);
+                        let expanded = self.fold_ty(tys, concrete, 0);
+                        self.seen.pop();
+                        return expanded;
+                    }
+                }
+                if !tys.flags(t).contains(crate::types::TypeFlags::HAS_TY_OPAQUE) { return t; }
+                super_fold_ty(tys, t, self, depth)
+            }
+        }
+        let id = tcx.opaque_types_defined_by(prog, owner);
+        let mut errors = Vec::new();
+        for &o in tcx.defining_opaques(id) {
+            if tcx.typeck(prog, owner).errors.len() > 0 { break; }
+            let indices = tcx.generic_indices_of(prog, o);
+            let tys = &tcx.tys;
+            let regions = tys.intern_region_args(&vec![crate::types::RegionId::ERASED; indices.lifetimes.len()]);
+            let opaque = tys.intern(TyKind::Alias(crate::consts::IsRigid::No, crate::types::AliasTy { kind: AliasTyKind::Opaque { def_id: o }, args: tys.mk_list(&indices.identity_types_consts(tys)), regions }));
+            let mut e = Expander { prog, tcx, seen: Vec::new(), primary: o, found_recursion: false, found_any: false };
+            e.fold_ty(tys, opaque, 0);
+            if e.found_recursion { errors.push(prog.record_error(prog.def(owner).file, pos, "typeck", "E0720: cannot resolve opaque type".to_string())); }
+        }
+        errors
     }
 
     /// Whether every ADT / fn item / alias in `ty` carries as many arguments as its definition has
