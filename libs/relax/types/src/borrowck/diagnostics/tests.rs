@@ -91,7 +91,7 @@ fn regions_of(b: &Body, r: &Regions) -> crate::borrowck::mir_nll::MirRegionResul
     universal.extend((1..nfree).map(|i| (i, Class::Local)));
     let mut outlives = OutlivesConstraintSet::default();
     for c in &r.constraints { outlives.push(*c); }
-    let input = RegionInput { polonius: Default::default(), tainted_by_errors: false,
+    let input = RegionInput { universe_causes: vec![], polonius: Default::default(), tainted_by_errors: false,
         relations: UniversalRegionRelations::create(UniversalRegions::new(0, None, universal), definitions.len(), &[]),
         definitions, outlives, liveness, type_tests: vec![] };
     let prog = Program::new(&std::sync::Arc::new(crate::Session::default()));

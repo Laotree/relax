@@ -50,8 +50,20 @@ struct Prepared<'a> {
 fn closures_inner_first(prog: &Program, tcx: &Tcx, body: &typeck::Body) -> Vec<u32> {
     let ast = &prog.files[body.file as usize].ast;
     let mut closures: Vec<u32> = closure_children(prog, tcx, body).into_iter().filter_map(|c| match c.kind { OwnerKind::Closure(e) => Some(e.0), _ => None }).collect();
-    closures.sort_by_key(|&c| { let e = ast.expr(crate::ast::ExprId(c)); (e.hi - e.lo, c) });
+    closures.sort_by_key(|&c| { let (lo, hi) = closure_extent(ast, c); (hi - lo, c) });
     closures
+}
+
+/// The source extent of a closure-like child: a closure or async block's expression, or the body
+/// block of an async fn (`ASYNC_FN_BODY | block`).
+fn closure_extent(ast: &crate::ast::Ast, c: u32) -> (u32, u32) {
+    if c & crate::tcx::ASYNC_FN_BODY != 0 {
+        let b = ast.block(crate::ast::BlockId(c & !crate::tcx::ASYNC_FN_BODY));
+        (b.lo, b.hi)
+    } else {
+        let e = ast.expr(crate::ast::ExprId(c));
+        (e.lo, e.hi)
+    }
 }
 
 /// The closures a body (and its promoted bodies) creates.

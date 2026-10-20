@@ -5,6 +5,10 @@ use crate::tcx::{EvalCx, EvalState, Tcx, TypingEnv};
 
 /// Error codes (or messages) and unchecked reasons of every fn of `source`.
 pub(super) fn borrowck_source(source: &str) -> (Vec<String>, Vec<String>) {
+    borrowck_source_in(source, std::env::var("PROBE_EDITION").ok().and_then(|e| e.parse().ok()).unwrap_or(2021))
+}
+
+pub(super) fn borrowck_source_in(source: &str, edition: u16) -> (Vec<String>, Vec<String>) {
     crate::borrowck::event::FORCE_USER_TYPES.with(|f| f.set(Some(true)));
     let sess = &std::sync::Arc::new(crate::Session::default());
     let mut prog = Program::new(sess);
@@ -20,7 +24,7 @@ pub(super) fn borrowck_source(source: &str) -> (Vec<String>, Vec<String>) {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("lib.rs");
     std::fs::write(&path, source).unwrap();
-    let user = prog.load_crate("repro", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(sess, &[]), vec![(core, 0), (alloc_name, alloc), (std_name, std)]).unwrap();
+    let user = prog.load_crate("repro", path.to_str().unwrap(), edition, crate::cfg::CfgSet::host(sess, &[]), vec![(core, 0), (alloc_name, alloc), (std_name, std)]).unwrap();
     std::fs::remove_file(&path).unwrap(); std::fs::remove_dir(&dir).unwrap();
     prog.prelude_crate = Some(0);
     prog.resolve_imports();
@@ -365,4 +369,145 @@ fn closures_in_a_promoted_constant_use_the_parents_user_type_annotations() {
         pub fn f<'a, T: 'a>(x: &'a T) -> usize { let g = |y: &'a T| -> usize { let _z: &'a T = y; 1 }; g(x) }");
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn lifetimes_written_on_a_constructor_pattern_path_are_a_user_type_annotation() {
+    for (decl, pat) in [
+        ("struct Foo<'a>(&'a u32);", "Foo::<'static>(_z)"),
+        ("struct Foo<'a> { field: &'a u32 }", "Foo::<'static> { field: _z }"),
+        ("enum Foo<'a> { Bar(&'a u32) }", "Foo::Bar::<'static>(_z)"),
+        ("enum Foo<'a> { Bar(&'a u32) }", "Foo::<'static>::Bar(_z)"),
+        ("enum Foo<'a> { Bar { field: &'a u32 } }", "Foo::Bar::<'static> { field: _z }"),
+    ] {
+        let make = if decl.contains("field") { if decl.contains("enum") { "Foo::Bar { field: &y }" } else { "Foo { field: &y }" } }
+            else if decl.contains("enum") { "Foo::Bar(&y)" } else { "Foo(&y)" };
+        let (errors, unchecked) = borrowck_source(&format!("{decl} pub fn f() {{ let y = 22; let foo = {make}; let {pat} = foo; }}"));
+        assert!(unchecked.is_empty(), "{pat}: {unchecked:?}");
+        assert!(errors.len() == 1 && errors[0].starts_with("E0597"), "{pat}: {errors:?}");
+    }
+}
+
+#[test]
+fn lifetimes_written_on_the_self_type_of_an_inherent_path_are_kept() {
+    let (errors, unchecked) = borrowck_source("
+        pub struct A<'a> { x: &'a u32 }
+        impl<'a> A<'a> { fn new<'b, T>(x: &'a u32, _y: T) -> Self { Self { x } } }
+        pub fn foo<'a>() { let v = 22; let _x = A::<'a>::new(&v, 22); }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0597"), "{errors:?}");
+}
+
+#[test]
+fn lifetimes_written_on_the_trait_of_a_qualified_path_are_kept() {
+    let (errors, unchecked) = borrowck_source("
+        pub trait Foo<'a> { const C: &'a u32; }
+        impl<'a, T> Foo<'a> for T { const C: &'a u32 = &22; }
+        pub fn foo<'a>(_: &'a u32) -> &'static u32 { <() as Foo<'a>>::C }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].contains("lifetime may not live long enough"), "{errors:?}");
+}
+
+#[test]
+fn a_promoted_fn_item_keeps_its_turbofish_annotation() {
+    let (errors, unchecked) = borrowck_source("
+        pub fn foo<'a>() { let x = 0; let f = &drop::<&'a i32>; f(&x); }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0597"), "{errors:?}");
+}
+
+#[test]
+fn a_tuple_constructor_item_is_invariant_in_its_arguments() {
+    let (errors, unchecked) = borrowck_source("
+        pub struct S<T>(T);
+        pub fn bad() { let c = 66; let f = S::<&'static u32>; f(&c); }
+        pub fn ok() { let c = 66; let f = S::<&u32>; f(&c); }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0597"), "{errors:?}");
+}
+
+#[test]
+fn an_opaque_with_a_static_bound_keeps_the_regions_it_captures_dead() {
+    let (errors, unchecked) = borrowck_source("
+        pub trait Captures<'a> {}
+        impl<T> Captures<'_> for T {}
+        pub fn foo(x: &mut i32) -> impl Sized + Captures<'_> + 'static {}
+        pub fn overlapping_mut() { let i = &mut 1; let _x = foo(i); let _y = foo(i); }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn an_opaque_outliving_every_lifetime_captures_no_live_region() {
+    let (errors, unchecked) = borrowck_source("
+        pub trait Captures<'a> {}
+        impl<T> Captures<'_> for T {}
+        pub trait Outlives<'a>: 'a {}
+        impl<'a, T: 'a> Outlives<'a> for T {}
+        pub fn test<'o>(v: &'o Vec<i32>) -> impl Captures<'o> + for<'a> Outlives<'a> {}
+        pub fn opaque_doesnt_use_temporary() { let _a = test(&vec![]); }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn an_async_fn_body_is_ordered_among_its_closures_by_its_block() {
+    // (the coroutine body itself is not yet qualified: the check stops, it does not panic)
+    let (errors, _unchecked) = borrowck_source("
+        pub async fn f(v: Vec<String>) -> usize { v.into_iter().map(|s| s.len()).sum() }");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_type_test_in_a_closure_is_promoted_to_the_lowest_universal_region_of_its_class() {
+    let (errors, unchecked) = borrowck_source("
+        use std::any::Any;
+        type B = Box<dyn for<'a> Fn(&(dyn Any + 'a)) -> Box<dyn Any + 'a>>;
+        pub fn foo<E>() -> B { Box::new(|e| Box::new(e.is::<E>())) }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0310"), "{errors:?}");
+}
+
+#[test]
+fn the_anonymous_lifetimes_of_a_bare_fn_trait_object_are_late_bound() {
+    let (errors, unchecked) = borrowck_source_in("
+        use std::fmt;
+        pub fn new_format<F>(_f: F) where F: FnMut(i32, &mut FnMut(&fmt::Display) -> fmt::Result) -> fmt::Result {}
+        pub fn main() { new_format(|i, f| f(&format_args!(\"0x{:x}\", i))); }", 2015);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_closure_returning_a_captured_reference_requires_the_capture_to_outlive_the_signature() {
+    let (errors, unchecked) = borrowck_source("
+        pub fn foo(_: impl FnOnce(&u32) -> &u32) {}
+        pub fn bar() { let x = 22; foo(|_a| &x) }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0597"), "{errors:?}");
+}
+
+#[test]
+fn a_nested_closure_returning_a_captured_reference_keeps_the_borrow_alive() {
+    let (errors, unchecked) = borrowck_source("
+        pub fn main() {
+            let mut greeting = String::new();
+            let res = (|| (|| &greeting)())();
+            greeting = String::new();
+            drop(greeting);
+            drop(res);
+        }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0506"), "{errors:?}");
+}
+
+#[test]
+fn a_higher_ranked_mismatch_is_e0308_one_type_is_more_general() {
+    let (errors, unchecked) = borrowck_source("
+        pub struct Inv<T>(*mut T);
+        pub type A = for<'a, 'b> fn(Inv<&'a &'b ()>, Inv<&'b &'a ()>, Inv<&'a ()>);
+        pub type B = for<'a, 'b> fn(Inv<&'a &'b ()>, Inv<&'b &'a ()>, Inv<&'b ()>);
+        pub fn f(x: A) { let _y: B = x; }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(!errors.is_empty() && errors.iter().all(|e| e.starts_with("E0308 mismatched types")), "{errors:?}");
 }

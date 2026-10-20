@@ -152,7 +152,7 @@ fn regions(b: &Body, f: &Fx, scopes: &[Vec<Location>]) -> crate::borrowck::mir_n
     let mut liveness = LivenessValues::new(definitions.len(), map.num_points());
     liveness.add_all_points(0);
     for (r, points) in scopes.iter().enumerate() { for &l in points { liveness.add_point(r + 1, map.point(l)); } }
-    let input = RegionInput { polonius: Default::default(), tainted_by_errors: false,
+    let input = RegionInput { universe_causes: vec![], polonius: Default::default(), tainted_by_errors: false,
         relations: UniversalRegionRelations::create(UniversalRegions::new(0, None, vec![(0, Class::Global)]), definitions.len(), &[]),
         definitions, outlives: OutlivesConstraintSet::default(), liveness, type_tests: vec![] };
     compute_regions(&f.tcx, &f.prog, b, input, false)

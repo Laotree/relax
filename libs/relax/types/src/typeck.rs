@@ -486,6 +486,8 @@ pub struct Fcx<'a> {
     known_method_args: Option<Vec<crate::consts::GenericArg>>,
     /// The written lifetime arguments of the value path being resolved.
     value_path_lifetimes: Vec<crate::types::RegionId>,
+    /// The lifetimes written on the segment before the last (`Enum::<'a>::Variant`).
+    value_path_enum_lifetimes: Vec<crate::types::RegionId>,
     /// The impl's lifetime args of an inherent associated value path (confirm.rs
     /// fresh_receiver_args): the item's FnDef carries them, not fresh ones.
     value_path_parent_regions: Vec<crate::types::RegionId>,
@@ -734,6 +736,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         last_lo: 0,
         known_method_args: None,
         value_path_lifetimes: Vec::new(),
+        value_path_enum_lifetimes: Vec::new(),
         value_path_parent_regions: Vec::new(),
         deferred_repeats: Vec::new(),
         forced_autoref: None,
@@ -2753,10 +2756,35 @@ impl<'a> Fcx<'a> {
         }
     }
 
+    /// The lifetime arguments written on segment `i` of `path`.
+    fn seg_lifetimes(&mut self, path: &Path, i: usize) -> Vec<crate::types::RegionId> {
+        let mut out = Vec::new();
+        let Some(GenericArgs::Angle(v)) = self.ast().segs(path.segs).get(i).and_then(|s| self.ast().gargs(s.args())) else { return out };
+        for a in self.ast().list(*v) {
+            if let GenericArg::Lifetime(lt) = a {
+                out.push(self.env.regions.resolve(Some(&self.infcx), &self.tcx.tys, self.prog, self.file, Some(*lt)));
+            }
+        }
+        out
+    }
+
+    /// hir_ty_lowering/generics.rs: the lifetimes written on a struct path (`S::<'a>`) or on a
+    /// variant path (`E::V::<'a>`, `E::<'a>::V`) instantiate the ADT's lifetime parameters, in
+    /// place of the fresh ones; a wrong count is E0107 (item checks) and leaves them fresh.
+    fn written_adt_regions(&mut self, path: &Path, variant: bool, fresh: crate::types::RegionArgsId) -> crate::types::RegionArgsId {
+        let n = path.segs.len();
+        let mut written = self.seg_lifetimes(path, n.wrapping_sub(1));
+        if written.is_empty() && variant { written = self.seg_lifetimes(path, n.wrapping_sub(2)); }
+        if written.is_empty() || written.len() != self.tcx.tys.region_args(fresh).len() { return fresh; }
+        self.tcx.tys.intern_region_args(&written)
+    }
+
     /// `Enum::<A>::Variant { .. }` / `Enum::Variant::<A> { .. }`: the enum's generic arguments written
     /// on the enum segment or on the variant segment (rustc: the variant path's generic args).
     fn variant_path_ty(&mut self, path: &Path, variant: DefId, fresh_adt: TyId) -> TyId {
         let TyKind::Adt(d, fa, regions) = self.tcx.tys.kind(fresh_adt).clone() else { return fresh_adt };
+        let regions = self.written_adt_regions(path, true, regions);
+        let fresh_adt = self.tcx.tys.intern(TyKind::Adt(d, fa, regions));
         let n = path.segs.len();
         // `Alias::<A>::Variant { .. }`: the type alias instantiated with its written (else fresh)
         // arguments is the enum type (rustc resolves the alias path as a type)
@@ -2824,12 +2852,13 @@ impl<'a> Fcx<'a> {
             }
         }
         if let TyKind::Adt(d, fa, regions) = self.tcx.tys.kind(fresh_adt).clone() {
-            let Some(a) = self.explicit_args(path, d, 0) else { return fresh_adt; };
-            if !a.is_empty() && a.len() <= self.tcx.tys.list(fa).len() {
-                let mut args = a;
-                args.extend_from_slice(&self.tcx.tys.list(fa)[args.len()..]);
-                return self.tcx.tys.intern(TyKind::Adt(d, self.tcx.tys.mk_list(&args), regions));
-            }
+            let regions = self.written_adt_regions(path, false, regions);
+            let written = self.explicit_args(path, d, 0).filter(|a| !a.is_empty() && a.len() <= self.tcx.tys.list(fa).len());
+            let args = match written {
+                Some(mut args) => { args.extend_from_slice(&self.tcx.tys.list(fa)[args.len()..]); self.tcx.tys.mk_list(&args) }
+                None => fa,
+            };
+            return self.tcx.tys.intern(TyKind::Adt(d, args, regions));
         }
         fresh_adt
     }
@@ -3156,7 +3185,8 @@ impl<'a> Fcx<'a> {
                         // (`<T as Tr>::C` proves `T: Tr`)
                         if def.kind == DefKind::AssocConst {
                             let indices = self.tcx.generic_indices_of(self.prog, d);
-                            let regions: Vec<_> = indices.lifetimes.iter().map(|_| self.fresh_region()).collect();
+                            // the parent's regions: the written trait lifetimes, or the impl's (inherent)
+                            let regions: Vec<_> = indices.lifetimes.iter().enumerate().map(|(i, _)| parent_regions.get(i).copied().unwrap_or_else(|| self.fresh_region())).collect();
                             let regions = self.tcx.tys.intern_region_args(&regions);
                             let full = self.tcx.complete_args(self.prog, d, &v, regions);
                             self.write_user_type_annotation_from_args(key, d, &full, user_self_ty);
@@ -3180,6 +3210,11 @@ impl<'a> Fcx<'a> {
                 let mut args = Vec::new();
                 let mut regions = Vec::new();
                 for _ in &adt.generic_indices.lifetimes { regions.push(self.fresh_region()); }
+                // the lifetimes written on the constructor path (`S::<'a>(..)`, `E::V::<'a>(..)`,
+                // `E::<'a>::V(..)`) instantiate the ADT's
+                let written = if !self.value_path_lifetimes.is_empty() { self.value_path_lifetimes.clone() }
+                    else if self.prog.def(d).kind == DefKind::Variant { self.value_path_enum_lifetimes.clone() } else { Vec::new() };
+                if written.len() == regions.len() { regions = written; }
                 let regions = self.tcx.tys.intern_region_args(&regions);
                 match explicit {
                     Some(v) => {
@@ -3382,15 +3417,8 @@ impl<'a> Fcx<'a> {
         let prog = self.prog;
         // hir_ty_lowering/generics.rs lower_generic_args: the item's own written
         // lifetime arguments (last segment).
-        self.value_path_lifetimes.clear();
-        if let Some(GenericArgs::Angle(v)) = self.ast().segs(path.segs).last().and_then(|s| self.ast().gargs(s.args())) {
-            for a in self.ast().list(*v) {
-                if let GenericArg::Lifetime(lt) = a {
-                    let r = self.env.regions.resolve(Some(&self.infcx), &self.tcx.tys, prog, self.file, Some(*lt));
-                    self.value_path_lifetimes.push(r);
-                }
-            }
-        }
+        self.value_path_lifetimes = self.seg_lifetimes(path, path.segs.len().wrapping_sub(1));
+        self.value_path_enum_lifetimes = self.seg_lifetimes(path, path.segs.len().wrapping_sub(2));
         let segs = crate::program::path_segs(prog, self.file, path);
         let error = self.tcx.tys.error;
         if self.tcx.validates(prog, self.file) && segs.len() == 1 && path.no_qself() && !path.global() && segs[0].0 == SegKind::Ident && !self.scopes.iter().any(|(sy, _)| *sy == segs[0].1) && !self.env.names.contains(&segs[0].1) {
@@ -3466,6 +3494,9 @@ impl<'a> Fcx<'a> {
             for i in 0..own as usize {
                 args.push(if i < given.len() { given[i] } else { self.fresh_arg(item, args.len()) });
             }
+            // `<T as Trait<'a>>::item`: the trait's written lifetimes are the item's parent regions
+            let trait_regions = self.tcx.lower_region_args(Some(&self.infcx), prog, self.file, self.module, &env, tp);
+            self.value_path_parent_regions = self.tcx.tys.region_args(trait_regions).to_vec();
             let t = self.value_def_ty(item, Some(args), key);
             return (Res::Def(item), t);
         }
@@ -4389,6 +4420,9 @@ impl<'a> Fcx<'a> {
                 }
                 let mut regions = Vec::new();
                 for _ in &self.tcx.generic_indices_of(prog, d).lifetimes { regions.push(self.fresh_region()); }
+                // the lifetimes written on the prefix segment (`A::<'a>::new`)
+                let written = self.seg_lifetimes(path, n - 1);
+                if written.len() == regions.len() { regions = written; }
                 Some(self.tcx.tys.intern(TyKind::Adt(d, self.tcx.tys.mk_list(&a), self.tcx.tys.intern_region_args(&regions))))
             }
             DefKind::TypeAlias => {

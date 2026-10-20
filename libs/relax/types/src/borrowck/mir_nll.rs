@@ -62,6 +62,8 @@ pub struct RegionInput {
     pub relations: UniversalRegionRelations,
     pub liveness: LivenessValues,
     pub type_tests: Vec<TypeTest>,
+    /// Why each universe was created (diagnostics of placeholder errors).
+    pub universe_causes: Vec<(UniverseIndex, super::type_check::UniverseInfo)>,
 }
 pub struct MirRegionResult {
     pub polonius: super::polonius::PoloniusContext,
@@ -70,6 +72,7 @@ pub struct MirRegionResult {
     pub regioncx: RegionInferenceContext,
     pub locations: LocationMap,
     pub type_tests: Vec<TypeTest>,
+    pub universe_causes: Vec<(UniverseIndex, super::type_check::UniverseInfo)>,
 }
 impl RegionScope for MirRegionResult {
     fn is_loan_live_at(&self, loan: usize, at: Location) -> Option<bool> {
@@ -85,7 +88,7 @@ pub fn compute_regions(tcx: &Tcx, prog: &Program, body: &Body, input: RegionInpu
         input.definitions, input.outlives, input.relations.universal_regions.fr_static);
     let regioncx = RegionInferenceContext::solve(tcx, prog, lowered, input.relations, input.liveness,
         locations.num_points(), &input.type_tests, nested);
-    MirRegionResult { polonius: input.polonius, nested, tainted_by_errors: input.tainted_by_errors, regioncx, locations, type_tests: input.type_tests }
+    MirRegionResult { polonius: input.polonius, nested, tainted_by_errors: input.tainted_by_errors, regioncx, locations, type_tests: input.type_tests, universe_causes: input.universe_causes }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -150,6 +153,8 @@ pub struct MirTypeck {
     pub universals: UniversalRegions,
     /// Relations known to hold between universals, as variables.
     pub known: Vec<(RegionVid, RegionVid)>,
+    /// `known[..n_explicit_known]` are the param-env's outlives clauses.
+    pub n_explicit_known: usize,
     pub constraints: MirTypeckRegionConstraints,
     pub polonius: PoloniusContext,
     pub tainted_by_errors: bool,
@@ -162,7 +167,7 @@ impl MirTypeck {
     /// The inputs of region inference: the definitions of every variable that exists now.
     pub fn region_input(&self, infcx: &dyn RegionDriverOps) -> RegionInput { self.clone_for_regions().into_region_input(infcx) }
     fn clone_for_regions(&self) -> MirTypeck {
-        MirTypeck { universals: self.universals.clone(), known: self.known.clone(), constraints: self.constraints.clone(),
+        MirTypeck { universals: self.universals.clone(), known: self.known.clone(), n_explicit_known: self.n_explicit_known, constraints: self.constraints.clone(),
             polonius: self.polonius.clone(), tainted_by_errors: self.tainted_by_errors,
             summary: MirTypeckSummary { errors: vec![], mir_bugs: vec![], dropck_overflows: vec![], deferred_closure_requirements: vec![] },
             closure_slots: vec![] }
@@ -181,14 +186,14 @@ impl MirTypeck {
     }
     /// The relations known between the universal regions, for `num_regions` variables.
     pub fn relations(&self, num_regions: usize) -> super::type_check::free_region_relations::UniversalRegionRelations {
-        super::type_check::free_region_relations::UniversalRegionRelations::create(self.universals.clone(), num_regions, &self.known)
+        super::type_check::free_region_relations::UniversalRegionRelations::create_with(self.universals.clone(), num_regions, &self.known, self.n_explicit_known)
     }
     pub fn into_region_input(self, infcx: &dyn RegionDriverOps) -> RegionInput {
         let definitions = self.definitions(infcx);
         let relations = self.relations(definitions.len());
-        let MirTypeckRegionConstraints { outlives_constraints, liveness_constraints, type_tests, .. } = self.constraints;
+        let MirTypeckRegionConstraints { outlives_constraints, liveness_constraints, type_tests, universe_causes, .. } = self.constraints;
         RegionInput { polonius: self.polonius, tainted_by_errors: self.tainted_by_errors, definitions, outlives: outlives_constraints,
-            relations, liveness: liveness_constraints, type_tests }
+            relations, liveness: liveness_constraints, type_tests, universe_causes }
     }
 }
 
@@ -249,9 +254,12 @@ pub fn type_check_body(tcx: &Tcx, prog: &Program, infcx: &mut dyn RegionDriverOp
     let universal_yield_resume = body.coroutine.as_ref().map(|c| (
         map_to_vids(tcx, &universals, infcx, &mut fresh, c.yield_ty), map_to_vids(tcx, &universals, infcx, &mut fresh, c.resume_ty)));
     // Relations known to hold between universals: implied bounds and where clauses.
-    let known: Vec<(RegionVid, RegionVid)> = implied.outlives.iter().filter_map(|&(a, b)| {
+    let mut n_explicit_known = 0;
+    let known: Vec<(RegionVid, RegionVid)> = implied.outlives.iter().enumerate().filter_map(|(i, &(a, b))| {
         let vid = |r| universals.indices.iter().find(|(o, _)| *o == r).map(|x| x.1);
-        Some((vid(a)?, vid(b)?))
+        let pair = (vid(a)?, vid(b)?);
+        if i < implied.explicit_outlives { n_explicit_known += 1; }
+        Some(pair)
     }).collect();
     let closure_slots = if matches!(body.source.kind, BodyKind::Closure(_)) { body.local_decls.get(1).map_or(vec![], |env| {
         let env = match tcx.tys.kind(env.ty) { TyKind::Ref(_, t, _) => *t, _ => env.ty };
@@ -264,7 +272,7 @@ pub fn type_check_body(tcx: &Tcx, prog: &Program, infcx: &mut dyn RegionDriverOp
         normalized_inputs_and_output: &normalized_inputs_and_output, universal_yield_resume,
         universals: &universals, moves: input.moves, has_loans: input.has_loans, constraints });
     let MirTypeckResults { constraints, polonius, tainted_by_errors, errors, mir_bugs, dropck_overflows, deferred_closure_requirements } = results;
-    MirTypeck { universals, known, constraints, polonius, tainted_by_errors,
+    MirTypeck { universals, known, n_explicit_known, constraints, polonius, tainted_by_errors,
         summary: MirTypeckSummary { errors, mir_bugs, dropck_overflows, deferred_closure_requirements }, closure_slots }
 }
 

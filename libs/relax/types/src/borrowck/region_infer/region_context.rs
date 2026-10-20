@@ -131,13 +131,20 @@ impl RegionInferenceContext {
         let Some(subject) = self.try_promote_type_test_subject(tcx,test.generic_kind) else { return false; };
         let scc = self.constraint_sccs.scc(test.lower_bound);
         let universal_regions = &self.universal_region_relations.universal_regions;
-        let bounds = if self.scc_values.elements_contained_in(scc).any(|e| matches!(e,RegionElement::PlaceholderRegion(_))) {
-            vec![universal_regions.fr_static]
-        } else {
-            self.scc_values.universal_regions_outlived_by(scc)
-                .flat_map(|ur| self.universal_region_relations.non_local_upper_bounds(ur)).collect()
-        };
-        assert!(!bounds.is_empty(),"promotable type test without a universal lower bound");
+        // A placeholder from a higher universe in the lower bound requires `'static`.
+        if self.scc_values.elements_contained_in(scc).any(|e| matches!(e,RegionElement::PlaceholderRegion(_))) {
+            self.propagated_type_requirements.push(super::ClosureTypeRequirement { subject, outlived_free_region: universal_regions.fr_static, blame_span: test.span });
+            return true;
+        }
+        // For each region outlived by the lower bound, the non-local upper bounds of it; (rustc
+        // asserts only that some universal region is outlived, a region may have no non-local bound).
+        let mut found_outlived_universal_region = false;
+        let mut bounds = Vec::new();
+        for ur in self.scc_values.universal_regions_outlived_by(scc) {
+            found_outlived_universal_region = true;
+            bounds.extend(self.universal_region_relations.non_local_upper_bounds(ur));
+        }
+        assert!(found_outlived_universal_region, "promotable type test without a universal lower bound");
         self.propagated_type_requirements.extend(bounds.into_iter().map(|outlived_free_region|
             super::ClosureTypeRequirement { subject,outlived_free_region,blame_span:test.span }));
         true

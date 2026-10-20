@@ -7,6 +7,9 @@ use crate::types::{RegionId, RegionKind, TyId, TyKind};
 #[derive(Clone, Debug, Default)]
 pub struct ImpliedBounds {
     pub outlives: Vec<(RegionId, RegionId)>,
+    /// How many leading `outlives` are the param-env's region-outlives clauses (rustc inserts those
+    /// into the universal region relations before the regions themselves, the implied ones after).
+    pub explicit_outlives: usize,
     /// Generic and alias subjects are retained as types, not flattened slots.
     pub type_outlives: Vec<(TyId, RegionId)>,
     pub obligations: Vec<OutlivesPredicate>,
@@ -26,7 +29,11 @@ impl ImpliedBounds {
             obligations,
             ..Self::default()
         };
-        for p in predicates {
+        for p in predicates.iter().filter(|p| matches!(p, OutlivesPredicate::Region(..))) {
+            result.assume(tcx, *p);
+        }
+        result.explicit_outlives = result.outlives.len();
+        for p in predicates.iter().filter(|p| matches!(p, OutlivesPredicate::Type(..))) {
             result.assume(tcx, *p);
         }
         for i in 0..raw.len().max(normalized.len()) {
@@ -35,7 +42,11 @@ impl ImpliedBounds {
         }
         // Relation insertion order determines nightly's SCC representatives.
         let mut seen = crate::fxhash::HashSet::default();
-        result.outlives.retain(|p| seen.insert(*p));
+        let explicit = result.explicit_outlives;
+        let mut index = 0;
+        let mut kept_explicit = 0;
+        result.outlives.retain(|p| { let keep = seen.insert(*p); if keep && index < explicit { kept_explicit += 1; } index += 1; keep });
+        result.explicit_outlives = kept_explicit;
         let mut seen = crate::fxhash::HashSet::default();
         result.type_outlives.retain(|p| seen.insert(*p));
         result
@@ -298,8 +309,13 @@ impl ImpliedBounds {
     pub fn instantiate_query_bounds(&mut self, tcx: &Tcx, replacements: &[(RegionId,RegionId)]) {
         let region = |r| replacements.iter().find(|p| p.0 == r).map_or(r,|p| p.1);
         let placeholder = |r| matches!(tcx.tys.region_kind(r),RegionKind::RePlaceholder { .. });
-        self.outlives = self.outlives.iter().map(|&(a,b)| (region(a),region(b)))
-            .filter(|&(a,b)| !placeholder(a) && !placeholder(b)).collect();
+        let explicit = self.explicit_outlives;
+        let mut kept_explicit = 0;
+        let mapped: Vec<(RegionId, RegionId)> = self.outlives.iter().enumerate().map(|(i, &(a,b))| (i, (region(a),region(b))))
+            .filter(|&(_, (a,b))| !placeholder(a) && !placeholder(b))
+            .map(|(i, p)| { if i < explicit { kept_explicit += 1; } p }).collect();
+        self.outlives = mapped;
+        self.explicit_outlives = kept_explicit;
         self.type_outlives = self.type_outlives.iter().filter_map(|&(t,r)| {
             let r = region(r);
             let has_placeholder = std::cell::Cell::new(placeholder(r));

@@ -587,7 +587,8 @@ impl crate::types::fold::TypeFolder for FreeRegionsVisitor<'_, '_> {
         for clause in from_item.iter().chain(self.cx.param_env.clauses.iter()) {
             let PredicateKind::Clause(ClauseKind::TypeOutlives(subject, bound)) = clause.kind else { continue };
             if !clause.has_bound_vars(tys) {
-                if subject == ty { bounds.push(bound); }
+                // (rustc compares the types; Relax's aliases also carry a rigidness bit the bounds do not share)
+                if tys.set_aliases_to_non_rigid(subject) == tys.set_aliases_to_non_rigid(ty) { bounds.push(bound); }
             } else if let Some(r) = crate::infer::outlives::test_type_match::extract_verify_if_eq(tcx, prog, clause, ty) {
                 bounds.push(r);
             }

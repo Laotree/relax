@@ -14,21 +14,29 @@ pub struct UniversalRegionRelations {
     inverse_order: Vec<usize>,
 }
 impl UniversalRegionRelations {
+    /// All of `known` is explicit (inserted before the universal regions).
     pub fn create(universal_regions: UniversalRegions, num_regions: usize, known: &[(RegionVid, RegionVid)]) -> Self {
+        Self::create_with(universal_regions, num_regions, known, known.len())
+    }
+    /// `known[..explicit]` are the param-env's outlives clauses; the rest are implied bounds.
+    pub fn create_with(universal_regions: UniversalRegions, num_regions: usize, known: &[(RegionVid, RegionVid)], explicit: usize) -> Self {
         let indices: Vec<_> = universal_regions.universal_regions_iter().collect();
         let mut index = vec![None; num_regions];
         for (i,&r) in indices.iter().enumerate() { index[r] = Some(i); }
         let at = |r: RegionVid| index[r].expect("relation on non-universal region");
         let n = indices.len();
+        // Insertion order is the elements' index order (`minimal_scc_representative` picks the lowest),
+        // as rustc's build: the param-env's outlives clauses, then every universal region (reflexive,
+        // outlived by 'static, outliving the fn body), then the implied bounds.
         let mut edges = vec![];
-        for &(a,b) in known {
-            if let (Some(a),Some(b)) = (index[a],index[b]) { edges.push((a,b)); }
-        }
+        let mut known_edge = |edges: &mut Vec<(usize, usize)>, &(a, b): &(RegionVid, RegionVid)| if let (Some(a), Some(b)) = (index[a], index[b]) { edges.push((a, b)); };
+        for k in &known[..explicit.min(known.len())] { known_edge(&mut edges, k); }
         for &fr in &indices {
             edges.push((at(fr),at(fr)));
             edges.push((at(universal_regions.fr_static),at(fr)));
             if let Some(body) = universal_regions.fr_fn_body { edges.push((at(fr),at(body))); }
         }
+        for k in &known[explicit.min(known.len())..] { known_edge(&mut edges, k); }
         let mut outlives_order = vec![];
         let mut inverse_order = vec![];
         for &(a,b) in &edges {

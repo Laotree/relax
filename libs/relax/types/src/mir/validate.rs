@@ -17,7 +17,12 @@ pub struct ValidationError {
 }
 
 pub fn validate(body: &Body, tcx: &Tcx) -> Vec<ValidationError> {
-    let mut checker = Checker { body, tcx, errors: Vec::new(), at: None, next_promoted: 0 };
+    validate_with_annotations(body, tcx, body.user_type_annotations.len())
+}
+/// `annotations`: the user type annotations a constant may name. A promoted body has none of its
+/// own and shares its root's (rustc_borrowck type_check: `user_type_annotations`).
+fn validate_with_annotations(body: &Body, tcx: &Tcx, annotations: usize) -> Vec<ValidationError> {
+    let mut checker = Checker { body, tcx, errors: Vec::new(), at: None, next_promoted: 0, annotations };
     checker.check_body();
     checker.errors
 }
@@ -27,6 +32,7 @@ struct Checker<'a> {
     errors: Vec<ValidationError>,
     at: Option<Location>,
     next_promoted: u32,
+    annotations: usize,
 }
 impl Checker<'_> {
     fn fail(&mut self, message: &str) {
@@ -149,7 +155,7 @@ impl Visitor for Checker<'_> {
         // super_body visits promotions in index order; each has its own index spaces.
         let id = self.next_promoted;
         self.next_promoted += 1;
-        for mut error in validate(body, self.tcx) {
+        for mut error in validate_with_annotations(body, self.tcx, self.annotations) {
             error.promoted.insert(0, PromotedId(id));
             self.errors.push(error);
         }
@@ -192,7 +198,7 @@ impl Visitor for Checker<'_> {
         }
     }
     fn visit_user_type_index(&mut self, user: &UserTypeAnnotationIndex) {
-        if user.0 as usize >= self.body.user_type_annotations.len() {
+        if user.0 as usize >= self.annotations {
             self.fail("user type annotation is out of range");
         }
     }
