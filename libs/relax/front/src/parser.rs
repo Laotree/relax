@@ -130,6 +130,9 @@ pub struct Parser<'a> {
     foreign_abi: Option<Option<Ident>>,
     /// inside a cfg'd-out item (parse_cfg_out): nothing is generated
     cfg_out: u32,
+    /// the statement macro whose expansion is being parsed was called with a `;` after it: its
+    /// last statement gets that `;` (rustc add_trailing_semicolon), so it is not a trailing macro
+    expansion_semi: bool,
     /// attributes whose shape is checked once their item is known to be configured in (check only)
     pending_shape: Vec<(TokRange, Option<PErr>)>,
 }
@@ -186,6 +189,7 @@ impl<'a> Parser<'a> {
             in_assoc: 0,
             foreign_abi: None,
             cfg_out: 0,
+            expansion_semi: false,
             pending_shape: Vec::new(),
         }
     }
@@ -1511,8 +1515,8 @@ impl<'a> Parser<'a> {
             self.pos = save;
             return Ok(None);
         }
-        let trailing = delim != b'{' && matches!(self.kind(), T::CloseBrace | T::Eof);
-        self.eat(T::Semi);
+        let trailing = delim != b'{' && (self.kind() == T::CloseBrace || (self.kind() == T::Eof && !self.expansion_semi));
+        let had_semi = self.eat(T::Semi);
         let start = self.expand_call(&def, toks, lo)?;
         let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
         if trailing && def.builtin == 0 && crate::macros::uses::recording() {
@@ -1528,7 +1532,10 @@ impl<'a> Parser<'a> {
                 crate::macros::uses::trailing_semi(&file, semi, lo, &def.def_file);
             }
         }
-        Ok(Some(self.in_expansion(start, |p| f(p, include))?))
+        let outer = std::mem::replace(&mut self.expansion_semi, had_semi);
+        let r = self.in_expansion(start, |p| f(p, include));
+        self.expansion_semi = outer;
+        Ok(Some(r?))
     }
 
     /// Moves to the end of the current macro expansion's tokens.

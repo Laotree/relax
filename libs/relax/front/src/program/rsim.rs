@@ -1151,13 +1151,11 @@ impl<'a> Sim<'a> {
     fn ambiguity_table(&self) -> HashMap<(u32, Sym, bool), u8> {
         let mut t = HashMap::default();
         for (&(m, name, ns), r) in &self.res {
-            if r.non_glob.is_some() { continue; }
-            if let Some(g) = r.glob {
-                let amb = self.chain_ambiguities(g);
-                if !amb.is_empty() {
-                    t.insert((m, name, ns_type(ns)), if amb.iter().any(|w| w.is_none()) { 1 } else { 2 });
-                }
-            }
+            // low bits: what a use of the name finds (a name a module binds directly -- an item or a
+            // single import -- has no glob ambiguity); bits 2..: the glob declaration's own
+            let glob = r.glob.map_or(0, |g| { let amb = self.chain_ambiguities(g); if amb.is_empty() { 0 } else if amb.iter().any(|w| w.is_none()) { 1 } else { 2 } });
+            if r.non_glob.is_none() && r.glob.is_none() { continue; }
+            t.insert((m, name, ns_type(ns)), (if r.non_glob.is_some() { 0 } else { glob }) | (glob << 2));
         }
         t
     }
@@ -1348,5 +1346,18 @@ mod tests {
         // rustc tests/ui/imports/cycle-import-in-std-1.rs with a module in place of `std`
         let d = replay("mod m { pub mod collections {} }\nfn main() {\n    use ops::{self as m};\n    use m::collections::{self as ops};\n}\n", 2018);
         assert!(has(&d, "unresolved import `ops`", 3), "{d:?}");
+    }
+
+    #[test]
+    fn a_statement_macro_expanding_to_a_macro_call_has_no_trailing_semicolon_lint() {
+        // rustc tests/ui/type-alias-enum-variants/enum-variant-generic-args-pass.rs: the `;` after the
+        // outer call goes to the inner call's statement
+        let src = "macro_rules! inner { ($e:expr) => ( assert!($e, \"x\"); ) }\nmacro_rules! outer { ($e:expr) => ( inner!($e) ) }\nfn main() { outer!(true); }\n";
+        crate::macros::uses::record(true);
+        let _ = crate::macros::uses::take_trailing_semis();
+        replay(src, 2021);
+        let t = crate::macros::uses::take_trailing_semis();
+        crate::macros::uses::record(false);
+        assert!(t.is_empty(), "{}", t.len());
     }
 }

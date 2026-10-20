@@ -3444,6 +3444,29 @@ fn trailing_semis(prog: &Program, own: &[bool]) {
     }
 }
 
+// ---------------------------------------------------------------- meta_variable_misuse
+
+pub const META_VARIABLE_MISUSE: Lint = lint::lint("meta_variable_misuse");
+
+/// rustc_expand `check_meta_variables`, for every `macro_rules!` of the checked crates.
+fn meta_variable_misuse(prog: &Program, own: &[bool]) {
+    let mut seen = std::collections::HashSet::new();
+    for (_, defs) in prog.macros.defs.iter() {
+        for d in defs {
+            if d.builtin != 0 || d.def_file.is_empty() { continue; }
+            let Some(file) = prog.file_paths.iter().position(|p| *p == d.def_file) else { continue };
+            let krate = prog.file_crate.get(file).copied().unwrap_or(u32::MAX);
+            if !own.get(krate as usize).copied().unwrap_or(false) || d.def_pos >= prog.files[file].src_len || !seen.insert((file, d.def_pos)) { continue; }
+            let Some(found) = relax_front::macro_check::check_meta_variables(d) else { continue };
+            for f in found {
+                if f.pos >= prog.files[file].src_len { continue; }
+                let def = enclosing_def(prog, file as u32, f.pos, krate);
+                emit(prog, def, &META_VARIABLE_MISUSE, file as u32, f.pos, &f.msg);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- unused_macros / unused_macro_rules
 
 pub const UNUSED_MACROS: Lint = lint::lint("unused_macros");
@@ -3455,6 +3478,7 @@ pub const UNUSED_MACRO_RULES: Lint = lint::lint("unused_macro_rules");
 pub fn finish(prog: &Program, own: &[bool]) {
     if !lint::enabled() { return; }
     trailing_semis(prog, own);
+    meta_variable_misuse(prog, own);
     cfg_attr_empties(prog, own);
     named_args_positional(prog, own);
     crate_attr_lints(prog, own);

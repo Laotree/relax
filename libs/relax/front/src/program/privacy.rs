@@ -110,7 +110,8 @@ impl Program {
             if self.own_crates.get(self.mods[m as usize].krate as usize).copied().unwrap_or(false) {
                 let md = &self.mods[m as usize];
                 if !skip_direct && (if ns_type { md.types.contains_key(&name) } else { md.values.contains_key(&name) }) { return 0; }
-                return t.get(&(m, name, ns_type)).copied().unwrap_or(0);
+                let v = t.get(&(m, name, ns_type)).copied().unwrap_or(0);
+                return if skip_direct { v >> 2 } else { v & 3 };
             }
         }
         let key = (m, name, ns_type, skip_direct);
@@ -183,6 +184,11 @@ impl Program {
             if ambig != 0 {
                 let def = self.lookup_in_module(m, name, ns_type, &mut Vec::new())?;
                 return Some(PrivacyError { name, def, import: true, ext: false, ambiguous: true, lint: ambig == 2 });
+            }
+            // the first scope that binds the name settles it (late resolution reports no ambiguity
+            // between a scope's glob and an outer scope)
+            if self.sim_ambiguity.as_ref().is_some_and(|t| self.own_crates.get(md.krate as usize).copied().unwrap_or(false) && t.contains_key(&(m, name, ns_type))) {
+                return None;
             }
             match md.lexical_parent {
                 Some(p) => m = p,
