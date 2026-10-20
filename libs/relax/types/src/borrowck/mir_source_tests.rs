@@ -51,6 +51,18 @@ pub(super) fn typeck_errors_source(source: &str, edition: u16) -> Vec<String> {
     errors
 }
 
+/// The well-formedness errors (wfcheck) of every definition of `source`.
+pub(super) fn wfcheck_errors(source: &str) -> Vec<String> {
+    let (prog, tcx, user) = load_source(source, 2021, "repro");
+    let mut errors = vec![];
+    for i in 0..prog.defs.len() {
+        let d = DefId(i as u32);
+        if prog.def(d).krate != user { continue; }
+        errors.extend(crate::wfcheck::obligations::check_def(&prog, &tcx, d));
+    }
+    errors
+}
+
 /// `borrowck_source_in` for a crate of the given name.
 pub(super) fn borrowck_source_named(source: &str, edition: u16, crate_name: &str) -> (Vec<String>, Vec<String>) {
     let (prog, tcx, user) = load_source(source, edition, crate_name);
@@ -896,4 +908,17 @@ fn a_region_inferred_in_a_closure_signature_is_an_external_region_of_the_closure
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("lifetime may not live long enough"), "{errors:?}");
+}
+
+#[test]
+fn a_type_that_must_outlive_a_region_in_a_well_formedness_check_reports_the_bound_failure() {
+    // wf/wf-in-fn-type-static.rs, lifetimes/lifetime-doesnt-live-long-enough.rs: wfcheck resolves the regions its
+    // obligations registered (E0310 for `'static`, E0309 for a named region).
+    let errors = wfcheck_errors("
+        struct Foo<T> { x: fn() -> &'static T }
+        struct Ok<'a, T> { x: &'a T }
+        fn f<'a, T>(_: &'a T) {}
+        fn main() {}");
+    assert_eq!(errors.iter().filter(|e| e.contains("E0310") && e.contains("may not live long enough")).count(), 1, "{errors:?}");
+    assert_eq!(errors.len(), 1, "{errors:?}");
 }
