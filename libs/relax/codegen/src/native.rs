@@ -20,20 +20,24 @@ impl relax_backend::probe::Probe for RelaxProbe {
     fn cost_enabled(&self) -> bool {
         crate::fncost::enabled()
     }
+    // A function compiled while its thread's locals are being destroyed (a lazily compiled TLS
+    // destructor) finds the stacks gone: its guards are then not kept (profiling only).
     fn phase_enter(&self, phase: usize) {
-        let p = crate::fncost::phase(phase);
-        PHASES.with(|s| s.borrow_mut().push(p));
+        let mut p = Some(crate::fncost::phase(phase));
+        let _ = PHASES.try_with(|s| s.borrow_mut().push(p.take().unwrap()));
+        std::mem::forget(p);
     }
     fn phase_leave(&self) {
-        let p = PHASES.with(|s| s.borrow_mut().pop());
+        let p = PHASES.try_with(|s| s.borrow_mut().pop()).ok().flatten();
         drop(p);
     }
     fn backend_enter(&self, name: &str) {
-        let s = crate::warm::Scope::backend(name);
-        SCOPES.with(|v| v.borrow_mut().push(s));
+        let mut s = Some(crate::warm::Scope::backend(name));
+        let _ = SCOPES.try_with(|v| v.borrow_mut().push(s.take().unwrap()));
+        std::mem::forget(s);
     }
     fn backend_leave(&self) {
-        let s = SCOPES.with(|v| v.borrow_mut().pop());
+        let s = SCOPES.try_with(|v| v.borrow_mut().pop()).ok().flatten();
         drop(s);
     }
     fn size(&self, f: &Func) {
