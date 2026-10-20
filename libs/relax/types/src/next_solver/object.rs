@@ -9,6 +9,20 @@ use crate::types::{TyKind, AliasTyKind, AliasTy, Types};
 use crate::types::fold::{TypeFolder, super_fold_ty};
 use crate::consts::IsRigid;
 impl Tcx {
+    /// Does `t` mention `needle` (a type, structurally)?
+    fn mentions_ty(&self, t: TyId, needle: TyId) -> bool {
+        struct Finder { needle: TyId, found: bool }
+        impl TypeFolder for Finder {
+            fn fold_ty(&mut self, tys: &Types, t: TyId, depth: u32) -> TyId {
+                if t == self.needle { self.found = true; return t; }
+                if !self.found { super_fold_ty(tys, t, self, depth); }
+                t
+            }
+        }
+        let mut f = Finder { needle, found: false };
+        f.fold_ty(&self.tys, t, 0);
+        f.found
+    }
     pub fn alias_ty_with_args(&self, kind: AliasTyKind, args: &[GenericArg]) -> TyId {
         let mut types = Vec::new(); let mut regions = Vec::new();
         for &a in args { match a { GenericArg::Lifetime(r) => regions.push(r), GenericArg::Type(t) => types.push(t), GenericArg::Const(c) => types.push(self.tys.intern(TyKind::Const(c))) } }
@@ -45,10 +59,23 @@ impl EvalCtxt<'_, '_> {
         let TyKind::Dyn(principal, ..) = tcx.tys.kind(ty) else { return Ok(()); };
         if *principal != NO_DEF && self.check_dyn_compatible(*principal).is_err() { return Ok(()); }
         let bounds = tcx.object_predicates(self.solver.prog, ty);
+        // rustc lowers the projections the principal's supertraits fix into the object type itself
+        // (dyn_trait.rs:225-285, unless the term mentions Self); the candidate's requirements are
+        // rewritten with all of them, so `<dyn Foo as Sup>::A` of `trait Foo: Sup<A = u8>` is `u8`.
+        let mut replacements = bounds.clone();
+        if *principal != NO_DEF {
+            for p in tcx.supertraits(self.solver.prog, bounds[0].clone()) {
+                let PredicateKind::Clause(ClauseKind::Projection(proj)) = &p.kind else { continue };
+                if replacements.iter().any(|r| matches!(&r.kind, PredicateKind::Clause(ClauseKind::Projection(q)) if q.projection_term == proj.projection_term)) { continue; }
+                let Term::Ty(term) = proj.term else { continue };
+                if tcx.mentions_ty(term, ty) { continue; }
+                replacements.push(p);
+            }
+        }
         for (i, p) in bounds.iter().enumerate() {
             if i == 0 && *principal != NO_DEF {
-                for (index, p) in tcx.supertraits(self.solver.prog, p.clone()).into_iter().enumerate() { self.probe_and_consider_object_bound_candidate(env, goal, &p, CandidateSource::BuiltinImpl(BuiltinImplSource::Object(index)), &bounds, candidates)?; }
-            } else { self.probe_and_consider_object_bound_candidate(env, goal, p, CandidateSource::BuiltinImpl(BuiltinImplSource::Misc), &bounds, candidates)?; }
+                for (index, p) in tcx.supertraits(self.solver.prog, p.clone()).into_iter().enumerate() { self.probe_and_consider_object_bound_candidate(env, goal, &p, CandidateSource::BuiltinImpl(BuiltinImplSource::Object(index)), &replacements, candidates)?; }
+            } else { self.probe_and_consider_object_bound_candidate(env, goal, p, CandidateSource::BuiltinImpl(BuiltinImplSource::Misc), &replacements, candidates)?; }
         }
         Ok(())
     }

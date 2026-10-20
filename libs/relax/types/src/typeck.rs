@@ -1060,6 +1060,9 @@ impl<'a> Fcx<'a> {
                     Some(i) => i,
                     None => return false,
                 };
+                // the solver's last-field rule: the parameter may not be mentioned by another
+                // field (`Foo<T: ?Sized>(Box<T>, T)` does not unsize `Foo<[u8; 1]>`)
+                if !matches!(self.tcx.lang_items.get(crate::lang_items::LangItem::Unsize), Some(unsize) if matches!(self.select_trait(unsize, a, &[d]), Ok(Some(_)))) { return false; }
                 (0..xs.len()).all(|j| j == i || self.eq(xs[j], ys[j])) && self.array_to_slice(xs[i], ys[i])
             }
             _ => false,
