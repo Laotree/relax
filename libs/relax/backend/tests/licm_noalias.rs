@@ -163,3 +163,19 @@ fn no_noalias_option_hoists_nothing() {
     o.no_noalias = true;
     assert_eq!(run(&mut f, &o), 2);
 }
+
+/// A call before the loop handed the param may keep it; the loop's store through `q` (another
+/// pointer, which could be the kept one) may then write the param's memory.
+#[test]
+fn load_stays_when_a_call_before_the_loop_is_handed_the_param() {
+    let (mut f, _) = build(Body::OtherStore, false);
+    let at = f.blocks[0].insts.len();
+    let p = p_of(&f);
+    f.blocks[0].insts.insert(at, Inst::Call(Callee::Fn(0), vec![p], vec![]));
+    f.blocks[0].pos.insert(at, 0);
+    assert_eq!(run(&mut f, &relax_session::Options::default()), 2);
+}
+
+fn p_of(f: &Func) -> VReg {
+    f.params[0]
+}

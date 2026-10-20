@@ -5291,7 +5291,27 @@ pub fn licm(options: &relax_session::Options, f: &mut Func) -> bool {
     // whose stores go through pointers not derived from that param and whose calls are not
     // handed it: rustc's `noalias`, with local_cse's roots. Params withheld until the borrow
     // check's verdict are not in `f.noalias`, so they hoist nothing.
-    let na = if f.noalias.is_empty() || no_noalias(options) { None } else { Some(noalias_roots(f, &ndef)) };
+    let mut na = if f.noalias.is_empty() || no_noalias(options) { None } else { Some(noalias_roots(f, &ndef)) };
+    // a param handed to a call anywhere in the function may be kept by it (then reached later through a
+    // loaded pointer, which the roots take as not derived from the param): captured for the hoist
+    if let Some((_, cap, taint)) = na.as_mut() {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Call(c, args, _) = i {
+                    let ind = match c {
+                        Callee::Indirect(x) | Callee::CIndirect(x, _) => Some(*x),
+                        _ => None,
+                    };
+                    for a in args.iter().copied().chain(ind) {
+                        let t = taint[a.0 as usize];
+                        if t != u32::MAX && !cap.contains(&t) {
+                            cap.push(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
     for (h, body) in &loops {
         let outside: Vec<u32> = preds[*h as usize].iter().copied().filter(|p| !body[*p as usize]).collect();
         if outside.len() != 1 {
