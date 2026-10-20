@@ -3989,7 +3989,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
         let mut rewatched = std::mem::take(&mut startup_scan);
         if loads != loads_seen || rewatched {
             loads_seen = loads;
+            let t_own = Instant::now();
             let loaded = crate::owner::call_quick(crate::owner::Class::App, || own_files(&*up));
+            if std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() { eprintln!("makepad live: rewatch (loads {loads}, startup scan {rewatched}): own files in {:.1} ms at t={:.0} ms", t_own.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
             let known: std::collections::HashMap<_, _> = files.iter().enumerate().map(|(i, f)| (f.0.clone(), i)).collect();
             let mut added = Vec::new();
             for (path, file) in loaded {
@@ -4003,7 +4005,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
                 rewatched = true;
             }
         }
+        let t_dr = Instant::now();
         drain_streams(up);
+        if std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() && t_dr.elapsed().as_millis() > 20 { eprintln!("makepad live: drain_streams took {:.1} ms at t={:.0} ms", t_dr.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
         // Re-check an unchanged failing prefix once, after one second of silence.
         let due: Vec<_> = stalled.iter().filter(|(_, (t, _, _))| t.elapsed().as_secs_f64() >= 1.0).map(|(&k, _)| k).collect();
         for k in due {
@@ -4034,7 +4038,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
             }
         }
         tick = tick.wrapping_add(1);
+        let t_ev = Instant::now();
         let notifications = events.as_mut().and_then(|w| w.changed());
+        if t_ev.elapsed().as_millis() > 20 && std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() { eprintln!("makepad live: events drain took {:.1} ms", t_ev.elapsed().as_secs_f64() * 1e3); }
         let lost = events.is_some() && notifications.is_none();
         if lost { events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str())); }
         let all = lost || rewatched || (events.is_none() && tick % 20 == 0);
@@ -4069,6 +4075,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
             continue;
         }
         let seen = std::time::Instant::now();
+        if std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() { eprintln!("makepad live: a change seen at t={:.0} ms ({} file(s))", crate::clock::ms_since_start(), changed.len()); }
         // from the save on, the post-boot loader keeps off the unit (the read below
         // compares with the running text on it)
         for &k in &changed {
