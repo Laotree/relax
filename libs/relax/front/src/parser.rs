@@ -3773,6 +3773,8 @@ impl<'a> Parser<'a> {
     /// (or a negated one); any other expression is "arbitrary" (a path, a call, an or-expression ..).
     fn expr_fragment_pat(&self) -> PResult<()> {
         let t = self.tok();
+        // (only the text of a macro_rules! expansion has fragments)
+        if !self.rules_exp.floor(t.lo).is_some_and(|(_, r)| t.lo < r.1) { return Ok(()); }
         let lit = |k: T| matches!(k, T::Int | T::Float | T::Str | T::ByteStr | T::CStr | T::RawStr | T::Char | T::Byte | T::KwTrue | T::KwFalse);
         let bad = match self.meta_frags.get(&{ t.lo }) {
             Some(&"expr") => !(lit(t.kind) || (t.kind == T::Minus && lit(self.nth(1)))),
