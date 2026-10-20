@@ -590,18 +590,7 @@ pub mod obligations {
                 errors.extend(with_wfcx(prog, tcx, did, |w| check_impl(w, ast, item)));
                 errors
             }
-            // (a trait's own environment is not built here: `param_env_id` of `trait Qux: Foo + AsRef<Self::Bar>` never
-            // returns -- solver, crash lane)
-            DefKind::Trait => {
-                // the defaults' own well-formedness mentions no parameter: no environment needed
-                let mut errors = with_wfcx_env(prog, tcx, did, ParamEnvId::EMPTY, |w| check_defaults(w, ast, item));
-                // dyn-compatibility of the `dyn` types its bounds mention needs no environment
-                let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), did);
-                let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env: ParamEnvId::EMPTY, def: did, only_dyn: true , extra: Vec::new()};
-                w.check_where_clauses(item.lo);
-                errors.extend(w.finish(def.file));
-                errors
-            }
+            DefKind::Trait => with_wfcx(prog, tcx, did, |w| { check_defaults(w, ast, item); w.check_where_clauses(item.lo); }),
             DefKind::Static | DefKind::ForeignStatic => with_wfcx(prog, tcx, did, |w| check_static(w, ast, item)),
             DefKind::AssocConst => with_wfcx(prog, tcx, did, |w| check_assoc_const(w, ast, item)),
             DefKind::AssocTy => with_wfcx(prog, tcx, did, |w| check_assoc_ty(w, ast, item)),
