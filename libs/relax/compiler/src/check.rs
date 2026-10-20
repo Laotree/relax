@@ -133,6 +133,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     errors.extend(relax_types::item_checks::private_assoc_types(&u.prog, &u.tcx, &own));
     errors.extend(relax_types::item_checks::gated_syntax(&u.prog, &own));
     errors.extend(relax_types::item_checks::node_attribute_targets(&u.prog, &own));
+    errors.extend(relax_types::item_checks::param_attributes(&u.prog, &own));
     errors.extend(relax_types::item_checks::foreign_blocks(&u.prog, &own));
     errors.extend(relax_types::item_checks::duplicate_symbols(&u.prog, &own));
     errors.extend(relax_types::item_checks::global_allocators_and_lang_items(&u.prog, &own));
@@ -697,7 +698,7 @@ fn function_origin(u: &Unit, mut id: u32) -> Option<(u32,u32)> {
         match &u.fns[id as usize].key {
             FnKey::Inst(d,_) => { let d = u.prog.def(*d); return Some((d.file,u.prog.files[d.file as usize].ast.item(d.item).lo)); }
             FnKey::Closure(f,e,_) => return Some((*f,u.prog.files[*f as usize].ast.expr(crate::ast::ExprId(*e)).lo)),
-            FnKey::Sandbox(parent) => id = *parent,
+            FnKey::Sandbox(parent) | FnKey::Plain(parent) => id = *parent,
             FnKey::Shim(shim) => { let d = u.prog.def(shim.kind.def_id()); return Some((d.file, u.prog.files[d.file as usize].ast.item(d.item).lo)); }
             FnKey::Glue(_,t) => {
                 if let crate::types::TyKind::Adt(d,_, _) = u.tcx.tys.kind(*t) {
