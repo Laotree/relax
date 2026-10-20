@@ -301,6 +301,10 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
             lint_unused_mut(prog, typeck.def, &p.mir, &checked.result.used_mut);
         }
         v.errors.extend(diagnostics::render_errors(&dcx, &checked.result));
+        // `report_opaque_type_errors`: only when the region inference found no error (those would explain them).
+        if checked.regions.regioncx.errors.is_empty() {
+            v.errors.extend(diagnostics::opaque_types::report_opaque_type_errors(&dcx, &checked.deferred_opaque_type_errors).iter().map(|d| diagnostics::capture(prog, p.owner.owner, d)));
+        }
         v.fv_only.extend(diagnostics::render_fv_only(&dcx, &checked.result));
         v.fv_records.extend(checked.result.fv_records.iter().cloned());
     }
