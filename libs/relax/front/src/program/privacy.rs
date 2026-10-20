@@ -104,17 +104,32 @@ impl Program {
 
     /// 0: not ambiguous; 1: two globs of `m` bring different items; 2: only inherited through a
     /// glob whose module is itself ambiguous for `name`.
-    pub fn glob_ambiguity(&self, m: u32, name: Sym, ns_type: bool, from: u32, skip_direct: bool) -> u8 {
-        self.glob_ambiguity_in(m, name, ns_type, from, skip_direct, &mut crate::fxhash::HashMap::default())
+    pub fn glob_ambiguity(&self, m: u32, name: Sym, ns_type: bool, _from: u32, skip_direct: bool) -> u8 {
+        let key = (m, name, ns_type, skip_direct);
+        if let Some(r) = self.glob_amb_cache.get(&key) { return r; }
+        let r = self.glob_ambiguity_in(m, name, ns_type, skip_direct, &mut crate::fxhash::HashMap::default());
+        if self.imports_done { self.glob_amb_cache.insert(key, r); }
+        r
     }
 
-    fn glob_ambiguity_in(&self, m: u32, name: Sym, ns_type: bool, from: u32, skip_direct: bool, seen: &mut crate::fxhash::HashMap<u32, u8>) -> u8 {
+    /// What a glob binds `name` to, for comparison with the module's other globs.
+    fn glob_binding(&self, sub: u32, name: Sym, ns_type: bool) -> Option<(DefId, BindVis)> {
+        if let Some(r) = self.glob_prec_cache.get(&(sub, name, ns_type)) { return r; }
+        let mut q = GlobQuery { precise: true, ..Default::default() };
+        let r = self.lookup_in_module_vis(sub, name, ns_type, &mut q);
+        if self.imports_done { self.glob_prec_cache.insert((sub, name, ns_type), r); }
+        r
+    }
+
+    /// Ambiguity is a property of the module's glob imports (rustc records it on the binding when
+    /// two globs meet), so the answer is per (module, name, namespace) and cached.
+    fn glob_ambiguity_in(&self, m: u32, name: Sym, ns_type: bool, skip_direct: bool, seen: &mut crate::fxhash::HashMap<u32, u8>) -> u8 {
         let md = &self.mods[m as usize];
         if md.globs.is_empty() || (!skip_direct && (if ns_type { md.types.contains_key(&name) } else { md.values.contains_key(&name) })) {
             return 0;
         }
-        // each module is judged once per query (the glob graph is a DAG with cycles, and a walk
-        // of all paths is exponential); a module still being judged answers 0
+        if let Some(r) = self.glob_amb_cache.get(&(m, name, ns_type, skip_direct)) { return r; }
+        // a module still being judged answers 0 (glob cycles)
         if let Some(&r) = seen.get(&m) { return r; }
         seen.insert(m, 0);
         let mut found: Option<DefId> = None;
@@ -123,16 +138,15 @@ impl Program {
             let gd = self.def(g);
             let r = match gd.kind {
                 DefKind::Mod => {
-                    let mut q = GlobQuery { precise: true, ..Default::default() };
-                    let r = self.lookup_in_module_vis(gd.sub, name, ns_type, &mut q);
-                    if r.is_some() && self.glob_ambiguity_in(gd.sub, name, ns_type, from, false, seen) != 0 { out = out.max(2); }
+                    let r = self.glob_binding(gd.sub, name, ns_type);
+                    if r.is_some() && self.glob_ambiguity_in(gd.sub, name, ns_type, false, seen) != 0 { out = out.max(2); }
                     r
                 }
                 DefKind::Enum => self.lookup_in_container(g, name, false).map(|d| (d, None)),
                 _ => None,
             };
             if let Some((d, v)) = r {
-                if !self.vis_visible(v, from) || !self.vis_visible(v, m) {
+                if !self.vis_visible(v, m) {
                     continue;
                 }
                 match found {
