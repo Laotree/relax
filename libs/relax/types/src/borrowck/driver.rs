@@ -94,6 +94,16 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
     // independent root of its own (rustc: an anon const is its own typeck root and `mir_borrowck`).
     let mut owners: Vec<CheckedBody> = Vec::new();
     let closure_order = closures_inner_first(prog, tcx, typeck);
+    // An async closure is a closure returning a coroutine over its captures (CoroutineClosure); which
+    // captures the coroutine takes (by ref through `AsyncFn`, by move through `FnOnce`: rustc's
+    // by-move body) is not modelled, so the root is not checked rather than misreported.
+    {
+        let ast = &prog.files[typeck.file as usize].ast;
+        if closure_order.iter().any(|&c| c & crate::tcx::ASYNC_FN_BODY == 0 && matches!(ast.expr(crate::ast::ExprId(c)).kind, crate::ast::ExprKind::Closure(row) if ast.row(row).is_async)) {
+            v.unchecked.push(format!("{name}: async closures are not borrow-checked"));
+            return v;
+        }
+    }
     for &c in &closure_order {
         owners.push(CheckedBody { owner: typeck.def, kind: OwnerKind::Closure(crate::ast::ExprId(c)) });
     }

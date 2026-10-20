@@ -73,8 +73,10 @@ impl Cx<'_> {
             TyKind::Tuple(l) => tcx.tys.list(l).iter().all(|x| self.valtree_type(*x, depth + 1)),
             TyKind::Adt(d, args, _) => {
                 let Some(a) = tcx.adts.get(&d) else { return false };
+                // (a type that never has a value tree of its own may still sit in an unused variant:
+                // `None::<Cell<_>>` is a constant; `valtree_to_pat` refuses one a value actually holds)
                 if a.is_union() || a.is_manually_drop() || a.is_unsafe_cell() || a.is_unsafe_pinned() || a.is_box() {
-                    return false;
+                    return true;
                 }
                 let tys = tcx.tys.list(args);
                 (0..a.variants.len()).all(|vi| {
@@ -117,8 +119,8 @@ impl Cx<'_> {
         let kind = match *tys.kind(ty) {
             TyKind::Adt(adt, args, _) => {
                 let Some(a) = tcx.adts.get(&adt) else { return self.unresolved(span, "constant of an unknown ADT") };
-                if a.is_union() {
-                    return self.unresolved(span, "union constant in a pattern");
+                if a.is_union() || a.is_manually_drop() || a.is_unsafe_cell() || a.is_unsafe_pinned() || a.is_box() {
+                    return self.unresolved(span, "constant of a type without a value tree in a pattern");
                 }
                 let Some(branches) = value.valtree.try_to_branch() else { return self.unresolved(span, "constant ADT is not a branch") };
                 if a.is_enum() {
