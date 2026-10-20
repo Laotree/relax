@@ -564,3 +564,25 @@ fn a_closure_cast_to_a_higher_ranked_fn_pointer_takes_the_signature_from_the_tar
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn the_region_bound_pairs_of_a_closure_name_the_universal_regions_of_its_type() {
+    // The upvar type carries typeck's own region variables; the pairs `Opaque<..>: 'env` must name
+    // the closure's external regions, not whatever NLL variable has the same number.
+    let (errors, unchecked) = borrowck_source("
+        pub struct It;
+        pub trait Resolver {}
+        impl<R: Resolver> Resolver for &R {}
+        impl Resolver for It {}
+        pub fn get2<'a, 'b: 'b>(mut items: impl Iterator<Item = &'a It>) -> impl Resolver + 'a { items.next().unwrap() }
+        pub struct Container<'a> { name: String, resolver: Box<dyn Resolver + 'a> }
+        impl<'a> Container<'a> { fn new<R: Resolver + 'a>(name: &str, resolver: R) -> Self { Self { name: name.to_owned(), resolver: Box::new(resolver) } } }
+        pub fn main() {
+            let it = It;
+            let resolver = get2(Some(&it).into_iter());
+            let f = |n: &str| Container::new(n, &resolver);
+            f(\"a\");
+        }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}

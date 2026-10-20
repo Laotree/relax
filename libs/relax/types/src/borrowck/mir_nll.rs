@@ -242,7 +242,12 @@ pub fn type_check_body(tcx: &Tcx, prog: &Program, infcx: &mut dyn RegionDriverOp
     // The signature as the body sees it: the implicit environment argument, the inputs, the output.
     let raw: Vec<TyId> = sig.implicit_input.into_iter().chain(sig.inputs.iter().copied()).chain([sig.output]).collect();
     let (implied, _normalized_by_query) = infcx.implied_bounds(sig, input.nested);
-    infcx.install_universals(&universals, &implied.type_outlives);
+    // The bound pairs name the signature's regions as written (a closure type carries typeck's own
+    // region variables): a universal region's name is its variable, never a variable of this body's.
+    let named = |r: RegionId| universals.indices.iter().find(|(o, _)| *o == r).map_or(r, |&(_, vid)| tcx.tys.intern_region(RegionKind::ReVar(vid as u32)));
+    let region_bound_pairs: Vec<(TyId, RegionId)> = implied.type_outlives.iter().map(|&(t, r)| (
+        tcx.tys.map_regions(t, &|r, depth| if matches!(tcx.tys.region_kind(r), RegionKind::ReBound(d, _) if d < depth) { r } else { named(r) }, 0), named(r))).collect();
+    infcx.install_universals(&universals, &region_bound_pairs);
     let mut constraints = MirTypeckRegionConstraints::new(LocationMap::new(body).num_points());
     let mut fresh = vec![];
     let mut normalized_inputs_and_output = vec![];
