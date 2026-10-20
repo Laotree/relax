@@ -34,7 +34,7 @@ enum BodyOutline {
 
 /// MAKEPAD_RUN_VERIFY_TOKENS: every macro_rules expansion's transcribed tokens are compared with the
 /// lexed text.
-fn verify_tokens() -> bool {
+pub(crate) fn verify_tokens() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("MAKEPAD_RUN_VERIFY_TOKENS").is_some())
 }
@@ -1317,7 +1317,7 @@ impl<'a> Parser<'a> {
                 // that contains it, an item's with the module; the file still loads
                 Err(m) => {
                     let semi = if crate::builtins::is_item_level(b) { ";" } else { "" };
-                    crate::builtins::Expansion::lexed(format!("compile_error!({:?}){}", format!("`{}!`: {}", def.name, m), semi)).map_err(|m| PErr { pos: call_lo, msg: m })?
+                    crate::builtins::Expansion::from_buf(crate::tokbuf::TokBuf::compile_error(self.edition, &format!("`{}!`: {}", def.name, m), !semi.is_empty()))
                 }
             };
             // MAKEPAD_RUN_TRACE=expand:<macro name> prints expansions (debugger-free macro debugging)
@@ -1809,7 +1809,7 @@ impl<'a> Parser<'a> {
                 self.derive_after(*id, tok_lo)?;
             }
             if self.cfg_out == 0 && matches!(self.ast.item(*id).kind, ItemKind::Struct(..) | ItemKind::Enum(..)) {
-                self.default_consts(*id)?;
+                self.default_consts(*id, tok_lo)?;
             }
         }
         r
