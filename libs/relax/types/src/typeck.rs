@@ -2211,6 +2211,18 @@ impl<'a> Fcx<'a> {
                     let lo = ast.list(*l).iter().find_map(|c| if let Pat::Ident { name, .. } = ast.pat(*c) { Some(name.lo) } else { None }).unwrap_or(0);
                     self.err(lo, format!("`..` can only be used once per {what} pattern"));
                 }
+                // ast_lowering lower_pat_tuple: `binding @ ..` is only allowed in a slice pattern
+                if report && !matches!(ast.pat(p), Pat::Slice(_)) {
+                    let what = if matches!(ast.pat(p), Pat::Tuple(_)) { "tuple" } else { "tuple struct" };
+                    for &c in ast.list(*l) {
+                        if let Pat::Ident { name, sub: Some(s), .. } = ast.pat(c) {
+                            if matches!(ast.pat(*s), Pat::Rest) {
+                                let shown = self.prog.syms.str(self.sym(*name)).to_string();
+                                self.err(name.lo, format!("`{shown} @` is not allowed in a {what}"));
+                            }
+                        }
+                    }
+                }
                 for &c in ast.list(*l) {
                     let more = self.pat_bindings(c, report);
                     add(self, &mut out, more);
