@@ -4676,6 +4676,16 @@ impl Unit {
 
     fn install_unchecked(&mut self, id: u32, code: &[u8], relocs: &[relax_backend::rir::RelocAt], pc_map: Vec<(u32, u64)>, gen: u32) -> Result<u64, String> {
         let _cost_install = relax_codegen::fncost::phase(6);
+        // makepad inspect: new code for an instrumented slot (a live patch, a verdict's rebuild,
+        // a lazy recompile) replaces its counters and probes, and the first code of a slot whose
+        // SPEC-V twin (or base) is instrumented runs the same fn: either way the instruments are
+        // put into the new code on the owner afterwards
+        let sibling = match self.fns[id as usize].key {
+            FnKey::Plain(b) => Some(b),
+            FnKey::Inst(..) | FnKey::Closure(..) => self.plain_twin_of(id),
+            _ => None,
+        };
+        crate::inspect::patches::replaced(id, sibling);
         let options = &self.prog.session.clone().options;
         // an interpreted function (its relocatable form) or, in no-codegen mode, a jump (a
         // foreign function's veneer): the slot takes the entry itself, nothing is written
@@ -4940,6 +4950,7 @@ impl Unit {
             f.pc_map = prev.2;
             f.patch_gen = prev.3;
             f.rir = None;
+            crate::inspect::patches::replaced(id as u32, None);
             // SPEC-V: the previous code is what ran before the group (its own status is rebuilt with it)
             f.unverified.store(false, Ordering::Relaxed);
             f.version += 1;
