@@ -144,6 +144,8 @@ pub struct Parser<'a> {
     /// parsing the items of an impl / trait / extern block: generated items (anonymous consts)
     /// belong to the enclosing module, not to the impl
     in_assoc: u32,
+    /// parsing the members of a trait (2015: parameters may be anonymous)
+    in_trait: bool,
     foreign_abi: Option<Option<Ident>>,
     /// inside a cfg'd-out item (parse_cfg_out): nothing is generated
     cfg_out: u32,
@@ -206,6 +208,7 @@ impl<'a> Parser<'a> {
             extra_assoc_items: Vec::new(),
             pending_inner: Vec::new(),
             in_assoc: 0,
+            in_trait: false,
             foreign_abi: None,
             cfg_out: 0,
             pending_shape: Vec::new(),
@@ -2144,6 +2147,24 @@ impl<'a> Parser<'a> {
     }
 
     fn item(&mut self, attrs: Vec<Attr>) -> PResult<Option<ItemId>> {
+        // rustc_passes check_attr `check_doc_inline`: `doc(inline)` and `doc(no_inline)` on one item conflict
+        if self.cfg_out == 0 && attrs.len() > 1 && crate::lexer::validation_enabled() {
+            let (mut inline, mut no_inline) = (false, false);
+            for a in &attrs {
+                let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+                if hi <= lo + 1 || (self.toks.at(lo).lo as usize) >= self.src.len() || self.tok_text(self.toks.at(lo)) != b"doc" { continue; }
+                for k in lo + 1..hi {
+                    match self.tok_text(self.toks.at(k)) {
+                        b"inline" => inline = true,
+                        b"no_inline" => no_inline = true,
+                        _ => {}
+                    }
+                }
+            }
+            if inline && no_inline {
+                return self.err("conflicting doc inlining attributes");
+            }
+        }
         let lo = self.lo();
         let tok_lo = self.pos;
         self.item_start.push([self.ast.exprs.len() as u32, self.ast.pats.len() as u32]);
@@ -2677,7 +2698,13 @@ impl<'a> Parser<'a> {
                 break;
             }
             let save = (self.pos,);
-            let res = self.named_param();
+            // rustc_parse `parse_param_general`: a 2015 trait method's parameter without a name
+            // (`ident :`) is a type
+            let res = if self.in_trait && self.edition < 2018 && self.in_assoc > 0 && !self.is_named_param() {
+                Err(PErr { pos: self.tok().lo, msg: "anonymous parameter".into() })
+            } else {
+                self.named_param()
+            };
             let (pat, ty) = match res {
                 Ok(x) => x,
                 Err(e) => {
@@ -2698,6 +2725,12 @@ impl<'a> Parser<'a> {
         }
         self.expect(T::CloseParen)?;
         Ok((self_param, params, variadic))
+    }
+
+    /// rustc_parse `is_named_param`: `ident :`, after an optional `&`, `&&` or `mut`.
+    fn is_named_param(&self) -> bool {
+        let off = if matches!(self.kind(), T::And | T::AndAnd | T::KwMut) { 1 } else { 0 };
+        matches!(self.nth(off), T::Ident | T::RawIdent) && self.nth(off + 1) == T::Colon
     }
 
     fn named_param(&mut self) -> PResult<(PatId, TyId)> {
@@ -2812,7 +2845,10 @@ impl<'a> Parser<'a> {
             v.extend(more);
             supers = self.ast.push_list(v);
         }
-        let items = self.assoc_items()?;
+        let outer_trait = std::mem::replace(&mut self.in_trait, true);
+        let items = self.assoc_items();
+        self.in_trait = outer_trait;
+        let items = items?;
         Ok(ItemKind::Trait(self.ast.push_row(TraitItem { unsafe_, auto, generics, supers, items })))
     }
 
@@ -2854,7 +2890,9 @@ impl<'a> Parser<'a> {
     fn foreign_items(&mut self, abi: Option<Ident>) -> PResult<List<ItemId>> {
         let saved = self.foreign_abi;
         self.foreign_abi = Some(abi);
+        let outer_trait = std::mem::replace(&mut self.in_trait, false);
         let items = self.assoc_items();
+        self.in_trait = outer_trait;
         self.foreign_abi = saved;
         let items = items?;
         // rustc_parse `parse_item_kind` in an extern block: `const` is not a foreign item
@@ -2896,7 +2934,10 @@ impl<'a> Parser<'a> {
             (None, first)
         };
         self.where_clause(&mut generics)?;
-        let items = self.assoc_items()?;
+        let outer_trait = std::mem::replace(&mut self.in_trait, false);
+        let items = self.assoc_items();
+        self.in_trait = outer_trait;
+        let items = items?;
         Ok(ItemKind::Impl(self.ast.push_row(ImplItem { unsafe_, default_, generics, negative, trait_, self_ty, items })))
     }
 
@@ -3026,7 +3067,18 @@ impl<'a> Parser<'a> {
     fn hrtb(&mut self) -> PResult<List<GenericParam>> {
         if self.kind() == T::KwFor && self.nth(1) == T::Lt {
             self.pos += 1;
-            Ok(self.generics()?.params)
+            let params = self.generics()?.params;
+            // ast_validation `check_late_bound_lifetime_defs`: a binder's lifetimes take no bounds
+            if self.cfg_out == 0 {
+                for gp in self.ast.list(params) {
+                    if let GenericParamKind::Lifetime(bs) = gp.kind {
+                        if let Some(b) = self.ast.list(bs).first() {
+                            return Err(PErr { pos: b.lo, msg: "bounds cannot be used in this context".into() });
+                        }
+                    }
+                }
+            }
+            Ok(params)
         } else {
             Ok(List::EMPTY)
         }
@@ -3828,6 +3880,7 @@ impl<'a> Parser<'a> {
         // to the enclosing item list, not to the block's statements
         let outer_items = std::mem::take(&mut self.extra_items);
         let outer_assoc = std::mem::replace(&mut self.in_assoc, 0);
+        let outer_in_trait = std::mem::replace(&mut self.in_trait, false);
         let scope_depth = self.scope_stack.len();
         self.push_rules_scope();
         let mut attrs = Vec::new();
@@ -3847,6 +3900,7 @@ impl<'a> Parser<'a> {
         }
         self.extra_items = outer_items;
         self.in_assoc = outer_assoc;
+        self.in_trait = outer_in_trait;
         self.scope_stack.truncate(scope_depth);
         self.pos += 1;
         let stmts = self.ast.push_list(stmts);

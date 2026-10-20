@@ -21,23 +21,6 @@ impl Program {
             let ast = &f.ast;
             let it = ast.item(def.item);
             let mut err = |pos: u32, msg: String| out.push(self.record_error(def.file, pos, "parse", msg));
-            // rustc_passes check_attr `check_doc_inline`: `doc(inline)` and `doc(no_inline)` on one item conflict
-            {
-                let (mut inline, mut no_inline) = (None, None);
-                for a in ast.list(it.attrs) {
-                    if a.toks.hi <= a.toks.lo || f.tok(a.toks.lo).lo >= f.src_len || f.tok_text(a.toks.lo) != "doc" { continue; }
-                    for k in a.toks.lo + 1..a.toks.hi {
-                        match f.tok_text(k) {
-                            "inline" if inline.is_none() => inline = Some(f.tok(k).lo),
-                            "no_inline" if no_inline.is_none() => no_inline = Some(f.tok(k).lo),
-                            _ => {}
-                        }
-                    }
-                }
-                if let (Some(a), Some(b)) = (inline, no_inline) {
-                    err(a.min(b), "conflicting doc inlining attributes".into());
-                }
-            }
             // `pub(in path)` on the item and on its fields
             self.check_vis_path(&mut err, ast, def, &it.vis, it.lo);
             let field_vis = |data: VariantData, out: &mut Vec<(Vis, u32)>| {

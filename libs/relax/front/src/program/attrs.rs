@@ -250,6 +250,23 @@ impl Program {
                     && matches!(f.tok(i + 1).kind, T::Str | T::RawStr) && matches!(f.tok_text(i + 1), "\"\"" | "r\"\"") {
                     out.push(self.record_error(fi as u32, f.tok(i + 1).lo, "parse", "crate name must not be empty".into()));
                 }
+                // rustc_attr_parsing debugger_visualizer: `natvis_file = ".."` or `gdb_script_file = ".."`, a readable file
+                // (relative to the file holding the attribute)
+                if segs.len() == 1 && !global && segs[0] == "debugger_visualizer" && f.tok(i).kind == T::OpenParen && f.tok(i).lo < f.src_len {
+                    let (key, eq, val) = (f.tok(i + 1), f.tok(i + 2), f.tok(i + 3));
+                    if key.kind == T::Ident && eq.kind == T::Eq && matches!(val.kind, T::Str | T::RawStr) {
+                        let k = f.tok_text(i + 1);
+                        if !matches!(k, "natvis_file" | "gdb_script_file") {
+                            out.push(self.record_error(fi as u32, key.lo, "parse", "E0539: malformed `debugger_visualizer` attribute input".into()));
+                        } else {
+                            let rel = crate::lit::unescape_str(f.tok_text(i + 3));
+                            let path = crate::vfs::normalize_path(&format!("{}/{}", dir_of(&self.file_paths[fi]), rel));
+                            if crate::vfs::read(&path).is_err() {
+                                out.push(self.record_uncoded_error(fi as u32, key.lo, "parse", format!("couldn't read {path}")));
+                            }
+                        }
+                    }
+                }
                 let tool = |n: &str| BUILTIN_TOOLS.contains(&n) || tools.contains(&n);
                 let msg = if segs.len() == 1 && !global {
                     let n = segs[0];
