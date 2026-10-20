@@ -97,6 +97,8 @@ pub struct Parser<'a> {
     pub token_input: bool,
     pub sources: Option<std::sync::Arc<SourceRegistry>>,
     exp_depth: u32,
+    /// the file's written `#![recursion_limit]`, read on the first macro call
+    rec_limit: std::cell::Cell<Option<Option<u32>>>,
     /// macro_rules expansions: (text lo, text hi, the macro's definition position in this
     /// file; 0 when defined elsewhere) -- the hygiene marks (ParsedFile::hyg_ctxt)
     pub rules_exp: OSeg<'a, Regions>,
@@ -169,6 +171,7 @@ impl<'a> Parser<'a> {
             token_input: false,
             sources: None,
             exp_depth: 0,
+            rec_limit: std::cell::Cell::new(None),
             rules_exp: Default::default(),
             body_origin: Default::default(),
             tok_undo: Vec::new(),
@@ -300,6 +303,12 @@ impl<'a> Parser<'a> {
         match self.kind() {
             T::Ident | T::RawIdent => {
                 let t = self.tok();
+                // `fn /// doc` ... a doc comment between an item keyword and its name
+                if self.pos > 0 && matches!(self.toks.at(self.pos - 1).kind, T::KwFn | T::KwStruct | T::KwEnum | T::KwTrait | T::KwMod | T::KwType | T::KwStatic | T::KwConst) {
+                    if let Some(pos) = self.doc_before_pos() {
+                        return Err(PErr { pos, msg: "expected identifier, found doc comment".into() });
+                    }
+                }
                 if let Some(m) = self.reserved_ident(t) {
                     return Err(PErr { pos: t.lo, msg: m });
                 }
@@ -317,14 +326,19 @@ impl<'a> Parser<'a> {
     /// current one? Such a comment documents the next item, field or statement; before a closing
     /// brace, a `;`, a `,` or the end of the file it documents nothing (E0584 / E0585).
     fn doc_before(&self) -> bool {
+        self.doc_before_pos().is_some()
+    }
+
+    /// The start of the doc comment `doc_before` found.
+    fn doc_before_pos(&self) -> Option<u32> {
         let cur = self.tok();
         let lo = cur.lo as usize;
         if lo > self.src.len() {
-            return false;
+            return None;
         }
         let prev_hi = if self.pos == 0 { 0 } else { self.toks.at(self.pos - 1).hi as usize };
         if prev_hi > lo {
-            return false;
+            return None;
         }
         let g = &self.src[prev_hi..lo];
         let mut i = 0;
@@ -333,7 +347,7 @@ impl<'a> Parser<'a> {
                 b' ' | b'\t' | b'\n' | b'\r' => i += 1,
                 b'/' if g.get(i + 1) == Some(&b'/') => {
                     if g.get(i + 2) == Some(&b'/') && g.get(i + 3) != Some(&b'/') {
-                        return true;
+                        return Some((prev_hi + i) as u32);
                     }
                     while i < g.len() && g[i] != b'\n' {
                         i += 1;
@@ -341,7 +355,7 @@ impl<'a> Parser<'a> {
                 }
                 b'/' if g.get(i + 1) == Some(&b'*') => {
                     if g.get(i + 2) == Some(&b'*') && !matches!(g.get(i + 3), Some(b'*') | Some(b'/')) {
-                        return true;
+                        return Some((prev_hi + i) as u32);
                     }
                     let mut depth = 0;
                     while i < g.len() {
@@ -359,10 +373,10 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
-                _ => return false,
+                _ => return None,
             }
         }
-        false
+        None
     }
 
     fn is_ident(&self) -> bool {
@@ -1297,8 +1311,30 @@ impl<'a> Parser<'a> {
         self.expand_call_inner(def, toks, call_lo)
     }
 
+    /// The `#![recursion_limit = ".."]` of this file's inner attributes.
+    fn written_recursion_limit(&self) -> Option<u32> {
+        if let Some(v) = self.rec_limit.get() { return v; }
+        let v = self.read_recursion_limit();
+        self.rec_limit.set(Some(v));
+        v
+    }
+
+    fn read_recursion_limit(&self) -> Option<u32> {
+        self.ast.root_attrs.iter().find_map(|a| {
+            if a.toks.hi == a.toks.lo + 3 && self.tok_text(self.toks.at(a.toks.lo as usize)) == b"recursion_limit" && self.tok_text(self.toks.at(a.toks.lo as usize + 1)) == b"=" {
+                std::str::from_utf8(self.tok_text(self.toks.at(a.toks.lo as usize + 2))).ok()?.trim_matches('"').parse().ok()
+            } else { None }
+        })
+    }
+
     fn expand_call_inner(&mut self, def: &crate::macros::MacroDef, toks: TokRange, call_lo: u32) -> PResult<usize> {
-        if self.exp_depth > 256 {
+        // rustc_expand expand_invoc: the crate's `#![recursion_limit = ".."]` bounds the expansion depth (a top-level call
+        // is at depth 1); the written limit is the root file's, other files keep the built-in bound
+        if let Some(limit) = self.written_recursion_limit() {
+            if self.exp_depth + 1 > limit {
+                return Err(PErr { pos: call_lo, msg: format!("recursion limit reached while expanding `{}!`", def.name) });
+            }
+        } else if self.exp_depth > 256 {
             return Err(PErr { pos: call_lo, msg: format!("`{}!` expands more than 256 levels deep -- add a base case", def.name) });
         }
         let trace = crate::preload::relax_trace().map_or(false, |t| t.split(',').any(|p| p.strip_prefix("expand:").map_or(false, |n| def.name.contains(n))));
@@ -1343,6 +1379,9 @@ impl<'a> Parser<'a> {
             eprintln!("expand {}! => {}", def.name, text);
         }
         let base = (self.src.len() + self.ext.len()) as u32;
+        if crate::macros::uses::recording() {
+            crate::macros::uses::synth_flush(self.bctx.as_ref().map_or("", |c| c.path.as_str()), base);
+        }
         for (off, o, n) in origins {
             self.tok_origin.push((base + off, o, n));
         }
@@ -1434,9 +1473,23 @@ impl<'a> Parser<'a> {
             self.pos = save;
             return Ok(None);
         }
+        let trailing = delim != b'{' && matches!(self.kind(), T::CloseBrace | T::Eof);
         self.eat(T::Semi);
         let start = self.expand_call(&def, toks, lo)?;
         let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
+        if trailing && def.builtin == 0 && crate::macros::uses::recording() {
+            // a macro call ending a block is an expression (rustc_expand flat_map_stmt
+            // `is_trailing_mac`): its expansion's `;` after the one expression is linted
+            let save = self.pos;
+            self.pos = start;
+            let one_expr = self.outer_attrs().is_ok() && self.expr().is_ok() && self.kind() == T::Semi && self.nth(1) == T::Eof;
+            let semi = self.lo();
+            self.pos = save;
+            if one_expr {
+                let file = self.bctx.as_ref().map_or("", |c| c.path.as_str()).to_string();
+                crate::macros::uses::trailing_semi(&file, semi, lo, &def.def_file);
+            }
+        }
         Ok(Some(self.in_expansion(start, |p| f(p, include))?))
     }
 
@@ -2757,6 +2810,10 @@ impl<'a> Parser<'a> {
             return Ok(Bound::Use(args));
         }
         let paren = self.eat(T::OpenParen);
+        // rustc_parse parse_trait_bound: the binder, then the modifiers (`for<'a> ?Tr` is an error, as is a
+        // binder after the modifiers)
+        let binder = self.kind() == T::KwFor && self.nth(1) == T::Lt;
+        let hrtb = self.hrtb()?;
         let mut konst = false;
         if self.kind() == T::Tilde && self.nth(1) == T::KwConst {
             self.pos += 2;
@@ -2765,9 +2822,17 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             konst = true;
         }
+        let async_pos = self.tok().lo;
         let async_ = self.eat(T::KwAsync);
+        if async_ { self.ast.gated_syntax.push(("async_trait_bounds", async_pos)); }
         let maybe = self.eat(T::Question);
-        let hrtb = self.hrtb()?;
+        if binder && maybe {
+            return self.err("`for<...>` binder not allowed with `?` trait polarity modifier");
+        }
+        if self.kind() == T::KwFor && self.nth(1) == T::Lt {
+            let _ = self.hrtb()?;
+            return self.err("`for<...>` binder should be placed before trait bound modifiers");
+        }
         if !self.ty_frags.is_empty() && self.ty_frags.contains(&{ self.tok().lo }) {
             return self.err("expected a trait, found type");
         }
@@ -3014,6 +3079,8 @@ impl<'a> Parser<'a> {
                 if self.eat(T::CloseParen) {
                     Ty::Tuple(List::EMPTY)
                 } else {
+                    // a type takes no attributes: a doc comment before a tuple element
+                    if let Some(pos) = self.doc_before_pos() { return Err(PErr { pos, msg: "expected type, found doc comment".into() }); }
                     let first = self.ty_plus()?;
                     if self.eat(T::CloseParen) {
                         Ty::Paren(first)
@@ -3023,6 +3090,7 @@ impl<'a> Parser<'a> {
                             if self.kind() == T::CloseParen {
                                 break;
                             }
+                            if let Some(pos) = self.doc_before_pos() { return Err(PErr { pos, msg: "expected type, found doc comment".into() }); }
                             v.push(self.ty_plus()?);
                         }
                         self.expect(T::CloseParen)?;
@@ -3225,6 +3293,10 @@ impl<'a> Parser<'a> {
     fn maybe_range_pat(&mut self, start: ExprId) -> PResult<Option<Pat>> {
         match self.kind() {
             T::DotDotEq | T::DotDotDot => {
+                // rustc_parse: `...` is a hard error in range patterns from edition 2021 (the edition of the written token)
+                if self.kind() == T::DotDotDot && self.edition >= 2021 && (self.toks.at(self.pos).lo as usize) < self.src.len() {
+                    return self.err("E0783: `...` range patterns are deprecated");
+                }
                 self.pos += 1;
                 let end = self.pat_range_end()?;
                 Ok(Some(Pat::Range(Some(start), Some(end), true)))
@@ -3282,7 +3354,8 @@ impl<'a> Parser<'a> {
                     trailing = true;
                 }
                 self.expect(T::CloseParen)?;
-                if v.len() == 1 && !trailing {
+                // rustc parse_pat_tuple_or_parens: `(..)` is a tuple pattern (a lone rest pattern)
+                if v.len() == 1 && !trailing && !matches!(self.ast.pat(v[0]), Pat::Rest) {
                     Pat::Paren(v[0])
                 } else {
                     Pat::Tuple(self.ast.push_list(v))
@@ -3500,6 +3573,12 @@ impl<'a> Parser<'a> {
                 if self.kind() == T::KwElse && self.pos > 0 && self.toks.at(self.pos - 1).kind == T::CloseBrace {
                     return self.err("right curly brace `}` before `else` in a `let...else` statement not allowed");
                 }
+                // check_let_else_init_bool_expr: a lazy boolean operator is not the whole initializer
+                if self.kind() == T::KwElse {
+                    if let ExprKind::Binary(op @ (BinOp::And | BinOp::Or), ..) = self.ast.expr(e).kind {
+                        return self.err(if op == BinOp::And { "a `&&` expression cannot be directly assigned in `let...else`" } else { "a `||` expression cannot be directly assigned in `let...else`" });
+                    }
+                }
                 let el = if self.eat(T::KwElse) { Some(self.block()?) } else { None };
                 (Some(e), el)
             } else {
@@ -3620,7 +3699,10 @@ impl<'a> Parser<'a> {
         let lo = self.lo();
         // attributes on expressions
         if self.kind() == T::Pound {
-            let _ = self.outer_attrs()?;
+            let at = self.tok().lo;
+            // (rustc gates these when the expression is configured, not while a macro fragment is matched)
+            let real = self.macros.is_some();
+            if !self.outer_attrs()?.is_empty() && real { self.ast.gated_syntax.push(("stmt_expr_attributes", at)); }
         }
         let lhs = self.unary(r)?;
         self.expr_continue(lhs, min, r, lo)
@@ -4131,6 +4213,7 @@ impl<'a> Parser<'a> {
             }
             T::Or | T::OrOr | T::KwMove => self.closure(false, false, r, lo),
             T::KwStatic if matches!(self.nth(1), T::Or | T::OrOr | T::KwMove) => {
+                self.ast.gated_syntax.push(("coroutines", self.tok().lo));
                 self.pos += 1;
                 self.closure(false, true, r, lo)
             }
@@ -4161,6 +4244,10 @@ impl<'a> Parser<'a> {
                         let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
                         return self.in_expansion(start, |p| {
                             let e = p.expr()?;
+                            if p.kind() == T::Semi && def.builtin == 0 && crate::macros::uses::recording() {
+                                let file = p.bctx.as_ref().map_or("", |c| c.path.as_str()).to_string();
+                                crate::macros::uses::trailing_semi(&file, p.lo(), lo, &def.def_file);
+                            }
                             p.eat(T::Semi);
                             if include { p.skip_to_eof(); }
                             Ok(e)
@@ -4341,16 +4428,14 @@ fn is_str(k: T) -> bool {
     matches!(k, T::Str | T::RawStr)
 }
 
+/// A tuple field index: only the canonical decimal spelling names a field (`.00`, `.001`, `.0_1`
+/// name none, rustc_hir_typeck check_expr_field compares the symbol with `sym::integer(index)`);
+/// any other spelling is `u32::MAX`, which no tuple or struct has.
 fn parse_index(s: &[u8]) -> u32 {
-    let mut n = 0u32;
-    for &c in s {
-        if c.is_ascii_digit() {
-            n = n * 10 + (c - b'0') as u32;
-        } else if c != b'_' {
-            break;
-        }
+    match std::str::from_utf8(s).ok().and_then(crate::ast::tuple_index) {
+        Some(n) => n,
+        None => u32::MAX,
     }
-    n
 }
 
 /// Lex + parse one file.

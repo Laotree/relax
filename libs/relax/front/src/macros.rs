@@ -1794,7 +1794,7 @@ pub mod uses {
     use crate::lexer::T;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
+    use relax_session::sync::Mutex;
 
     /// A definition: where it is written, and for each rule the position of its matcher and
     /// whether its transcriber holds a `compile_error!` (such a rule is never reported).
@@ -1845,6 +1845,50 @@ pub mod uses {
     pub(super) fn used(d: &MacroDef, arm: u32) {
         if !recording() || d.builtin != 0 { return; }
         USED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((d.def_file.clone(), d.def_pos, arm));
+    }
+
+    // The parentheses a transcription adds around a multi-token `$e:expr` fragment (the AST has
+    // no interpolated-expression node): the lints must see through them.
+    thread_local! { static SYNTH_PENDING: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) }; }
+    static SYNTH: Mutex<Option<HashSet<(String, u32)>>> = Mutex::new(None);
+
+    /// The transcriber added a paren at text offset `off` of the expansion being built.
+    pub(super) fn synth_note(off: u32) {
+        if recording() { SYNTH_PENDING.with(|p| p.borrow_mut().push(off)); }
+    }
+
+    /// The expansion built on this thread starts at `base` of `file`: its added parens are at `base + offset`.
+    pub fn synth_flush(file: &str, base: u32) {
+        let v = SYNTH_PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        if v.is_empty() { return; }
+        let mut g = SYNTH.lock().unwrap_or_else(|e| e.into_inner());
+        let set = g.get_or_insert_with(Default::default);
+        for off in v { set.insert((file.to_string(), base + off)); }
+    }
+
+    /// Whether the `(` at `pos` of `file` was added by a transcription around an expression fragment.
+    pub fn is_synth_paren(file: &str, pos: u32) -> bool {
+        SYNTH.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&(file.to_string(), pos)))
+    }
+
+    /// A `;` that ends a macro_rules expansion parsed as an expression (rustc_expand
+    /// ParserAnyMacro::make, semicolon_in_expressions_from_macros): the expansion's file, the
+    /// `;` token's position, the call's position and the file of the macro's definition.
+    pub struct TrailingSemi {
+        pub file: String,
+        pub semi: u32,
+        pub call: u32,
+        pub def_file: String,
+    }
+
+    static SEMIS: Mutex<Vec<TrailingSemi>> = Mutex::new(Vec::new());
+
+    pub fn trailing_semi(file: &str, semi: u32, call: u32, def_file: &str) {
+        SEMIS.lock().unwrap_or_else(|e| e.into_inner()).push(TrailingSemi { file: file.to_string(), semi, call, def_file: def_file.to_string() });
+    }
+
+    pub fn take_trailing_semis() -> Vec<TrailingSemi> {
+        std::mem::take(&mut *SEMIS.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// The recorded definitions and uses (file, definition position, rule or `RESOLVED`).
@@ -1938,7 +1982,13 @@ fn parse_matcher(toks: &[MTok], edition: u16) -> Result<Vec<MNode>, String> {
             let n = &toks[i + 1];
             if n.kind == T::OpenParen {
                 let (lo, hi, sep, op, next) = rep_at(toks, i).ok_or("bad repetition in macro matcher")?;
-                out.push(MNode::Rep(parse_matcher(&toks[lo..hi], edition)?, sep, op));
+                let inner = parse_matcher(&toks[lo..hi], edition)?;
+                // mbe/macro_rules.rs check_lhs_no_empty_seq: a repetition without separator must not match nothing
+                if sep.is_none() && crate::lexer::validation_enabled()
+                    && inner.iter().all(|n| matches!(n, MNode::Var(_, Frag::Vis) | MNode::Rep(_, _, b'*' | b'?'))) {
+                    return Err("repetition matches empty token tree".to_string());
+                }
+                out.push(MNode::Rep(inner, sep, op));
                 i = next;
                 continue;
             }
@@ -2467,6 +2517,7 @@ impl<'a> Parser<'a> {
                         let bare_macro = *f == Frag::Expr && taken.is_none() && ends && self.is_macro_call(*lo, *hi);
                         let wrap = *f == Frag::Expr && hi - lo + usize::from(taken.is_some()) > 1 && !*bare && !bare_macro;
                         if wrap {
+                            uses::synth_note(out.s.len() as u32 + 1);
                             out.push(T::OpenParen, "(", None, u32::MAX);
                         }
                         let group_start = out.s.len() + 1;

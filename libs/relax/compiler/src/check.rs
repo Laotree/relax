@@ -126,8 +126,11 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         }
     }
     errors.extend(relax_types::item_checks::duplicate_items(&u.prog, &own));
+    errors.extend(relax_types::item_checks::gated_syntax(&u.prog, &own));
+    errors.extend(relax_types::item_checks::node_attribute_targets(&u.prog, &own));
     errors.extend(relax_types::item_checks::foreign_blocks(&u.prog, &own));
     errors.extend(relax_types::item_checks::duplicate_symbols(&u.prog, &own));
+    errors.extend(relax_types::item_checks::global_allocators_and_lang_items(&u.prog, &own));
     if u.prog.crates[root as usize].is_bin { errors.extend(relax_types::item_checks::entry_point(&u.prog, root)); }
     if u.prog.crates[root as usize].is_bin { errors.extend(relax_types::item_checks::entry_symbol_conflict(&u.prog, &own, root)); }
     errors.extend(relax_types::lint_levels::check(&u.prog, &own));
@@ -218,6 +221,10 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let body = u.tcx.typeck(&u.prog, anon);
             let mut errs = body.errors.to_vec();
+            if errs.is_empty() {
+                relax_types::lint::check_literals(&u.prog, &u.tcx, &body);
+                relax_types::lint_pass::check_body(&u.prog, &u.tcx, &body);
+            }
             // rustc check_consts: an anonymous constant is a const context of its own
             if errs.is_empty() && crate::borrowck::enabled(options) {
                 if let Some((_, relax_front::def_collector::NodeId::AnonConst(expr))) = u.prog.def_id_to_node_id.get(&anon) {
