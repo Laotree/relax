@@ -11282,6 +11282,8 @@ extern "C" fn relax_first_present() {
             eprintln!("makepad-run O2 at first present: {} installed ({:.1} ms worker cpu), {} dropped; main thread waited {:.2} ms in {} unit-lock waits on the O2 worker; {} baseline slots sampled (queued)", n(0), n(1) as f64 / 1e6, n(2), n(3) as f64 / 1e6, n(4), hit);
         }
         crate::warm::first_present();
+        // the boot's crate records and front graph (cold front end: queued, not written, at load)
+        crate::cache::start_deferred_front();
         if let Some(t) = STARTUP_THREAD.get() {
             t.unpark();
         }
