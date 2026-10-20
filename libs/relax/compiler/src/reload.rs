@@ -2633,7 +2633,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         trace_sub("imports");
         let lowered = if body_only {
-            u.prog.lower_body_declarations(&legacy_owners)
+            u.prog.lower_body_declarations(&legacy_owners, &news.iter().map(|&(_, n)| n).collect::<Vec<_>>())
         } else {
             crate::def_collector::lower_legacy_const_generics_in(&mut u.prog, Some(&visible_crates))
         };

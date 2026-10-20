@@ -2020,10 +2020,13 @@ impl Program {
 
     /// Called once after all body-only versions have been committed under the
     /// front write lock. Unchanged owners retain their resolution results.
-    pub fn lower_body_declarations(&mut self, changed: &[DefId]) -> usize {
-        let owners: Vec<DefId> = self.legacy_const_args.keys().copied().collect();
+    /// `files`: the versions the transaction committed. Only the owners defined in them moved to
+    /// another file; every other owner's result already describes its file.
+    pub fn lower_body_declarations(&mut self, changed: &[DefId], files: &[u32]) -> usize {
+        let owners: Vec<DefId> = files.iter().flat_map(|&f| self.defs_in_file(f).iter().map(|&d| DefId(d)))
+            .filter(|d| self.legacy_const_args.contains_key(d) && !changed.contains(d)).collect();
         for owner in owners {
-            if !changed.contains(&owner) { crate::def_collector::retarget_legacy_owner(self, owner); }
+            crate::def_collector::retarget_legacy_owner(self, owner);
         }
         crate::def_collector::lower_legacy_const_owners(self, changed)
     }
