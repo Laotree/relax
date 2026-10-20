@@ -57,15 +57,12 @@ pub fn in_any_value_of_ty(cx: &ConstCx<'_>, ty: TyId, tainted_by_errors: bool) -
 }
 
 /// Whether the types of `body` can be qualified at all: no error or inference types and no
-/// coroutines (whose saved-local types the checker cannot see).
+/// (a coroutine is qualified conservatively: it needs drop and has interior mutability).
 pub fn check_body_types(cx: &ConstCx<'_>) -> Result<(), Blocked> {
     for decl in &cx.body.local_decls {
         let flags = cx.tcx.tys.flags(decl.ty);
         if flags.intersects(TypeFlags::HAS_ERROR) || flags.intersects(TypeFlags::HAS_NON_REGION_INFER) {
             return Err(Blocked("unresolved type in constant qualification"));
-        }
-        if cx.tcx.is_coroutine(decl.ty) {
-            return Err(Blocked("coroutine types are not qualified"));
         }
     }
     Ok(())

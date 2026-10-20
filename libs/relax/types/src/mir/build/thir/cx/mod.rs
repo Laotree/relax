@@ -246,6 +246,13 @@ impl<'a> Cx<'a> {
                     // parameter by value; the coroutine's own body is `OwnerKind::Closure` with the
                     // expression id `ASYNC_FN_BODY | body block`
                     let params = self.fn_params(sig, item.lo)?;
+                    // rustc moves each argument whole into the coroutine and matches its pattern
+                    // there; this lowering matches in the function, which is only equivalent for a
+                    // plain by-value binding
+                    for &param in &params {
+                        let simple = self.thir[param].pat.as_ref().is_none_or(|p| matches!(p.kind, PatKind::Binding { mode: BindingMode(crate::mir::ByRef::No, _), subpattern: None, .. }));
+                        if !simple { return self.unresolved(item_span, "async fn parameter pattern"); }
+                    }
                     let b = ast.block(body);
                     let scopes = fn_scopes(&self, Node::Block(body.0), item_span)?;
                     let Some(&opaque) = prog.node_id_to_def_id.get(&(def.file, relax_front::def_collector::NodeId::AsyncReturn(def.item))) else { return self.unresolved(item_span, "async fn return type") };
