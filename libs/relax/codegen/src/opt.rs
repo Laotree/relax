@@ -10887,6 +10887,33 @@ mod tests {
         assert!(!forward_slot_dests_x(&relax_session::Options::default(), &mut f, 32), "B was built over the returned result");
     }
 
+    #[test]
+    fn split_wide_access_cut_by_narrow_stores_lets_sroa_promote() {
+        // a pair of u32 stored one by one and moved as one u64
+        let mut f = Func::new("pair".into(), 0);
+        let (a, b) = (f.vreg(Cls::I), f.vreg(Cls::I));
+        f.params.extend([a, b]);
+        let s = f.slot(8, 8);
+        let (p, w, d) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        f.block();
+        f.blocks[0].insts = vec![
+            Inst::SlotAddr(p, s),
+            Inst::Store(Mem::Int(4, false), p, 0, a),
+            Inst::Store(Mem::Int(4, false), p, 4, b),
+            Inst::Load(Mem::Int(8, false), w, p, 0),
+            Inst::IBinI(IOp::Add, U64, d, w, 1),
+        ];
+        f.blocks[0].term = Term::Ret(vec![d]);
+        f.rets = vec![Cls::I];
+        f.blocks[0].pos = vec![0; f.blocks[0].insts.len()];
+        assert!(split_wide_slot_accesses(&mut f));
+        f.verify().unwrap();
+        assert!(!f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Load(Mem::Int(8, _), ..))));
+        assert_eq!(f.blocks[0].insts.len(), f.blocks[0].pos.len());
+        assert!(sroa(&mut f));
+        assert!(!f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Load(..) | Inst::Store(..))), "pair stayed in memory");
+    }
+
     fn sroa_fixture(size: u32) -> (Func, VReg) {
         let mut f = Func::new("sroa".into(), 0);
         let base = f.vreg(Cls::I);
