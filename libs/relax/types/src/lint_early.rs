@@ -3053,6 +3053,19 @@ fn cfg_attr_empties(prog: &Program, own: &[bool]) {
     }
 }
 
+pub const NAMED_ARGUMENTS_USED_POSITIONALLY: Lint = lint::lint("named_arguments_used_positionally");
+
+fn named_args_positional(prog: &Program, own: &[bool]) {
+    for (path, pos, name) in crate::macros::uses::take_named_arg_positional() {
+        let Some(file) = prog.file_paths.iter().position(|p| *p == path) else { continue };
+        let krate = prog.file_crate.get(file).copied().unwrap_or(u32::MAX);
+        if !own.get(krate as usize).copied().unwrap_or(false) { continue; }
+        if lint::external(prog, file as u32, pos) { continue; }
+        let def = enclosing_def(prog, file as u32, prog.files[file].lint_pos(pos), krate);
+        emit(prog, def, &NAMED_ARGUMENTS_USED_POSITIONALLY, file as u32, pos, &format!("named argument `{}` is not used by name", name));
+    }
+}
+
 /// The crate-level attribute lints: `unknown_crate_types` (an invalid `#![crate_type]`) and the
 /// crate's `missing_docs`.
 fn crate_attr_lints(prog: &Program, own: &[bool]) {
@@ -3114,6 +3127,7 @@ pub fn finish(prog: &Program, own: &[bool]) {
     if !lint::enabled() { return; }
     trailing_semis(prog, own);
     cfg_attr_empties(prog, own);
+    named_args_positional(prog, own);
     crate_attr_lints(prog, own);
     let (defs, used) = crate::macros::uses::take();
     if defs.is_empty() { return; }

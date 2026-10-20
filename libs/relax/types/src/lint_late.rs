@@ -2465,6 +2465,30 @@ pub fn variant_size_differences(prog: &Program, tcx: &Tcx, own: &[bool]) {
     }
 }
 
+pub const ASYNC_FN_IN_TRAIT: Lint = lint::lint("async_fn_in_trait");
+
+/// rustc_lint async_fn_in_trait.rs: an `async fn` in a publicly reachable trait.
+pub fn async_fn_in_trait(prog: &Program, own: &[bool], reach: &crate::lint_dead::Reach) {
+    if !lint::enabled() { return; }
+    for i in 0..prog.defs.len() {
+        let d = DefId(i as u32);
+        let def = prog.def(d);
+        if def.kind != DefKind::AssocFn || !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
+        if prog.def(def.parent).kind != DefKind::Trait || !reach.defs.contains(&def.parent) || lint::generated(prog, d) { continue; }
+        let pf = &prog.files[def.file as usize];
+        let ast = &pf.ast;
+        let item = ast.item(def.item);
+        let ItemKind::Fn(sig, _, _) = item.kind else { continue };
+        if !ast.fn_sig(sig).asyncness { continue; }
+        // the `async` keyword before the name
+        let head = pf.bytes(item.lo, item.name.lo);
+        let Some(k) = head.windows(5).position(|w| w == b"async") else { continue };
+        let pos = item.lo + k as u32;
+        if lint::external(prog, def.file, pos) { continue; }
+        lint::emit(prog, d, &ASYNC_FN_IN_TRAIT, def.file, pos, "use of `async fn` in public traits is discouraged as auto trait bounds cannot be specified");
+    }
+}
+
 /// rustc builtin.rs `MissingCopyImplementations`: a reachable, non-generic ADT with no
 /// destructor, no raw pointer field, no `Iterator` impl, at most 256 bytes and only `Copy`
 /// fields could implement `Copy`.
