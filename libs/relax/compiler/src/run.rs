@@ -3085,6 +3085,7 @@ fn summary_inner(why: &str) {
                     FnKey::Shim(_) => ("shim", "-".to_string(), true),
                     FnKey::Glue(g, _) => (if *g == jit::GLUE_DROP { "drop" } else { "glue" }, "-".to_string(), true),
                     FnKey::Sandbox(_) => ("sandbox", "-".to_string(), false),
+                    FnKey::Plain(_) => ("plain", "-".to_string(), false),
                 };
                 let src = jit::src_size(u, idx as u32);
                 let (origin, tr, selfty) = report_origin(u, &f.key);
@@ -3204,7 +3205,7 @@ fn report_origin(u: &jit::Unit, key: &FnKey) -> (&'static str, String, String) {
             };
             (origin, tr, selfty)
         }
-        FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) => ("-", String::new(), String::new()),
+        FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) => ("-", String::new(), String::new()),
     }
 }
 
