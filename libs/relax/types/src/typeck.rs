@@ -869,7 +869,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         let plain = matches!(ast.pat(p.pat), Pat::Ident { by_ref: false, sub: None, .. });
         if async_fn_body && !plain {
             let li = fcx.b.locals.len() as u32;
-            fcx.b.locals.push(Local { name: prog.syms.get("_").or_else(|| prog.syms.get("self")).unwrap_or(0), ty: t, mutable: false, pat: u32::MAX - 1 });
+            fcx.b.locals.push(Local { name: prog.syms.get("_").or_else(|| prog.syms.get("self")).unwrap_or(0), ty: t, mutable: true, pat: u32::MAX - 1 });
             fcx.local_hyg.resize(li as usize + 1, (Some(Vec::new()), 0));
             fcx.local_hyg[li as usize] = (None, 0);
             fcx.b.pat_local.insert(p.pat.0 | ASYNC_ARG_KEY, li);

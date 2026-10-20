@@ -435,7 +435,7 @@ impl<'a> Cx<'a> {
                 Some(&whole) => {
                     let local = &tb.locals[whole as usize];
                     let span = self.span(0, 0);
-                    self.binding_pat(LocalVarId(whole), "_", local.ty, false, span)
+                    self.binding_pat(LocalVarId(whole), "_", local.ty, true, span)
                 }
                 None => self.lower_pattern(p.pat)?,
             };
