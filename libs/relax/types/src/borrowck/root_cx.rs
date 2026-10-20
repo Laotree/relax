@@ -247,7 +247,7 @@ impl BorrowCheckRootCtxt<'_> {
             ClauseOwner::Def(_) => vec![],
         };
         // the nested body numbers its own placeholders after those it inherits from this body (`UniversalRegionsBuilder::build`)
-        let placeholder_base = universals.indices.iter().filter(|(r, _)| matches!(tys.region_kind(*r), RegionKind::RePlaceholder { .. })).count() as u32;
+        let placeholder_base = super::universal_regions::placeholder_base(self.tcx, universals.indices.iter().map(|(r, _)| *r));
         (0..num_external_vids).map(|vid| {
             let identity = child.universals.indices.iter().find(|(_, v)| *v == vid).map(|x| x.0)
                 .unwrap_or_else(|| panic!("external region {vid} of a nested body has no identity"));

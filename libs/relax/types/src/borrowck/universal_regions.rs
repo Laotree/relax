@@ -110,7 +110,7 @@ impl UniversalRegionsBuilder<'_> {
             // bound by an enclosing callable. Instantiate that outer binder as
             // external query identities before the ordinary erased-region pass.
             let raw: Vec<_> = inputs.iter().copied().chain([output]).collect();
-            let base = self.parent.as_ref().map_or(0,|p| p.regions.iter().filter(|u| matches!(u.identity,Identity::Region(_,r) if matches!(tcx.tys.region_kind(r),RegionKind::RePlaceholder { .. }))).count() as u32);
+            let base = self.parent.as_ref().map_or(0,|p| placeholder_base(tcx,p.regions.iter().filter_map(|u| match u.identity { Identity::Region(_,r) => Some(r), _ => None })));
             let mut replaced = crate::borrowck::implied_bounds::replace_erased_regions_with_placeholders(tcx,&raw,base);
             let next = std::cell::Cell::new(base + crate::borrowck::implied_bounds::implied_bounds_query_var_values(tcx,&replaced,
                 |r| matches!(tcx.tys.region_kind(r),RegionKind::RePlaceholder { .. })).len() as u32);
@@ -171,7 +171,16 @@ impl UniversalRegionsBuilder<'_> {
     }
     fn compute_indices(&mut self) -> UniversalRegionIndices {
         let mut regions = match self.parent.take() {
-            Some(parent) => parent.regions.into_iter().filter(|r| !matches!(r.identity,Identity::FnBody(_))).map(|mut r| {
+            // The parent's erased regions (its signature's placeholders, its environment's erased regions) are its own
+            // external regions: the nested closure's types hold them erased, as regions of their own.
+            Some(parent) => parent.regions.into_iter().filter(|r| !matches!(r.identity,Identity::FnBody(_)) && !match r.identity {
+                Identity::Region(_,x) => match self.tcx.tys.region_kind(x) {
+                    RegionKind::RePlaceholder { .. } => true,
+                    RegionKind::ReLateParam(_,LateParamKind::Anon(n)) => n >= ENV_ERASED_BASE,
+                    _ => false,
+                },
+                _ => false,
+            }).map(|mut r| {
                 if r.class != RegionClassification::Global { r.class = RegionClassification::External; } r
             }).collect(),
             None => vec![],
@@ -180,6 +189,12 @@ impl UniversalRegionsBuilder<'_> {
         UniversalRegionIndices { regions }
     }
 }
+/// The number the placeholders of a body nested in the one with these universal regions start from: after all of the
+/// creator's own, so that the two bodies' placeholders are different regions.
+pub fn placeholder_base(tcx: &Tcx, regions: impl Iterator<Item = RegionId>) -> u32 {
+    regions.filter_map(|r| match tcx.tys.region_kind(r) { RegionKind::RePlaceholder { var, .. } => Some(var.0 + 1), _ => None }).max().unwrap_or(0)
+}
+
 /// rustc's `replace_free_regions_with_nll_infer_vars` makes every region of the defining type, erased ones
 /// included, a universal region of its own: each erased occurrence of a closure's environment type takes a
 /// distinct identity, scoped to the closure (a nested closure inherits its creator's universal regions,
