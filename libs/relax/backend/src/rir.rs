@@ -10,6 +10,24 @@ pub enum Cls {
     F64,
     /// 128-bit vector of four 32-bit lanes (f32 or i32 by op); lives in float registers
     V128,
+    /// 256-bit vector (x64 AVX ymm): made only by `pair256` after optimisation, from V128
+    /// pairs that are the two halves of one value; every op on it is the V128 op on both halves
+    V256,
+}
+
+impl Cls {
+    /// a vector class (lives in a float register, saved and spilled whole)
+    pub fn is_vec(self) -> bool {
+        matches!(self, Cls::V128 | Cls::V256)
+    }
+    /// bytes of a spill slot of this class (vector slots 16-aligned)
+    pub fn spill_bytes(self) -> u32 {
+        match self {
+            Cls::V128 => 16,
+            Cls::V256 => 32,
+            _ => 8,
+        }
+    }
 }
 
 /// Lane width of a lane-typed vector op (`Inst::VX`): 8, 16, 32 or 64 bits (float ops: S = f32,
@@ -199,13 +217,18 @@ pub enum VX {
     MaxAcrossU(VW),
     /// I -> V128: the scalar in the low 64 bits, upper bits zero
     FromLo64,
+    // ---- 256-bit halves (made only by `pair256`)
+    /// (V128 lo, V128 hi) -> V256
+    Join,
+    /// V256 -> V128: the low (false) or high (true) half
+    Half(bool),
 }
 
 impl VX {
     /// Operands read: 1 (unary, scalar-from), 2, or 3 (Inst::VX3).
     pub fn arity(self) -> usize {
         match self {
-            VX::ArmSha1H | VX::FCvtLo | VX::MoveMask(_) | VX::FNeg(_) | VX::FAbs(_) | VX::FSqrt(..) | VX::FRound(..) | VX::FToI(_) | VX::IToF(_) | VX::Neg(_) | VX::Abs(_) | VX::ShlI(..) | VX::ShrUI(..) | VX::ShrSI(..) | VX::ShufS(_) | VX::BytesShrI(_) | VX::BytesShlI(_) | VX::WidenLoU(_) | VX::WidenHiU(_) | VX::WidenLoS(_) | VX::WidenHiS(_) | VX::PairAddLongU(_) | VX::Splat(_) | VX::Extract(..) | VX::MoveMaskB | VX::AddAcross(_) | VX::MaxAcrossU(_) | VX::FromLo64 => 1,
+            VX::ArmSha1H | VX::FCvtLo | VX::MoveMask(_) | VX::FNeg(_) | VX::FAbs(_) | VX::FSqrt(..) | VX::FRound(..) | VX::FToI(_) | VX::IToF(_) | VX::Neg(_) | VX::Abs(_) | VX::ShlI(..) | VX::ShrUI(..) | VX::ShrSI(..) | VX::ShufS(_) | VX::BytesShrI(_) | VX::BytesShlI(_) | VX::WidenLoU(_) | VX::WidenHiU(_) | VX::WidenLoS(_) | VX::WidenHiS(_) | VX::PairAddLongU(_) | VX::Splat(_) | VX::Extract(..) | VX::MoveMaskB | VX::AddAcross(_) | VX::MaxAcrossU(_) | VX::FromLo64 | VX::Half(_) => 1,
             VX::X86Sha256Rnds2 | VX::ArmSha1C | VX::ArmSha1P | VX::ArmSha1M
             | VX::ArmSha1Su0 | VX::ArmSha256H | VX::ArmSha256H2 | VX::ArmSha256Su1 => 3,
             _ => 2,

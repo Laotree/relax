@@ -6704,7 +6704,7 @@ impl<'a> Lcx<'a> {
                 d
             }
             // type layouts never have vector leaves
-            Cls::F64 | Cls::V128 => {
+            Cls::F64 | Cls::V128 | Cls::V256 => {
                 let d = self.f.vreg(Cls::F64);
                 self.emit(Inst::Fconst(d, raw, true));
                 d

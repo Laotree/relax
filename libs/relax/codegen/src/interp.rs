@@ -2856,6 +2856,7 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<(IFunc,
                             Cls::F32 => 1,
                             Cls::F64 => 2,
                             Cls::V128 => 3,
+                            Cls::V256 => unreachable!("V256 exists only inside the x64 back end (pair256)"),
                         };
                         ws.push(l.r(*v) | code << 32);
                     }
