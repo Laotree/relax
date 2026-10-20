@@ -634,7 +634,11 @@ fn icc(c: Cond, signed: bool) -> u8 {
 fn x64_clobbers(options: &relax_session::Options, i: &Inst) -> u64 {
     match i {
         Inst::IBin(IOp::Shl | IOp::Shr, _, _, _, _) if host_bmi2(options) => 0,
-        Inst::IBin(IOp::Div | IOp::Rem | IOp::Shl | IOp::Shr | IOp::Rotl | IOp::MulHi, _, _, _, _) | Inst::Conv(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) => (1 << RCX) | (1 << RDX),
+        // of the conversions only u64 -> float works in rcx / rdx (halve with a sticky bit); a
+        // movzx / movsx clobbering them pushed byte casts out of rcx / rdx and into spill slots
+        Inst::Conv(Conv::IntToF(from, _), _, _) if from.bits == 64 && !from.signed => (1 << RCX) | (1 << RDX),
+        Inst::Conv(..) => 0,
+        Inst::IBin(IOp::Div | IOp::Rem | IOp::Shl | IOp::Shr | IOp::Rotl | IOp::MulHi, _, _, _, _) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) => (1 << RCX) | (1 << RDX),
         _ => 0,
     }
 }
