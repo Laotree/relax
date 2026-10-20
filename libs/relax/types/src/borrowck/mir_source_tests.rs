@@ -646,3 +646,11 @@ fn an_async_fn_in_a_generic_impl_maps_the_signatures_erased_regions_after_its_pa
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn a_late_bound_lifetime_equal_to_static_by_implied_bounds_is_a_defining_use_argument() {
+    // `&'static &'_ ()` implies `'_: 'static`: the opaque's captured `'_` is 'static in the canonical arguments.
+    let (errors, unchecked) = borrowck_source_in("pub async fn x(x: &'static &'_ ()) {} pub fn y(x: &'static &()) -> impl Sized { }", 2024);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
