@@ -864,7 +864,8 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         fcx.b.locals.push(Local { name: s, ty: params[0], mutable, pat: u32::MAX });
         // `self` is hygienic like any local: a macro defined before the fn does not see it
         fcx.local_hyg.resize(li as usize + 1, (Some(Vec::new()), 0));
-        fcx.local_hyg[li as usize] = (Some(prog.files[file as usize].hyg_ctxt(ast.item(d.item).lo)), ast.item(d.item).lo);
+        let at = prog.files[file as usize].self_param_pos(ast.item(d.item).lo);
+        fcx.local_hyg[li as usize] = (Some(prog.files[file as usize].hyg_ctxt(at)), at);
         fcx.scopes.push((s, li));
         pi = 1;
     }

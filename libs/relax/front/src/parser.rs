@@ -4905,6 +4905,25 @@ impl ParsedFile {
     }
 
     /// Token `i`: the file's, then its lazily parsed bodies' expansion tokens.
+    /// The position of the `self` receiver token of the function item starting at `item_lo` (the
+    /// item's start when it has none in its parameter list): its hygiene context is the receiver's
+    /// own, which a macro may have passed in from the call site.
+    pub fn self_param_pos(&self, item_lo: u32) -> u32 {
+        let mut i = self.toks.partition_point(|t| t.lo < item_lo) as u32;
+        let mut depth = 0i32;
+        while (i as usize) < self.toks.len() {
+            match self.tok(i).kind {
+                T::OpenParen => depth += 1,
+                T::CloseParen => { depth -= 1; if depth <= 0 { break; } }
+                T::KwSelfValue if depth == 1 => return self.tok(i).lo,
+                T::OpenBrace | T::Semi if depth == 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        item_lo
+    }
+
     pub fn tok(&self, i: u32) -> Tok {
         match self.toks.get(i as usize) {
             Some(t) => t,
