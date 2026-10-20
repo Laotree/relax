@@ -2249,7 +2249,17 @@ impl Tcx {
             ast::Ty::Array(x, n) => {
                 let inner = self.lower_ty(cx, prog, file, module, env, *x);
                 if is_infer_len(ast, *n) {
-                    let length = match cx.infcx { Some(infcx) => infcx.next_const_var(), None => self.tys.intern_const(crate::consts::ConstKind::Error) };
+                    let length = match cx.infcx {
+                        Some(infcx) => infcx.next_const_var(),
+                        None => {
+                            // ItemCtxt::ct_infer: no `_` length in an item's signature either
+                            if self.validates(prog, file) {
+                                let pos = env.owner.filter(|o| prog.def(*o).file == file).map_or(0, |o| ast.item(prog.def(o).item).lo);
+                                self.err(cx, prog, file, pos, "E0121: the placeholder `_` is not allowed within types on item signatures".to_string());
+                            }
+                            self.tys.intern_const(crate::consts::ConstKind::Error)
+                        }
+                    };
                     return self.tys.mk_array(inner, length);
                 }
                 let lt = self.lower_const_arg(prog, file, env, *n, self.tys.usize_);

@@ -85,9 +85,9 @@ impl Program {
                     targets.resize(ranges.len(), 3);
                 }
             }
-            // `macro_rules!` items define nothing of the program's: their attributes are the item's own
-            for it in f.ast.items.iter() {
-                if matches!(it.kind, ItemKind::MacroRules(_)) && it.lo < f.src_len {
+            // `macro_rules!`, `use` and `extern crate` items define nothing of the program's: their attributes are the item's own
+            for (ii, it) in f.ast.items.iter().enumerate() {
+                if matches!(it.kind, ItemKind::MacroRules(_) | ItemKind::Use(..) | ItemKind::ExternCrate(_)) && it.lo < f.src_len && !self.item_defs.contains_key(&(fi as u32, ii as u32)) {
                     ranges.extend_from_slice(f.ast.list(it.attrs));
                     targets.resize(ranges.len(), 2);
                 }
