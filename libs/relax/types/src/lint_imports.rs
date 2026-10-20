@@ -22,6 +22,8 @@ use crate::lexer::T;
 use std::collections::{HashMap, HashSet};
 
 pub const UNUSED_IMPORTS: Lint = lint::lint("unused_imports");
+pub const REDUNDANT_IMPORTS: Lint = lint::lint("redundant_imports");
+pub const UNUSED_EXTERN_CRATES: Lint = lint::lint("unused_extern_crates");
 
 /// Traits one of whose methods a checked body calls (collected with the bodies).
 static METHOD_TRAITS: relax_session::sync::Mutex<Option<HashSet<DefId>>> = relax_session::sync::Mutex::new(None);
@@ -322,6 +324,9 @@ pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::
         macro_closure(prog, &mut names);
         written.push(names);
     }
+    for sc in &scopes {
+        unused_extern_crates(prog, sc);
+    }
     for (si, sc) in scopes.iter().enumerate() {
         let names = &written[si];
         for &it in &sc.items {
@@ -367,6 +372,17 @@ pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::
                 }
             }
             let _ = tcx;
+            if !exported && !matches!(item.vis, Vis::Pub) {
+                for l in &ls {
+                    if !unused.contains(&l.span) && ctx.redundant(l) {
+                        let pf = &prog.files[sc.file as usize];
+                        let attrs = sc.ast.list(item.attrs).to_vec();
+                        let name = l.name.as_deref().unwrap_or("");
+                        let _ = pf;
+                        lint::emit_in(prog, sc.def, &attrs, &REDUNDANT_IMPORTS, sc.file, l.span.0, &format!("the item `{}` is imported redundantly", name));
+                    }
+                }
+            }
             if unused.is_empty() { continue; }
             let pf = &prog.files[sc.file as usize];
             let mut snippets: Vec<String> = unused.iter().map(|&(a, b)| format!("`{}`", String::from_utf8_lossy(pf.bytes(a, b)).trim_end_matches(|c: char| c == ';' || c.is_whitespace()))).collect();
@@ -380,6 +396,33 @@ pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::
             let attrs = sc.ast.list(item.attrs).to_vec();
             lint::emit_in(prog, sc.def, &attrs, &UNUSED_IMPORTS, sc.file, unused[0].0, &msg);
         }
+    }
+}
+
+/// `unused_extern_crates` (check_unused.rs report_unused_extern_crate_items, the fully unused
+/// case): an `extern crate` item nothing resolved through, neither its module binding nor (a
+/// renamed one at the crate root) its extern prelude entry.
+fn unused_extern_crates(prog: &Program, sc: &Scope<'_>) {
+    if sc.block || sc.module == u32::MAX { return; }
+    let krate = prog.mods[sc.module as usize].krate;
+    let ast = sc.ast;
+    for &it in &sc.items {
+        let item = ast.item(it);
+        let ItemKind::ExternCrate(rename) = item.kind else { continue };
+        if matches!(item.vis, Vis::Pub) || lint::external(prog, sc.file, item.lo) || item.lo >= prog.files[sc.file as usize].src_len { continue; }
+        // attributes (`#[macro_use]`) may have semantics a removal loses
+        if !ast.list(item.attrs).is_empty() { continue; }
+        let pf = &prog.files[sc.file as usize];
+        let shown = pf.text(item.name).to_string();
+        if shown == "self" { continue; }
+        let bind_text = rename.map_or(shown.clone(), |r| pf.text(r).to_string());
+        if bind_text.starts_with('_') { continue; }
+        let bind = prog.syms.intern_late(&bind_text);
+        let root = prog.crates[krate as usize].root_mod == sc.module;
+        let used = prog.import_binding_used(sc.module, bind) || (rename.is_some() && root && prog.extern_prelude_used(krate, bind));
+        if used { continue; }
+        let attrs = ast.list(item.attrs).to_vec();
+        lint::emit_in(prog, sc.def, &attrs, &UNUSED_EXTERN_CRATES, sc.file, item.lo, "unused extern crate");
     }
 }
 
@@ -458,6 +501,34 @@ impl Ctx<'_, '_> {
             Some(d) => prog.def(d).kind == DefKind::Trait,
             None => true,
         }
+    }
+
+    /// check_for_redundant_imports: a single import `use a::name;` (no rename) of an item the
+    /// scope reaches without it (outside the module: the preludes; in a block: the enclosing
+    /// scopes) under the same name, in every namespace the import binds.
+    fn redundant(&self, l: &Leaf) -> bool {
+        let prog = self.prog;
+        let sc = self.sc;
+        if l.glob || l.empty || l.under || sc.module == u32::MAX { return false; }
+        let Some(name) = l.name.as_deref() else { return false };
+        let pf = &prog.files[sc.file as usize];
+        // `use source as target` with another name is never redundant
+        if l.segs.last().is_none_or(|s| pf.text(s.name) != name) { return false; }
+        let sym = prog.syms.intern_late(name);
+        let mut any = false;
+        for ns in [true, false] {
+            let Some(mine) = prog.lookup_in_module(sc.module, sym, ns, &mut Vec::new()) else { continue };
+            let other = if sc.block {
+                match prog.mods[sc.module as usize].lexical_parent { Some(p) => prog.lookup_in_scope(p, sym, ns), None => None }
+            } else {
+                prog.lookup_in_scope_outside(sc.module, sym, ns)
+            };
+            match other {
+                Some(o) if o == mine => any = true,
+                _ => return false,
+            }
+        }
+        any
     }
 
     fn leaf_used(&self, l: &Leaf) -> bool {
