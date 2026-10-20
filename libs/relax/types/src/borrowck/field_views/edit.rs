@@ -297,9 +297,62 @@ pub fn plan_relaxed(prog: &Program, records: &[super::RelaxedRecord]) -> Vec<cra
                     fix,
                 });
             }
+            RelaxedRecord::Disjoint(d) => {
+                let at = |span: Span| {
+                    let (l, c) = prog.files[span.file as usize].line_col(span.lo);
+                    format!("{}:{}:{}", prog.file_paths[span.file as usize], l, c)
+                };
+                let view = FileView { prog, file: d.second.file };
+                let planned = if d.first.file != d.second.file { Err("the borrows are in different files") } else { disjoint_rewrite(&view, d) };
+                let (fix, how) = match planned {
+                    Ok((edits, what)) => (Some((prog.file_paths[d.second.file as usize].clone(), edits)), format!("will write: {what}")),
+                    Err(why) => (None, format!("no known rewrite: {why}")),
+                };
+                let why = if d.proven { "the indices are distinct" } else { "the indices are compared when this runs (an overlap panics, as `get_disjoint_mut(..).unwrap()` does)" };
+                out.push(crate::relaxed::Note {
+                    at: at(d.second), feature: "disjoint-index", code: d.code,
+                    msg: format!("accepted with disjoint indices; stable rustc rejects it (`{}` is borrowed at {}); {why}; {how}", view.text(d.first.lo, d.first.hi), at(d.first)),
+                    fix,
+                });
+            }
         }
     }
     out
+}
+
+/// The `get_disjoint_mut` rewrite of two index borrows accepted as disjoint:
+/// `let a = &mut V[I]; let b = &mut V[J];` (two consecutive statements) ->
+/// `let [a, b] = V.get_disjoint_mut([I, J]).unwrap();`. Exact when `V`, `I` and `J` are side-effect-free
+/// (places, literals, `+` / `-` of them): the same elements are borrowed and an overlap panics, which is
+/// what the checked lowering does (an index out of bounds panics in both, with another message).
+fn disjoint_rewrite(v: &FileView<'_>, d: &super::DisjointRecord) -> Result<(Vec<Edit>, String), &'static str> {
+    let ast = v.ast();
+    if !d.both_mut { return Err("one of the borrows is shared (`get_disjoint_mut` makes both mutable)"); }
+    if d.second.hi > v.pf().src_len || d.first.hi > v.pf().src_len { return Err("inside a macro expansion"); }
+    // `let name = &mut base[index];` holding the index expression at `span`
+    let borrow_let = |span: Span| -> Result<(StmtRange, String, ExprId, ExprId), &'static str> {
+        let (index_id, index) = v.exprs().find(|(_, e)| e.lo == span.lo && e.hi == span.hi && matches!(e.kind, ExprKind::Index(..)))
+            .ok_or("the borrow is not an index expression")?;
+        let ExprKind::Index(base, i) = index.kind else { unreachable!() };
+        let stmt = v.enclosing_stmt(span).ok_or("the borrow is not inside a plain statement")?;
+        let Stmt::Let(row) = ast.stmts(stmt.block)[stmt.index] else { return Err("the borrow is not a `let`") };
+        let l = ast.row(row);
+        let (Some(init), Pat::Ident { by_ref: false, mutbl, name, sub: None }, None, None) = (l.init, *ast.pat(l.pat), l.ty, l.else_) else {
+            return Err("the `let` is not `let <name> = ..;`");
+        };
+        if !matches!(ast.expr(v.unparen(init)).kind, ExprKind::AddrOf(false, true, x) if v.unparen(x) == index_id) { return Err("the `let` does not bind `&mut base[index]`"); }
+        let name = format!("{}{}", if mutbl { "mut " } else { "" }, v.pf().text(name));
+        Ok((stmt, name, base, i))
+    };
+    let (s1, a, base1, i1) = borrow_let(d.first)?;
+    let (s2, b, base2, i2) = borrow_let(d.second)?;
+    if s1.block.0 != s2.block.0 || s2.index != s1.index + 1 { return Err("the two borrows are not consecutive `let`s"); }
+    if !v.simple_place(base1) || !v.same_place(base1, base2) { return Err("the container is not the same plain place"); }
+    if !v.simple_index(i1) || !v.simple_index(i2) { return Err("an index is not a side-effect-free expression"); }
+    let text = |e: ExprId| { let x = ast.expr(e); v.text(x.lo, x.hi) };
+    let base = text(base1);
+    let call = format!("let [{a}, {b}] = {base}.get_disjoint_mut([{}, {}]).unwrap();", text(i1), text(i2));
+    Ok((vec![Edit { lo: s1.lo, hi: s2.hi, text: call }], format!("`{base}.get_disjoint_mut([..]).unwrap()` borrows both elements")))
 }
 
 /// The re-lookup rewrite of a std map lookup whose borrow Polonius ends on the miss path:
@@ -395,6 +448,15 @@ impl FileView<'_> {
             ExprKind::Path(p) => self.ast().qself(&p).is_none(),
             ExprKind::Field(x, _) | ExprKind::TupleField(x, _) | ExprKind::Paren(x) => self.simple_place(x),
             _ => false,
+        }
+    }
+    /// An index without side effects: a simple place, a literal, `+` / `-` of those.
+    fn simple_index(&self, e: ExprId) -> bool {
+        match self.ast().expr(e).kind {
+            ExprKind::Lit(_) => true,
+            ExprKind::Paren(x) => self.simple_index(x),
+            ExprKind::Binary(crate::ast::BinOp::Add | crate::ast::BinOp::Sub, x, y) => self.simple_index(x) && self.simple_index(y),
+            _ => self.simple_place(e),
         }
     }
     /// A lookup key: a simple place or a literal, possibly borrowed (`&k`, `&self.id`, `&3`, `"a"`).

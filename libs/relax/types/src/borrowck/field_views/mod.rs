@@ -573,6 +573,32 @@ pub struct FvRecordRaw {
 #[derive(Clone, Debug)]
 pub enum RelaxedRecord {
     Polonius(PoloniusRecord),
+    Disjoint(DisjointRecord),
+}
+impl RelaxedRecord {
+    /// The same acceptance (a conflict is found again at an activation, or in the Polonius run).
+    pub fn same_site(&self, o: &Self) -> bool {
+        match (self, o) {
+            (Self::Polonius(a), Self::Polonius(b)) => a.span == b.span && a.code == b.code,
+            (Self::Disjoint(a), Self::Disjoint(b)) => a.first == b.first && a.second == b.second,
+            _ => false,
+        }
+    }
+}
+
+/// Two borrows of elements of one array / slice / `Vec` accepted as disjoint (D3).
+#[derive(Clone, Debug)]
+pub struct DisjointRecord {
+    /// the body's owner (the run-time check is lowered into its code)
+    pub owner: DefId,
+    /// the index expressions (`v[i]`) of the earlier and the later borrow
+    pub first: Span,
+    pub second: Span,
+    /// the indices are distinct by the checker's proof (else: compared at run time)
+    pub proven: bool,
+    /// both borrows are `&mut` (the `get_disjoint_mut` rewrite needs that)
+    pub both_mut: bool,
+    pub code: &'static str,
 }
 
 /// An NLL error that Polonius does not have (A2).

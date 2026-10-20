@@ -130,6 +130,8 @@ pub struct FnEntry {
     /// `noalias` dropped, no promotion and no inlining into verified code until the verdict is clean
     /// (`Unit::refresh_verified`). Kept (the swap keeps the code, so it keeps its status).
     pub unverified: AtomicBool,
+    /// Relaxed Rust D3: the slot's RIR was lowered with its verdict's run-time disjoint-index checks.
+    pub d3_lowered: AtomicBool,
 }
 
 /// SPEC-V: a body's standing with the borrow checker.
@@ -3665,7 +3667,7 @@ impl Unit {
         // most slots (the startup image's thousands) are never asked.
         let entry_ref = matches!(key, FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_)) && !matches!(key, FnKey::Glue(GLUE_UNNAMED, _));
         let name = crate::zone_alloc::kept_with(|| name.into_boxed_str());
-        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), calls: Box::default() }
+        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), calls: Box::default() }
     }
 
     /// Slot `id` has its key: the front's slot keys and its ahead check (before the slot is
@@ -4767,6 +4769,20 @@ impl Unit {
             // the unverified-mode twin is never promoted: it exists to run under aliasing
             FnKey::Plain(_) => Verdict::Unverifiable("unverified-mode twin".into()),
             _ => Verdict::Clean,
+        }
+    }
+
+    /// Relaxed Rust D3: the run-time disjoint-index checks slot `id`'s clean verdict asks its code
+    /// to make (the borrow checker accepted index borrows as disjoint without a proof). A closure is
+    /// checked with its parent. None: no such checks (or no verdict yet: unverified code has none).
+    pub(crate) fn disjoint_checks(&self, id: u32) -> Option<std::sync::Arc<Vec<(relax_types::mir::Span, relax_types::mir::Span)>>> {
+        match &self.fns[id as usize].key {
+            FnKey::Inst(d, _) => {
+                let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
+                crate::borrowck::lazy::disjoint_checks(std::sync::Arc::as_ptr(&self.front) as usize, *d, epoch)
+            }
+            FnKey::Closure(_, _, parent) => self.disjoint_checks(*parent),
+            _ => None,
         }
     }
 
@@ -7243,6 +7259,11 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
             if !normal || !(r.baseline || to_o2) || u.fns[id as usize].building || u.fns[id as usize].inflight {
                 return Ok(());
             }
+            // D3: the verdict asks for run-time disjoint-index checks, which an unverified lowering
+            // lacks: the body is lowered again (below) instead of upgraded
+            if !u.fns[id as usize].d3_lowered.load(Ordering::Relaxed) && u.disjoint_checks(id).is_some() {
+                u.fns[id as usize].rir = None;
+            } else {
             let mut f = (**r).clone();
             // SPEC-V: the verdict is clean (checked above): the body gets its noalias facts back
             if !f.withheld_noalias.is_empty() {
@@ -7250,6 +7271,7 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
                 f.noalias.extend(w);
             }
             lowered = Some(f);
+            }
         }
         if let Some(e) = &u.fns[id as usize].build_err {
             return Err(e.to_string());
@@ -8799,6 +8821,7 @@ fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(cr
         FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) => {}
     }
     lcx.finish();
+    u.fns[id as usize].d3_lowered.store(lcx.lowers_disjoint_checks(), Ordering::Relaxed);
     // A branch on a known constant was folded (check only) on the strength of registers written
     // once so far; registers are not SSA, so a later write (a loop assigning the variable) voids
     // the proof: the body is lowered again as written.
@@ -9871,11 +9894,17 @@ pub fn sweep_verdicts() {
     let verified = owner::call(owner::Class::Background, || unsafe {
         let u = &*up;
         let mut n = 0u32;
+        let mut relower = Vec::new();
         for id in 0..u.fns.len() {
             if u.fns[id].unverified.load(Ordering::Relaxed) && u.refresh_verified(id as u32) {
                 n += 1;
+                // D3: the installed code lacks the verdict's disjoint-index checks; it is built again
+                if u.fns[id].compiled && !u.fns[id].d3_lowered.load(Ordering::Relaxed) && u.disjoint_checks(id as u32).is_some() {
+                    relower.push(id as u32);
+                }
             }
         }
+        for id in relower { tier_push(id, Q_RETIER, 0); }
         let released: Vec<(u32, Await)> = {
             let mut a = AWAIT_VERDICT.lock().unwrap_or_else(|e| e.into_inner());
             let (go, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *a).into_iter().partition(|(id, _)| !u.fns[*id as usize].unverified.load(Ordering::Relaxed));

@@ -210,7 +210,8 @@ fn check_with_scopes_fv(prog: &Program, tcx: &Tcx, body: &Body, regions: &MirReg
     let mut cx = MirBorrowckCtxt { prog, tcx, body, moves, borrows: &borrows, cfg: CheckCfg::new(body), result,
         access_errors: vec![], reservation_errors: vec![], uninitialized_errors: BitSet::new_empty(body.local_decls.len()),
         move_errors: vec![], buffered_move_errors: vec![], buffered_mut_errors: vec![],
-        fv: fv.map(|v| fv_hook::FvRun::new(v, body, &borrows)), fv_own: None, nested };
+        fv: fv.map(|v| fv_hook::FvRun::new(v, body, &borrows)), fv_own: None,
+        d3: relaxed_feature(prog, body, "disjoint-index"), d3_feeds: None, d3_taken: None, nested };
     for b in cx.cfg.reverse_postorder.clone() {
         let block = &body.basic_blocks[b];
         let block_id = BasicBlock(b as u32);
@@ -317,6 +318,9 @@ struct MirBorrowckCtxt<'a> {
     /// Relaxed-Rust field views (field_views/check_hook.rs) and the loan the access being
     /// checked creates (its parts are narrowed by the callee's summary).
     fv: Option<fv_hook::FvRun<'a>>, fv_own: Option<usize>,
+    /// Relaxed Rust D3 (disjoint indices, field_views/disjoint.rs): on for the body's crate; the
+    /// single-use borrow temps that feed calls, and the locals whose address is taken (lazily).
+    d3: bool, d3_feeds: Option<crate::fxhash::HashMap<Local, super::field_views::Feed>>, d3_taken: Option<BitSet>,
     /// The nested bodies' `used_mut_upvars`.
     nested: &'a NestedUsedMut,
 }
@@ -508,8 +512,17 @@ impl MirBorrowckCtxt<'_> {
                 },
             };
             let detail = Detail::Conflict { place: place.clone(), access: access.access_kind(), location: at, borrow: BorrowInfo::from(borrow) };
-            // Relaxed Rust: the conflict may disappear under the callees' field views.
             let mut error = BorrowckError::with(kind, span, detail);
+            // Relaxed Rust D3: two borrows of distinct elements of one array / slice / Vec.
+            if let Some(outcome) = self.disjoint_outcome(i, place, access, at) {
+                error.fv = Some(Box::new(FvNote::Disjoint { proven: outcome.record.proven }));
+                let r = super::field_views::RelaxedRecord::Disjoint(outcome.record);
+                if !self.result.relaxed_records.iter().any(|x| x.same_site(&r)) { self.result.relaxed_records.push(r); }
+                if !self.result.fv_only.contains(&error) { self.result.fv_only.push(error); }
+                if matches!(access, Reservation(_)) && !self.reservation_errors.contains(place) { self.reservation_errors.push(place.clone()); }
+                continue;
+            }
+            // Relaxed Rust: the conflict may disappear under the callees' field views.
             if let Some(outcome) = self.fv_outcome(i, place, depth, access, at, span) {
                 error.fv = outcome.note.map(Box::new);
                 if let Some(record) = outcome.record { self.result.fv_records.push(record); }
@@ -1101,3 +1114,5 @@ fn check_promoted_moves(tcx: &Tcx, body: &Body, result: &mut MirBorrowckResult) 
 // private checker state).
 #[path = "field_views/check_hook.rs"]
 mod fv_hook;
+#[path = "field_views/disjoint.rs"]
+mod disjoint;
