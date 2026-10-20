@@ -4341,16 +4341,14 @@ fn is_str(k: T) -> bool {
     matches!(k, T::Str | T::RawStr)
 }
 
+/// A tuple field index: only the canonical decimal spelling names a field (`.00`, `.001`, `.0_1`
+/// name none, rustc_hir_typeck check_expr_field compares the symbol with `sym::integer(index)`);
+/// any other spelling is `u32::MAX`, which no tuple or struct has.
 fn parse_index(s: &[u8]) -> u32 {
-    let mut n = 0u32;
-    for &c in s {
-        if c.is_ascii_digit() {
-            n = n * 10 + (c - b'0') as u32;
-        } else if c != b'_' {
-            break;
-        }
+    match std::str::from_utf8(s).ok().and_then(crate::ast::tuple_index) {
+        Some(n) => n,
+        None => u32::MAX,
     }
-    n
 }
 
 /// Lex + parse one file.
