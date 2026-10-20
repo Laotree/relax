@@ -24,6 +24,7 @@ mod opaque_types;
 mod call;
 mod checks;
 mod cast;
+mod coerce_unsized;
 mod pat_bindings;
 mod instantiate;
 mod side_table;
@@ -148,6 +149,9 @@ pub struct Body {
     /// every struct field the body names, resolved: (ADT, field index) -- a live layout edit's
     /// dependents (reload.rs: the fns using a removed or renamed field, not its name)
     pub field_uses: ThinVec<(DefId, u32)>,
+    /// every `.await` of the body: (the enclosing coroutine's expression, the awaited operand's
+    /// type, position) -- the by-value edges of async recursion (E0733)
+    pub awaits: ThinVec<(u32, TyId, u32)>,
     /// Resolved definitions read while checking; deduplicated by the warm session.
     pub dependencies: ThinVec<DefId>,
     /// overloaded indexing: expr -> `Index::index` with [Self, Idx]
@@ -242,6 +246,7 @@ impl Body {
             hidden_types: SideTable::new(),
             field_idx: SideTable::new(),
             field_uses: ThinVec::new(),
+            awaits: ThinVec::new(),
             dependencies: ThinVec::new(),
             ov_index: SideTable::new(),
             mutable_index: SideTable::new(),
@@ -329,7 +334,7 @@ impl Body {
             field_idx, ov_index, mutable_index, std_index, for_next, for_into, call_traits, legacy_args,
             pat_derefs, pat_bind_ref, pat_discriminant_reads, try_branch, try_from_residual, fmt_named, closure_locals,
             closure_expected_kinds, closure_sigs, inline_const_types, struct_defaults,
-            args, expr_ty, expr_typed, pat_ty, pat_typed, field_uses, dependencies, locals, param_pats, closures, errors);
+            args, expr_ty, expr_typed, pat_ty, pat_typed, field_uses, awaits, dependencies, locals, param_pats, closures, errors);
     }
 
     /// Memory report (MAKEPAD_RUN_MEM_REPORT): per table (entries, heap bytes incl. nested vectors),
@@ -432,7 +437,6 @@ enum LoopKind {
 
 struct FcxSnapshot {
     inference: crate::infer::snapshot::CombinedSnapshot,
-    fulfillment: crate::next_solver::fulfill::FulfillmentCtxt,
 }
 
 pub struct Fcx<'a> {
@@ -449,6 +453,9 @@ pub struct Fcx<'a> {
     local_hyg: Vec<(Option<crate::parser::HygCtxt>, u32)>,
     infcx: crate::infer::InferCtxt<'a>,
     fulfillment_cx: crate::next_solver::fulfill::FulfillmentCtxt,
+    /// the pending obligations outside the open snapshots (innermost last): a snapshot works on
+    /// a fresh context, but what was pending before it is still visible to `type_var_is_sized`
+    suspended_fulfillment: Vec<crate::next_solver::fulfill::FulfillmentCtxt>,
     param_env: crate::next_solver::ParamEnvId,
     loops: Vec<Loop>,
     in_loop_condition: bool,
@@ -702,6 +709,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             hidden_types: SideTable::new(),
             field_idx: SideTable::new(),
             field_uses: ThinVec::new(),
+            awaits: ThinVec::new(),
             dependencies: ThinVec::new(),
             ov_index: SideTable::new(),
             mutable_index: SideTable::new(),
@@ -735,6 +743,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         scopes: Vec::new(),
         local_hyg: Vec::new(),
         fulfillment_cx: crate::next_solver::fulfill::FulfillmentCtxt::new(&infcx),
+        suspended_fulfillment: Vec::new(),
         infcx,
         param_env: Default::default(),
         loops: Vec::new(),
@@ -991,16 +1000,17 @@ impl<'a> Fcx<'a> {
     fn start_snapshot(&mut self) -> FcxSnapshot {
         let inference = self.infcx.start_snapshot();
         let local = crate::next_solver::fulfill::FulfillmentCtxt::new(&self.infcx);
-        let fulfillment = std::mem::replace(&mut self.fulfillment_cx, local);
-        FcxSnapshot { inference, fulfillment }
+        let outer = std::mem::replace(&mut self.fulfillment_cx, local);
+        self.suspended_fulfillment.push(outer);
+        FcxSnapshot { inference }
     }
     fn rollback_to(&mut self, snapshot: FcxSnapshot) {
-        self.fulfillment_cx = snapshot.fulfillment;
+        self.fulfillment_cx = self.suspended_fulfillment.pop().expect("open snapshot");
         self.infcx.rollback_to(snapshot.inference);
     }
     fn commit_from(&mut self, snapshot: FcxSnapshot) {
         let obligations = self.fulfillment_cx.pending_obligations();
-        self.fulfillment_cx = snapshot.fulfillment;
+        self.fulfillment_cx = self.suspended_fulfillment.pop().expect("open snapshot");
         self.infcx.commit_from(snapshot.inference);
         for obligation in obligations { self.fulfillment_cx.register_predicate_obligation(&self.infcx, obligation); }
     }
@@ -1124,35 +1134,15 @@ impl<'a> Fcx<'a> {
         }
     }
 
-    /// `P<?T>` against `P<dyn Tr>` (same pointer shape, the pointee still open).
-    fn pointee_pair_open_to_dyn(&mut self, ka: &TyKind, kx: &TyKind) -> bool {
-        let (a, d) = match (ka, kx) {
-            (TyKind::Ref(_, a, _), TyKind::Ref(_, d, _)) | (TyKind::Ptr(_, a), TyKind::Ptr(_, d)) => (*a, *d),
-            (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(*d1).kind == DefKind::Struct && self.tcx.tys.list(*xs).len() == self.tcx.tys.list(*ys).len() && !xs.is_empty() => {
-                let (xs, ys) = (self.tcx.tys.list(*xs), self.tcx.tys.list(*ys));
-                match (0..xs.len()).find(|&i| {
-                    let y = self.shallow(ys[i]);
-                    matches!(self.tcx.tys.kind(y), TyKind::Dyn(..))
-                }) {
-                    Some(i) => (xs[i], ys[i]),
-                    None => return false,
-                }
-            }
-            _ => return false,
-        };
-        let (a, d) = (self.shallow(a), self.shallow(d));
-        matches!(self.tcx.tys.kind(a), TyKind::Infer(_)) && matches!(self.tcx.tys.kind(d), TyKind::Dyn(..)) && self.type_var_is_sized(a)
-    }
-
     /// coercion.rs type_var_is_sized: a `$0: Sized` obligation is pending. Only then is `$0: Unsize<dyn
     /// Trait>` pending too; a bare variable (`ptr as *mut _`) is unified with the pointee instead.
     fn type_var_is_sized(&mut self, var: TyId) -> bool {
         let Some(sized) = self.tcx.lang_items.get(crate::lang_items::LangItem::Sized) else { return true };
         let v = self.shallow(var);
-        self.fulfillment_cx.pending_obligations().iter().any(|o| {
+        std::iter::once(&self.fulfillment_cx).chain(self.suspended_fulfillment.iter()).any(|cx| cx.pending_obligations().iter().any(|o| {
             matches!(&o.goal.predicate.kind, PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(t))
                 if t.trait_ref.def_id == sized && matches!(t.trait_ref.args.first(), Some(crate::consts::GenericArg::Type(a)) if self.infcx.shallow_resolve(*a) == v))
-        })
+        }))
     }
 
     /// Is item `d` visible from this body's module (`pub`, or private and defined in this module
@@ -1625,28 +1615,18 @@ impl<'a> Fcx<'a> {
             }
             return Some(x);
         }
-        if let Some((src, dy)) = self.dyn_coercion(&ka, &kx) {
+        // coercion.rs coerce: unsizing is tried first
+        if let Some(kind) = self.coerce_unsized(a, x) {
             if let Some(e) = e {
-                self.set_coerce(e.0, Coerce::ToDyn(src, dy), x);
                 if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { let b = self.borrow_target(a, *m); self.set_reborrow(e.0, *m, b); }
+                match kind {
+                    coerce_unsized::UnsizeKind::ToDyn(src, dy) => { self.set_coerce(e.0, Coerce::ToDyn(src, dy), x); }
+                    coerce_unsized::UnsizeKind::Upcast(sd, dd) => { self.set_coerce(e.0, Coerce::Upcast(sd, dd), x); }
+                    coerce_unsized::UnsizeKind::Deferred => self.deferred_dyn.push((e, a, x, pos)),
+                    coerce_unsized::UnsizeKind::Unsize => { self.set_coerce(e.0, Coerce::Unsize, x); }
+                }
             }
             return Some(x);
-        }
-        if let Some((sd, dd)) = self.dyn_upcast(&ka, &kx) {
-            if let Some(e) = e {
-                self.set_coerce(e.0, Coerce::Upcast(sd, dd), x);
-                if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { let b = self.borrow_target(a, *m); self.set_reborrow(e.0, *m, b); }
-            }
-            return Some(x);
-        }
-        // a pointer to a not yet known type as a pointer to `dyn Tr` (`let b: Box<dyn Tr> =
-        // v.clone();`): decided at the end, once the pointee is known (rustc keeps the
-        // CoerceUnsized obligation pending)
-        if let Some(ex) = e {
-            if self.pointee_pair_open_to_dyn(&ka, &kx) {
-                self.deferred_dyn.push((ex, a, x, pos));
-                return Some(x);
-            }
         }
         if let (TyKind::Ref(m1, ia, region), TyKind::Ref(m2, ix, _), Some(ex)) = (&ka, &kx, e) {
             if *m1 || !*m2 {
@@ -1663,13 +1643,6 @@ impl<'a> Fcx<'a> {
                     return Some(x);
                 }
             }
-        }
-        if self.unsize_coercion(&ka, &kx) {
-            if let Some(e) = e {
-                self.set_coerce(e.0, Coerce::Unsize, x);
-                if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { let b = self.borrow_target(a, *m); self.set_reborrow(e.0, *m, b); }
-            }
-            return Some(x);
         }
         match (&ka, &kx) {
             (TyKind::FnDef(d, _, _), TyKind::FnPtr(_, _, target, _)) => {
@@ -3632,6 +3605,13 @@ impl<'a> Fcx<'a> {
                 Some(d) => d,
                 None => return (Res::Err, error),
             };
+            // the trait path of `<T as a::b::Trait>::item` is privacy-checked like any path
+            if self.tcx.validates(prog, self.file) && tp.segs.len() >= 2 && tp.no_qself() && tp.lo < prog.files[self.file as usize].src_len {
+                let tsegs = crate::program::path_segs(prog, self.file, tp);
+                if let Some(e) = prog.path_privacy(self.module, tp.global(), &tsegs, Some(true), false, false) {
+                    if let Some(m) = crate::lint::privacy_diag(prog, self.file, tp.lo, &e) { self.err(tp.lo, m); }
+                }
+            }
             let name = segs[segs.len() - 1].1;
             let mut item = None;
             for &it in &prog.traits[prog.def(td).sub as usize] {
@@ -6664,6 +6644,7 @@ impl<'a> Fcx<'a> {
             return self.tcx.tys.error;
         }
         self.await_count += 1;
+        if let Some(&(coroutine, _)) = self.closure_depth.last() { self.b.awaits.push((coroutine, t, lo)); }
         // an async block / async fn body: its output is the coroutine's return type, known
         // without selection (rustc: the coroutine's Future::Output, so `A[async { 1 }.await]`
         // keeps the literal open for the index)
@@ -7330,6 +7311,7 @@ impl<'a> Fcx<'a> {
                 NextSolverError::Overflow(o) => ("E0275", o),
             };
             let predicate = &obligation.goal.predicate;
+            if crate::wfcheck::obligations::predicate_mentions_error(&self.infcx, predicate) { continue; }
             // rustc's wording (rustc_trait_selection report_selection_error and core's
             // #[rustc_on_unimplemented] messages) for an unmet trait bound
             if let PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(p)) = &predicate.kind {

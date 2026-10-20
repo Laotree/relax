@@ -215,7 +215,21 @@ pub(crate) struct Resolved {
 static HANDOFF: relax_session::sync::Mutex<Option<Resolved>> = relax_session::sync::Mutex::new(None);
 
 pub(crate) fn take_boot_resolved() -> Option<Resolved> {
-    HANDOFF.lock().unwrap_or_else(|e| e.into_inner()).take()
+    let mut g = HANDOFF.lock().unwrap_or_else(|e| e.into_inner());
+    let taken = g.take();
+    clear_dead(&mut g);
+    taken
+}
+
+/// An `Option` taken out of a static keeps its payload bytes (only the discriminant changes):
+/// words in them that point into a compiler generation are dead, but the swap's static scan
+/// (MAKEPAD_RUN_ZONE_CHECK=2) and anyone reading raw memory would take them for roots. Zeroed.
+pub(crate) fn clear_dead<T>(slot: &mut Option<T>) {
+    debug_assert!(slot.is_none());
+    unsafe {
+        std::ptr::write_bytes(slot as *mut Option<T> as *mut u8, 0, std::mem::size_of::<Option<T>>());
+        std::ptr::write(slot, None);
+    }
 }
 
 pub(crate) fn resolve_package(
@@ -1212,6 +1226,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 crate::warm::classify(warm);
                 crate::run_state::emit(crate::run_state::Event::Warm { domain: None, warm });
                 u.front.warm_cache.store(warm, Ordering::Relaxed);
+                jit::CODE_CACHE_EMPTY.store(c.stats.code_stores == 0, Ordering::Relaxed);
                 if warm {
                     warm_start = Some((c.manifest.len(), c.manifest_present, c.manifest_uncached));
                 } else if c.has_startup_manifest() && c.manifest_missing > 0 {
@@ -2943,6 +2958,9 @@ fn summary_inner(why: &str) {
         if !SILENT.load(Ordering::Relaxed) {
             let h = |i: usize| crate::owner::BUSY_NS[i].load(Ordering::Relaxed) as f64 / 1e6;
             verbose!("makepad-run: owner thread busy: job {:.0} ms, finish {:.0} ms, main {:.0} ms, app {:.0} ms, background {:.0} ms (t={:.0} ms)", h(0), h(1), h(2), h(3), h(4), crate::clock::ms_since_start());
+            let m = |i: usize| crate::owner::MAIN_ACC[i].load(Ordering::Relaxed);
+            verbose!("makepad-run: main thread's {} owner requests: waited {:.0} ms (queue delay before service {:.0} ms, wake delay after completion {:.0} ms); by wait length <20us {} ({:.0} ms), <200us {} ({:.0} ms), <2ms {} ({:.0} ms), longer {} ({:.0} ms)",
+                m(0), m(1) as f64 / 1e6, m(2) as f64 / 1e6, m(3) as f64 / 1e6, m(4), m(5) as f64 / 1e6, m(6), m(7) as f64 / 1e6, m(8), m(9) as f64 / 1e6, m(10), m(11) as f64 / 1e6);
         }
         let ah = |i: usize| jit::AHEAD_STATS[i].load(Ordering::Relaxed);
         if ah(0) + ah(2) > 0 && !SILENT.load(Ordering::Relaxed) {
