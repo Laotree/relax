@@ -614,6 +614,9 @@ enum CondBr {
 struct Gen<'a> {
     /// the block ends `t = x & K; t ==/!= 0; branch`: emitted as tst x, #K (the And skipped)
     test_fuse: Option<(VReg, i64)>,
+    /// a compare whose flags the selects right after it read (csel / fcsel on the condition, no
+    /// `cmp c, #0`): (its bool vreg, condition)
+    sel_chain: Option<(VReg, u8)>,
     /// the last spill store emitted: (sp offset, register, word position right after it)
     last_spill: Option<(i64, u8, usize)>,
     /// spill windows (Alloc::windows): vreg -> (first use pos, last use pos, register); and the
@@ -622,6 +625,8 @@ struct Gen<'a> {
     win_start: std::collections::HashMap<u32, Vec<(u32, u8)>>,
     /// passes::low_bits_only: narrow results whose re-extension nobody reads
     low_only: Vec<bool>,
+    /// passes::zero_above: values whose register is zero above that many bits
+    zero_above: Vec<u8>,
     /// table words to fill once blocks are placed: (word index, table start, target block)
     jt_fix: Vec<(usize, usize, u32)>,
     a: Asm,
@@ -1076,6 +1081,33 @@ impl<'a> Gen<'a> {
                     if let Some(()) = self.shifted_operand(options, inst, &b.insts[ii + 1]) {
                         skip_next = true;
                         continue;
+                    }
+                }
+                // a compare feeding the selects right after it: they read its flags (nothing between
+                // them sets flags); when they are all its uses, the bool is never materialised
+                // (`cmp; cset; cmp #0; csel` was `cmp; csel`: Paeth's lo / hi / thresh selects)
+                if !matches!(inst, Inst::Sel(..)) {
+                    self.sel_chain = None;
+                }
+                if let Inst::ICmp(_, _, d, ..) | Inst::ICmpI(_, _, d, ..) | Inst::FCmp(_, _, d, ..) = inst {
+                    let mut k = 0;
+                    while ii + 1 + k < n && !(fused && ii + 1 + k == n - 1) {
+                        match &b.insts[ii + 1 + k] {
+                            Inst::Sel(sd, c, x, y) if c == d && x != d && y != d && sd != d => k += 1,
+                            _ => break,
+                        }
+                    }
+                    if k > 0 {
+                        if self.al.uses[d.0 as usize] as usize == k {
+                            let cond = self.cmp_flags(inst);
+                            self.sel_chain = Some((*d, cond));
+                            continue;
+                        }
+                        if let Inst::ICmp(c, sg, ..) | Inst::ICmpI(c, sg, ..) = inst {
+                            self.inst(options, inst);
+                            self.sel_chain = Some((*d, icc(*c, *sg)));
+                            continue;
+                        }
                     }
                 }
                 self.inst(options, inst);
@@ -3192,20 +3224,26 @@ impl<'a> Gen<'a> {
             Inst::VX(op, d, a, b) => self.vx(*op, *d, *a, *b),
             Inst::VX3(op, d, a, b, c) => self.vx3(*op, *d, *a, *b, *c),
             Inst::Sel(d, c, a, b) => {
-                let rc = self.use_i(*c, S0);
-                self.cmp_imm(rc, 0);
+                let cond = match self.sel_chain {
+                    Some((c0, cc)) if c0 == *c => cc,
+                    _ => {
+                        let rc = self.use_i(*c, S0);
+                        self.cmp_imm(rc, 0);
+                        NE
+                    }
+                };
                 if self.cls(*d) == Cls::I {
                     let ra = self.use_i(*a, S0);
                     let rb = self.use_i(*b, S1);
                     let rd = self.def_i(*d, S0);
-                    self.a.csel(rd, ra, rb, NE);
+                    self.a.csel(rd, ra, rb, cond);
                     self.fin_i(*d, rd);
                 } else {
                     let w = self.cls(*d) == Cls::F64;
                     let xa = self.use_f(*a, FS0);
                     let xb = self.use_f(*b, FS1);
                     let xd = self.def_f(*d, FS0);
-                    self.a.e(0x1E20_0C00 | if w { DBL } else { 0 } | (xb as u32) << 16 | (NE as u32) << 12 | (xa as u32) << 5 | xd as u32);
+                    self.a.e(0x1E20_0C00 | if w { DBL } else { 0 } | (xb as u32) << 16 | (cond as u32) << 12 | (xa as u32) << 5 | xd as u32);
                     self.fin_f(*d, xd);
                 }
             }
@@ -3368,7 +3406,9 @@ impl<'a> Gen<'a> {
             Conv::IntToInt(it) => {
                 let rs = self.use_i(s, S0);
                 let rd = self.def_i(d, S0);
-                if self.low_only[d.0 as usize] {
+                // zero above fewer bits than the target: the extension is the value itself
+                let z = self.zero_above[s.0 as usize];
+                if self.low_only[d.0 as usize] || (z > 0 && z < it.bits) {
                     self.a.mov(rd, rs);
                 } else {
                     self.a.extend(rd, rs, it.bits, it.signed);
@@ -3637,6 +3677,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     let mut g = Gen {
         a: Asm { w: Vec::with_capacity(128) },
         test_fuse: None,
+        sel_chain: None,
         jt_fix: Vec::new(),
         last_spill: None,
         win: {
@@ -3647,6 +3688,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
             w
         },
         low_only: crate::passes::low_bits_only(f),
+        zero_above: Vec::new(),
         win_start: {
             let mut ws: std::collections::HashMap<u32, Vec<(u32, u8)>> = std::collections::HashMap::new();
             for &(v, a, _, r) in &al.windows {
@@ -3680,6 +3722,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         pads: Vec::new(),
         long,
     };
+    g.zero_above = crate::passes::zero_above(g.f, &g.low_only);
     BRANCH_RANGE.with(|c| c.set(false));
     g.gen(options);
     if BRANCH_RANGE.with(|c| c.replace(false)) {

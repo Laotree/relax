@@ -435,6 +435,38 @@ pub fn low_bits_only(f: &Func) -> Vec<bool> {
     ok
 }
 
+/// Values whose register is known zero above some bit: per vreg (one definition), that bit count
+/// (0: unknown): an unsigned narrow load (`ldrb` / movzx), an And with a non-negative mask, an
+/// unsigned cast that keeps its extension (`low`: passes::low_bits_only, whose casts leave the
+/// upper bits as they were). A cast of such a value to a wider type is a plain move: zero- and
+/// sign-extension of a value whose upper bits are zero are the value itself (Paeth's
+/// `i32::from(u8)` was ldrb + sxtw per pixel byte).
+pub fn zero_above(f: &Func, low: &[bool]) -> Vec<u8> {
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 2;
+    }
+    let mut z = vec![0u8; nv];
+    for b in &f.blocks {
+        for i in &b.insts {
+            crate::regalloc::for_defs(i, |d| ndef[d.0 as usize] += 1);
+            match *i {
+                Inst::Load(Mem::Int(n, false), d, _, _) | Inst::LoadX(Mem::Int(n, false), d, _, _, _, _) if n < 8 => z[d.0 as usize] = 8 * n,
+                Inst::IBinI(IOp::And, _, d, _, m) if m >= 0 => z[d.0 as usize] = (64 - (m as u64).leading_zeros()) as u8,
+                Inst::Conv(Conv::IntToInt(IntTy { bits, signed: false }), d, _) if bits < 64 && !low[d.0 as usize] => z[d.0 as usize] = bits,
+                _ => {}
+            }
+        }
+    }
+    for v in 0..nv {
+        if ndef[v] != 1 || f.vregs[v] != Cls::I {
+            z[v] = 0;
+        }
+    }
+    z
+}
+
 pub fn compact_vregs(f: &mut Func) {
     let nv = f.vregs.len();
     const NONE: u32 = u32::MAX;

@@ -717,6 +717,8 @@ struct Gen<'a> {
     win_start: std::collections::HashMap<u32, Vec<(u32, u8)>>,
     /// passes::low_bits_only: narrow results whose re-extension nobody reads
     low_only: Vec<bool>,
+    /// passes::zero_above: values whose register is zero above that many bits
+    zero_above: Vec<u8>,
     rir_map: Vec<(u32, u32, u32)>,
     rir_map_on: bool,
     /// (register, code position right after it): the last instruction emitted was an integer ALU op
@@ -4149,7 +4151,9 @@ impl<'a> Gen<'a> {
                 let rs = self.use_i(options, s, R10);
                 let rd = self.def_i(d, R10);
                 self.a.mov_rr(rd, rs);
-                if !self.low_only[d.0 as usize] {
+                // zero above fewer bits than the target: the extension is the value itself
+                let z = self.zero_above[s.0 as usize];
+                if !self.low_only[d.0 as usize] && !(z > 0 && z < it.bits) {
                     self.a.extend(rd, it.bits, it.signed);
                 }
                 self.fin_i(d, rd);
@@ -4752,6 +4756,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         win,
         win_start,
         low_only: crate::passes::low_bits_only(f),
+        zero_above: Vec::new(),
         fconsts: {
             let mut nd: std::collections::HashMap<u32, (u32, u64, bool)> = std::collections::HashMap::new();
             for b in &f.blocks {
@@ -4792,6 +4797,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         pads: Vec::new(),
         unwind_tab: Vec::new(),
     };
+    g.zero_above = crate::passes::zero_above(g.f, &g.low_only);
     g.gen(options);
     // unwind info for the runtime's frame walk (rir::unwind_info_words), 4-byte aligned
     while g.a.b.len() % 4 != 0 {
