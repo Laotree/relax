@@ -4097,10 +4097,12 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
             scanned += candidates.len() + changed.len();
             for k in candidates {
                 if stamp(&files[k].0) != files[k].2 && !changed.contains(&k) {
+                    if std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() { eprintln!("makepad live: settle: {} changed too (+{:.0} ms)", files[k].0, seen.elapsed().as_secs_f64() * 1e3); }
                     changed.push(k);
                     more = true;
                 }
             }
+            if std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() && now != last { eprintln!("makepad live: settle: a stamp moved (+{:.0} ms)", seen.elapsed().as_secs_f64() * 1e3); }
             if !more && now == last {
                 break;
             }
