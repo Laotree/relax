@@ -93,6 +93,14 @@ pub fn adt_dtorck_constraint(tcx: &Tcx, prog: &Program, def: DefId, limit: usize
     result
 }
 
+/// A coroutine that never suspends saves no local across a suspension point, so its witness
+/// (`mir_coroutine_witnesses`) is empty and no interior type needs drop: only its upvars are
+/// drop-live, as for a closure. With suspension points the witnesses are not computed (module doc).
+fn coroutine_has_no_suspension_points(tcx: &Tcx, prog: &Program, _file: u32, expr: u32, owner: TyId) -> bool {
+    let TyKind::FnDef(def, ..) = *tcx.tys.kind(owner) else { return false };
+    tcx.typeck(prog, def).min_captures.get(&expr).is_some_and(|c| c.suspension_points == Some(0))
+}
+
 /// dropck_outlives.rs:284 dtorck_constraint_for_ty_inner.
 pub fn dtorck_constraint_for_ty_inner(tcx: &Tcx, prog: &Program, limit: usize, depth: usize, ty: TyId, out: &mut DropckConstraint) {
     if depth > limit { out.overflows.push(ty); return; }
@@ -101,9 +109,9 @@ pub fn dtorck_constraint_for_ty_inner(tcx: &Tcx, prog: &Program, limit: usize, d
     match *tys.kind(ty) {
         TyKind::Array(e, _) | TyKind::Slice(e) => dtorck_constraint_for_ty_inner(tcx, prog, limit, depth + 1, e, out),
         TyKind::Tuple(ts) => for &t in tys.list(ts) { dtorck_constraint_for_ty_inner(tcx, prog, limit, depth + 1, t, out); },
-        TyKind::Closure(_, _, args) => {
+        TyKind::Closure(file, expr, args) => {
             let upvars = match *tys.kind(args.tupled_upvars_ty) { TyKind::Tuple(ts) => tys.list(ts).to_vec(), _ => vec![] };
-            if tcx.is_coroutine(ty) {
+            if tcx.is_coroutine(ty) && !coroutine_has_no_suspension_points(tcx, prog, file, expr, args.parent_args) {
                 // the needs-drop arm: use-live upvars (no coroutine witnesses, see the module doc)
                 out.outlives.extend(upvars.iter().map(|&t| GenericArg::Type(t)));
             } else {
