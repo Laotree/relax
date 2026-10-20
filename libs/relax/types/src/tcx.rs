@@ -1616,8 +1616,11 @@ impl Tcx {
             errors.extend(crate::item_checks::supertrait_cycles(prog, self, did));
         }
         if def.kind == DefKind::Impl {
-            errors.extend(self.check_impl_params_constrained(prog, did));
-            errors.extend(self.check_impl_items_against_trait(prog, did));
+            let unconstrained = self.check_impl_params_constrained(prog, did);
+            // (an impl with an unconstrained parameter has no sound item types to compare)
+            let compare = unconstrained.is_empty();
+            errors.extend(unconstrained);
+            if compare { errors.extend(self.check_impl_items_against_trait(prog, did)); }
             errors.extend(crate::item_checks::copy_impl(prog, self, did));
         }
         errors

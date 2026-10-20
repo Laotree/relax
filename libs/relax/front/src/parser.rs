@@ -2547,6 +2547,12 @@ impl<'a> Parser<'a> {
     // ------------------------------------------------------------ use trees
 
     fn use_tree(&mut self) -> PResult<UseTree> {
+        self.use_tree_in(None, false)
+    }
+
+    /// `prefix`: the kind of the last segment of the path before this tree; `in_group`: the tree
+    /// is an element of a `{..}` list (rustc_resolve build_reduced_graph: `{self}` names its prefix).
+    fn use_tree_in(&mut self, prefix: Option<SegKind>, in_group: bool) -> PResult<UseTree> {
         match self.kind() {
             T::Star => {
                 self.pos += 1;
@@ -2557,7 +2563,7 @@ impl<'a> Parser<'a> {
                 let mut v = Vec::new();
                 while self.kind() != T::CloseBrace {
                     self.eat(T::PathSep);
-                    v.push(self.use_tree()?);
+                    v.push(self.use_tree_in(prefix, true)?);
                     if !self.eat(T::Comma) {
                         break;
                     }
@@ -2568,10 +2574,18 @@ impl<'a> Parser<'a> {
             _ => {
                 let seg = self.path_seg_name()?;
                 if self.eat(T::PathSep) {
-                    let rest = self.use_tree()?;
+                    let rest = self.use_tree_in(Some(seg.kind()), false)?;
                     Ok(UseTree::Path(seg, self.ast.push_use_tree(rest)))
                 } else {
                     let rename = if self.eat(T::KwAs) { Some(self.ident_or_underscore()?) } else { None };
+                    // rustc_resolve: importing a path keyword without renaming it
+                    if rename.is_none() && crate::lexer::validation_enabled() && self.cfg_out == 0 {
+                        let named = if seg.kind() == SegKind::SelfValue && (in_group || prefix.is_some()) { prefix.unwrap_or(seg.kind()) } else { seg.kind() };
+                        if matches!(named, SegKind::SelfValue | SegKind::Super | SegKind::Crate) {
+                            let e = PErr { pos: seg.name.lo, msg: "imports need to be explicitly named".to_string() };
+                            self.pending_shape.push((TokRange { lo: 0, hi: 0 }, Some(e)));
+                        }
+                    }
                     Ok(UseTree::Name(seg, rename))
                 }
             }
