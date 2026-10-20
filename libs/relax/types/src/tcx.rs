@@ -247,6 +247,12 @@ pub struct Tcx {
     /// `mir_coroutine_witnesses` reduced to what dropck asks (whether any local live across a suspension
     /// point needs drop), per coroutine (file, expr), set when borrowck has built the coroutine's MIR.
     pub coroutine_witness_needs_drop: crate::conc::MemoMap<(u32, u32), bool>,
+    /// `coroutine_hidden_types` (rustc mir_coroutine_witnesses): the regions-erased types of the locals live
+    /// across any suspension point, per coroutine (file, expr), in terms of its owner's generics.
+    pub coroutine_hidden_types: crate::conc::MemoMap<(u32, u32), std::sync::Arc<Vec<TyId>>>,
+    /// `TypeckResults::coroutine_stalled_predicates`, per typeck root: the goals that were stalled on a
+    /// coroutine of that body (regions erased), proven once the coroutines' witnesses are known.
+    pub coroutine_stalled_predicates: relax_session::sync::Mutex<crate::fxhash::HashMap<DefId, Vec<(crate::next_solver::Goal, u32)>>>,
     /// a coroutine type's saved locals after its upvars: (end offset, alignment), made when its
     /// poll function is lowered (coroutine_transform)
     pub coro_frames: crate::conc::MemoMap<TyId, (u32, u32)>,
@@ -417,6 +423,8 @@ impl Tcx {
             destructor_impls: Default::default(),
             coroutines: crate::conc::MemoMap::with_bits(10),
             coroutine_witness_needs_drop: crate::conc::MemoMap::with_bits(10),
+            coroutine_hidden_types: crate::conc::MemoMap::new_kept(10),
+            coroutine_stalled_predicates: Default::default(),
             coro_frames: Default::default(),
             coro_shapes: Default::default(),
             coro_slot_ty: Default::default(),
