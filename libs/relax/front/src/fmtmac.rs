@@ -150,6 +150,10 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         let name = String::from_utf8_lossy(&name).into_owned();
+        // rustc_resolve: `#[no_implicit_prelude]` (edition 2018 and later) takes the std prelude's macros away
+        if self.no_prelude_hides(path, &name) {
+            return Err(PErr { pos: nlo, msg: format!("cannot find macro `{name}` in this scope") });
+        }
         let save = self.pos;
         self.pos = toks.lo as usize;
         let r = self.builtin_gen(&name, toks.hi as usize, lo);
@@ -953,6 +957,10 @@ fn parse_format(s: &str) -> Result<Vec<Piece>, String> {
                 let mut spec = default_spec("new_display");
                 if j < c.len() && c[j] == ':' {
                     let mut k = j + 1;
+                    // rustc_parse_format `format`: a character followed by an alignment is the fill, even `}`
+                    if matches!(c.get(k + 1), Some('<' | '>' | '^')) {
+                        k += 2;
+                    }
                     while k < c.len() && c[k] != '}' {
                         k += 1;
                     }

@@ -35,6 +35,14 @@ enum BodyOutline {
     Mismatched(u32),
 }
 
+/// The macros of std's prelude (`std::prelude::v1`): what `#[no_implicit_prelude]` takes away.
+const STD_PRELUDE_MACROS: &[&str] = &[
+    "assert", "assert_eq", "assert_ne", "cfg", "column", "compile_error", "concat", "debug_assert", "debug_assert_eq",
+    "debug_assert_ne", "env", "file", "format_args", "include", "include_bytes", "include_str", "line", "matches",
+    "module_path", "option_env", "stringify", "todo", "unimplemented", "unreachable", "write", "writeln", "dbg",
+    "eprint", "eprintln", "format", "print", "println", "thread_local", "vec", "panic",
+];
+
 /// MAKEPAD_RUN_VERIFY_TOKENS: every macro_rules expansion's transcribed tokens are compared with the
 /// lexed text.
 pub(crate) fn verify_tokens() -> bool {
@@ -116,6 +124,15 @@ pub struct Parser<'a> {
     pub bctx: Option<std::rc::Rc<crate::builtins::FileCtx>>,
     /// names of the inline `mod x { }` blocks being parsed (module_path!)
     pub mod_stack: Vec<String>,
+    /// rustc legacy (textual) macro_rules scopes: ids of the blocks and inline modules around the cursor
+    scope_stack: Vec<u32>,
+    /// open inline modules with `#[no_implicit_prelude]`
+    no_prelude: u32,
+    /// the range pattern parsed last was written with `...`
+    range_dots: bool,
+    next_scope: u32,
+    /// (definition position, scope id) of the macro_rules! this file's written code defines
+    rule_scopes: Vec<(u32, u32)>,
     /// token index -> expression of a `T::Interp` token
     interp: crate::fxhash::HashMap<u32, ExprId>,
     /// items generated after the last parsed item (derive expansions), for its container
@@ -179,6 +196,11 @@ impl<'a> Parser<'a> {
             ty_frags: Default::default(),
             bctx: None,
             mod_stack: Vec::new(),
+            scope_stack: Vec::new(),
+            no_prelude: 0,
+            range_dots: false,
+            next_scope: 1,
+            rule_scopes: Vec::new(),
             interp: Default::default(),
             extra_items: Vec::new(),
             extra_assoc_items: Vec::new(),
@@ -571,6 +593,10 @@ impl<'a> Parser<'a> {
                         if !(matches!(qn, b"std" | b"core" | b"alloc") && (i < 4 || self.toks.kind_at(i - 4) != T::PathSep)) {
                             return BodyOutline::Eager(6);
                         }
+                    }
+                    // the macros `#[no_implicit_prelude]` takes away are resolved by the eager parse
+                    if self.no_prelude > 0 && self.edition >= 2018 && !(i >= 2 && self.toks.kind_at(i - 2) == T::PathSep) && STD_PRELUDE_MACROS.contains(&name) {
+                        return BodyOutline::Eager(6);
                     }
                     let m = self.macros.as_ref().unwrap();
                     let module = module.get_or_init(|| self.cur_module());
@@ -1111,6 +1137,8 @@ impl<'a> Parser<'a> {
         let mt = crate::macros::mtoks(self, &self.toks.range(toks.lo as usize, toks.hi as usize));
         let file = self.bctx.as_ref().map_or("", |c| c.path.as_str());
         let edition = self.edition;
+        let rule_scope = self.scope_stack.last().copied().unwrap_or(0);
+        self.rule_scopes.push((name.lo, rule_scope));
         let scope = self.macros.as_mut().unwrap();
         scope.define_tokens(&n, &self.krate, self.edition, file, name.lo, exported, local_inner, &mt)
             .map_err(|msg| PErr { pos: name.lo, msg })?;
@@ -1228,6 +1256,11 @@ impl<'a> Parser<'a> {
         let mut from = 0;
         while let Some(i) = text[from..].find(name) {
             let at = from + i;
+            let word = |c: Option<u8>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_');
+            if word(at.checked_sub(1).map(|k| text.as_bytes()[k])) || word(text.as_bytes().get(at + name.len()).copied()) {
+                from = at + name.len();
+                continue;
+            }
             let line_start = text[..at].rfind('\n').map_or(0, |x| x + 1);
             if text[line_start..at].contains("use ") || text[..at].rfind("use ").is_some_and(|u| !text[u..at].contains(';')) {
                 return true;
@@ -1235,6 +1268,61 @@ impl<'a> Parser<'a> {
             from = at + name.len();
         }
         false
+    }
+
+    /// rustc_resolve: the positions that take only non-macro attributes (struct-pattern fields,
+    /// match arms, struct-expression fields) reject the built-in attribute macros.
+    fn non_macro_attrs(&self, attrs: &[Attr]) -> PResult<()> {
+        for a in attrs {
+            let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+            if hi <= lo || (self.toks.at(lo).lo as usize) >= self.src.len() { continue; }
+            if hi > lo + 1 && !matches!(self.toks.at(lo + 1).kind, T::OpenParen | T::Eq) { continue; }
+            let name = String::from_utf8_lossy(self.tok_text(self.toks.at(lo))).into_owned();
+            if matches!(name.as_str(), "test" | "bench" | "test_case" | "derive" | "global_allocator" | "cfg_eval" | "alloc_error_handler" | "derive_const") {
+                return Err(PErr { pos: self.toks.at(lo).lo, msg: format!("expected non-macro attribute, found attribute macro `{name}`") });
+            }
+        }
+        Ok(())
+    }
+
+    /// rustc_resolve: `#[no_implicit_prelude]` (edition 2018 and later; 2015 injects `#[macro_use] extern
+    /// crate std`, which it leaves) hides the std prelude's macros from a plain-name call in written code,
+    /// unless the file defines or imports one of that name.
+    pub(super) fn no_prelude_hides(&self, path: &Path, name: &str) -> bool {
+        let Some(m) = self.macros.as_ref() else { return false };
+        let seg = match self.ast.segs(path.segs) {
+            [seg] if !path.global() => seg,
+            _ => return false,
+        };
+        if self.no_prelude == 0 || self.edition < 2018 || !crate::lexer::validation_enabled() || (seg.name.lo as usize) >= self.src.len()
+            || !STD_PRELUDE_MACROS.contains(&name) || self.name_imported(name) {
+            return false;
+        }
+        !m.table.defs.get(name).into_iter().flatten().chain(m.local.iter()).any(|x| x.name == name && x.builtin == 0 && !matches!(x.krate.as_str(), "std" | "core" | "alloc"))
+    }
+
+    fn push_rules_scope(&mut self) -> u32 {
+        let id = self.next_scope;
+        self.next_scope += 1;
+        self.scope_stack.push(id);
+        id
+    }
+
+    /// rustc legacy scope: is the written `macro_rules!` `d` of this file in scope at the cursor
+    /// (its enclosing block / module without `#[macro_use]` still open)? Anything not known to be
+    /// out of scope counts as in scope.
+    fn rules_in_textual_scope(&self, d: &crate::macros::MacroDef, at: u32) -> bool {
+        if d.builtin != 0 || d.exported || (d.def_pos as usize) >= self.src.len() || !self.bctx.as_ref().is_some_and(|c| c.path == d.def_file) {
+            return true;
+        }
+        // defined further down: not in scope yet
+        if d.def_pos > at {
+            return false;
+        }
+        match self.rule_scopes.iter().rev().find(|r| r.0 == d.def_pos) {
+            Some(&(_, s)) => s == 0 || self.scope_stack.contains(&s),
+            None => true,
+        }
     }
 
     fn rules_macro(&self, path: &Path) -> Option<crate::macros::MacroRef> {
@@ -1266,15 +1354,24 @@ impl<'a> Parser<'a> {
         let module = self.cur_module();
         let qual = mpath.iter().find(|x| !x.is_empty()).cloned();
         let qual = qual.map(|q| q.strip_prefix("__relax_crate_").map(|x| x.to_string()).unwrap_or(q));
+        if qual.is_none() && !path.global() && self.no_prelude_hides(path, &name) {
+            return None;
+        }
         let mut r = m.lookup(&name, &self.krate, &mpath, &module);
         // textual scope (`macro_rules!` is visible only after its definition): a plain-name call of a
         // macro this file defines further down is not in scope (check only; the call must be written
         // code, not an expansion)
-        if let Some(d) = &r {
-            if qual.is_none() && d.builtin == 0 && !d.exported && crate::lexer::validation_enabled() && (seg.name.lo as usize) < self.src.len()
-                && self.bctx.as_ref().is_some_and(|c| c.path == d.def_file) && seg.name.lo < d.def_pos && (d.def_pos as usize) < self.src.len() && !self.name_imported(&name) {
-                r = None;
-            }
+        let out_of_scope = r.as_ref().is_some_and(|d| {
+            let written = qual.is_none() && d.builtin == 0 && !d.exported && crate::lexer::validation_enabled() && (seg.name.lo as usize) < self.src.len();
+            // defined further down in this file (textual scope: only after its definition)
+            let later = written && self.bctx.as_ref().is_some_and(|c| c.path == d.def_file) && seg.name.lo < d.def_pos && (d.def_pos as usize) < self.src.len();
+            // its block or module closed (rustc legacy scope) and no other one of the name is in scope
+            let closed = written && !self.rules_in_textual_scope(d, seg.name.lo)
+                && !m.table.defs.get(&name).into_iter().flatten().chain(m.local.iter()).any(|x| x.name == name && self.rules_in_textual_scope(x, seg.name.lo));
+            (later || closed) && !self.name_imported(&name)
+        });
+        if out_of_scope {
+            r = None;
         }
         // Relax's built-in macros (builtins.rs) when no macro_rules! of that name is visible
         match r {
@@ -2188,7 +2285,19 @@ impl<'a> Parser<'a> {
                     };
                     let mname = String::from_utf8_lossy(self.bytes(name.lo, name.hi)).trim_start_matches("r#").to_string();
                     self.mod_stack.push(mname);
+                    let scope_depth = self.scope_stack.len();
+                    let scope = self.push_rules_scope();
+                    let no_prelude = attrs.iter().chain(inner.iter()).any(|a| a.toks.hi > a.toks.lo && self.tok_text(self.toks.at(a.toks.lo as usize)) == b"no_implicit_prelude");
+                    if no_prelude { self.no_prelude += 1; }
                     let items = self.items_until(T::CloseBrace);
+                    if no_prelude { self.no_prelude -= 1; }
+                    self.scope_stack.truncate(scope_depth);
+                    // `#[macro_use]` on the module: its macros stay in scope after it
+                    let escape = attrs.iter().any(|a| a.toks.hi > a.toks.lo && self.tok_text(self.toks.at(a.toks.lo as usize)) == b"macro_use");
+                    if escape {
+                        let outer = self.scope_stack.last().copied().unwrap_or(0);
+                        for r in self.rule_scopes.iter_mut().filter(|r| r.1 == scope) { r.1 = outer; }
+                    }
                     self.mod_stack.pop();
                     if !active {
                         self.cfg_out -= 1;
@@ -3419,16 +3528,20 @@ impl<'a> Parser<'a> {
                 if self.kind() == T::DotDotDot && self.edition >= 2021 && (self.toks.at(self.pos).lo as usize) < self.src.len() {
                     return self.err("E0783: `...` range patterns are deprecated");
                 }
+                let dots = self.kind() == T::DotDotDot;
                 self.pos += 1;
                 let end = self.pat_range_end()?;
+                self.range_dots = dots;
                 Ok(Some(Pat::Range(Some(start), Some(end), true)))
             }
             T::DotDot => {
                 self.pos += 1;
                 if self.pat_range_end_start() {
                     let end = self.pat_range_end()?;
+                    self.range_dots = false;
                     Ok(Some(Pat::Range(Some(start), Some(end), false)))
                 } else {
+                    self.range_dots = false;
                     Ok(Some(Pat::Range(Some(start), None, false)))
                 }
             }
@@ -3447,6 +3560,7 @@ impl<'a> Parser<'a> {
                 // `..X` / `..-7` / `..'a'`: a half-open range pattern (exclusive end) when an end follows
                 if self.pat_range_end_start() {
                     let end = self.pat_range_end()?;
+                    self.range_dots = false;
                     Pat::Range(None, Some(end), false)
                 } else {
                     Pat::Rest
@@ -3455,12 +3569,18 @@ impl<'a> Parser<'a> {
             T::DotDotEq => {
                 self.pos += 1;
                 let end = self.pat_range_end()?;
+                self.range_dots = false;
                 Pat::Range(None, Some(end), true)
             }
             T::And | T::AndAnd => {
                 self.eat_amp();
                 let m = self.eat(T::KwMut);
+                let inner_lo = self.tok().lo;
                 let inner = self.pat_no_or()?;
+                // rustc_parse `ban_pat_range_if_ambiguous`: `&a..=b` is `&(a..=b)`, written without parentheses
+                if matches!(self.ast.pat(inner), Pat::Range(..)) && !self.range_dots && (inner_lo as usize) < self.src.len() {
+                    return Err(PErr { pos: inner_lo, msg: "the range pattern here has ambiguous interpretation".into() });
+                }
                 Pat::Ref(m, inner)
             }
             T::OpenParen => {
@@ -3582,6 +3702,7 @@ impl<'a> Parser<'a> {
         let mut rest = false;
         while self.kind() != T::CloseBrace {
             let attrs = self.outer_attrs()?;
+            if self.cfg_out == 0 { self.non_macro_attrs(&attrs)?; }
             let had_attrs = !attrs.is_empty();
             let attrs = self.ast.push_list(attrs);
             if self.kind() == T::DotDot && had_attrs {
@@ -3626,6 +3747,8 @@ impl<'a> Parser<'a> {
         // to the enclosing item list, not to the block's statements
         let outer_items = std::mem::take(&mut self.extra_items);
         let outer_assoc = std::mem::replace(&mut self.in_assoc, 0);
+        let scope_depth = self.scope_stack.len();
+        self.push_rules_scope();
         let mut attrs = Vec::new();
         self.inner_attrs(&mut attrs)?;
         let mut stmts = Vec::new();
@@ -3643,6 +3766,7 @@ impl<'a> Parser<'a> {
         }
         self.extra_items = outer_items;
         self.in_assoc = outer_assoc;
+        self.scope_stack.truncate(scope_depth);
         self.pos += 1;
         let stmts = self.ast.push_list(stmts);
         let attrs = self.ast.push_list(attrs);
@@ -3829,7 +3953,9 @@ impl<'a> Parser<'a> {
             let at = self.tok().lo;
             // (rustc gates these when the expression is configured, not while a macro fragment is matched)
             let real = self.macros.is_some();
-            if !self.outer_attrs()?.is_empty() && real { self.ast.gated_syntax.push(("stmt_expr_attributes", at)); }
+            let attrs = self.outer_attrs()?;
+            if !attrs.is_empty() && real { self.ast.gated_syntax.push(("stmt_expr_attributes", at)); }
+            self.closure_attrs(&attrs)?;
         }
         let lhs = self.unary(r)?;
         self.expr_continue(lhs, min, r, lo)
@@ -4133,11 +4259,35 @@ impl<'a> Parser<'a> {
         Ok(v)
     }
 
+    /// Attributes in front of a closure (rustc_attr_parsing AllowedTargets: `#[target_feature]` is not
+    /// allowed on closures; `#[track_caller]` is gated).
+    fn closure_attrs(&mut self, attrs: &[Attr]) -> PResult<()> {
+        let closure = match self.kind() {
+            T::Or | T::OrOr | T::KwMove => true,
+            T::KwStatic | T::KwAsync => matches!(self.nth(1), T::Or | T::OrOr | T::KwMove),
+            _ => false,
+        };
+        if closure && self.cfg_out == 0 {
+            for a in attrs {
+                let (alo, ahi) = (a.toks.lo as usize, a.toks.hi as usize);
+                if ahi <= alo || (self.toks.at(alo).lo as usize) >= self.src.len() { continue; }
+                let single = ahi == alo + 1 || matches!(self.toks.at(alo + 1).kind, T::OpenParen | T::Eq);
+                match (single, self.tok_text(self.toks.at(alo))) {
+                    (true, b"target_feature") => return Err(PErr { pos: self.toks.at(alo).lo, msg: "`#[target_feature]` attribute cannot be used on closures".into() }),
+                    (true, b"track_caller") => self.ast.gated_syntax.push(("closure_track_caller", self.toks.at(alo).lo)),
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// An element of an array / tuple / call-argument list: None when a `#[cfg(..)]` on it is false
     /// (the element is removed; Reference expressions.md [expr.attr.restriction] and
     /// conditional-compilation.md [cfg.attr]; rustc_expand config.rs configure_expr).
     fn list_elem(&mut self, r: u8) -> PResult<Option<ExprId>> {
         let attrs = if self.kind() == T::Pound && self.nth(1) == T::OpenBracket { self.outer_attrs()? } else { Vec::new() };
+        self.closure_attrs(&attrs)?;
         let e = self.expr_bp(0, r)?;
         Ok(if attrs.is_empty() || self.cfg_present(&attrs) { Some(e) } else { None })
     }
@@ -4267,6 +4417,7 @@ impl<'a> Parser<'a> {
                 let mut arms = Vec::new();
                 while self.kind() != T::CloseBrace {
                     let attrs = self.outer_attrs()?;
+                    if self.cfg_out == 0 { self.non_macro_attrs(&attrs)?; }
                     let pat = self.pat_top()?;
                     let guard = if self.eat(T::KwIf) { Some(self.guard_expr()?) } else { None };
                     self.expect(T::FatArrow)?;
@@ -4402,6 +4553,7 @@ impl<'a> Parser<'a> {
         let mut rest = false;
         while self.kind() != T::CloseBrace {
             let attrs = self.outer_attrs()?;
+            if self.cfg_out == 0 { self.non_macro_attrs(&attrs)?; }
             let attrs = self.ast.push_list(attrs);
             if self.eat(T::DotDot) {
                 if self.kind() != T::CloseBrace {
@@ -4504,7 +4656,8 @@ impl<'a> Parser<'a> {
             if let Some(pos) = self.inner_doc_before_pos() { return Err(PErr { pos, msg: "E0753: expected outer doc comment".into() }); }
         }
         let then = self.block()?;
-        let els = if self.eat(T::KwElse) {
+        // a doc comment before `else` is an attribute of whatever follows: the `if` ends there
+        let els = if !(self.kind() == T::KwElse && self.doc_before()) && self.eat(T::KwElse) {
             let elo = self.lo();
             if self.kind() == T::KwIf {
                 Some(self.if_expr(elo)?)

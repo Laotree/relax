@@ -76,6 +76,20 @@ impl Program {
                     }
                 }
                 targets.resize(ranges.len(), 3);
+                // the attributes of generic parameters (`struct S<#[x] T>`) resolve like any others
+                if let Some(g) = f.ast.kind_generics(&it.kind) {
+                    for p in f.ast.list(g.params) {
+                        ranges.extend_from_slice(f.ast.list(p.attrs));
+                    }
+                    targets.resize(ranges.len(), 3);
+                }
+            }
+            // `macro_rules!` items define nothing of the program's: their attributes are the item's own
+            for it in f.ast.items.iter() {
+                if matches!(it.kind, ItemKind::MacroRules(_)) && it.lo < f.src_len {
+                    ranges.extend_from_slice(f.ast.list(it.attrs));
+                    targets.resize(ranges.len(), 2);
+                }
             }
             // registered tools; derive helpers of non-std derives are not tracked: such a file
             // keeps its inert attributes
@@ -180,6 +194,11 @@ impl Program {
                 // `#[unsafe(name ..)]`
                 if f.tok(i).kind == T::KwUnsafe && f.tok(i + 1).kind == T::OpenParen {
                     i += 2;
+                    // rustc_parse `parse_attr_item`: the path of the inner attribute is an identifier
+                    if f.tok(i).kind == T::KwUnsafe && f.tok(i).lo < f.src_len {
+                        out.push(self.record_error(fi as u32, f.tok(i).lo, "parse", "expected identifier, found keyword `unsafe`".into()));
+                        continue;
+                    }
                 }
                 let first_i = i;
                 let mut global = false;
@@ -235,6 +254,10 @@ impl Program {
                     let n = segs[0];
                     if is_builtin_attr(n) || std_helpers.contains(&n) || crate::macro_reg::has_attr(n) {
                         continue;
+                    }
+                    // rustc_resolve smart_resolve_macro_path: an unresolved `rustc*` attribute is also reserved
+                    if n.starts_with("rustc") && pos < f.src_len {
+                        out.push(self.record_error(fi as u32, pos, "resolve", "attributes starting with `rustc` are reserved for use by the `rustc` compiler".into()));
                     }
                     format!("cannot find attribute `{n}` in this scope")
                 } else {

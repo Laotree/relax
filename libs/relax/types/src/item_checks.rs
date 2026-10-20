@@ -1736,6 +1736,7 @@ pub fn gated_syntax(prog: &Program, own: &[bool]) -> Vec<String> {
                 "stmt_expr_attributes" => "attributes on expressions are experimental",
                 "coroutines" => "coroutine syntax is experimental",
                 "async_trait_bounds" => "`async` trait bounds are unstable",
+                "closure_track_caller" => "`#[track_caller]` on closures is currently unstable",
                 _ => continue,
             };
             errors.push(prog.record_error(f as u32, pos, "typeck", format!("E0658: {msg}")));
@@ -1791,6 +1792,19 @@ pub fn param_attributes(prog: &Program, own: &[bool]) -> Vec<String> {
         if !own.get(krate as usize).copied().unwrap_or(false) { continue; }
         let ast = &pf.ast;
         let p = prog.src(f as u32);
+        // rustc_resolve: enum variants and struct fields take only non-macro attributes (struct-pattern
+        // fields, match arms and struct-expression fields are the parser's)
+        for a in ast.variants.iter().flat_map(|v| ast.list(v.attrs)).chain(ast.field_defs.iter().flat_map(|fd| ast.list(fd.attrs))) {
+            let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+            if hi <= lo { continue; }
+            let t = p.tok(lo);
+            if t.lo >= pf.src_len { continue; }
+            if hi > lo + 1 && !matches!(crate::cfg::tok_str(p, lo + 1), b"(" | b"=") { continue; }
+            let name = String::from_utf8_lossy(crate::cfg::tok_str(p, lo)).into_owned();
+            if matches!(name.as_str(), "test" | "bench" | "test_case" | "derive" | "global_allocator" | "cfg_eval" | "alloc_error_handler" | "derive_const") {
+                errors.push(prog.record_uncoded_error(f as u32, t.lo, "resolve", format!("expected non-macro attribute, found attribute macro `{name}`")));
+            }
+        }
         for prm in ast.params.iter() {
             for a in ast.list(prm.attrs) {
                 let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
