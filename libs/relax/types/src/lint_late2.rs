@@ -24,7 +24,7 @@ pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body, block: Option<BlockId>
     let ast = &pf.ast;
     let mut w = L2 {
         prog, tcx, body, ast, stack: Vec::new(), fns: Vec::new(), owner: HashMap::new(), init: HashMap::new(), names: HashMap::new(),
-        inside_call_args: false, reset_block: false, closure: u32::MAX, active: false, skip_if: Default::default(), stmt_like: Default::default(), module: tcx.item_module(prog, body.def), env: crate::pattern_analysis::body_cx(prog, tcx, body).typing_env(),
+        inside_call_args: false, reset_block: false, closure: u32::MAX, active: false, skip_if: Default::default(), stmt_like: Default::default(), module: u32::MAX, env: crate::pattern_analysis::body_cx(prog, tcx, body).typing_env(),
     };
     // pre-pass: which closure declares each local, the initialisers of plain bindings
     {
@@ -94,7 +94,7 @@ struct L2<'a> {
     closure: u32,
     /// inside a fn or closure body (rustc `check_fn`; const and static initialisers are not searched)
     active: bool,
-    /// the module (or block module) the walk is in
+    /// the block module the walk is in (u32::MAX: none, the body owner's module)
     module: u32,
 }
 
@@ -1273,6 +1273,7 @@ impl<'a> L2<'a> {
         if segs.len() < 2 { return; }
         let pf = &self.prog.files[self.body.file as usize];
         if lint::external(self.prog, self.body.file, p.lo) || p.lo >= pf.src_len { return; }
+        let module = if self.module == u32::MAX { self.tcx.item_module(self.prog, self.body.def) } else { self.module };
         let Some(Res::Def(target)) = self.body.res.get(&e.0).copied() else { return };
         // segments after the first one with generic arguments are not considered
         let end = segs.iter().position(|s| ast.gargs(s.args()).is_some()).map_or(segs.len(), |i| i + 1);
@@ -1284,10 +1285,10 @@ impl<'a> L2<'a> {
                 target
             } else {
                 let prefix: Vec<(SegKind, crate::program::Sym)> = segs[..=i].iter().map(|s| (s.kind(), self.prog.syms.intern_late(pf.text(s.name)))).collect();
-                match self.prog.resolve_mod_path(self.module, false, &prefix, false, false) { Some(d) => d, None => continue }
+                match self.prog.resolve_mod_path(module, false, &prefix, false, false) { Some(d) => d, None => continue }
             };
             let name = self.prog.syms.intern_late(pf.text(seg.name));
-            if self.prog.lookup_in_scope(self.module, name, !last) == Some(res) {
+            if self.prog.lookup_in_scope(module, name, !last) == Some(res) {
                 self.emit(&UNUSED_QUALIFICATIONS, p.lo, "unnecessary qualification");
                 return;
             }

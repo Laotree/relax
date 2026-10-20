@@ -2578,6 +2578,8 @@ pub(crate) fn attr_checks(prog: &Program, n: &AttrNode) {
     // `#[macro_use]` state: Some(first position) once all macros are used; the specific lists seen so far
     let mut use_all: Option<u32> = None;
     let mut specific: Vec<u32> = Vec::new();
+    // the `doc(alias)` values of the node, across its doc attributes
+    let doc_aliases: std::cell::RefCell<Vec<String>> = Default::default();
     for &(file, a) in n.attrs {
         let pf = &prog.files[file as usize];
         let apos = attr_pos(pf, &a);
@@ -2659,7 +2661,7 @@ pub(crate) fn attr_checks(prog: &Program, n: &AttrNode) {
         }
         // ---- doc attributes
         if word.as_deref() == Some("doc") {
-            doc_attr(prog, n, file, apos, args, &emit, &hard);
+            doc_attr(prog, n, file, apos, args, &emit, &hard, &doc_aliases);
         }
     }
 }
@@ -2688,7 +2690,7 @@ fn is_executable_crate(prog: &Program, krate: u32) -> bool {
 }
 
 /// rustc_attr_parsing `DocParser`.
-fn doc_attr(prog: &Program, n: &AttrNode, file: u32, apos: u32, args: &Args, emit: &dyn Fn(&Lint, u32, &str), hard: &dyn Fn(u32, &str)) {
+fn doc_attr(prog: &Program, n: &AttrNode, file: u32, apos: u32, args: &Args, emit: &dyn Fn(&Lint, u32, &str), hard: &dyn Fn(u32, &str), aliases_seen: &std::cell::RefCell<Vec<String>>) {
     let _ = prog;
     let invalid = |pos: u32, msg: &str| emit(&INVALID_DOC_ATTRIBUTES, pos, msg);
     match args {
@@ -2700,8 +2702,7 @@ fn doc_attr(prog: &Program, n: &AttrNode, file: u32, apos: u32, args: &Args, emi
             if !macro_call && string_value(tok).is_none() { invalid(*pos, "malformed `doc` attribute input"); }
         }
         Args::List { items, .. } => {
-            let mut aliases: Vec<String> = Vec::new();
-            let mut add_alias = |alias: String, pos: u32| {
+            let add_alias = |alias: String, pos: u32| {
                 if alias.is_empty() { hard(pos, "`#[doc(alias = \"...\")]` attribute cannot have empty value"); return; }
                 if let Some(c) = alias.chars().find(|&c| c == '"' || c == '\'' || (c.is_whitespace() && c != ' ')) {
                     hard(pos, &format!("{:?} character isn't allowed in `#[doc(alias = \"...\")]`", c));
@@ -2709,8 +2710,8 @@ fn doc_attr(prog: &Program, n: &AttrNode, file: u32, apos: u32, args: &Args, emi
                 }
                 if alias.starts_with(' ') || alias.ends_with(' ') { hard(pos, "`#[doc(alias = \"...\")]` cannot start or end with ' '"); return; }
                 if n.is_crate { hard(pos, "`#![doc(alias = \"...\")]` isn't allowed as a crate-level attribute"); return; }
-                if aliases.contains(&alias) { emit(&UNUSED_ATTRIBUTES, pos, "doc alias is duplicated"); }
-                aliases.push(alias);
+                if aliases_seen.borrow().contains(&alias) { emit(&UNUSED_ATTRIBUTES, pos, "doc alias is duplicated"); }
+                aliases_seen.borrow_mut().push(alias);
             };
             for m in items {
                 match m {
