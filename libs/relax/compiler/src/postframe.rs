@@ -28,6 +28,10 @@ static MAIN_COMPILE_NS: AtomicU64 = AtomicU64::new(0);
 static LAST_FRAME: AtomicU64 = AtomicU64::new(0);
 static LOGGED: AtomicU64 = AtomicU64::new(0);
 static SUMMARY_DONE: AtomicBool = AtomicBool::new(false);
+/// the owner's service in the window by class (ns), and of it the requests a program thread's
+/// request was queued behind when they ended (ns)
+static SERVED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static SERVED_BLOCKING: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 fn present_ns() -> u64 {
     FIRST_PRESENT_NS.load(Relaxed)
@@ -99,6 +103,35 @@ pub(crate) fn main_owner_wait(t0: u64, w: u64) {
     }
 }
 
+/// The owner served a request of class `class` asked at `site` by thread `from` from `t0` to `t1`;
+/// `foreground` program-thread requests were queued at its end. Nested requests count in their
+/// outer one too.
+pub(crate) fn owner_served(class: usize, site: &std::panic::Location<'_>, from: u64, t0: u64, t1: u64, foreground: u32) {
+    let fp = present_ns();
+    if fp == 0 || t0 < fp || crate::jit::QUIT_SEEN.load(Relaxed) {
+        return;
+    }
+    let dt = t1.saturating_sub(t0);
+    if in_window(t0) {
+        SERVED[class].fetch_add(dt, Relaxed);
+        if foreground > 0 {
+            SERVED_BLOCKING[class].fetch_add(dt, Relaxed);
+        }
+    }
+    if dt >= STALL_LOG_NS && t0 < fp + 3 * WINDOW_NS && may_log() {
+        eprintln!(
+            "makepad-run owner long: {} request of `{}` from {}:{} served {:.1} ms at +{:.2} s ({} program-thread requests queued at its end)",
+            crate::owner::CLASS_NAMES[class],
+            crate::os::thread::name(from),
+            site.file().rsplit('/').next().unwrap_or(""),
+            site.line(),
+            ms(dt),
+            (t0 - fp) as f64 / 1e9,
+            foreground
+        );
+    }
+}
+
 /// A real-time thread's lazy compile began at `t0` and stalled it `dt` ns.
 pub(crate) fn rt_compile(t0: u64, dt: u64) {
     if in_window(t0) {
@@ -146,12 +179,16 @@ fn summary_due(now: u64) {
     }
 }
 
+fn served(a: &[AtomicU64; 5]) -> String {
+    (0..5).map(|c| format!("{} {:.0}", crate::owner::CLASS_NAMES[c], ms(a[c].load(Relaxed)))).collect::<Vec<_>>().join(", ")
+}
+
 /// The window's sums (one line).
 pub fn summary() -> String {
     let c = |i: usize| COMPILES[i].load(Relaxed);
     let g = |i: usize| GAPS[i].load(Relaxed);
     format!(
-        "makepad-run post-present {:.0} s: main thread stalled {:.1} ms in {} lazy compiles ({} of {:.0} ms or more; owner queue {:.1}, typeck ahead {:.1}, front {:.1}, back {:.1}, finish {:.1}, in-flight wait {:.1} ms), {} owner requests waited {:.1} ms in all; real-time threads stalled {:.1} ms in {} lazy compiles; {} frames, {} gaps of {:.0} ms or more ({:.0} ms, longest {:.0} ms)",
+        "makepad-run post-present {:.0} s: main thread stalled {:.1} ms in {} lazy compiles ({} of {:.0} ms or more; owner queue {:.1}, typeck ahead {:.1}, front {:.1}, back {:.1}, finish {:.1}, in-flight wait {:.1} ms), {} owner requests waited {:.1} ms in all; real-time threads stalled {:.1} ms in {} lazy compiles; {} frames, {} gaps of {:.0} ms or more ({:.0} ms, longest {:.0} ms); owner served ms {} (with program-thread requests queued at the end: {})",
         WINDOW_NS as f64 / 1e9,
         ms(c(1)),
         c(0),
@@ -171,6 +208,8 @@ pub fn summary() -> String {
         g(1),
         ms(FRAME_GAP_NS),
         ms(g(2)),
-        ms(g(3))
+        ms(g(3)),
+        served(&SERVED),
+        served(&SERVED_BLOCKING)
     )
 }

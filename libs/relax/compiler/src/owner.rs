@@ -87,6 +87,8 @@ fn spin_iters(us: u32) -> u32 {
 struct Req {
     run: *mut dyn FnMut(),
     class: Class,
+    /// where it was asked (postframe's long-request log)
+    site: &'static std::panic::Location<'static>,
     /// requester (os thread id)
     from: u64,
     /// the requester's query context
@@ -301,17 +303,20 @@ pub fn call<R>(class: Class, f: impl FnOnce() -> R) -> R {
 }
 
 /// `call` for work that reads no slot identity (the startup identities stay encoded).
+#[track_caller]
 pub fn call_quick<R>(class: Class, f: impl FnOnce() -> R) -> R {
     request(class, true, None, f).unwrap()
 }
 
 /// `call`, unless the owner has not started it within `ms`: then it is withdrawn (None).
+#[track_caller]
 pub fn call_within<R>(class: Class, ms: u64, f: impl FnOnce() -> R) -> Option<R> {
     // (at least 2 ms: an idle owner picks a request up in microseconds; 0 means "only if the
     // owner is free now")
     request(class, false, Some(std::time::Instant::now() + std::time::Duration::from_millis(ms.max(2))), f)
 }
 
+#[track_caller]
 fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f: impl FnOnce() -> R) -> Option<R> {
     if is_owner() || CHILD.load(Ordering::Relaxed) {
         return Some(f());
@@ -339,6 +344,7 @@ fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f
     let req = Req {
         run,
         class,
+        site: std::panic::Location::caller(),
         from: me(),
         ctx: crate::query::context_ptr(),
         rec: crate::jit::main_rec_target(),
@@ -421,6 +427,7 @@ fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f
 }
 
 /// Posts `f` to the owner and returns at once (it runs later, in class order).
+#[track_caller]
 pub fn post(class: Class, f: impl FnOnce() + Send + 'static) {
     if is_owner() || CHILD.load(Ordering::Relaxed) {
         f();
@@ -432,6 +439,7 @@ pub fn post(class: Class, f: impl FnOnce() + Send + 'static) {
     let req = Box::new(Req {
         run: Box::into_raw(run),
         class,
+        site: std::panic::Location::caller(),
         from: me(),
         ctx: std::ptr::null(),
         rec: std::ptr::null(),
@@ -610,7 +618,9 @@ fn serve(r: usize) {
     SERVING.with(|s| s.set(prev));
     unsafe { crate::query::swap_context(prev_ctx) };
     OWNER_SERVING.store(was_serving, Ordering::Relaxed);
-    BUSY_NS[req.class as usize].fetch_add(crate::jit::wall_ns().saturating_sub(t0), Ordering::Relaxed);
+    let t1 = crate::jit::wall_ns();
+    BUSY_NS[req.class as usize].fetch_add(t1.saturating_sub(t0), Ordering::Relaxed);
+    crate::postframe::owner_served(req.class as usize, req.site, req.from, t0, t1, FOREGROUND.load(Ordering::Relaxed));
     // the process is ending on another thread: this request is never answered (its requester
     // waits until the process is gone)
     if res.as_ref().is_err_and(|p| p.is::<ExitParked>()) {
