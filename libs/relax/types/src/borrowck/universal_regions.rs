@@ -295,23 +295,21 @@ impl SignatureRegions {
         let mut signature = sig.liberated_bound();
         if !matches!(tcx.tys.kind(signature),TyKind::FnPtr(..)) { return None; }
         let mut bound = sig.bound;
-        if sig.annotation_eq.is_none() {
-            // rustc universal_regions.rs: the closure's inputs and output are the closure type's (bound) signature with its
-            // late-bound regions liberated. The typeck's liberated signature was normalized with region variables that
-            // writeback erases, which would make them unrelated external regions; the bound signature carries the
-            // higher-ranked regions as bound variables, so liberate it here.
-            if let TyKind::FnPtr(ps,ret,c,n) = tcx.tys.kind(bound).clone() {
-                let scope = RegionScope::Closure { owner, expr };
-                let regions: Vec<_> = (0..n).map(|v| tcx.tys.intern_region(RegionKind::ReLateParam(scope,LateParamKind::Anon(v)))).collect();
-                let replace = |r, depth| match tcx.tys.region_kind(r) {
-                    RegionKind::ReBound(d, var) if d == depth => regions[var.0 as usize],
-                    RegionKind::ReBound(d, var) if d > depth => tcx.tys.intern_region(RegionKind::ReBound(d - 1, var)),
-                    _ => r,
-                };
-                let ps: Vec<_> = tcx.tys.list(ps).iter().map(|t| tcx.tys.map_regions(*t,&replace,0)).collect();
-                let ret = tcx.tys.map_regions(ret,&replace,0);
-                signature = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&ps),ret,c,0));
-            }
+        // rustc universal_regions.rs: the closure's inputs and output are the closure type's (bound) signature with its
+        // late-bound regions liberated. The typeck's liberated signature (and a merged annotation's expected one) was normalized
+        // with region variables that writeback erases, which would make them unrelated external regions; the bound
+        // signature carries the higher-ranked regions as bound variables, so liberate it here.
+        if let TyKind::FnPtr(ps,ret,c,n) = tcx.tys.kind(bound).clone() {
+            let scope = RegionScope::Closure { owner, expr };
+            let regions: Vec<_> = (0..n).map(|v| tcx.tys.intern_region(RegionKind::ReLateParam(scope,LateParamKind::Anon(v)))).collect();
+            let replace = |r, depth| match tcx.tys.region_kind(r) {
+                RegionKind::ReBound(d, var) if d == depth => regions[var.0 as usize],
+                RegionKind::ReBound(d, var) if d > depth => tcx.tys.intern_region(RegionKind::ReBound(d - 1, var)),
+                _ => r,
+            };
+            let ps: Vec<_> = tcx.tys.list(ps).iter().map(|t| tcx.tys.map_regions(*t,&replace,0)).collect();
+            let ret = tcx.tys.map_regions(ret,&replace,0);
+            signature = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&ps),ret,c,0));
         }
         if let Some((plan, env)) = coroutine {
             signature = coroutine_closure_signature(tcx, owner, expr, signature, env, plan);
