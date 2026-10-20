@@ -1901,6 +1901,11 @@ pub mod uses {
         SEMIS.lock().unwrap_or_else(|e| e.into_inner()).push(TrailingSemi { file: file.to_string(), semi, call, def_file: def_file.to_string() });
     }
 
+    static META_LINTS: Mutex<Vec<(String, u32, String)>> = Mutex::new(Vec::new());
+    /// A `meta_variable_misuse` lint of the `macro_rules!` written at `pos` of `file` (macro_check).
+    pub fn meta_variable_misuse(file: &str, pos: u32, msg: String) { META_LINTS.lock().unwrap_or_else(|e| e.into_inner()).push((file.to_string(), pos, msg)); }
+    pub fn take_meta_variable_misuse() -> Vec<(String, u32, String)> { std::mem::take(&mut *META_LINTS.lock().unwrap_or_else(|e| e.into_inner())) }
+
     pub fn take_trailing_semis() -> Vec<TrailingSemi> {
         std::mem::take(&mut *SEMIS.lock().unwrap_or_else(|e| e.into_inner()))
     }

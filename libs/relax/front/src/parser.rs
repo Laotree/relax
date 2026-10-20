@@ -1223,6 +1223,12 @@ impl<'a> Parser<'a> {
         if crate::lexer::validation_enabled() {
             if let Some(d) = scope.local.last() {
                 crate::macros::check_rules(d, edition).map_err(|msg| PErr { pos: name.lo, msg })?;
+                // (macros an expansion defines were checked in the macro that wrote them)
+                if crate::macros::uses::recording() && (name.lo as usize) < self.src.len() {
+                    for msg in crate::macro_check::lints(d) {
+                        crate::macros::uses::meta_variable_misuse(file, name.lo, msg);
+                    }
+                }
             }
         }
         Ok(())
@@ -1793,7 +1799,8 @@ impl<'a> Parser<'a> {
             self.pos = save;
             return Ok(None);
         }
-        let trailing = delim != b'{' && matches!(self.kind(), T::CloseBrace | T::Eof);
+        // (an `Eof` after the call ends an enclosing expansion: a statement macro, nothing is linted)
+        let trailing = delim != b'{' && self.kind() == T::CloseBrace;
         // rustc_parse `parse_stmt_mac`: a call ending its block without `;` is an expression statement,
         // expanded as one expression (an `Eof` after it is the end of an enclosing expansion: a statement)
         let tail_expr = delim != b'{' && self.kind() == T::CloseBrace && def.builtin == 0 && crate::lexer::validation_enabled() && (lo as usize) < self.src.len();

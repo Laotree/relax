@@ -3115,10 +3115,36 @@ fn trailing_semis(prog: &Program, own: &[bool]) {
         // `is_local`: the macro is defined in the crate that calls it
         let local = prog.file_paths.iter().position(|p| *p == t.def_file).is_some_and(|f| prog.file_crate.get(f).copied() == Some(krate));
         if !local { continue; }
-        if !seen.insert((file, t.semi)) { continue; }
+        if !seen.insert((file, t.semi, t.call)) { continue; }
         let pf = &prog.files[file];
         let def = enclosing_def(prog, file as u32, pf.lint_pos(t.call), krate);
-        emit(prog, def, &SEMICOLON_IN_EXPRESSIONS_FROM_MACROS, file as u32, t.semi, "trailing semicolon in macro used in expression position");
+        let attrs = lint::attrs_at_call(prog, def, file as u32, pf.lint_pos(t.call));
+        emit_in(prog, def, &attrs, &SEMICOLON_IN_EXPRESSIONS_FROM_MACROS, file as u32, t.semi, "trailing semicolon in macro used in expression position");
+    }
+}
+
+// ---------------------------------------------------------------- meta_variable_misuse
+
+pub const META_VARIABLE_MISUSE: Lint = lint::lint("meta_variable_misuse");
+
+/// rustc_expand mbe/macro_check.rs: the lints the parser collected for the `macro_rules!` of the
+/// checked crates (front macro_check.rs), under the lint levels at the definition.
+fn meta_variable_misuse(prog: &Program, own: &[bool]) {
+    let mut seen = std::collections::HashSet::new();
+    for (path, pos, msg) in crate::macros::uses::take_meta_variable_misuse() {
+        let Some(file) = prog.file_paths.iter().position(|p| *p == path) else { continue };
+        let krate = prog.file_crate.get(file).copied().unwrap_or(u32::MAX);
+        if !own.get(krate as usize).copied().unwrap_or(false) { continue; }
+        if !seen.insert((file, pos, msg.clone())) { continue; }
+        let pf = &prog.files[file];
+        let def = enclosing_def(prog, file as u32, pf.lint_pos(pos), krate);
+        // the attributes of the `macro_rules!` item itself
+        let ast = &pf.ast;
+        let attrs: Vec<Attr> = ast.items.iter()
+            .filter(|it| matches!(it.kind, ItemKind::MacroRules(_)) && it.lo <= pos && pos < it.hi)
+            .flat_map(|it| ast.list(it.attrs).iter().copied())
+            .collect();
+        emit_in(prog, def, &attrs, &META_VARIABLE_MISUSE, file as u32, pos, &msg);
     }
 }
 
@@ -3133,6 +3159,7 @@ pub const UNUSED_MACRO_RULES: Lint = lint::lint("unused_macro_rules");
 pub fn finish(prog: &Program, own: &[bool]) {
     if !lint::enabled() { return; }
     trailing_semis(prog, own);
+    meta_variable_misuse(prog, own);
     cfg_attr_empties(prog, own);
     named_args_positional(prog, own);
     crate_attr_lints(prog, own);
