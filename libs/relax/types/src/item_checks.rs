@@ -1030,6 +1030,12 @@ fn attribute_args_error(p: crate::cfg::Src<'_>, lo: usize, hi: usize, name: &[u8
         }
         if start < hi - 1 { entries.push((start, hi - 1)); }
     }
+    // `NoArgsAttributeParser`s (+ `global_allocator`): any argument is malformed input
+    const NO_ARGS: &[&[u8]] = &[b"non_exhaustive", b"no_core", b"no_std", b"no_main", b"panic_runtime", b"needs_panic_runtime", b"profiler_runtime", b"no_builtins",
+        b"default_lib_allocator", b"may_dangle", b"coroutine", b"no_implicit_prelude", b"pin_v2", b"automatically_derived", b"macro_escape", b"allow_internal_unsafe",
+        b"no_link", b"cold", b"track_caller", b"no_mangle", b"thread_local", b"marker", b"fundamental", b"export_stable", b"ffi_const", b"ffi_pure",
+        b"needs_allocator", b"compiler_builtins", b"proc_macro", b"proc_macro_attribute", b"panic_handler", b"global_allocator"];
+    if n < hi && NO_ARGS.contains(&name) { return Some((lo, "E0565")); }
     match name {
         b"inline" if list => {
             if entries.len() != 1 { return Some((lo, "E0805")); }
