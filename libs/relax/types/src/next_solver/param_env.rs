@@ -191,7 +191,18 @@ fn do_normalize_clauses(tcx: &Tcx, prog: &Program, cause: ObligationCause, elabo
     // There are no assumed WF types here; this cannot fail to build the outlives env.
     let _ = infcx.resolve_regions(prog, tcx.intern_param_env(ParamEnv { clauses: normalized.clone().into() }), &[]);
     match infcx.deeply_resolve_clauses_via_region_graph(&normalized) {
-        Ok(clauses) => clauses,
+        Ok(clauses) => {
+            // A region variable no constraint reaches (an unconstrained impl lifetime) stays in the
+            // clauses as in rustc's lexical resolution, but belongs to this inference context only:
+            // another context cannot resolve it, so it becomes an error region (as the Err path below does).
+            struct EraseVars;
+            impl TypeFolder for EraseVars {
+                fn fold_region(&mut self, tys: &Types, r: crate::types::RegionId, _: u32) -> crate::types::RegionId {
+                    if matches!(tys.region_kind(r), crate::types::RegionKind::ReVar(_)) { tys.intern_region(crate::types::RegionKind::ReError) } else { r }
+                }
+            }
+            clauses.iter().map(|c| fold::fold_predicate(&tcx.tys, c, &mut EraseVars)).collect()
+        }
         Err(error) => {
             tcx.dcx.delayed_bug(cause, format!("inference variables in normalized parameter environment: {error:?}"));
             replace_infer_and_non_rigid_alias_with_error(&infcx, normalized, true)
