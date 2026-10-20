@@ -8978,10 +8978,7 @@ impl<'a> Lcx<'a> {
         }
         // SPEC-V: unverified code may break the borrow rules; the callee's `noalias` code must not
         // see such arguments
-        let callee = match callee {
-            Callee::Fn(id) if self.plain_calls && self.alias_prone(&args) => Callee::Fn(self.u.plain_twin(id)),
-            c => c,
-        };
+        let to_twin = self.plain_calls && matches!(callee, Callee::Fn(_)) && self.alias_prone(&args);
         // C ABI calls: every aggregate goes by pointer to a private copy, an aggregate
         // result through a result slot; the backend does the C placement (CSig)
         let csig = match &callee {
@@ -9065,6 +9062,17 @@ impl<'a> Lcx<'a> {
             let l = self.caller_location_val();
             abi_args.push(l);
         }
+        // (the twin has the original's ABI, hence its result slot and implicit caller location)
+        let callee = match callee {
+            Callee::Fn(id) if to_twin => {
+                let twin = self.u.plain_twin(id);
+                if sret.is_some() && !self.f.sret_callees.contains(&twin) {
+                    self.f.sret_callees.push(twin);
+                }
+                Callee::Fn(twin)
+            }
+            c => c,
+        };
         self.emit(Inst::Call(callee, abi_args, rets.clone()));
         if self.is_never(ret) {
             self.term(Term::Unreachable);
