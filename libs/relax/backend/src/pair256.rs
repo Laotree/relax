@@ -45,6 +45,9 @@ pub fn op256(op: VX) -> bool {
 enum Kind {
     Load(VReg),
     Store(VReg),
+    /// indexed: (base, index, shift)
+    LoadX(VReg, VReg, u8),
+    StoreX(VReg, VReg, u8),
     Vx(VX),
     Fma(bool, bool),
     Mov,
@@ -65,6 +68,8 @@ fn shape(f: &Func, i: &Inst, caps: Caps) -> Option<Shape> {
     match *i {
         Inst::VLoad(d, b, o) if v(d) && o <= i32::MAX - 16 => Some(Shape { kind: Kind::Load(b), off: o, dest: Some(d), ops: [z; 3], n: 0 }),
         Inst::VStore(b, o, s) if v(s) && o <= i32::MAX - 16 => Some(Shape { kind: Kind::Store(b), off: o, dest: None, ops: [s, z, z], n: 1 }),
+        Inst::VLoadX(d, b, x, sh, o) if v(d) && o <= i32::MAX - 16 => Some(Shape { kind: Kind::LoadX(b, x, sh), off: o, dest: Some(d), ops: [z; 3], n: 0 }),
+        Inst::VStoreX(b, x, sh, o, s) if v(s) && o <= i32::MAX - 16 => Some(Shape { kind: Kind::StoreX(b, x, sh), off: o, dest: None, ops: [s, z, z], n: 1 }),
         Inst::VX(op, d, a, b) if op256(op) && v(d) && v(a) && v(b) => Some(Shape { kind: Kind::Vx(op), off: 0, dest: Some(d), ops: [a, b, z], n: 2 }),
         Inst::VFma(np, na, d, a, b, c) if caps.fma && v(d) => Some(Shape { kind: Kind::Fma(np, na), off: 0, dest: Some(d), ops: [a, b, c], n: 3 }),
         Inst::Mov(d, a) if v(d) && v(a) && d != a => Some(Shape { kind: Kind::Mov, off: 0, dest: Some(d), ops: [a, z, z], n: 1 }),
@@ -143,8 +148,8 @@ impl Cx {
         let m = &insts[p as usize];
         let (mut mu, mut md) = (Vec::new(), Vec::new());
         uses_defs(m, &mut mu, &mut md);
-        let load = matches!(m, Inst::VLoad(..));
-        let store = matches!(m, Inst::VStore(..));
+        let load = matches!(m, Inst::VLoad(..) | Inst::VLoadX(..));
+        let store = matches!(m, Inst::VStore(..) | Inst::VStoreX(..));
         let (mut u, mut d) = (Vec::new(), Vec::new());
         for k in p + 1..q {
             let i = &insts[k as usize];
@@ -155,7 +160,7 @@ impl Cx {
             if (load || store) && is_mem_effect(i) {
                 return false;
             }
-            if store && matches!(i, Inst::Load(..) | Inst::LoadX(..) | Inst::VLoad(..) | Inst::VGather(..)) {
+            if store && matches!(i, Inst::Load(..) | Inst::LoadX(..) | Inst::VLoad(..) | Inst::VLoadX(..) | Inst::VGather(..)) {
                 return false;
             }
         }
@@ -176,7 +181,7 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
         let mut row = Vec::with_capacity(b.insts.len());
         for (k, i) in b.insts.iter().enumerate() {
             let s = shape(f, i, caps);
-            any |= matches!(s, Some(Shape { kind: Kind::Load(_) | Kind::Store(_), .. }));
+            any |= matches!(s, Some(Shape { kind: Kind::Load(_) | Kind::Store(_) | Kind::LoadX(..) | Kind::StoreX(..), .. }));
             row.push(s);
             uses_defs(i, &mut u, &mut d);
             for x in &u {
@@ -238,6 +243,15 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
                     let mut lo_i: Option<bool> = None;
                     let mut ok = true;
                     match (si.kind, sj.kind) {
+                        (Kind::LoadX(..) | Kind::StoreX(..), _) => {
+                            if sj.off == si.off + 16 {
+                                lo_i = Some(true);
+                            } else if si.off == sj.off + 16 {
+                                lo_i = Some(false);
+                            } else {
+                                continue;
+                            }
+                        }
                         (Kind::Load(bi_) | Kind::Store(bi_), Kind::Load(bj_) | Kind::Store(bj_)) => {
                             let (ri, oi) = cx.addr(f, bi_, si.off as i64);
                             let (rj, oj) = cx.addr(f, bj_, sj.off as i64);
@@ -546,6 +560,8 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
                 let fusedi = match *li {
                     Inst::VLoad(_, base, off) => Inst::VLoad(dest.unwrap(), base, off),
                     Inst::VStore(base, off, _) => Inst::VStore(base, off, ops[0]),
+                    Inst::VLoadX(_, base, x, sh, off) => Inst::VLoadX(dest.unwrap(), base, x, sh, off),
+                    Inst::VStoreX(base, x, sh, off, _) => Inst::VStoreX(base, x, sh, off, ops[0]),
                     Inst::VX(op, ..) => Inst::VX(op, dest.unwrap(), ops[0], ops[1]),
                     Inst::VFma(np, na, ..) => Inst::VFma(np, na, dest.unwrap(), ops[0], ops[1], ops[2]),
                     Inst::Mov(..) => Inst::Mov(dest.unwrap(), ops[0]),

@@ -153,12 +153,12 @@ pub fn uses_defs(i: &Inst, uses: &mut Vec<VReg>, defs: &mut Vec<VReg>) {
             uses.push(*b);
             uses.push(*s);
         }
-        Inst::LoadX(_, d, b, x, _, _) => {
+        Inst::LoadX(_, d, b, x, _, _) | Inst::VLoadX(d, b, x, _, _) => {
             uses.push(*b);
             uses.push(*x);
             defs.push(*d);
         }
-        Inst::StoreX(_, b, x, _, _, s) => {
+        Inst::StoreX(_, b, x, _, _, s) | Inst::VStoreX(b, x, _, _, s) => {
             uses.push(*b);
             uses.push(*x);
             uses.push(*s);
@@ -265,11 +265,11 @@ pub fn for_uses(i: &Inst, mut uses: impl FnMut(VReg)) {
             uses(*b);
             uses(*s);
         }
-        Inst::LoadX(_, d, b, x, _, _) => {
+        Inst::LoadX(_, d, b, x, _, _) | Inst::VLoadX(d, b, x, _, _) => {
             uses(*b);
             uses(*x);
         }
-        Inst::StoreX(_, b, x, _, _, s) => {
+        Inst::StoreX(_, b, x, _, _, s) | Inst::VStoreX(b, x, _, _, s) => {
             uses(*b);
             uses(*x);
             uses(*s);
@@ -348,7 +348,7 @@ pub fn for_uses(i: &Inst, mut uses: impl FnMut(VReg)) {
 #[inline]
 pub fn for_defs(i: &Inst, mut defs: impl FnMut(VReg)) {
     match i {
-        Inst::Store(..) | Inst::StoreX(..) | Inst::Copy(..) | Inst::Fence(..) | Inst::VStore(..) | Inst::AtomicStore(..) | Inst::FpEnv(true, _) => {}
+        Inst::Store(..) | Inst::StoreX(..) | Inst::Copy(..) | Inst::Fence(..) | Inst::VStore(..) | Inst::VStoreX(..) | Inst::AtomicStore(..) | Inst::FpEnv(true, _) => {}
         Inst::FpEnv(false, d) => defs(*d),
         Inst::Cpuid(ds, _, _) => { for d in ds { defs(*d); } }
         Inst::Xgetbv(d, _) => defs(*d),
@@ -374,6 +374,7 @@ pub fn for_defs(i: &Inst, mut defs: impl FnMut(VReg)) {
         | Inst::FCmp(_, _, d, _, _)
         | Inst::Load(_, d, _, _)
         | Inst::LoadX(_, d, _, _, _, _)
+        | Inst::VLoadX(d, _, _, _, _)
         | Inst::VGather(d, _, _)
         | Inst::VShuffle(d, _, _, _)
         | Inst::VX(_, d, _, _)

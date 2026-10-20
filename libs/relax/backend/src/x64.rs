@@ -2264,6 +2264,27 @@ impl<'a> Gen<'a> {
             Inst::Sel(d, c, a, b) => self.sel(options, *d, *c, *a, *b),
             _ if self.ymm && y_inst(self.f, i) => self.y(options, i),
             Inst::VShuffle(..) | Inst::VSel(..) | Inst::VFma(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) | Inst::VLoad(..) | Inst::VStore(..) | Inst::VAny(..) | Inst::VGather(..) | Inst::VConst(..) => self.vinst(options, i),
+            Inst::VLoadX(d, base, idx, sh, off) => {
+                let (ri, rb, off) = self.index_operands(options, *base, *idx, *off);
+                let xd = self.def_f(*d, XS);
+                self.a.sib = Some((ri, *sh));
+                if self.f.vregs[d.0 as usize] == Cls::V256 {
+                    self.a.vex_lm(0, 1, false, true, 0x10, xd, 0, rb, off); // vmovups ymm
+                } else {
+                    self.a.sse_rm(0, 0x10, xd, rb, off); // movups
+                }
+                self.fin_f(*d, xd);
+            }
+            Inst::VStoreX(base, idx, sh, off, v) => {
+                let xv = self.use_f(*v, XS);
+                let (ri, rb, off) = self.index_operands(options, *base, *idx, *off);
+                self.a.sib = Some((ri, *sh));
+                if self.f.vregs[v.0 as usize] == Cls::V256 {
+                    self.a.vex_lm(0, 1, false, true, 0x11, xv, 0, rb, off);
+                } else {
+                    self.a.sse_rm(0, 0x11, xv, rb, off);
+                }
+            }
             Inst::VX(op, d, a, b) => self.vx(options, *op, *d, *a, *b),
             Inst::VX3(op, d, a, b, c) => self.vx3(*op, *d, *a, *b, *c),
             Inst::FMulAdd(np, na, w, d, a, b, c) => self.fma(*np, *na, *w, *d, *a, *b, *c),
@@ -3570,6 +3591,20 @@ impl<'a> Gen<'a> {
     }
 
     /// 128-bit vector instructions (SSE4.1; AVX2 for per-lane shifts, FMA3 for VFma).
+    /// The index and base registers (and displacement) of an indexed access, as LoadX takes them:
+    /// a spilled index in rax (r10 is the base's scratch).
+    fn index_operands(&mut self, options: &relax_session::Options, base: VReg, idx: VReg, off: i32) -> (u8, u8, i32) {
+        let ri = self.use_i(options, idx, R10);
+        let ri = if ri == R10 {
+            self.a.mov_rr(RAX, R10);
+            RAX
+        } else {
+            ri
+        };
+        let (rb, off) = self.base_disp(options, base, R11, off);
+        (ri, rb, off)
+    }
+
     /// A 256-bit vector instruction (`pair256`): VEX.256 forms, three-operand.
     fn y(&mut self, options: &relax_session::Options, i: &Inst) {
         match *i {

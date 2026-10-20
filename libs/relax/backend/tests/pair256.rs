@@ -123,6 +123,48 @@ fn ops_match_halves() {
     }
 }
 
+/// fn(a, b, d, i): d[i*4..][0..32] = a[i*4..][0..32] * b[i*4..][0..32], indexed accesses
+fn indexed() -> Func {
+    let mut f = Func::new("pair_indexed".into(), 0);
+    let (pa, pb, pd, i) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+    f.params = vec![pa, pb, pd, i];
+    f.block();
+    let v: Vec<VReg> = (0..6).map(|_| f.vreg(Cls::V128)).collect();
+    let mul = VX::FMul(VW::S, NanBits::Host);
+    push(&mut f, 0, Inst::VLoadX(v[0], pa, i, 2, 0));
+    push(&mut f, 0, Inst::VLoadX(v[1], pa, i, 2, 16));
+    push(&mut f, 0, Inst::VLoadX(v[2], pb, i, 2, 0));
+    push(&mut f, 0, Inst::VLoadX(v[3], pb, i, 2, 16));
+    push(&mut f, 0, Inst::VX(mul, v[4], v[0], v[2]));
+    push(&mut f, 0, Inst::VX(mul, v[5], v[1], v[3]));
+    push(&mut f, 0, Inst::VStoreX(pd, i, 2, 0, v[4]));
+    push(&mut f, 0, Inst::VStoreX(pd, i, 2, 16, v[5]));
+    f.blocks[0].term = Term::Ret(vec![]);
+    f.verify().unwrap();
+    f
+}
+
+#[test]
+fn indexed_matches_halves() {
+    let Some(_) = caps() else { return };
+    let f = indexed();
+    assert!(fires(&f), "indexed: not fused");
+    let (on, off) = (options(true), options(false));
+    let (c1, c2) = (compile(&on, &f), compile(&off, &f));
+    type E = extern "sysv64" fn(*const u8, *const u8, *mut u8, u64);
+    let (e1, e2): (E, E) = unsafe { (std::mem::transmute(c1.ptr()), std::mem::transmute(c2.ptr())) };
+    let mut rng = Rng(77);
+    for i in 0..5u64 {
+        let (mut a, mut b) = ([0u8; 64], [0u8; 64]);
+        rng.bytes(false, &mut a);
+        rng.bytes(false, &mut b);
+        let (mut r1, mut r2) = ([0u8; 64], [0u8; 64]);
+        e1(a.as_ptr(), b.as_ptr(), r1.as_mut_ptr(), i);
+        e2(a.as_ptr(), b.as_ptr(), r2.as_mut_ptr(), i);
+        assert_eq!(r1, r2, "i={i}");
+    }
+}
+
 /// The piano modal kernel's shape (core::arch `__m256` code as halves): six state/coefficient
 /// pairs live across a loop, a splat of a loaded scalar used for both halves, fused multiply-adds,
 /// a loop-carried pair through a Mov, a per-iteration load/fma/store of an accumulator row, and an
