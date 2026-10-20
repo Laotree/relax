@@ -375,6 +375,66 @@ pub fn const_inst(d: VReg, k: K) -> Inst {
 /// later passes delete, and every pass sizes its per-vreg tables by `f.vregs.len()` -- at
 /// twice the instruction count that table work dominated the optimiser.
 #[inline(never)]
+/// Narrow integer results whose upper register bits nobody reads: per vreg, whether it has one
+/// definition by a narrow (< 64-bit) Add / Sub / Mul / Neg / Not / shift-left or integer cast,
+/// and every use reads only its low `bits`: a store of at most that width, a narrow wrapping
+/// operation (add, sub, mul, and, or, xor, neg, not) of at most that width -- whose result's low
+/// bits depend only on its operands' low bits --, a cast to at most that width, or (with at least 8
+/// bits) the count of a 64-bit shift (the hardware reads the count's low 6 bits). The backends then skip the
+/// result's re-extension (movzx / sxtw after every u8 / i32 operation): the bit reader's
+/// `bits_left -= n` (u8, stored back as a byte) and its `entry as u8` (a shift count).
+pub fn low_bits_only(f: &Func) -> Vec<bool> {
+    let nv = f.vregs.len();
+    let mut bits = vec![0u8; nv];
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 2;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            crate::regalloc::for_defs(i, |d| ndef[d.0 as usize] += 1);
+            match *i {
+                Inst::IBin(IOp::Add | IOp::Sub | IOp::Mul | IOp::Shl, it, d, _, _) | Inst::IBinI(IOp::Add | IOp::Sub | IOp::Mul | IOp::Shl, it, d, _, _) | Inst::INeg(it, d, _) | Inst::INot(it, d, _) | Inst::Conv(Conv::IntToInt(it), d, _) if it.bits < 64 => bits[d.0 as usize] = it.bits,
+                _ => {}
+            }
+        }
+    }
+    let mut ok: Vec<bool> = (0..nv).map(|v| bits[v] != 0 && ndef[v] == 1 && f.vregs[v] == Cls::I).collect();
+    let narrow_wrap = |op: IOp| matches!(op, IOp::Add | IOp::Sub | IOp::Mul | IOp::And | IOp::Or | IOp::Xor);
+    let mut tu = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            // the uses that read only low bits: (vreg, how many)
+            let mut low: [(u32, u8); 2] = [(u32::MAX, 0); 2];
+            match *i {
+                Inst::Store(Mem::Int(n, _), base, _, v) if base != v => low[0] = (v.0, 8 * n),
+                Inst::StoreX(Mem::Int(n, _), base, idx, _, _, v) if base != v && idx != v => low[0] = (v.0, 8 * n),
+                Inst::IBin(op, it, _, x, y) if narrow_wrap(op) && it.bits < 64 => {
+                    low[0] = (x.0, it.bits);
+                    low[1] = (y.0, it.bits);
+                }
+                Inst::IBinI(op, it, _, x, _) if narrow_wrap(op) && it.bits < 64 => low[0] = (x.0, it.bits),
+                Inst::INeg(it, _, x) | Inst::INot(it, _, x) if it.bits < 64 => low[0] = (x.0, it.bits),
+                Inst::Conv(Conv::IntToInt(it), _, x) => low[0] = (x.0, it.bits),
+                // a 64-bit shift's count: the hardware reads its low 6 bits
+                Inst::IBin(IOp::Shl | IOp::Shr, IntTy { bits: 64, .. }, _, x, y) if x != y => low[0] = (y.0, 8),
+                _ => {}
+            }
+            crate::regalloc::for_uses(i, |u| {
+                let u = u.0 as usize;
+                if !low.iter().any(|&(v, n)| v as usize == u && n > 0 && n <= bits[u]) {
+                    ok[u] = false;
+                }
+            });
+        }
+        crate::regalloc::term_uses(&b.term, &mut tu);
+        for u in &tu {
+            ok[u.0 as usize] = false;
+        }
+    }
+    ok
+}
+
 pub fn compact_vregs(f: &mut Func) {
     let nv = f.vregs.len();
     const NONE: u32 = u32::MAX;

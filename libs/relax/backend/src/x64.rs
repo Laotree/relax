@@ -715,6 +715,8 @@ struct Gen<'a> {
     /// loads to emit before the instruction at a position
     win: std::collections::HashMap<u32, Vec<(u32, u32, u8)>>,
     win_start: std::collections::HashMap<u32, Vec<(u32, u8)>>,
+    /// passes::low_bits_only: narrow results whose re-extension nobody reads
+    low_only: Vec<bool>,
     rir_map: Vec<(u32, u32, u32)>,
     rir_map_on: bool,
     /// (register, code position right after it): the last instruction emitted was an integer ALU op
@@ -2377,7 +2379,9 @@ impl<'a> Gen<'a> {
                 self.a.mov_rr(rd, ra);
                 let ext = if matches!(i, Inst::INeg(..)) { 3 } else { 2 };
                 self.a.grp3(ext, rd);
-                self.a.extend(rd, it.bits, it.signed);
+                if !self.low_only[d.0 as usize] {
+                    self.a.extend(rd, it.bits, it.signed);
+                }
                 self.fin_i(*d, rd);
             }
             Inst::ICmp(c, signed, d, a, b) => {
@@ -3989,7 +3993,7 @@ impl<'a> Gen<'a> {
                 _ => self.a.byte(0x33),
             }
             self.a.modrm_mem(rd, RBP, disp);
-            if w && it.bits < 64 && !matches!(op, IOp::And | IOp::Or | IOp::Xor) {
+            if w && it.bits < 64 && !matches!(op, IOp::And | IOp::Or | IOp::Xor) && !self.low_only[d.0 as usize] {
                 self.a.extend(rd, it.bits, it.signed);
             }
             self.fin_i(d, rd);
@@ -4041,7 +4045,7 @@ impl<'a> Gen<'a> {
                     _ => 3,
                 };
                 self.a.vex_rr(pp, 2, w, 0xf7, rd, rb, ra);
-                if w {
+                if w && !self.low_only[d.0 as usize] {
                     self.a.extend(rd, it.bits, it.signed);
                 }
                 self.fin_i(d, rd);
@@ -4132,7 +4136,7 @@ impl<'a> Gen<'a> {
             IOp::Mul => self.a.imul_rr(work, rb),
             _ => {}
         }
-        if it.bits < 64 && !matches!(op, IOp::And | IOp::Or | IOp::Xor) {
+        if it.bits < 64 && !matches!(op, IOp::And | IOp::Or | IOp::Xor) && !self.low_only[d.0 as usize] {
             self.a.extend(work, it.bits, it.signed);
         }
         self.a.mov_rr(rd, work);
@@ -4145,7 +4149,9 @@ impl<'a> Gen<'a> {
                 let rs = self.use_i(options, s, R10);
                 let rd = self.def_i(d, R10);
                 self.a.mov_rr(rd, rs);
-                self.a.extend(rd, it.bits, it.signed);
+                if !self.low_only[d.0 as usize] {
+                    self.a.extend(rd, it.bits, it.signed);
+                }
                 self.fin_i(d, rd);
             }
             Conv::IntToF(from, to64) => {
@@ -4537,7 +4543,9 @@ impl<'a> Gen<'a> {
         }
         let used_lea = matches!(op, IOp::Add | IOp::Sub) && rd != ra && (if op == IOp::Add { k } else { k.wrapping_neg() }) as i32 as i64 == (if op == IOp::Add { k } else { k.wrapping_neg() });
         if it.bits < 64 && !matches!(op, IOp::And | IOp::Or | IOp::Xor) {
-            self.a.extend(rd, it.bits, it.signed);
+            if !self.low_only[d.0 as usize] {
+                self.a.extend(rd, it.bits, it.signed);
+            }
         } else if matches!(op, IOp::Add | IOp::Sub | IOp::And | IOp::Or | IOp::Xor) && !used_lea && (-(1i64 << 31)..(1i64 << 31)).contains(&k) {
             self.last_alu = Some((rd, self.a.pos()));
         }
@@ -4743,6 +4751,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         last_spill: None,
         win,
         win_start,
+        low_only: crate::passes::low_bits_only(f),
         fconsts: {
             let mut nd: std::collections::HashMap<u32, (u32, u64, bool)> = std::collections::HashMap::new();
             for b in &f.blocks {

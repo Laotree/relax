@@ -620,6 +620,8 @@ struct Gen<'a> {
     /// loads to emit before the instruction at a position
     win: std::collections::HashMap<u32, Vec<(u32, u32, u8)>>,
     win_start: std::collections::HashMap<u32, Vec<(u32, u8)>>,
+    /// passes::low_bits_only: narrow results whose re-extension nobody reads
+    low_only: Vec<bool>,
     /// table words to fill once blocks are placed: (word index, table start, target block)
     jt_fix: Vec<(usize, usize, u32)>,
     a: Asm,
@@ -2896,7 +2898,8 @@ impl<'a> Gen<'a> {
                 let ra = self.use_i(*a, S0);
                 let rb = self.use_i(*b, S1);
                 let rd = self.def_i(*d, S0);
-                self.ibin_rr(*op, *it, rd, ra, rb);
+                let ext = !self.low_only[d.0 as usize];
+                self.ibin_rr(*op, *it, rd, ra, rb, ext);
                 self.fin_i(*d, rd);
             }
             Inst::IBinI(op, it, d, a, imm) => self.ibin_imm(*op, *it, *d, *a, *imm),
@@ -2930,7 +2933,9 @@ impl<'a> Gen<'a> {
                 } else {
                     self.a.rrr(0xAA20_0000, rd, ZR, ra);
                 }
-                self.a.extend(rd, rd, it.bits, it.signed);
+                if !self.low_only[d.0 as usize] {
+                    self.a.extend(rd, rd, it.bits, it.signed);
+                }
                 self.fin_i(*d, rd);
             }
             Inst::ICmp(c, signed, d, a, b) => {
@@ -3222,7 +3227,8 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn ibin_rr(&mut self, op: IOp, it: IntTy, rd: u8, ra: u8, rb: u8) {
+    /// `ext`: re-extend a narrow result (false: nobody reads its upper bits, passes::low_bits_only)
+    fn ibin_rr(&mut self, op: IOp, it: IntTy, rd: u8, ra: u8, rb: u8, ext: bool) {
         if op == IOp::Rotl {
             // rotate left by b = rorv by -b (rorv takes the count mod the width; W form for u32)
             self.a.e(0xCB00_03E0 | (rb as u32) << 16 | IP0 as u32);
@@ -3265,7 +3271,7 @@ impl<'a> Gen<'a> {
                 self.a.e(0x9B00_8000 | (rb as u32) << 16 | (ra as u32) << 10 | (IP0 as u32) << 5 | rd as u32);
             }
         }
-        if it.bits < 64 && !matches!(op, IOp::And | IOp::Or | IOp::Xor) {
+        if it.bits < 64 && !matches!(op, IOp::And | IOp::Or | IOp::Xor) && ext {
             self.a.extend(rd, rd, it.bits, it.signed);
         }
     }
@@ -3346,11 +3352,12 @@ impl<'a> Gen<'a> {
         }
         if !done {
             self.a.mov_imm(S1, imm);
-            self.ibin_rr(op, it, rd, ra, S1);
+            let ext = !self.low_only[d.0 as usize];
+            self.ibin_rr(op, it, rd, ra, S1, ext);
             self.fin_i(d, rd);
             return;
         }
-        if it.bits < 64 && !matches!(op, IOp::And | IOp::Or | IOp::Xor) {
+        if it.bits < 64 && !matches!(op, IOp::And | IOp::Or | IOp::Xor) && !self.low_only[d.0 as usize] {
             self.a.extend(rd, rd, it.bits, it.signed);
         }
         self.fin_i(d, rd);
@@ -3361,7 +3368,11 @@ impl<'a> Gen<'a> {
             Conv::IntToInt(it) => {
                 let rs = self.use_i(s, S0);
                 let rd = self.def_i(d, S0);
-                self.a.extend(rd, rs, it.bits, it.signed);
+                if self.low_only[d.0 as usize] {
+                    self.a.mov(rd, rs);
+                } else {
+                    self.a.extend(rd, rs, it.bits, it.signed);
+                }
                 self.fin_i(d, rd);
             }
             Conv::IntToF(from, to64) => {
@@ -3635,6 +3646,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
             }
             w
         },
+        low_only: crate::passes::low_bits_only(f),
         win_start: {
             let mut ws: std::collections::HashMap<u32, Vec<(u32, u8)>> = std::collections::HashMap::new();
             for &(v, a, _, r) in &al.windows {
