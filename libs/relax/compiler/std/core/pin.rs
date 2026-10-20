@@ -11,6 +11,12 @@ where
     U: PinSafePointer,
 {
 }
+impl<Ptr, U> crate::ops::CoerceUnsized<Pin<U>> for Pin<Ptr>
+where
+    Ptr: crate::ops::CoerceUnsized<U> + PinSafePointer,
+    U: PinSafePointer,
+{
+}
 pub unsafe trait PinSafePointer: Deref + Sized {}
 unsafe impl<'a, T: ?Sized> PinSafePointer for &'a T {}
 unsafe impl<'a, T: ?Sized> PinSafePointer for &'a mut T {}

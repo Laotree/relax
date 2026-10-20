@@ -17,6 +17,8 @@ use crate::pin::PinSafePointer;
 
 // library/alloc/src/rcs/rc.rs:357,2604 @8d1a764
 impl<T: ?Sized + Unsize<U>, U: ?Sized> DispatchFromDyn<Rc<U>> for Rc<T> {}
+impl<T: ?Sized + Unsize<U>, U: ?Sized> crate::ops::CoerceUnsized<Rc<U>> for Rc<T> {}
+impl<T: ?Sized + Unsize<U>, U: ?Sized> crate::ops::CoerceUnsized<Weak<U>> for Weak<T> {}
 unsafe impl<T: ?Sized> PinSafePointer for Rc<T> {}
 use crate::ptr;
 

@@ -14,6 +14,8 @@ use crate::pin::PinSafePointer;
 
 // library/alloc/src/rcs/arc.rs:292,2577 @8d1a764
 impl<T: ?Sized + Unsize<U>, U: ?Sized> DispatchFromDyn<Arc<U>> for Arc<T> {}
+impl<T: ?Sized + Unsize<U>, U: ?Sized> crate::ops::CoerceUnsized<Arc<U>> for Arc<T> {}
+impl<T: ?Sized + Unsize<U>, U: ?Sized> crate::ops::CoerceUnsized<Weak<U>> for Weak<T> {}
 unsafe impl<T: ?Sized> PinSafePointer for Arc<T> {}
 use crate::ptr;
 use crate::rc::{alloc_block, free_block, header_of, is_dangling, value_offset, Header, DANGLING};

@@ -104,6 +104,13 @@ pub struct Cell<T: ?Sized> {
 }
 
 unsafe impl<T: ?Sized + Send> Send for Cell<T> {}
+// library/core/src/cell.rs: cells coerce when their contents do.
+impl<T: crate::ops::CoerceUnsized<U>, U> crate::ops::CoerceUnsized<UnsafeCell<U>> for UnsafeCell<T> {}
+impl<T: crate::ops::CoerceUnsized<U>, U> crate::ops::CoerceUnsized<SyncUnsafeCell<U>> for SyncUnsafeCell<T> {}
+impl<T: crate::ops::CoerceUnsized<U>, U> crate::ops::CoerceUnsized<Cell<U>> for Cell<T> {}
+impl<T: crate::ops::CoerceUnsized<U>, U> crate::ops::CoerceUnsized<RefCell<U>> for RefCell<T> {}
+impl<'b, T: ?Sized + crate::marker::Unsize<U>, U: ?Sized> crate::ops::CoerceUnsized<Ref<'b, U>> for Ref<'b, T> {}
+impl<'b, T: ?Sized + crate::marker::Unsize<U>, U: ?Sized> crate::ops::CoerceUnsized<RefMut<'b, U>> for RefMut<'b, T> {}
 // library/core/src/cell.rs:325,1439,2328: shared access to interior mutability is not thread-safe.
 impl<T: ?Sized> !Sync for UnsafeCell<T> {}
 impl<T: ?Sized> !Sync for Cell<T> {}
