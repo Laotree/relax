@@ -2666,6 +2666,12 @@ impl Tcx {
                     let args = self.generic_indices_of(prog, imp).identity_args(&self.tys);
                     let trait_ref = self.impl_trait_ref(prog, imp, &args);
                     if let Some(t) = self.assoc_projection(prog, trait_ref, name) {
+                        // an enum variant of the same name: the variant has priority (ambiguous_associated_items)
+                        if let Some(TyKind::Adt(a, ..)) = env.self_ty.map(|t| self.tys.kind(t).clone()) {
+                            if self.validates(prog, file) && self.adts.get(&a).is_some_and(|adt| adt.is_enum() && adt.variants.iter().any(|v| v.name == name)) {
+                                crate::lint::emit(prog, imp, &crate::lint::AMBIGUOUS_ASSOCIATED_ITEMS, file, p.lo, "ambiguous associated item");
+                            }
+                        }
                         return self.lower_generic_args_of_assoc_item(cx, prog, file, module, env, p, t, source_ty);
                     }
                 } else if let Some(t) = self.impl_assoc_ty(cx, prog, imp, name) { return t; }
