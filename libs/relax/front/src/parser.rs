@@ -120,6 +120,8 @@ pub struct Parser<'a> {
     pub frag_groups: crate::fxhash::HashMap<u32, u32>,
     /// starts of the `$t:ty` substitutions of expansion text (not a trait where a bound is expected)
     ty_frags: crate::fxhash::HashSet<u32>,
+    /// starts of the `$e:expr` / `$l:literal` substitutions of expansion text (check only): the kind
+    meta_frags: crate::fxhash::HashMap<u32, &'static str>,
     /// file context for built-in macros (file!, module_path!, env!, cfg of derive inputs)
     pub bctx: Option<std::rc::Rc<crate::builtins::FileCtx>>,
     /// names of the inline `mod x { }` blocks being parsed (module_path!)
@@ -196,6 +198,7 @@ impl<'a> Parser<'a> {
             tok_undo: Vec::new(),
             frag_groups: Default::default(),
             ty_frags: Default::default(),
+            meta_frags: Default::default(),
             bctx: None,
             mod_stack: Vec::new(),
             scope_stack: Vec::new(),
@@ -861,7 +864,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             let (_, toks) = self.delim_tt()?;
             self.unraw_attr(toks);
-            if crate::lexer::validation_enabled() { self.attr_shape_now_or_later(toks)?; }
+            if crate::lexer::validation_enabled() { self.meta_frags_in_attr(toks)?; self.attr_shape_now_or_later(toks)?; }
             v.push(Attr { inner: false, toks });
         }
         Ok(self.expand_cfg_attrs(v))
@@ -913,6 +916,35 @@ impl<'a> Parser<'a> {
             self.pos = save;
             let (_, args) = group?;
             self.expand_call(&def, args, err_pos)?;
+        }
+        Ok(())
+    }
+
+    /// An `$e:expr` / `$l:literal` fragment where an attribute wants an identifier (its path, a `cfg_attr`
+    /// attribute) or a literal / meta item (a list entry): rustc's interpolated expression is a metavariable.
+    fn meta_frags_in_attr(&self, toks: TokRange) -> PResult<()> {
+        if self.meta_frags.is_empty() { return Ok(()); }
+        let (lo, hi) = (toks.lo as usize, toks.hi as usize);
+        if hi <= lo || hi > self.toks.len() { return Ok(()); }
+        if self.meta_frags.contains_key(&{ self.toks.at(lo).lo }) {
+            return Err(PErr { pos: self.toks.at(lo).lo, msg: "expected identifier, found metavariable".into() });
+        }
+        let mut depth = 0i32;
+        for i in lo + 1..hi {
+            match self.toks.at(i).kind {
+                T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
+                T::CloseParen | T::CloseBracket | T::CloseBrace => depth -= 1,
+                _ => {}
+            }
+            if depth == 1 && matches!(self.toks.at(i).kind, T::OpenParen | T::Comma) && i + 1 < hi {
+                let t = self.toks.at(i + 1);
+                // (a fragment that is a literal stays a literal)
+                if let Some(&kind) = self.meta_frags.get(&{ t.lo }) {
+                    if kind == "expr" && !matches!(t.kind, T::Int | T::Float | T::Str | T::ByteStr | T::CStr | T::RawStr | T::Char | T::Byte | T::KwTrue | T::KwFalse | T::Minus) {
+                        return Err(PErr { pos: t.lo, msg: "expected a literal (`1u8`, `1.0f32`, `\"string\"`, etc.) here, found `expr` metavariable".into() });
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1101,7 +1133,7 @@ impl<'a> Parser<'a> {
             self.pos += 2;
             let (_, toks) = self.delim_tt()?;
             self.unraw_attr(toks);
-            if crate::lexer::validation_enabled() { self.attr_shape_now_or_later(toks)?; }
+            if crate::lexer::validation_enabled() { self.meta_frags_in_attr(toks)?; self.attr_shape_now_or_later(toks)?; }
             new.push(Attr { inner: true, toks });
         }
         v.extend(self.expand_cfg_attrs(new));
@@ -1665,7 +1697,12 @@ impl<'a> Parser<'a> {
             if b & crate::macros::TY_FRAG != 0 {
                 self.ty_frags.insert(base + a);
             }
-            self.frag_groups.insert(base + a, base + (b & !crate::macros::TY_FRAG));
+            if b & (crate::macros::EXPR_FRAG | crate::macros::LIT_FRAG) != 0 && crate::lexer::validation_enabled() {
+                self.meta_frags.insert(base + a, if b & crate::macros::EXPR_FRAG != 0 { "expr" } else { "literal" });
+            }
+            if b & crate::macros::META_ONLY == 0 {
+                self.frag_groups.insert(base + a, base + (b & !crate::macros::FRAG_FLAGS));
+            }
         }
         let here = self.bctx.as_ref().map(|c| c.path.as_str()).unwrap_or("");
         let same_file = !def.def_file.is_empty() && def.def_file == here;
@@ -2288,6 +2325,10 @@ impl<'a> Parser<'a> {
                     let attrs = self.outer_attrs()?;
                     let _ = self.vis()?;
                     let vname = self.ident_tok()?;
+                    // a `$t:ty` fragment cannot start the fields of a variant (rustc: a `ty` metavariable)
+                    if !self.ty_frags.is_empty() && self.ty_frags.contains(&{ self.tok().lo }) && self.cfg_out == 0 {
+                        return self.err("expected one of `(`, `,`, `=`, `{`, or `}`, found `ty` metavariable");
+                    }
                     let data = match self.kind() {
                         T::OpenParen => VariantData::Tuple(self.tuple_fields()?),
                         T::OpenBrace => VariantData::Struct(self.named_fields()?),
@@ -4291,6 +4332,12 @@ impl<'a> Parser<'a> {
     /// rustc `parse_dot_suffix_expr`: the token after `expr.`; the flag says a float ended in
     /// the next access's dot (`foo.1.`), so another suffix follows at once.
     fn dot_suffix(&mut self, mut e: ExprId, lo: u32) -> PResult<(ExprId, bool)> {
+        // an interpolated `$e:expr` / `$l:literal` is no field name (rustc parse_dot_suffix_expr)
+        if !self.meta_frags.is_empty() && matches!(self.kind(), T::Int | T::Float) {
+            if let Some(k) = self.meta_frags.get(&{ self.tok().lo }) {
+                return self.err(&format!("unexpected token: `{k}` metavariable"));
+            }
+        }
         match self.kind() {
             T::KwAwait => {
                 self.pos += 1;
