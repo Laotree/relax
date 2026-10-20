@@ -468,10 +468,17 @@ pub fn vx_peep(f: &mut Func, ndef: &[u32]) {
     let mut def: Vec<Option<(VX, VReg)>> = vec![None; nv];
     // single-def scalar results (zero-extended lanes) and their lane width
     let mut lane_bits = vec![0u8; nv];
+    // single-def integer constants
+    let mut ik: Vec<Option<i64>> = vec![None; nv];
     for b in &f.blocks {
         for i in &b.insts {
             if let Inst::VConst(d, 0) = i {
                 zero[d.0 as usize] = ndef[d.0 as usize] == 1;
+            }
+            if let Inst::Iconst(d, k) = i {
+                if ndef[d.0 as usize] == 1 {
+                    ik[d.0 as usize] = Some(*k);
+                }
             }
             if let Inst::VX(op, d, a, _) = i {
                 if ndef[d.0 as usize] == 1 && ndef[a.0 as usize] == 1 {
@@ -496,6 +503,23 @@ pub fn vx_peep(f: &mut Func, ndef: &[u32]) {
     };
     for b in &mut f.blocks {
         for i in &mut b.insts {
+            // the splat of a constant whose lanes repeat a 32-bit word: a pool constant (zero:
+            // xorps / movi), not a GPR move and a shuffle (`_mm_setzero_ps`, `_mm_set1_epi8(k)`)
+            if let Inst::VX(VX::Splat(w), d, a, _) = *i {
+                if let Some(k) = ik[a.0 as usize] {
+                    let k = k as u64;
+                    let word = match w {
+                        VW::B => Some((k & 0xff) as u32 * 0x0101_0101),
+                        VW::H => Some((k & 0xffff) as u32 * 0x0001_0001),
+                        VW::S => Some(k as u32),
+                        VW::D => ((k >> 32) as u32 == k as u32).then_some(k as u32),
+                    };
+                    if let Some(word) = word {
+                        *i = Inst::VConst(d, word);
+                        continue;
+                    }
+                }
+            }
             if let Inst::VX(VX::CmpGtS(VW::B), d, a, b) = *i {
                 // Expanding an already canonical comparison mask's sign bits
                 // is an identity (the lowering of blendv_epi8 does this).

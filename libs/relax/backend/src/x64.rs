@@ -3821,6 +3821,11 @@ impl<'a> Gen<'a> {
                 let xv = self.use_f(v, XS);
                 self.a.sse_rm(0, 0x11, xv, rb, off);
             }
+            Inst::VConst(d, 0) => {
+                let xd = self.def_f(d, XS);
+                self.a.sse_rr(0, 0x57, xd, xd, false); // xorps xd, xd
+                self.fin_f(d, xd);
+            }
             Inst::VConst(d, bits) => {
                 // movups xd, [rip + entry]
                 let xd = self.def_f(d, XS);
