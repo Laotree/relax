@@ -28,9 +28,18 @@ fn caps() -> Option<relax_backend::pair256::Caps> {
     o.cpu.avx.then_some(relax_backend::pair256::Caps { avx2: o.cpu.avx2, fma: o.cpu.fma })
 }
 
+/// the pass fuses `f` (on any host: a CPU with AVX2 and FMA assumed)
 fn fires(f: &Func) -> bool {
     let mut g = f.clone();
-    relax_backend::pair256::pair256(&mut g, caps().unwrap()) && g.vregs.contains(&Cls::V256)
+    relax_backend::pair256::pair256(&mut g, relax_backend::pair256::Caps { avx2: true, fma: true }) && g.vregs.contains(&Cls::V256)
+}
+
+#[test]
+fn shapes_fuse() {
+    assert!(fires(&binop(VX::FAdd(VW::S, NanBits::Host))));
+    assert!(fires(&indexed()));
+    assert!(fires(&kernel(false)), "kernel without fma");
+    assert!(fires(&kernel(true)), "kernel with fma");
 }
 
 struct Rng(u64);

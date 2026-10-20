@@ -6,9 +6,10 @@
 //! pair one instruction on a `Cls::V256` vreg (one ymm register instead of two xmm). Nothing
 //! before this pass sees V256, and every rewrite keeps the meaning of the V128 code:
 //!
-//! - the fused instruction stands where the later of the two was; the earlier one moves down to
-//!   it only when nothing between reads its result, redefines its operands or (for memory
-//!   instructions) touches memory in a conflicting way;
+//! - the fused instruction stands where the earlier of the two was (lowering emits a value's low
+//!   half chain, then its high half chain); the later one moves up to it only when nothing between
+//!   reads or writes its result, defines its operands (other than high halves fused before it)
+//!   or (for memory instructions) touches memory in a conflicting way;
 //! - a vreg pair fuses only when every definition of both halves is such an instruction pair;
 //! - a read of a fused half by an unfused instruction gets the half out first (`VX::Half`), an
 //!   operand pair that is not fused is joined (`VX::Join`), a vreg read as both halves (a splat
@@ -83,6 +84,9 @@ struct IPair {
     lo: u32,
     hi: u32,
     on: bool,
+    /// positions between the two whose definitions the moved instruction needs first (see `movable`)
+    needs: [u32; 6],
+    nneeds: u8,
 }
 
 /// An operand pair of a fused instruction that is not a fused vreg pair.
@@ -142,29 +146,46 @@ impl Cx {
         (base, off)
     }
 
-    /// whether the instruction at `p` may move down to `q` (same block, p < q)
-    fn movable(f: &Func, b: u32, p: u32, q: u32) -> bool {
+    /// Whether the instruction at `q` may move up to `p` (same block, p < q): None if not, else
+    /// the positions between that define its V128 operands or read its V128 result's old value
+    /// (each must be the later half of a pair fused before `p`).
+    fn movable(f: &Func, b: u32, p: u32, q: u32) -> Option<Vec<u32>> {
         let insts = &f.blocks[b as usize].insts;
-        let m = &insts[p as usize];
+        let m = &insts[q as usize];
         let (mut mu, mut md) = (Vec::new(), Vec::new());
         uses_defs(m, &mut mu, &mut md);
         let load = matches!(m, Inst::VLoad(..) | Inst::VLoadX(..));
         let store = matches!(m, Inst::VStore(..) | Inst::VStoreX(..));
         let (mut u, mut d) = (Vec::new(), Vec::new());
+        let mut needs = Vec::new();
         for k in p + 1..q {
             let i = &insts[k as usize];
             uses_defs(i, &mut u, &mut d);
-            if d.iter().any(|x| md.contains(x) || mu.contains(x)) || u.iter().any(|x| md.contains(x)) {
-                return false;
+            if d.iter().any(|x| md.contains(x)) {
+                return None;
+            }
+            // a read of the old value of its result, or a definition of an operand: fine when
+            // that instruction is itself the later half of a pair fused before `p`
+            if u.iter().any(|x| md.contains(x)) {
+                if md.iter().any(|x| f.vregs[x.0 as usize] != Cls::V128) {
+                    return None;
+                }
+                needs.push(k);
+            }
+            for x in d.iter().filter(|x| mu.contains(x)) {
+                if f.vregs[x.0 as usize] != Cls::V128 {
+                    return None;
+                }
+                needs.push(k);
             }
             if (load || store) && is_mem_effect(i) {
-                return false;
+                return None;
             }
             if store && matches!(i, Inst::Load(..) | Inst::LoadX(..) | Inst::VLoad(..) | Inst::VLoadX(..) | Inst::VGather(..)) {
-                return false;
+                return None;
             }
         }
-        true
+        Some(needs)
     }
 }
 
@@ -219,6 +240,7 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
     // ---- candidates: anchors (loads/stores 16 bytes apart), then ops over known pairs
     let mut pairs: Vec<IPair> = Vec::new();
     let mut paired: HashSet<(u32, u32)> = HashSet::new();
+    let mut pair_at: HashMap<(u32, u32), usize> = HashMap::new();
     // vreg -> its pair (lo, hi)
     let mut vp: HashMap<u32, (VReg, VReg)> = HashMap::new();
     loop {
@@ -290,24 +312,34 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
                         continue;
                     }
                     let (l, h) = if lo_i { (si, sj) } else { (sj, si) };
+                    let mut fresh = false;
                     if let (Some(x), Some(y)) = (l.dest, h.dest) {
                         if x == y {
                             continue;
                         }
                         match (vp.get(&x.0), vp.get(&y.0)) {
-                            (None, None) => {
-                                vp.insert(x.0, (x, y));
-                                vp.insert(y.0, (x, y));
-                            }
+                            (None, None) => fresh = true,
                             (Some(e), Some(g)) if *e == (x, y) && *g == (x, y) => {}
                             _ => continue,
                         }
                     }
-                    if !Cx::movable(f, bi as u32, i as u32, j as u32) {
+                    let Some(needs) = Cx::movable(f, bi as u32, i as u32, j as u32) else { continue };
+                    let mut needs = needs;
+                    needs.dedup();
+                    if needs.len() > 6 || !needs.iter().all(|k| pair_at.get(&(bi as u32, *k)).is_some_and(|&x| pairs[x].lo.min(pairs[x].hi) < i as u32 && pairs[x].lo.max(pairs[x].hi) == *k)) {
                         continue;
                     }
+                    let mut nd = [0u32; 6];
+                    nd[..needs.len()].copy_from_slice(&needs);
                     let (lo, hi) = if lo_i { (i, j) } else { (j, i) };
-                    pairs.push(IPair { b: bi as u32, lo: lo as u32, hi: hi as u32, on: true });
+                    pair_at.insert((bi as u32, i as u32), pairs.len());
+                    pair_at.insert((bi as u32, j as u32), pairs.len());
+                    pairs.push(IPair { b: bi as u32, lo: lo as u32, hi: hi as u32, on: true, needs: nd, nneeds: needs.len() as u8 });
+                    if fresh {
+                        let (x, y) = (l.dest.unwrap(), h.dest.unwrap());
+                        vp.insert(x.0, (x, y));
+                        vp.insert(y.0, (x, y));
+                    }
                     paired.insert((bi as u32, i as u32));
                     paired.insert((bi as u32, j as u32));
                     changed = true;
@@ -401,6 +433,10 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
             };
             let (lo_pos, hi_pos) = (p.lo, p.hi);
             let (first, q) = (lo_pos.min(hi_pos), lo_pos.max(hi_pos));
+            // the fused instruction stands at `first`
+            for &k in &p.needs[..p.nneeds as usize] {
+                ok &= pair_at.get(&(p.b, k)).is_some_and(|&x| pairs[x].on && pairs[x].lo.min(pairs[x].hi) < first && pairs[x].lo.max(pairs[x].hi) == k);
+            }
             for k in 0..l.n {
                 if !ok {
                     break;
@@ -409,8 +445,8 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
                 if fused(&von, a) == Some((a, b)) {
                     // the fused read at q sees what the two reads saw
                     for (dl, dh) in def_pairs(p.b, a) {
-                        let dd = dl.max(dh);
-                        if (dl < lo_pos) != (dd < q) || (dh < hi_pos) != (dd < q) {
+                        let dd = dl.min(dh);
+                        if (dl < lo_pos) != (dd < first) || (dh < hi_pos) != (dd < first) {
                             ok = false;
                         }
                     }
@@ -424,7 +460,7 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
                 match cx.odd(a, b) {
                     Odd::Same(v) => ok &= !changes(v),
                     Odd::Splat(_) | Odd::Const(_) => {}
-                    Odd::Join(..) => ok &= !changes(if lo_pos < hi_pos { a } else { b }),
+                    Odd::Join(..) => ok &= !changes(if lo_pos < hi_pos { b } else { a }),
                 }
             }
             if !ok {
@@ -437,6 +473,13 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
         }
     }
     let on: Vec<IPair> = pairs.iter().copied().filter(|p| p.on).collect();
+    let trace = std::env::var_os("MAKEPAD_RUN_PAIR256_TRACE").is_some();
+    if trace {
+        eprintln!("pair256 {}: {} candidate pairs, {} kept", f.name, pairs.len(), on.len());
+        for p in pairs.iter().filter(|p| !p.on) {
+            eprintln!("  dropped b{} {} / {}: {:?} / {:?}", p.b, p.lo, p.hi, f.blocks[p.b as usize].insts[p.lo as usize], f.blocks[p.b as usize].insts[p.hi as usize]);
+        }
+    }
     if on.is_empty() {
         return false;
     }
@@ -479,6 +522,9 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
     halves.sort_unstable();
     halves.dedup();
     extra += halves.len();
+    if trace {
+        eprintln!("pair256 {}: {} fused, {} extra (halves {})", f.name, on.len(), extra, halves.len());
+    }
     if on.len() <= extra {
         return false;
     }
@@ -499,9 +545,8 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
     let mut at_q: HashMap<(u32, u32), IPair> = HashMap::new();
     let mut gone: HashSet<(u32, u32)> = HashSet::new();
     for p in &on {
-        let q = p.lo.max(p.hi);
-        at_q.insert((p.b, q), *p);
-        gone.insert((p.b, p.lo.min(p.hi)));
+        at_q.insert((p.b, p.lo.min(p.hi)), *p);
+        gone.insert((p.b, p.lo.max(p.hi)));
     }
     let halves: HashSet<(u32, u32, u32)> = halves.into_iter().collect();
     let lo_of = |v: u32| vp.get(&v).map(|e| e.0 .0 == v).unwrap_or(true);
