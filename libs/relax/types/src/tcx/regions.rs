@@ -270,6 +270,8 @@ mod tests {
             #![no_std]
             #[lang = "sized"] trait Sized {}
             #[lang = "unsize"] trait Unsize<T: ?Sized> {}
+            #[lang = "coerce_unsized"] trait CoerceUnsized<T: ?Sized> {}
+            impl<'a, 'b: 'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<&'a U> for &'b T {}
             struct S<'a, T>(&'a T);
             type A<'a> = &'a u32;
             type F<T> = fn(T);
