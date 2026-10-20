@@ -157,6 +157,9 @@ impl<'a> Lcx<'a> {
 
     /// `core::intrinsics::simd::simd_*`; None when `name` is not one this lowering knows.
     pub(super) fn simd_intrinsic(&mut self, name: &str, vals: &[(Val, TyId)], t: TyId) -> Option<Val> {
+        if let Some(v) = self.simd_per_lane(name, vals, t) {
+            return Some(v);
+        }
         let select = name == "simd_select";
         let any = [Lane::S(VW::S), Lane::U(VW::S), Lane::F(VW::S)];
         if !select && !any.iter().any(|&l| Self::simd_op(name, l).is_some()) {
@@ -221,5 +224,340 @@ impl<'a> Lcx<'a> {
         let res = self.new_slot_for(t);
         self.emit(Inst::Copy(res, out, size));
         Some(Val::M(res, 0))
+    }
+
+    fn simd_err(&mut self, name: &str, what: &str, ty: TyId) -> Val {
+        let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, ty);
+        self.err(self.pos, format!("E0511: invalid monomorphization of `{}` intrinsic: {} `{}`", name, what, ts));
+        self.dummy_val(ty)
+    }
+
+    fn lane_mem(l: Lane) -> Mem {
+        let bytes = (l.w().bits() / 8) as u8;
+        match l {
+            Lane::S(_) => Mem::Int(bytes, true),
+            Lane::U(_) => Mem::Int(bytes, false),
+            Lane::F(VW::D) => Mem::F64,
+            Lane::F(_) => Mem::F32,
+        }
+    }
+
+    fn lane_cls(l: Lane) -> Cls {
+        match l {
+            Lane::F(VW::D) => Cls::F64,
+            Lane::F(_) => Cls::F32,
+            _ => Cls::I,
+        }
+    }
+
+    fn lane_ity(l: Lane) -> IntTy {
+        IntTy { bits: l.w().bits() as u8, signed: matches!(l, Lane::S(_)) }
+    }
+
+    /// lane `k` of the SIMD value at (base, off), extended by signedness (ints)
+    fn lane_get(&mut self, base: VReg, off: i32, l: Lane, k: u32) -> VReg {
+        let d = self.f.vreg(Self::lane_cls(l));
+        self.emit(Inst::Load(Self::lane_mem(l), d, base, off + (k * l.w().bits() / 8) as i32));
+        d
+    }
+
+    fn lane_put(&mut self, base: VReg, off: i32, l: Lane, k: u32, v: VReg) {
+        self.emit(Inst::Store(Self::lane_mem(l), base, off + (k * l.w().bits() / 8) as i32, v));
+    }
+
+    /// The intrinsics computed lane by lane in scalar code: those without a vector op
+    /// (integer div/rem, bit counts, byte/bit reversal, fused multiply-add, round-ties-even),
+    /// lane moves (extract/insert/splat/shuffle), conversions, reductions and bit masks.
+    /// None when `name` is not one of them.
+    fn simd_per_lane(&mut self, name: &str, vals: &[(Val, TyId)], t: TyId) -> Option<Val> {
+        let unary_bits = matches!(name, "simd_ctpop" | "simd_ctlz" | "simd_cttz" | "simd_bswap" | "simd_bitreverse" | "simd_round_ties_even");
+        let known = unary_bits
+            || matches!(name, "simd_div" | "simd_rem" | "simd_fma" | "simd_relaxed_fma" | "simd_cast" | "simd_as" | "simd_splat" | "simd_shuffle" | "simd_bitmask" | "simd_select_bitmask")
+            || matches!(name, "simd_extract" | "simd_extract_dyn" | "simd_insert" | "simd_insert_dyn")
+            || name.starts_with("simd_reduce_");
+        if !known || vals.is_empty() {
+            return None;
+        }
+        // the SIMD operand that sets the lanes
+        let vi = match name {
+            "simd_splat" => None,
+            "simd_select_bitmask" => Some(1),
+            _ => Some(0),
+        };
+        let shape_ty = match vi {
+            Some(i) => vals[i].1,
+            None => t,
+        };
+        let Some((l, n)) = self.simd_shape(shape_ty) else {
+            return Some(self.simd_err(name, "expected SIMD type, found non-SIMD", shape_ty));
+        };
+        // integer div/rem by vector: rustc's float div is lane-wise (the vector path); float rem
+        // has no scalar instruction here
+        if name == "simd_div" && matches!(l, Lane::F(_)) {
+            return None;
+        }
+        let float = matches!(l, Lane::F(_));
+        let bits = l.w().bits() as i64;
+        let ops: Vec<(VReg, i32)> = vals.iter().map(|(v, ty)| self.simd_mem(v.clone(), *ty)).collect();
+        let scalar = |s: &mut Self, k: usize| s.to_leaves(vals[k].0.clone(), vals[k].1)[0];
+        match name {
+            "simd_div" | "simd_rem" | "simd_fma" | "simd_relaxed_fma" | "simd_ctpop" | "simd_ctlz" | "simd_cttz" | "simd_bswap" | "simd_bitreverse" | "simd_round_ties_even" => {
+                let ok = match name {
+                    "simd_div" | "simd_rem" | "simd_ctpop" | "simd_ctlz" | "simd_cttz" | "simd_bswap" | "simd_bitreverse" => !float,
+                    _ => float,
+                };
+                if !ok {
+                    return Some(self.simd_err(name, "unsupported element type of", shape_ty));
+                }
+                let out = self.new_slot_for(t);
+                for k in 0..n {
+                    let x = self.lane_get(ops[0].0, ops[0].1, l, k);
+                    let r = match name {
+                        "simd_div" | "simd_rem" => {
+                            let y = self.lane_get(ops[1].0, ops[1].1, l, k);
+                            let d = self.f.vreg(Cls::I);
+                            self.emit(Inst::IBin(if name == "simd_div" { IOp::Div } else { IOp::Rem }, Self::lane_ity(l), d, x, y));
+                            d
+                        }
+                        "simd_fma" | "simd_relaxed_fma" => {
+                            let y = self.lane_get(ops[1].0, ops[1].1, l, k);
+                            let z = self.lane_get(ops[2].0, ops[2].1, l, k);
+                            let d = self.f.vreg(Self::lane_cls(l));
+                            self.emit(Inst::FMulAdd(false, false, l.w() == VW::D, d, x, y, z));
+                            d
+                        }
+                        "simd_round_ties_even" => {
+                            let d = self.f.vreg(Self::lane_cls(l));
+                            self.emit(Inst::FUnary(FUn::RoundEven, l.w() == VW::D, d, x));
+                            d
+                        }
+                        _ => {
+                            // 64-bit bit ops on the zero-extended lane, scaled to the lane width
+                            let m = if bits == 64 { -1 } else { (1i64 << bits) - 1 };
+                            let xz = self.and_k(x, m);
+                            match name {
+                                "simd_ctpop" => self.popcount64(xz),
+                                "simd_ctlz" => {
+                                    let c = self.clz64(xz);
+                                    let k = self.iconst(64 - bits);
+                                    self.ibin(IOp::Sub, false, c, k)
+                                }
+                                "simd_cttz" => {
+                                    let top = self.iconst(if bits == 64 { 0 } else { 1i64 << bits });
+                                    let y = self.ibin(IOp::Or, false, xz, top);
+                                    self.ctz64(y)
+                                }
+                                "simd_bswap" => {
+                                    let r = self.bswap64(xz);
+                                    self.shr_k(r, 64 - bits)
+                                }
+                                _ => {
+                                    let r = self.rev64(xz);
+                                    self.shr_k(r, 64 - bits)
+                                }
+                            }
+                        }
+                    };
+                    self.lane_put(out, 0, l, k, r);
+                }
+                Some(Val::M(out, 0))
+            }
+            "simd_cast" | "simd_as" => {
+                let Some((l2, n2)) = self.simd_shape(t) else {
+                    return Some(self.simd_err(name, "expected SIMD return type, found non-SIMD", t));
+                };
+                if n2 != n {
+                    return Some(self.simd_err(name, "the return type must have the lane count of the input, found", t));
+                }
+                let out = self.new_slot_for(t);
+                for k in 0..n {
+                    let x = self.lane_get(ops[0].0, ops[0].1, l, k);
+                    let (fd, td) = (l.w() == VW::D, l2.w() == VW::D);
+                    let conv = match (l, l2) {
+                        (Lane::F(_), Lane::F(_)) if fd == td => None,
+                        (Lane::F(_), Lane::F(_)) => Some(if fd { Conv::F64ToF32 } else { Conv::F32ToF64 }),
+                        (Lane::F(_), _) => Some(Conv::FToInt(fd, Self::lane_ity(l2))),
+                        (_, Lane::F(_)) => Some(Conv::IntToF(Self::lane_ity(l), td)),
+                        _ => Some(Conv::IntToInt(Self::lane_ity(l2))),
+                    };
+                    let r = match conv {
+                        None => x,
+                        Some(c) => {
+                            let d = self.f.vreg(Self::lane_cls(l2));
+                            self.emit(Inst::Conv(c, d, x));
+                            d
+                        }
+                    };
+                    self.lane_put(out, 0, l2, k, r);
+                }
+                Some(Val::M(out, 0))
+            }
+            "simd_splat" => {
+                let x = scalar(self, 0);
+                let out = self.new_slot_for(t);
+                for k in 0..n {
+                    self.lane_put(out, 0, l, k, x);
+                }
+                Some(Val::M(out, 0))
+            }
+            "simd_extract" | "simd_extract_dyn" => {
+                let i = scalar(self, 1);
+                let a = self.simd_lane_addr(ops[0], l, i);
+                let d = self.f.vreg(Self::lane_cls(l));
+                self.emit(Inst::Load(Self::lane_mem(l), d, a, 0));
+                Some(Val::L(vec![d]))
+            }
+            "simd_insert" | "simd_insert_dyn" => {
+                let out = self.new_slot_for(t);
+                let size = n * l.w().bits() / 8;
+                let src = self.addr_add(ops[0].0, ops[0].1);
+                self.emit(Inst::Copy(out, src, size));
+                let i = scalar(self, 1);
+                let x = scalar(self, 2);
+                let a = self.simd_lane_addr((out, 0), l, i);
+                self.emit(Inst::Store(Self::lane_mem(l), a, 0, x));
+                Some(Val::M(out, 0))
+            }
+            "simd_shuffle" => {
+                // out lane j = (x ++ y) lane idx[j]; idx is a SIMD value of u32
+                let (idx_l, m) = match self.simd_shape(vals[2].1) {
+                    Some((il @ Lane::U(VW::S), m)) => (il, m),
+                    _ => return Some(self.simd_err(name, "the index must be a SIMD vector of u32, found", vals[2].1)),
+                };
+                match self.simd_shape(t) {
+                    Some((l2, m2)) if l2 == l && m2 == m => {}
+                    _ => return Some(self.simd_err(name, "the return type must have the input's element type and the index's lane count, found", t)),
+                }
+                let size = n * l.w().bits() / 8;
+                let both = self.f.slot(2 * size, 16);
+                self.f.slots[both as usize].born = self.coro.is_none();
+                let xy = self.f.vreg(Cls::I);
+                self.emit(Inst::SlotAddr(xy, both));
+                let (sx, sy) = (self.addr_add(ops[0].0, ops[0].1), self.addr_add(ops[1].0, ops[1].1));
+                self.emit(Inst::Copy(xy, sx, size));
+                let hi = self.addr_add(xy, size as i32);
+                self.emit(Inst::Copy(hi, sy, size));
+                let out = self.new_slot_for(t);
+                for j in 0..m {
+                    let i = self.lane_get(ops[2].0, ops[2].1, idx_l, j);
+                    let a = self.simd_lane_addr((xy, 0), l, i);
+                    let d = self.f.vreg(Self::lane_cls(l));
+                    self.emit(Inst::Load(Self::lane_mem(l), d, a, 0));
+                    self.lane_put(out, 0, l, j, d);
+                }
+                Some(Val::M(out, 0))
+            }
+            "simd_bitmask" => {
+                // bit k = lane k's top bit, in an integer or a byte array of the result's size
+                let size = self.layout(t).size;
+                if float || size > 8 || (size * 8) < n.min(64) {
+                    return Some(self.simd_err(name, "cannot return a bit mask of", t));
+                }
+                let mut r = self.iconst(0);
+                for k in 0..n {
+                    let x = self.lane_get(ops[0].0, ops[0].1, l, k);
+                    let b = self.shr_k(x, 63.min(bits - 1));
+                    let b = self.and_k(b, 1);
+                    let kk = self.iconst(k as i64);
+                    let b = self.ibin(IOp::Shl, false, b, kk);
+                    r = self.ibin(IOp::Or, false, r, b);
+                }
+                let out = self.new_slot_for(t);
+                let tmp = self.simd_scratch(1);
+                self.emit(Inst::Store(Mem::Int(8, false), tmp, 0, r));
+                self.emit(Inst::Copy(out, tmp, size));
+                Some(Val::M(out, 0))
+            }
+            "simd_select_bitmask" => {
+                let msize = self.layout(vals[0].1).size;
+                if msize > 8 {
+                    return Some(self.simd_err(name, "cannot select by a bit mask of", vals[0].1));
+                }
+                let tmp = self.simd_scratch(1);
+                let z = self.iconst(0);
+                self.emit(Inst::Store(Mem::Int(8, false), tmp, 0, z));
+                let ms = self.addr_add(ops[0].0, ops[0].1);
+                self.emit(Inst::Copy(tmp, ms, msize));
+                let mbits = self.f.vreg(Cls::I);
+                self.emit(Inst::Load(Mem::Int(8, false), mbits, tmp, 0));
+                let out = self.new_slot_for(t);
+                for k in 0..n {
+                    let b = self.shr_k(mbits, k as i64);
+                    let b = self.and_k(b, 1);
+                    let x = self.lane_get(ops[1].0, ops[1].1, l, k);
+                    let y = self.lane_get(ops[2].0, ops[2].1, l, k);
+                    let d = self.f.vreg(Self::lane_cls(l));
+                    self.emit(Inst::Sel(d, b, x, y));
+                    self.lane_put(out, 0, l, k, d);
+                }
+                Some(Val::M(out, 0))
+            }
+            _ => {
+                // reductions
+                let op = &name["simd_reduce_".len()..];
+                let mut acc = match op {
+                    "add_ordered" | "mul_ordered" => scalar(self, 1),
+                    _ => self.lane_get(ops[0].0, ops[0].1, l, 0),
+                };
+                let from = if matches!(op, "add_ordered" | "mul_ordered") { 0 } else { 1 };
+                let fw = l.w() == VW::D;
+                if matches!(op, "any" | "all") {
+                    // mask lanes are 0 or all ones: any = or of the lanes != 0, all = and
+                    for k in 1..n {
+                        let x = self.lane_get(ops[0].0, ops[0].1, l, k);
+                        acc = self.ibin(if op == "any" { IOp::Or } else { IOp::And }, false, acc, x);
+                    }
+                    let z = self.iconst(0);
+                    let r = self.icmp(Cond::Ne, false, acc, z);
+                    return Some(Val::L(vec![r]));
+                }
+                for k in from..n {
+                    let x = self.lane_get(ops[0].0, ops[0].1, l, k);
+                    acc = match (op, float) {
+                        // (rustc has no float min/max reductions: E0511 below)
+                        ("add_ordered" | "add_unordered", true) | ("mul_ordered" | "mul_unordered", true) => {
+                            let fop = if op.starts_with("add") { FOp::Add } else { FOp::Mul };
+                            let d = self.f.vreg(Self::lane_cls(l));
+                            self.emit(Inst::FBin(fop, fw, d, acc, x));
+                            d
+                        }
+                        ("min" | "max", false) => {
+                            let lt = self.icmp(Cond::Lt, matches!(l, Lane::S(_)), x, acc);
+                            let d = self.f.vreg(Cls::I);
+                            if op == "min" {
+                                self.emit(Inst::Sel(d, lt, x, acc));
+                            } else {
+                                self.emit(Inst::Sel(d, lt, acc, x));
+                            }
+                            d
+                        }
+                        (_, false) => {
+                            let iop = match op {
+                                "add_ordered" | "add_unordered" => IOp::Add,
+                                "mul_ordered" | "mul_unordered" => IOp::Mul,
+                                "and" => IOp::And,
+                                "or" => IOp::Or,
+                                "xor" => IOp::Xor,
+                                _ => return None,
+                            };
+                            let d = self.f.vreg(Cls::I);
+                            self.emit(Inst::IBin(iop, Self::lane_ity(l), d, acc, x));
+                            d
+                        }
+                        _ => return Some(self.simd_err(name, "unsupported element type of", shape_ty)),
+                    };
+                }
+                Some(Val::L(vec![acc]))
+            }
+        }
+    }
+
+    /// The address of lane `i` (a runtime index) of the SIMD value at `at`.
+    fn simd_lane_addr(&mut self, at: (VReg, i32), l: Lane, i: VReg) -> VReg {
+        let base = self.addr_add(at.0, at.1);
+        let sh = self.iconst((l.w().bits() / 8).trailing_zeros() as i64);
+        let iz = self.and_k(i, 0xffff_ffff);
+        let o = self.ibin(IOp::Shl, false, iz, sh);
+        self.ibin(IOp::Add, false, base, o)
     }
 }

@@ -66,6 +66,37 @@ pub mod intrinsics_simd {
         pub fn simd_gt<T, U>(x: T, y: T) -> U;
         pub fn simd_ge<T, U>(x: T, y: T) -> U;
         pub fn simd_select<M, T>(mask: M, if_true: T, if_false: T) -> T;
+        // lane by lane in scalar code (lower/simd.rs simd_per_lane)
+        pub fn simd_rem<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_ctpop<T>(x: T) -> T;
+        pub fn simd_ctlz<T>(x: T) -> T;
+        pub fn simd_cttz<T>(x: T) -> T;
+        pub fn simd_bswap<T>(x: T) -> T;
+        pub fn simd_bitreverse<T>(x: T) -> T;
+        pub fn simd_round_ties_even<T>(x: T) -> T;
+        pub fn simd_fma<T>(x: T, y: T, z: T) -> T;
+        pub fn simd_relaxed_fma<T>(x: T, y: T, z: T) -> T;
+        pub fn simd_cast<T, U>(x: T) -> U;
+        pub fn simd_as<T, U>(x: T) -> U;
+        pub fn simd_splat<T, U>(value: U) -> T;
+        pub fn simd_extract<T, U>(x: T, idx: u32) -> U;
+        pub fn simd_extract_dyn<T, U>(x: T, idx: u32) -> U;
+        pub fn simd_insert<T, U>(x: T, idx: u32, val: U) -> T;
+        pub fn simd_insert_dyn<T, U>(x: T, idx: u32, val: U) -> T;
+        pub fn simd_shuffle<T, U, V>(x: T, y: T, idx: U) -> V;
+        pub fn simd_bitmask<T, U>(x: T) -> U;
+        pub fn simd_select_bitmask<M, T>(m: M, yes: T, no: T) -> T;
+        pub fn simd_reduce_add_ordered<T, U>(x: T, y: U) -> U;
+        pub fn simd_reduce_add_unordered<T, U>(x: T) -> U;
+        pub fn simd_reduce_mul_ordered<T, U>(x: T, y: U) -> U;
+        pub fn simd_reduce_mul_unordered<T, U>(x: T) -> U;
+        pub fn simd_reduce_all<T>(x: T) -> bool;
+        pub fn simd_reduce_any<T>(x: T) -> bool;
+        pub fn simd_reduce_max<T, U>(x: T) -> U;
+        pub fn simd_reduce_min<T, U>(x: T) -> U;
+        pub fn simd_reduce_and<T, U>(x: T) -> U;
+        pub fn simd_reduce_or<T, U>(x: T) -> U;
+        pub fn simd_reduce_xor<T, U>(x: T) -> U;
     }
 }
 
