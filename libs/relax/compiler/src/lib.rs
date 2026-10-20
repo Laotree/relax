@@ -215,7 +215,7 @@ pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
 pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
     registry_net::install();
     if std::env::var_os("MAKEPAD_RUN_CODE_SIG").is_some() {
-        regalloc::SIG_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+        relax_backend::regalloc::SIG_ON.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     // a program's own arguments after `--` may be any bytes (`makepad run p -- $'\xff'`): Relax
     // reads its own options lossily, the program gets the bytes (run.rs)
