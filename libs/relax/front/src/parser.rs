@@ -4994,6 +4994,18 @@ impl ParsedFile {
         ExpnKind::Root
     }
 
+    /// An identity for the expansion whose text holds `pos`: 0 for the file's own text, the start
+    /// of the `macro_rules!` output region for a rules expansion, 1 for derive / attribute /
+    /// built-in output.
+    pub fn expansion_region_id(&self, pos: u32) -> u32 {
+        if pos < self.src_len { return 0; }
+        let rules = self.part_at(pos).map_or(&self.rules_exp, |p| &p.rules_exp);
+        if let Some((_, r)) = OSegRef::from(rules).floor(pos) {
+            if pos < r.1 { return r.0.max(2); }
+        }
+        1
+    }
+
     /// Which kind of expansion's text holds position `pos` (not following the origin of a token
     /// substituted from the call site): the file's own text, the output of a `macro_rules!`
     /// (this file's or another's), or the output of a derive / attribute / built-in macro.
