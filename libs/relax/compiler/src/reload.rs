@@ -4417,7 +4417,7 @@ mod round51_tests {
                 let version = prog.parse_version(file, "classify.rs", edited.into_bytes()).unwrap();
                 let pairs = pair_items(&prog.files[file as usize], &version.pf).0;
                 let new = prog.commit_body_version(version, &pairs).unwrap();
-                prog.lower_body_declarations(&[owner]);
+                prog.lower_body_declarations(&[owner], &[new]);
                 assert!(!ctfe_relevant_bodies(&prog, new, &[owner]), "removed: {body}");
                 prog.revert_version(file, new, &pairs);
                 assert!(ctfe_relevant_bodies(&prog, file, &[owner]), "restored: {body}");
