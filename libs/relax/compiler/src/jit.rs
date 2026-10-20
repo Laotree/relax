@@ -1982,6 +1982,7 @@ fn rt_compile(slot: u64) -> u64 {
     // own OS calls must not change it
     let _keep = os::proc::KeepLastError::new();
     ensure_altstack();
+    let _frame = crate::inspect::timeline::CompileMark::begin();
     unsafe {
         let _exec_call = profile_path().map(|_| crate::exec_profile::call(UNIT as usize, slot as u32));
         if profile_path().is_some() { (&*UNIT).exec_event(slot as u32, "call"); }
@@ -1993,57 +1994,9 @@ fn rt_compile(slot: u64) -> u64 {
 // ------------------------------------------------------------ compiler stack
 
 // A compile runs on the program's thread (lazy compile from a stub), and constant evaluation
-// runs program code inside it, which compiles again: `T::NUM + 1` over a type nested 1000 deep
-// nests 1000 compiles. rustc runs the compiler on its own stack and grows it on demand
-// (rustc_data_structures::stack::ensure_sufficient_stack: a 100 KiB red zone, new 1 MiB+
-// segments via stacker); Relax does the same here, so neither deep constant evaluation nor a
-// lazy compile reached near the end of a deep program recursion overflows the thread's stack.
-
-/// Run the compiler on a fresh segment when less than this is left
-const STACK_RED_ZONE: usize = 1 << 20;
-/// Size of a fresh segment (virtual; pages are touched on use)
-const STACK_SEGMENT: usize = 64 << 20;
-
-thread_local! {
-    /// lowest usable address of the stack this thread runs on now (0: not known yet)
-    static STACK_LO: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Runs `f` on a fresh stack segment when this thread's stack is nearly used up.
-fn ensure_sufficient_stack<R, F: FnOnce() -> R>(f: F) -> R {
-    let here = &f as *const _ as usize;
-    let mut lo = STACK_LO.with(|c| c.get());
-    if lo == 0 {
-        lo = os::thread::stack_lo();
-        STACK_LO.with(|c| c.set(lo));
-    }
-    if lo == 0 || here.saturating_sub(lo) >= STACK_RED_ZONE {
-        return f();
-    }
-    struct Job<F, R> {
-        f: Option<F>,
-        r: Option<std::thread::Result<R>>,
-    }
-    extern "C" fn run<F: FnOnce() -> R, R>(p: *mut u8) {
-        let job = unsafe { &mut *(p as *mut Job<F, R>) };
-        let f = job.f.take().unwrap();
-        // a Rust panic must not unwind through the stack switch (no unwind info for it)
-        job.r = Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)));
-    }
-    let seg = match os::mem::stack_segment(STACK_SEGMENT) {
-        Some(seg) => seg,
-        None => return f(),
-    };
-    let mut job: Job<F, R> = Job { f: Some(f), r: None };
-    STACK_LO.with(|c| c.set(seg.lo));
-    unsafe { os::mem::call_on_segment(&seg, run::<F, R>, &mut job as *mut Job<F, R> as *mut u8) };
-    STACK_LO.with(|c| c.set(lo));
-    os::mem::free_segment(seg);
-    match job.r.take().unwrap() {
-        Ok(r) => r,
-        Err(e) => std::panic::resume_unwind(e),
-    }
-}
+// runs program code inside it, which compiles again: base/src/stack.rs grows the stack onto
+// fresh segments (rustc's ensure_sufficient_stack).
+use crate::stack::ensure_sufficient_stack;
 
 /// Where the OS cannot run a handler on a looping thread (Windows: no signals), the watching
 /// thread redirects it into this glue (x64::hang_tramp in front of rt_hang); 0 = none.
@@ -4675,6 +4628,16 @@ impl Unit {
 
     fn install_unchecked(&mut self, id: u32, code: &[u8], relocs: &[relax_backend::rir::RelocAt], pc_map: Vec<(u32, u64)>, gen: u32) -> Result<u64, String> {
         let _cost_install = relax_codegen::fncost::phase(6);
+        // makepad inspect: new code for an instrumented slot (a live patch, a verdict's rebuild,
+        // a lazy recompile) replaces its counters and probes, and the first code of a slot whose
+        // SPEC-V twin (or base) is instrumented runs the same fn: either way the instruments are
+        // put into the new code on the owner afterwards
+        let sibling = match self.fns[id as usize].key {
+            FnKey::Plain(b) => Some(b),
+            FnKey::Inst(..) | FnKey::Closure(..) => self.plain_twin_of(id),
+            _ => None,
+        };
+        crate::inspect::patches::replaced(id, sibling);
         let options = &self.prog.session.clone().options;
         // an interpreted function (its relocatable form) or, in no-codegen mode, a jump (a
         // foreign function's veneer): the slot takes the entry itself, nothing is written
@@ -4831,6 +4794,11 @@ impl Unit {
     /// SPEC-V: the unverified-mode twin of slot `id` (created on first use); `id` itself when it has
     /// none (only fn instances and closures are built from a body).
     pub(crate) fn plain_twin(&self, id: u32) -> u32 {
+        // a callee a helper's ahead lowering has only a temporary reference to (no slot yet): the
+        // twin is keyed by the real slot, so the body is built on the locked path instead
+        if lower_ahead_fn_key(id).is_some() {
+            lower_ahead_needs_unit();
+        }
         match self.fns[id as usize].key {
             FnKey::Inst(..) | FnKey::Closure(..) => self.fn_id(FnKey::Plain(id)),
             _ => id,
@@ -4934,6 +4902,7 @@ impl Unit {
             f.pc_map = prev.2;
             f.patch_gen = prev.3;
             f.rir = None;
+            crate::inspect::patches::replaced(id as u32, None);
             // SPEC-V: the previous code is what ran before the group (its own status is rebuilt with it)
             f.unverified.store(false, Ordering::Relaxed);
             f.version += 1;
@@ -5161,6 +5130,15 @@ pub struct MainCompile {
     pub cpu: [u64; 3],
     /// RIR instructions entering optimisation (after the front's inlining) and entering codegen
     pub insts: [u32; 2],
+    /// the longest owner-queue wait of its requests (ns), and what the owner served when that
+    /// request was queued: class + 1 (0: idle) and requester
+    pub behind_ns: u64,
+    pub behind: u8,
+    pub behind_from: u64,
+    /// compile jobs running at its start, and the queued speculative, O2 and O3 builds (after the
+    /// first present only: postframe.rs)
+    pub jobs: u32,
+    pub queued: [u32; 3],
 }
 
 pub const MAIN_HOW_NAMES: [&str; 6] = ["done", "cache", "spec", "inflight", "split", "plain"];
@@ -5194,6 +5172,18 @@ fn main_rec(f: impl FnOnce(&mut MainCompile)) {
         f(&mut r);
         c.set(Some(r));
     }
+}
+
+/// A request of the main thread's compile waited `queue` ns in the owner's queue, queued while the
+/// owner served class `class` (u8::MAX: idle) for thread `from` (owner.rs, on the requester).
+pub(crate) fn main_rec_behind(queue: u64, class: u8, from: u64) {
+    main_rec(|r| {
+        if queue > r.behind_ns {
+            r.behind_ns = queue;
+            r.behind = if class == u8::MAX { 0 } else { class + 1 };
+            r.behind_from = from;
+        }
+    });
 }
 
 fn main_how(how: u8) {
@@ -5238,6 +5228,7 @@ unsafe fn compile_slot_on_stack(up: *mut Unit, id: u32) -> u64 {
             owner::post(owner::Class::Main, move || unsafe { realtime_reach(upn as *mut Unit, vec![id], "miss") });
         }
         let dt = wall_ns() - t;
+        crate::postframe::rt_compile(t, dt);
         let n = RT_LAZY.fetch_add(1, Ordering::Relaxed);
         RT_LAZY_NS.fetch_add(dt, Ordering::Relaxed);
         // the first few and every long stall by name; the total at exit (run.rs summary)
@@ -5258,12 +5249,23 @@ unsafe fn compile_slot_on_stack_rt(up: *mut Unit, id: u32) -> u64 {
     relax_codegen::fncost::event("call", id);
     let on_main = MAIN_TID.load(Ordering::Relaxed) == me() && !owner::is_owner();
     if on_main {
-        MAIN_REC.with(|c| c.set(Some(MainCompile { start: wall_ns(), slot: id, how: u8::MAX, ..Default::default() })));
+        let mut rec = MainCompile { start: wall_ns(), slot: id, how: u8::MAX, ..Default::default() };
+        if FIRST_PRESENT.load(Ordering::Relaxed) {
+            rec.jobs = BG_ACTIVE.load(Ordering::Relaxed);
+            let len = |n: Option<usize>| n.map_or(u32::MAX, |n| n as u32);
+            rec.queued = [len(SPEC_Q.try_lock().ok().map(|q| q.len())), len(O2_QUEUE.try_lock().ok().map(|q| q.len())), len(TIER_QUEUE.try_lock().ok().map(|q| q.len()))];
+        }
+        MAIN_REC.with(|c| c.set(Some(rec)));
+    }
+    if on_main {
+        crate::postframe::ui_wait_begin();
     }
     let r = compile_slot_on_stack_inner(up, id);
     if on_main {
+        crate::postframe::ui_wait_end();
         if let Some(mut rec) = MAIN_REC.with(|c| c.take()) {
             rec.end = wall_ns();
+            crate::postframe::main_compile(&(&*up).fns[id as usize].name, &rec);
             MAIN_COMPILES.lock().unwrap().push(rec);
         }
     }
@@ -9542,12 +9544,20 @@ fn sampler_thread() {
     let mut last_progress = std::time::Instant::now();
     let periods = sample_periods();
     let mut period_index = 0;
+    // wakes in a row in which no sampled thread was on a CPU (macOS: an idle app); past
+    // IDLE_WAKES the sampler sleeps IDLE_MS between looks instead of SAMPLE_MS (a 500 Hz
+    // suspend / resume of every JIT thread of an idle Stage cost ~8% of a core). A sample's
+    // weight is capped by the thread's CPU time, so the longer sleep does not over-credit it.
+    const IDLE_WAKES: u32 = 50;
+    const IDLE_MS: u64 = 20;
+    let mut idle_wakes = 0u32;
     loop {
         let period = periods[period_index];
         period_index = (period_index + 1) % periods.len();
         // Linux selects irregular observations from its perf stream. Drain
         // often enough to avoid overflowing the ring even for long intervals.
         let sleep_ms = if cfg!(target_os = "linux") && periods.len() > 1 { period.min(32) } else { period };
+        let sleep_ms = if idle_wakes >= IDLE_WAKES { sleep_ms.max(IDLE_MS) } else { sleep_ms };
         wait.sleep(sleep_ms);
         if TIER_STOP.load(Ordering::SeqCst) { break; }
         o3_progress_write(&mut last_progress);
@@ -9562,9 +9572,11 @@ fn sampler_thread() {
         let (lo, hi) = (EXEC_LO.load(Ordering::Relaxed), EXEC_HI.load(Ordering::Relaxed));
         {
             let g = SAMPLED.lock().unwrap();
+            let mut on_cpu = false;
             for (_, _, h) in g.iter() {
-                os::sample::read(h, &mut pcs, &mut selfs, lo, hi, weight);
+                on_cpu |= os::sample::read(h, &mut pcs, &mut selfs, lo, hi, weight);
             }
+            idle_wakes = if on_cpu { 0 } else { idle_wakes.saturating_add(1) };
         }
         if sample_trace() {
             static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -10811,7 +10823,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let (needs, key, front) = owner::call(owner::Class::Background, || (needs_rir(up), (&*up).fns[id as usize].key.clone(), (&*up).front.clone()));
     if needs && !t1prof_replay(options) && !owner::is_owner() {
         while !tier1_quiet() {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            job_sleep(std::time::Duration::from_millis(50));
         }
         // its type check runs first, off the unit (the build takes the checked body): one
         // solver search there took seconds, and every thread needing a lazy compile -- the UI
@@ -11832,6 +11844,11 @@ const YIELDED: &str = "(background build gave way)";
 /// relock wait, waits for in-flight builds]; and the same front/back cpu on workers
 pub static SPLIT_NS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
+/// Slots queued to be built ahead (postframe::ahead_progress; 1 while the queue is locked).
+pub(crate) fn ahead_queued() -> u64 {
+    SPEC_Q.try_lock().map_or(1, |q| q.len() as u64)
+}
+
 /// Queues the not-inlined direct callees of slot `id` (lock held), one level deeper.
 unsafe fn spec_enqueue(up: *mut Unit, id: u32, depth: u8) {
     if pipelined() && defer_startup_root(up, id, depth) { return; }
@@ -12314,7 +12331,12 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions, options: &crate::option
         if !unsafe { (&*up).spec_cached.contains(&id) } {
             unsafe { typeck_ahead_slot(up, id) };
         }
+        crate::postframe::AHEAD_RUNNING.fetch_add(1, Ordering::Relaxed);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { spec_build(up, id) }));
+        crate::postframe::AHEAD_RUNNING.fetch_sub(1, Ordering::Relaxed);
+        if FIRST_PRESENT.load(Ordering::Relaxed) && matches!(r, Ok(true)) {
+            crate::postframe::AHEAD_DONE.fetch_add(1, Ordering::Relaxed);
+        }
         match r {
             // gave way to a program thread: first in line again
             Ok(false) => SPEC_Q.lock().unwrap().push_front(id),
@@ -12486,6 +12508,15 @@ impl Drop for JobIdle {
     }
 }
 
+/// A compile job's sleep that waits for no owner request (a poll): the job is not running meanwhile
+/// (JobIdle), so an allocator swap or a fork never waits for it -- what the poll waits for may be
+/// held up by that very swap (a job polling for quiet compiles, while the jobs the swap parked keep
+/// their startup-compile counts, waited for the swap's whole length: the swap for it, forever).
+pub(crate) fn job_sleep(d: std::time::Duration) {
+    let _idle = JobIdle::enter();
+    std::thread::sleep(d);
+}
+
 /// The thread compile jobs are paused for (an allocator swap, a fork), 0: none.
 pub(crate) fn paused_for() -> u64 {
     // Only the pauser's requests are served while the jobs are paused, for as long as the pause
@@ -12609,6 +12640,7 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"fork" => Some(relax_fork as *const () as usize),
         b"relax_allocator_swap" => Some(relax_allocator_swap as *const () as usize),
         b"relax_first_present" => Some(relax_first_present as *const () as usize),
+        b"relax_frame_done" => Some(crate::postframe::relax_frame_done as *const () as usize),
         b"relax_quit_requested" => Some(crate::run::relax_quit_requested as *const () as usize),
         b"__relax_guard_enter" => Some(__relax_guard_enter as *const () as usize),
         b"__relax_guard_leave" => Some(__relax_guard_leave as *const () as usize),
