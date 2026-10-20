@@ -105,6 +105,8 @@ fn ring() -> Option<&'static Ring> {
     if !p.is_null() {
         return Some(unsafe { &*p });
     }
+    // a ring outlives every compiler generation (the owner records on its own thread too)
+    let _k = crate::zone_alloc::kept();
     let r: &'static Ring = Box::leak(Box::new(Ring {
         recs: (0..RING).map(|_| std::cell::UnsafeCell::new(Rec { t: 0, kind: 0, label_len: 0, label: 0, a: 0, b: 0 })).collect(),
         next: AtomicUsize::new(0),
@@ -172,7 +174,7 @@ pub extern "C" fn relax_span_end(name: *const u8, len: usize) {
 // it ends and raised as a `hitch` event (at most HITCH_PER_S a second; the rest are counted).
 
 const GAP_NS: u64 = 16_000_000;
-const FRAME_RECS: usize = 2048;
+const FRAME_RECS: usize = 8192;
 const HITCH_PER_S: u64 = 4;
 
 #[derive(Clone, Copy)]
@@ -220,6 +222,7 @@ fn frame_rec(l: &mut FrameLog, kind: u8, name: &'static str, detail: &'static st
 
 /// A phase begins / ends on this thread (makepad's ui_hang markers).
 fn frame_watch(begin: bool, name: &'static str) {
+    let _k = crate::zone_alloc::kept();
     let now = crate::clock::wall_ns();
     let done = FL.try_with(|c| {
         let Ok(mut g) = c.try_borrow_mut() else { return None };
@@ -395,18 +398,32 @@ fn analyse(l: &FrameLog, t0: u64, t1: u64) -> String {
     waits.sort_by(|a, b| b.1.cmp(&a.1));
     let ph: Vec<String> = phases.iter().take(10).map(|p| format!("{{\"phase\":{},\"ms\":{:.2},\"self_ms\":{:.2},\"n\":{}}}", json_str(&short(&p.0, 120)), ms(p.1), ms(p.2), p.3)).collect();
     let wt: Vec<String> = waits.iter().take(6).map(|w| format!("{{\"wait\":{},\"ms\":{:.2},\"max_ms\":{:.2},\"n\":{}}}", json_str(&short(&w.0, 120)), ms(w.1), ms(w.2), w.3)).collect();
-    // the path: pieces of >= 1 ms in order (the rest summed)
+    // the path: its 12 longest pieces in time order, and the time per kind of piece
     let total: u64 = path.iter().map(|p| p.1).sum();
-    let mut shown = 0u64;
-    let mut cp: Vec<String> = Vec::new();
     let mut at = 0u64;
+    let mut pieces: Vec<(u64, u64, &str)> = Vec::new();
     for (w, ns) in &path {
-        if *ns >= 1_000_000 && cp.len() < 16 {
-            cp.push(format!("{{\"at_ms\":{:.1},\"ms\":{:.2},\"on\":{}}}", ms(at), ms(*ns), json_str(&short(w, 120))));
-            shown += ns;
-        }
+        pieces.push((at, *ns, w.as_str()));
         at += ns;
     }
+    let mut longest: Vec<(u64, u64, &str)> = pieces.clone();
+    longest.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    longest.truncate(12);
+    longest.sort_by_key(|p| p.0);
+    let shown: u64 = longest.iter().map(|p| p.1).sum();
+    let cp: Vec<String> = longest.iter().map(|(at, ns, w)| format!("{{\"at_ms\":{:.1},\"ms\":{:.2},\"on\":{}}}", ms(*at), ms(*ns), json_str(&short(w, 120)))).collect();
+    let mut by: Vec<(&str, u64, u32)> = Vec::new();
+    for (_, ns, w) in &pieces {
+        match by.iter_mut().find(|b| b.0 == *w) {
+            Some(b) => {
+                b.1 += ns;
+                b.2 += 1;
+            }
+            None => by.push((w, *ns, 1)),
+        }
+    }
+    by.sort_by(|a, b| b.1.cmp(&a.1));
+    let time_by: Vec<String> = by.iter().take(8).map(|(w, ns, n)| format!("{{\"on\":{},\"ms\":{:.2},\"pieces\":{}}}", json_str(&short(w, 120)), ms(*ns), n)).collect();
     let mut probes = Vec::new();
     if !l.probes0.is_empty() {
         let now = super::instrument::counters();
@@ -422,12 +439,13 @@ fn analyse(l: &FrameLog, t0: u64, t1: u64) -> String {
         probes = d.iter().take(8).map(|(k, h, ns)| format!("{{\"counter\":{},\"delta\":{}{}}}", json_str(&short(k, 120)), h, if *ns > 0 { format!(",\"ms\":{:.2}", ms(*ns)) } else { String::new() })).collect();
     }
     format!(
-        "\"idle_gap_ms\":{:.1},\"phases\":[{}],\"waits\":[{}],\"compile\":{{\"ms\":{:.2},\"n\":{}}},\"critical_path\":[{}],\"critical_path_other_ms\":{:.2},\"probe_deltas\":[{}],\"records_dropped\":{}",
+        "\"idle_gap_ms\":{:.1},\"phases\":[{}],\"waits\":[{}],\"compile\":{{\"ms\":{:.2},\"n\":{}}},\"time_by\":[{}],\"critical_path\":[{}],\"critical_path_other_ms\":{:.2},\"probe_deltas\":[{}],\"records_dropped\":{}",
         ms(l.idle),
         ph.join(","),
         wt.join(","),
         ms(l.compile_ns),
         l.compiles,
+        time_by.join(","),
         cp.join(","),
         ms(total.saturating_sub(shown)),
         probes.join(","),

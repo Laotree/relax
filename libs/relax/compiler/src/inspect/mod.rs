@@ -33,6 +33,14 @@ pub mod cfi {
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use relax_session::sync::Mutex;
 
+/// The kept-state scan (zone_scan.rs, MAKEPAD_RUN_ZONE_CHECK=1) of inspect's records that
+/// outlive the compiler arena: instrumented and probed code calls into them after a settle swap.
+pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
+    instrument::scan_kept(a);
+    patches::scan_kept(a);
+    probes::scan_kept(a);
+}
+
 /// The inspect thread runs (a socket is listening).
 static STARTED: AtomicBool = AtomicBool::new(false);
 /// `makepad run --agent`: panics park, events also go to stderr.

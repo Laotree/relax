@@ -4,6 +4,10 @@
 //! instruments compose. When the last edit goes, the code from before the first instrumented
 //! install comes back (the installs' saved previous versions), with no recompile.
 //! All of it runs on the owner thread.
+//!
+//! Zones: SLOTS and the edits are kept state (the program heap): the instrumented code calls the
+//! sites they name long after a settle swap destroyed the compiler arena the owner compiles in.
+//! The entries take `zone_alloc::kept()`; only `rebuild`'s compile runs in the compiler phase.
 
 use std::collections::HashMap;
 use relax_session::sync::Mutex;
@@ -34,6 +38,24 @@ struct SlotState {
 
 static SLOTS: Mutex<Option<HashMap<u32, SlotState>>> = Mutex::new(None);
 
+pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
+    let Ok(g) = SLOTS.try_lock() else { return };
+    let Some(m) = g.as_ref() else { return };
+    a.field("inspect.patch_slots");
+    a.map(m, |a, _, s| {
+        a.vec(&s.edits);
+        for (_, e) in &s.edits {
+            if let Edit::ProbeLocals { point, .. } = e {
+                a.arc(point);
+                a.vec(&point.params);
+                for p in &point.params {
+                    a.string(&p.0);
+                }
+            }
+        }
+    });
+}
+
 /// Is slot `id` instrumented now? (O3 / O2 installs keep its instruments)
 pub fn active(id: u32) -> bool {
     SLOTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.contains_key(&id))
@@ -53,6 +75,9 @@ fn apply_edit(f: &mut relax_backend::rir::Func, u: &crate::jit::Unit, slot: u32,
 /// Rebuilds slot `id` with `edits` (restart landings last: they turn the calls the other edits
 /// added into invokes too) and installs it; the result per edit.
 unsafe fn rebuild(up: *mut crate::jit::Unit, id: u32, edits: &[(Owner, Edit)]) -> Result<(u32, Vec<bool>), String> {
+    // the build is compile work (the compiler arena, like any compile on the owner); the edits'
+    // records it reads stay kept (SLOTS, the sites)
+    let _compile = crate::zone_alloc::compiler();
     let u = &mut *up;
     let gen = u.begin_patch();
     let mut hits = vec![false; edits.len()];
@@ -84,6 +109,7 @@ unsafe fn rebuild(up: *mut crate::jit::Unit, id: u32, edits: &[(Owner, Edit)]) -
 
 /// Adds an edit to slot `id` and reinstalls it; whether the edit found its place.
 pub unsafe fn add(up: *mut crate::jit::Unit, id: u32, owner: Owner, edit: Edit) -> Result<bool, String> {
+    let _kept = crate::zone_alloc::kept();
     let mut g = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
     let m = g.get_or_insert_with(HashMap::new);
     let mut edits = m.get(&id).map(|s| s.edits.clone()).unwrap_or_default();
@@ -115,6 +141,7 @@ unsafe fn restore_or_rebuild(up: *mut crate::jit::Unit, id: u32, m: &mut HashMap
 
 /// Removes every edit of `owner`; the slots it touched are rebuilt or restored.
 pub unsafe fn remove_owner(up: *mut crate::jit::Unit, owner: Owner) -> usize {
+    let _kept = crate::zone_alloc::kept();
     let mut g = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = g.as_mut() else { return 0 };
     let ids: Vec<u32> = m.iter().filter(|(_, s)| s.edits.iter().any(|e| e.0 == owner)).map(|(k, _)| *k).collect();

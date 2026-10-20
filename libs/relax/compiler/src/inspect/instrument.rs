@@ -48,6 +48,39 @@ static SITES: Mutex<Vec<std::sync::Arc<Site>>> = Mutex::new(Vec::new());
 static GROUPS: Mutex<Vec<(u32, u32, Vec<u32>, String)>> = Mutex::new(Vec::new());
 static NEXT_GROUP: AtomicU64 = AtomicU64::new(1);
 
+pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
+    if let Ok(sites) = SITES.try_lock() {
+        a.field("inspect.sites");
+        a.vec(&sites);
+        for s in sites.iter() {
+            a.arc(s);
+            a.string(&s.label);
+            if let Some(p) = s.args.get() {
+                a.vec(&p.params);
+                for x in &p.params {
+                    a.string(&x.0);
+                    a.string(&x.1);
+                }
+            }
+        }
+    }
+    if let Ok(g) = GROUPS.try_lock() {
+        a.field("inspect.groups");
+        a.vec(&g);
+        for x in g.iter() {
+            a.vec(&x.2);
+            a.string(&x.3);
+        }
+    }
+    if let Ok(p) = PARKED.try_lock() {
+        a.field("inspect.parked");
+        a.vec(&p);
+        for x in p.iter() {
+            a.arc(x);
+        }
+    }
+}
+
 /// Are any counters installed (count groups or injected probes)? Cheap: a frame log asks it
 /// at each frame's start.
 pub fn any_counters() -> bool {
@@ -121,6 +154,9 @@ fn rt_inspect_enter(i: u64) {
     if let Some(s) = site(i) {
         if s.on.load(Relaxed) {
             s.hits.fetch_add(1, Relaxed);
+            // a counted fn may run inside a compile (constant evaluation): the thread-local stack
+            // is the thread's, never the compiler arena's
+            let _k = crate::zone_alloc::kept();
             let _ = ENTRIES.try_with(|e| e.borrow_mut().push((i, crate::clock::wall_ns())));
         }
     }
@@ -286,6 +322,7 @@ fn rt_inspect_break(i: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) {
 /// Parks the calling thread as a breakpoint hit (site index `i`, u64::MAX for none) and raises
 /// the `break` event; returns once an agent continues it (or after 10 minutes).
 pub fn park_here(i: u64, site_tag: &str, label: &str, extra: &str) {
+    let _k = crate::zone_alloc::kept();
     let id = PARK_IDS.fetch_add(1, SeqCst) + 1;
     let p = std::sync::Arc::new(Parked { id, site: i, os_id: super::threads::self_os_id(), go: AtomicBool::new(false) });
     let me = crate::os::thread::current();
@@ -685,7 +722,8 @@ pub(super) fn edit_count(f: &mut relax_backend::rir::Func, u: &crate::jit::Unit,
 /// `break`'s edit: the parking call with the fn's argument words at the entry or a line.
 pub(super) fn edit_break(f: &mut relax_backend::rir::Func, u: &crate::jit::Unit, slot: u32, site: u64, line: Option<u32>) -> bool {
     if let Some(s) = self::site(site) {
-        let _ = s.args.set(arg_plan(u, slot, f));
+        // kept state (the site outlives the compiler arena); this edit runs inside a compile
+        let _ = s.args.set(crate::zone_alloc::kept_with(|| arg_plan(u, slot, f)));
     }
     let mut hit = false;
     edit(f, u, site, ("inspect_break", rt_inspect_break as *const () as u64), None, line, true, &mut hit);
@@ -699,6 +737,23 @@ pub(super) fn edit_restart_site(f: &mut relax_backend::rir::Func, u: &crate::jit
         let _ = s.returns.set(n);
     }
     true
+}
+
+/// A new site (its index): kept state whatever the caller's phase (the owner compiles in the
+/// compiler arena; the instrumented code reads the site after a settle swap destroyed it).
+fn register_site(kind: Kind, slot: u32, label: String, group: u32) -> u64 {
+    let _k = crate::zone_alloc::kept();
+    let label = label.as_str().to_string();
+    let mut sites = SITES.lock().unwrap_or_else(|e| e.into_inner());
+    sites.push(std::sync::Arc::new(Site { kind, slot, label, args: std::sync::OnceLock::new(), returns: std::sync::OnceLock::new(), group, hits: AtomicU64::new(0), ns: AtomicU64::new(0), on: AtomicBool::new(true) }));
+    sites.len() as u64 - 1
+}
+
+/// A new probe group's record (kept state, like the sites).
+fn register_group(group: u32, slots: Vec<u32>, query: &str) {
+    let _k = crate::zone_alloc::kept();
+    let slots = slots.as_slice().to_vec();
+    GROUPS.lock().unwrap_or_else(|e| e.into_inner()).push((group, 0, slots, query.to_string()));
 }
 
 /// Installs probes of `kind` for `query` (on the owner, within `ms`): (group, sites).
@@ -722,6 +777,10 @@ fn add_to(kind: Kind, target: Target, time: bool) -> Result<(u32, Vec<(u64, Stri
     };
     let group = NEXT_GROUP.fetch_add(1, SeqCst) as u32;
     let r = crate::owner::call_within(crate::owner::Class::App, 10_000, move || -> Result<(u32, Vec<(u64, String, u32)>), String> {
+        // the sites, groups and patch edits are kept state (the instrumented code calls into them
+        // after a settle swap destroyed the compiler arena); patches::rebuild compiles in the
+        // compiler phase
+        let _kept = crate::zone_alloc::kept();
         let u = unsafe { &mut *up };
         let found = match target {
             Target::Query(ref q) => find(u, q, if kind == Kind::Break { 4 } else { 32 }),
@@ -732,11 +791,7 @@ fn add_to(kind: Kind, target: Target, time: bool) -> Result<(u32, Vec<(u64, Stri
         }
         let mut out = Vec::new();
         for (id, line, name) in found {
-            let si = {
-                let mut sites = SITES.lock().unwrap_or_else(|e| e.into_inner());
-                sites.push(std::sync::Arc::new(Site { kind, slot: id, label: match line { Some(l) => format!("{} (line {})", name, l), None => name.clone() }, args: std::sync::OnceLock::new(), returns: std::sync::OnceLock::new(), group, hits: AtomicU64::new(0), ns: AtomicU64::new(0), on: AtomicBool::new(true) }));
-                sites.len() as u64 - 1
-            };
+            let si = register_site(kind, id, match line { Some(l) => format!("{} (line {})", name, l), None => name.clone() }, group);
             let e = match kind {
                 Kind::Count => super::patches::Edit::Count { site: si, time },
                 Kind::Break => super::patches::Edit::Break { site: si, line },
@@ -748,8 +803,7 @@ fn add_to(kind: Kind, target: Target, time: bool) -> Result<(u32, Vec<(u64, Stri
                 Err(e) => out.push((si, format!("{}: not instrumented: {}", name, e), id)),
             }
         }
-        let gen = 0;
-        GROUPS.lock().unwrap_or_else(|e| e.into_inner()).push((group, gen, out.iter().map(|x| x.2).collect(), query.clone()));
+        register_group(group, out.iter().map(|x| x.2).collect(), &query);
         Ok((group, out))
     });
     r.unwrap_or_else(|| Err(format!("the owner did not take the request in 10 s ({})", crate::owner::serving_note())))
@@ -757,6 +811,7 @@ fn add_to(kind: Kind, target: Target, time: bool) -> Result<(u32, Vec<(u64, Stri
 
 /// Removes probe group `group` (all groups with None): the code they replaced comes back.
 fn remove(group: Option<u32>) -> Result<usize, String> {
+    let _k = crate::zone_alloc::kept();
     let up = crate::jit::current_unit();
     let groups: Vec<(u32, u32, Vec<u32>, String)> = {
         let mut g = GROUPS.lock().unwrap_or_else(|e| e.into_inner());
@@ -786,6 +841,7 @@ fn remove(group: Option<u32>) -> Result<usize, String> {
     let n = groups.len();
     let ids: Vec<u32> = groups.iter().map(|g| g.0).collect();
     let r = crate::owner::call_within(crate::owner::Class::App, 10_000, move || {
+        let _kept = crate::zone_alloc::kept();
         for g in ids {
             unsafe { super::patches::remove_owner(up, super::patches::Owner::Group(g)) };
         }
@@ -1010,5 +1066,53 @@ pub fn cmd(req: &Req, out: &mut Out) {
             out.line(&format!("{{\"resumed_threads\":{}}}", n));
         }
         _ => out.err("unknown probe command"),
+    }
+}
+
+#[cfg(test)]
+mod zone_tests {
+    /// The P0 of 2026-10-20 (Stage: count / rm / count, then the settle swap: "use after
+    /// compiler-zone destroy" in the counted fn): inspect's records were allocated in the owner's
+    /// compiler phase. Registering, removing and registering again from the compiler phase -- as
+    /// the owner does -- leaves nothing of inspect's state in the compiler arena (the kept scan
+    /// that MAKEPAD_RUN_ZONE_CHECK=1 runs at every settle reports 0 for it).
+    #[test]
+    fn probe_records_outlive_the_compiler_arena() {
+        assert!(crate::zone_alloc::compiler_arena_enabled());
+        let count = || {
+            let mut a = crate::jit::zone_scan::Acc::new_for_test();
+            super::super::scan_kept(&mut a);
+            a.total()
+        };
+        // the control: the scan sees an inspect-like record built in the compiler phase
+        {
+            let _c = crate::zone_alloc::compiler();
+            let mut a = crate::jit::zone_scan::Acc::new_for_test();
+            a.field("control");
+            let v: Vec<String> = vec!["x".repeat(40)];
+            a.vec(&v);
+            a.string(&v[0]);
+            assert_eq!(a.total(), 2, "the compiler arena is not in use: the fixture would prove nothing");
+        }
+        for round in 0..3 {
+            {
+                let _c = crate::zone_alloc::compiler();
+                let label = format!("fixture::counted_fn round {}", round);
+                let g = 9000 + round;
+                let si = super::register_site(super::Kind::Count, 1, label, g);
+                super::register_group(g, vec![1, 2, 3], "fixture::counted_fn");
+                let (p, _) = super::super::probes::register_probe_for_test(g, "fixture::probed_fn");
+                assert!(si < u64::MAX && p.id == g);
+            }
+            assert_eq!(count(), 0, "round {}: inspect state in the compiler arena", round);
+            // rm: the groups go, the sites stay (off), as `rm all` does
+            {
+                let _c = crate::zone_alloc::compiler();
+                let mut g = super::GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+                let _k = crate::zone_alloc::kept();
+                g.retain(|x| x.0 < 9000);
+            }
+            assert_eq!(count(), 0, "round {} after rm", round);
+        }
     }
 }

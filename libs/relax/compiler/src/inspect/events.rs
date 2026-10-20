@@ -68,6 +68,7 @@ pub fn emit(kind: &'static str, key: &str, fields: &str) -> u64 {
 }
 
 fn emit_record(kind: &'static str, key: &str, fields: &str) -> (u64, std::sync::Arc<str>) {
+    let _k = crate::zone_alloc::kept();
     let mut q = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(e) = q.iter().rev().find(|e| e.kind == kind && e.key == key) {
         if e.at.elapsed().as_secs() < 30 {
@@ -298,6 +299,7 @@ pub fn release_domain(domain: crate::domain::DomainId) {
 }
 
 pub fn on_panic(info: &crate::jit::PanicInfo, unwinds: bool) {
+    let _k = crate::zone_alloc::kept();
     if !super::STARTED.load(Relaxed) || crate::owner::is_owner() || super::probes::in_probe() {
         return;
     }
