@@ -33,6 +33,8 @@ pub mod intrinsics {
         pub fn fma_native() -> bool;
     }
     pub use super::intrinsics_simd as simd;
+    /// rustc's `intrinsics::assume` (UB when false): hint::assert_unchecked
+    pub use crate::hint::assert_unchecked as assume;
 }
 
 /// rustc's generic SIMD intrinsics (`core::intrinsics::simd`) on `#[repr(simd)]` types, lane-wise
@@ -97,6 +99,27 @@ pub mod intrinsics_simd {
         pub fn simd_reduce_and<T, U>(x: T) -> U;
         pub fn simd_reduce_or<T, U>(x: T) -> U;
         pub fn simd_reduce_xor<T, U>(x: T) -> U;
+        pub fn simd_gather<T, U, V>(val: T, ptr: U, mask: V) -> T;
+        pub fn simd_scatter<T, U, V>(val: T, ptr: U, mask: V);
+        pub fn simd_masked_load<V, U, T, const ALIGN: SimdAlign>(mask: V, ptr: U, val: T) -> T;
+        pub fn simd_masked_store<V, U, T, const ALIGN: SimdAlign>(mask: V, ptr: U, val: T);
+        pub fn simd_arith_offset<T, U>(ptr: T, offset: U) -> T;
+        pub fn simd_cast_ptr<T, U>(ptr: T) -> U;
+        pub fn simd_expose_provenance<T, U>(ptr: T) -> U;
+        pub fn simd_with_exposed_provenance<T, U>(addr: T) -> U;
+        pub fn simd_funnel_shl<T>(a: T, b: T, shift: T) -> T;
+        pub fn simd_funnel_shr<T>(a: T, b: T, shift: T) -> T;
+    }
+
+    /// Alignment options of the masked load/store intrinsics (rustc core/src/intrinsics/simd)
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum SimdAlign {
+        /// No alignment requirements on the pointer
+        Unaligned = 0,
+        /// The pointer must be aligned to the element type of the SIMD vector
+        Element = 1,
+        /// The pointer must be aligned to the SIMD vector type
+        Vector = 2,
     }
 }
 

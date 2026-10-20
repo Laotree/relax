@@ -48,6 +48,8 @@ impl<'a> Lcx<'a> {
                     Prim::F64 => Lane::F(VW::D),
                     _ => return None,
                 },
+                // thin pointers (gather/scatter addresses): 64-bit lanes
+                TyKind::Ptr(..) => Lane::U(VW::D),
                 _ => return None,
             })
         };
@@ -65,6 +67,17 @@ impl<'a> Lcx<'a> {
             }
             [] => None,
         }
+    }
+
+    /// The element type of a `#[repr(simd)]` struct (see `simd_shape`).
+    fn simd_elem_ty(&mut self, t: TyId) -> Option<TyId> {
+        let TyKind::Adt(d, args, _) = self.kind(t) else { return None };
+        let env = crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog);
+        let f0 = self.u.tcx.field_ty(&self.u.prog, env, d, 0, 0, self.u.tcx.tys.list(args));
+        Some(match self.kind(f0) {
+            TyKind::Array(e, _) => e,
+            _ => f0,
+        })
     }
 
     /// The memory of an operand: (base, offset).
@@ -274,6 +287,7 @@ impl<'a> Lcx<'a> {
         let known = unary_bits
             || matches!(name, "simd_div" | "simd_rem" | "simd_fma" | "simd_relaxed_fma" | "simd_cast" | "simd_as" | "simd_splat" | "simd_shuffle" | "simd_bitmask" | "simd_select_bitmask")
             || matches!(name, "simd_extract" | "simd_extract_dyn" | "simd_insert" | "simd_insert_dyn")
+            || matches!(name, "simd_gather" | "simd_scatter" | "simd_masked_load" | "simd_masked_store" | "simd_arith_offset" | "simd_cast_ptr" | "simd_expose_provenance" | "simd_with_exposed_provenance")
             || name.starts_with("simd_reduce_");
         if !known || vals.is_empty() {
             return None;
@@ -282,6 +296,7 @@ impl<'a> Lcx<'a> {
         let vi = match name {
             "simd_splat" => None,
             "simd_select_bitmask" => Some(1),
+            "simd_masked_load" | "simd_masked_store" => Some(2),
             _ => Some(0),
         };
         let shape_ty = match vi {
@@ -362,7 +377,7 @@ impl<'a> Lcx<'a> {
                 }
                 Some(Val::M(out, 0))
             }
-            "simd_cast" | "simd_as" => {
+            "simd_cast" | "simd_as" | "simd_cast_ptr" | "simd_expose_provenance" | "simd_with_exposed_provenance" => {
                 let Some((l2, n2)) = self.simd_shape(t) else {
                     return Some(self.simd_err(name, "expected SIMD return type, found non-SIMD", t));
                 };
@@ -389,6 +404,67 @@ impl<'a> Lcx<'a> {
                         }
                     };
                     self.lane_put(out, 0, l2, k, r);
+                }
+                Some(Val::M(out, 0))
+            }
+            "simd_gather" | "simd_scatter" | "simd_masked_load" | "simd_masked_store" => {
+                // lane k of the value <-> *addr[k] where mask lane k is set; a masked-off lane
+                // reads its fallback / writes a dummy slot through the same access (no branch)
+                let (mi, vi) = if name.starts_with("simd_masked") { (0, 2) } else { (2, 0) };
+                let Some((ml, mn)) = self.simd_shape(vals[mi].1) else {
+                    return Some(self.simd_err(name, "the mask must be a SIMD vector, found", vals[mi].1));
+                };
+                if mn != n || matches!(ml, Lane::F(_)) {
+                    return Some(self.simd_err(name, "the mask must be an integer vector of the value's lane count, found", vals[mi].1));
+                }
+                let load = matches!(name, "simd_gather" | "simd_masked_load");
+                let out = if load { Some(self.new_slot_for(t)) } else { None };
+                let dummy = self.simd_scratch(1);
+                let esize = l.w().bits() as i64 / 8;
+                let base = if name.starts_with("simd_masked") { Some(scalar(self, 1)) } else { None };
+                for k in 0..n {
+                    let m = self.lane_get(ops[mi].0, ops[mi].1, ml, k);
+                    let z = self.iconst(0);
+                    let on = self.icmp(Cond::Ne, false, m, z);
+                    let p = match base {
+                        Some(b) => {
+                            let o = self.iconst(k as i64 * esize);
+                            self.ibin(IOp::Add, false, b, o)
+                        }
+                        None => self.lane_get(ops[1].0, ops[1].1, Lane::U(VW::D), k),
+                    };
+                    let off = self.addr_add(if load { ops[vi].0 } else { dummy }, if load { ops[vi].1 + (k as i64 * esize) as i32 } else { 0 });
+                    let a = self.f.vreg(Cls::I);
+                    self.emit(Inst::Sel(a, on, p, off));
+                    if load {
+                        let d = self.f.vreg(Self::lane_cls(l));
+                        self.emit(Inst::Load(Self::lane_mem(l), d, a, 0));
+                        self.lane_put(out.unwrap(), 0, l, k, d);
+                    } else {
+                        let x = self.lane_get(ops[vi].0, ops[vi].1, l, k);
+                        self.emit(Inst::Store(Self::lane_mem(l), a, 0, x));
+                    }
+                }
+                Some(match out {
+                    Some(o) => Val::M(o, 0),
+                    None => Val::L(vec![]),
+                })
+            }
+            "simd_arith_offset" => {
+                // lane k = ptr[k] + offset[k] * size_of pointee (wrapping)
+                let pointee = match self.simd_elem_ty(vals[0].1).map(|e| self.kind(e)) {
+                    Some(TyKind::Ptr(_, p)) => p,
+                    _ => return Some(self.simd_err(name, "expected a SIMD vector of pointers, found", vals[0].1)),
+                };
+                let size = self.layout(pointee).size as i64;
+                let out = self.new_slot_for(t);
+                for k in 0..n {
+                    let p = self.lane_get(ops[0].0, ops[0].1, Lane::U(VW::D), k);
+                    let o = self.lane_get(ops[1].0, ops[1].1, Lane::S(VW::D), k);
+                    let sz = self.iconst(size);
+                    let o = self.ibin(IOp::Mul, false, o, sz);
+                    let r = self.ibin(IOp::Add, false, p, o);
+                    self.lane_put(out, 0, Lane::U(VW::D), k, r);
                 }
                 Some(Val::M(out, 0))
             }
