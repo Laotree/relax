@@ -111,6 +111,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         u.prog.crates[k as usize].validate = true;
     }
     u.prog.own_crates = own.clone();
+    errors.extend(u.prog.strict_import_errors(&own));
     // every checked definition's signature, on MAKEPAD_RUN_JOBS threads (queries over the shared
     // context); errors in definition order
     {

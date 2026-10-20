@@ -543,6 +543,10 @@ pub fn entry_point(prog: &Program, root: u32) -> Vec<String> {
         }
     }
     let Some(sym) = prog.syms.get("main") else { return vec![no_main_error(prog, root, m.file)] };
+    // `main` bound by two globs that disagree: E0659 (rustc resolves the entry point by name)
+    if let Some(e) = prog.name_ambiguity(c.root_mod, sym, false, false) {
+        if let Some(msg) = crate::lint::privacy_diag(prog, m.file, 0, &e) { return vec![prog.record_error(m.file, 0, "resolve", msg)]; }
+    }
     let main = match prog.lookup_in_module(c.root_mod, sym, false, &mut Vec::new()) {
         Some(d) if prog.def(d).kind == DefKind::Fn => d,
         _ => return vec![no_main_error(prog, root, m.file)],
