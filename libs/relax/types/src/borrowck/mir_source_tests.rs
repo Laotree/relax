@@ -337,7 +337,7 @@ fn zz_probe_files() {
     for f in files.to_string_lossy().split(':') {
         let src = std::fs::read_to_string(f).unwrap();
         let r = std::panic::catch_unwind(|| borrowck_source(&src));
-        match r { Ok((e, u)) => eprintln!("PROBE {f}: errors {} {:?} unchecked {:?}", e.len(), e.iter().map(|x| x.chars().take(60).collect::<String>()).collect::<Vec<_>>(), u),
+        match r { Ok((e, u)) => eprintln!("PROBE {f}: errors {} {:?} unchecked {:?}", e.len(), e.iter().map(|x| x.chars().take(std::env::var("PROBE_W").ok().and_then(|w| w.parse().ok()).unwrap_or(60)).collect::<String>()).collect::<Vec<_>>(), u),
                   Err(_) => eprintln!("PROBE {f}: harness panic (typeck/front errors?)") }
     }
 }
@@ -510,4 +510,38 @@ fn a_higher_ranked_mismatch_is_e0308_one_type_is_more_general() {
         pub fn f(x: A) { let _y: B = x; }");
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(!errors.is_empty() && errors.iter().all(|e| e.starts_with("E0308 mismatched types")), "{errors:?}");
+}
+
+#[test]
+fn an_async_block_is_borrow_checked_as_a_coroutine() {
+    let (errors, unchecked) = borrowck_source_in("
+        pub fn g() { let _a = async { let temp = 1; let _p: &'static u32 = &temp; }; }
+        pub async fn h(x: &mut Vec<u8>) { let r = &*x; yield_now().await; x.push(r.len() as u8); }
+        async fn yield_now() {}", 2018);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0597"), "{errors:?}");
+}
+
+#[test]
+fn a_coroutine_without_suspension_points_needs_only_its_upvars_drop_live() {
+    let (errors, unchecked) = borrowck_source_in("
+        pub async fn foo() { let mut f = None; let value = 0; f = Some(async { value }); core::mem::drop(f); }", 2018);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn an_async_fn_with_a_pattern_parameter_stops_the_check_instead_of_misreporting() {
+    let (errors, unchecked) = borrowck_source_in("
+        pub async fn c(ref vec: Vec<u32>) { vec.contains(&0); }", 2018);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(unchecked.iter().any(|u| u.contains("async fn parameter pattern")), "{unchecked:?}");
+}
+
+#[test]
+fn an_async_closure_with_a_macro_body_orders_its_coroutine_before_it() {
+    let (errors, unchecked) = borrowck_source_in("
+        pub fn main() { let _ = async || println!(); }", 2018);
+    assert!(unchecked.iter().all(|u| u.contains("async closures")), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
 }

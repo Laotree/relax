@@ -62,7 +62,8 @@ fn closure_extent(ast: &crate::ast::Ast, c: u32) -> (u32, u32) {
         (b.lo, b.hi)
     } else {
         let e = ast.expr(crate::ast::ExprId(c));
-        (e.lo, e.hi)
+        // (a macro-expanded body can carry a span that ends before it starts: it ends where it ends)
+        if e.lo > e.hi { (e.hi, e.hi) } else { (e.lo, e.hi) }
     }
 }
 
@@ -97,7 +98,18 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
     // The item body with its closures (inner first), then each array-length constant as an
     // independent root of its own (rustc: an anon const is its own typeck root and `mir_borrowck`).
     let mut owners: Vec<CheckedBody> = Vec::new();
-    for c in closures_inner_first(prog, tcx, typeck) {
+    let closure_order = closures_inner_first(prog, tcx, typeck);
+    // An async closure is a closure returning a coroutine over its captures (CoroutineClosure); which
+    // captures the coroutine takes (by ref through `AsyncFn`, by move through `FnOnce`: rustc's
+    // by-move body) is not modelled, so the root is not checked rather than misreported.
+    {
+        let ast = &prog.files[typeck.file as usize].ast;
+        if closure_order.iter().any(|&c| c & crate::tcx::ASYNC_FN_BODY == 0 && matches!(ast.expr(crate::ast::ExprId(c)).kind, crate::ast::ExprKind::Closure(row) if ast.row(row).is_async)) {
+            v.unchecked.push(format!("{name}: async closures are not borrow-checked"));
+            return v;
+        }
+    }
+    for &c in &closure_order {
         owners.push(CheckedBody { owner: typeck.def, kind: OwnerKind::Closure(crate::ast::ExprId(c)) });
     }
     let Some(item) = CheckedBody::item(prog, typeck.def) else {
@@ -187,7 +199,19 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
     let mut closure_sigs: crate::fxhash::HashMap<u32, SignatureRegions> = Default::default();
     for &c in closure_order.iter().rev() {
         let Some((_, mir)) = built.iter().find(|(o, _)| matches!(o.kind, OwnerKind::Closure(e) if e.0 == c)) else { continue };
-        let Some(sigs) = typeck.closure_sigs.get(&c) else { v.unchecked.push(format!("{name}: closure without a signature")); return; };
+        // A coroutine (async block, async fn body) has no written signature: rustc's
+        // `DefiningTy::Coroutine` has the resume argument as its one input and the return type as
+        // output (compute_inputs_and_output), both known to its MIR.
+        let synthesized;
+        let sigs = match (typeck.closure_sigs.get(&c), mir.coroutine.as_ref()) {
+            (Some(sigs), _) => sigs,
+            (None, Some(co)) => {
+                let bound = tcx.tys.intern(crate::types::TyKind::FnPtr(tcx.tys.mk_list(&[co.resume_ty]), mir.local_decls[0].ty, crate::types::FnHeader::RUST, 0));
+                synthesized = typeck::ClosureSignatures { bound, liberated: bound, annotation_eq: None };
+                &synthesized
+            }
+            (None, None) => { v.unchecked.push(format!("{name}: closure without a signature")); return; }
+        };
         let parent = match creator.get(&c).copied().flatten().and_then(|p| closure_sigs.get(&p)) {
             Some(p) => p.clone(),
             None => item_sig.clone(),
@@ -418,6 +442,8 @@ pub fn check_anon_const(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, body: &typec
 fn lint_unused_mut(prog: &Program, owner: DefId, mir: &Body, used: &crate::mir::dataflow::BitSet) {
     use crate::mir::{BindingForm, ByRef, LocalInfo, LocalKind, Mutability, VarBindingForm};
     for (i, decl) in mir.local_decls.iter().enumerate() {
+        // (the resume argument of a coroutine is `_task_context`: a name with a leading underscore is never linted)
+        if mir.coroutine.is_some() && i == 2 { continue; }
         if decl.mutability != Mutability::Mut || used.contains(i) || !matches!(decl.kind, LocalKind::UserVar | LocalKind::Arg) { continue; }
         let LocalInfo::User(BindingForm::Var(VarBindingForm { binding_mode: crate::mir::BindingMode(ByRef::No, Mutability::Mut), pat_span, .. })) = &decl.local_info else { continue };
         let Some(name) = mir.var_debug_info.iter().find(|v| v.place.local.0 as usize == i && v.place.projection.is_empty()).map(|v| v.name.as_str()) else { continue };
