@@ -5881,7 +5881,7 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
     compile_watch(None);
     let c = c?;
     note_frame(id, c.frame_size, slot_bytes(func), false);
-    code_sig(id, func, &c.code, c.alloc_sig);
+    code_sig(id, func, &c.code, c.alloc_sig, false);
     crate::syms::reloc_sig(u, || crate::syms::stable_fn_name(u, id), &c.code, &c.relocs, &c.pc_map);
     dump_o1(func, &c);
     let n = relax_codegen::opt::inst_count(func) as u32;
@@ -5983,7 +5983,8 @@ fn slot_bytes(f: &relax_backend::rir::Func) -> u32 {
 pub static FRAME_SLOTS: relax_session::sync::Mutex<Vec<(u32, u32)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// MAKEPAD_RUN_CODE_SIG=<file>: one line per compiled function (its stable name -- instance type
-/// arguments included, syms::stable_fn_name --, code bytes, RIR hash + allocation signature):
+/// arguments included, syms::stable_fn_name --, ` [O3]` after it for an O3 build, code bytes,
+/// RIR hash + allocation signature):
 /// back-end refactors compare these between builds for equal output, and two runs of one
 /// program compare them for build-order independence (tools/hrcheck/fe/sigcmp.py).
 /// A slot's name in MAKEPAD_RUN_CODE_SIG output: its stable name, with the DefId of an instance (two
@@ -6003,7 +6004,7 @@ fn sig_dir() -> Option<std::ffi::OsString> {
     D.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var_os("MAKEPAD_RUN_CODE_SIG_DIR"))).clone()
 }
 
-fn code_sig(id: u32, f: &relax_backend::rir::Func, code: &[u8], alloc: u64) {
+fn code_sig(id: u32, f: &relax_backend::rir::Func, code: &[u8], alloc: u64, o3: bool) {
     static F: std::sync::OnceLock<Option<relax_session::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     if let Some(m) = F.get_or_init(|| {
         let f = std::env::var("MAKEPAD_RUN_CODE_SIG").ok().and_then(|p| std::fs::File::create(p).ok()).map(relax_session::sync::Mutex::new);
@@ -6042,10 +6043,13 @@ fn code_sig(id: u32, f: &relax_backend::rir::Func, code: &[u8], alloc: u64) {
                 i += 1;
             }
         }
-        let name = match crate::syms::unit() {
+        let mut name = match crate::syms::unit() {
             Some(u) => sig_name(u, id),
             None => f.name.clone(),
         };
+        if o3 {
+            name.push_str(" [O3]");
+        }
         // MAKEPAD_RUN_CODE_SIG_DIR=<dir>: each signed RIR too, as <dir>/<name hash>-<RIR hash>.rir (first line
         // the stable name): two runs' dirs diff function by function
         if let Some(dir) = sig_dir() {
@@ -11140,6 +11144,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let c = crate::memstat::tagged(crate::memstat::Tag::Codegen, || relax_codegen::native::compile_freq(options, &func, &env, freq.as_deref()));
         crate::memstat::note_big("codegen O3", &func.name, mps, || cg_shape(&func));
         let c = c?;
+        code_sig(id, &func, &c.code, c.alloc_sig, true);
         let mut profile_entry = None;
         if let Some(k) = &t1key {
             let bits = |f: &Option<Vec<f32>>| f.as_ref().map(|f| f.iter().map(|x| x.to_bits()).collect::<Vec<u32>>());
@@ -13040,7 +13045,7 @@ impl BackWork {
             let c = c?;
             note_frame(id, c.frame_size, slot_bytes(&cg), false);
             dump_o1(&cg, &c);
-            code_sig(id, &cg, &c.code, c.alloc_sig);
+            code_sig(id, &cg, &c.code, c.alloc_sig, false);
             if let Some(u) = crate::syms::unit() {
                 crate::syms::reloc_sig(u, || crate::syms::stable_fn_name(u, id), &c.code, &c.relocs, &c.pc_map);
             }
