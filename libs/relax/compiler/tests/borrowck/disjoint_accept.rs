@@ -78,7 +78,7 @@ fn pairs_below(v: &mut [u32]) {
     }
 }
 
-// j >= i only: checked when this runs
+// j >= i only (the `j != i` test is not a range fact): checked when this runs
 fn pairs_from(v: &mut [u32]) {
     for i in 0..v.len() {
         for j in i + 1..v.len() {
@@ -86,10 +86,12 @@ fn pairs_from(v: &mut [u32]) {
             let b = &mut v[j]; //~ PROVEN
             *b += *a;
         }
-        for j in i..i {
-            let a = &mut v[i];
-            let b = &mut v[j]; //~ CHECKED
-            *b += *a;
+        for j in i..v.len() {
+            if j != i {
+                let a = &mut v[i];
+                let b = &mut v[j]; //~ CHECKED
+                *b += *a;
+            }
         }
     }
 }
@@ -121,6 +123,6 @@ fn main() {
     assert_eq!(u, [1, 2, 4]);
     let mut w = [1, 1, 1];
     pairs_from(&mut w);
-    assert_eq!(w, [1, 2, 5]);
+    assert_eq!(w, [1, 3, 10]);
     println!("disjoint_accept ok");
 }
