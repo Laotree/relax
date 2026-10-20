@@ -620,6 +620,41 @@ mod tests {
         assert!(n.fix.is_none() && n.msg.contains("no known rewrite") && n.msg.contains("plain place"), "{}", n.msg);
     }
 
+    const PAIRS: &str = "fn a(v: &mut Vec<u32>, i: usize) {\n    let x = &mut v[i];\n    let y = &mut v[i + 1];\n    *x += *y;\n}\nfn b(v: &mut Vec<u32>, i: usize) {\n    let x = &mut v[i];\n    v.len();\n    let y = &mut v[i + 1];\n    *x += *y;\n}\nfn c(v: &mut Vec<u32>, i: usize) {\n    let x = &v[i];\n    let y = &mut v[i + 1];\n    *y += *x;\n}\nfn main() {}\n";
+
+    fn pairs_prog() -> Program {
+        let session = std::sync::Arc::new(crate::Session::default());
+        let path = std::env::temp_dir().join(format!("relax-pairs-{}-{:?}.rs", std::process::id(), std::thread::current().id()));
+        std::fs::write(&path, PAIRS).unwrap();
+        let mut prog = Program::new(&session);
+        prog.load_crate("custom", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), Vec::new()).unwrap();
+        std::fs::remove_file(path).unwrap();
+        prog
+    }
+    /// The relaxed note of a D3 acceptance of the index expressions `first`, `second` (the `nth` pair).
+    fn disjoint_note(prog: &Program, first: &str, second: &str, nth: usize, both_mut: bool) -> crate::relaxed::Note {
+        let file = (prog.files.len() - 1) as u32;
+        let span = |t: &str| { let lo = PAIRS.match_indices(t).nth(nth).unwrap().0 as u32; Span { file, lo, hi: lo + t.len() as u32 } };
+        let rec = super::super::RelaxedRecord::Disjoint(super::super::DisjointRecord { owner: crate::program::DefId(0), first: span(first), second: span(second),
+            proven: true, both_mut, code: "E0499" });
+        plan_relaxed(prog, &[rec]).pop().unwrap()
+    }
+
+    #[test]
+    fn disjoint_pairs_become_get_disjoint_mut() {
+        let prog = pairs_prog();
+        let n = disjoint_note(&prog, "v[i]", "v[i + 1]", 0, true);
+        let (_, edits) = n.fix.expect("two consecutive lets are rewritten");
+        let out = String::from_utf8(crate::relaxed::apply(PAIRS.as_bytes(), &edits).0).unwrap();
+        assert!(out.contains("fn a(v: &mut Vec<u32>, i: usize) {\n    let [x, y] = v.get_disjoint_mut([i, i + 1]).unwrap();\n    *x += *y;"), "{out}");
+        // a statement between the borrows: not rewritten (it would run before both)
+        let n = disjoint_note(&prog, "v[i]", "v[i + 1]", 1, true);
+        assert!(n.fix.is_none() && n.msg.contains("not consecutive"), "{}", n.msg);
+        // a shared borrow: get_disjoint_mut would make it mutable
+        let n = disjoint_note(&prog, "v[i]", "v[i + 1]", 2, false);
+        assert!(n.fix.is_none() && n.msg.contains("shared"), "{}", n.msg);
+    }
+
     #[test]
     fn conditional_arguments_are_not_hoisted() {
         let prog = prog();
