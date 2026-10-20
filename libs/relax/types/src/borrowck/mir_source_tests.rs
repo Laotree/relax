@@ -688,7 +688,7 @@ fn a_type_alias_prefix_of_a_path_instantiates_the_aliass_lifetimes() {
         impl<'a, 'b> Shl<&'b u32> for S<'a, 'b> { type Output = &'a u32; fn shl(self, t: &'b u32) -> &'a u32 { t } }
         pub fn f(s: S2) -> &u32 { S2::shl(s, &mut 3) }", 2015);
     assert!(unchecked.is_empty(), "{unchecked:?}");
-    assert!(errors.len() == 1 && errors[0].starts_with("E0716"), "{errors:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0515"), "{errors:?}");
 }
 
 #[test]
@@ -776,4 +776,12 @@ fn a_local_without_an_annotation_is_instantiated_by_the_coercion_of_its_initiali
         }", 2021);
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_returned_reference_to_a_local_in_an_impl_trait_function_is_e0515() {
+    let (errors, unchecked) = borrowck_source_in("
+        pub fn b(x: &u32) -> impl Sized + '_ { let y = 5u32; &y }", 2021);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0515"), "{errors:?}");
 }

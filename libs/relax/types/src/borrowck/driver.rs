@@ -379,11 +379,14 @@ fn universal_names(tcx: &Tcx, prog: &Program, p: &Prepared<'_>) -> UniversalName
         };
         names.regions.push((vid, ext));
     }
+    // The signature's types name its universal regions by their variables, as the region names are looked up.
+    let by_vid = |ty| tcx.tys.map_regions(ty, &|r, _| match uni_vid(r) { Some(v) => tcx.tys.intern_region(crate::types::RegionKind::ReVar(v as u32)), None => r }, 0);
     for (i, &ty) in p.sig.inputs.iter().enumerate() {
+        let ty = by_vid(ty);
         let span = p.mir.local_decls.get(i + 1).map_or(Span::default(), |d| d.source_info.span);
         names.inputs.push(InputInfo { ty, ty_span: span, ref_span: matches!(tcx.tys.kind(ty), crate::types::TyKind::Ref(..)).then_some(span) });
     }
-    names.output = Some(OutputInfo { ty: p.sig.output, span: p.mir.span, ref_span: None, description: "" });
+    names.output = Some(OutputInfo { ty: by_vid(p.sig.output), span: p.mir.span, ref_span: None, description: "" });
     names.def_descr = match p.owner.kind { OwnerKind::Closure(_) => "closure", OwnerKind::Function => "function", _ => "constant" };
     names.is_fn_def = matches!(p.owner.kind, OwnerKind::Function);
     names.is_const = matches!(p.owner.kind, OwnerKind::Const | OwnerKind::Static | OwnerKind::AssocConst | OwnerKind::InlineConst(_) | OwnerKind::AnonConst(_));
