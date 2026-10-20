@@ -531,11 +531,16 @@ fn a_coroutine_without_suspension_points_needs_only_its_upvars_drop_live() {
 }
 
 #[test]
-fn an_async_fn_with_a_pattern_parameter_stops_the_check_instead_of_misreporting() {
+fn an_async_fn_matches_its_parameter_patterns_inside_the_coroutine() {
     let (errors, unchecked) = borrowck_source_in("
-        pub async fn c(ref vec: Vec<u32>) { vec.contains(&0); }", 2018);
+        pub async fn c(ref vec: Vec<u32>) { vec.contains(&0); }
+        pub async fn d((a, b): (String, String), _: Vec<u8>, mut m: i32, &n: &i32) { let _ = (a, b, m, n); m += 1; }", 2018);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
-    assert!(unchecked.iter().any(|u| u.contains("async fn parameter pattern")), "{unchecked:?}");
+    let (errors, unchecked) = borrowck_source_in("pub async fn e((a, _b): (String, String)) -> &'static str { &a }", 2018);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    // (rustc says E0515 for a coroutine's borrow of its own binding that is returned; the line is the same)
+    assert!(errors.len() == 1, "{errors:?}");
 }
 
 #[test]
