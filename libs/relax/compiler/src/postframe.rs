@@ -39,6 +39,8 @@ static SERVED_BLOCKING: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// UI-thread JIT waits open now (a lazy compile, an owner request; nested ones count once each)
 static UI_WAITING: AtomicU64 = AtomicU64::new(0);
+/// wall ns the UI thread's current outermost JIT wait began
+static UI_WAIT_START: AtomicU64 = AtomicU64::new(0);
 /// wall ns the last UI-thread JIT wait ended
 static UI_WAIT_END: AtomicU64 = AtomicU64::new(0);
 /// builds ahead (speculative / prepared) finished after the first present, and running now
@@ -47,6 +49,9 @@ pub(crate) static AHEAD_RUNNING: AtomicU64 = AtomicU64::new(0);
 
 /// The UI (main) thread begins / ends a wait on the JIT (jit.rs lazy compiles, owner.rs requests).
 pub(crate) fn ui_wait_begin() {
+    if UI_WAITING.load(Relaxed) == 0 {
+        UI_WAIT_START.store(wall_ns(), Relaxed);
+    }
     UI_WAITING.fetch_add(1, Relaxed);
 }
 pub(crate) fn ui_wait_end() {
@@ -65,6 +70,15 @@ pub fn ui_idle_ns() -> u64 {
         return 0;
     }
     wall_ns().saturating_sub(UI_WAIT_END.load(Relaxed).max(fp))
+}
+
+/// How long the UI thread's current JIT wait (a lazy compile, an owner request) has lasted; 0
+/// while it does not wait. Atomics only.
+pub fn ui_wait_ns() -> u64 {
+    if UI_WAITING.load(Relaxed) == 0 {
+        return 0;
+    }
+    wall_ns().saturating_sub(UI_WAIT_START.load(Relaxed))
 }
 
 /// Functions built ahead since the first present, and those still queued or building (the
