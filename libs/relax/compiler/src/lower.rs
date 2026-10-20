@@ -8978,7 +8978,7 @@ impl<'a> Lcx<'a> {
         }
         // SPEC-V: unverified code may break the borrow rules; the callee's `noalias` code must not
         // see such arguments
-        let to_twin = self.plain_calls && matches!(callee, Callee::Fn(_)) && self.alias_prone(&args);
+        let to_twin = self.plain_calls && matches!(callee, Callee::Fn(_) | Callee::Indirect(_)) && self.alias_prone(&args);
         // C ABI calls: every aggregate goes by pointer to a private copy, an aggregate
         // result through a result slot; the backend does the C placement (CSig)
         let csig = match &callee {
@@ -9066,10 +9066,21 @@ impl<'a> Lcx<'a> {
         let callee = match callee {
             Callee::Fn(id) if to_twin => {
                 let twin = self.u.plain_twin(id);
-                if sret.is_some() && !self.f.sret_callees.contains(&twin) {
-                    self.f.sret_callees.push(twin);
+                if twin != id {
+                    self.f.plain_calls = true;
+                    if sret.is_some() && !self.f.sret_callees.contains(&twin) {
+                        self.f.sret_callees.push(twin);
+                    }
                 }
                 Callee::Fn(twin)
+            }
+            // a fn pointer or vtable entry: the address is mapped to its target's twin when the call runs
+            Callee::Indirect(target) if to_twin => {
+                let entry = self.u.syms.intern(crate::syms::SymKind::Rt("alias_entry"), crate::syms::relax_alias_entry as *const () as usize as u64);
+                let safe = self.f.vreg(Cls::I);
+                self.emit(Inst::Call(Callee::Host(entry), vec![target], vec![safe]));
+                self.f.plain_calls = true;
+                Callee::Indirect(safe)
             }
             c => c,
         };

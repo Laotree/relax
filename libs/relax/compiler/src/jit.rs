@@ -7230,6 +7230,7 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
         return Ok(());
     }
     let mut lowered = None;
+    let mut relower = false;
     {
         let u = &mut *up;
         if let Some(r) = &u.fns[id as usize].rir {
@@ -7237,13 +7238,17 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
             if !normal || !(r.baseline || to_o2) || u.fns[id as usize].building || u.fns[id as usize].inflight {
                 return Ok(());
             }
+            if r.plain_calls {
+                // SPEC-V: its aliasing-prone calls go to twins: lowered again, now as verified code
+                relower = true;
+            }
             let mut f = (**r).clone();
             // SPEC-V: the verdict is clean (checked above): the body gets its noalias facts back
             if !f.withheld_noalias.is_empty() {
                 let w = std::mem::take(&mut f.withheld_noalias);
                 f.noalias.extend(w);
             }
-            lowered = Some(f);
+            if !relower { lowered = Some(f); }
         }
         if let Some(e) = &u.fns[id as usize].build_err {
             return Err(e.to_string());
@@ -7255,7 +7260,7 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
         (&mut *up).set_rir(id, f);
         return Ok(());
     }
-    if lowered.is_none() && (&*up).fns[id as usize].rir.is_some() {
+    if lowered.is_none() && !relower && (&*up).fns[id as usize].rir.is_some() {
         return Ok(());
     }
     if let Some(e) = &(&*up).fns[id as usize].build_err {

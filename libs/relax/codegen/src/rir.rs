@@ -1032,6 +1032,9 @@ pub struct Func {
     /// SPEC-V: the `noalias` parameters of a body built without a clean borrow-check verdict
     /// (`noalias` is empty then): they come back when its verdict is clean and the body is promoted
     pub withheld_noalias: Vec<VReg>,
+    /// SPEC-V: lowered as unverified code with aliasing-prone calls sent to unverified-mode twins; the
+    /// body is lowered again when its verdict is clean
+    pub plain_calls: bool,
     /// parameters pointing to at least this many dereferenceable bytes for the whole call
     /// (rustc `dereferenceable(N)` on `&T` / `&mut T` / by-pointer aggregates): loads from
     /// them may be executed speculatively (LICM hoists them out of loops without stores)
@@ -1068,7 +1071,7 @@ pub struct Func {
 
 impl Func {
     pub fn new(name: String, file: u32) -> Func {
-        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, nonnull: Vec::new(), dyn_calls: Vec::new() }
+        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, nonnull: Vec::new(), dyn_calls: Vec::new() }
     }
     pub fn vreg(&mut self, c: Cls) -> VReg {
         self.vregs.push(c);

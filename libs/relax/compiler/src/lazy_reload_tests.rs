@@ -330,7 +330,12 @@ fn specv_aliased_call_from_unverified_body() {
     std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
     let original = "pub fn callee(a: &mut u32, b: &mut u32) -> u32 { *a = 1; *b = 2; *a }\n\
         pub fn through_raw(out: &mut u32) { let mut x = 0u32; let p = &mut x as *mut u32; *out = callee(unsafe { &mut *p }, unsafe { &mut *p }); }\n\
-        pub fn value(out: &mut u32) { *out = 11; }\n";
+        pub fn value(out: &mut u32) { *out = 11; }\n\
+        pub fn value_ptr(out: &mut u32) { *out = 11; }\n\
+        pub trait Go { fn go(&self, a: &mut u32, b: &mut u32) -> u32; }\n\
+        pub struct S;\n\
+        impl Go for S { fn go(&self, a: &mut u32, b: &mut u32) -> u32 { *a = 1; *b = 2; *a } }\n\
+        pub fn value_dyn(out: &mut u32) { *out = 11; }\n";
     std::fs::write(dir.join("app/src/lib.rs"), original).unwrap();
     std::env::set_var("MAKEPAD_RUN_LIVE_LOG", dir.join("live.jsonl"));
     let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
@@ -343,50 +348,62 @@ fn specv_aliased_call_from_unverified_body() {
         (d.krate == app_crate && prog.name(id) == name).then_some(id)
     }).unwrap();
     let (callee_def, raw_def, value_def) = (find("callee"), find("through_raw"), find("value"));
+    let (ptr_def, dyn_def) = (find("value_ptr"), find("value_dyn"));
     let mut tcx = crate::tcx::Tcx::new();
     tcx.collect(&prog);
     crate::borrowck::event::set_app_scope(roots);
     let mut u = crate::jit::Unit::new(prog, tcx, core);
     let up = &mut *u as *mut crate::jit::Unit;
+    crate::syms::set_unit(up);
     let ids = crate::owner::call(crate::owner::Class::App, || {
         let c = u.fn_id(crate::jit::FnKey::Inst(callee_def, vec![]));
         let r = u.fn_id(crate::jit::FnKey::Inst(raw_def, vec![]));
         let v = u.fn_id(crate::jit::FnKey::Inst(value_def, vec![]));
-        (c, r, v, u.entry(r), u.entry(v))
+        let p = u.fn_id(crate::jit::FnKey::Inst(ptr_def, vec![]));
+        let d = u.fn_id(crate::jit::FnKey::Inst(dyn_def, vec![]));
+        (c, r, v, u.entry(r), u.entry(v), p, d)
     });
-    let (callee, raw, value, raw_entry, value_entry) = ids;
-    let run = |entry, expected| {
+    let (callee, raw, value, raw_entry, value_entry, value_ptr, value_dyn) = ids;
+    let (ptr_entry, dyn_entry) = crate::owner::call(crate::owner::Class::App, || (u.entry(value_ptr), u.entry(value_dyn)));
+    let run = |label: &str, entry, expected| {
         let mut result = 0u32;
         unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
-        assert_eq!(result, expected);
+        assert_eq!(result, expected, "{label}");
     };
     // the checker queues the program at the first compile; wait until the originals are verified
-    run(value_entry, 11);
+    run("value", value_entry, 11);
     let t0 = std::time::Instant::now();
     loop {
         crate::borrowck::settle().recv().unwrap();
-        if [callee, raw, value].iter().all(|&i| u.verdict_clean(i)) { break; }
+        if [callee, raw, value, value_ptr, value_dyn].iter().all(|&i| u.verdict_clean(i)) { break; }
         assert!(t0.elapsed().as_secs() < 20, "the originals never got a clean verdict");
     }
     // verified code: `callee` is compiled with noalias, and a call that aliases (through raw pointers, so
     // the checker accepts it) gets the answer the noalias code computes
-    run(raw_entry, 1);
+    run("raw", raw_entry, 1);
     assert!(!u.fns[callee as usize].unverified.load(Ordering::Relaxed));
     assert!(u.plain_twin_of(callee).is_none(), "verified code does not use twins");
     // an unverified body that aliases the same way, safely written (a borrow error)
     let patched = "pub fn callee(a: &mut u32, b: &mut u32) -> u32 { *a = 1; *b = 2; *a }\n\
         pub fn through_raw(out: &mut u32) { let mut x = 0u32; let p = &mut x as *mut u32; *out = callee(unsafe { &mut *p }, unsafe { &mut *p }); }\n\
-        pub fn value(out: &mut u32) { let mut x = 0u32; *out = callee(&mut x, &mut x); }\n";
+        pub fn value(out: &mut u32) { let mut x = 0u32; *out = callee(&mut x, &mut x); }\n\
+        pub fn value_ptr(out: &mut u32) { let f: fn(&mut u32, &mut u32) -> u32 = std::hint::black_box(callee); let mut x = 0u32; *out = f(&mut x, &mut x); }\n\
+        pub trait Go { fn go(&self, a: &mut u32, b: &mut u32) -> u32; }\n\
+        pub struct S;\n\
+        impl Go for S { fn go(&self, a: &mut u32, b: &mut u32) -> u32 { *a = 1; *b = 2; *a } }\n\
+        pub fn value_dyn(out: &mut u32) { let s: &dyn Go = std::hint::black_box(&S); let mut x = 0u32; *out = s.go(&mut x, &mut x); }\n";
     let file = u.prog.def(value_def).file;
     let outcome = unsafe { crate::reload::apply(up, vec![crate::reload::Edit { file, path: app.clone(), src: patched.as_bytes().to_vec() }]) };
     assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{:?}", outcome.lines);
     assert!(u.fns[value as usize].unverified.load(Ordering::Relaxed));
-    run(value_entry, 2);
+    run("value", value_entry, 2);
+    run("ptr", ptr_entry, 2);
+    run("dyn", dyn_entry, 2);
     let twin = u.plain_twin_of(callee).expect("the aliasing call went to the callee's twin");
     assert!(u.fns[twin as usize].compiled);
     // the verdict rejects the patch: it reverts
     let mut undos = vec![outcome.undo.unwrap()];
-    let mut pending = vec![crate::reload::PendingPatch { group: outcome.group, what: "lib.rs".into(), ids: vec![value], event_seq: crate::inspect::events::last_seq() }];
+    let mut pending = vec![crate::reload::PendingPatch { group: outcome.group, what: "lib.rs".into(), ids: vec![value, value_ptr, value_dyn], event_seq: crate::inspect::events::last_seq() }];
     crate::reload::UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
     let t0 = std::time::Instant::now();
     while !pending.is_empty() && t0.elapsed().as_secs() < 20 {
@@ -394,7 +411,9 @@ fn specv_aliased_call_from_unverified_body() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert!(pending.is_empty() && undos.is_empty());
-    run(value_entry, 11);
+    run("value", value_entry, 11);
+    run("ptr", ptr_entry, 11);
+    run("dyn", dyn_entry, 11);
     // the twin is never promoted
     assert!(u.fns[twin as usize].unverified.load(Ordering::Relaxed));
     std::mem::forget(u);
