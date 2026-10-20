@@ -3071,6 +3071,28 @@ impl Tcx {
                 }
             }
             if let Some(GenericArgs::Angle(v)) = ast.gargs(last.args()) {
+                // generics.rs generic_arg_mismatch_err: a type, placeholder or constant written before a lifetime
+                // argument is provided where the lifetime parameter (they come first) was expected
+                if self.validates(prog, file) {
+                    let mut first_other: Option<&'static str> = None;
+                    for g in ast.list(*v) {
+                        match g {
+                            GenericArg::Type(t) => {
+                                let mut t = t;
+                                while let ast::Ty::Paren(inner) = ast.ty(*t) { t = inner; }
+                                first_other.get_or_insert(if matches!(ast.ty(*t), ast::Ty::Infer) { "placeholder" } else { "type" });
+                            }
+                            GenericArg::Const(_) => { first_other.get_or_insert("constant"); }
+                            GenericArg::Lifetime(_) => {
+                                if let Some(what) = first_other {
+                                    self.err(cx, prog, file, p.lo, format!("E0747: {} provided when a lifetime was expected", what));
+                                }
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 for g in ast.list(*v) {
                     let index = out.len() + declaration.as_ref().map_or(0, |(d, _)| self.inherited_arg_count(prog, *d));
                     match g {
@@ -3238,6 +3260,14 @@ impl Tcx {
     pub fn prohibit_module_args(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, module: u32, p: &ast::Path) -> bool {
         if p.segs.len() < 2 || !p.no_qself() { return false; }
         let ast = &prog.files[file as usize].ast;
+        // rustc_ast_lowering lower_qpath: parenthesized sugar belongs to the last segment of a trait path
+        if self.validates(prog, file) {
+            let segs = ast.segs(p.segs);
+            if let Some(seg) = segs[..segs.len() - 1].iter().find(|s| matches!(ast.gargs(s.args()), Some(GenericArgs::Paren(..)))) {
+                self.err(cx, prog, file, seg.name.lo, "E0214: parenthesized type parameters may only be used with a `Fn` trait".to_string());
+                return true;
+            }
+        }
         let written = |seg: &ast::PathSeg| matches!(ast.gargs(seg.args()), Some(GenericArgs::Angle(v)) if ast.list(*v).iter().any(|a| matches!(a, GenericArg::Lifetime(_) | GenericArg::Type(_) | GenericArg::Const(_))));
         let segs = ast.segs(p.segs);
         if !segs[..segs.len() - 1].iter().any(written) || !self.validates(prog, file) { return false; }

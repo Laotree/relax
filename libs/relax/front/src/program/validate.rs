@@ -39,6 +39,16 @@ impl Program {
             for (v, pos) in fvs {
                 self.check_vis_path(&mut err, ast, def, &v, pos);
             }
+            // ast_validation: a where-clause bound may quantify lifetimes in the bounded type or in the bound, not both
+            if let Some(g) = ast.kind_generics(&it.kind) {
+                for w in ast.list(g.where_) {
+                    let WherePred::Bound { hrtb, bounds, .. } = w else { continue };
+                    if ast.list(*hrtb).is_empty() { continue; }
+                    if ast.list(*bounds).iter().any(|b| matches!(b, Bound::Trait { hrtb, .. } if !ast.list(*hrtb).is_empty())) {
+                        err(it.lo, "E0316: nested quantification of lifetimes".into());
+                    }
+                }
+            }
             // `impl Trait` nested in another (E0666) and in the output of `Fn` sugar (E0562), in a fn's signature
             if let ItemKind::Fn(sig, ..) = it.kind {
                 let sig = ast.fn_sig(sig);
