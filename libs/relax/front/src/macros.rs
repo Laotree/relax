@@ -1870,9 +1870,18 @@ pub mod uses {
         if recording() { SYNTH_PENDING.with(|p| p.borrow_mut().push(off)); }
     }
 
-    /// The expansion built on this thread starts at `base` of `file`: its added parens are at `base + offset`.
-    pub fn synth_flush(file: &str, base: u32) {
-        let v = SYNTH_PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    /// Forget the parens noted so far (an expansion starts).
+    pub fn synth_clear() {
+        SYNTH_PENDING.with(|p| p.borrow_mut().clear());
+    }
+
+    /// The parens noted by the expansion just built on this thread (offsets in its text).
+    pub fn synth_take() -> Vec<u32> {
+        SYNTH_PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()))
+    }
+
+    /// The expansion starts at `base` of `file`: its added parens `v` are at `base + offset`.
+    pub fn synth_flush(file: &str, base: u32, v: Vec<u32>) {
         if v.is_empty() { return; }
         let mut g = SYNTH.lock().unwrap_or_else(|e| e.into_inner());
         let set = g.get_or_insert_with(Default::default);

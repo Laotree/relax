@@ -122,6 +122,8 @@ pub struct Parser<'a> {
     ty_frags: crate::fxhash::HashSet<u32>,
     /// starts of the `$e:expr` / `$l:literal` substitutions of expansion text (check only): the kind
     meta_frags: crate::fxhash::HashMap<u32, &'static str>,
+    /// Offsets of the parens a transcription added around multi-token `$e:expr` fragments.
+    synth_parens: crate::fxhash::HashSet<u32>,
     /// file context for built-in macros (file!, module_path!, env!, cfg of derive inputs)
     pub bctx: Option<std::rc::Rc<crate::builtins::FileCtx>>,
     /// names of the inline `mod x { }` blocks being parsed (module_path!)
@@ -208,6 +210,7 @@ impl<'a> Parser<'a> {
             frag_groups: Default::default(),
             ty_frags: Default::default(),
             meta_frags: Default::default(),
+            synth_parens: Default::default(),
             bctx: None,
             mod_stack: Vec::new(),
             scope_stack: Vec::new(),
@@ -1713,6 +1716,7 @@ impl<'a> Parser<'a> {
         let _profile = crate::load_profile::span(self.session.runtime.profile, "macro-rules-output", &def.name);
         let key = crate::parse_work::rules_key(self, def, call_lo, self.toks.at(toks.hi as usize).hi);
         let (text, rtoks, origins, bodies, groups) = if let Some(x) = crate::parse_work::get_rules(&key).filter(|_| !crate::macros::uses::recording()) { x } else {
+            if crate::macros::uses::recording() { crate::macros::uses::synth_clear(); }
             let x = crate::preload::timed_named(2, &def.name, || self.expand_rules(def, toks.lo as usize, toks.hi as usize)).map_err(|m| PErr { pos: call_lo, msg: m })?;
             crate::parse_work::put_rules(key, &x);
             x
@@ -1722,7 +1726,9 @@ impl<'a> Parser<'a> {
         }
         let base = (self.src.len() + self.ext.len()) as u32;
         if crate::macros::uses::recording() {
-            crate::macros::uses::synth_flush(self.bctx.as_ref().map_or("", |c| c.path.as_str()), base);
+            let offs = crate::macros::uses::synth_take();
+            for &off in &offs { self.synth_parens.insert(base + off); }
+            crate::macros::uses::synth_flush(self.bctx.as_ref().map_or("", |c| c.path.as_str()), base, offs);
         }
         for (off, o, n) in origins {
             self.tok_origin.push((base + off, o, n));
@@ -3779,7 +3785,7 @@ impl<'a> Parser<'a> {
         let bad = match self.meta_frags.get(&{ t.lo }) {
             Some(&"expr") => !(lit(t.kind) || (t.kind == T::Minus && lit(self.nth(1)))),
             _ if t.kind == T::OpenParen && crate::macros::uses::recording()
-                && crate::macros::uses::is_synth_paren(self.bctx.as_ref().map_or("", |c| c.path.as_str()), t.lo) => {
+                && self.synth_parens.contains(&{ t.lo }) => {
                 // the transcription's parentheses around an expression fragment of several tokens
                 let close = self.tok_close_of(self.pos, self.toks.len());
                 match close {
