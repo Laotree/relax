@@ -96,6 +96,25 @@ fn pairs_from(v: &mut [u32]) {
     }
 }
 
+// not range facts (checked when this runs): a start of x + 2 (the proof takes x + 1 only), and an x the
+// loop body assigns (the next iteration may see another value)
+fn range_traps(v: &mut [u32]) {
+    for i in 0..v.len() {
+        for j in i + 2..v.len() {
+            let a = &mut v[i];
+            let b = &mut v[j]; //~ CHECKED
+            *b += *a;
+        }
+    }
+    let mut x = 0;
+    for j in x + 1..v.len() {
+        let a = &mut v[x];
+        let b = &mut v[j]; //~ CHECKED
+        *b += *a;
+        x = 0;
+    }
+}
+
 fn main() {
     let mut v = vec![1, 2, 3];
     add_next(&mut v, 0);
@@ -124,5 +143,8 @@ fn main() {
     let mut w = [1, 1, 1];
     pairs_from(&mut w);
     assert_eq!(w, [1, 3, 10]);
+    let mut r = [1, 1, 1, 1];
+    range_traps(&mut r);
+    assert_eq!(r, [1, 2, 3, 4]);
     println!("disjoint_accept ok");
 }
