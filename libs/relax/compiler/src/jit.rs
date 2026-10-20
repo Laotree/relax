@@ -2872,7 +2872,7 @@ impl Unit {
 
     /// On a target whose libm has a combined `sincos` routine (Darwin arm64), registers it with the
     /// optimiser once the program names both `sinf` and `cosf` (or `sin` and `cos`): rustc's LLVM
-    /// calls it for a sin and a cos of the same value in one block (opt::fuse_sincos).
+    /// calls it for a sin and a cos of the same value in one block (passes::fuse_sincos).
     fn note_sincos(&self, name: &str) {
         if !cfg!(all(target_vendor = "apple", target_arch = "aarch64")) {
             return;
@@ -2935,8 +2935,8 @@ impl Unit {
     }
 
     /// Constant-load folding for the optimiser (syms.rs ro_read).
-    pub fn ro_reader(&self) -> Option<crate::opt::RoReader> {
-        Some(crate::opt::RoReader::new(crate::syms::ro_read, self as *const Unit as usize))
+    pub fn ro_reader(&self) -> Option<crate::passes::RoReader> {
+        Some(crate::passes::RoReader::new(crate::syms::ro_read, self as *const Unit as usize))
     }
 
     /// The bytes of a string literal: one copy per content (rustc allocate_bytes_dedup for
@@ -7300,7 +7300,7 @@ pub struct Prep {
     func: crate::rir::Func,
     cfg: crate::opt::OptCfg,
     callees: Vec<(u32, std::sync::Arc<crate::rir::Func>, u8)>,
-    ro: Option<crate::opt::RoReader>,
+    ro: Option<crate::passes::RoReader>,
     relayout: bool,
     name: String,
     /// inline candidates whose own optimisation is deferred to the back end (split compiles):
@@ -7617,7 +7617,7 @@ fn backend_bench_on() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *B.get_or_init(|| std::env::var_os("MAKEPAD_RUN_BACKEND_BENCH").is_some())
 }
-static BENCH_CAPTURE: relax_session::sync::Mutex<Vec<(crate::rir::Func, crate::opt::OptCfg, Option<crate::opt::RoReader>, bool)>> = relax_session::sync::Mutex::new(Vec::new());
+static BENCH_CAPTURE: relax_session::sync::Mutex<Vec<(crate::rir::Func, crate::opt::OptCfg, Option<crate::passes::RoReader>, bool)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// Replays the captured back ends `reps` times; prints the best rep's cpu ms, per 1k fns
 /// and by function size (instructions entering the pipeline).
@@ -7656,10 +7656,10 @@ pub unsafe fn backend_bench(up: *mut Unit) {
             let mut f = f0.clone();
             opt_pipeline(options, &mut f, *ro, cfg, *relayout, full, &|c| f0.nounwind_inputs.iter().find(|x| x.0 == c).is_some_and(|x| x.1));
             if cfg.fold {
-                crate::opt::addr_modes(&mut f);
+                crate::passes::addr_modes(&mut f);
             }
             if cfg.layout && *relayout {
-                crate::opt::rotate_loops(&mut f);
+                crate::passes::rotate_loops(&mut f);
             }
             let t1 = cpu_ns();
             let _ = relax_codegen::native::compile(options, &f, &env);
@@ -7890,7 +7890,7 @@ static WATCH_ROUND: AtomicU64 = AtomicU64::new(0);
 /// Lowering already produces legal RIR for both backends. Only oversized stack
 /// aggregates require rewriting here: constructing them through temporary copies
 /// can overflow application threads' stacks even before their code becomes hot.
-fn baseline_rir(options: &crate::options::Options, func: &mut crate::rir::Func, ro: Option<crate::opt::RoReader>) {
+fn baseline_rir(options: &crate::options::Options, func: &mut crate::rir::Func, ro: Option<crate::passes::RoReader>) {
     if !func.slots.iter().any(|s| s.size >= BIG_SLOT) {
         return;
     }
@@ -7900,13 +7900,13 @@ fn baseline_rir(options: &crate::options::Options, func: &mut crate::rir::Func, 
     for s in func.slots.iter_mut() {
         s.born = false;
     }
-    crate::opt::simplify(options, func, ro, true, false);
+    crate::passes::simplify(options, func, ro, true, false);
     for _ in 0..3 {
         let mut changed = crate::opt::forward_slot_dests(func);
         changed |= crate::opt::forward_slot_dests_x(options, func, BIG_SLOT);
         changed |= crate::opt::forward_slot_copies(func);
         if !changed { break; }
-        crate::opt::simplify(options, func, ro, true, false);
+        crate::passes::simplify(options, func, ro, true, false);
     }
     crate::opt::compact_slots(func);
 }
@@ -7919,12 +7919,12 @@ fn tier0_codegen_rir<'a>(options: &crate::options::Options, rir: &'a crate::rir:
     // field promotion belongs to the code made from the RIR, not to the RIR callers inline: it
     // makes a function bigger, and the inliner reads sizes
     if fold && !relax_backend::stats::opt_off(options, "-promote") { crate::opt::promote_loop_memory(&mut cg); }
-    if fold { crate::opt::addr_modes(&mut cg); }
-    if rotate && layout_for(options, &cg.name) { crate::opt::rotate_loops(&mut cg); }
+    if fold { crate::passes::addr_modes(&mut cg); }
+    if rotate && layout_for(options, &cg.name) { crate::passes::rotate_loops(&mut cg); }
     std::borrow::Cow::Owned(cg)
 }
 
-fn opt_pipeline(options: &crate::options::Options, func: &mut crate::rir::Func, ro: Option<crate::opt::RoReader>, cfg: &crate::opt::OptCfg, relayout: bool, full: bool, nounwind: &dyn Fn(u32) -> bool) {
+fn opt_pipeline(options: &crate::options::Options, func: &mut crate::rir::Func, ro: Option<crate::passes::RoReader>, cfg: &crate::opt::OptCfg, relayout: bool, full: bool, nounwind: &dyn Fn(u32) -> bool) {
     let _mem = crate::memstat::tag(crate::memstat::Tag::Opt);
     compile_watch(Some((&func.name, crate::opt::inst_count(func))));
     let mps = crate::memstat::peak_start();
@@ -7933,7 +7933,7 @@ fn opt_pipeline(options: &crate::options::Options, func: &mut crate::rir::Func, 
     compile_watch(None);
 }
 
-fn opt_pipeline_inner(options: &crate::options::Options, func: &mut crate::rir::Func, ro: Option<crate::opt::RoReader>, cfg: &crate::opt::OptCfg, relayout: bool, full: bool, nounwind: &dyn Fn(u32) -> bool) {
+fn opt_pipeline_inner(options: &crate::options::Options, func: &mut crate::rir::Func, ro: Option<crate::passes::RoReader>, cfg: &crate::opt::OptCfg, relayout: bool, full: bool, nounwind: &dyn Fn(u32) -> bool) {
     verify_pass(func, "input (lowering / inlining)");
     // MAKEPAD_RUN_DUMP_INPUT=<name suffix>: the RIR entering the optimiser
     if let Ok(w) = std::env::var("MAKEPAD_RUN_DUMP_INPUT") {
@@ -7957,16 +7957,16 @@ fn opt_pipeline_inner(options: &crate::options::Options, func: &mut crate::rir::
                 crate::opt::forward_slot_loads(func);
                 verify_pass(func, "forward_slot_loads");
             }
-            let s1 = cfg.sroa && crate::opt::sroa(func);
+            let s1 = cfg.sroa && crate::passes::sroa(func);
             relax_backend::stats::pass_time(8, t);
             verify_pass(func, "sroa");
             if s1 {
                 let t = relax_backend::stats::pass_clock();
-                crate::opt::live_dce(func);
+                crate::passes::live_dce(func);
                 relax_backend::stats::pass_time(9, t);
                 verify_pass(func, "live_dce");
             }
-            crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+            crate::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
             verify_pass(func, "simplify");
             // big values moved through temporaries (a struct literal with a large array, then
             // Box::new): build them in place, at every tier -- these frames overflow threads'
@@ -7991,7 +7991,7 @@ fn opt_pipeline_inner(options: &crate::options::Options, func: &mut crate::rir::
                 if !ch {
                     break;
                 }
-                crate::opt::simplify(options, func, ro, cfg.imm, false);
+                crate::passes::simplify(options, func, ro, cfg.imm, false);
                 verify_pass(func, "simplify");
             }
             let t = relax_backend::stats::pass_clock();
@@ -8005,54 +8005,54 @@ fn opt_pipeline_inner(options: &crate::options::Options, func: &mut crate::rir::
                 fw |= crate::opt::forward_slot_loads(func);
                 verify_pass(func, "forward_slot_loads");
             }
-            let s2 = full && pipeline_variant(options) == 1 && cfg.sroa && crate::opt::sroa(func);
+            let s2 = full && pipeline_variant(options) == 1 && cfg.sroa && crate::passes::sroa(func);
             relax_backend::stats::pass_time(8, t);
             verify_pass(func, "sroa");
             if s2 {
                 let t = relax_backend::stats::pass_clock();
-                crate::opt::live_dce(func);
+                crate::passes::live_dce(func);
                 relax_backend::stats::pass_time(9, t);
                 verify_pass(func, "live_dce");
             }
             if s2 || fw {
-                crate::opt::simplify(options, func, ro, cfg.imm, false);
+                crate::passes::simplify(options, func, ro, cfg.imm, false);
                 verify_pass(func, "simplify");
             }
             let t = relax_backend::stats::pass_clock();
-            let l = cfg.licm && crate::opt::licm(func);
+            let l = cfg.licm && crate::passes::licm(func);
             relax_backend::stats::pass_time(10, t);
             verify_pass(func, "licm");
             if l {
-                crate::opt::simplify(options, func, ro, cfg.imm, false);
+                crate::passes::simplify(options, func, ro, cfg.imm, false);
                 verify_pass(func, "simplify");
             }
         } else {
-            crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+            crate::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
             verify_pass(func, "simplify");
-            if cfg.sroa && crate::opt::sroa(func) {
+            if cfg.sroa && crate::passes::sroa(func) {
                 verify_pass(func, "sroa");
                 // the cells' entry zeros that a write always precedes are dead by liveness only
-                crate::opt::live_dce(func);
+                crate::passes::live_dce(func);
                 verify_pass(func, "live_dce");
-                crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+                crate::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
                 verify_pass(func, "simplify");
             }
-            if cfg.licm && crate::opt::licm(func) {
+            if cfg.licm && crate::passes::licm(func) {
                 verify_pass(func, "licm");
-                crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+                crate::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
                 verify_pass(func, "simplify");
             }
         }
     }
     let ts = relax_backend::stats::pass_clock();
     if cfg.fold {
-        crate::opt::sink_consts(func);
+        crate::passes::sink_consts(func);
         verify_pass(func, "sink_consts");
     }
     relax_backend::stats::pass_time(6, ts);
     let ts = relax_backend::stats::pass_clock();
     if cfg.layout && relayout {
-        crate::opt::relayout(func);
+        crate::passes::relayout(func);
         verify_pass(func, "relayout");
     }
     relax_backend::stats::pass_time(7, ts);
@@ -8907,7 +8907,7 @@ fn t1_quick_ra(options: &crate::options::Options) -> bool {
     options.t1_quick_ra
 }
 
-fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func, id: u32, name: &str, get: &dyn Fn(u32) -> Option<(*const crate::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<crate::opt::RoReader>, cfg: &crate::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &crate::rir::Func) -> Option<Vec<f32>>) -> Vec<(u32, usize)> {
+fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func, id: u32, name: &str, get: &dyn Fn(u32) -> Option<(*const crate::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<crate::passes::RoReader>, cfg: &crate::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &crate::rir::Func) -> Option<Vec<f32>>) -> Vec<(u32, usize)> {
     let _cost_opt = crate::fncost::phase(4);
     crate::fncost::size(true, func);
     func.baseline = false;
@@ -8916,7 +8916,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
     struct NocapGuard;
     impl Drop for NocapGuard {
         fn drop(&mut self) {
-            crate::opt::set_sroa_nocapture(None);
+            crate::passes::set_sroa_nocapture(None);
         }
     }
     let _guard = NocapGuard;
@@ -8947,7 +8947,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
             r
         }
         let memo: std::cell::RefCell<HashMap<(u32, usize), Option<bool>>> = std::cell::RefCell::new(HashMap::new());
-        crate::opt::set_sroa_nocapture(Some(Box::new(move |c: &crate::rir::Callee, k: usize| -> bool {
+        crate::passes::set_sroa_nocapture(Some(Box::new(move |c: &crate::rir::Callee, k: usize| -> bool {
             let crate::rir::Callee::Fn(cid) = c else { return false };
             nocap(get_static, &memo, *cid, k, 4)
         })));
@@ -8986,13 +8986,13 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
                     inlined.push((c, rule));
                 }
             }
-            crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+            crate::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
             // simplify merges the blocks a copy and its reads were split over: forward again
             for _ in 0..2 {
                 if !(cfg.sroa && (crate::opt::forward_const_slots(func, ro) | crate::opt::forward_slot_copies(func) | crate::opt::forward_slot_dests(func) | crate::opt::forward_slot_dests_x(options, func, BIG_SLOT) | crate::opt::forward_slot_loads(func))) {
                     break;
                 }
-                crate::opt::simplify(options, func, ro, cfg.imm, false);
+                crate::passes::simplify(options, func, ro, cfg.imm, false);
             }
         }
     }
@@ -9010,15 +9010,15 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
             }
             crate::opt::forward_slot_copies(func);
             crate::opt::forward_slot_loads(func);
-            crate::opt::simplify(options, func, ro, cfg.imm, false);
+            crate::passes::simplify(options, func, ro, cfg.imm, false);
         }
     }
     // array iterators (a slot read at runtime offsets): their scalar fields in registers, so
     // the iteration counter can drive full unrolling below
     if cfg.fold && cfg.sroa && crate::opt::promote_dyn_read_slots(func) {
         // the cells' entry zeros that a write always precedes are dead by liveness only
-        crate::opt::live_dce(func);
-        crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+        crate::passes::live_dce(func);
+        crate::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
     }
     // loops with a small constant trip count: fully unrolled (each copy's counter a constant);
     // a second round reaches the loop around an unrolled inner one
@@ -9026,7 +9026,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
         if !(cfg.fold && relax_codegen::loops::unroll_const_loops(options, func)) {
             break;
         }
-        crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+        crate::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
         // the original loops the copies replaced: unreachable now, emptied for the passes below
         relax_codegen::loops::clear_unreachable(func);
         // unrolled reads at constant offsets: the slots they read can now go to registers (a
@@ -9034,9 +9034,9 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
         if cfg.sroa && crate::opt::drop_unread_slot_stores(func) {
             crate::opt::forward_slot_copies(func);
         }
-        if cfg.sroa && crate::opt::sroa(func) {
-            crate::opt::live_dce(func);
-            crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+        if cfg.sroa && crate::passes::sroa(func) {
+            crate::passes::live_dce(func);
+            crate::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
         }
     }
     // iterator steps: the element pointer's accesses read the advanced cursor, one register
@@ -9049,17 +9049,17 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
     }
     // compares value ranges decide (bounds checks of masked / branch-limited indices)
     if cfg.fold && relax_codegen::ranges::fold_ranges(options, func) {
-        crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+        crate::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
     }
     // Run after both inlining rounds and before small slots share storage:
     // aggregate ABI halves and partial byte buffers still name distinct slots.
     if cfg.fold && cfg.sroa && relax_codegen::opt::promote_vector_slots(func) {
         verify_pass(func, "promote_vector_slots");
-        crate::opt::live_dce(func);
-        crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
-        if crate::opt::sroa(func) {
-            crate::opt::live_dce(func);
-            crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+        crate::passes::live_dce(func);
+        crate::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
+        if crate::passes::sroa(func) {
+            crate::passes::live_dce(func);
+            crate::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
         }
         verify_pass(func, "vector slot cleanup");
     }
@@ -9068,7 +9068,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
         verify_pass(func, "promote_loop_memory");
     }
     if cfg.layout && layout_for(options, name) {
-        crate::opt::rotate_loops(func);
+        crate::passes::rotate_loops(func);
     }
     // hot code: small counted single-block loops unrolled (rotation made them single blocks;
     // address modes then fold the copies' i + j into displacements)
@@ -9081,9 +9081,9 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
     if cfg.fold {
         // steps of an unrolled copy hang off the first value (offsets fold into address modes)
         if relax_codegen::loops::flatten_step_chains(func) {
-            crate::opt::live_dce(func);
+            crate::passes::live_dce(func);
         }
-        crate::opt::addr_modes(func);
+        crate::passes::addr_modes(func);
         // results computed early for one later use move next to it (O3)
         crate::opt::sink_single_uses(func);
     }

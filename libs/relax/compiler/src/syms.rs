@@ -431,19 +431,19 @@ pub fn set_unit(u: *mut Unit) {
     UNIT_PTR.store(u, Ordering::SeqCst);
 }
 
-/// The optimiser's constant-load reader (`opt::RoReader`): `n` bytes at symbol + offset of
+/// The optimiser's constant-load reader (`passes::RoReader`): `n` bytes at symbol + offset of
 /// the unit `ctx` points to -- the unit the function is built for (Unit::ro_reader), never a
 /// process-wide one: the proc-macro world's unit is made after the program's on a warm start,
 /// and folding the program's loads against its symbol tables (or, once the world is freed,
 /// freed memory) baked another object's bytes into the program's code (a constant slice's
 /// length read as 0; that O2 code went to the disk cache, so every later warm start ran it).
-pub fn ro_read(ctx: usize, s: Sym, n: u32) -> crate::opt::RoRead {
+pub fn ro_read(ctx: usize, s: Sym, n: u32) -> crate::passes::RoRead {
     let u = unsafe { &*(ctx as *const Unit) };
     read_obj(u, s, n)
 }
 
-pub fn read_obj(u: &Unit, s: Sym, n: u32) -> crate::opt::RoRead {
-    use crate::opt::RoRead;
+pub fn read_obj(u: &Unit, s: Sym, n: u32) -> crate::passes::RoRead {
+    use crate::passes::RoRead;
     let idx = match u.syms.obj_of(s) {
         Some(i) => i,
         None => return RoRead::No,
@@ -485,7 +485,7 @@ pub fn read_obj(u: &Unit, s: Sym, n: u32) -> crate::opt::RoRead {
 }
 
 /// A constant leaf the front end reads at compile time (lower.rs const_val and pattern tests).
-pub fn read_leaf(u: &Unit, s: Sym, m: Mem) -> crate::opt::RoRead {
+pub fn read_leaf(u: &Unit, s: Sym, m: Mem) -> crate::passes::RoRead {
     let n = match m {
         Mem::Int(n, _) => n as u32,
         Mem::F32 => 4,

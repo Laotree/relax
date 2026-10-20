@@ -1555,9 +1555,9 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
     // MAKEPAD_RUN_SANDBOX_OPT=0/1 forces the O1 clean-up.
     let opt = options.sandbox_opt.unwrap_or(!jit::TIER1_ENABLED.load(std::sync::atomic::Ordering::Relaxed));
     if opt {
-        crate::opt::simplify(options, f, None, true, true);
-        crate::opt::licm(f);
-        crate::opt::simplify(options, f, None, true, true);
+        crate::passes::simplify(options, f, None, true, true);
+        crate::passes::licm(f);
+        crate::passes::simplify(options, f, None, true, true);
         f.verify().map_err(|e| format!("{}: sandbox clean-up made invalid RIR: {}", f.name, e))?;
     }
     Ok(())

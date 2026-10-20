@@ -747,8 +747,8 @@ impl<'a> Lcx<'a> {
     fn const_ptr_val(&mut self, cs: Option<crate::rir::Sym>, off: u32) -> Option<VReg> {
         let at = cs?.plus(off as i64);
         Some(match crate::syms::read_leaf(self.u, at, Mem::Int(8, false)) {
-            crate::opt::RoRead::Ptr(p) => self.sym_val(p),
-            crate::opt::RoRead::Bytes(v) if v < 4096 => self.iconst(v as i64),
+            crate::passes::RoRead::Ptr(p) => self.sym_val(p),
+            crate::passes::RoRead::Bytes(v) if v < 4096 => self.iconst(v as i64),
             _ => {
                 let a = self.sym_val(at);
                 let d = self.f.vreg(Cls::I);
@@ -767,9 +767,9 @@ impl<'a> Lcx<'a> {
     /// pointer to its symbol; None when the bytes cannot be read as either (syms.rs).
     fn const_leaf_at(&mut self, at: crate::rir::Sym, lf: crate::layout::Leaf) -> Option<VReg> {
         match crate::syms::read_leaf(self.u, at, lf.mem) {
-            crate::opt::RoRead::Bytes(raw) => Some(self.const_leaf(raw, lf)),
-            crate::opt::RoRead::Ptr(t) => Some(self.sym_val(t)),
-            crate::opt::RoRead::No | crate::opt::RoRead::Range(_) => None,
+            crate::passes::RoRead::Bytes(raw) => Some(self.const_leaf(raw, lf)),
+            crate::passes::RoRead::Ptr(t) => Some(self.sym_val(t)),
+            crate::passes::RoRead::No | crate::passes::RoRead::Range(_) => None,
         }
     }
     fn addr_add(&mut self, base: VReg, off: i32) -> VReg {
@@ -4848,7 +4848,7 @@ impl<'a> Lcx<'a> {
                 let unsized_ = self.unsized_ty(inner);
                 let cp = unsafe { read_raw(c, Mem::Int(8, false)) };
                 let cps = cs.and_then(|s| match crate::syms::read_leaf(self.u, s, Mem::Int(8, false)) {
-                    crate::opt::RoRead::Ptr(p) => Some(p),
+                    crate::passes::RoRead::Ptr(p) => Some(p),
                     _ => None,
                 });
                 match self.kind(inner) {
