@@ -102,6 +102,7 @@ struct Req {
     /// main-thread request accounting (0: not a main-thread request): wall ns at the push, and at
     /// the owner's completion
     t_push: u64,
+    t_serve: AtomicU64,
     t_done: AtomicU64,
     /// the requester sleeps on these until Done (no thread handle: a thread's TLS destructors
     /// compile too, after std::thread::current() is gone)
@@ -346,11 +347,13 @@ fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f
         panic: Cell::new(None),
         waited: true,
         t_push: if class == Class::Main && crate::jit::MAIN_TID.load(Ordering::Relaxed) == me() { crate::jit::wall_ns().max(1) } else { 0 },
+        t_serve: AtomicU64::new(0),
         t_done: AtomicU64::new(0),
         done: Mutex::new(false),
         wake: Condvar::new(),
     };
     let behind = NOW_CLASS.load(Ordering::Relaxed);
+    let behind_from = NOW_FROM.load(Ordering::Relaxed);
     let t_req = std::time::Instant::now();
     let t0 = if main_wait { crate::jit::wall_ns() } else { 0 };
     in_call_add(1);
@@ -372,6 +375,11 @@ fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f
         let b = if w < 20_000 { 4 } else if w < 200_000 { 6 } else if w < 2_000_000 { 8 } else { 10 };
         MAIN_ACC[b].fetch_add(1, Ordering::Relaxed);
         MAIN_ACC[b + 1].fetch_add(w, Ordering::Relaxed);
+        let served = req.t_serve.load(Ordering::Relaxed);
+        if served != 0 {
+            crate::jit::main_rec_behind(served.saturating_sub(req.t_push), behind, behind_from);
+        }
+        crate::postframe::main_owner_wait(req.t_push, w);
     }
     // makepad inspect: a real-time thread (an audio callback) that waited for the compiler
     if crate::inspect::events::watched() {
@@ -432,6 +440,7 @@ pub fn post(class: Class, f: impl FnOnce() + Send + 'static) {
         panic: Cell::new(None),
         waited: false,
         t_push: 0,
+        t_serve: AtomicU64::new(0),
         t_done: AtomicU64::new(0),
         done: Mutex::new(false),
         wake: Condvar::new(),
@@ -559,6 +568,7 @@ fn serve(r: usize) {
     let t0 = crate::jit::wall_ns();
     if req.t_push != 0 {
         MAIN_ACC[2].fetch_add(t0.saturating_sub(req.t_push), Ordering::Relaxed);
+        req.t_serve.store(t0.max(1), Ordering::Relaxed);
     }
     let prev_ctx = unsafe { crate::query::swap_context(req.ctx) };
     let prev = SERVING.with(|s| s.replace((req.class, req.from)));

@@ -5161,6 +5161,15 @@ pub struct MainCompile {
     pub cpu: [u64; 3],
     /// RIR instructions entering optimisation (after the front's inlining) and entering codegen
     pub insts: [u32; 2],
+    /// the longest owner-queue wait of its requests (ns), and what the owner served when that
+    /// request was queued: class + 1 (0: idle) and requester
+    pub behind_ns: u64,
+    pub behind: u8,
+    pub behind_from: u64,
+    /// compile jobs running at its start, and the queued speculative, O2 and O3 builds (after the
+    /// first present only: postframe.rs)
+    pub jobs: u32,
+    pub queued: [u32; 3],
 }
 
 pub const MAIN_HOW_NAMES: [&str; 6] = ["done", "cache", "spec", "inflight", "split", "plain"];
@@ -5194,6 +5203,18 @@ fn main_rec(f: impl FnOnce(&mut MainCompile)) {
         f(&mut r);
         c.set(Some(r));
     }
+}
+
+/// A request of the main thread's compile waited `queue` ns in the owner's queue, queued while the
+/// owner served class `class` (u8::MAX: idle) for thread `from` (owner.rs, on the requester).
+pub(crate) fn main_rec_behind(queue: u64, class: u8, from: u64) {
+    main_rec(|r| {
+        if queue > r.behind_ns {
+            r.behind_ns = queue;
+            r.behind = if class == u8::MAX { 0 } else { class + 1 };
+            r.behind_from = from;
+        }
+    });
 }
 
 fn main_how(how: u8) {
@@ -5238,6 +5259,7 @@ unsafe fn compile_slot_on_stack(up: *mut Unit, id: u32) -> u64 {
             owner::post(owner::Class::Main, move || unsafe { realtime_reach(upn as *mut Unit, vec![id], "miss") });
         }
         let dt = wall_ns() - t;
+        crate::postframe::rt_compile(t, dt);
         let n = RT_LAZY.fetch_add(1, Ordering::Relaxed);
         RT_LAZY_NS.fetch_add(dt, Ordering::Relaxed);
         // the first few and every long stall by name; the total at exit (run.rs summary)
@@ -5258,12 +5280,19 @@ unsafe fn compile_slot_on_stack_rt(up: *mut Unit, id: u32) -> u64 {
     relax_codegen::fncost::event("call", id);
     let on_main = MAIN_TID.load(Ordering::Relaxed) == me() && !owner::is_owner();
     if on_main {
-        MAIN_REC.with(|c| c.set(Some(MainCompile { start: wall_ns(), slot: id, how: u8::MAX, ..Default::default() })));
+        let mut rec = MainCompile { start: wall_ns(), slot: id, how: u8::MAX, ..Default::default() };
+        if FIRST_PRESENT.load(Ordering::Relaxed) {
+            rec.jobs = BG_ACTIVE.load(Ordering::Relaxed);
+            let len = |n: Option<usize>| n.map_or(u32::MAX, |n| n as u32);
+            rec.queued = [len(SPEC_Q.try_lock().ok().map(|q| q.len())), len(O2_QUEUE.try_lock().ok().map(|q| q.len())), len(TIER_QUEUE.try_lock().ok().map(|q| q.len()))];
+        }
+        MAIN_REC.with(|c| c.set(Some(rec)));
     }
     let r = compile_slot_on_stack_inner(up, id);
     if on_main {
         if let Some(mut rec) = MAIN_REC.with(|c| c.take()) {
             rec.end = wall_ns();
+            crate::postframe::main_compile(&(&*up).fns[id as usize].name, &rec);
             MAIN_COMPILES.lock().unwrap().push(rec);
         }
     }
@@ -12603,6 +12632,7 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"fork" => Some(relax_fork as *const () as usize),
         b"relax_allocator_swap" => Some(relax_allocator_swap as *const () as usize),
         b"relax_first_present" => Some(relax_first_present as *const () as usize),
+        b"relax_frame_done" => Some(crate::postframe::relax_frame_done as *const () as usize),
         b"relax_quit_requested" => Some(crate::run::relax_quit_requested as *const () as usize),
         b"__relax_guard_enter" => Some(__relax_guard_enter as *const () as usize),
         b"__relax_guard_leave" => Some(__relax_guard_leave as *const () as usize),
