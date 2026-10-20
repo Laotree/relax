@@ -82,6 +82,11 @@ pub fn adt_dtorck_constraint(tcx: &Tcx, prog: &Program, def: DefId, limit: usize
         return DropckConstraint { outlives: vec![], dtorck_types: vec![t], overflows: vec![] };
     }
     let mut result = DropckConstraint::default();
+    // (rustc's Box owns its `T` through `Unique<T>`'s `PhantomData<T>` marker; Relax's Box holds
+    // only a `NonNull<T>`, so the owned `T` is the Box's dtorck type itself)
+    if adt.is_box() {
+        if let Some(GenericArg::Type(t)) = identity.iter().copied().find(|a| matches!(a, GenericArg::Type(_))) { result.dtorck_types.push(t); }
+    }
     for variant in &adt.variants {
         for field in &variant.fields { dtorck_constraint_for_ty_inner(tcx, prog, limit, 0, field.ty, &mut result); }
     }
