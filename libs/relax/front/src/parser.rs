@@ -1884,12 +1884,17 @@ impl<'a> Parser<'a> {
             }
             T::KwExtern if self.nth(1) == T::KwCrate => {
                 self.pos += 2;
+                let is_self = self.kind() == T::KwSelfValue;
                 name = if self.eat(T::KwSelfValue) {
                     Ident { lo: self.prev_hi() - 4, hi: self.prev_hi() }
                 } else {
                     self.ident_tok()?
                 };
                 let rename = if self.eat(T::KwAs) { Some(self.ident_or_underscore()?) } else { None };
+                // rustc_ast_passes ast_validation: `extern crate self;` names nothing without `as`
+                if is_self && rename.is_none() && (name.lo as usize) < self.src.len() {
+                    return self.err("`extern crate self;` requires renaming");
+                }
                 self.expect(T::Semi)?;
                 ItemKind::ExternCrate(rename)
             }

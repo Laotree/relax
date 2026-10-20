@@ -943,6 +943,15 @@ pub fn attribute_safety(prog: &Program, d: DefId) -> Vec<String> {
         if from_source && name == b"macro_use" && hi > lo + 1 && crate::cfg::tok_str(p, lo + 1) == b"(" && !matches!(ast.item(def.item).kind, crate::ast::ItemKind::ExternCrate(_)) {
             errors.push(prog.record_uncoded_error(def.file, pos, "typeck", "arguments to `macro_use` are not allowed here".to_string()));
         }
+        // check_attr.rs check_instruction_set: `arm::*` instruction sets are for the arm targets
+        if from_source && name == b"instruction_set" && hi > first + 2 && crate::cfg::tok_str(p, first + 1) == b"(" && crate::cfg::tok_str(p, first + 2) == b"arm" {
+            let target = &prog.session.options.target;
+            let arch = if target.is_empty() { std::env::consts::ARCH } else { target.split('-').next().unwrap_or("") };
+            if !arch.starts_with("arm") && arch != "thumbv7em" {
+                let triple = if target.is_empty() { format!("{}-unknown-{}-gnu", arch, std::env::consts::OS) } else { target.clone() };
+                errors.push(prog.record_uncoded_error(def.file, pos, "typeck", format!("target `{}` does not support `#[instruction_set(arm::*)]`", triple)));
+            }
+        }
         if from_source && name == b"export_name" && hi > first + 2 && crate::cfg::tok_str(p, first + 1) == b"=" {
             if let Some(v) = crate::lint_early::string_value(crate::cfg::tok_str(p, first + 2)) {
                 if v.contains('\0') {

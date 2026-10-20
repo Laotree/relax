@@ -3248,7 +3248,10 @@ impl Tcx {
         if let ast::Ty::Path(p) = ast.ty(t) {
             if p.no_qself() && p.segs.len() == 1 && prog.files[file as usize].ast.segs(p.segs)[0].args().is_none() {
                 let name = prog.syms.get(prog.files[file as usize].text(prog.files[file as usize].ast.segs(p.segs)[0].name)).unwrap_or(u32::MAX);
-                for &(index, _, _) in &env.consts {
+                // late.rs: a name that is a type in scope is a type argument, whatever const parameter shares it
+                let type_item = prog.lookup_in_scope(module, name, true).is_some()
+                    && !env.names.iter().enumerate().any(|(i, n)| *n == name && !env.consts.iter().any(|c| c.0 as usize == i));
+                for &(index, _, _) in env.consts.iter().filter(|_| !type_item) {
                     if env.names.get(index as usize) == Some(&name) {
                         let ct = self.tys.intern_const(crate::consts::ConstKind::Param(crate::consts::ParamConst { index }));
                         return self.tys.intern(TyKind::Const(ct));

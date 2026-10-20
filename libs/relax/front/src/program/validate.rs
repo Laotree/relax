@@ -39,6 +39,22 @@ impl Program {
             for (v, pos) in fvs {
                 self.check_vis_path(&mut err, ast, def, &v, pos);
             }
+            // check_attr: attributes with a fixed list of targets (rustc_attr_parsing AllowedTargets) are not for generic parameters
+            if let Some(g) = ast.kind_generics(&it.kind) {
+                for gp in ast.list(g.params) {
+                    for a in ast.list(gp.attrs) {
+                        if a.toks.hi <= a.toks.lo || f.tok(a.toks.lo).lo >= f.src_len { continue; }
+                        let name = f.tok_text(a.toks.lo);
+                        let what = match gp.kind { GenericParamKind::Lifetime(_) => "lifetime parameters", GenericParamKind::Type(..) => "type parameters", GenericParamKind::Const(..) => "const parameters" };
+                        match name {
+                            "inline" | "cold" | "track_caller" | "no_mangle" | "export_name" | "used" | "target_feature" | "link_name" | "link_section" | "naked" | "non_exhaustive" =>
+                                err(f.tok(a.toks.lo).lo, format!("`#[{}]` attribute cannot be used on {}", name, what)),
+                            "repr" => err(f.tok(a.toks.lo).lo, "E0517: attribute should be applied to a struct, enum, or union".into()),
+                            _ => {}
+                        }
+                    }
+                }
+            }
             // ast_validation: a where-clause bound may quantify lifetimes in the bounded type or in the bound, not both
             if let Some(g) = ast.kind_generics(&it.kind) {
                 for w in ast.list(g.where_) {
@@ -47,6 +63,12 @@ impl Program {
                     if ast.list(*bounds).iter().any(|b| matches!(b, Bound::Trait { hrtb, .. } if !ast.list(*hrtb).is_empty())) {
                         err(it.lo, "E0316: nested quantification of lifetimes".into());
                     }
+                }
+            }
+            // ast_validation check_fn_decl / the limit on parameters of a function
+            if let ItemKind::Fn(sig, ..) = it.kind {
+                if ast.list(ast.fn_sig(sig).params).len() > 65535 {
+                    err(it.lo, "function can not have more than 65535 arguments".into());
                 }
             }
             // `impl Trait` nested in another (E0666) and in the output of `Fn` sugar (E0562), in a fn's signature
