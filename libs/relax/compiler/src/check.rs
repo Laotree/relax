@@ -806,13 +806,12 @@ fn mono_check(up: *mut Unit, own: &[bool], root: u32) {
                 let def = u.prog.def(d);
                 let pos = u.prog.files[def.file as usize].ast.item(def.item).lo;
                 let name = u.fns[id as usize].name.clone();
-                let msg = u.prog.record_error(def.file, pos, "mono", format!("reached the recursion limit while instantiating `{}`", name));
+                let msg = u.prog.record_uncoded_error(def.file, pos, "mono", format!("reached the recursion limit while instantiating `{}`", name));
                 unsafe { (&mut *up).errors.push(msg); }
                 continue;
             }
         }
         let callees = crate::owner::call(crate::owner::Class::App, || unsafe {
-            let u = &*up;
             if !mine { return Vec::new(); }
             // (a fn taking or returning a value of hundreds of MB is not lowered: its frame would
             // be allocated for real)
@@ -843,6 +842,18 @@ fn mono_check(up: *mut Unit, own: &[bool], root: u32) {
             })).unwrap_or(true);
             if huge { return Vec::new(); }
             let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| jit::build_rir(up, id)));
+            // (the lowering's own limit on how deep the type arguments of an instance may nest is the same one)
+            if let Ok(Err(msg)) = &built {
+                if msg.starts_with("reached the recursion limit while instantiating") {
+                    let u = &mut *up;
+                    if let FnKey::Inst(d, _) = &u.fns[id as usize].key {
+                        let def = u.prog.def(*d);
+                        let pos = u.prog.files[def.file as usize].ast.item(def.item).lo;
+                        let msg = u.prog.record_uncoded_error(def.file, pos, "mono", msg.clone());
+                        u.errors.push(msg);
+                    }
+                }
+            }
             if !matches!(built, Ok(Ok(()))) { return Vec::new(); }
             let mut out = Vec::new();
             if let Some(f) = &(&*up).fns[id as usize].rir {
