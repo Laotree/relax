@@ -375,6 +375,16 @@ impl Partial {
     }
 }
 
+pub fn diag_raw(tag: &[u8], v: usize) {
+    extern "C" { fn write(fd: i32, b: *const u8, n: usize) -> isize; }
+    let mut buf = [0u8; 80];
+    let mut n = 0;
+    for &c in tag { buf[n] = c; n += 1; }
+    for i in (0..8).rev() { let d = ((v >> (4 * i)) & 15) as u8; buf[n] = if d < 10 { b'0' + d } else { b'a' + d - 10 }; n += 1; }
+    buf[n] = b'\n'; n += 1;
+    unsafe { write(2, buf.as_ptr(), n); }
+}
+
 /// Granule of the page release: a multiple of every OS page size in use (4 KB, 16 KB).
 const GRANULE: usize = 16 << 10;
 
@@ -1451,6 +1461,7 @@ impl Arena {
             }
             let address = base + index * CHUNK;
             event(E_DECOMMIT);
+            diag_raw(b"DESTROY chunk ", index);
             // zeroing form: the range never reads old bytes again, whoever maps it later
             if !unsafe { os::decommit(address as *mut u8, s.committed, true) } {
                 lowest = lowest.min(s.epoch);
