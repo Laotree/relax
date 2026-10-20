@@ -2007,6 +2007,12 @@ impl<'a> Gen<'a> {
             self.a.alu_rr(0x85, r, r);
             return;
         }
+        if k as i32 as i64 != k {
+            // no 64-bit immediate form: compare against the value in the scratch register
+            self.a.mov_ri(R11, k);
+            self.a.alu_rr(0x39, r, R11);
+            return;
+        }
         self.a.rex(true, 0, 0, r, false);
         if (-128..128).contains(&k) {
             self.a.byte(0x83);
