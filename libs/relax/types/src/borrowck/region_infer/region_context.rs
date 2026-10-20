@@ -106,7 +106,11 @@ impl RegionInferenceContext {
                 })
             }
             VerifyBound::IsEmpty => self.scc_values.elements_contained_in(self.constraint_sccs.scc(lower)).next().is_none(),
-            VerifyBound::OutlivedBy(r) => self.eval_outlives(*r, lower),
+            VerifyBound::OutlivedBy(r) => {
+                let nvars = self.constraint_sccs.num_vars();
+                assert!(*r < nvars && lower < nvars, "OutlivedBy verify bound: bound region {r} lower {lower} of {nvars} region variables; generic_ty {generic_ty:?}");
+                self.eval_outlives(*r, lower)
+            }
             VerifyBound::AnyBound(bs) => bs.iter().any(|b| self.eval_verify_bound(tcx,prog,generic_ty,lower,b)),
             VerifyBound::AllBounds(bs) => bs.iter().all(|b| self.eval_verify_bound(tcx,prog,generic_ty,lower,b)),
         }
