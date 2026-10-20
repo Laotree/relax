@@ -177,6 +177,9 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
     }
 
     fn add_type_test(&mut self, type_test: TypeTest) {
+        fn max_vid(b: &VerifyBound) -> usize { match b { VerifyBound::OutlivedBy(r) => *r, VerifyBound::AnyBound(v) | VerifyBound::AllBounds(v) => v.iter().map(max_vid).max().unwrap_or(0), _ => 0 } }
+        let n = self.infcx.num_region_vars();
+        assert!(max_vid(&type_test.verify_bound) < n && type_test.lower_bound < n, "type test over region variables beyond the context's {n}: lower {} bound {}", type_test.lower_bound, max_vid(&type_test.verify_bound));
         self.constraints.type_tests.push(type_test);
     }
 }
