@@ -232,7 +232,11 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
     }
     fn relate_opaque(&mut self, out: &mut MirTypeckRegionConstraints, a: TyId, variance: V, b: TyId, locations: Locations, category: ConstraintCategory) -> Result<(), NoSolution> {
         let env = self.param_env_id();
-        self.fully_perform_op(out, locations, category, CustomTypeOp::new(|ocx: &mut crate::next_solver::fulfill::ObligationCtxt<'_, '_>| {
+        // The regions relating the value to the opaque's hidden type are the opaque type's constraints (rustc
+        // adds them when it equates each use with the final hidden type, `ConstraintCategory::OpaqueType`),
+        // not those of the assignment that defines it (a returned value is `Return`, not the hidden type).
+        let _ = category;
+        self.fully_perform_op(out, locations, ConstraintCategory::OpaqueType, CustomTypeOp::new(|ocx: &mut crate::next_solver::fulfill::ObligationCtxt<'_, '_>| {
             let goals = ocx.infcx.at(ocx.prog, env).relate(a, variance, b).map_err(|_| NoSolution)?;
             ocx.register_obligations(goals); Ok(())
         }))

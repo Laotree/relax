@@ -796,6 +796,16 @@ fn a_local_without_an_annotation_is_instantiated_by_the_coercion_of_its_initiali
 }
 
 #[test]
+fn a_reference_to_a_local_returned_as_an_opaque_type_names_the_universal_region() {
+    // The argument's region is named (`'1`), so the borrow is explained by the opaque type's constraint:
+    // E0597 "opaque type requires that `y` is borrowed for `'1`" (regions/do-not-suggest-adding-bound-to-opaque-type).
+    let (errors, unchecked) = borrowck_source_in("
+        pub fn b(x: &u32) -> impl Sized + '_ { let y = 5u32; &y }", 2021);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0597") && errors[0].contains("opaque type requires that `y` is borrowed for `'1`"), "{errors:?}");
+}
+
+#[test]
 fn an_async_closure_returned_as_a_trait_object_references_a_local() {
     // `(async || x)()` borrows `x` through a coroutine-closure, which is neither a closure nor a coroutine
     // for the E0373 explanation: the error is E0515.
@@ -832,16 +842,24 @@ fn calling_a_function_that_returns_an_opaque_type_is_no_defining_use() {
 }
 
 #[test]
+fn a_closure_stored_in_a_local_then_returned_as_an_opaque_type_is_e0597() {
+    // The returned value reaches the opaque type through the assignment to the local (category `Assignment`,
+    // "assignment requires that `p` is borrowed for `'static`"): no E0373 (closures/2229_closure_analysis/
+    // diagnostics/borrowck/borrowck-4.rs). Normalizing a place type does not define the opaque type.
+    let (errors, unchecked) = borrowck_source_in("
+        #[derive(Debug)] struct Point { x: i32, y: i32 }
+        pub fn foo() -> impl FnMut() {
+            let mut p = Point { x: 1, y: 2 };
+            let mut c = || { p.x += 5; println!(\"{:?}\", p); };
+            c
+        }", 2021);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0597"), "{errors:?}");
+}
+
+#[test]
 fn an_ambiguous_subtype_predicate_is_a_type_annotation_error() {
     // type/type-check/cannot_infer_local_or_array.rs: the local's variable is related to the array type's.
     let errors = typeck_errors_source("pub fn main() { let x = []; }", 2021);
     assert!(errors.iter().any(|e| e.contains("E0282")) && !errors.iter().any(|e| e.contains("E0283")), "{errors:?}");
-}
-
-#[test]
-fn a_returned_reference_to_a_local_in_an_impl_trait_function_is_e0515() {
-    let (errors, unchecked) = borrowck_source_in("
-        pub fn b(x: &u32) -> impl Sized + '_ { let y = 5u32; &y }", 2021);
-    assert!(unchecked.is_empty(), "{unchecked:?}");
-    assert!(errors.len() == 1 && errors[0].starts_with("E0515"), "{errors:?}");
 }
