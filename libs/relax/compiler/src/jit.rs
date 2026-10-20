@@ -2024,6 +2024,15 @@ rt_fn! {
     }
 }
 
+/// (exec, data, rw, syms, end) bases of the program unit's reservation (diagnostics: inspect memory).
+pub(crate) fn unit_areas() -> Option<[u64; 5]> {
+    unsafe {
+        if UNIT.is_null() { return None; }
+        let u = &*UNIT;
+        Some([u.exec_base, u.ro_base, u.rw_end - UNIT_RW_SIZE, u.syms.dom0(), u.rw_end + (crate::syms::SYM_CAP * 8) as u64])
+    }
+}
+
 /// Is `pc` in the unit's code memory (functions, stubs, glue)? Lock-free: the bounds are fixed
 /// once the unit exists (os::fault's Windows handler asks before anything else).
 pub(crate) fn in_jit_code(pc: u64) -> bool {
@@ -8857,11 +8866,8 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
     // later wider loads of narrower stores otherwise fail store forwarding (layout_widgets)
     if cfg.sroa && !crate::opt::opt_off(options, "-postinline") {
         for _ in 0..3 {
-            // forward_slot_dests_x(options, func, 32) is off here: it merged a by-value parameter
-            // copy into the result buffer while that copy was still read after the first payload
-            // write (O3 Result<&T,E>::cloned; tweaker build.rs crashed, coord.md 2026-10-08
-            // 08:10). backend2 re-enables it with a fixed interference check.
-            let ch = crate::opt::forward_slot_dests(func);
+            let ch = crate::opt::forward_slot_dests(func) | crate::opt::forward_slot_dests_x(options, func, 32);
+            let ch = ch | crate::opt::split_wide_slot_accesses(func);
             let ch = ch | crate::opt::sroa_post_inline(func);
             if !ch {
                 break;
@@ -11311,6 +11317,8 @@ extern "C" fn relax_first_present() {
             eprintln!("makepad-run O2 at first present: {} installed ({:.1} ms worker cpu), {} dropped; main thread waited {:.2} ms in {} unit-lock waits on the O2 worker; {} baseline slots sampled (queued)", n(0), n(1) as f64 / 1e6, n(2), n(3) as f64 / 1e6, n(4), hit);
         }
         crate::warm::first_present();
+        // the boot's crate records and front graph (cold front end: queued, not written, at load)
+        crate::cache::start_deferred_front();
         if let Some(t) = STARTUP_THREAD.get() {
             t.unpark();
         }
