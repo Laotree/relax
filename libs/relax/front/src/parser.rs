@@ -2757,6 +2757,10 @@ impl<'a> Parser<'a> {
             return Ok(Bound::Use(args));
         }
         let paren = self.eat(T::OpenParen);
+        // rustc_parse parse_trait_bound: the binder, then the modifiers (`for<'a> ?Tr` is an error, as is a
+        // binder after the modifiers)
+        let binder = self.kind() == T::KwFor && self.nth(1) == T::Lt;
+        let hrtb = self.hrtb()?;
         let mut konst = false;
         if self.kind() == T::Tilde && self.nth(1) == T::KwConst {
             self.pos += 2;
@@ -2767,7 +2771,13 @@ impl<'a> Parser<'a> {
         }
         let async_ = self.eat(T::KwAsync);
         let maybe = self.eat(T::Question);
-        let hrtb = self.hrtb()?;
+        if binder && maybe {
+            return self.err("`for<...>` binder not allowed with `?` trait polarity modifier");
+        }
+        if self.kind() == T::KwFor && self.nth(1) == T::Lt {
+            let _ = self.hrtb()?;
+            return self.err("`for<...>` binder should be placed before trait bound modifiers");
+        }
         if !self.ty_frags.is_empty() && self.ty_frags.contains(&{ self.tok().lo }) {
             return self.err("expected a trait, found type");
         }

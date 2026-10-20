@@ -755,6 +755,35 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
                     }
                 }
                 {
+                    // `#[link_ordinal(N)]`: N fits 16 bits, and the block links as `raw-dylib`
+                    let sp = prog.src(file);
+                    for a in ast.list(ast.item(it).attrs) {
+                        let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+                        if hi > lo + 3 && crate::cfg::tok_str(sp, lo) == b"link_ordinal" && crate::cfg::tok_str(sp, lo + 1) == b"(" {
+                            let n = crate::cfg::tok_str(sp, lo + 2);
+                            if std::str::from_utf8(n).ok().and_then(|n| n.replace('_', "").parse::<u128>().ok()).is_some_and(|v| v > u16::MAX as u128) {
+                                errors.push(prog.record_uncoded_error(file, sp.tok(lo).lo, "typeck", format!("ordinal value in `link_ordinal` is too large: `{}`", String::from_utf8_lossy(n))));
+                                continue;
+                            }
+                            // a block with `#[link(..)]` whose kind is not raw-dylib
+                            let mut linked = false;
+                            let mut raw = false;
+                            for b in &attrs {
+                                let (blo, bhi) = (b.toks.lo as usize, b.toks.hi as usize);
+                                if bhi > blo + 1 && crate::cfg::tok_str(sp, blo) == b"link" && crate::cfg::tok_str(sp, blo + 1) == b"(" {
+                                    linked = true;
+                                    for k in blo..bhi.saturating_sub(2) {
+                                        if crate::cfg::tok_str(sp, k) == b"kind" && crate::cfg::tok_str(sp, k + 2) == b"\"raw-dylib\"" { raw = true; }
+                                    }
+                                }
+                            }
+                            if linked && !raw {
+                                errors.push(prog.record_uncoded_error(file, sp.tok(lo).lo, "typeck", "`#[link_ordinal]` is only supported if link kind is `raw-dylib`".to_string()));
+                            }
+                        }
+                    }
+                }
+                {
                     // `#[track_caller]` on an item of a block whose ABI is not "Rust" (E0737)
                     let abi = fm.abi.map_or("C".to_string(), |a| crate::lit::unescape_str(pf.text(a)));
                     let sp = prog.src(file);
@@ -1023,6 +1052,12 @@ pub fn repr_checks(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
             if name == b")" { break; }
             if name == b"," { i += 1; continue; }
             let hpos = p.tok(i).lo;
+            // a literal where a hint belongs (`repr("C")`)
+            if matches!(p.tok(i).kind, crate::lexer::T::Str | crate::lexer::T::RawStr | crate::lexer::T::Int | crate::lexer::T::Float | crate::lexer::T::Char) {
+                err(hpos, "E0565: meta item in `repr` must be an identifier".to_string());
+                i += 1;
+                continue;
+            }
             i += 1;
             // the hint's argument: `(..)` or `= ..`
             let mut args: Vec<&[u8]> = Vec::new();
@@ -1305,7 +1340,7 @@ pub fn attribute_shapes(prog: &Program, d: DefId) -> Vec<String> {
         let first = if crate::cfg::tok_str(p, lo) == b"unsafe" && hi > lo + 2 && crate::cfg::tok_str(p, lo + 1) == b"(" { lo + 2 } else { lo };
         let name = crate::cfg::tok_str(p, first).to_vec();
         let name_str = String::from_utf8_lossy(&name).into_owned();
-        if !matches!(name.as_slice(), b"inline" | b"must_use" | b"deprecated" | b"link_name" | b"link_ordinal" | b"link") { continue; }
+        if !matches!(name.as_slice(), b"inline" | b"must_use" | b"deprecated" | b"link_name" | b"link_ordinal" | b"link" | b"derive") { continue; }
         let pos = p.tok(lo).lo;
         let end = if first > lo { hi.saturating_sub(1) } else { hi };
         let next = if first + 1 < end { crate::cfg::tok_str(p, first + 1) } else { b"" };
@@ -1330,6 +1365,14 @@ pub fn attribute_shapes(prog: &Program, d: DefId) -> Vec<String> {
         let is_str = |i: usize| p.tok(i).kind == crate::lexer::T::Str || p.tok(i).kind == crate::lexer::T::RawStr;
         let mut bad = |code: &str| errors.push(prog.record_error(def.file, pos, "typeck", format!("{}: malformed `{}` attribute input", code, name_str)));
         match name.as_slice() {
+            // rustc_builtin_macros derive.rs: each entry is a path to a trait
+            b"derive" => {
+                for arg in &args {
+                    if arg.len() == 1 && matches!(p.tok(arg[0]).kind, crate::lexer::T::Str | crate::lexer::T::RawStr | crate::lexer::T::Int | crate::lexer::T::Float | crate::lexer::T::Char | crate::lexer::T::Byte | crate::lexer::T::ByteStr | crate::lexer::T::KwTrue | crate::lexer::T::KwFalse) {
+                        errors.push(prog.record_error(def.file, p.tok(arg[0]).lo, "typeck", "E0777: expected path to a trait, found literal".to_string()));
+                    }
+                }
+            }
             b"inline" => {
                 if list {
                     if args.len() != 1 { bad("E0805"); }
@@ -1441,6 +1484,58 @@ pub fn precise_capture_params(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String
                 "`impl Trait` must mention all type parameters in scope in `use<...>`"
             };
             errors.push(prog.record_uncoded_error(def.file, ast.item(def.item).lo, "typeck", msg.to_string()));
+        }
+    }
+    errors
+}
+
+/// rustc_builtin_macros global_allocator.rs / rustc_metadata allocator.rs / rustc_passes weak_lang_items.rs /
+/// check_attr.rs: `#[global_allocator]` is for statics and there is one per program; a `#[panic_handler]` of a
+/// crate that links `std` duplicates `std`'s; `#[no_mangle]` is not for the language items.
+pub fn global_allocators_and_lang_items(prog: &Program, own: &[bool]) -> Vec<String> {
+    use crate::program::DefKind as K;
+    let mut errors = Vec::new();
+    let mut allocators = 0usize;
+    for i in 0..prog.defs.len() {
+        let d = DefId(i as u32);
+        let def = prog.def(d);
+        if !own.get(def.krate as usize).copied().unwrap_or(false) || !matches!(def.kind, K::Fn | K::AssocFn | K::Static | K::Const | K::Struct | K::Enum | K::Impl | K::TypeAlias | K::Trait) { continue; }
+        if prog.item_defs.get(&(def.file, def.item.0)) != Some(&d) { continue; }
+        let pf = &prog.files[def.file as usize];
+        let ast = &pf.ast;
+        let p = prog.src(def.file);
+        let item = ast.item(def.item);
+        let (mut allocator, mut panic_handler, mut no_mangle) = (None, None, None);
+        for a in ast.list(item.attrs) {
+            let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+            if hi <= lo || (p.tok(lo).lo as usize) >= pf.src_len as usize { continue; }
+            let first = if crate::cfg::tok_str(p, lo) == b"unsafe" && hi > lo + 2 { lo + 2 } else { lo };
+            match crate::cfg::tok_str(p, first) {
+                b"global_allocator" => allocator = Some(p.tok(lo).lo),
+                b"panic_handler" => panic_handler = Some(p.tok(lo).lo),
+                b"no_mangle" => no_mangle = Some(p.tok(lo).lo),
+                _ => {}
+            }
+        }
+        if allocator.is_some() {
+            if def.kind != K::Static {
+                errors.push(prog.record_uncoded_error(def.file, item.lo, "typeck", "allocators must be statics".to_string()));
+            } else {
+                allocators += 1;
+                if allocators > 1 {
+                    errors.push(prog.record_uncoded_error(def.file, item.lo, "typeck", "cannot define multiple global allocators".to_string()));
+                }
+            }
+        }
+        if panic_handler.is_some() {
+            let root_file = prog.mods[prog.crates[def.krate as usize].root_mod as usize].file;
+            let no_std = prog.files[root_file as usize].ast.root_attrs.iter().any(|a| a.toks.hi > a.toks.lo && prog.files[root_file as usize].tok_text(a.toks.lo) == "no_std");
+            if !no_std {
+                errors.push(prog.record_error(def.file, item.lo, "typeck", "E0152: found duplicate lang item `panic_impl`".to_string()));
+            }
+            if let Some(nm) = no_mangle {
+                errors.push(prog.record_uncoded_error(def.file, nm, "typeck", "`#[no_mangle]` cannot be used on internal language items".to_string()));
+            }
         }
     }
     errors
