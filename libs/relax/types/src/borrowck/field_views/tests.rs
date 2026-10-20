@@ -258,10 +258,10 @@ fn extended_two_phase_borrows_accept_a_reborrow_before_the_call() {
     };
     let r = run(true);
     assert!(r.errors.is_empty(), "{:?}", r.errors);
-    // the reservation of the argument, and its activation at the inner call
-    assert_eq!(r.fv_only.len(), 2, "{:?}", r.fv_only);
+    // the reservation of the argument; its activation at the inner call is the same finding
+    assert_eq!(r.fv_only.len(), 1, "{:?}", r.fv_only);
     assert!(r.fv_only.iter().all(|e| matches!(e.fv.as_deref(), Some(crate::borrowck::borrowck_errors::FvNote::TwoPhase { .. }))));
-    assert_eq!(r.fv_records.len(), 2);
+    assert_eq!(r.fv_records.len(), 1);
     let hoist = r.fv_records[0].hoist.as_ref().expect("the argument is hoisted");
     assert_eq!(hoist, &vec![Span { file: 0, lo: 12, hi: 14 }]);
     assert_eq!(r.fv_records[0].span, Span { file: 0, lo: 16, hi: 40 });
