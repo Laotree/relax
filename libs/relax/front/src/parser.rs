@@ -3637,7 +3637,9 @@ impl<'a> Parser<'a> {
         // attributes on expressions
         if self.kind() == T::Pound {
             let at = self.tok().lo;
-            if !self.outer_attrs()?.is_empty() { self.ast.gated_syntax.push(("stmt_expr_attributes", at)); }
+            // (rustc gates these when the expression is configured, not while a macro fragment is matched)
+            let real = self.macros.is_some();
+            if !self.outer_attrs()?.is_empty() && real { self.ast.gated_syntax.push(("stmt_expr_attributes", at)); }
         }
         let lhs = self.unary(r)?;
         self.expr_continue(lhs, min, r, lo)
