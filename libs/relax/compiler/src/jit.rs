@@ -1993,57 +1993,9 @@ fn rt_compile(slot: u64) -> u64 {
 // ------------------------------------------------------------ compiler stack
 
 // A compile runs on the program's thread (lazy compile from a stub), and constant evaluation
-// runs program code inside it, which compiles again: `T::NUM + 1` over a type nested 1000 deep
-// nests 1000 compiles. rustc runs the compiler on its own stack and grows it on demand
-// (rustc_data_structures::stack::ensure_sufficient_stack: a 100 KiB red zone, new 1 MiB+
-// segments via stacker); Relax does the same here, so neither deep constant evaluation nor a
-// lazy compile reached near the end of a deep program recursion overflows the thread's stack.
-
-/// Run the compiler on a fresh segment when less than this is left
-const STACK_RED_ZONE: usize = 1 << 20;
-/// Size of a fresh segment (virtual; pages are touched on use)
-const STACK_SEGMENT: usize = 64 << 20;
-
-thread_local! {
-    /// lowest usable address of the stack this thread runs on now (0: not known yet)
-    static STACK_LO: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Runs `f` on a fresh stack segment when this thread's stack is nearly used up.
-fn ensure_sufficient_stack<R, F: FnOnce() -> R>(f: F) -> R {
-    let here = &f as *const _ as usize;
-    let mut lo = STACK_LO.with(|c| c.get());
-    if lo == 0 {
-        lo = os::thread::stack_lo();
-        STACK_LO.with(|c| c.set(lo));
-    }
-    if lo == 0 || here.saturating_sub(lo) >= STACK_RED_ZONE {
-        return f();
-    }
-    struct Job<F, R> {
-        f: Option<F>,
-        r: Option<std::thread::Result<R>>,
-    }
-    extern "C" fn run<F: FnOnce() -> R, R>(p: *mut u8) {
-        let job = unsafe { &mut *(p as *mut Job<F, R>) };
-        let f = job.f.take().unwrap();
-        // a Rust panic must not unwind through the stack switch (no unwind info for it)
-        job.r = Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)));
-    }
-    let seg = match os::mem::stack_segment(STACK_SEGMENT) {
-        Some(seg) => seg,
-        None => return f(),
-    };
-    let mut job: Job<F, R> = Job { f: Some(f), r: None };
-    STACK_LO.with(|c| c.set(seg.lo));
-    unsafe { os::mem::call_on_segment(&seg, run::<F, R>, &mut job as *mut Job<F, R> as *mut u8) };
-    STACK_LO.with(|c| c.set(lo));
-    os::mem::free_segment(seg);
-    match job.r.take().unwrap() {
-        Ok(r) => r,
-        Err(e) => std::panic::resume_unwind(e),
-    }
-}
+// runs program code inside it, which compiles again: base/src/stack.rs grows the stack onto
+// fresh segments (rustc's ensure_sufficient_stack).
+use crate::stack::ensure_sufficient_stack;
 
 /// Where the OS cannot run a handler on a looping thread (Windows: no signals), the watching
 /// thread redirects it into this glue (x64::hang_tramp in front of rt_hang); 0 = none.
