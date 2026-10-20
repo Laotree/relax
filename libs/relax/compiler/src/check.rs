@@ -130,6 +130,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     errors.extend(relax_types::item_checks::node_attribute_targets(&u.prog, &own));
     errors.extend(relax_types::item_checks::foreign_blocks(&u.prog, &own));
     errors.extend(relax_types::item_checks::duplicate_symbols(&u.prog, &own));
+    errors.extend(relax_types::item_checks::global_allocators_and_lang_items(&u.prog, &own));
     if u.prog.crates[root as usize].is_bin { errors.extend(relax_types::item_checks::entry_point(&u.prog, root)); }
     if u.prog.crates[root as usize].is_bin { errors.extend(relax_types::item_checks::entry_symbol_conflict(&u.prog, &own, root)); }
     errors.extend(relax_types::lint_levels::check(&u.prog, &own));
@@ -170,6 +171,16 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     if options.borrowck_all != crate::options::BorrowckAll::Default {
         let n = crate::borrowck::check_all(&u.prog, &u.tcx, options.borrowck_all == crate::options::BorrowckAll::Std);
         return (if n == 0 { 0 } else { 1 }, Vec::new());
+    }
+    // MIR borrowck pipeline harness (docs: relax_types::mir::build::driver_borrowck).
+    if let Some(mode) = std::env::var_os("MAKEPAD_RUN_MIR_BORROWCK_ALL") {
+        let errors = relax_types::mir::build::driver_borrowck::borrowck_all(&u.prog, &u.tcx, mode == "std");
+        return (if errors == 0 { 0 } else { 1 }, Vec::new());
+    }
+    // MIR construction harness (docs: relax_types::mir::build::driver): build + validate every body.
+    if let Some(mode) = std::env::var_os("MAKEPAD_RUN_MIR_BUILD_ALL") {
+        let failures = relax_types::mir::build::driver::build_all(&u.prog, &u.tcx, mode == "std");
+        return (if failures == 0 { 0 } else { 1 }, Vec::new());
     }
     let console = crate::gandalf_out::Console::start(emit && crate::diag::enabled(), !emit);
     let mut borrow_diagnostics = Vec::new();
