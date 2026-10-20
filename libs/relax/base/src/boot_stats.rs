@@ -126,3 +126,33 @@ pub fn swap_done(chunks: usize, rss_before: u64, rss_after: u64) {
 pub fn main_called() {
     MAIN_AT_MS.store(crate::clock::ms_since_process_start() as u64 + 1, Relaxed);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // one test: the counters are process-wide statics
+    #[test]
+    fn arms_open_in_order_and_the_rest_share_one() {
+        for krate in 0..40u32 {
+            let arm = arm_of(900 + krate, || name_bytes(&format!("crate_{krate}")));
+            assert_eq!(arm, (krate as usize).min(REST));
+            // the same crate keeps its arm
+            assert_eq!(arm_of(900 + krate, || unreachable!()), arm);
+        }
+        let name = arm_name(3);
+        assert!(name.starts_with(b"crate_3\0"));
+        fn_installed(3);
+        fn_installed(3);
+        fn_installed(REST + 5);
+        assert_eq!(fns(3), 2);
+        assert_eq!(fns(REST), 1);
+        // a crate past the table is the rest arm and does not open one
+        assert_eq!(arm_of(100_000, || unreachable!()), REST);
+        let long = name_bytes("a_crate_name_longer_than_the_field");
+        assert_eq!(&long[..], b"a_crate_name_longer_than");
+        o3_installed(2, 77);
+        let n = O3_INSTALLED.load(Relaxed) - 1;
+        assert_eq!(o3_install(n), (2, 77));
+    }
+}
