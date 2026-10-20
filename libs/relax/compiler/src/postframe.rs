@@ -49,10 +49,26 @@ pub(crate) static AHEAD_RUNNING: AtomicU64 = AtomicU64::new(0);
 
 /// The UI (main) thread begins / ends a wait on the JIT (jit.rs lazy compiles, owner.rs requests).
 pub(crate) fn ui_wait_begin() {
-    if UI_WAITING.load(Relaxed) == 0 {
+    let outer = UI_WAITING.load(Relaxed) == 0;
+    if outer {
         UI_WAIT_START.store(wall_ns(), Relaxed);
     }
     UI_WAITING.fetch_add(1, Relaxed);
+    if outer && present_ns() != 0 {
+        let hook = UI_WAIT_HOOK.load(Relaxed);
+        if !hook.is_null() {
+            // SAFETY: only `on_ui_wait` stores here, always a `fn()`
+            unsafe { std::mem::transmute::<*mut (), fn()>(hook)() }
+        }
+    }
+}
+
+static UI_WAIT_HOOK: std::sync::atomic::AtomicPtr<()> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// `hook` runs on the UI thread when it begins a JIT wait after the first present (the outermost
+/// one): the host's window wakes to show the wait's activity once it lasts. It must not wait.
+pub fn on_ui_wait(hook: fn()) {
+    UI_WAIT_HOOK.store(hook as *mut (), Relaxed);
 }
 pub(crate) fn ui_wait_end() {
     UI_WAIT_END.store(wall_ns(), Relaxed);
