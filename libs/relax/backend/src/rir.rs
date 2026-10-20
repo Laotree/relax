@@ -10,6 +10,24 @@ pub enum Cls {
     F64,
     /// 128-bit vector of four 32-bit lanes (f32 or i32 by op); lives in float registers
     V128,
+    /// 256-bit vector (x64 AVX ymm): made only by `pair256` after optimisation, from V128
+    /// pairs that are the two halves of one value; every op on it is the V128 op on both halves
+    V256,
+}
+
+impl Cls {
+    /// a vector class (lives in a float register, saved and spilled whole)
+    pub fn is_vec(self) -> bool {
+        matches!(self, Cls::V128 | Cls::V256)
+    }
+    /// bytes of a spill slot of this class (vector slots 16-aligned)
+    pub fn spill_bytes(self) -> u32 {
+        match self {
+            Cls::V128 => 16,
+            Cls::V256 => 32,
+            _ => 8,
+        }
+    }
 }
 
 /// Lane width of a lane-typed vector op (`Inst::VX`): 8, 16, 32 or 64 bits (float ops: S = f32,
@@ -81,6 +99,16 @@ pub enum VX {
     ShlV(VW),
     ShrSV(VW),
     ShrUV(VW),
+    /// unsigned integer compare, all ones / zero per lane
+    UCmp(Cond, VW),
+    /// IEEE minNum / maxNum: a NaN lane takes the other operand (both NaN: a quiet NaN); the
+    /// sign of a zero result is unspecified (Rust's `simd_minimum_number_nsz`)
+    FMinNum(VW),
+    FMaxNum(VW),
+    /// lanes of a then b truncated to half their width (wrapping; lane = the source width)
+    Narrow(VW),
+    /// the two f64 lanes of a then of b rounded to f32 (four f32 lanes)
+    FCvtNarrow,
     Add(VW),
     Sub(VW),
     /// low half of the product (H, S)
@@ -154,6 +182,8 @@ pub enum VX {
     IToF(VW),
     /// wrapping integer negation
     Neg(VW),
+    /// f32 lanes 0 and 1 widened to two f64 lanes (exact)
+    FCvtLo,
     Abs(VW),
     ShlI(VW, u8),
     ShrUI(VW, u8),
@@ -179,19 +209,26 @@ pub enum VX {
     Insert(VW, u8),
     /// V128 -> I: the top bit of each byte (pmovmskb)
     MoveMaskB,
+    /// V128 -> I: the top bit of each lane of width w, lane i at bit i
+    MoveMask(VW),
     /// V128 -> I: wrapping sum of all lanes, zero-extended from the lane width
     AddAcross(VW),
     /// V128 -> I: unsigned maximum of all lanes
     MaxAcrossU(VW),
     /// I -> V128: the scalar in the low 64 bits, upper bits zero
     FromLo64,
+    // ---- 256-bit halves (made only by `pair256`)
+    /// (V128 lo, V128 hi) -> V256
+    Join,
+    /// V256 -> V128: the low (false) or high (true) half
+    Half(bool),
 }
 
 impl VX {
     /// Operands read: 1 (unary, scalar-from), 2, or 3 (Inst::VX3).
     pub fn arity(self) -> usize {
         match self {
-            VX::ArmSha1H | VX::FNeg(_) | VX::FAbs(_) | VX::FSqrt(..) | VX::FRound(..) | VX::FToI(_) | VX::IToF(_) | VX::Neg(_) | VX::Abs(_) | VX::ShlI(..) | VX::ShrUI(..) | VX::ShrSI(..) | VX::ShufS(_) | VX::BytesShrI(_) | VX::BytesShlI(_) | VX::WidenLoU(_) | VX::WidenHiU(_) | VX::WidenLoS(_) | VX::WidenHiS(_) | VX::PairAddLongU(_) | VX::Splat(_) | VX::Extract(..) | VX::MoveMaskB | VX::AddAcross(_) | VX::MaxAcrossU(_) | VX::FromLo64 => 1,
+            VX::ArmSha1H | VX::FCvtLo | VX::MoveMask(_) | VX::FNeg(_) | VX::FAbs(_) | VX::FSqrt(..) | VX::FRound(..) | VX::FToI(_) | VX::IToF(_) | VX::Neg(_) | VX::Abs(_) | VX::ShlI(..) | VX::ShrUI(..) | VX::ShrSI(..) | VX::ShufS(_) | VX::BytesShrI(_) | VX::BytesShlI(_) | VX::WidenLoU(_) | VX::WidenHiU(_) | VX::WidenLoS(_) | VX::WidenHiS(_) | VX::PairAddLongU(_) | VX::Splat(_) | VX::Extract(..) | VX::MoveMaskB | VX::AddAcross(_) | VX::MaxAcrossU(_) | VX::FromLo64 | VX::Half(_) => 1,
             VX::X86Sha256Rnds2 | VX::ArmSha1C | VX::ArmSha1P | VX::ArmSha1M
             | VX::ArmSha1Su0 | VX::ArmSha256H | VX::ArmSha256H2 | VX::ArmSha256Su1 => 3,
             _ => 2,
@@ -200,7 +237,7 @@ impl VX {
     /// the result is an I vreg
     /// Extract, MoveMaskB, AddAcross, MaxAcrossU: an I result, the lane zero-extended to 64 bits
     pub fn scalar_result(self) -> bool {
-        matches!(self, VX::Extract(..) | VX::MoveMaskB | VX::AddAcross(_) | VX::MaxAcrossU(_))
+        matches!(self, VX::Extract(..) | VX::MoveMaskB | VX::MoveMask(_) | VX::AddAcross(_) | VX::MaxAcrossU(_))
     }
 }
 
@@ -784,10 +821,16 @@ pub enum Inst {
     /// 16 bytes at [base + off] (no alignment needed)
     VLoad(VReg, VReg, i32),
     VStore(VReg, i32, VReg), // base, off, src
+    /// 16 bytes at [base + (idx << sh) + off] (sh <= 3; made by `passes::addr_modes` on x86-64)
+    VLoadX(VReg, VReg, VReg, u8, i32), // d, base, idx, sh, off
+    VStoreX(VReg, VReg, u8, i32, VReg), // base, idx, sh, off, src
     /// d (I) = 1 if any lane of v is nonzero, else 0
     VAny(VReg, VReg),
     /// lane l = the 32-bit word at [base + 4 * idx.lane(l)] (idx lanes as u32, in range)
     VGather(VReg, VReg, VReg), // d, base, idx
+    /// d byte i = (a ++ b) byte idx[i] for idx[i] < 32, else 0 (a constant two-source shuffle;
+    /// lane shuffles are their byte indices)
+    VShuffle(VReg, VReg, VReg, [u8; 16]), // d, a, b, idx
     /// lane-typed vector op (see `VX`): d, a, b (b repeats a for unary ops)
     VX(VX, VReg, VReg, VReg),
     /// Pure ternary vector op; a is the destructive hardware input, c is explicit in RIR.
@@ -878,14 +921,14 @@ impl Inst {
         match self {
             Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::TlsAddr(d, _) | Inst::VConst(d, _) => f(*d),
             Inst::Mov(d, _) | Inst::INeg(_, d, _) | Inst::INot(_, d, _) | Inst::IBit(_, d, _) | Inst::FUnary(_, _, d, _) | Inst::Conv(_, d, _) | Inst::IBinI(_, _, d, _, _) | Inst::ICmpI(_, _, d, _, _) | Inst::Load(_, d, _, _) | Inst::VSplat(d, _) | Inst::VExtract(d, _, _) | Inst::VLoad(d, _, _) | Inst::VAny(d, _) | Inst::AtomicLoad(_, _, d, _) => f(*d),
-            Inst::IBin(_, _, d, _, _) | Inst::ICmp(_, _, d, _, _) | Inst::FBin(_, _, d, _, _) | Inst::FCmp(_, _, d, _, _) | Inst::VGather(d, _, _) | Inst::VX(_, d, _, _) | Inst::AtomicRmw(_, _, _, d, _, _) | Inst::LoadX(_, d, _, _, _, _) => f(*d),
+            Inst::IBin(_, _, d, _, _) | Inst::ICmp(_, _, d, _, _) | Inst::FBin(_, _, d, _, _) | Inst::FCmp(_, _, d, _, _) | Inst::VGather(d, _, _) | Inst::VShuffle(d, _, _, _) | Inst::VX(_, d, _, _) | Inst::AtomicRmw(_, _, _, d, _, _) | Inst::LoadX(_, d, _, _, _, _) | Inst::VLoadX(d, _, _, _, _) => f(*d),
             Inst::Sel(d, _, _, _) | Inst::VX3(_, d, _, _, _) | Inst::VSel(d, _, _, _) | Inst::VFma(_, _, d, _, _, _) | Inst::FMulAdd(_, _, _, d, _, _, _) | Inst::AtomicCas(_, _, _, d, _, _, _) => f(*d),
             Inst::VInsert(d, _, _, _) => f(*d),
             Inst::Call(_, _, rets) => rets.iter().for_each(|r| f(*r)),
             Inst::FpEnv(_, v) => f(*v),
             Inst::Cpuid(ds, a, b) => { ds.iter().for_each(|d| f(*d)); f(*a); f(*b); }
             Inst::Xgetbv(d, a) => { f(*d); f(*a); }
-            Inst::Store(..) | Inst::Copy(..) | Inst::VStore(..) | Inst::AtomicStore(..) | Inst::StoreX(..) | Inst::Fence(..) => {}
+            Inst::Store(..) | Inst::Copy(..) | Inst::VStore(..) | Inst::VStoreX(..) | Inst::AtomicStore(..) | Inst::StoreX(..) | Inst::Fence(..) => {}
         }
     }
 
@@ -901,12 +944,12 @@ impl Inst {
                 f(a);
                 f(b);
             }
-            Inst::IBin(_, _, d, a, b) | Inst::ICmp(_, _, d, a, b) | Inst::FBin(_, _, d, a, b) | Inst::FCmp(_, _, d, a, b) | Inst::VGather(d, a, b) | Inst::VX(_, d, a, b) | Inst::AtomicRmw(_, _, _, d, a, b) | Inst::LoadX(_, d, a, b, _, _) => {
+            Inst::IBin(_, _, d, a, b) | Inst::ICmp(_, _, d, a, b) | Inst::FBin(_, _, d, a, b) | Inst::FCmp(_, _, d, a, b) | Inst::VGather(d, a, b) | Inst::VShuffle(d, a, b, _) | Inst::VX(_, d, a, b) | Inst::AtomicRmw(_, _, _, d, a, b) | Inst::LoadX(_, d, a, b, _, _) | Inst::VLoadX(d, a, b, _, _) => {
                 f(d);
                 f(a);
                 f(b);
             }
-            Inst::StoreX(_, a, b, _, _, c) | Inst::VInsert(a, b, _, c) => {
+            Inst::StoreX(_, a, b, _, _, c) | Inst::VStoreX(a, b, _, _, c) | Inst::VInsert(a, b, _, c) => {
                 f(a);
                 f(b);
                 f(c);
@@ -1150,12 +1193,12 @@ impl Func {
                         regs.push(*b);
                         regs.push(*s);
                     }
-                    Inst::LoadX(_, d, b, x, _, _) => {
+                    Inst::LoadX(_, d, b, x, _, _) | Inst::VLoadX(d, b, x, _, _) => {
                         regs.push(*d);
                         regs.push(*b);
                         regs.push(*x);
                     }
-                    Inst::StoreX(_, b, x, _, _, s) => {
+                    Inst::StoreX(_, b, x, _, _, s) | Inst::VStoreX(b, x, _, _, s) => {
                         regs.push(*b);
                         regs.push(*x);
                         regs.push(*s);
@@ -1180,7 +1223,7 @@ impl Func {
                         regs.push(*d);
                         regs.push(*a);
                     }
-                    Inst::VGather(d, a, b) => {
+                    Inst::VGather(d, a, b) | Inst::VShuffle(d, a, b, _) => {
                         regs.push(*d);
                         regs.push(*a);
                         regs.push(*b);
