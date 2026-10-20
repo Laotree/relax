@@ -2922,7 +2922,11 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let mut pre_n = 0usize;
     if errs.is_empty() {
         for &id in slots.iter().chain(fresh.iter()) {
+            // SPEC-V: the edited bodies have no verdict for their new text yet: flagged before any
+            // caller of this batch looks at them (unverified code is not inlined)
+            let unverified = !u.verdict_clean(id);
             let f = &mut u.fns[id as usize];
+            f.unverified.store(unverified, Ordering::Relaxed);
             f.rir = None;
             if let Some(h) = &mut f.history { h.inlined_into.clear(); }
             f.build_err = None;
@@ -3461,6 +3465,135 @@ pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
 
 /// makepad inspect: an edit that did not reach the running program is an agent's event (refused:
 /// errors; restart: the change needs one).
+/// SPEC-V: patch groups that are installed and run while their borrow-check verdict is still out.
+/// Observations made meanwhile (inspect answers, events) say `verified:false`.
+pub(crate) static UNVERIFIED_PATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether the code the program runs now all has its clean verdict (no patch group awaits one).
+pub fn observations_verified() -> bool {
+    UNVERIFIED_PATCHES.load(Ordering::Acquire) == 0
+}
+
+/// A patch group whose verdict has not arrived: the slots it installed, and where the event stream
+/// stood when it was installed (the events after it were made with its code).
+pub(crate) struct PendingPatch {
+    pub(crate) group: u32,
+    pub(crate) what: String,
+    pub(crate) ids: Vec<u32>,
+    pub(crate) event_seq: u64,
+}
+
+/// SPEC-V: settles the patch groups awaiting verdicts. A group whose every slot is clean is verified
+/// (an inspect event says which observations that makes verified). A group with a failed verdict is
+/// rolled back -- newer groups first, they were made on top of it -- the slots return to their
+/// previous code, and the error is reported with the observations it invalidates. Returns the
+/// (running file before, after) pairs of the rolled-back groups.
+pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, undos: &mut Vec<Undo>) -> Vec<(u32, u32)> {
+    use crate::jit::Verdict;
+    let mut back = Vec::new();
+    let mut i = 0;
+    while i < pending.len() {
+        let p = &pending[i];
+        // Some(None): verified, Some(Some(events)): rejected, None: not yet
+        let mut unchecked: Vec<String> = Vec::new();
+        let state: Option<Option<Vec<crate::borrowck::event::GandalfEvent>>> = unsafe {
+            crate::owner::call(crate::owner::Class::App, || {
+                let u = &*up;
+                let mut failed = Vec::new();
+                let mut waiting = false;
+                for &id in &p.ids {
+                    match u.verdict_state(id) {
+                        Verdict::Clean => {}
+                        Verdict::Failed(events) => failed.extend(events),
+                        // never verified, never reported: the slots stay unverified (baseline)
+                        Verdict::Unverifiable(why) => unchecked.push(format!("{}: {}", u.fns[id as usize].name, why)),
+                        Verdict::Pending => waiting = true,
+                    }
+                }
+                if !failed.is_empty() { Some(Some(failed)) }
+                else if waiting { None }
+                else {
+                    for &id in &p.ids { u.refresh_verified(id); }
+                    Some(None)
+                }
+            })
+        };
+        match state {
+            None => { i += 1; }
+            Some(None) => {
+                let p = pending.remove(i);
+                for why in &unchecked {
+                    eprintln!("makepad live: {}: the borrow checker did not check {} (it stays unverified baseline code)", p.what, why);
+                }
+                UNVERIFIED_PATCHES.fetch_sub(1, Ordering::AcqRel);
+                let seqs = crate::inspect::events::unverified_seqs_since(p.event_seq);
+                let seqs: Vec<String> = seqs.iter().map(|s| s.to_string()).collect();
+                crate::inspect::events::emit(
+                    "patchverified",
+                    &format!("{}", p.group),
+                    &format!("\"edit\":{},\"group\":{},\"verified_events\":[{}]", json_str(&p.what), p.group, seqs.join(",")),
+                );
+            }
+            Some(Some(events)) => {
+                let group = pending[i].group;
+                // newest first, down to the failed group
+                let mut reverted = Vec::new();
+                let mut names: Vec<String> = Vec::new();
+                let mut ok = false;
+                while let Some(undo) = undos.pop() {
+                    let g = undo.group;
+                    let versions = undo.versions.clone();
+                    let rolled = unsafe { rollback(up, undo) };
+                    names.extend(rolled);
+                    back.extend(versions);
+                    reverted.push(g);
+                    if g == group { ok = true; break; }
+                }
+                let mut invalidated: Vec<String> = Vec::new();
+                let mut first_seq = u64::MAX;
+                let what = pending[i].what.clone();
+                pending.retain(|q| {
+                    if reverted.contains(&q.group) || (!ok && q.group == group) {
+                        first_seq = first_seq.min(q.event_seq);
+                        UNVERIFIED_PATCHES.fetch_sub(1, Ordering::AcqRel);
+                        false
+                    } else { true }
+                });
+                if first_seq != u64::MAX {
+                    invalidated = crate::inspect::events::unverified_seqs_since(first_seq).iter().map(|s| s.to_string()).collect();
+                }
+                let mut rendered: Vec<String> = Vec::new();
+                for ev in &events {
+                    let r = ev.error.render();
+                    if !rendered.contains(&r) { rendered.push(r); }
+                }
+                let e = &events[0].error;
+                eprintln!(
+                    "makepad live: {}: REVERTED -- the borrow checker rejected it after it ran: {} at {}:{}:{}: {}; {} fn(s) run their previous code again{}",
+                    what, e.fn_path, e.file, e.line, e.col, e.message, names.len(),
+                    if ok { "" } else { " (its undo record was already dropped: not reverted)" }
+                );
+                for r in &rendered { eprintln!("{}", r); }
+                let d = e.to_diagnostic();
+                live_log(&format!("{{\"event\":\"patch_reverted\",\"edit\":{},\"groups\":{:?},\"fns\":[{}],\"invalidated_events\":[{}],\"diagnostic\":{}}}",
+                    json_str(&what), reverted, names.iter().map(|n| json_str(n)).collect::<Vec<_>>().join(","), invalidated.join(","), d.to_json()));
+                crate::inspect::events::emit(
+                    "patchreverted",
+                    &format!("{}|{}", what, group),
+                    &format!(
+                        "\"edit\":{},\"reverted\":{},\"groups\":{:?},\"fns\":[{}],\"error\":{},\"invalidates\":{{\"events\":[{}]}}",
+                        json_str(&what), ok, reverted, names.iter().map(|n| json_str(n)).collect::<Vec<_>>().join(","),
+                        json_str(&e.one_line()), invalidated.join(",")
+                    ),
+                );
+                if crate::run::reporting() { crate::run::report("borrowck", &d.to_json()); }
+                i = 0;
+            }
+        }
+    }
+    back
+}
+
 fn patch_refused_event(what: &str, refused: bool, lines: &[String]) {
     let reasons: Vec<String> = lines.iter().take(6).map(|l| crate::inspect::json_str(l)).collect();
     crate::inspect::events::emit(
@@ -3888,6 +4021,13 @@ pub(crate) fn stamp(path: &str) -> Option<(std::time::SystemTime, u64)> {
     Some((m.modified().ok()?, m.len()))
 }
 
+fn gate_note(g: u8) {
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+    if LAST.swap(g, Ordering::Relaxed) != g && std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() {
+        eprintln!("makepad live: watcher gate {} at t={:.0} ms", ["open", "domain loading", "no first present", "restart required"][g as usize], crate::clock::ms_since_start());
+    }
+}
+
 unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
     let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
     // (path, running file index, last stamp)
@@ -3920,6 +4060,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
     let mut events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str()));
     if !quiet { eprintln!("makepad live: watching {} source files; session log {}", files.len(), live_log_path()); }
     let mut undos: Vec<Undo> = Vec::new();
+    // SPEC-V: patches that ran before their verdict
+    let mut pending: Vec<PendingPatch> = Vec::new();
     // a save is seen within 100 ms (a restart's whole budget is 1 s); one round is a stat per
     // watched file (MAKEPAD_RUN_LIVE_TRACE=1 prints its cost once)
     let mut traced = std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_none();
@@ -3947,7 +4089,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
     loop {
         std::thread::sleep(std::time::Duration::from_millis(5));
         if WATCH_STOP.load(Ordering::SeqCst) { return; }
-        if DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire) { continue; }
+        if DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire) { gate_note(1); continue; }
         let latest = DOMAIN_REVISION.load(std::sync::atomic::Ordering::Acquire);
         if latest != revision {
             revision = latest;
@@ -3971,17 +4113,20 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
         // Keep the original stamps and queued OS notifications intact until startup
         // finishes. In particular, do not acquire Reloading or drain streamed edits:
         // either can compete with the cold compiler before the first frame.
-        if !jit::live_startup_done() { continue; }
+        if !jit::live_startup_done() { gate_note(2); continue; }
         // Once the tree no longer matches this session, later saves must not patch a
         // mixture of revisions into the old process. A fresh run restores live editing.
-        if restart_required { continue; }
+        if restart_required { gate_note(3); continue; }
+        gate_note(0);
         let loads = jit::DEFERRED_LOADS.load(std::sync::atomic::Ordering::Relaxed);
         // a new watch set drops the events the old one had not delivered yet (a save made
         // while the post-boot loader loads was never seen): stat every file once instead
         let mut rewatched = std::mem::take(&mut startup_scan);
         if loads != loads_seen || rewatched {
             loads_seen = loads;
+            let t_own = Instant::now();
             let loaded = crate::owner::call_quick(crate::owner::Class::App, || own_files(&*up));
+            if std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() { eprintln!("makepad live: rewatch (loads {loads}, startup scan {rewatched}): own files in {:.1} ms at t={:.0} ms", t_own.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
             let known: std::collections::HashMap<_, _> = files.iter().enumerate().map(|(i, f)| (f.0.clone(), i)).collect();
             let mut added = Vec::new();
             for (path, file) in loaded {
@@ -3995,7 +4140,16 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
                 rewatched = true;
             }
         }
+        let t_dr = Instant::now();
         drain_streams(up);
+        if std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() && t_dr.elapsed().as_millis() > 20 { eprintln!("makepad live: drain_streams took {:.1} ms at t={:.0} ms", t_dr.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
+        if !pending.is_empty() {
+            for (o, n) in settle_verdicts(up, &mut pending, &mut undos) {
+                for f in files.iter_mut() {
+                    if f.1 == n { f.1 = o; }
+                }
+            }
+        }
         // Re-check an unchanged failing prefix once, after one second of silence.
         let due: Vec<_> = stalled.iter().filter(|(_, (t, _, _))| t.elapsed().as_secs_f64() >= 1.0).map(|(&k, _)| k).collect();
         for k in due {
@@ -4004,6 +4158,10 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
             if stamp(&f.0) != f.2 { continue; }
             let seen = Instant::now();
             let mut o = apply_mode(up, vec![Edit { file: f.1, path: f.0.clone(), src }], 0, false);
+            if o.rung == Rung::Refuse {
+                // still refused: it was reported when it was saved
+                continue;
+            }
             if o.rung != Rung::Patch {
                 o.lines = refusal_lines(first, std::mem::take(&mut o.lines));
                 log_edit(&f.0, &o, f.2.map(|s| s.0), seen);
@@ -4026,7 +4184,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
             }
         }
         tick = tick.wrapping_add(1);
+        let t_ev = Instant::now();
         let notifications = events.as_mut().and_then(|w| w.changed());
+        if t_ev.elapsed().as_millis() > 20 && std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() { eprintln!("makepad live: events drain took {:.1} ms", t_ev.elapsed().as_secs_f64() * 1e3); }
         let lost = events.is_some() && notifications.is_none();
         if lost { events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str())); }
         let all = lost || rewatched || (events.is_none() && tick % 20 == 0);
@@ -4061,6 +4221,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
             continue;
         }
         let seen = std::time::Instant::now();
+        if std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() { eprintln!("makepad live: a change seen at t={:.0} ms ({} file(s))", crate::clock::ms_since_start(), changed.len()); }
         // from the save on, the post-boot loader keeps off the unit (the read below
         // compares with the running text on it)
         for &k in &changed {
@@ -4089,10 +4250,12 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
             scanned += candidates.len() + changed.len();
             for k in candidates {
                 if stamp(&files[k].0) != files[k].2 && !changed.contains(&k) {
+                    if std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() { eprintln!("makepad live: settle: {} changed too (+{:.0} ms)", files[k].0, seen.elapsed().as_secs_f64() * 1e3); }
                     changed.push(k);
                     more = true;
                 }
             }
+            if std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() && now != last { eprintln!("makepad live: settle: a stamp moved (+{:.0} ms)", seen.elapsed().as_secs_f64() * 1e3); }
             if !more && now == last {
                 break;
             }
@@ -4179,11 +4342,16 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
         if incomplete {
             for (&k, src) in which.iter().zip(originals) { stalled.insert(k, (Instant::now(), src, if o.rung == Rung::Refuse { o.lines.clone() } else { Vec::new() })); }
         }
+        let what = names.join(", ");
         if o.rung == Rung::Refuse {
-            // Diagnostics are emitted only by the stalled-file check above.
+            // reported at once (the AI loop's feedback must not wait); the silence re-check above
+            // stays as a retry and says nothing more while it is still refused
+            log_edit(&what, &o, saved, seen);
+            eprintln!("makepad live: {}: NOT applied (errors below); the app runs the previous code", what);
+            for l in &o.lines { eprintln!("makepad live:   {}", l); }
+            patch_refused_event(&what, true, &o.lines);
             continue;
         }
-        let what = names.join(", ");
         if o.rung == Rung::Restart {
             RESTART_SAVED_MS.store(saved.map_or(0.0, unix_ms) as u64, std::sync::atomic::Ordering::Relaxed);
         }
@@ -4221,6 +4389,17 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
             files[k].1 = o.files[j];
         }
         if let Some(u) = o.undo {
+            // SPEC-V: the slots this group installed without a clean verdict (all of them, unless
+            // --check-first refused what failed before the install)
+            let group = u.group;
+            let ids: Vec<u32> = crate::owner::call(crate::owner::Class::App, || {
+                let up = &*up;
+                (0..up.fns.len() as u32).filter(|&id| up.fns[id as usize].patch_gen == group && up.fns[id as usize].unverified.load(Ordering::Relaxed)).collect()
+            });
+            if !ids.is_empty() {
+                UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
+                pending.push(PendingPatch { group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq() });
+            }
             undos.push(u);
             // rollback by patch group arrives with the runtime panic boundaries (M7)
             if undos.len() > 64 {
