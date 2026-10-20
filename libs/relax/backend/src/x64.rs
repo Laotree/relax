@@ -4996,6 +4996,10 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
             w.entry(v).or_default().push((a, z, r));
             ws.entry(a).or_default().push((v, r));
         }
+        // entered with the value in the register: no load
+        for &(v, a, z, r) in &al.chained {
+            w.entry(v).or_default().push((a, z, r));
+        }
         (w, ws)
     };
     let mut g = Gen {

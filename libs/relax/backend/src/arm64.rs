@@ -3698,7 +3698,8 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         last_spill: None,
         win: {
             let mut w: std::collections::HashMap<u32, Vec<(u32, u32, u8)>> = std::collections::HashMap::new();
-            for &(v, a, z, r) in &al.windows {
+            // chained: entered with the value in the register (no load)
+            for &(v, a, z, r) in al.windows.iter().chain(al.chained.iter()) {
                 w.entry(v).or_default().push((a, z, r));
             }
             w

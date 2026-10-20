@@ -97,6 +97,9 @@ pub struct Alloc {
     /// loads the register before the first use; uses in the run read it; the slot stays the
     /// value's home (paths that read the slot directly remain right).
     pub windows: Vec<(u32, u32, u32, u8)>,
+    /// windows entered with the value already in the register (region windows whose block's
+    /// predecessors all hold it there): uses read the register, nothing is loaded
+    pub chained: Vec<(u32, u32, u32, u8)>,
 }
 
 /// A value the backend recomputes at each use instead of keeping it (see Alloc::remat).
@@ -1363,6 +1366,18 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             }
         }
     }
+    // region windows (O3): a spilled int value used in many blocks once each (a loop-carried
+    // value whose register some short temporary holds somewhere in the loop) gets a register
+    // over the blocks where one is free over its whole live part: blocks it enters live and does
+    // not redefine, with no call over it for a caller-saved register. Such a block loads the value
+    // at its start only when a predecessor is not in the region (the slot stays its home, as for
+    // windows); one whose predecessors all hold it in the register loads nothing.
+    let mut chained: Vec<(u32, u32, u32, u8)> = Vec::new();
+    let mut region_windows: Vec<(u32, u32, u32, u8)> = Vec::new();
+    let mut in_region: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    if thorough && windows_on(options) && !crate::stats::opt_off(options, "-regionwin") {
+        region_windows_alloc(f, &reach, &tab, &block_start, &block_end, &ranges, &wts, &loc, &remat, &call_pos, cfg, &used_callee_int, &mut occ, pos_words, &mut region_windows, &mut chained, &mut in_region);
+    }
     // spill windows (O3): a spilled int value's runs of >= 2 uses inside a block take a
     // register free over the run in the final occupancy -- one load instead of one per use.
     // Recomputed constants and addresses too (one recomputation instead of one per use), except
@@ -1425,7 +1440,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             }
             done.sort_by_key(|x| (std::cmp::Reverse(x.1.len()), x.0));
             for (v, us) in done {
-                if us.len() < 2 {
+                if us.len() < 2 || in_region.contains(&(v, bi as u32)) {
                     continue;
                 }
                 let a = block_start[bi] + 2 * us[0] as u32; // just before the first use
@@ -1454,7 +1469,165 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             }
         }
     }
-    Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows }
+    windows.extend(region_windows);
+    Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows, chained }
+}
+
+/// Region windows (see allocate_low): per spilled int value, heaviest first, the register whose
+/// region -- blocks the value enters live, does not define, and holds the register free over --
+/// saves the most weighted loads; a block of the region loads at its start unless every
+/// predecessor is in the region too (`chained`: the register already holds the value).
+#[allow(clippy::too_many_arguments)]
+fn region_windows_alloc(
+    f: &Func,
+    reach: &[bool],
+    tab: &OpTab,
+    block_start: &[u32],
+    block_end: &[u32],
+    ranges: &Ranges,
+    wts: &[f32],
+    loc: &[Loc],
+    remat: &[Remat],
+    call_pos: &[u32],
+    cfg: &RegConfig,
+    used_callee_int: &[u8],
+    occ: &mut [Vec<u64>],
+    pos_words: usize,
+    loading: &mut Vec<(u32, u32, u32, u8)>,
+    chained: &mut Vec<(u32, u32, u32, u8)>,
+    in_region: &mut std::collections::HashSet<(u32, u32)>,
+) {
+    let nv = f.vregs.len();
+    let nb = f.blocks.len();
+    let cand: Vec<bool> = (0..nv).map(|v| matches!(loc[v], Loc::Stack(_)) && f.vregs[v] == Cls::I && !remat[v].is_some()).collect();
+    if !cand.iter().any(|x| *x) {
+        return;
+    }
+    // per candidate: blocks it is used in (count) and blocks that define it
+    let mut uses_in: HashMap<u32, HashMap<u32, u32>> = HashMap::new();
+    let mut def_in: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        if !reach[bi] {
+            continue;
+        }
+        let k0 = tab.first[bi] as usize;
+        for k in 0..=b.insts.len() {
+            for &u in tab.uses(k0 + k) {
+                if cand[u as usize] {
+                    *uses_in.entry(u).or_default().entry(bi as u32).or_insert(0) += 1;
+                }
+            }
+            if k < b.insts.len() {
+                for &d in tab.defs(k0 + k) {
+                    if cand[d as usize] {
+                        def_in.insert((d, bi as u32));
+                    }
+                }
+            }
+        }
+    }
+    // blocks the emitters may skip (only moves, then a jump: x64 / arm64 jump threading sends
+    // their predecessors straight on) or that start no code are never in a region
+    let skippable: Vec<bool> = f.blocks.iter().map(|b| b.insts.is_empty() || (matches!(b.term, Term::Jump(_)) && b.insts.iter().all(|i| matches!(i, Inst::Mov(..))))).collect();
+    let preds = preds_of(f, reach);
+    // a predecessor ending in an invoke reaches its successors (the landing pad) after a call
+    let invoke_pred: Vec<bool> = (0..nb).map(|b| preds[b].iter().any(|&p| matches!(f.blocks[p as usize].term, Term::Invoke(..)))).collect();
+    let regs: Vec<u8> = cfg.int_caller.iter().chain(used_callee_int.iter()).copied().collect();
+    let mut order: Vec<u32> = (0..nv as u32).filter(|v| cand[*v as usize] && uses_in.get(v).map_or(false, |m| m.len() >= 2)).collect();
+    let heat = |v: u32| -> f32 { uses_in[&v].iter().map(|(b, n)| wts[*b as usize] * *n as f32).sum() };
+    order.sort_by(|a, b| heat(*b).partial_cmp(&heat(*a)).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(b)));
+    let block_of = |p: u32| block_start.partition_point(|&s| s <= p) - 1;
+    for v in order {
+        let rv = ranges.of(v);
+        // per block the value enters live: its live pieces there
+        let mut pieces: Vec<(u32, Vec<(u32, u32)>)> = Vec::new();
+        for &(a, z) in rv {
+            let mut p = a;
+            loop {
+                let b = block_of(p);
+                let e = z.min(block_end[b]);
+                match pieces.last_mut() {
+                    Some((lb, ps)) if *lb == b as u32 => ps.push((p, e)),
+                    _ => pieces.push((b as u32, vec![(p, e)])),
+                }
+                if e >= z || b + 1 >= nb {
+                    break;
+                }
+                p = block_start[b + 1];
+            }
+        }
+        let live_in = |b: u32, ps: &Vec<(u32, u32)>| ps.first().map_or(false, |x| x.0 == block_start[b as usize]);
+        let elig: Vec<(u32, &Vec<(u32, u32)>)> = pieces.iter().filter(|(b, ps)| reach[*b as usize] && !skippable[*b as usize] && live_in(*b, ps) && !def_in.contains(&(v, *b))).map(|(b, ps)| (*b, ps)).collect();
+        if elig.len() < 2 {
+            continue;
+        }
+        let used = &uses_in[&v];
+        let mut best: Option<(f32, u8, Vec<(u32, bool)>)> = None;
+        for &c in &regs {
+            let callee = used_callee_int.contains(&c);
+            let o = &occ[c as usize];
+            let mut set: Vec<u32> = Vec::new();
+            for (b, ps) in &elig {
+                let free = o.is_empty() || !ps.iter().any(|&(a, z)| bits_any(o, a, z));
+                let call = !callee && ps.iter().any(|&(a, z)| {
+                    let k = call_pos.partition_point(|q| *q < a);
+                    k < call_pos.len() && call_pos[k] <= z
+                });
+                if free && !call {
+                    set.push(*b);
+                }
+            }
+            if set.len() < 2 {
+                continue;
+            }
+            // drop blocks that only load for nothing (no use, and a load needed) until stable
+            loop {
+                let inset = |b: u32| set.binary_search(&b).is_ok();
+                let needs = |b: u32| invoke_pred[b as usize] || preds[b as usize].is_empty() || preds[b as usize].iter().any(|p| !inset(*p));
+                let drop: Vec<u32> = set.iter().copied().filter(|b| !used.contains_key(b) && needs(*b)).collect();
+                if drop.is_empty() {
+                    break;
+                }
+                set.retain(|b| !drop.contains(b));
+            }
+            let inset = |b: u32| set.binary_search(&b).is_ok();
+            let mut gain = 0f32;
+            let mut plan: Vec<(u32, bool)> = Vec::new();
+            for &b in &set {
+                let load = invoke_pred[b as usize] || preds[b as usize].is_empty() || preds[b as usize].iter().any(|p| !inset(*p));
+                // without the region: one load per block that uses it (windows join a block's uses)
+                let before = if used.contains_key(&b) { 1.0 } else { 0.0 };
+                gain += wts[b as usize] * (before - if load { 1.0 } else { 0.0 });
+                plan.push((b, load));
+            }
+            if gain > 0.0 && best.as_ref().map_or(true, |x| gain > x.0) {
+                best = Some((gain, c, plan));
+            }
+        }
+        let Some((gain, c, plan)) = best else { continue };
+        if trace_on(f) {
+            let bs: Vec<String> = plan.iter().map(|(b, l)| format!("b{}{}", b, if *l { "L" } else { "" })).collect();
+            eprintln!("ra-region {} v{} r{} gain {:.0}: {}", f.name, v, c, gain, bs.join(" "));
+        }
+        let o = &mut occ[c as usize];
+        if o.is_empty() {
+            o.resize(pos_words, 0);
+        }
+        for (b, load) in plan {
+            let ps = &pieces.iter().find(|x| x.0 == b).unwrap().1;
+            for &(a, z) in ps.iter() {
+                bits_fill(o, a, z);
+            }
+            let a = block_start[b as usize] + 1;
+            let z = ps.last().unwrap().1;
+            if load {
+                loading.push((v, a, z, c));
+            } else {
+                chained.push((v, a, z, c));
+            }
+            in_region.insert((v, b));
+        }
+    }
 }
 
 /// Baseline-tier allocation (cold code, compiled once before it is known to matter; hot code
@@ -1763,7 +1936,7 @@ fn allocate_baseline(options: &relax_session::Options, f: &Func, cfg: &RegConfig
             remat[v] = Remat::No;
         }
     }
-    Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows: Vec::new() }
+    Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows: Vec::new(), chained: Vec::new() }
 }
 
 /// Rematerialisable values: one definition by a constant-like instruction, not parameters.
