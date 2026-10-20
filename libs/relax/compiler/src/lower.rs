@@ -10289,26 +10289,26 @@ impl<'a> Lcx<'a> {
                         }
                         40..=53 | 60..=63 => {
                             let fop = match op {
-                                40 => VOp::FAddIntel,
-                                60 => VOp::FAddNeon,
-                                41 => VOp::FSubIntel,
-                                61 => VOp::FSubNeon,
-                                42 => VOp::FMulIntel,
-                                62 => VOp::FMulNeon,
-                                43 => VOp::FDivIntel,
-                                63 => VOp::FDivNeon,
-                                44 => VOp::FMinLt,
-                                45 => VOp::FMaxGt,
-                                46 => VOp::FCmp(Cond::Eq),
-                                47 => VOp::FCmp(Cond::Ne),
-                                48 => VOp::FCmp(Cond::Lt),
-                                49 => VOp::FCmp(Cond::Le),
-                                50 => VOp::FCmp(Cond::Gt),
-                                52 => VOp::FMinNeon,
-                                53 => VOp::FMaxNeon,
-                                _ => VOp::FCmp(Cond::Ge),
+                                40 => VX::FAdd(VW::S, NanBits::Intel),
+                                60 => VX::FAdd(VW::S, NanBits::Neon),
+                                41 => VX::FSub(VW::S, NanBits::Intel),
+                                61 => VX::FSub(VW::S, NanBits::Neon),
+                                42 => VX::FMul(VW::S, NanBits::Intel),
+                                62 => VX::FMul(VW::S, NanBits::Neon),
+                                43 => VX::FDiv(VW::S, NanBits::Intel),
+                                63 => VX::FDiv(VW::S, NanBits::Neon),
+                                44 => VX::FMinLt(VW::S),
+                                45 => VX::FMaxGt(VW::S),
+                                46 => VX::FCmp(Cond::Eq, VW::S),
+                                47 => VX::FCmp(Cond::Ne, VW::S),
+                                48 => VX::FCmp(Cond::Lt, VW::S),
+                                49 => VX::FCmp(Cond::Le, VW::S),
+                                50 => VX::FCmp(Cond::Gt, VW::S),
+                                52 => VX::FMinNeon(VW::S),
+                                53 => VX::FMaxNeon(VW::S),
+                                _ => VX::FCmp(Cond::Ge, VW::S),
                             };
-                            self.emit(Inst::VBin(fop, d, a, b));
+                            self.emit(Inst::VX(fop, d, a, b));
                             return self.vx_result(d, t);
                         }
                         _ => {
@@ -10338,11 +10338,11 @@ impl<'a> Lcx<'a> {
                         5 => VX::BytesShrI(k),
                         6 => VX::BytesShlI(k),
                         7 | 9 => {
-                            self.emit(Inst::VUn(if op == 7 { VUn::FSqrtIntel } else { VUn::FSqrtNeon }, d, a));
+                            self.emit(Inst::VX(VX::FSqrt(VW::S, if op == 7 { NanBits::Intel } else { NanBits::Neon }), d, a, a));
                             return self.vx_result(d, t);
                         }
                         8 => {
-                            self.emit(Inst::VUn(VUn::FAbs, d, a));
+                            self.emit(Inst::VX(VX::FAbs(VW::S), d, a, a));
                             return self.vx_result(d, t);
                         }
                         _ => {
