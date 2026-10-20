@@ -507,6 +507,24 @@ pub mod obligations {
                     NextSolverError::Overflow(o) => ("E0275", o),
                     NextSolverError::Ambiguity(o) => ("E0283", o),
                 };
+                // (an obligation that mentions an error type is a consequence of that error)
+                {
+                    struct HasError<'t, 'u>(&'t crate::types::Types, bool, &'t crate::infer::InferCtxt<'u>);
+                    impl crate::types::fold::TypeFolder for HasError<'_, '_> {
+                        fn fold_ty(&mut self, tys: &crate::types::Types, ty: TyId, depth: u32) -> TyId {
+                            let ty = self.2.deeply_resolve_ignoring_regions(ty);
+                            if self.0.has_error(ty) { self.1 = true; return ty; }
+                            crate::types::fold::super_fold_ty(tys, ty, self, depth)
+                        }
+                        fn fold_const(&mut self, tys: &crate::types::Types, ct: crate::consts::Const, depth: u32) -> crate::consts::Const {
+                            if matches!(tys.const_kind(ct), crate::consts::ConstKind::Error) { self.1 = true; return ct; }
+                            crate::types::fold::super_fold_const(tys, ct, self, depth)
+                        }
+                    }
+                    let mut h = HasError(&self.tcx.tys, false, self.infcx);
+                    crate::next_solver::fold::fold_predicate(&self.tcx.tys, &o.goal.predicate, &mut h);
+                    if h.1 { continue; }
+                }
                 let Some(msg) = self.message(code, &o) else { continue };
                 if !seen.insert((o.cause.span, msg.clone())) { continue; }
                 out.push(self.prog.record_error(file, o.cause.span, "typeck", msg));
