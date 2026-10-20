@@ -552,6 +552,10 @@ pub struct Program {
     pub prelexed: HashMap<String, (Vec<u8>, Vec<crate::lexer::Tok>)>,
     /// glob lookups after import resolution: (module, name, type ns) -> result
     pub glob_cache: crate::conc::MemoMap<(u32, Sym, bool), Option<(DefId, BindVis)>>,
+    /// `glob_ambiguity` answers once imports are resolved: (module, name, namespace, used from, skip_direct)
+    pub glob_amb_cache: crate::conc::MemoMap<(u32, Sym, bool, bool), u8>,
+    /// precise lookups of a name in a glob's module (what `glob_ambiguity` compares) once imports are resolved
+    pub glob_prec_cache: crate::conc::MemoMap<(u32, Sym, bool), Option<(DefId, BindVis)>>,
     /// the crates being checked (`makepad check`): the only ones whose paths are privacy-checked
     pub own_crates: Vec<bool>,
     /// lexical lookups (`lookup_in_scope`) once imports are resolved: (module, name, ns_type);
@@ -828,6 +832,8 @@ impl Program {
             errors: Vec::new(),
             macros: Default::default(),
             glob_cache: Default::default(),
+            glob_amb_cache: Default::default(),
+            glob_prec_cache: Default::default(),
             own_crates: Vec::new(),
             scope_cache: Default::default(),
             import_used: Default::default(),
@@ -2099,7 +2105,7 @@ impl Program {
         }
         if self.imports_done {
             self.scope_cache.clear();
-            self.glob_cache.clear();
+            self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
         }
         // only the crates that can see `file` can see what it added (lead decision 52 R1)
         let visible = self.crates_seeing_files([file].into_iter());
@@ -2210,7 +2216,7 @@ impl Program {
             }
         }
         self.scope_cache.clear();
-        self.glob_cache.clear();
+        self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
     }
 
     /// Hot reload: the imports of the `use` item at `pos` of file `file` go (a removed or edited
@@ -2247,7 +2253,7 @@ impl Program {
             out.push(UseUndo { index: i, module: m, bind, done, glob, bound, gone });
         }
         self.scope_cache.clear();
-        self.glob_cache.clear();
+        self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
         out
     }
 
@@ -2266,7 +2272,7 @@ impl Program {
             }
         }
         self.scope_cache.clear();
-        self.glob_cache.clear();
+        self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
     }
 
     /// Hot reload: takes out the imports from index `i0` on (a refused edit's `use` items) and
@@ -2294,7 +2300,7 @@ impl Program {
             self.imports_of_module.entry(im.module).or_default().push(j as u32);
         }
         self.scope_cache.clear();
-        self.glob_cache.clear();
+        self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
     }
 
     /// Hot reload: binds defs again (a refused edit that had removed them).
@@ -2317,7 +2323,7 @@ impl Program {
             }
         }
         self.scope_cache.clear();
-        self.glob_cache.clear();
+        self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
     }
 
     fn retarget_file(&mut self, from: u32, to: u32, map: &[(u32, u32)]) {
@@ -2912,7 +2918,7 @@ impl Program {
 
     fn resolve_imports_in(&mut self, visible: Option<&[bool]>) {
         self.imports_done = false;
-        self.glob_cache.clear();
+        self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
         self.trait_bind_cache.clear();
         self.scope_cache.clear();
         self.resolve_imports_fixpoint(0);

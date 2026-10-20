@@ -3742,6 +3742,15 @@ impl<'a> Fcx<'a> {
                 return (Res::Err, error);
             }
         };
+        // (rustc probe_for_name / resolve_fully_qualified_call: the self type is structurally resolved --
+        // an alias such as `type Foo<T> = <Option<T> as Mirror>::Assoc` names the type it normalizes to)
+        let self_ty = self.shallow(self_ty);
+        // the next solver proves the self type well formed before the lookup (its WF goal may constrain the
+        // inference variables the written type mentions: `Alias::foo()` with `Foo<?t, <() as Constrain<?t>>::Assoc>`)
+        if self.tcx.tys.has_infer(self.infcx.deeply_resolve_ignoring_regions(self_ty)) {
+            self.register_wf(self_ty, path.lo);
+            self.retry_goals(false);
+        }
         let name = segs[n - 1].1;
         // enum variant through a type alias / Self
         if let TyKind::Adt(ad, aargs, _) = self.tcx.tys.kind(self_ty).clone() {
@@ -6043,7 +6052,7 @@ impl<'a> Fcx<'a> {
                 // a primitive left operand with a non-primitive right one is an operator trait
                 // call too (`3u32 * duration`: `impl Mul<Duration> for u32`; rustc is_builtin_binop
                 // needs both sides primitive)
-                if matches!(self.tcx.tys.kind(sb0), TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..)) {
+                if matches!(self.tcx.tys.kind(sb0), TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..) | TyKind::Infer(_)) {
                     let sa = self.shallow(ta);
                     if let Some(r) = self.prim_lhs_op(op, e, sa, sb0, lo) {
                         return r;
