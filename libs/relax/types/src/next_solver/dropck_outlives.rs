@@ -4,9 +4,8 @@
 //! The `DropckOutlives` type op: which types and regions a destructor of `dropped_ty` may touch.
 //!
 //! Deviations (each is a Relax data gap, not a policy):
-//! * coroutines: rustc asks `mir_coroutine_witnesses` whether any interior type needs drop;
-//!   Relax has no witnesses here, so a coroutine conservatively takes the "needs drop" arm
-//!   (its upvars are use-live).
+//! * coroutines: rustc asks `mir_coroutine_witnesses` whether any interior type needs drop; borrowck
+//!   computes that when it has built the coroutine's MIR (`Tcx::coroutine_witness_needs_drop`).
 //! * `query_normalize` of the dtorck types is the ocx's deep normalization; a failure is a
 //!   `NoSolution` for the whole op.
 use super::*;
@@ -75,6 +74,13 @@ fn type_param_decl_index(tcx: &Tcx, prog: &Program, imp: DefId, compact: u32) ->
 /// rustc_traits/src/dropck_outlives.rs:34 adt_dtorck_constraint, over the ADT's identity
 /// parameters.
 pub fn adt_dtorck_constraint(tcx: &Tcx, prog: &Program, def: DefId, limit: usize) -> DropckConstraint {
+    if let Some(done) = tcx.dtorck_constraints.lock().unwrap().get(&(def, limit)) { return (**done).clone(); }
+    let result = adt_dtorck_constraint_uncached(tcx, prog, def, limit);
+    tcx.dtorck_constraints.lock().unwrap().insert((def, limit), std::sync::Arc::new(result.clone()));
+    result
+}
+
+fn adt_dtorck_constraint_uncached(tcx: &Tcx, prog: &Program, def: DefId, limit: usize) -> DropckConstraint {
     let adt = &tcx.adts[&def];
     let identity = tcx.generic_indices_of(prog, def).identity_args(&tcx.tys);
     if adt.is_phantom_data() {
@@ -82,6 +88,11 @@ pub fn adt_dtorck_constraint(tcx: &Tcx, prog: &Program, def: DefId, limit: usize
         return DropckConstraint { outlives: vec![], dtorck_types: vec![t], overflows: vec![] };
     }
     let mut result = DropckConstraint::default();
+    // (rustc's Box owns its `T` through `Unique<T>`'s `PhantomData<T>` marker; Relax's Box holds
+    // only a `NonNull<T>`, so the owned `T` is the Box's dtorck type itself)
+    if adt.is_box() {
+        if let Some(GenericArg::Type(t)) = identity.iter().copied().find(|a| matches!(a, GenericArg::Type(_))) { result.dtorck_types.push(t); }
+    }
     for variant in &adt.variants {
         for field in &variant.fields { dtorck_constraint_for_ty_inner(tcx, prog, limit, 0, field.ty, &mut result); }
     }
@@ -91,14 +102,6 @@ pub fn adt_dtorck_constraint(tcx: &Tcx, prog: &Program, def: DefId, limit: usize
     let mut seen = HashSet::new();
     result.dtorck_types.retain(|v| seen.insert(*v));
     result
-}
-
-/// A coroutine that never suspends saves no local across a suspension point, so its witness
-/// (`mir_coroutine_witnesses`) is empty and no interior type needs drop: only its upvars are
-/// drop-live, as for a closure. With suspension points the witnesses are not computed (module doc).
-fn coroutine_has_no_suspension_points(tcx: &Tcx, prog: &Program, _file: u32, expr: u32, owner: TyId) -> bool {
-    let TyKind::FnDef(def, ..) = *tcx.tys.kind(owner) else { return false };
-    tcx.typeck(prog, def).min_captures.get(&expr).is_some_and(|c| c.suspension_points == Some(0))
 }
 
 /// dropck_outlives.rs:284 dtorck_constraint_for_ty_inner.
@@ -111,8 +114,10 @@ pub fn dtorck_constraint_for_ty_inner(tcx: &Tcx, prog: &Program, limit: usize, d
         TyKind::Tuple(ts) => for &t in tys.list(ts) { dtorck_constraint_for_ty_inner(tcx, prog, limit, depth + 1, t, out); },
         TyKind::Closure(file, expr, args) => {
             let upvars = match *tys.kind(args.tupled_upvars_ty) { TyKind::Tuple(ts) => tys.list(ts).to_vec(), _ => vec![] };
-            if tcx.is_coroutine(ty) && !coroutine_has_no_suspension_points(tcx, prog, file, expr, args.parent_args) {
-                // the needs-drop arm: use-live upvars (no coroutine witnesses, see the module doc)
+            // rustc dtorck_constraint_for_ty_inner (Coroutine): when any type of the witness needs drop, the
+            // upvars are use-live; otherwise they are only drop-live. The resume type adds nothing: its regions
+            // are the coroutine's own. A coroutine whose witness is not known (its MIR was not built) has none.
+            if tcx.is_coroutine(ty) && tcx.coroutine_witness_needs_drop.get(&(file, expr)).unwrap_or(false) {
                 out.outlives.extend(upvars.iter().map(|&t| GenericArg::Type(t)));
             } else {
                 for t in upvars { dtorck_constraint_for_ty_inner(tcx, prog, limit, depth + 1, t, out); }

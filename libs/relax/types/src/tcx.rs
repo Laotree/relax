@@ -200,6 +200,9 @@ pub struct OpaqueDecl {
 
 pub struct Tcx {
     pub dcx: crate::infer::diagnostics::DiagCtxt,
+    /// `adt_dtorck_constraint` per (ADT, recursion limit): a query in rustc; uncached, a chain of
+    /// ADTs that each hold the previous one several times is exponential
+    pub(crate) dtorck_constraints: std::sync::Mutex<crate::fxhash::HashMap<(DefId, usize), std::sync::Arc<crate::next_solver::dropck_outlives::DropckConstraint>>>,
     pub tys: Types,
     envs: env::Envs,
     /// Immutable entries; each declaration is lowered once by its first reader.
@@ -239,6 +242,9 @@ pub struct Tcx {
     /// closure types that are coroutines -- they implement Future<Output = sig's return>; their
     /// storage record holds the state word and is extended by saved locals (coro_frames).
     pub coroutines: crate::conc::MemoMap<(u32, u32), ()>,
+    /// `mir_coroutine_witnesses` reduced to what dropck asks (whether any local live across a suspension
+    /// point needs drop), per coroutine (file, expr), set when borrowck has built the coroutine's MIR.
+    pub coroutine_witness_needs_drop: crate::conc::MemoMap<(u32, u32), bool>,
     /// a coroutine type's saved locals after its upvars: (end offset, alignment), made when its
     /// poll function is lowered (coroutine_transform)
     pub coro_frames: crate::conc::MemoMap<TyId, (u32, u32)>,
@@ -383,6 +389,7 @@ impl Tcx {
         Tcx {
             tys,
             dcx: Default::default(),
+            dtorck_constraints: Default::default(),
             envs: env::Envs::new(),
             sigs: Default::default(),
             ctor_sigs: Default::default(),
@@ -407,6 +414,7 @@ impl Tcx {
             adt_destructors: Default::default(),
             destructor_impls: Default::default(),
             coroutines: crate::conc::MemoMap::with_bits(10),
+            coroutine_witness_needs_drop: crate::conc::MemoMap::with_bits(10),
             coro_frames: Default::default(),
             coro_shapes: Default::default(),
             coro_slot_ty: Default::default(),

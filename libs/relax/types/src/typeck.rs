@@ -4930,6 +4930,10 @@ impl<'a> Fcx<'a> {
                         TyKind::Ptr(..) | TyKind::FnDef(..) | TyKind::FnPtr(..) => Some(self.tcx.tys.usize_),
                         _ => None,
                     }
+                } else if matches!(self.ast().expr(inner).kind, ExprKind::Closure(_)) {
+                    // ExpectCastableToType reaches the closure's signature deduction (`to_option`):
+                    // `(|_| {}) as for<'a> fn(&'a ())` is higher-ranked.
+                    Some(st)
                 } else { None };
                 let xt = self.check_expr(*x, hint);
                 if self.tcx.validates(self.prog, self.file) { self.cast_checks.push((*x, xt, target, lo)); }
@@ -7265,6 +7269,7 @@ impl<'a> Fcx<'a> {
                 NextSolverError::Overflow(o) => ("E0275", o),
             };
             let predicate = &obligation.goal.predicate;
+            if crate::wfcheck::obligations::predicate_mentions_error(&self.infcx, predicate) { continue; }
             // rustc's wording (rustc_trait_selection report_selection_error and core's
             // #[rustc_on_unimplemented] messages) for an unmet trait bound
             if let PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(p)) = &predicate.kind {
