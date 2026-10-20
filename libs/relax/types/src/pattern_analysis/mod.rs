@@ -33,6 +33,8 @@ pub struct DPat {
     pub ty: TyId,
     /// the source position diagnostics point at (None: a `_` / `..` with no position of its own)
     pub pos: Option<u32>,
+    /// an exclusive range pattern `lo..hi` (the non_contiguous_range_endpoints lint)
+    pub range_excl: bool,
 }
 
 /// The analysis context of one body: its types, the module it is in, the lowered patterns.
@@ -265,7 +267,7 @@ impl<'a> Cx<'a> {
     }
 
     fn push(&mut self, ctor: Ctor, fields: Vec<(usize, PIx)>, arity: usize, ty: TyId, pos: Option<u32>) -> PIx {
-        self.pats.push(DPat { ctor, fields, arity, ty, pos });
+        self.pats.push(DPat { ctor, fields, arity, ty, pos, range_excl: false });
         self.pats.len() - 1
     }
 
@@ -950,7 +952,11 @@ impl<'a> Cx<'a> {
             _ => None,
         };
         match ctor {
-            Some(c) => Some(self.push(c, Vec::new(), 0, t, pos)),
+            Some(c) => {
+                let p = self.push(c, Vec::new(), 0, t, pos);
+                self.pats[p].range_excl = !incl && b.is_some();
+                Some(p)
+            }
             None => Some(self.opaque(t, pos)),
         }
     }
@@ -1410,6 +1416,7 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        self.report_range_lints(&report.range_lints, ast.expr(scrut).lo);
         let witnesses = report.non_exhaustiveness_witnesses;
         if witnesses.is_empty() {
             return;
@@ -1441,6 +1448,40 @@ impl<'a> Checker<'a> {
             format!("E0004: non-exhaustive patterns: {} not covered -- {}; ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern", joined, notes)
         };
         self.errors.push(self.cx.prog.record_error(self.cx.body.file, pos, "typeck", msg));
+    }
+
+    /// rustc.rs lint_overlapping_range_endpoints / lint_non_contiguous_range_endpoints.
+    fn report_range_lints(&self, lints: &[usefulness::RangeLint], fallback: u32) {
+        let mut seen: Vec<(PIx, Vec<PIx>, bool)> = Vec::new();
+        for l in lints {
+            match l {
+                usefulness::RangeLint::Overlap { pat, overlaps_with, on } => {
+                    let mut key = overlaps_with.clone();
+                    key.sort_unstable();
+                    if seen.iter().any(|(p, k, o)| *o && p == pat && *k == key) { continue; }
+                    seen.push((*pat, key, true));
+                    let pos = self.cx.pat(*pat).pos.unwrap_or(fallback);
+                    let msg = format!("multiple patterns overlap on their endpoints -- this range overlaps on `{}`", self.cx.print_range(on, self.cx.pat(*pat).ty));
+                    self.lint(&crate::lint::OVERLAPPING_RANGE_ENDPOINTS, pos, &msg);
+                }
+                usefulness::RangeLint::NonContiguous { pat_before, gapped_with, gap } => {
+                    let p = self.cx.pat(*pat_before);
+                    // only an exclusive range `lo..gap`
+                    if !p.range_excl { continue; }
+                    let mut key = gapped_with.clone();
+                    key.sort_unstable();
+                    if seen.iter().any(|(q, k, o)| !*o && q == pat_before && *k == key) { continue; }
+                    seen.push((*pat_before, key, false));
+                    let pos = p.pos.unwrap_or(fallback);
+                    let g = self.cx.print_range(gap, p.ty);
+                    if gapped_with.is_empty() {
+                        self.lint(&crate::lint::NON_CONTIGUOUS_RANGE_ENDPOINTS, pos, &format!("exclusive range missing `{}`", g));
+                    } else {
+                        self.lint(&crate::lint::NON_CONTIGUOUS_RANGE_ENDPOINTS, pos, &format!("multiple ranges are one apart -- this range doesn't match `{}` because `..` is an exclusive range", g));
+                    }
+                }
+            }
+        }
     }
 
     fn report_unreachable(&self, p: PIx, covered_by: &[PIx], fallback: u32, attrs: &[Attr]) {
@@ -1483,6 +1524,7 @@ impl<'a> Checker<'a> {
             _ => PlaceValidity::ValidOnly,
         };
         let report = usefulness::compute_match_usefulness(&self.cx, &[MatchArm { pat, has_guard: false }], ty, validity)?;
+        self.report_range_lints(&report.range_lints, fallback);
         // (check_match.rs analyze_patterns: the redundant parts of a useful pattern)
         if let Usefulness::Useful(subs) = &report.arm_usefulness[0] {
             for (sp, covered_by) in subs {

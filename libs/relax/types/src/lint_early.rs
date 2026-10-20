@@ -748,7 +748,13 @@ impl<'a> W<'a> {
     }
 
     /// rustc `UnusedDelimLint::check_unused_delims_expr` of UnusedParens (`parens`) or UnusedBraces.
-    fn delims(&self, parens: bool, value: ExprId, ctx: Ctx, followed_by_block: bool) {
+    fn delims(&self, parens: bool, mut value: ExprId, ctx: Ctx, followed_by_block: bool) {
+        // the parens a macro transcription adds around an `$e:expr` fragment are no node of
+        // rustc's (the fragment is one interpolated expression)
+        while let ExprKind::Paren(inner) = self.kind(value) {
+            if !crate::macros::uses::is_synth_paren(&self.prog.file_paths[self.file as usize], self.ast.expr(value).lo) { break; }
+            value = inner;
+        }
         let v = *self.ast.expr(value);
         if parens {
             match v.kind {
@@ -2715,6 +2721,28 @@ fn back_kw_pos(pf: &crate::parser::ParsedFile, at: u32, kw: &str) -> u32 {
     if j >= n && pf.bytes(j - n, j) == kw.as_bytes() { j - n } else { at }
 }
 
+// ---------------------------------------------------------------- semicolon_in_expressions_from_macros
+
+pub const SEMICOLON_IN_EXPRESSIONS_FROM_MACROS: Lint = lint::lint("semicolon_in_expressions_from_macros");
+
+/// rustc_expand ParserAnyMacro::make: a local `macro_rules!` expansion parsed as an expression
+/// that ends with a `;`. The parser records the `;` (only under `makepad check`).
+fn trailing_semis(prog: &Program, own: &[bool]) {
+    let mut seen = std::collections::HashSet::new();
+    for t in crate::macros::uses::take_trailing_semis() {
+        let Some(file) = prog.file_paths.iter().position(|p| *p == t.file) else { continue };
+        let krate = prog.file_crate.get(file).copied().unwrap_or(u32::MAX);
+        if !own.get(krate as usize).copied().unwrap_or(false) { continue; }
+        // `is_local`: the macro is defined in the crate that calls it
+        let local = prog.file_paths.iter().position(|p| *p == t.def_file).is_some_and(|f| prog.file_crate.get(f).copied() == Some(krate));
+        if !local { continue; }
+        if !seen.insert((file, t.semi)) { continue; }
+        let pf = &prog.files[file];
+        let def = enclosing_def(prog, file as u32, pf.lint_pos(t.call), krate);
+        emit(prog, def, &SEMICOLON_IN_EXPRESSIONS_FROM_MACROS, file as u32, t.semi, "trailing semicolon in macro used in expression position");
+    }
+}
+
 // ---------------------------------------------------------------- unused_macros / unused_macro_rules
 
 pub const UNUSED_MACROS: Lint = lint::lint("unused_macros");
@@ -2725,6 +2753,7 @@ pub const UNUSED_MACRO_RULES: Lint = lint::lint("unused_macro_rules");
 /// expansion matched.
 pub fn finish(prog: &Program, own: &[bool]) {
     if !lint::enabled() { return; }
+    trailing_semis(prog, own);
     let (defs, used) = crate::macros::uses::take();
     if defs.is_empty() { return; }
     // Bodies nothing demanded are never expanded, so an invocation inside one leaves no record:

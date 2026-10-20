@@ -156,6 +156,8 @@ struct Leaf {
     name: Option<String>,
     glob: bool,
     empty: bool,
+    /// written `as _`
+    under: bool,
     span: (u32, u32),
     /// the leaf's path as segments (for resolving the target)
     segs: Vec<PathSeg>,
@@ -174,7 +176,8 @@ fn leaves(prog: &Program, file: u32, ast: &Ast, t: &UseTree, start: u32, item_hi
                     if seg.kind() == SegKind::SelfValue { prefix.last().map(|s| pf.text(s.name).to_string()) } else { Some(pf.text(seg.name).to_string()) }
                 }
             };
-            out.push(Leaf { name, glob: false, empty: false, span: (start, end), segs });
+            let under = rename.is_some_and(|r| pf.text(r) == "_");
+            out.push(Leaf { name, glob: false, empty: false, under, span: (start, end), segs });
         }
         UseTree::Path(seg, child) => {
             prefix.push(seg);
@@ -185,12 +188,12 @@ fn leaves(prog: &Program, file: u32, ast: &Ast, t: &UseTree, start: u32, item_hi
         UseTree::Glob => {
             // `*` has no segment of its own: ends at the last segment's end + `::*`
             let end = prefix.last().map_or(start, |s| s.name.hi);
-            out.push(Leaf { name: None, glob: true, empty: false, span: (start, end + 3) , segs: prefix.clone() });
+            out.push(Leaf { name: None, glob: true, empty: false, under: false, span: (start, end + 3) , segs: prefix.clone() });
         }
         UseTree::Group(l) => {
             if ast.list(l).is_empty() {
                 // `use a::{};` imports nothing: unused, as a whole
-                out.push(Leaf { name: None, glob: false, empty: true, span: (start, item_hi) , segs: prefix.clone() });
+                out.push(Leaf { name: None, glob: false, empty: true, under: false, span: (start, item_hi) , segs: prefix.clone() });
             }
             for c in ast.list(l) {
                 // a nested tree starts at its own first segment
@@ -353,7 +356,12 @@ pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::
             };
             for l in &ls {
                 if dup_glob(l) { continue; }
-                if exported && !(l.glob && ctx.glob_imports_nothing(l)) && !l.empty { continue; }
+                if exported && !(l.glob && ctx.glob_imports_nothing(l)) && !l.empty {
+                    // check_import_as_underscore: an exported `as _` import of anything but a
+                    // trait binds nothing a user can name
+                    if l.under && !ctx.is_trait_import(l) { unused.push(l.span); }
+                    continue;
+                }
                 if !ctx.leaf_used(l) {
                     unused.push(l.span);
                 }
@@ -427,6 +435,29 @@ impl Ctx<'_, '_> {
         let m = &prog.mods[td.sub as usize];
         let visible = |d: DefId| prog.def(d).is_pub;
         !(m.types.values().any(|&d| visible(d)) || m.values.values().any(|&d| visible(d)) || m.macros.values().any(|&d| visible(d)) || m.globs.iter().any(|_| true))
+    }
+
+    /// Whether the leaf's path resolves to a trait in the type namespace.
+    /// (An unresolvable path counts as a trait: it is never reported.)
+    fn is_trait_import(&self, l: &Leaf) -> bool {
+        let prog = self.prog;
+        let pf = &prog.files[self.sc.file as usize];
+        if self.sc.block || self.sc.module == u32::MAX { return true; }
+        let Some((last, prefix)) = l.segs.split_last() else { return true };
+        let segs: Vec<(SegKind, crate::program::Sym)> = prefix.iter().map(|s| (s.kind(), prog.syms.intern_late(pf.text(s.name)))).collect();
+        let name = prog.syms.intern_late(pf.text(last.name));
+        let found = if segs.is_empty() {
+            prog.lookup_in_scope(self.sc.module, name, true)
+        } else {
+            let Some(m) = prog.resolve_mod_path(self.sc.module, false, &segs, false, true).or_else(|| prog.resolve_mod_path(self.sc.module, true, &segs, false, true)) else { return true };
+            let td = prog.def(m);
+            if td.kind != DefKind::Mod { return true; }
+            prog.mods[td.sub as usize].types.get(&name).copied()
+        };
+        match found {
+            Some(d) => prog.def(d).kind == DefKind::Trait,
+            None => true,
+        }
     }
 
     fn leaf_used(&self, l: &Leaf) -> bool {
