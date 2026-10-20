@@ -863,3 +863,22 @@ fn an_ambiguous_subtype_predicate_is_a_type_annotation_error() {
     let errors = typeck_errors_source("pub fn main() { let x = []; }", 2021);
     assert!(errors.iter().any(|e| e.contains("E0282")) && !errors.iter().any(|e| e.contains("E0283")), "{errors:?}");
 }
+
+#[test]
+fn a_use_of_an_opaque_type_with_non_parameter_arguments_is_e0792() {
+    // On stable a non-defining use of an opaque type in its defining scope is a hard error
+    // (impl-trait/rpit/non-defining-use.rs, non-defining-use-lifetimes.rs, recursive-ice-101862.rs).
+    let (errors, unchecked) = borrowck_source_in("
+        #![allow(unconditional_recursion)]
+        pub fn foo<T>() -> impl Sized { let _: () = foo::<u8>(); }
+        pub fn bar<T>(val: T) -> impl Sized { let _: u8 = bar(0u8); val }
+        pub fn ice(x: impl AsRef<str>) -> impl IntoIterator<Item = ()> { vec![].append(&mut ice(x.as_ref())); Vec::new() }", 2021);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert_eq!(errors.iter().filter(|e| e.starts_with("E0792") && e.contains("expected generic type parameter, found")).count(), 3, "{errors:?}");
+    let (errors, _) = borrowck_source_in("
+        type Lt<'lt> = Option<*mut &'lt ()>;
+        pub fn foo<'a>(_: Lt<'a>) -> impl Sized + 'a { let _: () = foo(Lt::<'static>::None); }
+        pub fn equal<'a, 'b>(_: Lt<'a>, _: Lt<'b>) -> impl Sized + 'a + 'b { let _: () = equal(Lt::<'a>::None, Lt::<'a>::None); }", 2021);
+    assert!(errors.iter().any(|e| e.starts_with("E0792") && e.contains("expected generic lifetime parameter, found `'static`")), "{errors:?}");
+    assert!(errors.iter().any(|e| e.contains("non-defining opaque type use in defining scope")), "{errors:?}");
+}
