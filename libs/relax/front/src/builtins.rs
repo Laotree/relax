@@ -715,7 +715,8 @@ pub fn expand(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: 
         let sources = p.sources.as_ref().ok_or("include! requires a source registry")?;
         let file = sources.register(&path, std::sync::Arc::from(text.as_bytes()))?;
         let mut toks = Vec::new();
-        crate::lexer::lex(text.as_bytes(), p.edition, &mut toks).map_err(|e| format!("`{path}`: {}", e.msg))?;
+        let lexed = if p.include_as_expr { crate::lexer::lex_keep_shebang(text.as_bytes(), p.edition, &mut toks) } else { crate::lexer::lex(text.as_bytes(), p.edition, &mut toks) };
+        lexed.map_err(|e| format!("`{path}`: {}", e.msg))?;
         toks.retain(|t| t.kind != T::Eof);
         let mut origins = Vec::new();
         let mut origin = |lo, hi| origins.push(TokenOrigin { lo, hi, source: SourceSpan { file, lo, hi } });

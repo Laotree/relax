@@ -148,6 +148,10 @@ pub struct Parser<'a> {
     in_assoc: u32,
     /// parsing the members of a trait (2015: parameters may be anonymous)
     in_trait: bool,
+    /// a statement macro call is being resolved (`include!` there is an expression)
+    stmt_ctx: bool,
+    /// the `include!` being expanded is an expression or statement: its file keeps a leading `#!`
+    pub include_as_expr: bool,
     foreign_abi: Option<Option<Ident>>,
     /// inside a cfg'd-out item (parse_cfg_out): nothing is generated
     cfg_out: u32,
@@ -212,6 +216,8 @@ impl<'a> Parser<'a> {
             pending_inner: Vec::new(),
             in_assoc: 0,
             in_trait: false,
+            stmt_ctx: false,
+            include_as_expr: false,
             foreign_abi: None,
             cfg_out: 0,
             pending_shape: Vec::new(),
@@ -1766,6 +1772,7 @@ impl<'a> Parser<'a> {
     /// At an item / statement start: a `macro_rules!` call (`path!(..)` / `path! { .. }` ending
     /// the item or statement) expanded and parsed with `f`.
     fn try_expand_rules<X>(&mut self, f: impl FnOnce(&mut Self, bool, bool) -> PResult<X>) -> PResult<Option<X>> {
+        let as_expr = std::mem::take(&mut self.stmt_ctx);
         if self.macros.is_none() || !self.mac_ahead() {
             return Ok(None);
         }
@@ -1791,7 +1798,10 @@ impl<'a> Parser<'a> {
         // expanded as one expression (an `Eof` after it is the end of an enclosing expansion: a statement)
         let tail_expr = delim != b'{' && self.kind() == T::CloseBrace && def.builtin == 0 && crate::lexer::validation_enabled() && (lo as usize) < self.src.len();
         self.eat(T::Semi);
-        let start = self.expand_call(&def, toks, lo)?;
+        self.include_as_expr = as_expr;
+        let start = self.expand_call(&def, toks, lo);
+        self.include_as_expr = false;
+        let start = start?;
         let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
         if trailing && def.builtin == 0 && crate::macros::uses::recording() {
             // a macro call ending a block is an expression (rustc_expand flat_map_stmt
@@ -1863,6 +1873,7 @@ impl<'a> Parser<'a> {
     /// block (a `;` after the call ends a tail expression). False (cursor unspecified) when it
     /// is not one.
     fn stmt_macro(&mut self, stmts: &mut Vec<Stmt>) -> PResult<bool> {
+        self.stmt_ctx = true;
         let r = self.try_expand_rules(|p, include, tail_expr| {
             let mut v = Vec::new();
             if tail_expr {
@@ -4713,7 +4724,10 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     let (delim, toks) = self.delim_tt()?;
                     if let Some(def) = self.rules_macro(&path) {
-                        let start = self.expand_call(&def, toks, lo)?;
+                        self.include_as_expr = true;
+                        let start = self.expand_call(&def, toks, lo);
+                        self.include_as_expr = false;
+                        let start = start?;
                         let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
                         return self.in_expansion(start, |p| {
                             let e = p.expr()?;
