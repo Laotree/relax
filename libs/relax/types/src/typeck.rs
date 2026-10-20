@@ -2360,18 +2360,6 @@ impl<'a> Fcx<'a> {
                         }
                     }
                 }
-                // check_match: a by-value binding named like a unit variant of the matched enum
-                if sub.is_none() && !*by_ref && !*mutbl && self.tcx.validates(self.prog, self.file) {
-                    let mut t = self.shallow(expected);
-                    while let TyKind::Ref(_, i, _) = self.tcx.tys.kind(t).clone() { t = self.shallow(i); }
-                    if let TyKind::Adt(ed, _, _) = self.tcx.tys.kind(t).clone() {
-                        if self.tcx.adts.get(&ed).is_some_and(|a| a.is_enum && a.variants.iter().any(|v| v.name == s && v.shape == 0)) {
-                            let en = crate::typeck::ty_to_string(false, self.prog, self.tcx, t);
-                            crate::lint::emit(self.prog, self.b.def, &crate::lint::BINDINGS_WITH_VARIANT_NAME, self.file, name.lo,
-                                &format!("E0170: pattern binding `{}` is named the same as one of the variants of the type `{}`", self.text(*name), en));
-                        }
-                    }
-                }
                 let ty = if *by_ref {
                     self.tcx.tys.intern(TyKind::Ref(*mutbl, expected, crate::types::RegionId::ERASED))
                 } else if self.bind_mode != 0 && !*mutbl {
