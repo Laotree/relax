@@ -97,6 +97,8 @@ pub struct Parser<'a> {
     pub token_input: bool,
     pub sources: Option<std::sync::Arc<SourceRegistry>>,
     exp_depth: u32,
+    /// the file's written `#![recursion_limit]`, read on the first macro call
+    rec_limit: std::cell::Cell<Option<Option<u32>>>,
     /// macro_rules expansions: (text lo, text hi, the macro's definition position in this
     /// file; 0 when defined elsewhere) -- the hygiene marks (ParsedFile::hyg_ctxt)
     pub rules_exp: OSeg<'a, Regions>,
@@ -169,6 +171,7 @@ impl<'a> Parser<'a> {
             token_input: false,
             sources: None,
             exp_depth: 0,
+            rec_limit: std::cell::Cell::new(None),
             rules_exp: Default::default(),
             body_origin: Default::default(),
             tok_undo: Vec::new(),
@@ -1308,8 +1311,30 @@ impl<'a> Parser<'a> {
         self.expand_call_inner(def, toks, call_lo)
     }
 
+    /// The `#![recursion_limit = ".."]` of this file's inner attributes.
+    fn written_recursion_limit(&self) -> Option<u32> {
+        if let Some(v) = self.rec_limit.get() { return v; }
+        let v = self.read_recursion_limit();
+        self.rec_limit.set(Some(v));
+        v
+    }
+
+    fn read_recursion_limit(&self) -> Option<u32> {
+        self.ast.root_attrs.iter().find_map(|a| {
+            if a.toks.hi == a.toks.lo + 3 && self.tok_text(self.toks.at(a.toks.lo as usize)) == b"recursion_limit" && self.tok_text(self.toks.at(a.toks.lo as usize + 1)) == b"=" {
+                std::str::from_utf8(self.tok_text(self.toks.at(a.toks.lo as usize + 2))).ok()?.trim_matches('"').parse().ok()
+            } else { None }
+        })
+    }
+
     fn expand_call_inner(&mut self, def: &crate::macros::MacroDef, toks: TokRange, call_lo: u32) -> PResult<usize> {
-        if self.exp_depth > 256 {
+        // rustc_expand expand_invoc: the crate's `#![recursion_limit = ".."]` bounds the expansion depth (a top-level call
+        // is at depth 1); the written limit is the root file's, other files keep the built-in bound
+        if let Some(limit) = self.written_recursion_limit() {
+            if self.exp_depth + 1 > limit {
+                return Err(PErr { pos: call_lo, msg: format!("recursion limit reached while expanding `{}!`", def.name) });
+            }
+        } else if self.exp_depth > 256 {
             return Err(PErr { pos: call_lo, msg: format!("`{}!` expands more than 256 levels deep -- add a base case", def.name) });
         }
         let trace = crate::preload::relax_trace().map_or(false, |t| t.split(',').any(|p| p.strip_prefix("expand:").map_or(false, |n| def.name.contains(n))));
