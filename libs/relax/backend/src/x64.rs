@@ -799,7 +799,12 @@ impl<'a> Gen<'a> {
                 scratch
             }
             _ => {
-                self.remat_into(scratch, v);
+                if let Remat::Offset(b, k) = self.al.remat[v.0 as usize] {
+                    let (rb, d) = self.base_disp(options, b, scratch, k);
+                    self.a.lea(scratch, rb, d);
+                } else {
+                    self.remat_into(scratch, v);
+                }
                 scratch
             }
         }
@@ -816,15 +821,25 @@ impl<'a> Gen<'a> {
             // mov r, [rip + pool] leaves the flags alone
             Remat::Addr(a) => self.mov_reloc(r, Reloc::Sym(a)),
             Remat::FnAddr(id) => self.mov_reloc(r, Reloc::Thunk(id)),
+            Remat::Offset(..) => unreachable!("base + k moves through use_i"),
             _ => self.a.mov_ri_nf(r, 0),
         }
     }
     /// A load/store base and displacement: a stack-slot address that has no register (see
     /// Alloc::remat) folds into [rbp + disp].
     fn base_disp(&mut self, options: &relax_session::Options, base: VReg, scratch: u8, off: i32) -> (u8, i32) {
-        if let (Loc::None, Remat::Slot(s)) = (self.al.loc[base.0 as usize], self.al.remat[base.0 as usize]) {
-            let so = self.slot_off[s as usize];
-            return (RBP, off - (self.saved + so));
+        match (self.al.loc[base.0 as usize], self.al.remat[base.0 as usize]) {
+            (Loc::None, Remat::Slot(s)) => {
+                let so = self.slot_off[s as usize];
+                return (RBP, off - (self.saved + so));
+            }
+            // base + k without a register: k folds into the displacement
+            (Loc::None, Remat::Offset(b, k)) => {
+                if let Some(o) = off.checked_add(k) {
+                    return self.base_disp(options, b, scratch, o);
+                }
+            }
+            _ => {}
         }
         (self.use_i(options, base, scratch), off)
     }
@@ -916,7 +931,7 @@ impl<'a> Gen<'a> {
                 self.remat_into(R10, VReg(v));
                 self.a.store64(RBP, o, R10);
             }
-            (MLoc::F(_) | MLoc::K(_), _) | (_, MLoc::K(_)) => unreachable!("move {:?} <- {:?}", d, s),
+            (MLoc::F(_) | MLoc::K(_), _) => unreachable!("move {:?} <- {:?}", d, s),
         }
     }
 
@@ -2224,7 +2239,7 @@ impl<'a> Gen<'a> {
     fn inst(&mut self, options: &relax_session::Options, i: &Inst) {
         match i {
             // recomputed at each use (Alloc::remat)
-            Inst::Iconst(d, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::Mov(d, _) if self.al.remat[d.0 as usize].is_some() => {}
+            Inst::Iconst(d, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::Mov(d, _) | Inst::IBinI(IOp::Add, _, d, _, _) if self.al.remat[d.0 as usize].is_some() => {}
             Inst::Sel(d, c, a, b) => self.sel(options, *d, *c, *a, *b),
             Inst::VSel(..) | Inst::VFma(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) | Inst::VLoad(..) | Inst::VStore(..) | Inst::VAny(..) | Inst::VGather(..) | Inst::VConst(..) => self.vinst(options, i),
             Inst::VX(op, d, a, b) => self.vx(options, *op, *d, *a, *b),

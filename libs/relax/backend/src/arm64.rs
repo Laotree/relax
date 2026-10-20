@@ -699,15 +699,35 @@ impl<'a> Gen<'a> {
                 scratch
             }
             // recomputed at each use (Alloc::remat)
-            _ => {
-                if self.al.remat[v.0 as usize].is_some() {
+            _ => match self.al.remat[v.0 as usize] {
+                Remat::No => ZR,
+                Remat::Offset(b, k) => {
+                    let (b, o) = self.resolve_off(b, k as i64);
+                    let (rb, o) = match self.slot_base(b) {
+                        Some(so) => (SP, so + o),
+                        None => (self.use_i(b, scratch), o),
+                    };
+                    self.a.add_any(scratch, rb, o);
+                    scratch
+                }
+                _ => {
                     self.remat_into(scratch, v);
                     scratch
-                } else {
-                    ZR
                 }
-            }
+            },
         }
+    }
+    /// A memory base and offset with base + k values that have no register (Alloc::remat)
+    /// folded: their base and the summed offset.
+    fn resolve_off(&self, mut base: VReg, mut off: i64) -> (VReg, i64) {
+        while let (Loc::None, Remat::Offset(b, k)) = (self.al.loc[base.0 as usize], self.al.remat[base.0 as usize]) {
+            if off + k as i64 != (off + k as i64) as i32 as i64 {
+                break;
+            }
+            base = b;
+            off += k as i64;
+        }
+        (base, off)
     }
     /// Recomputes a value without a location (Alloc::remat) into r.
     fn remat_into(&mut self, r: u8, v: VReg) {
@@ -720,6 +740,7 @@ impl<'a> Gen<'a> {
             }
             Remat::Addr(a) => self.ldr_reloc(r, Reloc::Sym(a)),
             Remat::FnAddr(id) => self.ldr_reloc(r, Reloc::Thunk(id)),
+            Remat::Offset(..) => unreachable!("base + k moves through use_i"),
             Remat::No => self.a.mov_imm(r, 0),
         }
     }
@@ -733,6 +754,10 @@ impl<'a> Gen<'a> {
     /// [base + (idx << sh) + off] for an indexed access: the register-offset form when the shift
     /// is 0 or the access size and nothing is added, else ip1 = the address and the offset.
     fn index_addr(&mut self, base: VReg, ri: u8, sh: u8, off: i32, size: u32) -> (u8, Option<(u8, bool)>, i64) {
+        let (base, off) = match self.resolve_off(base, off as i64) {
+            (b, o) if o == o as i32 as i64 => (b, o as i32),
+            _ => (base, off),
+        };
         let scaled = sh as u32 == size.trailing_zeros();
         match self.slot_base(base) {
             Some(so) => {
@@ -850,7 +875,7 @@ impl<'a> Gen<'a> {
                     self.remat_into(S1, VReg(v));
                     self.a.ldst(STRX, 8, S1, SP, o as i64);
                 }
-                (d @ (MLoc::F(_) | MLoc::K(_)), s) | (d, s @ MLoc::K(_)) => unreachable!("move {:?} <- {:?}", d, s),
+                (d @ (MLoc::F(_) | MLoc::K(_)), s) => unreachable!("move {:?} <- {:?}", d, s),
             }
         }
     }
@@ -2677,7 +2702,7 @@ impl<'a> Gen<'a> {
     fn inst(&mut self, options: &relax_session::Options, i: &Inst) {
         match i {
             // recomputed at each use (Alloc::remat)
-            Inst::Iconst(d, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::Mov(d, _) if self.al.remat[d.0 as usize].is_some() => {}
+            Inst::Iconst(d, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::Mov(d, _) | Inst::IBinI(IOp::Add, _, d, _, _) if self.al.remat[d.0 as usize].is_some() => {}
             Inst::Iconst(d, v) => {
                 let r = self.def_i(*d, S0);
                 self.a.mov_imm(r, *v);
@@ -2874,9 +2899,10 @@ impl<'a> Gen<'a> {
                 self.ldst_x(op, size, rs, rn, rm, o);
             }
             Inst::Load(m, d, base, off) => {
-                let (rb, off) = match self.slot_base(*base) {
-                    Some(so) => (SP, &((so + *off as i64) as i32)),
-                    None => (self.use_i(*base, S1), off),
+                let (base, off) = self.resolve_off(*base, *off as i64);
+                let (rb, off) = match self.slot_base(base) {
+                    Some(so) => (SP, &((so + off) as i32)),
+                    None => (self.use_i(base, S1), &(off as i32)),
                 };
                 let (op, size) = mem_op(*m, true);
                 match m {
@@ -2893,9 +2919,10 @@ impl<'a> Gen<'a> {
                 }
             }
             Inst::Store(m, base, off, src) => {
-                let (rb, off) = match self.slot_base(*base) {
-                    Some(so) => (SP, &((so + *off as i64) as i32)),
-                    None => (self.use_i(*base, S1), off),
+                let (base, off) = self.resolve_off(*base, *off as i64);
+                let (rb, off) = match self.slot_base(base) {
+                    Some(so) => (SP, &((so + off) as i32)),
+                    None => (self.use_i(base, S1), &(off as i32)),
                 };
                 let (op, size) = mem_op(*m, false);
                 match m {

@@ -107,6 +107,11 @@ pub enum Remat {
     Addr(Sym),
     /// a function's table thunk
     FnAddr(u32),
+    /// base + k: an address derived from a value that is never redefined and is live wherever
+    /// this one is (e.g. `&self.table` from `self`); folds into the displacement of the
+    /// accesses based on it. Never a call argument or returned value (an argument move may
+    /// already have overwritten the base's register).
+    Offset(VReg, i32),
 }
 
 impl Remat {
@@ -853,6 +858,14 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     let wts = block_weights(options, f, &reach, freq);
     let aff = affinities(f, &reach, &block_start, &ranges, &wts);
     let (mut remat, base_only) = remat_values(options, f, &reach, cfg);
+    // base + k is recomputed only where the base is live (holds its one value)
+    for v in 0..nv as usize {
+        if let Remat::Offset(b, _) = remat[v] {
+            if !ranges_cover(ranges.of(b.0), ranges.of(v as u32)) {
+                remat[v] = Remat::No;
+            }
+        }
+    }
     // copy coalescing: vregs joined by a copy (or an operation whose operand dies there) whose
     // live ranges never meet become one allocation unit, strongest pairs first. The copies
     // between them then cost nothing, whatever order the units are placed in.
@@ -1507,6 +1520,15 @@ fn allocate_baseline(options: &relax_session::Options, f: &Func, cfg: &RegConfig
         }
     }
     let (mut remat, base_only) = remat_values(options, f, &reach, cfg);
+    // base + k: only inside the base's hull (it holds its one value there)
+    for v in 0..nv {
+        if let Remat::Offset(b, _) = remat[v] {
+            let b = b.0 as usize;
+            if start[v] != u32::MAX && !(start[b] <= start[v] && end[v] <= end[b]) {
+                remat[v] = Remat::No;
+            }
+        }
+    }
     let mut order: Vec<u64> = (0..nv).filter(|&v| start[v] != u32::MAX && !base_only[v]).map(|v| (start[v] as u64) << 32 | v as u64).collect();
     order.sort_unstable();
     // a call strictly inside (s, e)
@@ -1684,6 +1706,8 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
         }
         let mut cand: Vec<(u32, Remat)> = Vec::new();
         let mut movs: Vec<(u32, u32)> = Vec::new();
+        // call arguments and returned values (no Remat::Offset for them)
+        let mut argret = vec![false; nv];
         for (bi, b) in f.blocks.iter().enumerate() {
             if !reach[bi] {
                 continue;
@@ -1695,8 +1719,10 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
                     Inst::SlotAddr(d, n) => cand.push((d.0, Remat::Slot(*n))),
                     Inst::Addr(d, a) if crate::rir::SymClass::of(cfg.sym_class, a.id) != crate::rir::SymClass::Domain => cand.push((d.0, Remat::Addr(*a))),
                     Inst::FnAddr(d, n) => cand.push((d.0, Remat::FnAddr(*n))),
+                    Inst::IBinI(IOp::Add, IntTy { bits: 64, .. }, d, b2, k) if *k == *k as i32 as i64 => cand.push((d.0, Remat::Offset(*b2, *k as i32))),
                     Inst::Mov(d, s2) => movs.push((d.0, s2.0)),
-                    Inst::Call(c, _, _) => {
+                    Inst::Call(c, a, _) => {
+                        a.iter().for_each(|v| argret[v.0 as usize] = true);
                         if let Callee::Indirect(v) | Callee::CIndirect(v, _) = c {
                             nonbase[v.0 as usize] = true;
                         }
@@ -1725,13 +1751,25 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
                 }
             }
             match &b.term {
-                Term::Ret(vs) => vs.iter().for_each(|v| nonbase[v.0 as usize] = true),
+                Term::Ret(vs) => vs.iter().for_each(|v| {
+                    nonbase[v.0 as usize] = true;
+                    argret[v.0 as usize] = true;
+                }),
                 Term::Branch(c, _, _) | Term::Switch(c, _) => nonbase[c.0 as usize] = true,
                 _ => {}
             }
         }
+        let is_param = |v: VReg| f.params.contains(&v);
+        // an Offset base holds one value for the whole function: a parameter no instruction
+        // redefines, or a value with one definition
+        let fixed = |v: VReg| f.vregs[v.0 as usize] == Cls::I && if is_param(v) { ndef[v.0 as usize] == 0 } else { ndef[v.0 as usize] == 1 };
         for (d, i) in cand {
             let d = d as usize;
+            if let Remat::Offset(b2, _) = i {
+                if argret[d] || !fixed(b2) || b2.0 as usize == d {
+                    continue;
+                }
+            }
             if ndef[d] == 1 && !bad[d] && f.vregs[d] == Cls::I {
                 base_only[d] = !nonbase[d] && matches!(i, Remat::Slot(..));
                 remat[d] = i;
@@ -1742,7 +1780,7 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
             let mut more = false;
             for &(d, s2) in &movs {
                 let (d, s2) = (d as usize, s2 as usize);
-                if !remat[d].is_some() && remat[s2].is_some() && ndef[d] == 1 && !bad[d] && f.vregs[d] == Cls::I {
+                if !remat[d].is_some() && remat[s2].is_some() && ndef[d] == 1 && !bad[d] && f.vregs[d] == Cls::I && !(argret[d] && matches!(remat[s2], Remat::Offset(..))) {
                     remat[d] = remat[s2];
                     base_only[d] = !nonbase[d] && matches!(remat[d], Remat::Slot(..));
                     more = true;
@@ -3069,6 +3107,20 @@ fn split_loops(f: &mut Func, spilled: &[bool], inreg: Option<&[bool]>, hot: Opti
 
 fn coalesce_on(options: &relax_session::Options) -> bool {
     !options.no_coalesce
+}
+
+/// Is every position of `inner` inside `outer` (sorted, disjoint, merged range lists)?
+fn ranges_cover(outer: &[(u32, u32)], inner: &[(u32, u32)]) -> bool {
+    let mut k = 0;
+    for &(a, b) in inner {
+        while k < outer.len() && outer[k].1 < a {
+            k += 1;
+        }
+        if k == outer.len() || outer[k].0 > a || outer[k].1 < b {
+            return false;
+        }
+    }
+    true
 }
 
 /// Do two sorted, disjoint range lists share a position?
