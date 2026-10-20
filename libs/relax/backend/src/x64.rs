@@ -1138,9 +1138,11 @@ impl<'a> Gen<'a> {
             self.test_fuse = None;
             if fused && n >= 2 {
                 if let (Inst::IBinI(IOp::And, it, t, x, k), Inst::ICmpI(Cond::Eq | Cond::Ne, _, _, t2, 0)) = (&b.insts[n - 2], &b.insts[n - 1]) {
-                    // imm32 is sign-extended: a narrower value's mask must not reach its upper bits
-                    let lo = if it.bits == 64 { i32::MIN as i64 } else { 0 };
-                    if t == t2 && *x != *t && self.al.uses[t.0 as usize] == 1 && (lo..=i32::MAX as i64).contains(k) {
+                    // a mask within 32 bits tests the low half (test r32, imm32: any of its bits); a
+                    // negative imm32 is sign-extended by the 64-bit form, so only for 64-bit values
+                    // (a narrower value's mask must not reach its upper bits)
+                    let ok = (0..=u32::MAX as i64).contains(k) || (it.bits == 64 && (i32::MIN as i64..0).contains(k));
+                    if t == t2 && *x != *t && self.al.uses[t.0 as usize] == 1 && ok {
                         self.test_fuse = Some((*x, *k));
                     }
                 }
@@ -2137,9 +2139,10 @@ impl<'a> Gen<'a> {
                     }
                     Some(Inst::ICmpI(cond, signed, _, x, k)) => match self.test_fuse.take() {
                         Some((src, mask)) => {
-                            // test src, imm32 (REX.W F7 /0 id)
+                            // test src, imm32 (F7 /0 id): 32-bit for a mask within 32 bits, REX.W
+                            // for a negative one (sign-extended to 64)
                             let rs = self.use_i(options, src, R10);
-                            self.a.rex(true, 0, 0, rs, false);
+                            self.a.rex(mask < 0, 0, 0, rs, false);
                             self.a.byte(0xf7);
                             self.a.modrm_rr(0, rs);
                             self.a.u32(mask as i32 as u32);
@@ -4635,8 +4638,11 @@ fn imm_fits(i: &Inst) -> bool {
     let imm32 = |v: i64| (i32::MIN as i64..=i32::MAX as i64).contains(&v);
     match *i {
         Inst::ICmpI(_, _, _, _, v) => imm32(v),
-        Inst::IBinI(op, _, _, _, v) => match op {
+        Inst::IBinI(op, it, _, _, v) => match op {
             IOp::Shl | IOp::Shr | IOp::Rotl => true,
+            // u32 takes the 32-bit forms: the immediate is the constant's bit pattern (a mask
+            // with bit 31 set, 0x8000_0000, is one instruction, not a constant register)
+            IOp::Add | IOp::Sub | IOp::Mul | IOp::And | IOp::Or | IOp::Xor if it == U32 => (i32::MIN as i64..=u32::MAX as i64).contains(&v),
             IOp::Add | IOp::Sub | IOp::Mul | IOp::And | IOp::Or | IOp::Xor => imm32(v),
             _ => false,
         },
