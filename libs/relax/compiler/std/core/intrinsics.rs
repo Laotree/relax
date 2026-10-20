@@ -32,6 +32,41 @@ pub mod intrinsics {
         /// true when this target (arm64; x86-64 with FMA3) fuses in hardware: a constant per run
         pub fn fma_native() -> bool;
     }
+    pub use super::intrinsics_simd as simd;
+}
+
+/// rustc's generic SIMD intrinsics (`core::intrinsics::simd`) on `#[repr(simd)]` types, lane-wise
+/// (lowered per 16-byte chunk to Relax's vector IR; lower/simd.rs). Signatures as rustc's.
+pub mod intrinsics_simd {
+    extern "relax-intrinsic" {
+        pub fn simd_add<T>(x: T, y: T) -> T;
+        pub fn simd_sub<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_mul<T>(x: T, y: T) -> T;
+        pub fn simd_div<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_shl<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_shr<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_and<T>(x: T, y: T) -> T;
+        pub fn simd_or<T>(x: T, y: T) -> T;
+        pub fn simd_xor<T>(x: T, y: T) -> T;
+        pub fn simd_neg<T>(x: T) -> T;
+        pub fn simd_fabs<T>(x: T) -> T;
+        pub fn simd_fsqrt<T>(x: T) -> T;
+        pub fn simd_floor<T>(x: T) -> T;
+        pub fn simd_ceil<T>(x: T) -> T;
+        pub fn simd_trunc<T>(x: T) -> T;
+        pub fn simd_round<T>(x: T) -> T;
+        pub fn simd_minimum_number_nsz<T>(x: T, y: T) -> T;
+        pub fn simd_maximum_number_nsz<T>(x: T, y: T) -> T;
+        pub fn simd_saturating_add<T>(x: T, y: T) -> T;
+        pub fn simd_saturating_sub<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_eq<T, U>(x: T, y: T) -> U;
+        pub fn simd_ne<T, U>(x: T, y: T) -> U;
+        pub fn simd_lt<T, U>(x: T, y: T) -> U;
+        pub fn simd_le<T, U>(x: T, y: T) -> U;
+        pub fn simd_gt<T, U>(x: T, y: T) -> U;
+        pub fn simd_ge<T, U>(x: T, y: T) -> U;
+        pub fn simd_select<M, T>(mask: M, if_true: T, if_false: T) -> T;
+    }
 }
 
 /// Memory, pointers and type information.
