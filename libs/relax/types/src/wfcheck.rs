@@ -447,8 +447,6 @@ pub mod obligations {
                             if matches!(&q.kind, PredicateKind::Clause(ClauseKind::Trait(u)) if matches!(u.trait_ref.args.first(), Some(GenericArg::Type(t)) if matches!(self.tcx.tys.kind(*t), TyKind::Alias(..)))) { continue; }
                             let q = self.tcx.instantiate_predicate(self.prog, def, args, &q);
                             if crate::next_solver::wf::predicate_has_escaping_bound_vars(tys, &q) { continue; }
-                            // the trait's `Self: Trait` is the clause itself
-                            if matches!(&q.kind, PredicateKind::Clause(ClauseKind::Trait(u)) if u.trait_ref.def_id == def) { continue; }
                             self.register(Goal { param_env: self.env.clone(), predicate: q }, pos);
                         }
                     }
@@ -502,11 +500,12 @@ pub mod obligations {
         fn finish(mut self, file: u32) -> Vec<String> {
             let mut out: Vec<String> = std::mem::take(&mut self.extra);
             let mut seen = std::collections::HashSet::new();
-            for e in self.ocx.try_evaluate_obligations() {
+            // wfcheck.rs: `select_all_or_error` -- an ambiguous obligation is an error (E0283)
+            for e in self.ocx.engine.evaluate_obligations_error_on_ambiguity(self.infcx, self.prog) {
                 let (code, o) = match e {
                     NextSolverError::TrueError(o) => ("E0277", o),
                     NextSolverError::Overflow(o) => ("E0275", o),
-                    NextSolverError::Ambiguity(_) => continue,
+                    NextSolverError::Ambiguity(o) => ("E0283", o),
                 };
                 let Some(msg) = self.message(code, &o) else { continue };
                 if !seen.insert((o.cause.span, msg.clone())) { continue; }

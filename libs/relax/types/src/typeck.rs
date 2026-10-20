@@ -5955,7 +5955,7 @@ impl<'a> Fcx<'a> {
                 // a primitive left operand with a non-primitive right one is an operator trait
                 // call too (`3u32 * duration`: `impl Mul<Duration> for u32`; rustc is_builtin_binop
                 // needs both sides primitive)
-                if matches!(self.tcx.tys.kind(sb0), TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..)) {
+                if matches!(self.tcx.tys.kind(sb0), TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..) | TyKind::Infer(_)) {
                     let sa = self.shallow(ta);
                     if let Some(r) = self.prim_lhs_op(op, e, sa, sb0, lo) {
                         return r;
