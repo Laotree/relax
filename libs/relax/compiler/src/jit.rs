@@ -396,8 +396,10 @@ pub struct Unit {
     /// slots queued for speculation whose code the disk cache has: their worker links it and
     /// skips the type check ahead (a warm run checked ~11k bodies ahead it never used)
     pub spec_cached: crate::conc::MemoMap<u32, ()>,
-    /// a coroutine that needed its own layout (a cycle): rustc E0733
-    pub coro_cycle: AtomicBool,
+    /// coroutine types whose layout was asked for while their own poll function was being lowered
+    /// (`Box::pin(f(n - 1)).await` builds the callee future, of the same type, before the frame
+    /// is known): the lowering is done again with the frame in place (coro_frame)
+    pub coro_selfref: relax_session::sync::Mutex<Vec<TyId>>,
     /// drop_may_unwind answers
     pub unwind_drop_cache: crate::conc::MemoMap<TyId, bool>,
     /// types whose drop_may_unwind / is_unpin answer is being computed, per thread
@@ -2428,7 +2430,7 @@ impl Unit {
             coro_rir: Default::default(),
             coro_busy: Default::default(),
             spec_cached: Default::default(),
-            coro_cycle: Default::default(),
+            coro_selfref: Default::default(),
             unwind_drop_cache: Default::default(),
             cycle_inprog: Default::default(),
             vtables: crate::conc::MemoMap::new_kept(16),
@@ -3145,11 +3147,25 @@ impl Unit {
             if lcx.missing.borrow().is_empty() {
                 return l;
             }
+            let mut waiting = false;
             for ct in lcx.missing.into_inner() {
                 if self.tcx.coro_frames.get(&ct).is_none() {
+                    // the coroutine whose poll function is being lowered right now: the layout
+                    // so far (its state without the saved locals) answers this lowering; the
+                    // lowering is repeated once the frame is known (coro_frame)
+                    if self.coro_busy.lock().unwrap_or_else(|e| e.into_inner()).contains(&self.tcx.tys.erase_regions(ct)) {
+                        let mut s = self.coro_selfref.lock().unwrap_or_else(|e| e.into_inner());
+                        let ct = self.tcx.tys.erase_regions(ct);
+                        if !s.contains(&ct) { let _k = crate::zone_alloc::kept(); s.push(ct); }
+                        waiting = true;
+                        continue;
+                    }
                     // lowering a body changes the unit: a unit call
                     owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).coro_frame(ct) });
                 }
+            }
+            if waiting {
+                return l;
             }
         }
     }
@@ -3163,8 +3179,6 @@ impl Unit {
             return;
         }
         if self.coro_busy.lock().unwrap_or_else(|e| e.into_inner()).contains(&ct) {
-            self.coro_cycle.store(true, Ordering::Relaxed);
-            self.tcx.coro_frames.insert(ct, (0, 1));
             return;
         }
         let id = match self.closure_fn_id(ct) {
@@ -3188,7 +3202,22 @@ impl Unit {
         }
         self.coro_busy.lock().unwrap_or_else(|e| e.into_inner()).push(ct);
         let up = self as *mut Unit;
-        let r = unsafe { build_rir_lowered(up, id) };
+        let mut r = unsafe { build_rir_lowered(up, id) };
+        // the body asked for the layout of its own future (a temporary that moves into a box): it
+        // was lowered with the state so far, the frame is known now, so lower it again. A saved
+        // local of the future's own type makes the frame differ: E0733 (lower.rs)
+        let again = {
+            let u = unsafe { &*up };
+            let mut s = u.coro_selfref.lock().unwrap_or_else(|e| e.into_inner());
+            let n = s.len();
+            s.retain(|x| *x != ct);
+            n != s.len()
+        };
+        if again && r.is_ok() && unsafe { (&*up).tcx.coro_frames.get(&ct).is_some() } {
+            unsafe { (&mut *up).coro_selfref.lock().unwrap_or_else(|e| e.into_inner()).push(ct) };
+            r = unsafe { build_rir_lowered(up, id) };
+            unsafe { (&*up).coro_selfref.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| *x != ct) };
+        }
         let u = unsafe { &mut *up };
         u.coro_busy.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| *x != ct);
         match r {
@@ -4610,7 +4639,7 @@ impl Unit {
         }
         // borrowck lane: a fn instance's first code, and every live-patched version of it, is checked
         // lazily in the background (D3: a patch is never refused synchronously unless --check-first;
-        // its verdict arrives as a Gandalf event, at the front of the queue)
+        // its verdict arrives as a Gandalf event, at the front of the queue).
         if (first && gen == 0 || gen > 0) && crate::borrowck::lazy::gandalf_enabled(options) {
             self.note_first_borrowck(id, (gen > 0).then_some(0));
         }
@@ -4957,6 +4986,8 @@ pub fn reclaim_generation() -> u64 {
     COMPILED_FNS.load(Ordering::Relaxed) + TIER1_INSTALLS.load(Ordering::Relaxed)
         + TIER1_FINISHED.load(Ordering::Relaxed) + BUILD_GEN.load(Ordering::Relaxed)
 }
+/// The disk cache opened with no code store: no code entry can be linked in this run (run.rs).
+pub static CODE_CACHE_EMPTY: AtomicBool = AtomicBool::new(false);
 pub static MAIN_COMPILES: relax_session::sync::Mutex<Vec<MainCompile>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// One compile the main thread waited for (MAKEPAD_RUN_MAIN_COMPILE_LOG): wall interval, the slot,
@@ -5109,7 +5140,10 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
     // keep compiling meanwhile. Code linked ahead or found in the disk cache needs no front end:
     // that is tried first (in a unit call: a check without it saw no cache and type-checked
     // bodies -- parsing whole files' lazy bodies -- for code the cache had).
-    {
+    // (a cold start's cache has no code store and no speculative result exists before the first
+    // present: the probe could only miss, and it costs the main thread an owner round trip per
+    // slot; the front's own lookup follows anyway)
+    if !(CODE_CACHE_EMPTY.load(Ordering::Relaxed) && startup_phase()) {
         let r = owner::call(class, || {
             if (*up).cache.is_none() {
                 return None;
@@ -5233,8 +5267,10 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
             return Some(install_compiled(up, id, &code, map, &relocs, false));
         }
     }
-    // the disk cache (cache.rs): linked code from an earlier run, no front end or back end
-    let cached = cache_lookup(up, id);
+    // the disk cache (cache.rs): linked code from an earlier run, no front end or back end. A cold
+    // start's cache opened with no code store: the lookup could only miss, and it computes the
+    // slot's cache key on the main thread's path; the key is made when the entry is recorded
+    let cached = if CODE_CACHE_EMPTY.load(Ordering::Relaxed) && startup_phase() { None } else { cache_lookup(up, id) };
     // A relocation may install this slot recursively even if a later relocation
     // fails. Reuse that installation regardless of the outer lookup's result.
     if u.fns[id as usize].compiled { return Some(u.fns[id as usize].code); }
@@ -6584,9 +6620,19 @@ fn marked_hot(u: &Unit, id: u32) -> bool {
 /// Source-size bound (tokens) of baseline inline candidates.
 const BASE_INLINE_SRC_TOKS: u32 = 40;
 
+/// Baseline code inlines tiny drop glue (the optimiser's free-inline size rule decides which): each
+/// glue instance is a slot a cold start's main thread compiles on its first call (1.6 k of 21 k
+/// before the first present in Calculator) and most are a few instructions.
+/// MAKEPAD_RUN_BASE_GLUE=0: glue stays a call.
+fn base_glue() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MAKEPAD_RUN_BASE_GLUE").map_or(true, |v| v != "0"))
+}
+
 /// A callee a baseline caller may inline: a Relax core fn instance small in source.
 fn base_inline_wanted(u: &Unit, c: u32) -> bool {
     match &u.fns[c as usize].key {
+        FnKey::Glue(..) => base_glue(),
         FnKey::Inst(d, _) => u.prog.def(*d).krate == u.core_crate && src_size(u, c) <= BASE_INLINE_SRC_TOKS,
         _ => false,
     }
@@ -7301,7 +7347,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             }
             // refused callees (#[inline(never)], sandboxed, user code without inline_all,
             // MAKEPAD_RUN_NOINL) are not built for inlining: decided before the build, not after
-            let want = inline_source_wanted(u, *c, full)
+            let want = (baseline && matches!(u.fns[*c as usize].key, FnKey::Glue(..)) || inline_source_wanted(u, *c, full))
                 && callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint).is_some()
                 && !noinl_callee.is_some_and(|p| name_matches(&u.fns[*c as usize].name, p));
             if want && O2_SNAPSHOT.try_with(|c| c.get()).unwrap_or(false) {
@@ -11273,6 +11319,12 @@ extern "C" fn relax_first_present() {
     }
 }
 
+/// Records encoded per owner request of the work that follows the first
+/// present: a request is not interrupted, so the main thread's next lazy compile waits for the batch
+/// that is running (256 records took 50-100 ms: a hitch in the first frames); the batches are small
+/// and the owner serves the program's requests between them.
+const POST_PRESENT_BATCH: usize = 24;
+
 /// Releases speculation, O1 inline candidates and O3 at the first present, never on wall
 /// time (Stage needs 40-58 s from main to present; a clock released speculation in the middle
 /// of startup, and main then waited seconds on the unit lock behind speculative builds). A
@@ -11316,7 +11368,7 @@ pub fn startup_main(runtime: &crate::options::RuntimeOptions) {
             let _job = compile_job();
             let more = owner::call(owner::Class::Background, || {
                 let up = SPEC_UNIT.load(Ordering::Acquire);
-                !SPEC_STOP.load(Ordering::SeqCst) && !up.is_null() && unsafe { (&mut *up).record_cache_batch(256) }
+                !SPEC_STOP.load(Ordering::SeqCst) && !up.is_null() && unsafe { (&mut *up).record_cache_batch(POST_PRESENT_BATCH) }
             });
             if !more { break; }
             std::thread::yield_now();
