@@ -1361,3 +1361,74 @@ fn entry_main(prog: &Program, root: u32) -> Option<DefId> {
     let d = prog.lookup_in_module(prog.crates[root as usize].root_mod, sym, false, &mut Vec::new())?;
     (prog.def(d).kind == DefKind::Fn).then_some(d)
 }
+
+/// rustc_hir_analysis check_opaque_precise_captures: a `use<..>` list names every type and const parameter in
+/// scope of the opaque (`Self` of a trait too). The syntax of the list (order, duplicates) is checked where its
+/// names resolve (resolve_bound_vars).
+pub fn precise_capture_params(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
+    use crate::ast::{Bound, GenericArg, GenericArgs, ItemKind, Ty};
+    let def = prog.def(d);
+    if !matches!(def.kind, DefKind::Fn | DefKind::AssocFn) { return Vec::new(); }
+    let pf = &prog.files[def.file as usize];
+    let ast = &pf.ast;
+    let ItemKind::Fn(sig, _, _) = ast.item(def.item).kind else { return Vec::new() };
+    let Some(ret) = ast.fn_sig(sig).ret else { return Vec::new() };
+    // the `use<..>` lists of the opaque types written in the return type
+    fn walk(ast: &crate::ast::Ast, t: crate::ast::TyId, out: &mut Vec<crate::ast::GenericArgsId>, depth: u32) {
+        if depth > 16 { return; }
+        let bounds = |bs: crate::ast::List<Bound>, out: &mut Vec<crate::ast::GenericArgsId>| {
+            for b in ast.list(bs) {
+                match b {
+                    Bound::Use(a) => out.push(*a),
+                    Bound::Trait { path, .. } => for s in ast.segs(path.segs) {
+                        if let Some(GenericArgs::Angle(v)) = ast.gargs(s.args()) {
+                            for a in ast.list(*v) { if let GenericArg::Type(x) | GenericArg::Binding(_, _, x) = a { walk(ast, *x, out, depth + 1); } }
+                        }
+                    },
+                    _ => {}
+                }
+            }
+        };
+        match ast.ty(t) {
+            Ty::ImplTrait(bs) => bounds(*bs, out),
+            Ty::DynTrait(bs, _) => bounds(*bs, out),
+            Ty::Ref(_, _, x) | Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Paren(x) => walk(ast, *x, out, depth + 1),
+            Ty::Tuple(l) => for x in ast.list(*l) { walk(ast, *x, out, depth + 1); },
+            Ty::Path(p) => for s in ast.segs(p.segs) {
+                if let Some(GenericArgs::Angle(v)) = ast.gargs(s.args()) {
+                    for a in ast.list(*v) { if let GenericArg::Type(x) | GenericArg::Binding(_, _, x) = a { walk(ast, *x, out, depth + 1); } }
+                }
+            },
+            _ => {}
+        }
+    }
+    let mut uses = Vec::new();
+    walk(ast, ret, &mut uses, 0);
+    if uses.is_empty() { return Vec::new(); }
+    let env = tcx.declaration_env(prog, d);
+    let mut errors = Vec::new();
+    for args in uses {
+        let Some(GenericArgs::Angle(list)) = ast.gargs(args) else { continue };
+        let mut listed: Vec<&str> = Vec::new();
+        for a in ast.list(*list) {
+            match a {
+                GenericArg::Lifetime(lt) => listed.push(pf.text(*lt)),
+                GenericArg::Type(t) => if let Ty::Path(p) = ast.ty(*t) { if p.no_qself() && ast.segs(p.segs).len() == 1 { listed.push(pf.text(ast.segs(p.segs)[0].name)); } },
+                _ => {}
+            }
+        }
+        for (i, &name) in env.names.iter().enumerate() {
+            let written = prog.syms.str(name);
+            if listed.contains(&written) || env.impl_params.iter().any(|&(_, p)| p as usize == i) { continue; }
+            let msg = if i == 0 && written == "Self" && env.trait_def.is_some() {
+                "`impl Trait` must mention the `Self` type of the trait in `use<...>`"
+            } else if env.consts.iter().any(|c| c.0 as usize == i) {
+                "`impl Trait` must mention all const parameters in scope in `use<...>`"
+            } else {
+                "`impl Trait` must mention all type parameters in scope in `use<...>`"
+            };
+            errors.push(prog.record_uncoded_error(def.file, ast.item(def.item).lo, "typeck", msg.to_string()));
+        }
+    }
+    errors
+}

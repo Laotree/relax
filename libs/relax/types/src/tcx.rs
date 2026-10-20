@@ -1564,6 +1564,7 @@ impl Tcx {
             errors.extend(crate::item_checks::assoc_const_elision(prog, did));
             errors.extend(crate::item_checks::attribute_safety(prog, did));
             errors.extend(crate::item_checks::attribute_shapes(prog, did));
+            if self.validates(prog, def.file) { errors.extend(crate::item_checks::precise_capture_params(prog, self, did)); }
             if def.kind == DefKind::AssocFn && self.validates(prog, def.file) && errors.is_empty() {
                 errors.extend(self.check_method_receiver(prog, did));
             }
@@ -2529,6 +2530,10 @@ impl Tcx {
                                             for e in errs { self.err(cx, prog, file, n.lo, e); }
                                             return self.tys.error;
                                         }
+                                    }
+                                    // lower_assoc_item_constraint: an object type binds each associated item once (E0719)
+                                    if binds.iter().any(|b| b.0 == ad) && self.validates(prog, file) {
+                                        self.err(cx, prog, file, n.lo, format!("E0719: the value of the associated type `{}` in trait `{}` is already specified", f.text(*n), prog.def_path(prog.def(ad).parent)));
                                     }
                                     let bt = self.lower_ty(cx, prog, file, module, env, *t);
                                     binds.push((ad, bt, 0));
