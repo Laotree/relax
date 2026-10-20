@@ -11959,6 +11959,12 @@ fn cold_blocks(u: &Unit, func: &relax_backend::rir::Func) -> Vec<bool> {
     }
 }
 
+/// MAKEPAD_RUN_SPEC_DYN=0: speculation follows direct calls only, not fn pointers and vtables
+fn spec_dyn() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_SPEC_DYN").map_or(true, |v| v != "0"))
+}
+
 /// Queues the slots `func` calls (but not `skip`) at depth + 1 (lock held).
 unsafe fn spec_enqueue_calls(up: *mut Unit, func: &relax_backend::rir::Func, skip: &[u32], depth: u8) {
     if startup_phase() { return; }
@@ -11991,14 +11997,36 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, func: &relax_backend::rir::Func, ski
     }
     let mut front = Vec::new();
     let mut back = Vec::new();
+    let dyn_on = spec_dyn() && depth + 1 < spec_hot_from(options);
+    let mut dyn_refs: Vec<u32> = Vec::new();
+    let mut seen_dyn = crate::fxhash::HashSet::default();
     for (bi, b) in func.blocks.iter().enumerate() {
         if cold[bi] {
             SPEC_COLD_SKIPPED.fetch_add(b.insts.iter().filter(|i| matches!(i, Inst::Call(Callee::Fn(_), _, _))).count() as u64, Ordering::Relaxed);
             continue;
         }
         for i in &b.insts {
-            if let Inst::Call(Callee::Fn(c), _, _) = i {
-                if skip.contains(c) {
+            // what it calls, and (spec_dyn) the fns it can reach through data: fn pointers it takes,
+            // the methods of the vtables it makes (a widget's draw / event paths, which the program
+            // reaches only through `dyn`)
+            dyn_refs.clear();
+            let direct = match i {
+                Inst::Call(Callee::Fn(c), _, _) => Some(*c),
+                Inst::FnAddr(_, c) if dyn_on => { dyn_refs.push(*c); None }
+                Inst::Addr(_, sym) if dyn_on => {
+                    match u.syms.kind(sym.id) {
+                        Some(crate::syms::SymKind::Thunk(c)) => dyn_refs.push(c),
+                        Some(crate::syms::SymKind::Data(_)) => crate::syms::data_thunks(u, u.syms.value(relax_backend::rir::Sym { id: sym.id, off: 0 }), &mut dyn_refs),
+                        _ => {}
+                    }
+                    None
+                }
+                _ => None,
+            };
+            for &c in direct.iter().chain(dyn_refs.iter()) {
+                let is_dyn = direct.is_none();
+                let c = &c;
+                if skip.contains(c) || is_dyn && !seen_dyn.insert(*c) {
                     continue;
                 }
                 let f = &u.fns[*c as usize];
@@ -12015,12 +12043,13 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, func: &relax_backend::rir::Func, ski
                 if !ok {
                     continue;
                 }
-                // deeper levels follow only the fall-through path (they are a guess on a guess)
-                if !hot[bi] && (spec_hot_only(options) || depth + 1 >= spec_hot_from(options)) {
+                // deeper levels follow only the fall-through path (they are a guess on a guess);
+                // what is reachable through data only from the code that ran
+                if (!hot[bi] || is_dyn) && (spec_hot_only(options) || depth + 1 >= spec_hot_from(options)) {
                     continue;
                 }
                 u.fns[*c as usize].spec_depth = depth + 1;
-                if hot[bi] {
+                if hot[bi] && !is_dyn {
                     front.push(*c);
                 } else {
                     back.push(*c);
