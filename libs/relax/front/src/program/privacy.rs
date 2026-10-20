@@ -35,7 +35,7 @@ impl Program {
     /// `from` cannot see. `last_ns`: the namespace of the final segment (None: either, as in a
     /// `use`, where an inaccessible binding counts only when no namespace has an accessible one).
     pub fn path_privacy(&self, from: u32, global: bool, segs: &[(SegKind, Sym)], last_ns: Option<bool>, from_root: bool, in_use: bool) -> Option<PrivacyError> {
-        if segs.len() < 2 || !self.own_crates.get(self.mods[from as usize].krate as usize).copied().unwrap_or(false) {
+        if segs.len() < 2 || !self.crates[self.mods[from as usize].krate as usize].validate {
             return None;
         }
         let mut cur = self.resolve_mod_path(from, global, &segs[..1], from_root, in_use)?;
@@ -138,7 +138,7 @@ impl Program {
 
     /// A name used on its own: ambiguous when the scope it is found in binds it through globs only.
     pub fn name_ambiguity(&self, from: u32, name: Sym, ns_type: bool, skip_direct: bool) -> Option<PrivacyError> {
-        if !self.own_crates.get(self.mods[from as usize].krate as usize).copied().unwrap_or(false) {
+        if !self.crates[self.mods[from as usize].krate as usize].validate {
             return None;
         }
         let mut m = from;

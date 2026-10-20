@@ -3045,6 +3045,9 @@ impl<'a> Fcx<'a> {
                 return Res::Err;
             }
             if let Some(d) = prog.lookup_in_scope(self.module, segs[0].1, true) {
+                if self.tcx.validates(prog, self.file) && segs[0].0 == SegKind::Ident && !path.global() && path.no_qself() {
+                    if let Some(e) = prog.name_ambiguity(self.module, segs[0].1, true, false) { self.err(path.lo, prog.privacy_message(&e)); }
+                }
                 if matches!(prog.def(d).kind, DefKind::Struct | DefKind::Union) {
                     return Res::Def(d);
                 }
