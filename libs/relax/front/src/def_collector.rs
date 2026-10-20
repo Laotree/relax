@@ -74,12 +74,7 @@ pub fn lower_legacy_const_generics_in(prog: &mut Program, visible: Option<&[bool
     let mut owners: Vec<_> = Vec::new();
     // (the defs of the files of the visible crates, from the per-file index: a scoped pass does
     // not walk the whole program's definition table)
-    let visible_defs: Vec<DefId> = match visible {
-        None => Vec::new(),
-        Some(v) => (0..prog.files.len() as u32)
-            .filter(|&f| v.get(prog.file_crate[f as usize] as usize).copied().unwrap_or(true))
-            .flat_map(|f| prog.defs_in_file(f).iter().map(|&d| DefId(d))).collect(),
-    };
+    let visible_defs: Vec<DefId> = if visible.is_some() { prog.defs_in_visible_files(visible) } else { Vec::new() };
     if visible.is_none() {
         for &owner in &prog.collected_definitions { owners.push(owner); }
     } else {
