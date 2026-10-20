@@ -564,6 +564,28 @@ enum Mode {
     Pump,
 }
 
+/// Headroom for the program's threads after the first present: a Background request (a
+/// speculative front, an O3 snapshot, a cache batch) holds the owner until it ends, and a program
+/// thread's lazy compile makes several requests in a row with its own work in between (its back
+/// end, then the code it runs up to the next stub). So none starts while a program thread compiles
+/// or within BG_GAP_NS after its last compile ended -- unless background work has waited
+/// BG_STARVE_NS since the last one started (it always progresses; a program thread then waits for
+/// at most one background request in that time).
+const BG_GAP_NS: u64 = 2_000_000;
+const BG_STARVE_NS: u64 = 20_000_000;
+/// wall ns the last Background request started
+static BG_LAST_START: AtomicU64 = AtomicU64::new(0);
+/// pick held a Background request back: the idle owner looks again soon (nothing announces the
+/// end of a gap)
+static BG_HELD: AtomicBool = AtomicBool::new(false);
+
+fn background_held() -> bool {
+    if !crate::jit::FIRST_PRESENT.load(Ordering::Relaxed) || crate::jit::demand_quiet_ns() >= BG_GAP_NS {
+        return false;
+    }
+    crate::jit::wall_ns().saturating_sub(BG_LAST_START.load(Ordering::Relaxed)) < BG_STARVE_NS
+}
+
 fn pick(q: &mut Queue, mode: Mode) -> Option<usize> {
     // the process ends (only the exit set's requests), or the program swaps its allocator (only
     // the pauser's): other threads' foreground and background requests wait
@@ -578,6 +600,13 @@ fn pick(q: &mut Queue, mode: Mode) -> Option<usize> {
         }
         if c >= Class::Background as usize && FOREGROUND.load(Ordering::Relaxed) > 0 {
             break;
+        }
+        if c == Class::Background as usize && mode == Mode::Top && !q.lanes[c].is_empty() {
+            if background_held() {
+                BG_HELD.store(true, Ordering::Relaxed);
+                break;
+            }
+            BG_LAST_START.store(crate::jit::wall_ns(), Ordering::Relaxed);
         }
         let lane = &mut q.lanes[c];
         let at = if only != 0 && c >= Class::Main as usize {
@@ -713,11 +742,16 @@ fn owner_loop() -> ! {
                     q = Q.lock().unwrap_or_else(|e| e.into_inner());
                     continue;
                 }
+                BG_HELD.store(false, Ordering::Relaxed);
                 if let Some(r) = pick(&mut q, Mode::Top) {
                     break r;
                 }
                 OWNER_ASLEEP.store(true, Ordering::SeqCst);
-                q = WAKE.wait(q).unwrap_or_else(|e| e.into_inner());
+                q = if BG_HELD.load(Ordering::Relaxed) {
+                    WAKE.wait_timeout(q, std::time::Duration::from_millis(1)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0)
+                } else {
+                    WAKE.wait(q).unwrap_or_else(|e| e.into_inner())
+                };
                 OWNER_ASLEEP.store(false, Ordering::SeqCst);
             }
         };

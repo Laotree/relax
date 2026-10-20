@@ -10218,6 +10218,14 @@ impl Drop for StartupCompile {
 // Recheck for every job: renewed foreground compilation immediately throttles new builds
 // back to worker zero. In-flight builds always finish and install, even during startup.
 const TIER1_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+/// ns since the program threads' last lazy compile ended; 0 while one runs (owner.rs's headroom).
+pub(crate) fn demand_quiet_ns() -> u64 {
+    if DEMAND_COMPILES.load(Ordering::SeqCst) != 0 {
+        return 0;
+    }
+    wall_ns().saturating_sub(DEMAND_LAST.load(Ordering::SeqCst))
+}
+
 fn tier1_workers_ready() -> bool {
     DEMAND_COMPILES.load(Ordering::SeqCst) == 0
         && wall_ns().saturating_sub(DEMAND_LAST.load(Ordering::SeqCst)) >= TIER1_POLL.as_nanos() as u64
