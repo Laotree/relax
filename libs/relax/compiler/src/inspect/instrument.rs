@@ -874,17 +874,66 @@ fn program_thread(t: &super::threads::Thread) -> bool {
 #[cfg(target_os = "macos")]
 mod pause_imp {
     static HELD: relax_session::sync::Mutex<Vec<crate::inspect::threads::Thread>> = relax_session::sync::Mutex::new(Vec::new());
+    extern "C" {
+        static mach_task_self_: u32;
+        fn malloc_get_all_zones(task: u32, reader: *const u8, out: *mut *const usize, count: *mut u32) -> i32;
+    }
+
+    /// Every malloc zone's lock taken (zone->introspect->force_lock, as fork() does) while the
+    /// threads are suspended: no thread stops holding an allocator lock, so inspect's commands
+    /// (which allocate) keep working while the program is paused. Nothing may allocate between
+    /// `lock_zones` and `unlock_zones` (this thread would wait for itself).
+    unsafe fn zones() -> &'static [usize] {
+        let mut addrs: *const usize = std::ptr::null();
+        let mut n = 0u32;
+        if malloc_get_all_zones(mach_task_self_, std::ptr::null(), &mut addrs, &mut n) != 0 || addrs.is_null() {
+            return &[];
+        }
+        std::slice::from_raw_parts(addrs, n as usize)
+    }
+    /// malloc_zone_t: introspect is its 13th word; malloc_introspection_t: force_lock, force_unlock
+    /// are its 6th and 7th
+    unsafe fn zone_fn(zone: usize, k: usize) -> Option<unsafe extern "C" fn(usize)> {
+        let intro = *((zone as *const usize).add(12));
+        if intro == 0 {
+            return None;
+        }
+        let f = *((intro as *const usize).add(k));
+        (f != 0).then(|| std::mem::transmute::<usize, unsafe extern "C" fn(usize)>(f))
+    }
+
     pub fn pause(want: &dyn Fn(&crate::inspect::threads::Thread) -> bool) -> usize {
         let skip = crate::inspect::SERVER_TIDS.lock().unwrap().clone();
+        let mut list = crate::inspect::threads::list();
         let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
-        for t in crate::inspect::threads::list() {
-            if skip.contains(&t.os_id) || t.name.starts_with("run-inspect") || t.name.starts_with("makepad-remote") || !want(&t) {
-                continue;
+        held.reserve(list.len());
+        let picked: Vec<bool> = list.iter().map(|t| !(crate::inspect::is_inspect_thread(t, &skip) || !want(t))).collect();
+        let _ = crate::inspect::threads::self_os_id();
+        let mut rest: Vec<crate::inspect::threads::Thread> = Vec::with_capacity(list.len());
+        unsafe {
+            let zs = zones();
+            for &z in zs {
+                if let Some(f) = zone_fn(z, 5) {
+                    f(z);
+                }
             }
-            if crate::inspect::threads::suspend(&t) {
-                held.push(t);
+            // no allocation or free from here to the unlock: `held` has room, the threads move
+            // out of `list` by drain (its buffer is freed after the unlock)
+            for (k, t) in list.drain(..).enumerate() {
+                if picked[k] && crate::inspect::threads::suspend(&t) {
+                    held.push(t);
+                } else {
+                    // dropping a thread frees its name: after the unlock
+                    rest.push(t);
+                }
+            }
+            for &z in zs.iter().rev() {
+                if let Some(f) = zone_fn(z, 6) {
+                    f(z);
+                }
             }
         }
+        drop((list, picked, rest));
         held.len()
     }
     pub fn resume() -> usize {
