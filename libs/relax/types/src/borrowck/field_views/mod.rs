@@ -568,6 +568,34 @@ pub struct FvRecordRaw {
     pub hoist: Option<Vec<Span>>,
 }
 
+/// A conflict accepted by an analysis stronger than rustc's NLL (relaxed Rust), with the MIR facts
+/// its export to rustc needs (`edit::plan_relaxed`).
+#[derive(Clone, Debug)]
+pub enum RelaxedRecord {
+    Polonius(PoloniusRecord),
+}
+
+/// An NLL error that Polonius does not have (A2).
+#[derive(Clone, Debug)]
+pub struct PoloniusRecord {
+    pub code: &'static str,
+    /// the error's primary span (the conflicting access)
+    pub span: Span,
+    /// the statement that made the loan NLL kept alive
+    pub loan: Span,
+    /// the std map lookup the loan is the receiver of, when a second lookup with its key finds the
+    /// same entry (the re-lookup rewrite)
+    pub lookup: Option<Lookup>,
+}
+
+/// `map.get_mut(key)` / `map.get(key)` of std's HashMap / BTreeMap with a std-compared key.
+#[derive(Clone, Copy, Debug)]
+pub struct Lookup {
+    pub mutable: bool,
+    /// the call expression
+    pub call: Span,
+}
+
 /// The field-view context of one body's check (C-NLL4 conflict check hook, check_hook.rs).
 pub struct FieldViews<'a> {
     pub prog: &'a Program,

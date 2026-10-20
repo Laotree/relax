@@ -18,35 +18,14 @@ use super::FvRecordRaw;
 use crate::ast::{Ast, BlockId, ExprId, ExprKind, Pat, Stmt, UnOp};
 use crate::mir::Span;
 use crate::program::Program;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TypedEdit {
-    pub lo: u32,
-    pub hi: u32,
-    pub text: String,
-}
+use crate::relaxed::Edit;
 
 #[derive(Debug)]
 pub struct PlannedRewrite {
     pub file: u32,
-    pub edits: Vec<TypedEdit>,
+    pub edits: Vec<Edit>,
     pub applied: Vec<String>,
     pub skipped: Vec<String>,
-}
-
-/// Splice `edits` (non-overlapping, any order) into `src`.
-pub fn apply(src: &str, edits: &[TypedEdit]) -> String {
-    let mut edits: Vec<&TypedEdit> = edits.iter().collect();
-    edits.sort_by_key(|e| (e.lo, e.hi));
-    let mut out = String::with_capacity(src.len() + 64);
-    let mut at = 0usize;
-    for e in edits {
-        out.push_str(&src[at..e.lo as usize]);
-        out.push_str(&e.text);
-        at = e.hi as usize;
-    }
-    out.push_str(&src[at..]);
-    out
 }
 
 /// One statement of a block with its extent (the `let` keyword / expression start through the `;`).
@@ -127,8 +106,7 @@ impl<'a> FileView<'a> {
     fn enclosing_stmt(&self, span: Span) -> Option<StmtRange> {
         let ast = self.ast();
         let mut best: Option<(u32, StmtRange)> = None;
-        for i in 0..ast.blocks.len() {
-            let id = BlockId(ast.base[3] + i as u32);
+        for id in self.blocks() {
             let b = ast.block(id);
             if !(b.lo <= span.lo && span.hi <= b.hi) { continue; }
             for r in self.stmt_ranges(id) {
@@ -140,9 +118,17 @@ impl<'a> FileView<'a> {
         best.map(|(_, r)| r)
     }
 
+    /// Every expression of the file: its tree and its lazily parsed fn bodies.
     fn exprs(&self) -> impl Iterator<Item = (ExprId, crate::ast::Expr)> + '_ {
         let ast = self.ast();
-        (0..ast.exprs.len()).map(move |i| { let id = ExprId(ast.base[0] + i as u32); (id, *ast.expr(id)) })
+        let trees = std::iter::once(ast).chain(ast.part.get().map(|p| &**p));
+        trees.flat_map(|t| (0..t.exprs.len()).map(move |i| { let id = ExprId(t.base[0] + i as u32); (id, *t.expr(id)) }))
+    }
+    /// Every block of the file (its tree and its lazily parsed part).
+    fn blocks(&self) -> impl Iterator<Item = BlockId> + '_ {
+        let ast = self.ast();
+        let trees = std::iter::once(ast).chain(ast.part.get().map(|p| &**p));
+        trees.flat_map(|t| (0..t.blocks.len()).map(move |i| BlockId(t.base[3] + i as u32)))
     }
     /// The expression whose extent is exactly `span`.
     fn expr_at(&self, span: Span) -> Option<(ExprId, crate::ast::Expr)> {
@@ -215,7 +201,7 @@ pub fn plan(prog: &Program, records: &[FvRecordRaw]) -> Vec<PlannedRewrite> {
     out
 }
 
-fn rewrite_one(v: &FileView<'_>, r: &FvRecordRaw, n: usize) -> Result<(Vec<TypedEdit>, String), &'static str> {
+fn rewrite_one(v: &FileView<'_>, r: &FvRecordRaw, n: usize) -> Result<(Vec<Edit>, String), &'static str> {
     let ast = v.ast();
     if r.span.hi > v.pf().src_len { return Err("inside a macro expansion"); }
     let stmt = v.enclosing_stmt(r.span).ok_or("the borrow is not inside a plain statement")?;
@@ -238,8 +224,8 @@ fn rewrite_one(v: &FileView<'_>, r: &FvRecordRaw, n: usize) -> Result<(Vec<Typed
         }
         let text = v.text(arg.lo, arg.hi);
         return Ok((vec![
-            TypedEdit { lo: stmt.lo, hi: stmt.lo, text: format!("let {tmp} = {text};\n{indent}") },
-            TypedEdit { lo: arg.lo, hi: arg.hi, text: tmp },
+            Edit { lo: stmt.lo, hi: stmt.lo, text: format!("let {tmp} = {text};\n{indent}") },
+            Edit { lo: arg.lo, hi: arg.hi, text: tmp },
         ], "the argument is evaluated into a local before the statement".to_string()));
     }
 
@@ -262,7 +248,7 @@ fn rewrite_one(v: &FileView<'_>, r: &FvRecordRaw, n: usize) -> Result<(Vec<Typed
                 if v.mentions((access.lo, access.hi), &bound) { return Err("the conflicting statement uses the borrow"); }
                 let init_text = v.text(init_e.lo, init_e.hi);
                 let indent = v.indent_at(access.lo);
-                return Ok((vec![TypedEdit { lo: access.hi, hi: access.hi, text: format!("\n{indent}let {bound} = {init_text};") }],
+                return Ok((vec![Edit { lo: access.hi, hi: access.hi, text: format!("\n{indent}let {bound} = {init_text};") }],
                     format!("`{place_text}` borrowed again after the conflicting statement")));
             }
         }
@@ -273,10 +259,152 @@ fn rewrite_one(v: &FileView<'_>, r: &FvRecordRaw, n: usize) -> Result<(Vec<Typed
     let occurrences = v.exprs().filter(|(id, e)| stmt.lo <= e.lo && e.hi <= stmt.hi && !matches!(e.kind, ExprKind::Paren(_)) && v.is_plain(*id) && v.same_place(*id, place_id)).count();
     if occurrences != 1 { return Err("the place occurs more than once in the statement"); }
     Ok((vec![
-        TypedEdit { lo: stmt.lo, hi: stmt.lo, text: format!("let mut {tmp} = std::mem::take(&mut {place_text});\n{indent}") },
-        TypedEdit { lo: place.lo, hi: place.hi, text: tmp.clone() },
-        TypedEdit { lo: stmt.hi, hi: stmt.hi, text: format!("\n{indent}{place_text} = {tmp};") },
+        Edit { lo: stmt.lo, hi: stmt.lo, text: format!("let mut {tmp} = std::mem::take(&mut {place_text});\n{indent}") },
+        Edit { lo: place.lo, hi: place.hi, text: tmp.clone() },
+        Edit { lo: stmt.hi, hi: stmt.hi, text: format!("\n{indent}{place_text} = {tmp};") },
     ], format!("`{place_text}` moved out around the statement (mem::take)")))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Polonius (A2) and disjoint-index (D3) acceptances: relaxed notes with structured edits.
+
+/// The relaxed notes of `records` (one per accepted error, `--strict-report` lists them), each with
+/// the edits of its rewrite when one is known and exact; otherwise the note says why there is none.
+/// Records that share a loan share one rewrite (`apply` takes identical edits once).
+pub fn plan_relaxed(prog: &Program, records: &[super::RelaxedRecord]) -> Vec<crate::relaxed::Note> {
+    use super::RelaxedRecord;
+    let mut out = Vec::new();
+    for r in records {
+        match r {
+            RelaxedRecord::Polonius(p) => {
+                let at = |span: Span| {
+                    let (l, c) = prog.files[span.file as usize].line_col(span.lo);
+                    format!("{}:{}:{}", prog.file_paths[span.file as usize], l, c)
+                };
+                let view = FileView { prog, file: p.loan.file };
+                let planned = match p.lookup {
+                    Some(lookup) if lookup.call.file == p.loan.file => relookup(&view, lookup),
+                    Some(_) => Err("the lookup is in another file"),
+                    None => Err("the borrow is not a std map lookup with a std-compared key (no exact rewrite: entry API or a split borrow would change the code's structure)"),
+                };
+                let (fix, how) = match planned {
+                    Ok((edits, what)) => (Some((prog.file_paths[p.loan.file as usize].clone(), edits)), format!("will write: {what}")),
+                    Err(why) => (None, format!("no known rewrite: {why}")),
+                };
+                out.push(crate::relaxed::Note {
+                    at: at(p.span), feature: "polonius", code: p.code,
+                    msg: format!("accepted under Polonius; stable rustc rejects it (the borrow at {} is not live on this path); {how}", at(p.loan)),
+                    fix,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The re-lookup rewrite of a std map lookup whose borrow Polonius ends on the miss path:
+///  - `if let Some(v) = M.get_mut(K) { A } ..` -> `if M.contains_key(K) { let v = M.get_mut(K).unwrap(); A } ..`
+///  - `match M.get_mut(K) { Some(v) => A, None => B }` -> `if M.contains_key(K) { let v = M.get_mut(K).unwrap(); A } else { B }`
+/// (`get` likewise). Exact when `M` and `K` are side-effect-free places (the checker proved the map is
+/// reached without an overloaded deref and the key compares by std's own impls, so the second lookup
+/// finds the entry the first found); NLL then sees the borrow only on the hit path.
+fn relookup(v: &FileView<'_>, lookup: super::Lookup) -> Result<(Vec<Edit>, String), &'static str> {
+    let ast = v.ast();
+    if lookup.call.hi > v.pf().src_len { return Err("inside a macro expansion"); }
+    let (call_id, call) = v.exprs().find(|(_, e)| e.lo == lookup.call.lo && e.hi == lookup.call.hi && matches!(e.kind, ExprKind::MethodCall(..)))
+        .ok_or("the lookup is not a method call expression")?;
+    let ExprKind::MethodCall(recv, row) = call.kind else { return Err("the lookup is not a method call") };
+    let row = ast.row(row);
+    let args = ast.list(row.args);
+    if args.len() != 1 || !v.simple_place(recv) || !v.simple_key(args[0]) { return Err("the map or the key is not a plain place"); }
+    let method = if lookup.mutable { "get_mut" } else { "get" };
+    if v.pf().text(row.name) != method { return Err("the lookup is written through another method"); }
+    let (r, k) = (v.text(ast.expr(recv).lo, ast.expr(recv).hi), v.text(ast.expr(args[0]).lo, ast.expr(args[0]).hi));
+    let contains = format!("{r}.contains_key({k})");
+    let again = |name: &str, mutbl: bool| format!("let {}{name} = {r}.{method}({k}).unwrap();", if mutbl { "mut " } else { "" });
+    // `Some(name)` / `Some(mut name)` with a by-value binding
+    let some_binding = |pat: crate::ast::PatId| -> Option<(String, bool)> {
+        let crate::ast::Pat::TupleStruct(path, ps) = *ast.pat(pat) else { return None };
+        let segs = ast.segs(path.segs);
+        if v.pf().text(segs.last()?.name) != "Some" { return None; }
+        let [p] = ast.list(ps) else { return None };
+        match *ast.pat(*p) {
+            crate::ast::Pat::Ident { by_ref: false, mutbl, name, sub: None } => Some((v.pf().text(name).to_string(), mutbl)),
+            _ => None,
+        }
+    };
+    // `None` (an identifier pattern until resolution; on the miss path the scrutinee is `None` whether
+    // it names the variant or binds), `Option::None`, or `_`
+    let is_none = |pat: crate::ast::PatId| match *ast.pat(pat) {
+        crate::ast::Pat::Wild => true,
+        crate::ast::Pat::Ident { by_ref: false, mutbl: false, name, sub: None } => v.pf().text(name) == "None",
+        crate::ast::Pat::Path(path) => ast.segs(path.segs).last().is_some_and(|s| v.pf().text(s.name) == "None"),
+        _ => false,
+    };
+    for (id, e) in v.exprs() {
+        match e.kind {
+            // `if let Some(v) = <call> { .. }`: the `let` is the whole condition
+            ExprKind::Let(pat, scrut) if v.unparen(scrut) == call_id => {
+                let (name, mutbl) = some_binding(pat).ok_or("the pattern is not `Some(<binding>)`")?;
+                let (_, then) = v.exprs().find_map(|(_, x)| match x.kind { ExprKind::If(c, t, _) if c == id => Some((c, t)), _ => None })
+                    .ok_or("the `let` is not the whole condition of an `if`")?;
+                let open = ast.block(then).lo;
+                if v.pf().bytes(open, open + 1) != b"{" { return Err("the block does not start at its brace"); }
+                // on its own line when the block's first statement is
+                let first = v.tok_from(open + 1);
+                let first_lo = v.pf().tok(first).lo;
+                let lead = if v.pf().line_col(first_lo).0 > v.pf().line_col(open).0 { format!("\n{}", v.indent_at(first_lo)) } else { " ".to_string() };
+                return Ok((vec![
+                    Edit { lo: e.lo, hi: e.hi, text: contains.clone() },
+                    Edit { lo: open + 1, hi: open + 1, text: format!("{lead}{}", again(&name, mutbl)) },
+                ], format!("`{contains}` before a second `{method}` on the hit path (re-lookup)")));
+            }
+            ExprKind::Match(scrut, arms) if v.unparen(scrut) == call_id => {
+                let arms = ast.list(arms);
+                if arms.len() != 2 || arms.iter().any(|a| a.guard.is_some() || !ast.list(a.attrs).is_empty()) { return Err("the match is not two plain arms"); }
+                let (hit, miss) = if some_binding(arms[0].pat).is_some() && is_none(arms[1].pat) { (&arms[0], &arms[1]) }
+                    else if some_binding(arms[1].pat).is_some() && is_none(arms[0].pat) { (&arms[1], &arms[0]) }
+                    else { return Err("the arms are not `Some(<binding>)` and `None`") };
+                let (name, mutbl) = some_binding(hit.pat).unwrap();
+                // the match is a whole expression (not the receiver of `.`, `?` or `[`)
+                let next = v.tok_from(e.hi);
+                if matches!(v.pf().tok_text(next), "." | "?" | "[") { return Err("the match is used as a receiver"); }
+                let body = |a: &crate::ast::Arm| { let b = ast.expr(a.body); v.text(b.lo, b.hi) };
+                // a block arm is the `else` block itself
+                let miss_block = matches!(ast.expr(miss.body).kind, ExprKind::Block(_, l) if l.get().is_none());
+                let otherwise = if miss_block { body(miss) } else { format!("{{ {} }}", body(miss)) };
+                return Ok((vec![Edit { lo: e.lo, hi: e.hi,
+                    text: format!("if {contains} {{ {} {} }} else {otherwise}", again(&name, mutbl), body(hit)) }],
+                    format!("`{contains}` before a second `{method}` on the hit path (re-lookup)")));
+            }
+            _ => {}
+        }
+    }
+    Err("the lookup is not the scrutinee of an `if let` or a `match`")
+}
+
+impl FileView<'_> {
+    fn unparen(&self, mut e: ExprId) -> ExprId {
+        while let ExprKind::Paren(x) = self.ast().expr(e).kind { e = x; }
+        e
+    }
+    /// A place written as a path with fields (`map`, `self.cache.map`): evaluated again it is the
+    /// same place, with no call (no index, no explicit deref).
+    fn simple_place(&self, e: ExprId) -> bool {
+        match self.ast().expr(e).kind {
+            ExprKind::Path(p) => self.ast().qself(&p).is_none(),
+            ExprKind::Field(x, _) | ExprKind::TupleField(x, _) | ExprKind::Paren(x) => self.simple_place(x),
+            _ => false,
+        }
+    }
+    /// A lookup key: a simple place or a literal, possibly borrowed (`&k`, `&self.id`, `&3`, `"a"`).
+    fn simple_key(&self, e: ExprId) -> bool {
+        match self.ast().expr(e).kind {
+            ExprKind::Lit(_) => true,
+            ExprKind::AddrOf(false, false, x) | ExprKind::Paren(x) => self.simple_key(x),
+            _ => self.simple_place(e),
+        }
+    }
 }
 
 impl FileView<'_> {
@@ -346,7 +474,7 @@ mod tests {
     fn run(prog: &Program, r: FvRecordRaw) -> (String, Vec<String>, Vec<String>) {
         let mut plans = plan(prog, &[r]);
         let p = plans.pop().unwrap();
-        (apply(SRC, &p.edits), p.applied, p.skipped)
+        (String::from_utf8(crate::relaxed::apply(SRC.as_bytes(), &p.edits).0).unwrap(), p.applied, p.skipped)
     }
 
     #[test]

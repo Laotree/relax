@@ -49,6 +49,8 @@ pub struct Verdict {
     pub fv_only: Vec<event::BorrowError>,
     /// the field borrows (MIR spans and places) the export to rustc rewrites (field_views::edit)
     pub fv_records: Vec<field_views::FvRecordRaw>,
+    /// conflicts accepted by Polonius / disjoint indices, with their export facts (field_views::edit)
+    pub relaxed_records: Vec<field_views::RelaxedRecord>,
     pub bodies: usize,
 }
 
@@ -177,11 +179,13 @@ pub fn check_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
 
 static FV_ONLY: relax_session::sync::Mutex<Vec<event::BorrowError>> = relax_session::sync::Mutex::new(Vec::new());
 static FV_RECORDS: relax_session::sync::Mutex<Vec<field_views::FvRecordRaw>> = relax_session::sync::Mutex::new(Vec::new());
+static RELAXED_RECORDS: relax_session::sync::Mutex<Vec<field_views::RelaxedRecord>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// `makepad check`: remember a verdict's field-view-only acceptances (relaxed crates).
 pub fn note_verdict(v: &Verdict) {
     FV_ONLY.lock().unwrap_or_else(|e| e.into_inner()).extend(v.fv_only.iter().cloned());
     FV_RECORDS.lock().unwrap_or_else(|e| e.into_inner()).extend(v.fv_records.iter().cloned());
+    RELAXED_RECORDS.lock().unwrap_or_else(|e| e.into_inner()).extend(v.relaxed_records.iter().cloned());
 }
 
 /// End of `makepad check`: the "accepted only with field views" report (what rustc would reject)
@@ -189,8 +193,12 @@ pub fn note_verdict(v: &Verdict) {
 pub fn finish_check(prog: &Program) {
     let fvo = std::mem::take(&mut *FV_ONLY.lock().unwrap_or_else(|e| e.into_inner()));
     let recs = std::mem::take(&mut *FV_RECORDS.lock().unwrap_or_else(|e| e.into_inner()));
+    // Polonius / disjoint-index acceptances: one relaxed note each (`--strict-report`), with the
+    // structured edits `makepad fix --to-strict` applies when a rewrite is known.
+    let relaxed = std::mem::take(&mut *RELAXED_RECORDS.lock().unwrap_or_else(|e| e.into_inner()));
+    for n in field_views::edit::plan_relaxed(prog, &relaxed) { crate::relaxed::note(n); }
     if !fvo.is_empty() {
-        eprintln!("makepad check: {} conflict(s) accepted only in relaxed Rust (field views, extended two-phase borrows; rustc would reject them):", fvo.len());
+        eprintln!("makepad check: {} conflict(s) accepted only in relaxed Rust (field views, extended two-phase borrows, Polonius, disjoint indices; rustc would reject them):", fvo.len());
         for d in &fvo {
             eprintln!("{}", d.render());
         }
@@ -204,8 +212,7 @@ pub fn finish_check(prog: &Program) {
                 let _ = std::fs::create_dir_all(p);
             }
             let pf = &prog.files[r.file as usize];
-            let src = String::from_utf8_lossy(&pf.src[..pf.src_len as usize]).into_owned();
-            let _ = std::fs::write(&out, field_views::edit::apply(&src, &r.edits));
+            let _ = std::fs::write(&out, crate::relaxed::apply(&pf.src[..pf.src_len as usize], &r.edits).0);
             for a in &r.applied {
                 eprintln!("makepad-run fv-export: {}", a);
             }

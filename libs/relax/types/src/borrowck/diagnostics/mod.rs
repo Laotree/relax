@@ -161,6 +161,10 @@ pub fn render_error(cx: &DiagCx<'_>, error: &BorrowckError) -> Diag {
                 d.note(format!("accepted with field views (relaxed Rust): {}", fv_explain(cx, why)));
             }
             Remaining { why } => { d.note(format!("field views: {}", fv_explain(cx, why))); }
+            Polonius => {
+                d.fv_only = true;
+                d.note("accepted under Polonius (relaxed Rust): the borrow is not used on the path through this access; stable rustc (NLL) rejects this");
+            }
         }
     }
     d
