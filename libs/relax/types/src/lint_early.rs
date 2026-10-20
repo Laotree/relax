@@ -3086,7 +3086,11 @@ fn crate_attr_lints(prog: &Program, own: &[bool]) {
             }
         }
         // missing_docs for the crate: no `#![doc]` / `//!`
-        if !attrs.iter().any(|a| lint::attr_path(prog, md.file, a) == b"doc") {
+        let first_item = ast.root_items.iter().next().map_or(pf.src_len, |&i| ast.item(i).lo);
+        let head = pf.bytes(0, first_item.min(pf.src_len));
+        let doc_comment = head.split(|&b| b == b'\n').any(|l| { let t = l.trim_ascii_start(); t.starts_with(b"//!") || t.starts_with(b"/*!") });
+        let doc_attr = attrs.iter().any(|a| lint::attr_path(prog, md.file, a) == b"doc" && lint::attr_text(prog, md.file, a).contains('='));
+        if !doc_comment && !doc_attr {
             let pos = attrs.first().map(|a| prog.src(md.file).tok(a.toks.lo as usize).lo).or_else(|| ast.root_items.iter().next().map(|&i| ast.item(i).lo)).unwrap_or(0);
             emit(prog, root, &MISSING_DOCS, md.file, pos, "missing documentation for the crate");
         }
