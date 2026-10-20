@@ -16,7 +16,7 @@ fn fn_entry_size() {
         prev: Vec<(u64, u32, PcMap, u32)>,
         compiled: bool,
         patch_gen: u32,
-        rir: Option<std::sync::Arc<crate::rir::Func>>,
+        rir: Option<std::sync::Arc<relax_backend::rir::Func>>,
         refs: u32,
         rir_refs: Box<[u32]>,
         entry_ref: AtomicBool,
@@ -29,7 +29,7 @@ fn fn_entry_size() {
         version: u32,
         retired: Vec<(u64, u32, PcMap)>,
         inflight: bool,
-        spec: Option<(Vec<u8>, Vec<(u32, u64)>, Vec<crate::rir::RelocAt>, bool)>,
+        spec: Option<(Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>, bool)>,
         spec_state: u8,
         spec_depth: u8,
         baseline_hint: AtomicBool,
@@ -37,6 +37,7 @@ fn fn_entry_size() {
         o3: AtomicBool,
         base_code: AtomicBool,
         unverified: AtomicBool,
+        d3_lowered: AtomicBool,
         calls: Box<[u32]>,
     }
     let before = std::mem::size_of::<InlineFnEntry>();

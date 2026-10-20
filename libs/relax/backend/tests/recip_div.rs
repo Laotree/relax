@@ -2,7 +2,8 @@
 //! subnormal) is `x * (1 / c)`: bit-equal for every x (NaN, inf, zeros, subnormal and
 //! overflowing / underflowing results), and no divide is left. Other constants keep the divide.
 #![cfg(target_arch = "x86_64")]
-use relax_codegen::{exec::Code, opt, rir::*, x64};
+use relax_backend::{exec::Code, rir::*, x64};
+use relax_backend::passes;
 
 fn build(w: bool, c: u64) -> (Func, bool) {
     let cls = if w { Cls::F64 } else { Cls::F32 };
@@ -20,7 +21,7 @@ fn build(w: bool, c: u64) -> (Func, bool) {
     f.blocks[0].term = Term::Ret(vec![d]);
     f.verify().unwrap();
     let options = relax_session::Options::default();
-    opt::simplify(&options, &mut f, None, true, true);
+    passes::simplify(&options, &mut f, None, true, true);
     let divides = f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::FBin(FOp::Div, ..))));
     (f, divides)
 }

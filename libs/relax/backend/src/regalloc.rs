@@ -192,12 +192,7 @@ pub fn uses_defs(i: &Inst, uses: &mut Vec<VReg>, defs: &mut Vec<VReg>) {
             }
             defs.push(*d);
         }
-        Inst::VBin(_, d, a, b) => {
-            uses.push(*a);
-            uses.push(*b);
-            defs.push(*d);
-        }
-        Inst::VUn(_, d, a) | Inst::VSplat(d, a) | Inst::VExtract(d, a, _) | Inst::VLoad(d, a, _) | Inst::VAny(d, a) | Inst::VShift(_, d, a, _) => {
+        Inst::VSplat(d, a) | Inst::VExtract(d, a, _) | Inst::VLoad(d, a, _) | Inst::VAny(d, a) => {
             uses.push(*a);
             defs.push(*d);
         }
@@ -304,11 +299,7 @@ pub fn for_uses(i: &Inst, mut uses: impl FnMut(VReg)) {
                 uses(*b);
             }
         }
-        Inst::VBin(_, d, a, b) => {
-            uses(*a);
-            uses(*b);
-        }
-        Inst::VUn(_, d, a) | Inst::VSplat(d, a) | Inst::VExtract(d, a, _) | Inst::VLoad(d, a, _) | Inst::VAny(d, a) | Inst::VShift(_, d, a, _) => {
+        Inst::VSplat(d, a) | Inst::VExtract(d, a, _) | Inst::VLoad(d, a, _) | Inst::VAny(d, a) => {
             uses(*a);
         }
         Inst::VX3(_, d, m, a, b) | Inst::VSel(d, m, a, b) | Inst::VFma(_, _, d, m, a, b) => {
@@ -386,13 +377,10 @@ pub fn for_defs(i: &Inst, mut defs: impl FnMut(VReg)) {
         | Inst::VGather(d, _, _)
         | Inst::VX(_, d, _, _)
         | Inst::VX3(_, d, _, _, _)
-        | Inst::VBin(_, d, _, _)
-        | Inst::VUn(_, d, _)
         | Inst::VSplat(d, _)
         | Inst::VExtract(d, _, _)
         | Inst::VLoad(d, _, _)
         | Inst::VAny(d, _)
-        | Inst::VShift(_, d, _, _)
         | Inst::VSel(d, _, _, _)
         | Inst::VFma(_, _, d, _, _, _)
         | Inst::VInsert(d, _, _, _)
@@ -2282,7 +2270,7 @@ fn ra_stat(i: usize, v: u64) {
 /// them are then no-ops). Returns the function the allocation is for when it differs from `f`.
 /// `freq`: measured block frequencies of `f` (see block_weights), if any.
 pub fn allocate_split(options: &relax_session::Options, f: &Func, cfg: &RegConfig, thorough: bool, freq: Option<&[f32]>) -> (Option<Func>, Alloc) {
-    let t0 = crate::opt::pass_clock();
+    let t0 = crate::stats::pass_clock();
     let (g, al) = allocate_split_inner(options, f, cfg, thorough, freq, t0);
     if t0 != 0 {
         ra_stat(3, f.vregs.len() as u64);
@@ -2297,7 +2285,7 @@ pub fn allocate_split(options: &relax_session::Options, f: &Func, cfg: &RegConfi
 
 fn allocate_split_inner(options: &relax_session::Options, f: &Func, cfg: &RegConfig, thorough: bool, freq: Option<&[f32]>, t0: u64) -> (Option<Func>, Alloc) {
     let al = if !thorough && f.baseline && !options.no_quick_ra { allocate_baseline(options, f, cfg) } else { allocate_with(options, f, cfg, thorough, freq) };
-    let t1 = crate::opt::pass_clock();
+    let t1 = crate::stats::pass_clock();
     if t0 != 0 {
         ra_stat(0, t1 - t0);
         ra_stat(1, 0);
@@ -2314,7 +2302,7 @@ fn allocate_split_inner(options: &relax_session::Options, f: &Func, cfg: &RegCon
         if cand.iter().any(|x| *x) {
             if let Some(g) = split_cold_calls(f, fr, &cand) {
                 let al2 = allocate_with(options, &g, cfg, thorough, freq);
-                let t2 = crate::opt::pass_clock();
+                let t2 = crate::stats::pass_clock();
                 if t0 != 0 {
                     ra_stat(1, t2 - t1);
                 }
@@ -2324,7 +2312,7 @@ fn allocate_split_inner(options: &relax_session::Options, f: &Func, cfg: &RegCon
                 }
                 let (h, al3) = allocate_split_loops(options, &g, al2, cfg, thorough, freq);
                 if t0 != 0 {
-                    ra_stat(2, crate::opt::pass_clock() - t2);
+                    ra_stat(2, crate::stats::pass_clock() - t2);
                 }
                 return (Some(h.unwrap_or(g)), al3);
             }
@@ -2332,7 +2320,7 @@ fn allocate_split_inner(options: &relax_session::Options, f: &Func, cfg: &RegCon
     }
     let r = allocate_split_loops(options, f, al, cfg, thorough, freq);
     if t0 != 0 {
-        ra_stat(2, crate::opt::pass_clock() - t1);
+        ra_stat(2, crate::stats::pass_clock() - t1);
     }
     r
 }
@@ -2610,9 +2598,9 @@ fn allocate_split_loops_inner(options: &relax_session::Options, f: &Func, al: Al
 /// Natural loops (back edge b -> h with h dominating b): (header, member blocks), innermost
 /// (smallest) first. Loops headed by the entry block or entered through an unwind edge are left out.
 #[inline(never)]
-pub(crate) fn natural_loops(f: &Func, reach: &[bool], preds: &[Vec<u32>], all: bool) -> Vec<(u32, Vec<bool>)> {
-    let idom = crate::opt::idoms(f);
-    let (pre, post, _) = crate::opt::dom_numbers(&idom);
+pub fn natural_loops(f: &Func, reach: &[bool], preds: &[Vec<u32>], all: bool) -> Vec<(u32, Vec<bool>)> {
+    let idom = crate::dom::idoms(f);
+    let (pre, post, _) = crate::dom::dom_numbers(&idom);
     let dominates = |a: u32, b: u32| -> bool {
         pre[a as usize] <= pre[b as usize] && post[b as usize] <= post[a as usize]
     };
@@ -2658,7 +2646,7 @@ pub(crate) fn natural_loops(f: &Func, reach: &[bool], preds: &[Vec<u32>], all: b
 }
 
 #[inline(never)]
-pub(crate) fn preds_of(f: &Func, reach: &[bool]) -> Vec<Vec<u32>> {
+pub fn preds_of(f: &Func, reach: &[bool]) -> Vec<Vec<u32>> {
     let mut p = vec![Vec::new(); f.blocks.len()];
     for (bi, b) in f.blocks.iter().enumerate() {
         if reach[bi] {
@@ -2677,7 +2665,7 @@ fn live_in_sets(f: &Func, reach: &[bool]) -> LiveSets {
     live_sets(f, reach, &tab, false).0
 }
 
-pub(crate) fn term_vregs_mut(t: &mut Term, mut fv: impl FnMut(&mut VReg)) {
+pub fn term_vregs_mut(t: &mut Term, mut fv: impl FnMut(&mut VReg)) {
     match t {
         Term::Branch(c, _, _) | Term::Switch(c, _) => fv(c),
         Term::Ret(vs) => vs.iter_mut().for_each(fv),
@@ -3501,7 +3489,7 @@ pub fn domain_base_block(f: &Func, sym_class: u64, reach: &[bool]) -> Option<usi
         .map(|(bi, _)| bi)
         .collect();
     let first = *uses.first()?;
-    let idom = crate::opt::idoms(f);
+    let idom = crate::dom::idoms(f);
     // the dominator chain of a block, block first, entry last
     let chain = |mut b: usize| {
         let mut c = vec![b];
