@@ -565,25 +565,6 @@ mod imp {
 
     extern "C" fn on_signal(sig: i32, info: *mut u8, uc: *mut u8) {
         unsafe {
-            {
-                // TEMP-DIAG: raw line before anything else runs
-                extern "C" { fn write(fd: i32, b: *const u8, n: usize) -> isize; }
-                let mc = *(uc.add(UC_MCONTEXT) as *const *mut u8);
-                let pc = *(mc.add(SS_PC) as *const u64);
-                let lr = *(mc.add(SS + 240) as *const u64);
-                let addr = *(info.add(SI_ADDR) as *const u64);
-                let mut buf = [0u8; 120];
-                let mut n = 0;
-                let mut put = |b: &[u8]| { for &c in b { buf[n] = c; n += 1; } };
-                put(b"RAWSIG sig=");
-                put(&[b'0' + (sig / 10) as u8, b'0' + (sig % 10) as u8]);
-                for (tag, v) in [(&b" pc=0x"[..], pc), (&b" lr=0x"[..], lr), (&b" addr=0x"[..], addr)] {
-                    put(tag);
-                    for i in (0..12).rev() { let d = ((v >> (4 * i)) & 15) as u8; put(&[if d < 10 { b'0' + d } else { b'a' + d - 10 }]); }
-                }
-                put(b"\n");
-                write(2, buf.as_ptr(), n);
-            }
             // the handler allocates: in the system heap, never in the faulting thread's arena (the fault may be inside its allocator)
             let _kept = crate::zone_alloc::kept();
             if sig == SIGABRT {
