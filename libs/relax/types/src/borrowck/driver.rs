@@ -99,16 +99,6 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
     // independent root of its own (rustc: an anon const is its own typeck root and `mir_borrowck`).
     let mut owners: Vec<CheckedBody> = Vec::new();
     let closure_order = closures_inner_first(prog, tcx, typeck);
-    // An async closure is a closure returning a coroutine over its captures (CoroutineClosure); which
-    // captures the coroutine takes (by ref through `AsyncFn`, by move through `FnOnce`: rustc's
-    // by-move body) is not modelled, so the root is not checked rather than misreported.
-    {
-        let ast = &prog.files[typeck.file as usize].ast;
-        if closure_order.iter().any(|&c| c & crate::tcx::ASYNC_FN_BODY == 0 && matches!(ast.expr(crate::ast::ExprId(c)).kind, crate::ast::ExprKind::Closure(row) if ast.row(row).is_async)) {
-            v.unchecked.push(format!("{name}: async closures are not borrow-checked"));
-            return v;
-        }
-    }
     for &c in &closure_order {
         owners.push(CheckedBody { owner: typeck.def, kind: OwnerKind::Closure(crate::ast::ExprId(c)) });
     }
@@ -226,7 +216,8 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
             None => item_sig.clone(),
         };
         let env_ty = mir.local_decls.get(1).map_or(tcx.tys.unit, |d| d.ty);
-        let Some(sig) = SignatureRegions::closure_in(tcx, prog, typeck.def, c, sigs, parent) else {
+        let plan = super::universal_regions::coroutine_closure_upvars(typeck, c);
+        let Some(sig) = SignatureRegions::closure_in(tcx, prog, typeck.def, c, sigs, plan.as_ref().map(|p| (p, env_ty)), parent) else {
             v.unchecked.push(format!("{name}: closure signature is not a function pointer")); return;
         };
         closure_sigs.insert(c, sig.with_closure_env(tcx, typeck.def, c, env_ty));

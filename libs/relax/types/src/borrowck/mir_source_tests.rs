@@ -698,3 +698,39 @@ fn owning_pointers_own_their_pointee_for_dropck() {
         assert!(errors.len() == 1 && errors[0].starts_with("E0597"), "{owner}: {errors:?}");
     }
 }
+
+#[test]
+fn an_async_closure_returns_a_coroutine_that_borrows_from_its_environment() {
+    // The `FnMut` async closure's coroutine reborrows `i` from the closure's environment: its upvar has
+    // the environment's region (rustc `tupled_upvars_by_closure_kind`), not an unrelated external region.
+    let (errors, unchecked) = borrowck_source_in("
+        fn call_once<F>(_: impl FnOnce() -> F) {}
+        pub fn f() { let mut i = 0; let c = async || { i += 1; }; call_once(c); }", 2021);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn an_async_closures_arguments_are_its_coroutines_leading_upvars() {
+    // The coroutine's argument upvar has the closure signature's own (higher-ranked) region.
+    let (errors, unchecked) = borrowck_source_in("
+        use std::future::Future;
+        trait Foo<'a> { type Future: Future<Output = u8> + 'a; fn start(self, f: &'a u8) -> Self::Future; }
+        impl<'a, Fn, Fut> Foo<'a> for Fn where Fn: FnOnce(&'a u8) -> Fut, Fut: Future<Output = u8> + 'a {
+            type Future = Fut;
+            fn start(self, f: &'a u8) -> Self::Future { (self)(f) }
+        }
+        fn foo<F>(f: F) where F: for<'a> Foo<'a> { let bar = 5; f.start(&bar); }
+        pub fn g() { foo(async move |f: &u8| { *f }); }", 2021);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn an_async_closure_cannot_move_out_of_a_shared_reference() {
+    let (errors, unchecked) = borrowck_source_in("
+        pub struct Ty;
+        pub fn hello(x: &Ty) { let _c = async || { *x; }; }", 2021);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.iter().any(|e| e.starts_with("E0507")), "{errors:?}");
+}
