@@ -271,7 +271,37 @@ impl BoundVarContext<'_> {
         self.rbv.named_variable_map.insert(key, result);
     }
 
+    /// rustc_hir_analysis check_opaque_precise_captures: the `use<..>` list names each parameter once, lifetimes
+    /// first, and every type and const parameter in scope of the opaque.
+    fn check_precise_captures(&mut self, bounds: ast::List<ast::Bound>) {
+        let ast = &self.prog.files[self.file as usize].ast;
+        let Some(args) = ast.list(bounds).iter().find_map(|b| if let ast::Bound::Use(a) = b { Some(*a) } else { None }) else { return };
+        let Some(GenericArgs::Angle(list)) = ast.gargs(args) else { return };
+        let text = |i: ast::Ident| self.prog.files[self.file as usize].text(i).to_string();
+        let mut seen: Vec<String> = Vec::new();
+        let mut first_non_lifetime = false;
+        for arg in ast.list(*list) {
+            let (name, pos, lifetime) = match *arg {
+                GenericArg::Lifetime(lt) => (text(lt), lt.lo, true),
+                GenericArg::Type(t) => match ast.ty(t) {
+                    ast::Ty::Path(p) if p.no_qself() && ast.segs(p.segs).len() == 1 => { let seg = ast.segs(p.segs)[0]; (text(seg.name), seg.name.lo, false) }
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            if lifetime && first_non_lifetime {
+                self.tcx.dcx.report(self.cause(pos), format!("lifetime parameter `{}` must be listed before non-lifetime parameters", name));
+            }
+            if !lifetime { first_non_lifetime = true; }
+            if seen.contains(&name) {
+                self.tcx.dcx.report(self.cause(pos), format!("cannot capture parameter `{}` twice", name));
+            }
+            seen.push(name);
+        }
+    }
+
     fn visit_opaque_ty(&mut self, opaque: DefId, bounds: ast::List<ast::Bound>, async_output: Option<ast::TyId>) {
+        if self.tcx.validates(self.prog, self.file) { self.check_precise_captures(bounds); }
         self.rbv.opaque_captured_lifetimes.entry(opaque).or_default();
         let ast = &self.prog.files[self.file as usize].ast;
         let span = ast.item(self.prog.def(self.owner).item).lo;
@@ -947,10 +977,10 @@ impl BoundVarContext<'_> {
 }
 
 impl BoundVarContext<'_> {
-    /// resolve_bound_vars.rs:904-944 (visit_qpath). HIR's QPath::TypeRelative is a path whose
-    /// resolution stops at a type (`<T>::A`, `T::A`, `Self::A`, `S::new`): its unresolved
-    /// segments, and the resolved prefix's type around them, see an indeterminate (`None`)
-    /// object lifetime default; the prefix's own containers still apply inside it.
+    /// HIR's QPath::TypeRelative is a path whose resolution stops at a type (`<T>::A`, `T::A`,
+    /// `Self::A`, `S::new`): its unresolved segments' arguments are walked without a scope of
+    /// their own (rustc's visit_segment_args only runs for resolved paths), so they see the
+    /// enclosing object lifetime default; the resolved prefix's own containers still apply.
     fn resolved_prefix_len(&self, path: &ast::Path) -> usize {
         let ast = &self.prog.files[self.file as usize].ast;
         let segs = ast.segs(path.segs);
@@ -971,8 +1001,6 @@ impl BoundVarContext<'_> {
     fn visit_path(&mut self, path: &ast::Path) {
         let ast = &self.prog.files[self.file as usize].ast;
         let resolved_len = self.resolved_prefix_len(path);
-        let type_relative = resolved_len < path.segs.len();
-        if type_relative { self.scopes.push(Scope::ObjectLifetimeDefault(None)); }
         let resolved = ast::Path { segs: path.segs.prefix(resolved_len), ..*path };
         if let Some(qself) = ast.qself(path) {
             if let Some(trait_path) = qself.trait_path { self.visit_path(&trait_path); }
@@ -1045,7 +1073,6 @@ impl BoundVarContext<'_> {
             self.visit_ty(qself.ty);
             self.scopes.pop();
         }
-        if type_relative { self.scopes.pop(); }
     }
 
     /// resolve_bound_vars.rs:2000-2094: only the resolved declaration's
@@ -1496,17 +1523,16 @@ mod tests {
         assert_eq!(tcx.dcx.err_count(), 0);
     }
     #[test]
-    fn round33_lifetime_type_relative_paths_have_indeterminate_object_default() {
-        // resolve_bound_vars.rs:927-944 + collect.rs:506-520: `X::A<dyn Tr>` (type-relative)
-        // has no object lifetime default: E0228 in a signature; `<X as G>::A<dyn Tr>` is
-        // resolved and takes A's declared default.
+    fn round33_lifetime_type_relative_paths_take_the_enclosing_object_default() {
+        // resolve_bound_vars.rs:1686-1809 (visit_segment_args runs for resolved paths only):
+        // `X::A<dyn Tr>` (type-relative) pushes no object default scope, so a signature's
+        // `'static` applies (no E0228); `<X as G>::A<dyn Tr>` is resolved and takes A's
+        // declared default.
         let (prog, tcx) = source("#![no_std] trait Tr {} trait G { type A<T: ?Sized>; } fn relative<X: G>(_: X::A<dyn Tr>) {} fn qualified<X: G>(_: <X as G>::A<dyn Tr>) {}", 2021);
-        for name in ["relative"] {
+        for name in ["relative", "qualified"] {
             tcx.fn_sig(&prog, named(&prog, name));
-            assert!(sig_errors(&tcx, &prog, name).iter().any(|e| e.contains("E0228")), "{name}: {:?}", sig_errors(&tcx, &prog, name));
+            assert!(sig_errors(&tcx, &prog, name).is_empty(), "{name}: {:?}", sig_errors(&tcx, &prog, name));
         }
-        tcx.fn_sig(&prog, named(&prog, "qualified"));
-        assert!(sig_errors(&tcx, &prog, "qualified").is_empty(), "{:?}", sig_errors(&tcx, &prog, "qualified"));
         assert_eq!(object_default(&tcx, &prog, named(&prog, "qualified")), [RegionKind::ReStatic]);
     }
     #[test]
@@ -1635,6 +1661,18 @@ impl ResolveBoundVars {
             }
         };
         Some(self.region_for_arg(arg))
+    }
+    /// `map_opaque_lifetime_to_parent_lifetime` for each lifetime the opaque captures: a lifetime
+    /// that maps to a parameter of an enclosing opaque keeps mapping until it reaches the item's own.
+    pub(crate) fn opaque_captured_parent_lifetimes(&self, opaque: DefId) -> Vec<RegionKind> {
+        self.opaque_captured_lifetimes[&opaque].iter().map(|&(mut arg, _)| {
+            while let ResolvedArg::EarlyBound(id) = arg {
+                let decl = self.names.declarations.iter().chain(self.names.inherited.iter()).find(|d| d.id == id).expect("lifetime declaration");
+                let BinderId::Opaque(outer) = decl.binder else { break };
+                arg = self.opaque_captured_lifetimes[&outer].iter().find(|(_, own)| *own == id).expect("captured lifetime of the enclosing opaque").0;
+            }
+            self.region_for_arg(arg)
+        }).collect()
     }
     pub(crate) fn region_for_arg(&self, arg: ResolvedArg) -> RegionKind {
         match arg {

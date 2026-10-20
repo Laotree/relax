@@ -101,6 +101,7 @@ fn context<'a>(prog: &'a Program, tcx: &'a Tcx, state: &'a crate::tcx::EvalState
         await_count: 0,
         cur_binop: 0,
         keep_literal_vars: true,
+        keep_user_types: true,
         diverging: Vec::new(),
         deferred_dyn: Vec::new(),
         deferred_casts: Vec::new(),
@@ -116,11 +117,14 @@ fn context<'a>(prog: &'a Program, tcx: &'a Tcx, state: &'a crate::tcx::EvalState
         item_blocks: Vec::new(),
         checked_opaque_types_storage_entries: None,
         expected_closure_kinds: HashMap::default(),
+        async_expected_inner: None,
+        async_body_expected: HashMap::default(),
         extra_arg: None,
         soft: false,
         last_lo: 0,
         known_method_args: None,
         value_path_lifetimes: Vec::new(),
+        value_path_enum_lifetimes: Vec::new(),
         value_path_parent_regions: Vec::new(),
         deferred_repeats: Vec::new(),
         forced_autoref: None,
@@ -128,7 +132,7 @@ fn context<'a>(prog: &'a Program, tcx: &'a Tcx, state: &'a crate::tcx::EvalState
     }
 }
 
-fn program(source: &str) -> (Program, Tcx) {
+pub(super) fn program(source: &str) -> (Program, Tcx) {
     let dir = std::env::temp_dir().join(format!("relax-native-fcx-{}-{}", std::process::id(), crate::unique_test_suffix()));
     std::fs::create_dir(&dir).unwrap();
     let path = dir.join("lib.rs"); std::fs::write(&path, source).unwrap();
@@ -351,7 +355,7 @@ fn round28_writeback_rejects_new_opaque_definitions() {
     fcx.checked_opaque_types_storage_entries = Some(fcx.infcx.inner.borrow_mut().opaque_types().num_entries());
     fcx.infcx.inner.borrow_mut().opaque_types().register(
         crate::infer::opaque_types::OpaqueTypeKey { def_id: def, args: Vec::new().into() },
-        crate::infer::opaque_types::ProvisionalHiddenType { ty: tcx.tys.u32_ });
+        crate::infer::opaque_types::ProvisionalHiddenType::new(tcx.tys.u32_));
     fcx.detect_opaque_types_added_during_writeback();
 }
 

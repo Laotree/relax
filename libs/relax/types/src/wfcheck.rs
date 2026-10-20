@@ -381,15 +381,12 @@ pub mod obligations {
         ocx: ObligationCtxt<'a, 'tcx>,
         env: ParamEnvId,
         def: DefId,
-        /// only dyn-compatibility goals are kept (a trait definition: its environment is not built)
-        only_dyn: bool,
         /// errors of checks that are not obligations (region outlives)
         extra: Vec<String>,
     }
 
     impl<'a, 'tcx> Wfcx<'a, 'tcx> {
         fn register(&mut self, goal: Goal, pos: u32) {
-            if self.only_dyn && !matches!(goal.predicate.kind, PredicateKind::DynCompatible(_)) { return; }
             self.ocx.engine.register_predicate_obligation(self.infcx, PredicateObligation { goal, recursion_depth: 0, cause: ObligationCause { span: pos, body_id: self.def } });
         }
 
@@ -507,6 +504,8 @@ pub mod obligations {
                     NextSolverError::Overflow(o) => ("E0275", o),
                     NextSolverError::Ambiguity(o) => ("E0283", o),
                 };
+                // (an obligation that mentions an error type is a consequence of that error)
+                if predicate_mentions_error(self.infcx, &o.goal.predicate) { continue; }
                 let Some(msg) = self.message(code, &o) else { continue };
                 if !seen.insert((o.cause.span, msg.clone())) { continue; }
                 out.push(self.prog.record_error(file, o.cause.span, "typeck", msg));
@@ -517,6 +516,26 @@ pub mod obligations {
         fn message(&self, code: &str, o: &PredicateObligation) -> Option<String> {
             fulfillment_message(self.infcx, self.prog, code, &o.goal)
         }
+    }
+
+    /// rustc `references_error()`: a predicate that mentions an error type or constant (once its
+    /// inference variables are resolved) is the consequence of an error already reported.
+    pub(crate) fn predicate_mentions_error(infcx: &crate::infer::InferCtxt<'_>, pred: &Predicate) -> bool {
+        struct HasError<'t, 'u>(&'t crate::types::Types, bool, &'t crate::infer::InferCtxt<'u>);
+        impl crate::types::fold::TypeFolder for HasError<'_, '_> {
+            fn fold_ty(&mut self, tys: &crate::types::Types, ty: TyId, depth: u32) -> TyId {
+                let ty = self.2.deeply_resolve_ignoring_regions(ty);
+                if self.0.has_error(ty) { self.1 = true; return ty; }
+                crate::types::fold::super_fold_ty(tys, ty, self, depth)
+            }
+            fn fold_const(&mut self, tys: &crate::types::Types, ct: crate::consts::Const, depth: u32) -> crate::consts::Const {
+                if matches!(tys.const_kind(ct), crate::consts::ConstKind::Error) { self.1 = true; return ct; }
+                crate::types::fold::super_fold_const(tys, ct, self, depth)
+            }
+        }
+        let mut h = HasError(&infcx.tcx.tys, false, infcx);
+        crate::next_solver::fold::fold_predicate(&infcx.tcx.tys, pred, &mut h);
+        h.1
     }
 
     /// The failing leaf of a well-formedness goal: `WellFormed(T)` stands for the obligations of
@@ -555,17 +574,10 @@ pub mod obligations {
         }
     }
 
-    fn with_wfcx_env(prog: &Program, tcx: &Tcx, def: DefId, env: ParamEnvId, f: impl FnOnce(&mut Wfcx<'_, '_>)) -> Vec<String> {
-        let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), def);
-        let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env, def, only_dyn: false , extra: Vec::new()};
-        f(&mut w);
-        w.finish(prog.def(def).file)
-    }
-
     fn with_wfcx(prog: &Program, tcx: &Tcx, def: DefId, f: impl FnOnce(&mut Wfcx<'_, '_>)) -> Vec<String> {
         let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), def);
         let env = tcx.param_env_id(prog, def);
-        let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env, def, only_dyn: false , extra: Vec::new()};
+        let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env, def, extra: Vec::new()};
         w.check_false_global_bounds();
         f(&mut w);
         w.finish(prog.def(def).file)
@@ -590,18 +602,7 @@ pub mod obligations {
                 errors.extend(with_wfcx(prog, tcx, did, |w| check_impl(w, ast, item)));
                 errors
             }
-            // (a trait's own environment is not built here: `param_env_id` of `trait Qux: Foo + AsRef<Self::Bar>` never
-            // returns -- solver, crash lane)
-            DefKind::Trait => {
-                // the defaults' own well-formedness mentions no parameter: no environment needed
-                let mut errors = with_wfcx_env(prog, tcx, did, ParamEnvId::EMPTY, |w| check_defaults(w, ast, item));
-                // dyn-compatibility of the `dyn` types its bounds mention needs no environment
-                let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), did);
-                let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env: ParamEnvId::EMPTY, def: did, only_dyn: true , extra: Vec::new()};
-                w.check_where_clauses(item.lo);
-                errors.extend(w.finish(def.file));
-                errors
-            }
+            DefKind::Trait => with_wfcx(prog, tcx, did, |w| { check_defaults(w, ast, item); w.check_where_clauses(item.lo); }),
             DefKind::Static | DefKind::ForeignStatic => with_wfcx(prog, tcx, did, |w| check_static(w, ast, item)),
             DefKind::AssocConst => with_wfcx(prog, tcx, did, |w| check_assoc_const(w, ast, item)),
             DefKind::AssocTy => with_wfcx(prog, tcx, did, |w| check_assoc_ty(w, ast, item)),
