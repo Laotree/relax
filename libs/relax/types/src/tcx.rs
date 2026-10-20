@@ -472,6 +472,7 @@ impl Tcx {
                     }
                 }
                 Some(&td) => {
+                    self.header_coherence_errors(prog, im.def, krate, td, st, pos, &mut errors);
                     if prog.def(td).krate == krate {
                         continue;
                     }
@@ -499,6 +500,53 @@ impl Tcx {
             }
         }
         errors
+    }
+
+    /// coherence/mod.rs check_object_overlap (E0371) and coherence/orphan.rs `trait_is_auto` (E0321) of one trait impl.
+    fn header_coherence_errors(&self, prog: &Program, imp: DefId, krate: u32, td: DefId, st: TyId, pos: u32, errors: &mut Vec<(DefId, u32, String)>) {
+        use crate::next_solver::eval_ctxt::trait_is_auto;
+        let shown = || crate::typeck::ty_to_string(false, prog, self, st);
+        if let TyKind::Dyn(principal, _, _, _, _, _, autos) = self.tys.kind(st).clone() {
+            let mut components = vec![principal];
+            components.extend(self.tys.list(autos).iter().copied());
+            for c in components {
+                if !self.dyn_compatibility_violations(prog, c).is_empty() { continue; }
+                // the trait and its supertraits (elaborate::supertrait_def_ids)
+                let (mut seen, mut stack) = (vec![c], vec![c]);
+                while let Some(t) = stack.pop() {
+                    for s in self.trait_supers(prog, t) { if !seen.contains(&s) { seen.push(s); stack.push(s); } }
+                }
+                if seen.contains(&td) {
+                    errors.push((imp, pos, format!("E0371: the object type `{}` automatically implements the trait `{}`", shown(), prog.def_path(td))));
+                    return;
+                }
+            }
+        }
+        if !trait_is_auto(prog, td) { return; }
+        // (local ok, non-local ok, what is problematic for a local trait)
+        let local_trait = prog.def(td).krate == krate;
+        let (disallow_local, nonlocal_ok, nonlocal_defined): (Option<&str>, bool, bool) = match self.tys.kind(st).clone() {
+            TyKind::Adt(d, ..) | TyKind::Foreign(d) => { let own = prog.def(d).krate == krate; (None, own, !own) }
+            TyKind::Dyn(..) => (Some("trait object"), false, false),
+            TyKind::Param(i) => {
+                let sized = self.impl_generics(prog, imp).map_or(true, |e| e.sized_params.contains(&i));
+                (if sized { None } else { Some("generic type") }, false, false)
+            }
+            TyKind::Alias(_, a) => (Some(match a.kind { AliasTyKind::Projection { .. } => "associated type", AliasTyKind::Opaque { .. } => "opaque type", _ => "type alias" }), false, false),
+            TyKind::Error => (None, true, false),
+            _ => (None, false, false),
+        };
+        if local_trait {
+            if let Some(kind) = disallow_local {
+                errors.push((imp, pos, format!("E0321: traits with a default impl, like `{}`, cannot be implemented for {} `{}`", prog.def_path(td), kind, shown())));
+            }
+        } else if !nonlocal_ok {
+            if nonlocal_defined {
+                errors.push((imp, pos, format!("E0321: cross-crate traits with a default impl, like `{}`, can only be implemented for a struct/enum type defined in the current crate", prog.def_path(td))));
+            } else {
+                errors.push((imp, pos, format!("E0321: cross-crate traits with a default impl, like `{}`, can only be implemented for a struct/enum type, not `{}`", prog.def_path(td), shown())));
+            }
+        }
     }
 
     /// Coherence (N:rustc_hir_analysis/src/coherence/mod.rs:126-170 coherent_trait: orphan
