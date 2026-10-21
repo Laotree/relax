@@ -318,6 +318,9 @@ pub fn payload_of(b: &[u8]) -> Option<std::sync::Arc<Vec<u8>>> {
         Some(x) if **x == data => Some(x.clone()),
         Some(_) => fail(&format!("not registered, and `{path}` collides with another payload's key")),
         None => {
+            if std::env::var_os("MAKEPAD_RUN_ZONE_TRACE").is_some() {
+                eprintln!("makepad-run zone: include_bytes! payload {key} read again from `{path}`");
+            }
             let x = std::sync::Arc::new(data);
             p.insert(key.to_string(), x.clone());
             Some(x)
