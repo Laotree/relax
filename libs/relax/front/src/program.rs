@@ -661,6 +661,9 @@ pub struct Program {
     pub files: Vec<std::sync::Arc<ParsedFile>>,
     /// the proc-macro world's program: its core/alloc/std files come from the program's load
     /// (SHARED_STD) when that load runs
+    /// The target's pointer width in bytes: 4 for the wasm32 web target, else 8 (a proc-macro
+    /// world runs on this machine: always 8).
+    pub ptr_bytes: u32,
     pub std_from_shared: bool,
     /// the std crates include core::simd / std::simd (relax_portable_simd; `std_simd_wanted`)
     pub std_simd: bool,
@@ -668,6 +671,9 @@ pub struct Program {
     /// again once the crate is loaded (expand_pending: rustc's resolve/expand fixpoint for
     /// macros an expansion in a later file defines or imports), else errors
     pending_macs: Vec<(u32, ItemId, u32)>,
+    /// `global_asm!` items (unless `--no-asm`): (file, item, module), assembled and placed when
+    /// the program's code is set up (compiler global_asm.rs)
+    pub global_asms: Vec<(u32, ItemId, u32)>,
     /// files whose lazily parsed part has its identifiers interned here (part_idents)
     part_interned: relax_session::sync::Mutex<crate::fxhash::HashSet<(u32, u32)>>,
     pub file_paths: Vec<String>,
@@ -822,6 +828,14 @@ impl Drop for Program {
 }
 
 impl Program {
+    /// The name of the crate `file` belongs to ("" before the file is assigned to one).
+    pub fn file_crate_name(&self, file: u32) -> String {
+        match self.file_crate.get(file as usize).and_then(|&k| self.crates.get(k as usize)) {
+            Some(c) => self.syms.str(c.name).to_string(),
+            None => String::new(),
+        }
+    }
+
     pub fn new(sess: &std::sync::Arc<crate::Session>) -> Program {
         let mut p = Program {
             collected_starts: Vec::new(),
@@ -838,9 +852,11 @@ impl Program {
             syms: Interner::default(),
             files: Vec::new(),
             std_from_shared: false,
+            ptr_bytes: sess.options.check_target.web().map_or(8, |w| w.bytes()),
             std_simd: false,
             part_interned: Default::default(),
             pending_macs: Vec::new(),
+            global_asms: Vec::new(),
             file_paths: Vec::new(),
             file_crate: Vec::new(),
             crates: Vec::new(),
@@ -1272,7 +1288,7 @@ impl Program {
             }
             // Resolve scopes against the loader's complete dependency imports. Do not retain
             // a scope the prescan computed against its earlier macro table.
-            let mods = std::sync::Arc::new(crate::macros::CrateMods { root: ahead.mods.root.clone(), src: ahead.mods.src.clone(), mods: ahead.mods.mods.clone(), uses: ahead.mods.uses.clone(), externs, renames: ahead.mods.renames.clone(), ..Default::default() });
+            let mods = std::sync::Arc::new(crate::macros::CrateMods { root: ahead.mods.root.clone(), src: ahead.mods.src.clone(), mods: ahead.mods.mods.clone(), items: ahead.mods.items.clone(), uses: ahead.mods.uses.clone(), externs, renames: ahead.mods.renames.clone(), ..Default::default() });
             table.add_crate(ahead.name.clone(), mods);
             if !ahead.macro_use.is_empty() {
                 let v = table.macro_use.entry(ahead.name.clone()).or_default();
@@ -1782,6 +1798,60 @@ impl Program {
             cfg: self.crates[krate as usize].cfg.clone(), macros,
             reuse: self.parse_reuse.get(&old).cloned().unwrap_or_default(),
             previous: Some(self.files[old as usize].clone()), context: self.crates[krate as usize].context.clone() }
+    }
+
+    /// A parse of a NEW file that becomes child module `child` of module `parent` (makepad
+    /// inspect's probes and `eval`: code compiled in a module's scope): the parent's crate,
+    /// edition, cfg and macro table; `module_path!()` names the child.
+    pub fn child_parse_snapshot(&self, parent: u32, child: &str, path: &str) -> ParseSnapshot {
+        let krate = self.mods[parent as usize].krate;
+        let kname = self.syms.str(self.crates[krate as usize].name).to_string();
+        let normal = self.mods[parent as usize].normal;
+        let mod_path = format!("{}::{}", self.def_path(self.mods[normal as usize].def), child);
+        ParseSnapshot { old: self.mods[normal as usize].file, path: path.to_string(), edition: self.crates[krate as usize].edition, kname, mod_path,
+            cfg: self.crates[krate as usize].cfg.clone(), macros: self.macros.clone(), reuse: Default::default(), previous: None,
+            context: self.crates[krate as usize].context.clone() }
+    }
+
+    /// Adds `v` (a child_parse_snapshot parse) as a new private module `name` of module `parent`
+    /// and collects its items there: it is the parent's child, so the parent's private items,
+    /// imports and `crate::` / `super::` paths are its own as for any child module; `name` is
+    /// not bound in the parent (nothing of the program can name it). The parent's names are in
+    /// scope unqualified through a glob of the parent (what `use super::*;` gives a child).
+    /// Returns (module, file). The caller resolves the imports it added (resolve_imports_added).
+    pub fn add_child_module(&mut self, parent: u32, name: &str, v: FileVersion) -> Result<(u32, u32), String> {
+        let parent = self.mods[parent as usize].normal;
+        let krate = self.mods[parent as usize].krate;
+        for &(lo, hi) in &v.idents {
+            let s = std::str::from_utf8(&v.pf.src[lo as usize..hi as usize]).unwrap_or("?").to_string();
+            self.syms.intern(&s);
+        }
+        let table = std::sync::Arc::make_mut(&mut self.macros);
+        for d in v.macros {
+            table.push(d);
+        }
+        self.crates[krate as usize].context = v.context;
+        let mut pf = v.pf;
+        self.map_image(&v.path, krate, &mut pf);
+        self.files.push(std::sync::Arc::new(pf));
+        self.file_paths.push(v.path);
+        self.exec_profile_file(self.file_paths.len() as u32 - 1);
+        self.file_crate.push(krate);
+        self.file_blocks.push(v.blocks);
+        let f = self.files.len() as u32 - 1;
+        let sym = self.syms.intern(name);
+        let pdef = self.mods[parent as usize].def;
+        let d = self.add_def(Def { kind: DefKind::Mod, name: sym, parent: pdef, file: f, item: ItemId(0), sub: 0, is_pub: false, krate, scope: parent });
+        let m = self.new_module(d, Some(parent), None, krate, f);
+        self.defs[d.0 as usize].sub = m;
+        self.mods[m as usize].globs.push((pdef, false));
+        if self.imports_done {
+            self.scope_cache.clear();
+        }
+        let dir = dir_of(&self.file_paths[f as usize]).to_string();
+        let items: Vec<ItemId> = self.files[f as usize].ast.root_items.iter().copied().collect();
+        self.collect_items(f, &items, m, &dir, false)?;
+        Ok((m, f))
     }
 
     /// Item-level macro calls of crate `krate` no macro resolved at their parse, expanded again
@@ -2866,8 +2936,13 @@ impl Program {
                     if let ItemKind::Mac(m) = &it.kind {
                         let m = f.ast.row(*m);
                         let last = f.ast.segs(m.path.segs).last().map(|sg| f.text(sg.name).to_string()).unwrap_or_default();
-                        if last == "global_asm" || last == "naked_asm" {
-                            self.errors.push(self.record_error(file,it.lo,"lower","inline assembly is not supported; use core::arch intrinsics".to_string()));
+                        if last == "global_asm" && !self.session.options.no_asm {
+                            self.global_asms.push((file, iid, module));
+                        } else if last == "naked_asm" && !self.session.options.no_asm {
+                            self.errors.push(self.record_error(file, it.lo, "lower", "`naked_asm!` is allowed only as the body of a `#[unsafe(naked)]` function".to_string()));
+                        } else if last == "global_asm" || last == "naked_asm" {
+                            let e = relax_session::options::asm_blocked(&self.file_crate_name(file));
+                            self.errors.push(self.record_error(file, it.lo, "lower", e));
                         } else if last == "compile_error" && m.toks.hi > m.toks.lo {
                             let lit = f.tok_text(m.toks.lo);
                             let msg = crate::lit::unescape_str(lit);
@@ -5322,6 +5397,20 @@ impl ParseSnapshot {
             assert_eq!(v.blocks, full.blocks);
         }
         Ok(v)
+    }
+
+    /// A file whose items are `stream` (tokens built by the caller, a proc-macro-like
+    /// expansion), with `src` as the file's own text (the tokens' file-0 spans point into it:
+    /// diagnostics name it).
+    pub fn parse_tokens(&self, src: Vec<u8>, stream: crate::pm_tokens::TokenStream) -> Result<FileVersion, String> {
+        let Self { old, path, edition, kname, mod_path, cfg, macros, .. } = self;
+        let bctx = std::rc::Rc::new(crate::builtins::FileCtx::new(kname, path, mod_path, cfg));
+        let context = self.context.edited(path, src.into());
+        let (mut pf, used) = crate::parser::parse_token_stream(stream, path, *edition, Some(crate::macros::MacroScope::new(macros.clone())), bctx, context.sources().clone(), false)
+            .map_err(|(span, m)| format!("{}:{}: {}", path, span.lo, m))?;
+        let prep = prepare_file(&mut pf, cfg);
+        let local = used.map(|u| u.local).unwrap_or_default();
+        Ok(FileVersion { old: *old, path: path.clone(), pf, blocks: prep.blocks, idents: prep.idents, macros: local, reuse: Default::default(), context })
     }
 
     pub fn parse_full(&self, src: Vec<u8>) -> Result<FileVersion, String> {

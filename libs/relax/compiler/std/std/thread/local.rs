@@ -58,13 +58,11 @@ unsafe fn drop_slot<T>(p: *mut u8) {
 }
 
 extern "C" fn key_dtor(p: *mut c_void) {
-    if p as usize == DESTROYED {
-        return; // second destructor round: leave the key empty
-    }
     unsafe {
-        // The runtime cleared the key before calling us: mark it destroyed while the value
-        // drops (access from other destructors then fails with AccessError); the runtime
-        // calls us once more with DESTROYED and then leaves the key empty.
+        // std's `destroy` (sys/thread_local/native/lazy.rs): the key is marked destroyed for good
+        // before the value drops, so access from this and every later destructor fails with
+        // AccessError and nothing re-initialises it. The runtime calls this once per key, last
+        // registered first; a late key's (no drop glue) only after every other destructor ran.
         let header = &*(p as *const SlotHeader);
         let drop_fn = header.drop_slot;
         sys::key_set(header.key, DESTROYED as *const c_void);
@@ -76,6 +74,7 @@ extern "C" fn key_dtor(p: *mut c_void) {
 /// thread's block (word 1 points at its record, whose first three words are the domain the table
 /// belongs to, the table and its length -- domain_threads.rs ThreadData), the host call only
 /// when the thread runs another domain, has no record yet or has not set that key.
+#[cfg(not(target_family = "wasm"))]
 #[inline(always)]
 fn key_value(key: sys::Key) -> usize {
     unsafe {
@@ -85,6 +84,14 @@ fn key_value(key: sys::Key) -> usize {
             return *(*record.add(1) as *const usize).add(key as usize);
         }
     }
+    sys::key_get(key) as usize
+}
+
+/// The web targets: the runtime's per-thread record holds host words (native pointers, 8 bytes),
+/// which a wasm program cannot read in place; the host call answers.
+#[cfg(target_family = "wasm")]
+#[inline(always)]
+fn key_value(key: sys::Key) -> usize {
     sys::key_get(key) as usize
 }
 
