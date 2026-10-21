@@ -2361,7 +2361,7 @@ pub fn thread_known(f: &mut Func) -> bool {
     // loop headers (blocks with a predecessor they dominate): a path may not pass through
     // one, or P would enter its loop past the header (irreducible flow, which the dominator-
     // based passes -- CSE's join rules, LICM -- assume away)
-    let mut header: Option<Vec<bool>> = None;
+    let mut header: Option<(Vec<Vec<u32>>, Vec<Vec<u32>>)> = None;
     let mut kn: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
     let (mut uses, mut defs) = (Vec::new(), Vec::new());
     let mut changed = false;
@@ -2429,17 +2429,44 @@ pub fn thread_known(f: &mut Func) -> bool {
             let idom = idoms(f);
             let (pre, post, _) = dom_numbers(&idom);
             let dominates = |a: usize, b: usize| pre[a] != u32::MAX && pre[b] != u32::MAX && pre[a] <= pre[b] && post[b] <= post[a];
-            let mut h = vec![false; n];
+            // per header its back-edge sources; per block its predecessors
+            let mut h: Vec<Vec<u32>> = vec![Vec::new(); n];
+            let mut pr: Vec<Vec<u32>> = vec![Vec::new(); n];
             for (bi, b) in f.blocks.iter().enumerate() {
                 for t in b.term.succs() {
+                    pr[t as usize].push(bi as u32);
                     if dominates(t as usize, bi) {
-                        h[t as usize] = true;
+                        h[t as usize].push(bi as u32);
                     }
                 }
             }
-            h
+            (h, pr)
         });
-        if path.iter().any(|&x| hd[x]) {
+        let (hd, pr) = (&hd.0, &hd.1);
+        // a path through a loop header is fine when it leaves that loop (the target is outside the
+        // header's natural loop: a latch whose flag says "done" exits straight away, as rotation
+        // leaves it); anything else would enter the loop past its header
+        let mut through_header = false;
+        for &x in &path {
+            if hd[x].is_empty() {
+                continue;
+            }
+            let mut inl = vec![false; n];
+            inl[x] = true;
+            let mut work: Vec<u32> = hd[x].clone();
+            while let Some(y) = work.pop() {
+                if inl[y as usize] {
+                    continue;
+                }
+                inl[y as usize] = true;
+                work.extend(pr[y as usize].iter().copied());
+            }
+            if inl[target as usize] {
+                through_header = true;
+                break;
+            }
+        }
+        if through_header {
             continue;
         }
         {
