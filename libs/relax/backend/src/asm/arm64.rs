@@ -790,14 +790,8 @@ fn mov_imm(ctx: &mut Ctx, rd: Reg, k: i64) -> Res<()> {
     let bits = rd.bits();
     let sf = rd.sf();
     let mask = if bits == 32 { 0xffff_ffffu64 } else { !0u64 };
-    let v: u64 = if bits == 32 {
-        if k < i32::MIN as i64 || k > u32::MAX as i64 {
-            return msg("immediate out of range for a 32-bit register");
-        }
-        k as u32 as u64
-    } else {
-        k as u64
-    };
+    // LLVM truncates the immediate of a w register to 32 bits
+    let v: u64 = if bits == 32 { k as u32 as u64 } else { k as u64 };
     let wide = |val: u64| -> Option<(u32, u32)> {
         if val == 0 {
             return Some((0, 0));
@@ -805,6 +799,9 @@ fn mov_imm(ctx: &mut Ctx, rd: Reg, k: i64) -> Res<()> {
         (0..bits / 16).find(|hw| val & !(0xffffu64 << (16 * hw)) == 0).map(|hw| (hw, (val >> (16 * hw)) as u32))
     };
     if rd.sp {
+        if bits == 32 && !(i32::MIN as i64..=u32::MAX as i64).contains(&k) {
+            return msg("immediate out of range for a 32-bit register");
+        }
         let e = enc_bitmask(v, bits).ok_or("immediate cannot be encoded as a logical immediate")?;
         w(ctx, 0x3200_0000 | sf << 31 | e << 10 | 31 << 5 | 31);
         return Ok(());
@@ -813,7 +810,7 @@ fn mov_imm(ctx: &mut Ctx, rd: Reg, k: i64) -> Res<()> {
         w(ctx, 0x5280_0000 | sf << 31 | hw << 21 | i << 5 | rd.n());
     } else if let Some((hw, i)) = wide(!v & mask) {
         w(ctx, 0x1280_0000 | sf << 31 | hw << 21 | i << 5 | rd.n());
-    } else if let Some(e) = enc_bitmask(v, bits) {
+    } else if let (Some(e), false, true) = (enc_bitmask(v, bits), rd.n == 31, bits == 64 || (i32::MIN as i64..=u32::MAX as i64).contains(&k)) {
         w(ctx, 0x3200_0000 | sf << 31 | e << 10 | 31 << 5 | rd.n());
     } else {
         return msg("immediate cannot be moved by a single instruction");
@@ -1421,7 +1418,7 @@ fn ldstp(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<()> {
     let Some(Op::Mem(m)) = o.get(2) else { return bad() };
     let post = o.get(3);
     let k = mem_const(m)?;
-    if (m.pre && matches!(m.off, Off::None)) || (load == 1 && rt.n == rt2.n && !nt) {
+    if (m.pre && matches!(m.off, Off::None)) || (load == 1 && rt.n == rt2.n && !nt && (rt.is_fp() || (!m.pre && (post.is_none() || mn == "ldpsw")))) || ((m.pre || post.is_some()) && !rt.is_fp() && m.base.n != 31 && (m.base.n == rt.n || m.base.n == rt2.n)) {
         return bad();
     }
     let idx = if nt {
