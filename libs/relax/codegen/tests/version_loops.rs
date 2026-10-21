@@ -42,6 +42,10 @@ fn eval(f: &Func, args: &[u64], mem0: &[u8]) -> Out {
                 Inst::Iconst(d, k) => r[d.0 as usize] = k as u64,
                 Inst::Mov(d, s) => r[d.0 as usize] = r[s.0 as usize],
                 Inst::Sel(d, c, a, b2) => r[d.0 as usize] = if r[c.0 as usize] != 0 { r[a.0 as usize] } else { r[b2.0 as usize] },
+                Inst::Conv(Conv::IntToInt(t), d, s) => {
+                    let v = r[s.0 as usize];
+                    r[d.0 as usize] = if t.bits >= 64 { v } else if t.signed { (((v << (64 - t.bits)) as i64) >> (64 - t.bits)) as u64 } else { v & ((1u64 << t.bits) - 1) };
+                }
                 Inst::IBin(op, _, d, a, c) => r[d.0 as usize] = bin(op, r[a.0 as usize], r[c.0 as usize]),
                 Inst::IBinI(op, _, d, a, k) => r[d.0 as usize] = bin(op, r[a.0 as usize], k as u64),
                 Inst::ICmp(cc, s, d, a, c) => r[d.0 as usize] = cmp(cc, s, r[a.0 as usize], r[c.0 as usize]) as u64,
@@ -455,4 +459,50 @@ fn u32_map_with_shift_vectorises() {
     let ch = relax_codegen::loops::vectorize_reductions(&relax_session::Options::default(), &mut f);
     assert!(ch && f.blocks.len() > n0, "vectorised");
     assert!(f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::VX(VX::ShrUI(_, 1), ..)))));
+}
+
+/// `base = if a.cmp(&b) == Greater { base } else { mid }` (binary_search's step): the Ordering is a
+/// diamond (`-1` on one arm, `a == b ? 0 : 1` on the other) narrowed to i8 and compared with 1.
+/// simplify must leave no branch (the arms are speculated, the compare distributed over the
+/// Ordering's assignments) and compute the same results.
+#[test]
+fn ordering_diamond_becomes_selects() {
+    let mut f = Func::new("ord".into(), 0);
+    let p: Vec<VReg> = (0..4).map(|_| f.vreg(Cls::I)).collect();
+    f.params.extend(p.iter().copied());
+    let (a, b, base, mid) = (p[0], p[1], p[2], p[3]);
+    for _ in 0..4 {
+        f.block();
+    }
+    let (c, o, e, z, one, t, o8, g, r) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+    push(&mut f, 0, Inst::Iconst(z, 0));
+    push(&mut f, 0, Inst::Iconst(one, 1));
+    push(&mut f, 0, Inst::ICmp(Cond::Lt, false, c, a, b));
+    term(&mut f, 0, Term::Branch(c, 1, 2));
+    push(&mut f, 1, Inst::Iconst(o, -1));
+    term(&mut f, 1, Term::Jump(3));
+    push(&mut f, 2, Inst::ICmp(Cond::Eq, false, e, a, b));
+    push(&mut f, 2, Inst::Sel(t, e, z, one));
+    push(&mut f, 2, Inst::Mov(o, t));
+    term(&mut f, 2, Term::Jump(3));
+    push(&mut f, 3, Inst::Conv(Conv::IntToInt(IntTy { bits: 8, signed: true }), o8, o));
+    push(&mut f, 3, Inst::ICmpI(Cond::Eq, true, g, o8, 1));
+    push(&mut f, 3, Inst::Sel(r, g, base, mid));
+    f.rets.push(Cls::I);
+    term(&mut f, 3, Term::Ret(vec![r]));
+    let orig = f.clone();
+    relax_backend::passes::simplify(&relax_session::Options::default(), &mut f, None, true, true);
+    relax_backend::passes::simplify(&relax_session::Options::default(), &mut f, None, true, true);
+    let reach = reachable(&f);
+    let branches = f.blocks.iter().enumerate().filter(|(bi, bl)| reach[*bi] && matches!(bl.term, Term::Branch(..))).count();
+    for x in [0u64, 1, 5, 9, u64::MAX] {
+        for y in [0u64, 1, 5, 9, u64::MAX] {
+            let args = [x, y, 100, 200];
+            assert_eq!(eval(&orig, &args, &[]), eval(&f, &args, &[]), "a {x} b {y}");
+        }
+    }
+    // one compare (`a <= b`) and one select remain
+    let live: usize = f.blocks.iter().enumerate().filter(|(bi, _)| reach[*bi]).map(|(_, b)| b.insts.len()).sum();
+    assert!(live <= 2, "left: {:?}", f.blocks.iter().map(|b| &b.insts).collect::<Vec<_>>());
+    assert_eq!(branches, 0, "branch left:\n{:?}", f.blocks.iter().map(|b| (&b.insts, &b.term)).collect::<Vec<_>>());
 }
