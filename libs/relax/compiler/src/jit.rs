@@ -9751,6 +9751,12 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
         relax_backend::passes::renumber_rpo(func);
         relax_backend::stats::pass_time(5, ti);
     }
+    // loads in loops from a parameter the body only reads (noalias readonly): once at the
+    // entry, before the body is captured for inlining into callers (the fact dies with the
+    // parameter there)
+    if cfg.licm {
+        relax_codegen::version::hoist_readonly_param_loads(options, func);
+    }
     if let Some(raw) = inlined_only {
         *raw = (func.clone(), inlined.clone());
     }

@@ -810,3 +810,108 @@ fn prev_iv_find(f: &Func) -> Option<(VReg, VReg, Vec<(u32, usize, i64)>)> {
     }
     None
 }
+
+/// Loads from a `noalias` parameter that the function only ever reads (every use of the pointer
+/// and its copies is a load at an offset inside its dereferenceable size): the memory cannot
+/// change during the call (rustc: `noalias readonly` for `&T` of a Freeze T; `noalias` with no
+/// write through the pointer for `&mut T`), so a load of it inside a loop is done once at the
+/// function's entry. Run on a body before it is inlined: the facts die with the parameter,
+/// the hoisted load stays in front of the inlined loop (partition's `is_less(&*right, pivot)`:
+/// one pivot load per call, not per element). Returns whether anything changed.
+pub fn hoist_readonly_param_loads(options: &relax_session::Options, f: &mut Func) -> bool {
+    if f.noalias.is_empty() || f.blocks.is_empty() || relax_backend::stats::opt_off(options, "-roparam") {
+        return false;
+    }
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+        }
+    }
+    let reach = reachable(f);
+    let depth = relax_backend::regalloc::loop_depths(f, &reach);
+    let mut changed = false;
+    let mut entry: Vec<Inst> = Vec::new();
+    for &p in &f.noalias.clone() {
+        if !f.params.contains(&p) || ndef[p.0 as usize] != 1 {
+            continue;
+        }
+        let Some(&(_, size)) = f.deref.iter().find(|(v, _)| *v == p) else { continue };
+        // p and its single-def copies
+        let mut set = vec![false; nv];
+        set[p.0 as usize] = true;
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if let Inst::Mov(d, s) = *i {
+                        if set[s.0 as usize] && !set[d.0 as usize] && ndef[d.0 as usize] == 1 {
+                            set[d.0 as usize] = true;
+                            grew = true;
+                        }
+                    }
+                }
+            }
+        }
+        // every use: a copy into the set or an in-bounds load
+        let mut ok = true;
+        let mut tu = Vec::new();
+        for b in &f.blocks {
+            for i in &b.insts {
+                let mut uses_set = false;
+                for_uses(i, |u| uses_set |= set[u.0 as usize]);
+                if !uses_set {
+                    continue;
+                }
+                match *i {
+                    Inst::Mov(d, _) if set[d.0 as usize] => {}
+                    Inst::Load(m, _, base, off) if set[base.0 as usize] && off >= 0 && off as i64 + relax_backend::passes::mem_size(m) as i64 <= size as i64 => {}
+                    _ => ok = false,
+                }
+            }
+            term_uses(&b.term, &mut tu);
+            if tu.iter().any(|u| set[u.0 as usize]) {
+                ok = false;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        // loads in loops: one load per (kind, offset) at the entry
+        let mut hoisted: Vec<(Mem, i32, VReg)> = Vec::new();
+        for bi in 0..f.blocks.len() {
+            if !reach[bi] || depth[bi] == 0 {
+                continue;
+            }
+            for k in 0..f.blocks[bi].insts.len() {
+                let Inst::Load(m, d, base, off) = f.blocks[bi].insts[k] else { continue };
+                if !set[base.0 as usize] {
+                    continue;
+                }
+                let t = match hoisted.iter().find(|h| h.0 == m && h.1 == off) {
+                    Some(h) => h.2,
+                    None => {
+                        let t = f.vreg(f.vregs[d.0 as usize]);
+                        hoisted.push((m, off, t));
+                        entry.push(Inst::Load(m, t, p, off));
+                        t
+                    }
+                };
+                f.blocks[bi].insts[k] = Inst::Mov(d, t);
+                changed = true;
+            }
+        }
+    }
+    if !entry.is_empty() {
+        let pos = f.blocks[0].pos.first().copied().unwrap_or(f.blocks[0].term_pos);
+        let n = entry.len();
+        f.blocks[0].insts.splice(0..0, entry);
+        f.blocks[0].pos.splice(0..0, std::iter::repeat(pos).take(n));
+    }
+    changed
+}

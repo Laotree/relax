@@ -714,3 +714,48 @@ fn previous_iv_copy_reads_the_stepped_pointer() {
     h.blocks[0].insts[1] = Inst::IBinI(IOp::Add, U64, r, base, 8);
     assert!(!version::prev_iv_copies(&relax_session::Options::default(), &mut h));
 }
+
+/// A loop's loads from a read-only noalias parameter (`pivot: &T`) move to the entry; a
+/// parameter also stored through, or one escaping into a call, keeps its loads.
+#[test]
+fn readonly_param_loads_hoist() {
+    let build = |store_through: bool| {
+        let mut f = Func::new("ro".into(), 0);
+        let (piv, out, n) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        f.params.extend([piv, out, n]);
+        f.noalias.extend([piv, out]);
+        f.deref.push((piv, 4));
+        for _ in 0..4 {
+            f.block();
+        }
+        let v: Vec<VReg> = (0..8).map(|_| f.vreg(Cls::I)).collect();
+        let (i, c, k, a, x) = (v[0], v[1], v[2], v[3], v[4]);
+        push(&mut f, 0, Inst::Iconst(i, 0));
+        term(&mut f, 0, Term::Jump(1));
+        push(&mut f, 1, Inst::ICmp(Cond::Lt, false, c, i, n));
+        term(&mut f, 1, Term::Branch(c, 2, 3));
+        push(&mut f, 2, Inst::Load(Mem::Int(4, false), k, piv, 0));
+        push(&mut f, 2, Inst::IBinI(IOp::Shl, U64, a, i, 2));
+        push(&mut f, 2, Inst::IBin(IOp::Add, U64, a, a, out));
+        push(&mut f, 2, Inst::IBin(IOp::Add, U64, x, k, i));
+        push(&mut f, 2, Inst::Store(Mem::Int(4, false), a, 0, x));
+        if store_through {
+            push(&mut f, 2, Inst::Store(Mem::Int(4, false), piv, 0, x));
+        }
+        push(&mut f, 2, Inst::IBinI(IOp::Add, U64, i, i, 1));
+        term(&mut f, 2, Term::Jump(1));
+        term(&mut f, 3, Term::Ret(vec![]));
+        f
+    };
+    let mut f = build(false);
+    let orig = f.clone();
+    assert!(version::hoist_readonly_param_loads(&relax_session::Options::default(), &mut f));
+    assert!(matches!(f.blocks[0].insts[0], Inst::Load(..)), "{:?}", f.blocks[0].insts);
+    assert!(!f.blocks[2].insts.iter().any(|i| matches!(i, Inst::Load(..))));
+    let mem0: Vec<u8> = (0..64u8).collect();
+    for n in [0u64, 1, 3, 7] {
+        assert_eq!(eval(&orig, &[60, 16, n], &mem0), eval(&f, &[60, 16, n], &mem0), "n {n}");
+    }
+    let mut g = build(true);
+    assert!(!version::hoist_readonly_param_loads(&relax_session::Options::default(), &mut g));
+}
