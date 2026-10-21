@@ -62,12 +62,9 @@ pub fn relayout_order(f: &mut Func) -> Vec<u32> {
             }
             let stays = |s: u32| l == NO_LOOP || nest.contains(l, s);
             b = match f.blocks[b as usize].term {
-                Term::Jump(t) | Term::Invoke(t, _) => {
-                    if !stays(t) {
-                        break;
-                    }
-                    t
-                }
+                // an unconditional successor is followed out of the loop too: breaking there
+                // costs a jump on that path (brotli's state machine: +2% instructions)
+                Term::Jump(t) | Term::Invoke(t, _) => t,
                 Term::Branch(_, t, e) => {
                     // fall through to the true successor (then-block, loop body) unless it is
                     // placed already, a panic path or out of the loop
