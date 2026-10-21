@@ -389,12 +389,18 @@ impl InlineStats {
     }
 }
 
-/// O3's caller growth ceiling: max(4x, +8000) instructions. Bottom-up inlining (callees bring
-/// their own inlining, priced by their optimised bodies) made the room usable: max(2x, +4000)
-/// refused html_parse's and maps' hot sites for budget (html 0.66, maps 0.97, text_shape 0.985,
-/// geomean 0.969 vs 2x); top-down, the same room had cost text_shape 5% and Stage 4.6% (INL3).
-pub fn growth_ceiling(size: usize) -> usize {
-    size.saturating_mul(4).max(size.saturating_add(8000))
+/// O3's caller growth ceiling, scaled by the caller's measured hotness (HotSpot C2's frequent
+/// vs small limits, .NET's profile-boosted size tolerance): a caller the sampler found hot
+/// (its block frequencies are sampled) gets max(4x, +8000) instructions -- bottom-up inlining
+/// made that room usable, max(2x, +4000) refused html_parse's and maps' hot sites for budget
+/// (html 0.66, maps 0.97) --; every other caller max(2x, +4000): Stage's lukewarm UI functions
+/// grew 3x in code with the big room and its O3 compile CPU went up 4x.
+pub fn growth_ceiling(size: usize, hot: bool) -> usize {
+    if hot {
+        size.saturating_mul(4).max(size.saturating_add(8000))
+    } else {
+        size.saturating_mul(2).max(size.saturating_add(4000))
+    }
 }
 
 /// In-context pricing (LLVM InlineCost's simplified values): the body a site whose arguments
@@ -521,10 +527,10 @@ pub fn specialize_for_args(callee: &Func, consts: &[Option<i64>]) -> Option<Func
 }
 
 impl InlineLimits {
-    pub fn tier1_for(f: &Func) -> Self {
+    pub fn tier1_for(f: &Func, hot: bool) -> Self {
         let mut lim = Self::tier1();
         let size = inline_inst_count(f);
-        lim.growth_limit = Some(growth_ceiling(size));
+        lim.growth_limit = Some(growth_ceiling(size, hot));
         lim
     }
 }
@@ -583,7 +589,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
     let mut queue = BinaryHeap::new();
     let mut budget = lim.budget;
     let mut inst_count = inline_inst_count(f);
-    let mut growth_limit = lim.growth_limit.unwrap_or_else(|| growth_ceiling(inst_count));
+    let mut growth_limit = lim.growth_limit.unwrap_or_else(|| growth_ceiling(inst_count, false));
     // the size the ceiling sees: the actual size, but a priced callee counts its priced size
     let mut priced = inst_count;
     // Keep the separate raw-size free allowance.
@@ -5231,7 +5237,7 @@ mod inline_priority_tests {
         let mut f = callee(0);
         f.blocks[0].insts = vec![Inst::Call(Callee::Fn(1), vec![], vec![]); 200];
         f.blocks[0].pos = vec![0; 200];
-        let mut lim = InlineLimits::tier1_for(&f);
+        let mut lim = InlineLimits::tier1_for(&f, true);
         lim.growth_limit = Some(4200);
         let mut stats = InlineStats::default();
         let inlined = inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &lim, None, Some(&mut stats));
@@ -5250,7 +5256,7 @@ mod inline_priority_tests {
         let free = callee(INLINE_FREE_INSTS);
         let get = |id: u32| Some((if id == 3 { &free } else { &paid } as *const Func, 0));
         let mut f = caller();
-        let lim = InlineLimits::tier1_for(&f);
+        let lim = InlineLimits::tier1_for(&f, true);
         assert_eq!(lim.growth_limit, Some(8002));
         // Model growth from the first round; the original ceiling must still apply.
         let v = f.vreg(Cls::I);
@@ -5268,10 +5274,10 @@ mod inline_priority_tests {
 
     #[test]
     fn budget_does_not_scale_with_caller() {
-        assert_eq!(InlineLimits::tier1_for(&callee(100)).budget, 4000);
-        assert_eq!(InlineLimits::tier1_for(&callee(16000)).budget, 4000);
-        assert_eq!(InlineLimits::tier1_for(&callee(30000)).budget, 4000);
-        assert_eq!(InlineLimits::tier1_for(&callee(16000)).growth_limit, Some(64000));
+        assert_eq!(InlineLimits::tier1_for(&callee(100), true).budget, 4000);
+        assert_eq!(InlineLimits::tier1_for(&callee(16000), true).budget, 4000);
+        assert_eq!(InlineLimits::tier1_for(&callee(30000), true).budget, 4000);
+        assert_eq!(InlineLimits::tier1_for(&callee(16000), true).growth_limit, Some(64000));
     }
 
     #[test]
