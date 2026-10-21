@@ -41,6 +41,7 @@ fn eval(f: &Func, args: &[u64], mem0: &[u8]) -> Out {
             match *i {
                 Inst::Iconst(d, k) => r[d.0 as usize] = k as u64,
                 Inst::Mov(d, s) => r[d.0 as usize] = r[s.0 as usize],
+                Inst::Sel(d, c, a, b2) => r[d.0 as usize] = if r[c.0 as usize] != 0 { r[a.0 as usize] } else { r[b2.0 as usize] },
                 Inst::IBin(op, _, d, a, c) => r[d.0 as usize] = bin(op, r[a.0 as usize], r[c.0 as usize]),
                 Inst::IBinI(op, _, d, a, k) => r[d.0 as usize] = bin(op, r[a.0 as usize], k as u64),
                 Inst::ICmp(cc, s, d, a, c) => r[d.0 as usize] = cmp(cc, s, r[a.0 as usize], r[c.0 as usize]) as u64,
@@ -84,7 +85,17 @@ fn bin(op: IOp, a: u64, b: u64) -> u64 {
 }
 
 fn cmp(c: Cond, s: bool, a: u64, b: u64) -> bool {
-    assert!(!s);
+    if s {
+        let (a, b) = (a as i64, b as i64);
+        return match c {
+            Cond::Lt => a < b,
+            Cond::Le => a <= b,
+            Cond::Gt => a > b,
+            Cond::Ge => a >= b,
+            Cond::Eq => a == b,
+            Cond::Ne => a != b,
+        };
+    }
     match c {
         Cond::Lt => a < b,
         Cond::Le => a <= b,
@@ -99,10 +110,16 @@ fn cmp(c: Cond, s: bool, a: u64, b: u64) -> bool {
 /// in the shape fold_ranges leaves (`t = i; i = i + 1` after the header's test).
 /// params: y, ylen, x, xlen, n, start
 fn axpy(k: i64, check_y: bool) -> Func {
+    axpy_sym(k, check_y, false)
+}
+
+/// as axpy; `sym`: the x index is `(t + m) - w + k` with m, w two more params (a 2D stencil's
+/// `y * w + x - w`)
+fn axpy_sym(k: i64, check_y: bool, sym: bool) -> Func {
     let mut f = Func::new("axpy".into(), 0);
-    let v: Vec<VReg> = (0..6).map(|_| f.vreg(Cls::I)).collect();
+    let v: Vec<VReg> = (0..8).map(|_| f.vreg(Cls::I)).collect();
     let (y, ylen, x, xlen, n, start) = (v[0], v[1], v[2], v[3], v[4], v[5]);
-    f.params.extend([y, ylen, x, xlen, n, start]);
+    f.params.extend([y, ylen, x, xlen, n, start, v[6], v[7]]);
     for _ in 0..8 {
         f.block();
     }
@@ -124,10 +141,18 @@ fn axpy(k: i64, check_y: bool) -> Func {
         term(&mut f, 2, Term::Jump(3));
     }
     // b3: x check of t + k
-    if k >= 0 {
-        push(&mut f, 3, Inst::IBinI(IOp::Add, U64, xi, t, k));
+    let tk = if sym {
+        let (a1, a2) = (f.vreg(Cls::I), f.vreg(Cls::I));
+        push(&mut f, 3, Inst::IBin(IOp::Add, U64, a1, v[6], t));
+        push(&mut f, 3, Inst::IBin(IOp::Sub, U64, a2, a1, v[7]));
+        a2
     } else {
-        push(&mut f, 3, Inst::IBinI(IOp::Sub, U64, xi, t, -k));
+        t
+    };
+    if k >= 0 {
+        push(&mut f, 3, Inst::IBinI(IOp::Add, U64, xi, tk, k));
+    } else {
+        push(&mut f, 3, Inst::IBinI(IOp::Sub, U64, xi, tk, -k));
     }
     push(&mut f, 3, Inst::ICmp(Cond::Lt, false, cx, xi, xlen));
     term(&mut f, 3, Term::Branch(cx, 4, 7));
@@ -155,6 +180,10 @@ fn axpy(k: i64, check_y: bool) -> Func {
 }
 
 fn run_cases(orig: &Func, new: &Func) -> usize {
+    run_cases_mw(orig, new, &[(0, 0)])
+}
+
+fn run_cases_mw(orig: &Func, new: &Func, mws: &[(u64, u64)]) -> usize {
     // memory: y at 0 (64 u32), x at 256 (64 u32)
     let mut mem = vec![0u8; 512];
     for j in 0..128u32 {
@@ -166,14 +195,16 @@ fn run_cases(orig: &Func, new: &Func) -> usize {
         for xlen in [0u64, 3, 19, 20, 21, 40, 64] {
             for n in [0u64, 1, 4, 19, 20, 21, 40, 64] {
                 for start in [0u64, 1, 2, 3, 30] {
-                    let args = [0, ylen, 256, xlen, n, start];
-                    let a = eval(orig, &args, &mem);
-                    let b = eval(new, &args, &mem);
-                    assert_eq!(a, b, "ylen {ylen} xlen {xlen} n {n} start {start}");
-                    if matches!(a, Out::Panic(..)) {
-                        panics += 1;
+                    for &(m, w) in mws {
+                        let args = [0, ylen, 256, xlen, n, start, m, w];
+                        let a = eval(orig, &args, &mem);
+                        let b = eval(new, &args, &mem);
+                        assert_eq!(a, b, "ylen {ylen} xlen {xlen} n {n} start {start} m {m} w {w}");
+                        if matches!(a, Out::Panic(..)) {
+                            panics += 1;
+                        }
+                        cases += 1;
                     }
-                    cases += 1;
                 }
             }
         }
@@ -250,6 +281,16 @@ fn outside_def_of_index_copy() {
     let clone_checks = new.blocks[8..].iter().filter(|b| matches!(b.term, Term::Branch(_, t, e) if cold(t) || cold(e))).count();
     assert_eq!(clone_checks, 0);
     run_cases(&orig, &new);
+}
+
+/// Offsets with loop-invariant vregs (2D stencil rows): positive, negative and wrapping offsets.
+#[test]
+fn symbolic_offsets() {
+    for k in [0i64, 1, -1, 3] {
+        let (orig, new) = versioned(axpy_sym(k, true, true));
+        let mws: Vec<(u64, u64)> = vec![(0, 0), (5, 0), (0, 5), (5, 5), (8, 3), (3, 8), (0, 1), (1, 0), (40, 2), (u64::MAX, 0), (0, u64::MAX), (u64::MAX - 3, 0)];
+        run_cases_mw(&orig, &new, &mws);
+    }
 }
 
 #[test]
