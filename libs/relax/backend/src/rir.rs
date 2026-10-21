@@ -1059,6 +1059,9 @@ pub struct Func {
     /// SPEC-V: the `noalias` parameters of a body built without a clean borrow-check verdict
     /// (`noalias` is empty then): they come back when its verdict is clean and the body is promoted
     pub withheld_noalias: Vec<VReg>,
+    /// SPEC-V: the body was lowered as unverified code and sends calls to unverified-mode twins:
+    /// once its verdict is clean it is lowered again (verified code calls the slots themselves)
+    pub plain_calls: bool,
     /// parameters pointing to at least this many dereferenceable bytes for the whole call
     /// (rustc `dereferenceable(N)` on `&T` / `&mut T` / by-pointer aggregates): loads from
     /// them may be executed speculatively (LICM hoists them out of loops without stores)
@@ -1088,6 +1091,11 @@ pub struct Func {
     /// layout's niche excludes 0) -- the Load that defines each is non-null; other definitions
     /// of the same vreg prove nothing (fold_nonnull checks every definition)
     pub nonnull: Vec<VReg>,
+    /// values loaded from a scalar whose type restricts its valid values (`char`, `bool`, enum
+    /// tags: the layout's niche, rustc's `!range` load metadata): (vreg, load bytes, lo, hi) --
+    /// the zero-extending Load of that width defining the vreg yields a value in lo..=hi; other
+    /// definitions of the same vreg prove nothing (value ranges check the defining instruction)
+    pub ranged: Vec<(VReg, u8, u64, u64)>,
     /// the trait-object types this body calls methods through (virtual calls, by type id): code
     /// that must run without lazy compiles (real-time threads) compiles their vtables' methods
     pub dyn_calls: Vec<u32>,
@@ -1095,7 +1103,7 @@ pub struct Func {
 
 impl Func {
     pub fn new(name: String, file: u32) -> Func {
-        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, nonnull: Vec::new(), dyn_calls: Vec::new() }
+        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, nonnull: Vec::new(), ranged: Vec::new(), dyn_calls: Vec::new() }
     }
     pub fn vreg(&mut self, c: Cls) -> VReg {
         self.vregs.push(c);
