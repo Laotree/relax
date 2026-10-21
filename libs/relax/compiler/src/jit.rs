@@ -9448,6 +9448,13 @@ impl InlineBodies {
 /// with the callees that round inlined.
 fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, prepared: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, *const relax_backend::rir::Func)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, mut inline_stats: Option<&mut relax_codegen::opt::InlineStats>, inlined_only: Option<&mut (relax_backend::rir::Func, Vec<(u32, usize)>)>) -> Vec<(u32, usize)> {
     let mut limits = relax_codegen::opt::InlineLimits::tier1_for(func);
+    // EXPERIMENT (INL4, not for landing): MAKEPAD_RUN_OPT=ceil=<mul>:<add> growth ceiling
+    if let Some(c) = options.opt.iter().find_map(|t| t.trim().strip_prefix("ceil=")) {
+        if let Some((m, a)) = c.split_once(':').and_then(|(m, a)| Some((m.parse::<usize>().ok()?, a.parse::<usize>().ok()?))) {
+            let n = relax_codegen::opt::inst_count(func);
+            limits.growth_limit = Some(n.saturating_mul(m).max(n.saturating_add(a)));
+        }
+    }
     let mut inlined: Vec<(u32, usize)> = Vec::new();
     if cfg.inline {
         let ti = relax_backend::stats::pass_clock();
