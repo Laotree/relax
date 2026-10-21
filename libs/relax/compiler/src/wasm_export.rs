@@ -145,7 +145,7 @@ fn fnv64(bytes: &[u8]) -> u64 {
 /// Blanks the unused top-level statements of the record's blocks in the data images: (blocks in
 /// the record, blocks found, bytes of the found blocks, bytes blanked, items dropped). An item
 /// with `used` false is dropped; `used` true or null stays.
-fn splash_blank(path: &str, images: &mut [(u32, Vec<u8>)]) -> (usize, usize, usize, usize, usize) {
+fn splash_blank(path: &str, images: &mut [(u32, Vec<u8>)], blank_unrecorded: bool) -> (usize, usize, usize, usize, usize) {
     let src = match std::fs::read(path) {
         Ok(s) => s,
         Err(e) => {
@@ -188,6 +188,13 @@ fn splash_blank(path: &str, images: &mut [(u32, Vec<u8>)]) -> (usize, usize, usi
             // large text the record does not name (a lazy group never registered, an include)
             if bytes.len() >= 4096 && std::str::from_utf8(bytes).is_ok() {
                 unmatched.push((bytes.len(), String::from_utf8_lossy(&bytes[..60]).replace('\n', " ")));
+                if blank_unrecorded {
+                    for c in bytes.iter_mut() {
+                        if *c != b'\n' {
+                            *c = b' ';
+                        }
+                    }
+                }
             }
             continue;
         };
@@ -382,6 +389,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     // bodies, the callers' extra constants cost more. Kept as an option for raw size / compile time.
     let mut merge = false;
     let mut splash = true;
+    let mut blank_unrecorded = false;
     let mut blocks = crate::coverage::on();
     // -tee,-remat,...: switch size techniques off (or on) to measure them
     {
@@ -406,6 +414,9 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
                 "exnref" => opts.exnref = on,
                 "merge" => merge = on,
                 "splash" => splash = on,
+                // measurement only: also blank the large texts the record does not name (an upper
+                // bound for shaking lazy groups and document-VM texts; not sound without a touch record)
+                "blankunrec" => blank_unrecorded = on,
                 "blocks" => blocks = on && crate::coverage::on(),
                 _ => eprintln!("wasm export: unknown option {}", n),
             }
@@ -584,7 +595,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     // statements no run used are blanked to spaces (newlines kept): kept statements stay verbatim,
     // length and offsets unchanged, no code patched
     if let (true, Ok(rec)) = (splash, std::env::var("MAKEPAD_RUN_WASM_EXPORT_SPLASH")) {
-        let st = splash_blank(&rec, &mut images);
+        let st = splash_blank(&rec, &mut images, blank_unrecorded);
         if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
             eprintln!("wasm export: splash: {} blocks in the record, {} found in the data; {} of {} bytes blanked ({} items dropped)", st.0, st.1, st.3, st.2, st.4);
         }
