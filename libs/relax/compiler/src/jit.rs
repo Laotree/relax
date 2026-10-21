@@ -5257,6 +5257,8 @@ pub struct MainCompile {
     pub behind_ns: u64,
     pub behind: u8,
     pub behind_from: u64,
+    /// where that served request was made (its owner::call site)
+    pub behind_site: Option<&'static std::panic::Location<'static>>,
     /// compile jobs running at its start, and the queued speculative, O2 and O3 builds (after the
     /// first present only: postframe.rs)
     pub jobs: u32,
@@ -5298,12 +5300,13 @@ fn main_rec(f: impl FnOnce(&mut MainCompile)) {
 
 /// A request of the main thread's compile waited `queue` ns in the owner's queue, queued while the
 /// owner served class `class` (u8::MAX: idle) for thread `from` (owner.rs, on the requester).
-pub(crate) fn main_rec_behind(queue: u64, class: u8, from: u64) {
+pub(crate) fn main_rec_behind(queue: u64, class: u8, from: u64, site: Option<&'static std::panic::Location<'static>>) {
     main_rec(|r| {
         if queue > r.behind_ns {
             r.behind_ns = queue;
             r.behind = if class == u8::MAX { 0 } else { class + 1 };
             r.behind_from = from;
+            r.behind_site = site;
         }
     });
 }
@@ -10807,6 +10810,11 @@ pub fn lower_this_thread_priority(runtime: &crate::options::RuntimeOptions) {
 }
 
 fn lower_worker_priority(runtime: &crate::options::RuntimeOptions) {
+    // aot-min: every background compile thread in the OS background class
+    if ahead_policy().background_class {
+        os::thread::background();
+        return;
+    }
     let mode = runtime.worker_qos as u8;
     if mode == 0 {
         return;
@@ -12283,7 +12291,8 @@ pub fn set_ahead_level(l: crate::options::AheadLevel) {
 pub fn ahead_level() -> crate::options::AheadLevel {
     match AHEAD_LEVEL.load(Ordering::Relaxed) {
         0 => crate::options::AheadLevel::Minimal,
-        2 => crate::options::AheadLevel::Aot,
+        2 => crate::options::AheadLevel::AotMax,
+        3 => crate::options::AheadLevel::AotMin,
         _ => crate::options::AheadLevel::Balanced,
     }
 }
@@ -12316,6 +12325,11 @@ pub(crate) struct AheadPolicy {
     o3_revalidate: bool,
     /// O3 workers at most
     o3_threads: usize,
+    /// an AOT level: builds made during a UI burst have their callees speculated after it
+    /// (aot_drain), speculation does not follow only the fall-through path on battery
+    aot: bool,
+    /// every background compile thread runs in the OS's background class (os::thread::background)
+    background_class: bool,
 }
 
 pub(crate) fn ahead_policy() -> &'static AheadPolicy {
@@ -12323,19 +12337,28 @@ pub(crate) fn ahead_policy() -> &'static AheadPolicy {
     const MINIMAL: AheadPolicy = AheadPolicy {
         spec_calls: false, spec_cached: false, spec_depth: Some(0), spec_hot_from: Some(0), spec_dyn: false, spec_jobs: 1, spec_expire: true,
         post_present_helpers: 0, teardown: false, borrowck_discovery: false, last_run: false, o3_revalidate: true, o3_threads: 2,
+        aot: false, background_class: false,
     };
     const BALANCED: AheadPolicy = AheadPolicy {
         spec_calls: true, spec_cached: true, spec_depth: None, spec_hot_from: None, spec_dyn: true, spec_jobs: 2, spec_expire: true,
         post_present_helpers: u32::MAX, teardown: false, borrowck_discovery: false, last_run: false, o3_revalidate: true, o3_threads: 2,
+        aot: false, background_class: false,
     };
-    const AOT: AheadPolicy = AheadPolicy {
+    const AOT_MAX: AheadPolicy = AheadPolicy {
         spec_calls: true, spec_cached: true, spec_depth: Some(AOT_DEPTH), spec_hot_from: Some(AOT_DEPTH), spec_dyn: true, spec_jobs: usize::MAX, spec_expire: false,
         post_present_helpers: u32::MAX, teardown: true, borrowck_discovery: true, last_run: true, o3_revalidate: false, o3_threads: 3,
+        aot: true, background_class: false,
+    };
+    const AOT_MIN: AheadPolicy = AheadPolicy {
+        spec_calls: true, spec_cached: true, spec_depth: Some(AOT_DEPTH), spec_hot_from: Some(AOT_DEPTH), spec_dyn: true, spec_jobs: 2, spec_expire: false,
+        post_present_helpers: u32::MAX, teardown: true, borrowck_discovery: true, last_run: true, o3_revalidate: false, o3_threads: 2,
+        aot: true, background_class: true,
     };
     match ahead_level() {
         AheadLevel::Minimal => &MINIMAL,
         AheadLevel::Balanced => &BALANCED,
-        AheadLevel::Aot => &AOT,
+        AheadLevel::AotMax => &AOT_MAX,
+        AheadLevel::AotMin => &AOT_MIN,
     }
 }
 
@@ -12361,7 +12384,7 @@ fn spec_yield(options: &crate::options::Options) -> bool {
 /// Default: fall-through only while the machine runs on battery (less work built ahead that
 /// is never called), every warm call on mains power. MAKEPAD_RUN_SPEC_HOT=1/0 overrides.
 pub fn spec_hot_only(options: &crate::options::Options) -> bool {
-    options.spec_hot.unwrap_or_else(|| ahead_level() != crate::options::AheadLevel::Aot && on_battery())
+    options.spec_hot.unwrap_or_else(|| !ahead_policy().aot && on_battery())
 }
 
 /// Is the machine running on battery power (read once, at the first speculation)?
@@ -12509,7 +12532,7 @@ static AOT_DEFERRED: relax_session::sync::Mutex<Vec<(usize, u32, u8)>> = relax_s
 /// aot: once the UI's burst is over, the callees of the slots built during it are speculated (any
 /// thread; the monitor's tick).
 pub fn aot_drain() {
-    if ahead_level() != crate::options::AheadLevel::Aot || ui_burst() || startup_phase() {
+    if !ahead_policy().aot || ui_burst() || startup_phase() {
         return;
     }
     let roots = std::mem::take(&mut *AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()));
@@ -12538,7 +12561,7 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, id: u32, func: &relax_backend::rir::
     // a burst called few: 119 of 14.9k compiles in a cold Stage's first 10 s after present);
     // aot speculates them after the burst (aot_drain)
     if ui_burst() {
-        if ahead_level() == crate::options::AheadLevel::Aot {
+        if ahead_policy().aot {
             SPEC_UNIT.store(up, Ordering::Release);
             crate::zone_alloc::kept_with(|| AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id, depth)));
         }
@@ -12723,6 +12746,46 @@ pub unsafe fn spec_seed(up: *mut Unit, ids: &[u32]) {
 
 /// Teardown preparation: (slots built ahead, thread cpu ns)
 pub static TEARDOWN_STATS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// The teardown-ahead thread runs (prepare_teardown)
+static TEARDOWN_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// The aot levels' ahead set is built: no speculation, O3, teardown or Gandalf work queued or
+/// running, and nothing new compiled or checked for AHEAD_QUIET_NS.
+static AHEAD_COMPLETE: AtomicBool = AtomicBool::new(false);
+const AHEAD_QUIET_NS: u64 = 2_000_000_000;
+/// (activity counter at the last change, wall ns of that change)
+static AHEAD_SEEN: relax_session::sync::Mutex<(u64, u64)> = relax_session::sync::Mutex::new((u64::MAX, 0));
+
+/// aot-max / aot-min: once the ahead set is fully built, one line says so ("ahead complete: N
+/// fns, T s"); its products are in the warm cache by then (the monitor's mid-run cache writes,
+/// spill_cache), so a quit halfway keeps what was built. The monitor's tick calls this.
+pub fn ahead_complete_tick() {
+    if !ahead_policy().aot || AHEAD_COMPLETE.load(Ordering::Relaxed) || !FIRST_PRESENT.load(Ordering::Acquire) || startup_phase() {
+        return;
+    }
+    let fns = COMPILED_FNS.load(Ordering::Relaxed) + TIER1_INSTALLS.load(Ordering::Relaxed);
+    let activity = fns + crate::borrowck::lazy::checked();
+    let now = wall_ns();
+    let mut seen = AHEAD_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.0 != activity {
+        *seen = (activity, now);
+        return;
+    }
+    let queued = !SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        || !TIER_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        || !TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        || !AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        || TEARDOWN_RUNNING.load(Ordering::SeqCst)
+        || crate::borrowck::lazy::queued() > 0
+        || BG_ACTIVE.load(Ordering::SeqCst) > 0;
+    if queued || now.saturating_sub(seen.1) < AHEAD_QUIET_NS {
+        return;
+    }
+    AHEAD_COMPLETE.store(true, Ordering::Relaxed);
+    let t = crate::clock::ms_since_start() as f64 / 1e3 - AHEAD_QUIET_NS as f64 / 1e9;
+    eprintln!("makepad-run: ahead complete ({}): {} fns, {:.1} s", ahead_level().name(), fns, t);
+}
+
 /// Calls below a drop glue followed when preparing teardown (Drop impls and what they call:
 /// `<Vec as Drop>::drop` -> its element loop, a platform's `Drop` -> its destroy fns).
 const TEARDOWN_DEPTH: u8 = 3;
@@ -12745,7 +12808,11 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
     let p = P(up);
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     { let _k = crate::zone_alloc::kept();
+    TEARDOWN_RUNNING.store(true, Ordering::SeqCst);
     let _ = std::thread::Builder::new().name("run-teardown".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+        struct Done;
+        impl Drop for Done { fn drop(&mut self) { TEARDOWN_RUNNING.store(false, Ordering::SeqCst); } }
+        let _done = Done;
         let p = p;
         let up = p.0;
         ensure_altstack();

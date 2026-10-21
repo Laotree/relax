@@ -436,6 +436,16 @@ fn enqueue(options: &crate::options::Options, src: &Arc<dyn FrontSource>, def: D
     }
     WAKE.notify_one();
 }
+/// Checks queued (0 also before the worker started); the aot levels' completion line reads it.
+pub fn queued() -> usize {
+    QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |q| q.order.len())
+}
+
+/// Bodies checked so far this run.
+pub fn checked() -> u64 {
+    CHECKED.load(Ordering::Relaxed)
+}
+
 pub fn note_program(options: &crate::options::Options, src: &Arc<dyn FrontSource>, epoch: u64) {
     enqueue(options, src, crate::program::NO_DEF, None, None, epoch, None, None);
 }
