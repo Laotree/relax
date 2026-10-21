@@ -6737,7 +6737,61 @@ pub fn unify_slot_addrs(f: &mut Func) {
 /// Copies of 1, 2, 4, 8 or 16 bytes become integer loads then stores, so address modes can fold
 /// their addresses (a stable-partition step `copy(sel + count * 8, src, 8)` keeps `count << 3` and
 /// the add as temporaries otherwise; as [base + index * 8] it is one store).
+/// A small copy whose source was just loaded whole (same block, or the end of its one
+/// predecessor, no write or call between): a store of that value. `retain`'s
+/// `if keep(&v[i]) { v[j] = v[i] }` reads the element once.
+fn copies_from_loaded(f: &mut Func) {
+    let n = f.blocks.len();
+    let mut npred = vec![0u32; n];
+    let mut pred = vec![u32::MAX; n];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for t in b.term.succs() {
+            npred[t as usize] += 1;
+            pred[t as usize] = bi as u32;
+        }
+    }
+    for bi in 0..n {
+        for k in 0..f.blocks[bi].insts.len() {
+            let Inst::Copy(d, src, sz @ (1 | 2 | 4 | 8)) = f.blocks[bi].insts[k] else { continue };
+            let mut seen: Vec<VReg> = Vec::new();
+            let mut found = None;
+            let (mut b, mut end) = (bi, k);
+            'scan: for hop in 0..2 {
+                for j in (0..end).rev() {
+                    let i = &f.blocks[b].insts[j];
+                    if let Inst::Load(Mem::Int(w, _), v, base, 0) = *i {
+                        if base == src && w as u32 == sz && !seen.contains(&v) {
+                            found = Some(v);
+                            break 'scan;
+                        }
+                    }
+                    if matches!(i, Inst::Store(..) | Inst::StoreX(..) | Inst::VStore(..) | Inst::VStoreX(..) | Inst::Copy(..) | Inst::Call(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..)) {
+                        break 'scan;
+                    }
+                    let mut hit_src = false;
+                    for_defs(i, |x| {
+                        hit_src |= x == src;
+                        seen.push(x);
+                    });
+                    if hit_src {
+                        break 'scan;
+                    }
+                }
+                if hop == 1 || npred[b] != 1 || pred[b] == u32::MAX || pred[b] as usize == b || matches!(f.blocks[pred[b] as usize].term, Term::Invoke(..)) {
+                    break;
+                }
+                b = pred[b] as usize;
+                end = f.blocks[b].insts.len();
+            }
+            if let Some(v) = found {
+                f.blocks[bi].insts[k] = Inst::Store(Mem::Int(sz as u8, false), d, 0, v);
+            }
+        }
+    }
+}
+
 pub fn expand_small_copies(f: &mut Func) {
+    copies_from_loaded(f);
     for bi in 0..f.blocks.len() {
         if !f.blocks[bi].insts.iter().any(|i| matches!(i, Inst::Copy(_, _, 1 | 2 | 4 | 8 | 16))) {
             continue;
