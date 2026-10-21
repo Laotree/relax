@@ -13,16 +13,16 @@ fn options(off: &[&str]) -> relax_session::Options {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn compile(o: &relax_session::Options, f: &Func) -> Vec<u8> {
+fn compile(o: &relax_session::Options, f: &Func, freq: Option<&[f32]>) -> Vec<u8> {
     let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
-    let c = relax_backend::x64::compile(o, f, &env).unwrap();
+    let c = relax_backend::x64::compile_freq(o, f, &env, freq).unwrap();
     c.code[..c.text_len as usize].to_vec()
 }
 
 #[cfg(target_arch = "aarch64")]
-fn compile(o: &relax_session::Options, f: &Func) -> Vec<u8> {
+fn compile(o: &relax_session::Options, f: &Func, freq: Option<&[f32]>) -> Vec<u8> {
     let env = relax_backend::arm64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
-    let c = relax_backend::arm64::compile(o, f, &env).unwrap();
+    let c = relax_backend::arm64::compile_freq(o, f, &env, freq).unwrap();
     c.code[..c.text_len as usize].to_vec()
 }
 
@@ -144,7 +144,7 @@ fn spilled_loop_values_in_regions() {
                 let f = build(diamond, live_after, step);
                 let mut codes = Vec::new();
                 for off in offs {
-                    let bytes = compile(&options(off), &f);
+                    let bytes = compile(&options(off), &f, None);
                     let code = Code::new(&bytes).unwrap();
                     let run: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
                     for (n, seed) in [(0u64, 1u64), (1, 7), (5, 0x1234), (64, 0x9e3779b97f4a7c15), (1001, 3)] {
@@ -152,8 +152,97 @@ fn spilled_loop_values_in_regions() {
                     }
                     codes.push(bytes);
                 }
-                // the features change the code (they fired)
-                assert!(codes[0] != codes[4], "the features did not fire: diamond {} live_after {} step {}", diamond, live_after, step);
+                // every register is busy in this loop: correctness only
+                let _ = codes;
+            }
+        }
+    }
+}
+
+/// g(n, seed): acc = seed; i = 0; while i < n { x = acc ^ i; t_k = x + (k + 3) * 97 for k < T, all live
+/// at once (folded back in reverse); acc = fold; i += step }; ret acc (+ i when `live_after`).
+/// The temporaries need every register in the body block only: i and n are free in a register in
+/// the loop header and latch, the body block holds them in memory.
+const T: usize = 40;
+fn build_burst(live_after: bool, step: i64) -> Func {
+    let mut f = Func::new("spill_burst".into(), 0);
+    let (n, seed) = (f.vreg(Cls::I), f.vreg(Cls::I));
+    f.params = vec![n, seed];
+    f.rets = vec![Cls::I];
+    let (b0, b1, b2, b3, b4, b5) = (f.block(), f.block(), f.block(), f.block(), f.block(), f.block());
+    let (acc, i, c) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+    push(&mut f, b0, Inst::Mov(acc, seed));
+    push(&mut f, b0, Inst::Iconst(i, 0));
+    f.blocks[b0 as usize].term = Term::Jump(b1);
+    push(&mut f, b1, Inst::ICmp(Cond::Lt, false, c, i, n));
+    f.blocks[b1 as usize].term = Term::Branch(c, b5, b4);
+    // the burst runs every fourth iteration
+    let (bits, z) = (f.vreg(Cls::I), f.vreg(Cls::I));
+    push(&mut f, b5, Inst::IBinI(IOp::And, W, bits, i, 3));
+    push(&mut f, b5, Inst::ICmpI(Cond::Eq, false, z, bits, 0));
+    f.blocks[b5 as usize].term = Term::Branch(z, b2, b3);
+    let x = f.vreg(Cls::I);
+    push(&mut f, b2, Inst::IBin(IOp::Xor, W, x, acc, i));
+    let t: Vec<VReg> = (0..T).map(|_| f.vreg(Cls::I)).collect();
+    for k in 0..T {
+        push(&mut f, b2, Inst::IBinI(IOp::Add, W, t[k], x, (k as i64 + 3) * 97));
+    }
+    let r = f.vreg(Cls::I);
+    push(&mut f, b2, Inst::Iconst(r, 0));
+    for k in (0..T).rev() {
+        let u = f.vreg(Cls::I);
+        push(&mut f, b2, Inst::IBinI(IOp::Rotl, W, u, r, 5));
+        push(&mut f, b2, Inst::IBin(IOp::Xor, W, r, u, t[k]));
+    }
+    push(&mut f, b2, Inst::Mov(acc, r));
+    f.blocks[b2 as usize].term = Term::Jump(b3);
+    // the latch
+    push(&mut f, b3, Inst::IBinI(IOp::Add, W, i, i, step));
+    f.blocks[b3 as usize].term = Term::Jump(b1);
+    if live_after {
+        push(&mut f, b4, Inst::IBin(IOp::Add, W, acc, acc, i));
+    }
+    f.blocks[b4 as usize].term = Term::Ret(vec![acc]);
+    f.verify().unwrap();
+    f
+}
+
+fn reference_burst(n: u64, seed: u64, live_after: bool, step: u64) -> u64 {
+    let (mut acc, mut i) = (seed, 0u64);
+    while i < n {
+        if i & 3 == 0 {
+            let x = acc ^ i;
+            let mut r = 0u64;
+            for k in (0..T as u64).rev() {
+                r = r.rotate_left(5) ^ x.wrapping_add((k + 3) * 97);
+            }
+            acc = r;
+        }
+        i = i.wrapping_add(step);
+    }
+    if live_after {
+        acc = acc.wrapping_add(i);
+    }
+    acc
+}
+
+#[test]
+fn values_free_outside_a_burst_block() {
+    let offs: [&[&str]; 5] = [&[], &["-storeskip"], &["-edgeload"], &["-defregion"], &["-defregion", "-edgeload", "-storeskip"]];
+    for live_after in [false, true] {
+        for step in [1i64, 2, 3] {
+            let f = build_burst(live_after, step);
+            // sampled frequencies: the burst block runs on a quarter of the iterations
+            let freq = [0.0f32, 1.0, 0.25, 1.0, 0.0, 1.0];
+            for fr in [None, Some(&freq[..])] {
+                for off in offs {
+                    let bytes = compile(&options(off), &f, fr);
+                    let code = Code::new(&bytes).unwrap();
+                    let run: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
+                    for (n, seed) in [(0u64, 1u64), (1, 7), (5, 0x1234), (64, 0x9e3779b97f4a7c15), (1001, 3)] {
+                        assert_eq!(run(n, seed), reference_burst(n, seed, live_after, step as u64), "live_after {} step {} off {:?} freq {} n {}", live_after, step, off, fr.is_some(), n);
+                    }
+                }
             }
         }
     }

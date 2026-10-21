@@ -2150,6 +2150,10 @@ fn region_windows_alloc(
                 best = Some((gain, c, plan, edge));
             }
         }
+        if trace_on(f) && best.is_none() {
+            let eb: Vec<String> = elig.iter().map(|(b, _)| format!("b{}", b)).collect();
+            eprintln!("ra-region {} v{}: no gain over {}", f.name, v, eb.join(" "));
+        }
         let Some((gain, c, plan, edge)) = best else { continue };
         if trace_on(f) {
             let bs: Vec<String> = plan.iter().map(|(b, l)| format!("b{}{}{}", b, if *l { "L" } else { "" }, if def_in.contains_key(&(v, *b)) { "D" } else { "" })).collect();
