@@ -414,13 +414,25 @@ impl Asm {
         self.e(0xB400_0000 | t as u32);
         self.pos() - 1
     }
+    fn tbz(&mut self, nz: bool, t: u8, bit: u32) -> usize {
+        self.e(if nz { 0x3700_0000 } else { 0x3600_0000 } | (bit >> 5) << 31 | (bit & 31) << 19 | t as u32);
+        self.pos() - 1
+    }
     fn patch(&mut self, at: usize, target: usize) {
         let rel = target as i64 - at as i64;
         let w = self.w[at];
+        // tbz / tbnz: imm14 (+-32 KB); out of range flags TBZ_RANGE (emitted again without them)
+        if w & 0x7E00_0000 == 0x3600_0000 {
+            if rel < -(1i64 << 13) || rel >= 1i64 << 13 {
+                TBZ_RANGE.with(|c| c.set(true));
+            }
+            self.w[at] = (w & !(0x3FFF << 5)) | ((rel as u32) & 0x3FFF) << 5;
+            return;
+        }
         // b: imm26 (+-128 MB); b.cond / cbz / cbnz / ldr literal: imm19 (+-1 MB). An offset out
         // of range is never truncated: it flags the emission, which compile() repeats with
-        // relaxed branches (or fails past imm26). Only these encodings are patched here (tbz /
-        // tbnz have imm14 and adr imm21: none is emitted).
+        // relaxed branches (or fails past imm26). tbz / tbnz (imm14) flag TBZ_RANGE instead
+        // (emitted again with tst + b.cond); adr (imm21) is not patched.
         let is_b = w & 0xFC00_0000 == 0x1400_0000;
         let is_imm19 = w & 0xFF00_0010 == 0x5400_0000 || w & 0x7E00_0000 == 0x3400_0000 || w & 0x3B00_0000 == 0x1800_0000;
         assert!(is_b || is_imm19, "arm64 patch of an unknown encoding {:08x}", w);
@@ -622,6 +634,9 @@ enum CondBr {
     B(u8),
     Z(u8),
     Nz(u8),
+    /// tbz / tbnz register, bit (only when `Gen::tbz`: +-32 KB)
+    Tz(u8, u32),
+    Tnz(u8, u32),
 }
 
 struct Gen<'a> {
@@ -690,6 +705,8 @@ struct Gen<'a> {
     /// an inverted short branch over a `b` (+-128 MB), constants are built in registers
     /// instead of loaded from the literal pools after the code
     long: bool,
+    /// single-bit tests branch with tbz / tbnz (off when one of them did not reach: emitted again)
+    tbz: bool,
 }
 
 impl<'a> Gen<'a> {
@@ -2947,6 +2964,8 @@ impl<'a> Gen<'a> {
                 CondBr::B(cc) => self.a.bcond(cc),
                 CondBr::Z(r) => self.a.cbz(r),
                 CondBr::Nz(r) => self.a.cbnz(r),
+                CondBr::Tz(r, bit) => self.a.tbz(false, r, bit),
+                CondBr::Tnz(r, bit) => self.a.tbz(true, r, bit),
             };
             self.fixups.push((p, target));
             return;
@@ -2955,6 +2974,7 @@ impl<'a> Gen<'a> {
             CondBr::B(cc) => self.a.bcond(cc ^ 1),
             CondBr::Z(r) => self.a.cbnz(r),
             CondBr::Nz(r) => self.a.cbz(r),
+            CondBr::Tz(..) | CondBr::Tnz(..) => unreachable!("tbz is not used in long mode"),
         };
         let p = self.a.b();
         self.fixups.push((p, target));
@@ -3016,6 +3036,18 @@ impl<'a> Gen<'a> {
                     Some(Inst::ICmpI(cnd @ (Cond::Eq | Cond::Ne), _, _, _, 0)) if self.test_fuse.is_some() => {
                         let (src, mask) = self.test_fuse.take().unwrap();
                         let rs = self.use_i(src, S0);
+                        if self.tbz && (mask as u64).is_power_of_two() {
+                            // one bit: tbz / tbnz (branch to tt when the bit is zero == Eq)
+                            let bit = (mask as u64).trailing_zeros();
+                            let zero_to_tt = cnd == Cond::Eq;
+                            if *tt == next {
+                                self.cond_branch(if zero_to_tt { CondBr::Tnz(rs, bit) } else { CondBr::Tz(rs, bit) }, *ff);
+                            } else {
+                                self.cond_branch(if zero_to_tt { CondBr::Tz(rs, bit) } else { CondBr::Tnz(rs, bit) }, *tt);
+                                self.jump_to(*ff, bi);
+                            }
+                            return;
+                        }
                         let (nn, immr, imms) = bitmask_imm(mask as u64).unwrap();
                         // ANDS xzr, xs, #mask
                         self.a.e(0xF200_001F | nn << 22 | immr << 16 | imms << 10 | (rs as u32) << 5);
@@ -4050,6 +4082,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // a function past the branch ranges is emitted again in long mode: from the same
     // allocation (allocating twice doubled a 3.7 s allocation)
     let mut long = false;
+    let mut tbz = true;
     loop {
     let al = al0;
     let _cost_emit = crate::probe::phase(10);
@@ -4104,10 +4137,18 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         last_call_ret: 0,
         pads: Vec::new(),
         long,
+        tbz: tbz && !long,
     };
     g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
     BRANCH_RANGE.with(|c| c.set(false));
+    TBZ_RANGE.with(|c| c.set(false));
     g.gen(options);
+    if TBZ_RANGE.with(|c| c.replace(false)) && g.tbz && !BRANCH_RANGE.with(|c| c.get()) {
+        // a tbz past +-32 KB: emit again with tst + b.cond (from the same allocation)
+        tbz = false;
+        al0 = g.al;
+        continue;
+    }
     if BRANCH_RANGE.with(|c| c.replace(false)) {
         if !long {
             // past +-1 MB: emit again with relaxed branches and no literal pools (emission
@@ -4130,6 +4171,8 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
 thread_local! {
     /// a branch or literal load of the function being emitted did not reach its target
     static BRANCH_RANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// a tbz / tbnz of the function being emitted did not reach its target (+-32 KB)
+    static TBZ_RANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 // ------------------------------------------------------------ runtime glue
@@ -4427,6 +4470,49 @@ mod tests {
         };
         f.blocks[b1 as usize].term = Term::Ret(vec![last]);
         assert!(compile(options, &f, &env).is_ok());
+    }
+
+    /// A branch on one bit (`x & 1 << k` against zero) is tbz / tbnz, for bits in either word;
+    /// past their +-32 KB range the function is emitted again with tst + b.cond, and both
+    /// versions take the right side.
+    #[test]
+    fn single_bit_branches_use_tbz_and_fall_back_past_its_range() {
+        let options = &relax_session::Options::default();
+        let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+        for (bit, filler) in [(0u32, 0usize), (13, 0), (31, 0), (32, 0), (63, 0), (5, 12_000), (40, 12_000)] {
+            let mut f = Func::new("tbz".to_string(), 0);
+            let p = f.vreg(Cls::I);
+            f.params.push(p);
+            f.rets.push(Cls::I);
+            let (b0, b1, b2) = (f.block(), f.block(), f.block());
+            let (t, c) = (f.vreg(Cls::I), f.vreg(Cls::I));
+            let u = IntTy { bits: 64, signed: false };
+            f.blocks[b0 as usize].insts = vec![Inst::IBinI(IOp::And, u, t, p, 1i64 << bit), Inst::ICmpI(Cond::Ne, false, c, t, 0)];
+            f.blocks[b0 as usize].pos = vec![0, 0];
+            f.blocks[b0 as usize].term = Term::Branch(c, b2, b1);
+            // b1 (bit clear): p + 1 + filler adds, laid out between the branch and b2
+            let mut acc = p;
+            for k in 0..filler + 1 {
+                let d = f.vreg(Cls::I);
+                f.blocks[b1 as usize].insts.push(Inst::IBinI(IOp::Add, u, d, acc, if k == 0 { 1 } else { 0x1000 }));
+                f.blocks[b1 as usize].pos.push(0);
+                acc = d;
+            }
+            f.blocks[b1 as usize].term = Term::Ret(vec![acc]);
+            let k2 = f.vreg(Cls::I);
+            f.blocks[b2 as usize].insts = vec![Inst::Iconst(k2, 7)];
+            f.blocks[b2 as usize].pos = vec![0];
+            f.blocks[b2 as usize].term = Term::Ret(vec![k2]);
+            let r = compile(options, &f, &env).unwrap();
+            let w: Vec<u32> = r.code[..r.text_len as usize].chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let has_tbz = w.iter().any(|x| x & 0x7E00_0000 == 0x3600_0000);
+            assert_eq!(has_tbz, filler == 0, "bit {bit} filler {filler}: tbz {has_tbz}");
+            let code = crate::exec::Code::new(&r.code).unwrap();
+            let run: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
+            let x = 0x5a5a_0000_0000_1234u64 & !(1u64 << bit);
+            assert_eq!(run(x | 1 << bit), 7, "bit {bit} set");
+            assert_eq!(run(x), x + 1 + 0x1000 * filler as u64, "bit {bit} clear");
+        }
     }
 
     /// A select chain reads the flags of the compare right before it, never stale ones: here
