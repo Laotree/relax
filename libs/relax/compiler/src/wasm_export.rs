@@ -61,7 +61,10 @@ pub fn capture(id: u32, f: &Func) {
         unsafe { atexit(at_exit) };
         ENTRY.store(id, std::sync::atomic::Ordering::Relaxed);
     }
-    g.get_or_insert_with(BTreeMap::new).insert(id, f.clone());
+    // on the kept heap: a zone swap frees the compile arenas while the run goes on
+    crate::zone_alloc::kept_with(|| {
+        g.get_or_insert_with(BTreeMap::new).insert(id, f.clone());
+    });
 }
 
 struct Linked {
@@ -122,7 +125,10 @@ pub fn finish(u: &Unit) {
     }
     // `%p`: the process id (a run's child processes capture their own sets)
     let path = path.replace("%p", &std::process::id().to_string());
-    let Some(funcs) = CAPTURED.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let Some(mut funcs) = CAPTURED.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    // the trace: slots whose code was installed (called); a build made ahead of a call that
+    // never came is not part of it
+    funcs.retain(|id, _| (*id as usize) < u.fns.len() && u.fns[*id as usize].code != 0);
     if let Ok(pat) = std::env::var("MAKEPAD_RUN_WASM_EXPORT_DUMP") {
         for (id, f) in &funcs {
             if f.name.contains(pat.as_str()) {
@@ -147,6 +153,7 @@ pub fn finish(u: &Unit) {
                 "datafirst" => opts.data_first = on,
                 "sp0" => opts.sp0 = on,
                 "abort" => opts.panic_abort = on,
+                "byname" => opts.order_by_name = on,
                 "st" => single = on,
                 "names" => opts.names = on,
                 "untraced" => opts.untraced_import = on,
@@ -284,6 +291,19 @@ pub fn finish(u: &Unit) {
         sz.sort_by(|a, b| b.1.cmp(&a.1));
         for (n, b) in sz.iter().take(top) {
             eprintln!("  {:7} {}", b, n);
+        }
+        // bytes per crate (the first path segment of the function's name)
+        let mut by_crate: HashMap<String, (usize, usize)> = HashMap::new();
+        for (n, b) in &s.fn_sizes {
+            let k = n.trim_start_matches('<').split("::").next().unwrap_or("").split(' ').next().unwrap_or("").to_string();
+            let e = by_crate.entry(k).or_insert((0, 0));
+            e.0 += b;
+            e.1 += 1;
+        }
+        let mut by_crate: Vec<_> = by_crate.into_iter().collect();
+        by_crate.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        for (k, (b, n)) in by_crate.iter() {
+            eprintln!("  crate {:8} bytes {:5} fns  {}", b, n, k);
         }
         let mut why: HashMap<String, usize> = HashMap::new();
         for (_, e) in &s.failed {

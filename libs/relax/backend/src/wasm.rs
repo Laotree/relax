@@ -158,11 +158,14 @@ pub struct Options {
     /// panics abort: an invoke is a plain call, a resume traps, cleanup pads and the exception
     /// tag go away (rustc panic=abort)
     pub panic_abort: bool,
+    /// function order: false = by use count (the most called get 1-byte indices); true = by
+    /// name (a crate's and a generic's functions adjacent: similar code compresses together)
+    pub order_by_name: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: true, tee: true, remat: true, sp0: true, panic_abort: false }
+        Options { stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: true, tee: true, remat: true, sp0: true, panic_abort: false, order_by_name: false }
     }
 }
 
@@ -457,7 +460,12 @@ impl<'a> Module<'a> {
         let mut iord: Vec<usize> = (0..ni).collect();
         iord.sort_by(|a, b| fuse[*b].cmp(&fuse[*a]).then(a.cmp(b)));
         let mut dord: Vec<usize> = (ni..ni + n_user + n_help).collect();
-        dord.sort_by(|a, b| fuse[*b].cmp(&fuse[*a]).then(a.cmp(b)));
+        if opts.order_by_name {
+            let key = |g: usize| if g < ni + n_user { funcs[g - ni].1.name.as_str() } else { "\u{10FFFF}" };
+            dord.sort_by(|a, b| key(*a).cmp(key(*b)).then(a.cmp(b)));
+        } else {
+            dord.sort_by(|a, b| fuse[*b].cmp(&fuse[*a]).then(a.cmp(b)));
+        }
         let mut fmap = vec![0u32; ni + n_user + n_help];
         for (n, g) in iord.iter().chain(dord.iter()).enumerate() {
             fmap[*g] = n as u32;
