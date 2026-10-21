@@ -693,7 +693,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
                     }
                 }
             }
-            let Some(&(bottom_up, in_context, body, shape)) = tries.get(k) else { break };
+            let Some(&(_, in_context, body, shape)) = tries.get(k) else { break };
             k += 1;
             let (callee, shape) = unsafe { (&*body, &*shape) };
             let size = inline_inst_count(shape);
@@ -725,11 +725,11 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
                     _ => !free && (cost > budget || !tiny && priced > growth_limit),
                 };
             if !refused {
-                pick = Some((callee, rule.unwrap(), growth, size, cost, free, no_growth, bottom_up || in_context, in_context));
+                pick = Some((callee, rule.unwrap(), growth, size, cost, free, no_growth, in_context));
                 break;
             }
         }
-        let Some((callee, rule, growth, size, cost, free, no_growth, priced_growth, in_context)) = pick else { continue };
+        let Some((callee, rule, growth, size, cost, free, no_growth, in_context)) = pick else { continue };
         let callee = Some(callee);
         let rule = Some(rule);
         match rule.unwrap() {
@@ -760,7 +760,10 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
         let before = inst_count;
         inst_count = inst_count - old_block_size + f.blocks[bi].insts.len()
             + f.blocks[start..].iter().map(|b| b.insts.len()).sum::<usize>();
-        priced = if priced_growth { priced.saturating_add(growth) } else { priced + inst_count - before };
+        // the ceiling counts what moved in (a bottom-up body's unoptimised size: its priced size
+        // let collect_hybrid_decode_run take prepared bodies past the room top-down had, llm_host
+        // +2.1%), except a body priced in context (its constants fold it right away)
+        priced = if in_context { priced.saturating_add(growth) } else { priced + inst_count - before };
         priorities.resize(f.blocks.len(), priorities[bi]);
         let parent_loop = loop_sites[bi];
         loop_sites.resize(f.blocks.len(), parent_loop);

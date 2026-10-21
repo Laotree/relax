@@ -9569,8 +9569,10 @@ impl<'a> InlineBodies<'a> {
         let &(comp, calls) = self.node.get(&c)?;
         let (p, attrs) = get(c)?;
         let o1 = unsafe { &*p };
-        // a body above the largest size its rules admit (site_rule) is not prepared
-        if attrs & relax_codegen::opt::ATTR_COLD != 0 || !calls || relax_codegen::opt::inst_count(o1) > relax_codegen::opt::max_admitted_insts(options, attrs) {
+        // a body above the largest size any rule admits (site_rule) is not prepared (one that
+        // optimises down into its own rules' range still is: piano_render, brotli_decode)
+        let max_insts = if relax_codegen::opt::single_on(options) { relax_codegen::opt::INLINE_SINGLE_INSTS } else { relax_codegen::opt::InlineLimits::tier1().always_insts };
+        if attrs & relax_codegen::opt::ATTR_COLD != 0 || !calls || relax_codegen::opt::inst_count(o1) > max_insts {
             return None;
         }
         let sub = |x: u32| if self.node.get(&x).is_some_and(|n| n.0 == comp) { None } else { self.get_prepared(x) };
