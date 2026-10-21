@@ -4820,6 +4820,22 @@ mod inline_priority_tests {
     }
 
     #[test]
+    fn priced_body_decides_and_inlined_body_moves() {
+        // bottom-up O3: the optimised body prices the site, the inlined-only body is inlined
+        let options = &relax_session::Options::default();
+        let (raw, opt) = (callee(400), callee(30));
+        let get = |_: u32| Some((&raw as *const Func, 0));
+        let mut f = caller();
+        let n = inline_inst_count(&f);
+        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some(&opt as *const Func), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).len(), 2);
+        assert!(inline_inst_count(&f) > n + 2 * 390);
+        f.verify().unwrap();
+        let get = |_: u32| Some((&opt as *const Func, 0));
+        let mut f = caller();
+        assert!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some(&raw as *const Func), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).is_empty());
+    }
+
+    #[test]
     fn hot_nonleaf_and_exposed_calls() {
         let options = &relax_session::Options::default();
         let mut c = callee(30);
