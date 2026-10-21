@@ -6404,6 +6404,13 @@ fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &cra
         // inlined only through the hot-site rule, so any change in which round reached the site
         // left a per-element drop call (llm_host's `.map(Ok).collect::<Result<Vec<f32>, _>>()`)
         FnKey::Glue(..) if core_hint => relax_codegen::opt::ATTR_HINT,
+        // shims (reify, fn pointer, vtable, closure-once, clone, fn-pointer address) are hinted:
+        // rustc_codegen_llvm/src/attributes.rs:418 gives InlineAttr::Hint to every instance whose
+        // InstanceKind::requires_inline (rustc_middle/src/ty/instance.rs:291), which every shim
+        // kind Relax has does. Bottom-up, a shim's priced body holds the callee it forwards to,
+        // and unhinted it stayed a call per element (ttf_parser's `FromData::parse` shim in
+        // binary_search_by: 48% of text_shape_raster)
+        FnKey::Shim(_) if core_hint => relax_codegen::opt::ATTR_HINT,
         FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Closure(..) => 0,
         // twins are never inlined into anything (their callers are twins built from RIR)
         FnKey::Sandbox(_) | FnKey::Plain(_) => return None,
@@ -9212,7 +9219,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     // Bottom-up, as LLVM's CGSCC inliner: every callee in the snapshot is simplified first,
     // its own inlining included, and this build inlines (and prices) those optimised bodies.
     // A pure function of the snapshot, so replay stays exact.
-    let bodies = InlineBodies::prepare(options, id, candidates, get, ro, cfg, nounwind);
+    let bodies = InlineBodies::prepare(options, id, candidates, get, single, ro, cfg, nounwind);
     let get_inline = |c: u32| bodies.get(c).or_else(|| get(c));
     let price = |c: u32| bodies.price(c);
     let mut inlined = tier1_simplify(options, func, id, name, &get_inline, &price, single, ro, cfg, nounwind, frequencies, inline_stats.as_mut(), None);
@@ -9316,7 +9323,7 @@ struct InlineBodies {
 }
 
 impl InlineBodies {
-    fn prepare(options: &crate::options::Options, root: u32, candidates: &[u32], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool) -> Self {
+    fn prepare(options: &crate::options::Options, root: u32, candidates: &[u32], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool) -> Self {
         use relax_backend::rir::{Callee, Inst, Term};
         let mut out = InlineBodies { index: HashMap::new(), bodies: Vec::new() };
         if !cfg.inline || relax_backend::stats::opt_off(options, "-bottomup") {
@@ -9398,7 +9405,7 @@ impl InlineBodies {
                 let mut f = o1.clone();
                 f.baseline = false;
                 let mut raw = (relax_backend::rir::Func::new(String::new(), 0), Vec::new());
-                tier1_simplify(options, &mut f, ids[k], &o1.name, &sub, &sub_price, &|_, _| false, ro, cfg, nounwind, &mut structural, None, Some(&mut raw));
+                tier1_simplify(options, &mut f, ids[k], &o1.name, &sub, &sub_price, single, ro, cfg, nounwind, &mut structural, None, Some(&mut raw));
                 let (raw, mut taken) = raw;
                 if taken.is_empty() {
                     continue;
