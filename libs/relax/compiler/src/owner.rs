@@ -276,6 +276,19 @@ pub fn queued_note() -> String {
     )
 }
 
+/// The queued requests as `class:thread` (diagnostics: an allocator swap's long wait names them).
+pub fn queued_detail() -> String {
+    let q = Q.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    for (c, lane) in q.lanes.iter().enumerate() {
+        for r in lane {
+            let from = unsafe { (*(*r as *const Req)).from };
+            out.push(format!("{}:{}", CLASS_NAMES[c], crate::os::thread::name(from)));
+        }
+    }
+    out.join(" ")
+}
+
 /// What the main thread's longest post-present wait was behind (diagnostics).
 pub fn main_wait_behind() -> String {
     match MAIN_WAIT_BEHIND.load(Ordering::Relaxed) {
