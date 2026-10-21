@@ -269,7 +269,7 @@ pub fn print_as_rustc(sess: &std::sync::Arc<crate::Session>, args: &[String], in
                 C::LinuxX64 => crate::cfg::CfgSet::linux_x64(sess, &[]),
                 C::WindowsX64 => crate::cfg::CfgSet::windows_x64(sess, &[]),
                 C::AndroidArm64 => crate::cfg::CfgSet::android_arm64(sess, &[]),
-                C::Web => crate::cfg::CfgSet::web(sess, &[]),
+                C::Web(w) => crate::cfg::CfgSet::web(sess, w, &[]),
                 C::Host => unreachable!("from_triple names a target"),
             }
         }
@@ -290,7 +290,7 @@ pub fn print_as_rustc(sess: &std::sync::Arc<crate::Session>, args: &[String], in
         "aarch64-apple-darwin" => ("lib", ".dylib", "", "lib", ".a", &["off", "packed", "unpacked"], false),
         "x86_64-unknown-linux-gnu" | "aarch64-linux-android" => ("lib", ".so", "", "lib", ".a", &["off", "packed", "unpacked"], false),
         "x86_64-pc-windows-gnu" => ("", ".dll", ".exe", "lib", ".a", &["off"], false),
-        "wasm32-unknown-unknown" => ("", ".wasm", ".wasm", "lib", ".a", &["off"], true),
+        "wasm32-unknown-unknown" | "wasm64-unknown-unknown" => ("", ".wasm", ".wasm", "lib", ".a", &["off"], true),
         t => return Err(format!("no target model for {t}")),
     };
     let mut out = String::new();
