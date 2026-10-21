@@ -2552,6 +2552,16 @@ fn affinities(f: &Func, reach: &[bool], block_start: &[u32], ranges: &Ranges, wt
                     }
                     continue;
                 }
+                // scalar FMA: x64 writes the result in place over c (vfmadd231), a (213) or b (213
+                // with a and b swapped), arm64 fmadd has a separate destination: the operand that
+                // dies here, addend first
+                Inst::FMulAdd(_, _, _, d, a, b2, c) => {
+                    if let Some(s2) = [*c, *a, *b2].into_iter().find(|s2| *s2 != *d && dies_at(ranges, s2.0, p)) {
+                        edges.push((d.0, s2.0, w));
+                        edges.push((s2.0, d.0, w));
+                    }
+                    continue;
+                }
                 _ => {}
             }
             let (d, a, b2, comm) = match i {
