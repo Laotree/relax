@@ -1067,6 +1067,22 @@ struct Fx<'a> {
 fn lower_func(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &HashMap<u32, u32>, funcs: &[(u32, &Func)], link: &dyn Link, sh: &mut Shared) -> Result<Body, String> {
     // vector ops wasm has no instruction for: per-lane scalar code; switches: br_table
     let native = |op: VX| vx_native(op);
+    // DEBUG bisection (temporary): MAKEPAD_RUN_WASM_TEE_BISECT=k:v keeps tee only in functions
+    // whose name hash has v in its low k bits
+    let bis_o;
+    let o = match std::env::var("MAKEPAD_RUN_WASM_TEE_BISECT").ok().and_then(|s| { let (k, v) = s.split_once(':')?; Some((k.parse::<u32>().ok()?, v.parse::<u64>().ok()?)) }) {
+        Some((k, v)) => {
+            let h = f0.name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+            let mut c = o.clone();
+            c.tee = o.tee && (h & ((1u64 << k) - 1)) == v;
+            if c.tee && std::env::var_os("MAKEPAD_RUN_WASM_TEE_NAMES").is_some() {
+                eprintln!("tee on: {}", f0.name);
+            }
+            bis_o = c;
+            &bis_o
+        }
+        None => o,
+    };
     let pruned: Option<Func> = prune(o, f0, fn_ix, link);
     let f0: &Func = pruned.as_ref().unwrap_or(f0);
     let legal: Option<Func> = crate::legal::needed(f0, &native, true).then(|| {
