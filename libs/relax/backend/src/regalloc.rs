@@ -1372,7 +1372,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             }
         }
     }
-    let (save_skip, restore_skip) = if thorough && !crate::stats::opt_off(options, "-saveskip") { redundant_saves(f, &reach, &tab, &block_start, &saves) } else { Default::default() };
+    let (save_skip, restore_skip) = if thorough && !crate::stats::opt_off(options, "-saveskip") { redundant_saves(f, &reach, &tab, &block_start, &saves, &remat) } else { Default::default() };
     // region windows (O3): a spilled int value used in many blocks once each (a loop-carried
     // value whose register some short temporary holds somewhere in the loop) gets a register
     // over the blocks where one is free over its whole live part: blocks it enters live and does
@@ -1485,8 +1485,9 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
 /// intersection); backward, a restore is needed only when the register is read before it is
 /// redefined -- by a use or by a later save that stores (paths meet by union). A value live
 /// across a run of calls (lookup_local: five values around 18 calls) is then stored once and
-/// loaded only where it is used.
-fn redundant_saves(f: &Func, reach: &[bool], tab: &OpTab, block_start: &[u32], saves: &HashMap<u32, Vec<(VReg, i32)>>) -> (std::collections::HashSet<(u32, u32)>, std::collections::HashSet<(u32, u32)>) {
+/// loaded only where it is used. A use of a recomputed base + k (Remat::Offset) reads its base's
+/// register.
+fn redundant_saves(f: &Func, reach: &[bool], tab: &OpTab, block_start: &[u32], saves: &HashMap<u32, Vec<(VReg, i32)>>, remat: &[Remat]) -> (std::collections::HashSet<(u32, u32)>, std::collections::HashSet<(u32, u32)>) {
     let mut skip_s = std::collections::HashSet::new();
     let mut skip_r = std::collections::HashSet::new();
     if saves.is_empty() {
@@ -1584,7 +1585,17 @@ fn redundant_saves(f: &Func, reach: &[bool], tab: &OpTab, block_start: &[u32], s
             }
         }
     }
-    // backward: registers read before redefinition
+    // backward: registers read before redefinition (a recomputed base + k reads its base, and
+    // that base may be one too)
+    let read = |st: &mut [u64], mut u: u32| loop {
+        if let Some(&i) = ix.get(&u) {
+            set(st, i);
+        }
+        match remat[u as usize] {
+            Remat::Offset(b, _) => u = b.0,
+            _ => break,
+        }
+    };
     let mut inn = vec![vec![0u64; w]; nb];
     let walk = |bi: usize, inn: &Vec<Vec<u64>>, skip_r: &mut Option<&mut std::collections::HashSet<(u32, u32)>>| -> Vec<u64> {
         let b = &f.blocks[bi];
@@ -1596,9 +1607,7 @@ fn redundant_saves(f: &Func, reach: &[bool], tab: &OpTab, block_start: &[u32], s
         }
         let k0 = tab.first[bi] as usize;
         for &u in tab.uses(k0 + b.insts.len()) {
-            if let Some(&i) = ix.get(&u) {
-                set(&mut st, i);
-            }
+            read(&mut st, u);
         }
         for ii in (0..b.insts.len()).rev() {
             let p = block_start[bi] + 2 * ii as u32 + 1;
@@ -1627,9 +1636,7 @@ fn redundant_saves(f: &Func, reach: &[bool], tab: &OpTab, block_start: &[u32], s
                 }
             }
             for &u in tab.uses(k0 + ii) {
-                if let Some(&i) = ix.get(&u) {
-                    set(&mut st, i);
-                }
+                read(&mut st, u);
             }
         }
         st
