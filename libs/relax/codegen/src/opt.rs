@@ -221,7 +221,8 @@ impl InlineLimits {
 
 pub fn inline_rule(f: &Func, callee_id: u32, nargs: usize, nrets: usize, attrs: u8, lim: &InlineLimits) -> Option<usize> {
     let (n, leaf, rec) = callee_shape(f, callee_id);
-    if rec {
+    // a naked fn is its asm only: never inlined (rustc: naked implies inline(never))
+    if rec || f.naked {
         return None;
     }
     // a callee that never returns (panic helpers) only runs on cold paths: keep it a call
@@ -1257,7 +1258,8 @@ pub fn sroa_post_inline(f: &mut Func) -> bool {
 ///   through the parameter, and every one overlapping the field has its exact offset and type;
 /// * no call, atomic or fence in the loop for a stored field (a call may unwind with the memory
 ///   stale; a store is not delayed past one), calls are fine for a field that is only loaded when
-///   none is given a based-on pointer;
+///   none is given a based-on pointer, and for a stored field of a by-value argument's private copy
+///   (`Func::owned`) when the loop has no Invoke (LLVM's `isNotVisibleOnUnwind`);
 /// * the field is dereferenceable in the preheader (`Func::deref`), so loading it there is safe
 ///   even if the loop runs no iteration; the write-back on a path that never stored writes the
 ///   value it loaded, which no one can observe through a unique pointer.
@@ -1308,10 +1310,12 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
     // anything in the loop that stops every promotion, and what stops only stored fields
     let mut atomic_or_fence = false;
     let mut has_call = false;
+    let mut has_invoke = false;
     for bi in 0..n {
         if !body[bi] {
             continue;
         }
+        has_invoke |= matches!(f.blocks[bi].term, Term::Invoke(..));
         for i in &f.blocks[bi].insts {
             match i {
                 Inst::AtomicLoad(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..) | Inst::FpEnv(..) => atomic_or_fence = true,
@@ -1330,6 +1334,8 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         if ndef[p.0 as usize] != 1 || !f.params.contains(&p) {
             continue;
         }
+        // MAKEPAD_RUN_OPT=-owned: by-value argument copies as any noalias param (bisection)
+        let owned = f.owned.contains(&p) && !relax_backend::stats::opt_env_off("-owned");
         // the vregs based on p: moves and arithmetic on one, and call results when a based-on
         // pointer went into the call
         let mut based = vec![false; nv];
@@ -1422,7 +1428,10 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         let mut take: Vec<(i32, Mem, bool, bool, u32)> = Vec::new();
         for x in &fields {
             let clash = fields.iter().any(|y| !(y.0 == x.0 && y.1 == x.1) && y.0 < x.0 + size(x.1) && x.0 < y.0 + size(y.1));
-            if clash || (x.3 && has_call) {
+            // a stored field stays stale in memory over a call: fine for the private copy of a
+            // by-value argument (Func::owned) when every call is plain -- an unwind leaves this
+            // function at once and nobody reads the copy after (an Invoke's cleanup might)
+            if clash || (x.3 && has_call && !(owned && !has_invoke)) {
                 continue;
             }
             // dereferenceable in the preheader
@@ -1450,6 +1459,36 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
                     }
                 }
             }
+        }
+        // a by-value argument's private copy (Func::owned) needs no write-back on an exit that
+        // never returns (a bounds-check panic: it unwinds out of the function or aborts) and whose
+        // code never looks at the copy: nobody reads it after
+        if owned {
+            let quiet_dead_end = |t: u32| -> bool {
+                let mut seen = vec![false; n];
+                let mut work = vec![t];
+                while let Some(x) = work.pop() {
+                    let x = x as usize;
+                    if seen[x] {
+                        continue;
+                    }
+                    seen[x] = true;
+                    let blk = &f.blocks[x];
+                    if matches!(blk.term, Term::Ret(..)) || body[x] {
+                        return false;
+                    }
+                    let mut touches = false;
+                    for i in &blk.insts {
+                        for_uses(i, |u| touches |= based[u.0 as usize]);
+                    }
+                    if touches {
+                        return false;
+                    }
+                    work.extend(blk.term.succs());
+                }
+                true
+            };
+            exit_targets.retain(|&t| !quiet_dead_end(t));
         }
         let mut stored_n = 0;
         take.retain(|x| {
@@ -2512,6 +2551,45 @@ pub fn forward_slot_loads(f: &mut Func) -> bool {
     true
 }
 
+/// Vregs defined once, as a parameter or by moves and constant offsets of one (pointers into
+/// memory that existed before this frame did).
+fn param_based_vregs(f: &Func) -> Vec<bool> {
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+        }
+    }
+    let mut pb = vec![false; nv];
+    for p in &f.params {
+        if ndef[p.0 as usize] == 1 && f.vregs[p.0 as usize] == Cls::I {
+            pb[p.0 as usize] = true;
+        }
+    }
+    loop {
+        let mut grew = false;
+        for b in &f.blocks {
+            for i in &b.insts {
+                let (d, a) = match *i {
+                    Inst::Mov(d, a) | Inst::IBinI(IOp::Add | IOp::Sub, _, d, a, _) => (d, a),
+                    _ => continue,
+                };
+                if pb[a.0 as usize] && !pb[d.0 as usize] && ndef[d.0 as usize] == 1 {
+                    pb[d.0 as usize] = true;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            return pb;
+        }
+    }
+}
+
 /// Destination forwarding of slot copies: a slot B whose only read is one whole copy into
 /// another slot C (at some offset), with every write of B in the copy's block before it and
 /// nothing touching those bytes of C in between, is built in C directly: B's address becomes
@@ -2563,16 +2641,35 @@ pub fn forward_slot_dests(f: &mut Func) -> bool {
             }
         }
         let mut used = vec![false; ns];
+        let mut param_based: Option<Vec<bool>> = None;
         // (B, C, offset, block, copy index)
         let mut repl: Vec<(u32, u32, i64, usize, usize)> = Vec::new();
         for b in 0..ns {
             let Some((cb, ci, c, o, n)) = the_copy[b] else { continue };
-            if sc.esc[b] || sc.esc[c as usize] || multi_blk[b] || sc.reads[b] != 1 || used[b] || used[c as usize] {
+            if sc.esc[b] || multi_blk[b] || sc.reads[b] != 1 || used[b] || used[c as usize] {
                 continue;
             }
             let Some((sb, first, last)) = span[b] else { continue };
             if sb != cb || last != ci || o < 0 || o + n as i64 > f.slots[c as usize].size as i64 {
                 continue;
+            }
+            // C's address escapes (a by-value argument's copy handed to the calls of an inlined
+            // loop, a closure's environment): then B's writes may land in C early only when nothing
+            // from B's first access to the copy can see C through another pointer -- no call, copy
+            // or atomic, and every other memory access through a slot or a pointer based on a
+            // parameter (made before this frame's slots existed: it never points into them)
+            if sc.esc[c as usize] && relax_backend::stats::opt_env_off("-fwdesc") {
+                continue;
+            }
+            if sc.esc[c as usize] {
+                let pb = param_based.get_or_insert_with(|| param_based_vregs(f));
+                let unseen = f.blocks[cb].insts[first..ci].iter().all(|i| match i {
+                    Inst::Load(_, _, base, _) | Inst::Store(_, base, _, _) | Inst::VLoad(_, base, _) | Inst::VStore(base, _, _) | Inst::LoadX(_, _, base, ..) | Inst::StoreX(_, base, ..) => sl(*base) != NONE || pb[base.0 as usize],
+                    i => !relax_backend::passes::is_mem_effect(i),
+                });
+                if !unseen {
+                    continue;
+                }
             }
             // nothing touches C's bytes [o, o+n) from B's first access up to the copy
             let mut clash = false;
@@ -5935,6 +6032,84 @@ pub fn drop_undemanded_masks(options: &relax_session::Options, f: &mut Func) -> 
     any
 }
 
+/// A memory access through `p = q + k` (a single-def constant offset) reads `[q + k + off]`
+/// when q still holds its value there (defined once, or not redefined between in the block): an
+/// unrolled byte loop's `lea rsi,[r12+1]; movzx edx,byte [rsi-1]` per byte was left by
+/// fold_post_increments and flatten_step_chains; p then dies (the CRC loop of ogg parse_page:
+/// four leas per four bytes). Returns whether an access changed.
+pub fn fold_offset_bases(options: &relax_session::Options, f: &mut Func) -> bool {
+    if opt_off(options, "-offbase") {
+        return false;
+    }
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 2;
+    }
+    let mut off_of: Vec<Option<(VReg, i64, u32, u32)>> = vec![None; nv];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            if let Inst::IBinI(IOp::Add, it, d, q, c) = *i {
+                if it.bits == 64 && d != q {
+                    off_of[d.0 as usize] = Some((q, c, bi as u32, k as u32));
+                }
+            }
+        }
+    }
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        for k in 0..f.blocks[bi].insts.len() {
+            let base = match f.blocks[bi].insts[k] {
+                Inst::Load(_, _, b, _) | Inst::Store(_, b, _, _) | Inst::VLoad(_, b, _) | Inst::VStore(b, _, _) | Inst::LoadX(_, _, b, ..) | Inst::StoreX(_, b, ..) | Inst::VLoadX(_, b, ..) | Inst::VStoreX(b, ..) => b,
+                _ => continue,
+            };
+            if ndef[base.0 as usize] != 1 {
+                continue;
+            }
+            let Some((q, c, db, dk)) = off_of[base.0 as usize] else { continue };
+            let same = ndef[q.0 as usize] == 1
+                || db as usize == bi && (dk as usize) < k && (dk as usize + 1..k).all(|j| {
+                    let mut hit = false;
+                    for_defs(&f.blocks[bi].insts[j], |v| hit |= v == q);
+                    !hit
+                });
+            if !same {
+                continue;
+            }
+            let fits = |o: i32| -> Option<i32> { i32::try_from(o as i64 + c).ok() };
+            let n = match f.blocks[bi].insts[k] {
+                Inst::Load(m, d, _, o) => fits(o).map(|o| Inst::Load(m, d, q, o)),
+                Inst::Store(m, _, o, v) if v != base => fits(o).map(|o| Inst::Store(m, q, o, v)),
+                Inst::VLoad(d, _, o) => fits(o).map(|o| Inst::VLoad(d, q, o)),
+                Inst::VStore(_, o, v) => fits(o).map(|o| Inst::VStore(q, o, v)),
+                Inst::LoadX(m, d, _, x, sh, o) if x != base => fits(o).map(|o| Inst::LoadX(m, d, q, x, sh, o)),
+                Inst::StoreX(m, _, x, sh, o, v) if x != base && v != base => fits(o).map(|o| Inst::StoreX(m, q, x, sh, o, v)),
+                Inst::VLoadX(d, _, x, sh, o) if x != base => fits(o).map(|o| Inst::VLoadX(d, q, x, sh, o)),
+                Inst::VStoreX(_, x, sh, o, v) if x != base => fits(o).map(|o| Inst::VStoreX(q, x, sh, o, v)),
+                _ => None,
+            };
+            if let Some(n) = n {
+                f.blocks[bi].insts[k] = n;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// `passes::rename` plus the backend-only indexed memory forms `addr_modes` makes (the passes
+/// at the end of O3 run after it).
+fn rename_operands(i: &Inst, a: &dyn Fn(VReg) -> VReg) -> Inst {
+    match *i {
+        Inst::LoadX(m, d, b, x, sh, o) => Inst::LoadX(m, d, a(b), a(x), sh, o),
+        Inst::StoreX(m, b, x, sh, o, v) => Inst::StoreX(m, a(b), a(x), sh, o, a(v)),
+        Inst::VLoadX(d, b, x, sh, o) => Inst::VLoadX(d, a(b), a(x), sh, o),
+        Inst::VStoreX(b, x, sh, o, v) => Inst::VStoreX(a(b), a(x), sh, o, a(v)),
+        _ => rename(i, a),
+    }
+}
+
 /// Variables read again after a copy into them: `t = x >> n; x = t; ... use t` (O3, before
 /// register allocation). Copy propagation and value numbering make later reads of a variable x
 /// (several definitions: a loop-carried bit buffer, a counter) read the single-definition
@@ -6083,6 +6258,8 @@ pub fn reuse_copied_variables(options: &relax_session::Options, f: &mut Func) ->
     if !ok.iter().any(|&o| o) {
         return false;
     }
+    // MAKEPAD_RUN_OPT=-revarx: indexed memory operands keep the temporary (bisection)
+    let indexed = !opt_off(options, "-revarx");
     let mut any = false;
     for bi in 0..nb {
         if !reach[bi] {
@@ -6098,7 +6275,7 @@ pub fn reuse_copied_variables(options: &relax_session::Options, f: &mut Func) ->
                     u
                 }
             };
-            let n = rename(&f.blocks[bi].insts[k], &look);
+            let n = if indexed { rename_operands(&f.blocks[bi].insts[k], &look) } else { rename(&f.blocks[bi].insts[k], &look) };
             if n != f.blocks[bi].insts[k] {
                 f.blocks[bi].insts[k] = n;
                 any = true;
