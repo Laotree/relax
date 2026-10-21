@@ -124,7 +124,7 @@ extern "C" {
 }
 
 fn usage() -> i32 {
-    eprintln!("usage: makepad run [--units <unit-graph.json>] [--ahead=minimal|balanced|aot-max|aot-min] [--quiet] [--verbose] <package> [cargo flags] [-- program args]");
+    eprintln!("usage: makepad run [--units <unit-graph.json>] [--ahead=minimal|balanced|aot-max|aot-min] [--quiet] [--verbose] [--no-asm] [--allow-c] <package> [cargo flags] [-- program args]");
     2
 }
 
@@ -381,7 +381,11 @@ pub(crate) fn resolve_package(
                 let t = Instant::now();
                 (crate::provided::check_sources(&pkgs), t.elapsed())
             }));
-            let scripts = unitgraph::run_build_scripts(sess, &mut g, target_dir);
+            // `--allow-c`: cargo builds the native dependencies (front native.rs); a build
+            // script's own child run never builds them again
+            let triple = crate::cfg::CfgSet::host(sess, &[]).triple();
+            let native_request = (options.allow_c && !check_only && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none()).then(|| crate::native::Request { workspace, package, cargo_flags, relax_dir: target_dir, triple });
+            let scripts = unitgraph::run_build_scripts(sess, &mut g, target_dir, native_request.as_ref());
             let scripts_ms = t_scripts.elapsed().as_secs_f64() * 1e3;
             let t_wait = Instant::now();
             (sources.map(|h| h.join().expect("provided source check")), scripts, scripts_ms, t_wait.elapsed().as_secs_f64() * 1e3)
@@ -524,6 +528,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             "--selftest" => selftest = true,
             "--workspace" => workspace_check = true,
             "--verbose" => driver_options.verbose = true,
+            // read into the session (session_from_env)
+            "--no-asm" | "--allow-c" => {}
             "--report-to" if i + 1 < args.len() => {
                 if let Err(e) = report_open(&args[i + 1]) {
                     eprintln!("makepad-run: {}", e);
@@ -616,6 +622,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if !check && !watch && session.is_none() && !hosted {
         crate::tui::start(!driver_options.verbose && !QUIET.load(Ordering::Relaxed) && !crate::diag::enabled());
     }
+    crate::memstat::start_sampler();
     // `makepad run` of a working tree is a live session (watcher + hot reload); sources served from
     // a store (`makepad run <git url>`, mounted bundles) are not, and neither are checks and the
     // build scripts / self re-runs a program starts.
@@ -911,6 +918,15 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                     prog.crates[kk as usize].is_bin = c.bin;
                     crate_of[ci] = kk;
                     cold_front.loaded(&mut prog, kk);
+                    if crate::preload::trace() {
+                        // one line per crate loaded: what its files hold, and the process after it
+                        let (mut nf, mut src, mut ext, mut toks) = (0usize, 0usize, 0usize, 0usize);
+                        for (fi, f) in prog.files.iter().enumerate() {
+                            if prog.file_crate.get(fi).copied() == Some(kk) { nf += 1; src += f.src_len as usize; ext += f.src.len() - f.src_len as usize; toks += f.toks.len(); }
+                        }
+                        eprintln!("boot-trace-loaded: {} files={} src={}KB expansion={}KB toks={}k rss={}MB live={}MB t={:.0}ms", c.name, nf, src >> 10, ext >> 10, toks >> 10,
+                            crate::memstat::resident() >> 20, crate::memstat::live_total() >> 20, crate::clock::ms_since_start());
+                    }
                     crate::boot_stats::FILES_PARSED.store(prog.files.len() as u32, Ordering::Relaxed);
                     crate::boot_stats::LINES_PARSED.store(prog.lines_loaded as u64, Ordering::Relaxed);
 
@@ -1268,7 +1284,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
 
     // ---- the libraries the build scripts link (#[link] blocks load on the first miss)
     let t = Instant::now();
-    let (n_link, missing) = link_libraries(&prog, &g.link_libs, 0);
+    let (n_link, missing) = link_libraries(&prog, &g.link_libs, g.native.as_ref(), 0);
     phase(&format!("link libraries ({})", n_link), t);
     // a library that is not there only matters when one of its symbols is used: that miss is
     // reported where it happens (the #[link] block's lazy load); here only with --verbose
@@ -1728,13 +1744,20 @@ fn exported_fns(prog: &crate::program::Program, prefixes: &[String]) -> Result<V
 
 /// Loads the libraries the build scripts link and the ones `#[link]` blocks of files from
 /// `first_file` on name: (how many, the ones not found).
-pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(String, bool)], first_file: usize) -> (usize, Vec<String>) {
+pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(String, bool)], native: Option<&crate::native::NativeLib>, first_file: usize) -> (usize, Vec<String>) {
     let mut missing = Vec::new();
     // no-codegen mode: nothing is linked at run time -- native code is the host binary's, and
     // the program reaches only the symbols the host exports (jit.rs foreign_addr)
     if prog.session.options.no_codegen {
         return (0, missing);
     }
+    // `--allow-c`: the native dependencies' library (front native.rs), its symbols global
+    if let Some(n) = native {
+        if !crate::os::proc::load_path(&n.path) {
+            missing.push(format!("{} (--allow-c native library of {})", n.path, n.crates.join(", ")));
+        }
+    }
+    let provided_static = |name: &str| native.is_some_and(|n| n.statics.iter().any(|s| s == name));
     for (name, fw) in link_libs {
         if !crate::os::proc::load_library(name, *fw) && (*fw || !crate::os::proc::load_library_versioned(name)) {
             missing.push(name.clone());
@@ -1745,7 +1768,7 @@ pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(Strin
     // the program looks those up by name at run time)
     let mut n_link = link_libs.len();
     for (name, fw) in link_attr_libs(prog, first_file) {
-        if link_libs.iter().any(|l| l.0 == name && l.1 == fw) {
+        if link_libs.iter().any(|l| l.0 == name && l.1 == fw) || provided_static(&name) {
             continue;
         }
         n_link += 1;
@@ -2700,6 +2723,14 @@ pub fn quitting() {
     jit::QUIT_SEEN.store(true, Ordering::Relaxed);
 }
 
+/// std::relax::main_hosted: the runner's host has the process's main thread (the HAL's main loop
+/// and window) and the program's `main` runs as a guest on a thread of its own. False under the
+/// bare runner (`relax`: nothing hosts, the program's own HAL runs its main loop) and for a
+/// program without the HAL.
+pub(crate) extern "C" fn relax_main_hosted() -> bool {
+    HOSTED_RUN.load(Ordering::Acquire)
+}
+
 pub(crate) extern "C" fn relax_quit_requested() {
     crate::tui::abnormal();
     quit_mark();
@@ -3183,7 +3214,7 @@ fn summary_inner(why: &str) {
         let q = jit::TIER_QUEUED.load(Ordering::Relaxed);
         if q > 0 {
             verbose!(
-                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); snapshots {:.0} ms cpu on the owner ({} inline candidates built there, {:.0} ms; {} fronts off it, {:.0} ms cpu; {} optimised off it, {:.0} ms cpu), back ends {:.0} ms cpu off it",
+                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); snapshots {:.0} ms cpu on the owner ({} inline candidates built there, {:.0} ms; {} fronts off it, {:.0} ms cpu; {} optimised off it, {:.0} ms cpu), back ends {:.0} ms cpu off it; bottom-up preparation {:.0} ms cpu ({} bodies simplified, {} kept, {} shared, {} of the simplified had disagreeing shared ones: body {} attrs {} presence {} preparation {} single {}); {} code bytes",
                 jit::ahead_level().name(),
                 q,
                 jit::TIER_REVALIDATED.load(Ordering::Relaxed),
@@ -3201,6 +3232,17 @@ fn summary_inner(why: &str) {
                 jit::TIER1_SNAP_OFF[0].load(Ordering::Relaxed),
                 jit::TIER1_SNAP_OFF[1].load(Ordering::Relaxed) as f64 / 1e6,
                 s.tier1_free_ns as f64 / 1e6,
+                jit::TIER1_PREP[0].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_PREP[1].load(Ordering::Relaxed),
+                jit::TIER1_PREP[2].load(Ordering::Relaxed),
+                jit::TIER1_PREP[3].load(Ordering::Relaxed),
+                jit::TIER1_PREP[4].load(Ordering::Relaxed),
+                jit::TIER1_PREP[5].load(Ordering::Relaxed),
+                jit::TIER1_PREP[6].load(Ordering::Relaxed),
+                jit::TIER1_PREP[7].load(Ordering::Relaxed),
+                jit::TIER1_PREP[8].load(Ordering::Relaxed),
+                jit::TIER1_PREP[9].load(Ordering::Relaxed),
+                s.tier1_code_bytes,
             );
         }
         let mut tl = String::new();

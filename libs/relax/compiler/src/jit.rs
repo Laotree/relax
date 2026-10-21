@@ -286,6 +286,7 @@ pub(crate) struct ZoneTaken {
     o2_queue: Vec<(usize, u32)>,
     o2_base: std::collections::VecDeque<(usize, u32)>,
     o2_seen: Option<std::collections::HashSet<(usize, u32)>>,
+    prep_shared: HashMap<u32, Vec<std::sync::Arc<PrepShared>>>,
 }
 
 pub(crate) fn zone_take() -> ZoneTaken {
@@ -308,6 +309,7 @@ pub(crate) fn zone_take() -> ZoneTaken {
         o2_queue: take!(O2_QUEUE => is_empty),
         o2_base: take!(O2_BASE => is_empty),
         o2_seen: take!(O2_SEEN => is_none),
+        prep_shared: take!(PREP_SHARED => is_empty),
     }
 }
 
@@ -325,6 +327,7 @@ pub(crate) fn zone_put_back(taken: ZoneTaken) {
     put(&O2_QUEUE, taken.o2_queue);
     put(&O2_BASE, taken.o2_base);
     put(&O2_SEEN, taken.o2_seen);
+    put(&PREP_SHARED, taken.prep_shared);
 }
 
 /// Heap classes (memlane zones, DESIGN-zones.md F). KEPT (system heap; built and grown under
@@ -466,6 +469,9 @@ pub struct Unit {
     pub tls_next: u32,
     /// panicking stand-ins for foreign fns this host lacks, by symbol
     missing_stubs: relax_session::sync::Mutex<HashMap<String, u64>>,
+    /// the symbols the program's global_asm! defines, placed on the first foreign lookup
+    /// (global_asm.rs)
+    pub(crate) global_asm: std::sync::OnceLock<HashMap<String, u64>>,
     /// tier-up policy (None: O1 only) and its per-slot records / hot glue
     pub tier1: Option<Tier1Cfg>,
     /// O3 left calls to callees that had never run (ATTR_COLD): callee -> those O3
@@ -513,6 +519,8 @@ pub struct Stats {
     pub tier1_drop_why: std::collections::BTreeMap<&'static str, u32>,
     pub tier1_locked_ns: u64,
     pub tier1_free_ns: u64,
+    /// O3 machine code bytes installed
+    pub tier1_code_bytes: u64,
     /// constant initializers evaluated to data / compiled and run; cpu of the evaluations
     pub ctfe_data: u32,
     pub ctfe_code: u32,
@@ -649,7 +657,13 @@ fn tls_dtor(p: *mut u8) {
     os::tls::set(tls_key(), p);
     let registrations = unsafe { crate::domain_threads::finish(p as u64) };
     os::tls::set(tls_key(), std::ptr::null_mut());
-    os::mem::free(p as u64, TLS_CAP);
+    if crate::web32::on() {
+        // its shadow stack (web32.rs) goes back with it
+        crate::web32::thread_exit(p as u64);
+        crate::web32::free(p as u64, TLS_CAP);
+    } else {
+        os::mem::free(p as u64, TLS_CAP);
+    }
     for (base, token) in registrations { crate::domain::thread_finished(base, token); }
 }
 
@@ -716,7 +730,8 @@ fn rt_tls_block() -> u64 {
     if !b.is_null() {
         return b as u64;
     }
-    let b = os::mem::alloc_rw(TLS_CAP);
+    // the wasm32 program's thread-local blocks are in its window (`&THREAD_LOCAL` is an offset)
+    let b = if crate::web32::on() { crate::web32::alloc(TLS_CAP) } else { os::mem::alloc_rw(TLS_CAP) };
     // a thread nothing assigned a domain to (one native code started, or the first use of a
     // thread JIT code started before its start put it in its parent's domain): the default
     unsafe { *(b as *mut u64) = crate::domain::default_base() };
@@ -1346,7 +1361,7 @@ fn spec_pad(body: String, spec: u64, numeric: bool) -> String {
 }
 
 rt_fn! {
-fn rt_fmt_str(p: *const u8, len: u64, spec: u64) {
+pub(crate) fn rt_fmt_str(p: *const u8, len: u64, spec: u64) {
     let s = unsafe { std::slice::from_raw_parts(p, len as usize) };
     let s = String::from_utf8_lossy(s).into_owned();
     let ty = ((spec >> 40) & 0xff) as u8;
@@ -1492,7 +1507,7 @@ pub fn tls_block() -> u64 {
 }
 
 rt_fn! {
-fn rt_fmt_pop() -> StrRet {
+pub(crate) fn rt_fmt_pop() -> StrRet {
     let s = FMT.with(|f| {
         let mut v = f.borrow_mut();
         let s = v.pop().unwrap_or_default();
@@ -1522,7 +1537,7 @@ fn rt_fmt_print(stream: u64) {
 }
 
 rt_fn! {
-fn rt_str_eq(p1: *const u8, l1: u64, p2: *const u8, l2: u64) -> u64 {
+pub(crate) fn rt_str_eq(p1: *const u8, l1: u64, p2: *const u8, l2: u64) -> u64 {
     if l1 != l2 {
         return 0;
     }
@@ -1733,7 +1748,7 @@ fn rt_panic_bounds(idx: u64, len: u64, site: u64, _a3: u64, _a4: u64, _a5: u64, 
 
 rt_fn! {
 #[allow(clippy::too_many_arguments)]
-fn rt_panic_impl(msg: *const u8, len: u64, file: *const u8, file_len: u64, line: u64, col: u64, regs: *const u64, _a7: u64) {
+pub(crate) fn rt_panic_impl(msg: *const u8, len: u64, file: *const u8, file_len: u64, line: u64, col: u64, regs: *const u64, _a7: u64) {
     let m = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(msg, len as usize)).into_owned() };
     let f = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(file, file_len as usize)).into_owned() };
     PANIC_LOC.with(|l| *l.borrow_mut() = format!("{}:{}:{}", f, line as u32, col as u32));
@@ -1933,8 +1948,8 @@ pub fn set_program_args(args: Vec<Vec<u8>>) {
 
 #[repr(C)]
 pub struct ArgsRet {
-    argc: u64,
-    argv: u64,
+    pub(crate) argc: u64,
+    pub(crate) argv: u64,
 }
 
 rt_fn! {
@@ -1994,7 +2009,7 @@ fn fatal_compile_error(p: &PanicInfo, report: &str) {
 }
 
 rt_fn! {
-fn rt_thread_run(entry: u64, arg: u64) -> u64 {
+pub(crate) fn rt_thread_run(entry: u64, arg: u64) -> u64 {
     ensure_altstack();
     let u = unsafe { UNIT };
     // runs on the calling thread, in the domain it is in
@@ -2016,7 +2031,7 @@ rt_fn! {
 /// core::intrinsics_rt::catch_panic: `f(data)` under a recovery point (std::panic::
 /// catch_unwind, std::thread's start routine). The panic message itself was printed by
 /// std's hook; the report adds where it happened.
-fn rt_catch_panic(f: u64, data: u64) -> u64 {
+pub(crate) fn rt_catch_panic(f: u64, data: u64) -> u64 {
     ensure_altstack();
     let u = unsafe { UNIT };
     // a recovery point inside running code: the domain of that code, not the unit's own
@@ -2432,11 +2447,17 @@ impl Unit {
                 });
             }
         }
-        let exec_size: u64 = 768 << 20;
-        let data_size: u64 = UNIT_DATA_SIZE;
+        // the wasm32 web target's program: the unit lives in the linear memory's window (web32.rs)
+        let w32 = prog.ptr_bytes == 4;
+        let exec_size: u64 = if w32 { crate::web32::UNIT_CODE } else { 768 << 20 };
+        let data_size: u64 = if w32 { crate::web32::UNIT_DATA } else { UNIT_DATA_SIZE };
         let rw_size: u64 = UNIT_RW_SIZE;
         let syms_size = (crate::syms::SYM_CAP * 8) as u64;
-        let exec_base = os::mem::reserve(exec_size as usize, (data_size + rw_size + syms_size) as usize);
+        let exec_base = if w32 {
+            crate::web32::reserve_unit(exec_size as usize, (data_size + rw_size + syms_size) as usize)
+        } else {
+            os::mem::reserve(exec_size as usize, (data_size + rw_size + syms_size) as usize)
+        };
         let misc = exec_base;
         let data_base = exec_base + exec_size;
         let rw_base = data_base + data_size;
@@ -2534,6 +2555,7 @@ impl Unit {
             // slot 0 of the block: the thread's domain static block (domain.rs)
             tls_next: TLS_FIRST_FREE,
             missing_stubs: Default::default(),
+            global_asm: std::sync::OnceLock::new(),
             tier1: {
                 let t = Tier1Cfg::from_options(options);
                 TIER1_ENABLED.store(t.is_some(), Ordering::Relaxed);
@@ -2616,6 +2638,19 @@ impl Unit {
             let ld = x64::land();
             u.rt.land = u.emit_code(&ld);
         }
+        if w32 {
+            // the wasm32 program's runtime entries take and return offsets (web32.rs)
+            u.rt.fmt_str = crate::web32::w32_fmt_str as *const () as usize as u64;
+            u.rt.str_eq = crate::web32::w32_str_eq as *const () as usize as u64;
+            u.rt.thread_run = crate::web32::w32_thread_run as *const () as usize as u64;
+            u.rt.catch_panic = crate::web32::w32_catch_panic as *const () as usize as u64;
+            u.rt.args = crate::web32::w32_args as *const () as usize as u64;
+            u.rt.memcpy = crate::web32::w32_memcpy as *const () as usize as u64;
+            u.rt.memmove = crate::web32::w32_memmove as *const () as usize as u64;
+            u.rt.memset = crate::web32::w32_memset as *const () as usize as u64;
+            u.rt.fmt_pop = crate::web32::w32_fmt_pop as *const () as usize as u64;
+            u.rt.panic_impl = u.emit_code(&panic_tramp(crate::web32::w32_panic_impl as *const () as usize as u64));
+        }
         u.env.resume = u.rt.resume;
         if os::fault::NEEDS_HANG_TRAMP {
             HANG_TRAMP.store(u.emit_code(&relax_backend::x64::hang_tramp(rt_hang as *const () as usize as u64)), Ordering::Relaxed);
@@ -2648,6 +2683,14 @@ impl Unit {
             rethrow: u.syms.intern(crate::syms::SymKind::Rt("rethrow"), u.rt.rethrow),
         };
         relax_codegen::opt::set_mem_fns(u.rs.memcpy, u.rs.memmove);
+        if w32 {
+            // the shadow stacks' thread-local words, and the code transform (relax_codegen::web32)
+            let off = u.tls_alloc(16, 8);
+            crate::web32::set_ss_off(off);
+            let ss = u.syms.intern(crate::syms::SymKind::Rt("w32_ss"), off as u64);
+            let grow = u.syms.intern(crate::syms::SymKind::Rt("w32_stack"), crate::web32::rt_w32_stack as *const () as usize as u64);
+            relax_codegen::web32::configure(relax_codegen::web32::Cfg { syms: u.syms.vals, base: crate::web32::BASE, ss, grow });
+        }
         // runtime symbols lowering interns on first use: a cached entry may name them before any
         // function of this run was lowered (the cache links them by name)
         let _ = u.syms.intern(crate::syms::SymKind::Rt("divrem128"), crate::lower::divrem128_addr());
@@ -2840,6 +2883,15 @@ impl Unit {
         // filled whole right away (the startup image's code)
         os::mem::prefault(at, len as usize);
         at
+    }
+
+    /// `len` bytes of code memory (global_asm.rs places a block whose fields need its address
+    /// before it is written: write_reserved_code).
+    pub(crate) fn reserve_asm_code(&self, len: u64, align: u64) -> u64 {
+        bump(&self.code_next, len.max(1), align.max(16), self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory")
+    }
+    pub(crate) fn write_reserved_code(&self, at: u64, b: &[u8]) {
+        unsafe { os::mem::write_code(at, b) };
     }
 
     fn emit_code(&self, b: &[u8]) -> u64 {
@@ -3462,6 +3514,17 @@ impl Unit {
         None
     }
 
+    /// size_of::<usize>() of the program's target (4 on wasm32).
+    pub fn ptr_bytes(&self) -> u32 {
+        self.tcx.tys.ptr_bytes
+    }
+
+    /// A pointer or usize word as the program stores it: `ptr_bytes` little-endian bytes (an
+    /// address in the wasm32 window as its offset, its low 32 bits).
+    pub fn ptr_word(&self, v: u64) -> Vec<u8> {
+        if self.ptr_bytes() == 4 { (v as u32).to_le_bytes().to_vec() } else { v.to_le_bytes().to_vec() }
+    }
+
     /// vtable of `src` as `dy` (built once): [drop, size, align, methods...]
     pub fn vtable(&self, src: TyId, dy: TyId) -> Result<u64, String> {
         let src = self.tcx.tys.erase_regions(src);
@@ -3524,11 +3587,12 @@ impl Unit {
                 words.push(address); wsyms.push(Some(self.data_sym(address)));
             }
         }
-        let mut bytes = Vec::with_capacity(words.len() * 8);
+        let pb = self.ptr_bytes();
+        let mut bytes = Vec::with_capacity(words.len() * pb as usize);
         for w in &words {
-            bytes.extend_from_slice(&w.to_le_bytes());
+            bytes.extend_from_slice(&self.ptr_word(*w));
         }
-        let a = self.data(&bytes, 8, crate::syms::DataKind::Words(wsyms));
+        let a = self.data(&bytes, pb as u64, crate::syms::DataKind::Words(wsyms));
         self.syms.set_data_name(a, format!("vtable:{}:{}", crate::syms::stable_ty(self, src), crate::syms::stable_ty(self, dy)));
         // a racing builder of the same vtable: everyone uses the first (one symbol per vtable)
         let a = self.vtables.insert_first((src, dy), a);
@@ -3657,19 +3721,36 @@ impl Unit {
         } else if let Some(id) = self.fn_map.get(&key) {
             return id;
         }
-        let _g = self.fn_create.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(id) = self.fn_map.get(&key) {
-            return id;
-        }
+        // fn_create is a leaf lock: nothing under it waits for a query, the owner or a pump
+        // (owner::Leaf). The slot's name is made before it, its ahead work queued after it
+        // (is_cold_def reads the signature: a query).
+        let name = {
+            let _k = crate::zone_alloc::kept();
+            fn_name(self, &key)
+        };
+        let id = {
+            let _g = self.fn_create.lock().unwrap_or_else(|e| e.into_inner());
+            let _leaf = crate::owner::Leaf::enter();
+            if let Some(id) = self.fn_map.get(&key) {
+                return id;
+            }
+            self.fn_create_locked(&key, name)
+        };
+        self.slot_ahead(id, &key);
+        id
+    }
+
+    /// fn_id's new slot `id` for `key` (the caller holds fn_create).
+    fn fn_create_locked(&self, key: &FnKey, name: String) -> u32 {
         let id = self.fns.len() as u32;
         self.ensure_slots(id, 1);
         // identity state: the slot's key and name (and the map's copy of the key) are the
         // program's, not the compiler arena's
-        let (entry_key, map_key, name) = {
+        let (entry_key, map_key) = {
             let _k = crate::zone_alloc::kept();
-            (key.clone(), key.clone(), fn_name(self, &key))
+            (key.clone(), key.clone())
         };
-        let file = self.key_file(&key);
+        let file = self.key_file(key);
         let stub_addr = self.slots.stub(id);
         let stub = x64::stub(id, self.lazy_entry);
         let slot_addr = self.slots.table(id);
@@ -3682,10 +3763,10 @@ impl Unit {
             }
             *(slot_addr as *mut u64) = stub_addr;
         }
-        self.slot_named(id, &key);
+        self.slot_named(id, key);
         self.fns.push(Self::new_entry(entry_key, name, file, stub_addr, stub.len() as u32));
         if let Some(index) = self.reload_slots.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            index.insert(&key, id);
+            index.insert(key, id);
         }
         self.fn_map.insert(map_key, id);
         id
@@ -3762,6 +3843,11 @@ impl Unit {
             }
         }
         self.front.slot_keys.insert(id, key.clone());
+    }
+
+    /// Slot `id` (named `key`, pushed) goes to the lowering-ahead helpers' queue. Not under
+    /// fn_create: is_cold_def reads the signature (a query, which may wait).
+    fn slot_ahead(&self, id: u32, key: &FnKey) {
         // after the first present only the slots the program's own builds make (their callees),
         // not a speculative or tier-up build's, and no cold callee (panics, formatting): what
         // the UI thread's next calls most likely meet
@@ -3798,13 +3884,21 @@ impl Unit {
                 continue;
             }
             let count = relax_backend::rir::SlotTable::seg_slots(seg);
-            // the thunks are in the unit's code area, so calls reach them with a direct branch
-            // and their heads reach the code (calls.DESIGN.md); the lazy stubs, table words and
-            // tier records are a reservation of their own
-            let thunk = bump(&self.code_next, (count * THUNK_SIZE) as u64, 1 << 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
-            let code = count * STUB_SIZE;
-            let stub = os::mem::reserve(code, count * (8 + TIER_REC));
-            let table = stub + code as u64;
+            let (thunk, stub, table) = if self.prog.ptr_bytes == 4 {
+                // the 32-bit web target: thunks are what function pointers name, so thunks, stubs,
+                // table words and tier records all live in the program's 4 GB window
+                let code = count * (THUNK_SIZE + STUB_SIZE);
+                let base = crate::web32::reserve_slots(code, count * (8 + TIER_REC));
+                (base, base + (count * THUNK_SIZE) as u64, base + code as u64)
+            } else {
+                // the thunks are in the unit's code area, so calls reach them with a direct branch
+                // and their heads reach the code (calls.DESIGN.md); the lazy stubs, table words and
+                // tier records are a reservation of their own
+                let thunk = bump(&self.code_next, (count * THUNK_SIZE) as u64, 1 << 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+                let code = count * STUB_SIZE;
+                let stub = os::mem::reserve(code, count * (8 + TIER_REC));
+                (thunk, stub, stub + code as u64)
+            };
             let tier = table + (count * 8) as u64;
             self.slots.install(seg, thunk, stub, table, tier);
         }
@@ -3873,6 +3967,7 @@ impl Unit {
         let name = crate::zone_alloc::kept_with(|| fn_name(self, &key).into_boxed_str());
         let file = self.key_file(&key);
         self.slot_named(id, &key);
+        self.slot_ahead(id, &key);
         let f = &mut self.fns[id as usize];
         f.key = crate::zone_alloc::kept_clone(&key);
         f.name = name;
@@ -4095,6 +4190,9 @@ impl Unit {
         if let Some(a) = lookup_interposer(&link) {
             return Some(a);
         }
+        if let Some(&a) = self.global_asm.get().and_then(|m| m.get(&link)) {
+            return Some(a);
+        }
         if let Some(a) = loader_symbol(link.as_bytes()) {
             return Some(a as u64);
         }
@@ -4110,9 +4208,23 @@ impl Unit {
     /// on a miss).
     pub fn foreign_addr(&self, d: DefId) -> Option<u64> {
         let link = self.link_name(d);
+        // the wasm32 web target imports only what web32.rs gives in the offset ABI; anything
+        // else is missing there, as in a browser
+        if self.prog.ptr_bytes == 4 {
+            if let Some(a) = crate::web32::symbol(link.as_bytes()) {
+                return Some(a as u64);
+            }
+            return (self.prog.def(d).kind == DefKind::ForeignFn).then(|| self.missing_foreign_stub(d));
+        }
         // dlsym / GetProcAddress answer the symbols the loader provides to programs (loader_symbol) first
         if let Some(a) = lookup_interposer(&link) {
             return Some(a);
+        }
+        // the program's own global_asm! labels
+        if !self.prog.global_asms.is_empty() {
+            if let Some(&a) = crate::global_asm::symbols(self).get(&link) {
+                return Some(a);
+            }
         }
         if let Some(a) = loader_symbol(link.as_bytes()) {
             return Some(a as u64);
@@ -8785,7 +8897,7 @@ unsafe fn build_rir_inner_body(up: *mut Unit, id: u32) -> Result<relax_backend::
                 let value = v.try_to_value(&u.tcx.tys).ok_or("intrinsic const argument did not evaluate")?;
                 let scalar = value.valtree.try_to_leaf().ok_or("intrinsic const argument is not scalar")?;
                 let (size, signed) = match u.tcx.tys.kind(value.ty) {
-                    TyKind::Int(p) => crate::types::Types::int_info(*p),
+                    TyKind::Int(p) => u.tcx.tys.int_info(*p),
                     TyKind::Bool => (1, false),
                     TyKind::Char => (4, false),
                     _ => return Err("intrinsic const argument has a non-scalar type".into()),
@@ -8978,6 +9090,7 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
         key
     };
     if matches!(key, FnKey::Glue(GLUE_UNNAMED, _)) {
+        crate::cache::image_broken_unit(up, id);
         return Err(format!("slot {} of the startup image has no identity (its key did not decode)", id));
     }
     if let FnKey::Shim(ref shim) = key {
@@ -9324,7 +9437,7 @@ fn t1_quick_ra(options: &crate::options::Options) -> bool {
     options.t1_quick_ra
 }
 
-fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, candidates: &[u32], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>) -> Vec<(u32, usize)> {
+fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, snap: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, hot: bool) -> Vec<(u32, usize)> {
     let _cost_opt = relax_codegen::fncost::phase(4);
     relax_codegen::fncost::size(true, func);
     func.baseline = false;
@@ -9336,37 +9449,65 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
             relax_backend::passes::set_sroa_nocapture(None);
         }
     }
+    // what a bottom-up preparation reads (InlineBodies::prepare): recorded while one runs
+    let reads: std::cell::RefCell<Vec<PrepReads>> = std::cell::RefCell::new(Vec::new());
     let _guard = NocapGuard;
     {
-        // SAFETY: the oracle borrows `get` only while this function runs: the guard removes it
+        // SAFETY: the oracle borrows `get` and `reads` only while this function runs: the guard removes it
         // before `get` goes out of scope, also when the optimiser panics
         let get_static: &'static dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)> = unsafe { std::mem::transmute(get) };
         // callees' params, depth-limited (a Vec's push -> reserve -> grow -> realloc chain);
-        // false while a query is in progress (recursion), memoised per (callee, param)
-        fn nocap(get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, memo: &std::cell::RefCell<HashMap<(u32, usize), Option<bool>>>, cid: u32, k: usize, depth: u32) -> bool {
-            if let Some(r) = memo.borrow().get(&(cid, k)) {
-                return r.unwrap_or(false);
-            }
+        // false for a query already in progress (recursion). Memoised per (callee, param, depth)
+        // only when no answer below came from an in-progress query, so every answer is the one a
+        // fresh query gives, whatever was asked before; each answer keeps the slots it read, which
+        // a bottom-up preparation's read set takes in (PrepShared). Returns (answer, depended on an
+        // in-progress query); `out` gets the slots read.
+        type NocapMemo = std::cell::RefCell<HashMap<(u32, usize, u32), Option<(bool, Vec<u32>)>>>;
+        fn nocap(get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, memo: &NocapMemo, cid: u32, k: usize, depth: u32, out: &mut Vec<u32>) -> (bool, bool) {
             if depth == 0 {
-                return false;
+                return (false, false);
             }
-            let Some((fp, _)) = get(cid) else { return false };
-            memo.borrow_mut().insert((cid, k), None);
+            match memo.borrow().get(&(cid, k, depth)) {
+                Some(Some((r, reads))) => { out.extend_from_slice(reads); return (*r, false); }
+                Some(None) => return (false, true),
+                None => {}
+            }
+            let mut reads = vec![cid];
+            let Some((fp, _)) = get(cid) else { out.push(cid); return (false, false) };
+            memo.borrow_mut().insert((cid, k, depth), None);
             let f2 = unsafe { &*fp };
+            let tainted = std::cell::Cell::new(false);
+            let sub_reads = std::cell::RefCell::new(Vec::new());
             let sub = |c2: &relax_backend::rir::Callee, k2: usize| -> bool {
                 match c2 {
-                    relax_backend::rir::Callee::Fn(i2) => nocap(get, memo, *i2, k2, depth - 1),
+                    relax_backend::rir::Callee::Fn(i2) => {
+                        let (r, t) = nocap(get, memo, *i2, k2, depth - 1, &mut sub_reads.borrow_mut());
+                        if t { tainted.set(true); }
+                        r
+                    }
                     _ => false,
                 }
             };
             let r = relax_codegen::opt::param_nocapture(f2, k, &sub);
-            memo.borrow_mut().insert((cid, k), Some(r));
-            r
+            reads.extend(sub_reads.into_inner());
+            reads.sort_unstable();
+            reads.dedup();
+            out.extend_from_slice(&reads);
+            if tainted.get() {
+                memo.borrow_mut().remove(&(cid, k, depth));
+            } else {
+                memo.borrow_mut().insert((cid, k, depth), Some((r, reads)));
+            }
+            (r, tainted.get())
         }
-        let memo: std::cell::RefCell<HashMap<(u32, usize), Option<bool>>> = std::cell::RefCell::new(HashMap::new());
+        let memo: NocapMemo = std::cell::RefCell::new(HashMap::new());
+        let reads_static: &'static std::cell::RefCell<Vec<PrepReads>> = unsafe { std::mem::transmute(&reads) };
         relax_backend::passes::set_sroa_nocapture(Some(Box::new(move |c: &relax_backend::rir::Callee, k: usize| -> bool {
             let relax_backend::rir::Callee::Fn(cid) = c else { return false };
-            nocap(get_static, &memo, *cid, k, 4)
+            let mut rd = Vec::new();
+            let r = nocap(get_static, &memo, *cid, k, 4, &mut rd).0;
+            if let Some(rec) = reads_static.borrow_mut().last_mut() { rec.bodies.extend(rd); }
+            r
         })));
     }
     static INLINE_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -9374,12 +9515,25 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     let mut inline_stats = (*INLINE_STATS.get_or_init(|| std::env::var("MAKEPAD_RUN_INLINE_STATS").map_or(false, |v| v == "1" || v == "prep"))).then(relax_codegen::opt::InlineStats::default);
     // Bottom-up, as LLVM's CGSCC inliner: every callee in the snapshot is simplified first, its
     // own inlining included; a site takes that body when its optimised form passes the rules and
-    // fits, else the snapshot body (top-down, as before). A pure function of the snapshot, so
-    // replay stays exact. MAKEPAD_RUN_OPT=-bottomup: top-down only (bisection).
-    let bodies = InlineBodies::prepare(options, id, candidates, get, single, ro, cfg, nounwind);
-    let prepared = |c: u32| bodies.prepared(c);
-    let mut inlined = tier1_simplify(options, func, id, name, get, &prepared, single, ro, cfg, nounwind, frequencies, inline_stats.as_mut(), None);
+    // fits, else the snapshot body (top-down). A pure function of the snapshot, so replay stays
+    // exact.
+    let get_rec = |c: u32| {
+        if let Some(r) = reads.borrow_mut().last_mut() { r.bodies.push(c); }
+        get(c)
+    };
+    let bodies = InlineBodies::new(options, id, snap, &get_rec, &reads, single, ro, cfg, nounwind);
+    let prep_ns = std::cell::Cell::new(0u64);
+    let prepared = |c: u32| {
+        if !cfg.inline { return None; }
+        let tp = cpu_ns();
+        let r = bodies.prepared(c);
+        prep_ns.set(prep_ns.get() + cpu_ns() - tp);
+        r
+    };
+    let mut inlined = tier1_simplify(options, func, id, name, get, &prepared, single, ro, cfg, nounwind, frequencies, inline_stats.as_mut(), None, None, hot);
     bodies.expand(&mut inlined);
+    TIER1_PREP[0].fetch_add(prep_ns.get(), Ordering::Relaxed);
+    TIER1_PREP[2].fetch_add(bodies.index.borrow().values().filter(|b| b.is_some()).count() as u64, Ordering::Relaxed);
     // array iterators (a slot read at runtime offsets): their scalar fields in registers, so
     // the iteration counter can drive full unrolling below
     if cfg.fold && cfg.sroa && relax_codegen::opt::promote_dyn_read_slots(func) {
@@ -9465,6 +9619,10 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
             relax_backend::passes::local_copy_prop(func);
             relax_backend::passes::dce(func);
         }
+        // accesses through a constant offset of a base that is still live read the base
+        if relax_codegen::opt::fold_offset_bases(options, func) {
+            relax_backend::passes::dce(func);
+        }
         // reads of a temporary a variable was copied from read the variable: one register
         relax_codegen::opt::reuse_copied_variables(options, func);
     }
@@ -9482,38 +9640,129 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
 /// filter: the second simplify left a rotated loop that fold_post_increments and the stream
 /// vectoriser do not match; 1.79x). Members of one component see each other's snapshot bodies.
 /// Everything here is a function of the snapshot alone (frequencies are structural), so replay
-/// stays exact.
-struct InlineBodies {
-    index: HashMap<u32, usize>,
-    /// (the inlined body: the first inlining round's output, unoptimised; the optimised body
-    /// that prices its sites; every slot whose body the inlined one took, transitively)
-    bodies: Vec<(Box<relax_backend::rir::Func>, Box<relax_backend::rir::Func>, Vec<u32>)>,
+/// stays exact, and the O3 builds of one run share a callee's preparation while its inputs are
+/// the same (`PREP_SHARED`).
+struct InlineBodies<'a> {
+    options: &'a crate::options::Options,
+    root: u32,
+    get: &'a dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>,
+    reads: &'a std::cell::RefCell<Vec<PrepReads>>,
+    single: &'a dyn Fn(u32, u32) -> bool,
+    ro: Option<relax_backend::passes::RoReader>,
+    cfg: &'a relax_codegen::opt::OptCfg,
+    nounwind: &'a dyn Fn(u32) -> bool,
+    /// snapshot slot -> (its component in the call graph outside cold blocks, it calls a snapshot body)
+    node: HashMap<u32, (usize, bool)>,
+    arc_of: HashMap<u32, &'a std::sync::Arc<relax_backend::rir::Func>>,
+    /// the preparations made or taken so far (None: none for that slot)
+    index: std::cell::RefCell<HashMap<u32, Option<std::sync::Arc<Prepared>>>>,
 }
 
-impl InlineBodies {
-    fn prepare(options: &crate::options::Options, root: u32, candidates: &[u32], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool) -> Self {
-        use relax_backend::rir::{Callee, Inst, Term};
-        let mut out = InlineBodies { index: HashMap::new(), bodies: Vec::new() };
-        if !cfg.inline || relax_backend::stats::opt_off(options, "-bottomup") {
-            return out;
-        }
-        // nodes: the candidates, deduplicated in snapshot order (the lookup takes the first)
-        let mut ids: Vec<u32> = Vec::new();
-        let mut node: HashMap<u32, usize> = HashMap::new();
-        for &c in candidates {
-            if c != root && get(c).is_some() && !node.contains_key(&c) {
-                node.insert(c, ids.len());
-                ids.push(c);
+/// One callee prepared bottom-up.
+struct Prepared {
+    /// the first inlining round's output, unoptimised: what a site inlines
+    raw: relax_backend::rir::Func,
+    /// the optimised body: what prices the site
+    priced: relax_backend::rir::Func,
+    /// every slot whose body `raw` took, transitively
+    deps: Vec<u32>,
+}
+
+/// What one bottom-up preparation read: snapshot bodies (and absent slots) by slot, through the
+/// inliner, its chain and size queries, nounwind and the nocapture oracle; other callees'
+/// preparations; single-caller facts.
+#[derive(Default)]
+struct PrepReads {
+    bodies: Vec<u32>,
+    prepared: Vec<(u32, usize)>,
+    singles: Vec<(u32, u32, bool)>,
+}
+
+/// A callee's preparation, kept for the next O3 build of this run whose snapshot gives the same
+/// answers to everything it read (LLVM processes a callee once, bottom-up over the whole program;
+/// O3 builds see per-caller snapshots, so a callee's preparation is shared when its reads agree).
+/// Bodies are named by address, preparations by the address of their `Prepared`: `_pins` keep
+/// those allocations, so no other body or preparation can take an address while the entry lives.
+struct PrepShared {
+    /// (slot, body address or 0 when absent, attributes)
+    bodies: Vec<(u32, usize, u8)>,
+    /// (slot, its preparation's address or 0 when it had none)
+    prepared: Vec<(u32, usize)>,
+    singles: Vec<(u32, u32, bool)>,
+    _pins: (Vec<std::sync::Weak<relax_backend::rir::Func>>, Vec<std::sync::Weak<Prepared>>),
+    /// None: its first round inlined nothing (its callers take the snapshot body)
+    body: Option<std::sync::Arc<Prepared>>,
+    /// the nounwind answers the preparation consulted: asked again when the entry is taken, so
+    /// the build's recorded nounwind inputs are the ones a fresh preparation records
+    nounwind: Vec<u32>,
+}
+
+/// Preparations kept per slot (callers whose snapshots differ below it)
+const PREP_SHARED_PER_SLOT: usize = 4;
+
+static PREP_SHARED: std::sync::LazyLock<relax_session::sync::Mutex<HashMap<u32, Vec<std::sync::Arc<PrepShared>>>>> = std::sync::LazyLock::new(|| relax_session::sync::Mutex::new(HashMap::new()));
+
+/// Strongly connected components of a graph (Tarjan, iterative): callees first.
+fn sccs(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let n = edges.len();
+    let (mut index, mut low, mut on) = (vec![usize::MAX; n], vec![0; n], vec![false; n]);
+    let (mut stack, mut out, mut next): (Vec<usize>, Vec<Vec<usize>>, usize) = (Vec::new(), Vec::new(), 0);
+    for s in 0..n {
+        if index[s] != usize::MAX { continue; }
+        let mut work: Vec<(usize, usize)> = vec![(s, 0)];
+        index[s] = next; low[s] = next; next += 1; stack.push(s); on[s] = true;
+        while let Some(&mut (v, ref mut ei)) = work.last_mut() {
+            if *ei < edges[v].len() {
+                let w = edges[v][*ei];
+                *ei += 1;
+                if index[w] == usize::MAX {
+                    index[w] = next; low[w] = next; next += 1; stack.push(w); on[w] = true;
+                    work.push((w, 0));
+                } else if on[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+            } else {
+                work.pop();
+                if let Some(&(p, _)) = work.last() { low[p] = low[p].min(low[v]); }
+                if low[v] == index[v] {
+                    let mut scc = Vec::new();
+                    loop {
+                        let w = stack.pop().unwrap();
+                        on[w] = false;
+                        scc.push(w);
+                        if w == v { break; }
+                    }
+                    out.push(scc);
+                }
             }
         }
-        let body = |k: usize| unsafe { &*get(ids[k]).unwrap().0 };
-        let edges: Vec<Vec<usize>> = (0..ids.len()).map(|k| {
+    }
+    out
+}
+
+impl<'a> InlineBodies<'a> {
+    /// The call graph of the snapshot; nothing is prepared yet (`prepared` prepares on demand).
+    fn new(options: &'a crate::options::Options, root: u32, snap: &'a [(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], get: &'a dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, reads: &'a std::cell::RefCell<Vec<PrepReads>>, single: &'a dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &'a relax_codegen::opt::OptCfg, nounwind: &'a dyn Fn(u32) -> bool) -> Self {
+        use relax_backend::rir::{Callee, Inst, Term};
+        // nodes: the snapshot, deduplicated in order (the lookup takes the first)
+        let mut ids: Vec<u32> = Vec::new();
+        let mut at: HashMap<u32, usize> = HashMap::new();
+        let mut arc_of: HashMap<u32, &std::sync::Arc<relax_backend::rir::Func>> = HashMap::new();
+        for (c, body, _) in snap {
+            arc_of.entry(*c).or_insert(body);
+            if *c != root && !at.contains_key(c) {
+                at.insert(*c, ids.len());
+                ids.push(*c);
+            }
+        }
+        // the calls a preparation inlines (outside cold blocks)
+        let edges: Vec<Vec<usize>> = ids.iter().enumerate().map(|(k, &c)| {
             let mut e = Vec::new();
-            for b in &body(k).blocks {
+            for b in &unsafe { &*get(c).unwrap().0 }.blocks {
                 if matches!(b.term, Term::Unreachable | Term::Resume) { continue; }
                 for i in &b.insts {
-                    if let Inst::Call(Callee::Fn(c), _, _) | Inst::FnAddr(_, c) = i {
-                        if let Some(&n) = node.get(c) {
+                    if let Inst::Call(Callee::Fn(x), _, _) | Inst::FnAddr(_, x) = i {
+                        if let Some(&n) = at.get(x) {
                             if n != k && !e.contains(&n) { e.push(n); }
                         }
                     }
@@ -9521,76 +9770,135 @@ impl InlineBodies {
             }
             e
         }).collect();
-        // Tarjan (iterative): components come out callees first
-        let n = ids.len();
-        let (mut index, mut low, mut on) = (vec![usize::MAX; n], vec![0; n], vec![false; n]);
-        let (mut stack, mut sccs, mut next): (Vec<usize>, Vec<Vec<usize>>, usize) = (Vec::new(), Vec::new(), 0);
-        for s in 0..n {
-            if index[s] != usize::MAX { continue; }
-            let mut work: Vec<(usize, usize)> = vec![(s, 0)];
-            index[s] = next; low[s] = next; next += 1; stack.push(s); on[s] = true;
-            while let Some(&mut (v, ref mut ei)) = work.last_mut() {
-                if *ei < edges[v].len() {
-                    let w = edges[v][*ei];
-                    *ei += 1;
-                    if index[w] == usize::MAX {
-                        index[w] = next; low[w] = next; next += 1; stack.push(w); on[w] = true;
-                        work.push((w, 0));
-                    } else if on[w] {
-                        low[v] = low[v].min(index[w]);
-                    }
-                } else {
-                    work.pop();
-                    if let Some(&(p, _)) = work.last() { low[p] = low[p].min(low[v]); }
-                    if low[v] == index[v] {
-                        let mut scc = Vec::new();
-                        loop {
-                            let w = stack.pop().unwrap();
-                            on[w] = false;
-                            scc.push(w);
-                            if w == v { break; }
-                        }
-                        sccs.push(scc);
-                    }
-                }
-            }
+        let mut node = HashMap::new();
+        for (ci, comp) in sccs(&edges).iter().enumerate() {
+            for &k in comp { node.insert(ids[k], (ci, !edges[k].is_empty())); }
         }
-        // A body above the largest admission size never inlines into a caller (rules of
-        // site_rule): no preparation for it.
-        let max_insts = if relax_codegen::opt::single_on(options) { relax_codegen::opt::INLINE_SINGLE_INSTS } else { relax_codegen::opt::InlineLimits::tier1().always_insts };
-        let mut structural = |_: usize, f: &relax_backend::rir::Func| (!options.no_block_freq).then(|| inline_structural_freqs(f));
-        for scc in &sccs {
-            for &k in scc {
-                let (p, attrs) = get(ids[k]).unwrap();
-                let o1 = unsafe { &*p };
-                if attrs & relax_codegen::opt::ATTR_COLD != 0 || edges[k].is_empty() || relax_codegen::opt::inst_count(o1) > max_insts {
-                    continue;
-                }
-                let peers: &[usize] = scc;
-                let in_scc = |c: u32| node.get(&c).is_some_and(|m| peers.contains(m));
-                let sub_prepared = |c: u32| if in_scc(c) { None } else { out.prepared(c) };
-                let mut f = o1.clone();
-                f.baseline = false;
-                let mut raw = (relax_backend::rir::Func::new(String::new(), 0), Vec::new());
-                let mut stats = std::env::var("MAKEPAD_RUN_INLINE_STATS").is_ok_and(|v| v == "prep").then(relax_codegen::opt::InlineStats::default);
-                tier1_simplify(options, &mut f, ids[k], &o1.name, get, &sub_prepared, single, ro, cfg, nounwind, &mut structural, stats.as_mut(), Some(&mut raw));
-                if let Some(st) = stats { st.report(&format!("prep:{} (root {})", o1.name, root)); }
-                let (raw, mut taken) = raw;
-                if taken.is_empty() {
-                    continue;
-                }
-                out.expand(&mut taken);
-                let deps: Vec<u32> = taken.into_iter().map(|x| x.0).collect();
-                out.index.insert(ids[k], out.bodies.len());
-                out.bodies.push((Box::new(raw), Box::new(f), deps));
-            }
-        }
-        out
+        InlineBodies { options, root, get, reads, single, ro, cfg, nounwind, node, arc_of, index: Default::default() }
     }
 
-    /// (the body to inline, the body that prices it)
+    /// (the body to inline, the body that prices it): `c` prepared bottom-up on its first
+    /// request; members of one component see each other's snapshot bodies.
     fn prepared(&self, c: u32) -> Option<(*const relax_backend::rir::Func, *const relax_backend::rir::Func)> {
-        self.index.get(&c).map(|&k| (&*self.bodies[k].0 as *const relax_backend::rir::Func, &*self.bodies[k].1 as *const relax_backend::rir::Func))
+        self.get_prepared(c).map(|b| (&b.raw as *const relax_backend::rir::Func, &b.priced as *const relax_backend::rir::Func))
+    }
+
+    fn get_prepared(&self, c: u32) -> Option<std::sync::Arc<Prepared>> {
+        if let Some(r) = self.index.borrow().get(&c) {
+            return r.clone();
+        }
+        let r = ensure_sufficient_stack(|| self.prepare_one(c));
+        self.index.borrow_mut().insert(c, r.clone());
+        r
+    }
+
+    fn prepare_one(&self, c: u32) -> Option<std::sync::Arc<Prepared>> {
+        let (options, get, single, nounwind) = (self.options, self.get, self.single, self.nounwind);
+        let &(comp, calls) = self.node.get(&c)?;
+        let (p, attrs) = get(c)?;
+        let o1 = unsafe { &*p };
+        // a body above the largest size any rule admits (site_rule) is not prepared (one that
+        // optimises down into its own rules' range still is: piano_render, brotli_decode)
+        let max_insts = if relax_codegen::opt::single_on(options) { relax_codegen::opt::INLINE_SINGLE_INSTS } else { relax_codegen::opt::InlineLimits::tier1().always_insts };
+        if attrs & relax_codegen::opt::ATTR_COLD != 0 || !calls || relax_codegen::opt::inst_count(o1) > max_insts {
+            return None;
+        }
+        let sub = |x: u32| if self.node.get(&x).is_some_and(|n| n.0 == comp) { None } else { self.get_prepared(x) };
+        let addr = |b: &Option<std::sync::Arc<Prepared>>| b.as_ref().map_or(0, |b| std::sync::Arc::as_ptr(b) as usize);
+        // a preparation of this slot whose reads this snapshot answers the same way
+        let agrees = |e: &PrepShared| {
+            e.bodies.iter().all(|&(x, a, at)| get(x).map_or(a == 0, |(q, qa)| q as usize == a && qa == at))
+                && e.prepared.iter().all(|&(x, a)| addr(&sub(x)) == a)
+                && e.singles.iter().all(|&(o, x, v)| single(o, x) == v)
+        };
+        let entries: Vec<std::sync::Arc<PrepShared>> = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner()).get(&c).cloned().unwrap_or_default();
+        let shared = entries.iter().find(|e| agrees(e)).cloned();
+        if !entries.is_empty() && shared.is_none() { TIER1_PREP[4].fetch_add(1, Ordering::Relaxed); }
+        let verify = shared.is_some() && std::env::var_os("MAKEPAD_RUN_PREP_VERIFY").is_some();
+        if let Some(e) = shared.as_ref().filter(|_| !verify) {
+            TIER1_PREP[3].fetch_add(1, Ordering::Relaxed);
+            for &x in &e.nounwind { nounwind(x); }
+            return e.body.clone();
+        }
+        self.reads.borrow_mut().push(PrepReads { bodies: vec![c], ..Default::default() });
+        let sub_prepared = |x: u32| {
+            let b = sub(x);
+            if let Some(r) = self.reads.borrow_mut().last_mut() { r.prepared.push((x, addr(&b))); }
+            b.map(|b| (&b.raw as *const relax_backend::rir::Func, &b.priced as *const relax_backend::rir::Func))
+        };
+        let single_rec = |o: u32, x: u32| {
+            let v = single(o, x);
+            if let Some(r) = self.reads.borrow_mut().last_mut() { r.singles.push((o, x, v)); }
+            v
+        };
+        let asked = std::cell::RefCell::new(Vec::new());
+        let recording = |x: u32| {
+            let mut a = asked.borrow_mut();
+            if !a.contains(&x) { a.push(x); }
+            drop(a);
+            if let Some(r) = self.reads.borrow_mut().last_mut() { r.bodies.push(x); }
+            nounwind(x)
+        };
+        let mut f = o1.clone();
+        f.baseline = false;
+        let mut raw = (relax_backend::rir::Func::new(String::new(), 0), Vec::new());
+        let mut stats = std::env::var("MAKEPAD_RUN_INLINE_STATS").is_ok_and(|v| v == "prep").then(relax_codegen::opt::InlineStats::default);
+        let mut structural = |_: usize, f: &relax_backend::rir::Func| (!options.no_block_freq).then(|| inline_structural_freqs(f));
+        // a preparation only serves while its priced body stays admissible: it grows to the
+        // largest size its rules admit, not to a caller's growth room
+        let cap = relax_codegen::opt::max_admitted_insts(options, attrs);
+        tier1_simplify(options, &mut f, c, &o1.name, get, &sub_prepared, &single_rec, self.ro, self.cfg, &recording, &mut structural, stats.as_mut(), Some(&mut raw), Some(cap), false);
+        let rd = self.reads.borrow_mut().pop().unwrap();
+        TIER1_PREP[1].fetch_add(1, Ordering::Relaxed);
+        if let Some(st) = stats { st.report(&format!("prep:{} (root {})", o1.name, self.root)); }
+        let (raw, mut taken) = raw;
+        // shared preparations outlive this build: they live in the compiler arena (the
+        // generation the snapshot bodies are in; a zone swap takes them with it), not in the
+        // build's scratch
+        let prepared = (!taken.is_empty()).then(|| {
+            self.expand(&mut taken);
+            let deps: Vec<u32> = taken.into_iter().map(|x| x.0).collect();
+            crate::zone_alloc::outside_scratch(|| std::sync::Arc::new(Prepared { raw: raw.clone(), priced: f.clone(), deps: deps.clone() }))
+        });
+        let mut slots = rd.bodies;
+        slots.sort_unstable();
+        slots.dedup();
+        let mut pins = (Vec::new(), Vec::new());
+        let bodies: Vec<(u32, usize, u8)> = slots.iter().map(|&x| match get(x) {
+            Some((q, at)) => {
+                if let Some(a) = self.arc_of.get(&x) { pins.0.push(std::sync::Arc::downgrade(a)); }
+                (x, q as usize, at)
+            }
+            None => (x, 0, 0),
+        }).collect();
+        let mut prepared_reads = rd.prepared;
+        prepared_reads.sort_unstable();
+        prepared_reads.dedup();
+        for &(x, _) in &prepared_reads {
+            if let Some(b) = sub(x) { pins.1.push(std::sync::Arc::downgrade(&b)); }
+        }
+        let mut singles = rd.singles;
+        singles.sort_unstable();
+        singles.dedup();
+        let asked = asked.into_inner();
+        if let Some(old) = shared.filter(|_| verify) {
+            // MAKEPAD_RUN_PREP_VERIFY=1: a shared preparation is made again and compared
+            let h = |b: &Option<std::sync::Arc<Prepared>>| b.as_ref().map(|b| (t1_norm_hash(&b.raw), t1_norm_hash(&b.priced), b.deps.clone()));
+            if h(&old.body) != h(&prepared) || old.nounwind != asked {
+                eprintln!("PREP-VERIFY mismatch {} (root {}): reads {} / {}, nounwind {} / {}", o1.name, self.root, old.bodies.len(), bodies.len(), old.nounwind.len(), asked.len());
+            } else {
+                TIER1_PREP[3].fetch_add(1, Ordering::Relaxed);
+            }
+            return prepared;
+        }
+        crate::zone_alloc::outside_scratch(|| {
+            let e = std::sync::Arc::new(PrepShared { bodies: bodies.clone(), prepared: prepared_reads.clone(), singles: singles.clone(), _pins: (pins.0.clone(), pins.1.clone()), body: prepared.clone(), nounwind: asked.clone() });
+            let mut g = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner());
+            let v = g.entry(c).or_default();
+            if v.len() >= PREP_SHARED_PER_SLOT { v.remove(0); }
+            v.push(e);
+        });
+        prepared
     }
 
     /// Adds the bodies the inlined prepared callees took (hot reload and the cache's
@@ -9600,8 +9908,9 @@ impl InlineBodies {
         let mut k = 0;
         while k < inlined.len() {
             let (c, rule) = inlined[k];
-            if let Some(&b) = self.index.get(&c) {
-                for &d in &self.bodies[b].2 {
+            let b = self.index.borrow().get(&c).cloned().flatten();
+            if let Some(b) = b {
+                for &d in &b.deps {
                     if !inlined.iter().any(|x| x.0 == d) { inlined.push((d, rule)); }
                 }
             }
@@ -9614,8 +9923,11 @@ impl InlineBodies {
 /// slot cleanup): what a caller's build inlines when it takes this function bottom-up.
 /// `inlined_only`: receives the body after the first inlining round, before any optimisation,
 /// with the callees that round inlined.
-fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, prepared: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, *const relax_backend::rir::Func)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, mut inline_stats: Option<&mut relax_codegen::opt::InlineStats>, inlined_only: Option<&mut (relax_backend::rir::Func, Vec<(u32, usize)>)>) -> Vec<(u32, usize)> {
-    let mut limits = relax_codegen::opt::InlineLimits::tier1_for(func);
+fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, prepared: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, *const relax_backend::rir::Func)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, mut inline_stats: Option<&mut relax_codegen::opt::InlineStats>, inlined_only: Option<&mut (relax_backend::rir::Func, Vec<(u32, usize)>)>, growth_cap: Option<usize>, hot: bool) -> Vec<(u32, usize)> {
+    let mut limits = relax_codegen::opt::InlineLimits::tier1_for(func, hot);
+    if let (Some(cap), Some(g)) = (growth_cap, limits.growth_limit.as_mut()) {
+        *g = (*g).min(cap.max(relax_codegen::opt::inst_count(func)));
+    }
     let mut inlined: Vec<(u32, usize)> = Vec::new();
     if cfg.inline {
         let ti = relax_backend::stats::pass_clock();
@@ -11250,6 +11562,8 @@ struct T1Entry {
     freq: Option<Vec<f32>>,
     // Frequencies before each inlining round; backend frequencies describe a later RIR.
     inline_freq: Option<[Option<Vec<f32>>; 2]>,
+    /// the sampler found the function hot (its O3 build gets the large growth room)
+    hot: bool,
     input: u64,
     code: u64,
 }
@@ -11276,7 +11590,7 @@ fn t1prof_on(options: &crate::options::Options) -> bool {
             Some(t) if !t.is_empty() => {
                 for l in t.lines() {
                     let x: Vec<&str> = l.split('\t').collect();
-                    if x.len() != 6 && x.len() != 8 && x.len() != 9 {
+                    if x.len() != 10 {
                         continue;
                     }
                     let list = |t: &str| -> Vec<String> { if t.is_empty() { Vec::new() } else { t.split('\u{1f}').map(|c| c.to_string()).collect() } };
@@ -11285,8 +11599,8 @@ fn t1prof_on(options: &crate::options::Options) -> bool {
                     let inline_freq = (x.len() >= 8).then(|| [parse_freq(x[6]), parse_freq(x[7])]);
                     // Append single-reference keys after both rounds; older profiles
                     // have no single-reference facts to replay.
-                    let single = x.get(8).map_or_else(Vec::new, |s| list(s));
-                    map.insert(x[0].to_string(), T1Entry { cold: list(x[1]), snap: list(x[2]), single, freq, inline_freq, input: u64::from_str_radix(x[4], 16).unwrap_or(0), code: u64::from_str_radix(x[5], 16).unwrap_or(0) });
+                    let single = list(x[8]);
+                    map.insert(x[0].to_string(), T1Entry { cold: list(x[1]), snap: list(x[2]), single, freq, inline_freq, hot: x[9] == "1", input: u64::from_str_radix(x[4], 16).unwrap_or(0), code: u64::from_str_radix(x[5], 16).unwrap_or(0) });
                 }
                 true
             }
@@ -11423,7 +11737,7 @@ fn t1prof_finish() {
             None => "-".to_string(),
         };
         let inline = e.inline_freq.as_ref().expect("recorded inlining frequencies");
-        out.push_str(&format!("{}\t{}\t{}\t{}\t{:016x}\t{:016x}\t{}\t{}\t{}\n", k, e.cold.join("\u{1f}"), e.snap.join("\u{1f}"), fmt_freq(&e.freq), e.input, e.code, fmt_freq(&inline[0]), fmt_freq(&inline[1]), e.single.join("\u{1f}")));
+        out.push_str(&format!("{}\t{}\t{}\t{}\t{:016x}\t{:016x}\t{}\t{}\t{}\t{}\n", k, e.cold.join("\u{1f}"), e.snap.join("\u{1f}"), fmt_freq(&e.freq), e.input, e.code, fmt_freq(&inline[0]), fmt_freq(&inline[1]), e.single.join("\u{1f}"), if e.hot { "1" } else { "0" }));
     }
     let _ = std::fs::write(&p.path, out);
     if !p.differ.is_empty() {
@@ -11895,6 +12209,15 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // One immutable sample input for register allocation. Both inlining rounds
     // use structural frequencies from their current CFG, independent of when
     // the sampler reaches this evidence threshold.
+    // hot: the sampler measured it (its frequencies are sampled); replay: as recorded
+    let hot_root = match t1key.as_ref().and_then(|k| {
+        let g = T1PROF.lock().unwrap();
+        let p = g.as_ref().unwrap();
+        if p.replay { p.map.get(k).map(|e| e.hot) } else { None }
+    }) {
+        Some(h) => h,
+        None => u.frequency_profiles.get(&id).is_some_and(|h| h.samples >= FREQUENCY_SAMPLES),
+    };
     let sampled_positions = if options.no_block_freq || t1prof_replay(options) { None } else {
         u.frequency_profiles.get(&id).filter(|h| h.samples >= FREQUENCY_SAMPLES)
             .map(|h| h.positions.clone())
@@ -11905,7 +12228,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             u.frequency_profiles.get(&id).map_or(0, |h| h.samples), name);
     }
     owner_ns.set(owner_ns.get() + cpu_ns() - s0);
-    Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, sampled_positions))
+    Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, sampled_positions, hot_root))
     });
     let more = std::mem::take(&mut *fronts.borrow_mut());
     if snapped.is_some() || gave_way.get() || more.is_empty() {
@@ -11949,7 +12272,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     }
     drop(front);
     let t1 = cpu_ns();
-    let Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, sampled_positions)) = snapped else {
+    let Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, sampled_positions, hot_root)) = snapped else {
         if gave_way.get() {
             tier_push(id, Q_RETIER, 0);
         }
@@ -11989,9 +12312,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             freq
         };
         let queries = crate::nounwind::QueryCx::new(&snap);
-        let candidates: Vec<u32> = snap.iter().map(|x| x.0).collect();
         let (optimized, inline_rules) = queries.optimize(id, func, &mut |func, nounwind| {
-            Ok(tier1_optimize(options, func, id, &name, &candidates, &get, &single, ro, &cfg, nounwind, &mut frequencies))
+            Ok(tier1_optimize(options, func, id, &name, &snap, &get, &single, ro, &cfg, nounwind, &mut frequencies, hot_root))
         })?;
         func = optimized;
         let mut inlined = Vec::with_capacity(inline_rules.len());
@@ -12028,7 +12350,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let mut profile_entry = None;
         if let Some(k) = &t1key {
             let bits = |f: &Option<Vec<f32>>| f.as_ref().map(|f| f.iter().map(|x| x.to_bits()).collect::<Vec<u32>>());
-            let input = t1_hash(&(t1_cold_keys.clone(), t1_snap_keys.clone(), t1_single_keys.clone(), bits(&freq), inline_freq.iter().map(bits).collect::<Vec<_>>()));
+            let input = t1_hash(&(t1_cold_keys.clone(), t1_snap_keys.clone(), t1_single_keys.clone(), bits(&freq), inline_freq.iter().map(bits).collect::<Vec<_>>(), hot_root));
             // the optimised RIR (normalised) and the code size: code bytes hold slot numbers that
             // differ between runs
             let code = t1_norm_hash(&func) ^ (c.text_len as u64).rotate_left(48);
@@ -12041,7 +12363,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 _ => {}
             }
             if !p.replay {
-                profile_entry = Some(T1Entry { cold: t1_cold_keys.clone(), snap: t1_snap_keys.clone(), single: t1_single_keys.clone(), freq: freq.clone(), inline_freq: Some(inline_freq.clone()), input, code });
+                profile_entry = Some(T1Entry { cold: t1_cold_keys.clone(), snap: t1_snap_keys.clone(), single: t1_single_keys.clone(), freq: freq.clone(), inline_freq: Some(inline_freq.clone()), hot: hot_root, input, code });
             }
         }
         note_frame(id, c.frame_size, slot_bytes(&func), true);
@@ -12256,6 +12578,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     }
                 }
                 u.stats.code_bytes += code.len() as u64;
+                u.stats.tier1_code_bytes += code.len() as u64;
                 u.stats.tier1_installed += 1;
                 TIER1_INSTALLS.fetch_add(1, Ordering::Relaxed);
                 crate::boot_stats::o3_installed(boot_arm(u, id), id);
@@ -13291,6 +13614,8 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
 /// O3 had to build a slot's RIR again (code linked from the disk cache has none):
 /// (count, wall ns)
 pub static TIER1_RIR_REBUILT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// O3 bottom-up preparation (InlineBodies::prepare): thread cpu ns, bodies simplified, bodies kept, shared preparations taken, simplified although the slot had shared ones (reads disagreed)
+pub static TIER1_PREP: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 /// O3 snapshots: inline candidates built on the owner (count, wall ns), and the candidates whose
 /// fronts the O3 thread ran off the owner first (count, cpu ns)
 pub static TIER1_SNAP_BUILT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -13765,7 +14090,7 @@ extern "C" fn recorded_exit(code: i32) -> ! {
 }
 
 /// Symbols the loader provides to the programs it runs (found through dlsym).
-fn loader_symbol(name: &[u8]) -> Option<usize> {
+pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
     match name {
         #[cfg(unix)]
         b"exit" => Some(recorded_exit as *const () as usize),
@@ -13774,8 +14099,10 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"relax_allocator_swap" => Some(relax_allocator_swap as *const () as usize),
         b"relax_first_present" => Some(relax_first_present as *const () as usize),
         b"relax_frame_done" => Some(crate::postframe::relax_frame_done as *const () as usize),
+        b"relax_zone_swaps" => Some(zone_swap::relax_zone_swaps as *const () as usize),
         b"relax_quit_requested" => Some(crate::run::relax_quit_requested as *const () as usize),
         b"relax_quit_started" => Some(crate::run::relax_quit_started as *const () as usize),
+        b"__relax_main_hosted" => Some(crate::run::relax_main_hosted as *const () as usize),
         b"__relax_guard_enter" => Some(__relax_guard_enter as *const () as usize),
         b"__relax_guard_leave" => Some(__relax_guard_leave as *const () as usize),
         // Relax's std reads virtual files (git runs) through these (vfs.rs)

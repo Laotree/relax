@@ -23,6 +23,11 @@ extern "C" {
     /// live patch (from the watcher thread).
     #[link_name = "__relax_on_patch"]
     pub safe fn on_patch(wake: extern "C" fn());
+    /// The runner hosts the process's main thread (`makepad run` of a HAL program: the provided
+    /// HAL's main loop runs there and `main` runs on a thread of its own). False under the bare
+    /// `relax` runner, where the program's own HAL runs its main loop as in its rustc build.
+    #[link_name = "__relax_main_hosted"]
+    pub safe fn main_hosted() -> bool;
 }
 
 extern "C" {

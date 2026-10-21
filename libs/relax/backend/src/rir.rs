@@ -710,6 +710,39 @@ pub enum Callee {
     CIndirect(VReg, Box<CSig>),
     /// direct call of a Relax `extern "C" fn` (function table slot)
     CFn(u32, Box<CSig>),
+    /// an inline assembly block (`asm!`; `--no-asm` blocks it): the call's arguments are its
+    /// inputs and its results its outputs, each in the block's register. Every pass sees it as a
+    /// call (side effects, memory, no motion); the register allocator keeps all other values out
+    /// of its registers over it (`AsmBlock::regs`); the backend emits the bytes in place.
+    Asm(Box<AsmBlock>),
+}
+
+/// The options of an inline assembly block (Reference [asm.options]) that the backend reads.
+pub const ASM_NORETURN: u32 = 1;
+pub const ASM_NOSTACK: u32 = 2;
+pub const ASM_NOMEM: u32 = 4;
+pub const ASM_READONLY: u32 = 8;
+pub const ASM_PURE: u32 = 16;
+pub const ASM_PRESERVES_FLAGS: u32 = 32;
+
+/// An `asm!` block assembled at lowering (`asm` module): its machine code, with its operands
+/// in fixed registers.
+#[derive(Clone, PartialEq, Debug)]
+pub struct AsmBlock {
+    pub code: Vec<u8>,
+    /// fields that hold a symbol's value: (offset in `code`, encoding, symbol)
+    pub fixups: Vec<(u32, crate::asm::FixKind, Sym)>,
+    /// the register of each input (the call's argument vregs, in order)
+    pub ins: Vec<crate::asm::PReg>,
+    /// the register of each output (the call's result vregs, in order)
+    pub outs: Vec<crate::asm::PReg>,
+    /// every register the block reads or may write (`PReg::bit`): inputs, outputs, discarded
+    /// outputs, clobbers. No other value is held in them over the block.
+    pub regs: u64,
+    /// the registers it may write: callee-saved ones among them are saved by the prologue
+    pub writes: u64,
+    /// ASM_* bits
+    pub opts: u32,
 }
 
 /// An aggregate passed or returned by value under the C ABI.
@@ -868,7 +901,7 @@ pub enum Inst {
     /// 16 bytes at [base + off] (no alignment needed)
     VLoad(VReg, VReg, i32),
     VStore(VReg, i32, VReg), // base, off, src
-    /// 16 bytes at [base + (idx << sh) + off] (sh <= 3; made by `passes::addr_modes` on x86-64)
+    /// 16 bytes at [base + (idx << sh) + off] (made by `passes::addr_modes`; sh <= 3, arm64 <= 4)
     VLoadX(VReg, VReg, VReg, u8, i32), // d, base, idx, sh, off
     VStoreX(VReg, VReg, u8, i32, VReg), // base, idx, sh, off, src
     /// d (I) = 1 if any lane of v is nonzero, else 0
@@ -1138,6 +1171,11 @@ pub struct Func {
     /// register allocation): code marked `// relax: hot`, whose first code is its only code
     /// until O3 replaces it
     pub full: bool,
+    /// by-pointer aggregate params (each also in `noalias`): the private copy of a by-value
+    /// argument that the callee owns (Relax ABI). Nobody reads it after the call returns or unwinds
+    /// out of it (the caller moved it; a cleanup that drops it runs in this function, behind an
+    /// Invoke), so a value promoted to a register needs no store before a plain call
+    pub owned: Vec<VReg>,
     /// values loaded from a field whose type cannot be null (references, Box, NonNull: the
     /// layout's niche excludes 0) -- the Load that defines each is non-null; other definitions
     /// of the same vreg prove nothing (fold_nonnull checks every definition)
@@ -1150,11 +1188,14 @@ pub struct Func {
     /// the trait-object types this body calls methods through (virtual calls, by type id): code
     /// that must run without lazy compiles (real-time threads) compiles their vtables' methods
     pub dyn_calls: Vec<u32>,
+    /// a `#[unsafe(naked)]` fn: its one block is its `naked_asm!` (a noreturn Callee::Asm) and
+    /// the backend emits no prologue, no epilogue, nothing but the block
+    pub naked: bool,
 }
 
 impl Func {
     pub fn new(name: String, file: u32) -> Func {
-        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, nonnull: Vec::new(), ranged: Vec::new(), dyn_calls: Vec::new() }
+        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, owned: Vec::new(), nonnull: Vec::new(), ranged: Vec::new(), dyn_calls: Vec::new(), naked: false }
     }
     pub fn vreg(&mut self, c: Cls) -> VReg {
         self.vregs.push(c);
@@ -1211,7 +1252,8 @@ impl Func {
 
     /// Structural verifier: every use has a class-correct vreg, every target exists.
     pub fn verify(&self) -> Result<(), String> {
-        if let Some(sig) = &self.cabi {
+        // a naked fn's body is its asm: it has no parameter vregs
+        if let Some(sig) = self.cabi.as_ref().filter(|_| !self.naked) {
             for p in &self.params {
                 if p.0 as usize >= self.vregs.len() {
                     return Err(format!("{}: param vreg out of range", self.name));
