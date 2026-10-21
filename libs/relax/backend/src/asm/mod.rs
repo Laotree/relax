@@ -1413,3 +1413,5 @@ fn kind_len(k: FixKind) -> usize {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_x64;
