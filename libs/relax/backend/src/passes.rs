@@ -1474,7 +1474,8 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                     }
                     // a select on `c ? k1 : k2` (constants, one of them 0): a select on c, the
                     // arms swapped when k1 is the 0
-                    if let Inst::Sel(d, x, p, q) = new {
+                    if let (Inst::Sel(d, x, p, q), false) = (&new, opt_off(options, "-selfold")) {
+                        let (d, x, p, q) = (*d, *x, *p, *q);
                         if let Some((c, a, b)) = sel_def[x.0 as usize] {
                             if let (Some(K::I(ka)), Some(K::I(kb)), Some(_)) = (kn[a.0 as usize], kn[b.0 as usize], cmp_def[c.0 as usize]) {
                                 if ka == 0 && kb != 0 {
@@ -1488,7 +1489,8 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                     // `c1 ? v : (c2 ? v : w)` with c1, c2 compares of the same two operands:
                     // `(c1 | c2) ? v : w`, the union one compare (`a < b || a == b` is `a <= b`:
                     // an `Ordering` tested for one outcome, binary_search's step)
-                    if let Inst::Sel(d, c1, v1, x) = new {
+                    if let (Inst::Sel(d, c1, v1, x), false) = (&new, opt_off(options, "-selfold")) {
+                        let (d, c1, v1, x) = (*d, *c1, *v1, *x);
                         if let Some((v2, w, k1, k2)) = sel_def[x.0 as usize].and_then(|(c2, v2, w)| Some((v2, w, cmp_def[c1.0 as usize]?, cmp_def[c2.0 as usize]?))) {
                             let same_v = v1 == v2 || matches!((kn[v1.0 as usize], kn[v2.0 as usize]), (Some(K::I(p)), Some(K::I(q))) if p == q);
                             if same_v && single(x, &ndef) {
@@ -1711,7 +1713,7 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
         trace_opt(f, "thread");
         changed |= threaded;
         if if_conv_on(options) {
-            changed |= if_convert(f);
+            changed |= if_convert(f, !opt_off(options, "-ifspec"));
         }
         changed |= merge_blocks(f);
         trace_opt(f, "merge");
@@ -3323,7 +3325,7 @@ pub fn combine_loads(f: &mut Func, ndef: &[u32]) -> bool {
 /// `x = c ? a : b` (Sel: cmov / csel) and a jump to the join -- no branch to mispredict
 /// (rustc / LLVM SimplifyCFG speculates such arms into selects). The arms must have the
 /// branch as their only predecessor, copy into distinct registers and read none of them.
-pub fn if_convert(f: &mut Func) -> bool {
+pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
     const MAX_MOVS: usize = 3;
     // cheap pure instructions an arm may compute into its own temporaries (speculated: they run on
     // both paths): an `Ordering` built from a compare (`if a < b { -1 } else { (a != b) as i8 }`)
@@ -3404,7 +3406,7 @@ pub fn if_convert(f: &mut Func) -> bool {
                 _ => return None,
             }
         }
-        if spec.len() > MAX_SPEC || mv.len() > MAX_MOVS {
+        if spec.len() > MAX_SPEC || mv.len() > MAX_MOVS || (!spec_on && (!spec.is_empty() || mv.iter().any(|(_, s)| s.is_err()))) {
             return None;
         }
         Some((spec, mv, j))
