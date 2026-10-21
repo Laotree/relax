@@ -754,6 +754,8 @@ struct Gen<'a> {
     low_only: Vec<bool>,
     /// passes::zero_above: values whose register is zero above that many bits
     zero_above: Vec<u8>,
+    /// switch::switch_in_range: per block, its Switch needs no range test
+    switch_in_range: Vec<bool>,
     rir_map: Vec<(u32, u32, u32)>,
     rir_map_on: bool,
     /// (register, code position right after it): the last instruction emitted was an integer ALU op
@@ -2321,11 +2323,13 @@ impl<'a> Gen<'a> {
                     self.a.mov_ri(R11, tab.min);
                     self.a.alu_rr(0x29, RAX, R11);
                 }
-                // cmp rax, imm32 (len - 1 < 4096)
-                self.a.byte(0x48);
-                self.a.byte(0x3d);
-                self.a.u32(tab.targets.len() as u32 - 1);
-                self.jcc_to(CC_A, tab.default);
+                // cmp rax, imm32 (len - 1 < 4096), unless every way in bounds it (switch_in_range)
+                if !self.switch_in_range[bi] {
+                    self.a.byte(0x48);
+                    self.a.byte(0x3d);
+                    self.a.u32(tab.targets.len() as u32 - 1);
+                    self.jcc_to(CC_A, tab.default);
+                }
                 // lea r11, [rip + table]
                 self.a.byte(0x4c);
                 self.a.byte(0x8d);
@@ -5125,6 +5129,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         win_start,
         low_only: crate::passes::low_bits_only(options, f),
         zero_above: Vec::new(),
+        switch_in_range: Vec::new(),
         fconsts: {
             let mut nd: std::collections::HashMap<u32, (u32, u64, bool)> = std::collections::HashMap::new();
             for b in &f.blocks {
@@ -5167,6 +5172,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         unwind_tab: Vec::new(),
     };
     g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
+    g.switch_in_range = crate::switch::switch_in_range(g.f);
     g.gen(options);
     // unwind info for the runtime's frame walk (rir::unwind_info_words), 4-byte aligned
     while g.a.b.len() % 4 != 0 {

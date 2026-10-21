@@ -629,6 +629,8 @@ struct Gen<'a> {
     low_only: Vec<bool>,
     /// passes::zero_above: values whose register is zero above that many bits
     zero_above: Vec<u8>,
+    /// switch::switch_in_range: per block, its Switch needs no range test
+    switch_in_range: Vec<bool>,
     /// table words to fill once blocks are placed: (word index, table start, target block)
     jt_fix: Vec<(usize, usize, u32)>,
     a: Asm,
@@ -2850,8 +2852,11 @@ impl<'a> Gen<'a> {
                     self.a.rrr(0xCB00_0000, IP0, r, IP0); // sub x16, r, x16
                     IP0
                 };
-                self.cmp_imm(idx, tab.targets.len() as i64 - 1);
-                self.cond_branch(CondBr::B(HI), tab.default);
+                // unless every way in bounds it (switch_in_range)
+                if !self.switch_in_range[bi] {
+                    self.cmp_imm(idx, tab.targets.len() as i64 - 1);
+                    self.cond_branch(CondBr::B(HI), tab.default);
+                }
                 self.a.e(0x1000_0000 | (4 << 5) | IP1 as u32); // adr x17, .+16
                 self.a.e(0xB8A0_7800 | (idx as u32) << 16 | (IP1 as u32) << 5 | IP0 as u32); // ldrsw x16, [x17, idx, lsl #2]
                 self.a.rrr(0x8B00_0000, IP1, IP1, IP0); // add x17, x17, x16
@@ -3732,6 +3737,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         },
         low_only: crate::passes::low_bits_only(options, f),
         zero_above: Vec::new(),
+        switch_in_range: Vec::new(),
         win_start: {
             let mut ws: std::collections::HashMap<u32, Vec<(u32, u8)>> = std::collections::HashMap::new();
             for &(v, a, _, r) in &al.windows {
@@ -3767,6 +3773,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         long,
     };
     g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
+    g.switch_in_range = crate::switch::switch_in_range(g.f);
     BRANCH_RANGE.with(|c| c.set(false));
     g.gen(options);
     if BRANCH_RANGE.with(|c| c.replace(false)) {
