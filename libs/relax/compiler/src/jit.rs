@@ -9884,8 +9884,6 @@ fn sampler_thread() {
                 return;
             }
             let u = unsafe { &*up };
-            // (the startup's code at its first sample on every level: it is what a warm start runs)
-            let o2_from = if ahead_policy().o2_first_sample || !FIRST_PRESENT.load(Ordering::Acquire) { 1 } else { SAMPLES_HOT };
             let mut heat = crate::zone_alloc::kept_with(|| HEAT.lock().unwrap());
             let counts = heat.get_or_insert_with(std::collections::HashMap::new);
             for &os::sample::Sample { pc, weight } in &pcs {
@@ -9894,18 +9892,18 @@ fn sampler_thread() {
                 // of it runs, and verified callers lowered again (hot_twin_callers) call the base
                 let base = match u.fns[id as usize].key { FnKey::Plain(b) => Some(b), _ => None };
                 for id in std::iter::once(id).chain(base) {
+                unsafe { base_sampled(up, id) };
                 let (before, count) = crate::zone_alloc::kept_with(|| {
                     let c = counts.entry(id).or_insert(0);
                     let before = *c;
                     *c += weight;
                     (before, *c)
                 });
-                // baseline code gets its O2 build (the cache entry warm runs link) once it shows
-                // CPU: at its first sample (startup code, aot) or once it is hot
-                if before < o2_from && count >= o2_from {
-                    unsafe { base_sampled(up, id) };
-                }
-                if before < SAMPLES_HOT && count >= SAMPLES_HOT {
+                // a slot counted again after it went cold (tier_revalidate) is queued at its first
+                // sample: it runs again, so its earlier hotness counts (steady lukewarm UI code never
+                // crosses SAMPLES_HOT twice)
+                let rearmed = before == 0 && unsafe { (*tier_rec(&u.slots, id).add(5)).load(Ordering::Relaxed) & REARMED != 0 };
+                if before < SAMPLES_HOT && count >= SAMPLES_HOT || rearmed {
                     if sample_trace() {
                         eprintln!("sampler: {} hot", u.fns[id as usize].name);
                     }
@@ -12228,24 +12226,21 @@ pub(crate) struct AheadPolicy {
     o3_revalidate: bool,
     /// O3 workers at most
     o3_threads: usize,
-    /// baseline code made after the first present gets its O2 build at its first sample (else
-    /// once it is hot; the startup's at its first sample on every level)
-    o2_first_sample: bool,
 }
 
 pub(crate) fn ahead_policy() -> &'static AheadPolicy {
     use crate::options::AheadLevel;
     const MINIMAL: AheadPolicy = AheadPolicy {
         spec_calls: false, spec_cached: false, spec_depth: Some(0), spec_hot_from: Some(0), spec_dyn: false, spec_jobs: 1, spec_expire: true,
-        post_present_helpers: 0, teardown: false, borrowck_discovery: false, last_run: false, o3_revalidate: true, o3_threads: 2, o2_first_sample: false,
+        post_present_helpers: 0, teardown: false, borrowck_discovery: false, last_run: false, o3_revalidate: true, o3_threads: 2,
     };
     const BALANCED: AheadPolicy = AheadPolicy {
-        spec_calls: true, spec_cached: true, spec_depth: Some(2), spec_hot_from: Some(1), spec_dyn: false, spec_jobs: 2, spec_expire: true,
-        post_present_helpers: u32::MAX, teardown: false, borrowck_discovery: false, last_run: false, o3_revalidate: true, o3_threads: 2, o2_first_sample: false,
+        spec_calls: true, spec_cached: true, spec_depth: None, spec_hot_from: None, spec_dyn: true, spec_jobs: 2, spec_expire: true,
+        post_present_helpers: u32::MAX, teardown: false, borrowck_discovery: false, last_run: false, o3_revalidate: true, o3_threads: 2,
     };
     const AOT: AheadPolicy = AheadPolicy {
         spec_calls: true, spec_cached: true, spec_depth: Some(AOT_DEPTH), spec_hot_from: Some(AOT_DEPTH), spec_dyn: true, spec_jobs: usize::MAX, spec_expire: false,
-        post_present_helpers: u32::MAX, teardown: true, borrowck_discovery: true, last_run: true, o3_revalidate: false, o3_threads: 3, o2_first_sample: true,
+        post_present_helpers: u32::MAX, teardown: true, borrowck_discovery: true, last_run: true, o3_revalidate: false, o3_threads: 3,
     };
     match ahead_level() {
         AheadLevel::Minimal => &MINIMAL,
