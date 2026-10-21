@@ -470,6 +470,9 @@ pub struct Unit {
     pub tls_next: u32,
     /// panicking stand-ins for foreign fns this host lacks, by symbol
     missing_stubs: relax_session::sync::Mutex<HashMap<String, u64>>,
+    /// the symbols the program's global_asm! defines, placed on the first foreign lookup
+    /// (global_asm.rs)
+    pub(crate) global_asm: std::sync::OnceLock<HashMap<String, u64>>,
     /// tier-up policy (None: O1 only) and its per-slot records / hot glue
     pub tier1: Option<Tier1Cfg>,
     /// O3 left calls to callees that had never run (ATTR_COLD): callee -> those O3
@@ -2537,6 +2540,7 @@ impl Unit {
             // slot 0 of the block: the thread's domain static block (domain.rs)
             tls_next: TLS_FIRST_FREE,
             missing_stubs: Default::default(),
+            global_asm: std::sync::OnceLock::new(),
             tier1: {
                 let t = Tier1Cfg::from_options(options);
                 TIER1_ENABLED.store(t.is_some(), Ordering::Relaxed);
@@ -2821,6 +2825,15 @@ impl Unit {
         // filled whole right away (the startup image's code)
         os::mem::prefault(at, len as usize);
         at
+    }
+
+    /// `len` bytes of code memory (global_asm.rs places a block whose fields need its address
+    /// before it is written: write_reserved_code).
+    pub(crate) fn reserve_asm_code(&self, len: u64, align: u64) -> u64 {
+        bump(&self.code_next, len.max(1), align.max(16), self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory")
+    }
+    pub(crate) fn write_reserved_code(&self, at: u64, b: &[u8]) {
+        unsafe { os::mem::write_code(at, b) };
     }
 
     fn emit_code(&self, b: &[u8]) -> u64 {
@@ -3638,19 +3651,36 @@ impl Unit {
         } else if let Some(id) = self.fn_map.get(&key) {
             return id;
         }
-        let _g = self.fn_create.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(id) = self.fn_map.get(&key) {
-            return id;
-        }
+        // fn_create is a leaf lock: nothing under it waits for a query, the owner or a pump
+        // (owner::Leaf). The slot's name is made before it, its ahead work queued after it
+        // (is_cold_def reads the signature: a query).
+        let name = {
+            let _k = crate::zone_alloc::kept();
+            fn_name(self, &key)
+        };
+        let id = {
+            let _g = self.fn_create.lock().unwrap_or_else(|e| e.into_inner());
+            let _leaf = crate::owner::Leaf::enter();
+            if let Some(id) = self.fn_map.get(&key) {
+                return id;
+            }
+            self.fn_create_locked(&key, name)
+        };
+        self.slot_ahead(id, &key);
+        id
+    }
+
+    /// fn_id's new slot `id` for `key` (the caller holds fn_create).
+    fn fn_create_locked(&self, key: &FnKey, name: String) -> u32 {
         let id = self.fns.len() as u32;
         self.ensure_slots(id, 1);
         // identity state: the slot's key and name (and the map's copy of the key) are the
         // program's, not the compiler arena's
-        let (entry_key, map_key, name) = {
+        let (entry_key, map_key) = {
             let _k = crate::zone_alloc::kept();
-            (key.clone(), key.clone(), fn_name(self, &key))
+            (key.clone(), key.clone())
         };
-        let file = self.key_file(&key);
+        let file = self.key_file(key);
         let stub_addr = self.slots.stub(id);
         let stub = x64::stub(id, self.lazy_entry);
         let slot_addr = self.slots.table(id);
@@ -3663,10 +3693,10 @@ impl Unit {
             }
             *(slot_addr as *mut u64) = stub_addr;
         }
-        self.slot_named(id, &key);
+        self.slot_named(id, key);
         self.fns.push(Self::new_entry(entry_key, name, file, stub_addr, stub.len() as u32));
         if let Some(index) = self.reload_slots.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            index.insert(&key, id);
+            index.insert(key, id);
         }
         self.fn_map.insert(map_key, id);
         id
@@ -3743,6 +3773,11 @@ impl Unit {
             }
         }
         self.front.slot_keys.insert(id, key.clone());
+    }
+
+    /// Slot `id` (named `key`, pushed) goes to the lowering-ahead helpers' queue. Not under
+    /// fn_create: is_cold_def reads the signature (a query, which may wait).
+    fn slot_ahead(&self, id: u32, key: &FnKey) {
         // after the first present only the slots the program's own builds make (their callees),
         // not a speculative or tier-up build's, and no cold callee (panics, formatting): what
         // the UI thread's next calls most likely meet
@@ -3852,6 +3887,7 @@ impl Unit {
         let name = crate::zone_alloc::kept_with(|| fn_name(self, &key).into_boxed_str());
         let file = self.key_file(&key);
         self.slot_named(id, &key);
+        self.slot_ahead(id, &key);
         let f = &mut self.fns[id as usize];
         f.key = crate::zone_alloc::kept_clone(&key);
         f.name = name;
@@ -4074,6 +4110,9 @@ impl Unit {
         if let Some(a) = lookup_interposer(&link) {
             return Some(a);
         }
+        if let Some(&a) = self.global_asm.get().and_then(|m| m.get(&link)) {
+            return Some(a);
+        }
         if let Some(a) = loader_symbol(link.as_bytes()) {
             return Some(a as u64);
         }
@@ -4092,6 +4131,12 @@ impl Unit {
         // dlsym / GetProcAddress answer the symbols the loader provides to programs (loader_symbol) first
         if let Some(a) = lookup_interposer(&link) {
             return Some(a);
+        }
+        // the program's own global_asm! labels
+        if !self.prog.global_asms.is_empty() {
+            if let Some(&a) = crate::global_asm::symbols(self).get(&link) {
+                return Some(a);
+            }
         }
         if let Some(a) = loader_symbol(link.as_bytes()) {
             return Some(a as u64);
@@ -9456,6 +9501,10 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
             relax_backend::passes::local_copy_prop(func);
             relax_backend::passes::dce(func);
         }
+        // accesses through a constant offset of a base that is still live read the base
+        if relax_codegen::opt::fold_offset_bases(options, func) {
+            relax_backend::passes::dce(func);
+        }
         // reads of a temporary a variable was copied from read the variable: one register
         relax_codegen::opt::reuse_copied_variables(options, func);
     }
@@ -13681,29 +13730,9 @@ extern "C" fn recorded_exit(code: i32) -> ! {
     os::proc::exit(code)
 }
 
-/// std::relax::fpcr_read / fpcr_write: the calling thread's FP control register (AArch64 FPCR).
-/// Relax compiles no inline assembly; JIT code reaches these two instructions here.
-#[cfg(target_arch = "aarch64")]
-extern "C" fn relax_fpcr_read() -> u64 {
-    let v: u64;
-    // SAFETY: reads this thread's FP control bits.
-    unsafe { std::arch::asm!("mrs {0}, fpcr", out(reg) v, options(nomem, nostack, preserves_flags)) };
-    v
-}
-
-#[cfg(target_arch = "aarch64")]
-extern "C" fn relax_fpcr_write(v: u64) {
-    // SAFETY: writes this thread's FP control bits; callers restore what they read.
-    unsafe { std::arch::asm!("msr fpcr, {0}", in(reg) v, options(nomem, nostack, preserves_flags)) };
-}
-
 /// Symbols the loader provides to the programs it runs (found through dlsym).
-fn loader_symbol(name: &[u8]) -> Option<usize> {
+pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
     match name {
-        #[cfg(target_arch = "aarch64")]
-        b"__relax_fpcr_read" => Some(relax_fpcr_read as *const () as usize),
-        #[cfg(target_arch = "aarch64")]
-        b"__relax_fpcr_write" => Some(relax_fpcr_write as *const () as usize),
         #[cfg(unix)]
         b"exit" => Some(recorded_exit as *const () as usize),
         #[cfg(unix)]
