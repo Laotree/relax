@@ -153,12 +153,12 @@ pub fn uses_defs(i: &Inst, uses: &mut Vec<VReg>, defs: &mut Vec<VReg>) {
             uses.push(*b);
             uses.push(*s);
         }
-        Inst::LoadX(_, d, b, x, _, _) => {
+        Inst::LoadX(_, d, b, x, _, _) | Inst::VLoadX(d, b, x, _, _) => {
             uses.push(*b);
             uses.push(*x);
             defs.push(*d);
         }
-        Inst::StoreX(_, b, x, _, _, s) => {
+        Inst::StoreX(_, b, x, _, _, s) | Inst::VStoreX(b, x, _, _, s) => {
             uses.push(*b);
             uses.push(*x);
             uses.push(*s);
@@ -265,11 +265,11 @@ pub fn for_uses(i: &Inst, mut uses: impl FnMut(VReg)) {
             uses(*b);
             uses(*s);
         }
-        Inst::LoadX(_, d, b, x, _, _) => {
+        Inst::LoadX(_, d, b, x, _, _) | Inst::VLoadX(d, b, x, _, _) => {
             uses(*b);
             uses(*x);
         }
-        Inst::StoreX(_, b, x, _, _, s) => {
+        Inst::StoreX(_, b, x, _, _, s) | Inst::VStoreX(b, x, _, _, s) => {
             uses(*b);
             uses(*x);
             uses(*s);
@@ -348,7 +348,7 @@ pub fn for_uses(i: &Inst, mut uses: impl FnMut(VReg)) {
 #[inline]
 pub fn for_defs(i: &Inst, mut defs: impl FnMut(VReg)) {
     match i {
-        Inst::Store(..) | Inst::StoreX(..) | Inst::Copy(..) | Inst::Fence(..) | Inst::VStore(..) | Inst::AtomicStore(..) | Inst::FpEnv(true, _) => {}
+        Inst::Store(..) | Inst::StoreX(..) | Inst::Copy(..) | Inst::Fence(..) | Inst::VStore(..) | Inst::VStoreX(..) | Inst::AtomicStore(..) | Inst::FpEnv(true, _) => {}
         Inst::FpEnv(false, d) => defs(*d),
         Inst::Cpuid(ds, _, _) => { for d in ds { defs(*d); } }
         Inst::Xgetbv(d, _) => defs(*d),
@@ -374,6 +374,7 @@ pub fn for_defs(i: &Inst, mut defs: impl FnMut(VReg)) {
         | Inst::FCmp(_, _, d, _, _)
         | Inst::Load(_, d, _, _)
         | Inst::LoadX(_, d, _, _, _, _)
+        | Inst::VLoadX(d, _, _, _, _)
         | Inst::VGather(d, _, _)
         | Inst::VShuffle(d, _, _, _)
         | Inst::VX(_, d, _, _)
@@ -1029,7 +1030,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         let (caller, callee) = if is_int { (&cfg.int_caller, &cfg.int_callee) } else { (&cfg.flt_caller, &cfg.flt_callee) };
         // a vector crossing a call goes to a caller-saved register (saved/restored around
         // the call in 16 bytes): arm64's callee-saved d8-d15 keep only the low 64 bits
-        let vec_cross = crossing && f.vregs[v as usize] == Cls::V128;
+        let vec_cross = crossing && f.vregs[v as usize].is_vec();
         let callee = if vec_cross { &no_callee } else { callee };
         let base = if is_int { 0 } else { 32 };
         cands.clear();
@@ -1139,12 +1140,8 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             }
             None if remat[v as usize].is_some() => Loc::None,
             None => {
-                if f.vregs[v as usize] == Cls::V128 {
-                    // 16 bytes, 16-aligned offsets (backends address slots downwards)
-                    spill_bytes = (spill_bytes + 15) / 16 * 16 + 16;
-                } else {
-                    spill_bytes += 8;
-                }
+                // vectors: 16-aligned offsets (backends address slots downwards)
+                spill_bytes = grow_spill(spill_bytes, f.vregs[v as usize]);
                 Loc::Stack(spill_bytes as i32)
             }
         };
@@ -1168,7 +1165,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             for i in &b.insts {
                 if let Inst::Mov(d, s2) = i {
                     let (cd, cs) = (f.vregs[d.0 as usize], f.vregs[s2.0 as usize]);
-                    if (cd == Cls::V128) != (cs == Cls::V128) {
+                    if cd.spill_bytes() != cs.spill_bytes() {
                         continue;
                     }
                     if let (Loc::Stack(a), Loc::Stack(b2)) = (loc[d.0 as usize], loc[s2.0 as usize]) {
@@ -1247,7 +1244,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                     root = origin[root as usize];
                 }
                 if let (Loc::Stack(y), Loc::Stack(x)) = (loc[v], loc[root as usize]) {
-                    if f.vregs[v] != Cls::V128 && slot_users[&x] == 1 && slot_users[&y] == 1 {
+                    if !f.vregs[v].is_vec() && slot_users[&x] == 1 && slot_users[&y] == 1 {
                         loc[v] = Loc::Stack(x);
                     }
                 }
@@ -1267,11 +1264,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     }
     let mut saves: HashMap<u32, Vec<(VReg, i32)>> = HashMap::new();
     for v in needs_save {
-        if f.vregs[v as usize] == Cls::V128 {
-            spill_bytes = (spill_bytes + 15) / 16 * 16 + 16;
-        } else {
-            spill_bytes += 8;
-        }
+        spill_bytes = grow_spill(spill_bytes, f.vregs[v as usize]);
         let slot = spill_bytes as i32;
         for (a, b) in ranges.of(v) {
             // the calls strictly inside (a, b) (call_pos is sorted)
@@ -1542,7 +1535,7 @@ fn allocate_baseline(options: &relax_session::Options, f: &Func, cfg: &RegConfig
         let (caller, callee) = if is_int { (&cfg.int_caller, &cfg.int_callee) } else { (&cfg.flt_caller, &cfg.flt_callee) };
         // a vector crossing a call goes to a caller-saved register (saved/restored around the call
         // in 16 bytes): arm64's callee-saved d8-d15 keep only the low 64 bits
-        let callee = if crossing && f.vregs[v] == Cls::V128 { &no_callee } else { callee };
+        let callee = if crossing && f.vregs[v].is_vec() { &no_callee } else { callee };
         let base = if is_int { 0 } else { 32 };
         cands.clear();
         if crossing {
@@ -1609,13 +1602,13 @@ fn allocate_baseline(options: &relax_session::Options, f: &Func, cfg: &RegConfig
     if order.iter().any(|&k| matches!(loc[(k & 0xffff_ffff) as usize], Loc::Stack(_))) {
         let share = slot_share_on(options);
         // (offset, 16-byte slot, end of its last value)
-        let mut slots: Vec<(i32, bool, u32)> = Vec::new();
+        let mut slots: Vec<(i32, u32, u32)> = Vec::new();
         for &k in &order {
             let v = (k & 0xffff_ffff) as usize;
             if !matches!(loc[v], Loc::Stack(_)) {
                 continue;
             }
-            let wide = f.vregs[v] == Cls::V128;
+            let wide = f.vregs[v].spill_bytes();
             let found = if share { slots.iter_mut().find(|x| x.1 == wide && x.2 < start[v]) } else { None };
             let o = match found {
                 Some(x) => {
@@ -1623,7 +1616,7 @@ fn allocate_baseline(options: &relax_session::Options, f: &Func, cfg: &RegConfig
                     x.0
                 }
                 None => {
-                    spill_bytes = if wide { (spill_bytes + 15) / 16 * 16 + 16 } else { spill_bytes + 8 };
+                    spill_bytes = grow_spill(spill_bytes, f.vregs[v]);
                     slots.push((spill_bytes as i32, wide, end[v]));
                     spill_bytes as i32
                 }
@@ -1638,7 +1631,7 @@ fn allocate_baseline(options: &relax_session::Options, f: &Func, cfg: &RegConfig
     for v in 0..nv {
         let saved = match loc[v] {
             Loc::Reg(c) => !cfg.int_callee.contains(&c),
-            Loc::Flt(c) => f.vregs[v] == Cls::V128 || !cfg.flt_callee.contains(&c),
+            Loc::Flt(c) => f.vregs[v].is_vec() || !cfg.flt_callee.contains(&c),
             _ => false,
         };
         if !saved || !crosses(start[v], end[v]) {
@@ -1654,7 +1647,7 @@ fn allocate_baseline(options: &relax_session::Options, f: &Func, cfg: &RegConfig
                 continue;
             }
             if slot == 0 {
-                spill_bytes = if f.vregs[v] == Cls::V128 { (spill_bytes + 15) / 16 * 16 + 16 } else { spill_bytes + 8 };
+                spill_bytes = grow_spill(spill_bytes, f.vregs[v]);
                 slot = spill_bytes as i32;
             }
             saves.entry(p).or_default().push((VReg(v as u32), slot));
@@ -1964,6 +1957,15 @@ fn affinities(f: &Func, reach: &[bool], block_start: &[u32], ranges: &Ranges, wt
                     if d != s2 && f.vregs[d.0 as usize] == f.vregs[s2.0 as usize] {
                         edges.push((d.0, s2.0, w));
                         edges.push((s2.0, d.0, w));
+                    }
+                    continue;
+                }
+                // fused multiply-add accumulates in place on both targets (arm64 fmla/fmls
+                // vd += vn*vm, x64 vfmadd231 d += a*b): the result prefers the addend's register
+                Inst::VFma(_, _, d, _, _, c) => {
+                    if d != c && dies_at(ranges, c.0, p) {
+                        edges.push((d.0, c.0, w));
+                        edges.push((c.0, d.0, w));
                     }
                     continue;
                 }
@@ -2438,7 +2440,7 @@ fn split_cold_calls(f: &Func, freq: &[f32], cand: &[bool]) -> Option<Func> {
                         if cand[v as usize] {
                             n_cand += 1;
                         }
-                        if cand[v as usize] && hu[v as usize >> 6] & (1u64 << (v & 63)) != 0 && !defs.iter().any(|d| d.0 == v) && f.vregs[v as usize] != Cls::V128 {
+                        if cand[v as usize] && hu[v as usize >> 6] & (1u64 << (v & 63)) != 0 && !defs.iter().any(|d| d.0 == v) && !f.vregs[v as usize].is_vec() {
                             across.push(VReg(v));
                         }
                     }
@@ -2838,7 +2840,7 @@ fn split_loops(f: &mut Func, spilled: &[bool], inreg: Option<&[bool]>, hot: Opti
                 if k == 0 {
                     break;
                 }
-                if !inreg[v as usize] || refall[v as usize] || f.vregs[v as usize] == Cls::V128 || !live(f, &alias, header, v) {
+                if !inreg[v as usize] || refall[v as usize] || f.vregs[v as usize].is_vec() || !live(f, &alias, header, v) {
                     continue;
                 }
                 let mut back: Vec<u32> = Vec::new();
@@ -3116,16 +3118,24 @@ fn union_ranges(x: &[(u32, u32)], y: &[(u32, u32)]) -> Vec<(u32, u32)> {
 /// order of their first position into the first offset whose occupancy they do not meet.
 /// V128 slots (16 bytes, 16-aligned) and 8-byte slots are packed separately. Returns the new
 /// spill area size.
+/// The spill area grown by one slot of class `c` (vectors at 16-aligned offsets).
+fn grow_spill(bytes: u32, c: Cls) -> u32 {
+    match c.spill_bytes() {
+        8 => bytes + 8,
+        n => (bytes + 15) / 16 * 16 + n,
+    }
+}
+
 fn pack_spill_slots(f: &Func, reach: &[bool], block_start: &[u32], loc: &mut [Loc], ranges: &Ranges, start: &[u32]) -> u32 {
-    // per old offset: occupancy, whether it holds a V128
-    let mut occ: HashMap<i32, (Vec<(u32, u32)>, bool)> = HashMap::new();
+    // per old offset: occupancy, its slot size (Cls::spill_bytes)
+    let mut occ: HashMap<i32, (Vec<(u32, u32)>, u32)> = HashMap::new();
     for v in 0..loc.len() {
         if let Loc::Stack(o) = loc[v] {
-            let e = occ.entry(o).or_insert((Vec::new(), false));
+            let e = occ.entry(o).or_insert((Vec::new(), 8));
             // a value no reachable code touches: occupies everything
             let r: Vec<(u32, u32)> = if start[v] == u32::MAX { vec![(0, u32::MAX)] } else { ranges.of(v as u32).to_vec() };
             e.0 = union_ranges(&e.0, &r);
-            e.1 |= f.vregs[v] == Cls::V128;
+            e.1 = e.1.max(f.vregs[v].spill_bytes());
         }
     }
     if occ.len() < 2 {
@@ -3151,11 +3161,11 @@ fn pack_spill_slots(f: &Func, reach: &[bool], block_start: &[u32], loc: &mut [Lo
             });
         }
     }
-    let mut old: Vec<(u32, i32, bool, Vec<(u32, u32)>)> = occ.into_iter().map(|(o, (r, w))| (r.first().map_or(0, |x| x.0), o, w, r)).collect();
+    let mut old: Vec<(u32, i32, u32, Vec<(u32, u32)>)> = occ.into_iter().map(|(o, (r, w))| (r.first().map_or(0, |x| x.0), o, w, r)).collect();
     old.sort_unstable_by_key(|x| (x.0, x.1));
     let mut bytes = 0u32;
     let mut to: HashMap<i32, i32> = HashMap::new();
-    for wide in [true, false] {
+    for wide in [32u32, 16, 8] {
         // (offset, union of the occupancies placed there)
         let mut slots: Vec<(i32, Vec<(u32, u32)>)> = Vec::new();
         for (_, o, w, r) in &old {
@@ -3170,11 +3180,7 @@ fn pack_spill_slots(f: &Func, reach: &[bool], block_start: &[u32], loc: &mut [Lo
                     to.insert(*o, s.0);
                 }
                 None => {
-                    if wide {
-                        bytes = (bytes + 15) / 16 * 16 + 16;
-                    } else {
-                        bytes += 8;
-                    }
+                    bytes = if wide == 8 { bytes + 8 } else { (bytes + 15) / 16 * 16 + wide };
                     slots.push((bytes as i32, r.clone()));
                     to.insert(*o, bytes as i32);
                 }
@@ -3206,9 +3212,13 @@ fn remat_on(options: &relax_session::Options) -> bool {
 ///   into `IBin` / `ICmp` on a constant vreg;
 /// - constants used inside loops are defined once at the entry, one vreg per value.
 /// The allocator then keeps such a constant in a register across the loop, or recomputes it at
-/// the use when none is free (what the backend did at every use before). Returns the rewritten
-/// copy, or None when there is nothing to do.
-pub fn hoist_loop_consts(f: &Func, fits: &dyn Fn(&Inst) -> bool) -> Option<Func> {
+/// the use when none is free (what the backend did at every use before).
+/// - with `floats`, float constants defined inside loops move to the entry too (one vreg per
+///   value and width): for targets that build them with instructions or a literal-pool load at
+///   each definition (arm64 `fmov #imm`, `mov + fmov`, `ldr d, =lit`), not for those that fold
+///   them into the using instruction's memory operand (x64).
+/// Returns the rewritten copy, or None when there is nothing to do.
+pub fn hoist_loop_consts(f: &Func, fits: &dyn Fn(&Inst) -> bool, floats: bool) -> Option<Func> {
     let reach = reachable(f);
     let nv = f.vregs.len();
     let mut ndef = vec![0u32; nv];
@@ -3235,6 +3245,8 @@ pub fn hoist_loop_consts(f: &Func, fits: &dyn Fn(&Inst) -> bool) -> Option<Func>
     let mut changed = false;
     let mut g = f.clone();
     let mut consts: Vec<(i64, VReg)> = Vec::new();
+    // float constants by (bits, f64?)
+    let mut fconsts: Vec<((u64, bool), VReg)> = Vec::new();
     let mut moved = vec![false; nv];
     for bi in 0..g.blocks.len() {
         if !reach[bi] {
@@ -3269,6 +3281,13 @@ pub fn hoist_loop_consts(f: &Func, fits: &dyn Fn(&Inst) -> bool) -> Option<Func>
                     }
                     changed = true;
                 }
+                Inst::Fconst(d, bits, w) if floats && ndef[d.0 as usize] == 1 => {
+                    moved[d.0 as usize] = true;
+                    if !fconsts.iter().any(|x| x.0 == (bits, w)) {
+                        fconsts.push(((bits, w), d));
+                    }
+                    changed = true;
+                }
                 Inst::IBinI(op, it, d, a, v) if !fits(&i) => {
                     let c = const_vreg(&mut g, &mut consts, v);
                     g.blocks[bi].insts[k] = Inst::IBin(op, it, d, a, c);
@@ -3296,10 +3315,15 @@ pub fn hoist_loop_consts(f: &Func, fits: &dyn Fn(&Inst) -> bool) -> Option<Func>
                         map[d.0 as usize] = consts.iter().find(|x| x.0 == *v).unwrap().1 .0;
                     }
                 }
+                if let Inst::Fconst(d, bits, w) = i {
+                    if moved[d.0 as usize] {
+                        map[d.0 as usize] = fconsts.iter().find(|x| x.0 == (*bits, *w)).unwrap().1 .0;
+                    }
+                }
             }
         }
         for b in g.blocks.iter_mut() {
-            let keep: Vec<bool> = b.insts.iter().map(|i| !matches!(i, Inst::Iconst(d, _) if (d.0 as usize) < nv && moved[d.0 as usize])).collect();
+            let keep: Vec<bool> = b.insts.iter().map(|i| !matches!(i, Inst::Iconst(d, _) | Inst::Fconst(d, _, _) if (d.0 as usize) < nv && moved[d.0 as usize])).collect();
             let mut k = 0;
             b.insts.retain(|_| {
                 k += 1;
@@ -3317,8 +3341,8 @@ pub fn hoist_loop_consts(f: &Func, fits: &dyn Fn(&Inst) -> bool) -> Option<Func>
         }
     }
     let p0 = g.blocks[0].pos.first().copied().unwrap_or(g.blocks[0].term_pos);
-    let n = consts.len();
-    g.blocks[0].insts.splice(0..0, consts.iter().map(|(v, c)| Inst::Iconst(*c, *v)));
+    let n = consts.len() + fconsts.len();
+    g.blocks[0].insts.splice(0..0, consts.iter().map(|(v, c)| Inst::Iconst(*c, *v)).chain(fconsts.iter().map(|((bits, w), c)| Inst::Fconst(*c, *bits, *w))));
     g.blocks[0].pos.splice(0..0, std::iter::repeat(p0).take(n));
     Some(g)
 }

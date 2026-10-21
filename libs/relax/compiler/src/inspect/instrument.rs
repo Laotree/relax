@@ -789,6 +789,20 @@ fn add_to(kind: Kind, target: Target, time: bool) -> Result<(u32, Vec<(u64, Stri
         if found.is_empty() {
             return Err(format!("no compiled fn or line matches `{}` (a fn not called yet has no code to patch)", query));
         }
+        // a slot and its SPEC-V twin run the same fn (unverified callers call the twin): both are
+        // instrumented, into one site each (a twin compiled later joins on its first install)
+        let mut found = found;
+        for k in 0..found.len() {
+            let (id, line, _) = found[k].clone();
+            let sib = match u.fns[id as usize].key {
+                crate::jit::FnKey::Plain(b) => Some(b),
+                crate::jit::FnKey::Inst(..) | crate::jit::FnKey::Closure(..) => u.plain_twin_of(id),
+                _ => None,
+            };
+            if let Some(s) = sib.filter(|&s| u.fns[s as usize].compiled && !found.iter().any(|f| f.0 == s)) {
+                found.push((s, line, u.fns[s as usize].name.to_string()));
+            }
+        }
         let mut out = Vec::new();
         for (id, line, name) in found {
             let si = register_site(kind, id, match line { Some(l) => format!("{} (line {})", name, l), None => name.clone() }, group);

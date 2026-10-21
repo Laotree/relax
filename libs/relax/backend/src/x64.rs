@@ -526,6 +526,29 @@ impl Asm {
         self.byte(op);
         self.modrm_rr(reg, rm);
     }
+    /// VEX (3-byte) register form with the vector length: `y` = 256-bit (L = 1)
+    fn vex_l(&mut self, pp: u8, map: u8, w: bool, y: bool, op: u8, reg: u8, vvvv: u8, rm: u8) {
+        self.byte(0xc4);
+        self.byte(((!(reg >> 3) & 1) << 7) | (1 << 6) | ((!(rm >> 3) & 1) << 5) | map);
+        self.byte(((w as u8) << 7) | ((!vvvv & 15) << 3) | ((y as u8) << 2) | pp);
+        self.byte(op);
+        self.modrm_rr(reg, rm);
+    }
+    /// VEX (3-byte) [base + disp] form with the vector length (an index from `sib` too)
+    fn vex_lm(&mut self, pp: u8, map: u8, w: bool, y: bool, op: u8, reg: u8, vvvv: u8, base: u8, disp: i32) {
+        let x = self.sib.map_or(0, |s| s.0);
+        self.byte(0xc4);
+        self.byte(((!(reg >> 3) & 1) << 7) | ((!(x >> 3) & 1) << 6) | ((!(base >> 3) & 1) << 5) | map);
+        self.byte(((w as u8) << 7) | ((!vvvv & 15) << 3) | ((y as u8) << 2) | pp);
+        self.byte(op);
+        self.modrm_mem(reg, base, disp);
+    }
+    /// vzeroupper: no dirty upper ymm state into code using legacy SSE (callees, callers)
+    fn vzeroupper(&mut self) {
+        self.byte(0xc5);
+        self.byte(0xf8);
+        self.byte(0x77);
+    }
     /// VEX (3-byte) [rip + disp32] form, 128-bit; returns the disp32 patch position
     fn vex_rip(&mut self, pp: u8, map: u8, w: bool, op: u8, reg: u8, vvvv: u8) -> usize {
         self.byte(0xc4);
@@ -649,6 +672,8 @@ pub fn reg_config(options: &relax_session::Options) -> RegConfig {
 // ------------------------------------------------------------ code generation
 
 struct Gen<'a> {
+    /// the function has 256-bit vectors (vzeroupper before calls and returns)
+    ymm: bool,
     a: Asm,
     f: &'a Func,
     al: Alloc,
@@ -684,6 +709,9 @@ struct Gen<'a> {
     mem_const: Option<(VReg, u64)>,
     /// the block ends `t = x & K; t ==/!= 0; branch`: emitted as test x, K (the And skipped)
     test_fuse: Option<(VReg, i64)>,
+    /// the block ends `s = m >> t; c = s & 1; branch c` (s, c used once): emitted as bt m, t
+    /// (the bit-test switch clusters), the shift and mask skipped -- (m, t)
+    bt_fuse: Option<(VReg, VReg)>,
     /// `t = load [base + off]; c = t cmp K` feeding the branch (t used once): cmp [base + off], K
     /// in the load's width -- (base, off, bytes, K)
     load_fuse: Option<(VReg, i32, u8, i64)>,
@@ -734,6 +762,13 @@ impl<'a> Gen<'a> {
     /// Saves (or restores) a caller-saved register's value around a call: 16 bytes for a vector.
     fn save_restore(&mut self, v: VReg, slot: i32, save: bool) {
         let d = self.spill_disp(slot);
+        if self.f.vregs[v.0 as usize] == Cls::V256 {
+            if let Loc::Flt(x) = self.al.loc[v.0 as usize] {
+                // vmovups [rbp+d], ymm / vmovups ymm, [rbp+d]
+                self.a.vex_lm(0, 1, false, true, if save { 0x11 } else { 0x10 }, x, 0, RBP, d);
+            }
+            return;
+        }
         if self.f.vregs[v.0 as usize] == Cls::V128 {
             if let Loc::Flt(x) = self.al.loc[v.0 as usize] {
                 // movups [rbp+d], x / movups x, [rbp+d]
@@ -851,6 +886,11 @@ impl<'a> Gen<'a> {
     fn use_f(&mut self, v: VReg, scratch: u8) -> u8 {
         match self.al.loc[v.0 as usize] {
             Loc::Flt(x) => x,
+            Loc::Stack(o) if self.f.vregs[v.0 as usize] == Cls::V256 => {
+                let d = self.spill_disp(o);
+                self.a.vex_lm(0, 1, false, true, 0x10, scratch, 0, RBP, d); // vmovups ymm
+                scratch
+            }
             Loc::Stack(o) if self.f.vregs[v.0 as usize] == Cls::V128 => {
                 let d = self.spill_disp(o);
                 self.a.sse_rm(0, 0x10, scratch, RBP, d); // movups
@@ -874,6 +914,10 @@ impl<'a> Gen<'a> {
     fn fin_f(&mut self, v: VReg, x: u8) {
         if let Loc::Stack(o) = self.al.loc[v.0 as usize] {
             let d = self.spill_disp(o);
+            if self.f.vregs[v.0 as usize] == Cls::V256 {
+                self.a.vex_lm(0, 1, false, true, 0x11, x, 0, RBP, d); // vmovups ymm
+                return;
+            }
             if self.f.vregs[v.0 as usize] == Cls::V128 {
                 self.a.sse_rm(0, 0x11, x, RBP, d); // movups
                 return;
@@ -1087,6 +1131,15 @@ impl<'a> Gen<'a> {
                     }
                 }
             }
+            // a branch on bit t of m: bt m, t (CF = bit t mod 64, as the 64-bit shift reads t)
+            self.bt_fuse = None;
+            if !fused && n >= 2 {
+                if let (Term::Branch(c, _, _), Inst::IBin(IOp::Shr, it, s, m, t), Inst::IBinI(IOp::And, _, d, s2, 1)) = (&b.term, &b.insts[n - 2], &b.insts[n - 1]) {
+                    if d == c && s == s2 && it.bits == 64 && !it.signed && m != s && t != s && self.al.uses[c.0 as usize] == 1 && self.al.uses[s.0 as usize] == 1 {
+                        self.bt_fuse = Some((*m, *t));
+                    }
+                }
+            }
             // a branch on a loaded value itself (a bool field): cmp [p + o], 0
             let mut load_branch = false;
             if !fused && n >= 1 {
@@ -1123,6 +1176,9 @@ impl<'a> Gen<'a> {
                 }
                 if load_branch && ii == n - 1 {
                     break;
+                }
+                if self.bt_fuse.is_some() && ii >= n - 2 {
+                    continue;
                 }
                 // a compare whose one use is the next select: fused into it (flags + cmov,
                 // or a scalar float branch)
@@ -1545,6 +1601,9 @@ impl<'a> Gen<'a> {
         for (d, s2) in regalloc::seq_moves(&moves, R10, XS) {
             self.mv(d, s2);
         }
+        if self.ymm {
+            self.a.vzeroupper();
+        }
         match c {
             Callee::CFn(id, _) => {
                 self.mov_reloc(RAX, Reloc::Slot(*id));
@@ -1913,6 +1972,9 @@ impl<'a> Gen<'a> {
             self.a.pop(saved[i]);
         }
         self.a.pop(RBP);
+        if self.ymm {
+            self.a.vzeroupper();
+        }
         self.a.ret();
     }
 
@@ -2117,6 +2179,17 @@ impl<'a> Gen<'a> {
                         self.cmp_mem_imm(rb, disp, sz, k);
                         Some(CC_NE)
                     }
+                    _ if self.bt_fuse.is_some() => {
+                        let (m, t) = self.bt_fuse.take().unwrap();
+                        let rm = self.use_i(options, m, R10);
+                        let rt = self.use_i(options, t, R11);
+                        // bt rm, rt (REX.W 0F A3 /r): CF = bit rt of rm
+                        self.a.rex(true, rt, 0, rm, false);
+                        self.a.byte(0x0f);
+                        self.a.byte(0xa3);
+                        self.a.modrm_rr(rt, rm);
+                        Some(CC_B)
+                    }
                     _ => {
                         let r = self.use_i(options, *c, R10);
                         self.a.test_rr(r, r);
@@ -2215,7 +2288,29 @@ impl<'a> Gen<'a> {
             // recomputed at each use (Alloc::remat)
             Inst::Iconst(d, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::Mov(d, _) if self.al.remat[d.0 as usize].is_some() => {}
             Inst::Sel(d, c, a, b) => self.sel(options, *d, *c, *a, *b),
+            _ if self.ymm && y_inst(self.f, i) => self.y(options, i),
             Inst::VShuffle(..) | Inst::VSel(..) | Inst::VFma(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) | Inst::VLoad(..) | Inst::VStore(..) | Inst::VAny(..) | Inst::VGather(..) | Inst::VConst(..) => self.vinst(options, i),
+            Inst::VLoadX(d, base, idx, sh, off) => {
+                let (ri, rb, off) = self.index_operands(options, *base, *idx, *off);
+                let xd = self.def_f(*d, XS);
+                self.a.sib = Some((ri, *sh));
+                if self.f.vregs[d.0 as usize] == Cls::V256 {
+                    self.a.vex_lm(0, 1, false, true, 0x10, xd, 0, rb, off); // vmovups ymm
+                } else {
+                    self.a.sse_rm(0, 0x10, xd, rb, off); // movups
+                }
+                self.fin_f(*d, xd);
+            }
+            Inst::VStoreX(base, idx, sh, off, v) => {
+                let xv = self.use_f(*v, XS);
+                let (ri, rb, off) = self.index_operands(options, *base, *idx, *off);
+                self.a.sib = Some((ri, *sh));
+                if self.f.vregs[v.0 as usize] == Cls::V256 {
+                    self.a.vex_lm(0, 1, false, true, 0x11, xv, 0, rb, off);
+                } else {
+                    self.a.sse_rm(0, 0x11, xv, rb, off);
+                }
+            }
             Inst::VX(op, d, a, b) => self.vx(options, *op, *d, *a, *b),
             Inst::VX3(op, d, a, b, c) => self.vx3(*op, *d, *a, *b, *c),
             Inst::FMulAdd(np, na, w, d, a, b, c) => self.fma(*np, *na, *w, *d, *a, *b, *c),
@@ -2276,6 +2371,14 @@ impl<'a> Gen<'a> {
                         self.fin_i(*d, rd);
                     }
                 },
+                Cls::V256 => {
+                    let xs = self.use_f(*s, XS);
+                    let xd = self.def_f(*d, XS);
+                    if xd != xs {
+                        self.a.vex_l(0, 1, false, true, 0x28, xd, 0, xs); // vmovaps ymm
+                    }
+                    self.fin_f(*d, xd);
+                }
                 c => {
                     let xs = self.use_f(*s, XS);
                     let xd = self.def_f(*d, XS);
@@ -3514,6 +3617,160 @@ impl<'a> Gen<'a> {
     }
 
     /// 128-bit vector instructions (SSE4.1; AVX2 for per-lane shifts, FMA3 for VFma).
+    /// The index and base registers (and displacement) of an indexed access, as LoadX takes them:
+    /// a spilled index in rax (r10 is the base's scratch).
+    fn index_operands(&mut self, options: &relax_session::Options, base: VReg, idx: VReg, off: i32) -> (u8, u8, i32) {
+        let ri = self.use_i(options, idx, R10);
+        let ri = if ri == R10 {
+            self.a.mov_rr(RAX, R10);
+            RAX
+        } else {
+            ri
+        };
+        let (rb, off) = self.base_disp(options, base, R11, off);
+        (ri, rb, off)
+    }
+
+    /// A 256-bit vector instruction (`pair256`): VEX.256 forms, three-operand.
+    fn y(&mut self, options: &relax_session::Options, i: &Inst) {
+        match *i {
+            Inst::Mov(d, s) => {
+                if matches!(self.al.loc[d.0 as usize], Loc::Stack(_)) && self.al.loc[d.0 as usize] == self.al.loc[s.0 as usize] {
+                    return;
+                }
+                let xs = self.use_f(s, XS);
+                let xd = self.def_f(d, XS);
+                if xd != xs {
+                    self.a.vex_l(0, 1, false, true, 0x28, xd, 0, xs); // vmovaps ymm
+                }
+                self.fin_f(d, xd);
+            }
+            Inst::VLoad(d, base, off) => {
+                let rb = self.use_i(options, base, R11);
+                let xd = self.def_f(d, XS);
+                self.a.vex_lm(0, 1, false, true, 0x10, xd, 0, rb, off); // vmovups ymm, [b + off]
+                self.fin_f(d, xd);
+            }
+            Inst::VStore(base, off, v) => {
+                let rb = self.use_i(options, base, R11);
+                let xv = self.use_f(v, XS);
+                self.a.vex_lm(0, 1, false, true, 0x11, xv, 0, rb, off); // vmovups [b + off], ymm
+            }
+            Inst::VSplat(d, s) => {
+                let xs = if self.f.vregs[s.0 as usize] == Cls::I {
+                    let rs = self.use_i(options, s, R10);
+                    self.a.sse_rr(0x66, 0x6e, 0, rs, false); // movd xmm0, r32
+                    0
+                } else {
+                    self.use_f(s, XS2)
+                };
+                let xd = self.def_f(d, XS);
+                self.a.vex_l(1, 2, false, true, 0x18, xd, 0, xs); // vbroadcastss ymm, xmm
+                self.fin_f(d, xd);
+            }
+            Inst::VConst(d, bits) => {
+                let xd = self.def_f(d, XS);
+                if bits == 0 {
+                    self.a.vex_l(0, 1, false, true, 0x57, xd, xd, xd); // vxorps
+                } else {
+                    // vbroadcastss ymm, [rip + entry]
+                    self.a.byte(0xc4);
+                    self.a.byte(((!(xd >> 3) & 1) << 7) | (1 << 6) | (1 << 5) | 2);
+                    self.a.byte((15 << 3) | (1 << 2) | 1);
+                    self.a.byte(0x18);
+                    self.a.byte(((xd & 7) << 3) | 5);
+                    let at = self.a.pos();
+                    self.a.u32(0);
+                    self.vpool.push((at, bits as u128 * 0x0000_0001_0000_0001_0000_0001_0000_0001));
+                }
+                self.fin_f(d, xd);
+            }
+            Inst::VFma(np, na, d, a, b, c) => {
+                let xa = self.use_f(a, XS);
+                let xb = self.use_f(b, XS2);
+                let xc = self.use_f(c, 1);
+                let xd = self.def_f(d, XS);
+                let k = match (np, na) {
+                    (false, false) => 0,
+                    (false, true) => 2,
+                    (true, false) => 4,
+                    (true, true) => 6,
+                };
+                if xd != xa && xd != xb {
+                    // d = c; d (+-)= a*b: vf..231ps
+                    if xd != xc {
+                        self.a.vex_l(0, 1, false, true, 0x28, xd, 0, xc);
+                    }
+                    self.a.vex_l(1, 2, false, true, 0xb8 + k, xd, xa, xb);
+                } else if xd != xc {
+                    // d is a factor: vf..213ps d, other, c (d = d*other +- c)
+                    let other = if xd == xa { xb } else { xa };
+                    self.a.vex_l(1, 2, false, true, 0xa8 + k, xd, other, xc);
+                } else {
+                    self.a.vex_l(0, 1, false, true, 0x28, 0, 0, xc);
+                    self.a.vex_l(1, 2, false, true, 0xb8 + k, 0, xa, xb);
+                    self.a.vex_l(0, 1, false, true, 0x28, xd, 0, 0);
+                }
+                self.fin_f(d, xd);
+            }
+            Inst::VX(VX::Half(hi), d, a, _) => {
+                let xa = self.use_f(a, XS);
+                let xd = self.def_f(d, XS2);
+                if hi {
+                    self.a.vex_l(1, 3, false, true, 0x19, xa, 0, xd); // vextractf128 xd, ya, 1
+                    self.a.byte(1);
+                } else if xd != xa {
+                    self.a.vex_l(0, 1, false, false, 0x28, xd, 0, xa); // vmovaps xmm
+                }
+                self.fin_f(d, xd);
+            }
+            Inst::VX(VX::Join, d, a, b) => {
+                let xa = self.use_f(a, XS);
+                let xb = self.use_f(b, XS2);
+                let xd = self.def_f(d, XS);
+                self.a.vex_l(1, 3, false, true, 0x18, xd, xa, xb); // vinsertf128 yd, ya, xb, 1
+                self.a.byte(1);
+                self.fin_f(d, xd);
+            }
+            Inst::VX(op, d, a, b) => {
+                let (pp, opc, x, y, imm) = match op {
+                    VX::FAdd(w, _) => (pd(w), 0x58, a, b, None),
+                    VX::FSub(w, _) => (pd(w), 0x5c, a, b, None),
+                    VX::FMul(w, _) => (pd(w), 0x59, a, b, None),
+                    VX::FDiv(w, _) => (pd(w), 0x5e, a, b, None),
+                    VX::FMinLt(w) => (pd(w), 0x5d, a, b, None),
+                    VX::FMaxGt(w) => (pd(w), 0x5f, a, b, None),
+                    VX::And => (0, 0x54, a, b, None),
+                    VX::Or => (0, 0x56, a, b, None),
+                    VX::Xor => (0, 0x57, a, b, None),
+                    // a & !b = andn(b, a)
+                    VX::AndNot => (0, 0x55, b, a, None),
+                    VX::FCmp(c, w) => {
+                        let (x, y, pred) = match c {
+                            Cond::Lt => (a, b, 1),
+                            Cond::Le => (a, b, 2),
+                            Cond::Gt => (b, a, 1),
+                            Cond::Ge => (b, a, 2),
+                            Cond::Eq => (a, b, 0),
+                            Cond::Ne => (a, b, 4),
+                        };
+                        (pd(w), 0xc2, x, y, Some(pred))
+                    }
+                    _ => unreachable!("pair256 made a 256-bit {op:?}"),
+                };
+                let xx = self.use_f(x, XS);
+                let xy = self.use_f(y, XS2);
+                let xd = self.def_f(d, XS);
+                self.a.vex_l(pp, 1, false, true, opc, xd, xx, xy);
+                if let Some(p) = imm {
+                    self.a.byte(p);
+                }
+                self.fin_f(d, xd);
+            }
+            _ => unreachable!("not a 256-bit instruction"),
+        }
+    }
+
     fn vinst(&mut self, options: &relax_session::Options, i: &Inst) {
         match *i {
             Inst::VShuffle(d, a, b, idx) => self.vshuffle(d, a, b, idx),
@@ -3624,6 +3881,11 @@ impl<'a> Gen<'a> {
                 let rb = self.use_i(options, base, R11);
                 let xv = self.use_f(v, XS);
                 self.a.sse_rm(0, 0x11, xv, rb, off);
+            }
+            Inst::VConst(d, 0) => {
+                let xd = self.def_f(d, XS);
+                self.a.sse_rr(0, 0x57, xd, xd, false); // xorps xd, xd
+                self.fin_f(d, xd);
             }
             Inst::VConst(d, bits) => {
                 // movups xd, [rip + entry]
@@ -3826,20 +4088,23 @@ impl<'a> Gen<'a> {
         let xa = self.use_f(a, XS);
         let xb = self.use_f(b, XS2);
         let xc = self.use_f(c, 1);
-        self.a.movf_rr(true, 0, xc);
+        // the C library's operand placement (glibc fma/fmaf: vfmadd213 with x in the destination,
+        // y in vvvv, z in r/m), what rustc's code calls without the fma target feature: a NaN
+        // result takes the first NaN of vvvv, the destination, then r/m -- b, a, c
+        self.a.movf_rr(true, 0, xa);
         let op = match (neg_prod, neg_add) {
-            (false, false) => 0xb9, // vfmadd231
-            (false, true) => 0xbb,  // vfmsub231
-            (true, false) => 0xbd,  // vfnmadd231
-            (true, true) => 0xbf,   // vfnmsub231
+            (false, false) => 0xa9, // vfmadd213
+            (false, true) => 0xab,  // vfmsub213
+            (true, false) => 0xad,  // vfnmadd213
+            (true, true) => 0xaf,   // vfnmsub213
         };
-        // VEX.LIG.66.0F38.W{0,1} op /r: reg = xmm0, vvvv = xa, rm = xb
+        // VEX.LIG.66.0F38.W{0,1} op /r: reg = xmm0 (a), vvvv = xb, rm = xc
         let r = 0u8;
         self.a.byte(0xc4);
-        self.a.byte(((!(r >> 3) & 1) << 7) | (1 << 6) | ((!(xb >> 3) & 1) << 5) | 0b00010);
-        self.a.byte(((w as u8) << 7) | ((!xa & 15) << 3) | 0b01);
+        self.a.byte(((!(r >> 3) & 1) << 7) | (1 << 6) | ((!(xc >> 3) & 1) << 5) | 0b00010);
+        self.a.byte(((w as u8) << 7) | ((!xb & 15) << 3) | 0b01);
         self.a.byte(op);
-        self.a.modrm_rr(r, xb);
+        self.a.modrm_rr(r, xc);
         let xd = self.def_f(d, XS);
         self.a.movf_rr(true, xd, 0);
         self.fin_f(d, xd);
@@ -4287,6 +4552,9 @@ impl<'a> Gen<'a> {
         for (d, s2) in regalloc::seq_moves(&moves, R10, XS) {
             self.mv(d, s2);
         }
+        if self.ymm {
+            self.a.vzeroupper();
+        }
         match c {
             Callee::Fn(id) => {
                 self.mov_reloc(RAX, Reloc::Slot(*id));
@@ -4504,6 +4772,22 @@ fn scalar_minmax(i: &Inst, a: VReg, b: VReg) -> Option<(bool, u8)> {
     }
 }
 
+/// VEX pp of a float op's lane width: none (ps) or 66 (pd)
+fn pd(w: VW) -> u8 {
+    if w == VW::D { 1 } else { 0 }
+}
+
+/// An instruction on 256-bit vectors (its result or stored value is a V256, or a half of one).
+fn y_inst(f: &Func, i: &Inst) -> bool {
+    let y = |v: &VReg| f.vregs[v.0 as usize] == Cls::V256;
+    match i {
+        Inst::VX(VX::Half(_), ..) => true,
+        Inst::VX(_, d, ..) | Inst::VLoad(d, ..) | Inst::VFma(_, _, d, ..) | Inst::VSplat(d, _) | Inst::VConst(d, _) | Inst::Mov(d, _) => y(d),
+        Inst::VStore(_, _, v) => y(v),
+        _ => false,
+    }
+}
+
 /// Whether the emitter encodes `op` (the legaliser expands the lane-wise ops it does not).
 pub fn vx_native(options: &relax_session::Options, op: VX) -> bool {
     use VW::*;
@@ -4592,6 +4876,19 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     } else {
         f
     };
+    // 256-bit vectors from pairs of 128-bit halves (AVX, optimised tiers)
+    let paired;
+    let f = if host_avx(options) && (env.opt_regs || f.full) && f.vregs.contains(&Cls::V128) && !crate::stats::opt_off(options, "-pair256") {
+        let mut g = f.clone();
+        if crate::pair256::pair256(&mut g, crate::pair256::Caps { avx2: options.cpu.avx2, fma: options.cpu.fma }) {
+            paired = g;
+            &paired
+        } else {
+            f
+        }
+    } else {
+        f
+    };
     // chains of compares of one value against constants: jump tables, bit tests, binary search
     let switched = crate::switch::lower_switches(options, f);
     let (f, freq_sw) = match &switched {
@@ -4602,7 +4899,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // constants used in loops defined once at the entry (the allocator keeps them in registers
     // or recomputes them); constant operands that fit an imm32 become immediates
     // (hot code only: the rewrite copies the function, +15% back-end time at O1)
-    let hoisted = if env.opt_regs || f.full { regalloc::hoist_loop_consts(f, &imm_fits) } else { None };
+    let hoisted = if env.opt_regs || f.full { regalloc::hoist_loop_consts(f, &imm_fits, false) } else { None };
     let f = hoisted.as_ref().unwrap_or(f);
     // compares next to the selects that read them (the cmov takes the flags)
     let sunk = if env.opt_regs || f.full { regalloc::sink_compares(f) } else { None };
@@ -4647,6 +4944,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         text_len: 0,
         mem_const: None,
         test_fuse: None,
+        bt_fuse: None,
         load_fuse: None,
         jt_fix: Vec::new(),
         last_spill: None,
@@ -4689,6 +4987,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         cret_ptr: 0,
         stage: 0,
         last_call_ret: 0,
+        ymm: f.vregs.iter().any(|c| *c == Cls::V256),
         pads: Vec::new(),
         unwind_tab: Vec::new(),
     };
