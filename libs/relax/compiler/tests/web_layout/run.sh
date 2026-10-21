@@ -11,6 +11,11 @@ B=$1
 W=$2
 T=${3:-$(mktemp -d)}
 mkdir -p "$T"
+# TABLE=<file>: a reference table made elsewhere (the machine without rustc's wasm32 std or node)
+if [ -n "${TABLE:-}" ]; then
+  cp "$TABLE" "$T/table.txt"
+  case "$W" in w32) TRIPLE=wasm32-unknown-unknown ;; *) TRIPLE=wasm64-unknown-unknown ;; esac
+else
 case "$W" in
   w32) TRIPLE=wasm32-unknown-unknown
        rustc --edition 2021 -O --target wasm32-unknown-unknown --crate-type cdylib "$H/wasm_ref.rs" -o "$T/ref.wasm" 2>"$T/rustc.err" || { cat "$T/rustc.err"; exit 2; }
@@ -20,6 +25,7 @@ case "$W" in
        "$T/ref" > "$T/table.txt" || exit 2 ;;
   *) echo "usage: run.sh <binary> <w32|w64> [workdir]"; exit 2 ;;
 esac
+fi
 cp "$H/corpus.rs" "$T/corpus.rs"
 python3 "$H/gen_check.py" "$T/table.txt" "$T/check.rs" > "$T/gen.out" || exit 2
 mkdir -p "$T/u"
