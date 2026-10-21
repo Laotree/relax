@@ -9362,6 +9362,12 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     if cfg.fold && relax_codegen::ranges::fold_ranges(options, func) {
         relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
     }
+    // bounds checks the counted loop's range implies once a guard in front of it holds: a
+    // check-free clone (rotation, unrolling, vectorisation take it), the original as fallback
+    if cfg.fold && relax_codegen::version::version_bounds_loops(options, func) {
+        verify_pass(func, "version_bounds_loops");
+        relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
+    }
     // Run after both inlining rounds and before small slots share storage:
     // aggregate ABI halves and partial byte buffers still name distinct slots.
     if cfg.fold && cfg.sroa && relax_codegen::opt::promote_vector_slots(func) {

@@ -11,6 +11,7 @@ pub mod loops;
 pub mod native;
 pub mod opt;
 pub mod ranges;
+pub mod version;
 
 /// This crate has no movable compiler statics; opt::T remains a process-wide OnceLock.
 pub struct ZoneTaken;
