@@ -9310,7 +9310,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     TIER1_PREP[0].fetch_add(cpu_ns() - tp, Ordering::Relaxed);
     TIER1_PREP[2].fetch_add(bodies.index.len() as u64, Ordering::Relaxed);
     let prepared = |c: u32| bodies.prepared(c);
-    let mut inlined = tier1_simplify(options, func, id, name, get, &prepared, single, ro, cfg, nounwind, frequencies, inline_stats.as_mut(), None);
+    let mut inlined = tier1_simplify(options, func, id, name, get, &prepared, single, ro, cfg, nounwind, frequencies, inline_stats.as_mut(), None, None);
     bodies.expand(&mut inlined);
     // array iterators (a slot read at runtime offsets): their scalar fields in registers, so
     // the iteration counter can drive full unrolling below
@@ -9598,7 +9598,10 @@ impl InlineBodies {
                 f.baseline = false;
                 let mut raw = (relax_backend::rir::Func::new(String::new(), 0), Vec::new());
                 let mut stats = stats_on.then(relax_codegen::opt::InlineStats::default);
-                tier1_simplify(options, &mut f, ids[k], &o1.name, get, &sub_prepared, &single_rec, ro, cfg, &recording, &mut structural, stats.as_mut(), Some(&mut raw));
+                // a preparation only serves while its priced body stays admissible: it grows to the
+                // largest size its rules admit, not to a caller's growth room
+                let cap = relax_codegen::opt::max_admitted_insts(options, attrs);
+                tier1_simplify(options, &mut f, ids[k], &o1.name, get, &sub_prepared, &single_rec, ro, cfg, &recording, &mut structural, stats.as_mut(), Some(&mut raw), Some(cap));
                 let rd = reads.borrow_mut().take().unwrap();
                 TIER1_PREP[1].fetch_add(1, Ordering::Relaxed);
                 if let Some(st) = stats { st.report(&format!("prep:{} (root {})", o1.name, root)); }
@@ -9682,8 +9685,11 @@ impl InlineBodies {
 /// slot cleanup): what a caller's build inlines when it takes this function bottom-up.
 /// `inlined_only`: receives the body after the first inlining round, before any optimisation,
 /// with the callees that round inlined.
-fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, prepared: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, *const relax_backend::rir::Func)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, mut inline_stats: Option<&mut relax_codegen::opt::InlineStats>, inlined_only: Option<&mut (relax_backend::rir::Func, Vec<(u32, usize)>)>) -> Vec<(u32, usize)> {
+fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, prepared: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, *const relax_backend::rir::Func)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, mut inline_stats: Option<&mut relax_codegen::opt::InlineStats>, inlined_only: Option<&mut (relax_backend::rir::Func, Vec<(u32, usize)>)>, growth_cap: Option<usize>) -> Vec<(u32, usize)> {
     let mut limits = relax_codegen::opt::InlineLimits::tier1_for(func);
+    if let (Some(cap), Some(g)) = (growth_cap, limits.growth_limit.as_mut()) {
+        *g = (*g).min(cap.max(relax_codegen::opt::inst_count(func)));
+    }
     let mut inlined: Vec<(u32, usize)> = Vec::new();
     if cfg.inline {
         let ti = relax_backend::stats::pass_clock();
