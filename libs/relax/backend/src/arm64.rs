@@ -536,7 +536,7 @@ fn imm_fits(i: &Inst) -> bool {
         Inst::IBinI(op, it, _, _, v) => match op {
             IOp::Add | IOp::Sub => v.unsigned_abs() < (1 << 24),
             IOp::Shl | IOp::Shr => true,
-            IOp::Mul => v > 0 && (v & (v - 1)) == 0,
+            IOp::Mul => v > 0 && ((v & (v - 1)) == 0 || mul_shift_add(v).is_some()),
             IOp::And | IOp::Or | IOp::Xor => {
                 (op == IOp::And && (v == 0xff || v == 0xffff || v == 0xffff_ffff)) || ((it.bits == 64 || (it == U32 && (0..1i64 << 32).contains(&v))) && bitmask_imm(v as u64).is_some())
             }
@@ -544,6 +544,18 @@ fn imm_fits(i: &Inst) -> bool {
         },
         _ => true,
     }
+}
+
+/// x * v as one shifted add or subtract: v = 2^k + 1 -> (k, true) `add d, x, x, lsl k`;
+/// v = 2^k - 1 -> (k, false) `lsl t, x, k; sub d, t, x` (k >= 2; 1 and powers of two are shifts).
+fn mul_shift_add(v: i64) -> Option<(u32, bool)> {
+    if v > 2 && ((v - 1) & (v - 2)) == 0 {
+        return Some(((v - 1).trailing_zeros(), true));
+    }
+    if v > 2 && v < i64::MAX && ((v + 1) & v) == 0 {
+        return Some(((v + 1).trailing_zeros(), false));
+    }
+    None
 }
 
 /// The (N, immr, imms) fields of a logical-instruction immediate for a 64-bit value: a repeating
@@ -3470,6 +3482,15 @@ impl<'a> Gen<'a> {
                 let s = imm.trailing_zeros();
                 self.a.ubfm(rd, ra, (64 - s) & 63, 63 - s);
             }
+            IOp::Mul if mul_shift_add(imm).is_some() => match mul_shift_add(imm).unwrap() {
+                // add rd, ra, ra, lsl #k
+                (k, true) => self.a.e(0x8B00_0000 | (ra as u32) << 16 | k << 10 | (ra as u32) << 5 | rd as u32),
+                // lsl ip0, ra, #k; sub rd, ip0, ra
+                (k, false) => {
+                    self.a.ubfm(IP0, ra, (64 - k) & 63, 63 - k);
+                    self.a.rrr(0xCB00_0000, rd, IP0, ra);
+                }
+            },
             IOp::Shl => {
                 let s = (imm & 63) as u32;
                 self.a.ubfm(rd, ra, (64 - s) & 63, 63 - s);
