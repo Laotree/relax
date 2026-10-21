@@ -55,11 +55,21 @@ fn shake_blocks(f: &mut Func, trap: bool, keep: &dyn Fn(u32) -> bool, mut stub: 
     for p in &f.params {
         defs.entry(*p).or_insert((0, 0)).0 += 1;
     }
+    // a coverage store, possibly merged by the optimiser with its neighbours (consecutive blocks
+    // have consecutive bytes: two byte stores become one 2-, 4- or 8-byte store of 0x0101..):
+    // Some(any of its bytes' blocks ran)
     let cov = |i: &Inst| -> Option<bool> {
-        if let Inst::Store(Mem::Int(1, _), base, off, _) = i {
+        if let Inst::Store(Mem::Int(w, _), base, off, _) = i {
             let (n, v) = defs.get(base).copied()?;
             if n == 1 && v != i64::MIN {
-                return crate::coverage::hit_at((v as u64).wrapping_add(*off as i64 as u64));
+                let a = (v as u64).wrapping_add(*off as i64 as u64);
+                let mut any = None;
+                for k in 0..(*w as u64).max(1) {
+                    if let Some(h) = crate::coverage::hit_at(a + k) {
+                        any = Some(any.unwrap_or(false) || h);
+                    }
+                }
+                return any;
             }
         }
         None
@@ -138,6 +148,12 @@ fn shake_blocks(f: &mut Func, trap: bool, keep: &dyn Fn(u32) -> bool, mut stub: 
     }
     if removed > 0 {
         relax_backend::passes::dce(f);
+        // a coverage address still named: a store shape this pass does not know (it would write
+        // into linear memory at a wrapped address): say so
+        let left = f.blocks.iter().flat_map(|b| b.insts.iter()).filter(|i| matches!(i, Inst::Iconst(_, v) if crate::coverage::hit_at(*v as u64).is_some())).count();
+        if left > 0 {
+            eprintln!("wasm export: {}: {} coverage addresses left after the strip", f.name, left);
+        }
     }
     (trapped, removed)
 }
