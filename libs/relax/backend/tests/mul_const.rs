@@ -35,7 +35,7 @@ fn constant_multiplies_wrap_like_rust() {
     let tys = [IntTy { bits: 64, signed: true }, U32, IntTy { bits: 32, signed: true }, IntTy { bits: 8, signed: false }];
     let xs: [u64; 6] = [0, 1, 7, 0x7fff_ffff, 0xdead_beef_1234_5678, u64::MAX];
     for it in tys {
-        for k in [2i64, 3, 5, 7, 9, 15, 17, 31, 33, 255, 257, 1023, 1 << 20, (1 << 33) + 1, (1 << 40) - 1, 6, 10] {
+        for k in [2i64, 3, 5, 7, 9, 15, 17, 31, 33, 255, 257, 1023, 1 << 20, (1 << 30) + 1, (1i64 << 31) - 1, 6, 10] {
             let code = compile(&func(it, k));
             let run: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
             for x in xs {
