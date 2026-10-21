@@ -9208,6 +9208,8 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
                 inlined.push((c, rule));
             }
         }
+        // the code must not depend on the order the sites were taken in
+        relax_backend::passes::renumber_rpo(func);
         relax_backend::stats::pass_time(5, ti);
     }
     opt_pipeline(options, func, ro, cfg, layout_for(options, name), true, nounwind);
@@ -9219,6 +9221,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         let more = relax_codegen::opt::inline_calls_ordered(options, func, id, get, single, nounwind, &limits, freqs.as_deref(), inline_stats.as_mut());
         relax_backend::stats::pass_time(5, ti);
         if !more.is_empty() {
+            relax_backend::passes::renumber_rpo(func);
             for (c, rule) in more {
                 if !inlined.iter().any(|x| x.0 == c) {
                     inlined.push((c, rule));
