@@ -2829,7 +2829,7 @@ impl Unit {
 
     /// `len` bytes of code memory (global_asm.rs places a block whose fields need its address
     /// before it is written: write_reserved_code).
-    pub(crate) fn reserve_code(&self, len: u64, align: u64) -> u64 {
+    pub(crate) fn reserve_asm_code(&self, len: u64, align: u64) -> u64 {
         bump(&self.code_next, len.max(1), align.max(16), self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory")
     }
     pub(crate) fn write_reserved_code(&self, at: u64, b: &[u8]) {

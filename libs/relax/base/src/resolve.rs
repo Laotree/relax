@@ -162,6 +162,8 @@ pub struct Resolver {
     manifests: Vec<Manifest>,
     by_dir: HashMap<String, usize>,
     cfg: crate::cfg::CfgSet,
+    /// `--allow-c`: registry packages that compile C are accepted (cargo builds them, native.rs)
+    allow_c: bool,
 }
 
 fn read_toml(path: &str) -> Result<TomlTable, String> {
@@ -246,7 +248,7 @@ impl Resolver {
     /// `dir` is where `makepad run` starts (the current folder, a git run's workspace): the
     /// workspace is found as cargo finds it (find_root).
     pub fn new(sess: &std::sync::Arc<crate::Session>, dir: &str) -> Result<Resolver, String> {
-        Ok(Resolver { ws: Workspace::load(&find_root(dir)?)?, vendor: vendor_dir(dir)?, fetched: Default::default(), manifests: Vec::new(), by_dir: HashMap::new(), cfg: crate::cfg::CfgSet::host(sess, &[]) })
+        Ok(Resolver { ws: Workspace::load(&find_root(dir)?)?, vendor: vendor_dir(dir)?, fetched: Default::default(), manifests: Vec::new(), by_dir: HashMap::new(), cfg: crate::cfg::CfgSet::host(sess, &[]), allow_c: sess.options.allow_c })
     }
 
     fn registry_dir(&self, name: &str, req: &str) -> Result<String, String> {
@@ -506,10 +508,10 @@ impl Resolver {
                 }
             }
         }
-        if registry {
+        if registry && !self.allow_c {
             let build_deps: Vec<String> = deps.iter().filter(|d| d.build).map(|d| d.package.clone()).collect();
             if let Some(c) = crate::registry::c_build_dep(&build_deps) {
-                return Err(format!("registry package `{}` {} compiles C or C++ (build-dependency `{}`): makepad run runs no C compiler", name, version, c));
+                return Err(format!("registry package `{}` {} compiles C or C++ (build-dependency `{}`): it {}", name, version, c, relax_session::options::C_GATE));
             }
         }
         let i = self.manifests.len();

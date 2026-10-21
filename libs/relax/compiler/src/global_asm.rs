@@ -127,7 +127,7 @@ fn place_all(u: &Unit) -> Result<HashMap<String, u64>, String> {
             if s.exec {
                 let n_br = c.out.fixups.iter().filter(|f| f.section == si as u32 && matches!(f.kind, FixKind::X64Branch32 | FixKind::A64Branch26)).count();
                 let len = s.bytes.len() + 16 * n_br;
-                bases[ci][si] = u.reserve_code(len as u64, s.align.max(16) as u64);
+                bases[ci][si] = u.reserve_asm_code(len as u64, s.align.max(16) as u64);
             }
         }
     }
