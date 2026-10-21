@@ -1407,6 +1407,9 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     // Recomputed constants and addresses too (one recomputation instead of one per use), except
     // as the value of a store that writes the constant directly (RegConfig::store_imm)
     let mut windows: Vec<(u32, u32, u32, u8)> = Vec::new();
+    // windows that start at the value's definition: entered with the value in the register (no load)
+    let mut def_wins: Vec<(u32, u32, u32, u8)> = Vec::new();
+    let def_windows = !crate::stats::opt_off(options, "-defwin");
     if thorough && windows_on(options) {
         let regs: Vec<u8> = cfg.int_caller.iter().chain(used_callee_int.iter()).copied().collect();
         let callee_set = used_callee_int.clone();
@@ -1424,11 +1427,18 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             // per spilled vreg: use instruction indices, in order; a def or a call ends a run
             let mut runs: HashMap<u32, Vec<usize>> = HashMap::new();
             let mut done: Vec<(u32, Vec<usize>)> = Vec::new();
+            // runs that start at the value's definition (the result stays in the window's register
+            // after its store home: no reload for the reads after it in the block): (def index, uses)
+            let mut druns: HashMap<u32, (usize, Vec<usize>)> = HashMap::new();
+            let mut ddone: Vec<(u32, usize, Vec<usize>)> = Vec::new();
             for ii in 0..lim {
                 let i = &b.insts[ii];
                 if matches!(i, Inst::Call(..)) {
                     for (v, r) in runs.drain() {
                         done.push((v, r));
+                    }
+                    for (v, (di, r)) in druns.drain() {
+                        ddone.push((v, di, r));
                     }
                     continue;
                 }
@@ -1446,21 +1456,76 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                         let uv = u.0 as usize;
                         let rm = loc[uv] == Loc::None && matches!(remat[uv], Remat::Const(_) | Remat::Addr(_) | Remat::FnAddr(_)) && stored != Some(u.0);
                         if (matches!(loc[uv], Loc::Stack(_)) || rm) && f.vregs[uv] == Cls::I && !ds.contains(&u.0) {
+                            if let Some(e) = druns.get_mut(&u.0) {
+                                if e.1.last() != Some(&ii) {
+                                    e.1.push(ii);
+                                }
+                                return;
+                            }
                             let e = runs.entry(u.0).or_default();
                             if e.last() != Some(&ii) {
                                 e.push(ii);
                             }
                         }
                     });
+                } else {
+                    // another instruction kind reads its operands its own way: no def-run passes it
+                    for_uses(i, |u| {
+                        if let Some((di, r)) = druns.remove(&u.0) {
+                            ddone.push((u.0, di, r));
+                        }
+                    });
                 }
-                for d in ds {
-                    if let Some(r) = runs.remove(&d) {
-                        done.push((d, r));
+                for d in &ds {
+                    if let Some(r) = runs.remove(d) {
+                        done.push((*d, r));
+                    }
+                    if let Some((di, r)) = druns.remove(d) {
+                        ddone.push((*d, di, r));
+                    }
+                }
+                // emitters that compute a result into def_i's register and store it home (fin_i)
+                let defines_via_def_i = matches!(i, Inst::Load(Mem::Int(..), ..) | Inst::LoadX(Mem::Int(..), ..) | Inst::IBin(..) | Inst::IBinI(..) | Inst::Conv(Conv::IntToInt(_), ..));
+                if def_windows && defines_via_def_i && ds.len() == 1 {
+                    let d = ds[0];
+                    let mut reads_d = false;
+                    for_uses(i, |u| reads_d |= u.0 == d);
+                    if matches!(loc[d as usize], Loc::Stack(_)) && f.vregs[d as usize] == Cls::I && !reads_d {
+                        druns.insert(d, (ii, Vec::new()));
                     }
                 }
             }
             for (v, r) in runs.drain() {
                 done.push((v, r));
+            }
+            for (v, (di, r)) in druns.drain() {
+                ddone.push((v, di, r));
+            }
+            ddone.sort_by_key(|x| (std::cmp::Reverse(x.2.len()), x.0));
+            for (v, di, us) in ddone {
+                if us.is_empty() || in_region.contains(&(v, bi as u32)) {
+                    continue;
+                }
+                let a = block_start[bi] + 2 * di as u32 + 2; // the definition
+                let z = block_start[bi] + 2 * *us.last().unwrap() as u32 + 1;
+                // free over the defining instruction's operands and the one before it too (deferred
+                // fused compares read at the next instruction)
+                let a0 = if di > 0 { a - 5 } else { a - 1 };
+                for &c in &regs {
+                    let o = &mut occ[c as usize];
+                    if !o.is_empty() && bits_any(o, a0, z) {
+                        continue;
+                    }
+                    if !callee_set.contains(&c) && call_pos.iter().any(|p| *p >= a0 && *p <= z) {
+                        continue;
+                    }
+                    if o.is_empty() {
+                        o.resize(pos_words, 0);
+                    }
+                    bits_fill(o, a0, z);
+                    def_wins.push((v, a, z, c));
+                    break;
+                }
             }
             done.sort_by_key(|x| (std::cmp::Reverse(x.1.len()), x.0));
             for (v, us) in done {
@@ -1494,6 +1559,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         }
     }
     windows.extend(region_windows);
+    chained.extend(def_wins);
     Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows, chained, save_skip, restore_skip }
 }
 

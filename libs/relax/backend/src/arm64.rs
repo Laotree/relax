@@ -834,6 +834,9 @@ impl<'a> Gen<'a> {
     fn def_i(&self, v: VReg, scratch: u8) -> u8 {
         match self.al.loc[v.0 as usize] {
             Loc::Reg(r) => r,
+            // a window that starts at this definition (regalloc def windows): computed into its
+            // register, which keeps the value after fin_i stores it home
+            Loc::Stack(_) => self.win.get(&v.0).and_then(|ws| ws.iter().find(|w| w.0 == self.cur_pos + 1)).map_or(scratch, |w| w.2),
             _ => scratch,
         }
     }
