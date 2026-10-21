@@ -11224,6 +11224,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let fronts: std::cell::RefCell<Vec<(u32, DefId, Vec<TyId>)>> = Default::default();
     // owner cpu of the snapshot requests (cpu_ns is per thread: read on the owner)
     let owner_ns = std::cell::Cell::new(0u64);
+    // candidate RIR built off the owner is stored only if no patch landed meanwhile
+    let epoch0 = PATCH_EPOCH.load(Ordering::SeqCst);
     let snapped = loop {
     fronts.borrow_mut().clear();
     let snapped = owner::call(owner::Class::Background, || {
@@ -11557,13 +11559,32 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // this round's candidates: their type checks and lowering here, off the unit
     let tf = cpu_ns();
     TIER1_SNAP_FRONTS[0].fetch_add(more.len() as u64, Ordering::Relaxed);
+    let mut ids = Vec::with_capacity(more.len());
     for (c, d, args) in more {
         fronted.insert(c);
+        ids.push(c);
         let _preemptible = crate::preempt::Preemptible::on();
         typeck_ahead(&front, d, args, 1, false, true);
         lower_ahead(&front, c, true);
     }
     TIER1_SNAP_FRONTS[1].fetch_add(cpu_ns() - tf, Ordering::Relaxed);
+    // and their O1 builds as an O2 build makes its own (o2_begin / o2_finish): the front -- which
+    // takes the RIR lowered above -- on the owner, giving way to a program thread between bodies;
+    // the optimisation here; the RIR stored by a finish. What gave way or failed is built by the
+    // snapshot as before.
+    let (preps, gave): (Vec<(u32, Prep)>, Vec<u32>) = owner::call(owner::Class::Background, || o3_candidates_begin(up, &ids));
+    for c in gave { fronted.remove(&c); }
+    if !preps.is_empty() {
+        let to = cpu_ns();
+        let mut done: Vec<Deferred> = Vec::new();
+        for (c, prep) in preps {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize_tree(options, c, prep, &mut done)));
+            if let Ok(r) = r { done.push((c, r)); }
+        }
+        TIER1_SNAP_OFF[0].fetch_add(done.len() as u64, Ordering::Relaxed);
+        TIER1_SNAP_OFF[1].fetch_add(cpu_ns() - to, Ordering::Relaxed);
+        owner::call(owner::Class::FinishBackground, || o3_candidates_finish(up, epoch0, done));
+    }
     };
     // lowerings ahead that no snapshot build took (a candidate built meanwhile, or given way):
     // not kept for the rest of the run
@@ -12918,6 +12939,67 @@ pub static TIER1_RIR_REBUILT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::ne
 /// fronts the O3 thread ran off the owner first (count, cpu ns)
 pub static TIER1_SNAP_BUILT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 pub static TIER1_SNAP_FRONTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// O3 snapshots: inline candidates whose O1 optimisation ran on the O3 thread (count, cpu ns)
+pub static TIER1_SNAP_OFF: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// An O3 build's inline candidates (`ids`, their bodies checked and lowered ahead): the fronts of
+/// their O1 builds, deferring the optimisation (unit call; o2_begin's pattern). Returns the
+/// preparations, and the slots left out because a program thread's request arrived (they give way).
+unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[u32]) -> (Vec<(u32, Prep)>, Vec<u32>) {
+    let mut preps = Vec::new();
+    let mut gave = Vec::new();
+    for (i, &c) in ids.iter().enumerate() {
+        if owner::urgent() {
+            gave.extend_from_slice(&ids[i..]);
+            break;
+        }
+        let u = &*up;
+        let f = &u.fns[c as usize];
+        if f.rir.is_some() || f.building || f.inflight || f.build_err.is_some() {
+            continue;
+        }
+        match &f.key {
+            FnKey::Inst(_, args) if !args.iter().any(|t| u.tcx.tys.depth(*t) > INSTANCE_DEPTH_LIMIT) => {}
+            _ => continue,
+        }
+        (&mut *up).check_before_lowering(c);
+        if begin_build(up, c).is_err() {
+            continue;
+        }
+        let depth0 = BUILD_STACK.try_with(|s| s.borrow().len()).unwrap_or(0);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare_rir_from(up, c, true, None, RirMode::Tier0)));
+        if r.is_err() {
+            let open: Vec<u32> = BUILD_STACK.try_with(|s| s.borrow()[depth0.min(s.borrow().len())..].to_vec()).unwrap_or_default();
+            for x in open.into_iter().rev() {
+                end_build(up, x);
+            }
+        }
+        end_build(up, c);
+        match r {
+            Ok(Ok((p, _))) => preps.push((c, p)),
+            Ok(Err(e)) if e == YIELDED => gave.push(c),
+            Err(p) if p.is::<crate::preempt::OwnerBusy>() => std::panic::resume_unwind(p),
+            _ => {}
+        }
+    }
+    (preps, gave)
+}
+
+/// Stores the RIR o3_candidates_begin's builds made off the owner (unit call), where nobody built
+/// it meanwhile and no patch landed since `epoch`.
+unsafe fn o3_candidates_finish(up: *mut Unit, epoch: u64, done: Vec<Deferred>) {
+    if PATCH_EPOCH.load(Ordering::SeqCst) != epoch {
+        return;
+    }
+    for (c, r) in done {
+        if let Ok((f, inl)) = r {
+            let x = &(&*up).fns[c as usize];
+            if x.rir.is_none() && !x.building && x.build_err.is_none() {
+                store_rir(up, c, f, inl, 0);
+            }
+        }
+    }
+}
 
 /// Speculative results waiting for their first call: (slot, wall ns when built). A result
 /// nobody called within MAKEPAD_RUN_SPEC_TTL_MS (default 2000; 0 = keep forever) is dropped with its
