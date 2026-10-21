@@ -1,6 +1,7 @@
 //! AArch64 encoder tests: an oracle against clang's integrated assembler (skipped without
 //! clang), and unit tests for placeholders, fixups, labels, Mach-O syntax and errors.
 use super::*;
+use super::arm64::parse_reg;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -58,16 +59,49 @@ fn clang_bytes(src: &str) -> Vec<u8> {
     elf_text(&obj)
 }
 
-fn clang_rejects(line: &str) -> bool {
+const HEADER: &str = ".arch armv8.5-a+lse+fp16+lor+crc+sb+rcpc+dotprod+rdm+aes\n";
+
+fn clang_run(text: &str) -> (bool, String, Vec<u8>) {
     let id = COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir();
     let s = dir.join(format!("relax_asm_a64_{}_{}.s", std::process::id(), id));
     let o = dir.join(format!("relax_asm_a64_{}_{}.o", std::process::id(), id));
-    std::fs::write(&s, format!(".arch armv8.5-a+lse+fp16+lor\n{}\n", line)).unwrap();
-    let out = Command::new("clang").args(["-c", "-x", "assembler", "--target=aarch64-unknown-linux-gnu", "-o"]).arg(&o).arg(&s).output().unwrap();
+    std::fs::write(&s, text).unwrap();
+    let out = Command::new("clang").args(["-c", "-x", "assembler", "--target=aarch64-unknown-linux-gnu", "-ferror-limit=0", "-o"]).arg(&o).arg(&s).output().unwrap();
     let _ = std::fs::remove_file(&s);
+    let bytes = if out.status.success() { elf_text(&std::fs::read(&o).unwrap()) } else { Vec::new() };
     let _ = std::fs::remove_file(&o);
-    !out.status.success()
+    (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned(), bytes)
+}
+
+/// For every line (a single instruction): clang's four bytes, or None when clang rejects it.
+fn clang_each(lines: &[&str]) -> Vec<Option<Vec<u8>>> {
+    let text = format!("{}{}\n", HEADER, lines.join("\n"));
+    let (ok, stderr, bytes) = clang_run(&text);
+    if ok {
+        assert_eq!(bytes.len(), lines.len() * 4, "every line must be one instruction");
+        return bytes.chunks(4).map(|c| Some(c.to_vec())).collect();
+    }
+    let mut rejected = std::collections::HashSet::new();
+    for l in stderr.lines() {
+        if let Some(p) = l.find(".s:") {
+            let rest = &l[p + 3..];
+            let n: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if rest[n.len()..].contains(": error") {
+                rejected.insert(n.parse::<usize>().unwrap() - 2);
+            }
+        }
+    }
+    let kept: Vec<&str> = lines.iter().enumerate().filter(|(i, _)| !rejected.contains(i)).map(|(_, l)| *l).collect();
+    let (ok, stderr, bytes) = clang_run(&format!("{}{}\n", HEADER, kept.join("\n")));
+    assert!(ok, "clang rejected lines it did not report:\n{}", stderr);
+    assert_eq!(bytes.len(), kept.len() * 4);
+    let mut it = bytes.chunks(4);
+    (0..lines.len()).map(|i| if rejected.contains(&i) { None } else { it.next().map(|c| c.to_vec()) }).collect()
+}
+
+fn clang_rejects(line: &str) -> bool {
+    clang_each(&[line])[0].is_none()
 }
 
 fn hex(b: &[u8]) -> String {
@@ -746,8 +780,7 @@ fn gen(template: &str, subs: &[&str]) -> String {
     subs.iter().map(|s| template.replace('@', s)).collect::<Vec<_>>().join("\n")
 }
 
-#[test]
-fn oracle_fp() {
+fn fp_corpus() -> String {
     let mut src = String::new();
     src += r#"
 fmov d0, d1
@@ -834,11 +867,15 @@ ucvtf d0, w1
     for f in ["fcvtns", "fcvtnu", "fcvtas", "fcvtau", "fcvtps", "fcvtpu", "fcvtms", "fcvtmu"] {
         src += &format!("\n{f} x0, d1\n{f} w0, s1\n{f} w0, d1\n{f} x0, h1");
     }
-    oracle("fp", &src);
+    src
 }
 
 #[test]
-fn oracle_neon() {
+fn oracle_fp() {
+    oracle("fp", &fp_corpus());
+}
+
+fn neon_corpus() -> String {
     let mut src = String::new();
     src += r#"
 add d0, d1, d2
@@ -1089,7 +1126,12 @@ ld4r {v0.2d, v1.2d, v2.2d, v3.2d}, [x0], #32
             src += &format!("\n{f} v0.{a}, v1.{a}, v2.{a}");
         }
     }
-    oracle("neon", &src);
+    src
+}
+
+#[test]
+fn oracle_neon() {
+    oracle("neon", &neon_corpus());
 }
 
 #[test]
@@ -1143,4 +1185,368 @@ fn oracle_mov_imm() {
         src += &format!("\nmov w0, #{}", w as i32);
     }
     oracle_x("mov_imm", &src, true);
+}
+
+// ---------------------------------------------------------------- unit tests
+
+fn words(b: &[u8]) -> Vec<u32> {
+    b.chunks(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect()
+}
+
+fn run(format: Format, kind: Kind, tpl: &str, args: &[Arg]) -> Output {
+    let names: Vec<(String, u32)> = Vec::new();
+    let pieces = parse_template(&[tpl], &names, args.len() as u32, args.len() as u32, false).unwrap();
+    assemble(Arch::Arm64, format, kind, &pieces, args, false).unwrap_or_else(|e| panic!("`{}`: {}", tpl, e))
+}
+
+fn run_named(format: Format, tpl: &str, names: &[(&str, u32)], args: &[Arg]) -> Output {
+    let names: Vec<(String, u32)> = names.iter().map(|(n, k)| (n.to_string(), *k)).collect();
+    let pieces = parse_template(&[tpl], &names, 0, args.len() as u32, false).unwrap();
+    assemble(Arch::Arm64, format, Kind::Inline, &pieces, args, false).unwrap_or_else(|e| panic!("`{}`: {}", tpl, e))
+}
+
+fn text(o: &Output) -> &[u8] {
+    &o.sections[0].bytes
+}
+
+/// The template with its operands against clang's bytes for the equivalent concrete text.
+fn same_as_clang(format: Format, tpl: &str, args: &[Arg], concrete: &str) -> Output {
+    let o = run(format, Kind::Inline, tpl, args);
+    if clang_works() {
+        let want = clang_bytes(&format!("{}\n", concrete));
+        assert_eq!(text(&o), &want[..], "`{}` vs clang `{}`: ours {} clang {}", tpl, concrete, hex(text(&o)), hex(&want));
+    }
+    o
+}
+
+fn sym(n: &str) -> Arg {
+    Arg::Sym(SymRef::Name(n.to_string()))
+}
+fn symv(n: &str, k: i64) -> Value {
+    Value::Sym(SymRef::Name(n.to_string()), k)
+}
+fn r(n: u8) -> Arg {
+    Arg::Reg(PReg::int(n))
+}
+fn v(n: u8) -> Arg {
+    Arg::Reg(PReg::vec(n))
+}
+
+#[test]
+fn macho_dispatch_stub() {
+    // adrp x16, {t}@PAGE ; ldr x16, [x16, {t}@PAGEOFF] ; br x16
+    let o = run(Format::MachO, Kind::Global, "adrp x16, {0}@PAGE\nldr x16, [x16, {0}@PAGEOFF]\nbr x16", &[sym("table")]);
+    assert_eq!(words(text(&o)), vec![0x9000_0010, 0xF940_0210, 0xD61F_0200]);
+    assert_eq!(o.fixups.len(), 2);
+    assert_eq!((o.fixups[0].at, o.fixups[0].kind, &o.fixups[0].target), (0, FixKind::A64Page21, &symv("table", 0)));
+    assert_eq!((o.fixups[1].at, o.fixups[1].kind, &o.fixups[1].target), (4, FixKind::A64Lo12 { scale: 3 }, &symv("table", 0)));
+}
+
+#[test]
+fn macho_add_pageoff_and_access_sizes() {
+    let o = run(Format::MachO, Kind::Global, "add x17, x17, {0}@PAGEOFF\nldr w1, [x2, {0}@PAGEOFF]\nldr q0, [x2, {0}@PAGEOFF]\nldrb w3, [x2, {0}@PAGEOFF]\nldrh w3, [x2, {0}@PAGEOFF]\nstr d0, [x2, {0}@PAGEOFF]", &[sym("tab")]);
+    let scales: Vec<FixKind> = o.fixups.iter().map(|f| f.kind).collect();
+    assert_eq!(
+        scales,
+        vec![FixKind::A64Lo12 { scale: 0 }, FixKind::A64Lo12 { scale: 2 }, FixKind::A64Lo12 { scale: 4 }, FixKind::A64Lo12 { scale: 0 }, FixKind::A64Lo12 { scale: 1 }, FixKind::A64Lo12 { scale: 3 }]
+    );
+    assert_eq!(words(text(&o))[0], 0x9100_0231);
+}
+
+#[test]
+fn elf_relocation_forms() {
+    let o = run(Format::Elf, Kind::Global, "adrp x16, {0} + 16\nldr x16, [x16, :lo12:{0} + 16]\nadd x0, x0, :lo12:{0}", &[sym("s")]);
+    assert_eq!(words(text(&o)), vec![0x9000_0010, 0xF940_0210, 0x9100_0000]);
+    assert_eq!(o.fixups[0].kind, FixKind::A64Page21);
+    assert_eq!(o.fixups[0].target, symv("s", 16));
+    assert_eq!(o.fixups[1].kind, FixKind::A64Lo12 { scale: 3 });
+    assert_eq!(o.fixups[1].target, symv("s", 16));
+    assert_eq!(o.fixups[2].kind, FixKind::A64Lo12 { scale: 0 });
+    // the table index form of the inventory: sym + k*8
+    let o = run(Format::Elf, Kind::Global, "adrp x16, {0} + 3*8\nldr x16, [x16, :lo12:{0} + 3*8]", &[sym("tbl")]);
+    assert_eq!(o.fixups[1].target, symv("tbl", 24));
+}
+
+#[test]
+fn branches_to_symbols() {
+    let o = run(Format::MachO, Kind::Global, "b {0}\nbl {1}", &[sym("f"), sym("enter")]);
+    assert_eq!(words(text(&o)), vec![0x1400_0000, 0x9400_0000]);
+    assert_eq!((o.fixups[0].at, o.fixups[0].kind, &o.fixups[0].target), (0, FixKind::A64Branch26, &symv("f", 0)));
+    assert_eq!((o.fixups[1].at, o.fixups[1].kind, &o.fixups[1].target), (4, FixKind::A64Branch26, &symv("enter", 0)));
+    // an undefined name in the text is a symbol too
+    let o = run(Format::Elf, Kind::Global, "bl some_c_function\nb.eq other\ncbz x0, other\ntbz x0, #3, other\nldr x0, lit", &[]);
+    let kinds: Vec<FixKind> = o.fixups.iter().map(|f| f.kind).collect();
+    assert_eq!(kinds, vec![FixKind::A64Branch26, FixKind::A64Branch19, FixKind::A64Branch19, FixKind::A64Branch14, FixKind::A64Branch19]);
+    assert_eq!(o.fixups[0].target, symv("some_c_function", 0));
+}
+
+#[test]
+fn register_operands_and_modifiers() {
+    same_as_clang(Format::MachO, "blr {0}", &[r(19)], "blr x19");
+    same_as_clang(Format::MachO, "mov sp, {0}", &[r(20)], "mov sp, x20");
+    same_as_clang(Format::MachO, "mov {0}, sp", &[r(20)], "mov x20, sp");
+    same_as_clang(Format::MachO, "mov {0:w}, {1:w}", &[r(0), r(17)], "mov w0, w17");
+    same_as_clang(Format::MachO, "mov {0}, {1}", &[r(2), r(29)], "mov x2, x29");
+    same_as_clang(Format::MachO, "add {0}, {1}, #1", &[r(3), r(4)], "add x3, x4, #1");
+    same_as_clang(Format::MachO, "add {0:w}, {1:w}, #1", &[r(3), r(4)], "add w3, w4, #1");
+    same_as_clang(Format::MachO, "mrs {}, fpcr", &[r(5)], "mrs x5, fpcr");
+    same_as_clang(Format::MachO, "msr fpcr, {}", &[r(5)], "msr fpcr, x5");
+    same_as_clang(Format::MachO, "mrs {}, tpidr_el0", &[r(1)], "mrs x1, tpidr_el0");
+    same_as_clang(Format::MachO, "mrs {}, ctr_el0", &[r(1)], "mrs x1, ctr_el0");
+    same_as_clang(Format::MachO, "dc cvau, {}", &[r(1)], "dc cvau, x1");
+    same_as_clang(Format::MachO, "ic ivau, {}", &[r(1)], "ic ivau, x1");
+    same_as_clang(Format::MachO, "ldr x11, [{0}, {1}, lsl #3]", &[r(2), r(10)], "ldr x11, [x2, x10, lsl #3]");
+    same_as_clang(Format::MachO, "str {0}, [sp, {1}, lsl #3]", &[r(11), r(10)], "str x11, [sp, x10, lsl #3]");
+    same_as_clang(Format::MachO, "ldr x16, [{0}, {1}, lsl #3]", &[r(17), r(16)], "ldr x16, [x17, x16, lsl #3]");
+    same_as_clang(Format::MachO, "stp q0, q1, [{0}, #64]", &[r(20)], "stp q0, q1, [x20, #64]");
+    same_as_clang(Format::MachO, "ldp q6, q7, [{0}, #160]", &[r(20)], "ldp q6, q7, [x20, #160]");
+}
+
+#[test]
+fn vector_and_float_modifiers() {
+    same_as_clang(Format::MachO, "fcvt {0:s}, {1:h}", &[v(0), v(1)], "fcvt s0, h1");
+    same_as_clang(Format::MachO, "fcvt {0:d}, {1:h}", &[v(2), v(3)], "fcvt d2, h3");
+    same_as_clang(Format::MachO, "fcvt {0:h}, {1:s}", &[v(4), v(5)], "fcvt h4, s5");
+    same_as_clang(Format::MachO, "fcvt {0:h}, {1:d}", &[v(6), v(7)], "fcvt h6, d7");
+    same_as_clang(Format::MachO, "fcvtl {0:v}.4s, {1:v}.4h", &[v(1), v(2)], "fcvtl v1.4s, v2.4h");
+    // named operands
+    let o = run_named(Format::MachO, "fcvtl {out:v}.4s, {inp:v}.4h", &[("out", 0), ("inp", 1)], &[v(1), v(2)]);
+    assert_eq!(words(text(&o)).len(), 1);
+    same_as_clang(Format::MachO, "fcvtl {0:v}.2d, {2:v}.2s", &[v(0), v(9), v(3)], "fcvtl v0.2d, v3.2s");
+    same_as_clang(Format::MachO, "fcvtl2 {1:v}.2d, {2:v}.4s", &[v(9), v(0), v(3)], "fcvtl2 v0.2d, v3.4s");
+    same_as_clang(Format::MachO, "fcvtn {1:v}.2s, {2:v}.2d", &[v(9), v(0), v(3)], "fcvtn v0.2s, v3.2d");
+    same_as_clang(Format::MachO, "fcvtn2 {1:v}.4s, {3:v}.2d", &[v(9), v(0), v(9), v(3)], "fcvtn2 v0.4s, v3.2d");
+    same_as_clang(Format::MachO, "fcvtn {0:v}.4h, {1:v}.4s", &[v(0), v(1)], "fcvtn v0.4h, v1.4s");
+    for (f, c) in [("fadd", "fadd"), ("fsub", "fsub"), ("fmul", "fmul"), ("fdiv", "fdiv")] {
+        for (m, rn) in [('h', "h"), ('s', "s"), ('d', "d")] {
+            same_as_clang(Format::MachO, &format!("{f} {{0:{m}}}, {{1:{m}}}, {{2:{m}}}"), &[v(0), v(1), v(2)], &format!(".arch armv8.2-a+fp16\n{c} {rn}0, {rn}1, {rn}2"));
+        }
+    }
+    let o = run_named(Format::MachO, "fmadd {x:d}, {x:d}, {y:d}, {z:d}", &[("x", 0), ("y", 1), ("z", 2)], &[v(1), v(2), v(3)]);
+    if clang_works() {
+        assert_eq!(words(text(&o)), words(&clang_bytes("fmadd d1, d1, d2, d3\n")));
+    }
+    same_as_clang(Format::MachO, "frintn {0:d}, {0:d}", &[v(1)], "frintn d1, d1");
+    same_as_clang(Format::MachO, "frintn {0:s}, {0:s}", &[v(1)], "frintn s1, s1");
+    same_as_clang(Format::MachO, "fsqrt {0:d}, {1:d}", &[v(1), v(2)], "fsqrt d1, d2");
+    same_as_clang(Format::MachO, "fsqrt {0:s}, {1:s}", &[v(1), v(2)], "fsqrt s1, s2");
+    same_as_clang(Format::MachO, "ldr {0:q}, [{1}]", &[v(1), r(2)], "ldr q1, [x2]");
+    same_as_clang(Format::MachO, "stp {0:d}, {1:d}, [sp, #16]", &[v(8), v(9)], "stp d8, d9, [sp, #16]");
+    same_as_clang(Format::MachO, "add {0:v}.4s, {1:v}.4s, {2:v}.4s", &[v(0), v(1), v(2)], "add v0.4s, v1.4s, v2.4s");
+    same_as_clang(Format::MachO, "mov {0:v}.s[1], {1:w}", &[v(0), r(1)], "mov v0.s[1], w1");
+}
+
+#[test]
+fn constants_and_set_symbols() {
+    // movz w17, #rip_k (a .set symbol) and a const operand
+    let o = run(Format::MachO, Kind::Inline, ".set rip_k, 77\nmovz w17, #rip_k", &[]);
+    assert_eq!(words(text(&o)), vec![0x5280_0000 | 77 << 5 | 17]);
+    let o = run(Format::MachO, Kind::Inline, "movz w16, #({0} & 0xffff)\nmovk w16, #({0} >> 16), lsl #16", &[Arg::Const(0x1234_5678)]);
+    assert_eq!(words(text(&o)), vec![0x5280_0000 | 0x5678 << 5 | 16, 0x7280_0000 | 1 << 21 | 0x1234 << 5 | 16]);
+    let o = run(Format::MachO, Kind::Inline, "sub sp, sp, #{0}\nldr x8, [x20, #{1}]\nmov x0, #{2}", &[Arg::Const(208), Arg::Const(192), Arg::Const(-1)]);
+    assert_eq!(words(text(&o)), vec![0xD103_43FF, 0xF940_6288, 0x9280_0000]);
+}
+
+#[test]
+fn numeric_and_named_labels() {
+    // cbnz x0, 5f ; b.ge 4f ; b 2f ; b 3b ... with forward and backward numeric references
+    let src = "2:\nnop\ncbnz x0, 5f\nb.ge 4f\nb 2b\n4:\nnop\n5:\nret\nb 2f\n2:\nnop\nb 4b";
+    if clang_works() {
+        let want = clang_bytes(&format!("{}\n", src));
+        let got = ours_bytes(src).unwrap();
+        assert_eq!(hex(&got), hex(&want));
+    }
+    let o = run(Format::Elf, Kind::Inline, "2:\nnop\ncbnz x0, 5f\nb.ge 4f\nb 2b\n4:\nnop\n5:\nret", &[]);
+    assert_eq!(words(text(&o)), vec![0xD503_201F, 0xB500_0080, 0x5400_004A, 0x17FF_FFFD, 0xD503_201F, 0xD65F_03C0]);
+    assert!(o.fixups.is_empty());
+    // named labels, forward and backward, with Mach-O comments
+    let o = run(Format::MachO, Kind::Inline, "top: ; loop head\n  sub x0, x0, #1 ; count\n  cbnz x0, top\n  b done\ndone:\n  ret", &[]);
+    assert_eq!(words(text(&o)), vec![0xD100_0400, 0xB5FF_FFE0, 0x1400_0001, 0xD65F_03C0]);
+    // a missing numeric label is an error
+    assert!(ours_bytes("b 7f").is_err());
+}
+
+#[test]
+fn adr_to_label_and_literal_loads() {
+    let src = "adr x0, here\nnop\nhere:\nldr x1, lit\nnop\nlit:\n.quad 5";
+    if clang_works() {
+        assert_eq!(hex(&ours_bytes(src).unwrap()), hex(&clang_bytes(&format!("{}\n", src))));
+    }
+}
+
+#[test]
+fn pcrel_out_of_range_is_an_error() {
+    let e = ours_bytes("tbz x0, #1, far\n.zero 40000\nfar:\nnop").unwrap_err();
+    assert!(e.contains("out of range"), "{}", e);
+}
+
+#[test]
+fn errors_name_the_instruction() {
+    let cases: &[(&str, &str)] = &[
+        ("frobnicate x0", "unsupported instruction `frobnicate`"),
+        ("add x0, x1", "unsupported operands for `add`"),
+        ("add x0, w1, w2", "unsupported operands for `add`"),
+        ("ldr x0, [x1, #32768]", "out of range"),
+        ("add x0, x1, #4097", "out of range"),
+        ("mov x0, #0x12345678", "cannot be moved by a single instruction"),
+        ("movz x0, #0x10000", "out of range"),
+        ("and x0, x1, #0x12345", "logical immediate"),
+        ("b.xx 1f", "unknown condition"),
+        ("mrs x0, nosuchreg", "unknown system register"),
+        ("ldp x0, x1, [x2, #4]", "multiple of 8"),
+        ("ldr x0, [x1, #1]!!", "unexpected"),
+        ("svc #70000", "out of range"),
+        ("fmov d0, #1.234", "not encodable"),
+        ("ld1 {v0.4s, v2.4s}, [x0]", "consecutive"),
+        ("lsl x0, x1, #64", "out of range"),
+        ("tbz w0, #33, 1f", "out of range"),
+    ];
+    for (src, want) in cases {
+        let e = ours_bytes(src).unwrap_err();
+        assert!(e.contains(want), "`{}`: {} (wanted `{}`)", src, e, want);
+    }
+}
+
+#[test]
+fn parse_reg_names() {
+    assert_eq!(parse_reg("x0"), Some((PReg::int(0), 64)));
+    assert_eq!(parse_reg("X28"), Some((PReg::int(28), 64)));
+    assert_eq!(parse_reg("w20"), Some((PReg::int(20), 32)));
+    assert_eq!(parse_reg("lr"), Some((PReg::int(30), 64)));
+    assert_eq!(parse_reg("FP"), Some((PReg::int(29), 64)));
+    assert_eq!(parse_reg("v0"), Some((PReg::vec(0), 128)));
+    assert_eq!(parse_reg("V31"), Some((PReg::vec(31), 128)));
+    assert_eq!(parse_reg("q5"), Some((PReg::vec(5), 128)));
+    assert_eq!(parse_reg("d8"), Some((PReg::vec(8), 64)));
+    assert_eq!(parse_reg("s1"), Some((PReg::vec(1), 32)));
+    assert_eq!(parse_reg("h2"), Some((PReg::vec(2), 16)));
+    assert_eq!(parse_reg("b3"), Some((PReg::vec(3), 8)));
+    for bad in ["x31", "w31", "sp", "xzr", "wzr", "v32", "x", "xx", "y0", "x0.4s", "v0.4s", "", "x-1", "x+1", "d100"] {
+        assert_eq!(parse_reg(bad), None, "{}", bad);
+    }
+}
+
+#[test]
+fn macho_separators_and_comments() {
+    let o = assemble(Arch::Arm64, Format::MachO, Kind::Inline, &[Piece::Text("mov x0, #1 ; one\nmov x1, #2 %% mov x2, #3\n// c\nret".to_string())], &[], false).unwrap();
+    assert_eq!(words(text(&o)), vec![0xD280_0020, 0xD280_0041, 0xD280_0062, 0xD65F_03C0]);
+}
+
+#[test]
+fn inst_and_arch_directives() {
+    let o = ours(".arch armv8.2-a\n.inst 0xd503201f\n.inst 0xd65f03c0, 0x12345678\nnop").unwrap();
+    assert_eq!(words(text(&o)), vec![0xD503_201F, 0xD65F_03C0, 0x1234_5678, 0xD503_201F]);
+}
+
+#[test]
+fn macro_and_rept_with_instructions() {
+    let src = ".macro save a, b\n stp \\a, \\b, [sp, #-16]!\n.endm\nsave x19, x20\nsave x21, x22\n.rept 3\nnop\n.endr";
+    if clang_works() {
+        assert_eq!(hex(&ours_bytes(src).unwrap()), hex(&clang_bytes(&format!("{}\n", src))));
+    }
+    assert_eq!(text(&ours(src).unwrap()).len(), 20);
+}
+
+#[test]
+fn alignment_fills_with_nops() {
+    let o = ours("nop\n.p2align 4\nret").unwrap();
+    assert_eq!(words(text(&o)), vec![0xD503_201F, 0xD503_201F, 0xD503_201F, 0xD503_201F, 0xD65F_03C0]);
+}
+
+#[test]
+fn case_insensitive_and_aliases() {
+    let a = ours_bytes("ADD X0, X1, X2\nMOV Sp, X20\nB.GE 1f\n1:\nRET LR\nLDR X0, [SP, #8]\nfmov D0, D1\nMOV V0.16B, V1.16B").unwrap();
+    let b = ours_bytes("add x0, x1, x2\nmov sp, x20\nb.ge 1f\n1:\nret x30\nldr x0, [sp, #8]\nfmov d0, d1\nmov v0.16b, v1.16b").unwrap();
+    assert_eq!(a, b);
+}
+
+#[test]
+fn global_labels_and_data() {
+    let o = ours(".globl entry\nentry:\n  adr x0, tbl\n  ret\ntbl:\n  .quad entry\n  .word 7").unwrap();
+    assert_eq!(o.defs.iter().map(|d| (d.name.as_str(), d.offset, d.global)).collect::<Vec<_>>(), vec![("entry", 0, true), ("tbl", 8, false)]);
+    assert_eq!(o.fixups.len(), 1);
+    assert_eq!(o.fixups[0].kind, FixKind::Abs64);
+}
+
+/// Exploration: `RELAX_A64_PROBE=<file> cargo test probe -- --ignored --nocapture` compares every
+/// line of the file with clang one by one and lists the gaps.
+#[test]
+#[ignore]
+fn probe() {
+    let Ok(path) = std::env::var("RELAX_A64_PROBE") else { return };
+    let src = std::fs::read_to_string(path).unwrap();
+    let lines: Vec<&str> = src.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    let theirs = clang_each(&lines);
+    let (mut gaps, mut diffs, mut over, mut same) = (Vec::new(), Vec::new(), Vec::new(), 0);
+    for (l, t) in lines.iter().zip(theirs) {
+        match (ours_bytes(l), t) {
+            (Ok(a), Some(b)) if a == b => same += 1,
+            (Ok(a), Some(b)) => diffs.push(format!("{}: ours {} clang {}", l, hex(&a), hex(&b))),
+            (Err(e), Some(_)) => gaps.push(format!("{}: {}", l, e)),
+            (Ok(_), None) => over.push(l.to_string()),
+            (Err(_), None) => same += 1,
+        }
+    }
+    println!("same {} | gaps {} | diffs {} | accepted-but-invalid {}", same, gaps.len(), diffs.len(), over.len());
+    for g in &gaps {
+        println!("GAP {}", g);
+    }
+    for g in &diffs {
+        println!("DIFF {}", g);
+    }
+    for g in &over {
+        println!("OVER {}", g);
+    }
+}
+
+/// Wrong operands: whatever clang rejects, we must reject too (we may reject more).
+#[test]
+fn oracle_mutations_are_rejected() {
+    if !clang_works() {
+        return;
+    }
+    let mut base: Vec<String> = Vec::new();
+    for c in [CORE.to_string(), BRANCH.to_string(), MEM.to_string(), fp_corpus(), neon_corpus()] {
+        for l in c.lines().map(|l| l.trim()) {
+            if !l.is_empty() && !l.ends_with(':') && !l.starts_with('.') {
+                base.push(l.to_string());
+            }
+        }
+    }
+    base.sort();
+    base.dedup();
+    let mut muts: Vec<String> = Vec::new();
+    for l in &base {
+        muts.push(format!("{}, x0", l));
+        muts.push(format!("{}, #1", l));
+        muts.push(format!("{}, x1, x2", l));
+        if let Some(p) = l.rfind(", ") {
+            muts.push(l[..p].to_string());
+        }
+        if l.contains(" x") {
+            muts.push(l.replacen(" x", " w", 1));
+        } else if l.contains(" w") {
+            muts.push(l.replacen(" w", " x", 1));
+        }
+        if let Some(p) = l.find(' ') {
+            muts.push(format!("{} v7.4s, {}", &l[..p], &l[p + 1..]));
+            muts.push(format!("{} xzr, {}", &l[..p], &l[p + 1..]));
+        }
+    }
+    muts.sort();
+    muts.dedup();
+    let refs: Vec<&str> = muts.iter().map(|s| s.as_str()).collect();
+    let theirs = clang_each(&refs);
+    let (mut over, mut diffs, mut gaps, mut same) = (Vec::new(), Vec::new(), 0, 0);
+    for (l, t) in refs.iter().zip(theirs) {
+        match (ours_bytes(l), t) {
+            (Ok(a), Some(b)) if a == b => same += 1,
+            (Ok(a), Some(b)) => diffs.push(format!("{}: ours {} clang {}", l, hex(&a), hex(&b))),
+            (Ok(_), None) => over.push(l.to_string()),
+            (Err(_), Some(_)) => gaps += 1,
+            (Err(_), None) => {}
+        }
+    }
+    println!("mutations: {} lines, {} identical, {} accepted by clang only, {} different, {} accepted by us only", refs.len(), same, gaps, diffs.len(), over.len());
+    assert!(over.is_empty() && diffs.is_empty(), "accepted but invalid:\n{}\ndifferent:\n{}", over.iter().take(400).cloned().collect::<Vec<_>>().join("\n"), diffs.iter().take(30).cloned().collect::<Vec<_>>().join("\n"));
 }

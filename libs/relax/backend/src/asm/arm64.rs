@@ -168,7 +168,7 @@ fn parse_reg_text(name: &str) -> Option<(Reg, &str)> {
 /// are x30 and x29. `sp` and the zero registers are not allocatable registers.
 pub fn parse_reg(name: &str) -> Option<(PReg, u8)> {
     let (r, suf) = parse_reg_text(name)?;
-    if !suf.is_empty() || r.n == 31 {
+    if !suf.is_empty() || (r.n == 31 && matches!(r.k, K::X | K::W)) {
         return None;
     }
     let bits = match r.k {
@@ -311,6 +311,7 @@ fn parse_op<'a>(ctx: &Ctx, t: &'a [Tok]) -> Res<Op<'a>> {
         Some(Tok::Punct(b'[')) => parse_mem(ctx, t),
         Some(Tok::Punct(b'{')) => parse_list(ctx, t),
         Some(Tok::Punct(b'#')) => parse_expr_op(&t[1..]),
+        Some(Tok::Punct(b'=')) => msg("`=value` literal-pool operands are not supported (use movz/movk or adr)"),
         _ => {
             if let Some((r, arr, next)) = reg_at(t, 0)? {
                 let mut lane = None;
@@ -992,7 +993,30 @@ fn int_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
             let k = range(k, 0, rd.bits() as i64 - 1, "lsb")?;
             w(ctx, 0x1380_0000 | rd.sf() << 31 | rd.sf() << 22 | rm.n() << 16 | k << 10 | rn.n() << 5 | rd.n());
         }
-        "clz" | "cls" | "rbit" | "rev" | "rev16" | "rev32" => {
+        "uxtw" => {
+            let rd = gp_k(o.first(), K::X)?;
+            let rn = gp_k(o.get(1), K::W)?;
+            bfm(ctx, UBFM, rd, Reg { k: K::X, ..rn }, 0, 31)?;
+        }
+        m if m.starts_with("crc32") && (m.len() == 6 || m.len() == 7) => {
+            let rest = &m[5..];
+            let (c, sz) = match rest.strip_prefix('c') {
+                Some(r) => (1, r),
+                None => (0, rest),
+            };
+            let size = match sz {
+                "b" => 0,
+                "h" => 1,
+                "w" => 2,
+                "x" => 3,
+                _ => return Ok(false),
+            };
+            let rd = gp_k(o.first(), K::W)?;
+            let rn = gp_k(o.get(1), K::W)?;
+            let rm = gp_k(o.get(2), if size == 3 { K::X } else { K::W })?;
+            w(ctx, 0x1AC0_4000 | ((size == 3) as u32) << 31 | rm.n() << 16 | c << 12 | size << 10 | rn.n() << 5 | rd.n());
+        }
+        "clz" | "cls" | "rbit" | "rev" | "rev16" | "rev32" | "rev64" => {
             let rd = gp(o.first())?;
             let rn = gp_k(o.get(1), rd.k)?;
             let op = match (mn, rd.k) {
@@ -1002,7 +1026,7 @@ fn int_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
                 ("rev16", _) => 1,
                 ("rev32", K::X) => 2,
                 ("rev", K::W) => 2,
-                ("rev", _) => 3,
+                ("rev", _) | ("rev64", K::X) => 3,
                 _ => return bad(),
             };
             w(ctx, 0x5AC0_0000 | rd.sf() << 31 | op << 10 | rn.n() << 5 | rd.n());
@@ -1141,19 +1165,38 @@ fn mem_const(m: &Mem) -> Res<i64> {
 }
 
 fn ldst(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<()> {
-    let (unscaled, base) = if let Some(r) = mn.strip_prefix("ldur") {
-        (true, format!("ldr{}", r))
+    // kind 0: ldr / str, 1: the unscaled ldur / stur, 2: unprivileged ldtr / sttr, 3: ldapur / stlur
+    let (kind, base) = if let Some(r) = mn.strip_prefix("ldur") {
+        (1, format!("ldr{}", r))
     } else if let Some(r) = mn.strip_prefix("stur") {
-        (true, format!("str{}", r))
+        (1, format!("str{}", r))
+    } else if let Some(r) = mn.strip_prefix("ldtr") {
+        (2, format!("ldr{}", r))
+    } else if let Some(r) = mn.strip_prefix("sttr") {
+        (2, format!("str{}", r))
+    } else if let Some(r) = mn.strip_prefix("ldapur") {
+        (3, format!("ldr{}", r))
+    } else if let Some(r) = mn.strip_prefix("stlur") {
+        (3, format!("str{}", r))
     } else {
-        (false, mn.to_string())
+        (0, mn.to_string())
     };
+    let unscaled = kind != 0;
     let rt = match o.first() {
         Some(Op::Reg(r, None, None)) if r.is_gp() || r.is_fp() => *r,
         _ => return bad(),
     };
     let (size, v, opc, scale) = ls_class(&base, rt)?;
-    let head = 0x3800_0000 | size << 30 | v << 26 | opc << 22;
+    if kind >= 2 && v == 1 {
+        return bad();
+    }
+    let head = match kind {
+        2 => 0x3800_0800,
+        3 => 0x1900_0000,
+        _ => 0x3800_0000,
+    } | size << 30
+        | v << 26
+        | opc << 22;
     let t = rt.n();
     match o.get(1) {
         Some(Op::Mem(m)) => {
@@ -1198,6 +1241,9 @@ fn ldst(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<()> {
                 }
                 _ => {
                     let k = mem_const(m)?;
+                    if kind >= 2 && (post.is_some() || m.pre) {
+                        return bad();
+                    }
                     if let Some(p) = post {
                         let pk = imm(ctx, Some(p))?;
                         if k != 0 || m.pre {
@@ -1220,7 +1266,7 @@ fn ldst(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<()> {
             Ok(())
         }
         Some(Op::Expr { spec: Spec::None, .. }) if base == "ldr" || base == "ldrsw" => {
-            if unscaled {
+            if unscaled || o.len() != 2 {
                 return bad();
             }
             let (opc, v) = match (base.as_str(), rt.k) {
@@ -1371,6 +1417,19 @@ fn mem_base_only(ctx: &Ctx, o: Option<&Op>) -> Res<u32> {
 }
 
 fn excl(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
+    if matches!(mn, "ldapr" | "ldaprb" | "ldaprh") {
+        let rt = gp(o.first())?;
+        let n = mem_base_only(ctx, o.get(1))?;
+        let base = match (mn, rt.k) {
+            ("ldaprb", K::W) => 0x38BF_C000,
+            ("ldaprh", K::W) => 0x78BF_C000,
+            ("ldapr", K::W) => 0xB8BF_C000,
+            ("ldapr", K::X) => 0xF8BF_C000,
+            _ => return bad(),
+        };
+        w(ctx, base | n << 5 | rt.n());
+        return Ok(true);
+    }
     // (L, o2, o1, o0, has status register)
     let table = |n: &str| -> Option<(u32, u32, u32, u32, bool)> {
         Some(match n {
@@ -1425,6 +1484,25 @@ fn excl(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
 }
 
 fn lse(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
+    if let Some(rest) = mn.strip_prefix("casp") {
+        let (a, l) = match rest {
+            "" => (0, 0),
+            "a" => (1, 0),
+            "l" => (0, 1),
+            "al" => (1, 1),
+            _ => return Ok(false),
+        };
+        let rs = gp(o.first())?;
+        let rs2 = gp_k(o.get(1), rs.k)?;
+        let rt = gp_k(o.get(2), rs.k)?;
+        let rt2 = gp_k(o.get(3), rs.k)?;
+        if o.len() != 5 || rs.n % 2 != 0 || rt.n % 2 != 0 || rs2.n != rs.n + 1 || rt2.n != rt.n + 1 {
+            return msg("casp needs even-numbered consecutive register pairs");
+        }
+        let n = mem_base_only(ctx, o.get(4))?;
+        w(ctx, 0x0820_7C00 | rs.sf() << 30 | a << 22 | l << 15 | rs.n() << 16 | n << 5 | rt.n());
+        return Ok(true);
+    }
     const FAMS: [(&str, u32); 18] = [
         ("cas", 0),
         ("swp", 0x3820_8000),
@@ -1581,6 +1659,34 @@ fn sys_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
         "sev" => hint(ctx, 4),
         "sevl" => hint(ctx, 5),
         "csdb" => hint(ctx, 20),
+        "dgh" => hint(ctx, 6),
+        "xpaclri" => hint(ctx, 7),
+        "pacia1716" => hint(ctx, 8),
+        "pacib1716" => hint(ctx, 10),
+        "autia1716" => hint(ctx, 12),
+        "autib1716" => hint(ctx, 14),
+        "esb" => hint(ctx, 16),
+        "paciaz" => hint(ctx, 24),
+        "paciasp" => hint(ctx, 25),
+        "pacibz" => hint(ctx, 26),
+        "pacibsp" => hint(ctx, 27),
+        "autiaz" => hint(ctx, 28),
+        "autiasp" => hint(ctx, 29),
+        "autibz" => hint(ctx, 30),
+        "autibsp" => hint(ctx, 31),
+        "psb" | "tsb" => {
+            if name(o.first())? != "csync" {
+                return bad();
+            }
+            hint(ctx, if mn == "psb" { 17 } else { 18 })
+        }
+        "sb" => w(ctx, 0xD503_30FF),
+        "ssbb" => w(ctx, 0xD503_309F),
+        "pssbb" => w(ctx, 0xD503_349F),
+        "retaa" => w(ctx, 0xD65F_0BFF),
+        "retab" => w(ctx, 0xD65F_0FFF),
+        "eretaa" => w(ctx, 0xD69F_0BFF),
+        "eretab" => w(ctx, 0xD69F_0FFF),
         "hint" => {
             let n = uimm(ctx, o.first(), 127, "hint number")?;
             hint(ctx, n)
@@ -1689,13 +1795,10 @@ fn sys_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
                 ("tlbi", "alle1") => (4, 8, 7, 4, false),
                 _ => return msg(format!("unknown `{}` operation `{}`", mn, n)),
             };
-            let rt = if reg {
-                gp_k(o.get(1), K::X)?.n()
-            } else if o.len() == 2 {
-                gp_k(o.get(1), K::X)?.n()
-            } else {
-                31
-            };
+            if o.len() != 1 + reg as usize {
+                return bad();
+            }
+            let rt = if reg { gp_k(o.get(1), K::X)?.n() } else { 31 };
             w(ctx, 0xD508_0000 | op1 << 16 | crn << 12 | crm << 8 | op2 << 5 | rt);
         }
         _ => return Ok(false),
@@ -1797,6 +1900,16 @@ fn fmov(ctx: &mut Ctx, o: &[Op]) -> Res<()> {
         (Op::Reg(rd, Some(Arr { n: 0, es: 3 }), Some(1)), Op::Reg(rn, None, None)) if rd.k == K::V && rn.k == K::X => w(ctx, 0x9EAF_0000 | rn.n() << 5 | rd.n()),
         (Op::Reg(rd, None, None), Op::Expr { .. }) if rd.is_fp() => {
             let v = fp_lit(ctx, o.get(1))?;
+            if v == 0.0 && v.is_sign_positive() {
+                // fmov Sd, #0.0 is fmov Sd, wzr (LLVM's alias)
+                let base = match ftype(*rd)? {
+                    0 => 0x1E27_0000,
+                    1 => 0x9E67_0000,
+                    _ => 0x1EE7_0000,
+                };
+                w(ctx, base | 31 << 5 | rd.n());
+                return Ok(());
+            }
             let i = fp_imm8(v).ok_or("floating-point constant is not encodable as an 8-bit immediate")?;
             w(ctx, 0x1E20_1000 | ftype(*rd)? << 22 | i << 13 | rd.n());
         }
@@ -1806,6 +1919,7 @@ fn fmov(ctx: &mut Ctx, o: &[Op]) -> Res<()> {
             let base = match (a.n, a.es) {
                 (2, 2) | (4, 2) => 0x0F00_F400 | a.q() << 30,
                 (2, 3) => 0x6F00_F400,
+                (4, 1) | (8, 1) => 0x0F00_FC00 | a.q() << 30,
                 _ => return bad(),
             };
             w(ctx, base | ((i >> 5) & 7) << 16 | (i & 31) << 5 | rd.n());
@@ -1886,6 +2000,9 @@ fn fp_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
         return Ok(true);
     }
     if let Some((rmode, op)) = fcvt_int(mn) {
+        if matches!(o.first(), Some(Op::Reg(r, None, None)) if r.is_fp()) && matches!(o.get(1), Some(Op::Reg(r, None, None)) if r.is_fp()) {
+            return Ok(false);
+        }
         let to_float = matches!(mn, "scvtf" | "ucvtf");
         let (f, g) = if to_float { (fpr(o.first())?, gp(o.get(1))?) } else { (fpr(o.get(1))?, gp(o.first())?) };
         let ty = ftype(f)?;
@@ -2128,6 +2245,7 @@ const LONG3: &[(&str, u32)] = &[
     ("smlsl", 0x0E20_A000),
     ("umlsl", 0x2E20_A000),
     ("sabdl", 0x0E20_7000),
+    ("sqdmull", 0x0E20_D000),
     ("uabdl", 0x2E20_7000),
 ];
 
@@ -2143,6 +2261,9 @@ const SHIFT_IMM: &[(&str, u32, bool)] = &[
     ("urshr", 0x2F00_2400, false),
     ("ursra", 0x2F00_3400, false),
     ("sri", 0x2F00_4400, false),
+    ("sqshl", 0x0F00_7400, true),
+    ("uqshl", 0x2F00_7400, true),
+    ("sqshlu", 0x2F00_6400, true),
 ];
 
 const ACROSS: &[(&str, u32, bool)] = &[
@@ -2226,6 +2347,9 @@ fn ldst_vec(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
     if !(mn.len() == 3 || (rep && mn.len() == 4)) || (rep && load == 0) {
         return Ok(false);
     }
+    if o.len() > 3 {
+        return bad();
+    }
     let (regs, arr, lane) = vec_list(o.first())?;
     let Some(arr) = arr else { return bad() };
     let Some(Op::Mem(m)) = o.get(1) else { return bad() };
@@ -2295,6 +2419,9 @@ fn ldst_vec(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
 
 fn movi_like(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<()> {
     // movi / mvni / orr / bic with a vector immediate
+    if o.len() > 3 {
+        return bad();
+    }
     let (rd, a) = match o.first() {
         Some(Op::Reg(r, None, None)) if r.k == K::D && mn == "movi" => (*r, Arr { n: 1, es: 3 }),
         _ => vr(o.first())?,
@@ -2341,6 +2468,12 @@ fn movi_like(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<()> {
 }
 
 fn neon_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
+    if o.len() == 3 && matches!(o.get(2), Some(Op::Reg(_, Some(Arr { n: 0, .. }), Some(_)))) && elem_insn(ctx, mn, o)? {
+        return Ok(true);
+    }
+    if scalar_simd(ctx, mn, o)? {
+        return Ok(true);
+    }
     match mn {
         "mov" => {
             vec_mov(ctx, o)?;
@@ -2460,15 +2593,8 @@ fn neon_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
         }
         _ => {}
     }
-    // scalar d forms
-    if let Some(Op::Reg(rd, None, None)) = o.first() {
-        if rd.k == K::D && matches!(mn, "add" | "sub") {
-            let rn = fp_same(o.get(1), K::D)?;
-            let rm = fp_same(o.get(2), K::D)?;
-            w(ctx, if mn == "add" { 0x5EE0_8400 } else { 0x7EE0_8400 } | rm.n() << 16 | rn.n() << 5 | rd.n());
-            return Ok(true);
-        }
-        if mn == "addp" {
+    if mn == "addp" && o.len() == 2 {
+        if let Some(Op::Reg(rd, None, None)) = o.first() {
             let (rn, a) = vr(o.get(1))?;
             if rd.k != K::D || a != (Arr { n: 2, es: 3 }) {
                 return bad();
@@ -2476,7 +2602,9 @@ fn neon_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
             w(ctx, 0x5EF1_B800 | rn.n() << 5 | rd.n());
             return Ok(true);
         }
-        if mn == "faddp" {
+    }
+    if mn == "faddp" && o.len() == 2 {
+        if let Some(Op::Reg(rd, None, None)) = o.first() {
             let (rn, a) = vr(o.get(1))?;
             let sz = match (rd.k, a) {
                 (K::S, Arr { n: 2, es: 2 }) => 0,
@@ -2487,7 +2615,7 @@ fn neon_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
             return Ok(true);
         }
     }
-    if let Some(&(_, base, _)) = ACROSS.iter().find(|e| e.0 == mn) {
+    if let (Some(&(_, base, _)), 2) = (ACROSS.iter().find(|e| e.0 == mn), o.len()) {
         let long = ACROSS.iter().find(|e| e.0 == mn).unwrap().2;
         let rd = fpr(o.first())?;
         let (rn, a) = vr(o.get(1))?;
@@ -2500,7 +2628,7 @@ fn neon_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
         return Ok(true);
     }
     for &(name, base) in ZERO_CMP {
-        if name == mn && is_imm(o.get(2)) {
+        if name == mn && is_imm(o.get(2)) && is_vec_op(o.first()) && o.len() == 3 {
             let (rd, a) = vr(o.first())?;
             let (rn, b) = vr(o.get(1))?;
             if a != b || !arr_ok(M::All, a) || imm(ctx, o.get(2))? != 0 {
@@ -2511,7 +2639,7 @@ fn neon_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
         }
     }
     for &(name, base, _) in THREE_F {
-        if name == mn && is_vec_op(o.first()) {
+        if name == mn && is_vec_op(o.first()) && o.len() == 3 && !is_imm(o.get(2)) {
             let (rd, a) = vr(o.first())?;
             let (rn, b) = vr(o.get(1))?;
             let (rm, c) = vr(o.get(2))?;
@@ -2530,9 +2658,12 @@ fn neon_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
         }
     }
     for &(name, base) in TWO_F {
-        if name == mn && is_vec_op(o.first()) {
+        if name == mn && is_vec_op(o.first()) && o.len() == 2 {
             let (rd, a) = vr(o.first())?;
             let (rn, b) = vr(o.get(1))?;
+            if a.es == 1 {
+                continue;
+            }
             if a != b || !matches!((a.es, a.n), (2, 2) | (2, 4) | (3, 2)) {
                 return bad();
             }
@@ -2541,7 +2672,7 @@ fn neon_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
         }
     }
     for &(name, base, m) in TWO {
-        if name == mn && is_vec_op(o.first()) {
+        if name == mn && is_vec_op(o.first()) && o.len() == 2 {
             let (rd, a) = vr(o.first())?;
             let (rn, b) = vr(o.get(1))?;
             if a != b || !arr_ok(m, a) {
@@ -2554,7 +2685,7 @@ fn neon_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
     }
     for &(name, base) in LONG3 {
         let two = mn.ends_with('2') && mn.len() == name.len() + 1;
-        if (name == mn || two) && mn.starts_with(name) && is_vec_op(o.first()) {
+        if (name == mn || two) && mn.starts_with(name) && is_vec_op(o.first()) && o.len() == 3 {
             let (rd, a) = vr(o.first())?;
             let (rn, b) = vr(o.get(1))?;
             let (rm, c) = vr(o.get(2))?;
@@ -2566,7 +2697,7 @@ fn neon_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
         }
     }
     for &(name, base, left) in SHIFT_IMM {
-        if name == mn && is_vec_op(o.first()) {
+        if name == mn && is_vec_op(o.first()) && o.len() == 3 && is_imm(o.get(2)) {
             let (rd, a) = vr(o.first())?;
             let (rn, b) = vr(o.get(1))?;
             if a != b || !arr_ok(M::All, a) {
@@ -2587,7 +2718,7 @@ fn neon_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
         "cmlo" => Some("cmhi"),
         _ => None,
     };
-    if let Some(real) = swapped {
+    if let (Some(real), 3) = (swapped, o.len()) {
         let &(_, base, m) = THREE.iter().find(|e| e.0 == real).unwrap();
         let (rd, a) = vr(o.first())?;
         let (rn, b) = vr(o.get(1))?;
@@ -2602,7 +2733,7 @@ fn neon_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
         movi_like(ctx, mn, o)?;
         return Ok(true);
     }
-    if let Some(&(_, base, m)) = THREE.iter().find(|e| e.0 == mn) {
+    if let (Some(&(_, base, m)), 3) = (THREE.iter().find(|e| e.0 == mn), o.len()) {
         let (rd, a) = vr(o.first())?;
         let (rn, b) = vr(o.get(1))?;
         let (rm, c) = vr(o.get(2))?;
@@ -2613,7 +2744,7 @@ fn neon_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
         w(ctx, base | a.q() << 30 | size << 22 | rm.n() << 16 | rn.n() << 5 | rd.n());
         return Ok(true);
     }
-    Ok(false)
+    neon_extra(ctx, mn, o)
 }
 
 // ---------------------------------------------------------------- the encoder
@@ -2654,8 +2785,43 @@ impl Encoder for Arm64 {
     }
 }
 
+/// How many operands a mnemonic takes (min, max); None: not checked here.
+fn arity(mn: &str) -> Option<(usize, usize)> {
+    Some(match mn {
+        "add" | "adds" | "sub" | "subs" | "and" | "eor" | "ands" | "orn" | "eon" | "bics" => (3, 4),
+        "orr" | "bic" => (2, 4),
+        "cmp" | "cmn" | "tst" | "neg" | "negs" | "mvn" | "movz" | "movn" | "movk" => (2, 3),
+        "mov" | "ngc" | "ngcs" | "uxtb" | "uxth" | "sxtb" | "sxth" | "sxtw" | "uxtw" | "clz" | "cls" | "rbit" | "rev" | "rev16" | "rev32" | "rev64" | "cset" | "csetm" | "adr" | "adrp" | "cbz" | "cbnz" | "mrs" | "msr" | "fmov" | "fabs" | "fneg" | "fsqrt" | "frintn" | "frintp" | "frintm" | "frintz" | "frinta" | "frintx" | "frinti" | "fcvt" | "fcmp" | "fcmpe" | "fcvtl" | "fcvtl2" | "fcvtn" | "fcvtn2" | "xtn" | "xtn2" | "sxtl" | "uxtl" | "sxtl2" | "uxtl2" | "cnt" | "not" | "umov" | "smov" | "ins" | "dup" | "sqabs" | "sqneg" | "rbit16" | "dc" | "prfm" | "prfum" => (2, 2),
+        "adc" | "adcs" | "sbc" | "sbcs" | "mul" | "mneg" | "sdiv" | "udiv" | "smull" | "umull" | "smnegl" | "umnegl" | "smulh" | "umulh" | "lsl" | "lsr" | "asr" | "ror" | "cinc" | "cinv" | "cneg" | "bfc" | "tbz" | "tbnz" | "sshll" | "ushll" | "sshll2" | "ushll2" | "tbl" | "tbx" | "zip1" | "zip2" | "uzp1" | "uzp2" | "trn1" | "trn2" | "fadd" | "fsub" | "fdiv" | "fmax" | "fmin" | "fmaxnm" | "fminnm" | "fnmul" => (3, 3),
+        "madd" | "msub" | "smaddl" | "umaddl" | "smsubl" | "umsubl" | "extr" | "ubfm" | "sbfm" | "bfm" | "ubfx" | "sbfx" | "ubfiz" | "sbfiz" | "bfi" | "bfxil" | "csel" | "csinc" | "csinv" | "csneg" | "ccmp" | "ccmn" | "fmadd" | "fmsub" | "fnmadd" | "fnmsub" | "fccmp" | "fccmpe" | "fcsel" | "ext" => (4, 4),
+        "b" | "bl" | "br" | "blr" | "svc" | "hvc" | "smc" | "brk" | "hlt" | "udf" | "hint" | "dmb" | "dsb" => (1, 1),
+        "ret" | "isb" | "clrex" | "bti" => (0, 1),
+        "nop" | "yield" | "wfe" | "wfi" | "sev" | "sevl" | "eret" | "csdb" => (0, 0),
+        "movi" | "mvni" => (2, 3),
+        "ldr" | "str" | "ldrb" | "strb" | "ldrh" | "strh" | "ldrsb" | "ldrsh" | "ldrsw" | "ldur" | "stur" => (2, 3),
+        "ldp" | "stp" | "ldpsw" => (3, 4),
+        "ldnp" | "stnp" => (3, 3),
+        "at" => (2, 2),
+        "sys" => (4, 5),
+        "sysl" => (5, 5),
+        "fmul" | "fmla" | "fmls" | "fmulx" => (3, 3),
+        "ic" | "tlbi" => (1, 2),
+        "scvtf" | "ucvtf" | "fcvtzs" | "fcvtzu" => (2, 3),
+        "fcvtns" | "fcvtnu" | "fcvtas" | "fcvtau" | "fcvtps" | "fcvtpu" | "fcvtms" | "fcvtmu" => (2, 2),
+        _ => return None,
+    })
+}
+
 fn encode(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
+    if let Some((lo, hi)) = arity(mn) {
+        if o.len() < lo || o.len() > hi {
+            return bad();
+        }
+    }
     if let Some(c) = mn.strip_prefix("b.") {
+        if o.len() != 1 {
+            return bad();
+        }
         let c = cond_code(c).ok_or_else(|| format!("unknown condition code `{}`", c))?;
         branch_target(ctx, 0x5400_0000 | c, FixKind::A64Branch19, o.first(), 19, 5)?;
         return Ok(true);
@@ -2664,7 +2830,7 @@ fn encode(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
     let fpfirst = matches!(o.first(), Some(Op::Reg(r, _, _)) if r.k == K::V || r.is_fp());
     if !fpfirst || mn == "ldr" || mn == "str" || mn.starts_with("ldu") || mn.starts_with("stu") || mn.starts_with("ldp") || mn.starts_with("stp") || mn.starts_with("ldn") || mn.starts_with("stn") {
         match mn {
-            "ldr" | "str" | "ldrb" | "strb" | "ldrh" | "strh" | "ldrsb" | "ldrsh" | "ldrsw" | "ldur" | "stur" | "ldurb" | "sturb" | "ldurh" | "sturh" | "ldursb" | "ldursh" | "ldursw" => {
+            "ldr" | "str" | "ldrb" | "strb" | "ldrh" | "strh" | "ldrsb" | "ldrsh" | "ldrsw" | "ldur" | "stur" | "ldurb" | "sturb" | "ldurh" | "sturh" | "ldursb" | "ldursh" | "ldursw" | "ldtr" | "sttr" | "ldtrb" | "sttrb" | "ldtrh" | "sttrh" | "ldtrsb" | "ldtrsh" | "ldtrsw" | "ldapur" | "stlur" | "ldapurb" | "stlurb" | "ldapurh" | "stlurh" | "ldapursb" | "ldapursh" | "ldapursw" => {
                 ldst(ctx, mn, o)?;
                 return Ok(true);
             }
@@ -2686,4 +2852,385 @@ fn encode(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
         return Ok(true);
     }
     neon_insn(ctx, mn, o)
+}
+
+// ---------------------------------------------------------------- NEON, the long tail
+
+const SCALAR_D3: &[&str] = &["add", "sub", "cmeq", "cmgt", "cmge", "cmhi", "cmhs", "cmtst", "sshl", "ushl", "srshl", "urshl"];
+const SCALAR_F3: &[&str] = &["fabd", "fcmeq", "fcmge", "fcmgt", "facge", "facgt", "fmulx", "frecps", "frsqrts"];
+/// float 2-reg ops that also have scalar SIMD forms (s / d registers)
+const SCALAR_F2: &[&str] = &["scvtf", "ucvtf", "fcvtzs", "fcvtzu", "fcvtns", "fcvtnu", "fcvtms", "fcvtmu", "fcvtas", "fcvtau", "fcvtps", "fcvtpu", "frecpe", "frsqrte"];
+
+/// float 2-reg misc, half precision (4h / 8h) bases
+const TWO_F16: &[(&str, u32)] = &[
+    ("fabs", 0x0EF8_F800),
+    ("fneg", 0x2EF8_F800),
+    ("fsqrt", 0x2EF9_F800),
+    ("frintn", 0x0E79_8800),
+    ("frintm", 0x0E79_9800),
+    ("frintp", 0x0EF9_8800),
+    ("frintz", 0x0EF9_9800),
+    ("frinta", 0x2E79_8800),
+    ("frintx", 0x2E79_9800),
+    ("frinti", 0x2EF9_9800),
+    ("scvtf", 0x0E79_D800),
+    ("ucvtf", 0x2E79_D800),
+    ("fcvtzs", 0x0EF9_B800),
+    ("fcvtzu", 0x2EF9_B800),
+    ("fcvtns", 0x0E79_A800),
+    ("fcvtnu", 0x2E79_A800),
+    ("fcvtms", 0x0E79_B800),
+    ("fcvtmu", 0x2E79_B800),
+    ("fcvtas", 0x0E79_C800),
+    ("fcvtau", 0x2E79_C800),
+    ("fcvtps", 0x0EF9_A800),
+    ("fcvtpu", 0x2EF9_A800),
+    ("frecpe", 0x0EF9_D800),
+    ("frsqrte", 0x2EF9_D800),
+];
+
+/// float compare with zero: (name, single / double base, half base)
+const FCMP_ZERO: &[(&str, u32, u32)] = &[
+    ("fcmeq", 0x0EA0_D800, 0x0EF8_D800),
+    ("fcmge", 0x2EA0_C800, 0x2EF8_C800),
+    ("fcmgt", 0x0EA0_C800, 0x0EF8_C800),
+    ("fcmle", 0x2EA0_D800, 0x2EF8_D800),
+    ("fcmlt", 0x0EA0_E800, 0x0EF8_E800),
+];
+
+const ELEM_F: &[(&str, u32)] = &[("fmul", 0x0F80_9000), ("fmla", 0x0F80_1000), ("fmls", 0x0F80_5000), ("fmulx", 0x2F80_9000)];
+const ELEM_I: &[(&str, u32)] = &[("mul", 0x0F00_8000), ("mla", 0x2F00_0000), ("mls", 0x2F00_4000), ("sqdmulh", 0x0F00_C000), ("sqrdmulh", 0x0F00_D000)];
+const ELEM_L: &[(&str, u32)] = &[("smull", 0x0F00_A000), ("umull", 0x2F00_A000), ("smlal", 0x0F00_2000), ("umlal", 0x2F00_2000), ("smlsl", 0x0F00_6000), ("umlsl", 0x2F00_6000), ("sqdmull", 0x0F00_B000)];
+
+const NARROW_SHIFT: &[(&str, u32)] = &[("shrn", 0x0F00_8400), ("rshrn", 0x0F00_8C00), ("sqshrn", 0x0F00_9400), ("sqrshrn", 0x0F00_9C00), ("uqshrn", 0x2F00_9400), ("uqrshrn", 0x2F00_9C00), ("sqshrun", 0x2F00_8400), ("sqrshrun", 0x2F00_8C00)];
+const NARROW3: &[(&str, u32)] = &[("addhn", 0x0E20_4000), ("raddhn", 0x2E20_4000), ("subhn", 0x0E20_6000), ("rsubhn", 0x2E20_6000)];
+const NARROW2: &[(&str, u32)] = &[("xtn", 0x0E21_2800), ("sqxtn", 0x0E21_4800), ("uqxtn", 0x2E21_4800), ("sqxtun", 0x2E21_2800)];
+const PAIRLONG: &[(&str, u32)] = &[("saddlp", 0x0E20_2800), ("uaddlp", 0x2E20_2800), ("sadalp", 0x0E20_6800), ("uadalp", 0x2E20_6800)];
+
+/// L, M, H and the register field of an indexed element `vM.T[idx]`.
+fn elem_fields(es: u8, idx: i64, rm: Reg) -> Res<(u32, u32, u32, u32)> {
+    Ok(match es {
+        1 => {
+            let i = range(idx, 0, 7, "lane index")?;
+            if rm.n > 15 {
+                return msg("the element register must be v0 to v15 for half-word elements");
+            }
+            ((i >> 1) & 1, i & 1, i >> 2, rm.n())
+        }
+        2 => {
+            let i = range(idx, 0, 3, "lane index")?;
+            (i & 1, rm.n() >> 4, i >> 1, rm.n() & 15)
+        }
+        3 => {
+            let i = range(idx, 0, 1, "lane index")?;
+            (0, rm.n() >> 4, i, rm.n() & 15)
+        }
+        _ => return bad(),
+    })
+}
+
+fn elem_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
+    let (rd, a) = vr(o.first())?;
+    let (rn, b) = vr(o.get(1))?;
+    let (rm, es, idx) = velem(o.get(2))?;
+    if let Some(&(_, base)) = ELEM_F.iter().find(|e| e.0 == mn) {
+        if a != b || a.es != es || !matches!((a.n, a.es), (2, 2) | (4, 2) | (2, 3)) {
+            return bad();
+        }
+        let (l, m, h, r) = elem_fields(es, idx, rm)?;
+        w(ctx, base | a.q() << 30 | ((es == 3) as u32) << 22 | l << 21 | m << 20 | r << 16 | h << 11 | rn.n() << 5 | rd.n());
+        return Ok(true);
+    }
+    if let Some(&(_, base)) = ELEM_I.iter().find(|e| e.0 == mn) {
+        if a != b || a.es != es || !(a.es == 1 || a.es == 2) {
+            return bad();
+        }
+        let (l, m, h, r) = elem_fields(es, idx, rm)?;
+        w(ctx, base | a.q() << 30 | (es as u32) << 22 | l << 21 | m << 20 | r << 16 | h << 11 | rn.n() << 5 | rd.n());
+        return Ok(true);
+    }
+    for &(name, base) in ELEM_L {
+        let two = mn.len() == name.len() + 1 && mn.ends_with('2');
+        if mn == name || (two && mn.starts_with(name)) {
+            if b.es != es || !(b.es == 1 || b.es == 2) || a.es != b.es + 1 || a.n as u32 * (1 << a.es) != 16 || (b.n as u32 * (1 << b.es) == 16) != two {
+                return bad();
+            }
+            let (l, m, h, r) = elem_fields(es, idx, rm)?;
+            w(ctx, base | (two as u32) << 30 | (es as u32) << 22 | l << 21 | m << 20 | r << 16 | h << 11 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Scalar SIMD forms: d registers (integer ops) and s / d registers (float ops).
+fn scalar_simd(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
+    let Some(Op::Reg(rd, None, None)) = o.first() else { return Ok(false) };
+    if !(rd.k == K::D || rd.k == K::S) {
+        return Ok(false);
+    }
+    let sz = (rd.k == K::D) as u32;
+    if rd.k == K::D {
+        if SCALAR_D3.contains(&mn) && o.len() == 3 && !is_imm(o.get(2)) {
+            let &(_, base, _) = THREE.iter().find(|e| e.0 == mn).unwrap();
+            let (rn, rm) = (fp_same(o.get(1), K::D)?, fp_same(o.get(2), K::D)?);
+            w(ctx, base + 0x5000_0000 | 3 << 22 | rm.n() << 16 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+        if matches!(mn, "neg" | "abs") && o.len() == 2 {
+            let rn = fp_same(o.get(1), K::D)?;
+            w(ctx, if mn == "neg" { 0x2E20_B800 } else { 0x0E20_B800 } + 0x5000_0000 | 3 << 22 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+        if let Some(&(_, base)) = ZERO_CMP.iter().find(|e| e.0 == mn) {
+            if o.len() == 3 && is_imm(o.get(2)) {
+                let rn = fp_same(o.get(1), K::D)?;
+                if imm(ctx, o.get(2))? != 0 {
+                    return bad();
+                }
+                w(ctx, base + 0x5000_0000 | 3 << 22 | rn.n() << 5 | rd.n());
+                return Ok(true);
+            }
+        }
+        if let Some(&(_, base, left)) = SHIFT_IMM.iter().find(|e| e.0 == mn) {
+            if o.len() == 3 {
+                let rn = fp_same(o.get(1), K::D)?;
+                let sh = imm(ctx, o.get(2))?;
+                let hb = if left { 64 + range(sh, 0, 63, "shift amount")? } else { 128 - range(sh, 1, 64, "shift amount")? };
+                w(ctx, base + 0x5000_0000 | hb << 16 | rn.n() << 5 | rd.n());
+                return Ok(true);
+            }
+        }
+    }
+    if SCALAR_F3.contains(&mn) && o.len() == 3 && !is_imm(o.get(2)) {
+        let &(_, base, _) = THREE_F.iter().find(|e| e.0 == mn).unwrap();
+        let (rn, rm) = (fp_same(o.get(1), rd.k)?, fp_same(o.get(2), rd.k)?);
+        w(ctx, base + 0x5000_0000 | sz << 22 | rm.n() << 16 | rn.n() << 5 | rd.n());
+        return Ok(true);
+    }
+    if let Some(&(_, base, _)) = FCMP_ZERO.iter().find(|e| e.0 == mn) {
+        if o.len() == 3 && is_imm(o.get(2)) {
+            let rn = fp_same(o.get(1), rd.k)?;
+            if fp_lit(ctx, o.get(2))? != 0.0 {
+                return bad();
+            }
+            w(ctx, base + 0x5000_0000 | sz << 22 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+    }
+    if mn == "frecpx" && o.len() == 2 {
+        let rn = fp_same(o.get(1), rd.k)?;
+        w(ctx, 0x5EA1_F800 | sz << 22 | rn.n() << 5 | rd.n());
+        return Ok(true);
+    }
+    if SCALAR_F2.contains(&mn) && o.len() >= 2 && matches!(o.get(1), Some(Op::Reg(r, None, None)) if r.is_fp()) {
+        let &(_, base) = TWO_F.iter().find(|e| e.0 == mn).unwrap();
+        let rn = fp_same(o.get(1), rd.k)?;
+        if o.len() == 2 {
+            w(ctx, base + 0x5000_0000 | sz << 22 | rn.n() << 5 | rd.n());
+        } else {
+            let fixed = match mn {
+                "scvtf" => 0x5F00_E400,
+                "ucvtf" => 0x7F00_E400,
+                "fcvtzs" => 0x5F00_FC00,
+                "fcvtzu" => 0x7F00_FC00,
+                _ => return bad(),
+            };
+            let fb = imm(ctx, o.get(2))?;
+            let esize = if rd.k == K::D { 64 } else { 32 };
+            let hb = 2 * esize - range(fb, 1, esize as i64, "number of fractional bits")?;
+            w(ctx, fixed | hb << 16 | rn.n() << 5 | rd.n());
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn neon_extra(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
+    // across lanes, float
+    if matches!(mn, "fmaxv" | "fminv" | "fmaxnmv" | "fminnmv") {
+        let rd = fp_same(o.first(), K::S)?;
+        let (rn, a) = vr(o.get(1))?;
+        if a != (Arr { n: 4, es: 2 }) || o.len() != 2 {
+            return bad();
+        }
+        let base = match mn {
+            "fmaxv" => 0x6E30_F800,
+            "fminv" => 0x6EB0_F800,
+            "fmaxnmv" => 0x6E30_C800,
+            _ => 0x6EB0_C800,
+        };
+        w(ctx, base | rn.n() << 5 | rd.n());
+        return Ok(true);
+    }
+    for &(name, base) in PAIRLONG {
+        if name == mn {
+            let (rd, a) = vr(o.first())?;
+            let (rn, b) = vr(o.get(1))?;
+            if o.len() != 2 || a.es != b.es + 1 || a.es > 3 || a.n * 2 != b.n || b.es > 2 {
+                return bad();
+            }
+            w(ctx, base | b.q() << 30 | (b.es as u32) << 22 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+    }
+    for &(name, base) in NARROW2 {
+        let two = mn.len() == name.len() + 1 && mn.ends_with('2') && mn.starts_with(name);
+        if mn == name || two {
+            let (rd, a) = vr(o.first())?;
+            let (rn, b) = vr(o.get(1))?;
+            if o.len() != 2 || b.es != a.es + 1 || b.es > 3 || b.n as u32 * (1 << b.es) != 16 || (a.n as u32 * (1 << a.es) == 16) != two {
+                return bad();
+            }
+            w(ctx, base | (two as u32) << 30 | (a.es as u32) << 22 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+    }
+    for &(name, base) in NARROW3 {
+        let two = mn.len() == name.len() + 1 && mn.ends_with('2') && mn.starts_with(name);
+        if mn == name || two {
+            let (rd, a) = vr(o.first())?;
+            let (rn, b) = vr(o.get(1))?;
+            let (rm, c) = vr(o.get(2))?;
+            if o.len() != 3 || b != c || b.es != a.es + 1 || b.es > 3 || b.n as u32 * (1 << b.es) != 16 || (a.n as u32 * (1 << a.es) == 16) != two {
+                return bad();
+            }
+            w(ctx, base | (two as u32) << 30 | (a.es as u32) << 22 | rm.n() << 16 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+    }
+    for &(name, base) in NARROW_SHIFT {
+        let two = mn.len() == name.len() + 1 && mn.ends_with('2') && mn.starts_with(name);
+        if mn == name || two {
+            let (rd, a) = vr(o.first())?;
+            let (rn, b) = vr(o.get(1))?;
+            if o.len() != 3 || b.es != a.es + 1 || a.es > 2 || b.n as u32 * (1 << b.es) != 16 || (a.n as u32 * (1 << a.es) == 16) != two {
+                return bad();
+            }
+            let esize = 8i64 << a.es;
+            let sh = range(imm(ctx, o.get(2))?, 1, esize, "shift amount")?;
+            w(ctx, base | (two as u32) << 30 | (2 * esize as u32 - sh) << 16 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+    }
+    match mn {
+        "pmull" | "pmull2" => {
+            let (rd, a) = vr(o.first())?;
+            let (rn, b) = vr(o.get(1))?;
+            let (rm, c) = vr(o.get(2))?;
+            let two = mn.ends_with('2');
+            if o.len() != 3 || b != c {
+                return bad();
+            }
+            let size = match (a, b.es) {
+                (Arr { n: 8, es: 1 }, 0) => 0,
+                (Arr { n: 1, es: 4 }, 3) => 3,
+                _ => return bad(),
+            };
+            if (b.n as u32 * (1 << b.es) == 16) != two {
+                return bad();
+            }
+            w(ctx, 0x0E20_E000 | (two as u32) << 30 | size << 22 | rm.n() << 16 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+        "sdot" | "udot" => {
+            let (rd, a) = vr(o.first())?;
+            let (rn, b) = vr(o.get(1))?;
+            let (rm, c) = vr(o.get(2))?;
+            if o.len() != 3 || b != c || b.es != 0 || a.es != 2 || a.n * 4 != b.n {
+                return bad();
+            }
+            w(ctx, if mn == "sdot" { 0x0E80_9400 } else { 0x2E80_9400 } | a.q() << 30 | rm.n() << 16 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+        "sqrdmlah" | "sqrdmlsh" => {
+            let (rd, a) = vr(o.first())?;
+            let (rn, b) = vr(o.get(1))?;
+            let (rm, c) = vr(o.get(2))?;
+            if o.len() != 3 || a != b || b != c || !(a.es == 1 || a.es == 2) {
+                return bad();
+            }
+            w(ctx, if mn == "sqrdmlah" { 0x2E00_8400 } else { 0x2E00_8C00 } | a.q() << 30 | (a.es as u32) << 22 | rm.n() << 16 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+        "urecpe" | "ursqrte" => {
+            let (rd, a) = vr(o.first())?;
+            let (rn, b) = vr(o.get(1))?;
+            if o.len() != 2 || a != b || a.es != 2 {
+                return bad();
+            }
+            w(ctx, if mn == "urecpe" { 0x0EA1_C800 } else { 0x2EA1_C800 } | a.q() << 30 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+        _ => {}
+    }
+    // sqshl / uqshl / sqrshl / uqrshl with registers (the immediate forms are in SHIFT_IMM)
+    let reg3 = match mn {
+        "sqshl" => Some(0x0E20_4C00),
+        "uqshl" => Some(0x2E20_4C00),
+        "sqrshl" => Some(0x0E20_5C00),
+        "uqrshl" => Some(0x2E20_5C00),
+        _ => None,
+    };
+    if let Some(base) = reg3 {
+        let (rd, a) = vr(o.first())?;
+        let (rn, b) = vr(o.get(1))?;
+        let (rm, c) = vr(o.get(2))?;
+        if o.len() != 3 || a != b || b != c || !arr_ok(M::All, a) {
+            return bad();
+        }
+        w(ctx, base | a.q() << 30 | (a.es as u32) << 22 | rm.n() << 16 | rn.n() << 5 | rd.n());
+        return Ok(true);
+    }
+    // half-precision vectors and float compares with zero
+    for &(name, base, half) in FCMP_ZERO {
+        if name == mn && is_vec_op(o.first()) && is_imm(o.get(2)) {
+            let (rd, a) = vr(o.first())?;
+            let (rn, b) = vr(o.get(1))?;
+            if o.len() != 3 || a != b || fp_lit(ctx, o.get(2))? != 0.0 {
+                return bad();
+            }
+            let word = match (a.es, a.n) {
+                (2, 2) | (2, 4) => base | a.q() << 30,
+                (3, 2) => base | 1 << 30 | 1 << 22,
+                (1, 4) | (1, 8) => half | a.q() << 30,
+                _ => return bad(),
+            };
+            w(ctx, word | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+    }
+    for &(name, half) in TWO_F16 {
+        if name == mn && is_vec_op(o.first()) && o.len() == 2 {
+            let (rd, a) = vr(o.first())?;
+            let (rn, b) = vr(o.get(1))?;
+            if a != b || a.es != 1 || !(a.n == 4 || a.n == 8) {
+                return bad();
+            }
+            w(ctx, half | a.q() << 30 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+    }
+    // fixed-point vector conversions
+    if o.len() == 3 && is_imm(o.get(2)) {
+        let fixed = match mn {
+            "scvtf" => Some(0x0F00_E400),
+            "ucvtf" => Some(0x2F00_E400),
+            "fcvtzs" => Some(0x0F00_FC00),
+            "fcvtzu" => Some(0x2F00_FC00),
+            _ => None,
+        };
+        if let (Some(base), true) = (fixed, is_vec_op(o.first())) {
+            let (rd, a) = vr(o.first())?;
+            let (rn, b) = vr(o.get(1))?;
+            if a != b || !matches!((a.n, a.es), (2, 2) | (4, 2) | (2, 3)) {
+                return bad();
+            }
+            let esize = 8i64 << a.es;
+            let fb = range(imm(ctx, o.get(2))?, 1, esize, "number of fractional bits")?;
+            w(ctx, base | a.q() << 30 | (2 * esize as u32 - fb) << 16 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
