@@ -184,9 +184,11 @@ fn domain_tls() -> &'static DomainTls {
 /// compiled `try_with` is the general-dynamic model: a `__tls_get_addr` call that the linker
 /// relaxes to fs:0 + offset, but the argument registers it would clobber stay saved around it;
 /// the program allocator's fast paths read fs:0 + this offset instead and save nothing.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// Not under Relax: its thread-local blocks are allocated per thread, at no fixed offset from
+/// the thread pointer.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(relax)))]
 static DOMAIN_OFFSET: AtomicUsize = AtomicUsize::new(0);
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(relax)))]
 #[inline(always)]
 fn thread_pointer() -> usize {
     let tp: usize;
@@ -196,17 +198,17 @@ fn thread_pointer() -> usize {
 }
 /// Called before the program allocator's entries are handed out (domain.rs `symbol`).
 pub fn bind_program_tls() {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(relax)))]
     DOMAIN_OFFSET.store((domain_tls() as *const DomainTls as usize).wrapping_sub(thread_pointer()), Ordering::Relaxed);
 }
 /// `domain_tls` for the program allocator's fast paths (after `bind_program_tls`).
 #[inline(always)]
 fn program_tls() -> &'static DomainTls {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(relax)))]
     unsafe {
         &*(thread_pointer().wrapping_add(DOMAIN_OFFSET.load(Ordering::Relaxed)) as *const DomainTls)
     }
-    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64", not(relax))))]
     domain_tls()
 }
 
