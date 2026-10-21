@@ -842,6 +842,11 @@ impl<'a> Gen<'a> {
     }
     fn fin_i(&mut self, v: VReg, r: u8) {
         if let Loc::Stack(o) = self.al.loc[v.0 as usize] {
+            // nobody reads this store home (Alloc::store_skip): the window's register only
+            if self.al.store_skip.contains(&(self.cur_pos, v.0)) {
+                self.def_win_copy(v, r);
+                return;
+            }
             let off = self.spill_sp(o);
             self.a.ldst(STRX, 8, r, SP, off);
             self.last_spill = Some((off, r, self.a.pos()));
@@ -3007,8 +3012,10 @@ impl<'a> Gen<'a> {
                     // straight between a register and a spill slot
                     match (self.al.loc[d.0 as usize], self.al.loc[s.0 as usize]) {
                         (Loc::Stack(o), Loc::Reg(r)) => {
-                            let off = self.spill_sp(o);
-                            self.a.ldst(STRX, 8, r, SP, off);
+                            if !self.al.store_skip.contains(&(self.cur_pos, d.0)) {
+                                let off = self.spill_sp(o);
+                                self.a.ldst(STRX, 8, r, SP, off);
+                            }
                             self.def_win_copy(*d, r);
                         }
                         (Loc::Reg(r), Loc::Stack(o)) => {

@@ -862,7 +862,8 @@ impl<'a> Gen<'a> {
                 if let Some(ws) = self.win.get(&v.0) {
                     let p = self.cur_pos;
                     if let Some(&(_, _, r)) = ws.iter().find(|(a, z, _)| *a <= p && p <= *z) {
-                        if check_windows(options) {
+                        // (a value with dead stores home has a stale slot: not checked)
+                        if check_windows(options) && !self.al.store_skip.iter().any(|x| x.1 == v.0) {
                             // the slot stays the value's home: the register must still equal it
                             // (pushfq; cmp r, [rbp+d]; je +2; ud2; popfq -- flags kept)
                             let d = self.spill_disp(o);
@@ -973,6 +974,11 @@ impl<'a> Gen<'a> {
     }
     fn fin_i(&mut self, v: VReg, r: u8) {
         if let Loc::Stack(o) = self.al.loc[v.0 as usize] {
+            // nobody reads this store home (Alloc::store_skip): the window's register only
+            if self.al.store_skip.contains(&(self.cur_pos, v.0)) {
+                self.def_win_copy(v, r);
+                return;
+            }
             let d = self.spill_disp(o);
             self.a.store64(RBP, d, r);
             self.last_spill = Some((d, r, self.a.pos()));
@@ -2573,8 +2579,10 @@ impl<'a> Gen<'a> {
                 Cls::I => match (self.al.loc[d.0 as usize], self.uloc(*s)) {
                     // straight between a register and a spill slot
                     (Loc::Stack(o), Loc::Reg(r)) => {
-                        let disp = self.spill_disp(o);
-                        self.a.store64(RBP, disp, r);
+                        if !self.al.store_skip.contains(&(self.cur_pos, d.0)) {
+                            let disp = self.spill_disp(o);
+                            self.a.store64(RBP, disp, r);
+                        }
                         self.def_win_copy(*d, r);
                     }
                     (Loc::Reg(r), Loc::Stack(o)) => {

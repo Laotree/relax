@@ -106,6 +106,9 @@ pub struct Alloc {
     /// (call position, vreg) restores nobody reads (the value is not used before the next call
     /// whose save skips its store, or before it dies): no load
     pub restore_skip: std::collections::HashSet<(u32, u32)>,
+    /// (instruction position, vreg) definitions of a spilled value whose store home nobody reads
+    /// (dead_spill_stores): the result only goes to the region window's register
+    pub store_skip: std::collections::HashSet<(u32, u32)>,
 }
 
 /// A value the backend recomputes at each use instead of keeping it (see Alloc::remat).
@@ -1561,9 +1564,14 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             }
         }
     }
+    let store_skip = if thorough && windows_on(options) && !in_region.is_empty() && !crate::stats::opt_off(options, "-storeskip") {
+        dead_spill_stores(f, &reach, &tab, &block_start, &block_end, &loc, &in_region, &region_windows)
+    } else {
+        Default::default()
+    };
     windows.extend(region_windows);
     chained.extend(def_wins);
-    Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows, chained, save_skip, restore_skip }
+    Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows, chained, save_skip, restore_skip, store_skip }
 }
 
 /// Saves around calls that need no store or no load (Alloc::save_skip / restore_skip): forward,
@@ -1754,6 +1762,148 @@ fn redundant_saves(f: &Func, reach: &[bool], tab: &OpTab, block_start: &[u32], s
 /// saves the most weighted loads; a block of the region loads at its start unless every
 /// predecessor is in the region too (`chained`: the register already holds the value).
 #[allow(clippy::too_many_arguments)]
+/// Stores home of region values nobody reads (Alloc::store_skip). A spilled value a region
+/// window holds keeps its slot as home, stored at every definition; inside the region its reads
+/// take the register. A store is dead when no read of the slot can follow before the slot is
+/// written again: per slot (values sharing a slot share its contents), backward over the CFG,
+/// the reads are the uses outside the value's region blocks (and uses there by instructions that
+/// read operands their own way: calls, returns), the region's loads (block starts and the edge
+/// loads before predecessors' terminators); the writes are the definitions. A loop counter dead
+/// after its loop (piano's `i += 2` in a 49-instruction body) then lives in its register only.
+/// Slots shared with float or vector values are left alone.
+fn dead_spill_stores(
+    f: &Func,
+    reach: &[bool],
+    tab: &OpTab,
+    block_start: &[u32],
+    block_end: &[u32],
+    loc: &[Loc],
+    in_region: &std::collections::HashSet<(u32, u32)>,
+    region_loads: &[(u32, u32, u32, u8)],
+) -> std::collections::HashSet<(u32, u32)> {
+    let mut out = std::collections::HashSet::new();
+    let nv = f.vregs.len();
+    let nb = f.blocks.len();
+    // the slots of region values, and whether any non-integer value or overlapping slot touches them
+    let mut slots: Vec<i32> = Vec::new();
+    for &(v, _) in in_region {
+        if let Loc::Stack(o) = loc[v as usize] {
+            if !slots.contains(&o) {
+                slots.push(o);
+            }
+        }
+    }
+    if slots.is_empty() {
+        return out;
+    }
+    slots.sort_unstable();
+    for v in 0..nv {
+        if let Loc::Stack(o) = loc[v] {
+            if f.vregs[v] != Cls::I {
+                let n = f.vregs[v].spill_bytes() as i32;
+                // bytes [o - n, o) against the 8-byte slots [s - 8, s)
+                slots.retain(|&s| !(o - n < s && s - 8 < o));
+            }
+        }
+    }
+    if slots.is_empty() {
+        return out;
+    }
+    let slot_ix = |v: u32| -> Option<usize> {
+        match loc[v as usize] {
+            Loc::Stack(o) if f.vregs[v as usize] == Cls::I => slots.binary_search(&o).ok(),
+            _ => None,
+        }
+    };
+    let ns = slots.len();
+    // per block, per slot: events in order (position, read?) -- a read sorts before a write at
+    // the same position (an instruction reads its operands before its result goes home)
+    let mut ev: Vec<Vec<(u32, bool, usize, u32)>> = vec![Vec::new(); nb];
+    let simple = |i: &Inst| matches!(i, Inst::IBin(..) | Inst::IBinI(..) | Inst::ICmp(..) | Inst::ICmpI(..) | Inst::Load(..) | Inst::Store(..) | Inst::LoadX(..) | Inst::StoreX(..) | Inst::Conv(..) | Inst::Mov(..));
+    for (bi, b) in f.blocks.iter().enumerate() {
+        if !reach[bi] {
+            continue;
+        }
+        let k0 = tab.first[bi] as usize;
+        for k in 0..=b.insts.len() {
+            let p = if k < b.insts.len() { block_start[bi] + 2 * k as u32 + 1 } else { block_end[bi] - 1 };
+            let reg_read = k < b.insts.len() && simple(&b.insts[k]);
+            for &u in tab.uses(k0 + k) {
+                if let Some(si) = slot_ix(u) {
+                    // a no-op move between two values of one slot reads nothing
+                    let same = matches!(b.insts.get(k), Some(Inst::Mov(d, s2)) if s2.0 == u && loc[d.0 as usize] == loc[u as usize]);
+                    if !same && !(reg_read && in_region.contains(&(u, bi as u32))) {
+                        ev[bi].push((p, true, si, u));
+                    }
+                }
+            }
+            if k < b.insts.len() {
+                for &d in tab.defs(k0 + k) {
+                    if let Some(si) = slot_ix(d) {
+                        let same = matches!(b.insts[k], Inst::Mov(_, s2) if loc[s2.0 as usize] == loc[d as usize]);
+                        if !same {
+                            ev[bi].push((p + 1, false, si, d));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let block_of = |p: u32| block_start.partition_point(|&s| s <= p) - 1;
+    for &(v, a, _, _) in region_loads {
+        if let Some(si) = slot_ix(v) {
+            ev[block_of(a)].push((a, true, si, v));
+        }
+    }
+    for e in ev.iter_mut() {
+        // reads first at one position
+        e.sort_by_key(|x| (x.0, !x.1));
+    }
+    // backward: slot needed at block entry (a read comes before any write)
+    let words = (ns + 63) / 64;
+    let mut gen = vec![0u64; nb * words];
+    let mut kill = vec![0u64; nb * words];
+    for bi in 0..nb {
+        for &(_, rd, si, _) in &ev[bi] {
+            let (w, m) = (bi * words + si / 64, 1u64 << (si % 64));
+            if kill[w] & m == 0 {
+                if rd {
+                    gen[w] |= m;
+                } else {
+                    kill[w] |= m;
+                }
+            }
+        }
+    }
+    let (live_in, _) = solve_liveness(f, reach, words, &gen, &kill, false);
+    for bi in 0..nb {
+        if !reach[bi] || ev[bi].is_empty() {
+            continue;
+        }
+        let mut need = vec![0u64; words];
+        for t in f.blocks[bi].term.succs() {
+            if reach[t as usize] {
+                for w in 0..words {
+                    need[w] |= live_in[t as usize * words + w];
+                }
+            }
+        }
+        for &(p, rd, si, v) in ev[bi].iter().rev() {
+            let (w, m) = (si / 64, 1u64 << (si % 64));
+            if rd {
+                need[w] |= m;
+            } else {
+                if need[w] & m == 0 {
+                    // the store at the defining instruction (position p - 1)
+                    out.insert((p - 1, v));
+                }
+                need[w] &= !m;
+            }
+        }
+    }
+    out
+}
+
 fn region_windows_alloc(
     f: &Func,
     reach: &[bool],
@@ -2307,7 +2457,7 @@ fn allocate_baseline(options: &relax_session::Options, f: &Func, cfg: &RegConfig
             remat[v] = Remat::No;
         }
     }
-    Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows: Vec::new(), chained: Vec::new(), save_skip: Default::default(), restore_skip: Default::default() }
+    Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows: Vec::new(), chained: Vec::new(), save_skip: Default::default(), restore_skip: Default::default(), store_skip: Default::default() }
 }
 
 /// Rematerialisable values: one definition by a constant-like instruction, not parameters.
