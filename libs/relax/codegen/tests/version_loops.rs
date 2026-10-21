@@ -46,8 +46,8 @@ fn eval(f: &Func, args: &[u64], mem0: &[u8]) -> Out {
                     let v = r[s.0 as usize];
                     r[d.0 as usize] = if t.bits >= 64 { v } else if t.signed { (((v << (64 - t.bits)) as i64) >> (64 - t.bits)) as u64 } else { v & ((1u64 << t.bits) - 1) };
                 }
-                Inst::IBin(op, _, d, a, c) => r[d.0 as usize] = bin(op, r[a.0 as usize], r[c.0 as usize]),
-                Inst::IBinI(op, _, d, a, k) => r[d.0 as usize] = bin(op, r[a.0 as usize], k as u64),
+                Inst::IBin(op, it, d, a, c) => r[d.0 as usize] = typed(it, op, r[a.0 as usize], r[c.0 as usize]),
+                Inst::IBinI(op, it, d, a, k) => r[d.0 as usize] = typed(it, op, r[a.0 as usize], k as u64),
                 Inst::ICmp(cc, s, d, a, c) => r[d.0 as usize] = cmp(cc, s, r[a.0 as usize], r[c.0 as usize]) as u64,
                 Inst::ICmpI(cc, s, d, a, k) => r[d.0 as usize] = cmp(cc, s, r[a.0 as usize], k as u64) as u64,
                 Inst::Load(Mem::Int(4, false), d, a, off) => {
@@ -74,8 +74,27 @@ fn eval(f: &Func, args: &[u64], mem0: &[u8]) -> Out {
     }
 }
 
+/// an operation of a type: unsigned widths below 64 wrap (the result zero-extended); rotates and
+/// remainders at the type's width
+fn typed(it: IntTy, op: IOp, a: u64, b: u64) -> u64 {
+    if it.bits >= 64 || it.signed {
+        return bin(op, a, b);
+    }
+    let m = (1u64 << it.bits) - 1;
+    match op {
+        IOp::Rotl => {
+            let (a, k) = (a & m, b % it.bits as u64);
+            ((a << k) | (a >> ((it.bits as u64 - k) % it.bits as u64))) & m
+        }
+        _ => bin(op, a, b) & m,
+    }
+}
+
 fn bin(op: IOp, a: u64, b: u64) -> u64 {
     match op {
+        IOp::Rem => a % b,
+        IOp::Div => a / b,
+        IOp::Rotl => a.rotate_left(b as u32),
         IOp::Add => a.wrapping_add(b),
         IOp::Sub => a.wrapping_sub(b),
         IOp::Mul => a.wrapping_mul(b),
@@ -542,4 +561,43 @@ fn ordering_select_tree_folds() {
     }
     let live: usize = f.blocks.iter().map(|b| b.insts.len()).sum();
     assert!(live <= 2, "left: {:?}", f.blocks.iter().map(|b| &b.insts).collect::<Vec<_>>());
+}
+
+/// `x % c == 0` and `x % c != 0` (u32 and u64) become a multiply by c's inverse (and a rotate for even
+/// c) and an unsigned compare; exact for every tested x.
+#[test]
+fn divisibility_tests_fold() {
+    for bits in [32u8, 64] {
+        for c in [3u64, 5, 6, 7, 10, 12, 24, 100, 641, 1000, 65535, 0x7fff_ffff] {
+            for eq in [true, false] {
+                let it = IntTy { bits, signed: false };
+                let mut f = Func::new("rem".into(), 0);
+                let x = f.vreg(Cls::I);
+                f.params.push(x);
+                f.block();
+                let (kc, r, d) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+                push(&mut f, 0, Inst::Iconst(kc, c as i64));
+                push(&mut f, 0, Inst::IBin(IOp::Rem, it, r, x, kc));
+                push(&mut f, 0, Inst::ICmpI(if eq { Cond::Eq } else { Cond::Ne }, false, d, r, 0));
+                f.rets.push(Cls::I);
+                term(&mut f, 0, Term::Ret(vec![d]));
+                let orig = f.clone();
+                relax_backend::passes::simplify(&relax_session::Options::default(), &mut f, None, true, true);
+                assert!(!f.blocks[0].insts.iter().any(|i| matches!(i, Inst::IBin(IOp::Rem | IOp::MulHi, ..))), "c {c} bits {bits}: {:?}", f.blocks[0].insts);
+                let m = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                let mut xs: Vec<u64> = vec![0, 1, 2, c - 1, c, c + 1, 2 * c, 3 * c - 1, m, m - 1, m / c * c, m / c * c + 1];
+                let mut s = 0x9E37_79B9_7F4A_7C15u64;
+                for _ in 0..2000 {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    xs.push(s & m);
+                    xs.push((s % 1000) * c & m);
+                }
+                for xv in xs.iter().map(|v| v & m) {
+                    assert_eq!(eval(&orig, &[xv], &[]), eval(&f, &[xv], &[]), "x {xv} c {c} bits {bits} eq {eq}");
+                }
+            }
+        }
+    }
 }

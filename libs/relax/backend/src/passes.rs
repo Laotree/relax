@@ -1727,6 +1727,10 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
             b.insts.splice(e.at..e.at + e.remove, e.insts);
             b.pos.splice(e.at..e.at + e.remove, std::iter::repeat(e.pos).take(n));
         }
+        // `x % c == 0` (unsigned, c constant): one multiply by c's inverse and a compare
+        if !crate::stats::opt_off(options, "-remzero") {
+            changed |= rem_eq_zero(f, &kn, nv);
+        }
         // unsigned division / remainder by a constant: multiply-high and shifts
         changed |= div_by_const(f, &kn, nv);
         if !crate::stats::opt_off(options, "-divrem") {
@@ -3041,6 +3045,103 @@ pub fn udiv_magic(d: u64) -> (u64, u32, bool) {
         }
         (m.wrapping_add(1), l, true)
     }
+}
+
+/// Divisibility tests: `x % c == 0` / `!= 0` for an unsigned 32- or 64-bit x and a constant c (not a
+/// power of two) whose remainder only these compares read. With c = c0 << s (c0 odd) and
+/// inv = c0^-1 mod 2^w, `x % c == 0` exactly when `rotr(x * inv, s) <= (2^w - 1) / c` (Granlund and
+/// Montgomery; LLVM's urem-seteq fold): one multiply (and a rotate) instead of a multiply-high
+/// division sequence (Vec::retain(|x| x % 3 != 0)).
+pub fn rem_eq_zero(f: &mut Func, kn: &[Option<K>], nv: usize) -> bool {
+    let mut uses = vec![0u32; f.vregs.len()];
+    let mut cmp_uses = vec![0u32; f.vregs.len()];
+    let mut ndef = vec![0u32; f.vregs.len()];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut tu = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_uses(i, |u| uses[u.0 as usize] += 1);
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            if let Inst::ICmpI(Cond::Eq | Cond::Ne, _, _, r, 0) = i {
+                cmp_uses[r.0 as usize] += 1;
+            }
+        }
+        term_uses(&b.term, &mut tu);
+        for u in tu.drain(..) {
+            uses[u.0 as usize] += 1;
+        }
+    }
+    // candidates: r = x % c (unsigned 32 / 64 bits, c > 1 not a power of two), r single-def, read
+    // only by `r == 0` / `r != 0`
+    let mut plan: Vec<(VReg, u64, u8)> = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::IBin(IOp::Rem, it, r, _, y) = *i {
+                if it.signed || !(it.bits == 32 || it.bits == 64) || (y.0 as usize) >= nv {
+                    continue;
+                }
+                let Some(K::I(c)) = kn[y.0 as usize] else { continue };
+                let c = c as u64;
+                if c < 3 || c.is_power_of_two() || (it.bits == 32 && c >> 32 != 0) {
+                    continue;
+                }
+                if ndef[r.0 as usize] == 1 && uses[r.0 as usize] > 0 && uses[r.0 as usize] == cmp_uses[r.0 as usize] {
+                    plan.push((r, c, it.bits));
+                }
+            }
+        }
+    }
+    if plan.is_empty() {
+        return false;
+    }
+    for bi in 0..f.blocks.len() {
+        let mut k = 0;
+        while k < f.blocks[bi].insts.len() {
+            match f.blocks[bi].insts[k] {
+                Inst::IBin(IOp::Rem, it, r, x, _) if plan.iter().any(|p| p.0 == r) => {
+                    let &(_, c, bits) = plan.iter().find(|p| p.0 == r).unwrap();
+                    let s = c.trailing_zeros();
+                    let c0 = c >> s;
+                    // Newton's iteration for the inverse of an odd c0 mod 2^64 (5 steps: 3 -> 96 bits)
+                    let mut inv: u64 = c0;
+                    for _ in 0..5 {
+                        inv = inv.wrapping_mul(2u64.wrapping_sub(c0.wrapping_mul(inv)));
+                    }
+                    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                    let inv = inv & mask;
+                    let pos = f.blocks[bi].pos[k];
+                    let kv = f.vreg(Cls::I);
+                    let mut seq = vec![Inst::Iconst(kv, inv as i64)];
+                    if s == 0 {
+                        seq.push(Inst::IBin(IOp::Mul, it, r, x, kv));
+                    } else {
+                        let m = f.vreg(Cls::I);
+                        seq.push(Inst::IBin(IOp::Mul, it, m, x, kv));
+                        seq.push(Inst::IBinI(IOp::Rotl, it, r, m, (bits - s as u8) as i64));
+                    }
+                    let n = seq.len();
+                    f.blocks[bi].insts.splice(k..k + 1, seq);
+                    f.blocks[bi].pos.splice(k..k + 1, std::iter::repeat(pos).take(n));
+                    k += n;
+                }
+                Inst::ICmpI(cc @ (Cond::Eq | Cond::Ne), _, d, r, 0) if plan.iter().any(|p| p.0 == r) => {
+                    let &(_, c, bits) = plan.iter().find(|p| p.0 == r).unwrap();
+                    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                    let lim = mask / c;
+                    let pos = f.blocks[bi].pos[k];
+                    let lv = f.vreg(Cls::I);
+                    let seq = vec![Inst::Iconst(lv, lim as i64), Inst::ICmp(if cc == Cond::Eq { Cond::Le } else { Cond::Gt }, false, d, r, lv)];
+                    f.blocks[bi].insts.splice(k..k + 1, seq);
+                    f.blocks[bi].pos.splice(k..k + 1, std::iter::repeat(pos).take(2));
+                    k += 2;
+                }
+                _ => k += 1,
+            }
+        }
+    }
+    true
 }
 
 /// `x / c` and `x % c` for an unsigned x and a constant c > 1: a power of two becomes a shift
