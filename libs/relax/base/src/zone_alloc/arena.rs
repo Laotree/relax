@@ -4,7 +4,10 @@ use std::marker::PhantomData;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
-pub const CHUNK: usize = 2 << 20;
+/// A chunk holds one thread's blocks of one size class. The web target's linear memory takes
+/// 512 KB chunks: every thread keeps a current chunk per class, and at 2 MB the program's few
+/// threads committed 1.5 GB of the 2 GB for 250 MB live (P(DOOM) in the trace host).
+pub const CHUNK: usize = if WEB_AT != 0 { 512 << 10 } else { 2 << 20 };
 const MAX_SHIFT: usize = 18; // 16 B .. 256 KB; >256 KB gets an exclusive mapping
                              // Size classes. The burst arena keeps powers of two. The compiler arena holds its blocks for a
                              // long time, so rounding every one up to a power of two would waste a quarter of its pages:
@@ -61,9 +64,9 @@ const PLATFORM_MAX_ORDER: usize = 15; // 64 GB of virtual address space, not res
 const PLATFORM_MAX_ORDER: usize = 12;
 #[cfg(not(target_pointer_width = "64"))]
 const PLATFORM_MAX_ORDER: usize = 7; // 256 MB on 32-bit; exhaustion falls back to the heap
-// The web target's linear memory (zone_alloc/web.rs): 2 GB at a fixed address inside one 4 GB
-// window, so a pointer's low 32 bits are its wasm address.
-const MAX_ORDER: usize = if WEB_AT != 0 { 10 } else { PLATFORM_MAX_ORDER };
+// The web target's linear memory (zone_alloc/web.rs): 2 GB (4096 chunks of 512 KB) at a fixed
+// address inside one 4 GB window, so a pointer's low 32 bits are its wasm address.
+const MAX_ORDER: usize = if WEB_AT != 0 { 12 } else { PLATFORM_MAX_ORDER };
 const N: usize = 1 << MAX_ORDER;
 const RESERVE: usize = N * CHUNK;
 const NONE: usize = usize::MAX;
@@ -181,9 +184,11 @@ fn domain_tls() -> &'static DomainTls {
 /// compiled `try_with` is the general-dynamic model: a `__tls_get_addr` call that the linker
 /// relaxes to fs:0 + offset, but the argument registers it would clobber stay saved around it;
 /// the program allocator's fast paths read fs:0 + this offset instead and save nothing.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// Not under Relax: its thread-local blocks are allocated per thread, at no fixed offset from
+/// the thread pointer.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(relax)))]
 static DOMAIN_OFFSET: AtomicUsize = AtomicUsize::new(0);
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(relax)))]
 #[inline(always)]
 fn thread_pointer() -> usize {
     let tp: usize;
@@ -191,20 +196,94 @@ fn thread_pointer() -> usize {
     unsafe { std::arch::asm!("mov {}, qword ptr fs:[0]", out(reg) tp, options(pure, readonly, nostack, preserves_flags)) };
     tp
 }
+/// macOS arm64: `DOMAIN` is a thread-local variable whose address comes from a call through its
+/// descriptor (`_tlv_get_addr`: a `blr` per alloc and free, and a frame around it). The program
+/// allocator's fast paths read a pthread TSD slot instead (tpidrro_el0[key], the read the JIT's own
+/// thread-local block uses, os/tls.rs), which holds the address of the thread's `DOMAIN`: three
+/// instructions and no call. A null slot (the thread's first program allocation, or its
+/// thread-local destructors have started) takes the cold path, which reads `DOMAIN` the ordinary
+/// way and fills the slot. `SLOT_GUARD`'s destructor clears the slot in the thread's thread-local
+/// destructor round, before the thread-local storage it points into is released.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static DOMAIN_KEY: AtomicUsize = AtomicUsize::new(0);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+extern "C" {
+    fn pthread_key_create(key: *mut usize, dtor: Option<extern "C" fn(*mut u8)>) -> i32;
+    fn pthread_getspecific(key: usize) -> *mut u8;
+    fn pthread_setspecific(key: usize, v: *const u8) -> i32;
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct SlotGuard;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        unsafe { pthread_setspecific(DOMAIN_KEY.load(Ordering::Relaxed), std::ptr::null()) };
+    }
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+thread_local! {
+    static SLOT_GUARD: SlotGuard = const { SlotGuard };
+}
+/// The calling thread's TSD slot `key` (macOS: tpidrro_el0 is the slot array, its low 3 bits the
+/// cpu number).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[inline(always)]
+fn tsd_slot(key: usize) -> usize {
+    let v: usize;
+    unsafe {
+        std::arch::asm!("mrs {t}, tpidrro_el0", "and {t}, {t}, #0xfffffffffffffff8", "ldr {v}, [{t}, {k}, lsl #3]",
+            t = out(reg) _, k = in(reg) key, v = lateout(reg) v, options(readonly, nostack, preserves_flags));
+    }
+    v
+}
 /// Called before the program allocator's entries are handed out (domain.rs `symbol`).
 pub fn bind_program_tls() {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(relax)))]
     DOMAIN_OFFSET.store((domain_tls() as *const DomainTls as usize).wrapping_sub(thread_pointer()), Ordering::Relaxed);
-}
-/// `domain_tls` for the program allocator's fast paths (after `bind_program_tls`).
-#[inline(always)]
-fn program_tls() -> &'static DomainTls {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    unsafe {
-        &*(thread_pointer().wrapping_add(DOMAIN_OFFSET.load(Ordering::Relaxed)) as *const DomainTls)
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| unsafe {
+            let mut key = 0usize;
+            if pthread_key_create(&mut key, None) != 0 {
+                std::process::abort();
+            }
+            // the inline read must see what pthread stores
+            pthread_setspecific(key, 0x5a5a_0000 as *const u8);
+            if tsd_slot(key) != 0x5a5a_0000 || pthread_getspecific(key) as usize != 0x5a5a_0000 {
+                std::process::abort();
+            }
+            pthread_setspecific(key, std::ptr::null());
+            DOMAIN_KEY.store(key, Ordering::Release);
+        });
     }
-    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-    domain_tls()
+}
+/// `domain_tls` for the program allocator's fast paths (after `bind_program_tls`); None (macOS
+/// arm64): the slot is not filled, the caller tail-calls its cold path (`program_tls_fill`).
+#[inline(always)]
+fn program_tls() -> Option<&'static DomainTls> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(relax)))]
+    unsafe {
+        Some(&*(thread_pointer().wrapping_add(DOMAIN_OFFSET.load(Ordering::Relaxed)) as *const DomainTls))
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let p = tsd_slot(DOMAIN_KEY.load(Ordering::Relaxed));
+        if p == 0 { None } else { Some(unsafe { &*(p as *const DomainTls) }) }
+    }
+    #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64", not(relax)), all(target_os = "macos", target_arch = "aarch64"))))]
+    Some(domain_tls())
+}
+/// The thread's `DomainTls`, read the ordinary way; fills the fast paths' TSD slot (macOS arm64)
+/// unless the thread's thread-local destructors have started.
+#[inline(always)]
+fn program_tls_fill() -> &'static DomainTls {
+    let t = domain_tls();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if SLOT_GUARD.try_with(|_| ()).is_ok() {
+        unsafe { pthread_setspecific(DOMAIN_KEY.load(Ordering::Relaxed), t as *const DomainTls as *const u8) };
+    }
+    t
 }
 
 /// Hands the thread's chunks back when it ends, however it was started (a thread without
@@ -1741,17 +1820,41 @@ pub fn domain_here() -> Option<&'static Arena> {
 /// no registers.
 #[inline(always)]
 pub unsafe fn domain_alloc(l: Layout, none: unsafe extern "C" fn(usize, usize) -> *mut u8) -> *mut u8 {
-    let t = program_tls();
+    let Some(t) = program_tls() else {
+        return domain_alloc_fill(l.size(), l.align(), none);
+    };
     match t.arena.get().as_ref() {
         Some(a) => a.alloc_in(t, l),
         None => none(l.size(), l.align()),
+    }
+}
+/// `domain_alloc` when the fast paths' thread-local slot is not filled (`program_tls`).
+#[cold]
+#[inline(never)]
+unsafe extern "C" fn domain_alloc_fill(size: usize, align: usize, none: unsafe extern "C" fn(usize, usize) -> *mut u8) -> *mut u8 {
+    let t = program_tls_fill();
+    match t.arena.get().as_ref() {
+        Some(a) => a.alloc_in(t, Layout::from_size_align_unchecked(size, align)),
+        None => none(size, align),
     }
 }
 /// Frees `p` like `domain_dealloc`; a block that is not of the current domain arena goes to
 /// `other` (in a tail call, as every path but the fast one).
 #[inline(always)]
 pub unsafe fn domain_free(p: *mut u8, l: Layout, other: unsafe extern "C" fn(*mut u8, usize, usize)) {
-    let t = program_tls();
+    let Some(t) = program_tls() else {
+        return domain_free_fill(p, l.size(), l.align(), other);
+    };
+    domain_free_in(t, p, l, other)
+}
+/// `domain_free` when the fast paths' thread-local slot is not filled (`program_tls`).
+#[cold]
+#[inline(never)]
+unsafe extern "C" fn domain_free_fill(p: *mut u8, size: usize, align: usize, other: unsafe extern "C" fn(*mut u8, usize, usize)) {
+    domain_free_in(program_tls_fill(), p, Layout::from_size_align_unchecked(size, align), other)
+}
+#[inline(always)]
+unsafe fn domain_free_in(t: &'static DomainTls, p: *mut u8, l: Layout, other: unsafe extern "C" fn(*mut u8, usize, usize)) {
     let Some(a) = t.arena.get().as_ref() else {
         return other(p, l.size(), l.align());
     };

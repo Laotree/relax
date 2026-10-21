@@ -694,6 +694,7 @@ impl<'a> Parser<'a> {
             b"format" | b"print" | b"println" | b"eprint" | b"eprintln" | b"write" | b"writeln" | b"panic" | b"format_args"
                 | b"vec" | b"assert" | b"assert_eq" | b"assert_ne" | b"debug_assert" | b"debug_assert_eq" | b"debug_assert_ne"
                 | b"matches" | b"assert_matches" | b"debug_assert_matches" | b"unreachable" | b"todo" | b"unimplemented" | b"dbg" | b"asm"
+                | b"global_asm" | b"naked_asm"
         );
         if !known {
             return NO_MAC_ARGS;
@@ -703,7 +704,7 @@ impl<'a> Parser<'a> {
         let is_vec = name == b"vec";
         let save = self.pos;
         self.pos = toks.lo as usize;
-        let r = if name == b"asm" { self.asm_args(toks.hi as usize) } else { self.mac_args_inner(is_matches, has_msg, is_vec, toks.hi as usize) };
+        let r = if matches!(name.as_slice(), b"asm" | b"global_asm" | b"naked_asm") { self.asm_args(toks.hi as usize) } else { self.mac_args_inner(is_matches, has_msg, is_vec, toks.hi as usize) };
         self.pos = save;
         match r {
             Ok(a) => {
@@ -760,7 +761,8 @@ impl<'a> Parser<'a> {
         let mut spec = AsmArgs { templates: 0, ops: List::EMPTY, options: 0 };
         let mut exprs = Vec::new();
         let mut ops = Vec::new();
-        while self.pos < hi && matches!(self.kind(), T::Str | T::RawStr) {
+        // template strings: literals, or a macro call that makes one (`concat!(..)`)
+        while self.pos < hi && (matches!(self.kind(), T::Str | T::RawStr) || (self.kind() == T::Ident && self.nth(1) == T::Not && !self.is_word(0, b"sym"))) {
             exprs.push(self.expr()?);
             spec.templates += 1;
             if !self.eat(T::Comma) {
@@ -779,16 +781,30 @@ impl<'a> Parser<'a> {
                         b"noreturn" => spec.options |= ASM_NORETURN,
                         b"raw" => spec.options |= ASM_RAW,
                         b"att_syntax" => spec.options |= ASM_ATT_SYNTAX,
-                        b"pure" | b"nomem" | b"readonly" | b"preserves_flags" | b"nostack" | b"may_unwind" | b"," => {}
+                        b"pure" => spec.options |= ASM_PURE,
+                        b"nomem" => spec.options |= ASM_NOMEM,
+                        b"readonly" => spec.options |= ASM_READONLY,
+                        b"preserves_flags" => spec.options |= ASM_PRESERVES_FLAGS,
+                        b"nostack" => spec.options |= ASM_NOSTACK,
+                        b"may_unwind" => spec.options |= ASM_MAY_UNWIND,
+                        b"," => {}
                         _ => return self.err("unknown asm! option"),
                     }
                 }
                 self.expect(T::CloseParen)?;
             } else if self.is_word(0, b"clobber_abi") && self.nth(1) == T::OpenParen {
-                // the stub is a C call: every caller-saved register is clobbered already
                 self.pos += 2;
                 while self.kind() != T::CloseParen && self.kind() != T::Eof {
-                    self.pos += 1;
+                    let t = self.bump();
+                    if matches!(t.kind, T::Str) {
+                        let lit = self.text_of(t);
+                        spec.options |= match lit {
+                            b"\"C\"" | b"\"system\"" | b"\"efiapi\"" | b"\"C-unwind\"" | b"\"system-unwind\"" => ASM_CLOBBER_C,
+                            b"\"sysv64\"" | b"\"sysv64-unwind\"" => ASM_CLOBBER_SYSV64,
+                            b"\"win64\"" | b"\"win64-unwind\"" => ASM_CLOBBER_WIN64,
+                            _ => ASM_CLOBBER_UNKNOWN,
+                        };
+                    }
                 }
                 self.expect(T::CloseParen)?;
             } else {
@@ -1227,8 +1243,10 @@ impl<'a> Parser<'a> {
         let edition = self.edition;
         let rule_scope = self.scope_stack.last().copied().unwrap_or(0);
         self.rule_scopes.push((name.lo, rule_scope));
+        // the module it is written in (an expansion's position is not a source position: unknown)
+        let def_mod = if (name.lo as usize) < self.src.len() { self.cur_module() } else { String::new() };
         let scope = self.macros.as_mut().unwrap();
-        scope.define_tokens(&n, &self.krate, self.edition, file, name.lo, exported, local_inner, &mt)
+        scope.define_tokens(&n, &self.krate, self.edition, file, &def_mod, name.lo, exported, local_inner, &mt)
             .map_err(|msg| PErr { pos: name.lo, msg })?;
         if crate::lexer::validation_enabled() {
             if let Some(d) = scope.local.last() {
@@ -1732,7 +1750,15 @@ impl<'a> Parser<'a> {
             x
         };
         if trace {
-            eprintln!("expand {}! => {}", def.name, text);
+            // MAKEPAD_RUN_TRACE=expand:<macro name>: the expansion, where it was called, at what depth and
+            // on which thread; `bt` among the trace words adds a backtrace (which pass expands it)
+            let thr = std::thread::current();
+            eprintln!("expand {}! @{} base={} depth={} thr={} => {}", def.name, call_lo, self.src.len() + self.ext.len(), self.exp_depth, thr.name().unwrap_or("?"), text);
+            if crate::preload::relax_trace().map_or(false, |t| t.split(',').any(|x| x == "bt")) {
+                let bt = std::backtrace::Backtrace::force_capture().to_string();
+                let frames: Vec<String> = bt.lines().filter(|l| l.contains("relax_") || l.contains("makepad")).filter(|l| !l.trim_start().starts_with("at ")).take(40).map(|l| l.trim().to_string()).collect();
+                eprintln!("expand-bt {}! @{}: {}", def.name, call_lo, frames.join(" | "));
+            }
         }
         let base = (self.src.len() + self.ext.len()) as u32;
         if crate::macros::uses::recording() {
@@ -1854,7 +1880,14 @@ impl<'a> Parser<'a> {
             // `is_trailing_mac`): its expansion's `;` after the one expression is linted
             let save = self.pos;
             self.pos = start;
+            // the shape of the expansion only, without expanding the calls in it (rustc's
+            // is_trailing_mac parse does not either): with macros on, every nested call of the
+            // expansion was expanded here and again by the statement parse below, 3^depth
+            // expansions for statement macros nested through blocks (nom's alt_trait_inner! /
+            // succ! chains of depth 21 took every byte of memory under `makepad check`)
+            let macros = self.macros.take();
             let one_expr = self.outer_attrs().is_ok() && self.expr().is_ok() && self.kind() == T::Semi && self.nth(1) == T::Eof;
+            self.macros = macros;
             let semi = self.lo();
             self.pos = save;
             if one_expr {

@@ -57,6 +57,24 @@ pub(crate) fn const_copy(u: &Unit, addr: u64) -> u64 {
     rehome(u, addr, &mut seen, true)
 }
 
+/// Captures static `sym`'s initial image (just evaluated into its storage) and the image of
+/// every anonymous mutable block its words point into, then (the caller) materializes it. A
+/// static initializer that runs as code fills its promoted temporaries (`&CONST` /
+/// `&[..]` borrows lowered as a per-domain block written by the initializer, lower.rs
+/// promote_rvalue) in the compile domain only; without their images every other domain's copy
+/// of the static pointed at zeroed blocks (Sandbox's race kit read each event payload's
+/// FieldDefs as zeros: no names). `rehome` does the same for constants.
+pub(crate) fn capture_static(u: &Unit, sym: Sym) {
+    crate::sandbox::capture_initial_data(u, sym);
+    let Ok(bytes) = initial_bytes(u, sym.id) else { return };
+    let mut seen = HashSet::new();
+    for w in bytes.chunks_exact(8).map(|w| u64::from_le_bytes(w.try_into().unwrap())) {
+        if let Some(rw) = u.syms.rw_sym_at(w) {
+            capture_rw(u, rw.id, &mut seen);
+        }
+    }
+}
+
 /// Gives anonymous mutable block `id` (made by constant evaluation: a promoted temporary) and
 /// every such block its image points into an initial image, and copies them into the live
 /// domains: they have none until something names them.
@@ -1030,7 +1048,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     if compile_phase(id, "link").is_err() { return Ok(id); }
     let t2 = std::time::Instant::now();
     // the libraries the new crates link
-    let (_, missing) = crate::run::link_libraries(unsafe { &(*up).prog }, &g.link_libs, first_file);
+    let (_, missing) = crate::run::link_libraries(unsafe { &(*up).prog }, &g.link_libs, g.native.as_ref(), first_file);
     if !missing.is_empty() && crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
         eprintln!("makepad-run domain: libraries not found: {:?}", missing);
     }

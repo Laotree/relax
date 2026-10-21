@@ -48,6 +48,7 @@ mod test_child {
 }
 
 pub mod front;
+pub mod global_asm;
 pub mod live;
 pub mod reload;
 pub mod modules;
@@ -65,6 +66,8 @@ pub mod lower;
 pub mod cabi;
 pub use relax_types::*;
 pub mod run;
+mod harness;
+mod test_pkg;
 pub mod tui;
 pub mod check;
 mod gandalf_out;
@@ -197,6 +200,22 @@ pub fn relax_as_rustc() -> bool {
 /// rustc: compiler/rustc_session/src/config.rs:2428, session.rs:90-93.
 pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
     let mut options = crate::options::Options::from_env();
+    // `--no-asm` / `--allow-c` anywhere before `--`, for every command (run, test, check, the
+    // relax runner): the environment carries them to the processes this one starts (build
+    // scripts, test harnesses); cli_main drops them from the arguments
+    for a in args.iter().take_while(|a| a.as_str() != "--") {
+        match a.as_str() {
+            "--no-asm" => {
+                options.no_asm = true;
+                std::env::set_var("MAKEPAD_RUN_NO_ASM", "1");
+            }
+            "--allow-c" => {
+                options.allow_c = true;
+                std::env::set_var("MAKEPAD_RUN_ALLOW_C", "1");
+            }
+            _ => {}
+        }
+    }
     options.live |= args.get(1).map(String::as_str) == Some("live");
     if args.get(1).map(String::as_str) == Some("fix") {
         options.relaxed = Some("all".to_string());
@@ -227,7 +246,14 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
     }
     // a program's own arguments after `--` may be any bytes (`makepad run p -- $'\xff'`): Relax
     // reads its own options lossily, the program gets the bytes (run.rs)
-    let args: Vec<String> = os::proc::args_bytes().iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    let mut args: Vec<String> = os::proc::args_bytes().iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    // the gates were read into the session (session_from_env)
+    let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let mut k = 0;
+    args.retain(|a| {
+        k += 1;
+        !(k <= end && (a == "--no-asm" || a == "--allow-c"))
+    });
     if args.get(1).map(String::as_str) == Some("--version") {
         println!("makepad run {}", PROVENANCE);
         std::process::exit(0);
@@ -281,6 +307,12 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
             a.extend_from_slice(&args[3..]);
             let code = run::cmd_run(sess, &a);
             std::process::exit(code);
+        }
+        // `makepad test <file.rs>`: one file's tests; `makepad test <package>`: the package's
+        // lib and integration tests, each a harness program (run.rs `--harness`)
+        "test" if !args[2..].iter().any(|a| a.ends_with(".rs")) => {
+            let code = test_pkg::cmd_test_package(&args[2..]);
+            os::proc::exit(code);
         }
         "test" => {
             let code = cmd_test(sess, &args[2..]);

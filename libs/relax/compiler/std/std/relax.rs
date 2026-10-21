@@ -10,6 +10,10 @@
 
 use crate::string::String;
 
+/// The harness `makepad test <package>` runs a crate's `#[test]` fns with (libtest's semantics).
+#[doc(hidden)]
+pub mod test;
+
 // These entries only exchange scalars; every input is valid. No pointers or
 // caller-owned buffers cross the loader boundary.
 extern "C" {
@@ -19,6 +23,11 @@ extern "C" {
     /// live patch (from the watcher thread).
     #[link_name = "__relax_on_patch"]
     pub safe fn on_patch(wake: extern "C" fn());
+    /// The runner hosts the process's main thread (`makepad run` of a HAL program: the provided
+    /// HAL's main loop runs there and `main` runs on a thread of its own). False under the bare
+    /// `relax` runner, where the program's own HAL runs its main loop as in its rustc build.
+    #[link_name = "__relax_main_hosted"]
+    pub safe fn main_hosted() -> bool;
 }
 
 extern "C" {
@@ -667,6 +676,31 @@ pub mod probe {
         fn __relax_probe_hist(key: *const u8, klen: usize, x: f64);
         fn __relax_probe_sample(key: *const u8, klen: usize, text: *const u8, len: usize, keep: usize);
         fn __relax_probe_pause();
+        fn __relax_probe_result(tag: u32, text: *const u8, len: usize);
+    }
+
+    /// makepad inspect `eval`: the value's type and `{:#?}` are the answer.
+    #[doc(hidden)]
+    pub fn __eval<T: ?Sized + Debug>(v: &T) {
+        let t = crate::any::type_name::<T>();
+        unsafe { __relax_probe_result(0, t.as_ptr(), t.len()) }
+        let s = crate::format!("{:#?}", v);
+        unsafe { __relax_probe_result(1, s.as_ptr(), s.len()) }
+    }
+
+    /// makepad inspect `eval` of a value that is not Debug: its type, size, address and first bytes.
+    #[doc(hidden)]
+    pub fn __eval_raw<T: ?Sized>(v: &T) {
+        let t = crate::any::type_name::<T>();
+        unsafe { __relax_probe_result(0, t.as_ptr(), t.len()) }
+        let n = crate::mem::size_of_val(v);
+        let p = v as *const T as *const u8;
+        let bytes = unsafe { crate::slice::from_raw_parts(p, n.min(256)) };
+        let mut s = crate::format!("{} bytes at {:p}:", n, p);
+        for b in bytes {
+            s.push_str(&crate::format!(" {:02x}", b));
+        }
+        unsafe { __relax_probe_result(1, s.as_ptr(), s.len()) }
     }
 
     /// Sends `v` (its Debug form) to the agent as one `probe` event (rate-limited).
