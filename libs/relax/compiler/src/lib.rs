@@ -978,6 +978,9 @@ fn cmd_resolve(sess: &std::sync::Arc<crate::Session>, units_path: &str) {
 mod lazy_reload_tests;
 
 #[cfg(test)]
+mod calls_tests;
+
+#[cfg(test)]
 mod vfs_bind_tests;
 
 #[cfg(test)]
