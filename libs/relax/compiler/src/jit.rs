@@ -9549,7 +9549,8 @@ impl InlineBodies {
                         && e.singles.iter().all(|&(o, c, v)| single(o, c) == v)
                 };
                 let shared = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner()).get(&ids[k]).and_then(|v| v.iter().find(|e| agrees(e)).cloned());
-                if let Some(e) = shared {
+                let verify = shared.is_some() && std::env::var_os("MAKEPAD_RUN_PREP_VERIFY").is_some();
+                if let Some(e) = shared.as_ref().filter(|_| !verify) {
                     TIER1_PREP[3].fetch_add(1, Ordering::Relaxed);
                     for &c in &e.nounwind { nounwind(c); }
                     if let Some(b) = &e.body { out.index.insert(ids[k], b.clone()); }
@@ -9608,6 +9609,17 @@ impl InlineBodies {
                 singles.sort_unstable();
                 singles.dedup();
                 let e = std::sync::Arc::new(PrepShared { bodies, prepared: prepared_reads, singles, _pins: pins, body: prepared.clone(), nounwind: asked.into_inner() });
+                if let Some(old) = shared.filter(|_| verify) {
+                    // MAKEPAD_RUN_PREP_VERIFY=1: a shared preparation is made again and compared
+                    let h = |b: &Option<std::sync::Arc<Prepared>>| b.as_ref().map(|b| (t1_norm_hash(&b.raw), t1_norm_hash(&b.priced), b.deps.clone()));
+                    if h(&old.body) != h(&e.body) || old.nounwind != e.nounwind {
+                        eprintln!("PREP-VERIFY mismatch {} (root {}): reads {} / {}, nounwind {} / {}", o1.name, root, old.bodies.len(), e.bodies.len(), old.nounwind.len(), e.nounwind.len());
+                    } else {
+                        TIER1_PREP[3].fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(b) = prepared { out.index.insert(ids[k], b); }
+                    continue;
+                }
                 {
                     let mut g = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner());
                     let v = g.entry(ids[k]).or_default();
