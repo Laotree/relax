@@ -623,7 +623,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
             for (ii, inst) in f.blocks[bi].insts.iter().enumerate() {
                 if let Inst::Call(Callee::Fn(id), _, _) = inst {
                     let found = get(*id);
-                    let size = found.map_or(usize::MAX, |(p, _)| inline_inst_count(unsafe { &*prepared(*id).map_or(p, |x| x.1) }));
+                    let size = found.map_or(usize::MAX, |(p, _)| inline_inst_count(unsafe { &*if loop_sites[bi] { prepared(*id).map_or(p, |x| x.1) } else { p } }));
                     // Closure adapters need to be fused as a chain. Importing
                     // their loop after unrelated work has spent the budget
                     // leaves an indirect/aggregate call on every iteration.
@@ -677,7 +677,10 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
         // priced as written, then (constant arguments) as this site sees it
         let mut pick = None;
         let mut tries: Vec<(bool, bool, *const Func, *const Func)> = Vec::new();
-        for (bottom_up, (body, shape)) in prepared(id).map(|x| (true, x)).into_iter().chain(found.map(|(p, _)| (false, (p, p)))) {
+        // bottom-up bodies serve sites in loops (where a callee's own inlining pays per
+        // iteration); elsewhere the snapshot body decides, top-down, and no preparation is made
+        let bottom = if loop_sites[bi] { prepared(id) } else { None };
+        for (bottom_up, (body, shape)) in bottom.map(|x| (true, x)).into_iter().chain(found.map(|(p, _)| (false, (p, p)))) {
             tries.push((bottom_up, false, body, shape));
             if consts.iter().any(|c| c.is_some()) {
                 let spec = specialized.entry((id, bottom_up, consts.clone())).or_insert_with(|| specialize_for_args(unsafe { &*shape }, &consts).map(Box::new));

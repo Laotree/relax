@@ -9234,7 +9234,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         }
     }
     // what a bottom-up preparation reads (InlineBodies::prepare): recorded while one runs
-    let reads: std::cell::RefCell<Option<PrepReads>> = std::cell::RefCell::new(None);
+    let reads: std::cell::RefCell<Vec<PrepReads>> = std::cell::RefCell::new(Vec::new());
     let _guard = NocapGuard;
     {
         // SAFETY: the oracle borrows `get` and `reads` only while this function runs: the guard removes it
@@ -9285,12 +9285,12 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
             (r, tainted.get())
         }
         let memo: NocapMemo = std::cell::RefCell::new(HashMap::new());
-        let reads_static: &'static std::cell::RefCell<Option<PrepReads>> = unsafe { std::mem::transmute(&reads) };
+        let reads_static: &'static std::cell::RefCell<Vec<PrepReads>> = unsafe { std::mem::transmute(&reads) };
         relax_backend::passes::set_sroa_nocapture(Some(Box::new(move |c: &relax_backend::rir::Callee, k: usize| -> bool {
             let relax_backend::rir::Callee::Fn(cid) = c else { return false };
             let mut rd = Vec::new();
             let r = nocap(get_static, &memo, *cid, k, 4, &mut rd).0;
-            if let Some(rec) = reads_static.borrow_mut().as_mut() { rec.bodies.extend(rd); }
+            if let Some(rec) = reads_static.borrow_mut().last_mut() { rec.bodies.extend(rd); }
             r
         })));
     }
@@ -9301,17 +9301,23 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     // own inlining included; a site takes that body when its optimised form passes the rules and
     // fits, else the snapshot body (top-down). A pure function of the snapshot, so replay stays
     // exact.
-    let tp = cpu_ns();
     let get_rec = |c: u32| {
-        if let Some(r) = reads.borrow_mut().as_mut() { r.bodies.push(c); }
+        if let Some(r) = reads.borrow_mut().last_mut() { r.bodies.push(c); }
         get(c)
     };
-    let bodies = InlineBodies::prepare(options, id, snap, &get_rec, &reads, single, ro, cfg, nounwind);
-    TIER1_PREP[0].fetch_add(cpu_ns() - tp, Ordering::Relaxed);
-    TIER1_PREP[2].fetch_add(bodies.index.len() as u64, Ordering::Relaxed);
-    let prepared = |c: u32| bodies.prepared(c);
+    let bodies = InlineBodies::new(options, id, snap, &get_rec, &reads, single, ro, cfg, nounwind);
+    let prep_ns = std::cell::Cell::new(0u64);
+    let prepared = |c: u32| {
+        if !cfg.inline { return None; }
+        let tp = cpu_ns();
+        let r = bodies.prepared(c);
+        prep_ns.set(prep_ns.get() + cpu_ns() - tp);
+        r
+    };
     let mut inlined = tier1_simplify(options, func, id, name, get, &prepared, single, ro, cfg, nounwind, frequencies, inline_stats.as_mut(), None, None);
     bodies.expand(&mut inlined);
+    TIER1_PREP[0].fetch_add(prep_ns.get(), Ordering::Relaxed);
+    TIER1_PREP[2].fetch_add(bodies.index.borrow().values().filter(|b| b.is_some()).count() as u64, Ordering::Relaxed);
     // array iterators (a slot read at runtime offsets): their scalar fields in registers, so
     // the iteration counter can drive full unrolling below
     if cfg.fold && cfg.sroa && relax_codegen::opt::promote_dyn_read_slots(func) {
@@ -9408,8 +9414,20 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
 /// Everything here is a function of the snapshot alone (frequencies are structural), so replay
 /// stays exact, and the O3 builds of one run share a callee's preparation while its inputs are
 /// the same (`PREP_SHARED`).
-struct InlineBodies {
-    index: HashMap<u32, std::sync::Arc<Prepared>>,
+struct InlineBodies<'a> {
+    options: &'a crate::options::Options,
+    root: u32,
+    get: &'a dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>,
+    reads: &'a std::cell::RefCell<Vec<PrepReads>>,
+    single: &'a dyn Fn(u32, u32) -> bool,
+    ro: Option<relax_backend::passes::RoReader>,
+    cfg: &'a relax_codegen::opt::OptCfg,
+    nounwind: &'a dyn Fn(u32) -> bool,
+    /// snapshot slot -> (its component in the call graph outside cold blocks, it calls a snapshot body)
+    node: HashMap<u32, (usize, bool)>,
+    arc_of: HashMap<u32, &'a std::sync::Arc<relax_backend::rir::Func>>,
+    /// the preparations made or taken so far (None: none for that slot)
+    index: std::cell::RefCell<HashMap<u32, Option<std::sync::Arc<Prepared>>>>,
 }
 
 /// One callee prepared bottom-up.
@@ -9494,33 +9512,29 @@ fn sccs(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
     out
 }
 
-impl InlineBodies {
-    fn prepare(options: &crate::options::Options, root: u32, snap: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, reads: &std::cell::RefCell<Option<PrepReads>>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool) -> Self {
+impl<'a> InlineBodies<'a> {
+    /// The call graph of the snapshot; nothing is prepared yet (`prepared` prepares on demand).
+    fn new(options: &'a crate::options::Options, root: u32, snap: &'a [(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], get: &'a dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, reads: &'a std::cell::RefCell<Vec<PrepReads>>, single: &'a dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &'a relax_codegen::opt::OptCfg, nounwind: &'a dyn Fn(u32) -> bool) -> Self {
         use relax_backend::rir::{Callee, Inst, Term};
-        let mut out = InlineBodies { index: HashMap::new() };
-        if !cfg.inline {
-            return out;
-        }
         // nodes: the snapshot, deduplicated in order (the lookup takes the first)
         let mut ids: Vec<u32> = Vec::new();
-        let mut node: HashMap<u32, usize> = HashMap::new();
+        let mut at: HashMap<u32, usize> = HashMap::new();
         let mut arc_of: HashMap<u32, &std::sync::Arc<relax_backend::rir::Func>> = HashMap::new();
         for (c, body, _) in snap {
             arc_of.entry(*c).or_insert(body);
-            if *c != root && !node.contains_key(c) {
-                node.insert(*c, ids.len());
+            if *c != root && !at.contains_key(c) {
+                at.insert(*c, ids.len());
                 ids.push(*c);
             }
         }
-        let body = |k: usize| unsafe { &*get(ids[k]).unwrap().0 };
-        // the calls a preparation inlines (outside cold blocks): the order it runs in
-        let edges: Vec<Vec<usize>> = (0..ids.len()).map(|k| {
+        // the calls a preparation inlines (outside cold blocks)
+        let edges: Vec<Vec<usize>> = ids.iter().enumerate().map(|(k, &c)| {
             let mut e = Vec::new();
-            for b in &body(k).blocks {
+            for b in &unsafe { &*get(c).unwrap().0 }.blocks {
                 if matches!(b.term, Term::Unreachable | Term::Resume) { continue; }
                 for i in &b.insts {
-                    if let Inst::Call(Callee::Fn(c), _, _) | Inst::FnAddr(_, c) = i {
-                        if let Some(&n) = node.get(c) {
+                    if let Inst::Call(Callee::Fn(x), _, _) | Inst::FnAddr(_, x) = i {
+                        if let Some(&n) = at.get(x) {
                             if n != k && !e.contains(&n) { e.push(n); }
                         }
                     }
@@ -9528,140 +9542,133 @@ impl InlineBodies {
             }
             e
         }).collect();
-        // A body above the largest size its rules admit (site_rule) is not prepared.
-        let mut structural = |_: usize, f: &relax_backend::rir::Func| (!options.no_block_freq).then(|| inline_structural_freqs(f));
-        let stats_on = std::env::var("MAKEPAD_RUN_INLINE_STATS").is_ok_and(|v| v == "prep");
-        let addr = |b: &Option<std::sync::Arc<Prepared>>| b.as_ref().map_or(0, |b| std::sync::Arc::as_ptr(b) as usize);
-        for scc in &sccs(&edges) {
-            for &k in scc {
-                let (p, attrs) = get(ids[k]).unwrap();
-                let o1 = unsafe { &*p };
-                if attrs & relax_codegen::opt::ATTR_COLD != 0 || edges[k].is_empty() || relax_codegen::opt::inst_count(o1) > relax_codegen::opt::max_admitted_insts(options, attrs) {
-                    continue;
-                }
-                let peers: &[usize] = scc;
-                let in_scc = |c: u32| node.get(&c).is_some_and(|m| peers.contains(m));
-                let sub = |c: u32| if in_scc(c) { None } else { out.index.get(&c).cloned() };
-                // a preparation of this slot whose reads this snapshot answers the same way
-                let agrees = |e: &PrepShared| {
-                    e.bodies.iter().all(|&(c, a, at)| get(c).map_or(a == 0, |(q, qa)| q as usize == a && qa == at))
-                        && e.prepared.iter().all(|&(c, a)| addr(&sub(c)) == a)
-                        && e.singles.iter().all(|&(o, c, v)| single(o, c) == v)
-                };
-                let (known, shared) = {
-                    let g = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner());
-                    let v = g.get(&ids[k]);
-                    (v.is_some(), v.and_then(|v| v.iter().find(|e| agrees(e)).cloned()))
-                };
-                if known && shared.is_none() {
-                    TIER1_PREP[4].fetch_add(1, Ordering::Relaxed);
-                    // why the newest one disagreed (diagnostic): a body changed, its attributes,
-                    // its presence, another preparation
-                    if let Some(e) = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner()).get(&ids[k]).and_then(|v| v.last().cloned()) {
-                        let why = e.bodies.iter().find_map(|&(c, a, at)| match get(c) {
-                            Some(_) if a == 0 => Some(7),
-                            None if a != 0 => Some(7),
-                            Some((q, _)) if q as usize != a => Some(5),
-                            Some((_, qa)) if qa != at => Some(6),
-                            _ => None,
-                        }).or_else(|| e.prepared.iter().any(|&(c, a)| addr(&sub(c)) != a).then_some(8)).unwrap_or(9);
-                        TIER1_PREP[why].fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                let verify = shared.is_some() && std::env::var_os("MAKEPAD_RUN_PREP_VERIFY").is_some();
-                if let Some(e) = shared.as_ref().filter(|_| !verify) {
-                    TIER1_PREP[3].fetch_add(1, Ordering::Relaxed);
-                    for &c in &e.nounwind { nounwind(c); }
-                    if let Some(b) = &e.body { out.index.insert(ids[k], b.clone()); }
-                    continue;
-                }
-                *reads.borrow_mut() = Some(PrepReads { bodies: vec![ids[k]], ..Default::default() });
-                let sub_prepared = |c: u32| {
-                    let b = sub(c);
-                    if let Some(r) = reads.borrow_mut().as_mut() { r.prepared.push((c, addr(&b))); }
-                    b.map(|b| (&b.raw as *const relax_backend::rir::Func, &b.priced as *const relax_backend::rir::Func))
-                };
-                let single_rec = |o: u32, c: u32| {
-                    let v = single(o, c);
-                    if let Some(r) = reads.borrow_mut().as_mut() { r.singles.push((o, c, v)); }
-                    v
-                };
-                let asked = std::cell::RefCell::new(Vec::new());
-                let recording = |c: u32| {
-                    let mut a = asked.borrow_mut();
-                    if !a.contains(&c) { a.push(c); }
-                    drop(a);
-                    if let Some(r) = reads.borrow_mut().as_mut() { r.bodies.push(c); }
-                    nounwind(c)
-                };
-                let mut f = o1.clone();
-                f.baseline = false;
-                let mut raw = (relax_backend::rir::Func::new(String::new(), 0), Vec::new());
-                let mut stats = stats_on.then(relax_codegen::opt::InlineStats::default);
-                // a preparation only serves while its priced body stays admissible: it grows to the
-                // largest size its rules admit, not to a caller's growth room
-                let cap = relax_codegen::opt::max_admitted_insts(options, attrs);
-                tier1_simplify(options, &mut f, ids[k], &o1.name, get, &sub_prepared, &single_rec, ro, cfg, &recording, &mut structural, stats.as_mut(), Some(&mut raw), Some(cap));
-                let rd = reads.borrow_mut().take().unwrap();
-                TIER1_PREP[1].fetch_add(1, Ordering::Relaxed);
-                if let Some(st) = stats { st.report(&format!("prep:{} (root {})", o1.name, root)); }
-                let (raw, mut taken) = raw;
-                // shared preparations outlive this build: they live in the compiler arena (the
-                // generation the snapshot bodies are in; a zone swap takes them with it), not in
-                // the build's scratch
-                let prepared = (!taken.is_empty()).then(|| {
-                    out.expand(&mut taken);
-                    let deps: Vec<u32> = taken.into_iter().map(|x| x.0).collect();
-                    crate::zone_alloc::outside_scratch(|| std::sync::Arc::new(Prepared { raw: raw.clone(), priced: f.clone(), deps: deps.clone() }))
-                });
-                let mut slots = rd.bodies;
-                slots.sort_unstable();
-                slots.dedup();
-                let mut pins = (Vec::new(), Vec::new());
-                let bodies: Vec<(u32, usize, u8)> = slots.iter().map(|&c| match get(c) {
-                    Some((q, at)) => {
-                        if let Some(a) = arc_of.get(&c) { pins.0.push(std::sync::Arc::downgrade(a)); }
-                        (c, q as usize, at)
-                    }
-                    None => (c, 0, 0),
-                }).collect();
-                let mut prepared_reads = rd.prepared;
-                prepared_reads.sort_unstable();
-                prepared_reads.dedup();
-                for &(c, _) in &prepared_reads {
-                    if let Some(b) = sub(c) { pins.1.push(std::sync::Arc::downgrade(&b)); }
-                }
-                let mut singles = rd.singles;
-                singles.sort_unstable();
-                singles.dedup();
-                let asked = asked.into_inner();
-                let e = crate::zone_alloc::outside_scratch(|| std::sync::Arc::new(PrepShared { bodies: bodies.clone(), prepared: prepared_reads.clone(), singles: singles.clone(), _pins: (pins.0.clone(), pins.1.clone()), body: prepared.clone(), nounwind: asked.clone() }));
-                if let Some(old) = shared.filter(|_| verify) {
-                    // MAKEPAD_RUN_PREP_VERIFY=1: a shared preparation is made again and compared
-                    let h = |b: &Option<std::sync::Arc<Prepared>>| b.as_ref().map(|b| (t1_norm_hash(&b.raw), t1_norm_hash(&b.priced), b.deps.clone()));
-                    if h(&old.body) != h(&e.body) || old.nounwind != e.nounwind {
-                        eprintln!("PREP-VERIFY mismatch {} (root {}): reads {} / {}, nounwind {} / {}", o1.name, root, old.bodies.len(), e.bodies.len(), old.nounwind.len(), e.nounwind.len());
-                    } else {
-                        TIER1_PREP[3].fetch_add(1, Ordering::Relaxed);
-                    }
-                    if let Some(b) = prepared { out.index.insert(ids[k], b); }
-                    continue;
-                }
-                crate::zone_alloc::outside_scratch(|| {
-                    let mut g = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner());
-                    let v = g.entry(ids[k]).or_default();
-                    if v.len() >= PREP_SHARED_PER_SLOT { v.remove(0); }
-                    v.push(e);
-                });
-                if let Some(b) = prepared { out.index.insert(ids[k], b); }
-            }
+        let mut node = HashMap::new();
+        for (ci, comp) in sccs(&edges).iter().enumerate() {
+            for &k in comp { node.insert(ids[k], (ci, !edges[k].is_empty())); }
         }
-        out
+        InlineBodies { options, root, get, reads, single, ro, cfg, nounwind, node, arc_of, index: Default::default() }
     }
 
-    /// (the body to inline, the body that prices it)
+    /// (the body to inline, the body that prices it): `c` prepared bottom-up on its first
+    /// request; members of one component see each other's snapshot bodies.
     fn prepared(&self, c: u32) -> Option<(*const relax_backend::rir::Func, *const relax_backend::rir::Func)> {
-        self.index.get(&c).map(|b| (&b.raw as *const relax_backend::rir::Func, &b.priced as *const relax_backend::rir::Func))
+        self.get_prepared(c).map(|b| (&b.raw as *const relax_backend::rir::Func, &b.priced as *const relax_backend::rir::Func))
+    }
+
+    fn get_prepared(&self, c: u32) -> Option<std::sync::Arc<Prepared>> {
+        if let Some(r) = self.index.borrow().get(&c) {
+            return r.clone();
+        }
+        let r = ensure_sufficient_stack(|| self.prepare_one(c));
+        self.index.borrow_mut().insert(c, r.clone());
+        r
+    }
+
+    fn prepare_one(&self, c: u32) -> Option<std::sync::Arc<Prepared>> {
+        let (options, get, single, nounwind) = (self.options, self.get, self.single, self.nounwind);
+        let &(comp, calls) = self.node.get(&c)?;
+        let (p, attrs) = get(c)?;
+        let o1 = unsafe { &*p };
+        // a body above the largest size its rules admit (site_rule) is not prepared
+        if attrs & relax_codegen::opt::ATTR_COLD != 0 || !calls || relax_codegen::opt::inst_count(o1) > relax_codegen::opt::max_admitted_insts(options, attrs) {
+            return None;
+        }
+        let sub = |x: u32| if self.node.get(&x).is_some_and(|n| n.0 == comp) { None } else { self.get_prepared(x) };
+        let addr = |b: &Option<std::sync::Arc<Prepared>>| b.as_ref().map_or(0, |b| std::sync::Arc::as_ptr(b) as usize);
+        // a preparation of this slot whose reads this snapshot answers the same way
+        let agrees = |e: &PrepShared| {
+            e.bodies.iter().all(|&(x, a, at)| get(x).map_or(a == 0, |(q, qa)| q as usize == a && qa == at))
+                && e.prepared.iter().all(|&(x, a)| addr(&sub(x)) == a)
+                && e.singles.iter().all(|&(o, x, v)| single(o, x) == v)
+        };
+        let entries: Vec<std::sync::Arc<PrepShared>> = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner()).get(&c).cloned().unwrap_or_default();
+        let shared = entries.iter().find(|e| agrees(e)).cloned();
+        if !entries.is_empty() && shared.is_none() { TIER1_PREP[4].fetch_add(1, Ordering::Relaxed); }
+        let verify = shared.is_some() && std::env::var_os("MAKEPAD_RUN_PREP_VERIFY").is_some();
+        if let Some(e) = shared.as_ref().filter(|_| !verify) {
+            TIER1_PREP[3].fetch_add(1, Ordering::Relaxed);
+            for &x in &e.nounwind { nounwind(x); }
+            return e.body.clone();
+        }
+        self.reads.borrow_mut().push(PrepReads { bodies: vec![c], ..Default::default() });
+        let sub_prepared = |x: u32| {
+            let b = sub(x);
+            if let Some(r) = self.reads.borrow_mut().last_mut() { r.prepared.push((x, addr(&b))); }
+            b.map(|b| (&b.raw as *const relax_backend::rir::Func, &b.priced as *const relax_backend::rir::Func))
+        };
+        let single_rec = |o: u32, x: u32| {
+            let v = single(o, x);
+            if let Some(r) = self.reads.borrow_mut().last_mut() { r.singles.push((o, x, v)); }
+            v
+        };
+        let asked = std::cell::RefCell::new(Vec::new());
+        let recording = |x: u32| {
+            let mut a = asked.borrow_mut();
+            if !a.contains(&x) { a.push(x); }
+            drop(a);
+            if let Some(r) = self.reads.borrow_mut().last_mut() { r.bodies.push(x); }
+            nounwind(x)
+        };
+        let mut f = o1.clone();
+        f.baseline = false;
+        let mut raw = (relax_backend::rir::Func::new(String::new(), 0), Vec::new());
+        let mut stats = std::env::var("MAKEPAD_RUN_INLINE_STATS").is_ok_and(|v| v == "prep").then(relax_codegen::opt::InlineStats::default);
+        let mut structural = |_: usize, f: &relax_backend::rir::Func| (!options.no_block_freq).then(|| inline_structural_freqs(f));
+        // a preparation only serves while its priced body stays admissible: it grows to the
+        // largest size its rules admit, not to a caller's growth room
+        let cap = relax_codegen::opt::max_admitted_insts(options, attrs);
+        tier1_simplify(options, &mut f, c, &o1.name, get, &sub_prepared, &single_rec, self.ro, self.cfg, &recording, &mut structural, stats.as_mut(), Some(&mut raw), Some(cap));
+        let rd = self.reads.borrow_mut().pop().unwrap();
+        TIER1_PREP[1].fetch_add(1, Ordering::Relaxed);
+        if let Some(st) = stats { st.report(&format!("prep:{} (root {})", o1.name, self.root)); }
+        let (raw, mut taken) = raw;
+        // shared preparations outlive this build: they live in the compiler arena (the
+        // generation the snapshot bodies are in; a zone swap takes them with it), not in the
+        // build's scratch
+        let prepared = (!taken.is_empty()).then(|| {
+            self.expand(&mut taken);
+            let deps: Vec<u32> = taken.into_iter().map(|x| x.0).collect();
+            crate::zone_alloc::outside_scratch(|| std::sync::Arc::new(Prepared { raw: raw.clone(), priced: f.clone(), deps: deps.clone() }))
+        });
+        let mut slots = rd.bodies;
+        slots.sort_unstable();
+        slots.dedup();
+        let mut pins = (Vec::new(), Vec::new());
+        let bodies: Vec<(u32, usize, u8)> = slots.iter().map(|&x| match get(x) {
+            Some((q, at)) => {
+                if let Some(a) = self.arc_of.get(&x) { pins.0.push(std::sync::Arc::downgrade(a)); }
+                (x, q as usize, at)
+            }
+            None => (x, 0, 0),
+        }).collect();
+        let mut prepared_reads = rd.prepared;
+        prepared_reads.sort_unstable();
+        prepared_reads.dedup();
+        for &(x, _) in &prepared_reads {
+            if let Some(b) = sub(x) { pins.1.push(std::sync::Arc::downgrade(&b)); }
+        }
+        let mut singles = rd.singles;
+        singles.sort_unstable();
+        singles.dedup();
+        let asked = asked.into_inner();
+        if let Some(old) = shared.filter(|_| verify) {
+            // MAKEPAD_RUN_PREP_VERIFY=1: a shared preparation is made again and compared
+            let h = |b: &Option<std::sync::Arc<Prepared>>| b.as_ref().map(|b| (t1_norm_hash(&b.raw), t1_norm_hash(&b.priced), b.deps.clone()));
+            if h(&old.body) != h(&prepared) || old.nounwind != asked {
+                eprintln!("PREP-VERIFY mismatch {} (root {}): reads {} / {}, nounwind {} / {}", o1.name, self.root, old.bodies.len(), bodies.len(), old.nounwind.len(), asked.len());
+            } else {
+                TIER1_PREP[3].fetch_add(1, Ordering::Relaxed);
+            }
+            return prepared;
+        }
+        crate::zone_alloc::outside_scratch(|| {
+            let e = std::sync::Arc::new(PrepShared { bodies: bodies.clone(), prepared: prepared_reads.clone(), singles: singles.clone(), _pins: (pins.0.clone(), pins.1.clone()), body: prepared.clone(), nounwind: asked.clone() });
+            let mut g = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner());
+            let v = g.entry(c).or_default();
+            if v.len() >= PREP_SHARED_PER_SLOT { v.remove(0); }
+            v.push(e);
+        });
+        prepared
     }
 
     /// Adds the bodies the inlined prepared callees took (hot reload and the cache's
@@ -9671,7 +9678,8 @@ impl InlineBodies {
         let mut k = 0;
         while k < inlined.len() {
             let (c, rule) = inlined[k];
-            if let Some(b) = self.index.get(&c) {
+            let b = self.index.borrow().get(&c).cloned().flatten();
+            if let Some(b) = b {
                 for &d in &b.deps {
                     if !inlined.iter().any(|x| x.0 == d) { inlined.push((d, rule)); }
                 }
