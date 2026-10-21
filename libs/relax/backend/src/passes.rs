@@ -5148,7 +5148,8 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
         let mut has_in = vec![false; ns];
         let mut has_out = vec![false; ns];
         let mut access_depth = vec![0u32; ns];
-        let mut copies: Vec<(u32, i64, i64, u32)> = Vec::new(); // (group, lo, hi, loop depth)
+        // (group, lo, hi, loop depth, internal: both ends in the group, so promoted it is register moves)
+        let mut copies: Vec<(u32, i64, i64, u32, bool)> = Vec::new();
         let okat = |v: VReg| -> Option<(u32, i64)> {
             let (sl, o) = at(v);
             if sl != u32::MAX && ok[sl as usize] {
@@ -5174,16 +5175,17 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                     }
                     Inst::Copy(d, s2, n) => {
                         let (ga, gc) = (okat(*d), okat(*s2));
+                        let internal = matches!((ga, gc), (Some((x, _)), Some((y, _))) if root[x as usize] == root[y as usize]);
                         if let Some((sl, o)) = ga {
                             let lo = o + delta[sl as usize];
-                            copies.push((root[sl as usize], lo, lo + *n as i64, depth[bi as usize]));
+                            copies.push((root[sl as usize], lo, lo + *n as i64, depth[bi as usize], internal));
                             if gc.is_none() {
                                 has_in[root[sl as usize] as usize] = true;
                             }
                         }
                         if let Some((sl, o)) = gc {
                             let lo = o + delta[sl as usize];
-                            copies.push((root[sl as usize], lo, lo + *n as i64, depth[bi as usize]));
+                            copies.push((root[sl as usize], lo, lo + *n as i64, depth[bi as usize], internal));
                             if ga.is_none() {
                                 has_out[root[sl as usize] as usize] = true;
                             }
@@ -5287,7 +5289,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                     // moves per copy (brotli ProcessCommandsInternal: +28% instructions). Keep
                     // the group in memory unless every copied range has at most two cells per
                     // 8-byte word (plus two for an unaligned tail).
-                    let dense = copies[ci..ce].iter().all(|&(_, lo, hi, _)| {
+                    let dense = copies[ci..ce].iter().all(|&(_, lo, hi, _, _)| {
                         let n = gcells[g].iter().filter(|c| c.off >= lo && c.off < hi).count() as i64;
                         n <= (hi - lo + 7) / 8 * 2 + 2
                     });
@@ -5301,7 +5303,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
         // A copy may not cut a cell in two. Keep large copies intact unless
         // promotion removes accesses in a deeper loop: initialization of a
         // compound iterator should not keep its state in memory per element.
-        for &(g, lo, hi, copy_depth) in &copies {
+        for &(g, lo, hi, copy_depth, internal) in &copies {
             let g = g as usize;
             let mut cnt = 0;
             for c in &gcells[g] {
@@ -5314,7 +5316,9 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                 }
             }
             let limit = if has_in[g] && has_out[g] { SROA_COPY_IN_OUT_CELLS } else { SROA_COPY_CELLS };
-            if cnt > limit && copy_depth >= access_depth[g] {
+            // a copy inside the group becomes one register move per cell (coalesced away mostly):
+            // only copies to or from memory cost a load / store per cell
+            if !internal && cnt > limit && copy_depth >= access_depth[g] {
                 bad[g].get_or_insert(SroaReject::CopyCells);
             }
         }
