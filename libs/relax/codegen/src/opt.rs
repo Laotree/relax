@@ -1257,7 +1257,8 @@ pub fn sroa_post_inline(f: &mut Func) -> bool {
 ///   through the parameter, and every one overlapping the field has its exact offset and type;
 /// * no call, atomic or fence in the loop for a stored field (a call may unwind with the memory
 ///   stale; a store is not delayed past one), calls are fine for a field that is only loaded when
-///   none is given a based-on pointer;
+///   none is given a based-on pointer, and for a stored field of a by-value argument's private copy
+///   (`Func::owned`) when the loop has no Invoke (LLVM's `isNotVisibleOnUnwind`);
 /// * the field is dereferenceable in the preheader (`Func::deref`), so loading it there is safe
 ///   even if the loop runs no iteration; the write-back on a path that never stored writes the
 ///   value it loaded, which no one can observe through a unique pointer.
@@ -1308,10 +1309,12 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
     // anything in the loop that stops every promotion, and what stops only stored fields
     let mut atomic_or_fence = false;
     let mut has_call = false;
+    let mut has_invoke = false;
     for bi in 0..n {
         if !body[bi] {
             continue;
         }
+        has_invoke |= matches!(f.blocks[bi].term, Term::Invoke(..));
         for i in &f.blocks[bi].insts {
             match i {
                 Inst::AtomicLoad(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..) | Inst::FpEnv(..) => atomic_or_fence = true,
@@ -1330,6 +1333,8 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         if ndef[p.0 as usize] != 1 || !f.params.contains(&p) {
             continue;
         }
+        // MAKEPAD_RUN_OPT=-owned: by-value argument copies as any noalias param (bisection)
+        let owned = f.owned.contains(&p) && !relax_backend::stats::opt_env_off("-owned");
         // the vregs based on p: moves and arithmetic on one, and call results when a based-on
         // pointer went into the call
         let mut based = vec![false; nv];
@@ -1422,7 +1427,10 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         let mut take: Vec<(i32, Mem, bool, bool, u32)> = Vec::new();
         for x in &fields {
             let clash = fields.iter().any(|y| !(y.0 == x.0 && y.1 == x.1) && y.0 < x.0 + size(x.1) && x.0 < y.0 + size(y.1));
-            if clash || (x.3 && has_call) {
+            // a stored field stays stale in memory over a call: fine for the private copy of a
+            // by-value argument (Func::owned) when every call is plain -- an unwind leaves this
+            // function at once and nobody reads the copy after (an Invoke's cleanup might)
+            if clash || (x.3 && has_call && !(owned && !has_invoke)) {
                 continue;
             }
             // dereferenceable in the preheader
@@ -1450,6 +1458,36 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
                     }
                 }
             }
+        }
+        // a by-value argument's private copy (Func::owned) needs no write-back on an exit that
+        // never returns (a bounds-check panic: it unwinds out of the function or aborts) and whose
+        // code never looks at the copy: nobody reads it after
+        if owned {
+            let quiet_dead_end = |t: u32| -> bool {
+                let mut seen = vec![false; n];
+                let mut work = vec![t];
+                while let Some(x) = work.pop() {
+                    let x = x as usize;
+                    if seen[x] {
+                        continue;
+                    }
+                    seen[x] = true;
+                    let blk = &f.blocks[x];
+                    if matches!(blk.term, Term::Ret(..)) || body[x] {
+                        return false;
+                    }
+                    let mut touches = false;
+                    for i in &blk.insts {
+                        for_uses(i, |u| touches |= based[u.0 as usize]);
+                    }
+                    if touches {
+                        return false;
+                    }
+                    work.extend(blk.term.succs());
+                }
+                true
+            };
+            exit_targets.retain(|&t| !quiet_dead_end(t));
         }
         let mut stored_n = 0;
         take.retain(|x| {
@@ -2512,6 +2550,45 @@ pub fn forward_slot_loads(f: &mut Func) -> bool {
     true
 }
 
+/// Vregs defined once, as a parameter or by moves and constant offsets of one (pointers into
+/// memory that existed before this frame did).
+fn param_based_vregs(f: &Func) -> Vec<bool> {
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+        }
+    }
+    let mut pb = vec![false; nv];
+    for p in &f.params {
+        if ndef[p.0 as usize] == 1 && f.vregs[p.0 as usize] == Cls::I {
+            pb[p.0 as usize] = true;
+        }
+    }
+    loop {
+        let mut grew = false;
+        for b in &f.blocks {
+            for i in &b.insts {
+                let (d, a) = match *i {
+                    Inst::Mov(d, a) | Inst::IBinI(IOp::Add | IOp::Sub, _, d, a, _) => (d, a),
+                    _ => continue,
+                };
+                if pb[a.0 as usize] && !pb[d.0 as usize] && ndef[d.0 as usize] == 1 {
+                    pb[d.0 as usize] = true;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            return pb;
+        }
+    }
+}
+
 /// Destination forwarding of slot copies: a slot B whose only read is one whole copy into
 /// another slot C (at some offset), with every write of B in the copy's block before it and
 /// nothing touching those bytes of C in between, is built in C directly: B's address becomes
@@ -2563,16 +2640,35 @@ pub fn forward_slot_dests(f: &mut Func) -> bool {
             }
         }
         let mut used = vec![false; ns];
+        let mut param_based: Option<Vec<bool>> = None;
         // (B, C, offset, block, copy index)
         let mut repl: Vec<(u32, u32, i64, usize, usize)> = Vec::new();
         for b in 0..ns {
             let Some((cb, ci, c, o, n)) = the_copy[b] else { continue };
-            if sc.esc[b] || sc.esc[c as usize] || multi_blk[b] || sc.reads[b] != 1 || used[b] || used[c as usize] {
+            if sc.esc[b] || multi_blk[b] || sc.reads[b] != 1 || used[b] || used[c as usize] {
                 continue;
             }
             let Some((sb, first, last)) = span[b] else { continue };
             if sb != cb || last != ci || o < 0 || o + n as i64 > f.slots[c as usize].size as i64 {
                 continue;
+            }
+            // C's address escapes (a by-value argument's copy handed to the calls of an inlined
+            // loop, a closure's environment): then B's writes may land in C early only when nothing
+            // from B's first access to the copy can see C through another pointer -- no call, copy
+            // or atomic, and every other memory access through a slot or a pointer based on a
+            // parameter (made before this frame's slots existed: it never points into them)
+            if sc.esc[c as usize] && relax_backend::stats::opt_env_off("-fwdesc") {
+                continue;
+            }
+            if sc.esc[c as usize] {
+                let pb = param_based.get_or_insert_with(|| param_based_vregs(f));
+                let unseen = f.blocks[cb].insts[first..ci].iter().all(|i| match i {
+                    Inst::Load(_, _, base, _) | Inst::Store(_, base, _, _) | Inst::VLoad(_, base, _) | Inst::VStore(base, _, _) | Inst::LoadX(_, _, base, ..) | Inst::StoreX(_, base, ..) => sl(*base) != NONE || pb[base.0 as usize],
+                    i => !relax_backend::passes::is_mem_effect(i),
+                });
+                if !unseen {
+                    continue;
+                }
             }
             // nothing touches C's bytes [o, o+n) from B's first access up to the copy
             let mut clash = false;
@@ -5809,6 +5905,130 @@ pub fn promote_dyn_read_slots(f: &mut Func) -> bool {
         f.blocks[bi].pos = pos;
     }
     true
+}
+
+/// Bit-tracking dead code for masks and casts (LLVM's BDCE): per integer vreg, the bits any of
+/// its uses reads (a fixed point over every use, so multi-definition variables -- a bit
+/// reader's `bitsleft`, read only as `bitsleft as u8` and `(bitsleft >> 3) & 7` -- are covered);
+/// an `x & k` whose result is read only within k, or an integer cast whose result is read only
+/// within the source's low bits, becomes a copy of x (then coalesced: `bitsleft -= entry & 0xff`
+/// was movzx + sub). Narrow operations re-extend their results (both backends), so a narrow
+/// result's demanded bits above its width demand its top bit (signed) or nothing (unsigned).
+/// MAKEPAD_RUN_OPT=-bdce: off (bisection).
+pub fn drop_undemanded_masks(options: &relax_session::Options, f: &mut Func) -> bool {
+    if opt_off(options, "-bdce") {
+        return false;
+    }
+    let nv = f.vregs.len();
+    const ALL: u64 = !0;
+    let mask = |w: u8| if w >= 64 { ALL } else { (1u64 << w) - 1 };
+    // the bits of an operation's w-bit result that its demanded 64-bit register bits read
+    let narrow = |d: u64, it: IntTy| -> u64 {
+        if it.bits >= 64 {
+            d
+        } else {
+            let m = mask(it.bits);
+            (d & m) | if it.signed && d & !m != 0 { 1u64 << (it.bits - 1) } else { 0 }
+        }
+    };
+    // the low bits an add / sub / mul result's bits depend on
+    let upto = |d: u64| if d == 0 { 0 } else { mask(64 - d.leading_zeros() as u8) };
+    let mut dem = vec![0u64; nv];
+    let mut changed = true;
+    let mut tu = Vec::new();
+    let isint = |f: &Func, v: VReg| f.vregs[v.0 as usize] == Cls::I;
+    while changed {
+        changed = false;
+        let mut need = |v: VReg, m: u64, dem: &mut Vec<u64>| {
+            let e = &mut dem[v.0 as usize];
+            if *e | m != *e {
+                *e |= m;
+                changed = true;
+            }
+        };
+        for b in &f.blocks {
+            for i in &b.insts {
+                match *i {
+                    Inst::Mov(d, x) => need(x, dem[d.0 as usize], &mut dem),
+                    Inst::IBin(op, it, d, x, y) => {
+                        let r = narrow(dem[d.0 as usize], it);
+                        match op {
+                            IOp::Add | IOp::Sub | IOp::Mul => {
+                                need(x, upto(r), &mut dem);
+                                need(y, upto(r), &mut dem);
+                            }
+                            // bitwise results are not re-extended: the operands' upper bits pass through
+                            IOp::And | IOp::Or | IOp::Xor => {
+                                need(x, dem[d.0 as usize], &mut dem);
+                                need(y, dem[d.0 as usize], &mut dem);
+                            }
+                            IOp::Shl | IOp::Shr if it.bits == 64 && x != y => {
+                                need(x, ALL, &mut dem);
+                                need(y, 63, &mut dem);
+                            }
+                            _ => {
+                                need(x, ALL, &mut dem);
+                                need(y, ALL, &mut dem);
+                            }
+                        }
+                    }
+                    Inst::IBinI(op, it, d, x, k) => {
+                        let full = dem[d.0 as usize];
+                        let r = narrow(full, it);
+                        // a narrow bitwise immediate may be emitted as the 64-bit form with the
+                        // immediate sign-extended: the operand's upper bits pass through
+                        let kk = if it.bits >= 64 { k as u64 } else { k as u64 | !mask(it.bits) };
+                        let m = match op {
+                            IOp::Add | IOp::Sub | IOp::Mul => upto(r),
+                            IOp::And => full & kk,
+                            IOp::Or => full & !(k as u64 & mask(it.bits)),
+                            IOp::Xor => full,
+                            // shifted left (and re-extended when narrow)
+                            IOp::Shl if (0..it.bits as i64).contains(&k) => r >> k,
+                            // a 64-bit logical shift of the register (narrow values too): bit i
+                            // of the result is bit i + k of the operand
+                            IOp::Shr if !it.signed && (0..it.bits as i64).contains(&k) => full << k,
+                            _ => ALL,
+                        };
+                        need(x, m, &mut dem);
+                    }
+                    Inst::INeg(it, d, x) | Inst::INot(it, d, x) => {
+                        let r = narrow(dem[d.0 as usize], it);
+                        need(x, if matches!(i, Inst::INeg(..)) { upto(r) } else { r }, &mut dem);
+                    }
+                    Inst::Conv(Conv::IntToInt(it), d, x) => need(x, narrow(dem[d.0 as usize], it), &mut dem),
+                    Inst::Store(Mem::Int(n, _), base, _, v) if base != v => {
+                        need(base, ALL, &mut dem);
+                        need(v, mask(8 * n), &mut dem);
+                    }
+                    Inst::StoreX(Mem::Int(n, _), base, idx, _, _, v) if base != v && idx != v => {
+                        need(base, ALL, &mut dem);
+                        need(idx, ALL, &mut dem);
+                        need(v, mask(8 * n), &mut dem);
+                    }
+                    _ => for_uses(i, |u| if isint(f, u) { need(u, ALL, &mut dem) }),
+                }
+            }
+            term_uses(&b.term, &mut tu);
+            for &u in &tu {
+                need(u, ALL, &mut dem);
+            }
+        }
+    }
+    let ints: Vec<bool> = f.vregs.iter().map(|c| *c == Cls::I).collect();
+    let mut any = false;
+    for b in &mut f.blocks {
+        for i in &mut b.insts {
+            let n = match *i {
+                Inst::IBinI(IOp::And, it, d, x, k) if dem[d.0 as usize] & !(k as u64 & mask(it.bits)) == 0 => Inst::Mov(d, x),
+                Inst::Conv(Conv::IntToInt(it), d, x) if ints[x.0 as usize] && dem[d.0 as usize] & !mask(it.bits) == 0 => Inst::Mov(d, x),
+                _ => continue,
+            };
+            *i = n;
+            any = true;
+        }
+    }
+    any
 }
 
 /// Variables read again after a copy into them: `t = x >> n; x = t; ... use t` (O3, before
