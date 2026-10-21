@@ -854,6 +854,10 @@ const THREAD_INSTS: usize = 8;
 /// B is never a loop header (nor entered by irreducible flow): a copy of a header would enter its
 /// loop past it.
 fn thread_decided(f: &mut Func, ed: &Edges) -> bool {
+    // MAKEPAD_RUN_OPT=-threadedge: off (bisection)
+    if relax_backend::stats::opt_env_off("-threadedge") {
+        return false;
+    }
     let n = f.blocks.len();
     let reach = reachable(f);
     let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];

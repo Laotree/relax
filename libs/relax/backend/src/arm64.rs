@@ -2853,7 +2853,7 @@ impl<'a> Gen<'a> {
                     IP0
                 };
                 // unless every way in bounds it (switch_in_range)
-                if !self.switch_in_range[bi] {
+                if !self.switch_in_range.get(bi).copied().unwrap_or(false) {
                     self.cmp_imm(idx, tab.targets.len() as i64 - 1);
                     self.cond_branch(CondBr::B(HI), tab.default);
                 }
@@ -3773,7 +3773,9 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         long,
     };
     g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
-    g.switch_in_range = crate::switch::switch_in_range(g.f);
+    if !crate::stats::opt_off(options, "-swrange") {
+        g.switch_in_range = crate::switch::switch_in_range(g.f);
+    }
     BRANCH_RANGE.with(|c| c.set(false));
     g.gen(options);
     if BRANCH_RANGE.with(|c| c.replace(false)) {

@@ -886,6 +886,9 @@ impl<'a> Gen<'a> {
     /// region windows) holds in a register here reads that register. The memory-operand fast paths
     /// (cmp / op r, [slot], loads straight into the result) use this, so the window's load pays.
     fn uloc(&self, v: VReg) -> Loc {
+        if crate::stats::opt_env_off("-uloc") {
+            return self.al.loc[v.0 as usize];
+        }
         match self.al.loc[v.0 as usize] {
             Loc::Stack(o) => match self.win_reg(v) {
                 Some(r) => Loc::Reg(r),
@@ -2324,7 +2327,7 @@ impl<'a> Gen<'a> {
                     self.a.alu_rr(0x29, RAX, R11);
                 }
                 // cmp rax, imm32 (len - 1 < 4096), unless every way in bounds it (switch_in_range)
-                if !self.switch_in_range[bi] {
+                if !self.switch_in_range.get(bi).copied().unwrap_or(false) {
                     self.a.byte(0x48);
                     self.a.byte(0x3d);
                     self.a.u32(tab.targets.len() as u32 - 1);
@@ -5172,7 +5175,9 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         unwind_tab: Vec::new(),
     };
     g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
-    g.switch_in_range = crate::switch::switch_in_range(g.f);
+    if !crate::stats::opt_off(options, "-swrange") {
+        g.switch_in_range = crate::switch::switch_in_range(g.f);
+    }
     g.gen(options);
     // unwind info for the runtime's frame walk (rir::unwind_info_words), 4-byte aligned
     while g.a.b.len() % 4 != 0 {

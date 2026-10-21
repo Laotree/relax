@@ -1307,6 +1307,8 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         if ndef[p.0 as usize] != 1 || !f.params.contains(&p) {
             continue;
         }
+        // MAKEPAD_RUN_OPT=-owned: by-value argument copies as any noalias param (bisection)
+        let owned = f.owned.contains(&p) && !relax_backend::stats::opt_env_off("-owned");
         // the vregs based on p: moves and arithmetic on one, and call results when a based-on
         // pointer went into the call
         let mut based = vec![false; nv];
@@ -1402,7 +1404,7 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
             // a stored field stays stale in memory over a call: fine for the private copy of a
             // by-value argument (Func::owned) when every call is plain -- an unwind leaves this
             // function at once and nobody reads the copy after (an Invoke's cleanup might)
-            if clash || (x.3 && has_call && !(f.owned.contains(&p) && !has_invoke)) {
+            if clash || (x.3 && has_call && !(owned && !has_invoke)) {
                 continue;
             }
             // dereferenceable in the preheader
@@ -1434,7 +1436,7 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         // a by-value argument's private copy (Func::owned) needs no write-back on an exit that
         // never returns (a bounds-check panic: it unwinds out of the function or aborts) and whose
         // code never looks at the copy: nobody reads it after
-        if f.owned.contains(&p) {
+        if owned {
             let quiet_dead_end = |t: u32| -> bool {
                 let mut seen = vec![false; n];
                 let mut work = vec![t];
@@ -2629,6 +2631,9 @@ pub fn forward_slot_dests(f: &mut Func) -> bool {
             // from B's first access to the copy can see C through another pointer -- no call, copy
             // or atomic, and every other memory access through a slot or a pointer based on a
             // parameter (made before this frame's slots existed: it never points into them)
+            if sc.esc[c as usize] && relax_backend::stats::opt_env_off("-fwdesc") {
+                continue;
+            }
             if sc.esc[c as usize] {
                 let pb = param_based.get_or_insert_with(|| param_based_vregs(f));
                 let unseen = f.blocks[cb].insts[first..ci].iter().all(|i| match i {

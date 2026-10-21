@@ -507,8 +507,24 @@ pub fn zero_above(options: &relax_session::Options, f: &Func, low: &[bool]) -> V
             break;
         }
     }
+    // MAKEPAD_RUN_OPT=-zeromulti: single-definition values only, no copies (bisection)
+    let single = crate::stats::opt_off(options, "-zeromulti");
+    let mut ndef = vec![0u32; if single { nv } else { 0 }];
+    if single {
+        for p in &f.params {
+            ndef[p.0 as usize] += 2;
+        }
+        for b in &f.blocks {
+            for i in &b.insts {
+                crate::regalloc::for_defs(i, |d| ndef[d.0 as usize] += 1);
+                if let Inst::Mov(d, _) | Inst::Iconst(d, _) = *i {
+                    ndef[d.0 as usize] += 2;
+                }
+            }
+        }
+    }
     for v in 0..nv {
-        if z[v] == NONE || z[v] >= 64 || f.vregs[v] != Cls::I {
+        if z[v] == NONE || z[v] >= 64 || f.vregs[v] != Cls::I || (single && ndef[v] != 1) {
             z[v] = 0;
         }
     }
@@ -1554,7 +1570,9 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
         }
         // unsigned division / remainder by a constant: multiply-high and shifts
         changed |= div_by_const(f, &kn, nv);
-        changed |= div_rem_pairs(f);
+        if !crate::stats::opt_off(options, "-divrem") {
+            changed |= div_rem_pairs(f);
+        }
         pass_time(0, tf);
         let t = pass_clock();
         trace_opt(f, "fold");
@@ -2461,7 +2479,7 @@ pub fn thread_known(f: &mut Func) -> bool {
                 inl[y as usize] = true;
                 work.extend(pr[y as usize].iter().copied());
             }
-            if inl[target as usize] {
+            if inl[target as usize] || crate::stats::opt_env_off("-threadhdr") {
                 through_header = true;
                 break;
             }
@@ -4057,6 +4075,8 @@ pub fn local_cse(options: &relax_session::Options, f: &mut Func) -> bool {
     if !cse_can_change(f) {
         return false;
     }
+    // MAKEPAD_RUN_OPT=-cseevict: a full table takes nothing new (bisection)
+    let keep_full = crate::stats::opt_off(options, "-cseevict");
     let n = f.blocks.len();
     let nv = f.vregs.len();
     let mut uses = Vec::new();
@@ -4442,7 +4462,7 @@ pub fn local_cse(options: &relax_session::Options, f: &mut Func) -> bool {
                     });
                     // forward the stored value to later loads of the same cell (a full table
                     // forgets its oldest entry: the nearest expressions are the likely repeats)
-                    {
+                    if st.avail.len() < CSE_AVAIL || !keep_full {
                         if st.avail.len() >= CSE_AVAIL {
                             st.avail.remove(0);
                         }
@@ -4492,7 +4512,7 @@ pub fn local_cse(options: &relax_session::Options, f: &mut Func) -> bool {
                 }
             }
             if let (Some(d), false, Some(key)) = (cand, replaced, key) {
-                {
+                if st.avail.len() < CSE_AVAIL || !keep_full {
                     if st.avail.len() >= CSE_AVAIL {
                         st.avail.remove(0);
                     }
