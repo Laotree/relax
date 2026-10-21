@@ -1351,6 +1351,17 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                             _ => Inst::Mov(d, y),
                         },
                         Inst::Sel(d, _, x, y) if x == y => Inst::Mov(d, x),
+                        // c ? 1 : 0 of a 0/1 value (a compare): c itself, c ? 0 : 1 is c ^ 1
+                        // (`count += is_less as usize` after an Ordering became a select)
+                        Inst::Sel(d, c, x, y)
+                            if zw[c.0 as usize] == 1 && f.vregs[d.0 as usize] == Cls::I && !opt_off(options, "-sel01") && matches!((kn[x.0 as usize], kn[y.0 as usize]), (Some(K::I(1)), Some(K::I(0))) | (Some(K::I(0)), Some(K::I(1)))) =>
+                        {
+                            if kn[x.0 as usize] == Some(K::I(1)) {
+                                Inst::Mov(d, c)
+                            } else {
+                                Inst::IBinI(IOp::Xor, U64, d, c, 1)
+                            }
+                        }
                         Inst::IBin(op, it, d, x, y) if imm && op != IOp::Div && op != IOp::Rem && op != IOp::MulHi => {
                             let fits = |k: Option<K>| match k {
                                 Some(K::I(v)) if v >= i32::MIN as i64 && v <= i32::MAX as i64 => Some(v),
@@ -1808,6 +1819,10 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
     if branch_on_compare(f) {
         dce(f);
     }
+    // a float load read only as its bits: an integer load (and the reverse)
+    if !opt_off(options, "-loadbits") && f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Conv(Conv::FToBits(_) | Conv::BitsToF(_), ..)))) {
+        load_bits(f);
+    }
     fuse_sincos(f);
 }
 
@@ -2101,6 +2116,79 @@ pub fn combine_rotates(f: &mut Func) -> bool {
         }
     }
     changed
+}
+
+/// Float loads read only as their bits (`f32::to_bits` of a loaded float: `total_cmp`, float
+/// hashing and radix keys) load the integer directly: `Load(F32, x); FToBits(d, x)` ->
+/// `Load(Int(4), t); Mov(d, t)` (F64: Int(8)), and integer loads read only through `BitsToF`
+/// load the float. One definition and one use of x; the load stays where it was, so no store
+/// can come between. Returns whether anything changed.
+pub fn load_bits(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    let mut nuse = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut tu = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            for_uses(i, |u| nuse[u.0 as usize] += 1);
+        }
+        term_uses(&b.term, &mut tu);
+        for u in &tu {
+            nuse[u.0 as usize] += 1;
+        }
+    }
+    // x -> the memory kind its one reader wants
+    let mut want: Vec<Option<Mem>> = vec![None; nv];
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::Conv(c, _, x) = *i {
+                let m = match c {
+                    Conv::FToBits(w) => Mem::Int(if w { 8 } else { 4 }, false),
+                    Conv::BitsToF(w) => if w { Mem::F64 } else { Mem::F32 },
+                    _ => continue,
+                };
+                if ndef[x.0 as usize] == 1 && nuse[x.0 as usize] == 1 {
+                    want[x.0 as usize] = Some(m);
+                }
+            }
+        }
+    }
+    // the loads that qualify: x -> its replacement t (of the reader's class)
+    let mut repl: Vec<Option<VReg>> = vec![None; nv];
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        for ii in 0..f.blocks[bi].insts.len() {
+            let Inst::Load(m, x, base, off) = f.blocks[bi].insts[ii] else { continue };
+            let Some(w) = want[x.0 as usize] else { continue };
+            let ok = matches!((m, w), (Mem::F32, Mem::Int(4, _)) | (Mem::F64, Mem::Int(8, _)) | (Mem::Int(4, _), Mem::F32) | (Mem::Int(8, _), Mem::F64));
+            if !ok {
+                continue;
+            }
+            let cls = if matches!(w, Mem::Int(..)) { Cls::I } else if w == Mem::F32 { Cls::F32 } else { Cls::F64 };
+            let t = f.vreg(cls);
+            repl.resize(f.vregs.len(), None);
+            repl[x.0 as usize] = Some(t);
+            f.blocks[bi].insts[ii] = Inst::Load(w, t, base, off);
+            changed = true;
+        }
+    }
+    if !changed {
+        return false;
+    }
+    for b in f.blocks.iter_mut() {
+        for i in b.insts.iter_mut() {
+            if let Inst::Conv(Conv::FToBits(_) | Conv::BitsToF(_), d, x) = *i {
+                if let Some(Some(t)) = repl.get(x.0 as usize) {
+                    *i = Inst::Mov(d, *t);
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Removes pure instructions whose results are dead by liveness: the definitions `dce`'s use
