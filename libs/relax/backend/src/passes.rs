@@ -493,19 +493,26 @@ pub fn zero_above(options: &relax_session::Options, f: &Func, low: &[bool]) -> V
             }
         }
     }
-    loop {
-        let mut ch = false;
-        for &(d, s) in &copies {
-            let (d, k) = (d as usize, z[s as usize]);
-            if k == NONE {
-                continue;
-            }
-            let old = z[d];
-            merge(&mut z, d, k);
-            ch |= z[d] != old;
+    // a worklist over the copies by source: each change re-merges the copies of that value only
+    // (linear-ish; a sweep to a fixed point was quadratic in long copy chains)
+    let mut by_src: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    for &(d, s) in &copies {
+        by_src.entry(s).or_default().push(d);
+    }
+    let mut work: Vec<u32> = copies.iter().map(|c| c.1).collect();
+    while let Some(s) = work.pop() {
+        let k = z[s as usize];
+        if k == NONE {
+            continue;
         }
-        if !ch {
-            break;
+        if let Some(ds) = by_src.get(&s) {
+            for &d in ds {
+                let old = z[d as usize];
+                merge(&mut z, d as usize, k);
+                if z[d as usize] != old {
+                    work.push(d);
+                }
+            }
         }
     }
     // MAKEPAD_RUN_OPT=-zeromulti: single-definition values only, no copies (bisection)
@@ -2381,6 +2388,7 @@ pub fn thread_known(f: &mut Func) -> bool {
     // one, or P would enter its loop past the header (irreducible flow, which the dominator-
     // based passes -- CSE's join rules, LICM -- assume away)
     let mut header: Option<(Vec<Vec<u32>>, Vec<Vec<u32>>)> = None;
+    let mut loop_body: std::collections::HashMap<usize, Vec<bool>> = std::collections::HashMap::new();
     let mut kn: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
     let (mut uses, mut defs) = (Vec::new(), Vec::new());
     let mut changed = false;
@@ -2470,17 +2478,25 @@ pub fn thread_known(f: &mut Func) -> bool {
             if hd[x].is_empty() {
                 continue;
             }
-            let mut inl = vec![false; n];
-            inl[x] = true;
-            let mut work: Vec<u32> = hd[x].clone();
-            while let Some(y) = work.pop() {
-                if inl[y as usize] {
-                    continue;
-                }
-                inl[y as usize] = true;
-                work.extend(pr[y as usize].iter().copied());
+            if crate::stats::opt_env_off("-threadhdr") {
+                through_header = true;
+                break;
             }
-            if inl[target as usize] || crate::stats::opt_env_off("-threadhdr") {
+            // the header's natural loop, once per header
+            let inl = loop_body.entry(x).or_insert_with(|| {
+                let mut inl = vec![false; n];
+                inl[x] = true;
+                let mut work: Vec<u32> = hd[x].clone();
+                while let Some(y) = work.pop() {
+                    if inl[y as usize] {
+                        continue;
+                    }
+                    inl[y as usize] = true;
+                    work.extend(pr[y as usize].iter().copied());
+                }
+                inl
+            });
+            if inl[target as usize] {
                 through_header = true;
                 break;
             }
