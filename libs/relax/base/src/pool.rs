@@ -346,6 +346,7 @@ mod tests {
 
     #[test]
     fn tasks_borrow_the_callers_locals_and_the_scope_waits() {
+        let _s = crate::zone_alloc::test_serial();
         let mut data = vec![1u64; 64];
         let total = AtomicU64::new(0);
         scope(|s| {
@@ -365,6 +366,7 @@ mod tests {
 
     #[test]
     fn join_returns_the_value_or_the_panic() {
+        let _s = crate::zone_alloc::test_serial();
         let (a, b) = scope(|s| {
             let ok = s.spawn(|| 40 + 2);
             let bad = s.spawn(|| -> u32 { panic!("boom") });
@@ -377,6 +379,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "a scoped thread panicked")]
     fn an_unjoined_panic_panics_the_scope_after_the_tasks_ended() {
+        let _s = crate::zone_alloc::test_serial();
         let done = AtomicBool::new(false);
         let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
             scope(|s| {
@@ -393,6 +396,7 @@ mod tests {
 
     #[test]
     fn a_panic_of_the_closure_still_waits_for_the_tasks() {
+        let _s = crate::zone_alloc::test_serial();
         let done = AtomicBool::new(false);
         let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
             scope(|s| {
@@ -409,6 +413,7 @@ mod tests {
 
     #[test]
     fn tasks_that_wait_for_each_other_all_run_at_once() {
+        let _s = crate::zone_alloc::test_serial();
         // a barrier of 6: with fewer than 6 running tasks this would never end
         let barrier = std::sync::Barrier::new(6);
         scope(|s| {
@@ -422,6 +427,7 @@ mod tests {
 
     #[test]
     fn sections_nest_in_tasks() {
+        let _s = crate::zone_alloc::test_serial();
         let n = AtomicUsize::new(0);
         scope(|s| {
             for _ in 0..8 {
@@ -441,6 +447,7 @@ mod tests {
 
     #[test]
     fn workers_are_reused_across_sections() {
+        let _s = crate::zone_alloc::test_serial();
         // a pool of its own: the tests running at the same time use the process pool
         let pool: &'static Pool = Box::leak(Box::new(Pool::new()));
         for _ in 0..500 {
@@ -465,6 +472,7 @@ mod tests {
 
     #[test]
     fn sections_from_many_threads_at_once() {
+        let _s = crate::zone_alloc::test_serial();
         let total = AtomicUsize::new(0);
         std::thread::scope(|ts| {
             for _ in 0..8 {
@@ -486,6 +494,7 @@ mod tests {
 
     #[test]
     fn retired_workers_end_and_new_tasks_still_run() {
+        let _s = crate::zone_alloc::test_serial();
         scope(|s| {
             for _ in 0..4 {
                 s.spawn(|| {});
@@ -509,6 +518,7 @@ mod tests {
 
     #[test]
     fn a_worker_that_ran_a_panicking_task_ends_and_retire_joins_it() {
+        let _s = crate::zone_alloc::test_serial();
         thread_local! { static MARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
         let survived = AtomicUsize::new(0);
         for _ in 0..20 {
