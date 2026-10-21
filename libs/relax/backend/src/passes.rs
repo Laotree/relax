@@ -49,6 +49,7 @@ pub fn map_inst(x: &Inst, m: &dyn Fn(VReg) -> VReg, slot_base: u32) -> Inst {
                 Callee::CHost(h, sig) => Callee::CHost(*h, sig.clone()),
                 Callee::CIndirect(v, sig) => Callee::CIndirect(m(*v), sig.clone()),
                 Callee::CFn(i, sig) => Callee::CFn(*i, sig.clone()),
+                Callee::Asm(b) => Callee::Asm(b.clone()),
             };
             let mut a2 = Vec::new();
             for v in a {
@@ -6335,9 +6336,9 @@ pub fn addr_modes(f: &mut Func) {
             let (m, base, off) = match &b.insts[k] {
                 Inst::Load(m, _, base, off) => (*m, *base, *off),
                 Inst::Store(m, base, off, _) => (*m, *base, *off),
-                // vectors too on x86-64 (movups takes any SIB form; arm64's ldr q only an
-                // unscaled or x16-scaled register)
-                Inst::VLoad(_, base, off) | Inst::VStore(base, off, _) if cfg!(target_arch = "x86_64") => (Mem::Int(8, false), *base, *off),
+                // vectors too: movups takes any SIB form; arm64's ldr q an unscaled or x16-scaled
+                // register (other shifts: one shifted add instead of a shift and an add)
+                Inst::VLoad(_, base, off) | Inst::VStore(base, off, _) => (Mem::Int(8, false), *base, *off),
                 i => {
                     for_defs(i, |d| {
                         if ndef[d.0 as usize] == 1 {
@@ -6347,22 +6348,41 @@ pub fn addr_modes(f: &mut Func) {
                     continue;
                 }
             };
-            let _ = m;
+            // arm64: an address read by several accesses (a load and a store of one element) is
+            // folded into each one that needs no displacement ([x, x{, lsl #size}] is free); the
+            // add stays for the others and goes with its last use
             let ai = match def_at.get(&base.0) {
-                Some(&ai) if nuse[base.0 as usize] == 1 && !dead[ai] => ai,
+                Some(&ai) if (nuse[base.0 as usize] == 1 || cfg!(target_arch = "aarch64")) && !dead[ai] => ai,
                 _ => continue,
             };
+            let shared_add = nuse[base.0 as usize] > 1;
             let (p, q) = match b.insts[ai] {
                 Inst::IBin(IOp::Add, it, _, p, q) if it.bits == 64 => (p, q),
                 _ => continue,
             };
             // which operand is the scaled index
+            // arm64: the access's own scale (q: 16, else its size) is free in the register-offset
+            // form, so a shift shared by several accesses (a load and a store of one element) is
+            // folded into each; it goes when its last use does
+            let vector = matches!(b.insts[k], Inst::VLoad(..) | Inst::VStore(..));
+            let natural = if vector {
+                4
+            } else {
+                match m {
+                    Mem::Int(n, _) => n.trailing_zeros() as i64,
+                    Mem::F32 => 2,
+                    Mem::F64 => 3,
+                }
+            };
             let mut found: Option<(VReg, VReg, u8, Option<usize>)> = None;
             for (pp, qq) in [(p, q), (q, p)] {
                 if let Some(&si) = def_at.get(&qq.0) {
-                    if nuse[qq.0 as usize] == 1 && !dead[si] {
-                        if let Inst::IBinI(IOp::Shl, it, _, idx, sh) = b.insts[si] {
-                            if it.bits == 64 && sh <= 3 {
+                    if let Inst::IBinI(IOp::Shl, it, _, idx, sh) = b.insts[si] {
+                        let shared_ok = cfg!(target_arch = "aarch64") && sh == natural;
+                        if (nuse[qq.0 as usize] == 1 || shared_ok) && !dead[si] {
+                            // scaled index: x86-64 scales 1..8; arm64 vector accesses also 16
+                            let max_sh = if cfg!(target_arch = "aarch64") && vector { 4 } else { 3 };
+                            if it.bits == 64 && sh <= max_sh {
                                 found = Some((pp, idx, sh as u8, Some(si)));
                                 break;
                             }
@@ -6381,7 +6401,12 @@ pub fn addr_modes(f: &mut Func) {
             let mut idx = idx;
             let mut extra: i64 = 0;
             let mut fold_at: Option<usize> = None;
-            if let Some(&ii) = def_at.get(&idx.0) {
+            // a shift that stays for other uses keeps reading idx: no folding through it
+            let shift_stays = shared_add || si.is_some_and(|si| matches!(b.insts[si], Inst::IBinI(_, _, sv, _, _) if nuse[sv.0 as usize] > 1));
+            if shared_add && (off != 0 || !(sh == 0 || sh as i64 == natural)) {
+                continue;
+            }
+            if let Some(&ii) = def_at.get(&idx.0).filter(|_| !shift_stays) {
                 // x64: the displacement is free in every form, so an index used elsewhere too is
                 // still replaced by its operand here (`a[j - 1]` reads [b + j*4 - 4]; the subtract
                 // stays for its other uses and can then sink to them); arm64 keeps the
@@ -6435,13 +6460,31 @@ pub fn addr_modes(f: &mut Func) {
                 Inst::VStore(_, off2, v) => Inst::VStoreX(pp, idx, sh, off2 + extra as i32, v),
                 ref other => other.clone(),
             };
-            let _ = off;
+            if shared_add {
+                nuse[base.0 as usize] -= 1;
+                if nuse[base.0 as usize] > 0 {
+                    // the add stays (with its shift): the access reads its operands too
+                    nuse[pp.0 as usize] += 1;
+                    nuse[idx.0 as usize] += 1;
+                    continue;
+                }
+            }
             dead[ai] = true;
             if let Some(ii) = fold_at {
                 dead[ii] = true;
             }
             if let Some(si) = si {
-                dead[si] = true;
+                // a shared shift (arm64) stays for its other uses; the access reads its operand
+                let sv = match b.insts[si] {
+                    Inst::IBinI(_, _, sv, _, _) => sv,
+                    _ => unreachable!(),
+                };
+                nuse[sv.0 as usize] -= 1;
+                if nuse[sv.0 as usize] == 0 {
+                    dead[si] = true;
+                } else {
+                    nuse[idx.0 as usize] += 1;
+                }
             }
         }
         if dead.iter().any(|x| *x) {
