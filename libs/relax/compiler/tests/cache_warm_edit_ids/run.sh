@@ -27,7 +27,7 @@ for step in "" "" "" "line 1" "host 1" "line 2" "closure+" "host 2" "line 3" "mo
   if [ $rc != 0 ] || [ -z "$got" ] || [ "$got" != "$want" ] || grep -qE "has no identity|startup image dropped" "$C/run$k.log"; then
     bad="$bad run$k(${step:-warm}) exit $rc: $(grep -m1 -E "has no identity|startup image dropped|segfault|panicked|error|result" "$C/run$k.log" | cut -c1-200);"
   fi
-  [ -n "$WF_LOG" ] && grep -E "prelinked|identities decoded|startup image of|startup manifest|tier|O3" "$C/run$k.log" | sed "s/^/run$k(${step:-warm}): /"
+  [ -n "$WF_LOG" ] && grep -E "prelinked|identities decoded|startup image of|startup manifest" "$C/run$k.log" | sed "s/^/run$k(${step:-warm}): /"
 done
 if [ -z "$bad" ]; then echo "cache_warm_edit_ids: ok"; else echo "cache_warm_edit_ids: FAILED$bad"; fi
 # the temp dir this script made (mktemp -d), nothing else

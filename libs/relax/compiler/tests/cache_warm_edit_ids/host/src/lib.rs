@@ -50,6 +50,17 @@ pub fn bump(n: u64) -> u64 {
     *g
 }
 
+// A closure called directly and also taken as a fn pointer (a thunk symbol: the startup image
+// makes a slot for every thunk key, used or not). After an edit below it, the cached code of
+// `tick` -- unchanged, so its entry is taken again -- names the closure by its old file version;
+// that key must never resolve to a slot the image made but cannot name.
+#[inline(never)]
+pub fn tick(v: u64) -> u64 {
+    let c = |x: u64| x * 3 + 1;
+    let p: fn(u64) -> u64 = c;
+    std::hint::black_box(p)(v) + c(v)
+}
+
 #[inline(never)]
 pub fn host_open(x: u64) -> u64 {
     // HOST-EDIT

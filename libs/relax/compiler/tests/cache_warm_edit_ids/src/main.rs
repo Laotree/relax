@@ -30,7 +30,7 @@ fn round() -> u64 {
     }
     let e = wf_edit::eval(5);
     let p = wf_host::apply(|x| wf_edit::eval(x) + 1, 3);
-    h.run(10) + e + p + wf_host::host_open(3) + (wf_host::bump(4) & 0) + wf_edit::Item(2).later()
+    h.run(10) + e + p + wf_host::host_open(3) + (wf_host::bump(4) & 0) + wf_host::tick(6) + wf_edit::Item(2).later()
 }
 
 fn main() {
