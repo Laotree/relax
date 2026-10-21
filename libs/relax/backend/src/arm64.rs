@@ -3938,8 +3938,21 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // a function that calls nothing and returns no float may keep values in v0-v3 too (they
     // carry float arguments and results, and calls' aggregate results, only around calls)
     let mut cfg = RegConfig { sym_class: env.sym_class, ..reg_config() };
-    if f.rets.iter().all(|c| *c == Cls::I) && f.blocks.iter().all(|b| !b.insts.iter().any(|i| matches!(i, Inst::Call(..)))) {
+    let leaf = f.blocks.iter().all(|b| !b.insts.iter().any(|i| matches!(i, Inst::Call(..))));
+    if f.rets.iter().all(|c| *c == Cls::I) && leaf {
         cfg.flt_caller.extend_from_slice(&[0, 1, 2, 3]);
+    }
+    // likewise x0 / x1 (integer results: the return's moves place them) and x8 (the large-copy and
+    // atomic loops' scratch) in a function that calls nothing: small leaf fns kept values in
+    // callee-saved registers and saved / restored them on every return path
+    if leaf {
+        cfg.int_caller.extend_from_slice(&[0, 1]);
+        let x8_free = f.blocks.iter().all(|b| {
+            !b.insts.iter().any(|i| matches!(i, Inst::AtomicLoad(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..)) || matches!(i, Inst::Copy(_, _, n) if *n > 256))
+        });
+        if x8_free {
+            cfg.int_caller.push(X8);
+        }
     }
     let (split, mut al0) = regalloc::allocate_split(options, f, &cfg, env.opt_regs || f.full, freq);
     let f = split.as_ref().unwrap_or(f);
