@@ -3,8 +3,10 @@
 //! compiler/rustc_session/src/options.rs:222-259 (whole-options dependency hash).
 use crate::sip::Sip128;
 
-/// The error a program that needs inline assembly gets without `--allow-asm`.
-pub const ASM_GATE: &str = "inline assembly (asm!, global_asm!, naked_asm!) is assembled only with `--allow-asm` (or MAKEPAD_RUN_ALLOW_ASM=1)";
+/// The error inline assembly in crate `krate` gets under `--no-asm`.
+pub fn asm_blocked(krate: &str) -> String {
+    format!("inline assembly (asm!, global_asm!, naked_asm!) in crate `{}` is blocked by `--no-asm` (MAKEPAD_RUN_NO_ASM=1)", krate)
+}
 /// The error a program whose dependencies compile C gets without `--allow-c`.
 pub const C_GATE: &str = "is built only with `--allow-c` (or MAKEPAD_RUN_ALLOW_C=1): cargo and the system C compiler build it, and its library is linked into the run";
 
@@ -90,9 +92,10 @@ pub struct Options {
     pub verbose: bool,
     /// `MAKEPAD_RUN_CHECK_WINDOWS`; default `false`.
     pub check_windows: bool,
-    /// `--allow-asm` / `MAKEPAD_RUN_ALLOW_ASM=1`: `asm!`, `global_asm!` and `naked_asm!` are
-    /// assembled (backend asm); without it they are an error naming the flag. Default `false`.
-    pub allow_asm: bool,
+    /// `--no-asm` / `MAKEPAD_RUN_NO_ASM=1` (sandboxed uses): `asm!`, `global_asm!` and
+    /// `naked_asm!` are an error naming the crate and the flag. Default `false`: inline assembly
+    /// is assembled (backend asm).
+    pub no_asm: bool,
     /// `--allow-c` / `MAKEPAD_RUN_ALLOW_C=1`: dependencies whose build script compiles C are built
     /// by cargo and the system C compiler and linked in (front native.rs); without it they are an
     /// error naming the flag. Default `false`.
@@ -284,7 +287,7 @@ impl Default for Options {
         Self {
             verbose: false,
             check_windows: false,
-            allow_asm: false,
+            no_asm: false,
             allow_c: false,
             gather: false,
             memconst: false,
@@ -391,7 +394,7 @@ impl Options {
         Self {
             verbose: get("MAKEPAD_RUN_VERBOSE").is_some_and(|v| v == "1"),
             check_windows: { let os = get("MAKEPAD_RUN_CHECK_WINDOWS"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
-            allow_asm: get("MAKEPAD_RUN_ALLOW_ASM").is_some_and(|v| v == "1"),
+            no_asm: get("MAKEPAD_RUN_NO_ASM").is_some_and(|v| v == "1"),
             allow_c: get("MAKEPAD_RUN_ALLOW_C").is_some_and(|v| v == "1"),
             gather: { let os = get("MAKEPAD_RUN_GATHER"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
             memconst: { let os = get("MAKEPAD_RUN_MEMCONST"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
@@ -497,7 +500,7 @@ impl Options {
             // which dependencies cargo builds does not change the code Relax compiles from them
             allow_c: _,
             check_windows,
-            allow_asm,
+            no_asm,
             gather,
             memconst,
             no_avx,
@@ -584,8 +587,8 @@ impl Options {
         h.str("relax-options-v1");
         h.str("check_windows");
         h.u8(*check_windows as u8);
-        h.str("allow_asm");
-        h.u8(*allow_asm as u8);
+        h.str("no_asm");
+        h.u8(*no_asm as u8);
         h.str("gather");
         h.u8(*gather as u8);
         h.str("memconst");

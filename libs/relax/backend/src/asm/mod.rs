@@ -1,4 +1,4 @@
-//! Relax's assembler for `asm!`, `global_asm!` and `naked_asm!` (gated behind `--allow-asm`).
+//! Relax's assembler for `asm!`, `global_asm!` and `naked_asm!` (blocked by `--no-asm`).
 //!
 //! rustc hands the template to LLVM's integrated assembler after substituting each operand
 //! (rustc_codegen_llvm/src/asm.rs: `${N:mod}` placeholders the AsmPrinter prints as register

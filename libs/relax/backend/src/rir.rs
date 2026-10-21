@@ -665,7 +665,7 @@ pub enum Callee {
     CIndirect(VReg, Box<CSig>),
     /// direct call of a Relax `extern "C" fn` (function table slot)
     CFn(u32, Box<CSig>),
-    /// an inline assembly block (`asm!`, gated by `--allow-asm`): the call's arguments are its
+    /// an inline assembly block (`asm!`; `--no-asm` blocks it): the call's arguments are its
     /// inputs and its results its outputs, each in the block's register. Every pass sees it as a
     /// call (side effects, memory, no motion); the register allocator keeps all other values out
     /// of its registers over it (`AsmBlock::regs`); the backend emits the bytes in place.

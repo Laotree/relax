@@ -1,4 +1,4 @@
-//! `global_asm!` (gated by `--allow-asm`): the program's module-level assembly, assembled and
+//! `global_asm!` (blocked by `--no-asm`): the program's module-level assembly, assembled and
 //! placed on the first lookup of a foreign symbol (jit.rs foreign_addr), so a program without
 //! it pays nothing. As rustc hands all `global_asm!` of a crate to LLVM as one module asm, the
 //! blocks of a crate are assembled as one text (each starting in `.text`); its code goes to the

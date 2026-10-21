@@ -10924,7 +10924,7 @@ impl<'a> Lcx<'a> {
         let margs = ast.mac_arg(m.args);
         let mexprs = ast.list(margs.exprs);
         match name {
-            // assembled with `--allow-asm` (typeck reports the gate otherwise)
+            // assembled unless `--no-asm` (typeck reports the block then)
             "asm" => self.lower_asm(margs),
             "assert" => {
                 let c = mexprs[0];

@@ -124,7 +124,7 @@ extern "C" {
 }
 
 fn usage() -> i32 {
-    eprintln!("usage: makepad run [--units <unit-graph.json>] [--ahead=minimal|balanced|aot-max|aot-min] [--quiet] [--verbose] [--allow-asm] [--allow-c] <package> [cargo flags] [-- program args]");
+    eprintln!("usage: makepad run [--units <unit-graph.json>] [--ahead=minimal|balanced|aot-max|aot-min] [--quiet] [--verbose] [--no-asm] [--allow-c] <package> [cargo flags] [-- program args]");
     2
 }
 
@@ -529,7 +529,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             "--workspace" => workspace_check = true,
             "--verbose" => driver_options.verbose = true,
             // read into the session (session_from_env)
-            "--allow-asm" | "--allow-c" => {}
+            "--no-asm" | "--allow-c" => {}
             "--report-to" if i + 1 < args.len() => {
                 if let Err(e) = report_open(&args[i + 1]) {
                     eprintln!("makepad-run: {}", e);

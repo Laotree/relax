@@ -7550,10 +7550,10 @@ impl<'a> Fcx<'a> {
         }
         // `compile_error!("msg")` (what a failed built-in or derive leaves at its call): the
         // message is the error, as rustc reports it
-        // inline assembly is assembled only with `--allow-asm` (user decision 2026-10-21)
+        // inline assembly is assembled unless `--no-asm` (user decision 2026-10-21)
         if matches!(name, "asm" | "global_asm" | "naked_asm") {
-            if !self.prog.session.options.allow_asm {
-                self.err(lo, relax_session::options::ASM_GATE.to_string());
+            if self.prog.session.options.no_asm {
+                self.err(lo, relax_session::options::asm_blocked(&self.prog.file_crate_name(self.file)));
                 return self.tcx.tys.error;
             }
             if name == "global_asm" || m.args == NO_MAC_ARGS {

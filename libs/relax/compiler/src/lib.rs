@@ -200,14 +200,14 @@ pub fn relax_as_rustc() -> bool {
 /// rustc: compiler/rustc_session/src/config.rs:2428, session.rs:90-93.
 pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
     let mut options = crate::options::Options::from_env();
-    // `--allow-asm` / `--allow-c` anywhere before `--`, for every command (run, test, check, the
+    // `--no-asm` / `--allow-c` anywhere before `--`, for every command (run, test, check, the
     // relax runner): the environment carries them to the processes this one starts (build
     // scripts, test harnesses); cli_main drops them from the arguments
     for a in args.iter().take_while(|a| a.as_str() != "--") {
         match a.as_str() {
-            "--allow-asm" => {
-                options.allow_asm = true;
-                std::env::set_var("MAKEPAD_RUN_ALLOW_ASM", "1");
+            "--no-asm" => {
+                options.no_asm = true;
+                std::env::set_var("MAKEPAD_RUN_NO_ASM", "1");
             }
             "--allow-c" => {
                 options.allow_c = true;
@@ -252,7 +252,7 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
     let mut k = 0;
     args.retain(|a| {
         k += 1;
-        !(k <= end && (a == "--allow-asm" || a == "--allow-c"))
+        !(k <= end && (a == "--no-asm" || a == "--allow-c"))
     });
     if args.get(1).map(String::as_str) == Some("--version") {
         println!("makepad run {}", PROVENANCE);

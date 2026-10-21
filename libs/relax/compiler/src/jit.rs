@@ -4109,7 +4109,7 @@ impl Unit {
         if let Some(a) = lookup_interposer(&link) {
             return Some(a);
         }
-        // the program's own global_asm! labels (--allow-asm)
+        // the program's own global_asm! labels
         if !self.prog.global_asms.is_empty() {
             if let Some(&a) = crate::global_asm::symbols(self).get(&link) {
                 return Some(a);

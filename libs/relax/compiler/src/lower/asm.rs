@@ -1,4 +1,4 @@
-//! `asm!` (gated by `--allow-asm`; typeck reports the gate): the block is assembled here, with
+//! `asm!` (blocked by `--no-asm`; typeck reports it): the block is assembled here, with
 //! its operands in registers chosen for it, into one `Callee::Asm` call whose arguments are the
 //! inputs and whose results are the outputs (rir AsmBlock). Semantics follow the Reference
 //! (inline-assembly.md) and rustc_builtin_macros/src/asm.rs + rustc_target/src/asm/{x86,aarch64}.rs:
@@ -427,8 +427,8 @@ impl<'a> Lcx<'a> {
 
     fn lower_asm_inner(&mut self, margs: &MacArgs, naked: bool) -> Result<Val, String> {
         let ast = self.ast();
-        if !self.u.prog.session.options.allow_asm {
-            return Err(relax_session::options::ASM_GATE.to_string());
+        if self.u.prog.session.options.no_asm {
+            return Err(relax_session::options::asm_blocked(&self.u.prog.file_crate_name(self.b.file)));
         }
         let spec = margs.asm.ok_or("asm! without operands")?;
         let arch = Arch::host();
