@@ -696,6 +696,19 @@ fn previous_iv_copy_reads_the_stepped_pointer() {
         let args = [0u64, 4 + 4 * n];
         assert_eq!(eval(&orig, &args, &mem0), eval(&f, &args, &mem0), "n {n}");
     }
+    // the step twice per iteration (lomuto's source unrolling): both copies' reads rewritten
+    let mut u = orig.clone();
+    let body = u.blocks[2].insts.clone();
+    u.blocks[2].insts.extend(body);
+    u.blocks[2].pos = vec![1; u.blocks[2].insts.len()];
+    let u0 = u.clone();
+    assert!(version::prev_iv_copies(&relax_session::Options::default(), &mut u));
+    let n_rewrites = u.blocks[2].insts.iter().filter(|i| matches!(i, Inst::IBinI(IOp::Add, _, _, rr, -4) if *rr == r)).count();
+    assert_eq!(n_rewrites, 2, "{:?}", u.blocks[2].insts);
+    for n in [0u64, 2, 4, 6] {
+        let args = [0u64, 4 + 4 * n];
+        assert_eq!(eval(&u0, &args, &mem0), eval(&u, &args, &mem0), "unrolled n {n}");
+    }
     // entry offset that does not match the step: left alone
     let mut h = orig.clone();
     h.blocks[0].insts[1] = Inst::IBinI(IOp::Add, U64, r, base, 8);

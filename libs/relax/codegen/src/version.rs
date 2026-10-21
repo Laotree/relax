@@ -585,16 +585,17 @@ pub fn unswitch_loops(options: &relax_session::Options, f: &mut Func) -> bool {
     changed > 0
 }
 
-/// Copies of an induction variable's previous value: in a loop where `r` steps by a constant `s`
-/// (`r = r + s`, its one definition in the loop) and `g` is assigned `r + c` earlier in the same
-/// block (`gap = right; right = right.add(1)`: partition's gap pointer, insertion sort's hole),
-/// and the two enter the loop as `b + k_g` / `b + k_r` with k_g - k_r = c - s, `g == r + (c - s)`
-/// at the top of every iteration (SCEV's add-recurrence equality). Reads of g that see that value
-/// read `r + (c - s)` instead, so accesses through it share r's base: a store through the old
-/// pointer no longer hides a load through the new one from forwarding (lomuto's reload of
-/// `*right` after `*gap = *left`). Every exit leaves the loop with both or neither assignment of
-/// the iteration done (one block), so the equality holds at each entry too. Returns whether
-/// anything changed.
+/// Copies of an induction variable's previous value: in a loop where `r` steps by constants
+/// (`r = r + s`, every definition of it in the loop in one block B) and `g` is assigned values
+/// `r + c` in B too (`gap = right; right = right.add(1)`, twice per iteration when unrolled in the
+/// source: lomuto's cyclic partition; insertion sort's hole), `g - r` is the same constant `d` at
+/// the end of B on every iteration; when g and r enter the loop as `b + k_g` / `b + k_r` with
+/// k_g - k_r = d, then `g == r + d` everywhere in the loop outside B (SCEV's add-recurrence
+/// equality), and inside B at each point `g == r + (its offset there)`. Reads of g become reads of
+/// `r + offset`, so accesses through both share one base: a store through the old pointer no
+/// longer hides a load through the new one from forwarding (lomuto's reload of `*right` after
+/// `*gap = *left`). Exits leave B only at its end, so the equality holds on every entry too.
+/// Returns whether anything changed.
 pub fn prev_iv_copies(options: &relax_session::Options, f: &mut Func) -> bool {
     if relax_backend::stats::opt_off(options, "-previv") || f.blocks.len() < 2 {
         return false;
@@ -602,8 +603,8 @@ pub fn prev_iv_copies(options: &relax_session::Options, f: &mut Func) -> bool {
     let mut changed = false;
     // one rewrite per round (tables are rebuilt); a rewritten loop's reads no longer name g
     for _ in 0..MAX_LOOPS * 2 {
-        let Some((g, r, delta, sites)) = prev_iv_find(f) else { break };
-        for &(lb, k) in sites.iter().rev() {
+        let Some((g, r, sites)) = prev_iv_find(f) else { break };
+        for &(lb, k, delta) in sites.iter().rev() {
             let t = f.vreg(Cls::I);
             let pos = f.blocks[lb as usize].pos[k];
             let mut i = f.blocks[lb as usize].insts[k].clone();
@@ -621,8 +622,27 @@ pub fn prev_iv_copies(options: &relax_session::Options, f: &mut Func) -> bool {
     changed
 }
 
-/// prev_iv_copies' analysis: (g, r, c - s, the reads of g's header value) of one loop.
-fn prev_iv_find(f: &Func) -> Option<(VReg, VReg, i64, Vec<(u32, usize)>)> {
+/// The offset from r's header value R that each vreg holds after instruction k of `insts`
+/// (`sym` updated in place): copies and constant adds of known offsets; anything else unknown.
+fn sym_step(i: &Inst, sym: &mut std::collections::HashMap<u32, i64>) {
+    let v = match *i {
+        Inst::Mov(_, y) => sym.get(&y.0).copied(),
+        Inst::IBinI(IOp::Add, it, _, y, c) if it.bits == 64 => sym.get(&y.0).map(|o| o.wrapping_add(c)),
+        Inst::IBinI(IOp::Sub, it, _, y, c) if it.bits == 64 => sym.get(&y.0).map(|o| o.wrapping_sub(c)),
+        _ => None,
+    };
+    for_defs(i, |d| match v {
+        Some(o) => {
+            sym.insert(d.0, o);
+        }
+        None => {
+            sym.remove(&d.0);
+        }
+    });
+}
+
+/// prev_iv_copies' analysis: (g, r, the reads of g with the offset `g - r` at each) of one loop.
+fn prev_iv_find(f: &Func) -> Option<(VReg, VReg, Vec<(u32, usize, i64)>)> {
     let nv = f.vregs.len();
     let mut ndef = vec![0u32; nv];
     let mut def_at: Vec<(u32, usize)> = vec![(u32::MAX, 0); nv];
@@ -638,7 +658,7 @@ fn prev_iv_find(f: &Func) -> Option<(VReg, VReg, i64, Vec<(u32, usize)>)> {
         }
     }
     // (base, offset) of a value through single-def copies and constant adds
-    let base_off = |f: &Func, mut v: VReg| -> (VReg, i64) {
+    let base_off = |mut v: VReg| -> (VReg, i64) {
         let mut k = 0i64;
         for _ in 0..16 {
             if ndef[v.0 as usize] != 1 || f.params.contains(&v) || def_at[v.0 as usize].0 == u32::MAX {
@@ -662,136 +682,129 @@ fn prev_iv_find(f: &Func) -> Option<(VReg, VReg, i64, Vec<(u32, usize)>)> {
     };
     let dom = Dom::new(f);
     for l in candidate_loops(f) {
-        // r: the counter-like value stepped once per iteration in block b at index inc
-        for r in 0..nv {
-            let r = VReg(r as u32);
-            if ndef[r.0 as usize] != 2 || f.vregs[r.0 as usize] != Cls::I {
-                continue;
+        // the outside definition of v: exactly one, every other definition in the loop
+        let outside = |v: VReg, inside: usize| -> Option<(u32, usize)> {
+            let mut out = None;
+            let mut n = 0;
+            for (bi, bl) in f.blocks.iter().enumerate() {
+                if l.member[bi] {
+                    continue;
+                }
+                for (k, i) in bl.insts.iter().enumerate() {
+                    let mut hit = false;
+                    for_defs(i, |dd| hit |= dd == v);
+                    if hit {
+                        out = Some((bi as u32, k));
+                        n += 1;
+                    }
+                }
             }
-            let d = defs_in(f, &l, r);
-            if d.len() != 1 {
-                continue;
-            }
-            let (b, inc) = d[0];
+            (n == 1 && ndef[v.0 as usize] as usize == inside + 1).then_some(out?)
+        };
+        for &b in &l.blocks {
             let insts = &f.blocks[b as usize].insts;
-            let step = match insts[inc] {
-                Inst::IBinI(IOp::Add, it, _, a, s) if a == r && it.bits == 64 => s,
-                Inst::Mov(_, t) if ndef[t.0 as usize] == 1 && def_at[t.0 as usize].0 == b && def_at[t.0 as usize].1 < inc => match insts[def_at[t.0 as usize].1] {
-                    Inst::IBinI(IOp::Add, it, _, a, s) if a == r && it.bits == 64 => s,
-                    _ => continue,
-                },
-                _ => continue,
-            };
-            // g = r + c, assigned before the increment in the same block
-            for (gk, gi) in insts[..inc].iter().enumerate() {
-                let Inst::Mov(g, x) = *gi else { continue };
-                if g == r || ndef[g.0 as usize] != 2 || defs_in(f, &l, g).len() != 1 {
+            // r: a multi-def value every loop definition of which is in b, each `r + s`
+            let mut rs: Vec<VReg> = Vec::new();
+            for i in insts.iter() {
+                for_defs(i, |d| {
+                    if ndef[d.0 as usize] >= 2 && f.vregs[d.0 as usize] == Cls::I && !rs.contains(&d) {
+                        rs.push(d)
+                    }
+                });
+            }
+            for r in rs {
+                let rd = defs_in(f, &l, r);
+                if rd.iter().any(|d| d.0 != b) {
                     continue;
                 }
-                // x as r's header value plus c: a chain of single-def copies / constant adds in
-                // this block before g's assignment, ending at r (r is not redefined before inc)
-                let mut c = 0i64;
-                let mut v = x;
-                let mut ok = false;
-                for _ in 0..8 {
-                    if v == r {
-                        ok = true;
-                        break;
-                    }
-                    if ndef[v.0 as usize] != 1 || def_at[v.0 as usize].0 != b || def_at[v.0 as usize].1 >= gk {
-                        break;
-                    }
-                    match insts[def_at[v.0 as usize].1] {
-                        Inst::Mov(_, y) => v = y,
-                        Inst::IBinI(IOp::Add, it, _, y, k) if it.bits == 64 => {
-                            c = c.wrapping_add(k);
-                            v = y
-                        }
-                        Inst::IBinI(IOp::Sub, it, _, y, k) if it.bits == 64 => {
-                            c = c.wrapping_sub(k);
-                            v = y
-                        }
-                        _ => break,
+                // the values in b as offsets from r's value at b's start
+                let mut sym: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
+                sym.insert(r.0, 0);
+                let mut r_ok = true;
+                for (k, i) in insts.iter().enumerate() {
+                    sym_step(i, &mut sym);
+                    if rd.iter().any(|d| d.1 == k) && !sym.contains_key(&r.0) {
+                        r_ok = false;
                     }
                 }
-                if !ok {
-                    continue;
-                }
-                let delta = c.wrapping_sub(step);
-                // the entry: the outside assignments, one block P dominating the header
-                let outside = |v: VReg| -> Option<(u32, usize)> {
-                    let mut out = None;
-                    for (bi, bl) in f.blocks.iter().enumerate() {
-                        if l.member[bi] {
+                let Some(&s_end) = sym.get(&r.0).filter(|_| r_ok) else { continue };
+                // g candidates: defined in b at a known offset, every loop definition in b
+                let mut cands: Vec<u32> = sym.keys().copied().filter(|&v| v != r.0 && ndef[v as usize] >= 2 && f.vregs[v as usize] == Cls::I).collect();
+                cands.sort_unstable();
+                for gv in cands {
+                    let g = VReg(gv);
+                    let gd = defs_in(f, &l, g);
+                    if gd.is_empty() || gd.iter().any(|d| d.0 != b) {
+                        continue;
+                    }
+                    let delta = sym[&gv].wrapping_sub(s_end);
+                    // second walk: g starts at r + delta; its offset at every read in b
+                    let mut sym2: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
+                    sym2.insert(r.0, 0);
+                    sym2.insert(gv, delta);
+                    let mut sites: Vec<(u32, usize, i64)> = Vec::new();
+                    let mut ok = true;
+                    for (k, i) in insts.iter().enumerate() {
+                        let (mut reads, mut writes) = (false, false);
+                        for_uses(i, |u| reads |= u == g);
+                        for_defs(i, |u| writes |= u == g);
+                        if reads && !writes {
+                            match (sym2.get(&gv), sym2.get(&r.0)) {
+                                (Some(go), Some(ro)) => sites.push((b, k, go.wrapping_sub(*ro))),
+                                _ => {}
+                            }
+                        }
+                        sym_step(i, &mut sym2);
+                        if writes && !sym2.contains_key(&gv) {
+                            ok = false;
+                        }
+                    }
+                    if !ok || sym2.get(&gv).map(|go| go.wrapping_sub(sym2[&r.0])) != Some(delta) {
+                        continue;
+                    }
+                    // the entry: both assigned once outside, in one block dominating the header,
+                    // from one base with the same difference
+                    let (Some(go), Some(ro)) = (outside(g, gd.len()), outside(r, rd.len())) else { continue };
+                    if go.0 != ro.0 || !dom.before((go.0, usize::MAX), (l.header, 0)) {
+                        continue;
+                    }
+                    let val = |at: (u32, usize)| -> Option<(VReg, i64)> {
+                        match f.blocks[at.0 as usize].insts[at.1] {
+                            Inst::Mov(_, y) if y != g && y != r => Some(base_off(y)),
+                            Inst::IBinI(IOp::Add, it, _, y, k) if it.bits == 64 && y != g && y != r => {
+                                let (bb, kk) = base_off(y);
+                                Some((bb, kk.wrapping_add(k)))
+                            }
+                            _ => None,
+                        }
+                    };
+                    let (Some((gb, gk0)), Some((rb, rk0))) = (val(go), val(ro)) else { continue };
+                    if gb != rb || gk0.wrapping_sub(rk0) != delta {
+                        continue;
+                    }
+                    // reads in the loop's other blocks: g == r + delta there
+                    for &lb in &l.blocks {
+                        if lb == b {
                             continue;
                         }
-                        for (k, i) in bl.insts.iter().enumerate() {
-                            let mut hit = false;
-                            for_defs(i, |dd| hit |= dd == v);
-                            if hit {
-                                out = Some((bi as u32, k));
+                        for (k, i) in f.blocks[lb as usize].insts.iter().enumerate() {
+                            let (mut reads, mut writes) = (false, false);
+                            for_uses(i, |u| reads |= u == g);
+                            for_defs(i, |u| writes |= u == g);
+                            if reads && !writes {
+                                sites.push((lb, k, delta));
                             }
                         }
                     }
-                    out
-                };
-                let (Some(go), Some(ro)) = (outside(g), outside(r)) else { continue };
-                if go.0 != ro.0 || !dom.before((go.0, usize::MAX), (l.header, 0)) {
-                    continue;
-                }
-                let val = |at: (u32, usize)| -> Option<(VReg, i64)> {
-                    match f.blocks[at.0 as usize].insts[at.1] {
-                        Inst::Mov(_, y) if y != g && y != r => Some(base_off(f, y)),
-                        Inst::IBinI(IOp::Add, it, _, y, k) if it.bits == 64 && y != g && y != r => {
-                            let (bb, kk) = base_off(f, y);
-                            Some((bb, kk.wrapping_add(k)))
-                        }
-                        _ => None,
-                    }
-                };
-                let (Some((gb, gk0)), Some((rb, rk0))) = (val(go), val(ro)) else { continue };
-                if gb != rb || gk0.wrapping_sub(rk0) != delta {
-                    continue;
-                }
-                // reads of g's header value: in the header .. b before gk, outside the part of the
-                // iteration after g's assignment
-                let mut after = vec![false; f.blocks.len()];
-                {
-                    let mut work: Vec<u32> = f.blocks[b as usize].term.succs().filter(|&s| l.member[s as usize] && s != l.header).collect();
-                    while let Some(x) = work.pop() {
-                        if after[x as usize] {
-                            continue;
-                        }
-                        after[x as usize] = true;
-                        work.extend(f.blocks[x as usize].term.succs().filter(|&s| l.member[s as usize] && s != l.header));
-                    }
-                }
-                if after[b as usize] {
-                    continue;
-                }
-                let mut sites: Vec<(u32, usize)> = Vec::new();
-                for &lb in &l.blocks {
-                    if after[lb as usize] {
+                    if sites.is_empty() {
                         continue;
                     }
-                    let end = if lb == b { gk } else { f.blocks[lb as usize].insts.len() };
-                    for k in 0..end {
-                        // (an instruction that also assigns g is not renamed)
-                        let (mut reads, mut writes) = (false, false);
-                        for_uses(&f.blocks[lb as usize].insts[k], |u| reads |= u == g);
-                        for_defs(&f.blocks[lb as usize].insts[k], |u| writes |= u == g);
-                        if reads && !writes {
-                            sites.push((lb, k));
-                        }
+                    sites.sort_unstable();
+                    if trace() {
+                        eprintln!("previv: {} loop b{}: {:?} = {:?} {:+} ({} reads)", f.name, l.header, g, r, delta, sites.len());
                     }
+                    return Some((g, r, sites));
                 }
-                if sites.is_empty() {
-                    continue;
-                }
-                if trace() {
-                    eprintln!("previv: {} loop b{}: {:?} = {:?} {:+} ({} reads)", f.name, l.header, g, r, delta, sites.len());
-                }
-                return Some((g, r, delta, sites));
             }
         }
     }

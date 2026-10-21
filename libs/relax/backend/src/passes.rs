@@ -1838,7 +1838,7 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
         dce(f);
     }
     // a float load read only as its bits: an integer load (and the reverse)
-    if !opt_off(options, "-loadbits") && f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Conv(Conv::FToBits(_) | Conv::BitsToF(_), ..)))) {
+    if !opt_off(options, "-loadbits") && f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Conv(Conv::FToBits(_) | Conv::BitsToF(_) | Conv::IntToInt(_), ..)))) {
         load_bits(f);
     }
     fuse_sincos(f);
@@ -2167,6 +2167,9 @@ pub fn load_bits(f: &mut Func) -> bool {
                 let m = match c {
                     Conv::FToBits(w) => Mem::Int(if w { 8 } else { 4 }, false),
                     Conv::BitsToF(w) => if w { Mem::F64 } else { Mem::F32 },
+                    // a narrow integer load re-extended at its own width: the load extends
+                    // (`to_bits() as i32` of a loaded f32: movsxd from memory)
+                    Conv::IntToInt(t) if matches!(t.bits, 8 | 16 | 32) => Mem::Int(t.bits / 8, t.signed),
                     _ => continue,
                 };
                 if ndef[x.0 as usize] == 1 && nuse[x.0 as usize] == 1 {
@@ -2182,7 +2185,8 @@ pub fn load_bits(f: &mut Func) -> bool {
         for ii in 0..f.blocks[bi].insts.len() {
             let Inst::Load(m, x, base, off) = f.blocks[bi].insts[ii] else { continue };
             let Some(w) = want[x.0 as usize] else { continue };
-            let ok = matches!((m, w), (Mem::F32, Mem::Int(4, _)) | (Mem::F64, Mem::Int(8, _)) | (Mem::Int(4, _), Mem::F32) | (Mem::Int(8, _), Mem::F64));
+            let ok = matches!((m, w), (Mem::F32, Mem::Int(4, _)) | (Mem::F64, Mem::Int(8, _)) | (Mem::Int(4, _), Mem::F32) | (Mem::Int(8, _), Mem::F64))
+                || matches!((m, w), (Mem::Int(a, _), Mem::Int(b, _)) if a == b && a < 8);
             if !ok {
                 continue;
             }
@@ -2199,7 +2203,7 @@ pub fn load_bits(f: &mut Func) -> bool {
     }
     for b in f.blocks.iter_mut() {
         for i in b.insts.iter_mut() {
-            if let Inst::Conv(Conv::FToBits(_) | Conv::BitsToF(_), d, x) = *i {
+            if let Inst::Conv(Conv::FToBits(_) | Conv::BitsToF(_) | Conv::IntToInt(_), d, x) = *i {
                 if let Some(Some(t)) = repl.get(x.0 as usize) {
                     *i = Inst::Mov(d, *t);
                 }
@@ -6769,7 +6773,46 @@ pub fn expand_small_copies(f: &mut Func) {
     }
 }
 
+/// Late: `c ? 1 : 0` / `c ? 0 : 1` of a compare result c (0 / 1) is c / c ^ 1 (setcc instead of
+/// two constants and a cmov: `count += is_less as usize` after an Ordering became a select).
+/// Runs after the last simplify, whose Ordering / phi folds read selects of constants.
+pub fn bool_selects(f: &mut Func) {
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    let mut k01: Vec<Option<i64>> = vec![None; nv];
+    let mut is_cmp = vec![false; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            match *i {
+                Inst::Iconst(d, k @ (0 | 1)) => k01[d.0 as usize] = Some(k),
+                Inst::ICmp(_, _, d, ..) | Inst::ICmpI(_, _, d, ..) | Inst::FCmp(_, _, d, ..) => is_cmp[d.0 as usize] = true,
+                _ => {}
+            }
+        }
+    }
+    let one = |v: VReg, ndef: &[u32]| ndef[v.0 as usize] == 1;
+    for b in f.blocks.iter_mut() {
+        for i in b.insts.iter_mut() {
+            if let Inst::Sel(d, c, x, y) = *i {
+                if !one(c, &ndef) || !is_cmp[c.0 as usize] || !one(x, &ndef) || !one(y, &ndef) || f.vregs[d.0 as usize] != Cls::I {
+                    continue;
+                }
+                match (k01[x.0 as usize], k01[y.0 as usize]) {
+                    (Some(1), Some(0)) => *i = Inst::Mov(d, c),
+                    (Some(0), Some(1)) => *i = Inst::IBinI(IOp::Xor, U64, d, c, 1),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 pub fn addr_modes(f: &mut Func) {
+    bool_selects(f);
     unify_slot_addrs(f);
     fold_shift_masks(f);
     expand_small_copies(f);
