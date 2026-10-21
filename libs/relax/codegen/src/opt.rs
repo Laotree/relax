@@ -339,11 +339,16 @@ pub struct InlineStats {
     growth_after: usize,
     pub left: [usize; 5],
     pub rejected: std::collections::BTreeMap<(String, &'static str), usize>,
+    /// calls left in hot blocks (not cold, not panic paths): name, reason, callee size
+    pub hot_rejected: std::collections::BTreeMap<(String, &'static str, usize), usize>,
 }
 
 impl InlineStats {
-    fn reject(&mut self, name: String, reason: usize) {
+    fn reject(&mut self, name: String, reason: usize, hot: Option<usize>) {
         const REASONS: [&str; 5] = ["cold", "no-rir", "no-rule", "budget", "arity"];
+        if let Some(size) = hot {
+            *self.hot_rejected.entry((name.clone(), REASONS[reason], size)).or_default() += 1;
+        }
         self.left[reason] += 1;
         *self.rejected.entry((name, REASONS[reason])).or_default() += 1;
     }
@@ -359,6 +364,9 @@ impl InlineStats {
             name, self.inlined + self.left.iter().sum::<usize>(), self.inlined,
             self.hot_inlined + self.hot_left, self.growth_before.unwrap_or(0), self.growth_after,
             self.left[0], self.left[1], self.left[2], self.left[3], self.left[4], top);
+        if !self.hot_rejected.is_empty() {
+            eprintln!("  hot calls left: {}", self.hot_rejected.iter().map(|((n, why, size), k)| format!("{} ({}, {} insts, {})", n, why, size, k)).collect::<Vec<_>>().join("; "));
+        }
         eprintln!("  rules: {}", RULE_NAMES.iter().zip(self.rules).map(|(rule, n)| format!("{} {}", rule, n)).collect::<Vec<_>>().join(", "));
     }
 }
@@ -431,6 +439,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
         s.hot_left = 0;
         s.left = [0; 5];
         s.rejected.clear();
+        s.hot_rejected.clear();
     }
     // Scalar closure combinators do not carry a per-element call penalty.
     // Look through adapter forwarding bodies for an actual loop before giving
@@ -592,7 +601,8 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
                 } else {
                     1
                 };
-                s.reject(callee.map_or_else(|| format!("fn#{}", id), |c| c.name.clone()), reason);
+                let hot = (priorities[bi].1 && reason != 0).then(|| callee.map_or(0, inline_inst_count));
+                s.reject(callee.map_or_else(|| format!("fn#{}", id), |c| c.name.clone()), reason, hot);
             }
         }
     }
