@@ -10309,7 +10309,9 @@ impl Unit {
             FnKey::Inst(d, _) => self.prog.def(*d).kind != DefKind::ForeignFn,
             FnKey::Closure(..) => true,
             FnKey::Sandbox(base) => *base != u32::MAX,
-            FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Plain(_) => false,
+            // SPEC-V: twins tier up too (Unit::o3_allowed); the sampler queues only counted slots
+            FnKey::Plain(_) => true,
+            FnKey::Shim(_) | FnKey::Glue(..) => false,
         };
         self.arm_counter_as(id, code, counted);
     }
