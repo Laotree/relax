@@ -2654,6 +2654,28 @@ pub fn relayout(f: &mut Func) {
     relayout_order(f);
 }
 
+/// Numbers the blocks in reverse postorder from the entry (unreachable ones after, in index
+/// order). Inlining appends each body's blocks in the order sites were taken, so the same code
+/// reached by a different inline order had different block numbers, and the passes and the
+/// allocator that visit blocks by index (relayout's next seed, ties) made different code from it
+/// (html_parse process_entity: identical RIR up to numbering, 2% more instructions).
+pub fn renumber_rpo(f: &mut Func) {
+    let order = crate::frame::block_rpo(f);
+    if order.iter().enumerate().all(|(i, b)| i as u32 == *b) {
+        return;
+    }
+    let mut map = vec![0u32; order.len()];
+    for (i, b) in order.iter().enumerate() {
+        map[*b as usize] = i as u32;
+    }
+    let mut old: Vec<Option<Block>> = std::mem::take(&mut f.blocks).into_iter().map(Some).collect();
+    for b in &order {
+        let mut blk = old[*b as usize].take().unwrap();
+        blk.term.map_succs(|t| map[t as usize]);
+        f.blocks.push(blk);
+    }
+}
+
 /// Appends a block's single-predecessor jump target to it (straight-line code after
 /// inlining and branch folding), so compares end up next to their branches.
 #[inline(never)]
@@ -4228,7 +4250,9 @@ pub fn local_cse(options: &relax_session::Options, f: &mut Func) -> bool {
             };
             let mut replaced = false;
             if let (Some(d), Some(key)) = (cand, key) {
-                if let Some(e) = st.avail.iter().find(|x| x.0 == key).map(|x| x.1) {
+                // the same key with another result class is another value: a VExtract of one
+                // lane as an integer (sign-extended) and as an f32
+                if let Some(e) = st.avail.iter().find(|x| x.0 == key && f.vregs[x.1 .0 as usize] == f.vregs[d.0 as usize]).map(|x| x.1) {
                     if e != d {
                         b.insts[k] = match fx.fact[e.0 as usize] {
                             Some(x) => Inst::Iconst(d, x),
@@ -4397,6 +4421,80 @@ pub fn load_key_size(k0: u64) -> i64 {
     } else {
         (mk & 0xff) as i64
     }
+}
+
+/// Value numbering of pure values over the dominator tree, without local_cse's bounded table
+/// (48 values per path, sized for Rust functions): an instruction with a `cse_key` that is no load
+/// and no constant, whose result and operands each have one definition, becomes a copy of the
+/// result of an instruction with the same key and result class above it in the dominator tree
+/// (simplify's copy propagation then removes the copy). Constants stay: they are rematerialised
+/// and sunk to their uses. For generated code with long runs of repeated pure values: a Splash
+/// kernel's lane extracts, which LICM gathers in the element loop's preheader (Stage's largest x4
+/// kernel extracted each lane of one product 216 times, all live through its 14k blocks).
+/// Returns whether anything changed.
+pub fn gvn_pure(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+        }
+    }
+    let idom = idoms(f);
+    let (_, _, kids) = dom_numbers(&idom);
+    let (blocks, vregs) = (&mut f.blocks, &f.vregs);
+    let mut table: std::collections::HashMap<([u64; 3], Cls), VReg> = std::collections::HashMap::new();
+    let mut undo: Vec<([u64; 3], Cls)> = Vec::new();
+    let mut marks: Vec<usize> = Vec::new();
+    let (mut uses, mut defs) = (Vec::new(), Vec::new());
+    let mut changed = false;
+    // (block, entering): a block's values are dropped when it is left, after its subtree
+    let mut work: Vec<(u32, bool)> = vec![(0, true)];
+    while let Some((bi, enter)) = work.pop() {
+        if !enter {
+            let m = marks.pop().unwrap_or(0);
+            for k in undo.drain(m..) {
+                table.remove(&k);
+            }
+            continue;
+        }
+        marks.push(undo.len());
+        work.push((bi, false));
+        let b = &mut blocks[bi as usize];
+        for k in 0..b.insts.len() {
+            let i = &b.insts[k];
+            if matches!(i, Inst::Load(..) | Inst::Iconst(..) | Inst::Fconst(..) | Inst::VConst(..) | Inst::Addr(..) | Inst::FnAddr(..)) {
+                continue;
+            }
+            let Some(key) = cse_key(i) else { continue };
+            uses_defs(i, &mut uses, &mut defs);
+            if defs.len() != 1 {
+                continue;
+            }
+            let d = defs[0];
+            if ndef[d.0 as usize] != 1 || uses.iter().any(|u| *u == d || ndef[u.0 as usize] != 1) {
+                continue;
+            }
+            let cls = vregs[d.0 as usize];
+            match table.get(&(key, cls)) {
+                Some(&e) => {
+                    b.insts[k] = Inst::Mov(d, e);
+                    changed = true;
+                }
+                None => {
+                    table.insert((key, cls), d);
+                    undo.push((key, cls));
+                }
+            }
+        }
+        for &c in kids[bi as usize].iter().rev() {
+            work.push((c, true));
+        }
+    }
+    changed
 }
 
 pub fn cse_key(i: &Inst) -> Option<[u64; 3]> {

@@ -706,6 +706,8 @@ struct Gen<'a> {
     /// rbp offset base for spills/slots: [rbp - (saved + x)]
     saved: i32,
     slot_off: Vec<i32>,
+    /// per value: its frame position when it is a slot address (frame::slot_addr_positions)
+    slot_pos: Vec<i64>,
     block_pos: Vec<usize>,
     fixups: Vec<(usize, u32)>,
     pc_map: Vec<(u32, u64)>,
@@ -1038,6 +1040,7 @@ impl<'a> Gen<'a> {
         // it (frame::slot_layout)
         let (at, end) = crate::frame::slot_layout(self.f, self.al.spill_bytes as i64, !crate::stats::opt_off(options, "-slotcolor"));
         self.slot_off.extend(at.iter().map(|&x| x as i32));
+        self.slot_pos = crate::frame::slot_addr_positions(self.f, &at);
         let mut off = end as i32;
         off = (off + 7) / 8 * 8;
         // C ABI body: buffers rebuilding aggregate params from registers, the result buffer
@@ -2814,6 +2817,11 @@ impl<'a> Gen<'a> {
             }
             Inst::Call(c, args, rets) => self.call(options, c, args, rets),
             Inst::Copy(dst, src, size) => {
+                // a slot copied onto its own storage (frame::slot_addr_positions): nothing moves
+                let p = self.slot_pos[dst.0 as usize];
+                if p != i64::MIN && p == self.slot_pos[src.0 as usize] {
+                    return;
+                }
                 let rd = self.use_i(options, *dst, R10);
                 let rs = self.use_i(options, *src, R11);
                 if *size >= 32 && *size <= 512 {
@@ -2826,10 +2834,17 @@ impl<'a> Gen<'a> {
                         self.a.sse_rm(0, 0x11, XS, rd, o);
                         o += 16;
                     }
-                    if o < size {
-                        // the tail as one overlapping 16-byte move
-                        self.a.sse_rm(0, 0x10, XS, rs, size - 16);
-                        self.a.sse_rm(0, 0x11, XS, rd, size - 16);
+                    // the tail in 8/4/2/1-byte pieces, not one overlapping 16-byte move: a value
+                    // moved through several temporaries is copied with the same pieces each
+                    // time, so every load reads exactly one earlier store (an overlapping tail
+                    // made the next copy's [n-32, n-16) load span two stores: a failed store
+                    // forward per chained copy)
+                    for w in [8i32, 4, 2, 1] {
+                        while o + w <= size {
+                            self.a.load_ext(RAX, rs, o, w as u8, false);
+                            self.a.store_n(rd, o, RAX, w as u8);
+                            o += w;
+                        }
                     }
                     return;
                 }
@@ -4994,6 +5009,16 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     } else {
         f
     };
+    // negated fused multiply-add operands as explicit negations (NaN signs, see legal.rs)
+    let unfused;
+    let f = if f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::FMulAdd(np, na, ..) | Inst::VFma(np, na, ..) if *np || *na))) {
+        let mut g = f.clone();
+        crate::legal::expand_fma_negations(&mut g);
+        unfused = g;
+        &unfused
+    } else {
+        f
+    };
     // vector ops without an instruction sequence here: per-lane scalar code
     let legal;
     // (MAKEPAD_RUN_OPT=-vxnative: every expandable op, the legaliser's reference meaning)
@@ -5065,6 +5090,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         al,
         saved: 0,
         slot_off: Vec::new(),
+        slot_pos: Vec::new(),
         block_pos: Vec::new(),
         fixups: Vec::new(),
         pc_map: Vec::new(),
