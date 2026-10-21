@@ -9236,31 +9236,46 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         // before `get` goes out of scope, also when the optimiser panics
         let get_static: &'static dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)> = unsafe { std::mem::transmute(get) };
         // callees' params, depth-limited (a Vec's push -> reserve -> grow -> realloc chain);
-        // false while a query is in progress (recursion), memoised per (callee, param)
-        fn nocap(get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, memo: &std::cell::RefCell<HashMap<(u32, usize), Option<bool>>>, cid: u32, k: usize, depth: u32) -> bool {
-            if let Some(r) = memo.borrow().get(&(cid, k)) {
-                return r.unwrap_or(false);
-            }
+        // false for a query already in progress (recursion). Memoised per (callee, param, depth)
+        // only when no answer below came from an in-progress query, so every answer is the one a
+        // fresh query gives, whatever was asked before: the bottom-up preparations an O3 build
+        // shares with another (PREP_SHARED) must not depend on the order of the other's queries.
+        // Returns (answer, depended on an in-progress query).
+        fn nocap(get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, memo: &std::cell::RefCell<HashMap<(u32, usize, u32), Option<bool>>>, cid: u32, k: usize, depth: u32) -> (bool, bool) {
             if depth == 0 {
-                return false;
+                return (false, false);
             }
-            let Some((fp, _)) = get(cid) else { return false };
-            memo.borrow_mut().insert((cid, k), None);
+            match memo.borrow().get(&(cid, k, depth)) {
+                Some(Some(r)) => return (*r, false),
+                Some(None) => return (false, true),
+                None => {}
+            }
+            let Some((fp, _)) = get(cid) else { return (false, false) };
+            memo.borrow_mut().insert((cid, k, depth), None);
             let f2 = unsafe { &*fp };
+            let tainted = std::cell::Cell::new(false);
             let sub = |c2: &relax_backend::rir::Callee, k2: usize| -> bool {
                 match c2 {
-                    relax_backend::rir::Callee::Fn(i2) => nocap(get, memo, *i2, k2, depth - 1),
+                    relax_backend::rir::Callee::Fn(i2) => {
+                        let (r, t) = nocap(get, memo, *i2, k2, depth - 1);
+                        if t { tainted.set(true); }
+                        r
+                    }
                     _ => false,
                 }
             };
             let r = relax_codegen::opt::param_nocapture(f2, k, &sub);
-            memo.borrow_mut().insert((cid, k), Some(r));
-            r
+            if tainted.get() {
+                memo.borrow_mut().remove(&(cid, k, depth));
+            } else {
+                memo.borrow_mut().insert((cid, k, depth), Some(r));
+            }
+            (r, tainted.get())
         }
-        let memo: std::cell::RefCell<HashMap<(u32, usize), Option<bool>>> = std::cell::RefCell::new(HashMap::new());
+        let memo: std::cell::RefCell<HashMap<(u32, usize, u32), Option<bool>>> = std::cell::RefCell::new(HashMap::new());
         relax_backend::passes::set_sroa_nocapture(Some(Box::new(move |c: &relax_backend::rir::Callee, k: usize| -> bool {
             let relax_backend::rir::Callee::Fn(cid) = c else { return false };
-            nocap(get_static, &memo, *cid, k, 4)
+            nocap(get_static, &memo, *cid, k, 4).0
         })));
     }
     static INLINE_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
