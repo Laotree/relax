@@ -477,7 +477,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
         }
         if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_UNTRACED").is_some() {
             for t in &un {
-                let n = u.fns.get(*t as usize).map(|f| f.name.to_string()).unwrap_or_default();
+                let n = if (*t as usize) < u.fns.len() { u.fns[*t as usize].name.to_string() } else { String::new() };
                 eprintln!("  untraced slot {} {}", t, n);
             }
         }
