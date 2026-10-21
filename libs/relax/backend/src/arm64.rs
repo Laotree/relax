@@ -845,6 +845,16 @@ impl<'a> Gen<'a> {
             let off = self.spill_sp(o);
             self.a.ldst(STRX, 8, r, SP, off);
             self.last_spill = Some((off, r, self.a.pos()));
+            self.def_win_copy(v, r);
+        }
+    }
+    /// A window that starts at this definition (def windows, regions over redefining blocks)
+    /// holds the result: computed elsewhere (a scratch), it is copied there.
+    fn def_win_copy(&mut self, v: VReg, r: u8) {
+        if let Some(c) = self.win.get(&v.0).and_then(|ws| ws.iter().find(|w| w.0 == self.cur_pos + 1)).map(|w| w.2) {
+            if c != r {
+                self.a.mov(c, r);
+            }
         }
     }
     fn use_f(&mut self, v: VReg, scratch: u8) -> u8 {
@@ -1139,6 +1149,19 @@ impl<'a> Gen<'a> {
                     }
                 }
                 self.inst(options, inst);
+            }
+            // region windows entered from here: loaded before the jump (regalloc edge loads)
+            if matches!(b.term, Term::Jump(_)) {
+                let tp = self.al.block_end[bi] - 1;
+                if let Some(ls) = self.win_start.get(&tp).cloned() {
+                    self.cur_pos = tp;
+                    for (v, r) in ls {
+                        if let Loc::Stack(o) = self.al.loc[v as usize] {
+                            let off = self.spill_sp(o);
+                            self.a.ldst(LDRX, 8, r, SP, off);
+                        }
+                    }
+                }
             }
             self.pc_map.push(((self.a.pos() * 4) as u32, b.term_pos));
             let fuse_inst = if fused { Some(b.insts[n - 1].clone()) } else { None };
@@ -2986,6 +3009,7 @@ impl<'a> Gen<'a> {
                         (Loc::Stack(o), Loc::Reg(r)) => {
                             let off = self.spill_sp(o);
                             self.a.ldst(STRX, 8, r, SP, off);
+                            self.def_win_copy(*d, r);
                         }
                         (Loc::Reg(r), Loc::Stack(o)) => {
                             let off = self.spill_sp(o);

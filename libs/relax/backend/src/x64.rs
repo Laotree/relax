@@ -976,6 +976,14 @@ impl<'a> Gen<'a> {
             let d = self.spill_disp(o);
             self.a.store64(RBP, d, r);
             self.last_spill = Some((d, r, self.a.pos()));
+            self.def_win_copy(v, r);
+        }
+    }
+    /// A window that starts at this definition (def windows, regions over redefining blocks)
+    /// holds the result: computed elsewhere (a scratch), it is copied there.
+    fn def_win_copy(&mut self, v: VReg, r: u8) {
+        if let Some(c) = self.win.get(&v.0).and_then(|ws| ws.iter().find(|w| w.0 == self.cur_pos + 1)).map(|w| w.2) {
+            self.a.mov_rr(c, r);
         }
     }
     /// dst = the spill slot at disp: a register move (or nothing) when the slot was stored from a
@@ -1395,6 +1403,19 @@ impl<'a> Gen<'a> {
             self.pc_map.push((self.a.pos() as u32, b.term_pos));
             if self.rir_map_on {
                 self.rir_map.push((self.a.pos() as u32, bi as u32, u32::MAX));
+            }
+            // region windows entered from here: loaded before the jump (regalloc edge loads)
+            if matches!(b.term, Term::Jump(_)) {
+                let tp = self.al.block_end[bi] - 1;
+                if let Some(ls) = self.win_start.get(&tp).cloned() {
+                    self.cur_pos = tp;
+                    for (v, r) in ls {
+                        if let Loc::Stack(o) = self.al.loc[v as usize] {
+                            let d = self.spill_disp(o);
+                            self.load_spill(r, d);
+                        }
+                    }
+                }
             }
             let fuse_inst = if fused { Some(b.insts[n - 1].clone()) } else { None };
             self.term(options, &b.term, bi, fuse_inst);
@@ -2176,7 +2197,8 @@ impl<'a> Gen<'a> {
             let b = &self.f.blocks[bi];
             let Term::Jump(t) = b.term else { continue };
             // the block that reads the domain base is not skipped, whatever else it holds
-            if !reach[bi] || t as usize == bi || self.dom_read.get(bi) == Some(&true) {
+            // nor a block that loads a region window before its jump
+            if !reach[bi] || t as usize == bi || self.dom_read.get(bi) == Some(&true) || self.win_start.contains_key(&(self.al.block_end[bi] - 1)) {
                 continue;
             }
             let silent = b.insts.iter().enumerate().all(|(ii, i)| match *i {
@@ -2396,8 +2418,11 @@ impl<'a> Gen<'a> {
             }
             Term::Switch(x, tab) => {
                 // rax = x - min; if rax >u len - 1 { default }; jump through the table
-                let r = self.use_i(options, *x, R10);
-                self.a.mov_rr(RAX, r);
+                // a spilled value loads straight into rax
+                let r = self.use_i(options, *x, RAX);
+                if r != RAX {
+                    self.a.mov_rr(RAX, r);
+                }
                 if tab.min == 0 {
                 } else if tab.min as i32 as i64 == tab.min {
                     // sub rax, imm32
@@ -2550,6 +2575,7 @@ impl<'a> Gen<'a> {
                     (Loc::Stack(o), Loc::Reg(r)) => {
                         let disp = self.spill_disp(o);
                         self.a.store64(RBP, disp, r);
+                        self.def_win_copy(*d, r);
                     }
                     (Loc::Reg(r), Loc::Stack(o)) => {
                         let disp = self.spill_disp(o);
@@ -2814,13 +2840,8 @@ impl<'a> Gen<'a> {
             }
             Inst::Conv(c, d, s) => self.conv(options, *c, *d, *s),
             Inst::LoadX(m, d, base, idx, sh, off) => {
-                let ri = self.use_i(options, *idx, R10);
-                let ri = if ri == R10 {
-                    self.a.mov_rr(RAX, R10);
-                    RAX
-                } else {
-                    ri
-                };
+                // a spilled index loads straight into rax (base: r11, value: r10)
+                let ri = self.use_i(options, *idx, RAX);
                 let (rb, off) = self.base_disp(options, *base, R11, *off);
                 match m {
                     Mem::Int(n, signed) => {
@@ -2838,13 +2859,8 @@ impl<'a> Gen<'a> {
                 }
             }
             Inst::StoreX(m, base, idx, sh, off, src) => {
-                let ri = self.use_i(options, *idx, R10);
-                let ri = if ri == R10 {
-                    self.a.mov_rr(RAX, R10);
-                    RAX
-                } else {
-                    ri
-                };
+                // a spilled index loads straight into rax (base: r11, value: r10)
+                let ri = self.use_i(options, *idx, RAX);
                 let (rb, off) = self.base_disp(options, *base, R11, *off);
                 match m {
                     Mem::Int(n, _) => {
@@ -3834,13 +3850,7 @@ impl<'a> Gen<'a> {
     /// The index and base registers (and displacement) of an indexed access, as LoadX takes them:
     /// a spilled index in rax (r10 is the base's scratch).
     fn index_operands(&mut self, options: &relax_session::Options, base: VReg, idx: VReg, off: i32) -> (u8, u8, i32) {
-        let ri = self.use_i(options, idx, R10);
-        let ri = if ri == R10 {
-            self.a.mov_rr(RAX, R10);
-            RAX
-        } else {
-            ri
-        };
+        let ri = self.use_i(options, idx, RAX);
         let (rb, off) = self.base_disp(options, base, R11, off);
         (ri, rb, off)
     }
@@ -4563,12 +4573,15 @@ impl<'a> Gen<'a> {
                 self.fin_i(d, rd);
             }
             Conv::IntToF(from, to64) => {
-                let rs = self.use_i(options, s, R10);
+                // a spilled value loads straight into rax (the u64 path works there)
+                let rs = self.use_i(options, s, RAX);
                 let xd = self.def_f(d, XS);
                 let pfx = if to64 { 0xf2 } else { 0xf3 };
                 if from.bits == 64 && !from.signed {
                     // u64 -> float: if negative as i64, halve with sticky bit, convert, double
-                    self.a.mov_rr(RAX, rs);
+                    if rs != RAX {
+                        self.a.mov_rr(RAX, rs);
+                    }
                     self.a.test_rr(RAX, RAX);
                     let p = self.a.jcc32(0x8); // js
                     self.a.break_dep(xd, 0xff);
