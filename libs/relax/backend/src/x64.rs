@@ -807,6 +807,9 @@ fn keeps_xmm01(options: &relax_session::Options, f: &Func, i: &Inst) -> bool {
         Inst::Fconst(..) | Inst::VLoad(..) | Inst::VStore(..) | Inst::VLoadX(..) | Inst::VStoreX(..) | Inst::VConst(..) => true,
         // the NaN-correct min / max uses xmm0 / xmm1 (and the constant-operand form is chosen later)
         Inst::FBin(op, ..) => !matches!(op, FOp::Min | FOp::Max),
+        // round-half-away builds its addend in xmm0; the sign masks, sqrt and roundss do not
+        Inst::FUnary(op, ..) => *op != FUn::RoundAway,
+        Inst::FCmp(..) => true,
         // Gen::fma's VEX / EVEX form (the destination register or XS takes a)
         Inst::FMulAdd(..) => options.cpu.avx,
         // the 128-bit float lane ops that go straight to v3's VEX / EVEX three-operand form
