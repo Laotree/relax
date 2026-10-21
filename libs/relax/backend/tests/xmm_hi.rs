@@ -17,7 +17,7 @@ const N: usize = 40;
 
 /// fn(src, dst): x[i] = load src[i]; d[i] = (x[i] * x[(i+1)%N] + x[(i+7)%N]) - x[(i+13)%N] / x[(i+3)%N],
 /// every x live until the last d is computed; then dst[i] = d[i] + x[i].
-fn build(cls: Cls, mem: Mem, sz: i64, vector: bool) -> (Code, bool) {
+fn build(cls: Cls, mem: Mem, sz: i32, vector: bool) -> (Code, bool) {
     let mut f = Func::new("xmm_hi".into(), 0);
     let (ps, pd) = (f.vreg(Cls::I), f.vreg(Cls::I));
     f.params = vec![ps, pd];
@@ -25,7 +25,7 @@ fn build(cls: Cls, mem: Mem, sz: i64, vector: bool) -> (Code, bool) {
     let mut insts = Vec::new();
     let xs: Vec<VReg> = (0..N).map(|_| f.vreg(cls)).collect();
     for (i, x) in xs.iter().enumerate() {
-        insts.push(if vector { Inst::VLoad(*x, ps, i as i64 * 16) } else { Inst::Load(mem, *x, ps, i as i64 * sz) });
+        insts.push(if vector { Inst::VLoad(*x, ps, i as i32 * 16) } else { Inst::Load(mem, *x, ps, i as i32 * sz) });
     }
     let f64_ = cls == Cls::F64;
     let mut ds = Vec::new();
@@ -48,10 +48,10 @@ fn build(cls: Cls, mem: Mem, sz: i64, vector: bool) -> (Code, bool) {
         let r = f.vreg(cls);
         if vector {
             insts.push(Inst::VX(VX::FAdd(VW::S, NanBits::Host), r, ds[i], xs[i]));
-            insts.push(Inst::VStore(pd, i as i64 * 16, r));
+            insts.push(Inst::VStore(pd, i as i32 * 16, r));
         } else {
             insts.push(Inst::FBin(FOp::Add, f64_, r, ds[i], xs[i]));
-            insts.push(Inst::Store(mem, pd, i as i64 * sz, r));
+            insts.push(Inst::Store(mem, pd, i as i32 * sz, r));
         }
     }
     f.blocks[0].pos = vec![0; insts.len()];
