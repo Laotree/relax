@@ -2827,9 +2827,12 @@ pub fn div_rem_pairs(f: &mut Func) -> bool {
                 (None, Some((m, q2))) => {
                     let blk = &mut f.blocks[bi];
                     let div = blk.insts.remove(m);
-                    let p = blk.pos.remove(m);
                     blk.insts.insert(k, div);
-                    blk.pos.insert(k, p);
+                    // (positions are kept per instruction only when the block has them all)
+                    if blk.pos.len() == blk.insts.len() {
+                        let p = blk.pos.remove(m);
+                        blk.pos.insert(k, p);
+                    }
                     k += 1;
                     q2
                 }
@@ -2840,10 +2843,12 @@ pub fn div_rem_pairs(f: &mut Func) -> bool {
             };
             let t = f.vreg(Cls::I);
             let blk = &mut f.blocks[bi];
-            let p = blk.pos[k];
+            if blk.pos.len() == blk.insts.len() {
+                let p = blk.pos[k];
+                blk.pos.insert(k + 1, p);
+            }
             blk.insts[k] = Inst::IBin(IOp::Mul, it, t, qv, b);
             blk.insts.insert(k + 1, Inst::IBin(IOp::Sub, it, r, a, t));
-            blk.pos.insert(k + 1, p);
             changed = true;
             k += 2;
         }
