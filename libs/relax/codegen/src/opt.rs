@@ -5024,23 +5024,36 @@ mod inline_priority_tests {
         f.verify().unwrap();
     }
 
+    /// `caller` with both calls in its loop (bottom-up bodies serve sites in loops)
+    fn caller_in_loop() -> Func {
+        let mut f = caller();
+        f.blocks[0].insts.clear();
+        f.blocks[0].pos.clear();
+        f.blocks[1].insts = vec![Inst::Call(Callee::Fn(1), vec![], vec![]), Inst::Call(Callee::Fn(2), vec![], vec![])];
+        f.blocks[1].pos = vec![0, 0];
+        f
+    }
+
     #[test]
     fn priced_body_decides_and_inlined_body_moves() {
         // bottom-up O3: the optimised body prices the site, the inlined-only body is inlined
         let options = &relax_session::Options::default();
         let (raw, opt) = (callee(400), callee(30));
         let get = |_: u32| Some((&raw as *const Func, 0));
-        let mut f = caller();
+        let mut f = caller_in_loop();
         let n = inline_inst_count(&f);
         assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some((&raw as *const Func, &opt as *const Func)), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).len(), 2);
         assert!(inline_inst_count(&f) > n + 2 * 390);
         f.verify().unwrap();
-        // refused bottom-up (priced too big), the snapshot body decides: here too big as well
+        // outside a loop the snapshot body decides (here: too big), inside one the bottom-up body
         let mut f = caller();
+        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some((&raw as *const Func, &opt as *const Func)), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None), vec![(2, RULE_SMALL_LEAF)]);
+        // refused bottom-up (priced too big), the snapshot body decides: here too big as well
+        let mut f = caller_in_loop();
         assert!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some((&opt as *const Func, &raw as *const Func)), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).is_empty());
         // ... and here small enough: the snapshot body moves
         let get = |_: u32| Some((&opt as *const Func, 0));
-        let mut f = caller();
+        let mut f = caller_in_loop();
         assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some((&raw as *const Func, &raw as *const Func)), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).len(), 2);
         assert!(inline_inst_count(&f) < n + 2 * 40);
     }
