@@ -880,6 +880,18 @@ impl<'a> Gen<'a> {
             }
         }
     }
+    /// Where an operand is read at the current position: a spilled value a window (Alloc::windows,
+    /// region windows) holds in a register here reads that register. The memory-operand fast paths
+    /// (cmp / op r, [slot], loads straight into the result) use this, so the window's load pays.
+    fn uloc(&self, v: VReg) -> Loc {
+        match self.al.loc[v.0 as usize] {
+            Loc::Stack(o) => match self.win_reg(v) {
+                Some(r) => Loc::Reg(r),
+                None => Loc::Stack(o),
+            },
+            l => l,
+        }
+    }
     /// The register of a window (Alloc::windows) holding v at the current position.
     fn win_reg(&self, v: VReg) -> Option<u8> {
         let p = self.cur_pos;
@@ -2127,7 +2139,7 @@ impl<'a> Gen<'a> {
     /// cmp x, y (flags of x - y); a spilled operand is read by the compare itself
     /// (cmp r, [rbp - o] / cmp [rbp - o], r) instead of loaded into a scratch first
     fn cmp_vregs(&mut self, options: &relax_session::Options, x: VReg, y: VReg) {
-        match (self.al.loc[x.0 as usize], self.al.loc[y.0 as usize]) {
+        match (self.uloc(x), self.uloc(y)) {
             (_, Loc::Stack(o)) => {
                 let rx = self.use_i(options, x, R10);
                 let d = self.spill_disp(o);
@@ -2444,7 +2456,7 @@ impl<'a> Gen<'a> {
             // pieces of one split value sharing a slot
             Inst::Mov(d, s) if matches!(self.al.loc[d.0 as usize], Loc::Stack(_)) && self.al.loc[d.0 as usize] == self.al.loc[s.0 as usize] => {}
             Inst::Mov(d, s) => match self.f.vregs[d.0 as usize] {
-                Cls::I => match (self.al.loc[d.0 as usize], self.al.loc[s.0 as usize]) {
+                Cls::I => match (self.al.loc[d.0 as usize], self.uloc(*s)) {
                     // straight between a register and a spill slot
                     (Loc::Stack(o), Loc::Reg(r)) => {
                         let disp = self.spill_disp(o);
@@ -4255,7 +4267,7 @@ impl<'a> Gen<'a> {
 
     fn ibin(&mut self, options: &relax_session::Options, op: IOp, it: IntTy, d: VReg, a: VReg, b: VReg) {
         // a spilled first operand of a register result loads straight into it, unless b lives there
-        let ra = match (self.al.loc[a.0 as usize], self.al.loc[d.0 as usize], self.al.loc[b.0 as usize]) {
+        let ra = match (self.uloc(a), self.al.loc[d.0 as usize], self.uloc(b)) {
             (Loc::Stack(o), Loc::Reg(r), lb) if lb != Loc::Reg(r) && !matches!(op, IOp::Div | IOp::Rem | IOp::Shl | IOp::Shr | IOp::Rotl | IOp::MulHi) => {
                 let disp = self.spill_disp(o);
                 self.load_spill(r, disp);
@@ -4264,7 +4276,7 @@ impl<'a> Gen<'a> {
             _ => self.use_i(options, a, R10),
         };
         // a spilled second operand is read by the operation itself: op rd, [rbp - o]
-        if let (Loc::Stack(o), IOp::Add | IOp::Sub | IOp::And | IOp::Or | IOp::Xor | IOp::Mul) = (self.al.loc[b.0 as usize], op) {
+        if let (Loc::Stack(o), IOp::Add | IOp::Sub | IOp::And | IOp::Or | IOp::Xor | IOp::Mul) = (self.uloc(b), op) {
             let disp = self.spill_disp(o);
             let rd = self.def_i(d, R10);
             self.a.mov_rr(rd, ra);
@@ -4732,7 +4744,7 @@ impl<'a> Gen<'a> {
 
     fn ibin_imm(&mut self, options: &relax_session::Options, op: IOp, it: IntTy, d: VReg, a: VReg, k: i64) {
         // a spilled operand of a register result loads straight into it (no scratch + copy)
-        let ra = match (self.al.loc[a.0 as usize], self.al.loc[d.0 as usize]) {
+        let ra = match (self.uloc(a), self.al.loc[d.0 as usize]) {
             (Loc::Stack(o), Loc::Reg(r)) if !matches!(op, IOp::Div | IOp::Rem | IOp::MulHi) => {
                 let disp = self.spill_disp(o);
                 self.load_spill(r, disp);
