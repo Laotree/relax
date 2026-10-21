@@ -4376,6 +4376,11 @@ impl<'a> Gen<'a> {
                     self.a.byte(lane);
                     self.a.extend(rd, 32, true);
                     self.fin_i(d, rd);
+                } else if lane == 0 {
+                    // lane 0 is the f32 already (the upper lanes are don't-care for a scalar)
+                    let xd = self.def_f(d, XS2);
+                    self.a.movf_rr(false, xd, xv);
+                    self.fin_f(d, xd);
                 } else {
                     let xd = self.def_f(d, XS2);
                     self.a.sse_rr(0x66, 0x70, xd, xv, false); // pshufd: lane -> lane 0
