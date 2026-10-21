@@ -417,3 +417,42 @@ fn unswitch_invariant_branch() {
         }
     }
 }
+
+/// `out[i] = a[i].wrapping_mul(3) ^ b[i] >> 1` (u32) after versioning and rotation: one block, a
+/// constant shift among the lane operations; the stream-map vectoriser takes it.
+#[test]
+fn u32_map_with_shift_vectorises() {
+    let mut f = Func::new("mix_clone".into(), 0);
+    let p: Vec<VReg> = (0..4).map(|_| f.vreg(Cls::I)).collect();
+    let (out, a, b, n) = (p[0], p[1], p[2], p[3]);
+    f.params.extend([out, a, b, n]);
+    for _ in 0..3 {
+        f.block();
+    }
+    let i = f.vreg(Cls::I);
+    let (c0, t, i2, off, aa, av, m, ba, bv, sh, x, oa, c1) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+    let u32t = IntTy { bits: 32, signed: false };
+    push(&mut f, 0, Inst::Iconst(i, 0));
+    push(&mut f, 0, Inst::ICmp(Cond::Lt, false, c0, i, n));
+    term(&mut f, 0, Term::Branch(c0, 1, 2));
+    push(&mut f, 1, Inst::Mov(t, i));
+    push(&mut f, 1, Inst::IBinI(IOp::Add, U64, i2, i, 1));
+    push(&mut f, 1, Inst::Mov(i, i2));
+    push(&mut f, 1, Inst::IBinI(IOp::Shl, U64, off, t, 2));
+    push(&mut f, 1, Inst::IBin(IOp::Add, U64, aa, a, off));
+    push(&mut f, 1, Inst::Load(Mem::Int(4, false), av, aa, 0));
+    push(&mut f, 1, Inst::IBinI(IOp::Mul, u32t, m, av, 3));
+    push(&mut f, 1, Inst::IBin(IOp::Add, U64, ba, b, off));
+    push(&mut f, 1, Inst::Load(Mem::Int(4, false), bv, ba, 0));
+    push(&mut f, 1, Inst::IBinI(IOp::Shr, u32t, sh, bv, 1));
+    push(&mut f, 1, Inst::IBin(IOp::Xor, u32t, x, m, sh));
+    push(&mut f, 1, Inst::IBin(IOp::Add, U64, oa, out, off));
+    push(&mut f, 1, Inst::Store(Mem::Int(4, false), oa, 0, x));
+    push(&mut f, 1, Inst::ICmp(Cond::Lt, false, c1, i, n));
+    term(&mut f, 1, Term::Branch(c1, 1, 2));
+    term(&mut f, 2, Term::Ret(vec![]));
+    let n0 = f.blocks.len();
+    let ch = relax_codegen::loops::vectorize_reductions(&relax_session::Options::default(), &mut f);
+    assert!(ch && f.blocks.len() > n0, "vectorised");
+    assert!(f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::VX(VX::ShrUI(_, 1), ..)))));
+}
