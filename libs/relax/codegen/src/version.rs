@@ -32,6 +32,36 @@ fn trace() -> bool {
     *E.get_or_init(|| std::env::var("MAKEPAD_RUN_VERSION_TRACE").is_ok())
 }
 
+/// Dominance over f's blocks (pre/post numbers of the dominator tree).
+pub struct Dom {
+    pre: Vec<u32>,
+    post: Vec<u32>,
+}
+
+impl Dom {
+    pub fn new(f: &Func) -> Dom {
+        let idom = relax_backend::dom::idoms(f);
+        let (pre, post, _) = relax_backend::dom::dom_numbers(&idom);
+        Dom { pre, post }
+    }
+    /// instruction (a, i) runs before (b, j) on every path from the entry to (b, j)
+    /// (j == usize::MAX: b's terminator)
+    pub fn before(&self, a: (u32, usize), b: (u32, usize)) -> bool {
+        if a.0 == b.0 {
+            return a.1 < b.1;
+        }
+        let (x, y) = (a.0 as usize, b.0 as usize);
+        self.pre[x] <= self.pre[y] && self.post[y] <= self.post[x]
+    }
+}
+
+/// The one definition of `v` inside the loop when it runs before `at` on every path (so `at` reads
+/// the value of this iteration's definition), else None.
+fn local_def(f: &Func, l: &Loop, dom: &Dom, v: VReg, at: (u32, usize)) -> Option<(u32, usize)> {
+    let d = defs_in(f, l, v);
+    (d.len() == 1 && dom.before(d[0], at)).then(|| d[0])
+}
+
 /// A natural loop: its header, member flags and member list.
 pub struct Loop {
     pub header: u32,
@@ -54,8 +84,28 @@ pub fn version_loop(f: &mut Func, l: &Loop, guard: Vec<Inst>, g: VReg, facts: &[
     let mut ndef = vec![0u32; nv];
     let mut used_outside = vec![false; nv];
     let mut defined_inside = vec![false; nv];
+    let inside_of = |bi: usize| l.member.get(bi).copied().unwrap_or(false);
+    // the outside blocks the clone can reach: through its exits, not through the edges its facts
+    // remove (an original check's panic block keeps reading the original's names)
+    let mut reach_out = vec![false; f.blocks.len()];
+    {
+        let mut work: Vec<u32> = Vec::new();
+        for &b in &l.blocks {
+            match facts.iter().find(|t| t.block == b) {
+                Some(t) => work.push(t.to),
+                None => work.extend(f.blocks[b as usize].term.succs()),
+            }
+        }
+        while let Some(b) = work.pop() {
+            if inside_of(b as usize) || reach_out[b as usize] {
+                continue;
+            }
+            reach_out[b as usize] = true;
+            work.extend(f.blocks[b as usize].term.succs());
+        }
+    }
     for (bi, b) in f.blocks.iter().enumerate() {
-        let inside = l.member.get(bi).copied().unwrap_or(false);
+        let inside = inside_of(bi);
         for i in &b.insts {
             for_defs(i, |d| {
                 ndef[d.0 as usize] += 1;
@@ -63,11 +113,11 @@ pub fn version_loop(f: &mut Func, l: &Loop, guard: Vec<Inst>, g: VReg, facts: &[
                     defined_inside[d.0 as usize] = true;
                 }
             });
-            if !inside {
+            if !inside && reach_out[bi] {
                 for_uses(i, |u| used_outside[u.0 as usize] = true);
             }
         }
-        if !inside {
+        if !inside && reach_out[bi] {
             let mut tu = Vec::new();
             term_uses(&b.term, &mut tu);
             for u in tu {
@@ -78,13 +128,34 @@ pub fn version_loop(f: &mut Func, l: &Loop, guard: Vec<Inst>, g: VReg, facts: &[
     for p in &f.params {
         ndef[p.0 as usize] += 1;
     }
-    // fresh names: single-def vregs the loop defines and only the loop reads
+    // fresh names: vregs defined once in the loop, read only in the loop (and in blocks the clone
+    // cannot reach) and only after that definition within the iteration; definitions outside the
+    // loop do not matter then (a storage-dead zero after the loop)
+    let dom = Dom::new(f);
+    let mut inside_uses: Vec<Vec<(u32, usize)>> = vec![Vec::new(); nv];
+    for &b in &l.blocks {
+        let bl = &f.blocks[b as usize];
+        for (k, i) in bl.insts.iter().enumerate() {
+            for_uses(i, |u| inside_uses[u.0 as usize].push((b, k)));
+        }
+        let mut tu = Vec::new();
+        term_uses(&bl.term, &mut tu);
+        for u in tu {
+            inside_uses[u.0 as usize].push((b, usize::MAX));
+        }
+    }
+    let _ = ndef;
     let mut rename: std::collections::HashMap<u32, VReg> = std::collections::HashMap::new();
     for v in 0..nv {
-        if defined_inside[v] && ndef[v] == 1 && !used_outside[v] && !f.params.contains(&VReg(v as u32)) {
-            let nvr = f.vreg(f.vregs[v]);
-            rename.insert(v as u32, nvr);
+        if !defined_inside[v] || used_outside[v] || f.params.contains(&VReg(v as u32)) {
+            continue;
         }
+        let d = defs_in(f, l, VReg(v as u32));
+        if d.len() != 1 || !inside_uses[v].iter().all(|&u| dom.before(d[0], u)) {
+            continue;
+        }
+        let nvr = f.vreg(f.vregs[v]);
+        rename.insert(v as u32, nvr);
     }
     let base = f.blocks.len() as u32;
     let map: Vec<(u32, u32)> = l.blocks.iter().enumerate().map(|(k, &b)| (b, base + k as u32)).collect();
@@ -258,25 +329,18 @@ fn after_increment(f: &Func, l: &Loop, inc: (u32, usize)) -> Option<Vec<bool>> {
     Some(seen)
 }
 
-/// `x` as `t + k` where every value t takes was just tested `< n`: t = i read at a fresh point
-/// (after the header's test, before the increment in the iteration), t single-def in f.
-/// Returns k (0 for t itself).
-fn fresh_offset(f: &Func, l: &Loop, cnt: &Counted, stale: &[bool], ndef: &[u32], x: VReg, depth: u32) -> Option<i64> {
-    if depth > 4 || ndef[x.0 as usize] != 1 {
+/// `x` (read at `at`) as `t + k` where every value t takes was just tested `< n`: t = i read at a
+/// fresh point (after the header's test, before the increment in the iteration); each value of the
+/// chain defined once in the loop, before its read. Returns k (0 for t itself).
+fn fresh_offset(f: &Func, l: &Loop, dom: &Dom, cnt: &Counted, stale: &[bool], x: VReg, at: (u32, usize), depth: u32) -> Option<i64> {
+    if depth > 6 {
         return None;
     }
-    let d = defs_in(f, l, x);
-    if d.len() != 1 {
-        return None;
+    if x == cnt.iv {
+        return fresh_at(l, cnt, stale, at.0, at.1).then_some(0);
     }
-    let (b, k) = d[0];
-    let src_off = |src: VReg| -> Option<i64> {
-        if src == cnt.iv {
-            fresh_at(l, cnt, stale, b, k).then_some(0)
-        } else {
-            fresh_offset(f, l, cnt, stale, ndef, src, depth + 1)
-        }
-    };
+    let (b, k) = local_def(f, l, dom, x, at)?;
+    let src_off = |src: VReg| fresh_offset(f, l, dom, cnt, stale, src, (b, k), depth + 1);
     match f.blocks[b as usize].insts[k] {
         Inst::Mov(_, src) => src_off(src),
         Inst::IBinI(IOp::Add, it, _, src, c) if it.bits == 64 && c.abs() <= 1 << 20 => Some(src_off(src)? + c),
@@ -323,16 +387,7 @@ pub fn version_bounds_loops(options: &relax_session::Options, f: &mut Func) -> b
         }
         let Some(cnt) = counted(f, &l) else { continue };
         let Some(stale) = after_increment(f, &l, cnt.inc) else { continue };
-        let nv = f.vregs.len();
-        let mut ndef = vec![0u32; nv];
-        for b in &f.blocks {
-            for i in &b.insts {
-                for_defs(i, |d| ndef[d.0 as usize] += 1);
-            }
-        }
-        for p in &f.params {
-            ndef[p.0 as usize] += 1;
-        }
+        let dom = Dom::new(f);
         // the checks
         let mut facts: Vec<Taken> = Vec::new();
         let mut conds: Vec<(VReg, i64)> = Vec::new(); // (len, k)
@@ -360,17 +415,8 @@ pub fn version_bounds_loops(options: &relax_session::Options, f: &mut Func) -> b
             if !defs_in(f, &l, len).is_empty() || len == x {
                 continue;
             }
-            let k = if x == cnt.iv {
-                // the compare itself reads the counter
-                let at = bl.insts.iter().rposition(|i| matches!(i, Inst::ICmp(_, _, dd, _, _) if *dd == c)).unwrap();
-                if !fresh_at(&l, &cnt, &stale, b, at) {
-                    continue;
-                }
-                0
-            } else {
-                let Some(k) = fresh_offset(f, &l, &cnt, &stale, &ndef, x, 0) else { continue };
-                k
-            };
+            let at = bl.insts.iter().rposition(|i| matches!(i, Inst::ICmp(_, _, dd, _, _) if *dd == c)).unwrap();
+            let Some(k) = fresh_offset(f, &l, &dom, &cnt, &stale, x, (b, at), 0) else { continue };
             if k < 0 && cnt.step != 1 {
                 continue;
             }

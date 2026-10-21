@@ -221,6 +221,37 @@ fn negative_offset_needs_start() {
     run_cases(&orig, &new);
 }
 
+/// The clone renames the counter copy t although the original's panic block reads it (the clone
+/// cannot reach that block): later single-def passes and the vectoriser see a loop-local t.
+#[test]
+fn clone_renames_values_only_cold_blocks_read() {
+    let (_, new) = versioned(axpy(0, true));
+    let t = match new.blocks[2].insts[0] {
+        Inst::Mov(d, _) => d,
+        _ => unreachable!(),
+    };
+    let clone_defines_t = new.blocks[8..].iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Mov(d, _) if *d == t)));
+    assert!(!clone_defines_t);
+}
+
+/// The index copy also defined after the loop (a storage-dead zero, as lowering emits): the check
+/// is still proved, and the clone still renames it.
+#[test]
+fn outside_def_of_index_copy() {
+    let mut f = axpy(0, true);
+    let t = match f.blocks[2].insts[0] {
+        Inst::Mov(d, _) => d,
+        _ => unreachable!(),
+    };
+    f.blocks[5].insts.insert(0, Inst::Iconst(t, 0));
+    f.blocks[5].pos.insert(0, 1);
+    let (orig, new) = versioned(f);
+    let cold = |b: u32| matches!(new.blocks[b as usize].term, Term::Unreachable);
+    let clone_checks = new.blocks[8..].iter().filter(|b| matches!(b.term, Term::Branch(_, t, e) if cold(t) || cold(e))).count();
+    assert_eq!(clone_checks, 0);
+    run_cases(&orig, &new);
+}
+
 #[test]
 fn not_counted_left_alone() {
     // the bound redefined in the loop: no counted loop, nothing versioned
@@ -252,4 +283,47 @@ fn stale_read_after_increment_not_proved() {
     assert_eq!(clone_checks, 1);
     // memory comparison: the x read at i reaches index n, inside the 128-word buffer
     run_cases(&orig, &new);
+}
+
+/// The clone of `y[i] += k * x[i]` after rotation (one block): the stream-map vectoriser must take it.
+#[test]
+fn clone_shape_vectorises() {
+    let mut f = Func::new("axpy_clone".into(), 0);
+    let p: Vec<VReg> = (0..4).map(|_| f.vreg(Cls::I)).collect();
+    let k = f.vreg(Cls::F32);
+    let (y, ylen, x, _xlen) = (p[0], p[1], p[2], p[3]);
+    f.params.extend([p[0], p[1], p[2], p[3], k]);
+    for _ in 0..4 {
+        f.block();
+    }
+    let i = f.vreg(Cls::I);
+    let (c0, t, i2, off, xa, xv, m, ya, yv, s, c1) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::F32), f.vreg(Cls::F32), f.vreg(Cls::I), f.vreg(Cls::F32), f.vreg(Cls::F32), f.vreg(Cls::I));
+    push(&mut f, 0, Inst::Iconst(i, 0));
+    push(&mut f, 0, Inst::ICmp(Cond::Lt, false, c0, i, ylen));
+    term(&mut f, 0, Term::Branch(c0, 1, 2));
+    push(&mut f, 1, Inst::Mov(t, i));
+    push(&mut f, 1, Inst::IBinI(IOp::Add, U64, i2, i, 1));
+    push(&mut f, 1, Inst::Mov(i, i2));
+    push(&mut f, 1, Inst::IBinI(IOp::Shl, U64, off, t, 2));
+    push(&mut f, 1, Inst::IBin(IOp::Add, U64, xa, x, off));
+    push(&mut f, 1, Inst::Load(Mem::F32, xv, xa, 0));
+    push(&mut f, 1, Inst::FBin(FOp::Mul, false, m, k, xv));
+    push(&mut f, 1, Inst::IBin(IOp::Add, U64, ya, y, off));
+    push(&mut f, 1, Inst::Load(Mem::F32, yv, ya, 0));
+    push(&mut f, 1, Inst::FBin(FOp::Add, false, s, yv, m));
+    push(&mut f, 1, Inst::Store(Mem::F32, ya, 0, s));
+    push(&mut f, 1, Inst::ICmp(Cond::Lt, false, c1, i, ylen));
+    term(&mut f, 1, Term::Branch(c1, 1, 2));
+    term(&mut f, 2, Term::Ret(vec![]));
+    let mut g = f.clone();
+    let n0 = f.blocks.len();
+    let ch = relax_codegen::loops::vectorize_reductions(&relax_session::Options::default(), &mut f);
+    assert!(ch && f.blocks.len() > n0, "vectorised");
+    // t read in an unreachable block outside the loop (an original loop's panic block)
+    let b = g.block();
+    push(&mut g, b, Inst::Call(Callee::Host(Sym { id: 5, off: 0 }), vec![t, ylen], Vec::new()));
+    term(&mut g, b, Term::Unreachable);
+    let n0 = g.blocks.len();
+    let ch = relax_codegen::loops::vectorize_reductions(&relax_session::Options::default(), &mut g);
+    eprintln!("with outside read of t: vectorised {}", ch && g.blocks.len() > n0);
 }
