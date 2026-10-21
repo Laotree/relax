@@ -371,11 +371,19 @@ impl InlineStats {
     }
 }
 
+/// O3's caller growth ceiling: max(4x, +8000) instructions. Bottom-up inlining (callees bring
+/// their own inlining, priced by their optimised bodies) made the room usable: max(2x, +4000)
+/// refused html_parse's and maps' hot sites for budget (html 0.66, maps 0.97, text_shape 0.985,
+/// geomean 0.969 vs 2x); top-down, the same room had cost text_shape 5% and Stage 4.6% (INL3).
+pub fn growth_ceiling(size: usize) -> usize {
+    size.saturating_mul(4).max(size.saturating_add(8000))
+}
+
 impl InlineLimits {
     pub fn tier1_for(f: &Func) -> Self {
         let mut lim = Self::tier1();
         let size = inline_inst_count(f);
-        lim.growth_limit = Some(size.saturating_mul(2).max(size.saturating_add(4000)));
+        lim.growth_limit = Some(growth_ceiling(size));
         lim
     }
 }
@@ -434,7 +442,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
     let mut queue = BinaryHeap::new();
     let mut budget = lim.budget;
     let mut inst_count = inline_inst_count(f);
-    let mut growth_limit = lim.growth_limit.unwrap_or_else(|| inst_count.saturating_mul(2).max(inst_count.saturating_add(4000)));
+    let mut growth_limit = lim.growth_limit.unwrap_or_else(|| growth_ceiling(inst_count));
     // the size the ceiling sees: the actual size, but a priced callee counts its priced size
     let mut priced = inst_count;
     // Keep the separate raw-size free allowance.
@@ -4976,7 +4984,8 @@ mod inline_priority_tests {
         let mut f = callee(0);
         f.blocks[0].insts = vec![Inst::Call(Callee::Fn(1), vec![], vec![]); 200];
         f.blocks[0].pos = vec![0; 200];
-        let lim = InlineLimits::tier1_for(&f);
+        let mut lim = InlineLimits::tier1_for(&f);
+        lim.growth_limit = Some(4200);
         let mut stats = InlineStats::default();
         let inlined = inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &lim, None, Some(&mut stats));
         // Each inline grows by 24 instructions but costs only 22 budget units.
@@ -4995,11 +5004,11 @@ mod inline_priority_tests {
         let get = |id: u32| Some((if id == 3 { &free } else { &paid } as *const Func, 0));
         let mut f = caller();
         let lim = InlineLimits::tier1_for(&f);
-        assert_eq!(lim.growth_limit, Some(4002));
+        assert_eq!(lim.growth_limit, Some(8002));
         // Model growth from the first round; the original ceiling must still apply.
         let v = f.vreg(Cls::I);
-        f.blocks[0].insts.extend(vec![Inst::Iconst(v, 1); 4001]);
-        f.blocks[0].pos.extend(vec![0; 4001]);
+        f.blocks[0].insts.extend(vec![Inst::Iconst(v, 1); 8001]);
+        f.blocks[0].pos.extend(vec![0; 8001]);
         f.blocks[0].insts.push(Inst::Call(Callee::Fn(3), vec![], vec![]));
         f.blocks[0].pos.push(0);
         let mut stats = InlineStats::default();
@@ -5015,7 +5024,7 @@ mod inline_priority_tests {
         assert_eq!(InlineLimits::tier1_for(&callee(100)).budget, 4000);
         assert_eq!(InlineLimits::tier1_for(&callee(16000)).budget, 4000);
         assert_eq!(InlineLimits::tier1_for(&callee(30000)).budget, 4000);
-        assert_eq!(InlineLimits::tier1_for(&callee(16000)).growth_limit, Some(32000));
+        assert_eq!(InlineLimits::tier1_for(&callee(16000)).growth_limit, Some(64000));
     }
 
     #[test]
