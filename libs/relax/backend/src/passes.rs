@@ -3920,6 +3920,9 @@ pub fn noalias_roots(f: &Func, ndef: &[u32]) -> (Vec<u64>, Vec<u32>, Vec<u32>) {
     (root, captured, taint)
 }
 
+/// Expressions local_cse keeps available along a dominator path (oldest forgotten first).
+const CSE_AVAIL: usize = 48;
+
 pub fn local_cse(options: &relax_session::Options, f: &mut Func) -> bool {
     if !cse_can_change(f) {
         return false;
@@ -4307,8 +4310,12 @@ pub fn local_cse(options: &relax_session::Options, f: &mut Func) -> bool {
                         }
                         false
                     });
-                    // forward the stored value to later loads of the same cell
-                    if st.avail.len() < 48 {
+                    // forward the stored value to later loads of the same cell (a full table
+                    // forgets its oldest entry: the nearest expressions are the likely repeats)
+                    {
+                        if st.avail.len() >= CSE_AVAIL {
+                            st.avail.remove(0);
+                        }
                         let key = cse_key(&Inst::Load(m, VReg(0), base, off as i32)).unwrap();
                         st.avail.push((key, v, [base, v], true));
                         mentioned[v.0 as usize] = true;
@@ -4355,7 +4362,10 @@ pub fn local_cse(options: &relax_session::Options, f: &mut Func) -> bool {
                 }
             }
             if let (Some(d), false, Some(key)) = (cand, replaced, key) {
-                if st.avail.len() < 48 {
+                {
+                    if st.avail.len() >= CSE_AVAIL {
+                        st.avail.remove(0);
+                    }
                     let o0 = if !ops.is_empty() { ops[0] } else { VReg(u32::MAX) };
                     let o1 = if ops.len() > 1 { ops[1] } else { VReg(u32::MAX) };
                     st.avail.push((key, d, [o0, o1], is_load));
