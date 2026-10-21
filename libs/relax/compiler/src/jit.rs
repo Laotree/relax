@@ -9396,7 +9396,15 @@ impl InlineBodies {
                 };
                 let mut f = o1.clone();
                 f.baseline = false;
-                let mut taken = tier1_simplify(options, &mut f, ids[k], &o1.name, &sub, &|_, _| false, ro, cfg, nounwind, &mut structural, None);
+                let mut taken = if options.opt.iter().any(|t| t.trim() == "+buraw") {
+                    let lim = relax_codegen::opt::InlineLimits::tier1_for(&f);
+                    let freqs = structural(0, &f);
+                    let t = relax_codegen::opt::inline_calls_ordered(options, &mut f, ids[k], &sub, &|_, _| false, nounwind, &lim, freqs.as_deref(), None);
+                    relax_backend::passes::renumber_rpo(&mut f);
+                    t
+                } else {
+                    tier1_simplify(options, &mut f, ids[k], &o1.name, &sub, &|_, _| false, ro, cfg, nounwind, &mut structural, None)
+                };
                 if taken.is_empty() {
                     continue;
                 }
