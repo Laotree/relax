@@ -647,6 +647,18 @@ impl Cache {
         // which crates are bound to the loader's rustc build (provided.rs) is in the interface
         // fingerprints (items::apply_bound), so only the code that can reach a bound crate is keyed by it
         cfgh.u128(u.prog.session.options.fingerprint());
+        // the static a #[global_allocator] program's allocator shim calls: code inlining a shim
+        // caller (core::heap::alloc & co) is certified by crate fingerprints, which do not show
+        // whether or which allocator the program has (the static's type is in the shim callers'
+        // own keys, code_key_bytes)
+        match u.global_allocator_static() {
+            Some(s) => {
+                cfgh.u8(1);
+                cfgh.u128(crate_ident.get(prog.def(s).krate as usize).copied().unwrap_or(0));
+                cfgh.str(&prog.def_path(s));
+            }
+            None => cfgh.u8(0),
+        }
         let mut c = Cache {
             verbose,
             mode,
