@@ -4868,6 +4868,43 @@ impl<'a> Fcx<'a> {
 
     // ------------------------------------------------------------ expressions
 
+    /// `asm!` operands (Reference [asm.operand-type]): inputs are values, outputs places, a
+    /// `const` an integer constant; `sym` paths are resolved by lowering. The block is `()`, or
+    /// `!` with `options(noreturn)`. Register classes and operand types are checked when the
+    /// block is assembled (lowering), against the target's registers.
+    fn check_asm(&mut self, m: &MacCall) -> TyId {
+        let ast = self.ast();
+        let margs = ast.mac_arg(m.args);
+        let Some(spec) = margs.asm else { return self.tcx.tys.error };
+        for op in ast.list(spec.ops) {
+            match op.dir {
+                AsmDir::Sym | AsmDir::Const => {
+                    if let Some(x) = op.input {
+                        self.check_expr(x, None);
+                    }
+                }
+                _ => {
+                    if let Some(x) = op.input {
+                        let t = self.check_expr(x, None);
+                        if let Some(y) = op.output {
+                            if y != x {
+                                let u = self.check_expr(y, Some(t));
+                                let _ = u;
+                            }
+                        }
+                    } else if let Some(y) = op.output {
+                        self.check_expr(y, None);
+                    }
+                }
+            }
+        }
+        if spec.options & ASM_NORETURN != 0 {
+            self.tcx.tys.never
+        } else {
+            self.tcx.tys.unit
+        }
+    }
+
     pub fn check_expr(&mut self, e: ExprId, expected: Option<TyId>) -> TyId {
         crate::preempt::point();
         let _why = crate::why::enabled().then(|| crate::why::enter(self.prog.why_expr(
@@ -7513,10 +7550,18 @@ impl<'a> Fcx<'a> {
         }
         // `compile_error!("msg")` (what a failed built-in or derive leaves at its call): the
         // message is the error, as rustc reports it
-        // Relax has no assembler (user decision 2026-10-05): core::arch intrinsics instead
+        // inline assembly is assembled only with `--allow-asm` (user decision 2026-10-21)
         if matches!(name, "asm" | "global_asm" | "naked_asm") {
-            self.err(lo, "inline assembly is not supported; use core::arch intrinsics".to_string());
-            return self.tcx.tys.error;
+            if !self.prog.session.options.allow_asm {
+                self.err(lo, relax_session::options::ASM_GATE.to_string());
+                return self.tcx.tys.error;
+            }
+            if name != "asm" || m.args == NO_MAC_ARGS {
+                // global_asm! / naked_asm! as an expression: not where rustc accepts them
+                self.err(lo, format!("`{}!` is not allowed here", name));
+                return self.tcx.tys.error;
+            }
+            return self.check_asm(m);
         }
         if name == "compile_error" && m.toks.hi > m.toks.lo {
             let f = &self.prog.files[self.file as usize];

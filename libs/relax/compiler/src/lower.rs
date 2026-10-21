@@ -22,6 +22,7 @@ use crate::typeck::{Body, Coerce, Res};
 use crate::types::{TyId, TyKind};
 use crate::fxhash::HashMap;
 
+mod asm;
 mod match_tree;
 mod simd;
 
@@ -10787,11 +10788,8 @@ impl<'a> Lcx<'a> {
         let margs = ast.mac_arg(m.args);
         let mexprs = ast.list(margs.exprs);
         match name {
-            "asm" => {
-                // rejected by typeck (no assembler in Relax)
-                self.err(self.pos, "inline assembly is not supported; use core::arch intrinsics".to_string());
-                self.unit()
-            }
+            // assembled with `--allow-asm` (typeck reports the gate otherwise)
+            "asm" => self.lower_asm(margs),
             "assert" => {
                 let c = mexprs[0];
                 let ok = self.f.block();

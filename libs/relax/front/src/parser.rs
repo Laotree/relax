@@ -779,16 +779,30 @@ impl<'a> Parser<'a> {
                         b"noreturn" => spec.options |= ASM_NORETURN,
                         b"raw" => spec.options |= ASM_RAW,
                         b"att_syntax" => spec.options |= ASM_ATT_SYNTAX,
-                        b"pure" | b"nomem" | b"readonly" | b"preserves_flags" | b"nostack" | b"may_unwind" | b"," => {}
+                        b"pure" => spec.options |= ASM_PURE,
+                        b"nomem" => spec.options |= ASM_NOMEM,
+                        b"readonly" => spec.options |= ASM_READONLY,
+                        b"preserves_flags" => spec.options |= ASM_PRESERVES_FLAGS,
+                        b"nostack" => spec.options |= ASM_NOSTACK,
+                        b"may_unwind" => spec.options |= ASM_MAY_UNWIND,
+                        b"," => {}
                         _ => return self.err("unknown asm! option"),
                     }
                 }
                 self.expect(T::CloseParen)?;
             } else if self.is_word(0, b"clobber_abi") && self.nth(1) == T::OpenParen {
-                // the stub is a C call: every caller-saved register is clobbered already
                 self.pos += 2;
                 while self.kind() != T::CloseParen && self.kind() != T::Eof {
-                    self.pos += 1;
+                    let t = self.bump();
+                    if matches!(t.kind, T::Str) {
+                        let lit = self.text_of(t);
+                        spec.options |= match lit {
+                            b"\"C\"" | b"\"system\"" | b"\"efiapi\"" | b"\"C-unwind\"" | b"\"system-unwind\"" => ASM_CLOBBER_C,
+                            b"\"sysv64\"" | b"\"sysv64-unwind\"" => ASM_CLOBBER_SYSV64,
+                            b"\"win64\"" | b"\"win64-unwind\"" => ASM_CLOBBER_WIN64,
+                            _ => ASM_CLOBBER_UNKNOWN,
+                        };
+                    }
                 }
                 self.expect(T::CloseParen)?;
             } else {
