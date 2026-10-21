@@ -2552,7 +2552,8 @@ fn equal_copies(options: &relax_session::Options, f: &Func, reach: &[bool], tab:
         for i in &b.insts {
             let (d, s2, cast) = match *i {
                 Inst::Mov(d, s2) => (d, s2, 0),
-                Inst::Conv(Conv::IntToInt(it), d, s2) => (d, s2, it.bits),
+                // (bits | 0x80 for a signed target)
+                Inst::Conv(Conv::IntToInt(it), d, s2) => (d, s2, it.bits | if it.signed { 0x80 } else { 0 }),
                 _ => continue,
             };
             if d == s2 || f.vregs[d.0 as usize] != f.vregs[s2.0 as usize] || f.vregs[d.0 as usize].is_vec() || remat[d.0 as usize].is_some() || remat[s2.0 as usize].is_some() {
@@ -2597,7 +2598,7 @@ fn equal_copies(options: &relax_session::Options, f: &Func, reach: &[bool], tab:
             continue;
         }
         // a cast is a plain move: its upper bits nobody reads, or its source zero above fewer bits
-        if cast != 0 && !(low[d as usize] || (zero[s2 as usize] > 0 && zero[s2 as usize] < cast)) {
+        if cast != 0 && !(low[d as usize] || crate::passes::cast_is_move(zero[s2 as usize], IntTy { bits: cast & 0x7f, signed: cast & 0x80 != 0 })) {
             continue;
         }
         let rd = ranges.of(d);

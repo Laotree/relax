@@ -3444,7 +3444,7 @@ impl<'a> Gen<'a> {
                 let rd = self.def_i(d, S0);
                 // zero above fewer bits than the target: the extension is the value itself
                 let z = self.zero_above[s.0 as usize];
-                if self.low_only[d.0 as usize] || (z > 0 && z < it.bits) {
+                if self.low_only[d.0 as usize] || crate::passes::cast_is_move(z, it) {
                     self.a.mov(rd, rs);
                 } else {
                     self.a.extend(rd, rs, it.bits, it.signed);

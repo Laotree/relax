@@ -449,6 +449,13 @@ pub fn low_bits_only(options: &relax_session::Options, f: &Func) -> Vec<bool> {
     ok
 }
 
+/// A cast to `it` of a value whose register is zero above `z` bits (zero_above; 0 unknown) is the
+/// value itself: a zero-extension from `it.bits` when z <= bits, a sign-extension only when z < bits
+/// (bit bits - 1 is then zero too).
+pub fn cast_is_move(z: u8, it: IntTy) -> bool {
+    z > 0 && (z < it.bits || (!it.signed && z == it.bits))
+}
+
 /// Values whose register is known zero above some bit: per vreg (over all its definitions and copies), that bit count
 /// (0: unknown): an unsigned narrow load (`ldrb` / movzx), an And with a non-negative mask, an
 /// unsigned cast that keeps its extension (`low`: passes::low_bits_only, whose casts leave the
@@ -1547,6 +1554,7 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
         }
         // unsigned division / remainder by a constant: multiply-high and shifts
         changed |= div_by_const(f, &kn, nv);
+        changed |= div_rem_pairs(f);
         pass_time(0, tf);
         let t = pass_clock();
         trace_opt(f, "fold");
@@ -2703,6 +2711,101 @@ pub fn renumber_rpo(f: &mut Func) {
 /// inlining and branch folding), so compares end up next to their branches.
 #[inline(never)]
 /// libdivide's unsigned 64-bit magic for d > 1 not a power of two: (magic, shift, add)
+/// A remainder of operands a block also divides (`x / n` and `x % n`: an index split into row
+/// and column) is `a - (a / b) * b` from that quotient: one division instead of two (LLVM's
+/// DivRemPairs; x64 `div` and arm64 `udiv` are tens of cycles, the multiply and subtract a few).
+/// The division moves up to the remainder when it comes later and nothing between needs it moved.
+pub fn div_rem_pairs(f: &mut Func) -> bool {
+    let mut changed = false;
+    let (mut us, mut ds) = (Vec::new(), Vec::new());
+    for bi in 0..f.blocks.len() {
+        if !f.blocks[bi].insts.iter().any(|i| matches!(i, Inst::IBin(IOp::Rem, ..))) {
+            continue;
+        }
+        let mut k = 0;
+        while k < f.blocks[bi].insts.len() {
+            let Inst::IBin(IOp::Rem, it, r, a, b) = f.blocks[bi].insts[k] else {
+                k += 1;
+                continue;
+            };
+            let insts = &f.blocks[bi].insts;
+            // touches(i, v): i defines v; reads(i, v): i reads v
+            let mut defines = |i: &Inst, v: VReg| {
+                crate::regalloc::uses_defs(i, &mut us, &mut ds);
+                ds.contains(&v)
+            };
+            // an earlier division of the same operands, its quotient still there
+            let mut q = None;
+            for j in (0..k).rev() {
+                if let Inst::IBin(IOp::Div, it2, q2, a2, b2) = insts[j] {
+                    if it2 == it && a2 == a && b2 == b && q2 != a && q2 != b {
+                        q = Some((j, q2));
+                        break;
+                    }
+                }
+                if defines(&insts[j], a) || defines(&insts[j], b) {
+                    break;
+                }
+            }
+            let mut hoist = None;
+            if let Some((j, q2)) = q {
+                if insts[j + 1..k].iter().any(|i| {
+                    crate::regalloc::uses_defs(i, &mut us, &mut ds);
+                    ds.contains(&q2)
+                }) {
+                    q = None;
+                }
+            } else if r != a && r != b {
+                // a later one: it moves up to just before the remainder when its quotient is
+                // neither read nor written in between (nor is a or b written)
+                for m in k + 1..insts.len() {
+                    if let Inst::IBin(IOp::Div, it2, q2, a2, b2) = insts[m] {
+                        if it2 == it && a2 == a && b2 == b && q2 != a && q2 != b && q2 != r {
+                            let clear = insts[k + 1..m].iter().all(|i| {
+                                crate::regalloc::uses_defs(i, &mut us, &mut ds);
+                                !us.contains(&q2) && !ds.contains(&q2)
+                            });
+                            if clear {
+                                hoist = Some((m, q2));
+                            }
+                            break;
+                        }
+                    }
+                    crate::regalloc::uses_defs(&insts[m], &mut us, &mut ds);
+                    if ds.contains(&a) || ds.contains(&b) {
+                        break;
+                    }
+                }
+            }
+            let qv = match (q, hoist) {
+                (Some((_, q2)), _) => q2,
+                (None, Some((m, q2))) => {
+                    let blk = &mut f.blocks[bi];
+                    let div = blk.insts.remove(m);
+                    let p = blk.pos.remove(m);
+                    blk.insts.insert(k, div);
+                    blk.pos.insert(k, p);
+                    k += 1;
+                    q2
+                }
+                _ => {
+                    k += 1;
+                    continue;
+                }
+            };
+            let t = f.vreg(Cls::I);
+            let blk = &mut f.blocks[bi];
+            let p = blk.pos[k];
+            blk.insts[k] = Inst::IBin(IOp::Mul, it, t, qv, b);
+            blk.insts.insert(k + 1, Inst::IBin(IOp::Sub, it, r, a, t));
+            blk.pos.insert(k + 1, p);
+            changed = true;
+            k += 2;
+        }
+    }
+    changed
+}
+
 pub fn udiv_magic(d: u64) -> (u64, u32, bool) {
     let l = 63 - d.leading_zeros();
     let num: u128 = 1u128 << (64 + l);
