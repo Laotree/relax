@@ -9230,34 +9230,39 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
             relax_backend::passes::set_sroa_nocapture(None);
         }
     }
+    // what a bottom-up preparation reads (InlineBodies::prepare): recorded while one runs
+    let reads: std::cell::RefCell<Option<PrepReads>> = std::cell::RefCell::new(None);
     let _guard = NocapGuard;
     {
-        // SAFETY: the oracle borrows `get` only while this function runs: the guard removes it
+        // SAFETY: the oracle borrows `get` and `reads` only while this function runs: the guard removes it
         // before `get` goes out of scope, also when the optimiser panics
         let get_static: &'static dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)> = unsafe { std::mem::transmute(get) };
         // callees' params, depth-limited (a Vec's push -> reserve -> grow -> realloc chain);
         // false for a query already in progress (recursion). Memoised per (callee, param, depth)
         // only when no answer below came from an in-progress query, so every answer is the one a
-        // fresh query gives, whatever was asked before: the bottom-up preparations an O3 build
-        // shares with another (PREP_SHARED) must not depend on the order of the other's queries.
-        // Returns (answer, depended on an in-progress query).
-        fn nocap(get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, memo: &std::cell::RefCell<HashMap<(u32, usize, u32), Option<bool>>>, cid: u32, k: usize, depth: u32) -> (bool, bool) {
+        // fresh query gives, whatever was asked before; each answer keeps the slots it read, which
+        // a bottom-up preparation's read set takes in (PrepShared). Returns (answer, depended on an
+        // in-progress query); `out` gets the slots read.
+        type NocapMemo = std::cell::RefCell<HashMap<(u32, usize, u32), Option<(bool, Vec<u32>)>>>;
+        fn nocap(get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, memo: &NocapMemo, cid: u32, k: usize, depth: u32, out: &mut Vec<u32>) -> (bool, bool) {
             if depth == 0 {
                 return (false, false);
             }
             match memo.borrow().get(&(cid, k, depth)) {
-                Some(Some(r)) => return (*r, false),
+                Some(Some((r, reads))) => { out.extend_from_slice(reads); return (*r, false); }
                 Some(None) => return (false, true),
                 None => {}
             }
-            let Some((fp, _)) = get(cid) else { return (false, false) };
+            let mut reads = vec![cid];
+            let Some((fp, _)) = get(cid) else { out.push(cid); return (false, false) };
             memo.borrow_mut().insert((cid, k, depth), None);
             let f2 = unsafe { &*fp };
             let tainted = std::cell::Cell::new(false);
+            let sub_reads = std::cell::RefCell::new(Vec::new());
             let sub = |c2: &relax_backend::rir::Callee, k2: usize| -> bool {
                 match c2 {
                     relax_backend::rir::Callee::Fn(i2) => {
-                        let (r, t) = nocap(get, memo, *i2, k2, depth - 1);
+                        let (r, t) = nocap(get, memo, *i2, k2, depth - 1, &mut sub_reads.borrow_mut());
                         if t { tainted.set(true); }
                         r
                     }
@@ -9265,17 +9270,25 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
                 }
             };
             let r = relax_codegen::opt::param_nocapture(f2, k, &sub);
+            reads.extend(sub_reads.into_inner());
+            reads.sort_unstable();
+            reads.dedup();
+            out.extend_from_slice(&reads);
             if tainted.get() {
                 memo.borrow_mut().remove(&(cid, k, depth));
             } else {
-                memo.borrow_mut().insert((cid, k, depth), Some(r));
+                memo.borrow_mut().insert((cid, k, depth), Some((r, reads)));
             }
             (r, tainted.get())
         }
-        let memo: std::cell::RefCell<HashMap<(u32, usize, u32), Option<bool>>> = std::cell::RefCell::new(HashMap::new());
+        let memo: NocapMemo = std::cell::RefCell::new(HashMap::new());
+        let reads_static: &'static std::cell::RefCell<Option<PrepReads>> = unsafe { std::mem::transmute(&reads) };
         relax_backend::passes::set_sroa_nocapture(Some(Box::new(move |c: &relax_backend::rir::Callee, k: usize| -> bool {
             let relax_backend::rir::Callee::Fn(cid) = c else { return false };
-            nocap(get_static, &memo, *cid, k, 4).0
+            let mut rd = Vec::new();
+            let r = nocap(get_static, &memo, *cid, k, 4, &mut rd).0;
+            if let Some(rec) = reads_static.borrow_mut().as_mut() { rec.bodies.extend(rd); }
+            r
         })));
     }
     static INLINE_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -9286,7 +9299,11 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     // fits, else the snapshot body (top-down). A pure function of the snapshot, so replay stays
     // exact.
     let tp = cpu_ns();
-    let bodies = InlineBodies::prepare(options, id, snap, get, single, ro, cfg, nounwind);
+    let get_rec = |c: u32| {
+        if let Some(r) = reads.borrow_mut().as_mut() { r.bodies.push(c); }
+        get(c)
+    };
+    let bodies = InlineBodies::prepare(options, id, snap, &get_rec, &reads, single, ro, cfg, nounwind);
     TIER1_PREP[0].fetch_add(cpu_ns() - tp, Ordering::Relaxed);
     TIER1_PREP[2].fetch_add(bodies.index.len() as u64, Ordering::Relaxed);
     let prepared = |c: u32| bodies.prepared(c);
@@ -9402,14 +9419,28 @@ struct Prepared {
     deps: Vec<u32>,
 }
 
-/// A callee's preparation, kept for the next O3 build of this run that sees the same inputs. A
-/// preparation reads the snapshot bodies reachable from the callee (their attributes, which slots
-/// are absent, the single-caller facts), nothing else: `fp` fingerprints those, naming each body
-/// by its address. `_pins` keep those bodies' allocations, so no other body can take one of the
-/// addresses while the entry lives. One entry per slot: a changed input replaces it.
+/// What one bottom-up preparation read: snapshot bodies (and absent slots) by slot, through the
+/// inliner, its chain and size queries, nounwind and the nocapture oracle; other callees'
+/// preparations; single-caller facts.
+#[derive(Default)]
+struct PrepReads {
+    bodies: Vec<u32>,
+    prepared: Vec<(u32, usize)>,
+    singles: Vec<(u32, u32, bool)>,
+}
+
+/// A callee's preparation, kept for the next O3 build of this run whose snapshot gives the same
+/// answers to everything it read (LLVM processes a callee once, bottom-up over the whole program;
+/// O3 builds see per-caller snapshots, so a callee's preparation is shared when its reads agree).
+/// Bodies are named by address, preparations by the address of their `Prepared`: `_pins` keep
+/// those allocations, so no other body or preparation can take an address while the entry lives.
 struct PrepShared {
-    fp: u128,
-    _pins: Vec<std::sync::Weak<relax_backend::rir::Func>>,
+    /// (slot, body address or 0 when absent, attributes)
+    bodies: Vec<(u32, usize, u8)>,
+    /// (slot, its preparation's address or 0 when it had none)
+    prepared: Vec<(u32, usize)>,
+    singles: Vec<(u32, u32, bool)>,
+    _pins: (Vec<std::sync::Weak<relax_backend::rir::Func>>, Vec<std::sync::Weak<Prepared>>),
     /// None: its first round inlined nothing (its callers take the snapshot body)
     body: Option<std::sync::Arc<Prepared>>,
     /// the nounwind answers the preparation consulted: asked again when the entry is taken, so
@@ -9417,7 +9448,10 @@ struct PrepShared {
     nounwind: Vec<u32>,
 }
 
-static PREP_SHARED: std::sync::LazyLock<relax_session::sync::Mutex<HashMap<u32, PrepShared>>> = std::sync::LazyLock::new(|| relax_session::sync::Mutex::new(HashMap::new()));
+/// Preparations kept per slot (callers whose snapshots differ below it)
+const PREP_SHARED_PER_SLOT: usize = 4;
+
+static PREP_SHARED: std::sync::LazyLock<relax_session::sync::Mutex<HashMap<u32, Vec<std::sync::Arc<PrepShared>>>>> = std::sync::LazyLock::new(|| relax_session::sync::Mutex::new(HashMap::new()));
 
 /// Strongly connected components of a graph (Tarjan, iterative): callees first.
 fn sccs(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
@@ -9458,7 +9492,7 @@ fn sccs(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
 }
 
 impl InlineBodies {
-    fn prepare(options: &crate::options::Options, root: u32, snap: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool) -> Self {
+    fn prepare(options: &crate::options::Options, root: u32, snap: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, reads: &std::cell::RefCell<Option<PrepReads>>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool) -> Self {
         use relax_backend::rir::{Callee, Inst, Term};
         let mut out = InlineBodies { index: HashMap::new() };
         if !cfg.inline {
@@ -9466,74 +9500,38 @@ impl InlineBodies {
         }
         // nodes: the snapshot, deduplicated in order (the lookup takes the first)
         let mut ids: Vec<u32> = Vec::new();
-        let mut arcs: Vec<&std::sync::Arc<relax_backend::rir::Func>> = Vec::new();
         let mut node: HashMap<u32, usize> = HashMap::new();
+        let mut arc_of: HashMap<u32, &std::sync::Arc<relax_backend::rir::Func>> = HashMap::new();
         for (c, body, _) in snap {
+            arc_of.entry(*c).or_insert(body);
             if *c != root && !node.contains_key(c) {
                 node.insert(*c, ids.len());
                 ids.push(*c);
-                arcs.push(body);
             }
         }
         let body = |k: usize| unsafe { &*get(ids[k]).unwrap().0 };
         // the calls a preparation inlines (outside cold blocks): the order it runs in
-        let mut refs_all: Vec<Vec<u32>> = Vec::with_capacity(ids.len());
         let edges: Vec<Vec<usize>> = (0..ids.len()).map(|k| {
-            let (mut e, mut all) = (Vec::new(), Vec::new());
+            let mut e = Vec::new();
             for b in &body(k).blocks {
-                let cold = matches!(b.term, Term::Unreachable | Term::Resume);
+                if matches!(b.term, Term::Unreachable | Term::Resume) { continue; }
                 for i in &b.insts {
                     if let Inst::Call(Callee::Fn(c), _, _) | Inst::FnAddr(_, c) = i {
-                        if !all.contains(c) { all.push(*c); }
-                        if cold { continue; }
                         if let Some(&n) = node.get(c) {
                             if n != k && !e.contains(&n) { e.push(n); }
                         }
                     }
                 }
             }
-            refs_all.push(all);
             e
         }).collect();
-        // What a preparation can read: every body reachable over all references (cold blocks,
-        // addresses taken: the nocapture and chain queries look there too). One hash per
-        // component of that graph, callees first: its members (slot, body address, attributes),
-        // the absent slots they name, the single-caller facts they own, its callee components.
-        let all_edges: Vec<Vec<usize>> = refs_all.iter().map(|r| r.iter().filter_map(|c| node.get(c).copied()).collect()).collect();
-        let comps = sccs(&all_edges);
-        let mut comp_of = vec![0usize; ids.len()];
-        for (ci, comp) in comps.iter().enumerate() {
-            for &k in comp { comp_of[k] = ci; }
-        }
-        let singles_on = relax_codegen::opt::single_on(options);
-        let mut comp_hash: Vec<u128> = vec![0; comps.len()];
-        for (ci, comp) in comps.iter().enumerate() {
-            let mut h = crate::sip::Sip128::new();
-            let mut members = comp.clone();
-            members.sort_by_key(|&k| ids[k]);
-            for &k in &members {
-                h.u32(ids[k]);
-                h.u64(std::sync::Arc::as_ptr(arcs[k]) as u64);
-                h.u8(get(ids[k]).unwrap().1);
-                for &c in &refs_all[k] {
-                    match node.get(&c) {
-                        None => { h.u8(1); h.u32(c); }
-                        Some(_) if singles_on && single(ids[k], c) => { h.u8(2); h.u32(c); }
-                        Some(_) => {}
-                    }
-                }
-            }
-            let mut sub: Vec<u128> = comp.iter().flat_map(|&k| all_edges[k].iter().map(|&m| comp_of[m])).filter(|&d| d != ci).map(|d| comp_hash[d]).collect();
-            sub.sort_unstable();
-            sub.dedup();
-            for x in sub { h.u128(x); }
-            comp_hash[ci] = h.finish128();
-        }
         // A body above the largest admission size never inlines into a caller (rules of
         // site_rule): no preparation for it.
+        let singles_on = relax_codegen::opt::single_on(options);
         let max_insts = if singles_on { relax_codegen::opt::INLINE_SINGLE_INSTS } else { relax_codegen::opt::InlineLimits::tier1().always_insts };
         let mut structural = |_: usize, f: &relax_backend::rir::Func| (!options.no_block_freq).then(|| inline_structural_freqs(f));
         let stats_on = std::env::var("MAKEPAD_RUN_INLINE_STATS").is_ok_and(|v| v == "prep");
+        let addr = |b: &Option<std::sync::Arc<Prepared>>| b.as_ref().map_or(0, |b| std::sync::Arc::as_ptr(b) as usize);
         for scc in &sccs(&edges) {
             for &k in scc {
                 let (p, attrs) = get(ids[k]).unwrap();
@@ -9541,34 +9539,47 @@ impl InlineBodies {
                 if attrs & relax_codegen::opt::ATTR_COLD != 0 || edges[k].is_empty() || relax_codegen::opt::inst_count(o1) > max_insts {
                     continue;
                 }
-                let fp = {
-                    let mut h = crate::sip::Sip128::new();
-                    h.u32(ids[k]);
-                    h.u128(comp_hash[comp_of[k]]);
-                    h.finish128()
-                };
-                let shared = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner()).get(&ids[k]).filter(|e| e.fp == fp).map(|e| (e.body.clone(), e.nounwind.clone()));
-                if let Some((b, asked)) = shared {
-                    TIER1_PREP[3].fetch_add(1, Ordering::Relaxed);
-                    for c in asked { nounwind(c); }
-                    if let Some(b) = b { out.index.insert(ids[k], b); }
-                    continue;
-                }
                 let peers: &[usize] = scc;
                 let in_scc = |c: u32| node.get(&c).is_some_and(|m| peers.contains(m));
-                let sub_prepared = |c: u32| if in_scc(c) { None } else { out.prepared(c) };
+                let sub = |c: u32| if in_scc(c) { None } else { out.index.get(&c).cloned() };
+                // a preparation of this slot whose reads this snapshot answers the same way
+                let agrees = |e: &PrepShared| {
+                    e.bodies.iter().all(|&(c, a, at)| get(c).map_or(a == 0, |(q, qa)| q as usize == a && qa == at))
+                        && e.prepared.iter().all(|&(c, a)| addr(&sub(c)) == a)
+                        && e.singles.iter().all(|&(o, c, v)| single(o, c) == v)
+                };
+                let shared = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner()).get(&ids[k]).and_then(|v| v.iter().find(|e| agrees(e)).cloned());
+                if let Some(e) = shared {
+                    TIER1_PREP[3].fetch_add(1, Ordering::Relaxed);
+                    for &c in &e.nounwind { nounwind(c); }
+                    if let Some(b) = &e.body { out.index.insert(ids[k], b.clone()); }
+                    continue;
+                }
+                *reads.borrow_mut() = Some(PrepReads { bodies: vec![ids[k]], ..Default::default() });
+                let sub_prepared = |c: u32| {
+                    let b = sub(c);
+                    if let Some(r) = reads.borrow_mut().as_mut() { r.prepared.push((c, addr(&b))); }
+                    b.map(|b| (&b.raw as *const relax_backend::rir::Func, &b.priced as *const relax_backend::rir::Func))
+                };
+                let single_rec = |o: u32, c: u32| {
+                    let v = single(o, c);
+                    if let Some(r) = reads.borrow_mut().as_mut() { r.singles.push((o, c, v)); }
+                    v
+                };
                 let asked = std::cell::RefCell::new(Vec::new());
                 let recording = |c: u32| {
                     let mut a = asked.borrow_mut();
                     if !a.contains(&c) { a.push(c); }
                     drop(a);
+                    if let Some(r) = reads.borrow_mut().as_mut() { r.bodies.push(c); }
                     nounwind(c)
                 };
                 let mut f = o1.clone();
                 f.baseline = false;
                 let mut raw = (relax_backend::rir::Func::new(String::new(), 0), Vec::new());
                 let mut stats = stats_on.then(relax_codegen::opt::InlineStats::default);
-                tier1_simplify(options, &mut f, ids[k], &o1.name, get, &sub_prepared, single, ro, cfg, &recording, &mut structural, stats.as_mut(), Some(&mut raw));
+                tier1_simplify(options, &mut f, ids[k], &o1.name, get, &sub_prepared, &single_rec, ro, cfg, &recording, &mut structural, stats.as_mut(), Some(&mut raw));
+                let rd = reads.borrow_mut().take().unwrap();
                 TIER1_PREP[1].fetch_add(1, Ordering::Relaxed);
                 if let Some(st) = stats { st.report(&format!("prep:{} (root {})", o1.name, root)); }
                 let (raw, mut taken) = raw;
@@ -9576,20 +9587,33 @@ impl InlineBodies {
                     out.expand(&mut taken);
                     std::sync::Arc::new(Prepared { raw, priced: f, deps: taken.into_iter().map(|x| x.0).collect() })
                 });
-                // the bodies the fingerprint names: everything reachable from k
-                let mut pins = Vec::new();
-                let mut seen = vec![false; comps.len()];
-                let mut work = vec![comp_of[k]];
-                seen[comp_of[k]] = true;
-                while let Some(ci) = work.pop() {
-                    for &m in &comps[ci] {
-                        pins.push(std::sync::Arc::downgrade(arcs[m]));
-                        for &d in &all_edges[m] {
-                            if !seen[comp_of[d]] { seen[comp_of[d]] = true; work.push(comp_of[d]); }
-                        }
+                let mut slots = rd.bodies;
+                slots.sort_unstable();
+                slots.dedup();
+                let mut pins = (Vec::new(), Vec::new());
+                let bodies: Vec<(u32, usize, u8)> = slots.iter().map(|&c| match get(c) {
+                    Some((q, at)) => {
+                        if let Some(a) = arc_of.get(&c) { pins.0.push(std::sync::Arc::downgrade(a)); }
+                        (c, q as usize, at)
                     }
+                    None => (c, 0, 0),
+                }).collect();
+                let mut prepared_reads = rd.prepared;
+                prepared_reads.sort_unstable();
+                prepared_reads.dedup();
+                for &(c, _) in &prepared_reads {
+                    if let Some(b) = sub(c) { pins.1.push(std::sync::Arc::downgrade(&b)); }
                 }
-                PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner()).insert(ids[k], PrepShared { fp, _pins: pins, body: prepared.clone(), nounwind: asked.into_inner() });
+                let mut singles = rd.singles;
+                singles.sort_unstable();
+                singles.dedup();
+                let e = std::sync::Arc::new(PrepShared { bodies, prepared: prepared_reads, singles, _pins: pins, body: prepared.clone(), nounwind: asked.into_inner() });
+                {
+                    let mut g = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner());
+                    let v = g.entry(ids[k]).or_default();
+                    if v.len() >= PREP_SHARED_PER_SLOT { v.remove(0); }
+                    v.push(e);
+                }
                 if let Some(b) = prepared { out.index.insert(ids[k], b); }
             }
         }
