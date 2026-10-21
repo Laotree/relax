@@ -45,6 +45,82 @@ extern "C" fn relax_web_memory_grow(mem: u32, delta: usize) -> usize {
     if delta == 0 { relax_web_memory_size(mem) } else { usize::MAX }
 }
 
+/// A thread blocked in `relax_web_atomic_wait32`: woken once its flag is set.
+struct Waiter {
+    woken: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+/// The threads waiting on each address (`memory.atomic.wait32` / `notify` over this process's
+/// threads: the page's instructions are the real thing, this is their semantics on the trace host).
+static WAITERS: std::sync::Mutex<Vec<(usize, std::sync::Arc<Waiter>)>> = std::sync::Mutex::new(Vec::new());
+
+/// `memory.atomic.wait32`: 0 = woken by a notify, 1 = `*addr != expected`, 2 = timed out; a negative
+/// timeout waits forever. The value check and the registration are atomic against `notify`.
+extern "C" fn relax_web_atomic_wait32(addr: *mut i32, expected: i32, timeout_ns: i64) -> i32 {
+    let a = unsafe { &*(addr as *const std::sync::atomic::AtomicI32) };
+    let w = std::sync::Arc::new(Waiter { woken: std::sync::Mutex::new(false), cv: std::sync::Condvar::new() });
+    {
+        let mut table = WAITERS.lock().unwrap();
+        if a.load(Ordering::SeqCst) != expected {
+            return 1;
+        }
+        table.push((addr as usize, w.clone()));
+    }
+    let deadline = if timeout_ns < 0 { None } else { Some(std::time::Instant::now() + std::time::Duration::from_nanos(timeout_ns as u64)) };
+    let mut woken = w.woken.lock().unwrap();
+    while !*woken {
+        match deadline {
+            None => woken = w.cv.wait(woken).unwrap(),
+            Some(d) => {
+                let now = std::time::Instant::now();
+                if now >= d {
+                    break;
+                }
+                woken = w.cv.wait_timeout(woken, d - now).unwrap().0;
+            }
+        }
+    }
+    if *woken {
+        return 0;
+    }
+    drop(woken);
+    // timed out: leave the table unless a notify took this waiter in the meantime
+    let mut table = WAITERS.lock().unwrap();
+    match table.iter().position(|(_, x)| std::sync::Arc::ptr_eq(x, &w)) {
+        Some(i) => {
+            table.remove(i);
+            2
+        }
+        None => 0,
+    }
+}
+
+/// `memory.atomic.notify`: wakes up to `count` waiters of `addr`, oldest first; how many.
+extern "C" fn relax_web_atomic_notify(addr: *mut i32, count: u32) -> u32 {
+    let mut table = WAITERS.lock().unwrap();
+    let mut n = 0;
+    let mut i = 0;
+    while i < table.len() && n < count {
+        if table[i].0 == addr as usize {
+            let (_, w) = table.remove(i);
+            *w.woken.lock().unwrap() = true;
+            w.cv.notify_one();
+            n += 1;
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
+
+/// The trace host's output channel for tests (the program's `extern "C" { fn relax_web_print }`):
+/// `len` bytes at `ptr` to stderr.
+extern "C" fn relax_web_print(ptr: *const u8, len: usize) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(unsafe { std::slice::from_raw_parts(ptr, len) });
+}
+
 /// The embedder's page-side symbols (the program's `extern "C"` imports of `env`), asked first.
 static EMBEDDER: AtomicUsize = AtomicUsize::new(0);
 
@@ -65,6 +141,9 @@ pub fn symbol(name: &[u8]) -> Option<usize> {
     match name {
         b"relax_web_memory_size" => Some(relax_web_memory_size as *const () as usize),
         b"relax_web_memory_grow" => Some(relax_web_memory_grow as *const () as usize),
+        b"relax_web_atomic_wait32" => Some(relax_web_atomic_wait32 as *const () as usize),
+        b"relax_web_atomic_notify" => Some(relax_web_atomic_notify as *const () as usize),
+        b"relax_web_print" => Some(relax_web_print as *const () as usize),
         _ => None,
     }
 }
