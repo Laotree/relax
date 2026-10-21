@@ -665,6 +665,39 @@ pub enum Callee {
     CIndirect(VReg, Box<CSig>),
     /// direct call of a Relax `extern "C" fn` (function table slot)
     CFn(u32, Box<CSig>),
+    /// an inline assembly block (`asm!`, gated by `--allow-asm`): the call's arguments are its
+    /// inputs and its results its outputs, each in the block's register. Every pass sees it as a
+    /// call (side effects, memory, no motion); the register allocator keeps all other values out
+    /// of its registers over it (`AsmBlock::regs`); the backend emits the bytes in place.
+    Asm(Box<AsmBlock>),
+}
+
+/// The options of an inline assembly block (Reference [asm.options]) that the backend reads.
+pub const ASM_NORETURN: u32 = 1;
+pub const ASM_NOSTACK: u32 = 2;
+pub const ASM_NOMEM: u32 = 4;
+pub const ASM_READONLY: u32 = 8;
+pub const ASM_PURE: u32 = 16;
+pub const ASM_PRESERVES_FLAGS: u32 = 32;
+
+/// An `asm!` block assembled at lowering (`asm` module): its machine code, with its operands
+/// in fixed registers.
+#[derive(Clone, PartialEq, Debug)]
+pub struct AsmBlock {
+    pub code: Vec<u8>,
+    /// fields that hold a symbol's value: (offset in `code`, encoding, symbol)
+    pub fixups: Vec<(u32, crate::asm::FixKind, Sym)>,
+    /// the register of each input (the call's argument vregs, in order)
+    pub ins: Vec<crate::asm::PReg>,
+    /// the register of each output (the call's result vregs, in order)
+    pub outs: Vec<crate::asm::PReg>,
+    /// every register the block reads or may write (`PReg::bit`): inputs, outputs, discarded
+    /// outputs, clobbers. No other value is held in them over the block.
+    pub regs: u64,
+    /// the registers it may write: callee-saved ones among them are saved by the prologue
+    pub writes: u64,
+    /// ASM_* bits
+    pub opts: u32,
 }
 
 /// An aggregate passed or returned by value under the C ABI.
