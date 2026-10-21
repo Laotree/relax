@@ -138,6 +138,65 @@ fn shake_blocks(f: &mut Func, trap: bool, keep: &dyn Fn(u32) -> bool, mut stub: 
     (trapped, removed)
 }
 
+fn fnv64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+}
+
+/// Blanks the unused top-level statements of the record's blocks in the data images: (blocks in
+/// the record, blocks found, bytes of the found blocks, bytes blanked, items dropped). An item
+/// with `used` false is dropped; `used` true or null stays.
+fn splash_blank(path: &str, images: &mut [(u32, Vec<u8>)]) -> (usize, usize, usize, usize, usize) {
+    let src = match std::fs::read(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("wasm export: splash record {}: {}", path, e);
+            return (0, 0, 0, 0, 0);
+        }
+    };
+    let rec = match crate::json::parse(&src) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("wasm export: splash record {}: {}", path, e);
+            return (0, 0, 0, 0, 0);
+        }
+    };
+    let mut by_hash: HashMap<u64, Vec<(usize, usize)>> = HashMap::new();
+    let mut n_blocks = 0;
+    let mut dropped = 0;
+    for b in rec.get("blocks").map(|b| b.arr()).unwrap_or(&[]) {
+        n_blocks += 1;
+        let Ok(h) = u64::from_str_radix(b.get("hash").map(|h| h.str()).unwrap_or(""), 16) else { continue };
+        let e = by_hash.entry(h).or_default();
+        for it in b.get("items").map(|i| i.arr()).unwrap_or(&[]) {
+            if matches!(it.get("used"), Some(crate::json::Json::Bool(false))) {
+                let (s, t) = (it.get("start").map_or(0.0, |v| v.num()) as usize, it.get("end").map_or(0.0, |v| v.num()) as usize);
+                if t > s {
+                    e.push((s, t));
+                    dropped += 1;
+                }
+            }
+        }
+    }
+    let (mut found, mut total, mut blanked) = (0, 0, 0);
+    for (_, bytes) in images.iter_mut() {
+        if bytes.len() < 16 {
+            continue;
+        }
+        let Some(ranges) = by_hash.get(&fnv64(bytes)) else { continue };
+        found += 1;
+        total += bytes.len();
+        for &(s, t) in ranges {
+            for c in &mut bytes[s.min(bytes.len())..t.min(bytes.len())] {
+                if *c != b'\n' {
+                    *c = b' ';
+                    blanked += 1;
+                }
+            }
+        }
+    }
+    (n_blocks, found, total, blanked, dropped)
+}
+
 fn succs(t: &relax_backend::rir::Term) -> Vec<u32> {
     use relax_backend::rir::Term;
     match t {
@@ -501,6 +560,16 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
             k += 8;
         }
         images.push((id, bytes));
+    }
+    // Splash shaking: `MAKEPAD_RUN_WASM_EXPORT_SPLASH=<splash use record>` (platform splash_trace.rs,
+    // MAKEPAD_SPLASH_TRACE): in each embedded `script_mod!` text (found by its hash), the top-level
+    // statements no run used are blanked to spaces (newlines kept): kept statements stay verbatim,
+    // length and offsets unchanged, no code patched
+    if let Ok(rec) = std::env::var("MAKEPAD_RUN_WASM_EXPORT_SPLASH") {
+        let st = splash_blank(&rec, &mut images);
+        if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
+            eprintln!("wasm export: splash: {} blocks in the record, {} found in the data; {} of {} bytes blanked ({} items dropped)", st.0, st.1, st.3, st.2, st.4);
+        }
     }
     let n_data = images.len();
     // MAKEPAD_RUN_WASM_EXPORT_STATS: the data by what it is (literals and vtables, statics, blocks)
