@@ -27,8 +27,19 @@ assert bins, "no makepad binary given"
 rounds = int(os.environ.get("ROUNDS", "4"))
 src = open(os.path.join(here, "src/main.rs")).read()
 names = re.findall(r'\("(\w+)", \w+::\w+\),', src)
+# The commercial set: apps/commercial/relax_tests (package relax-commercial-tests, binary
+# relax-rwbench-commercial, the same harness) joins when that checkout is present (RW_COMMERCIAL=0 skips it).
+# Its workloads run from their own binaries; everything else (rounds, tables, checksums) is shared.
+tree = os.environ.get("RW_ROOT", os.path.abspath(os.path.join(here, "../../../..")))
+cbench = os.path.join(tree, "apps/commercial/relax_tests/src/bench.rs")
+CPKG, CBIN = "relax-commercial-tests", "relax-rwbench-commercial"
+cnames = []
+if os.environ.get("RW_COMMERCIAL", "1") != "0" and os.path.isfile(cbench):
+    cnames = [n for n in re.findall(r'\("(\w+)", [\w:]+\),', open(cbench).read()) if n not in names]
+names += cnames
 if os.environ.get("WORKLOADS"):
     names = os.environ["WORKLOADS"].split()
+cnames = [n for n in names if n in cnames]
 pf = os.environ.get("RUN_PREFIX", "nice -n 10" if os.name != "nt" else "none")
 prefix = [] if pf in ("", "none") else shlex.split(os.path.expandvars(pf))
 exe = ".exe" if os.name == "nt" else ""
@@ -37,6 +48,12 @@ native = os.environ.get("NATIVE")
 if not native:
     subprocess.run(prefix + ["cargo", "build", "--release", "--offline", "-q", "-j", "8"], cwd=here, env=env, check=True)
     native = os.path.join(target, "rustc/release/relax-rwbench" + exe)
+cnative = os.environ.get("NATIVE_COMMERCIAL")
+if cnames and not cnative:
+    subprocess.run(prefix + ["cargo", "build", "--release", "--offline", "-q", "-j", "8", "-p", CPKG, "--bin", CBIN], cwd=here, env=env, check=True)
+    cnative = os.path.join(target, "rustc/release/" + CBIN + exe)
+def native_cmd(w): return [cnative if w in cnames else native, w]
+def relax_cmd(p, w): return [p, "run", "--quiet", "--verbose"] + ([CPKG, "--bin", CBIN] if w in cnames else ["relax-rwbench"]) + ["--", w]
 std = os.environ.get("MAKEPAD_RUN_STD", os.path.join(here, "../std"))
 base = dict(os.environ, RW_MS=os.environ.get("RW_MS", "8000"))
 LINE = r"^\| (\w+) steady_ms=([\d.]+) tts_main_ms=([\d.]+) tts_proc_ms=([\d.]+) iters=(\d+) first_ms=([\d.]+) o3_ms=(-?\d+) (\d+)$"
@@ -92,7 +109,7 @@ def relax_env(n, w=""):
     return e
 def prepare(n, p, w):
     renv = relax_env(n, w)
-    cmd = prefix + [p, "run", "--quiet", "--verbose", "relax-rwbench", "--", w]
+    cmd = prefix + relax_cmd(p, w)
     if profiled:
         profile = profile_dir / (n + "-" + w + ".t1")
         renv["MAKEPAD_RUN_O3_PROFILE"] = str(profile)
@@ -122,14 +139,14 @@ errs = {}
 for r in range(rounds):
     order = list(reversed(bins)) if r % 2 == 1 else bins
     for w in names:
-        a, ea = one(prefix + [native, w], base)
+        a, ea = one(prefix + native_cmd(w), base)
         runs[w]["rustc"].append(a)
         if ea: errs[(w, "rustc")] = ea
         for n, p in order:
             renv = prepare(n, p, w)
             if profiled:
                 Path(renv["MAKEPAD_RUN_O3_PROFILE"] + ".replay").unlink(missing_ok=True)
-            b, eb = one(prefix + [p, "run", "--quiet", "--verbose", "relax-rwbench", "--", w], renv)
+            b, eb = one(prefix + relax_cmd(p, w), renv)
             runs[w][n].append(b)
             if eb: errs[(w, n)] = eb
     print("# round %d/%d done (order %s)" % (r + 1, rounds, ",".join(n for n, _ in order)), file=sys.stderr, flush=True)
