@@ -1313,6 +1313,25 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                         }
                         other => other,
                     };
+                    // (x + k) - x -> k and x - (x + k) -> -k (wrapping 64-bit arithmetic, x one
+                    // value; LLVM InstSimplify): `data[i..i + 8]` is 8 long, so `try_into::<[u8; 8]>`
+                    // is always Ok -- the Err path, its tag store and reload and the default's fill
+                    // stayed in every BitReader::peek
+                    if ic {
+                        if let Inst::IBin(IOp::Sub, it, d, a, b) = new {
+                            let off = |s: VReg, x: VReg| match bin_def[s.0 as usize] {
+                                Some((op @ (IOp::Add | IOp::Sub), t, y, k, _, _)) if y == x && t.bits == 64 && single(x, &ndef) => Some(if op == IOp::Add { k } else { k.wrapping_neg() }),
+                                _ => None,
+                            };
+                            let k = if it.bits != 64 { None } else if let Some(k) = off(a, b) { Some(k) } else { off(b, a).map(|k| k.wrapping_neg()) };
+                            if let Some(k) = k {
+                                new = Inst::Iconst(d, k);
+                                if single(d, &ndef) {
+                                    kn[d.0 as usize] = Some(K::I(k));
+                                }
+                            }
+                        }
+                    }
                     // x * 1.0, 1.0 * x, x / 1.0, x - 0.0, x + -0.0, -0.0 + x: x itself (exact in
                     // IEEE arithmetic, a NaN's payload aside, which Rust leaves unspecified;
                     // LLVM's instsimplify does the same) -- `Vec4 { w: 1.0, .. }` through a matrix
