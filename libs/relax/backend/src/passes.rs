@@ -449,7 +449,7 @@ pub fn low_bits_only(options: &relax_session::Options, f: &Func) -> Vec<bool> {
     ok
 }
 
-/// Values whose register is known zero above some bit: per vreg (one definition), that bit count
+/// Values whose register is known zero above some bit: per vreg (over all its definitions and copies), that bit count
 /// (0: unknown): an unsigned narrow load (`ldrb` / movzx), an And with a non-negative mask, an
 /// unsigned cast that keeps its extension (`low`: passes::low_bits_only, whose casts leave the
 /// upper bits as they were). A cast of such a value to a wider type is a plain move: zero- and
@@ -461,24 +461,47 @@ pub fn zero_above(options: &relax_session::Options, f: &Func, low: &[bool]) -> V
     if crate::stats::opt_off(options, "-zeroabove") {
         return vec![0; nv];
     }
-    let mut ndef = vec![0u32; nv];
+    // per vreg the widest of its definitions (0: some definition unknown, absorbing); copies take
+    // their source's, to a fixed point (a loop variable copied around its loop: optimistic, as
+    // every value enters the cycle from a definition outside it)
+    const NONE: u8 = 255;
+    let mut z = vec![NONE; nv];
     for p in &f.params {
-        ndef[p.0 as usize] += 2;
+        z[p.0 as usize] = 0;
     }
-    let mut z = vec![0u8; nv];
+    let mut copies: Vec<(u32, u32)> = Vec::new();
+    let mut merge = |z: &mut [u8], d: usize, k: u8| {
+        z[d] = if z[d] == NONE { k } else if z[d] == 0 || k == 0 { 0 } else { z[d].max(k) };
+    };
     for b in &f.blocks {
         for i in &b.insts {
-            crate::regalloc::for_defs(i, |d| ndef[d.0 as usize] += 1);
             match *i {
-                Inst::Load(Mem::Int(n, false), d, _, _) | Inst::LoadX(Mem::Int(n, false), d, _, _, _, _) if n < 8 => z[d.0 as usize] = 8 * n,
-                Inst::IBinI(IOp::And, _, d, _, m) if m >= 0 => z[d.0 as usize] = (64 - (m as u64).leading_zeros()) as u8,
-                Inst::Conv(Conv::IntToInt(IntTy { bits, signed: false }), d, _) if bits < 64 && !low[d.0 as usize] => z[d.0 as usize] = bits,
-                _ => {}
+                Inst::Load(Mem::Int(n, false), d, _, _) | Inst::LoadX(Mem::Int(n, false), d, _, _, _, _) if n < 8 => merge(&mut z, d.0 as usize, 8 * n),
+                Inst::IBinI(IOp::And, _, d, _, m) if m >= 0 => merge(&mut z, d.0 as usize, (64 - (m as u64).leading_zeros()).max(1) as u8),
+                Inst::Conv(Conv::IntToInt(IntTy { bits, signed: false }), d, _) if bits < 64 && !low[d.0 as usize] => merge(&mut z, d.0 as usize, bits),
+                Inst::Iconst(d, k) if k >= 0 && f.vregs[d.0 as usize] == Cls::I => merge(&mut z, d.0 as usize, (64 - (k as u64).leading_zeros()).max(1) as u8),
+                Inst::Mov(d, s) if f.vregs[d.0 as usize] == Cls::I => copies.push((d.0, s.0)),
+                _ => crate::regalloc::for_defs(i, |d| z[d.0 as usize] = 0),
             }
         }
     }
+    loop {
+        let mut ch = false;
+        for &(d, s) in &copies {
+            let (d, k) = (d as usize, z[s as usize]);
+            if k == NONE {
+                continue;
+            }
+            let old = z[d];
+            merge(&mut z, d, k);
+            ch |= z[d] != old;
+        }
+        if !ch {
+            break;
+        }
+    }
     for v in 0..nv {
-        if ndef[v] != 1 || f.vregs[v] != Cls::I {
+        if z[v] == NONE || z[v] >= 64 || f.vregs[v] != Cls::I {
             z[v] = 0;
         }
     }
