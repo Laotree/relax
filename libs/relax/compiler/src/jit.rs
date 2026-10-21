@@ -3192,6 +3192,32 @@ impl Unit {
         r
     }
 
+    /// The program's `#[global_allocator]` static and its type (rustc_metadata creader
+    /// inject_allocator_crate: at most one per program, item_checks reports a second), which the
+    /// allocator shim (intrinsics_rt::rust_alloc & co) calls; None: the default allocator. Files
+    /// with the attribute are global roots of the demand plan (front lazy.rs), so the static is
+    /// loaded before any code allocates.
+    pub fn global_allocator(&self) -> Option<(DefId, TyId)> {
+        let prog = &self.prog;
+        let d = (0..prog.defs.len() as u32).map(DefId).find(|&d| {
+            let def = prog.def(d);
+            def.kind == DefKind::Static && prog.item_defs.get(&(def.file, def.item.0)) == Some(&d) && {
+                let ast = &prog.files[def.file as usize].ast;
+                crate::lang_items::has_attr(prog, def.file, ast.list(ast.item(def.item).attrs), "global_allocator")
+            }
+        })?;
+        let t = self.tcx.const_ty(prog, d)?;
+        Some((d, self.tcx.normalize_erasing_regions(prog, crate::tcx::TypingEnv::fully_monomorphized(prog), t)))
+    }
+
+    /// Whether `d` is one of the fns whose bodies call the allocator shim (core::heap's alloc,
+    /// alloc_zeroed, dealloc, realloc): their code depends on the program's global allocator.
+    pub fn calls_allocator_shim(&self, d: DefId) -> bool {
+        let def = self.prog.def(d);
+        def.krate == self.core_crate && def.kind == DefKind::Fn && matches!(self.prog.name(d), "alloc" | "alloc_zeroed" | "dealloc" | "realloc")
+            && ["alloc", "alloc_zeroed", "dealloc", "realloc"].iter().any(|n| self.core_path(&["heap", n]) == Some(d))
+    }
+
     /// Deferred diagnostic items and Relax runtime helpers, not language-item identities.
     pub fn core_path(&self, path: &[&str]) -> Option<DefId> {
         let key = path.join("::");

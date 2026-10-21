@@ -1813,6 +1813,19 @@ impl Cache {
         let mut crates = Vec::new();
         let outer = self.enc_defs.replace(Vec::new());
         let r = self.enc_fnkey(u, key, &mut e, &mut crates, 0);
+        // the allocator shim's callers call the program's #[global_allocator] (or the default):
+        // their code depends on it, which the fn's own identity does not show
+        let mut shim = E::default();
+        if key_defs(u, key).first().is_some_and(|&d| u.calls_allocator_shim(d)) {
+            match u.global_allocator() {
+                Some((s, t)) => {
+                    shim.u8(1);
+                    self.enc_def(u, s, &mut shim, &mut crates);
+                    self.enc_ty(u, t, &mut shim, &mut crates, 0)?;
+                }
+                None => shim.u8(0),
+            }
+        }
         let named = std::mem::replace(&mut self.enc_defs, outer).unwrap_or_default();
         r?;
         // code of (or instantiated with) a crate loaded after the cache opened: never cached
@@ -1832,6 +1845,7 @@ impl Cache {
                 h.str("code");
                 h.u128(self.cfg);
                 h.write(&e.0);
+                h.write(&shim.0);
                 for &c in &crates {
                     h.u128(*self.iface.get(c as usize)?);
                 }
