@@ -5891,7 +5891,10 @@ pub fn licm(options: &relax_session::Options, f: &mut Func) -> bool {
     // check's verdict are not in `f.noalias`, so they hoist nothing.
     let mut na = if f.noalias.is_empty() || no_noalias(options) { None } else { Some(noalias_roots(f, &ndef)) };
     // a param handed to a call anywhere in the function may be kept by it (then reached later through a
-    // loaded pointer, which the roots take as not derived from the param): captured for the hoist
+    // loaded pointer, which the roots take as not derived from the param): captured for the hoist,
+    // unless the callee provably keeps no pointer it gets there (O3's param_nocapture oracle, as
+    // LLVM's `nocapture`: `f1.decode(&mut r, &self.setup.codebooks, y)` left every `self.spectra`
+    // load in decode_spectra's loops)
     if let Some((_, cap, taint)) = na.as_mut() {
         for b in &f.blocks {
             for i in &b.insts {
@@ -5900,8 +5903,14 @@ pub fn licm(options: &relax_session::Options, f: &mut Func) -> bool {
                         Callee::Indirect(x) | Callee::CIndirect(x, _) => Some(*x),
                         _ => None,
                     };
-                    for a in args.iter().copied().chain(ind) {
+                    for (k, a) in args.iter().copied().enumerate() {
                         let t = taint[a.0 as usize];
+                        if t != u32::MAX && !cap.contains(&t) && !sroa_nocapture(c, k) {
+                            cap.push(t);
+                        }
+                    }
+                    if let Some(x) = ind {
+                        let t = taint[x.0 as usize];
                         if t != u32::MAX && !cap.contains(&t) {
                             cap.push(t);
                         }
