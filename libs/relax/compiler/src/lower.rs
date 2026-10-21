@@ -1620,6 +1620,14 @@ impl<'a> Lcx<'a> {
             let cs = crate::cabi::c_sig(self.u, &ptys, ret, None, abi);
             self.f.cabi = Some(Box::new(cs));
         }
+        // `#[unsafe(naked)]`: the body is its naked_asm! and nothing else (lower/asm.rs)
+        if self.is_naked(prog_def_item) {
+            if !c_abi {
+                self.err(ast.item(prog_def_item).lo, "naked functions with the Rust ABI are not supported by Relax (give it an explicit ABI such as `extern \"C\"`)".to_string());
+            }
+            self.lower_naked(body);
+            return;
+        }
         let c_agg_ret = match &self.f.cabi {
             Some(cs) => Some(cs.ret.is_some()),
             None => None,

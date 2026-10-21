@@ -1138,11 +1138,14 @@ pub struct Func {
     /// the trait-object types this body calls methods through (virtual calls, by type id): code
     /// that must run without lazy compiles (real-time threads) compiles their vtables' methods
     pub dyn_calls: Vec<u32>,
+    /// a `#[unsafe(naked)]` fn: its one block is its `naked_asm!` (a noreturn Callee::Asm) and
+    /// the backend emits no prologue, no epilogue, nothing but the block
+    pub naked: bool,
 }
 
 impl Func {
     pub fn new(name: String, file: u32) -> Func {
-        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, nonnull: Vec::new(), ranged: Vec::new(), dyn_calls: Vec::new() }
+        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, nonnull: Vec::new(), ranged: Vec::new(), dyn_calls: Vec::new(), naked: false }
     }
     pub fn vreg(&mut self, c: Cls) -> VReg {
         self.vregs.push(c);
@@ -1199,7 +1202,8 @@ impl Func {
 
     /// Structural verifier: every use has a class-correct vreg, every target exists.
     pub fn verify(&self) -> Result<(), String> {
-        if let Some(sig) = &self.cabi {
+        // a naked fn's body is its asm: it has no parameter vregs
+        if let Some(sig) = self.cabi.as_ref().filter(|_| !self.naked) {
             for p in &self.params {
                 if p.0 as usize >= self.vregs.len() {
                     return Err(format!("{}: param vreg out of range", self.name));

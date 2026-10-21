@@ -1017,19 +1017,21 @@ impl<'a> Gen<'a> {
         self.cret_buf = frame - cret_fp;
         self.stage = frame - stage_fp;
 
-        // prologue
-        self.a.stp_pre(FP, LR, SP, -16);
-        self.a.mov_sp(FP, SP);
-        self.stack_probe(frame);
-        self.a.add_any(SP, SP, -frame);
-        self.callee_saves(true);
-        if self.dom_read.first() == Some(&true) {
-            self.dom_base();
-        }
-        if self.cplan.is_some() {
-            self.c_prologue();
-        } else {
-            self.params_prologue();
+        // prologue (a naked fn is its asm block only)
+        if !self.f.naked {
+            self.a.stp_pre(FP, LR, SP, -16);
+            self.a.mov_sp(FP, SP);
+            self.stack_probe(frame);
+            self.a.add_any(SP, SP, -frame);
+            self.callee_saves(true);
+            if self.dom_read.first() == Some(&true) {
+                self.dom_base();
+            }
+            if self.cplan.is_some() {
+                self.c_prologue();
+            } else {
+                self.params_prologue();
+            }
         }
 
         let nb = self.f.blocks.len();

@@ -356,7 +356,9 @@ impl<'a> Lcx<'a> {
                 return self.u.foreign_sym(d).ok_or_else(|| format!("sym operand: `{}` has no address on this host", self.u.prog.name(d)));
             }
             if self.u.prog.def(d).kind == DefKind::Static {
-                return Err("sym operand naming a Rust static: not supported by Relax yet (statics live per domain)".to_string());
+                // the compile domain's copy (assembly cannot add a thread's domain base)
+                let a = self.static_addr(d);
+                return Ok(self.u.syms.intern(crate::syms::SymKind::StaticAddr(d), a));
             }
         }
         Err("invalid `sym` operand: the path must refer to a function or a static".to_string())
@@ -381,9 +383,40 @@ impl<'a> Lcx<'a> {
         Err("`const` operand: the expression must be a constant integer".to_string())
     }
 
+    /// Whether the fn item carries `#[naked]` / `#[unsafe(naked)]`.
+    pub(super) fn is_naked(&self, item: ItemId) -> bool {
+        let f = &self.u.prog.files[self.b.file as usize];
+        f.ast.list(f.ast.item(item).attrs).iter().any(|a| (a.toks.lo..a.toks.hi).take(3).any(|t| f.tok_text(t) == "naked"))
+    }
+
+    /// A naked fn's body: one `naked_asm!` (Reference [attributes.codegen.naked]), assembled as
+    /// the whole function (Func::naked).
+    pub(super) fn lower_naked(&mut self, body: Option<BlockId>) {
+        let pos = self.pos;
+        let r = (|| -> Result<(), String> {
+            let ast = self.ast();
+            let b = body.ok_or("a naked fn needs a body")?;
+            let stmts = ast.list(ast.block(b).stmts);
+            let [Stmt::Expr(e, _)] = stmts else { return Err("the body of a naked function must be a single `naked_asm!` invocation".to_string()) };
+            let ExprKind::Mac(m) = &ast.expr(*e).kind else { return Err("the body of a naked function must be a single `naked_asm!` invocation".to_string()) };
+            let m = ast.row(*m);
+            let name = ast.segs(m.path.segs).last().map(|s| self.ident_text(s.name)).unwrap_or("");
+            if name != "naked_asm" || m.args == NO_MAC_ARGS {
+                return Err("the body of a naked function must be a single `naked_asm!` invocation".to_string());
+            }
+            let margs = ast.mac_arg(m.args);
+            self.pos = ast.expr(*e).lo;
+            self.lower_asm_inner(&margs, true).map(|_| ())
+        })();
+        if let Err(m) = r {
+            self.err(pos, m);
+            self.term(Term::Unreachable);
+        }
+    }
+
     pub(super) fn lower_asm(&mut self, margs: &MacArgs) -> Val {
         let pos = self.pos;
-        match self.lower_asm_inner(margs) {
+        match self.lower_asm_inner(margs, false) {
             Ok(v) => v,
             Err(m) => {
                 self.err(pos, m);
@@ -392,7 +425,7 @@ impl<'a> Lcx<'a> {
         }
     }
 
-    fn lower_asm_inner(&mut self, margs: &MacArgs) -> Result<Val, String> {
+    fn lower_asm_inner(&mut self, margs: &MacArgs, naked: bool) -> Result<Val, String> {
         let ast = self.ast();
         if !self.u.prog.session.options.allow_asm {
             return Err(relax_session::options::ASM_GATE.to_string());
@@ -460,6 +493,9 @@ impl<'a> Lcx<'a> {
                     continue;
                 }
                 _ => {}
+            }
+            if naked {
+                return Err("naked_asm! takes only `const` and `sym` operands".to_string());
             }
             let (r, class) = regs[k].unwrap();
             args.push(Arg::Reg(r));
@@ -553,12 +589,18 @@ impl<'a> Lcx<'a> {
                 opts |= b;
             }
         }
+        if naked {
+            opts |= R_NORETURN;
+        }
         if opts & R_NORETURN != 0 && !outs.is_empty() {
             return Err("asm outputs are not allowed with the `noreturn` option".to_string());
         }
         let block = AsmBlock { code, fixups, ins: in_regs, outs: outs.iter().map(|o| regs_of(&ops, &regs, o.0, &outs)).collect(), regs: used | writes, writes, opts };
         let rets: Vec<VReg> = outs.iter().map(|o| o.0).collect();
         self.emit(Inst::Call(Callee::Asm(Box::new(block)), ins, rets));
+        if naked {
+            self.f.naked = true;
+        }
         if opts & R_NORETURN != 0 {
             self.term(Term::Unreachable);
             self.dead();

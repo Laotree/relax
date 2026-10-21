@@ -1067,6 +1067,11 @@ impl<'a> Gen<'a> {
 
     fn gen(&mut self, options: &relax_session::Options) {
         let reach = regalloc::reachable(self.f);
+        // a naked fn is its asm block only
+        if self.f.naked {
+            self.blocks_and_pool(options, reach);
+            return;
+        }
         // prologue
         self.a.push(RBP);
         self.a.mov_rr(RBP, RSP);

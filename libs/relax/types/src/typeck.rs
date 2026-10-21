@@ -7556,12 +7556,14 @@ impl<'a> Fcx<'a> {
                 self.err(lo, relax_session::options::ASM_GATE.to_string());
                 return self.tcx.tys.error;
             }
-            if name != "asm" || m.args == NO_MAC_ARGS {
-                // global_asm! / naked_asm! as an expression: not where rustc accepts them
+            if name == "global_asm" || m.args == NO_MAC_ARGS {
+                // global_asm! as an expression: not where rustc accepts it
                 self.err(lo, format!("`{}!` is not allowed here", name));
                 return self.tcx.tys.error;
             }
-            return self.check_asm(m);
+            // naked_asm! (the body of a naked fn, lowering checks where it is) never returns
+            let t = self.check_asm(m);
+            return if name == "naked_asm" { self.tcx.tys.never } else { t };
         }
         if name == "compile_error" && m.toks.hi > m.toks.lo {
             let f = &self.prog.files[self.file as usize];

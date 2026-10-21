@@ -135,7 +135,7 @@ fn place_all(u: &Unit) -> Result<HashMap<String, u64>, String> {
     for (ci, c) in assembled.iter().enumerate() {
         for d in &c.out.defs {
             if d.global {
-                if table.insert(d.name.clone(), bases[ci][d.section as usize] + d.offset as u64).is_some() {
+                if table.insert(c_name(&d.name).to_string(), bases[ci][d.section as usize] + d.offset as u64).is_some() {
                     return Err(format!("symbol `{}` is defined by two global_asm! blocks", d.name));
                 }
             }
@@ -148,7 +148,12 @@ fn place_all(u: &Unit) -> Result<HashMap<String, u64>, String> {
             if let Some(k) = name.strip_prefix("\u{1}sym") {
                 return Ok(c.syms[k.parse::<usize>().unwrap()]);
             }
-            if let Some(&a) = local.get(name).or_else(|| table.get(name)) {
+            if let Some(&a) = local.get(name) {
+                return Ok(a);
+            }
+            // from here on the C name (Mach-O symbols carry a leading underscore)
+            let name = c_name(name);
+            if let Some(&a) = table.get(name) {
                 return Ok(a);
             }
             if let Some(&d) = exports.get(name) {
@@ -205,6 +210,16 @@ fn place_all(u: &Unit) -> Result<HashMap<String, u64>, String> {
         }
     }
     Ok(table)
+}
+
+/// The C name of an assembly symbol: Mach-O prefixes C names with `_` (dlsym, extern blocks and
+/// `#[no_mangle]` know them without it).
+fn c_name(n: &str) -> &str {
+    if cfg!(target_vendor = "apple") {
+        n.strip_prefix('_').unwrap_or(n)
+    } else {
+        n
+    }
 }
 
 /// A jump to `target` from anywhere (x64: jmp [rip + 0]; .quad target -- arm64: ldr x16, 8;
