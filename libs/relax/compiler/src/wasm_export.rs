@@ -367,6 +367,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     // 23,345 -> 18,620 functions, br11 +5.0 KB): the compressor already shares near-identical
     // bodies, the callers' extra constants cost more. Kept as an option for raw size / compile time.
     let mut merge = false;
+    let mut splash = true;
     let mut blocks = crate::coverage::on();
     // -tee,-remat,...: switch size techniques off (or on) to measure them
     {
@@ -390,6 +391,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
                 "untraced" => opts.untraced_import = on,
                 "exnref" => opts.exnref = on,
                 "merge" => merge = on,
+                "splash" => splash = on,
                 "blocks" => blocks = on && crate::coverage::on(),
                 _ => eprintln!("wasm export: unknown option {}", n),
             }
@@ -567,7 +569,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     // MAKEPAD_SPLASH_TRACE): in each embedded `script_mod!` text (found by its hash), the top-level
     // statements no run used are blanked to spaces (newlines kept): kept statements stay verbatim,
     // length and offsets unchanged, no code patched
-    if let Ok(rec) = std::env::var("MAKEPAD_RUN_WASM_EXPORT_SPLASH") {
+    if let (true, Ok(rec)) = (splash, std::env::var("MAKEPAD_RUN_WASM_EXPORT_SPLASH")) {
         let st = splash_blank(&rec, &mut images);
         if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
             eprintln!("wasm export: splash: {} blocks in the record, {} found in the data; {} of {} bytes blanked ({} items dropped)", st.0, st.1, st.3, st.2, st.4);
