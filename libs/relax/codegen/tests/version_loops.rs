@@ -759,3 +759,49 @@ fn readonly_param_loads_hoist() {
     let mut g = build(true);
     assert!(!version::hoist_readonly_param_loads(&relax_session::Options::default(), &mut g));
 }
+
+/// The pivot reached through argument cells (`&&T` in a closure's tuple: p stored in cell A,
+/// A's address stored in cell B, the loop loads B, then A, then p's memory): hoisted. A second
+/// write into A keeps it.
+#[test]
+fn readonly_param_through_cells() {
+    let build = |second_write: bool| {
+        let mut f = Func::new("cells".into(), 0);
+        let (piv, n) = (f.vreg(Cls::I), f.vreg(Cls::I));
+        f.params.extend([piv, n]);
+        f.noalias.push(piv);
+        f.deref.push((piv, 4));
+        let (sa, sb) = (f.slot(8, 8), f.slot(16, 8));
+        for _ in 0..4 {
+            f.block();
+        }
+        let v: Vec<VReg> = (0..10).map(|_| f.vreg(Cls::I)).collect();
+        let (a, b, i, c, x, y, k, acc) = (v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+        push(&mut f, 0, Inst::SlotAddr(a, sa));
+        push(&mut f, 0, Inst::SlotAddr(b, sb));
+        push(&mut f, 0, Inst::Store(Mem::Int(8, false), a, 0, piv));
+        push(&mut f, 0, Inst::Store(Mem::Int(8, false), b, 8, a));
+        if second_write {
+            push(&mut f, 0, Inst::Store(Mem::Int(8, false), a, 0, n));
+        }
+        push(&mut f, 0, Inst::Iconst(i, 0));
+        push(&mut f, 0, Inst::Iconst(acc, 0));
+        term(&mut f, 0, Term::Jump(1));
+        push(&mut f, 1, Inst::ICmp(Cond::Lt, false, c, i, n));
+        term(&mut f, 1, Term::Branch(c, 2, 3));
+        push(&mut f, 2, Inst::Load(Mem::Int(8, false), x, b, 8));
+        push(&mut f, 2, Inst::Load(Mem::Int(8, false), y, x, 0));
+        push(&mut f, 2, Inst::Load(Mem::Int(4, false), k, y, 0));
+        push(&mut f, 2, Inst::IBin(IOp::Add, U64, acc, acc, k));
+        push(&mut f, 2, Inst::IBinI(IOp::Add, U64, i, i, 1));
+        term(&mut f, 2, Term::Jump(1));
+        f.rets.push(Cls::I);
+        term(&mut f, 3, Term::Ret(vec![acc]));
+        f
+    };
+    let mut f = build(false);
+    assert!(version::hoist_readonly_param_loads(&relax_session::Options::default(), &mut f));
+    assert!(matches!(f.blocks[0].insts[0], Inst::Load(Mem::Int(4, false), _, p, 0) if p == f.params[0]), "{:?}", f.blocks[0].insts);
+    let mut g = build(true);
+    assert!(!version::hoist_readonly_param_loads(&relax_session::Options::default(), &mut g));
+}

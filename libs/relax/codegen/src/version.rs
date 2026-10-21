@@ -860,53 +860,6 @@ pub fn hoist_readonly_param_loads(options: &relax_session::Options, f: &mut Func
     }
     let reach = reachable(f);
     let depth = relax_backend::regalloc::loop_depths(f, &reach);
-    // stack slots whose address goes only into load / store bases (the raw body before SROA
-    // passes a pointer argument through such a cell: a closure's argument tuple), and their
-    // 8-byte cells written exactly once: (slot of each address vreg, writes per (slot, offset))
-    let mut slot_of: Vec<u32> = vec![u32::MAX; nv];
-    for b in &f.blocks {
-        for i in &b.insts {
-            if let Inst::SlotAddr(d, sl) = *i {
-                if ndef[d.0 as usize] == 1 {
-                    slot_of[d.0 as usize] = sl;
-                }
-            }
-        }
-    }
-    let mut dirty = vec![false; f.slots.len()];
-    let mut writes: std::collections::HashMap<(u32, i32), u32> = std::collections::HashMap::new();
-    for b in &f.blocks {
-        for i in &b.insts {
-            match *i {
-                Inst::Load(_, _, a, _) if slot_of[a.0 as usize] != u32::MAX => {}
-                Inst::Store(m, a, off, v) if slot_of[a.0 as usize] != u32::MAX && slot_of[v.0 as usize] == u32::MAX => {
-                    let sl = slot_of[a.0 as usize];
-                    if matches!(m, Mem::Int(8, _)) && off % 8 == 0 {
-                        *writes.entry((sl, off)).or_insert(0) += 1;
-                    } else {
-                        // a narrower or unaligned write may overlap a cell
-                        dirty[sl as usize] = true;
-                    }
-                }
-                _ => for_uses(i, |u| {
-                    if slot_of[u.0 as usize] != u32::MAX {
-                        dirty[slot_of[u.0 as usize] as usize] = true;
-                    }
-                }),
-            }
-        }
-        let mut tu = Vec::new();
-        term_uses(&b.term, &mut tu);
-        for u in tu {
-            if slot_of[u.0 as usize] != u32::MAX {
-                dirty[slot_of[u.0 as usize] as usize] = true;
-            }
-        }
-    }
-    let cell_once = |a: VReg, off: i32| -> bool {
-        let sl = slot_of[a.0 as usize];
-        sl != u32::MAX && !dirty[sl as usize] && writes.get(&(sl, off)) == Some(&1)
-    };
     let dom = Dom::new(f);
     let mut changed = false;
     let mut entry: Vec<Inst> = Vec::new();
@@ -915,74 +868,9 @@ pub fn hoist_readonly_param_loads(options: &relax_session::Options, f: &mut Func
             continue;
         }
         let Some(&(_, size)) = f.deref.iter().find(|(v, _)| *v == p) else { continue };
-        // p and its single-def copies
-        let mut set = vec![false; nv];
-        set[p.0 as usize] = true;
-        let mut grew = true;
-        while grew {
-            grew = false;
-            // cells holding p: stored once with a value of the set
-            let mut cells: Vec<(u32, i32, (u32, usize))> = Vec::new();
-            for (bi, b) in f.blocks.iter().enumerate() {
-                for (k, i) in b.insts.iter().enumerate() {
-                    if let Inst::Store(Mem::Int(8, _), a, off, v) = *i {
-                        if set[v.0 as usize] && cell_once(a, off) {
-                            cells.push((slot_of[a.0 as usize], off, (bi as u32, k)));
-                        }
-                    }
-                }
-            }
-            for (bi, b) in f.blocks.iter().enumerate() {
-                for (k, i) in b.insts.iter().enumerate() {
-                    match *i {
-                        Inst::Mov(d, s) if set[s.0 as usize] && !set[d.0 as usize] && ndef[d.0 as usize] == 1 => {
-                            set[d.0 as usize] = true;
-                            grew = true;
-                        }
-                        // a load of such a cell after its store: a copy of p
-                        Inst::Load(Mem::Int(8, _), d, a, off) if !set[d.0 as usize] && ndef[d.0 as usize] == 1 && slot_of[a.0 as usize] != u32::MAX => {
-                            let sl = slot_of[a.0 as usize];
-                            if cells.iter().any(|c| c.0 == sl && c.1 == off && dom.before(c.2, (bi as u32, k))) {
-                                set[d.0 as usize] = true;
-                                grew = true;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        // every use: a copy into the set or an in-bounds load
-        let mut ok = true;
-        let mut tu = Vec::new();
-        for b in &f.blocks {
-            for i in &b.insts {
-                let mut uses_set = false;
-                for_uses(i, |u| uses_set |= set[u.0 as usize]);
-                if !uses_set {
-                    continue;
-                }
-                match *i {
-                    Inst::Mov(d, _) if set[d.0 as usize] => {}
-                    // p kept in a clean cell (its loads joined the set)
-                    Inst::Store(Mem::Int(8, _), a, off, v) if set[v.0 as usize] && !set[a.0 as usize] && cell_once(a, off) => {}
-                    Inst::Load(m, _, base, off) if set[base.0 as usize] && off >= 0 && off as i64 + relax_backend::passes::mem_size(m) as i64 <= size as i64 => {}
-                    _ => {
-                        if ok && trace() {
-                            eprintln!("roparam: {} {:?} kept by {:?}", f.name, p, i);
-                        }
-                        ok = false
-                    }
-                }
-            }
-            term_uses(&b.term, &mut tu);
-            if tu.iter().any(|u| set[u.0 as usize]) {
-                ok = false;
-            }
-        }
-        if !ok {
-            continue;
-        }
+        // p and every value equal to it (copies, cells it was kept in); None: some use may
+        // write its memory or let it escape
+        let Some(set) = ro_aliases(f, &ndef, &dom, p, size) else { continue };
         // loads in loops: one load per (kind, offset) at the entry
         let mut hoisted: Vec<(Mem, i32, VReg)> = Vec::new();
         for bi in 0..f.blocks.len() {
@@ -1018,4 +906,183 @@ pub fn hoist_readonly_param_loads(options: &relax_session::Options, f: &mut Func
         f.blocks[0].pos.splice(0..0, std::iter::repeat(pos).take(n));
     }
     changed
+}
+
+/// The values equal to noalias parameter `p` (`size` dereferenceable bytes) when every use of
+/// them only reads p's memory: copies, loads of 8-byte stack cells it (or a pointer to such a
+/// cell, any depth: the raw body's closure argument tuples hold `&&T`) was stored in once, and
+/// in-bounds loads through it. Stack slots taking part must be clean: their addresses only
+/// address their own cells or are stored into other clean cells, each cell written once, every
+/// load of a cell holding a tracked value after that write (dominated). None when anything
+/// else touches them.
+fn ro_aliases(f: &Func, ndef: &[u32], dom: &Dom, p: VReg, size: u32) -> Option<Vec<bool>> {
+    let nv = f.vregs.len();
+    let mut slot_of: Vec<u32> = vec![u32::MAX; nv];
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::SlotAddr(d, sl) = *i {
+                if ndef[d.0 as usize] == 1 {
+                    slot_of[d.0 as usize] = sl;
+                }
+            }
+        }
+    }
+    // clean slots: address uses are 8-byte aligned load/store bases, or values of 8-byte
+    // stores into a clean cell; cells written once
+    let ns = f.slots.len();
+    let mut dirty = vec![false; ns];
+    let mut writes: std::collections::HashMap<(u32, i32), Vec<(u32, usize, VReg)>> = std::collections::HashMap::new();
+    let mut tu = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            let mark = |v: VReg, dirty: &mut Vec<bool>| {
+                if slot_of[v.0 as usize] != u32::MAX {
+                    dirty[slot_of[v.0 as usize] as usize] = true;
+                }
+            };
+            match *i {
+                Inst::Load(m, _, a, off) if slot_of[a.0 as usize] != u32::MAX => {
+                    if !(matches!(m, Mem::Int(8, _)) && off % 8 == 0) {
+                        // a narrow read of a cell is fine; it reads, never writes
+                    }
+                }
+                Inst::Store(m, a, off, v) if slot_of[a.0 as usize] != u32::MAX => {
+                    let sl = slot_of[a.0 as usize];
+                    if matches!(m, Mem::Int(8, _)) && off % 8 == 0 {
+                        writes.entry((sl, off)).or_default().push((bi as u32, k, v));
+                    } else {
+                        dirty[sl as usize] = true;
+                        mark(v, &mut dirty);
+                    }
+                }
+                _ => for_uses(i, |u| mark(u, &mut dirty)),
+            }
+        }
+        term_uses(&b.term, &mut tu);
+        for u in &tu {
+            if slot_of[u.0 as usize] != u32::MAX {
+                dirty[slot_of[u.0 as usize] as usize] = true;
+            }
+        }
+    }
+    // an address stored into a dirty slot escapes with it (to a fixed point)
+    loop {
+        let mut grew = false;
+        for ((sl, _), ws) in &writes {
+            for &(_, _, v) in ws {
+                let vs = slot_of[v.0 as usize];
+                if vs != u32::MAX && (dirty[*sl as usize] || ws.len() != 1) && !dirty[vs as usize] {
+                    dirty[vs as usize] = true;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    let clean_cell = |a: VReg, off: i32| -> Option<(u32, usize, VReg)> {
+        let sl = slot_of[a.0 as usize];
+        if sl == u32::MAX || dirty[sl as usize] {
+            return None;
+        }
+        match writes.get(&(sl, off)) {
+            Some(ws) if ws.len() == 1 => Some(ws[0]),
+            _ => None,
+        }
+    };
+    // levels: 0 = p, k + 1 = a pointer to a cell holding a level-k value
+    let mut level: Vec<Option<u32>> = vec![None; nv];
+    level[p.0 as usize] = Some(0);
+    // slot addresses: level from their offset-0 cell, valid after that cell's write
+    let addr_level = |a: VReg, level: &Vec<Option<u32>>| -> Option<(u32, (u32, usize))> {
+        let (wb, wk, v) = clean_cell(a, 0)?;
+        level[v.0 as usize].map(|k| (k + 1, (wb, wk)))
+    };
+    for _ in 0..16 {
+        let mut grew = false;
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for (k, i) in b.insts.iter().enumerate() {
+                let at = (bi as u32, k);
+                let new = match *i {
+                    Inst::Mov(d, x) if ndef[d.0 as usize] == 1 => level[x.0 as usize].map(|l| (d, l)),
+                    // a load of a clean cell after its write: the stored value's level
+                    Inst::Load(Mem::Int(8, _), d, a, off) if ndef[d.0 as usize] == 1 && slot_of[a.0 as usize] != u32::MAX => {
+                        clean_cell(a, off).and_then(|(wb, wk, v)| {
+                            let lv = level[v.0 as usize].or_else(|| addr_level(v, &level).map(|x| x.0))?;
+                            dom.before((wb, wk), at).then_some((d, lv))
+                        })
+                    }
+                    // a load through a pointer to a cell: one level down
+                    Inst::Load(Mem::Int(8, _), d, x, 0) if ndef[d.0 as usize] == 1 && slot_of[x.0 as usize] == u32::MAX => match level[x.0 as usize] {
+                        Some(l) if l >= 1 => Some((d, l - 1)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some((d, l)) = new {
+                    if level[d.0 as usize].is_none() {
+                        level[d.0 as usize] = Some(l);
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    // every use of a tracked value only reads; every load of a cell holding one is tracked
+    let tracked = |v: VReg, level: &Vec<Option<u32>>| level[v.0 as usize].is_some() || (slot_of[v.0 as usize] != u32::MAX && addr_level(v, level).is_some());
+    for b in &f.blocks {
+        for i in &b.insts {
+            match *i {
+                Inst::Load(m, d, a, off) => {
+                    if level[a.0 as usize] == Some(0) {
+                        if !(off >= 0 && off as i64 + relax_backend::passes::mem_size(m) as i64 <= size as i64) {
+                            return None;
+                        }
+                    } else if level[a.0 as usize].is_some() {
+                        if !(matches!(m, Mem::Int(8, _)) && off == 0 && level[d.0 as usize].is_some()) {
+                            return None;
+                        }
+                    } else if slot_of[a.0 as usize] != u32::MAX {
+                        if let Some((_, _, v)) = clean_cell(a, off) {
+                            if tracked(v, &level) && level[d.0 as usize].is_none() {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                Inst::Store(m, a, off, v) => {
+                    if tracked(a, &level) && slot_of[a.0 as usize] == u32::MAX {
+                        return None;
+                    }
+                    if tracked(v, &level) && !(matches!(m, Mem::Int(8, _)) && clean_cell(a, off).is_some()) {
+                        return None;
+                    }
+                }
+                Inst::Mov(d, x) => {
+                    if level[x.0 as usize].is_some() && level[d.0 as usize].is_none() {
+                        return None;
+                    }
+                }
+                _ => {
+                    let mut bad = false;
+                    for_uses(i, |u| bad |= level[u.0 as usize].is_some());
+                    if bad {
+                        if trace() {
+                            eprintln!("roparam: {} {:?} kept by {:?}", f.name, p, i);
+                        }
+                        return None;
+                    }
+                }
+            }
+        }
+        term_uses(&b.term, &mut tu);
+        if tu.iter().any(|u| level[u.0 as usize].is_some()) {
+            return None;
+        }
+    }
+    Some(level.iter().map(|l| *l == Some(0)).collect())
 }
