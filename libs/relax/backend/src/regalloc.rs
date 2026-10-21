@@ -2588,7 +2588,8 @@ fn equal_copies(options: &relax_session::Options, f: &Func, reach: &[bool], tab:
         for i in &b.insts {
             let (d, s2, cast) = match *i {
                 Inst::Mov(d, s2) => (d, s2, 0),
-                Inst::Conv(Conv::IntToInt(it), d, s2) => (d, s2, it.bits),
+                // (bits | 0x80 for a signed target)
+                Inst::Conv(Conv::IntToInt(it), d, s2) => (d, s2, it.bits | if it.signed { 0x80 } else { 0 }),
                 _ => continue,
             };
             if d == s2 || f.vregs[d.0 as usize] != f.vregs[s2.0 as usize] || f.vregs[d.0 as usize].is_vec() || remat[d.0 as usize].is_some() || remat[s2.0 as usize].is_some() {
@@ -2633,7 +2634,7 @@ fn equal_copies(options: &relax_session::Options, f: &Func, reach: &[bool], tab:
             continue;
         }
         // a cast is a plain move: its upper bits nobody reads, or its source zero above fewer bits
-        if cast != 0 && !(low[d as usize] || (zero[s2 as usize] > 0 && zero[s2 as usize] < cast)) {
+        if cast != 0 && !(low[d as usize] || crate::passes::cast_is_move(zero[s2 as usize], IntTy { bits: cast & 0x7f, signed: cast & 0x80 != 0 })) {
             continue;
         }
         let rd = ranges.of(d);
@@ -4087,6 +4088,67 @@ pub fn share_index_bases(f: &Func) -> Option<Func> {
 /// right after cmp + setcc) instead of testing the materialised bool again after other
 /// arithmetic clobbered the flags (stable partition: `c = a < b; p = end - 8; d = c ? x : p`).
 /// Returns the rewritten copy, or None.
+/// Reads of a spilled integer value that a register copy of it can serve: after `u = v` (one of
+/// them in a stack slot, the other in a register) a later read of the spilled one in the same
+/// block -- neither redefined since, no call between, and the register one still read later in the
+/// block (so its register holds it there) -- reads the register instead of loading the slot.
+/// `mov r14, [rbp-0x70]` then `cmp r10, [rbp-0x70]` (html's position after its copy) becomes
+/// `cmp r14, ...`. Keyed by (use position, vreg). MAKEPAD_RUN_OPT=-copyreuse: none (bisection).
+pub fn copy_reuse(options: &relax_session::Options, f: &Func, al: &Alloc) -> HashMap<(u32, u32), u8> {
+    let mut out = HashMap::new();
+    if crate::stats::opt_off(options, "-copyreuse") {
+        return out;
+    }
+    let reach = reachable(f);
+    let (mut us, mut ds) = (Vec::new(), Vec::new());
+    let mut tu = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        if !reach[bi] || !b.insts.iter().any(|i| matches!(i, Inst::Mov(..))) {
+            continue;
+        }
+        // last read of each vreg in the block (the terminator reads at index n)
+        let mut last: HashMap<u32, usize> = HashMap::new();
+        for (ii, i) in b.insts.iter().enumerate() {
+            uses_defs(i, &mut us, &mut ds);
+            for u in &us {
+                last.insert(u.0, ii);
+            }
+        }
+        term_uses(&b.term, &mut tu);
+        for u in &tu {
+            last.insert(u.0, b.insts.len());
+        }
+        // spilled vreg -> (its register copy, that register)
+        let mut have: Vec<(u32, u32, u8)> = Vec::new();
+        for (ii, i) in b.insts.iter().enumerate() {
+            uses_defs(i, &mut us, &mut ds);
+            if !have.is_empty() {
+                for u in &us {
+                    if let Some(&(_, c, r)) = have.iter().find(|h| h.0 == u.0) {
+                        if last.get(&c).map_or(false, |&l| l >= ii) {
+                            out.insert((al.inst_pos(bi, ii), u.0), r);
+                        }
+                    }
+                }
+                if matches!(i, Inst::Call(..)) {
+                    have.clear();
+                }
+                have.retain(|h| !ds.iter().any(|d| d.0 == h.0 || d.0 == h.1));
+            }
+            if let Inst::Mov(d, s2) = *i {
+                if d != s2 && f.vregs[d.0 as usize] == Cls::I && f.vregs[s2.0 as usize] == Cls::I {
+                    match (al.loc[d.0 as usize], al.loc[s2.0 as usize]) {
+                        (Loc::Reg(r), Loc::Stack(_)) => have.push((s2.0, d.0, r)),
+                        (Loc::Stack(_), Loc::Reg(r)) => have.push((d.0, s2.0, r)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn sink_compares(f: &Func) -> Option<Func> {
     let mut g: Option<Func> = None;
     for bi in 0..f.blocks.len() {
