@@ -1,6 +1,7 @@
 #!/bin/bash
-# usage: run.sh <relax or makepad binary> (from the workspace root): the warm-cache edit series of
-# a real app (WARMFIX 2026-10-21). The workspace is copied (no target, .git, local, commercial)
+# usage: run.sh <relax binary> (from the workspace root): the warm-cache edit series of a real app
+# (WARMFIX 2026-10-21). The bare runner: the VM and the HAL are JIT-compiled from the copied
+# source (`makepad` provides them rustc-built, so their edits do not reach it this way). The workspace is copied (no target, .git, local, commercial)
 # and the Calculator runs hidden on one fresh home and cache, each run a fresh process: cold, warm,
 # a line inserted in the script VM, a line inserted in the HAL (a crate the VM does not depend on:
 # its prelinked code stays while the VM changes), the VM line's literal changed, a closure added
