@@ -9772,6 +9772,8 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
             // then the only writes of those bytes, so the reads after it can be forwarded
             let ch = relax_codegen::opt::dead_slot_stores(func);
             let ch = ch | relax_codegen::opt::forward_slot_dests(func) | relax_codegen::opt::forward_slot_dests_x(options, func, 32);
+            // slots joined along whole copies by byte liveness (loops too); MAKEPAD_RUN_OPT=-slotcoal
+            let ch = ch | (!relax_backend::stats::opt_off(options, "-slotcoal") && relax_codegen::opt::coalesce_slot_copies(func));
             let ch = ch | relax_codegen::opt::split_wide_slot_accesses(func);
             let ch = ch | relax_codegen::opt::sroa_post_inline(func);
             if !ch {
