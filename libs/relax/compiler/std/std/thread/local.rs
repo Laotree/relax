@@ -41,10 +41,6 @@ impl Error for AccessError {}
 struct Slot<T> {
     drop_slot: unsafe fn(*mut u8),
     key: sys::Key,
-    /// a value without drop glue: std registers no destructor for it and it is never destroyed
-    /// (library/std/src/sys/thread_local/native: EagerStorage / LazyStorage<T, ()>), so other
-    /// keys' destructors still read it; its slot is freed only after every destructor ran
-    late: bool,
     value: T,
 }
 
@@ -52,7 +48,6 @@ struct Slot<T> {
 struct SlotHeader {
     drop_slot: unsafe fn(*mut u8),
     key: sys::Key,
-    late: bool,
 }
 
 /// Stored in the key while a slot is being destroyed (and after): access fails.
@@ -63,21 +58,11 @@ unsafe fn drop_slot<T>(p: *mut u8) {
 }
 
 extern "C" fn key_dtor(p: *mut c_void) {
-    if p as usize == DESTROYED {
-        return; // second destructor round: leave the key empty
-    }
     unsafe {
-        // A value that is never destroyed stays readable: put it back; the runtime's call for
-        // what is left after all destructors frees it
-        let header = &mut *(p as *mut SlotHeader);
-        if header.late {
-            header.late = false;
-            sys::key_set(header.key, p);
-            return;
-        }
-        // The runtime cleared the key before calling us: mark it destroyed while the value
-        // drops (access from other destructors then fails with AccessError); the runtime
-        // calls us once more with DESTROYED and then leaves the key empty.
+        // std's `destroy` (sys/thread_local/native/lazy.rs): the key is marked destroyed for good
+        // before the value drops, so access from this and every later destructor fails with
+        // AccessError and nothing re-initialises it. The runtime calls this once per key, last
+        // registered first; a late key's (no drop glue) only after every other destructor ran.
         let header = &*(p as *const SlotHeader);
         let drop_fn = header.drop_slot;
         sys::key_set(header.key, DESTROYED as *const c_void);
@@ -111,7 +96,9 @@ impl<T: 'static> LocalKey<T> {
         if k != 0 {
             return (k - 1) as sys::Key;
         }
-        let new_key = match sys::key_create(key_dtor) {
+        // rustc never destroys a thread-local whose type has no drop glue (std's native TLS
+        // registers no destructor for it): its value stays readable in every other destructor
+        let new_key = match sys::key_create(key_dtor, !core::mem::needs_drop::<T>()) {
             Some(k) => k,
             None => panic!("failed to allocate a thread-local storage key"),
         };
@@ -150,7 +137,7 @@ impl<T: 'static> LocalKey<T> {
                 return Some(&(*slot).value as *const T);
             }
         }
-        let slot = Box::into_raw(Box::new(Slot { drop_slot: drop_slot::<T>, key, late: !core::mem::needs_drop::<T>(), value }));
+        let slot = Box::into_raw(Box::new(Slot { drop_slot: drop_slot::<T>, key, value }));
         unsafe {
             sys::key_set(key, slot as *const c_void);
             Some(&(*slot).value as *const T)

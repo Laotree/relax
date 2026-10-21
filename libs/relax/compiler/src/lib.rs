@@ -81,6 +81,7 @@ mod native_macros;
 pub mod ctfe;
 mod valtrees;
 pub mod syms;
+pub mod wasm_export;
 pub mod pack;
 pub mod store;
 pub mod kernel_store;
@@ -779,6 +780,7 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         // speculative workers compile concurrently: unit access under the lock
         let entry = crate::owner::call(crate::owner::Class::App, || {
             let id = u.fn_id(jit::FnKey::Inst(d, Vec::new()));
+            crate::wasm_export::root(id, &name);
             u.entry(id)
         });
         let ts = Instant::now();
