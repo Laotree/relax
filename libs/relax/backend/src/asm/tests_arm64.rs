@@ -1601,3 +1601,225 @@ pmull2 v0.8h, v1.16b, v2.16b
 "#,
     );
 }
+
+// ---------------------------------------------------------------- operand matrices
+
+/// Every combination of the slots (`$0`, `$1` ... in the template).
+fn combos(template: &str, slots: &[&[&str]]) -> Vec<String> {
+    let mut out = vec![template.to_string()];
+    for (i, set) in slots.iter().enumerate() {
+        let key = format!("${}", i);
+        let mut next = Vec::with_capacity(out.len() * set.len());
+        for t in &out {
+            for s in set.iter() {
+                next.push(t.replace(&key, s));
+            }
+        }
+        out = next;
+    }
+    out
+}
+
+/// Single-instruction lines: acceptance and bytes must be those of clang (both ways).
+fn matrix(name: &str, lines: &[String]) {
+    if !clang_works() {
+        println!("{}: clang not found, matrix skipped", name);
+        return;
+    }
+    let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+    let theirs = clang_each(&refs);
+    let (mut bad, mut accepted) = (Vec::new(), 0);
+    for (l, t) in refs.iter().zip(theirs) {
+        match (ours_bytes(l), t) {
+            (Ok(a), Some(b)) => {
+                accepted += 1;
+                if a != b {
+                    bad.push(format!("DIFF {}: ours {} clang {}", l, hex(&a), hex(&b)));
+                }
+            }
+            (Ok(_), None) => bad.push(format!("OVER {}", l)),
+            (Err(e), Some(_)) => bad.push(format!("GAP {}: {}", l, e.split(" (").next().unwrap_or(""))),
+            (Err(_), None) => {}
+        }
+    }
+    println!("{}: {} lines, {} valid, {} problems", name, refs.len(), accepted, bad.len());
+    if !bad.is_empty() {
+        // a summary: the first few problems of each kind and mnemonic
+        let mut seen: std::collections::BTreeMap<String, (usize, Vec<String>)> = Default::default();
+        for p in &bad {
+            let mut it = p.split_whitespace();
+            let kind = it.next().unwrap_or("");
+            let mn = it.next().unwrap_or("");
+            let e = seen.entry(format!("{} {}", kind, mn)).or_default();
+            e.0 += 1;
+            if e.1.len() < 4 {
+                e.1.push(p.clone());
+            }
+        }
+        for (k, (n, samples)) in &seen {
+            println!("SUMMARY {} x{}", k, n);
+            for sm in samples {
+                println!("    {}", sm);
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}: {} problems\n{}", name, bad.len(), bad.iter().take(60).cloned().collect::<Vec<_>>().join("\n"));
+}
+
+const GPR: &[&str] = &["x0", "x28", "sp", "xzr", "w0", "w30", "wsp", "wzr"];
+const SHIFTS: &[&str] = &["", ", lsl #3", ", lsr #1", ", asr #63", ", ror #4", ", uxtw", ", sxtx #2", ", uxtb", ", sxth #4", ", uxtx #5", ", lsl #0", ", lsl #64", ", lsl #31", ", lsr #32", ", sxtw #4"];
+
+#[test]
+fn matrix_addsub_registers() {
+    let mut lines = Vec::new();
+    for op in ["add", "adds", "sub", "subs"] {
+        lines.extend(combos(&format!("{} $0, $1, $2$3", op), &[GPR, GPR, GPR, SHIFTS]));
+    }
+    for op in ["cmp", "cmn"] {
+        lines.extend(combos(&format!("{} $0, $1$2", op), &[GPR, GPR, SHIFTS]));
+    }
+    for op in ["neg", "negs"] {
+        lines.extend(combos(&format!("{} $0, $1$2", op), &[GPR, GPR, SHIFTS]));
+    }
+    matrix("addsub_registers", &lines);
+}
+
+#[test]
+fn matrix_addsub_immediates() {
+    let imms = &["#0", "#1", "#4095", "#4096", "#0xfff000", "#-1", "#-4096", "#0x1001", "#0xfff001", "#-0xfff000", "#0x1000000", "#4095, lsl #12", "#1, lsl #0", "#1, lsl #24", "#0, lsl #12", "#-1, lsl #12"];
+    let mut lines = Vec::new();
+    for op in ["add", "adds", "sub", "subs"] {
+        lines.extend(combos(&format!("{} $0, $1, $2", op), &[GPR, GPR, imms]));
+    }
+    for op in ["cmp", "cmn"] {
+        lines.extend(combos(&format!("{} $0, $1", op), &[GPR, imms]));
+    }
+    matrix("addsub_immediates", &lines);
+}
+
+#[test]
+fn matrix_logical() {
+    let imms = &["#0", "#1", "#-1", "#0xff", "#0xff00ff00", "#0x5555555555555555", "#0x80000000", "#0xffffffff", "#0x100000000", "#-16", "#0xf0f0f0f0f0f0f0f0", "#0xfffffffffffffffe", "#0x7fffffff", "#-2147483648"];
+    let mut lines = Vec::new();
+    for op in ["and", "orr", "eor", "ands", "bic", "orn", "eon", "bics"] {
+        lines.extend(combos(&format!("{} $0, $1, $2$3", op), &[GPR, GPR, GPR, SHIFTS]));
+        lines.extend(combos(&format!("{} $0, $1, $2", op), &[GPR, GPR, imms]));
+    }
+    for op in ["tst"] {
+        lines.extend(combos(&format!("{} $0, $1$2", op), &[GPR, GPR, SHIFTS]));
+        lines.extend(combos(&format!("{} $0, $1", op), &[GPR, imms]));
+    }
+    lines.extend(combos("mvn $0, $1$2", &[GPR, GPR, SHIFTS]));
+    lines.extend(combos("mov $0, $1", &[GPR, GPR]));
+    lines.extend(combos("mov $0, $1", &[GPR, imms]));
+    matrix("logical", &lines);
+}
+
+#[test]
+fn matrix_arith_misc() {
+    let mut lines = Vec::new();
+    for op in ["mul", "mneg", "sdiv", "udiv", "adc", "adcs", "sbc", "sbcs", "lsl", "lsr", "asr", "ror", "smull", "umull", "smnegl", "umnegl", "smulh", "umulh", "crc32w", "crc32cx", "crc32b"] {
+        lines.extend(combos(&format!("{} $0, $1, $2", op), &[GPR, GPR, GPR]));
+    }
+    for op in ["madd", "msub", "smaddl", "umaddl", "smsubl", "umsubl"] {
+        lines.extend(combos(&format!("{} $0, $1, $2, $3", op), &[&["x0", "xzr", "w1", "sp"], &["x1", "w2", "wzr"], &["x2", "w3", "xzr"], &["x3", "w4", "xzr"]]));
+    }
+    for op in ["clz", "cls", "rbit", "rev", "rev16", "rev32", "rev64", "ngc", "ngcs", "uxtb", "uxth", "sxtb", "sxth", "sxtw", "uxtw"] {
+        lines.extend(combos(&format!("{} $0, $1", op), &[GPR, GPR]));
+    }
+    for op in ["lsl", "lsr", "asr", "ror"] {
+        lines.extend(combos(&format!("{} $0, $1, $2", op), &[&["x0", "w1", "xzr"], &["x1", "w2", "wzr"], &["#0", "#1", "#31", "#32", "#63", "#64", "#-1"]]));
+    }
+    for op in ["csel", "csinc", "csinv", "csneg"] {
+        lines.extend(combos(&format!("{} $0, $1, $2, $3", op), &[&["x0", "w1", "sp"], &["x1", "w2", "xzr", "wzr"], &["x2", "w3", "xzr", "wzr"], &["eq", "hs", "lo", "al", "nv", "ge"]]));
+    }
+    for op in ["cset", "csetm"] {
+        lines.extend(combos(&format!("{} $0, $1", op), &[&["x0", "w1", "sp", "xzr"], &["eq", "hs", "al", "nv", "lt"]]));
+    }
+    for op in ["cinc", "cinv", "cneg"] {
+        lines.extend(combos(&format!("{} $0, $1, $2", op), &[&["x0", "w1", "sp"], &["x1", "w2", "xzr", "wzr"], &["eq", "hs", "al", "nv", "lt"]]));
+    }
+    for op in ["ccmp", "ccmn"] {
+        lines.extend(combos(&format!("{} $0, $1, $2, $3", op), &[&["x0", "w1", "xzr"], &["x1", "w2", "#0", "#31", "#32", "wzr"], &["#0", "#15", "#16"], &["eq", "al", "lt"]]));
+    }
+    for op in ["extr"] {
+        lines.extend(combos(&format!("{} $0, $1, $2, $3", op), &[&["x0", "w1"], &["x1", "w2"], &["x2", "w3"], &["#0", "#31", "#32", "#63", "#64"]]));
+    }
+    for op in ["ubfx", "sbfx", "ubfiz", "sbfiz", "bfi", "bfxil"] {
+        lines.extend(combos(&format!("{} $0, $1, $2, $3", op), &[&["x0", "w1"], &["x1", "w2"], &["#0", "#1", "#31", "#32", "#63"], &["#1", "#8", "#32", "#33", "#64"]]));
+    }
+    for op in ["ubfm", "sbfm", "bfm"] {
+        lines.extend(combos(&format!("{} $0, $1, $2, $3", op), &[&["x0", "w1"], &["x1", "w2"], &["#0", "#31", "#32", "#63", "#64"], &["#0", "#31", "#32", "#63"]]));
+    }
+    lines.extend(combos("bfc $0, $1, $2", &[&["x0", "w1", "xzr"], &["#0", "#8", "#32", "#63"], &["#1", "#8", "#32", "#64"]]));
+    for op in ["movz", "movn", "movk"] {
+        lines.extend(combos(&format!("{} $0, $1$2", op), &[&["x0", "w1", "xzr", "sp"], &["#0", "#0xffff", "#0x10000", "#-1"], &["", ", lsl #0", ", lsl #16", ", lsl #32", ", lsl #48", ", lsl #8", ", lsl #64"]]));
+    }
+    matrix("arith_misc", &lines);
+}
+
+#[test]
+fn matrix_memory() {
+    let rt = &["x0", "w0", "xzr", "wzr", "sp", "b0", "h0", "s0", "d0", "q0"];
+    let addr = &["", ", #8", ", #-8", ", #3", ", #4096", ", #32760", ", #-256", ", #255", ", #256", ", #-257", ", x2", ", x2, lsl #3", ", x2, lsl #2", ", w2, uxtw", ", w2, sxtw #3", ", x2, sxtx", ", w2, sxtw #2", ", x2, lsl #0", ", w2, uxtw #0", ", x2, lsl #1", ", x2, lsl #4", ", w2, sxtw", ", x2, uxtx", ", x2, sxtw", ", w2, lsl #3"];
+    let bases = &["x1", "sp", "w1", "xzr"];
+    let tails = &["", "!", "], #8"];
+    let mut lines = Vec::new();
+    for op in ["ldr", "str", "ldrb", "strb", "ldrh", "strh", "ldrsb", "ldrsh", "ldrsw", "ldur", "stur", "ldurb", "ldursw", "ldtr", "sttrb", "ldapur", "stlurh", "ldapursw", "prfm", "prfum"] {
+        for t in tails {
+            let tmpl = if t.is_empty() { format!("{} $0, [$1$2]", op) } else if *t == "!" { format!("{} $0, [$1$2]!", op) } else { format!("{} $0, [$1$2{}", op, t) };
+            lines.extend(combos(&tmpl, &[rt, bases, addr]));
+        }
+    }
+    for op in ["ldp", "stp", "ldpsw", "ldnp", "stnp"] {
+        for t in tails {
+            let tmpl = if t.is_empty() { format!("{} $0, $0, [$1$2]", op) } else if *t == "!" { format!("{} $0, $0, [$1$2]!", op) } else { format!("{} $0, $0, [$1$2{}", op, t) };
+            lines.extend(combos(&tmpl, &[&["x0", "w0", "xzr", "s0", "d0", "q0", "x1"], &["x1", "sp"], &["", ", #8", ", #-8", ", #4", ", #16", ", #504", ", #512", ", #-512", ", #252", ", #1008", ", #-1024", ", #-1040", ", x2"]]));
+        }
+    }
+    matrix("memory", &lines);
+}
+
+#[test]
+fn matrix_branches_and_system() {
+    let mut lines = Vec::new();
+    for op in ["br", "blr", "ret"] {
+        lines.extend(combos(&format!("{} $0", op), &[&["x0", "x30", "w0", "xzr", "sp", "lr", ""]]));
+    }
+    for op in ["cbz", "cbnz"] {
+        lines.extend(combos(&format!("{} $0, $1", op), &[&["x0", "w1", "xzr", "sp"], &["lab", "#8", "#4", "#3", "#1048576", "#-1048576", "#1048580"]]));
+    }
+    for op in ["tbz", "tbnz"] {
+        lines.extend(combos(&format!("{} $0, $1, $2", op), &[&["x0", "w1", "xzr", "sp"], &["#0", "#31", "#32", "#63", "#64"], &["lab", "#8", "#32768", "#-32768", "#32764"]]));
+    }
+    for op in ["b", "bl", "b.eq", "b.lt"] {
+        lines.extend(combos(&format!("{} $0", op), &[&["lab", "#8", "#4", "#2", "#134217728", "#-134217728", "#134217724", "#1048576"]]));
+    }
+    for op in ["adr", "adrp"] {
+        lines.extend(combos(&format!("{} $0, $1", op), &[&["x0", "w1", "xzr", "sp"], &["lab", "#0", "#4", "#4096", "#8192", "#-4096", "#1048575", "#1048576", "#4294967296", "#4294963200", "#-4294967296"]]));
+    }
+    for op in ["svc", "hvc", "smc", "brk", "hlt", "udf", "hint"] {
+        lines.extend(combos(&format!("{} $0", op), &[&["#0", "#1", "#255", "#127", "#128", "#65535", "#65536", "#-1"]]));
+    }
+    for op in ["dmb", "dsb"] {
+        lines.extend(combos(&format!("{} $0", op), &[&["sy", "ish", "ishst", "ishld", "ld", "st", "osh", "oshld", "oshst", "nsh", "nshld", "nshst", "#0", "#4", "#15", "#16", "isb", "foo"]]));
+    }
+    lines.extend(combos("isb $0", &[&["", "sy", "#0", "#15", "#16", "ish"]]));
+    lines.extend(combos("clrex $0", &[&["", "#0", "#15", "#16"]]));
+    lines.extend(combos("msr $0, #$1", &[&["daifset", "daifclr", "spsel", "uao", "pan", "dit", "ssbs", "tco", "fpcr"], &["0", "1", "7", "15", "16"]]));
+    for op in ["dc", "ic", "tlbi", "at"] {
+        lines.extend(combos(&format!("{} $0$1", op), &[&["zva", "cvac", "cvau", "civac", "ivac", "isw", "csw", "cisw", "cvap", "iallu", "ialluis", "ivau", "vmalle1is", "vae1is", "vmalle1", "s1e1r", "s1e0w", "foo"], &["", ", x0", ", xzr", ", w0", ", sp"]]));
+    }
+    for op in ["mrs", "msr"] {
+        lines.extend(combos(&format!("{} $0", op), &[&["x0, nzcv", "x0, fpcr", "xzr, tpidr_el0", "w0, fpcr", "sp, fpsr", "x0, x1", "x0, s3_3_c4_c4_0", "x0, s4_3_c4_c4_0", "x0, s3_8_c4_c4_0", "x0, s3_3_c16_c4_0", "x0, s3_3_c4_c4_8", "fpcr, x0", "fpcr, xzr", "tpidr_el0, w0", "s3_3_c4_c4_0, x0", "nzcv, #1", "ctr_el0, x0"]]));
+    }
+    matrix("branches_and_system", &lines);
+}
+
+#[test]
+fn unencodable_logical_immediates_are_errors() {
+    for l in ["eor x0, x0, #0x55", "and x0, x1, #0", "orr x0, x1, #-1", "and w0, w1, #0xffffffff", "orr x0, x1, #0x12345"] {
+        let e = ours_bytes(l).unwrap_err();
+        assert!(e.contains("logical immediate"), "{}: {}", l, e);
+    }
+}
