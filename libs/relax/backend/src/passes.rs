@@ -3240,6 +3240,16 @@ pub fn div_by_const(f: &mut Func, kn: &[Option<K>], nv: usize) -> bool {
     for bi in 0..f.blocks.len() {
         let mut k = 0;
         while k < f.blocks[bi].insts.len() {
+            // by 1: x / 1 is x, x % 1 is 0 (any signedness; `len / size_of::<T>()` of byte
+            // slices, `n / step` of a step of 1)
+            if let Inst::IBin(op @ (IOp::Div | IOp::Rem), _, d, x, y) = f.blocks[bi].insts[k] {
+                if (y.0 as usize) < nv && kn[y.0 as usize] == Some(K::I(1)) {
+                    f.blocks[bi].insts[k] = if op == IOp::Div { Inst::Mov(d, x) } else { Inst::Iconst(d, 0) };
+                    changed = true;
+                    k += 1;
+                    continue;
+                }
+            }
             // signed by a power of two 2^s (s < 31): bias = (x >>a 63) >>u (64 - s) is 2^s - 1 for
             // negative x, else 0; t = x + bias; quotient t >>a s, remainder x - (t & -2^s) (x is
             // sign-extended to 64 bits, so 64-bit steps are exact; the last step re-extends)
