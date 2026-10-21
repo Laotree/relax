@@ -92,6 +92,7 @@ pub fn reg_config() -> RegConfig {
         clobbers: None,
         sym_class: 0,
         store_imm: |k| k == 0,
+        fconst_remat: true,
     }
 }
 
@@ -612,6 +613,8 @@ enum CondBr {
 }
 
 struct Gen<'a> {
+    /// isel_flags(options) & A64_FCONST: float constants by fmov #imm / literal loads
+    fconst_isel: bool,
     /// the block ends `t = x & K; t ==/!= 0; branch`: emitted as tst x, #K (the And skipped)
     test_fuse: Option<(VReg, i64)>,
     /// a compare whose flags the selects right after it read (csel / fcsel on the condition, no
@@ -769,7 +772,15 @@ impl<'a> Gen<'a> {
             Remat::FnAddr(id) => self.ldr_reloc(r, Reloc::Thunk(id)),
             Remat::Offset(..) => unreachable!("base + k moves through use_i"),
             Remat::VConst(_) => unreachable!("a vector constant is made by use_f"),
+            Remat::FConst(..) => unreachable!("a float constant is made by use_f / fconst_to"),
             Remat::No => self.a.mov_imm(r, 0),
+        }
+    }
+    /// A recomputed float constant (Remat::FConst) into x.
+    fn fconst_to(&mut self, x: u8, v: VReg) {
+        match self.al.remat[v.0 as usize] {
+            Remat::FConst(bits, f64_) => self.fconst_into(x, bits, f64_),
+            r => unreachable!("float move from {:?}", r),
         }
     }
     /// A stack-slot address without a register (Alloc::remat) as a load/store base: sp + its offset.
@@ -852,8 +863,10 @@ impl<'a> Gen<'a> {
             }
             // recomputed at each use (Alloc::remat)
             Loc::None => {
-                if let Remat::VConst(bits) = self.al.remat[v.0 as usize] {
-                    self.vconst_into(scratch, bits);
+                match self.al.remat[v.0 as usize] {
+                    Remat::VConst(bits) => self.vconst_into(scratch, bits),
+                    Remat::FConst(bits, f64_) => self.fconst_into(scratch, bits, f64_),
+                    _ => {}
                 }
                 scratch
             }
@@ -905,12 +918,17 @@ impl<'a> Gen<'a> {
                 }
                 (MLoc::R(d), MLoc::F(s)) => self.a.fmov_to_gp(true, d, s),
                 (MLoc::F(d), MLoc::R(s)) => self.a.fmov_from_gp(true, d, s),
+                (MLoc::F(d), MLoc::K(v)) => self.fconst_to(d, VReg(v)),
+                (MLoc::M(o), MLoc::K(v)) if self.cls(VReg(v)) != Cls::I => {
+                    self.fconst_to(FS1, VReg(v));
+                    self.a.ldst(STRD, 8, FS1, SP, o as i64);
+                }
                 (MLoc::R(d), MLoc::K(v)) => self.remat_into(d, VReg(v)),
                 (MLoc::M(o), MLoc::K(v)) => {
                     self.remat_into(S1, VReg(v));
                     self.a.ldst(STRX, 8, S1, SP, o as i64);
                 }
-                (d @ (MLoc::F(_) | MLoc::K(_)), s) => unreachable!("move {:?} <- {:?}", d, s),
+                (d @ MLoc::K(_), s) => unreachable!("move {:?} <- {:?}", d, s),
             }
         }
     }
@@ -1871,6 +1889,28 @@ impl<'a> Gen<'a> {
         // add s1, n, m, lsl sh (vldst's large-offset form uses ip1)
         self.a.e(0x8B00_0000 | (m as u32) << 16 | (sh as u32) << 10 | (n as u32) << 5 | S1 as u32);
         self.vldst(load, t, S1, off);
+    }
+
+    /// A float constant into x: fmov #0 / #imm8, else one literal load (ldr d / ldr s from the pool
+    /// after the code), else (code past the literal range) through ip0.
+    fn fconst_into(&mut self, x: u8, bits: u64, f64_: bool) {
+        if bits == 0 {
+            self.a.fmov_from_gp(true, x, ZR);
+        } else if !self.fconst_isel {
+            self.a.mov_imm(IP0, bits as i64);
+            self.a.fmov_from_gp(f64_, x, IP0);
+        } else if let Some(imm8) = fp_imm8(bits, f64_) {
+            // fmov dd/sd, #imm
+            self.a.e(0x1E20_1000 | if f64_ { DBL } else { 0 } | imm8 << 13 | x as u32);
+        } else if !self.long {
+            // ldr dd / sd, =bits (an f32 reads the low word of its 8-byte entry)
+            let at = self.a.pos();
+            self.a.e(if f64_ { 0x5C00_0000 } else { 0x1C00_0000 } | x as u32);
+            self.fpool.push((at, if f64_ { bits } else { bits & 0xffff_ffff }));
+        } else {
+            self.a.mov_imm(IP0, bits as i64);
+            self.a.fmov_from_gp(f64_, x, IP0);
+        }
     }
 
     fn vldst(&mut self, load: bool, t: u8, n: u8, off: i64) {
@@ -2951,10 +2991,10 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn inst(&mut self, options: &relax_session::Options, i: &Inst) {
+    fn inst(&mut self, _options: &relax_session::Options, i: &Inst) {
         match i {
             // recomputed at each use (Alloc::remat)
-            Inst::Iconst(d, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::Mov(d, _) | Inst::IBinI(IOp::Add, _, d, _, _) if self.al.remat[d.0 as usize].is_some() => {}
+            Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::Mov(d, _) | Inst::IBinI(IOp::Add, _, d, _, _) if self.al.remat[d.0 as usize].is_some() => {}
             Inst::Iconst(d, v) => {
                 let r = self.def_i(*d, S0);
                 self.a.mov_imm(r, *v);
@@ -2962,23 +3002,7 @@ impl<'a> Gen<'a> {
             }
             Inst::Fconst(d, bits, f64_) => {
                 let x = self.def_f(*d, FS0);
-                if *bits == 0 {
-                    self.a.fmov_from_gp(true, x, ZR);
-                } else if isel_flags(options) & A64_FCONST == 0 {
-                    self.a.mov_imm(IP0, *bits as i64);
-                    self.a.fmov_from_gp(*f64_, x, IP0);
-                } else if let Some(imm8) = fp_imm8(*bits, *f64_) {
-                    // fmov dd/sd, #imm
-                    self.a.e(0x1E20_1000 | if *f64_ { DBL } else { 0 } | imm8 << 13 | x as u32);
-                } else if *f64_ && !self.long {
-                    // ldr dd, =bits (literal pool after the code)
-                    let at = self.a.pos();
-                    self.a.e(0x5C00_0000 | x as u32);
-                    self.fpool.push((at, *bits));
-                } else {
-                    self.a.mov_imm(IP0, *bits as i64);
-                    self.a.fmov_from_gp(*f64_, x, IP0);
-                }
+                self.fconst_into(x, *bits, *f64_);
                 self.fin_f(*d, x);
             }
             // pieces of one split value sharing a slot
@@ -3618,6 +3642,10 @@ impl<'a> Gen<'a> {
                         self.a.ldst(LDRX, 8, S1, SP, o as i64);
                         self.a.ldst(STRX, 8, S1, SP, 8 * k);
                     }
+                    MLoc::K(v) if self.cls(VReg(v)) != Cls::I => {
+                        self.fconst_to(FS1, VReg(v));
+                        self.a.ldst(STRD, 8, FS1, SP, 8 * k);
+                    }
                     MLoc::K(v) => {
                         self.remat_into(S1, VReg(v));
                         self.a.ldst(STRX, 8, S1, SP, 8 * k);
@@ -3904,6 +3932,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         block_pos: Vec::new(),
         next_block: Vec::new(),
         fixups: Vec::new(),
+        fconst_isel: isel_flags(options) & A64_FCONST != 0,
         fpool: Vec::new(),
         vpool: Vec::new(),
         apool: Vec::new(),

@@ -29,6 +29,8 @@ pub struct RegConfig {
     /// which recomputed constants a store writes straight from the instruction (x64: imm32,
     /// sign-extended for 8 bytes; arm64: 0 from xzr): such stores need no register for them
     pub store_imm: fn(i64) -> bool,
+    /// scalar float constants are recomputed at their uses instead of spilled (Remat::FConst)
+    pub fconst_remat: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -118,6 +120,9 @@ pub enum Remat {
     /// a V128 constant: every lane `bits` (`Inst::VConst`): one movi / literal load at a use beats a
     /// spill store at the definition and a reload at each use
     VConst(u32),
+    /// a scalar float constant (`Inst::Fconst`: bits, f64?) where the target loads one in a single
+    /// instruction at a use (`RegConfig::fconst_remat`; arm64: fmov #imm or a literal load)
+    FConst(u64, bool),
     /// a symbol's value (relocated: loaded from the address pool)
     Addr(Sym),
     /// a function's table thunk
@@ -2188,6 +2193,7 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
                     Inst::Addr(d, a) if crate::rir::SymClass::of(cfg.sym_class, a.id) != crate::rir::SymClass::Domain => cand.push((d.0, Remat::Addr(*a))),
                     Inst::FnAddr(d, n) => cand.push((d.0, Remat::FnAddr(*n))),
                     Inst::VConst(d, bits) => cand.push((d.0, Remat::VConst(*bits))),
+                    Inst::Fconst(d, bits, w) if cfg.fconst_remat => cand.push((d.0, Remat::FConst(*bits, *w))),
                     Inst::IBinI(IOp::Add, IntTy { bits: 64, .. }, d, b2, k) if *k == *k as i32 as i64 => cand.push((d.0, Remat::Offset(*b2, *k as i32))),
                     Inst::Mov(d, s2) => movs.push((d.0, s2.0)),
                     Inst::Call(c, a, _) => {
@@ -2260,6 +2266,7 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
             let same_const = matches!(i, Remat::Const(_)) && kdefs[d].2 && kdefs[d].1 == ndef[d];
             let cls_ok = match i {
                 Remat::VConst(_) => f.vregs[d] == Cls::V128,
+                Remat::FConst(_, w) => f.vregs[d] == if w { Cls::F64 } else { Cls::F32 },
                 _ => f.vregs[d] == Cls::I,
             };
             if (ndef[d] == 1 || same_const) && !bad[d] && cls_ok {
