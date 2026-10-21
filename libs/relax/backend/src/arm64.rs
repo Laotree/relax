@@ -2210,6 +2210,16 @@ impl<'a> Gen<'a> {
                 self.v2(0x0E61_7800, xd, xa); // fcvtl .2d, .2s
                 self.fin_f(d, xd);
             }
+            VX::MoveMask(VW::D) => {
+                // two lanes: ushr #63; lane 0 | lane 1 << 1 (fmov x, d; umov x, v.d[1]; orr .., lsl #1)
+                let xa = self.use_f(a, FS0);
+                self.v2(0x6F00_0400 | 65 << 16, T0, xa); // ushr v.2d, #63 (immh:immb = 128 - 63)
+                let rd = self.def_i(d, S0);
+                self.v2(0x9E66_0000, rd, T0); // fmov x, d (lane 0)
+                self.a.e(0x4E18_3C00 | (T0 as u32) << 5 | IP0 as u32); // umov x16, v.d[1]
+                self.a.e(0xAA00_0000 | (IP0 as u32) << 16 | 1 << 10 | (rd as u32) << 5 | rd as u32); // orr rd, rd, x16, lsl #1
+                self.fin_i(d, rd);
+            }
             VX::MoveMask(w) if w != VW::B => {
                 // top bits to 0/1 lanes, each shifted to its lane index, summed across
                 let xa = self.use_f(a, FS0);
@@ -3113,6 +3123,10 @@ impl<'a> Gen<'a> {
         match i {
             // recomputed at each use (Alloc::remat)
             Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::Mov(d, _) | Inst::IBinI(IOp::Add, _, d, _, _) if self.al.remat[d.0 as usize].is_some() => {}
+            // pure values nothing reads (a constant whose only use became an immediate form, a
+            // copy into a dead variable): not built (a hoisted 64-bit mask was 4 instructions)
+            Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::VConst(d, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::Mov(d, _) | Inst::IBinI(_, _, d, _, _) | Inst::Conv(Conv::IntToInt(_), d, _)
+                if self.al.uses[d.0 as usize] == 0 => {}
             Inst::Iconst(d, v) => {
                 let r = self.def_i(*d, S0);
                 self.a.mov_imm(r, *v);
