@@ -238,6 +238,14 @@ impl Asm {
                 ones += 1;
             }
         }
+        // a value movz/movn + movk need 2+ instructions for that is a logical immediate (SWAR masks
+        // 0x8080.., 0x0101.., 0x00ff00ff..): orr d, xzr, #imm (register 31 is sp as orr's destination)
+        if zeros.max(ones) < 3 && d != 31 {
+            if let Some((n, immr, imms)) = bitmask_imm(u) {
+                self.e(0xB200_03E0 | n << 22 | immr << 16 | imms << 10 | d as u32);
+                return;
+            }
+        }
         if ones > zeros {
             // movn then movk the halves that are not 0xffff
             let mut first = true;

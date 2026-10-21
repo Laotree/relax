@@ -58,3 +58,24 @@ fn constant_multiplies_wrap_like_rust() {
         }
     }
 }
+
+/// Integer constants of every shape (one 16-bit half, movn forms, logical immediates such as
+/// SWAR masks, arbitrary 64-bit values) come back exactly.
+#[test]
+fn integer_constants_materialise_exactly() {
+    let vals: [u64; 14] = [0, 1, 0xffff, 0x1_0000, 0xffff_ffff_ffff_ffff, 0xffff_ffff_ffff_0000, 0x8080_8080_8080_8080, 0x0101_0101_0101_0101, 0x00ff_00ff_00ff_00ff, 0x7f7f_7f7f_7f7f_7f7f, 0x5555_5555_5555_5555, 0x0000_ffff_0000_ffff, 0xdead_beef_cafe_f00d, 0x0f0f_0f0f_0f0f_0f0e];
+    for v in vals {
+        let mut f = Func::new("k".into(), 0);
+        f.params = vec![];
+        f.rets = vec![Cls::I];
+        f.block();
+        let d = f.vreg(Cls::I);
+        f.blocks[0].insts.push(Inst::Iconst(d, v as i64));
+        f.blocks[0].pos.push(0);
+        f.blocks[0].term = Term::Ret(vec![d]);
+        f.verify().unwrap();
+        let code = compile(&f);
+        let run: extern "C" fn() -> u64 = unsafe { std::mem::transmute(code.ptr()) };
+        assert_eq!(run(), v, "{v:#x}");
+    }
+}
