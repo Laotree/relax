@@ -273,6 +273,7 @@ impl Plan {
                     for (alias, qual, target) in &scan.aliases { Arc::make_mut(&mut table).add_alias(c.name.clone(), alias.clone(), (qual.clone(), target.clone())); }
                     for name in &scan.macro_use { Arc::make_mut(&mut table).macro_use.entry(c.name.clone()).or_default().push(name.clone()); }
                     modules.mods.extend(scan.mods.iter().cloned());
+                    modules.items.extend(scan.mod_items.iter().cloned());
                     for u in &scan.uses {
                         if let Some(bind) = &u.bind {
                             if u.path.last() != Some(bind) { modules.renames.insert(bind.clone()); }
