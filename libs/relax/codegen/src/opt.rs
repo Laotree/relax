@@ -204,11 +204,6 @@ pub struct InlineLimits {
 impl InlineLimits {
     /// O1 ("obviously inline"); MAKEPAD_RUN_INLINE_LEAF=insts,blocks overrides the leaf rule
     pub fn tier0(options: &relax_session::Options) -> InlineLimits {
-        // MAKEPAD_RUN_OPT=+inlinesize: size first (a module export): callees about as small as
-        // the call, plus #[inline(always)] ones of moderate size
-        if relax_backend::stats::opt_off(options, "+inlinesize") {
-            return InlineLimits { budget: 200, leaf_insts: 8, leaf_blocks: 2, hint_insts: 12, chain_insts: 12, always_insts: 40, free_any: false, ordered: false, hot_insts: 0, growth_limit: None };
-        }
         let (leaf_insts, leaf_blocks) = leaf_budget(options);
         InlineLimits { budget: INLINE_BUDGET, leaf_insts, leaf_blocks, hint_insts: INLINE_HINT_INSTS, chain_insts: INLINE_CHAIN_INSTS, always_insts: 200, free_any: false, ordered: false, hot_insts: 0, growth_limit: None }
     }
