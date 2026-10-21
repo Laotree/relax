@@ -3070,7 +3070,7 @@ fn summary_inner(why: &str) {
         let q = jit::TIER_QUEUED.load(Ordering::Relaxed);
         if q > 0 {
             verbose!(
-                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); cpu {:.0} ms on the owner, {:.0} ms off it",
+                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); snapshots {:.0} ms cpu on the owner ({} inline candidates built there, {:.0} ms; {} fronts off it, {:.0} ms cpu), back ends {:.0} ms cpu off it",
                 jit::ahead_level().name(),
                 q,
                 jit::TIER_REVALIDATED.load(Ordering::Relaxed),
@@ -3081,6 +3081,10 @@ fn summary_inner(why: &str) {
                 jit::TIER1_RIR_REBUILT[0].load(Ordering::Relaxed),
                 jit::TIER1_RIR_REBUILT[1].load(Ordering::Relaxed) as f64 / 1e6,
                 s.tier1_locked_ns as f64 / 1e6,
+                jit::TIER1_SNAP_BUILT[0].load(Ordering::Relaxed),
+                jit::TIER1_SNAP_BUILT[1].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_SNAP_FRONTS[0].load(Ordering::Relaxed),
+                jit::TIER1_SNAP_FRONTS[1].load(Ordering::Relaxed) as f64 / 1e6,
                 s.tier1_free_ns as f64 / 1e6,
             );
         }

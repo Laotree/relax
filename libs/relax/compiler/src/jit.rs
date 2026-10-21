@@ -11200,11 +11200,26 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         if let FnKey::Inst(d, args) = key {
             let _preemptible = crate::preempt::Preemptible::on();
             typeck_ahead(&front, d, args, 0, false, false);
+            // and its lowering: the snapshot below only takes the RIR
+            if pipelined() { lower_ahead(&front, id, true); }
         }
     }
-    drop(front);
     let gave_way = std::cell::Cell::new(false);
+    // The inline candidates' front ends (type check, lowering) run on this thread, not on the
+    // owner: a snapshot that meets a candidate without RIR whose front this build has not run
+    // yet hands it back (`fronts`) instead of building it; this thread checks and lowers those
+    // off the unit (typeck_ahead, lower_ahead) and asks again, one traversal level per round.
+    // The owner's build then only takes the lowered RIR (O1 optimisation and the candidate's own
+    // small inline candidates stay there). Warm Stage: single snapshots of 100-680 ms on the owner.
+    let prefront = !owner::is_owner() && !t1prof_replay(options) && pipelined();
+    let mut fronted: std::collections::HashSet<u32> = Default::default();
+    let fronts: std::cell::RefCell<Vec<(u32, DefId, Vec<TyId>)>> = Default::default();
+    // owner cpu of the snapshot requests (cpu_ns is per thread: read on the owner)
+    let owner_ns = std::cell::Cell::new(0u64);
+    let snapped = loop {
+    fronts.borrow_mut().clear();
     let snapped = owner::call(owner::Class::Background, || {
+    let s0 = cpu_ns();
         trace_tier1_phase(id, "snapshot");
         cost_name(up, id);
         compile_watch(Some((&format!("tier1 locked: {}", (&*up).fns[id as usize].name), 0)));
@@ -11329,9 +11344,20 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let source_size = src_size(u, c);
         if force || cached_code || source_size <= src_toks || attr & relax_codegen::opt::ATTR_ALWAYS != 0
             || (single && source_size <= TIER1_SINGLE_SRC_TOKS) {
+            if prefront && !fronted.contains(&c) {
+                if let FnKey::Inst(d, args) = &u.fns[c as usize].key {
+                    if matches!(u.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn) {
+                        fronts.borrow_mut().push((c, *d, args.clone()));
+                        return;
+                    }
+                }
+            }
+            let t = wall_ns();
             compile_watch(Some((&format!("O3 snapshot: build_rir {}", u.fns[c as usize].name), 0)));
             let _ = build_rir(up, c);
             compile_watch(None);
+            TIER1_SNAP_BUILT[0].fetch_add(1, Ordering::Relaxed);
+            TIER1_SNAP_BUILT[1].fetch_add(wall_ns() - t, Ordering::Relaxed);
         }
     };
     let mut frontier = callees.clone();
@@ -11401,7 +11427,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             seen = end;
         }
     }
-    if gave_way.get() {
+    // candidates whose fronts this thread runs first: asked again after them
+    if gave_way.get() || !fronts.borrow().is_empty() {
+        owner_ns.set(owner_ns.get() + cpu_ns() - s0);
         return None;
     }
     for &c in &callees { (&mut *up).sync_entry_ref(c); }
@@ -11511,10 +11539,33 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             crate::clock::ms_since_start(), if sampled_positions.is_some() { "sampled" } else { "structural" },
             u.frequency_profiles.get(&id).map_or(0, |h| h.samples), name);
     }
-    let t1 = cpu_ns();
-    Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, sampled_positions, t1))
+    owner_ns.set(owner_ns.get() + cpu_ns() - s0);
+    Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, sampled_positions))
     });
-    let Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, sampled_positions, t1)) = snapped else {
+    let more = std::mem::take(&mut *fronts.borrow_mut());
+    if snapped.is_some() || gave_way.get() || more.is_empty() {
+        break snapped;
+    }
+    // this round's candidates: their type checks and lowering here, off the unit
+    let tf = cpu_ns();
+    TIER1_SNAP_FRONTS[0].fetch_add(more.len() as u64, Ordering::Relaxed);
+    for (c, d, args) in more {
+        fronted.insert(c);
+        let _preemptible = crate::preempt::Preemptible::on();
+        typeck_ahead(&front, d, args, 1, false, true);
+        lower_ahead(&front, c, true);
+    }
+    TIER1_SNAP_FRONTS[1].fetch_add(cpu_ns() - tf, Ordering::Relaxed);
+    };
+    // lowerings ahead that no snapshot build took (a candidate built meanwhile, or given way):
+    // not kept for the rest of the run
+    if !fronted.is_empty() {
+        let mut lowered = front.lowered.lock().unwrap_or_else(|e| e.into_inner());
+        for c in &fronted { lowered.remove(c); }
+    }
+    drop(front);
+    let t1 = cpu_ns();
+    let Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, sampled_positions)) = snapped else {
         if gave_way.get() {
             tier_push(id, Q_RETIER, 0);
         }
@@ -11693,7 +11744,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         trace_tier1_phase(id, "install");
         let _cost_install = relax_codegen::fncost::phase(6);
         let u = &mut *up;
-        u.stats.tier1_locked_ns += (t1 - t0) + (cpu_ns() - t2);
+        u.stats.tier1_locked_ns += owner_ns.get();
         u.stats.tier1_free_ns += t2 - t1;
         let ok = match built {
             Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, frame_size, self_call, nounwind_used, profile_entry)))) if PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && !crate::inspect::instrument::active(id) && {
@@ -11841,7 +11892,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     trace_build(u, id, "installed", t2 - t1);
                 }
                 if std::env::var("MAKEPAD_RUN_O3_TRACE").is_ok() {
-                    eprintln!("tier1: {} installed ({} bytes, {} callees inlined, {:.1} ms build, {:.1} ms snapshot)", u.fns[id as usize].name, code.len(), n_inl, (t2 - t1) as f64 / 1e6, (t1 - t0) as f64 / 1e6);
+                    eprintln!("tier1: {} installed ({} bytes, {} callees inlined, {:.1} ms build, {:.1} ms snapshot)", u.fns[id as usize].name, code.len(), n_inl, (t2 - t1) as f64 / 1e6, owner_ns.get() as f64 / 1e6);
                     let mut left = Vec::new();
                     for (c, cold, snap) in &left_calls {
                         let n = u.fns[*c as usize].rir.as_ref().map(|r| relax_codegen::opt::inst_count(r)).unwrap_or(0);
@@ -12792,6 +12843,10 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
 /// O3 had to build a slot's RIR again (code linked from the disk cache has none):
 /// (count, wall ns)
 pub static TIER1_RIR_REBUILT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// O3 snapshots: inline candidates built on the owner (count, wall ns), and the candidates whose
+/// fronts the O3 thread ran off the owner first (count, cpu ns)
+pub static TIER1_SNAP_BUILT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+pub static TIER1_SNAP_FRONTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Speculative results waiting for their first call: (slot, wall ns when built). A result
 /// nobody called within MAKEPAD_RUN_SPEC_TTL_MS (default 2000; 0 = keep forever) is dropped with its
