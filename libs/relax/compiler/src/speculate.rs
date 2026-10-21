@@ -453,3 +453,114 @@ fn guard_site(f: &mut Func, bi: usize, ii: usize, r: &SiteRec, slot: u32, count:
     f.blocks[bi].term = Term::Branch(c, fast, miss);
     f.blocks[bi].term_pos = pos;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec() -> &'static SiteRec {
+        site(u32::MAX - 7, 0x1234)
+    }
+    fn syms() -> Syms {
+        Syms { probe: Sym::new(1), ready: Sym::new(2), fail: Sym::new(3) }
+    }
+    /// fn(fp, x) -> r: one indirect call in the middle of a block, or (invoke) ending one with an unwind edge
+    fn func(invoke: bool) -> Func {
+        let mut f = Func::new("t".to_string(), 0);
+        let b = f.block();
+        let fp = f.vreg(Cls::I);
+        let x = f.vreg(Cls::I);
+        let r = f.vreg(Cls::I);
+        let s = f.vreg(Cls::I);
+        f.params = vec![fp, x];
+        f.rets = vec![Cls::I];
+        push(&mut f, b, Inst::IBinI(IOp::Add, U64, x, x, 1), 7);
+        push(&mut f, b, Inst::Call(Callee::Indirect(fp), vec![x], vec![r]), 9);
+        if invoke {
+            let n = f.block();
+            let u = f.block();
+            f.blocks[b as usize].term = Term::Invoke(n, u);
+            push(&mut f, n, Inst::IBinI(IOp::Add, U64, s, r, 2), 11);
+            f.blocks[n as usize].term = Term::Ret(vec![s]);
+            f.blocks[u as usize].term = Term::Resume;
+        } else {
+            push(&mut f, b, Inst::IBinI(IOp::Add, U64, s, r, 2), 11);
+            f.blocks[b as usize].term = Term::Ret(vec![s]);
+        }
+        f
+    }
+    fn calls(f: &Func) -> (usize, usize, usize) {
+        let (mut ind, mut direct, mut host) = (0, 0, 0);
+        for b in &f.blocks {
+            assert_eq!(b.insts.len(), b.pos.len());
+            for (k, i) in b.insts.iter().enumerate() {
+                match i {
+                    Inst::Call(Callee::Indirect(_), ..) => ind += 1,
+                    Inst::Call(Callee::Fn(_), ..) => direct += 1,
+                    Inst::Call(Callee::Host(_), ..) => host += 1,
+                    _ => continue,
+                }
+                // a call that unwinds stays its block's last instruction
+                if matches!(b.term, Term::Invoke(..)) && !matches!(i, Inst::Call(Callee::Host(_), ..)) {
+                    assert_eq!(k + 1, b.insts.len());
+                }
+            }
+        }
+        (ind, direct, host)
+    }
+
+    #[test]
+    fn probe_and_guard_shapes_verify() {
+        for invoke in [false, true] {
+            let mut f = func(invoke);
+            probe_site(&mut f, 0, 1, rec(), syms());
+            f.verify().unwrap();
+            assert_eq!(calls(&f), (1, 0, 2), "probe: the original call, rt_spec_ready, rt_spec_probe");
+            for count in [true, false] {
+                let mut f = func(invoke);
+                guard_site(&mut f, 0, 1, rec(), 42, count, syms());
+                f.verify().unwrap();
+                assert_eq!(calls(&f), (1, 1, count as usize), "guard: the direct call, the fallback, rt_spec_fail when counting");
+                let invokes = f.blocks.iter().filter(|b| matches!(b.term, Term::Invoke(..))).count();
+                assert_eq!(invokes, if invoke { 2 } else { 0 }, "both calls keep the unwind edge");
+                assert!(f.blocks[0].insts.iter().any(|i| matches!(i, Inst::FnAddr(_, 42))));
+            }
+        }
+    }
+
+    #[test]
+    fn ladder() {
+        let r = site(u32::MAX - 8, 1);
+        let slot_of = |a: u64| (a >= 0x1000).then_some(5u32);
+        // profile: 70% one target -> guard
+        r.t0.store(0x1000, Ordering::Relaxed); r.n0.store(70, Ordering::Relaxed);
+        r.t1.store(0x2000, Ordering::Relaxed); r.n1.store(30, Ordering::Relaxed);
+        r.queued.store(true, Ordering::Relaxed);
+        assert_eq!(decide(u32::MAX - 8, &slot_of), vec![(0x1000, 5)]);
+        assert_eq!(r.state.load(Ordering::Relaxed), GUARD);
+        // the failure limit: profile again; the same guess -> stable
+        r.state.store(GUARD, Ordering::Relaxed);
+        rt_spec_fail(r as *const SiteRec as u64);
+        assert_eq!(r.state.load(Ordering::Relaxed), PROFILE);
+        assert!(r.queued.load(Ordering::Relaxed));
+        r.t0.store(0x1000, Ordering::Relaxed); r.n0.store(60, Ordering::Relaxed);
+        decide(u32::MAX - 8, &slot_of);
+        assert_eq!(r.state.load(Ordering::Relaxed), STABLE);
+        // a new target after a failure re-specialises, MAX_RESPECS times, then the site is off
+        for k in 0..=MAX_RESPECS {
+            r.state.store(GUARD, Ordering::Relaxed);
+            rt_spec_fail(r as *const SiteRec as u64);
+            r.t0.store(0x3000 + k as u64, Ordering::Relaxed); r.n0.store(90, Ordering::Relaxed);
+            decide(u32::MAX - 8, &slot_of);
+            let want = if k < MAX_RESPECS { GUARD } else { OFF };
+            assert_eq!(r.state.load(Ordering::Relaxed), want, "respec {}", k);
+        }
+        // no row reaches 30%: off
+        let q = site(u32::MAX - 9, 1);
+        q.t0.store(0x1000, Ordering::Relaxed); q.n0.store(20, Ordering::Relaxed);
+        q.t1.store(0x2000, Ordering::Relaxed); q.n1.store(20, Ordering::Relaxed);
+        q.other.store(60, Ordering::Relaxed); q.queued.store(true, Ordering::Relaxed);
+        assert!(decide(u32::MAX - 9, &slot_of).is_empty());
+        assert_eq!(q.state.load(Ordering::Relaxed), OFF);
+    }
+}
