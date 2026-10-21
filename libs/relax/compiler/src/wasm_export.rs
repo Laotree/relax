@@ -149,7 +149,7 @@ fn fnv64(bytes: &[u8]) -> u64 {
 /// Blanks the unused top-level statements of the record's blocks in the data images: (blocks in
 /// the record, blocks found, bytes of the found blocks, bytes blanked, items dropped). An item
 /// with `used` false is dropped; `used` true or null stays.
-fn splash_blank(path: &str, images: &mut [(u32, Vec<u8>)], blank_unrecorded: bool) -> (usize, usize, usize, usize, usize) {
+fn splash_blank(path: &str, images: &mut [(u32, Vec<u8>)]) -> (usize, usize, usize, usize, usize) {
     let src = match std::fs::read(path) {
         Ok(s) => s,
         Err(e) => {
@@ -181,24 +181,28 @@ fn splash_blank(path: &str, images: &mut [(u32, Vec<u8>)], blank_unrecorded: boo
             }
         }
     }
-    let (mut found, mut total, mut blanked) = (0, 0, 0);
+    let (mut found, mut total, mut blanked, mut whole) = (0, 0, 0, 0usize);
     let mut unmatched: Vec<(usize, String)> = Vec::new();
+    let splash_files = splash_file_hashes();
     for (_, bytes) in images.iter_mut() {
         if bytes.len() < 16 {
             continue;
         }
         let h = fnv64(bytes);
         let Some(ranges) = by_hash.get(&h) else {
-            // large text the record does not name (a lazy group never registered, an include)
-            if bytes.len() >= 4096 && std::str::from_utf8(bytes).is_ok() {
-                unmatched.push((bytes.len(), String::from_utf8_lossy(&bytes[..60]).replace('\n', " ")));
-                if blank_unrecorded {
-                    for c in bytes.iter_mut() {
-                        if *c != b'\n' {
-                            *c = b' ';
-                        }
+            // a `.splash` file's text (include_str! of a module registry) that no VM evaluated in
+            // the run (the record lists every text any VM evaluated): blanked whole
+            if splash_files.contains(&h) {
+                whole += 1;
+                total += bytes.len();
+                for c in bytes.iter_mut() {
+                    if *c != b'\n' {
+                        *c = b' ';
+                        blanked += 1;
                     }
                 }
+            } else if bytes.len() >= 4096 && std::str::from_utf8(bytes).is_ok() {
+                unmatched.push((bytes.len(), String::from_utf8_lossy(&bytes[..60]).replace('\n', " ")));
             }
             continue;
         };
@@ -216,12 +220,48 @@ fn splash_blank(path: &str, images: &mut [(u32, Vec<u8>)], blank_unrecorded: boo
     }
     unmatched.sort_by(|a, b| b.0.cmp(&a.0));
     if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
+        eprintln!("wasm export: splash: {} .splash files in the crates; {} embedded ones no VM evaluated, blanked whole", splash_files.len(), whole);
         eprintln!("wasm export: splash: {} text objects >= 4 KB not in the record, {} bytes", unmatched.len(), unmatched.iter().map(|u| u.0).sum::<usize>());
         for (n, t) in unmatched.iter().take(20) {
             eprintln!("  unrecorded text {:7} {}", n, t);
         }
     }
     (n_blocks, found, total, blanked, dropped)
+}
+
+/// FNV-1a 64 of every `.splash` file in the program's crate directories (what include_str! of a
+/// `.splash` path embeds verbatim); `target` and hidden directories are skipped.
+fn splash_file_hashes() -> std::collections::HashSet<u64> {
+    let mut out = std::collections::HashSet::new();
+    let mut dirs: Vec<std::path::PathBuf> = crate::run::crate_dirs().into_iter().map(|(_, d)| std::path::PathBuf::from(d)).collect();
+    dirs.sort();
+    dirs.dedup();
+    let mut seen: std::collections::HashSet<std::path::PathBuf> = Default::default();
+    while let Some(d) = dirs.pop() {
+        if !seen.insert(d.clone()) {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => {
+                    if !name.starts_with('.') && name != "target" {
+                        dirs.push(p);
+                    }
+                }
+                Ok(t) if t.is_file() && name.ends_with(".splash") => {
+                    if let Ok(b) = std::fs::read(&p) {
+                        out.insert(fnv64(&b));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 fn succs(t: &relax_backend::rir::Term) -> Vec<u32> {
@@ -393,7 +433,6 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     // bodies, the callers' extra constants cost more. Kept as an option for raw size / compile time.
     let mut merge = false;
     let mut splash = true;
-    let mut blank_unrecorded = false;
     let mut blocks = crate::coverage::on();
     // -tee,-remat,...: switch size techniques off (or on) to measure them
     {
@@ -418,9 +457,6 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
                 "exnref" => opts.exnref = on,
                 "merge" => merge = on,
                 "splash" => splash = on,
-                // measurement only: also blank the large texts the record does not name (an upper
-                // bound for shaking lazy groups and document-VM texts; not sound without a touch record)
-                "blankunrec" => blank_unrecorded = on,
                 "blocks" => blocks = on && crate::coverage::on(),
                 _ => eprintln!("wasm export: unknown option {}", n),
             }
@@ -618,7 +654,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     // statements no run used are blanked to spaces (newlines kept): kept statements stay verbatim,
     // length and offsets unchanged, no code patched
     if let (true, Ok(rec)) = (splash, std::env::var("MAKEPAD_RUN_WASM_EXPORT_SPLASH")) {
-        let st = splash_blank(&rec, &mut images, blank_unrecorded);
+        let st = splash_blank(&rec, &mut images);
         if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
             eprintln!("wasm export: splash: {} blocks in the record, {} found in the data; {} of {} bytes blanked ({} items dropped)", st.0, st.1, st.3, st.2, st.4);
         }
