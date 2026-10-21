@@ -5759,10 +5759,112 @@ pub fn natural_loops(f: &Func) -> (Vec<Vec<u32>>, Vec<(u32, Vec<bool>)>) {
     (preds, loops)
 }
 
+/// Loop-invariant reassociation (C2's `reassociate_invariants`): in a loop, `t1 = a + b; t2 = t1 + c`
+/// with a and c invariant, b not, and t1 read only by t2 becomes `t1 = a + c; t2 = t1 + b`, so the
+/// invariant half hoists (a 2-D index `row + x + k`: `row + k` once per row). Integer adds wrap in
+/// their type, so the regrouping is exact. Runs at the start of licm. Returns whether any changed.
+/// MAKEPAD_RUN_OPT=-reassoc: off (bisection).
+pub fn reassociate_invariants(options: &relax_session::Options, f: &mut Func) -> bool {
+    if crate::stats::opt_off(options, "-reassoc") {
+        return false;
+    }
+    let (_, loops) = natural_loops(f);
+    if loops.is_empty() {
+        return false;
+    }
+    let nv = f.vregs.len();
+    let (mut us, mut ds) = (Vec::new(), Vec::new());
+    let mut ndef = vec![0u32; nv];
+    let mut nuse = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut tu = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            uses_defs(i, &mut us, &mut ds);
+            for d in &ds {
+                ndef[d.0 as usize] += 1;
+            }
+            for u in &us {
+                nuse[u.0 as usize] += 1;
+            }
+        }
+        crate::regalloc::term_uses(&b.term, &mut tu);
+        for u in &tu {
+            nuse[u.0 as usize] += 1;
+        }
+    }
+    let mut changed = false;
+    for (_, body) in &loops {
+        // defined in the loop (not invariant)
+        let mut inl = vec![false; nv];
+        for (bi, b) in f.blocks.iter().enumerate() {
+            if body[bi] {
+                for i in &b.insts {
+                    for_defs(i, |d| inl[d.0 as usize] = true);
+                }
+            }
+        }
+        for bi in 0..f.blocks.len() {
+            if !body[bi] {
+                continue;
+            }
+            for k in 0..f.blocks[bi].insts.len() {
+                // t2 = t1 + c (c invariant or a constant)
+                let (it2, t2, t1, c) = match f.blocks[bi].insts[k] {
+                    Inst::IBin(IOp::Add, it, t2, x, y) if !inl[y.0 as usize] && inl[x.0 as usize] => (it, t2, x, Some(y)),
+                    Inst::IBin(IOp::Add, it, t2, x, y) if !inl[x.0 as usize] && inl[y.0 as usize] => (it, t2, y, Some(x)),
+                    Inst::IBinI(IOp::Add, it, t2, x, _) if inl[x.0 as usize] => (it, t2, x, None),
+                    _ => continue,
+                };
+                if t1 == t2 || ndef[t1.0 as usize] != 1 || nuse[t1.0 as usize] != 1 {
+                    continue;
+                }
+                // t1 = a + b in this block before, a invariant, b not; b unchanged up to t2
+                let Some(j) = (0..k).rev().find(|&j| {
+                    let mut d = false;
+                    for_defs(&f.blocks[bi].insts[j], |x| d |= x == t1);
+                    d
+                }) else { continue };
+                let Inst::IBin(IOp::Add, it1, _, a0, b0) = f.blocks[bi].insts[j] else { continue };
+                if it1 != it2 {
+                    continue;
+                }
+                let (a, b) = if !inl[a0.0 as usize] && inl[b0.0 as usize] {
+                    (a0, b0)
+                } else if !inl[b0.0 as usize] && inl[a0.0 as usize] {
+                    (b0, a0)
+                } else {
+                    continue;
+                };
+                if b == t2 || f.blocks[bi].insts[j + 1..k].iter().any(|i| {
+                    let mut d = false;
+                    for_defs(i, |x| d |= x == b);
+                    d
+                }) {
+                    continue;
+                }
+                let (new1, new2) = match (&f.blocks[bi].insts[k], c) {
+                    (Inst::IBin(..), Some(c)) => (Inst::IBin(IOp::Add, it1, t1, a, c), Inst::IBin(IOp::Add, it2, t2, t1, b)),
+                    (Inst::IBinI(_, _, _, _, kk), None) => (Inst::IBinI(IOp::Add, it1, t1, a, *kk), Inst::IBin(IOp::Add, it2, t2, t1, b)),
+                    _ => continue,
+                };
+                f.blocks[bi].insts[j] = new1;
+                f.blocks[bi].insts[k] = new2;
+                // t1 is invariant now (licm hoists it); t2 still is not
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 pub fn licm(options: &relax_session::Options, f: &mut Func) -> bool {
     if forward_only(f) {
         return false;
     }
+    let reassoc = reassociate_invariants(options, f);
     let n = f.blocks.len();
     let (preds, loops) = natural_loops(f);
     let nv = f.vregs.len();
@@ -5970,7 +6072,7 @@ pub fn licm(options: &relax_session::Options, f: &mut Func) -> bool {
             f.blocks[pre as usize].pos.push(p);
         }
     }
-    changed
+    changed || reassoc
 }
 
 /// 64-bit shifts by a register take the count mod 64 on both backends (x64 shl/shr/sar/shlx,
