@@ -856,7 +856,7 @@ pub enum Inst {
     /// 16 bytes at [base + off] (no alignment needed)
     VLoad(VReg, VReg, i32),
     VStore(VReg, i32, VReg), // base, off, src
-    /// 16 bytes at [base + (idx << sh) + off] (sh <= 3; made by `passes::addr_modes` on x86-64)
+    /// 16 bytes at [base + (idx << sh) + off] (made by `passes::addr_modes`; sh <= 3, arm64 <= 4)
     VLoadX(VReg, VReg, VReg, u8, i32), // d, base, idx, sh, off
     VStoreX(VReg, VReg, u8, i32, VReg), // base, idx, sh, off, src
     /// d (I) = 1 if any lane of v is nonzero, else 0

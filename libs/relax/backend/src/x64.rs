@@ -705,7 +705,7 @@ pub fn reg_config(options: &relax_session::Options) -> RegConfig {
         int_caller.push(RCX);
         int_caller.push(RDX);
     }
-    RegConfig { int_caller, int_callee: CALLEE_SAVED.to_vec(), flt_caller: flt, flt_callee: Vec::new(), slot_index_free: true, clobbers: Some(x64_clobbers), sym_class: 0, store_imm: |k| k == k as i32 as i64 }
+    RegConfig { int_caller, int_callee: CALLEE_SAVED.to_vec(), flt_caller: flt, flt_callee: Vec::new(), slot_index_free: true, clobbers: Some(x64_clobbers), sym_class: 0, store_imm: |k| k == k as i32 as i64, fconst_remat: false }
 }
 
 // ------------------------------------------------------------ code generation
@@ -945,6 +945,7 @@ impl<'a> Gen<'a> {
             Remat::FnAddr(id) => self.mov_reloc(r, Reloc::Thunk(id)),
             Remat::Offset(..) => unreachable!("base + k moves through use_i"),
             Remat::VConst(_) => unreachable!("a vector constant is made by use_f"),
+            Remat::FConst(..) => unreachable!("x64 does not recompute float constants (RegConfig::fconst_remat)"),
             _ => self.a.mov_ri_nf(r, 0),
         }
     }
@@ -5271,7 +5272,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // constants used in loops defined once at the entry (the allocator keeps them in registers
     // or recomputes them); constant operands that fit an imm32 become immediates
     // (hot code only: the rewrite copies the function, +15% back-end time at O1)
-    let hoisted = if env.opt_regs || f.full { regalloc::hoist_loop_consts(f, &imm_fits, false) } else { None };
+    let hoisted = if env.opt_regs || f.full { regalloc::hoist_loop_consts(f, &imm_fits, false, false, None) } else { None };
     let f = hoisted.as_ref().unwrap_or(f);
     // compares next to the selects that read them (the cmov takes the flags)
     let sunk = if env.opt_regs || f.full { regalloc::sink_compares(f) } else { None };
