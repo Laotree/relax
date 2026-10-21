@@ -2531,6 +2531,14 @@ impl<'a> Lcx<'a> {
                         self.f.noalias.push(regs[0]);
                     }
                 }
+                // and `&T` for T: Freeze (rustc_ty_utils abi.rs: PointerKind::SharedRef { frozen }
+                // -> noalias + readonly): nothing writes the memory during the call, so its loads
+                // are loop-invariant (quicksort's pivot under partition's stores)
+                if let TyKind::Ref(false, inner, _) = self.kind(t) {
+                    if !self.unsized_ty(inner) && regs.len() == 1 && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), inner) {
+                        self.f.noalias.push(regs[0]);
+                    }
+                }
                 // a reference's (or fat reference's data) pointer is never null (rustc `nonnull`
                 // on reference parameters): the niche tests of iterators over a slice parameter
                 // fold
