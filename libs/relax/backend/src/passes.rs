@@ -6782,6 +6782,20 @@ pub fn addr_modes(f: &mut Func) {
         // index of the defining inst in this block for single-def vregs
         let mut def_at: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
         let mut dead = vec![false; n];
+        // x64: uses of a vreg as an access's base in this block; an address every use of which is
+        // such an access folds into each of them (SIB with any scale and displacement is free),
+        // so the add and shift go (lomuto partition: one element loaded and stored through
+        // [v + i*4])
+        let mut blk_base: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        if cfg!(target_arch = "x86_64") {
+            for i in &b.insts {
+                match i {
+                    Inst::Load(_, _, base, _) | Inst::Store(_, base, _, _) | Inst::VLoad(_, base, _) | Inst::VStore(base, _, _) => *blk_base.entry(base.0).or_insert(0) += 1,
+                    _ => {}
+                }
+            }
+            blk_base.retain(|v, c| *c == nuse[*v as usize]);
+        }
         for k in 0..n {
             let (m, base, off) = match &b.insts[k] {
                 Inst::Load(m, _, base, off) => (*m, *base, *off),
@@ -6802,7 +6816,7 @@ pub fn addr_modes(f: &mut Func) {
             // folded into each one that needs no displacement ([x, x{, lsl #size}] is free); the
             // add stays for the others and goes with its last use
             let ai = match def_at.get(&base.0) {
-                Some(&ai) if (nuse[base.0 as usize] == 1 || cfg!(target_arch = "aarch64")) && !dead[ai] => ai,
+                Some(&ai) if (nuse[base.0 as usize] == 1 || cfg!(target_arch = "aarch64") || blk_base.contains_key(&base.0)) && !dead[ai] => ai,
                 _ => continue,
             };
             let shared_add = nuse[base.0 as usize] > 1;
@@ -6853,7 +6867,7 @@ pub fn addr_modes(f: &mut Func) {
             let mut fold_at: Option<usize> = None;
             // a shift that stays for other uses keeps reading idx: no folding through it
             let shift_stays = shared_add || si.is_some_and(|si| matches!(b.insts[si], Inst::IBinI(_, _, sv, _, _) if nuse[sv.0 as usize] > 1));
-            if shared_add && (off != 0 || !(sh == 0 || sh as i64 == natural)) {
+            if shared_add && cfg!(target_arch = "aarch64") && (off != 0 || !(sh == 0 || sh as i64 == natural)) {
                 continue;
             }
             if let Some(&ii) = def_at.get(&idx.0).filter(|_| !shift_stays) {
