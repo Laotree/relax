@@ -501,6 +501,8 @@ pub enum FixKind {
     /// x64 disp32 at `at`; `tail` more bytes of the instruction follow it (an immediate): value
     /// - (address of at + 4 + tail)
     X64Rel32 { tail: u8 },
+    /// x64 jmp / call / jcc rel32 at `at` (ends the instruction): value - (address of at + 4)
+    X64Branch32,
     /// x64 rel8 at `at` (jcc / jmp short): value - (address of at + 1)
     X64Rel8,
     /// 8 bytes = value
@@ -1319,7 +1321,7 @@ fn finish(mut ctx: Ctx, _enc: &dyn Encoder) -> Result<Output, AsmError> {
 }
 
 pub fn is_pc_relative(k: FixKind) -> bool {
-    matches!(k, FixKind::X64Rel32 { .. } | FixKind::X64Rel8 | FixKind::A64Branch26 | FixKind::A64Branch19 | FixKind::A64Branch14 | FixKind::A64Adr21)
+    matches!(k, FixKind::X64Rel32 { .. } | FixKind::X64Branch32 | FixKind::X64Rel8 | FixKind::A64Branch26 | FixKind::A64Branch19 | FixKind::A64Branch14 | FixKind::A64Adr21)
 }
 
 /// Writes the field of a pc-relative fixup whose target is `target` and whose instruction is at
@@ -1331,7 +1333,8 @@ pub fn patch(b: &mut [u8], at: usize, kind: FixKind, target: i64, pc: i64) -> Re
         return Err("fixup past the end of its section".to_string());
     }
     match kind {
-        FixKind::X64Rel32 { tail } => {
+        FixKind::X64Rel32 { .. } | FixKind::X64Branch32 => {
+            let tail = if let FixKind::X64Rel32 { tail } = kind { tail } else { 0 };
             let d = target - (pc + 4 + tail as i64);
             if d < i32::MIN as i64 || d > i32::MAX as i64 {
                 return Err("rel32 out of range".to_string());
@@ -1410,3 +1413,5 @@ fn kind_len(k: FixKind) -> usize {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_x64;
