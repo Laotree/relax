@@ -126,6 +126,8 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
     let mut root = usize::MAX;
     // (crate index, bin name, package dir) of the bins cargo would build
     let mut root_bins: Vec<(usize, String, String)> = Vec::new();
+    // crates built with `--test` (cargo's unit mode "test"): cfg(test) is set for them
+    let mut test_crates: Vec<usize> = Vec::new();
     // unit index of a run-custom-build unit -> its script (src_path, edition, features, build unit)
     let mut run_build: Vec<Option<(String, u16, Vec<String>, usize)>> = vec![None; n_units];
     let mut raw: Vec<RawUnit> = vec![RawUnit { name: String::new(), src_path: String::new(), edition: 2015, features: Vec::new(), proc_macro: false, deps: Vec::new(), run_script: false, pkg: Default::default() }; n_units];
@@ -148,7 +150,8 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
             match s.as_str() {
                 "lib" | "rlib" => lib = true,
                 "proc-macro" => pm = true,
-                "bin" => bin = true,
+                // an integration test target: a root like a bin (its harness runs its tests)
+                "bin" | "test" => bin = true,
                 "custom-build" => build = true,
                 _ => {}
             }
@@ -190,6 +193,9 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
             root = crates.len();
         }
         map[ui] = crates.len();
+        if mode == "test" {
+            test_crates.push(crates.len());
+        }
         crates.push(CrateUnit { name: tname, src_path, edition, features, deps: udeps,  proc_macro: pm, bin, build_script: false, version: ver.clone() });
         crate_paths.push(norm);
         pkg.push((pkg_dir, pname, ver));
@@ -207,6 +213,11 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
             Some(v.trim_matches('"').to_string())
         });
         match default_run.and_then(|d| root_bins.iter().find(|b| b.1 == d)) {
+            // a test graph's integration tests: every one of them is run
+            _ if root_bins.iter().all(|b| test_crates.contains(&b.0)) => {
+                root = root_bins[0].0;
+                bins = root_bins.iter().map(|b| b.0).collect();
+            }
             Some(b) => root = b.0,
             // a check runs nothing: it checks every bin, as `cargo check` does
             None if check_all_bins => {
@@ -243,7 +254,15 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
     for (ci, c) in crates.iter().enumerate() {
         env[ci].push(("CARGO_CRATE_NAME".to_string(), c.name.clone()));
     }
-    Ok(Graph { crates, root, build_scripts, pkg, cfgs: vec![Vec::new(); n], env, link_libs: Vec::new(), raw, bins })
+    let mut cfgs = vec![Vec::new(); n];
+    for &ci in &test_crates {
+        cfgs[ci].push("test".to_string());
+    }
+    // a single integration test is the graph's only test root: it is listed like several
+    if bins.is_empty() && test_crates.contains(&root) && crates[root].bin {
+        bins.push(root);
+    }
+    Ok(Graph { crates, root, build_scripts, pkg, cfgs, env, link_libs: Vec::new(), raw, bins })
 }
 
 /// cargo's per-package compile-time environment (CARGO_MANIFEST_DIR, CARGO_PKG_*).
@@ -253,11 +272,21 @@ fn pkg_env(dir: &str, name: &str, ver: &str) -> Vec<(String, String)> {
         ("CARGO_PKG_NAME".to_string(), name.to_string()),
         ("CARGO_PKG_VERSION".to_string(), ver.to_string()),
     ];
-    let parts: Vec<&str> = ver.split(['.', '-']).collect();
+    let (core, pre) = version_parts(ver);
+    let parts: Vec<&str> = core.split('.').collect();
     for (k, key) in ["CARGO_PKG_VERSION_MAJOR", "CARGO_PKG_VERSION_MINOR", "CARGO_PKG_VERSION_PATCH"].iter().enumerate() {
         e.push((key.to_string(), parts.get(k).unwrap_or(&"0").to_string()));
     }
+    e.push(("CARGO_PKG_VERSION_PRE".to_string(), pre.to_string()));
+    e.extend(crate::resolve::package_meta_env(dir));
     e
+}
+
+/// A version's numeric core and its pre-release part (`1.2.3-rc.1+build` -> `1.2.3`, `rc.1`; the
+/// pre-release empty when none): cargo's CARGO_PKG_VERSION_{MAJOR,MINOR,PATCH,PRE} come from these.
+fn version_parts(ver: &str) -> (&str, &str) {
+    let core = ver.split('+').next().unwrap_or(ver);
+    core.split_once('-').unwrap_or((core, ""))
 }
 
 fn fnv(data: &[u8], mut h: u64) -> u64 {
@@ -603,8 +632,12 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         .env("CARGO_MANIFEST_DIR", dir)
         .env("CARGO_PKG_NAME", pname)
         .env("CARGO_PKG_VERSION", ver)
-        // cargo gives scripts RUSTC; theirs is Relax itself, answering `--version` (relax_as_rustc)
+        .env("CARGO_PKG_VERSION_PRE", version_parts(ver).1)
+        .envs(crate::resolve::package_meta_env(dir))
+        // cargo gives scripts RUSTC; theirs is Relax itself, answering `--version` (relax_as_rustc).
+        // RUSTDOC too (the `built` crate requires it); nothing documents here
         .env("RUSTC", &exe)
+        .env("RUSTDOC", "rustdoc")
         .env("MAKEPAD_RUN_AS_RUSTC", "1")
         .env("MAKEPAD_RUN_SCRIPT_DEPTH", depth.to_string())
         .env_remove("MAKEPAD_RUN_SELF_EXEC")

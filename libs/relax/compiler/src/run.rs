@@ -124,7 +124,7 @@ extern "C" {
 }
 
 fn usage() -> i32 {
-    eprintln!("usage: makepad run [--units <unit-graph.json>] [--ahead=minimal|balanced|aot] [--quiet] [--verbose] <package> [cargo flags] [-- program args]");
+    eprintln!("usage: makepad run [--units <unit-graph.json>] [--ahead=minimal|balanced|aot-max|aot-min] [--quiet] [--verbose] <package> [cargo flags] [-- program args]");
     2
 }
 
@@ -143,8 +143,8 @@ pub fn cmd_run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     }
     let host = MAIN_HOST.get().filter(|_| {
         !sess.runtime.boot_only && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none()
-            && !args.iter().take_while(|a| a.as_str() != "--").any(|a| matches!(a.as_str(), "--check" | "--watch" | "--entry" | "--exports"))
-    });
+            && !args.iter().take_while(|a| a.as_str() != "--").any(|a| matches!(a.as_str(), "--check" | "--watch" | "--entry" | "--exports" | "--harness"))
+    }).filter(|_| hosted_program(sess, args));
     let code = if let Some(host) = host {
         HOSTED_RUN.store(true, Ordering::Release);
         let sess = sess.clone();
@@ -170,6 +170,41 @@ pub fn cmd_run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     }
     code
 }
+
+/// Whether the program is a HAL program: its crate graph links makepad-hal (or the run starts
+/// `--domain` packages into it). Only such a program gets the main-thread host (the HAL's main
+/// loop, the window, the boot screen); any other program -- a terminal tool, a pure-Rust crate --
+/// runs on the process's main thread with its output on the terminal, as its rustc build does.
+/// The graph resolved here is the boot's (BOOT_UNITS): the resolve does not run twice.
+fn hosted_program(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() && args[i].starts_with("--") {
+        match args[i].as_str() {
+            // a build script's child (a saved graph) or a re-run: not a host decision made here
+            "--units" => return true,
+            "--report-to" | "--run-dir" | "--cfg" | "--boundary" => i += 2,
+            _ => i += 1,
+        }
+    }
+    let Some(package) = args.get(i).cloned() else { return false };
+    let mut flags = Vec::new();
+    let mut words = args[i + 1..].iter().take_while(|a| a.as_str() != "--");
+    while let Some(w) = words.next() {
+        match w.as_str() {
+            "--domain" => return true,
+            "--cfg" => { words.next(); }
+            _ if w.starts_with("--cfg=") => {}
+            _ => flags.push(w.clone()),
+        }
+    }
+    let Ok(units) = unitgraph::unit_graph(sess, &workspace_dir(), &package, &flags) else { return false };
+    let hal = units.units.iter().any(|u| u.name.replace('-', "_") == "makepad_hal");
+    *BOOT_UNITS.lock().unwrap() = Some((package, flags, units));
+    hal
+}
+
+/// The unit graph `hosted_program` resolved for the boot, taken by the boot's resolve.
+static BOOT_UNITS: relax_session::sync::Mutex<Option<(String, Vec<String>, unitgraph::Units)>> = relax_session::sync::Mutex::new(None);
 
 /// A warm check session runs with the disk cache off (unless MAKEPAD_RUN_CACHE says otherwise): with
 /// cached code installed, constant evaluation in a session crashed (makepad-platform's
@@ -272,7 +307,15 @@ pub(crate) fn resolve_package(
     // ---- crate graph
     let t = Instant::now();
     // the resolver's graph in memory; a build script's child reads its units from JSON
-    let units = if units_json.is_empty() {
+    let pre = if boot {
+        let mut g = BOOT_UNITS.lock().unwrap();
+        let taken = g.take();
+        clear_dead(&mut g);
+        taken
+    } else { None };
+    let units = if let Some((_, _, units)) = pre.filter(|(p, f, _)| units_json.is_empty() && p == package && f == cargo_flags) {
+        Ok(units)
+    } else if units_json.is_empty() {
         unitgraph::unit_graph(sess, workspace, package, cargo_flags)
     } else {
         std::fs::read(units_json).map_err(|e| format!("{}: {}", units_json, e)).and_then(|d| unitgraph::Units::from_json(&d))
@@ -316,7 +359,9 @@ pub(crate) fn resolve_package(
         // The boundary audit (`check --boundary`) binds as a run does: what it reports is what
         // JIT-compiled code reaches past the bound ops.
         let machine = crate::cfg::CfgSet::machine(sess, &[]).triple();
-        let bind = crate::cfg::CfgSet::host(sess, &[]).triple() == machine && (!check_only || crate::boundary::requested());
+        // A test harness (`makepad test`) binds none either: its crates are the tests' subject, built
+        // from their source as `cargo test` builds them, internals and all.
+        let bind = crate::cfg::CfgSet::host(sess, &[]).triple() == machine && (!check_only || crate::boundary::requested()) && !HARNESS_RUN.load(Ordering::Acquire);
         // The sources are hashed while the build scripts run (and, for a run's boot, while the
         // program loads): they share nothing (the hash reads the provided packages, the scripts
         // write the graph's cfgs and env).
@@ -423,7 +468,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut units_json = String::new();
     if let Some(v) = std::env::var_os("MAKEPAD_RUN_AHEAD") {
         if v.to_str().and_then(crate::options::AheadLevel::parse).is_none() {
-            eprintln!("makepad-run: MAKEPAD_RUN_AHEAD={} is not a level: minimal, balanced or aot", v.to_string_lossy());
+            eprintln!("makepad-run: MAKEPAD_RUN_AHEAD={} is not a level: minimal, balanced, aot-max or aot-min", v.to_string_lossy());
             return 2;
         }
     }
@@ -444,6 +489,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut selftest = false;
     // `makepad check --workspace`: every workspace crate the package reaches, not only its app crates
     let mut workspace_check = false;
+    // `makepad test <package>` (lib.rs): the program is the package's test harness, not its main
+    let mut harness = false;
+    let mut no_fail_fast = false;
     let mut i = 0;
     while i < args.len() && args[i].starts_with("--") {
         match args[i].as_str() {
@@ -459,10 +507,17 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                     std::env::set_var("MAKEPAD_RUN_AHEAD", l.name());
                 }
                 None => {
-                    eprintln!("makepad-run: --ahead=<level> wants minimal, balanced or aot");
+                    eprintln!("makepad-run: --ahead=<level> wants minimal, balanced, aot-max or aot-min");
                     return 2;
                 }
             },
+            "--harness" => {
+                harness = true;
+                HARNESS_RUN.store(true, Ordering::Release);
+                // a test whose code Relax cannot compile fails as that test; the others still run
+                jit::COMPILE_ERRORS_FATAL.store(false, Ordering::Relaxed);
+            }
+            "--no-fail-fast" => no_fail_fast = true,
             // `makepad selftest --root-only`: the root crate's fns and what they reach
             "--root-only" => root_only = true,
             // `makepad selftest` (lib.rs): the check, then every fn compiled (check.rs)
@@ -554,16 +609,18 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if driver_options.verbose { crate::tui::track_for_verbose(); }
     // the boot progress line (tui.rs): a terminal run of a program, with nothing asking for plain output
     unsafe { std::env::remove_var("MAKEPAD_RUN_PROGRESS") };
-    let hosted = !entries.is_empty() || !export_names.is_empty();
+    // a test harness is a terminal program: no progress line, no inspect socket, no live session
+    let hosted = !entries.is_empty() || !export_names.is_empty() || harness;
     // the `unused_macros` lints need the macro uses of the whole load
     if check { relax_types::macros::uses::record(true); relax_front::program::set_record_import_uses(true); }
     if !check && !watch && session.is_none() && !hosted {
         crate::tui::start(!driver_options.verbose && !QUIET.load(Ordering::Relaxed) && !crate::diag::enabled());
     }
+    crate::memstat::start_sampler();
     // `makepad run` of a working tree is a live session (watcher + hot reload); sources served from
     // a store (`makepad run <git url>`, mounted bundles) are not, and neither are checks and the
     // build scripts / self re-runs a program starts.
-    if !check && !no_live && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() && !SILENT.load(Ordering::Relaxed)
+    if !check && !harness && !no_live && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() && !SILENT.load(Ordering::Relaxed)
         && !crate::vfs::is_virtual(&workspace_dir()) {
         driver_options.live = true;
     }
@@ -855,6 +912,15 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                     prog.crates[kk as usize].is_bin = c.bin;
                     crate_of[ci] = kk;
                     cold_front.loaded(&mut prog, kk);
+                    if crate::preload::trace() {
+                        // one line per crate loaded: what its files hold, and the process after it
+                        let (mut nf, mut src, mut ext, mut toks) = (0usize, 0usize, 0usize, 0usize);
+                        for (fi, f) in prog.files.iter().enumerate() {
+                            if prog.file_crate.get(fi).copied() == Some(kk) { nf += 1; src += f.src_len as usize; ext += f.src.len() - f.src_len as usize; toks += f.toks.len(); }
+                        }
+                        eprintln!("boot-trace-loaded: {} files={} src={}KB expansion={}KB toks={}k rss={}MB live={}MB t={:.0}ms", c.name, nf, src >> 10, ext >> 10, toks >> 10,
+                            crate::memstat::resident() >> 20, crate::memstat::live_total() >> 20, crate::clock::ms_since_start());
+                    }
                     crate::boot_stats::FILES_PARSED.store(prog.files.len() as u32, Ordering::Relaxed);
                     crate::boot_stats::LINES_PARSED.store(prog.lines_loaded as u64, Ordering::Relaxed);
 
@@ -1178,7 +1244,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             }
         }
     }
-    let main_def = if exports_mode {
+    let main_def = if exports_mode || harness {
         None
     } else {
         match find_main(&prog, root) {
@@ -1522,6 +1588,34 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         std::mem::forget(u);
         return 0;
     }
+    if harness {
+        // the root crate and, in an integration test graph, every test target
+        let pkg_dir = &g.pkg[g.root].0;
+        let label = |ci: usize| {
+            let p = &g.crates[ci].src_path;
+            let rel = p.strip_prefix(pkg_dir.as_str()).map_or(p.as_str(), |r| r.trim_start_matches(['/', '\\']));
+            if g.crates[ci].bin { rel.to_string() } else { format!("unittests {rel}") }
+        };
+        let mut groups = vec![(label(g.root), root)];
+        for &b in &g.bins {
+            if b != g.root && crate_of[b] != u32::MAX {
+                groups.push((label(b), crate_of[b]));
+            }
+        }
+        groups.sort();
+        let code = crate::harness::run(&mut u, up, &groups, no_fail_fast);
+        flush_errors(true);
+        crate::zone_alloc::tombstone_frees_expected();
+        std::mem::forget(u);
+        if jit::zone_swap::swapped() {
+            crate::tui::exit_code(code);
+            if let Some(exit) = EXIT_SUMMARY.get() {
+                let _ = exit.code.set(code);
+            }
+            crate::os::proc::exit(code);
+        }
+        return code;
+    }
     let main_def = main_def.expect("a run without --exports has main");
     if HAL_RUN.load(Ordering::Acquire) {
         unsafe { jit::set_runtime_unit(up) };
@@ -1685,6 +1779,8 @@ pub struct MainHost {
 
 static MAIN_HOST: std::sync::OnceLock<MainHost> = std::sync::OnceLock::new();
 static HOSTED_RUN: AtomicBool = AtomicBool::new(false);
+/// `makepad run --harness` (`makepad test`): the program is a test harness.
+static HARNESS_RUN: AtomicBool = AtomicBool::new(false);
 static HAL_RUN: AtomicBool = AtomicBool::new(false);
 static APP_DOMAIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -1822,22 +1918,26 @@ fn startup_defs(prog: &crate::program::Program, path: &str) -> Vec<DefId> {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    let mut by_path = std::collections::HashMap::new();
+    // A path names one fn only when no other fn has it: the methods of different impls share
+    // theirs (`core::sync::atomic::::store` is every atomic type's), and a generic impl's
+    // method compiled with no type arguments does not normalize (aot warm runs: 63 internal
+    // compiler errors in the ahead worker). Ambiguous paths are left to the program's calls.
+    let mut by_path: std::collections::HashMap<String, Option<DefId>> = std::collections::HashMap::new();
     for (i, d) in prog.defs.iter().enumerate() {
         if matches!(d.kind, DefKind::Fn | DefKind::AssocFn) {
-            by_path.insert(prog.def_path(DefId(i as u32)), DefId(i as u32));
+            by_path.entry(prog.def_path(DefId(i as u32))).and_modify(|e| *e = None).or_insert(Some(DefId(i as u32)));
         }
     }
     let mut out = Vec::new();
     for l in list.lines() {
-        if let Some(d) = by_path.get(l.trim()) {
+        if let Some(Some(d)) = by_path.get(l.trim()) {
             out.push(*d);
         }
     }
     out
 }
 
-/// Ahead-of-call compilation on a worker (`--ahead=aot`): the previous run's startup functions, in
+/// Ahead-of-call compilation on a worker (`--ahead=aot-max|aot-min`): the previous run's startup functions, in
 /// order, at worker priority. Compiles serialize with lazy compiles on the owner thread, so the
 /// worker overlaps with the program's own execution, not with its compiles.
 fn start_ahead(up: *mut Unit, defs: Vec<DefId>, runtime: &crate::options::RuntimeOptions) {
@@ -2294,6 +2394,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             // speculative results nobody called within the TTL go (memory: jit::expire_spec)
             jit::expire_spec(options);
             jit::aot_drain();
+            jit::ahead_complete_tick();
             // recorded disk-cache entries are written out as they pile up, not held to the exit
             spill_cache();
             // Independent allocator relief for later O3 bursts and non-GUI programs.
@@ -2581,7 +2682,7 @@ static MID_COLLECTED_TRIED: AtomicBool = AtomicBool::new(false);
 /// A mid-run write recorded the startup manifest (its window had closed).
 static MID_MANIFEST_DONE: AtomicBool = AtomicBool::new(false);
 
-/// Compile totals since boot, the startup list for `--ahead=aot`, and the JSON report.
+/// Compile totals since boot, the startup list for the aot levels, and the JSON report.
 /// jit::wall_ns() when main was called (MAKEPAD_RUN_MAIN_COMPILE_LOG's time base)
 static MAIN_START_WALL: AtomicU64 = AtomicU64::new(0);
 
@@ -2607,6 +2708,14 @@ pub fn quit_requested() {
 /// The run ends (its window closed, the app quit, a signal): no settle swap starts from now on.
 pub fn quitting() {
     jit::QUIT_SEEN.store(true, Ordering::Relaxed);
+}
+
+/// std::relax::main_hosted: the runner's host has the process's main thread (the HAL's main loop
+/// and window) and the program's `main` runs as a guest on a thread of its own. False under the
+/// bare runner (`relax`: nothing hosts, the program's own HAL runs its main loop) and for a
+/// program without the HAL.
+pub(crate) extern "C" fn relax_main_hosted() -> bool {
+    HOSTED_RUN.load(Ordering::Acquire)
 }
 
 pub(crate) extern "C" fn relax_quit_requested() {
@@ -3092,7 +3201,7 @@ fn summary_inner(why: &str) {
         let q = jit::TIER_QUEUED.load(Ordering::Relaxed);
         if q > 0 {
             verbose!(
-                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); cpu {:.0} ms on the owner, {:.0} ms off it",
+                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); snapshots {:.0} ms cpu on the owner ({} inline candidates built there, {:.0} ms; {} fronts off it, {:.0} ms cpu; {} optimised off it, {:.0} ms cpu), back ends {:.0} ms cpu off it",
                 jit::ahead_level().name(),
                 q,
                 jit::TIER_REVALIDATED.load(Ordering::Relaxed),
@@ -3103,6 +3212,12 @@ fn summary_inner(why: &str) {
                 jit::TIER1_RIR_REBUILT[0].load(Ordering::Relaxed),
                 jit::TIER1_RIR_REBUILT[1].load(Ordering::Relaxed) as f64 / 1e6,
                 s.tier1_locked_ns as f64 / 1e6,
+                jit::TIER1_SNAP_BUILT[0].load(Ordering::Relaxed),
+                jit::TIER1_SNAP_BUILT[1].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_SNAP_FRONTS[0].load(Ordering::Relaxed),
+                jit::TIER1_SNAP_FRONTS[1].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_SNAP_OFF[0].load(Ordering::Relaxed),
+                jit::TIER1_SNAP_OFF[1].load(Ordering::Relaxed) as f64 / 1e6,
                 s.tier1_free_ns as f64 / 1e6,
             );
         }
