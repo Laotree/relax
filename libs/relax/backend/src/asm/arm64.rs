@@ -708,7 +708,7 @@ fn addsub_core(ctx: &mut Ctx, rd: Reg, rn: Reg, third: Option<&Op>, ext: Option<
                 // x registers extended from w (uxtb .. sxtw), or from x (uxtx / sxtx / lsl); a w
                 // destination takes w sources with any option
                 let ok = if rd.k == K::X {
-                    ((opt & 3 == 3) == (rm.k == K::X) || (s && rm.k == K::W && opt == 7))
+                    (opt & 3 == 3) == (rm.k == K::X) || (s && rm.k == K::W && opt == 7)
                 } else {
                     rm.k == K::W
                 };
