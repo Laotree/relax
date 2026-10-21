@@ -744,6 +744,8 @@ struct Gen<'a> {
     /// coalesced, edge blocks of split ranges) are passed through by the jumps into them
     thru: Vec<u32>,
     frame: i32,
+    /// no rbp frame at all (frameless_leaf)
+    frameless: bool,
     text_len: u32,
     /// a single-use float constant whose use (the next FBin) reads it from the pool
     mem_const: Option<(VReg, u64)>,
@@ -1085,12 +1087,7 @@ impl<'a> Gen<'a> {
 
     fn gen(&mut self, options: &relax_session::Options) {
         let reach = regalloc::reachable(self.f);
-        // prologue
-        self.a.push(RBP);
-        self.a.mov_rr(RBP, RSP);
-        for r in self.al.used_callee_int.clone() {
-            self.a.push(r);
-        }
+        // prologue (emitted once the frame is known: a frameless leaf has none)
         self.saved = 8 * self.al.used_callee_int.len() as i32;
         // only slots something addresses take space; slots whose lifetimes cannot overlap share
         // it (frame::slot_layout)
@@ -1166,6 +1163,14 @@ impl<'a> Gen<'a> {
             frame += 8;
         }
         self.frame = frame;
+        self.frameless = frame == 0 && self.frameless_leaf(options, &reach);
+        if !self.frameless {
+            self.a.push(RBP);
+            self.a.mov_rr(RBP, RSP);
+            for r in self.al.used_callee_int.clone() {
+                self.a.push(r);
+            }
+        }
         self.stack_probe(frame);
         self.a.sub_rsp(frame as u32);
         if self.dom_read.first() == Some(&true) {
@@ -2105,6 +2110,39 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// A function that needs no frame (K6 frame elision): no frame bytes (no slots, spills or call
+    /// staging), no callee-saved register, no call of any kind (Call, Invoke, Resume, TLS slow
+    /// path), no stack or C-ABI parameters, and no loop. Nothing in it addresses rbp, and it is
+    /// never mid-call: an unwind never walks through it, and without a loop the hang watchdog never
+    /// stops it, so the frame chain only misses it as the faulting frame of undefined behaviour
+    /// (Unreachable). Saves push rbp / mov rbp, rsp / pop rbp per call of small helpers.
+    /// MAKEPAD_RUN_OPT=-frameless: always a frame.
+    fn frameless_leaf(&self, options: &relax_session::Options, reach: &[bool]) -> bool {
+        if crate::stats::opt_off(options, "-frameless") || !self.al.used_callee_int.is_empty() || self.cplan.is_some() || self.f.cabi.is_some() || !self.dom_read.is_empty() {
+            return false;
+        }
+        let (mut ni, mut nf) = (0, 0);
+        for p in &self.f.params {
+            match self.f.vregs[p.0 as usize] {
+                Cls::I => ni += 1,
+                Cls::F32 | Cls::F64 => nf += 1,
+                _ => return false,
+            }
+        }
+        if ni > 6 || nf > 8 {
+            return false;
+        }
+        for (bi, b) in self.f.blocks.iter().enumerate() {
+            if !reach[bi] {
+                continue;
+            }
+            if matches!(b.term, Term::Invoke(..) | Term::Resume) || b.insts.iter().any(|i| matches!(i, Inst::Call(..) | Inst::TlsAddr(..))) {
+                return false;
+            }
+        }
+        regalloc::loop_depths(self.f, reach).iter().all(|&d| d == 0)
+    }
+
     fn epilogue(&mut self) {
         self.win64_saves(false);
         if self.frame != 0 {
@@ -2116,7 +2154,9 @@ impl<'a> Gen<'a> {
             i -= 1;
             self.a.pop(saved[i]);
         }
-        self.a.pop(RBP);
+        if !self.frameless {
+            self.a.pop(RBP);
+        }
         if self.ymm {
             self.a.vzeroupper();
         }
@@ -5174,6 +5214,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         next_block: Vec::new(),
         thru: Vec::new(),
         frame: 0,
+        frameless: false,
         text_len: 0,
         mem_const: None,
         test_fuse: None,
