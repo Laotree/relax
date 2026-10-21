@@ -138,7 +138,8 @@ macro_rules! web_layout_rows {
         sz!(Option<Vec<u8>>, Option<String>, Option<Box<dyn Fn()>>, Option<&dyn Fn()>, Option<Rc<u8>>, Option<Arc<str>>, Result<Vec<u8>, String>, Result<usize, Box<str>>, Option<Option<Vec<u8>>>);
         sz!(Cell<usize>, RefCell<Vec<u8>>, Option<RefCell<usize>>, Range<usize>, Range<u64>, RangeInclusive<usize>, Duration, Option<Duration>, Cow<'static, str>, Option<Cow<'static, [u8]>>);
         sz!(PhantomData<u64>, ManuallyDrop<String>, MaybeUninit<usize>, Wrapping<usize>, Reverse<usize>, Ordering, Pin<Box<u8>>, Option<Pin<Box<dyn Fn()>>>);
-        sz!(core::slice::Iter<'static, u8>, core::str::Chars<'static>, core::ops::Bound<usize>, AtomicUsize, AtomicU64, AtomicPtr<u8>, AtomicBool, Option<AtomicUsize>);
+        // (core::str::Chars is left out: Relax's core keeps the str and two indices, rustc's a byte iterator)
+        sz!(core::slice::Iter<'static, u8>, core::ops::Bound<usize>, AtomicUsize, AtomicU64, AtomicPtr<u8>, AtomicBool, Option<AtomicUsize>);
         sz!(W1, W2, W3, W4, W5, W6, W7, W8, W9, WC1, WC2, WC3, WU1, WU2, WE1, WE2, WE3, WE4, WE5, WE6, WR1, WR2);
         sz!(Option<W1>, Option<W4>, Option<W5>, Option<W6>, Option<W9>, Option<WE1>, Option<WE2>, Option<WE3>, Option<WE5>, Option<WR1>, Option<Option<WE2>>);
         sz!(LiveIdLike, MsgTextureLike, MsgWindowLike, MsgPtrLike, MsgEventLike, Option<MsgEventLike>, Vec<MsgEventLike>);

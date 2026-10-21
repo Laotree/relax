@@ -207,3 +207,70 @@ pub fn symbol(name: &[u8]) -> Option<usize> {
         _ => return None,
     })
 }
+
+// The same allocator in the wasm32 offset ABI (compiler web32.rs): a pointer argument or result is
+// the block's offset in the window (0 = null).
+#[inline(always)]
+fn w32_ptr(p: usize) -> *mut u8 {
+    if p as u32 == 0 { std::ptr::null_mut() } else { (BASE | (p & 0xffff_ffff)) as *mut u8 }
+}
+#[inline(always)]
+fn w32_off(p: *mut u8) -> usize {
+    p as usize & 0xffff_ffff
+}
+unsafe extern "C" fn w32_alloc(size: usize, align: usize) -> usize {
+    w32_off(web_alloc(size, align))
+}
+unsafe extern "C" fn w32_alloc_zeroed(size: usize, align: usize) -> usize {
+    w32_off(web_alloc_zeroed(size, align))
+}
+unsafe extern "C" fn w32_dealloc(p: usize, size: usize, align: usize) {
+    web_dealloc(w32_ptr(p), size, align)
+}
+unsafe extern "C" fn w32_resize(p: usize, old: usize, align: usize, size: usize) -> usize {
+    w32_off(web_resize(w32_ptr(p), old, align, size))
+}
+unsafe extern "C" fn w32_malloc(size: usize) -> usize {
+    w32_off(web_malloc(size))
+}
+unsafe extern "C" fn w32_calloc(n: usize, size: usize) -> usize {
+    w32_off(web_calloc(n, size))
+}
+unsafe extern "C" fn w32_free(p: usize) {
+    web_free(w32_ptr(p))
+}
+unsafe extern "C" fn w32_realloc(p: usize, size: usize) -> usize {
+    w32_off(web_realloc(w32_ptr(p), size))
+}
+unsafe extern "C" fn w32_memalign(out: usize, align: usize, size: usize) -> i32 {
+    // `*out` is a 4-byte pointer word in the program's memory
+    if !align.is_power_of_two() || align < 4 {
+        return 22;
+    }
+    let p = allocate(size, align, false);
+    if p.is_null() {
+        return 12;
+    }
+    (w32_ptr(out) as *mut u32).write_unaligned(w32_off(p) as u32);
+    0
+}
+
+/// The allocator symbols of a wasm32 program (offsets in and out); None while the linear memory
+/// is not active.
+pub fn symbol32(name: &[u8]) -> Option<usize> {
+    if !active() {
+        return None;
+    }
+    Some(match name {
+        b"relax_alloc" => w32_alloc as *const () as usize,
+        b"relax_alloc_zeroed" => w32_alloc_zeroed as *const () as usize,
+        b"relax_dealloc" => w32_dealloc as *const () as usize,
+        b"relax_realloc" => w32_resize as *const () as usize,
+        b"malloc" => w32_malloc as *const () as usize,
+        b"calloc" => w32_calloc as *const () as usize,
+        b"realloc" => w32_realloc as *const () as usize,
+        b"free" => w32_free as *const () as usize,
+        b"posix_memalign" => w32_memalign as *const () as usize,
+        _ => return None,
+    })
+}
