@@ -178,12 +178,19 @@ fn splash_blank(path: &str, images: &mut [(u32, Vec<u8>)]) -> (usize, usize, usi
         }
     }
     let (mut found, mut total, mut blanked) = (0, 0, 0);
+    let mut unmatched: Vec<(usize, String)> = Vec::new();
     for (_, bytes) in images.iter_mut() {
         if bytes.len() < 16 {
             continue;
         }
         let h = fnv64(bytes);
-        let Some(ranges) = by_hash.get(&h) else { continue };
+        let Some(ranges) = by_hash.get(&h) else {
+            // large text the record does not name (a lazy group never registered, an include)
+            if bytes.len() >= 4096 && std::str::from_utf8(bytes).is_ok() {
+                unmatched.push((bytes.len(), String::from_utf8_lossy(&bytes[..60]).replace('\n', " ")));
+            }
+            continue;
+        };
         found += 1;
         total += bytes.len();
         for &(s, t) in ranges {
@@ -194,6 +201,13 @@ fn splash_blank(path: &str, images: &mut [(u32, Vec<u8>)]) -> (usize, usize, usi
                     blanked += 1;
                 }
             }
+        }
+    }
+    unmatched.sort_by(|a, b| b.0.cmp(&a.0));
+    if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
+        eprintln!("wasm export: splash: {} text objects >= 4 KB not in the record, {} bytes", unmatched.len(), unmatched.iter().map(|u| u.0).sum::<usize>());
+        for (n, t) in unmatched.iter().take(20) {
+            eprintln!("  unrecorded text {:7} {}", n, t);
         }
     }
     (n_blocks, found, total, blanked, dropped)
@@ -777,7 +791,9 @@ fn single_thread(name: &str) -> Option<HostBind> {
     Some(match name {
         "pthread_create" | "pthread_join" | "pthread_detach" | "pthread_attr_init" | "pthread_attr_setstacksize" | "pthread_attr_destroy" | "pthread_setname_np" => HostBind::Trap,
         n if n.starts_with("__relax_domain_") => HostBind::Trap,
-        "__relax_wait_enter" | "__relax_wait_leave" | "__relax_wake" | "__ulock_wake" | "__ulock_wait" | "pthread_self" | "pthread_threadid_np" | "pthread_main_np" | "sched_yield" | "__relax_key_delete" => HostBind::Builtin(Builtin::Nop),
+        // Linux std's only syscall is futex wait/wake (std sys/linux.rs): a no-op returning 0, as
+        // macOS's __ulock_*
+        "syscall" | "__relax_wait_enter" | "__relax_wait_leave" | "__relax_wake" | "__ulock_wake" | "__ulock_wait" | "pthread_self" | "pthread_threadid_np" | "pthread_main_np" | "sched_yield" | "__relax_key_delete" => HostBind::Builtin(Builtin::Nop),
         "__relax_key_create" => HostBind::Builtin(Builtin::KeyCreate),
         "__relax_key_get" => HostBind::Builtin(Builtin::KeyGet),
         "__relax_key_set" => HostBind::Builtin(Builtin::KeySet),
