@@ -216,7 +216,9 @@ fn run(t: &Tests) -> i32 {
     let mut passed = 0usize;
     let mut ignored = 0usize;
     let mut failures: Vec<(String, Option<String>)> = Vec::new();
-    let mut report = |name: &str, o: Outcome, failures: &mut Vec<(String, Option<String>)>| {
+    // libtest's pretty formatter names the mode of a `#[should_panic]` test
+    let mut report = |name: &str, should_panic: bool, o: Outcome, failures: &mut Vec<(String, Option<String>)>| {
+        let mode = if should_panic { " - should panic" } else { "" };
         let word = match &o {
             Outcome::Ok => "ok",
             Outcome::Failed(_) => "FAILED",
@@ -225,7 +227,7 @@ fn run(t: &Tests) -> i32 {
         if opts.quiet {
             print!("{}", match &o { Outcome::Ok => ".", Outcome::Failed(_) => "F", Outcome::Ignored => "i" });
         } else {
-            println!("test {} ... {}", name, word);
+            println!("test {}{} ... {}", name, mode, word);
         }
         let _ = crate::io::stdout().flush();
         match o {
@@ -283,7 +285,7 @@ fn run(t: &Tests) -> i32 {
         let Ok((i, o)) = rx.recv() else { break };
         running -= 1;
         done += 1;
-        report(&descs[i].name, o, &mut failures);
+        report(&descs[i].name, descs[i].should_panic != 0, o, &mut failures);
     }
     if opts.quiet {
         println!();

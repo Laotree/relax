@@ -492,6 +492,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             "--harness" => {
                 harness = true;
                 HARNESS_RUN.store(true, Ordering::Release);
+                // a test whose code Relax cannot compile fails as that test; the others still run
+                jit::COMPILE_ERRORS_FATAL.store(false, Ordering::Relaxed);
             }
             "--no-fail-fast" => no_fail_fast = true,
             // `makepad selftest --root-only`: the root crate's fns and what they reach
