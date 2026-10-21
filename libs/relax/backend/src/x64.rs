@@ -564,7 +564,11 @@ impl Asm {
     }
     /// VEX (3-byte) register form, 128-bit: map 1 = 0F, 2 = 0F38, 3 = 0F3A; pp 1 = 66
     fn vex_rr(&mut self, pp: u8, map: u8, w: bool, op: u8, reg: u8, vvvv: u8, rm: u8) {
-        assert!(vvvv < 16, "x64: vvvv {}", vvvv);
+        if reg >= 16 || vvvv >= 16 || rm >= 16 {
+            let ew = evex_direct(pp, map, op).unwrap_or_else(|| panic!("x64: vex op {:#x} (pp {} map {}) with xmm{} {} {}", op, pp, map, reg, vvvv, rm));
+            self.evex_rr(pp, map, ew, false, op, reg, vvvv, rm);
+            return;
+        }
         self.byte(0xc4);
         self.byte(((!(reg >> 3) & 1) << 7) | (1 << 6) | ((!(rm >> 3) & 1) << 5) | map);
         self.byte(((w as u8) << 7) | ((!vvvv & 15) << 3) | pp);
@@ -754,6 +758,18 @@ fn icc(c: Cond, signed: bool) -> u8 {
         (Cond::Le, false) => CC_BE,
         (Cond::Gt, false) => CC_A,
         (Cond::Ge, false) => CC_AE,
+    }
+}
+
+/// The 128-bit / scalar VEX three-operand ops whose EVEX form (AVX-512F / VL, same opcode) the
+/// emitter writes when an operand is in xmm16..31: Some(EVEX.W). Float add/mul/sub/div/min/max
+/// (ps/pd/ss/sd: W1 for the double forms) and the dword/qword integer and/add/sub/or/xor/andn.
+fn evex_direct(pp: u8, map: u8, op: u8) -> Option<bool> {
+    match (map, pp, op) {
+        (1, _, 0x58 | 0x59 | 0x5c | 0x5e | 0x5d | 0x5f) => Some(pp == 1 || pp == 3),
+        (1, 1, 0xfe | 0xfa | 0xdb | 0xdf | 0xeb | 0xef) => Some(false),
+        (1, 1, 0xd4 | 0xfb) => Some(true),
+        _ => None,
     }
 }
 
@@ -1069,6 +1085,21 @@ impl<'a> Gen<'a> {
             self.a.vex_l(0, 1, false, true, 0x28, dst, 0, src); // vmovaps ymm, ymm
         } else {
             self.a.movf_rr(true, dst, src);
+        }
+    }
+    /// use_f for an instruction with an EVEX form here (evex_direct): xmm16..31 read in place.
+    fn use_fx(&mut self, v: VReg, scratch: u8) -> u8 {
+        match self.al.loc[v.0 as usize] {
+            Loc::Flt(x) if x >= 16 => x,
+            _ => self.use_f(v, scratch),
+        }
+    }
+    /// def_f for an instruction with an EVEX form here: xmm16..31 written in place (fin_f then
+    /// moves nothing).
+    fn def_fx(&self, v: VReg, scratch: u8) -> u8 {
+        match self.al.loc[v.0 as usize] {
+            Loc::Flt(x) => x,
+            _ => scratch,
         }
     }
     fn use_f(&mut self, v: VReg, scratch: u8) -> u8 {
@@ -2761,9 +2792,12 @@ impl<'a> Gen<'a> {
                 self.fin_f(*d, xd);
             }
             Inst::FBin(op, f64_, d, a, b) => {
-                let xa = self.use_f(*a, XS);
-                let xb = self.use_f(*b, XS2);
-                let xd = self.def_f(*d, XS);
+                // AVX: the VEX / EVEX three-operand form reads and writes xmm16..31 in place
+                let (xa, xb, xd) = if self.avx {
+                    (self.use_fx(*a, XS), self.use_fx(*b, XS2), self.def_fx(*d, XS))
+                } else {
+                    (self.use_f(*a, XS), self.use_f(*b, XS2), self.def_f(*d, XS))
+                };
                 let pfx = if *f64_ { 0xf2 } else { 0xf3 };
                 let opc = match op {
                     FOp::Add => 0x58,
@@ -3071,9 +3105,12 @@ impl<'a> Gen<'a> {
     /// form. pp: 0 none / 1 66; map: 1 0F / 2 0F38 / 3 0F3A; imm for compares.
     fn v3(&mut self, d: VReg, a: VReg, b: VReg, pp: u8, map: u8, op: u8, imm: Option<u8>) {
         if self.avx {
-            let xa = self.use_f(a, XS);
-            let xb = self.use_f(b, XS2);
-            let xd = self.def_f(d, XS);
+            let direct = imm.is_none() && evex_direct(pp, map, op).is_some() && self.f.vregs[d.0 as usize] != Cls::V256;
+            let (xa, xb, xd) = if direct {
+                (self.use_fx(a, XS), self.use_fx(b, XS2), self.def_fx(d, XS))
+            } else {
+                (self.use_f(a, XS), self.use_f(b, XS2), self.def_f(d, XS))
+            };
             self.a.vex_rr(pp, map, false, op, xd, xa, xb);
             if let Some(k) = imm {
                 self.a.byte(k);
