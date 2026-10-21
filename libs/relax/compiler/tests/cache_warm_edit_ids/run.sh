@@ -9,7 +9,7 @@
 # startup image (the guard of a broken image).
 # Prints "cache_warm_edit_ids: ok" or "cache_warm_edit_ids: FAILED ...".
 H=$(cd "$(dirname "$0")" && pwd)
-R=$1
+R=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 C=$(mktemp -d)
 chmod 700 "$C"
 mkdir "$C/pkg"
