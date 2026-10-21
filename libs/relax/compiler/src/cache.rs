@@ -501,9 +501,9 @@ pub struct Cache {
     /// carries a fresh image
     image_slots: usize,
     image_stale: usize,
-    /// a key of the loaded image that should decode did not, or code reached a slot of it
-    /// without an identity: the next manifest carries no image (written at once, at exit too),
-    /// so no later run starts from it
+    /// code reached a slot of the loaded image without an identity (`image_broken`): the
+    /// manifest carries no image from now on (written at once, at exit too), so no later run
+    /// starts from it
     image_bad: bool,
     /// the root crate whose manifest load_manifest read
     manifest_root: Option<u32>,
@@ -5368,7 +5368,12 @@ mod data_tests {
         for kind in kinds {
             let key = FnKey::Shim(crate::jit::ShimInstance { kind, args: vec![callable, pointer, borrowed, early, alias, object, reference, array, tuple, slice] });
             let mut bytes = E::default();
-            assert!(cache.enc_fnkey(&u, &key, &mut bytes, &mut vec![], 0).is_some());
+            let mut crates = vec![];
+            assert!(cache.enc_fnkey(&u, &key, &mut bytes, &mut crates, 0).is_some());
+            // the image's walk of a key finds the crates its encoder named (prelink's key_ok)
+            crates.sort_unstable();
+            crates.dedup();
+            assert_eq!(cache.key_crates(&u, &bytes.0), Some(crates));
             assert!(!encoded.contains(&bytes.0), "colliding shim key");
             encoded.push(bytes.0);
         }
@@ -6466,13 +6471,7 @@ impl Linker {
             }
             7 => {
                 let id = match self.image_slot_at(u, d) {
-                    Some(id) => {
-                        if let Ok(p) = std::env::var("WARMFIX_DBG") {
-                            use std::io::Write;
-                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) { let _ = writeln!(f, "T id={} named={}", id, !matches!(u.fns[id as usize].key, FnKey::Glue(crate::jit::GLUE_UNNAMED, _))); }
-                        }
-                        id
-                    }
+                    Some(id) => id,
                     None => {
                         let t = crate::jit::wall_ns();
                         let key = self.dec_fnkey(u, d, 0)?;

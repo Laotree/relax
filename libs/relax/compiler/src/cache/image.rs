@@ -152,11 +152,11 @@ impl Cache {
         Ok(Some((e.0, n)))
     }
 
-    /// The loaded startup image is not to be trusted (`why`): a key whose crates are unchanged
-    /// did not decode, or code reached one of its slots without an identity. Neither may happen;
-    /// if one does, the manifest is replaced at once by an empty one (no slots, no image), so
-    /// the next run starts without it and records a fresh one: a broken image never outlives
-    /// the run that found it.
+    /// The loaded startup image is not to be trusted (`why`): code reached one of its slots
+    /// without an identity (a key that decodes for sure did not, after code was linked to its
+    /// slot). That may not happen; if it does, the manifest is replaced at once by an empty one
+    /// (no slots, no image), so the next run starts without it and records a fresh one: a broken
+    /// image never outlives the run that found it.
     pub(super) fn image_broken(&mut self, why: &str) {
         if self.image_bad {
             return;
@@ -181,7 +181,7 @@ impl Cache {
 
     /// The crates (of this run) image key `b` names: the crates of the definitions it names and
     /// of the files whose closures it names. None: one of them is not known here.
-    fn key_crates(&mut self, u: &Unit, b: &[u8]) -> Option<Vec<u32>> {
+    pub(super) fn key_crates(&mut self, u: &Unit, b: &[u8]) -> Option<Vec<u32>> {
         let mut atoms = Vec::new();
         skip_fnkey(&mut D { b, p: 0 }, 0, &mut |a| atoms.push(a))?;
         let mut out = Vec::with_capacity(atoms.len());
@@ -1625,7 +1625,6 @@ impl Linker {
             }
         }
         let first = self.img_place(u, &mut im, ready);
-        warmfix_dbg_placed(&im, &first);
         let mut n = first.len();
         install(u, first);
         let mut ready = Vec::with_capacity(later.len());
@@ -1636,7 +1635,6 @@ impl Linker {
             }
         }
         let second = self.img_place(u, &mut im, ready);
-        warmfix_dbg_placed(&im, &second);
         n += second.len();
         install(u, second);
         let c = self.cache();
@@ -1756,17 +1754,8 @@ impl Linker {
         match self.dec_fnkey(u, &mut D { b, p: 0 }, 0) {
             Some(key) => Some(u.name_slot(id, key)),
             None => {
-                if let Ok(p) = std::env::var("WARMFIX_DBG") {
-                    use std::io::Write;
-                    let hex: String = b.iter().map(|x| format!("{:02x}", x)).collect();
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) { let _ = writeln!(f, "F k={} id={} bytes={}", k, id, hex); }
-                }
-                let sure = self.cache().image_ids.as_mut().map_or(false, |ids| {
+                if let Some(ids) = self.cache().image_ids.as_mut() {
                     ids.slot[k] = NO_SLOT;
-                    ids.key_ok[k]
-                });
-                if sure {
-                    self.cache().image_broken("a key naming only unchanged crates did not decode");
                 }
                 None
             }
@@ -1864,28 +1853,4 @@ pub(crate) unsafe fn ids_report_unit(up: *mut Unit, by: &str) {
     let s = &c.stats;
     eprintln!("makepad-run cache: startup identities decoded: {} ({} in the background, {} in the prelink (keys naming a changed crate, {:.1} ms); {} duplicate, {} did not decode) in {:.1} ms, finished by {} (t={:.0} ms)",
         s.ids_decoded, s.ids_bg, s.ids_unsure, s.ids_unsure_ns as f64 / 1e6, s.ids_dup, s.ids_failed, s.ids_ns as f64 / 1e6, by, crate::clock::ms_since_start());
-}
-
-/// WARMFIX temporary: the placed slots and the image keys they name.
-fn warmfix_dbg_placed(im: &Img, placed: &[PrelinkedSlot]) {
-    let Ok(p) = std::env::var("WARMFIX_DBG") else { return };
-    use std::io::Write;
-    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) else { return };
-    let by_id: HashMap<u32, usize> = placed.iter().map(|s| (s.id, 0)).collect();
-    for (si, s) in im.slots.iter().enumerate() {
-        let Some(id) = im.slot_of(s.key) else { continue };
-        if !by_id.contains_key(&id) { continue; }
-        let mut refs = Vec::new();
-        for ri in (s.rel.0..s.rel.1).step_by(REL_SIZE) {
-            if let Some((_, _, t, ix)) = im.rel_at(ri) {
-                if t == IMG_SLOT || t == IMG_THUNK { refs.push(format!("{}{}", if t == IMG_SLOT { "s" } else { "t" }, ix)); }
-            }
-        }
-        let crates: Vec<String> = im.flat[s.crates.0..s.crates.1].iter().map(|c| c.to_string()).collect();
-        let _ = writeln!(f, "P id={} si={} key={} crates={} inl={:?} refs={}", id, si, s.key, crates.join(","), &im.flat[s.inl.0..s.inl.1], refs.join(","));
-    }
-    for (si, s) in im.slots.iter().enumerate() {
-        let crates: Vec<String> = im.flat[s.crates.0..s.crates.1].iter().map(|c| format!("{}:{}", c, im.crate_ok.get(*c as usize).copied().unwrap_or(false))).collect();
-        let _ = writeln!(f, "S si={} key={} slot={:?} crates={}", si, s.key, im.slot_of(s.key), crates.join(","));
-    }
 }
