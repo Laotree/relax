@@ -139,6 +139,8 @@ impl Asm {
             Some((ix, _)) => ix,
             None => x,
         };
+        // xmm16..31 need EVEX (evex_*): a legacy encoding would silently name xmm(n & 15)
+        assert!(r < 16 && x < 16 && b < 16, "x64: register {} {} {} in a REX encoding", r, x, b);
         let v = 0x40 | ((w as u8) << 3) | (((r >> 3) & 1) << 2) | (((x >> 3) & 1) << 1) | ((b >> 3) & 1);
         if v != 0x40 || force {
             self.byte(v);
@@ -147,11 +149,13 @@ impl Asm {
 
     /// ModRM for register-register.
     fn modrm_rr(&mut self, reg: u8, rm: u8) {
+        assert!(reg < 16 && rm < 16, "x64: register {} {} in a legacy/VEX ModRM", reg, rm);
         self.byte(0xc0 | ((reg & 7) << 3) | (rm & 7));
     }
 
     /// ModRM + SIB + disp for [base + disp].
     fn modrm_mem(&mut self, reg: u8, base: u8, disp: i32) {
+        assert!(reg < 16 && base < 16, "x64: register {} {} in a legacy/VEX ModRM", reg, base);
         if let Some((ix, sh)) = self.sib.take() {
             // [base + index << sh + disp]: rm = 100, SIB follows
             let r = (reg & 7) << 3;
@@ -501,6 +505,13 @@ impl Asm {
         self.modrm_rr(dst, src);
     }
     fn sse_rm(&mut self, pfx: u8, op: u8, reg: u8, base: u8, disp: i32) {
+        if reg >= 16 {
+            // movups / movss / movsd load and store: vmovups / vmovss / vmovsd (EVEX)
+            assert!(matches!(op, 0x10 | 0x11), "x64: sse op {:#x} with xmm{}", op, reg);
+            let (pp, w) = match pfx { 0 => (0, false), 0xf3 => (2, false), 0xf2 => (3, true), _ => panic!("x64: sse prefix {:#x} with xmm{}", pfx, reg) };
+            self.evex_m(pp, 1, w, false, op, reg, 0, base, disp);
+            return;
+        }
         if pfx != 0 {
             self.byte(pfx);
         }
@@ -553,6 +564,7 @@ impl Asm {
     }
     /// VEX (3-byte) register form, 128-bit: map 1 = 0F, 2 = 0F38, 3 = 0F3A; pp 1 = 66
     fn vex_rr(&mut self, pp: u8, map: u8, w: bool, op: u8, reg: u8, vvvv: u8, rm: u8) {
+        assert!(vvvv < 16, "x64: vvvv {}", vvvv);
         self.byte(0xc4);
         self.byte(((!(reg >> 3) & 1) << 7) | (1 << 6) | ((!(rm >> 3) & 1) << 5) | map);
         self.byte(((w as u8) << 7) | ((!vvvv & 15) << 3) | pp);
@@ -561,6 +573,12 @@ impl Asm {
     }
     /// VEX (3-byte) register form with the vector length: `y` = 256-bit (L = 1)
     fn vex_l(&mut self, pp: u8, map: u8, w: bool, y: bool, op: u8, reg: u8, vvvv: u8, rm: u8) {
+        if (reg >= 16 || rm >= 16) && pp == 0 && map == 1 && op == 0x28 && vvvv == 0 {
+            // vmovaps ymm, ymm (EVEX)
+            self.evex_rr(0, 1, w, y, 0x28, reg, 0, rm);
+            return;
+        }
+        assert!(vvvv < 16, "x64: vvvv {}", vvvv);
         self.byte(0xc4);
         self.byte(((!(reg >> 3) & 1) << 7) | (1 << 6) | ((!(rm >> 3) & 1) << 5) | map);
         self.byte(((w as u8) << 7) | ((!vvvv & 15) << 3) | ((y as u8) << 2) | pp);
@@ -569,6 +587,13 @@ impl Asm {
     }
     /// VEX (3-byte) [base + disp] form with the vector length (an index from `sib` too)
     fn vex_lm(&mut self, pp: u8, map: u8, w: bool, y: bool, op: u8, reg: u8, vvvv: u8, base: u8, disp: i32) {
+        if reg >= 16 {
+            // vmovups ymm/xmm load and store (EVEX)
+            assert!(pp == 0 && map == 1 && vvvv == 0 && matches!(op, 0x10 | 0x11), "x64: vex op {:#x} with xmm{}", op, reg);
+            self.evex_m(0, 1, w, y, op, reg, 0, base, disp);
+            return;
+        }
+        assert!(vvvv < 16, "x64: vvvv {}", vvvv);
         let x = self.sib.map_or(0, |s| s.0);
         self.byte(0xc4);
         self.byte(((!(reg >> 3) & 1) << 7) | ((!(x >> 3) & 1) << 6) | ((!(base >> 3) & 1) << 5) | map);
@@ -584,6 +609,7 @@ impl Asm {
     }
     /// VEX (3-byte) [rip + disp32] form, 128-bit; returns the disp32 patch position
     fn vex_rip(&mut self, pp: u8, map: u8, w: bool, op: u8, reg: u8, vvvv: u8) -> usize {
+        assert!(reg < 16 && vvvv < 16, "x64: register {} {} in a VEX encoding", reg, vvvv);
         self.byte(0xc4);
         self.byte(((!(reg >> 3) & 1) << 7) | (1 << 6) | (1 << 5) | map);
         self.byte(((w as u8) << 7) | ((!vvvv & 15) << 3) | pp);
@@ -595,10 +621,63 @@ impl Asm {
     }
     fn movf_rr(&mut self, f64_: bool, dst: u8, src: u8) {
         if dst != src {
-            // movaps xmm, xmm (full register copy)
-            self.sse_rr(0, 0x28, dst, src, false);
+            if dst >= 16 || src >= 16 {
+                // vmovaps xmm, xmm (EVEX: xmm16..31)
+                self.evex_rr(0, 1, false, false, 0x28, dst, 0, src);
+            } else {
+                // movaps xmm, xmm (full register copy)
+                self.sse_rr(0, 0x28, dst, src, false);
+            }
         }
         let _ = f64_;
+    }
+    /// EVEX prefix (62 P0 P1 P2), no masking, no broadcast: `reg` and `vvvv` up to 31; `rm_hi` = bit
+    /// 4 of a register rm (EVEX.X), `x3` / `b3` = bit 3 of the index / base (or of rm).
+    fn evex_prefix(&mut self, pp: u8, map: u8, w: bool, y: bool, reg: u8, vvvv: u8, x: u8, b: u8) {
+        self.byte(0x62);
+        self.byte(((!(reg >> 3) & 1) << 7) | ((!(x >> 3) & 1) << 6) | ((!(b >> 3) & 1) << 5) | ((!(reg >> 4) & 1) << 4) | map);
+        self.byte(((w as u8) << 7) | ((!vvvv & 15) << 3) | (1 << 2) | pp);
+        self.byte(((y as u8) << 5) | ((!(vvvv >> 4) & 1) << 3));
+    }
+    /// EVEX register form: op reg, [vvvv,] rm (each 0..31)
+    fn evex_rr(&mut self, pp: u8, map: u8, w: bool, y: bool, op: u8, reg: u8, vvvv: u8, rm: u8) {
+        // for a register rm, EVEX.X carries its bit 4 and EVEX.B its bit 3
+        self.evex_prefix(pp, map, w, y, reg, vvvv, (rm >> 4) << 3, rm);
+        self.byte(op);
+        self.byte(0xc0 | ((reg & 7) << 3) | (rm & 7));
+    }
+    /// EVEX [base + disp] form (an index from `sib` too). The displacement is always a disp32 (or
+    /// none): EVEX's disp8 is scaled by the operand size (disp8*N), which this encoder does not track.
+    fn evex_m(&mut self, pp: u8, map: u8, w: bool, y: bool, op: u8, reg: u8, vvvv: u8, base: u8, disp: i32) {
+        let ix = self.sib.map_or(0, |s| s.0);
+        assert!(base < 16 && ix < 16, "x64: evex base {} index {}", base, ix);
+        self.evex_prefix(pp, map, w, y, reg, vvvv, ix, base);
+        self.byte(op);
+        let r = (reg & 7) << 3;
+        if let Some((ix, sh)) = self.sib.take() {
+            let sib = (sh << 6) | ((ix & 7) << 3) | (base & 7);
+            if disp == 0 && base & 7 != 5 {
+                self.byte(r | 4);
+                self.byte(sib);
+            } else {
+                self.byte(0x80 | r | 4);
+                self.byte(sib);
+                self.u32(disp as u32);
+            }
+            return;
+        }
+        let bb = base & 7;
+        if disp == 0 && bb != 5 {
+            self.byte(r | bb);
+        } else {
+            self.byte(0x80 | r | bb);
+        }
+        if bb == 4 {
+            self.byte(0x24);
+        }
+        if !(disp == 0 && bb != 5) {
+            self.u32(disp as u32);
+        }
     }
     fn loadf(&mut self, f64_: bool, dst: u8, base: u8, disp: i32) {
         self.sse_rm(if f64_ { 0xf2 } else { 0xf3 }, 0x10, dst, base, disp);
@@ -608,10 +687,20 @@ impl Asm {
     }
     /// movq xmm, r64 (or movd for 32 bits)
     fn movq_xr(&mut self, x: u8, r: u8, w: bool) {
+        if x >= 16 {
+            // vmovq / vmovd xmm, r (EVEX.128.66.0F.W{1,0} 6E /r)
+            self.evex_rr(1, 1, w, false, 0x6e, x, 0, r);
+            return;
+        }
         self.sse_rr(0x66, 0x6e, x, r, w);
     }
     /// movq r64, xmm (or movd)
     fn movq_rx(&mut self, r: u8, x: u8, w: bool) {
+        if x >= 16 {
+            // vmovq / vmovd r, xmm (EVEX.128.66.0F.W{1,0} 7E /r: reg = xmm, rm = gpr)
+            self.evex_rr(1, 1, w, false, 0x7e, x, 0, r);
+            return;
+        }
         // 66 REX.W 0F 7E /r : reg = xmm, rm = gpr
         self.byte(0x66);
         self.rex(w, x, 0, r, false);
@@ -697,6 +786,15 @@ pub fn reg_config(options: &relax_session::Options) -> RegConfig {
     let mut flt = Vec::new();
     for x in 2..14u8 {
         flt.push(x);
+    }
+    // AVX-512VL: xmm16..31 (caller-saved in both ABIs). Only EVEX reaches them, so the emitter
+    // treats a value there like a spilled one (use_f / def_f / fin_f move it through the
+    // instruction's scratch register with an EVEX vmovaps) except for the moves, loads and stores
+    // that have EVEX forms here (movf_rr, loadf / storef, movups, vmovups ymm, movq).
+    if options.cpu.avx512 {
+        for x in 16..32u8 {
+            flt.push(x);
+        }
     }
     let mut int_caller = CALLER_SAVED_ALLOC.to_vec();
     if !options.no_rcx {
@@ -962,8 +1060,24 @@ impl<'a> Gen<'a> {
         }
         self.a.load64(dst, RBP, disp);
     }
+    /// A full register copy of v's class between any two of xmm0..31 (ymm for V256).
+    fn mov_cls(&mut self, v: VReg, dst: u8, src: u8) {
+        if dst == src {
+            return;
+        }
+        if self.f.vregs[v.0 as usize] == Cls::V256 {
+            self.a.vex_l(0, 1, false, true, 0x28, dst, 0, src); // vmovaps ymm, ymm
+        } else {
+            self.a.movf_rr(true, dst, src);
+        }
+    }
     fn use_f(&mut self, v: VReg, scratch: u8) -> u8 {
         match self.al.loc[v.0 as usize] {
+            // xmm16..31 (AVX-512VL, reg_config): read like a spill, through the scratch register
+            Loc::Flt(x) if x >= 16 => {
+                self.mov_cls(v, scratch, x);
+                scratch
+            }
             Loc::Flt(x) => x,
             Loc::Stack(o) if self.f.vregs[v.0 as usize] == Cls::V256 => {
                 let d = self.spill_disp(o);
@@ -1008,11 +1122,17 @@ impl<'a> Gen<'a> {
     }
     fn def_f(&self, v: VReg, scratch: u8) -> u8 {
         match self.al.loc[v.0 as usize] {
-            Loc::Flt(x) => x,
+            Loc::Flt(x) if x < 16 => x,
             _ => scratch,
         }
     }
     fn fin_f(&mut self, v: VReg, x: u8) {
+        if let Loc::Flt(h) = self.al.loc[v.0 as usize] {
+            if h >= 16 {
+                self.mov_cls(v, h, x);
+            }
+            return;
+        }
         if let Loc::Stack(o) = self.al.loc[v.0 as usize] {
             let d = self.spill_disp(o);
             if self.f.vregs[v.0 as usize] == Cls::V256 {
@@ -5547,6 +5667,7 @@ pub fn detect_cpu(options: &relax_session::Options) -> relax_session::options::C
         cpu.bmi1 = !options.no_bitops && std::is_x86_feature_detected!("bmi1");
         cpu.fma = cpu.avx && std::is_x86_feature_detected!("fma");
         cpu.avx2 = cpu.avx && std::is_x86_feature_detected!("avx2");
+        cpu.avx512 = cpu.avx && !options.no_avx512 && std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512vl");
         cpu
     }
     #[cfg(not(target_arch = "x86_64"))]
