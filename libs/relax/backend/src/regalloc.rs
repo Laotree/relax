@@ -2045,10 +2045,40 @@ fn region_windows_alloc(
                 continue;
             }
             let entered = |b: u32| -> bool { pieces.iter().find(|x| x.0 == b).map_or(false, |(_, ps)| live_in(b, ps)) };
-            // drop blocks that only load for nothing (no use, and a load needed) until stable
+            // the outside predecessors of b that load at their end instead (before their
+            // terminator) when together they run less often than b: a loop's preheader or guard,
+            // the join of a cold path. The register must be free from the predecessor's last two
+            // instructions on (fused compares and loads are emitted with the terminator and read
+            // operands whose ranges ended there) to its end (whatever it holds into another
+            // successor is live out). None: b loads at its start.
+            let edge_preds = |b: u32, inset: &dyn Fn(u32) -> bool| -> Option<Vec<u32>> {
+                let bu = b as usize;
+                if !edge_loads || invoke_pred[bu] || preds[bu].is_empty() {
+                    return None;
+                }
+                let mut at_end: Vec<u32> = Vec::new();
+                for &p in &preds[bu] {
+                    if inset(p) || at_end.contains(&p) {
+                        continue;
+                    }
+                    let pu = p as usize;
+                    let from = block_end[pu].saturating_sub(5).max(block_start[pu]);
+                    let term_ok = matches!(f.blocks[pu].term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..));
+                    if p == b || !reach[pu] || !term_ok || (!o.is_empty() && bits_any(o, from, block_end[pu])) {
+                        return None;
+                    }
+                    at_end.push(p);
+                }
+                if at_end.is_empty() || at_end.iter().map(|p| wts[*p as usize]).sum::<f32>() >= wts[bu] {
+                    return None;
+                }
+                Some(at_end)
+            };
+            // drop blocks that only load for nothing (no use, no definition, and a load of their
+            // own needed) until stable
             loop {
                 let inset = |b: u32| set.binary_search(&b).is_ok();
-                let needs = |b: u32| entered(b) && (invoke_pred[b as usize] || preds[b as usize].is_empty() || preds[b as usize].iter().any(|p| !inset(*p)));
+                let needs = |b: u32| entered(b) && (invoke_pred[b as usize] || preds[b as usize].is_empty() || preds[b as usize].iter().any(|p| !inset(*p))) && edge_preds(b, &inset).is_none();
                 let drop: Vec<u32> = set.iter().copied().filter(|b| !used.contains_key(b) && !def_in.contains_key(&(v, *b)) && needs(*b)).collect();
                 if drop.is_empty() {
                     break;
@@ -2067,41 +2097,22 @@ fn region_windows_alloc(
                 let load = entered(b) && (invoke_pred[bu] || preds[bu].is_empty() || preds[bu].iter().any(|p| !inset(*p)));
                 // without the region: one load per block that uses it (windows join a block's uses)
                 let before = if used.contains_key(&b) { 1.0 } else { 0.0 };
-                // the outside predecessors load at their end instead (before their terminator) when
-                // that runs less often than b: a loop's preheader or guard, the join of a cold path.
-                // The register must be free from the predecessor's last two instructions on (fused
-                // compares and loads are emitted with the terminator and read operands whose ranges
-                // ended there) to its end (whatever it holds into another successor is live out)
-                let mut at_end: Vec<u32> = Vec::new();
-                if load && edge_loads && !invoke_pred[bu] && !preds[bu].is_empty() {
-                    for &p in &preds[bu] {
-                        if inset(p) {
-                            continue;
-                        }
-                        let pu = p as usize;
-                        let from = block_end[pu].saturating_sub(5).max(block_start[pu]);
-                        let term_ok = matches!(f.blocks[pu].term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..));
-                        if p != b && reach[pu] && term_ok && (o.is_empty() || !bits_any(o, from, block_end[pu])) && !at_end.contains(&p) && !edge.contains(&p) {
-                            at_end.push(p);
-                        } else {
-                            at_end.clear();
-                            break;
-                        }
-                    }
-                    if at_end.iter().map(|p| wts[*p as usize]).sum::<f32>() >= wts[bu] {
-                        at_end.clear();
-                    }
-                }
+                let at_end = if load { edge_preds(b, &inset).unwrap_or_default() } else { Vec::new() };
+                // a predecessor that already loads (for another successor in the region) is free
                 let cost = if !load {
                     0.0
                 } else if !at_end.is_empty() {
-                    at_end.iter().map(|p| wts[*p as usize]).sum::<f32>()
+                    at_end.iter().filter(|p| !edge.contains(p)).map(|p| wts[*p as usize]).sum::<f32>()
                 } else {
                     wts[bu]
                 };
                 gain += wts[bu] * before - cost;
                 plan.push((b, load && at_end.is_empty()));
-                edge.extend(at_end);
+                for p in at_end {
+                    if !edge.contains(&p) {
+                        edge.push(p);
+                    }
+                }
             }
             if gain > 0.0 && best.as_ref().map_or(true, |x| gain > x.0) {
                 best = Some((gain, c, plan, edge));
