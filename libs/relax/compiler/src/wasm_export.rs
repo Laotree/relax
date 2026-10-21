@@ -146,6 +146,50 @@ fn shake_blocks(f: &mut Func, trap: bool, keep: &dyn Fn(u32) -> bool, mut stub: 
             });
         }
     }
+    // the other shapes the optimiser leaves (a coverage base reached through Mov/IBinI/IBin, an
+    // indexed store): every store whose address derives from a coverage-table constant goes
+    {
+        use std::collections::HashSet;
+        let mut cvr: HashSet<VReg> = HashSet::new();
+        loop {
+            let n0 = cvr.len();
+            for b in &f.blocks {
+                for i in &b.insts {
+                    match i {
+                        Inst::Iconst(d, v) if crate::coverage::hit_at(*v as u64).is_some() => {
+                            cvr.insert(*d);
+                        }
+                        Inst::Mov(d, a) | Inst::IBinI(_, _, d, a, _) if cvr.contains(a) => {
+                            cvr.insert(*d);
+                        }
+                        Inst::IBin(relax_backend::rir::IOp::Add, _, d, a, c) if cvr.contains(a) || cvr.contains(c) => {
+                            cvr.insert(*d);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if cvr.len() == n0 {
+                break;
+            }
+        }
+        if !cvr.is_empty() {
+            for b in f.blocks.iter_mut() {
+                let keep: Vec<bool> = b.insts.iter().map(|i| !matches!(i, Inst::Store(_, a, _, _) | Inst::StoreX(_, a, _, _, _, _) | Inst::AtomicStore(_, _, a, _) if cvr.contains(a))).collect();
+                if keep.iter().all(|k| *k) {
+                    continue;
+                }
+                removed += keep.iter().filter(|k| !**k).count();
+                let positioned = b.pos.len() == b.insts.len();
+                let mut k = 0;
+                b.insts.retain(|_| { k += 1; keep[k - 1] });
+                if positioned {
+                    let mut k = 0;
+                    b.pos.retain(|_| { k += 1; keep[k - 1] });
+                }
+            }
+        }
+    }
     if removed > 0 {
         relax_backend::passes::dce(f);
         // a coverage address still named: a store shape this pass does not know (it would write
