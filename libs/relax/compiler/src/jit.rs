@@ -10791,6 +10791,7 @@ pub(crate) fn tier1_stats_report() {
     let s = g.as_ref().unwrap_or(&empty);
     let ms = |ns: u64| ns as f64 / 1e6;
     eprintln!("makepad-run o3-stats: builds={} cpu_ms={:.3} max_threads={} in_flight={} (completed attempts; Windows CPU is cycle-estimated)", s.builds, ms(s.cpu), s.max_active, s.active);
+    eprintln!("makepad-run o3-stats: pgo counted_builds={} counted_cpu_ms={:.3} counted_dropped={}", PGO_STATS[0].load(Ordering::Relaxed), ms(PGO_STATS[1].load(Ordering::Relaxed)), PGO_STATS[2].load(Ordering::Relaxed));
     eprintln!("makepad-run o3-stats: phases_cpu_ms snapshot={:.3} backend={:.3} install={:.3}", ms(s.phases[0]), ms(s.phases[1]), ms(s.phases[2]));
     let passes: Vec<String> = relax_backend::stats::PASS_NAMES.iter().enumerate().map(|(i, n)| format!("{}={:.3}", n, ms(s.passes[i]))).collect();
     eprintln!("makepad-run o3-stats: backend_pass_ms {} (pass slots can overlap; MAKEPAD_RUN_PASS_TIMES=wall selects wall time)", passes.join(" "));

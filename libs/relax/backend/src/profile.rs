@@ -128,12 +128,17 @@ pub fn freqs(f: &Func) -> Option<Vec<f32>> {
     Some(est.iter().map(|e| ((e / top) as f32).max(1e-4)).collect())
 }
 
-/// The inliner's frequencies of a counted body: relative to the hottest block, and exactly 0.0
-/// for a block that did not run (its sites are cold: only free bodies inline there).
+/// The inliner's frequencies of a counted body, per entry of the function: a block that runs
+/// on half the calls or more gets the inliner's hot level (codegen opt::HOT_FREQ, 0.05) or above,
+/// one that did not run exactly 0.0 (its sites are cold: only free bodies inline there). Relative
+/// to the entry, not to the hottest block: exact loop counts (millions per call) would leave every
+/// site outside the innermost loop below the hot level.
 pub fn inline_freqs(f: &Func) -> Option<Vec<f32>> {
+    const HOT_PER_ENTRY: f64 = 0.5;
+    const HOT_FREQ: f64 = 0.05;
     let est = estimates(f)?;
-    let top = est.iter().copied().fold(0.0f64, f64::max);
-    (top > 0.0).then(|| est.iter().map(|e| (e / top) as f32).collect())
+    let entry = est.first().copied().unwrap_or(0.0);
+    (entry > 0.0).then(|| est.iter().map(|e| (e / entry * HOT_FREQ / HOT_PER_ENTRY) as f32).collect())
 }
 
 /// Blocks of a counted body that ran at least `REPEAT` times per entry of the function (a loop
