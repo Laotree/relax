@@ -9214,7 +9214,8 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     // A pure function of the snapshot, so replay stays exact.
     let bodies = InlineBodies::prepare(options, id, candidates, get, ro, cfg, nounwind);
     let get_inline = |c: u32| bodies.get(c).or_else(|| get(c));
-    let mut inlined = tier1_simplify(options, func, id, name, &get_inline, single, ro, cfg, nounwind, frequencies, inline_stats.as_mut());
+    let price = |c: u32| bodies.price(c);
+    let mut inlined = tier1_simplify(options, func, id, name, &get_inline, &price, single, ro, cfg, nounwind, frequencies, inline_stats.as_mut(), None);
     bodies.expand(&mut inlined);
     // array iterators (a slot read at runtime offsets): their scalar fields in registers, so
     // the iteration counter can drive full unrolling below
@@ -9309,8 +9310,9 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
 /// are structural), so replay stays exact.
 struct InlineBodies {
     index: HashMap<u32, usize>,
-    /// (body, attributes, every slot whose body it took, transitively)
-    bodies: Vec<(Box<relax_backend::rir::Func>, u8, Vec<u32>)>,
+    /// (the inlined body: the first inlining round's output, unoptimised; the optimised body
+    /// that prices its sites; attributes; every slot whose body the inlined one took, transitively)
+    bodies: Vec<(Box<relax_backend::rir::Func>, Box<relax_backend::rir::Func>, u8, Vec<u32>)>,
 }
 
 impl InlineBodies {
@@ -9390,36 +9392,32 @@ impl InlineBodies {
                     continue;
                 }
                 let peers: &[usize] = scc;
-                let sub = |c: u32| match node.get(&c) {
-                    Some(m) if peers.contains(m) => get(c),
-                    _ => out.get(c).or_else(|| get(c)),
-                };
+                let in_scc = |c: u32| node.get(&c).is_some_and(|m| peers.contains(m));
+                let sub = |c: u32| if in_scc(c) { get(c) } else { out.get(c).or_else(|| get(c)) };
+                let sub_price = |c: u32| if in_scc(c) { None } else { out.price(c) };
                 let mut f = o1.clone();
                 f.baseline = false;
-                let mut taken = if options.opt.iter().any(|t| t.trim() == "+buraw") {
-                    let lim = relax_codegen::opt::InlineLimits::tier1_for(&f);
-                    let freqs = structural(0, &f);
-                    let t = relax_codegen::opt::inline_calls_ordered(options, &mut f, ids[k], &sub, &|_, _| false, nounwind, &lim, freqs.as_deref(), None);
-                    relax_backend::passes::renumber_rpo(&mut f);
-                    t
-                } else {
-                    tier1_simplify(options, &mut f, ids[k], &o1.name, &sub, &|_, _| false, ro, cfg, nounwind, &mut structural, None)
-                };
+                let mut raw = (relax_backend::rir::Func::new(String::new(), 0), Vec::new());
+                tier1_simplify(options, &mut f, ids[k], &o1.name, &sub, &sub_price, &|_, _| false, ro, cfg, nounwind, &mut structural, None, Some(&mut raw));
+                let (raw, mut taken) = raw;
                 if taken.is_empty() {
                     continue;
                 }
                 out.expand(&mut taken);
-                let mut deps: Vec<u32> = taken.into_iter().map(|x| x.0).collect();
-                deps.dedup();
+                let deps: Vec<u32> = taken.into_iter().map(|x| x.0).collect();
                 out.index.insert(ids[k], out.bodies.len());
-                out.bodies.push((Box::new(f), attrs, deps));
+                out.bodies.push((Box::new(raw), Box::new(f), attrs, deps));
             }
         }
         out
     }
 
     fn get(&self, c: u32) -> Option<(*const relax_backend::rir::Func, u8)> {
-        self.index.get(&c).map(|&k| (&*self.bodies[k].0 as *const relax_backend::rir::Func, self.bodies[k].1))
+        self.index.get(&c).map(|&k| (&*self.bodies[k].0 as *const relax_backend::rir::Func, self.bodies[k].2))
+    }
+
+    fn price(&self, c: u32) -> Option<*const relax_backend::rir::Func> {
+        self.index.get(&c).map(|&k| &*self.bodies[k].1 as *const relax_backend::rir::Func)
     }
 
     /// Adds the bodies the inlined prepared callees took (hot reload and the cache's
@@ -9429,7 +9427,7 @@ impl InlineBodies {
         while k < inlined.len() {
             let (c, rule) = inlined[k];
             if let Some(&b) = self.index.get(&c) {
-                for &d in &self.bodies[b].2 {
+                for &d in &self.bodies[b].3 {
                     if !inlined.iter().any(|x| x.0 == d) { inlined.push((d, rule)); }
                 }
             }
@@ -9440,13 +9438,15 @@ impl InlineBodies {
 
 /// O3's simplification (both inlining rounds, the pipeline between them, the post-inline
 /// slot cleanup): what a caller's build inlines when it takes this function bottom-up.
-fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, mut inline_stats: Option<&mut relax_codegen::opt::InlineStats>) -> Vec<(u32, usize)> {
+/// `inlined_only`: receives the body after the first inlining round, before any optimisation,
+/// with the callees that round inlined.
+fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, price: &dyn Fn(u32) -> Option<*const relax_backend::rir::Func>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, mut inline_stats: Option<&mut relax_codegen::opt::InlineStats>, inlined_only: Option<&mut (relax_backend::rir::Func, Vec<(u32, usize)>)>) -> Vec<(u32, usize)> {
     let mut limits = relax_codegen::opt::InlineLimits::tier1_for(func);
     let mut inlined: Vec<(u32, usize)> = Vec::new();
     if cfg.inline {
         let ti = relax_backend::stats::pass_clock();
         let freqs = frequencies(0, func);
-        for (c, rule) in relax_codegen::opt::inline_calls_ordered(options, func, id, get, single, nounwind, &limits, freqs.as_deref(), inline_stats.as_deref_mut()) {
+        for (c, rule) in relax_codegen::opt::inline_calls_ordered(options, func, id, get, price, single, nounwind, &limits, freqs.as_deref(), inline_stats.as_deref_mut()) {
             // a single-caller body moved into this fn: the second round's ceiling includes it
             if rule == relax_codegen::opt::RULE_SINGLE {
                 if let (Some(g), Some((p, _))) = (limits.growth_limit.as_mut(), get(c)) {
@@ -9461,13 +9461,16 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
         relax_backend::passes::renumber_rpo(func);
         relax_backend::stats::pass_time(5, ti);
     }
+    if let Some(raw) = inlined_only {
+        *raw = (func.clone(), inlined.clone());
+    }
     opt_pipeline(options, func, ro, cfg, layout_for(options, name), true, nounwind);
     // optimisation exposes calls inlining could not see (a call through a known fn address
     // became a direct call: `.map(GlyphId)`): one more inlining round for them
     if cfg.inline {
         let ti = relax_backend::stats::pass_clock();
         let freqs = frequencies(1, func);
-        let more = relax_codegen::opt::inline_calls_ordered(options, func, id, get, single, nounwind, &limits, freqs.as_deref(), inline_stats.as_deref_mut());
+        let more = relax_codegen::opt::inline_calls_ordered(options, func, id, get, price, single, nounwind, &limits, freqs.as_deref(), inline_stats.as_deref_mut());
         relax_backend::stats::pass_time(5, ti);
         if !more.is_empty() {
             relax_backend::passes::renumber_rpo(func);
