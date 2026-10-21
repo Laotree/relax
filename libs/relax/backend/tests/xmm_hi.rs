@@ -114,3 +114,68 @@ fn many_live_vectors_use_the_upper_registers() {
         }
     }
 }
+
+/// fn(src, dst) for F32 / F64: dst[i] = (fma(-x[i], x[i+1], x[i+7]) + 2.5) + x[i], every x live until
+/// the end (FUnary, FMulAdd and Fconst in the upper registers too).
+fn build_fma(f64_: bool) -> Code {
+    let (cls, mem, sz) = if f64_ { (Cls::F64, Mem::F64, 8) } else { (Cls::F32, Mem::F32, 4) };
+    let mut f = Func::new("xmm_hi_fma".into(), 0);
+    let (ps, pd) = (f.vreg(Cls::I), f.vreg(Cls::I));
+    f.params = vec![ps, pd];
+    f.block();
+    let mut insts = Vec::new();
+    let xs: Vec<VReg> = (0..N).map(|_| f.vreg(cls)).collect();
+    for (i, x) in xs.iter().enumerate() {
+        insts.push(Inst::Load(mem, *x, ps, i as i32 * sz));
+    }
+    let k = f.vreg(cls);
+    insts.push(Inst::Fconst(k, if f64_ { 2.5f64.to_bits() } else { 2.5f32.to_bits() as u64 }, f64_));
+    let mut ds = Vec::new();
+    for i in 0..N {
+        let (n, m, a) = (f.vreg(cls), f.vreg(cls), f.vreg(cls));
+        insts.push(Inst::FUnary(FUn::Neg, f64_, n, xs[i]));
+        insts.push(Inst::FMulAdd(false, false, f64_, m, n, xs[(i + 1) % N], xs[(i + 7) % N]));
+        insts.push(Inst::FBin(FOp::Add, f64_, a, m, k));
+        ds.push(a);
+    }
+    for i in 0..N {
+        let r = f.vreg(cls);
+        insts.push(Inst::FBin(FOp::Add, f64_, r, ds[i], xs[i]));
+        insts.push(Inst::Store(mem, pd, i as i32 * sz, r));
+    }
+    f.blocks[0].pos = vec![0; insts.len()];
+    f.blocks[0].insts = insts;
+    f.blocks[0].term = Term::Ret(vec![]);
+    f.verify().unwrap();
+    let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+    let c = relax_backend::x64::compile(&options(), &f, &env).unwrap();
+    Code::new(&c.code).unwrap()
+}
+
+#[test]
+fn many_live_fma_operands() {
+    if !options().cpu.fma {
+        return;
+    }
+    for f64_ in [false, true] {
+        let code = build_fma(f64_);
+        let run: Entry = unsafe { std::mem::transmute(code.ptr()) };
+        if f64_ {
+            let x: Vec<f64> = (0..N).map(|i| 1.0 + i as f64 * 0.37 - (i % 5) as f64).collect();
+            let mut out = vec![0f64; N];
+            run(x.as_ptr() as *const u8, out.as_mut_ptr() as *mut u8);
+            for i in 0..N {
+                let want = ((-x[i]).mul_add(x[(i + 1) % N], x[(i + 7) % N]) + 2.5) + x[i];
+                assert_eq!(out[i].to_bits(), want.to_bits(), "f64 {}", i);
+            }
+        } else {
+            let x: Vec<f32> = (0..N).map(|i| 1.0 + i as f32 * 0.37 - (i % 5) as f32).collect();
+            let mut out = vec![0f32; N];
+            run(x.as_ptr() as *const u8, out.as_mut_ptr() as *mut u8);
+            for i in 0..N {
+                let want = ((-x[i]).mul_add(x[(i + 1) % N], x[(i + 7) % N]) + 2.5) + x[i];
+                assert_eq!(out[i].to_bits(), want.to_bits(), "f32 {}", i);
+            }
+        }
+    }
+}

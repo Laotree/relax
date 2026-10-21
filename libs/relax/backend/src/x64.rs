@@ -663,6 +663,16 @@ impl Asm {
         self.byte(op);
         self.byte(0xc0 | ((reg & 7) << 3) | (rm & 7));
     }
+    /// EVEX [rip + disp32] form; returns the disp32 patch position
+    fn evex_rip(&mut self, pp: u8, map: u8, w: bool, op: u8, reg: u8, vvvv: u8) -> usize {
+        assert!(self.sib.is_none());
+        self.evex_prefix(pp, map, w, false, reg, vvvv, 0, 0);
+        self.byte(op);
+        self.byte(((reg & 7) << 3) | 5);
+        let at = self.pos();
+        self.u32(0);
+        at
+    }
     /// EVEX [base + disp] form (an index from `sib` too). The displacement is always a disp32 (or
     /// none): EVEX's disp8 is scaled by the operand size (disp8*N), which this encoder does not track.
     fn evex_m(&mut self, pp: u8, map: u8, w: bool, y: bool, op: u8, reg: u8, vvvv: u8, base: u8, disp: i32) {
@@ -2663,6 +2673,17 @@ impl<'a> Gen<'a> {
                 self.a.mov_ri(r, *v);
                 self.fin_i(*d, r);
             }
+            Inst::Fconst(d, bits, f64_) if matches!(self.al.loc[d.0 as usize], Loc::Flt(x) if x >= 16) => {
+                let x = self.def_fx(*d, XS);
+                if *bits == 0 {
+                    self.a.evex_rr(1, 1, false, false, 0xef, x, x, x); // vpxord x, x, x
+                } else {
+                    // vmovss / vmovsd x, [rip + pool]
+                    let at = self.a.evex_rip(if *f64_ { 3 } else { 2 }, 1, *f64_, 0x10, x, 0);
+                    self.fpool.push((at, *bits));
+                }
+                self.fin_f(*d, x);
+            }
             Inst::Fconst(d, bits, f64_) => {
                 let x = self.def_f(*d, XS);
                 if *bits == 0 {
@@ -2710,8 +2731,8 @@ impl<'a> Gen<'a> {
                     self.fin_f(*d, xd);
                 }
                 c => {
-                    let xs = self.use_f(*s, XS);
-                    let xd = self.def_f(*d, XS);
+                    let xs = self.use_fx(*s, XS);
+                    let xd = self.def_fx(*d, XS);
                     self.a.movf_rr(c == Cls::F64, xd, xs);
                     self.fin_f(*d, xd);
                 }
@@ -2880,8 +2901,8 @@ impl<'a> Gen<'a> {
                 self.fin_f(*d, xd);
             }
             Inst::FUnary(op, f64_, d, a) => {
-                let xa = self.use_f(*a, XS);
-                let xd = self.def_f(*d, XS);
+                // the AVX sign masks have EVEX forms: xmm16..31 in place
+                let (xa, xd) = if self.avx && matches!(op, FUn::Neg | FUn::Abs) { (self.use_fx(*a, XS), self.def_fx(*d, XS)) } else { (self.use_f(*a, XS), self.def_f(*d, XS)) };
                 match op {
                     FUn::Neg | FUn::Abs if self.avx => {
                         let mask: u64 = match (op, f64_) {
@@ -2890,7 +2911,14 @@ impl<'a> Gen<'a> {
                             (_, true) => 0x7fff_ffff_ffff_ffff,
                             (_, false) => 0x7fff_ffff,
                         };
-                        self.vex_pool(1, if *op == FUn::Neg { 0x57 } else { 0x54 }, xd, xa, mask);
+                        if xa >= 16 || xd >= 16 {
+                            // vpxorq / vpandq x, a, [rip + mask] (EVEX.128.66.0F.W1 EF / DB: the
+                            // same bits as xorpd / andpd, AVX-512F)
+                            let at = self.a.evex_rip(1, 1, true, if *op == FUn::Neg { 0xef } else { 0xdb }, xd, xa);
+                            self.fpool.push((at, mask));
+                        } else {
+                            self.vex_pool(1, if *op == FUn::Neg { 0x57 } else { 0x54 }, xd, xa, mask);
+                        }
                     }
                     FUn::Neg | FUn::Abs => {
                         let mask: u64 = match (op, f64_) {
@@ -2972,7 +3000,7 @@ impl<'a> Gen<'a> {
                         self.fin_i(*d, rd);
                     }
                     Mem::F32 | Mem::F64 => {
-                        let xd = self.def_f(*d, XS);
+                        let xd = self.def_fx(*d, XS);
                         self.a.sib = Some((ri, *sh));
                         self.a.loadf(*m == Mem::F64, xd, rb, off);
                         self.fin_f(*d, xd);
@@ -3000,7 +3028,7 @@ impl<'a> Gen<'a> {
                         }
                     }
                     Mem::F32 | Mem::F64 => {
-                        let xs = self.use_f(*src, XS);
+                        let xs = self.use_fx(*src, XS);
                         self.a.sib = Some((ri, *sh));
                         self.a.storef(*m == Mem::F64, rb, off, xs);
                     }
@@ -3015,7 +3043,7 @@ impl<'a> Gen<'a> {
                         self.fin_i(*d, rd);
                     }
                     Mem::F32 | Mem::F64 => {
-                        let xd = self.def_f(*d, XS);
+                        let xd = self.def_fx(*d, XS);
                         self.a.loadf(*m == Mem::F64, xd, rb, off);
                         self.fin_f(*d, xd);
                     }
@@ -3033,7 +3061,7 @@ impl<'a> Gen<'a> {
                         }
                     }
                     Mem::F32 | Mem::F64 => {
-                        let xs = self.use_f(*src, XS);
+                        let xs = self.use_fx(*src, XS);
                         self.a.storef(*m == Mem::F64, rb, off, xs);
                     }
                 }
@@ -4232,13 +4260,13 @@ impl<'a> Gen<'a> {
             }
             Inst::VLoad(d, base, off) => {
                 let rb = self.use_i(options, base, R11);
-                let xd = self.def_f(d, XS);
+                let xd = self.def_fx(d, XS);
                 self.a.sse_rm(0, 0x10, xd, rb, off);
                 self.fin_f(d, xd);
             }
             Inst::VStore(base, off, v) => {
                 let rb = self.use_i(options, base, R11);
-                let xv = self.use_f(v, XS);
+                let xv = self.use_fx(v, XS);
                 self.a.sse_rm(0, 0x11, xv, rb, off);
             }
             // a constant without a register is made at its uses (Alloc::remat)
@@ -4469,7 +4497,7 @@ impl<'a> Gen<'a> {
             // the destination register t = d's own (unless that is b's or c's) or XS: no xmm0 /
             // xmm1 (keeps_xmm01). b reads xmm16..31 in place (EVEX), c too or straight from its
             // spill slot.
-            let xa = self.use_f(a, XS);
+            let xa = self.use_fx(a, XS);
             let xb = self.use_fx(b, XS2);
             let mc = match self.al.loc[c.0 as usize] {
                 Loc::Stack(o) => Some(self.spill_disp(o)),
@@ -4483,7 +4511,7 @@ impl<'a> Gen<'a> {
                 l => panic!("x64 fma: c at {:?}", l),
             };
             let xd = self.def_fx(d, XS);
-            let t = if xd < 16 && (xd == xa || (xd != xb && (mc.is_some() || xd != xc))) { xd } else { XS };
+            let t = if xd == xa || (xd != xb && (mc.is_some() || xd != xc)) { xd } else { XS };
             // t is written with a first: it must not hold b or c unless it holds a (the same value)
             assert!(t == xa || (t != xb && (mc.is_some() || t != xc)), "x64 fma: destination {} vs a {} b {} c {}", t, xa, xb, xc);
             self.a.movf_rr(true, t, xa);
