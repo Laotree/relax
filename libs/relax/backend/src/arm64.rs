@@ -1861,6 +1861,18 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// q register at [n + (m << sh) + off]
+    fn vldst_x(&mut self, load: bool, t: u8, n: u8, m: u8, sh: u8, off: i64) {
+        if off == 0 && (sh == 0 || sh == 4) {
+            // LDR/STR (register, SIMD&FP) 128-bit, option LSL, S = shift by 4
+            self.a.e(if load { 0x3CE0_6800 } else { 0x3CA0_6800 } | if sh == 4 { 0x1000 } else { 0 } | (m as u32) << 16 | (n as u32) << 5 | t as u32);
+            return;
+        }
+        // add s1, n, m, lsl sh (vldst's large-offset form uses ip1)
+        self.a.e(0x8B00_0000 | (m as u32) << 16 | (sh as u32) << 10 | (n as u32) << 5 | S1 as u32);
+        self.vldst(load, t, S1, off);
+    }
+
     fn vldst(&mut self, load: bool, t: u8, n: u8, off: i64) {
         if off >= 0 && off % 16 == 0 && off / 16 < 4096 {
             self.a.e(if load { 0x3DC0_0000 } else { 0x3D80_0000 } | ((off / 16) as u32) << 10 | (n as u32) << 5 | t as u32);
@@ -1996,6 +2008,8 @@ impl<'a> Gen<'a> {
                 match op {
                     VX::FAdd(_, NanBits::Host | NanBits::Neon) => self.v3(FADD | f, xd, xa, xb),
                     VX::FSub(_, NanBits::Host | NanBits::Neon) => self.v3(FSUB | f, xd, xa, xb),
+                    // by element (fold_lane_splats): fmul vd.4s, va.4s, vb.s[0]
+                    VX::FMul(_, NanBits::Host | NanBits::Neon) if self.cls(b) == Cls::F32 => self.v3(0x4F80_9000, xd, xa, xb),
                     VX::FMul(_, NanBits::Host | NanBits::Neon) => self.v3(FMUL | f, xd, xa, xb),
                     VX::FDiv(_, NanBits::Host | NanBits::Neon) => self.v3(FDIV | f, xd, xa, xb),
                     VX::FMinNeon(_) => self.v3(0x4EA0_F400 | f, xd, xa, xb),
@@ -2557,7 +2571,12 @@ impl<'a> Gen<'a> {
                 }
                 let xa = self.use_f(a, FS0);
                 let xb = self.use_f(b, FS1);
-                self.v3(if np { 0x4EA0_CC00 } else { 0x4E20_CC00 }, t, xa, xb);
+                if self.cls(b) == Cls::F32 {
+                    // by element (fold_lane_splats): fmla / fmls t.4s, a.4s, b.s[0]
+                    self.v3(if np { 0x4F80_5000 } else { 0x4F80_1000 }, t, xa, xb);
+                } else {
+                    self.v3(if np { 0x4EA0_CC00 } else { 0x4E20_CC00 }, t, xa, xb);
+                }
                 let xd = self.def_f(d, FS2);
                 self.vmov(xd, t);
                 self.fin_f(d, xd);
@@ -2614,21 +2633,20 @@ impl<'a> Gen<'a> {
                 let xv = self.use_f(v, FS0);
                 self.vldst(false, xv, rb, off as i64);
             }
-            // (addr_modes makes these on x86-64 only; the address is computed into s1)
+            // [base + (idx << sh) + off]: ldr/str q [rb, ri{, lsl #4}] when nothing is added and the
+            // shift is 0 or 4; else the address into s1 by one shifted add
             Inst::VLoadX(d, base, idx, sh, off) => {
                 let rb = self.use_i(base, S1);
                 let ri = self.use_i(idx, S0);
-                self.a.e(0x8B00_0000 | (ri as u32) << 16 | (sh as u32) << 10 | (rb as u32) << 5 | S1 as u32); // add s1, rb, ri, lsl sh
                 let xd = self.def_f(d, FS0);
-                self.vldst(true, xd, S1, off as i64);
+                self.vldst_x(true, xd, rb, ri, sh, off as i64);
                 self.fin_f(d, xd);
             }
             Inst::VStoreX(base, idx, sh, off, v) => {
                 let rb = self.use_i(base, S1);
                 let ri = self.use_i(idx, S0);
-                self.a.e(0x8B00_0000 | (ri as u32) << 16 | (sh as u32) << 10 | (rb as u32) << 5 | S1 as u32);
                 let xv = self.use_f(v, FS0);
-                self.vldst(false, xv, S1, off as i64);
+                self.vldst_x(false, xv, rb, ri, sh, off as i64);
             }
             // a constant without a register is made at its uses (Alloc::remat)
             Inst::VConst(d, _) if self.al.loc[d.0 as usize] == Loc::None => {}
@@ -3674,6 +3692,99 @@ pub fn compile(options: &relax_session::Options, f: &Func, env: &Env) -> Result<
     compile_freq(options, f, env, None)
 }
 
+/// A multiplicand that is a splat of an f32 vreg (`VSplat` of an F32 value, single def) is read as
+/// that scalar: `VFma(.., a, s, c)` / `VX(FMul(S, _), d, a, s)` with `s` of class F32 (backend-only
+/// form, made here just before register allocation) mean every lane times `s`, which the emitter
+/// encodes by element (`fmla vd.4s, vn.4s, vm.s[0]`). A splat whose every use is folded goes. The
+/// product of `VFma` commutes, so a splat first operand is swapped in; `FMul`'s operand order
+/// picks the NaN for the Neon flavour, so only its second operand is folded unless the NaN is the host's.
+fn fold_lane_splats(f: &Func) -> Option<Func> {
+    let n = f.vregs.len();
+    let mut splat: Vec<Option<VReg>> = vec![None; n];
+    let mut ndef = vec![0u32; n];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut any = false;
+    for b in &f.blocks {
+        for i in &b.insts {
+            i.defs(|d| ndef[d.0 as usize] += 1);
+            if let Inst::VSplat(d, s) = i {
+                if f.vregs[s.0 as usize] == Cls::F32 {
+                    splat[d.0 as usize] = Some(*s);
+                    any = true;
+                }
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    // both single-def: the scalar holds the splatted value wherever the splat is read
+    let of = |v: VReg| if ndef[v.0 as usize] == 1 { splat[v.0 as usize].filter(|s| ndef[s.0 as usize] == 1) } else { None };
+    let mut g = f.clone();
+    let mut changed = false;
+    for b in &mut g.blocks {
+        for i in &mut b.insts {
+            match i {
+                Inst::VFma(_, _, _, a, bb, _) => {
+                    if let Some(s) = of(*bb) {
+                        *bb = s;
+                        changed = true;
+                    } else if let Some(s) = of(*a) {
+                        *a = *bb;
+                        *bb = s;
+                        changed = true;
+                    }
+                }
+                Inst::VX(VX::FMul(VW::S, nb), _, a, bb) if *a != *bb => {
+                    if let Some(s) = of(*bb) {
+                        *bb = s;
+                        changed = true;
+                    } else if let (Some(s), NanBits::Host) = (of(*a), *nb) {
+                        *a = *bb;
+                        *bb = s;
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    // splats left without uses go (they are pure)
+    let mut used = vec![false; n];
+    for b in &g.blocks {
+        for i in &b.insts {
+            regalloc::for_uses(i, |u| used[u.0 as usize] = true);
+        }
+        let mut t = Vec::new();
+        regalloc::term_uses(&b.term, &mut t);
+        for u in t {
+            used[u.0 as usize] = true;
+        }
+    }
+    for b in &mut g.blocks {
+        let keep: Vec<bool> = b.insts.iter().map(|i| !matches!(i, Inst::VSplat(d, _) if splat[d.0 as usize].is_some() && !used[d.0 as usize])).collect();
+        if keep.iter().all(|k| *k) {
+            continue;
+        }
+        let mut k = 0;
+        b.insts.retain(|_| {
+            k += 1;
+            keep[k - 1]
+        });
+        let mut k = 0;
+        b.pos.retain(|_| {
+            k += 1;
+            keep[k - 1]
+        });
+    }
+    Some(g)
+}
+
 /// Whether the emitter encodes `op` (the legaliser expands the lane-wise ops it does not).
 pub fn vx_native(op: VX) -> bool {
     use VW::*;
@@ -3734,6 +3845,9 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     let freq = if switched.is_some() { freq_sw.as_deref() } else { freq };
     let _cost_ra = crate::probe::phase(9);
     let t_ra = crate::stats::pass_clock();
+    // f32 splats read only by multiplies: the by-element forms (fmla / fmls / fmul v, v, v.s[0])
+    let lanes = fold_lane_splats(f);
+    let f = lanes.as_ref().unwrap_or(f);
     // immediates arm64 cannot encode and float constants, inside loops: registers set up once
     let hoisted = regalloc::hoist_loop_consts(f, &imm_fits, true);
     let f = hoisted.as_ref().unwrap_or(f);
