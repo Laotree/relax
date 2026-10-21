@@ -2337,6 +2337,10 @@ pub(crate) fn zone_put_back(taken: ZoneTaken) {
 }
 
 extern "C" fn at_exit() {
+    if jit::QUIT_SEEN.load(Ordering::Relaxed) {
+        verbose!("makepad-run quit: {} lazy compiles after the quit request, {:.0} ms",
+            jit::QUIT_COMPILES[0].load(Ordering::Relaxed), jit::QUIT_COMPILES[1].load(Ordering::Relaxed) as f64 / 1e6);
+    }
     finish_run("exit", EXIT_SUMMARY.get().and_then(|exit| exit.code.get().copied()));
 }
 
