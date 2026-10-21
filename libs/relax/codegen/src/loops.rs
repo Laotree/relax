@@ -1892,7 +1892,6 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
     }
     let mut changed = false;
     let mut budget = 800usize;
-    let mut merged = false;
     // innermost first (natural_loops sorts by size); loops nested in a changed one are skipped
     let mut touched = vec![false; f.blocks.len()];
     'next: for (h, m0) in &loops {
@@ -1951,25 +1950,6 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
             continue;
         }
         if latches.len() != 1 {
-            // several back edges (`continue` in the body): one latch block they all jump to
-            // (LLVM loop-simplify's unique latch), then this pass runs again on the new shape
-            if latches.len() > 1 && latches.iter().all(|b| matches!(f.blocks[*b as usize].term, Term::Jump(_) | Term::Branch(..))) {
-                let nl = f.blocks.len() as u32;
-                let p = f.blocks[h as usize].pos.first().copied().unwrap_or(f.blocks[h as usize].term_pos);
-                for &b in &latches {
-                    retarget(&mut f.blocks[b as usize].term, |t| if t == h { nl } else { t });
-                }
-                f.blocks.push(Block { insts: Vec::new(), pos: Vec::new(), term: Term::Jump(h), term_pos: p });
-                if tr {
-                    eprintln!("  {} latches merged into b{}", latches.len(), nl);
-                }
-                merged = true;
-                touched.resize(f.blocks.len(), true);
-                for &b in &core {
-                    touched[b as usize] = true;
-                }
-                continue;
-            }
             if tr {
                 eprintln!("  {} latches", latches.len());
             }
@@ -2236,11 +2216,6 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
             touched[b as usize] = true;
         }
         changed = true;
-    }
-    if merged {
-        // the loops whose back edges were joined into one latch: unroll them now
-        unroll_const_loops(options, f);
-        return true;
     }
     changed
 }
