@@ -12021,6 +12021,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             );
         }
         if let Some(base) = dump_base(&name) {
+            // MAKEPAD_RUN_DUMP_EACH=1: one set of files per O3 build, named by its code size too
+            // (the instances of a generic fn share a name; the perf map's sizes tell them apart)
+            static EACH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let base = if *EACH.get_or_init(|| std::env::var("MAKEPAD_RUN_DUMP_EACH").is_ok()) { format!("{}_{}", base, c.text_len) } else { base };
             let _ = std::fs::write(format!("{}.t1.bin", base), &c.code[..c.text_len as usize]);
             let _ = std::fs::write(format!("{}.t1.frame", base), format!("frame {} slot-area {} of {}\n", c.frame_size, relax_backend::frame::slot_layout(&func, 0, true).1, slot_bytes(&func)));
             let _ = std::fs::write(format!("{}.t1.rir", base), func.dump());
