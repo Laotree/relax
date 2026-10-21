@@ -950,6 +950,9 @@ struct Gen<'a> {
     text_len: u32,
     /// a single-use float constant whose use (the next FBin) reads it from the pool
     mem_const: Option<(VReg, u64)>,
+    /// (t, base, off): a float Load of t that the next instruction (an AVX FBin or FMulAdd, t's
+    /// only use) reads as its memory operand instead
+    mem_load: Option<(VReg, VReg, i32)>,
     /// the block ends `t = x & K; t ==/!= 0; branch`: emitted as test x, K (the And skipped)
     test_fuse: Option<(VReg, i64)>,
     /// the block ends `s = m >> t; c = s & 1; branch c` (s, c used once): emitted as bt m, t
@@ -1596,6 +1599,25 @@ impl<'a> Gen<'a> {
                                 self.sel_flags = Some((cd, icc(*cc, *sg)));
                                 continue;
                             }
+                        }
+                    }
+                }
+                // a float Load used once, by the next instruction: an AVX FBin's second operand
+                // (either operand of a commutative op) or an FMA's addend / factor, read straight
+                // from memory (vmulss xd, xa, [base + off]; vfmadd213ss xd, xb, [base + off])
+                if let Inst::Load(m @ (Mem::F32 | Mem::F64), t, base, off) = inst {
+                    if self.avx && self.al.uses[t.0 as usize] == 1 && ii + 1 < n && !(fused && ii + 1 == n - 1) {
+                        let w = *m == Mem::F64;
+                        let ok = match &b.insts[ii + 1] {
+                            Inst::FBin(op @ (FOp::Add | FOp::Sub | FOp::Mul | FOp::Div), w2, _, x, y) => {
+                                *w2 == w && ((y == t && x != t) || (matches!(op, FOp::Add | FOp::Mul) && x == t && y != t))
+                            }
+                            Inst::FMulAdd(_, _, w2, _, a, b2, c) => *w2 == w && [*a, *b2, *c].iter().filter(|v| **v == *t).count() == 1,
+                            _ => false,
+                        };
+                        if ok {
+                            self.mem_load = Some((*t, *base, *off));
+                            continue;
                         }
                     }
                 }
@@ -2784,7 +2806,7 @@ impl<'a> Gen<'a> {
             }
             Inst::VX(op, d, a, b) => self.vx(options, *op, *d, *a, *b),
             Inst::VX3(op, d, a, b, c) => self.vx3(*op, *d, *a, *b, *c),
-            Inst::FMulAdd(np, na, w, d, a, b, c) => self.fma(*np, *na, *w, *d, *a, *b, *c),
+            Inst::FMulAdd(np, na, w, d, a, b, c) => self.fma(options, *np, *na, *w, *d, *a, *b, *c),
             Inst::AtomicLoad(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..) => self.atomic(options, i),
             Inst::TlsAddr(d, off) => self.tls_addr(*d, *off),
             Inst::FpEnv(set, v) => self.fp_env(options, *set, *v),
@@ -2963,6 +2985,28 @@ impl<'a> Gen<'a> {
                 self.a.sse_rr(0x66, 0x55, 0, tmp, false); // andnpd mask -> !mask & tmp
                 self.a.sse_rr(0x66, 0x56, 0, XS, false); // orpd
                 self.a.movf_rr(true, xd, 0);
+                self.fin_f(*d, xd);
+            }
+            Inst::FBin(op, f64_, d, a, b) if self.mem_load.is_some() => {
+                // the other operand in a register, the loaded one as [base + off] (VEX / EVEX)
+                let (t, base, off) = self.mem_load.take().unwrap();
+                let opc = match op {
+                    FOp::Add => 0x58,
+                    FOp::Mul => 0x59,
+                    FOp::Sub => 0x5c,
+                    FOp::Div => 0x5e,
+                    _ => unreachable!("x64: memory operand for {:?}", op),
+                };
+                let other = if *b == t { *a } else { *b };
+                let xo = self.use_fx(other, XS);
+                let xd = self.def_fx(*d, XS);
+                let (rb, disp) = self.base_disp(options, base, R11, off);
+                let pp = if *f64_ { 3 } else { 2 };
+                if xd >= 16 || xo >= 16 {
+                    self.a.evex_m(pp, 1, *f64_, false, opc, xd, xo, rb, disp);
+                } else {
+                    self.a.vex_lm(pp, 1, false, false, opc, xd, xo, rb, disp);
+                }
                 self.fin_f(*d, xd);
             }
             Inst::FBin(op, f64_, d, a, b) if self.mem_const.is_some() => {
@@ -4640,13 +4684,45 @@ impl<'a> Gen<'a> {
 
     /// Fused multiply-add (FMA3, one rounding): xmm0 = c, then vf[n]m{add,sub}231 xmm0, a, b.
     #[allow(clippy::too_many_arguments)]
-    fn fma(&mut self, neg_prod: bool, neg_add: bool, w: bool, d: VReg, a: VReg, b: VReg, c: VReg) {
+    fn fma(&mut self, options: &relax_session::Options, neg_prod: bool, neg_add: bool, w: bool, d: VReg, a: VReg, b: VReg, c: VReg) {
         let op = match (neg_prod, neg_add) {
             (false, false) => 0xa9, // vfmadd213
             (false, true) => 0xab,  // vfmsub213
             (true, false) => 0xad,  // vfnmadd213
             (true, true) => 0xaf,   // vfnmsub213
         };
+        if let Some((t, base, off)) = self.mem_load.take() {
+            // one operand comes from memory ([base + off], its Load folded here; AVX only)
+            let (rb, disp) = self.base_disp(options, base, R11, off);
+            let xd = self.def_fx(d, XS);
+            if t == c {
+                // 213: t = a (d's register unless that holds b), vvvv = b, r/m = [c]
+                let xa = self.use_fx(a, XS);
+                let xb = self.use_fx(b, XS2);
+                let r = if xd == xa || xd != xb { xd } else { XS };
+                self.a.movf_rr(true, r, xa);
+                self.a.vex_m_fma(w, op, r, xb, rb, disp);
+                self.a.movf_rr(true, xd, r);
+                self.fin_f(d, xd);
+                return;
+            }
+            // a factor from memory (the product commutes): the other factor f
+            let f = if t == b { a } else { b };
+            let xf = self.use_fx(f, XS);
+            let xc = self.use_fx(c, XS2);
+            if xd == xc && xd != xf {
+                // 231: d (= c) += f * [m]
+                self.a.vex_m_fma(w, op + 0x10, xd, xf, rb, disp);
+            } else {
+                // 132: r = f; r = r * [m] + c
+                let r = if xd == xf || xd != xc { xd } else { XS };
+                self.a.movf_rr(true, r, xf);
+                self.a.vex_m_fma(w, op - 0x10, r, xc, rb, disp);
+                self.a.movf_rr(true, xd, r);
+            }
+            self.fin_f(d, xd);
+            return;
+        }
         if self.avx {
             // the same operand placement as below (a in the destination, b in vvvv, c in r/m), with
             // the destination register t = d's own (unless that is b's or c's) or XS: no xmm0 /
@@ -5699,6 +5775,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         frameless: false,
         text_len: 0,
         mem_const: None,
+        mem_load: None,
         test_fuse: None,
         bt_fuse: None,
         load_fuse: None,
