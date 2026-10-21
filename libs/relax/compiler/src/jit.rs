@@ -9583,6 +9583,11 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         }
         // reads of a temporary a variable was copied from read the variable: one register
         relax_codegen::opt::reuse_copied_variables(options, func);
+        // copies the late folds left unread (an unrolled pointer's per-copy values once address
+        // modes read the base: `lea rcx,[rdi+1]; mov r8,rcx` before r8 is loaded over)
+        if !relax_backend::stats::opt_off(options, "-latedce") {
+            relax_backend::passes::live_dce(func);
+        }
     }
     if let Some(stats) = inline_stats { stats.report(name); }
     inlined
