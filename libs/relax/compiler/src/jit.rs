@@ -9215,7 +9215,8 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         })));
     }
     static INLINE_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let mut inline_stats = (*INLINE_STATS.get_or_init(|| std::env::var("MAKEPAD_RUN_INLINE_STATS").map_or(false, |v| v == "1"))).then(relax_codegen::opt::InlineStats::default);
+    // MAKEPAD_RUN_INLINE_STATS=1: per O3 build; =prep: also per bottom-up preparation
+    let mut inline_stats = (*INLINE_STATS.get_or_init(|| std::env::var("MAKEPAD_RUN_INLINE_STATS").map_or(false, |v| v == "1" || v == "prep"))).then(relax_codegen::opt::InlineStats::default);
     // Bottom-up, as LLVM's CGSCC inliner: every callee in the snapshot is simplified first,
     // its own inlining included, and this build inlines (and prices) those optimised bodies.
     // A pure function of the snapshot, so replay stays exact.
@@ -9405,7 +9406,9 @@ impl InlineBodies {
                 let mut f = o1.clone();
                 f.baseline = false;
                 let mut raw = (relax_backend::rir::Func::new(String::new(), 0), Vec::new());
-                tier1_simplify(options, &mut f, ids[k], &o1.name, &sub, &sub_price, single, ro, cfg, nounwind, &mut structural, None, Some(&mut raw));
+                let mut stats = std::env::var("MAKEPAD_RUN_INLINE_STATS").is_ok_and(|v| v == "prep").then(relax_codegen::opt::InlineStats::default);
+                tier1_simplify(options, &mut f, ids[k], &o1.name, &sub, &sub_price, single, ro, cfg, nounwind, &mut structural, stats.as_mut(), Some(&mut raw));
+                if let Some(st) = stats { st.report(&format!("prep:{} (root {})", o1.name, root)); }
                 let (raw, mut taken) = raw;
                 if taken.is_empty() {
                     continue;
