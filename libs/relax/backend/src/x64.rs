@@ -767,6 +767,8 @@ struct Gen<'a> {
     zero_above: Vec<u8>,
     /// switch::switch_in_range: per block, its Switch needs no range test
     switch_in_range: Vec<bool>,
+    /// regalloc::copy_reuse: (use position, spilled vreg) -> the register of a copy holding it
+    copy_reg: std::collections::HashMap<(u32, u32), u8>,
     rir_map: Vec<(u32, u32, u32)>,
     rir_map_on: bool,
     /// (register, code position right after it): the last instruction emitted was an integer ALU op
@@ -875,6 +877,9 @@ impl<'a> Gen<'a> {
                         return r;
                     }
                 }
+                if let Some(&r) = self.copy_reg.get(&(self.cur_pos, v.0)) {
+                    return r;
+                }
                 let d = self.spill_disp(o);
                 self.load_spill(scratch, d);
                 scratch
@@ -901,7 +906,7 @@ impl<'a> Gen<'a> {
             return self.al.loc[v.0 as usize];
         }
         match self.al.loc[v.0 as usize] {
-            Loc::Stack(o) => match self.win_reg(v) {
+            Loc::Stack(o) => match self.win_reg(v).or_else(|| self.copy_reg.get(&(self.cur_pos, v.0)).copied()) {
                 Some(r) => Loc::Reg(r),
                 None => Loc::Stack(o),
             },
@@ -5181,6 +5186,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         low_only: crate::passes::low_bits_only(options, f),
         zero_above: Vec::new(),
         switch_in_range: Vec::new(),
+        copy_reg: std::collections::HashMap::new(),
         fconsts: {
             let mut nd: std::collections::HashMap<u32, (u32, u64, bool)> = std::collections::HashMap::new();
             for b in &f.blocks {
@@ -5223,6 +5229,9 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         unwind_tab: Vec::new(),
     };
     g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
+    if env.opt_regs || g.f.full {
+        g.copy_reg = regalloc::copy_reuse(options, g.f, &g.al);
+    }
     if !crate::stats::opt_off(options, "-swrange") {
         g.switch_in_range = crate::switch::switch_in_range(g.f);
     }
