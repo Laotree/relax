@@ -1231,7 +1231,8 @@ pub fn sroa_post_inline(f: &mut Func) -> bool {
 ///   through the parameter, and every one overlapping the field has its exact offset and type;
 /// * no call, atomic or fence in the loop for a stored field (a call may unwind with the memory
 ///   stale; a store is not delayed past one), calls are fine for a field that is only loaded when
-///   none is given a based-on pointer;
+///   none is given a based-on pointer, and for a stored field of a by-value argument's private copy
+///   (`Func::owned`) when the loop has no Invoke (LLVM's `isNotVisibleOnUnwind`);
 /// * the field is dereferenceable in the preheader (`Func::deref`), so loading it there is safe
 ///   even if the loop runs no iteration; the write-back on a path that never stored writes the
 ///   value it loaded, which no one can observe through a unique pointer.
@@ -1282,10 +1283,12 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
     // anything in the loop that stops every promotion, and what stops only stored fields
     let mut atomic_or_fence = false;
     let mut has_call = false;
+    let mut has_invoke = false;
     for bi in 0..n {
         if !body[bi] {
             continue;
         }
+        has_invoke |= matches!(f.blocks[bi].term, Term::Invoke(..));
         for i in &f.blocks[bi].insts {
             match i {
                 Inst::AtomicLoad(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..) | Inst::FpEnv(..) => atomic_or_fence = true,
@@ -1396,7 +1399,10 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         let mut take: Vec<(i32, Mem, bool, bool, u32)> = Vec::new();
         for x in &fields {
             let clash = fields.iter().any(|y| !(y.0 == x.0 && y.1 == x.1) && y.0 < x.0 + size(x.1) && x.0 < y.0 + size(y.1));
-            if clash || (x.3 && has_call) {
+            // a stored field stays stale in memory over a call: fine for the private copy of a
+            // by-value argument (Func::owned) when every call is plain -- an unwind leaves this
+            // function at once and nobody reads the copy after (an Invoke's cleanup might)
+            if clash || (x.3 && has_call && !(f.owned.contains(&p) && !has_invoke)) {
                 continue;
             }
             // dereferenceable in the preheader
