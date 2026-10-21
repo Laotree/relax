@@ -1486,7 +1486,10 @@ impl<'a> Gen<'a> {
         let plan = cabi::plan(sig, sig.conv.target());
         let saves = self.al.saves.get(&self.cur_pos).cloned().unwrap_or_default();
         for (v, slot) in &saves {
-            self.save_restore(*v, *slot, true);
+            // Alloc::save_skip: the slot already holds it / nobody reads the register
+            if !self.al.save_skip.contains(&(self.cur_pos, v.0)) {
+                self.save_restore(*v, *slot, true);
+            }
         }
         let has_ret = sig.ret.is_some();
         let cargs = if has_ret { &args[1..] } else { args };
@@ -1608,7 +1611,10 @@ impl<'a> Gen<'a> {
         }
         self.moves(&mv);
         for (v, slot) in &saves {
-            self.save_restore(*v, *slot, false);
+            // Alloc::restore_skip: the slot already holds it / nobody reads the register
+            if !self.al.restore_skip.contains(&(self.cur_pos, v.0)) {
+                self.save_restore(*v, *slot, false);
+            }
         }
         if let RetPlan::Parts(parts) = &plan.ret {
             self.a.ldst(LDRX, 8, S0, SP, st);
@@ -3512,7 +3518,10 @@ impl<'a> Gen<'a> {
         // save caller-saved values that live across this call
         let saves = self.al.saves.get(&self.cur_pos).cloned().unwrap_or_default();
         for (v, slot) in &saves {
-            self.save_restore(*v, *slot, true);
+            // Alloc::save_skip: the slot already holds it / nobody reads the register
+            if !self.al.save_skip.contains(&(self.cur_pos, v.0)) {
+                self.save_restore(*v, *slot, true);
+            }
         }
         // indirect target first: argument moves may overwrite its register
         if let Callee::Indirect(v) = c {
@@ -3582,7 +3591,10 @@ impl<'a> Gen<'a> {
         }
         self.moves(&mv);
         for (v, slot) in &saves {
-            self.save_restore(*v, *slot, false);
+            // Alloc::restore_skip: the slot already holds it / nobody reads the register
+            if !self.al.restore_skip.contains(&(self.cur_pos, v.0)) {
+                self.save_restore(*v, *slot, false);
+            }
         }
     }
 }

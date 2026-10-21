@@ -100,6 +100,12 @@ pub struct Alloc {
     /// windows entered with the value already in the register (region windows whose block's
     /// predecessors all hold it there): uses read the register, nothing is loaded
     pub chained: Vec<(u32, u32, u32, u8)>,
+    /// (call position, vreg) saves whose slot already holds the value (saved at an earlier call
+    /// on every path, not redefined since): no store
+    pub save_skip: std::collections::HashSet<(u32, u32)>,
+    /// (call position, vreg) restores nobody reads (the value is not used before the next call
+    /// whose save skips its store, or before it dies): no load
+    pub restore_skip: std::collections::HashSet<(u32, u32)>,
 }
 
 /// A value the backend recomputes at each use instead of keeping it (see Alloc::remat).
@@ -1366,6 +1372,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             }
         }
     }
+    let (save_skip, restore_skip) = if thorough && !crate::stats::opt_off(options, "-saveskip") { redundant_saves(f, &reach, &tab, &block_start, &saves) } else { Default::default() };
     // region windows (O3): a spilled int value used in many blocks once each (a loop-carried
     // value whose register some short temporary holds somewhere in the loop) gets a register
     // over the blocks where one is free over its whole live part: blocks it enters live and does
@@ -1470,7 +1477,183 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         }
     }
     windows.extend(region_windows);
-    Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows, chained }
+    Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows, chained, save_skip, restore_skip }
+}
+
+/// Saves around calls that need no store or no load (Alloc::save_skip / restore_skip): forward,
+/// a value's save slot is clean after a save until the value is redefined (paths meet by
+/// intersection); backward, a restore is needed only when the register is read before it is
+/// redefined -- by a use or by a later save that stores (paths meet by union). A value live
+/// across a run of calls (lookup_local: five values around 18 calls) is then stored once and
+/// loaded only where it is used.
+fn redundant_saves(f: &Func, reach: &[bool], tab: &OpTab, block_start: &[u32], saves: &HashMap<u32, Vec<(VReg, i32)>>) -> (std::collections::HashSet<(u32, u32)>, std::collections::HashSet<(u32, u32)>) {
+    let mut skip_s = std::collections::HashSet::new();
+    let mut skip_r = std::collections::HashSet::new();
+    if saves.is_empty() {
+        return (skip_s, skip_r);
+    }
+    // the saved values, densely
+    let mut ix: HashMap<u32, usize> = HashMap::new();
+    for l in saves.values() {
+        for (v, _) in l {
+            let n = ix.len();
+            ix.entry(v.0).or_insert(n);
+        }
+    }
+    let k = ix.len();
+    let w = (k + 63) / 64;
+    let nb = f.blocks.len();
+    let preds = preds_of(f, reach);
+    let set = |s: &mut [u64], i: usize| s[i >> 6] |= 1 << (i & 63);
+    let clr = |s: &mut [u64], i: usize| s[i >> 6] &= !(1u64 << (i & 63));
+    let get = |s: &[u64], i: usize| s[i >> 6] >> (i & 63) & 1 != 0;
+    // forward: clean save slots
+    let mut out = vec![vec![!0u64; w]; nb];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bi in 0..nb {
+            if !reach[bi] {
+                continue;
+            }
+            let mut st = if bi == 0 || preds[bi].is_empty() {
+                vec![0u64; w]
+            } else {
+                let mut x = vec![!0u64; w];
+                for &p in &preds[bi] {
+                    for j in 0..w {
+                        x[j] &= out[p as usize][j];
+                    }
+                }
+                x
+            };
+            let b = &f.blocks[bi];
+            let k0 = tab.first[bi] as usize;
+            for ii in 0..b.insts.len() {
+                let p = block_start[bi] + 2 * ii as u32 + 1;
+                if let Some(l) = saves.get(&p) {
+                    for (v, _) in l {
+                        set(&mut st, ix[&v.0]);
+                    }
+                }
+                for &d in tab.defs(k0 + ii) {
+                    if let Some(&i) = ix.get(&d) {
+                        clr(&mut st, i);
+                    }
+                }
+            }
+            if st != out[bi] {
+                out[bi] = st;
+                changed = true;
+            }
+        }
+    }
+    // the stores the clean state makes redundant
+    for bi in 0..nb {
+        if !reach[bi] {
+            continue;
+        }
+        let mut st = if bi == 0 || preds[bi].is_empty() {
+            vec![0u64; w]
+        } else {
+            let mut x = vec![!0u64; w];
+            for &p in &preds[bi] {
+                for j in 0..w {
+                    x[j] &= out[p as usize][j];
+                }
+            }
+            x
+        };
+        let b = &f.blocks[bi];
+        let k0 = tab.first[bi] as usize;
+        for ii in 0..b.insts.len() {
+            let p = block_start[bi] + 2 * ii as u32 + 1;
+            if let Some(l) = saves.get(&p) {
+                for (v, _) in l {
+                    let i = ix[&v.0];
+                    if get(&st, i) {
+                        skip_s.insert((p, v.0));
+                    }
+                    set(&mut st, i);
+                }
+            }
+            for &d in tab.defs(k0 + ii) {
+                if let Some(&i) = ix.get(&d) {
+                    clr(&mut st, i);
+                }
+            }
+        }
+    }
+    // backward: registers read before redefinition
+    let mut inn = vec![vec![0u64; w]; nb];
+    let walk = |bi: usize, inn: &Vec<Vec<u64>>, skip_r: &mut Option<&mut std::collections::HashSet<(u32, u32)>>| -> Vec<u64> {
+        let b = &f.blocks[bi];
+        let mut st = vec![0u64; w];
+        for s2 in b.term.succs() {
+            for j in 0..w {
+                st[j] |= inn[s2 as usize][j];
+            }
+        }
+        let k0 = tab.first[bi] as usize;
+        for &u in tab.uses(k0 + b.insts.len()) {
+            if let Some(&i) = ix.get(&u) {
+                set(&mut st, i);
+            }
+        }
+        for ii in (0..b.insts.len()).rev() {
+            let p = block_start[bi] + 2 * ii as u32 + 1;
+            let l = saves.get(&p);
+            if let Some(l) = l {
+                for (v, _) in l {
+                    let i = ix[&v.0];
+                    if !get(&st, i) {
+                        if let Some(r) = skip_r.as_mut() {
+                            r.insert((p, v.0));
+                        }
+                    }
+                    clr(&mut st, i);
+                }
+            }
+            for &d in tab.defs(k0 + ii) {
+                if let Some(&i) = ix.get(&d) {
+                    clr(&mut st, i);
+                }
+            }
+            if let Some(l) = l {
+                for (v, _) in l {
+                    if !skip_s.contains(&(p, v.0)) {
+                        set(&mut st, ix[&v.0]);
+                    }
+                }
+            }
+            for &u in tab.uses(k0 + ii) {
+                if let Some(&i) = ix.get(&u) {
+                    set(&mut st, i);
+                }
+            }
+        }
+        st
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bi in (0..nb).rev() {
+            if !reach[bi] {
+                continue;
+            }
+            let st = walk(bi, &inn, &mut None);
+            if st != inn[bi] {
+                inn[bi] = st;
+                changed = true;
+            }
+        }
+    }
+    for bi in 0..nb {
+        if reach[bi] {
+            walk(bi, &inn, &mut Some(&mut skip_r));
+        }
+    }
+    (skip_s, skip_r)
 }
 
 /// Region windows (see allocate_low): per spilled int value, heaviest first, the register whose
@@ -1936,7 +2119,7 @@ fn allocate_baseline(options: &relax_session::Options, f: &Func, cfg: &RegConfig
             remat[v] = Remat::No;
         }
     }
-    Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows: Vec::new(), chained: Vec::new() }
+    Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows: Vec::new(), chained: Vec::new(), save_skip: Default::default(), restore_skip: Default::default() }
 }
 
 /// Rematerialisable values: one definition by a constant-like instruction, not parameters.
