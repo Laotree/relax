@@ -605,6 +605,19 @@ impl Asm {
         self.byte(op);
         self.modrm_mem(reg, base, disp);
     }
+    /// VEX.LIG.66.0F38.W{0,1} op reg, vvvv, [base + disp]: the scalar FMA with c from memory
+    fn vex_m_fma(&mut self, w: bool, op: u8, reg: u8, vvvv: u8, base: u8, disp: i32) {
+        if reg >= 16 || vvvv >= 16 {
+            self.evex_m(1, 2, w, false, op, reg, vvvv, base, disp);
+            return;
+        }
+        let x = self.sib.map_or(0, |s| s.0);
+        self.byte(0xc4);
+        self.byte(((!(reg >> 3) & 1) << 7) | ((!(x >> 3) & 1) << 6) | ((!(base >> 3) & 1) << 5) | 2);
+        self.byte(((w as u8) << 7) | ((!vvvv & 15) << 3) | 1);
+        self.byte(op);
+        self.modrm_mem(reg, base, disp);
+    }
     /// vzeroupper: no dirty upper ymm state into code using legacy SSE (callees, callers)
     fn vzeroupper(&mut self) {
         self.byte(0xc5);
@@ -775,7 +788,42 @@ fn evex_direct(pp: u8, map: u8, op: u8) -> Option<bool> {
 
 /// rcx and rdx as an instruction's own scratch: divisions and multiply-high (rdx:rax), variable
 /// shifts (cl), conversions, cmpxchg loops. Values live there go to other registers.
-fn x64_clobbers(options: &relax_session::Options, i: &Inst) -> u64 {
+/// xmm0 / xmm1 (bits 32, 33) likewise for every instruction whose emitter may use them as fixed
+/// temporaries: all but `keeps_xmm01`. The allocator keeps a float value out of a clobbered
+/// register over the whole instruction (its operands and results included).
+fn x64_clobbers(options: &relax_session::Options, f: &Func, i: &Inst) -> u64 {
+    let xmm01 = if keeps_xmm01(options, f, i) { 0 } else { (1 << 32) | (1 << 33) };
+    xmm01 | x64_int_clobbers(options, i)
+}
+
+/// The instructions whose emitter arms (and the helpers they call) never name xmm0 / xmm1: they
+/// reach float registers only through use_f / def_f / fin_f and the scratch registers XS / XS2.
+/// Checked against `Gen::inst` arm by arm; anything not listed clobbers xmm0 / xmm1.
+fn keeps_xmm01(options: &relax_session::Options, f: &Func, i: &Inst) -> bool {
+    let y = |v: &VReg| f.vregs[v.0 as usize] == Cls::V256;
+    match i {
+        Inst::Iconst(..) | Inst::IBinI(..) | Inst::ICmpI(..) | Inst::ICmp(..) | Inst::IBin(..) | Inst::IBit(..) | Inst::INeg(..) | Inst::INot(..) => true,
+        Inst::SlotAddr(..) | Inst::Addr(..) | Inst::FnAddr(..) | Inst::Mov(..) | Inst::Load(..) | Inst::Store(..) | Inst::LoadX(..) | Inst::StoreX(..) => true,
+        Inst::Fconst(..) | Inst::VLoad(..) | Inst::VStore(..) | Inst::VLoadX(..) | Inst::VStoreX(..) | Inst::VConst(..) => true,
+        // the NaN-correct min / max uses xmm0 / xmm1 (and the constant-operand form is chosen later)
+        Inst::FBin(op, ..) => !matches!(op, FOp::Min | FOp::Max),
+        // Gen::fma's VEX / EVEX form (the destination register or XS takes a)
+        Inst::FMulAdd(..) => options.cpu.avx,
+        // the 128-bit float lane ops that go straight to v3's VEX / EVEX three-operand form
+        Inst::VX(op, d, ..) if options.cpu.avx && !y(d) => matches!(
+            op,
+            VX::FAdd(VW::S | VW::D, NanBits::Host | NanBits::Intel)
+                | VX::FSub(VW::S | VW::D, NanBits::Host | NanBits::Intel)
+                | VX::FMul(VW::S | VW::D, NanBits::Host | NanBits::Intel)
+                | VX::FDiv(VW::S | VW::D, NanBits::Host | NanBits::Intel)
+                | VX::FMinLt(VW::S | VW::D)
+                | VX::FMaxGt(VW::S | VW::D)
+        ),
+        _ => false,
+    }
+}
+
+fn x64_int_clobbers(options: &relax_session::Options, i: &Inst) -> u64 {
     match i {
         Inst::IBin(IOp::Shl | IOp::Shr, _, _, _, _) if host_bmi2(options) => 0,
         // of the conversions only u64 -> float works in rcx / rdx (halve with a sticky bit); a
@@ -803,6 +851,10 @@ pub fn reg_config(options: &relax_session::Options) -> RegConfig {
     for x in 2..14u8 {
         flt.push(x);
     }
+    // xmm0 / xmm1: allocatable except over the instructions that use them as temporaries
+    // (x64_clobbers); last among the low registers, which those instructions leave alone
+    flt.push(0);
+    flt.push(1);
     // AVX-512VL: xmm16..31 (caller-saved in both ABIs). Only EVEX reaches them, so the emitter
     // treats a value there like a spilled one (use_f / def_f / fin_f move it through the
     // instruction's scratch register with an EVEX vmovaps) except for the moves, loads and stores
@@ -4403,6 +4455,48 @@ impl<'a> Gen<'a> {
     /// Fused multiply-add (FMA3, one rounding): xmm0 = c, then vf[n]m{add,sub}231 xmm0, a, b.
     #[allow(clippy::too_many_arguments)]
     fn fma(&mut self, neg_prod: bool, neg_add: bool, w: bool, d: VReg, a: VReg, b: VReg, c: VReg) {
+        let op = match (neg_prod, neg_add) {
+            (false, false) => 0xa9, // vfmadd213
+            (false, true) => 0xab,  // vfmsub213
+            (true, false) => 0xad,  // vfnmadd213
+            (true, true) => 0xaf,   // vfnmsub213
+        };
+        if self.avx {
+            // the same operand placement as below (a in the destination, b in vvvv, c in r/m), with
+            // the destination register t = d's own (unless that is b's or c's) or XS: no xmm0 /
+            // xmm1 (keeps_xmm01). b reads xmm16..31 in place (EVEX), c too or straight from its
+            // spill slot.
+            let xa = self.use_f(a, XS);
+            let xb = self.use_fx(b, XS2);
+            let mc = match self.al.loc[c.0 as usize] {
+                Loc::Stack(o) => Some(self.spill_disp(o)),
+                _ => None,
+            };
+            // c's register: its own (any of xmm0..31)
+            let xc = match self.al.loc[c.0 as usize] {
+                _ if mc.is_some() => 0,
+                Loc::Flt(x) => x,
+                // a scalar float value is in a register or a slot (only V128 constants are remat'd)
+                l => panic!("x64 fma: c at {:?}", l),
+            };
+            let xd = self.def_fx(d, XS);
+            let t = if xd < 16 && (xd == xa || (xd != xb && (mc.is_some() || xd != xc))) { xd } else { XS };
+            // t is written with a first: it must not hold b or c unless it holds a (the same value)
+            assert!(t == xa || (t != xb && (mc.is_some() || t != xc)), "x64 fma: destination {} vs a {} b {} c {}", t, xa, xb, xc);
+            self.a.movf_rr(true, t, xa);
+            if let Some(disp) = mc {
+                self.a.vex_m_fma(w, op, t, xb, RBP, disp);
+            } else if t >= 16 || xb >= 16 || xc >= 16 {
+                self.a.evex_rr(1, 2, w, false, op, t, xb, xc);
+            } else {
+                self.a.vex_rr(1, 2, w, op, t, xb, xc);
+            }
+            if t != xd {
+                self.a.movf_rr(true, xd, t);
+            }
+            self.fin_f(d, xd);
+            return;
+        }
         let xa = self.use_f(a, XS);
         let xb = self.use_f(b, XS2);
         let xc = self.use_f(c, 1);
@@ -4410,12 +4504,6 @@ impl<'a> Gen<'a> {
         // y in vvvv, z in r/m), what rustc's code calls without the fma target feature: a NaN
         // result takes the first NaN of vvvv, the destination, then r/m -- b, a, c
         self.a.movf_rr(true, 0, xa);
-        let op = match (neg_prod, neg_add) {
-            (false, false) => 0xa9, // vfmadd213
-            (false, true) => 0xab,  // vfmsub213
-            (true, false) => 0xad,  // vfnmadd213
-            (true, true) => 0xaf,   // vfnmsub213
-        };
         // VEX.LIG.66.0F38.W{0,1} op /r: reg = xmm0 (a), vvvv = xb, rm = xc
         let r = 0u8;
         self.a.byte(0xc4);
