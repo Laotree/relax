@@ -10005,8 +10005,12 @@ pub fn sweep_verdicts() {
         for id in relower { tier_push(id, Q_RETIER, 0); }
         let released: Vec<(u32, Await)> = {
             let mut a = AWAIT_VERDICT.lock().unwrap_or_else(|e| e.into_inner());
-            let (go, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *a).into_iter().partition(|(id, _)| !u.fns[*id as usize].unverified.load(Ordering::Relaxed));
-            crate::zone_alloc::kept_with(|| *a = keep);
+            // the list outlives the compiler zone (a swap destroys it): the kept part is allocated
+            // in the kept heap (assigning a Vec made outside kept_with kept its zone buffer, and
+            // the next await_verdict after a swap faulted reading it)
+            let all = std::mem::take(&mut *a);
+            let (go, keep): (Vec<_>, Vec<_>) = crate::zone_alloc::kept_with(|| all.into_iter().partition(|(id, _)| !u.fns[*id as usize].unverified.load(Ordering::Relaxed)));
+            *a = keep;
             go
         };
         for (id, w) in released {
