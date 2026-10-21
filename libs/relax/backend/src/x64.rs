@@ -2627,9 +2627,16 @@ impl<'a> Gen<'a> {
                     }
                 };
                 let cc = icond.unwrap();
+                // a target laid out at or before this block: a loop's back edge (taken while it runs)
+                let back = |s: &Self, b: u32| s.block_pos.get(s.thru(b) as usize).map_or(false, |p| *p != usize::MAX);
                 if self.thru(*tt) == self.thru(next) {
                     // fall into the true block: branch on the inverted condition
                     self.jcc_to(cc ^ 1, *ff);
+                } else if self.thru(*ff) != self.thru(next) && back(self, *ff) && !back(self, *tt) {
+                    // neither falls through and the false edge loops: the conditional jump takes the
+                    // back edge (one taken branch per iteration instead of a not-taken jcc + jmp)
+                    self.jcc_to(cc ^ 1, *ff);
+                    self.jump_to(*tt, bi);
                 } else {
                     self.jcc_to(cc, *tt);
                     self.jump_to(*ff, bi);
@@ -4671,8 +4678,12 @@ impl<'a> Gen<'a> {
 
     fn ibin(&mut self, options: &relax_session::Options, op: IOp, it: IntTy, d: VReg, a: VReg, b: VReg) {
         // a spilled first operand of a register result loads straight into it, unless b lives there
+        // (uloc covers a spilled b's window; a rematerialised b's window register counts too: b's
+        // last read can share d's register, and the load would overwrite b before the operation
+        // reads it -- `mov rdx, [a]; and rdx, rdx` for `d = a & 0xffffffff`, x64 HashMap hashes)
+        let b_win = self.win_reg(b);
         let ra = match (self.uloc(a), self.al.loc[d.0 as usize], self.uloc(b)) {
-            (Loc::Stack(o), Loc::Reg(r), lb) if lb != Loc::Reg(r) && !matches!(op, IOp::Div | IOp::Rem | IOp::Shl | IOp::Shr | IOp::Rotl | IOp::MulHi) => {
+            (Loc::Stack(o), Loc::Reg(r), lb) if lb != Loc::Reg(r) && b_win != Some(r) && !matches!(op, IOp::Div | IOp::Rem | IOp::Shl | IOp::Shr | IOp::Rotl | IOp::MulHi) => {
                 let disp = self.spill_disp(o);
                 self.load_spill(r, disp);
                 r

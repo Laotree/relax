@@ -766,6 +766,44 @@ pub fn fold_insert(f: &Func, edits: &mut Vec<FoldEdit>, block: usize, after: usi
     edits.push(FoldEdit { block, at: after + 1, remove: 0, insts: vec![inst], pos: f.blocks[block].pos[after] });
 }
 
+/// The one compare equal to `k1 || k2` for two compares of the same operands (same signedness;
+/// the second may name them swapped), when there is one (`Lt | Eq` = `Le`, `Lt | Gt` = `Ne`).
+fn cond_union(k1: (Cond, bool, VReg, i64, bool), k2: (Cond, bool, VReg, i64, bool)) -> Option<Cond> {
+    let (c1, s1, a1, b1, i1) = k1;
+    let (c2, s2, a2, b2, i2) = k2;
+    if s1 != s2 || i1 != i2 {
+        return None;
+    }
+    // outcome sets over {less, equal, greater} of `a ? b`
+    let set = |c: Cond| -> u8 {
+        match c {
+            Cond::Lt => 0b100,
+            Cond::Eq => 0b010,
+            Cond::Gt => 0b001,
+            Cond::Le => 0b110,
+            Cond::Ge => 0b011,
+            Cond::Ne => 0b101,
+        }
+    };
+    let swap = |m: u8| (m & 0b010) | ((m & 0b100) >> 2) | ((m & 0b001) << 2);
+    let m2 = if a2 == a1 && b2 == b1 {
+        set(c2)
+    } else if !i1 && a2.0 as i64 == b1 && b2 == a1.0 as i64 {
+        swap(set(c2))
+    } else {
+        return None;
+    };
+    match set(c1) | m2 {
+        0b100 => Some(Cond::Lt),
+        0b010 => Some(Cond::Eq),
+        0b001 => Some(Cond::Gt),
+        0b110 => Some(Cond::Le),
+        0b011 => Some(Cond::Ge),
+        0b101 => Some(Cond::Ne),
+        _ => None,
+    }
+}
+
 /// All definitions must be constants or copies of such values. Params and copy cycles
 /// fail too; at most four copy edges are followed.
 pub fn const_phi(f: &Func, def_at: &[Vec<(usize, usize)>], ndef: &[u32], v: VReg, depth: u32) -> bool {
@@ -776,8 +814,21 @@ pub fn const_phi(f: &Func, def_at: &[Vec<(usize, usize)>], ndef: &[u32], v: VReg
     ds.iter().all(|&(bi, ii)| match f.blocks[bi].insts[ii] {
         Inst::Iconst(..) => true,
         Inst::Mov(_, x) => const_phi(f, def_at, ndef, x, depth + 1),
+        Inst::Sel(_, _, a, b) => sel_const(f, def_at, ndef, a).is_some() && sel_const(f, def_at, ndef, b).is_some(),
         _ => false,
     })
+}
+
+/// The constant a select operand holds: a single-def vreg defined by an Iconst.
+fn sel_const(f: &Func, def_at: &[Vec<(usize, usize)>], ndef: &[u32], v: VReg) -> Option<i64> {
+    let ds = def_at.get(v.0 as usize)?;
+    if ds.len() != 1 || ndef[v.0 as usize] != 1 {
+        return None;
+    }
+    match f.blocks[ds[0].0].insts[ds[0].1] {
+        Inst::Iconst(_, k) => Some(k),
+        _ => None,
+    }
 }
 
 // Targets of DFS back edges, as in loop_depths. These include natural loop headers
@@ -864,6 +915,19 @@ pub fn phi_compare(
                 Some(K::I(kx)) => Inst::Iconst(b, cmp(kx)),
                 _ => Inst::Mov(b, phi_compare(f, def_at, kn, x, cc, signed, k, narrow, shadows, edits)),
             },
+            // c ? ka : kb compares as c ? cmp(ka) : cmp(kb) (read where the select read c)
+            Inst::Sel(_, c, x, y) => {
+                // const_phi checked both operands: single-def, defined by an Iconst
+                let konst = |v: VReg| match def_at[v.0 as usize].first().map(|&(b2, i2)| &f.blocks[b2].insts[i2]) {
+                    Some(Inst::Iconst(_, k)) => *k,
+                    _ => unreachable!(),
+                };
+                let (kx, ky) = (konst(x), konst(y));
+                let (tx, ty) = (f.vreg(Cls::I), f.vreg(Cls::I));
+                let pos = f.blocks[bi].pos[ii];
+                edits.push(FoldEdit { block: bi, at: ii + 1, remove: 0, insts: vec![Inst::Iconst(tx, cmp(kx)), Inst::Iconst(ty, cmp(ky)), Inst::Sel(b, c, tx, ty)], pos });
+                continue;
+            }
             _ => unreachable!(),
         };
         fold_insert(f, edits, bi, ii, inst);
@@ -1048,6 +1112,9 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                 if ic {
                     match *i {
                         Inst::Iconst(d, _) | Inst::Mov(d, _) => phi_defs[d.0 as usize].push((bi, ii)),
+                        // a choice between two constants (an `Ordering` from `a == b`): an
+                        // assignment of the phi machinery too (const_phi / phi_compare)
+                        Inst::Sel(d, ..) => phi_defs[d.0 as usize].push((bi, ii)),
                         Inst::Conv(Conv::IntToInt(t), d, x) if single(d, &ndef) => conv_def[d.0 as usize] = Some((t, x, bi, ii)),
                         Inst::IBinI(op @ (IOp::Add | IOp::Sub | IOp::And), t, d, x, k) if single(d, &ndef) => bin_def[d.0 as usize] = Some((op, t, x, k, bi, ii)),
                         _ => {}
@@ -1164,7 +1231,7 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                         break;
                     }
                 }
-                if !interesting && !matches!(f.blocks[bi].insts[ii], Inst::IBin(..) | Inst::ICmp(..) | Inst::IBinI(..) | Inst::ICmpI(..) | Inst::Conv(..) | Inst::Call(Callee::Indirect(_), ..)) {
+                if !interesting && !matches!(f.blocks[bi].insts[ii], Inst::IBin(..) | Inst::ICmp(..) | Inst::IBinI(..) | Inst::ICmpI(..) | Inst::Conv(..) | Inst::Sel(..) | Inst::Call(Callee::Indirect(_), ..)) {
                     continue;
                 }
                 let old = f.blocks[bi].insts[ii].clone();
@@ -1405,6 +1472,89 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                             _ => new,
                         };
                     }
+                    // a compare of a two-level select tree of constants (an Ordering made branch-free:
+                    // `c1 ? -1 : (c2 ? 0 : 1)`, maybe narrowed to i8), against a constant: the tree of
+                    // the compare's outcomes (0 / 1 constants); the select folds below merge it into
+                    // one compare (`ord == Greater` -> `!(a <= b)`)
+                    if let (Inst::ICmpI(cc, sg, d, x, k), false) = (&new, opt_off(options, "-selfold")) {
+                        let (cc, sg, d, x, k) = (*cc, *sg, *d, *x, *k);
+                        let (root, narrow) = match conv_def.get(x.0 as usize).copied().flatten() {
+                            Some((t, y, _, _)) if t.bits < 64 && single(x, &ndef) => (y, Some(t)),
+                            _ => (x, None),
+                        };
+                        let leaf = |v: VReg| match kn[v.0 as usize] {
+                            Some(K::I(kv)) => Some(cmp_i(cc, sg, narrow.map_or(kv, |t| crate::bitops::ext(kv, t)), k) as i64),
+                            _ => None,
+                        };
+                        if let Some((c1, a1, b1)) = sel_def[root.0 as usize].filter(|_| single(root, &ndef)) {
+                            // one arm a constant, the other a select of two constants
+                            let nested = |v: VReg| sel_def[v.0 as usize].filter(|_| single(v, &ndef)).and_then(|(c2, a2, b2)| Some((c2, leaf(a2)?, leaf(b2)?)));
+                            let plan = match (leaf(a1), leaf(b1)) {
+                                (Some(ka), None) => nested(b1).map(|n| (Some(ka), None, None, Some(n))),
+                                (None, Some(kb)) => nested(a1).map(|n| (None, Some(kb), Some(n), None)),
+                                _ => None,
+                            };
+                            if let Some((ka, kb, na, nb)) = plan {
+                                let pos = f.blocks[bi].pos[ii];
+                                let mut insts = Vec::new();
+                                let konst = |f: &mut Func, insts: &mut Vec<Inst>, kv: i64| {
+                                    let t = f.vreg(Cls::I);
+                                    insts.push(Inst::Iconst(t, kv));
+                                    t
+                                };
+                                let side = |f: &mut Func, insts: &mut Vec<Inst>, kc: Option<i64>, n: Option<(VReg, i64, i64)>| -> VReg {
+                                    match (kc, n) {
+                                        (Some(kv), _) => konst(f, insts, kv),
+                                        (None, Some((c2, x2, y2))) => {
+                                            let (tx, ty, t) = (konst(f, insts, x2), konst(f, insts, y2), f.vreg(Cls::I));
+                                            insts.push(Inst::Sel(t, c2, tx, ty));
+                                            t
+                                        }
+                                        _ => unreachable!(),
+                                    }
+                                };
+                                let ta = side(f, &mut insts, ka, na);
+                                let tb = side(f, &mut insts, kb, nb);
+                                let top = f.vreg(Cls::I);
+                                insts.push(Inst::Sel(top, c1, ta, tb));
+                                edits.push(FoldEdit { block: bi, at: ii, remove: 0, insts, pos });
+                                new = Inst::Mov(d, top);
+                            }
+                        }
+                    }
+                    // a select on `c ? k1 : k2` (constants, one of them 0): a select on c, the
+                    // arms swapped when k1 is the 0
+                    if let (Inst::Sel(d, x, p, q), false) = (&new, opt_off(options, "-selfold")) {
+                        let (d, x, p, q) = (*d, *x, *p, *q);
+                        if let Some((c, a, b)) = sel_def[x.0 as usize] {
+                            if let (Some(K::I(ka)), Some(K::I(kb)), Some(_)) = (kn[a.0 as usize], kn[b.0 as usize], cmp_def[c.0 as usize]) {
+                                if ka == 0 && kb != 0 {
+                                    new = Inst::Sel(d, c, q, p);
+                                } else if kb == 0 && ka != 0 {
+                                    new = Inst::Sel(d, c, p, q);
+                                }
+                            }
+                        }
+                    }
+                    // `c1 ? v : (c2 ? v : w)` with c1, c2 compares of the same two operands:
+                    // `(c1 | c2) ? v : w`, the union one compare (`a < b || a == b` is `a <= b`:
+                    // an `Ordering` tested for one outcome, binary_search's step)
+                    if let (Inst::Sel(d, c1, v1, x), false) = (&new, opt_off(options, "-selfold")) {
+                        let (d, c1, v1, x) = (*d, *c1, *v1, *x);
+                        if let Some((v2, w, k1, k2)) = sel_def[x.0 as usize].and_then(|(c2, v2, w)| Some((v2, w, cmp_def[c1.0 as usize]?, cmp_def[c2.0 as usize]?))) {
+                            let same_v = v1 == v2 || matches!((kn[v1.0 as usize], kn[v2.0 as usize]), (Some(K::I(p)), Some(K::I(q))) if p == q);
+                            if same_v && single(x, &ndef) {
+                                if let Some(cu) = cond_union(k1, k2) {
+                                    let cm = f.vreg(Cls::I);
+                                    let (cc, sg, a, bk, imm) = k1;
+                                    let _ = cc;
+                                    let ci = if imm { Inst::ICmpI(cu, sg, cm, a, bk) } else { Inst::ICmp(cu, sg, cm, a, VReg(bk as u32)) };
+                                    edits.push(FoldEdit { block: bi, at: ii, remove: 0, insts: vec![ci], pos: f.blocks[bi].pos[ii] });
+                                    new = Inst::Sel(d, cm, v1, w);
+                                }
+                            }
+                        }
+                    }
                     // `(c ? k1 : k2) == k` with constants k1 != k2: c itself (or !c); c is a
                     // compare result (0 / 1)
                     if let Inst::ICmpI(cc @ (Cond::Eq | Cond::Ne), _, d, x, k) = new {
@@ -1577,6 +1727,10 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
             b.insts.splice(e.at..e.at + e.remove, e.insts);
             b.pos.splice(e.at..e.at + e.remove, std::iter::repeat(e.pos).take(n));
         }
+        // `x % c == 0` (unsigned, c constant): one multiply by c's inverse and a compare
+        if !crate::stats::opt_off(options, "-remzero") {
+            changed |= rem_eq_zero(f, &kn, nv);
+        }
         // unsigned division / remainder by a constant: multiply-high and shifts
         changed |= div_by_const(f, &kn, nv);
         if !crate::stats::opt_off(options, "-divrem") {
@@ -1613,7 +1767,7 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
         trace_opt(f, "thread");
         changed |= threaded;
         if if_conv_on(options) {
-            changed |= if_convert(f);
+            changed |= if_convert(f, !opt_off(options, "-ifspec"));
         }
         changed |= merge_blocks(f);
         trace_opt(f, "merge");
@@ -2893,6 +3047,103 @@ pub fn udiv_magic(d: u64) -> (u64, u32, bool) {
     }
 }
 
+/// Divisibility tests: `x % c == 0` / `!= 0` for an unsigned 32- or 64-bit x and a constant c (not a
+/// power of two) whose remainder only these compares read. With c = c0 << s (c0 odd) and
+/// inv = c0^-1 mod 2^w, `x % c == 0` exactly when `rotr(x * inv, s) <= (2^w - 1) / c` (Granlund and
+/// Montgomery; LLVM's urem-seteq fold): one multiply (and a rotate) instead of a multiply-high
+/// division sequence (Vec::retain(|x| x % 3 != 0)).
+pub fn rem_eq_zero(f: &mut Func, kn: &[Option<K>], nv: usize) -> bool {
+    let mut uses = vec![0u32; f.vregs.len()];
+    let mut cmp_uses = vec![0u32; f.vregs.len()];
+    let mut ndef = vec![0u32; f.vregs.len()];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut tu = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_uses(i, |u| uses[u.0 as usize] += 1);
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            if let Inst::ICmpI(Cond::Eq | Cond::Ne, _, _, r, 0) = i {
+                cmp_uses[r.0 as usize] += 1;
+            }
+        }
+        term_uses(&b.term, &mut tu);
+        for u in tu.drain(..) {
+            uses[u.0 as usize] += 1;
+        }
+    }
+    // candidates: r = x % c (unsigned 32 / 64 bits, c > 1 not a power of two), r single-def, read
+    // only by `r == 0` / `r != 0`
+    let mut plan: Vec<(VReg, u64, u8)> = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::IBin(IOp::Rem, it, r, _, y) = *i {
+                if it.signed || !(it.bits == 32 || it.bits == 64) || (y.0 as usize) >= nv {
+                    continue;
+                }
+                let Some(K::I(c)) = kn[y.0 as usize] else { continue };
+                let c = c as u64;
+                if c < 3 || c.is_power_of_two() || (it.bits == 32 && c >> 32 != 0) {
+                    continue;
+                }
+                if ndef[r.0 as usize] == 1 && uses[r.0 as usize] > 0 && uses[r.0 as usize] == cmp_uses[r.0 as usize] {
+                    plan.push((r, c, it.bits));
+                }
+            }
+        }
+    }
+    if plan.is_empty() {
+        return false;
+    }
+    for bi in 0..f.blocks.len() {
+        let mut k = 0;
+        while k < f.blocks[bi].insts.len() {
+            match f.blocks[bi].insts[k] {
+                Inst::IBin(IOp::Rem, it, r, x, _) if plan.iter().any(|p| p.0 == r) => {
+                    let &(_, c, bits) = plan.iter().find(|p| p.0 == r).unwrap();
+                    let s = c.trailing_zeros();
+                    let c0 = c >> s;
+                    // Newton's iteration for the inverse of an odd c0 mod 2^64 (5 steps: 3 -> 96 bits)
+                    let mut inv: u64 = c0;
+                    for _ in 0..5 {
+                        inv = inv.wrapping_mul(2u64.wrapping_sub(c0.wrapping_mul(inv)));
+                    }
+                    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                    let inv = inv & mask;
+                    let pos = f.blocks[bi].pos[k];
+                    let kv = f.vreg(Cls::I);
+                    let mut seq = vec![Inst::Iconst(kv, inv as i64)];
+                    if s == 0 {
+                        seq.push(Inst::IBin(IOp::Mul, it, r, x, kv));
+                    } else {
+                        let m = f.vreg(Cls::I);
+                        seq.push(Inst::IBin(IOp::Mul, it, m, x, kv));
+                        seq.push(Inst::IBinI(IOp::Rotl, it, r, m, (bits - s as u8) as i64));
+                    }
+                    let n = seq.len();
+                    f.blocks[bi].insts.splice(k..k + 1, seq);
+                    f.blocks[bi].pos.splice(k..k + 1, std::iter::repeat(pos).take(n));
+                    k += n;
+                }
+                Inst::ICmpI(cc @ (Cond::Eq | Cond::Ne), _, d, r, 0) if plan.iter().any(|p| p.0 == r) => {
+                    let &(_, c, bits) = plan.iter().find(|p| p.0 == r).unwrap();
+                    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                    let lim = mask / c;
+                    let pos = f.blocks[bi].pos[k];
+                    let lv = f.vreg(Cls::I);
+                    let seq = vec![Inst::Iconst(lv, lim as i64), Inst::ICmp(if cc == Cond::Eq { Cond::Le } else { Cond::Gt }, false, d, r, lv)];
+                    f.blocks[bi].insts.splice(k..k + 1, seq);
+                    f.blocks[bi].pos.splice(k..k + 1, std::iter::repeat(pos).take(2));
+                    k += 2;
+                }
+                _ => k += 1,
+            }
+        }
+    }
+    true
+}
+
 /// `x / c` and `x % c` for an unsigned x and a constant c > 1: a power of two becomes a shift
 /// / mask, anything else multiply-high and shifts (libdivide's u64 algorithm, exact for every
 /// 64-bit x, so also for narrower zero-extended values). A divide takes 20-40 cycles.
@@ -3225,8 +3476,20 @@ pub fn combine_loads(f: &mut Func, ndef: &[u32]) -> bool {
 /// `x = c ? a : b` (Sel: cmov / csel) and a jump to the join -- no branch to mispredict
 /// (rustc / LLVM SimplifyCFG speculates such arms into selects). The arms must have the
 /// branch as their only predecessor, copy into distinct registers and read none of them.
-pub fn if_convert(f: &mut Func) -> bool {
+/// Where an if-converted arm's result comes from: a register, a constant, or a speculated compare /
+/// select (computed into a fresh temporary before the select).
+#[derive(Clone)]
+enum ArmSrc {
+    V(VReg),
+    K(i64),
+    I(Inst),
+}
+
+pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
     const MAX_MOVS: usize = 3;
+    // cheap pure instructions an arm may compute into its own temporaries (speculated: they run on
+    // both paths): an `Ordering` built from a compare (`if a < b { -1 } else { (a != b) as i8 }`)
+    const MAX_SPEC: usize = 6;
     let n = f.blocks.len();
     if n < 3 {
         return false;
@@ -3240,24 +3503,68 @@ pub fn if_convert(f: &mut Func) -> bool {
             }
         }
     }
-    // an arm: (copies, join) when block x is only copies then a jump, entered only from the branch
-    let arm = |f: &Func, npred: &[u32], x: u32| -> Option<(Vec<(VReg, VReg)>, u32)> {
+    let nv = f.vregs.len();
+    let (mut ndef, mut nuse) = (vec![0u32; nv], vec![0u32; nv]);
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut tu = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            for_uses(i, |u| nuse[u.0 as usize] += 1);
+        }
+        term_uses(&b.term, &mut tu);
+        for u in tu.drain(..) {
+            nuse[u.0 as usize] += 1;
+        }
+    }
+    // compares and selects only: the arms of a value choice (an Ordering), not general arithmetic
+    // (speculating sums cost iterator loops more instructions than their branches: iter_chain +27%)
+    let speculatable = |i: &Inst| matches!(i, Inst::ICmp(..) | Inst::ICmpI(..) | Inst::Sel(..));
+    // an arm: (speculated temporaries, copies (dest, source or constant), join) when block x is
+    // cheap temporaries (single-def, read only in x) then copies / constants into its results and a
+    // jump, entered only from the branch
+    let arm = |f: &Func, npred: &[u32], x: u32| -> Option<(Vec<Inst>, Vec<(VReg, ArmSrc)>, u32)> {
         let b = &f.blocks[x as usize];
-        if npred[x as usize] != 1 || b.insts.len() > MAX_MOVS {
+        if npred[x as usize] != 1 || b.insts.len() > MAX_MOVS + MAX_SPEC {
             return None;
         }
         let j = match b.term {
             Term::Jump(j) if j != x => j,
             _ => return None,
         };
+        let mut spec = Vec::new();
         let mut mv = Vec::new();
+        let mut local_uses: Vec<(VReg, u32)> = Vec::new();
         for i in &b.insts {
+            for_uses(i, |u| match local_uses.iter_mut().find(|e| e.0 == u) {
+                Some(e) => e.1 += 1,
+                None => local_uses.push((u, 1)),
+            });
+        }
+        for i in &b.insts {
+            let mut defs = Vec::new();
+            for_defs(i, |d| defs.push(d));
+            let temp = defs.len() == 1 && {
+                let d = defs[0];
+                ndef[d.0 as usize] == 1 && nuse[d.0 as usize] > 0 && local_uses.iter().any(|e| e.0 == d && e.1 == nuse[d.0 as usize])
+            };
             match i {
-                Inst::Mov(d, s) if d != s && matches!(f.vregs[d.0 as usize], Cls::I | Cls::F32 | Cls::F64) => mv.push((*d, *s)),
+                _ if temp && speculatable(i) && mv.is_empty() => spec.push(i.clone()),
+                Inst::Iconst(..) if temp && mv.is_empty() => spec.push(i.clone()),
+                Inst::Mov(d, s) if d != s && matches!(f.vregs[d.0 as usize], Cls::I | Cls::F32 | Cls::F64) => mv.push((*d, ArmSrc::V(*s))),
+                Inst::Iconst(d, k) if f.vregs[d.0 as usize] == Cls::I => mv.push((*d, ArmSrc::K(*k))),
+                // a result computed by a select / compare (the phi machinery's boolean shadow):
+                // speculated into a fresh temporary, then copied (Spec)
+                Inst::Sel(d, ..) | Inst::ICmp(_, _, d, _, _) | Inst::ICmpI(_, _, d, _, _) if defs.len() == 1 && f.vregs[d.0 as usize] == Cls::I && { let mut clean = true; for_uses(i, |u| clean &= !mv.iter().any(|(md, _)| *md == u)); clean } => mv.push((*d, ArmSrc::I(i.clone()))),
                 _ => return None,
             }
         }
-        Some((mv, j))
+        if spec.len() > MAX_SPEC || mv.len() > MAX_MOVS || (!spec_on && (!spec.is_empty() || mv.iter().any(|(_, s)| !matches!(s, ArmSrc::V(_))))) {
+            return None;
+        }
+        Some((spec, mv, j))
     };
     let mut changed = false;
     for bi in 0..n {
@@ -3268,15 +3575,28 @@ pub fn if_convert(f: &mut Func) -> bool {
             Term::Branch(c, t, e) if t != e && t as usize != bi && e as usize != bi => (c, t, e),
             _ => continue,
         };
-        let (mt, me, j) = match (arm(f, &npred, t), arm(f, &npred, e)) {
-            (Some((mt, jt)), Some((me, je))) if jt == je => (mt, me, jt),
-            (Some((mt, jt)), _) if jt == e => (mt, Vec::new(), e),
-            (_, Some((me, je))) if je == t => (Vec::new(), me, t),
+        let (st, mt0, se, me0, j) = match (arm(f, &npred, t), arm(f, &npred, e)) {
+            (Some((st, mt, jt)), Some((se, me, je))) if jt == je => (st, mt, se, me, jt),
+            (Some((st, mt, jt)), _) if jt == e => (st, mt, Vec::new(), Vec::new(), e),
+            (_, Some((se, me, je))) if je == t => (Vec::new(), Vec::new(), se, me, t),
             _ => continue,
         };
-        if mt.is_empty() && me.is_empty() {
+        if mt0.is_empty() && me0.is_empty() {
             continue;
         }
+        let konst = |m: &Vec<(VReg, ArmSrc)>| m.iter().filter(|(_, s)| !matches!(s, ArmSrc::V(_))).count();
+        // speculation only for a choice between constants and compare outcomes (an Ordering-like
+        // value): an arm that also copies values keeps its branch (iterator loops: position / any /
+        // count arms speculated cost iter_chain +26% instructions)
+        let speculated = !st.is_empty() || !se.is_empty() || konst(&mt0) + konst(&me0) > 0;
+        if speculated && mt0.iter().chain(me0.iter()).any(|(_, s)| matches!(s, ArmSrc::V(v) if !st.iter().chain(se.iter()).any(|i| { let mut d = false; for_defs(i, |x| d |= x == *v); d }))) {
+            continue;
+        }
+        if st.len() + se.len() + konst(&mt0) + konst(&me0) > MAX_SPEC {
+            continue;
+        }
+        let as_movs = |m: &Vec<(VReg, ArmSrc)>| -> Vec<(VReg, VReg)> { m.iter().map(|(d, s)| (*d, if let ArmSrc::V(v) = s { *v } else { *d })).collect() };
+        let (mt, me) = (as_movs(&mt0), as_movs(&me0));
         // destinations, each once per arm; sources and the condition are not among them
         let mut dests: Vec<VReg> = Vec::new();
         let mut ok = true;
@@ -3290,7 +3610,7 @@ pub fn if_convert(f: &mut Func) -> bool {
                 }
             }
         }
-        if !ok || dests.contains(&c) || mt.iter().chain(me.iter()).any(|(_, s)| dests.contains(s)) {
+        if !ok || dests.contains(&c) || mt0.iter().chain(me0.iter()).any(|(_, s)| match s { ArmSrc::V(v) => dests.contains(v), ArmSrc::I(i) => { let mut r = false; for_uses(i, |u| r |= dests.contains(&u)); r } ArmSrc::K(_) => false }) {
             continue;
         }
         // a choice the join then branches on stays a branch: the branch can be threaded to
@@ -3327,6 +3647,38 @@ pub fn if_convert(f: &mut Func) -> bool {
             }
         }
         let pos = f.blocks[bi].term_pos;
+        // the speculated temporaries run here, both arms' (they only define arm-local values);
+        // an arm's constant goes through a fresh temporary
+        let mut mt = mt;
+        let mut me = me;
+        for i in st.iter().chain(se.iter()) {
+            f.blocks[bi].insts.push(i.clone());
+            f.blocks[bi].pos.push(pos);
+        }
+        for (src, dst) in [(&mt0, &mut mt), (&me0, &mut me)] {
+            for (k, (d, s2)) in src.iter().enumerate() {
+                let hoisted = match s2 {
+                    ArmSrc::V(_) => continue,
+                    ArmSrc::K(kv) => {
+                        let tmp = f.vreg(f.vregs[d.0 as usize]);
+                        (Inst::Iconst(tmp, *kv), tmp)
+                    }
+                    ArmSrc::I(i) => {
+                        let tmp = f.vreg(f.vregs[d.0 as usize]);
+                        let i2 = match i.clone() {
+                            Inst::Sel(_, c2, a2, b2) => Inst::Sel(tmp, c2, a2, b2),
+                            Inst::ICmp(cc, sg, _, a2, b2) => Inst::ICmp(cc, sg, tmp, a2, b2),
+                            Inst::ICmpI(cc, sg, _, a2, k2) => Inst::ICmpI(cc, sg, tmp, a2, k2),
+                            other => other,
+                        };
+                        (i2, tmp)
+                    }
+                };
+                f.blocks[bi].insts.push(hoisted.0);
+                f.blocks[bi].pos.push(pos);
+                dst[k] = (*d, hoisted.1);
+            }
+        }
         for d in dests {
             let a = mt.iter().find(|x| x.0 == d).map_or(d, |x| x.1);
             let b = me.iter().find(|x| x.0 == d).map_or(d, |x| x.1);
