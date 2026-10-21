@@ -1,10 +1,12 @@
-//! The web target run on this machine (`MAKEPAD_RUN_CHECK_TARGET=wasm32-unknown-unknown`, cfg.rs
-//! `web`): what Relax itself gives such a program. The page side (the JS imports, `env.*`) is the
-//! embedder's: the trace host `makepad-web-trace` names its functions through `set_embedder_symbols`.
+//! The web targets run on this machine (`MAKEPAD_RUN_CHECK_TARGET=wasm32-unknown-unknown` /
+//! `wasm64-unknown-unknown`, cfg.rs `web`): what Relax itself gives such a program. The page side
+//! (the JS imports, `env.*`) is the embedder's: the trace host `makepad-web-trace` names its
+//! functions through `set_embedder_symbols`.
 //!
-//! - Linear memory: zone_alloc/web.rs (`activate`). Every program allocation lives in one 4 GB
-//!   window, so `ptr as u32` is a wasm address and `u32 as *mut T` (lower.rs `cast`) adds the
-//!   window's base back.
+//! - Linear memory: zone_alloc/web.rs (`activate`): every program allocation lives in one 4 GB
+//!   window. On wasm32 a pointer is a 32-bit offset into it (web32.rs: code, data, statics,
+//!   thread-locals and stacks are in the window too); on wasm64 pointers are native and
+//!   `u32 as *mut T` (lower.rs `cast`) adds the window's base back.
 //! - `core::arch::wasm32::{memory_size, memory_grow}` (Relax std core/arch/wasm32.rs): the linear
 //!   memory's committed size in pages; it grows by itself (an allocator over the arena), so an
 //!   explicit grow only succeeds for 0 pages.

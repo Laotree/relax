@@ -1,9 +1,10 @@
 //! The web target's linear memory (`MAKEPAD_RUN_CHECK_TARGET=wasm32-unknown-unknown`, run by the
 //! trace host `makepad-web-trace`): every allocation of the program goes to one arena inside one
 //! 4 GB-aligned window at `BASE`, as a wasm program's heap lives in its linear memory. A pointer's
-//! low 32 bits are then its wasm address: `ptr as u32` (truncation) is what the program hands the
-//! page, and a `u32 as *mut T` cast gets `BASE` back (lower.rs `cast`, web target only). On Linux
-//! the window is the first 4 GB of the address space (`BASE` 0: a wasm address is the pointer).
+//! low 32 bits are then its wasm address. On wasm32 the program's pointers are those offsets
+//! (compiler web32.rs; `symbol32`: this allocator in that ABI); on wasm64 they are native and a
+//! `u32 as *mut T` cast gets `BASE` back (lower.rs `cast`). On Linux the window is the first 4 GB
+//! of the address space (`BASE` 0: a wasm address is the pointer).
 //!
 //! Active only after `activate()` (the trace host, before the program is linked): the program's
 //! allocator symbols (`symbol`) then name these functions instead of domain.rs's.
