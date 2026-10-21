@@ -6,11 +6,13 @@
 //! rustc-env), then core/alloc/std (std unless MAKEPAD_RUN_STD says otherwise) and every crate in
 //! dependency order, import resolution, signatures/layouts, the libraries the build scripts
 //! link, and finally `main` through its lazy stub: every function compiles on its first call.
-//! With `--ahead` a worker compiles the functions the previous run compiled (recorded per package
-//! in <target>/makepad-run/startup/<package>.startup, dirs.rs) while the program runs.
+//! `--ahead=<level>` (MAKEPAD_RUN_AHEAD; jit::AheadPolicy) sets how much is compiled ahead of the
+//! program's calls: `minimal`, `balanced` (default) or `aot`, which also compiles the functions the
+//! previous run compiled (recorded per package in <target>/makepad-run/startup/<package>.startup,
+//! dirs.rs) on a worker while the program runs.
 //!
 //! Options (before the package): `--units <json>` uses a saved unit graph instead of cargo;
-//! `--ahead`; `--quiet` (no compile-error stream); `--verbose` (phase timings and info).
+//! `--ahead=<level>`; `--quiet` (no compile-error stream); `--verbose` (phase timings and info).
 //! Env: MAKEPAD_RUN_VERBOSE=1, MAKEPAD_RUN_STD, MAKEPAD_RUN_ERRORS=N (resolve /
 //! signature errors printed, default 20), MAKEPAD_RUN_REPORT=<path> (JSON boot report).
 //! `--report-to <path>`: progress for a launcher (the runner app), see `report` below.
@@ -122,7 +124,7 @@ extern "C" {
 }
 
 fn usage() -> i32 {
-    eprintln!("usage: makepad run [--units <unit-graph.json>] [--ahead] [--quiet] [--verbose] <package> [cargo flags] [-- program args]");
+    eprintln!("usage: makepad run [--units <unit-graph.json>] [--ahead=minimal|balanced|aot] [--quiet] [--verbose] <package> [cargo flags] [-- program args]");
     2
 }
 
@@ -363,6 +365,10 @@ pub(crate) fn resolve_package(
             verbose!("makepad-run: build scripts to remove ({}; only makepad-platform keeps one): {}", l.len(), names.join(", "));
         }
     }
+    if boot {
+        let _k = crate::zone_alloc::kept();
+        *CRATE_DIRS.lock().unwrap() = g.crates.iter().zip(g.pkg.iter()).map(|(c, (dir, _, _))| (c.name.clone(), dir.clone())).collect();
+    }
     // every crate's cfg set (its env!() environment is set when it is loaded: `set_crate_env`)
     let order = crate::crates::topo_order(&g.crates);
     let mut cfgs: Vec<crate::cfg::CfgSet> = Vec::with_capacity(g.crates.len());
@@ -415,7 +421,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     crate::clock::mark_start();
     let _ = jit::wall_ns();
     let mut units_json = String::new();
-    let mut ahead = false;
+    if let Some(v) = std::env::var_os("MAKEPAD_RUN_AHEAD") {
+        if v.to_str().and_then(crate::options::AheadLevel::parse).is_none() {
+            eprintln!("makepad-run: MAKEPAD_RUN_AHEAD={} is not a level: minimal, balanced or aot", v.to_string_lossy());
+            return 2;
+        }
+    }
+    jit::set_ahead_level(sess.runtime.ahead);
     let mut entries: Vec<String> = Vec::new();
     // `--exports a,b`: compile (and publish the addresses of) the `#[no_mangle]` / `#[export_name]`
     // fns whose names start with one of these, then return to the caller instead of running `main`
@@ -436,7 +448,18 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 units_json = args[i + 1].clone();
                 i += 1;
             }
-            "--ahead" => ahead = true,
+            // how much is compiled ahead of the program's calls (jit::AheadPolicy); the
+            // environment carries it to processes this one starts
+            a if a.starts_with("--ahead=") => match crate::options::AheadLevel::parse(&a[8..]) {
+                Some(l) => {
+                    jit::set_ahead_level(l);
+                    std::env::set_var("MAKEPAD_RUN_AHEAD", l.name());
+                }
+                None => {
+                    eprintln!("makepad-run: --ahead=<level> wants minimal, balanced or aot");
+                    return 2;
+                }
+            },
             // `makepad selftest --root-only`: the root crate's fns and what they reach
             "--root-only" => root_only = true,
             // `makepad selftest` (lib.rs): the check, then every fn compiled (check.rs)
@@ -517,6 +540,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
         i += 1;
     }
+    // the level in effect, for the program's first-frame line and the processes it starts
+    std::env::set_var("MAKEPAD_RUN_AHEAD", jit::ahead_level().name());
     if i >= args.len() {
         return usage();
     }
@@ -1192,6 +1217,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
 
     let t = Instant::now();
+    let ahead = jit::ahead_policy().last_run;
     let fn_defs = if ahead { startup_defs(&prog, &format!("{}/startup/{}.startup", target_dir, package)) } else { Vec::new() };
     // `main` lives at the root of the root crate (find_main)
     let root_crate = root;
@@ -1381,7 +1407,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     crate::mainprof::start();
     MAIN_START_WALL.store(jit::wall_ns(), Ordering::Relaxed);
     if ahead {
-        start_ahead(up, fn_defs);
+        start_ahead(up, fn_defs, runtime);
     }
     let mut domain_inputs = None;
     // a live session: hot reload of the program's own sources (reload.rs); none for store sources
@@ -1549,6 +1575,15 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         crate::os::proc::exit(code);
     }
     code
+}
+
+/// The booted program's crates: (crate name, package dir), in graph order.
+static CRATE_DIRS: relax_session::sync::Mutex<Vec<(String, String)>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// The crates of the program `cmd_run` booted, by name, with their package directories (a host
+/// serving the program's resources: the web trace host maps `/<crate>/<path>` to them).
+pub fn crate_dirs() -> Vec<(String, String)> {
+    CRATE_DIRS.lock().unwrap().clone()
 }
 
 /// What `--exports` published: (symbol, address) of each exported fn, in program order.
@@ -1798,13 +1833,15 @@ fn startup_defs(prog: &crate::program::Program, path: &str) -> Vec<DefId> {
     out
 }
 
-/// Ahead-of-call compilation on a worker: the previous run's startup functions, in order.
-/// Compiles serialize with lazy compiles on the owner thread, so the worker overlaps with the
-/// program's own execution, not with its compiles.
-fn start_ahead(up: *mut Unit, defs: Vec<DefId>) {
+/// Ahead-of-call compilation on a worker (`--ahead=aot`): the previous run's startup functions, in
+/// order, at worker priority. Compiles serialize with lazy compiles on the owner thread, so the
+/// worker overlaps with the program's own execution, not with its compiles.
+fn start_ahead(up: *mut Unit, defs: Vec<DefId>, runtime: &crate::options::RuntimeOptions) {
     let upn = up as usize;
+    let runtime = crate::zone_alloc::kept_clone(runtime);
     { let _k = crate::zone_alloc::kept();
     std::thread::spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+        jit::lower_this_thread_priority(&runtime);
         let up = upn as *mut Unit;
         let t = Instant::now();
         let mut n = 0;
@@ -2252,6 +2289,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             }
             // speculative results nobody called within the TTL go (memory: jit::expire_spec)
             jit::expire_spec(options);
+            jit::aot_drain();
             // recorded disk-cache entries are written out as they pile up, not held to the exit
             spill_cache();
             // Independent allocator relief for later O3 bursts and non-GUI programs.
@@ -2539,7 +2577,7 @@ static MID_COLLECTED_TRIED: AtomicBool = AtomicBool::new(false);
 /// A mid-run write recorded the startup manifest (its window had closed).
 static MID_MANIFEST_DONE: AtomicBool = AtomicBool::new(false);
 
-/// Compile totals since boot, the startup list for `--ahead`, and the JSON report.
+/// Compile totals since boot, the startup list for `--ahead=aot`, and the JSON report.
 /// jit::wall_ns() when main was called (MAKEPAD_RUN_MAIN_COMPILE_LOG's time base)
 static MAIN_START_WALL: AtomicU64 = AtomicU64::new(0);
 
@@ -3050,8 +3088,10 @@ fn summary_inner(why: &str) {
         let q = jit::TIER_QUEUED.load(Ordering::Relaxed);
         if q > 0 {
             verbose!(
-                "makepad-run: O3: {} hot, {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); cpu {:.0} ms on the owner, {:.0} ms off it",
+                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); cpu {:.0} ms on the owner, {:.0} ms off it",
+                jit::ahead_level().name(),
                 q,
+                jit::TIER_REVALIDATED.load(Ordering::Relaxed),
                 s.tier1_installed,
                 s.tier1_retier,
                 s.tier1_dropped,

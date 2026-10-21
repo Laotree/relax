@@ -8,7 +8,7 @@ pub enum Borrowck { Off, Moves, Full }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BorrowckAll { Default, Nongeneric, Std, All }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CheckTarget { Host, MacosArm64, LinuxX64, WindowsX64, AndroidArm64 }
+pub enum CheckTarget { Host, MacosArm64, LinuxX64, WindowsX64, AndroidArm64, Web }
 impl CheckTarget {
     /// The targets Relax runs on (and checks for), by triple: `MAKEPAD_RUN_CHECK_TARGET` and `makepad host-gen`.
     pub const TRIPLES: [(&'static str, CheckTarget); 4] = [
@@ -17,7 +17,15 @@ impl CheckTarget {
         ("x86_64-pc-windows-gnu", CheckTarget::WindowsX64),
         ("aarch64-linux-android", CheckTarget::AndroidArm64),
     ];
+    /// The web target (`wasm32-unknown-unknown`): the program's crates are read as a web build
+    /// reads them (cfg(target_arch = "wasm32"), the web platform backend) and run by this
+    /// machine's JIT; std stays the machine's (the trace host, `makepad-web-trace`). Not a
+    /// host-gen target.
+    pub const WEB_TRIPLE: &'static str = "wasm32-unknown-unknown";
     pub fn from_triple(triple: &str) -> Option<CheckTarget> {
+        if triple == Self::WEB_TRIPLE {
+            return Some(CheckTarget::Web);
+        }
         Self::TRIPLES.iter().find(|(t, _)| *t == triple).map(|(_, c)| *c)
     }
 }
@@ -31,6 +39,26 @@ pub enum Priority { Length, References, Sqrt }
 pub enum WorkerQos { Default, Background, Utility }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier0Baseline { Off, Startup, Always }
+/// How much the JIT compiles ahead of the program's calls (`makepad run --ahead=<level>`,
+/// `MAKEPAD_RUN_AHEAD`). Every level compiles what runs on its first call and tiers hot code up to
+/// O3; they differ in the work done for code that has not run yet (jit::AheadPolicy).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AheadLevel {
+    /// iteration: only what ran (plus the startup image and O3 for what is hot)
+    Minimal,
+    /// the default: a bounded, prioritised compile-ahead of what the UI is about to need
+    Balanced,
+    /// a background AOT pass at worker priority: everything reachable from what ran
+    Aot,
+}
+impl AheadLevel {
+    pub fn name(self) -> &'static str {
+        match self { AheadLevel::Minimal => "minimal", AheadLevel::Balanced => "balanced", AheadLevel::Aot => "aot" }
+    }
+    pub fn parse(v: &str) -> Option<AheadLevel> {
+        match v { "minimal" => Some(AheadLevel::Minimal), "balanced" => Some(AheadLevel::Balanced), "aot" => Some(AheadLevel::Aot), _ => None }
+    }
+}
 
 /// Effective machine capabilities; detected once by codegen before freezing Options.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -751,6 +779,9 @@ pub struct RuntimeOptions {
     pub restore: Option<String>,
     /// `MAKEPAD_RUN_WORKER_QOS`; default `WorkerQos::Background`.
     pub worker_qos: WorkerQos,
+    /// `MAKEPAD_RUN_AHEAD` (`--ahead=<level>` sets it); default `AheadLevel::Balanced`. Not part of
+    /// the code identity: every level makes the same code for a slot, so they share warm caches.
+    pub ahead: AheadLevel,
 }
 
 impl Default for RuntimeOptions {
@@ -776,6 +807,7 @@ impl Default for RuntimeOptions {
             tier1_threads: None,
             restore: None,
             worker_qos: WorkerQos::Background,
+            ahead: AheadLevel::Balanced,
         }
     }
 }
@@ -817,6 +849,7 @@ impl RuntimeOptions {
             tier1_threads: { let os = get("MAKEPAD_RUN_O3_THREADS"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()) },
             restore: { let os = get("MAKEPAD_RUN_RESTORE"); let v = os.and_then(|v| v.into_string().ok()); v },
             worker_qos: { let os = get("MAKEPAD_RUN_WORKER_QOS"); let v = os.and_then(|v| v.into_string().ok()); match v.as_deref() { Some("0") => WorkerQos::Default, Some("utility") => WorkerQos::Utility, _ => WorkerQos::Background } },
+            ahead: { let os = get("MAKEPAD_RUN_AHEAD"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref().and_then(AheadLevel::parse).unwrap_or(AheadLevel::Balanced) },
         }
     }
 }
