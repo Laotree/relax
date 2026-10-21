@@ -5294,6 +5294,9 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                         n <= (hi - lo + 7) / 8 * 2 + 2
                     });
                     if !dense {
+                        if std::env::var("MAKEPAD_RUN_SROA_DEBUG").is_ok() {
+                            eprintln!("sroa-dbg {} not-dense g={}", f.name, g);
+                        }
                         bad[g] = Some(SroaReject::CopyCells);
                     }
                 }
@@ -5319,6 +5322,9 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
             // a copy inside the group becomes one register move per cell (coalesced away mostly):
             // only copies to or from memory cost a load / store per cell
             if !internal && cnt > limit && copy_depth >= access_depth[g] {
+                if std::env::var("MAKEPAD_RUN_SROA_DEBUG").is_ok() {
+                    eprintln!("sroa-dbg {} copycells g={} size={} lo={} hi={} cnt={} limit={} in={} out={} depth={}/{} internal={}", f.name, g, f.slots[g].size, lo, hi, cnt, limit, has_in[g], has_out[g], copy_depth, access_depth[g], internal);
+                }
                 bad[g].get_or_insert(SroaReject::CopyCells);
             }
         }
