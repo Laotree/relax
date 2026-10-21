@@ -1594,39 +1594,130 @@ fn sysreg(n: &str) -> Option<(u32, u32, u32, u32, u32)> {
             }
         }
     }
-    Some(match n {
-        "nzcv" => (3, 3, 4, 2, 0),
-        "daif" => (3, 3, 4, 2, 1),
-        "fpcr" => (3, 3, 4, 4, 0),
-        "fpsr" => (3, 3, 4, 4, 1),
-        "dit" => (3, 3, 4, 2, 5),
-        "tpidr_el0" => (3, 3, 13, 0, 2),
-        "tpidrro_el0" => (3, 3, 13, 0, 3),
-        "tpidr_el1" => (3, 0, 13, 0, 4),
-        "ctr_el0" => (3, 3, 0, 0, 1),
-        "dczid_el0" => (3, 3, 0, 0, 7),
-        "cntvct_el0" => (3, 3, 14, 0, 2),
-        "cntpct_el0" => (3, 3, 14, 0, 1),
-        "cntfrq_el0" => (3, 3, 14, 0, 0),
-        "cntv_ctl_el0" => (3, 3, 14, 3, 1),
-        "cntv_tval_el0" => (3, 3, 14, 3, 0),
-        "cntv_cval_el0" => (3, 3, 14, 3, 2),
-        "midr_el1" => (3, 0, 0, 0, 0),
-        "mpidr_el1" => (3, 0, 0, 0, 5),
-        "revidr_el1" => (3, 0, 0, 0, 6),
-        "id_aa64pfr0_el1" => (3, 0, 0, 4, 0),
-        "id_aa64pfr1_el1" => (3, 0, 0, 4, 1),
-        "id_aa64dfr0_el1" => (3, 0, 0, 5, 0),
-        "id_aa64isar0_el1" => (3, 0, 0, 6, 0),
-        "id_aa64isar1_el1" => (3, 0, 0, 6, 1),
-        "id_aa64mmfr0_el1" => (3, 0, 0, 7, 0),
-        "id_aa64mmfr1_el1" => (3, 0, 0, 7, 1),
-        "currentel" => (3, 0, 4, 2, 2),
-        "spsel" => (3, 0, 4, 2, 0),
-        "sp_el0" => (3, 0, 4, 1, 0),
-        _ => return None,
-    })
+    // pmevcntr<n>_el0 / pmevtyper<n>_el0
+    for (pre, crn_base) in [("pmevcntr", 8u32), ("pmevtyper", 12)] {
+        if let Some(rest) = n.strip_prefix(pre).and_then(|r| r.strip_suffix("_el0")) {
+            if let Ok(k) = rest.parse::<u32>() {
+                if k < 31 {
+                    return Some((3, 3, 14, crn_base + (k >> 3), k & 7));
+                }
+            }
+        }
+    }
+    SYSREGS.iter().find(|e| e.0 == n).map(|e| (e.1, e.2, e.3, e.4, e.5))
 }
+
+/// (name, op0, op1, CRn, CRm, op2)
+pub(super) const SYSREGS: &[(&str, u32, u32, u32, u32, u32)] = &[
+    ("nzcv", 3, 3, 4, 2, 0),
+    ("daif", 3, 3, 4, 2, 1),
+    ("fpcr", 3, 3, 4, 4, 0),
+    ("fpsr", 3, 3, 4, 4, 1),
+    ("dit", 3, 3, 4, 2, 5),
+    ("ssbs", 3, 3, 4, 2, 6),
+    ("tco", 3, 3, 4, 2, 7),
+    ("pan", 3, 0, 4, 2, 3),
+    ("uao", 3, 0, 4, 2, 4),
+    ("tpidr_el0", 3, 3, 13, 0, 2),
+    ("tpidrro_el0", 3, 3, 13, 0, 3),
+    ("tpidr_el1", 3, 0, 13, 0, 4),
+    ("tpidr_el2", 3, 4, 13, 0, 2),
+    ("tpidr_el3", 3, 6, 13, 0, 2),
+    ("ctr_el0", 3, 3, 0, 0, 1),
+    ("dczid_el0", 3, 3, 0, 0, 7),
+    ("cntvct_el0", 3, 3, 14, 0, 2),
+    ("cntpct_el0", 3, 3, 14, 0, 1),
+    ("cntfrq_el0", 3, 3, 14, 0, 0),
+    ("cntv_ctl_el0", 3, 3, 14, 3, 1),
+    ("cntv_tval_el0", 3, 3, 14, 3, 0),
+    ("cntv_cval_el0", 3, 3, 14, 3, 2),
+    ("cntp_ctl_el0", 3, 3, 14, 2, 1),
+    ("cntp_tval_el0", 3, 3, 14, 2, 0),
+    ("cntp_cval_el0", 3, 3, 14, 2, 2),
+    ("cntkctl_el1", 3, 0, 14, 1, 0),
+    ("cnthctl_el2", 3, 4, 14, 1, 0),
+    ("cntvoff_el2", 3, 4, 14, 0, 3),
+    ("midr_el1", 3, 0, 0, 0, 0),
+    ("mpidr_el1", 3, 0, 0, 0, 5),
+    ("revidr_el1", 3, 0, 0, 0, 6),
+    ("vpidr_el2", 3, 4, 0, 0, 0),
+    ("vmpidr_el2", 3, 4, 0, 0, 5),
+    ("id_aa64pfr0_el1", 3, 0, 0, 4, 0),
+    ("id_aa64pfr1_el1", 3, 0, 0, 4, 1),
+    ("id_aa64zfr0_el1", 3, 0, 0, 4, 4),
+    ("id_aa64dfr0_el1", 3, 0, 0, 5, 0),
+    ("id_aa64dfr1_el1", 3, 0, 0, 5, 1),
+    ("id_aa64afr0_el1", 3, 0, 0, 5, 4),
+    ("id_aa64afr1_el1", 3, 0, 0, 5, 5),
+    ("id_aa64isar0_el1", 3, 0, 0, 6, 0),
+    ("id_aa64isar1_el1", 3, 0, 0, 6, 1),
+    ("id_aa64isar2_el1", 3, 0, 0, 6, 2),
+    ("id_aa64mmfr0_el1", 3, 0, 0, 7, 0),
+    ("id_aa64mmfr1_el1", 3, 0, 0, 7, 1),
+    ("id_aa64mmfr2_el1", 3, 0, 0, 7, 2),
+    ("ccsidr_el1", 3, 1, 0, 0, 0),
+    ("clidr_el1", 3, 1, 0, 0, 1),
+    ("aidr_el1", 3, 1, 0, 0, 7),
+    ("csselr_el1", 3, 2, 0, 0, 0),
+    ("currentel", 3, 0, 4, 2, 2),
+    ("spsel", 3, 0, 4, 2, 0),
+    ("sp_el0", 3, 0, 4, 1, 0),
+    ("sp_el1", 3, 4, 4, 1, 0),
+    ("sp_el2", 3, 6, 4, 1, 0),
+    ("sctlr_el1", 3, 0, 1, 0, 0),
+    ("actlr_el1", 3, 0, 1, 0, 1),
+    ("cpacr_el1", 3, 0, 1, 0, 2),
+    ("ttbr0_el1", 3, 0, 2, 0, 0),
+    ("ttbr1_el1", 3, 0, 2, 0, 1),
+    ("tcr_el1", 3, 0, 2, 0, 2),
+    ("spsr_el1", 3, 0, 4, 0, 0),
+    ("elr_el1", 3, 0, 4, 0, 1),
+    ("esr_el1", 3, 0, 5, 2, 0),
+    ("far_el1", 3, 0, 6, 0, 0),
+    ("par_el1", 3, 0, 7, 4, 0),
+    ("mair_el1", 3, 0, 10, 2, 0),
+    ("amair_el1", 3, 0, 10, 3, 0),
+    ("vbar_el1", 3, 0, 12, 0, 0),
+    ("contextidr_el1", 3, 0, 13, 0, 1),
+    ("sctlr_el2", 3, 4, 1, 0, 0),
+    ("hcr_el2", 3, 4, 1, 1, 0),
+    ("cptr_el2", 3, 4, 1, 1, 2),
+    ("ttbr0_el2", 3, 4, 2, 0, 0),
+    ("tcr_el2", 3, 4, 2, 0, 2),
+    ("vttbr_el2", 3, 4, 2, 1, 0),
+    ("vtcr_el2", 3, 4, 2, 1, 2),
+    ("spsr_el2", 3, 4, 4, 0, 0),
+    ("elr_el2", 3, 4, 4, 0, 1),
+    ("esr_el2", 3, 4, 5, 2, 0),
+    ("far_el2", 3, 4, 6, 0, 0),
+    ("hpfar_el2", 3, 4, 6, 0, 4),
+    ("mair_el2", 3, 4, 10, 2, 0),
+    ("vbar_el2", 3, 4, 12, 0, 0),
+    ("sctlr_el3", 3, 6, 1, 0, 0),
+    ("scr_el3", 3, 6, 1, 1, 0),
+    ("ttbr0_el3", 3, 6, 2, 0, 0),
+    ("tcr_el3", 3, 6, 2, 0, 2),
+    ("spsr_el3", 3, 6, 4, 0, 0),
+    ("elr_el3", 3, 6, 4, 0, 1),
+    ("esr_el3", 3, 6, 5, 2, 0),
+    ("far_el3", 3, 6, 6, 0, 0),
+    ("mair_el3", 3, 6, 10, 2, 0),
+    ("vbar_el3", 3, 6, 12, 0, 0),
+    ("pmcr_el0", 3, 3, 9, 12, 0),
+    ("pmcntenset_el0", 3, 3, 9, 12, 1),
+    ("pmcntenclr_el0", 3, 3, 9, 12, 2),
+    ("pmselr_el0", 3, 3, 9, 12, 5),
+    ("pmccntr_el0", 3, 3, 9, 13, 0),
+    ("pmxevtyper_el0", 3, 3, 9, 13, 1),
+    ("pmxevcntr_el0", 3, 3, 9, 13, 2),
+    ("pmuserenr_el0", 3, 3, 9, 14, 0),
+    ("pmccfiltr_el0", 3, 3, 14, 15, 7),
+    ("mdscr_el1", 2, 0, 0, 2, 2),
+    ("oslar_el1", 2, 0, 1, 0, 4),
+    ("rndr", 3, 3, 2, 4, 0),
+    ("rndrrs", 3, 3, 2, 4, 1),
+    ("zcr_el1", 3, 0, 1, 2, 0),
+];
 
 fn barrier_opt(ctx: &Ctx, o: Option<&Op>) -> Res<u32> {
     if let Ok(n) = name(o) {
@@ -1747,6 +1838,10 @@ fn sys_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
             let (reg, sysop, l) = if mn == "mrs" { (gp_k(o.first(), K::X)?, o.get(1), 1) } else { (gp_k(o.get(1), K::X)?, o.first(), 0) };
             let n = name(sysop)?;
             let (op0, op1, crn, crm, op2) = sysreg(&n).ok_or_else(|| format!("unknown system register `{}`", n))?;
+            let read_only = n.starts_with("id_") || matches!(n.as_str(), "ctr_el0" | "dczid_el0" | "cntvct_el0" | "cntpct_el0" | "midr_el1" | "mpidr_el1" | "revidr_el1" | "ccsidr_el1" | "clidr_el1" | "aidr_el1" | "currentel" | "rndr" | "rndrrs");
+            if (l == 0 && read_only) || (l == 1 && n == "oslar_el1") {
+                return msg(format!("system register `{}` is {}", n, if l == 0 { "read-only" } else { "write-only" }));
+            }
             w(ctx, 0xD510_0000 | l << 21 | (op0 & 1) << 19 | op1 << 16 | crn << 12 | crm << 8 | op2 << 5 | reg.n());
         }
         "sys" | "sysl" => {
@@ -3114,6 +3209,75 @@ fn neon_extra(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
         }
     }
     match mn {
+        "aese" | "aesd" | "aesmc" | "aesimc" => {
+            let (rd, a) = vr(o.first())?;
+            let (rn, b) = vr(o.get(1))?;
+            if o.len() != 2 || a != (Arr { n: 16, es: 0 }) || b != a {
+                return bad();
+            }
+            let base = match mn {
+                "aese" => 0x4E28_4800,
+                "aesd" => 0x4E28_5800,
+                "aesmc" => 0x4E28_6800,
+                _ => 0x4E28_7800,
+            };
+            w(ctx, base | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+        "sha1c" | "sha1p" | "sha1m" | "sha256h" | "sha256h2" => {
+            let rd = fp_same(o.first(), K::Q)?;
+            let rn = fpr(o.get(1))?;
+            let (rm, c) = vr(o.get(2))?;
+            if o.len() != 3 || c != (Arr { n: 4, es: 2 }) || rn.k != if mn.starts_with("sha1") { K::S } else { K::Q } {
+                return bad();
+            }
+            let base = match mn {
+                "sha1c" => 0x5E00_0000,
+                "sha1p" => 0x5E00_1000,
+                "sha1m" => 0x5E00_2000,
+                "sha256h" => 0x5E00_4000,
+                _ => 0x5E00_5000,
+            };
+            w(ctx, base | rm.n() << 16 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+        "sha1su0" | "sha256su1" => {
+            let (rd, a) = vr(o.first())?;
+            let (rn, b) = vr(o.get(1))?;
+            let (rm, c) = vr(o.get(2))?;
+            if o.len() != 3 || a != (Arr { n: 4, es: 2 }) || b != a || c != a {
+                return bad();
+            }
+            w(ctx, if mn == "sha1su0" { 0x5E00_3000 } else { 0x5E00_6000 } | rm.n() << 16 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+        "sha1su1" | "sha256su0" => {
+            let (rd, a) = vr(o.first())?;
+            let (rn, b) = vr(o.get(1))?;
+            if o.len() != 2 || a != (Arr { n: 4, es: 2 }) || b != a {
+                return bad();
+            }
+            w(ctx, if mn == "sha1su1" { 0x5E28_1800 } else { 0x5E28_2800 } | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+        "sha1h" => {
+            let rd = fp_same(o.first(), K::S)?;
+            let rn = fp_same(o.get(1), K::S)?;
+            if o.len() != 2 {
+                return bad();
+            }
+            w(ctx, 0x5E28_0800 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
+        "fjcvtzs" => {
+            let rd = gp_k(o.first(), K::W)?;
+            let rn = fp_same(o.get(1), K::D)?;
+            if o.len() != 2 {
+                return bad();
+            }
+            w(ctx, 0x1E7E_0000 | rn.n() << 5 | rd.n());
+            return Ok(true);
+        }
         "pmull" | "pmull2" => {
             let (rd, a) = vr(o.first())?;
             let (rn, b) = vr(o.get(1))?;

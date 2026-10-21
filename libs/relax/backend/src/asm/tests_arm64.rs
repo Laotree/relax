@@ -1,7 +1,7 @@
 //! AArch64 encoder tests: an oracle against clang's integrated assembler (skipped without
 //! clang), and unit tests for placeholders, fixups, labels, Mach-O syntax and errors.
 use super::*;
-use super::arm64::parse_reg;
+use super::arm64::{parse_reg, SYSREGS};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -59,7 +59,7 @@ fn clang_bytes(src: &str) -> Vec<u8> {
     elf_text(&obj)
 }
 
-const HEADER: &str = ".arch armv8.5-a+lse+fp16+lor+crc+sb+rcpc+dotprod+rdm+aes\n";
+const HEADER: &str = ".arch armv8.5-a+lse+fp16+lor+crc+sb+rcpc+dotprod+rdm+aes+sha2+rng+mte+sve\n";
 
 fn clang_run(text: &str) -> (bool, String, Vec<u8>) {
     let id = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -67,7 +67,7 @@ fn clang_run(text: &str) -> (bool, String, Vec<u8>) {
     let s = dir.join(format!("relax_asm_a64_{}_{}.s", std::process::id(), id));
     let o = dir.join(format!("relax_asm_a64_{}_{}.o", std::process::id(), id));
     std::fs::write(&s, text).unwrap();
-    let out = Command::new("clang").args(["-c", "-x", "assembler", "--target=aarch64-unknown-linux-gnu", "-ferror-limit=0", "-o"]).arg(&o).arg(&s).output().unwrap();
+    let out = Command::new("clang").args(["-c", "-x", "assembler", "--target=aarch64-unknown-linux-gnu", "-ferror-limit=0", "-Wno-unused-command-line-argument", "-o"]).arg(&o).arg(&s).output().unwrap();
     let _ = std::fs::remove_file(&s);
     let bytes = if out.status.success() { elf_text(&std::fs::read(&o).unwrap()) } else { Vec::new() };
     let _ = std::fs::remove_file(&o);
@@ -151,7 +151,7 @@ fn oracle_x(name: &str, src: &str, rejects: bool) {
     if !errs.is_empty() {
         panic!("{}: {} lines rejected by us:\n{}", name, errs.len(), errs.join("\n"));
     }
-    let text = format!(".arch armv8.5-a+lse+fp16+lor\n{}\n", lines.join("\n"));
+    let text = format!("{}{}\n", HEADER, lines.join("\n"));
     let got = ours_bytes(&text).unwrap_or_else(|e| panic!("{}: {}", name, e));
     let want = clang_bytes(&text);
     if got == want {
@@ -1549,4 +1549,55 @@ fn oracle_mutations_are_rejected() {
     }
     println!("mutations: {} lines, {} identical, {} accepted by clang only, {} different, {} accepted by us only", refs.len(), same, gaps, diffs.len(), over.len());
     assert!(over.is_empty() && diffs.is_empty(), "accepted but invalid:\n{}\ndifferent:\n{}", over.iter().take(400).cloned().collect::<Vec<_>>().join("\n"), diffs.iter().take(30).cloned().collect::<Vec<_>>().join("\n"));
+}
+
+#[test]
+fn oracle_system_registers() {
+    let mut src = String::new();
+    for (n, ..) in SYSREGS {
+        src += &format!("\nmrs x0, {}\nmsr {}, x1", n, n.to_uppercase());
+    }
+    for n in ["pmevcntr0_el0", "pmevcntr17_el0", "pmevcntr30_el0", "pmevtyper5_el0", "pmevtyper30_el0", "s3_3_c4_c4_0", "S3_1_C15_C2_7", "s2_0_c0_c0_0"] {
+        src += &format!("\nmrs x0, {}\nmsr {}, x1", n, n);
+    }
+    // read-only / write-only registers: clang rejects the other direction and so do we
+    let lines: Vec<&str> = src.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    let theirs = clang_each(&lines);
+    let mut bad = Vec::new();
+    for (l, t) in lines.iter().zip(&theirs) {
+        match (ours_bytes(l), t) {
+            (Ok(a), Some(b)) if &a == b => {}
+            (Err(_), None) => {}
+            (a, b) => bad.push(format!("{}: ours {:?} clang {:?}", l, a.map(|x| hex(&x)), b.as_ref().map(|x| hex(x)))),
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+#[test]
+fn oracle_crypto_and_misc() {
+    oracle(
+        "crypto_misc",
+        r#"
+aese v0.16b, v1.16b
+aesd v0.16b, v1.16b
+aesmc v0.16b, v1.16b
+aesimc v0.16b, v1.16b
+sha1c q0, s1, v2.4s
+sha1p q0, s1, v2.4s
+sha1m q0, s1, v2.4s
+sha1h s0, s1
+sha1su0 v0.4s, v1.4s, v2.4s
+sha1su1 v0.4s, v1.4s
+sha256h q0, q1, v2.4s
+sha256h2 q0, q1, v2.4s
+sha256su0 v0.4s, v1.4s
+sha256su1 v0.4s, v1.4s, v2.4s
+fjcvtzs w0, d1
+pmull v0.1q, v1.1d, v2.1d
+pmull2 v0.1q, v1.2d, v2.2d
+pmull v0.8h, v1.8b, v2.8b
+pmull2 v0.8h, v1.16b, v2.16b
+"#,
+    );
 }
