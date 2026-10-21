@@ -477,7 +477,7 @@ pub fn zero_above(options: &relax_session::Options, f: &Func, low: &[bool]) -> V
         z[p.0 as usize] = 0;
     }
     let mut copies: Vec<(u32, u32)> = Vec::new();
-    let mut merge = |z: &mut [u8], d: usize, k: u8| {
+    let merge = |z: &mut [u8], d: usize, k: u8| {
         z[d] = if z[d] == NONE { k } else if z[d] == 0 || k == 0 { 0 } else { z[d].max(k) };
     };
     for b in &f.blocks {
