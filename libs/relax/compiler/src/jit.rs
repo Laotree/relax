@@ -9217,9 +9217,10 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     static INLINE_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // MAKEPAD_RUN_INLINE_STATS=1: per O3 build; =prep: also per bottom-up preparation
     let mut inline_stats = (*INLINE_STATS.get_or_init(|| std::env::var("MAKEPAD_RUN_INLINE_STATS").map_or(false, |v| v == "1" || v == "prep"))).then(relax_codegen::opt::InlineStats::default);
-    // Bottom-up, as LLVM's CGSCC inliner: every callee in the snapshot is simplified first,
-    // its own inlining included, and this build inlines (and prices) those optimised bodies.
-    // A pure function of the snapshot, so replay stays exact.
+    // Bottom-up, as LLVM's CGSCC inliner: every callee in the snapshot is simplified first, its
+    // own inlining included; a site takes that body when its optimised form passes the rules and
+    // fits, else the snapshot body (top-down, as before). A pure function of the snapshot, so
+    // replay stays exact. MAKEPAD_RUN_OPT=-bottomup: top-down only (bisection).
     let bodies = InlineBodies::prepare(options, id, candidates, get, single, ro, cfg, nounwind);
     let prepared = |c: u32| bodies.prepared(c);
     let mut inlined = tier1_simplify(options, func, id, name, get, &prepared, single, ro, cfg, nounwind, frequencies, inline_stats.as_mut(), None);
@@ -9310,11 +9311,15 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
 
 /// The snapshot callees as a caller's O3 build inlines them: bottom-up over the snapshot's call
 /// graph (strongly connected components, callees first, as LLVM's CGSCC inliner), each callee
-/// gets `tier1_simplify` against its callees' prepared bodies, so a caller inlines the callee's
-/// optimised body, with that body's own inlining (apply_layout_table keeps pair_pos::apply when
-/// a closure inlines it), and its rules and costs see that body. Members of one component see
-/// each other's snapshot bodies. Everything here is a function of the snapshot alone (frequencies
-/// are structural), so replay stays exact.
+/// gets `tier1_simplify` against its callees' prepared bodies, so a caller inlines the callee with
+/// that callee's own inlining (apply_layout_table keeps pair_pos::apply when a closure inlines
+/// it), and its rules and costs see the callee's optimised body. What moves is the body after the
+/// callee's first inlining round, unoptimised: the caller's pipeline then runs once over it, as it
+/// does over snapshot bodies (inlining the optimised body, png_decode lost its vectorised row
+/// filter: the second simplify left a rotated loop that fold_post_increments and the stream
+/// vectoriser do not match; 1.79x). Members of one component see each other's snapshot bodies.
+/// Everything here is a function of the snapshot alone (frequencies are structural), so replay
+/// stays exact.
 struct InlineBodies {
     index: HashMap<u32, usize>,
     /// (the inlined body: the first inlining round's output, unoptimised; the optimised body
@@ -9448,14 +9453,6 @@ impl InlineBodies {
 /// with the callees that round inlined.
 fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, prepared: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, *const relax_backend::rir::Func)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, mut inline_stats: Option<&mut relax_codegen::opt::InlineStats>, inlined_only: Option<&mut (relax_backend::rir::Func, Vec<(u32, usize)>)>) -> Vec<(u32, usize)> {
     let mut limits = relax_codegen::opt::InlineLimits::tier1_for(func);
-    // EXPERIMENT (INL4, not for landing): MAKEPAD_RUN_OPT=ceil=<mul>:<add> growth ceiling
-    let ceil_fn = options.opt.iter().find_map(|t| t.trim().strip_prefix("ceilfn=")).map_or(true, |p| name.contains(p));
-    if let Some(c) = options.opt.iter().find_map(|t| t.trim().strip_prefix("ceil=")).filter(|_| ceil_fn) {
-        if let Some((m, a)) = c.split_once(':').and_then(|(m, a)| Some((m.parse::<usize>().ok()?, a.parse::<usize>().ok()?))) {
-            let n = relax_codegen::opt::inst_count(func);
-            limits.growth_limit = Some(n.saturating_mul(m).max(n.saturating_add(a)));
-        }
-    }
     let mut inlined: Vec<(u32, usize)> = Vec::new();
     if cfg.inline {
         let ti = relax_backend::stats::pass_clock();
