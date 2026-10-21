@@ -1139,6 +1139,11 @@ impl<'a> Gen<'a> {
                         skip_next = true;
                         continue;
                     }
+                    // two accesses of adjacent words off one base: ldp / stp
+                    if let Some(()) = self.pair_access(options, inst, &b.insts[ii + 1], self.al.inst_pos(bi, ii + 1)) {
+                        skip_next = true;
+                        continue;
+                    }
                 }
                 // a compare feeding the selects right after it: they read its flags (nothing between
                 // them sets flags); when they are all its uses, the bool is never materialised
@@ -2815,6 +2820,75 @@ impl<'a> Gen<'a> {
         let rd = self.def_i(d, S0);
         self.a.e(op | (ra as u32) << 5 | rd as u32);
         self.fin_i(d, rd);
+        Some(())
+    }
+
+    /// `Load a, [p + o]; Load b, [p + o +- w]` (or two stores) of the same width w (8/4-byte ints,
+    /// f64/f32; 4-byte loads zero-extending) as one ldp / stp: both values in registers (no spill
+    /// windows), distinct, the loads' destinations not the base, the lower offset a multiple of w
+    /// within the signed 7-bit scaled range. None: no match.
+    fn pair_access(&mut self, options: &relax_session::Options, i1: &Inst, i2: &Inst, pos2: u32) -> Option<()> {
+        if isel_flags(options) & A64_FUSE == 0 || self.win_start.contains_key(&pos2) {
+            return None;
+        }
+        let (load, m1, v1, b1, o1, m2, v2, b2, o2) = match (i1, i2) {
+            (Inst::Load(m1, d1, b1, o1), Inst::Load(m2, d2, b2, o2)) => (true, *m1, *d1, *b1, *o1, *m2, *d2, *b2, *o2),
+            (Inst::Store(m1, b1, o1, s1), Inst::Store(m2, b2, o2, s2)) => (false, *m1, *s1, *b1, *o1, *m2, *s2, *b2, *o2),
+            _ => return None,
+        };
+        if m1 != m2 || b1 != b2 || v1 == v2 {
+            return None;
+        }
+        // (pair opcode, width, float?)
+        let (op, w, fp) = match (m1, load) {
+            (Mem::Int(8, _), true) => (0xA940_0000u32, 8i64, false),
+            (Mem::Int(8, _), false) => (0xA900_0000, 8, false),
+            (Mem::Int(4, false), true) => (0x2940_0000, 4, false),
+            (Mem::Int(4, _), false) => (0x2900_0000, 4, false),
+            (Mem::F64, true) => (0x6D40_0000, 8, true),
+            (Mem::F64, false) => (0x6D00_0000, 8, true),
+            (Mem::F32, true) => (0x2D40_0000, 4, true),
+            (Mem::F32, false) => (0x2D00_0000, 4, true),
+            _ => return None,
+        };
+        if load && (v1 == b1 || v2 == b1) {
+            return None;
+        }
+        let (base, off1) = self.resolve_off(b1, o1 as i64);
+        let (base2, off2) = self.resolve_off(b2, o2 as i64);
+        if base != base2 {
+            return None;
+        }
+        let (lo_v, hi_v, lo) = if off2 == off1 + w {
+            (v1, v2, off1)
+        } else if off1 == off2 + w {
+            (v2, v1, off2)
+        } else {
+            return None;
+        };
+        let rb = match self.slot_base(base) {
+            Some(so) => {
+                let o = so + lo;
+                if o % w != 0 || !(-64 * w..=63 * w).contains(&o) {
+                    return None;
+                }
+                (SP, o)
+            }
+            None => match self.al.loc[base.0 as usize] {
+                Loc::Reg(r) if lo % w == 0 && (-64 * w..=63 * w).contains(&lo) => (r, lo),
+                _ => return None,
+            },
+        };
+        let reg_of = |s: &Self, v: VReg| match (s.al.loc[v.0 as usize], fp) {
+            (Loc::Reg(r), false) | (Loc::Flt(r), true) => Some(r),
+            _ => None,
+        };
+        let (t1, t2) = (reg_of(self, lo_v)?, reg_of(self, hi_v)?);
+        if t1 == t2 {
+            return None;
+        }
+        let imm = ((rb.1 / w) as u32) & 0x7f;
+        self.a.e(op | imm << 15 | (t2 as u32) << 10 | (rb.0 as u32) << 5 | t1 as u32);
         Some(())
     }
 
