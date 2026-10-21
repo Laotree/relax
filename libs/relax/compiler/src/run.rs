@@ -1818,15 +1818,19 @@ fn startup_defs(prog: &crate::program::Program, path: &str) -> Vec<DefId> {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    let mut by_path = std::collections::HashMap::new();
+    // A path names one fn only when no other fn has it: the methods of different impls share
+    // theirs (`core::sync::atomic::::store` is every atomic type's), and a generic impl's
+    // method compiled with no type arguments does not normalize (aot warm runs: 63 internal
+    // compiler errors in the ahead worker). Ambiguous paths are left to the program's calls.
+    let mut by_path: std::collections::HashMap<String, Option<DefId>> = std::collections::HashMap::new();
     for (i, d) in prog.defs.iter().enumerate() {
         if matches!(d.kind, DefKind::Fn | DefKind::AssocFn) {
-            by_path.insert(prog.def_path(DefId(i as u32)), DefId(i as u32));
+            by_path.entry(prog.def_path(DefId(i as u32))).and_modify(|e| *e = None).or_insert(Some(DefId(i as u32)));
         }
     }
     let mut out = Vec::new();
     for l in list.lines() {
-        if let Some(d) = by_path.get(l.trim()) {
+        if let Some(Some(d)) = by_path.get(l.trim()) {
             out.push(*d);
         }
     }
