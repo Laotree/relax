@@ -137,11 +137,14 @@ pub struct Options {
     pub names: bool,
     /// export the tag as "t" (for host code that throws into the module)
     pub export_tag: bool,
+    /// exceptions as `try_table` (exnref); default: the legacy `try`/`catch_all` every engine
+    /// runs (and 5 bytes smaller per invoke)
+    pub exnref: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { memory64: false, stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true }
+        Options { memory64: false, stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false }
     }
 }
 
@@ -764,6 +767,8 @@ const CALL_INDIRECT: u8 = 0x11;
 const DROP: u8 = 0x1A;
 const SELECT: u8 = 0x1B;
 const TRY_TABLE: u8 = 0x1F;
+const TRY: u8 = 0x06;
+const CATCH_ALL: u8 = 0x19;
 const LGET: u8 = 0x20;
 const LSET: u8 = 0x21;
 const LTEE: u8 = 0x22;
@@ -2616,6 +2621,20 @@ impl<'a> Fx<'a> {
             Term::Invoke(normal, unwind) => {
                 self.sh.uses_tag = true;
                 let i = self.f.blocks[b as usize].insts.len() - 1;
+                if !self.o.exnref {
+                    // try { call } catch_all { sp back; unwind path } ; normal path
+                    self.open(TRY, Ctx::Plain);
+                    self.stmt(b, i)?;
+                    self.op(CATCH_ALL);
+                    if self.fp != NONE {
+                        self.lget(self.fp);
+                        self.out.extend_from_slice(&[GSET, 0]);
+                    }
+                    self.do_branch(b, *unwind)?;
+                    self.ctx.pop();
+                    self.op(END);
+                    return self.do_branch(b, *normal);
+                }
                 self.open(BLOCK, Ctx::Plain);
                 self.op(TRY_TABLE);
                 self.op(0x40);
@@ -3175,7 +3194,11 @@ fn helper_body(o: &Options, h: Helper, sh: &mut Shared, fn_ix: &HashMap<u32, u32
                     let fty = sh.ty(FnType { params: vec![I64], results: vec![] });
                     locals.push((1, if o.memory64 { I64 } else { I32 }));
                     c.extend_from_slice(&[GGET, 0, LSET, 2]);
-                    c.extend_from_slice(&[BLOCK, 0x40, TRY_TABLE, 0x40, 1, 2, 0]);
+                    if o.exnref {
+                        c.extend_from_slice(&[BLOCK, 0x40, TRY_TABLE, 0x40, 1, 2, 0]);
+                    } else {
+                        c.extend_from_slice(&[TRY, 0x40]);
+                    }
                     g(&mut c, 1);
                     aw(&mut c, 0);
                     c.push(CALL_INDIRECT);
@@ -3184,7 +3207,11 @@ fn helper_body(o: &Options, h: Helper, sh: &mut Shared, fn_ix: &HashMap<u32, u32
                     c.push(I64C);
                     c.push(0);
                     c.push(RETURN);
-                    c.push(END);
+                    if o.exnref {
+                        c.push(END);
+                    } else {
+                        c.push(CATCH_ALL);
+                    }
                     c.push(END);
                     c.extend_from_slice(&[LGET, 2, GSET, 0]);
                     c.push(I64C);
