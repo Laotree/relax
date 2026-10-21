@@ -2911,20 +2911,29 @@ impl Unit {
         Some(s)
     }
 
-    /// On a target whose libm has a combined `sincos` routine (Darwin arm64), registers it with the
-    /// optimiser once the program names both `sinf` and `cosf` (or `sin` and `cos`): rustc's LLVM
-    /// calls it for a sin and a cos of the same value in one block (passes::fuse_sincos).
+    /// On a target whose libm has a combined `sincos` routine, registers it with the optimiser once
+    /// the program names both `sinf` and `cosf` (or `sin` and `cos`): rustc's LLVM calls it for a
+    /// sin and a cos of the same value in one block (passes::fuse_sincos). Darwin arm64:
+    /// `__sincos_stret` / `__sincosf_stret` (two floats in d0/s0, d1/s1). x86-64 glibc: `sincos` /
+    /// `sincosf` (results through pointers), called through `sincos_pair` / `sincosf_pair`, which
+    /// return the two results in xmm0 and xmm1 as the combined call expects.
     fn note_sincos(&self, name: &str) {
-        if !cfg!(all(target_vendor = "apple", target_arch = "aarch64")) {
+        if !SINCOS_TARGET {
             return;
         }
         let (sin, cos, both, wide) = match name {
-            "sinf" | "cosf" => ("sinf", "cosf", "__sincosf_stret", false),
-            "sin" | "cos" => ("sin", "cos", "__sincos_stret", true),
+            "sinf" | "cosf" => ("sinf", "cosf", if cfg!(target_vendor = "apple") { "__sincosf_stret" } else { "relax_sincosf_pair" }, false),
+            "sin" | "cos" => ("sin", "cos", if cfg!(target_vendor = "apple") { "__sincos_stret" } else { "relax_sincos_pair" }, true),
             _ => return,
         };
         let (Some(sn), Some(cs)) = (self.syms.find_foreign(sin), self.syms.find_foreign(cos)) else { return };
-        let p = unsafe { os::proc::find(format!("{}\0", both).as_ptr()) };
+        let p = if cfg!(target_vendor = "apple") {
+            unsafe { os::proc::find(format!("{}\0", both).as_ptr()) }
+        } else if wide {
+            sincos_pair as *mut u8
+        } else {
+            sincosf_pair as *mut u8
+        };
         if p.is_null() {
             return;
         }
@@ -2935,7 +2944,7 @@ impl Unit {
     /// optimised from its first compile, because only the optimiser pairs the calls like rustc's
     /// LLVM, and a baseline version would compute other bits than the optimised one.
     fn pairs_sincos(&self, func: &relax_backend::rir::Func) -> bool {
-        if !cfg!(all(target_vendor = "apple", target_arch = "aarch64")) {
+        if !SINCOS_TARGET {
             return false;
         }
         let (mut sin, mut cos) = (false, false);
@@ -9161,6 +9170,41 @@ fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(re
 }
 
 /// Finds `#[test]` functions of a crate.
+/// Targets whose rustc build combines a sin and a cos of one value into one libm call
+/// (`note_sincos`): Darwin arm64 and x86-64 glibc.
+const SINCOS_TARGET: bool = cfg!(any(all(target_vendor = "apple", target_arch = "aarch64"), all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")));
+
+/// glibc's `sincos` with both results returned in registers: a struct of two doubles comes back
+/// in xmm0 and xmm1 (SysV), where the optimiser's combined call reads them.
+#[repr(C)]
+struct SinCos(f64, f64);
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+extern "C" {
+    fn sincos(x: f64, s: *mut f64, c: *mut f64);
+    fn sincosf(x: f32, s: *mut f32, c: *mut f32);
+}
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+extern "C" fn sincos_pair(x: f64) -> SinCos {
+    let (mut s, mut c) = (0.0, 0.0);
+    unsafe { sincos(x, &mut s, &mut c) };
+    SinCos(s, c)
+}
+/// `sincosf`: each f32 result in the low 32 bits of its register (the bits an f32 value reads)
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+extern "C" fn sincosf_pair(x: f32) -> SinCos {
+    let (mut s, mut c) = (0.0f32, 0.0f32);
+    unsafe { sincosf(x, &mut s, &mut c) };
+    SinCos(f64::from_bits(s.to_bits() as u64), f64::from_bits(c.to_bits() as u64))
+}
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+extern "C" fn sincos_pair(_: f64) -> SinCos {
+    unreachable!()
+}
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+extern "C" fn sincosf_pair(_: f32) -> SinCos {
+    unreachable!()
+}
+
 pub fn find_tests(prog: &Program, krate: u32) -> Vec<DefId> {
     let mut out = Vec::new();
     for (i, d) in prog.defs.iter().enumerate() {
@@ -9371,6 +9415,12 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         relax_backend::passes::addr_modes(func);
         // results computed early for one later use move next to it (O3)
         relax_codegen::opt::sink_single_uses(func);
+        // masks and casts whose results are read only within the kept bits: copies, read
+        // through within their blocks (the allocator joins a copy only with a value in no unit)
+        if relax_codegen::opt::drop_undemanded_masks(options, func) {
+            relax_backend::passes::local_copy_prop(func);
+            relax_backend::passes::dce(func);
+        }
         // reads of a temporary a variable was copied from read the variable: one register
         relax_codegen::opt::reuse_copied_variables(options, func);
     }
