@@ -667,6 +667,10 @@ struct Gen<'a> {
     low_only: Vec<bool>,
     /// passes::zero_above: values whose register is zero above that many bits
     zero_above: Vec<u8>,
+    /// switch::switch_in_range: per block, its Switch needs no range test
+    switch_in_range: Vec<bool>,
+    /// regalloc::copy_reuse: (use position, spilled vreg) -> the register of a copy holding it
+    copy_reg: std::collections::HashMap<(u32, u32), u8>,
     /// table words to fill once blocks are placed: (word index, table start, target block)
     jt_fix: Vec<(usize, usize, u32)>,
     a: Asm,
@@ -737,6 +741,9 @@ impl<'a> Gen<'a> {
                     if let Some(&(_, _, r)) = ws.iter().find(|(a, z, _)| *a <= p && p <= *z) {
                         return r;
                     }
+                }
+                if let Some(&r) = self.copy_reg.get(&(self.cur_pos, v.0)) {
+                    return r;
                 }
                 let off = self.spill_sp(o);
                 // stored from a register by the very last instruction emitted (same block)
@@ -3113,8 +3120,11 @@ impl<'a> Gen<'a> {
                     self.a.rrr(0xCB00_0000, IP0, r, IP0); // sub x16, r, x16
                     IP0
                 };
-                self.cmp_imm(idx, tab.targets.len() as i64 - 1);
-                self.cond_branch(CondBr::B(HI), tab.default);
+                // unless every way in bounds it (switch_in_range)
+                if !self.switch_in_range.get(bi).copied().unwrap_or(false) {
+                    self.cmp_imm(idx, tab.targets.len() as i64 - 1);
+                    self.cond_branch(CondBr::B(HI), tab.default);
+                }
                 self.a.e(0x1000_0000 | (4 << 5) | IP1 as u32); // adr x17, .+16
                 self.a.e(0xB8A0_7800 | (idx as u32) << 16 | (IP1 as u32) << 5 | IP0 as u32); // ldrsw x16, [x17, idx, lsl #2]
                 self.a.rrr(0x8B00_0000, IP1, IP1, IP0); // add x17, x17, x16
@@ -3180,7 +3190,8 @@ impl<'a> Gen<'a> {
             // pieces of one split value sharing a slot
             Inst::Mov(d, s) if matches!(self.al.loc[d.0 as usize], Loc::Stack(_)) && self.al.loc[d.0 as usize] == self.al.loc[s.0 as usize] => {}
             Inst::Mov(d, s) => {
-                if self.cls(*d) == Cls::I && matches!((self.al.loc[d.0 as usize], self.al.loc[s.0 as usize]), (Loc::Stack(_), Loc::Reg(_)) | (Loc::Reg(_), Loc::Stack(_))) {
+                // (a spilled source a window holds here is read from the window's register: use_i)
+                if self.cls(*d) == Cls::I && self.win_reg(*s).is_none() && !self.copy_reg.contains_key(&(self.cur_pos, s.0)) && matches!((self.al.loc[d.0 as usize], self.al.loc[s.0 as usize]), (Loc::Stack(_), Loc::Reg(_)) | (Loc::Reg(_), Loc::Stack(_))) {
                     // straight between a register and a spill slot
                     match (self.al.loc[d.0 as usize], self.al.loc[s.0 as usize]) {
                         (Loc::Stack(o), Loc::Reg(r)) => {
@@ -3703,7 +3714,7 @@ impl<'a> Gen<'a> {
                 let rd = self.def_i(d, S0);
                 // zero above fewer bits than the target: the extension is the value itself
                 let z = self.zero_above[s.0 as usize];
-                if self.low_only[d.0 as usize] || (z > 0 && z < it.bits) {
+                if self.low_only[d.0 as usize] || crate::passes::cast_is_move(z, it) {
                     self.a.mov(rd, rs);
                 } else {
                     self.a.extend(rd, rs, it.bits, it.signed);
@@ -4111,6 +4122,8 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         },
         low_only: crate::passes::low_bits_only(options, f),
         zero_above: Vec::new(),
+        switch_in_range: Vec::new(),
+        copy_reg: std::collections::HashMap::new(),
         win_start: {
             let mut ws: std::collections::HashMap<u32, Vec<(u32, u8)>> = std::collections::HashMap::new();
             for &(v, a, _, r) in &al.windows {
@@ -4148,6 +4161,12 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         tbz: tbz && !long,
     };
     g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
+    if env.opt_regs || g.f.full {
+        g.copy_reg = regalloc::copy_reuse(options, g.f, &g.al);
+    }
+    if !crate::stats::opt_off(options, "-swrange") {
+        g.switch_in_range = crate::switch::switch_in_range(g.f);
+    }
     BRANCH_RANGE.with(|c| c.set(false));
     TBZ_RANGE.with(|c| c.set(false));
     g.gen(options);
