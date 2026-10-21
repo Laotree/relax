@@ -10194,6 +10194,7 @@ fn sampler_thread() {
 /// holding the lock from here on (never released: the process is ending) stops them.
 impl Drop for Unit {
     fn drop(&mut self) {
+        crate::speculate::dump(&|id| if (id as usize) < self.fns.len() { self.fns[id as usize].name.to_string() } else { String::new() });
         crate::domain::forget_tls_keys(self.syms.dom0());
         let options = &self.prog.session.clone().options;
         if !self.retired {
@@ -10584,6 +10585,10 @@ fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
 /// A speculation site of slot `id` changed state (crate::speculate): rebuild its O3 code. Called
 /// from program threads (no unit lock), as rt_hot queues.
 pub(crate) fn spec_relink(id: u32) {
+    // one rebuild decides every ready site of the slot: no second entry while one waits
+    if TIER_QUEUE.lock().unwrap().iter().any(|e| e.0 == id && e.1 == Q_RETIER) {
+        return;
+    }
     tier_push(id, Q_RETIER, 0);
 }
 
@@ -11809,6 +11814,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             None => optimize(),
         }?;
         func = optimized;
+        if let Some(ctx) = &spec_ctx {
+            crate::speculate::probe(ctx, &mut func);
+        }
         let mut inlined = Vec::with_capacity(inline_rules.len());
         for (c, _) in inline_rules { inlined.push(c); }
         let nounwind_used = func.nounwind_inputs.clone();

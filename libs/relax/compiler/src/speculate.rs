@@ -51,6 +51,7 @@ const MAX_RESPECS: u8 = 2;
 const OFF_T0: i32 = 0;
 const OFF_N0: i32 = 8;
 const OFF_FAILS: i32 = 40;
+const OFF_DONE: i32 = 56;
 
 #[repr(C)]
 pub struct SiteRec {
@@ -64,6 +65,9 @@ pub struct SiteRec {
     fails: AtomicU64,
     /// the guessed target (a slot's callable address) while GUARD / STABLE
     guess: AtomicU64,
+    /// nonzero once the profile is ready: PROFILE code stops calling rt_spec_probe (a polymorphic
+    /// site waiting in a long O3 queue would otherwise pay a host call per call)
+    done: AtomicU64,
     slot: u32,
     pos: u64,
     state: AtomicU8,
@@ -77,7 +81,7 @@ impl SiteRec {
         self.n0.load(Ordering::Relaxed) + self.n1.load(Ordering::Relaxed) + self.other.load(Ordering::Relaxed)
     }
     fn reset_profile(&self) {
-        for a in [&self.t0, &self.n0, &self.t1, &self.n1, &self.other, &self.fails] {
+        for a in [&self.t0, &self.n0, &self.t1, &self.n1, &self.other, &self.fails, &self.done] {
             a.store(0, Ordering::Relaxed);
         }
     }
@@ -117,10 +121,19 @@ fn site(slot: u32, pos: u64) -> &'static SiteRec {
         }
         let r: &'static SiteRec = Box::leak(Box::new(SiteRec {
             t0: AtomicU64::new(0), n0: AtomicU64::new(0), t1: AtomicU64::new(0), n1: AtomicU64::new(0),
-            other: AtomicU64::new(0), fails: AtomicU64::new(0), guess: AtomicU64::new(0),
+            other: AtomicU64::new(0), fails: AtomicU64::new(0), guess: AtomicU64::new(0), done: AtomicU64::new(0),
             slot, pos, state: AtomicU8::new(PROFILE), respecs: AtomicU8::new(0), queued: AtomicBool::new(false),
         }));
         v.push(r);
+        if trace() {
+            static WATCH: std::sync::Once = std::sync::Once::new();
+            WATCH.call_once(|| {
+                let _ = std::thread::Builder::new().name("run-spec-trace".to_string()).spawn(|| loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    dump(&|id| format!("#{}", id));
+                });
+            });
+        }
         r
     })
 }
@@ -136,6 +149,7 @@ fn note(r: &SiteRec, what: &str) {
 
 /// Queues the site's caller for an O3 rebuild, once per state.
 fn relink(r: &SiteRec, why: &str) {
+    r.done.store(1, Ordering::Relaxed);
     if !r.queued.swap(true, Ordering::AcqRel) {
         note(r, why);
         crate::jit::spec_relink(r.slot);
@@ -179,6 +193,29 @@ fn rt_spec_fail(rec: u64) {
         relink(r, "guard failing: profile again");
     }
 }
+}
+
+/// MAKEPAD_RUN_SPEC_TRACE: every site's final state at the end of the run (Unit drop).
+pub fn dump(name: &dyn Fn(u32) -> String) {
+    if !trace() {
+        return;
+    }
+    let g = SITES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = g.as_ref() else { return };
+    let mut by = [0usize; 4];
+    let mut stuck = 0usize;
+    for (slot, v) in m {
+        for r in v {
+            let st = r.state.load(Ordering::Relaxed);
+            by[st as usize] += 1;
+            if st == PROFILE && r.queued.load(Ordering::Relaxed) {
+                stuck += 1;
+                eprintln!("spec: end: slot {} {} pos {:#x}: profile ready, never rebuilt (calls {})", slot, name(*slot), r.pos, r.total());
+            }
+        }
+    }
+    eprintln!("spec: end: sites profile {} guard {} stable {} off {}; ready but not rebuilt {}", by[0], by[1], by[2], by[3], stuck);
+    let _ = std::io::Write::flush(&mut std::io::stderr());
 }
 
 /// The runtime entries generated code calls (interned by the snapshot, under the unit lock).
@@ -270,7 +307,8 @@ pub fn with_ctx<R>(ctx: &Ctx, f: impl FnOnce() -> R) -> R {
 }
 
 /// The root build's hook (tier1_simplify, after the first inlining round, before the pipeline):
-/// every Rust-ABI indirect call gets its site's probe or guard.
+/// indirect calls at GUARD / STABLE sites get their guard, so the second round can inline the
+/// guessed callee and the pipeline optimises across it.
 pub fn apply(func: &mut Func, id: u32) {
     let p = CTX.with(|c| c.get());
     if p.is_null() {
@@ -280,6 +318,17 @@ pub fn apply(func: &mut Func, id: u32) {
     if ctx.root != id {
         return;
     }
+    edit(ctx, func, false);
+}
+
+/// After the O3 pipeline (compile_tier1, before code generation): indirect calls at PROFILE sites
+/// get their probe. Late, so the probe's counter stores never constrain the optimiser.
+pub fn probe(ctx: &Ctx, func: &mut Func) {
+    edit(ctx, func, true);
+}
+
+fn edit(ctx: &Ctx, func: &mut Func, probes: bool) {
+    let id = ctx.root;
     let mut sites: Vec<(usize, usize)> = Vec::new();
     for (bi, b) in func.blocks.iter().enumerate() {
         if matches!(b.term, Term::Unreachable | Term::Resume) {
@@ -293,26 +342,30 @@ pub fn apply(func: &mut Func, id: u32) {
     }
     // later sites of a block first: a split moves only what follows the call
     sites.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-    let mut changed = false;
+    let mut changed = 0usize;
+    let n_sites = sites.len();
     for (bi, ii) in sites {
         let pos = func.blocks[bi].pos[ii];
         let r = site(id, pos);
         match r.state.load(Ordering::Acquire) {
-            PROFILE => {
+            PROFILE if probes => {
                 probe_site(func, bi, ii, r, ctx.syms);
-                changed = true;
+                changed += 1;
             }
-            st @ (GUARD | STABLE) => {
+            st @ (GUARD | STABLE) if !probes => {
                 let g = r.guess.load(Ordering::Relaxed);
                 if let Some(&(_, slot)) = ctx.slots.iter().find(|x| x.0 == g) {
                     guard_site(func, bi, ii, r, slot, st == GUARD, ctx.syms);
-                    changed = true;
+                    changed += 1;
                 }
             }
             _ => {}
         }
     }
-    if changed {
+    if trace() && n_sites > 0 {
+        eprintln!("spec: build of slot {}: {} indirect sites, {} {}", id, n_sites, changed, if probes { "probed" } else { "guarded" });
+    }
+    if changed > 0 {
         ctx.emitted.set(true);
         relax_backend::passes::renumber_rpo(func);
     }
@@ -385,9 +438,16 @@ fn probe_site(f: &mut Func, bi: usize, ii: usize, r: &SiteRec, s: Syms) {
     let a2 = rec_addr(f, rdy, r, pos);
     host_call(f, rdy, s.ready, vec![a2], pos);
     f.blocks[rdy as usize].term = Term::Jump(call);
+    // miss: rt_spec_probe until the profile is ready
     let a3 = rec_addr(f, miss, r, pos);
-    host_call(f, miss, s.probe, vec![a3, v], pos);
-    f.blocks[miss as usize].term = Term::Jump(call);
+    let dn = f.vreg(Cls::I);
+    push(f, miss, Inst::Load(Mem::Int(8, false), dn, a3, OFF_DONE), pos);
+    let rec_miss = f.block();
+    f.blocks[miss as usize].term = Term::Branch(dn, call, rec_miss);
+    let a4 = rec_addr(f, rec_miss, r, pos);
+    host_call(f, rec_miss, s.probe, vec![a4, v], pos);
+    f.blocks[rec_miss as usize].term = Term::Jump(call);
+    f.blocks[rec_miss as usize].term_pos = pos;
     for x in [hit, rdy, miss] {
         f.blocks[x as usize].term_pos = pos;
     }
@@ -507,6 +567,14 @@ mod tests {
             }
         }
         (ind, direct, host)
+    }
+
+    #[test]
+    fn record_offsets() {
+        assert_eq!(std::mem::offset_of!(SiteRec, t0), OFF_T0 as usize);
+        assert_eq!(std::mem::offset_of!(SiteRec, n0), OFF_N0 as usize);
+        assert_eq!(std::mem::offset_of!(SiteRec, fails), OFF_FAILS as usize);
+        assert_eq!(std::mem::offset_of!(SiteRec, done), OFF_DONE as usize);
     }
 
     #[test]
