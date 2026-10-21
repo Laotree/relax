@@ -694,6 +694,7 @@ impl<'a> Parser<'a> {
             b"format" | b"print" | b"println" | b"eprint" | b"eprintln" | b"write" | b"writeln" | b"panic" | b"format_args"
                 | b"vec" | b"assert" | b"assert_eq" | b"assert_ne" | b"debug_assert" | b"debug_assert_eq" | b"debug_assert_ne"
                 | b"matches" | b"assert_matches" | b"debug_assert_matches" | b"unreachable" | b"todo" | b"unimplemented" | b"dbg" | b"asm"
+                | b"global_asm" | b"naked_asm"
         );
         if !known {
             return NO_MAC_ARGS;
@@ -703,7 +704,7 @@ impl<'a> Parser<'a> {
         let is_vec = name == b"vec";
         let save = self.pos;
         self.pos = toks.lo as usize;
-        let r = if name == b"asm" { self.asm_args(toks.hi as usize) } else { self.mac_args_inner(is_matches, has_msg, is_vec, toks.hi as usize) };
+        let r = if matches!(name.as_slice(), b"asm" | b"global_asm" | b"naked_asm") { self.asm_args(toks.hi as usize) } else { self.mac_args_inner(is_matches, has_msg, is_vec, toks.hi as usize) };
         self.pos = save;
         match r {
             Ok(a) => {
@@ -760,7 +761,8 @@ impl<'a> Parser<'a> {
         let mut spec = AsmArgs { templates: 0, ops: List::EMPTY, options: 0 };
         let mut exprs = Vec::new();
         let mut ops = Vec::new();
-        while self.pos < hi && matches!(self.kind(), T::Str | T::RawStr) {
+        // template strings: literals, or a macro call that makes one (`concat!(..)`)
+        while self.pos < hi && (matches!(self.kind(), T::Str | T::RawStr) || (self.kind() == T::Ident && self.nth(1) == T::Not && !self.is_word(0, b"sym"))) {
             exprs.push(self.expr()?);
             spec.templates += 1;
             if !self.eat(T::Comma) {
