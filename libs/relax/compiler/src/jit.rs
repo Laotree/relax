@@ -517,6 +517,8 @@ pub struct Stats {
     pub tier1_drop_why: std::collections::BTreeMap<&'static str, u32>,
     pub tier1_locked_ns: u64,
     pub tier1_free_ns: u64,
+    /// O3 machine code bytes installed
+    pub tier1_code_bytes: u64,
     /// constant initializers evaluated to data / compiled and run; cpu of the evaluations
     pub ctfe_data: u32,
     pub ctfe_code: u32,
@@ -9268,7 +9270,10 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     // own inlining included; a site takes that body when its optimised form passes the rules and
     // fits, else the snapshot body (top-down, as before). A pure function of the snapshot, so
     // replay stays exact. MAKEPAD_RUN_OPT=-bottomup: top-down only (bisection).
+    let tp = cpu_ns();
     let bodies = InlineBodies::prepare(options, id, candidates, get, single, ro, cfg, nounwind);
+    TIER1_PREP[0].fetch_add(cpu_ns() - tp, Ordering::Relaxed);
+    TIER1_PREP[2].fetch_add(bodies.bodies.len() as u64, Ordering::Relaxed);
     let prepared = |c: u32| bodies.prepared(c);
     let mut inlined = tier1_simplify(options, func, id, name, get, &prepared, single, ro, cfg, nounwind, frequencies, inline_stats.as_mut(), None);
     bodies.expand(&mut inlined);
@@ -9458,6 +9463,7 @@ impl InlineBodies {
                 let mut raw = (relax_backend::rir::Func::new(String::new(), 0), Vec::new());
                 let mut stats = std::env::var("MAKEPAD_RUN_INLINE_STATS").is_ok_and(|v| v == "prep").then(relax_codegen::opt::InlineStats::default);
                 tier1_simplify(options, &mut f, ids[k], &o1.name, get, &sub_prepared, single, ro, cfg, nounwind, &mut structural, stats.as_mut(), Some(&mut raw));
+                TIER1_PREP[1].fetch_add(1, Ordering::Relaxed);
                 if let Some(st) = stats { st.report(&format!("prep:{} (root {})", o1.name, root)); }
                 let (raw, mut taken) = raw;
                 if taken.is_empty() {
@@ -11676,15 +11682,16 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             crate::clock::ms_since_start(), if sampled_positions.is_some() { "sampled" } else { "structural" },
             u.frequency_profiles.get(&id).map_or(0, |h| h.samples), name);
     }
-    let t1 = cpu_ns();
-    Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, sampled_positions, t1))
+    Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, sampled_positions))
     });
-    let Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, sampled_positions, t1)) = snapped else {
+    let Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, sampled_positions)) = snapped else {
         if gave_way.get() {
             tier_push(id, Q_RETIER, 0);
         }
         return false;
     };
+    // (this thread's clock: the snapshot ran on the owner thread)
+    let t1 = cpu_ns();
     if let Some(m) = measure.as_mut() { m.phase(1, t1); }
     trace_tier1_phase(id, "backend");
     // optimise and generate code without the lock
@@ -11859,7 +11866,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         trace_tier1_phase(id, "install");
         let _cost_install = relax_codegen::fncost::phase(6);
         let u = &mut *up;
-        u.stats.tier1_locked_ns += (t1 - t0) + (cpu_ns() - t2);
+        u.stats.tier1_locked_ns += t1 - t0;
         u.stats.tier1_free_ns += t2 - t1;
         let ok = match built {
             Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, frame_size, self_call, nounwind_used, profile_entry)))) if PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && !crate::inspect::instrument::active(id) && {
@@ -11986,6 +11993,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     }
                 }
                 u.stats.code_bytes += code.len() as u64;
+                u.stats.tier1_code_bytes += code.len() as u64;
                 u.stats.tier1_installed += 1;
                 TIER1_INSTALLS.fetch_add(1, Ordering::Relaxed);
                 crate::boot_stats::o3_installed(boot_arm(u, id), id);
@@ -12958,6 +12966,8 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
 /// O3 had to build a slot's RIR again (code linked from the disk cache has none):
 /// (count, wall ns)
 pub static TIER1_RIR_REBUILT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// O3 bottom-up preparation (InlineBodies::prepare): thread cpu ns, bodies simplified, bodies kept
+pub static TIER1_PREP: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Speculative results waiting for their first call: (slot, wall ns when built). A result
 /// nobody called within MAKEPAD_RUN_SPEC_TTL_MS (default 2000; 0 = keep forever) is dropped with its
