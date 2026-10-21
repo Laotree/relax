@@ -9419,6 +9419,9 @@ fn t1_quick_ra(options: &crate::options::Options) -> bool {
     options.t1_quick_ra
 }
 
+/// How many calls deep the O3 nocapture oracle follows a parameter (memoised per callee and parameter).
+const NOCAP_DEPTH: u32 = 8;
+
 fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, candidates: &[u32], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>) -> Vec<(u32, usize)> {
     let _cost_opt = relax_codegen::fncost::phase(4);
     relax_codegen::fncost::size(true, func);
@@ -9436,7 +9439,9 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         // SAFETY: the oracle borrows `get` only while this function runs: the guard removes it
         // before `get` goes out of scope, also when the optimiser panics
         let get_static: &'static dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)> = unsafe { std::mem::transmute(get) };
-        // callees' params, depth-limited (a Vec's push -> reserve -> grow -> realloc chain);
+        // callees' params, depth-limited (a Vec's push -> grow_one -> grow_amortized -> finish_grow ->
+        // allocator chain is 5 calls deep: at 4, `self.members.push(c)` captured `self` and kept every
+        // `self.spectra` load in decode_spectra's loops);
         // false while a query is in progress (recursion), memoised per (callee, param)
         fn nocap(get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, memo: &std::cell::RefCell<HashMap<(u32, usize), Option<bool>>>, cid: u32, k: usize, depth: u32) -> bool {
             if let Some(r) = memo.borrow().get(&(cid, k)) {
@@ -9461,7 +9466,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         let memo: std::cell::RefCell<HashMap<(u32, usize), Option<bool>>> = std::cell::RefCell::new(HashMap::new());
         relax_backend::passes::set_sroa_nocapture(Some(Box::new(move |c: &relax_backend::rir::Callee, k: usize| -> bool {
             let relax_backend::rir::Callee::Fn(cid) = c else { return false };
-            nocap(get_static, &memo, *cid, k, 4)
+            nocap(get_static, &memo, *cid, k, NOCAP_DEPTH)
         })));
     }
     static INLINE_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
