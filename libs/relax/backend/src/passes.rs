@@ -1472,6 +1472,56 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                             _ => new,
                         };
                     }
+                    // a compare of a two-level select tree of constants (an Ordering made branch-free:
+                    // `c1 ? -1 : (c2 ? 0 : 1)`, maybe narrowed to i8), against a constant: the tree of
+                    // the compare's outcomes (0 / 1 constants); the select folds below merge it into
+                    // one compare (`ord == Greater` -> `!(a <= b)`)
+                    if let (Inst::ICmpI(cc, sg, d, x, k), false) = (&new, opt_off(options, "-selfold")) {
+                        let (cc, sg, d, x, k) = (*cc, *sg, *d, *x, *k);
+                        let (root, narrow) = match conv_def.get(x.0 as usize).copied().flatten() {
+                            Some((t, y, _, _)) if t.bits < 64 && single(x, &ndef) => (y, Some(t)),
+                            _ => (x, None),
+                        };
+                        let leaf = |v: VReg| match kn[v.0 as usize] {
+                            Some(K::I(kv)) => Some(cmp_i(cc, sg, narrow.map_or(kv, |t| crate::bitops::ext(kv, t)), k) as i64),
+                            _ => None,
+                        };
+                        if let Some((c1, a1, b1)) = sel_def[root.0 as usize].filter(|_| single(root, &ndef)) {
+                            // one arm a constant, the other a select of two constants
+                            let nested = |v: VReg| sel_def[v.0 as usize].filter(|_| single(v, &ndef)).and_then(|(c2, a2, b2)| Some((c2, leaf(a2)?, leaf(b2)?)));
+                            let plan = match (leaf(a1), leaf(b1)) {
+                                (Some(ka), None) => nested(b1).map(|n| (Some(ka), None, None, Some(n))),
+                                (None, Some(kb)) => nested(a1).map(|n| (None, Some(kb), Some(n), None)),
+                                _ => None,
+                            };
+                            if let Some((ka, kb, na, nb)) = plan {
+                                let pos = f.blocks[bi].pos[ii];
+                                let mut insts = Vec::new();
+                                let konst = |f: &mut Func, insts: &mut Vec<Inst>, kv: i64| {
+                                    let t = f.vreg(Cls::I);
+                                    insts.push(Inst::Iconst(t, kv));
+                                    t
+                                };
+                                let side = |f: &mut Func, insts: &mut Vec<Inst>, kc: Option<i64>, n: Option<(VReg, i64, i64)>| -> VReg {
+                                    match (kc, n) {
+                                        (Some(kv), _) => konst(f, insts, kv),
+                                        (None, Some((c2, x2, y2))) => {
+                                            let (tx, ty, t) = (konst(f, insts, x2), konst(f, insts, y2), f.vreg(Cls::I));
+                                            insts.push(Inst::Sel(t, c2, tx, ty));
+                                            t
+                                        }
+                                        _ => unreachable!(),
+                                    }
+                                };
+                                let ta = side(f, &mut insts, ka, na);
+                                let tb = side(f, &mut insts, kb, nb);
+                                let top = f.vreg(Cls::I);
+                                insts.push(Inst::Sel(top, c1, ta, tb));
+                                edits.push(FoldEdit { block: bi, at: ii, remove: 0, insts, pos });
+                                new = Inst::Mov(d, top);
+                            }
+                        }
+                    }
                     // a select on `c ? k1 : k2` (constants, one of them 0): a select on c, the
                     // arms swapped when k1 is the 0
                     if let (Inst::Sel(d, x, p, q), false) = (&new, opt_off(options, "-selfold")) {
@@ -3325,6 +3375,15 @@ pub fn combine_loads(f: &mut Func, ndef: &[u32]) -> bool {
 /// `x = c ? a : b` (Sel: cmov / csel) and a jump to the join -- no branch to mispredict
 /// (rustc / LLVM SimplifyCFG speculates such arms into selects). The arms must have the
 /// branch as their only predecessor, copy into distinct registers and read none of them.
+/// Where an if-converted arm's result comes from: a register, a constant, or a speculated compare /
+/// select (computed into a fresh temporary before the select).
+#[derive(Clone)]
+enum ArmSrc {
+    V(VReg),
+    K(i64),
+    I(Inst),
+}
+
 pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
     const MAX_MOVS: usize = 3;
     // cheap pure instructions an arm may compute into its own temporaries (speculated: they run on
@@ -3359,21 +3418,13 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
             nuse[u.0 as usize] += 1;
         }
     }
-    let speculatable = |i: &Inst| {
-        matches!(
-            i,
-            Inst::ICmp(..)
-                | Inst::ICmpI(..)
-                | Inst::Sel(..)
-                | Inst::Conv(Conv::IntToInt(_), ..)
-                | Inst::IBin(IOp::Add | IOp::Sub | IOp::And | IOp::Or | IOp::Xor | IOp::Mul, ..)
-                | Inst::IBinI(IOp::Add | IOp::Sub | IOp::And | IOp::Or | IOp::Xor | IOp::Mul | IOp::Shl | IOp::Shr, ..)
-        )
-    };
+    // compares and selects only: the arms of a value choice (an Ordering), not general arithmetic
+    // (speculating sums cost iterator loops more instructions than their branches: iter_chain +27%)
+    let speculatable = |i: &Inst| matches!(i, Inst::ICmp(..) | Inst::ICmpI(..) | Inst::Sel(..));
     // an arm: (speculated temporaries, copies (dest, source or constant), join) when block x is
     // cheap temporaries (single-def, read only in x) then copies / constants into its results and a
     // jump, entered only from the branch
-    let arm = |f: &Func, npred: &[u32], x: u32| -> Option<(Vec<Inst>, Vec<(VReg, Result<VReg, i64>)>, u32)> {
+    let arm = |f: &Func, npred: &[u32], x: u32| -> Option<(Vec<Inst>, Vec<(VReg, ArmSrc)>, u32)> {
         let b = &f.blocks[x as usize];
         if npred[x as usize] != 1 || b.insts.len() > MAX_MOVS + MAX_SPEC {
             return None;
@@ -3401,12 +3452,15 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
             match i {
                 _ if temp && speculatable(i) && mv.is_empty() => spec.push(i.clone()),
                 Inst::Iconst(..) if temp && mv.is_empty() => spec.push(i.clone()),
-                Inst::Mov(d, s) if d != s && matches!(f.vregs[d.0 as usize], Cls::I | Cls::F32 | Cls::F64) => mv.push((*d, Ok(*s))),
-                Inst::Iconst(d, k) if f.vregs[d.0 as usize] == Cls::I => mv.push((*d, Err(*k))),
+                Inst::Mov(d, s) if d != s && matches!(f.vregs[d.0 as usize], Cls::I | Cls::F32 | Cls::F64) => mv.push((*d, ArmSrc::V(*s))),
+                Inst::Iconst(d, k) if f.vregs[d.0 as usize] == Cls::I => mv.push((*d, ArmSrc::K(*k))),
+                // a result computed by a select / compare (the phi machinery's boolean shadow):
+                // speculated into a fresh temporary, then copied (Spec)
+                Inst::Sel(d, ..) | Inst::ICmp(_, _, d, _, _) | Inst::ICmpI(_, _, d, _, _) if defs.len() == 1 && f.vregs[d.0 as usize] == Cls::I && { let mut clean = true; for_uses(i, |u| clean &= !mv.iter().any(|(md, _)| *md == u)); clean } => mv.push((*d, ArmSrc::I(i.clone()))),
                 _ => return None,
             }
         }
-        if spec.len() > MAX_SPEC || mv.len() > MAX_MOVS || (!spec_on && (!spec.is_empty() || mv.iter().any(|(_, s)| s.is_err()))) {
+        if spec.len() > MAX_SPEC || mv.len() > MAX_MOVS || (!spec_on && (!spec.is_empty() || mv.iter().any(|(_, s)| !matches!(s, ArmSrc::V(_))))) {
             return None;
         }
         Some((spec, mv, j))
@@ -3429,11 +3483,11 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
         if mt0.is_empty() && me0.is_empty() {
             continue;
         }
-        let konst = |m: &Vec<(VReg, Result<VReg, i64>)>| m.iter().filter(|(_, s)| s.is_err()).count();
+        let konst = |m: &Vec<(VReg, ArmSrc)>| m.iter().filter(|(_, s)| !matches!(s, ArmSrc::V(_))).count();
         if st.len() + se.len() + konst(&mt0) + konst(&me0) > MAX_SPEC {
             continue;
         }
-        let as_movs = |m: &Vec<(VReg, Result<VReg, i64>)>| -> Vec<(VReg, VReg)> { m.iter().map(|(d, s)| (*d, s.unwrap_or(*d))).collect() };
+        let as_movs = |m: &Vec<(VReg, ArmSrc)>| -> Vec<(VReg, VReg)> { m.iter().map(|(d, s)| (*d, if let ArmSrc::V(v) = s { *v } else { *d })).collect() };
         let (mt, me) = (as_movs(&mt0), as_movs(&me0));
         // destinations, each once per arm; sources and the condition are not among them
         let mut dests: Vec<VReg> = Vec::new();
@@ -3448,7 +3502,7 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
                 }
             }
         }
-        if !ok || dests.contains(&c) || mt0.iter().chain(me0.iter()).any(|(_, s)| matches!(s, Ok(v) if dests.contains(v))) {
+        if !ok || dests.contains(&c) || mt0.iter().chain(me0.iter()).any(|(_, s)| match s { ArmSrc::V(v) => dests.contains(v), ArmSrc::I(i) => { let mut r = false; for_uses(i, |u| r |= dests.contains(&u)); r } ArmSrc::K(_) => false }) {
             continue;
         }
         // a choice the join then branches on stays a branch: the branch can be threaded to
@@ -3495,12 +3549,26 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
         }
         for (src, dst) in [(&mt0, &mut mt), (&me0, &mut me)] {
             for (k, (d, s2)) in src.iter().enumerate() {
-                if let Err(kv) = s2 {
-                    let tmp = f.vreg(f.vregs[d.0 as usize]);
-                    f.blocks[bi].insts.push(Inst::Iconst(tmp, *kv));
-                    f.blocks[bi].pos.push(pos);
-                    dst[k] = (*d, tmp);
-                }
+                let hoisted = match s2 {
+                    ArmSrc::V(_) => continue,
+                    ArmSrc::K(kv) => {
+                        let tmp = f.vreg(f.vregs[d.0 as usize]);
+                        (Inst::Iconst(tmp, *kv), tmp)
+                    }
+                    ArmSrc::I(i) => {
+                        let tmp = f.vreg(f.vregs[d.0 as usize]);
+                        let i2 = match i.clone() {
+                            Inst::Sel(_, c2, a2, b2) => Inst::Sel(tmp, c2, a2, b2),
+                            Inst::ICmp(cc, sg, _, a2, b2) => Inst::ICmp(cc, sg, tmp, a2, b2),
+                            Inst::ICmpI(cc, sg, _, a2, k2) => Inst::ICmpI(cc, sg, tmp, a2, k2),
+                            other => other,
+                        };
+                        (i2, tmp)
+                    }
+                };
+                f.blocks[bi].insts.push(hoisted.0);
+                f.blocks[bi].pos.push(pos);
+                dst[k] = (*d, hoisted.1);
             }
         }
         for d in dests {

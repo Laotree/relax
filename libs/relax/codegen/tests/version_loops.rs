@@ -506,3 +506,40 @@ fn ordering_diamond_becomes_selects() {
     assert!(live <= 2, "left: {:?}", f.blocks.iter().map(|b| &b.insts).collect::<Vec<_>>());
     assert_eq!(branches, 0, "branch left:\n{:?}", f.blocks.iter().map(|b| (&b.insts, &b.term)).collect::<Vec<_>>());
 }
+
+/// The same step once the Ordering is already a select tree (`a < b ? -1 : (a == b ? 0 : 1)`,
+/// narrowed to i8, compared with 1): one compare and one select remain.
+#[test]
+fn ordering_select_tree_folds() {
+    let mut f = Func::new("ord2".into(), 0);
+    let p: Vec<VReg> = (0..4).map(|_| f.vreg(Cls::I)).collect();
+    f.params.extend(p.iter().copied());
+    let (a, b, base, mid) = (p[0], p[1], p[2], p[3]);
+    f.block();
+    let v: Vec<VReg> = (0..10).map(|_| f.vreg(Cls::I)).collect();
+    let (m1, z, one, lt, eq, t, o, o8, g, r) = (v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9]);
+    push(&mut f, 0, Inst::Iconst(m1, -1));
+    push(&mut f, 0, Inst::Iconst(z, 0));
+    push(&mut f, 0, Inst::Iconst(one, 1));
+    push(&mut f, 0, Inst::ICmp(Cond::Lt, false, lt, a, b));
+    push(&mut f, 0, Inst::ICmp(Cond::Eq, false, eq, a, b));
+    push(&mut f, 0, Inst::Sel(t, eq, z, one));
+    push(&mut f, 0, Inst::Sel(o, lt, m1, t));
+    push(&mut f, 0, Inst::Conv(Conv::IntToInt(IntTy { bits: 8, signed: true }), o8, o));
+    push(&mut f, 0, Inst::ICmpI(Cond::Eq, true, g, o8, 1));
+    push(&mut f, 0, Inst::Sel(r, g, base, mid));
+    f.rets.push(Cls::I);
+    term(&mut f, 0, Term::Ret(vec![r]));
+    let orig = f.clone();
+    for _ in 0..2 {
+        relax_backend::passes::simplify(&relax_session::Options::default(), &mut f, None, true, true);
+    }
+    for x in [0u64, 1, 5, 9, u64::MAX] {
+        for y in [0u64, 1, 5, 9, u64::MAX] {
+            let args = [x, y, 100, 200];
+            assert_eq!(eval(&orig, &args, &[]), eval(&f, &args, &[]), "a {x} b {y}");
+        }
+    }
+    let live: usize = f.blocks.iter().map(|b| b.insts.len()).sum();
+    assert!(live <= 2, "left: {:?}", f.blocks.iter().map(|b| &b.insts).collect::<Vec<_>>());
+}
