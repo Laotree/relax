@@ -9573,6 +9573,11 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
         relax_backend::passes::renumber_rpo(func);
         relax_backend::stats::pass_time(5, ti);
     }
+    // speculation (the root build only): probes / guards on the indirect calls the first round
+    // left or exposed; the second round inlines the guarded direct calls
+    if inlined_only.is_none() {
+        crate::speculate::apply(func, id);
+    }
     if let Some(raw) = inlined_only {
         *raw = (func.clone(), inlined.clone());
     }
@@ -10576,6 +10581,12 @@ fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
     }
 }
 
+/// A speculation site of slot `id` changed state (crate::speculate): rebuild its O3 code. Called
+/// from program threads (no unit lock), as rt_hot queues.
+pub(crate) fn spec_relink(id: u32) {
+    tier_push(id, Q_RETIER, 0);
+}
+
 fn tier_push(id: u32, why: u8, rate: u64) {
     let mut q = TIER_QUEUE.lock().unwrap();
     q.push((id, why, wall_ns(), rate));
@@ -11426,6 +11437,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     }
     drop(front);
     let gave_way = std::cell::Cell::new(false);
+    let mut spec_ctx: Option<crate::speculate::Ctx> = None;
     let snapped = owner::call(owner::Class::Background, || {
         trace_tier1_phase(id, "snapshot");
         cost_name(up, id);
@@ -11491,6 +11503,18 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     }
                 }
             }
+        }
+        // speculation: sites of this slot that finished profiling are decided now; the guessed
+        // targets join the snapshot (their RIR inlines into the guarded call)
+        if crate::speculate::enabled() && !sandboxed && !(&*up).fns[id as usize].unverified.load(Ordering::Relaxed) {
+            let u = &*up;
+            let slots = crate::speculate::decide(id, &|a| u.thunk_slot(a));
+            for &(_, s) in &slots {
+                if s != id && !callees.contains(&s) {
+                    callees.push(s);
+                }
+            }
+            spec_ctx = Some(crate::speculate::Ctx { root: id, syms: crate::speculate::syms(u), slots, emitted: std::cell::Cell::new(false) });
         }
         // callees the O3 policy wants inlinable get their RIR built, one per lock hold;
         // then their callees (outside cold blocks), 16 levels (a binary search closure sits ~10 deep), built the same way: an inlined
@@ -11777,9 +11801,13 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         };
         let queries = crate::nounwind::QueryCx::new(&snap);
         let candidates: Vec<u32> = snap.iter().map(|x| x.0).collect();
-        let (optimized, inline_rules) = queries.optimize(id, func, &mut |func, nounwind| {
+        let optimize = || queries.optimize(id, func, &mut |func, nounwind| {
             Ok(tier1_optimize(options, func, id, &name, &candidates, &get, &single, ro, &cfg, nounwind, &mut frequencies))
-        })?;
+        });
+        let (optimized, inline_rules) = match &spec_ctx {
+            Some(ctx) => crate::speculate::with_ctx(ctx, optimize),
+            None => optimize(),
+        }?;
         func = optimized;
         let mut inlined = Vec::with_capacity(inline_rules.len());
         for (c, _) in inline_rules { inlined.push(c); }
@@ -11939,7 +11967,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 let frame_max = if recursive { TIER1_CACHE_FRAME_MAX } else { TIER1_CACHE_FRAME_MAX_FLAT };
                 // SPEC-V: unverified O3 code is never the slot's entry (it is built again once verified)
                 let unverified = u.fns[id as usize].unverified.load(Ordering::Relaxed);
-                if frame_size <= frame_max && !unverified {
+                // speculative code holds this run's site records (crate::speculate): never cached
+                let speculative = spec_ctx.as_ref().is_some_and(|c| c.emitted.get());
+                if frame_size <= frame_max && !unverified && !speculative {
                     if let Some(mut c) = u.cache.take() {
                         c.record_o3(u, id, &code, &relocs, &map, &inlined, &nounwind_used);
                         u.cache = Some(c);

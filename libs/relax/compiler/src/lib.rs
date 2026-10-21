@@ -55,6 +55,7 @@ pub mod sandbox;
 pub mod domain;
 mod domain_threads;
 pub mod jit;
+pub mod speculate;
 pub mod web;
 pub mod coverage;
 pub mod owner;
