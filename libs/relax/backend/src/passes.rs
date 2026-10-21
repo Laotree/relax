@@ -1094,6 +1094,24 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
         for p in &f.params {
             zw[p.0 as usize] = 64;
         }
+        // vregs read only by arithmetic and stores (not by copies, compares, selects or
+        // terminators, where a select of constants feeds the Ordering / phi folds): a 0/1 select
+        // of them becomes its condition
+        let mut arith_read = vec![true; nv];
+        {
+            let mut tu = Vec::new();
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if matches!(i, Inst::Mov(..) | Inst::ICmp(..) | Inst::ICmpI(..) | Inst::Sel(..)) {
+                        for_uses(i, |u| arith_read[u.0 as usize] = false);
+                    }
+                }
+                term_uses(&b.term, &mut tu);
+                for u in &tu {
+                    arith_read[u.0 as usize] = false;
+                }
+            }
+        }
         // single-def function addresses (devirtualised calls)
         let mut fn_def: Vec<u32> = vec![u32::MAX; nv];
         for (bi, b) in f.blocks.iter().enumerate() {
@@ -1354,7 +1372,7 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                         // c ? 1 : 0 of a 0/1 value (a compare): c itself, c ? 0 : 1 is c ^ 1
                         // (`count += is_less as usize` after an Ordering became a select)
                         Inst::Sel(d, c, x, y)
-                            if zw[c.0 as usize] == 1 && f.vregs[d.0 as usize] == Cls::I && !opt_off(options, "-sel01") && matches!((kn[x.0 as usize], kn[y.0 as usize]), (Some(K::I(1)), Some(K::I(0))) | (Some(K::I(0)), Some(K::I(1)))) =>
+                            if zw[c.0 as usize] == 1 && arith_read[d.0 as usize] && f.vregs[d.0 as usize] == Cls::I && !opt_off(options, "-sel01") && matches!((kn[x.0 as usize], kn[y.0 as usize]), (Some(K::I(1)), Some(K::I(0))) | (Some(K::I(0)), Some(K::I(1)))) =>
                         {
                             if kn[x.0 as usize] == Some(K::I(1)) {
                                 Inst::Mov(d, c)

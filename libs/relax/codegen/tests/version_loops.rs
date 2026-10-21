@@ -601,3 +601,59 @@ fn divisibility_tests_fold() {
         }
     }
 }
+
+/// `c ? 1 : 0` and `c ? 0 : 1` of a compare: c and c ^ 1 (no select left); x / 1 is x and x % 1 is 0.
+#[test]
+fn bool_selects_and_unit_divisors_fold() {
+    for (k1, k0) in [(1i64, 0i64), (0, 1)] {
+        let mut f = Func::new("sel01".into(), 0);
+        let (a, b) = (f.vreg(Cls::I), f.vreg(Cls::I));
+        f.params.extend([a, b]);
+        f.block();
+        let v: Vec<VReg> = (0..8).map(|_| f.vreg(Cls::I)).collect();
+        push(&mut f, 0, Inst::Iconst(v[0], k1));
+        push(&mut f, 0, Inst::Iconst(v[1], k0));
+        push(&mut f, 0, Inst::ICmp(Cond::Lt, false, v[2], a, b));
+        push(&mut f, 0, Inst::Sel(v[3], v[2], v[0], v[1]));
+        push(&mut f, 0, Inst::Iconst(v[4], 1));
+        push(&mut f, 0, Inst::IBin(IOp::Div, U64, v[5], a, v[4]));
+        push(&mut f, 0, Inst::IBin(IOp::Rem, IntTy { bits: 32, signed: true }, v[6], b, v[4]));
+        push(&mut f, 0, Inst::IBin(IOp::Add, U64, v[7], v[3], v[5]));
+        f.rets.extend([Cls::I, Cls::I]);
+        term(&mut f, 0, Term::Ret(vec![v[7], v[6]]));
+        let orig = f.clone();
+        relax_backend::passes::simplify(&relax_session::Options::default(), &mut f, None, true, true);
+        assert!(!f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Sel(..) | Inst::IBin(IOp::Div | IOp::Rem, ..))), "{:?}", f.blocks[0].insts);
+        for x in [0u64, 1, 5, 9, u64::MAX] {
+            for y in [0u64, 1, 5, 9, (-3i64) as u64] {
+                assert_eq!(eval(&orig, &[x, y], &[]), eval(&f, &[x, y], &[]), "a {x} b {y} k1 {k1}");
+            }
+        }
+    }
+}
+
+/// A float load read only by FToBits becomes an integer load (f32 and f64), and an integer
+/// load read only by BitsToF a float load.
+#[test]
+fn float_loads_read_as_bits_load_integers() {
+    for (fm, w, im) in [(Mem::F32, false, Mem::Int(4, false)), (Mem::F64, true, Mem::Int(8, false))] {
+        let mut f = Func::new("lb".into(), 0);
+        let p = f.vreg(Cls::I);
+        f.params.push(p);
+        f.block();
+        let x = f.vreg(if w { Cls::F64 } else { Cls::F32 });
+        let (d, y) = (f.vreg(Cls::I), f.vreg(Cls::I));
+        let z = f.vreg(if w { Cls::F64 } else { Cls::F32 });
+        push(&mut f, 0, Inst::Load(fm, x, p, 8));
+        push(&mut f, 0, Inst::Conv(Conv::FToBits(w), d, x));
+        push(&mut f, 0, Inst::Load(im, y, p, 16));
+        push(&mut f, 0, Inst::Conv(Conv::BitsToF(w), z, y));
+        f.rets.extend([Cls::I, if w { Cls::F64 } else { Cls::F32 }]);
+        term(&mut f, 0, Term::Ret(vec![d, z]));
+        relax_backend::passes::simplify(&relax_session::Options::default(), &mut f, None, true, true);
+        let insts = &f.blocks[0].insts;
+        assert!(!insts.iter().any(|i| matches!(i, Inst::Conv(..))), "{insts:?}");
+        assert!(insts.iter().any(|i| matches!(i, Inst::Load(m, _, _, 8) if *m == im)), "{insts:?}");
+        assert!(insts.iter().any(|i| matches!(i, Inst::Load(m, _, _, 16) if *m == fm)), "{insts:?}");
+    }
+}
