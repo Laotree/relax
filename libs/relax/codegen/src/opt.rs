@@ -219,6 +219,22 @@ impl InlineLimits {
     }
 }
 
+/// The largest body any O3 rule admits for a callee with these attributes (the cost rule's
+/// bodies are small: at most 25 instructions that are not moves or constants): a bottom-up
+/// preparation whose O1 body is already larger rarely optimises down into range, so it is not
+/// prepared and its sites decide on the snapshot body.
+pub fn max_admitted_insts(options: &relax_session::Options, attrs: u8) -> usize {
+    let lim = InlineLimits::tier1();
+    if single_on(options) {
+        return INLINE_SINGLE_INSTS;
+    }
+    let mut n = lim.leaf_insts.max(lim.hot_insts);
+    if attrs & ATTR_ALWAYS != 0 { n = n.max(lim.always_insts); }
+    if attrs & ATTR_HINT != 0 { n = n.max(lim.hint_insts); }
+    if attrs & ATTR_CHAIN != 0 { n = n.max(lim.chain_insts); }
+    n
+}
+
 pub fn inline_rule(f: &Func, callee_id: u32, nargs: usize, nrets: usize, attrs: u8, lim: &InlineLimits) -> Option<usize> {
     let (n, leaf, rec) = callee_shape(f, callee_id);
     if rec {

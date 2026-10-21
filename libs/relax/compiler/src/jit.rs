@@ -9525,10 +9525,7 @@ impl InlineBodies {
             }
             e
         }).collect();
-        // A body above the largest admission size never inlines into a caller (rules of
-        // site_rule): no preparation for it.
-        let singles_on = relax_codegen::opt::single_on(options);
-        let max_insts = if singles_on { relax_codegen::opt::INLINE_SINGLE_INSTS } else { relax_codegen::opt::InlineLimits::tier1().always_insts };
+        // A body above the largest size its rules admit (site_rule) is not prepared.
         let mut structural = |_: usize, f: &relax_backend::rir::Func| (!options.no_block_freq).then(|| inline_structural_freqs(f));
         let stats_on = std::env::var("MAKEPAD_RUN_INLINE_STATS").is_ok_and(|v| v == "prep");
         let addr = |b: &Option<std::sync::Arc<Prepared>>| b.as_ref().map_or(0, |b| std::sync::Arc::as_ptr(b) as usize);
@@ -9536,7 +9533,7 @@ impl InlineBodies {
             for &k in scc {
                 let (p, attrs) = get(ids[k]).unwrap();
                 let o1 = unsafe { &*p };
-                if attrs & relax_codegen::opt::ATTR_COLD != 0 || edges[k].is_empty() || relax_codegen::opt::inst_count(o1) > max_insts {
+                if attrs & relax_codegen::opt::ATTR_COLD != 0 || edges[k].is_empty() || relax_codegen::opt::inst_count(o1) > relax_codegen::opt::max_admitted_insts(options, attrs) {
                     continue;
                 }
                 let peers: &[usize] = scc;
