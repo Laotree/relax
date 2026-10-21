@@ -4602,7 +4602,7 @@ mod tests {
 
     /// A branch on one bit (`x & 1 << k` against zero) is tbz / tbnz, for bits in either word;
     /// past their +-32 KB range the function is emitted again with tst + b.cond, and both
-    /// versions take the right side.
+    /// versions take the right side (run on arm64 hosts).
     #[test]
     fn single_bit_branches_use_tbz_and_fall_back_past_its_range() {
         let options = &relax_session::Options::default();
@@ -4635,6 +4635,10 @@ mod tests {
             let w: Vec<u32> = r.code[..r.text_len as usize].chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             let has_tbz = w.iter().any(|x| x & 0x7E00_0000 == 0x3600_0000);
             assert_eq!(has_tbz, filler == 0, "bit {bit} filler {filler}: tbz {has_tbz}");
+            // the code is arm64: it runs only on an arm64 host (an x64 host checks the encoding only)
+            if !cfg!(target_arch = "aarch64") {
+                continue;
+            }
             let code = crate::exec::Code::new(&r.code).unwrap();
             let run: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
             let x = 0x5a5a_0000_0000_1234u64 & !(1u64 << bit);
