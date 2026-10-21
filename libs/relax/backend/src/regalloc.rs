@@ -1827,7 +1827,8 @@ fn region_windows_alloc(
     // a predecessor ending in an invoke reaches its successors (the landing pad) after a call
     let invoke_pred: Vec<bool> = (0..nb).map(|b| preds[b].iter().any(|&p| matches!(f.blocks[p as usize].term, Term::Invoke(..)))).collect();
     let regs: Vec<u8> = cfg.int_caller.iter().chain(used_callee_int.iter()).copied().collect();
-    let mut order: Vec<u32> = (0..nv as u32).filter(|v| cand[*v as usize] && uses_in.get(v).map_or(false, |m| m.len() >= 2)).collect();
+    let min_blocks = if edge_loads { 1 } else { 2 };
+    let mut order: Vec<u32> = (0..nv as u32).filter(|v| cand[*v as usize] && uses_in.get(v).map_or(false, |m| m.len() >= min_blocks)).collect();
     let heat = |v: u32| -> f32 { uses_in[&v].iter().map(|(b, n)| wts[*b as usize] * *n as f32).sum() };
     order.sort_by(|a, b| heat(*b).partial_cmp(&heat(*a)).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(b)));
     let block_of = |p: u32| block_start.partition_point(|&s| s <= p) - 1;
@@ -1865,7 +1866,9 @@ fn region_windows_alloc(
             })
             .map(|(b, ps)| (*b, ps))
             .collect();
-        if elig.len() < 2 {
+        // one block is enough when its entry loads move into its predecessors (a single-block
+        // loop: the loop's own edge holds the value): the gain decides
+        if elig.len() < if edge_loads { 1 } else { 2 } {
             continue;
         }
         let used = &uses_in[&v];
@@ -1888,7 +1891,7 @@ fn region_windows_alloc(
                     set.push(*b);
                 }
             }
-            if set.len() < 2 {
+            if set.len() < if edge_loads { 1 } else { 2 } {
                 continue;
             }
             let entered = |b: u32| -> bool { pieces.iter().find(|x| x.0 == b).map_or(false, |(_, ps)| live_in(b, ps)) };
@@ -1902,7 +1905,7 @@ fn region_windows_alloc(
                 }
                 set.retain(|b| !drop.contains(b));
             }
-            if set.len() < 2 {
+            if set.len() < if edge_loads { 1 } else { 2 } {
                 continue;
             }
             let inset = |b: u32| set.binary_search(&b).is_ok();
@@ -1914,8 +1917,11 @@ fn region_windows_alloc(
                 let load = entered(b) && (invoke_pred[bu] || preds[bu].is_empty() || preds[bu].iter().any(|p| !inset(*p)));
                 // without the region: one load per block that uses it (windows join a block's uses)
                 let before = if used.contains_key(&b) { 1.0 } else { 0.0 };
-                // the outside predecessors load at their end instead when each one only jumps here
-                // (a loop's preheader, the join of a cold path): each runs at most as often as b
+                // the outside predecessors load at their end instead (before their terminator) when
+                // that runs less often than b: a loop's preheader or guard, the join of a cold path.
+                // The register must be free from the predecessor's last two instructions on (fused
+                // compares and loads are emitted with the terminator and read operands whose ranges
+                // ended there) to its end (whatever it holds into another successor is live out)
                 let mut at_end: Vec<u32> = Vec::new();
                 if load && edge_loads && !invoke_pred[bu] && !preds[bu].is_empty() {
                     for &p in &preds[bu] {
@@ -1923,13 +1929,17 @@ fn region_windows_alloc(
                             continue;
                         }
                         let pu = p as usize;
-                        let pos = block_end[pu] - 1;
-                        if p != b && reach[pu] && matches!(f.blocks[pu].term, Term::Jump(t) if t == b) && (o.is_empty() || !bits_any(o, pos, block_end[pu])) && !at_end.contains(&p) && !edge.contains(&p) {
+                        let from = block_end[pu].saturating_sub(5).max(block_start[pu]);
+                        let term_ok = matches!(f.blocks[pu].term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..));
+                        if p != b && reach[pu] && term_ok && (o.is_empty() || !bits_any(o, from, block_end[pu])) && !at_end.contains(&p) && !edge.contains(&p) {
                             at_end.push(p);
                         } else {
                             at_end.clear();
                             break;
                         }
+                    }
+                    if at_end.iter().map(|p| wts[*p as usize]).sum::<f32>() >= wts[bu] {
+                        at_end.clear();
                     }
                 }
                 let cost = if !load {
@@ -1984,7 +1994,7 @@ fn region_windows_alloc(
         for p in edge {
             let pu = p as usize;
             let pos = block_end[pu] - 1;
-            bits_fill(o, pos, block_end[pu]);
+            bits_fill(o, block_end[pu].saturating_sub(5).max(block_start[pu]), block_end[pu]);
             // loaded right before the jump (Gen: loads at the terminator position)
             loading.push((v, pos, block_end[pu], c));
         }

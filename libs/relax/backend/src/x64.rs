@@ -1404,8 +1404,8 @@ impl<'a> Gen<'a> {
             if self.rir_map_on {
                 self.rir_map.push((self.a.pos() as u32, bi as u32, u32::MAX));
             }
-            // region windows entered from here: loaded before the jump (regalloc edge loads)
-            if matches!(b.term, Term::Jump(_)) {
+            // region windows entered from here: loaded before the terminator (regalloc edge loads)
+            if matches!(b.term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..)) {
                 let tp = self.al.block_end[bi] - 1;
                 if let Some(ls) = self.win_start.get(&tp).cloned() {
                     self.cur_pos = tp;
