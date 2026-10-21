@@ -111,6 +111,13 @@ pub enum Builtin {
     Memset,
     /// (f, data) -> u64: calls fn pointer `f(data)`; 0 when it returned, 1 when it unwound
     CatchPanic,
+    /// does nothing; its results are zero (single-threaded waits, wakes, thread ids)
+    Nop,
+    /// thread-local keys of a single-threaded program: (dtor) -> key, (key) -> value,
+    /// (key, value); a table in linear memory
+    KeyCreate,
+    KeyGet,
+    KeySet,
 }
 
 /// What the link step tells the backend about the symbols code names.
@@ -124,8 +131,6 @@ pub trait Link {
 
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// 64-bit linear memory (addresses stay i64; no wraps). Default: wasm32
-    pub memory64: bool,
     /// bytes of shadow stack (at the bottom of memory, growing down)
     pub stack_size: u32,
     /// pages (64 KiB) of heap after the data, in the initial memory size
@@ -150,11 +155,14 @@ pub struct Options {
     pub remat: bool,
     /// a function with a frame and several returns keeps the caller's stack pointer in a local
     pub sp0: bool,
+    /// panics abort: an invoke is a plain call, a resume traps, cleanup pads and the exception
+    /// tag go away (rustc panic=abort)
+    pub panic_abort: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { memory64: false, stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: true, tee: true, remat: true, sp0: true }
+        Options { stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: true, tee: true, remat: true, sp0: true, panic_abort: false }
     }
 }
 
@@ -241,6 +249,8 @@ struct Shared {
     untraced_sites: usize,
     uses_tag: bool,
     uses_table: bool,
+    /// the thread-local key table (Builtin::Key*)
+    keys_base: u64,
 }
 
 impl Shared {
@@ -310,6 +320,7 @@ impl<'a> Module<'a> {
                 untraced_sites: 0,
                 uses_tag: false,
                 uses_table: false,
+                keys_base: 0,
             },
         }
     }
@@ -368,7 +379,6 @@ impl<'a> Module<'a> {
     /// Lowers every function and assembles the module.
     pub fn finish(mut self, options: &relax_session::Options, link: &dyn Link) -> Output {
         let opts = self.opts.clone();
-        let m64 = opts.memory64;
         // user function types first (their indices are needed by every call)
         let mut bodies: Vec<Body> = Vec::with_capacity(self.funcs.len());
         let mut failed = Vec::new();
@@ -385,6 +395,9 @@ impl<'a> Module<'a> {
             }
         }
         // helpers (bodies made on demand; a helper may ask for another)
+        if self.sh.helpers.iter().any(|h| matches!(h, Helper::Builtin(Builtin::KeyCreate | Builtin::KeyGet | Builtin::KeySet, _))) {
+            self.sh.keys_base = self.place(8 * 256, 8);
+        }
         let mut k = 0;
         while k < self.sh.helpers.len() {
             if self.sh.helper_bodies[k].is_none() {
@@ -523,7 +536,7 @@ impl<'a> Module<'a> {
             (stack_sz, (self.data_end + 15) & !15)
         };
         let pages = (heap_base + 0xFFFF) / 0x10000 + opts.heap_pages as u64;
-        let mut s = vec![1, if m64 { 0x04 } else { 0x00 }];
+        let mut s = vec![1, 0x00];
         uleb(&mut s, pages);
         let b0 = out.len();
         section(&mut out, 5, &s);
@@ -538,11 +551,10 @@ impl<'a> Module<'a> {
         }
         // globals: 0 = shadow stack pointer, 1 = heap base (immutable)
         let mut s = vec![2];
-        let aty = if m64 { 0x7E } else { 0x7F };
-        s.extend_from_slice(&[aty, 1, if m64 { 0x42 } else { 0x41 }]);
+        s.extend_from_slice(&[0x7F, 1, 0x41]);
         sleb(&mut s, stack_top as i64);
         s.push(0x0B);
-        s.extend_from_slice(&[aty, 0, if m64 { 0x42 } else { 0x41 }]);
+        s.extend_from_slice(&[0x7F, 0, 0x41]);
         sleb(&mut s, heap_base as i64);
         s.push(0x0B);
         let b0 = out.len();
@@ -623,12 +635,8 @@ impl<'a> Module<'a> {
                 match d.addr {
                     Some(a) => {
                         s.push(0);
-                        if m64 {
-                            s.push(0x42);
-                        } else {
-                            s.push(0x41);
-                        }
-                        sleb(&mut s, if m64 { a as i64 } else { a as u32 as i32 as i64 });
+                        s.push(0x41);
+                        sleb(&mut s, a as u32 as i32 as i64);
                         s.push(0x0B);
                     }
                     None => s.push(1),
@@ -985,22 +993,21 @@ struct Fx<'a> {
     /// (end, opcode position, local, vreg) of the last `local.set`
     last_set: (usize, usize, u32, u32),
     sp0: u32,
-    m64: bool,
 }
 
 fn lower_func(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &HashMap<u32, u32>, funcs: &[(u32, &Func)], link: &dyn Link, sh: &mut Shared) -> Result<Body, String> {
     // vector ops wasm has no instruction for: per-lane scalar code; switches: br_table
     let native = |op: VX| vx_native(op);
-    let mut owned: Option<Func> = None;
-    if crate::legal::needed(f0, &native, true) {
+    let pruned: Option<Func> = prune(o, f0, fn_ix, link);
+    let f0: &Func = pruned.as_ref().unwrap_or(f0);
+    let legal: Option<Func> = crate::legal::needed(f0, &native, true).then(|| {
         let mut g = f0.clone();
         crate::legal::legalize(&mut g, &native, true);
-        owned = Some(g);
-    }
-    if let Some(sw) = crate::switch::lower_switches(options, owned.as_ref().unwrap_or(f0)) {
-        owned = Some(sw.0);
-    }
-    let f: &Func = owned.as_ref().unwrap_or(f0);
+        g
+    });
+    let f0: &Func = legal.as_ref().unwrap_or(f0);
+    let switched = crate::switch::lower_switches(options, f0);
+    let f: &Func = switched.as_ref().map(|s| &s.0).unwrap_or(f0);
     let ft = func_type(f)?;
     let ty = sh.ty(ft.clone());
     let cfg = analyse(f);
@@ -1031,7 +1038,6 @@ fn lower_func(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &
         last_ret: usize::MAX,
         last_set: (usize::MAX, 0, 0, 0),
         sp0: NONE,
-        m64: o.memory64,
     };
     fx.check()?;
     fx.plan_folds();
@@ -1067,7 +1073,7 @@ fn lower_func(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &
             uleb(&mut fx.out, l as u64);
         }
         fx.aconst(frame as i64);
-        fx.out.push(if fx.m64 { I64_SUB } else { I32_SUB });
+        fx.out.push(I32_SUB);
         fx.out.push(LTEE);
         let fp = fx.fp;
         uleb(&mut fx.out, fp as u64);
@@ -1093,6 +1099,37 @@ fn lower_func(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &
     body.extend_from_slice(&fx.out);
     let fix = fx.fix.iter().map(|(p, x)| (p + hdr, *x)).collect();
     Ok(Body { bytes: body, fix, ty })
+}
+
+/// A call that never returns here (untraced, or bound to a trap) ends its block; with
+/// `panic_abort` an invoke is a plain call and a resume traps. None: nothing to change.
+fn prune(o: &Options, f: &Func, fn_ix: &HashMap<u32, u32>, link: &dyn Link) -> Option<Func> {
+    let traps = |i: &Inst| match i {
+        Inst::Call(Callee::Fn(id) | Callee::CFn(id, _), _, _) => !fn_ix.contains_key(id),
+        Inst::Call(Callee::Host(s) | Callee::CHost(s, _), _, _) => link.host(s.id) == HostBind::Trap,
+        _ => false,
+    };
+    let cut = |b: &Block| b.insts.iter().position(|i| traps(i)).map(|k| k + 1 < b.insts.len() || !matches!(b.term, Term::Unreachable)).unwrap_or(false);
+    let abort = |b: &Block| o.panic_abort && matches!(b.term, Term::Invoke(..) | Term::Resume);
+    if !f.blocks.iter().any(|b| cut(b) || abort(b)) {
+        return None;
+    }
+    let mut g = f.clone();
+    for b in &mut g.blocks {
+        if let Some(k) = b.insts.iter().position(|i| traps(i)) {
+            b.insts.truncate(k + 1);
+            b.pos.truncate(k + 1);
+            b.term = Term::Unreachable;
+        }
+        if o.panic_abort {
+            match b.term {
+                Term::Invoke(n, _) => b.term = Term::Jump(n),
+                Term::Resume => b.term = Term::Unreachable,
+                _ => {}
+            }
+        }
+    }
+    Some(g)
 }
 
 /// Lane-typed vector ops with a SIMD128 instruction here.
@@ -1584,7 +1621,7 @@ impl<'a> Fx<'a> {
             cuse.push(uses);
             ctype.len() as u32 - 1
         };
-        let aty = if self.m64 { Val::I64 } else { Val::I32 };
+        let aty = Val::I32;
         let fpc = if want_fp { extra(aty, 1 << 20, &mut ctype, &mut cuse) } else { NONE };
         let sp0c = if want_sp0 { extra(aty, 1 << 19, &mut ctype, &mut cuse) } else { NONE };
         let needs_tmp = f.blocks.iter().any(|b| matches!(b.term, Term::Switch(..)) || b.insts.iter().any(|i| matches!(i, Inst::AtomicRmw(..) | Inst::AtomicCas(..))));
@@ -1646,7 +1683,7 @@ impl<'a> Fx<'a> {
         sleb(&mut self.out, v as i64);
     }
     fn aconst(&mut self, v: i64) {
-        if self.m64 { self.i64c(v) } else { self.i32c(v as i32) }
+        self.i32c(v as i32)
     }
     fn lget(&mut self, l: u32) {
         self.out.push(LGET);
@@ -1773,17 +1810,13 @@ impl<'a> Fx<'a> {
                 Ok(0)
             }
             Want::Addr(off) => {
-                if off < 0 || (!self.m64 && off > u32::MAX as i64) {
+                if off < 0 || off > u32::MAX as i64 {
                     self.i64c(off);
                     self.op(I64_ADD);
-                    if !self.m64 {
-                        self.op(WRAP);
-                    }
+                    self.op(WRAP);
                     Ok(0)
                 } else {
-                    if !self.m64 {
-                        self.op(WRAP);
-                    }
+                    self.op(WRAP);
                     Ok(off as u64)
                 }
             }
@@ -1874,8 +1907,8 @@ impl<'a> Fx<'a> {
             Inst::Iconst(_, v) => {
                 if let Want::Addr(off) = want {
                     let a = v.wrapping_add(off);
-                    if self.m64 || (0..=u32::MAX as i64).contains(&a) {
-                        self.aconst(if self.m64 { a } else { a as u32 as i32 as i64 });
+                    if (0..=u32::MAX as i64).contains(&a) {
+                        self.aconst(a as u32 as i32 as i64);
                         return Ok(0);
                     }
                 }
@@ -2117,9 +2150,7 @@ impl<'a> Fx<'a> {
                     }
                 }
                 self.lget(self.fp);
-                if !self.m64 {
-                    self.op(EXT_U);
-                }
+                self.op(EXT_U);
                 if so != 0 {
                     self.i64c(so);
                     self.op(I64_ADD);
@@ -2130,8 +2161,8 @@ impl<'a> Fx<'a> {
                 let v = self.sym_val(*s);
                 if let Want::Addr(off) = want {
                     let a = v.wrapping_add(off);
-                    if self.m64 || (0..=u32::MAX as i64).contains(&a) {
-                        self.aconst(if self.m64 { a } else { a as u32 as i32 as i64 });
+                    if (0..=u32::MAX as i64).contains(&a) {
+                        self.aconst(a as u32 as i32 as i64);
                         return Ok(0);
                     }
                 }
@@ -2650,7 +2681,7 @@ impl<'a> Fx<'a> {
         let o = self.value(b, v, Want::Addr(0))?;
         if o != 0 {
             self.aconst(o as i64);
-            self.op(if self.m64 { I64_ADD } else { I32_ADD });
+            self.op(I32_ADD);
         }
         Ok(())
     }
@@ -2676,7 +2707,7 @@ impl<'a> Fx<'a> {
         } else if self.frame > 0 {
             self.lget(self.fp);
             self.aconst(self.frame as i64);
-            self.op(if self.m64 { I64_ADD } else { I32_ADD });
+            self.op(I32_ADD);
             self.out.extend_from_slice(&[GSET, 0]);
         }
     }
@@ -3252,9 +3283,7 @@ fn helper_body(o: &Options, h: Helper, sh: &mut Shared, fn_ix: &HashMap<u32, u32
             let aw = |c: &mut Vec<u8>, l: u8| {
                 c.push(LGET);
                 c.push(l);
-                if !o.memory64 {
-                    c.push(WRAP);
-                }
+                c.push(WRAP);
             };
             match bi {
                 Builtin::Memcpy | Builtin::Memmove | Builtin::Memset => {
@@ -3276,10 +3305,69 @@ fn helper_body(o: &Options, h: Helper, sh: &mut Shared, fn_ix: &HashMap<u32, u32
                         g(&mut c, 0);
                     }
                 }
+                Builtin::Nop => {
+                    for r in &t.results {
+                        match r {
+                            I32 => c.extend_from_slice(&[I32C, 0]),
+                            I64 => c.extend_from_slice(&[I64C, 0]),
+                            F32 => {
+                                c.push(F32C);
+                                c.extend_from_slice(&[0; 4]);
+                            }
+                            F64 => {
+                                c.push(F64C);
+                                c.extend_from_slice(&[0; 8]);
+                            }
+                            V128 => c.extend_from_slice(&[I32C, 0, 0xFD, 17]),
+                        }
+                    }
+                }
+                Builtin::KeyCreate => {
+                    // the counter is word 0; key k's value is word k
+                    let kb = sh.keys_base as i64;
+                    locals.push((1, I64));
+                    let l = t.params.len() as u8;
+                    c.push(I32C);
+                    sleb(&mut c, kb);
+                    c.push(I32C);
+                    sleb(&mut c, kb);
+                    c.extend_from_slice(&[0x29, 3, 0, I64C, 1, I64_ADD, LTEE, l, 0x37, 3, 0]);
+                    g(&mut c, l);
+                    if t.results.first() == Some(&I32) {
+                        c.push(WRAP);
+                    }
+                }
+                Builtin::KeyGet | Builtin::KeySet => {
+                    let kb = sh.keys_base;
+                    g(&mut c, 0);
+                    if t.params[0] == I64 {
+                        c.push(WRAP);
+                    }
+                    c.extend_from_slice(&[I32C, 3, 0x74]);
+                    if bi == Builtin::KeySet {
+                        g(&mut c, 1);
+                        c.push(0x37);
+                    } else {
+                        c.push(0x29);
+                    }
+                    c.push(3);
+                    uleb(&mut c, kb);
+                }
+                Builtin::CatchPanic if o.panic_abort => {
+                    g(&mut c, 1);
+                    g(&mut c, 0);
+                    c.push(WRAP);
+                    c.push(CALL_INDIRECT);
+                    sh.uses_table = true;
+                    let fty = sh.ty(FnType { params: vec![I64], results: vec![] });
+                    fix.push((c.len() as u32, Fix::Type(fty)));
+                    c.push(0);
+                    c.extend_from_slice(&[I64C, 0]);
+                }
                 Builtin::CatchPanic => {
                     sh.uses_tag = true;
                     let fty = sh.ty(FnType { params: vec![I64], results: vec![] });
-                    locals.push((1, if o.memory64 { I64 } else { I32 }));
+                    locals.push((1, I32));
                     c.extend_from_slice(&[GGET, 0, LSET, 2]);
                     if o.exnref {
                         c.extend_from_slice(&[BLOCK, 0x40, TRY_TABLE, 0x40, 1, 2, 0]);

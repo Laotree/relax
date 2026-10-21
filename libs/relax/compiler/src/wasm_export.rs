@@ -131,7 +131,9 @@ pub fn finish(u: &Unit) {
         }
     }
     let options = u.prog.session.options.clone();
-    let mut opts = wasm::Options::default();
+    // the web player's profile: panics abort, one thread (TLS keys and waits built in)
+    let mut opts = wasm::Options { panic_abort: true, ..wasm::Options::default() };
+    let mut single = true;
     // MAKEPAD_RUN_WASM_OPT=-tee,-remat,...: switch size techniques off (or on) to measure them
     if let Ok(v) = std::env::var("MAKEPAD_RUN_WASM_OPT") {
         for t in v.split(',').filter(|t| !t.is_empty()) {
@@ -144,7 +146,8 @@ pub fn finish(u: &Unit) {
                 "remat" => opts.remat = on,
                 "datafirst" => opts.data_first = on,
                 "sp0" => opts.sp0 = on,
-                "memory64" => opts.memory64 = on,
+                "abort" => opts.panic_abort = on,
+                "st" => single = on,
                 "names" => opts.names = on,
                 "untraced" => opts.untraced_import = on,
                 "exnref" => opts.exnref = on,
@@ -152,6 +155,7 @@ pub fn finish(u: &Unit) {
             }
         }
     }
+    let abort = opts.panic_abort;
     let mut m = Module::new(opts);
     let mut roots: Vec<(u32, String)> = ROOTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if roots.is_empty() {
@@ -194,8 +198,11 @@ pub fn finish(u: &Unit) {
                 "memmove" => HostBind::Builtin(Builtin::Memmove),
                 "memset" => HostBind::Builtin(Builtin::Memset),
                 "catch_panic" => HostBind::Builtin(Builtin::CatchPanic),
+                "panicking" if abort => HostBind::Builtin(Builtin::Nop),
+                "rethrow" if abort => HostBind::Trap,
                 n => HostBind::Import("r".into(), n.to_string()),
             },
+            Some(SymKind::Foreign(n)) if single => single_thread(&n).unwrap_or(HostBind::Import("c".into(), n)),
             Some(SymKind::Foreign(n)) => HostBind::Import("c".into(), n),
             Some(SymKind::Provided(k)) => HostBind::Import("p".into(), k),
             _ => HostBind::Trap,
@@ -337,4 +344,18 @@ fn reach(u: &Unit, funcs: &BTreeMap<u32, Func>, roots: &[u32]) -> Vec<u32> {
         }
     }
     seen.into_iter().collect()
+}
+
+/// A single-threaded program's binding of the threading C symbols: no threads are started,
+/// waits and wakes do nothing, thread-local keys are a table in linear memory.
+fn single_thread(name: &str) -> Option<HostBind> {
+    Some(match name {
+        "pthread_create" | "pthread_join" | "pthread_detach" | "pthread_attr_init" | "pthread_attr_setstacksize" | "pthread_attr_destroy" | "pthread_setname_np" => HostBind::Trap,
+        n if n.starts_with("__relax_domain_") => HostBind::Trap,
+        "__relax_wait_enter" | "__relax_wait_leave" | "__relax_wake" | "__ulock_wake" | "__ulock_wait" | "pthread_self" | "pthread_threadid_np" | "pthread_main_np" | "sched_yield" | "__relax_key_delete" => HostBind::Builtin(Builtin::Nop),
+        "__relax_key_create" => HostBind::Builtin(Builtin::KeyCreate),
+        "__relax_key_get" => HostBind::Builtin(Builtin::KeyGet),
+        "__relax_key_set" => HostBind::Builtin(Builtin::KeySet),
+        _ => return None,
+    })
 }
