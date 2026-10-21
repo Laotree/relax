@@ -9548,7 +9548,26 @@ impl InlineBodies {
                         && e.prepared.iter().all(|&(c, a)| addr(&sub(c)) == a)
                         && e.singles.iter().all(|&(o, c, v)| single(o, c) == v)
                 };
-                let shared = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner()).get(&ids[k]).and_then(|v| v.iter().find(|e| agrees(e)).cloned());
+                let (known, shared) = {
+                    let g = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner());
+                    let v = g.get(&ids[k]);
+                    (v.is_some(), v.and_then(|v| v.iter().find(|e| agrees(e)).cloned()))
+                };
+                if known && shared.is_none() {
+                    TIER1_PREP[4].fetch_add(1, Ordering::Relaxed);
+                    // why the newest one disagreed (diagnostic): a body changed, its attributes,
+                    // its presence, another preparation
+                    if let Some(e) = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner()).get(&ids[k]).and_then(|v| v.last().cloned()) {
+                        let why = e.bodies.iter().find_map(|&(c, a, at)| match get(c) {
+                            Some(_) if a == 0 => Some(7),
+                            None if a != 0 => Some(7),
+                            Some((q, _)) if q as usize != a => Some(5),
+                            Some((_, qa)) if qa != at => Some(6),
+                            _ => None,
+                        }).or_else(|| e.prepared.iter().any(|&(c, a)| addr(&sub(c)) != a).then_some(8)).unwrap_or(9);
+                        TIER1_PREP[why].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 let verify = shared.is_some() && std::env::var_os("MAKEPAD_RUN_PREP_VERIFY").is_some();
                 if let Some(e) = shared.as_ref().filter(|_| !verify) {
                     TIER1_PREP[3].fetch_add(1, Ordering::Relaxed);
@@ -13119,8 +13138,8 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
 /// O3 had to build a slot's RIR again (code linked from the disk cache has none):
 /// (count, wall ns)
 pub static TIER1_RIR_REBUILT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-/// O3 bottom-up preparation (InlineBodies::prepare): thread cpu ns, bodies simplified, bodies kept, shared preparations taken
-pub static TIER1_PREP: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// O3 bottom-up preparation (InlineBodies::prepare): thread cpu ns, bodies simplified, bodies kept, shared preparations taken, simplified although the slot had shared ones (reads disagreed)
+pub static TIER1_PREP: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// Speculative results waiting for their first call: (slot, wall ns when built). A result
 /// nobody called within MAKEPAD_RUN_SPEC_TTL_MS (default 2000; 0 = keep forever) is dropped with its
