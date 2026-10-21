@@ -396,10 +396,13 @@ pub fn version_bounds_loops(options: &relax_session::Options, f: &mut Func) -> b
     let mut changed = 0;
     // one loop at a time: block numbers stay valid for the loops found before (clones append)
     let loops = candidate_loops(f);
-    for l in loops {
+    for mut l in loops {
         if changed >= MAX_LOOPS {
             break;
         }
+        // blocks an earlier versioning added (clones, guards: a later loop's exit may now go to
+        // one) are members of no other loop
+        l.member.resize(f.blocks.len(), false);
         if l.blocks.len() > MAX_BLOCKS {
             continue;
         }
@@ -562,10 +565,11 @@ pub fn unswitch_loops(options: &relax_session::Options, f: &mut Func) -> bool {
         return false;
     }
     let mut changed = 0;
-    for l in candidate_loops(f) {
+    for mut l in candidate_loops(f) {
         if changed >= 2 || l.blocks.len() > MAX_BLOCKS {
             continue;
         }
+        l.member.resize(f.blocks.len(), false);
         let size: usize = l.blocks.iter().map(|&b| f.blocks[b as usize].insts.len()).sum();
         if size > 48 || l.blocks.iter().any(|&b| matches!(f.blocks[b as usize].term, Term::Invoke(..) | Term::Switch(..) | Term::Resume)) {
             continue;
@@ -682,24 +686,46 @@ fn prev_iv_find(f: &Func) -> Option<(VReg, VReg, Vec<(u32, usize, i64)>)> {
     };
     let dom = Dom::new(f);
     for l in candidate_loops(f) {
-        // the outside definition of v: exactly one, every other definition in the loop
-        let outside = |v: VReg, inside: usize| -> Option<(u32, usize)> {
-            let mut out = None;
-            let mut n = 0;
+        // blocks from which the header can be reached (backwards from it, outside the loop)
+        let mut to_header = vec![false; f.blocks.len()];
+        {
+            let mut preds: Vec<Vec<u32>> = vec![Vec::new(); f.blocks.len()];
             for (bi, bl) in f.blocks.iter().enumerate() {
-                if l.member[bi] {
+                for t in bl.term.succs() {
+                    preds[t as usize].push(bi as u32);
+                }
+            }
+            let mut work = vec![l.header];
+            while let Some(x) = work.pop() {
+                for &p in &preds[x as usize] {
+                    if !to_header[p as usize] && !l.member[p as usize] {
+                        to_header[p as usize] = true;
+                        work.push(p);
+                    }
+                }
+            }
+        }
+        // the outside definition of v that enters the loop: one block that reaches the header
+        // has definitions (its last one counts); definitions after the loop (a remainder step)
+        // never reach it
+        let outside = |v: VReg| -> Option<(u32, usize)> {
+            let mut out: Option<(u32, usize)> = None;
+            for (bi, bl) in f.blocks.iter().enumerate() {
+                if l.member[bi] || !to_header[bi] {
                     continue;
                 }
                 for (k, i) in bl.insts.iter().enumerate() {
                     let mut hit = false;
                     for_defs(i, |dd| hit |= dd == v);
                     if hit {
+                        if out.is_some_and(|o| o.0 != bi as u32) {
+                            return None;
+                        }
                         out = Some((bi as u32, k));
-                        n += 1;
                     }
                 }
             }
-            (n == 1 && ndef[v.0 as usize] as usize == inside + 1).then_some(out?)
+            out
         };
         for &b in &l.blocks {
             let insts = &f.blocks[b as usize].insts;
@@ -764,7 +790,7 @@ fn prev_iv_find(f: &Func) -> Option<(VReg, VReg, Vec<(u32, usize, i64)>)> {
                     }
                     // the entry: both assigned once outside, in one block dominating the header,
                     // from one base with the same difference
-                    let (Some(go), Some(ro)) = (outside(g, gd.len()), outside(r, rd.len())) else { continue };
+                    let (Some(go), Some(ro)) = (outside(g), outside(r)) else { continue };
                     if go.0 != ro.0 || !dom.before((go.0, usize::MAX), (l.header, 0)) {
                         continue;
                     }
@@ -871,7 +897,12 @@ pub fn hoist_readonly_param_loads(options: &relax_session::Options, f: &mut Func
                 match *i {
                     Inst::Mov(d, _) if set[d.0 as usize] => {}
                     Inst::Load(m, _, base, off) if set[base.0 as usize] && off >= 0 && off as i64 + relax_backend::passes::mem_size(m) as i64 <= size as i64 => {}
-                    _ => ok = false,
+                    _ => {
+                        if ok && trace() {
+                            eprintln!("roparam: {} {:?} kept by {:?}", f.name, p, i);
+                        }
+                        ok = false
+                    }
                 }
             }
             term_uses(&b.term, &mut tu);
@@ -904,6 +935,9 @@ pub fn hoist_readonly_param_loads(options: &relax_session::Options, f: &mut Func
                 };
                 f.blocks[bi].insts[k] = Inst::Mov(d, t);
                 changed = true;
+                if trace() {
+                    eprintln!("roparam: {} {:?} load b{} hoisted", f.name, p, bi);
+                }
             }
         }
     }

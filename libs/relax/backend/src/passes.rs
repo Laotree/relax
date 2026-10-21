@@ -6750,27 +6750,60 @@ fn copies_from_loaded(f: &mut Func) {
             pred[t as usize] = bi as u32;
         }
     }
+    // single-def `v = b + k`: accesses at [b + k] read the same bytes as at [v]
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+        }
+    }
+    let mut add_def: Vec<Option<(VReg, i64)>> = vec![None; nv];
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::IBinI(IOp::Add, it, d, x, c) = *i {
+                if it.bits == 64 && ndef[d.0 as usize] == 1 && ndef[x.0 as usize] == 1 && c.abs() < 1 << 30 {
+                    add_def[d.0 as usize] = Some((x, c));
+                }
+            }
+        }
+    }
     for bi in 0..n {
         for k in 0..f.blocks[bi].insts.len() {
             let Inst::Copy(d, src, sz @ (1 | 2 | 4 | 8)) = f.blocks[bi].insts[k] else { continue };
+            let (sb, sk) = add_def[src.0 as usize].unwrap_or((src, 0));
+            let at = |base: VReg, off: i32| -> Option<i64> {
+                if base == src {
+                    Some(sk + off as i64)
+                } else if base == sb {
+                    Some(off as i64)
+                } else {
+                    None
+                }
+            };
             let mut seen: Vec<VReg> = Vec::new();
             let mut found = None;
             let (mut b, mut end) = (bi, k);
             'scan: for hop in 0..2 {
                 for j in (0..end).rev() {
                     let i = &f.blocks[b].insts[j];
-                    if let Inst::Load(Mem::Int(w, _), v, base, 0) = *i {
-                        if base == src && w as u32 == sz && !seen.contains(&v) {
+                    if let Inst::Load(Mem::Int(w, _), v, base, off) = *i {
+                        if at(base, off) == Some(sk) && w as u32 == sz && !seen.contains(&v) {
                             found = Some(v);
                             break 'scan;
                         }
                     }
-                    if matches!(i, Inst::Store(..) | Inst::StoreX(..) | Inst::VStore(..) | Inst::VStoreX(..) | Inst::Copy(..) | Inst::Call(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..)) {
+                    // a store through the source's own base beside the copied bytes leaves them
+                    let beside = matches!(*i, Inst::Store(m, base, off, _) if at(base, off).is_some_and(|o| o >= sk + sz as i64 || o + mem_size(m) as i64 <= sk));
+                    if !beside && matches!(i, Inst::Store(..) | Inst::StoreX(..) | Inst::VStore(..) | Inst::VStoreX(..) | Inst::Copy(..) | Inst::Call(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..)) {
                         break 'scan;
                     }
                     let mut hit_src = false;
                     for_defs(i, |x| {
-                        hit_src |= x == src;
+                        hit_src |= x == src || x == sb;
                         seen.push(x);
                     });
                     if hit_src {
