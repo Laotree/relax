@@ -416,10 +416,11 @@ fn site_rule(options: &relax_session::Options, callee: &Func, id: u32, nargs: us
 /// The queue uses stable block/instruction indices: splitting invalidates only the tail,
 /// whose calls are enqueued again in the new continuation block.
 /// `single(caller, callee)` proves that caller's O1 body owns the sole reference.
-/// `price(callee)`: the body whose shape and size decide a site, when it is not the one inlined
-/// (bottom-up O3: the callee's optimised body prices the site, its inlined-only body is inlined);
-/// the growth ceiling is charged with the priced size.
-pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self_id: u32, get: &dyn Fn(u32) -> Option<(*const Func, u8)>, price: &dyn Fn(u32) -> Option<*const Func>, single: &dyn Fn(u32, u32) -> bool, nounwind: &dyn Fn(u32) -> bool, lim: &InlineLimits, freqs: Option<&[f32]>, mut stats: Option<&mut InlineStats>) -> Vec<(u32, usize)> {
+/// `prepared(callee)`: the callee bottom-up (O3), as (the body to inline: its own first inlining
+/// round, unoptimised; the optimised body that prices the site). A site takes it when the priced
+/// body passes the rules and fits, charging the growth ceiling with the priced size; otherwise
+/// the site is decided on `get`'s body as before (top-down), whose calls then come up here again.
+pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self_id: u32, get: &dyn Fn(u32) -> Option<(*const Func, u8)>, prepared: &dyn Fn(u32) -> Option<(*const Func, *const Func)>, single: &dyn Fn(u32, u32) -> bool, nounwind: &dyn Fn(u32) -> bool, lim: &InlineLimits, freqs: Option<&[f32]>, mut stats: Option<&mut InlineStats>) -> Vec<(u32, usize)> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
     let depths = relax_backend::regalloc::loop_depths(f, &reachable(f));
@@ -473,7 +474,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
             for (ii, inst) in f.blocks[bi].insts.iter().enumerate() {
                 if let Inst::Call(Callee::Fn(id), _, _) = inst {
                     let found = get(*id);
-                    let size = found.map_or(usize::MAX, |(p, _)| inline_inst_count(unsafe { &*price(*id).unwrap_or(p) }));
+                    let size = found.map_or(usize::MAX, |(p, _)| inline_inst_count(unsafe { &*prepared(*id).map_or(p, |x| x.1) }));
                     // Closure adapters need to be fused as a chain. Importing
                     // their loop after unrelated work has spent the budget
                     // leaves an indirect/aggregate call on every iteration.
@@ -497,52 +498,50 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
         }
     };
     enqueue(f, 0, &priorities, &loop_sites, &mut queue);
-    while let Some((_, _, Reverse(size), Reverse(bi), Reverse(ii))) = queue.pop() {
+    while let Some((_, _, _, Reverse(bi), Reverse(ii))) = queue.pop() {
         let Some(Inst::Call(Callee::Fn(id), args, rets)) = f.blocks[bi].insts.get(ii) else { continue };
         let (id, args, rets) = (*id, args.clone(), rets.clone());
         let found = get(id);
-        let callee = found.map(|(p, _)| unsafe { &*p });
-        let priced_by = price(id);
-        let shape = found.map(|(p, _)| unsafe { &*priced_by.unwrap_or(p) });
-        let cost = size.saturating_sub(args.len() + rets.len() + 3);
-        // Preserve the raw-size R13 free cap; the paid budget charges net growth.
-        let free = size <= INLINE_FREE_INSTS && size <= free_budget;
-        // A tiny body (no bigger than the call's own argument/return moves, or within the free
-        // size) is admitted whatever the caller has grown to: refusing it keeps a call that costs
-        // more than the body (sandbox leap, node: encode_cascades left core::mem::drop x130,
-        // rc::header_of x140, slice::iter::next x26 as calls -- "budget" -- once big chains had
-        // filled the growth ceiling). Only the raw free allowance is charged for it.
-        let tiny = size <= INLINE_FREE_INSTS;
-        // ... and one no bigger than the call itself costs nothing: no allowance at all.
-        let no_growth = cost == 0;
-        let rule = found.and_then(|(_, attrs)| site_rule(options, shape.unwrap(), id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), id), ancestry[bi].len() - 1, multi_depths[bi], lim));
-        // New admissions respect the actual growth ceiling, including ABI moves.
-        let growth = shape.map_or(0, |c| size.saturating_add(args.len()).saturating_add(
-            c.blocks.iter().filter(|b| matches!(b.term, Term::Ret(_))).count().saturating_mul(rets.len())
-        ).saturating_sub(1));
-        let reason = if matches!(f.blocks[bi].term, Term::Unreachable | Term::Resume) {
-            Some(0)
-        } else if callee.is_none() {
-            Some(1)
-        } else if ancestry[bi].contains(&id) || rule.is_none() {
-            Some(2)
-        } else if found.unwrap().1 & ATTR_COLD != 0 && !free && rule != Some(RULE_COST) {
-            Some(0)
-        } else if callee.unwrap().params.len() != args.len() || callee.unwrap().rets.len() != rets.len() {
-            Some(4)
-        } else if match rule.unwrap() {
-            _ if no_growth => false,
-            RULE_COST => size > free_budget || !tiny && priced.saturating_add(growth) > growth_limit,
-            RULE_SINGLE => priced.saturating_add(growth) > growth_limit,
-            _ => !free && (cost > budget || !tiny && priced > growth_limit),
-        } {
-            Some(3)
-        } else {
-            None
-        };
-        if reason.is_some() {
-            continue;
+        // the bottom-up body first, then the snapshot body: (inlined body, priced body)
+        let mut pick = None;
+        for (bottom_up, (body, shape)) in prepared(id).map(|x| (true, x)).into_iter().chain(found.map(|(p, _)| (false, (p, p)))) {
+            let (callee, shape) = unsafe { (&*body, &*shape) };
+            let size = inline_inst_count(shape);
+            let cost = size.saturating_sub(args.len() + rets.len() + 3);
+            // Preserve the raw-size R13 free cap; the paid budget charges net growth.
+            let free = size <= INLINE_FREE_INSTS && size <= free_budget;
+            // A tiny body (no bigger than the call's own argument/return moves, or within the free
+            // size) is admitted whatever the caller has grown to: refusing it keeps a call that costs
+            // more than the body (sandbox leap, node: encode_cascades left core::mem::drop x130,
+            // rc::header_of x140, slice::iter::next x26 as calls -- "budget" -- once big chains had
+            // filled the growth ceiling). Only the raw free allowance is charged for it.
+            let tiny = size <= INLINE_FREE_INSTS;
+            // ... and one no bigger than the call itself costs nothing: no allowance at all.
+            let no_growth = cost == 0;
+            let attrs = found.unwrap().1;
+            let rule = site_rule(options, shape, id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), id), ancestry[bi].len() - 1, multi_depths[bi], lim);
+            // New admissions respect the actual growth ceiling, including ABI moves.
+            let growth = size.saturating_add(args.len()).saturating_add(
+                shape.blocks.iter().filter(|b| matches!(b.term, Term::Ret(_))).count().saturating_mul(rets.len())
+            ).saturating_sub(1);
+            let refused = matches!(f.blocks[bi].term, Term::Unreachable | Term::Resume)
+                || ancestry[bi].contains(&id) || rule.is_none()
+                || attrs & ATTR_COLD != 0 && !free && rule != Some(RULE_COST)
+                || callee.params.len() != args.len() || callee.rets.len() != rets.len()
+                || match rule.unwrap() {
+                    _ if no_growth => false,
+                    RULE_COST => size > free_budget || !tiny && priced.saturating_add(growth) > growth_limit,
+                    RULE_SINGLE => priced.saturating_add(growth) > growth_limit,
+                    _ => !free && (cost > budget || !tiny && priced > growth_limit),
+                };
+            if !refused {
+                pick = Some((callee, rule.unwrap(), growth, size, cost, free, no_growth, bottom_up));
+                break;
+            }
         }
+        let Some((callee, rule, growth, size, cost, free, no_growth, bottom_up)) = pick else { continue };
+        let callee = Some(callee);
+        let rule = Some(rule);
         match rule.unwrap() {
             // the body moves here (its one caller): the ceiling grows with it, so the calls
             // around it (Vec::push in the absorbed loop) still fit
@@ -564,7 +563,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
         let before = inst_count;
         inst_count = inst_count - old_block_size + f.blocks[bi].insts.len()
             + f.blocks[start..].iter().map(|b| b.insts.len()).sum::<usize>();
-        priced = if priced_by.is_some() { priced.saturating_add(growth) } else { priced + inst_count - before };
+        priced = if bottom_up { priced.saturating_add(growth) } else { priced + inst_count - before };
         priorities.resize(f.blocks.len(), priorities[bi]);
         let parent_loop = loop_sites[bi];
         loop_sites.resize(f.blocks.len(), parent_loop);
@@ -592,7 +591,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
                 let Inst::Call(Callee::Fn(id), args, rets) = inst else { continue };
                 s.hot_left += usize::from(priorities[bi].1 && !matches!(block.term, Term::Unreachable | Term::Resume));
                 let found = get(*id);
-                let callee = found.map(|(p, _)| unsafe { &*price(*id).unwrap_or(p) });
+                let callee = found.map(|(p, _)| unsafe { &*p });
                 let reason = if matches!(block.term, Term::Unreachable | Term::Resume) {
                     0
                 } else if let Some((_, attrs)) = found {
@@ -4827,12 +4826,17 @@ mod inline_priority_tests {
         let get = |_: u32| Some((&raw as *const Func, 0));
         let mut f = caller();
         let n = inline_inst_count(&f);
-        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some(&opt as *const Func), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).len(), 2);
+        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some((&raw as *const Func, &opt as *const Func)), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).len(), 2);
         assert!(inline_inst_count(&f) > n + 2 * 390);
         f.verify().unwrap();
+        // refused bottom-up (priced too big), the snapshot body decides: here too big as well
+        let mut f = caller();
+        assert!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some((&opt as *const Func, &raw as *const Func)), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).is_empty());
+        // ... and here small enough: the snapshot body moves
         let get = |_: u32| Some((&opt as *const Func, 0));
         let mut f = caller();
-        assert!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some(&raw as *const Func), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).is_empty());
+        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some((&raw as *const Func, &raw as *const Func)), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).len(), 2);
+        assert!(inline_inst_count(&f) < n + 2 * 40);
     }
 
     #[test]
