@@ -2461,6 +2461,12 @@ impl<'a> Gen<'a> {
     fn jump_to(&mut self, target: u32, bi: usize) {
         let target = self.thru(target);
         if self.thru(self.next_block[bi]) != target {
+            // a backward jump (loop back edge) to a placed block in rel8 range: jmp rel8
+            if let Some(rel) = self.short_back(target) {
+                self.a.byte(0xeb);
+                self.a.byte(rel as u8);
+                return;
+            }
             let p = self.a.jmp32();
             self.fixups.push((p, target));
         }
@@ -2468,8 +2474,23 @@ impl<'a> Gen<'a> {
 
     fn jcc_to(&mut self, cc: u8, target: u32) {
         let target = self.thru(target);
+        if let Some(rel) = self.short_back(target) {
+            self.a.byte(0x70 | cc);
+            self.a.byte(rel as u8);
+            return;
+        }
         let p = self.a.jcc32(cc);
         self.fixups.push((p, target));
+    }
+
+    /// rel8 of a two-byte jump emitted here to an already placed block, when it fits (forward
+    /// targets are not placed yet: they keep rel32 and a fixup)
+    fn short_back(&self, target: u32) -> Option<i8> {
+        let at = *self.block_pos.get(target as usize)?;
+        if at == usize::MAX {
+            return None;
+        }
+        i8::try_from(at as i64 - (self.a.pos() as i64 + 2)).ok()
     }
 
     /// cmp r, imm32 (sign-extended)
