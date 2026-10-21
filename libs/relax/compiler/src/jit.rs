@@ -9218,7 +9218,7 @@ fn t1_quick_ra(options: &crate::options::Options) -> bool {
     options.t1_quick_ra
 }
 
-fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, candidates: &[u32], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>) -> Vec<(u32, usize)> {
+fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, snap: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>) -> Vec<(u32, usize)> {
     let _cost_opt = relax_codegen::fncost::phase(4);
     relax_codegen::fncost::size(true, func);
     func.baseline = false;
@@ -9268,12 +9268,12 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     let mut inline_stats = (*INLINE_STATS.get_or_init(|| std::env::var("MAKEPAD_RUN_INLINE_STATS").map_or(false, |v| v == "1" || v == "prep"))).then(relax_codegen::opt::InlineStats::default);
     // Bottom-up, as LLVM's CGSCC inliner: every callee in the snapshot is simplified first, its
     // own inlining included; a site takes that body when its optimised form passes the rules and
-    // fits, else the snapshot body (top-down, as before). A pure function of the snapshot, so
-    // replay stays exact. MAKEPAD_RUN_OPT=-bottomup: top-down only (bisection).
+    // fits, else the snapshot body (top-down). A pure function of the snapshot, so replay stays
+    // exact.
     let tp = cpu_ns();
-    let bodies = InlineBodies::prepare(options, id, candidates, get, single, ro, cfg, nounwind);
+    let bodies = InlineBodies::prepare(options, id, snap, get, single, ro, cfg, nounwind);
     TIER1_PREP[0].fetch_add(cpu_ns() - tp, Ordering::Relaxed);
-    TIER1_PREP[2].fetch_add(bodies.bodies.len() as u64, Ordering::Relaxed);
+    TIER1_PREP[2].fetch_add(bodies.index.len() as u64, Ordering::Relaxed);
     let prepared = |c: u32| bodies.prepared(c);
     let mut inlined = tier1_simplify(options, func, id, name, get, &prepared, single, ro, cfg, nounwind, frequencies, inline_stats.as_mut(), None);
     bodies.expand(&mut inlined);
@@ -9371,108 +9371,211 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
 /// filter: the second simplify left a rotated loop that fold_post_increments and the stream
 /// vectoriser do not match; 1.79x). Members of one component see each other's snapshot bodies.
 /// Everything here is a function of the snapshot alone (frequencies are structural), so replay
-/// stays exact.
+/// stays exact, and the O3 builds of one run share a callee's preparation while its inputs are
+/// the same (`PREP_SHARED`).
 struct InlineBodies {
-    index: HashMap<u32, usize>,
-    /// (the inlined body: the first inlining round's output, unoptimised; the optimised body
-    /// that prices its sites; every slot whose body the inlined one took, transitively)
-    bodies: Vec<(Box<relax_backend::rir::Func>, Box<relax_backend::rir::Func>, Vec<u32>)>,
+    index: HashMap<u32, std::sync::Arc<Prepared>>,
+}
+
+/// One callee prepared bottom-up.
+struct Prepared {
+    /// the first inlining round's output, unoptimised: what a site inlines
+    raw: relax_backend::rir::Func,
+    /// the optimised body: what prices the site
+    priced: relax_backend::rir::Func,
+    /// every slot whose body `raw` took, transitively
+    deps: Vec<u32>,
+}
+
+/// A callee's preparation, kept for the next O3 build of this run that sees the same inputs. A
+/// preparation reads the snapshot bodies reachable from the callee (their attributes, which slots
+/// are absent, the single-caller facts), nothing else: `fp` fingerprints those, naming each body
+/// by its address. `_pins` keep those bodies' allocations, so no other body can take one of the
+/// addresses while the entry lives. One entry per slot: a changed input replaces it.
+struct PrepShared {
+    fp: u128,
+    _pins: Vec<std::sync::Weak<relax_backend::rir::Func>>,
+    /// None: its first round inlined nothing (its callers take the snapshot body)
+    body: Option<std::sync::Arc<Prepared>>,
+    /// the nounwind answers the preparation consulted: asked again when the entry is taken, so
+    /// the build's recorded nounwind inputs are the ones a fresh preparation records
+    nounwind: Vec<u32>,
+}
+
+static PREP_SHARED: std::sync::LazyLock<relax_session::sync::Mutex<HashMap<u32, PrepShared>>> = std::sync::LazyLock::new(|| relax_session::sync::Mutex::new(HashMap::new()));
+
+/// Strongly connected components of a graph (Tarjan, iterative): callees first.
+fn sccs(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let n = edges.len();
+    let (mut index, mut low, mut on) = (vec![usize::MAX; n], vec![0; n], vec![false; n]);
+    let (mut stack, mut out, mut next): (Vec<usize>, Vec<Vec<usize>>, usize) = (Vec::new(), Vec::new(), 0);
+    for s in 0..n {
+        if index[s] != usize::MAX { continue; }
+        let mut work: Vec<(usize, usize)> = vec![(s, 0)];
+        index[s] = next; low[s] = next; next += 1; stack.push(s); on[s] = true;
+        while let Some(&mut (v, ref mut ei)) = work.last_mut() {
+            if *ei < edges[v].len() {
+                let w = edges[v][*ei];
+                *ei += 1;
+                if index[w] == usize::MAX {
+                    index[w] = next; low[w] = next; next += 1; stack.push(w); on[w] = true;
+                    work.push((w, 0));
+                } else if on[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+            } else {
+                work.pop();
+                if let Some(&(p, _)) = work.last() { low[p] = low[p].min(low[v]); }
+                if low[v] == index[v] {
+                    let mut scc = Vec::new();
+                    loop {
+                        let w = stack.pop().unwrap();
+                        on[w] = false;
+                        scc.push(w);
+                        if w == v { break; }
+                    }
+                    out.push(scc);
+                }
+            }
+        }
+    }
+    out
 }
 
 impl InlineBodies {
-    fn prepare(options: &crate::options::Options, root: u32, candidates: &[u32], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool) -> Self {
+    fn prepare(options: &crate::options::Options, root: u32, snap: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool) -> Self {
         use relax_backend::rir::{Callee, Inst, Term};
-        let mut out = InlineBodies { index: HashMap::new(), bodies: Vec::new() };
-        if !cfg.inline || relax_backend::stats::opt_off(options, "-bottomup") {
+        let mut out = InlineBodies { index: HashMap::new() };
+        if !cfg.inline {
             return out;
         }
-        // nodes: the candidates, deduplicated in snapshot order (the lookup takes the first)
+        // nodes: the snapshot, deduplicated in order (the lookup takes the first)
         let mut ids: Vec<u32> = Vec::new();
+        let mut arcs: Vec<&std::sync::Arc<relax_backend::rir::Func>> = Vec::new();
         let mut node: HashMap<u32, usize> = HashMap::new();
-        for &c in candidates {
-            if c != root && get(c).is_some() && !node.contains_key(&c) {
-                node.insert(c, ids.len());
-                ids.push(c);
+        for (c, body, _) in snap {
+            if *c != root && !node.contains_key(c) {
+                node.insert(*c, ids.len());
+                ids.push(*c);
+                arcs.push(body);
             }
         }
         let body = |k: usize| unsafe { &*get(ids[k]).unwrap().0 };
+        // the calls a preparation inlines (outside cold blocks): the order it runs in
+        let mut refs_all: Vec<Vec<u32>> = Vec::with_capacity(ids.len());
         let edges: Vec<Vec<usize>> = (0..ids.len()).map(|k| {
-            let mut e = Vec::new();
+            let (mut e, mut all) = (Vec::new(), Vec::new());
             for b in &body(k).blocks {
-                if matches!(b.term, Term::Unreachable | Term::Resume) { continue; }
+                let cold = matches!(b.term, Term::Unreachable | Term::Resume);
                 for i in &b.insts {
                     if let Inst::Call(Callee::Fn(c), _, _) | Inst::FnAddr(_, c) = i {
+                        if !all.contains(c) { all.push(*c); }
+                        if cold { continue; }
                         if let Some(&n) = node.get(c) {
                             if n != k && !e.contains(&n) { e.push(n); }
                         }
                     }
                 }
             }
+            refs_all.push(all);
             e
         }).collect();
-        // Tarjan (iterative): components come out callees first
-        let n = ids.len();
-        let (mut index, mut low, mut on) = (vec![usize::MAX; n], vec![0; n], vec![false; n]);
-        let (mut stack, mut sccs, mut next): (Vec<usize>, Vec<Vec<usize>>, usize) = (Vec::new(), Vec::new(), 0);
-        for s in 0..n {
-            if index[s] != usize::MAX { continue; }
-            let mut work: Vec<(usize, usize)> = vec![(s, 0)];
-            index[s] = next; low[s] = next; next += 1; stack.push(s); on[s] = true;
-            while let Some(&mut (v, ref mut ei)) = work.last_mut() {
-                if *ei < edges[v].len() {
-                    let w = edges[v][*ei];
-                    *ei += 1;
-                    if index[w] == usize::MAX {
-                        index[w] = next; low[w] = next; next += 1; stack.push(w); on[w] = true;
-                        work.push((w, 0));
-                    } else if on[w] {
-                        low[v] = low[v].min(index[w]);
-                    }
-                } else {
-                    work.pop();
-                    if let Some(&(p, _)) = work.last() { low[p] = low[p].min(low[v]); }
-                    if low[v] == index[v] {
-                        let mut scc = Vec::new();
-                        loop {
-                            let w = stack.pop().unwrap();
-                            on[w] = false;
-                            scc.push(w);
-                            if w == v { break; }
-                        }
-                        sccs.push(scc);
+        // What a preparation can read: every body reachable over all references (cold blocks,
+        // addresses taken: the nocapture and chain queries look there too). One hash per
+        // component of that graph, callees first: its members (slot, body address, attributes),
+        // the absent slots they name, the single-caller facts they own, its callee components.
+        let all_edges: Vec<Vec<usize>> = refs_all.iter().map(|r| r.iter().filter_map(|c| node.get(c).copied()).collect()).collect();
+        let comps = sccs(&all_edges);
+        let mut comp_of = vec![0usize; ids.len()];
+        for (ci, comp) in comps.iter().enumerate() {
+            for &k in comp { comp_of[k] = ci; }
+        }
+        let singles_on = relax_codegen::opt::single_on(options);
+        let mut comp_hash: Vec<u128> = vec![0; comps.len()];
+        for (ci, comp) in comps.iter().enumerate() {
+            let mut h = crate::sip::Sip128::new();
+            let mut members = comp.clone();
+            members.sort_by_key(|&k| ids[k]);
+            for &k in &members {
+                h.u32(ids[k]);
+                h.u64(std::sync::Arc::as_ptr(arcs[k]) as u64);
+                h.u8(get(ids[k]).unwrap().1);
+                for &c in &refs_all[k] {
+                    match node.get(&c) {
+                        None => { h.u8(1); h.u32(c); }
+                        Some(_) if singles_on && single(ids[k], c) => { h.u8(2); h.u32(c); }
+                        Some(_) => {}
                     }
                 }
             }
+            let mut sub: Vec<u128> = comp.iter().flat_map(|&k| all_edges[k].iter().map(|&m| comp_of[m])).filter(|&d| d != ci).map(|d| comp_hash[d]).collect();
+            sub.sort_unstable();
+            sub.dedup();
+            for x in sub { h.u128(x); }
+            comp_hash[ci] = h.finish128();
         }
         // A body above the largest admission size never inlines into a caller (rules of
         // site_rule): no preparation for it.
-        let max_insts = if relax_codegen::opt::single_on(options) { relax_codegen::opt::INLINE_SINGLE_INSTS } else { relax_codegen::opt::InlineLimits::tier1().always_insts };
+        let max_insts = if singles_on { relax_codegen::opt::INLINE_SINGLE_INSTS } else { relax_codegen::opt::InlineLimits::tier1().always_insts };
         let mut structural = |_: usize, f: &relax_backend::rir::Func| (!options.no_block_freq).then(|| inline_structural_freqs(f));
-        for scc in &sccs {
+        let stats_on = std::env::var("MAKEPAD_RUN_INLINE_STATS").is_ok_and(|v| v == "prep");
+        for scc in &sccs(&edges) {
             for &k in scc {
                 let (p, attrs) = get(ids[k]).unwrap();
                 let o1 = unsafe { &*p };
                 if attrs & relax_codegen::opt::ATTR_COLD != 0 || edges[k].is_empty() || relax_codegen::opt::inst_count(o1) > max_insts {
                     continue;
                 }
+                let fp = {
+                    let mut h = crate::sip::Sip128::new();
+                    h.u32(ids[k]);
+                    h.u128(comp_hash[comp_of[k]]);
+                    h.finish128()
+                };
+                let shared = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner()).get(&ids[k]).filter(|e| e.fp == fp).map(|e| (e.body.clone(), e.nounwind.clone()));
+                if let Some((b, asked)) = shared {
+                    TIER1_PREP[3].fetch_add(1, Ordering::Relaxed);
+                    for c in asked { nounwind(c); }
+                    if let Some(b) = b { out.index.insert(ids[k], b); }
+                    continue;
+                }
                 let peers: &[usize] = scc;
                 let in_scc = |c: u32| node.get(&c).is_some_and(|m| peers.contains(m));
                 let sub_prepared = |c: u32| if in_scc(c) { None } else { out.prepared(c) };
+                let asked = std::cell::RefCell::new(Vec::new());
+                let recording = |c: u32| {
+                    let mut a = asked.borrow_mut();
+                    if !a.contains(&c) { a.push(c); }
+                    drop(a);
+                    nounwind(c)
+                };
                 let mut f = o1.clone();
                 f.baseline = false;
                 let mut raw = (relax_backend::rir::Func::new(String::new(), 0), Vec::new());
-                let mut stats = std::env::var("MAKEPAD_RUN_INLINE_STATS").is_ok_and(|v| v == "prep").then(relax_codegen::opt::InlineStats::default);
-                tier1_simplify(options, &mut f, ids[k], &o1.name, get, &sub_prepared, single, ro, cfg, nounwind, &mut structural, stats.as_mut(), Some(&mut raw));
+                let mut stats = stats_on.then(relax_codegen::opt::InlineStats::default);
+                tier1_simplify(options, &mut f, ids[k], &o1.name, get, &sub_prepared, single, ro, cfg, &recording, &mut structural, stats.as_mut(), Some(&mut raw));
                 TIER1_PREP[1].fetch_add(1, Ordering::Relaxed);
                 if let Some(st) = stats { st.report(&format!("prep:{} (root {})", o1.name, root)); }
                 let (raw, mut taken) = raw;
-                if taken.is_empty() {
-                    continue;
+                let prepared = (!taken.is_empty()).then(|| {
+                    out.expand(&mut taken);
+                    std::sync::Arc::new(Prepared { raw, priced: f, deps: taken.into_iter().map(|x| x.0).collect() })
+                });
+                // the bodies the fingerprint names: everything reachable from k
+                let mut pins = Vec::new();
+                let mut seen = vec![false; comps.len()];
+                let mut work = vec![comp_of[k]];
+                seen[comp_of[k]] = true;
+                while let Some(ci) = work.pop() {
+                    for &m in &comps[ci] {
+                        pins.push(std::sync::Arc::downgrade(arcs[m]));
+                        for &d in &all_edges[m] {
+                            if !seen[comp_of[d]] { seen[comp_of[d]] = true; work.push(comp_of[d]); }
+                        }
+                    }
                 }
-                out.expand(&mut taken);
-                let deps: Vec<u32> = taken.into_iter().map(|x| x.0).collect();
-                out.index.insert(ids[k], out.bodies.len());
-                out.bodies.push((Box::new(raw), Box::new(f), deps));
+                PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner()).insert(ids[k], PrepShared { fp, _pins: pins, body: prepared.clone(), nounwind: asked.into_inner() });
+                if let Some(b) = prepared { out.index.insert(ids[k], b); }
             }
         }
         out
@@ -9480,7 +9583,7 @@ impl InlineBodies {
 
     /// (the body to inline, the body that prices it)
     fn prepared(&self, c: u32) -> Option<(*const relax_backend::rir::Func, *const relax_backend::rir::Func)> {
-        self.index.get(&c).map(|&k| (&*self.bodies[k].0 as *const relax_backend::rir::Func, &*self.bodies[k].1 as *const relax_backend::rir::Func))
+        self.index.get(&c).map(|b| (&b.raw as *const relax_backend::rir::Func, &b.priced as *const relax_backend::rir::Func))
     }
 
     /// Adds the bodies the inlined prepared callees took (hot reload and the cache's
@@ -9490,8 +9593,8 @@ impl InlineBodies {
         let mut k = 0;
         while k < inlined.len() {
             let (c, rule) = inlined[k];
-            if let Some(&b) = self.index.get(&c) {
-                for &d in &self.bodies[b].2 {
+            if let Some(b) = self.index.get(&c) {
+                for &d in &b.deps {
                     if !inlined.iter().any(|x| x.0 == d) { inlined.push((d, rule)); }
                 }
             }
@@ -11726,9 +11829,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             freq
         };
         let queries = crate::nounwind::QueryCx::new(&snap);
-        let candidates: Vec<u32> = snap.iter().map(|x| x.0).collect();
         let (optimized, inline_rules) = queries.optimize(id, func, &mut |func, nounwind| {
-            Ok(tier1_optimize(options, func, id, &name, &candidates, &get, &single, ro, &cfg, nounwind, &mut frequencies))
+            Ok(tier1_optimize(options, func, id, &name, &snap, &get, &single, ro, &cfg, nounwind, &mut frequencies))
         })?;
         func = optimized;
         let mut inlined = Vec::with_capacity(inline_rules.len());
@@ -12966,8 +13068,8 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
 /// O3 had to build a slot's RIR again (code linked from the disk cache has none):
 /// (count, wall ns)
 pub static TIER1_RIR_REBUILT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-/// O3 bottom-up preparation (InlineBodies::prepare): thread cpu ns, bodies simplified, bodies kept
-pub static TIER1_PREP: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// O3 bottom-up preparation (InlineBodies::prepare): thread cpu ns, bodies simplified, bodies kept, shared preparations taken
+pub static TIER1_PREP: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Speculative results waiting for their first call: (slot, wall ns when built). A result
 /// nobody called within MAKEPAD_RUN_SPEC_TTL_MS (default 2000; 0 = keep forever) is dropped with its

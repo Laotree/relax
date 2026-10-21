@@ -3070,7 +3070,7 @@ fn summary_inner(why: &str) {
         let q = jit::TIER_QUEUED.load(Ordering::Relaxed);
         if q > 0 {
             verbose!(
-                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); O3 thread cpu {:.0} ms waiting for snapshots, {:.0} ms building (bottom-up preparation {:.0} ms: {} bodies simplified, {} kept); {} code bytes",
+                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); O3 thread cpu {:.0} ms waiting for snapshots, {:.0} ms building (bottom-up preparation {:.0} ms: {} bodies simplified, {} kept, {} shared); {} code bytes",
                 jit::ahead_level().name(),
                 q,
                 jit::TIER_REVALIDATED.load(Ordering::Relaxed),
@@ -3085,6 +3085,7 @@ fn summary_inner(why: &str) {
                 jit::TIER1_PREP[0].load(Ordering::Relaxed) as f64 / 1e6,
                 jit::TIER1_PREP[1].load(Ordering::Relaxed),
                 jit::TIER1_PREP[2].load(Ordering::Relaxed),
+                jit::TIER1_PREP[3].load(Ordering::Relaxed),
                 s.tier1_code_bytes,
             );
         }
