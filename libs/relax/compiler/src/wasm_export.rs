@@ -97,6 +97,7 @@ fn shake_blocks(f: &mut Func, trap: bool, keep: &dyn Fn(u32) -> bool, mut stub: 
         }
     }
     let (mut trapped, mut removed) = (0, 0);
+    let fname = f.name.clone();
     for (bi, b) in f.blocks.iter_mut().enumerate() {
         if state[bi].is_none() {
             continue;
@@ -109,6 +110,9 @@ fn shake_blocks(f: &mut Func, trap: bool, keep: &dyn Fn(u32) -> bool, mut stub: 
             if let Some(n) = stub.as_deref_mut() {
                 // the replay gate's build: the trap names the block (`env.u(id)` of an id past
                 // every slot)
+                if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_UNTRACED").is_some() {
+                    eprintln!("  block stub {} = {} b{}", *n, fname, bi);
+                }
                 b.insts.push(Inst::Call(relax_backend::rir::Callee::Fn(*n), Vec::new(), Vec::new()));
                 b.pos.push(0);
                 *n += 1;
