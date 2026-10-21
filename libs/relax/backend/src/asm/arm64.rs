@@ -369,14 +369,14 @@ fn parse_mem<'a>(ctx: &Ctx, t: &'a [Tok]) -> Res<Op<'a>> {
     let parts = split_commas(&t[1..close]);
     let Some((base_t, rest)) = parts.split_first() else { return msg("empty memory operand") };
     let base = match reg_at(base_t, 0)? {
-        Some((r, None, n)) if n == base_t.len() && r.k == K::X => r,
+        Some((r, None, n)) if n == base_t.len() && r.k == K::X && (r.n != 31 || r.sp) => r,
         _ => return msg("a memory operand needs an x register or sp as its base"),
     };
     let off = match rest.first() {
         None => Off::None,
         Some(&o) => {
             if let Some((rm, None, n)) = reg_at(o, 0)? {
-                if n != o.len() || !rm.is_gp() {
+                if n != o.len() || !rm.is_gp() || rm.sp {
                     return msg("bad register offset");
                 }
                 let ext = match rest.get(1) {
@@ -470,7 +470,15 @@ fn parse_ops<'a>(ctx: &Ctx, toks: &'a [Tok]) -> Res<Vec<Op<'a>>> {
 
 // operand accessors: a mismatch is the `bad` sentinel
 
+/// a general register or the zero register (not sp)
 fn gp(o: Option<&Op>) -> Res<Reg> {
+    match o {
+        Some(Op::Reg(r, None, None)) if r.is_gp() && !r.sp => Ok(*r),
+        _ => bad(),
+    }
+}
+/// a general register, the zero register or sp
+fn gpsp(o: Option<&Op>) -> Res<Reg> {
     match o {
         Some(Op::Reg(r, None, None)) if r.is_gp() => Ok(*r),
         _ => bad(),
@@ -611,7 +619,7 @@ fn addsub_core(ctx: &mut Ctx, rd: Reg, rn: Reg, third: Option<&Op>, ext: Option<
             match spec {
                 Spec::Page => msg("@PAGE is for adrp"),
                 Spec::PageOff => {
-                    if rd.k != K::X || shift != 0 || sub {
+                    if rd.k != K::X || shift != 0 || sub || (rn.n == 31 && !rn.sp) || (rd.n == 31 && !rd.sp && !s) {
                         return bad();
                     }
                     let v = val(ctx, toks)?;
@@ -627,6 +635,9 @@ fn addsub_core(ctx: &mut Ctx, rd: Reg, rn: Reg, third: Option<&Op>, ext: Option<
                     Ok(())
                 }
                 Spec::None => {
+                    if (rn.n == 31 && !rn.sp) || (rd.n == 31 && !rd.sp && !s) {
+                        return bad();
+                    }
                     let mut k = const_i64(ctx, toks)?;
                     if k < 0 {
                         k = k.checked_neg().ok_or("immediate out of range")?;
@@ -643,9 +654,14 @@ fn addsub_core(ctx: &mut Ctx, rd: Reg, rn: Reg, third: Option<&Op>, ext: Option<
                 }
             }
         }
-        Some(Op::Reg(rm, None, None)) if rm.is_gp() => {
+        Some(Op::Reg(rm, None, None)) if rm.is_gp() && !rm.sp => {
             let ext_kind = matches!(ext, Some(Op::Ext(n, _)) if n.starts_with("uxt") || n.starts_with("sxt"));
-            let need_ext = ext_kind || rn.sp || (rd.sp && !s);
+            // `add x0, x1, w2, lsl #3` is the extended form with uxtw
+            let lsl_ext = matches!(ext, Some(Op::Ext(n, _)) if n == "lsl") && s && rd.k == K::X && rm.k == K::W;
+            if (rn.sp || (rd.sp && !s)) && rd.k == K::X && rm.k == K::W && !ext_kind && !(s && lsl_ext) {
+                return bad();
+            }
+            let need_ext = ext_kind || lsl_ext || rn.sp || (rd.sp && !s);
             if !need_ext {
                 let (shift, amt) = match ext {
                     None => (0, 0),
@@ -666,7 +682,10 @@ fn addsub_core(ctx: &mut Ctx, rd: Reg, rn: Reg, third: Option<&Op>, ext: Option<
                 let amt = range(amt, 0, rd.bits() as i64 - 1, "shift amount")?;
                 w(ctx, 0x0B00_0000 | sf << 31 | (sub as u32) << 30 | (s as u32) << 29 | shift << 22 | rm.n() << 16 | amt << 10 | rn.n() << 5 | rd.n());
             } else {
-                let lsl_opt = if rd.k == K::X { 3 } else { 2 };
+                if (rn.n == 31 && !rn.sp) || (rd.n == 31 && !rd.sp && !s) {
+                    return bad();
+                }
+                let lsl_opt = if rm.k == K::X { 3 } else { 2 };
                 let (opt, amt) = match ext {
                     None => (lsl_opt, 0),
                     Some(Op::Ext(n, a)) => (
@@ -686,7 +705,14 @@ fn addsub_core(ctx: &mut Ctx, rd: Reg, rn: Reg, third: Option<&Op>, ext: Option<
                     ),
                     _ => return bad(),
                 };
-                if (opt & 3 == 3) != (rm.k == K::X) {
+                // x registers extended from w (uxtb .. sxtw), or from x (uxtx / sxtx / lsl); a w
+                // destination takes w sources with any option
+                let ok = if rd.k == K::X {
+                    ((opt & 3 == 3) == (rm.k == K::X) || (s && rm.k == K::W && opt == 7))
+                } else {
+                    rm.k == K::W
+                };
+                if !ok {
                     return bad();
                 }
                 let amt = range(amt, 0, 4, "extend shift amount")?;
@@ -705,7 +731,7 @@ fn logical_core(ctx: &mut Ctx, rd: Reg, rn: Reg, third: Option<&Op>, ext: Option
     let sf = rd.sf();
     match third {
         Some(Op::Expr { toks, spec: Spec::None }) => {
-            if ext.is_some() || rn.sp || (rd.sp && opc == 3) {
+            if ext.is_some() || rn.sp || (rd.sp && opc == 3) || (rd.n == 31 && !rd.sp && opc != 3) {
                 return bad();
             }
             let k = const_i64(ctx, toks)?;
@@ -725,7 +751,7 @@ fn logical_core(ctx: &mut Ctx, rd: Reg, rn: Reg, third: Option<&Op>, ext: Option
             w(ctx, 0x1200_0000 | sf << 31 | opc << 29 | e << 10 | rn.n() << 5 | rd.n());
             Ok(())
         }
-        Some(Op::Reg(rm, None, None)) if rm.is_gp() => {
+        Some(Op::Reg(rm, None, None)) if rm.is_gp() && !rm.sp => {
             if rd.sp || rn.sp || rm.k != rd.k {
                 return bad();
             }
@@ -764,14 +790,8 @@ fn mov_imm(ctx: &mut Ctx, rd: Reg, k: i64) -> Res<()> {
     let bits = rd.bits();
     let sf = rd.sf();
     let mask = if bits == 32 { 0xffff_ffffu64 } else { !0u64 };
-    let v: u64 = if bits == 32 {
-        if k < i32::MIN as i64 || k > u32::MAX as i64 {
-            return msg("immediate out of range for a 32-bit register");
-        }
-        k as u32 as u64
-    } else {
-        k as u64
-    };
+    // LLVM truncates the immediate of a w register to 32 bits
+    let v: u64 = if bits == 32 { k as u32 as u64 } else { k as u64 };
     let wide = |val: u64| -> Option<(u32, u32)> {
         if val == 0 {
             return Some((0, 0));
@@ -779,13 +799,18 @@ fn mov_imm(ctx: &mut Ctx, rd: Reg, k: i64) -> Res<()> {
         (0..bits / 16).find(|hw| val & !(0xffffu64 << (16 * hw)) == 0).map(|hw| (hw, (val >> (16 * hw)) as u32))
     };
     if rd.sp {
-        return bad();
+        if bits == 32 && !(i32::MIN as i64..=u32::MAX as i64).contains(&k) {
+            return msg("immediate out of range for a 32-bit register");
+        }
+        let e = enc_bitmask(v, bits).ok_or("immediate cannot be encoded as a logical immediate")?;
+        w(ctx, 0x3200_0000 | sf << 31 | e << 10 | 31 << 5 | 31);
+        return Ok(());
     }
     if let Some((hw, i)) = wide(v) {
         w(ctx, 0x5280_0000 | sf << 31 | hw << 21 | i << 5 | rd.n());
     } else if let Some((hw, i)) = wide(!v & mask) {
         w(ctx, 0x1280_0000 | sf << 31 | hw << 21 | i << 5 | rd.n());
-    } else if let Some(e) = enc_bitmask(v, bits) {
+    } else if let (Some(e), false, true) = (enc_bitmask(v, bits), rd.n == 31, bits == 64 || (i32::MIN as i64..=u32::MAX as i64).contains(&k)) {
         w(ctx, 0x3200_0000 | sf << 31 | e << 10 | 31 << 5 | rd.n());
     } else {
         return msg("immediate cannot be moved by a single instruction");
@@ -819,10 +844,10 @@ fn int_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
     match mn {
         "add" | "adds" | "sub" | "subs" => {
             let (sub, s) = (mn.starts_with("sub"), mn.ends_with('s'));
-            addsub_core(ctx, gp(o.first())?, gp(o.get(1))?, o.get(2), o.get(3), sub, s)?;
+            addsub_core(ctx, gpsp(o.first())?, gpsp(o.get(1))?, o.get(2), o.get(3), sub, s)?;
         }
         "cmp" | "cmn" => {
-            let rn = gp(o.first())?;
+            let rn = gpsp(o.first())?;
             addsub_core(ctx, Reg::zr(rn.k), rn, o.get(1), o.get(2), mn == "cmp", true)?;
         }
         "neg" | "negs" => {
@@ -846,7 +871,7 @@ fn int_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
                 "eon" => (2, true),
                 _ => (3, true),
             };
-            logical_core(ctx, gp(o.first())?, gp(o.get(1))?, o.get(2), o.get(3), opc, inv)?;
+            logical_core(ctx, gpsp(o.first())?, gp(o.get(1))?, o.get(2), o.get(3), opc, inv)?;
         }
         "tst" => {
             let rn = gp(o.first())?;
@@ -862,7 +887,7 @@ fn int_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
             }
             match (&o[0], &o[1]) {
                 (Op::Reg(rd, None, None), Op::Reg(rm, None, None)) if rd.is_gp() && rm.is_gp() => {
-                    if rd.k != rm.k {
+                    if rd.k != rm.k || (rd.sp && rm.n == 31 && !rm.sp) || (rm.sp && rd.n == 31 && !rd.sp) {
                         return bad();
                     }
                     if rd.sp || rm.sp {
@@ -935,7 +960,7 @@ fn int_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
             let sf = rd.sf();
             let size = rd.bits() as i64;
             match o.get(2) {
-                Some(Op::Reg(rm, None, None)) if rm.k == rd.k => w(ctx, 0x1AC0_2000 | sf << 31 | kind << 10 | rm.n() << 16 | rn.n() << 5 | rd.n()),
+                Some(Op::Reg(rm, None, None)) if rm.k == rd.k && !rm.sp => w(ctx, 0x1AC0_2000 | sf << 31 | kind << 10 | rm.n() << 16 | rn.n() << 5 | rd.n()),
                 _ => {
                     let k = imm(ctx, o.get(2))?;
                     range(k, 0, size - 1, "shift amount")?;
@@ -981,9 +1006,12 @@ fn int_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
                 "h" => 15,
                 _ => 31,
             };
-            if mn == "sxtw" && rd.k != K::X || mn.starts_with('u') && rd.k != K::W || rn.k != K::W && !(mn.starts_with('s') && rd.k == K::X) {
+            let signed_x = mn.starts_with('s') && rd.k == K::X && rn.k == K::X;
+            if mn == "sxtw" && rd.k != K::X || (rn.k != K::W && !signed_x) {
                 return bad();
             }
+            // `uxtb x0, w1` is the 32-bit uxtb
+            let rd = if mn.starts_with('u') { Reg { k: K::W, ..rd } } else { rd };
             bfm(ctx, if mn.starts_with('u') { UBFM } else { SBFM }, rd, Reg { k: rd.k, ..rn }, 0, imms)?;
         }
         "extr" => {
@@ -995,7 +1023,7 @@ fn int_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
         }
         "uxtw" => {
             let rd = gp_k(o.first(), K::X)?;
-            let rn = gp_k(o.get(1), K::W)?;
+            let rn = gp(o.get(1))?;
             bfm(ctx, UBFM, rd, Reg { k: K::X, ..rn }, 0, 31)?;
         }
         m if m.starts_with("crc32") && (m.len() == 6 || m.len() == 7) => {
@@ -1039,14 +1067,21 @@ fn int_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
         }
         "cset" | "csetm" => {
             let rd = gp(o.first())?;
-            let c = cond(o.get(1))? ^ 1;
+            let c = cond(o.get(1))?;
+            if c >= 14 {
+                return msg("the condition of cset / csetm cannot be al or nv");
+            }
+            let c = c ^ 1;
             csel(ctx, if mn == "cset" { "csinc" } else { "csinv" }, rd, Reg::zr(rd.k), Reg::zr(rd.k), c);
         }
         "cinc" | "cinv" | "cneg" => {
             let rd = gp(o.first())?;
             let rn = gp_k(o.get(1), rd.k)?;
-            let c = cond(o.get(2))? ^ 1;
-            csel(ctx, &format!("cs{}", &mn[1..]), rd, rn, rn, c);
+            let c = cond(o.get(2))?;
+            if c >= 14 {
+                return msg("the condition of cinc / cinv / cneg cannot be al or nv");
+            }
+            csel(ctx, &format!("cs{}", &mn[1..]), rd, rn, rn, c ^ 1);
         }
         "ccmp" | "ccmn" => {
             let rn = gp(o.first())?;
@@ -1183,7 +1218,7 @@ fn ldst(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<()> {
     };
     let unscaled = kind != 0;
     let rt = match o.first() {
-        Some(Op::Reg(r, None, None)) if r.is_gp() || r.is_fp() => *r,
+        Some(Op::Reg(r, None, None)) if (r.is_gp() && !r.sp) || r.is_fp() => *r,
         _ => return bad(),
     };
     let (size, v, opc, scale) = ls_class(&base, rt)?;
@@ -1241,7 +1276,7 @@ fn ldst(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<()> {
                 }
                 _ => {
                     let k = mem_const(m)?;
-                    if kind >= 2 && (post.is_some() || m.pre) {
+                    if (kind >= 1 && (post.is_some() || m.pre)) || (m.pre && matches!(m.off, Off::None)) {
                         return bad();
                     }
                     if let Some(p) = post {
@@ -1364,7 +1399,7 @@ fn ldstp(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<()> {
     let load = mn.starts_with("ld") as u32;
     let nt = mn.ends_with("np");
     let rt = match o.first() {
-        Some(Op::Reg(r, None, None)) if r.is_gp() || r.is_fp() => *r,
+        Some(Op::Reg(r, None, None)) if (r.is_gp() && !r.sp) || r.is_fp() => *r,
         _ => return bad(),
     };
     let rt2 = match o.get(1) {
@@ -1383,6 +1418,9 @@ fn ldstp(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<()> {
     let Some(Op::Mem(m)) = o.get(2) else { return bad() };
     let post = o.get(3);
     let k = mem_const(m)?;
+    if (m.pre && matches!(m.off, Off::None)) || (load == 1 && rt.n == rt2.n && !nt && (rt.is_fp() || (!m.pre && (post.is_none() || mn == "ldpsw")))) || ((m.pre || post.is_some()) && !rt.is_fp() && m.base.n != 31 && (m.base.n == rt.n || m.base.n == rt2.n)) {
+        return bad();
+    }
     let idx = if nt {
         if post.is_some() || m.pre {
             return bad();
@@ -1795,7 +1833,13 @@ fn sys_insn(ctx: &mut Ctx, mn: &str, o: &[Op]) -> Res<bool> {
             hint(ctx, 32 + n * 2)
         }
         "dmb" | "dsb" | "isb" => {
-            let crm = if o.is_empty() && mn == "isb" { 15 } else { barrier_opt(ctx, o.first())? };
+            let crm = if mn == "isb" && (o.is_empty() || name(o.first()).is_ok_and(|n| n == "sy")) {
+                15
+            } else if mn == "isb" && name(o.first()).is_ok() {
+                return bad();
+            } else {
+                barrier_opt(ctx, o.first())?
+            };
             w(ctx, (match mn {
                 "dsb" => 0xD503_309F,
                 "dmb" => 0xD503_30BF,
