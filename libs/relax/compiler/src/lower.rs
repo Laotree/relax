@@ -253,6 +253,8 @@ pub struct Lcx<'a> {
     /// the next indirect call is a virtual call of a #[track_caller] trait method: it passes
     /// the caller location (the vtable holds the tracked fn itself)
     indirect_tracked: bool,
+    /// integer SIMD values evaluated at compile time: (slot base, offset) -> their bytes
+    pub(crate) simd_consts: HashMap<(u32, i32), Vec<u8>>,
     /// temporaries whose lifetime a `let` extends to the end of its block (`let r = &make();`),
     /// one list per drop scope (parallel to `scopes`)
     /// temporaries living to the end of a scope (let-extended; `while let` scrutinees), with
@@ -400,6 +402,7 @@ impl<'a> Lcx<'a> {
             guard_flags: HashMap::default(),
             cond_rescope: None,
             indirect_tracked: false,
+            simd_consts: HashMap::default(),
             extend_ops: Default::default(),
             pat_path: None,
             field_moved: HashMap::default(),
@@ -991,12 +994,20 @@ impl<'a> Lcx<'a> {
                 // a pointer-sized leaf the type's niche keeps from 0 (references, Box, NonNull,
                 // a Vec's buffer pointer): codegen folds its null tests (Func::nonnull)
                 let nn = l.niche.filter(|n| n.bytes == 8 && n.start >= 1 && n.start <= n.end).map(|n| n.off);
+                // an unsigned scalar leaf the niche limits to start..=end (char, bool, enum
+                // tags): value ranges decide its niche tests (Func::ranged)
+                let rg = l.niche.filter(|n| n.bytes < 8 && n.start <= n.end && (n.start > 0 || n.end < (1u128 << (8 * n.bytes)) - 1));
                 let mut v = Vec::with_capacity(leaves.len());
                 for lf in leaves {
                     let d = self.f.vreg(lf.cls);
                     self.emit(Inst::Load(lf.mem, d, base, off + lf.off as i32));
                     if nn == Some(lf.off) && matches!(lf.mem, relax_backend::rir::Mem::Int(8, _)) {
                         self.f.nonnull.push(d);
+                    }
+                    if let (Some(n), relax_backend::rir::Mem::Int(b, false)) = (rg, lf.mem) {
+                        if n.off == lf.off && n.bytes == b as u32 {
+                            self.f.ranged.push((d, b, n.start as u64, n.end as u64));
+                        }
                     }
                     v.push(d);
                 }
@@ -6056,6 +6067,11 @@ impl<'a> Lcx<'a> {
             }
             ExprKind::Unsafe(b) => self.lower_block(*b),
             ExprKind::ConstBlock(b) => {
+                // an integer SIMD vector (simd_shuffle's index, `const { .. }` in core::simd's
+                // swizzles): evaluated here, its lanes known to the SIMD intrinsics
+                if let Some(v) = self.simd_const_block(*b, t) {
+                    return v;
+                }
                 let previous = self.overflow_checks;
                 self.overflow_checks = true;
                 let value = self.lower_block(*b);
@@ -6704,7 +6720,7 @@ impl<'a> Lcx<'a> {
                 d
             }
             // type layouts never have vector leaves
-            Cls::F64 | Cls::V128 => {
+            Cls::F64 | Cls::V128 | Cls::V256 => {
                 let d = self.f.vreg(Cls::F64);
                 self.emit(Inst::Fconst(d, raw, true));
                 d
@@ -9124,6 +9140,7 @@ impl<'a> Lcx<'a> {
         let callee = match callee {
             Callee::Fn(id) if to_twin => {
                 let twin = self.u.plain_twin(id);
+                if twin != id { self.f.plain_calls = true; }
                 if sret.is_some() && !self.f.sret_callees.contains(&twin) {
                     self.f.sret_callees.push(twin);
                 }
