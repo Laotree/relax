@@ -6064,6 +6064,7 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
     let rir = twin_func.as_ref().unwrap_or_else(|| u.fns[id as usize].rir.as_ref().unwrap());
     let cg = tier0_codegen_rir(options, rir, u.opt.fold, u.opt.layout);
     let func = &cg;
+    crate::wasm_export::capture(id, func);
     // without O3 these are the only compiles: allocate thoroughly
     let env_full;
     let env = if func.baseline || (TIER1_ENABLED.load(Ordering::Relaxed) && !func.full) {
@@ -6884,6 +6885,7 @@ impl O2Work {
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let (func, inlined) = optimize_tree(options, id, prep, &mut done)?;
             let cg = tier0_codegen_rir(options, &func, fold, layout);
+            crate::wasm_export::capture(id, &cg);
             let _scratch = crate::zone_alloc::scratch(&session.runtime);
             let c = relax_codegen::native::compile(options, &cg, &env)?;
             Ok::<_, String>((func, inlined, c))
@@ -13183,6 +13185,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                             }
                         };
                         let cg = tier0_codegen_rir(options, &rir, fold, rotate);
+                        crate::wasm_export::capture(id, &cg);
                         let e = &env;
                         let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: e.opt_regs && !rir.baseline, syms: e.syms, sym_class: e.sym_class };
                         let c = relax_codegen::native::compile(options, &cg, &env)?;
@@ -13434,6 +13437,7 @@ impl BackWork {
             };
             let t1 = cpu_ns();
             let cg = tier0_codegen_rir(options, &rir, fold, rotate);
+            crate::wasm_export::capture(id, &cg);
             let mut env = env;
             env.opt_regs &= !rir.baseline;
             compile_watch(Some((&format!("codegen {}", cg.name), relax_codegen::opt::inst_count(&cg))));

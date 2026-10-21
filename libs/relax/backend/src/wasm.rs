@@ -140,11 +140,21 @@ pub struct Options {
     /// exceptions as `try_table` (exnref); default: the legacy `try`/`catch_all` every engine
     /// runs (and 5 bytes smaller per invoke)
     pub exnref: bool,
+    /// data at the bottom of memory (small addresses: short constants and offsets), the stack
+    /// above it; false: the stack at the bottom (an overflow traps instead of reaching data)
+    pub data_first: bool,
+    /// `local.set x; local.get x` becomes `local.tee x`, or stays on the stack for a single use
+    pub tee: bool,
+    /// cheap single-definition values (small constants, frame addresses used as memory bases)
+    /// are recomputed at each use instead of living in a local
+    pub remat: bool,
+    /// a function with a frame and several returns keeps the caller's stack pointer in a local
+    pub sp0: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { memory64: false, stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false }
+        Options { memory64: false, stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: true, tee: true, remat: true, sp0: true }
     }
 }
 
@@ -166,6 +176,8 @@ pub struct Stats {
     /// functions whose body could not be lowered (id, why): they trap
     pub failed: Vec<(u32, String)>,
     pub untraced_sites: usize,
+    /// (function name, body bytes) of every chosen function
+    pub fn_sizes: Vec<(String, usize)>,
 }
 
 pub struct Output {
@@ -228,6 +240,7 @@ struct Shared {
     untraced_entry: Option<u32>,
     untraced_sites: usize,
     uses_tag: bool,
+    uses_table: bool,
 }
 
 impl Shared {
@@ -275,13 +288,14 @@ pub struct Module<'a> {
 impl<'a> Module<'a> {
     pub fn new(opts: Options) -> Self {
         let stack = (opts.stack_size as u64 + 15) & !15;
+        let data_end = if opts.data_first { 16 } else { stack.max(16) };
         Module {
             opts,
             funcs: Vec::new(),
             fn_ix: HashMap::new(),
             exports: Vec::new(),
             data: Vec::new(),
-            data_end: stack.max(16),
+            data_end,
             sh: Shared {
                 types: Vec::new(),
                 type_ix: HashMap::new(),
@@ -295,6 +309,7 @@ impl<'a> Module<'a> {
                 untraced_entry: None,
                 untraced_sites: 0,
                 uses_tag: false,
+                uses_table: false,
             },
         }
     }
@@ -491,15 +506,22 @@ impl<'a> Module<'a> {
         sz(&mut st, &out, b0, 3);
         // table
         let tlen = self.sh.table.len() as u64;
-        if tlen > 1 {
+        if tlen > 1 || self.sh.uses_table {
             let mut s = vec![1, 0x70, 0];
             uleb(&mut s, tlen);
             let b0 = out.len();
             section(&mut out, 4, &s);
             sz(&mut st, &out, b0, 4);
         }
-        // memory
-        let heap_base = (self.data_end + 15) & !15;
+        // memory: [16, data_end) data, then the stack (growing down from stack_top), then the heap
+        // (data_first); else the stack from 0, then data, then heap
+        let stack_sz = (opts.stack_size as u64 + 15) & !15;
+        let (stack_top, heap_base) = if opts.data_first {
+            let t = ((self.data_end + 15) & !15) + stack_sz;
+            (t, t)
+        } else {
+            (stack_sz, (self.data_end + 15) & !15)
+        };
         let pages = (heap_base + 0xFFFF) / 0x10000 + opts.heap_pages as u64;
         let mut s = vec![1, if m64 { 0x04 } else { 0x00 }];
         uleb(&mut s, pages);
@@ -515,7 +537,6 @@ impl<'a> Module<'a> {
             sz(&mut st, &out, b0, 13);
         }
         // globals: 0 = shadow stack pointer, 1 = heap base (immutable)
-        let stack_top = (opts.stack_size as u64 + 15) & !15;
         let mut s = vec![2];
         let aty = if m64 { 0x7E } else { 0x7F };
         s.extend_from_slice(&[aty, 1, if m64 { 0x42 } else { 0x41 }]);
@@ -643,6 +664,7 @@ impl<'a> Module<'a> {
         st.n_imports = ni;
         st.failed = failed;
         st.untraced_sites = self.sh.untraced_sites;
+        st.fn_sizes = funcs.iter().zip(bodies.iter()).map(|((_, f), b)| (f.name.clone(), b.bytes.len())).collect();
         Output { bytes: out, stats: st }
     }
 }
@@ -960,6 +982,9 @@ struct Fx<'a> {
     last_br0: usize,
     last_transfer: usize,
     last_ret: usize,
+    /// (end, opcode position, local, vreg) of the last `local.set`
+    last_set: (usize, usize, u32, u32),
+    sp0: u32,
     m64: bool,
 }
 
@@ -1004,6 +1029,8 @@ fn lower_func(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &
         last_br0: usize::MAX,
         last_transfer: usize::MAX,
         last_ret: usize::MAX,
+        last_set: (usize::MAX, 0, 0, 0),
+        sp0: NONE,
         m64: o.memory64,
     };
     fx.check()?;
@@ -1013,7 +1040,9 @@ fn lower_func(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &
     fx.slot_at = slot_at;
     fx.frame = frame;
     let has_invoke = f.blocks.iter().any(|b| matches!(b.term, Term::Invoke(..)));
-    let locals = fx.colour(frame > 0 || has_invoke)?;
+    let n_ret = fx.cfg.rpo.iter().filter(|b| matches!(f.blocks[**b as usize].term, Term::Ret(_))).count();
+    let want_sp0 = o.sp0 && frame > 0 && n_ret >= 2;
+    let locals = fx.colour(frame > 0 || has_invoke, want_sp0)?;
     // locals declaration
     let mut body = Vec::new();
     let mut runs: Vec<(u32, Val)> = Vec::new();
@@ -1032,6 +1061,11 @@ fn lower_func(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &
     // prologue
     if frame > 0 {
         fx.out.extend_from_slice(&[GGET, 0]);
+        if fx.sp0 != NONE {
+            fx.out.push(LTEE);
+            let l = fx.sp0;
+            uleb(&mut fx.out, l as u64);
+        }
         fx.aconst(frame as i64);
         fx.out.push(if fx.m64 { I64_SUB } else { I32_SUB });
         fx.out.push(LTEE);
@@ -1266,6 +1300,43 @@ impl<'a> Fx<'a> {
                 self.fold_ops(b, &ops, &mut cur, &defs);
             }
         }
+        if self.o.remat {
+            self.plan_remat(&defs);
+        }
+    }
+
+    /// Single-definition values cheaper to recompute at each use than to keep in a local.
+    fn plan_remat(&mut self, defs: &[u32]) {
+        let f = self.f;
+        // uses as a memory base (an address operand folds the frame offset into the access)
+        let mut base_uses = vec![0u32; f.vregs.len()];
+        for &b in &self.cfg.rpo {
+            for i in &f.blocks[b as usize].insts {
+                match i {
+                    Inst::Load(_, _, a, _) | Inst::Store(_, a, _, _) | Inst::VLoad(_, a, _) | Inst::VStore(a, _, _) | Inst::LoadX(_, _, a, _, _, _) | Inst::StoreX(_, a, _, _, _, _) => base_uses[a.0 as usize] += 1,
+                    _ => {}
+                }
+            }
+        }
+        let small = |k: i64| -> bool { (-64..64).contains(&k) || (-8192..8192).contains(&k) };
+        for &b in &self.cfg.rpo {
+            for (i, x) in f.blocks[b as usize].insts.iter().enumerate() {
+                if self.folded[b as usize][i] {
+                    continue;
+                }
+                let d = match x {
+                    Inst::Iconst(d, k) if small(*k) => *d,
+                    Inst::Addr(d, s) | Inst::TlsAddr(d, s) if small(self.link.sym(s.id).wrapping_add(s.off as u64) as i64) => *d,
+                    Inst::SlotAddr(d, _) if self.uses[d.0 as usize] <= 2 * base_uses[d.0 as usize] + 1 => *d,
+                    _ => continue,
+                };
+                if defs[d.0 as usize] != 1 || self.uses[d.0 as usize] < 2 {
+                    continue;
+                }
+                self.folded[b as usize][i] = true;
+                self.fold_def[d.0 as usize] = (b, i as u32);
+            }
+        }
     }
 
     fn fold_ops(&mut self, b: u32, ops: &[VReg], cur: &mut isize, defs: &[u32]) {
@@ -1292,7 +1363,7 @@ impl<'a> Fx<'a> {
 
     /// Liveness, interference and greedy colouring: a local per non-folded vreg; returns the
     /// declared (non-param) locals' types in index order.
-    fn colour(&mut self, want_fp: bool) -> Result<Vec<Val>, String> {
+    fn colour(&mut self, want_fp: bool, want_sp0: bool) -> Result<Vec<Val>, String> {
         let f = self.f;
         let nv = f.vregs.len();
         let words = (nv + 63) / 64;
@@ -1515,6 +1586,7 @@ impl<'a> Fx<'a> {
         };
         let aty = if self.m64 { Val::I64 } else { Val::I32 };
         let fpc = if want_fp { extra(aty, 1 << 20, &mut ctype, &mut cuse) } else { NONE };
+        let sp0c = if want_sp0 { extra(aty, 1 << 19, &mut ctype, &mut cuse) } else { NONE };
         let needs_tmp = f.blocks.iter().any(|b| matches!(b.term, Term::Switch(..)) || b.insts.iter().any(|i| matches!(i, Inst::AtomicRmw(..) | Inst::AtomicCas(..))));
         let tmpc = if needs_tmp { extra(Val::I64, 1, &mut ctype, &mut cuse) } else { NONE };
         let lblc = if self.dispatch { extra(Val::I32, 1 << 10, &mut ctype, &mut cuse) } else { NONE };
@@ -1543,6 +1615,7 @@ impl<'a> Fx<'a> {
             }
         }
         self.fp = if fpc != NONE { cmap[fpc as usize] } else { NONE };
+        self.sp0 = if sp0c != NONE { cmap[sp0c as usize] } else { NONE };
         self.tmp64 = if tmpc != NONE { cmap[tmpc as usize] } else { NONE };
         self.lbl = if lblc != NONE { cmap[lblc as usize] } else { NONE };
         Ok(rest.iter().map(|c| ctype[*c as usize]).collect())
@@ -1646,13 +1719,23 @@ impl<'a> Fx<'a> {
 
     /// Pushes vreg `v` (from its tree or its local) in the form `want`; Addr returns the memarg
     /// offset.
-    fn value(&mut self, b: u32, v: VReg, want: Want) -> Result<u64, String> {
+    fn value(&mut self, _b: u32, v: VReg, want: Want) -> Result<u64, String> {
         let (fb, fi) = self.fold_def[v.0 as usize];
         if fb != NONE {
-            debug_assert_eq!(fb, b);
             return self.expr(fb, fi as usize, want);
         }
         let l = self.loc[v.0 as usize];
+        if l != NONE && self.o.tee && self.last_set.0 == self.out.len() && self.last_set.2 == l && self.last_set.3 == v.0 {
+            // the value was just stored: keep it on the stack (tee when it is read again)
+            let at = self.last_set.1;
+            if self.uses[v.0 as usize] == 1 {
+                self.out.truncate(at);
+            } else {
+                self.out[at] = LTEE;
+            }
+            self.last_set.0 = usize::MAX;
+            return self.from_nat(want);
+        }
         if l == NONE {
             // never written: zero of its class
             match self.f.vregs[v.0 as usize] {
@@ -2361,12 +2444,11 @@ impl<'a> Fx<'a> {
                 let ty = self.sh.ty(t);
                 push_args(self)?;
                 self.value(b, *v, Want::Nat)?;
-                if !self.m64 {
-                    self.op(WRAP);
-                }
+                self.op(WRAP);
                 self.op(CALL_INDIRECT);
                 self.fix.push((self.out.len() as u32, Fix::Type(ty)));
                 self.op(0);
+                self.sh.uses_table = true;
             }
         }
         if let (Some(it), 1) = (narrow, rets.len()) {
@@ -2393,7 +2475,9 @@ impl<'a> Fx<'a> {
         if l == NONE || self.uses[d.0 as usize] == 0 {
             self.op(DROP);
         } else {
+            let at = self.out.len();
             self.lset(l);
+            self.last_set = (self.out.len(), at, l, d.0);
         }
     }
 
@@ -2586,7 +2670,10 @@ impl<'a> Fx<'a> {
     }
 
     fn restore_sp(&mut self) {
-        if self.frame > 0 {
+        if self.sp0 != NONE {
+            self.lget(self.sp0);
+            self.out.extend_from_slice(&[GSET, 0]);
+        } else if self.frame > 0 {
             self.lget(self.fp);
             self.aconst(self.frame as i64);
             self.op(if self.m64 { I64_ADD } else { I32_ADD });
@@ -3200,8 +3287,10 @@ fn helper_body(o: &Options, h: Helper, sh: &mut Shared, fn_ix: &HashMap<u32, u32
                         c.extend_from_slice(&[TRY, 0x40]);
                     }
                     g(&mut c, 1);
-                    aw(&mut c, 0);
+                    g(&mut c, 0);
+                    c.push(WRAP);
                     c.push(CALL_INDIRECT);
+                    sh.uses_table = true;
                     fix.push((c.len() as u32, Fix::Type(fty)));
                     c.push(0);
                     c.push(I64C);
