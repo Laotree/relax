@@ -8776,7 +8776,7 @@ unsafe fn build_rir_inner_body(up: *mut Unit, id: u32) -> Result<relax_backend::
                 let value = v.try_to_value(&u.tcx.tys).ok_or("intrinsic const argument did not evaluate")?;
                 let scalar = value.valtree.try_to_leaf().ok_or("intrinsic const argument is not scalar")?;
                 let (size, signed) = match u.tcx.tys.kind(value.ty) {
-                    TyKind::Int(p) => crate::types::Types::int_info(*p),
+                    TyKind::Int(p) => u.tcx.tys.int_info(*p),
                     TyKind::Bool => (1, false),
                     TyKind::Char => (4, false),
                     _ => return Err("intrinsic const argument has a non-scalar type".into()),

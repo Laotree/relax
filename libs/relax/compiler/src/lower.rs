@@ -936,7 +936,7 @@ impl<'a> Lcx<'a> {
     fn int_ty(&self, t: TyId) -> IntTy {
         match self.u.tcx.tys.kind(t) {
             TyKind::Int(p) => {
-                let (b, s) = crate::types::Types::int_info(*p);
+                let (b, s) = self.u.tcx.tys.int_info(*p);
                 IntTy { bits: (b * 8) as u8, signed: s }
             }
             TyKind::Bool => IntTy { bits: 8, signed: false },
@@ -8279,7 +8279,7 @@ impl<'a> Lcx<'a> {
                 let addr = self.place_addr(&place, from);
                 let Some(mut words) = self.load_disc(addr, 0, from) else { return self.unit(); };
                 let repr = self.u.tcx.adts[&d].repr_int.unwrap_or(Prim::Isize);
-                let signed = crate::types::Types::int_info(repr).1;
+                let signed = self.u.tcx.tys.int_info(repr).1;
                 if self.is_wide(to) {
                     if words.len() == 1 {
                         let hi = if signed { { let shift = self.iconst(63); self.ibin(IOp::Shr, true, words[0], shift) } } else { self.iconst(0) };
@@ -8336,9 +8336,10 @@ impl<'a> Lcx<'a> {
                 v.truncate(n);
                 Val::L(v)
             }
-            (TyKind::Int(_), TyKind::Ptr(..)) if crate::web::BASE != 0 && self.int_ty(from).bits == 32 && self.u.prog.session.options.check_target == crate::options::CheckTarget::Web => {
-                // the web target: a 32-bit integer cast to a pointer is a wasm address, the
-                // offset into the linear memory's 4 GB window (web.rs)
+            (TyKind::Int(_), TyKind::Ptr(..)) if crate::web::BASE != 0 && self.int_ty(from).bits == 32 && self.u.prog.session.options.check_target == crate::options::CheckTarget::Web(crate::options::PtrWidth::W64) => {
+                // the wasm64 web target: a 32-bit integer cast to a pointer is a wasm address, the
+                // offset into the linear memory's 4 GB window (web.rs); on wasm32 a pointer is that
+                // offset already
                 let x = if self.int_ty(from).signed {
                     let z = self.f.vreg(Cls::I);
                     self.emit(Inst::IBinI(IOp::And, U64, z, x, 0xffff_ffff));
@@ -11696,7 +11697,7 @@ pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>,
             let d = f.vreg(Cls::I);
             let discr = adt.discriminant_for_variant(&u.tcx, &u.prog, v)?;
             push_at(f, b, pos, Inst::Iconst(d, discr.signed_value() as i64));
-            if crate::types::Types::int_info(discr.ty).0 == 16 {
+            if u.tcx.tys.int_info(discr.ty).0 == 16 {
                 let hi = f.vreg(Cls::I);
                 push_at(f, b, pos, Inst::Iconst(hi, (discr.val >> 64) as i64));
                 vec![d, hi]
@@ -11845,7 +11846,10 @@ pub fn decode_tag_const(u: &Unit, raw: i128, l: &Layout, adt: &crate::tcx::AdtT)
     use crate::layout::TagEnc;
     if l.uninhabited { return None; }
     Some(match l.enc {
-        TagEnc::Direct => crate::tcx::Discr { val: raw as u128, ty: adt.repr_int.unwrap_or(Prim::Isize) }.signed_value(),
+        TagEnc::Direct => {
+            let ty = adt.repr_int.unwrap_or(Prim::Isize);
+            crate::tcx::Discr { val: raw as u128, ty, bytes: u.tcx.tys.int_info(ty).0 }.signed_value()
+        }
         TagEnc::Single(v) => adt.discriminant_for_variant(&u.tcx, &u.prog, v)?.signed_value(),
         TagEnc::Niche { untagged, lo, hi, start } => {
             let bytes = match l.tag {

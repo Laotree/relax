@@ -365,7 +365,7 @@ impl<'a> Ctx<'a> {
     fn int_of(&self, t: TyId) -> Option<(usize, bool)> {
         match self.u.tcx.tys.kind(t) {
             TyKind::Int(p) => {
-                let (b, s) = crate::types::Types::int_info(*p);
+                let (b, s) = self.u.tcx.tys.int_info(*p);
                 Some((b as usize, s))
             }
             TyKind::Bool => Some((1, false)),
