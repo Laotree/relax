@@ -55,6 +55,9 @@ fn validate_package(reg: &Reg, unit: usize, overlays: &std::collections::HashMap
     let features: &[&str] = match u.name.as_str() {
         "makepad_derive_widget" => &["default", "nightly"],
         "makepad_live_id" => &["default"],
+        // the loader's own copy is built with it (relax-native-macros enables it in the loader's
+        // graph): a graph that reaches relax-native-macros (relax-compiler) asks for the same build
+        "makepad_micro_proc_macro" => &["relax-tokens"],
         _ => &[],
     };
     if u.edition != 2021 || !u.features.iter().all(|f| features.contains(&f.as_str())) {

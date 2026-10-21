@@ -357,7 +357,9 @@ pub(crate) fn resolve_package(
         // The boundary audit (`check --boundary`) binds as a run does: what it reports is what
         // JIT-compiled code reaches past the bound ops.
         let machine = crate::cfg::CfgSet::machine(sess, &[]).triple();
-        let bind = crate::cfg::CfgSet::host(sess, &[]).triple() == machine && (!check_only || crate::boundary::requested());
+        // A test harness (`makepad test`) binds none either: its crates are the tests' subject, built
+        // from their source as `cargo test` builds them, internals and all.
+        let bind = crate::cfg::CfgSet::host(sess, &[]).triple() == machine && (!check_only || crate::boundary::requested()) && !HARNESS_RUN.load(Ordering::Acquire);
         // The sources are hashed while the build scripts run (and, for a run's boot, while the
         // program loads): they share nothing (the hash reads the provided packages, the scripts
         // write the graph's cfgs and env).
@@ -487,7 +489,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 i += 1;
             }
             "--ahead" => ahead = true,
-            "--harness" => harness = true,
+            "--harness" => {
+                harness = true;
+                HARNESS_RUN.store(true, Ordering::Release);
+            }
             "--no-fail-fast" => no_fail_fast = true,
             // `makepad selftest --root-only`: the root crate's fns and what they reach
             "--root-only" => root_only = true,
@@ -1736,6 +1741,8 @@ pub struct MainHost {
 
 static MAIN_HOST: std::sync::OnceLock<MainHost> = std::sync::OnceLock::new();
 static HOSTED_RUN: AtomicBool = AtomicBool::new(false);
+/// `makepad run --harness` (`makepad test`): the program is a test harness.
+static HARNESS_RUN: AtomicBool = AtomicBool::new(false);
 static HAL_RUN: AtomicBool = AtomicBool::new(false);
 static APP_DOMAIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 

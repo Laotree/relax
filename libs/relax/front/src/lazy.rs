@@ -570,6 +570,14 @@ impl Plan {
                 demands.insert(name);
             }
         }
+        for c in crates.iter() {
+            // A crate built with `--test` (cfg(test): `makepad test`) is entered at its `#[test]`
+            // fns, wherever they are: all of its own items are demanded, its dependencies' only
+            // as they reach them.
+            if c.cfg.set.iter().any(|x| x == "test") && forced.insert(c.name.clone()) {
+                force_origin.entry(c.name.clone()).or_insert((c.root.clone(), "test harness".into()));
+            }
+        }
         for (ci, c) in crates.iter().enumerate() {
             // The runtime looks up main even when the root only glob-reexports
             // it. No authored identifier at that root seeds this demand.
