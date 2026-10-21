@@ -4072,9 +4072,12 @@ pub fn share_index_bases(f: &Func) -> Option<Func> {
             continue;
         }
         let gf = g.get_or_insert_with(|| f.clone());
-        // rewrite back to front so earlier indices stay valid
+        // the accesses are rewritten in place first, the address definitions spliced in after,
+        // back to front (groups interleave: a load and a store run of one copy loop; splicing a
+        // group's definition first moved the other group's later accesses off their indices)
         let mut plan: Vec<(usize, (VReg, VReg, u8), Vec<usize>)> = worth.iter().map(|(key, ks)| (ks[0], *key, ks.clone())).collect();
         plan.sort_by(|a, b2| b2.0.cmp(&a.0));
+        let mut splices: Vec<(usize, Vec<Inst>)> = Vec::new();
         for (first, (base, x, sh), ks) in plan {
             let p = gf.vreg(Cls::I);
             let mut ins: Vec<Inst> = Vec::new();
@@ -4093,6 +4096,11 @@ pub fn share_index_bases(f: &Func) -> Option<Func> {
                     ref other => other.clone(),
                 };
             }
+            splices.push((first, ins));
+        }
+        // plan is sorted by first index, descending
+        let blk = &mut gf.blocks[bi];
+        for (first, ins) in splices {
             let ps = blk.pos[first];
             let n = ins.len();
             blk.insts.splice(first..first, ins);
