@@ -165,11 +165,13 @@ pub struct Options {
     pub order_by_name: bool,
     /// identical function bodies are emitted once
     pub fold_identical: bool,
+    /// functions ordered by their body bytes (similar bodies adjacent for the compressor)
+    pub order_by_bytes: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, remat_slots: false, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true }
+        Options { stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, remat_slots: false, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true, order_by_bytes: true }
     }
 }
 
@@ -510,7 +512,11 @@ impl<'a> Module<'a> {
         let mut iord: Vec<usize> = (0..ni).collect();
         iord.sort_by(|a, b| fuse[*b].cmp(&fuse[*a]).then(a.cmp(b)));
         let mut dord: Vec<usize> = (ni..ni + n_user + n_help).filter(|g| canon[*g] == *g).collect();
-        if opts.order_by_name {
+        if opts.order_by_bytes {
+            // similar bodies next to each other (the compressor's window): by their bytes
+            let body = |g: usize| -> &[u8] { if g < ni + n_user { &bodies[g - ni].bytes } else { &helper_bodies[g - ni - n_user].bytes } };
+            dord.sort_by(|a, b| body(*a).cmp(body(*b)).then(a.cmp(b)));
+        } else if opts.order_by_name {
             let key = |g: usize| if g < ni + n_user { funcs[g - ni].1.name.as_str() } else { "\u{10FFFF}" };
             dord.sort_by(|a, b| key(*a).cmp(key(*b)).then(a.cmp(b)));
         } else {

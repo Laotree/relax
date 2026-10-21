@@ -322,6 +322,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
                 "sp0" => opts.sp0 = on,
                 "abort" => opts.panic_abort = on,
                 "byname" => opts.order_by_name = on,
+                "bybytes" => opts.order_by_bytes = on,
                 "fold" => opts.fold_identical = on,
                 "st" => single = on,
                 "names" => opts.names = on,
@@ -552,7 +553,14 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
             let ni: usize = f.blocks.iter().map(|b| b.insts.len()).sum();
             txt.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", id, b, ni, f.blocks.len(), calls_in.get(id).copied().unwrap_or(0), taken.contains(id) as u8, kept.contains(id) as u8, n));
         }
-        let _ = std::fs::write(fl.replace("%p", &std::process::id().to_string()), txt);
+        let fl = fl.replace("%p", &std::process::id().to_string());
+        let _ = std::fs::write(&fl, txt);
+        // and the data objects: bytes, what it is, its name or first bytes
+        let mut dt = String::new();
+        for (b, n) in &data_top {
+            dt.push_str(&format!("{}\t{}\n", b, n.chars().take(100).map(|c| if c.is_control() { ' ' } else { c }).collect::<String>()));
+        }
+        let _ = std::fs::write(format!("{}.data", fl), dt);
     }
     if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
         let s = &out.stats;
