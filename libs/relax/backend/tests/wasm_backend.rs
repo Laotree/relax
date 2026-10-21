@@ -67,9 +67,21 @@ fn inst(bytes: &[u8]) -> Instance {
 }
 
 fn run(fs: &[Func], k: usize, args: &[u64]) -> Result<Vec<u64>, Trap> {
-    let (b, _) = build(fs, opts());
+    run_o(fs, k, args, opts())
+}
+
+fn run_o(fs: &[Func], k: usize, args: &[u64], o: Options) -> Result<Vec<u64>, Trap> {
+    let (b, _) = build(fs, o);
     let mut i = inst(&b);
     i.call_export(&format!("f{}", k), args)
+}
+
+/// Runs on both memories (wasm32, wasm64): the results must agree.
+fn run2(fs: &[Func], k: usize, args: &[u64]) -> Result<Vec<u64>, Trap> {
+    let r32 = run_o(fs, k, args, opts());
+    let r64 = run_o(fs, k, args, Options { memory64: true, ..opts() });
+    assert_eq!(r32, r64, "wasm32 and wasm64 differ");
+    r32
 }
 
 struct B {
@@ -363,7 +375,7 @@ fn memory_and_slots() {
     // x = 0x1_0000_00F5: [p] = x, p[9] = 0xF5, q = copy of p, a = (i8)0xF5 = -11, b = p[8..10] = 0xF500, c = q[16..20]? (p + 3*4 + 4 = p + 16) = low 32 of x
     let xv: u64 = 0x1_0000_00F5;
     let want = (-11i64 as u64).wrapping_add(0xF500).wrapping_add(0xF5).wrapping_add(b'd' as u64);
-    assert_eq!(run(&[fu], 0, &[xv]).unwrap(), vec![want]);
+    assert_eq!(run2(&[fu], 0, &[xv]).unwrap(), vec![want]);
 }
 
 /// An atomic read-modify-write reads its address twice: an address computed just before it
@@ -387,7 +399,7 @@ fn atomic_rmw_address_just_set() {
     let sum = f.bin(IOp::Add, I64, r, old);
     f.term(Term::Ret(vec![sum]));
     // [p+8] = 5, old = 5, new = 6: 11
-    assert_eq!(run(&[f.done()], 0, &[5]).unwrap(), vec![11]);
+    assert_eq!(run2(&[f.done()], 0, &[5]).unwrap(), vec![11]);
 }
 
 /// Direct, recursive, indirect, host and untraced calls; multiple results.
@@ -454,9 +466,9 @@ fn calls() {
         }
         a
     };
-    assert_eq!(run(&fs, 0, &[20]).unwrap(), vec![fibr(20)]);
-    assert_eq!(run(&fs, 2, &[9]).unwrap(), vec![fibr(10) + 18 + 7]);
-    assert_eq!(run(&fs, 3, &[]), Err(Trap::Trap("untraced 99".into())));
+    assert_eq!(run2(&fs, 0, &[20]).unwrap(), vec![fibr(20)]);
+    assert_eq!(run2(&fs, 2, &[9]).unwrap(), vec![fibr(10) + 18 + 7]);
+    assert_eq!(run2(&fs, 3, &[]), Err(Trap::Trap("untraced 99".into())));
     // without the import the untraced call is a bare trap
     let (b, st) = build(&fs, Options { untraced_import: false, ..opts() });
     assert_eq!(st.untraced_sites, 1);
@@ -515,15 +527,17 @@ fn unwinding() {
     f.term(Term::Ret(vec![r]));
     let catcher = f.done();
     let fs = [thrower, middle, inner, catcher];
-    let (b, _) = build(&fs, opts());
-    let mut i = inst(&b);
-    let sp0 = i.globals[0];
-    assert_eq!(i.call_export("f1", &[1000, 5]).unwrap(), vec![5]);
-    assert_eq!(i.globals[0], sp0);
-    assert_eq!(i.call_export("f3", &[2000]).unwrap(), vec![1]);
-    assert_eq!(&i.mem[2000..2008], &77u64.to_le_bytes());
-    assert_eq!(i.globals[0], sp0, "the catch restores the shadow stack");
-    assert_eq!(i.call_export("f1", &[1000, 0]), Err(Trap::Exception));
+    for m64 in [false, true] {
+        let (b, _) = build(&fs, Options { memory64: m64, ..opts() });
+        let mut i = inst(&b);
+        let sp0 = i.globals[0];
+        assert_eq!(i.call_export("f1", &[1000, 5]).unwrap(), vec![5]);
+        assert_eq!(i.globals[0], sp0);
+        assert_eq!(i.call_export("f3", &[2000]).unwrap(), vec![1]);
+        assert_eq!(&i.mem[2000..2008], &77u64.to_le_bytes());
+        assert_eq!(i.globals[0], sp0, "the catch restores the shadow stack");
+        assert_eq!(i.call_export("f1", &[1000, 0]), Err(Trap::Exception));
+    }
 }
 
 #[test]
@@ -721,12 +735,14 @@ fn random_programs_match_rir() {
         let args: Vec<u64> = (0..fu.params.len()).map(|_| rng.below(64).wrapping_sub(16)).collect();
         let mut fuel = 200;
         let want = eval(&fu, &args, &mut fuel);
-        let mut m = Module::new(opts());
+        // every other program on memory64 (the wasm64 target)
+        let mut m = Module::new(Options { memory64: checked % 2 == 1, ..opts() });
         m.add_func(0, &fu);
         m.export_func(0, "f");
         let out = m.finish(&options, &L);
         assert!(out.stats.failed.is_empty(), "{:?}\n{}", out.stats.failed, fu.dump());
         let mut i = inst(&out.bytes);
+        assert_eq!(i.mem64, checked % 2 == 1);
         i.max_steps = 200_000;
         let got = i.call_export("f", &args);
         match want {

@@ -1578,6 +1578,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         for (name, d) in &export_defs {
             let en = crate::owner::call(crate::owner::Class::App, || {
                 let id = u.fn_id(FnKey::Inst(*d, Vec::new()));
+                crate::wasm_export::export(id, name);
                 u.entry_direct(id)
             });
             crate::zone_alloc::kept_with(|| addrs.push((name.clone(), en)));

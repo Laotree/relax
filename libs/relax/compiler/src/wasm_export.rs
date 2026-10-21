@@ -349,16 +349,57 @@ pub fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_WASM_EXPORT").is_some())
 }
 
-static ROOTS: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
+/// (slot, export name: None = a test fn, exported as `t<k>` in registration order)
+static ROOTS: Mutex<Vec<(u32, Option<String>)>> = Mutex::new(Vec::new());
 
-/// A function the host calls (a test fn): a root of the export, exported under its name.
-pub fn root(id: u32, name: &str) {
+/// A test fn the harness calls: a root of the export, exported as `t<k>` (the k-th test).
+pub fn root(id: u32, _name: &str) {
+    add_root(id, None);
+}
+
+/// A `#[no_mangle]` / `#[export_name]` fn the embedder calls (`--exports`: the page's `wasm_*`
+/// entries): a root of the export, exported under its symbol name.
+pub fn export(id: u32, symbol: &str) {
+    add_root(id, Some(symbol.to_string()));
+}
+
+fn add_root(id: u32, name: Option<String>) {
     if enabled() {
         let mut r = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
         if !r.iter().any(|x| x.0 == id) {
-            r.push((id, name.to_string()));
+            r.push((id, name));
         }
     }
+}
+
+/// The import module of foreign fn `d` as rustc names it for a wasm target: its extern block's
+/// `#[link(wasm_import_module = "..")]`, else "env" (rustc_codegen_llvm: `wasm_import_module`
+/// defaults to `env`). None: not a foreign item of an extern block.
+fn wasm_import_module(u: &Unit, d: crate::program::DefId) -> Option<String> {
+    let def = u.prog.def(d);
+    let f = &u.prog.files[def.file as usize];
+    let ast = &f.ast;
+    for it in &ast.items {
+        let crate::ast::ItemKind::ForeignMod(r) = &it.kind else { continue };
+        if !ast.list(ast.row(*r).items).contains(&def.item) {
+            continue;
+        }
+        for a in ast.list(it.attrs) {
+            let (lo, hi) = (a.toks.lo, a.toks.hi);
+            if hi <= lo || f.tok_text(lo) != "link" {
+                continue;
+            }
+            let mut t = lo + 1;
+            while t + 2 < hi {
+                if f.tok_text(t) == "wasm_import_module" && f.tok_text(t + 1) == "=" {
+                    return Some(f.tok_text(t + 2).trim_matches('"').to_string());
+                }
+                t += 1;
+            }
+        }
+        return Some("env".to_string());
+    }
+    None
 }
 
 /// Records the RIR slot `id`'s code is compiled from (the last compile of a slot wins).
@@ -548,9 +589,9 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
         funcs
     };
     let mut m = Module::new(opts);
-    let mut roots: Vec<(u32, String)> = ROOTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut roots: Vec<(u32, Option<String>)> = ROOTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if roots.is_empty() {
-        roots.push((ENTRY.load(std::sync::atomic::Ordering::Relaxed), "main".to_string()));
+        roots.push((ENTRY.load(std::sync::atomic::Ordering::Relaxed), None));
     }
     roots.retain(|r| funcs.contains_key(&r.0));
     // roots: the entry and every function whose address any traced code takes (directly or in
@@ -601,10 +642,17 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     for id in &reached {
         m.add_func(*id, &funcs[id]);
     }
-    for (k, (id, name)) in roots.iter().enumerate() {
-        // short export names; MAKEPAD_RUN_WASM_EXPORT_STATS lists them
-        let _ = name;
-        m.export_func(*id, &format!("t{}", k));
+    // the embedder's entries under their symbol names (`wasm_create_app`, ...); test fns (and a
+    // run's entry) as t0, t1, ... in registration order
+    let mut k = 0;
+    for (id, name) in &roots {
+        match name {
+            Some(n) => m.export_func(*id, n),
+            None => {
+                m.export_func(*id, &format!("t{}", k));
+                k += 1;
+            }
+        }
     }
     // symbols the code names
     let mut addr_syms: Vec<u32> = Vec::new();
@@ -628,6 +676,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     host_syms.dedup();
     let mut vals: HashMap<u32, u64> = HashMap::new();
     let mut host: HashMap<u32, HostBind> = HashMap::new();
+    let web = u.prog.session.options.check_target == crate::options::CheckTarget::Web;
     for id in host_syms {
         let b = match u.syms.kind(id) {
             Some(SymKind::Rt(n)) => match n {
@@ -639,8 +688,16 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
                 "rethrow" if abort => HostBind::Trap,
                 n => HostBind::Import("r".into(), n.to_string()),
             },
-            Some(SymKind::Foreign(n)) if single => single_thread(&n).unwrap_or(HostBind::Import("c".into(), n)),
-            Some(SymKind::Foreign(n)) => HostBind::Import("c".into(), n),
+            Some(SymKind::Foreign(n)) => match single.then(|| single_thread(&n)).flatten() {
+                Some(b) => b,
+                // the web target: the module rustc imports it from (the page's `env.js_*`); a
+                // native capture's C symbols are `c.<name>`
+                None => {
+                    let d = u.syms.foreign_defs.lock().unwrap_or_else(|e| e.into_inner()).get(&id).copied();
+                    let module = if web { d.and_then(|d| wasm_import_module(u, d)) } else { None };
+                    HostBind::Import(module.unwrap_or_else(|| "c".into()), n)
+                }
+            },
             Some(SymKind::Provided(k)) => HostBind::Import("p".into(), k),
             _ => HostBind::Trap,
         };
