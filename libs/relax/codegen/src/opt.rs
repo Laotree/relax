@@ -670,6 +670,9 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
     for v in &callee.nonnull {
         f.nonnull.push(vmap[v.0 as usize]);
     }
+    for &(v, n, lo, hi) in &callee.ranged {
+        f.ranged.push((vmap[v.0 as usize], n, lo, hi));
+    }
     let slot_base = f.slots.len() as u32;
     // an inlined body's SlotAddrs were moved by its own optimisation: not `born` here
     f.slots.extend(callee.slots.iter().map(|s| Slot { born: false, ..s.clone() }));
@@ -986,7 +989,8 @@ pub fn promote_vector_slots(f: &mut Func) -> bool {
                     }
                 }
                 Inst::Load(m, _, p, o) | Inst::Store(m, p, o, _) => {
-                    access(p, o, mem_size(m) as u32, matches!(m, Mem::Int(1 | 2 | 4 | 8, _)));
+                    // f32 lanes too (`a.0[0]` of a core::arch __m128: _mm_cvtss_f32, _mm_add_ss)
+                    access(p, o, mem_size(m) as u32, matches!(m, Mem::Int(1 | 2 | 4 | 8, _) | Mem::F32));
                 }
                 Inst::Copy(d, s, n) => {
                     // Copies are split into aligned lanes below, so their byte
@@ -1105,6 +1109,14 @@ pub fn promote_vector_slots(f: &mut Func) -> bool {
                 Inst::Store(Mem::Int(n, _), b, o, x) if cell(b, o).is_some() => {
                     let (v, off) = cell(b, o).unwrap();
                     out.push(Inst::VX(VX::Insert(width(n), off / n), v, v, x));
+                }
+                Inst::Load(Mem::F32, d, b, o) if cell(b, o).is_some() => {
+                    let (v, off) = cell(b, o).unwrap();
+                    out.push(Inst::VExtract(d, v, off / 4));
+                }
+                Inst::Store(Mem::F32, b, o, x) if cell(b, o).is_some() => {
+                    let (v, off) = cell(b, o).unwrap();
+                    out.push(Inst::VInsert(v, v, off / 4, x));
                 }
                 Inst::Copy(d, s, n) if cell(d, 0).is_some() || cell(s, 0).is_some() => {
                     if n % 16 == 0 && [d, s].iter().all(|&p| cell(p, 0).map_or(true, |(_, off)| off == 0)) {
