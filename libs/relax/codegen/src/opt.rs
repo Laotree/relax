@@ -255,7 +255,7 @@ pub fn inline_rule(f: &Func, callee_id: u32, nargs: usize, nrets: usize, attrs: 
 /// its inline attributes. Returns (inlined callee slot, rule) per inlined call site.
 pub fn inline_calls(options: &relax_session::Options, f: &mut Func, self_id: u32, get: &dyn Fn(u32) -> Option<(*const Func, u8)>, nounwind: &dyn Fn(u32) -> bool, lim: &InlineLimits) -> Vec<(u32, usize)> {
     if lim.ordered {
-        return inline_calls_ordered(options, f, self_id, get, &|_, _| false, nounwind, lim, None, None);
+        return inline_calls_ordered(options, f, self_id, get, &|_| None, &|_, _| false, nounwind, lim, None, None);
     }
     let mut inlined = Vec::new();
     let mut budget = lim.budget;
@@ -339,11 +339,16 @@ pub struct InlineStats {
     growth_after: usize,
     pub left: [usize; 5],
     pub rejected: std::collections::BTreeMap<(String, &'static str), usize>,
+    /// calls left in hot blocks (not cold, not panic paths): name, reason, callee size
+    pub hot_rejected: std::collections::BTreeMap<(String, &'static str, usize), usize>,
 }
 
 impl InlineStats {
-    fn reject(&mut self, name: String, reason: usize) {
+    fn reject(&mut self, name: String, reason: usize, hot: Option<usize>) {
         const REASONS: [&str; 5] = ["cold", "no-rir", "no-rule", "budget", "arity"];
+        if let Some(size) = hot {
+            *self.hot_rejected.entry((name.clone(), REASONS[reason], size)).or_default() += 1;
+        }
         self.left[reason] += 1;
         *self.rejected.entry((name, REASONS[reason])).or_default() += 1;
     }
@@ -359,15 +364,26 @@ impl InlineStats {
             name, self.inlined + self.left.iter().sum::<usize>(), self.inlined,
             self.hot_inlined + self.hot_left, self.growth_before.unwrap_or(0), self.growth_after,
             self.left[0], self.left[1], self.left[2], self.left[3], self.left[4], top);
+        if !self.hot_rejected.is_empty() {
+            eprintln!("  hot calls left: {}", self.hot_rejected.iter().map(|((n, why, size), k)| format!("{} ({}, {} insts, {})", n, why, size, k)).collect::<Vec<_>>().join("; "));
+        }
         eprintln!("  rules: {}", RULE_NAMES.iter().zip(self.rules).map(|(rule, n)| format!("{} {}", rule, n)).collect::<Vec<_>>().join(", "));
     }
+}
+
+/// O3's caller growth ceiling: max(4x, +8000) instructions. Bottom-up inlining (callees bring
+/// their own inlining, priced by their optimised bodies) made the room usable: max(2x, +4000)
+/// refused html_parse's and maps' hot sites for budget (html 0.66, maps 0.97, text_shape 0.985,
+/// geomean 0.969 vs 2x); top-down, the same room had cost text_shape 5% and Stage 4.6% (INL3).
+pub fn growth_ceiling(size: usize) -> usize {
+    size.saturating_mul(4).max(size.saturating_add(8000))
 }
 
 impl InlineLimits {
     pub fn tier1_for(f: &Func) -> Self {
         let mut lim = Self::tier1();
         let size = inline_inst_count(f);
-        lim.growth_limit = Some(size.saturating_mul(2).max(size.saturating_add(4000)));
+        lim.growth_limit = Some(growth_ceiling(size));
         lim
     }
 }
@@ -408,7 +424,11 @@ fn site_rule(options: &relax_session::Options, callee: &Func, id: u32, nargs: us
 /// The queue uses stable block/instruction indices: splitting invalidates only the tail,
 /// whose calls are enqueued again in the new continuation block.
 /// `single(caller, callee)` proves that caller's O1 body owns the sole reference.
-pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self_id: u32, get: &dyn Fn(u32) -> Option<(*const Func, u8)>, single: &dyn Fn(u32, u32) -> bool, nounwind: &dyn Fn(u32) -> bool, lim: &InlineLimits, freqs: Option<&[f32]>, mut stats: Option<&mut InlineStats>) -> Vec<(u32, usize)> {
+/// `prepared(callee)`: the callee bottom-up (O3), as (the body to inline: its own first inlining
+/// round, unoptimised; the optimised body that prices the site). A site takes it when the priced
+/// body passes the rules and fits, charging the growth ceiling with the priced size; otherwise
+/// the site is decided on `get`'s body as before (top-down), whose calls then come up here again.
+pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self_id: u32, get: &dyn Fn(u32) -> Option<(*const Func, u8)>, prepared: &dyn Fn(u32) -> Option<(*const Func, *const Func)>, single: &dyn Fn(u32, u32) -> bool, nounwind: &dyn Fn(u32) -> bool, lim: &InlineLimits, freqs: Option<&[f32]>, mut stats: Option<&mut InlineStats>) -> Vec<(u32, usize)> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
     let depths = relax_backend::regalloc::loop_depths(f, &reachable(f));
@@ -422,7 +442,9 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
     let mut queue = BinaryHeap::new();
     let mut budget = lim.budget;
     let mut inst_count = inline_inst_count(f);
-    let mut growth_limit = lim.growth_limit.unwrap_or_else(|| inst_count.saturating_mul(2).max(inst_count.saturating_add(4000)));
+    let mut growth_limit = lim.growth_limit.unwrap_or_else(|| growth_ceiling(inst_count));
+    // the size the ceiling sees: the actual size, but a priced callee counts its priced size
+    let mut priced = inst_count;
     // Keep the separate raw-size free allowance.
     let mut free_budget = if opt_off(options, "-freecap") { usize::MAX } else { InlineLimits::tier1().budget };
     let mut inlined = Vec::new();
@@ -431,6 +453,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
         s.hot_left = 0;
         s.left = [0; 5];
         s.rejected.clear();
+        s.hot_rejected.clear();
     }
     // Scalar closure combinators do not carry a per-element call penalty.
     // Look through adapter forwarding bodies for an actual loop before giving
@@ -459,7 +482,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
             for (ii, inst) in f.blocks[bi].insts.iter().enumerate() {
                 if let Inst::Call(Callee::Fn(id), _, _) = inst {
                     let found = get(*id);
-                    let size = found.map_or(usize::MAX, |(p, _)| inline_inst_count(unsafe { &*p }));
+                    let size = found.map_or(usize::MAX, |(p, _)| inline_inst_count(unsafe { &*prepared(*id).map_or(p, |x| x.1) }));
                     // Closure adapters need to be fused as a chain. Importing
                     // their loop after unrelated work has spent the budget
                     // leaves an indirect/aggregate call on every iteration.
@@ -483,50 +506,50 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
         }
     };
     enqueue(f, 0, &priorities, &loop_sites, &mut queue);
-    while let Some((_, _, Reverse(size), Reverse(bi), Reverse(ii))) = queue.pop() {
+    while let Some((_, _, _, Reverse(bi), Reverse(ii))) = queue.pop() {
         let Some(Inst::Call(Callee::Fn(id), args, rets)) = f.blocks[bi].insts.get(ii) else { continue };
         let (id, args, rets) = (*id, args.clone(), rets.clone());
         let found = get(id);
-        let callee = found.map(|(p, _)| unsafe { &*p });
-        let cost = size.saturating_sub(args.len() + rets.len() + 3);
-        // Preserve the raw-size R13 free cap; the paid budget charges net growth.
-        let free = size <= INLINE_FREE_INSTS && size <= free_budget;
-        // A tiny body (no bigger than the call's own argument/return moves, or within the free
-        // size) is admitted whatever the caller has grown to: refusing it keeps a call that costs
-        // more than the body (sandbox leap, node: encode_cascades left core::mem::drop x130,
-        // rc::header_of x140, slice::iter::next x26 as calls -- "budget" -- once big chains had
-        // filled the growth ceiling). Only the raw free allowance is charged for it.
-        let tiny = size <= INLINE_FREE_INSTS;
-        // ... and one no bigger than the call itself costs nothing: no allowance at all.
-        let no_growth = cost == 0;
-        let rule = found.and_then(|(_, attrs)| site_rule(options, callee.unwrap(), id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), id), ancestry[bi].len() - 1, multi_depths[bi], lim));
-        // New admissions respect the actual growth ceiling, including ABI moves.
-        let growth = callee.map_or(0, |c| size.saturating_add(args.len()).saturating_add(
-            c.blocks.iter().filter(|b| matches!(b.term, Term::Ret(_))).count().saturating_mul(rets.len())
-        ).saturating_sub(1));
-        let reason = if matches!(f.blocks[bi].term, Term::Unreachable | Term::Resume) {
-            Some(0)
-        } else if callee.is_none() {
-            Some(1)
-        } else if ancestry[bi].contains(&id) || rule.is_none() {
-            Some(2)
-        } else if found.unwrap().1 & ATTR_COLD != 0 && !free && rule != Some(RULE_COST) {
-            Some(0)
-        } else if callee.unwrap().params.len() != args.len() || callee.unwrap().rets.len() != rets.len() {
-            Some(4)
-        } else if match rule.unwrap() {
-            _ if no_growth => false,
-            RULE_COST => size > free_budget || !tiny && inst_count.saturating_add(growth) > growth_limit,
-            RULE_SINGLE => inst_count.saturating_add(growth) > growth_limit,
-            _ => !free && (cost > budget || !tiny && inst_count > growth_limit),
-        } {
-            Some(3)
-        } else {
-            None
-        };
-        if reason.is_some() {
-            continue;
+        // the bottom-up body first, then the snapshot body: (inlined body, priced body)
+        let mut pick = None;
+        for (bottom_up, (body, shape)) in prepared(id).map(|x| (true, x)).into_iter().chain(found.map(|(p, _)| (false, (p, p)))) {
+            let (callee, shape) = unsafe { (&*body, &*shape) };
+            let size = inline_inst_count(shape);
+            let cost = size.saturating_sub(args.len() + rets.len() + 3);
+            // Preserve the raw-size R13 free cap; the paid budget charges net growth.
+            let free = size <= INLINE_FREE_INSTS && size <= free_budget;
+            // A tiny body (no bigger than the call's own argument/return moves, or within the free
+            // size) is admitted whatever the caller has grown to: refusing it keeps a call that costs
+            // more than the body (sandbox leap, node: encode_cascades left core::mem::drop x130,
+            // rc::header_of x140, slice::iter::next x26 as calls -- "budget" -- once big chains had
+            // filled the growth ceiling). Only the raw free allowance is charged for it.
+            let tiny = size <= INLINE_FREE_INSTS;
+            // ... and one no bigger than the call itself costs nothing: no allowance at all.
+            let no_growth = cost == 0;
+            let attrs = found.unwrap().1;
+            let rule = site_rule(options, shape, id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), id), ancestry[bi].len() - 1, multi_depths[bi], lim);
+            // New admissions respect the actual growth ceiling, including ABI moves.
+            let growth = size.saturating_add(args.len()).saturating_add(
+                shape.blocks.iter().filter(|b| matches!(b.term, Term::Ret(_))).count().saturating_mul(rets.len())
+            ).saturating_sub(1);
+            let refused = matches!(f.blocks[bi].term, Term::Unreachable | Term::Resume)
+                || ancestry[bi].contains(&id) || rule.is_none()
+                || attrs & ATTR_COLD != 0 && !free && rule != Some(RULE_COST)
+                || callee.params.len() != args.len() || callee.rets.len() != rets.len()
+                || match rule.unwrap() {
+                    _ if no_growth => false,
+                    RULE_COST => size > free_budget || !tiny && priced.saturating_add(growth) > growth_limit,
+                    RULE_SINGLE => priced.saturating_add(growth) > growth_limit,
+                    _ => !free && (cost > budget || !tiny && priced > growth_limit),
+                };
+            if !refused {
+                pick = Some((callee, rule.unwrap(), growth, size, cost, free, no_growth, bottom_up));
+                break;
+            }
         }
+        let Some((callee, rule, growth, size, cost, free, no_growth, bottom_up)) = pick else { continue };
+        let callee = Some(callee);
+        let rule = Some(rule);
         match rule.unwrap() {
             // the body moves here (its one caller): the ceiling grows with it, so the calls
             // around it (Vec::push in the absorbed loop) still fit
@@ -545,8 +568,10 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
         let start = f.blocks.len();
         let old_block_size = f.blocks[bi].insts.len();
         inline_site(f, bi, ii, callee.unwrap(), &args, &rets, nounwind);
+        let before = inst_count;
         inst_count = inst_count - old_block_size + f.blocks[bi].insts.len()
             + f.blocks[start..].iter().map(|b| b.insts.len()).sum::<usize>();
+        priced = if bottom_up { priced.saturating_add(growth) } else { priced + inst_count - before };
         priorities.resize(f.blocks.len(), priorities[bi]);
         let parent_loop = loop_sites[bi];
         loop_sites.resize(f.blocks.len(), parent_loop);
@@ -592,7 +617,8 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
                 } else {
                     1
                 };
-                s.reject(callee.map_or_else(|| format!("fn#{}", id), |c| c.name.clone()), reason);
+                let hot = (priorities[bi].1 && reason != 0).then(|| callee.map_or(0, inline_inst_count));
+                s.reject(callee.map_or_else(|| format!("fn#{}", id), |c| c.name.clone()), reason, hot);
             }
         }
     }
@@ -1382,7 +1408,7 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
                     }
                     Inst::Call(_, args, _) => bad |= args.iter().any(|a| based[a.0 as usize]),
                     // any other dereference of a based-on pointer
-                    Inst::Load(_, _, base, _) | Inst::Store(_, base, _, _) | Inst::VLoad(_, base, _) | Inst::VStore(base, _, _) | Inst::VGather(_, base, _) => bad |= based[base.0 as usize],
+                    Inst::Load(_, _, base, _) | Inst::Store(_, base, _, _) | Inst::VLoad(_, base, _) | Inst::VStore(base, _, _) | Inst::VGather(_, base, _) | Inst::VTbl(_, base, _, _) => bad |= based[base.0 as usize],
                     Inst::Copy(d, s, _) => bad |= based[d.0 as usize] || based[s.0 as usize],
                     _ => {}
                 }
@@ -2203,7 +2229,7 @@ pub fn forward_const_slots(f: &mut Func, ro: Option<RoReader>) -> bool {
                     return;
                 };
                 let read = match *i {
-                    Inst::Load(_, _, base, _) | Inst::VLoad(_, base, _) | Inst::VGather(_, base, _) => v == base,
+                    Inst::Load(_, _, base, _) | Inst::VLoad(_, base, _) | Inst::VGather(_, base, _) | Inst::VTbl(_, base, _, _) => v == base,
                     Inst::LoadX(_, _, base, idx, ..) => v == base && v != idx,
                     Inst::Copy(d, src, _) => v == src && v != d,
                     _ => false,
@@ -4793,11 +4819,32 @@ mod inline_priority_tests {
         let mut lim = InlineLimits::tier1();
         lim.budget = 27;
         let mut f = caller();
-        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_, _| false, &|_| false, &lim, Some(&[1.0, 0.5, 0.0]), None), vec![(1, RULE_SMALL_LEAF)]);
+        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &lim, Some(&[1.0, 0.5, 0.0]), None), vec![(1, RULE_SMALL_LEAF)]);
         lim.budget = 54;
         let mut f = caller();
         assert_eq!(inline_calls(options, &mut f, 0, &get, &|_| false, &lim).len(), 2);
         f.verify().unwrap();
+    }
+
+    #[test]
+    fn priced_body_decides_and_inlined_body_moves() {
+        // bottom-up O3: the optimised body prices the site, the inlined-only body is inlined
+        let options = &relax_session::Options::default();
+        let (raw, opt) = (callee(400), callee(30));
+        let get = |_: u32| Some((&raw as *const Func, 0));
+        let mut f = caller();
+        let n = inline_inst_count(&f);
+        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some((&raw as *const Func, &opt as *const Func)), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).len(), 2);
+        assert!(inline_inst_count(&f) > n + 2 * 390);
+        f.verify().unwrap();
+        // refused bottom-up (priced too big), the snapshot body decides: here too big as well
+        let mut f = caller();
+        assert!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some((&opt as *const Func, &raw as *const Func)), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).is_empty());
+        // ... and here small enough: the snapshot body moves
+        let get = |_: u32| Some((&opt as *const Func, 0));
+        let mut f = caller();
+        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some((&raw as *const Func, &raw as *const Func)), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).len(), 2);
+        assert!(inline_inst_count(&f) < n + 2 * 40);
     }
 
     #[test]
@@ -4830,7 +4877,7 @@ mod inline_priority_tests {
         c.params.push(VReg(0));
         let get = |_: u32| Some((&c as *const Func, ATTR_ALWAYS));
         let mut stats = InlineStats::default();
-        assert!(inline_calls_ordered(options, &mut f, 0, &get, &|_, _| false, &|_| false, &InlineLimits::tier1(), None, Some(&mut stats)).is_empty());
+        assert!(inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &InlineLimits::tier1(), None, Some(&mut stats)).is_empty());
         assert_eq!(stats.left, [0, 0, 0, 0, 2]);
     }
 
@@ -4848,7 +4895,7 @@ mod inline_priority_tests {
         let mut lim = InlineLimits::tier1();
         lim.budget = 27;
         let mut stats = InlineStats::default();
-        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_, _| false, &|_| false, &lim, None, Some(&mut stats)), vec![(2, RULE_SMALL_LEAF)]);
+        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &lim, None, Some(&mut stats)), vec![(2, RULE_SMALL_LEAF)]);
         assert_eq!(stats.inlined, 1);
         assert_eq!(stats.left, [0, 0, 0, 1, 0]);
         f.verify().unwrap();
@@ -4886,7 +4933,7 @@ mod inline_priority_tests {
         f.blocks[2].term = Term::Jump(0);
         assert!(relax_backend::regalloc::loop_depths(&f, &reachable(&f)).iter().all(|d| *d >= 1));
         let mut stats = InlineStats::default();
-        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_, _| false, &|_| false, &InlineLimits::tier1(), Some(&[0.01, 1.0, 0.0]), Some(&mut stats)), vec![(2, RULE_SMALL_LEAF)]);
+        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &InlineLimits::tier1(), Some(&[0.01, 1.0, 0.0]), Some(&mut stats)), vec![(2, RULE_SMALL_LEAF)]);
         assert_eq!(stats.hot_inlined, 1);
         assert_eq!(stats.hot_left, 1); // the exposed call inherits hotness
         assert_eq!(stats.growth_before, Some(3));
@@ -4902,12 +4949,12 @@ mod inline_priority_tests {
         let get = |id: u32| (id != 99).then_some((&c as *const Func, 0));
         for (freq, expected) in [(0.049, 0), (HOT_FREQ, 1)] {
             let mut f = caller();
-            assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_, _| false, &|_| false, &InlineLimits::tier1(), Some(&[0.01, freq, 1.0]), None).len(), expected);
+            assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &InlineLimits::tier1(), Some(&[0.01, freq, 1.0]), None).len(), expected);
         }
         for (blocks, expected) in [(64, 1), (65, 0)] {
             let mut f = caller();
             while f.blocks.len() < blocks { f.block(); }
-            assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).len(), expected);
+            assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).len(), expected);
         }
     }
 
@@ -4918,7 +4965,7 @@ mod inline_priority_tests {
             let c = callee(size);
             let get = |_: u32| Some((&c as *const Func, attrs));
             let mut f = caller();
-            assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_, _| false, &|_| false, &InlineLimits::tier1(), Some(&[0.0, 0.0, 1.0]), None).len(), expected);
+            assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &InlineLimits::tier1(), Some(&[0.0, 0.0, 1.0]), None).len(), expected);
             f.verify().unwrap();
         }
         // inline(always) still consumes the paid allowance.
@@ -4926,7 +4973,7 @@ mod inline_priority_tests {
         let get = |_: u32| Some((&c as *const Func, ATTR_ALWAYS));
         let mut lim = InlineLimits::tier1();
         lim.budget = 27;
-        assert_eq!(inline_calls_ordered(options, &mut caller(), 0, &get, &|_, _| false, &|_| false, &lim, Some(&[0.0, 0.0, 1.0]), None).len(), 1);
+        assert_eq!(inline_calls_ordered(options, &mut caller(), 0, &get, &|_| None, &|_, _| false, &|_| false, &lim, Some(&[0.0, 0.0, 1.0]), None).len(), 1);
     }
 
     #[test]
@@ -4937,9 +4984,10 @@ mod inline_priority_tests {
         let mut f = callee(0);
         f.blocks[0].insts = vec![Inst::Call(Callee::Fn(1), vec![], vec![]); 200];
         f.blocks[0].pos = vec![0; 200];
-        let lim = InlineLimits::tier1_for(&f);
+        let mut lim = InlineLimits::tier1_for(&f);
+        lim.growth_limit = Some(4200);
         let mut stats = InlineStats::default();
-        let inlined = inline_calls_ordered(options, &mut f, 0, &get, &|_, _| false, &|_| false, &lim, None, Some(&mut stats));
+        let inlined = inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &lim, None, Some(&mut stats));
         // Each inline grows by 24 instructions but costs only 22 budget units.
         assert_eq!(inlined.len(), 167);
         assert_eq!(inline_inst_count(&f), 4208);
@@ -4956,18 +5004,18 @@ mod inline_priority_tests {
         let get = |id: u32| Some((if id == 3 { &free } else { &paid } as *const Func, 0));
         let mut f = caller();
         let lim = InlineLimits::tier1_for(&f);
-        assert_eq!(lim.growth_limit, Some(4002));
+        assert_eq!(lim.growth_limit, Some(8002));
         // Model growth from the first round; the original ceiling must still apply.
         let v = f.vreg(Cls::I);
-        f.blocks[0].insts.extend(vec![Inst::Iconst(v, 1); 4001]);
-        f.blocks[0].pos.extend(vec![0; 4001]);
+        f.blocks[0].insts.extend(vec![Inst::Iconst(v, 1); 8001]);
+        f.blocks[0].pos.extend(vec![0; 8001]);
         f.blocks[0].insts.push(Inst::Call(Callee::Fn(3), vec![], vec![]));
         f.blocks[0].pos.push(0);
         let mut stats = InlineStats::default();
-        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_, _| false, &|_| false, &lim, None, Some(&mut stats)).len(), 1);
+        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &lim, None, Some(&mut stats)).len(), 1);
         assert_eq!(stats.left[3], 2);
         assert_eq!(stats.growth_after, inline_inst_count(&f));
-        assert!(inline_calls_ordered(options, &mut f, 0, &get, &|_, _| false, &|_| false, &lim, None, Some(&mut stats)).is_empty());
+        assert!(inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &lim, None, Some(&mut stats)).is_empty());
         f.verify().unwrap();
     }
 
@@ -4976,7 +5024,7 @@ mod inline_priority_tests {
         assert_eq!(InlineLimits::tier1_for(&callee(100)).budget, 4000);
         assert_eq!(InlineLimits::tier1_for(&callee(16000)).budget, 4000);
         assert_eq!(InlineLimits::tier1_for(&callee(30000)).budget, 4000);
-        assert_eq!(InlineLimits::tier1_for(&callee(16000)).growth_limit, Some(32000));
+        assert_eq!(InlineLimits::tier1_for(&callee(16000)).growth_limit, Some(64000));
     }
 
     #[test]
@@ -5043,7 +5091,7 @@ mod inline_priority_tests {
             let mut lim = InlineLimits::tier1();
             lim.budget = 0;
             let mut stats = InlineStats::default();
-            assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_, _| false, &|_| false, &lim, Some(&[0.0]), Some(&mut stats)), vec![(1, RULE_COST)]);
+            assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &lim, Some(&[0.0]), Some(&mut stats)), vec![(1, RULE_COST)]);
             assert_eq!(stats.rules[RULE_COST], 1);
             f.verify().unwrap();
         }
@@ -5060,7 +5108,7 @@ mod inline_priority_tests {
             let mut lim = InlineLimits::tier1();
             lim.budget = 0;
             let mut stats = InlineStats::default();
-            let result = inline_calls_ordered(options, &mut f, 0, &get, &single, &|_| false, &lim, Some(&[0.0]), Some(&mut stats));
+            let result = inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &single, &|_| false, &lim, Some(&[0.0]), Some(&mut stats));
             assert_eq!(result, if refs == 1 { vec![(1, RULE_SINGLE)] } else { vec![] });
             assert_eq!(stats.rules[RULE_SINGLE], usize::from(refs == 1));
             f.verify().unwrap();
@@ -5073,7 +5121,7 @@ mod inline_priority_tests {
         let c = callee(500);
         let get = |id| (id == 1).then_some((&c as *const Func, ATTR_COLD));
         let mut f = one_call(1);
-        assert!(inline_calls_ordered(options, &mut f, 0, &get, &|_, _| true, &|_| false, &InlineLimits::tier1(), Some(&[1.0]), None).is_empty());
+        assert!(inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| true, &|_| false, &InlineLimits::tier1(), Some(&[1.0]), None).is_empty());
         assert!(matches!(f.blocks[0].insts[0], Inst::Call(Callee::Fn(1), _, _)));
     }
 
@@ -5085,7 +5133,7 @@ mod inline_priority_tests {
         for term in [Term::Unreachable, Term::Resume] {
             let mut f = one_call(1);
             f.blocks[0].term = term;
-            assert!(inline_calls_ordered(options, &mut f, 0, &get, &|_, _| true, &|_| false, &InlineLimits::tier1(), None, None).is_empty());
+            assert!(inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| true, &|_| false, &InlineLimits::tier1(), None, None).is_empty());
         }
     }
 
@@ -5097,7 +5145,7 @@ mod inline_priority_tests {
             options.opt.push(toggle.into());
             let get = |id| (id == 1).then_some((&c as *const Func, 0));
             let mut f = one_call(1);
-            assert!(inline_calls_ordered(&options, &mut f, 0, &get, &|_, _| toggle.is_empty(), &|_| false, &InlineLimits::tier1(), Some(&[0.0]), None).is_empty());
+            assert!(inline_calls_ordered(&options, &mut f, 0, &get, &|_| None, &|_, _| toggle.is_empty(), &|_| false, &InlineLimits::tier1(), Some(&[0.0]), None).is_empty());
         }
     }
 
@@ -5112,10 +5160,10 @@ mod inline_priority_tests {
         let mut lim = InlineLimits::tier1();
         lim.budget = 0;
         lim.growth_limit = Some(10000);
-        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_, _| false, &|_| false, &lim, None, None), vec![(1, RULE_COST); 4]);
+        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &lim, None, None), vec![(1, RULE_COST); 4]);
         f.verify().unwrap();
         lim.growth_limit = Some(999);
-        assert!(inline_calls_ordered(options, &mut one_call(1), 0, &get, &|_, _| false, &|_| false, &lim, None, None).is_empty());
+        assert!(inline_calls_ordered(options, &mut one_call(1), 0, &get, &|_| None, &|_, _| false, &|_| false, &lim, None, None).is_empty());
     }
 
     #[test]
@@ -5127,7 +5175,7 @@ mod inline_priority_tests {
             let mut lim = InlineLimits::tier1();
             lim.budget = 0;
             lim.growth_limit = Some(ceiling);
-            assert_eq!(inline_calls_ordered(options, &mut one_call(1), 0, &get, &|_, _| true, &|_| false, &lim, None, None).len(), expected);
+            assert_eq!(inline_calls_ordered(options, &mut one_call(1), 0, &get, &|_| None, &|_, _| true, &|_| false, &lim, None, None).len(), expected);
         }
     }
 
@@ -5142,7 +5190,7 @@ mod inline_priority_tests {
         let mut lim = InlineLimits::tier1();
         lim.budget = 0;
         lim.growth_limit = Some(5000);
-        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|owner, _| owner == 0, &|_| false, &lim, None, None).len(), 9);
+        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|owner, _| owner == 0, &|_| false, &lim, None, None).len(), 9);
         assert_eq!(inline_inst_count(&f), 4500); // exceeds the 4000-instruction free allowance
         f.verify().unwrap();
     }
@@ -5178,7 +5226,7 @@ mod inline_priority_tests {
             }).collect();
             let get = |id: u32| callees.get(id.wrapping_sub(1) as usize).map(|c| (c as *const Func, 0));
             let mut f = one_call(1);
-            let inlined = inline_calls_ordered(options, &mut f, 0, &get, &|_, _| false, &|_| false, &InlineLimits::tier1(), Some(&[0.0]), None);
+            let inlined = inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &InlineLimits::tier1(), Some(&[0.0]), None);
             assert_eq!(inlined, (1..=expected).map(|id| (id, RULE_COST)).collect::<Vec<_>>());
             f.verify().unwrap();
         }
@@ -5198,7 +5246,7 @@ mod inline_priority_tests {
         for owner in [0, 1] {
             let mut f = one_call(1);
             let single = |caller, callee| caller == owner && callee == 2;
-            let result = inline_calls_ordered(options, &mut f, 0, &get, &single, &|_| false, &InlineLimits::tier1(), Some(&[0.0]), None);
+            let result = inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &single, &|_| false, &InlineLimits::tier1(), Some(&[0.0]), None);
             assert_eq!(result, if owner == 1 { vec![(1, RULE_COST), (2, RULE_SINGLE)] } else { vec![(1, RULE_COST)] });
             f.verify().unwrap();
         }
@@ -5763,65 +5811,370 @@ pub fn promote_dyn_read_slots(f: &mut Func) -> bool {
     true
 }
 
-/// Stores into a slot that nothing ever reads back at those bytes (no load, no copy out of the
-/// slot overlaps them) go: after full unrolling, a write-through counter's memory copy
-/// (`start` of an array iterator) is written every iteration and read by nobody, and it keeps
-/// the slot from being forwarded or scalar-replaced. Only slots `slot_scan` follows completely
-/// (not escaping). Returns whether any store went.
-pub fn drop_unread_slot_stores(f: &mut Func) -> bool {
+/// Variables read again after a copy into them: `t = x >> n; x = t; ... use t` (O3, before
+/// register allocation). Copy propagation and value numbering make later reads of a variable x
+/// (several definitions: a loop-carried bit buffer, a counter) read the single-definition
+/// temporary t its value came from. t and x then hold the same value over the same stretch,
+/// both live: two registers, and the copy `x = t` stays a move (`shrx rdi,r13,rsi; mov r13,rdi`,
+/// `mov rax,r12; sub eax,esi; mov rsi,rax; mov r12,rsi` per bit-reader step in inflate).
+/// LLVM has no such pair: SSA phis coalesce.
+/// Here every read of t at which x still holds t's value (on every path from the copy, a
+/// forward must-analysis over copies, kill at any other definition of x or of t) reads x
+/// instead, when that leaves t read only between its definition and the copy in the copy's
+/// block: t then dies at the copy and the allocator gives both one register.
+/// Candidates: `Mov(x, t)`, x defined more than once, t defined once in the same block before
+/// it, not a parameter and not a value the allocator recomputes (constants, addresses).
+/// MAKEPAD_RUN_OPT=-revar: off (bisection).
+pub fn reuse_copied_variables(options: &relax_session::Options, f: &mut Func) -> bool {
+    if opt_off(options, "-revar") {
+        return false;
+    }
+    let nv = f.vregs.len();
+    let nb = f.blocks.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 2;
+    }
+    // single-def vreg -> (block, index) of its definition
+    let mut def_at = vec![(u32::MAX, 0u32); nv];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            for_defs(i, |d| {
+                ndef[d.0 as usize] += 1;
+                def_at[d.0 as usize] = (bi as u32, k as u32);
+            });
+        }
+    }
+    let reach = reachable(f);
+    // candidates: (block, index of the copy, x, t)
+    const NONE: u32 = u32::MAX;
+    let mut cand: Vec<(u32, u32, VReg, VReg)> = Vec::new();
+    let mut by_t = vec![NONE; nv];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        if !reach[bi] {
+            continue;
+        }
+        for (k, i) in b.insts.iter().enumerate() {
+            let Inst::Mov(x, t) = *i else { continue };
+            let (xu, tu) = (x.0 as usize, t.0 as usize);
+            if x == t || ndef[tu] != 1 || ndef[xu] < 2 || by_t[tu] != NONE || def_at[tu].0 != bi as u32 || def_at[tu].1 >= k as u32 {
+                continue;
+            }
+            let (db, di) = def_at[tu];
+            if matches!(f.blocks[db as usize].insts[di as usize], Inst::Iconst(..) | Inst::Fconst(..) | Inst::VConst(..) | Inst::Addr(..) | Inst::SlotAddr(..)) {
+                continue;
+            }
+            by_t[tu] = cand.len() as u32;
+            cand.push((bi as u32, k as u32, x, t));
+        }
+    }
+    if cand.is_empty() {
+        return false;
+    }
+    let nc = cand.len();
+    let w = (nc + 63) / 64;
+    // x -> its candidates (x is the target of several copies: one per temporary)
+    let mut by_x: Vec<Vec<u32>> = vec![Vec::new(); nv];
+    for (c, &(_, _, x, _)) in cand.iter().enumerate() {
+        by_x[x.0 as usize].push(c as u32);
+    }
+    let bit = |s: &[u64], c: usize| s[c / 64] >> (c % 64) & 1 != 0;
+    // the state change of one instruction: copies set their bit, other defs of x or t clear
+    let step = |s: &mut [u64], bi: usize, k: usize, i: &Inst| {
+        for_defs(i, |d| {
+            for &c in &by_x[d.0 as usize] {
+                let c = c as usize;
+                if cand[c].0 as usize == bi && cand[c].1 as usize == k {
+                    s[c / 64] |= 1 << (c % 64);
+                } else {
+                    s[c / 64] &= !(1 << (c % 64));
+                }
+            }
+            let c = by_t[d.0 as usize];
+            if c != NONE {
+                s[c as usize / 64] &= !(1 << (c % 64));
+            }
+        });
+    };
+    let preds = relax_backend::regalloc::preds_of(f, &reach);
+    let order = relax_backend::frame::block_rpo(f);
+    let mut inn = vec![!0u64; nb * w];
+    let mut out = vec![!0u64; nb * w];
+    let mut cur = vec![0u64; w];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &order {
+            let bi = b as usize;
+            if !reach[bi] {
+                continue;
+            }
+            if bi == 0 {
+                cur.iter_mut().for_each(|x| *x = 0);
+            } else {
+                cur.iter_mut().for_each(|x| *x = !0);
+                for &p in &preds[bi] {
+                    for j in 0..w {
+                        cur[j] &= out[p as usize * w + j];
+                    }
+                }
+            }
+            inn[bi * w..bi * w + w].copy_from_slice(&cur);
+            for (k, i) in f.blocks[bi].insts.iter().enumerate() {
+                step(&mut cur, bi, k, i);
+            }
+            if out[bi * w..bi * w + w] != cur[..] {
+                out[bi * w..bi * w + w].copy_from_slice(&cur);
+                changed = true;
+            }
+        }
+    }
+    // a candidate qualifies when each read of t is either rewritable or lies between t's
+    // definition and the copy
+    let mut ok = vec![true; nc];
+    let mut uses = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        if !reach[bi] {
+            continue;
+        }
+        cur.copy_from_slice(&inn[bi * w..bi * w + w]);
+        let mut check = |cur: &[u64], u: VReg, k: usize| {
+            let c = by_t[u.0 as usize];
+            if c != NONE && !bit(cur, c as usize) {
+                let (cb, ck, _, _) = cand[c as usize];
+                if !(cb as usize == bi && k <= ck as usize) {
+                    ok[c as usize] = false;
+                }
+            }
+        };
+        for (k, i) in b.insts.iter().enumerate() {
+            for_uses(i, |u| check(&cur, u, k));
+            step(&mut cur, bi, k, i);
+        }
+        term_uses(&b.term, &mut uses);
+        for &u in &uses {
+            check(&cur, u, usize::MAX);
+        }
+    }
+    if !ok.iter().any(|&o| o) {
+        return false;
+    }
+    let mut any = false;
+    for bi in 0..nb {
+        if !reach[bi] {
+            continue;
+        }
+        cur.copy_from_slice(&inn[bi * w..bi * w + w]);
+        for k in 0..f.blocks[bi].insts.len() {
+            let look = |u: VReg| -> VReg {
+                let c = by_t[u.0 as usize];
+                if c != NONE && ok[c as usize] && bit(&cur, c as usize) {
+                    cand[c as usize].2
+                } else {
+                    u
+                }
+            };
+            let n = rename(&f.blocks[bi].insts[k], &look);
+            if n != f.blocks[bi].insts[k] {
+                f.blocks[bi].insts[k] = n;
+                any = true;
+            }
+            step(&mut cur, bi, k, &f.blocks[bi].insts[k]);
+        }
+        let mut t = f.blocks[bi].term.clone();
+        relax_backend::regalloc::term_vregs_mut(&mut t, |v| {
+            let c = by_t[v.0 as usize];
+            if c != NONE && ok[c as usize] && bit(&cur, c as usize) {
+                *v = cand[c as usize].2;
+                any = true;
+            }
+        });
+        f.blocks[bi].term = t;
+    }
+    any
+}
+
+/// Dead stores into slots (O3): a store, vector store or copy into a slot whose bytes no later
+/// read can see -- on every path from it the bytes are overwritten first, or never read again
+/// -- goes. Backward liveness of slot bytes over the CFG, for the slots `slot_scan` follows
+/// completely (not escaping): every read of such a slot is a load or a copy out of it.
+/// `let mut tmp = [0u8; 16]; tmp.copy_from_slice(src); dst.copy_from_slice(&tmp)` (brotli's
+/// ring-buffer copy): the 16 zero byte stores before the copy were kept, and with them the slot
+/// (forwarding needs one store per byte range); after full unrolling, a write-through counter's
+/// memory copy nobody reads. Slots over 256 bytes are tracked in 256 chunks (a store kills only
+/// the chunks it covers). Returns whether any store went.
+pub fn dead_slot_stores(f: &mut Func) -> bool {
     let ns = f.slots.len();
     if ns == 0 {
         return false;
     }
     let SlotScan { vs, esc, .. } = slot_scan(f);
     const NONE: u32 = u32::MAX;
+    // per tracked slot: first bit, bytes per bit, bit count
+    let mut base = vec![NONE; ns];
+    let mut gran = vec![1i64; ns];
+    let mut nbits = vec![0i64; ns];
+    let mut tot = 0usize;
+    for s2 in 0..ns {
+        let size = f.slots[s2].size as i64;
+        if esc[s2] || size == 0 {
+            continue;
+        }
+        let g = (size + 255) / 256;
+        base[s2] = tot as u32;
+        gran[s2] = g;
+        nbits[s2] = (size + g - 1) / g;
+        tot += nbits[s2] as usize;
+    }
+    if tot == 0 {
+        return false;
+    }
+    let w = (tot + 63) / 64;
     let sl = |v: VReg| vs[v.0 as usize].0;
-    let at = |v: VReg| vs[v.0 as usize].1;
-    let mut reads: Vec<Vec<(i64, i64)>> = vec![Vec::new(); ns];
-    for b in &f.blocks {
-        for i in &b.insts {
-            match *i {
-                Inst::Load(m, _, base, off) if sl(base) != NONE => {
-                    let o = at(base) + off as i64;
-                    reads[sl(base) as usize].push((o, o + mem_size(m) as i64));
+    // bits [a, b) of the bit vector
+    fn set(s: &mut [u64], a: usize, b: usize) {
+        for i in a..b {
+            s[i / 64] |= 1 << (i % 64);
+        }
+    }
+    fn clr(s: &mut [u64], a: usize, b: usize) {
+        for i in a..b {
+            s[i / 64] &= !(1 << (i % 64));
+        }
+    }
+    fn any(s: &[u64], a: usize, b: usize) -> bool {
+        (a..b).any(|i| s[i / 64] >> (i % 64) & 1 != 0)
+    }
+    // what an instruction does to a tracked slot: (slot, lo, hi) read and written byte ranges,
+    // hi = i64::MAX: unknown offset (the whole slot)
+    #[derive(Clone, Copy)]
+    struct Acc {
+        rd: Option<(u32, i64, i64)>,
+        wr: Option<(u32, i64, i64)>,
+    }
+    let acc = |f: &Func, i: &Inst| -> Acc {
+        let at = |v: VReg| vs[v.0 as usize].1;
+        let tracked = |v: VReg| sl(v) != NONE && base[sl(v) as usize] != NONE;
+        let mut a = Acc { rd: None, wr: None };
+        let vw = |v: VReg| if f.vregs[v.0 as usize] == Cls::V256 { 32 } else { 16 };
+        match *i {
+            Inst::Load(m, _, b, o) if tracked(b) => a.rd = Some((sl(b), at(b) + o as i64, at(b) + o as i64 + mem_size(m) as i64)),
+            Inst::VLoad(d, b, o) if tracked(b) => a.rd = Some((sl(b), at(b) + o as i64, at(b) + o as i64 + vw(d))),
+            Inst::LoadX(_, _, b, ..) | Inst::VLoadX(_, b, ..) if tracked(b) => a.rd = Some((sl(b), 0, i64::MAX)),
+            Inst::Store(m, b, o, _) if tracked(b) => a.wr = Some((sl(b), at(b) + o as i64, at(b) + o as i64 + mem_size(m) as i64)),
+            Inst::VStore(b, o, v) if tracked(b) => a.wr = Some((sl(b), at(b) + o as i64, at(b) + o as i64 + vw(v))),
+            Inst::StoreX(_, b, ..) | Inst::VStoreX(b, ..) if tracked(b) => a.wr = Some((sl(b), 0, i64::MAX)),
+            Inst::Copy(d, s2, n) => {
+                if tracked(s2) {
+                    a.rd = Some((sl(s2), at(s2), at(s2) + n as i64));
                 }
-                Inst::VLoad(_, base, off) if sl(base) != NONE => {
-                    let o = at(base) + off as i64;
-                    reads[sl(base) as usize].push((o, o + 16));
+                if tracked(d) {
+                    a.wr = Some((sl(d), at(d), at(d) + n as i64));
                 }
-                Inst::LoadX(_, _, base, ..) if sl(base) != NONE => reads[sl(base) as usize].push((i64::MIN, i64::MAX)),
-                Inst::Copy(_, s2, n) if sl(s2) != NONE => {
-                    let o = at(s2);
-                    reads[sl(s2) as usize].push((o, o + n as i64));
+            }
+            _ => {}
+        }
+        a
+    };
+    // a byte range as bits: (overlapping bits, fully covered bits); None: out of the slot
+    let bits = |s2: u32, lo: i64, hi: i64| -> Option<((usize, usize), (usize, usize))> {
+        let s2 = s2 as usize;
+        let (b0, g, n) = (base[s2] as i64, gran[s2], nbits[s2]);
+        if hi == i64::MAX || lo < 0 || hi > f.slots[s2].size as i64 || lo >= hi {
+            return None;
+        }
+        let over = ((b0 + lo / g) as usize, (b0 + (hi + g - 1) / g).min(b0 + n) as usize);
+        let full_hi = if hi == f.slots[s2].size as i64 { n } else { hi / g };
+        let cov = ((b0 + (lo + g - 1) / g) as usize, (b0 + full_hi) as usize);
+        Some((over, if cov.0 < cov.1 { cov } else { (0, 0) }))
+    };
+    let whole = |s2: u32| (base[s2 as usize] as usize, (base[s2 as usize] as i64 + nbits[s2 as usize]) as usize);
+    // backward transfer of one instruction; returns whether its write is dead
+    let xfer = |live: &mut [u64], a: Acc| -> bool {
+        let mut dead = false;
+        if let Some((s2, lo, hi)) = a.wr {
+            match bits(s2, lo, hi) {
+                Some((over, cov)) => {
+                    dead = !any(live, over.0, over.1);
+                    clr(live, cov.0, cov.1);
                 }
-                _ => {}
+                None => {
+                    let (x, y) = whole(s2);
+                    dead = hi == i64::MAX && !any(live, x, y);
+                }
+            }
+        }
+        if let Some((s2, lo, hi)) = a.rd {
+            match bits(s2, lo, hi) {
+                Some((over, _)) => set(live, over.0, over.1),
+                None => {
+                    let (x, y) = whole(s2);
+                    set(live, x, y);
+                }
+            }
+        }
+        dead
+    };
+    let nb = f.blocks.len();
+    let reach = reachable(f);
+    let mut order = relax_backend::frame::block_rpo(f);
+    order.reverse();
+    let mut live_in = vec![0u64; nb * w];
+    let mut cur = vec![0u64; w];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &order {
+            let bi = b as usize;
+            if !reach[bi] {
+                continue;
+            }
+            cur.iter_mut().for_each(|x| *x = 0);
+            for t in f.blocks[bi].term.succs() {
+                for j in 0..w {
+                    cur[j] |= live_in[t as usize * w + j];
+                }
+            }
+            for i in f.blocks[bi].insts.iter().rev() {
+                let a = acc(f, i);
+                xfer(&mut cur, a);
+            }
+            if live_in[bi * w..bi * w + w] != cur[..] {
+                live_in[bi * w..bi * w + w].copy_from_slice(&cur);
+                changed = true;
             }
         }
     }
-    let unread = |s2: usize, lo: i64, hi: i64| -> bool { !esc[s2] && reads[s2].iter().all(|&(a, b2)| b2 <= lo || hi <= a) };
-    let mut any = false;
-    for b in &mut f.blocks {
-        let mut k = 0;
-        while k < b.insts.len() {
-            let drop = match b.insts[k] {
-                Inst::Store(m, base, off, _) if sl(base) != NONE => {
-                    let o = at(base) + off as i64;
-                    unread(sl(base) as usize, o, o + mem_size(m) as i64)
-                }
-                _ => false,
-            };
-            if drop {
-                b.insts.remove(k);
-                if k < b.pos.len() {
-                    b.pos.remove(k);
-                }
-                any = true;
-            } else {
-                k += 1;
+    let mut dead: Vec<(usize, usize)> = Vec::new();
+    for bi in 0..nb {
+        if !reach[bi] {
+            continue;
+        }
+        cur.iter_mut().for_each(|x| *x = 0);
+        for t in f.blocks[bi].term.succs() {
+            for j in 0..w {
+                cur[j] |= live_in[t as usize * w + j];
+            }
+        }
+        for k in (0..f.blocks[bi].insts.len()).rev() {
+            let a = acc(f, &f.blocks[bi].insts[k]);
+            if xfer(&mut cur, a) {
+                dead.push((bi, k));
             }
         }
     }
-    any
+    if dead.is_empty() {
+        return false;
+    }
+    // indices were pushed in descending order per block: removal keeps the others valid
+    for (bi, k) in dead {
+        let b = &mut f.blocks[bi];
+        b.insts.remove(k);
+        if k < b.pos.len() {
+            b.pos.remove(k);
+        }
+    }
+    true
 }
 
 #[cfg(test)]
