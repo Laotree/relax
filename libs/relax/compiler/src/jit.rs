@@ -292,6 +292,7 @@ pub(crate) struct ZoneTaken {
     o2_queue: Vec<(usize, u32)>,
     o2_base: std::collections::VecDeque<(usize, u32)>,
     o2_seen: Option<std::collections::HashSet<(usize, u32)>>,
+    prep_shared: HashMap<u32, Vec<std::sync::Arc<PrepShared>>>,
 }
 
 pub(crate) fn zone_take() -> ZoneTaken {
@@ -314,6 +315,7 @@ pub(crate) fn zone_take() -> ZoneTaken {
         o2_queue: take!(O2_QUEUE => is_empty),
         o2_base: take!(O2_BASE => is_empty),
         o2_seen: take!(O2_SEEN => is_none),
+        prep_shared: take!(PREP_SHARED => is_empty),
     }
 }
 
@@ -331,6 +333,7 @@ pub(crate) fn zone_put_back(taken: ZoneTaken) {
     put(&O2_QUEUE, taken.o2_queue);
     put(&O2_BASE, taken.o2_base);
     put(&O2_SEEN, taken.o2_seen);
+    put(&PREP_SHARED, taken.prep_shared);
 }
 
 /// Heap classes (memlane zones, DESIGN-zones.md F). KEPT (system heap; built and grown under
@@ -9600,9 +9603,13 @@ impl InlineBodies {
                 TIER1_PREP[1].fetch_add(1, Ordering::Relaxed);
                 if let Some(st) = stats { st.report(&format!("prep:{} (root {})", o1.name, root)); }
                 let (raw, mut taken) = raw;
+                // shared preparations outlive this build: they live in the compiler arena (the
+                // generation the snapshot bodies are in; a zone swap takes them with it), not in
+                // the build's scratch
                 let prepared = (!taken.is_empty()).then(|| {
                     out.expand(&mut taken);
-                    std::sync::Arc::new(Prepared { raw, priced: f, deps: taken.into_iter().map(|x| x.0).collect() })
+                    let deps: Vec<u32> = taken.into_iter().map(|x| x.0).collect();
+                    crate::zone_alloc::outside_scratch(|| std::sync::Arc::new(Prepared { raw: raw.clone(), priced: f.clone(), deps: deps.clone() }))
                 });
                 let mut slots = rd.bodies;
                 slots.sort_unstable();
@@ -9624,7 +9631,8 @@ impl InlineBodies {
                 let mut singles = rd.singles;
                 singles.sort_unstable();
                 singles.dedup();
-                let e = std::sync::Arc::new(PrepShared { bodies, prepared: prepared_reads, singles, _pins: pins, body: prepared.clone(), nounwind: asked.into_inner() });
+                let asked = asked.into_inner();
+                let e = crate::zone_alloc::outside_scratch(|| std::sync::Arc::new(PrepShared { bodies: bodies.clone(), prepared: prepared_reads.clone(), singles: singles.clone(), _pins: (pins.0.clone(), pins.1.clone()), body: prepared.clone(), nounwind: asked.clone() }));
                 if let Some(old) = shared.filter(|_| verify) {
                     // MAKEPAD_RUN_PREP_VERIFY=1: a shared preparation is made again and compared
                     let h = |b: &Option<std::sync::Arc<Prepared>>| b.as_ref().map(|b| (t1_norm_hash(&b.raw), t1_norm_hash(&b.priced), b.deps.clone()));
@@ -9636,12 +9644,12 @@ impl InlineBodies {
                     if let Some(b) = prepared { out.index.insert(ids[k], b); }
                     continue;
                 }
-                {
+                crate::zone_alloc::outside_scratch(|| {
                     let mut g = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner());
                     let v = g.entry(ids[k]).or_default();
                     if v.len() >= PREP_SHARED_PER_SLOT { v.remove(0); }
                     v.push(e);
-                }
+                });
                 if let Some(b) = prepared { out.index.insert(ids[k], b); }
             }
         }
