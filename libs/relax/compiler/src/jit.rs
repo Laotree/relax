@@ -12241,7 +12241,7 @@ pub(crate) fn ahead_policy() -> &'static AheadPolicy {
     };
     const BALANCED: AheadPolicy = AheadPolicy {
         spec_calls: true, spec_cached: true, spec_depth: Some(2), spec_hot_from: Some(1), spec_dyn: false, spec_jobs: 2, spec_expire: true,
-        post_present_helpers: 2, teardown: false, borrowck_discovery: false, last_run: false, o3_revalidate: true, o3_threads: 2, o2_first_sample: false,
+        post_present_helpers: u32::MAX, teardown: false, borrowck_discovery: false, last_run: false, o3_revalidate: true, o3_threads: 2, o2_first_sample: false,
     };
     const AOT: AheadPolicy = AheadPolicy {
         spec_calls: true, spec_cached: true, spec_depth: Some(AOT_DEPTH), spec_hot_from: Some(AOT_DEPTH), spec_dyn: true, spec_jobs: usize::MAX, spec_expire: false,
