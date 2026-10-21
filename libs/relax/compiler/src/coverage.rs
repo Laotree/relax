@@ -152,3 +152,17 @@ pub unsafe fn functions(up: *const Unit) -> Vec<FnCoverage> {
     }
     out
 }
+
+/// Whether `addr` is a block byte of the coverage table, and then whether that block ran (the
+/// wasm export reads the block stores that travelled into optimised code).
+pub fn hit_at(addr: u64) -> Option<bool> {
+    let t = TABLE.load(Ordering::Acquire);
+    if t.is_null() {
+        return None;
+    }
+    let base = t as u64;
+    if addr < base || addr >= base + NEXT.load(Ordering::Relaxed).min(CAP) as u64 {
+        return None;
+    }
+    Some(unsafe { std::ptr::read_volatile(t.add((addr - base) as usize)) } != 0)
+}

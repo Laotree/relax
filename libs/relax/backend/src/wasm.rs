@@ -734,7 +734,8 @@ impl<'a> Module<'a> {
         st.n_imports = ni;
         st.failed = failed;
         st.untraced_sites = self.sh.untraced_sites;
-        st.fn_sizes = funcs.iter().zip(bodies.iter()).map(|((id, f), b)| (*id, f.name.clone(), b.bytes.len())).collect();
+        // a folded copy emits no body: 0 bytes
+        st.fn_sizes = funcs.iter().zip(bodies.iter()).enumerate().map(|(k, ((id, f), b))| (*id, f.name.clone(), if canon[ni + k] == ni + k { b.bytes.len() } else { 0 })).collect();
         Output { bytes: out, stats: st }
     }
 }
