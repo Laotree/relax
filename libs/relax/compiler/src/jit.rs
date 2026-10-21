@@ -4265,12 +4265,15 @@ impl Unit {
             // its initializer needed a module the post-boot loader has loaded since: run it
             // again into the same storage (its symbol already names that address)
             if DEFERRED_STATICS.lock().unwrap_or_else(|e| e.into_inner()).remove(&d.0) {
-                if self.run_init(d, Vec::new(), a).is_none() {
+                let pending = PendingInit::arm(d);
+                let r = self.run_init(d, Vec::new(), a);
+                pending.disarm();
+                if r.is_none() {
                     if DEFERRED_ABORT.with(|f| f.get()) { crate::zone_alloc::kept_with(|| DEFERRED_STATICS.lock().unwrap_or_else(|e| e.into_inner()).insert(d.0)); }
                     return a;
                 }
                 let sym = self.syms.intern(crate::syms::SymKind::Static(d), a);
-                crate::sandbox::capture_initial_data(self, sym);
+                crate::domain::capture_static(self, sym);
                 crate::domain::materialize(self, sym);
             }
             return a;
@@ -4296,9 +4299,15 @@ impl Unit {
         // object is an immutable snapshot taken immediately after pure CTFE,
         // never the static's later (possibly mutated) contents.
         let cached = unsafe { crate::cache::const_value(self.self_ptr.0, d, &[]) };
+        let ran = cached.is_none().then(|| {
+            let pending = PendingInit::arm(d);
+            let r = self.run_init(d, Vec::new(), buf);
+            pending.disarm();
+            r
+        });
         if let Some(initial) = cached {
             unsafe { std::ptr::copy_nonoverlapping(initial as *const u8, buf as *mut u8, l.size as usize); }
-        } else if self.run_init(d, Vec::new(), buf).is_none() {
+        } else if ran.flatten().is_none() {
             // needs a skipped module: evaluated again (same storage) once the outer compile
             // loaded it; the build using it fails meanwhile (DEFERRED_ABORT)
             if DEFERRED_ABORT.with(|a| a.get()) {
@@ -4312,7 +4321,7 @@ impl Unit {
             self.validate_final(d, t, buf);
         }
         let sym = self.syms.intern(crate::syms::SymKind::Static(d), buf);
-        crate::sandbox::capture_initial_data(self, sym);
+        crate::domain::capture_static(self, sym);
         // every other live domain gets its own copy of the new static (none: nothing to do)
         crate::domain::materialize(self, sym);
         buf
@@ -8452,6 +8461,29 @@ static DEFERRED_MISSING: relax_session::sync::Mutex<Vec<(u32, (u32, String))>> =
 /// stays; static_addr runs the initializer again.
 static DEFERRED_STATICS: relax_session::sync::Mutex<std::collections::BTreeSet<u32>> = relax_session::sync::Mutex::new(std::collections::BTreeSet::new());
 
+/// A static's initializer in progress. The static's address is recorded before it runs (statics
+/// may name each other cyclically), so an initializer that unwinds -- a nested owner request
+/// cancelled with OwnerBusy and posted again, a preemption -- would leave the address with no
+/// value, and the retried request would read the zeroed storage as the static (Sandbox's race
+/// kit read every slice of its `static RACE_DEF` as empty). Unwinding marks it like a deferred
+/// static instead: the next static_addr runs the initializer again into the same storage.
+struct PendingInit(u32);
+
+impl PendingInit {
+    fn arm(d: DefId) -> PendingInit {
+        PendingInit(d.0)
+    }
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for PendingInit {
+    fn drop(&mut self) {
+        crate::zone_alloc::kept_with(|| DEFERRED_STATICS.lock().unwrap_or_else(|e| e.into_inner()).insert(self.0));
+    }
+}
+
 /// Whether static `d`'s initializer is waiting for a module the post-boot loader has still to
 /// load (its storage holds no value yet). A cached entry naming it is not linked: the slot is
 /// built instead, and that build defers (DEFERRED_ABORT). Outside any build the deferral flag
@@ -9310,7 +9342,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         relax_codegen::loops::clear_unreachable(func);
         // unrolled reads at constant offsets: the slots they read can now go to registers (a
         // write-through counter's stores nobody reads go first, then the copy chains)
-        if cfg.sroa && relax_codegen::opt::drop_unread_slot_stores(func) {
+        if cfg.sroa && relax_codegen::opt::dead_slot_stores(func) {
             relax_codegen::opt::forward_slot_copies(func);
         }
         if cfg.sroa && relax_backend::passes::sroa(func) {
@@ -9346,7 +9378,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     // stores into slot bytes nobody reads back: the forwarding passes above left them behind
     // (a `[0u8; 8]` buffer filled by copy_from_slice and read by from_le_bytes, the load
     // forwarded from the source: zero-fill and copy stores, every refill)
-    if cfg.sroa && relax_codegen::opt::drop_unread_slot_stores(func) {
+    if cfg.sroa && relax_codegen::opt::dead_slot_stores(func) {
         relax_backend::passes::live_dce(func);
     }
     if cfg.licm && !relax_backend::stats::opt_off(options, "-promote") && relax_codegen::opt::promote_loop_memory(func) {
@@ -9371,6 +9403,8 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         relax_backend::passes::addr_modes(func);
         // results computed early for one later use move next to it (O3)
         relax_codegen::opt::sink_single_uses(func);
+        // reads of a temporary a variable was copied from read the variable: one register
+        relax_codegen::opt::reuse_copied_variables(options, func);
     }
     if let Some(stats) = inline_stats { stats.report(name); }
     inlined
@@ -9573,7 +9607,10 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
     // later wider loads of narrower stores otherwise fail store forwarding (layout_widgets)
     if cfg.sroa && !relax_backend::stats::opt_off(options, "-postinline") {
         for _ in 0..3 {
-            let ch = relax_codegen::opt::forward_slot_dests(func) | relax_codegen::opt::forward_slot_dests_x(options, func, 32);
+            // zero fills a copy overwrites before any read go first: the copy's stores are
+            // then the only writes of those bytes, so the reads after it can be forwarded
+            let ch = relax_codegen::opt::dead_slot_stores(func);
+            let ch = ch | relax_codegen::opt::forward_slot_dests(func) | relax_codegen::opt::forward_slot_dests_x(options, func, 32);
             let ch = ch | relax_codegen::opt::split_wide_slot_accesses(func);
             let ch = ch | relax_codegen::opt::sroa_post_inline(func);
             if !ch {
