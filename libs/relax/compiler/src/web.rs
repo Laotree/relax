@@ -45,6 +45,17 @@ extern "C" fn relax_web_memory_grow(mem: u32, delta: usize) -> usize {
     if delta == 0 { relax_web_memory_size(mem) } else { usize::MAX }
 }
 
+/// `relax_web_print(ptr, len)`: the bytes to stderr (test programs' output; a page has no
+/// stdout). The pointer is the program's: an offset on wasm32.
+extern "C" fn relax_web_print(p: usize, len: usize) {
+    use std::io::Write;
+    let a = if crate::web32::on() { crate::web32::native(p as u64) as usize } else { p };
+    if len != 0 {
+        let b = unsafe { std::slice::from_raw_parts(a as *const u8, len) };
+        let _ = std::io::stderr().write_all(b);
+    }
+}
+
 /// The embedder's page-side symbols (the program's `extern "C"` imports of `env`), asked first.
 static EMBEDDER: AtomicUsize = AtomicUsize::new(0);
 
@@ -65,6 +76,7 @@ pub fn symbol(name: &[u8]) -> Option<usize> {
     match name {
         b"relax_web_memory_size" => Some(relax_web_memory_size as *const () as usize),
         b"relax_web_memory_grow" => Some(relax_web_memory_grow as *const () as usize),
+        b"relax_web_print" => Some(relax_web_print as *const () as usize),
         _ => None,
     }
 }
