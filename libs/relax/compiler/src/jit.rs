@@ -6381,6 +6381,12 @@ fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &cra
         // a closure body is usually called from the one adapter instance made for it; with
         // the core hint (O3) it inlines like #[inline]
         FnKey::Closure(..) if core_hint => relax_codegen::opt::ATTR_HINT,
+        // drop glue at O3 as any other generated instance: rustc leaves drop_in_place unhinted
+        // (Instance::requires_inline) and LLVM inlines it by cost like an unhinted same-crate fn.
+        // Without it an enum's glue (Result<f32, E>: the error payload's drops on the Err arm)
+        // inlined only through the hot-site rule, so any change in which round reached the site
+        // left a per-element drop call (llm_host's `.map(Ok).collect::<Result<Vec<f32>, _>>()`)
+        FnKey::Glue(..) if core_hint => relax_codegen::opt::ATTR_HINT,
         FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Closure(..) => 0,
         // twins are never inlined into anything (their callers are twins built from RIR)
         FnKey::Sandbox(_) | FnKey::Plain(_) => return None,
