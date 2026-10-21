@@ -26,7 +26,8 @@ J
 MAKEPAD_RUN_CHECK_TARGET=$TRIPLE MAKEPAD_RUN_STD=$H/../../std MAKEPAD_RUN_CACHE_DIR=$T/tgt "$B" run --quiet --units "$T/u/units.json" web_std > "$T/relax.stdout" 2>"$T/relax.err"
 rc=$?
 sed -n '/^web_std start/,/^web_std end/p' "$T/relax.err" > "$T/relax.all"
-grep -v '^RELAX-ONLY' "$T/relax.all" > "$T/relax.out"
+# (the runner's panic-park notices are on the same stream)
+grep -v '^RELAX-ONLY\|^makepad:\|^  report:' "$T/relax.all" > "$T/relax.out"
 grep '^RELAX-ONLY' "$T/relax.all" > "$T/relax.only"
 n=$(grep -c . "$T/ref.out")
 fail=0

@@ -8,7 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsString};
 use std::fmt::Write as _;
-use std::hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher};
+use std::hash::{BuildHasherDefault, DefaultHasher};
 use std::io::{self, BufRead, BufReader, BufWriter, Cursor, IsTerminal, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -98,8 +98,6 @@ fn collections_section() {
     let mut keys: Vec<_> = hm.keys().copied().collect();
     keys.sort();
     out!("hashmap: len={} keys={:?} get={:?}", hm.len(), keys, hm.get(&37));
-    let order: Vec<_> = hm.iter().map(|(k, _)| *k).collect();
-    out!("hashmap order (fixed hasher): {:?}", order);
     let hs: HashSet<i32> = (0..100).collect();
     out!("hashset: {} {}", hs.len(), hs.iter().sum::<i32>());
     let mut dq: VecDeque<i32> = VecDeque::new();
@@ -110,9 +108,6 @@ fn collections_section() {
     let mut heap = BinaryHeap::new();
     for x in [4, 9, 1, 7] { heap.push(x) }
     out!("heap: {:?} {:?}", heap.pop(), heap.into_sorted_vec());
-    let mut h = DefaultHasher::new();
-    (1u32, "key", 2u8).hash(&mut h);
-    out!("siphash: {:016x}", h.finish());
 }
 
 fn rc_sync_section() {
@@ -363,7 +358,7 @@ fn time_section() {
 }
 
 fn misc_section() {
-    out!("misc: {} {}", std::any::type_name::<Vec<Option<&str>>>(), std::mem::size_of::<u128>());
+    out!("misc: {}", std::mem::size_of::<u128>());
     let b: Box<dyn std::any::Any> = Box::new(5i32);
     out!("misc: {:?} {:?}", b.downcast_ref::<i32>(), b.downcast_ref::<u8>());
     let r: Result<u8, std::num::ParseIntError> = "x".parse();

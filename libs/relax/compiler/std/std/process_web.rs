@@ -34,7 +34,7 @@ pub fn abort() -> ! {
 enum StdioKind {
     Inherit,
     Null,
-    Piped,
+    MakePipe,
     ParentStdout,
     ParentStderr,
     #[allow(dead_code)] // exists only for the Debug impl
@@ -51,7 +51,7 @@ impl fmt::Debug for Stdio {
 
 impl Stdio {
     pub fn piped() -> Stdio {
-        Stdio(StdioKind::Piped)
+        Stdio(StdioKind::MakePipe)
     }
     pub fn inherit() -> Stdio {
         Stdio(StdioKind::Inherit)

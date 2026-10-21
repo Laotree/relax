@@ -234,11 +234,14 @@ impl<'a> fmt::Debug for SplitPaths<'a> {
 
 #[derive(Debug)]
 pub struct JoinPathsError {
-    inner: SysJoinPathsError,
+    inner: imp::JoinPathsError,
 }
 
-#[derive(Debug)]
-struct SysJoinPathsError;
+/// rustc's platform `JoinPathsError` (sys/paths/unsupported.rs), the field of the public one.
+mod imp {
+    #[derive(Debug)]
+    pub struct JoinPathsError;
+}
 
 impl fmt::Display for JoinPathsError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -254,7 +257,7 @@ where
     I: IntoIterator<Item = T>,
     T: AsRef<OsStr>,
 {
-    Err(JoinPathsError { inner: SysJoinPathsError })
+    Err(JoinPathsError { inner: imp::JoinPathsError })
 }
 
 pub mod consts {
