@@ -8,6 +8,8 @@ machine hits all sides alike. Per name and workload: median over rounds of each 
 min..max), the ratio to the rustc run of the same round (median of per-round ratios, spread), median
 time-to-steady, Relax's O3 coverage line, checksums equal across all runs. With more than one name a final
 A/B table gives new/base per workload (median of per-round ratios, spread) and the geomean of the medians.
+The commercial set (apps/commercial/relax_tests/src/bench.rs) joins when present; RW_COMMERCIAL=0 skips it,
+NATIVE_COMMERCIAL names its prebuilt rustc binary.
 Env: WARM=1 (O3/code disk cache on, one dir per name, one untimed fill run per workload and name before the timed rounds; the O3 column then shows hot / installed / from the disk cache), ROUNDS (default 4), RW_MS (per-process iteration budget ms, default 4000), WORKLOADS ("a b": only those),
 MAKEPAD_RUN_STD_<NAME> (that name's own std tree, e.g. its compiler tree's std; a Relax change that touches std must be measured with its own std), NATIVE (prebuilt rustc binary; else built here with cargo --release into <target dir>/rustc), MAKEPAD_RUN_STD
 (default ../std), RUN_PREFIX (default "nice -n 10", "none" on Windows), RW_ROOT (the tree holding the inputs).
