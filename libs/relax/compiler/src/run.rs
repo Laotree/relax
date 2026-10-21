@@ -2276,6 +2276,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             }
             // speculative results nobody called within the TTL go (memory: jit::expire_spec)
             jit::expire_spec(options);
+            jit::aot_drain();
             // recorded disk-cache entries are written out as they pile up, not held to the exit
             spill_cache();
             // Independent allocator relief for later O3 bursts and non-GUI programs.

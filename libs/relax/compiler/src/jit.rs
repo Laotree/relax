@@ -7311,6 +7311,8 @@ pub unsafe fn settle_drop(up: *mut Unit) -> SettleDrops {
     let queue = TIER_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     let active = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     let mut pinned: std::collections::HashSet<u32> = queue.iter().map(|x| x.0).chain(active.iter().copied()).collect();
+    // aot: the slots whose callees are speculated after the burst keep their RIR until then
+    pinned.extend(AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|x| x.0 == up as usize).map(|x| x.1));
     // Queued jobs have not enumerated their inline snapshots yet. Their known RIR
     // dependency graph is still pending input too; dropping it would make each queued
     // caller recheck shared callees. The edges survive slot RIR eviction (warm rebuilds).
@@ -12328,7 +12330,7 @@ unsafe fn spec_enqueue(up: *mut Unit, id: u32, depth: u8) {
         Some(r) => r.clone(),
         None => return,
     };
-    spec_enqueue_calls(up, &rir, &[], depth);
+    spec_enqueue_calls(up, id, &rir, &[], depth);
 }
 
 fn note_entered(_u: &Unit, id: u32) {
@@ -12416,12 +12418,47 @@ fn spec_dyn() -> bool {
     ahead_policy().spec_dyn && *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_SPEC_DYN").map_or(true, |v| v != "0"))
 }
 
-/// Queues the slots `func` calls (but not `skip`) at depth + 1 (lock held).
-unsafe fn spec_enqueue_calls(up: *mut Unit, func: &relax_backend::rir::Func, skip: &[u32], depth: u8) {
+/// aot: slots (unit, slot, depth) built in a UI burst whose callees are speculated after it
+static AOT_DEFERRED: relax_session::sync::Mutex<Vec<(usize, u32, u8)>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// aot: once the UI's burst is over, the callees of the slots built during it are speculated (any
+/// thread; the monitor's tick).
+pub fn aot_drain() {
+    if ahead_level() != crate::options::AheadLevel::Aot || ui_burst() || startup_phase() {
+        return;
+    }
+    let roots = std::mem::take(&mut *AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()));
+    if roots.is_empty() {
+        return;
+    }
+    let _job = compile_job();
+    owner::call(owner::Class::Background, || {
+        let up = SPEC_UNIT.load(Ordering::Acquire);
+        if SPEC_STOP.load(Ordering::SeqCst) || up.is_null() {
+            return;
+        }
+        for (unit, id, depth) in roots {
+            if unit == up as usize && (id as usize) < unsafe { (&*up).fns.len() } {
+                unsafe { spec_enqueue(up, id, depth) };
+            }
+        }
+    });
+}
+
+/// Queues the slots `func` (slot `id`'s RIR) calls (but not `skip`) at depth + 1 (lock held).
+unsafe fn spec_enqueue_calls(up: *mut Unit, id: u32, func: &relax_backend::rir::Func, skip: &[u32], depth: u8) {
+    if startup_phase() || !ahead_policy().spec_calls { return; }
     // nor in a burst of the UI thread's lazy compiles after the present: the ahead helpers check
     // and lower the callees its builds make (cheaper than whole speculative builds, of which
-    // a burst called few: 119 of 14.9k compiles in a cold Stage's first 10 s after present)
-    if startup_phase() || ui_burst() || !ahead_policy().spec_calls { return; }
+    // a burst called few: 119 of 14.9k compiles in a cold Stage's first 10 s after present);
+    // aot speculates them after the burst (aot_drain)
+    if ui_burst() {
+        if ahead_level() == crate::options::AheadLevel::Aot {
+            SPEC_UNIT.store(up, Ordering::Release);
+            crate::zone_alloc::kept_with(|| AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id, depth)));
+        }
+        return;
+    }
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
     if !pipelined() || depth >= spec_depth_max(options) {
@@ -13576,7 +13613,7 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
         skip.extend(p.deferred.iter().map(|x| x.0));
         let depth = if spec { (&*up).fns[id as usize].spec_depth } else { 0 };
         if !pipelined() || !defer_startup_root(up, id, depth) {
-            spec_enqueue_calls(up, &p.func, &skip, depth);
+            spec_enqueue_calls(up, id, &p.func, &skip, depth);
         }
     }
     let u = &mut *up;
