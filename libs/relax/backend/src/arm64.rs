@@ -1133,6 +1133,12 @@ impl<'a> Gen<'a> {
                         skip_next = true;
                         continue;
                     }
+                    // a 64-bit byte swap whose only use shifts the low half back down: the 32-bit
+                    // forms (u32 / u16 from_be_bytes: rev w; rev16 w)
+                    if let Some(()) = self.narrow_bswap(options, inst, &b.insts[ii + 1]) {
+                        skip_next = true;
+                        continue;
+                    }
                 }
                 // a compare feeding the selects right after it: they read its flags (nothing between
                 // them sets flags); when they are all its uses, the bool is never materialised
@@ -2782,6 +2788,32 @@ impl<'a> Gen<'a> {
         let ra = self.use_i(a, S1);
         let rd = self.def_i(d, S0);
         self.a.e(base | kind << 22 | (ra as u32) << 16 | k << 10 | (rx as u32) << 5 | rd as u32);
+        self.fin_i(d, rd);
+        Some(())
+    }
+
+    /// `t = bswap64(a); d = t >> 32` is `rev wd, wa` (the byte-reversed low word, zero-extended);
+    /// `d = t >> 48` with a zero above 16 bits is `rev16 wd, wa`; `t = bitrev64(a); d = t >> 32`
+    /// is `rbit wd, wa` (t used once). None: no match.
+    fn narrow_bswap(&mut self, options: &relax_session::Options, sw: &Inst, next: &Inst) -> Option<()> {
+        let (t, a, bits) = match sw {
+            Inst::IBit(BitOp::Bswap, t, a) => (*t, *a, true),
+            Inst::IBit(BitOp::Rev, t, a) => (*t, *a, false),
+            _ => return None,
+        };
+        if self.al.uses[t.0 as usize] != 1 || isel_flags(options) & A64_FUSE == 0 {
+            return None;
+        }
+        let (d, op) = match next {
+            // rbit w (bit reverse of the low word)
+            Inst::IBinI(IOp::Shr, it, d, x, 32) if !bits && *x == t && it.bits == 64 && !it.signed => (*d, 0x5AC0_0000u32),
+            Inst::IBinI(IOp::Shr, it, d, x, 32) if bits && *x == t && it.bits == 64 && !it.signed => (*d, 0x5AC0_0800u32),
+            Inst::IBinI(IOp::Shr, it, d, x, 48) if bits && *x == t && it.bits == 64 && !it.signed && self.zero_above.get(a.0 as usize).is_some_and(|z| (1..=16).contains(z)) => (*d, 0x5AC0_0400),
+            _ => return None,
+        };
+        let ra = self.use_i(a, S0);
+        let rd = self.def_i(d, S0);
+        self.a.e(op | (ra as u32) << 5 | rd as u32);
         self.fin_i(d, rd);
         Some(())
     }
