@@ -657,3 +657,47 @@ fn float_loads_read_as_bits_load_integers() {
         assert!(insts.iter().any(|i| matches!(i, Inst::Load(m, _, _, 16) if *m == fm)), "{insts:?}");
     }
 }
+
+/// Lomuto's cyclic step: `*gap = *left; *left = *right; gap = right; right += 4` with gap entering
+/// as right - 4: the gap's reads become `right - 4`, the memory and result do not change, and the
+/// store through the gap shares right's base.
+#[test]
+fn previous_iv_copy_reads_the_stepped_pointer() {
+    let mut f = Func::new("gap".into(), 0);
+    let (base, end) = (f.vreg(Cls::I), f.vreg(Cls::I));
+    f.params.extend([base, end]);
+    for _ in 0..4 {
+        f.block();
+    }
+    let v: Vec<VReg> = (0..8).map(|_| f.vreg(Cls::I)).collect();
+    let (g, r, c, x, y, left) = (v[0], v[1], v[2], v[3], v[4], v[5]);
+    // entry: gap = base, right = base + 4, left = base + 40
+    push(&mut f, 0, Inst::Mov(g, base));
+    push(&mut f, 0, Inst::IBinI(IOp::Add, U64, r, base, 4));
+    push(&mut f, 0, Inst::IBinI(IOp::Add, U64, left, base, 40));
+    term(&mut f, 0, Term::Jump(1));
+    push(&mut f, 1, Inst::ICmp(Cond::Lt, false, c, r, end));
+    term(&mut f, 1, Term::Branch(c, 2, 3));
+    push(&mut f, 2, Inst::Load(Mem::Int(4, false), x, left, 0));
+    push(&mut f, 2, Inst::Store(Mem::Int(4, false), g, 0, x));
+    push(&mut f, 2, Inst::Load(Mem::Int(4, false), y, r, 0));
+    push(&mut f, 2, Inst::Store(Mem::Int(4, false), left, 0, y));
+    push(&mut f, 2, Inst::Mov(g, r));
+    push(&mut f, 2, Inst::IBinI(IOp::Add, U64, r, r, 4));
+    term(&mut f, 2, Term::Jump(1));
+    f.rets.push(Cls::I);
+    term(&mut f, 3, Term::Ret(vec![g]));
+    let orig = f.clone();
+    assert!(version::prev_iv_copies(&relax_session::Options::default(), &mut f));
+    assert!(f.blocks[2].insts.iter().any(|i| matches!(i, Inst::IBinI(IOp::Add, _, _, rr, -4) if *rr == r)), "{:?}", f.blocks[2].insts);
+    assert!(!version::prev_iv_copies(&relax_session::Options::default(), &mut f), "a second round finds nothing");
+    let mem0: Vec<u8> = (0..64u8).collect();
+    for n in [0u64, 1, 2, 5, 8] {
+        let args = [0u64, 4 + 4 * n];
+        assert_eq!(eval(&orig, &args, &mem0), eval(&f, &args, &mem0), "n {n}");
+    }
+    // entry offset that does not match the step: left alone
+    let mut h = orig.clone();
+    h.blocks[0].insts[1] = Inst::IBinI(IOp::Add, U64, r, base, 8);
+    assert!(!version::prev_iv_copies(&relax_session::Options::default(), &mut h));
+}
