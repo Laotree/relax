@@ -404,6 +404,8 @@ fn wasm_import_module(u: &Unit, d: crate::program::DefId) -> Option<String> {
 
 /// Records the RIR slot `id`'s code is compiled from (the last compile of a slot wins).
 static FINISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// finish() has begun (the union's compiles still capture)
+static FORCING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn capture(id: u32, f: &Func) {
     if !enabled() || FINISHED.load(std::sync::atomic::Ordering::Acquire) {
@@ -480,9 +482,77 @@ fn data_of(u: &Unit, id: u32) -> Option<(Vec<u8>, u64, u64)> {
     Some((bytes, len, align))
 }
 
+/// The union of several runs (`MAKEPAD_RUN_WASM_EXPORT_UNION=<coverage.json>[,...]`: the
+/// makepad-web-trace coverage of the drivers' runs, functions by `jit::slot_key`): every function the
+/// captured code can reach (calls, function addresses, pointers in its data) whose key another run
+/// executed is compiled now, so it is captured too; to a fixpoint (a forced function's own callees).
+/// Returns the slots forced (kept in the module although this run never installed them).
+fn force_union(up: *mut Unit) -> std::collections::BTreeSet<u32> {
+    let mut forced = std::collections::BTreeSet::new();
+    let Ok(file) = std::env::var("MAKEPAD_RUN_WASM_EXPORT_UNION") else { return forced };
+    let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for path in file.split(',').filter(|p| !p.is_empty()) {
+        let j = std::fs::read(path).map_err(|e| e.to_string()).and_then(|d| crate::json::parse(&d).map_err(|e| e.to_string()));
+        match j {
+            Ok(j) => keys.extend(j.get("functions").map_or(&[][..], |f| f.arr()).iter().filter_map(|f| f.get("key")).map(|k| k.str().to_string())),
+            Err(e) => eprintln!("wasm export: union {}: {}", path, e),
+        }
+    }
+    let u = unsafe { &*up };
+    let mut tried: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let (mut failed, mut rounds) = (0usize, 0usize);
+    loop {
+        rounds += 1;
+        // the slots the captured set names that it lacks
+        let want: Vec<u32> = {
+            let g = CAPTURED.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(funcs) = g.as_ref() else { return forced };
+            let mut named: Vec<u32> = Vec::new();
+            address_taken(u, funcs, &mut named);
+            for f in funcs.values() {
+                for b in &f.blocks {
+                    for i in &b.insts {
+                        if let Inst::Call(relax_backend::rir::Callee::Fn(t) | relax_backend::rir::Callee::CFn(t, _), _, _) = i {
+                            named.push(*t);
+                        }
+                    }
+                }
+            }
+            named.sort_unstable();
+            named.dedup();
+            named.into_iter().filter(|t| (*t as usize) < u.fns.len() && !funcs.contains_key(t) && !tried.contains(t)).collect()
+        };
+        let mut any = false;
+        for t in want {
+            tried.insert(t);
+            if !keys.contains(crate::jit::slot_key(u, t).as_str()) {
+                continue;
+            }
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::jit::compile_fn(up, t) })) {
+                Ok(Ok(_)) => {
+                    forced.insert(t);
+                    any = true;
+                }
+                _ => failed += 1,
+            }
+        }
+        if !any {
+            break;
+        }
+    }
+    if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
+        eprintln!("wasm export: union: {} keys, {} functions other runs executed compiled in ({} rounds, {} failed)", keys.len(), forced.len(), rounds, failed);
+    }
+    forced
+}
+
 /// Writes the module of the captured functions to the export path.
 pub fn finish(u: &Unit) {
     let Some(path) = std::env::var("MAKEPAD_RUN_WASM_EXPORT").ok() else { return };
+    if FORCING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let forced = force_union(u as *const Unit as *mut Unit);
     if FINISHED.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
     }
@@ -492,7 +562,7 @@ pub fn finish(u: &Unit) {
     // the trace: slots whose code was installed (called); a build made ahead of a call that
     // never came is not part of it
     let n_cap = funcs.len();
-    funcs.retain(|id, _| (*id as usize) < u.fns.len() && u.fns[*id as usize].code != 0);
+    funcs.retain(|id, _| (*id as usize) < u.fns.len() && (u.fns[*id as usize].code != 0 || forced.contains(id)));
     if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
         eprintln!("wasm export: {} slots captured, {} installed (of {} slots in the unit)", n_cap, funcs.len(), u.fns.len());
     }
@@ -515,15 +585,15 @@ pub fn finish(u: &Unit) {
                     None => format!("{}.{}", path, name),
                 };
                 eprintln!("wasm export variant {} [{}]:", name, o);
-                emit(u, &funcs, &kept, kept_failed, o, &p);
+                emit(u, &funcs, &kept, kept_failed, &forced, o, &p);
             }
         }
-        Err(_) => emit(u, &funcs, &kept, kept_failed, &std::env::var("MAKEPAD_RUN_WASM_OPT").unwrap_or_default(), &path),
+        Err(_) => emit(u, &funcs, &kept, kept_failed, &forced, &std::env::var("MAKEPAD_RUN_WASM_OPT").unwrap_or_default(), &path),
     }
 }
 
 /// One module of the captured set with options `optv` (`-tee,remat,...`), written to `path`.
-fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet<u32>, kept_failed: usize, optv: &str, path: &str) {
+fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet<u32>, kept_failed: usize, forced: &std::collections::BTreeSet<u32>, optv: &str, path: &str) {
     let options = u.prog.session.options.clone();
     // the web player's profile: panics abort, one thread (TLS keys and waits built in)
     // untraced calls are a bare trap (option untraced: env.u(id) first, for a message)
@@ -576,7 +646,8 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
         let untraced = opts.untraced_import;
         for (id, f) in w.iter_mut() {
             nb += f.blocks.len();
-            let (t, r) = shake_blocks(f, blocks && !kept.contains(id), &keep, if untraced { Some(&mut stub_id) } else { None });
+            // a function another run executed (the union) has no block coverage here: whole
+            let (t, r) = shake_blocks(f, blocks && !kept.contains(id) && !forced.contains(id), &keep, if untraced { Some(&mut stub_id) } else { None });
             nt += t;
             nr += r;
         }
