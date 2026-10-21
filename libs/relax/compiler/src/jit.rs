@@ -12771,14 +12771,18 @@ pub fn ahead_complete_tick() {
         *seen = (activity, now);
         return;
     }
-    let queued = !SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-        || !TIER_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-        || !TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-        || !AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    drop(seen);
+    // one lock at a time (each its own statement: no two held together)
+    let spec = SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let tier = TIER_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let tier_active = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let deferred = AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let checks = crate::borrowck::lazy::queued();
+    let queued = spec + tier + tier_active + deferred + checks > 0
         || TEARDOWN_RUNNING.load(Ordering::SeqCst)
-        || crate::borrowck::lazy::queued() > 0
-        || BG_ACTIVE.load(Ordering::SeqCst) > 0;
-    if queued || now.saturating_sub(seen.1) < AHEAD_QUIET_NS {
+        || BG_ACTIVE.load(Ordering::SeqCst) > JOB_DEPTH.with(|d| (d.get() > 0) as u32);
+    let since = AHEAD_SEEN.lock().unwrap_or_else(|e| e.into_inner()).1;
+    if queued || now.saturating_sub(since) < AHEAD_QUIET_NS {
         return;
     }
     AHEAD_COMPLETE.store(true, Ordering::Relaxed);
