@@ -20,12 +20,13 @@ k=0
 for step in "" "" "" "line 1" "host 1" "line 2" "closure+" "host 2" "line 3" "move" "closure-" "host 3" "line 4" "" ""; do
   k=$((k + 1))
   if [ -n "$step" ]; then python3 "$H/edit.py" "$C/pkg" "$step" || { bad="$bad edit '$step' failed;"; break; }; fi
-  (cd "$C/pkg" && env -u MAKEPAD_RUN_PRELINK -u MAKEPAD_RUN_CACHE_TRACE MAKEPAD_RUN_VERBOSE=1 MAKEPAD_RUN_CACHE_DIR="$C/cache" MAKEPAD_RUN_TARGET_DIR="$C/target" MAKEPAD_RUN_STD="$H/../../std" "$R" run cache-warm-edit-ids) > "$C/run$k.log" 2>&1
+  (cd "$C/pkg" && env -u MAKEPAD_RUN_PRELINK -u MAKEPAD_RUN_CACHE_TRACE MAKEPAD_RUN_VERBOSE=1 MAKEPAD_RUN_CACHE_DIR="$C/cache" MAKEPAD_RUN_TARGET_DIR="$C/target" MAKEPAD_RUN_STD="$H/../../std" "$R" run cache-warm-edit-ids) > "$C/run$k.out" 2> "$C/run$k.log"
   rc=$?
-  got=$(grep -m1 "^cache_warm_edit_ids result " "$C/run$k.log")
+  # (stdout on its own: verbose stderr lines would split the result line)
+  got=$(grep -m1 "^cache_warm_edit_ids result " "$C/run$k.out")
   [ -z "$want" ] && want=$got
   if [ $rc != 0 ] || [ -z "$got" ] || [ "$got" != "$want" ] || grep -qE "has no identity|startup image dropped" "$C/run$k.log"; then
-    bad="$bad run$k(${step:-warm}) exit $rc: $(grep -m1 -E "has no identity|startup image dropped|segfault|panicked|error|result" "$C/run$k.log" | cut -c1-200);"
+    bad="$bad run$k(${step:-warm}) exit $rc: $(grep -m1 -E "has no identity|startup image dropped|segfault|panicked|error|result" "$C/run$k.log" "$C/run$k.out" | cut -c1-200);"
   fi
   [ -n "$WF_LOG" ] && grep -E "prelinked|identities decoded|startup image of|startup manifest" "$C/run$k.log" | sed "s/^/run$k(${step:-warm}): /"
 done
