@@ -87,3 +87,54 @@ fn promoted_lanes_compute_the_same_bits() {
         assert_eq!(outs[1][5 * N + i], src[4 * i + 1].to_bits());
     }
 }
+
+/// x64: VSplat + VInsert chains whose inserted f32 comes from the Load right before it (the load is
+/// folded into vinsertps' memory operand), many vectors live (xmm16..31 on AVX-512VL hosts).
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
+fn vinsert_from_memory_builds_the_lanes() {
+    use relax_backend::exec::Code;
+    type Entry = extern "sysv64" fn(*const u8, *mut u8);
+    const M: usize = 40;
+    let mut o = relax_session::Options::default();
+    o.cpu = relax_backend::x64::detect_cpu(&o);
+    let mut f = Func::new("vinsert_mem".into(), 0);
+    let (ps, pd) = (f.vreg(Cls::I), f.vreg(Cls::I));
+    f.params = vec![ps, pd];
+    f.block();
+    let mut insts = Vec::new();
+    let mut vs = Vec::new();
+    for i in 0..M {
+        let x0 = f.vreg(Cls::F32);
+        insts.push(Inst::Load(Mem::F32, x0, ps, (4 * ((i * 3) % 64)) as i32));
+        let mut v = f.vreg(Cls::V128);
+        insts.push(Inst::VSplat(v, x0));
+        for j in 1..4u8 {
+            let x = f.vreg(Cls::F32);
+            insts.push(Inst::Load(Mem::F32, x, ps, (4 * ((i * 3 + 5 * j as usize) % 64)) as i32));
+            let v2 = f.vreg(Cls::V128);
+            insts.push(Inst::VInsert(v2, v, j, x));
+            v = v2;
+        }
+        vs.push(v);
+    }
+    for (i, v) in vs.iter().enumerate() {
+        insts.push(Inst::VStore(pd, 16 * i as i32, *v));
+    }
+    f.blocks[0].pos = vec![0; insts.len()];
+    f.blocks[0].insts = insts;
+    f.blocks[0].term = Term::Ret(vec![]);
+    f.verify().unwrap();
+    let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+    let c = relax_backend::x64::compile(&o, &f, &env).unwrap();
+    let code = Code::new(&c.code).unwrap();
+    let run: Entry = unsafe { std::mem::transmute(code.ptr()) };
+    let src: Vec<f32> = (0..64).map(|k| k as f32 * 0.5 - 3.0).collect();
+    let mut dst = vec![0f32; 4 * M];
+    run(src.as_ptr() as *const u8, dst.as_mut_ptr() as *mut u8);
+    for i in 0..M {
+        for j in 0..4 {
+            assert_eq!(dst[4 * i + j].to_bits(), src[(i * 3 + 5 * j) % 64].to_bits(), "vector {} lane {}", i, j);
+        }
+    }
+}

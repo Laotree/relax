@@ -9592,6 +9592,8 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     relax_codegen::loops::unroll_loops(options, func);
     // byte stores of one value's bytes -> one wide store (before address modes)
     relax_codegen::loops::merge_stores(options, func);
+    // f32 lane stores of one 16 bytes -> one vector store
+    relax_codegen::loops::merge_lane_stores(options, func);
     if cfg.fold {
         // steps of an unrolled copy hang off the first value (offsets fold into address modes)
         if relax_codegen::loops::flatten_step_chains(func) {

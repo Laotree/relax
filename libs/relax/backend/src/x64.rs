@@ -1613,6 +1613,8 @@ impl<'a> Gen<'a> {
                                 *w2 == w && ((y == t && x != t) || (matches!(op, FOp::Add | FOp::Mul) && x == t && y != t))
                             }
                             Inst::FMulAdd(_, _, w2, _, a, b2, c) => *w2 == w && [*a, *b2, *c].iter().filter(|v| **v == *t).count() == 1,
+                            // vinsertps xd, xv, [m], lane << 4
+                            Inst::VInsert(_, _, _, s2) => !w && s2 == t,
                             _ => false,
                         };
                         if ok {
@@ -4431,6 +4433,20 @@ impl<'a> Gen<'a> {
                     self.a.byte(lane);
                     self.fin_f(d, xd);
                 }
+            }
+            Inst::VInsert(d, v, lane, _) if self.mem_load.is_some() => {
+                // the inserted f32 straight from memory (its Load folded here)
+                let (_, base, off) = self.mem_load.take().unwrap();
+                let xv = self.use_fx(v, XS);
+                let xd = self.def_fx(d, XS);
+                let (rb, disp) = self.base_disp(options, base, R11, off);
+                if xd >= 16 || xv >= 16 {
+                    self.a.evex_m(1, 3, false, false, 0x21, xd, xv, rb, disp);
+                } else {
+                    self.a.vex_lm(1, 3, false, false, 0x21, xd, xv, rb, disp);
+                }
+                self.a.byte(lane << 4);
+                self.fin_f(d, xd);
             }
             Inst::VInsert(d, v, lane, s) if options.cpu.avx && self.f.vregs[s.0 as usize] != Cls::I => {
                 // vinsertps xd, xv, xs, lane << 4 (VEX; EVEX for xmm16..31)

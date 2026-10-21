@@ -1656,6 +1656,63 @@ fn apply_lane_group(f: &mut Func, head: u32, members: &[bool], preds: &[Vec<u32>
     }
 }
 
+/// Four consecutive f32 stores to the lanes of one 16 bytes, `[p + o + 4j] = v_j` (j = 0..3, no
+/// other instruction between them), become one vector store of the four values (splat v0, insert
+/// v1..v3): core::arch `_mm_setr_ps` and lane setters write a vector a lane at a time, and the
+/// 16-byte load that reads it back cannot forward from four 4-byte stores (a store-forwarding
+/// stall per vector; LLVM's DAG combiner merges such stores the same way). Returns whether
+/// anything changed.
+pub fn merge_lane_stores(options: &relax_session::Options, f: &mut Func) -> bool {
+    if !merge_stores_on(options) {
+        return false;
+    }
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        if f.blocks[bi].insts.iter().filter(|i| matches!(i, Inst::Store(Mem::F32, ..))).count() < 4 {
+            continue;
+        }
+        let old = std::mem::take(&mut f.blocks[bi].insts);
+        let old_pos = std::mem::take(&mut f.blocks[bi].pos);
+        let mut out = Vec::with_capacity(old.len());
+        let mut pos = Vec::with_capacity(old.len());
+        let mut k = 0;
+        while k < old.len() {
+            let lanes = (k + 4 <= old.len()).then(|| {
+                let Inst::Store(Mem::F32, base, o, _) = old[k] else { return None };
+                let mut vs = [VReg(0); 4];
+                for j in 0..4 {
+                    match old[k + j] {
+                        Inst::Store(Mem::F32, b2, o2, v) if b2 == base && o2 as i64 == o as i64 + 4 * j as i64 => vs[j] = v,
+                        _ => return None,
+                    }
+                }
+                Some((base, o, vs))
+            }).flatten();
+            let p = old_pos.get(k).copied().unwrap_or(0);
+            if let Some((base, o, vs)) = lanes {
+                let mut t = f.vreg(Cls::V128);
+                out.push(Inst::VSplat(t, vs[0]));
+                for j in 1..4 {
+                    let t2 = f.vreg(Cls::V128);
+                    out.push(Inst::VInsert(t2, t, j as u8, vs[j]));
+                    t = t2;
+                }
+                out.push(Inst::VStore(base, o, t));
+                pos.extend(std::iter::repeat(p).take(5));
+                changed = true;
+                k += 4;
+                continue;
+            }
+            out.push(old[k].clone());
+            pos.push(p);
+            k += 1;
+        }
+        f.blocks[bi].insts = out;
+        f.blocks[bi].pos = pos;
+    }
+    changed
+}
+
 fn merge_stores_on(options: &relax_session::Options) -> bool {
     !options.no_store_merge
 }
