@@ -676,20 +676,25 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
         // the bottom-up body first, then the snapshot body: (inlined body, priced body); each
         // priced as written, then (constant arguments) as this site sees it
         let mut pick = None;
-        let mut tries: Vec<(bool, bool, *const Func, *const Func)> = Vec::new();
         // bottom-up bodies serve sites in loops (where a callee's own inlining pays per
         // iteration); elsewhere the snapshot body decides, top-down, and no preparation is made
         let bottom = if loop_sites[bi] { prepared(id) } else { None };
-        for (bottom_up, (body, shape)) in bottom.map(|x| (true, x)).into_iter().chain(found.map(|(p, _)| (false, (p, p)))) {
-            tries.push((bottom_up, false, body, shape));
-            if consts.iter().any(|c| c.is_some()) {
-                let spec = specialized.entry((id, bottom_up, consts.clone())).or_insert_with(|| specialize_for_args(unsafe { &*shape }, &consts).map(Box::new));
-                if let Some(g) = spec {
-                    tries.push((bottom_up, true, body, &**g as *const Func));
+        let plain: Vec<(bool, *const Func, *const Func)> = bottom.map(|(b, s)| (true, b, s)).into_iter().chain(found.map(|(p, _)| (false, p, p))).collect();
+        // as written first; the constant-argument pricing only for a site those refused
+        let mut tries: Vec<(bool, bool, *const Func, *const Func)> = plain.iter().map(|&(u, b, s)| (u, false, b, s)).collect();
+        let any_const = consts.iter().any(|c| c.is_some());
+        let mut k = 0;
+        loop {
+            if k == plain.len() && any_const {
+                for &(bottom_up, body, shape) in &plain {
+                    let spec = specialized.entry((id, bottom_up, consts.clone())).or_insert_with(|| specialize_for_args(unsafe { &*shape }, &consts).map(Box::new));
+                    if let Some(g) = spec {
+                        tries.push((bottom_up, true, body, &**g as *const Func));
+                    }
                 }
             }
-        }
-        for (bottom_up, in_context, body, shape) in tries {
+            let Some(&(bottom_up, in_context, body, shape)) = tries.get(k) else { break };
+            k += 1;
             let (callee, shape) = unsafe { (&*body, &*shape) };
             let size = inline_inst_count(shape);
             let cost = size.saturating_sub(args.len() + rets.len() + 3);
