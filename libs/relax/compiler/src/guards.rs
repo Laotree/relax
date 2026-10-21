@@ -27,8 +27,9 @@
 //! the disk cache (`Ctx::emitted`); a later run profiles again. Hot reload needs nothing extra: a
 //! patched caller is built again (new code, same records), a patched guessed callee was inlined or
 //! is called through its slot, and inlined callees recompile their callers as before.
-//! Off by default: MAKEPAD_RUN_SPEC=1 turns it on. MAKEPAD_RUN_SPEC_READY / _FAILS set the
-//! thresholds (diff_fast uses small ones so every guard path runs), MAKEPAD_RUN_SPEC_TRACE=1 logs
+//! Off by default: MAKEPAD_RUN_GUARDS=1 turns it on (MAKEPAD_RUN_SPEC is the unrelated ahead-of-call compile).
+//! MAKEPAD_RUN_GUARDS_READY / _FAILS set the
+//! thresholds (diff_fast uses small ones so every guard path runs), MAKEPAD_RUN_GUARDS_TRACE=1 logs
 //! each transition.
 
 include!("rt_abi.rs");
@@ -93,19 +94,19 @@ fn env_u64(name: &str, d: u64) -> u64 {
 
 pub fn enabled() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var("MAKEPAD_RUN_SPEC").is_ok_and(|v| v == "1"))
+    *E.get_or_init(|| std::env::var("MAKEPAD_RUN_GUARDS").is_ok_and(|v| v == "1"))
 }
 fn ready() -> u64 {
     static E: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *E.get_or_init(|| env_u64("MAKEPAD_RUN_SPEC_READY", 1000))
+    *E.get_or_init(|| env_u64("MAKEPAD_RUN_GUARDS_READY", 1000))
 }
 fn fail_limit() -> u64 {
     static E: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *E.get_or_init(|| env_u64("MAKEPAD_RUN_SPEC_FAILS", 1 << 16))
+    *E.get_or_init(|| env_u64("MAKEPAD_RUN_GUARDS_FAILS", 1 << 16))
 }
 fn trace() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var_os("MAKEPAD_RUN_SPEC_TRACE").is_some())
+    *E.get_or_init(|| std::env::var_os("MAKEPAD_RUN_GUARDS_TRACE").is_some())
 }
 
 /// Every site of the run, by caller slot (a slot's sites are few; the map is read once per O3
@@ -128,7 +129,7 @@ fn site(slot: u32, pos: u64) -> &'static SiteRec {
         if trace() {
             static WATCH: std::sync::Once = std::sync::Once::new();
             WATCH.call_once(|| {
-                let _ = std::thread::Builder::new().name("run-spec-trace".to_string()).spawn(|| loop {
+                let _ = std::thread::Builder::new().name("run-guards-trace".to_string()).spawn(|| loop {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     dump(&|id| format!("#{}", id));
                 });
@@ -140,7 +141,7 @@ fn site(slot: u32, pos: u64) -> &'static SiteRec {
 
 fn note(r: &SiteRec, what: &str) {
     if trace() {
-        eprintln!("spec: slot {} pos {:#x}: {} (state {}, t0 {:#x} x{}, t1 {:#x} x{}, other {}, fails {}, respecs {})", r.slot, r.pos, what,
+        eprintln!("guards: slot {} pos {:#x}: {} (state {}, t0 {:#x} x{}, t1 {:#x} x{}, other {}, fails {}, respecs {})", r.slot, r.pos, what,
             STATE_NAMES[r.state.load(Ordering::Relaxed) as usize], r.t0.load(Ordering::Relaxed), r.n0.load(Ordering::Relaxed),
             r.t1.load(Ordering::Relaxed), r.n1.load(Ordering::Relaxed), r.other.load(Ordering::Relaxed), r.fails.load(Ordering::Relaxed),
             r.respecs.load(Ordering::Relaxed));
@@ -152,7 +153,7 @@ fn relink(r: &SiteRec, why: &str) {
     r.done.store(1, Ordering::Relaxed);
     if !r.queued.swap(true, Ordering::AcqRel) {
         note(r, why);
-        crate::jit::spec_relink(r.slot);
+        crate::jit::guard_relink(r.slot);
     }
 }
 
@@ -195,7 +196,7 @@ fn rt_spec_fail(rec: u64) {
 }
 }
 
-/// MAKEPAD_RUN_SPEC_TRACE: every site's final state at the end of the run (Unit drop).
+/// MAKEPAD_RUN_GUARDS_TRACE: every site's final state at the end of the run (Unit drop).
 pub fn dump(name: &dyn Fn(u32) -> String) {
     if !trace() {
         return;
@@ -210,11 +211,11 @@ pub fn dump(name: &dyn Fn(u32) -> String) {
             by[st as usize] += 1;
             if st == PROFILE && r.queued.load(Ordering::Relaxed) {
                 stuck += 1;
-                eprintln!("spec: end: slot {} {} pos {:#x}: profile ready, never rebuilt (calls {})", slot, name(*slot), r.pos, r.total());
+                eprintln!("guards: end: slot {} {} pos {:#x}: profile ready, never rebuilt (calls {})", slot, name(*slot), r.pos, r.total());
             }
         }
     }
-    eprintln!("spec: end: sites profile {} guard {} stable {} off {}; ready but not rebuilt {}", by[0], by[1], by[2], by[3], stuck);
+    eprintln!("guards: end: sites profile {} guard {} stable {} off {}; ready but not rebuilt {}", by[0], by[1], by[2], by[3], stuck);
     let _ = std::io::Write::flush(&mut std::io::stderr());
 }
 
@@ -228,9 +229,9 @@ pub struct Syms {
 
 pub fn syms(u: &crate::jit::Unit) -> Syms {
     Syms {
-        probe: u.syms.intern(crate::syms::SymKind::Rt("spec_probe"), rt_spec_probe as *const () as usize as u64),
-        ready: u.syms.intern(crate::syms::SymKind::Rt("spec_ready"), rt_spec_ready as *const () as usize as u64),
-        fail: u.syms.intern(crate::syms::SymKind::Rt("spec_fail"), rt_spec_fail as *const () as usize as u64),
+        probe: u.syms.intern(crate::syms::SymKind::Rt("guard_probe"), rt_spec_probe as *const () as usize as u64),
+        ready: u.syms.intern(crate::syms::SymKind::Rt("guard_ready"), rt_spec_ready as *const () as usize as u64),
+        fail: u.syms.intern(crate::syms::SymKind::Rt("guard_fail"), rt_spec_fail as *const () as usize as u64),
     }
 }
 
@@ -363,7 +364,7 @@ fn edit(ctx: &Ctx, func: &mut Func, probes: bool) {
         }
     }
     if trace() && n_sites > 0 {
-        eprintln!("spec: build of slot {}: {} indirect sites, {} {}", id, n_sites, changed, if probes { "probed" } else { "guarded" });
+        eprintln!("guards: build of slot {}: {} indirect sites, {} {}", id, n_sites, changed, if probes { "probed" } else { "guarded" });
     }
     if changed > 0 {
         ctx.emitted.set(true);

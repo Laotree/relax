@@ -196,6 +196,8 @@ static MAIN_WAIT_BEHIND: AtomicU64 = AtomicU64::new(u64::MAX);
 /// what the owner serves now: class (u8::MAX: idle) and requester
 static NOW_CLASS: AtomicU8 = AtomicU8::new(u8::MAX);
 static NOW_FROM: AtomicU64 = AtomicU64::new(0);
+/// the call site of the request being served (null: none)
+static NOW_SITE: std::sync::atomic::AtomicPtr<std::panic::Location<'static>> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 thread_local! {
     static IS_OWNER: Cell<bool> = const { Cell::new(false) };
@@ -204,6 +206,34 @@ thread_local! {
     /// owner: the request being served (class, requester) and how many are open on its stack
     static SERVING: Cell<(Class, u64)> = const { Cell::new((Class::Background, 0)) };
     static DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// leaf locks this thread holds (`Leaf`)
+    static LEAVES: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Held with a leaf lock (a unit's `fn_create`): while it lives this thread may not wait for the
+/// owner, pump, or serve requests -- a request served there may need the same lock (the owner
+/// creating a slot pumped inside it and served a build that created a slot: self-deadlock). The
+/// check is a thread-local read on the waiting paths only.
+pub(crate) struct Leaf(());
+
+impl Leaf {
+    pub(crate) fn enter() -> Leaf {
+        let _ = LEAVES.try_with(|l| l.set(l.get() + 1));
+        Leaf(())
+    }
+}
+
+impl Drop for Leaf {
+    fn drop(&mut self) {
+        let _ = LEAVES.try_with(|l| l.set(l.get() - 1));
+    }
+}
+
+#[track_caller]
+fn assert_no_leaf(what: &str) {
+    if LEAVES.try_with(|l| l.get()).unwrap_or(0) > 0 {
+        panic!("makepad: {} while holding a leaf lock (fn_create): lock order violated, this would deadlock", what);
+    }
 }
 
 fn me() -> u64 {
@@ -360,6 +390,7 @@ fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f
     if is_owner() || CHILD.load(Ordering::Relaxed) {
         return Some(f());
     }
+    assert_no_leaf("a request to the compiler's owner");
     // a front reader that must not wait (lowering ahead) gives the work back first; a back
     // end's finish is never refused (its slots stay in flight until it is served)
     if !class.is_finish() {
@@ -399,6 +430,8 @@ fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f
     };
     let behind = NOW_CLASS.load(Ordering::Relaxed);
     let behind_from = NOW_FROM.load(Ordering::Relaxed);
+    // SAFETY: only &'static Locations are stored
+    let behind_site = unsafe { NOW_SITE.load(Ordering::Relaxed).as_ref() };
     let t_req = std::time::Instant::now();
     let t0 = if main_wait { crate::jit::wall_ns() } else { 0 };
     in_call_add(1);
@@ -426,7 +459,7 @@ fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f
         MAIN_ACC[b + 1].fetch_add(w, Ordering::Relaxed);
         let served = req.t_serve.load(Ordering::Relaxed);
         if served != 0 {
-            crate::jit::main_rec_behind(served.saturating_sub(req.t_push), behind, behind_from);
+            crate::jit::main_rec_behind(served.saturating_sub(req.t_push), behind, behind_from, behind_site);
         }
         crate::postframe::main_owner_wait(req.t_push, w);
     }
@@ -583,8 +616,9 @@ fn wait(req: &Req, deadline: Option<std::time::Instant>) -> bool {
 enum Mode {
     /// the owner's idle loop: everything, in class order
     Top,
-    /// a wait inside a request: Job and Finish only (what the awaited thread may be waiting
-    /// for; a program thread's request waits for the owner's current one to end)
+    /// a wait inside a request: Job, Finish and FinishBackground only (Class::keeps_job: what
+    /// the awaited thread may be waiting for; a program thread's or a background request waits
+    /// for the owner's current one to end)
     Pump,
 }
 
@@ -619,7 +653,13 @@ fn pick(q: &mut Queue, mode: Mode) -> Option<usize> {
     };
     let helper = EXIT_HELPER.load(Ordering::Acquire);
     for c in 0..CLASSES {
-        if mode == Mode::Pump && (c == Class::Main as usize || c == Class::App as usize) {
+        // a pump serves only what the awaited thread may be waiting for: a job's request, a
+        // back end's finish. Never a program thread's request, never a Background one: those open
+        // builds of their own (a speculative build's split_begin) on top of the request that
+        // pumps -- which holds its own state open meanwhile -- and a program thread whose
+        // request the pump's request is would wait behind them (Sandbox's race game hung on a
+        // speculative build served inside a main-thread request's pump, 2026-10-21)
+        if mode == Mode::Pump && !CLASS_OF[c].keeps_job() {
             continue;
         }
         if c >= Class::Background as usize && FOREGROUND.load(Ordering::Relaxed) > 0 {
@@ -666,6 +706,7 @@ fn serve(r: usize) {
     let prev_ctx = unsafe { crate::query::swap_context(req.ctx) };
     let prev = SERVING.with(|s| s.replace((req.class, req.from)));
     let prev_now = (NOW_CLASS.swap(req.class as u8, Ordering::Relaxed), NOW_FROM.swap(req.from, Ordering::Relaxed));
+    let prev_site = NOW_SITE.swap(req.site as *const std::panic::Location<'static> as *mut _, Ordering::Relaxed);
     DEPTH.with(|d| d.set(d.get() + 1));
     let frame = crate::jit::frame_enter(req.rec);
     // makepad inspect's timeline: the owner's service of this request is a span
@@ -700,6 +741,7 @@ fn serve(r: usize) {
     DEPTH.with(|d| d.set(d.get() - 1));
     NOW_CLASS.store(prev_now.0, Ordering::Relaxed);
     NOW_FROM.store(prev_now.1, Ordering::Relaxed);
+    NOW_SITE.store(prev_site, Ordering::Relaxed);
     SERVING.with(|s| s.set(prev));
     unsafe { crate::query::swap_context(prev_ctx) };
     OWNER_SERVING.store(was_serving, Ordering::Relaxed);
@@ -801,6 +843,7 @@ fn pump_wait_for(runner: u64, done: &dyn Fn() -> bool) {
     if done() {
         return;
     }
+    assert_no_leaf("a wait that serves the owner's requests");
     let _w = crate::waits::begin(crate::waits::Kind::Pump, 0, runner, "pump");
     if !is_owner() || CHILD.load(Ordering::Relaxed) {
         // a job waiting for another thread is not running meanwhile (jit::job_sleep's reason)
@@ -955,4 +998,61 @@ pub fn fork_child() {
     CHILD.store(true, Ordering::SeqCst);
     FORKING.store(false, Ordering::SeqCst);
     IS_OWNER.with(|o| o.set(true));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Sandbox race-game hang (2026-10-21): the owner, serving a main-thread request, pumped
+    /// inside it (a query latch) and took a queued Background request -- a speculative build --
+    /// which reached the slot lock the outer request held. A pump serves Job and Finish
+    /// requests only; the Background one waits for the top of the owner loop.
+    #[test]
+    fn a_pump_serves_jobs_but_no_background_request() {
+        isolated_test!(a_pump_serves_jobs_but_no_background_request);
+        static BACKGROUND_RAN: AtomicBool = AtomicBool::new(false);
+        static JOB_RAN: AtomicBool = AtomicBool::new(false);
+        call(Class::App, || {
+            assert!(is_owner());
+            post_queued(Class::Background, || BACKGROUND_RAN.store(true, Ordering::SeqCst));
+            // the job comes only once the pump has looked at the queue and gone to sleep: before
+            // the fix the pump took the background request at its first look
+            let job = std::thread::spawn(|| {
+                while !OWNER_ASLEEP.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                call(Class::Job, || JOB_RAN.store(true, Ordering::SeqCst));
+            });
+            pump_wait(&|| JOB_RAN.load(Ordering::SeqCst));
+            assert!(!BACKGROUND_RAN.load(Ordering::SeqCst), "a background request was served inside a pump");
+            job.join().unwrap();
+        });
+        // the owner's top loop serves it once the request ended
+        call(Class::Background, || {});
+        assert!(BACKGROUND_RAN.load(Ordering::SeqCst));
+    }
+
+    /// A thread holding a leaf lock (fn_create) that asks the owner, or pumps, is a lock-order
+    /// violation: it panics instead of deadlocking.
+    #[test]
+    fn a_wait_under_a_leaf_lock_panics() {
+        isolated_test!(a_wait_under_a_leaf_lock_panics);
+        let r = std::thread::spawn(|| {
+            let _leaf = Leaf::enter();
+            call(Class::App, || {});
+        })
+        .join();
+        let p = r.expect_err("a request under a leaf lock panics");
+        let msg = p.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("leaf lock"), "{msg}");
+        // the owner itself, pumping under one
+        let r = std::panic::catch_unwind(|| call(Class::App, || {
+            let _leaf = Leaf::enter();
+            pump_wait(&|| false);
+        }));
+        assert!(r.is_err(), "a pump under a leaf lock panics");
+        // and the guard is released by the unwind: requests work again
+        assert_eq!(call(Class::App, || 5), 5);
+    }
 }
