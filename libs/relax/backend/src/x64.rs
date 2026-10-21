@@ -803,7 +803,12 @@ fn evex_direct(pp: u8, map: u8, op: u8) -> Option<bool> {
 /// register over the whole instruction (its operands and results included).
 fn x64_clobbers(options: &relax_session::Options, f: &Func, i: &Inst) -> u64 {
     let xmm01 = if keeps_xmm01(options, f, i) { 0 } else { (1 << 32) | (1 << 33) };
-    xmm01 | x64_int_clobbers(options, i)
+    // the 32-byte block copies of Gen::inst's Copy go through ymm31
+    let ymm31 = match i {
+        Inst::Copy(_, _, n) if options.cpu.avx512 && *n >= 32 && *n <= 512 => 1u64 << 63,
+        _ => 0,
+    };
+    xmm01 | ymm31 | x64_int_clobbers(options, i)
 }
 
 /// The instructions whose emitter arms (and the helpers they call) never name xmm0 / xmm1: they
@@ -3192,6 +3197,16 @@ impl<'a> Gen<'a> {
                     // ~30 cycles: Option<T> moves of a few hundred bytes in hot paths)
                     let size = *size as i32;
                     let mut o = 0i32;
+                    if options.cpu.avx512 {
+                        // AVX-512VL: 32-byte vmovups through ymm31 (x64_clobbers keeps values out of
+                        // it here). An upper register needs no vzeroupper: legacy SSE code cannot
+                        // see it, so its dirty upper half costs nothing at calls and returns.
+                        while o + 32 <= size {
+                            self.a.evex_m(0, 1, false, true, 0x10, 31, 0, rs, o);
+                            self.a.evex_m(0, 1, false, true, 0x11, 31, 0, rd, o);
+                            o += 32;
+                        }
+                    }
                     while o + 16 <= size {
                         self.a.sse_rm(0, 0x10, XS, rs, o);
                         self.a.sse_rm(0, 0x11, XS, rd, o);
