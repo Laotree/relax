@@ -41,6 +41,10 @@ impl Error for AccessError {}
 struct Slot<T> {
     drop_slot: unsafe fn(*mut u8),
     key: sys::Key,
+    /// a value without drop glue: std registers no destructor for it and it is never destroyed
+    /// (library/std/src/sys/thread_local/native: EagerStorage / LazyStorage<T, ()>), so other
+    /// keys' destructors still read it; its slot is freed only after every destructor ran
+    late: bool,
     value: T,
 }
 
@@ -48,6 +52,7 @@ struct Slot<T> {
 struct SlotHeader {
     drop_slot: unsafe fn(*mut u8),
     key: sys::Key,
+    late: bool,
 }
 
 /// Stored in the key while a slot is being destroyed (and after): access fails.
@@ -62,6 +67,14 @@ extern "C" fn key_dtor(p: *mut c_void) {
         return; // second destructor round: leave the key empty
     }
     unsafe {
+        // A value that is never destroyed stays readable: put it back; the runtime's call for
+        // what is left after all destructors frees it
+        let header = &mut *(p as *mut SlotHeader);
+        if header.late {
+            header.late = false;
+            sys::key_set(header.key, p);
+            return;
+        }
         // The runtime cleared the key before calling us: mark it destroyed while the value
         // drops (access from other destructors then fails with AccessError); the runtime
         // calls us once more with DESTROYED and then leaves the key empty.
@@ -137,7 +150,7 @@ impl<T: 'static> LocalKey<T> {
                 return Some(&(*slot).value as *const T);
             }
         }
-        let slot = Box::into_raw(Box::new(Slot { drop_slot: drop_slot::<T>, key, value }));
+        let slot = Box::into_raw(Box::new(Slot { drop_slot: drop_slot::<T>, key, late: !core::mem::needs_drop::<T>(), value }));
         unsafe {
             sys::key_set(key, slot as *const c_void);
             Some(&(*slot).value as *const T)

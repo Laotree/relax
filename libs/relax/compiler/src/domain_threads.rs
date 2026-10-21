@@ -14,6 +14,13 @@ pub(crate) struct ThreadData {
     cache_len: usize,
     pub registrations: Vec<(u64, u64)>,
     values: Vec<(u64, Vec<usize>)>,
+    /// (domain, key) in the order this thread first set each key: destructors run last-first, as
+    /// std's (library/std/src/sys/thread_local/destructors/list.rs: registered at a key's first
+    /// initialisation on the thread, run by popping the list); each key is registered once
+    order: Vec<(u64, u32)>,
+    /// every (domain, key) ever registered in `order` (a destroyed key's DESTROYED marker is no
+    /// new registration)
+    registered: Vec<(u64, u32)>,
 }
 
 impl ThreadData {
@@ -41,6 +48,8 @@ pub(crate) unsafe fn data(block: u64) -> &'static mut ThreadData {
             cache_len: 0,
             registrations: Vec::new(),
             values: Vec::new(),
+            order: Vec::new(),
+            registered: Vec::new(),
         })) as u64;
     }
     &mut *(*slot as *mut ThreadData)
@@ -84,6 +93,11 @@ pub extern "C" fn key_set(key: u32, value: *const c_void) {
         if values.len() <= key as usize {
             values.resize(key as usize + 1, 0);
         }
+        if values[key as usize] == 0 && value as usize != 0 && !t.registered.contains(&(base, key)) {
+            t.registered.push((base, key));
+            t.order.push((base, key));
+        }
+        let values = &mut t.values[i].1;
         values[key as usize] = value as usize;
         t.refresh(base);
     }
@@ -97,6 +111,26 @@ pub(crate) unsafe fn finish(block: u64) -> Vec<(u64, u64)> {
         return Vec::new();
     }
     let p = *slot as *mut ThreadData;
+    // registration order, last first; a destructor that initialises another key registers it
+    // and it runs next
+    while let Some((key_base, key)) = (*p).order.pop() {
+        let value = (*p)
+            .values
+            .iter_mut()
+            .find(|v| v.0 == key_base)
+            .and_then(|v| v.1.get_mut(key as usize).map(std::mem::take))
+            .unwrap_or(0);
+        if value == 0 {
+            continue;
+        }
+        if let Some(dtor) = crate::domain::tls_destructor(key_base, key) {
+            crate::domain::enter(key_base);
+            let f: extern "C" fn(*mut c_void) = std::mem::transmute(dtor);
+            f(value as *mut c_void);
+        }
+    }
+    // what the destructors left (std's DESTROYED markers): one more call each, as for a key
+    // whose value is still set after its destructor ran
     loop {
         // Complete a round before revisiting keys set by a destructor. LocalKey marks itself
         // destroyed while it drops; a later destructor must see that marker, not a fresh key.

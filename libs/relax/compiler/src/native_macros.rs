@@ -57,6 +57,9 @@ fn validate_package(reg: &Reg, unit: usize, overlays: &std::collections::HashMap
         "makepad_live_id" => &["default"],
         // see `optional` below: the target side's feature of a graph that links relax-native-macros
         "makepad_micro_proc_macro" => &["relax-tokens"],
+        // the loader's copy is built with it (the loader links makepad-hal, which enables it): a
+        // graph that links makepad-hal (its own tests) asks for that build
+        "makepad_relax_api" => &["host-shims"],
         _ => &[],
     };
     if u.edition != 2021 || !u.features.iter().all(|f| features.contains(&f.as_str())) {
