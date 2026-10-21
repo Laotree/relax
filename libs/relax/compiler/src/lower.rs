@@ -5313,6 +5313,24 @@ impl<'a> Lcx<'a> {
         if self.unsized_ty(xt) {
             return None;
         }
+        // `&CONST` (shared, no interior mutability): the constant's own evaluated allocation,
+        // which is immutable (rustc interns it; const_val copies out of it for every by-value
+        // use). Not a writable static refilled with a copy of it at every evaluation.
+        let xs = strip_paren(self.ast(), x);
+        if shared && matches!(self.ast().expr(xs).kind, ExprKind::Path(_)) && self.layout(xt).size > 0 && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), xt) {
+            if let Some(Res::Def(d)) = self.b.res.get(&xs.0).copied() {
+                if matches!(self.u.prog.def(d).kind, DefKind::Const | DefKind::AssocConst) {
+                    let args = self.b.res_args.get(&xs.0).copied().unwrap_or_default();
+                    let args = self.mono_list(args);
+                    if let Some(addr) = self.u.const_addr_shared(d, args) {
+                        let s = self.u.data_sym(addr);
+                        let p = self.f.vreg(Cls::I);
+                        self.emit(Inst::Addr(p, s));
+                        return Some(p);
+                    }
+                }
+            }
+        }
         let (blk0, at0) = (self.cur, self.f.blocks[self.cur as usize].insts.len());
         let v = self.lower_expr(x);
         let l = self.layout(xt);

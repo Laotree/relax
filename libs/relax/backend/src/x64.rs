@@ -792,6 +792,8 @@ fn evex_direct(pp: u8, map: u8, op: u8) -> Option<bool> {
         (1, _, 0x58 | 0x59 | 0x5c | 0x5e | 0x5d | 0x5f) => Some(pp == 1 || pp == 3),
         (1, 1, 0xfe | 0xfa | 0xdb | 0xdf | 0xeb | 0xef) => Some(false),
         (1, 1, 0xd4 | 0xfb) => Some(true),
+        // vinsertps (EVEX.128.66.0F3A.W0 21)
+        (3, 1, 0x21) => Some(false),
         _ => None,
     }
 }
@@ -827,6 +829,8 @@ fn keeps_xmm01(options: &relax_session::Options, f: &Func, i: &Inst) -> bool {
         Inst::FCmp(..) => true,
         // Gen::fma's VEX / EVEX form (the destination register or XS takes a)
         Inst::FMulAdd(..) => options.cpu.avx,
+        // Gen::vinst's vinsertps form
+        Inst::VInsert(_, _, _, s) => options.cpu.avx && f.vregs[s.0 as usize] != Cls::I,
         // the 128-bit float lane ops that go straight to v3's VEX / EVEX three-operand form
         Inst::VX(op, d, ..) if options.cpu.avx && !y(d) => matches!(
             op,
@@ -4348,6 +4352,15 @@ impl<'a> Gen<'a> {
                     self.a.byte(lane);
                     self.fin_f(d, xd);
                 }
+            }
+            Inst::VInsert(d, v, lane, s) if options.cpu.avx && self.f.vregs[s.0 as usize] != Cls::I => {
+                // vinsertps xd, xv, xs, lane << 4 (VEX; EVEX for xmm16..31)
+                let xv = self.use_fx(v, XS);
+                let xs = self.use_fx(s, XS2);
+                let xd = self.def_fx(d, XS);
+                self.a.vex_rr(1, 3, false, 0x21, xd, xv, xs);
+                self.a.byte(lane << 4);
+                self.fin_f(d, xd);
             }
             Inst::VInsert(d, v, lane, s) => {
                 let xv = self.use_f(v, XS);
