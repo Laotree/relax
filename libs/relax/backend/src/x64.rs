@@ -4474,13 +4474,14 @@ impl<'a> Gen<'a> {
                 self.fin_f(d, xd);
             }
             Inst::VLoad(d, base, off) => {
-                let rb = self.use_i(options, base, R11);
+                // a slot address without a register is rbp + k (base_disp), as for scalar loads
+                let (rb, off) = self.base_disp(options, base, R11, off);
                 let xd = self.def_fx(d, XS);
                 self.a.sse_rm(0, 0x10, xd, rb, off);
                 self.fin_f(d, xd);
             }
             Inst::VStore(base, off, v) => {
-                let rb = self.use_i(options, base, R11);
+                let (rb, off) = self.base_disp(options, base, R11, off);
                 let xv = self.use_fx(v, XS);
                 self.a.sse_rm(0, 0x11, xv, rb, off);
             }
