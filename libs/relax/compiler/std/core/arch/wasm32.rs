@@ -39,3 +39,9 @@ pub unsafe fn memory_atomic_wait32(ptr: *mut i32, expression: i32, timeout_ns: i
 pub unsafe fn memory_atomic_notify(ptr: *mut i32, waiters: u32) -> u32 {
     relax_web_atomic_notify(ptr, waiters)
 }
+
+/// The 128-bit vector type (simd128): same size and alignment as wasm's `v128`.
+#[derive(Copy, Clone)]
+#[repr(C, align(16))]
+#[allow(non_camel_case_types)]
+pub struct v128(pub [i32; 4]);

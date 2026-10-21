@@ -4955,14 +4955,17 @@ impl<'a> Lcx<'a> {
             }
             TyKind::Ref(_, inner, _) => {
                 let unsized_ = self.unsized_ty(inner);
-                let cp = unsafe { read_raw(c, Mem::Int(8, false)) };
-                let cps = cs.and_then(|s| match crate::syms::read_leaf(self.u, s, Mem::Int(8, false)) {
+                // pointer-sized words (a wasm32 word holds the window offset: syms::read_ptr)
+                let pb = self.pb() as u64;
+                let pm = self.pmem();
+                let cp = crate::syms::read_ptr(self.u, c);
+                let cps = cs.and_then(|s| match crate::syms::read_leaf(self.u, s, pm) {
                     relax_backend::passes::RoRead::Ptr(p) => Some(p),
                     _ => None,
                 });
                 match self.kind(inner) {
                     TyKind::Str => {
-                        let cl = unsafe { read_raw(c + 8, Mem::Int(8, false)) };
+                        let cl = unsafe { read_raw(c + pb, pm) };
                         let v = self.read_place(place, t);
                         let a = match self.const_ptr_val(cs, 0) {
                             Some(a) => a,
@@ -4973,7 +4976,7 @@ impl<'a> Lcx<'a> {
                         branch(self, r);
                     }
                     TyKind::Slice(el) => {
-                        let cl = unsafe { read_raw(c + 8, Mem::Int(8, false)) };
+                        let cl = unsafe { read_raw(c + pb, pm) };
                         let v = self.read_place(place, t);
                         let v = self.to_leaves(v, t);
                         let n = self.iconst(cl as i64);
