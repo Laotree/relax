@@ -5450,11 +5450,15 @@ pub fn veneer(target: u64) -> Vec<u8> {
     b
 }
 
-/// Per-slot call counter (tier-up): while a function runs at O1 its table slot points
-/// here. `*counter -= 1`; on reaching 0 jumps to `hot` (lazy_entry-style glue: rax = slot,
-/// returns the address to continue at), else to the O1 code. Uses rax and r11 only.
-pub fn count_stub(counter: u64, slot: u32, code: u64, hot: u64) -> Vec<u8> {
-    let mut a = Asm { b: Vec::with_capacity(48), sib: None };
+/// Bytes per count stub (`count_stub`; the stubs of a block are this far apart).
+pub const COUNT_STUB_SIZE: usize = 64;
+
+/// Per-slot call counter (tier-up) at `at` (0: not known yet): while a function runs at O1 its
+/// table slot points here. `*counter -= 1`; on reaching 0 jumps to `hot` (lazy_entry-style glue:
+/// rax = slot, returns the address to continue at), else to the O1 code: `jmp rel32` when in
+/// reach, else through r11. Uses rax and r11 only.
+pub fn count_stub(at: u64, counter: u64, slot: u32, code: u64, hot: u64) -> Vec<u8> {
+    let mut a = Asm { b: Vec::with_capacity(COUNT_STUB_SIZE), sib: None };
     a.mov_ri(RAX, counter as i64);
     // sub qword [rax], 1
     for x in [0x48u8, 0x83, 0x28, 0x01] {
@@ -5464,10 +5468,16 @@ pub fn count_stub(counter: u64, slot: u32, code: u64, hot: u64) -> Vec<u8> {
     a.byte(0x74);
     a.byte(0);
     let je = a.b.len();
-    a.mov_ri(R11, code as i64);
-    a.rex(false, 0, 0, R11, false);
-    a.byte(0xff);
-    a.modrm_rr(4, R11);
+    let d = code.wrapping_sub(at + je as u64 + 5) as i64;
+    if at != 0 && d >= i32::MIN as i64 && d <= i32::MAX as i64 {
+        a.byte(0xe9);
+        a.u32(d as i32 as u32);
+    } else {
+        a.mov_ri(R11, code as i64);
+        a.rex(false, 0, 0, R11, false);
+        a.byte(0xff);
+        a.modrm_rr(4, R11);
+    }
     let off = a.b.len() - je;
     assert!(off <= 127, "count stub: je rel8 out of range");
     a.b[je - 1] = off as u8;
@@ -5476,6 +5486,7 @@ pub fn count_stub(counter: u64, slot: u32, code: u64, hot: u64) -> Vec<u8> {
     a.rex(false, 0, 0, R11, false);
     a.byte(0xff);
     a.modrm_rr(4, R11);
+    assert!(a.b.len() <= COUNT_STUB_SIZE);
     a.b
 }
 

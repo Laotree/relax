@@ -58,3 +58,23 @@ fn thunk_heads() {
     assert_eq!(u64::from_le_bytes(t[16..24].try_into().unwrap()), 0x1234_5678_9abc);
     assert_eq!(t.len(), relax_backend::arm64::THUNK_SIZE);
 }
+
+#[test]
+fn count_stubs_jump_directly_in_reach() {
+    let at = 0x7000_0000u64;
+    // x64: mov rax, counter (10) ; sub [rax], 1 (4) ; je (2) ; jmp rel32 code
+    let s = relax_backend::x64::count_stub(at, 0x1234_5678_9abc, 7, at + 0x1000, 0x5555_0000_0000);
+    assert_eq!(s[16], 0xe9);
+    assert_eq!(i32::from_le_bytes([s[17], s[18], s[19], s[20]]) as i64, 0x1000 - 21);
+    assert_eq!(s[15] as usize, 5, "je skips the direct jmp");
+    assert!(s.len() <= relax_backend::x64::COUNT_STUB_SIZE);
+    // unknown address: the absolute form
+    let f = relax_backend::x64::count_stub(0, 0x1234_5678_9abc, 7, at + 0x1000, 0x5555_0000_0000);
+    assert_ne!(f[16], 0xe9);
+    // arm64: 4 words counter, ldr/subs/str, b.eq, then b code
+    let s = relax_backend::arm64::count_stub(at, 0x1234_5678_9abc, 7, at + 0x1000, 0x5555_0000_0000);
+    let w = |k: usize| u32::from_le_bytes(s[4 * k..4 * k + 4].try_into().unwrap());
+    assert_eq!(w(7), 0x5400_0000 | 2 << 5, "b.eq skips the direct b");
+    assert_eq!(w(8), 0x1400_0000 | ((0x1000 - 32) >> 2));
+    assert!(s.len() <= relax_backend::arm64::COUNT_STUB_SIZE);
+}
