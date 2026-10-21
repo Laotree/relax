@@ -1431,6 +1431,36 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
                 }
             }
         }
+        // a by-value argument's private copy (Func::owned) needs no write-back on an exit that
+        // never returns (a bounds-check panic: it unwinds out of the function or aborts) and whose
+        // code never looks at the copy: nobody reads it after
+        if f.owned.contains(&p) {
+            let quiet_dead_end = |t: u32| -> bool {
+                let mut seen = vec![false; n];
+                let mut work = vec![t];
+                while let Some(x) = work.pop() {
+                    let x = x as usize;
+                    if seen[x] {
+                        continue;
+                    }
+                    seen[x] = true;
+                    let blk = &f.blocks[x];
+                    if matches!(blk.term, Term::Ret(..)) || body[x] {
+                        return false;
+                    }
+                    let mut touches = false;
+                    for i in &blk.insts {
+                        for_uses(i, |u| touches |= based[u.0 as usize]);
+                    }
+                    if touches {
+                        return false;
+                    }
+                    work.extend(blk.term.succs());
+                }
+                true
+            };
+            exit_targets.retain(|&t| !quiet_dead_end(t));
+        }
         let mut stored_n = 0;
         take.retain(|x| {
             if x.3 {
