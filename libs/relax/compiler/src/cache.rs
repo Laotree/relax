@@ -3408,6 +3408,7 @@ fn kind_code(k: RelocKind) -> u8 {
         RelocKind::A64LdrLo12X => 4,
         RelocKind::Imm32 => 5,
         RelocKind::A64MovzMovk => 6,
+        RelocKind::A64CoverageBit(_) => unreachable!("coverage disables the code cache"),
     }
 }
 

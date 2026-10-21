@@ -2811,6 +2811,7 @@ impl Unit {
         let mut c = code.to_vec();
         relax_backend::rir::link(&mut c, at, relocs, &|r| self.env.reloc_value(r))?;
         unsafe { os::mem::write_code(at, &c) };
+        crate::coverage::installed(self, at, relocs);
         Ok(at)
     }
 
@@ -6189,7 +6190,10 @@ pub(crate) unsafe fn relower_with_probes(up: *mut Unit, id: u32, points: Vec<cra
     let lowered = build_rir_lowered(up, id);
     let _ = crate::lower::PROBE_POINTS.try_with(|p| p.borrow_mut().clear());
     let results = crate::lower::PROBE_RESULTS.try_with(|p| std::mem::take(&mut *p.borrow_mut())).unwrap_or_default();
-    let lowered = lowered?;
+    let mut lowered = lowered?;
+    if crate::coverage::on() {
+        crate::coverage::instrument(up, id, &mut lowered);
+    }
     let (prep, _) = prepare_rir_from(up, id, false, Some(lowered), RirMode::Baseline)?;
     let (func, _) = optimize_rir(options, id, prep)?;
     Ok((func, results))
@@ -7673,15 +7677,23 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
         crate::options::Tier0Baseline::Startup => startup_phase() || warmup_foreground() || (&*up).fns[id as usize].baseline_hint.load(Ordering::Relaxed),
         crate::options::Tier0Baseline::Always => true,
     };
-    let r = match lowered { Some(f) => Ok(f), None => build_rir_inner(up, id) };
+    // Reused RIR already carries the source probes, including those copied
+    // from inlinees. Instrumenting its optimized blocks again would invent
+    // coverage sites from tier-dependent control flow under the caller's key.
+    let r = match lowered {
+        Some(f) => Ok(f),
+        None => build_rir_inner(up, id).map(|mut f| {
+            if crate::coverage::on() {
+                crate::coverage::instrument(up, id, &mut f);
+            }
+            f
+        }),
+    };
     if let Err(e) = &r {
         (&mut *up).reload_errors.insert(id);
         (&mut *up).fns[id as usize].build_err = Some(e.as_str().into());
     }
     let mut func = r?;
-    if crate::coverage::on() {
-        crate::coverage::instrument(up, id, &mut func);
-    }
     relax_codegen::fncost::size(true, &func);
     // Keep the wrapper's sandbox calls in the saved RIR, not just its O1 codegen
     // copy. O3 and callers inlining this wrapper must also call the twins; base
@@ -8283,6 +8295,7 @@ fn opt_pipeline(options: &crate::options::Options, func: &mut relax_backend::rir
 }
 
 fn opt_pipeline_inner(options: &crate::options::Options, func: &mut relax_backend::rir::Func, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, relayout: bool, full: bool, nounwind: &dyn Fn(u32) -> bool) {
+    crate::coverage::retire(func);
     verify_pass(func, "input (lowering / inlining)");
     // MAKEPAD_RUN_DUMP_INPUT=<name suffix>: the RIR entering the optimiser
     if let Ok(w) = std::env::var("MAKEPAD_RUN_DUMP_INPUT") {
@@ -10287,6 +10300,7 @@ impl Drop for Unit {
         }
         // a retired unit's code and data go with it (nothing calls into it any more); the
         // program's own unit lives to process exit
+        crate::coverage::forget(self);
         if !std::thread::panicking() { self.flush_query_errors(true); }
         if self.retired {
             let rest = UNIT_DATA_SIZE + UNIT_RW_SIZE + (crate::syms::SYM_CAP * 8) as u64;
@@ -12369,7 +12383,8 @@ fn defer_startup_root(up: *mut Unit, id: u32, depth: u8) -> bool {
 /// Whether the program has presented its first frame (the boot screen goes away then).
 pub fn first_present_seen() -> bool { FIRST_PRESENT.load(Ordering::Acquire) }
 
-extern "C" fn relax_first_present() {
+/// Notify the loader that the application or its embedder presented a frame.
+pub extern "C" fn relax_first_present() {
     crate::domain::first_present();
     if !FIRST_PRESENT.swap(true, Ordering::AcqRel) {
         if EXEC_CHECK.load(Ordering::Relaxed) {
