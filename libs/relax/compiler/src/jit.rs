@@ -6548,6 +6548,40 @@ fn relax_mark(u: &Unit, id: u32) -> u8 {
     l
 }
 
+/// Whether slot `id`'s fn (or its impl block) carries `#[relax(keep_reachable)]`.
+pub fn keep_reachable(u: &Unit, id: u32) -> bool {
+    let d = match &u.fns[id as usize].key {
+        FnKey::Inst(d, _) => *d,
+        _ => return false,
+    };
+    let def = u.prog.def(d);
+    if !matches!(def.kind, DefKind::Fn | DefKind::AssocFn) {
+        return false;
+    }
+    let marked = |d: DefId| -> bool {
+        let def = u.prog.def(d);
+        let f = &u.prog.files[def.file as usize];
+        let text = |k: usize| f.tok_text(k as u32).to_string();
+        f.ast.list(f.ast.item(def.item).attrs).iter().any(|a| {
+            let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+            hi > lo + 1 && f.tok_text(lo as u32) == "relax" && crate::builtins::relax_keep_toks(&text, &f.toks, lo + 1, hi)
+        })
+    };
+    marked(d) || (def.parent.0 != u32::MAX && (def.parent.0 as usize) < u.prog.defs.len() && u.prog.def(def.parent).kind == DefKind::Impl && marked(def.parent))
+}
+
+/// The RIR a wasm export takes for slot `id` (built now if the run never built it): what its
+/// baseline code would be compiled from.
+pub unsafe fn export_rir(up: *mut Unit, id: u32) -> Result<relax_backend::rir::Func, String> {
+    if (&*up).fns[id as usize].rir.is_none() {
+        build_rir(up, id)?;
+    }
+    let u = &*up;
+    let session = u.prog.session.clone();
+    let rir = u.fns[id as usize].rir.clone().ok_or("no RIR for this slot")?;
+    Ok(tier0_codegen_rir(&session.options, &rir, u.opt.fold, u.opt.layout).into_owned())
+}
+
 thread_local! {
     /// compile_tier1 builds the first code of a `#[relax(O3, always)]` slot (compile_o3_always)
     static O3_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

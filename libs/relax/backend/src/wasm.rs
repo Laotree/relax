@@ -150,9 +150,11 @@ pub struct Options {
     pub data_first: bool,
     /// `local.set x; local.get x` becomes `local.tee x`, or stays on the stack for a single use
     pub tee: bool,
-    /// cheap single-definition values (small constants, frame addresses used as memory bases)
-    /// are recomputed at each use instead of living in a local
+    /// cheap single-definition constants are recomputed at each use instead of living in a local
     pub remat: bool,
+    /// the same for frame addresses used mostly as memory bases (the frame offset folds into
+    /// the access)
+    pub remat_slots: bool,
     /// a function with a frame and several returns keeps the caller's stack pointer in a local
     pub sp0: bool,
     /// panics abort: an invoke is a plain call, a resume traps, cleanup pads and the exception
@@ -161,11 +163,13 @@ pub struct Options {
     /// function order: false = by use count (the most called get 1-byte indices); true = by
     /// name (a crate's and a generic's functions adjacent: similar code compresses together)
     pub order_by_name: bool,
+    /// identical function bodies are emitted once
+    pub fold_identical: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: true, tee: true, remat: true, sp0: true, panic_abort: false, order_by_name: false }
+        Options { stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, remat_slots: false, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true }
     }
 }
 
@@ -187,8 +191,10 @@ pub struct Stats {
     /// functions whose body could not be lowered (id, why): they trap
     pub failed: Vec<(u32, String)>,
     pub untraced_sites: usize,
-    /// (function name, body bytes) of every chosen function
-    pub fn_sizes: Vec<(String, usize)>,
+    /// function bodies folded into an identical one
+    pub n_folded: usize,
+    /// (slot id, function name, body bytes) of every chosen function
+    pub fn_sizes: Vec<(u32, String, usize)>,
 }
 
 pub struct Output {
@@ -419,14 +425,58 @@ impl<'a> Module<'a> {
         let ni = self.sh.imports.len();
         let mut fuse = vec![0u64; ni + n_user + n_help];
         let mut tuse = vec![0u64; self.sh.types.len()];
-        let gidx = |r: FRef| -> usize {
+        let gidx0 = |r: FRef| -> usize {
             match r {
                 FRef::Import(i) => i as usize,
                 FRef::User(i) => ni + i as usize,
                 FRef::Helper(i) => ni + n_user + i as usize,
             }
         };
-        for b in bodies.iter().chain(helper_bodies.iter()) {
+        // identical functions (type, code and call targets, the targets compared after folding)
+        // become one: monomorphic copies of generic code that lower to the same wasm
+        let mut canon: Vec<usize> = (0..ni + n_user + n_help).collect();
+        if opts.fold_identical {
+            let all_b: Vec<&Body> = bodies.iter().chain(helper_bodies.iter()).collect();
+            loop {
+                let mut seen: HashMap<(u32, &[u8], Vec<(u32, bool, u64)>), usize> = HashMap::new();
+                let mut changed = false;
+                for (k, b) in all_b.iter().enumerate() {
+                    let g = ni + k;
+                    if canon[g] != g {
+                        continue;
+                    }
+                    let fx: Vec<(u32, bool, u64)> = b.fix.iter().map(|(p, f)| match f {
+                        Fix::Func(r) => (*p, false, canon[gidx0(*r)] as u64),
+                        Fix::Type(t) => (*p, true, *t as u64),
+                    }).collect();
+                    match seen.entry((b.ty, &b.bytes[..], fx)) {
+                        std::collections::hash_map::Entry::Occupied(e) => {
+                            canon[g] = *e.get();
+                            changed = true;
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(g);
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            // chains: a merged function's canonical one may itself have merged later
+            for g in 0..canon.len() {
+                let mut c = canon[g];
+                while canon[c] != c {
+                    c = canon[c];
+                }
+                canon[g] = c;
+            }
+        }
+        let gidx = |r: FRef| -> usize { canon[gidx0(r)] };
+        for (k, b) in bodies.iter().chain(helper_bodies.iter()).enumerate() {
+            if canon[ni + k] != ni + k {
+                continue;
+            }
             tuse[b.ty as usize] += 1;
             for (_, fx) in &b.fix {
                 match fx {
@@ -451,7 +501,7 @@ impl<'a> Module<'a> {
         // imports: by use; defined functions: by use (exports and table entries count too)
         for (_, id) in &self.exports {
             if let Some(&u) = self.fn_ix.get(id) {
-                fuse[ni + u as usize] += 1;
+                fuse[canon[ni + u as usize]] += 1;
             }
         }
         for e in self.sh.table.iter().flatten() {
@@ -459,7 +509,7 @@ impl<'a> Module<'a> {
         }
         let mut iord: Vec<usize> = (0..ni).collect();
         iord.sort_by(|a, b| fuse[*b].cmp(&fuse[*a]).then(a.cmp(b)));
-        let mut dord: Vec<usize> = (ni..ni + n_user + n_help).collect();
+        let mut dord: Vec<usize> = (ni..ni + n_user + n_help).filter(|g| canon[*g] == *g).collect();
         if opts.order_by_name {
             let key = |g: usize| if g < ni + n_user { funcs[g - ni].1.name.as_str() } else { "\u{10FFFF}" };
             dord.sort_by(|a, b| key(*a).cmp(key(*b)).then(a.cmp(b)));
@@ -469,6 +519,9 @@ impl<'a> Module<'a> {
         let mut fmap = vec![0u32; ni + n_user + n_help];
         for (n, g) in iord.iter().chain(dord.iter()).enumerate() {
             fmap[*g] = n as u32;
+        }
+        for g in 0..fmap.len() {
+            fmap[g] = fmap[canon[g]];
         }
 
         let mut out = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
@@ -658,8 +711,8 @@ impl<'a> Module<'a> {
         }
         if opts.names {
             let mut sub = Vec::new();
-            uleb(&mut sub, (n_user) as u64);
-            let mut named: Vec<(u32, &str)> = funcs.iter().enumerate().map(|(u, (_, f))| (fmap[ni + u], f.name.as_str())).collect();
+            uleb(&mut sub, funcs.iter().enumerate().filter(|(u, _)| canon[ni + u] == ni + u).count() as u64);
+            let mut named: Vec<(u32, &str)> = funcs.iter().enumerate().filter(|(u, _)| canon[ni + u] == ni + u).map(|(u, (_, f))| (fmap[ni + u], f.name.as_str())).collect();
             named.sort();
             for (i, nm) in named {
                 uleb(&mut sub, i as u64);
@@ -676,11 +729,12 @@ impl<'a> Module<'a> {
         }
         st.total = out.len();
         st.n_funcs = dord.len();
+        st.n_folded = (ni..ni + n_user + n_help).filter(|g| canon[*g] != *g).count();
         st.n_types = tord.len();
         st.n_imports = ni;
         st.failed = failed;
         st.untraced_sites = self.sh.untraced_sites;
-        st.fn_sizes = funcs.iter().zip(bodies.iter()).map(|((_, f), b)| (f.name.clone(), b.bytes.len())).collect();
+        st.fn_sizes = funcs.iter().zip(bodies.iter()).map(|((id, f), b)| (*id, f.name.clone(), b.bytes.len())).collect();
         Output { bytes: out, stats: st }
     }
 }
@@ -1147,7 +1201,7 @@ fn vx_native(op: VX) -> bool {
         VX::Add(_) | VX::Sub(_) | VX::And | VX::Or | VX::Xor | VX::AndNot => true,
         VX::MulLo(w) => matches!(w, H | S),
         VX::FAdd(w, NanBits::Host) | VX::FSub(w, NanBits::Host) | VX::FMul(w, NanBits::Host) | VX::FDiv(w, NanBits::Host) => matches!(w, S | D),
-        VX::Splat(_) | VX::Extract(..) | VX::Insert(..) => true,
+        VX::Splat(_) | VX::Extract(..) | VX::Insert(..) | VX::FromLo64 => true,
         _ => false,
     }
 }
@@ -1226,7 +1280,7 @@ fn tree_def(i: &Inst) -> Option<VReg> {
         Inst::FBin(_, _, d, _, _) | Inst::FUnary(_, _, d, _) | Inst::FCmp(_, _, d, _, _) | Inst::Conv(_, d, _) | Inst::Load(_, d, _, _) | Inst::LoadX(_, d, _, _, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::TlsAddr(d, _) => Some(*d),
         Inst::Sel(d, _, _, _) | Inst::FMulAdd(_, _, _, d, _, _, _) | Inst::AtomicLoad(_, _, d, _) => Some(*d),
         Inst::VConst(d, _) | Inst::VSplat(d, _) | Inst::VExtract(d, _, _) | Inst::VInsert(d, _, _, _) | Inst::VLoad(d, _, _) | Inst::VLoadX(d, _, _, _, _) | Inst::VAny(d, _) | Inst::VSel(d, _, _, _) | Inst::VShuffle(d, _, _, _) => Some(*d),
-        Inst::VX(op, d, _, _) if simd_op(*op).is_some() || matches!(op, VX::Splat(_) | VX::Extract(..) | VX::Insert(..)) => Some(*d),
+        Inst::VX(op, d, _, _) if simd_op(*op).is_some() || matches!(op, VX::Splat(_) | VX::Extract(..) | VX::Insert(..) | VX::FromLo64) => Some(*d),
         Inst::Call(_, _, r) if r.len() == 1 => Some(r[0]),
         _ => None,
     }
@@ -1264,7 +1318,7 @@ impl<'a> Fx<'a> {
             Inst::VSel(_, m, a, b) => vec![*a, *b, *m],
             Inst::VShuffle(_, a, b, _) => vec![*a, *b],
             Inst::VX(op, _, a, b) => match op {
-                VX::Splat(_) | VX::Extract(..) => vec![*a],
+                VX::Splat(_) | VX::Extract(..) | VX::FromLo64 => vec![*a],
                 _ if simd_op(*op).is_some() || matches!(op, VX::Insert(..)) => vec![*a, *b],
                 _ => vec![],
             },
@@ -1345,7 +1399,7 @@ impl<'a> Fx<'a> {
                 self.fold_ops(b, &ops, &mut cur, &defs);
             }
         }
-        if self.o.remat {
+        if self.o.remat || self.o.remat_slots {
             self.plan_remat(&defs);
         }
     }
@@ -1370,9 +1424,9 @@ impl<'a> Fx<'a> {
                     continue;
                 }
                 let d = match x {
-                    Inst::Iconst(d, k) if small(*k) => *d,
-                    Inst::Addr(d, s) | Inst::TlsAddr(d, s) if small(self.link.sym(s.id).wrapping_add(s.off as u64) as i64) => *d,
-                    Inst::SlotAddr(d, _) if self.uses[d.0 as usize] <= 2 * base_uses[d.0 as usize] + 1 => *d,
+                    Inst::Iconst(d, k) if self.o.remat && small(*k) => *d,
+                    Inst::Addr(d, s) | Inst::TlsAddr(d, s) if self.o.remat && small(self.link.sym(s.id).wrapping_add(s.off as u64) as i64) => *d,
+                    Inst::SlotAddr(d, _) if self.o.remat_slots && self.uses[d.0 as usize] <= 2 * base_uses[d.0 as usize] + 1 => *d,
                     _ => continue,
                 };
                 if defs[d.0 as usize] != 1 || self.uses[d.0 as usize] < 2 {
@@ -2296,6 +2350,15 @@ impl<'a> Fx<'a> {
                             self.op(WRAP);
                             self.simd(match w { VW::B => 15, VW::H => 16, _ => 17 });
                         }
+                        Ok(0)
+                    }
+                    VX::FromLo64 => {
+                        // the scalar in lane 0 of i64x2, lane 1 zero
+                        self.value(b, *x, Want::Nat)?;
+                        self.simd(18);
+                        self.i64c(0);
+                        self.simd(30);
+                        self.op(1);
                         Ok(0)
                     }
                     VX::Extract(w, k) => {

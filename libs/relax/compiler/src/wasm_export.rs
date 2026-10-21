@@ -136,13 +136,35 @@ pub fn finish(u: &Unit) {
             }
         }
     }
+    let (kept, kept_failed) = keep_closure(&mut funcs, u);
+    // MAKEPAD_RUN_WASM_EXPORT_VARIANTS="a=opts;b=opts": one module per variant from this capture
+    // (<path>.a.wasm, ...) for size work; else one module with MAKEPAD_RUN_WASM_OPT
+    match std::env::var("MAKEPAD_RUN_WASM_EXPORT_VARIANTS") {
+        Ok(v) => {
+            for var in v.split(';').filter(|v| !v.is_empty()) {
+                let (name, o) = var.split_once('=').unwrap_or((var, ""));
+                let p = match path.strip_suffix(".wasm") {
+                    Some(stem) => format!("{}.{}.wasm", stem, name),
+                    None => format!("{}.{}", path, name),
+                };
+                eprintln!("wasm export variant {} [{}]:", name, o);
+                emit(u, &funcs, &kept, kept_failed, o, &p);
+            }
+        }
+        Err(_) => emit(u, &funcs, &kept, kept_failed, &std::env::var("MAKEPAD_RUN_WASM_OPT").unwrap_or_default(), &path),
+    }
+}
+
+/// One module of the captured set with options `optv` (`-tee,remat,...`), written to `path`.
+fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet<u32>, kept_failed: usize, optv: &str, path: &str) {
     let options = u.prog.session.options.clone();
     // the web player's profile: panics abort, one thread (TLS keys and waits built in)
-    let mut opts = wasm::Options { panic_abort: true, ..wasm::Options::default() };
+    // untraced calls are a bare trap (option untraced: env.u(id) first, for a message)
+    let mut opts = wasm::Options { panic_abort: true, untraced_import: false, ..wasm::Options::default() };
     let mut single = true;
-    // MAKEPAD_RUN_WASM_OPT=-tee,-remat,...: switch size techniques off (or on) to measure them
-    if let Ok(v) = std::env::var("MAKEPAD_RUN_WASM_OPT") {
-        for t in v.split(',').filter(|t| !t.is_empty()) {
+    // -tee,-remat,...: switch size techniques off (or on) to measure them
+    {
+        for t in optv.split(',').filter(|t| !t.is_empty()) {
             let (on, n) = match t.strip_prefix('-') {
                 Some(n) => (false, n),
                 None => (true, t),
@@ -150,10 +172,12 @@ pub fn finish(u: &Unit) {
             match n {
                 "tee" => opts.tee = on,
                 "remat" => opts.remat = on,
+                "rematslots" => opts.remat_slots = on,
                 "datafirst" => opts.data_first = on,
                 "sp0" => opts.sp0 = on,
                 "abort" => opts.panic_abort = on,
                 "byname" => opts.order_by_name = on,
+                "fold" => opts.fold_identical = on,
                 "st" => single = on,
                 "names" => opts.names = on,
                 "untraced" => opts.untraced_import = on,
@@ -169,7 +193,7 @@ pub fn finish(u: &Unit) {
         roots.push((ENTRY.load(std::sync::atomic::Ordering::Relaxed), "main".to_string()));
     }
     roots.retain(|r| funcs.contains_key(&r.0));
-    let reached = reach(u, &funcs, &roots.iter().map(|r| r.0).collect::<Vec<_>>());
+    let reached = reach(u, funcs, &roots.iter().map(|r| r.0).collect::<Vec<_>>());
     for id in &reached {
         m.add_func(*id, &funcs[id]);
     }
@@ -180,12 +204,14 @@ pub fn finish(u: &Unit) {
     }
     // symbols the code names
     let mut addr_syms: Vec<u32> = Vec::new();
+    let mut tls_syms: Vec<u32> = Vec::new();
     let mut host_syms: Vec<u32> = Vec::new();
     for f in reached.iter().map(|id| &funcs[id]) {
         for b in &f.blocks {
             for i in &b.insts {
                 match i {
-                    Inst::Addr(_, s) | Inst::TlsAddr(_, s) => addr_syms.push(s.id),
+                    Inst::Addr(_, s) => addr_syms.push(s.id),
+                    Inst::TlsAddr(_, s) => tls_syms.push(s.id),
                     Inst::Call(relax_backend::rir::Callee::Host(s) | relax_backend::rir::Callee::CHost(s, _), _, _) => host_syms.push(s.id),
                     _ => {}
                 }
@@ -217,7 +243,7 @@ pub fn finish(u: &Unit) {
         host.insert(id, b);
     }
     // data: placed on first reference, pointer words translated (worklist)
-    let tls = m.place(64 * 1024, 16);
+    let tls = m.place(64 * 1024, 64);
     let mut placed: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut pending: Vec<u32> = Vec::new();
     let mut images: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -231,6 +257,17 @@ pub fn finish(u: &Unit) {
         pending.push(id);
         Some(a)
     };
+    // a thread-local symbol holds its offset in the thread's block: one block (one thread)
+    tls_syms.sort_unstable();
+    tls_syms.dedup();
+    let tls_size = 64 * 1024u64;
+    for &id in &tls_syms {
+        let off = u.syms.value(Sym::new(id));
+        if off >= tls_size {
+            eprintln!("wasm export: thread-local offset {} past the {} byte block", off, tls_size);
+        }
+        vals.insert(id, tls + off);
+    }
     let mut n_unlinked = 0usize;
     for &id in &addr_syms {
         let v = match u.syms.kind(id) {
@@ -269,6 +306,23 @@ pub fn finish(u: &Unit) {
         images.push((id, bytes));
     }
     let n_data = images.len();
+    // MAKEPAD_RUN_WASM_EXPORT_STATS: the data by what it is (literals and vtables, statics, blocks)
+    let mut data_kinds: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut data_top: Vec<(usize, String)> = Vec::new();
+    for (id, bytes) in &images {
+        let (k, name) = match u.syms.kind(*id) {
+            Some(SymKind::Data(i)) => ("data object".to_string(), u.syms.obj_name(i).unwrap_or_else(|| String::from_utf8_lossy(&bytes[..bytes.len().min(40)]).replace('\n', " "))),
+            Some(SymKind::Static(d)) => ("static".to_string(), u.prog.def_path(d)),
+            Some(SymKind::Rw(_)) => ("writable block".to_string(), String::new()),
+            _ => ("other".to_string(), String::new()),
+        };
+        let nz = bytes.iter().filter(|b| **b != 0).count();
+        let e = data_kinds.entry(k.clone()).or_insert((0, 0));
+        e.0 += bytes.len();
+        e.1 += nz;
+        data_top.push((bytes.len(), format!("{} {}", k, name)));
+    }
+    data_top.sort_by(|a, b| b.0.cmp(&a.0));
     for (id, bytes) in images {
         let a = placed[&id].0;
         m.data_at(a, bytes);
@@ -276,25 +330,27 @@ pub fn finish(u: &Unit) {
     let link = Linked { vals, host };
     let nf = reached.len();
     let out = m.finish(&options, &link);
-    if let Err(e) = std::fs::write(&path, &out.bytes) {
+    if let Err(e) = std::fs::write(path, &out.bytes) {
         eprintln!("wasm export: {}: {}", std::path::Path::new(&path).display(), e);
         return;
     }
     if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
         let s = &out.stats;
         eprintln!(
-            "wasm export: {} bytes ({} functions captured, {} in module, {} types, {} imports): code {} data {} types {} imports {} funcs {} elems {} other {}; {} data objects, {} pointer words linked, {} symbols unlinked, {} untraced call sites, {} functions failed",
-            s.total, nf, s.n_funcs, s.n_types, s.n_imports, s.code, s.data, s.types, s.imports, s.funcs, s.elems, s.other, n_data, n_ptrs, n_unlinked, s.untraced_sites, s.failed.len()
+            "wasm export: {} bytes ({} functions captured, {} in module, {} types, {} imports): code {} data {} types {} imports {} funcs {} elems {} other {}; {} data objects, {} pointer words linked, {} symbols unlinked, {} untraced call sites, {} functions failed, {} folded into identical ones",
+            s.total, nf, s.n_funcs, s.n_types, s.n_imports, s.code, s.data, s.types, s.imports, s.funcs, s.elems, s.other, n_data, n_ptrs, n_unlinked, s.untraced_sites, s.failed.len(), s.n_folded
         );
         let top: usize = std::env::var("MAKEPAD_RUN_WASM_EXPORT_TOP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let mut sz = s.fn_sizes.clone();
-        sz.sort_by(|a, b| b.1.cmp(&a.1));
-        for (n, b) in sz.iter().take(top) {
+        sz.sort_by(|a, b| b.2.cmp(&a.2));
+        let kept_bytes: usize = s.fn_sizes.iter().filter(|x| kept.contains(&x.0)).map(|x| x.2).sum();
+        eprintln!("wasm export: keep_reachable closure: {} functions not traced, {} code bytes ({} failed to build)", kept.len(), kept_bytes, kept_failed);
+        for (_, n, b) in sz.iter().take(top) {
             eprintln!("  {:7} {}", b, n);
         }
         // bytes per crate (the first path segment of the function's name)
         let mut by_crate: HashMap<String, (usize, usize)> = HashMap::new();
-        for (n, b) in &s.fn_sizes {
+        for (_, n, b) in &s.fn_sizes {
             let k = n.trim_start_matches('<').split("::").next().unwrap_or("").split(' ').next().unwrap_or("").to_string();
             let e = by_crate.entry(k).or_insert((0, 0));
             e.0 += b;
@@ -304,6 +360,12 @@ pub fn finish(u: &Unit) {
         by_crate.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
         for (k, (b, n)) in by_crate.iter() {
             eprintln!("  crate {:8} bytes {:5} fns  {}", b, n, k);
+        }
+        for (k, (b, nz)) in &data_kinds {
+            eprintln!("  data {:9} bytes ({} nonzero)  {}", b, nz, k);
+        }
+        for (b, n) in data_top.iter().take(top) {
+            eprintln!("  data {:9} {}", b, n.chars().take(140).collect::<String>());
         }
         let mut why: HashMap<String, usize> = HashMap::new();
         for (_, e) in &s.failed {
@@ -378,4 +440,43 @@ fn single_thread(name: &str) -> Option<HostBind> {
         "__relax_key_set" => HostBind::Builtin(Builtin::KeySet),
         _ => return None,
     })
+}
+
+/// Callees the traced code names but never ran that carry `#[relax(keep_reachable)]` (a GC, a
+/// growth path), built now with their whole static call closure: (the slots added, how many
+/// could not be built).
+fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit) -> (std::collections::BTreeSet<u32>, usize) {
+    use relax_backend::rir::Callee;
+    let callees = |f: &Func, out: &mut Vec<u32>| {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Call(Callee::Fn(t) | Callee::CFn(t, _), _, _) | Inst::FnAddr(_, t) = i {
+                    out.push(*t);
+                }
+            }
+        }
+    };
+    let mut work: Vec<u32> = Vec::new();
+    for f in funcs.values() {
+        callees(f, &mut work);
+    }
+    work.retain(|id| !funcs.contains_key(id) && (*id as usize) < u.fns.len() && crate::jit::keep_reachable(u, *id));
+    let mut kept = std::collections::BTreeSet::new();
+    let mut failed = 0;
+    let up = crate::jit::current_unit();
+    while let Some(id) = work.pop() {
+        if funcs.contains_key(&id) || (id as usize) >= u.fns.len() {
+            continue;
+        }
+        let r = crate::owner::call(crate::owner::Class::App, || crate::zone_alloc::kept_with(|| unsafe { crate::jit::export_rir(up, id) }));
+        match r {
+            Ok(f) => {
+                callees(&f, &mut work);
+                funcs.insert(id, f);
+                kept.insert(id);
+            }
+            Err(_) => failed += 1,
+        }
+    }
+    (kept, failed)
 }

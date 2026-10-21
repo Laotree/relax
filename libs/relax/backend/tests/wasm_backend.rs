@@ -352,9 +352,9 @@ fn memory_and_slots() {
     f.i(Inst::LoadX(Mem::Int(4, false), c, p, k, 2, 4));
     let d = f.bin(IOp::Add, I64, a, b);
     let e = f.bin(IOp::Add, I64, d, c);
-    // data placed by the link step at the first data address (16, below the stack): "hello, data"
+    // data placed by the link step after the 64 KiB stack: "hello, data"
     let h = f.v(Cls::I);
-    f.i(Inst::Iconst(h, 16 + 7));
+    f.i(Inst::Iconst(h, 64 * 1024 + 7));
     let hv = f.v(Cls::I);
     f.i(Inst::Load(Mem::Int(1, false), hv, h, 0));
     let g = f.bin(IOp::Add, I64, e, hv);
