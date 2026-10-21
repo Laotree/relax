@@ -575,6 +575,15 @@ impl Asm {
         self.byte(op);
         self.modrm_rr(reg, rm);
     }
+    /// VEX register form, or EVEX (same opcode, W given) when a register is xmm16..31: for ops
+    /// whose EVEX encoding exists with the same W (scalar FMA, ...)
+    fn vex_rr_any(&mut self, pp: u8, map: u8, w: bool, op: u8, reg: u8, vvvv: u8, rm: u8) {
+        if reg >= 16 || vvvv >= 16 || rm >= 16 {
+            self.evex_rr(pp, map, w, false, op, reg, vvvv, rm);
+        } else {
+            self.vex_rr(pp, map, w, op, reg, vvvv, rm);
+        }
+    }
     /// VEX (3-byte) register form with the vector length: `y` = 256-bit (L = 1)
     fn vex_l(&mut self, pp: u8, map: u8, w: bool, y: bool, op: u8, reg: u8, vvvv: u8, rm: u8) {
         if (reg >= 16 || rm >= 16) && pp == 0 && map == 1 && op == 0x28 && vvvv == 0 {
@@ -4652,6 +4661,24 @@ impl<'a> Gen<'a> {
                 l => panic!("x64 fma: c at {:?}", l),
             };
             let xd = self.def_fx(d, XS);
+            // d in c's register (an accumulation: the allocator hints d to c): vfmadd231 d, a, b
+            // (d = a * b + d); d in b's: 213 with a and b swapped (the product commutes). Only a
+            // NaN result's payload choice among several NaN inputs differs from the 213 form, which
+            // Rust leaves unspecified (LLVM picks the form by register too).
+            if xd != xa && mc.is_none() && xd == xc && xd != xb {
+                self.a.vex_rr_any(1, 2, w, op + 0x10, xd, xa, xb);
+                self.fin_f(d, xd);
+                return;
+            }
+            if xd != xa && xd == xb && (mc.is_some() || xd != xc) {
+                if let Some(disp) = mc {
+                    self.a.vex_m_fma(w, op, xd, xa, RBP, disp);
+                } else {
+                    self.a.vex_rr_any(1, 2, w, op, xd, xa, xc);
+                }
+                self.fin_f(d, xd);
+                return;
+            }
             let t = if xd == xa || (xd != xb && (mc.is_some() || xd != xc)) { xd } else { XS };
             // t is written with a first: it must not hold b or c unless it holds a (the same value)
             assert!(t == xa || (t != xb && (mc.is_some() || t != xc)), "x64 fma: destination {} vs a {} b {} c {}", t, xa, xb, xc);
