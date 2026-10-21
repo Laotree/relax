@@ -437,7 +437,9 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
     let mut priorities: Vec<(u32, bool, bool)> = depths.iter().enumerate().map(|(b, d)| {
         freqs.map_or((*d, *d >= 1 && f.blocks.len() <= 64, false), |v| (v[b].max(0.0).to_bits(), v[b] >= HOT_FREQ, v[b] == 0.0))
     }).collect();
-    let mut loop_sites: Vec<bool> = depths.iter().map(|d| *d > 0).collect();
+    // PGO: a counted body's loop sites are the blocks the counts saw repeat per entry, not every
+    // block a loop holds (a loop that never iterates gets no bottom-up preparation)
+    let mut loop_sites: Vec<bool> = relax_backend::profile::repeated_blocks(f).unwrap_or_else(|| depths.iter().map(|d| *d > 0).collect());
     let mut ancestry = vec![vec![self_id]; f.blocks.len()];
     let mut multi_depths = vec![0; f.blocks.len()];
     let mut queue = BinaryHeap::new();
@@ -678,6 +680,8 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
     let call_pos = blk.pos.pop().unwrap_or(0);
     let mut old_term = std::mem::replace(&mut blk.term, Term::Unreachable);
     let old_term_pos = blk.term_pos;
+    // (the code after the call runs as often as the call)
+    let call_count = blk.count;
     // the invoked call itself (last in its block): its body continues at the normal
     // target, and whatever unwinds in it continues at the invoke's cleanup pad
     let mut unwind = None;
@@ -688,7 +692,7 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
         }
     }
     let cont = f.blocks.len() as u32;
-    f.blocks.push(Block { insts: tail, pos: tail_pos, term: old_term, term_pos: old_term_pos });
+    f.blocks.push(Block { insts: tail, pos: tail_pos, term: old_term, term_pos: old_term_pos, count: call_count });
     // map callee vregs and slots
     let mut vmap = Vec::with_capacity(callee.vregs.len());
     for c in &callee.vregs {
@@ -718,6 +722,12 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
     // (blocks split this way are appended after the callee's)
     let mut extra: Vec<Block> = Vec::new();
     let nextra_base = boff + callee.blocks.len() as u32;
+    // PGO: a counted callee's block counts, scaled from its own entries to this call's
+    let scale = (call_count >= 0.0 && callee.blocks.first().is_some_and(|b| b.count > 0.0)).then(|| call_count / callee.blocks[0].count);
+    let scaled = |c: f32| match scale {
+        Some(k) if c >= 0.0 => c * k,
+        _ => -1.0,
+    };
     for cb in &callee.blocks {
         let mut insts = Vec::with_capacity(cb.insts.len());
         for x in &cb.insts {
@@ -780,12 +790,12 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
                 term_pos = pos.last().copied().unwrap_or(orig_pos);
                 for (k, (ik, pk)) in it.enumerate() {
                     let tp = pk.last().copied().unwrap_or(orig_pos);
-                    extra.push(Block { insts: ik, pos: pk, term: Term::Invoke(first_extra + k as u32 + 1, u), term_pos: tp });
+                    extra.push(Block { insts: ik, pos: pk, term: Term::Invoke(first_extra + k as u32 + 1, u), term_pos: tp, count: scaled(cb.count) });
                 }
-                extra.push(Block { insts: rest_i, pos: rest_p, term: orig_term, term_pos: orig_pos });
+                extra.push(Block { insts: rest_i, pos: rest_p, term: orig_term, term_pos: orig_pos, count: scaled(cb.count) });
             }
         }
-        f.blocks.push(Block { insts, pos, term, term_pos });
+        f.blocks.push(Block { insts, pos, term, term_pos, count: scaled(cb.count) });
     }
     f.blocks.extend(extra);
 }
@@ -1509,7 +1519,7 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         }
         let pre = f.blocks.len() as u32;
         let hp = f.blocks[h as usize].insts.first().map(|_| f.blocks[h as usize].pos[0]).unwrap_or(f.blocks[h as usize].term_pos);
-        f.blocks.push(Block { insts: Vec::new(), pos: Vec::new(), term: Term::Jump(h), term_pos: hp });
+        f.blocks.push(Block { insts: Vec::new(), pos: Vec::new(), term: Term::Jump(h), term_pos: hp, count: -1.0 });
         for &o in &outside {
             let t = &mut f.blocks[o as usize].term;
             retarget(t, h, pre);
@@ -1554,7 +1564,7 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
                 let tp = f.blocks.iter().enumerate().find(|(bi, b)| body[*bi] && b.term.succs().any(|s| s == t)).map(|(_, b)| b.term_pos).unwrap_or(0);
                 let ins: Vec<Inst> = stored.iter().map(|&k| Inst::Store(take[k].1, p, take[k].0, regs[k])).collect();
                 let np = ins.len();
-                f.blocks.push(Block { insts: ins, pos: vec![tp; np], term: Term::Jump(t), term_pos: tp });
+                f.blocks.push(Block { insts: ins, pos: vec![tp; np], term: Term::Jump(t), term_pos: tp, count: -1.0 });
                 for bi in 0..n {
                     if body[bi] {
                         retarget(&mut f.blocks[bi].term, t, x);

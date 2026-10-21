@@ -17,6 +17,7 @@ pub mod merge;
 pub mod pair256;
 pub mod passes;
 pub mod probe;
+pub mod profile;
 pub mod regalloc;
 pub mod rir;
 pub mod stats;

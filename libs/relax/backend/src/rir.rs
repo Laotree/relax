@@ -1059,6 +1059,10 @@ pub struct Block {
     pub pos: Vec<u64>,
     pub term: Term,
     pub term_pos: u64,
+    /// how often the block ran in the slot's counted build (PGO: the counted tier's exact
+    /// count of the O3 input block this one came from; copies keep it), negative = unknown.
+    /// A frequency for layout and register allocation only: never a correctness fact.
+    pub count: f32,
 }
 
 #[derive(Clone)]
@@ -1157,7 +1161,7 @@ impl Func {
         VReg(self.vregs.len() as u32 - 1)
     }
     pub fn block(&mut self) -> u32 {
-        self.blocks.push(Block { insts: Vec::new(), pos: Vec::new(), term: Term::Unreachable, term_pos: 0 });
+        self.blocks.push(Block { insts: Vec::new(), pos: Vec::new(), term: Term::Unreachable, term_pos: 0, count: -1.0 });
         self.blocks.len() as u32 - 1
     }
     pub fn slot(&mut self, size: u32, align: u32) -> u32 {
