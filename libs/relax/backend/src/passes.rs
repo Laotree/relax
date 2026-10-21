@@ -6041,10 +6041,14 @@ pub fn addr_modes(f: &mut Func) {
                     continue;
                 }
             };
+            // arm64: an address read by several accesses (a load and a store of one element) is
+            // folded into each one that needs no displacement ([x, x{, lsl #size}] is free); the
+            // add stays for the others and goes with its last use
             let ai = match def_at.get(&base.0) {
-                Some(&ai) if nuse[base.0 as usize] == 1 && !dead[ai] => ai,
+                Some(&ai) if (nuse[base.0 as usize] == 1 || cfg!(target_arch = "aarch64")) && !dead[ai] => ai,
                 _ => continue,
             };
+            let shared_add = nuse[base.0 as usize] > 1;
             let (p, q) = match b.insts[ai] {
                 Inst::IBin(IOp::Add, it, _, p, q) if it.bits == 64 => (p, q),
                 _ => continue,
@@ -6091,7 +6095,10 @@ pub fn addr_modes(f: &mut Func) {
             let mut extra: i64 = 0;
             let mut fold_at: Option<usize> = None;
             // a shift that stays for other uses keeps reading idx: no folding through it
-            let shift_stays = si.is_some_and(|si| matches!(b.insts[si], Inst::IBinI(_, _, sv, _, _) if nuse[sv.0 as usize] > 1));
+            let shift_stays = shared_add || si.is_some_and(|si| matches!(b.insts[si], Inst::IBinI(_, _, sv, _, _) if nuse[sv.0 as usize] > 1));
+            if shared_add && (off != 0 || !(sh == 0 || sh as i64 == natural)) {
+                continue;
+            }
             if let Some(&ii) = def_at.get(&idx.0).filter(|_| !shift_stays) {
                 // x64: the displacement is free in every form, so an index used elsewhere too is
                 // still replaced by its operand here (`a[j - 1]` reads [b + j*4 - 4]; the subtract
@@ -6146,7 +6153,15 @@ pub fn addr_modes(f: &mut Func) {
                 Inst::VStore(_, off2, v) => Inst::VStoreX(pp, idx, sh, off2 + extra as i32, v),
                 ref other => other.clone(),
             };
-            let _ = off;
+            if shared_add {
+                nuse[base.0 as usize] -= 1;
+                if nuse[base.0 as usize] > 0 {
+                    // the add stays (with its shift): the access reads its operands too
+                    nuse[pp.0 as usize] += 1;
+                    nuse[idx.0 as usize] += 1;
+                    continue;
+                }
+            }
             dead[ai] = true;
             if let Some(ii) = fold_at {
                 dead[ii] = true;
