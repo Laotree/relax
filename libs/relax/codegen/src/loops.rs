@@ -1742,7 +1742,7 @@ pub fn merge_stores(options: &relax_session::Options, f: &mut Func) -> bool {
         for (k, i) in insts.iter().enumerate() {
             let touches = matches!(i, Inst::Load(..) | Inst::LoadX(..) | Inst::VLoad(..) | Inst::VGather(..) | Inst::VTbl(..)) || crate::opt::is_mem_effect_pub(i);
             if let Inst::Store(Mem::Int(1, _), p, off, v) = *i {
-                if let Some(c) = kconst[v.0 as usize] {
+                if let Some(c) = kconst[v.0 as usize].filter(|_| !relax_backend::stats::opt_off(options, "-cstores")) {
                     if let Some(g) = cur.take() {
                         groups.push(g);
                     }

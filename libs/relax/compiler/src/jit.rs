@@ -9466,7 +9466,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         let memo: std::cell::RefCell<HashMap<(u32, usize), Option<bool>>> = std::cell::RefCell::new(HashMap::new());
         relax_backend::passes::set_sroa_nocapture(Some(Box::new(move |c: &relax_backend::rir::Callee, k: usize| -> bool {
             let relax_backend::rir::Callee::Fn(cid) = c else { return false };
-            nocap(get_static, &memo, *cid, k, NOCAP_DEPTH)
+            nocap(get_static, &memo, *cid, k, if relax_backend::stats::opt_env_off("-nocap8") { 4 } else { NOCAP_DEPTH })
         })));
     }
     static INLINE_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

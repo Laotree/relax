@@ -1317,7 +1317,7 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                     // value; LLVM InstSimplify): `data[i..i + 8]` is 8 long, so `try_into::<[u8; 8]>`
                     // is always Ok -- the Err path, its tag store and reload and the default's fill
                     // stayed in every BitReader::peek
-                    if ic {
+                    if ic && !opt_off(options, "-subk") {
                         if let Inst::IBin(IOp::Sub, it, d, a, b) = new {
                             let off = |s: VReg, x: VReg| match bin_def[s.0 as usize] {
                                 Some((op @ (IOp::Add | IOp::Sub), t, y, k, _, _)) if y == x && t.bits == 64 && single(x, &ndef) => Some(if op == IOp::Add { k } else { k.wrapping_neg() }),
@@ -5924,7 +5924,7 @@ pub fn licm(options: &relax_session::Options, f: &mut Func) -> bool {
                     };
                     for (k, a) in args.iter().copied().enumerate() {
                         let t = taint[a.0 as usize];
-                        if t != u32::MAX && !cap.contains(&t) && !sroa_nocapture(c, k) {
+                        if t != u32::MAX && !cap.contains(&t) && !(sroa_nocapture(c, k) && !opt_off(options, "-licmnocap")) {
                             cap.push(t);
                         }
                     }

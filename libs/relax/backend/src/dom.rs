@@ -30,7 +30,8 @@ pub fn relayout_order(f: &mut Func) -> Vec<u32> {
     // code was laid out in pieces: inflate's fast loop had its literal path at 0x566 and its
     // length/match path at 0x1393, 3.3 KB of the slow decoder between (14x rustc's i-cache misses,
     // 40% more taken branches).
-    let nest = LoopNest::new(f, &reach);
+    // MAKEPAD_RUN_OPT=-looplayout: the index-order seeding (bisection)
+    let nest = if crate::stats::opt_env_off("-looplayout") { LoopNest { inner: vec![NO_LOOP; n], parent: Vec::new(), body: Vec::new(), size: Vec::new() } } else { LoopNest::new(f, &reach) };
     let mut left: Vec<u32> = nest.size.clone();
     // per loop: the next body index (bodies ascending) not known to be placed
     let mut cursor = vec![0usize; nest.body.len()];
