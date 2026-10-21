@@ -462,6 +462,25 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     let reached = reach(u, funcs, &seeds);
     if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
         eprintln!("wasm export: {} roots (entry + address-taken), {} of {} captured reached", seeds.len(), reached.len(), funcs.len());
+        // the untraced callees (slot, name), for the stub ids `env.u(id)` reports
+        let mut un: std::collections::BTreeSet<u32> = Default::default();
+        for id in &reached {
+            for b in &funcs[id].blocks {
+                for i in &b.insts {
+                    if let Inst::Call(relax_backend::rir::Callee::Fn(t) | relax_backend::rir::Callee::CFn(t, _), _, _) = i {
+                        if !funcs.contains_key(t) {
+                            un.insert(*t);
+                        }
+                    }
+                }
+            }
+        }
+        if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_UNTRACED").is_some() {
+            for t in &un {
+                let n = u.fns.get(*t as usize).map(|f| f.name.to_string()).unwrap_or_default();
+                eprintln!("  untraced slot {} {}", t, n);
+            }
+        }
     }
     // functions that differ only in constants become one body (relax_backend::merge)
     let merged_store: BTreeMap<u32, Func>;
