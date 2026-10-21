@@ -78,8 +78,10 @@ pub struct Taken {
 
 /// Clones loop `l`: a new guard block takes every entry into the loop's header and runs `guard`
 /// (instructions defining `g`), then `Branch(g, clone header, original header)`. In the clone,
-/// every `Taken` branch becomes a jump. Returns the map original block -> clone block.
-pub fn version_loop(f: &mut Func, l: &Loop, guard: Vec<Inst>, g: VReg, facts: &[Taken]) -> Vec<(u32, u32)> {
+/// every `Taken` branch of `facts` becomes a jump; in the original, those of `orig_facts` (what
+/// the guard's failure implies, e.g. the other side of an unswitched branch). Returns the map
+/// original block -> clone block.
+pub fn version_loop(f: &mut Func, l: &Loop, guard: Vec<Inst>, g: VReg, facts: &[Taken], orig_facts: &[Taken]) -> Vec<(u32, u32)> {
     let nv = f.vregs.len();
     let mut ndef = vec![0u32; nv];
     let mut used_outside = vec![false; nv];
@@ -200,6 +202,9 @@ pub fn version_loop(f: &mut Func, l: &Loop, guard: Vec<Inst>, g: VReg, facts: &[
         if !l.member.get(bi).copied().unwrap_or(false) {
             f.blocks[bi].term.map_succs(|s| if s == l.header { gb } else { s });
         }
+    }
+    for t in orig_facts {
+        f.blocks[t.block as usize].term = Term::Jump(t.to);
     }
     map
 }
@@ -542,7 +547,39 @@ pub fn version_bounds_loops(options: &relax_session::Options, f: &mut Func) -> b
         if trace() {
             eprintln!("version: {} loop b{} ({} blocks, {} insts): {} checks, {} guard conds", f.name, l.header, l.blocks.len(), size, facts.len(), conds.len());
         }
-        version_loop(f, &l, guard, g, &facts);
+        version_loop(f, &l, guard, g, &facts, &[]);
+        changed += 1;
+    }
+    changed > 0
+}
+
+/// Loop unswitching: an innermost loop with a branch on a loop-invariant condition (defined
+/// before the loop, both targets in the loop) becomes two loops, one per outcome, chosen once in
+/// front: `c` true runs the clone (the branch a jump to its true side), false the original (a jump
+/// to its false side). Small loops only (the loop is duplicated). Returns whether anything changed.
+pub fn unswitch_loops(options: &relax_session::Options, f: &mut Func) -> bool {
+    if relax_backend::stats::opt_off(options, "-unswitch") || f.blocks.len() < 3 {
+        return false;
+    }
+    let mut changed = 0;
+    for l in candidate_loops(f) {
+        if changed >= 2 || l.blocks.len() > MAX_BLOCKS {
+            continue;
+        }
+        let size: usize = l.blocks.iter().map(|&b| f.blocks[b as usize].insts.len()).sum();
+        if size > 48 || l.blocks.iter().any(|&b| matches!(f.blocks[b as usize].term, Term::Invoke(..) | Term::Switch(..) | Term::Resume)) {
+            continue;
+        }
+        let pick = l.blocks.iter().find_map(|&b| match f.blocks[b as usize].term {
+            Term::Branch(c, t, e) if t != e && l.member[t as usize] && l.member[e as usize] && defs_in(f, &l, c).is_empty() && f.vregs[c.0 as usize] == Cls::I => Some((b, c, t, e)),
+            _ => None,
+        });
+        let Some((b, c, t, e)) = pick else { continue };
+        if trace() {
+            eprintln!("unswitch: {} loop b{} ({} blocks, {} insts) on b{}", f.name, l.header, l.blocks.len(), size, b);
+        }
+        let g = f.vreg(Cls::I);
+        version_loop(f, &l, vec![Inst::Mov(g, c)], g, &[Taken { block: b, to: t }], &[Taken { block: b, to: e }]);
         changed += 1;
     }
     changed > 0

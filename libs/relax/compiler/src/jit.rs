@@ -9368,6 +9368,11 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         verify_pass(func, "version_bounds_loops");
         relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
     }
+    // a branch on a loop-invariant condition: one small loop per outcome, chosen once in front
+    if cfg.fold && relax_codegen::version::unswitch_loops(options, func) {
+        verify_pass(func, "unswitch_loops");
+        relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
+    }
     // Run after both inlining rounds and before small slots share storage:
     // aggregate ABI halves and partial byte buffers still name distinct slots.
     if cfg.fold && cfg.sroa && relax_codegen::opt::promote_vector_slots(func) {

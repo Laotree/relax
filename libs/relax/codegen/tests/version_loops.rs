@@ -368,3 +368,52 @@ fn clone_shape_vectorises() {
     let ch = relax_codegen::loops::vectorize_reductions(&relax_session::Options::default(), &mut g);
     eprintln!("with outside read of t: vectorised {}", ch && g.blocks.len() > n0);
 }
+
+/// `for i in 0..n { y[i] += if flag { 1 } else { x[i] } }` with flag a param: two loops, chosen once.
+#[test]
+fn unswitch_invariant_branch() {
+    let mut f = Func::new("unsw".into(), 0);
+    let p: Vec<VReg> = (0..5).map(|_| f.vreg(Cls::I)).collect();
+    let (y, x, n, flag, _) = (p[0], p[1], p[2], p[3], p[4]);
+    f.params.extend([p[0], p[1], p[2], p[3]]);
+    for _ in 0..6 {
+        f.block();
+    }
+    let (i, c, off, ya, yv, xa, xv, s, one, z) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+    push(&mut f, 0, Inst::Iconst(i, 0));
+    term(&mut f, 0, Term::Jump(1));
+    push(&mut f, 1, Inst::ICmp(Cond::Lt, false, c, i, n));
+    term(&mut f, 1, Term::Branch(c, 2, 5));
+    push(&mut f, 2, Inst::IBinI(IOp::Shl, U64, off, i, 2));
+    push(&mut f, 2, Inst::IBin(IOp::Add, U64, ya, y, off));
+    push(&mut f, 2, Inst::Load(Mem::Int(4, false), yv, ya, 0));
+    term(&mut f, 2, Term::Branch(flag, 3, 4));
+    push(&mut f, 3, Inst::Iconst(one, 1));
+    push(&mut f, 3, Inst::IBin(IOp::Add, U64, s, yv, one));
+    push(&mut f, 3, Inst::Store(Mem::Int(4, false), ya, 0, s));
+    push(&mut f, 3, Inst::IBinI(IOp::Add, U64, i, i, 1));
+    term(&mut f, 3, Term::Jump(1));
+    push(&mut f, 4, Inst::IBin(IOp::Add, U64, xa, x, off));
+    push(&mut f, 4, Inst::Load(Mem::Int(4, false), xv, xa, 0));
+    push(&mut f, 4, Inst::IBin(IOp::Add, U64, z, yv, xv));
+    push(&mut f, 4, Inst::Store(Mem::Int(4, false), ya, 0, z));
+    push(&mut f, 4, Inst::IBinI(IOp::Add, U64, i, i, 1));
+    term(&mut f, 4, Term::Jump(1));
+    f.rets.push(Cls::I);
+    term(&mut f, 5, Term::Ret(vec![i]));
+    let orig = f.clone();
+    assert!(version::unswitch_loops(&relax_session::Options::default(), &mut f));
+    // neither copy branches on flag any more
+    let reach = reachable(&f);
+    assert!(!f.blocks.iter().enumerate().any(|(b, bl)| reach[b] && matches!(bl.term, Term::Branch(c, _, _) if c == flag)));
+    let mut mem = vec![0u8; 512];
+    for j in 0..128u32 {
+        mem[j as usize * 4..j as usize * 4 + 4].copy_from_slice(&(j * 3 + 2).to_le_bytes());
+    }
+    for n in [0u64, 1, 7, 64] {
+        for fl in [0u64, 1, 2] {
+            let args = [0, 256, n, fl];
+            assert_eq!(eval(&orig, &args, &mem), eval(&f, &args, &mem), "n {n} flag {fl}");
+        }
+    }
+}
