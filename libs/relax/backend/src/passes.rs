@@ -3388,7 +3388,7 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
     const MAX_MOVS: usize = 3;
     // cheap pure instructions an arm may compute into its own temporaries (speculated: they run on
     // both paths): an `Ordering` built from a compare (`if a < b { -1 } else { (a != b) as i8 }`)
-    const MAX_SPEC: usize = 4;
+    const MAX_SPEC: usize = 6;
     let n = f.blocks.len();
     if n < 3 {
         return false;
@@ -3484,6 +3484,13 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
             continue;
         }
         let konst = |m: &Vec<(VReg, ArmSrc)>| m.iter().filter(|(_, s)| !matches!(s, ArmSrc::V(_))).count();
+        // speculation only for a choice between constants and compare outcomes (an Ordering-like
+        // value): an arm that also copies values keeps its branch (iterator loops: position / any /
+        // count arms speculated cost iter_chain +26% instructions)
+        let speculated = !st.is_empty() || !se.is_empty() || konst(&mt0) + konst(&me0) > 0;
+        if speculated && mt0.iter().chain(me0.iter()).any(|(_, s)| matches!(s, ArmSrc::V(v) if !st.iter().chain(se.iter()).any(|i| { let mut d = false; for_defs(i, |x| d |= x == *v); d }))) {
+            continue;
+        }
         if st.len() + se.len() + konst(&mt0) + konst(&me0) > MAX_SPEC {
             continue;
         }
