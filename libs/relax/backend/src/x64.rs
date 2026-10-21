@@ -4303,8 +4303,12 @@ impl<'a> Gen<'a> {
 
     fn ibin(&mut self, options: &relax_session::Options, op: IOp, it: IntTy, d: VReg, a: VReg, b: VReg) {
         // a spilled first operand of a register result loads straight into it, unless b lives there
+        // (its own register, or a spill window / rematerialised constant's window register: b's
+        // last read can share d's register, and the load would overwrite b before the operation
+        // reads it -- `mov rdx, [a]; and rdx, rdx` for `d = a & 0xffffffff`, x64 HashMap hashes)
+        let b_win = self.win_reg(b);
         let ra = match (self.al.loc[a.0 as usize], self.al.loc[d.0 as usize], self.al.loc[b.0 as usize]) {
-            (Loc::Stack(o), Loc::Reg(r), lb) if lb != Loc::Reg(r) && !matches!(op, IOp::Div | IOp::Rem | IOp::Shl | IOp::Shr | IOp::Rotl | IOp::MulHi) => {
+            (Loc::Stack(o), Loc::Reg(r), lb) if lb != Loc::Reg(r) && b_win != Some(r) && !matches!(op, IOp::Div | IOp::Rem | IOp::Shl | IOp::Shr | IOp::Rotl | IOp::MulHi) => {
                 let disp = self.spill_disp(o);
                 self.load_spill(r, disp);
                 r
