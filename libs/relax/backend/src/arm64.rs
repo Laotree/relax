@@ -3877,7 +3877,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     let lanes = fold_lane_splats(f);
     let f = lanes.as_ref().unwrap_or(f);
     // immediates arm64 cannot encode and float constants, inside loops: registers set up once
-    let hoisted = regalloc::hoist_loop_consts(f, &imm_fits, true);
+    let hoisted = regalloc::hoist_loop_consts(f, &imm_fits, true, true, freq);
     let f = hoisted.as_ref().unwrap_or(f);
     // indexed accesses with displacements on one base and index: one address register
     let shared = regalloc::share_index_bases(f);
