@@ -182,11 +182,13 @@ fn splash_blank(path: &str, images: &mut [(u32, Vec<u8>)]) -> (usize, usize, usi
         if bytes.len() < 16 {
             continue;
         }
-        let Some(ranges) = by_hash.get(&fnv64(bytes)) else { continue };
+        let h = fnv64(bytes);
+        let Some(ranges) = by_hash.get(&h) else { continue };
         found += 1;
         total += bytes.len();
         for &(s, t) in ranges {
-            for c in &mut bytes[s.min(bytes.len())..t.min(bytes.len())] {
+            let n = bytes.len();
+            for c in &mut bytes[s.min(n)..t.min(n)] {
                 if *c != b'\n' {
                     *c = b' ';
                     blanked += 1;
