@@ -827,7 +827,10 @@ fn single_thread(name: &str) -> Option<HostBind> {
         n if n.starts_with("__relax_domain_") => HostBind::Trap,
         // Linux std's only syscall is futex wait/wake (std sys/linux.rs): a no-op returning 0, as
         // macOS's __ulock_*
-        "syscall" | "__relax_wait_enter" | "__relax_wait_leave" | "__relax_wake" | "__ulock_wake" | "__ulock_wait" | "pthread_self" | "pthread_threadid_np" | "pthread_main_np" | "sched_yield" | "__relax_key_delete" => HostBind::Builtin(Builtin::Nop),
+        "syscall" | "__relax_wait_enter" | "__relax_wait_leave" | "__relax_wake" | "__ulock_wake" | "__ulock_wait" | "pthread_threadid_np" | "sched_yield" | "__relax_key_delete" => HostBind::Builtin(Builtin::Nop),
+        // the one thread: id 1 (0 is a lock's "no owner": a reentrant lock would think it holds
+        // itself), the main thread (gettid == getpid)
+        "pthread_self" | "pthread_main_np" | "gettid" | "getpid" => HostBind::Builtin(Builtin::One),
         "__relax_key_create" => HostBind::Builtin(Builtin::KeyCreate),
         "__relax_key_get" => HostBind::Builtin(Builtin::KeyGet),
         "__relax_key_set" => HostBind::Builtin(Builtin::KeySet),

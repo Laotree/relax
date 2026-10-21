@@ -111,8 +111,11 @@ pub enum Builtin {
     Memset,
     /// (f, data) -> u64: calls fn pointer `f(data)`; 0 when it returned, 1 when it unwound
     CatchPanic,
-    /// does nothing; its results are zero (single-threaded waits, wakes, thread ids)
+    /// does nothing; its results are zero (single-threaded waits and wakes)
     Nop,
+    /// does nothing; its integer results are 1: the one thread's id (never 0, the "no owner"
+    /// of locks), "is the main thread"
+    One,
     /// thread-local keys of a single-threaded program: (dtor) -> key, (key) -> value,
     /// (key, value); a table in linear memory
     KeyCreate,
@@ -3387,11 +3390,12 @@ fn helper_body(o: &Options, h: Helper, sh: &mut Shared, fn_ix: &HashMap<u32, u32
                         g(&mut c, 0);
                     }
                 }
-                Builtin::Nop => {
+                Builtin::Nop | Builtin::One => {
+                    let k = (bi == Builtin::One) as u8;
                     for r in &t.results {
                         match r {
-                            I32 => c.extend_from_slice(&[I32C, 0]),
-                            I64 => c.extend_from_slice(&[I64C, 0]),
+                            I32 => c.extend_from_slice(&[I32C, k]),
+                            I64 => c.extend_from_slice(&[I64C, k]),
                             F32 => {
                                 c.push(F32C);
                                 c.extend_from_slice(&[0; 4]);
