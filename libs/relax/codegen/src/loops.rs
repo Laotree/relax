@@ -1667,6 +1667,20 @@ pub fn merge_lane_stores(options: &relax_session::Options, f: &mut Func) -> bool
         return false;
     }
     let mut changed = false;
+    // use / def counts: a lane value loaded right before the stores, used only there, is loaded
+    // next to its insert instead (x64 folds the load into vinsertps)
+    let nv = f.vregs.len();
+    let mut nuse = vec![0u32; nv];
+    let mut ndef = vec![0u32; nv];
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_uses(i, |u| nuse[u.0 as usize] += 1);
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+        }
+        let mut tu = Vec::new();
+        relax_backend::regalloc::term_uses(&b.term, &mut tu);
+        tu.iter().for_each(|v| nuse[v.0 as usize] += 1);
+    }
     for bi in 0..f.blocks.len() {
         if f.blocks[bi].insts.iter().filter(|i| matches!(i, Inst::Store(Mem::F32, ..))).count() < 4 {
             continue;
@@ -1690,15 +1704,44 @@ pub fn merge_lane_stores(options: &relax_session::Options, f: &mut Func) -> bool
             }).flatten();
             let p = old_pos.get(k).copied().unwrap_or(0);
             if let Some((base, o, vs)) = lanes {
+                // the loads of v1..v3 among the instructions right before (only loads there):
+                // each goes next to its insert
+                let mut moved: [Option<(Inst, u64)>; 4] = [None, None, None, None];
+                let mut back = out.len();
+                while back > 0 && matches!(out[back - 1], Inst::Load(..)) {
+                    back -= 1;
+                }
+                let mut keep = Vec::new();
+                for (q, i) in out.drain(back..).enumerate() {
+                    let pq = pos[back + q];
+                    match i {
+                        Inst::Load(Mem::F32, d, ..) if vs[1..].contains(&d) && nuse[d.0 as usize] == 1 && ndef[d.0 as usize] == 1 && base != d => {
+                            let j = vs.iter().position(|v| *v == d).unwrap();
+                            moved[j] = Some((i, pq));
+                        }
+                        i => keep.push((i, pq)),
+                    }
+                }
+                pos.truncate(back);
+                for (i, pq) in keep {
+                    out.push(i);
+                    pos.push(pq);
+                }
                 let mut t = f.vreg(Cls::V128);
                 out.push(Inst::VSplat(t, vs[0]));
+                pos.push(p);
                 for j in 1..4 {
+                    if let Some((l, pq)) = moved[j].take() {
+                        out.push(l);
+                        pos.push(pq);
+                    }
                     let t2 = f.vreg(Cls::V128);
                     out.push(Inst::VInsert(t2, t, j as u8, vs[j]));
+                    pos.push(p);
                     t = t2;
                 }
                 out.push(Inst::VStore(base, o, t));
-                pos.extend(std::iter::repeat(p).take(5));
+                pos.push(p);
                 changed = true;
                 k += 4;
                 continue;
