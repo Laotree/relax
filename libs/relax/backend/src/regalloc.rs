@@ -31,6 +31,9 @@ pub struct RegConfig {
     pub store_imm: fn(i64) -> bool,
     /// scalar float constants are recomputed at their uses instead of spilled (Remat::FConst)
     pub fconst_remat: bool,
+    /// instructions read a spilled operand from its slot themselves (x64 `op r, [slot]`, a load
+    /// straight into the result): such a read costs no instruction of its own (second_chance)
+    pub mem_operands: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1802,6 +1805,46 @@ fn second_chance(
             }
         }
     }
+    // what a spilled candidate costs in instructions: its weighted references, except, where
+    // instructions read slots themselves (RegConfig::mem_operands), the reads that are not an
+    // address or a stored value count a quarter (a load micro-op, no instruction)
+    let mut cost_w: Vec<f32> = refs_w.to_vec();
+    if cfg.mem_operands {
+        let wts_ = wts;
+        for (bi, b) in f.blocks.iter().enumerate() {
+            if !reach[bi] {
+                continue;
+            }
+            for i in &b.insts {
+                // operands an instruction needs in a register: load / store bases and indices, the
+                // stored value
+                let mut reg_ops: [u32; 3] = [u32::MAX; 3];
+                match *i {
+                    Inst::Load(_, _, b0, _) => reg_ops[0] = b0.0,
+                    Inst::LoadX(_, _, b0, x, _, _) => {
+                        reg_ops[0] = b0.0;
+                        reg_ops[1] = x.0;
+                    }
+                    Inst::Store(_, b0, _, v) => {
+                        reg_ops[0] = b0.0;
+                        reg_ops[1] = v.0;
+                    }
+                    Inst::StoreX(_, b0, x, _, _, v) => {
+                        reg_ops[0] = b0.0;
+                        reg_ops[1] = x.0;
+                        reg_ops[2] = v.0;
+                    }
+                    _ => {}
+                }
+                for_uses(i, |u| {
+                    let ui = u.0 as usize;
+                    if matches!(loc[ui], Loc::Stack(_)) && !reg_ops.contains(&u.0) {
+                        cost_w[ui] -= 0.75 * wts_[bi];
+                    }
+                });
+            }
+        }
+    }
     let block_of = |p: u32| block_start.partition_point(|&s| s <= p) - 1;
     let live_at = |v: u32, p: u32| ranges.of(v).iter().any(|&(a, z)| a <= p && p <= z);
     let enters = |v: u32, b: usize| ranges.of(v).iter().any(|&(a, _)| a == block_start[b]);
@@ -1933,7 +1976,7 @@ fn second_chance(
             for &p in &rl {
                 cost += wts[block_of(p)];
             }
-            if cost >= refs_w[v as usize] {
+            if cost >= cost_w[v as usize] {
                 continue;
             }
             if best.as_ref().map_or(true, |b| cost < b.0) {

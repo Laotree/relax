@@ -93,6 +93,7 @@ pub fn reg_config() -> RegConfig {
         sym_class: 0,
         store_imm: |k| k == 0,
         fconst_remat: true,
+        mem_operands: false,
     }
 }
 
