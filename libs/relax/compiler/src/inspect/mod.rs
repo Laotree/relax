@@ -99,6 +99,9 @@ pub fn start(app: &str) {
     let _ = WATCH.set(endpoint.register_watch_with(events::remote_watcher_opened, events::remote_watcher_closed));
     pstream::register(&endpoint);
     serve_first_services(&endpoint);
+    for (name, version, factory) in HOST_SERVICES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        endpoint.register(name, *version, factory.clone());
+    }
     *ENDPOINT.lock().unwrap_or_else(|e| e.into_inner()) = Some(endpoint.clone());
     let sock = match endpoint.listen_unix(&extra) {
         Ok(s) => s,
@@ -948,6 +951,17 @@ static HOST_PROVIDERS: Mutex<Vec<(&'static str, HostQuery)>> = Mutex::new(Vec::n
 
 /// Registers a process-lifetime provider (for example the HAL's GPU ledger). The loader calls
 /// this before starting inspect or any app; domain teardown only removes program providers.
+/// A binary service the host itself serves on the inspect socket (the HAL's `gpuprof` stream),
+/// registered before or after the endpoint starts.
+pub fn register_host_service(name: &'static str, version: u32, factory: makepad_remote::endpoint::Factory) {
+    HOST_SERVICES.lock().unwrap_or_else(|e| e.into_inner()).push((name, version, factory.clone()));
+    if let Some(ep) = ENDPOINT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        ep.register(name, version, factory);
+    }
+}
+
+static HOST_SERVICES: std::sync::Mutex<Vec<(&'static str, u32, makepad_remote::endpoint::Factory)>> = std::sync::Mutex::new(Vec::new());
+
 pub fn register_host_inspect(name: &'static str, query: HostQuery) {
     let mut providers = HOST_PROVIDERS.lock().unwrap_or_else(|e| e.into_inner());
     providers.retain(|(n, _)| *n != name);
