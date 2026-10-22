@@ -1017,6 +1017,14 @@ pub fn host_file_query(path: &str, words: &[String]) -> Option<i32> {
     Some(if text.lines().any(|l| l.starts_with("{\"err\":")) { 1 } else { 0 })
 }
 
+/// Answers `req` with the host provider of command `name` (the Splash VM's `sprobe` for a
+/// `probe` on a .splash line); false when the host has none or it did not answer.
+pub(crate) fn host_query(name: &str, req: &Req, out: &mut Out) -> bool {
+    let query = HOST_PROVIDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(n, _)| *n == name).map(|(_, query)| *query);
+    let r = Req { cmd: name.to_string(), pos: req.pos.clone(), kv: req.kv.clone() };
+    query.is_some_and(|query| query(&r, out))
+}
+
 fn cmd_host_provided(req: &Req, out: &mut Out) -> bool {
     let query = HOST_PROVIDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(n, _)| *n == req.cmd).map(|(_, query)| *query);
     query.is_some_and(|query| query(req, out))

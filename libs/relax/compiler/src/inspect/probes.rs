@@ -780,7 +780,21 @@ fn read_json(p: &Probe, n_recent: usize) -> Vec<String> {
 /// `probe add <fn|file:line> <probe.rs | code> [mutate=1]` | `probe list` | `probe read P<n>` |
 /// `probe rm <P<n>|all>`
 pub fn cmd(req: &Req, out: &mut Out) {
-    match req.pos.first().map(String::as_str).unwrap_or("list") {
+    // a Splash line (`game.splash:76`) or a Splash probe (`SP3`): the script VM's line probes
+    let sub = req.pos.first().map(String::as_str).unwrap_or("list");
+    let target = req.pos.get(1).map(String::as_str).unwrap_or("");
+    let splash = match sub {
+        "add" => target.rsplit_once(':').is_some_and(|(f, _)| f.ends_with(".splash")),
+        "read" | "rm" => target.starts_with("SP"),
+        _ => false,
+    };
+    if splash {
+        if !super::host_query("sprobe", req, out) {
+            out.err("Splash line probes need a host with Splash VMs (makepad run of a makepad app)");
+        }
+        return;
+    }
+    match sub {
         "add" => {
             // the client sends the code (or a file's path) as `code`; a typed line has it as words
             let src = req.get("code").map(str::to_string).or_else(|| (req.pos.len() > 2).then(|| req.pos[2..].join(" ")));
@@ -806,6 +820,8 @@ pub fn cmd(req: &Req, out: &mut Out) {
         }
         "list" => {
             out.measured("probes", "probe counters", &[]);
+            // the Splash line probes (SP<n>) first
+            let _ = super::host_query("sprobe", req, out);
             for p in PROBES.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|p| !p.slots.lock().unwrap_or_else(|e| e.into_inner()).is_empty()) {
                 let (hits, ns, timed) = (p.hits.load(Relaxed), p.ns.load(Relaxed), p.timed.load(Relaxed));
                 let failed = p.failed.lock().unwrap_or_else(|e| e.into_inner()).clone();
