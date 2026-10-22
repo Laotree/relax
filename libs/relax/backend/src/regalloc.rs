@@ -65,7 +65,7 @@ pub fn alloc_sig(al: &Alloc) -> u64 {
     for e in &al.evicts {
         mix(e.v as u64);
         mix(e.reg as u64 | (e.slot as u32 as u64) << 8);
-        mix(e.store as u64 | (e.reload as u64) << 32);
+        mix(e.reload as u64);
     }
     for p in &al.prestores {
         mix(p.0 as u64 | (p.1 as u64) << 32);
@@ -119,32 +119,28 @@ pub struct Alloc {
     /// (instruction position, vreg) definitions of a spilled value whose store home nobody reads
     /// (dead_spill_stores): the result only goes to the region window's register
     pub store_skip: std::collections::HashSet<(u32, u32)>,
-    /// block-local evictions (O3): a value in an integer register, live through a run of a hot
-    /// block that neither reads nor writes it, is put aside over the run so spilled values' windows
-    /// can use the register there (see `Evict`)
+    /// reloads of values whose register second_chance lent to a spilled value (see `Evict`)
     pub evicts: Vec<Evict>,
-    /// (position, vreg, register, slot): stores of an evicted value's register into its eviction
-    /// slot right before the instruction at the position (once, after its only definition), so its
-    /// evictions only reload
+    /// (position, vreg, register, slot): an evicted value's register stored into its eviction slot
+    /// right before the instruction at the position (once, two instructions after its only
+    /// definition, which dominates every point it is live at)
     pub prestores: Vec<(u32, u32, u8, i32)>,
+    /// (register, from, to): positions where a register is lent (holds another value than its
+    /// allocation says, or is about to be reloaded); copy_reuse serves no read from it there
+    pub lent: Vec<(u8, u32, u32)>,
 }
 
-/// One block-local eviction (Alloc::evicts). Before the instruction at `store` (u32::MAX: none,
-/// the slot already holds the value -- a prestore -- or it is recomputed) the backend stores `reg`
-/// into `slot`; spill windows inside `free` (positions) use `reg`; before the instruction at
-/// `reload` it loads `reg` from `slot` again, or recomputes `remat` into it when that is not
-/// `Remat::No` (a constant or address held in a register: nothing is stored). Neither the value nor
-/// anything sharing its register is read or written from the store to the reload, and no call is
-/// between them.
+/// One reload of an evicted value (Alloc::evicts, second_chance): before the instruction at
+/// position `reload` (or before the terminator, at its position) the backend loads `reg` from
+/// `slot` (filled by the value's prestore), or recomputes `remat` into it when that is not
+/// `Remat::No` (a constant or address held in a register: never stored).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Evict {
     pub v: u32,
     pub reg: u8,
     pub slot: i32,
     pub remat: Remat,
-    pub store: u32,
     pub reload: u32,
-    pub free: (u32, u32),
 }
 
 /// A register / slot transfer an emitter makes before the instruction at a position, for evictions
@@ -157,17 +153,12 @@ pub enum EvOp {
     Remat(u8, Remat),
 }
 
-/// Alloc::evicts and Alloc::prestores as the transfers before each instruction position, stores
-/// first (a reload at a position never reads what a store there writes: different registers).
+/// Alloc::evicts and Alloc::prestores as the transfers before each instruction (or terminator)
+/// position, stores first (a store and a reload at one position are of different registers).
 pub fn evict_ops(al: &Alloc) -> HashMap<u32, Vec<EvOp>> {
     let mut m: HashMap<u32, Vec<EvOp>> = HashMap::new();
     for &(p, _, r, o) in &al.prestores {
         m.entry(p).or_default().push(EvOp::Store(r, o));
-    }
-    for e in &al.evicts {
-        if e.store != u32::MAX {
-            m.entry(e.store).or_default().push(EvOp::Store(e.reg, e.slot));
-        }
     }
     for e in &al.evicts {
         m.entry(e.reload).or_default().push(if e.remat.is_some() { EvOp::Remat(e.reg, e.remat) } else { EvOp::Load(e.reg, e.slot) });
@@ -1378,6 +1369,15 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             eprintln!("ra-spill {} v{} w={:.3} refs={:.2} len={} unit={} ranges={} | {}", f.name, v, weight[v], refs[v], len, unit, r.len(), by.join(" "));
         }
     }
+    // second chance for spilled values (O3, second_chance). MAKEPAD_RUN_OPT=-evict: off
+    let evict_on = thorough && !crate::stats::opt_off(options, "-evict");
+    let (evicts, prestores, lent) = if evict_on && loc.iter().any(|l| matches!(l, Loc::Stack(_))) {
+        // values in a coalesced unit, passed-through loop pieces and recomputed ones keep their place
+        let skip: Vec<bool> = (0..nv).map(|v| unit_members(v).is_some() || parent[v as usize] != v || is_low(v) || remat[v as usize].is_some()).collect();
+        second_chance(options, f, &reach, &tab, &block_start, &block_end, &ranges, &wts, cfg, &used_callee_int, &call_pos, &mut loc, &remat, &skip, &refs, &mut occ, pos_words, &mut spill_bytes)
+    } else {
+        Default::default()
+    };
     // spill slots shared along copies: a copy between two spilled values whose live ranges
     // never meet puts both in one slot, so the copy is no code at all (call-crossing splits of a
     // value that spilled anyway were a load + store per copy: shape's apply_forward moved values
@@ -1483,10 +1483,6 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     if slot_share_on(options) {
         spill_bytes = pack_spill_slots(f, &reach, &block_start, &mut loc, &ranges, &start);
     }
-    // block-local evictions (O3, Alloc::evicts): a constant or address that holds a register is
-    // recomputed at the end of its eviction, so its kind is kept here
-    let evict_on = thorough && windows_on(options) && !crate::stats::opt_off(options, "-evict");
-    let remat0: Vec<Remat> = if evict_on { remat.clone() } else { Vec::new() };
     for v in 0..nv as usize {
         if !matches!(loc[v], Loc::None) {
             remat[v] = Remat::No;
@@ -1531,7 +1527,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     // windows that start at the value's definition: entered with the value in the register (no load)
     let mut def_wins: Vec<(u32, u32, u32, u8)> = Vec::new();
     let def_windows = !crate::stats::opt_off(options, "-defwin");
-    let mut evicted: EvictState = EvictState::default();
+
     if thorough && windows_on(options) {
         let regs: Vec<u8> = cfg.int_caller.iter().chain(used_callee_int.iter()).copied().collect();
         let callee_set = used_callee_int.clone();
@@ -1539,8 +1535,6 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         // blocks heaviest first: hot runs get the free registers first
         let mut bo: Vec<usize> = (0..nb).filter(|b| reach[*b]).collect();
         bo.sort_by(|a, b| wts[*b].partial_cmp(&wts[*a]).unwrap_or(std::cmp::Ordering::Equal));
-        // eviction candidates: blocks that run more often than the entry, long enough for a run
-        let ev = if evict_on { Some(EvictInfo::new(f, &reach, &tab, &block_start, &ranges, &wts, &loc, |bi| wts[bi] >= 2.0 * entry_w && f.blocks[bi].insts.len() >= 6)) } else { None };
         for bi in bo {
             let b = &f.blocks[bi];
             let n = b.insts.len();
@@ -1625,9 +1619,6 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             for (v, (di, r)) in druns.drain() {
                 ddone.push((v, di, r));
             }
-            // runs that found no register (eviction candidates in a hot block)
-            let mut fails: Vec<WinFail> = Vec::new();
-            let hot = ev.as_ref().map_or(false, |e| e.hot[bi]);
             ddone.sort_by_key(|x| (std::cmp::Reverse(x.2.len()), x.0));
             for (v, di, us) in ddone {
                 if us.is_empty() || in_region.contains(&(v, bi as u32)) {
@@ -1638,7 +1629,6 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                 // free over the defining instruction's operands and the one before it too (deferred
                 // fused compares read at the next instruction)
                 let a0 = if di > 0 { a - 5 } else { a - 1 };
-                let mut placed = false;
                 for &c in &regs {
                     let o = &mut occ[c as usize];
                     if !o.is_empty() && bits_any(o, a0, z) {
@@ -1652,12 +1642,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                     }
                     bits_fill(o, a0, z);
                     def_wins.push((v, a, z, c));
-                    placed = true;
                     break;
-                }
-                if !placed && hot {
-                    // every use reads the register instead of the slot
-                    fails.push(WinFail { v, a0, z, at: a, def: true, gain: us.len() as f32 });
                 }
             }
             done.sort_by_key(|x| (std::cmp::Reverse(x.1.len()), x.0));
@@ -1671,7 +1656,6 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                 // a folded load / fused compare into the next instruction, which then reads operands
                 // whose ranges ended at the previous one -- after this window's load at its start
                 let a0 = if us[0] > 0 { a - 2 } else { a };
-                let mut placed = false;
                 for &c in &regs {
                     let o = &mut occ[c as usize];
                     if !o.is_empty() && bits_any(o, a0, z) {
@@ -1687,16 +1671,8 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                     }
                     bits_fill(o, a0, z);
                     windows.push((v, a + 1, z, c));
-                    placed = true;
                     break;
                 }
-                if !placed && hot {
-                    // one load instead of one per use
-                    fails.push(WinFail { v, a0, z, at: a + 1, def: false, gain: (us.len() - 1) as f32 });
-                }
-            }
-            if let (false, Some(e)) = (fails.is_empty(), ev.as_ref()) {
-                e.evict_block(f, &tab, &block_start, &ranges, &wts, &loc, &remat, &remat0, bi, &regs, &mut fails, &mut occ, &mut windows, &mut def_wins, &mut evicted, &mut spill_bytes);
             }
         }
     }
@@ -1712,295 +1688,292 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     };
     chained.extend(def_wins);
     asm_callee_writes(f, cfg, &mut used_callee_int, &mut used_callee_flt);
-    let EvictState { evicts, prestores, .. } = evicted;
     if trace_on(f) {
         for e in &evicts {
-            eprintln!("ra-evict {} v{} r{} store {} reload {} free {:?} remat {:?}", f.name, e.v, e.reg, if e.store == u32::MAX { "-".to_string() } else { e.store.to_string() }, e.reload, e.free, e.remat);
+            eprintln!("ra-evict {} v{} r{} reload {} remat {:?}", f.name, e.v, e.reg, e.reload, e.remat);
         }
         for p in &prestores {
             eprintln!("ra-prestore {} v{} r{} at {}", f.name, p.1, p.2, p.0);
         }
         eprintln!("ra-windows {}: {} windows, {} def windows/chained, {} dead stores, {} evictions", f.name, windows.len(), chained.len(), store_skip.len(), evicts.len());
     }
-    Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows, chained, save_skip, restore_skip, store_skip, evicts, prestores }
+    Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows, chained, save_skip, restore_skip, store_skip, evicts, prestores, lent }
 }
 
-/// A spilled value's window run that found no free register in a hot block: the register must be
-/// free over positions a0..=z; the window starts at `at` (a def window when `def`); `gain` = loads
-/// it saves.
-#[derive(Clone, Copy)]
-struct WinFail {
-    v: u32,
-    a0: u32,
-    z: u32,
-    at: u32,
-    def: bool,
-    gain: f32,
-}
-
-/// Evictions made so far in one allocation.
-#[derive(Default)]
-struct EvictState {
-    evicts: Vec<Evict>,
-    prestores: Vec<(u32, u32, u8, i32)>,
-    /// evicted vreg -> its eviction slot
-    slot: HashMap<u32, i32>,
-    /// vregs whose slot a prestore fills after their definition
-    prestored: std::collections::HashSet<u32>,
-}
-
-/// What block-local eviction needs about the function: hot blocks, the integer values held in a
-/// register live in each hot block, and each value's only definition.
-struct EvictInfo {
-    hot: Vec<bool>,
-    occupants: Vec<Vec<u32>>,
-    /// (block, instruction index) of a vreg's only definition (u32::MAX: none or several, or a
-    /// value live into the entry)
-    def_at: Vec<(u32, u32)>,
-    trace: bool,
-}
-
-impl EvictInfo {
-    fn new(f: &Func, reach: &[bool], tab: &OpTab, block_start: &[u32], ranges: &Ranges, wts: &[f32], loc: &[Loc], hot_block: impl Fn(usize) -> bool) -> EvictInfo {
-        let nb = f.blocks.len();
-        let nv = f.vregs.len();
-        let hot: Vec<bool> = (0..nb).map(|b| reach[b] && hot_block(b)).collect();
-        let _ = wts;
-        let mut occupants: Vec<Vec<u32>> = vec![Vec::new(); nb];
-        let mut def_at = vec![(u32::MAX, 0u32); nv];
-        if !hot.iter().any(|h| *h) {
-            return EvictInfo { hot, occupants, def_at, trace: trace_on(f) };
-        }
-        let block_of = |p: u32| block_start.partition_point(|&s| s <= p) - 1;
-        for v in 0..nv {
-            if !matches!(loc[v], Loc::Reg(_)) || f.vregs[v] != Cls::I {
-                continue;
-            }
-            for &(a, z) in ranges.of(v as u32) {
-                for b in block_of(a)..=block_of(z).min(nb - 1) {
-                    if hot[b] && occupants[b].last() != Some(&(v as u32)) {
-                        occupants[b].push(v as u32);
-                    }
-                }
-            }
-        }
-        let mut ndefs = vec![0u32; nv];
-        for (bi, b) in f.blocks.iter().enumerate() {
-            if !reach[bi] {
-                continue;
-            }
-            let k0 = tab.first[bi] as usize;
-            for ii in 0..b.insts.len() {
-                for &d in tab.defs(k0 + ii) {
-                    ndefs[d as usize] += 1;
-                    def_at[d as usize] = (bi as u32, ii as u32);
-                }
-            }
-        }
-        for v in 0..nv {
-            // several definitions, or live at the entry (a parameter, or read before any definition
-            // on some path): no single definition dominates every point it is live at
-            if ndefs[v] != 1 || ranges.of(v as u32).first().map_or(true, |r| r.0 == 0) {
-                def_at[v] = (u32::MAX, 0);
-            }
-        }
-        EvictInfo { hot, occupants, def_at, trace: trace_on(f) }
+/// Second chance for spilled integer values (O3; Alloc::evicts, prestores, lent): a spilled value v
+/// whose live range one register c holds for a single other value g -- g neither read nor written
+/// anywhere near v's range (two instructions on each side: emitters defer a folded instruction into
+/// the next one), no call there unless c is callee-saved, nothing clobbering c -- takes c over its
+/// whole range, and g is put aside there: g's value is safe in memory because it is stored once
+/// right after its only definition (a prestore; that definition dominates every point g is live
+/// at) or is a constant / address recomputed at the reload. g is reloaded where v's range ends and g
+/// is still live: in the block, two instructions after v's last reference (before g's next one;
+/// before the terminator of a block ending in a jump; not among a branch's last two instructions,
+/// which may fuse into it), or at the start of each successor v does not enter (a reload there on a
+/// path that never lent c reloads the same value). Taken when v's weighted references (each a
+/// stack access) outweigh the reloads plus a first prestore. LLVM's eviction with a spill region
+/// for the evicted value, restricted to evicted values without references in the region.
+#[allow(clippy::too_many_arguments)]
+fn second_chance(
+    options: &relax_session::Options,
+    f: &Func,
+    reach: &[bool],
+    tab: &OpTab,
+    block_start: &[u32],
+    block_end: &[u32],
+    ranges: &Ranges,
+    wts: &[f32],
+    cfg: &RegConfig,
+    used_callee: &[u8],
+    call_pos: &[u32],
+    loc: &mut [Loc],
+    remat0: &[Remat],
+    skip: &[bool],
+    refs_w: &[f32],
+    occ: &mut [Vec<u64>],
+    pos_words: usize,
+    spill_bytes: &mut u32,
+) -> (Vec<Evict>, Vec<(u32, u32, u8, i32)>, Vec<(u8, u32, u32)>) {
+    let nv = f.vregs.len();
+    let mut evicts: Vec<Evict> = Vec::new();
+    let mut prestores: Vec<(u32, u32, u8, i32)> = Vec::new();
+    let mut lent_iv: Vec<(u8, u32, u32)> = Vec::new();
+    let mut cand: Vec<u32> = (0..nv as u32).filter(|&v| matches!(loc[v as usize], Loc::Stack(_)) && f.vregs[v as usize] == Cls::I && !skip[v as usize] && refs_w[v as usize] > 0.0 && !ranges.of(v).is_empty()).collect();
+    if cand.is_empty() {
+        return (evicts, prestores, lent_iv);
     }
-
-    /// Block-local eviction for the window runs of block `bi` that found no register: a register
-    /// held over a gap between its references in the block (no reference at all to it there, no
-    /// call) by one value is stored at the gap's start and reloaded at its end, when the runs that
-    /// then fit in it save more loads than the store and the reload cost. The store is not needed
-    /// for a recomputed constant / address (the reload recomputes it) or after a prestore (once,
-    /// after the value's only definition, when that runs less often than this block). Margins: the
-    /// gap starts two instructions after the previous reference and the freed positions end before
-    /// the instruction ahead of the reload (emitters defer a folded instruction into the next one),
-    /// and the reload is at most at the block's third-last instruction (the last two may fuse into
-    /// the terminator).
-    #[allow(clippy::too_many_arguments)]
-    fn evict_block(
-        &self,
-        f: &Func,
-        tab: &OpTab,
-        block_start: &[u32],
-        ranges: &Ranges,
-        wts: &[f32],
-        loc: &[Loc],
-        remat: &[Remat],
-        remat0: &[Remat],
-        bi: usize,
-        regs: &[u8],
-        fails: &mut Vec<WinFail>,
-        occ: &mut [Vec<u64>],
-        windows: &mut Vec<(u32, u32, u32, u8)>,
-        def_wins: &mut Vec<(u32, u32, u32, u8)>,
-        st: &mut EvictState,
-        spill_bytes: &mut u32,
-    ) {
-        let b = &f.blocks[bi];
-        let n = b.insts.len() as u32;
-        let bs = block_start[bi];
-        let w = wts[bi].max(1e-9);
+    cand.sort_by(|a, b| refs_w[*b as usize].partial_cmp(&refs_w[*a as usize]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(b)));
+    let regs: Vec<u8> = cfg.int_caller.iter().chain(used_callee.iter()).copied().collect();
+    let mut in_reg: Vec<Vec<u32>> = vec![Vec::new(); 32];
+    for v in 0..nv {
+        if let (Loc::Reg(r), Cls::I) = (loc[v], f.vregs[v]) {
+            in_reg[r as usize].push(v as u32);
+        }
+    }
+    let maxp = (pos_words * 64 - 1) as u32;
+    // integer registers instructions overwrite (RegConfig::clobbers)
+    let mut clob: Vec<Vec<u64>> = vec![Vec::new(); 32];
+    // single definitions and reference positions (a recomputed base + k reads its base)
+    let mut ndefs = vec![0u32; nv];
+    let mut def_at = vec![(u32::MAX, 0u32); nv];
+    let mut refpos: Vec<Vec<u32>> = vec![Vec::new(); nv];
+    let base_of = |mut u: u32| -> u32 {
+        for _ in 0..8 {
+            match (loc[u as usize], remat0.get(u as usize)) {
+                (Loc::None, Some(Remat::Offset(b, _))) => u = b.0,
+                _ => break,
+            }
+        }
+        u
+    };
+    for (bi, b) in f.blocks.iter().enumerate() {
+        if !reach[bi] {
+            continue;
+        }
         let k0 = tab.first[bi] as usize;
-        // instruction indices referencing each candidate register (n: the terminator); a recomputed
-        // base + k reads its base's register
-        let mut refs: Vec<Vec<u32>> = vec![Vec::new(); regs.len()];
-        let reg_of = |mut u: u32| -> Option<u8> {
-            for _ in 0..8 {
-                match (loc[u as usize], remat[u as usize]) {
-                    (Loc::Reg(r), _) => return Some(r),
-                    (Loc::None, Remat::Offset(base, _)) => u = base.0,
-                    _ => return None,
+        let n = b.insts.len();
+        for k in 0..=n {
+            let p = if k < n { block_start[bi] + 2 * k as u32 + 1 } else { block_end[bi] - 1 };
+            for &u in tab.uses(k0 + k) {
+                let u = base_of(u);
+                if matches!(loc[u as usize], Loc::Reg(_)) {
+                    refpos[u as usize].push(p);
                 }
             }
-            None
-        };
-        for k in 0..=n {
-            let k = k as usize;
-            let mut note = |u: u32| {
-                if let Some(r) = reg_of(u) {
-                    if let Some(ix) = regs.iter().position(|&x| x == r) {
-                        if refs[ix].last() != Some(&(k as u32)) {
-                            refs[ix].push(k as u32);
-                        }
+            if k < n {
+                for &d in tab.defs(k0 + k) {
+                    ndefs[d as usize] += 1;
+                    def_at[d as usize] = (bi as u32, k as u32);
+                    if matches!(loc[d as usize], Loc::Reg(_)) {
+                        refpos[d as usize].push(p + 1);
                     }
                 }
-            };
-            for &u in tab.uses(k0 + k) {
-                note(u);
-            }
-            if k < n as usize {
-                for &d in tab.defs(k0 + k) {
-                    note(d);
+                if let Some(cl) = cfg.clobbers {
+                    let mut m = cl(options, f, &b.insts[k]) & 0xffff_ffff;
+                    let w = if matches!(b.insts[k], Inst::Call(Callee::Asm(_), _, _)) { 2 } else { 1 };
+                    while m != 0 {
+                        let r = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        if clob[r].is_empty() {
+                            clob[r].resize(pos_words, 0);
+                        }
+                        bits_fill(&mut clob[r], p, p + w);
+                    }
                 }
             }
         }
-        let calls: Vec<u32> = (0..n).filter(|&k| matches!(b.insts[k as usize], Inst::Call(..))).collect();
-        // evictions made in this block: (register index, s, r)
-        let mut made: Vec<(usize, u32, u32)> = Vec::new();
-        let recomputed = |g: u32| matches!(remat0.get(g as usize), Some(Remat::Const(_) | Remat::Addr(_) | Remat::FnAddr(_) | Remat::Slot(_)));
-        // diagnostics (MAKEPAD_RUN_RA_TRACE): gaps looked at, with a holder, with runs fitting
-        let mut diag = [0u32; 4];
-        let nfails = fails.len();
-        for _round in 0..8 {
-            if fails.is_empty() {
-                break;
+    }
+    let block_of = |p: u32| block_start.partition_point(|&s| s <= p) - 1;
+    let live_at = |v: u32, p: u32| ranges.of(v).iter().any(|&(a, z)| a <= p && p <= z);
+    let enters = |v: u32, b: usize| ranges.of(v).iter().any(|&(a, _)| a == block_start[b]);
+    let mut lent: Vec<Vec<u64>> = vec![Vec::new(); 32];
+    let mut prestored: HashMap<u32, i32> = HashMap::new();
+    let mut slot_of: HashMap<u32, i32> = HashMap::new();
+    for v in cand {
+        let r = ranges.of(v);
+        let ext: Vec<(u32, u32)> = r.iter().map(|&(a, z)| (a.saturating_sub(4), (z + 4).min(maxp))).collect();
+        let call_in = |iv: &[(u32, u32)]| iv.iter().any(|&(a, z)| {
+            let k = call_pos.partition_point(|&p| p < a);
+            k < call_pos.len() && call_pos[k] <= z
+        });
+        let crossing = call_in(r);
+        let call_near = crossing || call_in(&ext);
+        // (cost, register, evicted value, reloads)
+        let mut best: Option<(f32, u8, Option<u32>, Vec<u32>)> = None;
+        for &c in &regs {
+            let ci = c as usize;
+            let callee = used_callee.contains(&c);
+            if call_near && !callee {
+                continue;
             }
-            // (net gain, register index, value, s, r, runs taken, prestore)
-            let mut best: Option<(f32, usize, u32, u32, u32, Vec<usize>, bool)> = None;
-            for (ix, &c) in regs.iter().enumerate() {
-                if occ[c as usize].is_empty() {
+            if !clob[ci].is_empty() && r.iter().any(|&(a, z)| bits_any(&clob[ci], a, z)) {
+                continue;
+            }
+            if !lent[ci].is_empty() && ext.iter().any(|&(a, z)| bits_any(&lent[ci], a, z)) {
+                continue;
+            }
+            let mut g: Option<u32> = None;
+            let mut bad = false;
+            for &u in &in_reg[ci] {
+                if ranges_meet(ranges.of(u), r) {
+                    if g.is_some() {
+                        bad = true;
+                        break;
+                    }
+                    g = Some(u);
+                }
+            }
+            if bad {
+                continue;
+            }
+            let Some(g) = g else {
+                // free over the whole range (a register an earlier eviction freed)
+                if best.as_ref().map_or(true, |b| b.0 > 0.0) {
+                    best = Some((0.0, c, None, Vec::new()));
+                }
+                continue;
+            };
+            let gi = g as usize;
+            if refpos[gi].iter().any(|&p| ext.iter().any(|&(a, z)| a <= p && p <= z)) {
+                continue;
+            }
+            let rm = matches!(remat0.get(gi), Some(Remat::Const(_) | Remat::Addr(_) | Remat::FnAddr(_) | Remat::Slot(_)));
+            let mut cost = 0.0;
+            if !rm && !prestored.contains_key(&g) {
+                let (db, di) = def_at[gi];
+                if db == u32::MAX || ndefs[gi] != 1 || ranges.of(g).first().map_or(true, |x| x.0 == 0) || di as usize + 2 >= f.blocks[db as usize].insts.len() {
                     continue;
                 }
-                let rf = &refs[ix];
-                let mut prev: Option<u32> = None;
-                for t in 0..=rf.len() {
-                    let next = if t < rf.len() { rf[t] } else { n + 1 };
-                    let s = prev.map_or(0, |p| p + 2);
-                    prev = rf.get(t).copied();
-                    let r = next.min(n.saturating_sub(2));
-                    diag[0] += 1;
-                    if r < s + 3 {
-                        continue;
+                cost += wts[db as usize];
+            }
+            let mut rl: Vec<u32> = Vec::new();
+            let mut ok = true;
+            for &(a, z) in r {
+                let bi = block_of(a);
+                let b = &f.blocks[bi];
+                let n = b.insts.len() as u32;
+                let bs = block_start[bi];
+                let mut to_succs = false;
+                if z == block_end[bi] {
+                    to_succs = true;
+                } else if live_at(g, z) {
+                    // v's last reference here: instruction u (n: the terminator)
+                    let u = (z - bs - 1) / 2;
+                    let gnext = refpos[gi].iter().copied().filter(|&p| p > z && p < block_end[bi]).min().map_or(n + 1, |p| (p - bs - 1) / 2);
+                    let jump = matches!(b.term, Term::Jump(_));
+                    let lim = if jump { n.saturating_sub(1) } else { n.saturating_sub(2) };
+                    if u + 2 <= lim.min(gnext) && u + 2 < n {
+                        rl.push(bs + 2 * (u + 2) + 1);
+                    } else if jump && u < n && gnext > n {
+                        rl.push(block_end[bi] - 1);
+                    } else {
+                        to_succs = true;
                     }
-                    if calls.iter().any(|&k| k + 1 >= s && k <= r) {
-                        continue;
-                    }
-                    if made.iter().any(|&(mi, ms, mr)| mi == ix && s <= mr + 2 && ms <= r + 2) {
-                        continue;
-                    }
-                    let (fa, fz) = (bs + 2 * s, bs + 2 * (r - 1));
-                    // the one value held over the whole gap, live at the reload
-                    let hold = bs + 2 * r + 1;
-                    let Some(&g) = self.occupants[bi].iter().find(|&&g| loc[g as usize] == Loc::Reg(c) && ranges.of(g).iter().any(|&(a, z)| a <= fa && z >= hold)) else { continue };
-                    diag[1] += 1;
-                    let mut fit: Vec<usize> = (0..fails.len()).filter(|&j| fails[j].a0 >= fa && fails[j].z <= fz).collect();
-                    if fit.is_empty() {
-                        continue;
-                    }
-                    diag[2] += 1;
-                    fit.sort_by(|&x, &y| fails[y].gain.partial_cmp(&fails[x].gain).unwrap_or(std::cmp::Ordering::Equal).then(x.cmp(&y)));
-                    let mut take: Vec<usize> = Vec::new();
-                    let mut gain = 0.0;
-                    for j in fit {
-                        if take.iter().all(|&k| fails[k].z < fails[j].a0 || fails[j].z < fails[k].a0) {
-                            take.push(j);
-                            gain += fails[j].gain;
+                }
+                if to_succs {
+                    for s in b.term.succs() {
+                        let s = s as usize;
+                        if !reach[s] || enters(v, s) || !live_at(g, block_start[s]) {
+                            continue;
+                        }
+                        let sb = &f.blocks[s];
+                        if !sb.insts.is_empty() {
+                            rl.push(block_start[s] + 1);
+                        } else if matches!(sb.term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..)) {
+                            rl.push(block_end[s] - 1);
+                        } else {
+                            ok = false;
+                            break;
                         }
                     }
-                    let (store_cost, pre) = if recomputed(g) || st.prestored.contains(&g) {
-                        (0.0, false)
-                    } else {
-                        match self.def_at[g as usize] {
-                            (db, di) if db != u32::MAX && di + 2 < f.blocks[db as usize].insts.len() as u32 && wts[db as usize] < w => (wts[db as usize] / w, true),
-                            _ => (1.0, false),
-                        }
-                    };
-                    let net = gain - 1.0 - store_cost;
-                    if net > 0.0 && best.as_ref().map_or(true, |x| net > x.0) {
-                        best = Some((net, ix, g, s, r, take, pre));
-                    }
+                    // v live out of a block whose terminator reads it, and dead after: only the
+                    // successors' starts are after its last read
+                }
+                if !ok {
+                    break;
                 }
             }
-            let Some((_, ix, g, s, r, mut take, pre)) = best else { break };
-            let c = regs[ix];
-            let (fa, fz) = (bs + 2 * s, bs + 2 * (r - 1));
-            bits_clear(&mut occ[c as usize], fa, fz);
-            for &j in &take {
-                let x = fails[j];
-                bits_fill(&mut occ[c as usize], x.a0, x.z);
-                if x.def {
-                    def_wins.push((x.v, x.at, x.z, c));
-                } else {
-                    windows.push((x.v, x.at, x.z, c));
-                }
+            if !ok {
+                continue;
             }
-            take.sort_unstable_by(|a, b| b.cmp(a));
-            for j in take {
-                fails.swap_remove(j);
+            rl.sort_unstable();
+            rl.dedup();
+            // a reload position inside v's range would overwrite v
+            if rl.iter().any(|&p| r.iter().any(|&(a, z)| a <= p && p <= z)) {
+                continue;
             }
-            let rm = recomputed(g);
-            let slot = if rm {
-                0
-            } else {
-                *st.slot.entry(g).or_insert_with(|| {
-                    *spill_bytes = grow_spill(*spill_bytes, Cls::I);
-                    *spill_bytes as i32
-                })
-            };
-            if pre {
-                let (db, di) = self.def_at[g as usize];
-                st.prestores.push((block_start[db as usize] + 2 * (di + 2) + 1, g, c, slot));
-                st.prestored.insert(g);
+            for &p in &rl {
+                cost += wts[block_of(p)];
             }
-            let store = if rm || st.prestored.contains(&g) { u32::MAX } else { bs + 2 * s + 1 };
-            st.evicts.push(Evict { v: g, reg: c, slot, remat: if rm { remat0[g as usize] } else { Remat::No }, store, reload: bs + 2 * r + 1, free: (fa, fz) });
-            made.push((ix, s, r));
-            diag[3] += 1;
-            // runs that fit in the freed part that is still free (no further eviction needed)
-            let mut j = 0;
-            while j < fails.len() {
-                let x = fails[j];
-                let o = &mut occ[c as usize];
-                if x.a0 >= fa && x.z <= fz && !bits_any(o, x.a0, x.z) {
-                    bits_fill(o, x.a0, x.z);
-                    if x.def {
-                        def_wins.push((x.v, x.at, x.z, c));
-                    } else {
-                        windows.push((x.v, x.at, x.z, c));
-                    }
-                    fails.swap_remove(j);
-                } else {
-                    j += 1;
-                }
+            if cost >= refs_w[v as usize] {
+                continue;
+            }
+            if best.as_ref().map_or(true, |b| cost < b.0) {
+                best = Some((cost, c, Some(g), rl));
             }
         }
-        if self.trace {
-            let fl: Vec<String> = fails.iter().take(12).map(|x| format!("v{}{}[{}..{}]+{}", x.v, if x.def { "d" } else { "" }, x.a0 - bs, x.z - bs, x.gain)).collect();
-            let rf: Vec<String> = regs.iter().zip(&refs).map(|(c, r)| format!("r{}:{}", c, r.len())).collect();
-            eprintln!("ra-evblk {} b{} n {} w {:.1} fails {} -> {} gaps {} held {} fit {} made {} | left {} | refs {}", f.name, bi, n, w, nfails, fails.len(), diag[0], diag[1], diag[2], diag[3], fl.join(" "), rf.join(" "));
+        let Some((_, c, g, rl)) = best else { continue };
+        let ci = c as usize;
+        loc[v as usize] = Loc::Reg(c);
+        in_reg[ci].push(v);
+        if occ[ci].is_empty() {
+            occ[ci].resize(pos_words, 0);
+        }
+        if lent[ci].is_empty() {
+            lent[ci].resize(pos_words, 0);
+        }
+        for &(a, z) in r {
+            bits_fill(&mut occ[ci], a, z);
+        }
+        for &(a, z) in &ext {
+            bits_fill(&mut lent[ci], a, z);
+            lent_iv.push((c, a, z));
+        }
+        let Some(g) = g else { continue };
+        let gi = g as usize;
+        let rm = matches!(remat0.get(gi), Some(Remat::Const(_) | Remat::Addr(_) | Remat::FnAddr(_) | Remat::Slot(_)));
+        let slot = if rm {
+            0
+        } else {
+            *slot_of.entry(g).or_insert_with(|| {
+                *spill_bytes = grow_spill(*spill_bytes, Cls::I);
+                *spill_bytes as i32
+            })
+        };
+        if !rm && !prestored.contains_key(&g) {
+            let (db, di) = def_at[gi];
+            prestores.push((block_start[db as usize] + 2 * (di + 2) + 1, g, c, slot));
+            prestored.insert(g, slot);
+        }
+        for p in rl {
+            // from v's end in the reload's block (the register still holds v there) to the reload
+            let from = r.iter().filter(|&&(_, z)| z < p && block_of(z) == block_of(p)).map(|x| x.1).max().unwrap_or(p.saturating_sub(1));
+            bits_fill(&mut lent[ci], from, (p + 1).min(maxp));
+            lent_iv.push((c, from, p));
+            evicts.push(Evict { v: g, reg: c, slot, remat: if rm { remat0[gi] } else { Remat::No }, reload: p });
         }
     }
+    (evicts, prestores, lent_iv)
 }
 
 /// Saves around calls that need no store or no load (Alloc::save_skip / restore_skip): forward,
@@ -2927,7 +2900,7 @@ fn allocate_baseline(options: &relax_session::Options, f: &Func, cfg: &RegConfig
         }
     }
     asm_callee_writes(f, cfg, &mut used_callee_int, &mut used_callee_flt);
-    Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows: Vec::new(), chained: Vec::new(), save_skip: Default::default(), restore_skip: Default::default(), store_skip: Default::default(), evicts: Vec::new(), prestores: Vec::new() }
+    Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows: Vec::new(), chained: Vec::new(), save_skip: Default::default(), restore_skip: Default::default(), store_skip: Default::default(), evicts: Vec::new(), prestores: Vec::new(), lent: Vec::new() }
 }
 
 /// Rematerialisable values: one definition by a constant-like instruction, not parameters.
@@ -4981,9 +4954,9 @@ pub fn copy_reuse(options: &relax_session::Options, f: &Func, al: &Alloc) -> Has
             }
         }
     }
-    // an evicted register holds window values between its store and its reload, not the copy
-    if !al.evicts.is_empty() {
-        out.retain(|&(p, _), r| !al.evicts.iter().any(|e| e.reg == *r && e.free.0 <= p && p <= e.reload));
+    // a lent register holds another value there, not the copy
+    if !al.lent.is_empty() {
+        out.retain(|&(p, _), r| !al.lent.iter().any(|&(c, a, z)| c == *r && a <= p && p <= z));
     }
     out
 }

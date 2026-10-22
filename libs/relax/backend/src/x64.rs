@@ -1745,6 +1745,9 @@ impl<'a> Gen<'a> {
             // region windows entered from here: loaded before the terminator (regalloc edge loads)
             if matches!(b.term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..)) {
                 let tp = self.al.block_end[bi] - 1;
+                if let Some(ops) = self.evict_at.get(&tp).cloned() {
+                    self.evict_transfers(&ops);
+                }
                 if let Some(ls) = self.win_start.get(&tp).cloned() {
                     for (v, r) in ls {
                         if let Loc::Stack(o) = self.al.loc[v as usize] {
