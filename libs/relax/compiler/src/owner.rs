@@ -346,6 +346,8 @@ fn assert_no_leaf(what: &str) {
 }
 
 fn me() -> u64 {
+    // a request's thread may be named later, after it ended (os::thread::name)
+    crate::os::thread::note_current();
     crate::os::thread::current()
 }
 
@@ -831,7 +833,7 @@ fn serve(r: usize) {
     // makepad inspect's timeline: the owner's service of this request is a span
     let traced = crate::inspect::timeline::recording();
     if traced {
-        crate::inspect::timeline::push(crate::inspect::timeline::Kind::SpanBegin, SERVE_NAMES[req.class as usize], req.from, 0);
+        crate::inspect::timeline::push(crate::inspect::timeline::Kind::SpanBegin, SERVE_NAMES[req.class as usize], req.from, crate::inspect::pstream::SITE | (req.site as *const std::panic::Location<'static> as u64));
     }
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if !req.quick {
