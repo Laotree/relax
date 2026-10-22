@@ -2155,8 +2155,9 @@ pub fn check_alloc(options: &relax_session::Options, f: &Func, cfg: &RegConfig, 
                 if let Some(sv) = al.saves.get(&p) {
                     for &(v, _) in sv {
                         if let Loc::Reg(c) = al.loc[v.0 as usize] {
-                            if !al.restore_skip.contains(&(p, v.0)) {
-                                st[c as usize] = vec![v.0];
+                            // (equal copies sharing the register are restored together)
+                            if !al.restore_skip.contains(&(p, v.0)) && !st[c as usize].contains(&v.0) {
+                                st[c as usize].push(v.0);
                             }
                         }
                     }
