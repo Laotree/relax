@@ -4485,7 +4485,7 @@ pub fn share_index_bases(f: &Func) -> Option<Func> {
         let mut open: Vec<usize> = Vec::new(); // indices into groups still valid
         for (k, i) in b.insts.iter().enumerate() {
             let key = match i {
-                Inst::LoadX(_, _, base, x, sh, _) | Inst::StoreX(_, base, x, sh, _, _) => Some((*base, *x, *sh)),
+                Inst::LoadX(_, _, base, x, sh, _) | Inst::StoreX(_, base, x, sh, _, _) | Inst::VLoadX(_, base, x, sh, _) | Inst::VStoreX(base, x, sh, _, _) => Some((*base, *x, *sh)),
                 _ => None,
             };
             if let Some(key) = key {
@@ -4508,7 +4508,7 @@ pub fn share_index_bases(f: &Func) -> Option<Func> {
         }
         let worth: Vec<&((VReg, VReg, u8), Vec<usize>)> = groups
             .iter()
-            .filter(|(_, ks)| ks.len() >= 2 && ks.iter().any(|k| matches!(b.insts[*k], Inst::LoadX(_, _, _, _, _, o) | Inst::StoreX(_, _, _, _, o, _) if o != 0)))
+            .filter(|(_, ks)| ks.len() >= 2 && ks.iter().any(|k| matches!(b.insts[*k], Inst::LoadX(_, _, _, _, _, o) | Inst::StoreX(_, _, _, _, o, _) | Inst::VLoadX(_, _, _, _, o) | Inst::VStoreX(_, _, _, o, _) if o != 0)))
             .collect();
         if worth.is_empty() {
             continue;
@@ -4535,6 +4535,8 @@ pub fn share_index_bases(f: &Func) -> Option<Func> {
                 blk.insts[*k] = match blk.insts[*k] {
                     Inst::LoadX(m, d, _, _, _, o) => Inst::Load(m, d, p, o),
                     Inst::StoreX(m, _, _, _, o, v) => Inst::Store(m, p, o, v),
+                    Inst::VLoadX(d, _, _, _, o) => Inst::VLoad(d, p, o),
+                    Inst::VStoreX(_, _, _, o, v) => Inst::VStore(p, o, v),
                     ref other => other.clone(),
                 };
             }
