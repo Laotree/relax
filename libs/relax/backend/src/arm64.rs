@@ -3617,9 +3617,14 @@ impl<'a> Gen<'a> {
         let next = self.next_block[bi];
         // (MAKEPAD_RUN_OPT=-a64backedge: off, A/B)
         let back = |b: u32| b as usize <= bi && !crate::stats::opt_env_off("-a64backedge");
-        // both laid out before: the nearer one is the innermost loop's header (an exit placed
-        // before the loop is further back)
-        if tt == next || ff != next && back(ff) && (!back(tt) || ff > tt) {
+        // neither falls through: the conditional branch goes where the code goes more often (a
+        // taken b.cond is one instruction, a not-taken one plus the b two). Counted code (PGO
+        // block counts) says which; static code takes the back edge, and of two targets laid out
+        // before the nearer one (the innermost loop's header; an exit placed before the loop is
+        // further back).
+        let (ct, cf) = (self.f.blocks[tt as usize].count, self.f.blocks[ff as usize].count);
+        let ff_cond = if ct >= 0.0 && cf >= 0.0 && ct != cf && !crate::stats::opt_env_off("-a64backedge") { cf > ct } else { back(ff) && (!back(tt) || ff > tt) };
+        if tt == next || ff != next && ff_cond {
             self.cond_branch(no, ff);
             self.jump_to(tt, bi);
         } else {
