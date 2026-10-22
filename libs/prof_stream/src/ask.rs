@@ -126,7 +126,7 @@ impl Q {
     }
 }
 
-pub const HELP: &str = "compare two recordings: `diff` with base=<A.mkpf> (B is the one asked). queries: summary | frames [n=10] [sort=slow|time] | frame F<n> | top [cpu|jit|gpu] [lane=main|all|T<n>] [range=R<a>-<b>] [n=12] | hitches [ms=<n>] | timeline F<n>|R<a>-<b> [width=100] | lanes | why-slow [F<n>|R<a>-<b>] | diff (needs a baseline: B) | gpu <frames|frame F<n>|top by=shader|owner|pass|util>  (ids: F<n> frame, T<n> lane, R<a>-<b> ms range from the start)";
+pub const HELP: &str = "compare two recordings: `diff` with base=<A.mkpf> (B is the one asked). `brief`: the starting point of an analysis (findings, slowest frame, JIT, how to test a fix). queries: summary | frames [n=10] [sort=slow|time] | frame F<n> | top [cpu|jit|gpu] [lane=main|all|T<n>] [range=R<a>-<b>] [n=12] | hitches [ms=<n>] | timeline F<n>|R<a>-<b> [width=100] | lanes | why-slow [F<n>|R<a>-<b>] | diff (needs a baseline: B) | gpu <frames|frame F<n>|top by=shader|owner|pass|util>  (ids: F<n> frame, T<n> lane, R<a>-<b> ms range from the start)";
 
 /// Answers `query` on `p` (`base`: the baseline recording of a diff).
 pub fn ask(p: &Profile, query: &str, base: Option<&Profile>) -> Ans {
@@ -152,6 +152,7 @@ pub fn ask(p: &Profile, query: &str, base: Option<&Profile>) -> Ans {
             None => "diff needs a baseline recording: ask with A=<baseline.mkpf> (the CLI: `pf diff base=<file>`)\nmore: summary".into(),
         },
         "gpu" => gpu(p, &q),
+        "brief" => brief(p),
         "help" => Ans::new(HELP),
         other => format!("unknown query `{other}`\n{HELP}").into(),
     }
@@ -881,4 +882,35 @@ fn gpu(p: &Profile, q: &Q) -> Ans {
         }
         Err(e) => format!("{e}\nmore: gpu frames").into(),
     }
+}
+
+/// The starting point of an analysis for an agent: the ranked findings, the slowest frame, the
+/// JIT's work, and how to test a hypothesis (each a command the agent can run).
+fn brief(p: &Profile) -> Ans {
+    let ws = why_slow(p, &Q::parse("why-slow"));
+    let mut out = Ans::new(format!("{} (pid {}): {}", if p.info.app.is_empty() { "the app" } else { &p.info.app }, p.info.pid, ws.finding));
+    out.blocks.extend(ws.blocks);
+    if let Some(id) = p.frames.iter().max_by_key(|f| f.dur()).map(|f| f.id) {
+        let fr = frame(p, &format!("F{id}"));
+        out.title(format!("slowest frame: {}", fr.finding));
+        out.blocks.extend(fr.blocks.into_iter().filter(|b| matches!(b, Block::Table(_))).take(1));
+    }
+    if !p.jit.is_empty() {
+        let j = top_jit(p, p.t_min, p.t_max + 1, "the recording", 5);
+        out.title(j.finding.clone());
+        out.blocks.extend(j.blocks);
+    }
+    let app = if p.info.pid != 0 { p.info.pid.to_string() } else { "<pid>".into() };
+    out.title("to test a hypothesis (makepad inspect <app> ...)".to_string());
+    let mut t = Table::new(&["what", "command"]);
+    t.row(vec!["record a baseline".into(), format!("makepad inspect {app} pf summary s=5 save=a.mkpf")]);
+    t.row(vec!["after a change: compare".into(), format!("makepad inspect {app} pf diff s=5 base=a.mkpf")]);
+    t.row(vec!["pin a fn's tier (miscompile / tier cost)".into(), format!("makepad inspect {app} tier <fn> o1|o3|auto")]);
+    t.row(vec!["count calls and time of a fn".into(), format!("makepad inspect {app} count <fn> time=1")]);
+    t.row(vec!["probe a fn (log args, histograms)".into(), format!("makepad inspect {app} probe add <fn> <code>")]);
+    t.row(vec!["code versions of a fn".into(), format!("makepad inspect {app} versions <fn>")]);
+    t.row(vec!["sample a lane's CPU (unmarked work)".into(), format!("makepad inspect {app} prof s=3 threads=<owner|main|compiler>")]);
+    out.table(t);
+    out.more("frames  hitches  top cpu lane=all  top jit  timeline slowest");
+    out
 }
