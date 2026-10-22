@@ -3605,6 +3605,14 @@ impl<'a> Parser<'a> {
             T::KwFalse => LitKind::Bool(false),
             _ => return self.err("expected literal"),
         };
+        // a literal of an expansion was not cooked by the file's token validation (it was a macro
+        // argument): rustc reports its suffix when the parser consumes it
+        if self.exp_depth > 0 && matches!(k, LitKind::Int | LitKind::Float) {
+            let t = self.tok();
+            if let Err(msg) = crate::lexer::validate_number(self.tok_text(t), k == LitKind::Float) {
+                return Err(PErr { pos: t.lo, msg });
+            }
+        }
         self.pos += 1;
         Ok(self.mk_expr(ExprKind::Lit(k), lo))
     }
