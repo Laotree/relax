@@ -502,6 +502,30 @@ pub(super) fn closest(u: &crate::jit::Unit, query: &str) -> String {
         }
         best.push((d, ty, f.name.to_string(), targetable(f, true)));
     }
+    // fns never called have no slot: the program's fn definitions by name (display path only for
+    // the few whose name is close)
+    for k in 0..u.prog.defs.len() {
+        let d = crate::program::DefId(k as u32);
+        let def = u.prog.def(d);
+        if !matches!(def.kind, crate::program::DefKind::Fn | crate::program::DefKind::AssocFn) {
+            continue;
+        }
+        let n = u.prog.syms.str(def.name);
+        let dd = if n == q_last { 0 } else if n.len().abs_diff(q_last.len()) > 2 { 9 } else { edit_distance(n, &q_last) };
+        if dd > 2 || (dd > 0 && q_last.len() < 4) {
+            continue;
+        }
+        let path = crate::lower::display_path(&u.prog, d);
+        if best.iter().any(|b| b.2 == path) {
+            continue;
+        }
+        let ns = segs(&path);
+        let ty = if ns.len() >= 2 { edit_distance(&ns[ns.len() - 2], &q_ty).min(9) } else { 9 };
+        best.push((dd, ty, path, false));
+        if best.len() > 400 {
+            break;
+        }
+    }
     best.sort_by(|a, b| (a.0, a.1, !a.3).cmp(&(b.0, b.1, !b.3)).then(a.2.len().cmp(&b.2.len())));
     let n = best.len();
     let shown: Vec<String> = best.iter().take(6).map(|(_, _, name, live)| if *live { name.clone() } else { format!("{} (not called yet: no code)", name) }).collect();

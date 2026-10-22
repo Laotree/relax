@@ -192,33 +192,30 @@ fn add(query: &str) -> Result<(Arc<Watch>, Vec<String>), String> {
         let fields = fields_named(u, &q)?;
         let fname = q.rsplit("::").next().unwrap_or("").to_string();
         let needle = format!(".{}", fname);
-        // candidate writers: compiled fns whose text assigns `.field`
+        // candidate writers: the lines of the loaded sources that assign `.field`, and the
+        // compiled fns spanning them (the same lookup as `probe add file:line`)
         let mut cands: Vec<u32> = Vec::new();
-        for id in 0..u.fns.len() {
-            let f = &u.fns[id];
-            if !(f.compiled || !f.history().inlined_into.is_empty()) {
+        let nb = needle.as_bytes();
+        let mut seen_paths: Vec<&str> = Vec::new();
+        for fi in (0..u.prog.files.len()).rev() {
+            let path = u.prog.file_paths[fi].as_str();
+            if seen_paths.contains(&path) {
                 continue;
             }
-            let crate::jit::FnKey::Inst(d, _) = &f.key else { continue };
-            let def = u.prog.def(*d);
-            let file = &u.prog.files[def.file as usize];
-            let item = file.ast.item(def.item);
-            if !matches!(item.kind, crate::ast::ItemKind::Fn(..)) || item.hi <= item.lo {
-                continue;
-            }
-            let text = file.bytes(item.lo, item.hi);
-            let nb = needle.as_bytes();
+            seen_paths.push(path);
+            let file = &u.prog.files[fi];
+            let text = file.bytes(0, file.src_len);
             let mut k = 0;
-            let mut hit = false;
             while k + nb.len() <= text.len() {
                 if &text[k..k + nb.len()] == nb && text.get(k + nb.len()).map_or(true, |c| !(c.is_ascii_alphanumeric() || *c == b'_')) && assigns(&text[k + nb.len()..]) {
-                    hit = true;
-                    break;
+                    let line = 1 + text[..k].iter().filter(|&&c| c == b'\n').count();
+                    for (slot, _, _) in super::instrument::find_all(u, &format!("{}:{}", path, line), 8) {
+                        if !cands.contains(&slot) {
+                            cands.push(slot);
+                        }
+                    }
                 }
                 k += 1;
-            }
-            if hit {
-                cands.push(id as u32);
             }
             if cands.len() >= 64 {
                 break;
@@ -234,7 +231,7 @@ fn add(query: &str) -> Result<(Arc<Watch>, Vec<String>), String> {
             ws.len() as u64 - 1
         };
         let owner = super::patches::Owner::Watch(id);
-        let mut notes = Vec::new();
+        let mut notes = vec![format!("{} compiled fn(s) assign `.{}` in their text: {}", cands.len(), fname, cands.iter().take(8).map(|c| short(&u.fns[*c as usize].name, 80)).collect::<Vec<_>>().join(", "))];
         let mut ok: Vec<(u32, Option<u32>)> = Vec::new();
         for slot in cands {
             for (adt, fi, _) in &fields {
@@ -247,7 +244,7 @@ fn add(query: &str) -> Result<(Arc<Watch>, Vec<String>), String> {
                             ok.push((slot, None));
                         }
                     }
-                    Ok(false) => {}
+                    Ok(false) => notes.push(format!("{}: relowered, no write of {} found (another struct's field of that name?)", short(&u.fns[slot as usize].name, 120), q)),
                     Err(e) => notes.push(format!("{}: not watched: {}", short(&u.fns[slot as usize].name, 120), e)),
                 }
             }

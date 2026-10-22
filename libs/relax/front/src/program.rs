@@ -2102,6 +2102,12 @@ impl Program {
         self.file_crate.push(krate);
         self.file_blocks.push(v.blocks);
         self.retarget_file(old, new, pairs);
+        // items added inside a body a paired item already has (`use` in a fn or closure body,
+        // a nested fn or const): their blocks get anonymous modules as at load
+        if let Err(error) = self.collect_new_body_blocks(new, pairs) {
+            self.revert_version(old, new, pairs);
+            return Err(error);
+        }
         self.declaration_versions.insert(new, declarations);
         let t_collect = std::time::Instant::now();
         let collected = self.collect_version_definitions(new, !same_scopes, true, visible);
@@ -3021,6 +3027,59 @@ impl Program {
         let d = self.add_def(Def { kind, name, parent: owner, file, item: si, sub: 0, is_pub, krate, scope: module });
         self.item_defs.insert((file, si.0), d);
         Ok(Some(d))
+    }
+
+    /// Hot reload: the body blocks of `file`'s paired items that hold items but have no block
+    /// module yet (a `use` or a fn added in a body) get one, under the block module or item
+    /// module around them, as collect_body_items gives at load. Blocks already mapped keep theirs.
+    fn collect_new_body_blocks(&mut self, file: u32, pairs: &[(u32, u32)]) -> Result<(), String> {
+        for &(_, n) in pairs {
+            let Some(&d) = self.item_defs.get(&(file, n)) else { continue };
+            let def = self.def(d);
+            if !matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::Const | DefKind::AssocConst | DefKind::Static) {
+                continue;
+            }
+            let module = def.scope;
+            let mut blocks = Vec::new();
+            {
+                let ast = &self.files[file as usize].ast;
+                let kind = &ast.item(ItemId(n)).kind;
+                blocks_in_item_signature(ast, kind, &mut blocks);
+                match kind {
+                    ItemKind::Fn(_, Some(b), _) => blocks.push(*b),
+                    ItemKind::Const(_, e) | ItemKind::Static(_, _, e) => if let Some(e) = e.get() { blocks_in_expr(ast, e, &mut blocks) },
+                    _ => {}
+                }
+            }
+            for b in blocks {
+                self.collect_new_block_items(file, b, module, Some(d))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_new_block_items(&mut self, file: u32, b: BlockId, module: u32, owner: Option<DefId>) -> Result<(), String> {
+        let Some((items, subs)) = self.file_blocks[file as usize].get(&b.0).cloned() else { return Ok(()) };
+        let inner = match self.block_mods.get(&(file, b.0)).copied() {
+            Some(m) => m,
+            None if !items.is_empty() => {
+                let krate = self.mods[module as usize].krate;
+                let mdef = self.mods[module as usize].def;
+                let inner = self.new_module(mdef, Some(module), Some(module), krate, file);
+                self.block_mods.insert((file, b.0), inner);
+                if let Some(o) = owner {
+                    self.block_owner.insert(inner, o);
+                }
+                let (dir, mod_rs) = self.mod_dirs.get(&module).cloned().unwrap_or_else(|| (".".to_string(), true));
+                self.collect_items(file, &items, inner, &dir, mod_rs)?;
+                inner
+            }
+            None => module,
+        };
+        for sb in subs {
+            self.collect_new_block_items(file, sb, inner, owner)?;
+        }
+        Ok(())
     }
 
     /// Items declared inside a fn/const body get anonymous block modules.

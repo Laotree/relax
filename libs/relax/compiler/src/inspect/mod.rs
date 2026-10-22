@@ -185,10 +185,20 @@ fn dispatch_command(req: &Req, out: &mut Out) {
     match req.cmd.as_str() {
         "session" => match req.pos.first().map(String::as_str) {
             Some("relaunch") => match crate::run::relaunch() {
-                Ok(()) => out.line(&format!("{{\"relaunch\":\"queued\",\"pid\":{},\"window_kept\":true}}", std::process::id())),
+                Ok(()) => {
+                    crate::reload::clear_restart_pending();
+                    out.line(&format!("{{\"relaunch\":\"queued\",\"pid\":{},\"window_kept\":true}}", std::process::id()))
+                }
                 Err(e) => out.err(&e),
             },
-            _ => out.err("session relaunch"),
+            None | Some("pending") => {
+                let p = crate::reload::restart_pending();
+                out.line(&format!("{{\"restart_pending\":{},\"note\":\"edits that cannot apply live wait here; the app runs the code before them until `session relaunch`\"}}", p.len()));
+                for w in p {
+                    out.line(&format!("{{\"waits\":{}}}", json_str(&w)));
+                }
+            }
+            _ => out.err("session [pending] | session relaunch"),
         },
         "help" => help(req, out),
         "pf" => out.err("pf is answered by the client: makepad inspect <app> pf <query> (it attaches to the app's prof stream)"),

@@ -1083,9 +1083,22 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
     // incrementally, apply_locked)
     let addable = |pf: &crate::parser::ParsedFile, k: &ItemKind| matches!(k, ItemKind::Fn(sig, _, _) if pf.ast.fn_sig(*sig).lazy_body.is_some()) || matches!(k, ItemKind::Fn(_, Some(_), _) | ItemKind::Const(..) | ItemKind::Static(..) | ItemKind::Struct(..) | ItemKind::Enum(..) | ItemKind::Union(..) | ItemKind::TypeAlias { .. } | ItemKind::Impl { .. } | ItemKind::Use { .. } | ItemKind::Mod(Some(_)));
     let inherent_impl = |pf: &crate::parser::ParsedFile, i: u32| matches!(&pf.ast.items[i as usize].kind, ItemKind::Impl(r) if pf.ast.row(*r).trait_.is_none());
+    // an item in a body (`use` in a fn or closure body, a nested fn): part of the edit of the
+    // paired item whose body holds it -- its body is checked again, and its blocks' items get
+    // their scopes when the version is committed (Program::collect_new_body_blocks)
+    let in_paired_body = |pf: &crate::parser::ParsedFile, side_new: bool, at: u32| -> bool {
+        pairs.iter().any(|&(i, j)| {
+            let k = if side_new { j } else { i };
+            let it = &pf.ast.items[k as usize];
+            matches!(it.kind, ItemKind::Fn(..) | ItemKind::Const(..) | ItemKind::Static(..)) && it.lo < at && at < it.hi
+        })
+    };
     for &j in &added {
         let it = &na.items[j as usize];
         let name = String::from_utf8_lossy(&new.src[it.name.lo as usize..it.name.hi as usize]).into_owned();
+        if !nreached[j as usize] && in_paired_body(new, true, it.lo) {
+            continue;
+        }
         // inside an added container: collected with it
         if let Some(p) = np[j as usize] {
             if added.contains(&p) {
@@ -1108,12 +1121,19 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
         // (a Drop impl changes needs_drop of its type: apply_locked rebuilds what dropped it)
         match at {
             Some(a) => plan_added.push((j, a)),
-            None => why.push(format!("{}: {} `{}` added here -- adding this kind of item is not applied live yet: restart the app", pos(new, it.lo), kind_name(&it.kind), name)),
+            None => {
+                let shown = if name.is_empty() { String::from_utf8_lossy(&new.src[it.lo as usize..(it.hi as usize).min(it.lo as usize + 80)]).split_whitespace().collect::<Vec<_>>().join(" ") } else { format!("`{}`", name) };
+                let place = if nreached[j as usize] { "" } else { " (inside a fn body)" };
+                why.push(format!("{}: {} {} added here{} -- adding this kind of item is not applied live yet: restart the app", pos(new, it.lo), kind_name(&it.kind), shown, place))
+            }
         }
     }
     for &i in &removed {
         let it = &oa.items[i as usize];
         let name = String::from_utf8_lossy(&old.src[it.name.lo as usize..it.name.hi as usize]).into_owned();
+        if !oreached[i as usize] && in_paired_body(old, false, it.lo) {
+            continue;
+        }
         if let Some(p) = op[i as usize] {
             if removed.contains(&p) && !matches!(&oa.items[p as usize].kind, ItemKind::Impl { .. }) {
                 continue;
@@ -3606,6 +3626,34 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
     back
 }
 
+/// MAKEPAD_RUN_AUTO_RELAUNCH=1: a change that cannot apply live relaunches the app domain at once
+/// (the old default). Off: it waits for `session relaunch`.
+fn auto_relaunch() -> bool {
+    std::env::var("MAKEPAD_RUN_AUTO_RELAUNCH").is_ok_and(|v| v == "1")
+}
+
+/// Edits waiting for a relaunch (`session` in inspect lists them).
+static RESTART_PENDING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn note_restart_pending(why: &str) {
+    let mut p = RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if !p.iter().any(|x| x == why) {
+        p.push(why.to_string());
+    }
+    if p.len() > 32 {
+        p.remove(0);
+    }
+}
+
+/// The edits that wait for a relaunch, oldest first (cleared by a relaunch).
+pub fn restart_pending() -> Vec<String> {
+    RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+pub fn clear_restart_pending() {
+    RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
 fn patch_refused_event(what: &str, refused: bool, lines: &[String]) {
     let reasons: Vec<String> = lines.iter().take(6).map(|l| crate::inspect::json_str(l)).collect();
     crate::inspect::events::emit(
@@ -4281,7 +4329,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
                 .then_some("sources outside the loaded program changed")
         });
         if let Some(reason) = reason {
-            if !inputs.host_restart_required(changed.iter().map(|&k| files[k].0.as_str())) && restart_domain(reason.to_string()) {
+            if auto_relaunch() && !inputs.host_restart_required(changed.iter().map(|&k| files[k].0.as_str())) && restart_domain(reason.to_string()) {
                 eprintln!("makepad live: {reason}; relaunching the app domain (window kept)");
                 restart_required = true;
                 stalled.clear();
@@ -4295,7 +4343,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
             } else {
                 format!("restart `makepad run {package}`")
             };
-            let message = format!("{} {what} changed: {reason}; {restart} to pick them up; keeping the running code", changed.len());
+            let message = format!("{} {what} changed: {reason}; {restart} (or `makepad inspect <app> session relaunch`) to pick them up; keeping the running code", changed.len());
+            note_restart_pending(&message);
             eprintln!("makepad live: {message}");
             live_log(&format!("{{\"restart_required\":true,\"message\":{}}}", json_str(&message)));
             restart_required = true;
@@ -4377,17 +4426,23 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
                 o.ms.iter().sum::<f64>()
             ),
             Rung::Refuse => eprintln!("makepad live: {}: NOT applied (errors below); the app runs the previous code", what),
-            Rung::Restart if restart_domain(format!("{}: {}", what, o.lines.first().cloned().unwrap_or_default())) => {
+            // a change that cannot apply live never relaunches on its own (a relaunch lost the
+            // user's session): the old code keeps running until a relaunch is asked for
+            // (`session relaunch`, or MAKEPAD_RUN_AUTO_RELAUNCH=1)
+            Rung::Restart if auto_relaunch() && restart_domain(format!("{}: {}", what, o.lines.first().cloned().unwrap_or_default())) => {
                 restart_required = true;
                 eprintln!("makepad live: {what}: relaunching the app domain (window kept)");
             }
-            Rung::Restart if RESTART_SUPPORTED.load(std::sync::atomic::Ordering::SeqCst) => {
+            Rung::Restart if auto_relaunch() && RESTART_SUPPORTED.load(std::sync::atomic::Ordering::SeqCst) => {
                 // the program restarts itself at its next safe point, carrying its state over
                 *RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = format!("{}: {}", what, o.lines.first().cloned().unwrap_or_default());
                 RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
                 eprintln!("makepad live: {}: restarting with state at the app's next safe point (reasons below)", what);
             }
-            Rung::Restart => eprintln!("makepad live: {}: needs a restart (reasons below); the app runs the previous code", what),
+            Rung::Restart => {
+                note_restart_pending(&format!("{}: {}", what, o.lines.first().cloned().unwrap_or_default()));
+                eprintln!("makepad live: {}: restart to apply (reasons below); the app keeps running the previous code -- `makepad inspect <app> session relaunch` applies it", what)
+            }
         }
         for l in &o.lines {
             eprintln!("makepad live:   {}", l);
