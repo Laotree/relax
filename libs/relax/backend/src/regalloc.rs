@@ -4577,6 +4577,159 @@ pub fn copy_reuse(options: &relax_session::Options, f: &Func, al: &Alloc) -> Has
     out
 }
 
+/// Loop counters stepped before their last read of the old value (`Range::next`: `old = i;
+/// i = i + 1;` at the top of the body, the body reads `old`, the latch tests `i`): the step moves
+/// down to the first instruction that reads or writes `i` again, along blocks entered only from
+/// the block before, past side exits where `i` is dead (bounds-check panics). `old` then lives only
+/// where `i` still holds the same value, so the allocator joins them (`equal_copies`) and the copy
+/// `mov old, i` per iteration is gone (LLVM: one induction variable, its increment at the latch).
+/// A step is `i = i +- k` in place or `t = i +- k; i = t` (t read only by that move).
+/// MAKEPAD_RUN_OPT=-sinkinc off.
+pub fn sink_increments(options: &relax_session::Options, f: &Func) -> Option<Func> {
+    if crate::stats::opt_off(options, "-sinkinc") {
+        return None;
+    }
+    let nv = f.vregs.len();
+    let mut uses = vec![0u32; nv];
+    let mut ndef = vec![0u32; nv];
+    let mut tu: Vec<VReg> = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_uses(i, |u| uses[u.0 as usize] += 1);
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+        }
+        tu.clear();
+        term_uses(&b.term, &mut tu);
+        for u in &tu {
+            uses[u.0 as usize] += 1;
+        }
+    }
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let reach = reachable(f);
+    let preds = preds_of(f, &reach);
+    let touches = |i: &Inst, v: VReg| {
+        let mut t = false;
+        for_uses(i, |u| t |= u == v);
+        for_defs(i, |d| t |= d == v);
+        t
+    };
+    // is v read on some path from the start of block x before it is written?
+    let live_in = |f: &Func, x: u32, v: VReg| -> bool {
+        let mut seen = vec![false; f.blocks.len()];
+        let mut work = vec![x];
+        let mut tu: Vec<VReg> = Vec::new();
+        while let Some(b) = work.pop() {
+            if std::mem::replace(&mut seen[b as usize], true) {
+                continue;
+            }
+            let blk = &f.blocks[b as usize];
+            let mut written = false;
+            for i in &blk.insts {
+                let mut r = false;
+                for_uses(i, |u| r |= u == v);
+                if r {
+                    return true;
+                }
+                let mut w = false;
+                for_defs(i, |d| w |= d == v);
+                if w {
+                    written = true;
+                    break;
+                }
+            }
+            if written {
+                continue;
+            }
+            tu.clear();
+            term_uses(&blk.term, &mut tu);
+            if tu.contains(&v) {
+                return true;
+            }
+            if let Term::Switch(_, t) = &blk.term {
+                work.extend(t.succ.iter().copied());
+            } else {
+                work.extend(blk.term.succs());
+            }
+        }
+        false
+    };
+    let mut g: Option<Func> = None;
+    for bi in 0..f.blocks.len() {
+        if !reach[bi] {
+            continue;
+        }
+        let mut a = 0;
+        loop {
+            let cur = g.as_ref().unwrap_or(f);
+            let b = &cur.blocks[bi];
+            if a >= b.insts.len() {
+                break;
+            }
+            // the step at a: (counter, number of instructions)
+            let step = match b.insts[a] {
+                Inst::IBinI(IOp::Add | IOp::Sub, _, d, x, _) if d == x && ndef[d.0 as usize] >= 2 => Some((d, 1)),
+                Inst::IBinI(IOp::Add | IOp::Sub, _, t, x, _) if t != x && ndef[t.0 as usize] == 1 && uses[t.0 as usize] == 1 && matches!(b.insts.get(a + 1), Some(Inst::Mov(d, s)) if *d == x && *s == t) => Some((x, 2)),
+                _ => None,
+            };
+            let Some((v, n)) = step else {
+                a += 1;
+                continue;
+            };
+            // walk to the first instruction that reads or writes v
+            let (mut c, mut k) = (bi as u32, a + n);
+            let target = loop {
+                let blk = &cur.blocks[c as usize];
+                if let Some(off) = blk.insts[k..].iter().position(|i| touches(i, v)) {
+                    break (c, k + off);
+                }
+                tu.clear();
+                term_uses(&blk.term, &mut tu);
+                // (an Invoke's call stays last: a step stopping in its block goes before the call)
+                let end = (c, if matches!(blk.term, Term::Invoke(..)) { blk.insts.len().saturating_sub(1).max(if c as usize == bi { a + n } else { 0 }) } else { blk.insts.len() });
+                if tu.contains(&v) {
+                    break end;
+                }
+                // one way on: the successor entered only from here, the others side exits where v is dead
+                let succ: Vec<u32> = match &blk.term {
+                    Term::Jump(t) => vec![*t],
+                    Term::Branch(_, t, e) | Term::Invoke(t, e) if t != e => vec![*t, *e],
+                    _ => break end,
+                };
+                let on: Vec<u32> = succ.iter().copied().filter(|&s| s as usize != bi && preds[s as usize].len() == 1 && preds[s as usize][0] == c).collect();
+                // an Invoke continues at its normal successor only (its call is the block's last instruction)
+                let next = match &blk.term {
+                    Term::Invoke(t, _) => on.contains(t).then_some(*t),
+                    _ if on.len() == 1 => Some(on[0]),
+                    _ => None,
+                };
+                let Some(next) = next else { break end };
+                if succ.iter().any(|&s| s != next && live_in(cur, s, v)) {
+                    break end;
+                }
+                c = next;
+                k = 0;
+            };
+            if target == (bi as u32, a + n) {
+                a += n;
+                continue;
+            }
+            let gf = g.get_or_insert_with(|| f.clone());
+            let moved: Vec<Inst> = gf.blocks[bi].insts.drain(a..a + n).collect();
+            let mpos: Vec<u64> = gf.blocks[bi].pos.drain(a..a + n).collect();
+            let at = if target.0 as usize == bi { target.1 - n } else { target.1 };
+            let tb = &mut gf.blocks[target.0 as usize];
+            for (j, (i, p)) in moved.into_iter().zip(mpos).enumerate() {
+                tb.insts.insert(at + j, i);
+                tb.pos.insert(at + j, p);
+            }
+            // the instructions after a moved up by n: look at a again
+        }
+    }
+    g
+}
+
 pub fn sink_compares(f: &Func) -> Option<Func> {
     let mut g: Option<Func> = None;
     for bi in 0..f.blocks.len() {
