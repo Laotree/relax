@@ -621,6 +621,8 @@ pub fn compact_vregs(f: &mut Func) {
     for r in f.ranged.iter_mut() {
         r.0 = m(r.0);
     }
+    // (the debug table follows; a vreg no instruction mentions is gone: its leaf is no longer held)
+    f.dbg_map_vregs(&|v| map.get(v.0 as usize).filter(|x| **x != NONE).map(|x| VReg(*x)));
     f.vregs = cls;
 }
 
@@ -1261,6 +1263,17 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
             if alias[v] != v as u32 && kn[v].is_none() {
                 kn[v] = kn[alias[v] as usize];
             }
+        }
+        if !f.dbg.is_empty() {
+            // the debug table follows the renaming (and keeps folded constants)
+            let named = f.dbg_vregs();
+            let copies: Vec<(VReg, VReg)> = named.iter().filter(|&&v| (v as usize) < nv && alias[v as usize] != v).map(|&v| (VReg(v), VReg(alias[v as usize]))).collect();
+            let consts: Vec<(VReg, i64)> = named.iter().filter(|&&v| (v as usize) < nv && single(VReg(v), &ndef)).filter_map(|&v| match kn[v as usize] {
+                Some(K::I(k)) => Some((VReg(v), k)),
+                Some(K::F(bits, _)) => Some((VReg(v), bits as i64)),
+                _ => None,
+            }).collect();
+            f.dbg_salvage(&copies, &consts);
         }
         let mut changed = false;
         let mut edits = Vec::new();
@@ -3054,6 +3067,30 @@ pub fn dce(f: &mut Func) -> bool {
                 });
             }
         }
+    }
+    if any && !f.dbg.is_empty() {
+        // removed copies / constants of single-definition values the debug table names: the
+        // table keeps their value (side metadata)
+        let named = f.dbg_vregs();
+        let single = |v: VReg| match def_at[v.0 as usize] {
+            (u32::MAX, _) => f.params.contains(&v),
+            (b, _) => b < MULTI && !f.params.contains(&v),
+        };
+        let (mut copies, mut consts) = (Vec::new(), Vec::new());
+        for (bi, rs) in removed.iter().enumerate() {
+            for (k, r) in rs.iter().enumerate() {
+                if !*r {
+                    continue;
+                }
+                match &f.blocks[bi].insts[k] {
+                    Inst::Mov(d, s) if d != s && named.binary_search(&d.0).is_ok() && single(*d) && single(*s) => copies.push((*d, *s)),
+                    Inst::Iconst(d, v) if named.binary_search(&d.0).is_ok() && single(*d) => consts.push((*d, *v)),
+                    Inst::Fconst(d, bits, _) if named.binary_search(&d.0).is_ok() && single(*d) => consts.push((*d, *bits as i64)),
+                    _ => {}
+                }
+            }
+        }
+        f.dbg_salvage(&copies, &consts);
     }
     if any {
         for (bi, b) in f.blocks.iter_mut().enumerate() {

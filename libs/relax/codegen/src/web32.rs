@@ -259,6 +259,8 @@ pub fn transform(f: &mut Func, c: &Cfg, sym_class: u64) -> Result<(), String> {
     out.extend(extra);
     f.blocks = out;
     f.slots.clear();
+    // (the slots are gone into the shadow stack: no variable locations)
+    f.dbg.clear();
     // facts about the old (offset) values do not hold for native addresses
     f.deref.clear();
     f.noalias.clear();

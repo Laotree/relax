@@ -923,6 +923,21 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
         f.ranged.push((vmap[v.0 as usize], n, lo, hi));
     }
     let slot_base = f.slots.len() as u32;
+    // the callee's named locals, in its new contexts (side metadata: makepad inspect `locals`)
+    for d in &callee.dbg {
+        let c = if d.ctx == 0 { root } else { base + d.ctx as u64 };
+        if c >= POS_CTX_LOST {
+            continue;
+        }
+        let mv = |v: VReg| if v == DBG_NONE { DBG_NONE } else { vmap[v.0 as usize] };
+        let loc = match &d.loc {
+            DbgLoc::Regs(r) => DbgLoc::Regs(r.iter().map(|v| mv(*v)).collect()),
+            DbgLoc::Slot(s, o) if *s != u32::MAX => DbgLoc::Slot(slot_base + s, *o),
+            DbgLoc::Slot(s, o) => DbgLoc::Slot(*s, *o),
+            DbgLoc::Mem(v, o) => DbgLoc::Mem(mv(*v), *o),
+        };
+        f.dbg.push(DbgVar { ctx: c as u16, local: d.local, loc, k: d.k.clone() });
+    }
     // an inlined body's SlotAddrs were moved by its own optimisation: not `born` here
     f.slots.extend(callee.slots.iter().map(|s| Slot { born: false, ..s.clone() }));
     let boff = f.blocks.len() as u32;
@@ -2289,6 +2304,10 @@ pub fn forward_slot_copies(f: &mut Func) -> bool {
                 }
             }
         }
+        f.dbg_map_slots(&|s| match to.get(s as usize) {
+            Some(&(a, None)) if a != NONE => Some(a),
+            _ => Some(s),
+        });
         if repl.iter().any(|r| r.4.is_some()) {
             for bi in 0..nb {
                 let insts = std::mem::take(&mut f.blocks[bi].insts);
@@ -3636,6 +3655,7 @@ pub fn compact_slots(f: &mut Func) -> u64 {
             }
         }
     }
+    f.dbg_map_slots(&|s| map.get(s as usize).copied().filter(|x| *x != u32::MAX));
     freed
 }
 

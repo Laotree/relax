@@ -1014,6 +1014,8 @@ struct Gen<'a> {
     pads: Vec<(usize, Vec<(VReg, i32)>, u32)>,
     /// (return offset, landing stub offset) of each invoked call
     unwind_tab: Vec<(u32, u32)>,
+    /// (instruction position, return offset) of every call: the variable table's sites (dbgloc)
+    var_calls: Vec<(u32, u32)>,
 }
 
 impl<'a> Gen<'a> {
@@ -2125,6 +2127,7 @@ impl<'a> Gen<'a> {
         }
         // a C-unwind call is invoked like a Relax one: its landing stub is keyed by this address
         self.last_call_ret = self.a.pos();
+        self.var_calls.push((self.cur_pos, self.a.pos() as u32));
         if stack_bytes > 0 {
             // add rsp, imm32
             self.a.byte(0x48);
@@ -5533,6 +5536,7 @@ impl<'a> Gen<'a> {
             Callee::CHost(..) | Callee::CIndirect(..) | Callee::CFn(..) | Callee::Asm(..) => {}
         }
         self.last_call_ret = self.a.pos();
+        self.var_calls.push((self.cur_pos, self.a.pos() as u32));
         if stack_bytes > 0 {
             // add rsp, imm32
             self.a.byte(0x48);
@@ -6088,6 +6092,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         ymm: f.vregs.iter().any(|c| *c == Cls::V256),
         pads: Vec::new(),
         unwind_tab: Vec::new(),
+        var_calls: Vec::new(),
     };
     g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
     if env.opt_regs || g.f.full {
@@ -6110,7 +6115,21 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     let text_len = g.text_len;
     crate::stats::pass_time(12, t_emit);
     crate::probe::code(g.a.b.len());
-    Ok(Compiled { code: g.a.b, pc_map: g.pc_map, frame_size: frame, text_len, alloc_sig, relocs: g.relocs, rir_emitted: if g.rir_map_on { g.f.dump() } else { String::new() }, rir_map: g.rir_map })
+    // where the named locals are at each call (makepad inspect `locals`; side metadata)
+    let mut pc_map = std::mem::take(&mut g.pc_map);
+    if !g.frameless && !g.f.dbg.is_empty() {
+        let (saved, slot_off) = (g.saved, &g.slot_off);
+        let spill = |o: i32| -(saved + o);
+        let slot = |s: u32| -(saved + slot_off[s as usize]);
+        let fr = crate::dbgloc::Frame { callee_int: &cfg.int_callee, callee_flt: &cfg.flt_callee, arg_regs: &[RDI, RSI, RDX, RCX, R8, R9], captured: &[RDI, RSI, RDX, RCX, R8, R9], call_writes: &[RAX, R10, R11], spill_fp: &spill, slot_fp: &slot };
+        let vars = crate::dbgloc::build(g.f, &g.al, &fr, &g.var_calls);
+        let e = crate::dbgloc::pc_entries(&vars, g.f.file);
+        crate::dbgloc::note_stats(&pc_map, &e, vars.len());
+        pc_map.extend(e);
+    } else {
+        crate::dbgloc::note_stats(&pc_map, &[], 0);
+    }
+    Ok(Compiled { code: g.a.b, pc_map, frame_size: frame, text_len, alloc_sig, relocs: g.relocs, rir_emitted: if g.rir_map_on { g.f.dump() } else { String::new() }, rir_map: g.rir_map })
 }
 
 /// `jmp target` through r11 (caller-saved, never an argument register): every argument

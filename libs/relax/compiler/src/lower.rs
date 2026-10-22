@@ -1664,7 +1664,60 @@ impl<'a> Lcx<'a> {
 
     /// Lowers a fn item body. `params`: ABI parameter vregs are created here.
     /// Puts the drop-flag initialisations at the start of the entry block.
+    /// `Func::dbg`: where each named local of the body lives (makepad inspect `locals`). A
+    /// local in memory names its slot (and offset) when its address is a slot's, else the
+    /// address vreg. Coroutine bodies keep none (their transform moves the slots).
+    fn record_dbg(&mut self) {
+        if self.coro.is_some() || !relax_backend::dbgloc::on() {
+            return;
+        }
+        // single definitions of address vregs: SlotAddr and slot + constant
+        let mut slot_of: std::collections::HashMap<u32, (u32, i32)> = std::collections::HashMap::new();
+        let mut consts: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
+        for b in &self.f.blocks {
+            for i in &b.insts {
+                let (d, a, off) = match i {
+                    Inst::SlotAddr(d, s) => {
+                        slot_of.insert(d.0, (*s, 0));
+                        continue;
+                    }
+                    Inst::Iconst(d, k) => {
+                        consts.insert(d.0, *k);
+                        continue;
+                    }
+                    Inst::IBinI(IOp::Add, _, d, a, off) => (d, a, *off),
+                    Inst::IBin(IOp::Add, _, d, a, k) => match consts.get(&k.0) {
+                        Some(off) => (d, a, *off),
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                if let Some(&(s, o)) = slot_of.get(&a.0) {
+                    if let Ok(off) = i32::try_from(o as i64 + off) {
+                        slot_of.insert(d.0, (s, off));
+                    }
+                }
+            }
+        }
+        for (li, st) in self.locals.iter().enumerate() {
+            let Some(st) = st else { continue };
+            let n = self.u.prog.syms.str(self.b.locals[li].name);
+            if n.is_empty() || n.starts_with("__") {
+                continue;
+            }
+            let loc = match st {
+                LocalSt::Regs(r) => DbgLoc::Regs(r.clone()),
+                LocalSt::Slot(a) => match slot_of.get(&a.0) {
+                    Some(&(s, o)) => DbgLoc::Slot(s, o),
+                    None => DbgLoc::Mem(*a, 0),
+                },
+            };
+            self.f.dbg.push(DbgVar { ctx: 0, local: li as u32, loc, k: Vec::new() });
+        }
+    }
+
     pub fn finish(&mut self) {
+        self.record_dbg();
         let inits = std::mem::take(&mut self.entry_inits);
         let flags: Vec<VReg> = if self.coro.is_none() { inits.iter().filter_map(|i| if let Inst::Iconst(f, 0) = i { Some(*f) } else { None }).collect() } else { Vec::new() };
         if !inits.is_empty() {

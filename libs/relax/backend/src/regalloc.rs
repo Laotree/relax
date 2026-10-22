@@ -3403,6 +3403,7 @@ fn split_cold_calls(f: &Func, freq: &[f32], cand: &[bool]) -> Option<Func> {
     let nv0 = f.vregs.len();
     let mut g = f.clone();
     let mut changed = false;
+    let mut pieces: Vec<(VReg, VReg)> = Vec::new();
     for bi in 0..f.blocks.len() {
         if !cold[bi] {
             continue;
@@ -3471,6 +3472,7 @@ fn split_cold_calls(f: &Func, freq: &[f32], cand: &[bool]) -> Option<Func> {
             let mut call = g.blocks[bi].insts[ii].clone();
             for v in across {
                 let t = g.vreg(f.vregs[v.0 as usize]);
+                pieces.push((t, v));
                 before.push(Inst::Mov(t, v));
                 after.push(Inst::Mov(v, t));
                 if let Inst::Call(_, args, _) = &mut call {
@@ -3499,6 +3501,7 @@ fn split_cold_calls(f: &Func, freq: &[f32], cand: &[bool]) -> Option<Func> {
         }
     }
     if changed {
+        g.dbg_add_pieces(&pieces);
         Some(g)
     } else {
         None
@@ -3597,6 +3600,9 @@ fn allocate_split_loops_inner(options: &relax_session::Options, f: &Func, al: Al
             }
         }
     }
+    // the pieces that stay hold their originals' values (debug locations follow them)
+    let pairs: Vec<(VReg, VReg)> = (n_orig..g.vregs.len()).filter(|&v| back[v] as usize == v && origin[v] != u32::MAX).map(|v| (VReg(v as u32), VReg(origin[v]))).collect();
+    g.dbg_add_pieces(&pairs);
     let gf: Option<Vec<f32>> = gfreq.map(|x| x.to_vec());
     (Some(g), al2, through, gf)
 }

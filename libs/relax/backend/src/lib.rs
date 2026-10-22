@@ -9,6 +9,7 @@ pub mod arm64;
 pub mod asm;
 pub mod bitops;
 pub mod cabi;
+pub mod dbgloc;
 pub mod dom;
 pub mod exec;
 pub mod frame;

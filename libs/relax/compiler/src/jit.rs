@@ -1749,7 +1749,7 @@ fn raise_with(kind: &str, message: String, site: u64, fault: u64, rbp: u64, ret:
     // makepad inspect: a watched run parks the panic here, stack intact, until a client decides
     // (a resume_unwind continues a panic inspect already parked: no second park)
     if !RETHROW.with(|c| c.replace(false)) {
-        crate::inspect::events::on_panic(&info, !regs.is_null());
+        crate::inspect::events::on_panic(&info, regs);
     }
     PANIC.with(|p| *p.borrow_mut() = Some(info));
     FMT.with(|f| {
@@ -1906,13 +1906,32 @@ pub(crate) fn rt_panic_impl(msg: *const u8, len: u64, file: *const u8, file_len:
 // cut back to the recovery point as before.
 
 #[cfg(target_arch = "aarch64")]
-const REG_WORDS: usize = 20;
+pub(crate) const REG_WORDS: usize = 36;
 #[cfg(not(target_arch = "aarch64"))]
-const REG_WORDS: usize = 7;
+pub(crate) const REG_WORDS: usize = 13;
+
+/// Index of caller-saved register `r` in the register block (as the call it was stored at
+/// began: arm64 x0..x15; x86_64 rdi, rsi, rdx, rcx, r8, r9).
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn call_reg_slot(r: u32) -> Option<usize> {
+    (r < 16).then_some(20 + r as usize)
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) fn call_reg_slot(r: u32) -> Option<usize> {
+    match r {
+        7 => Some(7),
+        6 => Some(8),
+        2 => Some(9),
+        1 => Some(10),
+        8 => Some(11),
+        9 => Some(12),
+        _ => None,
+    }
+}
 
 /// Index of callee-saved register `r` (a trailer entry) in the register block.
 #[cfg(target_arch = "aarch64")]
-fn reg_slot(r: u32) -> Option<usize> {
+pub(crate) fn reg_slot(r: u32) -> Option<usize> {
     match r {
         19..=28 => Some(2 + (r - 19) as usize),
         0x108..=0x10f => Some(12 + (r - 0x108) as usize),
@@ -1920,7 +1939,7 @@ fn reg_slot(r: u32) -> Option<usize> {
     }
 }
 #[cfg(not(target_arch = "aarch64"))]
-fn reg_slot(r: u32) -> Option<usize> {
+pub(crate) fn reg_slot(r: u32) -> Option<usize> {
     match r {
         3 => Some(2),
         12..=15 => Some(3 + (r - 12) as usize),
@@ -2397,13 +2416,11 @@ fn panic_tramp(target: u64) -> Vec<u8> {
 fn panic_tramp(target: u64) -> Vec<u8> {
     let mut b = Vec::new();
     // Entered by `call` (rsp = 8 mod 16, [rsp] = the JIT return address). Builds the register
-    // block [rbp, return address, rbx, r12, r13, r14, r15] on the stack and passes its address
-    // as argument 7 (SysV: the first stack argument): the target sees [rsp] = a return slot,
-    // [rsp+8] = the block, [rsp+16] = 0, with rsp = 8 mod 16 as after a call. Never returns.
-    // mov r10, [rsp]
-    b.extend_from_slice(&[0x4c, 0x8b, 0x14, 0x24]);
-    // push r15 ; push r14 ; push r13 ; push r12 ; push rbx ; push r10 ; push rbp
-    b.extend_from_slice(&[0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x41, 0x52, 0x55]);
+    // block [rbp, return address, rbx, r12, r13, r14, r15, rdi, rsi, rdx, rcx, r8, r9] on the
+    // stack and passes its address as argument 7 (SysV: the first stack argument): the target
+    // sees [rsp] = a return slot, [rsp+8] = the block, [rsp+16] = 0, with rsp = 8 mod 16 as
+    // after a call. Never returns.
+    push_reg_block(&mut b);
     // mov r11, rsp
     b.extend_from_slice(&[0x49, 0x89, 0xe3]);
     // push 0 ; push r11 ; push r11
@@ -2413,6 +2430,66 @@ fn panic_tramp(target: u64) -> Vec<u8> {
     b.extend_from_slice(&target.to_le_bytes());
     b.extend_from_slice(&[0x41, 0xff, 0xe3]);
     b
+}
+
+/// JIT trampoline in front of a host function that returns (makepad inspect's breakpoint):
+/// the register block of `panic_tramp`, made the frame record (rbp = its address: [rbp, return
+/// address] lead it, so frame walks go on into the JIT caller), passed as argument 7 (the first
+/// stack argument; argument 8 = 0); calls `target`, restores rbp and returns to the JIT caller.
+#[cfg(not(target_arch = "aarch64"))]
+fn regs_call_tramp(target: u64) -> Vec<u8> {
+    let mut b = Vec::new();
+    push_reg_block(&mut b);
+    // mov r11, rsp ; mov rbp, r11
+    b.extend_from_slice(&[0x49, 0x89, 0xe3, 0x4c, 0x89, 0xdd]);
+    // push 0 ; push r11 (rsp = 0 mod 16 here: the target sees 8 mod 16 after the call)
+    b.extend_from_slice(&[0x6a, 0x00, 0x41, 0x53]);
+    // mov rax, imm64(target) ; call rax
+    b.extend_from_slice(&[0x48, 0xb8]);
+    b.extend_from_slice(&target.to_le_bytes());
+    b.extend_from_slice(&[0xff, 0xd0]);
+    // add rsp, 16 ; pop rbp ; add rsp, 96 (the rest of the block) ; ret
+    b.extend_from_slice(&[0x48, 0x83, 0xc4, 0x10, 0x5d, 0x48, 0x83, 0xc4, 0x60, 0xc3]);
+    b
+}
+
+/// Pushes the register block of a trampoline entered by `call`: [rbp, return address, rbx,
+/// r12..r15, rdi, rsi, rdx, rcx, r8, r9] from rsp up (13 words; the argument registers: makepad
+/// inspect `locals` of a stop's innermost call).
+#[cfg(not(target_arch = "aarch64"))]
+fn push_reg_block(b: &mut Vec<u8>) {
+    // mov r10, [rsp]
+    b.extend_from_slice(&[0x4c, 0x8b, 0x14, 0x24]);
+    // push r9 ; push r8 ; push rcx ; push rdx ; push rsi ; push rdi
+    b.extend_from_slice(&[0x41, 0x51, 0x41, 0x50, 0x51, 0x52, 0x56, 0x57]);
+    // push r15 ; push r14 ; push r13 ; push r12 ; push rbx ; push r10 ; push rbp
+    b.extend_from_slice(&[0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x41, 0x52, 0x55]);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn regs_call_tramp(target: u64) -> Vec<u8> {
+    x64::regs_call_tramp(target)
+}
+
+impl Unit {
+    /// The address JIT code calls to reach `target` (a returning host fn taking a register
+    /// block as argument 6) through `regs_call_tramp`, made once per unit and target; None when
+    /// this unit makes no code (prebuilt glue only).
+    pub(crate) fn regs_tramp(&self, target: u64) -> Option<u64> {
+        if self.prog.session.options.no_codegen {
+            return None;
+        }
+        static MADE: relax_session::sync::Mutex<Vec<(usize, u64, u64)>> = relax_session::sync::Mutex::new(Vec::new());
+        let me = self as *const Unit as usize;
+        let mut m = MADE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(x) = m.iter().find(|x| x.0 == me && x.1 == target) {
+            return Some(x.2);
+        }
+        let at = self.emit_code(&regs_call_tramp(target));
+        let _k = crate::zone_alloc::kept();
+        m.push((me, target, at));
+        Some(at)
+    }
 }
 
 // ------------------------------------------------------------ the unit
@@ -4353,6 +4430,17 @@ impl Unit {
     /// The slot whose code (current, earlier or retired) holds `pc` (no unit call needed).
     pub fn find_fn(&self, pc: u64) -> Option<u32> {
         self.code.read().unwrap_or_else(|e| e.into_inner()).slot_at(pc)
+    }
+
+    /// The callee-saved registers the prologue of the code body holding `pc` saved below its
+    /// frame pointer ([fp - 8k], k = 1..; rir::unwind_info_words) and the body's start.
+    pub(crate) fn saved_regs_at(&self, pc: u64) -> Option<(u64, Vec<u32>)> {
+        let t = self.code.read().unwrap_or_else(|e| e.into_inner());
+        let (start, _, _) = t.entry_at(pc)?;
+        match t.unwind.get(&start) {
+            Some(i) => Some((start, i.saved.clone())),
+            None => t.image_unwind_at(start).map(|i| (start, i.saved)),
+        }
     }
 
     /// Foreign fns declared in Relax core's `intrinsics*` modules become instructions.
