@@ -68,14 +68,17 @@ const FLT_ARGS: usize = 8;
 /// arm64 isel switches for measurements: `MAKEPAD_RUN_A64=none` or `-fuse,-fconst`.
 const A64_FUSE: u8 = 1;
 const A64_FCONST: u8 = 2;
+/// struct copies of >= 32 bytes through 16-byte vector pairs (off: 8-byte pieces; measurement switch)
+const A64_QCOPY: u8 = 4;
 
 fn isel_flags(options: &relax_session::Options) -> u8 {
-    let mut f = A64_FUSE | A64_FCONST;
+    let mut f = A64_FUSE | A64_FCONST | A64_QCOPY;
     for part in &options.a64 {
         match part.as_str() {
             "none" => f = 0,
             "-fuse" => f &= !A64_FUSE,
             "-fconst" => f &= !A64_FCONST,
+            "-qcopy" => f &= !A64_QCOPY,
             _ => {}
         }
     }
@@ -708,6 +711,7 @@ enum CondBr {
 struct Gen<'a> {
     /// isel_flags(options) & A64_FCONST: float constants by fmov #imm / literal loads
     fconst_isel: bool,
+    qcopy: bool,
     /// the block ends `t = x & K; t ==/!= 0; branch`: emitted as tst x, #K (the And skipped)
     test_fuse: Option<(VReg, i64)>,
     /// a compare whose flags the selects right after it read (csel / fcsel on the condition, no
@@ -3882,7 +3886,7 @@ impl<'a> Gen<'a> {
                 let rs = self.use_i(*src, S1);
                 let size = *size as i64;
                 let mut o = 0i64;
-                if size >= 32 {
+                if size >= 32 && self.qcopy {
                     // 16-byte vector moves through the float scratch (an `ldp`/`stp` pair moves 32
                     // bytes in two instructions): a 160-byte struct move is 10 instructions, not 40
                     let pair = |o: i64| o <= 1008;
@@ -4704,6 +4708,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         next_block: Vec::new(),
         fixups: Vec::new(),
         fconst_isel: isel_flags(options) & A64_FCONST != 0,
+        qcopy: isel_flags(options) & A64_QCOPY != 0,
         fpool: Vec::new(),
         vpool: Vec::new(),
         apool: Vec::new(),
