@@ -11631,6 +11631,10 @@ fn rt_loop_hot(counter: u64, fp: u64) {
         // address into it); a frame that is not JIT code ends the walk before its fp is read
         let mut fp = fp;
         let mut at = id;
+        // callers big enough to be their own build (O1 code > SMALL_CODE) are credited up to
+        // LOOP_BIG_CALLERS of them (the sampler's pc + two callers); small frames between them
+        // (iterator adaptors, wrappers) are inlined anyway and do not count
+        let mut big = 0;
         for _ in 0..LOOP_CALLERS {
             if fp == 0 || fp % 8 != 0 {
                 break;
@@ -11650,6 +11654,12 @@ fn rt_loop_hot(counter: u64, fp: u64) {
                 }
                 if again(c) {
                     queue_loop(u, c, rate);
+                }
+                if (*tier_rec(&u.slots, c).add(5)).load(Ordering::Relaxed) & !REARMED > SMALL_CODE {
+                    big += 1;
+                    if big >= LOOP_BIG_CALLERS {
+                        break;
+                    }
                 }
             }
             at = c;
@@ -11681,6 +11691,9 @@ const LOOP_PER_CALL: u64 = 20;
 /// all entered rarely). The sampler reached the same frames by crediting each sample to the pc's
 /// function and two callers, again as their code tiered up.
 const LOOP_CALLERS: usize = 64;
+/// ... of which at most this many callers with O1 code over SMALL_CODE (event dispatch frames under
+/// a UI's per-frame loops took 1-1.4 s O3 builds each: Stage idle O3 CPU 1.5x the sampler's)
+const LOOP_BIG_CALLERS: usize = 2;
 /// A count stub reaching zero queues its slot only if the TIER1_CALLS calls came within this
 /// window (a rate, not a total): otherwise the count starts again. Counts never decayed: in a
 /// UI everything called once per frame reached 2000 within a minute and O3 never went
@@ -11966,8 +11979,10 @@ pub fn sweep_verdicts() {
                 }
             }
         }
-        // ... and warm ones whose unverified lowering calls hot twins
-        relower.extend(hot_twin_callers(u, Some(&verified), None));
+        // ... and the ones whose unverified lowering calls hot twins
+        let tc = twin_callers(u, Some(&verified), None);
+        relower.extend(tc.o3.iter().copied());
+        relower_twin_callers(up, &tc);
         for id in relower { tier_push(id, Q_RETIER, 0); }
         let released: Vec<(u32, Await)> = {
             let mut a = AWAIT_VERDICT.lock().unwrap_or_else(|e| e.into_inner());
@@ -12022,25 +12037,60 @@ fn short_name(n: &str) -> &str {
     match n.rmatch_indices("::").nth(1) { Some((i, _)) => &n[i + 2..], None => n }
 }
 
-/// SPEC-V: the slots among `cands` (None: every slot) that are verified, built at O3, and still run
-/// an unverified lowering whose calls go to `twin` (None: to any twin built at O3). Built again
-/// (retier), they are lowered as verified code, so the hot chain under them reaches the slots
-/// themselves: noalias, inlining, cache entries. Unit read. (O3 code is the evidence: a slot that
-/// merely turned hot once -- a loader, a lukewarm UI fn -- is not rebuilt for its twins.)
-fn hot_twin_callers(u: &Unit, cands: Option<&[u32]>, twin: Option<u32>) -> Vec<u32> {
-    let warm = |c: u32| u.fns[c as usize].o3.load(Ordering::Relaxed);
+/// SPEC-V: the slots among `cands` (None: every slot) whose current lowering calls `twin` (None:
+/// any twin built at O3), by what brings them to the base slots: `o3` verified and built at O3
+/// (retier: lowered again as verified code, so the hot chain under them reaches the slots
+/// themselves: noalias, inlining, cache entries, PGO counts); `below` verified, below O3 (an O2
+/// build lowers them again: a per-frame caller that never reaches O3 otherwise called the twin for
+/// the whole session, and twins get no counted build); `unverified` (their verdicts go first in
+/// the checker's queue). Unit read. (A slot that merely turned hot once -- a loader, a lukewarm UI
+/// fn -- is not rebuilt at O3 for its twins.)
+#[derive(Default)]
+struct TwinCallers { o3: Vec<u32>, below: Vec<u32>, unverified: Vec<u32> }
+
+fn twin_callers(u: &Unit, cands: Option<&[u32]>, twin: Option<u32>) -> TwinCallers {
     let hot = |t: u32| matches!(u.fns[t as usize].key, FnKey::Plain(_)) && match twin {
         Some(w) => t == w,
-        None => warm(t),
+        None => u.fns[t as usize].o3.load(Ordering::Relaxed),
     };
-    let calls_hot = |c: u32| {
+    let mut out = TwinCallers::default();
+    let mut look = |c: u32| {
         let f = &u.fns[c as usize];
-        warm(c) && f.compiled && !f.unverified.load(Ordering::Relaxed) && !matches!(f.key, FnKey::Plain(_) | FnKey::Sandbox(_))
-            && f.rir.as_ref().is_some_and(|r| r.plain_calls && r.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(t), _, _) if hot(*t)))))
+        if !f.compiled || matches!(f.key, FnKey::Plain(_) | FnKey::Sandbox(_) | FnKey::Glue(..) | FnKey::Shim(_)) {
+            return;
+        }
+        let calls = f.rir.as_ref().is_some_and(|r| r.plain_calls && r.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(t), _, _) if hot(*t)))));
+        if !calls {
+            return;
+        }
+        if f.unverified.load(Ordering::Relaxed) {
+            out.unverified.push(c);
+        } else if f.o3.load(Ordering::Relaxed) {
+            out.o3.push(c);
+        } else {
+            out.below.push(c);
+        }
     };
     match cands {
-        Some(c) => c.iter().copied().filter(|&c| calls_hot(c)).collect(),
-        None => (0..u.fns.len() as u32).filter(|&c| calls_hot(c)).collect(),
+        Some(c) => c.iter().copied().for_each(&mut look),
+        None => (0..u.fns.len() as u32).for_each(&mut look),
+    }
+    out
+}
+
+/// SPEC-V: brings twin callers below O3 to the base slots (twin_callers; the O3 ones are the
+/// caller's to retier): an O2 build lowers them again; unverified ones have their owners' verdicts
+/// checked first.
+unsafe fn relower_twin_callers(up: *mut Unit, tc: &TwinCallers) {
+    for &c in &tc.below {
+        O2_SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).remove(&(up as usize, c));
+        o2_base(up, c);
+    }
+    let u = &*up;
+    if !tc.unverified.is_empty() {
+        let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
+        let ranks: Vec<(DefId, Vec<TyId>, u32)> = tc.unverified.iter().filter_map(|&c| Some((u.verdict_owner(c)?, Vec::new(), 0))).collect();
+        crate::borrowck::lazy::set_ranks(std::sync::Arc::as_ptr(&u.front) as usize, epoch, &ranks);
     }
 }
 
@@ -14153,9 +14203,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     if specv_trace() {
                         eprintln!("specv @{:.3} twin O3 #{} {}: callers {}", wall_ns() as f64 / 1e9, id, short_name(&u.fns[id as usize].name), twin_caller_census(u, id));
                     }
-                    for c in hot_twin_callers(u, None, Some(id)) {
+                    let tc = twin_callers(u, None, Some(id));
+                    for &c in &tc.o3 {
                         u.retier(c);
                     }
+                    relower_twin_callers(up, &tc);
                 }
                 u.stats.code_bytes += code.len() as u64;
                 u.stats.tier1_code_bytes += code.len() as u64;
