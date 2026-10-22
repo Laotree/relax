@@ -219,27 +219,41 @@ fn pick_lanes(p: &Profile, sel: Option<&str>) -> Result<Vec<usize>, String> {
     }
 }
 
+/// What a lane did in [t0, t1) of a critical path's running step: self time by span, and the
+/// time no span covers (on the main lane: idle, waiting for the next event or frame tick; on
+/// another lane: work without a marker).
+fn run_parts(p: &Profile, lane: usize, t0: u64, t1: u64) -> Vec<(String, u64)> {
+    let main = p.main_lane() == Some(lane);
+    let mut v: Vec<(String, u64)> = p.exclusive(lane, t0, t1).into_iter().filter(|x| !x.1).map(|(n, _, ns)| (p.s(n).to_string(), ns)).collect();
+    let covered: u64 = p.lanes[lane].segs_in(0, t0, t1).iter().filter(|s| !s.wait).map(|s| s.t1.min(t1).saturating_sub(s.t0.max(t0))).sum();
+    let gap = (t1 - t0).saturating_sub(covered);
+    if gap > 0 {
+        v.push((if main { "idle".to_string() } else { "unmarked work".to_string() }, gap));
+    }
+    if !main {
+        let ln = p.lane_name(lane);
+        for x in v.iter_mut() {
+            x.0 = format!("{} on {}", x.0, ln);
+        }
+    }
+    v
+}
+
 /// What a frame's time went to, in one phrase: the largest critical-path pieces.
 fn cause(p: &Profile, f: &Frame) -> String {
     let Some(main) = p.main_lane() else { return String::new() };
     let mut by: Vec<(String, u64)> = Vec::new();
     for st in p.critical_path(main, f.t0, f.t1) {
-        let what = match (st.wait, st.ended_by) {
-            (Some(w), Some(by)) => format!("wait {} (until {})", p.s(w.name), p.lane_name(by)),
-            (Some(w), None) => format!("wait {}", p.s(w.name)),
-            (None, _) => {
-                let mid = st.t0 + (st.t1 - st.t0) / 2;
-                let nm = p.innermost(st.lane, mid).map_or("unmarked", |s| p.s(s.name)).to_string();
-                if st.lane == main {
-                    nm
-                } else {
-                    format!("{} on {}", nm, p.lane_name(st.lane))
-                }
-            }
+        let parts = match (st.wait, st.ended_by) {
+            (Some(w), Some(by)) => vec![(format!("wait {} (until {})", p.s(w.name), p.lane_name(by)), st.t1 - st.t0)],
+            (Some(w), None) => vec![(format!("wait {}", p.s(w.name)), st.t1 - st.t0)],
+            (None, _) => run_parts(p, st.lane, st.t0, st.t1),
         };
-        match by.iter_mut().find(|x| x.0 == what) {
-            Some(x) => x.1 += st.t1 - st.t0,
-            None => by.push((what, st.t1 - st.t0)),
+        for (what, ns) in parts {
+            match by.iter_mut().find(|x| x.0 == what) {
+                Some(x) => x.1 += ns,
+                None => by.push((what, ns)),
+            }
         }
     }
     by.sort_by(|a, b| b.1.cmp(&a.1));
@@ -403,14 +417,26 @@ fn frame(p: &Profile, w: &str) -> Ans {
     let cp = p.critical_path(main, f.t0, f.t1);
     let mut steps: Vec<(usize, String, u64)> = Vec::new();
     for st in &cp {
-        let what = match (st.wait, st.ended_by) {
-            (Some(s), Some(by)) => format!("wait {} → ended by T{}", p.s(s.name), p.lanes[by].thread.tid),
-            (Some(s), None) => format!("wait {}", p.s(s.name)),
-            (None, _) => p.innermost(st.lane, st.t0 + (st.t1 - st.t0) / 2).map_or("unmarked".to_string(), |s| p.s(s.name).to_string()),
+        let parts = match (st.wait, st.ended_by) {
+            (Some(s), Some(by)) => vec![(format!("wait {} → ended by T{}", p.s(s.name), p.lanes[by].thread.tid), st.t1 - st.t0)],
+            (Some(s), None) => vec![(format!("wait {}", p.s(s.name)), st.t1 - st.t0)],
+            // the lane's own time on the path: its largest part names the step
+            (None, _) => {
+                let mut v = run_parts(p, st.lane, st.t0, st.t1);
+                v.sort_by(|a, b| b.1.cmp(&a.1));
+                let ln = format!(" on {}", p.lane_name(st.lane));
+                let mut name = v.first().map_or("idle".to_string(), |x| x.0.trim_end_matches(ln.as_str()).to_string());
+                if v.len() > 1 {
+                    name.push_str(&format!(" (+{} more)", v.len() - 1));
+                }
+                vec![(name, st.t1 - st.t0)]
+            }
         };
-        match steps.last_mut() {
-            Some(l) if l.0 == st.lane && l.1 == what => l.2 += st.t1 - st.t0,
-            _ => steps.push((st.lane, what, st.t1 - st.t0)),
+        for (what, ns) in parts {
+            match steps.last_mut() {
+                Some(l) if l.0 == st.lane && l.1 == what => l.2 += ns,
+                _ => steps.push((st.lane, what, ns)),
+            }
         }
     }
     let mut t = Table::new(&["#", "lane", "ms", "critical path step"]);
@@ -667,19 +693,26 @@ fn why_slow(p: &Profile, q: &Q) -> Ans {
                     e.2 = f.id;
                 }
                 None => {
-                    let nm = p.innermost(st.lane, st.t0 + (st.t1 - st.t0) / 2).map_or("unmarked", |s| p.s(s.name)).to_string();
-                    let key = if st.lane == main { nm } else { format!("{} on {}", nm, p.lane_name(st.lane)) };
-                    *runs.entry(key).or_default() += st.t1 - st.t0;
+                    for (key, ns) in run_parts(p, st.lane, st.t0, st.t1) {
+                        *runs.entry(key).or_default() += ns;
+                    }
                 }
             }
         }
     }
     let mut lg = Legend::default();
     for (w, (ns, k, last)) in &waits {
-        findings.push((*ns, format!("{} blocks the main lane: {} ms over {} frames", lg.name(w), ms(*ns), k), format!("F{last}")));
+        findings.push((*ns, format!("{} blocks the main lane: {} ms over {} frames", lg.name(w), ms(*ns), k), format!("frame F{last}")));
     }
     let mut rv: Vec<(String, u64)> = runs.into_iter().collect();
     rv.sort_by(|a, b| b.1.cmp(&a.1));
+    // the main lane idle inside frames is latency (waiting for the next event or frame tick),
+    // not work: a finding of its own, ranked below work
+    let idle = rv.iter().find(|x| x.0 == "idle").map_or(0, |x| x.1);
+    rv.retain(|x| x.0 != "idle");
+    if idle > 0 {
+        findings.push((idle / 4, format!("the main lane sat idle {} ms inside frames (between an event and the frame's draw: latency, not work)", ms(idle)), "frames".into()));
+    }
     for (w, ns) in rv.iter().take(3) {
         let look = if q.pos.get(1).is_some() { format!("top cpu lane=all range={name}") } else { "top cpu lane=all".to_string() };
         findings.push((*ns, format!("{} on the critical path: {} ms ({} ms per frame)", lg.name(w), ms(*ns), ms(*ns / frames.len().max(1) as u64)), look));

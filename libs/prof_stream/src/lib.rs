@@ -409,3 +409,36 @@ pub fn mono_ns() -> u64 {
         T0.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
     }
 }
+
+/// Re-frames a `gpuprof` service message (`.mkgp` bytes: on the first message the "MKGP" prelude,
+/// then chunks `tag u8 | len varint | payload`) as profile stream records (GPU_HEADER /
+/// GPU_STRINGS / GPU_FRAMES), so a viewer applies them like the rest and a recording holds CPU,
+/// JIT and GPU in one file. Unknown chunks are skipped; a chunk cut at the message end is dropped.
+pub fn gpu_records(msg: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut d = Dec::new(msg);
+    if msg.len() >= 4 && &msg[..4] == b"MKGP" {
+        d.i = 4;
+        // version, anchor mono ns, anchor unix ms
+        for _ in 0..3 {
+            if d.u().is_err() {
+                return out;
+            }
+        }
+    }
+    while d.i < msg.len() {
+        let tag = msg[d.i];
+        d.i += 1;
+        let Ok(len) = d.u() else { break };
+        let Some(payload) = msg.get(d.i..d.i + len as usize) else { break };
+        d.i += len as usize;
+        let k = match tag {
+            1 => kind::GPU_HEADER,
+            2 => kind::GPU_STRINGS,
+            3 => kind::GPU_FRAMES,
+            _ => continue,
+        };
+        record(&mut out, k, payload);
+    }
+    out
+}

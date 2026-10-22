@@ -256,7 +256,11 @@ impl Profile {
                     self.jit.push(e);
                 }
             }
-            kind::GPU_HEADER => self.gpu.ingest(makepad_gpu_trace::chunk_tag::HEADER, payload)?,
+            kind::GPU_HEADER => {
+                // a header starts a new GPU recording: its string table restarts at 0
+                self.gpu = makepad_gpu_trace::Recording::default();
+                self.gpu.ingest(makepad_gpu_trace::chunk_tag::HEADER, payload)?
+            }
             kind::GPU_STRINGS => self.gpu.ingest(makepad_gpu_trace::chunk_tag::STRINGS, payload)?,
             kind::GPU_FRAMES => {
                 let from = self.gpu.frames.len();
@@ -342,22 +346,25 @@ impl Profile {
         Ok(())
     }
 
-    /// relax inspect's frame rule: a frame ends when its Draw dispatch ends; Draw dispatches less
-    /// than 1 ms apart (one per window or pass) close one frame; the frame runs from the previous
-    /// frame's end (the first: from its first root span).
+    /// A frame ends when its Draw dispatch ends; Draw dispatches less than 1 ms apart (one per
+    /// window or pass) close one frame. It starts at the first work of the main lane after the
+    /// previous frame (an event-driven app idles between frames: that idle time is no frame's).
     fn frame_from_draw(&mut self, li: usize, s: Seg) {
-        if let Some(last) = self.frames.last_mut() {
-            if s.t0 < last.t1 + 1_000_000 {
+        let prev_end = match self.frames.last_mut() {
+            Some(last) if s.t0 < last.t1 + 1_000_000 => {
                 last.t1 = last.t1.max(s.t1);
                 return;
             }
-            let id = last.id + 1;
-            let t0 = last.t1;
-            self.frames.push(Frame { id, t0, t1: s.t1, ..Default::default() });
-            return;
-        }
-        let first = self.lanes[li].rows.first().and_then(|r| r.first()).map_or(s.t0, |r| r.t0.min(s.t0));
-        self.frames.push(Frame { id: 0, t0: first, t1: s.t1, ..Default::default() });
+            Some(last) => last.t1,
+            None => 0,
+        };
+        let id = self.frames.last().map_or(0, |f| f.id + 1);
+        // the main lane's first root span (or open root) that starts after the previous frame
+        let lane = &self.lanes[li];
+        let first_root = lane.rows.first().and_then(|r| r.get(r.partition_point(|x| x.t0 < prev_end))).map(|x| x.t0);
+        let open_root = lane.stack.first().map(|o| o.0).filter(|t| *t >= prev_end);
+        let t0 = [Some(s.t0), first_root, open_root].into_iter().flatten().filter(|t| *t <= s.t0).min().unwrap_or(s.t0);
+        self.frames.push(Frame { id, t0, t1: s.t1, ..Default::default() });
     }
 
     // ------------------------------------------------------------------ lookups
