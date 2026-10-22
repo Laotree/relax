@@ -69,12 +69,16 @@ pub(crate) fn unpack_str(w: u64) -> &'static str {
     unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p as *const u8, n)) }
 }
 
-/// Records of an ordinary thread's ring, and of the main and owner threads' (the lanes a hitch
-/// is read from: about 8 MB each).
-const RING_SMALL: usize = 1 << 14;
-const RING_BIG: usize = 1 << 18;
+/// Ring sizes (records of 32 bytes): every thread starts small; one that wraps its ring within
+/// GROW_NS gets a medium one; the main and owner threads get a big one (the lanes a hitch is
+/// read from: 8 MB each, minutes of frames).
+const RING_LEN: [usize; 3] = [1 << 11, 1 << 14, 1 << 18];
+const GROW_NS: u64 = 60_000_000_000;
 /// ring memory at most (a thread past it records nothing; threads that exit give their ring back)
-const RINGS_MAX_BYTES: usize = 96 << 20;
+pub(super) const RINGS_MAX_BYTES: usize = 48 << 20;
+/// a span shorter than this with nothing recorded inside it is dropped at its end (most of a
+/// frame's widget draws: the rings keep minutes instead of seconds); 0: keep all
+static ELIDE_NS: AtomicU64 = AtomicU64::new(100_000);
 
 pub(super) struct Ring {
     recs: Box<[UnsafeCell<Rec>]>,
@@ -85,7 +89,11 @@ pub(super) struct Ring {
     /// the threads that wrote it: (first record, os id, handle); a ring is reused by the next
     /// thread when one exits
     occ: Mutex<Vec<(u64, u64, u64)>>,
-    big: bool,
+    tier: u8,
+    /// when it last wrapped (or was taken): a ring that wraps faster than GROW_NS grows
+    wrap_t: AtomicU64,
+    /// short spans dropped (ELIDE_NS)
+    pub(super) elided: AtomicU64,
 }
 
 // written by its own thread only; readers check `head` before and after reading a slot
@@ -113,7 +121,7 @@ pub(super) static NO_RING: AtomicU64 = AtomicU64::new(0);
 /// the threads that recorded: (os id, handle, name), for lanes of threads gone
 static NAMES: Mutex<Vec<(u64, u64, String)>> = Mutex::new(Vec::new());
 
-struct Mine(Cell<*const Ring>);
+struct Mine(Cell<*const Ring>, Cell<bool>);
 
 impl Drop for Mine {
     // the thread exits: its ring (and its records) goes to the next thread
@@ -128,7 +136,8 @@ impl Drop for Mine {
 }
 
 thread_local! {
-    static MY: Mine = const { Mine(Cell::new(std::ptr::null())) };
+    /// this thread's ring, and whether it should grow
+    static MY: Mine = const { Mine(Cell::new(std::ptr::null()), Cell::new(false)) };
 }
 
 fn wants_big(handle: u64) -> bool {
@@ -136,23 +145,25 @@ fn wants_big(handle: u64) -> bool {
 }
 
 fn ring() -> Option<&'static Ring> {
-    let p = MY.try_with(|m| m.0.get()).ok()?;
+    let (p, grow) = MY.try_with(|m| (m.0.get(), m.1.get())).ok()?;
     if !p.is_null() {
         let r: &'static Ring = unsafe { &*p };
         // the main thread / owner recorded before they were known as such: a big ring now
-        if r.big || !wants_big(r.handle.load(Relaxed)) {
+        if !grow && (r.tier == 2 || !wants_big(r.handle.load(Relaxed))) {
             return Some(r);
         }
+        let want = if wants_big(r.handle.load(Relaxed)) { 2 } else { r.tier + 1 };
+        let _ = MY.try_with(|m| m.1.set(false));
+        return claim(p, want.min(2));
     }
-    claim(p)
+    claim(p, if wants_big(crate::waits::me()) { 2 } else { 0 })
 }
 
 #[cold]
-fn claim(old: *const Ring) -> Option<&'static Ring> {
+fn claim(old: *const Ring, tier: u8) -> Option<&'static Ring> {
     let _k = crate::zone_alloc::kept();
     let os_id = super::threads::self_os_id();
     let handle = crate::waits::me();
-    let big = wants_big(handle);
     let name = crate::os::thread::name(crate::os::thread::current());
     {
         let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
@@ -163,11 +174,13 @@ fn claim(old: *const Ring) -> Option<&'static Ring> {
     }
     let reused = {
         let mut free = FREE.lock().unwrap_or_else(|e| e.into_inner());
-        free.iter().position(|r| r.big == big).map(|i| free.swap_remove(i))
+        free.iter().position(|r| r.tier == tier).map(|i| free.swap_remove(i))
     };
+    let now = crate::clock::wall_ns();
     let r: &'static Ring = match reused {
         Some(r) => {
             r.handle.store(handle, Relaxed);
+            r.wrap_t.store(now, Relaxed);
             let mut occ = r.occ.lock().unwrap_or_else(|e| e.into_inner());
             let at = r.head.load(Relaxed);
             // occupants whose records were all overwritten are forgotten
@@ -180,25 +193,31 @@ fn claim(old: *const Ring) -> Option<&'static Ring> {
             r
         }
         None => {
-            let n = if big { RING_BIG } else { RING_SMALL };
+            let n = RING_LEN[tier as usize];
             let bytes = n * std::mem::size_of::<Rec>();
             if RING_BYTES.fetch_add(bytes, Relaxed) + bytes > RINGS_MAX_BYTES {
                 RING_BYTES.fetch_sub(bytes, Relaxed);
                 NO_RING.fetch_add(1, Relaxed);
-                return (!old.is_null()).then(|| unsafe { &*old });
+                // a thread that wanted a bigger ring keeps the one it has
+                if !old.is_null() {
+                    return Some(unsafe { &*old });
+                }
+                return None;
             }
             let r: &'static Ring = Box::leak(Box::new(Ring {
                 recs: (0..n).map(|_| UnsafeCell::new(Rec { tk: 0, label: 0, a: 0, b: 0 })).collect(),
                 head: AtomicU64::new(0),
                 handle: AtomicU64::new(handle),
                 occ: Mutex::new(vec![(0, os_id, handle)]),
-                big,
+                tier,
+                wrap_t: AtomicU64::new(now),
+                elided: AtomicU64::new(0),
             }));
             RINGS.lock().unwrap_or_else(|e| e.into_inner()).push(r);
             r
         }
     };
-    // a small ring the thread outgrew keeps its records (read by os id) and goes to the next thread
+    // a ring the thread outgrew keeps its records (read by os id) and goes to the next thread
     if !old.is_null() {
         FREE.lock().unwrap_or_else(|e| e.into_inner()).push(unsafe { &*old });
     }
@@ -211,7 +230,34 @@ fn claim(old: *const Ring) -> Option<&'static Ring> {
 #[inline]
 pub fn push(kind: u8, label: &'static str, a: u64, b: u64) {
     let Some(r) = ring() else { return };
-    r.write(Rec { tk: crate::clock::wall_ns() | ((kind as u64) << 60), label: pack_str(label), a, b });
+    let t = crate::clock::wall_ns();
+    let n = r.head.load(Relaxed);
+    let mask = r.len() - 1;
+    // a short span with nothing inside it: its begin (the last record) is taken back
+    if kind == 2 && n > 0 {
+        let last = unsafe { *r.recs[(n as usize - 1) & mask].get() };
+        if last.kind() == 1 && last.label == pack_str(label) && t.saturating_sub(last.t()) < ELIDE_NS.load(Relaxed) && !viewing() {
+            r.head.store(n - 1, Release);
+            r.elided.store(r.elided.load(Relaxed) + 1, Relaxed);
+            return;
+        }
+    }
+    r.write(Rec { tk: t | ((kind as u64) << 60), label: pack_str(label), a, b });
+    // a ring that wraps within GROW_NS grows (once per tier)
+    if (n as usize + 1) & mask == 0 && r.tier == 0 {
+        if t.saturating_sub(r.wrap_t.swap(t, Relaxed)) < GROW_NS {
+            let _ = MY.try_with(|m| m.1.set(true));
+        }
+    }
+}
+
+/// MAKEPAD_RUN_FLIGHTREC_ELIDE_US: the short-span threshold (0: keep every span).
+pub(super) fn set_elide_us(us: u64) {
+    ELIDE_NS.store(us * 1000, Relaxed);
+}
+
+pub(super) fn elide_us() -> u64 {
+    ELIDE_NS.load(Relaxed) / 1000
 }
 
 /// Every ring: (ring, head now).

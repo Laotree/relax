@@ -54,6 +54,9 @@ pub fn init() {
     if let Some(ms) = std::env::var("MAKEPAD_RUN_FLIGHTREC_DUMP_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
         DUMP_MS.store(ms, Relaxed);
     }
+    if let Some(us) = std::env::var("MAKEPAD_RUN_FLIGHTREC_ELIDE_US").ok().and_then(|v| v.parse::<u64>().ok()) {
+        super::pstream::set_elide_us(us);
+    }
     let _k = crate::zone_alloc::kept();
     let args: Vec<String> = std::env::args().collect();
     let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
@@ -210,7 +213,7 @@ fn events() -> &'static Slots<Ev> {
     EVENTS.get_or_init(|| crate::zone_alloc::kept_with(|| Slots::new(1 << 14)))
 }
 fn inputs() -> &'static Slots<In> {
-    INPUTS.get_or_init(|| crate::zone_alloc::kept_with(|| Slots::new(1 << 17)))
+    INPUTS.get_or_init(|| crate::zone_alloc::kept_with(|| Slots::new(1 << 16)))
 }
 fn jits() -> &'static Slots<Jit> {
     JITS.get_or_init(|| crate::zone_alloc::kept_with(|| Slots::new(1 << 16)))
@@ -888,13 +891,25 @@ fn status(out: &mut super::Out) {
     for (n, s, c) in &reach {
         out.line(&format!("| {} | {:.0} | {} |", n, s, c));
     }
-    out.line(&format!("| events | | {} |", fill(events().fill())));
-    out.line(&format!("| input | | {} |", fill(inputs().fill())));
-    out.line(&format!("| JIT installs | | {} |", fill(jits().fill())));
-    out.line(&format!("| frames | | {} |", fill(frames().fill())));
+    // how far back a fixed ring reaches: its oldest entry kept
+    fn oldest<T: Copy>(s: &Slots<T>, t: impl Fn(&T) -> u64) -> u64 {
+        let mut o = u64::MAX;
+        let (head, len) = s.fill();
+        let _ = s.read(head.saturating_sub(len), &mut |_, x| o = o.min(t(&x)));
+        o
+    }
+    let back = |o: u64| if o == u64::MAX { String::new() } else { format!("{:.0}", now.saturating_sub(o) as f64 / 1e9) };
+    out.line(&format!("| events | {} | {} |", back(oldest(events(), |e| e.t)), fill(events().fill())));
+    out.line(&format!("| input | {} | {} |", back(oldest(inputs(), |e| e.t)), fill(inputs().fill())));
+    out.line(&format!("| JIT installs | {} | {} |", back(oldest(jits(), |e| e.t)), fill(jits().fill())));
+    out.line(&format!("| frames | {} | {} |", back(oldest(frames(), |e| e.t0)), fill(frames().fill())));
+    let elided: u64 = super::pstream::rings().iter().map(|r| r.elided.load(Relaxed)).sum();
+    if elided > 0 {
+        out.line(&format!("note: {} spans under {} µs with nothing inside were not kept (MAKEPAD_RUN_FLIGHTREC_ELIDE_US)", elided, super::pstream::elide_us()));
+    }
     let no_ring = super::pstream::NO_RING.load(Relaxed);
     if no_ring > 0 {
-        out.line(&format!("note: {} threads found no ring (the {} MB cap)", no_ring, 96));
+        out.line(&format!("note: {} threads found no ring (the {} MB cap)", no_ring, super::pstream::RINGS_MAX_BYTES >> 20));
     }
     out.line(&format!("note: automatic recordings on a hitch over {} ms, a panic and a fatal fault go to {}", DUMP_MS.load(Relaxed), folder().display()));
     for d in DUMPS.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().take(5) {
