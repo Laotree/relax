@@ -728,6 +728,8 @@ struct Gen<'a> {
     zero_vec: Vec<bool>,
     /// vregs defined once, by an f32 load (a register holding one has its upper 96 bits zero)
     f32_load: Vec<bool>,
+    /// single-def +0.0 constants read only by float compares: never built (fcmp #0.0)
+    zero_cmp: Vec<bool>,
     /// the last spill store emitted: (sp offset, register, word position right after it)
     last_spill: Option<(i64, u8, usize)>,
     /// spill windows (Alloc::windows): vreg -> (first use pos, last use pos, register); and the
@@ -3301,7 +3303,7 @@ impl<'a> Gen<'a> {
     /// #0.0`, no `fmov d31, xzr`). Returns the condition on the flags (swapped with the operands:
     /// a < b == b > a, also for unordered operands).
     fn fcmp_v(&mut self, c: Cond, f64_: bool, a: VReg, b: VReg) -> Cond {
-        let zero = |g: &Self, v: VReg| g.al.loc[v.0 as usize] == Loc::None && matches!(g.al.remat[v.0 as usize], Remat::FConst(0, _));
+        let zero = |g: &Self, v: VReg| g.zero_cmp[v.0 as usize] || (g.al.loc[v.0 as usize] == Loc::None && matches!(g.al.remat[v.0 as usize], Remat::FConst(0, _)));
         let (x, c) = if zero(self, b) {
             (a, c)
         } else if zero(self, a) {
@@ -3318,7 +3320,13 @@ impl<'a> Gen<'a> {
             self.a.fcmp(f64_, xa, xb);
             return c;
         };
-        let xx = self.use_f(x, FS0);
+        let xx = if self.zero_cmp[x.0 as usize] {
+            // both sides the unbuilt +0.0
+            self.fconst_into(FS0, 0, f64_);
+            FS0
+        } else {
+            self.use_f(x, FS0)
+        };
         self.a.e(0x1E20_2008 | if f64_ { DBL } else { 0 } | (xx as u32) << 5);
         c
     }
@@ -3600,6 +3608,8 @@ impl<'a> Gen<'a> {
                 self.a.mov_imm(r, *v);
                 self.fin_i(*d, r);
             }
+            // a +0.0 only compares read: they use the zero form (fcmp_v)
+            Inst::Fconst(d, ..) if self.zero_cmp[d.0 as usize] => {}
             Inst::Fconst(d, bits, f64_) => {
                 let x = self.def_f(*d, FS0);
                 self.fconst_into(x, *bits, *f64_);
@@ -4444,9 +4454,96 @@ fn fold_fma_negs(f: &Func) -> Option<Func> {
     Some(g)
 }
 
+/// Every FCmp operand that is a single-def +0.0 (Fconst 0) defined elsewhere reads a fresh copy of
+/// the constant defined right before the compare instead; the emitter builds none of them
+/// (`fcmp s, #0.0`, Gen::zero_cmp).
+fn split_zero_compares(f: &Func) -> Option<Func> {
+    let n = f.vregs.len();
+    let mut ndef = vec![0u32; n];
+    let mut fz: Vec<Option<bool>> = vec![None; n];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut any = false;
+    for b in &f.blocks {
+        for i in &b.insts {
+            i.defs(|d| ndef[d.0 as usize] += 1);
+            if let Inst::Fconst(d, 0, w) = *i {
+                fz[d.0 as usize] = Some(w);
+            }
+            any |= matches!(i, Inst::FCmp(..));
+        }
+    }
+    let zero = |v: VReg| if ndef[v.0 as usize] == 1 { fz[v.0 as usize] } else { None };
+    if !any {
+        return None;
+    }
+    let mut g = f.clone();
+    let mut changed = false;
+    for bi in 0..g.blocks.len() {
+        let mut k = 0;
+        while k < g.blocks[bi].insts.len() {
+            if let Inst::FCmp(c, w, d, a, b) = g.blocks[bi].insts[k] {
+                let prev_def = |v: VReg, blk: &Block| k > 0 && matches!(blk.insts[k - 1], Inst::Fconst(t, 0, _) if t == v);
+                let mut ins = Vec::new();
+                let (mut a2, mut b2) = (a, b);
+                for (op, slot) in [(a, 0), (b, 1)] {
+                    if zero(op) == Some(w) && !prev_def(op, &g.blocks[bi]) && a != b {
+                        let t = g.vreg(if w { Cls::F64 } else { Cls::F32 });
+                        ins.push(Inst::Fconst(t, 0, w));
+                        if slot == 0 {
+                            a2 = t;
+                        } else {
+                            b2 = t;
+                        }
+                    }
+                }
+                if !ins.is_empty() {
+                    let m = ins.len();
+                    let pos = g.blocks[bi].pos[k];
+                    g.blocks[bi].insts[k] = Inst::FCmp(c, w, d, a2, b2);
+                    g.blocks[bi].insts.splice(k..k, ins);
+                    g.blocks[bi].pos.splice(k..k, std::iter::repeat(pos).take(m));
+                    k += m;
+                    changed = true;
+                }
+            }
+            k += 1;
+        }
+    }
+    changed.then_some(g)
+}
+
 /// Per vreg: defined exactly once, as an all-zero vector (VConst 0, or FromLo64 of a vreg defined
 /// once as the constant 0)
 /// (and, per vreg, defined once by an f32 load)
+fn zero_compare_consts(f: &Func) -> Vec<bool> {
+    let n = f.vregs.len();
+    let mut ndef = vec![0u32; n];
+    let mut z = vec![false; n];
+    let mut other = vec![false; n];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            i.defs(|d| ndef[d.0 as usize] += 1);
+            if let Inst::Fconst(d, 0, _) = *i {
+                z[d.0 as usize] = true;
+            }
+            if !matches!(i, Inst::FCmp(..)) {
+                regalloc::for_uses(i, |u| other[u.0 as usize] = true);
+            }
+        }
+        let mut t = Vec::new();
+        regalloc::term_uses(&b.term, &mut t);
+        for u in t {
+            other[u.0 as usize] = true;
+        }
+    }
+    (0..n).map(|v| z[v] && ndef[v] == 1 && !other[v]).collect()
+}
+
 fn zero_vectors(f: &Func) -> (Vec<bool>, Vec<bool>) {
     let n = f.vregs.len();
     let mut defs = vec![0u32; n];
@@ -4679,6 +4776,10 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // negations read only by a fused multiply-add: its sign flags (fmsub / fnmadd / fnmsub)
     let nf = fold_fma_negs(f);
     let f = nf.as_ref().unwrap_or(f);
+    // compares with a shared +0.0: each its own adjacent constant (fcmp #0.0; the shared zero
+    // no longer holds a register over the function)
+    let zc = split_zero_compares(f);
+    let f = zc.as_ref().unwrap_or(f);
     // f32 splats read only by multiplies: the by-element forms (fmla / fmls / fmul v, v, v.s[0])
     let lanes = fold_lane_splats(f);
     let f = lanes.as_ref().unwrap_or(f);
@@ -4729,6 +4830,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         fnmul_ins: None,
         zero_vec: Vec::new(),
         f32_load: Vec::new(),
+        zero_cmp: Vec::new(),
         jt_fix: Vec::new(),
         last_spill: None,
         win: {
@@ -4785,6 +4887,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     };
     g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
     (g.zero_vec, g.f32_load) = zero_vectors(g.f);
+    g.zero_cmp = zero_compare_consts(g.f);
     if env.opt_regs || g.f.full {
         g.copy_reg = regalloc::copy_reuse(options, g.f, &g.al);
     }
