@@ -4318,6 +4318,7 @@ impl<'a> Gen<'a> {
     }
 }
 
+/// FCmp of negations (or of a negation and +0.0): the compare of the negated values, mirrored.
 /// `FMulAdd(.., a, b, c)` whose a or c is a negation `-x` used only there: the negation folds into
 /// the multiply-add's flags (product / addend negated), x read instead. Exact: the fused forms negate
 /// the operand (FPNeg) before the one rounding, as the separate fneg did (NaN signs included).
@@ -4326,6 +4327,7 @@ fn fold_fma_negs(f: &Func) -> Option<Func> {
     let mut ndef = vec![0u32; n];
     let mut uses = vec![0u32; n];
     let mut neg: Vec<Option<(VReg, bool)>> = vec![None; n];
+    let mut fzero = vec![false; n];
     let mut any = false;
     for p in &f.params {
         ndef[p.0 as usize] += 1;
@@ -4337,7 +4339,10 @@ fn fold_fma_negs(f: &Func) -> Option<Func> {
             if let Inst::FUnary(FUn::Neg, w, d, x) = *i {
                 neg[d.0 as usize] = Some((x, w));
             }
-            any |= matches!(i, Inst::FMulAdd(..));
+            any |= matches!(i, Inst::FMulAdd(..) | Inst::FCmp(..));
+            if let Inst::Fconst(d, 0, _) = *i {
+                fzero[d.0 as usize] = true;
+            }
         }
         let mut t = Vec::new();
         regalloc::term_uses(&b.term, &mut t);
@@ -4354,8 +4359,37 @@ fn fold_fma_negs(f: &Func) -> Option<Func> {
     };
     let mut g = f.clone();
     let mut dead = vec![false; n];
+    let zero = |v: VReg| fzero[v.0 as usize] && ndef[v.0 as usize] == 1;
     for b in &mut g.blocks {
         for i in &mut b.insts {
+            // -x c -y == x c' y and -x c 0 == x c' 0 (c' mirrored: -x < y == x > -y; unordered
+            // stays unordered; -0 == +0)
+            if let Inst::FCmp(c, w, _, a, bb) = i {
+                let (na, nb) = (of(*a, *w), of(*bb, *w));
+                let fold = match (na, nb) {
+                    (Some(x), Some(y)) => Some((x, y)),
+                    (Some(x), None) if zero(*bb) => Some((x, *bb)),
+                    (None, Some(y)) if zero(*a) => Some((*a, y)),
+                    _ => None,
+                };
+                if let Some((x, y)) = fold {
+                    if na.is_some() {
+                        dead[a.0 as usize] = true;
+                    }
+                    if nb.is_some() {
+                        dead[bb.0 as usize] = true;
+                    }
+                    *a = x;
+                    *bb = y;
+                    *c = match *c {
+                        Cond::Lt => Cond::Gt,
+                        Cond::Le => Cond::Ge,
+                        Cond::Gt => Cond::Lt,
+                        Cond::Ge => Cond::Le,
+                        c => c,
+                    };
+                }
+            }
             if let Inst::FMulAdd(np, na, w, _, a, _, c) = i {
                 if let Some(x) = of(*c, *w) {
                     dead[c.0 as usize] = true;
