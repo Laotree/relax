@@ -33,7 +33,6 @@ pub(super) struct ElfFn {
     pub addr: u64,
     pub size: u64,
     pub name: String,
-    pub sect: usize,
 }
 
 pub(super) struct Elf {
@@ -136,7 +135,7 @@ pub(super) fn parse_elf(b: &[u8]) -> Option<Elf> {
             }
             let value = u64_at(b, o + 8)?;
             if let Some(name) = cstr(b, stroff + u32_at(b, o)? as usize) {
-                fns.push(ElfFn { addr: value, size: sz, name: name.to_string(), sect: shndx });
+                fns.push(ElfFn { addr: value, size: sz, name: name.to_string() });
             }
         }
     }

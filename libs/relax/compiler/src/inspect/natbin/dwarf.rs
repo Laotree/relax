@@ -833,7 +833,7 @@ impl Dbg {
         let mut files: Vec<(String, usize)> = Vec::new();
         if ver >= 5 {
             // entry formats: (content type, form)
-            let mut table = |r: &mut Rd| -> Option<Vec<(String, usize)>> {
+            let table = |r: &mut Rd| -> Option<Vec<(String, usize)>> {
                 let nf = r.u8()? as usize;
                 let mut fmt = Vec::new();
                 for _ in 0..nf {
