@@ -145,7 +145,7 @@ pub fn cmd_remarks(req: &Req, out: &mut Out) {
             _ => super::instrument::find_all(u, &q, 8).into_iter().map(|x| x.0).collect(),
         };
         if ids.is_empty() {
-            return Err(format!("no fn matches `{}`; try: asm top", q));
+            return Err(format!("no fn matches `{}`{}; try: asm top", q, super::instrument::closest(u, &q)));
         }
         let mut rows = Vec::new();
         for id in ids {

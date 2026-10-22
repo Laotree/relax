@@ -8,7 +8,9 @@ use makepad_prof_stream::answer::{self, Request};
 fn renders(line: &str) -> bool {
     let req = makepad_remote::Req::parse(line);
     let c = req.cmd.as_str();
-    matches!(c, "frames" | "frame" | "top" | "path" | "hang" | "panics" | "resume" | "rm" | "continue" | "pause")
+    // (`src`, `vm`, `verbs`, `script`: the Splash VM's host commands, makepad_script::inspect_query;
+    // `game`: the Sandbox's app query)
+    matches!(c, "frames" | "frame" | "top" | "path" | "hang" | "panics" | "resume" | "rm" | "continue" | "pause" | "src" | "vm" | "verbs" | "script" | "game")
         || super::COMMANDS.iter().chain(makepad_gpu_trace::query::COMMANDS).any(|x| x.0 == c)
 }
 
