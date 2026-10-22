@@ -3148,12 +3148,12 @@ impl Unit {
 
     /// A `#[thread_local]` static's per-thread storage (Reference items/static-items: each thread
     /// has its own copy, initialised to the static's value, never dropped). Its initializer runs
-    /// as any static's does: the result is the image every thread starts from. An all-zero image
-    /// of a small type goes in the executable's static TLS (os::tls::static_tls: a fixed offset
-    /// from the thread pointer, `Inst::TlsStatic`, as rustc's local-exec model), where the
-    /// platform has one; otherwise in the thread-local block (`Inst::TlsAddr`, zeroed per thread),
-    /// a non-zero image copied in on the thread's first access behind a flag byte. None: the
-    /// initializer failed (reported as its own error).
+    /// as any static's does: the result is the image every thread starts from. It goes in the
+    /// executable's static TLS (os::tls::static_tls: a fixed offset from the thread pointer,
+    /// `Inst::TlsStatic`, as rustc's local-exec model) where the platform has one and it fits,
+    /// otherwise in the thread-local block (`Inst::TlsAddr`); both start as zeros on every
+    /// thread, so a non-zero image is copied in on the thread's first access behind a flag
+    /// byte. None: the initializer failed (reported as its own error).
     pub fn thread_local_place(&mut self, d: DefId) -> Option<TlsPlace> {
         if let Some(p) = self.tls_places.get(&d) {
             return Some(*p);
@@ -3166,12 +3166,13 @@ impl Unit {
         let l = self.layout_of(t);
         let (size, align) = (l.size.max(1) as u32, l.align.max(1) as u32);
         let zero = unsafe { std::slice::from_raw_parts(image as *const u8, size as usize) }.iter().all(|b| *b == 0);
-        let fixed = if zero && self.static_tls_ok() { os::tls::static_tls_alloc(size, align) } else { None };
-        let (value, init) = match fixed {
-            Some(off) => (off as u32 as u64, None),
-            None if zero => (self.tls_alloc(size, align) as u64, None),
-            // the flag byte right after the value
-            None => (self.tls_alloc(size + 1, align) as u64, Some(size)),
+        // a non-zero image: the flag byte right after the value
+        let bytes = if zero { size } else { size + 1 };
+        let init = (!zero).then_some(size);
+        let fixed = if self.static_tls_ok() { os::tls::static_tls_alloc(bytes, align) } else { None };
+        let value = match fixed {
+            Some(off) => off as u32 as u64,
+            None => self.tls_alloc(bytes, align) as u64,
         };
         let place = TlsPlace { sym: self.syms.intern(crate::syms::SymKind::ThreadLocal(d), value), fixed: fixed.is_some(), init };
         crate::zone_alloc::kept_with(|| self.tls_places.insert(d, place));
