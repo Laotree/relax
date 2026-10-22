@@ -7833,6 +7833,13 @@ pub unsafe fn settle_drop(up: *mut Unit) -> SettleDrops {
     let queue = TIER_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     let active = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     let mut pinned: std::collections::HashSet<u32> = queue.iter().map(|x| x.0).chain(active.iter().copied()).collect();
+    // code the sampler saw lately (HEAT, decaying) keeps its RIR, its callees too (below): it is what
+    // tiers up next -- O3, retier, its callers' inline snapshots. Dropped, every O3 build of the
+    // running set rebuilt that RIR on the owner (lane SETTLE: Sandbox's O3 tail, the owner 38% in
+    // settle_drop and its rebuilds while the workers waited)
+    if let Some(h) = HEAT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        pinned.extend(h.keys().copied().filter(|&id| (id as usize) < u.fns.len()));
+    }
     // aot: the slots whose callees are speculated after the burst keep their RIR until then
     pinned.extend(AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|x| x.0 == up as usize).map(|x| x.1));
     // Queued jobs have not enumerated their inline snapshots yet. Their known RIR
