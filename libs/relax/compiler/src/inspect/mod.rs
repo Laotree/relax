@@ -20,6 +20,7 @@ pub mod counters;
 pub mod eval;
 pub mod events;
 pub mod experiments;
+pub mod flightrec;
 pub mod gpuprof;
 mod hang;
 pub mod heap;
@@ -113,6 +114,7 @@ pub fn start(app: &str) {
     eprintln!("makepad-remote: pid {} app {} socket {} (makepad inspect {} help)", pid, app, sock.display(), pid);
     events::start();
     timeline::hitch_init();
+    flightrec::init();
     if AGENT.load(Relaxed) {
         timeline::set_frame_watch(true);
     }
@@ -126,6 +128,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("why-slow", "[s=3]", "where the time goes: ranked findings -- the main thread's CPU split (program / compiles / makepad run runtime / system), its hot fns, the owner's service, other busy threads"),
     ("prof", "[s=3] [hz=200] [threads=all|main|owner|program|compiler|<name>] [ev=cpu|cycles|instructions|branch-misses|cache-misses] [view=top|tree|callers|flame] [focus=<fn>] [fn=<fn>] [min=1] [n=15] [save=1]", "sampling profile of JIT and host frames: per-thread CPU, activity split, top fns by self time with their hottest line, inclusive fns; view=tree: the call tree with the JIT's inline levels as frames and each frame's tier (focus= re-roots at a fn, view=callers fn= inverts); save=1 / view=flame writes folded stacks; ev= samples a hardware event (Linux)"),
     ("pf", "<summary|frames|frame F<n>|top cpu|jit|gpu|hitches|timeline F<n>|lanes|why-slow|diff> [s=3] [save=x.mkpf] [base=y.mkpf]", "the profiler for agents: the client records the app's live `prof` stream (lanes, phases, waits, compile jobs, JIT installs with tiers, GPU passes) for s seconds and answers as compact text: finding first, tables, drill-down ids; file=<x.mkpf> pf ... answers on a recording"),
+    ("rec", "[status] | save [last=60s|5m|all] [path=<file>] | mark <text> | on | off | replay (file=<x.mkpf>: client side)", "the flight recorder (always on, bounded memory): the last minutes of frames, every thread's spans and waits, the owner's requests with requester and call site, JIT installs, events (app marks, logs, panics, script errors, hitches, zone swaps), input; save = a .mkpf recording for `pf` queries and Scope; automatic recordings on a hitch over 1 s, a panic, a fatal fault"),
     ("timeline", "start [max_s=30] | stop | frames [n=30] | frame <n|slowest> | waits [s=3] [n=15] | save", "dataflow timeline: record UI phases, owner service, waits and wakes; per frame the critical path, work vs critical path vs wall, longest waits and who ended them; waits = contention by what was waited on; save = a .mkpf profile recording (Scope, `pf` queries)"),
     ("watch", "[on=panic,hang,...] [since=<seq>] [timeout_s=N]", "block until the next event (panic, hang, ...) and answer it as one JSON line; re-arm with since=<seq>"),
     ("events", "[follow=1] [since=<seq>] [on=...]", "the recent events (follow=1: stream one JSON line per new event)"),
@@ -199,6 +202,7 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "prof" => prof::cmd_prof(req, out),
         "timeline" => timeline::cmd_timeline(req, out),
         "hitch" => timeline::cmd_hitch(req, out),
+        "rec" => flightrec::cmd(req, out),
         // question-shaped aliases (DESIGN.md §2.1)
         "frame" => timeline::cmd_timeline(&shifted(req, "frame"), out),
         "frames" => timeline::cmd_timeline(&shifted(req, "frames"), out),

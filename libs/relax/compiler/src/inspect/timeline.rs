@@ -214,6 +214,14 @@ struct FrameLog {
     compiles: u32,
     /// probe / count values at the frame's start (only while probes are installed)
     probes0: Vec<(String, u64, u64)>,
+    /// the frame's waits (outermost): open depth, the open one's start and whether it is on the
+    /// owner, their time (of it on the owner) and count (the flight recorder's frame summary)
+    wait_depth: u32,
+    wait_t0: u64,
+    wait_owner: bool,
+    wait_ns: u64,
+    owner_ns: u64,
+    waits: u32,
 }
 
 thread_local! {
@@ -240,7 +248,7 @@ fn frame_watch(begin: bool, name: &'static str) {
     let done = FL.try_with(|c| {
         let Ok(mut g) = c.try_borrow_mut() else { return None };
         let l = g.get_or_insert_with(|| {
-            Box::new(FrameLog { depth: 0, start: 0, avg: 0, last_root_end: 0, idle: 0, recs: Vec::with_capacity(FRAME_RECS), dropped: 0, compile_depth: 0, compile_t0: 0, compile_ns: 0, compiles: 0, probes0: Vec::new() })
+            Box::new(FrameLog { depth: 0, start: 0, avg: 0, last_root_end: 0, idle: 0, recs: Vec::with_capacity(FRAME_RECS), dropped: 0, compile_depth: 0, compile_t0: 0, compile_ns: 0, compiles: 0, probes0: Vec::new(), wait_depth: 0, wait_t0: 0, wait_owner: false, wait_ns: 0, owner_ns: 0, waits: 0 })
         });
         if begin {
             if l.start == 0 {
@@ -251,6 +259,13 @@ fn frame_watch(begin: bool, name: &'static str) {
                 l.compile_ns = 0;
                 l.compiles = 0;
                 l.probes0.clear();
+                l.wait_ns = 0;
+                l.owner_ns = 0;
+                l.waits = 0;
+                if l.wait_depth > 0 {
+                    l.wait_t0 = now;
+                }
+                super::flightrec::frame_begin(now);
                 if HITCH_NS.load(Relaxed) > 0 && super::instrument::any_counters() {
                     l.probes0 = super::instrument::counters();
                 }
@@ -273,6 +288,9 @@ fn frame_watch(begin: bool, name: &'static str) {
         }
         FRAMES.fetch_add(1, Relaxed);
         let ms = now.saturating_sub(l.start).saturating_sub(l.idle);
+        // a wait still open at the frame's end counts up to it
+        let (open_w, open_o) = if l.wait_depth > 0 { let w = now.saturating_sub(l.wait_t0.max(l.start)); (w, if l.wait_owner { w } else { 0 }) } else { (0, 0) };
+        super::flightrec::frame(l.start, now, l.idle, l.compile_ns, l.compiles, l.wait_ns + open_w, l.owner_ns + open_o, l.waits);
         let avg = l.avg;
         l.avg = if avg == 0 { ms } else { (avg * 15 + ms) / 16 };
         let start = l.start;
@@ -290,6 +308,9 @@ fn frame_watch(begin: bool, name: &'static str) {
         Some((spike, ms, avg, analysis))
     });
     let Ok(Some((spike, ms, avg, analysis))) = done else { return };
+    if analysis.is_some() {
+        super::flightrec::hitch(ms, avg);
+    }
     if spike {
         super::events::emit(
             "spike",
@@ -542,6 +563,24 @@ fn wait_trace(begin: bool, kind: &'static str, detail: &'static str, object: u64
                 if l.start != 0 {
                     frame_rec(l, if begin { 3 } else { 4 }, kind, detail);
                 }
+                // the frame summary's waits (outermost only)
+                if begin {
+                    if l.wait_depth == 0 {
+                        l.wait_t0 = crate::clock::wall_ns();
+                        l.wait_owner = kind == "owner";
+                    }
+                    l.wait_depth += 1;
+                } else if l.wait_depth > 0 {
+                    l.wait_depth -= 1;
+                    if l.wait_depth == 0 && l.start != 0 {
+                        let w = crate::clock::wall_ns().saturating_sub(l.wait_t0.max(l.start));
+                        l.wait_ns += w;
+                        if l.wait_owner {
+                            l.owner_ns += w;
+                        }
+                        l.waits += 1;
+                    }
+                }
             }
         });
     }
@@ -604,7 +643,7 @@ pub extern "C" fn relax_gpu_span(name: *const u8, len: usize, begin: u64, end: u
         return;
     }
     let name = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name, len)) };
-    if super::pstream::on() {
+    if super::pstream::viewing() {
         super::pstream::gpu_span(name, begin, end);
     }
     if !RINGS_ON.load(Relaxed) {
@@ -1155,7 +1194,7 @@ fn save_cmd(out: &mut Out) {
     let gpu_sid = strings.id("GPU");
     let mut file = ps::prelude().to_vec();
     let app = super::APP.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let hello = ps::Hello { app, host: String::new(), pid: std::process::id() as u64, build: crate::jit::PROVENANCE.to_string(), device: String::new(), refresh_mhz: 0, flags: 1 };
+    let hello = ps::Hello { app, host: String::new(), pid: std::process::id() as u64, build: crate::jit::PROVENANCE.to_string(), device: String::new(), refresh_mhz: 0, flags: 1, start_mono: (ps::mono_ns() as i128 - crate::clock::wall_ns() as i128).max(0) as u64 };
     ps::record(&mut file, ps::kind::HELLO, &hello.payload());
     let unix_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     ps::record(&mut file, ps::kind::CLOCK, &ps::clock_payload(ps::mono_ns(), unix_now));

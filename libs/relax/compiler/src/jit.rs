@@ -1440,6 +1440,7 @@ unsafe fn fatal_report(f: &os::fault::Fault) -> ! {
     let frames = collect_frames(f.fp, f.pc, false);
     let kind = if is_stack_fault(f.addr, f.sp) { "stack overflow" } else { "fault" };
     let info = PanicInfo { kind: kind.to_string(), message: format!("{} at {:#x}", f.label(), f.addr), site: u64::MAX, frames, fault_addr: f.addr, location: String::new() };
+    crate::inspect::flightrec::fault_dump(&format!("{} {}", kind, info.message));
     let r = owner::call(owner::Class::Job, || (&*UNIT).report(&info));
     eprintln!("makepad: fault on a thread without a recovery point, aborting\n  report: {}", r);
     std::process::abort()
@@ -2267,6 +2268,18 @@ pub(crate) fn in_jit_code(pc: u64) -> bool {
     unsafe { !UNIT.is_null() && pc >= (*UNIT).exec_base && pc - (*UNIT).exec_base < (*UNIT).exec_size }
 }
 
+/// The name of slot `id` (None: no unit or no such slot; the flight recorder, no lock: names are
+/// kept data of an append-only table).
+pub(crate) fn slot_name(id: u32) -> Option<String> {
+    unsafe {
+        if UNIT.is_null() {
+            return None;
+        }
+        let u = &*UNIT;
+        ((id as usize) < u.fns.len()).then(|| u.fns[id as usize].name.to_string())
+    }
+}
+
 /// The name of the function whose code holds `pc` ("-" when none; diagnostics, no lock).
 pub(crate) fn fn_name_at(pc: u64) -> String {
     unsafe {
@@ -2397,6 +2410,7 @@ unsafe fn on_fault_locked(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os:
     let pinfo = PanicInfo { kind: kind.to_string(), message: format!("{} at {:#x}", label, fault), site: u64::MAX, frames, fault_addr: fault, location: String::new() };
     if fault_policy(&label, &pinfo) {
         // the default action: the instruction faults again and the process ends by the signal
+        crate::inspect::flightrec::fault_dump(&format!("{} {}", kind, pinfo.message));
         return Action::Die;
     }
     PANIC.with(|p| *p.borrow_mut() = Some(pinfo));
@@ -3051,7 +3065,8 @@ impl Unit {
     pub(crate) fn index_code(&mut self, at: u64, len: u32, id: u32, unwind: Option<relax_backend::rir::UnwindInfo>) {
         let kind = code_as_now().unwrap_or_else(|| self.default_code_kind(id));
         self.code.write().unwrap_or_else(|e| e.into_inner()).add(at, len, id, unwind, kind);
-        if crate::inspect::pstream::on() {
+        crate::inspect::flightrec::jit_install(id, len, kind.tier, kind.origin);
+        if crate::inspect::pstream::viewing() {
             let src = crate::inspect::codever::fn_lines(self, id).and_then(|(f, lo, _)| self.prog.file_paths.get(f as usize).map(|p| format!("{}:{}", p, lo))).unwrap_or_default();
             crate::inspect::pstream::jit_install(&self.fns[id as usize].name, src, id, len, kind.tier, kind.origin);
         }
@@ -15425,6 +15440,9 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"relax_register_inspect" => Some(crate::inspect::relax_register_inspect as *const () as usize),
         b"relax_register_remote_service" => Some(crate::inspect::relax_register_remote_service as *const () as usize),
         b"relax_gpu_span" => Some(crate::inspect::timeline::relax_gpu_span as *const () as usize),
+        b"relax_flight_mark" => Some(crate::inspect::flightrec::relax_flight_mark as *const () as usize),
+        b"relax_flight_input" => Some(crate::inspect::flightrec::relax_flight_input as *const () as usize),
+        b"relax_flight_on" => Some(crate::inspect::flightrec::relax_flight_on as *const () as usize),
         b"relax_span_begin" => Some(crate::inspect::timeline::relax_span_begin as *const () as usize),
         b"relax_span_end" => Some(crate::inspect::timeline::relax_span_end as *const () as usize),
         b"__relax_wake" => Some(crate::inspect::timeline::relax_wake as *const () as usize),

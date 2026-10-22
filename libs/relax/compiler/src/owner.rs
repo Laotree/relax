@@ -712,7 +712,7 @@ fn serve(r: usize) {
     // makepad inspect's timeline: the owner's service of this request is a span
     let traced = crate::inspect::timeline::recording();
     if traced {
-        crate::inspect::timeline::push(crate::inspect::timeline::Kind::SpanBegin, SERVE_NAMES[req.class as usize], req.from, 0);
+        crate::inspect::timeline::push(crate::inspect::timeline::Kind::SpanBegin, SERVE_NAMES[req.class as usize], req.from, crate::inspect::pstream::SITE | (req.site as *const std::panic::Location<'static> as u64));
     }
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if !req.quick {
