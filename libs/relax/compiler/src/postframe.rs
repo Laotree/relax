@@ -132,6 +132,13 @@ pub fn ahead_progress() -> (u64, u64) {
     (AHEAD_DONE.load(Relaxed), crate::jit::ahead_queued() + AHEAD_RUNNING.load(Relaxed))
 }
 
+/// The O3 tier's settling (the run's settling indicator): builds queued or running now, and O3
+/// installs so far (a monotonic count; the indicator's percentage is installs since it showed over
+/// those plus the pending ones).
+pub fn settle_progress() -> (u64, u64) {
+    crate::jit::o3_settle_state()
+}
+
 /// The app is ready after its first present (false before it): the UI thread has not waited on the JIT for
 /// `quiet_ns` and nothing is left to build ahead.
 pub fn ready(quiet_ns: u64) -> bool {

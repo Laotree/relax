@@ -10958,6 +10958,13 @@ fn profile_write() {
 /// for a benchmark that times only once the optimised code has settled: `pending` = builds queued or
 /// running, plus one while the startup phase holds the workers; `installs` = O3 installs so far.
 /// The file exists from the first write on; a program that never reads it pays nothing.
+/// The O3 state for the settling indicator (postframe::settle_progress): builds queued or
+/// running now, and O3 installs so far.
+pub(crate) fn o3_settle_state() -> (u64, u64) {
+    let pending = TIER_QUEUE.lock().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len());
+    (pending as u64, TIER1_INSTALLS.load(Ordering::Relaxed))
+}
+
 fn o3_progress_write(last: &mut std::time::Instant) {
     static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let Some(path) = PATH.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_O3_PROGRESS").ok().filter(|s| !s.is_empty()))) else { return };
@@ -11733,10 +11740,11 @@ static TIER_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::n
 static TIER_THREAD: std::sync::Once = std::sync::Once::new();
 
 /// The level's O3 workers (`o3_threads`) always run. A level with `o3_burst` also starts burst workers
-/// (up to the machine's cores less two, at most O3_BURST_MAX): after the first present, while the queue
-/// is long, burst worker j builds only while more than O3_BURST_PER * (j + 1) builds wait, so a cold
-/// app's backlog (thousands of builds) drains on many cores and a warm app's (~150) on a few; once it
-/// drains they sleep on the queue (no polling: 0% CPU) and the lean policy is back. They run at the
+/// (user, 10-22: every performance core but one, the program's main thread's): after the first present,
+/// while the queue is not trivial, burst worker j builds only while more than O3_BURST_PER * (j + 1)
+/// builds wait (hottest first, tier_pop), so a cold app's backlog (thousands of builds) drains on every
+/// performance core and a short queue on a few; once it drains they sleep on the queue (no polling:
+/// 0% CPU) and the lean policy is back. They run at the
 /// same priority as the other workers (below the program's threads, performance cores) and, like
 /// every worker past the first, only while the program's threads have no lazy compile in flight.
 /// MAKEPAD_RUN_O3_BURST=0 (A/B) keeps the level's workers only; MAKEPAD_RUN_O3_THREADS a fixed pool.
@@ -11751,7 +11759,7 @@ fn spawn_tier1_threads(runtime: &crate::options::RuntimeOptions, options: &crate
         (n, n)
     } else {
         let n = 3.min(cap).min(ahead_policy().o3_threads);
-        let burst = if runtime.tier1_burst && ahead_policy().o3_burst { cores.saturating_sub(2).min(O3_BURST_MAX) } else { 0 };
+        let burst = if runtime.tier1_burst && ahead_policy().o3_burst { os::thread::performance_cores().saturating_sub(1).min(cap) } else { 0 };
         (n, burst.max(n))
     };
     for k in 0..max {
@@ -11762,10 +11770,8 @@ fn spawn_tier1_threads(runtime: &crate::options::RuntimeOptions, options: &crate
     }
 }
 
-/// O3 workers at most in a burst (spawn_tier1_threads)
-const O3_BURST_MAX: usize = 12;
 /// queued builds per burst worker (spawn_tier1_threads)
-const O3_BURST_PER: usize = 32;
+const O3_BURST_PER: usize = 8;
 
 /// Burst worker `j` (0 = the first past the level's workers) may build now: the program has
 /// presented its first frame and more than O3_BURST_PER * (j + 1) builds wait.

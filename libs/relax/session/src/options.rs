@@ -834,7 +834,7 @@ pub struct RuntimeOptions {
     /// `MAKEPAD_RUN_BURST_ARENA`; default `true`.
     pub burst_arena: bool,
     /// `MAKEPAD_RUN_O3_BURST` (`0`: off, for A/Bs); default `true`: after the first present, while the O3
-    /// queue is long, more O3 workers run (up to the machine's cores less two) until it drains.
+    /// queue is not trivial, more O3 workers run (every performance core but one) until it drains.
     pub tier1_burst: bool,
     /// `MAKEPAD_RUN_MODULE_FUEL`; default `4_000_000_000`.
     pub module_fuel: i64,
