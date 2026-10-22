@@ -14,14 +14,15 @@ fn push(f: &mut Func, i: Inst) {
     f.blocks[0].pos.push(0);
 }
 
-/// f(a, b) = (narrow(a < b ? -1 : (a == b) ^ 1)) cc k; narrow 0 none, 1 `& 255`, 2 i8 conversion
+/// f(a, b) = (narrow(a < b ? -1 : (a == b) ^ 1)) cc k; narrow 0 none, 1 `& 255`, 2 i8 conversion,
+/// 3 i8 conversion then `& 255` (`Option<Ordering>` read as a byte)
 fn build(cc: Cond, signed: bool, k: i64, narrow: u8) -> Func {
     let mut f = Func::new("ord_fold".into(), 0);
     let (a, b) = (f.vreg(Cls::I), f.vreg(Cls::I));
     f.params = vec![a, b];
     f.rets = vec![Cls::I];
     f.block();
-    let [lt, eq, ne, m1, ord, x, d] = [(); 7].map(|_| f.vreg(Cls::I));
+    let [lt, eq, ne, m1, ord, x, d, x8] = [(); 8].map(|_| f.vreg(Cls::I));
     push(&mut f, Inst::ICmp(Cond::Lt, false, lt, a, b));
     push(&mut f, Inst::ICmp(Cond::Eq, false, eq, a, b));
     push(&mut f, Inst::IBinI(IOp::Xor, U64, ne, eq, 1));
@@ -36,6 +37,11 @@ fn build(cc: Cond, signed: bool, k: i64, narrow: u8) -> Func {
             push(&mut f, Inst::Conv(Conv::IntToInt(IntTy { bits: 8, signed: true }), x, ord));
             x
         }
+        3 => {
+            push(&mut f, Inst::Conv(Conv::IntToInt(IntTy { bits: 8, signed: true }), x8, ord));
+            push(&mut f, Inst::IBinI(IOp::And, U64, x, x8, 255));
+            x
+        }
         _ => ord,
     };
     push(&mut f, Inst::ICmpI(cc, signed, d, x, k));
@@ -47,7 +53,7 @@ fn build(cc: Cond, signed: bool, k: i64, narrow: u8) -> Func {
 fn want(cc: Cond, signed: bool, k: i64, narrow: u8, a: u64, b: u64) -> u64 {
     let ord: i64 = if a < b { -1 } else { (a != b) as i64 };
     let x = match narrow {
-        1 => ord & 255,
+        1 | 3 => ord & 255,
         2 => ord as i8 as i64,
         _ => ord,
     };
@@ -82,9 +88,9 @@ fn sels_left(f: &Func) -> usize {
 #[test]
 fn ordering_niche_test_is_a_constant() {
     let options = relax_session::Options::default();
-    for narrow in [1u8, 2] {
+    for narrow in [1u8, 2, 3] {
         // (ord as u8) != 254: no outcome is 254
-        let mut f = build(Cond::Ne, false, if narrow == 1 { 254 } else { -2 }, narrow);
+        let mut f = build(Cond::Ne, false, if narrow == 2 { -2 } else { 254 }, narrow);
         passes::simplify(&options, &mut f, None, true, true);
         let ret = match &f.blocks[0].term {
             Term::Ret(v) => v[0],
@@ -98,10 +104,10 @@ fn ordering_niche_test_is_a_constant() {
 #[test]
 fn ordering_compares_fold_into_outcomes() {
     let options = relax_session::Options::default();
-    for narrow in 0..3u8 {
+    for narrow in 0..4u8 {
         for cc in [Cond::Eq, Cond::Ne] {
             for k in [-1i64, 0, 1] {
-                let k = if narrow == 1 { k & 255 } else { k };
+                let k = if narrow == 1 || narrow == 3 { k & 255 } else { k };
                 let mut f = build(cc, false, k, narrow);
                 passes::simplify(&options, &mut f, None, true, true);
                 // the Ordering's select is gone: at most the outcome select on `a < b`
@@ -119,7 +125,7 @@ fn folded_ordering_compares_compute_the_same() {
     type Entry = extern "sysv64" fn(u64, u64) -> u64;
     let options = relax_session::Options::default();
     let vals = [0u64, 1, 2, 7, u64::MAX];
-    for narrow in 0..3u8 {
+    for narrow in 0..4u8 {
         for cc in CONDS {
             for signed in [false, true] {
                 for k in [-2i64, -1, 0, 1, 2, 254, 255] {

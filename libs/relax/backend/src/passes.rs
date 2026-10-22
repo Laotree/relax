@@ -1079,6 +1079,8 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
         let mut cmp_def: Vec<Option<(Cond, bool, VReg, i64, bool)>> = vec![None; nv];
         // single-def selects of single-def operands: (cond, a, b)
         let mut sel_def: Vec<Option<(VReg, VReg, VReg)>> = vec![None; nv];
+        // `d = a ^ 1` (single defs): a compare outcome's negation, seen through by the select-tree fold
+        let mut xor1_def: Vec<Option<VReg>> = vec![None; nv];
         // IntToInt definitions also retain their source location: RIR operands can be
         // reassigned between the inner conversion and its use.
         let mut conv_def: Vec<Option<(IntTy, VReg, usize, usize)>> = vec![None; if ic { nv } else { 0 }];
@@ -1160,6 +1162,7 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                     Inst::ICmpI(c, sg, d, a, k) if single(*d, &ndef) && single(*a, &ndef) => cmp_def[d.0 as usize] = Some((*c, *sg, *a, *k, true)),
                     Inst::ICmp(c, sg, d, a, b2) if single(*d, &ndef) && single(*a, &ndef) && single(*b2, &ndef) => cmp_def[d.0 as usize] = Some((*c, *sg, *a, b2.0 as i64, false)),
                     Inst::Sel(d, c, a, b2) if single(*d, &ndef) && single(*c, &ndef) && single(*a, &ndef) && single(*b2, &ndef) => sel_def[d.0 as usize] = Some((*c, *a, *b2)),
+                    Inst::IBinI(IOp::Xor, _, d, a, 1) if single(*d, &ndef) && single(*a, &ndef) => xor1_def[d.0 as usize] = Some(*a),
                     _ => {}
                 }
             }
@@ -1527,6 +1530,12 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                             }
                         }
                     }
+                    // `(y ^ 1) ^ 1`: y
+                    if let Inst::IBinI(IOp::Xor, _, d, x, 1) = new {
+                        if let Some(y) = xor1_def[x.0 as usize] {
+                            new = Inst::Mov(d, y);
+                        }
+                    }
                     // a compare result (0 / 1) masked with 1
                     if let Inst::IBinI(IOp::And, _, d, x, 1) = new {
                         if cmp_def[x.0 as usize].is_some() {
@@ -1551,22 +1560,41 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                     if let (Inst::ICmpI(cc, sg, d, x, k), false) = (&new, opt_off(options, "-selfold")) {
                         let (cc, sg, d, x, k) = (*cc, *sg, *d, *x, *k);
                         let low_mask = |m: i64| m > 0 && (m as u64 + 1).is_power_of_two();
-                        let (root, narrow) = match (conv_def.get(x.0 as usize).copied().flatten(), bin_def.get(x.0 as usize).copied().flatten()) {
-                            (Some((t, y, _, _)), _) if t.bits < 64 && single(x, &ndef) => (y, Some(t)),
-                            (_, Some((IOp::And, _, y, m, _, _))) if low_mask(m) && single(x, &ndef) => (y, Some(IntTy { bits: (64 - (m as u64).leading_zeros()) as u8, signed: false })),
-                            _ => (x, None),
-                        };
+                        // the narrowing steps between the select and the compare (innermost last):
+                        // conversions below 64 bits and low masks (`ord as i8 as u8`)
+                        let mut narrow: Vec<IntTy> = Vec::new();
+                        let mut root = x;
+                        while narrow.len() < 4 && single(root, &ndef) {
+                            match (conv_def.get(root.0 as usize).copied().flatten(), bin_def.get(root.0 as usize).copied().flatten()) {
+                                (Some((t, y, _, _)), _) if t.bits < 64 => {
+                                    narrow.push(t);
+                                    root = y;
+                                }
+                                (_, Some((IOp::And, _, y, m, _, _))) if low_mask(m) => {
+                                    narrow.push(IntTy { bits: (64 - (m as u64).leading_zeros()) as u8, signed: false });
+                                    root = y;
+                                }
+                                _ => break,
+                            }
+                        }
                         // a leaf's outcome: Ok(0 / 1) a constant, Err((v, negated)) the 0 / 1 value v
                         // (a compare result) or its negation
-                        let cmp_k = |kv: i64| cmp_i(cc, sg, narrow.map_or(kv, |t| crate::bitops::ext(kv, t)), k) as i64;
+                        let cmp_k = |kv: i64| cmp_i(cc, sg, narrow.iter().rev().fold(kv, |v, t| crate::bitops::ext(v, *t)), k) as i64;
                         let leaf = |v: VReg| -> Option<Result<i64, (VReg, bool)>> {
                             match kn[v.0 as usize] {
                                 Some(K::I(kv)) => Some(Ok(cmp_k(kv))),
-                                _ if zw[v.0 as usize] == 1 && single(v, &ndef) => match (cmp_k(0), cmp_k(1)) {
-                                    (o0, o1) if o0 == o1 => Some(Ok(o0)),
-                                    (0, _) => Some(Err((v, false))),
-                                    _ => Some(Err((v, true))),
-                                },
+                                _ if zw[v.0 as usize] == 1 && single(v, &ndef) => {
+                                    // `y ^ 1` of an outcome y: y, negated
+                                    let (v, neg) = match xor1_def[v.0 as usize] {
+                                        Some(y) if zw[y.0 as usize] == 1 => (y, true),
+                                        _ => (v, false),
+                                    };
+                                    match (cmp_k(0), cmp_k(1)) {
+                                        (o0, o1) if o0 == o1 => Some(Ok(o0)),
+                                        (0, _) => Some(Err((v, neg))),
+                                        _ => Some(Err((v, !neg))),
+                                    }
+                                }
                                 _ => None,
                             }
                         };
