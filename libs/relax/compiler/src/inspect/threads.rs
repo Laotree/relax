@@ -613,8 +613,16 @@ mod imp {
 
     /// A paused thread's pc, frame pointer and callee-saved integer registers (x86_64: rbx,
     /// r12..r15 as the panic trampoline's block holds them: indices 2..6).
+    /// A thread blocked in a syscall (a pause never signals one: its stack stands still while
+    /// it blocks) gives its syscall's pc and the first frame record above its sp, no registers.
     pub fn regs_now(t: &Thread) -> Option<(u64, u64, Vec<(usize, u64)>)> {
-        let slot = held(t.os_id)?;
+        let Some(slot) = held(t.os_id) else {
+            let (_, _, sp, pc) = read_syscall(t.os_id)?;
+            #[cfg(target_arch = "x86_64")]
+            return find_record(sp, &read).map(|fp| (pc, fp, Vec::new()));
+            #[cfg(not(target_arch = "x86_64"))]
+            return super::arm64_walk::find_record(sp, &super::arm64_walk::code_ranges(), &read).map(|fp| (pc, fp, Vec::new()));
+        };
         let r = |k: usize| slot.regs[k].load(Relaxed);
         #[cfg(target_arch = "x86_64")]
         return Some((r(0), r(2), (3..8).map(|k| (k - 1, r(k))).collect()));
