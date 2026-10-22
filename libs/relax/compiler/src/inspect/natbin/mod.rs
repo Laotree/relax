@@ -541,9 +541,15 @@ fn main() {
     #[test]
     fn corpus_agreement() {
         let Ok(path) = std::env::var("NATBIN_CORPUS") else { return };
+        let t0 = std::time::Instant::now();
         let nb = NativeBin::open(&path).unwrap();
-        eprintln!("corpus: {} fns, debug from {}", nb.fns.len(), nb.debug_from);
-        let (mut total, mut same, mut fns_done) = (0usize, 0usize, 0usize);
+        eprintln!("corpus: {} fns, debug from {}, open {:?}", nb.fns.len(), nb.debug_from, t0.elapsed());
+        if let Some(f) = nb.fns.iter().find(|f| f.size > 64) {
+            let t1 = std::time::Instant::now();
+            let n = nb.lines(f.addr, f.addr + f.size).len();
+            eprintln!("corpus: first lines() {} rows in {:?} (includes the unit index), second {:?}", n, t1.elapsed(), { let t2 = std::time::Instant::now(); nb.lines(f.addr, f.addr + f.size); t2.elapsed() });
+        }
+        let (mut total, mut same, mut fns_done, mut zero) = (0usize, 0usize, 0usize, 0usize);
         let step = (nb.fns.len() / 400).max(1);
         for f in nb.fns.iter().step_by(step) {
             if fns_done >= 60 || f.size < 24 {
@@ -568,16 +574,23 @@ fn main() {
                 let Some((a, _)) = t.trim_start().split_once(":\t") else { continue };
                 let Ok(addr) = u64::from_str_radix(a, 16) else { continue };
                 let Some((file, line)) = &cur else { continue };
-                total += 1;
                 let i = rows.partition_point(|r| r.addr <= addr);
                 if let Some(r) = i.checked_sub(1).map(|i| &rows[i]) {
+                    if r.line == 0 {
+                        zero += 1; // no source line: the system listing carries the previous line over
+                        continue;
+                    }
+                    total += 1;
                     let ours = nb.file(r.file);
                     if r.line == *line && Path::new(&ours).file_name() == Path::new(file).file_name() {
                         same += 1;
+                    } else if total - same < 25 {
+                        eprintln!("mismatch {:x} {}: ours {}:{} theirs {}:{}", addr, f.name, ours, r.line, file, line);
                     }
                 }
             }
         }
+        eprintln!("corpus: {} instructions in line-0 rows skipped", zero);
         eprintln!("corpus agreement: {}/{} instructions over {} fns ({:.2}%)", same, total, fns_done, 100.0 * same as f64 / total.max(1) as f64);
         assert!(total == 0 || same * 100 >= total * 90);
     }
