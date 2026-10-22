@@ -762,7 +762,11 @@ pub mod obligations {
                 errors.extend(with_wfcx(prog, tcx, did, |w| check_impl(w, ast, item)));
                 errors
             }
-            DefKind::Trait => with_wfcx(prog, tcx, did, |w| { check_defaults(w, ast, item); w.check_where_clauses(item.lo); }),
+            DefKind::Trait => {
+                let mut errors = with_wfcx(prog, tcx, did, |w| { check_defaults(w, ast, item); w.check_where_clauses(item.lo); });
+                errors.extend(crate::gat_bounds::check(prog, tcx, did));
+                errors
+            }
             DefKind::Static | DefKind::ForeignStatic => with_wfcx(prog, tcx, did, |w| check_static(w, ast, item)),
             DefKind::AssocConst => with_wfcx(prog, tcx, did, |w| check_assoc_const(w, ast, item)),
             DefKind::AssocTy => with_wfcx(prog, tcx, did, |w| check_assoc_ty(w, ast, item)),
