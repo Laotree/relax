@@ -24,6 +24,11 @@ struct Site {
 pub(super) struct Watch {
     id: u32,
     what: String,
+    /// the watched (struct, field index) pairs
+    fields: Vec<(crate::program::DefId, u32)>,
+    /// lines that assign the field in fns with no code yet: (path, line).
+    /// A fn that first gets code over one of them is watched then (code_installed).
+    pending: Mutex<Vec<(String, u32)>>,
     on: std::sync::atomic::AtomicBool,
     hits: AtomicU64,
     sites: Mutex<Vec<Site>>,
@@ -35,6 +40,98 @@ const RECENT: usize = 512;
 
 static WATCHES: Mutex<Vec<Arc<Watch>>> = Mutex::new(Vec::new());
 static NEXT: AtomicU64 = AtomicU64::new(1);
+/// how many watches have pending writer lines (every install asks: one load when none)
+static PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// slots that got code over a pending writer line: (slot, watch index), waiting for the owner
+static ARM: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
+
+fn count_pending(ws: &[Arc<Watch>]) {
+    let n = ws.iter().filter(|w| w.on.load(Relaxed) && !w.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()).count();
+    PENDING.store(n, SeqCst);
+}
+
+/// Does a watch wait for writers that have no code yet?
+pub(super) fn waiting() -> bool {
+    PENDING.load(Relaxed) != 0
+}
+
+/// Every install (patches::code_installed): a fn that first gets code over a line a watch is
+/// waiting for is watched too (posted to the owner). Cheap when no watch waits.
+pub(super) fn code_installed(u: &crate::jit::Unit, id: u32) {
+    if !waiting() {
+        return;
+    }
+    let Some(f) = u.fns.get(id as usize) else { return };
+    let Some(path) = u.prog.file_paths.get(f.file as usize) else { return };
+    let mut hits: Vec<u64> = Vec::new();
+    {
+        let ws = WATCHES.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, w) in ws.iter().enumerate().filter(|(_, w)| w.on.load(Relaxed)) {
+            let p = w.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if p.iter().any(|(pp, line)| pp.as_str() == path.as_str() && super::instrument::fn_spans_line(u, id, *line)) {
+                hits.push(i as u64);
+            }
+        }
+    }
+    if hits.is_empty() {
+        return;
+    }
+    let _k = crate::zone_alloc::kept();
+    let first = {
+        let mut a = ARM.lock().unwrap_or_else(|e| e.into_inner());
+        let first = a.is_empty();
+        for i in hits {
+            if !a.contains(&(id, i)) {
+                a.push((id, i));
+            }
+        }
+        first
+    };
+    if first {
+        crate::owner::post(crate::owner::Class::App, || {
+            let up = crate::jit::current_unit();
+            if !up.is_null() {
+                unsafe { arm_new(up) };
+            }
+        });
+    }
+}
+
+/// The owner: watches the slots that got code over a pending writer line.
+unsafe fn arm_new(up: *mut crate::jit::Unit) {
+    let _kept = crate::zone_alloc::kept();
+    let list: Vec<(u32, u64)> = std::mem::take(&mut *ARM.lock().unwrap_or_else(|e| e.into_inner()));
+    for (slot, idx) in list {
+        let Some(w) = watch_at(idx) else { continue };
+        if !w.on.load(Relaxed) {
+            continue;
+        }
+        let owner = super::patches::Owner::Watch(w.id);
+        if super::patches::owner_slots(owner).iter().any(|x| x.0 == slot) {
+            continue;
+        }
+        let mut placed = false;
+        let mut err = None;
+        for &(adt, field) in &w.fields {
+            let wf = Arc::new(crate::lower::WatchField { slot, adt, field, idx, hit: rt_watch_hit as *const () as u64 });
+            match super::patches::add(up, slot, owner, super::patches::Edit::Watch { field: wf }) {
+                Ok(true) => placed = true,
+                Ok(false) => {}
+                Err(e) => err = Some(e),
+            }
+        }
+        if placed {
+            let _ = super::codever::cover_inliners(up, owner, &[(slot, None)], false);
+        }
+        let name = short(&(&*up).fns[slot as usize].name, 120);
+        let why = match (&err, placed) {
+            (_, true) => "it got code (first call) over a line that writes the field: watched now".to_string(),
+            (Some(e), false) => format!("it got code over a writer line but was not watched: {}", e),
+            (None, false) => "it got code over a writer line, but its body writes another struct's field of that name".to_string(),
+        };
+        super::events::emit("probe", &format!("watch {} armed {}", owner.label(), slot), &format!("\"owner\":\"{}\",\"slot\":{},\"fn\":{},\"watched\":{},\"why\":{}", owner.label(), slot, super::json_str(&name), placed, super::json_str(&why)));
+    }
+}
 
 fn watch_at(i: u64) -> Option<Arc<Watch>> {
     WATCHES.lock().unwrap_or_else(|e| e.into_inner()).get(i as usize).cloned()
@@ -121,6 +218,13 @@ pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
     for w in ws.iter() {
         a.arc(w);
         a.string(&w.what);
+        a.vec(&w.fields);
+        if let Ok(p) = w.pending.try_lock() {
+            a.vec(&p);
+            for x in p.iter() {
+                a.string(&x.0);
+            }
+        }
         if let Ok(s) = w.sites.try_lock() {
             a.vec(&s);
             for x in s.iter() {
@@ -195,6 +299,8 @@ fn add(query: &str) -> Result<(Arc<Watch>, Vec<String>), String> {
         // candidate writers: the lines of the loaded sources that assign `.field`, and the
         // compiled fns spanning them (the same lookup as `probe add file:line`)
         let mut cands: Vec<u32> = Vec::new();
+        // writer lines no fn with code spans (not called yet): watched when they get code
+        let mut pending: Vec<(String, u32)> = Vec::new();
         let nb = needle.as_bytes();
         let mut seen_paths: Vec<&str> = Vec::new();
         for fi in (0..u.prog.files.len()).rev() {
@@ -216,7 +322,11 @@ fn add(query: &str) -> Result<(Arc<Watch>, Vec<String>), String> {
             while k + nb.len() <= text.len() {
                 if &text[k..k + nb.len()] == nb && text.get(k + nb.len()).map_or(true, |c| !(c.is_ascii_alphanumeric() || *c == b'_')) && assigns(&text[k + nb.len()..]) {
                     let line = 1 + text[..k].iter().filter(|&&c| c == b'\n').count();
-                    for (slot, _, _) in super::instrument::find_all(u, &format!("{}:{}", path, line), 8) {
+                    let found = super::instrument::find_all(u, &format!("{}:{}", path, line), 8);
+                    if found.is_empty() {
+                        pending.push((path.to_string(), line as u32));
+                    }
+                    for (slot, _, _) in found {
                         if !cands.contains(&slot) {
                             cands.push(slot);
                         }
@@ -231,14 +341,18 @@ fn add(query: &str) -> Result<(Arc<Watch>, Vec<String>), String> {
         let _kept = crate::zone_alloc::kept();
         let id = NEXT.fetch_add(1, SeqCst) as u32;
         let what = fields.iter().map(|f| f.2.clone()).collect::<Vec<_>>().join(", ");
-        let w = Arc::new(Watch { id, what, on: std::sync::atomic::AtomicBool::new(true), hits: AtomicU64::new(0), sites: Mutex::new(Vec::new()), recent: Mutex::new(VecDeque::new()) });
+        let field_ids: Vec<(crate::program::DefId, u32)> = fields.iter().map(|f| (f.0, f.1)).collect();
+        let pending_note = (!pending.is_empty()).then(|| format!("{} writer line(s) in fns with no code yet (not called yet), watched when they first run: {}", pending.len(), pending.iter().take(6).map(|(p, l)| format!("{}:{}", p.rsplit('/').next().unwrap_or(p), l)).collect::<Vec<_>>().join(", ")));
+        let w = Arc::new(Watch { id, what, fields: field_ids, pending: Mutex::new(pending.iter().map(|(p, l)| (p.clone(), *l)).collect()), on: std::sync::atomic::AtomicBool::new(true), hits: AtomicU64::new(0), sites: Mutex::new(Vec::new()), recent: Mutex::new(VecDeque::new()) });
         let idx = {
             let mut ws = WATCHES.lock().unwrap_or_else(|e| e.into_inner());
             ws.push(w.clone());
+            count_pending(&ws);
             ws.len() as u64 - 1
         };
         let owner = super::patches::Owner::Watch(id);
         let mut notes = vec![format!("{} compiled fn(s) assign `.{}` in their text: {}", cands.len(), fname, cands.iter().take(8).map(|c| short(&u.fns[*c as usize].name, 80)).collect::<Vec<_>>().join(", "))];
+        notes.extend(pending_note);
         let mut ok: Vec<(u32, Option<u32>)> = Vec::new();
         for slot in cands {
             for (adt, fi, _) in &fields {
@@ -291,8 +405,12 @@ pub fn cmd(req: &Req, out: &mut Out) {
         "rm" => {
             let which = req.pos.get(1).map(String::as_str).unwrap_or("all");
             let ids: Vec<u32> = WATCHES.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.on.load(Relaxed) && (which == "all" || which.trim_start_matches('W').parse::<u32>().ok() == Some(w.id))).map(|w| w.id).collect();
-            for w in WATCHES.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| ids.contains(&w.id)) {
-                w.on.store(false, SeqCst);
+            {
+                let ws = WATCHES.lock().unwrap_or_else(|e| e.into_inner());
+                for w in ws.iter().filter(|w| ids.contains(&w.id)) {
+                    w.on.store(false, SeqCst);
+                }
+                count_pending(&ws);
             }
             let n = ids.len();
             let _ = crate::owner::call_within(crate::owner::Class::App, 20_000, move || {

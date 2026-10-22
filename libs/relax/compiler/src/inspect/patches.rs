@@ -208,7 +208,13 @@ fn unwatch(owner: Owner) {
 /// inlined copy of a watched target is rebuilt on the owner (an event says so). Cheap when
 /// nothing is watched.
 pub fn code_installed(u: &crate::jit::Unit, id: u32) {
-    if WATCHING.load(std::sync::atomic::Ordering::Acquire) == 0 || INSTRUMENTING.try_with(|c| c.get()).unwrap_or(false) {
+    let watching = WATCHING.load(std::sync::atomic::Ordering::Acquire) != 0;
+    if !watching && !super::watch::waiting() || INSTRUMENTING.try_with(|c| c.get()).unwrap_or(false) {
+        return;
+    }
+    // a field watch waiting for a writer that had no code yet
+    super::watch::code_installed(u, id);
+    if !watching {
         return;
     }
     let hits: Vec<(Owner, bool)> = {

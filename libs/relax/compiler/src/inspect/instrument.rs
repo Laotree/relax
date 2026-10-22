@@ -401,6 +401,28 @@ fn targetable(f: &crate::jit::FnEntry, inlined_too: bool) -> bool {
 /// Slots matching a fn query (exact display name, else a suffix of it, else a substring) that
 /// have code -- or only run inlined into other code -- at most `max`; or the slots of `file:line`
 /// whose fn spans that line. Run on the owner.
+/// Does slot `id`'s fn span `line` of its file? A fn instance by its item, a closure by its
+/// own expression, a twin (SPEC-V `[unverified]`, sandbox) by its base's fn: a twin is often the
+/// only slot with code (unverified callers run it), so it is the one a line probe must reach.
+pub(super) fn fn_spans_line(u: &crate::jit::Unit, id: u32, line: u32) -> bool {
+    let mut id = id;
+    for _ in 0..8 {
+        let Some(f) = u.fns.get(id as usize) else { return false };
+        match &f.key {
+            crate::jit::FnKey::Plain(b) | crate::jit::FnKey::Sandbox(b) if *b != u32::MAX => id = *b,
+            crate::jit::FnKey::Closure(file, e, _) => {
+                let Some(pf) = u.prog.files.get(*file as usize) else { return false };
+                let x = pf.ast.expr(crate::ast::ExprId(*e));
+                let (lo, hi) = (pf.line_col(x.lo).0 as u32, pf.line_col(x.hi).0 as u32);
+                return lo <= line && line <= hi;
+            }
+            crate::jit::FnKey::Inst(..) => return matches!(super::codever::fn_lines(u, id), Some((_, lo, hi)) if lo <= line && line <= hi),
+            _ => return false,
+        }
+    }
+    false
+}
+
 pub(super) fn find_all(u: &crate::jit::Unit, query: &str, max: usize) -> Vec<(u32, Option<u32>, String)> {
     find_in(u, query, max, true)
 }
@@ -423,12 +445,7 @@ fn find_in(u: &crate::jit::Unit, query: &str, max: usize, inlined_too: bool) -> 
             }
             // the fn whose item spans the line (its RIR, built for the instrumented build when it
             // is gone -- code from the disk cache has none -- places the hook)
-            let crate::jit::FnKey::Inst(d, _) = &f.key else { continue };
-            let def = u.prog.def(*d);
-            let file = &u.prog.files[def.file as usize];
-            let item = file.ast.item(def.item);
-            let (lo, hi) = (file.line_col(item.lo).0 as u32, file.line_col(item.hi).0 as u32);
-            if lo <= line && line <= hi && matches!(item.kind, crate::ast::ItemKind::Fn(..)) {
+            if fn_spans_line(u, id as u32, line) {
                 out.push((id as u32, Some(line), f.name.to_string()));
             }
             if out.len() >= max {
