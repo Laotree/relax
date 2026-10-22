@@ -6716,15 +6716,25 @@ pub fn form_bzhi(options: &relax_session::Options, f: &mut Func) -> bool {
     let mut ndef = vec![0u32; nv];
     let mut nuse = vec![0u32; nv];
     let mut def_at = vec![(u32::MAX, 0u32); nv];
+    // the constant every definition of a vreg assigns (a constant materialised on several paths)
+    let mut kval: Vec<Option<Option<i64>>> = vec![None; nv];
     for p in &f.params {
         ndef[p.0 as usize] += 1;
+        kval[p.0 as usize] = Some(None);
     }
     let mut tu = Vec::new();
     for (bi, b) in f.blocks.iter().enumerate() {
         for (k, i) in b.insts.iter().enumerate() {
+            let c = if let Inst::Iconst(_, c) = *i { Some(c) } else { None };
             for_defs(i, |d| {
                 ndef[d.0 as usize] += 1;
                 def_at[d.0 as usize] = (bi as u32, k as u32);
+                let e = &mut kval[d.0 as usize];
+                *e = Some(match (*e, c) {
+                    (None, c) => c,
+                    (Some(Some(x)), Some(y)) if x == y => Some(x),
+                    _ => None,
+                });
             });
             for_uses(i, |u| nuse[u.0 as usize] += 1);
         }
@@ -6735,7 +6745,7 @@ pub fn form_bzhi(options: &relax_session::Options, f: &mut Func) -> bool {
     }
     let single = |v: VReg| ndef[v.0 as usize] == 1 && def_at[v.0 as usize].0 != u32::MAX;
     let def = |f: &Func, v: VReg| -> Inst { let (b, k) = def_at[v.0 as usize]; f.blocks[b as usize].insts[k as usize].clone() };
-    let konst = |f: &Func, v: VReg, want: i64| single(v) && matches!(def(f, v), Inst::Iconst(_, c) if c == want);
+    let konst = |_: &Func, v: VReg, want: i64| kval[v.0 as usize] == Some(Some(want));
     // (shift's block, index, count) of `m` when it is the low-n-bits mask of a count n
     let mask = |f: &Func, m: VReg| -> Option<(u32, u32, VReg)> {
         if !single(m) || nuse[m.0 as usize] != 1 {
