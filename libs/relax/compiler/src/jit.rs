@@ -6719,18 +6719,24 @@ pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, base
 /// makepad inspect's by-name probes: slot `id`'s body lowered again with probe calls at `points`
 /// (lower.rs ProbePoint), as baseline RIR (no inlining of user fns: the probe calls stay calls
 /// for probes.rs to guard). The slot's own RIR is untouched. What each point found comes back.
-pub(crate) unsafe fn relower_with_probes(up: *mut Unit, id: u32, points: Vec<crate::lower::ProbePoint>) -> Result<(relax_backend::rir::Func, Vec<(u32, Result<(), String>)>), String> {
+/// Field watches (lower.rs WatchField) are lowered in the same pass: the writes they instrumented
+/// come back as (slot, source position).
+pub(crate) unsafe fn relower_with_probes(up: *mut Unit, id: u32, points: Vec<crate::lower::ProbePoint>, watches: Vec<crate::lower::WatchField>) -> Result<(relax_backend::rir::Func, Vec<(u32, Result<(), String>)>, Vec<(u32, u64)>), String> {
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
     let _ = crate::lower::PROBE_POINTS.try_with(|p| *p.borrow_mut() = points);
     let _ = crate::lower::PROBE_RESULTS.try_with(|p| p.borrow_mut().clear());
+    let _ = crate::lower::WATCH_FIELDS.try_with(|p| *p.borrow_mut() = watches);
+    let _ = crate::lower::WATCH_RESULTS.try_with(|p| p.borrow_mut().clear());
     let lowered = build_rir_lowered(up, id);
     let _ = crate::lower::PROBE_POINTS.try_with(|p| p.borrow_mut().clear());
+    let _ = crate::lower::WATCH_FIELDS.try_with(|p| p.borrow_mut().clear());
     let results = crate::lower::PROBE_RESULTS.try_with(|p| std::mem::take(&mut *p.borrow_mut())).unwrap_or_default();
+    let watched = crate::lower::WATCH_RESULTS.try_with(|p| std::mem::take(&mut *p.borrow_mut())).unwrap_or_default();
     let lowered = lowered?;
     let (prep, _) = prepare_rir_from(up, id, false, Some(lowered), RirMode::Baseline)?;
     let (func, _) = optimize_rir(options, id, prep)?;
-    Ok((func, results))
+    Ok((func, results, watched))
 }
 
 /// Stack frame bytes of each slot's latest code (O1, O3): the compile report's frame

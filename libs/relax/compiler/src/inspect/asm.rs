@@ -272,7 +272,7 @@ fn our_sides(q: &str, max: usize) -> Result<(Vec<(u32, Side)>, Vec<String>), Str
             None => super::instrument::find_all(u, &q, max).into_iter().map(|x| x.0).collect(),
         };
         if found.is_empty() {
-            return Err(format!("no fn matches `{}`; try: top by=time (hot fns), or a longer path like `krate::Type::method`", q));
+            return Err(format!("no fn matches `{}`{}; try: top by=time (hot fns)", q, super::instrument::closest(u, &q)));
         }
         let mut sides = Vec::new();
         let mut notes = Vec::new();
