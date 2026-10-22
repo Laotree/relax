@@ -487,6 +487,7 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     eprintln!("makepad-run zone: swap {}->{} at t={:.0} ms (attempt {}): quiesce {:.1} ms, front images {:.1} ms, encode {:.1} ms, store {:.1} ms, restore {:.1} ms (cache {:.1} ms), commit {:.1} ms, total {:.1} ms; destroyed {} chunks ({:.1} MB touched); {} speculative codes moved to the kept heap ({:.1} MB); rss {:.0} -> {:.0} MB",
         old_gen, old_gen + 1, crate::clock::ms_since_start(), n + 1, tl.quiesce, tl.front_images, tl.encode, tl.store, tl.restore, tl.cache, tl.commit, ms(t_all),
         tl.chunks, tl.touched as f64 / 1048576.0, tl.specs.0, tl.specs.1 as f64 / 1048576.0, rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0);
+    crate::inspect::flightrec::event("zone.swap", &format!("gen {}->{}: total {:.0} ms (quiesce {:.0}, encode {:.0}, restore {:.0}, commit {:.0}); rss {:.0} -> {:.0} MB", old_gen, old_gen + 1, ms(t_all), tl.quiesce, tl.encode, tl.restore, tl.commit, rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0), (ms(t_all) * 1e6) as u64, 0);
     Outcome::Done
 }
 
