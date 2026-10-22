@@ -46,24 +46,16 @@ pub fn instrument(f: &mut Func, base: u64) -> Vec<bool> {
 }
 
 /// Back-edge counting (tier-up of loops; HotSpot's backedge counters, the CLR's Tier0 patchpoint
-/// counters): every block some edge reaches from a block at or after it (in block order every
-/// cycle has such an edge, so every loop iteration passes one) starts with a decrement of the
+/// counters): every block a back edge goes to (`header`: back_edge_targets; every loop iteration
+/// passes one) starts with a decrement of the
 /// slot's loop counter, the 8-byte word at `counter` (a relocated symbol: the code stays
 /// cacheable). When the count drops below zero the block calls `helper(counter address)` (the
 /// tier-up decision, which resets the count) and goes on. The block's own code moves to a new
 /// block right after it, which the counting block falls into; the calls go after all other blocks.
 /// False: no loop, nothing changed.
-pub fn loop_counters(f: &mut Func, counter: Sym, helper: Sym) -> bool {
+pub fn loop_counters(f: &mut Func, header: &[bool], counter: Sym, helper: Sym) -> bool {
     let nb = f.blocks.len();
-    let mut header = vec![false; nb];
-    for (b, blk) in f.blocks.iter().enumerate() {
-        for t in blk.term.succs() {
-            if (t as usize) <= b {
-                header[t as usize] = true;
-            }
-        }
-    }
-    if !header.iter().any(|h| *h) {
+    if header.len() != nb || !header.iter().any(|h| *h) {
         return false;
     }
     // block order: each counting block, then its body; the helper calls last
@@ -112,6 +104,42 @@ pub fn loop_counters(f: &mut Func, counter: Sym, helper: Sym) -> bool {
         f.blocks.push(blk);
     }
     true
+}
+
+/// The blocks a back edge of a depth-first walk from the entry goes to (an edge to a block still
+/// on the walk's stack): every cycle has one, and code without a cycle has none (a return block
+/// placed before its callers is no target, so calls before it stay in tail position).
+pub fn back_edge_targets(f: &Func) -> Vec<bool> {
+    let nb = f.blocks.len();
+    let mut header = vec![false; nb];
+    if nb == 0 {
+        return header;
+    }
+    // 0 unvisited, 1 on the stack, 2 done
+    let mut state = vec![0u8; nb];
+    let mut stack: Vec<(u32, Vec<u32>)> = vec![(0, f.blocks[0].term.succs().collect())];
+    state[0] = 1;
+    while let Some((b, succs)) = stack.last_mut() {
+        match succs.pop() {
+            Some(t) => {
+                let t = t as usize;
+                match state[t] {
+                    0 => {
+                        state[t] = 1;
+                        let next: Vec<u32> = f.blocks[t].term.succs().collect();
+                        stack.push((t as u32, next));
+                    }
+                    1 => header[t] = true,
+                    _ => {}
+                }
+            }
+            None => {
+                state[*b as usize] = 2;
+                stack.pop();
+            }
+        }
+    }
+    header
 }
 
 /// Some block carries a count.
@@ -444,5 +472,30 @@ mod tests {
         assert!(matches!(f.blocks[1].insts[0], Inst::Iconst(_, 0x1008)));
         assert!(matches!(f.blocks[1].insts[3], Inst::Store(..)));
         assert!(f.verify().is_ok());
+    }
+
+    #[test]
+    fn loop_headers_count_and_keep_their_body_next() {
+        // 0 -> 1; 1 -> (1 | 2): block 1 loops on itself
+        let mut f = func(vec![
+            blk(Term::Jump(1), -1.0),
+            blk(Term::Branch(VReg(0), 1, 2), -1.0),
+            blk(Term::Ret(Vec::new()), -1.0),
+        ]);
+        let h = back_edge_targets(&f);
+        assert_eq!(h, vec![false, true, false]);
+        assert!(loop_counters(&mut f, &h, Sym::new(7), Sym::new(8)));
+        // entry, counting block, the loop body, exit, the helper call
+        assert_eq!(f.blocks.len(), 5);
+        assert!(matches!(f.blocks[1].insts[0], Inst::Addr(_, Sym { id: 7, off: 0 })));
+        assert!(matches!(f.blocks[1].term, Term::Branch(_, 4, 2)));
+        // the body loops back to the counting block
+        assert!(matches!(f.blocks[2].term, Term::Branch(_, 1, 3)));
+        assert!(matches!(f.blocks[4].insts[1], Inst::Call(Callee::Host(Sym { id: 8, .. }), _, _)));
+        assert!(matches!(f.blocks[4].term, Term::Jump(2)));
+        assert!(f.verify().is_ok());
+        // a return block placed before its caller is no loop header
+        let g = func(vec![blk(Term::Jump(2), -1.0), blk(Term::Ret(Vec::new()), -1.0), blk(Term::Jump(1), -1.0)]);
+        assert!(back_edge_targets(&g).iter().all(|h| !*h));
     }
 }

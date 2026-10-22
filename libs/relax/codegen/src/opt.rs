@@ -571,11 +571,17 @@ fn site_rule(options: &relax_session::Options, callee: &Func, id: u32, nargs: us
 /// PGO: a site the counts saw run at least this often per call of the function being inlined
 /// into (profile::inline_freqs units: 0.1 per run) is very hot: any body up to the
 /// inline(always) size may inline there (LLVM's hot-callsite threshold, which rustc PGO uses: it
-/// inlines html_parse's process_entity).
+/// inlines html_parse's process_entity) -- if the body does not loop: what inlining saves is the
+/// call, and a body that iterates per call (sdf_glyphs' esdt over a row: +5.6% instructions when
+/// it went into each caller) pays for its call many times over.
 const PGO_VERY_HOT: f32 = 1.0;
 
-fn pgo_site_limits(lim: &InlineLimits, counted: bool, priority: u32) -> InlineLimits {
-    if counted && f32::from_bits(priority) >= PGO_VERY_HOT {
+fn pgo_site_limits(lim: &InlineLimits, counted: bool, priority: u32, callee: &Func) -> InlineLimits {
+    let loops = || match relax_backend::profile::repeated_blocks(callee) {
+        Some(r) => r.iter().any(|x| *x),
+        None => relax_backend::regalloc::loop_depths(callee, &reachable(callee)).iter().any(|d| *d > 0),
+    };
+    if counted && f32::from_bits(priority) >= PGO_VERY_HOT && !loops() {
         InlineLimits { hot_insts: lim.hot_insts.max(lim.always_insts), ..*lim }
     } else {
         *lim
@@ -741,7 +747,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
             // ... and one no bigger than the call itself costs nothing: no allowance at all.
             let no_growth = cost == 0;
             let attrs = found.unwrap().1;
-            let lim_b = pgo_site_limits(lim, counted, priorities[bi].0);
+            let lim_b = pgo_site_limits(lim, counted, priorities[bi].0, shape);
             let rule = site_rule(options, shape, id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), id), ancestry[bi].len() - 1, multi_depths[bi], &lim_b);
             // New admissions respect the actual growth ceiling, including ABI moves.
             let growth = size.saturating_add(args.len()).saturating_add(
@@ -837,7 +843,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
                     0
                 } else if let Some((_, attrs)) = found {
                     let c = callee.unwrap();
-                    let lim_b = pgo_site_limits(lim, counted, priorities[bi].0);
+                    let lim_b = pgo_site_limits(lim, counted, priorities[bi].0, c);
                     let rule = site_rule(options, c, *id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), *id), ancestry[bi].len() - 1, multi_depths[bi], &lim_b);
                     if ancestry[bi].contains(id) || rule.is_none() {
                         2
