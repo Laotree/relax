@@ -5747,6 +5747,16 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                 && !lanes
                 && matches!(size, 2 | 4 | 8)
                 && cells[start..end].iter().all(|c| matches!(c.2, Mem::Int(n, _) if n <= 8))
+                // every slot of the group that holds part of the cell holds all of it (the cell
+                // is one register per slot: a 4-byte slot copied into the low half of an 8-byte
+                // one cannot hold an 8-byte cell)
+                && (0..ns).all(|sl| {
+                    if root[sl] != g || !ok[sl] {
+                        return true;
+                    }
+                    let (a, b) = (delta[sl], delta[sl] + f.slots[sl].size as i64);
+                    b <= lo || a >= hi || (a <= lo && hi <= b)
+                })
                 && !crate::stats::opt_env_off("-sroapack");
             if lanes {
                 gcells[g as usize].push(SroaCell { off: lo, mem: SROA_V128, widened: false, lanes: true, packed: false });

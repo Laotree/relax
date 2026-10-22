@@ -106,3 +106,27 @@ fn promoted_packed_cells_compute_the_same_values() {
         }
     }
 }
+
+/// A 4-byte slot copied into the low half of an 8-byte one that is read as 8 bytes: the 8-byte
+/// cell does not fit the small slot, so the group is not packed (was: "sroa cell outside its
+/// slot" in FlatMap::next at the base tier).
+#[test]
+fn a_cell_wider_than_a_member_slot_is_not_packed() {
+    let mut f = Func::new("sroa_packed_small".into(), 0);
+    let a = f.vreg(Cls::I);
+    f.params = vec![a];
+    f.rets = vec![Cls::I];
+    f.block();
+    let (sa, sb) = (f.slot(4, 4), f.slot(8, 8));
+    let (pa, pb, r) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+    push(&mut f, Inst::SlotAddr(pa, sa));
+    push(&mut f, Inst::SlotAddr(pb, sb));
+    push(&mut f, Inst::Store(Mem::Int(8, false), pb, 0, a));
+    push(&mut f, Inst::Store(Mem::Int(4, false), pa, 0, a));
+    push(&mut f, Inst::Copy(pb, pa, 4));
+    push(&mut f, Inst::Load(Mem::Int(8, false), r, pb, 0));
+    f.blocks[0].term = Term::Ret(vec![r]);
+    f.verify().unwrap();
+    relax_backend::passes::sroa(&mut f);
+    f.verify().unwrap();
+}
