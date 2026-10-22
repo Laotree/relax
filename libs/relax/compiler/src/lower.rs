@@ -7877,29 +7877,13 @@ impl<'a> Lcx<'a> {
         (d, hi)
     }
 
-    /// 64 x 64 -> high 64 bits of the unsigned product (through 32-bit halves).
+    /// 64 x 64 -> high 64 bits of the unsigned product: one MulHi (umulh / mul's rdx / the wasm
+    /// helper), as wide_mul_overflow uses. It was built from four 32-bit products, shifts and adds
+    /// (~20 instructions where rustc emits `umulh`): every u128 product -- the std hasher's
+    /// folded multiply, so every HashMap key of JIT code -- paid it (RACEPAR, city drive's
+    /// LocalShadows::render: 29% of its samples in fast.rs folded_multiply).
     fn mulhi_u64(&mut self, x: VReg, y: VReg) -> VReg {
-        let m32 = self.iconst(0xffff_ffff);
-        let s32 = self.iconst(32);
-        let x0 = self.ibin(IOp::And, false, x, m32);
-        let x1 = self.ibin(IOp::Shr, false, x, s32);
-        let y0 = self.ibin(IOp::And, false, y, m32);
-        let y1 = self.ibin(IOp::Shr, false, y, s32);
-        let p00 = self.ibin(IOp::Mul, false, x0, y0);
-        let p01 = self.ibin(IOp::Mul, false, x0, y1);
-        let p10 = self.ibin(IOp::Mul, false, x1, y0);
-        let p11 = self.ibin(IOp::Mul, false, x1, y1);
-        let p00h = self.ibin(IOp::Shr, false, p00, s32);
-        let p01l = self.ibin(IOp::And, false, p01, m32);
-        let p10l = self.ibin(IOp::And, false, p10, m32);
-        let mid0 = self.ibin(IOp::Add, false, p00h, p01l);
-        let mid = self.ibin(IOp::Add, false, mid0, p10l);
-        let p01h = self.ibin(IOp::Shr, false, p01, s32);
-        let p10h = self.ibin(IOp::Shr, false, p10, s32);
-        let midh = self.ibin(IOp::Shr, false, mid, s32);
-        let h0 = self.ibin(IOp::Add, false, p11, p01h);
-        let h1 = self.ibin(IOp::Add, false, h0, p10h);
-        self.ibin(IOp::Add, false, h1, midh)
+        self.ibin(IOp::MulHi, false, x, y)
     }
 
     // N:rustc_mir_build/src/builder/expr/as_rvalue.rs:457-541; round-30 RIR design.
