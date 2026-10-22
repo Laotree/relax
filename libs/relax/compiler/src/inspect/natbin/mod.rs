@@ -386,3 +386,199 @@ impl NativeBin {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const FIXTURE: &str = "use std::hint::black_box;
+#[inline(always)]
+fn helper_inl(x: u64) -> u64 {
+    black_box(x).wrapping_mul(31).wrapping_add(7)
+}
+#[inline(never)]
+pub fn natbin_outer(x: u64) -> u64 {
+    let a = helper_inl(x);
+    a ^ (a >> 3)
+}
+fn main() {
+    println!(\"{}\", natbin_outer(std::env::args().count() as u64));
+}
+";
+
+    fn have_rustc() -> bool {
+        Command::new("rustc").arg("--version").output().map_or(false, |o| o.status.success())
+    }
+
+    /// Builds the fixture with the system compiler into a fresh temp dir; returns (dir, binary).
+    fn build(tag: &str, flags: &[&str]) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("natbin-test-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fixture.rs"), FIXTURE).unwrap();
+        let st = Command::new("rustc").current_dir(&dir).args(["-O", "-C", "codegen-units=1", "fixture.rs", "-o", "fixture_bin"]).args(flags).status().unwrap();
+        assert!(st.success(), "rustc failed");
+        (dir.clone(), dir.join("fixture_bin"))
+    }
+
+    fn check(tag: &str, flags: &[&str], want_inline: bool) {
+        if !have_rustc() {
+            eprintln!("natbin test skipped: no rustc");
+            return;
+        }
+        let (dir, bin) = build(tag, flags);
+        let nb = NativeBin::open(bin.to_str().unwrap()).unwrap();
+        let hits = nb.find("natbin_outer");
+        assert_eq!(hits.len(), 1, "fns: {:?}", hits);
+        let f = hits[0];
+        assert!(f.name.ends_with("natbin_outer") && f.size > 0, "{:?}", f);
+        assert_eq!(nb.code(f).len() as u64, f.size);
+        assert!(nb.fn_at(f.addr + 1).map(|g| g.addr) == Some(f.addr));
+        // the same bytes through the system disassembler's section dump
+        #[cfg(target_os = "linux")]
+        if let Ok(o) = Command::new("objdump").args(["-s", &format!("--start-address={}", f.addr), &format!("--stop-address={}", f.addr + f.size), bin.to_str().unwrap()]).output() {
+            let mut hex = Vec::new();
+            for l in String::from_utf8_lossy(&o.stdout).lines() {
+                // " 401120 f30f1efa 4889f8 ...  text"
+                let mut it = l.split_whitespace();
+                if it.next().map_or(false, |a| u64::from_str_radix(a, 16).is_ok()) {
+                    for w in it.take(4) {
+                        if w.len() % 2 == 0 && w.bytes().all(|c| c.is_ascii_hexdigit()) {
+                            hex.extend((0..w.len() / 2).map(|i| u8::from_str_radix(&w[2 * i..2 * i + 2], 16).unwrap()));
+                        }
+                    }
+                }
+            }
+            assert_eq!(&hex[..], nb.code(f), "code bytes differ from the system dump");
+        }
+        assert_ne!(nb.debug_from, "none", "no debug info found");
+        let rows = nb.lines(f.addr, f.addr + f.size);
+        assert!(!rows.is_empty());
+        assert!(rows.windows(2).all(|w| w[0].addr < w[1].addr));
+        let ours: Vec<&LineRow> = rows.iter().filter(|r| nb.file(r.file).ends_with("fixture.rs")).collect();
+        assert!(!ours.is_empty(), "no fixture rows: {:?}", rows.iter().map(|r| (nb.file(r.file), r.line)).collect::<Vec<_>>());
+        assert!(ours.iter().all(|r| (7..=10).contains(&r.line) || (3..=5).contains(&r.line) || r.line == 0), "{:?}", ours);
+        assert!(ours.iter().any(|r| r.line == 8 || r.line == 9));
+        if want_inline {
+            let call_line = FIXTURE.lines().position(|l| l.contains("helper_inl(x);")).unwrap() as u32 + 1;
+            let inl = nb.inlined(f.addr, f.addr + f.size);
+            let h = inl.iter().find(|c| c.name.ends_with("helper_inl")).unwrap_or_else(|| panic!("no helper_inl in {:?}", inl));
+            assert_eq!(h.call_line, call_line);
+            assert!(nb.file(h.call_file).ends_with("fixture.rs"));
+            assert_eq!(h.depth, 1);
+            assert!(h.ranges.iter().all(|r| r.0 >= f.addr && r.1 <= f.addr + f.size));
+            // black_box / wrapping ops inlined into the helper are deeper
+            assert!(inl.iter().all(|c| c.depth >= 1));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn variants() -> Vec<(&'static str, Vec<&'static str>)> {
+        if cfg!(target_vendor = "apple") {
+            vec![("unpacked", vec!["-C", "split-debuginfo=unpacked"]), ("packed", vec!["-C", "split-debuginfo=packed"])]
+        } else {
+            vec![("plain", vec![])]
+        }
+    }
+
+    #[test]
+    fn line_tables_only() {
+        for (tag, extra) in variants() {
+            let mut fl = vec!["-C", "debuginfo=line-tables-only"];
+            fl.extend(extra);
+            check(&format!("lt-{}", tag), &fl, false);
+        }
+    }
+
+    #[test]
+    fn full_debuginfo_inline_tree() {
+        for (tag, extra) in variants() {
+            let mut fl = vec!["-C", "debuginfo=2"];
+            fl.extend(extra);
+            check(&format!("full-{}", tag), &fl, true);
+        }
+    }
+
+    #[test]
+    fn dwarf4_and_5() {
+        if !have_rustc() {
+            return;
+        }
+        for v in ["4", "5"] {
+            let flag = format!("-Zdwarf-version={}", v);
+            // -Z flags need nightly (or RUSTC_BOOTSTRAP); skip when the compiler refuses
+            let (dir, bin) = {
+                let dir = std::env::temp_dir().join(format!("natbin-test-{}-dw{}", std::process::id(), v));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("fixture.rs"), FIXTURE).unwrap();
+                let st = Command::new("rustc").env("RUSTC_BOOTSTRAP", "1").current_dir(&dir).args(["-O", "-C", "debuginfo=2", &flag, "fixture.rs", "-o", "fixture_bin"]).status().unwrap();
+                if !st.success() {
+                    continue;
+                }
+                (dir.clone(), dir.join("fixture_bin"))
+            };
+            let nb = NativeBin::open(bin.to_str().unwrap()).unwrap();
+            let f = nb.find("natbin_outer")[0].clone();
+            assert!(!nb.lines(f.addr, f.addr + f.size).is_empty(), "dwarf {}", v);
+            assert!(nb.inlined(f.addr, f.addr + f.size).iter().any(|c| c.name.ends_with("helper_inl")), "dwarf {}", v);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn find_rules() {
+        assert_eq!(strip_generics("a::f<T, U>::g<V>"), "a::f::g");
+        assert_eq!(strip_generics("<T as X>::m<Y>"), "<T as X>::m");
+        assert_eq!(strip_generics("a::f<fn(A) -> B>"), "a::f");
+        assert_eq!(strip_generics("a::{closure#0}"), "a::{closure#0}");
+    }
+
+    /// NATBIN_CORPUS=<binary>: compares our line rows with the system disassembler's `-l` listing
+    /// for a sample of the binary's functions.
+    #[test]
+    fn corpus_agreement() {
+        let Ok(path) = std::env::var("NATBIN_CORPUS") else { return };
+        let nb = NativeBin::open(&path).unwrap();
+        eprintln!("corpus: {} fns, debug from {}", nb.fns.len(), nb.debug_from);
+        let (mut total, mut same, mut fns_done) = (0usize, 0usize, 0usize);
+        let step = (nb.fns.len() / 400).max(1);
+        for f in nb.fns.iter().step_by(step) {
+            if fns_done >= 60 || f.size < 24 {
+                continue;
+            }
+            let rows = nb.lines(f.addr, f.addr + f.size);
+            if rows.is_empty() {
+                continue;
+            }
+            let Ok(o) = Command::new("objdump").args(["-d", "-l", "--no-show-raw-insn", &format!("--start-address={}", f.addr), &format!("--stop-address={}", f.addr + f.size), &path]).output() else { return };
+            let mut cur: Option<(String, u32)> = None;
+            fns_done += 1;
+            for l in String::from_utf8_lossy(&o.stdout).lines() {
+                let t = l.trim_end();
+                if let Some((p, rest)) = t.rsplit_once(':') {
+                    let n = rest.split_whitespace().next().unwrap_or("");
+                    if !t.starts_with(' ') && !p.is_empty() && !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()) {
+                        cur = Some((p.to_string(), n.parse().unwrap()));
+                        continue;
+                    }
+                }
+                let Some((a, _)) = t.trim_start().split_once(":\t") else { continue };
+                let Ok(addr) = u64::from_str_radix(a, 16) else { continue };
+                let Some((file, line)) = &cur else { continue };
+                total += 1;
+                let i = rows.partition_point(|r| r.addr <= addr);
+                if let Some(r) = i.checked_sub(1).map(|i| &rows[i]) {
+                    let ours = nb.file(r.file);
+                    if r.line == *line && Path::new(&ours).file_name() == Path::new(file).file_name() {
+                        same += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("corpus agreement: {}/{} instructions over {} fns ({:.2}%)", same, total, fns_done, 100.0 * same as f64 / total.max(1) as f64);
+        assert!(total == 0 || same * 100 >= total * 90);
+    }
+}
