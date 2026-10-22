@@ -3189,6 +3189,53 @@ impl<'a> Gen<'a> {
         if self.al.uses[t.0 as usize] != 1 || isel_flags(options) & A64_FUSE == 0 {
             return None;
         }
+        // an indexed access whose index is the product (no shift, a register base): the address
+        // by madd into ip1, then [ip1 + off]
+        let reg_base = |g: &Self, v: VReg| v != t && g.slot_base(v).is_none() && g.resolve_off(v, 0).0 == v;
+        match *next {
+            Inst::LoadX(mm, d, base, x, 0, off) if x == t && reg_base(self, base) && (off as i64).unsigned_abs() < 1 << 24 => {
+                if !emit {
+                    return Some(());
+                }
+                let rc = self.use_i(base, S0);
+                let ra = self.use_i(a, S1);
+                let rb = self.mul_operand(b);
+                self.a.e(0x9B00_0000 | (rb as u32) << 16 | (rc as u32) << 10 | (ra as u32) << 5 | IP1 as u32);
+                let (op, size) = mem_op(mm, true);
+                let off = self.ip1_off(off as i64, size);
+                match mm {
+                    Mem::Int(..) => {
+                        let rd = self.def_i(d, S0);
+                        self.a.ldst(op, size, rd, IP1, off);
+                        self.fin_i(d, rd);
+                    }
+                    _ => {
+                        let xd = self.def_f(d, FS0);
+                        self.a.ldst(op, size, xd, IP1, off);
+                        self.fin_f(d, xd);
+                    }
+                }
+                return Some(());
+            }
+            Inst::StoreX(mm, base, x, 0, off, src) if x == t && reg_base(self, base) && src != t && (off as i64).unsigned_abs() < 1 << 24 => {
+                if !emit {
+                    return Some(());
+                }
+                let (op, size) = mem_op(mm, false);
+                let rs = match mm {
+                    Mem::Int(..) => self.use_stored(src, S0),
+                    _ => self.use_f(src, FS0),
+                };
+                let rc = self.use_i(base, S1);
+                let ra = self.use_i(a, IP1);
+                let rb = self.mul_operand(b);
+                self.a.e(0x9B00_0000 | (rb as u32) << 16 | (rc as u32) << 10 | (ra as u32) << 5 | IP1 as u32);
+                let off = self.ip1_off(off as i64, size);
+                self.a.ldst(op, size, rs, IP1, off);
+                return Some(());
+            }
+            _ => {}
+        }
         let (sub, d, c) = match *next {
             Inst::IBin(IOp::Add, it, d, x, y) if it.bits == 64 && y == t && x != t => (false, d, x),
             Inst::IBin(IOp::Add, it, d, x, y) if it.bits == 64 && x == t && y != t => (false, d, y),
@@ -3200,18 +3247,33 @@ impl<'a> Gen<'a> {
         }
         let rc = self.use_i(c, S0);
         let ra = self.use_i(a, S1);
-        let rb = match b {
-            Ok(b) => self.use_i(b, IP0),
-            Err(k) => {
-                self.a.mov_imm(IP0, k);
-                IP0
-            }
-        };
+        let rb = self.mul_operand(b);
         let rd = self.def_i(d, S0);
         // madd / msub xd, xa, xb, xc
         self.a.e(if sub { 0x9B00_8000 } else { 0x9B00_0000 } | (rb as u32) << 16 | (rc as u32) << 10 | (ra as u32) << 5 | rd as u32);
         self.fin_i(d, rd);
         Some(())
+    }
+
+    /// mul_add's second factor: its register (ip0 when spilled), or the constant built in ip0
+    fn mul_operand(&mut self, b: Result<VReg, i64>) -> u8 {
+        match b {
+            Ok(b) => self.use_i(b, IP0),
+            Err(k) => {
+                self.a.mov_imm(IP0, k);
+                IP0
+            }
+        }
+    }
+
+    /// An offset from ip1 that ldst encodes without ip1 as its offset register (else folded in)
+    fn ip1_off(&mut self, off: i64, size: u32) -> i64 {
+        if (off >= 0 && off % size as i64 == 0 && off / (size as i64) < 4096) || (-256..256).contains(&off) {
+            off
+        } else {
+            self.a.add_any(IP1, IP1, off);
+            0
+        }
     }
 
     /// `t = bswap64(a); d = t >> 32` is `rev wd, wa` (the byte-reversed low word, zero-extended);
