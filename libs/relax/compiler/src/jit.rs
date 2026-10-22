@@ -2895,6 +2895,7 @@ impl Unit {
             rethrow: u.syms.intern(crate::syms::SymKind::Rt("rethrow"), u.rt.rethrow),
         };
         relax_codegen::opt::set_mem_fns(u.rs.memcpy, u.rs.memmove);
+        relax_codegen::loops::set_memset(u.rs.memset);
         if w32 {
             // the shadow stacks' thread-local words, and the code transform (relax_codegen::web32)
             let off = u.tls_alloc(16, 8);
@@ -10289,6 +10290,12 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     // forwarded from the source: zero-fill and copy stores, every refill)
     if cfg.sroa && relax_codegen::opt::dead_slot_stores(func) {
         relax_backend::passes::live_dce(func);
+    }
+    // loops storing zeros over every element of an array (`[T::default(); N]`): one memset
+    if cfg.fold && relax_codegen::loops::zero_fill_loops(options, func) {
+        relax_codegen::loops::clear_unreachable(func);
+        relax_backend::passes::live_dce(func);
+        verify_pass(func, "zero_fill_loops");
     }
     if cfg.licm && !relax_backend::stats::opt_off(options, "-promote") && relax_codegen::opt::promote_loop_memory(func) {
         verify_pass(func, "promote_loop_memory");
