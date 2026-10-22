@@ -3406,6 +3406,9 @@ impl Unit {
     /// closures over them) answer false: the safe side for noalias.
     pub fn is_unpin(&self, t: TyId) -> bool {
         let t = self.tcx.tys.erase_regions(t);
+        // a field's associated-type projection (`<A as Allocator<u8>>::AllocatedMemory`) names
+        // the type it normalises to, as rustc's auto-trait selection sees it
+        let t = self.tcx.try_normalize_erasing_regions(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), t).unwrap_or(t);
         if let Some(b) = self.unpin_cache.get(&t) {
             return b;
         }
@@ -10142,6 +10145,10 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     if cfg.fold && relax_codegen::ranges::fold_ranges(options, func) {
         relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
     }
+    // compares a small set of possible operand values decides (tuple `lt` through Ordering)
+    if cfg.fold && !relax_backend::stats::opt_off(options, "-smallsets") && relax_codegen::opt::fold_small_sets(func) {
+        relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
+    }
     // bounds checks the counted loop's range implies once a guard in front of it holds: a
     // check-free clone (rotation, unrolling, vectorisation take it), the original as fallback
     if cfg.fold && relax_codegen::version::version_bounds_loops(options, func) {
@@ -10213,6 +10220,10 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         }
         // reads of a temporary a variable was copied from read the variable: one register
         relax_codegen::opt::reuse_copied_variables(options, func);
+        // bit readers' `x & ((1 << n) - 1)`: one bzhi (x64 BMI2) / bic of a shifted -1 (arm64)
+        if relax_codegen::opt::form_bzhi(options, func) {
+            relax_backend::passes::dce(func);
+        }
         // copies the late folds left unread (an unrolled pointer's per-copy values once address
         // modes read the base: `lea rcx,[rdi+1]; mov r8,rcx` before r8 is loaded over)
         if !relax_backend::stats::opt_off(options, "-latedce") {

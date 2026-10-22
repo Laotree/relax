@@ -287,6 +287,10 @@ pub enum IOp {
     /// rotate left by the second operand (mod the width); made by the optimiser from
     /// `x << k | x >> (w - k)` for unsigned 32-bit and 64-bit values only
     Rotl,
+    /// `a & ((1 << (b mod 64)) - 1)`: the low `b mod 64` bits of a (IntTy is U64); made by the
+    /// optimiser from that mask idiom (bit readers' `bitbuf & bitmask(n)`): x64 BMI2 `bzhi`,
+    /// arm64 `lsl` of all ones + `bic`
+    Bzhi,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

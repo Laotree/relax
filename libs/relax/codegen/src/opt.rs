@@ -6419,6 +6419,243 @@ pub fn promote_dyn_read_slots(f: &mut Func) -> bool {
     true
 }
 
+/// The mask idiom of bit readers, `x & ((1 << n) - 1)` (and `x & !(-1 << n)`) on 64-bit values,
+/// becomes `x bzhi n` (IOp::Bzhi) when the shift and the mask are read only there: x64 BMI2 `and`
+/// of the count + `bzhi` (was `mov 1; shlx; sub; and`, a three-deep chain), arm64 `movn; lslv;
+/// bic`. The shift and subtraction are left for DCE. The count must hold the same value at the
+/// mask as at the shift: one definition, or none between them in their block. Only where the
+/// target has the short form (x64 without BMI2 would expand it again). Returns whether anything
+/// changed.
+pub fn form_bzhi(options: &relax_session::Options, f: &mut Func) -> bool {
+    if opt_off(options, "-bzhi") || !(cfg!(target_arch = "aarch64") || options.cpu.bmi2) {
+        return false;
+    }
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    let mut nuse = vec![0u32; nv];
+    let mut def_at = vec![(u32::MAX, 0u32); nv];
+    // the constant every definition of a vreg assigns (a constant materialised on several paths)
+    let mut kval: Vec<Option<Option<i64>>> = vec![None; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+        kval[p.0 as usize] = Some(None);
+    }
+    let mut tu = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            let c = if let Inst::Iconst(_, c) = *i { Some(c) } else { None };
+            for_defs(i, |d| {
+                ndef[d.0 as usize] += 1;
+                def_at[d.0 as usize] = (bi as u32, k as u32);
+                let e = &mut kval[d.0 as usize];
+                *e = Some(match (*e, c) {
+                    (None, c) => c,
+                    (Some(Some(x)), Some(y)) if x == y => Some(x),
+                    _ => None,
+                });
+            });
+            for_uses(i, |u| nuse[u.0 as usize] += 1);
+        }
+        term_uses(&b.term, &mut tu);
+        for u in &tu {
+            nuse[u.0 as usize] += 1;
+        }
+    }
+    let single = |v: VReg| ndef[v.0 as usize] == 1 && def_at[v.0 as usize].0 != u32::MAX;
+    let def = |f: &Func, v: VReg| -> Inst { let (b, k) = def_at[v.0 as usize]; f.blocks[b as usize].insts[k as usize].clone() };
+    let konst = |_: &Func, v: VReg, want: i64| kval[v.0 as usize] == Some(Some(want));
+    // (shift's block, index, count) of `m` when it is the low-n-bits mask of a count n
+    let mask = |f: &Func, m: VReg| -> Option<(u32, u32, VReg)> {
+        if !single(m) || nuse[m.0 as usize] != 1 {
+            return None;
+        }
+        let (s, ones) = match def(f, m) {
+            Inst::IBinI(IOp::Sub, it, _, s, 1) if it.bits == 64 => (s, 1),
+            Inst::IBinI(IOp::Add, it, _, s, -1) if it.bits == 64 => (s, 1),
+            Inst::IBinI(IOp::Xor, it, _, s, -1) if it.bits == 64 => (s, -1),
+            _ => return None,
+        };
+        if !single(s) || nuse[s.0 as usize] != 1 {
+            return None;
+        }
+        match def(f, s) {
+            Inst::IBin(IOp::Shl, it, _, one, n) if it.bits == 64 && konst(f, one, ones) => {
+                let (b, k) = def_at[s.0 as usize];
+                Some((b, k, n))
+            }
+            _ => None,
+        }
+    };
+    let mut edits = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            let Inst::IBin(IOp::And, it, d, p, q) = *i else { continue };
+            if it.bits != 64 {
+                continue;
+            }
+            for (x, m) in [(p, q), (q, p)] {
+                let Some((sb, sk, n)) = mask(f, m) else { continue };
+                // n unchanged from the shift to here
+                let same = if single(n) || f.params.contains(&n) && ndef[n.0 as usize] == 1 {
+                    true
+                } else if sb as usize == bi && (sk as usize) < k {
+                    !b.insts[sk as usize + 1..k].iter().any(|j| {
+                        let mut w = false;
+                        for_defs(j, |v| w |= v == n);
+                        w
+                    })
+                } else {
+                    false
+                };
+                if same && x != m {
+                    edits.push((bi, k, Inst::IBin(IOp::Bzhi, U64, d, x, n)));
+                    break;
+                }
+            }
+        }
+    }
+    let changed = !edits.is_empty();
+    for (bi, k, i) in edits {
+        f.blocks[bi].insts[k] = i;
+    }
+    changed
+}
+
+/// The few values an integer vreg can hold where it is read, when its definitions make them a
+/// small set: constants, compare outcomes (0 / 1, or what the operands' sets give), selects of such
+/// values, and unary maps of them (integer conversions, operations with a constant). A vreg with
+/// several definitions (RIR is not SSA: a constant per path, `Iconst(v, 0)` in two blocks) holds
+/// one of their values. At most four values, eight definitions deep. `defs[v]` is empty for a
+/// parameter (unknown).
+fn small_set(f: &Func, defs: &[Vec<(u32, u32)>], v: VReg, depth: u32, out: &mut Vec<i64>, budget: &mut u32) -> bool {
+    if depth == 0 || defs[v.0 as usize].is_empty() || *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    defs[v.0 as usize].iter().all(|&(bi, k)| small_set_def(f, defs, &f.blocks[bi as usize].insts[k as usize], depth, out, budget))
+}
+
+fn small_set_def(f: &Func, defs: &[Vec<(u32, u32)>], i: &Inst, depth: u32, out: &mut Vec<i64>, budget: &mut u32) -> bool {
+    let push = |out: &mut Vec<i64>, x: i64| -> bool {
+        if !out.contains(&x) {
+            if out.len() == 4 {
+                return false;
+            }
+            out.push(x);
+        }
+        true
+    };
+    match *i {
+        Inst::Iconst(_, c) => push(out, c),
+        // a compare of small sets: its outcomes; else either
+        Inst::ICmpI(cc, sg, _, x, c) => {
+            let mut xs = Vec::new();
+            if small_set(f, defs, x, depth - 1, &mut xs, budget) {
+                xs.into_iter().all(|a| push(out, cmp_i(cc, sg, a, c) as i64))
+            } else {
+                push(out, 0) && push(out, 1)
+            }
+        }
+        Inst::ICmp(cc, sg, _, x, y) => {
+            let (mut xs, mut ys) = (Vec::new(), Vec::new());
+            if small_set(f, defs, x, depth - 1, &mut xs, budget) && small_set(f, defs, y, depth - 1, &mut ys, budget) {
+                xs.iter().all(|&a| ys.iter().all(|&b| push(out, cmp_i(cc, sg, a, b) as i64)))
+            } else {
+                push(out, 0) && push(out, 1)
+            }
+        }
+        Inst::FCmp(..) => push(out, 0) && push(out, 1),
+        Inst::Mov(_, a) => small_set(f, defs, a, depth - 1, out, budget),
+        Inst::Sel(_, _, a, b) => small_set(f, defs, a, depth - 1, out, budget) && small_set(f, defs, b, depth - 1, out, budget),
+        Inst::Conv(Conv::IntToInt(it), _, a) => {
+            let mut xs = Vec::new();
+            small_set(f, defs, a, depth - 1, &mut xs, budget) && xs.into_iter().all(|x| push(out, extend_const(x, it)))
+        }
+        Inst::IBinI(op, it, _, a, c) if !matches!(op, IOp::Div | IOp::Rem) => {
+            let mut xs = Vec::new();
+            small_set(f, defs, a, depth - 1, &mut xs, budget) && xs.into_iter().all(|x| fold_ibin(op, it, x, c).map_or(false, |y| push(out, y)))
+        }
+        _ => false,
+    }
+}
+
+/// Compares and selects decided by the small value sets of their operands (LLVM's fold of a
+/// compare of a select of constants, InstCombine `foldCmpLoadFromIndexedGlobal`'s set form):
+/// tuple `lt` compares fields through `Ordering` as an i8 (`lt ? -1 : (eq ^ 1)`) and tests the
+/// sign-extended byte against `ControlFlow`'s niche (254), which no value of the set is: the
+/// branch is always taken. A compare all of whose operand values give one outcome becomes that
+/// constant; a select on a condition with one possible value becomes a copy. Returns whether
+/// anything changed (simplify then folds the branches).
+pub fn fold_small_sets(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    let mut defs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nv];
+    let mut param = vec![false; nv];
+    for p in &f.params {
+        param[p.0 as usize] = true;
+    }
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            for_defs(i, |d| {
+                if !param[d.0 as usize] {
+                    defs[d.0 as usize].push((bi as u32, k as u32));
+                }
+            });
+        }
+    }
+    // a parameter (also when redefined) has values no definition shows
+    for v in 0..nv {
+        if param[v] {
+            defs[v].clear();
+        }
+    }
+    let mut edits: Vec<(usize, usize, Inst)> = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            let (d, cc, sg, x, y) = match *i {
+                Inst::ICmpI(cc, sg, d, x, c) => (d, cc, sg, x, Err(c)),
+                Inst::ICmp(cc, sg, d, x, y) => (d, cc, sg, x, Ok(y)),
+                Inst::Sel(d, c, a, b2) => {
+                    let mut cs = Vec::new();
+                    if small_set(f, &defs, c, 8, &mut cs, &mut 64) && !cs.is_empty() {
+                        let t = cs.iter().all(|&x| x != 0);
+                        if t || cs.iter().all(|&x| x == 0) {
+                            edits.push((bi, k, Inst::Mov(d, if t { a } else { b2 })));
+                        }
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            let mut xs = Vec::new();
+            if !small_set(f, &defs, x, 8, &mut xs, &mut 64) || xs.is_empty() {
+                continue;
+            }
+            let ys = match y {
+                Err(c) => vec![c],
+                Ok(y) => {
+                    let mut ys = Vec::new();
+                    if !small_set(f, &defs, y, 8, &mut ys, &mut 64) || ys.is_empty() {
+                        continue;
+                    }
+                    ys
+                }
+            };
+            let r0 = cmp_i(cc, sg, xs[0], ys[0]);
+            if xs.iter().all(|&a| ys.iter().all(|&b| cmp_i(cc, sg, a, b) == r0)) {
+                // a single-value pair is a constant compare simplify folds itself
+                if xs.len() > 1 || ys.len() > 1 {
+                    edits.push((bi, k, Inst::Iconst(d, r0 as i64)));
+                }
+            }
+        }
+    }
+    let changed = !edits.is_empty();
+    for (bi, k, i) in edits {
+        f.blocks[bi].insts[k] = i;
+    }
+    changed
+}
+
 /// Bit-tracking dead code for masks and casts (LLVM's BDCE): per integer vreg, the bits any of
 /// its uses reads (a fixed point over every use, so multi-definition variables -- a bit
 /// reader's `bitsleft`, read only as `bitsleft as u8` and `(bitsleft >> 3) & 7` -- are covered);
