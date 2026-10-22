@@ -192,7 +192,7 @@ impl NativeBin {
             let sec = &m.secs[s.sect as usize - 1];
             let b = &bounds[&s.sect];
             let end = b.get(b.partition_point(|&x| x <= s.value)).copied().unwrap_or(sec.addr + sec.size as u64);
-            fns.push(NativeFn { addr: s.value, size: end - s.value, name: demangle(&s.name) });
+            fns.push(NativeFn { addr: s.value, size: end - s.value, name: demangle(s.name.strip_prefix('_').unwrap_or(&s.name)) });
         }
         dedupe(&mut fns);
         let mut text: Vec<(u64, usize, usize)> = m.secs.iter().filter(|s| s.seg == "__TEXT" && s.name == "__text").map(|s| (s.addr, s.off, s.size)).collect();
