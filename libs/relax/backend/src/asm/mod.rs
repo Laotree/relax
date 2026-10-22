@@ -1422,3 +1422,5 @@ mod tests_x64;
 mod tests_arm64;
 #[cfg(test)]
 mod tests_dis_x64;
+#[cfg(test)]
+mod tests_dis_arm64;
