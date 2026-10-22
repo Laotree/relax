@@ -6603,9 +6603,6 @@ pub fn coalesce_slot_copies(f: &mut Func) -> bool {
                 s[i / 64] &= !(1 << (i % 64));
             }
         }
-        fn anyb(s: &[u64], a: usize, b: usize) -> bool {
-            (a..b).any(|i| s[i / 64] >> (i % 64) & 1 != 0)
-        }
         let xfer = |live: &mut [u64], rd: Option<(u32, i64, i64)>, wr: Option<(u32, i64, i64)>| {
             if let Some((s2, lo, hi)) = wr {
                 if let Some((_, cov)) = bits(s2, lo, hi) {
@@ -6652,8 +6649,10 @@ pub fn coalesce_slot_copies(f: &mut Func) -> bool {
                 }
             }
         }
-        // per candidate: interference found
+        // per candidate: interference found, and the bytes it was found in (byte-granular slots:
+        // the cover [lo, hi) of the conflicting bytes)
         let mut bad = vec![false; cands.len()];
+        let mut conf: Vec<Option<(i64, i64)>> = vec![None; cands.len()];
         // slot -> candidates it is in
         let mut of_slot: Vec<Vec<usize>> = vec![Vec::new(); ns];
         for (k, &(_, _, bs, cs)) in cands.iter().enumerate() {
@@ -6681,38 +6680,208 @@ pub fn coalesce_slot_copies(f: &mut Func) -> bool {
                             continue;
                         }
                         let other = if s2 == bs { cs } else { bs };
-                        let hit = match bits(other, lo, hi) {
-                            Some((over, _)) => anyb(&cur, over.0, over.1),
-                            None => {
-                                let (x, y) = whole(other);
-                                anyb(&cur, x, y)
-                            }
+                        let (x, y) = match bits(other, lo, hi) {
+                            Some((over, _)) => over,
+                            None => whole(other),
                         };
-                        if hit {
-                            bad[k] = true;
+                        for bit in x..y {
+                            if cur[bit / 64] >> (bit % 64) & 1 != 0 {
+                                if gran[other as usize] != 1 {
+                                    bad[k] = true;
+                                    break;
+                                }
+                                let byte = (bit - base[other as usize] as usize) as i64;
+                                conf[k] = Some(match conf[k] {
+                                    None => (byte, byte + 1),
+                                    Some((a, b)) => (a.min(byte), b.max(byte + 1)),
+                                });
+                            }
                         }
                     }
                 }
                 xfer(&mut cur, rd, wr);
             }
         }
+        // a partial join: the conflicting bytes stay in C (the copy shrinks to them); every other
+        // access of C goes to B. Each access of C must lie wholly inside or outside the kept bytes
+        // (constant extents only); C is no call's result buffer. `Option::take` after a move out
+        // (pulldown-cmark's peeked item): only the discriminant byte is written in B while C is
+        // still read, so 1 byte is copied instead of 80
+        let keep_ok = |k: usize| -> Option<(i64, i64)> {
+            let (cb, ci, _, cs) = cands[k];
+            let (lo, hi) = conf[k]?;
+            let n = f.slots[cs as usize].size as i64;
+            if bad[k] || sret_call[cs as usize].is_some() || 2 * (hi - lo) > n {
+                return None;
+            }
+            for (bi, b) in f.blocks.iter().enumerate() {
+                for (ii, i) in b.insts.iter().enumerate() {
+                    if (bi, ii) == (cb, ci) {
+                        continue;
+                    }
+                    let mut ext: Vec<(i64, i64)> = Vec::new();
+                    let at = |v: VReg| vs[v.0 as usize].1;
+                    match *i {
+                        Inst::Load(m, _, b2, o) | Inst::Store(m, b2, o, _) if sl(b2) == cs => ext.push((at(b2) + o as i64, at(b2) + o as i64 + mem_size(m) as i64)),
+                        Inst::VLoad(d, b2, o) if sl(b2) == cs => ext.push((at(b2) + o as i64, at(b2) + o as i64 + if f.vregs[d.0 as usize] == Cls::V256 { 32 } else { 16 })),
+                        Inst::VStore(b2, o, v) if sl(b2) == cs => ext.push((at(b2) + o as i64, at(b2) + o as i64 + if f.vregs[v.0 as usize] == Cls::V256 { 32 } else { 16 })),
+                        Inst::LoadX(_, _, b2, ..) | Inst::VLoadX(_, b2, ..) | Inst::StoreX(_, b2, ..) | Inst::VStoreX(b2, ..) if sl(b2) == cs => return None,
+                        Inst::Copy(d, s2, m) => {
+                            if sl(d) == cs {
+                                ext.push((at(d), at(d) + m as i64));
+                            }
+                            if sl(s2) == cs {
+                                ext.push((at(s2), at(s2) + m as i64));
+                            }
+                        }
+                        _ => {}
+                    }
+                    for (a, z) in ext {
+                        let inside = a >= lo && z <= hi;
+                        let outside = z <= lo || a >= hi;
+                        if !inside && !outside {
+                            return None;
+                        }
+                    }
+                }
+            }
+            Some((lo, hi))
+        };
         // join the first good candidate per slot pair (slots may sit in several candidates)
         let mut used = vec![false; ns];
         let mut to: Vec<u32> = (0..ns as u32).collect();
         let mut dels: Vec<(usize, usize)> = Vec::new();
+        // partial joins: (copy block, copy index, B, C, kept bytes)
+        let mut parts: Vec<(usize, usize, u32, u32, (i64, i64))> = Vec::new();
+        let mut aligns: Vec<(u32, u32)> = Vec::new();
         for (k, &(cb, ci, bs, cs)) in cands.iter().enumerate() {
-            if bad[k] || used[bs as usize] || used[cs as usize] {
+            if used[bs as usize] || used[cs as usize] {
+                continue;
+            }
+            if bad[k] || conf[k].is_some() {
+                if let Some(keep) = keep_ok(k) {
+                    used[bs as usize] = true;
+                    used[cs as usize] = true;
+                    parts.push((cb, ci, bs, cs, keep));
+                }
                 continue;
             }
             used[bs as usize] = true;
             used[cs as usize] = true;
             to[bs as usize] = cs;
-            let al = f.slots[bs as usize].align.max(f.slots[cs as usize].align);
-            f.slots[cs as usize].align = al;
+            aligns.push((cs, f.slots[bs as usize].align.max(f.slots[cs as usize].align)));
             dels.push((cb, ci));
         }
-        if dels.is_empty() {
+        for (cs, al) in aligns {
+            f.slots[cs as usize].align = al;
+        }
+        if dels.is_empty() && parts.is_empty() {
             return any;
+        }
+        // partial joins first (positions of the whole joins' copies stay valid: those are removed
+        // back to front below, and partial rewrites insert only within blocks after recording)
+        if !parts.is_empty() {
+            let vs2 = vs.clone();
+            let slv = |v: VReg| vs2[v.0 as usize].0;
+            let mut part_of: Vec<Option<usize>> = vec![None; ns];
+            for (k, p) in parts.iter().enumerate() {
+                part_of[p.3 as usize] = Some(k);
+            }
+            for bi in 0..nb {
+                let insts = std::mem::take(&mut f.blocks[bi].insts);
+                let pos = std::mem::take(&mut f.blocks[bi].pos);
+                for (ii, mut i) in insts.into_iter().enumerate() {
+                    let p0 = pos.get(ii).copied();
+                    let mut pre: Vec<Inst> = Vec::new();
+                    // the shrunken copy: C[lo..hi) <- B[lo..hi)
+                    if let Some(k) = parts.iter().position(|p| (p.0, p.1) == (bi, ii)) {
+                        let (_, _, _, _, (lo, hi)) = parts[k];
+                        if let Inst::Copy(d, s2, _) = i {
+                            let (dd, ss) = if lo == 0 {
+                                (d, s2)
+                            } else {
+                                let (dd, ss) = (f.vreg(Cls::I), f.vreg(Cls::I));
+                                pre.push(Inst::IBinI(IOp::Add, U64, dd, d, lo));
+                                pre.push(Inst::IBinI(IOp::Add, U64, ss, s2, lo));
+                                (dd, ss)
+                            };
+                            i = Inst::Copy(dd, ss, (hi - lo) as u32);
+                        }
+                    } else {
+                        // an access of a partially joined C outside the kept bytes: B's address
+                        let redirect = |v: VReg, ext: (i64, i64)| -> Option<(u32, i64)> {
+                            let s3 = slv(v);
+                            if s3 == NONE {
+                                return None;
+                            }
+                            let k = part_of[s3 as usize]?;
+                            let (lo, hi) = parts[k].4;
+                            if ext.1 <= lo || ext.0 >= hi {
+                                Some((parts[k].2, vs2[v.0 as usize].1))
+                            } else {
+                                None
+                            }
+                        };
+                        let at = |v: VReg| vs2[v.0 as usize].1;
+                        let new_base = |f: &mut Func, pre: &mut Vec<Inst>, b3: u32, o: i64| -> VReg {
+                            let t = f.vreg(Cls::I);
+                            pre.push(Inst::SlotAddr(t, b3));
+                            if o == 0 {
+                                t
+                            } else {
+                                let t2 = f.vreg(Cls::I);
+                                pre.push(Inst::IBinI(IOp::Add, U64, t2, t, o));
+                                t2
+                            }
+                        };
+                        match &mut i {
+                            Inst::Load(m, _, b2, o) | Inst::Store(m, b2, o, _) => {
+                                let e = (at(*b2) + *o as i64, at(*b2) + *o as i64 + mem_size(*m) as i64);
+                                if let Some((b3, bo)) = redirect(*b2, e) {
+                                    *b2 = new_base(f, &mut pre, b3, bo);
+                                }
+                            }
+                            Inst::VLoad(d, b2, o) => {
+                                let wv = if f.vregs[d.0 as usize] == Cls::V256 { 32 } else { 16 };
+                                let e = (at(*b2) + *o as i64, at(*b2) + *o as i64 + wv);
+                                if let Some((b3, bo)) = redirect(*b2, e) {
+                                    *b2 = new_base(f, &mut pre, b3, bo);
+                                }
+                            }
+                            Inst::VStore(b2, o, v) => {
+                                let wv = if f.vregs[v.0 as usize] == Cls::V256 { 32 } else { 16 };
+                                let e = (at(*b2) + *o as i64, at(*b2) + *o as i64 + wv);
+                                if let Some((b3, bo)) = redirect(*b2, e) {
+                                    *b2 = new_base(f, &mut pre, b3, bo);
+                                }
+                            }
+                            Inst::Copy(d, s2, m) => {
+                                let m = *m as i64;
+                                if let Some((b3, bo)) = redirect(*d, (at(*d), at(*d) + m)) {
+                                    *d = new_base(f, &mut pre, b3, bo);
+                                }
+                                if let Some((b3, bo)) = redirect(*s2, (at(*s2), at(*s2) + m)) {
+                                    *s2 = new_base(f, &mut pre, b3, bo);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    for x in pre {
+                        f.blocks[bi].insts.push(x);
+                        if let Some(p) = p0 {
+                            f.blocks[bi].pos.push(p);
+                        }
+                    }
+                    f.blocks[bi].insts.push(i);
+                    if let Some(p) = p0 {
+                        f.blocks[bi].pos.push(p);
+                    }
+                }
+            }
+            // whole joins wait for the next round (the positions moved)
+            any = true;
+            continue;
         }
         dels.sort_unstable_by(|x, y| y.cmp(x));
         for (cb, ci) in dels {
