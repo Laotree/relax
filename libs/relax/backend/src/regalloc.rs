@@ -970,7 +970,11 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     let (mut remat, base_only) = remat_values(options, f, &reach, cfg);
     // base + k is recomputed at its uses: the base must be live (hold its one value) at each of
     // them -- not over the whole range of the value (the cold-call split leaves the base a hole
-    // at a call the value lives across)
+    // at a call the value lives across). A base that is base + k itself is recomputed there too
+    // (x64/arm64 base_disp fold the chain down to the first base with a location), so every base
+    // of the chain must be live at the use: `v = w + 16, w = self + 0x2938` read v in a loop where
+    // the split parked `self` in a copy (a hole) while w stayed live past the loop: the load used
+    // `self`'s register, which the loop counter had taken (Sandbox race x64 fault at 0x2948).
     if remat.iter().any(|r| matches!(r, Remat::Offset(..))) {
         let mut ok = vec![true; nv as usize];
         let live_at = |b: u32, p: u32| ranges.of(b).iter().any(|&(a, z)| a <= p && p <= z);
@@ -982,10 +986,13 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             for k in 0..=b.insts.len() {
                 let p = if k < b.insts.len() { block_start[bi] + 2 * k as u32 + 1 } else { block_end[bi] - 1 };
                 for &u in tab.uses(k0 + k) {
-                    if let Remat::Offset(base, _) = remat[u as usize] {
+                    let mut at = u;
+                    while let Remat::Offset(base, _) = remat[at as usize] {
                         if !live_at(base.0, p) {
                             ok[u as usize] = false;
+                            break;
                         }
+                        at = base.0;
                     }
                 }
             }
@@ -1366,10 +1373,11 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             eprintln!("ra-spill {} v{} w={:.3} refs={:.2} len={} unit={} ranges={} | {}", f.name, v, weight[v], refs[v], len, unit, r.len(), by.join(" "));
         }
     }
-    // second chance for spilled values (O3, second_chance) on load/store targets. MAKEPAD_RUN_OPT=-evict:
-    // off, +evict: also where instructions read slots (x64: measured neutral to +1.3% instructions
-    // over rwbench there and +14% allocation time -- a folded slot read costs no instruction, a reload does)
-    let evict_on = thorough && !crate::stats::opt_off(options, "-evict") && (!cfg.mem_operands || crate::stats::opt_off(options, "+evict"));
+    // second chance for spilled values (O3, second_chance): only on request (MAKEPAD_RUN_OPT=+evict).
+    // Measured neutral on both arches against +14% allocation time: x64 rwbench neutral to +1.3%
+    // instructions (a folded slot read costs no instruction, a reload does); arm64 (mini, same binary)
+    // ogg / sdf -0.3..0.4%, box3d / layout +0.2..0.25%
+    let evict_on = thorough && crate::stats::opt_off(options, "+evict");
     let (evicts, prestores, lent) = if evict_on && loc.iter().any(|l| matches!(l, Loc::Stack(_))) {
         // values in a coalesced unit, passed-through loop pieces and recomputed ones keep their place
         let skip: Vec<bool> = (0..nv).map(|v| unit_members(v).is_some() || parent[v as usize] != v || is_low(v) || remat[v as usize].is_some()).collect();
@@ -3103,13 +3111,20 @@ fn allocate_baseline(options: &relax_session::Options, f: &Func, cfg: &RegConfig
     }
     fma_alt.sort_unstable();
     let (mut remat, base_only) = remat_values(options, f, &reach, cfg);
-    // base + k: only inside the base's hull (it holds its one value there)
+    // base + k: only inside the base's hull (it holds its one value there); a base that is base + k
+    // itself is folded down to its own base at the use, so inside every hull of the chain
     for v in 0..nv {
-        if let Remat::Offset(b, _) = remat[v] {
+        if start[v] == u32::MAX {
+            continue;
+        }
+        let mut at = v;
+        while let Remat::Offset(b, _) = remat[at] {
             let b = b.0 as usize;
-            if start[v] != u32::MAX && !(start[b] <= start[v] && end[v] <= end[b]) {
+            if !(start[b] <= start[v] && end[v] <= end[b]) {
                 remat[v] = Remat::No;
+                break;
             }
+            at = b;
         }
     }
     let mut order: Vec<u64> = (0..nv).filter(|&v| start[v] != u32::MAX && !base_only[v]).map(|v| (start[v] as u64) << 32 | v as u64).collect();
