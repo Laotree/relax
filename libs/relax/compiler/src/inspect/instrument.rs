@@ -194,6 +194,11 @@ struct Parked {
     regs: Vec<u64>,
 }
 
+/// The parked breakpoint hit of thread `os_id`, if any: its id.
+pub fn parked_break_of(os_id: u64) -> Option<u64> {
+    PARKED.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|p| p.os_id == os_id).map(|p| p.id)
+}
+
 /// Parked breakpoint hit `id` (the newest with None): (id, thread os id, register block).
 pub fn parked_break(id: Option<u64>) -> Option<(u64, u64, Vec<u64>)> {
     let list = PARKED.lock().unwrap_or_else(|e| e.into_inner());

@@ -1290,6 +1290,8 @@ impl Func {
         if self.dbg.is_empty() || copies.is_empty() && consts.is_empty() {
             return;
         }
+        let copies: std::collections::HashMap<u32, VReg> = copies.iter().map(|c| (c.0 .0, c.1)).collect();
+        let consts: std::collections::HashMap<u32, i64> = consts.iter().map(|c| (c.0 .0, c.1)).collect();
         for d in self.dbg.iter_mut() {
             match &mut d.loc {
                 DbgLoc::Regs(r) => {
@@ -1297,18 +1299,21 @@ impl Func {
                         if *v == DBG_NONE {
                             continue;
                         }
-                        // a copy chain resolves in order (the pass's list is resolved already)
-                        if let Some(&(_, s)) = copies.iter().find(|c| c.0 == *v) {
-                            *v = s;
+                        // (a chain of removed copies: to its end)
+                        for _ in 0..64 {
+                            match copies.get(&v.0) {
+                                Some(&s) if s != *v => *v = s,
+                                _ => break,
+                            }
                         }
-                        if let Some(&(_, k)) = consts.iter().find(|c| c.0 == *v) {
+                        if let Some(&k) = consts.get(&v.0) {
                             *v = DBG_NONE;
                             d.k.push((leaf as u32, k));
                         }
                     }
                 }
                 DbgLoc::Mem(v, _) => {
-                    if let Some(&(_, s)) = copies.iter().find(|c| c.0 == *v) {
+                    if let Some(&s) = copies.get(&v.0) {
                         *v = s;
                     }
                 }

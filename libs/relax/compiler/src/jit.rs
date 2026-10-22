@@ -16857,12 +16857,25 @@ impl PcMap {
             b.push((x as u8 & 0x7f) | 0x80);
             x >>= 7;
         };
+        // the variable table (relax_backend::dbgloc): its length entry as any other, then its
+        // bytes as they are (the four of each chunk entry, the last one's remainder)
+        let mut raw = 0usize;
         for (o, p) in v {
+            if raw > 0 && o == relax_backend::dbgloc::PC_VARS {
+                let n = raw.min(4);
+                b.extend_from_slice(&(p as u32).to_le_bytes()[..n]);
+                raw -= n;
+                continue;
+            }
+            raw = 0;
             put(b, o.wrapping_sub(po) as u64);
             let d = p.wrapping_sub(pp) as i64;
             put(b, ((d << 1) ^ (d >> 63)) as u64);
             po = o;
             pp = p;
+            if o == relax_backend::dbgloc::PC_VARS {
+                raw = p as u32 as usize;
+            }
         }
     }
 
@@ -16921,6 +16934,20 @@ impl PcMap {
             };
             if !f(o, q) {
                 break;
+            }
+            // the variable table's bytes follow its length entry as they are (encode_to)
+            if o == relax_backend::dbgloc::PC_VARS {
+                let mut left = (p as u32 as usize).min(b.len() - i);
+                while left > 0 {
+                    let n = left.min(4);
+                    let mut w = [0u8; 4];
+                    w[..n].copy_from_slice(&b[i..i + n]);
+                    i += n;
+                    left -= n;
+                    if !f(o, (q & !0xffff_ffff) | u32::from_le_bytes(w) as u64) {
+                        return;
+                    }
+                }
             }
         }
     }

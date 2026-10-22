@@ -87,7 +87,7 @@ pub fn stats_on() -> bool {
 }
 
 /// Bytes of `entries` in PcMap's varint delta form, continuing from entry `prev`.
-fn varint_bytes(prev: (u32, u64), entries: &[(u32, u64)]) -> u64 {
+pub fn varint_bytes(prev: (u32, u64), entries: &[(u32, u64)]) -> u64 {
     let len = |x: u64| -> u64 { (64 - x.max(1).leading_zeros() as u64 + 6) / 7 };
     let (mut po, mut pp) = prev;
     let mut n = 0;
@@ -109,12 +109,17 @@ pub fn note_stats(code: &[(u32, u64)], vars: &[(u32, u64)], table_bytes: usize) 
     if !stats_on() {
         return;
     }
-    STATS[1].fetch_add(1, Relaxed);
+    let n = STATS[1].fetch_add(1, Relaxed) + 1;
     STATS[4].fetch_add(varint_bytes((0, 0), code), Relaxed);
+    if n % 2000 == 0 {
+        let g = |k: usize| STATS[k].load(Relaxed);
+        eprintln!("makepad-run vars: {} of {} bodies with a table, table bytes {}, its pc-map bytes {}, code pc-map bytes {}", g(0), g(1), g(2), g(3), g(4));
+    }
     if !vars.is_empty() {
         STATS[0].fetch_add(1, Relaxed);
         STATS[2].fetch_add(table_bytes as u64, Relaxed);
-        STATS[3].fetch_add(varint_bytes(code.last().map_or((0, 0), |e| (e.0, e.1)), vars), Relaxed);
+        // (PcMap stores the length entry, then the table's bytes as they are)
+        STATS[3].fetch_add(varint_bytes(code.last().map_or((0, 0), |e| (e.0, e.1)), &vars[..1]) + table_bytes as u64, Relaxed);
     }
 }
 
@@ -150,6 +155,7 @@ pub fn build(f: &Func, al: &Alloc, fr: &Frame, calls: &[(u32, u32)]) -> Vec<u8> 
     // variables by (context, local); every debug entry is one of them (live-range pieces of a
     // leaf are twins of an entry)
     let mut vars: Vec<Var> = Vec::new();
+    let mut var_of: std::collections::HashMap<(u16, u32), usize> = std::collections::HashMap::new();
     let mut of_entry: Vec<u32> = Vec::with_capacity(f.dbg.len());
     let used = used_slots(f);
     for d in &f.dbg {
@@ -178,14 +184,11 @@ pub fn build(f: &Func, al: &Alloc, fr: &Frame, calls: &[(u32, u32)]) -> Vec<u8> 
             }
             DbgLoc::Mem(_, off) => VarKind::Mem(*off),
         };
-        let k = match vars.iter().position(|v| v.ctx == d.ctx && v.local == d.local) {
-            // a twin (a live-range piece): the same variable
-            Some(k) => k,
-            None => {
-                vars.push(Var { ctx: d.ctx, local: d.local, kind, consts: Vec::new() });
-                vars.len() - 1
-            }
-        };
+        // a twin (a live-range piece) is the same variable
+        let k = *var_of.entry((d.ctx, d.local)).or_insert_with(|| {
+            vars.push(Var { ctx: d.ctx, local: d.local, kind, consts: Vec::new() });
+            vars.len() - 1
+        });
         for &c in &d.k {
             if !vars[k].consts.iter().any(|x| x.0 == c.0) {
                 vars[k].consts.push(c);
@@ -450,7 +453,24 @@ pub fn build(f: &Func, al: &Alloc, fr: &Frame, calls: &[(u32, u32)]) -> Vec<u8> 
                             }
                         };
                         let mut row: Vec<(u32, u32, Home)> = Vec::new();
-                        for (n, &v) in regs_of.iter().enumerate() {
+                        // the candidates: live after the call, held on entry, or its operands
+                        let mut cand: Vec<usize> = Vec::new();
+                        for w in 0..words {
+                            let mut m = held[w] | live_after.get(w).copied().unwrap_or(0);
+                            while m != 0 {
+                                cand.push(w * 64 + m.trailing_zeros() as usize);
+                                m &= m - 1;
+                            }
+                        }
+                        for a in args.iter().chain(match callee { Callee::Indirect(x) => std::slice::from_ref(x), _ => &[] }) {
+                            if let Some(&i) = idx.get(a.0 as usize).filter(|i| **i != NONE) {
+                                cand.push(i as usize);
+                            }
+                        }
+                        cand.sort_unstable();
+                        cand.dedup();
+                        for n in cand {
+                            let v = regs_of[n];
                             let across = !live_after.is_empty() && has(live_after, n) && !defs_here.contains(&v);
                             let used = args.contains(&VReg(v)) || matches!(callee, Callee::Indirect(x) if x.0 == v);
                             let held_here = !across && !used && has(&held, n);
@@ -474,12 +494,12 @@ pub fn build(f: &Func, al: &Alloc, fr: &Frame, calls: &[(u32, u32)]) -> Vec<u8> 
                             });
                             let Some(h) = h else { continue };
                             for &(var, leaf) in &holds[n] {
-                                if !row.iter().any(|r| r.0 == var && r.1 == leaf) {
-                                    row.push((var, leaf, h));
-                                }
+                                row.push((var, leaf, h));
                             }
                         }
-                        row.sort_unstable_by_key(|r| (r.0, r.1));
+                        // one home per leaf (values of one copy class hold the same value)
+                        row.sort_by_key(|r| (r.0, r.1));
+                        row.dedup_by_key(|r| (r.0, r.1));
                         table.sites.push((ret, row));
                     }
                     // a call clobbers the caller-saved registers
@@ -503,6 +523,32 @@ pub fn build(f: &Func, al: &Alloc, fr: &Frame, calls: &[(u32, u32)]) -> Vec<u8> 
             }
         }
         table.sites.sort_unstable_by_key(|s| s.0);
+    }
+    // only what a stop can show: variables located somewhere (a site, a constant, a frame
+    // slot) and the sites that locate something; a variable left out reads as optimised out
+    let mut used = vec![false; table.vars.len()];
+    for (_, row) in &table.sites {
+        for r in row {
+            used[r.0 as usize] = true;
+        }
+    }
+    for (k, v) in table.vars.iter().enumerate() {
+        used[k] |= !v.consts.is_empty() || matches!(v.kind, VarKind::Frame(_) | VarKind::Shared);
+    }
+    let mut renum = vec![u32::MAX; table.vars.len()];
+    let mut kept = Vec::new();
+    for (k, v) in table.vars.drain(..).enumerate() {
+        if used[k] {
+            renum[k] = kept.len() as u32;
+            kept.push(v);
+        }
+    }
+    table.vars = kept;
+    table.sites.retain(|s| !s.1.is_empty());
+    for (_, row) in table.sites.iter_mut() {
+        for r in row.iter_mut() {
+            r.0 = renum[r.0 as usize];
+        }
     }
     if table.vars.is_empty() {
         return Vec::new();
@@ -573,33 +619,34 @@ fn put_s(b: &mut Vec<u8>, x: i64) {
     put(b, ((x << 1) ^ (x >> 63)) as u64);
 }
 
+// A home is one byte, tag in the top three bits: Reg / Flt / CallReg with the register number
+// (< 32), Fp and Const followed by the zigzag value.
+const H_REG: u8 = 0x00;
+const H_FLT: u8 = 0x20;
+const H_CALL: u8 = 0x40;
+const H_FP: u8 = 0x60;
+const H_CONST: u8 = 0x80;
+
 fn put_home(b: &mut Vec<u8>, h: Home) {
     match h {
-        Home::Reg(r) => {
-            put(b, 0);
-            put(b, r as u64);
-        }
-        Home::Flt(r) => {
-            put(b, 1);
-            put(b, r as u64);
-        }
+        Home::Reg(r) => b.push(H_REG | (r & 0x1f)),
+        Home::Flt(r) => b.push(H_FLT | (r & 0x1f)),
+        Home::CallReg(r) => b.push(H_CALL | (r & 0x1f)),
         Home::Fp(d) => {
-            put(b, 2);
+            b.push(H_FP);
             put_s(b, d as i64);
         }
         Home::Const(k) => {
-            put(b, 3);
+            b.push(H_CONST);
             put_s(b, k);
-        }
-        Home::CallReg(r) => {
-            put(b, 4);
-            put(b, r as u64);
         }
     }
 }
 
-/// The table's bytes: the variables, then per call site its return offset (delta) and its
-/// located leaves (0: the same as the previous site's).
+/// The table's bytes: the variables (context, local, then one byte: kind in bits 0..1, a Regs
+/// variable's leaf count - 1 in bits 3.., bit 2 = constant leaves follow), then per call site
+/// that locates something its return offset (delta) and its located leaves (0: the same as the
+/// previous site's), each (variable << 2 | leaf, leaf 3 = the leaf follows) and its home.
 pub fn encode(t: &Table) -> Vec<u8> {
     let mut b = Vec::new();
     put(&mut b, t.vars.len() as u64);
@@ -608,12 +655,13 @@ pub fn encode(t: &Table) -> Vec<u8> {
         put(&mut b, v.local as u64);
         match v.kind {
             VarKind::Regs(n) => {
-                put(&mut b, 0);
-                put(&mut b, n as u64);
-                put(&mut b, v.consts.len() as u64);
-                for &(leaf, k) in &v.consts {
-                    put(&mut b, leaf as u64);
-                    put_s(&mut b, k);
+                put(&mut b, (n.saturating_sub(1) as u64) << 3 | (!v.consts.is_empty() as u64) << 2);
+                if !v.consts.is_empty() {
+                    put(&mut b, v.consts.len() as u64);
+                    for &(leaf, k) in &v.consts {
+                        put(&mut b, leaf as u64);
+                        put_s(&mut b, k);
+                    }
                 }
             }
             VarKind::Frame(d) => {
@@ -639,8 +687,10 @@ pub fn encode(t: &Table) -> Vec<u8> {
         }
         put(&mut b, row.len() as u64 + 1);
         for &(var, leaf, h) in row {
-            put(&mut b, var as u64);
-            put(&mut b, leaf as u64);
+            put(&mut b, (var as u64) << 2 | leaf.min(3) as u64);
+            if leaf >= 3 {
+                put(&mut b, leaf as u64);
+            }
             put_home(&mut b, h);
         }
         prev = Some(row);
@@ -684,18 +734,19 @@ pub fn decode(b: &[u8]) -> Option<Table> {
         let ctx = r.u()? as u16;
         let local = r.u()? as u32;
         let mut consts = Vec::new();
-        let kind = match r.u()? {
+        let k = r.u()?;
+        let kind = match k & 3 {
             0 => {
-                let n = r.u()? as u32;
-                for _ in 0..r.u()?.min(4096) {
-                    consts.push((r.u()? as u32, r.s()?));
+                if k & 4 != 0 {
+                    for _ in 0..r.u()?.min(4096) {
+                        consts.push((r.u()? as u32, r.s()?));
+                    }
                 }
-                VarKind::Regs(n)
+                VarKind::Regs((k >> 3) as u32 + 1)
             }
             1 => VarKind::Frame(r.s()? as i32),
             2 => VarKind::Shared,
-            3 => VarKind::Mem(r.s()? as i32),
-            _ => return None,
+            _ => VarKind::Mem(r.s()? as i32),
         };
         vars.push(Var { ctx, local, kind, consts });
     }
@@ -710,14 +761,17 @@ pub fn decode(b: &[u8]) -> Option<Table> {
         } else {
             let mut row = Vec::with_capacity((n - 1).min(4096));
             for _ in 0..n - 1 {
-                let var = r.u()? as u32;
-                let leaf = r.u()? as u32;
-                let h = match r.u()? {
-                    0 => Home::Reg(r.u()? as u8),
-                    1 => Home::Flt(r.u()? as u8),
-                    2 => Home::Fp(r.s()? as i32),
-                    3 => Home::Const(r.s()?),
-                    4 => Home::CallReg(r.u()? as u8),
+                let vl = r.u()?;
+                let var = (vl >> 2) as u32;
+                let leaf = if vl & 3 == 3 { r.u()? as u32 } else { (vl & 3) as u32 };
+                let hb = *r.b.get(r.i)?;
+                r.i += 1;
+                let h = match hb & 0xe0 {
+                    H_REG => Home::Reg(hb & 0x1f),
+                    H_FLT => Home::Flt(hb & 0x1f),
+                    H_CALL => Home::CallReg(hb & 0x1f),
+                    H_FP => Home::Fp(r.s()? as i32),
+                    H_CONST => Home::Const(r.s()?),
                     _ => return None,
                 };
                 row.push((var, leaf, h));
@@ -731,7 +785,8 @@ pub fn decode(b: &[u8]) -> Option<Table> {
 
 /// The pc-map entries carrying table bytes `b` (at `PC_VARS`, four bytes per entry after one
 /// holding the length; positions in file `file`, so a cache translates them as any other and
-/// the bytes, their low 32 bits, stay as they are).
+/// the bytes, their low 32 bits, stay as they are). The compiler's PcMap stores the chunks as
+/// the bytes themselves after the length entry.
 pub fn pc_entries(b: &[u8], file: u32) -> Vec<(u32, u64)> {
     if b.is_empty() {
         return Vec::new();

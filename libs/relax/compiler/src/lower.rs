@@ -1706,6 +1706,8 @@ impl<'a> Lcx<'a> {
                 continue;
             }
             let loc = match st {
+                // (a value of no bytes has nothing to show)
+                LocalSt::Regs(r) if r.is_empty() => continue,
                 LocalSt::Regs(r) => DbgLoc::Regs(r.clone()),
                 LocalSt::Slot(a) => match slot_of.get(&a.0) {
                     Some(&(s, o)) => DbgLoc::Slot(s, o),

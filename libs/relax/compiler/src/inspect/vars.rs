@@ -438,3 +438,35 @@ pub(crate) fn local_json(l: &Local, shown: Option<&Result<String, String>>) -> S
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::jit::PcMap;
+    use relax_backend::dbgloc::{self, Home, Table, Var, VarKind};
+
+    #[test]
+    fn variable_table_round_trips_through_the_pc_map_bytes() {
+        let t = Table {
+            vars: vec![Var { ctx: 0, local: 2, kind: VarKind::Regs(1), consts: Vec::new() }, Var { ctx: 1, local: 0, kind: VarKind::Frame(-16), consts: vec![] }],
+            sites: vec![(20, vec![(0, 0, Home::Reg(19))]), (48, vec![(0, 0, Home::CallReg(3))])],
+        };
+        let bytes = dbgloc::encode(&t);
+        // code entries, the table, the inline stack's entries
+        let mut v: Vec<(u32, u64)> = vec![(0, 5 << 32 | 10), (8, 5 << 32 | 14), (16, 1 << 48 | 5 << 32 | 20)];
+        v.extend(dbgloc::pc_entries(&bytes, 5));
+        v.push((u32::MAX, 5 << 32 | 3));
+        v.push((u32::MAX, 5 << 32 | 9));
+        let m = PcMap::new(&v);
+        let back = m.entries();
+        assert_eq!(dbgloc::from_pc_entries(back.iter().copied()), bytes);
+        assert_eq!(dbgloc::decode(&dbgloc::from_pc_entries(back.iter().copied())), Some(t));
+        // the code entries and the inline stack come back as they were; a lookup never reaches the table
+        assert_eq!(&back[..3], &v[..3]);
+        assert_eq!(&back[back.len() - 2..], &v[v.len() - 2..]);
+        assert_eq!(m.lookup(17), Some(1 << 48 | 5 << 32 | 20));
+        // stored compactly: the table's bytes as they are after one length entry
+        let without: Vec<(u32, u64)> = v.iter().copied().filter(|e| e.0 != dbgloc::PC_VARS).collect();
+        let extra = m.bytes() - PcMap::new(&without).bytes();
+        assert!(extra <= bytes.len() + 12, "{} more bytes for a {}-byte table", extra, bytes.len());
+    }
+}

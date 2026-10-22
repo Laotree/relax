@@ -507,6 +507,12 @@ pub fn cmd_locals(req: &Req, out: &mut Out) {
         if t.os_id == super::threads::self_os_id() {
             return out.err("that is the inspect thread");
         }
+        if super::events::panic_parked(t.os_id) || super::instrument::parked_break_of(t.os_id).is_some() {
+            return out.err("that thread is parked at a panic or breakpoint: `locals panic=P<n>` / `locals break=K<n>` read its stop (with its registers)");
+        }
+        if !super::instrument::stopped(t) {
+            return out.err("that thread is running: `pause` first (its stack moves while it runs)");
+        }
         match super::threads::regs_now(t) {
             Some((pc, fp, ints)) => (format!("\"thread\":\"T{}\"", t.os_id), Src::Thread(pc, fp, ints), None),
             None => return out.err("this thread's registers are not readable here (pause it first: `pause`)"),
