@@ -1899,6 +1899,9 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
         thread_jumps(f);
         trace_opt(f, "dce+jumps");
         changed |= ic_nn && fold_nonnull(f);
+        if !opt_off(options, "-unfoldsel") {
+            changed |= unfold_branch_selects(f);
+        }
         let tt = pass_clock();
         let threaded = thread_on(options) && thread_known(f);
         pass_time(15, tt);
@@ -3928,6 +3931,74 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
         // the arms are entered from here only: now unreachable
         npred[t as usize] = 0;
         npred[e as usize] = npred[e as usize].saturating_sub(1);
+        changed = true;
+    }
+    changed
+}
+
+/// A branch on a select of constants and compare outcomes (`c ? k : x`, what if-conversion of a
+/// callee's `Ordering` / `Option<Ordering>` leaves once the caller tests it) branches on c, then
+/// on the chosen arm (LLVM JumpThreading's select unfolding): the arms' compares become branches
+/// edge facts and threading can decide (`a < b` re-tested on the other path). The select must be
+/// read only by the branch; a constant arm goes straight to its target.
+pub fn unfold_branch_selects(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    let (mut ndef, mut nuse) = (vec![0u32; nv], vec![0u32; nv]);
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    // single definitions: 0 = other, 1 = compare outcome, 2 = constant (value in kv)
+    let mut kind = vec![0u8; nv];
+    let mut kv = vec![0i64; nv];
+    let mut sel: Vec<Option<(usize, VReg, VReg, VReg)>> = vec![None; nv];
+    let mut tu = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            for_uses(i, |u| nuse[u.0 as usize] += 1);
+            match *i {
+                Inst::ICmp(_, _, d, ..) | Inst::ICmpI(_, _, d, ..) | Inst::FCmp(_, _, d, ..) => kind[d.0 as usize] = 1,
+                Inst::Iconst(d, k) => {
+                    kind[d.0 as usize] = 2;
+                    kv[d.0 as usize] = k;
+                }
+                Inst::Sel(d, c, a, x) if f.vregs[d.0 as usize] == Cls::I => sel[d.0 as usize] = Some((bi, c, a, x)),
+                _ => {}
+            }
+        }
+        term_uses(&b.term, &mut tu);
+        for u in tu.drain(..) {
+            nuse[u.0 as usize] += 1;
+        }
+    }
+    let reach = reachable(f);
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        if !reach.get(bi).copied().unwrap_or(false) {
+            continue;
+        }
+        let (v, t, e) = match f.blocks[bi].term {
+            Term::Branch(v, t, e) if t != e => (v, t, e),
+            _ => continue,
+        };
+        let Some((sb, c, a, x)) = sel[v.0 as usize] else { continue };
+        let ok = |w: VReg| ndef[w.0 as usize] == 1 && kind[w.0 as usize] != 0;
+        if sb != bi || ndef[v.0 as usize] != 1 || nuse[v.0 as usize] != 1 || ndef[c.0 as usize] != 1 || !ok(a) || !ok(x) {
+            continue;
+        }
+        let pos = f.blocks[bi].term_pos;
+        let target = |f: &mut Func, w: VReg| -> u32 {
+            if kind[w.0 as usize] == 2 {
+                return if kv[w.0 as usize] != 0 { t } else { e };
+            }
+            let nb = f.block();
+            f.blocks[nb as usize].term = Term::Branch(w, t, e);
+            f.blocks[nb as usize].term_pos = pos;
+            nb
+        };
+        let ta = target(f, a);
+        let tx = target(f, x);
+        f.blocks[bi].term = Term::Branch(c, ta, tx);
         changed = true;
     }
     changed
