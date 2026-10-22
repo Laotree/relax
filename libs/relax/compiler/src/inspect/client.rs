@@ -29,6 +29,10 @@ pub fn main(args: &[String]) -> i32 {
     let Some(target) = args.first() else { return usage() };
     // `file=<x.mkgp> gpu prof <query>`: a saved GPU recording, no app
     if let Some(path) = target.strip_prefix("file=") {
+        // a file a host provider reads (`file=<x.mkcap> cap ...`), else a GPU recording
+        if let Some(code) = super::host_file_query(path, &args[1..]) {
+            return code;
+        }
         return super::gpuprof::file_main(path, &args[1..]);
     }
     if target == "list" {
