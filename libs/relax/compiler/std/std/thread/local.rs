@@ -181,7 +181,7 @@ impl<T: 'static> LazyKey<T> {
 
 impl<T: 'static> LocalKey<T> {
     /// `inner` returns the calling thread's value (None: destroyed); the expansion's.
-    pub const unsafe fn new(inner: fn() -> Option<*const T>) -> LocalKey<T> {
+    pub const fn new(inner: fn() -> Option<*const T>) -> LocalKey<T> {
         LocalKey { inner }
     }
 
