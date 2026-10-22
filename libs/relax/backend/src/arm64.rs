@@ -714,6 +714,8 @@ struct Gen<'a> {
     /// a zero vector whose definition was skipped: the VInsert of lane 0 right after it reads
     /// it (fmov s, which zeroes lanes 1-3)
     zero_ins: Option<VReg>,
+    /// vregs defined once, as a zero vector (VConst 0 / FromLo64 of a constant 0)
+    zero_vec: Vec<bool>,
     /// the last spill store emitted: (sp offset, register, word position right after it)
     last_spill: Option<(i64, u8, usize)>,
     /// spill windows (Alloc::windows): vreg -> (first use pos, last use pos, register); and the
@@ -2962,7 +2964,7 @@ impl<'a> Gen<'a> {
                     self.fin_f(d, xd);
                 }
             }
-            Inst::VInsert(d, v, 0, s) if self.zero_ins.take() == Some(v) || (self.al.loc[v.0 as usize] == Loc::None && self.al.remat[v.0 as usize] == Remat::VConst(0)) => {
+            Inst::VInsert(d, v, 0, s) if self.zero_ins.take() == Some(v) || self.zero_vec[v.0 as usize] => {
                 // into a zero vector: fmov s (a scalar write zeroes the rest of the register)
                 let xd = self.def_f(d, FS2);
                 if self.cls(s) == Cls::I {
@@ -3533,14 +3535,20 @@ impl<'a> Gen<'a> {
                     self.a.mov(rd, rs);
                     self.fin_i(*d, rd);
                 } else {
-                    let xs = self.use_f(*s, FS0);
+                    // a spilled source loads straight into d's register; a spilled d stores
+                    // straight from s's (no move through the scratch)
                     let xd = self.def_f(*d, FS0);
-                    if self.cls(*d) == Cls::V128 {
-                        self.vmov(xd, xs);
+                    let xs = self.use_f(*s, xd);
+                    if matches!(self.al.loc[d.0 as usize], Loc::Stack(_)) {
+                        self.fin_f(*d, xs);
                     } else {
-                        self.a.fmov(xd, xs);
+                        if self.cls(*d) == Cls::V128 {
+                            self.vmov(xd, xs);
+                        } else {
+                            self.a.fmov(xd, xs);
+                        }
+                        self.fin_f(*d, xd);
                     }
-                    self.fin_f(*d, xd);
                 }
             }
             Inst::IBin(op, it, d, a, b) => {
@@ -4220,6 +4228,38 @@ impl<'a> Gen<'a> {
     }
 }
 
+/// Per vreg: defined exactly once, as an all-zero vector (VConst 0, or FromLo64 of a vreg defined
+/// once as the constant 0)
+fn zero_vectors(f: &Func) -> Vec<bool> {
+    let n = f.vregs.len();
+    let mut defs = vec![0u32; n];
+    let mut zint = vec![false; n];
+    let mut zvec = vec![false; n];
+    for b in &f.blocks {
+        for i in &b.insts {
+            i.defs(|d| defs[d.0 as usize] += 1);
+            match *i {
+                Inst::Iconst(d, 0) => zint[d.0 as usize] = true,
+                Inst::VConst(d, 0) => zvec[d.0 as usize] = true,
+                _ => {}
+            }
+        }
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::VX(VX::FromLo64, d, k, _) = *i {
+                if zint[k.0 as usize] && defs[k.0 as usize] == 1 {
+                    zvec[d.0 as usize] = true;
+                }
+            }
+        }
+    }
+    for p in &f.params {
+        defs[p.0 as usize] += 1;
+    }
+    (0..n).map(|v| zvec[v] && defs[v] == 1).collect()
+}
+
 fn words_to_bytes(w: &[u32]) -> Vec<u8> {
     let mut b = Vec::with_capacity(w.len() * 4);
     for x in w {
@@ -4445,6 +4485,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         test_fuse: None,
         sel_chain: None,
         zero_ins: None,
+        zero_vec: Vec::new(),
         jt_fix: Vec::new(),
         last_spill: None,
         win: {
@@ -4499,6 +4540,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         tbz: tbz && !long,
     };
     g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
+    g.zero_vec = zero_vectors(g.f);
     if env.opt_regs || g.f.full {
         g.copy_reg = regalloc::copy_reuse(options, g.f, &g.al);
     }
