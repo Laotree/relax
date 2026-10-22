@@ -1221,10 +1221,24 @@ impl<'a> Gen<'a> {
             }
             // `t = x & K; c = t ==/!= 0` feeding the branch (t used once, K a bitmask immediate): tst x, #K
             self.test_fuse = None;
+            let mut test_pair = false;
             if fused && n >= 2 {
                 if let (Inst::IBinI(IOp::And, it, t, x, k), Inst::ICmpI(Cond::Eq | Cond::Ne, _, _, t2, 0)) = (&b.insts[n - 2], &b.insts[n - 1]) {
                     if t == t2 && *x != *t && self.al.uses[t.0 as usize] == 1 && (it.bits == 64 || (0..1i64 << 32).contains(k)) && bitmask_imm(*k as u64).is_some() {
                         self.test_fuse = Some((*x, *k));
+                        test_pair = true;
+                    }
+                }
+            }
+            // `c = x & K` branched on directly (c used once): tst x, #K / tbnz (switch bit tests:
+            // `lsr; and #1; cbnz` was three instructions)
+            if let Term::Branch(c, _, _) = &b.term {
+                if !fused && n > 0 && self.al.uses[c.0 as usize] == 1 && isel_flags(options) & A64_FUSE != 0 {
+                    if let Inst::IBinI(IOp::And, it, t, x, k) = &b.insts[n - 1] {
+                        if t == c && *x != *t && (it.bits == 64 || (0..1i64 << 32).contains(k)) && bitmask_imm(*k as u64).is_some() {
+                            self.test_fuse = Some((*x, *k));
+                            fused = true;
+                        }
                     }
                 }
             }
@@ -1273,7 +1287,7 @@ impl<'a> Gen<'a> {
                 if fused && ii == n - 1 {
                     break;
                 }
-                if self.test_fuse.is_some() && ii == n - 2 {
+                if test_pair && ii == n - 2 {
                     continue;
                 }
                 if skip_next {
@@ -3448,7 +3462,12 @@ impl<'a> Gen<'a> {
                 let next = self.next_block[bi];
                 match fused {
                     // and with a bitmask immediate, compared with zero: tst + b.cond
-                    Some(Inst::ICmpI(cnd @ (Cond::Eq | Cond::Ne), _, _, _, 0)) if self.test_fuse.is_some() => {
+                    Some(ref fi @ (Inst::ICmpI(Cond::Eq | Cond::Ne, _, _, _, 0) | Inst::IBinI(IOp::And, ..))) if self.test_fuse.is_some() => {
+                        // (x & K) != 0 for a branch straight on the and
+                        let cnd = match fi {
+                            Inst::ICmpI(c, ..) => *c,
+                            _ => Cond::Ne,
+                        };
                         let (src, mask) = self.test_fuse.take().unwrap();
                         let rs = self.use_i(src, S0);
                         if self.tbz && (mask as u64).is_power_of_two() {
