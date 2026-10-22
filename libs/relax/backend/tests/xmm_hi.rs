@@ -58,7 +58,7 @@ fn build(cls: Cls, mem: Mem, sz: i32, vector: bool) -> (Code, bool) {
     f.blocks[0].insts = insts;
     f.blocks[0].term = Term::Ret(vec![]);
     f.verify().unwrap();
-    let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+    let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
     let c = relax_backend::x64::compile(&options(), &f, &env).unwrap();
     assert!(c.relocs.is_empty());
     let evex = c.code.windows(2).any(|w| w[0] == 0x62 && w[1] & 0x0c == 0);
@@ -147,7 +147,7 @@ fn build_fma(f64_: bool) -> Code {
     f.blocks[0].insts = insts;
     f.blocks[0].term = Term::Ret(vec![]);
     f.verify().unwrap();
-    let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+    let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
     let c = relax_backend::x64::compile(&options(), &f, &env).unwrap();
     Code::new(&c.code).unwrap()
 }
@@ -193,7 +193,7 @@ fn block_copies_of_every_size() {
         f.blocks[0].insts = insts;
         f.blocks[0].term = Term::Ret(vec![]);
         f.verify().unwrap();
-        let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+        let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
         let c = relax_backend::x64::compile(&options(), &f, &env).unwrap();
         let code = Code::new(&c.code).unwrap();
         let run: Entry = unsafe { std::mem::transmute(code.ptr()) };
