@@ -65,6 +65,9 @@ impl Lane {
     }
 }
 
+/// Idle time on the main lane longer than this separates a frame's work from earlier events.
+pub const FRAME_GAP_NS: u64 = 34_000_000;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Frame {
     pub id: u64,
@@ -347,8 +350,10 @@ impl Profile {
     }
 
     /// A frame ends when its Draw dispatch ends; Draw dispatches less than 1 ms apart (one per
-    /// window or pass) close one frame. It starts at the first work of the main lane after the
-    /// previous frame (an event-driven app idles between frames: that idle time is no frame's).
+    /// window or pass) close one frame. It starts at the first of the main lane's root spans that
+    /// lead up to the Draw without an idle gap over [`FRAME_GAP_NS`] (an event-driven app idles
+    /// between frames, and an event that draws nothing is no frame's), never before the previous
+    /// frame's end.
     fn frame_from_draw(&mut self, li: usize, s: Seg) {
         let prev_end = match self.frames.last_mut() {
             Some(last) if s.t0 < last.t1 + 1_000_000 => {
@@ -359,12 +364,23 @@ impl Profile {
             None => 0,
         };
         let id = self.frames.last().map_or(0, |f| f.id + 1);
-        // the main lane's first root span (or open root) that starts after the previous frame
         let lane = &self.lanes[li];
-        let first_root = lane.rows.first().and_then(|r| r.get(r.partition_point(|x| x.t0 < prev_end))).map(|x| x.t0);
-        let open_root = lane.stack.first().map(|o| o.0).filter(|t| *t >= prev_end);
-        let t0 = [Some(s.t0), first_root, open_root].into_iter().flatten().filter(|t| *t <= s.t0).min().unwrap_or(s.t0);
-        self.frames.push(Frame { id, t0, t1: s.t1, ..Default::default() });
+        // the root holding the Draw (still open, or closed already when Draw is a root)
+        let mut t0 = lane.stack.first().map_or(s.t0, |o| o.0.min(s.t0));
+        if let Some(row) = lane.rows.first() {
+            let mut k = row.partition_point(|x| x.t0 < t0);
+            while k > 0 {
+                let r = row[k - 1];
+                if r.t0 < prev_end || t0.saturating_sub(r.t1) > FRAME_GAP_NS {
+                    break;
+                }
+                if !r.wait {
+                    t0 = r.t0;
+                }
+                k -= 1;
+            }
+        }
+        self.frames.push(Frame { id, t0: t0.max(prev_end), t1: s.t1, ..Default::default() });
     }
 
     // ------------------------------------------------------------------ lookups

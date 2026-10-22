@@ -326,7 +326,7 @@ fn summary(p: &Profile) -> Ans {
     }
     // lanes: busy share of the whole recording
     let mut t = Table::new(&["lane", "role", "busy ms", "busy %", "wait ms"]);
-    let mut rows: Vec<(usize, u64, u64)> = (0..p.lanes.len()).map(|i| {
+    let mut rows: Vec<(usize, u64, u64)> = (0..p.lanes.len()).filter(|&i| !p.lanes[i].rows.is_empty()).map(|i| {
         let (b, w) = p.busy_in(i, p.t_min, p.t_max + 1);
         (i, b, w)
     }).collect();
@@ -340,6 +340,10 @@ fn summary(p: &Profile) -> Ans {
     if rows.len() > shown {
         let rest: u64 = rows[shown..].iter().map(|x| x.1).sum();
         out.note(format!("+{} lanes, {} ms busy total", rows.len() - shown, ms(rest)));
+    }
+    let quiet = p.lanes.iter().filter(|l| l.rows.is_empty()).count();
+    if quiet > 0 {
+        out.note(format!("+{} threads with no spans (they only woke others or stayed idle)", quiet));
     }
     let (installs, compile_ns, tiers) = jit_counts(p, 0, u64::MAX);
     if installs > 0 || compile_ns > 0 {
@@ -386,13 +390,31 @@ fn frames(p: &Profile, q: &Q) -> Ans {
         worst.id,
         ms(worst.dur())
     ));
-    let mut t = Table::new(&["frame", "at ms", "ms", "main busy ms", "main wait ms", "crit path ms", "jit installs", "cause"]);
+    // a native app has no JIT column; one lane has no critical path of its own
+    let jit = !p.jit.is_empty();
+    let multi = p.lanes.iter().filter(|l| !l.rows.is_empty()).count() > 1;
+    let mut head = vec!["frame", "at ms", "ms", "main busy ms", "main wait ms"];
+    if multi {
+        head.push("crit path ms");
+    }
+    if jit {
+        head.push("jit installs");
+    }
+    head.push("cause");
+    let mut t = Table::new(&head);
     for &i in idx.iter().take(n) {
         let f = &p.frames[i];
         let (b, w) = main.map_or((0, 0), |m| p.busy_in(m, f.t0, f.t1));
-        let cp: u64 = main.map_or(0, |m| p.critical_path(m, f.t0, f.t1).iter().filter(|s| s.wait.is_none()).map(|s| s.t1 - s.t0).sum());
-        let (inst, _, _) = jit_counts(p, f.t0, f.t1);
-        t.row(vec![format!("F{}", f.id), at(p, f.t0), ms(f.dur()), ms(b), ms(w), ms(cp), inst.to_string(), cause(p, f)]);
+        let mut row = vec![format!("F{}", f.id), at(p, f.t0), ms(f.dur()), ms(b), ms(w)];
+        if multi {
+            let cp: u64 = main.map_or(0, |m| p.critical_path(m, f.t0, f.t1).iter().filter(|s| s.wait.is_none()).map(|s| s.t1 - s.t0).sum());
+            row.push(ms(cp));
+        }
+        if jit {
+            row.push(jit_counts(p, f.t0, f.t1).0.to_string());
+        }
+        row.push(cause(p, f));
+        t.row(row);
     }
     out.table(t);
     if idx.len() > n {
@@ -653,14 +675,24 @@ fn timeline(p: &Profile, q: &Q) -> Ans {
 
 fn lanes(p: &Profile) -> Ans {
     let span = p.t_max.saturating_sub(p.t_min).max(1);
-    let mut out = Ans::new(format!("{} lanes over {} s", p.lanes.len(), sig(span as f64 / 1e9)));
+    let mut out = Ans::new(format!("{} lanes with spans over {} s", p.lanes.iter().filter(|l| !l.rows.is_empty()).count(), sig(span as f64 / 1e9)));
     let mut t = Table::new(&["lane", "name", "role", "os id", "busy %", "spans"]);
-    for (i, l) in p.lanes.iter().enumerate() {
-        let (b, _) = p.busy_in(i, p.t_min, p.t_max + 1);
-        let n: usize = l.rows.iter().map(|r| r.len()).sum();
+    // busiest first, at most 12
+    let mut v: Vec<(usize, u64, usize)> = p.lanes.iter().enumerate().filter(|x| !x.1.rows.is_empty()).map(|(i, l)| (i, p.busy_in(i, p.t_min, p.t_max + 1).0, l.rows.iter().map(|r| r.len()).sum())).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+    for &(i, b, n) in v.iter().take(12) {
+        let l = &p.lanes[i];
         t.row(vec![format!("T{}", l.thread.tid), p.lane_name(i), role::NAMES.get(l.thread.role as usize).unwrap_or(&"?").to_string(), l.thread.os_id.to_string(), pct(b, span), n.to_string()]);
     }
     out.table(t);
+    if v.len() > 12 {
+        let rest: u64 = v[12..].iter().map(|x| x.1).sum();
+        out.note(format!("+{} quieter lanes, {} ms busy in all", v.len() - 12, ms(rest)));
+    }
+    let quiet = p.lanes.iter().filter(|l| l.rows.is_empty()).count();
+    if quiet > 0 {
+        out.note(format!("+{} threads with no spans", quiet));
+    }
     out.more("top cpu lane=T<n>  timeline slowest");
     out
 }
@@ -751,8 +783,17 @@ fn diff(a: &Profile, b: &Profile) -> Ans {
     let (am, ap, _) = median_p95_max(&a.frame_durs());
     let (bm, bp, _) = median_p95_max(&b.frame_durs());
     let ch = |x: u64, y: u64| if x == 0 { "-".to_string() } else { format!("{:+.0}%", (y as f64 - x as f64) * 100.0 / x as f64) };
-    let verdict = if bm < am * 97 / 100 { "faster" } else if bm > am * 103 / 100 { "slower" } else { "about the same" };
-    let mut out = Ans::new(format!("B is {} than A: median frame {} → {} ms ({}), p95 {} → {} ms ({})", verdict, ms(am), ms(bm), ch(am, bm), ms(ap), ms(bp), ch(ap, bp)));
+    // -1 faster, 0 within 3%, 1 slower
+    let dir = |x: u64, y: u64| if y < x * 97 / 100 { -1 } else if y > x * 103 / 100 { 1 } else { 0 };
+    let verdict = match (dir(am, bm), dir(ap, bp)) {
+        (-1, d) if d <= 0 => "B is faster than A",
+        (1, d) if d >= 0 => "B is slower than A",
+        (0, 0) => "B and A are about the same",
+        (0, -1) => "B has fewer slow frames than A",
+        (0, 1) => "B has more slow frames than A",
+        _ => "mixed: B's typical frame and its slow frames moved in opposite directions",
+    };
+    let mut out = Ans::new(format!("{}: median frame {} → {} ms ({}), p95 {} → {} ms ({})", verdict, ms(am), ms(bm), ch(am, bm), ms(ap), ms(bp), ch(ap, bp)));
     // main lane self time per frame by span
     let per_frame = |p: &Profile| -> HashMap<String, u64> {
         let mut m = HashMap::new();
