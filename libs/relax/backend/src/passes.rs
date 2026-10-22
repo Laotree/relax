@@ -1193,6 +1193,14 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                             let b = (64 - *k as u8).min(w(x, &zw));
                             set(*d, b, &mut zw)
                         }
+                        Inst::IBinI(IOp::Xor | IOp::Or, _, d, x, k) if *k >= 0 => {
+                            let b = ((64 - (*k as u64).leading_zeros()) as u8).max(w(x, &zw));
+                            set(*d, b, &mut zw)
+                        }
+                        Inst::Sel(d, _, a, b2) => {
+                            let b = w(a, &zw).max(w(b2, &zw));
+                            set(*d, b, &mut zw)
+                        }
                         Inst::Iconst(d, v) if *v >= 0 => set(*d, (64 - (*v as u64).leading_zeros()) as u8, &mut zw),
                         Inst::ICmp(_, _, d, ..) | Inst::ICmpI(_, _, d, ..) | Inst::FCmp(_, _, d, ..) => set(*d, 1, &mut zw),
                         Inst::Mov(d, x) => {
@@ -1532,53 +1540,94 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                             _ => new,
                         };
                     }
-                    // a compare of a two-level select tree of constants (an Ordering made branch-free:
-                    // `c1 ? -1 : (c2 ? 0 : 1)`, maybe narrowed to i8), against a constant: the tree of
-                    // the compare's outcomes (0 / 1 constants); the select folds below merge it into
-                    // one compare (`ord == Greater` -> `!(a <= b)`)
+                    // a compare of a two-level select tree of constants and compare outcomes (an
+                    // Ordering made branch-free: `c1 ? -1 : (c2 ? 0 : 1)` or `lt ? -1 : ne`, maybe
+                    // narrowed to i8 by a conversion or a low mask), against a constant: the tree
+                    // of the compare's outcomes, each a constant 0 / 1, an outcome or its negation
+                    // (LLVM foldICmpSelect); the select folds below merge it into one compare
+                    // (`ord == Greater` -> `!(a <= b)`), a tree of equal outcomes is a constant
+                    // (`(lt ? -1 : ne) as u8 != 254`, Option<Ordering>'s niche test)
                     if let (Inst::ICmpI(cc, sg, d, x, k), false) = (&new, opt_off(options, "-selfold")) {
                         let (cc, sg, d, x, k) = (*cc, *sg, *d, *x, *k);
-                        let (root, narrow) = match conv_def.get(x.0 as usize).copied().flatten() {
-                            Some((t, y, _, _)) if t.bits < 64 && single(x, &ndef) => (y, Some(t)),
+                        let low_mask = |m: i64| m > 0 && (m as u64 + 1).is_power_of_two();
+                        let (root, narrow) = match (conv_def.get(x.0 as usize).copied().flatten(), bin_def.get(x.0 as usize).copied().flatten()) {
+                            (Some((t, y, _, _)), _) if t.bits < 64 && single(x, &ndef) => (y, Some(t)),
+                            (_, Some((IOp::And, _, y, m, _, _))) if low_mask(m) && single(x, &ndef) => (y, Some(IntTy { bits: (64 - (m as u64).leading_zeros()) as u8, signed: false })),
                             _ => (x, None),
                         };
-                        let leaf = |v: VReg| match kn[v.0 as usize] {
-                            Some(K::I(kv)) => Some(cmp_i(cc, sg, narrow.map_or(kv, |t| crate::bitops::ext(kv, t)), k) as i64),
-                            _ => None,
+                        // a leaf's outcome: Ok(0 / 1) a constant, Err((v, negated)) the 0 / 1 value v
+                        // (a compare result) or its negation
+                        let cmp_k = |kv: i64| cmp_i(cc, sg, narrow.map_or(kv, |t| crate::bitops::ext(kv, t)), k) as i64;
+                        let leaf = |v: VReg| -> Option<Result<i64, (VReg, bool)>> {
+                            match kn[v.0 as usize] {
+                                Some(K::I(kv)) => Some(Ok(cmp_k(kv))),
+                                _ if zw[v.0 as usize] == 1 && single(v, &ndef) => match (cmp_k(0), cmp_k(1)) {
+                                    (o0, o1) if o0 == o1 => Some(Ok(o0)),
+                                    (0, _) => Some(Err((v, false))),
+                                    _ => Some(Err((v, true))),
+                                },
+                                _ => None,
+                            }
+                        };
+                        // an arm: a leaf, or a select of two leaves
+                        let arm = |v: VReg| -> Option<(Option<VReg>, [Result<i64, (VReg, bool)>; 2])> {
+                            if let Some(l) = leaf(v) {
+                                return Some((None, [l.clone(), l]));
+                            }
+                            let (c2, a2, b2) = sel_def[v.0 as usize].filter(|_| single(v, &ndef))?;
+                            Some((Some(c2), [leaf(a2)?, leaf(b2)?]))
                         };
                         if let Some((c1, a1, b1)) = sel_def[root.0 as usize].filter(|_| single(root, &ndef)) {
-                            // one arm a constant, the other a select of two constants
-                            let nested = |v: VReg| sel_def[v.0 as usize].filter(|_| single(v, &ndef)).and_then(|(c2, a2, b2)| Some((c2, leaf(a2)?, leaf(b2)?)));
-                            let plan = match (leaf(a1), leaf(b1)) {
-                                (Some(ka), None) => nested(b1).map(|n| (Some(ka), None, None, Some(n))),
-                                (None, Some(kb)) => nested(a1).map(|n| (None, Some(kb), Some(n), None)),
-                                _ => None,
-                            };
-                            if let Some((ka, kb, na, nb)) = plan {
-                                let pos = f.blocks[bi].pos[ii];
-                                let mut insts = Vec::new();
-                                let konst = |f: &mut Func, insts: &mut Vec<Inst>, kv: i64| {
-                                    let t = f.vreg(Cls::I);
-                                    insts.push(Inst::Iconst(t, kv));
-                                    t
-                                };
-                                let side = |f: &mut Func, insts: &mut Vec<Inst>, kc: Option<i64>, n: Option<(VReg, i64, i64)>| -> VReg {
-                                    match (kc, n) {
-                                        (Some(kv), _) => konst(f, insts, kv),
-                                        (None, Some((c2, x2, y2))) => {
-                                            let (tx, ty, t) = (konst(f, insts, x2), konst(f, insts, y2), f.vreg(Cls::I));
-                                            insts.push(Inst::Sel(t, c2, tx, ty));
-                                            t
+                            // at least one arm a leaf (two levels at most)
+                            if let (Some(pa), Some(pb)) = (arm(a1), arm(b1)) {
+                                // two constant leaves: the select-of-constants folds below (and the
+                                // phi distribution) take it, unless every outcome is the same
+                                let konst_leaf = |p: &(Option<VReg>, [Result<i64, (VReg, bool)>; 2])| p.0.is_none() && p.1[0].is_ok();
+                                let same = pa.1.iter().chain(pb.1.iter()).all(|o| *o == pa.1[0]) && pa.1[0].is_ok();
+                                if (pa.0.is_none() || pb.0.is_none()) && (same || !(konst_leaf(&pa) && konst_leaf(&pb))) {
+                                    let pos = f.blocks[bi].pos[ii];
+                                    let mut insts = Vec::new();
+                                    let out = |f: &mut Func, insts: &mut Vec<Inst>, o: &Result<i64, (VReg, bool)>| -> VReg {
+                                        let t = f.vreg(Cls::I);
+                                        insts.push(match *o {
+                                            Ok(kv) => Inst::Iconst(t, kv),
+                                            Err((v, false)) => Inst::Mov(t, v),
+                                            Err((v, true)) => Inst::IBinI(IOp::Xor, U64, t, v, 1),
+                                        });
+                                        t
+                                    };
+                                    let side = |f: &mut Func, insts: &mut Vec<Inst>, (c2, os): (Option<VReg>, [Result<i64, (VReg, bool)>; 2])| -> VReg {
+                                        match c2 {
+                                            Some(c2) if os[0] != os[1] => {
+                                                let (tx, ty, t) = (out(f, insts, &os[0]), out(f, insts, &os[1]), f.vreg(Cls::I));
+                                                insts.push(Inst::Sel(t, c2, tx, ty));
+                                                t
+                                            }
+                                            _ => out(f, insts, &os[0]),
                                         }
-                                        _ => unreachable!(),
+                                    };
+                                    let both_k = |p: &(Option<VReg>, [Result<i64, (VReg, bool)>; 2])| match (&p.1[0], &p.1[1]) {
+                                        (Ok(x), Ok(y)) if x == y => Some(*x),
+                                        _ => None,
+                                    };
+                                    match (both_k(&pa), both_k(&pb)) {
+                                        // every outcome the same: a constant
+                                        (Some(x), Some(y)) if x == y => {
+                                            new = Inst::Iconst(d, x);
+                                            if single(d, &ndef) {
+                                                kn[d.0 as usize] = Some(K::I(x));
+                                            }
+                                        }
+                                        _ => {
+                                            let ta = side(f, &mut insts, pa);
+                                            let tb = side(f, &mut insts, pb);
+                                            let top = f.vreg(Cls::I);
+                                            insts.push(Inst::Sel(top, c1, ta, tb));
+                                            edits.push(FoldEdit { block: bi, at: ii, remove: 0, insts, pos });
+                                            new = Inst::Mov(d, top);
+                                        }
                                     }
-                                };
-                                let ta = side(f, &mut insts, ka, na);
-                                let tb = side(f, &mut insts, kb, nb);
-                                let top = f.vreg(Cls::I);
-                                insts.push(Inst::Sel(top, c1, ta, tb));
-                                edits.push(FoldEdit { block: bi, at: ii, remove: 0, insts, pos });
-                                new = Inst::Mov(d, top);
+                                }
                             }
                         }
                     }
@@ -1827,7 +1876,9 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
         trace_opt(f, "thread");
         changed |= threaded;
         if if_conv_on(options) {
-            changed |= if_convert(f, !opt_off(options, "-ifspec"));
+            // TEMP bisect: MAKEPAD_RUN_IFSPEC_SKIP=<substr,...> no speculation in matching fns
+            let skip = std::env::var("MAKEPAD_RUN_IFSPEC_SKIP").map(|v| v.split(',').any(|p| !p.is_empty() && f.name.contains(p))).unwrap_or(false);
+            changed |= if_convert(f, !opt_off(options, "-ifspec") && !skip);
         }
         changed |= merge_blocks(f);
         trace_opt(f, "merge");
