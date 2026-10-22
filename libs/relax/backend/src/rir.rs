@@ -1112,6 +1112,10 @@ pub struct Block {
     pub pos: Vec<u64>,
     pub term: Term,
     pub term_pos: u64,
+    /// how often the block ran in the slot's counted build (PGO: the counted tier's exact
+    /// count of the O3 input block this one came from; copies keep it), negative = unknown.
+    /// A frequency for layout and register allocation only: never a correctness fact.
+    pub count: f32,
 }
 
 #[derive(Clone)]
@@ -1208,6 +1212,140 @@ pub struct Func {
     /// own context is the parent's --, a position inside the inlined fn naming it). Machine code
     /// carries it in its pc map (`inline_pc_entries`).
     pub inl: Vec<(u64, u64)>,
+    /// Where the source's named locals live (makepad inspect `locals`): side metadata only --
+    /// no pass reads it to decide anything, passes that rename vregs or slots map it, and the
+    /// back end turns it into per-call-site locations in the pc map (`vars_pc_entries`).
+    pub dbg: Vec<DbgVar>,
+}
+
+/// A named local of the source and its storage (`Func::dbg`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DbgVar {
+    /// its fn's inline context (`pos_ctx`): 0 the function itself, k an inlined copy
+    pub ctx: u16,
+    /// the local's index in its fn's checked body (`Body::locals`)
+    pub local: u32,
+    pub loc: DbgLoc,
+    /// (leaf, value) of `Regs` leaves the optimiser found constant (their vreg folded away)
+    pub k: Vec<(u32, i64)>,
+}
+
+/// Storage of a `DbgVar`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DbgLoc {
+    /// one vreg per layout leaf (in leaf order); `DBG_NONE` = that leaf is no longer held
+    Regs(Vec<VReg>),
+    /// the bytes of stack slot `slot` from offset `off`
+    Slot(u32, i32),
+    /// the bytes at the address a vreg holds, plus `off` (a by-pointer argument copy)
+    Mem(VReg, i32),
+}
+
+/// A `DbgLoc::Regs` leaf whose value no vreg holds any more.
+pub const DBG_NONE: VReg = VReg(u32::MAX);
+
+impl Func {
+    /// Maps the debug table through a vreg renaming (`map(v)` None: v is gone).
+    pub fn dbg_map_vregs(&mut self, map: &dyn Fn(VReg) -> Option<VReg>) {
+        for d in self.dbg.iter_mut() {
+            match &mut d.loc {
+                DbgLoc::Regs(r) => {
+                    for v in r.iter_mut() {
+                        if *v != DBG_NONE {
+                            *v = map(*v).unwrap_or(DBG_NONE);
+                        }
+                    }
+                }
+                DbgLoc::Mem(v, _) => *v = map(*v).unwrap_or(DBG_NONE),
+                DbgLoc::Slot(..) => {}
+            }
+        }
+    }
+    /// Live-range splits (register allocation): each (piece, original) pair is a vreg made to
+    /// hold the original's value over part of the function. Every debug entry naming the
+    /// original gets a twin naming the piece; where a local is looked up, the leaf's vreg live
+    /// there (original or piece) holds it.
+    pub fn dbg_add_pieces(&mut self, pairs: &[(VReg, VReg)]) {
+        if self.dbg.is_empty() || pairs.is_empty() {
+            return;
+        }
+        let mut of: std::collections::HashMap<u32, Vec<VReg>> = std::collections::HashMap::new();
+        for &(p, o) in pairs {
+            of.entry(o.0).or_default().push(p);
+        }
+        let mut more = Vec::new();
+        for d in &self.dbg {
+            if let DbgLoc::Regs(r) = &d.loc {
+                for (k, v) in r.iter().enumerate() {
+                    for p in of.get(&v.0).map(|x| x.as_slice()).unwrap_or(&[]) {
+                        let mut leaves = vec![DBG_NONE; r.len()];
+                        leaves[k] = *p;
+                        more.push(DbgVar { ctx: d.ctx, local: d.local, loc: DbgLoc::Regs(leaves), k: Vec::new() });
+                    }
+                }
+            }
+        }
+        self.dbg.extend(more);
+    }
+    /// A pass proved, for vregs the debug table may name, `d == s` everywhere (`copies`: both
+    /// single-definition, d a copy of s) or `d == k` (`consts`: single-definition constants)
+    /// before d goes away: its leaves name s, or hold the constant.
+    pub fn dbg_salvage(&mut self, copies: &[(VReg, VReg)], consts: &[(VReg, i64)]) {
+        if self.dbg.is_empty() || copies.is_empty() && consts.is_empty() {
+            return;
+        }
+        let copies: std::collections::HashMap<u32, VReg> = copies.iter().map(|c| (c.0 .0, c.1)).collect();
+        let consts: std::collections::HashMap<u32, i64> = consts.iter().map(|c| (c.0 .0, c.1)).collect();
+        for d in self.dbg.iter_mut() {
+            match &mut d.loc {
+                DbgLoc::Regs(r) => {
+                    for (leaf, v) in r.iter_mut().enumerate() {
+                        if *v == DBG_NONE {
+                            continue;
+                        }
+                        // (a chain of removed copies: to its end)
+                        for _ in 0..64 {
+                            match copies.get(&v.0) {
+                                Some(&s) if s != *v => *v = s,
+                                _ => break,
+                            }
+                        }
+                        if let Some(&k) = consts.get(&v.0) {
+                            *v = DBG_NONE;
+                            d.k.push((leaf as u32, k));
+                        }
+                    }
+                }
+                DbgLoc::Mem(v, _) => {
+                    if let Some(&s) = copies.get(&v.0) {
+                        *v = s;
+                    }
+                }
+                DbgLoc::Slot(..) => {}
+            }
+        }
+    }
+
+    /// The vregs the debug table names (sorted, deduplicated): passes check removals against it.
+    pub fn dbg_vregs(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.dbg.iter().flat_map(|d| match &d.loc {
+            DbgLoc::Regs(r) => r.clone(),
+            DbgLoc::Mem(a, _) => vec![*a],
+            DbgLoc::Slot(..) => Vec::new(),
+        }).filter(|v| *v != DBG_NONE).map(|v| v.0).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Maps the debug table through a slot renumbering (`map(s)` None: s is gone).
+    pub fn dbg_map_slots(&mut self, map: &dyn Fn(u32) -> Option<u32>) {
+        for d in self.dbg.iter_mut() {
+            if let DbgLoc::Slot(s, _) = &mut d.loc {
+                *s = map(*s).unwrap_or(u32::MAX);
+            }
+        }
+    }
 }
 
 /// Source positions are `(file << 32) | byte`, with the inline context in bits 48..63 (0: the
@@ -1245,14 +1383,14 @@ pub fn inline_pc_entries(f: &Func) -> impl Iterator<Item = (u32, u64)> + '_ {
 
 impl Func {
     pub fn new(name: String, file: u32) -> Func {
-        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nocapture: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, owned: Vec::new(), nonnull: Vec::new(), ranged: Vec::new(), dyn_calls: Vec::new(), naked: false, inl: Vec::new() }
+        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nocapture: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, owned: Vec::new(), nonnull: Vec::new(), ranged: Vec::new(), dyn_calls: Vec::new(), naked: false, inl: Vec::new(), dbg: Vec::new() }
     }
     pub fn vreg(&mut self, c: Cls) -> VReg {
         self.vregs.push(c);
         VReg(self.vregs.len() as u32 - 1)
     }
     pub fn block(&mut self) -> u32 {
-        self.blocks.push(Block { insts: Vec::new(), pos: Vec::new(), term: Term::Unreachable, term_pos: 0 });
+        self.blocks.push(Block { insts: Vec::new(), pos: Vec::new(), term: Term::Unreachable, term_pos: 0, count: -1.0 });
         self.blocks.len() as u32 - 1
     }
     pub fn slot(&mut self, size: u32, align: u32) -> u32 {
