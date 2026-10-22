@@ -11305,10 +11305,12 @@ fn sampler_thread() {
                 return;
             }
             let u = unsafe { &*up };
+            // the slots first, HEAT after: a program thread's count stub (rt_hot) reads HEAT, and
+            // it waited (a futex on the UI thread) while this held it across a batch of pc lookups
+            let ids: Vec<(u32, u32)> = pcs.iter().filter_map(|&os::sample::Sample { pc, weight }| Some((u.find_fn(pc)?, weight))).collect();
             let mut heat = crate::zone_alloc::kept_with(|| HEAT.lock().unwrap());
             let counts = heat.get_or_insert_with(std::collections::HashMap::new);
-            for &os::sample::Sample { pc, weight } in &pcs {
-                let Some(id) = u.find_fn(pc) else { continue };
+            for &(id, weight) in &ids {
                 // SPEC-V: a twin's samples heat its base slot too: the body is hot whichever lowering
                 // of it runs, and verified callers lowered again (hot_twin_callers) call the base
                 let base = match u.fns[id as usize].key { FnKey::Plain(b) => Some(b), _ => None };
@@ -12577,7 +12579,8 @@ fn rt_hot(slot: u64) -> u64 {
         // the sampler has not seen it lately: many calls, little CPU (a cheap function a
         // frame calls a few dozen times) -- a O3 build would cost more than it saves
         // (no samples at all: no sampler on this platform -- the count alone decides)
-        let unseen = || HEAT.lock().unwrap().as_ref().map_or(false, |h| h.get(&(slot as u32)).copied().unwrap_or(0) == 0);
+        // (never waits: a busy HEAT reads as unseen -- the slot counts again, its next window decides)
+        let unseen = || HEAT.try_lock().ok().map_or(true, |g| g.as_ref().map_or(false, |h| h.get(&(slot as u32)).copied().unwrap_or(0) == 0));
         let took = now.saturating_sub((*rec.add(4)).load(Ordering::Relaxed));
         // ... unless the calls came very fast (a tight loop: hot before the sampler's first
         // ticks see it -- bench_rt rc_refcell's cold run stayed at O1, 6x rustc)
