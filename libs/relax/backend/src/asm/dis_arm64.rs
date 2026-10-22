@@ -305,7 +305,11 @@ fn dp_imm(w: u32, pc: u64) -> Option<D> {
             let rdr = if opc == 3 { gp(sf, rd) } else { gs(sf, rd) };
             if opc == 1 && rn == 31 && (rd == 31 || !mov_wide_able(imm, sf)) {
                 let mut d = D::new("mov", Class::MovImm);
-                wr!(d, "{}, #0x{:x}", gs(sf, rd), imm);
+                if !sf && imm >= 1 << 31 {
+                    wr!(d, "{}, #{}", gs(sf, rd), imm as u32 as i32);
+                } else {
+                    wr!(d, "{}, #0x{:x}", gs(sf, rd), imm);
+                }
                 return Some(d);
             }
             if opc == 3 && rd == 31 {
@@ -329,7 +333,12 @@ fn dp_imm(w: u32, pc: u64) -> Option<D> {
             let mut d = D::new("mov", Class::MovImm);
             match opc {
                 2 if alias_ok => {
-                    wr!(d, "{}, #{}", gp(sf, rd), (imm as u64) << sh);
+                    let v = (imm as u64) << sh;
+                    if sf {
+                        wr!(d, "{}, #{}", gp(sf, rd), v as i64);
+                    } else {
+                        wr!(d, "{}, #{}", gp(sf, rd), v as u32 as i32);
+                    }
                 }
                 0 if alias_ok && !(!sf && imm == 0xffff) => {
                     let v = !((imm as u64) << sh);
@@ -1790,6 +1799,63 @@ fn simd_fp(w: u32) -> Option<D> {
         };
         let mut d = D::new(name, Class::Vector);
         wr!(d, "v{}.16b, v{}.16b", f(w, 0, 5), f(w, 5, 5));
+        return Some(d);
+    }
+    // sha3: eor3 / bcax / xar / rax1
+    if w & 0xFFC0_8000 == 0xCE00_0000 {
+        let (rd, rn, rm, ra) = (f(w, 0, 5), f(w, 5, 5), f(w, 16, 5), f(w, 10, 5));
+        let mut d = D::new(if bit(w, 21) { "bcax" } else { "eor3" }, Class::Vector);
+        wr!(d, "v{}.16b, v{}.16b, v{}.16b, v{}.16b", rd, rn, rm, ra);
+        return Some(d);
+    }
+    if w & 0xFFE0_0000 == 0xCE80_0000 {
+        let mut d = D::new("xar", Class::Vector);
+        wr!(d, "v{}.2d, v{}.2d, v{}.2d, #{}", f(w, 0, 5), f(w, 5, 5), f(w, 16, 5), f(w, 10, 6));
+        return Some(d);
+    }
+    if w & 0xFFE0_FC00 == 0xCE60_8C00 {
+        let mut d = D::new("rax1", Class::Vector);
+        wr!(d, "v{}.2d, v{}.2d, v{}.2d", f(w, 0, 5), f(w, 5, 5), f(w, 16, 5));
+        return Some(d);
+    }
+    // sdot / udot
+    if w & 0x9F20_FC00 == 0x0E00_9400 && f(w, 22, 2) == 2 {
+        let q = f(w, 30, 1);
+        let mut d = D::new(if bit(w, 29) { "udot" } else { "sdot" }, Class::Vector);
+        wr!(d, "v{}.{}, v{}.{}, v{}.{}", f(w, 0, 5), if q == 1 { "4s" } else { "2s" }, f(w, 5, 5), if q == 1 { "16b" } else { "8b" }, f(w, 16, 5), if q == 1 { "16b" } else { "8b" });
+        return Some(d);
+    }
+    if w & 0x9F20_F400 == 0x0F00_E000 && f(w, 22, 2) == 2 {
+        let q = f(w, 30, 1);
+        let mut d = D::new(if bit(w, 29) { "udot" } else { "sdot" }, Class::Vector);
+        wr!(d, "v{}.{}, v{}.{}, v{}.4b[{}]", f(w, 0, 5), if q == 1 { "4s" } else { "2s" }, f(w, 5, 5), if q == 1 { "16b" } else { "8b" }, bit(w, 20) as u32 * 16 + f(w, 16, 4), f(w, 11, 1) << 1 | f(w, 21, 1));
+        return Some(d);
+    }
+    if w & 0xFFFF_0C00 == 0x5E28_0800 {
+        let (name, ops) = match f(w, 12, 4) {
+            0 => ("sha1h", format!("s{}, s{}", f(w, 0, 5), f(w, 5, 5))),
+            1 => ("sha1su1", format!("v{}.4s, v{}.4s", f(w, 0, 5), f(w, 5, 5))),
+            2 => ("sha256su0", format!("v{}.4s, v{}.4s", f(w, 0, 5), f(w, 5, 5))),
+            _ => return None,
+        };
+        let mut d = D::new(name, Class::Vector);
+        d.ops = ops;
+        return Some(d);
+    }
+    if w & 0xFFE0_8C00 == 0x5E00_0000 {
+        let (rd, rn, rm) = (f(w, 0, 5), f(w, 5, 5), f(w, 16, 5));
+        let (name, ops) = match f(w, 12, 3) {
+            0 => ("sha1c", format!("q{}, s{}, v{}.4s", rd, rn, rm)),
+            1 => ("sha1p", format!("q{}, s{}, v{}.4s", rd, rn, rm)),
+            2 => ("sha1m", format!("q{}, s{}, v{}.4s", rd, rn, rm)),
+            3 => ("sha1su0", format!("v{}.4s, v{}.4s, v{}.4s", rd, rn, rm)),
+            4 => ("sha256h", format!("q{}, q{}, v{}.4s", rd, rn, rm)),
+            5 => ("sha256h2", format!("q{}, q{}, v{}.4s", rd, rn, rm)),
+            6 => ("sha256su1", format!("v{}.4s, v{}.4s, v{}.4s", rd, rn, rm)),
+            _ => return None,
+        };
+        let mut d = D::new(name, Class::Vector);
+        d.ops = ops;
         return Some(d);
     }
     match f(w, 24, 5) {

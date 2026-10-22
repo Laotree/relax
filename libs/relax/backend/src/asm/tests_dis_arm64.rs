@@ -411,25 +411,53 @@ fn load_text(path: &str) -> Text {
     }
 }
 
-/// The text of an instruction with the spacing and number spelling of both disassemblers removed:
-/// hex literals become decimal, whitespace goes.
+/// The text of an instruction as both disassemblers can agree on it: whitespace goes, numbers
+/// become decimal (64-bit values as signed), and the vector arrangements (which the reference
+/// spells on the mnemonic) are dropped from both sides; arrangements are checked by the encoder
+/// round trip.
 fn norm(s: &str) -> String {
-    let s: String = s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
-    let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    let s = s.trim();
+    let (m, rest) = match s.find(char::is_whitespace) {
+        Some(p) => (&s[..p], &s[p..]),
+        None => (s, ""),
+    };
+    let m = match m.find('.') {
+        Some(p) if !m.starts_with("b.") => &m[..p],
+        _ => m,
+    };
+    let rest: String = rest.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+    let mut text = format!("{}{}", m.to_ascii_lowercase(), if rest.is_empty() { String::new() } else { format!(" {}", rest) });
+    if text.contains(',') && (text.starts_with("ushll") || text.starts_with("sshll")) && text.ends_with(",#0x0") {
+        text = text.replace("ushll", "uxtl").replace("sshll", "sxtl").trim_end_matches(",#0x0").to_string();
+    }
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < b.len() {
-        let prev = if i == 0 { b',' } else { b[i - 1] };
-        if b[i] == b'0' && b.get(i + 1) == Some(&b'x') && matches!(prev, b'#' | b',' | b'[' | b'-') {
+        let prev = if i == 0 { b' ' } else { b[i - 1] };
+        if b[i] == b'0' && b.get(i + 1) == Some(&b'x') && matches!(prev, b'#' | b',' | b'[' | b'-' | b' ') {
             let mut j = i + 2;
             while j < b.len() && b[j].is_ascii_hexdigit() {
                 j += 1;
             }
-            match u64::from_str_radix(&s[i + 2..j], 16) {
+            match u64::from_str_radix(&text[i + 2..j], 16) {
+                Ok(v) if v >= 1 << 63 && prev != b'-' => out.push_str(&(v as i64).to_string()),
                 Ok(v) => out.push_str(&v.to_string()),
-                Err(_) => out.push_str(&s[i..j]),
+                Err(_) => out.push_str(&text[i..j]),
             }
             i = j;
+        } else if b[i] == b'.' && prev.is_ascii_digit() {
+            // `.4s` after a register number
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < b.len() && matches!(b[j], b'b' | b'h' | b's' | b'd' | b'q') && (j + 1 == b.len() || matches!(b[j + 1], b',' | b'[' | b'}')) {
+                i = j + 1;
+            } else {
+                out.push('.');
+                i += 1;
+            }
         } else {
             out.push(b[i] as char);
             i += 1;
@@ -438,9 +466,9 @@ fn norm(s: &str) -> String {
     out
 }
 
-/// A reference line `addr:\ttext` split into the text with the comment dealt with: adr / adrp
-/// take the address of the comment as operand.
-fn ref_text(t: &str) -> String {
+/// A reference line's text with the comment dealt with: adr / adrp take the address of the
+/// comment as operand, adr's relative offset becomes an address, `movi` 64-bit masks get `0x`.
+fn ref_text(t: &str, addr: u64) -> String {
     let t = t.trim();
     if let Some(p) = t.find(';') {
         let (head, comment) = (&t[..p], t[p + 1..].trim());
@@ -450,6 +478,22 @@ fn ref_text(t: &str) -> String {
             return format!("{} {}, {}", m, reg, comment);
         }
         return head.trim().to_string();
+    }
+    let m = t.split_whitespace().next().unwrap_or("");
+    if m == "adr" {
+        if let Some((reg, imm)) = t[3..].trim().split_once(',') {
+            if let Ok(v) = imm.trim().trim_start_matches('#').parse::<i64>() {
+                return format!("adr {}, 0x{:x}", reg.trim(), addr.wrapping_add(v as u64));
+            }
+        }
+    }
+    if m.starts_with("movi") {
+        if let Some(p) = t.rfind('#') {
+            let h = &t[p + 1..];
+            if h.len() == 16 && h.bytes().all(|c| c.is_ascii_hexdigit()) {
+                return format!("{}#0x{}", &t[..p], h);
+            }
+        }
     }
     t.to_string()
 }
@@ -498,6 +542,7 @@ fn corpus_decode_and_compare() {
     let mut agree = 0usize;
     let mut we_unknown_ref_known: HashMap<String, (usize, String)> = HashMap::new();
     let mut we_known_ref_data = 0usize;
+    let mut data_by_mnem: HashMap<String, usize> = HashMap::new();
     let mut diffs: HashMap<(String, String), (usize, String, String)> = HashMap::new();
     let mut classes: HashMap<Class, usize> = HashMap::new();
     let chunk = 1 << 20;
@@ -521,10 +566,11 @@ fn corpus_decode_and_compare() {
             }
             if have_refs {
                 let Some(r) = refs.get(&idx) else { continue };
-                let rt = ref_text(r);
+                let rt = ref_text(r, t.base + (idx * 4) as u64);
                 if is_data_dir(&rt) {
                     if i.class != Class::Unknown {
                         we_known_ref_data += 1;
+                        *data_by_mnem.entry(i.mnem.clone()).or_insert(0) += 1;
                     }
                     continue;
                 }
@@ -558,6 +604,9 @@ fn corpus_decode_and_compare() {
     if have_refs {
         println!("compared {}: agree {} ({:.4}%)", compared, agree, 100.0 * agree as f64 / compared.max(1) as f64);
         println!("we decode, reference says data: {}", we_known_ref_data);
+        let mut dm: Vec<_> = data_by_mnem.iter().collect();
+        dm.sort_by(|a, b| b.1.cmp(a.1));
+        println!("  by mnemonic: {}", dm.iter().take(25).map(|(m, n)| format!("{}={}", m, n)).collect::<Vec<_>>().join(" "));
         let mut u: Vec<_> = we_unknown_ref_known.iter().collect();
         u.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
         for (m, (n, ex)) in u.iter().take(40) {
