@@ -3050,6 +3050,10 @@ impl Unit {
     pub(crate) fn index_code(&mut self, at: u64, len: u32, id: u32, unwind: Option<relax_backend::rir::UnwindInfo>) {
         let kind = code_as_now().unwrap_or_else(|| self.default_code_kind(id));
         self.code.write().unwrap_or_else(|e| e.into_inner()).add(at, len, id, unwind, kind);
+        if crate::inspect::pstream::on() {
+            let src = crate::inspect::codever::fn_lines(self, id).and_then(|(f, lo, _)| self.prog.file_paths.get(f as usize).map(|p| format!("{}:{}", p, lo))).unwrap_or_default();
+            crate::inspect::pstream::jit_install(&self.fns[id as usize].name, src, id, len, kind.tier, kind.origin);
+        }
     }
 
     /// The kind of new code for slot `id` when its install path did not say (`code_as`): what
@@ -7921,6 +7925,13 @@ pub unsafe fn settle_drop(up: *mut Unit) -> SettleDrops {
     let queue = TIER_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     let active = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     let mut pinned: std::collections::HashSet<u32> = queue.iter().map(|x| x.0).chain(active.iter().copied()).collect();
+    // code the sampler saw lately (HEAT, decaying) keeps its RIR, its callees too (below): it is what
+    // tiers up next -- O3, retier, its callers' inline snapshots. Dropped, every O3 build of the
+    // running set rebuilt that RIR on the owner (lane SETTLE: Sandbox's O3 tail, the owner 38% in
+    // settle_drop and its rebuilds while the workers waited)
+    if let Some(h) = HEAT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        pinned.extend(h.keys().copied().filter(|&id| (id as usize) < u.fns.len()));
+    }
     // aot: the slots whose callees are speculated after the burst keep their RIR until then
     pinned.extend(AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|x| x.0 == up as usize).map(|x| x.1));
     // Queued jobs have not enumerated their inline snapshots yet. Their known RIR
@@ -11090,6 +11101,13 @@ fn profile_write() {
 /// for a benchmark that times only once the optimised code has settled: `pending` = builds queued or
 /// running or counting (PGO), plus one while the startup phase holds the workers; `installs` = O3 installs so far.
 /// The file exists from the first write on; a program that never reads it pays nothing.
+/// The O3 state for the settling indicator (postframe::settle_progress): builds queued or
+/// running now, and O3 installs so far.
+pub(crate) fn o3_settle_state() -> (u64, u64) {
+    let pending = TIER_QUEUE.lock().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len());
+    (pending as u64, TIER1_INSTALLS.load(Ordering::Relaxed))
+}
+
 fn o3_progress_write(last: &mut std::time::Instant) {
     static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let Some(path) = PATH.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_O3_PROGRESS").ok().filter(|s| !s.is_empty()))) else { return };
@@ -11282,9 +11300,14 @@ fn sampler_thread() {
                 });
                 // a slot counted again after it went cold (tier_revalidate) is queued at its first
                 // sample: it runs again, so its earlier hotness counts (steady lukewarm UI code never
-                // crosses SAMPLES_HOT twice)
-                let rearmed = before == 0 && unsafe { (*tier_rec(&u.slots, id).add(5)).load(Ordering::Relaxed) & REARMED != 0 };
-                if before < SAMPLES_HOT && count >= SAMPLES_HOT || rearmed {
+                // crosses SAMPLES_HOT twice). And a slot that is hot now and still counting is queued
+                // whether or not its heat just crossed SAMPLES_HOT: one counted again while its heat
+                // dipped, whose count stub an O2 install then replaced, stayed hot above the line,
+                // never crossed it again and ran O2 for minutes (Sandbox's reconcile, lane SETTLE)
+                let rec = tier_rec(&u.slots, id);
+                let state = unsafe { (*rec.add(3)).load(Ordering::Relaxed) };
+                let rearmed = before == 0 && unsafe { (*rec.add(5)).load(Ordering::Relaxed) & REARMED != 0 };
+                if count >= SAMPLES_HOT && (before < SAMPLES_HOT || state == T_COUNTING) || rearmed {
                     if sample_trace() {
                         eprintln!("sampler: {} hot", u.fns[id as usize].name);
                     }
@@ -11329,6 +11352,8 @@ impl Drop for Unit {
         let me = self as *mut Unit;
         if self.tier1.is_some() && (TIER_UNIT.load(Ordering::SeqCst) == me || unsafe { UNIT } == me) {
             TIER_STOP.store(true, Ordering::SeqCst);
+            // parked O3 workers see the stop and end
+            TIER_WAKE.notify_all();
             if profile_path().is_some() {
                 profile_write();
             }
@@ -11917,10 +11942,15 @@ fn tier_pop(q: &mut Vec<(u32, u8, u64, u64)>) -> Option<(u32, u8, u64, u64)> {
 static TIER_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
 static TIER_THREAD: std::sync::Once = std::sync::Once::new();
 
-/// Three workers by default. MAKEPAD_RUN_O3_ADAPTIVE=1 opts into additional low-priority
-/// workers admitted only after startup and while >32 builds remain. Queue length is a
-/// cheap demand proxy, not an idle-core measurement: leave at least one core to the program, cap at half the machine, and let
-/// the OS prefer foreground work. Explicit overrides keep a fixed pool.
+/// The level's O3 workers (`o3_threads`) always run. A level with `o3_burst` also starts burst workers
+/// (user, 10-22: every performance core but one, the program's main thread's): after the first present,
+/// while the queue is not trivial, burst worker j builds only while more than O3_BURST_PER * (j + 1)
+/// builds wait (hottest first, tier_pop), so a cold app's backlog (thousands of builds) drains on every
+/// performance core and a short queue on a few; once it drains they sleep on the queue (no polling:
+/// 0% CPU) and the lean policy is back. They run at the
+/// same priority as the other workers (below the program's threads, performance cores) and, like
+/// every worker past the first, only while the program's threads have no lazy compile in flight.
+/// MAKEPAD_RUN_O3_BURST=0 (A/B) keeps the level's workers only; MAKEPAD_RUN_O3_THREADS a fixed pool.
 fn spawn_tier1_threads(runtime: &crate::options::RuntimeOptions, options: &crate::options::Options) {
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     let cap = cores.saturating_sub(1).max(1);
@@ -11930,11 +11960,10 @@ fn spawn_tier1_threads(runtime: &crate::options::RuntimeOptions, options: &crate
     } else if let Some(n) = forced {
         let n = n.clamp(1, cap);
         (n, n)
-    } else if runtime.tier1_adaptive {
-        (3.min(cap), 3.max(cores / 2).min(cap))
     } else {
         let n = 3.min(cap).min(ahead_policy().o3_threads);
-        (n, n)
+        let burst = if runtime.tier1_burst && ahead_policy().o3_burst { os::thread::performance_cores().saturating_sub(1).min(cap) } else { 0 };
+        (n, burst.max(n))
     };
     for k in 0..max {
         let runtime = crate::zone_alloc::kept_clone(runtime);
@@ -11942,6 +11971,15 @@ fn spawn_tier1_threads(runtime: &crate::options::RuntimeOptions, options: &crate
         let _ = std::thread::Builder::new().name(format!("run-o3-{}", k)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); tier1_thread(&runtime, k, normal) });
         }
     }
+}
+
+/// queued builds per burst worker (spawn_tier1_threads)
+const O3_BURST_PER: usize = 8;
+
+/// Burst worker `j` (0 = the first past the level's workers) may build now: the program has
+/// presented its first frame and more than O3_BURST_PER * (j + 1) builds wait.
+fn tier1_burst_admits(j: usize, queued: usize) -> bool {
+    FIRST_PRESENT.load(Ordering::Acquire) && queued > O3_BURST_PER * (j + 1)
 }
 
 /// Opt-in only: no extra clocks, pass timing, allocations or statistics locks when off.
@@ -12053,12 +12091,12 @@ pub(crate) fn tier1_stats_report() {
 static COMPILE_LAST: AtomicU64 = AtomicU64::new(0);
 static STARTUP_COMPILES: AtomicU64 = AtomicU64::new(0);
 
-// A long compile must not look quiet merely because its start was >500 ms ago.
+// A long compile must not look quiet merely because its start was long ago.
 // Include type checking before the unit lock, and release this count on panic too.
 // Only one O3 worker competes with foreground startup compiles (mini, Amp: first
 // present +23% with three). Admission follows demand, not speculative work.
-// A speculative tail can keep COMPILE_LAST fresh long after the hot loop starts. Keep the
-// stricter all-compiler quiet rule below for expensive missing-RIR reconstruction only.
+// A speculative tail can keep COMPILE_LAST fresh long after the hot loop starts: no O3 build,
+// missing-RIR reconstruction included, waits for it.
 static DEMAND_COMPILES: AtomicU64 = AtomicU64::new(0);
 static DEMAND_LAST: AtomicU64 = AtomicU64::new(0);
 
@@ -12103,12 +12141,6 @@ fn tier1_workers_ready() -> bool {
         && wall_ns().saturating_sub(DEMAND_LAST.load(Ordering::SeqCst)) >= TIER1_POLL.as_nanos() as u64
 }
 
-fn tier1_quiet() -> bool {
-    STARTUP_COMPILES.load(Ordering::SeqCst) == 0
-        && wall_ns().saturating_sub(COMPILE_LAST.load(Ordering::SeqCst)) >= TIER1_QUIET_NS
-}
-/// No lazy / speculative compile for this long: missing RIR may be rebuilt under the lock.
-const TIER1_QUIET_NS: u64 = 500_000_000;
 /// slots queued hot (rt_hot runs without the lock; Stats reads it)
 pub static TIER_QUEUED: AtomicU64 = AtomicU64::new(0);
 
@@ -12369,8 +12401,8 @@ unsafe fn counted_build(up: *mut Unit, id: u32) -> bool {
     };
     let (needs, key, front) = owner::call(owner::Class::Background, || (needs_rir(up), (&*up).fns[id as usize].key.clone(), (&*up).front.clone()));
     if needs && !owner::is_owner() {
-        while !tier1_quiet() {
-            job_sleep(std::time::Duration::from_millis(50));
+        while !tier1_workers_ready() {
+            job_sleep(TIER1_POLL);
         }
         if let FnKey::Inst(d, args) = key {
             let _preemptible = crate::preempt::Preemptible::on();
@@ -12586,15 +12618,20 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
                 // Recheck admission on every wake and pop, including a wake from an empty
                 // queue during startup. Already-running builds finish when demand drops.
                 let ready = tier1_workers_ready();
-                if !startup_holds_tier1() && (k == 0 || ready) && (k < normal || q.len() > 32) {
+                if !startup_holds_tier1() && (k == 0 || ready) && (k < normal || tier1_burst_admits(k - normal, q.len())) {
                     tier_revalidate(&mut q);
                     if let Some(e) = tier_pop(&mut q) {
                         TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(e.0);
                         break e;
                     }
                 }
+                // nothing for this worker until the queue grows (empty, or too short for a burst
+                // worker): the next push wakes it, no 50 ms polls of an idle app; the first worker
+                // polls on for the verdict sweep below
+                let parked = k != 0 && (q.is_empty() || k >= normal && !tier1_burst_admits(k - normal, q.len()));
+                // the first worker polls faster while the PGO counted window is open
                 let poll = if k == 0 && pgo_counting() { PGO_POLL } else { TIER1_POLL };
-                q = TIER_WAKE.wait_timeout(q, poll).unwrap().0;
+                q = if parked { TIER_WAKE.wait(q).unwrap() } else { TIER_WAKE.wait_timeout(q, poll).unwrap().0 };
                 if k == 0 {
                     // SPEC-V: verdicts that arrived release the promotions that waited for them
                     drop(q);
@@ -12962,17 +12999,19 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let t0 = cpu_ns();
     let mut measure = tier1_stats_on().then(|| Tier1Measure::new(t0));
     // code installed from the disk cache has no RIR: build it here (the front end and lowering
-    // run on this thread), else a cached function would stay at O1 for good. Not while the
-    // program still compiles (or links) its way to a frame: that front end would hold the unit
-    // the main thread is waiting for.
+    // run on this thread), else a cached function would stay at O1 for good. Not while a
+    // program thread has a lazy compile in flight (or had one in the last TIER1_POLL): the UI
+    // goes first. Speculative and other background compiles do not hold it back: they refreshed
+    // an all-compiler quiet window for seconds after Stage's present, every O3 worker slept here
+    // with ~1.5k hot builds queued (lane SETTLE trace, 165), hot code waiting behind guesses.
     let needs_rir = |up: *mut Unit| {
         let f = &(&*up).fns[id as usize];
         f.compiled && f.rir.is_none() && f.build_err.is_none() && !f.building
     };
     let (needs, key, front) = owner::call(owner::Class::Background, || (needs_rir(up), (&*up).fns[id as usize].key.clone(), (&*up).front.clone()));
     if needs && !t1prof_replay(options) && !owner::is_owner() {
-        while !tier1_quiet() {
-            job_sleep(std::time::Duration::from_millis(50));
+        while !tier1_workers_ready() {
+            job_sleep(TIER1_POLL);
         }
         // its type check runs first, off the unit (the build takes the checked body): one
         // solver search there took seconds, and every thread needing a lazy compile -- the UI
@@ -13958,6 +13997,8 @@ extern "C" fn relax_first_present() {
             exec_check_now("first frame");
         }
         FIRST_PRESENT_NS.store(wall_ns(), Ordering::Release);
+        // burst O3 workers wait for the present (tier1_burst_admits)
+        TIER_WAKE.notify_all();
         for i in 0..8 { AHEAD_AT_PRESENT[i].store(AHEAD_STATS[i].load(Ordering::Relaxed), Ordering::Relaxed); }
         crate::solver_work::report();
         relax_codegen::exec_census::first_present();
@@ -14199,8 +14240,10 @@ pub(crate) struct AheadPolicy {
     pub(crate) last_run: bool,
     /// O3 queue entries of code gone cold are counted again
     o3_revalidate: bool,
-    /// O3 workers at most
+    /// O3 workers that always run
     o3_threads: usize,
+    /// burst workers drain a long O3 queue after the first present (spawn_tier1_threads)
+    o3_burst: bool,
     /// an AOT level: builds made during a UI burst have their callees speculated after it
     /// (aot_drain), speculation does not follow only the fall-through path on battery
     aot: bool,
@@ -14213,22 +14256,22 @@ pub(crate) fn ahead_policy() -> &'static AheadPolicy {
     const MINIMAL: AheadPolicy = AheadPolicy {
         spec_calls: false, spec_cached: false, spec_depth: Some(0), spec_hot_from: Some(0), spec_dyn: false, spec_jobs: 1, spec_expire: true,
         post_present_helpers: 0, teardown: false, borrowck_discovery: false, last_run: false, o3_revalidate: true, o3_threads: 2,
-        aot: false, background_class: false,
+        o3_burst: false, aot: false, background_class: false,
     };
     const BALANCED: AheadPolicy = AheadPolicy {
         spec_calls: true, spec_cached: true, spec_depth: None, spec_hot_from: None, spec_dyn: true, spec_jobs: 2, spec_expire: true,
         post_present_helpers: u32::MAX, teardown: false, borrowck_discovery: false, last_run: false, o3_revalidate: true, o3_threads: 2,
-        aot: false, background_class: false,
+        o3_burst: true, aot: false, background_class: false,
     };
     const AOT_MAX: AheadPolicy = AheadPolicy {
         spec_calls: true, spec_cached: true, spec_depth: Some(AOT_DEPTH), spec_hot_from: Some(AOT_DEPTH), spec_dyn: true, spec_jobs: usize::MAX, spec_expire: false,
         post_present_helpers: u32::MAX, teardown: true, borrowck_discovery: true, last_run: true, o3_revalidate: false, o3_threads: 3,
-        aot: true, background_class: false,
+        o3_burst: true, aot: true, background_class: false,
     };
     const AOT_MIN: AheadPolicy = AheadPolicy {
         spec_calls: true, spec_cached: true, spec_depth: Some(AOT_DEPTH), spec_hot_from: Some(AOT_DEPTH), spec_dyn: true, spec_jobs: 2, spec_expire: false,
         post_present_helpers: u32::MAX, teardown: true, borrowck_discovery: true, last_run: true, o3_revalidate: false, o3_threads: 2,
-        aot: true, background_class: true,
+        o3_burst: false, aot: true, background_class: true,
     };
     match ahead_level() {
         AheadLevel::Minimal => &MINIMAL,
@@ -15067,7 +15110,17 @@ pub struct JobGuard;
 
 /// Starts a compile job: waits while an allocator swap is in progress.
 pub fn compile_job() -> JobGuard {
-    job_gate(false)
+    let g = job_gate(false);
+    // the outermost job of the thread is a `compile` span of the timeline / prof stream
+    if JOB_DEPTH.with(|d| d.get()) == 1 && crate::inspect::timeline::recording() && !JOB_SPAN.with(|s| s.replace(true)) {
+        crate::inspect::timeline::push(crate::inspect::timeline::Kind::SpanBegin, "compile", 0, 0);
+    }
+    g
+}
+
+thread_local! {
+    /// this thread's outermost compile job opened a `compile` span (its guard's drop ends it)
+    static JOB_SPAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn job_gate(reenter: bool) -> JobGuard {
@@ -15167,6 +15220,9 @@ impl Drop for JobGuard {
         });
         if outer {
             BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            if JOB_SPAN.with(|s| s.replace(false)) {
+                crate::inspect::timeline::push(crate::inspect::timeline::Kind::SpanEnd, "compile", 0, 0);
+            }
         }
     }
 }
