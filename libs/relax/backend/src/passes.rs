@@ -1421,6 +1421,25 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                         }
                         other => other,
                     };
+                    // (x + k) - x -> k and x - (x + k) -> -k (wrapping 64-bit arithmetic, x one
+                    // value; LLVM InstSimplify): `data[i..i + 8]` is 8 long, so `try_into::<[u8; 8]>`
+                    // is always Ok -- the Err path, its tag store and reload and the default's fill
+                    // stayed in every BitReader::peek
+                    if ic && !opt_off(options, "-subk") {
+                        if let Inst::IBin(IOp::Sub, it, d, a, b) = new {
+                            let off = |s: VReg, x: VReg| match bin_def[s.0 as usize] {
+                                Some((op @ (IOp::Add | IOp::Sub), t, y, k, _, _)) if y == x && t.bits == 64 && single(x, &ndef) => Some(if op == IOp::Add { k } else { k.wrapping_neg() }),
+                                _ => None,
+                            };
+                            let k = if it.bits != 64 { None } else if let Some(k) = off(a, b) { Some(k) } else { off(b, a).map(|k| k.wrapping_neg()) };
+                            if let Some(k) = k {
+                                new = Inst::Iconst(d, k);
+                                if single(d, &ndef) {
+                                    kn[d.0 as usize] = Some(K::I(k));
+                                }
+                            }
+                        }
+                    }
                     // x * 1.0, 1.0 * x, x / 1.0, x - 0.0, x + -0.0, -0.0 + x: x itself (exact in
                     // IEEE arithmetic, a NaN's payload aside, which Rust leaves unspecified;
                     // LLVM's instsimplify does the same) -- `Vec4 { w: 1.0, .. }` through a matrix
@@ -6409,7 +6428,10 @@ pub fn licm(options: &relax_session::Options, f: &mut Func) -> bool {
     // check's verdict are not in `f.noalias`, so they hoist nothing.
     let mut na = if f.noalias.is_empty() || no_noalias(options) { None } else { Some(noalias_roots(f, &ndef)) };
     // a param handed to a call anywhere in the function may be kept by it (then reached later through a
-    // loaded pointer, which the roots take as not derived from the param): captured for the hoist
+    // loaded pointer, which the roots take as not derived from the param): captured for the hoist,
+    // unless the callee provably keeps no pointer it gets there (O3's param_nocapture oracle, as
+    // LLVM's `nocapture`: `f1.decode(&mut r, &self.setup.codebooks, y)` left every `self.spectra`
+    // load in decode_spectra's loops)
     if let Some((_, cap, taint)) = na.as_mut() {
         for b in &f.blocks {
             for i in &b.insts {
@@ -6418,8 +6440,14 @@ pub fn licm(options: &relax_session::Options, f: &mut Func) -> bool {
                         Callee::Indirect(x) | Callee::CIndirect(x, _) => Some(*x),
                         _ => None,
                     };
-                    for a in args.iter().copied().chain(ind) {
+                    for (k, a) in args.iter().copied().enumerate() {
                         let t = taint[a.0 as usize];
+                        if t != u32::MAX && !cap.contains(&t) && !(sroa_nocapture(c, k) && !opt_off(options, "-licmnocap")) {
+                            cap.push(t);
+                        }
+                    }
+                    if let Some(x) = ind {
+                        let t = taint[x.0 as usize];
                         if t != u32::MAX && !cap.contains(&t) {
                             cap.push(t);
                         }
