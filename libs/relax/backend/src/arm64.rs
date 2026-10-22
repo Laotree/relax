@@ -93,6 +93,7 @@ pub fn reg_config() -> RegConfig {
         sym_class: 0,
         store_imm: |k| k == 0,
         fconst_remat: true,
+        float_windows: true,
     }
 }
 
@@ -981,6 +982,12 @@ impl<'a> Gen<'a> {
         }
     }
     fn use_f(&mut self, v: VReg, scratch: u8) -> u8 {
+        if !matches!(self.al.loc[v.0 as usize], Loc::Flt(_)) {
+            // held in a register over this run of uses (float windows)
+            if let Some(r) = self.win_reg(v) {
+                return r;
+            }
+        }
         match self.al.loc[v.0 as usize] {
             Loc::Flt(x) => x,
             Loc::Stack(o) if self.cls(v) == Cls::V128 => {
@@ -1230,11 +1237,25 @@ impl<'a> Gen<'a> {
                 self.cur_pos = self.al.inst_pos(bi, ii);
                 if let Some(ls) = self.win_start.get(&self.cur_pos).cloned() {
                     for (v, r) in ls {
-                        if let Loc::Stack(o) = self.al.loc[v as usize] {
-                            let off = self.spill_sp(o);
-                            self.a.ldst(LDRX, 8, r, SP, off);
-                        } else {
-                            self.remat_into(r, VReg(v));
+                        match (self.cls(VReg(v)), self.al.loc[v as usize]) {
+                            (Cls::I, Loc::Stack(o)) => {
+                                let off = self.spill_sp(o);
+                                self.a.ldst(LDRX, 8, r, SP, off);
+                            }
+                            (Cls::I, _) => self.remat_into(r, VReg(v)),
+                            (Cls::V128, Loc::Stack(o)) => {
+                                let off = self.spill_sp(o);
+                                self.vldst(true, r, SP, off);
+                            }
+                            (_, Loc::Stack(o)) => {
+                                let off = self.spill_sp(o);
+                                self.a.ldst(LDRD, 8, r, SP, off);
+                            }
+                            (_, _) => match self.al.remat[v as usize] {
+                                Remat::VConst(bits) => self.vconst_into(r, bits),
+                                Remat::FConst(bits, f64_) => self.fconst_into(r, bits, f64_),
+                                m => unreachable!("float window of {:?}", m),
+                            },
                         }
                     }
                 }
