@@ -2842,8 +2842,12 @@ pub fn forward_slot_dests(f: &mut Func) -> bool {
         let mut param_based: Option<Vec<bool>> = None;
         // (B, C, offset, block, copy index)
         let mut repl: Vec<(u32, u32, i64, usize, usize)> = Vec::new();
+        let dbg = std::env::var("MAKEPAD_RUN_FSD_DEBUG").map_or(false, |w| f.name.ends_with(w.as_str()));
         for b in 0..ns {
             let Some((cb, ci, c, o, n)) = the_copy[b] else { continue };
+            if dbg {
+                eprintln!("fsd {} B={} C={} n={} esc_b={} multi_blk={} reads={} used={}/{} esc_c={} span={:?} copy=({},{})", f.name, b, c, n, sc.esc[b], multi_blk[b], sc.reads[b], used[b], used[c as usize], sc.esc[c as usize], span[b], cb, ci);
+            }
             if sc.esc[b] || multi_blk[b] || sc.reads[b] != 1 || used[b] || used[c as usize] {
                 continue;
             }
