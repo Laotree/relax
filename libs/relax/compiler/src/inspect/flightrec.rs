@@ -607,7 +607,7 @@ pub(super) fn encode(cur: &mut Cursors, enc: &mut super::pstream::StreamEnc, min
     }
     // stall samples (a live viewer's start: none of the earlier ones)
     let raw: Vec<RawSample> = {
-        let mut log = SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
+        let log = SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
         if cur.samples == u64::MAX {
             cur.samples = log.base + log.v.len() as u64;
         }
