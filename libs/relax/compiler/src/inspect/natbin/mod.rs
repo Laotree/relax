@@ -201,7 +201,18 @@ impl NativeBin {
         let mut srcs = Vec::new();
         let mut from = "none";
         let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let dsym = format!("{}.dSYM/Contents/Resources/DWARF/{}", path, name);
+        let dir = format!("{}.dSYM/Contents/Resources/DWARF", path);
+        let mut dsym = format!("{}/{}", dir, name);
+        // cargo makes the dSYM for the deps/ file and links it next to the binary: the DWARF file
+        // inside keeps the deps name (`krate-<hash>`); a dSYM holds one
+        if !std::path::Path::new(&dsym).exists() {
+            if let Some(only) = std::fs::read_dir(&dir).ok().and_then(|d| {
+                let v: Vec<_> = d.flatten().map(|e| e.path()).collect();
+                (v.len() == 1).then(|| v[0].to_string_lossy().into_owned())
+            }) {
+                dsym = only;
+            }
+        }
         if let Some(d) = NativeBin::load_dsym(&dsym, m.arch) {
             srcs.push(Src::Dbg(d));
             from = "dSYM";
