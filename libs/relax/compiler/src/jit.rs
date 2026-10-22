@@ -9871,6 +9871,13 @@ fn dump_base(name: &str) -> Option<String> {
     static DUMP: std::sync::OnceLock<Option<(Vec<String>, String)>> = std::sync::OnceLock::new();
     let (wants, dir) = DUMP.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_DUMP").ok().map(|w| (w.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect(), std::env::var("MAKEPAD_RUN_DUMP_DIR").unwrap_or_else(|_| "/tmp".to_string()))))).as_ref()?;
     let w = wants.iter().find(|w| name.ends_with(w.as_str()))?;
+    // MAKEPAD_RUN_DUMP_EACH=1: every build its own files (instances of one generic share a name)
+    static EACH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *EACH.get_or_init(|| std::env::var_os("MAKEPAD_RUN_DUMP_EACH").is_some()) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Some(format!("{}/relax_dump_{}.{}", dir, w.replace("::", "_"), n));
+    }
     Some(format!("{}/relax_dump_{}", dir, w.replace("::", "_")))
 }
 
