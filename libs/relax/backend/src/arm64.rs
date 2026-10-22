@@ -792,8 +792,8 @@ struct Gen<'a> {
     slot_pos: Vec<i64>,
     block_pos: Vec<usize>,
     next_block: Vec<u32>,
-    /// counted code: per block its PGO count or the estimate from the nearest counted block
-    /// (profile::estimates), for the direction of two-way branches
+    /// counted code: per block the share of its predecessors' counts that reaches it (PGO counts,
+    /// profile::estimates for blocks without one), for the direction of two-way branches
     block_est: Option<Vec<f64>>,
     fixups: Vec<(usize, u32)>,
     /// float literal pool: (ldr word index, bits)
@@ -1231,7 +1231,21 @@ impl<'a> Gen<'a> {
         let nb = self.f.blocks.len();
         self.block_pos = vec![0; nb];
         self.next_block = vec![u32::MAX; nb];
-        self.block_est = if crate::stats::opt_env_off("-a64backedge") { None } else { crate::profile::estimates(self.f) };
+        // per block: its estimated count over its predecessors' (profile::layout's edge split), so
+        // the edge b -> t weighs est[b] * share[t]
+        self.block_est = if crate::stats::opt_env_off("-a64backedge") { None } else {
+            crate::profile::estimates(self.f).map(|est| {
+                let mut pred = vec![0.0f64; nb];
+                for (b, blk) in self.f.blocks.iter().enumerate() {
+                    if reach[b] {
+                        for t in blk.term.succs() {
+                            pred[t as usize] += est[b];
+                        }
+                    }
+                }
+                est.iter().zip(&pred).map(|(e, p)| if *p > 0.0 { e / p } else { 0.0 }).collect()
+            })
+        };
         let mut prev: Option<usize> = None;
         for bi in 0..nb {
             if reach[bi] {
@@ -3625,7 +3639,7 @@ impl<'a> Gen<'a> {
         // taken b.cond is one instruction, a not-taken one plus the b two). Counted code (PGO
         // block counts) says which; static code takes the back edge, and of two targets laid out
         // before the nearer one (the innermost loop's header; an exit placed before the loop is
-        // further back). A target's count stands for the edge's (most blocks have one hot way in).
+        // further back).
         let est = self.block_est.as_ref().map(|e| (e[tt as usize], e[ff as usize])).filter(|(t, f)| t != f);
         let ff_cond = match est { Some((t, f)) => f > t, None => back(ff) && (!back(tt) || ff > tt) };
         if tt == next || ff != next && ff_cond {
