@@ -806,6 +806,8 @@ fn evex_direct(pp: u8, map: u8, op: u8) -> Option<bool> {
         (1, 1, 0xd4 | 0xfb) => Some(true),
         // vinsertps (EVEX.128.66.0F3A.W0 21)
         (3, 1, 0x21) => Some(false),
+        // vpshufd (EVEX.128.66.0F.W0 70 /r ib; no vvvv operand)
+        (1, 1, 0x70) => Some(false),
         _ => None,
     }
 }
@@ -1605,6 +1607,14 @@ impl<'a> Gen<'a> {
                             if let Inst::ICmp(cc, sg, ..) | Inst::ICmpI(cc, sg, ..) = inst {
                                 self.inst(options, inst);
                                 self.sel_flags = Some((cd, icc(*cc, *sg)));
+                                continue;
+                            }
+                            // an ordered float compare (ucomis[sd], operands swapped for Lt / Le:
+                            // `a` / `ae`, false when unordered): an argmax's index select
+                            if let Inst::FCmp(cc @ (Cond::Lt | Cond::Le | Cond::Gt | Cond::Ge), ..) = inst {
+                                let fcc = if matches!(cc, Cond::Lt | Cond::Gt) { CC_A } else { CC_AE };
+                                self.inst(options, inst);
+                                self.sel_flags = Some((cd, fcc));
                                 continue;
                             }
                         }
@@ -4021,11 +4031,20 @@ impl<'a> Gen<'a> {
                 self.fin_f(d, xd);
             }
             VX::ShufS(k) => {
-                let xa = self.use_f(a, XS);
-                let xd = self.def_f(d, XS);
-                self.a.sse_rr(0x66, 0x70, xd, xa, false);
-                self.a.byte(k);
-                self.fin_f(d, xd);
+                if self.avx {
+                    // vpshufd (VEX, or EVEX for xmm16..31: no trip through the scratch register)
+                    let xa = self.use_fx(a, XS);
+                    let xd = self.def_fx(d, XS);
+                    self.a.vex_rr(1, 1, false, 0x70, xd, 0, xa);
+                    self.a.byte(k);
+                    self.fin_f(d, xd);
+                } else {
+                    let xa = self.use_f(a, XS);
+                    let xd = self.def_f(d, XS);
+                    self.a.sse_rr(0x66, 0x70, xd, xa, false);
+                    self.a.byte(k);
+                    self.fin_f(d, xd);
+                }
             }
             VX::BytesShrI(k) | VX::BytesShlI(k) => {
                 let xa = self.use_f(a, XS);

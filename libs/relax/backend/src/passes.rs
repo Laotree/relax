@@ -740,6 +740,18 @@ pub fn vx_peep(f: &mut Func, ndef: &[u32]) {
                     VX::ZipLo(VW::D) => {
                         *a = low(*a);
                         *bb = low(*bb);
+                        // the low halves of two lane shuffles of one vector: one shuffle
+                        // (`_mm_shuffle_ps(a, a, m)` = pshufd a, m; cross products, dot splats)
+                        let src = |v: VReg| match def[v.0 as usize] {
+                            Some((VX::ShufS(k), x)) => (x, k),
+                            _ => (v, 0b11_10_01_00),
+                        };
+                        let ((x, k1), (y, k2)) = (src(*a), src(*bb));
+                        if x == y {
+                            *op = VX::ShufS((k1 & 0x0f) | ((k2 & 0x0f) << 4));
+                            *a = x;
+                            *bb = x;
+                        }
                     }
                     VX::Extract(w, lane) if (lane as u32 + 1) * w.bits() <= 64 => {
                         *a = low(*a);
@@ -4902,7 +4914,7 @@ pub fn local_cse(options: &relax_session::Options, f: &mut Func) -> bool {
                     uses_defs(&b.insts[k], &mut uses, &mut defs);
                 }
             }
-            let is_load = matches!(b.insts[k], Inst::Load(..));
+            let is_load = matches!(b.insts[k], Inst::Load(..) | Inst::VLoad(..));
             ops.clear();
             ops.extend_from_slice(&uses);
             let cand = match &b.insts[k] {
@@ -5097,6 +5109,8 @@ pub fn load_key_size(k0: u64) -> i64 {
         4
     } else if mk & (2 << 16) != 0 {
         8
+    } else if mk & (4 << 16) != 0 {
+        32
     } else {
         (mk & 0xff) as i64
     }
@@ -5168,7 +5182,7 @@ pub fn gvn_pure(f: &mut Func) -> bool {
                 changed = true;
             }
             let i = &b.insts[k];
-            if matches!(i, Inst::Load(..) | Inst::Iconst(..) | Inst::Fconst(..) | Inst::VConst(..) | Inst::Addr(..) | Inst::FnAddr(..)) {
+            if matches!(i, Inst::Load(..) | Inst::VLoad(..) | Inst::Iconst(..) | Inst::Fconst(..) | Inst::VConst(..) | Inst::Addr(..) | Inst::FnAddr(..)) {
                 continue;
             }
             // an operand: its constant (Iconst / VConst operands differ by value: tagged) or its vreg
@@ -5266,6 +5280,9 @@ pub fn cse_key(i: &Inst) -> Option<[u64; 3]> {
             };
             [13 | (mk << 8), v(b), *o as i64 as u64]
         }
+        // a vector load (16 or 32 bytes: load_key_size takes 32); the result class tells V128 and
+        // V256 apart where local_cse matches keys
+        Inst::VLoad(_, b, o) => [13 | ((4 << 16) << 8), v(b), *o as i64 as u64],
         Inst::Addr(_, x) => [14, x.id as u64, x.off as u64],
         Inst::FnAddr(_, x) => [15, *x as u64, 0],
         Inst::VExtract(_, a, l) => [16 | ((*l as u64) << 8), v(a), 0],

@@ -2251,6 +2251,101 @@ pub fn forward_slot_copies(f: &mut Func) -> bool {
     any
 }
 
+/// Copies of a value the same block just stored into a temporary: `Copy(d, t, n)` out of a
+/// non-escaping slot whose copied bytes the stores in front of it (same block) cover exactly
+/// becomes those stores' values stored at `d` (a value built in a temporary and moved into
+/// place: `[SimplexVertex::default(); 4]`, `vs[i] = Vertex { .. }`, a struct literal assigned
+/// to a field). The bytes are no longer read back through memory -- each 16-byte piece of the
+/// copy, read behind the narrower stores that just wrote it, failed store forwarding -- and the
+/// temporary's stores are left for dead_slot_stores. At most 16 stores per copy; a store
+/// reaching outside the copied bytes, an indexed or unknown write of the temporary, a value
+/// redefined before the copy, or a byte not stored in the block keeps the copy.
+pub fn stores_for_copies(f: &mut Func) -> bool {
+    if f.slots.is_empty() {
+        return false;
+    }
+    let SlotScan { vs, esc, .. } = slot_scan(f);
+    const NONE: u32 = u32::MAX;
+    const MAX_STORES: usize = 16;
+    let sl = |v: VReg| vs[v.0 as usize].0;
+    let mut any = false;
+    for bi in 0..f.blocks.len() {
+        let mut ii = 0;
+        while ii < f.blocks[bi].insts.len() {
+            let Inst::Copy(d, t, n) = f.blocks[bi].insts[ii] else { ii += 1; continue };
+            let ts = sl(t);
+            if ts == NONE || esc[ts as usize] || sl(d) == ts || n == 0 || n > 4096 {
+                ii += 1;
+                continue;
+            }
+            let (lo, hi) = (vs[t.0 as usize].1, vs[t.0 as usize].1 + n as i64);
+            // backwards from the copy: the latest store of every copied byte
+            let mut covered = vec![false; n as usize];
+            let mut left = n as usize;
+            let mut taken: Vec<(i64, Inst)> = Vec::new();
+            let mut defs: Vec<VReg> = Vec::new();
+            let mut ok = false;
+            for j in (0..ii).rev() {
+                let i = &f.blocks[bi].insts[j];
+                let st = match *i {
+                    Inst::Store(m, base, off, v) if sl(base) == ts => Some((vs[base.0 as usize].1 + off as i64, mem_size(m) as i64, v)),
+                    Inst::VStore(base, off, v) if sl(base) == ts => Some((vs[base.0 as usize].1 + off as i64, if f.vregs[v.0 as usize] == Cls::V256 { 32 } else { 16 }, v)),
+                    Inst::StoreX(_, base, ..) | Inst::VStoreX(base, ..) if sl(base) == ts => break,
+                    Inst::Copy(d2, _, _) if sl(d2) == ts => break,
+                    _ => None,
+                };
+                if let Some((a, sz, v)) = st {
+                    let b = a + sz;
+                    if b <= lo || a >= hi {
+                        // outside the copied bytes
+                    } else if a < lo || b > hi {
+                        break;
+                    } else {
+                        let r = (a - lo) as usize..(b - lo) as usize;
+                        let fresh = covered[r.clone()].iter().filter(|c| !**c).count();
+                        if fresh == r.len() {
+                            if defs.contains(&v) || taken.len() == MAX_STORES {
+                                break;
+                            }
+                            let rel = (a - lo) as i32;
+                            let ni = match *i {
+                                Inst::Store(m, ..) => Inst::Store(m, d, rel, v),
+                                _ => Inst::VStore(d, rel, v),
+                            };
+                            taken.push((a, ni));
+                            covered[r].iter_mut().for_each(|c| *c = true);
+                            left -= fresh;
+                            if left == 0 {
+                                ok = true;
+                                break;
+                            }
+                        } else if fresh != 0 {
+                            // partly overwritten by a later store
+                            break;
+                        }
+                    }
+                }
+                for_defs(i, |x| defs.push(x));
+            }
+            if !ok {
+                ii += 1;
+                continue;
+            }
+            taken.sort_by_key(|x| x.0);
+            let k = taken.len();
+            let pos = f.blocks[bi].pos.get(ii).copied();
+            let blk = &mut f.blocks[bi];
+            blk.insts.splice(ii..ii + 1, taken.into_iter().map(|x| x.1));
+            if let Some(p) = pos {
+                blk.pos.splice(ii..ii + 1, std::iter::repeat(p).take(k));
+            }
+            ii += k;
+            any = true;
+        }
+    }
+    any
+}
+
 /// Wide integer accesses of a stack slot that other accesses of the slot cut: a pair of
 /// `u32` fields stored one by one and moved as one `u64` (or `u16` halves of a `u32`) makes
 /// the slot's overlapping cells unpromotable (sroa: one cell per offset and size) and, left in

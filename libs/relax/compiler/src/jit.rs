@@ -9633,6 +9633,11 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         }
         verify_pass(func, "vector slot cleanup");
     }
+    // values built in a temporary and copied into place: stored there directly (the
+    // temporary's stores die below)
+    if cfg.fold && cfg.sroa && relax_codegen::opt::stores_for_copies(func) {
+        verify_pass(func, "stores_for_copies");
+    }
     relax_codegen::opt::compact_slots(func);
     // stores into slot bytes nobody reads back: the forwarding passes above left them behind
     // (a `[0u8; 8]` buffer filled by copy_from_slice and read by from_le_bytes, the load

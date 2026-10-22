@@ -1746,6 +1746,10 @@ pub fn merge_lane_stores(options: &relax_session::Options, f: &mut Func) -> bool
                         out.push(l);
                         pos.push(pq);
                     }
+                    // the splat already holds lane 0's value in every lane (a zeroed vector)
+                    if vs[j] == vs[0] {
+                        continue;
+                    }
                     let t2 = f.vreg(Cls::V128);
                     out.push(Inst::VInsert(t2, t, j as u8, vs[j]));
                     pos.push(p);
