@@ -1713,6 +1713,15 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     chained.extend(def_wins);
     asm_callee_writes(f, cfg, &mut used_callee_int, &mut used_callee_flt);
     let EvictState { evicts, prestores, .. } = evicted;
+    if trace_on(f) {
+        for e in &evicts {
+            eprintln!("ra-evict {} v{} r{} store {} reload {} free {:?} remat {:?}", f.name, e.v, e.reg, if e.store == u32::MAX { "-".to_string() } else { e.store.to_string() }, e.reload, e.free, e.remat);
+        }
+        for p in &prestores {
+            eprintln!("ra-prestore {} v{} r{} at {}", f.name, p.1, p.2, p.0);
+        }
+        eprintln!("ra-windows {}: {} windows, {} def windows/chained, {} dead stores, {} evictions", f.name, windows.len(), chained.len(), store_skip.len(), evicts.len());
+    }
     Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows, chained, save_skip, restore_skip, store_skip, evicts, prestores }
 }
 
