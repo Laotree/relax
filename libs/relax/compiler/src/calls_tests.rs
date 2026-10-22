@@ -111,6 +111,20 @@ fn patched_callee_while_callers_run() {
     }
     let new = u.fns[leaf as usize].code;
     assert_ne!(old, new, "leaf has new code");
+    // a direct call site (optimised code, `direct`): linked to leaf's code, then it follows the word
+    #[cfg(target_arch = "aarch64")]
+    let site = {
+        use relax_backend::rir::{Reloc, RelocAt, RelocKind};
+        let relocs = [RelocAt { at: 0, kind: RelocKind::A64Branch26, target: Reloc::Call(leaf) }];
+        u.emit_linked(&0x9400_0000u32.to_le_bytes(), &relocs, true).unwrap()
+    };
+    #[cfg(target_arch = "aarch64")]
+    let site_target = |at: u64| {
+        let w = unsafe { std::ptr::read_volatile(at as *const u32) };
+        at.wrapping_add((((w & 0x03FF_FFFF) << 6) as i32 >> 4) as i64 as u64)
+    };
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(site_target(site), new, "a direct site branches to the callee's code, not its thunk");
     // racing writers of the table word (old and new code: both are leaf), callers still running:
     // the head ends matching the word
     let slots = &*u.slots as *const relax_backend::rir::SlotTable as usize;
@@ -126,6 +140,14 @@ fn patched_callee_while_callers_run() {
     assert_eq!(head(&u, leaf), head_for(&u, leaf, word), "after racing stores the head matches the word");
     crate::jit::SlotWord::of(&u.slots, leaf).store(new, Ordering::SeqCst);
     assert_eq!(head(&u, leaf), head_for(&u, leaf, new));
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert_eq!(site_target(site), new, "after racing stores the direct site matches the word");
+        crate::jit::SlotWord::of(&u.slots, leaf).store(old, Ordering::SeqCst);
+        assert_eq!(site_target(site), old, "the site follows a store of the word");
+        crate::jit::SlotWord::of(&u.slots, leaf).store(new, Ordering::SeqCst);
+        assert_eq!(site_target(site), new);
+    }
     let mut seen = [0u64; 3];
     call(finish, seen.as_mut_ptr() as u64);
     assert_eq!(seen[2], 0, "a caller saw neither the old nor the new leaf: {seen:?}");
