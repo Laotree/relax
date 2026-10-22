@@ -11942,15 +11942,19 @@ pub(crate) fn sampler_period_floor() -> u64 {
 }
 
 fn tier_push(id: u32, why: u8, rate: u64) {
-    TIER_PUSHES.fetch_add(1, Ordering::Relaxed);
     let mut q = TIER_QUEUE.lock().unwrap();
+    tier_push_locked(&mut *q, id, why, rate);
+    drop(q);
+    TIER_WAKE.notify_all();
+}
+
+fn tier_push_locked(q: &mut Vec<(u32, u8, u64, u64)>, id: u32, why: u8, rate: u64) {
+    TIER_PUSHES.fetch_add(1, Ordering::Relaxed);
     q.push((id, why, wall_ns(), rate));
     if tier1_trace() {
         // no unit lock here (rt_hot): the slot, not its name
         eprintln!("O3q @{:.3} queued #{} ({}) q={}", wall_ns() as f64 / 1e9, id, Q_WHY[why as usize], q.len());
     }
-    drop(q);
-    TIER_WAKE.notify_all();
 }
 
 /// Current sampled CPU first (including hits inside loops), call rate next, then oldest.
@@ -12593,12 +12597,23 @@ fn rt_hot(slot: u64) -> u64 {
             (*rec.add(4)).store(now, Ordering::Relaxed);
             return code;
         }
+        // The queue lock is taken only if free (a calling program thread never waits on it: O3
+        // workers and the sampler hold it): busy, the slot counts again from now, stub in place.
+        let Ok(mut q) = TIER_QUEUE.try_lock() else {
+            if let Some(t) = &u.tier1 {
+                (*rec).store(t.calls, Ordering::Relaxed);
+            }
+            (*rec.add(4)).store(now, Ordering::Relaxed);
+            return code;
+        };
         // a patch may have replaced the stub in the meantime: then that code runs
         let _ = s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
         if (*rec.add(3)).compare_exchange(T_COUNTING, T_QUEUED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
             churn_queued(slot as u32);
-            tier_push(slot as u32, Q_CALLS, call_rate(rec, u.tier1.as_ref().map_or(0, |t| t.calls), now));
+            tier_push_locked(&mut *q, slot as u32, Q_CALLS, call_rate(rec, u.tier1.as_ref().map_or(0, |t| t.calls), now));
+            drop(q);
+            TIER_WAKE.notify_all();
             TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime, &u.prog.session.options));
         }
         s.load(Ordering::SeqCst)
