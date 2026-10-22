@@ -3615,7 +3615,8 @@ impl<'a> Gen<'a> {
     /// plus a taken b (as x64's term).
     fn branch_pair(&mut self, yes: CondBr, no: CondBr, tt: u32, ff: u32, bi: usize) {
         let next = self.next_block[bi];
-        let back = |b: u32| b as usize <= bi;
+        // (MAKEPAD_RUN_OPT=-a64backedge: off, A/B)
+        let back = |b: u32| b as usize <= bi && !crate::stats::opt_env_off("-a64backedge");
         if tt == next || ff != next && back(ff) && (!back(tt) || ff as usize == bi && tt as usize != bi) {
             self.cond_branch(no, ff);
             self.jump_to(tt, bi);

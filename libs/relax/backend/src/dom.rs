@@ -25,15 +25,17 @@ pub fn relayout_order(f: &mut Func) -> Vec<u32> {
     }
     // loop blocks: an equality of two values decides a search there (`find`, `position`, a key
     // compare per element): the hit is the rare way out of the scan
-    let depth = crate::regalloc::loop_depths(f, &reach);
-    let search_hit = |b: usize, c: VReg| {
-        depth[b] > 0
-            && f.blocks[b].insts.iter().rev().find(|i| {
-                let mut d = false;
-                i.defs(|v| d |= v == c);
-                d
-            }).is_some_and(|i| matches!(i, Inst::ICmp(Cond::Eq, _, _, x, y) if x != y))
+    // (MAKEPAD_RUN_OPT=-searchlayout: off, A/B)
+    let eq_test = |b: usize| match f.blocks[b].term {
+        Term::Branch(c, ..) => f.blocks[b].insts.iter().rev().find(|i| {
+            let mut d = false;
+            i.defs(|v| d |= v == c);
+            d
+        }).is_some_and(|i| matches!(i, Inst::ICmp(Cond::Eq, _, _, x, y) if x != y)),
+        _ => false,
     };
+    let depth = (!crate::stats::opt_env_off("-searchlayout") && (0..n).any(|b| reach[b] && eq_test(b))).then(|| crate::regalloc::loop_depths(f, &reach));
+    let search_hit = |b: usize| depth.as_ref().is_some_and(|d| d[b] > 0) && eq_test(b);
     let mut placed = vec![false; n];
     let mut order: Vec<u32> = Vec::new();
     let mut cold: Vec<u32> = Vec::new();
@@ -50,12 +52,12 @@ pub fn relayout_order(f: &mut Func) -> Vec<u32> {
             }
             b = match f.blocks[b as usize].term {
                 Term::Jump(t) | Term::Invoke(t, _) => t,
-                Term::Branch(c, t, e) => {
+                Term::Branch(_, t, e) => {
                     // fall through to the true successor (then-block, loop body) unless it is
                     // placed already or a panic path, or the branch is a search's hit test in a
                     // loop (then the scan goes on next: the miss is what repeats)
                     let t_cold = matches!(f.blocks[t as usize].term, Term::Unreachable);
-                    let e_first = !placed[e as usize] && !matches!(f.blocks[e as usize].term, Term::Unreachable) && search_hit(b as usize, c);
+                    let e_first = !placed[e as usize] && !matches!(f.blocks[e as usize].term, Term::Unreachable) && search_hit(b as usize);
                     if !placed[t as usize] && !t_cold && !e_first {
                         t
                     } else {
