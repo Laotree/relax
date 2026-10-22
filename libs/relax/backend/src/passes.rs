@@ -6185,7 +6185,16 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                             };
                             let keep = !((((1u64 << (n as u32 * 8)) - 1) << (b * 8)) as i64);
                             let k = new_vregs.vreg(Cls::I);
-                            out.push(Inst::IBinI(IOp::And, U64, k, r, keep));
+                            if (i32::MIN as i64..=i32::MAX as i64).contains(&keep) {
+                                out.push(Inst::IBinI(IOp::And, U64, k, r, keep));
+                            } else {
+                                // a 64-bit mask beyond imm32 goes through a register (x64 ALU
+                                // immediates are sign-extended 32-bit)
+                                let km = new_vregs.vreg(Cls::I);
+                                out.push(Inst::Iconst(km, keep));
+                                pos.push(p);
+                                out.push(Inst::IBin(IOp::And, U64, k, r, km));
+                            }
                             pos.push(p);
                             out.push(Inst::IBin(IOp::Or, U64, r, k, t));
                         }
