@@ -237,6 +237,8 @@ fn assert_no_leaf(what: &str) {
 }
 
 fn me() -> u64 {
+    // a request's thread may be named later, after it ended (os::thread::name)
+    crate::os::thread::note_current();
     crate::os::thread::current()
 }
 
