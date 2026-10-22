@@ -6125,7 +6125,6 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
     // write of it reads padding or an unwritten variant field: any value will do)
     let mut slot_regs: Vec<Vec<u32>> = vec![Vec::new(); ns];
     let mut init: Vec<Inst> = Vec::new();
-    let mut vzero = None;
     for sl in 0..ns {
         if !ok[sl] {
             continue;
@@ -6141,17 +6140,10 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                 continue;
             }
             if m == SROA_V128 {
-                let z = match vzero {
-                    Some(z) => z,
-                    None => {
-                        let z = f.vreg(Cls::I);
-                        init.push(Inst::Iconst(z, 0));
-                        vzero = Some(z);
-                        z
-                    }
-                };
+                // a constant (rematerialised at its uses: movi / pxor), not a register held
+                // from the entry on
                 let r = f.vreg(Cls::V128);
-                init.push(Inst::VX(VX::FromLo64, r, z, z));
+                init.push(Inst::VConst(r, 0));
                 regs.push(r.0);
                 continue;
             }

@@ -86,7 +86,7 @@ pub fn reg_config() -> RegConfig {
     RegConfig {
         int_caller: vec![9, 10, 11, 12, 13, 2, 3, 4, 5, 6, 7],
         int_callee: vec![19, 20, 21, 22, 23, 24, 25, 26, 27, 28],
-        flt_caller: vec![16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28],
+        flt_caller: vec![16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 0, 1, 2, 3, 4, 5, 6, 7],
         flt_callee: vec![8, 9, 10, 11, 12, 13, 14, 15],
         slot_index_free: false,
         clobbers: Some(arm64_clobbers),
@@ -96,12 +96,52 @@ pub fn reg_config() -> RegConfig {
     }
 }
 
-/// Registers an instruction overwrites while it runs (RegConfig::clobbers): only an asm! block
-/// (every register it names; regalloc also keeps its results out of them).
-fn arm64_clobbers(_options: &relax_session::Options, _f: &Func, i: &Inst) -> u64 {
+/// Registers an instruction overwrites while it runs (RegConfig::clobbers): an asm! block's
+/// (every register it names; regalloc also keeps its results out of them), and v0-v7 (bits
+/// 32..40) for every instruction whose emitter arm may name them: calls (float arguments and
+/// results, aggregate result registers) and the vector sequences with v4-v7 temporaries.
+/// v0-v7 are allocatable caller-saved registers everywhere else (reg_config).
+fn arm64_clobbers(_options: &relax_session::Options, f: &Func, i: &Inst) -> u64 {
     match i {
-        Inst::Call(Callee::Asm(b), _, _) => b.regs,
-        _ => 0,
+        Inst::Call(Callee::Asm(b), _, _) => b.regs | V0_7,
+        _ if keeps_v0_7(f, i) => 0,
+        _ => V0_7,
+    }
+}
+
+/// v0-v7 as regalloc clobber bits (float register r = bit 32 + r)
+const V0_7: u64 = 0xff << 32;
+
+/// The instructions whose emitter arms (and the helpers they call) never name v0-v7: they reach
+/// vector registers only through use_f / def_f / fin_f / vtmp and the scratch registers v29-v31.
+/// Checked against `Gen::inst`, `vinst`, `vx_lanes` and `vx` arm by arm; anything not listed
+/// clobbers v0-v7.
+fn keeps_v0_7(f: &Func, i: &Inst) -> bool {
+    use VW::*;
+    match i {
+        Inst::Iconst(..) | Inst::IBinI(..) | Inst::ICmpI(..) | Inst::ICmp(..) | Inst::IBin(..) | Inst::IBit(..) | Inst::INeg(..) | Inst::INot(..) => true,
+        Inst::SlotAddr(..) | Inst::Addr(..) | Inst::FnAddr(..) | Inst::Mov(..) | Inst::Load(..) | Inst::Store(..) | Inst::LoadX(..) | Inst::StoreX(..) => true,
+        Inst::Fconst(..) | Inst::FBin(..) | Inst::FUnary(..) | Inst::FCmp(..) | Inst::FMulAdd(..) | Inst::Sel(..) | Inst::Conv(..) | Inst::Copy(..) => true,
+        Inst::VLoad(..) | Inst::VStore(..) | Inst::VLoadX(..) | Inst::VStoreX(..) | Inst::VConst(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) => true,
+        Inst::VSel(..) | Inst::VFma(..) | Inst::VAny(..) | Inst::VGather(..) => true,
+        Inst::VX(op, ..) => {
+            let _ = f;
+            match *op {
+                VX::FAdd(w, n) | VX::FSub(w, n) | VX::FMul(w, n) | VX::FDiv(w, n) => matches!(w, S | D) && n != NanBits::Intel,
+                VX::FMinNeon(w) | VX::FMaxNeon(w) | VX::FMinLt(w) | VX::FMaxGt(w) | VX::FCmp(_, w) => matches!(w, S | D),
+                VX::MinS(D) | VX::MaxS(D) | VX::MinU(D) | VX::MaxU(D) => true,
+                VX::ShlV(_) | VX::ShrSV(_) | VX::ShrUV(_) | VX::ICmp(..) | VX::UCmp(..) | VX::Neg(_) | VX::FCvtLo => true,
+                VX::FNeg(w) | VX::FAbs(w) | VX::FRound(w, _) | VX::FToI(w) | VX::IToF(w) => matches!(w, S | D),
+                VX::FSqrt(w, n) => matches!(w, S | D) && n != NanBits::Intel,
+                // vx's three-same table
+                VX::Add(_) | VX::Sub(_) | VX::MaxS(_) | VX::MinS(_) | VX::MaxU(_) | VX::MinU(_) | VX::CmpEq(_) | VX::CmpGtS(_) => true,
+                VX::AddSatU(_) | VX::AddSatS(_) | VX::SubSatU(_) | VX::SubSatS(_) | VX::AvgU(_) | VX::ZipLo(_) | VX::ZipHi(_) => true,
+                VX::MulLo(w) => w != D,
+                VX::And | VX::Or | VX::Xor | VX::AndNot | VX::Splat(_) | VX::FromLo64 | VX::Extract(..) => true,
+                _ => false,
+            }
+        }
+        _ => false,
     }
 }
 
@@ -671,6 +711,9 @@ struct Gen<'a> {
     /// the compare in its block: any other instruction, a fused compare-and-branch, or a block
     /// boundary ends it (the flags then belong to something else).
     sel_chain: Option<(VReg, u8)>,
+    /// a zero vector whose definition was skipped: the VInsert of lane 0 right after it reads
+    /// it (fmov s, which zeroes lanes 1-3)
+    zero_ins: Option<VReg>,
     /// the last spill store emitted: (sp offset, register, word position right after it)
     last_spill: Option<(i64, u8, usize)>,
     /// spill windows (Alloc::windows): vreg -> (first use pos, last use pos, register); and the
@@ -1227,6 +1270,14 @@ impl<'a> Gen<'a> {
                         skip_next = true;
                         continue;
                     }
+                }
+                // a zero vector only read by the lane-0 insert right after it (SROA'd vector cells,
+                // `_mm_setr_ps` gathers): no movi; the insert is `fmov s` (zeroes lanes 1-3)
+                if ii + 1 < n && !(fused && ii + 1 == n - 1) && self.zero_then_insert(inst, &b.insts[ii + 1]) {
+                    if let Inst::VConst(z, _) | Inst::VX(_, z, _, _) = inst {
+                        self.zero_ins = Some(*z);
+                    }
+                    continue;
                 }
                 // a compare feeding the selects right after it: they read its flags (nothing between
                 // them sets flags); when they are all its uses, the bool is never materialised
@@ -2038,6 +2089,34 @@ impl<'a> Gen<'a> {
             let at = self.a.pos();
             self.a.e(0x9C00_0000 | xd as u32);
             self.vpool.push((at, bits));
+        }
+    }
+
+    /// `z = 0` (VConst 0, or FromLo64 of a constant 0) read only by the next instruction, an
+    /// insert of a 32-bit lane 0 into it
+    fn zero_then_insert(&self, a: &Inst, b: &Inst) -> bool {
+        let z = match *a {
+            Inst::VConst(z, 0) => z,
+            Inst::VX(VX::FromLo64, z, k, _) if self.al.loc[k.0 as usize] == Loc::None && self.al.remat[k.0 as usize] == Remat::Const(0) => z,
+            _ => return false,
+        };
+        if self.al.loc[z.0 as usize] == Loc::None {
+            return false;
+        }
+        match *b {
+            // d == z: the insert redefines the vreg, so the zero dies there
+            Inst::VInsert(d, v, 0, s) => v == z && s != z && (d == z || self.al.uses[z.0 as usize] == 1) && matches!(self.cls(s), Cls::I | Cls::F32),
+            _ => false,
+        }
+    }
+
+    /// A vector access's base register and offset: register-less slot addresses and base + k
+    /// values (Alloc::remat) folded in (sp + offset / the base's register + summed offset)
+    fn vbase(&mut self, base: VReg, off: i64) -> (u8, i64) {
+        let (b, o) = self.resolve_off(base, off);
+        match self.slot_base(b) {
+            Some(so) => (SP, so + o),
+            None => (self.use_i(b, S1), o),
         }
     }
 
@@ -2883,6 +2962,18 @@ impl<'a> Gen<'a> {
                     self.fin_f(d, xd);
                 }
             }
+            Inst::VInsert(d, v, 0, s) if self.zero_ins.take() == Some(v) || (self.al.loc[v.0 as usize] == Loc::None && self.al.remat[v.0 as usize] == Remat::VConst(0)) => {
+                // into a zero vector: fmov s (a scalar write zeroes the rest of the register)
+                let xd = self.def_f(d, FS2);
+                if self.cls(s) == Cls::I {
+                    let rs = self.use_i(s, S0);
+                    self.a.e(0x1E27_0000 | (rs as u32) << 5 | xd as u32); // fmov sd, wn
+                } else {
+                    let xs = self.use_f(s, FS1);
+                    self.a.e(0x1E20_4000 | (xs as u32) << 5 | xd as u32); // fmov sd, sn
+                }
+                self.fin_f(d, xd);
+            }
             Inst::VInsert(d, v, lane, s) => {
                 let t = if self.cls(s) == Cls::I { self.vtmp(d, &[]) } else { self.vtmp(d, &[s]) };
                 let xv = self.use_f(v, t);
@@ -2899,16 +2990,18 @@ impl<'a> Gen<'a> {
                 self.vmov(xd, t);
                 self.fin_f(d, xd);
             }
+            // a stack-slot or base + k address without a register folds into the access, as
+            // for scalar loads / stores ([sp, #k], not `add x15, sp, #k` first)
             Inst::VLoad(d, base, off) => {
-                let rb = self.use_i(base, S1);
+                let (rb, o) = self.vbase(base, off as i64);
                 let xd = self.def_f(d, FS0);
-                self.vldst(true, xd, rb, off as i64);
+                self.vldst(true, xd, rb, o);
                 self.fin_f(d, xd);
             }
             Inst::VStore(base, off, v) => {
-                let rb = self.use_i(base, S1);
+                let (rb, o) = self.vbase(base, off as i64);
                 let xv = self.use_f(v, FS0);
-                self.vldst(false, xv, rb, off as i64);
+                self.vldst(false, xv, rb, o);
             }
             // [base + (idx << sh) + off]: ldr/str q [rb, ri{, lsl #4}] when nothing is added and the
             // shift is 0 or 4; else the address into s1 by one shifted add
@@ -4314,13 +4407,14 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // indexed accesses with displacements on one base and index: one address register
     let shared = regalloc::share_index_bases(f);
     let f = shared.as_ref().unwrap_or(f);
-    // a function that calls nothing and returns no float may keep values in v0-v3 too (they
-    // carry float arguments and results, and calls' aggregate results, only around calls)
+    // v0-v7 are allocatable outside the instructions that name them (arm64_clobbers), except
+    // in an `extern "C"` body returning an aggregate in registers: its Ret loads the parts into
+    // v0-v3 before the result moves (c_ret_parts)
     let mut cfg = RegConfig { sym_class: env.sym_class, ..reg_config() };
-    let leaf = f.blocks.iter().all(|b| !b.insts.iter().any(|i| matches!(i, Inst::Call(..))));
-    if f.rets.iter().all(|c| *c == Cls::I) && leaf {
-        cfg.flt_caller.extend_from_slice(&[0, 1, 2, 3]);
+    if f.cabi.as_ref().is_some_and(|s| matches!(cabi::plan(s, s.conv.target()).ret, RetPlan::Parts(_))) {
+        cfg.flt_caller.retain(|x| *x >= 8);
     }
+    let leaf = f.blocks.iter().all(|b| !b.insts.iter().any(|i| matches!(i, Inst::Call(..))));
     // likewise x0 / x1 (integer results: the return's moves place them) and x8 (the large-copy and
     // atomic loops' scratch) in a function that calls nothing: small leaf fns kept values in
     // callee-saved registers and saved / restored them on every return path
@@ -4350,6 +4444,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         a: Asm { w: Vec::with_capacity(128) },
         test_fuse: None,
         sel_chain: None,
+        zero_ins: None,
         jt_fix: Vec::new(),
         last_spill: None,
         win: {

@@ -10499,6 +10499,14 @@ impl<'a> Lcx<'a> {
             return Val::L(vec![r]);
         } else if name == "vx_ternary" {
             let selector = constant(self, 3);
+            if selector == 10 {
+                // NEON BSL: bitwise a ? b : c (a is the mask)
+                let a = vector(self, 0);
+                let b = vector(self, 1);
+                let c = vector(self, 2);
+                self.emit(Inst::VSel(d, a, b, c));
+                return self.vx_result(d, t);
+            }
             if selector == 8 || selector == 9 {
                 // NEON FMLA / FMLS .4s: a + b * c, a - b * c, fused (one rounding, the
                 // instruction's own NaN rules).
@@ -10649,7 +10657,7 @@ impl<'a> Lcx<'a> {
                 } else {
                     match op {
                         0..=3 => true,
-                        4 | 7 | 8 | 9 => w == VW::S,
+                        4 | 7 | 8 | 9 | 10 => w == VW::S,
                         5 | 6 => w == VW::B,
                         _ => false,
                     }
@@ -10765,6 +10773,10 @@ impl<'a> Lcx<'a> {
                         }
                         8 => {
                             self.emit(Inst::VX(VX::FAbs(VW::S), d, a, a));
+                            return self.vx_result(d, t);
+                        }
+                        10 => {
+                            self.emit(Inst::VX(VX::FNeg(VW::S), d, a, a));
                             return self.vx_result(d, t);
                         }
                         _ => {
