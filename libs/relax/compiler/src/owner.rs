@@ -714,9 +714,18 @@ fn wait(req: &Req, deadline: Option<std::time::Instant>) -> bool {
         }
     }
     drop(done);
-    // the owner's last touch follows its unlock
+    // The owner's last touch follows its unlock. The unlock's wake can put this thread on the
+    // owner's CPU and preempt it right there, before that store: spinning then holds the CPU the
+    // owner needs to make it (Linux, cold Stage: 8 s of the app thread's CPU in this loop, most of
+    // it after the wait). A few spins, then yield.
+    let mut spins = 0u32;
     while req.state.load(Ordering::Acquire) != RELEASED {
-        std::hint::spin_loop();
+        if spins < 64 {
+            spins += 1;
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
     }
     false
 }
