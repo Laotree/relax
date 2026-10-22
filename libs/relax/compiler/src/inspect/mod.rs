@@ -9,6 +9,8 @@
 //! timeout after which the reply says what it could not resolve.
 
 pub mod asm;
+pub(crate) use asm::plain_name as asm_plain;
+pub mod calltree;
 pub mod client;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod cfi;
@@ -113,7 +115,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("session", "relaunch", "restart the app domain in this process, keeping its host window and GPU device"),
     ("why-hung", "[probe_ms=200]", "is it stuck and why: verdict (deadlock / blocked / busy / idle), the wait chain or cycle, stacks of the threads in it"),
     ("why-slow", "[s=3]", "where the time goes: ranked findings -- the main thread's CPU split (program / compiles / makepad run runtime / system), its hot fns, the owner's service, other busy threads"),
-    ("prof", "[s=3] [hz=200] [threads=all|main|owner|program|compiler|<name>] [n=15] [save=1]", "sampling CPU profile of JIT and host frames: per-thread CPU, activity split, top fns by self time with their hottest line, inclusive fns; save=1 writes folded stacks"),
+    ("prof", "[s=3] [hz=200] [threads=all|main|owner|program|compiler|<name>] [ev=cpu|cycles|instructions|branch-misses|cache-misses] [view=top|tree|callers|flame] [focus=<fn>] [fn=<fn>] [min=1] [n=15] [save=1]", "sampling profile of JIT and host frames: per-thread CPU, activity split, top fns by self time with their hottest line, inclusive fns; view=tree: the call tree with the JIT's inline levels as frames and each frame's tier (focus= re-roots at a fn, view=callers fn= inverts); save=1 / view=flame writes folded stacks; ev= samples a hardware event (Linux)"),
     ("timeline", "start [max_s=30] | stop | frames [n=30] | frame <n|slowest> | save", "dataflow timeline: record UI phases, owner service, waits and wakes; per frame the critical path, work vs critical path vs wall, longest waits and who ended them; save = Chrome trace JSON"),
     ("watch", "[on=panic,hang,...] [since=<seq>] [timeout_s=N]", "block until the next event (panic, hang, ...) and answer it as one JSON line; re-arm with since=<seq>"),
     ("events", "[follow=1] [since=<seq>] [on=...]", "the recent events (follow=1: stream one JSON line per new event)"),

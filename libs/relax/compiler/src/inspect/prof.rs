@@ -382,10 +382,17 @@ pub fn cmd_prof(req: &Req, out: &mut Out) {
     let secs = (req.num("s", 3) as f64).clamp(0.2, 30.0);
     let hz = req.num("hz", 200).clamp(10, 2000);
     let n = req.num("n", 15) as usize;
+    let ev = match Ev::parse(req.get("ev").unwrap_or("cpu")) {
+        Ok(e) => e,
+        Err(e) => return out.err(&e),
+    };
     let gone = out.gone();
-    let run = collect(secs, hz, &*pick(req.get("threads").unwrap_or("all")), &*gone);
+    let run = collect_ev(secs, hz, ev, &*pick(req.get("threads").unwrap_or("all")), &*gone);
     if gone() {
         return;
+    }
+    if matches!(req.get("view"), Some("tree" | "callers" | "flame")) {
+        return super::calltree::report(&run, req, out);
     }
     report(&run, n, req.get("save") == Some("1"), out);
 }

@@ -182,7 +182,7 @@ fn file_name(path: &str) -> &str {
 
 /// A fn path without generic arguments, with `<T as Trait>::f` as `T::f` and the legacy hash
 /// gone: the form both sides' names are compared in.
-fn plain_name(n: &str) -> String {
+pub(crate) fn plain_name(n: &str) -> String {
     let mut out = String::with_capacity(n.len());
     let mut depth = 0i32;
     let b = n.as_bytes();
