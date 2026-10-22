@@ -1109,7 +1109,7 @@ pub fn cmd_asm(req: &Req, out: &mut Out) {
 
 #[allow(clippy::too_many_arguments)]
 fn render(out: &mut Out, slot: u32, a: &Side, b: Option<&Side>, view: &str, line: Option<&str>, n: usize, took: f64, hz: u64, ev: super::prof::Ev, pcs: &[(u64, u64, u64)], others: usize, others_samples: u64, notes: &[String], snotes: &[String], q: &str) {
-    let bytes = |s: &Side| s.insns.last().map_or(0, |i| i.off + i.len as u32);
+    let bytes = |s: &Side| s.insns.iter().map(|i| i.len as u32).sum::<u32>();
     let ts = a.total_samples();
     let unknown = a.insns.iter().filter(|i| i.class == Class::Unknown).count() + b.map_or(0, |b| b.insns.iter().filter(|i| i.class == Class::Unknown).count());
     let j = join(a, b);
@@ -1275,8 +1275,11 @@ fn render(out: &mut Out, slot: u32, a: &Side, b: Option<&Side>, view: &str, line
 
 // ------------------------------------------------------------------ asm top
 
-/// `asm top [vs=rustc] [s=3] [n=15]`: the hottest JIT fns ranked by the time their excess
-/// instructions cost: samples x (ours - rustc) / ours.
+/// `asm top [vs=rustc] [s=3] [n=15] [ev=]`: the hottest JIT code ranked by the time its excess
+/// instructions cost. With vs=rustc the comparison is inline-normalised: a sample counts for the
+/// innermost fn on its stack that rustc kept as a symbol (its root); our side of a root is its
+/// JIT body plus the bodies of the JIT callees under it that rustc inlined (no symbol of their
+/// own), so both sides hold the same source. Score = samples % x (ours - rustc) / ours.
 fn cmd_top(req: &Req, out: &mut Out) {
     let secs = req.get("s").and_then(|v| v.parse::<f64>().ok()).unwrap_or(3.0).clamp(0.2, 30.0);
     let hz = req.num("hz", 1000).clamp(10, 4000);
@@ -1286,7 +1289,8 @@ fn cmd_top(req: &Req, out: &mut Out) {
         Ok(e) => e,
         Err(e) => return out.err(&e),
     };
-    let (pcs, took, snotes, ev) = sample(secs, hz, ev, out);
+    let gone = out.gone();
+    let run = super::prof::collect_ev(secs, hz, ev, &|_| true, &*gone);
     if out.cancelled() {
         return;
     }
@@ -1294,90 +1298,170 @@ fn cmd_top(req: &Req, out: &mut Out) {
     if up.is_null() {
         return out.err("no running unit");
     }
-    let jit_pcs: Vec<(u64, u64)> = pcs.iter().map(|x| (x.0, x.2)).filter(|&(pc, _)| crate::jit::in_jit_code(pc)).collect();
-    let total: u64 = pcs.iter().map(|x| x.2).sum();
+    let total: u64 = run.samples.iter().map(|s| s.weight.max(1)).sum();
+    // every JIT pc of every stack -> its slot (and the slot's installed code)
+    let mut pcs: Vec<u64> = run.samples.iter().flat_map(|s| s.frames.iter().enumerate().map(|(i, &p)| if i == 0 { p } else { p.wrapping_sub(1) })).filter(|&p| crate::jit::in_jit_code(p)).collect();
+    pcs.sort_unstable();
+    pcs.dedup();
     let r = crate::owner::call_within(crate::owner::Class::Job, 10_000, move || {
         let u = unsafe { &*up };
         let tab = u.code.read().unwrap_or_else(|e| e.into_inner());
-        let mut per: HashMap<u32, (u64, u64, u32)> = HashMap::new();
-        for (pc, w) in jit_pcs {
-            if let Some((start, len, id)) = tab.entry_at(pc) {
-                let e = per.entry(id).or_insert((0, start, len));
-                e.0 += w;
-                if start == u.fns[id as usize].code {
-                    e.1 = start;
-                    e.2 = len;
-                }
-            }
-        }
+        let at: HashMap<u64, u32> = pcs.iter().filter_map(|&p| tab.entry_at(p).map(|e| (p, e.2))).collect();
         drop(tab);
-        let mut v: Vec<(u32, u64, u64, u32, String, String)> = per.into_iter().map(|(id, (c, st, len))| {
-            let k = super::codever::kind_at(u, st);
-            (id, c, st, len, super::display_name(u, id, 0), format!("{} {}", k.tier_name(), k.origin_name()))
-        }).collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        v.truncate(60);
-        v
+        let mut slots: HashMap<u32, (String, String, u64, u32)> = HashMap::new();
+        for &id in at.values() {
+            slots.entry(id).or_insert_with(|| {
+                let f = &u.fns[id as usize];
+                let k = super::codever::kind_at(u, f.code);
+                (super::display_name(u, id, 0), format!("{} {}", k.tier_name(), k.origin_name()), f.code, f.code_len)
+            });
+        }
+        (at, slots)
     });
-    let Some(hot) = r else {
+    let Some((at, slots)) = r else {
         return out.err(&format!("the owner did not answer in 10 s ({})", crate::owner::serving_note()));
     };
-    let jit_total: u64 = hot.iter().map(|x| x.1).sum();
-    let native = if vs { native_path(req).ok() } else { None };
-    let mut rows: Vec<(f64, String)> = Vec::new();
-    let mut missing = 0;
-    for (id, c, st, len, name, tier) in hot.iter() {
-        let code = unsafe { std::slice::from_raw_parts(*st as *const u8, *len as usize) };
-        let ours = dis::decode(Arch::host(), code, *st).len();
-        let theirs = native.as_deref().and_then(|p| with_native(p, |nb| rustc_side(nb, name, *len as usize, &[]).ok().map(|s| s.0.insns.len())).ok().flatten());
-        if vs && theirs.is_none() {
-            missing += 1;
+    let instr_of = |id: u32| -> usize {
+        let (_, _, st, len) = &slots[&id];
+        if *len == 0 {
+            return 0;
         }
+        let code = unsafe { std::slice::from_raw_parts(*st as *const u8, *len as usize) };
+        let mut v = dis::decode(Arch::host(), code, *st);
+        trim_tail_data(&mut v);
+        v.len()
+    };
+    let native = if vs { native_path(req) } else { Err(String::new()) };
+    let native_ok = native.as_ref().ok().cloned();
+    // rustc's instruction count of a fn name (None: no symbol: rustc inlined it everywhere)
+    let mut rustc_n: HashMap<u32, Option<usize>> = HashMap::new();
+    let mut rustc_of = |id: u32| -> Option<usize> {
+        *rustc_n.entry(id).or_insert_with(|| {
+            let p = native_ok.as_deref()?;
+            with_native(p, |nb| rustc_side(nb, &slots[&id].0, slots[&id].3 as usize, &[]).ok().map(|s| s.0.insns.len())).ok().flatten()
+        })
+    };
+    // the last name segments of what rustc inlined into a root (its inline tree)
+    let mut inl_names: HashMap<u32, std::collections::HashSet<String>> = HashMap::new();
+    let mut inlined_into = |r: u32, m: u32| -> bool {
+        let set = inl_names.entry(r).or_insert_with(|| {
+            let Some(p) = native_ok.as_deref() else { return Default::default() };
+            let name = plain_name(&slots[&r].0);
+            with_native(p, |nb| {
+                let f = nb.find(&name).into_iter().next().cloned();
+                f.map(|f| nb.inlined(f.addr, f.addr + f.size).into_iter().map(|c| plain_name(&c.name).rsplit("::").next().unwrap_or("").to_string()).collect()).unwrap_or_default()
+            })
+            .unwrap_or_default()
+        });
+        set.contains(plain_name(&slots[&m].0).rsplit("::").next().unwrap_or(""))
+    };
+    // root per sample: the innermost JIT fn rustc has a symbol of (vs=rustc), when every JIT fn
+    // under it is one rustc inlined into it; else the leaf slot on its own (rustc: ?)
+    let mut root_w: HashMap<u32, u64> = HashMap::new();
+    let mut members: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut jit_total = 0u64;
+    let mut unrooted = 0u64;
+    let mut unmatched = 0u64;
+    for s in &run.samples {
+        let w = s.weight.max(1);
+        let chain: Vec<u32> = s.frames.iter().enumerate().map(|(i, &p)| if i == 0 { p } else { p.wrapping_sub(1) }).map_while(|p| at.get(&p).copied()).collect();
+        let Some(&leaf) = chain.first() else { continue };
+        jit_total += w;
+        if !vs {
+            *root_w.entry(leaf).or_default() += w;
+            continue;
+        }
+        let mut root = None;
+        let mut under = Vec::new();
+        for &id in &chain {
+            if rustc_of(id).is_some() {
+                root = Some(id);
+                break;
+            }
+            under.push(id);
+        }
+        let root = match root {
+            Some(r) if under.iter().all(|&m| inlined_into(r, m)) => Some(r),
+            Some(_) => {
+                // a JIT fn under the root that rustc's tree does not hold (another name, or kept
+                // out of line under a name we do not match): the leaf counts alone
+                *root_w.entry(leaf).or_default() += w;
+                unmatched += w;
+                continue;
+            }
+            None => None,
+        };
+        match root {
+            Some(r) => {
+                *root_w.entry(r).or_default() += w;
+                let m = members.entry(r).or_default();
+                for id in under {
+                    if !m.contains(&id) && id != r {
+                        m.push(id);
+                    }
+                }
+            }
+            None => unrooted += w,
+        }
+    }
+    let mut rows: Vec<(f64, String)> = Vec::new();
+    for (&id, &w) in &root_w {
+        let own = instr_of(id);
+        let mem = members.get(&id).cloned().unwrap_or_default();
+        let ours = own + mem.iter().map(|&m| instr_of(m)).sum::<usize>();
+        let theirs = if vs { rustc_of(id) } else { None };
         let excess = theirs.map(|t| (ours as f64 - t as f64) / ours.max(1) as f64);
-        let score = *c as f64 * excess.unwrap_or(0.0).max(0.0);
+        let score = w as f64 * excess.unwrap_or(0.0).max(0.0);
+        let (name, tier, _, _) = &slots[&id];
         rows.push((
-            if vs { score } else { *c as f64 },
+            if vs { score } else { w as f64 },
             format!(
-                "| @{} | {} | {} | {} | {} | {} | {} |",
+                "| @{} | {} | {} | {} | {}{} | {} | {} |",
                 id,
                 short(&name.replace('|', "/"), 70),
-                pct(*c, total),
+                pct(w, jit_total),
                 tier,
                 ours,
+                if mem.is_empty() { String::new() } else { format!(" ({} fns)", mem.len() + 1) },
                 theirs.map_or("?".into(), |t| t.to_string()),
-                excess.map_or("?".into(), |e| format!("{}", pct((score * 1000.0) as u64, total * 1000)).to_string() + if e < 0.0 { " (ours smaller)" } else { "" }),
+                excess.map_or("?".into(), |e| format!("{}{}", pct((score * 1000.0) as u64, jit_total * 1000), if e < 0.0 { " (ours smaller)" } else { "" })),
             ),
         ));
     }
     rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     let top = rows.first().map(|r| r.1.split('|').nth(2).unwrap_or("").trim().to_string()).unwrap_or_default();
     if vs {
-        let est: f64 = rows.iter().map(|r| r.0).sum::<f64>() * 100.0 / total.max(1) as f64;
-        out.always(&format!("excess JIT instructions cost an estimated {:.1}% of all {} ({} in JIT code of {} in {:.1} s); worst: {}", est, ev_unit(ev), count_str(jit_total), count_str(total), took, if top.is_empty() { "-".into() } else { top }));
+        let est: f64 = rows.iter().map(|r| r.0).sum::<f64>() * 100.0 / jit_total.max(1) as f64;
+        out.always(&format!("excess JIT instructions cost an estimated {:.1}% of the JIT code's {} ({} of {} on all threads in {:.1} s); worst: {}", est, ev_unit(ev), count_str(jit_total), count_str(total), run.secs, if top.is_empty() { "-".into() } else { top }));
     } else {
-        out.always(&format!("{} of {} {} ({}%) in JIT code in {:.1} s; hottest: {}", count_str(jit_total), count_str(total), ev_unit(ev), pct(jit_total, total), took, if top.is_empty() { "-".into() } else { top }));
+        out.always(&format!("{} of {} {} ({}%) in JIT code in {:.1} s; hottest: {}", count_str(jit_total), count_str(total), ev_unit(ev), pct(jit_total, total), run.secs, if top.is_empty() { "-".into() } else { top }));
     }
     out.line("");
-    out.line(&format!("| slot | fn | {} % | tier | ours instr | rustc instr | excess cost % |", ev_unit(ev)));
+    out.line(&format!("| slot | fn (root) | JIT {} % | tier | ours instr | rustc instr | excess cost % |", ev_unit(ev)));
     out.line("|---|---|---:|---|---:|---:|---:|");
     for (_, r) in rows.iter().take(n) {
         out.line(r);
     }
     if rows.len() > n {
-        out.line(&format!("+{} smaller fns", rows.len() - n));
+        out.line(&format!("+{} smaller", rows.len() - n));
     }
-    out.always("note: excess cost % = samples % x (ours - rustc) / ours: the share of all samples the fn's extra instructions take if each instruction costs the same; `asm @<slot> vs=rustc` shows where they are");
-    if missing > 0 {
-        out.always(&format!("note: {} fns have no rustc symbol of the same path (inlined by rustc, or Relax-only names): excess ?", missing));
+    if vs {
+        out.always("note: a root is the innermost fn on a sample's stack that rustc kept as a symbol; ours = its JIT body + the bodies of JIT callees under it that rustc inlined ((n fns)); excess cost % = samples % x (ours - rustc) / ours");
+        if unrooted > 0 {
+            out.always(&format!("note: {}% of the JIT samples have no root (no JIT frame on their stack that rustc has a symbol of)", pct(unrooted, jit_total)));
+        }
+        if unmatched > 0 {
+            out.always(&format!("note: {}% of the JIT samples count for their leaf alone: a JIT fn between it and the root is not in rustc's inline tree of the root (a name we do not match)", pct(unmatched, jit_total)));
+        }
+        if let Err(e) = &native {
+            out.always(&format!("note: {}", e));
+        }
     }
-    if vs && native.is_none() {
-        out.always(&format!("note: {}", native_path(req).err().unwrap_or_default()));
-    }
-    for s in &snotes {
+    for s in &run.notes {
         out.always(&format!("note: {}", s));
     }
     out.always(&format!("note: {}", super::reliability::line(true)));
-    out.always("more: asm @<slot> vs=rustc  asm @<slot> view=listing  prof threads=main");
+    out.always("more: asm @<slot> vs=rustc  asm @<slot> view=code  remarks @<slot>  prof view=tree");
 }
 
 #[cfg(test)]
