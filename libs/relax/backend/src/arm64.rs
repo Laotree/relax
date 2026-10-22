@@ -3682,6 +3682,13 @@ impl<'a> Gen<'a> {
 
     /// `ext`: re-extend a narrow result (false: nobody reads its upper bits, passes::low_bits_only)
     fn ibin_rr(&mut self, op: IOp, it: IntTy, rd: u8, ra: u8, rb: u8, ext: bool) {
+        if op == IOp::Bzhi {
+            // ip0 = -1 << (b mod 64); rd = a & !ip0 (movn, lslv, bic)
+            self.a.e(0x9280_0000 | IP0 as u32);
+            self.a.rrr(0x9AC0_2000, IP0, IP0, rb);
+            self.a.rrr(0x8A20_0000, rd, ra, IP0);
+            return;
+        }
         if op == IOp::Rotl {
             // rotate left by b = rorv by -b (rorv takes the count mod the width; W form for u32)
             self.a.e(0xCB00_03E0 | (rb as u32) << 16 | IP0 as u32);
@@ -3716,7 +3723,7 @@ impl<'a> Gen<'a> {
             // smulh / umulh
             IOp::MulHi => self.a.rrr(if it.signed { 0x9B40_7C00 } else { 0x9BC0_7C00 }, rd, ra, rb),
             // handled at the top
-            IOp::Rotl => {}
+            IOp::Rotl | IOp::Bzhi => {}
             IOp::Rem => {
                 // q = a / b; d = a - q * b  (rd may alias ra or rb: compute q in IP0)
                 self.a.rrr(if it.signed { 0x9AC0_0C00 } else { 0x9AC0_0800 }, IP0, ra, rb);
@@ -3730,6 +3737,11 @@ impl<'a> Gen<'a> {
     }
 
     fn ibin_imm(&mut self, op: IOp, it: IntTy, d: VReg, a: VReg, imm: i64) {
+        if op == IOp::Bzhi {
+            // a constant count is a constant mask
+            let n = (imm & 63) as u32;
+            return self.ibin_imm(IOp::And, it, d, a, if n == 0 { 0 } else { (u64::MAX >> (64 - n)) as i64 });
+        }
         let ra = self.use_i(a, S0);
         let rd = self.def_i(d, S0);
         if op == IOp::Rotl {

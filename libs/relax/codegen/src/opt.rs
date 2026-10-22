@@ -6247,6 +6247,98 @@ pub fn promote_dyn_read_slots(f: &mut Func) -> bool {
     true
 }
 
+/// The mask idiom of bit readers, `x & ((1 << n) - 1)` (and `x & !(-1 << n)`) on 64-bit values,
+/// becomes `x bzhi n` (IOp::Bzhi) when the shift and the mask are read only there: x64 BMI2 `and`
+/// of the count + `bzhi` (was `mov 1; shlx; sub; and`, a three-deep chain), arm64 `movn; lslv;
+/// bic`. The shift and subtraction are left for DCE. The count must hold the same value at the
+/// mask as at the shift: one definition, or none between them in their block. Only where the
+/// target has the short form (x64 without BMI2 would expand it again). Returns whether anything
+/// changed.
+pub fn form_bzhi(options: &relax_session::Options, f: &mut Func) -> bool {
+    if opt_off(options, "-bzhi") || !(cfg!(target_arch = "aarch64") || options.cpu.bmi2) {
+        return false;
+    }
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    let mut nuse = vec![0u32; nv];
+    let mut def_at = vec![(u32::MAX, 0u32); nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut tu = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            for_defs(i, |d| {
+                ndef[d.0 as usize] += 1;
+                def_at[d.0 as usize] = (bi as u32, k as u32);
+            });
+            for_uses(i, |u| nuse[u.0 as usize] += 1);
+        }
+        term_uses(&b.term, &mut tu);
+        for u in &tu {
+            nuse[u.0 as usize] += 1;
+        }
+    }
+    let single = |v: VReg| ndef[v.0 as usize] == 1 && def_at[v.0 as usize].0 != u32::MAX;
+    let def = |f: &Func, v: VReg| -> Inst { let (b, k) = def_at[v.0 as usize]; f.blocks[b as usize].insts[k as usize].clone() };
+    let konst = |f: &Func, v: VReg, want: i64| single(v) && matches!(def(f, v), Inst::Iconst(_, c) if c == want);
+    // (shift's block, index, count) of `m` when it is the low-n-bits mask of a count n
+    let mask = |f: &Func, m: VReg| -> Option<(u32, u32, VReg)> {
+        if !single(m) || nuse[m.0 as usize] != 1 {
+            return None;
+        }
+        let (s, ones) = match def(f, m) {
+            Inst::IBinI(IOp::Sub, it, _, s, 1) if it.bits == 64 => (s, 1),
+            Inst::IBinI(IOp::Add, it, _, s, -1) if it.bits == 64 => (s, 1),
+            Inst::IBinI(IOp::Xor, it, _, s, -1) if it.bits == 64 => (s, -1),
+            _ => return None,
+        };
+        if !single(s) || nuse[s.0 as usize] != 1 {
+            return None;
+        }
+        match def(f, s) {
+            Inst::IBin(IOp::Shl, it, _, one, n) if it.bits == 64 && konst(f, one, ones) => {
+                let (b, k) = def_at[s.0 as usize];
+                Some((b, k, n))
+            }
+            _ => None,
+        }
+    };
+    let mut edits = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            let Inst::IBin(IOp::And, it, d, p, q) = *i else { continue };
+            if it.bits != 64 {
+                continue;
+            }
+            for (x, m) in [(p, q), (q, p)] {
+                let Some((sb, sk, n)) = mask(f, m) else { continue };
+                // n unchanged from the shift to here
+                let same = if single(n) || f.params.contains(&n) && ndef[n.0 as usize] == 1 {
+                    true
+                } else if sb as usize == bi && (sk as usize) < k {
+                    !b.insts[sk as usize + 1..k].iter().any(|j| {
+                        let mut w = false;
+                        for_defs(j, |v| w |= v == n);
+                        w
+                    })
+                } else {
+                    false
+                };
+                if same && x != m {
+                    edits.push((bi, k, Inst::IBin(IOp::Bzhi, U64, d, x, n)));
+                    break;
+                }
+            }
+        }
+    }
+    let changed = !edits.is_empty();
+    for (bi, k, i) in edits {
+        f.blocks[bi].insts[k] = i;
+    }
+    changed
+}
+
 /// The few values an integer vreg can hold where it is read, when its definitions make them a
 /// small set: constants, compare outcomes (0 / 1, or what the operands' sets give), selects of such
 /// values, and unary maps of them (integer conversions, operations with a constant). A vreg with

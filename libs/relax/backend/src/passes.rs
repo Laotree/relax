@@ -174,6 +174,14 @@ pub fn fold_ibin(op: IOp, it: IntTy, a: i64, b: i64) -> Option<i64> {
                 _ => return None,
             }
         }
+        IOp::Bzhi => {
+            let n = (b & 63) as u32;
+            if n == 0 {
+                0
+            } else {
+                a & (u64::MAX >> (64 - n)) as i64
+            }
+        }
         IOp::MulHi => {
             if it.signed {
                 ((a as i128 * b as i128) >> 64) as i64
