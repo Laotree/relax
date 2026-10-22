@@ -20,6 +20,7 @@ pub mod counters;
 pub mod eval;
 pub mod events;
 pub mod experiments;
+pub mod flightrec;
 pub mod gpuprof;
 mod hang;
 pub mod heap;
@@ -33,9 +34,11 @@ pub mod pf;
 pub mod pstream;
 pub mod reliability;
 pub mod remarks;
+pub mod replay;
 pub mod timeline;
 pub mod vars;
 pub mod vsnative;
+pub mod watch;
 pub(crate) mod symbols;
 pub mod threads;
 
@@ -56,6 +59,7 @@ pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
     probes::scan_kept(a);
     codever::scan_kept(a);
     remarks::scan_kept(a);
+    watch::scan_kept(a);
 }
 
 /// The inspect thread runs (a socket is listening).
@@ -113,6 +117,7 @@ pub fn start(app: &str) {
     eprintln!("makepad-remote: pid {} app {} socket {} (makepad inspect {} help)", pid, app, sock.display(), pid);
     events::start();
     timeline::hitch_init();
+    flightrec::init();
     if AGENT.load(Relaxed) {
         timeline::set_frame_watch(true);
     }
@@ -126,6 +131,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("why-slow", "[s=3]", "where the time goes: ranked findings -- the main thread's CPU split (program / compiles / makepad run runtime / system), its hot fns, the owner's service, other busy threads"),
     ("prof", "[s=3] [hz=200] [threads=all|main|owner|program|compiler|<name>] [ev=cpu|cycles|instructions|branch-misses|cache-misses] [view=top|tree|callers|flame] [focus=<fn>] [fn=<fn>] [min=1] [n=15] [save=1]", "sampling profile of JIT and host frames: per-thread CPU, activity split, top fns by self time with their hottest line, inclusive fns; view=tree: the call tree with the JIT's inline levels as frames and each frame's tier (focus= re-roots at a fn, view=callers fn= inverts); save=1 / view=flame writes folded stacks; ev= samples a hardware event (Linux)"),
     ("pf", "<summary|frames|frame F<n>|top cpu|jit|gpu|hitches|timeline F<n>|lanes|why-slow|diff> [s=3] [save=x.mkpf] [base=y.mkpf]", "the profiler for agents: the client records the app's live `prof` stream (lanes, phases, waits, compile jobs, JIT installs with tiers, GPU passes) for s seconds and answers as compact text: finding first, tables, drill-down ids; file=<x.mkpf> pf ... answers on a recording"),
+    ("rec", "status | save [last=60s|5m|all] [path=<file>] | mark <text> | on | off | replay (file=<x.mkpf>: client side)", "the flight recorder (always on, bounded memory): the last minutes of frames, every thread's spans and waits, the owner's requests with requester and call site, JIT installs, events (app marks, logs, panics, script errors, hitches, zone swaps), input; save = a .mkpf recording for `pf` queries and Scope; automatic recordings on a hitch over 1 s, a panic, a fatal fault"),
     ("timeline", "start [max_s=30] | stop | frames [n=30] | frame <n|slowest> | waits [s=3] [n=15] | save", "dataflow timeline: record UI phases, owner service, waits and wakes; per frame the critical path, work vs critical path vs wall, longest waits and who ended them; waits = contention by what was waited on; save = a .mkpf profile recording (Scope, `pf` queries)"),
     ("watch", "[on=panic,hang,...] [since=<seq>] [timeout_s=N]", "block until the next event (panic, hang, ...) and answer it as one JSON line; re-arm with since=<seq>"),
     ("events", "[follow=1] [since=<seq>] [on=...]", "the recent events (follow=1: stream one JSON line per new event)"),
@@ -139,7 +145,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("frame", "<n|slowest>", "one frame of the last timeline: UI phases, critical path, waits and who ended them (alias of timeline frame)"),
     ("path", "<H<n>|R<n>>", "the full stack of a heap site id"),
     ("count", "<fn> [time=1] [tier=o1]", "exact call counts (and inclusive time) of every slot of a fn: its code is rebuilt with probes at the tier of the code it replaces (O3 code gets an O3 instrumented build; tier=o1 asks for O1) and installed as a probe group G<n>; every slot whose code holds an inlined copy of the fn is rebuilt at its tier without that inlining, so it calls the counted code; each row names the code version replaced and the one now, later installs with an inlined copy are rebuilt too (a `probe` event)"),
-    ("asm", "<fn|@slot> [vs=rustc] [native=<binary>] [s=2] [ev=cpu|cycles|instructions|branch-misses|cache-misses] [view=summary|lines|listing|code] [line=<n>] | top vs=rustc [s=3] [n=15]", "the JIT's machine code of a fn next to rustc's for the same fn (native=: a release build with line tables), aligned by source line, with CPU samples and PGO counts per line and a diff summary first: excess instructions, spill traffic, kept bounds checks, calls rustc inlined, loops rustc vectorised; `asm top vs=rustc` ranks the hottest fns by the time their excess instructions cost"),
+    ("asm", "<fn|@slot> [vs=rustc] [native=<binary>] [s=2] [ev=cpu|cycles|instructions|branch-misses|cache-misses] [view=summary|lines|listing|code] [line=<n>] [at=<off> [n=24]] | top vs=rustc [s=3] [n=15]", "the JIT's machine code of a fn next to rustc's for the same fn (native=: a release build with line tables), aligned by source line, with CPU samples and PGO counts per line and a diff summary first: excess instructions, spill traffic, kept bounds checks, calls rustc inlined, loops rustc vectorised; at=: the n instructions either side of one code offset (a fault's `off` in decimal, or 0x hex), the one at it marked; `asm top vs=rustc` ranks the hottest fns by the time their excess instructions cost"),
     ("vsnative", "[native=<bin>] [args=a,b] [s=5] [warm_ms=3000] [ev=instructions|cycles|cpu] [n=20]", "the program's rustc release build run next to this process for the same window, both sampled with the same event, diffed per fn: events/s here and native, ratio, shares, the JIT tier (Linux)"),
     ("ab", "<fn|@slot> b=<base|o1|opt:<tok>,..|inline:<callee>|noinline:<callee>> [a=base] [rounds=5] [s=1] [metric=incl|self] [per=s|frame|call] [ev=cpu|cycles|instructions] [keep=a|b]", "a live A/B of one fn: the variants' builds installed in turn (ABAB rounds), each round's cost rate of the fn measured alike; answer: medians, spread, permutation-test p, verdict (real / no difference beyond noise)"),
     ("contention", "[s=3] [n=15]", "lock / condvar / park / owner waits grouped by what was waited on: total and longest wait, per frame, waiting threads, who ended them (records s seconds of timeline first; alias of timeline waits)"),
@@ -161,6 +167,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("resume", "", "after pause: the program runs again (`resume P<n> panic` releases a parked panic)"),
     ("gpu", "[top [by=bytes|owner|site|churn] [n=15]|idle [frames=1800] [n=15]|snap <name>|diff <a> <b|now>|path <session>:<kind>:<index>:<generation>]", "HAL GPU memory: totals per session, kind and owner against the device (native apps: MAKEPAD_INSPECT=1 or MAKEPAD_REMOTE=1)"),
     ("hal", "pump", "HAL pump loop per session: turns and wake causes, totals and per second since the last call (an idle app shows none)"),
+    ("writes", "<Type::field> | (none: the watches) | W<n> [n=20] | rm <W<n>|all>", "who writes a struct field: the compiled fns that assign `x.field` (`=`, `op=`) are rebuilt to record every write: its site (fn, file:line), the value written and the field's address; `writes W<n>` reads the sites and the latest writes"),
     ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
     ("threads", "", "every thread: name, role, state, CPU time, what it waits on"),
     ("stacks", "[thread=<name|tid|main|owner|all>] [depth=12]", "symbolised stacks (identical stacks folded)"),
@@ -182,10 +189,20 @@ fn dispatch_command(req: &Req, out: &mut Out) {
     match req.cmd.as_str() {
         "session" => match req.pos.first().map(String::as_str) {
             Some("relaunch") => match crate::run::relaunch() {
-                Ok(()) => out.line(&format!("{{\"relaunch\":\"queued\",\"pid\":{},\"window_kept\":true}}", std::process::id())),
+                Ok(()) => {
+                    crate::reload::clear_restart_pending();
+                    out.line(&format!("{{\"relaunch\":\"queued\",\"pid\":{},\"window_kept\":true}}", std::process::id()))
+                }
                 Err(e) => out.err(&e),
             },
-            _ => out.err("session relaunch"),
+            None | Some("pending") => {
+                let p = crate::reload::restart_pending();
+                out.line(&format!("{{\"restart_pending\":{},\"note\":\"edits that cannot apply live wait here; the app runs the code before them until `session relaunch`\"}}", p.len()));
+                for w in p {
+                    out.line(&format!("{{\"waits\":{}}}", json_str(&w)));
+                }
+            }
+            _ => out.err("session [pending] | session relaunch"),
         },
         "help" => help(req, out),
         "pf" => out.err("pf is answered by the client: makepad inspect <app> pf <query> (it attaches to the app's prof stream)"),
@@ -199,6 +216,7 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "prof" => prof::cmd_prof(req, out),
         "timeline" => timeline::cmd_timeline(req, out),
         "hitch" => timeline::cmd_hitch(req, out),
+        "rec" => flightrec::cmd(req, out),
         // question-shaped aliases (DESIGN.md §2.1)
         "frame" => timeline::cmd_timeline(&shifted(req, "frame"), out),
         "frames" => timeline::cmd_timeline(&shifted(req, "frames"), out),
@@ -229,6 +247,7 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         // Commands the program registered (`relax_register_inspect`), scoped to its domain.
         c if provider(c).is_some() => cmd_provided(req, out),
         "probe" => probes::cmd(req, out),
+        "writes" => watch::cmd(req, out),
         "eval" => eval::cmd_eval(req, out),
         "static" => eval::cmd_static(req, out),
         "locals" => eval::cmd_locals(req, out),
@@ -635,7 +654,10 @@ fn jit_names(pcs: &[u64], partial: &mut Vec<String>, ms: u64) -> Vec<JitName> {
                     let levels = c.inlined.as_ref().map(|i| i.stack.iter().map(|(n, _, at)| (n.clone(), at.clone())).collect()).unwrap_or_default();
                     JitName::of(codever::frame_fields(u, &c), Some(c.slot), levels)
                 }
-                None => JitName::unknown(pc),
+                None => match codever::glue_name(u, pc) {
+                    Some((name, module)) => JitName::of((name, String::new(), module.into(), String::new()), None, Vec::new()),
+                    None => JitName::unknown(pc),
+                },
             })
             .collect::<Vec<_>>()
     });
@@ -697,7 +719,7 @@ pub(crate) fn is_std_fn(name: &str) -> bool {
 
 /// The program's own JIT frame: not std, not a JIT trampoline, not an unidentified inline level.
 pub(crate) fn is_program_frame(f: &Frame) -> bool {
-    f.module.starts_with("jit") && !is_std_fn(&f.name) && !f.name.starts_with("jit 0x") && !f.name.starts_with("(inlined") && !f.name.starts_with("slot#")
+    f.module.starts_with("jit") && !is_std_fn(&f.name) && !f.name.starts_with("jit 0x") && !f.name.starts_with("(inlined") && !f.name.starts_with("slot#") && !f.module.starts_with("jit/glue")
 }
 
 /// One frame as a short JSON object.
@@ -1001,6 +1023,14 @@ pub fn host_file_query(path: &str, words: &[String]) -> Option<i32> {
     let text = String::from_utf8_lossy(&bytes);
     print!("{text}");
     Some(if text.lines().any(|l| l.starts_with("{\"err\":")) { 1 } else { 0 })
+}
+
+/// Answers `req` with the host provider of command `name` (the Splash VM's `sprobe` for a
+/// `probe` on a .splash line); false when the host has none or it did not answer.
+pub(crate) fn host_query(name: &str, req: &Req, out: &mut Out) -> bool {
+    let query = HOST_PROVIDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(n, _)| *n == name).map(|(_, query)| *query);
+    let r = Req { cmd: name.to_string(), pos: req.pos.clone(), kv: req.kv.clone() };
+    query.is_some_and(|query| query(&r, out))
 }
 
 fn cmd_host_provided(req: &Req, out: &mut Out) -> bool {

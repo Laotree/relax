@@ -40,6 +40,12 @@ pub mod kind {
     pub const COUNTERS: u16 = 12;
     pub const DROP: u16 = 13;
     pub const MARK: u16 = 14;
+    /// (15: FRAMECAP, proposed) events: `u n, u base_t, n * { d t, u tid, u cat_sid, u a, u b,
+    /// str text }` -- app marks, log lines, panics, script errors, zone swaps, hitches, ...
+    pub const EVENT: u16 = 16;
+    /// the program's input events as the remote commands that inject them again: `u n, u base_t,
+    /// n * { d t, u frame, u flags (bit0: injected by makepad remote), str command }`
+    pub const INPUT: u16 = 17;
 }
 
 /// Span record kinds inside a SPANS batch.
@@ -456,12 +462,14 @@ pub struct Hello {
     pub refresh_mhz: u64,
     /// bit0: a JIT (makepad run) app; bit1: a native build
     pub flags: u64,
+    /// the process's start on the stream clock (0: unknown): answers say "at 896 s of the run"
+    pub start_mono: u64,
 }
 
 impl Hello {
     pub fn payload(&self) -> Vec<u8> {
         let mut e = Enc::default();
-        e.s(&self.app).s(&self.host).u(self.pid).s(&self.build).s(&self.device).u(self.refresh_mhz).u(self.flags);
+        e.s(&self.app).s(&self.host).u(self.pid).s(&self.build).s(&self.device).u(self.refresh_mhz).u(self.flags).u(self.start_mono);
         e.0
     }
 }

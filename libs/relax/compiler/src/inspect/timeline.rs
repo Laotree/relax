@@ -214,6 +214,14 @@ struct FrameLog {
     compiles: u32,
     /// probe / count values at the frame's start (only while probes are installed)
     probes0: Vec<(String, u64, u64)>,
+    /// the frame's waits (outermost): open depth, the open one's start and whether it is on the
+    /// owner, their time (of it on the owner) and count (the flight recorder's frame summary)
+    wait_depth: u32,
+    wait_t0: u64,
+    wait_owner: bool,
+    wait_ns: u64,
+    owner_ns: u64,
+    waits: u32,
 }
 
 thread_local! {
@@ -240,7 +248,7 @@ fn frame_watch(begin: bool, name: &'static str) {
     let done = FL.try_with(|c| {
         let Ok(mut g) = c.try_borrow_mut() else { return None };
         let l = g.get_or_insert_with(|| {
-            Box::new(FrameLog { depth: 0, start: 0, avg: 0, last_root_end: 0, idle: 0, recs: Vec::with_capacity(FRAME_RECS), dropped: 0, compile_depth: 0, compile_t0: 0, compile_ns: 0, compiles: 0, probes0: Vec::new() })
+            Box::new(FrameLog { depth: 0, start: 0, avg: 0, last_root_end: 0, idle: 0, recs: Vec::with_capacity(FRAME_RECS), dropped: 0, compile_depth: 0, compile_t0: 0, compile_ns: 0, compiles: 0, probes0: Vec::new(), wait_depth: 0, wait_t0: 0, wait_owner: false, wait_ns: 0, owner_ns: 0, waits: 0 })
         });
         if begin {
             if l.start == 0 {
@@ -251,11 +259,20 @@ fn frame_watch(begin: bool, name: &'static str) {
                 l.compile_ns = 0;
                 l.compiles = 0;
                 l.probes0.clear();
+                l.wait_ns = 0;
+                l.owner_ns = 0;
+                l.waits = 0;
+                if l.wait_depth > 0 {
+                    l.wait_t0 = now;
+                }
                 if HITCH_NS.load(Relaxed) > 0 && super::instrument::any_counters() {
                     l.probes0 = super::instrument::counters();
                 }
             } else if l.depth == 0 && l.last_root_end > l.start && now.saturating_sub(l.last_root_end) > GAP_NS {
                 l.idle += now - l.last_root_end;
+            }
+            if l.depth == 0 {
+                super::flightrec::ui_root(now);
             }
             l.depth += 1;
             frame_rec(l, 1, name, "");
@@ -267,12 +284,16 @@ fn frame_watch(begin: bool, name: &'static str) {
         }
         if l.depth == 0 {
             l.last_root_end = now;
+            super::flightrec::ui_root(0);
         }
         if name != "Draw" || l.start == 0 {
             return None;
         }
         FRAMES.fetch_add(1, Relaxed);
         let ms = now.saturating_sub(l.start).saturating_sub(l.idle);
+        // a wait still open at the frame's end counts up to it
+        let (open_w, open_o) = if l.wait_depth > 0 { let w = now.saturating_sub(l.wait_t0.max(l.start)); (w, if l.wait_owner { w } else { 0 }) } else { (0, 0) };
+        super::flightrec::frame(l.start, now, l.idle, l.compile_ns, l.compiles, l.wait_ns + open_w, l.owner_ns + open_o, l.waits);
         let avg = l.avg;
         l.avg = if avg == 0 { ms } else { (avg * 15 + ms) / 16 };
         let start = l.start;
@@ -290,6 +311,9 @@ fn frame_watch(begin: bool, name: &'static str) {
         Some((spike, ms, avg, analysis))
     });
     let Ok(Some((spike, ms, avg, analysis))) = done else { return };
+    if analysis.is_some() {
+        super::flightrec::hitch(ms, avg);
+    }
     if spike {
         super::events::emit(
             "spike",
@@ -337,12 +361,15 @@ fn analyse(l: &FrameLog, t0: u64, t1: u64) -> String {
     let mut stack: Vec<(&'static str, u64, u64)> = Vec::new();
     let mut phases: Vec<(String, u64, u64, u32)> = Vec::new();
     let mut waits: Vec<(String, u64, u64, u32)> = Vec::new();
-    let mut wait_open: Vec<(String, u64)> = Vec::new();
+    // open waits: (label, begin, kind name; the end record carries no kind)
+    let mut wait_open: Vec<(String, u64, &'static str)> = Vec::new();
+    // the UI thread's waits for the owner thread: (begin, end, label), for what the owner served
+    let mut owner_waits: Vec<(u64, u64, String)> = Vec::new();
     // the critical path: (what, ns) pieces in order
     let mut path: Vec<(String, u64)> = Vec::new();
     let mut compile_open = 0u32;
     let mut cur_t = t0;
-    let what_now = |stack: &[(&'static str, u64, u64)], wait_open: &[(String, u64)], compile_open: u32| -> String {
+    let what_now = |stack: &[(&'static str, u64, u64)], wait_open: &[(String, u64, &'static str)], compile_open: u32| -> String {
         if let Some(w) = wait_open.last() {
             format!("wait: {}", w.0)
         } else if compile_open > 0 {
@@ -388,10 +415,13 @@ fn analyse(l: &FrameLog, t0: u64, t1: u64) -> String {
                     }
                 }
             }
-            3 => wait_open.push((if r.detail.is_empty() { r.name.to_string() } else { format!("{} ({})", r.name, r.detail) }, r.t)),
+            3 => wait_open.push((if r.detail.is_empty() { r.name.to_string() } else { format!("{} ({})", r.name, r.detail) }, r.t, r.name)),
             4 => {
-                if let Some((k, b)) = wait_open.pop() {
+                if let Some((k, b, kind)) = wait_open.pop() {
                     let dur = r.t.saturating_sub(b);
+                    if kind == "owner" {
+                        owner_waits.push((b, r.t, k.clone()));
+                    }
                     match waits.iter_mut().find(|w| w.0 == k) {
                         Some(w) => {
                             w.1 += dur;
@@ -452,11 +482,17 @@ fn analyse(l: &FrameLog, t0: u64, t1: u64) -> String {
         d.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         probes = d.iter().take(8).map(|(k, h, ns)| format!("{{\"counter\":{},\"delta\":{}{}}}", json_str(&short(k, 120)), h, if *ns > 0 { format!(",\"ms\":{:.2}", ms(*ns)) } else { String::new() })).collect();
     }
+    // the 3 longest waits for the owner, each with what the owner served meanwhile
+    owner_waits.sort_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0)));
+    let ow: Vec<String> = owner_waits.iter().filter(|w| w.1 - w.0 >= 1_000_000).take(3).map(|(b, e, k)| {
+        format!("{{\"wait\":{},\"at_ms\":{:.1},\"ms\":{:.2},\"owner_served\":{}}}", json_str(&short(k, 120)), ms(b.saturating_sub(t0)), ms(e - b), crate::owner::served_during(*b, *e))
+    }).collect();
     format!(
-        "\"idle_gap_ms\":{:.1},\"phases\":[{}],\"waits\":[{}],\"compile\":{{\"ms\":{:.2},\"n\":{}}},\"time_by\":[{}],\"critical_path\":[{}],\"critical_path_other_ms\":{:.2},\"probe_deltas\":[{}],\"records_dropped\":{}",
+        "\"idle_gap_ms\":{:.1},\"phases\":[{}],\"waits\":[{}],\"owner_waits\":[{}],\"compile\":{{\"ms\":{:.2},\"n\":{}}},\"time_by\":[{}],\"critical_path\":[{}],\"critical_path_other_ms\":{:.2},\"probe_deltas\":[{}],\"records_dropped\":{}",
         ms(l.idle),
         ph.join(","),
         wt.join(","),
+        ow.join(","),
         ms(l.compile_ns),
         l.compiles,
         time_by.join(","),
@@ -542,6 +578,24 @@ fn wait_trace(begin: bool, kind: &'static str, detail: &'static str, object: u64
                 if l.start != 0 {
                     frame_rec(l, if begin { 3 } else { 4 }, kind, detail);
                 }
+                // the frame summary's waits (outermost only)
+                if begin {
+                    if l.wait_depth == 0 {
+                        l.wait_t0 = crate::clock::wall_ns();
+                        l.wait_owner = kind == "owner";
+                    }
+                    l.wait_depth += 1;
+                } else if l.wait_depth > 0 {
+                    l.wait_depth -= 1;
+                    if l.wait_depth == 0 && l.start != 0 {
+                        let w = crate::clock::wall_ns().saturating_sub(l.wait_t0.max(l.start));
+                        l.wait_ns += w;
+                        if l.wait_owner {
+                            l.owner_ns += w;
+                        }
+                        l.waits += 1;
+                    }
+                }
             }
         });
     }
@@ -604,7 +658,7 @@ pub extern "C" fn relax_gpu_span(name: *const u8, len: usize, begin: u64, end: u
         return;
     }
     let name = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name, len)) };
-    if super::pstream::on() {
+    if super::pstream::viewing() {
         super::pstream::gpu_span(name, begin, end);
     }
     if !RINGS_ON.load(Relaxed) {
@@ -1155,7 +1209,7 @@ fn save_cmd(out: &mut Out) {
     let gpu_sid = strings.id("GPU");
     let mut file = ps::prelude().to_vec();
     let app = super::APP.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let hello = ps::Hello { app, host: String::new(), pid: std::process::id() as u64, build: crate::jit::PROVENANCE.to_string(), device: String::new(), refresh_mhz: 0, flags: 1 };
+    let hello = ps::Hello { app, host: String::new(), pid: std::process::id() as u64, build: crate::jit::PROVENANCE.to_string(), device: String::new(), refresh_mhz: 0, flags: 1, start_mono: (ps::mono_ns() as i128 - crate::clock::wall_ns() as i128).max(0) as u64 };
     ps::record(&mut file, ps::kind::HELLO, &hello.payload());
     let unix_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     ps::record(&mut file, ps::kind::CLOCK, &ps::clock_payload(ps::mono_ns(), unix_now));
@@ -1175,5 +1229,37 @@ fn save_cmd(out: &mut Out) {
     match std::fs::write(&path, &file) {
         Ok(()) => out.line(&format!("{{\"saved\":{},\"records\":{},\"lanes\":{},\"bytes\":{},\"more\":[\"makepad inspect file={} pf summary\"]}}", json_str(&path.display().to_string()), n_recs, lanes.len(), file.len(), path.display())),
         Err(e) => out.err(&format!("cannot write {}: {}", path.display(), e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A hitch's owner_waits come from the UI thread's waits of kind owner (the end record carries
+    /// no kind: the begin's names it).
+    #[test]
+    fn hitch_names_its_owner_waits() {
+        let rec = |t: u64, kind: u8, name: &'static str, detail: &'static str| super::FRec { t, kind, name, detail };
+        let l = super::FrameLog {
+            depth: 0,
+            start: 1,
+            avg: 0,
+            last_root_end: 0,
+            idle: 0,
+            recs: vec![rec(1_000, 3, "owner", "main"), rec(3_001_000, 4, "none", ""), rec(3_002_000, 3, "futex", ""), rec(9_002_000, 4, "none", "")],
+            dropped: 0,
+            compile_depth: 0,
+            compile_t0: 0,
+            compile_ns: 0,
+            compiles: 0,
+            probes0: Vec::new(),
+            wait_depth: 0,
+            wait_t0: 0,
+            wait_owner: false,
+            wait_ns: 0,
+            owner_ns: 0,
+            waits: 0,
+        };
+        let s = super::analyse(&l, 0, 10_000_000);
+        assert!(s.contains("\"owner_waits\":[{\"wait\":\"owner (main)\",\"at_ms\":0.0,\"ms\":3.00,"), "{s}");
     }
 }
