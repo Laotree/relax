@@ -2670,8 +2670,12 @@ fn region_windows_alloc(
     let regs: Vec<u8> = cfg.int_caller.iter().chain(used_callee_int.iter()).copied().collect();
     let min_blocks = if edge_loads { 1 } else { 2 };
     let mut order: Vec<u32> = (0..nv as u32).filter(|v| cand[*v as usize] && uses_in.get(v).map_or(false, |m| m.len() >= min_blocks)).collect();
-    let heat = |v: u32| -> f32 { uses_in[&v].iter().map(|(b, n)| wts[*b as usize] * *n as f32).sum() };
-    order.sort_by(|a, b| heat(*b).partial_cmp(&heat(*a)).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(b)));
+    // weighted uses, computed once (the comparator summed every use block per comparison)
+    let mut heat: HashMap<u32, f32> = HashMap::with_capacity(order.len());
+    for &v in &order {
+        heat.insert(v, uses_in[&v].iter().map(|(b, n)| wts[*b as usize] * *n as f32).sum());
+    }
+    order.sort_by(|a, b| heat[b].partial_cmp(&heat[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(b)));
     let block_of = |p: u32| block_start.partition_point(|&s| s <= p) - 1;
     for v in order {
         let rv = ranges.of(v);
@@ -2693,6 +2697,9 @@ fn region_windows_alloc(
             }
         }
         let live_in = |b: u32, ps: &Vec<(u32, u32)>| ps.first().map_or(false, |x| x.0 == block_start[b as usize]);
+        // pieces are in ascending block order: a block's pieces by binary search (a linear find
+        // per lookup made big O3 functions quadratic: 43-49% of arm64 O3 worker time, ARM64CG3)
+        let piece_of = |b: u32| pieces.binary_search_by_key(&b, |x| x.0).ok().map(|k| &pieces[k].1);
         // a block that defines the value: in a region only when every definition there leaves the
         // result in the register
         let elig: Vec<(u32, &Vec<(u32, u32)>)> = pieces
@@ -2735,7 +2742,7 @@ fn region_windows_alloc(
             if set.len() < if edge_loads { 1 } else { 2 } {
                 continue;
             }
-            let entered = |b: u32| -> bool { pieces.iter().find(|x| x.0 == b).map_or(false, |(_, ps)| live_in(b, ps)) };
+            let entered = |b: u32| -> bool { piece_of(b).map_or(false, |ps| live_in(b, ps)) };
             // the outside predecessors of b that load at their end instead (before their
             // terminator) when together they run less often than b: a loop's preheader or guard,
             // the join of a cold path. The register must be free from the predecessor's last two
@@ -2766,15 +2773,32 @@ fn region_windows_alloc(
                 Some(at_end)
             };
             // drop blocks that only load for nothing (no use, no definition, and a load of their
-            // own needed) until stable
-            loop {
-                let inset = |b: u32| set.binary_search(&b).is_ok();
-                let needs = |b: u32| entered(b) && (invoke_pred[b as usize] || preds[b as usize].is_empty() || preds[b as usize].iter().any(|p| !inset(*p))) && edge_preds(b, &inset).is_none();
-                let drop: Vec<u32> = set.iter().copied().filter(|b| !used.contains_key(b) && !def_in.contains_key(&(v, *b)) && needs(*b)).collect();
-                if drop.is_empty() {
-                    break;
+            // own needed) until stable. Dropping a block only makes its successors' loads more
+            // needed (more predecessors outside), so a worklist over the successors of dropped
+            // blocks reaches the same fixpoint (a round-by-round rescan cascaded one block per
+            // round along chains)
+            {
+                let idle = |b: u32| !used.contains_key(&b) && !def_in.contains_key(&(v, b));
+                let mut inset_h: std::collections::HashSet<u32> = set.iter().copied().collect();
+                let mut queue: Vec<u32> = set.iter().copied().filter(|b| idle(*b)).collect();
+                while let Some(b) = queue.pop() {
+                    if !inset_h.contains(&b) {
+                        continue;
+                    }
+                    let inset = |x: u32| inset_h.contains(&x);
+                    let needs = entered(b) && (invoke_pred[b as usize] || preds[b as usize].is_empty() || preds[b as usize].iter().any(|p| !inset(*p))) && edge_preds(b, &inset).is_none();
+                    if needs {
+                        inset_h.remove(&b);
+                        for t in f.blocks[b as usize].term.succs() {
+                            if inset_h.contains(&t) && idle(t) {
+                                queue.push(t);
+                            }
+                        }
+                    }
                 }
-                set.retain(|b| !drop.contains(b));
+                if inset_h.len() != set.len() {
+                    set.retain(|b| inset_h.contains(b));
+                }
             }
             if set.len() < if edge_loads { 1 } else { 2 } {
                 continue;
@@ -2825,7 +2849,7 @@ fn region_windows_alloc(
         }
         for (b, load) in plan {
             let bu = b as usize;
-            let ps = &pieces.iter().find(|x| x.0 == b).unwrap().1;
+            let ps = piece_of(b).unwrap();
             for &(a, z) in ps.iter() {
                 bits_fill(o, a, z);
             }
