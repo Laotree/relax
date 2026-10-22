@@ -733,6 +733,8 @@ struct Gen<'a> {
     last_call_ret: usize,
     /// invoked calls: (return word index, caller-saved values to reload, cleanup pad block)
     pads: Vec<(usize, Vec<(VReg, i32)>, u32)>,
+    /// (instruction position, return offset in bytes) of every call: the variable table's sites (dbgloc)
+    var_calls: Vec<(u32, u32)>,
     /// branch relaxation (a function past imm19's +-1 MB): conditional block branches become
     /// an inverted short branch over a `b` (+-128 MB), constants are built in registers
     /// instead of loaded from the literal pools after the code
@@ -1753,6 +1755,7 @@ impl<'a> Gen<'a> {
         }
         // a C-unwind call is invoked like a Relax one: its landing stub is keyed by this address
         self.last_call_ret = self.a.pos();
+        self.var_calls.push((self.cur_pos, (self.a.pos() * 4) as u32));
         // C leaves a narrow integer result's upper bits undefined
         if let Some(it) = sig.ret_narrow {
             self.a.extend(0, 0, it.bits, it.signed);
@@ -4102,6 +4105,7 @@ impl<'a> Gen<'a> {
             Callee::CHost(..) | Callee::CIndirect(..) | Callee::CFn(..) | Callee::Asm(..) => {}
         }
         self.last_call_ret = self.a.pos();
+        self.var_calls.push((self.cur_pos, (self.a.pos() * 4) as u32));
         let mut mv = Vec::new();
         let mut ri = 0u8;
         let mut rf = 0u8;
@@ -4420,6 +4424,12 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // indexed accesses with displacements on one base and index: one address register
     let shared = regalloc::share_index_bases(f);
     let f = shared.as_ref().unwrap_or(f);
+    // counter steps after the last read of the old value (no copy per iteration)
+    let stepped = if env.opt_regs || f.full { regalloc::sink_increments(options, f) } else { None };
+    let f = stepped.as_ref().unwrap_or(f);
+    // branch compares at the end of their block (fused into cmp + b.cond)
+    let brs = if env.opt_regs || f.full { regalloc::sink_branch_compares(options, f) } else { None };
+    let f = brs.as_ref().unwrap_or(f);
     // a function that calls nothing and returns no float may keep values in v0-v3 too (they
     // carry float arguments and results, and calls' aggregate results, only around calls)
     let mut cfg = RegConfig { sym_class: env.sym_class, ..reg_config() };
@@ -4506,6 +4516,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         stage: 0,
         last_call_ret: 0,
         pads: Vec::new(),
+        var_calls: Vec::new(),
         long,
         tbz: tbz && !long,
     };
@@ -4540,7 +4551,22 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     let text_len = (g.text_words * 4) as u32;
     crate::stats::pass_time(12, t_emit);
     crate::probe::code(code.len());
-    return Ok(Compiled { code, pc_map: g.pc_map, frame_size: frame, text_len, alloc_sig, relocs: g.relocs, rir_map: Vec::new(), rir_emitted: String::new() });
+    // where the named locals are at each call (makepad inspect `locals`; side metadata)
+    let mut pc_map = std::mem::take(&mut g.pc_map);
+    if !g.f.naked && !g.f.dbg.is_empty() {
+        let (saved, fsz, slot_off) = (g.saved, g.frame, &g.slot_off);
+        // sp = fp - frame in the body
+        let spill = |o: i32| -(saved as i32 + o);
+        let slot = |s: u32| (slot_off[s as usize] - fsz) as i32;
+        let fr = crate::dbgloc::Frame { callee_int: &cfg.int_callee, callee_flt: &cfg.flt_callee, arg_regs: &[0, 1, 2, 3, 4, 5, 6, 7], captured: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], call_writes: &[S0, S1, IP0, IP1], spill_fp: &spill, slot_fp: &slot };
+        let vars = crate::dbgloc::build(g.f, &g.al, &fr, &g.var_calls);
+        let e = crate::dbgloc::pc_entries(&vars, g.f.file);
+        crate::dbgloc::note_stats(&pc_map, &e, vars.len());
+        pc_map.extend(e);
+    } else {
+        crate::dbgloc::note_stats(&pc_map, &[], 0);
+    }
+    return Ok(Compiled { code, pc_map, frame_size: frame, text_len, alloc_sig, relocs: g.relocs, rir_map: Vec::new(), rir_emitted: String::new() });
     }
 }
 
@@ -4712,13 +4738,12 @@ pub fn enter_leave() -> (Vec<u8>, usize) {
     (words_to_bytes(&a.w), leave * 4)
 }
 
-/// JIT trampoline in front of a host panic function (or the unwinder's resume entry): stores
-/// the JIT caller's register state as a block on the stack -- [fp, return address, x19..x28,
-/// d8..d15] (20 words) -- passes its address as argument 6 (x6), then tail-jumps to `target`,
-/// which never returns. The unwinder starts its frame walk from the block.
-pub fn panic_tramp(target: u64) -> Vec<u8> {
-    let mut a = Asm { w: Vec::new() };
-    a.sub_imm(SP, SP, 160);
+/// Bytes of the register block the panic trampolines store (rir REG_BLOCK layout, arm64).
+pub const REG_BLOCK_BYTES: u32 = 288;
+
+/// Stores the register block [fp, lr, x19..x28, d8..d15, x0..x15] at sp (sp lowered first).
+fn store_reg_block(a: &mut Asm) {
+    a.sub_imm(SP, SP, REG_BLOCK_BYTES);
     a.stp(false, FP, LR, SP, 0);
     for k in 0..5u8 {
         a.stp(false, 19 + 2 * k, 20 + 2 * k, SP, 16 + 16 * k as i32);
@@ -4726,10 +4751,42 @@ pub fn panic_tramp(target: u64) -> Vec<u8> {
     for k in 0..4u8 {
         a.stp(true, 8 + 2 * k, 9 + 2 * k, SP, 96 + 16 * k as i32);
     }
+    // the caller-saved registers as the call began (makepad inspect `locals`: its arguments and
+    // the values the caller keeps there, at a stop's innermost call)
+    for k in 0..8u8 {
+        a.stp(false, 2 * k, 2 * k + 1, SP, 160 + 16 * k as i32);
+    }
+}
+
+/// JIT trampoline in front of a host panic function (or the unwinder's resume entry): stores
+/// the JIT caller's register state as a block on the stack -- [fp, return address, x19..x28,
+/// d8..d15, x0..x15] (36 words) -- passes its address as argument 6 (x6), then tail-jumps to
+/// `target`, which never returns. The unwinder starts its frame walk from the block.
+pub fn panic_tramp(target: u64) -> Vec<u8> {
+    let mut a = Asm { w: Vec::new() };
+    store_reg_block(&mut a);
     a.mov_sp(6, SP);
     a.mov_imm(7, 0);
     a.mov_imm64_fixed(IP0, target);
     a.br(IP0);
+    words_to_bytes(&a.w)
+}
+
+/// JIT trampoline in front of a host function that returns (makepad inspect's breakpoint):
+/// stores the register block as `panic_tramp` does, makes it the frame record (x29 = its
+/// address: [fp, return address] lead it, so frame walks go on into the JIT caller), passes its
+/// address as argument 6 (x6, x7 = 0), calls `target` and returns to the JIT caller.
+pub fn regs_call_tramp(target: u64) -> Vec<u8> {
+    let mut a = Asm { w: Vec::new() };
+    store_reg_block(&mut a);
+    a.mov_sp(FP, SP);
+    a.mov_sp(6, SP);
+    a.mov_imm(7, 0);
+    a.mov_imm64_fixed(IP0, target);
+    a.blr(IP0);
+    a.ldp(false, FP, LR, SP, 0);
+    a.add_imm(SP, SP, REG_BLOCK_BYTES);
+    a.ret();
     words_to_bytes(&a.w)
 }
 
