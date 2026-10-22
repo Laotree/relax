@@ -90,3 +90,49 @@ fn a_captured_pointer_is_left_alone() {
     f.blocks[0].pos.insert(0, 1);
     assert!(!forward_param_fields(&relax_session::Options::default(), &mut f));
 }
+
+/// dead_param_field_stores: a store overwritten on every path before any read or may-unwind call
+/// goes; one a load, a returning path or a call that may unwind can see stays.
+#[test]
+fn an_overwritten_field_store_is_dead() {
+    use relax_codegen::opt::dead_param_field_stores;
+    let o = relax_session::Options::default();
+    // b0: [p+8] = c; branch c -> b1 / b2; b1: [p+8] = x; b2: [p+8] = c + 1; b3: ret
+    let build = |read_in_b2: bool, call_in_b0: bool| -> Func {
+        let mut f = Func::new("dse".into(), 0);
+        let (p, c, x) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        f.params = vec![p, c, x];
+        f.noalias = vec![p];
+        for _ in 0..4 {
+            f.block();
+        }
+        let (c1, r) = (f.vreg(Cls::I), f.vreg(Cls::I));
+        let m = Mem::Int(8, false);
+        push(&mut f, 0, Inst::Store(m, p, 8, c));
+        if call_in_b0 {
+            push(&mut f, 0, Inst::Call(Callee::Fn(3), Vec::new(), Vec::new()));
+        }
+        f.blocks[0].term = Term::Branch(c, 1, 2);
+        push(&mut f, 1, Inst::Store(m, p, 8, x));
+        f.blocks[1].term = Term::Jump(3);
+        if read_in_b2 {
+            push(&mut f, 2, Inst::Load(Mem::Int(4, false), r, p, 12));
+        }
+        push(&mut f, 2, Inst::IBinI(IOp::Add, U64, c1, c, 1));
+        push(&mut f, 2, Inst::Store(m, p, 8, c1));
+        f.blocks[2].term = Term::Jump(3);
+        f.blocks[3].term = Term::Ret(vec![]);
+        f.verify().unwrap();
+        f
+    };
+    let stores0 = |f: &Func| f.blocks[0].insts.iter().filter(|i| matches!(i, Inst::Store(..))).count();
+    let mut f = build(false, false);
+    assert!(dead_param_field_stores(&o, &mut f));
+    assert_eq!(stores0(&f), 0, "{}", f.dump());
+    // the later stores reach the return: kept
+    assert_eq!(f.blocks[1].insts.len() + f.blocks[2].insts.len(), 3);
+    let mut f = build(true, false);
+    assert!(!dead_param_field_stores(&o, &mut f));
+    let mut f = build(false, true);
+    assert!(!dead_param_field_stores(&o, &mut f));
+}

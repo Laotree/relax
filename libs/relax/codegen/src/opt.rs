@@ -6511,6 +6511,196 @@ pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> b
     changed
 }
 
+/// Dead stores to a `noalias` parameter's fields (LLVM DSE): a store to `[p + off]` that every
+/// path overwrites with a store of the same field before anything may read those bytes -- a load
+/// overlapping them, any other access through a pointer based on p, a call given one, any call that
+/// may unwind (the caller may look after a caught panic), an atomic, fence or return -- is removed.
+/// Same legality as forward_param_fields (p defined once, noalias, not captured). Returns whether
+/// anything changed.
+pub fn dead_param_field_stores(options: &relax_session::Options, f: &mut Func) -> bool {
+    if opt_off(options, "-dsefields") || f.noalias.is_empty() {
+        return false;
+    }
+    let nv = f.vregs.len();
+    let nb = f.blocks.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+        }
+    }
+    let reach = reachable(f);
+    let mut changed = false;
+    for pi in 0..f.noalias.len() {
+        let p = f.noalias[pi];
+        if ndef[p.0 as usize] != 1 || !f.params.contains(&p) {
+            continue;
+        }
+        let mut based = vec![false; nv];
+        based[p.0 as usize] = true;
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if matches!(i, Inst::Load(..) | Inst::LoadX(..) | Inst::AtomicLoad(..)) {
+                        continue;
+                    }
+                    let mut any = false;
+                    for_uses(i, |u| any |= based[u.0 as usize]);
+                    if any {
+                        for_defs(i, |d| {
+                            if !based[d.0 as usize] {
+                                based[d.0 as usize] = true;
+                                grew = true;
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        let mut captured = false;
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Store(_, _, _, src) | Inst::StoreX(_, _, _, _, _, src) | Inst::VStore(_, _, src) | Inst::AtomicStore(_, _, _, src) => captured |= based[src.0 as usize],
+                    Inst::AtomicRmw(_, _, _, _, _, src) => captured |= based[src.0 as usize],
+                    Inst::AtomicCas(_, _, _, _, _, e, nw) => captured |= based[e.0 as usize] || based[nw.0 as usize],
+                    Inst::Call(c, args, _) => {
+                        captured |= args.iter().enumerate().any(|(k, a)| based[a.0 as usize] && !sroa_nocapture(c, k));
+                        if let Callee::Indirect(v) | Callee::CIndirect(v, _) = c {
+                            captured |= based[v.0 as usize];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Term::Ret(vs) = &b.term {
+                captured |= vs.iter().any(|v| based[v.0 as usize]);
+            }
+        }
+        if captured {
+            continue;
+        }
+        let mut fields: Vec<(i32, Mem)> = Vec::new();
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Store(m, base, off, _) = *i {
+                    if base == p && !fields.contains(&(off, m)) && fields.len() < 64 {
+                        fields.push((off, m));
+                    }
+                }
+            }
+        }
+        if fields.is_empty() {
+            continue;
+        }
+        let nf = fields.len();
+        let all: u64 = if nf == 64 { u64::MAX } else { (1u64 << nf) - 1 };
+        let overlap = |a: (i32, i32), b: (i32, Mem)| a.0 < b.0 + mem_size(b.1) && b.0 < a.0 + a.1;
+        // the fields an access reading bytes [off, off + n) through p makes live
+        let reads = |off: i32, n: i32| -> u64 {
+            let mut m = 0u64;
+            for (j, x) in fields.iter().enumerate() {
+                if overlap((off, n), *x) {
+                    m |= 1 << j;
+                }
+            }
+            m
+        };
+        let unwinds = |c: &Callee| match c {
+            Callee::CHost(_, sig) => sig.unwinds,
+            _ => true,
+        };
+        // backward: (kill = a store of exactly this field, gen = fields read)
+        let step = |live: u64, i: &Inst| -> u64 {
+            match *i {
+                Inst::Store(m, base, off, _) if base == p => {
+                    let k = fields.iter().position(|x| *x == (off, m)).unwrap();
+                    live & !(1u64 << k)
+                }
+                Inst::Load(m, _, base, off) if base == p => live | reads(off, mem_size(m)),
+                Inst::Call(ref c, ref args, _) => {
+                    if args.iter().any(|a| based[a.0 as usize]) || unwinds(c) || matches!(c, Callee::Asm(_)) {
+                        all
+                    } else {
+                        live
+                    }
+                }
+                Inst::AtomicLoad(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..) => all,
+                _ => {
+                    // any other access through a based-on pointer reads anything
+                    let mut any = false;
+                    match *i {
+                        Inst::Load(_, _, base, _) | Inst::LoadX(_, _, base, _, _, _) | Inst::VLoad(_, base, _) | Inst::VLoadX(_, base, _, _, _) | Inst::VGather(_, base, _) | Inst::VTbl(_, base, _, _) => any = based[base.0 as usize],
+                        Inst::Store(_, base, _, _) | Inst::StoreX(_, base, _, _, _, _) | Inst::VStore(base, _, _) | Inst::VStoreX(base, _, _, _, _) => any = based[base.0 as usize],
+                        Inst::Copy(d, s2, _) => any = based[d.0 as usize] || based[s2.0 as usize],
+                        _ => {}
+                    }
+                    if any { all } else { live }
+                }
+            }
+        };
+        let term_live = |t: &Term| -> Option<u64> {
+            match t {
+                Term::Ret(..) | Term::Resume | Term::Unreachable => Some(all),
+                _ => None,
+            }
+        };
+        let mut live_in = vec![0u64; nb];
+        let mut work = true;
+        while work {
+            work = false;
+            for bi in (0..nb).rev() {
+                if !reach[bi] {
+                    continue;
+                }
+                let b = &f.blocks[bi];
+                let mut live = term_live(&b.term).unwrap_or_else(|| b.term.succs().fold(0u64, |a, t| a | live_in[t as usize]));
+                // an Invoke's call may unwind into its landing pad: covered by the call's own rule
+                for i in b.insts.iter().rev() {
+                    live = step(live, i);
+                }
+                if live != live_in[bi] {
+                    live_in[bi] = live;
+                    work = true;
+                }
+            }
+        }
+        for bi in 0..nb {
+            if !reach[bi] {
+                continue;
+            }
+            let b = &f.blocks[bi];
+            let mut live = term_live(&b.term).unwrap_or_else(|| b.term.succs().fold(0u64, |a, t| a | live_in[t as usize]));
+            let mut dead: Vec<usize> = Vec::new();
+            for (k, i) in b.insts.iter().enumerate().rev() {
+                if let Inst::Store(m, base, off, _) = *i {
+                    if base == p {
+                        let j = fields.iter().position(|x| *x == (off, m)).unwrap();
+                        if live & (1u64 << j) == 0 {
+                            dead.push(k);
+                        }
+                    }
+                }
+                live = step(live, i);
+            }
+            if !dead.is_empty() {
+                let b = &mut f.blocks[bi];
+                for k in dead {
+                    b.insts.remove(k);
+                    b.pos.remove(k);
+                }
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// The mask idiom of bit readers, `x & ((1 << n) - 1)` (and `x & !(-1 << n)`) on 64-bit values,
 /// becomes `x bzhi n` (IOp::Bzhi) when the shift and the mask are read only there: x64 BMI2 `and`
 /// of the count + `bzhi` (was `mov 1; shlx; sub; and`, a three-deep chain), arm64 `movn; lslv;
