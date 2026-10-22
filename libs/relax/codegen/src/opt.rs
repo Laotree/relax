@@ -6263,6 +6263,11 @@ pub fn promote_dyn_read_slots(f: &mut Func) -> bool {
 /// (`s.br.bit_pos_` loaded, bumped and stored, then loaded again in the next block). Returns
 /// whether anything changed.
 pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let trace = *TRACE.get_or_init(|| std::env::var("MAKEPAD_RUN_FIELDS_TRACE").is_ok());
+    if trace {
+        eprintln!("fields {}: noalias {:?} params {:?}", f.name, f.noalias, f.params);
+    }
     if opt_off(options, "-fwdfields") || f.noalias.is_empty() {
         return false;
     }
@@ -6335,6 +6340,9 @@ pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> b
             if let Term::Ret(vs) = &b.term {
                 captured |= vs.iter().any(|v| based[v.0 as usize]);
             }
+        }
+        if trace {
+            eprintln!("fields {}: p {:?} captured {}", f.name, p, captured);
         }
         if captured {
             continue;
@@ -6452,6 +6460,9 @@ pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> b
                 }
                 st = apply(st, eff(i));
             }
+        }
+        if trace {
+            eprintln!("fields {}: p {:?} {} fields, {} loads forwarded", f.name, p, nf, fwd.len());
         }
         if fwd.is_empty() {
             continue;
