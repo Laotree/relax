@@ -155,3 +155,39 @@ fn a_field_through_an_offset_base_is_one_field() {
     assert!(forward_param_fields(&relax_session::Options::default(), &mut f));
     assert_eq!(loads_of(&f, 0), 0, "{}", f.dump());
 }
+
+/// Load PRE: the field is stored on one path and unknown on the other; with p dereferenceable the
+/// unknown edge gets the load and the join's load reads the variable. Without dereferenceability
+/// nothing moves.
+#[test]
+fn a_load_known_on_all_but_one_edge_is_moved_onto_it() {
+    let build = |deref: bool| -> Func {
+        let mut f = Func::new("pre".into(), 0);
+        let (p, c, x) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        f.params = vec![p, c, x];
+        f.noalias = vec![p];
+        if deref {
+            f.deref = vec![(p, 16)];
+        }
+        f.rets = vec![Cls::I];
+        for _ in 0..4 {
+            f.block();
+        }
+        let r = f.vreg(Cls::I);
+        f.blocks[0].term = Term::Branch(c, 1, 2);
+        push(&mut f, 1, Inst::Store(Mem::Int(8, false), p, 8, x));
+        f.blocks[1].term = Term::Jump(3);
+        f.blocks[2].term = Term::Jump(3);
+        push(&mut f, 3, Inst::Load(Mem::Int(8, false), r, p, 8));
+        f.blocks[3].term = Term::Ret(vec![r]);
+        f.verify().unwrap();
+        f
+    };
+    let mut f = build(true);
+    assert!(forward_param_fields(&relax_session::Options::default(), &mut f));
+    f.verify().unwrap();
+    assert_eq!(loads_of(&f, 3), 0, "{}", f.dump());
+    assert_eq!(loads_of(&f, 2), 1, "{}", f.dump());
+    let mut f = build(false);
+    assert!(!forward_param_fields(&relax_session::Options::default(), &mut f));
+}

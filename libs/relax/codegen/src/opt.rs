@@ -6282,7 +6282,7 @@ pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> b
             for_defs(i, |d| ndef[d.0 as usize] += 1);
         }
     }
-    let reach = reachable(f);
+    let mut reach = reachable(f);
     let mut preds: Vec<Vec<u32>> = vec![Vec::new(); nb];
     for (bi, b) in f.blocks.iter().enumerate() {
         if reach[bi] {
@@ -6418,27 +6418,100 @@ pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> b
                 Eff::KillAll => 0,
             }
         };
-        // forward must-availability
+        // forward must-availability; then load PRE (GVN's): a load at the top of a block whose
+        // field every predecessor but one makes known gets a load of the field on that one edge
+        // (the predecessor's end, or a new block on a critical edge; p is dereferenceable, so the
+        // load may run where the program did not load), and the round repeats
+        let dr = f.deref.clone();
+        let deref = |o: i64, m: Mem| dr.iter().any(|(q, sz)| *q == p && o >= 0 && o + mem_size(m) as i64 <= *sz as i64);
         let mut out = vec![all; nb];
         let mut inn = vec![0u64; nb];
-        let mut work = true;
-        while work {
-            work = false;
-            for bi in 0..nb {
-                if !reach[bi] {
-                    continue;
-                }
-                let mut st = if bi == 0 { 0 } else { preds[bi].iter().fold(all, |a, &q| a & out[q as usize]) };
-                inn[bi] = st;
-                for i in &f.blocks[bi].insts {
-                    st = apply(st, eff(i));
-                }
-                if st != out[bi] {
-                    out[bi] = st;
-                    work = true;
+        let mut pre_left = 32;
+        loop {
+            let nb = f.blocks.len();
+            if out.len() < nb {
+                out.resize(nb, all);
+                inn.resize(nb, 0);
+                preds.resize(nb, Vec::new());
+                reach.resize(nb, true);
+            }
+            out.iter_mut().for_each(|x| *x = all);
+            let mut work = true;
+            while work {
+                work = false;
+                for bi in 0..nb {
+                    if !reach[bi] {
+                        continue;
+                    }
+                    let mut st = if bi == 0 { 0 } else { preds[bi].iter().fold(all, |a, &q| a & out[q as usize]) };
+                    inn[bi] = st;
+                    for i in &f.blocks[bi].insts {
+                        st = apply(st, eff(i));
+                    }
+                    if st != out[bi] {
+                        out[bi] = st;
+                        work = true;
+                    }
                 }
             }
+            if pre_left == 0 {
+                break;
+            }
+            // one insertion per round
+            let mut ins: Option<(usize, usize, Mem, i64)> = None; // (pred, block, type, offset)
+            'blocks: for bi in 1..nb {
+                if !reach[bi] || preds[bi].len() < 2 {
+                    continue;
+                }
+                let mut touched = 0u64;
+                for i in &f.blocks[bi].insts {
+                    if let Inst::Load(m, _, base, off) = *i {
+                        if let Some(j) = field_of(m, base, off) {
+                            let o = fields[j].0;
+                            if inn[bi] & (1 << j) == 0 && touched & (1 << j) == 0 && deref(o, m) && (i32::MIN as i64..=i32::MAX as i64).contains(&o) {
+                                let missing: Vec<u32> = preds[bi].iter().copied().filter(|&q| out[q as usize] & (1 << j) == 0).collect();
+                                if missing.len() == 1 && missing[0] as usize != bi && !matches!(f.blocks[missing[0] as usize].term, Term::Invoke(..)) {
+                                    ins = Some((missing[0] as usize, bi, m, o));
+                                    break 'blocks;
+                                }
+                            }
+                        }
+                    }
+                    match eff(i) {
+                        Eff::KillAll => continue 'blocks,
+                        Eff::Gen(k, kill) => touched |= (1 << k) | kill,
+                        Eff::None => {}
+                    }
+                }
+            }
+            let Some((q, bi, m, o)) = ins else { break };
+            pre_left -= 1;
+            let t = f.vreg(match m {
+                Mem::F32 => Cls::F32,
+                Mem::F64 => Cls::F64,
+                Mem::Int(..) => Cls::I,
+            });
+            let load = Inst::Load(m, t, p, o as i32);
+            let tp = f.blocks[q].term_pos;
+            if f.blocks[q].term.succs().count() == 1 {
+                f.blocks[q].insts.push(load);
+                f.blocks[q].pos.push(tp);
+            } else {
+                let nbk = f.blocks.len() as u32;
+                f.blocks.push(Block { insts: vec![load], pos: vec![tp], term: Term::Jump(bi as u32), term_pos: tp });
+                f.blocks[q].term.map_succs(|x| if x == bi as u32 { nbk } else { x });
+                preds.push(vec![q as u32]);
+                for x in preds[bi].iter_mut() {
+                    if *x == q as u32 {
+                        *x = nbk;
+                    }
+                }
+                preds[bi].dedup();
+                reach.push(true);
+            }
+            changed = true;
         }
+        let nb = f.blocks.len();
         // the loads whose field is known on arrival
         let mut fwd: Vec<(usize, usize, usize)> = Vec::new(); // block, index, field
         let mut used = vec![false; nf];
