@@ -99,10 +99,11 @@ fn a_c_body_forwards_to_a_c_callee_with_its_frame_gone() {
     f.rets = vec![Cls::I];
     let (t, a, r) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
     let mut args = f.params.clone();
+    let p0 = args[0];
     args[0] = a;
     block(&mut f, vec![
         Inst::Iconst(t, mix as *const () as i64),
-        Inst::IBinI(IOp::Add, U64, a, f.params[0], 100),
+        Inst::IBinI(IOp::Add, U64, a, p0, 100),
         Inst::Call(Callee::CIndirect(t, Box::new(sig)), args, vec![r]),
     ], Term::Ret(vec![r]));
     f.verify().unwrap();

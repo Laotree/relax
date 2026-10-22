@@ -4728,6 +4728,7 @@ mod tests {
     /// past their +-32 KB range the function is emitted again with tst + b.cond, and both
     /// versions take the right side.
     #[test]
+    #[cfg(target_arch = "aarch64")]
     fn single_bit_branches_use_tbz_and_fall_back_past_its_range() {
         let options = &relax_session::Options::default();
         let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
