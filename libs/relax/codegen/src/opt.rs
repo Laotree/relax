@@ -392,6 +392,8 @@ pub const WHY_ARITY: u8 = 5;
 pub const WHY_FREE_SPENT: u8 = 6;
 pub const WHY_GROWTH: u8 = 7;
 pub const WHY_BUDGET: u8 = 8;
+/// an inspect experiment forbade it (`-inl@<slot>`)
+pub const WHY_FORBIDDEN: u8 = 9;
 
 impl SiteRemark {
     /// The refusal in words, with its numbers.
@@ -410,6 +412,7 @@ impl SiteRemark {
             WHY_FREE_SPENT => format!("the free-size allowance is spent: callee {} insts, {} left", self.size, self.a),
             WHY_GROWTH => format!("growth ceiling: the caller would grow to {} insts, ceiling {} (callee {} insts)", self.a, self.b, self.size),
             WHY_BUDGET => format!("inline budget spent: callee costs {} insts, {} left", self.a, self.b),
+            WHY_FORBIDDEN => "forbidden by an inspect experiment (noinline)".into(),
             _ => "kept a call".into(),
         }
     }
@@ -820,6 +823,24 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
                         _ => mk(WHY_GROWTH, priced, growth_limit),
                     }
                 });
+            }
+        }
+        // makepad inspect experiments (`ab <fn> b=inline:<callee>` / `noinline:`): MAKEPAD_RUN_OPT
+        // tokens `+inl@<slot>` / `-inl@<slot>` force or forbid this callee's sites
+        if !options.opt.is_empty() {
+            let tok = |p: &str| options.opt.iter().any(|t| t.strip_prefix(p).and_then(|x| x.parse::<u32>().ok()) == Some(id));
+            if tok("-inl@") {
+                pick = None;
+                why = Some(SiteRemark { pos: f.blocks[bi].pos.get(ii).copied().unwrap_or(0), callee: id, why: WHY_FORBIDDEN, hot: priorities[bi].1, size: 0, a: 0, b: 0 });
+            } else if pick.is_none() && tok("+inl@") && !ancestry[bi].contains(&id) {
+                if let Some((p, _)) = found {
+                    let callee: &Func = unsafe { &*p };
+                    if callee.params.len() == args.len() && callee.rets.len() == rets.len() && callee.blocks.iter().any(|b| matches!(b.term, Term::Ret(_))) {
+                        let size = inline_inst_count(callee);
+                        let growth = size.saturating_add(args.len()).saturating_sub(1);
+                        pick = Some((callee, RULE_ALWAYS, growth, size, size.saturating_sub(args.len() + rets.len() + 3), false, true, false));
+                    }
+                }
             }
         }
         if pick.is_none() {

@@ -12861,7 +12861,18 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
 
     let _cost = relax_codegen::fncost::Record::new(id, 1, "O3");
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
-    let options = &session.options;
+    // makepad inspect `ab`: an experiment's extra MAKEPAD_RUN_OPT tokens for this slot's inspect
+    // O3 build (never cached: inspect builds are not)
+    let exp_options;
+    let options = match crate::inspect::experiments::opts_for(id).filter(|_| inspect_o3_on()) {
+        Some(extra) => {
+            let mut o = session.options.clone();
+            o.opt.extend(extra);
+            exp_options = o;
+            &exp_options
+        }
+        None => &session.options,
+    };
     let runtime = &session.runtime;
     // Replay has one active O3 build, including live fallback builds: the whole build is one
     // unit call (its back end too), so it cannot race a caller's first-call build.
