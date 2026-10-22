@@ -1302,7 +1302,7 @@ impl<'a> Gen<'a> {
                 // readable at the next instruction (deferred reads)
                 if let Some(k) = deferred.take() {
                     let first = &b.insts[k];
-                    let done = self.shifted_operand(options, first, inst, true).is_some() || self.narrow_bswap(options, first, inst, true).is_some();
+                    let done = self.shifted_operand(options, first, inst, true).is_some() || self.narrow_bswap(options, first, inst, true).is_some() || self.mul_add(options, first, inst, true).is_some();
                     debug_assert!(done, "a deferred pair no longer matches");
                     continue;
                 }
@@ -1311,7 +1311,7 @@ impl<'a> Gen<'a> {
                     // register operand form (`eor d, a, b, lsl #13`); a 64-bit byte swap whose only
                     // use shifts the low half back down: the 32-bit forms (u32 / u16
                     // from_be_bytes: rev w; rev16 w). Emitted with the next instruction (above).
-                    if self.shifted_operand(options, inst, &b.insts[ii + 1], false).is_some() || self.narrow_bswap(options, inst, &b.insts[ii + 1], false).is_some() {
+                    if self.shifted_operand(options, inst, &b.insts[ii + 1], false).is_some() || self.narrow_bswap(options, inst, &b.insts[ii + 1], false).is_some() || self.mul_add(options, inst, &b.insts[ii + 1], false).is_some() {
                         deferred = Some(ii);
                         continue;
                     }
@@ -3173,6 +3173,43 @@ impl<'a> Gen<'a> {
         let ra = self.use_i(a, S1);
         let rd = self.def_i(d, S0);
         self.a.e(base | kind << 22 | (ra as u32) << 16 | k << 10 | (rx as u32) << 5 | rd as u32);
+        self.fin_i(d, rd);
+        Some(())
+    }
+
+    /// `t = a * b; d = c + t` (or `t + c`) is `madd d, a, b, c`, `d = c - t` is `msub` (64-bit, t
+    /// used once; b may be an immediate without a cheaper shift form, built in ip0). None: no match.
+    /// `emit` false: only whether the pair matches.
+    fn mul_add(&mut self, options: &relax_session::Options, m: &Inst, next: &Inst, emit: bool) -> Option<()> {
+        let (t, a, b) = match *m {
+            Inst::IBin(IOp::Mul, it, t, a, b) if it.bits == 64 && a != t && b != t => (t, a, Ok(b)),
+            Inst::IBinI(IOp::Mul, it, t, a, k) if it.bits == 64 && a != t && !(k > 0 && ((k & (k - 1)) == 0 || mul_shift_add(k).is_some())) => (t, a, Err(k)),
+            _ => return None,
+        };
+        if self.al.uses[t.0 as usize] != 1 || isel_flags(options) & A64_FUSE == 0 {
+            return None;
+        }
+        let (sub, d, c) = match *next {
+            Inst::IBin(IOp::Add, it, d, x, y) if it.bits == 64 && y == t && x != t => (false, d, x),
+            Inst::IBin(IOp::Add, it, d, x, y) if it.bits == 64 && x == t && y != t => (false, d, y),
+            Inst::IBin(IOp::Sub, it, d, x, y) if it.bits == 64 && y == t && x != t => (true, d, x),
+            _ => return None,
+        };
+        if !emit {
+            return Some(());
+        }
+        let rc = self.use_i(c, S0);
+        let ra = self.use_i(a, S1);
+        let rb = match b {
+            Ok(b) => self.use_i(b, IP0),
+            Err(k) => {
+                self.a.mov_imm(IP0, k);
+                IP0
+            }
+        };
+        let rd = self.def_i(d, S0);
+        // madd / msub xd, xa, xb, xc
+        self.a.e(if sub { 0x9B00_8000 } else { 0x9B00_0000 } | (rb as u32) << 16 | (rc as u32) << 10 | (ra as u32) << 5 | rd as u32);
         self.fin_i(d, rd);
         Some(())
     }
