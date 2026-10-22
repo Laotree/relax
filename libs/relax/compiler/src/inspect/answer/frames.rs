@@ -211,15 +211,15 @@ impl Frames {
     }
 }
 
+/// By the fn's path first (generated code's line table can point into std), by the file for an
+/// unidentified inline level.
 pub fn kind_of(at: &str, name: &str) -> Kind {
-    if at.contains("/relax/compiler/std/") || at.starts_with("std/") {
+    let n = name.strip_prefix("{closure} in ").unwrap_or(name).trim_start_matches('<');
+    if ["core::", "std::", "alloc::"].iter().any(|p| n.starts_with(p)) {
         return Kind::Std;
     }
-    if at.is_empty() {
-        let n = name.trim_start_matches('<');
-        if ["core::", "std::", "alloc::"].iter().any(|p| n.starts_with(p)) {
-            return Kind::Std;
-        }
+    if (name.starts_with("(inlined") || name.is_empty()) && (at.contains("/relax/compiler/std/") || at.starts_with("std/")) {
+        return Kind::Std;
     }
     Kind::Program
 }

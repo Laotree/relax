@@ -101,7 +101,14 @@ pub fn threads(a: &mut Answer) {
     let rt: Vec<&Value> = rows.iter().filter(|r| is_runtime_role(s(r, "role"))).collect();
     let busiest = rows.iter().max_by(|x, y| f(x, "cpu_ms").partial_cmp(&f(y, "cpu_ms")).unwrap_or(std::cmp::Ordering::Equal));
     let waiting: Vec<&&Value> = prog.iter().filter(|r| !s(r, "waits").is_empty()).collect();
-    let mut head = format!("{} threads: {} of the program, {} of makepad run.", rows.len(), prog.len(), rt.len());
+    let unnamed = prog.iter().filter(|r| s(r, "role") == "unnamed").count();
+    let mut head = format!(
+        "{} threads: {} of the program, {} of makepad run{}.",
+        rows.len(),
+        prog.len() - unnamed,
+        rt.len(),
+        if unnamed > 0 { format!(", {} unnamed (OS dispatch workers or unnamed program threads: `stacks thread=<id>` tells)", unnamed) } else { String::new() }
+    );
     if let Some(b) = busiest {
         head.push_str(&format!(" Most CPU since start: {} ({}) {} s = {} of all thread CPU.", s(b, "name"), s(b, "id"), sig(f(b, "cpu_ms") / 1000.0), pct(f(b, "cpu_ms") * 100.0 / total)));
     }

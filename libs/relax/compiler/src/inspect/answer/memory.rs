@@ -41,7 +41,7 @@ pub fn memory(a: &mut Answer) {
     }
     head.push(')');
     if let Some(d) = t.get("rss_since_last_mb") {
-        head.push_str(&format!(", {} since the last `memory`", super::num(Some(d)).map(|x| format!("{:+} MB", sig(x))).unwrap_or_default()));
+        head.push_str(&format!(", {} since the last `memory`", super::num(Some(d)).map(|x| format!("{}{} MB", if x >= 0.0 { "+" } else { "" }, sig(x))).unwrap_or_default()));
     }
     let prog = in_use + held;
     let runtime = arena_res + sp("burst_arena_committed_mb") + sp("jit_code_mb") + sp("jit_ro_data_mb");
@@ -69,13 +69,13 @@ pub fn memory(a: &mut Answer) {
         let shown: Vec<String> = os.iter().take(4).map(|(k, v)| format!("{} {}", k, mb(*v))).collect();
         a.line(&format!("OS mappings, resident (overlapping kinds; can exceed RSS): {}", shown.join(", ")));
     }
-    let grew: Vec<String> = nodes.iter().filter(|n| n.get("since_last_mb").is_some()).take(4).map(|n| format!("{} {:+}", s(n, "node"), sig(f(n, "since_last_mb")))).collect();
+    let grew: Vec<String> = nodes.iter().filter(|n| n.get("since_last_mb").is_some() && !s(n, "node").contains("DefaultMallocZone")).take(4).map(|n| format!("{} {}{}", s(n, "node"), if f(n, "since_last_mb") >= 0.0 { "+" } else { "" }, sig(f(n, "since_last_mb")))).collect();
     if !grew.is_empty() {
         a.line(&format!("changed since the last `memory` (MB): {}", grew.join(", ")));
     }
     if let Some(fd) = findings {
         for x in arr(&fd, "findings").iter().filter_map(Value::as_str) {
-            if x.starts_with("makepad run's own reservations") {
+            if x.starts_with("makepad run's own reservations") || x.contains("/DefaultMallocZone") || x.starts_with("regions") {
                 continue;
             }
             a.line(&format!("- {}", x));

@@ -354,6 +354,16 @@ fn report(run: &Run, n: usize, save: bool, out: &mut Out) {
         .map(|(id, ms, c)| format!("{{\"thread\":{},\"id\":\"{}\",\"cpu_ms\":{:.0},\"pct_of_samples\":{:.1}}}", json_str(&tname(*id)), super::tid_label(*id), ms, *c as f64 * 100.0 / total as f64))
         .collect();
     let rest: f64 = by_cpu.iter().skip(12).map(|x| x.1).sum();
+    // the busiest thread off its CPU: where it waits (the samples only see it running)
+    if let Some(&(id, ms, _)) = by_cpu.first() {
+        let wall = run.secs * 1000.0;
+        if ms < wall * 0.8 && ms > 0.0 {
+            let (seen, n) = off_cpu_stacks(id);
+            if let Some((k, c)) = seen.first() {
+                out.line(&format!("{{\"off_cpu\":{{\"tid\":\"{}\",\"pct\":{:.0},\"stack\":{},\"seen\":{},\"of\":{}}}}}", super::tid_label(id), (wall - ms) * 100.0 / wall.max(1.0), json_str(&short(k, 240)), c, n));
+            }
+        }
+    }
     out.line(&format!("{{\"threads\":[{}],\"other_threads\":{},\"other_cpu_ms\":{:.0}}}", threads.join(","), by_cpu.len().saturating_sub(12), rest));
     let _ = ms_per;
     // activity split
@@ -439,6 +449,36 @@ fn report(run: &Run, n: usize, save: bool, out: &mut Out) {
     let _ = frame_json;
 }
 
+/// Where thread `os_id` is when it is not on a CPU: its stack a few times (15 ms apart), the
+/// distinct tops ("__semwait_signal in std::sys::time::sleep from main (file:line)") most seen first.
+fn off_cpu_stacks(os_id: u64) -> (Vec<(String, usize)>, usize) {
+    let is_it = |t: &super::threads::Thread| t.os_id == os_id;
+    let mut seen: Vec<(String, usize)> = Vec::new();
+    let mut caps_n = 0;
+    for _ in 0..5 {
+        if let Ok(c) = super::capture_all(&is_it) {
+            if let Some(c) = c.first() {
+                let mut p2 = Vec::new();
+                let f: Vec<Vec<u64>> = vec![c.frames.iter().copied().take(24).collect()];
+                let sy = super::symbolise_within(&f, &mut p2, 300);
+                let fr = &sy[0];
+                let top = fr.first().map(|f| f.name.clone()).unwrap_or_default();
+                let prog = fr.iter().find(|f| super::is_program_frame(f)).map(|f| format!(" from {}{}", f.name, if f.at.is_empty() { String::new() } else { format!(" ({})", f.at) })).unwrap_or_default();
+                let jit = fr.iter().find(|f| f.module.starts_with("jit")).map(|f| format!(" in {}", f.name)).unwrap_or_default();
+                let k = format!("{}{}{}", top, jit, prog);
+                caps_n += 1;
+                match seen.iter_mut().find(|x| x.0 == k) {
+                    Some(x) => x.1 += 1,
+                    None => seen.push((k, 1)),
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    seen.sort_by(|a, b| b.1.cmp(&a.1));
+    (seen, caps_n)
+}
+
 /// `why-slow [s=3]`: ranked causes of where the main thread's time goes: its CPU split (program,
 /// compiles, Relax runtime, system), the hot program fns, and the owner's service while it ran.
 pub fn cmd_why_slow(req: &Req, out: &mut Out) {
@@ -496,8 +536,8 @@ pub fn cmd_why_slow(req: &Req, out: &mut Out) {
     // the program fn whose code the samples are in (its inlined copies counted with it)
     let mut phys: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for s in &main_samples {
-        if let Some(f) = s.iter().find(|f| f.module.starts_with("jit") && !f.at.contains("/compiler/std/") || f.levels.last().is_some_and(|l| !l.1.contains("/compiler/std/"))) {
-            let n = f.levels.last().map_or(f.name.clone(), |l| l.0.clone());
+        // the innermost frame whose physical fn (the code it is in) is the program's
+        if let Some(n) = s.iter().filter(|f| f.module.starts_with("jit")).map(|f| f.levels.last().map_or(f.name.clone(), |l| l.0.clone())).find(|n| !super::is_std_fn(n) && !n.starts_with("jit 0x") && !n.starts_with("slot#")) {
             *phys.entry(n).or_default() += 1;
         }
     }
@@ -534,30 +574,7 @@ pub fn cmd_why_slow(req: &Req, out: &mut Out) {
     // where main is when it is not on a CPU: a few stack captures (the samples only see it running)
     let off = (wall_ms - main_cpu_ms).max(0.0);
     if off > wall_ms * 0.2 {
-        let is_main = |t: &super::threads::Thread| t.os_id == main_id;
-        let mut seen: Vec<(String, usize)> = Vec::new();
-        let mut caps_n = 0;
-        for _ in 0..5 {
-            if let Ok(c) = super::capture_all(&is_main) {
-                if let Some(c) = c.first() {
-                    let mut p2 = Vec::new();
-                    let f: Vec<Vec<u64>> = vec![c.frames.iter().copied().take(24).collect()];
-                    let sy = super::symbolise_within(&f, &mut p2, 300);
-                    let fr = &sy[0];
-                    let top = fr.first().map(|f| f.name.clone()).unwrap_or_default();
-                    let prog = fr.iter().find(|f| f.module.starts_with("jit") && !f.at.contains("/compiler/std/") && !f.name.starts_with("(inlined")).map(|f| format!(" from {}{}", f.name, if f.at.is_empty() { String::new() } else { format!(" ({})", f.at) })).unwrap_or_default();
-                    let jit = fr.iter().find(|f| f.module.starts_with("jit")).map(|f| format!(" in {}", f.name)).unwrap_or_default();
-                    let k = format!("{}{}{}", top, jit, prog);
-                    caps_n += 1;
-                    match seen.iter_mut().find(|x| x.0 == k) {
-                        Some(x) => x.1 += 1,
-                        None => seen.push((k, 1)),
-                    }
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(15));
-        }
-        seen.sort_by(|a, b| b.1.cmp(&a.1));
+        let (seen, caps_n) = off_cpu_stacks(main_id);
         if let Some((k, c)) = seen.first() {
             findings.push((main_cpu_ms - 0.001, format!("main off CPU {:.0}% of the time ({:.0} ms); its stack then ({} of {} captures): {}", off * 100.0 / wall_ms.max(1.0), off, c, caps_n, short(k, 240))));
         }

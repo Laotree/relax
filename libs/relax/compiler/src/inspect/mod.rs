@@ -273,6 +273,8 @@ fn role(name: &str, os_id: u64, handle: u64) -> &'static str {
         n if n.starts_with("run-inspect") || n.starts_with("makepad-remote") => "inspect",
         n if n.starts_with("run-spec") || n.starts_with("run-O2") || n.starts_with("run-o3") || n.starts_with("run-ahead") || n.starts_with("gandalf") || n.starts_with("run-check") => "compiler",
         n if n.starts_with("run-") => "makepad run",
+        // an unnamed thread: the OS's dispatch workers, or a program thread spawned without a name
+        "" => "unnamed",
         _ => "program",
     }
 }
@@ -652,6 +654,18 @@ pub(crate) fn staged_path(name: &str) -> String {
     let dir = std::env::temp_dir().join(format!("relax-probes-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     dir.join(name).to_string_lossy().into_owned()
+}
+
+/// A frame of Relax's std / core (by its fn path; the line table of generated std glue can point
+/// anywhere), not the program's.
+pub(crate) fn is_std_fn(name: &str) -> bool {
+    let n = name.strip_prefix("{closure} in ").unwrap_or(name).trim_start_matches('<');
+    ["core::", "std::", "alloc::"].iter().any(|p| n.starts_with(p))
+}
+
+/// The program's own JIT frame: not std, not a JIT trampoline, not an unidentified inline level.
+pub(crate) fn is_program_frame(f: &Frame) -> bool {
+    f.module.starts_with("jit") && !is_std_fn(&f.name) && !f.name.starts_with("jit 0x") && !f.name.starts_with("(inlined") && !f.name.starts_with("slot#")
 }
 
 /// One frame as a short JSON object.

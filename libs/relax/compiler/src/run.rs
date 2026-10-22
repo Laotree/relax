@@ -2167,7 +2167,8 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
     let (runtime, options, present_forward) = crate::zone_alloc::kept_with(|| (runtime.clone(), options.clone(), present_forward.clone()));
     let _k = crate::zone_alloc::kept();
     { let _k = crate::zone_alloc::kept();
-    std::thread::spawn(move || {
+    // named: inspect lists it as makepad run's, not the program's
+    let _ = std::thread::Builder::new().name("run-monitor".into()).spawn(move || {
         let runtime = &runtime;
         let options = &options;
         // A measurement harness requests an allocator snapshot at its own landmark

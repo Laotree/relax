@@ -15,7 +15,7 @@ H<n> heap site, P<n> panic, K<n> breakpoint, G<n> probe group, F<n> frame, V<n> 
 - JIT code: `versions <fn|S<n>>`, `tier <fn> o1|o3|auto`, `count <fn>`
 - frames / hitches: `timeline start`, `timeline frames`, `frame F12`, `events on=hitch`
 - threads: `threads`, `stacks`; Splash VMs: `vms`; GPU memory: `gpu top`
-Every command: `as=json` gives the JSON lines (for programs); `help <cmd>` the full description.";
+Every command: `as=json` gives the JSON lines (for programs).";
 
 pub fn help(a: &mut Answer) {
     let rows = a.take("cmd");
@@ -26,23 +26,10 @@ pub fn help(a: &mut Answer) {
         }
         return;
     }
-    a.head = format!("makepad inspect: {} commands.", rows.len());
+    a.head = format!("makepad inspect: {} commands; `help <cmd>` gives one's arguments and answer.", rows.len());
     a.line(START);
-    a.line("");
-    let mut t = Table::new(&["command", "args", "answers"]);
-    for r in &rows {
-        let w = s(r, "answers");
-        // the first clause: the full text is `help <cmd>`
-        let cut = [": ", "; ", " -- ", " ("].iter().filter_map(|p| w.find(p)).min().unwrap_or(w.len()).min(90);
-        let mut short = w[..w.char_indices().map(|(i, _)| i).find(|&i| i >= cut).unwrap_or(w.len())].to_string();
-        if short.len() < w.len() {
-            short.push_str(" ..");
-        }
-        let args = s(r, "args");
-        let args = if args.len() > 60 { format!("{} ..", &args[..args.char_indices().map(|(i, _)| i).take_while(|&i| i <= 56).last().unwrap_or(0)]) } else { args.to_string() };
-        t.row(vec![s(r, "cmd").into(), args, short]);
-    }
-    a.line(&t.md());
+    let names: Vec<&str> = rows.iter().map(|r| s(r, "cmd")).collect();
+    a.line(&format!("all commands: {}", names.join(", ")));
 }
 
 // ------------------------------------------------------------------ events
@@ -314,7 +301,7 @@ pub fn frames(a: &mut Answer) {
     a.line("slowest frames:");
     a.line(&t.md());
     if rows.len() > 8 {
-        a.line(&format!("+{} more slow frames listed by `timeline frames n={}` (as=json)", rows.len() - 8, rows.len()));
+        a.line(&format!("+{} more slow frames not shown (the next is {} ms)", rows.len() - 8, sig(f(&rows[8], "ms"))));
     }
     if let Some(r) = slow {
         a.more(format!("frame {}", s(r, "frame")));

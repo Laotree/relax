@@ -118,7 +118,7 @@ pub fn why_hung(req: &Req, out: &mut Out) {
         let w = wait_of(c.t.handle).map(|w| super::wait_text(w, &list));
         // where: the program's innermost frame and the std call it is in (`Mutex::lock in post_ledger at ..`)
         let fr = &syms[i];
-        let prog = fr.iter().position(|f| f.module.starts_with("jit") && !f.at.contains("/compiler/std/") && !f.name.starts_with("(inlined"));
+        let prog = fr.iter().position(super::is_program_frame);
         let top = match prog {
             Some(p) => {
                 let callee = fr[..p].iter().rev().find(|f| f.module.starts_with("jit") && !f.name.starts_with("(inlined") && !f.name.starts_with("std::sys::") && !f.name.starts_with("std::sync::raw"));

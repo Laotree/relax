@@ -82,6 +82,10 @@ pub fn prof(a: &mut Answer) {
             a.line(&format!("+{} more threads under 1% of a core, {} CPU together", n_small, ms(ms_small)));
         }
     }
+    if let Some(o) = a.take1("off_cpu").and_then(|x| x.get("off_cpu").cloned()) {
+        let st = a.names.text(s(&o, "stack"));
+        a.head.push_str(&format!(" Off CPU {}% of the time: {} ({} of {} stack captures).", f(&o, "pct"), meaning_of(&st), f(&o, "seen"), f(&o, "of")));
+    }
     if let Some(Value::Obj(p)) = act.as_ref().and_then(|x| x.get("activity_pct")) {
         let parts: Vec<String> = p.iter().map(|(k, v)| format!("{} {}", k, pct(super::num(Some(v)).unwrap_or(0.0)))).collect();
         a.line(&format!("samples by activity: {}", parts.join(", ")));
@@ -136,7 +140,13 @@ pub fn prof(a: &mut Answer) {
 
 pub fn why_slow(a: &mut Answer) {
     let rows = a.take("finding");
-    let list: Vec<String> = rows.iter().map(|r| a.names.text(s(r, "finding"))).collect();
+    let list: Vec<String> = rows.iter().map(|r| {
+        let t = a.names.text(s(r, "finding"));
+        match t.split_once("): ") {
+            Some((h, st)) if h.contains("off CPU") => format!("{}): {}", h, meaning_of(st)),
+            _ => t,
+        }
+    }).collect();
     if let Some(first) = list.first() {
         a.head = format!("{}.", first.trim_end_matches('.'));
     }
@@ -146,4 +156,13 @@ pub fn why_slow(a: &mut Answer) {
     a.more("prof threads=main s=5");
     a.more("why-hung");
     a.more("stacks thread=main");
+}
+
+/// "__semwait_signal in std::sys::time::sleep from main (..)" -> "sleeping in std::sys::time::sleep from main (..)".
+pub fn meaning_of(stack: &str) -> String {
+    let (top, rest) = stack.split_once(' ').unwrap_or((stack, ""));
+    match super::frames::meaning(top) {
+        Some(m) => format!("{} ({}) {}", m, top, rest).trim().to_string(),
+        None => stack.to_string(),
+    }
 }
