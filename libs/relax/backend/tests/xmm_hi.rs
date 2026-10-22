@@ -182,7 +182,7 @@ fn many_live_fma_operands() {
 
 #[test]
 fn block_copies_of_every_size() {
-    // Copy of 32..=512 bytes (ymm31 on AVX-512VL hosts, xmm / gpr pieces otherwise)
+    // Copy of 32..=512 bytes (16-byte xmm pieces, then 8/4/2/1-byte gpr pieces)
     for n in [32u32, 33, 47, 48, 63, 64, 100, 200, 255, 256, 300, 511, 512] {
         let mut f = Func::new("copy".into(), 0);
         let (ps, pd) = (f.vreg(Cls::I), f.vreg(Cls::I));
