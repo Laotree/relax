@@ -1611,9 +1611,9 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                             if let (Some(pa), Some(pb)) = (arm(a1), arm(b1)) {
                                 // two constant leaves: the select-of-constants folds below (and the
                                 // phi distribution) take it, unless every outcome is the same
-                                let konst_leaf = |p: &(Option<VReg>, [Result<i64, (VReg, bool)>; 2])| p.0.is_none() && p.1[0].is_ok();
+                                let konst = |v: VReg| matches!(kn[v.0 as usize], Some(K::I(_)));
                                 let same = pa.1.iter().chain(pb.1.iter()).all(|o| *o == pa.1[0]) && pa.1[0].is_ok();
-                                if (pa.0.is_none() || pb.0.is_none()) && (same || !(konst_leaf(&pa) && konst_leaf(&pb))) {
+                                if (pa.0.is_none() || pb.0.is_none()) && (same || !(konst(a1) && konst(b1))) {
                                     let pos = f.blocks[bi].pos[ii];
                                     let mut insts = Vec::new();
                                     let out = |f: &mut Func, insts: &mut Vec<Inst>, o: &Result<i64, (VReg, bool)>| -> VReg {
