@@ -337,14 +337,15 @@ fn analyse(l: &FrameLog, t0: u64, t1: u64) -> String {
     let mut stack: Vec<(&'static str, u64, u64)> = Vec::new();
     let mut phases: Vec<(String, u64, u64, u32)> = Vec::new();
     let mut waits: Vec<(String, u64, u64, u32)> = Vec::new();
-    let mut wait_open: Vec<(String, u64)> = Vec::new();
+    // open waits: (label, begin, kind name; the end record carries no kind)
+    let mut wait_open: Vec<(String, u64, &'static str)> = Vec::new();
     // the UI thread's waits for the owner thread: (begin, end, label), for what the owner served
     let mut owner_waits: Vec<(u64, u64, String)> = Vec::new();
     // the critical path: (what, ns) pieces in order
     let mut path: Vec<(String, u64)> = Vec::new();
     let mut compile_open = 0u32;
     let mut cur_t = t0;
-    let what_now = |stack: &[(&'static str, u64, u64)], wait_open: &[(String, u64)], compile_open: u32| -> String {
+    let what_now = |stack: &[(&'static str, u64, u64)], wait_open: &[(String, u64, &'static str)], compile_open: u32| -> String {
         if let Some(w) = wait_open.last() {
             format!("wait: {}", w.0)
         } else if compile_open > 0 {
@@ -390,11 +391,11 @@ fn analyse(l: &FrameLog, t0: u64, t1: u64) -> String {
                     }
                 }
             }
-            3 => wait_open.push((if r.detail.is_empty() { r.name.to_string() } else { format!("{} ({})", r.name, r.detail) }, r.t)),
+            3 => wait_open.push((if r.detail.is_empty() { r.name.to_string() } else { format!("{} ({})", r.name, r.detail) }, r.t, r.name)),
             4 => {
-                if let Some((k, b)) = wait_open.pop() {
+                if let Some((k, b, kind)) = wait_open.pop() {
                     let dur = r.t.saturating_sub(b);
-                    if r.name == "owner" {
+                    if kind == "owner" {
                         owner_waits.push((b, r.t, k.clone()));
                     }
                     match waits.iter_mut().find(|w| w.0 == k) {
@@ -1186,5 +1187,31 @@ fn save_cmd(out: &mut Out) {
     match std::fs::write(&path, &file) {
         Ok(()) => out.line(&format!("{{\"saved\":{},\"records\":{},\"lanes\":{},\"bytes\":{},\"more\":[\"makepad inspect file={} pf summary\"]}}", json_str(&path.display().to_string()), n_recs, lanes.len(), file.len(), path.display())),
         Err(e) => out.err(&format!("cannot write {}: {}", path.display(), e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A hitch's owner_waits come from the UI thread's waits of kind owner (the end record carries
+    /// no kind: the begin's names it).
+    #[test]
+    fn hitch_names_its_owner_waits() {
+        let rec = |t: u64, kind: u8, name: &'static str, detail: &'static str| super::FRec { t, kind, name, detail };
+        let l = super::FrameLog {
+            depth: 0,
+            start: 1,
+            avg: 0,
+            last_root_end: 0,
+            idle: 0,
+            recs: vec![rec(1_000, 3, "owner", "main"), rec(3_001_000, 4, "none", ""), rec(3_002_000, 3, "futex", ""), rec(9_002_000, 4, "none", "")],
+            dropped: 0,
+            compile_depth: 0,
+            compile_t0: 0,
+            compile_ns: 0,
+            compiles: 0,
+            probes0: Vec::new(),
+        };
+        let s = super::analyse(&l, 0, 10_000_000);
+        assert!(s.contains("\"owner_waits\":[{\"wait\":\"owner (main)\",\"at_ms\":0.0,\"ms\":3.00,"), "{s}");
     }
 }
