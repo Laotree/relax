@@ -11655,7 +11655,7 @@ fn rt_loop_hot(counter: u64, fp: u64) {
                 if again(c) {
                     queue_loop(u, c, rate);
                 }
-                if (*tier_rec(&u.slots, c).add(5)).load(Ordering::Relaxed) & !REARMED > SMALL_CODE {
+                if (*tier_rec(&u.slots, c).add(5)).load(Ordering::Relaxed) & CODE_BYTES > SMALL_CODE {
                     big += 1;
                     if big >= LOOP_BIG_CALLERS {
                         break;
@@ -12097,6 +12097,14 @@ unsafe fn relower_twin_callers(up: *mut Unit, tc: &TwinCallers) {
 /// Tier record word 5 (O1 code bytes): the slot was counted again once (tier_revalidate) and
 /// queued since: its next build goes ahead whatever its age.
 const REARMED: u64 = 1 << 63;
+/// Tier record word 5, bits 48..52: the count windows in a row that were too slow (rt_hot)
+const SLOW_SHIFT: u64 = 48;
+/// ... after this many the count stub is taken out of the slot (rt_hot)
+const SLOW_RETIRE: u64 = 4;
+/// Tier record word 5: the O1 code bytes
+const CODE_BYTES: u64 = (1 << SLOW_SHIFT) - 1;
+/// count stubs taken out of their slots after SLOW_RETIRE slow windows
+pub static STUBS_RETIRED: AtomicU64 = AtomicU64::new(0);
 /// A calls / loop entry older than this is counted again (tier_revalidate).
 const REVALIDATE_NS: u64 = 1_000_000_000;
 /// O3 queue entries counted again (they had gone cold before their build)
@@ -12341,7 +12349,7 @@ pub(crate) fn tier1_stats_report() {
     let s = g.as_ref().unwrap_or(&empty);
     let ms = |ns: u64| ns as f64 / 1e6;
     eprintln!("makepad-run o3-stats: builds={} cpu_ms={:.3} max_threads={} in_flight={} (completed attempts; Windows CPU is cycle-estimated)", s.builds, ms(s.cpu), s.max_active, s.active);
-    eprintln!("makepad-run o3-stats: pgo counted_builds={} counted_cpu_ms={:.3} counted_dropped={}", PGO_STATS[0].load(Ordering::Relaxed), ms(PGO_STATS[1].load(Ordering::Relaxed)), PGO_STATS[2].load(Ordering::Relaxed));
+    eprintln!("makepad-run o3-stats: pgo counted_builds={} counted_cpu_ms={:.3} counted_dropped={} stubs_retired={}", PGO_STATS[0].load(Ordering::Relaxed), ms(PGO_STATS[1].load(Ordering::Relaxed)), PGO_STATS[2].load(Ordering::Relaxed), STUBS_RETIRED.load(Ordering::Relaxed));
     eprintln!("makepad-run o3-stats: phases_cpu_ms snapshot={:.3} backend={:.3} install={:.3}", ms(s.phases[0]), ms(s.phases[1]), ms(s.phases[2]));
     let passes: Vec<String> = relax_backend::stats::PASS_NAMES.iter().enumerate().map(|(i, n)| format!("{}={:.3}", n, ms(s.passes[i]))).collect();
     eprintln!("makepad-run o3-stats: backend_pass_ms {} (pass slots can overlap; MAKEPAD_RUN_PASS_TIMES=wall selects wall time)", passes.join(" "));
@@ -12933,6 +12941,18 @@ fn rt_hot(slot: u64) -> u64 {
             }
             (*rec.add(4)).store(now, Ordering::Relaxed);
             note_slow_base(u, slot as u32);
+            // SLOW_RETIRE slow windows in a row: the stub goes (lukewarm code called a few hundred
+            // times a frame paid a cold stub call each time for the whole session: 2.2% of the race's
+            // UI cycles). Its loop counters still queue it; new code (a patch, O2) counts again.
+            let w = (*rec.add(5)).load(Ordering::Relaxed);
+            let slow = (w >> SLOW_SHIFT) & 0xf;
+            if slow + 1 >= SLOW_RETIRE {
+                if s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    STUBS_RETIRED.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                (*rec.add(5)).store((w & !(0xf << SLOW_SHIFT)) | (slow + 1) << SLOW_SHIFT, Ordering::Relaxed);
+            }
             return code;
         }
         // The queue lock is taken only if free (a calling program thread never waits on it: O3
@@ -13044,7 +13064,7 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
                 let u = &*up;
                 let calls = u.tier1.as_ref().map_or(0, |t| t.calls);
                 (rate as u128) * (CALL_FAST_NS as u128) < (calls as u128) * 1_000_000_000
-                    && (*tier_rec(&u.slots, id).add(5)).load(Ordering::Relaxed) & !REARMED > SMALL_CODE
+                    && (*tier_rec(&u.slots, id).add(5)).load(Ordering::Relaxed) & CODE_BYTES > SMALL_CODE
             };
             // PGO: its counted build first; the O3 build follows once that code has run
             if unsafe { counted_build(up, id, lukewarm) } {
