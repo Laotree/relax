@@ -23,7 +23,7 @@ enum Out {
     Panic(u64, u64, Vec<u8>, usize),
 }
 
-/// Blocks executed past the original function's 8 (axpy shapes): the clone ran.
+// Blocks executed past the original function's 8 (axpy shapes): the clone ran.
 thread_local! { static CLONE_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 /// Integer-only evaluator: memory is one byte vector, pointers are offsets into it. A Host call

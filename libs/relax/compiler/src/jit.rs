@@ -9631,16 +9631,6 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     if cfg.fold && !relax_backend::stats::opt_off(options, "-smallsets") && relax_codegen::opt::fold_small_sets(func) {
         relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
     }
-    // loads of a noalias parameter's fields that every path reaches with the value known
-    if cfg.fold && relax_codegen::opt::forward_param_fields(options, func) {
-        relax_backend::passes::live_dce(func);
-        relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
-    }
-    // stores to those fields that every path overwrites before anything may read them
-    if cfg.fold && relax_codegen::opt::dead_param_field_stores(options, func) {
-        relax_backend::passes::dce(func);
-        relax_backend::passes::live_dce(func);
-    }
     // bounds checks the counted loop's range implies once a guard in front of it holds: a
     // check-free clone (rotation, unrolling, vectorisation take it), the original as fallback
     if cfg.fold && relax_codegen::version::version_bounds_loops(options, func) {
