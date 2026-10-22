@@ -366,7 +366,9 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
         Err(e) => return Outcome::Retry(format!("quiesce: {e}")),
     };
     tl.quiesce = ms(t_all);
-    let hurry = || ms(t_all) > 2500.0 || { let s = GATED_MAIN.load(Ordering::SeqCst); s != 0 && wall_ns().saturating_sub(s) > 250_000_000 };
+    // the main thread waiting at the gate ends the swap at the next step, as in the quiesce (30 ms):
+    // 250 ms here let a swap hold the UI for its encode + restore (the user's Sandbox: 2.1 s swap)
+    let hurry = || ms(t_all) > 2500.0 || { let s = GATED_MAIN.load(Ordering::SeqCst); s != 0 && wall_ns().saturating_sub(s) > 30_000_000 };
 
     // 3. the front images the store does not have yet
     let t = Instant::now();

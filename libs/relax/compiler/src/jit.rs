@@ -11151,11 +11151,9 @@ fn profile_write() {
 /// for a benchmark that times only once the optimised code has settled: `pending` = builds queued or
 /// running or counting (PGO), plus one while the startup phase holds the workers; `installs` = O3 installs so far.
 /// The file exists from the first write on; a program that never reads it pays nothing.
-/// The O3 state for the settling indicator (postframe::settle_progress): builds queued or
-/// running now, and O3 installs so far.
-pub(crate) fn o3_settle_state() -> (u64, u64) {
-    let pending = TIER_QUEUE.lock().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len());
-    (pending as u64, TIER1_INSTALLS.load(Ordering::Relaxed))
+/// O3 builds queued or running now (postframe::activity, the run's activity badge).
+pub(crate) fn o3_pending() -> u64 {
+    (TIER_QUEUE.lock().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len())) as u64
 }
 
 fn o3_progress_write(last: &mut std::time::Instant) {
@@ -12035,8 +12033,14 @@ const O3_BURST_PER: usize = 8;
 /// Burst worker `j` (0 = the first past the level's workers) may build now: the program has
 /// presented its first frame and more than O3_BURST_PER * (j + 1) builds wait.
 fn tier1_burst_admits(j: usize, queued: usize) -> bool {
-    FIRST_PRESENT.load(Ordering::Acquire) && queued > O3_BURST_PER * (j + 1)
+    // only while the UI thread has not waited on the JIT for a second: a level load's thousands
+    // of lazy compiles (each typed and lowered on the UI thread) never share the cores with the
+    // burst (the user's cold Sandbox: 11 burst workers ran through the 'leap' load)
+    FIRST_PRESENT.load(Ordering::Acquire) && queued > O3_BURST_PER * (j + 1) && crate::postframe::ui_idle_ns() >= BURST_UI_QUIET_NS
 }
+
+/// the UI thread's JIT-idle time burst workers wait for
+const BURST_UI_QUIET_NS: u64 = 1_000_000_000;
 
 /// Opt-in only: no extra clocks, pass timing, allocations or statistics locks when off.
 fn tier1_stats_on() -> bool {
