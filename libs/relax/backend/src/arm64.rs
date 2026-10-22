@@ -94,7 +94,26 @@ pub fn reg_config() -> RegConfig {
         store_imm: |k| k == 0,
         fconst_remat: true,
         mem_operands: false,
+        remat_cost: arm64_remat_cost,
     }
+}
+
+/// Instructions Gen::remat_into / mov_imm take to recompute a value (RegConfig::remat_cost): a
+/// constant is one orr for a logical immediate, else one movz / movn plus a movk per remaining
+/// halfword that is neither all zeros nor all ones; addresses and slot offsets one.
+fn arm64_remat_cost(r: &Remat) -> u8 {
+    let Remat::Const(v) = *r else { return 1 };
+    let u = v as u64;
+    let (mut zeros, mut ones) = (0u8, 0u8);
+    for k in 0..4 {
+        let h = (u >> (16 * k)) & 0xffff;
+        zeros += (h == 0) as u8;
+        ones += (h == 0xffff) as u8;
+    }
+    if zeros.max(ones) < 3 && bitmask_imm(u).is_some() {
+        return 1;
+    }
+    (4 - zeros.max(ones)).max(1)
 }
 
 /// Registers an instruction overwrites while it runs (RegConfig::clobbers): only an asm! block

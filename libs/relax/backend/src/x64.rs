@@ -923,7 +923,7 @@ pub fn reg_config(options: &relax_session::Options) -> RegConfig {
         int_caller.push(RCX);
         int_caller.push(RDX);
     }
-    RegConfig { int_caller, int_callee: CALLEE_SAVED.to_vec(), flt_caller: flt, flt_callee: Vec::new(), slot_index_free: true, clobbers: Some(x64_clobbers), sym_class: 0, store_imm: |k| k == k as i32 as i64, fconst_remat: false, mem_operands: true }
+    RegConfig { int_caller, int_callee: CALLEE_SAVED.to_vec(), flt_caller: flt, flt_callee: Vec::new(), slot_index_free: true, clobbers: Some(x64_clobbers), sym_class: 0, store_imm: |k| k == k as i32 as i64, fconst_remat: false, mem_operands: true, remat_cost: |_| 1 }
 }
 
 // ------------------------------------------------------------ code generation

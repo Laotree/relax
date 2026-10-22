@@ -34,6 +34,10 @@ pub struct RegConfig {
     /// instructions read a spilled operand from its slot themselves (x64 `op r, [slot]`, a load
     /// straight into the result): such a read costs no instruction of its own (second_chance)
     pub mem_operands: bool,
+    /// instructions that recompute a value at a use (Alloc::remat): arm64 builds a 64-bit
+    /// constant in up to four (movz / movk). A recomputation dearer than a reload ranks with the
+    /// instructions it costs, crosses calls in a register, and spills when no register is left
+    pub remat_cost: fn(&Remat) -> u8,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1095,8 +1099,9 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                 l += lens[u as usize];
             }
         }
-        // recomputing costs about what a reload does, without the store: half the weight
-        weight[v as usize] = prio(options, r, l) * if remat[v as usize].is_some() { 0.5 } else { 1.0 };
+        // recomputing costs about what a reload does, without the store: half the weight (times the
+        // instructions a recomputation takes: an arm64 64-bit constant is up to four)
+        weight[v as usize] = prio(options, r, l) * if remat[v as usize].is_some() { 0.5 * (cfg.remat_cost)(&remat[v as usize]) as f32 } else { 1.0 };
         if low.map_or(false, |lw| lw.get(v as usize).copied().unwrap_or(false)) {
             weight[v as usize] *= 1e-6;
         }
@@ -1200,7 +1205,8 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         let cold_cross = crossing && cross_w(r) < 0.5 * entry_w;
         // a recomputed value never pays for a call: no callee-saved register (push / pop on
         // every entry) and no saves around calls; it is recomputed after them instead
-        if crossing && remat[v as usize].is_some() {
+        let cheap_remat = remat[v as usize].is_some() && (cfg.remat_cost)(&remat[v as usize]) <= 1;
+        if crossing && cheap_remat {
             loc[v as usize] = Loc::None;
             if let Some(m) = unit_members(v) {
                 for &u in m {
@@ -1320,7 +1326,8 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                     Loc::Flt(c)
                 }
             }
-            None if remat[v as usize].is_some() => Loc::None,
+            // a dear recomputation (several instructions per use) spills instead: one load per use
+            None if cheap_remat => Loc::None,
             None => {
                 // vectors: 16-aligned offsets (backends address slots downwards)
                 spill_bytes = grow_spill(spill_bytes, f.vregs[v as usize]);
