@@ -6426,7 +6426,8 @@ pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> b
         let deref = |o: i64, m: Mem| dr.iter().any(|(q, sz)| *q == p && o >= 0 && o + mem_size(m) as i64 <= *sz as i64);
         let mut out = vec![all; nb];
         let mut inn = vec![0u64; nb];
-        let mut pre_left = 32;
+        let joins = relax_backend::stats::opt_env_off("+fieldjoins");
+        let mut pre_left = if joins { 32 } else { 0 };
         loop {
             let nb = f.blocks.len();
             if out.len() < nb {
@@ -6443,7 +6444,10 @@ pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> b
                     if !reach[bi] {
                         continue;
                     }
-                    let mut st = if bi == 0 { 0 } else { preds[bi].iter().fold(all, |a, &q| a & out[q as usize]) };
+                    // within extended basic blocks only (one predecessor): a value carried over a
+                    // join or a loop's back edge lives in a register across the whole region,
+                    // and in big state machines (brotli) those registers spill (+40% instructions)
+                    let mut st = if bi == 0 || (!joins && preds[bi].len() != 1) { 0 } else { preds[bi].iter().fold(all, |a, &q| a & out[q as usize]) };
                     inn[bi] = st;
                     for i in &f.blocks[bi].insts {
                         st = apply(st, eff(i));
@@ -6565,7 +6569,12 @@ pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> b
                     Inst::Load(m, d, base, off) if field_of(m, base, off).map_or(false, |j| vars[j].is_some()) => {
                         let v = vars[field_of(m, base, off).unwrap()].unwrap();
                         if fwd.iter().any(|x| x.0 == bi && x.1 == k) {
-                            ins.push(Inst::Mov(d, v));
+                            // the variable holds the stored register (its low bytes are the
+                            // field's): the load's extension of them
+                            ins.push(match m {
+                                Mem::Int(n, sg) if n < 8 => Inst::Conv(Conv::IntToInt(IntTy { bits: n * 8, signed: sg }), d, v),
+                                _ => Inst::Mov(d, v),
+                            });
                             pos.push(ps);
                         } else {
                             ins.push(i);
@@ -6578,11 +6587,7 @@ pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> b
                         let v = vars[field_of(m, base, off).unwrap()].unwrap();
                         ins.push(i);
                         pos.push(ps);
-                        // the value a load of this type returns
-                        ins.push(match m {
-                            Mem::Int(n, sg) if n < 8 => Inst::Conv(Conv::IntToInt(IntTy { bits: n * 8, signed: sg }), v, x),
-                            _ => Inst::Mov(v, x),
-                        });
+                        ins.push(Inst::Mov(v, x));
                         pos.push(ps);
                     }
                     _ => {
