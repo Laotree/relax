@@ -3733,6 +3733,13 @@ impl Program {
         true
     }
 
+    /// The imports from `i0` that are still open and name something an unresolved import is an
+    /// error for (import_reportable: not a macro, not bound in the other namespace).
+    pub fn open_reportable_imports(&self, i0: usize) -> Vec<usize> {
+        let mut macro_binds: Option<crate::fxhash::HashSet<Sym>> = None;
+        (i0..self.imports.len()).filter(|&i| !self.imports[i].done && self.import_reportable(i, &mut macro_binds)).collect()
+    }
+
     /// Unresolved imports (from `i0`) become errors.
     fn report_unresolved_imports(&mut self, i0: usize) {
         let mut macro_binds: Option<crate::fxhash::HashSet<Sym>> = None;
@@ -4288,13 +4295,34 @@ impl Program {
         }
         // `$crate` from another crate's macro: `::__relax_crate_<name>` is that crate by identity
         if let Some(cn) = self.syms.str(name).strip_prefix("__relax_crate_") {
-            for (i, c) in self.crates.iter().enumerate() {
-                if self.syms.str(c.name) == cn {
-                    return Some(i as u32);
+            return self.dollar_crate(krate, cn);
+        }
+        None
+    }
+
+    /// The crate `$crate` of a macro defined in crate `name` denotes in code of crate `krate`
+    /// (rustc: the macro's defining crate, carried by hygiene). The expansion spells it by name,
+    /// and the program can hold two crates of one name: a domain relaunched after a Cargo graph
+    /// change loads new revisions of changed crates next to the old ones (domain.rs load_graph).
+    /// The defining crate is the one `krate` depends on (a macro reaches code only through the
+    /// dependency graph), nearest first; outside that graph, the newest crate of the name (the
+    /// macro table resolves a name to its newest definition).
+    fn dollar_crate(&self, krate: u32, name: &str) -> Option<u32> {
+        let named = |k: u32| self.syms.str(self.crates[k as usize].name) == name;
+        let mut seen = vec![false; self.crates.len()];
+        let mut queue = std::collections::VecDeque::from([krate]);
+        seen[krate as usize] = true;
+        while let Some(k) = queue.pop_front() {
+            if named(k) {
+                return Some(k);
+            }
+            for &(_, d) in &self.crates[k as usize].deps {
+                if !std::mem::replace(&mut seen[d as usize], true) {
+                    queue.push_back(d);
                 }
             }
         }
-        None
+        (0..self.crates.len() as u32).rev().find(|&k| named(k))
     }
 
     /// Resolves a path to a container (module, enum, trait, type). `from_root`: 2015-style
