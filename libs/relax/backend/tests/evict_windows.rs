@@ -40,7 +40,9 @@ fn push(f: &mut Func, b: u32, i: Inst) {
 
 /// long values l[k] (L of them), temporaries t[k] (T of them); the latch redefines every
 /// `redef`-th long value (0: none).
-fn build(l_n: usize, t_n: usize, redef: usize) -> Func {
+/// `branchy`: the burst block ends in a branch on a long value (l[0] & 1), both ways to the long
+/// values' block (one through an extra block): a long value read right after the burst.
+fn build(l_n: usize, t_n: usize, redef: usize, branchy: bool) -> Func {
     let mut f = Func::new("evict_windows".into(), 0);
     let (n, seed) = (f.vreg(Cls::I), f.vreg(Cls::I));
     f.params = vec![n, seed];
@@ -74,7 +76,17 @@ fn build(l_n: usize, t_n: usize, redef: usize) -> Func {
         }
     }
     push(&mut f, b2, Inst::Mov(acc, r));
-    f.blocks[b2 as usize].term = Term::Jump(b4);
+    if branchy {
+        let b6 = f.block();
+        let (bit, z) = (f.vreg(Cls::I), f.vreg(Cls::I));
+        push(&mut f, b2, Inst::IBinI(IOp::And, W, bit, l[0], 1));
+        push(&mut f, b2, Inst::ICmpI(Cond::Ne, false, z, bit, 0));
+        f.blocks[b2 as usize].term = Term::Branch(z, b6, b4);
+        push(&mut f, b6, Inst::IBinI(IOp::Add, W, acc, acc, 1));
+        f.blocks[b6 as usize].term = Term::Jump(b4);
+    } else {
+        f.blocks[b2 as usize].term = Term::Jump(b4);
+    }
     // the long values' block: acc += l[k] ^ l[k + 1], acc ^= cst per pass
     for _ in 0..REPS {
         for k in 0..l_n {
@@ -102,7 +114,7 @@ fn build(l_n: usize, t_n: usize, redef: usize) -> Func {
     f
 }
 
-fn reference(n: u64, seed: u64, l_n: usize, t_n: usize, redef: usize) -> u64 {
+fn reference(n: u64, seed: u64, l_n: usize, t_n: usize, redef: usize, branchy: bool) -> u64 {
     let mut l: Vec<u64> = (0..l_n as u64).map(|k| seed.wrapping_add((k + 1) * 0x9e37)).collect();
     let mut acc = seed;
     let mut i = 0u64;
@@ -116,6 +128,9 @@ fn reference(n: u64, seed: u64, l_n: usize, t_n: usize, redef: usize) -> u64 {
             }
         }
         acc = r;
+        if branchy && l[0] & 1 != 0 {
+            acc = acc.wrapping_add(1);
+        }
         for _ in 0..REPS {
             for k in 0..l_n {
                 acc = acc.wrapping_add(l[k] ^ l[(k + 1) % l_n]);
@@ -141,15 +156,15 @@ fn evicted_registers_serve_windows() {
     let shapes: &[(usize, usize)] = if cfg!(target_arch = "x86_64") { &[(9, 14), (10, 20)] } else { &[(22, 30), (26, 40)] };
     let mut changed = false;
     for &(l_n, t_n) in shapes {
-        for redef in [0usize, 1, 3] {
-            let f = build(l_n, t_n, redef);
+        for (redef, branchy) in [(0usize, false), (1, false), (3, false), (0, true), (3, true)] {
+            let f = build(l_n, t_n, redef, branchy);
             let mut codes = Vec::new();
             for off in offs {
                 let bytes = compile(&options(off), &f);
                 let code = Code::new(&bytes).unwrap();
                 let run: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
                 for (n, seed) in [(0u64, 1u64), (1, 7), (5, 0x1234), (64, 0x9e3779b97f4a7c15), (301, 3)] {
-                    assert_eq!(run(n, seed), reference(n, seed, l_n, t_n, redef), "L {} T {} redef {} off {:?} n {}", l_n, t_n, redef, off, n);
+                    assert_eq!(run(n, seed), reference(n, seed, l_n, t_n, redef, branchy), "L {} T {} redef {} branchy {} off {:?} n {}", l_n, t_n, redef, branchy, off, n);
                 }
                 codes.push(bytes);
             }
