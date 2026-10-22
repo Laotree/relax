@@ -53,12 +53,14 @@ struct Side {
     check: Vec<Option<&'static str>>,
     /// per call instruction (ours): the O3 remark on why it stayed a call
     why: Vec<Option<String>>,
+    /// per branch leaving the fn's code: what its target is (a shared panic stub, a tail call)
+    ext: Vec<Option<String>>,
 }
 
 impl Side {
     fn new(label: String, name: String, addr: u64, insns: Vec<Insn>) -> Side {
         let n = insns.len();
-        Side { label, name, addr, insns, at: vec![u32::MAX; n], inl: vec![(String::new(), 0); n], callee: vec![None; n], samples: vec![0; n], below: vec![0; n], count: vec![None; n], lines: Vec::new(), check: vec![None; n], why: vec![None; n] }
+        Side { label, name, addr, insns, at: vec![u32::MAX; n], inl: vec![(String::new(), 0); n], callee: vec![None; n], samples: vec![0; n], below: vec![0; n], count: vec![None; n], lines: Vec::new(), check: vec![None; n], why: vec![None; n], ext: vec![None; n] }
     }
 
     fn line_index(&mut self, idx: &mut HashMap<String, u32>, key: String, show: String) -> u32 {
@@ -108,7 +110,9 @@ impl Side {
                 continue;
             }
             let taken = self.insns[k].target.and_then(|t| self.at_addr(t)).and_then(|t| leads_to(self, t));
-            self.check[k] = taken.or_else(|| leads_to(self, k + 1));
+            // a branch out of the fn to a panic entry (a shared out-of-line stub)
+            let out = self.ext[k].as_deref().and_then(check_kind);
+            self.check[k] = taken.or(out).or_else(|| leads_to(self, k + 1));
         }
     }
 
@@ -284,6 +288,8 @@ fn our_sides(q: &str, max: usize) -> Result<(Vec<(u32, Side)>, Vec<String>), Str
                 m
             });
             let rem = super::remarks::inline_of(id);
+            // the counts the O3 code was built from, by exact position (inlined code included)
+            let pos_counts = super::remarks::counts_of(id);
             for b in bodies {
                 let kind = super::codever::kind_at(u, b.start);
                 let label = format!("ours {} {}{}", kind.tier_name(), kind.origin_name(), if b.state == "installed" { String::new() } else { format!(" ({})", b.state) });
@@ -316,6 +322,7 @@ fn our_sides(q: &str, max: usize) -> Result<(Vec<(u32, Side)>, Vec<String>), Str
                         pos_cache.insert(p, (li, inl, cnt));
                     }
                     let (li, inl, cnt) = pos_cache[&p].clone();
+                    let cnt = pos_counts.binary_search_by_key(&p, |x| x.0).ok().map(|k| pos_counts[k].1).or(cnt);
                     if matches!(s.insns[k].class, Class::Call | Class::IndirectCall) {
                         s.why[k] = rem.iter().find(|r| r.pos == p).map(|r| r.describe());
                     }
@@ -323,21 +330,29 @@ fn our_sides(q: &str, max: usize) -> Result<(Vec<(u32, Side)>, Vec<String>), Str
                     s.inl[k] = inl;
                     s.count[k] = cnt;
                 }
-                // call targets: JIT slots (by their thunk or code), host fns (symbol tables)
+                // call targets: JIT slots (by their thunk or code), host fns (symbol tables); the
+                // same for branches that leave the body (panic stubs, tail calls)
                 let code_tab = u.code.read().unwrap_or_else(|e| e.into_inner());
+                let (lo, hi) = (b.start, b.start + b.len as u64);
                 for k in 0..s.insns.len() {
-                    if s.insns[k].class != Class::Call {
+                    let call = s.insns[k].class == Class::Call;
+                    let Some(t) = s.insns[k].target else { continue };
+                    if !call && t >= lo && t < hi {
                         continue;
                     }
-                    let Some(t) = s.insns[k].target else { continue };
                     let name = match u.slots.find(0, t) {
                         Some((c, 0)) if (c as usize) < u.fns.len() => Some(super::display_name(u, c, 0)),
                         _ => match code_tab.entry_at(t) {
-                            Some((_, _, c)) => Some(super::display_name(u, c, 0)),
+                            Some((st, _, c)) if !(st == lo && !call) => Some(super::display_name(u, c, 0)),
+                            Some(_) => None,
                             None => super::symbols::host_symbol(t).map(|x| x.0),
                         },
                     };
-                    s.callee[k] = name;
+                    if call {
+                        s.callee[k] = name;
+                    } else {
+                        s.ext[k] = name.or_else(|| Some(format!("{:#x} (outside the fn)", t)));
+                    }
                 }
                 drop(code_tab);
                 s.find_checks();
@@ -501,9 +516,13 @@ fn rustc_side(nb: &NativeBin, ours: &str, our_bytes: usize) -> Result<(Side, usi
             s.inl[k] = (c.name.clone(), c.depth.min(255) as u8);
         }
     }
+    let end = pick.addr + pick.size;
     for k in 0..s.insns.len() {
+        let Some(t) = s.insns[k].target else { continue };
         if s.insns[k].class == Class::Call {
-            s.callee[k] = s.insns[k].target.and_then(|t| nb.fn_at(t)).map(|f| f.name.clone());
+            s.callee[k] = nb.fn_at(t).map(|f| f.name.clone());
+        } else if t < pick.addr || t >= end {
+            s.ext[k] = Some(nb.fn_at(t).map_or_else(|| format!("{:#x} (outside the fn)", t), |f| f.name.clone()));
         }
     }
     s.find_checks();
@@ -821,9 +840,16 @@ fn findings(a: &Side, b: &Side, j: &Joined) -> Vec<(f64, String)> {
 
 fn listing_row(s: &Side, k: usize, show_cost: bool) -> String {
     let i = &s.insns[k];
+    let end = s.addr + s.insns.last().map_or(0, |l| l.off as u64 + l.len as u64);
     let mut t = i.text();
+    // targets inside the fn as its own offsets (`@3f`), the listing's left column
+    if let Some(tg) = i.target.filter(|&tg| tg >= s.addr && tg < end) {
+        t = t.replace(&format!("{:#x}", tg), &format!("@{:x}", tg - s.addr));
+    }
     if let Some(c) = &s.callee[k] {
         t = format!("{} ; {}", i.mnem, short(&plain_name(c), 60));
+    } else if let Some(e) = &s.ext[k] {
+        t = format!("{} ; -> {}", i.mnem, short(&plain_name(e), 60));
     }
     if let Some(c) = s.check[k] {
         t.push_str(&format!(" ; {} check", c));
@@ -837,14 +863,15 @@ fn listing_row(s: &Side, k: usize, show_cost: bool) -> String {
     if !s.inl[k].0.is_empty() {
         t.push_str(&format!(" ·in {}", short(&plain_name(&s.inl[k].0), 40)));
     }
-    if show_cost && (s.samples[k] > 0 || s.below[k] > 0) {
-        format!("{:>4}{} {}", s.samples[k], if s.below[k] > 0 { format!("(+{})", s.below[k]) } else { String::new() }, t)
+    if show_cost {
+        let c = if s.samples[k] > 0 || s.below[k] > 0 { format!("{}{}", s.samples[k], if s.below[k] > 0 { format!("+{}", s.below[k]) } else { String::new() }) } else { String::new() };
+        format!("{:>7} {}", c, t)
     } else {
         t
     }
 }
 
-/// `asm <fn|@slot> [vs=rustc] [native=<bin>] [s=2] [hz=1000] [view=summary|lines|listing|ours] [line=<n>] [n=12]`
+/// `asm <fn|@slot> [vs=rustc] [native=<bin>] [s=2] [hz=1000] [view=summary|lines|listing|ours|code] [line=<n>] [n=12]`
 /// and `asm top [vs=rustc] [s=3] [n=15]`.
 pub fn cmd_asm(req: &Req, out: &mut Out) {
     let Some(q) = req.pos.first().cloned() else {
@@ -995,6 +1022,29 @@ fn render(out: &mut Out, slot: u32, a: &Side, b: Option<&Side>, view: &str, line
         }
         out.line(LEGEND);
     }
+    if view == "code" {
+        // our code in address order: the line where it changes, loop heads, samples per instruction
+        let heads: std::collections::HashSet<usize> = a.loops().iter().map(|l| l.0).collect();
+        let mut last = u32::MAX;
+        out.line("```");
+        out.line(&format!("  off {:>7} instruction   (samples: self+below a call)", ev_unit(ev)));
+        for k in 0..a.insns.len() {
+            if a.at[k] != last {
+                last = a.at[k];
+                let l = a.lines.get(last as usize).map_or("(no line)".to_string(), |l| l.show.clone());
+                let inl = if a.inl[k].0.is_empty() { String::new() } else { format!(" (inlined {})", short(&plain_name(&a.inl[k].0), 60)) };
+                out.line(&format!("; {}{}", l, inl));
+            }
+            if heads.contains(&k) {
+                out.line(&format!("; loop head @{:x}", a.insns[k].off));
+            }
+            out.line(&format!("{:5x} {}", a.insns[k].off, listing_row(a, k, true)));
+        }
+        out.line("```");
+        if out.truncated {
+            out.always("(cut at the reply limit: full=1)");
+        }
+    }
     if view == "listing" || view == "ours" {
         // per line, in our code order: our instructions, then rustc's at that line
         let want: Option<u32> = line.and_then(|l| l.rsplit(':').next()).and_then(|l| l.parse().ok());
@@ -1046,7 +1096,7 @@ fn render(out: &mut Out, slot: u32, a: &Side, b: Option<&Side>, view: &str, line
         out.always(&format!("note: {}", t));
     }
     let lines_hint = j.keys.iter().zip(&j.samples).max_by_key(|x| x.1).map(|x| x.0.rsplit(':').next().unwrap_or("").to_string()).unwrap_or_default();
-    out.always(&format!("more: asm @{} view=listing line={}  asm @{} view=lines  versions @{}  count {}", slot, lines_hint, slot, slot, q));
+    out.always(&format!("more: asm @{} view=listing line={}  asm @{} view=code  asm @{} view=lines  remarks @{}  versions @{}", slot, lines_hint, slot, slot, slot, slot));
 }
 
 // ------------------------------------------------------------------ asm top

@@ -13431,6 +13431,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             }
             _ => (!options.no_block_freq).then(|| inline_structural_freqs(&func)),
         };
+        // makepad inspect `asm`: the PGO block counts this O3 code was built from, by position
+        if func.blocks.iter().any(|b| b.count >= 0.0) {
+            crate::inspect::remarks::record_counts(id, &func);
+        }
         let mps = crate::memstat::peak_start();
         if dump_base(&name).is_some() {
             // tools/run/tools/asmcmp: code offset -> RIR block/instruction of the dumped fn

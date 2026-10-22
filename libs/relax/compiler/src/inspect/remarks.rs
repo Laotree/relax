@@ -9,6 +9,34 @@ use std::collections::HashMap;
 
 static INLINE: relax_session::sync::Mutex<Option<HashMap<u32, Vec<SiteRemark>>>> = relax_session::sync::Mutex::new(None);
 
+static COUNTS: relax_session::sync::Mutex<Option<HashMap<u32, Vec<(u64, u64)>>>> = relax_session::sync::Mutex::new(None);
+
+/// The PGO counts slot `id`'s O3 code was built from: (source position, executions of its block
+/// in the counted window), one entry per position and block, sorted by position.
+pub fn record_counts(id: u32, f: &relax_backend::rir::Func) {
+    let _k = crate::zone_alloc::kept();
+    let mut v: Vec<(u64, u64)> = Vec::new();
+    for b in f.blocks.iter().filter(|b| b.count >= 0.0) {
+        for &p in b.pos.iter().chain(std::iter::once(&b.term_pos)) {
+            if p != 0 {
+                v.push((p, b.count as u64));
+            }
+        }
+    }
+    v.sort_unstable();
+    v.dedup_by(|a, b| a.0 == b.0 && {
+        b.1 = b.1.max(a.1);
+        true
+    });
+    v.shrink_to_fit();
+    COUNTS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(id, v);
+}
+
+/// The PGO counts of slot `id`'s last O3 build by position (empty: none).
+pub fn counts_of(id: u32) -> Vec<(u64, u64)> {
+    COUNTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&id).cloned()).unwrap_or_default()
+}
+
 /// The O3 build of slot `id` kept these call sites as calls (its last inlining round).
 pub fn record_inline(id: u32, v: Vec<SiteRemark>) {
     let _k = crate::zone_alloc::kept();
@@ -28,6 +56,14 @@ pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
     if let Ok(g) = INLINE.try_lock() {
         if let Some(m) = g.as_ref() {
             a.field("inspect.remarks");
+            for v in m.values() {
+                a.vec(v);
+            }
+        }
+    }
+    if let Ok(g) = COUNTS.try_lock() {
+        if let Some(m) = g.as_ref() {
+            a.field("inspect.counts");
             for v in m.values() {
                 a.vec(v);
             }
