@@ -575,9 +575,9 @@ fn site_rule(options: &relax_session::Options, callee: &Func, id: u32, nargs: us
 /// call, and a body that iterates per call (sdf_glyphs' esdt over a row: +5.6% instructions when
 /// it went into each caller) pays for its call many times over.
 const PGO_VERY_HOT: f32 = 1.0;
-/// ... a body loops when it runs more instructions per call than this many times its size (the
-/// back-edge / invocation ratio the JIT's loop counters use, HotSpot's: a loop body is one that
-/// iterates about that often per call). Measured on the counts: llm_host's HostDecodeBench::step
+/// ... a body loops when it runs more instructions per call than this many times its size
+/// (HotSpot's back-edge / invocation ratio: a loop body is one that iterates about that often per
+/// call). Measured on the counts: llm_host's HostDecodeBench::step
 /// 3.9 (inlined: its caller specialises it), sdf_glyphs' esdt 31 (kept out of line).
 const PGO_LOOP_WORK: f64 = 8.0;
 

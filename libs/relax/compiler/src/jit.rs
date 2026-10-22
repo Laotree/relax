@@ -11592,6 +11592,13 @@ fn rt_loop_hot(counter: u64, fp: u64) {
         if start == 0 || took > CALL_WINDOW_NS || (*rec.add(3)).load(Ordering::Relaxed) != T_COUNTING {
             return;
         }
+        // without OSR an O3 build pays from the next entry on: a function entered once (a loader's
+        // parse loop, an event loop) is not built for its loops (count stub: calls left since armed)
+        let calls = budget / LOOP_PER_CALL;
+        let again = |c: u32| (*tier_rec(&u.slots, c)).load(Ordering::Relaxed).saturating_add(2) <= calls;
+        if !again(id) {
+            return;
+        }
         let rate = ((budget as u128 * 1_000_000_000 / took.max(1) as u128) / LOOP_PER_CALL as u128).min(u64::MAX as u128) as u64;
         queue_loop(u, id, rate);
         // the frame's JIT callers (frame records: [fp] = the caller's fp, [fp + 8] = the return
@@ -11615,7 +11622,9 @@ fn rt_loop_hot(counter: u64, fp: u64) {
                 if st == T_QUEUED && !pgo_credit(c) {
                     break;
                 }
-                queue_loop(u, c, rate);
+                if again(c) {
+                    queue_loop(u, c, rate);
+                }
             }
             at = c;
             let next = *(fp as *const u64);
@@ -11635,10 +11644,11 @@ fn rt_loop_hot(counter: u64, fp: u64) {
 const TIER_REC: usize = 64;
 /// the loop counter's offset in the tier record
 const TIER_LOOP: u64 = 48;
-/// A slot's loops are hot when this many back edges (times the call threshold) ran within
-/// CALL_WINDOW_NS: HotSpot's back-edge / invocation thresholds (C2: Tier4BackEdgeThreshold 40000,
-/// Tier4InvocationThreshold 5000).
-const LOOP_PER_CALL: u64 = 8;
+/// A slot's loops are hot when this many back edges (times the call threshold: 40000 at the
+/// default 2000, HotSpot's C2 Tier4BackEdgeThreshold) ran within CALL_WINDOW_NS. At 8x (HotSpot's
+/// back-edge / invocation ratio, 16000) Stage's per-frame drawing loops all went to O3: 3x the O3
+/// CPU of the sampler's 10 ms-of-CPU rule.
+const LOOP_PER_CALL: u64 = 20;
 /// A hot loop queues the JIT frames under it with it (rt_loop_hot), up to the first one queued
 /// already and at most this many: a loop in a callee is its callers' loop too, and their O3 builds
 /// inline it (llm_host: a generic collect's loop under f32_bytes_to_vec under the decode step,
@@ -11957,16 +11967,16 @@ pub fn sweep_verdicts() {
     let _ = verified;
 }
 
-/// SPEC-V: the slots among `cands` (None: every slot that turned hot) that are verified, warm (they
-/// turned hot: queued, counted or built at O3) and still run an unverified lowering whose calls go
-/// to `twin` (None: to any twin that turned hot or has O3 code). Built again (retier), they are
-/// lowered as verified code, so the hot chain under them reaches the slots themselves: noalias,
-/// inlining, cache entries. Unit read.
+/// SPEC-V: the slots among `cands` (None: every slot) that are verified, built at O3, and still run
+/// an unverified lowering whose calls go to `twin` (None: to any twin built at O3). Built again
+/// (retier), they are lowered as verified code, so the hot chain under them reaches the slots
+/// themselves: noalias, inlining, cache entries. Unit read. (O3 code is the evidence: a slot that
+/// merely turned hot once -- a loader, a lukewarm UI fn -- is not rebuilt for its twins.)
 fn hot_twin_callers(u: &Unit, cands: Option<&[u32]>, twin: Option<u32>) -> Vec<u32> {
-    let warm = |c: u32| unsafe { (*tier_rec(&u.slots, c).add(3)).load(Ordering::Relaxed) == T_QUEUED };
+    let warm = |c: u32| u.fns[c as usize].o3.load(Ordering::Relaxed);
     let hot = |t: u32| matches!(u.fns[t as usize].key, FnKey::Plain(_)) && match twin {
         Some(w) => t == w,
-        None => u.fns[t as usize].o3.load(Ordering::Relaxed) || warm(t),
+        None => warm(t),
     };
     let calls_hot = |c: u32| {
         let f = &u.fns[c as usize];
