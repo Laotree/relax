@@ -12513,6 +12513,13 @@ fn pgo_on(options: &crate::options::Options) -> bool {
     *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_PGO").map_or(true, |v| v != "0")) && !options.no_block_freq && !t1prof_replay(options)
 }
 
+/// MAKEPAD_RUN_PGO_HOLD=1: counted code stays installed (no counting window ends): with
+/// MAKEPAD_RUN_O3=1 a program runs in counted code (diff_fast's counted tier)
+fn pgo_hold() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_PGO_HOLD").is_ok_and(|v| v == "1"))
+}
+
 /// MAKEPAD_RUN_PGO_LAYOUT=0: counted O3 code keeps the static block order (A/B)
 fn pgo_layout() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -12626,7 +12633,7 @@ fn pgo_poll() {
                 sum = sum.saturating_add(c.load(Ordering::Relaxed));
                 if sum >= PGO_BLOCKS { break; }
             }
-            let done = entries >= PGO_ENTRIES || sum >= PGO_BLOCKS || (sum > 0 && el >= PGO_MS * 1_000_000) || el >= PGO_IDLE_MS * 1_000_000;
+            let done = !pgo_hold() && (entries >= PGO_ENTRIES || sum >= PGO_BLOCKS || (sum > 0 && el >= PGO_MS * 1_000_000) || el >= PGO_IDLE_MS * 1_000_000);
             if done {
                 ready.push((e.id, rate));
             }
@@ -12736,7 +12743,10 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
             crate::guards::probe(g, &mut func);
         }
         let cg = tier0_codegen_rir(options, &func, fold, layout);
-        relax_codegen::native::compile(options, &cg, &env).map(|c| (c, counted))
+        relax_codegen::native::compile(options, &cg, &env).map(|c| {
+            dump_o1(&cg, &c);
+            (c, counted)
+        })
     }));
     let Ok(Ok((c, counted))) = built else {
         PGO_STATS[2].fetch_add(1, Ordering::Relaxed);
