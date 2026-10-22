@@ -57,7 +57,9 @@ impl Ans {
     /// Drill-downs: queries separated by two spaces.
     pub fn more(&mut self, s: impl Into<String>) {
         for q in s.into().split("  ").map(str::trim).filter(|q| !q.is_empty()) {
-            self.more.push(q.to_string());
+            if !self.more.iter().any(|m| m == q) {
+                self.more.push(q.to_string());
+            }
         }
     }
     /// The text an agent reads.

@@ -24,10 +24,14 @@ fn scalar(v: &Value) -> String {
 }
 
 fn cut(s: String) -> String {
-    if s.chars().count() <= CELL {
+    cut_at(s, CELL)
+}
+
+fn cut_at(s: String, max: usize) -> String {
+    if s.chars().count() <= max {
         return s;
     }
-    let mut c: String = s.chars().take(CELL - 1).collect();
+    let mut c: String = s.chars().take(max - 1).collect();
     c.push('…');
     c
 }
@@ -90,7 +94,8 @@ pub fn render(cmd: &str, lines: &[String]) -> Ans {
         }
         if j - i == 1 {
             for (k, v) in rows[i].iter().filter(|x| x.0 != "more") {
-                ans.note(cut(format!("{}: {}", head(k), scalar(v))));
+                // a single answer's fields (a panic's message, a fn's path) keep more of their text
+                ans.note(cut_at(format!("{}: {}", head(k), scalar(v)), 400));
             }
         } else {
             let mut t = Table::new(&keys.iter().map(|k| head(k)).collect::<Vec<_>>().iter().map(String::as_str).collect::<Vec<_>>());
