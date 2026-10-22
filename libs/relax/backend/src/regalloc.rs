@@ -1362,8 +1362,10 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             eprintln!("ra-spill {} v{} w={:.3} refs={:.2} len={} unit={} ranges={} | {}", f.name, v, weight[v], refs[v], len, unit, r.len(), by.join(" "));
         }
     }
-    // second chance for spilled values (O3, second_chance). MAKEPAD_RUN_OPT=-evict: off
-    let evict_on = thorough && !crate::stats::opt_off(options, "-evict");
+    // second chance for spilled values (O3, second_chance) on load/store targets. MAKEPAD_RUN_OPT=-evict:
+    // off, +evict: also where instructions read slots (x64: measured neutral to +1.3% instructions
+    // over rwbench there and +14% allocation time -- a folded slot read costs no instruction, a reload does)
+    let evict_on = thorough && !crate::stats::opt_off(options, "-evict") && (!cfg.mem_operands || crate::stats::opt_off(options, "+evict"));
     let (evicts, prestores, lent) = if evict_on && loc.iter().any(|l| matches!(l, Loc::Stack(_))) {
         // values in a coalesced unit, passed-through loop pieces and recomputed ones keep their place
         let skip: Vec<bool> = (0..nv).map(|v| unit_members(v).is_some() || parent[v as usize] != v || is_low(v) || remat[v as usize].is_some()).collect();

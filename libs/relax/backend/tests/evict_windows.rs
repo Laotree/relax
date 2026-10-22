@@ -152,7 +152,8 @@ fn reference(n: u64, seed: u64, l_n: usize, t_n: usize, redef: usize, branchy: b
 
 #[test]
 fn evicted_registers_serve_windows() {
-    let offs: [&[&str]; 4] = [&[], &["-evict"], &["-defstore"], &["-evict", "-defstore"]];
+    // x64 (slot-reading instructions) runs second chance only on request
+    let offs: [&[&str]; 4] = if cfg!(target_arch = "x86_64") { [&["+evict"], &["-evict"], &["+evict", "-defstore"], &["-evict", "-defstore"]] } else { [&[], &["-evict"], &["-defstore"], &["-evict", "-defstore"]] };
     let shapes: &[(usize, usize)] = if cfg!(target_arch = "x86_64") { &[(9, 14), (10, 20)] } else { &[(22, 30), (26, 40)] };
     let mut changed = false;
     for &(l_n, t_n) in shapes {
