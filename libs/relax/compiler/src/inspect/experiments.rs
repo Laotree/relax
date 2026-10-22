@@ -10,8 +10,9 @@
 //!   none (tokens `+inl@<slot>` / `-inl@<slot>`, read by the inliner)
 //! - `o1`: O1 code (a pin, as `tier <fn> o1`)
 //! The rate metric fits workloads that run at a fixed pace (frame-locked UI, playback); a
-//! throughput loop that runs flat out keeps the fn's share constant: measure those per frame or
-//! per call (`count <fn> time=1`).
+//! throughput loop that runs flat out keeps the fn's share constant: measure those `per=call`
+//! (each round's variant built again with timed entry/exit probes: exact ns per call) or
+//! `per=frame`.
 
 use super::{short, Out, Req};
 use std::collections::HashMap;
@@ -206,7 +207,7 @@ fn perm_p(a: &[f64], b: &[f64]) -> f64 {
     hits as f64 / tries.max(1) as f64
 }
 
-/// `ab <fn|@slot> b=<variant> [a=base] [rounds=5] [s=1] [settle_ms=300] [metric=incl|self] [per=s|frame] [ev=cpu|cycles|instructions] [keep=a|b]`
+/// `ab <fn|@slot> b=<variant> [a=base] [rounds=5] [s=1] [settle_ms=300] [metric=incl|self] [per=s|frame|call] [ev=cpu|cycles|instructions] [keep=a|b]`
 pub fn cmd_ab(req: &Req, out: &mut Out) {
     let Some(q) = req.pos.first().cloned() else {
         return out.err("usage: ab <fn|@slot> b=<base|o1|opt:<tok>,..|inline:<callee>|noinline:<callee>> [a=base] [rounds=5] [s=1] [metric=incl|self] [ev=cpu|cycles|instructions] [keep=a|b]");
@@ -221,6 +222,7 @@ pub fn cmd_ab(req: &Req, out: &mut Out) {
     let hz = req.num("hz", 1000).clamp(50, 4000);
     let self_only = req.get("metric") == Some("self");
     let per_frame = req.get("per") == Some("frame");
+    let per_call = req.get("per") == Some("call");
     let ev = match super::prof::Ev::parse(req.get("ev").unwrap_or("cpu")) {
         Ok(e) => e,
         Err(e) => return out.err(&e),
@@ -263,13 +265,42 @@ pub fn cmd_ab(req: &Req, out: &mut Out) {
             let _ = install(up, id, &Variant::Base, 99);
             return out.err(&format!("variant {} ({}): {}", if k == 0 { "A" } else { "B" }, if k == 0 { &la } else { &lb }, e));
         }
-        std::thread::sleep(std::time::Duration::from_millis(settle));
         let Some((lo, hi, tier)) = code_of(up, id) else {
             return out.err("the fn has no installed code after the build");
         };
         sizes[k] = hi - lo;
         tiers[k] = tier;
-        let (val, took) = measure(lo, hi, secs, hz, ev, self_only, per_frame, out);
+        let (val, took) = if per_call {
+            // exact calls and inclusive time per call: the variant's build again with timed entry /
+            // exit probes (the variant's tokens stay set for that build), the same probes in A and B
+            set_opts(id, match v {
+                Variant::Opt(t) => Some(t.clone()),
+                _ => None,
+            });
+            let g = super::instrument::count_slot(id);
+            set_opts(id, None);
+            let (group, sites) = match g {
+                Ok(x) => x,
+                Err(e) => {
+                    let _ = install(up, id, &Variant::Base, 99);
+                    return out.err(&format!("per=call: the timed count build failed: {}", e));
+                }
+            };
+            std::thread::sleep(std::time::Duration::from_millis(settle));
+            let (h0, n0) = super::instrument::site_totals(&sites);
+            let t0 = std::time::Instant::now();
+            let gone = out.gone();
+            while t0.elapsed().as_secs_f64() < secs && !gone() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let (h1, n1) = super::instrument::site_totals(&sites);
+            let _ = super::instrument::remove_group(group);
+            let calls = h1.saturating_sub(h0);
+            (if calls > 0 { n1.saturating_sub(n0) as f64 / calls as f64 } else { 0.0 }, t0.elapsed().as_secs_f64())
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(settle));
+            measure(lo, hi, secs, hz, ev, self_only, per_frame, out)
+        };
         if took < secs * 0.8 {
             notes.push(format!("round {} measured {:.2} s of {:.2}", r + 1, took, secs));
         }
@@ -291,13 +322,13 @@ pub fn cmd_ab(req: &Req, out: &mut Out) {
     let d = (mb - ma) / ma.max(1e-9) * 100.0;
     let p = perm_p(&a, &b);
     let noise = sa.max(sb);
-    let unit = format!("{}/{}", match ev {
+    let unit = if per_call { "ns per call (incl.)".to_string() } else { format!("{}/{}", match ev {
         super::prof::Ev::Cpu => "ms CPU",
         super::prof::Ev::Cycles => "cycles",
         super::prof::Ev::Instructions => "instr",
         super::prof::Ev::BranchMisses => "branch misses",
         super::prof::Ev::CacheMisses => "cache misses",
-    }, if per_frame { "frame" } else { "s" });
+    }, if per_frame { "frame" } else { "s" }) };
     let verdict = if ma <= 0.0 && mb <= 0.0 {
         "no samples in the fn: is it running? (ab measures the fn's cost rate while the app runs)".to_string()
     } else if p < 0.05 && d.abs() > noise / 2.0 {
@@ -321,7 +352,9 @@ pub fn cmd_ab(req: &Req, out: &mut Out) {
         ev.name(),
         if keep_b { "B" } else { "A" }
     ));
-    if !per_frame {
+    if per_call {
+        out.always("note: per=call: each round counts the variant's build again with timed entry/exit probes (exact calls, inclusive ns per call); the probes cost the same in A and B");
+    } else if !per_frame {
         out.always("note: a rate per second of wall: right for fixed-pace work (playback, a frame-locked UI); per=frame divides by UI frames instead; a flat-out loop keeps the fn's share constant -- compare those with count <fn> time=1");
     }
     for n in notes {

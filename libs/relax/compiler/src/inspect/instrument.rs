@@ -1015,6 +1015,22 @@ fn remove_rows(group: Option<u32>) -> Result<(usize, Vec<String>), String> {
     r.map(|rows| (n, rows)).ok_or_else(|| format!("the owner did not take the request in 10 s ({}); the probes are off but still in the code", crate::owner::serving_note()))
 }
 
+/// `ab per=call`: a timed count group on slot `id` (its code rebuilt with entry/exit probes at
+/// the tier of the code it replaces): (group, site ids).
+pub(crate) fn count_slot(id: u32) -> Result<(u32, Vec<u64>), String> {
+    add_to(Kind::Count, Target::Slot(id), true, false).map(|(g, rows, _)| (g, rows.iter().map(|r| r.0).collect()))
+}
+
+/// (hits, inclusive ns) of count sites `sites` together.
+pub(crate) fn site_totals(sites: &[u64]) -> (u64, u64) {
+    sites.iter().filter_map(|&si| site(si)).fold((0, 0), |a, s| (a.0 + s.hits.load(Relaxed), a.1 + s.ns.load(Relaxed)))
+}
+
+/// Removes count group `group` (the code it replaced comes back).
+pub(crate) fn remove_group(group: u32) -> Result<usize, String> {
+    remove_rows(Some(group)).map(|r| r.0)
+}
+
 #[cfg(test)]
 pub(crate) fn count_for_test(query: &str) -> Result<(u32, Vec<(u64, String, u32, String)>, Vec<String>), String> {
     add(Kind::Count, query, false, false)
