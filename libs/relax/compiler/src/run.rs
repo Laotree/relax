@@ -2123,8 +2123,10 @@ static SETTLE_WHY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::ne
 fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
     let up = unsafe { RUN_UNIT };
     if up.is_null() { return false; }
-    // a front write and the whole pending cache: structural work, a program-class request (rule
-    // I-PUB: no publish; its records go in bounded publishes with step 4 of OWNERARCH.DESIGN.md)
+    // the deferred cache records first, in bounded publishes (the type side they are keyed from
+    // is retired below: what installs add meanwhile is flushed in the request)
+    jit::drain_records_bounded();
+    // a front write: structural work, a program-class request (rule I-PUB: no publish)
     let Some(Some((drops, pending, spill, at, landmark, retired))) = Some(crate::owner::call(crate::owner::Class::App, || {
         if jit::COMPILED_FNS.load(Ordering::Relaxed) != compiled {
             SETTLE_WHY.store(1, Ordering::Relaxed);
@@ -2309,6 +2311,8 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             let _job = jit::compile_job();
             jit::reassert_signals();
             flush_errors(false);
+            // the deferred cache records of this tick's installs (rule I-PUB: bounded publishes)
+            if jit::records_due() { jit::drain_records_bounded(); }
             if settle_on {
                 let present = FIRST_PRESENT_WALL.load(Ordering::Acquire).max(DOMAIN_PRESENT_WALL.load(Ordering::Acquire));
                 if present != settle_present {
@@ -2876,7 +2880,10 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     if up.is_null() {
         return None;
     }
-    let mut parts = [0f64; 3];
+    // the deferred cache records in bounded publishes (a program thread waits for one batch);
+    // the request below holds only what installs add meanwhile
+    jit::drain_records_bounded();
+    let mut parts = [0f64; 4];
     let mut n_imgs = 0;
     // the files whose front images this write holds: the collected program below is recorded
     // only if no file was loaded since (its restore maps every file from these images)
@@ -2886,6 +2893,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     let spill = {
         let u = unsafe { &mut *up };
         u.flush_cache_records();
+        parts[3] = held.elapsed().as_secs_f64() * 1e3;
         // the startup manifest, once its window has closed (first present + 5 s after main):
         // what the exit recorded before, so a killed or force-quit app starts warm too; the exit
         // writes it again only if O2 code replaced startup code since (record_manifest)
@@ -2977,7 +2985,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             }
             (ready, retired_boot, t)
         }) {
-            if std::env::var_os("MAKEPAD_RUN_CACHE_TRACE").is_some() { verbose!("makepad-run cache: collected record held the unit lock {:.1} ms", t.elapsed().as_secs_f64() * 1e3); }
+            verbose!("makepad-run cache: collected record held the owner {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
             drop(retired_boot);
             if let Some((report, dest, payload)) = ready {
                 if let Some(written) = crate::cache::Cache::commit_collected(report, dest, payload) {
@@ -2989,7 +2997,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             }
         }
     }
-    if std::env::var_os("MAKEPAD_RUN_CACHE_TRACE").is_some() { verbose!("makepad-run cache: mid write held the unit lock {:.1} ms (manifest to {:.1}, front images to {:.1}, crate records to {:.1}, then spill)", held1, parts[0], parts[1], parts[2]); }
+    verbose!("makepad-run cache: mid write held the owner {:.1} ms (records to {:.1}, manifest to {:.1}, front images to {:.1}, crate records to {:.1}, then spill)", held1, parts[3], parts[0], parts[1], parts[2]);
     crate::inspect::flightrec::event("cache.write", &format!("mid write: {} records, {} images; held the owner {:.1} ms (manifest {:.1}, front images {:.1}, crate records {:.1})", n, n_imgs, held1, parts[0], parts[1], parts[2]), (held1 * 1e6) as u64, 0);
     // All temporary encoders and retired boot arrays are now outside compiler locks.
     crate::memstat::trim();
