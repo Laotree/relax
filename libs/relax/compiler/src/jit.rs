@@ -11198,9 +11198,14 @@ fn sampler_thread() {
                 });
                 // a slot counted again after it went cold (tier_revalidate) is queued at its first
                 // sample: it runs again, so its earlier hotness counts (steady lukewarm UI code never
-                // crosses SAMPLES_HOT twice)
-                let rearmed = before == 0 && unsafe { (*tier_rec(&u.slots, id).add(5)).load(Ordering::Relaxed) & REARMED != 0 };
-                if before < SAMPLES_HOT && count >= SAMPLES_HOT || rearmed {
+                // crosses SAMPLES_HOT twice). And a slot that is hot now and still counting is queued
+                // whether or not its heat just crossed SAMPLES_HOT: one counted again while its heat
+                // dipped, whose count stub an O2 install then replaced, stayed hot above the line,
+                // never crossed it again and ran O2 for minutes (Sandbox's reconcile, lane SETTLE)
+                let rec = tier_rec(&u.slots, id);
+                let state = unsafe { (*rec.add(3)).load(Ordering::Relaxed) };
+                let rearmed = before == 0 && unsafe { (*rec.add(5)).load(Ordering::Relaxed) & REARMED != 0 };
+                if count >= SAMPLES_HOT && (before < SAMPLES_HOT || state == T_COUNTING) || rearmed {
                     if sample_trace() {
                         eprintln!("sampler: {} hot", u.fns[id as usize].name);
                     }
