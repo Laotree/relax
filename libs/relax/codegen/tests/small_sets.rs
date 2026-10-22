@@ -67,3 +67,15 @@ fn a_select_on_a_decided_condition_is_a_copy() {
     assert!(fold_small_sets(&mut f));
     assert!(matches!(def(&f, s), Inst::Mov(_, x) if x == a), "{}", f.dump());
 }
+
+#[test]
+fn a_constant_defined_on_two_paths_is_one_value() {
+    // the -1 arm is a vreg assigned -1 twice (one constant per path after jump threading)
+    let (mut f, [ne, ..]) = ordering(254);
+    let k = f.blocks[0].insts.iter().position(|i| matches!(i, Inst::Iconst(_, -1))).unwrap();
+    let Inst::Iconst(m1, _) = f.blocks[0].insts[k] else { unreachable!() };
+    f.blocks[0].insts.insert(k, Inst::Iconst(m1, -1));
+    f.blocks[0].pos.insert(k, 1);
+    assert!(fold_small_sets(&mut f));
+    assert!(matches!(def(&f, ne), Inst::Iconst(_, 1)), "{}", f.dump());
+}

@@ -6247,17 +6247,21 @@ pub fn promote_dyn_read_slots(f: &mut Func) -> bool {
     true
 }
 
-/// The few values a single-def integer vreg can hold, when its definition chain makes them a
-/// small set: constants, compare results (0 / 1), selects of such values, and unary maps of them
-/// (integer conversions, operations with a constant). At most four values, eight definitions deep.
-fn small_set(f: &Func, def_at: &[(u32, u32)], v: VReg, depth: u32, out: &mut Vec<i64>) -> bool {
-    if depth == 0 {
+/// The few values an integer vreg can hold where it is read, when its definitions make them a
+/// small set: constants, compare outcomes (0 / 1, or what the operands' sets give), selects of such
+/// values, and unary maps of them (integer conversions, operations with a constant). A vreg with
+/// several definitions (RIR is not SSA: a constant per path, `Iconst(v, 0)` in two blocks) holds
+/// one of their values. At most four values, eight definitions deep. `defs[v]` is empty for a
+/// parameter (unknown).
+fn small_set(f: &Func, defs: &[Vec<(u32, u32)>], v: VReg, depth: u32, out: &mut Vec<i64>, budget: &mut u32) -> bool {
+    if depth == 0 || defs[v.0 as usize].is_empty() || *budget == 0 {
         return false;
     }
-    let (bi, k) = def_at[v.0 as usize];
-    if bi == u32::MAX {
-        return false;
-    }
+    *budget -= 1;
+    defs[v.0 as usize].iter().all(|&(bi, k)| small_set_def(f, defs, &f.blocks[bi as usize].insts[k as usize], depth, out, budget))
+}
+
+fn small_set_def(f: &Func, defs: &[Vec<(u32, u32)>], i: &Inst, depth: u32, out: &mut Vec<i64>, budget: &mut u32) -> bool {
     let push = |out: &mut Vec<i64>, x: i64| -> bool {
         if !out.contains(&x) {
             if out.len() == 4 {
@@ -6267,12 +6271,12 @@ fn small_set(f: &Func, def_at: &[(u32, u32)], v: VReg, depth: u32, out: &mut Vec
         }
         true
     };
-    match f.blocks[bi as usize].insts[k as usize] {
+    match *i {
         Inst::Iconst(_, c) => push(out, c),
         // a compare of small sets: its outcomes; else either
         Inst::ICmpI(cc, sg, _, x, c) => {
             let mut xs = Vec::new();
-            if small_set(f, def_at, x, depth - 1, &mut xs) {
+            if small_set(f, defs, x, depth - 1, &mut xs, budget) {
                 xs.into_iter().all(|a| push(out, cmp_i(cc, sg, a, c) as i64))
             } else {
                 push(out, 0) && push(out, 1)
@@ -6280,22 +6284,22 @@ fn small_set(f: &Func, def_at: &[(u32, u32)], v: VReg, depth: u32, out: &mut Vec
         }
         Inst::ICmp(cc, sg, _, x, y) => {
             let (mut xs, mut ys) = (Vec::new(), Vec::new());
-            if small_set(f, def_at, x, depth - 1, &mut xs) && small_set(f, def_at, y, depth - 1, &mut ys) {
+            if small_set(f, defs, x, depth - 1, &mut xs, budget) && small_set(f, defs, y, depth - 1, &mut ys, budget) {
                 xs.iter().all(|&a| ys.iter().all(|&b| push(out, cmp_i(cc, sg, a, b) as i64)))
             } else {
                 push(out, 0) && push(out, 1)
             }
         }
         Inst::FCmp(..) => push(out, 0) && push(out, 1),
-        Inst::Mov(_, a) => small_set(f, def_at, a, depth - 1, out),
-        Inst::Sel(_, _, a, b) => small_set(f, def_at, a, depth - 1, out) && small_set(f, def_at, b, depth - 1, out),
+        Inst::Mov(_, a) => small_set(f, defs, a, depth - 1, out, budget),
+        Inst::Sel(_, _, a, b) => small_set(f, defs, a, depth - 1, out, budget) && small_set(f, defs, b, depth - 1, out, budget),
         Inst::Conv(Conv::IntToInt(it), _, a) => {
             let mut xs = Vec::new();
-            small_set(f, def_at, a, depth - 1, &mut xs) && xs.into_iter().all(|x| push(out, extend_const(x, it)))
+            small_set(f, defs, a, depth - 1, &mut xs, budget) && xs.into_iter().all(|x| push(out, extend_const(x, it)))
         }
         Inst::IBinI(op, it, _, a, c) if !matches!(op, IOp::Div | IOp::Rem) => {
             let mut xs = Vec::new();
-            small_set(f, def_at, a, depth - 1, &mut xs) && xs.into_iter().all(|x| fold_ibin(op, it, x, c).map_or(false, |y| push(out, y)))
+            small_set(f, defs, a, depth - 1, &mut xs, budget) && xs.into_iter().all(|x| fold_ibin(op, it, x, c).map_or(false, |y| push(out, y)))
         }
         _ => false,
     }
@@ -6310,22 +6314,24 @@ fn small_set(f: &Func, def_at: &[(u32, u32)], v: VReg, depth: u32, out: &mut Vec
 /// anything changed (simplify then folds the branches).
 pub fn fold_small_sets(f: &mut Func) -> bool {
     let nv = f.vregs.len();
-    let mut ndef = vec![0u32; nv];
+    let mut defs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nv];
+    let mut param = vec![false; nv];
     for p in &f.params {
-        ndef[p.0 as usize] += 2;
+        param[p.0 as usize] = true;
     }
-    let mut def_at = vec![(u32::MAX, 0u32); nv];
     for (bi, b) in f.blocks.iter().enumerate() {
         for (k, i) in b.insts.iter().enumerate() {
             for_defs(i, |d| {
-                ndef[d.0 as usize] += 1;
-                def_at[d.0 as usize] = (bi as u32, k as u32);
+                if !param[d.0 as usize] {
+                    defs[d.0 as usize].push((bi as u32, k as u32));
+                }
             });
         }
     }
+    // a parameter (also when redefined) has values no definition shows
     for v in 0..nv {
-        if ndef[v] != 1 {
-            def_at[v] = (u32::MAX, 0);
+        if param[v] {
+            defs[v].clear();
         }
     }
     let mut edits: Vec<(usize, usize, Inst)> = Vec::new();
@@ -6336,7 +6342,7 @@ pub fn fold_small_sets(f: &mut Func) -> bool {
                 Inst::ICmp(cc, sg, d, x, y) => (d, cc, sg, x, Ok(y)),
                 Inst::Sel(d, c, a, b2) => {
                     let mut cs = Vec::new();
-                    if small_set(f, &def_at, c, 8, &mut cs) && !cs.is_empty() {
+                    if small_set(f, &defs, c, 8, &mut cs, &mut 64) && !cs.is_empty() {
                         let t = cs.iter().all(|&x| x != 0);
                         if t || cs.iter().all(|&x| x == 0) {
                             edits.push((bi, k, Inst::Mov(d, if t { a } else { b2 })));
@@ -6347,14 +6353,14 @@ pub fn fold_small_sets(f: &mut Func) -> bool {
                 _ => continue,
             };
             let mut xs = Vec::new();
-            if !small_set(f, &def_at, x, 8, &mut xs) || xs.is_empty() {
+            if !small_set(f, &defs, x, 8, &mut xs, &mut 64) || xs.is_empty() {
                 continue;
             }
             let ys = match y {
                 Err(c) => vec![c],
                 Ok(y) => {
                     let mut ys = Vec::new();
-                    if !small_set(f, &def_at, y, 8, &mut ys) || ys.is_empty() {
+                    if !small_set(f, &defs, y, 8, &mut ys, &mut 64) || ys.is_empty() {
                         continue;
                     }
                     ys
