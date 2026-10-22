@@ -1252,6 +1252,12 @@ mod tests {
             compile_ns: 0,
             compiles: 0,
             probes0: Vec::new(),
+            wait_depth: 0,
+            wait_t0: 0,
+            wait_owner: false,
+            wait_ns: 0,
+            owner_ns: 0,
+            waits: 0,
         };
         let s = super::analyse(&l, 0, 10_000_000);
         assert!(s.contains("\"owner_waits\":[{\"wait\":\"owner (main)\",\"at_ms\":0.0,\"ms\":3.00,"), "{s}");
