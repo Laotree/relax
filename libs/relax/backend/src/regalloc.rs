@@ -1968,6 +1968,163 @@ fn second_chance(
     (evicts, prestores, lent_iv)
 }
 
+/// MAKEPAD_RUN_OPT=+checkra (debug): symbolic check of an integer allocation. A forward dataflow over
+/// which vregs each integer register holds -- set by definitions (a same-register move or plain
+/// integer cast adds its result to what the register holds), emptied by clobbers, calls (except the
+/// values a call restores: Alloc::saves minus restore_skip), spill windows over their positions,
+/// and set again by eviction reloads -- meeting by intersection; every read of a value placed in a
+/// register must find it there. Returns one line per violation.
+pub fn check_alloc(options: &relax_session::Options, f: &Func, cfg: &RegConfig, al: &Alloc) -> Vec<String> {
+    let mut out = Vec::new();
+    let nb = f.blocks.len();
+    let reach = reachable(f);
+    let mut reload_at: HashMap<u32, Vec<(u8, u32)>> = HashMap::new();
+    for e in &al.evicts {
+        reload_at.entry(e.reload).or_default().push((e.reg, e.v));
+    }
+    // positions where a window occupies a register
+    let wins: Vec<(u32, u32, u8)> = al.windows.iter().chain(al.chained.iter()).map(|&(_, a, z, r)| (a, z, r)).collect();
+    let win_regs = |p: u32| -> u64 {
+        let mut m = 0u64;
+        for &(a, z, r) in &wins {
+            if a <= p && p <= z {
+                m |= 1 << r;
+            }
+        }
+        m
+    };
+    let caller: u64 = cfg.int_caller.iter().fold(0, |m, r| m | 1 << r);
+    type St = Vec<Vec<u32>>;
+    let mut state_in: Vec<Option<St>> = vec![None; nb];
+    let mut entry: St = vec![Vec::new(); 32];
+    for p in &f.params {
+        if let Loc::Reg(c) = al.loc[p.0 as usize] {
+            entry[c as usize].push(p.0);
+        }
+    }
+    state_in[0] = Some(entry);
+    let reg_of = |mut u: u32| -> Option<(u32, u8)> {
+        for _ in 0..8 {
+            match (al.loc[u as usize], al.remat[u as usize]) {
+                (Loc::Reg(c), _) if f.vregs[u as usize] == Cls::I => return Some((u, c)),
+                (Loc::None, Remat::Offset(b, _)) => u = b.0,
+                _ => return None,
+            }
+        }
+        None
+    };
+    let (mut us, mut ds) = (Vec::new(), Vec::new());
+    let mut tu = Vec::new();
+    let mut work: Vec<usize> = vec![0];
+    let mut rounds = 0usize;
+    let mut reported = std::collections::HashSet::new();
+    while let Some(bi) = work.pop() {
+        rounds += 1;
+        if rounds > 50 * nb + 1000 {
+            out.push(format!("ra-check {}: no fixpoint", f.name));
+            break;
+        }
+        let Some(mut st) = state_in[bi].clone() else { continue };
+        let b = &f.blocks[bi];
+        let n = b.insts.len();
+        let bs = al.block_start[bi];
+        let kill = |st: &mut St, m: u64| {
+            let mut m = m;
+            while m != 0 {
+                let r = m.trailing_zeros() as usize;
+                m &= m - 1;
+                st[r].clear();
+            }
+        };
+        let mut check = |st: &St, u: u32, p: u32, what: &str, out: &mut Vec<String>| {
+            if let Some((v, c)) = reg_of(u) {
+                if !st[c as usize].contains(&v) && reported.insert((p, v)) {
+                    out.push(format!("ra-check {}: {} of v{} (via v{}) at {} (b{} +{}) reads r{} holding {:?}", f.name, what, v, u, p, bi, p - bs, c, st[c as usize]));
+                }
+            }
+        };
+        for ii in 0..=n {
+            let p = if ii < n { bs + 2 * ii as u32 + 1 } else { al.block_end[bi] - 1 };
+            if let Some(rs) = reload_at.get(&p) {
+                for &(c, g) in rs {
+                    st[c as usize] = vec![g];
+                }
+            }
+            kill(&mut st, win_regs(p) & 0xffff_ffff);
+            if ii == n {
+                term_uses(&b.term, &mut tu);
+                for &u in &tu {
+                    check(&st, u.0, p, "terminator read", &mut out);
+                }
+                break;
+            }
+            let i = &b.insts[ii];
+            uses_defs(i, &mut us, &mut ds);
+            for u in &us {
+                check(&st, u.0, p, "read", &mut out);
+            }
+            if let Some(cl) = cfg.clobbers {
+                kill(&mut st, cl(options, f, i) & 0xffff_ffff);
+            }
+            if matches!(i, Inst::Call(..)) {
+                kill(&mut st, caller);
+                if let Some(sv) = al.saves.get(&p) {
+                    for &(v, _) in sv {
+                        if let Loc::Reg(c) = al.loc[v.0 as usize] {
+                            if !al.restore_skip.contains(&(p, v.0)) {
+                                st[c as usize] = vec![v.0];
+                            }
+                        }
+                    }
+                }
+            }
+            kill(&mut st, win_regs(p + 1) & 0xffff_ffff);
+            let same = match *i {
+                Inst::Mov(d, s2) | Inst::Conv(Conv::IntToInt(_), d, s2) => Some((d, s2)),
+                _ => None,
+            };
+            for d in &ds {
+                if let Loc::Reg(c) = al.loc[d.0 as usize] {
+                    if f.vregs[d.0 as usize] != Cls::I {
+                        continue;
+                    }
+                    let keep = matches!(same, Some((dd, s2)) if dd == *d && al.loc[s2.0 as usize] == Loc::Reg(c) && st[c as usize].contains(&s2.0));
+                    if keep {
+                        st[c as usize].push(d.0);
+                    } else {
+                        st[c as usize] = vec![d.0];
+                    }
+                }
+            }
+        }
+        for t in b.term.succs() {
+            let t = t as usize;
+            if !reach[t] {
+                continue;
+            }
+            let changed = match &mut state_in[t] {
+                None => {
+                    state_in[t] = Some(st.clone());
+                    true
+                }
+                Some(old) => {
+                    let mut ch = false;
+                    for r in 0..32 {
+                        let before = old[r].len();
+                        old[r].retain(|v| st[r].contains(v));
+                        ch |= old[r].len() != before;
+                    }
+                    ch
+                }
+            };
+            if changed {
+                work.push(t);
+            }
+        }
+    }
+    out
+}
+
 /// Saves around calls that need no store or no load (Alloc::save_skip / restore_skip): forward,
 /// a value's save slot is clean after a save until the value is redefined (paths meet by
 /// intersection); backward, a restore is needed only when the register is read before it is

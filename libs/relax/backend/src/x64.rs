@@ -6052,6 +6052,11 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     crate::stats::pass_time(11, t_ra);
     drop(_cost_ra);
     let alloc_sig = regalloc::alloc_sig(&al);
+    if crate::stats::opt_env_off("+checkra") {
+        for l in regalloc::check_alloc(options, f, &cfg, &al) {
+            eprintln!("{}", l);
+        }
+    }
     let _cost_emit = crate::probe::phase(10);
     let t_emit = crate::stats::pass_clock();
     let (win, win_start) = {

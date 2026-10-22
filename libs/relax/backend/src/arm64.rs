@@ -4372,6 +4372,11 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     crate::stats::pass_time(11, t_ra);
     drop(_cost_ra);
     let alloc_sig = regalloc::alloc_sig(&al0);
+    if crate::stats::opt_env_off("+checkra") {
+        for l in regalloc::check_alloc(options, f, &cfg, &al0) {
+            eprintln!("{}", l);
+        }
+    }
     // a function past the branch ranges is emitted again in long mode: from the same
     // allocation (allocating twice doubled a 3.7 s allocation)
     let mut long = false;
