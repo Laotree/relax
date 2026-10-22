@@ -430,6 +430,7 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
         return abort("an owner request arrived after the quiesce".into());
     };
     trace("statics taken");
+    zone_scan::stale_after_take(crate::zone_alloc::compiler_generation());
     let fresh = {
         let _c = crate::zone_alloc::compiler();
         // live edits after the swap expand the program's derives and macro calls as before it
@@ -662,7 +663,7 @@ unsafe fn commit(up: *mut Unit, f: Fresh) -> (usize, usize, (usize, usize)) {
     crate::run::set_diagnostics(u.tcx.dcx.clone());
     // Only commit invalidates TLS; an aborted restore must keep the running state's TLS valid.
     relax_session::gen_local::bump();
-    zone_scan::stale_roots(crate::zone_alloc::compiler_generation().saturating_sub(1));
+    zone_scan::stale_roots(crate::zone_alloc::compiler_generation());
     trace("commit: destroying");
     let (chunks, touched) = crate::zone_alloc::compiler_destroy_older();
     trace("commit: destroyed");
