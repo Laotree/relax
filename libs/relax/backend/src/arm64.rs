@@ -722,6 +722,8 @@ struct Gen<'a> {
     fnmul_ins: Option<(VReg, VReg)>,
     /// vregs defined once, as a zero vector (VConst 0 / FromLo64 of a constant 0)
     zero_vec: Vec<bool>,
+    /// vregs defined once, by an f32 load (a register holding one has its upper 96 bits zero)
+    f32_load: Vec<bool>,
     /// the last spill store emitted: (sp offset, register, word position right after it)
     last_spill: Option<(i64, u8, usize)>,
     /// spill windows (Alloc::windows): vreg -> (first use pos, last use pos, register); and the
@@ -3008,7 +3010,11 @@ impl<'a> Gen<'a> {
                     self.a.e(0x1E27_0000 | (rs as u32) << 5 | xd as u32); // fmov sd, wn
                 } else {
                     let xs = self.use_f(s, FS1);
-                    self.a.e(0x1E20_4000 | (xs as u32) << 5 | xd as u32); // fmov sd, sn
+                    // an f32 loaded straight into d's register is already [s, 0, 0, 0] (`ldr s`
+                    // zeroes the rest of the register)
+                    if !(xs == xd && self.f32_load[s.0 as usize]) {
+                        self.a.e(0x1E20_4000 | (xs as u32) << 5 | xd as u32); // fmov sd, sn
+                    }
                 }
                 self.fin_f(d, xd);
             }
@@ -4383,17 +4389,20 @@ fn fold_fma_negs(f: &Func) -> Option<Func> {
 
 /// Per vreg: defined exactly once, as an all-zero vector (VConst 0, or FromLo64 of a vreg defined
 /// once as the constant 0)
-fn zero_vectors(f: &Func) -> Vec<bool> {
+/// (and, per vreg, defined once by an f32 load)
+fn zero_vectors(f: &Func) -> (Vec<bool>, Vec<bool>) {
     let n = f.vregs.len();
     let mut defs = vec![0u32; n];
     let mut zint = vec![false; n];
     let mut zvec = vec![false; n];
+    let mut fload = vec![false; n];
     for b in &f.blocks {
         for i in &b.insts {
             i.defs(|d| defs[d.0 as usize] += 1);
             match *i {
                 Inst::Iconst(d, 0) => zint[d.0 as usize] = true,
                 Inst::VConst(d, 0) => zvec[d.0 as usize] = true,
+                Inst::Load(Mem::F32, d, ..) | Inst::LoadX(Mem::F32, d, ..) => fload[d.0 as usize] = true,
                 _ => {}
             }
         }
@@ -4410,7 +4419,7 @@ fn zero_vectors(f: &Func) -> Vec<bool> {
     for p in &f.params {
         defs[p.0 as usize] += 1;
     }
-    (0..n).map(|v| zvec[v] && defs[v] == 1).collect()
+    ((0..n).map(|v| zvec[v] && defs[v] == 1).collect(), (0..n).map(|v| fload[v] && defs[v] == 1).collect())
 }
 
 fn words_to_bytes(w: &[u32]) -> Vec<u8> {
@@ -4662,6 +4671,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         zero_ins: None,
         fnmul_ins: None,
         zero_vec: Vec::new(),
+        f32_load: Vec::new(),
         jt_fix: Vec::new(),
         last_spill: None,
         win: {
@@ -4716,7 +4726,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         tbz: tbz && !long,
     };
     g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
-    g.zero_vec = zero_vectors(g.f);
+    (g.zero_vec, g.f32_load) = zero_vectors(g.f);
     if env.opt_regs || g.f.full {
         g.copy_reg = regalloc::copy_reuse(options, g.f, &g.al);
     }
