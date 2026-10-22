@@ -369,15 +369,15 @@ fn park_with(i: u64, site_tag: &str, label: &str, extra: &str, regs: Vec<u64>) {
         "break",
         &format!("K{}", id),
         &format!(
-            "\"id\":\"K{}\",\"site\":\"{}\",\"at\":{},\"thread\":{},\"tid\":\"T{}\"{}{},\"more\":[\"stacks thread=T{}\",{}\"continue K{}\"]",
+            "\"id\":\"K{}\",\"site\":\"{}\",\"at\":{},\"thread\":{},\"tid\":\"{}\"{}{},\"more\":[\"stacks thread={}\",{}\"continue K{}\"]",
             id,
             site_tag,
             json_str(label),
             json_str(&thread),
-            p.os_id,
+            super::tid_label(p.os_id),
             extra,
             super::script_stack_field("script_stack", me),
-            p.os_id,
+            super::tid_label(p.os_id),
             if has_regs { format!("\"locals break=K{}\",", id) } else { String::new() },
             id
         ),
@@ -406,6 +406,13 @@ pub(super) fn find_all(u: &crate::jit::Unit, query: &str, max: usize) -> Vec<(u3
 }
 
 fn find_in(u: &crate::jit::Unit, query: &str, max: usize, inlined_too: bool) -> Vec<(u32, Option<u32>, String)> {
+    // `S35`: the fn of slot 35 (the handle answers print next to JIT frames)
+    if let Some(id) = query.strip_prefix('S').and_then(|n| n.parse::<u32>().ok()) {
+        if (id as usize) < u.fns.len() && targetable(&u.fns[id as usize], inlined_too) {
+            return vec![(id, None, u.fns[id as usize].name.to_string())];
+        }
+        return Vec::new();
+    }
     if let Some((file, line)) = query.rsplit_once(':').and_then(|(f, l)| l.parse::<u32>().ok().map(|l| (f, l))) {
         let files: Vec<u32> = u.prog.file_paths.iter().enumerate().filter(|(_, p)| p.ends_with(file)).map(|(i, _)| i as u32).collect();
         let mut out = Vec::new();
@@ -1015,6 +1022,22 @@ fn remove_rows(group: Option<u32>) -> Result<(usize, Vec<String>), String> {
     r.map(|rows| (n, rows)).ok_or_else(|| format!("the owner did not take the request in 10 s ({}); the probes are off but still in the code", crate::owner::serving_note()))
 }
 
+/// `ab per=call`: a timed count group on slot `id` (its code rebuilt with entry/exit probes at
+/// the tier of the code it replaces): (group, site ids).
+pub(crate) fn count_slot(id: u32) -> Result<(u32, Vec<u64>), String> {
+    add_to(Kind::Count, Target::Slot(id), true, false).map(|(g, rows, _)| (g, rows.iter().map(|r| r.0).collect()))
+}
+
+/// (hits, inclusive ns) of count sites `sites` together.
+pub(crate) fn site_totals(sites: &[u64]) -> (u64, u64) {
+    sites.iter().filter_map(|&si| site(si)).fold((0, 0), |a, s| (a.0 + s.hits.load(Relaxed), a.1 + s.ns.load(Relaxed)))
+}
+
+/// Removes count group `group` (the code it replaced comes back).
+pub(crate) fn remove_group(group: u32) -> Result<usize, String> {
+    remove_rows(Some(group)).map(|r| r.0)
+}
+
 #[cfg(test)]
 pub(crate) fn count_for_test(query: &str) -> Result<(u32, Vec<(u64, String, u32, String)>, Vec<String>), String> {
     add(Kind::Count, query, false, false)
@@ -1247,7 +1270,7 @@ pub fn cmd(req: &Req, out: &mut Out) {
             }
             let parked = PARKED.lock().unwrap_or_else(|e| e.into_inner());
             for p in parked.iter() {
-                out.line(&format!("{{\"parked\":\"K{}\",\"site\":\"B{}\",\"tid\":\"T{}\"}}", p.id, p.site, p.os_id));
+                out.line(&format!("{{\"parked\":\"K{}\",\"site\":\"B{}\",\"tid\":\"{}\"}}", p.id, p.site, super::tid_label(p.os_id)));
             }
             drop(sites);
             let mut injected = Vec::new();
