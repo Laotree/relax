@@ -41,7 +41,9 @@ fn expand_pcs(pcs: &[u64], partial: &mut Vec<String>) -> HashMap<u64, Vec<XFrame
                                 Some(i) if !i.stack.is_empty() => {
                                     // innermost first; the last level is the slot's own fn at the outermost call site
                                     let n = i.stack.len();
-                                    i.stack.iter().enumerate().map(|(k, (name, _, at))| XFrame { name: if k + 1 == n { own.clone() } else { name.clone() }, tier: if k + 1 == n { tier.clone() } else { "inl".into() }, at: at.clone() }).collect()
+                                    // a level the code tables cannot name: its source position names it
+                                    let unnamed = |name: &str, at: &str| if name == "(inlined fn)" { format!("(inlined code at {})", at.rsplit('/').next().unwrap_or(at).rsplitn(2, ':').last().unwrap_or(at)) } else { name.to_string() };
+                                    i.stack.iter().enumerate().map(|(k, (name, _, at))| XFrame { name: if k + 1 == n { own.clone() } else { unnamed(name, at) }, tier: if k + 1 == n { tier.clone() } else { "inl".into() }, at: at.clone() }).collect()
                                 }
                                 Some(i) => vec![XFrame { name: i.name.clone(), tier: "inl".into(), at: c.at.clone() }, XFrame { name: own, tier, at: String::new() }],
                                 None => vec![XFrame { name: own, tier, at: c.at.clone() }],

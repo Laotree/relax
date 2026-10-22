@@ -564,7 +564,16 @@ fn top(p: &Profile, q: &Q) -> Ans {
             out
         }
         "jit" => top_jit(p, t0, t1, &wname, n),
-        "fn" | "samples" => top_fn(p, t0, t1, &wname, n),
+        "fn" | "samples" => {
+            let tids: Option<Vec<u32>> = match q.get("lane") {
+                Some(l) => match pick_lanes(p, Some(l)) {
+                    Ok(v) => Some(v.iter().map(|&i| p.lanes[i].thread.tid).collect()),
+                    Err(e) => return e.into(),
+                },
+                None => None,
+            };
+            top_fn(p, t0, t1, &wname, n, tids.as_deref(), q.get("lane").unwrap_or("all lanes"))
+        }
         "gpu" => gpu(p, &Q::parse(&format!("gpu top {}", q.kv.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")))),
         other => format!("top {other}? top cpu | top fn | top jit | top gpu").into(),
     }
@@ -572,8 +581,8 @@ fn top(p: &Profile, q: &Q) -> Ans {
 
 /// `top fn`: the CPU stack samples (SAMPLES, the producer's `hz=` sampler): fns by self and
 /// inclusive weight, each with the tier it ran at (JIT inline levels are frames of their own).
-fn top_fn(p: &Profile, t0: u64, t1: u64, wname: &str, n: usize) -> Ans {
-    let v: Vec<&(u32, u8, crate::SampleRec)> = p.samples.iter().filter(|s| s.2.t >= t0 && s.2.t < t1).collect();
+fn top_fn(p: &Profile, t0: u64, t1: u64, wname: &str, n: usize, tids: Option<&[u32]>, lname: &str) -> Ans {
+    let v: Vec<&(u32, u8, crate::SampleRec)> = p.samples.iter().filter(|s| s.2.t >= t0 && s.2.t < t1 && tids.map_or(true, |t| t.contains(&s.0))).collect();
     if v.is_empty() {
         return format!("no CPU samples in {wname}: the stream samples stacks only when opened with hz=N (`pf ... hz=1000`)\nmore: top cpu  summary").into();
     }
@@ -613,7 +622,7 @@ fn top_fn(p: &Profile, t0: u64, t1: u64, wname: &str, n: usize) -> Ans {
         3 => "branch-miss",
         _ => "cache-miss",
     };
-    let mut out = Ans::new(format!("hottest fn in {} ({} samples, {} weighted): {} [{}] {}% self", wname, v.len(), ev, lg.name(p.s(first.0 .0)), tier(first.0 .1), pct(first.1, total)));
+    let mut out = Ans::new(format!("hottest fn on {} in {} ({} samples, {} weighted): {} [{}] {}% self", lname, wname, v.len(), ev, lg.name(p.s(first.0 .0)), tier(first.0 .1), pct(first.1, total)));
     let mut t = Table::new(&["fn", "tier", "self %", "incl %"]);
     for ((f, tr), w) in rows.iter().take(n) {
         t.row(vec![lg.name(p.s(*f)), tier(*tr).to_string(), pct(*w, total), pct(incl.get(f).copied().unwrap_or(0), total)]);
@@ -624,7 +633,7 @@ fn top_fn(p: &Profile, t0: u64, t1: u64, wname: &str, n: usize) -> Ans {
         out.note(format!("+{} smaller, {}% self", rows.len() - n, pct(rest, total)));
     }
     out.note(lg.render());
-    out.more("top cpu  top jit  summary");
+    out.more("top fn lane=main  top cpu  top jit  summary");
     out
 }
 
