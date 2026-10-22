@@ -2803,8 +2803,29 @@ fn region_windows_alloc(
                         }
                     }
                 }
+                // TEMPORARY (+regionchk): the round-by-round fixpoint must give the same set
+                let old_set: Option<Vec<u32>> = if crate::stats::opt_env_off("+regionchk") {
+                    let mut s2 = set.clone();
+                    loop {
+                        let inset = |b: u32| s2.binary_search(&b).is_ok();
+                        let needs = |b: u32| entered(b) && (invoke_pred[b as usize] || preds[b as usize].is_empty() || preds[b as usize].iter().any(|p| !inset(*p))) && edge_preds(b, &inset).is_none();
+                        let drop: Vec<u32> = s2.iter().copied().filter(|b| idle(*b) && needs(*b)).collect();
+                        if drop.is_empty() {
+                            break;
+                        }
+                        s2.retain(|b| !drop.contains(b));
+                    }
+                    Some(s2)
+                } else {
+                    None
+                };
                 if inset_h.len() != set.len() {
                     set.retain(|b| inset_h.contains(b));
+                }
+                if let Some(s2) = old_set {
+                    if s2 != set {
+                        eprintln!("region-check MISMATCH {} v{} r{}: old {:?} new {:?}", f.name, v, c, s2, set);
+                    }
                 }
             }
             if set.len() < if edge_loads { 1 } else { 2 } {
