@@ -22,6 +22,8 @@ pub mod patches;
 pub mod probes;
 pub mod mem;
 mod prof;
+pub mod pf;
+pub mod pstream;
 pub mod timeline;
 pub mod vars;
 pub(crate) mod symbols;
@@ -84,6 +86,7 @@ pub fn start(app: &str) {
     // SPEC-V: every answer says whether the code it observed has its borrow-check verdict
     endpoint.set_end_fields(|s| s.push_str(if crate::reload::observations_verified() { ",\"verified\":true" } else { ",\"verified\":false" }));
     let _ = WATCH.set(endpoint.register_watch_with(events::remote_watcher_opened, events::remote_watcher_closed));
+    pstream::register(&endpoint);
     serve_first_services(&endpoint);
     *ENDPOINT.lock().unwrap_or_else(|e| e.into_inner()) = Some(endpoint.clone());
     let sock = match endpoint.listen_unix(&extra) {
@@ -108,7 +111,8 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("why-hung", "[probe_ms=200]", "is it stuck and why: verdict (deadlock / blocked / busy / idle), the wait chain or cycle, stacks of the threads in it"),
     ("why-slow", "[s=3]", "where the time goes: ranked findings -- the main thread's CPU split (program / compiles / makepad run runtime / system), its hot fns, the owner's service, other busy threads"),
     ("prof", "[s=3] [hz=200] [threads=all|main|owner|program|compiler|<name>] [n=15] [save=1]", "sampling CPU profile of JIT and host frames: per-thread CPU, activity split, top fns by self time with their hottest line, inclusive fns; save=1 writes folded stacks"),
-    ("timeline", "start [max_s=30] | stop | frames [n=30] | frame <n|slowest> | save", "dataflow timeline: record UI phases, owner service, waits and wakes; per frame the critical path, work vs critical path vs wall, longest waits and who ended them; save = Chrome trace JSON"),
+    ("pf", "<summary|frames|frame F<n>|top cpu|jit|gpu|hitches|timeline F<n>|lanes|why-slow|diff> [s=3] [save=x.mkpf] [base=y.mkpf]", "the profiler for agents: the client records the app's live `prof` stream (lanes, phases, waits, compile jobs, JIT installs with tiers, GPU passes) for s seconds and answers as compact text: finding first, tables, drill-down ids; file=<x.mkpf> pf ... answers on a recording"),
+    ("timeline", "start [max_s=30] | stop | frames [n=30] | frame <n|slowest> | save", "dataflow timeline: record UI phases, owner service, waits and wakes; per frame the critical path, work vs critical path vs wall, longest waits and who ended them; save = a .mkpf profile recording (Scope, `pf` queries)"),
     ("watch", "[on=panic,hang,...] [since=<seq>] [timeout_s=N]", "block until the next event (panic, hang, ...) and answer it as one JSON line; re-arm with since=<seq>"),
     ("events", "[follow=1] [since=<seq>] [on=...]", "the recent events (follow=1: stream one JSON line per new event)"),
     ("panics", "", "panics parked now, waiting for a decision"),
@@ -164,6 +168,7 @@ fn dispatch_command(req: &Req, out: &mut Out) {
             _ => out.err("session relaunch"),
         },
         "help" => help(req, out),
+        "pf" => out.err("pf is answered by the client: makepad inspect <app> pf <query> (it attaches to the app's prof stream)"),
         "ping" => out.line(&format!("{{\"pid\":{},\"app\":{},\"ms\":{}}}", std::process::id(), json_str(&APP.lock().unwrap()), now_ms())),
         "threads" => cmd_threads(out),
         "stacks" => cmd_stacks(req, out),

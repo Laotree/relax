@@ -3050,6 +3050,9 @@ impl Unit {
     pub(crate) fn index_code(&mut self, at: u64, len: u32, id: u32, unwind: Option<relax_backend::rir::UnwindInfo>) {
         let kind = code_as_now().unwrap_or_else(|| self.default_code_kind(id));
         self.code.write().unwrap_or_else(|e| e.into_inner()).add(at, len, id, unwind, kind);
+        if crate::inspect::pstream::on() {
+            crate::inspect::pstream::jit_install(&self.fns[id as usize].name, id, len, kind.tier, kind.origin);
+        }
     }
 
     /// The kind of new code for slot `id` when its install path did not say (`code_as`): what
@@ -14970,7 +14973,17 @@ pub struct JobGuard;
 
 /// Starts a compile job: waits while an allocator swap is in progress.
 pub fn compile_job() -> JobGuard {
-    job_gate(false)
+    let g = job_gate(false);
+    // the outermost job of the thread is a `compile` span of the timeline / prof stream
+    if JOB_DEPTH.with(|d| d.get()) == 1 && crate::inspect::timeline::recording() && !JOB_SPAN.with(|s| s.replace(true)) {
+        crate::inspect::timeline::push(crate::inspect::timeline::Kind::SpanBegin, "compile", 0, 0);
+    }
+    g
+}
+
+thread_local! {
+    /// this thread's outermost compile job opened a `compile` span (its guard's drop ends it)
+    static JOB_SPAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn job_gate(reenter: bool) -> JobGuard {
@@ -15070,6 +15083,9 @@ impl Drop for JobGuard {
         });
         if outer {
             BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            if JOB_SPAN.with(|s| s.replace(false)) {
+                crate::inspect::timeline::push(crate::inspect::timeline::Kind::SpanEnd, "compile", 0, 0);
+            }
         }
     }
 }
