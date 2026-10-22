@@ -105,6 +105,12 @@ fn dis_x64_classes() {
     chk(&[0x66, 0x48, 0x0f, 0x6e, 0xc0], "movq xmm0, rax", Class::MovReg);
     chk(&[0x66, 0x0f, 0x73, 0xd8, 0x04], "psrldq xmm0, 0x4", Class::Vector);
     chk(&[0x0f, 0xc2, 0xc1, 0x01], "cmpltps xmm0, xmm1", Class::Vector);
+    // EVEX
+    chk(&[0x62, 0xf1, 0xfe, 0x48, 0x6f, 0x00], "vmovdqu64 zmm0, zmmword ptr [rax]", Class::Load);
+    chk(&[0x62, 0xf1, 0x7d, 0x48, 0xef, 0xc0], "vpxord zmm0, zmm0, zmm0", Class::MovImm);
+    chk(&[0x62, 0xf1, 0x6c, 0x49, 0x58, 0xcb], "vaddps zmm1 {k1}, zmm2, zmm3", Class::Vector);
+    chk(&[0x62, 0xf1, 0x7c, 0x48, 0x10, 0x40, 0x01], "vmovups zmm0, zmmword ptr [rax+0x40]", Class::Load);
+    chk(&[0x62, 0xf1, 0x7c, 0x58, 0x58, 0x40, 0x01], "vaddps zmm0, zmm0, dword ptr [rax+0x4]{1to16}", Class::Vector);
 }
 
 #[test]
@@ -335,6 +341,7 @@ fn norm_mnem(text: &str) -> String {
         "cltq" => "cdqe".to_string(),
         "jz" => "je".to_string(),
         "jnz" => "jne".to_string(),
+        "pclmullqlqdq" | "pclmulhqlqdq" | "pclmullqhqdq" | "pclmulhqhqdq" => "pclmulqdq".to_string(),
         _ => m,
     }
 }
@@ -380,7 +387,10 @@ fn dis_x64_vs_system_disassembler() {
             samples.entry(format!("len {}", norm_mnem(t))).or_insert((0, format!("{}   <-> ours {} [{}]", t, i.text(), i.len))).0 += 1;
             continue;
         }
-        let rm = norm_mnem(t);
+        let mut rm = norm_mnem(t);
+        if rm == "xchg" && t.contains("ax,ax") {
+            rm = "nop".to_string();
+        }
         let mut om = norm_mnem(&i.text());
         // movsq / stosb ... against movs / stos
         for s in ["movs", "cmps", "stos", "lods", "scas"] {
