@@ -2406,7 +2406,7 @@ impl Cache {
                 for rl in relocs {
                     let t = match &rl.target {
                         Reloc::Sym(s) => format!("{} +{}", crate::syms::describe(u, *s), s.off),
-                        Reloc::Slot(x) | Reloc::Thunk(x) => format!("slot {}", crate::syms::stable_fn_name(u, *x)),
+                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => format!("slot {}", crate::syms::stable_fn_name(u, *x)),
                         r => format!("{:?}", r),
                     };
                     eprintln!("makepad-run cache: RELOCS rec {} {} {}", name, rl.at, t);
@@ -2471,8 +2471,8 @@ impl Cache {
             let r = &rl.target;
             let ok = match r {
                 Reloc::Sym(s) => self.enc_sym(u, *s, &mut e, &mut rw).is_some(),
-                Reloc::Slot(x) | Reloc::Thunk(x) => {
-                    e.u8(if matches!(r, Reloc::Slot(_)) { 20 } else { 21 });
+                Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => {
+                    e.u8(match r { Reloc::Slot(_) => 20, Reloc::Call(_) => 25, _ => 21 });
                     match self.slot_bytes(u, *x) {
                         Some(b) => {
                             e.bytes(&b);
@@ -2505,7 +2505,7 @@ impl Cache {
                 self.stats.unencodable += 1;
                 if trace_on() {
                     let w = match r {
-                        Reloc::Slot(x) | Reloc::Thunk(x) => format!("slot/thunk key {}", crate::syms::stable_fn_name(u, *x)),
+                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => format!("slot/thunk key {}", crate::syms::stable_fn_name(u, *x)),
                         _ => self.last_why.to_string(),
                     };
                     trace_lookup(u, id, &format!("unstorable:{}", w));
@@ -3377,13 +3377,13 @@ impl Cache {
                     let mut e = E::default();
                     let ok = match &rl.target {
                         Reloc::Sym(s) => self.enc_sym(u, *s, &mut e, &mut rw).is_some(),
-                        Reloc::Slot(x) | Reloc::Thunk(x) => self.slot_bytes(u, *x).map(|b| e.bytes(&b)).is_some(),
+                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => self.slot_bytes(u, *x).map(|b| e.bytes(&b)).is_some(),
                         _ => false,
                     };
                     if ok && !rest.windows(e.0.len().max(1)).any(|w| w == &e.0[..]) {
                         missing.push(match &rl.target {
                             Reloc::Sym(s) => format!("{} {}", rl.at, crate::syms::describe(u, *s)),
-                            Reloc::Slot(x) | Reloc::Thunk(x) => format!("{} slot {}", rl.at, crate::syms::stable_fn_name(u, *x)),
+                            Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => format!("{} slot {}", rl.at, crate::syms::stable_fn_name(u, *x)),
                             _ => String::new(),
                         });
                     }
@@ -3392,7 +3392,7 @@ impl Cache {
                 for rl in relocs {
                     let t = match &rl.target {
                         Reloc::Sym(s) => format!("{} +{}", crate::syms::describe(u, *s), s.off),
-                        Reloc::Slot(x) | Reloc::Thunk(x) => format!("slot {}", crate::syms::stable_fn_name(u, *x)),
+                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => format!("slot {}", crate::syms::stable_fn_name(u, *x)),
                         r => format!("{:?}", r),
                     };
                     eprintln!("makepad-run cache: RELOCS fresh {} {} {}", name, rl.at, t);
@@ -3411,8 +3411,8 @@ impl Cache {
             let mut e = E::default();
             let ok = match r {
                 Reloc::Sym(s) => self.enc_sym(u, *s, &mut e, &mut rw).is_some(),
-                Reloc::Slot(x) | Reloc::Thunk(x) => {
-                    e.u8(if matches!(r, Reloc::Slot(_)) { 20 } else { 21 });
+                Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => {
+                    e.u8(match r { Reloc::Slot(_) => 20, Reloc::Call(_) => 25, _ => 21 });
                     match self.slot_bytes(u, *x) {
                         Some(b) => {
                             e.bytes(&b);
@@ -3428,7 +3428,7 @@ impl Cache {
             };
             let cbytes = d.b.get(d.p..d.p + e.0.len()).map(|x| x.to_vec());
             if co != *o || ck != Some(rl.kind) || !ok || cbytes.as_deref() != Some(&e.0[..]) {
-                eprintln!("makepad-run cache: VERIFY RELOC differs: {} at {} ({:?} -> {})", name, o, r, match r { Reloc::Sym(s) => crate::syms::describe(u, *s), Reloc::Slot(x) | Reloc::Thunk(x) => crate::syms::stable_fn_name(u, *x), _ => String::new() });
+                eprintln!("makepad-run cache: VERIFY RELOC differs: {} at {} ({:?} -> {})", name, o, r, match r { Reloc::Sym(s) => crate::syms::describe(u, *s), Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => crate::syms::stable_fn_name(u, *x), _ => String::new() });
                 return false;
             }
             d.p += e.0.len();
@@ -3452,6 +3452,8 @@ fn kind_code(k: RelocKind) -> u8 {
         RelocKind::A64LdrLo12X => 4,
         RelocKind::Imm32 => 5,
         RelocKind::A64MovzMovk => 6,
+        RelocKind::X64Branch32 => 7,
+        RelocKind::A64Branch26 => 8,
     }
 }
 
@@ -3464,6 +3466,8 @@ fn kind_of(c: u8) -> Option<RelocKind> {
         4 => RelocKind::A64LdrLo12X,
         5 => RelocKind::Imm32,
         6 => RelocKind::A64MovzMovk,
+        7 => RelocKind::X64Branch32,
+        8 => RelocKind::A64Branch26,
         _ => return None,
     })
 }
@@ -6730,16 +6734,16 @@ impl Linker {
             let kind = kind_of(d.u8()?)?;
             let tag = d.b.get(d.p).copied()?;
             let v = match tag {
-                20 | 21 => {
+                20 | 21 | 25 => {
                     d.u8()?;
                     let b = d.bytes()?;
                     let sid = self.slot_of_bytes(u, b)?;
-                    if tag == 20 {
-                        callees.push(sid);
-                    } else {
+                    if tag == 21 {
                         thunks.push(sid);
+                    } else {
+                        callees.push(sid);
                     }
-                    u.env.reloc_value(if tag == 20 { Reloc::Slot(sid) } else { Reloc::Thunk(sid) })
+                    u.env.reloc_value(match tag { 20 => Reloc::Slot(sid), 25 => Reloc::Call(sid), _ => Reloc::Thunk(sid) })
                 }
                 22 => {
                     d.u8()?;
