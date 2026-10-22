@@ -1357,7 +1357,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     let (evicts, prestores, lent) = if evict_on && loc.iter().any(|l| matches!(l, Loc::Stack(_))) {
         // values in a coalesced unit, passed-through loop pieces and recomputed ones keep their place
         let skip: Vec<bool> = (0..nv).map(|v| unit_members(v).is_some() || parent[v as usize] != v || is_low(v) || remat[v as usize].is_some()).collect();
-        second_chance(options, f, &reach, &tab, &block_start, &block_end, &ranges, &wts, cfg, &used_callee_int, &call_pos, &mut loc, &remat, &skip, &refs, &mut occ, pos_words, &mut spill_bytes)
+        second_chance(options, f, &reach, &tab, &block_start, &block_end, &ranges, &wts, cfg, &used_callee_int, &call_pos, &mut loc, &remat, &skip, &refs, &mut occ, pos_words)
     } else {
         Default::default()
     };
@@ -1469,6 +1469,23 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     for v in 0..nv as usize {
         if !matches!(loc[v], Loc::None) {
             remat[v] = Remat::No;
+        }
+    }
+    // eviction slots (second_chance numbered them) after the packed spill slots
+    let (mut evicts, mut prestores) = (evicts, prestores);
+    if !prestores.is_empty() {
+        let mut off: Vec<i32> = Vec::new();
+        for _ in 0..prestores.len() {
+            spill_bytes = grow_spill(spill_bytes, Cls::I);
+            off.push(spill_bytes as i32);
+        }
+        for p in prestores.iter_mut() {
+            p.3 = off[p.3 as usize];
+        }
+        for e in evicts.iter_mut() {
+            if !e.remat.is_some() {
+                e.slot = off[e.slot as usize];
+            }
         }
     }
     let mut saves: HashMap<u32, Vec<(VReg, i32)>> = HashMap::new();
@@ -1715,7 +1732,6 @@ fn second_chance(
     refs_w: &[f32],
     occ: &mut [Vec<u64>],
     pos_words: usize,
-    spill_bytes: &mut u32,
 ) -> (Vec<Evict>, Vec<(u32, u32, u8, i32)>, Vec<(u8, u32, u32)>) {
     let nv = f.vregs.len();
     let mut evicts: Vec<Evict> = Vec::new();
@@ -1947,10 +1963,9 @@ fn second_chance(
         let slot = if rm {
             0
         } else {
-            *slot_of.entry(g).or_insert_with(|| {
-                *spill_bytes = grow_spill(*spill_bytes, Cls::I);
-                *spill_bytes as i32
-            })
+            // an index here: offsets are given once the spill slots are packed (pack_spill_slots)
+            let k = slot_of.len() as i32;
+            *slot_of.entry(g).or_insert(k)
         };
         if !rm && !prestored.contains_key(&g) {
             let (db, di) = def_at[gi];
@@ -1981,6 +1996,10 @@ pub fn check_alloc(options: &relax_session::Options, f: &Func, cfg: &RegConfig, 
     let mut reload_at: HashMap<u32, Vec<(u8, u32)>> = HashMap::new();
     for e in &al.evicts {
         reload_at.entry(e.reload).or_default().push((e.reg, e.v));
+    }
+    let mut prestore_at: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(p, v, _, _) in &al.prestores {
+        prestore_at.entry(p).or_default().push(v);
     }
     // positions where a window occupies a register
     let wins: Vec<(u32, u32, u8)> = al.windows.iter().chain(al.chained.iter()).map(|&(_, a, z, r)| (a, z, r)).collect();
@@ -2045,6 +2064,12 @@ pub fn check_alloc(options: &relax_session::Options, f: &Func, cfg: &RegConfig, 
         };
         for ii in 0..=n {
             let p = if ii < n { bs + 2 * ii as u32 + 1 } else { al.block_end[bi] - 1 };
+            // a prestore stores the register: it must hold its value
+            if let Some(vs) = prestore_at.get(&p) {
+                for &v in vs {
+                    check(&st, v, p, "prestore", &mut out);
+                }
+            }
             if let Some(rs) = reload_at.get(&p) {
                 for &(c, g) in rs {
                     st[c as usize] = vec![g];
