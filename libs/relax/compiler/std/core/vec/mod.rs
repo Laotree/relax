@@ -628,6 +628,10 @@ pub fn from_elem<T: Clone>(elem: T, n: usize) -> Vec<T> {
     }
     let mut v = Vec::with_capacity(n);
     v.extend_with(n, elem);
+    // extend_with wrote all n elements (a panicking clone never gets here): the caller sees the
+    // length n, not a load after the call, so its bounds checks against `n` fold (LLVM inlines
+    // extend_with and knows the same)
+    v.len = n;
     v
 }
 

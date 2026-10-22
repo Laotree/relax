@@ -1698,7 +1698,11 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         }
         // profitability: a loop is worth it for a field it both loads and stores (the carried state:
         // a cursor index, a bit buffer); load-only fields come along, write-only ones are left
-        if !take.iter().any(|x| x.2 && x.3) {
+        // Load-only fields alone are LLVM LICM's invariant-load hoisting: a Vec's pointer and length
+        // read through `&mut self` in a loop that writes only through the heap pointer (vorbis
+        // `self.spectra[i] *= self.curves[i]` reloaded both headers every iteration).
+        // MAKEPAD_RUN_OPT=-promoteld: carried fields only.
+        if !take.iter().any(|x| x.2 && x.3) && (relax_backend::stats::opt_env_off("-promoteld") || !take.iter().any(|x| x.2)) {
             continue;
         }
         take.retain(|x| x.2);
