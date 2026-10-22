@@ -10765,6 +10765,9 @@ impl<'a> Lcx<'a> {
                 "ceil" => FUn::Ceil,
                 "trunc" => FUn::Trunc,
                 "rint" => FUn::RoundEven,
+                // round half away from zero (Rust `round`): inline on both backends (x64
+                // trunc(x + copysign(0.5 - ulp/2, x)), arm64 frinta), not a libm call
+                "round" => FUn::RoundAway,
                 _ => return None,
             })
         };
