@@ -1117,6 +1117,11 @@ fn launch_main(upn: usize, id: DomainId, base: u64, target: u64, arg: u64, packa
         crate::jit::ensure_altstack();
         if crate::run::app_domain() == Some(id) {
             crate::jit::MAIN_TID.store(crate::jit::current_thread_id(), std::sync::atomic::Ordering::Relaxed);
+            // The app's main thread runs its UI (Cx event loop, frame build, HAL submit): natively that is the
+            // process main thread, which macOS runs at QOS_CLASS_USER_INTERACTIVE. A spawned thread starts at
+            // the default class, the same class as the JIT's O3 workers and any background load, and loses the
+            // P-cores to them on a busy machine; give it the class the native main thread has.
+            crate::os::thread::interactive();
         }
         let up = upn as *mut Unit;
         relax_domain_enter(base, token);
