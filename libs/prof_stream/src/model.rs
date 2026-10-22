@@ -128,6 +128,10 @@ pub struct Profile {
     /// records lost by lane (DROP)
     pub dropped: Vec<(u32, u64)>,
     pub marks: Vec<(u64, u32)>,
+    /// CPU stack samples (SAMPLES): (stream tid, event, sample)
+    pub samples: Vec<(u32, u8, crate::SampleRec)>,
+    /// counter values (COUNTERS)
+    pub counters: Vec<crate::CounterRec>,
     /// the earliest and latest time seen
     pub t_min: u64,
     pub t_max: u64,
@@ -283,6 +287,20 @@ impl Profile {
                 let (t, name) = (d.u()?, d.u()? as u32);
                 self.see(t);
                 self.marks.push((t, name));
+            }
+            kind::SAMPLES => {
+                let (tid, ev, v) = crate::decode_samples(payload)?;
+                self.lane_of(tid);
+                for r in v {
+                    self.see(r.t);
+                    self.samples.push((tid, ev, r));
+                }
+            }
+            kind::COUNTERS => {
+                for c in crate::decode_counters(payload)? {
+                    self.see(c.t);
+                    self.counters.push(c);
+                }
             }
             _ => {}
         }
