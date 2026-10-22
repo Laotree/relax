@@ -3269,6 +3269,14 @@ fn summary_inner(why: &str) {
     if !SILENT.load(Ordering::Relaxed) {         verbose!("makepad-run: opt passes (cpu ms): {}", passes); }
             verbose!("makepad-run: invokes {} seen, {} made plain calls", relax_codegen::opt::INVOKES_SEEN.load(Ordering::Relaxed), relax_codegen::opt::INVOKES_DEMOTED.load(Ordering::Relaxed));
         }
+        if relax_backend::dbgloc::stats_on() {
+            let st = &relax_backend::dbgloc::STATS;
+            let g = |k: usize| st[k].load(Ordering::Relaxed);
+            eprintln!(
+                "makepad-run: variable tables: {} of {} bodies, {} KB of tables, {} KB in pc maps (+{:.1}% on the code entries' {} KB), {:.0} B per body with a table",
+                g(0), g(1), g(2) / 1024, g(3) / 1024, 100.0 * g(3) as f64 / g(4).max(1) as f64, g(4) / 1024, g(3) as f64 / g(0).max(1) as f64
+            );
+        }
         if relax_backend::rir::unwind_stats_on() {
             let st = &relax_backend::rir::UNWIND_STATS;
             verbose!("makepad-run: unwind bytes: pads {} KB, landing stubs {} KB, trailers {} KB; invokes emitted {}", st[0].load(Ordering::Relaxed) / 1024, st[1].load(Ordering::Relaxed) / 1024, st[2].load(Ordering::Relaxed) / 1024, st[3].load(Ordering::Relaxed));
