@@ -19,6 +19,8 @@ fn all_passes(f: &mut Func) {
         opt::forward_slot_copies(f);
         opt::forward_slot_dests(f);
         opt::forward_slot_loads(f);
+        opt::forward_param_fields(&relax_session::Options::default(), f);
+        opt::fold_small_sets(f);
         passes::sroa(f);
         passes::simplify(&relax_session::Options::default(), f, None, true, true);
         passes::licm(&relax_session::Options::default(), f);

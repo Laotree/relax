@@ -6247,6 +6247,270 @@ pub fn promote_dyn_read_slots(f: &mut Func) -> bool {
     true
 }
 
+/// Redundant loads of a `noalias` parameter's fields (LLVM GVN's load elimination through memory
+/// phis): a load of `[p + off]` that every path reaches with the field's value known -- stored
+/// there, or loaded before -- with nothing in between that may write it, reads that value from a
+/// register. RIR is not SSA, so the value lives in one fresh variable per field, assigned at each
+/// store (canonical for the field's type) and after each load that stays; the variable is read
+/// only by the forwarded loads (the others' copies are dead and go to live_dce).
+///
+/// Legality (as promote_loop_memory): p is a parameter defined once, `noalias` and not captured,
+/// so only accesses through pointers based on it reach its pointee. A call given a based-on
+/// pointer, any other access through one (indexed, vector, copies, atomics), an atomic or fence
+/// anywhere forgets every field of p; a store to overlapping bytes of another type forgets the
+/// field. Calls not given p cannot touch the pointee and keep the facts (the stores stay in
+/// place, so an unwind still sees memory as the program wrote it). Brotli's state machine
+/// (`s.br.bit_pos_` loaded, bumped and stored, then loaded again in the next block). Returns
+/// whether anything changed.
+pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> bool {
+    if opt_off(options, "-fwdfields") || f.noalias.is_empty() {
+        return false;
+    }
+    let nv = f.vregs.len();
+    let nb = f.blocks.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+        }
+    }
+    let reach = reachable(f);
+    let mut preds: Vec<Vec<u32>> = vec![Vec::new(); nb];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        if reach[bi] {
+            for t in b.term.succs() {
+                preds[t as usize].push(bi as u32);
+            }
+        }
+    }
+    let mut changed = false;
+    for pi in 0..f.noalias.len() {
+        let p = f.noalias[pi];
+        if ndef[p.0 as usize] != 1 || !f.params.contains(&p) {
+            continue;
+        }
+        let nv = f.vregs.len();
+        let mut based = vec![false; nv];
+        based[p.0 as usize] = true;
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if matches!(i, Inst::Load(..) | Inst::LoadX(..) | Inst::AtomicLoad(..)) {
+                        continue;
+                    }
+                    let mut any = false;
+                    for_uses(i, |u| any |= based[u.0 as usize]);
+                    if any {
+                        for_defs(i, |d| {
+                            if !based[d.0 as usize] {
+                                based[d.0 as usize] = true;
+                                grew = true;
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        let mut captured = false;
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Store(_, _, _, src) | Inst::StoreX(_, _, _, _, _, src) | Inst::VStore(_, _, src) | Inst::AtomicStore(_, _, _, src) => captured |= based[src.0 as usize],
+                    Inst::AtomicRmw(_, _, _, _, _, src) => captured |= based[src.0 as usize],
+                    Inst::AtomicCas(_, _, _, _, _, e, nw) => captured |= based[e.0 as usize] || based[nw.0 as usize],
+                    Inst::Call(c, args, _) => {
+                        captured |= args.iter().enumerate().any(|(k, a)| based[a.0 as usize] && !sroa_nocapture(c, k));
+                        if let Callee::Indirect(v) | Callee::CIndirect(v, _) = c {
+                            captured |= based[v.0 as usize];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Term::Ret(vs) = &b.term {
+                captured |= vs.iter().any(|v| based[v.0 as usize]);
+            }
+        }
+        if captured {
+            continue;
+        }
+        // the fields: exact (offset, type) accesses through p itself
+        let mut fields: Vec<(i32, Mem)> = Vec::new();
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Load(m, _, base, off) | Inst::Store(m, base, off, _) = *i {
+                    if base == p && !fields.contains(&(off, m)) && fields.len() < 64 {
+                        fields.push((off, m));
+                    }
+                }
+            }
+        }
+        if fields.is_empty() {
+            continue;
+        }
+        let nf = fields.len();
+        let overlap = |a: (i32, Mem), b: (i32, Mem)| a.0 < b.0 + mem_size(b.1) && b.0 < a.0 + mem_size(a.1);
+        let field_of = |m: Mem, off: i32| fields.iter().position(|x| *x == (off, m));
+        // the effect of one instruction on the known fields (bit k: field k known)
+        #[derive(Clone, Copy)]
+        enum Eff {
+            None,
+            // field known, other fields forgotten (a store over their bytes)
+            Gen(usize, u64),
+            KillAll,
+        }
+        let all: u64 = if nf == 64 { u64::MAX } else { (1u64 << nf) - 1 };
+        let eff = |i: &Inst| -> Eff {
+            match *i {
+                Inst::Load(m, _, base, off) if base == p => match field_of(m, off) {
+                    Some(k) => Eff::Gen(k, 0),
+                    None => Eff::None,
+                },
+                Inst::Store(m, base, off, _) if base == p => {
+                    let k = field_of(m, off).unwrap();
+                    let mut kill = 0u64;
+                    for (j, x) in fields.iter().enumerate() {
+                        if j != k && overlap(*x, (off, m)) {
+                            kill |= 1 << j;
+                        }
+                    }
+                    Eff::Gen(k, kill)
+                }
+                Inst::Call(ref c, ref args, _) => {
+                    if args.iter().any(|a| based[a.0 as usize]) || matches!(c, Callee::Asm(_)) {
+                        Eff::KillAll
+                    } else {
+                        Eff::None
+                    }
+                }
+                Inst::AtomicLoad(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..) => Eff::KillAll,
+                Inst::Load(_, _, base, _) | Inst::LoadX(_, _, base, _, _, _) | Inst::VLoad(_, base, _) | Inst::VGather(_, base, _) | Inst::VTbl(_, base, _, _) => {
+                    // a read elsewhere through a based-on pointer changes nothing
+                    let _ = base;
+                    Eff::None
+                }
+                Inst::Store(_, base, _, _) | Inst::StoreX(_, base, _, _, _, _) | Inst::VStore(base, _, _) | Inst::VStoreX(base, _, _, _, _) if based[base.0 as usize] => Eff::KillAll,
+                Inst::Copy(d, _, _) if based[d.0 as usize] => Eff::KillAll,
+                _ => Eff::None,
+            }
+        };
+        let apply = |st: u64, e: Eff| -> u64 {
+            match e {
+                Eff::None => st,
+                Eff::Gen(k, kill) => (st & !kill) | 1 << k,
+                Eff::KillAll => 0,
+            }
+        };
+        // forward must-availability
+        let mut out = vec![all; nb];
+        let mut inn = vec![0u64; nb];
+        let mut work = true;
+        while work {
+            work = false;
+            for bi in 0..nb {
+                if !reach[bi] {
+                    continue;
+                }
+                let mut st = if bi == 0 { 0 } else { preds[bi].iter().fold(all, |a, &q| a & out[q as usize]) };
+                inn[bi] = st;
+                for i in &f.blocks[bi].insts {
+                    st = apply(st, eff(i));
+                }
+                if st != out[bi] {
+                    out[bi] = st;
+                    work = true;
+                }
+            }
+        }
+        // the loads whose field is known on arrival
+        let mut fwd: Vec<(usize, usize, usize)> = Vec::new(); // block, index, field
+        let mut used = vec![false; nf];
+        for bi in 0..nb {
+            if !reach[bi] {
+                continue;
+            }
+            let mut st = inn[bi];
+            for (k, i) in f.blocks[bi].insts.iter().enumerate() {
+                if let Inst::Load(m, _, base, off) = *i {
+                    if base == p {
+                        if let Some(j) = field_of(m, off) {
+                            if st & (1 << j) != 0 {
+                                fwd.push((bi, k, j));
+                                used[j] = true;
+                            }
+                        }
+                    }
+                }
+                st = apply(st, eff(i));
+            }
+        }
+        if fwd.is_empty() {
+            continue;
+        }
+        // one variable per forwarded field
+        let vars: Vec<Option<VReg>> = (0..nf)
+            .map(|j| {
+                used[j].then(|| {
+                    f.vreg(match fields[j].1 {
+                        Mem::F32 => Cls::F32,
+                        Mem::F64 => Cls::F64,
+                        Mem::Int(..) => Cls::I,
+                    })
+                })
+            })
+            .collect();
+        for bi in 0..nb {
+            if !reach[bi] {
+                continue;
+            }
+            let old = std::mem::take(&mut f.blocks[bi].insts);
+            let old_pos = std::mem::take(&mut f.blocks[bi].pos);
+            let mut ins = Vec::with_capacity(old.len() + 4);
+            let mut pos = Vec::with_capacity(old.len() + 4);
+            for (k, (i, ps)) in old.into_iter().zip(old_pos).enumerate() {
+                match i {
+                    Inst::Load(m, d, base, off) if base == p && field_of(m, off).map_or(false, |j| vars[j].is_some()) => {
+                        let v = vars[field_of(m, off).unwrap()].unwrap();
+                        if fwd.iter().any(|x| x.0 == bi && x.1 == k) {
+                            ins.push(Inst::Mov(d, v));
+                            pos.push(ps);
+                        } else {
+                            ins.push(i);
+                            pos.push(ps);
+                            ins.push(Inst::Mov(v, d));
+                            pos.push(ps);
+                        }
+                    }
+                    Inst::Store(m, base, off, x) if base == p && field_of(m, off).map_or(false, |j| vars[j].is_some()) => {
+                        let v = vars[field_of(m, off).unwrap()].unwrap();
+                        ins.push(i);
+                        pos.push(ps);
+                        // the value a load of this type returns
+                        ins.push(match m {
+                            Mem::Int(n, sg) if n < 8 => Inst::Conv(Conv::IntToInt(IntTy { bits: n * 8, signed: sg }), v, x),
+                            _ => Inst::Mov(v, x),
+                        });
+                        pos.push(ps);
+                    }
+                    _ => {
+                        ins.push(i);
+                        pos.push(ps);
+                    }
+                }
+            }
+            f.blocks[bi].insts = ins;
+            f.blocks[bi].pos = pos;
+        }
+        changed = true;
+    }
+    changed
+}
+
 /// The mask idiom of bit readers, `x & ((1 << n) - 1)` (and `x & !(-1 << n)`) on 64-bit values,
 /// becomes `x bzhi n` (IOp::Bzhi) when the shift and the mask are read only there: x64 BMI2 `and`
 /// of the count + `bzhi` (was `mov 1; shlx; sub; and`, a three-deep chain), arm64 `movn; lslv;
