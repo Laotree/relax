@@ -41,7 +41,7 @@ mod collected;
 pub use collected::{CollectedCache, CollectedRecord, CollectedWritten};
 mod image;
 use image::{ManifestImage, IMAGE_MAGIC};
-pub(crate) use image::{complete_identities_unit, ids_report_unit, image_slot_by_key_unit, name_unnamed_unit, prelink_unit, PrelinkedSlot};
+pub(crate) use image::{complete_identities_unit, ids_report_unit, image_broken_unit, image_slot_by_key_unit, name_unnamed_unit, prelink_unit, PrelinkedSlot};
 mod items;
 mod demand;
 mod front_run;
@@ -308,6 +308,9 @@ pub struct CacheStats {
     pub ids_failed: u64,
     pub ids_ns: u64,
     pub ids_bg: u64,
+    /// of them, decoded in the prelink because their keys name a changed crate, and its wall ns
+    pub ids_unsure: u64,
+    pub ids_unsure_ns: u64,
 }
 
 /// Interior storage for the cache installed in a Unit. The owner thread protects
@@ -350,6 +353,11 @@ fn pending_current(u: &Unit, p: &PendingRecord) -> bool {
 
 /// The slots whose RIR the code of `id` took in (`Unit::body_deps` from `id` and `extra`,
 /// transitively), without `id` itself.
+/// What code addressing a `#[thread_local]` static depends on of its place.
+fn tls_shape(pl: &crate::jit::TlsPlace) -> u8 {
+    pl.fixed as u8 | (pl.init.is_some() as u8) << 1
+}
+
 fn record_deps(u: &Unit, id: u32, extra: &[u32]) -> Vec<u32> {
     let mut stack: Vec<u32> = extra.iter().copied().chain(u.body_deps.get(&id).into_iter().flatten().copied()).collect();
     let mut deps = Vec::new();
@@ -498,6 +506,12 @@ pub struct Cache {
     /// carries a fresh image
     image_slots: usize,
     image_stale: usize,
+    /// code reached a slot of the loaded image without an identity (`image_broken`): the
+    /// manifest carries no image from now on (written at once, at exit too), so no later run
+    /// starts from it
+    image_bad: bool,
+    /// the root crate whose manifest load_manifest read
+    manifest_root: Option<u32>,
     /// slot -> the code entry its code was linked from this run (lazily or prelinked): the next
     /// manifest's image takes that entry
     linked_key: HashMap<u32, u128>,
@@ -647,6 +661,18 @@ impl Cache {
         // which crates are bound to the loader's rustc build (provided.rs) is in the interface
         // fingerprints (items::apply_bound), so only the code that can reach a bound crate is keyed by it
         cfgh.u128(u.prog.session.options.fingerprint());
+        // the static a #[global_allocator] program's allocator shim calls: code inlining a shim
+        // caller (core::heap::alloc & co) is certified by crate fingerprints, which do not show
+        // whether or which allocator the program has (the static's type is in the shim callers'
+        // own keys, code_key_bytes)
+        match u.global_allocator_static() {
+            Some(s) => {
+                cfgh.u8(1);
+                cfgh.u128(crate_ident.get(prog.def(s).krate as usize).copied().unwrap_or(0));
+                cfgh.str(&prog.def_path(s));
+            }
+            None => cfgh.u8(0),
+        }
         let mut c = Cache {
             verbose,
             mode,
@@ -708,6 +734,8 @@ impl Cache {
             manifest_done: false,
             image_slots: 0,
             image_stale: 0,
+            image_bad: false,
+            manifest_root: None,
             linked_key: HashMap::new(),
             slot_keys: HashMap::new(),
             key_waits: false,
@@ -1164,6 +1192,11 @@ impl Cache {
 
     fn dec_file(&mut self, u: &Unit, d: &mut D) -> Option<u32> {
         let ident = d.u128()?;
+        self.file_by_ident(u, ident)
+    }
+
+    /// The file of this program with identity `ident` (enc_file).
+    fn file_by_ident(&mut self, u: &Unit, ident: u128) -> Option<u32> {
         if ident == 0 { return None; }
         if self.file_ids_n != u.prog.file_paths.len() {
             for i in self.file_ids_n..u.prog.file_paths.len() {
@@ -1813,6 +1846,19 @@ impl Cache {
         let mut crates = Vec::new();
         let outer = self.enc_defs.replace(Vec::new());
         let r = self.enc_fnkey(u, key, &mut e, &mut crates, 0);
+        // the allocator shim's callers call the program's #[global_allocator] (or the default):
+        // their code depends on it, which the fn's own identity does not show
+        let mut shim = E::default();
+        if key_defs(u, key).first().is_some_and(|&d| u.calls_allocator_shim(d)) {
+            match u.global_allocator() {
+                Some((s, t)) => {
+                    shim.u8(1);
+                    self.enc_def(u, s, &mut shim, &mut crates);
+                    self.enc_ty(u, t, &mut shim, &mut crates, 0)?;
+                }
+                None => shim.u8(0),
+            }
+        }
         let named = std::mem::replace(&mut self.enc_defs, outer).unwrap_or_default();
         r?;
         // code of (or instantiated with) a crate loaded after the cache opened: never cached
@@ -1832,6 +1878,7 @@ impl Cache {
                 h.str("code");
                 h.u128(self.cfg);
                 h.write(&e.0);
+                h.write(&shim.0);
                 for &c in &crates {
                     h.u128(*self.iface.get(c as usize)?);
                 }
@@ -2062,6 +2109,15 @@ impl Cache {
             SymKind::Provided(n) => {
                 e.u8(9);
                 e.str(&n);
+            }
+            // a `#[thread_local]` static's offset: placed again by the linking run, which must
+            // give the code's shape (static TLS or the block, the first-access copy or not)
+            SymKind::ThreadLocal(d) => {
+                let pl = u.tls_places.get(&d).copied()?;
+                e.u8(11);
+                e.u8(tls_shape(&pl));
+                let mut cr = Vec::new();
+                self.enc_def(u, d, e, &mut cr);
             }
         }
         e.u64(s.off as u64);
@@ -2364,7 +2420,7 @@ impl Cache {
                 for rl in relocs {
                     let t = match &rl.target {
                         Reloc::Sym(s) => format!("{} +{}", crate::syms::describe(u, *s), s.off),
-                        Reloc::Slot(x) | Reloc::Thunk(x) => format!("slot {}", crate::syms::stable_fn_name(u, *x)),
+                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => format!("slot {}", crate::syms::stable_fn_name(u, *x)),
                         r => format!("{:?}", r),
                     };
                     eprintln!("makepad-run cache: RELOCS rec {} {} {}", name, rl.at, t);
@@ -2429,8 +2485,8 @@ impl Cache {
             let r = &rl.target;
             let ok = match r {
                 Reloc::Sym(s) => self.enc_sym(u, *s, &mut e, &mut rw).is_some(),
-                Reloc::Slot(x) | Reloc::Thunk(x) => {
-                    e.u8(if matches!(r, Reloc::Slot(_)) { 20 } else { 21 });
+                Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => {
+                    e.u8(match r { Reloc::Slot(_) => 20, Reloc::Call(_) => 25, _ => 21 });
                     match self.slot_bytes(u, *x) {
                         Some(b) => {
                             e.bytes(&b);
@@ -2463,7 +2519,7 @@ impl Cache {
                 self.stats.unencodable += 1;
                 if trace_on() {
                     let w = match r {
-                        Reloc::Slot(x) | Reloc::Thunk(x) => format!("slot/thunk key {}", crate::syms::stable_fn_name(u, *x)),
+                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => format!("slot/thunk key {}", crate::syms::stable_fn_name(u, *x)),
                         _ => self.last_why.to_string(),
                     };
                     trace_lookup(u, id, &format!("unstorable:{}", w));
@@ -2589,6 +2645,7 @@ impl Cache {
     }
 
     pub fn load_manifest(&mut self, root: u32) {
+        self.manifest_root = Some(root);
         let Some(key) = self.manifest_key(root) else { return };
         if let Some(pk) = self.stores.iter().find(|st| st.path == self.code_path[root as usize]).cloned() {
             if let Some((KIND_MANIFEST, p)) = pk.get(key) {
@@ -2659,7 +2716,7 @@ impl Cache {
         // keeps the image (a rewrite there covers only the slots already keyed, and the
         // next start would prelink a few dozen slots instead of ~20,000). Slots whose entry
         // an O2/O3 build replaced since stay lazy at the next start (image.rs img_live).
-        if self.manifest_done && crate::preempt::is_stopped() {
+        if self.manifest_done && crate::preempt::is_stopped() && !self.image_bad {
             return true;
         }
         let Some(key) = self.manifest_key(root) else { self.manifest_done = true; return true };
@@ -2690,7 +2747,7 @@ impl Cache {
             self.manifest_done = true;
             return true;
         }
-        let img = if self.mode != Mode::Verify {
+        let img = if self.mode != Mode::Verify && !self.image_bad {
             match self.build_image(u, &present_ids, stop) { Err(()) => return false, Ok(img) => img }
         } else { None };
         self.manifest_done = true;
@@ -2699,7 +2756,7 @@ impl Cache {
         // mid-run write) must not replace the loaded image with one covering fewer slots: the
         // next start would prelink a fraction of it (Calculator: 16,000 -> 2 slots)
         let n_img = img.as_ref().map_or(0, |i| i.1 as usize);
-        if crate::preempt::is_stopped() && self.image_slots > 0 && n_img * 50 < self.image_slots * 49 {
+        if crate::preempt::is_stopped() && self.image_slots > 0 && n_img * 50 < self.image_slots * 49 && !self.image_bad {
             if self.verbose {
                 eprintln!("makepad-run cache: startup manifest kept: at exit the image would cover {} of the {} slots the loaded one has", n_img, self.image_slots);
             }
@@ -3334,13 +3391,13 @@ impl Cache {
                     let mut e = E::default();
                     let ok = match &rl.target {
                         Reloc::Sym(s) => self.enc_sym(u, *s, &mut e, &mut rw).is_some(),
-                        Reloc::Slot(x) | Reloc::Thunk(x) => self.slot_bytes(u, *x).map(|b| e.bytes(&b)).is_some(),
+                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => self.slot_bytes(u, *x).map(|b| e.bytes(&b)).is_some(),
                         _ => false,
                     };
                     if ok && !rest.windows(e.0.len().max(1)).any(|w| w == &e.0[..]) {
                         missing.push(match &rl.target {
                             Reloc::Sym(s) => format!("{} {}", rl.at, crate::syms::describe(u, *s)),
-                            Reloc::Slot(x) | Reloc::Thunk(x) => format!("{} slot {}", rl.at, crate::syms::stable_fn_name(u, *x)),
+                            Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => format!("{} slot {}", rl.at, crate::syms::stable_fn_name(u, *x)),
                             _ => String::new(),
                         });
                     }
@@ -3349,7 +3406,7 @@ impl Cache {
                 for rl in relocs {
                     let t = match &rl.target {
                         Reloc::Sym(s) => format!("{} +{}", crate::syms::describe(u, *s), s.off),
-                        Reloc::Slot(x) | Reloc::Thunk(x) => format!("slot {}", crate::syms::stable_fn_name(u, *x)),
+                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => format!("slot {}", crate::syms::stable_fn_name(u, *x)),
                         r => format!("{:?}", r),
                     };
                     eprintln!("makepad-run cache: RELOCS fresh {} {} {}", name, rl.at, t);
@@ -3368,8 +3425,8 @@ impl Cache {
             let mut e = E::default();
             let ok = match r {
                 Reloc::Sym(s) => self.enc_sym(u, *s, &mut e, &mut rw).is_some(),
-                Reloc::Slot(x) | Reloc::Thunk(x) => {
-                    e.u8(if matches!(r, Reloc::Slot(_)) { 20 } else { 21 });
+                Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => {
+                    e.u8(match r { Reloc::Slot(_) => 20, Reloc::Call(_) => 25, _ => 21 });
                     match self.slot_bytes(u, *x) {
                         Some(b) => {
                             e.bytes(&b);
@@ -3385,7 +3442,7 @@ impl Cache {
             };
             let cbytes = d.b.get(d.p..d.p + e.0.len()).map(|x| x.to_vec());
             if co != *o || ck != Some(rl.kind) || !ok || cbytes.as_deref() != Some(&e.0[..]) {
-                eprintln!("makepad-run cache: VERIFY RELOC differs: {} at {} ({:?} -> {})", name, o, r, match r { Reloc::Sym(s) => crate::syms::describe(u, *s), Reloc::Slot(x) | Reloc::Thunk(x) => crate::syms::stable_fn_name(u, *x), _ => String::new() });
+                eprintln!("makepad-run cache: VERIFY RELOC differs: {} at {} ({:?} -> {})", name, o, r, match r { Reloc::Sym(s) => crate::syms::describe(u, *s), Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => crate::syms::stable_fn_name(u, *x), _ => String::new() });
                 return false;
             }
             d.p += e.0.len();
@@ -3409,6 +3466,8 @@ fn kind_code(k: RelocKind) -> u8 {
         RelocKind::A64LdrLo12X => 4,
         RelocKind::Imm32 => 5,
         RelocKind::A64MovzMovk => 6,
+        RelocKind::X64Branch32 => 7,
+        RelocKind::A64Branch26 => 8,
     }
 }
 
@@ -3421,6 +3480,8 @@ fn kind_of(c: u8) -> Option<RelocKind> {
         4 => RelocKind::A64LdrLo12X,
         5 => RelocKind::Imm32,
         6 => RelocKind::A64MovzMovk,
+        7 => RelocKind::X64Branch32,
+        8 => RelocKind::A64Branch26,
         _ => return None,
     })
 }
@@ -5352,7 +5413,12 @@ mod data_tests {
         for kind in kinds {
             let key = FnKey::Shim(crate::jit::ShimInstance { kind, args: vec![callable, pointer, borrowed, early, alias, object, reference, array, tuple, slice] });
             let mut bytes = E::default();
-            assert!(cache.enc_fnkey(&u, &key, &mut bytes, &mut vec![], 0).is_some());
+            let mut crates = vec![];
+            assert!(cache.enc_fnkey(&u, &key, &mut bytes, &mut crates, 0).is_some());
+            // the image's walk of a key finds the crates its encoder named (prelink's key_ok)
+            crates.sort_unstable();
+            crates.dedup();
+            assert_eq!(cache.key_crates(&u, &bytes.0), Some(crates));
             assert!(!encoded.contains(&bytes.0), "colliding shim key");
             encoded.push(bytes.0);
         }
@@ -5364,7 +5430,7 @@ mod data_tests {
             assert_eq!(decoder.p, bytes.len());
             // the image's skip walks exactly the bytes the encoder wrote (a short skip cut thunk keys)
             let mut skipped = D { b: &bytes, p: 0 };
-            assert!(image::skip_fnkey(&mut skipped, 0).is_some() && skipped.p == bytes.len(), "skip_fnkey stopped at {} of {}", skipped.p, bytes.len());
+            assert!(image::skip_fnkey(&mut skipped, 0, &mut image::no_atoms).is_some() && skipped.p == bytes.len(), "skip_fnkey stopped at {} of {}", skipped.p, bytes.len());
             let mut again = E::default();
             assert!(cache.enc_fnkey(&u, &key, &mut again, &mut vec![], 0).is_some());
             assert_eq!(bytes, again.0);
@@ -6347,7 +6413,7 @@ impl Linker {
                 let expr = d.u32()?;
                 if !self.cache().closure_fp_agrees(u, file, expr, d.u64()?) { return None; }
                 // a parent the startup image names: its slot, decoded or not
-                let parent = match self.image_slot_at(d) {
+                let parent = match self.image_slot_at(u, d) {
                     Some(p) => p,
                     None => {
                         let pk = self.dec_fnkey(u, d, depth + 1)?;
@@ -6377,7 +6443,7 @@ impl Linker {
             }
             // SPEC-V: an unverified-mode twin, keyed by its base (a base the startup image names: its slot)
             4 => {
-                let base = match self.image_slot_at(d) {
+                let base = match self.image_slot_at(u, d) {
                     Some(b) => b,
                     None => {
                         let bk = self.dec_fnkey(u, d, depth + 1)?;
@@ -6449,7 +6515,7 @@ impl Linker {
                 u.site_sym(file, pos, msg)
             }
             7 => {
-                let id = match self.image_slot_at(d) {
+                let id = match self.image_slot_at(u, d) {
                     Some(id) => id,
                     None => {
                         let t = crate::jit::wall_ns();
@@ -6470,6 +6536,18 @@ impl Linker {
                     rw.push(u.rw_sym(sz, al, None));
                 }
                 *rw.get(ord)?
+            }
+            11 => {
+                let shape = d.u8()?;
+                let def = self.cache().dec_def(u, d)?;
+                if u.prog.def(def).kind != DefKind::Static {
+                    return None;
+                }
+                let pl = u.thread_local_place(def)?;
+                if tls_shape(&pl) != shape {
+                    return None;
+                }
+                pl.sym
             }
             // the per-domain copy of constant data object `k` (domain.rs const_copy): one copy
             // per object this run, as the cold run had one per constant
@@ -6682,16 +6760,16 @@ impl Linker {
             let kind = kind_of(d.u8()?)?;
             let tag = d.b.get(d.p).copied()?;
             let v = match tag {
-                20 | 21 => {
+                20 | 21 | 25 => {
                     d.u8()?;
                     let b = d.bytes()?;
                     let sid = self.slot_of_bytes(u, b)?;
-                    if tag == 20 {
-                        callees.push(sid);
-                    } else {
+                    if tag == 21 {
                         thunks.push(sid);
+                    } else {
+                        callees.push(sid);
                     }
-                    u.env.reloc_value(if tag == 20 { Reloc::Slot(sid) } else { Reloc::Thunk(sid) })
+                    u.env.reloc_value(match tag { 20 => Reloc::Slot(sid), 25 => Reloc::Call(sid), _ => Reloc::Thunk(sid) })
                 }
                 22 => {
                     d.u8()?;

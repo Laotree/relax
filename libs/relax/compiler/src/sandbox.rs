@@ -182,7 +182,7 @@ unsafe fn sb_init(up: *mut Unit) -> Result<(), String> {
     let trap_slot = u.fn_id(FnKey::Sandbox(u32::MAX));
     let s0 = u.reserve_code(SPACE);
     let s1 = u.reserve_code(SPACE);
-    let trap = tgt::thunk(u.slots.table(trap_slot), ts as usize);
+    let trap = tgt::thunk(u.slots.table(trap_slot));
     let mut all = Vec::with_capacity(bytes);
     for _ in 0..SBT_N {
         all.extend_from_slice(&trap);
@@ -387,8 +387,8 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
         f.code_len = code.len() as u32;
         f.pc_map = crate::jit::PcMap::new(&map);
         f.version += 1;
-        let slot = u.slots.table(t) as *const std::sync::atomic::AtomicU64;
-        (*slot).store(at, std::sync::atomic::Ordering::SeqCst);
+        let slot = crate::jit::SlotWord::of(&u.slots, t);
+        slot.store(at, std::sync::atomic::Ordering::SeqCst);
         u.rearm_sandbox_counter(t, at);
     }
     for t in dead {
@@ -398,8 +398,8 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
         f.rir = None;
         f.version += 1;
         if let Some(h) = &mut f.history { h.prev.clear(); }
-        let slot = u.slots.table(t) as *const std::sync::atomic::AtomicU64;
-        (*slot).store(stub, std::sync::atomic::Ordering::SeqCst);
+        let slot = crate::jit::SlotWord::of(&u.slots, t);
+        slot.store(stub, std::sync::atomic::Ordering::SeqCst);
     }
     let used = next - tbase;
     let n = live.len();
@@ -490,7 +490,7 @@ pub unsafe fn twin(up: *mut Unit, base: u32) -> u32 {
     if k >= SBT_N {
         panic!("makepad: sandbox thunk table full ({} functions)", SBT_N);
     }
-    crate::os::mem::write_code(sbt + k as u64 * ts, &tgt::thunk(u.slots.table(t), ts as usize));
+    crate::os::mem::write_code(sbt + k as u64 * ts, &tgt::thunk(u.slots.table(t)));
     t
 }
 
@@ -636,15 +636,16 @@ pub(crate) fn initial_bytes(u: &Unit, sym: u32) -> Result<Vec<u8>, String> {
 /// known data object, static or thunk). Never inspect a running host static here.
 pub(crate) fn provenance_words(u: &Unit, b: &[u8]) -> Vec<(u32, Sym)> {
     let mut out = Vec::new();
+    let pw = u.ptr_bytes() as usize;
     let mut i = 0;
-    while i + 8 <= b.len() {
-        let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        if w > 0x10000 {
+    while i + pw <= b.len() {
+        let w = crate::syms::word_in(u, b, i);
+        if (if pw == 4 { w & 0xffff_ffff } else { w }) > 0x10000 {
             if let Some(s) = u.syms.symbol_at(w, u) {
                 out.push((i as u32, s));
             }
         }
-        i += 8;
+        i += pw;
     }
     out
 }
@@ -1435,7 +1436,7 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                     refs.push(t);
                     emit(Inst::Iconst(d, sbthunk(t) as i64), &mut insts, &mut pos);
                 }
-                Inst::TlsAddr(..) => return Err(format!("{}: thread-local storage is not available to sandboxed modules", f.name)),
+                Inst::TlsAddr(..) | Inst::TlsStatic(..) => return Err(format!("{}: thread-local storage is not available to sandboxed modules", f.name)),
                 Inst::VGather(..) | Inst::VTbl(..) => return Err(format!("{}: vector gathers are not available to sandboxed modules", f.name)),
                 Inst::Load(mm, d, base, off) => {
                     let (b2, o2) = mask(f, &mut insts, &mut pos, &mut cache, base, off);

@@ -418,6 +418,22 @@ pub enum RelocKind {
     Imm32,
     /// arm64 movz at `at` and movk (lsl 16) at `at + 4`: the low 32 bits of value (must fit)
     A64MovzMovk,
+    /// x64: the disp32 of a `call`/`jmp` at `at` (ends the instruction): value - (base + at + 4);
+    /// a target out of reach is branched to through a veneer (`link_with`)
+    X64Branch32,
+    /// arm64 `b`/`bl` at `at`: (value - pc) / 4 in imm26 (+-128 MB); out of reach: a veneer
+    A64Branch26,
+}
+
+/// Reach of a pc-relative branch field from the branch's own pc (`RelocKind::X64Branch32`: from
+/// the end of the disp32, `A64Branch26`: from the instruction).
+pub fn branch_reaches(kind: RelocKind, pc: u64, target: u64) -> bool {
+    let d = target.wrapping_sub(pc) as i64;
+    match kind {
+        RelocKind::X64Branch32 => d >= i32::MIN as i64 && d <= i32::MAX as i64,
+        RelocKind::A64Branch26 => d & 3 == 0 && (-(1i64 << 27)..1i64 << 27).contains(&d),
+        _ => false,
+    }
 }
 
 /// One relocated field: where, how, and what value goes there.
@@ -569,11 +585,28 @@ impl SlotsPtr {
 
 /// Writes every relocated field of `code`, to run at address `base`. Backends emit the fields
 /// zeroed, so emitted code is independent of where and in which run it runs; the embedder
-/// links it here (fresh and cached code alike). Err: a value does not fit its field at `base`.
+/// links it here (fresh and cached code alike). Err: a value does not fit its field at `base`
+/// (a branch field out of reach included: `link_with` takes veneers for those).
 pub fn link(code: &mut [u8], base: u64, relocs: &[RelocAt], value: &dyn Fn(Reloc) -> u64) -> Result<(), String> {
+    link_with(code, base, relocs, value, &|_, _, _| None)
+}
+
+/// `link`, where a branch field (`X64Branch32`, `A64Branch26`) whose target is out of reach
+/// branches to `veneer(kind, target, pc)` instead: code in reach of `pc` that jumps to `target`
+/// (None: no veneer, the link fails).
+pub fn link_with(code: &mut [u8], base: u64, relocs: &[RelocAt], value: &dyn Fn(Reloc) -> u64, veneer: &dyn Fn(RelocKind, u64, u64) -> Option<u64>) -> Result<(), String> {
     for r in relocs {
         let at = r.at as usize;
-        let v = value(r.target);
+        let mut v = value(r.target);
+        if matches!(r.kind, RelocKind::X64Branch32 | RelocKind::A64Branch26) {
+            let pc = base + at as u64 + if r.kind == RelocKind::X64Branch32 { 4 } else { 0 };
+            if !branch_reaches(r.kind, pc, v) {
+                v = match veneer(r.kind, v, pc) {
+                    Some(t) if branch_reaches(r.kind, pc, t) => t,
+                    _ => return Err(format!("branch out of reach ({:#x} from {:#x}) and no veneer", v, pc)),
+                };
+            }
+        }
         let rd32 = |c: &[u8], o: usize| -> Result<u32, String> {
             c.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).ok_or_else(|| format!("relocation at {} past the code", o))
         };
@@ -582,6 +615,15 @@ pub fn link(code: &mut [u8], base: u64, relocs: &[RelocAt], value: &dyn Fn(Reloc
             RelocKind::Pool64 => {
                 let w = code.get_mut(at..at + 8).ok_or_else(|| format!("relocation at {} past the code", at))?;
                 w.copy_from_slice(&v.to_le_bytes());
+            }
+            RelocKind::X64Branch32 => {
+                rd32(code, at)?;
+                wr32(code, at, v.wrapping_sub(base + at as u64 + 4) as i64 as i32 as u32);
+            }
+            RelocKind::A64Branch26 => {
+                let d = (v.wrapping_sub(base + at as u64) as i64 >> 2) as u32;
+                let w = rd32(code, at)? & !0x03FF_FFFF;
+                wr32(code, at, w | (d & 0x03FF_FFFF));
             }
             RelocKind::X64Rel32 => {
                 let d = v.wrapping_sub(base + at as u64 + 4) as i64;
@@ -640,8 +682,11 @@ pub enum Reloc {
     Sym(Sym),
     /// the function table word of a slot (`SlotTable::table`)
     Slot(u32),
-    /// a slot's permanent callable address (`SlotTable::thunk`)
+    /// a slot's permanent callable address (`SlotTable::callable`): a value (fn pointers, vtables)
     Thunk(u32),
+    /// a slot as a call target: its thunk (`SlotTable::thunk`), which jumps to the slot's current
+    /// code (a direct branch the runtime keeps in step with the table word)
+    Call(u32),
     /// the thread-local block key / cell offset (`Env::tls_key`, pre-scaled as the backend loads it)
     TlsKey,
     /// `Env::tls_slow`
@@ -839,6 +884,10 @@ pub enum Inst {
     Xgetbv(VReg, VReg),
     /// d = address of this thread's copy of the thread-local block at the offset a symbol holds
     TlsAddr(VReg, Sym),
+    /// d = the thread pointer + the symbol's value: a variable in the executable's static TLS
+    /// (x86-64 Linux: fs:0 + offset, rustc's local-exec model). Pure within a thread, like TlsAddr
+    /// never moved (a coroutine may resume on another thread).
+    TlsStatic(VReg, Sym),
     // ---- 128-bit vectors (Cls::V128; four 32-bit lanes)
     /// d = bitwise m ? a : b (m: lane masks)
     VSel(VReg, VReg, VReg, VReg), // d, m, a, b
@@ -958,7 +1007,7 @@ impl Inst {
     /// counts as written.
     pub fn defs(&self, mut f: impl FnMut(VReg)) {
         match self {
-            Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::TlsAddr(d, _) | Inst::VConst(d, _) => f(*d),
+            Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::TlsAddr(d, _) | Inst::TlsStatic(d, _) | Inst::VConst(d, _) => f(*d),
             Inst::Mov(d, _) | Inst::INeg(_, d, _) | Inst::INot(_, d, _) | Inst::IBit(_, d, _) | Inst::FUnary(_, _, d, _) | Inst::Conv(_, d, _) | Inst::IBinI(_, _, d, _, _) | Inst::ICmpI(_, _, d, _, _) | Inst::Load(_, d, _, _) | Inst::VSplat(d, _) | Inst::VExtract(d, _, _) | Inst::VLoad(d, _, _) | Inst::VAny(d, _) | Inst::AtomicLoad(_, _, d, _) => f(*d),
             Inst::IBin(_, _, d, _, _) | Inst::ICmp(_, _, d, _, _) | Inst::FBin(_, _, d, _, _) | Inst::FCmp(_, _, d, _, _) | Inst::VGather(d, _, _) | Inst::VTbl(d, _, _, _) | Inst::VShuffle(d, _, _, _) | Inst::VX(_, d, _, _) | Inst::AtomicRmw(_, _, _, d, _, _) | Inst::LoadX(_, d, _, _, _, _) | Inst::VLoadX(d, _, _, _, _) => f(*d),
             Inst::Sel(d, _, _, _) | Inst::VX3(_, d, _, _, _) | Inst::VSel(d, _, _, _) | Inst::VFma(_, _, d, _, _, _) | Inst::FMulAdd(_, _, _, d, _, _, _) | Inst::AtomicCas(_, _, _, d, _, _, _) => f(*d),
@@ -974,7 +1023,7 @@ impl Inst {
     /// Every vreg operand and result, in place (renaming without rebuilding the instruction).
     pub fn vregs_mut(&mut self, mut f: impl FnMut(&mut VReg)) {
         match self {
-            Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::TlsAddr(d, _) | Inst::VConst(d, _) => f(d),
+            Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::TlsAddr(d, _) | Inst::TlsStatic(d, _) | Inst::VConst(d, _) => f(d),
             Inst::Mov(d, a) | Inst::INeg(_, d, a) | Inst::INot(_, d, a) | Inst::IBit(_, d, a) | Inst::FUnary(_, _, d, a) | Inst::Conv(_, d, a) | Inst::IBinI(_, _, d, a, _) | Inst::ICmpI(_, _, d, a, _) | Inst::Load(_, d, a, _) | Inst::VSplat(d, a) | Inst::VExtract(d, a, _) | Inst::VLoad(d, a, _) | Inst::VAny(d, a) | Inst::AtomicLoad(_, _, d, a) => {
                 f(d);
                 f(a);
@@ -1120,6 +1169,11 @@ pub struct Func {
     /// slot passed there is written by the call, not read (forward_slot_dests_x builds such a
     /// result straight where it is copied to)
     pub sret_callees: Vec<u32>,
+    /// (callee, argument index, may return it) of calls whose callee keeps no copy of that
+    /// pointer argument (codegen opt::param_escape over its body): a frame address passed there
+    /// does not escape for sibling calls (tail.rs), the call's result is one when it may be
+    /// returned. Filled by the front end for bodies with tail-shaped calls.
+    pub nocapture: Vec<(Callee, u32, bool)>,
     /// Nounwind query answers consulted by this body's optimization, including false.
     /// They travel with the immutable O1 body, not with a mutable function slot.
     pub nounwind_inputs: Vec<(u32, bool)>,
@@ -1154,7 +1208,7 @@ pub struct Func {
 
 impl Func {
     pub fn new(name: String, file: u32) -> Func {
-        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, owned: Vec::new(), nonnull: Vec::new(), ranged: Vec::new(), dyn_calls: Vec::new(), naked: false }
+        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nocapture: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, owned: Vec::new(), nonnull: Vec::new(), ranged: Vec::new(), dyn_calls: Vec::new(), naked: false }
     }
     pub fn vreg(&mut self, c: Cls) -> VReg {
         self.vregs.push(c);
@@ -1278,7 +1332,7 @@ impl Func {
                     Inst::FpEnv(_, v) => regs.push(*v),
                     Inst::Cpuid(ds, a, b) => { regs.extend_from_slice(ds); regs.push(*a); regs.push(*b); }
                     Inst::Xgetbv(d, a) => { regs.push(*d); regs.push(*a); }
-                    Inst::TlsAddr(d, _) => regs.push(*d),
+                    Inst::TlsAddr(d, _) | Inst::TlsStatic(d, _) => regs.push(*d),
                     Inst::VSplat(d, a) | Inst::VExtract(d, a, _) | Inst::VLoad(d, a, _) | Inst::VStore(d, _, a) | Inst::VAny(d, a) => {
                         regs.push(*d);
                         regs.push(*a);

@@ -98,7 +98,7 @@ pub fn reg_config() -> RegConfig {
 
 /// Registers an instruction overwrites while it runs (RegConfig::clobbers): only an asm! block
 /// (every register it names; regalloc also keeps its results out of them).
-fn arm64_clobbers(_options: &relax_session::Options, i: &Inst) -> u64 {
+fn arm64_clobbers(_options: &relax_session::Options, _f: &Func, i: &Inst) -> u64 {
     match i {
         Inst::Call(Callee::Asm(b), _, _) => b.regs,
         _ => 0,
@@ -142,6 +142,10 @@ pub struct Env {
     pub syms: u64,
     /// how each symbol may be encoded (`SymClass` as u8 per `Sym::id`; 0 = no table: all Far)
     pub sym_class: u64,
+    /// the embedder links branch fields (`X64Branch32` / `A64Branch26`) with veneers for targets
+    /// out of reach (`rir::link_with`): host and runtime calls become direct `call`/`bl`. Off:
+    /// they call through pool words (position-independent code, e.g. stored compute kernels).
+    pub near: bool,
 }
 
 impl Env {
@@ -151,6 +155,7 @@ impl Env {
             Reloc::Sym(s) => unsafe { s.value(self.syms) },
             Reloc::Slot(id) => self.slots.table(id),
             Reloc::Thunk(id) => self.slots.callable(id),
+            Reloc::Call(id) => self.slots.thunk(id),
             // the TSD slot's byte offset (ldr x16, [x16, x17])
             Reloc::TlsKey => self.tls_key * 8,
             Reloc::TlsSlow => self.tls_slow,
@@ -687,6 +692,8 @@ struct Gen<'a> {
     al: Alloc,
     /// total frame size below fp (sp = fp - frame)
     frame: i64,
+    /// per block: the index of its sibling call (tail::sibling_calls; empty: none)
+    tail: Vec<Option<usize>>,
     /// bytes of callee-saved registers below fp
     saved: i64,
     slot_off: Vec<i64>,
@@ -705,6 +712,8 @@ struct Gen<'a> {
     asm_veneers: Vec<(usize, Sym)>,
     /// `Env::sym_class`: how each symbol is encoded (SymClass::Domain: an offset in the domain block)
     sym_class: u64,
+    /// `Env::near`: host and runtime calls are `bl` (the embedder places veneers)
+    near: bool,
     /// sp offset of the frame word holding the domain base (-1: the function names no domain symbol)
     dom_slot: i64,
     /// per block: whether its start reads the domain base into that slot (block 0: the prologue;
@@ -893,14 +902,32 @@ impl<'a> Gen<'a> {
     fn def_i(&self, v: VReg, scratch: u8) -> u8 {
         match self.al.loc[v.0 as usize] {
             Loc::Reg(r) => r,
+            // a window that starts at this definition (regalloc def windows): computed into its
+            // register, which keeps the value after fin_i stores it home
+            Loc::Stack(_) => self.win.get(&v.0).and_then(|ws| ws.iter().find(|w| w.0 == self.cur_pos + 1)).map_or(scratch, |w| w.2),
             _ => scratch,
         }
     }
     fn fin_i(&mut self, v: VReg, r: u8) {
         if let Loc::Stack(o) = self.al.loc[v.0 as usize] {
+            // nobody reads this store home (Alloc::store_skip): the window's register only
+            if self.al.store_skip.contains(&(self.cur_pos, v.0)) {
+                self.def_win_copy(v, r);
+                return;
+            }
             let off = self.spill_sp(o);
             self.a.ldst(STRX, 8, r, SP, off);
             self.last_spill = Some((off, r, self.a.pos()));
+            self.def_win_copy(v, r);
+        }
+    }
+    /// A window that starts at this definition (def windows, regions over redefining blocks)
+    /// holds the result: computed elsewhere (a scratch), it is copied there.
+    fn def_win_copy(&mut self, v: VReg, r: u8) {
+        if let Some(c) = self.win.get(&v.0).and_then(|ws| ws.iter().find(|w| w.0 == self.cur_pos + 1)).map(|w| w.2) {
+            if c != r {
+                self.a.mov(c, r);
+            }
         }
     }
     fn use_f(&mut self, v: VReg, scratch: u8) -> u8 {
@@ -1086,6 +1113,7 @@ impl<'a> Gen<'a> {
             self.stack_probe(frame);
             self.a.add_any(SP, SP, -frame);
             self.callee_saves(true);
+            self.tail = crate::tail::sibling_calls(options, self.f, &reach, crate::tail::Arch::Arm64);
             if self.dom_read.first() == Some(&true) {
                 self.dom_base();
             }
@@ -1143,6 +1171,9 @@ impl<'a> Gen<'a> {
             // nor flags: the previous block's terminator (a fused cmp + b.cond) or another
             // predecessor set them, not the compare a select chain was started for
             self.sel_chain = None;
+            // window lookups of this block never see the previous block's last position (an empty
+            // block's terminator reads at its start: no window there, the slot is read)
+            self.cur_pos = self.al.block_start[bi];
             for (ii, inst) in b.insts.iter().enumerate() {
                 self.pc_map.push(((self.a.pos() * 4) as u32, b.pos[ii]));
                 self.cur_pos = self.al.inst_pos(bi, ii);
@@ -1214,7 +1245,29 @@ impl<'a> Gen<'a> {
                         }
                     }
                 }
+                if self.tail.get(bi) == Some(&Some(ii)) {
+                    if let Inst::Call(c, args, _) = inst {
+                        self.tail_call(c, args);
+                    }
+                    break;
+                }
                 self.inst(options, inst);
+            }
+            // a sibling call ended the block: its Ret is the callee's
+            if self.tail.get(bi).is_some_and(|t| t.is_some()) {
+                continue;
+            }
+            // region windows entered from here: loaded before the terminator (regalloc edge loads)
+            if matches!(b.term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..)) {
+                let tp = self.al.block_end[bi] - 1;
+                if let Some(ls) = self.win_start.get(&tp).cloned() {
+                    for (v, r) in ls {
+                        if let Loc::Stack(o) = self.al.loc[v as usize] {
+                            let off = self.spill_sp(o);
+                            self.a.ldst(LDRX, 8, r, SP, off);
+                        }
+                    }
+                }
             }
             self.pc_map.push(((self.a.pos() * 4) as u32, b.term_pos));
             let fuse_inst = if fused { Some(b.insts[n - 1].clone()) } else { None };
@@ -1687,15 +1740,8 @@ impl<'a> Gen<'a> {
         }
         self.moves(&mv);
         match c {
-            Callee::CFn(id, _) => {
-                self.ldr_reloc(IP0, Reloc::Slot(*id));
-                self.a.ldst(LDRX, 8, IP0, IP0, 0);
-                self.a.blr(IP0);
-            }
-            Callee::CHost(sym, _) => {
-                self.ldr_reloc(IP0, Reloc::Sym(*sym));
-                self.a.blr(IP0);
-            }
+            Callee::CFn(id, _) => self.bl_reloc(Reloc::Call(*id)),
+            Callee::CHost(sym, _) => self.call_far(Reloc::Sym(*sym)),
             _ => self.a.blr(IP0),
         }
         // a C-unwind call is invoked like a Relax one: its landing stub is keyed by this address
@@ -1886,8 +1932,12 @@ impl<'a> Gen<'a> {
         self.ldr_reloc(IP1, Reloc::TlsKey);
         self.a.e(0xF860_6800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
         let p = self.a.cbnz(IP0);
-        self.ldr_reloc(IP1, Reloc::TlsSlow);
-        self.a.blr(IP1);
+        if self.near {
+            self.bl_reloc(Reloc::TlsSlow);
+        } else {
+            self.ldr_reloc(IP1, Reloc::TlsSlow);
+            self.a.blr(IP1);
+        }
         let skip = self.a.pos();
         self.a.patch(p, skip);
     }
@@ -1917,6 +1967,24 @@ impl<'a> Gen<'a> {
         self.a.ldst(LDRX, 8, IP0, SP, self.dom_slot);
         self.ldr_reloc(IP1, Reloc::Sym(off));
         self.a.rrr(0x8B00_0000, rd, IP0, IP1);
+    }
+
+    /// `bl` to a relocated target (a slot's thunk, a near host or runtime entry): the embedder
+    /// links the field, through a veneer (x16 only) when the target is out of reach.
+    fn bl_reloc(&mut self, r: Reloc) {
+        let at = self.a.pos();
+        self.a.e(0x9400_0000);
+        self.relocs.push(RelocAt { at: (at * 4) as u32, kind: RelocKind::A64Branch26, target: r });
+    }
+
+    /// A call of a host / runtime entry `r`: `bl` (near), else `blr x16` loaded from the pool.
+    fn call_far(&mut self, r: Reloc) {
+        if self.near {
+            self.bl_reloc(r);
+        } else {
+            self.ldr_reloc(IP0, r);
+            self.a.blr(IP0);
+        }
     }
 
     /// `ldr xd, =<relocated value>` from the address pool after the code.
@@ -3132,10 +3200,59 @@ impl<'a> Gen<'a> {
     }
 
     fn epilogue(&mut self) {
+        self.frame_exit();
+        self.a.ret();
+    }
+
+    /// The epilogue up to its `ret`: callee-saved registers back, the frame record popped.
+    fn frame_exit(&mut self) {
         self.callee_saves(false);
         self.a.mov_sp(SP, FP);
         self.a.ldp_post(FP, LR, SP, 16);
-        self.a.ret();
+    }
+
+    /// A sibling call (tail::sibling_calls): the arguments into the callee's registers, this
+    /// frame gone (lr = this function's return address), then `b` / `br x16`.
+    fn tail_call(&mut self, c: &Callee, args: &[VReg]) {
+        if let Callee::Indirect(v) | Callee::CIndirect(v, _) = c {
+            let r = self.use_i(*v, IP0);
+            self.a.mov(IP0, r);
+        }
+        let mut mv = Vec::new();
+        match c {
+            Callee::CFn(_, sig) | Callee::CIndirect(_, sig) => {
+                let plan = cabi::plan(sig, sig.conv.target());
+                for (k, ap) in plan.args.iter().enumerate() {
+                    match ap {
+                        ArgPlan::Scalar(PLoc::Int(r), _) => mv.push((MLoc::R(*r), self.mloc(args[k]))),
+                        ArgPlan::Scalar(PLoc::Flt(x), _) => mv.push((MLoc::F(*x), self.mloc(args[k]))),
+                        _ => unreachable!("tail call with a memory argument"),
+                    }
+                }
+            }
+            _ => {
+                let (mut ni, mut nf) = (0u8, 0u8);
+                for a in args {
+                    if self.cls(*a) == Cls::I {
+                        mv.push((MLoc::R(ni), self.mloc(*a)));
+                        ni += 1;
+                    } else {
+                        mv.push((MLoc::F(nf), self.mloc(*a)));
+                        nf += 1;
+                    }
+                }
+            }
+        }
+        self.moves(&mv);
+        self.frame_exit();
+        match c {
+            Callee::Fn(id) | Callee::CFn(id, _) => {
+                let at = self.a.pos();
+                self.a.e(0x1400_0000);
+                self.relocs.push(RelocAt { at: (at * 4) as u32, kind: RelocKind::A64Branch26, target: Reloc::Call(*id) });
+            }
+            _ => self.a.br(IP0),
+        }
     }
 
     fn term(&mut self, t: &Term, bi: usize, fused: Option<Inst>) {
@@ -3259,8 +3376,7 @@ impl<'a> Gen<'a> {
                 self.jump_to(*normal, bi);
             }
             Term::Resume => {
-                self.ldr_reloc(IP0, Reloc::Resume);
-                self.a.blr(IP0);
+                self.call_far(Reloc::Resume);
                 self.a.udf();
             }
         }
@@ -3292,8 +3408,11 @@ impl<'a> Gen<'a> {
                     // straight between a register and a spill slot
                     match (self.al.loc[d.0 as usize], self.al.loc[s.0 as usize]) {
                         (Loc::Stack(o), Loc::Reg(r)) => {
-                            let off = self.spill_sp(o);
-                            self.a.ldst(STRX, 8, r, SP, off);
+                            if !self.al.store_skip.contains(&(self.cur_pos, d.0)) {
+                                let off = self.spill_sp(o);
+                                self.a.ldst(STRX, 8, r, SP, off);
+                            }
+                            self.def_win_copy(*d, r);
                         }
                         (Loc::Reg(r), Loc::Stack(o)) => {
                             let off = self.spill_sp(o);
@@ -3599,6 +3718,8 @@ impl<'a> Gen<'a> {
             }
             Inst::AtomicLoad(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..) => self.atomic(i),
             Inst::TlsAddr(d, off) => self.tls_addr(*d, *off),
+            // static TLS is placed for x86-64 Linux only (compiler os/tls.rs)
+            Inst::TlsStatic(..) => unreachable!("arm64: no static TLS placement"),
             Inst::Cpuid(..) | Inst::Xgetbv(..) => unreachable!("x86 CPU query rejected before arm64 emission"),
             Inst::FpEnv(true, x) => {
                 // msr fpcr, xt
@@ -3948,16 +4069,9 @@ impl<'a> Gen<'a> {
         }
         self.moves(&mv);
         match c {
-            Callee::Fn(id) => {
-                self.ldr_reloc(IP0, Reloc::Slot(*id));
-                self.a.ldst(LDRX, 8, IP0, IP0, 0);
-                self.a.blr(IP0);
-            }
+            Callee::Fn(id) => self.bl_reloc(Reloc::Call(*id)),
             Callee::Indirect(_) => self.a.blr(IP0),
-            Callee::Host(sym) => {
-                self.ldr_reloc(IP0, Reloc::Sym(*sym));
-                self.a.blr(IP0);
-            }
+            Callee::Host(sym) => self.call_far(Reloc::Sym(*sym)),
             Callee::CHost(..) | Callee::CIndirect(..) | Callee::CFn(..) | Callee::Asm(..) => {}
         }
         self.last_call_ret = self.a.pos();
@@ -4234,6 +4348,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         f,
         al,
         frame: 0,
+        tail: Vec::new(),
         saved: 0,
         slot_off: Vec::new(),
         slot_pos: Vec::new(),
@@ -4246,6 +4361,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         apool: Vec::new(),
         asm_veneers: Vec::new(),
         sym_class: env.sym_class,
+        near: env.near,
         dom_slot: -1,
         dom_read: Vec::new(),
         relocs: Vec::new(),
@@ -4334,37 +4450,81 @@ pub fn lazy_entry(host_compile: u64) -> Vec<u8> {
     words_to_bytes(&a.w)
 }
 
-/// Per-slot thunk: `ldr x16, [table + slot*8]; br x16` (the permanent address of a function).
-pub fn thunk(slot_addr: u64, size: usize) -> Vec<u8> {
-    let mut a = Asm { w: Vec::with_capacity(12) };
-    a.mov_imm64_fixed(IP0, slot_addr);
+/// Per-slot thunk (the permanent address of a function, `THUNK_SIZE` bytes, 8-aligned): its
+/// head (`thunk_head`) is `b` straight to the slot's code, or, when that is out of reach or not
+/// known, `b +4`: `ldr x16, =table_word; ldr x16, [x16]; br x16`. Built with the head to `+4`.
+pub fn thunk(slot_addr: u64) -> Vec<u8> {
+    let mut a = Asm { w: Vec::with_capacity(THUNK_SIZE / 4) };
+    a.e(THUNK_HEAD_TABLE);
+    // ldr x16, [pc + 12] (the literal at +16)
+    a.e(0x5800_0000 | 3 << 5 | IP0 as u32);
     a.ldst(LDRX, 8, IP0, IP0, 0);
     a.br(IP0);
-    while a.w.len() * 4 < size {
+    a.e(slot_addr as u32);
+    a.e((slot_addr >> 32) as u32);
+    while a.w.len() * 4 < THUNK_SIZE {
         a.udf();
     }
     words_to_bytes(&a.w)
 }
 
-/// Per-slot call counter (tier-up): while a function runs at O1 its table slot points
-/// here. `*counter -= 1`; on reaching 0 jumps to `hot` (a lazy_entry-style glue: x16 = slot,
-/// returns the address to continue at), else to the O1 code. Argument registers, sp
-/// and lr are untouched; only x16/x17 (the AAPCS veneer registers) are used.
-pub fn count_stub(counter: u64, slot: u32, code: u64, hot: u64) -> Vec<u8> {
-    let mut a = Asm { w: Vec::with_capacity(12) };
+/// The thunk head that goes the table-word way: `b +4`.
+const THUNK_HEAD_TABLE: u32 = 0x1400_0001;
+
+/// The first instruction of the thunk at `at` (one aligned 4-byte store patches it; `b` may be
+/// modified while other cores execute it) for a slot whose table word holds `target`: a direct
+/// `b` when in reach (+-128 MB), else the table-word path.
+pub fn thunk_head(at: u64, target: u64) -> u32 {
+    let d = target.wrapping_sub(at) as i64;
+    if target == 0 || d & 3 != 0 || !(-(1i64 << 27)..1i64 << 27).contains(&d) {
+        return THUNK_HEAD_TABLE;
+    }
+    0x1400_0000 | ((d >> 2) as u32 & 0x03FF_FFFF)
+}
+
+/// A veneer: `ldr x16, [pc + 8]; br x16; .quad target` (16 bytes; a near branch to a far
+/// target, x16 only, as the AAPCS allows a veneer).
+pub fn veneer(target: u64) -> Vec<u8> {
+    let mut a = Asm { w: Vec::with_capacity(4) };
+    a.e(0x5800_0000 | 2 << 5 | IP0 as u32);
+    a.br(IP0);
+    a.e(target as u32);
+    a.e((target >> 32) as u32);
+    words_to_bytes(&a.w)
+}
+
+/// Bytes per count stub (`count_stub`; the stubs of a block are this far apart).
+pub const COUNT_STUB_SIZE: usize = 80;
+
+/// Per-slot call counter (tier-up) at `at` (0: not known yet): while a function runs at O1 its
+/// table slot points here. `*counter -= 1`; on reaching 0 jumps to `hot` (a lazy_entry-style
+/// glue: x16 = slot, returns the address to continue at), else to the O1 code: `b` when in reach,
+/// else through x16. Argument registers, sp and lr are untouched; only x16/x17 (the AAPCS veneer
+/// registers) are used.
+pub fn count_stub(at: u64, counter: u64, slot: u32, code: u64, hot: u64) -> Vec<u8> {
+    let mut a = Asm { w: Vec::with_capacity(COUNT_STUB_SIZE / 4) };
     a.mov_imm64_fixed(IP0, counter);
     a.ldst(LDRX, 8, IP1, IP0, 0);
     // subs x17, x17, #1
     a.e(0xF100_0000 | 1 << 10 | (IP1 as u32) << 5 | IP1 as u32);
     a.ldst(STRX, 8, IP1, IP0, 0);
-    // b.eq hot (6 words ahead: 4 + br + this)
-    a.e(0x5400_0000 | 6 << 5);
-    a.mov_imm64_fixed(IP0, code);
-    a.br(IP0);
+    // b.eq hot (patched below)
+    let beq = a.pos();
+    a.e(0x5400_0000);
+    let pc = at + 4 * a.pos() as u64;
+    let d = code.wrapping_sub(pc) as i64;
+    if at != 0 && d & 3 == 0 && (-(1i64 << 27)..1i64 << 27).contains(&d) {
+        a.e(0x1400_0000 | ((d >> 2) as u32 & 0x03FF_FFFF));
+    } else {
+        a.mov_imm64_fixed(IP0, code);
+        a.br(IP0);
+    }
+    a.w[beq] |= ((a.pos() - beq) as u32) << 5;
     a.e(0xD280_0000 | (slot & 0xffff) << 5 | IP0 as u32);
     a.e(0xF2A0_0000 | (slot >> 16) << 5 | IP0 as u32);
     a.mov_imm64_fixed(IP1, hot);
     a.br(IP1);
+    assert!(a.w.len() * 4 <= COUNT_STUB_SIZE);
     words_to_bytes(&a.w)
 }
 
@@ -4564,7 +4724,7 @@ mod tests {
         }
         f.blocks[b1 as usize].term = Term::Ret(vec![acc]);
         f.blocks[b2 as usize].term = Term::Ret(vec![p]);
-        let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+        let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
         let r = compile(options, &f, &env).expect("relaxed");
         let w: Vec<u32> = r.code[..r.text_len as usize].chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         // the entry block's branch on p: cbz/cbnz skipping one word, then `b` beyond 1 MB
@@ -4602,11 +4762,12 @@ mod tests {
 
     /// A branch on one bit (`x & 1 << k` against zero) is tbz / tbnz, for bits in either word;
     /// past their +-32 KB range the function is emitted again with tst + b.cond, and both
-    /// versions take the right side.
+    /// versions take the right side (run on arm64 hosts).
     #[test]
+    #[cfg(target_arch = "aarch64")]
     fn single_bit_branches_use_tbz_and_fall_back_past_its_range() {
         let options = &relax_session::Options::default();
-        let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+        let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
         for (bit, filler) in [(0u32, 0usize), (13, 0), (31, 0), (32, 0), (63, 0), (5, 12_000), (40, 12_000)] {
             let mut f = Func::new("tbz".to_string(), 0);
             let p = f.vreg(Cls::I);
@@ -4635,6 +4796,10 @@ mod tests {
             let w: Vec<u32> = r.code[..r.text_len as usize].chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             let has_tbz = w.iter().any(|x| x & 0x7E00_0000 == 0x3600_0000);
             assert_eq!(has_tbz, filler == 0, "bit {bit} filler {filler}: tbz {has_tbz}");
+            // the code is arm64: it runs only on an arm64 host (an x64 host checks the encoding only)
+            if !cfg!(target_arch = "aarch64") {
+                continue;
+            }
             let code = crate::exec::Code::new(&r.code).unwrap();
             let run: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
             let x = 0x5a5a_0000_0000_1234u64 & !(1u64 << bit);
@@ -4670,7 +4835,7 @@ mod tests {
         f.blocks[b2 as usize].insts.push(Inst::IBinI(IOp::Add, it, s2, s, 1));
         f.blocks[b2 as usize].pos.push(0);
         f.blocks[b2 as usize].term = Term::Ret(vec![s2]);
-        let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+        let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
         let r = compile(options, &f, &env).expect("compiles");
         let w: Vec<u32> = r.code[..r.text_len as usize].chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         let csel = |x: u32| x & 0x7FE0_0C00 == 0x1A80_0000;
@@ -4714,7 +4879,7 @@ mod tests {
             }
             f.blocks[b1 as usize].term = Term::Ret(vec![acc]);
             f.blocks[b2 as usize].term = Term::Ret(vec![p]);
-            let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+            let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
             let r = compile(options, &f, &env).expect("relaxed");
             let w: Vec<u32> = r.code[..r.text_len as usize].chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             // the first conditional branch skips one word; a `b` beyond 1 MB follows

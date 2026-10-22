@@ -15,6 +15,8 @@ pub mod intrinsics {
         pub fn trunc_f32(x: f32) -> f32;
         pub fn rint_f64(x: f64) -> f64;
         pub fn rint_f32(x: f32) -> f32;
+        pub fn round_f64(x: f64) -> f64;
+        pub fn round_f32(x: f32) -> f32;
         pub fn fabs_f64(x: f64) -> f64;
         pub fn fabs_f32(x: f32) -> f32;
         pub fn fmin_f64(x: f64, y: f64) -> f64;
@@ -238,6 +240,13 @@ pub mod intrinsics_rt {
         /// Writes this thread's floating-point control register (flush-to-zero,
         /// denormals-are-zero, rounding, ...).
         pub fn fp_env_set(x: u64);
+        /// The allocator shim (rustc_codegen_ssa allocator shim: `__rust_alloc` and the others):
+        /// a call of core::heap's `__rg_*::<A>(&STATIC, ..)` when the program has a
+        /// `#[global_allocator] static STATIC: A`, else of the default `__rdl_*` (System).
+        pub fn rust_alloc(size: usize, align: usize) -> *mut u8;
+        pub fn rust_alloc_zeroed(size: usize, align: usize) -> *mut u8;
+        pub fn rust_dealloc(ptr: *mut u8, size: usize, align: usize);
+        pub fn rust_realloc(ptr: *mut u8, old_size: usize, align: usize, new_size: usize) -> *mut u8;
     }
 }
 
@@ -294,7 +303,7 @@ pub mod intrinsics_vx {
         pub fn vx_store<T>(p: *mut u8, a: T);
         pub fn vx_narrow<T, U>(a: T, op: u32) -> U;
         pub fn vx_table<T, U>(a: T, b: U) -> T;
-        pub fn vx_mask<T>(a: T) -> i32;
+        pub fn vx_mask<T>(a: T, width: u32) -> i32;
         pub fn vx_blend<T>(a: T, b: T, mask: T) -> T;
     }
 }
