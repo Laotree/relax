@@ -222,7 +222,7 @@ fn app_events() -> &'static Slots<Ev> {
 /// The program's categories that are the host's or the platform's (log lines, seeds, the
 /// window, replays): they go with the host's events.
 fn host_cat(cat: &str) -> bool {
-    ["log", "seed.", "window.", "replay."].iter().any(|p| cat.starts_with(p))
+    ["log", "seed.", "window.", "replay.", "script."].iter().any(|p| cat.starts_with(p))
 }
 fn inputs() -> &'static Slots<In> {
     INPUTS.get_or_init(|| crate::zone_alloc::kept_with(|| Slots::new(1 << 16)))
@@ -454,6 +454,7 @@ fn watch() {
     // everything this thread keeps outlives compiler generations (a zone swap frees their heaps)
     let _k = crate::zone_alloc::kept();
     super::heap::exclude_this_thread();
+    let mut last_heap = std::time::Instant::now();
     loop {
         std::thread::park_timeout(std::time::Duration::from_millis(50));
         if !on() {
@@ -476,6 +477,14 @@ fn watch() {
                     Ok((path, n)) => eprintln!("makepad-run flightrec: {} recorded: {} ({} KB; makepad inspect file={} pf brief)", why.name(), path.display(), n / 1024, path.display()),
                     Err(e) => eprintln!("makepad-run flightrec: cannot write the {} recording: {}", why.name(), e),
                 }
+            }
+        }
+        // the app's heap once a second (live and committed bytes)
+        if last_heap.elapsed().as_secs() >= 1 {
+            last_heap = std::time::Instant::now();
+            if let Some((live, committed)) = crate::domain::app_heap_stats() {
+                counter("app_heap", live as i64);
+                counter("app_heap_committed", committed as i64);
             }
         }
         // a UI wait on the JIT or a frame that runs long: sample both sides until it ends

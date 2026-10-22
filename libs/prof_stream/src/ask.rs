@@ -163,7 +163,7 @@ impl Q {
     }
 }
 
-pub const HELP: &str = "compare two recordings: `diff` with base=<A.mkpf> (B is the one asked). `brief`: the starting point of an analysis (findings, slowest frame, JIT, how to test a fix). queries: summary | frames [n=10] [sort=slow|time] | frame F<n> | top [cpu|jit|gpu] [lane=main|all|T<n>] [range=R<a>-<b>] [n=12] | hitches [ms=<n>] | timeline F<n>|R<a>-<b> [width=100] | lanes | why-slow [F<n>|R<a>-<b>] | diff (needs a baseline: B) | gpu <frames|frame F<n>|top by=shader|owner|pass|util> | stall [F<n>|slowest] (a hitch from both sides: what the UI waited on and what that lane did) | events [cat=<prefix>] [app=1] [text=] [a=] [range=R<a>-<b>] [n=30] | log | marks (the app's own events) | input [n=] | at <s of the run>|R<ms>|F<n> (every lane at one moment)  (ids: F<n> frame, T<n> lane, R<a>-<b> ms range from the start)";
+pub const HELP: &str = "compare two recordings: `diff` with base=<A.mkpf> (B is the one asked). `brief`: the starting point of an analysis (findings, slowest frame, JIT, how to test a fix). queries: summary | frames [n=10] [sort=slow|time] | frame F<n> | top [cpu|jit|gpu] [lane=main|all|T<n>] [range=R<a>-<b>] [n=12] | hitches [ms=<n>] | timeline F<n>|R<a>-<b> [width=100] | lanes | why-slow [F<n>|R<a>-<b>] | diff (needs a baseline: B) | gpu <frames|frame F<n>|top by=shader|owner|pass|util> | stall [F<n>|slowest] (a hitch from both sides: what the UI waited on and what that lane did) | events [cat=<prefix>] [app=1] [text=] [a=] [range=R<a>-<b>] [n=30] | log | marks (the app's own events) | input [n=] | at <s of the run>|R<ms>|F<n> (every lane at one moment) | memory (resident size and the app heap over time)  (ids: F<n> frame, T<n> lane, R<a>-<b> ms range from the start)";
 
 /// Answers `query` on `p` (`base`: the baseline recording of a diff).
 pub fn ask(p: &Profile, query: &str, base: Option<&Profile>) -> Ans {
@@ -196,6 +196,7 @@ pub fn ask(p: &Profile, query: &str, base: Option<&Profile>) -> Ans {
         "marks" => events(p, &Q::parse(&format!("{query} app=1")), None),
         "input" => input(p, &q),
         "at" => at_time(p, &q),
+        "memory" => memory(p),
         "help" => Ans::new(HELP),
         other => format!("unknown query `{other}`\n{HELP}").into(),
     }
@@ -1100,7 +1101,7 @@ fn time_arg(p: &Profile, w: &str) -> Result<u64, String> {
 
 /// The host's and the platform's own event categories (everything else is the app's).
 fn is_host_cat(c: &str) -> bool {
-    const PREFIXES: &[&str] = &["run.", "log", "panic", "window.", "seed.", "replay.", "zone.", "cache.", "fault"];
+    const PREFIXES: &[&str] = &["run.", "log", "panic", "window.", "seed.", "replay.", "zone.", "cache.", "fault", "script."];
     const KINDS: &[&str] = &["hitch", "mark", "hang", "deadlock", "mem", "spike", "rtstall", "scripterr", "patchrefused", "patchverified", "patchreverted"];
     PREFIXES.iter().any(|p| c.starts_with(p)) || KINDS.contains(&c)
 }
@@ -1429,4 +1430,37 @@ fn cut(s: &str, n: usize) -> String {
     let mut o: String = s.chars().take(n.saturating_sub(1)).collect();
     o.push('…');
     o
+}
+
+/// `memory`: the recorder's memory counters over time (resident size, the app's heap): first,
+/// last, peak, growth and a sparkline each.
+fn memory(p: &Profile) -> Ans {
+    let mut names: Vec<u32> = Vec::new();
+    for c in &p.counters {
+        if c.tid == 0 && !names.contains(&c.counter) {
+            names.push(c.counter);
+        }
+    }
+    if names.is_empty() {
+        return "no memory counters recorded (the flight recorder writes rss and app_heap once a second)\nmore: summary".into();
+    }
+    let mb = |v: i64| sig(v as f64 / (1 << 20) as f64);
+    let mut t = Table::new(&["counter", "first MB", "last MB", "peak MB", "growth MB", "over s", "trend"]);
+    let mut finding = String::new();
+    for n in names {
+        let v: Vec<&crate::CounterRec> = p.counters.iter().filter(|c| c.counter == n && c.tid == 0).collect();
+        let (first, last) = (v[0], v[v.len() - 1]);
+        let peak = v.iter().map(|c| c.value).max().unwrap_or(0);
+        let vals: Vec<u64> = v.iter().map(|c| c.value.max(0) as u64).collect();
+        let secs = last.t.saturating_sub(first.t) as f64 / 1e9;
+        if finding.is_empty() {
+            finding = format!("{} {} MB -> {} MB over {} s (peak {} MB)", p.s(n), mb(first.value), mb(last.value), sig(secs), mb(peak));
+        }
+        t.row(vec![p.s(n).to_string(), mb(first.value), mb(last.value), mb(peak), mb(last.value - first.value), sig(secs), text::sparkline(&vals, 40)]);
+    }
+    let mut out = Ans::new(finding);
+    out.table(t);
+    out.note("counters: rss = the process's resident size; app_heap = live bytes of the app domain's heap (app_heap_committed: its pages)");
+    out.more("events cat=script.gc  events cat=zone.swap  summary");
+    out
 }
