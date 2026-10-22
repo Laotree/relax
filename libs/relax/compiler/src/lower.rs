@@ -1092,6 +1092,41 @@ impl<'a> Lcx<'a> {
         }
     }
 
+    /// The byte every byte of a repeated element `v` (one scalar leaf of kind `m`, no padding)
+    /// holds, as a vreg for memset: the value itself for a byte-sized element, else a constant
+    /// whose bytes are all equal (rustc codegen_rvalue Repeat: `const_to_opt_u128` bytes all the
+    /// first, or an i8 immediate). None: store per element.
+    fn repeat_fill_byte(&mut self, v: &Val, m: Mem) -> Option<VReg> {
+        let Val::L(regs) = v else { return None };
+        if regs.len() != 1 {
+            return None;
+        }
+        let r = regs[0];
+        let n = match m {
+            Mem::Int(1, _) => return Some(r),
+            Mem::Int(n, _) => n as usize,
+            Mem::F32 => 4,
+            Mem::F64 => 8,
+        };
+        // the constant defining r in the current block (lowering just emitted it)
+        let b = &self.f.blocks[self.cur as usize];
+        let bits = b.insts.iter().rev().find_map(|i| match *i {
+            Inst::Iconst(d, k) if d == r => Some(Some(k as u64)),
+            Inst::Fconst(d, k, _) if d == r => Some(Some(k)),
+            _ => {
+                let mut def = false;
+                relax_backend::regalloc::for_defs(i, |d| def |= d == r);
+                def.then_some(None)
+            }
+        })??;
+        let bytes = bits.to_le_bytes();
+        let first = bytes[0];
+        if bytes[1..n].iter().any(|&x| x != first) {
+            return None;
+        }
+        Some(self.iconst(first as i64))
+    }
+
     fn store_val(&mut self, base: VReg, off: i32, t: TyId, v: Val) {
         let l = self.layout(t);
         self.store_val_with_layout(base, off, l, v);
@@ -2493,6 +2528,14 @@ impl<'a> Lcx<'a> {
                 // self-referential future, may be aliased through itself)
                 if let TyKind::Ref(true, inner, _) = self.kind(t) {
                     if !self.unsized_ty(inner) && regs.len() == 1 && self.u.is_unpin(inner) {
+                        self.f.noalias.push(regs[0]);
+                    }
+                }
+                // and `&T` for T: Freeze (rustc_ty_utils abi.rs: PointerKind::SharedRef { frozen }
+                // -> noalias + readonly): nothing writes the memory during the call, so its loads
+                // are loop-invariant (quicksort's pivot under partition's stores)
+                if let TyKind::Ref(false, inner, _) = self.kind(t) {
+                    if !self.unsized_ty(inner) && regs.len() == 1 && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), inner) {
                         self.f.noalias.push(regs[0]);
                     }
                 }
@@ -5313,6 +5356,24 @@ impl<'a> Lcx<'a> {
         if self.unsized_ty(xt) {
             return None;
         }
+        // `&CONST` (shared, no interior mutability): the constant's own evaluated allocation,
+        // which is immutable (rustc interns it; const_val copies out of it for every by-value
+        // use). Not a writable static refilled with a copy of it at every evaluation.
+        let xs = strip_paren(self.ast(), x);
+        if shared && matches!(self.ast().expr(xs).kind, ExprKind::Path(_)) && self.layout(xt).size > 0 && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), xt) {
+            if let Some(Res::Def(d)) = self.b.res.get(&xs.0).copied() {
+                if matches!(self.u.prog.def(d).kind, DefKind::Const | DefKind::AssocConst) {
+                    let args = self.b.res_args.get(&xs.0).copied().unwrap_or_default();
+                    let args = self.mono_list(args);
+                    if let Some(addr) = self.u.const_addr_shared(d, args) {
+                        let s = self.u.data_sym(addr);
+                        let p = self.f.vreg(Cls::I);
+                        self.emit(Inst::Addr(p, s));
+                        return Some(p);
+                    }
+                }
+            }
+        }
         let (blk0, at0) = (self.cur, self.f.blocks[self.cur as usize].insts.len());
         let v = self.lower_expr(x);
         let l = self.layout(xt);
@@ -6357,6 +6418,8 @@ impl<'a> Lcx<'a> {
                 };
                 let el = self.layout(et);
                 let stride = crate::layout::round_up(el.size, el.align);
+                // a single scalar filling the whole element: memset candidate
+                let fill_mem = el.leaves.as_ref().and_then(|l| (l.len() == 1 && l[0].off == 0 && stride == el.size).then(|| l[0].mem));
                 let a = self.new_slot_for(t);
                 // the operand coerced to the element type (`[&[]; 4]` as `[&[i16]; 4]`)
                 let val = self.lower_expr_coerced(*x, et);
@@ -6375,6 +6438,13 @@ impl<'a> Lcx<'a> {
                     for i in 0..n {
                         self.store_val(a, (i as u32 * stride) as i32, et, val.clone());
                     }
+                } else if let Some(byte) = fill_mem.and_then(|m| self.repeat_fill_byte(&val, m)) {
+                    // every byte of the array is one value (a byte element, or zero of any
+                    // scalar element): memset, as rustc's lowering of a repeat (MIR Rvalue::Repeat
+                    // -> `memset` for a byte-sized or all-zero operand); `[0u8; 1024]` buffers
+                    let len = self.iconst((n * stride as u64) as i64);
+                    let rt = self.u.rs.memset;
+                    self.emit(Inst::Call(Callee::Host(rt), vec![a, byte, len], Vec::new()));
                 } else {
                     // loop: i in 0..n
                     let i = self.f.vreg(Cls::I);
@@ -10623,6 +10693,41 @@ impl<'a> Lcx<'a> {
         Val::M(base, 0)
     }
 
+    /// The allocator shim (rustc_codegen_ssa base.rs allocator_shim / codegen_allocator: `__rust_<op>`
+    /// calls `__rg_<op>` of the program's `#[global_allocator]`, else the default `__rdl_<op>`):
+    /// core::heap::__rg_<op>::<A>(&STATIC, args) or core::heap::__rdl_<op>(args).
+    fn allocator_shim(&mut self, op: &str, vals: &[(Val, TyId)], t: TyId) -> Val {
+        let mut args = vals.to_vec();
+        let id = match self.u.global_allocator() {
+            Some((s, a)) => {
+                let Some(shim) = self.u.core_path(&["heap", &format!("__rg_{op}")]) else {
+                    self.err(self.pos, format!("core has no heap::__rg_{op} (the global allocator shim)"));
+                    return self.dummy_val(t);
+                };
+                // the static as a place, as a path to it lowers (lower_def_value)
+                crate::boundary::note_static(self.u, self.b.def, &self.b.args, s);
+                if !self.u.provided.is_empty() {
+                    self.check_provided_static(s, a);
+                }
+                let addr = self.static_addr(s);
+                let addr = self.u.syms.intern(crate::syms::SymKind::Static(s), addr);
+                let p = self.f.vreg(Cls::I);
+                self.emit(Inst::Addr(p, addr));
+                let r = self.u.tcx.tys.intern(TyKind::Ref(false, a, crate::types::RegionId::ERASED));
+                args.insert(0, (Val::L(vec![p]), r));
+                self.u.fn_id(FnKey::Inst(shim, vec![a]))
+            }
+            None => {
+                let Some(default) = self.u.core_path(&["heap", &format!("__rdl_{op}")]) else {
+                    self.err(self.pos, format!("core has no heap::__rdl_{op} (the default allocator)"));
+                    return self.dummy_val(t);
+                };
+                self.u.fn_id(FnKey::Inst(default, Vec::new()))
+            }
+        };
+        self.emit_call(Callee::Fn(id), args, t)
+    }
+
     fn intrinsic(&mut self, d: DefId, gargs: &[TyId], vals: &[(Val, TyId)], t: TyId) -> Option<Val> {
         if self.u.prog.def(d).kind != DefKind::ForeignFn || !self.u.is_intrinsic(d) {
             return None;
@@ -10642,6 +10747,9 @@ impl<'a> Lcx<'a> {
         if let Some(v) = self.mem_intrinsic(&name, gargs, vals, t) {
             return Some(v);
         }
+        if let Some(op) = name.strip_prefix("rust_").filter(|op| matches!(*op, "alloc" | "alloc_zeroed" | "dealloc" | "realloc")) {
+            return Some(self.allocator_shim(op, vals, t));
+        }
         let mut a = Vec::new();
         for (v, ty) in vals {
             let r = self.to_leaves(v.clone(), *ty);
@@ -10657,6 +10765,9 @@ impl<'a> Lcx<'a> {
                 "ceil" => FUn::Ceil,
                 "trunc" => FUn::Trunc,
                 "rint" => FUn::RoundEven,
+                // round half away from zero (Rust `round`): inline on both backends (x64
+                // trunc(x + copysign(0.5 - ulp/2, x)), arm64 frinta), not a libm call
+                "round" => FUn::RoundAway,
                 _ => return None,
             })
         };
