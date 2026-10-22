@@ -275,6 +275,8 @@ impl ReloadSlots {
 pub(crate) mod zone_scan;
 #[path = "zone_swap.rs"]
 pub(crate) mod zone_swap;
+#[path = "bmemo.rs"]
+pub(crate) mod bmemo;
 
 pub(crate) struct ZoneTaken {
     last_front: Option<std::sync::Arc<FrontShared>>,
@@ -287,11 +289,12 @@ pub(crate) struct ZoneTaken {
     o2_base: std::collections::VecDeque<(usize, u32)>,
     o2_seen: Option<std::collections::HashSet<(usize, u32)>>,
     prep_shared: HashMap<u32, Vec<std::sync::Arc<PrepShared>>>,
+    bmemo: bmemo::Memo,
 }
 
 pub(crate) fn zone_take() -> ZoneTaken {
     macro_rules! take {
-        ($name:ident => $empty:ident) => {{
+        ($name:path => $empty:ident) => {{
             let mut guard = $name.lock().unwrap_or_else(|e| e.into_inner());
             let taken = std::mem::take(&mut *guard);
             #[cfg(test)]
@@ -310,6 +313,7 @@ pub(crate) fn zone_take() -> ZoneTaken {
         o2_base: take!(O2_BASE => is_empty),
         o2_seen: take!(O2_SEEN => is_none),
         prep_shared: take!(PREP_SHARED => is_empty),
+        bmemo: take!(bmemo::MEMO => is_empty),
     }
 }
 
@@ -328,6 +332,7 @@ pub(crate) fn zone_put_back(taken: ZoneTaken) {
     put(&O2_BASE, taken.o2_base);
     put(&O2_SEEN, taken.o2_seen);
     put(&PREP_SHARED, taken.prep_shared);
+    put(&bmemo::MEMO, taken.bmemo);
 }
 
 /// Heap classes (memlane zones, DESIGN-zones.md F). KEPT (system heap; built and grown under
@@ -5781,7 +5786,7 @@ pub struct MainCompile {
     pub queued: [u32; 3],
 }
 
-pub const MAIN_HOW_NAMES: [&str; 6] = ["done", "cache", "spec", "inflight", "split", "plain"];
+pub const MAIN_HOW_NAMES: [&str; 7] = ["done", "cache", "spec", "inflight", "split", "plain", "memo"];
 
 thread_local! {
     /// the main thread's compile being recorded (only between compile_slot_on_stack's ends)
@@ -15756,6 +15761,8 @@ pub(crate) struct BackWork {
     name: String,
     /// wall ns when the front ended (SPLIT_NS)
     w1: u64,
+    /// the back-end memo may answer it (bmemo::worthy)
+    memo: bool,
 }
 
 /// What a back end made, for its finish (a unit call).
@@ -15855,18 +15862,38 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
             r.cpu[0] += c1 - c0;
         });
     }
-    Begin::Back(BackWork { id, spec, front, slots, epoch, env, fold, rotate, session, name, w1 })
+    let memo = bmemo::worthy(&*up, id);
+    Begin::Back(BackWork { id, spec, front, slots, epoch, env, fold, rotate, session, name, w1, memo })
 }
 
 impl BackWork {
     /// Optimises and generates the code (any thread, no unit state).
     pub(crate) fn run(self) -> BackDone {
-        let BackWork { id, spec, front, slots, epoch, env, fold, rotate, session, name, w1 } = self;
+        let BackWork { id, spec, front, slots, epoch, env, fold, rotate, session, name, w1, memo: worthy } = self;
         let options = &session.options;
         let runtime = &session.runtime;
         let done_out: relax_session::sync::Mutex<Vec<Deferred>> = relax_session::sync::Mutex::new(Vec::new());
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
             let t0 = cpu_ns();
+            // the back-end memo (bmemo.rs): an earlier back end over the same preparation up to
+            // slot names made this code; a miss keeps what the back end got for its entry
+            let mut memo = None;
+            if let Front::Opt(p, _) = &front {
+                if worthy && bmemo::on(options) {
+                    let k = bmemo::key(id, p, (fold, rotate, env.opt_regs, epoch));
+                    if let Some((opt, code, map, relocs, cg_ns, done, frame)) = bmemo::lookup(&k, p) {
+                        *done_out.lock().unwrap() = done;
+                        note_frame(id, frame.0, frame.1, false);
+                        if !spec {
+                            main_rec(|r| if r.how == 4 { r.how = 6 });
+                        }
+                        return Ok((opt, code, map, relocs, cg_ns));
+                    }
+                    memo = Some((k, bmemo::SPrep::of(p)));
+                }
+            } else {
+                bmemo::STATS[5].fetch_add(1, Ordering::Relaxed);
+            }
             let (rir, opt) = match front {
                 Front::Codegen(r) => (r, None),
                 Front::Opt(p, prep_ns) => {
@@ -15897,7 +15924,8 @@ impl BackWork {
             crate::memstat::note_big("codegen", &cg.name, mps, || cg_shape(&cg));
             compile_watch(None);
             let c = c?;
-            note_frame(id, c.frame_size, slot_bytes(&cg), false);
+            let frame = (c.frame_size, slot_bytes(&cg));
+            note_frame(id, frame.0, frame.1, false);
             dump_o1(&cg, &c);
             code_sig(id, &cg, &c.code, c.alloc_sig, false);
             if let Some(u) = crate::syms::unit() {
@@ -15911,6 +15939,9 @@ impl BackWork {
                     r.cpu[2] += t2 - t1;
                     r.insts[1] += n;
                 });
+            }
+            if let Some((k, prep)) = memo {
+                bmemo::store(k, prep, &opt, &c.code, &c.pc_map, &c.relocs, t2 - t1, &done_out.lock().unwrap(), frame, t2 - t0);
             }
             Ok((opt, c.code, c.pc_map, c.relocs, t2 - t1))
         }));
