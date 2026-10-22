@@ -30,6 +30,10 @@ static RINGS_ON: AtomicBool = AtomicBool::new(false);
 /// frame spikes are watched (`watch`, `events follow=1`, `--agent`)
 static FRAME_WATCH: AtomicBool = AtomicBool::new(false);
 
+/// UI frames finished (a frame's Draw dispatch ended) while frame markers are on (hitch
+/// detection, on by default): the per-frame denominator of `heap frame` and other rates
+pub static FRAMES: AtomicU64 = AtomicU64::new(0);
+
 /// frames slower than this are `hitch` events (ns; 0: off): always on, MAKEPAD_RUN_HITCH_MS
 /// (default 50) or `hitch ms=<n>|off`
 static HITCH_NS: AtomicU64 = AtomicU64::new(0);
@@ -258,6 +262,7 @@ fn frame_watch(begin: bool, name: &'static str) {
         if name != "Draw" || l.start == 0 {
             return None;
         }
+        FRAMES.fetch_add(1, Relaxed);
         let ms = now.saturating_sub(l.start).saturating_sub(l.idle);
         let avg = l.avg;
         l.avg = if avg == 0 { ms } else { (avg * 15 + ms) / 16 };

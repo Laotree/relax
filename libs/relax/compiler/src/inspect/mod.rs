@@ -125,7 +125,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("memory", "[compiler=1] [n=24]", "where the memory is and why: RSS by mapping kind, malloc in use vs held free, makepad run's own parts, findings, growth since the last `memory`"),
     ("diff", "<snap a> <snap b|now>", "memory growth between two snapshots, largest first"),
     ("mem", "snap <name> | timeline [from_ms= to_ms=]", "keep a named memory snapshot; resident size over time with phase markers and the peak's phase"),
-    ("heap", "start [rate=65536] [ttl_s=600] | top [by=live|alloc|freed|peak] | snap <name> | diff <a> <b|now> | path H<id> | stop | status", "program heap by allocation stack (JIT-patched allocator hooks, byte-sampled): live, allocated, freed; growth and leaks between snapshots"),
+    ("heap", "start [rate=65536] [ttl_s=600] | top [by=live|alloc|freed|peak] | frame [s=2] [n=12] | snap <name> | diff <a> <b|now> | path H<id> | stop | status", "program heap by allocation stack (JIT-patched allocator hooks, byte-sampled): live, allocated, freed; growth and leaks between snapshots"),
     ("top", "by=time|alloc|bytes|live [s=3] [n=15]", "the top functions by CPU time (prof) or allocation sites by allocated / live bytes (heap)"),
     ("frame", "<n|slowest>", "one frame of the last timeline: UI phases, critical path, waits and who ended them (alias of timeline frame)"),
     ("path", "<H<n>|R<n>>", "the full stack of a heap site id"),
