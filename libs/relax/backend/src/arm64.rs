@@ -152,8 +152,12 @@ fn keeps_v0_7(f: &Func, i: &Inst) -> bool {
     }
 }
 
-/// x64 records RIR offsets for asm dumps; arm64 keeps the switch for one embedder API
-pub fn set_rir_map(_on: bool) {}
+static RIR_MAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record `Compiled::rir_map` (code offset -> RIR block/instruction) in later compiles (asm dumps)
+pub fn set_rir_map(on: bool) {
+    RIR_MAP.store(on, std::sync::atomic::Ordering::Relaxed);
+}
 
 pub struct Compiled {
     pub code: Vec<u8>,
@@ -167,7 +171,8 @@ pub struct Compiled {
     /// the relocated fields, emitted zeroed: the embedder links the code (`rir::link`) where it
     /// installs it
     pub relocs: Vec<RelocAt>,
-    /// x64 only (tools/run/tools/asmcmp); empty here
+    /// (code offset, block, instruction or u32::MAX = terminator) of every RIR instruction
+    /// emitted -- filled only while `set_rir_map(true)` (asm dumps)
     pub rir_map: Vec<(u32, u32, u32)>,
     pub rir_emitted: String,
 }
@@ -794,6 +799,8 @@ struct Gen<'a> {
     pads: Vec<(usize, Vec<(VReg, i32)>, u32)>,
     /// (instruction position, return offset in bytes) of every call: the variable table's sites (dbgloc)
     var_calls: Vec<(u32, u32)>,
+    rir_map: Vec<(u32, u32, u32)>,
+    rir_map_on: bool,
     /// branch relaxation (a function past imm19's +-1 MB): conditional block branches become
     /// an inverted short branch over a `b` (+-128 MB), constants are built in registers
     /// instead of loaded from the literal pools after the code
@@ -1258,6 +1265,9 @@ impl<'a> Gen<'a> {
             self.cur_pos = self.al.block_start[bi];
             for (ii, inst) in b.insts.iter().enumerate() {
                 self.pc_map.push(((self.a.pos() * 4) as u32, b.pos[ii]));
+                if self.rir_map_on {
+                    self.rir_map.push(((self.a.pos() * 4) as u32, bi as u32, ii as u32));
+                }
                 self.cur_pos = self.al.inst_pos(bi, ii);
                 if let Some(ls) = self.win_start.get(&self.cur_pos).cloned() {
                     for (v, r) in ls {
@@ -1390,6 +1400,9 @@ impl<'a> Gen<'a> {
                 }
             }
             self.pc_map.push(((self.a.pos() * 4) as u32, b.term_pos));
+            if self.rir_map_on {
+                self.rir_map.push(((self.a.pos() * 4) as u32, bi as u32, u32::MAX));
+            }
             let fuse_inst = if fused { Some(b.insts[n - 1].clone()) } else { None };
             self.term(&b.term, bi, fuse_inst);
         }
@@ -5098,6 +5111,8 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         last_call_ret: 0,
         pads: Vec::new(),
         var_calls: Vec::new(),
+        rir_map: Vec::new(),
+        rir_map_on: RIR_MAP.load(std::sync::atomic::Ordering::Relaxed),
         long,
         tbz: tbz && !long,
     };
@@ -5149,7 +5164,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     } else {
         crate::dbgloc::note_stats(&pc_map, &[], 0);
     }
-    return Ok(Compiled { code, pc_map, frame_size: frame, text_len, alloc_sig, relocs: g.relocs, rir_map: Vec::new(), rir_emitted: String::new() });
+    return Ok(Compiled { code, pc_map, frame_size: frame, text_len, alloc_sig, relocs: g.relocs, rir_emitted: if g.rir_map_on { g.f.dump() } else { String::new() }, rir_map: g.rir_map });
     }
 }
 
