@@ -9,6 +9,10 @@ publish = false
 # The native library tests are in src/; fixtures run through the compiler test runners.
 autotests = false
 
+# files outside this crate its build reads (makepad-source-slice ships them in a slice or source archive)
+[package.metadata.commercial]
+include = ["../build_stamp.rs", "std"]
+
 [lib]
 name = "relax_compiler"
 path = "src/lib.rs"
