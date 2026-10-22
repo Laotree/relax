@@ -126,3 +126,29 @@ fn branch_compare_moves_to_the_block_end() {
     assert_eq!(run(0x100, 5), 12);
     assert_eq!(run(0x101, 5), 0x101);
 }
+
+/// Two counters stepped next to each other before one instruction that reads both: each step
+/// moves once (they used to hop over each other forever, hanging the O3 worker).
+#[test]
+fn two_steps_before_a_common_reader_terminate() {
+    let o = relax_session::Options::default();
+    let mut f = Func::new("two".into(), 0);
+    let (a, b) = (f.vreg(Cls::I), f.vreg(Cls::I));
+    f.params = vec![a, b];
+    f.rets = vec![Cls::I];
+    f.block();
+    let (x, y, k, r) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+    push(&mut f, 0, Inst::Mov(x, a));
+    push(&mut f, 0, Inst::Mov(x, a));
+    push(&mut f, 0, Inst::Mov(y, b));
+    push(&mut f, 0, Inst::Mov(y, b));
+    push(&mut f, 0, Inst::IBinI(IOp::Add, U64, x, x, 1));
+    push(&mut f, 0, Inst::IBinI(IOp::Add, U64, y, y, 2));
+    push(&mut f, 0, Inst::Iconst(k, 5));
+    push(&mut f, 0, Inst::IBin(IOp::Add, U64, r, x, y));
+    f.blocks[0].term = Term::Ret(vec![r]);
+    f.verify().unwrap();
+    let g = regalloc::sink_increments(&o, &f).expect("both move past the constant");
+    let ins = &g.blocks[0].insts;
+    assert!(matches!(ins[4], Inst::Iconst(..)), "{:?}", ins);
+}

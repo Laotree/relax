@@ -4660,23 +4660,23 @@ pub fn sink_increments(options: &relax_session::Options, f: &Func) -> Option<Fun
         if !reach[bi] {
             continue;
         }
-        let mut a = 0;
-        loop {
+        // the block's steps, last first: a step only ever moves down and each is looked at once
+        // (two steps of different counters before a common reader would otherwise keep hopping
+        // over each other)
+        let cands: Vec<usize> = {
+            let b = &f.blocks[bi];
+            (0..b.insts.len()).filter(|&a| matches!(b.insts[a], Inst::IBinI(IOp::Add | IOp::Sub, ..))).collect()
+        };
+        for &a in cands.iter().rev() {
             let cur = g.as_ref().unwrap_or(f);
             let b = &cur.blocks[bi];
-            if a >= b.insts.len() {
-                break;
-            }
             // the step at a: (counter, number of instructions)
             let step = match b.insts[a] {
                 Inst::IBinI(IOp::Add | IOp::Sub, _, d, x, _) if d == x && ndef[d.0 as usize] >= 2 => Some((d, 1)),
                 Inst::IBinI(IOp::Add | IOp::Sub, _, t, x, _) if t != x && ndef[t.0 as usize] == 1 && uses[t.0 as usize] == 1 && matches!(b.insts.get(a + 1), Some(Inst::Mov(d, s)) if *d == x && *s == t) => Some((x, 2)),
                 _ => None,
             };
-            let Some((v, n)) = step else {
-                a += 1;
-                continue;
-            };
+            let Some((v, n)) = step else { continue };
             // walk to the first instruction that reads or writes v
             let (mut c, mut k) = (bi as u32, a + n);
             let target = loop {
@@ -4716,7 +4716,6 @@ pub fn sink_increments(options: &relax_session::Options, f: &Func) -> Option<Fun
                 k = 0;
             };
             if target == (bi as u32, a + n) {
-                a += n;
                 continue;
             }
             let gf = g.get_or_insert_with(|| f.clone());
@@ -4728,7 +4727,6 @@ pub fn sink_increments(options: &relax_session::Options, f: &Func) -> Option<Fun
                 tb.insts.insert(at + j, i);
                 tb.pos.insert(at + j, p);
             }
-            // the instructions after a moved up by n: look at a again
         }
     }
     g
