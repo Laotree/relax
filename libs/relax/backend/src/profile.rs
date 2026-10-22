@@ -9,7 +9,7 @@
 //! ratio of the two (loop depth and branch splits), so a function never mixes measured and
 //! static weights.
 
-use crate::rir::{Block, Cls, Func, IOp, Inst, Mem, Term, I64};
+use crate::rir::{Block, Callee, Cls, Cond, Func, IOp, Inst, Mem, Sym, Term, I64};
 
 /// Block `b`'s counter is the u64 at `base + 8 * b`. Each block starts with a plain (racy,
 /// non-atomic) load, add and store of its counter: counts are a frequency, never a fact.
@@ -43,6 +43,75 @@ pub fn instrument(f: &mut Func, base: u64) -> Vec<bool> {
         }
     }
     counted
+}
+
+/// Back-edge counting (tier-up of loops; HotSpot's backedge counters, the CLR's Tier0 patchpoint
+/// counters): every block some edge reaches from a block at or after it (in block order every
+/// cycle has such an edge, so every loop iteration passes one) starts with a decrement of the
+/// slot's loop counter, the 8-byte word at `counter` (a relocated symbol: the code stays
+/// cacheable). When the count drops below zero the block calls `helper(counter address)` (the
+/// tier-up decision, which resets the count) and goes on. The block's own code moves to a new
+/// block right after it, which the counting block falls into; the calls go after all other blocks.
+/// False: no loop, nothing changed.
+pub fn loop_counters(f: &mut Func, counter: Sym, helper: Sym) -> bool {
+    let nb = f.blocks.len();
+    let mut header = vec![false; nb];
+    for (b, blk) in f.blocks.iter().enumerate() {
+        for t in blk.term.succs() {
+            if (t as usize) <= b {
+                header[t as usize] = true;
+            }
+        }
+    }
+    if !header.iter().any(|h| *h) {
+        return false;
+    }
+    // block order: each counting block, then its body; the helper calls last
+    let mut order: Vec<u32> = Vec::with_capacity(nb + 2 * header.iter().filter(|h| **h).count());
+    let mut colds: Vec<u32> = Vec::new();
+    for t in 0..nb {
+        order.push(t as u32);
+        if !header[t] {
+            continue;
+        }
+        let at = f.blocks[t].pos.first().copied().unwrap_or(f.blocks[t].term_pos);
+        let body = f.block();
+        let cold = f.block();
+        let (a, v, w, c, a2) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        let old = std::mem::replace(&mut f.blocks[t], Block { insts: Vec::new(), pos: Vec::new(), term: Term::Unreachable, term_pos: at, count: -1.0 });
+        let count = old.count;
+        f.blocks[body as usize] = old;
+        let blk = &mut f.blocks[t];
+        blk.insts = vec![
+            Inst::Addr(a, counter),
+            Inst::Load(Mem::Int(8, false), v, a, 0),
+            Inst::IBinI(IOp::Sub, I64, w, v, 1),
+            Inst::Store(Mem::Int(8, false), a, 0, w),
+            Inst::ICmpI(Cond::Lt, true, c, w, 0),
+        ];
+        blk.pos = vec![at; 5];
+        blk.term = Term::Branch(c, cold, body);
+        blk.count = count;
+        let cb = &mut f.blocks[cold as usize];
+        cb.insts = vec![Inst::Addr(a2, counter), Inst::Call(Callee::Host(helper), vec![a2], Vec::new())];
+        cb.pos = vec![at; 2];
+        cb.term = Term::Jump(body);
+        cb.term_pos = at;
+        order.push(body);
+        colds.push(cold);
+    }
+    order.extend(colds);
+    let mut map = vec![0u32; order.len()];
+    for (i, b) in order.iter().enumerate() {
+        map[*b as usize] = i as u32;
+    }
+    let mut old: Vec<Option<Block>> = std::mem::take(&mut f.blocks).into_iter().map(Some).collect();
+    for b in &order {
+        let mut blk = old[*b as usize].take().unwrap();
+        blk.term.map_succs(|t| map[t as usize]);
+        f.blocks.push(blk);
+    }
+    true
 }
 
 /// Some block carries a count.

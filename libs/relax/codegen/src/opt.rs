@@ -582,6 +582,11 @@ fn pgo_site_limits(lim: &InlineLimits, counted: bool, priority: u32) -> InlineLi
     }
 }
 
+fn inline_trace(name: &str) -> bool {
+    static T: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    T.get_or_init(|| std::env::var("MAKEPAD_RUN_INLINE_TRACE").ok().filter(|s| !s.is_empty())).as_deref().is_some_and(|t| name.ends_with(t))
+}
+
 /// Frequencies must describe this exact RIR. New blocks inherit the site's priority.
 /// The queue uses stable block/instruction indices: splitting invalidates only the tail,
 /// whose calls are enqueued again in the new continuation block.
@@ -693,6 +698,8 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
     for p in &f.params { kdef[p.0 as usize].0 = 1; }
     for b in 0..f.blocks.len() { note_defs(&mut kdef, &f.blocks[b].insts, f.vregs.len()); }
     let mut specialized: std::collections::HashMap<(u32, bool, Vec<Option<i64>>), Option<Box<Func>>> = std::collections::HashMap::new();
+    // MAKEPAD_RUN_INLINE_TRACE=<suffix>: every site decision of the callers whose name ends with it
+    let trace = inline_trace(&f.name);
     while let Some((_, _, _, Reverse(bi), Reverse(ii))) = queue.pop() {
         let Some(Inst::Call(Callee::Fn(id), args, rets)) = f.blocks[bi].insts.get(ii) else { continue };
         let (id, args, rets) = (*id, args.clone(), rets.clone());
@@ -753,6 +760,14 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
             if !refused {
                 pick = Some((callee, rule.unwrap(), growth, size, cost, free, no_growth, in_context));
                 break;
+            }
+        }
+        if trace {
+            let fq = f32::from_bits(priorities[bi].0);
+            let name = found.map_or_else(|| format!("fn#{}", id), |(p, _)| unsafe { &*p }.name.clone());
+            match &pick {
+                Some((c, r, g, sz, cost, free, _, ic)) => eprintln!("inline-trace {}: take {} freq {:.2} rule {} size {} (body {}) growth {} cost {} free {} ctx {} | budget {} priced {} limit {}", f.name, name, fq, r, sz, inline_inst_count(c), g, cost, free, ic, budget, priced, growth_limit),
+                None => eprintln!("inline-trace {}: left {} freq {:.2} tries {} | budget {} priced {} limit {}", f.name, name, fq, tries.len(), budget, priced, growth_limit),
             }
         }
         let Some((callee, rule, growth, size, cost, free, no_growth, in_context)) = pick else { continue };

@@ -124,7 +124,7 @@ pub struct FnEntry {
     pub hot_hint: AtomicBool,
     /// O3 code is installed (built or linked): O2 builds must not replace it
     pub o3: AtomicBool,
-    /// its installed code is baseline code (note_base) the sampler has not found running yet
+    /// its installed code is baseline code (note_base) that has not kept running yet (base_running)
     pub base_code: AtomicBool,
     /// SPEC-V: the body was built (and may run) without a clean borrow-check verdict: baseline code,
     /// `noalias` dropped, no promotion and no inlining into verified code until the verdict is clean
@@ -6181,8 +6181,8 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
     // a `#[relax(O2)]` fn's O1 code is not the cache's entry for it: the O2 worker's code is
     let o2 = record && marked_hot(&*up, id);
     let record = record && !o2;
-    // baseline code (built this run, or a TIER_BASE entry linked from the cache): the sampler
-    // may find it running (note_base)
+    // baseline code (built this run, or a TIER_BASE entry linked from the cache): it may keep
+    // running (note_base)
     let base = if record {
         (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline)
     } else {
@@ -6494,8 +6494,9 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
     main_rec(|r| r.cpu[0] += t0 - tb);
     let rir = twin_func.as_ref().unwrap_or_else(|| u.fns[id as usize].rir.as_ref().unwrap());
     let cg = tier0_codegen_rir(options, rir, u.opt.fold, u.opt.layout);
+    crate::wasm_export::capture(id, &cg);
+    let cg = with_loop_counters(cg, loop_syms(u, id));
     let func = &cg;
-    crate::wasm_export::capture(id, func);
     // without O3 these are the only compiles: allocate thoroughly
     let env_full;
     let env = if func.baseline || (TIER1_ENABLED.load(Ordering::Relaxed) && !func.full) {
@@ -7155,9 +7156,9 @@ unsafe fn o2_start(up: *mut Unit) {
     });
 }
 
-/// Baseline slots the sampler found running (a sample in the slot or one of its SAMPLE_CALLERS
-/// callers): their O2 builds -- `hit` until the startup releases its workers after the first
-/// present (startup_main), at once after.
+/// Baseline slots that keep running (their count stub reached its count, slowly: rt_hot): their
+/// O2 builds -- `hit` until the startup releases its workers after the first present
+/// (startup_main), at once after. (Hot ones get theirs with their O3 queueing: o2_hot.)
 struct BaseSlots {
     released: bool,
     hit: Vec<(usize, u32)>,
@@ -7168,15 +7169,15 @@ static O2_BASE: relax_session::sync::Mutex<std::collections::VecDeque<(usize, u3
 
 /// Slot `id` runs baseline code -- built so the cold start compiles fast, but every launch that
 /// links it from the cache runs it again (unoptimised RIR, no inlining of user fns: a warm
-/// Calculator's first frame ran ~2x native in it). Baseline code the sampler finds running gets
+/// Calculator's first frame ran ~2x native in it). Baseline code that keeps running gets
 /// an O2 build that replaces the code and the cache entry (record_o2); the rest (most startup
 /// code runs for microseconds) stays as it is. Unit lock held.
 unsafe fn note_base(up: *mut Unit, id: u32) {
     (&*up).fns[id as usize].base_code.store(true, Ordering::Relaxed);
 }
 
-/// The sampler found slot `id` running (unit lock held): baseline code gets its O2 build.
-unsafe fn base_sampled(up: *mut Unit, id: u32) {
+/// Baseline slot `id` keeps running (unit lock held): its O2 build.
+unsafe fn base_running(up: *mut Unit, id: u32) {
     if !(&*up).fns[id as usize].base_code.swap(false, Ordering::Relaxed) {
         return;
     }
@@ -7188,6 +7189,50 @@ unsafe fn base_sampled(up: *mut Unit, id: u32) {
         }
     }
     o2_base(up, id);
+}
+
+/// baseline slots whose count stub reached its count at a slow rate (rt_hot, no unit lock): their
+/// O2 builds, queued by the first O3 worker (drain_slow_base)
+static SLOW_BASE: relax_session::sync::Mutex<Vec<u32>> = relax_session::sync::Mutex::new(Vec::new());
+
+fn note_slow_base(u: &Unit, id: u32) {
+    {
+        let mut g = SLOW_BASE.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.contains(&id) {
+            crate::zone_alloc::kept_with(|| g.push(id));
+        }
+    }
+    TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime, &u.prog.session.options));
+}
+
+/// The first O3 worker's poll (no lock held): SLOW_BASE's O2 builds, and (at most once a second)
+/// the parked counting entries whose counted code is gone.
+fn drain_slow_base() {
+    static LAST_FORGET: AtomicU64 = AtomicU64::new(0);
+    let ids = std::mem::take(&mut *SLOW_BASE.lock().unwrap_or_else(|e| e.into_inner()));
+    let now = wall_ns();
+    let forget = now.saturating_sub(LAST_FORGET.load(Ordering::Relaxed)) >= PGO_WORK_NS
+        && COUNTING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|e| e.parked);
+    if ids.is_empty() && !forget {
+        return;
+    }
+    let up = TIER_UNIT.load(Ordering::Acquire);
+    if up.is_null() {
+        return;
+    }
+    if forget {
+        LAST_FORGET.store(now, Ordering::Relaxed);
+    }
+    owner::call(owner::Class::Background, || unsafe {
+        for id in ids {
+            if (id as usize) < (&*up).fns.len() {
+                base_running(up, id);
+            }
+        }
+        if forget {
+            pgo_forget(&*up);
+        }
+    });
 }
 
 /// The startup released its workers (after the first present): the baseline slots sampled so far
@@ -7340,7 +7385,8 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     let e = &u.env;
     let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class, near: e.near };
     let (fold, layout) = (u.opt.fold, u.opt.layout);
-    Some(O2Work { id, prep, epoch, snapshot, session, env, fold, layout, t0 })
+    let lc = loop_syms(u, id);
+    Some(O2Work { id, prep, epoch, snapshot, session, env, fold, layout, lc, t0 })
 }
 
 /// An O2 build's optimisation and code generation (no unit state).
@@ -7353,6 +7399,8 @@ struct O2Work {
     env: x64::Env,
     fold: bool,
     layout: bool,
+    /// the code counts its loops (loop_syms)
+    lc: Option<(relax_backend::rir::Sym, relax_backend::rir::Sym)>,
     t0: u64,
 }
 
@@ -7367,13 +7415,14 @@ struct O2Done {
 
 impl O2Work {
     fn run(self) -> O2Done {
-        let O2Work { id, prep, epoch, snapshot, session, env, fold, layout, t0 } = self;
+        let O2Work { id, prep, epoch, snapshot, session, env, fold, layout, lc, t0 } = self;
         let options = &session.options;
         let mut done: Vec<Deferred> = Vec::new();
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let (func, inlined) = optimize_tree(options, id, prep, &mut done)?;
             let cg = tier0_codegen_rir(options, &func, fold, layout);
             crate::wasm_export::capture(id, &cg);
+            let cg = with_loop_counters(cg, lc);
             let _scratch = crate::zone_alloc::scratch(&session.runtime);
             let c = relax_codegen::native::compile(options, &cg, &env)?;
             Ok::<_, String>((func, inlined, c))
@@ -9961,7 +10010,7 @@ impl Tier1Cfg {
     pub fn from_options(options: &crate::options::Options) -> Option<Tier1Cfg> {
         // on by default (MAKEPAD_RUN_O3=0: O1 only, which then also inlines Relax core's small
         // functions itself). Hot = calls through the slot (count stub) or CPU samples (loops
-        // in functions entered rarely: sampler). Counter (hidden): first present 4.05-4.45 ->
+        // in functions entered rarely: loop counters). Counter (hidden): first present 4.05-4.45 ->
         // 3.74-3.78 s, opt CPU 1.93 -> 1.6 s; bench_rt geomean 1.99 -> 2.05.
         if !options.tier1 {
             return None;
@@ -10601,15 +10650,15 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
     inlined
 }
 
-// ---- loop hotness by sampling (tier-up of functions entered rarely that loop a lot)
+// ---- the on-demand PC sampler (MAKEPAD_RUN_PROFILE; not part of tier-up)
 //
 // A sampler thread reads the pc of every thread running JIT code (registered by call_jit)
 // every SAMPLE_MS -- without signals, so no system call of the program is ever interrupted
 // (EINTR): on macOS by suspending the thread for a Mach thread_get_state, on Linux from a
 // perf_event task-clock sampling ring the kernel fills. pcs inside the JIT code region are
-// mapped to slots under a non-waiting unit lock through an address-ordered code index and a
-// slot is queued for O3 after SAMPLES_HOT samples (~SAMPLES_HOT * SAMPLE_MS of its CPU),
-// like a count stub reaching zero. Without OSR the next entry runs O3.
+// mapped to functions for the profile file (and MAKEPAD_RUN_FIELD_PROF's field profile). It runs
+// only when a profile is asked for: tier-up counts calls (count stubs) and loop iterations (loop
+// counters, rt_loop_hot), and the counted tier measures the work.
 
 pub(crate) const SAMPLE_MS: u64 = 2;
 
@@ -10625,7 +10674,6 @@ pub(crate) fn sample_periods() -> &'static [u64] {
         }).filter(|v| !v.is_empty()).unwrap_or_else(|| vec![SAMPLE_MS])
     })
 }
-const SAMPLES_HOT: u32 = 5;
 /// The sampler hands what it read to the owner at most this often (sampler_thread) ...
 const SAMPLE_BATCH: std::time::Duration = std::time::Duration::from_millis(16);
 /// ... or once this many samples wait
@@ -10640,6 +10688,10 @@ static SAMPLED: relax_session::sync::Mutex<Vec<(u64, u32, os::sample::Handle)>> 
 static SAMPLER: std::sync::Once = std::sync::Once::new();
 
 fn sampler_enter(exec_base: u64, exec_size: u64) {
+    progress_start();
+    if profile_path().is_none() {
+        return;
+    }
     EXEC_LO.store(exec_base, Ordering::Relaxed);
     EXEC_HI.store(exec_base + exec_size, Ordering::Relaxed);
     let me = os::thread::current();
@@ -10662,6 +10714,9 @@ fn sampler_enter(exec_base: u64, exec_size: u64) {
 }
 
 fn sampler_leave() {
+    if profile_path().is_none() {
+        return;
+    }
     let me = os::thread::current();
     let mut g = SAMPLED.lock().unwrap();
     if let Some(k) = g.iter().position(|x| x.0 == me) {
@@ -10957,6 +11012,25 @@ fn profile_write() {
     }
 }
 
+/// MAKEPAD_RUN_O3_PROGRESS: a thread writes the progress file (o3_progress_write) from the first
+/// JIT call on.
+fn progress_start() {
+    static PROGRESS: std::sync::Once = std::sync::Once::new();
+    PROGRESS.call_once(|| {
+        if std::env::var_os("MAKEPAD_RUN_O3_PROGRESS").is_none_or(|v| v.is_empty()) {
+            return;
+        }
+        let _k = crate::zone_alloc::kept();
+        let _ = std::thread::Builder::new().name("run-progress".to_string()).spawn(|| {
+            let mut last = std::time::Instant::now();
+            while !TIER_STOP.load(Ordering::SeqCst) {
+                o3_progress_write(&mut last);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    });
+}
+
 /// MAKEPAD_RUN_O3_PROGRESS=<path>: the O3 state as one line `pending installs` rewritten every 100 ms,
 /// for a benchmark that times only once the optimised code has settled: `pending` = builds queued or
 /// running or counting (PGO), plus one while the startup phase holds the workers; `installs` = O3 installs so far.
@@ -10970,7 +11044,7 @@ fn o3_progress_write(last: &mut std::time::Instant) {
     *last = std::time::Instant::now();
     // (PGO: slots in their counting window are O3 builds to come)
     let pending = TIER_QUEUE.lock().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len()) + usize::from(startup_holds_tier1())
-        + COUNTING.lock().map_or(0, |c| c.len());
+        + COUNTING.lock().map_or(0, |c| c.iter().filter(|e| !e.parked).count());
     let line = format!("{} {}\n", pending, TIER1_INSTALLS.load(Ordering::Relaxed));
     let tmp = format!("{}.tmp", path);
     if std::fs::write(&tmp, line).is_ok() {
@@ -10985,12 +11059,9 @@ fn sampler_thread() {
     os::thread::interactive();
     let mut wait = os::sample::Wait::new();
     let mut pcs: Vec<os::sample::Sample> = Vec::with_capacity(4096);
-    let mut last_half = wall_ns();
-    let mut hot: Vec<u32> = Vec::new();
     let mut selfs: Vec<os::sample::Sample> = Vec::with_capacity(1024);
     let mut last = std::time::Instant::now();
     let mut last_write = std::time::Instant::now();
-    let mut last_progress = std::time::Instant::now();
     let mut last_batch = std::time::Instant::now();
     let periods = sample_periods();
     let mut period_index = 0;
@@ -11010,7 +11081,6 @@ fn sampler_thread() {
         let sleep_ms = if idle_wakes >= IDLE_WAKES { sleep_ms.max(IDLE_MS) } else { sleep_ms };
         wait.sleep(sleep_ms);
         if TIER_STOP.load(Ordering::SeqCst) { break; }
-        o3_progress_write(&mut last_progress);
         // Direct-PC samplers use the time since the previous wake. Linux's ring
         // supplies each observation's own period instead. A sleep the OS stretched
         // (timer coalescing of low-QoS / nice'd processes: 2 ms became ~18 ms on the bench
@@ -11033,19 +11103,6 @@ fn sampler_thread() {
             let t = T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0;
             let threads = SAMPLED.lock().map(|g| g.len()).unwrap_or(0);
             eprintln!("sampler: t={:.1} ms, {} threads, {} pcs", t, threads, pcs.len());
-        }
-        // Decay even with no samples or a busy unit lock. Otherwise yesterday's hot code
-        // retains its priority during an idle spell. Catch up after delayed sampler wakes.
-        let now = wall_ns();
-        let halves = now.saturating_sub(last_half) / HEAT_HALF_NS;
-        if halves > 0 {
-            last_half += halves * HEAT_HALF_NS;
-            if let Some(counts) = HEAT.lock().unwrap().as_mut() {
-                counts.retain(|_, c| {
-                    *c = c.checked_shr(halves.min(32) as u32).unwrap_or(0);
-                    *c > 0
-                });
-            }
         }
         // the samples go to the owner in batches, one unit call per SAMPLE_BATCH (not one per
         // 2 ms wake: an animating Stage at idle woke the owner 500 times a second for them)
@@ -11099,51 +11156,6 @@ fn sampler_thread() {
             });
         }
         selfs.clear();
-        if pcs.is_empty() || TIER_STOP.load(Ordering::SeqCst) {
-            pcs.clear();
-            continue;
-        }
-        owner::call_within(owner::Class::Background, 0, || {
-            let up = unsafe { UNIT };
-            if up.is_null() {
-                return;
-            }
-            let u = unsafe { &*up };
-            let mut heat = crate::zone_alloc::kept_with(|| HEAT.lock().unwrap());
-            let counts = heat.get_or_insert_with(std::collections::HashMap::new);
-            for &os::sample::Sample { pc, weight } in &pcs {
-                let Some(id) = u.find_fn(pc) else { continue };
-                // SPEC-V: a twin's samples heat its base slot too: the body is hot whichever lowering
-                // of it runs, and verified callers lowered again (hot_twin_callers) call the base
-                let base = match u.fns[id as usize].key { FnKey::Plain(b) => Some(b), _ => None };
-                for id in std::iter::once(id).chain(base) {
-                unsafe { base_sampled(up, id) };
-                let (before, count) = crate::zone_alloc::kept_with(|| {
-                    let c = counts.entry(id).or_insert(0);
-                    let before = *c;
-                    *c += weight;
-                    (before, *c)
-                });
-                // a slot counted again after it went cold (tier_revalidate) is queued at its first
-                // sample: it runs again, so its earlier hotness counts (steady lukewarm UI code never
-                // crosses SAMPLES_HOT twice)
-                let rearmed = before == 0 && unsafe { (*tier_rec(&u.slots, id).add(5)).load(Ordering::Relaxed) & REARMED != 0 };
-                if before < SAMPLES_HOT && count >= SAMPLES_HOT || rearmed {
-                    if sample_trace() {
-                        eprintln!("sampler: {} hot", u.fns[id as usize].name);
-                    }
-                    // (the sampler's own vector grows here, on the owner: kept, it outlives the compiler arena)
-                    crate::zone_alloc::kept_with(|| hot.push(id));
-                }
-                }
-            }
-            // HEAT before TIER_QUEUE nowhere (tier_pop holds the queue, then reads HEAT)
-            drop(heat);
-            for &id in &hot {
-                unsafe { queue_hot(u, id) };
-            }
-        });
-        hot.clear();
         pcs.clear();
     }
 }
@@ -11283,8 +11295,9 @@ unsafe fn queue_marked(u: &Unit, id: u32) {
     }
 }
 
-/// Queues slot `id` for O3 as the count stub's rt_hot does (if it is still counting).
-unsafe fn queue_hot(u: &Unit, id: u32) {
+/// Queues slot `id` for O3 as the count stub's rt_hot does (if it is still counting): its loops
+/// ran hot (rt_loop_hot), `rate` = back edges per second / LOOP_PER_CALL.
+unsafe fn queue_loop(u: &Unit, id: u32, rate: u64) {
     let rec = tier_rec(&u.slots, id);
     let code = (*rec.add(1)).load(Ordering::Relaxed);
     let stub = (*rec.add(2)).load(Ordering::Relaxed);
@@ -11293,17 +11306,98 @@ unsafe fn queue_hot(u: &Unit, id: u32) {
         let _ = s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
         TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
         churn_queued(id);
-        tier_push(id, Q_SAMPLES, call_rate(rec, u.tier1.as_ref().map_or(0, |t| t.calls), wall_ns()));
+        tier_push(id, Q_LOOP, rate);
         TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime, &u.prog.session.options));
     }
 }
 
+/// The loop counter of slot `id` (its tier record's back-edge word), as the symbol its code names it by.
+pub(crate) fn loop_counter_sym(u: &Unit, id: u32) -> relax_backend::rir::Sym {
+    u.syms.intern(crate::syms::SymKind::TierRec(id), u.slots.tier(id) + TIER_LOOP)
+}
+
+/// The loop counter and rt_loop_hot symbols for the baseline / O1 / O2 code of slot `id` (unit
+/// lock held): every slot whose calls the count stub counts, when O3 is on. None: its code counts
+/// no loops (O3 off, a shim / glue / foreign fn, a naked fn).
+unsafe fn loop_syms(u: &Unit, id: u32) -> Option<(relax_backend::rir::Sym, relax_backend::rir::Sym)> {
+    let counted = match &u.fns[id as usize].key {
+        FnKey::Inst(d, _) => u.prog.def(*d).kind != DefKind::ForeignFn,
+        FnKey::Closure(..) | FnKey::Plain(_) => true,
+        FnKey::Sandbox(base) => *base != u32::MAX,
+        FnKey::Shim(_) | FnKey::Glue(..) => false,
+    };
+    if u.tier1.is_none() || !counted || !loops_on() {
+        return None;
+    }
+    let helper = u.syms.intern(crate::syms::SymKind::Rt("loop_hot"), rt_loop_hot as *const () as usize as u64);
+    Some((loop_counter_sym(u, id), helper))
+}
+
+/// MAKEPAD_RUN_LOOP_COUNTERS=0: no back-edge counters (loops in rarely entered functions stay at
+/// their first tier; A/B)
+fn loops_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_LOOP_COUNTERS").map_or(true, |v| v != "0"))
+}
+
+/// The code made from `cg` counts its loops (`lc`: loop_syms); `cg` is copied only if it has one.
+fn with_loop_counters<'a>(cg: std::borrow::Cow<'a, relax_backend::rir::Func>, lc: Option<(relax_backend::rir::Sym, relax_backend::rir::Sym)>) -> std::borrow::Cow<'a, relax_backend::rir::Func> {
+    let Some((counter, helper)) = lc else { return cg };
+    if cg.naked || !cg.blocks.iter().enumerate().any(|(b, blk)| blk.term.succs().any(|t| t as usize <= b)) {
+        return cg;
+    }
+    let mut cg = cg;
+    relax_backend::profile::loop_counters(cg.to_mut(), counter, helper);
+    cg
+}
+
+rt_fn! {
+/// A slot's loop counter ran out (its baseline / O1 / O2 code, profile::loop_counters; no unit
+/// lock): the count starts again, and if the last LOOP_PER_CALL x O3-calls back edges came within
+/// CALL_WINDOW_NS the slot is queued for O3 (its counted build first), as rt_hot does for calls.
+/// Without OSR the frame running the loop finishes in the code it is in; the next entry runs O3.
+fn rt_loop_hot(counter: u64) {
+    let _z = crate::zone_alloc::compiler();
+    let _keep = os::proc::KeepLastError::new();
+    let up = TIER_UNIT.load(Ordering::Acquire);
+    if up.is_null() {
+        return;
+    }
+    unsafe {
+        let u = &*up;
+        let Some(budget) = u.tier1.as_ref().map(|t| t.calls.saturating_mul(LOOP_PER_CALL)) else { return };
+        let Some((id, off)) = u.slots.find(3, counter) else { return };
+        if off != TIER_LOOP {
+            return;
+        }
+        let rec = tier_rec(&u.slots, id);
+        let now = wall_ns();
+        let start = (*rec.add(7)).swap(now, Ordering::Relaxed);
+        (*rec.add(6)).store(budget, Ordering::Relaxed);
+        let took = now.saturating_sub(start);
+        // the first look starts the window; a slow loop starts it again
+        if start == 0 || took > CALL_WINDOW_NS || (*rec.add(3)).load(Ordering::Relaxed) != T_COUNTING {
+            return;
+        }
+        let rate = ((budget as u128 * 1_000_000_000 / took.max(1) as u128) / LOOP_PER_CALL as u128).min(u64::MAX as u128) as u64;
+        queue_loop(u, id, rate);
+    }
+}
+}
+
 /// Per-slot record at `SlotTable::tier(slot)`: [counter, O1 code, count stub, state,
-/// counting window start (wall_ns), O1 code bytes] (read by JIT code and rt_hot without
-/// the lock).
-const TIER_REC: usize = 48;
-/// O1 code at most this big tiers up on its call rate alone (no sampler word: samples
-/// rarely land in a 12-byte `as_ptr`, and a O1 kernel calling it then stayed 6x rustc --
+/// counting window start (wall_ns), O1 code bytes, loop counter, loop window start (wall_ns)]
+/// (read by JIT code, rt_hot and rt_loop_hot without the lock). The loop counter is the word the
+/// slot's own baseline / O1 / O2 code decrements per loop iteration (profile::loop_counters).
+const TIER_REC: usize = 64;
+/// the loop counter's offset in the tier record
+const TIER_LOOP: u64 = 48;
+/// A slot's loops are hot when this many back edges (times the call threshold) ran within
+/// CALL_WINDOW_NS: HotSpot's back-edge / invocation thresholds (C2: Tier4BackEdgeThreshold 40000,
+/// Tier4InvocationThreshold 5000).
+const LOOP_PER_CALL: u64 = 8;
+/// O1 code at most this big tiers up on its call rate alone, with no counted evidence of work
+/// (a 12-byte `as_ptr` shows little, and a O1 kernel calling it then stayed 6x rustc --
 /// bench_rt rc_refcell); its build is cheap either way
 const SMALL_CODE: u64 = 256;
 /// A count stub reaching zero queues its slot only if the TIER1_CALLS calls came within this
@@ -11311,11 +11405,11 @@ const SMALL_CODE: u64 = 256;
 /// UI everything called once per frame reached 2000 within a minute and O3 never went
 /// quiet (Stage playing P(DOOM): 3 O3 threads busy at 90 s).
 const CALL_WINDOW_NS: u64 = 1_000_000_000;
-/// TIER1_CALLS calls within this: hot without the sampler's word
+/// TIER1_CALLS calls within this: hot without the counted window's evidence of work (lukewarm)
 const CALL_FAST_NS: u64 = 10_000_000;
 const T_COUNTING: u64 = 1;
 const T_QUEUED: u64 = 2;
-// The sampler cannot queue a recorded instance before its first call.
+// A loop counter cannot queue a recorded instance before its first call.
 const T_REPLAY: u64 = 3;
 
 thread_local! {
@@ -11466,16 +11560,12 @@ impl Drop for TierActive {
 /// queued O3 builds: (slot, why: Q_*, queued at wall_ns, calls/sec at enqueue)
 static TIER_QUEUE: relax_session::sync::Mutex<Vec<(u32, u8, u64, u64)>> = relax_session::sync::Mutex::new(Vec::new());
 const Q_CALLS: u8 = 0;
-const Q_SAMPLES: u8 = 1;
+const Q_LOOP: u8 = 1;
 const Q_RETIER: u8 = 2;
 const Q_MARKED: u8 = 3;
 /// PGO: a counted build's window is over (pgo_poll)
 const Q_PROFILED: u8 = 4;
-const Q_WHY: [&str; 5] = ["calls", "samples", "retier", "marked", "profiled"];
-/// the sampler's recent samples per slot (halved every HEAT_HALF_NS): which queued build
-/// goes first
-static HEAT: relax_session::sync::Mutex<Option<std::collections::HashMap<u32, u32>>> = relax_session::sync::Mutex::new(None);
-const HEAT_HALF_NS: u64 = 1_000_000_000;
+const Q_WHY: [&str; 5] = ["calls", "loop", "retier", "marked", "profiled"];
 
 fn tier1_trace() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -11574,50 +11664,48 @@ pub fn sweep_verdicts() {
     let _ = verified;
 }
 
-/// SPEC-V: the slots among `cands` (None: every slot the sampler saw lately) that are verified, warm
-/// (in HEAT) and still run an unverified lowering whose calls go to `twin` (None: to any twin that is
-/// hot or has O3 code). Built again (retier), they are lowered as verified code, so the hot chain
-/// under them reaches the slots themselves: noalias, inlining, cache entries. Unit read; HEAT is
-/// taken here and released before the caller queues them (tier_pop reads HEAT under the queue).
+/// SPEC-V: the slots among `cands` (None: every slot that turned hot) that are verified, warm (they
+/// turned hot: queued, counted or built at O3) and still run an unverified lowering whose calls go
+/// to `twin` (None: to any twin that turned hot or has O3 code). Built again (retier), they are
+/// lowered as verified code, so the hot chain under them reaches the slots themselves: noalias,
+/// inlining, cache entries. Unit read.
 fn hot_twin_callers(u: &Unit, cands: Option<&[u32]>, twin: Option<u32>) -> Vec<u32> {
-    let heat = HEAT.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(h) = heat.as_ref() else { return Vec::new() };
+    let warm = |c: u32| unsafe { (*tier_rec(&u.slots, c).add(3)).load(Ordering::Relaxed) == T_QUEUED };
     let hot = |t: u32| matches!(u.fns[t as usize].key, FnKey::Plain(_)) && match twin {
         Some(w) => t == w,
-        None => u.fns[t as usize].o3.load(Ordering::Relaxed) || h.get(&t).is_some_and(|n| *n >= SAMPLES_HOT),
+        None => u.fns[t as usize].o3.load(Ordering::Relaxed) || warm(t),
     };
     let calls_hot = |c: u32| {
         let f = &u.fns[c as usize];
-        h.contains_key(&c) && f.compiled && !f.unverified.load(Ordering::Relaxed) && !matches!(f.key, FnKey::Plain(_) | FnKey::Sandbox(_))
+        warm(c) && f.compiled && !f.unverified.load(Ordering::Relaxed) && !matches!(f.key, FnKey::Plain(_) | FnKey::Sandbox(_))
             && f.rir.as_ref().is_some_and(|r| r.plain_calls && r.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(t), _, _) if hot(*t)))))
     };
     match cands {
         Some(c) => c.iter().copied().filter(|&c| calls_hot(c)).collect(),
-        None => h.keys().copied().filter(|&c| (c as usize) < u.fns.len() && calls_hot(c)).collect(),
+        None => (0..u.fns.len() as u32).filter(|&c| calls_hot(c)).collect(),
     }
 }
 
 /// Tier record word 5 (O1 code bytes): the slot was counted again once (tier_revalidate) and
 /// queued since: its next build goes ahead whatever its age.
 const REARMED: u64 = 1 << 63;
-/// A calls / samples entry older than this whose slot is not hot now (fewer than SAMPLES_HOT recent
-/// samples: under ~0.5% of a thread) is counted again (tier_revalidate).
+/// A calls / loop entry older than this is counted again (tier_revalidate).
 const REVALIDATE_NS: u64 = 1_000_000_000;
 /// O3 queue entries counted again (they had gone cold before their build)
 pub static TIER_REVALIDATED: AtomicU64 = AtomicU64::new(0);
 
-/// The O3 queue's backlog of code that has gone cold (queue lock held): an entry queued by its
-/// calls or samples REVALIDATE_NS ago or earlier, whose slot is not hot now, goes back to counting
-/// (its count stub in the slot again) instead of being built. Hot code is queued again within its
-/// count window and built then (REARMED: whatever its age); startup code that was busy once (a
-/// cold Stage queued 2k slots before its first present) and lukewarm UI code never builds. The
-/// level's policy (o3_revalidate).
+/// The O3 queue's backlog of code that may have gone cold (queue lock held): an entry queued by its
+/// calls or loops REVALIDATE_NS ago or earlier goes back to counting (its count stub in the slot
+/// again; its loop counter runs on) instead of being built: the count is the evidence. Hot code is
+/// queued again within its count window and built then (REARMED: whatever its age); startup code
+/// that was busy once (a cold Stage queued 2k slots before its first present) and lukewarm UI code
+/// never builds. The level's policy (o3_revalidate).
 fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
     if q.is_empty() || !ahead_policy().o3_revalidate {
         return;
     }
     let now = wall_ns();
-    if !q.iter().any(|e| matches!(e.1, Q_CALLS | Q_SAMPLES) && now.saturating_sub(e.2) >= REVALIDATE_NS) {
+    if !q.iter().any(|e| matches!(e.1, Q_CALLS | Q_LOOP) && now.saturating_sub(e.2) >= REVALIDATE_NS) {
         return;
     }
     let up = TIER_UNIT.load(Ordering::Acquire);
@@ -11630,13 +11718,9 @@ fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
         return;
     }
     let Some(calls) = u.tier1.as_ref().map(|t| t.calls) else { return };
-    let heat = HEAT.lock().unwrap();
-    // no samples at all (no sampler on this platform): no evidence either way, the count decides
-    let Some(h) = heat.as_ref() else { return };
     let mut n = 0u64;
     q.retain(|&(id, why, at, _)| {
-        // still hot: as many recent samples (decayed) as make a slot hot
-        if !matches!(why, Q_CALLS | Q_SAMPLES) || now.saturating_sub(at) < REVALIDATE_NS || h.get(&id).copied().unwrap_or(0) >= SAMPLES_HOT {
+        if !matches!(why, Q_CALLS | Q_LOOP) || now.saturating_sub(at) < REVALIDATE_NS {
             return true;
         }
         unsafe {
@@ -11690,14 +11774,11 @@ fn tier_push(id: u32, why: u8, rate: u64) {
     TIER_WAKE.notify_all();
 }
 
-/// Current sampled CPU first (including hits inside loops), call rate next, then oldest.
-/// Scan once under the heat lock: O(queue), no stale heap keys when samples change/halve,
-/// and only ~1,000 cheap lookups for a build that takes milliseconds.
+/// The highest rate first (calls per second; a loop's back edges per second / LOOP_PER_CALL; a
+/// counted window's entries per second), then the oldest. One scan: O(queue), ~1,000 cheap
+/// compares for a build that takes milliseconds.
 fn tier_pop(q: &mut Vec<(u32, u8, u64, u64)>) -> Option<(u32, u8, u64, u64)> {
-    let heat = HEAT.lock().unwrap();
-    let best = q.iter().enumerate().max_by_key(|(k, e)| {
-        (heat.as_ref().and_then(|h| h.get(&e.0)).copied().unwrap_or(0), e.3, std::cmp::Reverse(e.2), std::cmp::Reverse(*k))
-    }).map(|(k, _)| k)?;
+    let best = q.iter().enumerate().max_by_key(|(k, e)| (e.3, std::cmp::Reverse(e.2), std::cmp::Reverse(*k))).map(|(k, _)| k)?;
     Some(q.remove(best))
 }
 static TIER_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
@@ -11915,7 +11996,7 @@ impl Unit {
             FnKey::Inst(d, _) => self.prog.def(*d).kind != DefKind::ForeignFn,
             FnKey::Closure(..) => true,
             FnKey::Sandbox(base) => *base != u32::MAX,
-            // SPEC-V: twins tier up too (Unit::o3_allowed); the sampler queues only counted slots
+            // SPEC-V: twins tier up too (Unit::o3_allowed); loop counters queue only counted slots
             FnKey::Plain(_) => true,
             FnKey::Shim(_) | FnKey::Glue(..) => false,
         };
@@ -12016,7 +12097,7 @@ impl Unit {
             let slot = SlotWord::of(&self.slots, id);
             slot.store(at, Ordering::SeqCst);
         }
-        // tier-up state is process-wide (TIER_UNIT, the hot queue, the sampler: slot ids with
+        // tier-up state is process-wide (TIER_UNIT, the hot queue, rt_loop_hot: slot ids with
         // no unit attached): a second tiering unit would get its hot slots built against the
         // first one's table (code installed into the wrong slots). One per process, loudly.
         let me = self as *mut Unit;
@@ -12048,8 +12129,8 @@ impl Unit {
 
 // ---- counted tier (PGO; modelled on the CLR's tiered PGO, TieredPGO_InstrumentOnlyHotCode)
 //
-// Baseline and O1 code count nothing. A slot that turns hot (its count stub's call rate or the
-// sampler) gets ONE counted build first: its O1 code from the O3 input RIR plus a counter per
+// Baseline and O1 code count only calls (count stubs) and loop iterations (loop counters). A slot that turns hot (its count stub's call rate or the
+// loop counter) gets ONE counted build first: its O1 code from the O3 input RIR plus a counter per
 // block (profile::instrument), built and installed by the O3 worker. Once that code has run long
 // enough (pgo_poll) the slot is queued for O3, whose input blocks take the counts 1:1; the passes
 // carry them (Block::count) to the profile-driven block layout and the register allocator's
@@ -12099,8 +12180,31 @@ const PGO_MS: u64 = 250;
 const PGO_IDLE_MS: u64 = 2000;
 /// how often the first O3 worker looks at the counting slots while there are any
 const PGO_POLL: std::time::Duration = std::time::Duration::from_millis(5);
-/// slots running counted code: (slot, counters, installed at wall_ns)
-static COUNTING: relax_session::sync::Mutex<Vec<(u32, &'static [AtomicU64], u64)>> = relax_session::sync::Mutex::new(Vec::new());
+/// A slot running counted code.
+struct Counting {
+    id: u32,
+    counters: &'static [AtomicU64],
+    /// instructions per block (the work a block's count stands for)
+    weights: &'static [u32],
+    /// installed at wall_ns
+    at: u64,
+    /// its calls came at a rate that says nothing about its CPU (rt_hot: not within CALL_FAST_NS,
+    /// bigger than SMALL_CODE): O3 only once the counts show it working (PGO_MIN_WORK)
+    lukewarm: bool,
+    /// (work, wall_ns) at the start of the current work window
+    mark: (u64, u64),
+    /// a lukewarm slot whose last window showed too little work: it stays in its counted code
+    /// (not pending for O3_PROGRESS, looked at on the usual poll)
+    parked: bool,
+}
+/// slots running counted code
+static COUNTING: relax_session::sync::Mutex<Vec<Counting>> = relax_session::sync::Mutex::new(Vec::new());
+/// A lukewarm slot's counted code goes to O3 once a window of at least PGO_MS shows this many
+/// RIR instructions per second (~0.2% of a core); a window of PGO_WORK_NS with less parks it.
+/// The counted tier's measurement replaces the sampler's CPU samples, which made the same call
+/// ("many calls, little CPU: a O3 build would cost more than it saves").
+const PGO_MIN_WORK: u64 = 4_000_000;
+const PGO_WORK_NS: u64 = 1_000_000_000;
 /// counted builds installed, their build CPU ns, dropped (not built or not installed)
 pub static PGO_STATS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
@@ -12108,39 +12212,73 @@ pub static PGO_STATS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), At
 fn pgo_poll() {
     let now = wall_ns();
     let mut ready: Vec<(u32, u64)> = Vec::new();
+    let mut parked_now: Vec<u32> = Vec::new();
     {
         let mut g = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_empty() {
             return;
         }
-        g.retain(|&(id, ctr, at)| {
+        g.retain_mut(|e| {
+            let ctr = e.counters;
             let entries = ctr.first().map_or(0, |c| c.load(Ordering::Relaxed));
+            let el = now.saturating_sub(e.at);
+            let rate = (entries as u128 * 1_000_000_000 / el.max(1) as u128).min(u64::MAX as u128) as u64;
+            if e.lukewarm {
+                let work: u64 = ctr.iter().zip(e.weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
+                let win = now.saturating_sub(e.mark.1);
+                if win < PGO_MS * 1_000_000 {
+                    return true;
+                }
+                let per_s = ((work - e.mark.0.min(work)) as u128 * 1_000_000_000 / win as u128) as u64;
+                if per_s >= PGO_MIN_WORK {
+                    ready.push((e.id, rate));
+                    return false;
+                }
+                if win >= PGO_WORK_NS {
+                    e.mark = (work, now);
+                    if !e.parked {
+                        e.parked = true;
+                        parked_now.push(e.id);
+                    }
+                }
+                return true;
+            }
             let mut sum = 0u64;
             for c in ctr {
                 sum = sum.saturating_add(c.load(Ordering::Relaxed));
                 if sum >= PGO_BLOCKS { break; }
             }
-            let el = now.saturating_sub(at);
             let done = entries >= PGO_ENTRIES || sum >= PGO_BLOCKS || (sum > 0 && el >= PGO_MS * 1_000_000) || el >= PGO_IDLE_MS * 1_000_000;
             if done {
-                ready.push((id, (entries as u128 * 1_000_000_000 / el.max(1) as u128).min(u64::MAX as u128) as u64));
+                ready.push((e.id, rate));
             }
             !done
         });
+    }
+    if tier1_trace() {
+        for id in &parked_now {
+            eprintln!("O3c @{:.3} #{} parked in counted code (under {} insts/s)", now as f64 / 1e9, id, PGO_MIN_WORK);
+        }
     }
     for (id, rate) in ready {
         tier_push(id, Q_PROFILED, rate);
     }
 }
 
+/// Some slot's counting window is open (parked slots are not waited for).
 fn pgo_counting() -> bool {
-    !COUNTING.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    COUNTING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|e| !e.parked)
+}
+
+/// The counting entries of slots whose counted code is gone (patched, rebuilt): dropped (unit read).
+fn pgo_forget(u: &Unit) {
+    COUNTING.lock().unwrap_or_else(|e| e.into_inner()).retain(|e| !e.parked || u.frequency_profiles.contains_key(&e.id));
 }
 
 /// Slot `id` turned hot: builds and installs its counted code (O3 worker). False: no counted build
 /// for it (not a plain instance or closure, no RIR, already counted, PGO off, or it failed) -- its
 /// O3 build goes ahead now.
-unsafe fn counted_build(up: *mut Unit, id: u32) -> bool {
+unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
     let session = (*std::ptr::addr_of!((*up).prog.session)).clone();
     let options = &session.options;
     if !pgo_on(options) {
@@ -12245,7 +12383,9 @@ unsafe fn counted_build(up: *mut Unit, id: u32) -> bool {
                 });
                 crate::zone_alloc::kept_with(|| {
                     u.frequency_profiles.insert(id, profile);
-                    COUNTING.lock().unwrap_or_else(|e| e.into_inner()).push((id, counters, wall_ns()));
+                    let weights: &'static [u32] = Box::leak(rir.blocks.iter().map(|b| b.insts.len() as u32 + 1).collect::<Vec<_>>().into_boxed_slice());
+                    let at = wall_ns();
+                    COUNTING.lock().unwrap_or_else(|e| e.into_inner()).push(Counting { id, counters, weights, at, lukewarm, mark: (0, at), parked: false });
                 });
                 true
             }
@@ -12313,20 +12453,18 @@ fn rt_hot(slot: u64) -> u64 {
             return s.load(Ordering::SeqCst);
         }
         let now = wall_ns();
-        // the sampler has not seen it lately: many calls, little CPU (a cheap function a
-        // frame calls a few dozen times) -- a O3 build would cost more than it saves
-        // (no samples at all: no sampler on this platform -- the count alone decides)
-        let unseen = || HEAT.lock().unwrap().as_ref().map_or(false, |h| h.get(&(slot as u32)).copied().unwrap_or(0) == 0);
         let took = now.saturating_sub((*rec.add(4)).load(Ordering::Relaxed));
-        // ... unless the calls came very fast (a tight loop: hot before the sampler's first
-        // ticks see it -- bench_rt rc_refcell's cold run stayed at O1, 6x rustc)
-        let small = (*rec.add(5)).load(Ordering::Relaxed) & !REARMED <= SMALL_CODE;
-        if (*rec.add(3)).load(Ordering::Relaxed) == T_COUNTING && (took > CALL_WINDOW_NS || (took > CALL_FAST_NS && !small && unseen())) {
-            // too slow a rate, or no CPU to show: count again from now (the stub stays)
+        // (calls that came at a rate below CALL_FAST_NS say nothing about CPU: the counted build's
+        // window decides whether O3 pays -- tier1_thread's lukewarm, pgo_poll)
+        if (*rec.add(3)).load(Ordering::Relaxed) == T_COUNTING && took > CALL_WINDOW_NS {
+            // too slow a rate: count again from now (the stub stays). Baseline code that keeps
+            // running (its count reached, slowly) gets its O2 build: the cache's entry then
+            // links optimised code for it
             if let Some(t) = &u.tier1 {
                 (*rec).store(t.calls, Ordering::Relaxed);
             }
             (*rec.add(4)).store(now, Ordering::Relaxed);
+            note_slow_base(u, slot as u32);
             return code;
         }
         // a patch may have replaced the stub in the meantime: then that code runs
@@ -12372,7 +12510,7 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
     ensure_altstack();
     lower_worker_priority(runtime);
     loop {
-        let (id, why, queued_at, _) = {
+        let (id, why, queued_at, rate) = {
             let mut q = TIER_QUEUE.lock().unwrap();
             loop {
                 if TIER_STOP.load(Ordering::SeqCst) { return; }
@@ -12394,6 +12532,9 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
                     sweep_verdicts();
                     // PGO: counted slots whose window is over go to the queue
                     pgo_poll();
+                    // baseline code that ran slowly but long: its O2 builds; parked counting
+                    // entries whose code is gone: dropped
+                    drain_slow_base();
                     q = TIER_QUEUE.lock().unwrap();
                 }
             }
@@ -12408,10 +12549,18 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
             continue;
         }
         let _job = compile_job();
-        if why == Q_CALLS || why == Q_SAMPLES {
+        if why == Q_CALLS || why == Q_LOOP {
             owner::call(owner::Class::Background, || unsafe { o2_hot(up, id) });
+            // calls that came slower than CALL_FAST_NS into code bigger than SMALL_CODE: lukewarm
+            // until its counts show the work
+            let lukewarm = why == Q_CALLS && unsafe {
+                let u = &*up;
+                let calls = u.tier1.as_ref().map_or(0, |t| t.calls);
+                (rate as u128) * (CALL_FAST_NS as u128) < (calls as u128) * 1_000_000_000
+                    && (*tier_rec(&u.slots, id).add(5)).load(Ordering::Relaxed) & !REARMED > SMALL_CODE
+            };
             // PGO: its counted build first; the O3 build follows once that code has run
-            if unsafe { counted_build(up, id) } {
+            if unsafe { counted_build(up, id, lukewarm) } {
                 continue;
             }
         }
@@ -12745,7 +12894,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     }
     // SPEC-V: unverified code gets O3 code too, built as it is (Unit::o3_allowed)
     if !owner::call(owner::Class::Background, || (&*up).o3_allowed(id)) {
-        await_verdict(id, Await::Tier(Q_SAMPLES, 0));
+        await_verdict(id, Await::Tier(Q_LOOP, 0));
         return false;
     }
     trace_tier1_phase(id, "start");
@@ -15238,7 +15387,8 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
     // fronts, under the lock; each front's slots go in flight at once (no other thread starts
     // them meanwhile). A later front of this batch that inlines one of them does not wait for it
     // (wait_inflight skips BATCH_FLIGHT): its back end starts only after the last front.
-    let mut work: Vec<(u32, Front, String)> = Vec::new();
+    type Lc = Option<(relax_backend::rir::Sym, relax_backend::rir::Sym)>;
+    let mut work: Vec<(u32, Front, String, Lc)> = Vec::new();
     let mut flight: Vec<u32> = Vec::new();
     struct ClearBatch;
     impl Drop for ClearBatch { fn drop(&mut self) { let _ = BATCH_FLIGHT.try_with(|b| b.borrow_mut().clear()); } }
@@ -15258,7 +15408,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                         BATCH_FLIGHT.with(|b| b.borrow_mut().push(x));
                     }
                 }
-                work.push((id, f, u.fns[id as usize].name.to_string()));
+                work.push((id, f, u.fns[id as usize].name.to_string(), loop_syms(u, id)));
             }
             Err(e) => out.push((id, Err(e))),
         }
@@ -15273,7 +15423,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
     type Built = (u32, Result<(Option<(std::sync::Arc<relax_backend::rir::Func>, Vec<(u32, usize)>, u64)>, Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>), String>, Vec<Deferred>);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results: relax_session::sync::Mutex<Vec<Built>> = relax_session::sync::Mutex::new(Vec::new());
-    let work_cells: Vec<relax_session::sync::Mutex<Option<(u32, Front, String)>>> = work.into_iter().map(|w| relax_session::sync::Mutex::new(Some(w))).collect();
+    let work_cells: Vec<relax_session::sync::Mutex<Option<(u32, Front, String, Lc)>>> = work.into_iter().map(|w| relax_session::sync::Mutex::new(Some(w))).collect();
     let finished = std::sync::atomic::AtomicUsize::new(0);
     let helpers = threads.max(1).min(work_cells.len().max(1));
     crate::pool::scope(|sc| {
@@ -15293,7 +15443,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                     if k >= work_cells.len() {
                         break;
                     }
-                    let Some((id, front, name)) = work_cells[k].lock().unwrap().take() else { continue };
+                    let Some((id, front, name, lc)) = work_cells[k].lock().unwrap().take() else { continue };
                     let _census_context = relax_codegen::exec_census::Context::new(census_unit, false);
                     let _cost = relax_codegen::fncost::Record::new(id, 0, "ahead");
                     relax_codegen::fncost::name(id, &name);
@@ -15311,6 +15461,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                         };
                         let cg = tier0_codegen_rir(options, &rir, fold, rotate);
                         crate::wasm_export::capture(id, &cg);
+                        let cg = with_loop_counters(cg, lc);
                         let e = &env;
                         let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: e.opt_regs && !rir.baseline, syms: e.syms, sym_class: e.sym_class, near: e.near };
                         let c = relax_codegen::native::compile(options, &cg, &env)?;
@@ -15429,6 +15580,8 @@ pub(crate) struct BackWork {
     env: x64::Env,
     fold: bool,
     rotate: bool,
+    /// the code counts its loops (loop_syms)
+    lc: Option<(relax_backend::rir::Sym, relax_backend::rir::Sym)>,
     session: std::sync::Arc<crate::Session>,
     name: String,
     /// wall ns when the front ended (SPLIT_NS)
@@ -15532,13 +15685,14 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
             r.cpu[0] += c1 - c0;
         });
     }
-    Begin::Back(BackWork { id, spec, front, slots, epoch, env, fold, rotate, session, name, w1 })
+    let lc = loop_syms(u, id);
+    Begin::Back(BackWork { id, spec, front, slots, epoch, env, fold, rotate, lc, session, name, w1 })
 }
 
 impl BackWork {
     /// Optimises and generates the code (any thread, no unit state).
     pub(crate) fn run(self) -> BackDone {
-        let BackWork { id, spec, front, slots, epoch, env, fold, rotate, session, name, w1 } = self;
+        let BackWork { id, spec, front, slots, epoch, env, fold, rotate, lc, session, name, w1 } = self;
         let options = &session.options;
         let runtime = &session.runtime;
         let done_out: relax_session::sync::Mutex<Vec<Deferred>> = relax_session::sync::Mutex::new(Vec::new());
@@ -15563,6 +15717,7 @@ impl BackWork {
             let t1 = cpu_ns();
             let cg = tier0_codegen_rir(options, &rir, fold, rotate);
             crate::wasm_export::capture(id, &cg);
+            let cg = with_loop_counters(cg, lc);
             let mut env = env;
             env.opt_regs &= !rir.baseline;
             compile_watch(Some((&format!("codegen {}", cg.name), relax_codegen::opt::inst_count(&cg))));
