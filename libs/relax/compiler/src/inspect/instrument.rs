@@ -453,7 +453,7 @@ fn find_in(u: &crate::jit::Unit, query: &str, max: usize, inlined_too: bool) -> 
         let mut out = Vec::new();
         for id in 0..u.fns.len() {
             let f = &u.fns[id];
-            if !targetable(f, inlined_too) {
+            if !targetable(f, inlined_too) || !files.contains(&f.file) {
                 continue;
             }
             // the fn whose item spans the line (its RIR, built for the instrumented build when it
