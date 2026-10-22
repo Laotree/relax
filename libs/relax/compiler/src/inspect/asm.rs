@@ -42,10 +42,10 @@ struct Side {
     inl: Vec<(String, u8)>,
     /// per instruction: the callee a direct call goes to (named)
     callee: Vec<Option<String>>,
-    /// per instruction: CPU samples with this pc innermost
-    samples: Vec<u32>,
+    /// per instruction: samples (weighted: events for hardware events) with this pc innermost
+    samples: Vec<u64>,
     /// per call instruction: samples whose return address is right after it (time in the callee)
-    below: Vec<u32>,
+    below: Vec<u64>,
     /// per instruction: PGO executions of its line (ours, counted builds)
     count: Vec<Option<u64>>,
     lines: Vec<Line>,
@@ -72,7 +72,7 @@ impl Side {
     }
 
     fn total_samples(&self) -> u64 {
-        self.samples.iter().map(|&s| s as u64).sum()
+        self.samples.iter().sum()
     }
 
     /// The instruction at absolute address `a`.
@@ -369,12 +369,81 @@ fn native_path(req: &Req) -> Result<String, String> {
             return Ok(p);
         }
     }
-    Err(concat!(
-        "no native build to compare with; pass native=<binary> (kept for later asks) or set MAKEPAD_INSPECT_NATIVE. ",
-        "Build one with line tables (same machine code as the plain release build): ",
-        "CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed cargo build --release -p <package> --target-dir target/relax-native"
-    )
-    .into())
+    auto_native(req.get("build") != Some("0"))
+}
+
+/// The pid and log of a native build this process started.
+static BUILDING: relax_session::sync::Mutex<Option<(std::process::Child, String)>> = relax_session::sync::Mutex::new(None);
+
+/// The running package's own rustc release build (the workspace's release profile, line tables
+/// added: the same machine code), in `<workspace>/target/relax-native`; started in the background
+/// when there is none yet (`build=0`: never).
+fn auto_native(build: bool) -> Result<String, String> {
+    let how = "pass native=<binary> (kept for later asks) or set MAKEPAD_INSPECT_NATIVE";
+    let Some((krate, dir)) = crate::run::root_package() else {
+        return Err(format!("no native build to compare with (the program's package is unknown); {}", how));
+    };
+    let mut ws = std::path::PathBuf::from(&dir);
+    let mut cur = ws.clone();
+    loop {
+        if std::fs::read_to_string(cur.join("Cargo.toml")).map_or(false, |t| t.contains("[workspace]")) {
+            ws = cur.clone();
+            break;
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    let target = ws.join("target").join("relax-native");
+    let names = [krate.replace('_', "-"), krate.clone()];
+    let mut g = BUILDING.lock().unwrap();
+    if let Some((child, log)) = g.as_mut() {
+        match child.try_wait() {
+            Ok(None) => return Err(format!("the native baseline build is still running (pid {}, log {}); ask again when it is done", child.id(), log)),
+            Ok(Some(st)) if !st.success() => {
+                let log = log.clone();
+                *g = None;
+                let tail = std::fs::read_to_string(&log).map(|t| t.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" / ")).unwrap_or_default();
+                return Err(format!("the native baseline build failed (log {}): {}; {}", log, short(&tail, 400), how));
+            }
+            _ => *g = None,
+        }
+    }
+    for n in &names {
+        let p = target.join("release").join(n);
+        if p.is_file() {
+            return Ok(p.to_string_lossy().into_owned());
+        }
+    }
+    if !build {
+        return Err(format!("no native build in {}; {}", target.display(), how));
+    }
+    let log = target.join("relax-native-build.log").to_string_lossy().into_owned();
+    let _ = std::fs::create_dir_all(&target);
+    let f = std::fs::File::create(&log).map_err(|e| format!("cannot write {}: {}", log, e))?;
+    let f2 = f.try_clone().map_err(|e| e.to_string())?;
+    let mut cmd = std::process::Command::new("nice");
+    cmd.args(["-n", "15", "cargo", "build", "--release", "-j", "4", "--manifest-path"])
+        .arg(std::path::Path::new(&dir).join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(&target)
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_PROFILE_RELEASE_DEBUG", "line-tables-only")
+        .env("CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO", "packed")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTFLAGS")
+        .stdin(std::process::Stdio::null())
+        .stdout(f)
+        .stderr(f2);
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("MAKEPAD_RUN_") {
+            cmd.env_remove(&k);
+        }
+    }
+    let child = cmd.spawn().map_err(|e| format!("cannot start cargo for the native baseline: {}; {}", e, how))?;
+    let pid = child.id();
+    *g = Some((child, log.clone()));
+    Err(format!("building the native baseline of `{}` now (cargo build --release, line tables only, -j4, nice; pid {}, log {}); ask again when it is done", krate, pid, log))
 }
 
 /// Runs `f` with the native binary at `path` (read once, again when the file changes).
@@ -445,17 +514,17 @@ fn rustc_side(nb: &NativeBin, ours: &str, our_bytes: usize) -> Result<(Side, usi
 
 /// CPU samples of every program thread for `secs` (0: none): innermost pcs and the return
 /// address above them.
-fn sample(secs: f64, hz: u64, out: &Out) -> (Vec<(u64, u64)>, f64, Vec<String>) {
+fn sample(secs: f64, hz: u64, ev: super::prof::Ev, out: &Out) -> (Vec<(u64, u64, u64)>, f64, Vec<String>, super::prof::Ev) {
     if secs <= 0.0 {
-        return (Vec::new(), 0.0, Vec::new());
+        return (Vec::new(), 0.0, Vec::new(), ev);
     }
     let gone = out.gone();
-    let run = super::prof::collect(secs, hz, &|_| true, &*gone);
-    let v = run.samples.iter().filter_map(|s| s.frames.first().map(|&pc| (pc, s.frames.get(1).copied().unwrap_or(0)))).collect();
-    (v, run.secs, run.notes)
+    let run = super::prof::collect_ev(secs, hz, ev, &|_| true, &*gone);
+    let v = run.samples.iter().filter_map(|s| s.frames.first().map(|&pc| (pc, s.frames.get(1).copied().unwrap_or(0), s.weight.max(1)))).collect();
+    (v, run.secs, run.notes, run.ev)
 }
 
-fn attach_samples(s: &mut Side, pcs: &[(u64, u64)]) {
+fn attach_samples(s: &mut Side, pcs: &[(u64, u64, u64)]) {
     let lo = s.addr;
     let hi = s.addr + s.insns.last().map_or(0, |i| i.off as u64 + i.len as u64);
     let find = |s: &Side, pc: u64| -> Option<usize> {
@@ -463,15 +532,15 @@ fn attach_samples(s: &mut Side, pcs: &[(u64, u64)]) {
         let k = s.insns.partition_point(|i| i.off <= off);
         k.checked_sub(1)
     };
-    for &(pc, ret) in pcs {
+    for &(pc, ret, w) in pcs {
         if pc >= lo && pc < hi {
             if let Some(k) = find(s, pc) {
-                s.samples[k] += 1;
+                s.samples[k] += w;
             }
         } else if ret > lo && ret <= hi {
             // the call right before the return address
             if let Some(k) = find(s, ret - 1) {
-                s.below[k] += 1;
+                s.below[k] += w;
             }
         }
     }
@@ -589,7 +658,7 @@ fn join(a: &Side, b: Option<&Side>) -> Joined {
         };
         let x = slot(&mut j, key, show, k);
         j.ours[x].add(a, k);
-        j.samples[x] += a.samples[k] as u64;
+        j.samples[x] += a.samples[k];
         j.count[x] = j.count[x].max(a.count[k].unwrap_or(0));
     }
     if let Some(b) = b {
@@ -615,6 +684,14 @@ fn pct(a: u64, t: u64) -> String {
         } else {
             format!("{:.1}", p)
         }
+    }
+}
+
+/// What sample totals count, for headers.
+fn ev_unit(ev: super::prof::Ev) -> &'static str {
+    match ev {
+        super::prof::Ev::Cpu => "samples",
+        e => e.name(),
     }
 }
 
@@ -702,7 +779,7 @@ fn findings(a: &Side, b: &Side, j: &Joined) -> Vec<(f64, String)> {
         if e.4.is_none() {
             e.4 = a.why[k].clone();
         }
-        e.1 += a.below[k] as u64 + a.count[k].unwrap_or(0) * u64::from(!by_samples);
+        e.1 += a.below[k] + a.count[k].unwrap_or(0) * u64::from(!by_samples);
         if let Some(l) = a.lines.get(a.at[k] as usize) {
             if !e.2.contains(&l.show) {
                 e.2.push(l.show.clone());
@@ -779,6 +856,10 @@ pub fn cmd_asm(req: &Req, out: &mut Out) {
     }
     let secs = req.get("s").and_then(|v| v.parse::<f64>().ok()).unwrap_or(2.0).clamp(0.0, 30.0);
     let hz = req.num("hz", 1000).clamp(10, 4000);
+    let ev = match super::prof::Ev::parse(req.get("ev").unwrap_or("cpu")) {
+        Ok(e) => e,
+        Err(e) => return out.err(&e),
+    };
     let vs = req.get("vs").map_or(req.get("native").is_some(), |v| v == "rustc");
     let view = req.get("view").unwrap_or("summary");
     let n = req.num("n", 12) as usize;
@@ -792,7 +873,7 @@ pub fn cmd_asm(req: &Req, out: &mut Out) {
         return out.err(&notes.join("; "));
     }
     let starts: Vec<u64> = sides.iter().map(|s| s.1.addr).collect();
-    let (pcs, took, mut snotes) = sample(secs, hz, out);
+    let (pcs, took, mut snotes, ev) = sample(secs, hz, ev, out);
     if out.cancelled() {
         return;
     }
@@ -826,11 +907,11 @@ pub fn cmd_asm(req: &Req, out: &mut Out) {
     } else {
         None
     };
-    render(out, slot, &a, b.as_ref(), view, req.get("line"), n, took, hz, &pcs, others, others_samples, &notes, &snotes, &q);
+    render(out, slot, &a, b.as_ref(), view, req.get("line"), n, took, hz, ev, &pcs, others, others_samples, &notes, &snotes, &q);
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render(out: &mut Out, slot: u32, a: &Side, b: Option<&Side>, view: &str, line: Option<&str>, n: usize, took: f64, hz: u64, pcs: &[(u64, u64)], others: usize, others_samples: u64, notes: &[String], snotes: &[String], q: &str) {
+fn render(out: &mut Out, slot: u32, a: &Side, b: Option<&Side>, view: &str, line: Option<&str>, n: usize, took: f64, hz: u64, ev: super::prof::Ev, pcs: &[(u64, u64, u64)], others: usize, others_samples: u64, notes: &[String], snotes: &[String], q: &str) {
     let bytes = |s: &Side| s.insns.last().map_or(0, |i| i.off + i.len as u32);
     let ts = a.total_samples();
     let unknown = a.insns.iter().filter(|i| i.class == Class::Unknown).count() + b.map_or(0, |b| b.insns.iter().filter(|i| i.class == Class::Unknown).count());
@@ -849,10 +930,10 @@ fn render(out: &mut Out, slot: u32, a: &Side, b: Option<&Side>, view: &str, line
                 bytes(b),
                 d,
                 d as f64 * 100.0 / b.insns.len().max(1) as f64,
-                if ts > 0 { format!("; {} samples in it ({:.1} s)", ts, took) } else { String::new() }
+                if ts > 0 { format!("; {} {} in it ({:.1} s)", count_str(ts), ev_unit(ev), took) } else { String::new() }
             )
         }
-        None => format!("`{}`: {} instr ({}, {} B){}", short(&a.name, 100), a.insns.len(), a.label.trim_start_matches("ours "), bytes(a), if ts > 0 { format!("; {} samples in it ({:.1} s at {} Hz)", ts, took, hz) } else { String::new() }),
+        None => format!("`{}`: {} instr ({}, {} B){}", short(&a.name, 100), a.insns.len(), a.label.trim_start_matches("ours "), bytes(a), if ts > 0 { format!("; {} {} in it ({:.1} s at {} Hz)", count_str(ts), ev_unit(ev), took, hz) } else { String::new() }),
     };
     out.always(&head);
     let fnd = b.map(|b| findings(a, b, &j)).unwrap_or_default();
@@ -895,10 +976,10 @@ fn render(out: &mut Out, slot: u32, a: &Side, b: Option<&Side>, view: &str, line
         let rows = if view == "lines" { order.len() } else { n.min(order.len()) };
         out.line("");
         if b.is_some() {
-            out.line("| line | samples % | PGO count | ours | rustc | Δ | ours mix | rustc mix |");
+            out.line(&format!("| line | {} % | PGO count | ours | rustc | Δ | ours mix | rustc mix |", ev_unit(ev)));
             out.line("|---|---:|---:|---:|---:|---:|---|---|");
         } else {
-            out.line("| line | samples % | PGO count | instr | mix |");
+            out.line(&format!("| line | {} % | PGO count | instr | mix |", ev_unit(ev)));
             out.line("|---|---:|---:|---:|---|");
         }
         for &x in order.iter().take(rows) {
@@ -977,7 +1058,11 @@ fn cmd_top(req: &Req, out: &mut Out) {
     let hz = req.num("hz", 1000).clamp(10, 4000);
     let n = req.num("n", 15) as usize;
     let vs = req.get("vs").map_or(req.get("native").is_some(), |v| v == "rustc");
-    let (pcs, took, snotes) = sample(secs, hz, out);
+    let ev = match super::prof::Ev::parse(req.get("ev").unwrap_or("cpu")) {
+        Ok(e) => e,
+        Err(e) => return out.err(&e),
+    };
+    let (pcs, took, snotes, ev) = sample(secs, hz, ev, out);
     if out.cancelled() {
         return;
     }
@@ -985,16 +1070,16 @@ fn cmd_top(req: &Req, out: &mut Out) {
     if up.is_null() {
         return out.err("no running unit");
     }
-    let jit_pcs: Vec<u64> = pcs.iter().map(|x| x.0).filter(|&pc| crate::jit::in_jit_code(pc)).collect();
-    let total = pcs.len() as u64;
+    let jit_pcs: Vec<(u64, u64)> = pcs.iter().map(|x| (x.0, x.2)).filter(|&(pc, _)| crate::jit::in_jit_code(pc)).collect();
+    let total: u64 = pcs.iter().map(|x| x.2).sum();
     let r = crate::owner::call_within(crate::owner::Class::Job, 10_000, move || {
         let u = unsafe { &*up };
         let tab = u.code.read().unwrap_or_else(|e| e.into_inner());
         let mut per: HashMap<u32, (u64, u64, u32)> = HashMap::new();
-        for pc in jit_pcs {
+        for (pc, w) in jit_pcs {
             if let Some((start, len, id)) = tab.entry_at(pc) {
                 let e = per.entry(id).or_insert((0, start, len));
-                e.0 += 1;
+                e.0 += w;
                 if start == u.fns[id as usize].code {
                     e.1 = start;
                     e.2 = len;
@@ -1044,12 +1129,12 @@ fn cmd_top(req: &Req, out: &mut Out) {
     let top = rows.first().map(|r| r.1.split('|').nth(2).unwrap_or("").trim().to_string()).unwrap_or_default();
     if vs {
         let est: f64 = rows.iter().map(|r| r.0).sum::<f64>() * 100.0 / total.max(1) as f64;
-        out.always(&format!("excess JIT instructions cost an estimated {:.1}% of all samples ({} JIT samples of {} in {:.1} s); worst: {}", est, jit_total, total, took, if top.is_empty() { "-".into() } else { top }));
+        out.always(&format!("excess JIT instructions cost an estimated {:.1}% of all {} ({} in JIT code of {} in {:.1} s); worst: {}", est, ev_unit(ev), count_str(jit_total), count_str(total), took, if top.is_empty() { "-".into() } else { top }));
     } else {
-        out.always(&format!("{} of {} samples ({}%) in JIT code in {:.1} s; hottest: {}", jit_total, total, pct(jit_total, total), took, if top.is_empty() { "-".into() } else { top }));
+        out.always(&format!("{} of {} {} ({}%) in JIT code in {:.1} s; hottest: {}", count_str(jit_total), count_str(total), ev_unit(ev), pct(jit_total, total), took, if top.is_empty() { "-".into() } else { top }));
     }
     out.line("");
-    out.line("| slot | fn | samples % | tier | ours instr | rustc instr | excess cost % |");
+    out.line(&format!("| slot | fn | {} % | tier | ours instr | rustc instr | excess cost % |", ev_unit(ev)));
     out.line("|---|---|---:|---|---:|---:|---:|");
     for (_, r) in rows.iter().take(n) {
         out.line(r);

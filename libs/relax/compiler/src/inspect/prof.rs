@@ -16,6 +16,42 @@ use super::{frame_json, json_str, now_ms, short, Out, Req};
 pub struct Sample {
     pub os_id: u64,
     pub frames: Vec<u64>,
+    /// events this sample stands for (hardware events: the period the kernel sampled at; CPU
+    /// time: 1)
+    pub weight: u64,
+}
+
+/// What a sample counts. CPU time works everywhere; the hardware events need Linux perf_event
+/// (macOS gives an unprivileged process no per-thread hardware sampling).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ev {
+    Cpu,
+    Cycles,
+    Instructions,
+    BranchMisses,
+    CacheMisses,
+}
+
+impl Ev {
+    pub fn parse(s: &str) -> Result<Ev, String> {
+        Ok(match s {
+            "cpu" | "time" | "task-clock" => Ev::Cpu,
+            "cycles" => Ev::Cycles,
+            "instructions" | "ins" => Ev::Instructions,
+            "branch-misses" | "branches" => Ev::BranchMisses,
+            "cache-misses" | "cache" => Ev::CacheMisses,
+            _ => return Err(format!("ev={}: cpu | cycles | instructions | branch-misses | cache-misses", s)),
+        })
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Ev::Cpu => "CPU time",
+            Ev::Cycles => "cycles",
+            Ev::Instructions => "instructions",
+            Ev::BranchMisses => "branch misses",
+            Ev::CacheMisses => "cache misses",
+        }
+    }
 }
 
 pub struct Run {
@@ -26,18 +62,26 @@ pub struct Run {
     pub lost: u64,
     /// why sampling stopped early or skipped rounds (client gone, capture lock busy)
     pub notes: Vec<String>,
+    /// what the samples count (a hardware event falls back to CPU time where it cannot be opened)
+    pub ev: Ev,
 }
 
 /// Collects samples for `secs` at `hz` per thread of CPU time, from the threads `want` picks
 /// (never inspect's own: the caller would suspend itself). Stops early once `cancel` says the
 /// client is gone.
 pub fn collect(secs: f64, hz: u64, want: &dyn Fn(&super::threads::Thread) -> bool, cancel: &dyn Fn() -> bool) -> Run {
+    collect_ev(secs, hz, Ev::Cpu, want, cancel)
+}
+
+/// `collect` counting `ev`: hardware events are sampled about `hz` times a second per thread
+/// (the kernel adapts the period), each sample weighted by its period.
+pub fn collect_ev(secs: f64, hz: u64, ev: Ev, want: &dyn Fn(&super::threads::Thread) -> bool, cancel: &dyn Fn() -> bool) -> Run {
     super::cfi::refresh();
     let skip = super::SERVER_TIDS.lock().unwrap().clone();
     let mut threads = super::threads::list();
     super::name_handles(&mut threads);
     threads.retain(|t| !super::is_inspect_thread(t, &skip) && want(t));
-    let mut run = imp::collect(threads, secs, hz, cancel);
+    let mut run = imp::collect(threads, secs, hz, ev, cancel);
     if cancel() {
         run.notes.push(format!("stopped after {:.1} s: the client went away", run.secs));
     }
@@ -67,15 +111,33 @@ mod imp {
         os_id: u64,
     }
 
-    fn open(tid: u64, hz: u64) -> Option<Ring> {
+    fn open(tid: u64, hz: u64, ev: super::Ev) -> Option<Ring> {
         let mut attr = [0u8; 128];
         let put = |a: &mut [u8; 128], off: usize, v: &[u8]| a[off..off + v.len()].copy_from_slice(v);
-        put(&mut attr, 0, &1u32.to_ne_bytes()); // PERF_TYPE_SOFTWARE
+        // exclude_kernel | exclude_hv
+        let mut flags = (1u64 << 5) | (1u64 << 6);
+        match ev {
+            super::Ev::Cpu => {
+                put(&mut attr, 0, &1u32.to_ne_bytes()); // PERF_TYPE_SOFTWARE
+                put(&mut attr, 8, &1u64.to_ne_bytes()); // PERF_COUNT_SW_TASK_CLOCK
+                put(&mut attr, 16, &(1_000_000_000 / hz.max(1)).to_ne_bytes()); // period, ns of CPU time
+            }
+            hw => {
+                put(&mut attr, 0, &0u32.to_ne_bytes()); // PERF_TYPE_HARDWARE
+                let config: u64 = match hw {
+                    super::Ev::Cycles => 0,
+                    super::Ev::Instructions => 1,
+                    super::Ev::CacheMisses => 3,
+                    _ => 5, // branch misses
+                };
+                put(&mut attr, 8, &config.to_ne_bytes());
+                put(&mut attr, 16, &hz.max(1).to_ne_bytes()); // sample_freq (freq bit below)
+                flags |= 1u64 << 10; // freq
+            }
+        }
         put(&mut attr, 4, &128u32.to_ne_bytes());
-        put(&mut attr, 8, &1u64.to_ne_bytes()); // PERF_COUNT_SW_TASK_CLOCK
-        put(&mut attr, 16, &(1_000_000_000 / hz.max(1)).to_ne_bytes()); // period, ns of CPU time
-        put(&mut attr, 24, &(1u64 | 2 | 0x1000 | 0x2000).to_ne_bytes()); // IP | TID | REGS_USER | STACK_USER
-        put(&mut attr, 40, &((1u64 << 5) | (1u64 << 6)).to_ne_bytes()); // exclude_kernel | exclude_hv
+        put(&mut attr, 24, &(1u64 | 2 | 0x100 | 0x1000 | 0x2000).to_ne_bytes()); // IP | TID | PERIOD | REGS_USER | STACK_USER
+        put(&mut attr, 40, &flags.to_ne_bytes());
         put(&mut attr, 80, &REGS_MASK.to_ne_bytes());
         put(&mut attr, 88, &STACK_COPY.to_ne_bytes());
         let fd = unsafe { syscall(298, attr.as_ptr(), tid as i32, -1i32, -1i32, 0u64) } as i32;
@@ -121,11 +183,13 @@ mod imp {
         unsafe { (*tail_p).store(tail, Ordering::Release) };
     }
 
-    /// One PERF_RECORD_SAMPLE: header, ip, pid/tid, regs (abi + 8 regs), stack (size, bytes,
-    /// dyn_size); walked on the copied stack.
+    /// One PERF_RECORD_SAMPLE: header, ip, pid/tid, period, regs (abi + 8 regs), stack (size,
+    /// bytes, dyn_size); walked on the copied stack.
     fn parse(rec: &[u8], os_id: u64) -> Option<Sample> {
         let u = |o: usize| -> Option<u64> { Some(u64::from_ne_bytes(rec.get(o..o + 8)?.try_into().ok()?)) };
         let mut o = 8 + 8 + 8;
+        let weight = u(o)?;
+        o += 8;
         let abi = u(o)?;
         o += 8;
         if abi == 0 {
@@ -147,11 +211,18 @@ mod imp {
         };
         let mut buf = [0u64; 96];
         let n = crate::inspect::threads::walk_regs_with(&mut regs, &mut buf, &read);
-        Some(Sample { os_id, frames: buf[..n].to_vec() })
+        Some(Sample { os_id, frames: buf[..n].to_vec(), weight })
     }
 
-    pub fn collect(threads: Vec<crate::inspect::threads::Thread>, secs: f64, hz: u64, cancel: &dyn Fn() -> bool) -> Run {
-        let rings: Vec<Ring> = threads.iter().filter_map(|t| open(t.os_id, hz)).collect();
+    pub fn collect(threads: Vec<crate::inspect::threads::Thread>, secs: f64, hz: u64, ev: super::Ev, cancel: &dyn Fn() -> bool) -> Run {
+        let mut notes = Vec::new();
+        let mut ev = ev;
+        let mut rings: Vec<Ring> = threads.iter().filter_map(|t| open(t.os_id, hz, ev)).collect();
+        if rings.is_empty() && ev != super::Ev::Cpu && !threads.is_empty() {
+            notes.push(format!("{} cannot be sampled here (no hardware PMU access for this process: perf_event_paranoid, a VM); CPU time instead", ev.name()));
+            ev = super::Ev::Cpu;
+            rings = threads.iter().filter_map(|t| open(t.os_id, hz, ev)).collect();
+        }
         let mut samples = Vec::new();
         let mut lost = 0u64;
         let t0 = std::time::Instant::now();
@@ -171,7 +242,12 @@ mod imp {
         }
         let secs = t0.elapsed().as_secs_f64().min(secs);
         crate::inspect::activity::phase("running", 0);
-        Run { samples, threads, secs, hz, lost, notes: Vec::new() }
+        if ev == super::Ev::Cpu {
+            for s in samples.iter_mut() {
+                s.weight = 1;
+            }
+        }
+        Run { samples, threads, secs, hz, lost, notes, ev }
     }
 }
 
@@ -183,8 +259,11 @@ mod imp {
     /// fixed array and resumes it before anything is allocated or locked (a suspended thread may
     /// hold malloc's lock). The capture lock is taken per round, so `stacks` and `why-hung` get
     /// in between.
-    pub fn collect(threads: Vec<crate::inspect::threads::Thread>, secs: f64, hz: u64, cancel: &dyn Fn() -> bool) -> Run {
+    pub fn collect(threads: Vec<crate::inspect::threads::Thread>, secs: f64, hz: u64, ev: super::Ev, cancel: &dyn Fn() -> bool) -> Run {
         let mut notes = Vec::new();
+        if ev != super::Ev::Cpu {
+            notes.push(format!("{} cannot be sampled on macOS without root (per-thread hardware sampling is privileged); CPU time instead -- `counters` gives this process's total instructions and cycles", ev.name()));
+        }
         let mut busy_rounds = 0u64;
         let mut samples = Vec::with_capacity(((secs * hz as f64) as usize).min(1 << 16));
         let mut raw = crate::inspect::threads::Raw::new();
@@ -221,7 +300,7 @@ mod imp {
                     continue;
                 }
                 if crate::inspect::threads::capture(now, &mut raw).is_ok() && raw.n > 0 {
-                    samples.push(Sample { os_id: t.os_id, frames: raw.frames().to_vec() });
+                    samples.push(Sample { os_id: t.os_id, frames: raw.frames().to_vec(), weight: 1 });
                 }
             }
             drop(_g);
@@ -236,15 +315,15 @@ mod imp {
         }
         crate::inspect::activity::phase("running", 0);
         let secs = t0.elapsed().as_secs_f64().min(secs);
-        Run { samples, threads, secs, hz, lost: 0, notes }
+        Run { samples, threads, secs, hz, lost: 0, notes, ev: super::Ev::Cpu }
     }
 }
 
 #[cfg(any(windows, target_os = "android"))]
 mod imp {
     use super::Run;
-    pub fn collect(threads: Vec<crate::inspect::threads::Thread>, secs: f64, hz: u64, _cancel: &dyn Fn() -> bool) -> Run {
-        Run { samples: Vec::new(), threads, secs, hz, lost: 0, notes: vec!["no CPU sampler on this target".into()] }
+    pub fn collect(threads: Vec<crate::inspect::threads::Thread>, secs: f64, hz: u64, _ev: super::Ev, _cancel: &dyn Fn() -> bool) -> Run {
+        Run { samples: Vec::new(), threads, secs, hz, lost: 0, notes: vec!["no CPU sampler on this target".into()], ev: super::Ev::Cpu }
     }
 }
 
