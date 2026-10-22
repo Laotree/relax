@@ -3134,23 +3134,14 @@ impl Unit {
         if self.prog.session.options.no_codegen || relax_codegen::interp::blob::is_blob(code) {
             self.no_codegen_target(code, relocs, what)
         } else {
-            self.emit_linked(code, relocs, false)
+            self.emit_linked(code, relocs)
         }
     }
 
-    /// `direct`: optimised code, whose slot calls branch to their callees' code (`direct`).
-    pub(crate) fn emit_linked(&self, code: &[u8], relocs: &[relax_backend::rir::RelocAt], direct: bool) -> Result<u64, String> {
+    fn emit_linked(&self, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Result<u64, String> {
         let at = bump(&self.code_next, code.len() as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
         let mut c = code.to_vec();
         self.link_code(&mut c, at, relocs)?;
-        #[cfg(target_arch = "aarch64")]
-        if direct && direct::on() {
-            let sites = direct::link(&self.slots, &mut c, at, relocs);
-            unsafe { os::mem::write_code(at, &c) };
-            direct::record(&self.slots, sites);
-            return Ok(at);
-        }
-        let _ = direct;
         unsafe { os::mem::write_code(at, &c) };
         Ok(at)
     }
@@ -5272,7 +5263,7 @@ impl Unit {
             Some(t) => t,
             None => match if twin { crate::sandbox::emit_twin(self, code, relocs) } else { None } {
                 Some(a) => a,
-                None => self.emit_linked(code, relocs, code_as_now().is_some_and(|k| matches!(k.tier, tier::O2 | tier::O3 | tier::GUARDED)))?,
+                None => self.emit_linked(code, relocs)?,
             },
         };
         if redirect.is_none() {
@@ -11440,9 +11431,6 @@ impl Drop for Unit {
         // a retired unit's code and data go with it (nothing calls into it any more); the
         // program's own unit lives to process exit
         if !std::thread::panicking() { self.flush_query_errors(true); }
-        // its direct call sites are keyed by its slot table, whose address a later unit may reuse
-        #[cfg(target_arch = "aarch64")]
-        direct::forget(&self.slots);
         if self.retired {
             let rest = UNIT_DATA_SIZE + UNIT_RW_SIZE + (crate::syms::SYM_CAP * 8) as u64;
             os::mem::release(self.exec_base, self.exec_size as usize, rest as usize);
@@ -11661,8 +11649,6 @@ fn sync_thunk(slots: &relax_backend::rir::SlotTable, id: u32) {
     let at = slots.thunk(id);
     let mut v = word.load(Ordering::SeqCst);
     loop {
-        #[cfg(target_arch = "aarch64")]
-        direct::sync(slots, id, v);
         // (the head as it is, read through the executable view: no write when it already fits)
         unsafe {
             #[cfg(target_arch = "aarch64")]
@@ -11685,131 +11671,6 @@ fn sync_thunk(slots: &relax_backend::rir::SlotTable, id: u32) {
             return;
         }
         v = now;
-    }
-}
-
-/// Direct calls (arm64): a call in optimised code (O2, O3) branches straight to its callee's
-/// current code, as rustc's `bl` does, instead of to the callee's thunk. The thunk hop costs a
-/// second taken branch per call and, worse, a fetch of the thunk's line: thunks sit at slot-id
-/// order in an 8 MB array, so the few thousand hot callees of a frame touch hundreds of thunk
-/// pages (race, M3: 4% of the UI thread's samples stalled on a thunk head).
-/// Each such call site is recorded under its callee; `sync_thunk` re-points the sites whenever
-/// it re-points the thunk head, under the same convergence rule (each writer patches for the word
-/// it read, then reads again). A site is `bl <word>` when the word is in reach, else `bl <thunk>`.
-/// Code memory of a unit is never reused (replaced code stays mapped), so a site in an old body
-/// is always safe to write. Sandbox twin spaces (recycled) and baseline/O1 code keep thunk calls.
-/// `bl` may be modified while other cores execute it (Arm ARM B2.2.5), as the thunk head is.
-/// MAKEPAD_RUN_DIRECT_CALLS=0: off (every call through its thunk, as before).
-#[cfg(target_arch = "aarch64")]
-pub(crate) mod direct {
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-    use relax_backend::rir::{RelocAt, RelocKind, Reloc, SlotTable};
-
-    /// (slot table, callee) -> its direct call sites: (code address of the `bl`, the target it
-    /// had when linked: the thunk, or a veneer to it when the thunk is out of reach). A leaf lock.
-    static SITES: relax_session::sync::Mutex<Option<HashMap<(usize, u32), Vec<(u64, u64)>>>> = relax_session::sync::Mutex::new(None);
-    static ON: AtomicU8 = AtomicU8::new(0);
-    /// sites recorded, and site patches written after placement
-    pub(crate) static SITE_COUNT: AtomicU64 = AtomicU64::new(0);
-    pub(crate) static REPATCHES: AtomicU64 = AtomicU64::new(0);
-
-    pub(crate) fn on() -> bool {
-        match ON.load(Ordering::Relaxed) {
-            0 => {
-                let on = std::env::var("MAKEPAD_RUN_DIRECT_CALLS").map_or(true, |v| v != "0");
-                ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-                on
-            }
-            v => v == 1,
-        }
-    }
-
-    fn bl(site: u64, target: u64) -> u32 {
-        0x9400_0000 | ((target.wrapping_sub(site) as i64 >> 2) as u32 & 0x03FF_FFFF)
-    }
-
-    fn bl_target(site: u64, w: u32) -> u64 {
-        site.wrapping_add((((w & 0x03FF_FFFF) << 6) as i32 >> 4) as i64 as u64)
-    }
-
-    /// Where a site branches for table word `v`: the word's code when in reach, else what it was
-    /// linked to (the thunk, or its veneer).
-    fn dest(site: u64, fallback: u64, v: u64) -> u64 {
-        if v != 0 && relax_backend::rir::branch_reaches(RelocKind::A64Branch26, site, v) { v } else { fallback }
-    }
-
-    fn word(slots: &SlotTable, id: u32) -> u64 {
-        unsafe { (*(slots.table(id) as *const AtomicU64)).load(Ordering::SeqCst) }
-    }
-
-    fn is_bl(w: u32) -> bool {
-        w & 0xFC00_0000 == 0x9400_0000
-    }
-
-    /// Before the linked `code` is written at `at`: its slot calls branch to their callees'
-    /// current code. Returns the sites (address, callee, fallback, target linked).
-    pub(crate) fn link(slots: &SlotTable, code: &mut [u8], at: u64, relocs: &[RelocAt]) -> Vec<(u64, u32, u64, u64)> {
-        let mut out = Vec::new();
-        for r in relocs {
-            let (RelocKind::A64Branch26, Reloc::Call(id)) = (r.kind, r.target) else { continue };
-            let o = r.at as usize;
-            let Some(b) = code.get_mut(o..o + 4) else { continue };
-            let w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-            if !is_bl(w) {
-                continue;
-            }
-            let site = at + o as u64;
-            let fallback = bl_target(site, w);
-            let t = dest(site, fallback, word(slots, id));
-            if t != fallback {
-                b.copy_from_slice(&bl(site, t).to_le_bytes());
-            }
-            out.push((site, id, fallback, t));
-        }
-        out
-    }
-
-    /// After the code is written: records its sites, and re-points any whose callee's word moved
-    /// since `link` (a `sync` meanwhile did not know the site yet).
-    pub(crate) fn record(slots: &SlotTable, sites: Vec<(u64, u32, u64, u64)>) {
-        if sites.is_empty() {
-            return;
-        }
-        let key = slots as *const SlotTable as usize;
-        let mut g = SITES.lock().unwrap_or_else(|e| e.into_inner());
-        SITE_COUNT.fetch_add(sites.len() as u64, Ordering::Relaxed);
-        for (site, id, fallback, linked) in sites {
-            crate::zone_alloc::kept_with(|| g.get_or_insert_with(HashMap::new).entry((key, id)).or_default().push((site, fallback)));
-            let t = dest(site, fallback, word(slots, id));
-            if t != linked {
-                REPATCHES.fetch_add(1, Ordering::Relaxed);
-                unsafe { crate::os::mem::patch_code_u32(site, bl(site, t)) };
-            }
-        }
-    }
-
-    /// The sites of slot `id` follow table word `v` (sync_thunk's loop).
-    pub(crate) fn sync(slots: &SlotTable, id: u32, v: u64) {
-        let key = slots as *const SlotTable as usize;
-        let g = SITES.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(sites) = g.as_ref().and_then(|m| m.get(&(key, id))) else { return };
-        for &(site, fallback) in sites {
-            let w = bl(site, dest(site, fallback, v));
-            let cur = unsafe { std::ptr::read_volatile(site as *const u32) };
-            if cur != w && is_bl(cur) {
-                REPATCHES.fetch_add(1, Ordering::Relaxed);
-                unsafe { crate::os::mem::patch_code_u32(site, w) };
-            }
-        }
-    }
-
-    /// A unit's table goes away (retire_unit): its sites with it.
-    pub(crate) fn forget(slots: &SlotTable) {
-        let key = slots as *const SlotTable as usize;
-        if let Some(m) = SITES.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            m.retain(|k, _| k.0 != key);
-        }
     }
 }
 
@@ -13968,7 +13829,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 } else {
                     match if sandboxed { crate::sandbox::emit_twin(u, &code, &relocs) } else { None } {
                         Some(at) => at,
-                        None => u.emit_linked(&code, &relocs, true).expect("O3 code links (checked)"),
+                        None => u.emit_linked(&code, &relocs).expect("O3 code links (checked)"),
                     }
                 };
                 if sandboxed {
