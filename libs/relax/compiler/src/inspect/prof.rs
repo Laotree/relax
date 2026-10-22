@@ -130,7 +130,7 @@ mod imp {
         let mut attr = [0u8; 128];
         let put = |a: &mut [u8; 128], off: usize, v: &[u8]| a[off..off + v.len()].copy_from_slice(v);
         // exclude_kernel | exclude_hv
-        let mut flags = (1u64 << 5) | (1u64 << 6);
+        let flags = (1u64 << 5) | (1u64 << 6);
         match ev {
             super::Ev::Cpu => {
                 put(&mut attr, 0, &1u32.to_ne_bytes()); // PERF_TYPE_SOFTWARE

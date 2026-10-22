@@ -28,22 +28,112 @@ pub struct SpillRemark {
     pub span: u32,
 }
 
-thread_local! {
-    static SINK: RefCell<Option<Vec<SpillRemark>>> = const { RefCell::new(None) };
+/// A loop a vectoriser looked at and how far it got: `stage` is the last check it passed (each
+/// pass names its stages, `LoopRemark::describe`); `done`: it was vectorised.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoopRemark {
+    /// source position of the loop's head (its first instruction, else its terminator)
+    pub pos: u64,
+    pub pass: &'static str,
+    pub stage: u8,
+    pub done: bool,
 }
 
-/// Starts collecting remarks for the next build on this thread.
-pub fn begin() {
-    SINK.with(|s| *s.borrow_mut() = Some(Vec::new()));
+/// What one build recorded.
+#[derive(Default, Debug)]
+pub struct Remarks {
+    pub spills: Vec<SpillRemark>,
+    pub loops: Vec<LoopRemark>,
+}
+
+thread_local! {
+    static SINK: RefCell<Option<Remarks>> = const { RefCell::new(None) };
+}
+
+/// Collecting for one build on this thread; dropping it without `take` stops collecting.
+pub struct Collect(());
+
+impl Drop for Collect {
+    fn drop(&mut self) {
+        SINK.with(|s| *s.borrow_mut() = None);
+    }
+}
+
+/// Starts collecting remarks for the build that follows on this thread (its optimisation and
+/// its code generation).
+pub fn begin() -> Collect {
+    SINK.with(|s| *s.borrow_mut() = Some(Remarks::default()));
+    Collect(())
 }
 
 /// Stops collecting and returns what the build recorded.
-pub fn take() -> Vec<SpillRemark> {
-    SINK.with(|s| s.borrow_mut().take()).unwrap_or_default()
+pub fn take(c: Collect) -> Remarks {
+    let r = SINK.with(|s| s.borrow_mut().take()).unwrap_or_default();
+    drop(c);
+    r
 }
 
 fn on() -> bool {
     SINK.with(|s| s.borrow().is_some())
+}
+
+/// A vectoriser starts on the loop whose head is at `pos` (a later look at the same loop by the
+/// same pass replaces the earlier record).
+pub fn loop_try(pass: &'static str, pos: u64) {
+    if !on() {
+        return;
+    }
+    SINK.with(|s| {
+        if let Some(r) = s.borrow_mut().as_mut() {
+            r.loops.retain(|l| !(l.pass == pass && l.pos == pos));
+            r.loops.push(LoopRemark { pos, pass, stage: 0, done: false });
+        }
+    });
+}
+
+/// The current loop passed check `stage`.
+pub fn loop_stage(stage: u8) {
+    if !on() {
+        return;
+    }
+    SINK.with(|s| {
+        if let Some(l) = s.borrow_mut().as_mut().and_then(|r| r.loops.last_mut()) {
+            l.stage = l.stage.max(stage);
+        }
+    });
+}
+
+/// The current loop was vectorised.
+pub fn loop_done() {
+    if !on() {
+        return;
+    }
+    SINK.with(|s| {
+        if let Some(l) = s.borrow_mut().as_mut().and_then(|r| r.loops.last_mut()) {
+            l.done = true;
+        }
+    });
+}
+
+impl LoopRemark {
+    /// The pass and, when it gave up, the first check the loop failed.
+    pub fn describe(&self) -> String {
+        if self.done {
+            return format!("{}: vectorised", self.pass);
+        }
+        let why = match (self.pass, self.stage) {
+            ("stream-map", 0) => "not a single linear cycle (one entry, guards that exit, the back edge after the store) with one definition per value",
+            ("stream-map", 1) => "the body has an operation or address it does not widen (u8 / f32 / i32 element loads and one store at stream positions, lane-wise ops, loop-invariant scalars)",
+            ("stream-map", 2) => "a stream does not step one element per iteration",
+            ("stream-map", 3) => "the exit tests are not a down-counting length, a pointer or counter reaching an end, a counter below a bound or a null test",
+            ("stream-map", 4) => "a value computed in the loop is used after it, or the store overlaps a load within one vector",
+            ("reduction", 0) => "not a single-block counted loop",
+            ("reduction", 1) => "no integer sum over a contiguous array in it",
+            ("lane-accumulators", 0) => "no group of independent accumulators of one array",
+            _ => "a later check failed",
+        };
+        format!("{}: not vectorised: {}", self.pass, why)
+    }
 }
 
 /// The finished allocation `a` of `f`: its spilled values (called by the emitters).
@@ -95,7 +185,7 @@ pub fn note_spills(f: &Func, a: &Alloc) {
     }
     SINK.with(|s| {
         if let Some(sink) = s.borrow_mut().as_mut() {
-            sink.extend(v);
+            sink.spills.extend(v);
         }
     });
 }

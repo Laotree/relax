@@ -34,6 +34,21 @@ pub fn usable_regs(flt: bool) -> u32 {
     }
 }
 
+static LOOPS: relax_session::sync::Mutex<Option<HashMap<u32, Vec<relax_backend::remark::LoopRemark>>>> = relax_session::sync::Mutex::new(None);
+
+/// The loops slot `id`'s last O3 build's vectorisers looked at, and how far each got.
+pub fn record_loops(id: u32, v: Vec<relax_backend::remark::LoopRemark>) {
+    let _k = crate::zone_alloc::kept();
+    let mut v = v;
+    v.shrink_to_fit();
+    LOOPS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(id, v);
+}
+
+/// The vectoriser remarks of slot `id`'s last O3 build.
+pub fn loops_of(id: u32) -> Vec<relax_backend::remark::LoopRemark> {
+    LOOPS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&id).cloned()).unwrap_or_default()
+}
+
 static COUNTS: relax_session::sync::Mutex<Option<HashMap<u32, Vec<(u64, u64)>>>> = relax_session::sync::Mutex::new(None);
 
 /// The PGO counts slot `id`'s O3 code was built from: (source position, executions of its block
@@ -86,6 +101,14 @@ pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
             }
         }
     }
+    if let Ok(g) = LOOPS.try_lock() {
+        if let Some(m) = g.as_ref() {
+            a.field("inspect.loops");
+            for v in m.values() {
+                a.vec(v);
+            }
+        }
+    }
     if let Ok(g) = SPILLS.try_lock() {
         if let Some(m) = g.as_ref() {
             a.field("inspect.spills");
@@ -130,7 +153,7 @@ pub fn cmd_remarks(req: &Req, out: &mut Out) {
             let mut v = inline_of(id);
             let tiers: Vec<String> = super::codever::bodies(u, id).iter().map(|b| format!("{} ({})", super::codever::label(super::codever::kind_at(u, b.start)), b.state)).collect();
             let built = INLINE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.contains_key(&id));
-            if v.is_empty() && spills_of(id).is_empty() {
+            if v.is_empty() && spills_of(id).is_empty() && loops_of(id).is_empty() {
                 rows.push(format!(
                     "`{}` (@{}): {}; code: {}",
                     short(&f.name, 100),
@@ -153,6 +176,17 @@ pub fn cmd_remarks(req: &Req, out: &mut Out) {
             }
             if v.len() > n {
                 rows.push(format!("+{} more (n=)", v.len() - n));
+            }
+            let lp = loops_of(id);
+            if !lp.is_empty() {
+                rows.push(String::new());
+                rows.push(format!("vectorisers: {} loop look(s), {} vectorised", lp.len(), lp.iter().filter(|l| l.done).count()));
+                rows.push("| loop at | remark |".into());
+                rows.push("|---|---|".into());
+                for l in lp.iter().take(n) {
+                    let at = super::codever::pos_line(u, l.pos).map(|(fi, ln)| format!("{}:{}", u.prog.file_paths.get(fi as usize).map(|p| p.rsplit('/').next().unwrap_or(p)).unwrap_or("?"), ln)).unwrap_or_else(|| "?".into());
+                    rows.push(format!("| {} | {} |", at, l.describe()));
+                }
             }
             let mut sp = spills_of(id);
             if !sp.is_empty() {

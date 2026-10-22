@@ -57,6 +57,8 @@ struct Side {
     ext: Vec<Option<String>>,
     /// the O3 build's spilled values: (line key, line shown, why), most used first
     spills: Vec<(String, String, String)>,
+    /// the O3 build's vectoriser remarks: (line key of the loop head, remark)
+    loop_notes: Vec<(String, String)>,
     /// bytes after the code that are not instructions (padding, constant pool)
     data: u32,
 }
@@ -64,7 +66,7 @@ struct Side {
 impl Side {
     fn new(label: String, name: String, addr: u64, insns: Vec<Insn>) -> Side {
         let n = insns.len();
-        Side { label, name, addr, insns, at: vec![u32::MAX; n], inl: vec![(String::new(), 0); n], callee: vec![None; n], samples: vec![0; n], below: vec![0; n], count: vec![None; n], lines: Vec::new(), check: vec![None; n], why: vec![None; n], ext: vec![None; n], spills: Vec::new(), data: 0 }
+        Side { label, name, addr, insns, at: vec![u32::MAX; n], inl: vec![(String::new(), 0); n], callee: vec![None; n], samples: vec![0; n], below: vec![0; n], count: vec![None; n], lines: Vec::new(), check: vec![None; n], why: vec![None; n], ext: vec![None; n], spills: Vec::new(), loop_notes: Vec::new(), data: 0 }
     }
 
     fn line_index(&mut self, idx: &mut HashMap<String, u32>, key: String, show: String) -> u32 {
@@ -411,6 +413,12 @@ fn our_sides(q: &str, max: usize) -> Result<(Vec<(u32, Side)>, Vec<String>), Str
                     if let Some((file, line)) = super::codever::pos_line(u, r.pos) {
                         let path = u.prog.file_paths.get(file as usize).cloned().unwrap_or_default();
                         s.spills.push((format!("{}:{}", path_key(&path), line), format!("{}:{}", file_name(&path), line), r.describe(super::remarks::usable_regs(r.flt))));
+                    }
+                }
+                for l in super::remarks::loops_of(id) {
+                    if let Some((file, line)) = super::codever::pos_line(u, l.pos) {
+                        let path = u.prog.file_paths.get(file as usize).cloned().unwrap_or_default();
+                        s.loop_notes.push((format!("{}:{}", path_key(&path), line), l.describe()));
                     }
                 }
                 sides.push((id, s));
@@ -943,7 +951,8 @@ fn findings(a: &Side, b: &Side, j: &Joined) -> Vec<(f64, String)> {
             what.push(format!("{} check(s) rustc does not have ({} vs {})", ours.checks - theirs.checks, ours.checks, theirs.checks));
         }
         if theirs.get(Class::Vector) > 0 && ours.get(Class::Vector) == 0 {
-            what.push(format!("not vectorised (rustc: {} vector instr)", theirs.get(Class::Vector)));
+            let why: Vec<String> = a.loop_notes.iter().filter(|x| keys.contains(&x.0)).map(|x| x.1.clone()).collect();
+            what.push(format!("not vectorised (rustc: {} vector instr){}", theirs.get(Class::Vector), if why.is_empty() { "; no vectoriser looked at it (not a candidate shape)".to_string() } else { format!("; {}", why.join("; ")) }));
         }
         let ours_calls: Vec<String> = ours.calls.iter().map(|c| callee_key(c)).collect();
         let their_calls: std::collections::HashSet<String> = theirs.calls.iter().map(|c| callee_key(c)).collect();
