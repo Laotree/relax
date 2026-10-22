@@ -11315,8 +11315,36 @@ unsafe fn loop_syms(u: &Unit, id: u32) -> Option<(relax_backend::rir::Sym, relax
     if u.tier1.is_none() || !counted || !loops_on() {
         return None;
     }
-    let helper = u.syms.intern(crate::syms::SymKind::Rt("loop_hot"), rt_loop_hot as *const () as usize as u64);
-    Some((loop_counter_sym(u, id), helper))
+    Some((loop_counter_sym(u, id), loop_hot_sym(u)))
+}
+
+/// The symbol JIT code calls when a loop counter runs out: a trampoline that passes the calling
+/// JIT frame's frame pointer as the second argument and jumps to rt_loop_hot (interned on first
+/// use, also by a warm start's link: lower::intern_lazy_rt).
+pub(crate) fn loop_hot_sym(u: &Unit) -> relax_backend::rir::Sym {
+    static TRAMP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let at = *TRAMP.get_or_init(|| u.emit_code(&loop_tramp(rt_loop_hot as *const () as usize as u64)));
+    u.syms.intern(crate::syms::SymKind::Rt("loop_hot"), at)
+}
+
+/// `mov x1, x29; ldr x16, 8; br x16; .quad target` (the literal at pc + 8 from the ldr)
+#[cfg(target_arch = "aarch64")]
+fn loop_tramp(target: u64) -> Vec<u8> {
+    let mut b = Vec::new();
+    for w in [0xaa1d03e1u32, 0x58000050, 0xd61f0200] {
+        b.extend_from_slice(&w.to_le_bytes());
+    }
+    b.extend_from_slice(&target.to_le_bytes());
+    b
+}
+
+/// `mov rsi, rbp; movabs rax, target; jmp rax`
+#[cfg(not(target_arch = "aarch64"))]
+fn loop_tramp(target: u64) -> Vec<u8> {
+    let mut b = vec![0x48, 0x89, 0xee, 0x48, 0xb8];
+    b.extend_from_slice(&target.to_le_bytes());
+    b.extend_from_slice(&[0xff, 0xe0]);
+    b
 }
 
 /// MAKEPAD_RUN_LOOP_COUNTERS=0: no back-edge counters (loops in rarely entered functions stay at
@@ -11346,7 +11374,7 @@ rt_fn! {
 /// lock): the count starts again, and if the last LOOP_PER_CALL x O3-calls back edges came within
 /// CALL_WINDOW_NS the slot is queued for O3 (its counted build first), as rt_hot does for calls.
 /// Without OSR the frame running the loop finishes in the code it is in; the next entry runs O3.
-fn rt_loop_hot(counter: u64) {
+fn rt_loop_hot(counter: u64, fp: u64) {
     let _z = crate::zone_alloc::compiler();
     let _keep = os::proc::KeepLastError::new();
     let up = TIER_UNIT.load(Ordering::Acquire);
@@ -11371,6 +11399,34 @@ fn rt_loop_hot(counter: u64) {
         }
         let rate = ((budget as u128 * 1_000_000_000 / took.max(1) as u128) / LOOP_PER_CALL as u128).min(u64::MAX as u128) as u64;
         queue_loop(u, id, rate);
+        // the frame's JIT callers (frame records: [fp] = the caller's fp, [fp + 8] = the return
+        // address into it); a frame that is not JIT code ends the walk before its fp is read
+        let mut fp = fp;
+        let mut at = id;
+        for _ in 0..LOOP_CALLERS {
+            if fp == 0 || fp % 8 != 0 {
+                break;
+            }
+            let ra = *((fp + 8) as *const u64);
+            let found = u.find_fn(ra);
+            if tier1_trace() {
+                eprintln!("O3q loop #{}: caller {:?} (state {})", at, found, found.map_or(0, |c| (*tier_rec(&u.slots, c).add(3)).load(Ordering::Relaxed)));
+            }
+            let Some(c) = found else { break };
+            if c != at {
+                let st = (*tier_rec(&u.slots, c).add(3)).load(Ordering::Relaxed);
+                if st == T_QUEUED {
+                    break;
+                }
+                queue_loop(u, c, rate);
+            }
+            at = c;
+            let next = *(fp as *const u64);
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
     }
 }
 }
@@ -11386,6 +11442,12 @@ const TIER_LOOP: u64 = 48;
 /// CALL_WINDOW_NS: HotSpot's back-edge / invocation thresholds (C2: Tier4BackEdgeThreshold 40000,
 /// Tier4InvocationThreshold 5000).
 const LOOP_PER_CALL: u64 = 8;
+/// A hot loop queues the JIT frames under it with it (rt_loop_hot), up to the first one queued
+/// already and at most this many: a loop in a callee is its callers' loop too, and their O3 builds
+/// inline it (llm_host: a generic collect's loop under f32_bytes_to_vec under the decode step,
+/// all entered rarely). The sampler reached the same frames by crediting each sample to the pc's
+/// function and two callers, again as their code tiered up.
+const LOOP_CALLERS: usize = 64;
 /// A count stub reaching zero queues its slot only if the TIER1_CALLS calls came within this
 /// window (a rate, not a total): otherwise the count starts again. Counts never decayed: in a
 /// UI everything called once per frame reached 2000 within a minute and O3 never went

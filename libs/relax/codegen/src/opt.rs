@@ -575,10 +575,30 @@ fn site_rule(options: &relax_session::Options, callee: &Func, id: u32, nargs: us
 /// call, and a body that iterates per call (sdf_glyphs' esdt over a row: +5.6% instructions when
 /// it went into each caller) pays for its call many times over.
 const PGO_VERY_HOT: f32 = 1.0;
+/// ... a body loops when it runs more instructions per call than this many times its size (the
+/// back-edge / invocation ratio the JIT's loop counters use, HotSpot's: a loop body is one that
+/// iterates about that often per call). Measured on the counts: llm_host's HostDecodeBench::step
+/// 3.9 (inlined: its caller specialises it), sdf_glyphs' esdt 31 (kept out of line).
+const PGO_LOOP_WORK: f64 = 8.0;
+
+/// A counted body's instructions executed per call over its size (1: straight-line code; a loop
+/// raises it by its trips). None: no counts.
+pub fn work_per_size(f: &Func) -> Option<f64> {
+    let entry = f.blocks.first().map_or(-1.0, |b| b.count);
+    if entry <= 0.0 {
+        return None;
+    }
+    let (mut work, mut size) = (0.0f64, 0usize);
+    for b in &f.blocks {
+        size += b.insts.len() + 1;
+        work += b.count.max(0.0) as f64 * (b.insts.len() + 1) as f64;
+    }
+    Some(work / entry as f64 / size.max(1) as f64)
+}
 
 fn pgo_site_limits(lim: &InlineLimits, counted: bool, priority: u32, callee: &Func) -> InlineLimits {
-    let loops = || match relax_backend::profile::repeated_blocks(callee) {
-        Some(r) => r.iter().any(|x| *x),
+    let loops = || match work_per_size(callee) {
+        Some(w) => w > PGO_LOOP_WORK,
         None => relax_backend::regalloc::loop_depths(callee, &reachable(callee)).iter().any(|d| *d > 0),
     };
     if counted && f32::from_bits(priority) >= PGO_VERY_HOT && !loops() {
@@ -773,7 +793,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
             let name = found.map_or_else(|| format!("fn#{}", id), |(p, _)| unsafe { &*p }.name.clone());
             match &pick {
                 Some((c, r, g, sz, cost, free, _, ic)) => eprintln!("inline-trace {}: take {} freq {:.2} rule {} size {} (body {}) growth {} cost {} free {} ctx {} | budget {} priced {} limit {}", f.name, name, fq, r, sz, inline_inst_count(c), g, cost, free, ic, budget, priced, growth_limit),
-                None => eprintln!("inline-trace {}: left {} freq {:.2} tries {} | budget {} priced {} limit {}", f.name, name, fq, tries.len(), budget, priced, growth_limit),
+                None => eprintln!("inline-trace {}: left {} freq {:.2} tries {} work/size {:?} | budget {} priced {} limit {}", f.name, name, fq, tries.len(), found.and_then(|(p, _)| work_per_size(unsafe { &*p })), budget, priced, growth_limit),
             }
         }
         let Some((callee, rule, growth, size, cost, free, no_growth, in_context)) = pick else { continue };
