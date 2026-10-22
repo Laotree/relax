@@ -10519,6 +10519,8 @@ struct FrequencyProfile {
     /// (source position, block) of the counted RIR, sorted: a RIR stored since (an O2 build's)
     /// takes the counts by position
     pos_blocks: Vec<(u64, u32)>,
+    /// the blocks that have a counter (profile::instrument leaves out moves-only tail blocks)
+    counted: Vec<bool>,
     /// kept-heap words the counted code increments (never freed: retired counted code may still
     /// run on another thread)
     counters: &'static [AtomicU64],
@@ -10527,7 +10529,7 @@ struct FrequencyProfile {
 impl FrequencyProfile {
     /// The counts for the blocks of `rir` (the O3 input), None when nothing ran.
     fn counts_for(&self, rir: &relax_backend::rir::Func) -> Option<Vec<f32>> {
-        let c = |b: usize| self.counters[b].load(Ordering::Relaxed) as f32;
+        let c = |b: usize| if self.counted[b] { self.counters[b].load(Ordering::Relaxed) as f32 } else { -1.0 };
         if self.counters.iter().all(|x| x.load(Ordering::Relaxed) == 0) {
             return None;
         }
@@ -11921,11 +11923,11 @@ unsafe fn counted_build(up: *mut Unit, id: u32) -> bool {
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _scratch = crate::zone_alloc::scratch(&session.runtime);
         let mut func = (*rir).clone();
-        relax_backend::profile::instrument(&mut func, counters.as_ptr() as u64);
+        let counted = relax_backend::profile::instrument(&mut func, counters.as_ptr() as u64);
         let cg = tier0_codegen_rir(options, &func, fold, layout);
-        relax_codegen::native::compile(options, &cg, &env)
+        relax_codegen::native::compile(options, &cg, &env).map(|c| (c, counted))
     }));
-    let Ok(Ok(c)) = built else {
+    let Ok(Ok((c, counted))) = built else {
         PGO_STATS[2].fetch_add(1, Ordering::Relaxed);
         return false;
     };
@@ -11948,7 +11950,7 @@ unsafe fn counted_build(up: *mut Unit, id: u32) -> bool {
                 }
                 let profile = crate::zone_alloc::kept_with(|| {
                     let mut pos_blocks: Vec<(u64, u32)> = Vec::new();
-                    for (b, blk) in rir.blocks.iter().enumerate() {
+                    for (b, blk) in rir.blocks.iter().enumerate().filter(|(b, _)| counted[*b]) {
                         for p in blk.pos.iter().chain(std::iter::once(&blk.term_pos)) {
                             if *p != 0 {
                                 pos_blocks.push((*p, b as u32));
@@ -11957,7 +11959,7 @@ unsafe fn counted_build(up: *mut Unit, id: u32) -> bool {
                     }
                     pos_blocks.sort_unstable();
                     pos_blocks.dedup();
-                    FrequencyProfile { rir: std::sync::Arc::as_ptr(&rir) as usize, blocks: n, pos_blocks, counters }
+                    FrequencyProfile { rir: std::sync::Arc::as_ptr(&rir) as usize, blocks: n, pos_blocks, counted: counted.clone(), counters }
                 });
                 crate::zone_alloc::kept_with(|| {
                     u.frequency_profiles.insert(id, profile);

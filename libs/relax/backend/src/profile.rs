@@ -13,8 +13,20 @@ use crate::rir::{Block, Cls, Func, IOp, Inst, Mem, Term, I64};
 
 /// Block `b`'s counter is the u64 at `base + 8 * b`. Each block starts with a plain (racy,
 /// non-atomic) load, add and store of its counter: counts are a frequency, never a fact.
-pub fn instrument(f: &mut Func, base: u64) {
+///
+/// A block of moves only that jumps on or returns gets no counter (its count comes from its
+/// predecessors): a call followed by such blocks is in tail position (tail::returns_results), and a
+/// counter there would turn a sibling call back into a call (a tail-recursive interpreter then
+/// overflows its stack in the counted code).
+/// Returns per block whether it got a counter.
+pub fn instrument(f: &mut Func, base: u64) -> Vec<bool> {
+    let mut counted = vec![false; f.blocks.len()];
     for b in 0..f.blocks.len() {
+        let blk = &f.blocks[b];
+        if blk.insts.iter().all(|i| matches!(i, Inst::Mov(..))) && matches!(blk.term, Term::Jump(_) | Term::Ret(_)) {
+            continue;
+        }
+        counted[b] = true;
         let (a, v, w) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
         let blk: &mut Block = &mut f.blocks[b];
         let at = blk.pos.first().copied().unwrap_or(blk.term_pos);
@@ -30,6 +42,7 @@ pub fn instrument(f: &mut Func, base: u64) {
             blk.pos.splice(0..0, [at; 4]);
         }
     }
+    counted
 }
 
 /// Some block carries a count.
@@ -357,8 +370,8 @@ mod tests {
 
     #[test]
     fn instrumented_blocks_start_with_their_counter() {
-        let mut f = func(vec![blk(Term::Jump(1), -1.0), blk(Term::Ret(Vec::new()), -1.0)]);
-        instrument(&mut f, 0x1000);
+        let mut f = func(vec![blk(Term::Jump(1), -1.0), blk(Term::Unreachable, -1.0)]);
+        assert_eq!(instrument(&mut f, 0x1000), vec![false, true]);
         assert!(matches!(f.blocks[1].insts[0], Inst::Iconst(_, 0x1008)));
         assert!(matches!(f.blocks[1].insts[3], Inst::Store(..)));
         assert!(f.verify().is_ok());
