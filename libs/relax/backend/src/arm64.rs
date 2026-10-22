@@ -692,6 +692,8 @@ struct Gen<'a> {
     al: Alloc,
     /// total frame size below fp (sp = fp - frame)
     frame: i64,
+    /// per block: the index of its sibling call (tail::sibling_calls; empty: none)
+    tail: Vec<Option<usize>>,
     /// bytes of callee-saved registers below fp
     saved: i64,
     slot_off: Vec<i64>,
@@ -1093,6 +1095,7 @@ impl<'a> Gen<'a> {
             self.stack_probe(frame);
             self.a.add_any(SP, SP, -frame);
             self.callee_saves(true);
+            self.tail = crate::tail::sibling_calls(options, self.f, &reach, crate::tail::Arch::Arm64);
             if self.dom_read.first() == Some(&true) {
                 self.dom_base();
             }
@@ -1221,7 +1224,17 @@ impl<'a> Gen<'a> {
                         }
                     }
                 }
+                if self.tail.get(bi) == Some(&Some(ii)) {
+                    if let Inst::Call(c, args, _) = inst {
+                        self.tail_call(c, args);
+                    }
+                    break;
+                }
                 self.inst(options, inst);
+            }
+            // a sibling call ended the block: its Ret is the callee's
+            if self.tail.get(bi).is_some_and(|t| t.is_some()) {
+                continue;
             }
             self.pc_map.push(((self.a.pos() * 4) as u32, b.term_pos));
             let fuse_inst = if fused { Some(b.insts[n - 1].clone()) } else { None };
@@ -3154,10 +3167,59 @@ impl<'a> Gen<'a> {
     }
 
     fn epilogue(&mut self) {
+        self.frame_exit();
+        self.a.ret();
+    }
+
+    /// The epilogue up to its `ret`: callee-saved registers back, the frame record popped.
+    fn frame_exit(&mut self) {
         self.callee_saves(false);
         self.a.mov_sp(SP, FP);
         self.a.ldp_post(FP, LR, SP, 16);
-        self.a.ret();
+    }
+
+    /// A sibling call (tail::sibling_calls): the arguments into the callee's registers, this
+    /// frame gone (lr = this function's return address), then `b` / `br x16`.
+    fn tail_call(&mut self, c: &Callee, args: &[VReg]) {
+        if let Callee::Indirect(v) | Callee::CIndirect(v, _) = c {
+            let r = self.use_i(*v, IP0);
+            self.a.mov(IP0, r);
+        }
+        let mut mv = Vec::new();
+        match c {
+            Callee::CFn(_, sig) | Callee::CIndirect(_, sig) => {
+                let plan = cabi::plan(sig, sig.conv.target());
+                for (k, ap) in plan.args.iter().enumerate() {
+                    match ap {
+                        ArgPlan::Scalar(PLoc::Int(r), _) => mv.push((MLoc::R(*r), self.mloc(args[k]))),
+                        ArgPlan::Scalar(PLoc::Flt(x), _) => mv.push((MLoc::F(*x), self.mloc(args[k]))),
+                        _ => unreachable!("tail call with a memory argument"),
+                    }
+                }
+            }
+            _ => {
+                let (mut ni, mut nf) = (0u8, 0u8);
+                for a in args {
+                    if self.cls(*a) == Cls::I {
+                        mv.push((MLoc::R(ni), self.mloc(*a)));
+                        ni += 1;
+                    } else {
+                        mv.push((MLoc::F(nf), self.mloc(*a)));
+                        nf += 1;
+                    }
+                }
+            }
+        }
+        self.moves(&mv);
+        self.frame_exit();
+        match c {
+            Callee::Fn(id) | Callee::CFn(id, _) => {
+                let at = self.a.pos();
+                self.a.e(0x1400_0000);
+                self.relocs.push(RelocAt { at: (at * 4) as u32, kind: RelocKind::A64Branch26, target: Reloc::Call(*id) });
+            }
+            _ => self.a.br(IP0),
+        }
     }
 
     fn term(&mut self, t: &Term, bi: usize, fused: Option<Inst>) {
@@ -4248,6 +4310,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         f,
         al,
         frame: 0,
+        tail: Vec::new(),
         saved: 0,
         slot_off: Vec::new(),
         slot_pos: Vec::new(),

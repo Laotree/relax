@@ -7799,6 +7799,8 @@ pub struct Prep {
     /// inline candidates whose own optimisation is deferred to the back end (split compiles):
     /// (slot, inline attributes if inlinable, their preparation)
     deferred: Vec<(u32, Option<u8>, Prep)>,
+    /// nounwind answers for its tail-shaped invokes (tail_nounwind_facts)
+    facts: Vec<(u32, bool)>,
 }
 
 /// Type check + lower `id`, and build the RIR of the callees O1 may inline (under the
@@ -8095,8 +8097,107 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     }
     let name = u.fns[id as usize].name.to_string();
     let relayout = layout_for(options, &name);
+    // (their builds count as nested, like the inline candidates')
+    let tn = cpu_ns();
+    let facts = tail_nounwind_facts(up, &func, if baseline { RirMode::Baseline } else { RirMode::Tier0 });
+    nested_ns += cpu_ns() - tn;
     let prep_ns = (cpu_ns() - t0).saturating_sub(nested_ns);
-    Ok((Prep { func, cfg, callees: snap, ro: u.ro_reader(), relayout, name, deferred }, prep_ns))
+    let u = &*up;
+    Ok((Prep { func, cfg, callees: snap, ro: u.ro_reader(), relayout, name, deferred, facts }, prep_ns))
+}
+
+/// Answers for the callees of tail-shaped invokes -- the call's results go straight to the Ret
+/// and only its unwind edge runs code here, as an `extern "C"` body's cannot-unwind guard does.
+/// A callee known not to unwind makes the invoke a plain call, which the back end then makes a
+/// sibling call (relax_backend::tail): LLVM's FunctionAttrs nounwind + invoke-to-call, which is
+/// what keeps a threaded interpreter of `extern "C"` handlers (makepad_stitch) in constant stack.
+/// A callee and the warm callees it reaches (depth-limited) get their RIR built for the answer, as
+/// inline candidates do (the call runs right before this body returns): the answer depends on
+/// the source, not on what happened to be compiled first. Every answer consulted, transitively,
+/// becomes a nounwind input of the body (store_rir notes them, the cache certifies them).
+/// Recursive and unbuildable callees are false, and so is any panic path.
+unsafe fn tail_nounwind_facts(up: *mut Unit, f: &relax_backend::rir::Func, mode: RirMode) -> Vec<(u32, bool)> {
+    use relax_backend::rir::{Callee, Inst, Term};
+    let mut facts = Vec::new();
+    for b in &f.blocks {
+        let Term::Invoke(n, _) = b.term else { continue };
+        let Some(Inst::Call(Callee::Fn(c), _, rets)) = b.insts.last() else { continue };
+        if !relax_backend::tail::returns_results(f, n as usize, 0, rets) {
+            continue;
+        }
+        known_nounwind(up, *c, 3, mode, &mut facts);
+    }
+    facts.sort_unstable();
+    facts
+}
+
+unsafe fn known_nounwind(up: *mut Unit, c: u32, depth: u32, mode: RirMode, facts: &mut Vec<(u32, bool)>) -> bool {
+    use relax_backend::rir::{Callee, Inst, Term};
+    if let Some(&(_, v)) = facts.iter().find(|x| x.0 == c) {
+        return v;
+    }
+    // asked while its own answer is open (recursion): false
+    facts.push((c, false));
+    let v = 'v: {
+        if (c as usize) >= (&*up).fns.len() || matches!((&*up).fns[c as usize].key, FnKey::Sandbox(_) | FnKey::Plain(_)) {
+            break 'v false;
+        }
+        if (&*up).fns[c as usize].rir.is_none() {
+            let e = &(&*up).fns[c as usize];
+            if e.build_err.is_some() {
+                break 'v false;
+            }
+            if e.inflight {
+                wait_inflight(up, c);
+            }
+            let e = &(&*up).fns[c as usize];
+            if e.rir.is_none() && e.building {
+                // open in an earlier request lower on the owner's stack: this build depends on that timing
+                if !open_here(c) {
+                    TAINTED.with(|t| t.set(true));
+                }
+                break 'v false;
+            }
+            if e.rir.is_none() && build_rir_mode(up, c, mode).is_err() {
+                break 'v false;
+            }
+        }
+        let Some(r) = (&*up).fns[c as usize].rir.clone() else { break 'v false };
+        let reach = relax_backend::regalloc::reachable(&r);
+        let cold = cold_blocks(&*up, &r);
+        // first what needs no callee: a Resume, a call that may unwind, any call on a panic path
+        let mut fns = Vec::new();
+        for (bi, b) in r.blocks.iter().enumerate() {
+            if !reach[bi] {
+                continue;
+            }
+            if matches!(b.term, Term::Resume) {
+                break 'v false;
+            }
+            let n = b.insts.len();
+            for (k, i) in b.insts.iter().enumerate() {
+                let Inst::Call(callee, _, _) = i else { continue };
+                if k + 1 == n && matches!(b.term, Term::Invoke(..)) {
+                    continue;
+                }
+                match callee {
+                    Callee::Fn(x) if !cold[bi] && depth > 0 => fns.push(*x),
+                    _ if relax_codegen::opt::may_unwind(callee, &|x| r.nounwind_inputs.iter().any(|f| f.0 == x && f.1)) => break 'v false,
+                    _ => {}
+                }
+            }
+        }
+        for x in fns {
+            if !known_nounwind(up, x, depth - 1, mode, facts) {
+                break 'v false;
+            }
+        }
+        true
+    };
+    if let Some(e) = facts.iter_mut().find(|x| x.0 == c) {
+        e.1 = v;
+    }
+    v
 }
 
 /// Callee `c` calls caller `id` back directly (mutual recursion: derived impls of mutually
@@ -8192,10 +8293,14 @@ pub unsafe fn backend_bench(up: *mut Unit) {
 
 fn optimize_rir(options: &crate::options::Options, id: u32, prep: Prep) -> Result<(relax_backend::rir::Func, Vec<(u32, usize)>), String> {
     let _census_opt = relax_codegen::exec_census::phase(4);
-    let Prep { func, cfg, callees, ro, relayout, name, deferred } = prep;
+    let Prep { func, cfg, callees, ro, relayout, name, deferred, facts } = prep;
     debug_assert!(deferred.is_empty());
     if func.baseline {
         let mut func = func;
+        if !facts.is_empty() {
+            relax_codegen::opt::demote_invokes(&mut func, &|c| facts.iter().any(|x| x.0 == c && x.1));
+            func.nounwind_inputs = facts;
+        }
         let mut inlined = Vec::new();
         if cfg.inline && !callees.is_empty() {
             let get = |c: u32| -> Option<(*const relax_backend::rir::Func, u8)> { callees.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const relax_backend::rir::Func, x.2)) };
@@ -8205,7 +8310,7 @@ fn optimize_rir(options: &crate::options::Options, id: u32, prep: Prep) -> Resul
             relax_backend::stats::pass_time(5, ti);
         }
         baseline_rir(options, &mut func, ro);
-        // No callee facts were queried: missing nounwind answers conservatively mean false.
+        // Only tail_nounwind_facts were asked: other missing answers conservatively mean false.
         verify_pass(&func, "baseline");
         if let Some(w) = debug_env().0.as_deref() {
             if dump_rir_match(&name, w) { eprintln!("{}", func.dump()); }
@@ -8215,6 +8320,9 @@ fn optimize_rir(options: &crate::options::Options, id: u32, prep: Prep) -> Resul
     let queries = crate::nounwind::QueryCx::new(&callees);
     let mut capture = None;
     let result = queries.optimize(id, func, &mut |func, nounwind| {
+        // the candidates' answers, and the tail-shaped invokes' (tail_nounwind_facts)
+        let known = |c: u32| nounwind(c) || facts.iter().any(|x| x.0 == c && x.1);
+        let nounwind: &dyn Fn(u32) -> bool = &known;
         let mut inlined = Vec::new();
         if cfg.inline {
             let get = |c: u32| -> Option<(*const relax_backend::rir::Func, u8)> { callees.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const relax_backend::rir::Func, x.2)) };
@@ -8248,6 +8356,16 @@ fn optimize_rir(options: &crate::options::Options, id: u32, prep: Prep) -> Resul
         }
         Ok(inlined)
     });
+    let mut result = result;
+    if let Ok((optimized, _)) = &mut result {
+        for &(c, v) in &facts {
+            match optimized.nounwind_inputs.iter_mut().find(|x| x.0 == c) {
+                Some(x) => x.1 |= v,
+                None => optimized.nounwind_inputs.push((c, v)),
+            }
+        }
+        optimized.nounwind_inputs.sort_unstable();
+    }
     if let (Some(mut input), Ok((optimized, _))) = (capture, &result) {
         input.nounwind_inputs = optimized.nounwind_inputs.clone();
         BENCH_CAPTURE.lock().unwrap().push((input, cfg, ro, relayout));

@@ -934,6 +934,8 @@ struct Gen<'a> {
     frame: i32,
     /// no rbp frame at all (frameless_leaf)
     frameless: bool,
+    /// per block: the index of its sibling call (tail::sibling_calls; empty: none)
+    tail: Vec<Option<usize>>,
     text_len: u32,
     /// a single-use float constant whose use (the next FBin) reads it from the pool
     mem_const: Option<(VReg, u64)>,
@@ -1395,6 +1397,7 @@ impl<'a> Gen<'a> {
         }
         self.frame = frame;
         self.frameless = frame == 0 && self.frameless_leaf(options, &reach);
+        self.tail = crate::tail::sibling_calls(options, self.f, &reach, crate::tail::Arch::X64);
         if !self.frameless {
             self.a.push(RBP);
             self.a.mov_rr(RBP, RSP);
@@ -1618,7 +1621,17 @@ impl<'a> Gen<'a> {
                         }
                     }
                 }
+                if self.tail.get(bi) == Some(&Some(ii)) {
+                    if let Inst::Call(c, args, _) = inst {
+                        self.tail_call(options, c, args);
+                    }
+                    break;
+                }
                 self.inst(options, inst);
+            }
+            // a sibling call ended the block: its Ret is the callee's
+            if self.tail.get(bi).is_some_and(|t| t.is_some()) {
+                continue;
             }
             self.pc_map.push((self.a.pos() as u32, b.term_pos));
             if self.rir_map_on {
@@ -2420,6 +2433,12 @@ impl<'a> Gen<'a> {
     }
 
     fn epilogue(&mut self) {
+        self.frame_exit();
+        self.a.ret();
+    }
+
+    /// The epilogue up to its `ret`: the frame gone, callee-saved registers back.
+    fn frame_exit(&mut self) {
         self.win64_saves(false);
         if self.frame != 0 {
             self.a.lea(RSP, RBP, -self.saved);
@@ -2436,7 +2455,65 @@ impl<'a> Gen<'a> {
         if self.ymm {
             self.a.vzeroupper();
         }
-        self.a.ret();
+    }
+
+    /// A sibling call (tail::sibling_calls): the arguments into the callee's registers, this
+    /// frame gone, then a jump: the callee returns to this function's caller.
+    fn tail_call(&mut self, options: &relax_session::Options, c: &Callee, args: &[VReg]) {
+        if let Callee::Indirect(v) | Callee::CIndirect(v, _) = c {
+            let r = self.use_i(options, *v, R11);
+            self.a.mov_rr(R11, r);
+        }
+        let mut moves = Vec::new();
+        let mut n_flt = 0;
+        match c {
+            Callee::CFn(_, sig) | Callee::CIndirect(_, sig) => {
+                let plan = cabi::plan(sig, sig.conv.target());
+                n_flt = plan.n_flt;
+                for (k, ap) in plan.args.iter().enumerate() {
+                    let dst = match ap {
+                        ArgPlan::Scalar(PLoc::Int(r), _) => MLoc::R(INT_ARGS[*r as usize]),
+                        ArgPlan::Scalar(PLoc::Flt(x), _) => MLoc::F(*x),
+                        _ => unreachable!("tail call with a memory argument"),
+                    };
+                    if let Some(s2) = self.mloc(args[k]) {
+                        moves.push((dst, s2));
+                    }
+                }
+            }
+            _ => {
+                let (mut ni, mut nf) = (0, 0);
+                for a in args {
+                    let dst = if self.f.vregs[a.0 as usize] == Cls::I {
+                        ni += 1;
+                        MLoc::R(INT_ARGS[ni - 1])
+                    } else {
+                        nf += 1;
+                        MLoc::F(nf as u8 - 1)
+                    };
+                    if let Some(s2) = self.mloc(*a) {
+                        moves.push((dst, s2));
+                    }
+                }
+            }
+        }
+        for (d, s2) in regalloc::seq_moves(&moves, R10, XS) {
+            self.mv(d, s2);
+        }
+        if matches!(c, Callee::CIndirect(..)) {
+            // SysV: al = vector registers used (as the call sets it)
+            self.a.mov_ri(RAX, n_flt as i64);
+        }
+        self.frame_exit();
+        match c {
+            Callee::Fn(id) | Callee::CFn(id, _) => {
+                self.a.byte(0xe9);
+                let at = self.a.pos();
+                self.a.u32(0);
+                self.relocs.push(RelocAt { at: at as u32, kind: RelocKind::X64Branch32, target: Reloc::Call(*id) });
+            }
+            _ => self.a.jmp_r(R11),
+        }
     }
 
     /// Blocks whose code is only their `jmp`: a block (not the entry) of moves the allocator
@@ -5650,6 +5727,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         thru: Vec::new(),
         frame: 0,
         frameless: false,
+        tail: Vec::new(),
         text_len: 0,
         mem_const: None,
         test_fuse: None,
