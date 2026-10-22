@@ -8,6 +8,7 @@
 //! and lines of JIT frames ask the owner (Job class: served inside its pumps too), with a short
 //! timeout after which the reply says what it could not resolve.
 
+pub mod answer;
 pub mod client;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod cfi;
@@ -277,8 +278,10 @@ fn role(name: &str, os_id: u64, handle: u64) -> &'static str {
     let _ = os_id;
     match name {
         n if n.starts_with("run-inspect") || n.starts_with("makepad-remote") => "inspect",
-        n if n.starts_with("run-spec") || n.starts_with("run-O2") || n.starts_with("run-o3") || n.starts_with("run-ahead") || n == "gandalf" || n.starts_with("run-check") => "compiler",
+        n if n.starts_with("run-spec") || n.starts_with("run-O2") || n.starts_with("run-o3") || n.starts_with("run-ahead") || n.starts_with("gandalf") || n.starts_with("run-check") => "compiler",
         n if n.starts_with("run-") => "makepad run",
+        // an unnamed thread: the OS's dispatch workers, or a program thread spawned without a name
+        "" => "unnamed",
         _ => "program",
     }
 }
@@ -370,7 +373,7 @@ pub mod capture {
         }
         let ms = crate::clock::wall_ns().saturating_sub(SINCE_NS.load(Relaxed)) / 1_000_000;
         let doing = super::activity::describe(h).map(|d| format!(": {}", d)).unwrap_or_default();
-        Some(format!("capture lock held for {} by T{} for {:.1} s{}", super::activity::unpack(WHAT.load(Relaxed)), h, ms as f64 / 1000.0, doing))
+        Some(format!("capture lock held for {} by {} for {:.1} s{}", super::activity::unpack(WHAT.load(Relaxed)), super::tid_label(h), ms as f64 / 1000.0, doing))
     }
 }
 
@@ -465,7 +468,7 @@ pub mod activity {
         let ph = unpack(s.phase.load(Relaxed));
         let pms = now.saturating_sub(s.phase_ns.load(Relaxed)) / 1_000_000;
         let d = s.detail.load(Relaxed);
-        let on = if d != 0 { format!(" T{}", d) } else { String::new() };
+        let on = if d != 0 { format!(" {}", super::tid_label(d)) } else { String::new() };
         let mut t = format!("{} for {:.1} s; now: {}{} for {} ms", cmd, since, ph, on, pms);
         if ph == "waiting for the owner" {
             t.push_str(&format!(" (owner serves {})", crate::owner::serving_note()));
@@ -516,6 +519,11 @@ pub struct Frame {
     pub module: String,
     /// JIT frames: the code version as a JSON object (codever::frame_fields); else empty
     pub code: String,
+    /// JIT frames: the slot whose code it is (the physical fn)
+    pub slot: Option<u32>,
+    /// an inlined copy: its logical frames, innermost first, ending with the physical fn at the
+    /// call site (fn, file:line:col); empty for a fn's own code
+    pub levels: Vec<(String, String)>,
 }
 
 /// Names for raw pcs: JIT frames by the unit (one owner Job request; on timeout `slot#id+off`),
@@ -547,12 +555,12 @@ pub fn symbolise_within(frames: &[Vec<u64>], partial: &mut Vec<String>, ms: u64)
                 .map(|(i, &pc)| {
                     let look = if i == 0 { pc } else { pc.wrapping_sub(1) };
                     if let Ok(k) = jit_pcs.binary_search(&look) {
-                        let (name, at, tier, code) = names[k].clone();
-                        Frame { pc, name, at, module: tier, code }
+                        let n = names[k].clone();
+                        Frame { pc, name: n.name, at: n.at, module: n.module, code: n.code, slot: n.slot, levels: n.levels }
                     } else {
                         match symbols::host_symbol(look) {
-                            Some((name, module, _)) => Frame { pc, name, at: String::new(), module, code: String::new() },
-                            None => Frame { pc, name: format!("{:#x}", pc), at: String::new(), module: "?".into(), code: String::new() },
+                            Some((name, module, _)) => Frame { pc, name, at: String::new(), module, code: String::new(), slot: None, levels: Vec::new() },
+                            None => Frame { pc, name: format!("{:#x}", pc), at: String::new(), module: "?".into(), code: String::new(), slot: None, levels: Vec::new() },
                         }
                     }
                 })
@@ -561,13 +569,33 @@ pub fn symbolise_within(frames: &[Vec<u64>], partial: &mut Vec<String>, ms: u64)
         .collect()
 }
 
+/// A JIT pc's frame fields.
+#[derive(Clone)]
+struct JitName {
+    name: String,
+    at: String,
+    module: String,
+    code: String,
+    slot: Option<u32>,
+    levels: Vec<(String, String)>,
+}
+
+impl JitName {
+    fn of(t: (String, String, String, String), slot: Option<u32>, levels: Vec<(String, String)>) -> JitName {
+        JitName { name: t.0, at: t.1, module: t.2, code: t.3, slot, levels }
+    }
+    fn unknown(pc: u64) -> JitName {
+        JitName::of((format!("jit {:#x}", pc), String::new(), "jit".into(), String::new()), None, Vec::new())
+    }
+}
+
 /// (name, file:line:col, module label, code version JSON) of JIT pcs: the code version (slot,
 /// tier, origin, address, installed / replaced / retired) and, for a pc in an inlined copy, the
-/// inlined fn's name with "inlined into <slot>".
-fn jit_names(pcs: &[u64], partial: &mut Vec<String>, ms: u64) -> Vec<(String, String, String, String)> {
+/// inlined fn's name with "inlined into <slot>" and its logical frames.
+fn jit_names(pcs: &[u64], partial: &mut Vec<String>, ms: u64) -> Vec<JitName> {
     let up = crate::jit::current_unit();
     if pcs.is_empty() || up.is_null() {
-        return pcs.iter().map(|pc| (format!("jit {:#x}", pc), String::new(), "jit".into(), String::new())).collect();
+        return pcs.iter().map(|&pc| JitName::unknown(pc)).collect();
     }
     let pcs_v = pcs.to_vec();
     activity::phase("waiting for the owner", 0);
@@ -578,8 +606,11 @@ fn jit_names(pcs: &[u64], partial: &mut Vec<String>, ms: u64) -> Vec<(String, St
         pcs_v
             .iter()
             .map(|&pc| match codever::describe_pc(u, &mut res, pc) {
-                Some(c) => codever::frame_fields(u, &c),
-                None => (format!("jit {:#x}", pc), String::new(), "jit".into(), String::new()),
+                Some(c) => {
+                    let levels = c.inlined.as_ref().map(|i| i.stack.iter().map(|(n, _, at)| (n.clone(), at.clone())).collect()).unwrap_or_default();
+                    JitName::of(codever::frame_fields(u, &c), Some(c.slot), levels)
+                }
+                None => JitName::unknown(pc),
             })
             .collect::<Vec<_>>()
     });
@@ -590,7 +621,7 @@ fn jit_names(pcs: &[u64], partial: &mut Vec<String>, ms: u64) -> Vec<(String, St
             // the code index is a leaf lock: slot ids and code versions without the owner
             let u = unsafe { &*up };
             pcs.iter()
-                .map(|&pc| codever::frame_fields_no_owner(u, pc).unwrap_or_else(|| (format!("jit {:#x}", pc), String::new(), "jit".into(), String::new())))
+                .map(|&pc| codever::frame_fields_no_owner(u, pc).map(|t| JitName::of(t, None, Vec::new())).unwrap_or_else(|| JitName::unknown(pc)))
                 .collect()
         }
     }
@@ -632,6 +663,18 @@ pub(crate) fn staged_path(name: &str) -> String {
     dir.join(name).to_string_lossy().into_owned()
 }
 
+/// A frame of Relax's std / core (by its fn path; the line table of generated std glue can point
+/// anywhere), not the program's.
+pub(crate) fn is_std_fn(name: &str) -> bool {
+    let n = name.strip_prefix("{closure} in ").unwrap_or(name).trim_start_matches('<');
+    ["core::", "std::", "alloc::"].iter().any(|p| n.starts_with(p))
+}
+
+/// The program's own JIT frame: not std, not a JIT trampoline, not an unidentified inline level.
+pub(crate) fn is_program_frame(f: &Frame) -> bool {
+    f.module.starts_with("jit") && !is_std_fn(&f.name) && !f.name.starts_with("jit 0x") && !f.name.starts_with("(inlined") && !f.name.starts_with("slot#")
+}
+
 /// One frame as a short JSON object.
 pub fn frame_json(f: &Frame) -> String {
     let code = if f.code.is_empty() { String::new() } else { format!(",\"code\":{}", f.code) };
@@ -653,13 +696,54 @@ pub fn short(s: &str, n: usize) -> String {
     format!("{}..", &s[..k])
 }
 
+/// Short thread ids (`T3`): numbered in the order inspect first saw each thread (the threads alive
+/// at the first answer in OS id order, so main is T1), stable for the life of the process. Every
+/// answer names threads by them and every `thread=` argument takes them.
+static TIDS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+fn tid_index(os_id: u64) -> usize {
+    let mut t = TIDS.lock().unwrap_or_else(|e| e.into_inner());
+    if t.is_empty() {
+        let mut all: Vec<u64> = threads::list().iter().map(|x| x.os_id).collect();
+        all.sort_unstable();
+        // the process's first thread first (Linux: os id == pid)
+        let pid = std::process::id() as u64;
+        if let Some(i) = all.iter().position(|&x| x == pid) {
+            all.remove(i);
+            all.insert(0, pid);
+        }
+        *t = all;
+    }
+    match t.iter().position(|&x| x == os_id) {
+        Some(i) => i + 1,
+        None => {
+            t.push(os_id);
+            t.len()
+        }
+    }
+}
+
+/// `T<n>` of an OS thread id.
+pub fn tid_label(os_id: u64) -> String {
+    format!("T{}", tid_index(os_id))
+}
+
+/// The OS thread id a `T<n>` names (None: not a thread id inspect gave out).
+pub fn tid_of(label: &str) -> Option<u64> {
+    let n: usize = label.strip_prefix('T')?.parse().ok()?;
+    if TIDS.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        tid_index(0);
+    }
+    TIDS.lock().unwrap_or_else(|e| e.into_inner()).get(n.checked_sub(1)?).copied()
+}
+
 /// The thread a registry handle names, as a short label.
 pub fn thread_label(handle: u64, threads: &[threads::Thread]) -> String {
     if handle == 0 {
         return "?".into();
     }
     match threads.iter().find(|t| t.handle == handle) {
-        Some(t) => format!("{} (T{})", if t.name.is_empty() { "-" } else { &t.name }, t.os_id),
+        Some(t) => format!("{} ({})", if t.name.is_empty() { "-" } else { &t.name }, tid_label(t.os_id)),
         None => format!("thread {:#x}", handle),
     }
 }
@@ -692,8 +776,8 @@ fn cmd_threads(out: &mut Out) {
             wait.push_str(&format!(",\"inspect\":{}", json_str(&d)));
         }
         out.line(&format!(
-            "{{\"id\":\"T{}\",\"name\":{},\"role\":\"{}\",\"state\":\"{}\",\"cpu_ms\":{}{}}}",
-            t.os_id,
+            "{{\"id\":\"{}\",\"name\":{},\"role\":\"{}\",\"state\":\"{}\",\"cpu_ms\":{}{}}}",
+            tid_label(t.os_id),
             json_str(&t.name),
             role(&t.name, t.os_id, t.handle),
             t.state,
@@ -704,12 +788,23 @@ fn cmd_threads(out: &mut Out) {
 }
 
 pub fn wait_text(w: &crate::waits::Wait, list: &[threads::Thread]) -> String {
-    let ms = crate::clock::wall_ns().saturating_sub(w.since_ns) / 1_000_000;
+    let ms_n = crate::clock::wall_ns().saturating_sub(w.since_ns) / 1_000_000;
+    // "for 812 ms", "for 40.9 s"
+    let ms = if ms_n >= 10_000 { format!("{:.1} s", ms_n as f64 / 1000.0) } else { format!("{} ms", ms_n) };
     let kind = crate::waits::KIND_NAMES[w.kind as usize];
     match w.kind {
-        crate::waits::Kind::Futex => format!("{} {:#x} for {} ms", if w.label.is_empty() { "futex" } else { w.label }, w.object, ms),
-        crate::waits::Kind::Owner => format!("owner ({} request) for {} ms; owner serves {}", w.label, ms, crate::owner::serving_note()),
-        _ => format!("{} held by {} for {} ms", kind, thread_label(w.holder, list), ms),
+        crate::waits::Kind::Futex => {
+            // a mutex names its holder by a stack page: the thread whose stack holds it
+            let page = (w.holder >> 1) & 0x3fff_ffff;
+            let held = (w.holder != 0)
+                .then(|| list.iter().find(|t| t.stack.0 != 0 && (t.stack.0 >> 12..=t.stack.1 >> 12).any(|p| p & 0x3fff_ffff == page)))
+                .flatten()
+                .map(|t| format!(" held by {} ({})", if t.name.is_empty() { "-" } else { &t.name }, tid_label(t.os_id)))
+                .unwrap_or_default();
+            format!("{} {:#x}{} for {}", if w.label.is_empty() { "futex" } else { w.label }, w.object, held, ms)
+        }
+        crate::waits::Kind::Owner => format!("owner ({} request) for {}; owner serves {}", w.label, ms, crate::owner::serving_note()),
+        _ => format!("{} held by {} for {}", kind, thread_label(w.holder, list), ms),
     }
 }
 
@@ -719,7 +814,7 @@ pub(crate) fn pick_threads(sel: &str) -> Box<dyn Fn(&threads::Thread) -> bool> {
         "all" | "" => true,
         "main" => t.handle != 0 && t.handle == crate::jit::MAIN_TID.load(Relaxed) || t.os_id == std::process::id() as u64,
         "owner" => t.handle != 0 && t.handle == crate::owner::owner_tid(),
-        s => s.trim_start_matches('T').parse::<u64>().map_or(false, |id| id == t.os_id) || t.name.starts_with(s),
+        s => tid_of(s).is_some_and(|id| id == t.os_id) || t.name.starts_with(s),
     })
 }
 
@@ -744,7 +839,7 @@ fn cmd_stacks(req: &Req, out: &mut Out) {
         }
     }
     for (key, members) in &groups {
-        let names: Vec<String> = members.iter().map(|&i| json_str(&format!("{} (T{})", caps[i].t.name, caps[i].t.os_id))).collect();
+        let names: Vec<String> = members.iter().map(|&i| json_str(&format!("{} ({})", caps[i].t.name, tid_label(caps[i].t.os_id)))).collect();
         let c = &caps[members[0]];
         let mut err = c.err.map(|e| format!(",\"err\":{}", json_str(e))).unwrap_or_default();
         if c.t.handle != 0 && instrument::stopped(&c.t) {
@@ -762,7 +857,7 @@ fn cmd_waits(out: &mut Out) {
     // inspect's own command threads (a stuck command says on what) and the capture lock
     for (tid, d) in activity::all() {
         let name = list.iter().find(|t| t.os_id == tid).map(|t| t.name.as_str()).unwrap_or("makepad-remote-cmd");
-        out.line(&format!("{{\"thread\":{},\"inspect\":{}}}", json_str(&format!("{} (T{})", name, tid)), json_str(&d)));
+        out.line(&format!("{{\"thread\":{},\"inspect\":{}}}", json_str(&format!("{} ({})", name, tid_label(tid))), json_str(&d)));
     }
     if let Some(h) = capture::holder_note() {
         out.line(&format!("{{\"capture_lock\":{}}}", json_str(&h)));
