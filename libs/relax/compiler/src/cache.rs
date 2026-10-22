@@ -876,6 +876,21 @@ impl Cache {
             }
             c.stores.push(st);
         }
+        // the program's stores by role (its store set, write_sets): keyed by its root crate (the
+        // last one loaded)
+        if let Some(root) = c.crate_ident.last() {
+            let mut roles = std::collections::BTreeMap::new();
+            let name = |p: &PathBuf| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            for (ci, id) in c.crate_ident.iter().enumerate() {
+                if let Some(p) = c.crate_path.get(ci) { roles.insert(format!("front {id:032x}"), name(p)); }
+                if let Some(p) = c.code_path.get(ci) { roles.insert(format!("code {id:032x}"), name(p)); }
+            }
+            if let Some(g) = prog.front_graph.as_ref() {
+                roles.insert("graph".to_string(), name(&front_graph_path(&dir, g.identity)));
+                roles.insert("collected".to_string(), name(&collected::path(&dir, g.identity)));
+            }
+            crate::store::note_program(*root as u64, roles);
+        }
         // other Relax builds' files and the cap: pruned off the start's critical path, after
         // this run's stores are open (so marked live: store::live)
         if mode != Mode::ReadOnly {
@@ -3083,7 +3098,7 @@ const IN_USE_BY_OTHERS: std::time::Duration = std::time::Duration::from_secs(10 
 /// Only checked store files are ever deleted. Returns (bytes before, after).
 pub fn prune_root(root: &std::path::Path) -> (u64, u64) {
     let cap = std::env::var("MAKEPAD_RUN_CACHE_MAX").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20);
-    prune(root, &crate::store::live(), &crate::store::open_files(), cap)
+    prune(root, &crate::store::live(), &crate::store::open_files(), &crate::store::programs(), cap)
 }
 
 /// At exit: every store's replaced generations go, including the ones this process itself
@@ -3115,7 +3130,7 @@ pub fn retire_replaced_in_use() {
 
 /// prune_root with this run's stores `live` (generation 0 paths), the generation files it opened
 /// `open`, and the cap in bytes (None: the default).
-fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf>, cap: Option<u64>) -> (u64, u64) {
+fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf>, programs: &[(u64, std::collections::BTreeMap<String, String>)], cap: Option<u64>) -> (u64, u64) {
     let mut before = 0u64;
     let dir = root.join("cache");
     let mut files: Vec<(std::time::SystemTime, PathBuf, u64)> = match std::fs::read_dir(&dir) {
@@ -3149,12 +3164,14 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
     // other builds' stores, by build (a store being written right now, or unreadable, has no
     // build here and is left to the cap)
     let me = crate::store::this_build();
+    let builds: HashMap<PathBuf, Option<u64>> = files.iter().map(|f| (f.1.clone(), crate::store::build_of(&f.1))).collect();
     let mut other: HashMap<u64, Vec<PathBuf>> = HashMap::new();
     for f in &files {
-        if let Some(b) = crate::store::build_of(&f.1).filter(|b| *b != me) {
+        if let Some(b) = builds[&f.1].filter(|b| *b != me) {
             other.entry(b).or_default().push(f.1.clone());
         }
     }
+    let sets = dir.join("sets");
     // ended builds whose stores are gone leave only their lock file
     for b in crate::store::lock_builds(&dir) {
         if b != me {
@@ -3170,18 +3187,45 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
                     retired.insert(p.clone());
                 }
             }
+            for n in set_files(&sets, *b) {
+                let _ = std::fs::remove_file(sets.join(n));
+            }
         });
         if !idle {
             running.extend(paths.iter().cloned());
         }
     }
     files.retain(|f| !retired.contains(&f.1));
+    let now = std::time::SystemTime::now();
+    let recent = |t: &std::time::SystemTime| now.duration_since(*t).map_or(true, |age| age < IN_USE_BY_OTHERS);
+    // this build's replaced variants (store sets, write_sets): a store a program's set named and
+    // its current set no longer names (an edit changed the crate's fingerprint, the graph's
+    // identity) goes, unless another set names it, this run uses it or a run stamped it recently
+    let name = |p: &PathBuf| crate::store::base_path(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let keep = |f: &(std::time::SystemTime, PathBuf, u64)| builds.get(&f.1).copied().flatten() != Some(me)
+        || live.contains(&crate::store::base_path(&f.1)) || open.contains(&f.1) || recent(&f.0);
+    let (named, dropped) = write_sets(&sets, me, programs);
+    files.retain(|f| {
+        let n = name(&f.1);
+        !(dropped.contains(&n) && !named.contains(&n) && !keep(f) && crate::store::delete_checked(&f.1))
+    });
+    // run stores (file images) no store refers to: once per process (the scan reads every store's
+    // references), at its first prune
+    static RUNS_CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if files.iter().any(|f| family(&name(&f.1)) == RUN_STORE_FAMILY && !keep(f)) && !RUNS_CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        // a store that cannot be read right now (a writer has it) may refer to any of them
+        let referenced: Option<HashSet<String>> = files.iter().filter(|f| family(&name(&f.1)) != RUN_STORE_FAMILY)
+            .map(|f| crate::store::peek(&f.1, KIND_FRONT_REF)).collect::<Option<Vec<_>>>()
+            .map(|v| v.iter().flatten().filter_map(|b| front_run::decode_ref(b).map(|(n, _)| n.to_string())).collect());
+        if let Some(referenced) = referenced { files.retain(|f| {
+            let n = name(&f.1);
+            !(family(&n) == RUN_STORE_FAMILY && !referenced.contains(&n) && !keep(f) && crate::store::delete_checked(&f.1))
+        }); }
+    }
     let mut total: u64 = files.iter().map(|f| f.2).sum();
     let live_bytes: u64 = files.iter().filter(|f| live.contains(&crate::store::base_path(&f.1))).map(|f| f.2).sum();
     let cap = cap.unwrap_or((CAP_FLOOR_MB << 20).max(2 * live_bytes));
-    let now = std::time::SystemTime::now();
     files.sort();
-    let recent = |t: &std::time::SystemTime| now.duration_since(*t).map_or(true, |age| age < IN_USE_BY_OTHERS);
     let mut evicted: HashSet<&PathBuf> = HashSet::new();
     for (t, p, len) in &files {
         if total <= cap {
@@ -3211,6 +3255,47 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
         );
     }
     (before, total)
+}
+
+/// The run stores' family (front_run.rs): file images, kept while a store refers to them.
+const RUN_STORE_FAMILY: &str = "front_run";
+
+/// A store name's family: the crate (or `front_graph`, `collected_graph`, `front_run`, ...)
+/// before its 16 hex.
+fn family(name: &str) -> &str {
+    name.rsplit_once('-').map_or(name, |x| x.0)
+}
+
+/// The set files of build `build` in `sets` (`<build hex>-<program hex>`).
+fn set_files(sets: &std::path::Path, build: u64) -> Vec<String> {
+    let prefix = format!("{build:016x}-");
+    std::fs::read_dir(sets).into_iter().flatten().flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.len() == 33 && n.starts_with(&prefix) && n.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
+        .collect()
+}
+
+/// Store sets: each program this process runs (`programs`, store::note_program) names the
+/// stores it uses, one per role (a crate's front store, its code store, the program's graph
+/// stores), in `<cache>/sets/<build>-<program>` (`role name` lines). Returns every store name the
+/// build's sets hold now, and the names this run's sets no longer hold (the previous run of
+/// the program named them).
+fn write_sets(sets: &std::path::Path, build: u64, programs: &[(u64, std::collections::BTreeMap<String, String>)]) -> (HashSet<String>, HashSet<String>) {
+    let mut dropped = HashSet::new();
+    if !programs.is_empty() && pack::ensure_private_dir(sets).is_ok() {
+        for (prog, roles) in programs {
+            let file = format!("{build:016x}-{prog:016x}");
+            let prev = std::fs::read_to_string(sets.join(&file)).unwrap_or_default();
+            let now: HashSet<&String> = roles.values().collect();
+            dropped.extend(prev.lines().filter_map(|l| l.rsplit_once(' ')).map(|(_, n)| n.to_string()).filter(|n| !now.contains(n)));
+            let text: String = roles.iter().map(|(r, n)| format!("{r} {n}\n")).collect();
+            let _ = pack::write_atomic_with(sets, &file, |f| std::io::Write::write_all(f, text.as_bytes()));
+        }
+    }
+    let named = set_files(sets, build).iter()
+        .flat_map(|n| std::fs::read_to_string(sets.join(n)).unwrap_or_default().lines().filter_map(|l| l.rsplit_once(' ').map(|x| x.1.to_string())).collect::<Vec<_>>())
+        .collect();
+    (named, dropped)
 }
 
 /// Each crate's longest dependency chain (core 0).
@@ -3958,10 +4043,23 @@ impl FrontImages {
         })
     }
     /// `why`: the last check reached (MAKEPAD_RUN_BOOT_TRACE names it when the image is not used)
+    /// Crate `c`'s image from the front store at `path`. Only a store whose image is taken is
+    /// marked as used by this run (store.rs mark_used): the variants a scan rejects stay unused
+    /// (cache.rs prune retires replaced variants).
     fn candidate(&self, options: &crate::options::Options, c: &crate::preload::PreCrate, deps: &[u128], path: &std::path::Path, why: &std::cell::Cell<&'static str>, selection: Option<(u128, &[String])>) -> Option<crate::crate_image::CrateImage> {
-        use crate::crate_image::{decode, CrateImage, Record};
         why.set("store open");
-        let st = std::sync::Arc::new(Store::open(path)?);
+        let st = std::sync::Arc::new(Store::open_unmarked(path)?);
+        let r = self.candidate_of(options, c, deps, &st, why, selection);
+        if r.is_some() {
+            st.mark_used();
+        }
+        r
+    }
+
+    fn candidate_of(&self, options: &crate::options::Options, c: &crate::preload::PreCrate, deps: &[u128], st: &std::sync::Arc<Store>, why: &std::cell::Cell<&'static str>, selection: Option<(u128, &[String])>) -> Option<crate::crate_image::CrateImage> {
+        use crate::crate_image::{decode, CrateImage, Record};
+        let st = st.clone();
+        let path = &st.path;
         why.set("no crate record");
         let (kind, b) = st.get(front_crate_key(&c.name, &c.root))?;
         if kind != KIND_FRONT_CRATE {
@@ -7060,19 +7158,19 @@ mod prune_tests {
         let live: HashSet<PathBuf> = used.iter().cloned().collect();
         let all: u64 = [&used[0], &used[1], &stale_old, &stale_new, &other_run].iter().map(|p| std::fs::metadata(p).unwrap().len()).sum();
         // one store over the cap: the least recently used one not in use goes
-        let (before, after) = prune(&root, &live, &HashSet::new(), Some(all - 1));
+        let (before, after) = prune(&root, &live, &HashSet::new(), &[], Some(all - 1));
         assert_eq!(before, all);
         assert!(!stale_old.exists());
         assert!(stale_new.exists());
         assert!(after < all);
         // a tiny cap: every unused store goes; the run's own and the other run's stay (reported)
-        let (_, after) = prune(&root, &live, &HashSet::new(), Some(1));
+        let (_, after) = prune(&root, &live, &HashSet::new(), &[], Some(1));
         assert!(!stale_new.exists());
         assert!(used.iter().all(|p| p.exists()));
         assert!(other_run.exists());
         assert!(after > 1);
         // the default cap (floor, or twice the run's stores) keeps what is left
-        assert_eq!(prune(&root, &live, &HashSet::new(), None).1, after);
+        assert_eq!(prune(&root, &live, &HashSet::new(), &[], None).1, after);
         // a rewritten store's older generation goes at the next prune (also a store this run
         // uses), unless this run itself reads that generation file
         let stale_gen = store("serde-00000000000000dd.rcs", 60);
@@ -7082,7 +7180,7 @@ mod prune_tests {
         let used_gen1 = crate::store::gen_path(&used[1], 1);
         std::fs::copy(&used[1], &used_gen1).unwrap();
         let open: HashSet<PathBuf> = [used[0].clone()].into_iter().collect();
-        prune(&root, &live, &open, None);
+        prune(&root, &live, &open, &[], None);
         assert!(!stale_gen.exists() && crate::store::gen_path(&stale_gen, 1).exists());
         assert!(used[0].exists() && used_gen.exists());
         assert!(!used[1].exists() && used_gen1.exists());
@@ -7092,6 +7190,61 @@ mod prune_tests {
         // the folder also holds this process's live lock (store::hold_build)
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir(&root).unwrap();
+    }
+
+    /// Store sets: a program's run names its store per role; a store the previous run's set named
+    /// that the program's set no longer names (an edit gave the crate another fingerprint, the
+    /// graph another identity, a crate left the program) goes unless another program's set names
+    /// it; a run store no store refers to goes; a store no set ever named, or one a run stamped
+    /// recently, stays (the cap's business).
+    #[test]
+    fn replaced_variants_retire_by_store_sets() {
+        isolated_test!(replaced_variants_retire_by_store_sets);
+        let root = std::env::temp_dir().join(format!("relax-sets-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        let dir = root.join("cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let store = |name: &str, entries: Vec<NewEntry>| -> PathBuf {
+            let p = dir.join(name);
+            crate::store::append(&p, entries, true).unwrap();
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(old).unwrap();
+            p
+        };
+        let data = || vec![NewEntry { key: 1, kind: KIND_DATA, payload: vec![7; 64] }];
+        let reference = |run: &str| vec![NewEntry { key: 2, kind: KIND_FRONT_REF, payload: front_run::encode_ref(&crate::parser::ImageLoc { store: run.into(), key: 9 }) }];
+        let run_kept = store("front_run-00000000000000a1.rcs", data());
+        let run_dead = store("front_run-00000000000000a2.rcs", data());
+        let widgets_v1 = store("widgets-0000000000000001.rcs", data());
+        let widgets_v2 = store("widgets-0000000000000011.rcs", data());
+        let lazy = store("lazy_crate-0000000000000002.rcs", reference("front_run-00000000000000a1.rcs"));
+        let graph_v1 = store("front_graph-0000000000000003.rcs", data());
+        let graph_v2 = store("front_graph-0000000000000013.rcs", data());
+        let removed = store("removed-0000000000000004.rcs", data());
+        let shared_v1 = store("shared-0000000000000005.rcs", data());
+        let shared_v2 = store("shared-0000000000000015.rcs", data());
+        let unnamed = store("unnamed-0000000000000006.rcs", data());
+        let me = crate::store::this_build();
+        let (prog, other) = (0x5eed_u64, 0x0ade_u64);
+        let sets = dir.join("sets");
+        std::fs::create_dir_all(&sets).unwrap();
+        std::fs::write(sets.join(format!("{me:016x}-{prog:016x}")), "front w widgets-0000000000000001.rcs\nfront l lazy_crate-0000000000000002.rcs\ngraph front_graph-0000000000000003.rcs\nfront r removed-0000000000000004.rcs\nfront s shared-0000000000000005.rcs\n").unwrap();
+        // another program of this build still uses the old `shared`
+        std::fs::write(sets.join(format!("{me:016x}-{other:016x}")), "front s shared-0000000000000005.rcs\n").unwrap();
+        let roles: std::collections::BTreeMap<String, String> = [("front w", "widgets-0000000000000011.rcs"), ("front l", "lazy_crate-0000000000000002.rcs"),
+            ("graph", "front_graph-0000000000000013.rcs"), ("front s", "shared-0000000000000015.rcs")].into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        let live: HashSet<PathBuf> = [widgets_v2.clone(), graph_v2.clone()].into_iter().collect();
+        // a recently stamped variant stays
+        std::fs::File::options().write(true).open(&removed).unwrap().set_modified(std::time::SystemTime::now()).unwrap();
+        prune(&root, &live, &HashSet::new(), &[(prog, roles)], Some(u64::MAX));
+        assert!(!widgets_v1.exists() && !graph_v1.exists(), "replaced variants go");
+        assert!(removed.exists(), "stamped recently");
+        assert!(shared_v1.exists(), "another program's set names it");
+        assert!(lazy.exists() && widgets_v2.exists() && graph_v2.exists() && shared_v2.exists());
+        assert!(unnamed.exists(), "never named: the cap's business");
+        assert!(run_kept.exists() && !run_dead.exists(), "run stores: kept while referenced");
+        let set = std::fs::read_to_string(sets.join(format!("{me:016x}-{prog:016x}"))).unwrap();
+        assert_eq!(set, "front l lazy_crate-0000000000000002.rcs\nfront s shared-0000000000000015.rcs\nfront w widgets-0000000000000011.rcs\ngraph front_graph-0000000000000013.rcs\n");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Another build's stores go at the next prune (no build but their own ever reads them),
@@ -7135,7 +7288,7 @@ mod prune_tests {
         let ended = dir.join("live").join(format!("{:016x}", me ^ 0x3333));
         std::fs::File::create(&ended).unwrap();
         let live: HashSet<PathBuf> = [mine_used.clone()].into_iter().collect();
-        prune(&root, &live, &HashSet::new(), Some(u64::MAX));
+        prune(&root, &live, &HashSet::new(), &[], Some(u64::MAX));
         assert!(!other_recent.exists() && !other_gen.exists() && !unnamed.exists());
         assert!(other_running.exists(), "a running build's stores stay");
         assert!(mine_old.exists() && mine_used.exists(), "this build's stores are the cap's business");
@@ -7144,12 +7297,12 @@ mod prune_tests {
         assert!(!ended.exists(), "an ended build's lock file goes");
         // that build's process ends: its stores go at the next prune
         drop(lock);
-        prune(&root, &live, &HashSet::new(), Some(u64::MAX));
+        prune(&root, &live, &HashSet::new(), &[], Some(u64::MAX));
         assert!(!other_running.exists());
         #[cfg(unix)]
         assert!(!dir.join("live").join(format!("{alive:016x}")).exists());
         // this build's stores: unchanged LRU under the cap (the run's own stay)
-        prune(&root, &live, &HashSet::new(), Some(1));
+        prune(&root, &live, &HashSet::new(), &[], Some(1));
         assert!(!mine_old.exists() && mine_used.exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
