@@ -21,6 +21,7 @@ pub mod instrument;
 pub mod patches;
 pub mod probes;
 pub mod mem;
+pub mod natbin;
 mod prof;
 pub mod timeline;
 pub mod vars;
