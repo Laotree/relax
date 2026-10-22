@@ -19,6 +19,7 @@ mod cpu;
 mod frames;
 mod hang;
 mod jit;
+mod live;
 mod memory;
 mod misc;
 #[cfg(test)]
@@ -68,6 +69,13 @@ pub fn render(req: &Request, lines: &[String]) -> String {
         ("mem", "timeline") => memory::mem_timeline(&mut a),
         ("versions", _) => jit::versions(&mut a),
         ("probes", _) => jit::probes(&mut a),
+        ("probe", "read") => jit::probe_read(&mut a),
+        ("src", _) => live::src(&mut a),
+        ("script", _) => live::script_errors(&mut a),
+        ("vm", _) => live::vm(&mut a),
+        ("verbs", _) => live::verbs(&mut a),
+        ("game", _) => live::game(&mut a),
+        ("writes", _) => live::writes(&mut a),
         ("timeline" | "frames", "frames") | ("frames", _) => misc::frames(&mut a),
         ("timeline" | "frame", "frame") | ("frame", _) => misc::frame(&mut a),
         ("hitch", _) => misc::hitch(&mut a),
