@@ -235,10 +235,20 @@ enum Shape {
     Other,
 }
 
+/// A slot's fn key, through a SPEC-V twin (`FnKey::Plain`, named `[unverified]`) to the slot it
+/// twins: the twin is the same fn body, so its item, scope and signature are the base's. (Probes
+/// and line hooks of unverified code -- most of a relaxed app -- refused "not a fn instance".)
+pub(super) fn base_key(u: &crate::jit::Unit, id: u32) -> &crate::jit::FnKey {
+    match &u.fns[id as usize].key {
+        crate::jit::FnKey::Plain(b) => &u.fns[*b as usize].key,
+        k => k,
+    }
+}
+
 /// The parameters of slot `id` (on the owner) and how they map onto `f`'s integer parameter words.
 fn arg_plan(u: &crate::jit::Unit, id: u32, f: &relax_backend::rir::Func) -> ArgPlan {
     use crate::types::TyKind;
-    let crate::jit::FnKey::Inst(d, gargs) = &u.fns[id as usize].key else { return ArgPlan::default() };
+    let crate::jit::FnKey::Inst(d, gargs) = base_key(u, id) else { return ArgPlan::default() };
     let Some(sig) = u.tcx.fn_sig(&u.prog, *d) else { return ArgPlan::default() };
     let mut names: Vec<String> = Vec::new();
     {
@@ -418,12 +428,15 @@ fn find_in(u: &crate::jit::Unit, query: &str, max: usize, inlined_too: bool) -> 
         let mut out = Vec::new();
         for id in 0..u.fns.len() {
             let f = &u.fns[id];
-            if !targetable(f, inlined_too) || !files.contains(&f.file) {
+            if !targetable(f, inlined_too) {
                 continue;
             }
             // the fn whose item spans the line (its RIR, built for the instrumented build when it
             // is gone -- code from the disk cache has none -- places the hook)
-            let crate::jit::FnKey::Inst(d, _) = &f.key else { continue };
+            let crate::jit::FnKey::Inst(d, _) = base_key(u, id as u32) else { continue };
+            if !files.contains(&u.prog.def(*d).file) {
+                continue;
+            }
             let def = u.prog.def(*d);
             let file = &u.prog.files[def.file as usize];
             let item = file.ast.item(def.item);
