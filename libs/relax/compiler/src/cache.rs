@@ -143,6 +143,8 @@ const KIND_FRONT_REF: u32 = 14;
 const KIND_FRONT_CRATE: u32 = 7;
 const KIND_FRONT_GRAPH: u32 = 8;
 const KIND_DEMAND_PART: u32 = 13;
+/// a graph store's list of the crate stores its demand parts take images from (prune keeps them)
+const KIND_DEMAND_STORES: u32 = 16;
 const KIND_CONST: u32 = 9;
 const KIND_WARM_OUTCOME: u32 = 10;
 /// stores a front image was mapped from: kept for the rest of the process (the arrays point
@@ -889,7 +891,7 @@ impl Cache {
                 roles.insert("graph".to_string(), name(&front_graph_path(&dir, g.identity)));
                 roles.insert("collected".to_string(), name(&collected::path(&dir, g.identity)));
             }
-            crate::store::note_program(*root as u64, roles);
+            crate::store::note_program(*root as u64, &roles);
         }
         // other Relax builds' files and the cap: pruned off the start's critical path, after
         // this run's stores are open (so marked live: store::live)
@@ -3190,6 +3192,7 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
             for n in set_files(&sets, *b) {
                 let _ = std::fs::remove_file(sets.join(n));
             }
+            let _ = std::fs::remove_file(retiring_path(&sets, *b));
         });
         if !idle {
             running.extend(paths.iter().cloned());
@@ -3198,17 +3201,35 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
     files.retain(|f| !retired.contains(&f.1));
     let now = std::time::SystemTime::now();
     let recent = |t: &std::time::SystemTime| now.duration_since(*t).map_or(true, |age| age < IN_USE_BY_OTHERS);
-    // this build's replaced variants (store sets, write_sets): a store a program's set named and
-    // its current set no longer names (an edit changed the crate's fingerprint, the graph's
-    // identity) goes, unless another set names it, this run uses it or a run stamped it recently
+    // this build's replaced crate stores (store sets, write_sets): one a program's set named and
+    // its current set no longer names goes once no set or demand part names it, this run does
+    // not use it and no run stamped it recently (until then it stays on the retiring list)
     let name = |p: &PathBuf| crate::store::base_path(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let keep = |f: &(std::time::SystemTime, PathBuf, u64)| builds.get(&f.1).copied().flatten() != Some(me)
         || live.contains(&crate::store::base_path(&f.1)) || open.contains(&f.1) || recent(&f.0);
-    let (named, dropped) = write_sets(&sets, me, programs);
-    files.retain(|f| {
-        let n = name(&f.1);
-        !(dropped.contains(&n) && !named.contains(&n) && !keep(f) && crate::store::delete_checked(&f.1))
+    let (named, retiring) = write_sets(&sets, me, programs);
+    let mut part_named: HashSet<String> = HashSet::new();
+    // the front stores demand parts take images from (each graph store lists them); a graph
+    // store that cannot be read right now (being written) may name any of them
+    let parts_known = files.iter().filter(|f| family(&name(&f.1)) == "front_graph").all(|f| match crate::store::peek(&f.1, KIND_DEMAND_STORES) {
+        Some(lists) => {
+            part_named.extend(lists.iter().flat_map(|b| String::from_utf8_lossy(b).lines().map(str::to_string).collect::<Vec<_>>()));
+            true
+        }
+        None => false,
     });
+    if parts_known {
+        files.retain(|f| {
+            let n = name(&f.1);
+            !(retiring.contains(&n) && !named.contains(&n) && !part_named.contains(&n) && !keep(f) && crate::store::delete_checked(&f.1))
+        });
+    }
+    // what stays retiring: still on disk (in use or stamped recently now) and named by no set
+    if !retiring.is_empty() || retiring_path(&sets, me).exists() {
+        let left: std::collections::BTreeSet<String> = files.iter().map(|f| name(&f.1)).filter(|n| retiring.contains(n) && !named.contains(n)).collect();
+        let text: String = left.iter().map(|n| format!("{n}\n")).collect();
+        let _ = pack::write_atomic_with(&sets, &format!("{me:016x}.retiring"), |f| std::io::Write::write_all(f, text.as_bytes()));
+    }
     // run stores (file images) no store refers to: once per process (the scan reads every store's
     // references), at its first prune
     static RUNS_CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3277,17 +3298,21 @@ fn set_files(sets: &std::path::Path, build: u64) -> Vec<String> {
 
 /// Store sets: each program this process runs (`programs`, store::note_program) names the
 /// stores it uses, one per role (a crate's front store, its code store, the program's graph
-/// stores), in `<cache>/sets/<build>-<program>` (`role name` lines). Returns every store name the
-/// build's sets hold now, and the names this run's sets no longer hold (the previous run of
-/// the program named them).
+/// stores), in `<cache>/sets/<build>-<program>` (`role name` lines). A crate store the previous
+/// run's set named and the program's set no longer names was replaced (an edit changed the
+/// crate's fingerprint, or the crate left the program): it joins `<cache>/sets/<build>.retiring`
+/// until it can go (prune; a retained demand part still naming an old front store keeps it,
+/// KIND_DEMAND_STORES). Returns every store name the build's sets hold now, and the retiring list.
 fn write_sets(sets: &std::path::Path, build: u64, programs: &[(u64, std::collections::BTreeMap<String, String>)]) -> (HashSet<String>, HashSet<String>) {
-    let mut dropped = HashSet::new();
+    let mut retiring: HashSet<String> = std::fs::read_to_string(retiring_path(sets, build)).unwrap_or_default()
+        .lines().filter(|n| crate::store::name_ours(n)).map(str::to_string).collect();
     if !programs.is_empty() && pack::ensure_private_dir(sets).is_ok() {
         for (prog, roles) in programs {
             let file = format!("{build:016x}-{prog:016x}");
             let prev = std::fs::read_to_string(sets.join(&file)).unwrap_or_default();
             let now: HashSet<&String> = roles.values().collect();
-            dropped.extend(prev.lines().filter_map(|l| l.rsplit_once(' ')).map(|(_, n)| n.to_string()).filter(|n| !now.contains(n)));
+            retiring.extend(prev.lines().filter_map(|l| l.rsplit_once(' ')).filter(|(r, _)| r.starts_with("code ") || r.starts_with("front "))
+                .map(|(_, n)| n.to_string()).filter(|n| !now.contains(n) && crate::store::name_ours(n)));
             let text: String = roles.iter().map(|(r, n)| format!("{r} {n}\n")).collect();
             let _ = pack::write_atomic_with(sets, &file, |f| std::io::Write::write_all(f, text.as_bytes()));
         }
@@ -3295,7 +3320,12 @@ fn write_sets(sets: &std::path::Path, build: u64, programs: &[(u64, std::collect
     let named = set_files(sets, build).iter()
         .flat_map(|n| std::fs::read_to_string(sets.join(n)).unwrap_or_default().lines().filter_map(|l| l.rsplit_once(' ').map(|x| x.1.to_string())).collect::<Vec<_>>())
         .collect();
-    (named, dropped)
+    (named, retiring)
+}
+
+/// The build's list of replaced code stores not deleted yet (write_sets).
+fn retiring_path(sets: &std::path::Path, build: u64) -> PathBuf {
+    sets.join(format!("{build:016x}.retiring"))
 }
 
 /// Each crate's longest dependency chain (core 0).
@@ -3754,6 +3784,12 @@ fn front_graph_key(identity: u128) -> u128 {
     h.u128(identity);
     h.finish128()
 }
+fn demand_stores_key(identity: u128) -> u128 {
+    let mut h = Sip128::new();
+    h.str("demand-stores");
+    h.u128(front_graph_key(identity));
+    h.finish128()
+}
 fn front_graph_path(dir: &std::path::Path, identity: u128) -> PathBuf {
     dir.join(format!("front_graph-{:016x}.rcs", front_graph_key(identity) as u64))
 }
@@ -3934,6 +3970,7 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
             images.finish(job.profile, name)?;
             Some(Some(body))
         });
+        let mut part_stores = std::collections::BTreeSet::new();
         header.parts = recorded.iter().zip(encoded).map(|(part, body)| {
             let (key, payload) = match body? {
                 Some(body) => body,
@@ -3943,10 +3980,13 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
                     (part.key, bytes.to_vec())
                 }
             };
+            part_stores.insert(crate::preload::DemandPart::image_store(&payload)?);
             entries.push(NewEntry { key, kind: KIND_DEMAND_PART, payload });
             Some(std::sync::Arc::new(part.header(key)))
         }).collect::<Option<Vec<_>>>()?;
         graph.demand_image = Some(std::sync::Arc::new(header));
+        let names: String = part_stores.iter().map(|n| format!("{n}\n")).collect();
+        entries.push(NewEntry { key: demand_stores_key(recipe.identity), kind: KIND_DEMAND_STORES, payload: names.into_bytes() });
     }
     mark("demand-encode");
     let payload = crate::crate_image::encode(&graph);
@@ -7192,58 +7232,77 @@ mod prune_tests {
         std::fs::remove_dir(&root).unwrap();
     }
 
-    /// Store sets: a program's run names its store per role; a store the previous run's set named
-    /// that the program's set no longer names (an edit gave the crate another fingerprint, the
-    /// graph another identity, a crate left the program) goes unless another program's set names
-    /// it; a run store no store refers to goes; a store no set ever named, or one a run stamped
-    /// recently, stays (the cap's business).
+    /// Store sets: a program's run names its store per role; a crate store the previous run's set
+    /// named that the program's set no longer names (an edit changed the crate's fingerprint, a
+    /// crate left the program) goes unless another program's set or a graph's demand parts name it
+    /// -- once no run stamped it recently, also at a later prune (the retiring list); a run store
+    /// no store refers to goes; a store no set ever named stays (the cap's business).
     #[test]
-    fn replaced_variants_retire_by_store_sets() {
-        isolated_test!(replaced_variants_retire_by_store_sets);
+    fn replaced_crate_stores_retire_by_store_sets() {
+        isolated_test!(replaced_crate_stores_retire_by_store_sets);
         let root = std::env::temp_dir().join(format!("relax-sets-{}-{}", std::process::id(), crate::clock::wall_ns()));
         let dir = root.join("cache");
         std::fs::create_dir_all(&dir).unwrap();
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let stamp = |p: &PathBuf, t: std::time::SystemTime| std::fs::File::options().write(true).open(p).unwrap().set_modified(t).unwrap();
         let store = |name: &str, entries: Vec<NewEntry>| -> PathBuf {
             let p = dir.join(name);
             crate::store::append(&p, entries, true).unwrap();
-            std::fs::File::options().write(true).open(&p).unwrap().set_modified(old).unwrap();
+            stamp(&p, old);
             p
         };
         let data = || vec![NewEntry { key: 1, kind: KIND_DATA, payload: vec![7; 64] }];
         let reference = |run: &str| vec![NewEntry { key: 2, kind: KIND_FRONT_REF, payload: front_run::encode_ref(&crate::parser::ImageLoc { store: run.into(), key: 9 }) }];
         let run_kept = store("front_run-00000000000000a1.rcs", data());
         let run_dead = store("front_run-00000000000000a2.rcs", data());
-        let widgets_v1 = store("widgets-0000000000000001.rcs", data());
-        let widgets_v2 = store("widgets-0000000000000011.rcs", data());
-        let lazy = store("lazy_crate-0000000000000002.rcs", reference("front_run-00000000000000a1.rcs"));
-        let graph_v1 = store("front_graph-0000000000000003.rcs", data());
-        let graph_v2 = store("front_graph-0000000000000013.rcs", data());
+        let code_v1 = store("widgets-0000000000000001.rcs", data());
+        let code_v2 = store("widgets-0000000000000011.rcs", data());
+        let front_v1 = store("widgets-0000000000000021.rcs", reference("front_run-00000000000000a1.rcs"));
+        let front_v2 = store("widgets-0000000000000031.rcs", data());
         let removed = store("removed-0000000000000004.rcs", data());
         let shared_v1 = store("shared-0000000000000005.rcs", data());
         let shared_v2 = store("shared-0000000000000015.rcs", data());
         let unnamed = store("unnamed-0000000000000006.rcs", data());
+        // a retained demand part still takes images from the old front store of `parted`
+        let parted_v1 = store("parted-0000000000000007.rcs", data());
+        let parted_v2 = store("parted-0000000000000017.rcs", data());
+        let graph = store("front_graph-0000000000000008.rcs", vec![NewEntry { key: 3, kind: KIND_DEMAND_STORES, payload: b"parted-0000000000000007.rcs\n".to_vec() }]);
         let me = crate::store::this_build();
         let (prog, other) = (0x5eed_u64, 0x0ade_u64);
         let sets = dir.join("sets");
         std::fs::create_dir_all(&sets).unwrap();
-        std::fs::write(sets.join(format!("{me:016x}-{prog:016x}")), "front w widgets-0000000000000001.rcs\nfront l lazy_crate-0000000000000002.rcs\ngraph front_graph-0000000000000003.rcs\nfront r removed-0000000000000004.rcs\nfront s shared-0000000000000005.rcs\n").unwrap();
+        std::fs::write(sets.join(format!("{me:016x}-{prog:016x}")), "code w widgets-0000000000000001.rcs\nfront w widgets-0000000000000021.rcs\ncode r removed-0000000000000004.rcs\ncode s shared-0000000000000005.rcs\nfront p parted-0000000000000007.rcs\ngraph front_graph-0000000000000008.rcs\n").unwrap();
         // another program of this build still uses the old `shared`
-        std::fs::write(sets.join(format!("{me:016x}-{other:016x}")), "front s shared-0000000000000005.rcs\n").unwrap();
-        let roles: std::collections::BTreeMap<String, String> = [("front w", "widgets-0000000000000011.rcs"), ("front l", "lazy_crate-0000000000000002.rcs"),
-            ("graph", "front_graph-0000000000000013.rcs"), ("front s", "shared-0000000000000015.rcs")].into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
-        let live: HashSet<PathBuf> = [widgets_v2.clone(), graph_v2.clone()].into_iter().collect();
-        // a recently stamped variant stays
-        std::fs::File::options().write(true).open(&removed).unwrap().set_modified(std::time::SystemTime::now()).unwrap();
-        prune(&root, &live, &HashSet::new(), &[(prog, roles)], Some(u64::MAX));
-        assert!(!widgets_v1.exists() && !graph_v1.exists(), "replaced variants go");
+        std::fs::write(sets.join(format!("{me:016x}-{other:016x}")), "code s shared-0000000000000005.rcs\n").unwrap();
+        let roles: std::collections::BTreeMap<String, String> = [("code w", "widgets-0000000000000011.rcs"), ("front w", "widgets-0000000000000031.rcs"),
+            ("code s", "shared-0000000000000015.rcs"), ("front p", "parted-0000000000000017.rcs"), ("graph", "front_graph-0000000000000008.rcs")].into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        let live: HashSet<PathBuf> = [code_v2.clone(), front_v2.clone(), parted_v2.clone(), graph.clone()].into_iter().collect();
+        // a replaced store another run stamped recently stays for now
+        stamp(&removed, std::time::SystemTime::now());
+        prune(&root, &live, &HashSet::new(), &[(prog, roles.clone())], Some(u64::MAX));
+        assert!(!code_v1.exists() && !front_v1.exists(), "replaced crate stores go");
+        assert!(parted_v1.exists(), "a demand part takes images from it");
         assert!(removed.exists(), "stamped recently");
         assert!(shared_v1.exists(), "another program's set names it");
-        assert!(lazy.exists() && widgets_v2.exists() && graph_v2.exists() && shared_v2.exists());
+        assert!(code_v2.exists() && front_v2.exists() && shared_v2.exists());
         assert!(unnamed.exists(), "never named: the cap's business");
-        assert!(run_kept.exists() && !run_dead.exists(), "run stores: kept while referenced");
+        assert!(!run_kept.exists() && !run_dead.exists(), "run stores: go once no store refers to them (front_v1 went)");
         let set = std::fs::read_to_string(sets.join(format!("{me:016x}-{prog:016x}"))).unwrap();
-        assert_eq!(set, "front l lazy_crate-0000000000000002.rcs\nfront s shared-0000000000000015.rcs\nfront w widgets-0000000000000011.rcs\ngraph front_graph-0000000000000013.rcs\n");
+        assert_eq!(set, "code s shared-0000000000000015.rcs\ncode w widgets-0000000000000011.rcs\nfront p parted-0000000000000017.rcs\nfront w widgets-0000000000000031.rcs\ngraph front_graph-0000000000000008.rcs\n");
+        assert_eq!(std::fs::read_to_string(sets.join(format!("{me:016x}.retiring"))).unwrap(), "parted-0000000000000007.rcs\nremoved-0000000000000004.rcs\n");
+        // later: the retiring store is no longer recent and goes; the other program dropping `shared` too lets it go
+        stamp(&removed, old);
+        std::fs::write(sets.join(format!("{me:016x}-{other:016x}")), "code s shared-0000000000000015.rcs\n").unwrap();
+        let roles2 = roles.clone();
+        prune(&root, &live, &HashSet::new(), &[(prog, roles)], Some(u64::MAX));
+        assert!(!removed.exists());
+        assert!(shared_v1.exists(), "dropped by the other program without a run of it here: not on the list");
+        // the part was encoded again against the new store: the old one goes
+        crate::store::append(&graph, vec![NewEntry { key: 3, kind: KIND_DEMAND_STORES, payload: b"parted-0000000000000017.rcs\n".to_vec() }], true).unwrap();
+        stamp(&graph, old);
+        prune(&root, &live, &HashSet::new(), &[(prog, roles2)], Some(u64::MAX));
+        assert!(!parted_v1.exists());
+        assert_eq!(std::fs::read_to_string(sets.join(format!("{me:016x}.retiring"))).unwrap(), "");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
