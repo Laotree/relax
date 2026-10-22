@@ -299,6 +299,29 @@ pub(crate) fn clear_dead<T>(slot: &mut Option<T>) {
     }
 }
 
+/// rustc's crate locator finds `extern crate proc_macro;` in the sysroot for any crate (a
+/// `#![crate_type = "proc-macro"]` file checked on its own, a test's helper). Relax's sysroot is
+/// its std dir, whose `proc_macro` the app graph otherwise never loads (proc-macro crates run in the
+/// macro host): a check whose root unit declares the crate gets it as a dependency unit.
+fn with_sysroot_proc_macro(mut units: unitgraph::Units, std_dir: &str) -> unitgraph::Units {
+    let pm_root = format!("{}/proc_macro/lib.rs", std_dir);
+    if units.units.iter().any(|u| u.name == "proc_macro") || !crate::vfs::exists(&pm_root) { return units; }
+    let wants = |u: &unitgraph::GraphUnit| crate::vfs::read_shared(&u.src_path).is_ok_and(|src| {
+        const NEEDLE: &[u8] = b"extern crate proc_macro";
+        src.windows(NEEDLE.len()).any(|w| w == NEEDLE)
+    });
+    let roots: Vec<usize> = units.roots.iter().copied().filter(|&r| r < units.units.len() && !units.units[r].kind.iter().any(|k| k == "proc-macro") && wants(&units.units[r])).collect();
+    if roots.is_empty() { return units; }
+    let pm = units.units.len();
+    units.units.push(unitgraph::GraphUnit {
+        pkg_id: format!("path+file://{}/proc_macro#proc_macro@0.0.0", std_dir),
+        kind: vec!["lib".to_string()], name: "proc_macro".to_string(), src_path: pm_root, edition: "2021".to_string(),
+        host: false, mode: "build".to_string(), features: Vec::new(), deps: Vec::new(),
+    });
+    for r in roots { units.units[r].deps.push((pm, "proc_macro".to_string())); }
+    units
+}
+
 pub(crate) fn resolve_package(
     sess: &std::sync::Arc<crate::Session>,
     workspace: &str,
@@ -334,6 +357,7 @@ pub(crate) fn resolve_package(
     } else {
         std::fs::read(units_json).map_err(|e| format!("{}: {}", units_json, e)).and_then(|d| unitgraph::Units::from_json(&d))
     }?;
+    let units = if check_only { with_sysroot_proc_macro(units, std_dir) } else { units };
     let t_load = Instant::now();
     let mut g = unitgraph::load(&units, check_only)?;
     let t_loaded = Instant::now();
