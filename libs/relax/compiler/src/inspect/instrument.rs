@@ -407,7 +407,10 @@ fn targetable(f: &crate::jit::FnEntry, inlined_too: bool) -> bool {
 pub(super) fn fn_spans_line(u: &crate::jit::Unit, id: u32, line: u32) -> bool {
     let mut id = id;
     for _ in 0..8 {
-        let Some(f) = u.fns.get(id as usize) else { return false };
+        if id as usize >= u.fns.len() {
+            return false;
+        }
+        let f = &u.fns[id as usize];
         match &f.key {
             crate::jit::FnKey::Plain(b) | crate::jit::FnKey::Sandbox(b) if *b != u32::MAX => id = *b,
             crate::jit::FnKey::Closure(file, e, _) => {

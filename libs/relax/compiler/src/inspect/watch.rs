@@ -61,7 +61,10 @@ pub(super) fn code_installed(u: &crate::jit::Unit, id: u32) {
     if !waiting() {
         return;
     }
-    let Some(f) = u.fns.get(id as usize) else { return };
+    if id as usize >= u.fns.len() {
+        return;
+    }
+    let f = &u.fns[id as usize];
     let Some(path) = u.prog.file_paths.get(f.file as usize) else { return };
     let mut hits: Vec<u64> = Vec::new();
     {
