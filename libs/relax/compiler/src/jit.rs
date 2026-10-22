@@ -2602,7 +2602,7 @@ impl Unit {
         // identity state below (the provided crates' shims, the slot table, the unit itself) is
         // built in the kept heap; the compile state (prog, tcx, layouts, front) stays as built
         let provided = crate::zone_alloc::kept_with(|| crate::provided::take_for(&prog));
-        let (provided_types, opaque_layouts, check_layouts) = provided_type_tables(&prog, &provided);
+        let (provided_types, opaque_layouts, check_layouts, handles) = provided_type_tables(&prog, &provided);
         let provided_types = crate::zone_alloc::kept_clone(&provided_types);
         let slots = crate::zone_alloc::kept_with(|| {
             if no_codegen {
@@ -2869,6 +2869,7 @@ impl Unit {
                 crate::zone_alloc::kept_with(|| u.provided_types.insert(d, 0));
             }
         }
+        u.rustc_laid_handles(&handles);
         u.self_ptr = UnitPtr(&mut *u as *mut Unit);
         #[cfg(target_os = "android")]
         u.slots.set_callable_hook(c_callable_hook, u.self_ptr.0 as usize);
@@ -2909,7 +2910,26 @@ impl Unit {
         self.provided_shared.get()
     }
 
-    /// Does a value of type `t` cross the provided-crate boundary? Worked out for every provided
+    /// The handle structs among `handles` whose rustc layout is Relax's own
+    /// (provided::same_layout_handles) get it: no longer opaque, JIT-compiled code builds them and
+    /// reads their fields (`provided_rustc_layout`); rustc's drop and trait ops stay theirs.
+    fn rustc_laid_handles(&mut self, handles: &HandleLayouts) {
+        let same = {
+            let (opaque, types) = (&self.lay.opaque, &self.provided_types);
+            crate::provided::same_layout_handles(&self.prog, &self.tcx, handles, &|d| opaque.contains_key(&d), &|d| types.contains_key(&d) && !opaque.contains_key(&d))
+        };
+        for d in same {
+            self.lay.opaque.remove(&d);
+        }
+    }
+
+    /// A provided crate's handle laid out as rustc lays it out (rustc_laid_handles): its values
+    /// are the same bytes on both sides.
+    pub(crate) fn provided_rustc_layout(&self, d: DefId) -> bool {
+        self.provided_types.contains_key(&d) && !self.lay.opaque.contains_key(&d)
+    }
+
+        /// Does a value of type `t` cross the provided-crate boundary? Worked out for every provided
     /// crate on the first call: boot needs it for nothing (a misuse of a provided type asks).
     pub(crate) fn provided_shared_contains(&self, t: TyId) -> bool {
         self.provided_shared.get_or_init(|| {
@@ -9505,16 +9525,25 @@ unsafe fn provided_fmt_hash(u: &mut Unit, d: DefId, args: &[TyId], id: u32) -> R
     let Some(&tr) = u.tcx.impl_trait.get(&def.parent) else { return Ok(None) };
     let Some(&st) = u.tcx.impl_self.get(&def.parent) else { return Ok(None) };
     let Some(_ad) = opaque(u, st) else { return Ok(None) };
+    // a handle laid out as rustc does (Unit::provided_rustc_layout): its impls read its fields
+    // here like any type's; Clone and PartialEq stay rustc's when the attribute lists them
+    let laid = u.provided_rustc_layout(_ad);
     let mname = u.prog.name(d).to_string();
     let is_eq = Some(tr) == u.tcx.lang_items.get(LangItem::PartialEq) && mname == "eq"
         && u.tcx.impl_trait_args.get(&def.parent).is_some_and(|a| a.as_slice() == [st]);
     let is_clone = Some(tr) == u.tcx.lang_items.get(LangItem::Clone) && mname == "clone";
+    if laid && !(is_eq || is_clone) {
+        return Ok(None);
+    }
     if is_eq || is_clone {
         let ad = _ad;
         let krate = u.prog.def(ad).krate;
         let key = crate::provided::opaque_method_key(&u.prog, ad, &mname);
         let pc = &u.provided.iter().find(|(k, _)| *k == krate).unwrap().1;
         let Some(shim) = pc.shims.get(key.as_str()).map(|s| s.f) else {
+            if laid {
+                return Ok(None);
+            }
             return Err(format!("`{}` is not provided: mark the type #[relax_api(handle, ..)] with that trait", key));
         };
         let r = u.tcx.tys.intern(TyKind::Ref(false, st, crate::types::RegionId::ERASED));
@@ -17450,28 +17479,37 @@ fn ctfe_error_message(m: &str) -> String {
     if builtin.iter().any(|b| m.starts_with(b)) { m.replacen("the len is", "the length is", 1) } else { format!("evaluation panicked: {}", m) }
 }
 
+/// The handle structs of `provided_type_tables` with their rustc layout: (def, size, align, field
+/// offsets), checked by provided::same_layout_handles.
+type HandleLayouts = Vec<(DefId, u32, u32, &'static [u64])>;
+
 /// Per provided crate present in `provided`: its opaque (handle) types with rustc's drop, their
-/// layouts, and the plain types whose layout must be checked against rustc's.
+/// layouts, the plain types whose layout must be checked against rustc's, and the handle structs
+/// whose rustc layout may be Relax's own (provided::same_layout_handles).
 fn provided_type_tables(prog: &Program, provided: &[(u32, crate::provided::ProvidedCrate)])
-    -> (HashMap<DefId, u64>, HashMap<DefId, (u32, u32)>, Vec<(DefId, u32, u32, String, &'static [u64])>)
+    -> (HashMap<DefId, u64>, HashMap<DefId, (u32, u32)>, Vec<(DefId, u32, u32, String, &'static [u64])>, HandleLayouts)
 {
     let mut provided_types = HashMap::new();
     let mut opaque_layouts = HashMap::new();
     let mut check_layouts = Vec::new();
+    let mut handles = Vec::new();
     for (k, pc) in provided {
         for (i, def) in prog.defs.iter().enumerate() {
             if def.krate == *k && matches!(def.kind, DefKind::Struct | DefKind::Enum) {
                 let path = crate::provided::norm(&prog.def_path(DefId(i as u32)));
-                if let Some((size, align, drop)) = pc.types.get(path.as_str()) {
+                if let Some((size, align, drop, offs)) = pc.types.get(path.as_str()) {
                     provided_types.insert(DefId(i as u32), drop.map_or(0, |f| f as usize as u64));
                     opaque_layouts.insert(DefId(i as u32), (*size as u32, *align as u32));
+                    if !offs.is_empty() {
+                        handles.push((DefId(i as u32), *size as u32, *align as u32, *offs));
+                    }
                 } else if let Some((size, align, offs)) = pc.layouts.get(path.as_str()) {
                     check_layouts.push((DefId(i as u32), *size as u32, *align as u32, path, *offs));
                 }
             }
         }
     }
-    (provided_types, opaque_layouts, check_layouts)
+    (provided_types, opaque_layouts, check_layouts, handles)
 }
 
 impl Unit {
@@ -17483,7 +17521,7 @@ impl Unit {
     pub(crate) unsafe fn bind_added_provided(&mut self, new: &[u32]) {
         let added = crate::provided::take_for_crates(&self.prog, new);
         if added.is_empty() { return; }
-        let (types, opaque, check_layouts) = provided_type_tables(&self.prog, &added);
+        let (types, opaque, check_layouts, handles) = provided_type_tables(&self.prog, &added);
         crate::zone_alloc::kept_with(|| {
             self.provided.extend(added.iter().cloned());
             self.provided_types.extend(types);
@@ -17501,6 +17539,7 @@ impl Unit {
                 crate::zone_alloc::kept_with(|| self.provided_types.insert(d, 0));
             }
         }
+        self.rustc_laid_handles(&handles);
         // a set worked out already also covers the added crates; one not yet worked out will
         if let Some(mut set) = self.provided_shared.take() {
             let ks: Vec<u32> = added.iter().map(|(k, _)| *k).collect();
