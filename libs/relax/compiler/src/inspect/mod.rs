@@ -241,7 +241,8 @@ fn help(req: &Req, out: &mut Out) {
         return;
     }
     out.measured("commands", "static", &[]);
-    for (name, args, what) in COMMANDS.iter().chain(makepad_gpu_trace::query::COMMANDS) {
+    let host = host_commands();
+    for (name, args, what) in COMMANDS.iter().chain(makepad_gpu_trace::query::COMMANDS).chain(host.iter()) {
         if let Some(w) = req.pos.first() {
             if w != name {
                 continue;
@@ -254,7 +255,8 @@ fn help(req: &Req, out: &mut Out) {
 /// A tool definition for agent / MCP-style clients: one tool, `relax_inspect`, whose `command`
 /// is one line of this protocol.
 pub fn schema() -> String {
-    let cmds: Vec<String> = COMMANDS.iter().chain(makepad_gpu_trace::query::COMMANDS).map(|(n, a, w)| format!("{} {} -- {}", n, a, w)).collect();
+    let host = host_commands();
+    let cmds: Vec<String> = COMMANDS.iter().chain(makepad_gpu_trace::query::COMMANDS).chain(host.iter()).map(|(n, a, w)| format!("{} {} -- {}", n, a, w)).collect();
     format!(
         "{{\"name\":\"relax_inspect\",\"description\":{},\"input_schema\":{{\"type\":\"object\",\"properties\":{{\"target\":{{\"type\":\"string\",\"description\":\"pid, app name, or all\"}},\"command\":{{\"type\":\"string\",\"description\":\"one request line, e.g. `why-hung` or `stacks thread=main`\"}}}},\"required\":[\"target\",\"command\"]}}}}",
         json_str(&format!("Ask a running makepad app about itself. Run as `makepad inspect <target> <command>`. Commands:\n{}", cmds.join("\n")))
@@ -833,6 +835,41 @@ pub fn register_host_inspect(name: &'static str, query: HostQuery) {
     let mut providers = HOST_PROVIDERS.lock().unwrap_or_else(|e| e.into_inner());
     providers.retain(|(n, _)| *n != name);
     providers.push((name, query));
+}
+
+/// Command tables of host providers (`help` and `schema` list them with the built-in ones).
+type CommandTable = &'static [(&'static str, &'static str, &'static str)];
+static HOST_COMMANDS: Mutex<Vec<CommandTable>> = Mutex::new(Vec::new());
+
+/// Registers the command table of a host provider for `help` / `schema`.
+pub fn register_host_commands(table: CommandTable) {
+    let mut t = HOST_COMMANDS.lock().unwrap_or_else(|e| e.into_inner());
+    if !t.iter().any(|x| std::ptr::eq(*x, table)) {
+        t.push(table);
+    }
+}
+
+fn host_commands() -> Vec<(&'static str, &'static str, &'static str)> {
+    HOST_COMMANDS.lock().unwrap_or_else(|e| e.into_inner()).iter().flat_map(|t| t.iter().copied()).collect()
+}
+
+/// `makepad inspect file=<path> <cmd> ...` for a file a host provider reads (a frame capture):
+/// the provider of `<cmd>` answers with `file=<path>` added; None when no provider has `<cmd>`.
+pub fn host_file_query(path: &str, words: &[String]) -> Option<i32> {
+    let cmd = words.first()?;
+    if !HOST_PROVIDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(n, _)| n == cmd) {
+        return None;
+    }
+    let line = format!("{} file={}", words.join(" "), path);
+    fn dispatch(req: &Req, out: &mut Out) {
+        if !cmd_host_provided(req, out) {
+            out.err("no provider answered");
+        }
+    }
+    let (bytes, _) = makepad_remote::cmd::answer(dispatch, &line);
+    let text = String::from_utf8_lossy(&bytes);
+    print!("{text}");
+    Some(if text.lines().any(|l| l.starts_with("{\"err\":")) { 1 } else { 0 })
 }
 
 fn cmd_host_provided(req: &Req, out: &mut Out) -> bool {
