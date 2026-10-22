@@ -11953,6 +11953,10 @@ pub fn sweep_verdicts() {
             if look.as_ref().is_some_and(|l| !l.contains(&(id as u32))) { continue; }
             if u.fns[id].unverified.load(Ordering::Relaxed) && u.refresh_verified(id as u32) {
                 n += 1;
+                if specv_trace() {
+                    let f = &u.fns[id];
+                    eprintln!("specv @{:.3} verified #{} {} (o3={} plain_calls={})", wall_ns() as f64 / 1e9, id, short_name(&f.name), f.o3.load(Ordering::Relaxed), f.rir.as_ref().map_or(false, |r| r.plain_calls));
+                }
                 // D3: the installed code lacks the verdict's disjoint-index checks; O3 code built
                 // while unverified lacks its noalias facts: built again
                 if u.fns[id].compiled && (u.fns[id].o3.load(Ordering::Relaxed) || !u.fns[id].d3_lowered.load(Ordering::Relaxed) && u.disjoint_checks(id as u32).is_some()) {
@@ -11991,6 +11995,31 @@ pub fn sweep_verdicts() {
         n
     });
     let _ = verified;
+}
+
+/// MAKEPAD_RUN_SPECV_TRACE=1: SPEC-V verdict sweeps (slots turning verified) and twins tiering up,
+/// with the callers whose lowering still calls them.
+fn specv_trace() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var_os("MAKEPAD_RUN_SPECV_TRACE").is_some())
+}
+
+/// SPEC-V (trace): the slots whose current lowering calls `twin`, by state (unit read).
+fn twin_caller_census(u: &Unit, twin: u32) -> String {
+    let (mut unv, mut o3, mut below) = (Vec::new(), Vec::new(), Vec::new());
+    for (c, f) in u.fns.iter().enumerate() {
+        let calls = f.rir.as_ref().is_some_and(|r| r.plain_calls && r.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(t), _, _) if *t == twin))));
+        if !calls { continue; }
+        let n = format!("#{} {}", c, short_name(&f.name));
+        if f.unverified.load(Ordering::Relaxed) { unv.push(n) } else if f.o3.load(Ordering::Relaxed) { o3.push(n) } else { below.push(n) }
+    }
+    let l = |v: &Vec<String>| format!("{} [{}]", v.len(), v.iter().take(4).cloned().collect::<Vec<_>>().join(", "));
+    format!("unverified {} / verified-O3 {} / verified-below-O3 {}", l(&unv), l(&o3), l(&below))
+}
+
+fn short_name(n: &str) -> &str {
+    let n = n.split('<').next().unwrap_or(n);
+    match n.rmatch_indices("::").nth(1) { Some((i, _)) => &n[i + 2..], None => n }
 }
 
 /// SPEC-V: the slots among `cands` (None: every slot) that are verified, built at O3, and still run
@@ -14121,6 +14150,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // SPEC-V: a twin tiered up: its warm callers that are verified by now are lowered
                 // again, so they call the base slot (which the twin's samples heat as well)
                 if matches!(u.fns[id as usize].key, FnKey::Plain(_)) {
+                    if specv_trace() {
+                        eprintln!("specv @{:.3} twin O3 #{} {}: callers {}", wall_ns() as f64 / 1e9, id, short_name(&u.fns[id as usize].name), twin_caller_census(u, id));
+                    }
                     for c in hot_twin_callers(u, None, Some(id)) {
                         u.retier(c);
                     }
