@@ -2086,7 +2086,9 @@ pub fn check_alloc(options: &relax_session::Options, f: &Func, cfg: &RegConfig, 
             let i = &b.insts[ii];
             uses_defs(i, &mut us, &mut ds);
             for u in &us {
-                check(&st, u.0, p, "read", &mut out);
+                if reg_of(u.0).map_or(false, |(v, c)| !st[c as usize].contains(&v)) {
+                    check(&st, u.0, p, &format!("read by {:?}", i), &mut out);
+                }
             }
             if let Some(cl) = cfg.clobbers {
                 kill(&mut st, cl(options, f, i) & 0xffff_ffff);
