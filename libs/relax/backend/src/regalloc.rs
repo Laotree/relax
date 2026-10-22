@@ -1531,6 +1531,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     // windows that start at the value's definition: entered with the value in the register (no load)
     let mut def_wins: Vec<(u32, u32, u32, u8)> = Vec::new();
     let def_windows = !crate::stats::opt_off(options, "-defwin");
+    let mut evicted: EvictState = EvictState::default();
     if thorough && windows_on(options) {
         let regs: Vec<u8> = cfg.int_caller.iter().chain(used_callee_int.iter()).copied().collect();
         let callee_set = used_callee_int.clone();
@@ -1540,7 +1541,6 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         bo.sort_by(|a, b| wts[*b].partial_cmp(&wts[*a]).unwrap_or(std::cmp::Ordering::Equal));
         // eviction candidates: blocks that run more often than the entry, long enough for a run
         let ev = if evict_on { Some(EvictInfo::new(f, &reach, &tab, &block_start, &ranges, &wts, &loc, |bi| wts[bi] >= 2.0 * entry_w && f.blocks[bi].insts.len() >= 6)) } else { None };
-        let mut evicted: EvictState = EvictState::default();
         for bi in bo {
             let b = &f.blocks[bi];
             let n = b.insts.len();
