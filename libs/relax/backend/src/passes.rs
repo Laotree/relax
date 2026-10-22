@@ -3682,6 +3682,17 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
         if npred[x as usize] != 1 || b.insts.len() > MAX_MOVS + MAX_SPEC {
             return None;
         }
+        // a block an earlier conversion rewrote holds its fresh temporaries (vregs made after the
+        // def / use counts): no counts to judge it by, so it is no arm this time (ndef[d] was out
+        // of bounds: O3 panic compiling wasm::Fx::expr under counted frequencies)
+        let mut fresh = false;
+        for i in &b.insts {
+            for_defs(i, |d| fresh |= d.0 as usize >= nv);
+            for_uses(i, |u| fresh |= u.0 as usize >= nv);
+        }
+        if fresh {
+            return None;
+        }
         let j = match b.term {
             Term::Jump(j) if j != x => j,
             _ => return None,
