@@ -1363,7 +1363,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         }
     }
     // second chance for spilled values (O3, second_chance). MAKEPAD_RUN_OPT=-evict: off
-    let evict_on = thorough && !crate::stats::opt_off(options, "-evict") && evict_bis(f);
+    let evict_on = thorough && !crate::stats::opt_off(options, "-evict");
     let (evicts, prestores, lent) = if evict_on && loc.iter().any(|l| matches!(l, Loc::Stack(_))) {
         // values in a coalesced unit, passed-through loop pieces and recomputed ones keep their place
         let skip: Vec<bool> = (0..nv).map(|v| unit_members(v).is_some() || parent[v as usize] != v || is_low(v) || remat[v as usize].is_some()).collect();
@@ -2803,29 +2803,8 @@ fn region_windows_alloc(
                         }
                     }
                 }
-                // TEMPORARY (+regionchk): the round-by-round fixpoint must give the same set
-                let old_set: Option<Vec<u32>> = if crate::stats::opt_env_off("+regionchk") {
-                    let mut s2 = set.clone();
-                    loop {
-                        let inset = |b: u32| s2.binary_search(&b).is_ok();
-                        let needs = |b: u32| entered(b) && (invoke_pred[b as usize] || preds[b as usize].is_empty() || preds[b as usize].iter().any(|p| !inset(*p))) && edge_preds(b, &inset).is_none();
-                        let drop: Vec<u32> = s2.iter().copied().filter(|b| idle(*b) && needs(*b)).collect();
-                        if drop.is_empty() {
-                            break;
-                        }
-                        s2.retain(|b| !drop.contains(b));
-                    }
-                    Some(s2)
-                } else {
-                    None
-                };
                 if inset_h.len() != set.len() {
                     set.retain(|b| inset_h.contains(b));
-                }
-                if let Some(s2) = old_set {
-                    if s2 != set {
-                        eprintln!("region-check MISMATCH {} v{} r{}: old {:?} new {:?}", f.name, v, c, s2, set);
-                    }
                 }
             }
             if set.len() < if edge_loads { 1 } else { 2 } {
@@ -4048,27 +4027,6 @@ fn allocate_split_inner(options: &relax_session::Options, f: &Func, cfg: &RegCon
 /// save / restore happens on the cold path only. (Without this, every value live across such a
 /// call -- an Rc drop_slow, a Vec grow inlined into the loop -- needs a callee-saved register for
 /// the whole loop or spills: x64 has five.) Returns the rewritten copy, or None.
-/// TEMPORARY bisection: MAKEPAD_RUN_EVICT_BIS=lo-hi enables second_chance only in functions whose
-/// name hash mod 4096 is in lo..hi
-fn evict_bis(f: &Func) -> bool {
-    match std::env::var("MAKEPAD_RUN_EVICT_BIS") {
-        Ok(w) => {
-            let mut h = 0xcbf2_9ce4_8422_2325u64;
-            for b in f.name.bytes() {
-                h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
-            }
-            let k = (h % 4096) as u32;
-            let (lo, hi) = w.split_once('-').map(|(a, b)| (a.parse().unwrap_or(0), b.parse().unwrap_or(4096))).unwrap_or((0, 4096));
-            let on = lo <= k && k < hi;
-            if on && std::env::var("MAKEPAD_RUN_EVICT_BIS_LOG").is_ok() {
-                eprintln!("evict-bis {} {}", k, f.name);
-            }
-            on
-        }
-        Err(_) => true,
-    }
-}
-
 fn trace_on(f: &Func) -> bool {
     match std::env::var("MAKEPAD_RUN_RA_TRACE") {
         Ok(w) => f.name.ends_with(w.as_str()),
