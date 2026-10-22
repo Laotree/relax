@@ -462,6 +462,19 @@ fn auto_native(build: bool) -> Result<String, String> {
     Err(format!("building the native baseline of `{}` now (cargo build --release, line tables only, -j4, nice; pid {}, log {}); ask again when it is done", krate, pid, log))
 }
 
+/// The native build to compare with (native=, the last one named, MAKEPAD_INSPECT_NATIVE, else
+/// the package's own release build, started in the background when missing).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn native_for(req: &Req) -> Result<String, String> {
+    native_path(req)
+}
+
+/// `with_native` for other commands (vsnative).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn with_native_bin<R>(path: &str, f: impl FnOnce(&NativeBin) -> R) -> Result<R, String> {
+    with_native(path, f)
+}
+
 /// Runs `f` with the native binary at `path` (read once, again when the file changes).
 fn with_native<R>(path: &str, f: impl FnOnce(&NativeBin) -> R) -> Result<R, String> {
     let mtime = std::fs::metadata(path).and_then(|m| m.modified()).map_err(|e| format!("cannot read {}: {}", path, e))?;
