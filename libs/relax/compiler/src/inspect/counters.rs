@@ -13,6 +13,17 @@ pub fn cmd_counters(req: &Req, out: &mut Out) {
     let secs = req.get("s").and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0).clamp(0.1, 30.0);
     let n = req.num("n", 12) as usize;
     imp::run(secs, n, out);
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let d = &crate::jit::direct::SITE_COUNT;
+        out.always(&format!(
+            "direct calls: {} call sites in O2/O3 code branch straight to their callees' code ({} re-pointed since){}",
+            d.load(Relaxed),
+            crate::jit::direct::REPATCHES.load(Relaxed),
+            if crate::jit::direct::on() { "" } else { "; off (MAKEPAD_RUN_DIRECT_CALLS=0): every call goes through its thunk" }
+        ));
+    }
     out.always(&format!("note: {}", super::reliability::line(true)));
     out.always("more: asm top vs=rustc ev=cycles  asm <fn> ev=instructions  prof threads=main");
 }
