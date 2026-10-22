@@ -3204,6 +3204,9 @@ impl Unit {
     /// closures over them) answer false: the safe side for noalias.
     pub fn is_unpin(&self, t: TyId) -> bool {
         let t = self.tcx.tys.erase_regions(t);
+        // a field's associated-type projection (`<A as Allocator<u8>>::AllocatedMemory`) names
+        // the type it normalises to, as rustc's auto-trait selection sees it
+        let t = self.tcx.try_normalize_erasing_regions(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), t).unwrap_or(t);
         if let Some(b) = self.unpin_cache.get(&t) {
             return b;
         }
