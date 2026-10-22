@@ -1598,65 +1598,53 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                                 _ => None,
                             }
                         };
-                        // an arm: a leaf, or a select of two leaves
-                        let arm = |v: VReg| -> Option<(Option<VReg>, [Result<i64, (VReg, bool)>; 2])> {
+                        // the outcome tree, four levels at most (`partial_cmp` of floats is three);
+                        // equal subtrees collapse
+                        fn otree(v: VReg, depth: u32, sel_def: &[Option<(VReg, VReg, VReg)>], ndef: &[u32], leaf: &dyn Fn(VReg) -> Option<Result<i64, (VReg, bool)>>) -> Option<OTree> {
                             if let Some(l) = leaf(v) {
-                                return Some((None, [l.clone(), l]));
+                                return Some(OTree::L(l));
                             }
-                            let (c2, a2, b2) = sel_def[v.0 as usize].filter(|_| single(v, &ndef))?;
-                            Some((Some(c2), [leaf(a2)?, leaf(b2)?]))
-                        };
-                        if let Some((c1, a1, b1)) = sel_def[root.0 as usize].filter(|_| single(root, &ndef)) {
-                            // at least one arm a leaf (two levels at most)
-                            if let (Some(pa), Some(pb)) = (arm(a1), arm(b1)) {
-                                // two constant leaves: the select-of-constants folds below (and the
-                                // phi distribution) take it, unless every outcome is the same
-                                let konst = |v: VReg| matches!(kn[v.0 as usize], Some(K::I(_)));
-                                let same = pa.1.iter().chain(pb.1.iter()).all(|o| *o == pa.1[0]) && pa.1[0].is_ok();
-                                if (pa.0.is_none() || pb.0.is_none()) && (same || !(konst(a1) && konst(b1))) {
-                                    let pos = f.blocks[bi].pos[ii];
-                                    let mut insts = Vec::new();
-                                    let out = |f: &mut Func, insts: &mut Vec<Inst>, o: &Result<i64, (VReg, bool)>| -> VReg {
-                                        let t = f.vreg(Cls::I);
-                                        insts.push(match *o {
-                                            Ok(kv) => Inst::Iconst(t, kv),
-                                            Err((v, false)) => Inst::Mov(t, v),
-                                            Err((v, true)) => Inst::IBinI(IOp::Xor, U64, t, v, 1),
-                                        });
-                                        t
-                                    };
-                                    let side = |f: &mut Func, insts: &mut Vec<Inst>, (c2, os): (Option<VReg>, [Result<i64, (VReg, bool)>; 2])| -> VReg {
-                                        match c2 {
-                                            Some(c2) if os[0] != os[1] => {
-                                                let (tx, ty, t) = (out(f, insts, &os[0]), out(f, insts, &os[1]), f.vreg(Cls::I));
-                                                insts.push(Inst::Sel(t, c2, tx, ty));
-                                                t
-                                            }
-                                            _ => out(f, insts, &os[0]),
-                                        }
-                                    };
-                                    let both_k = |p: &(Option<VReg>, [Result<i64, (VReg, bool)>; 2])| match (&p.1[0], &p.1[1]) {
-                                        (Ok(x), Ok(y)) if x == y => Some(*x),
-                                        _ => None,
-                                    };
-                                    match (both_k(&pa), both_k(&pb)) {
-                                        // every outcome the same: a constant
-                                        (Some(x), Some(y)) if x == y => {
-                                            new = Inst::Iconst(d, x);
-                                            if single(d, &ndef) {
-                                                kn[d.0 as usize] = Some(K::I(x));
-                                            }
-                                        }
-                                        _ => {
-                                            let ta = side(f, &mut insts, pa);
-                                            let tb = side(f, &mut insts, pb);
-                                            let top = f.vreg(Cls::I);
-                                            insts.push(Inst::Sel(top, c1, ta, tb));
-                                            edits.push(FoldEdit { block: bi, at: ii, remove: 0, insts, pos });
-                                            new = Inst::Mov(d, top);
-                                        }
+                            if depth == 0 {
+                                return None;
+                            }
+                            let (c, a, b) = sel_def[v.0 as usize].filter(|_| ndef[v.0 as usize] == 1)?;
+                            let (ta, tb) = (otree(a, depth - 1, sel_def, ndef, leaf)?, otree(b, depth - 1, sel_def, ndef, leaf)?);
+                            Some(if ta == tb { ta } else { OTree::N(c, Box::new(ta), Box::new(tb)) })
+                        }
+                        fn emit(f: &mut Func, insts: &mut Vec<Inst>, t: &OTree) -> VReg {
+                            let d = f.vreg(Cls::I);
+                            let i = match t {
+                                OTree::L(Ok(kv)) => Inst::Iconst(d, *kv),
+                                OTree::L(Err((v, false))) => Inst::Mov(d, *v),
+                                OTree::L(Err((v, true))) => Inst::IBinI(IOp::Xor, U64, d, *v, 1),
+                                OTree::N(c, a, b) => {
+                                    let (ta, tb) = (emit(f, insts, a), emit(f, insts, b));
+                                    Inst::Sel(d, *c, ta, tb)
+                                }
+                            };
+                            insts.push(i);
+                            d
+                        }
+                        if let Some((_, a1, b1)) = sel_def[root.0 as usize].filter(|_| single(root, &ndef)) {
+                            let konst = |v: VReg| matches!(kn[v.0 as usize], Some(K::I(_)));
+                            match otree(root, 4, &sel_def, &ndef, &leaf) {
+                                // every outcome the same: a constant
+                                Some(OTree::L(Ok(kv))) => {
+                                    new = Inst::Iconst(d, kv);
+                                    if single(d, &ndef) {
+                                        kn[d.0 as usize] = Some(K::I(kv));
                                     }
                                 }
+                                // a select of two constants: the select-of-constants folds below (and
+                                // the phi distribution) take it
+                                Some(t) if !(konst(a1) && konst(b1)) => {
+                                    let pos = f.blocks[bi].pos[ii];
+                                    let mut insts = Vec::new();
+                                    let top = emit(f, &mut insts, &t);
+                                    edits.push(FoldEdit { block: bi, at: ii, remove: 0, insts, pos });
+                                    new = Inst::Mov(d, top);
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -3934,6 +3922,14 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
         changed = true;
     }
     changed
+}
+
+/// A compare's outcome over a select tree (simplify's select-tree fold): a leaf (Ok: constant 0 / 1,
+/// Err: a 0 / 1 value or its negation) or a select on a condition.
+#[derive(Clone, PartialEq)]
+enum OTree {
+    L(Result<i64, (VReg, bool)>),
+    N(VReg, Box<OTree>, Box<OTree>),
 }
 
 /// A branch on a select of constants and compare outcomes (`c ? k : x`, what if-conversion of a
