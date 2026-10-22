@@ -22,6 +22,7 @@ pub fn apps() -> Vec<App> {
 fn usage() -> i32 {
     eprintln!("usage: makepad inspect <pid|app|all|list> <command> [args]   (makepad inspect <pid> help: the commands)");
     eprintln!("       makepad inspect <host>:<app|pid> <command> | <host>:list | <host>:session <launch|kill> .. | hosts | all:list");
+    eprintln!("       makepad inspect <pid|app> pf <query> [s=3] [save=x.mkpf] | file=<x.mkpf> pf <query> [base=y.mkpf]   (pf help: the profiler queries)");
     2
 }
 
@@ -29,6 +30,14 @@ pub fn main(args: &[String]) -> i32 {
     let Some(target) = args.first() else { return usage() };
     // `file=<x.mkgp> gpu prof <query>`: a saved GPU recording, no app
     if let Some(path) = target.strip_prefix("file=") {
+        // a profile recording (`file=<x.mkpf> pf ...`)
+        if path.ends_with(".mkpf") || args.get(1).map(String::as_str) == Some("pf") {
+            return super::pf::file_main(path, &args[1..]);
+        }
+        // a file a host provider reads (`file=<x.mkcap> cap ...`), else a GPU recording
+        if let Some(code) = super::host_file_query(path, &args[1..]) {
+            return code;
+        }
         return super::gpuprof::file_main(path, &args[1..]);
     }
     if target == "list" {
@@ -66,6 +75,28 @@ pub fn main(args: &[String]) -> i32 {
         // the most recent of several with that name
         many => many[many.len() - 1],
     };
+    if args.get(1).map(String::as_str) == Some("pf") {
+        return super::pf::live_main(app, &args[2..]);
+    }
+    // `as=md`: the answer as compact text (finding, tables, drill-downs) instead of JSON lines
+    if args.iter().any(|a| a == "as=md") {
+        let words: Vec<String> = args[1..].iter().filter(|a| *a != "as=md").cloned().collect();
+        let line = request_line(&words);
+        let mut lines = Vec::new();
+        let r = ask(app, &line, &mut |l| {
+            lines.push(l.to_string());
+            true
+        });
+        println!("{}", makepad_prof_stream::jsonview::render(&cmd, &lines).text());
+        return match r {
+            Ok(false) => 0,
+            Ok(true) => 1,
+            Err(e) => {
+                eprintln!("makepad inspect: {} (pid {}): {}", app.app, app.pid, e);
+                2
+            }
+        };
+    }
     match ask(app, &line, &mut |l| {
         println!("{}", l);
         true

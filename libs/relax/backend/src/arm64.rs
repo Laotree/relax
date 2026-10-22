@@ -4881,9 +4881,11 @@ pub fn compile(options: &relax_session::Options, f: &Func, env: &Env) -> Result<
 /// A multiplicand that is a splat of an f32 vreg (`VSplat` of an F32 value, single def) is read as
 /// that scalar: `VFma(.., a, s, c)` / `VX(FMul(S, _), d, a, s)` with `s` of class F32 (backend-only
 /// form, made here just before register allocation) mean every lane times `s`, which the emitter
-/// encodes by element (`fmla vd.4s, vn.4s, vm.s[0]`). A splat whose every use is folded goes. The
-/// product of `VFma` commutes, so a splat first operand is swapped in; `FMul`'s operand order
-/// picks the NaN for the Neon flavour, so only its second operand is folded unless the NaN is the host's.
+/// encodes by element (`fmla vd.4s, vn.4s, vm.s[0]`). A splat whose every use is folded goes. Only
+/// `VFma`'s second factor folds: fmls negates Vn, and the NaN of a lane is c's, Vn's, then Vm's
+/// (rir::fma_nan_f32), so a splat first factor swapped into Vm would flip the wrong operand's NaN
+/// sign. `FMul`'s operand order picks the NaN for the Neon flavour, so only its second operand is
+/// folded unless the NaN is the host's.
 /// Right shifts by per-lane amounts (`ShrUV` / `ShrSV`, 32-bit lanes) are `neg` + `ushl` / `sshl`
 /// on NEON. Where the amount is `y + c` (`c` a constant splat, the sum read only by the shift: a
 /// hash's `x >> ((x >> 28) + 4)`), the amount becomes `-c - y` -- the add a `sub` from the
@@ -5098,12 +5100,8 @@ fn fold_lane_splats(f: &Func) -> Option<Func> {
                     *i = Inst::VConst(*d, kof(*s).unwrap());
                     changed = true;
                 }
-                Inst::VFma(_, _, _, a, bb, _) => {
+                Inst::VFma(_, _, _, _, bb, _) => {
                     if let Some(s) = of(*bb) {
-                        *bb = s;
-                        changed = true;
-                    } else if let Some(s) = of(*a) {
-                        *a = *bb;
                         *bb = s;
                         changed = true;
                     }
