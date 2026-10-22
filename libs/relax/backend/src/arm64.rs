@@ -3002,6 +3002,11 @@ impl<'a> Gen<'a> {
             }
             Inst::VStore(base, off, v) => {
                 let (rb, o) = self.vbase(base, off as i64);
+                if self.al.loc[v.0 as usize] == Loc::None && self.al.remat[v.0 as usize] == Remat::VConst(0) && o % 8 == 0 && (-512..=496).contains(&o) {
+                    // a zero vector: stp xzr, xzr (no movi)
+                    self.a.stp(false, ZR, ZR, rb, o as i32);
+                    return;
+                }
                 let xv = self.use_f(v, FS0);
                 self.vldst(false, xv, rb, o);
             }
@@ -3733,6 +3738,12 @@ impl<'a> Gen<'a> {
                         let rs = self.use_stored(*src, S0);
                         self.a.ldst(op, size, rs, rb, *off as i64);
                     }
+                    // a float 0.0 without a register: the integer store of zr (`fmov d30, xzr;
+                    // str s30` was two instructions)
+                    _ if self.al.loc[src.0 as usize] == Loc::None && matches!(self.al.remat[src.0 as usize], Remat::FConst(0, _)) => {
+                        let op = if size == 8 { STRX } else { STRW };
+                        self.a.ldst(op, size, ZR, rb, *off as i64);
+                    }
                     _ => {
                         let xs = self.use_f(*src, FS0);
                         self.a.ldst(op, size, xs, rb, *off as i64);
@@ -4299,19 +4310,34 @@ fn fold_lane_splats(f: &Func) -> Option<Func> {
         ndef[p.0 as usize] += 1;
     }
     let mut any = false;
+    // 32-bit constants (f32 bits / integers) by vreg
+    let mut k32: Vec<Option<u32>> = vec![None; n];
     for b in &f.blocks {
         for i in &b.insts {
             i.defs(|d| ndef[d.0 as usize] += 1);
-            if let Inst::VSplat(d, s) = i {
-                if f.vregs[s.0 as usize] == Cls::F32 {
-                    splat[d.0 as usize] = Some(*s);
+            match *i {
+                Inst::VSplat(d, s) => {
+                    splat[d.0 as usize] = Some(s);
                     any = true;
                 }
+                Inst::Fconst(d, bits, false) => k32[d.0 as usize] = Some(bits as u32),
+                Inst::Iconst(d, k) => k32[d.0 as usize] = Some(k as u32),
+                _ => {}
             }
         }
     }
     if !any {
         return None;
+    }
+    // a splat of a single-def constant is a vector constant (movi / fmov .4s #imm / one literal
+    // load, rematerialised at its uses: `fmov d31, xzr; dup v.4s, v31.s[0]` was a 0.0 splat)
+    let kof = |s: VReg| if ndef[s.0 as usize] == 1 { k32[s.0 as usize] } else { None };
+    for v in 0..n {
+        if let Some(s) = splat[v] {
+            if f.vregs[s.0 as usize] != Cls::F32 || kof(s).is_some() {
+                splat[v] = None;
+            }
+        }
     }
     // both single-def: the scalar holds the splatted value wherever the splat is read
     let of = |v: VReg| if ndef[v.0 as usize] == 1 { splat[v.0 as usize].filter(|s| ndef[s.0 as usize] == 1) } else { None };
@@ -4320,6 +4346,10 @@ fn fold_lane_splats(f: &Func) -> Option<Func> {
     for b in &mut g.blocks {
         for i in &mut b.insts {
             match i {
+                Inst::VSplat(d, s) if kof(*s).is_some() => {
+                    *i = Inst::VConst(*d, kof(*s).unwrap());
+                    changed = true;
+                }
                 Inst::VFma(_, _, _, a, bb, _) => {
                     if let Some(s) = of(*bb) {
                         *bb = s;
