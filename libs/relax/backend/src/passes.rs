@@ -3817,7 +3817,10 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
     }
     // compares and selects only: the arms of a value choice (an Ordering), not general arithmetic
     // (speculating sums cost iterator loops more instructions than their branches: iter_chain +27%)
-    let speculatable = |i: &Inst| matches!(i, Inst::ICmp(..) | Inst::ICmpI(..) | Inst::Sel(..));
+    // A float negation too: `if x < 0.0 { -x } else { x }` (box3d's scalar abs_v: -0.0 and NaN keep
+    // their sign, so no fabs) is fcmp + fneg + fcsel, not a branch around one fneg per lane
+    // (rustc's arm64 test_bounds_triangle_overlap has no such branches)
+    let speculatable = |i: &Inst| matches!(i, Inst::ICmp(..) | Inst::ICmpI(..) | Inst::Sel(..) | Inst::FUnary(FUn::Neg, ..));
     // an arm: (speculated temporaries, copies (dest, source or constant), join) when block x is
     // cheap temporaries (single-def, read only in x) then copies / constants into its results and a
     // jump, entered only from the branch
