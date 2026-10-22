@@ -741,7 +741,8 @@ pub fn cmd_timeline(req: &Req, out: &mut Out) {
         "frames" => frames_cmd(req, out),
         "frame" => frame_cmd(req, out),
         "save" => save_cmd(out),
-        _ => out.err("usage: timeline start [max_s=30] | stop | frames [n=30] | frame <n|slowest> | save"),
+        "waits" | "contention" => waits_cmd(req, out),
+        _ => out.err("usage: timeline start [max_s=30] | stop | frames [n=30] | frame <n|slowest> | waits [s=3] [n=15] | save"),
     }
 }
 use std::sync::atomic::Ordering::AcqRel;
@@ -878,6 +879,111 @@ fn frames_cmd(req: &Req, out: &mut Out) {
             i
         ));
     }
+}
+
+/// `timeline waits [s=3] [n=15]` (alias `contention`): lock / condvar / park / owner waits of a
+/// capture grouped by what was waited on: count, total and longest wait, per frame, which threads
+/// waited and who ended the waits most. `s=`: record that long first (else the last capture).
+fn waits_cmd(req: &Req, out: &mut Out) {
+    if let Some(sv) = req.get("s").and_then(|v| v.parse::<f64>().ok()) {
+        if recording() {
+            return out.err("a timeline capture is running: `timeline stop` first (or ask without s=)");
+        }
+        EPOCH.fetch_add(1, AcqRel);
+        STARTED_NS.store(crate::clock::wall_ns(), Relaxed);
+        STOPPED_NS.store(0, Relaxed);
+        RINGS_ON.store(true, Release);
+        flag_update();
+        let gone = out.gone();
+        let t0 = std::time::Instant::now();
+        while t0.elapsed().as_secs_f64() < sv.clamp(0.2, 30.0) && !gone() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        stop();
+    }
+    let stop_t = stopped_or_now();
+    let ths = build(collect(), stop_t);
+    if ths.is_empty() {
+        return out.err("no capture: `timeline waits s=3` records 3 s first");
+    }
+    let wall = stop_t.saturating_sub(STARTED_NS.load(Relaxed)).max(1);
+    let frames = ui_thread(&ths).map_or(0, |ui| frames_of(&ths[ui]).len());
+    let tname = |h: u64| -> String {
+        let all = super::threads::list();
+        match ths.iter().find(|t| t.handle == h) {
+            Some(t) => all.iter().find(|x| x.os_id == t.os_id).map(|x| if x.name.is_empty() { format!("T{}", x.os_id) } else { x.name.clone() }).unwrap_or_else(|| format!("T{}", t.os_id)),
+            None => "?".into(),
+        }
+    };
+    // (what, total ns, max ns, count, waiting threads, wakers)
+    let mut groups: Vec<(String, u64, u64, u64, Vec<u64>, Vec<(u64, u64)>)> = Vec::new();
+    for th in &ths {
+        for sg in th.segs.iter().filter(|s| s.wait) {
+            let d = sg.t1.saturating_sub(sg.t0);
+            let what = sg.what.trim_start_matches("wait: ").to_string();
+            let k = match groups.iter().position(|g| g.0 == what) {
+                Some(k) => k,
+                None => {
+                    groups.push((what, 0, 0, 0, Vec::new(), Vec::new()));
+                    groups.len() - 1
+                }
+            };
+            let g = &mut groups[k];
+            g.1 += d;
+            g.2 = g.2.max(d);
+            g.3 += 1;
+            if !g.4.contains(&th.handle) {
+                g.4.push(th.handle);
+            }
+            if let Some((w, _)) = sg.woke_by.filter(|w| w.0 != 0) {
+                match g.5.iter_mut().find(|x| x.0 == w) {
+                    Some(x) => x.1 += 1,
+                    None => g.5.push((w, 1)),
+                }
+            }
+        }
+    }
+    groups.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let total: u64 = groups.iter().map(|g| g.1).sum();
+    let Some(top) = groups.first() else {
+        out.always(&format!("no waits in {:.1} s ({} threads recorded): nothing blocked", wall as f64 / 1e9, ths.len()));
+        return;
+    };
+    out.always(&format!(
+        "waits took {:.1} ms of thread time in {:.1} s{}; most: `{}` {:.1} ms in {} waits (longest {:.2} ms)",
+        total as f64 / 1e6,
+        wall as f64 / 1e9,
+        if frames > 0 { format!(" ({} frames)", frames) } else { String::new() },
+        short(&top.0, 80),
+        top.1 as f64 / 1e6,
+        top.3,
+        top.2 as f64 / 1e6
+    ));
+    out.line("");
+    out.line("| waited on | total ms | waits | longest ms | per frame ms | waiting threads | ended by |");
+    out.line("|---|---:|---:|---:|---:|---|---|");
+    let n = req.num("n", 15) as usize;
+    for g in groups.iter().take(n) {
+        let mut wk = g.5.clone();
+        wk.sort_by(|a, b| b.1.cmp(&a.1));
+        out.line(&format!(
+            "| {} | {:.2} | {} | {:.2} | {} | {} | {} |",
+            short(&g.0.replace('|', "/"), 70),
+            g.1 as f64 / 1e6,
+            g.3,
+            g.2 as f64 / 1e6,
+            if frames > 0 { format!("{:.3}", g.1 as f64 / 1e6 / frames as f64) } else { "-".into() },
+            g.4.iter().take(3).map(|h| tname(*h)).collect::<Vec<_>>().join(", "),
+            wk.iter().take(2).map(|(h, c)| format!("{} ({})", tname(*h), c)).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if groups.len() > n {
+        let rest: u64 = groups[n..].iter().map(|g| g.1).sum();
+        out.line(&format!("+{} more waited-on objects, {:.2} ms", groups.len() - n, rest as f64 / 1e6));
+    }
+    out.always("note: waits the registry sees (program Mutex / Condvar / park / once / join, owner requests, query latches); a wait's waker is the futex wake or owner reply that ended it");
+    out.always(&format!("note: {}", super::reliability::line(true)));
+    out.always("more: timeline frames  timeline frame slowest  why-hung  waits");
 }
 
 fn frame_cmd(req: &Req, out: &mut Out) {
