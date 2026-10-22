@@ -6886,10 +6886,7 @@ impl<'a> Lcx<'a> {
                 if !self.u.provided.is_empty() {
                     self.check_provided_static(d, t);
                 }
-                let addr = self.static_addr(d);
-                let addr = self.u.syms.intern(crate::syms::SymKind::Static(d), addr);
-                let p = self.f.vreg(Cls::I);
-                self.emit(Inst::Addr(p, addr));
+                let p = self.static_ptr(d);
                 self.read_place(&Place::Mem(p, 0), t)
             }
             DefKind::ForeignStatic => match self.u.foreign_sym(d) {
@@ -6918,6 +6915,46 @@ impl<'a> Lcx<'a> {
             // fn items are zero-sized values; calls resolve them directly
             _ => self.unit(),
         }
+    }
+
+    /// The address of static `d`: the calling thread's copy of a `#[thread_local]` one
+    /// (Unit::thread_local_place), any other's storage in the running domain.
+    fn static_ptr(&mut self, d: DefId) -> VReg {
+        let p = self.f.vreg(Cls::I);
+        let def = self.u.prog.def(d);
+        let ast = &self.u.prog.files[def.file as usize].ast;
+        if crate::lang_items::has_attr(&self.u.prog, def.file, ast.list(ast.item(def.item).attrs), "thread_local") {
+            let Some(pl) = self.u.thread_local_place_shared(d) else {
+                self.err(self.pos, format!("could not evaluate static {} -- see its own error", self.u.prog.def_path(d)));
+                self.emit(Inst::Iconst(p, 0));
+                return p;
+            };
+            self.emit(if pl.fixed { Inst::TlsStatic(p, pl.sym) } else { Inst::TlsAddr(p, pl.sym) });
+            if let Some(size) = pl.init {
+                // the thread's first access: its copy starts as the static's value (the image in
+                // the static's own storage, rebased for the running domain), then the flag is set
+                let flag = self.f.vreg(Cls::I);
+                self.emit(Inst::Load(Mem::Int(1, false), flag, p, size as i32));
+                let init = self.f.block();
+                let done = self.f.block();
+                self.term(Term::Branch(flag, done, init));
+                self.switch(init);
+                let image = self.static_addr(d);
+                let image = self.u.syms.intern(crate::syms::SymKind::Static(d), image);
+                let src = self.f.vreg(Cls::I);
+                self.emit(Inst::Addr(src, image));
+                self.emit(Inst::Copy(p, src, size));
+                let one = self.iconst(1);
+                self.emit(Inst::Store(Mem::Int(1, false), p, size as i32, one));
+                self.goto(done);
+                self.switch(done);
+            }
+            return p;
+        }
+        let addr = self.static_addr(d);
+        let addr = self.u.syms.intern(crate::syms::SymKind::Static(d), addr);
+        self.emit(Inst::Addr(p, addr));
+        p
     }
 
     /// Static `d`'s storage. Its initializer failed (address 0, reported as its own error):
@@ -7181,10 +7218,7 @@ impl<'a> Lcx<'a> {
                     if !self.u.provided.is_empty() {
                         self.check_provided_static(d, t);
                     }
-                    let addr = self.static_addr(d);
-                    let addr = self.u.syms.intern(crate::syms::SymKind::Static(d), addr);
-                    let p = self.f.vreg(Cls::I);
-                    self.emit(Inst::Addr(p, addr));
+                    let p = self.static_ptr(d);
                     (Place::Mem(p, 0), t)
                 }
                 Some(Res::Def(d)) if self.u.prog.def(d).kind == DefKind::ForeignStatic => match self.u.foreign_sym(d) {

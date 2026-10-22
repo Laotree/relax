@@ -73,6 +73,7 @@ pub fn map_inst(x: &Inst, m: &dyn Fn(VReg) -> VReg, slot_base: u32) -> Inst {
         Inst::Cpuid(ds, a, b) => Inst::Cpuid(ds.map(m), m(*a), m(*b)),
         Inst::Xgetbv(d, a) => Inst::Xgetbv(m(*d), m(*a)),
         Inst::TlsAddr(d, off) => Inst::TlsAddr(m(*d), *off),
+        Inst::TlsStatic(d, off) => Inst::TlsStatic(m(*d), *off),
         Inst::Sel(d, c, a, b) => Inst::Sel(m(*d), m(*c), m(*a), m(*b)),
         Inst::VSel(d, k, a, b) => Inst::VSel(m(*d), m(*k), m(*a), m(*b)),
         Inst::VFma(np, na, d, a, b, c) => Inst::VFma(*np, *na, m(*d), m(*a), m(*b), m(*c)),
@@ -2592,7 +2593,7 @@ pub fn sink_to_successor(f: &mut Func) -> bool {
         for (ii, i) in b.insts.iter().enumerate().rev() {
             uses_defs(i, &mut uses, &mut defs);
             let load = matches!(i, Inst::Load(..));
-            let movable = is_pure(i) && !matches!(i, Inst::LoadX(..) | Inst::VLoad(..) | Inst::VLoadX(..) | Inst::VGather(..) | Inst::VTbl(..) | Inst::TlsAddr(..));
+            let movable = is_pure(i) && !matches!(i, Inst::LoadX(..) | Inst::VLoad(..) | Inst::VLoadX(..) | Inst::VGather(..) | Inst::VTbl(..) | Inst::TlsAddr(..) | Inst::TlsStatic(..));
             if movable && !fp_env && (!load || !memory_effect) && defs.len() == 1 && ndef[defs[0].0 as usize] == 1 {
                 let s = use_block[defs[0].0 as usize];
                 if s < nb && s != bi && s != 0 && npred[s] == 1 && b.term.succs().any(|t| t as usize == s)
@@ -3750,7 +3751,10 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
             for_defs(i, |d| defs.push(d));
             let temp = defs.len() == 1 && {
                 let d = defs[0];
-                ndef[d.0 as usize] == 1 && nuse[d.0 as usize] > 0 && local_uses.iter().any(|e| e.0 == d && e.1 == nuse[d.0 as usize])
+                // temporaries this pass made for an earlier conversion (the block is now another
+                // branch's arm) are past the counts: one def, one use in their block
+                let (nd, nu) = (ndef.get(d.0 as usize).copied().unwrap_or(1), nuse.get(d.0 as usize).copied().unwrap_or(1));
+                nd == 1 && nu > 0 && local_uses.iter().any(|e| e.0 == d && e.1 == nu)
             };
             match i {
                 _ if temp && speculatable(i) && mv.is_empty() => spec.push(i.clone()),

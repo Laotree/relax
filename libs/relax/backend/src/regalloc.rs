@@ -207,7 +207,7 @@ pub fn uses_defs(i: &Inst, uses: &mut Vec<VReg>, defs: &mut Vec<VReg>) {
         Inst::FpEnv(false, v) => defs.push(*v),
         Inst::Cpuid(ds, a, b) => { uses.push(*a); uses.push(*b); defs.extend_from_slice(ds); }
         Inst::Xgetbv(d, a) => { uses.push(*a); defs.push(*d); }
-        Inst::TlsAddr(d, _) => defs.push(*d),
+        Inst::TlsAddr(d, _) | Inst::TlsStatic(d, _) => defs.push(*d),
         Inst::VGather(d, a, b) | Inst::VTbl(d, a, b, _) | Inst::VShuffle(d, a, b, _) => {
             uses.push(*a);
             uses.push(*b);
@@ -316,7 +316,7 @@ pub fn for_uses(i: &Inst, mut uses: impl FnMut(VReg)) {
         Inst::FpEnv(true, v) => uses(*v),
         Inst::Cpuid(_, a, b) => { uses(*a); uses(*b); }
         Inst::Xgetbv(_, a) => uses(*a),
-        Inst::TlsAddr(d, _) => {}
+        Inst::TlsAddr(d, _) | Inst::TlsStatic(d, _) => {}
         Inst::VGather(d, a, b) | Inst::VTbl(d, a, b, _) | Inst::VShuffle(d, a, b, _) => {
             uses(*a);
             uses(*b);
@@ -388,6 +388,7 @@ pub fn for_defs(i: &Inst, mut defs: impl FnMut(VReg)) {
         | Inst::FnAddr(d, _)
         | Inst::VConst(d, _)
         | Inst::TlsAddr(d, _)
+        | Inst::TlsStatic(d, _)
         | Inst::Mov(d, _)
         | Inst::INeg(_, d, _)
         | Inst::INot(_, d, _)

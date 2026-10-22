@@ -868,6 +868,11 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
             f.sret_callees.push(*c);
         }
     }
+    for c in &callee.nocapture {
+        if !f.nocapture.contains(c) {
+            f.nocapture.push(c.clone());
+        }
+    }
     // split the block after the call
     let blk = &mut f.blocks[bi];
     let tail = blk.insts.split_off(ii + 1);
@@ -1167,6 +1172,59 @@ pub fn param_nocapture(f: &Func, k: usize, sub: &dyn Fn(&Callee, usize) -> bool)
         }
     }
     true
+}
+
+/// How `f` uses the pointer it gets as parameter `k`, as LLVM's capture tracking with `returned`:
+/// None when it may keep a copy (a derived value stored to memory, used as an indirect callee, or
+/// passed to a call `sub` cannot vouch for); Some(r) when it keeps none, `r` when a value derived
+/// from it may be returned. `sub(callee, arg)` answers the same for the calls it is passed to: a
+/// call that may return it gives a derived result. Loads, stores and copies through it are fine.
+pub fn param_escape(f: &Func, k: usize, sub: &dyn Fn(&Callee, usize) -> Option<bool>) -> Option<bool> {
+    let &p = f.params.get(k)?;
+    let mut t = vec![false; f.vregs.len()];
+    t[p.0 as usize] = true;
+    let mut returned = false;
+    for _ in 0..16 {
+        let mut more = false;
+        for b in &f.blocks {
+            for i in &b.insts {
+                let from = match i {
+                    Inst::Mov(_, x) | Inst::IBinI(_, _, _, x, _) | Inst::Conv(_, _, x) => t[x.0 as usize],
+                    Inst::IBin(_, _, _, x, y) | Inst::Sel(_, _, x, y) => t[x.0 as usize] || t[y.0 as usize],
+                    Inst::Store(_, _, _, v) | Inst::StoreX(_, _, _, _, _, v) | Inst::VStore(_, _, v) | Inst::AtomicStore(_, _, _, v) | Inst::AtomicRmw(_, _, _, _, _, v) if t[v.0 as usize] => return None,
+                    Inst::AtomicCas(_, _, _, _, _, e, n) if t[e.0 as usize] || t[n.0 as usize] => return None,
+                    Inst::Call(c, args, _) => {
+                        if matches!(c, Callee::Indirect(v) | Callee::CIndirect(v, _) if t[v.0 as usize]) || matches!(c, Callee::Asm(_)) && args.iter().any(|a| t[a.0 as usize]) {
+                            return None;
+                        }
+                        let mut r = false;
+                        for (j, a) in args.iter().enumerate() {
+                            if t[a.0 as usize] {
+                                r |= sub(c, j)?;
+                            }
+                        }
+                        r
+                    }
+                    _ => false,
+                };
+                if from {
+                    i.defs(|d| {
+                        if !t[d.0 as usize] {
+                            t[d.0 as usize] = true;
+                            more = true;
+                        }
+                    });
+                }
+            }
+            if let Term::Ret(vals) = &b.term {
+                returned |= vals.iter().any(|v| t[v.0 as usize]);
+            }
+        }
+        if !more {
+            return Some(returned);
+        }
+    }
+    None
 }
 
 /// Keep addressable 16-byte SIMD values in vector registers, including the
@@ -3598,7 +3656,7 @@ fn slot_derivation(f: &Func) -> Option<(Vec<u32>, Vec<bool>)> {
             for i in &b.insts {
                 let src = match i {
                     Inst::SlotAddr(_, s) => *s,
-                    Inst::Load(..) | Inst::LoadX(..) | Inst::VLoad(..) | Inst::AtomicLoad(..) | Inst::Iconst(..) | Inst::Fconst(..) | Inst::Addr(..) | Inst::FnAddr(..) | Inst::TlsAddr(..) | Inst::VConst(..) => NONE,
+                    Inst::Load(..) | Inst::LoadX(..) | Inst::VLoad(..) | Inst::AtomicLoad(..) | Inst::Iconst(..) | Inst::Fconst(..) | Inst::Addr(..) | Inst::FnAddr(..) | Inst::TlsAddr(..) | Inst::TlsStatic(..) | Inst::VConst(..) => NONE,
                     // stores, copies: no result (their operands are not joined)
                     _ => {
                         let mut has_def = false;
