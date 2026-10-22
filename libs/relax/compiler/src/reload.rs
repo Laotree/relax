@@ -2615,6 +2615,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     news_pairs.push(pairs);
                     let items: Vec<(crate::ast::ItemId, Result<u32, DefId>)> = added.iter().map(|&(j, at)| (crate::ast::ItemId(j), at)).collect();
                     trace_count("added_items", items.len());
+                    // items added inside a paired body (a `use` in a closure) got their defs at the
+                    // commit: the type context collects them with the other added items
+                    added_defs.extend(u.prog.take_body_added());
                     match u.prog.add_items(n, &items) {
                         Ok(ds) => added_defs.extend(ds),
                         Err(e) => add_errs.push(e),
@@ -2631,6 +2634,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     removed_defs.extend(removed);
                 }
                 Err(e) => {
+                    let _ = u.prog.take_body_added();
                     for (k, &(o, n)) in news.iter().enumerate().rev() {
                         u.prog.revert_version(o, n, &news_pairs[k]);
                     }
@@ -4564,7 +4568,7 @@ mod use_edit_tests {
         isolated_test!(editing_a_use_of_a_same_module_item_patches);
         const CHILD: &str = "MAKEPAD_RUN_USE_EDIT_CASE";
         let Ok(case) = std::env::var(CHILD) else {
-            for case in ["enum_variants", "fn_rename"] {
+            for case in ["enum_variants", "fn_rename", "use_in_closure"] {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "reload::use_edit_tests::editing_a_use_of_a_same_module_item_patches", "--nocapture", "--test-threads=1"])
                     .env(CHILD, case).env("MAKEPAD_RUN_CTFE", "0").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0")
@@ -4579,6 +4583,11 @@ mod use_edit_tests {
             "enum_variants" => (
                 "enum M { A, B }\nuse M::{A, B};\nfn main() { let _ = (A, B); }\n",
                 "enum M { A, B }\nuse M::{B, A};\nfn main() { let _ = (A, B); }\n"),
+            // a `use` and a fn added inside a closure body (LIVEDEBUG2: their defs were never
+            // collected, so the declaration table the borrow checker reads stopped short of them)
+            "use_in_closure" => (
+                "mod m { pub fn g() -> u32 { 1 } }\nfn main() { let f = || 1u32; let _ = f(); }\n",
+                "mod m { pub fn g() -> u32 { 1 } }\nfn main() { let f = || { use self::m::g as h; fn k() -> u32 { 2 } h() + k() }; let _ = f(); }\n"),
             _ => (
                 "fn f() {}\nuse self::f as g;\nfn main() { g(); }\n",
                 "fn f() {}\nuse self::f as g;\nfn main() { g(); g(); }\n"),
@@ -4592,12 +4601,23 @@ mod use_edit_tests {
         let file = prog.defs.iter().find(|d| d.krate == krate && d.kind == DefKind::Fn).map(|d| d.file).unwrap();
         let mut tcx = crate::tcx::Tcx::new();
         tcx.collect(&prog);
+        // the declaration table exists before the edit (as in a running app)
+        let main = (0..prog.defs.len() as u32).map(DefId).find(|d| prog.def(*d).krate == krate && prog.name(*d) == "main").unwrap();
+        let _ = tcx.generic_indices_of(&prog, main);
         crate::layout::set_root_crate(krate);
         crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut unit = Unit::new(prog, tcx, core);
         let up = &mut *unit as *mut Unit;
         let outcome = unsafe { apply(up, vec![Edit { file, path: path.to_string_lossy().into_owned(), src: new.as_bytes().to_vec() }]) };
         assert_eq!(outcome.rung, Rung::Patch, "{case}: {:?}", outcome.lines);
+        if case == "use_in_closure" {
+            // the body's new fn `k` has a def and its declarations are reachable
+            let k = (0..unit.prog.defs.len() as u32).map(DefId).find(|d| unit.prog.def(*d).krate == krate && unit.prog.name(*d) == "k").expect("k collected");
+            let _ = unit.tcx.generic_indices_of(&unit.prog, k);
+            for d in (0..unit.prog.defs.len() as u32).map(DefId).filter(|d| unit.prog.def(*d).krate == krate) {
+                let _ = unit.tcx.generic_indices_of(&unit.prog, d);
+            }
+        }
         std::mem::forget(unit);
         std::fs::remove_file(path).unwrap();
     }
