@@ -14,7 +14,10 @@ pub(super) struct Images {
     pending: Vec<NewEntry>,
     keys: HashSet<u128>,
     definitions: HashMap<usize, (u128, usize)>,
-    main: HashMap<u128, Option<&'static [u8]>>,
+    /// per file image key: the store and entry holding it (the crate store's own, or the run
+    /// store its reference names, mapped here: never the process's zone-scoped front mappings)
+    main: HashMap<u128, Option<(Arc<Store>, usize)>>,
+    runs: HashMap<String, Option<Arc<Store>>>,
     reused_src: usize,
     written: usize,
 }
@@ -23,7 +26,7 @@ impl Images {
     pub(super) fn open(dir: &std::path::Path, name: String) -> Option<Self> {
         let path = dir.join(&name);
         Some(Self { name, store: Arc::new(Store::open(&path)?), path,
-            pending: Vec::new(), keys: HashSet::new(), definitions: HashMap::new(), main: HashMap::new(), reused_src: 0, written: 0 })
+            pending: Vec::new(), keys: HashSet::new(), definitions: HashMap::new(), main: HashMap::new(), runs: HashMap::new(), reused_src: 0, written: 0 })
     }
 
     fn add(&mut self, key: u128, image: Writer<'_>) {
@@ -33,6 +36,26 @@ impl Images {
             self.written += payload.len();
             self.pending.push(NewEntry { key, kind: KIND_FRONT, payload });
         }
+    }
+
+    /// The file image `key` of this crate store: inline, or in the run store its reference
+    /// names; checksummed.
+    fn file_image(&mut self, key: u128) -> Option<(Arc<Store>, usize)> {
+        let ix = self.store.index.binary_search_by_key(&key, |e| e.key).ok()?;
+        let (kind, b) = self.store.get_at(ix, key)?;
+        let (st, i) = match kind {
+            KIND_FRONT => (self.store.clone(), ix),
+            KIND_FRONT_REF => {
+                let (name, k) = front_run::decode_ref(b)?;
+                if !crate::store::name_ours(name) { return None; }
+                let dir = self.path.parent()?.to_path_buf();
+                let st = self.runs.entry(name.to_string()).or_insert_with(|| Store::open(&dir.join(name)).map(Arc::new)).clone()?;
+                let i = st.index.binary_search_by_key(&k, |e| e.key).ok()?;
+                (st, i)
+            }
+            _ => return None,
+        };
+        (st.index[i].kind == KIND_FRONT && st.verify_at(i)).then_some((st, i))
     }
 
     pub(super) fn finish(self, profile: bool, name: &str) -> Option<()> {
@@ -52,13 +75,18 @@ impl DemandWriter for Images {
         // when that holds the same bytes; the scan's tokens are always stored here: a file image
         // keeps its tokens packed (PackedToks), the planner reads plain `Tok` slices.
         let main = Cache::front_key(path, hash);
-        let image = *self.main.entry(main).or_insert_with(|| {
-            let ix = self.store.index.binary_search_by_key(&main, |e| e.key).ok()?;
-            Reader::new(checked_front_entry(&self.store, ix, main)?)?.slice::<u8>(0, 1)
+        if !self.main.contains_key(&main) {
+            let found = self.file_image(main);
+            self.main.insert(main, found);
+        }
+        let same_src = self.main[&main].as_ref().is_some_and(|(st, i)| {
+            let Some((_, b)) = st.get_at(*i, st.index[*i].key) else { return false };
+            // SAFETY: only read here, while `st` (held in self.main) keeps the mapping
+            let b: &'static [u8] = unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) };
+            Reader::new(b).and_then(|r| r.slice::<u8>(0, 1)).is_some_and(|s| s.starts_with(src))
         });
         let src_hash = crate::crate_image::file_hash("", src);
         let toks_hash = crate::crate_image::demand_token_hash(toks);
-        let same_src = image.is_some_and(|s| s.starts_with(src));
         let mut key = Sip128::new();
         key.str("demand-front-surface-v2"); key.str(path); key.u128(hash);
         key.u128(src_hash); key.u128(toks_hash);
