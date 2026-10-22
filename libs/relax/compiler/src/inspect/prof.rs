@@ -115,7 +115,10 @@ mod imp {
         fn close(fd: i32) -> i32;
     }
     const PAGE: usize = 4096;
+    /// data pages of a ring (a power of two): at most, and the least a ring is opened with (one
+    /// sample with its stack copy is ~16.5 KB)
     const RING_PAGES: usize = 256;
+    const MIN_PAGES: usize = 16;
     const STACK_COPY: u32 = 16384;
     /// perf regs (x86): bx 1, bp 6, sp 7, ip 8, r12..r15 20..23 -- ascending order in a sample
     const REGS_MASK: u64 = (1 << 1) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 20) | (1 << 21) | (1 << 22) | (1 << 23);
@@ -124,9 +127,19 @@ mod imp {
         fd: i32,
         base: usize,
         os_id: u64,
+        pages: usize,
     }
 
-    fn open(tid: u64, hz: u64, ev: super::Ev) -> Option<Ring> {
+    /// Why a ring did not open: the perf_event_open errno, or the mmap's (the locked-memory
+    /// budget: RLIMIT_MEMLOCK plus the user's perf_event_mlock_kb x CPUs, shared with every perf
+    /// user of this uid -- 165 ran out at ~8-24 rings of 1 MB with ~100 program threads, and the
+    /// busy UI thread got none: no JIT samples).
+    enum OpenErr {
+        Event(i64),
+        Map,
+    }
+
+    fn open(tid: u64, hz: u64, ev: super::Ev, pages: usize) -> Result<Ring, OpenErr> {
         let mut attr = [0u8; 128];
         let put = |a: &mut [u8; 128], off: usize, v: &[u8]| a[off..off + v.len()].copy_from_slice(v);
         // exclude_kernel | exclude_hv
@@ -159,21 +172,48 @@ mod imp {
         put(&mut attr, 88, &STACK_COPY.to_ne_bytes());
         let fd = unsafe { syscall(298, attr.as_ptr(), tid as i32, -1i32, -1i32, 0u64) } as i32;
         if fd < 0 {
-            return None;
+            return Err(OpenErr::Event(std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as i64));
         }
-        let len = (1 + RING_PAGES) * PAGE;
-        let p = unsafe { mmap(std::ptr::null_mut(), len, 3, 1, fd, 0) };
-        if p as isize == -1 {
-            unsafe { close(fd) };
-            return None;
+        // the largest ring the locked-memory budget still gives (halved until it maps)
+        let mut pages = pages;
+        loop {
+            let len = (1 + pages) * PAGE;
+            let p = unsafe { mmap(std::ptr::null_mut(), len, 3, 1, fd, 0) };
+            if p as isize != -1 {
+                return Ok(Ring { fd, base: p as usize, os_id: tid, pages });
+            }
+            if pages <= MIN_PAGES {
+                unsafe { close(fd) };
+                return Err(OpenErr::Map);
+            }
+            pages /= 2;
         }
-        Some(Ring { fd, base: p as usize, os_id: tid })
+    }
+
+    /// The threads worth a ring, busiest first: those whose CPU time moved in a 30-ms look (a
+    /// thread idle then is very likely idle in the run), then the rest by CPU so far. Every thread
+    /// gets one while the budget lasts; the busy ones are opened first, so a short budget is spent
+    /// on them.
+    fn by_activity(threads: &[crate::inspect::threads::Thread]) -> Vec<usize> {
+        let before: Vec<(u64, u64)> = threads.iter().map(|t| (t.os_id, t.cpu_ns)).collect();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let now = crate::inspect::threads::list();
+        let mut order: Vec<(u64, u64, usize)> = before
+            .iter()
+            .enumerate()
+            .map(|(k, &(id, c0))| {
+                let c1 = now.iter().find(|t| t.os_id == id).map_or(c0, |t| t.cpu_ns);
+                (c1.saturating_sub(c0), c1, k)
+            })
+            .collect();
+        order.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        order.into_iter().map(|x| x.2).collect()
     }
 
     fn drain(r: &Ring, out: &mut Vec<Sample>, lost: &mut u64) {
         use std::sync::atomic::{AtomicU64, Ordering};
         let data = r.base + PAGE;
-        let size = (RING_PAGES * PAGE) as u64;
+        let size = (r.pages * PAGE) as u64;
         let head = unsafe { (*((r.base + 1024) as *const AtomicU64)).load(Ordering::Acquire) };
         let tail_p = (r.base + 1032) as *const AtomicU64;
         let mut tail = unsafe { (*tail_p).load(Ordering::Relaxed) };
@@ -234,18 +274,54 @@ mod imp {
     pub fn collect(threads: Vec<crate::inspect::threads::Thread>, secs: f64, hz: u64, ev: super::Ev, cancel: &dyn Fn() -> bool) -> Run {
         let mut notes = Vec::new();
         let mut ev = ev;
-        let mut rings: Vec<Ring> = threads.iter().filter_map(|t| open(t.os_id, hz, ev)).collect();
+        let order = by_activity(&threads);
+        let open_all = |ev: super::Ev, notes: &mut Vec<String>| -> Vec<Ring> {
+            let mut rings = Vec::new();
+            let (mut no_event, mut no_map) = (Vec::new(), Vec::new());
+            let mut errno = 0;
+            let mut pages = RING_PAGES;
+            for &k in &order {
+                let t = &threads[k];
+                // once a ring had to shrink, the next ones start at its size
+                match open(t.os_id, hz, ev, pages) {
+                    Ok(r) => {
+                        pages = r.pages;
+                        rings.push(r);
+                    }
+                    Err(OpenErr::Event(e)) => {
+                        errno = e;
+                        no_event.push(t.name.clone());
+                    }
+                    Err(OpenErr::Map) => no_map.push(t.name.clone()),
+                }
+            }
+            let list = |v: &[String]| v.iter().take(6).cloned().collect::<Vec<_>>().join(", ");
+            if !no_map.is_empty() && !rings.is_empty() {
+                notes.push(format!("{} of {} threads not sampled (the busiest {} were): the perf locked-memory budget is spent (RLIMIT_MEMLOCK + perf_event_mlock_kb, shared with this user's other perf jobs; rings of {} KB); not sampled: {}", no_map.len(), threads.len(), rings.len(), pages * PAGE / 1024, list(&no_map)));
+            } else if !no_map.is_empty() {
+                notes.push(format!("no thread could be sampled: no perf ring maps (locked-memory budget spent: RLIMIT_MEMLOCK + perf_event_mlock_kb, shared with this user's other perf jobs)"));
+            }
+            if !no_event.is_empty() && rings.is_empty() && ev == super::Ev::Cpu {
+                notes.push(format!("no thread could be sampled: perf_event_open failed (errno {}; perf_event_paranoid, seccomp or a container)", errno));
+            } else if !no_event.is_empty() && !rings.is_empty() {
+                notes.push(format!("{} threads not sampled (perf_event_open errno {}: they exited?): {}", no_event.len(), errno, list(&no_event)));
+            }
+            rings
+        };
+        let mut rings = open_all(ev, &mut notes);
         if rings.is_empty() && ev != super::Ev::Cpu && !threads.is_empty() {
             notes.push(format!("{} cannot be sampled here (no hardware PMU access for this process: perf_event_paranoid, a VM); CPU time instead", ev.name()));
             ev = super::Ev::Cpu;
-            rings = threads.iter().filter_map(|t| open(t.os_id, hz, ev)).collect();
+            rings = open_all(ev, &mut notes);
         }
         let mut samples = Vec::new();
         let mut lost = 0u64;
+        // small rings hold a few samples: drained more often
+        let tick = if rings.iter().any(|r| r.pages < 64) { 2 } else { 10 };
         let t0 = std::time::Instant::now();
         crate::inspect::activity::phase("sampling (perf rings)", 0);
         while t0.elapsed().as_secs_f64() < secs && !cancel() {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(tick));
             for r in &rings {
                 drain(r, &mut samples, &mut lost);
             }
@@ -253,7 +329,7 @@ mod imp {
         for r in &rings {
             drain(r, &mut samples, &mut lost);
             unsafe {
-                munmap(r.base as *mut u8, (1 + RING_PAGES) * PAGE);
+                munmap(r.base as *mut u8, (1 + r.pages) * PAGE);
                 close(r.fd);
             }
         }
@@ -368,6 +444,8 @@ fn activity(names: &[super::Frame]) -> &'static str {
         }
     }
     match names.first() {
+        // a thunk, lazy stub or veneer between a call and its callee: what calls cost to reach
+        Some(f) if f.module.starts_with("jit/glue") => "JIT call glue (thunks, stubs, veneers)",
         Some(f) if f.module.starts_with("jit") => "program",
         Some(f) if f.module == "makepad" => {
             if jit_seen {
@@ -647,7 +725,7 @@ pub fn cmd_why_slow(req: &Req, out: &mut Out) {
     let mut phys: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for s in &main_samples {
         // the innermost frame whose physical fn (the code it is in) is the program's
-        if let Some(n) = s.iter().filter(|f| f.module.starts_with("jit")).map(|f| f.levels.last().map_or(f.name.clone(), |l| l.0.clone())).find(|n| !super::is_std_fn(n) && !n.starts_with("jit 0x") && !n.starts_with("slot#")) {
+        if let Some(n) = s.iter().filter(|f| f.module.starts_with("jit")).map(|f| f.levels.last().map_or(f.name.clone(), |l| l.0.clone())).find(|n| !super::is_std_fn(n) && !n.starts_with("jit 0x") && !n.starts_with("slot#") && !n.starts_with('[')) {
             *phys.entry(n).or_default() += 1;
         }
     }
