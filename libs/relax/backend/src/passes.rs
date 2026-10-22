@@ -3700,7 +3700,10 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
             for_defs(i, |d| defs.push(d));
             let temp = defs.len() == 1 && {
                 let d = defs[0];
-                ndef[d.0 as usize] == 1 && nuse[d.0 as usize] > 0 && local_uses.iter().any(|e| e.0 == d && e.1 == nuse[d.0 as usize])
+                // temporaries this pass made for an earlier conversion (the block is now another
+                // branch's arm) are past the counts: one def, one use in their block
+                let (nd, nu) = (ndef.get(d.0 as usize).copied().unwrap_or(1), nuse.get(d.0 as usize).copied().unwrap_or(1));
+                nd == 1 && nu > 0 && local_uses.iter().any(|e| e.0 == d && e.1 == nu)
             };
             match i {
                 _ if temp && speculatable(i) && mv.is_empty() => spec.push(i.clone()),
