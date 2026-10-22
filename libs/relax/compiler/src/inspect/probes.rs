@@ -544,21 +544,34 @@ pub fn counters(out: &mut Vec<(String, u64, u64)>) {
 }
 
 fn remove(id: Option<u32>) -> usize {
+    remove_rows(id).0
+}
+
+/// `remove`, with a row per slot saying which code is back.
+fn remove_rows(id: Option<u32>) -> (usize, Vec<String>) {
     let up = crate::jit::current_unit();
     let take: Vec<Arc<Probe>> = PROBES.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|p| id.map_or(true, |k| k == p.id) && !p.slots.lock().unwrap_or_else(|e| e.into_inner()).is_empty()).cloned().collect();
     for p in &take {
         p.on.store(false, SeqCst);
     }
     let ids: Vec<u32> = take.iter().map(|p| p.id).collect();
-    let _ = crate::owner::call_within(crate::owner::Class::App, 10_000, move || {
+    let rows = crate::owner::call_within(crate::owner::Class::App, 10_000, move || {
+        let mut rows = Vec::new();
         for id in ids {
-            unsafe { super::patches::remove_owner(up, super::patches::Owner::Probe(id)) };
+            let owner = super::patches::Owner::Probe(id);
+            let slots = super::patches::owner_slots(owner);
+            unsafe { super::patches::remove_owner(up, owner) };
+            let u = unsafe { &*up };
+            for (slot, role, _) in slots {
+                rows.push(format!("{{\"removed\":\"P{}\",\"slot\":{},\"role\":\"{}\",\"back\":{}}}", id, slot, role, super::codever::installed_json(u, slot)));
+            }
         }
-    });
+        rows
+    }).unwrap_or_default();
     for p in &take {
         p.slots.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
-    take.len()
+    (take.len(), rows)
 }
 
 /// Removes every probe (the inspect session that added them ended).
@@ -656,7 +669,11 @@ pub fn cmd(req: &Req, out: &mut Out) {
         "rm" => {
             let w = req.pos.get(1).map(String::as_str).unwrap_or("all");
             let id = if w == "all" { None } else { w.trim_start_matches('P').parse::<u32>().ok() };
-            out.line(&format!("{{\"removed\":{}}}", remove(id)));
+            let (n, rows) = remove_rows(id);
+            for r in rows {
+                out.line(&r);
+            }
+            out.line(&format!("{{\"removed\":{}}}", n));
         }
         _ => out.err("usage: probe add <fn|file:line> <probe.rs|code> [mutate=1] | list | read P<n> | rm <P<n>|all>"),
     }

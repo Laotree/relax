@@ -924,8 +924,9 @@ fn add_to(kind: Kind, target: Target, time: bool, low: bool) -> Result<(u32, Vec
     r.unwrap_or_else(|| Err(format!("the owner did not take the request in 10 s ({})", crate::owner::serving_note())))
 }
 
-/// Removes probe group `group` (all groups with None): the code they replaced comes back.
-fn remove(group: Option<u32>) -> Result<usize, String> {
+/// Removes probe group `group` (all groups with None): the code they replaced comes back; a row
+/// per slot says which code is back.
+fn remove_rows(group: Option<u32>) -> Result<(usize, Vec<String>), String> {
     let _k = crate::zone_alloc::kept();
     let up = crate::jit::current_unit();
     let groups: Vec<(u32, u32, Vec<u32>, String)> = {
@@ -957,11 +958,19 @@ fn remove(group: Option<u32>) -> Result<usize, String> {
     let ids: Vec<u32> = groups.iter().map(|g| g.0).collect();
     let r = crate::owner::call_within(crate::owner::Class::App, 10_000, move || {
         let _kept = crate::zone_alloc::kept();
+        let mut rows = Vec::new();
         for g in ids {
-            unsafe { super::patches::remove_owner(up, super::patches::Owner::Group(g)) };
+            let owner = super::patches::Owner::Group(g);
+            let slots = super::patches::owner_slots(owner);
+            unsafe { super::patches::remove_owner(up, owner) };
+            let u = unsafe { &*up };
+            for (slot, role, _) in slots {
+                rows.push(format!("{{\"removed\":\"G{}\",\"slot\":{},\"role\":\"{}\",\"back\":{}}}", g, slot, role, super::codever::installed_json(u, slot)));
+            }
         }
+        rows
     });
-    r.map(|_| n).ok_or_else(|| format!("the owner did not take the request in 10 s ({}); the probes are off but still in the code", crate::owner::serving_note()))
+    r.map(|rows| (n, rows)).ok_or_else(|| format!("the owner did not take the request in 10 s ({}); the probes are off but still in the code", crate::owner::serving_note()))
 }
 
 #[cfg(test)]
@@ -976,7 +985,7 @@ pub(crate) fn site_hits_for_test(si: u64) -> u64 {
 
 #[cfg(test)]
 pub(crate) fn remove_for_test(group: u32) -> Result<usize, String> {
-    remove(Some(group))
+    remove_rows(Some(group)).map(|r| r.0)
 }
 
 // ------------------------------------------------------------------ pause
@@ -1225,8 +1234,13 @@ pub fn cmd(req: &Req, out: &mut Out) {
                 out.err("usage: rm <G<n>|all>");
                 return;
             }
-            match remove(g) {
-                Ok(n) => out.line(&format!("{{\"removed_groups\":{}}}", n)),
+            match remove_rows(g) {
+                Ok((n, rows)) => {
+                    for r in rows {
+                        out.line(&r);
+                    }
+                    out.line(&format!("{{\"removed_groups\":{}}}", n));
+                }
                 Err(e) => out.err(&e),
             }
         }

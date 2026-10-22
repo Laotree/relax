@@ -234,9 +234,10 @@ pub(crate) unsafe fn cover_inliners(up: *mut Unit, owner: super::patches::Owner,
         let r = super::patches::add(up, c, owner, if pin { super::patches::Edit::Pin } else { super::patches::Edit::Uninline });
         let u = &*up;
         let still = map_holds(u, &u.fns[c as usize].pc_map, &lines);
+        let now_tier = kind_at(u, u.fns[c as usize].code).tier_name();
         let why = match (&r, pin, still) {
             (Ok(true), true, _) => "its code held an inlined copy: built again at O1 (the pinned fn runs at O1 here too)".to_string(),
-            (Ok(true), false, false) => "its code held an inlined copy: built again from its baseline RIR (no inlining), so it calls the instrumented code".to_string(),
+            (Ok(true), false, false) => format!("its code held an inlined copy: built again ({}) without inlining the fn, so it calls the instrumented code", now_tier),
             (Ok(true), false, true) => "rebuilt without inlining, but its code still holds the line (a core adapter's inlined closure?): that copy runs unprobed".to_string(),
             (Ok(false), ..) => "the rebuild found no place: its inlined copy runs unprobed".to_string(),
             (Err(e), ..) => format!("not rebuilt ({}): its inlined copy runs unprobed", e),
@@ -416,6 +417,9 @@ pub(crate) fn frame_fields(u: &Unit, c: &PcCode) -> (String, String, String, Str
             if let Some(cs) = i.slot {
                 code.push_str(&format!(",\"inlined_slot\":{}", cs));
             }
+            // (the line table keeps no inline stack yet: which call site of the slot's fn this copy
+            // is for is not known, and a guess from neighbouring lines misleads)
+            code.push_str(",\"call_site\":\"not recorded (no inline stack in the line table)\"");
             i.name.clone()
         }
         None => slot_name,
