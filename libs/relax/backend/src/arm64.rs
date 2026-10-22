@@ -109,6 +109,9 @@ fn arm64_clobbers(_options: &relax_session::Options, f: &Func, i: &Inst) -> u64 
     }
 }
 
+/// pair_access's stand-in memory kind for VLoad / VStore pairs
+const V128_MEM: Mem = Mem::F64;
+
 /// v0-v7 as regalloc clobber bits (float register r = bit 32 + r)
 const V0_7: u64 = 0xff << 32;
 
@@ -3145,7 +3148,7 @@ impl<'a> Gen<'a> {
     }
 
     /// `Load a, [p + o]; Load b, [p + o +- w]` (or two stores) of the same width w (8/4-byte ints,
-    /// f64/f32; 4-byte loads zero-extending) as one ldp / stp: both values in registers (no spill
+    /// f64/f32, 16-byte vectors; 4-byte loads zero-extending) as one ldp / stp: both values in registers (no spill
     /// windows), distinct, the loads' destinations not the base, the lower offset a multiple of w
     /// within the signed 7-bit scaled range. None: no match.
     fn pair_access(&mut self, options: &relax_session::Options, i1: &Inst, i2: &Inst, pos2: u32) -> Option<()> {
@@ -3155,13 +3158,18 @@ impl<'a> Gen<'a> {
         let (load, m1, v1, b1, o1, m2, v2, b2, o2) = match (i1, i2) {
             (Inst::Load(m1, d1, b1, o1), Inst::Load(m2, d2, b2, o2)) => (true, *m1, *d1, *b1, *o1, *m2, *d2, *b2, *o2),
             (Inst::Store(m1, b1, o1, s1), Inst::Store(m2, b2, o2, s2)) => (false, *m1, *s1, *b1, *o1, *m2, *s2, *b2, *o2),
+            // 16-byte vectors: ldp / stp q (Mem::F64 stands in for "float register"; the width is 16)
+            (Inst::VLoad(d1, b1, o1), Inst::VLoad(d2, b2, o2)) => (true, V128_MEM, *d1, *b1, *o1, V128_MEM, *d2, *b2, *o2),
+            (Inst::VStore(b1, o1, s1), Inst::VStore(b2, o2, s2)) => (false, V128_MEM, *s1, *b1, *o1, V128_MEM, *s2, *b2, *o2),
             _ => return None,
         };
+        let vec = matches!(i1, Inst::VLoad(..) | Inst::VStore(..));
         if m1 != m2 || b1 != b2 || v1 == v2 {
             return None;
         }
         // (pair opcode, width, float?)
         let (op, w, fp) = match (m1, load) {
+            _ if vec => (if load { 0xAD40_0000u32 } else { 0xAD00_0000 }, 16i64, true),
             (Mem::Int(8, _), true) => (0xA940_0000u32, 8i64, false),
             (Mem::Int(8, _), false) => (0xA900_0000, 8, false),
             (Mem::Int(4, false), true) => (0x2940_0000, 4, false),
@@ -3227,14 +3235,35 @@ impl<'a> Gen<'a> {
                 self.cmp_imm(ra, *v);
                 icc(*c, *signed)
             }
-            Inst::FCmp(c, f64_, _, a, b) => {
-                let xa = self.use_f(*a, FS0);
-                let xb = self.use_f(*b, FS1);
-                self.a.fcmp(*f64_, xa, xb);
-                fcc(*c)
-            }
+            Inst::FCmp(c, f64_, _, a, b) => fcc(self.fcmp_v(*c, *f64_, *a, *b)),
             _ => NE,
         }
+    }
+
+    /// fcmp a, b for `a c b`; against a register-less +0.0 (either side) the zero form (`fcmp s,
+    /// #0.0`, no `fmov d31, xzr`). Returns the condition on the flags (swapped with the operands:
+    /// a < b == b > a, also for unordered operands).
+    fn fcmp_v(&mut self, c: Cond, f64_: bool, a: VReg, b: VReg) -> Cond {
+        let zero = |g: &Self, v: VReg| g.al.loc[v.0 as usize] == Loc::None && matches!(g.al.remat[v.0 as usize], Remat::FConst(0, _));
+        let (x, c) = if zero(self, b) {
+            (a, c)
+        } else if zero(self, a) {
+            (b, match c {
+                Cond::Lt => Cond::Gt,
+                Cond::Le => Cond::Ge,
+                Cond::Gt => Cond::Lt,
+                Cond::Ge => Cond::Le,
+                c => c,
+            })
+        } else {
+            let xa = self.use_f(a, FS0);
+            let xb = self.use_f(b, FS1);
+            self.a.fcmp(f64_, xa, xb);
+            return c;
+        };
+        let xx = self.use_f(x, FS0);
+        self.a.e(0x1E20_2008 | if f64_ { DBL } else { 0 } | (xx as u32) << 5);
+        c
     }
 
     fn cmp_imm(&mut self, ra: u8, v: i64) {
@@ -3668,11 +3697,9 @@ impl<'a> Gen<'a> {
                 self.fin_f(*d, xd);
             }
             Inst::FCmp(c, f64_, d, a, b) => {
-                let xa = self.use_f(*a, FS0);
-                let xb = self.use_f(*b, FS1);
-                self.a.fcmp(*f64_, xa, xb);
+                let c = self.fcmp_v(*c, *f64_, *a, *b);
                 let rd = self.def_i(*d, S0);
-                self.a.cset(rd, fcc(*c));
+                self.a.cset(rd, fcc(c));
                 self.fin_i(*d, rd);
             }
             Inst::Conv(c, d, s) => self.conv(*c, *d, *s),
