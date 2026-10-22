@@ -11667,11 +11667,6 @@ fn rt_loop_hot(counter: u64, fp: u64) {
         // address into it); a frame that is not JIT code ends the walk before its fp is read
         let mut fp = fp;
         let mut at = id;
-        // callers big enough to be their own build (O1 code > SMALL_CODE) are credited up to
-        // LOOP_BIG_CALLERS of them (the sampler's pc + two callers); small frames between them
-        // (iterator adaptors, wrappers) are inlined anyway and do not count
-        let mut big = 0;
-        let limit = if pgo3_off("walk") { usize::MAX } else { LOOP_BIG_CALLERS };
         for _ in 0..LOOP_CALLERS {
             if fp == 0 || fp % 8 != 0 {
                 break;
@@ -11691,12 +11686,6 @@ fn rt_loop_hot(counter: u64, fp: u64) {
                 }
                 if again(c) {
                     queue_loop(u, c, rate);
-                }
-                if (*tier_rec(&u.slots, c).add(5)).load(Ordering::Relaxed) & CODE_BYTES > SMALL_CODE {
-                    big += 1;
-                    if big >= limit {
-                        break;
-                    }
                 }
             }
             at = c;
@@ -11728,9 +11717,6 @@ const LOOP_PER_CALL: u64 = 20;
 /// all entered rarely). The sampler reached the same frames by crediting each sample to the pc's
 /// function and two callers, again as their code tiered up.
 const LOOP_CALLERS: usize = 64;
-/// ... of which at most this many callers with O1 code over SMALL_CODE (event dispatch frames under
-/// a UI's per-frame loops took 1-1.4 s O3 builds each: Stage idle O3 CPU 1.5x the sampler's)
-const LOOP_BIG_CALLERS: usize = 2;
 /// A count stub reaching zero queues its slot only if the TIER1_CALLS calls came within this
 /// window (a rate, not a total): otherwise the count starts again. Counts never decayed: in a
 /// UI everything called once per frame reached 2000 within a minute and O3 never went
