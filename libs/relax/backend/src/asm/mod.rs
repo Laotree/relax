@@ -1420,3 +1420,5 @@ mod tests;
 mod tests_x64;
 #[cfg(test)]
 mod tests_arm64;
+#[cfg(test)]
+mod tests_dis_x64;
