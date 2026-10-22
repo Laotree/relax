@@ -677,6 +677,8 @@ struct Gen<'a> {
     /// loads to emit before the instruction at a position
     win: std::collections::HashMap<u32, Vec<(u32, u32, u8)>>,
     win_start: std::collections::HashMap<u32, Vec<(u32, u8)>>,
+    /// block-local evictions (Alloc::evicts / prestores): transfers before the instruction at a position
+    evict_at: std::collections::HashMap<u32, Vec<regalloc::EvOp>>,
     /// passes::low_bits_only: narrow results whose re-extension nobody reads
     low_only: Vec<bool>,
     /// passes::zero_above: values whose register is zero above that many bits
@@ -823,9 +825,29 @@ impl<'a> Gen<'a> {
         }
         (base, off)
     }
+    /// Eviction stores / reloads before an instruction (regalloc::evict_ops); flags untouched.
+    fn evict_transfers(&mut self, ops: &[regalloc::EvOp]) {
+        for op in ops {
+            match *op {
+                regalloc::EvOp::Store(r, o) => {
+                    let off = self.spill_sp(o);
+                    self.a.ldst(STRX, 8, r, SP, off);
+                }
+                regalloc::EvOp::Load(r, o) => {
+                    let off = self.spill_sp(o);
+                    self.a.ldst(LDRX, 8, r, SP, off);
+                }
+                regalloc::EvOp::Remat(r, k) => self.remat_kind_into(r, k),
+            }
+        }
+    }
     /// Recomputes a value without a location (Alloc::remat) into r.
     fn remat_into(&mut self, r: u8, v: VReg) {
-        match self.al.remat[v.0 as usize] {
+        self.remat_kind_into(r, self.al.remat[v.0 as usize]);
+    }
+    /// remat_into for a recomputation kind (also an evicted constant's reload, Alloc::evicts).
+    fn remat_kind_into(&mut self, r: u8, k: Remat) {
+        match k {
             // never xzr for 0: register 31 is sp in add-immediate and address operands
             Remat::Const(k) => self.a.mov_imm(r, k),
             Remat::Slot(s) => {
@@ -1178,6 +1200,9 @@ impl<'a> Gen<'a> {
             for (ii, inst) in b.insts.iter().enumerate() {
                 self.pc_map.push(((self.a.pos() * 4) as u32, b.pos[ii]));
                 self.cur_pos = self.al.inst_pos(bi, ii);
+                if let Some(ops) = self.evict_at.get(&self.cur_pos).cloned() {
+                    self.evict_transfers(&ops);
+                }
                 if let Some(ls) = self.win_start.get(&self.cur_pos).cloned() {
                     for (v, r) in ls {
                         if let Loc::Stack(o) = self.al.loc[v as usize] {
@@ -3049,7 +3074,7 @@ impl<'a> Gen<'a> {
     /// windows), distinct, the loads' destinations not the base, the lower offset a multiple of w
     /// within the signed 7-bit scaled range. None: no match.
     fn pair_access(&mut self, options: &relax_session::Options, i1: &Inst, i2: &Inst, pos2: u32) -> Option<()> {
-        if isel_flags(options) & A64_FUSE == 0 || self.win_start.contains_key(&pos2) {
+        if isel_flags(options) & A64_FUSE == 0 || self.win_start.contains_key(&pos2) || self.evict_at.contains_key(&pos2) {
             return None;
         }
         let (load, m1, v1, b1, o1, m2, v2, b2, o2) = match (i1, i2) {
@@ -4370,6 +4395,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         zero_above: Vec::new(),
         switch_in_range: Vec::new(),
         copy_reg: std::collections::HashMap::new(),
+        evict_at: regalloc::evict_ops(&al),
         win_start: {
             let mut ws: std::collections::HashMap<u32, Vec<(u32, u8)>> = std::collections::HashMap::new();
             for &(v, a, _, r) in &al.windows {

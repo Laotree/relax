@@ -971,6 +971,8 @@ struct Gen<'a> {
     /// loads to emit before the instruction at a position
     win: std::collections::HashMap<u32, Vec<(u32, u32, u8)>>,
     win_start: std::collections::HashMap<u32, Vec<(u32, u8)>>,
+    /// block-local evictions (Alloc::evicts / prestores): transfers before the instruction at a position
+    evict_at: std::collections::HashMap<u32, Vec<regalloc::EvOp>>,
     /// passes::low_bits_only: narrow results whose re-extension nobody reads
     low_only: Vec<bool>,
     /// passes::zero_above: values whose register is zero above that many bits
@@ -1147,7 +1149,11 @@ impl<'a> Gen<'a> {
     /// Recomputes a value without a location (Alloc::remat) into r, flags-preserving: a fused
     /// compare may have set them for the next jcc / cmov.
     fn remat_into(&mut self, r: u8, v: VReg) {
-        match self.al.remat[v.0 as usize] {
+        self.remat_kind_into(r, self.al.remat[v.0 as usize]);
+    }
+    /// remat_into for a recomputation kind (also an evicted constant's reload, Alloc::evicts).
+    fn remat_kind_into(&mut self, r: u8, k: Remat) {
+        match k {
             Remat::Const(k) => self.a.mov_ri_nf(r, k),
             Remat::Slot(s) => {
                 let off = self.slot_off[s as usize];
@@ -1219,6 +1225,27 @@ impl<'a> Gen<'a> {
             }
         }
         self.a.load64(dst, RBP, disp);
+    }
+    /// Eviction stores / reloads before an instruction (regalloc::evict_ops): plain moves, the
+    /// flags are left alone.
+    fn evict_transfers(&mut self, ops: &[regalloc::EvOp]) {
+        for op in ops {
+            match *op {
+                regalloc::EvOp::Store(r, o) => {
+                    let d = self.spill_disp(o);
+                    self.a.store64(RBP, d, r);
+                }
+                regalloc::EvOp::Load(r, o) => {
+                    let d = self.spill_disp(o);
+                    self.a.load64(r, RBP, d);
+                }
+                regalloc::EvOp::Remat(r, k) => self.remat_kind_into(r, k),
+            }
+        }
+    }
+    /// Spill-window loads or eviction transfers happen before the instruction at position p.
+    fn pos_events(&self, p: u32) -> bool {
+        self.win_start.contains_key(&p) || self.evict_at.contains_key(&p)
     }
     /// A full register copy of v's class between any two of xmm0..31 (ymm for V256).
     fn mov_cls(&mut self, v: VReg, dst: u8, src: u8) {
@@ -1582,6 +1609,9 @@ impl<'a> Gen<'a> {
                     self.rir_map.push((self.a.pos() as u32, bi as u32, ii as u32));
                 }
                 self.cur_pos = self.al.inst_pos(bi, ii);
+                if let Some(ops) = self.evict_at.get(&self.cur_pos).cloned() {
+                    self.evict_transfers(&ops);
+                }
                 if let Some(ls) = self.win_start.get(&self.cur_pos).cloned() {
                     for (v, r) in ls {
                         if let Loc::Stack(o) = self.al.loc[v as usize] {
@@ -2635,13 +2665,13 @@ impl<'a> Gen<'a> {
             let Term::Jump(t) = b.term else { continue };
             // the block that reads the domain base is not skipped, whatever else it holds
             // nor a block that loads a region window before its jump
-            if !reach[bi] || t as usize == bi || self.dom_read.get(bi) == Some(&true) || self.win_start.contains_key(&(self.al.block_end[bi] - 1)) {
+            if !reach[bi] || t as usize == bi || self.dom_read.get(bi) == Some(&true) || self.pos_events(self.al.block_end[bi] - 1) {
                 continue;
             }
             let silent = b.insts.iter().enumerate().all(|(ii, i)| match *i {
                 Inst::Mov(d, s2) => {
                     let (ld, ls) = (self.al.loc[d.0 as usize], self.al.loc[s2.0 as usize]);
-                    ld == ls && matches!(ld, Loc::Reg(_) | Loc::Flt(_) | Loc::Stack(_)) && !self.win_start.contains_key(&self.al.inst_pos(bi, ii))
+                    ld == ls && matches!(ld, Loc::Reg(_) | Loc::Flt(_) | Loc::Stack(_)) && !self.pos_events(self.al.inst_pos(bi, ii))
                 }
                 _ => false,
             });
@@ -6034,6 +6064,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         }
         (w, ws)
     };
+    let evict_at = regalloc::evict_ops(&al);
     let mut g = Gen {
         a: Asm { b: Vec::with_capacity(256), sib: None },
         f,
@@ -6064,6 +6095,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         last_spill: None,
         win,
         win_start,
+        evict_at,
         low_only: crate::passes::low_bits_only(options, f),
         zero_above: Vec::new(),
         switch_in_range: Vec::new(),
