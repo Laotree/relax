@@ -321,7 +321,8 @@ pub fn hitch(ns: u64, typical_ns: u64) {
     if !on() {
         return;
     }
-    event("hitch", &format!("frame {:.0} ms (typical {:.1} ms)", ns as f64 / 1e6, typical_ns as f64 / 1e6), ns, typical_ns);
+    let typical = if typical_ns > 0 && typical_ns < ns / 2 { format!(" (typical {:.1} ms)", typical_ns as f64 / 1e6) } else { String::new() };
+    event("hitch", &format!("frame {:.0} ms{}", ns as f64 / 1e6, typical), ns, typical_ns);
     let th = DUMP_MS.load(Relaxed);
     if th > 0 && ns >= th * 1_000_000 {
         request_dump(Why::Hitch);
@@ -356,6 +357,7 @@ pub fn counter(name: &'static str, value: i64) {
     if !on() {
         return;
     }
+    let _k = crate::zone_alloc::kept();
     COUNTERS.lock().unwrap_or_else(|e| e.into_inner()).push((crate::clock::wall_ns(), name, value));
 }
 
@@ -425,6 +427,8 @@ fn is_ui_or_owner(t: &super::threads::Thread) -> bool {
 }
 
 fn watch() {
+    // everything this thread keeps outlives compiler generations (a zone swap frees their heaps)
+    let _k = crate::zone_alloc::kept();
     super::heap::exclude_this_thread();
     loop {
         std::thread::park_timeout(std::time::Duration::from_millis(50));

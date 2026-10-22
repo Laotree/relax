@@ -1098,8 +1098,12 @@ fn time_arg(p: &Profile, w: &str) -> Result<u64, String> {
     Ok(base + (v * 1e9) as u64)
 }
 
-/// The host's own event categories (everything else is the app's).
-const HOST_CATS: &[&str] = &["log", "log.warn", "log.error", "panic", "panic.decided", "hitch", "zone.swap", "cache.write", "fault", "mark", "seed.script", "hang", "deadlock", "mem", "spike", "rtstall", "scripterr", "patchrefused", "patchverified", "patchreverted"];
+/// The host's and the platform's own event categories (everything else is the app's).
+fn is_host_cat(c: &str) -> bool {
+    const PREFIXES: &[&str] = &["run.", "log", "panic", "window.", "seed.", "replay.", "zone.", "cache.", "fault"];
+    const KINDS: &[&str] = &["hitch", "mark", "hang", "deadlock", "mem", "spike", "rtstall", "scripterr", "patchrefused", "patchverified", "patchreverted"];
+    PREFIXES.iter().any(|p| c.starts_with(p)) || KINDS.contains(&c)
+}
 
 /// What lane `other` did during the waits `ws` (intervals) of another lane: the one sentence
 /// that names the other side of a UI stall.
@@ -1168,6 +1172,9 @@ fn other_side(p: &Profile, other: usize, ws: &[(u64, u64)]) -> String {
     let mut lg = Legend::default();
     let hot_s: Vec<String> = hot.iter().take(3).map(|(f, w)| format!("{} {}%", lg.name(p.s(*f)), pct(*w, sw))).collect();
     let mut s = format!("{} was {}", p.lane_name(other), doing);
+    if roots.first().is_some_and(|r| p.s(r.0).contains(" for main at ")) {
+        s.push_str(" (the UI's own requests: its lazy compiles and links)");
+    }
     if !inner_s.is_empty() {
         s.push_str(&format!("; inside: {}", inner_s.join(", ")));
     }
@@ -1182,27 +1189,30 @@ fn other_side(p: &Profile, other: usize, ws: &[(u64, u64)]) -> String {
 fn hitch_sides(p: &Profile, f: &Frame) -> Option<(String, u64)> {
     let main = p.main_lane()?;
     let owner = p.lanes.iter().position(|l| l.thread.role == role::OWNER);
-    // (other lane, wait name) -> waits
+    // the main lane's waits in the frame by (the lane that ended them, wait name)
     let mut groups: Vec<((usize, u32), Vec<(u64, u64)>)> = Vec::new();
-    for st in p.critical_path(main, f.t0, f.t1) {
-        let (Some(w), true) = (st.wait, st.lane == main) else { continue };
-        // a wait no wake ended (cut, or its wake not recorded): an owner wait reads the owner
-        let other = match st.ended_by {
-            Some(o) => o,
-            None if p.s(w.name).starts_with("owner") => match owner {
+    let lane = &p.lanes[main];
+    for d in 0..lane.rows.len() {
+        for w in lane.segs_in(d, f.t0, f.t1).iter().filter(|s| s.wait) {
+            // a wait no wake ended (cut, or its wake not recorded): an owner wait reads the owner
+            let other = match p.woke_by(main, w).map(|x| x.0) {
                 Some(o) => o,
+                None if p.s(w.name).starts_with("owner") => match owner {
+                    Some(o) => o,
+                    None => continue,
+                },
                 None => continue,
-            },
-            None => continue,
-        };
-        let iv = (w.t0.max(f.t0), w.t1.min(f.t1));
-        match groups.iter_mut().find(|g| g.0 == (other, w.name)) {
-            Some(g) => g.1.push(iv),
-            None => groups.push(((other, w.name), vec![iv])),
+            };
+            let iv = (w.t0.max(f.t0), w.t1.min(f.t1));
+            match groups.iter_mut().find(|g| g.0 == (other, w.name)) {
+                Some(g) => g.1.push(iv),
+                None => groups.push(((other, w.name), vec![iv])),
+            }
         }
     }
     let sum = |v: &Vec<(u64, u64)>| v.iter().map(|w| w.1.saturating_sub(w.0)).sum::<u64>();
-    let ((other, wname), ws) = groups.into_iter().max_by_key(|g| sum(&g.1))?;
+    let ((other, wname), mut ws) = groups.into_iter().max_by_key(|g| sum(&g.1))?;
+    ws.sort_unstable();
     let wait_ns = sum(&ws);
     if wait_ns < f.dur() / 4 {
         return None;
@@ -1272,7 +1282,7 @@ fn events(p: &Profile, q: &Q, cat_default: Option<&str>) -> Ans {
         .iter()
         .filter(|e| e.t >= t0 && e.t < t1)
         .filter(|e| cat.map_or(true, |c| p.s(e.cat).starts_with(c)))
-        .filter(|e| !app_only || !HOST_CATS.contains(&p.s(e.cat)))
+        .filter(|e| !app_only || !is_host_cat(p.s(e.cat)))
         .filter(|e| needle.map_or(true, |n| e.text.contains(n)))
         .filter(|e| a.map_or(true, |a| e.a == a))
         .collect();
@@ -1290,6 +1300,16 @@ fn events(p: &Profile, q: &Q, cat_default: Option<&str>) -> Ans {
         return format!("no events match (have {}: {})\nmore: events", p.events.len(), cats.join(", ")).into();
     }
     let n = q.num("n", 30) as usize;
+    let mut by_sel: Vec<(&str, usize)> = Vec::new();
+    for e in &sel {
+        let c = p.s(e.cat);
+        match by_sel.iter_mut().find(|x| x.0 == c) {
+            Some(x) => x.1 += 1,
+            None => by_sel.push((c, 1)),
+        }
+    }
+    by_sel.sort_by(|a, b| b.1.cmp(&a.1));
+    let cats: Vec<String> = by_sel.iter().take(10).map(|(c, n)| format!("{c} {n}")).collect();
     let mut out = Ans::new(format!(
         "{} events{} from {} s to {} s of the run; by kind: {}",
         sel.len(),

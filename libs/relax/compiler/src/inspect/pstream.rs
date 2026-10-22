@@ -121,6 +121,7 @@ impl Drop for Mine {
         let p = self.0.get();
         if !p.is_null() {
             let r: &'static Ring = unsafe { &*p };
+            let _k = crate::zone_alloc::kept();
             FREE.lock().unwrap_or_else(|e| e.into_inner()).push(r);
         }
     }
