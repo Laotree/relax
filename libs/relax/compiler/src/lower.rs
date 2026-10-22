@@ -73,6 +73,13 @@ pub struct WatchField {
     pub hit: u64,
 }
 
+/// Is the body lowered as `cur_fn` the body of slot `slot`? Its own, or its SPEC-V twin's
+/// (`[unverified]`: jit::build_rir_lowered lowers a twin as its base slot): a probe or watch on
+/// the twin -- often the only slot with code -- goes into that lowering.
+fn lowers_slot(u: &Unit, slot: u32, cur_fn: u32) -> bool {
+    slot == cur_fn || (slot as usize) < u.fns.len() && matches!(u.fns[slot as usize].key, crate::jit::FnKey::Plain(b) if b == cur_fn)
+}
+
 crate::gen_local! {
     pub static PROBE_POINTS: std::cell::RefCell<Vec<ProbePoint>>;
     pub static PROBE_RESULTS: std::cell::RefCell<Vec<(u32, Result<(), String>)>>;
@@ -517,9 +524,9 @@ impl<'a> Lcx<'a> {
             scope_temp_pos: vec![Vec::new()],
             scope_marks: vec![0],
             or_sel: HashMap::default(),
-            probe_pts: PROBE_POINTS.try_with(|p| p.borrow().iter().filter(|x| x.slot == cur_fn).map(|x| (x.clone(), false)).collect()).unwrap_or_default(),
+            probe_pts: PROBE_POINTS.try_with(|p| p.borrow().iter().filter(|x| lowers_slot(u, x.slot, cur_fn)).map(|x| (x.clone(), false)).collect()).unwrap_or_default(),
             probe_scope: Vec::new(),
-            watch_fields: WATCH_FIELDS.try_with(|p| p.borrow().iter().filter(|x| x.slot == cur_fn).cloned().collect()).unwrap_or_default(),
+            watch_fields: WATCH_FIELDS.try_with(|p| p.borrow().iter().filter(|x| lowers_slot(u, x.slot, cur_fn)).cloned().collect()).unwrap_or_default(),
             or_force: HashMap::default(),
             defer_moves: None,
             drop_misaligned: false,
