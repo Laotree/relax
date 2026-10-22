@@ -11916,12 +11916,12 @@ pub(crate) fn tier1_stats_report() {
 static COMPILE_LAST: AtomicU64 = AtomicU64::new(0);
 static STARTUP_COMPILES: AtomicU64 = AtomicU64::new(0);
 
-// A long compile must not look quiet merely because its start was >500 ms ago.
+// A long compile must not look quiet merely because its start was long ago.
 // Include type checking before the unit lock, and release this count on panic too.
 // Only one O3 worker competes with foreground startup compiles (mini, Amp: first
 // present +23% with three). Admission follows demand, not speculative work.
-// A speculative tail can keep COMPILE_LAST fresh long after the hot loop starts. Keep the
-// stricter all-compiler quiet rule below for expensive missing-RIR reconstruction only.
+// A speculative tail can keep COMPILE_LAST fresh long after the hot loop starts: no O3 build,
+// missing-RIR reconstruction included, waits for it.
 static DEMAND_COMPILES: AtomicU64 = AtomicU64::new(0);
 static DEMAND_LAST: AtomicU64 = AtomicU64::new(0);
 
@@ -11966,12 +11966,6 @@ fn tier1_workers_ready() -> bool {
         && wall_ns().saturating_sub(DEMAND_LAST.load(Ordering::SeqCst)) >= TIER1_POLL.as_nanos() as u64
 }
 
-fn tier1_quiet() -> bool {
-    STARTUP_COMPILES.load(Ordering::SeqCst) == 0
-        && wall_ns().saturating_sub(COMPILE_LAST.load(Ordering::SeqCst)) >= TIER1_QUIET_NS
-}
-/// No lazy / speculative compile for this long: missing RIR may be rebuilt under the lock.
-const TIER1_QUIET_NS: u64 = 500_000_000;
 /// slots queued hot (rt_hot runs without the lock; Stats reads it)
 pub static TIER_QUEUED: AtomicU64 = AtomicU64::new(0);
 
@@ -12599,17 +12593,19 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let t0 = cpu_ns();
     let mut measure = tier1_stats_on().then(|| Tier1Measure::new(t0));
     // code installed from the disk cache has no RIR: build it here (the front end and lowering
-    // run on this thread), else a cached function would stay at O1 for good. Not while the
-    // program still compiles (or links) its way to a frame: that front end would hold the unit
-    // the main thread is waiting for.
+    // run on this thread), else a cached function would stay at O1 for good. Not while a
+    // program thread has a lazy compile in flight (or had one in the last TIER1_POLL): the UI
+    // goes first. Speculative and other background compiles do not hold it back: they refreshed
+    // an all-compiler quiet window for seconds after Stage's present, every O3 worker slept here
+    // with ~1.5k hot builds queued (lane SETTLE trace, 165), hot code waiting behind guesses.
     let needs_rir = |up: *mut Unit| {
         let f = &(&*up).fns[id as usize];
         f.compiled && f.rir.is_none() && f.build_err.is_none() && !f.building
     };
     let (needs, key, front) = owner::call(owner::Class::Background, || (needs_rir(up), (&*up).fns[id as usize].key.clone(), (&*up).front.clone()));
     if needs && !t1prof_replay(options) && !owner::is_owner() {
-        while !tier1_quiet() {
-            job_sleep(std::time::Duration::from_millis(50));
+        while !tier1_workers_ready() {
+            job_sleep(TIER1_POLL);
         }
         // its type check runs first, off the unit (the build takes the checked body): one
         // solver search there took seconds, and every thread needing a lazy compile -- the UI
