@@ -44,7 +44,7 @@ pub mod kind {
     /// str text }` -- app marks, log lines, panics, script errors, zone swaps, hitches, ...
     pub const EVENT: u16 = 16;
     /// the program's input events as the remote commands that inject them again: `u n, u base_t,
-    /// n * { d t, u frame, str command }`
+    /// n * { d t, u frame, u flags (bit0: injected by makepad remote), str command }`
     pub const INPUT: u16 = 17;
 }
 

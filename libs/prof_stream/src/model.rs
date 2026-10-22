@@ -112,6 +112,8 @@ pub struct Input {
     pub t: u64,
     /// the program's UI frame (presented frames) it arrived in
     pub frame: u64,
+    /// injected by makepad remote (an agent's click), not the person's
+    pub injected: bool,
     pub command: String,
 }
 
@@ -323,7 +325,7 @@ impl Profile {
                 let mut t = d.u()?;
                 for _ in 0..n {
                     t = d.d(t)?;
-                    let e = Input { t, frame: d.u()?, command: d.s()? };
+                    let e = Input { t, frame: d.u()?, injected: d.u()? & 1 != 0, command: d.s()? };
                     self.see(t);
                     self.inputs.push(e);
                 }

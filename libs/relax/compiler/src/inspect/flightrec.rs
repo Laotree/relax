@@ -42,6 +42,8 @@ const DUMP_LAST_NS: u64 = 120_000_000_000;
 const AUTO_KEEP: usize = 24;
 
 static DUMP_MS: AtomicU64 = AtomicU64::new(1000);
+/// how the run was started (a replay starts the same): (args, cwd, MAKEPAD_* environment)
+static RUN: Mutex<Option<(String, String, String)>> = Mutex::new(None);
 static THREAD: Mutex<Option<std::thread::Thread>> = Mutex::new(None);
 
 /// Starts the recorder (inspect's start).
@@ -53,6 +55,10 @@ pub fn init() {
         DUMP_MS.store(ms, Relaxed);
     }
     let _k = crate::zone_alloc::kept();
+    let args: Vec<String> = std::env::args().collect();
+    let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+    let env: Vec<String> = std::env::vars().filter(|(k, _)| k.starts_with("MAKEPAD") || k.starts_with("SANDBOX_")).map(|(k, v)| format!("{k}={v}")).collect();
+    *RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some((args.join("\u{1f}"), cwd, env.join("\u{1f}")));
     // the rings exist before the first record (no allocation on a recording thread later)
     let _ = (events(), inputs(), jits(), frames());
     ON.store(true, Release);
@@ -167,8 +173,10 @@ struct Ev {
 struct In {
     t: u64,
     frame: u64,
-    len: u16,
-    text: [u8; 110],
+    len: u8,
+    /// bit0: injected (makepad remote), not the person's
+    flags: u8,
+    text: [u8; 78],
 }
 
 #[derive(Clone, Copy)]
@@ -202,7 +210,7 @@ fn events() -> &'static Slots<Ev> {
     EVENTS.get_or_init(|| crate::zone_alloc::kept_with(|| Slots::new(1 << 14)))
 }
 fn inputs() -> &'static Slots<In> {
-    INPUTS.get_or_init(|| crate::zone_alloc::kept_with(|| Slots::new(1 << 15)))
+    INPUTS.get_or_init(|| crate::zone_alloc::kept_with(|| Slots::new(1 << 17)))
 }
 fn jits() -> &'static Slots<Jit> {
     JITS.get_or_init(|| crate::zone_alloc::kept_with(|| Slots::new(1 << 16)))
@@ -265,13 +273,19 @@ pub fn event(cat: &str, text: &str, a: u64, b: u64) {
 
 /// An input event of the program as the remote command that injects it again
 /// (`mouse k=down x=.. y=..`, `key k=down c=..`, `text t=..`), at its UI frame.
-pub fn input(frame: u64, command: &str) {
+pub fn input(frame: u64, injected: bool, command: &str) {
     if !on() {
         return;
     }
-    let (text, len) = copy_text::<110>(command);
-    inputs().push(In { t: crate::clock::wall_ns(), frame, len, text });
+    if command.len() > 78 {
+        INPUT_CUT.fetch_add(1, Relaxed);
+    }
+    let (text, len) = copy_text::<78>(command);
+    inputs().push(In { t: crate::clock::wall_ns(), frame, len: len as u8, flags: injected as u8, text });
 }
+
+/// input commands longer than a slot (cut: a replay of them is not exact)
+static INPUT_CUT: AtomicU64 = AtomicU64::new(0);
 
 /// Code was installed for slot `id` (jit index_code).
 pub fn jit_install(id: u32, len: u32, tier: u8, origin: u8) {
@@ -357,13 +371,13 @@ pub extern "C" fn relax_flight_mark(cat: *const u8, cat_len: usize, text: *const
     event(s(cat, cat_len), s(text, text_len), a, b);
 }
 
-/// `relax_flight_input(frame, command, len)`: an input event the program dispatched, as the
-/// remote command that injects it.
-pub extern "C" fn relax_flight_input(frame: u64, cmd: *const u8, len: usize) {
+/// `relax_flight_input(frame, injected, command, len)`: an input event the program dispatched,
+/// as the remote command that injects it.
+pub extern "C" fn relax_flight_input(frame: u64, injected: u64, cmd: *const u8, len: usize) {
     if !on() || cmd.is_null() {
         return;
     }
-    input(frame, unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(cmd, len)) });
+    input(frame, injected != 0, unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(cmd, len)) });
 }
 
 /// `relax_flight_on()`: the recorder records (programs skip formatting otherwise).
@@ -466,13 +480,15 @@ pub(super) struct Cursors {
     counters: u64,
     /// the last FRAME written: (frame number, its t0 on the stream clock)
     prev_frame: Option<(u64, u64)>,
+    /// the run's start (args, cwd, environment) was sent
+    run_sent: bool,
 }
 
 impl Cursors {
     /// From the rings' start (`backfill`), else from now on.
     pub fn new(backfill: bool) -> Cursors {
         if backfill {
-            return Cursors { ev: 0, input: 0, jit: 0, frames: 0, samples: 0, counters: 0, prev_frame: None };
+            return Cursors { ev: 0, input: 0, jit: 0, frames: 0, samples: 0, counters: 0, prev_frame: None, run_sent: false };
         }
         Cursors {
             ev: events().fill().0,
@@ -482,6 +498,7 @@ impl Cursors {
             samples: u64::MAX,
             counters: u64::MAX,
             prev_frame: None,
+            run_sent: false,
         }
     }
 }
@@ -537,13 +554,26 @@ pub(super) fn encode(cur: &mut Cursors, enc: &mut super::pstream::StreamEnc, min
     });
     cur.ev = c;
     lost_total += lost;
+    // how the run started (whole strings, separated by U+001F): a replay starts it the same way
+    let mut run_evs: Vec<(&'static str, String)> = Vec::new();
+    if !cur.run_sent {
+        cur.run_sent = true;
+        if let Some((args, cwd, env)) = RUN.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            run_evs = vec![("run.args", args), ("run.cwd", cwd), ("run.env", env), ("run.home", crate::gitstore::relax_home().display().to_string())];
+        }
+    }
     let mut ev_payload = None;
-    if !evs.is_empty() {
+    if !evs.is_empty() || !run_evs.is_empty() {
         evs.sort_by_key(|e| e.t);
         let mut e = ps::Enc::default();
-        let base = enc.map(evs[0].t);
-        e.u(evs.len() as u64).u(base);
+        let base = enc.map(evs.first().map_or(crate::clock::wall_ns(), |x| x.t));
+        e.u((evs.len() + run_evs.len()) as u64).u(base);
         let mut prev = base;
+        for (cat, text) in &run_evs {
+            let cat = enc.strings.id(cat);
+            e.d(base, prev).u(0).u(cat as u64).u(0).u(0).s(text);
+            prev = base;
+        }
         for x in &evs {
             let t = enc.map(x.t);
             let tid = enc.tid(x.os_id, 0);
@@ -570,7 +600,7 @@ pub(super) fn encode(cur: &mut Cursors, enc: &mut super::pstream::StreamEnc, min
         let mut prev = base;
         for x in &ins {
             let t = enc.map(x.t);
-            e.d(t, prev).u(x.frame).s(text_of(&x.text, x.len));
+            e.d(t, prev).u(x.frame).u(x.flags as u64).s(text_of(&x.text, x.len as u16));
             prev = t;
         }
         in_payload = Some(e.0);

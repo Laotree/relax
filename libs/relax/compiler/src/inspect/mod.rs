@@ -34,6 +34,7 @@ pub mod pf;
 pub mod pstream;
 pub mod reliability;
 pub mod remarks;
+pub mod replay;
 pub mod timeline;
 pub mod vars;
 pub mod vsnative;
