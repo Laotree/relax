@@ -489,7 +489,7 @@ fn rustc_side(nb: &NativeBin, ours: &str, our_bytes: usize) -> Result<(Side, usi
             r += 1;
         }
         if let Some(row) = rows.get(r).filter(|row| row.addr <= a && row.line != 0) {
-            let path = nb.files.get(row.file as usize).cloned().unwrap_or_default();
+            let path = nb.file(row.file);
             s.at[k] = s.line_index(&mut idx, format!("{}:{}", path_key(&path), row.line), format!("{}:{}", file_name(&path), row.line));
         }
     }
