@@ -922,9 +922,21 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             for k in 0..=b.insts.len() {
                 let p = if k < b.insts.len() { block_start[bi] + 2 * k as u32 + 1 } else { block_end[bi] - 1 };
                 for &u in tab.uses(k0 + k) {
-                    if let Remat::Offset(base, _) = remat[u as usize] {
+                    // every base down the chain: a recomputed base is recomputed from its own
+                    // base at this use too (base_disp folds `(b + k1) + k2`; draw_scene_inner's
+                    // `value` slice read through a base whose register held a loop index by then)
+                    let mut v = u;
+                    let mut n = 0;
+                    while let Remat::Offset(base, _) = remat[v as usize] {
                         if !live_at(base.0, p) {
                             ok[u as usize] = false;
+                            break;
+                        }
+                        v = base.0;
+                        n += 1;
+                        if n > 64 {
+                            ok[u as usize] = false;
+                            break;
                         }
                     }
                 }
