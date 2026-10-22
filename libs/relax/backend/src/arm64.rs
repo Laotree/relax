@@ -717,6 +717,8 @@ struct Gen<'a> {
     /// a zero vector whose definition was skipped: the VInsert of lane 0 right after it reads
     /// it (fmov s, which zeroes lanes 1-3)
     zero_ins: Option<VReg>,
+    /// a skipped multiply's operands: the negation right after it is `fnmul`
+    fnmul_ins: Option<(VReg, VReg)>,
     /// vregs defined once, as a zero vector (VConst 0 / FromLo64 of a constant 0)
     zero_vec: Vec<bool>,
     /// the last spill store emitted: (sp offset, register, word position right after it)
@@ -1274,6 +1276,16 @@ impl<'a> Gen<'a> {
                     if let Some(()) = self.pair_access(options, inst, &b.insts[ii + 1], self.al.inst_pos(bi, ii + 1)) {
                         skip_next = true;
                         continue;
+                    }
+                }
+                // a float multiply only read by the negation right after it: fnmul (one
+                // instruction; -(a*b) bit for bit, NaNs included)
+                if ii + 1 < n && !(fused && ii + 1 == n - 1) {
+                    if let (Inst::FBin(FOp::Mul, w1, t, a, bb), Inst::FUnary(FUn::Neg, w2, _, t2)) = (inst, &b.insts[ii + 1]) {
+                        if w1 == w2 && t == t2 && t != a && t != bb && self.al.uses[t.0 as usize] == 1 {
+                            self.fnmul_ins = Some((*a, *bb));
+                            continue;
+                        }
                     }
                 }
                 // a zero vector only read by the lane-0 insert right after it (SROA'd vector cells,
@@ -3680,6 +3692,15 @@ impl<'a> Gen<'a> {
                 self.a.fp3(opc, *f64_, xd, xa, xb);
                 self.fin_f(*d, xd);
             }
+            Inst::FUnary(FUn::Neg, f64_, d, _) if self.fnmul_ins.is_some() => {
+                let (a, b) = self.fnmul_ins.take().unwrap();
+                let xa = self.use_f(a, FS0);
+                let xb = self.use_f(b, FS1);
+                let xd = self.def_f(*d, FS0);
+                // fnmul sd/dd, a, b
+                self.a.e(0x1E20_8800 | if *f64_ { DBL } else { 0 } | (xb as u32) << 16 | (xa as u32) << 5 | xd as u32);
+                self.fin_f(*d, xd);
+            }
             Inst::FUnary(op, f64_, d, a) => {
                 let xa = self.use_f(*a, FS0);
                 let xd = self.def_f(*d, FS0);
@@ -4266,6 +4287,79 @@ impl<'a> Gen<'a> {
     }
 }
 
+/// `FMulAdd(.., a, b, c)` whose a or c is a negation `-x` used only there: the negation folds into
+/// the multiply-add's flags (product / addend negated), x read instead. Exact: the fused forms negate
+/// the operand (FPNeg) before the one rounding, as the separate fneg did (NaN signs included).
+fn fold_fma_negs(f: &Func) -> Option<Func> {
+    let n = f.vregs.len();
+    let mut ndef = vec![0u32; n];
+    let mut uses = vec![0u32; n];
+    let mut neg: Vec<Option<(VReg, bool)>> = vec![None; n];
+    let mut any = false;
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            i.defs(|d| ndef[d.0 as usize] += 1);
+            regalloc::for_uses(i, |u| uses[u.0 as usize] += 1);
+            if let Inst::FUnary(FUn::Neg, w, d, x) = *i {
+                neg[d.0 as usize] = Some((x, w));
+            }
+            any |= matches!(i, Inst::FMulAdd(..));
+        }
+        let mut t = Vec::new();
+        regalloc::term_uses(&b.term, &mut t);
+        for u in t {
+            uses[u.0 as usize] += 1;
+        }
+    }
+    if !any {
+        return None;
+    }
+    let of = |v: VReg, w: bool| match neg[v.0 as usize] {
+        Some((x, w2)) if w2 == w && ndef[v.0 as usize] == 1 && uses[v.0 as usize] == 1 && ndef[x.0 as usize] == 1 => Some(x),
+        _ => None,
+    };
+    let mut g = f.clone();
+    let mut dead = vec![false; n];
+    for b in &mut g.blocks {
+        for i in &mut b.insts {
+            if let Inst::FMulAdd(np, na, w, _, a, _, c) = i {
+                if let Some(x) = of(*c, *w) {
+                    dead[c.0 as usize] = true;
+                    *c = x;
+                    *na = !*na;
+                }
+                // a only: FMSUB / FNMADD negate the first factor (Rn), so a NaN b keeps its sign
+                // only when the negation was on a
+                if let Some(x) = of(*a, *w) {
+                    dead[a.0 as usize] = true;
+                    *a = x;
+                    *np = !*np;
+                }
+            }
+        }
+    }
+    if !dead.iter().any(|d| *d) {
+        return None;
+    }
+    for b in &mut g.blocks {
+        let keep: Vec<bool> = b.insts.iter().map(|i| !matches!(i, Inst::FUnary(FUn::Neg, _, d, _) if dead[d.0 as usize])).collect();
+        let mut k = 0;
+        b.insts.retain(|_| {
+            k += 1;
+            keep[k - 1]
+        });
+        let mut k = 0;
+        b.pos.retain(|_| {
+            k += 1;
+            keep[k - 1]
+        });
+    }
+    Some(g)
+}
+
 /// Per vreg: defined exactly once, as an all-zero vector (VConst 0, or FromLo64 of a vreg defined
 /// once as the constant 0)
 fn zero_vectors(f: &Func) -> Vec<bool> {
@@ -4495,6 +4589,9 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     let freq = if switched.is_some() { freq_sw.as_deref() } else { freq };
     let _cost_ra = crate::probe::phase(9);
     let t_ra = crate::stats::pass_clock();
+    // negations read only by a fused multiply-add: its sign flags (fmsub / fnmadd / fnmsub)
+    let nf = fold_fma_negs(f);
+    let f = nf.as_ref().unwrap_or(f);
     // f32 splats read only by multiplies: the by-element forms (fmla / fmls / fmul v, v, v.s[0])
     let lanes = fold_lane_splats(f);
     let f = lanes.as_ref().unwrap_or(f);
@@ -4542,6 +4639,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         test_fuse: None,
         sel_chain: None,
         zero_ins: None,
+        fnmul_ins: None,
         zero_vec: Vec::new(),
         jt_fix: Vec::new(),
         last_spill: None,
