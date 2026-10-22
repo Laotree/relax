@@ -131,9 +131,11 @@ fn code_of(up: *mut crate::jit::Unit, id: u32) -> Option<(u64, u64, String)> {
 
 /// One round: weighted samples with a pc in [lo, hi) anywhere on the stack (incl) or innermost
 /// (self), per second.
-fn measure(lo: u64, hi: u64, secs: f64, hz: u64, ev: super::prof::Ev, self_only: bool, out: &Out) -> (f64, f64) {
+fn measure(lo: u64, hi: u64, secs: f64, hz: u64, ev: super::prof::Ev, self_only: bool, per_frame: bool, out: &Out) -> (f64, f64) {
     let gone = out.gone();
+    let f0 = super::timeline::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
     let run = super::prof::collect_ev(secs, hz, ev, &|_| true, &*gone);
+    let frames = super::timeline::FRAMES.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(f0);
     let mut w = 0u64;
     for s in &run.samples {
         let hit = if self_only { s.frames.first().is_some_and(|&pc| pc >= lo && pc < hi) } else { s.frames.iter().enumerate().any(|(i, &pc)| { let p = if i == 0 { pc } else { pc.wrapping_sub(1) }; p >= lo && p < hi }) };
@@ -141,9 +143,10 @@ fn measure(lo: u64, hi: u64, secs: f64, hz: u64, ev: super::prof::Ev, self_only:
             w += s.weight.max(1);
         }
     }
-    let per_s = w as f64 / run.secs.max(0.01);
-    // CPU samples: ms of CPU per second of wall
-    let v = if ev == super::prof::Ev::Cpu { per_s * 1000.0 / hz as f64 } else { per_s };
+    // per second of wall, or per UI frame
+    let per = if per_frame { w as f64 / frames.max(1) as f64 } else { w as f64 / run.secs.max(0.01) };
+    // CPU samples: ms of CPU
+    let v = if ev == super::prof::Ev::Cpu { per * 1000.0 / hz as f64 } else { per };
     (v, run.secs)
 }
 
@@ -203,7 +206,7 @@ fn perm_p(a: &[f64], b: &[f64]) -> f64 {
     hits as f64 / tries.max(1) as f64
 }
 
-/// `ab <fn|@slot> b=<variant> [a=base] [rounds=5] [s=1] [settle_ms=300] [metric=incl|self] [ev=cpu|cycles|instructions] [keep=a|b]`
+/// `ab <fn|@slot> b=<variant> [a=base] [rounds=5] [s=1] [settle_ms=300] [metric=incl|self] [per=s|frame] [ev=cpu|cycles|instructions] [keep=a|b]`
 pub fn cmd_ab(req: &Req, out: &mut Out) {
     let Some(q) = req.pos.first().cloned() else {
         return out.err("usage: ab <fn|@slot> b=<base|o1|opt:<tok>,..|inline:<callee>|noinline:<callee>> [a=base] [rounds=5] [s=1] [metric=incl|self] [ev=cpu|cycles|instructions] [keep=a|b]");
@@ -217,6 +220,7 @@ pub fn cmd_ab(req: &Req, out: &mut Out) {
     let settle = req.num("settle_ms", 300).min(5000);
     let hz = req.num("hz", 1000).clamp(50, 4000);
     let self_only = req.get("metric") == Some("self");
+    let per_frame = req.get("per") == Some("frame");
     let ev = match super::prof::Ev::parse(req.get("ev").unwrap_or("cpu")) {
         Ok(e) => e,
         Err(e) => return out.err(&e),
@@ -265,7 +269,7 @@ pub fn cmd_ab(req: &Req, out: &mut Out) {
         };
         sizes[k] = hi - lo;
         tiers[k] = tier;
-        let (val, took) = measure(lo, hi, secs, hz, ev, self_only, out);
+        let (val, took) = measure(lo, hi, secs, hz, ev, self_only, per_frame, out);
         if took < secs * 0.8 {
             notes.push(format!("round {} measured {:.2} s of {:.2}", r + 1, took, secs));
         }
@@ -287,13 +291,13 @@ pub fn cmd_ab(req: &Req, out: &mut Out) {
     let d = (mb - ma) / ma.max(1e-9) * 100.0;
     let p = perm_p(&a, &b);
     let noise = sa.max(sb);
-    let unit = match ev {
-        super::prof::Ev::Cpu => "ms CPU/s",
-        super::prof::Ev::Cycles => "cycles/s",
-        super::prof::Ev::Instructions => "instr/s",
-        super::prof::Ev::BranchMisses => "branch misses/s",
-        super::prof::Ev::CacheMisses => "cache misses/s",
-    };
+    let unit = format!("{}/{}", match ev {
+        super::prof::Ev::Cpu => "ms CPU",
+        super::prof::Ev::Cycles => "cycles",
+        super::prof::Ev::Instructions => "instr",
+        super::prof::Ev::BranchMisses => "branch misses",
+        super::prof::Ev::CacheMisses => "cache misses",
+    }, if per_frame { "frame" } else { "s" });
     let verdict = if ma <= 0.0 && mb <= 0.0 {
         "no samples in the fn: is it running? (ab measures the fn's cost rate while the app runs)".to_string()
     } else if p < 0.05 && d.abs() > noise / 2.0 {
@@ -317,7 +321,9 @@ pub fn cmd_ab(req: &Req, out: &mut Out) {
         ev.name(),
         if keep_b { "B" } else { "A" }
     ));
-    out.always("note: a rate per second of wall: right for fixed-pace work (frames, playback); a flat-out loop keeps the fn's share constant -- compare those with count <fn> time=1 or per frame");
+    if !per_frame {
+        out.always("note: a rate per second of wall: right for fixed-pace work (playback, a frame-locked UI); per=frame divides by UI frames instead; a flat-out loop keeps the fn's share constant -- compare those with count <fn> time=1");
+    }
     for n in notes {
         out.always(&format!("note: {}", n));
     }
