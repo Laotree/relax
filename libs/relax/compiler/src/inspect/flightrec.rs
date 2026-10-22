@@ -63,7 +63,7 @@ pub fn init() {
     let env: Vec<String> = std::env::vars().filter(|(k, _)| k.starts_with("MAKEPAD") || k.starts_with("SANDBOX_")).map(|(k, v)| format!("{k}={v}")).collect();
     *RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some((args.join("\u{1f}"), cwd, env.join("\u{1f}")));
     // the rings exist before the first record (no allocation on a recording thread later)
-    let _ = (events(), inputs(), jits(), frames());
+    let _ = (events(), app_events(), inputs(), jits(), frames());
     ON.store(true, Release);
     super::timeline::flag_update();
     let t = std::thread::Builder::new().name("run-flightrec".into()).spawn(watch);
@@ -205,12 +205,24 @@ struct Fr {
 }
 
 static EVENTS: std::sync::OnceLock<Slots<Ev>> = std::sync::OnceLock::new();
+/// the app's own marks (game events): a ring of their own, so a flood of them never pushes out
+/// the host's (panics, hitches, logs)
+static APP_EVENTS: std::sync::OnceLock<Slots<Ev>> = std::sync::OnceLock::new();
 static INPUTS: std::sync::OnceLock<Slots<In>> = std::sync::OnceLock::new();
 static JITS: std::sync::OnceLock<Slots<Jit>> = std::sync::OnceLock::new();
 static FRAMES: std::sync::OnceLock<Slots<Fr>> = std::sync::OnceLock::new();
 
 fn events() -> &'static Slots<Ev> {
     EVENTS.get_or_init(|| crate::zone_alloc::kept_with(|| Slots::new(1 << 14)))
+}
+fn app_events() -> &'static Slots<Ev> {
+    APP_EVENTS.get_or_init(|| crate::zone_alloc::kept_with(|| Slots::new(1 << 14)))
+}
+
+/// The program's categories that are the host's or the platform's (log lines, seeds, the
+/// window, replays): they go with the host's events.
+fn host_cat(cat: &str) -> bool {
+    ["log", "seed.", "window.", "replay."].iter().any(|p| cat.starts_with(p))
 }
 fn inputs() -> &'static Slots<In> {
     INPUTS.get_or_init(|| crate::zone_alloc::kept_with(|| Slots::new(1 << 16)))
@@ -269,9 +281,13 @@ pub fn event(cat: &str, text: &str, a: u64, b: u64) {
     if !on() {
         return;
     }
+    push_ev(events(), cat, text, a, b);
+}
+
+fn push_ev(ring: &Slots<Ev>, cat: &str, text: &str, a: u64, b: u64) {
     let (cat_b, cat_len) = copy_text::<28>(cat);
     let (text_b, len) = copy_text::<168>(text);
-    events().push(Ev { t: crate::clock::wall_ns(), os_id: super::threads::self_os_id(), a, b, cat_len, len, cat: cat_b, text: text_b });
+    ring.push(Ev { t: crate::clock::wall_ns(), os_id: super::threads::self_os_id(), a, b, cat_len, len, cat: cat_b, text: text_b });
 }
 
 /// An input event of the program as the remote command that injects it again
@@ -373,7 +389,12 @@ pub extern "C" fn relax_flight_mark(cat: *const u8, cat_len: usize, text: *const
         return;
     }
     let s = |p: *const u8, n: usize| if p.is_null() || n == 0 { "" } else { unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p, n)) } };
-    event(s(cat, cat_len), s(text, text_len), a, b);
+    let (cat, text) = (s(cat, cat_len), s(text, text_len));
+    if host_cat(cat) {
+        event(cat, text, a, b);
+    } else {
+        push_ev(app_events(), cat, text, a, b);
+    }
 }
 
 /// `relax_flight_input(frame, injected, command, len)`: an input event the program dispatched,
@@ -480,6 +501,7 @@ fn watch() {
 /// Per-reader positions in the rings (a live viewer keeps one; a recording starts from 0).
 pub(super) struct Cursors {
     ev: u64,
+    app_ev: u64,
     input: u64,
     jit: u64,
     frames: u64,
@@ -495,10 +517,11 @@ impl Cursors {
     /// From the rings' start (`backfill`), else from now on.
     pub fn new(backfill: bool) -> Cursors {
         if backfill {
-            return Cursors { ev: 0, input: 0, jit: 0, frames: 0, samples: 0, counters: 0, prev_frame: None, run_sent: false };
+            return Cursors { ev: 0, app_ev: 0, input: 0, jit: 0, frames: 0, samples: 0, counters: 0, prev_frame: None, run_sent: false };
         }
         Cursors {
             ev: events().fill().0,
+            app_ev: app_events().fill().0,
             input: inputs().fill().0,
             jit: jits().fill().0,
             frames: frames().fill().0,
@@ -560,6 +583,13 @@ pub(super) fn encode(cur: &mut Cursors, enc: &mut super::pstream::StreamEnc, min
         }
     });
     cur.ev = c;
+    lost_total += lost;
+    let (c, lost) = app_events().read(cur.app_ev, &mut |_, e| {
+        if e.t >= min_t {
+            evs.push(e);
+        }
+    });
+    cur.app_ev = c;
     lost_total += lost;
     // how the run started (whole strings, separated by U+001F): a replay starts it the same way
     let mut run_evs: Vec<(&'static str, String)> = Vec::new();
@@ -852,7 +882,7 @@ pub fn cmd(req: &super::Req, out: &mut super::Out) {
 
 fn status(out: &mut super::Out) {
     let (ring_bytes, rings) = super::pstream::ring_stats();
-    let fixed = events().bytes() + inputs().bytes() + jits().bytes() + frames().bytes();
+    let fixed = events().bytes() + app_events().bytes() + inputs().bytes() + jits().bytes() + frames().bytes();
     let now = crate::clock::wall_ns();
     // how far back the UI thread's and the owner's lanes reach
     let mut reach: Vec<(String, f64, u64)> = Vec::new();
@@ -900,6 +930,7 @@ fn status(out: &mut super::Out) {
     }
     let back = |o: u64| if o == u64::MAX { String::new() } else { format!("{:.0}", now.saturating_sub(o) as f64 / 1e9) };
     out.line(&format!("| events | {} | {} |", back(oldest(events(), |e| e.t)), fill(events().fill())));
+    out.line(&format!("| app marks | {} | {} |", back(oldest(app_events(), |e| e.t)), fill(app_events().fill())));
     out.line(&format!("| input | {} | {} |", back(oldest(inputs(), |e| e.t)), fill(inputs().fill())));
     out.line(&format!("| JIT installs | {} | {} |", back(oldest(jits(), |e| e.t)), fill(jits().fill())));
     out.line(&format!("| frames | {} | {} |", back(oldest(frames(), |e| e.t0)), fill(frames().fill())));
