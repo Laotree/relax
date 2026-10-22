@@ -2578,6 +2578,10 @@ pub fn zero_fill_loops(options: &relax_session::Options, f: &mut Func) -> bool {
     if !f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Store(..) | Inst::VStore(..))) && matches!(b.term, Term::Jump(_))) {
         return false;
     }
+    // MAKEPAD_RUN_ZEROFILL_TRACE=<fn name part>: the loops looked at, appended to
+    // $MAKEPAD_RUN_DUMP_DIR/zerofill.txt (stderr of compile threads is not kept)
+    let tr = std::env::var("MAKEPAD_RUN_ZEROFILL_TRACE").map_or(false, |w| f.name.contains(w.as_str()));
+    let mut log = String::new();
     let reach = relax_backend::regalloc::reachable(f);
     let preds = relax_backend::regalloc::preds_of(f, &reach);
     let loops = relax_backend::regalloc::natural_loops(f, &reach, &preds, false);
@@ -2621,6 +2625,12 @@ pub fn zero_fill_loops(options: &relax_session::Options, f: &mut Func) -> bool {
     'next: for (h, m) in &loops {
         let h = *h as usize;
         let members: Vec<usize> = (0..m.len()).filter(|b| m[*b]).collect();
+        if tr {
+            log.push_str(&format!("zero-fill {}: loop b{} blocks {:?}\n", f.name, h, members));
+            for &bb in &members {
+                log.push_str(&format!("  b{}: {:?} -> {:?}\n", bb, f.blocks[bb].insts, f.blocks[bb].term));
+            }
+        }
         if members.len() != 2 {
             continue;
         }
@@ -2649,11 +2659,14 @@ pub fn zero_fill_loops(options: &relax_session::Options, f: &mut Func) -> bool {
         let mut iv_uses = 0u32;
         let mut step = false;
         let (mut off, mut addr, mut base, mut stride): (Option<VReg>, Option<VReg>, Option<VReg>, Option<i64>) = (None, None, None, None);
+        // a slot's address made in the body (Alloc remat leaves it there): (vreg, slot)
+        let mut slot_base: Option<(VReg, u32)> = None;
         let mut spans: Vec<(i64, i64)> = Vec::new();
         let in_body = |v: VReg| def_blk[v.0 as usize] == body as u32 && ndef[v.0 as usize] == 1;
         for i in &f.blocks[body].insts {
             match *i {
                 Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::VConst(d, _) if ndef[d.0 as usize] == 1 => {}
+                Inst::SlotAddr(d, sl) if slot_base.is_none() && in_body(d) && nuse[d.0 as usize] == 1 => slot_base = Some((d, sl)),
                 Inst::IBinI(IOp::Add, it, d, a, 1) if d == iv && a == iv && it.bits == 64 && !step => {
                     step = true;
                     iv_uses += 1;
@@ -2677,8 +2690,8 @@ pub fn zero_fill_loops(options: &relax_session::Options, f: &mut Func) -> bool {
                 }
                 Inst::IBin(IOp::Add, it, d, a, b) if addr.is_none() && it.bits == 64 && in_body(d) && off.is_some() && (b == off.unwrap() || a == off.unwrap()) => {
                     let a = if b == off.unwrap() { a } else { b };
-                    // the base: defined outside the loop
-                    if a == iv || (def_blk[a.0 as usize] != u32::MAX && m[def_blk[a.0 as usize] as usize]) {
+                    // the base: defined outside the loop, or the body's slot address
+                    if a == iv || (def_blk[a.0 as usize] != u32::MAX && m[def_blk[a.0 as usize] as usize] && slot_base.map(|s| s.0) != Some(a)) {
                         continue 'next;
                     }
                     addr = Some(d);
@@ -2736,11 +2749,32 @@ pub fn zero_fill_loops(options: &relax_session::Options, f: &mut Func) -> bool {
         let tp = f.blocks[h].term_pos;
         let zr = f.vreg(Cls::I);
         let ln = f.vreg(Cls::I);
+        let mut ins = Vec::new();
+        let base = match slot_base {
+            Some((sv, sl)) if sv == base => {
+                let p = f.vreg(Cls::I);
+                ins.push(Inst::SlotAddr(p, sl));
+                p
+            }
+            _ => base,
+        };
+        ins.extend([Inst::Iconst(zr, 0), Inst::Iconst(ln, len), Inst::Call(Callee::Host(ms), vec![base, zr, ln], Vec::new())]);
         let hb = &mut f.blocks[h];
-        hb.insts = vec![Inst::Iconst(zr, 0), Inst::Iconst(ln, len), Inst::Call(Callee::Host(ms), vec![base, zr, ln], Vec::new())];
-        hb.pos = vec![tp; 3];
+        hb.pos = vec![tp; ins.len()];
+        hb.insts = ins;
         hb.term = Term::Jump(x);
         changed = true;
+        if tr {
+            log.push_str(&format!("  -> memset {} bytes\n", len));
+        }
+    }
+    if tr {
+        if let Ok(d) = std::env::var("MAKEPAD_RUN_DUMP_DIR") {
+            use std::io::Write;
+            if let Ok(mut o) = std::fs::OpenOptions::new().create(true).append(true).open(format!("{}/zerofill.txt", d)) {
+                let _ = o.write_all(format!("zero-fill {}: {} loops\n{}", f.name, loops.len(), log).as_bytes());
+            }
+        }
     }
     changed
 }
