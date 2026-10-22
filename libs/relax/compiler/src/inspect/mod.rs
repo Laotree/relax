@@ -13,6 +13,7 @@ pub mod client;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod cfi;
 pub mod codever;
+pub mod counters;
 pub mod eval;
 pub mod events;
 pub mod gpuprof;
@@ -127,6 +128,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("path", "<H<n>|R<n>>", "the full stack of a heap site id"),
     ("count", "<fn> [time=1] [tier=o1]", "exact call counts (and inclusive time) of every slot of a fn: its code is rebuilt with probes at the tier of the code it replaces (O3 code gets an O3 instrumented build; tier=o1 asks for O1) and installed as a probe group G<n>; every slot whose code holds an inlined copy of the fn is rebuilt at its tier without that inlining, so it calls the counted code; each row names the code version replaced and the one now, later installs with an inlined copy are rebuilt too (a `probe` event)"),
     ("asm", "<fn|@slot> [vs=rustc] [native=<binary>] [s=2] [ev=cpu|cycles|instructions|branch-misses|cache-misses] [view=summary|lines|listing|ours] [line=<n>] | top vs=rustc [s=3] [n=15]", "the JIT's machine code of a fn next to rustc's for the same fn (native=: a release build with line tables), aligned by source line, with CPU samples and PGO counts per line and a diff summary first: excess instructions, spill traffic, kept bounds checks, calls rustc inlined, loops rustc vectorised; `asm top vs=rustc` ranks the hottest fns by the time their excess instructions cost"),
+    ("counters", "[s=1] [n=12]", "hardware counters over a window: Linux per thread (cycles, instructions, IPC, branch and cache misses); macOS the process's instructions and cycles (all a non-root process gets)"),
     ("remarks", "<fn|@slot> [n=20]", "the O3 tier's optimisation remarks for the fn: every call its last O3 build kept (hot sites first) and why (no rule, budget, growth ceiling, cold, recursive, no body) with the numbers, and the tiers of its code"),
     ("versions", "<fn|file:line>", "every code version of the fn: per slot its installed, replaced and retired code (tier baseline/O1/O2/O3/O3-guarded/instrumented, origin fresh/warm-cache/warm-image/live-patch/inspect, address, patch generation, cache key and build), which threads run in which, and the slots whose code holds an inlined copy of it"),
     ("tier", "<fn|file:line> o1|o3|auto [fresh=1] | (none: the pins)", "pins the fn and every slot that inlined it to a tier in the live process (A/B a suspected miscompile): o1 = O1 code generation, kept until `tier <fn> auto`; o3 = the o1 pin goes and they get O3 builds now (fresh=1: rebuild O3 code even where it runs, e.g. warm-cache code)"),
@@ -201,6 +203,7 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "versions" => codever::cmd_versions(req, out),
         "asm" => asm::cmd_asm(req, out),
         "remarks" => remarks::cmd_remarks(req, out),
+        "counters" => counters::cmd_counters(req, out),
         "tier" => codever::cmd_tier(req, out),
         // Host-native providers outlive app domains and never enter program code.
         _ if cmd_host_provided(req, out) => {},
