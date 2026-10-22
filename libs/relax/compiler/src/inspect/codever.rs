@@ -570,13 +570,13 @@ pub fn cmd_versions(req: &Req, out: &mut Out) {
     let caps = super::capture_all(&|_| true).unwrap_or_default();
     let stacks: Vec<(String, Vec<u64>)> = caps
         .iter()
-        .map(|c| (format!("{} (T{})", if c.t.name.is_empty() { "-" } else { &c.t.name }, c.t.os_id), c.frames.iter().enumerate().map(|(i, &pc)| if i == 0 { pc } else { pc.wrapping_sub(1) }).collect()))
+        .map(|c| (format!("{} ({})", if c.t.name.is_empty() { "-" } else { &c.t.name }, super::tid_label(c.t.os_id)), c.frames.iter().enumerate().map(|(i, &pc)| if i == 0 { pc } else { pc.wrapping_sub(1) }).collect()))
         .collect();
     let r = crate::owner::call_within(crate::owner::Class::Job, 10_000, move || -> Result<Vec<String>, String> {
         let u = unsafe { &mut *up };
         let found = super::instrument::find_all(u, &q, 32);
         if found.is_empty() {
-            return Err(format!("no fn or line matches `{}`", q));
+            return Err(format!("no fn or line matches `{}`{}", q, super::instrument::closest(u, &q)));
         }
         let threads_in = |start: u64, len: u32| -> Vec<String> {
             stacks
@@ -747,7 +747,7 @@ pub fn cmd_tier(req: &Req, out: &mut Out) {
         let u = unsafe { &mut *up };
         let mut found: Vec<(u32, Option<u32>)> = super::instrument::find_all(u, &qq, 16).into_iter().map(|x| (x.0, x.1)).collect();
         if found.is_empty() {
-            return Err(format!("no fn or line matches `{}`", qq));
+            return Err(format!("no fn or line matches `{}`{}", qq, super::instrument::closest(u, &qq)));
         }
         // a slot's SPEC-V twin runs the same fn
         for k in 0..found.len() {
