@@ -841,8 +841,9 @@ pub struct RuntimeOptions {
     pub settle_drop: bool,
     /// `MAKEPAD_RUN_BURST_ARENA`; default `true`.
     pub burst_arena: bool,
-    /// `MAKEPAD_RUN_O3_ADAPTIVE`; default `false`.
-    pub tier1_adaptive: bool,
+    /// `MAKEPAD_RUN_O3_BURST` (`0`: off, for A/Bs); default `true`: after the first present, while the O3
+    /// queue is not trivial, more O3 workers run (every performance core but one) until it drains.
+    pub tier1_burst: bool,
     /// `MAKEPAD_RUN_MODULE_FUEL`; default `4_000_000_000`.
     pub module_fuel: i64,
     /// `MAKEPAD_RUN_MODULE_MEM_MB`; default `256`.
@@ -879,7 +880,7 @@ impl Default for RuntimeOptions {
             mem_trim: true,
             settle_drop: true,
             burst_arena: true,
-            tier1_adaptive: false,
+            tier1_burst: true,
             module_fuel: 4_000_000_000,
             module_mem_mb: 256,
             repeat: 1,
@@ -921,7 +922,7 @@ impl RuntimeOptions {
             mem_trim: { let os = get("MAKEPAD_RUN_MEM_TRIM"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             settle_drop: { let os = get("MAKEPAD_RUN_SETTLE_DROP"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             burst_arena: { let os = get("MAKEPAD_RUN_BURST_ARENA"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
-            tier1_adaptive: { let os = get("MAKEPAD_RUN_O3_ADAPTIVE"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() == Some("1") },
+            tier1_burst: { let os = get("MAKEPAD_RUN_O3_BURST"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             module_fuel: { let os = get("MAKEPAD_RUN_MODULE_FUEL"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(4_000_000_000) },
             module_mem_mb: { let os = get("MAKEPAD_RUN_MODULE_MEM_MB"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(256) },
             repeat: { let os = get("MAKEPAD_RUN_REPEAT"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(1) },
