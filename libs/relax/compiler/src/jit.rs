@@ -4945,7 +4945,7 @@ impl Unit {
         let Some(pos) = map.lookup(off) else {
             return Some((id, self.prog.file_paths.get(f.file as usize).cloned().unwrap_or_else(|| "source position unknown".to_string())));
         };
-        Some((id, self.pos_str((pos >> 32) as u32, pos as u32)))
+        Some((id, self.pos_str(relax_backend::rir::pos_file(pos), pos as u32)))
     }
 
     /// Structured JSON crash report for a panic/fault/hang.
@@ -10780,7 +10780,7 @@ fn inline_structural_freqs(f: &relax_backend::rir::Func) -> Vec<f32> {
 fn sampled_freqs(f: &relax_backend::rir::Func, h: &HashMap<u64, u32>) -> Vec<f32> {
     let counts: Vec<u32> = f.blocks.iter().map(|b| {
         b.pos.iter().chain(std::iter::once(&b.term_pos))
-            .map(|p| h.get(p).copied().unwrap_or(0)).max().unwrap_or(0)
+            .map(|p| h.get(&relax_backend::rir::pos_plain(*p)).copied().unwrap_or(0)).max().unwrap_or(0)
     }).collect();
     // The allocator expects 0..=1 relative to the hottest block. Entry PCs are
     // too short to give a reliable denominator; never divide by a noisy entry.
@@ -10802,7 +10802,8 @@ fn pc_source_pos(u: &Unit, pc: u64) -> Option<u64> {
         &f.history().retired.iter().find(|r| pc >= r.0 && pc < r.0 + r.1 as u64)?.2
     };
     let off = (pc - start) as u32;
-    map.lookup(off)
+    // profiles key source places: without the inline context (positions matched as before it)
+    map.lookup(off).map(relax_backend::rir::pos_plain)
 }
 
 /// MAKEPAD_RUN_FIELD_PROF=<path> (with MAKEPAD_RUN_PROFILE, steady from MAKEPAD_RUN_PROFILE_FROM_MS): every struct
@@ -13106,7 +13107,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 }
                 let pos = c.pc_map.get(pi).map_or(0, |x| x.1);
                 // (a debug dump: the program's files, read off the unit)
-                let src = unsafe { (&*up).pos_str((pos >> 32) as u32, pos as u32) };
+                let src = unsafe { (&*up).pos_str(relax_backend::rir::pos_file(pos), pos as u32) };
                 let ins = if i == u32::MAX { "-".to_string() } else { i.to_string() };
                 m.push_str(&format!("{:x}\t{}\t{}\t{}\n", off, b, ins, src));
             }
@@ -16815,7 +16816,8 @@ impl PcMap {
             let z = get(&mut i);
             p = p.wrapping_add((((z >> 1) as i64) ^ -((z & 1) as i64)) as u64);
             let q = match files {
-                Some(t) => (t.files.get((p >> 32) as usize).copied().unwrap_or(u32::MAX) as u64) << 32 | (p & 0xffff_ffff),
+                // (the inline context in the top bits stays)
+                Some(t) => (t.files.get(relax_backend::rir::pos_file(p) as usize).copied().unwrap_or(u32::MAX) as u64) << 32 | (p & 0xffff_ffff) | (p & !relax_backend::rir::pos_plain(u64::MAX)),
                 None => p,
             };
             if !f(o, q) {

@@ -892,6 +892,25 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
     }
     let cont = f.blocks.len() as u32;
     f.blocks.push(Block { insts: tail, pos: tail_pos, term: old_term, term_pos: old_term_pos });
+    // the inline stack: the callee's body runs in a new context under the call's (its own
+    // contexts follow, renumbered); the callee is named by a position in its own body
+    let root = f.inl.len() as u64 + 1;
+    let anchor = callee.blocks.iter().flat_map(|b| b.pos.iter().copied().chain(std::iter::once(b.term_pos))).find(|&p| p != 0 && pos_ctx(p) == 0).unwrap_or(0);
+    f.inl.push((call_pos, anchor));
+    let base = f.inl.len() as u64;
+    // a callee position in the caller: its own body (context 0) under the new context, its
+    // context c (callee.inl[c - 1]) at f.inl[base + c - 1]
+    let ctx_of = move |p: u64| -> u64 {
+        match pos_ctx(p) {
+            _ if p == 0 => 0,
+            0 => pos_with_ctx(p, root),
+            POS_CTX_LOST => p,
+            c => pos_with_ctx(p, base + c),
+        }
+    };
+    for &(cp, a) in &callee.inl {
+        f.inl.push((ctx_of(cp), a));
+    }
     // map callee vregs and slots
     let mut vmap = Vec::with_capacity(callee.vregs.len());
     for c in &callee.vregs {
@@ -926,14 +945,14 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
         for x in &cb.insts {
             insts.push(map_inst(x, &m, slot_base));
         }
-        let mut pos = cb.pos.clone();
+        let mut pos: Vec<u64> = cb.pos.iter().map(|&p| ctx_of(p)).collect();
         let mut term = match &cb.term {
             Term::Jump(t) => Term::Jump(t + boff),
             Term::Branch(c, t, e) => Term::Branch(m(*c), t + boff, e + boff),
             Term::Ret(vals) => {
                 for (k, v) in vals.iter().enumerate() {
                     insts.push(Inst::Mov(rets[k], m(*v)));
-                    pos.push(cb.term_pos);
+                    pos.push(ctx_of(cb.term_pos));
                 }
                 Term::Jump(cont)
             }
@@ -947,7 +966,7 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
                 None => Term::Resume,
             },
         };
-        let mut term_pos = cb.term_pos;
+        let mut term_pos = ctx_of(cb.term_pos);
         if let Some(u) = unwind {
             // split after every call that may unwind and is not already invoked
             let last_invoked = matches!(cb.term, Term::Invoke(..));
