@@ -934,7 +934,16 @@ fn findings(a: &Side, b: &Side, j: &Joined) -> Vec<(f64, String)> {
         let d_sp = ours.spill() as i64 - theirs.spill() as i64;
         if d_sp > 0 {
             what.push(format!("+{} stack loads/stores (spills/reloads: ours {}, rustc {})", d_sp, ours.spill(), theirs.spill()));
-            let sp: Vec<String> = a.spills.iter().filter(|x| keys.contains(&x.0)).take(2).map(|x| format!("value of {} spilled: {}", x.1, x.2)).collect();
+            let mut sp: Vec<String> = Vec::new();
+            for x in a.spills.iter().filter(|x| keys.contains(&x.0)) {
+                let t = format!("value of {} spilled: {}", x.1, x.2);
+                if !sp.contains(&t) {
+                    sp.push(t);
+                }
+                if sp.len() == 2 {
+                    break;
+                }
+            }
             if !sp.is_empty() {
                 what.push(sp.join("; "));
             }

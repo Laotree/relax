@@ -166,9 +166,11 @@ pub fn cmd_remarks(req: &Req, out: &mut Out) {
             v.sort_by_key(|r| (!r.hot, r.pos));
             let hot = v.iter().filter(|r| r.hot).count();
             rows.push(format!("`{}` (@{}): its last O3 build kept {} call(s) ({} in hot blocks); code: {}", short(&super::display_name(u, id, 0), 100), id, v.len(), hot, tiers.join(", ")));
-            rows.push(String::new());
-            rows.push("| line | callee | hot | why it stayed a call |".into());
-            rows.push("|---|---|---|---|".into());
+            if !v.is_empty() {
+                rows.push(String::new());
+                rows.push("| line | callee | hot | why it stayed a call |".into());
+                rows.push("|---|---|---|---|".into());
+            }
             for r in v.iter().take(n) {
                 let at = super::codever::pos_line(u, r.pos).map(|(fi, l)| format!("{}:{}", u.prog.file_paths.get(fi as usize).map(|p| p.rsplit('/').next().unwrap_or(p)).unwrap_or("?"), l)).unwrap_or_else(|| "?".into());
                 let callee = if (r.callee as usize) < u.fns.len() { super::display_name(u, r.callee, 0) } else { format!("fn#{}", r.callee) };
