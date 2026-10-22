@@ -13440,7 +13440,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             // tools/run/tools/asmcmp: code offset -> RIR block/instruction of the dumped fn
             x64::set_rir_map(true);
         }
+        relax_backend::remark::begin();
         let c = crate::memstat::tagged(crate::memstat::Tag::Codegen, || relax_codegen::native::compile_freq(options, &func, &env, freq.as_deref()));
+        crate::inspect::remarks::record_spills(id, relax_backend::remark::take());
         crate::memstat::note_big("codegen O3", &func.name, mps, || cg_shape(&func));
         let c = c?;
         code_sig(id, &func, &c.code, c.alloc_sig, true);

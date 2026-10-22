@@ -9,6 +9,31 @@ use std::collections::HashMap;
 
 static INLINE: relax_session::sync::Mutex<Option<HashMap<u32, Vec<SiteRemark>>>> = relax_session::sync::Mutex::new(None);
 
+static SPILLS: relax_session::sync::Mutex<Option<HashMap<u32, Vec<relax_backend::remark::SpillRemark>>>> = relax_session::sync::Mutex::new(None);
+
+/// The values slot `id`'s last O3 build spilled (the register allocator's choices).
+pub fn record_spills(id: u32, v: Vec<relax_backend::remark::SpillRemark>) {
+    let _k = crate::zone_alloc::kept();
+    let mut v = v;
+    v.shrink_to_fit();
+    SPILLS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(id, v);
+}
+
+/// The spilled values of slot `id`'s last O3 build.
+pub fn spills_of(id: u32) -> Vec<relax_backend::remark::SpillRemark> {
+    SPILLS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&id).cloned()).unwrap_or_default()
+}
+
+/// Usable registers per class on this target (int, float) for the spill remarks' wording.
+pub fn usable_regs(flt: bool) -> u32 {
+    match (relax_backend::asm::Arch::host(), flt) {
+        (relax_backend::asm::Arch::X64, false) => 14,
+        (relax_backend::asm::Arch::X64, true) => 16,
+        (relax_backend::asm::Arch::Arm64, false) => 27,
+        (relax_backend::asm::Arch::Arm64, true) => 32,
+    }
+}
+
 static COUNTS: relax_session::sync::Mutex<Option<HashMap<u32, Vec<(u64, u64)>>>> = relax_session::sync::Mutex::new(None);
 
 /// The PGO counts slot `id`'s O3 code was built from: (source position, executions of its block
@@ -61,6 +86,14 @@ pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
             }
         }
     }
+    if let Ok(g) = SPILLS.try_lock() {
+        if let Some(m) = g.as_ref() {
+            a.field("inspect.spills");
+            for v in m.values() {
+                a.vec(v);
+            }
+        }
+    }
     if let Ok(g) = COUNTS.try_lock() {
         if let Some(m) = g.as_ref() {
             a.field("inspect.counts");
@@ -96,8 +129,8 @@ pub fn cmd_remarks(req: &Req, out: &mut Out) {
             let f = &u.fns[id as usize];
             let mut v = inline_of(id);
             let tiers: Vec<String> = super::codever::bodies(u, id).iter().map(|b| format!("{} ({})", super::codever::label(super::codever::kind_at(u, b.start)), b.state)).collect();
-            if v.is_empty() {
-                rows.push(format!("`{}` (@{}): no O3 remarks (no O3 build in this run{}); code: {}", short(&f.name, 100), id, if tiers.is_empty() { "" } else { ", or every call was inlined" }, if tiers.is_empty() { "none".into() } else { tiers.join(", ") }));
+            if v.is_empty() && spills_of(id).is_empty() {
+                rows.push(format!("`{}` (@{}): no O3 remarks (no O3 build in this run{}); code: {}", short(&f.name, 100), id, if tiers.is_empty() { "" } else { ", or every call was inlined and nothing spilled" }, if tiers.is_empty() { "none".into() } else { tiers.join(", ") }));
                 continue;
             }
             v.sort_by_key(|r| (!r.hot, r.pos));
@@ -113,6 +146,22 @@ pub fn cmd_remarks(req: &Req, out: &mut Out) {
             }
             if v.len() > n {
                 rows.push(format!("+{} more (n=)", v.len() - n));
+            }
+            let mut sp = spills_of(id);
+            if !sp.is_empty() {
+                // the most used first: their stack traffic costs most
+                sp.sort_by_key(|r| (std::cmp::Reverse(r.uses), r.pos));
+                rows.push(String::new());
+                rows.push(format!("register allocation: {} value(s) spilled to stack slots ({} across calls, {} under pressure)", sp.len(), sp.iter().filter(|r| r.calls > 0).count(), sp.iter().filter(|r| r.pressure + 1 >= usable_regs(r.flt)).count()));
+                rows.push("| defined at | spilled value |".into());
+                rows.push("|---|---|".into());
+                for r in sp.iter().take(n) {
+                    let at = super::codever::pos_line(u, r.pos).map(|(fi, l)| format!("{}:{}", u.prog.file_paths.get(fi as usize).map(|p| p.rsplit('/').next().unwrap_or(p)).unwrap_or("?"), l)).unwrap_or_else(|| "(entry)".into());
+                    rows.push(format!("| {} | {} |", at, r.describe(usable_regs(r.flt))));
+                }
+                if sp.len() > n {
+                    rows.push(format!("+{} more spilled values", sp.len() - n));
+                }
             }
         }
         Ok(rows)

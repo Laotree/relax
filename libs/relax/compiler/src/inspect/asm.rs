@@ -55,12 +55,14 @@ struct Side {
     why: Vec<Option<String>>,
     /// per branch leaving the fn's code: what its target is (a shared panic stub, a tail call)
     ext: Vec<Option<String>>,
+    /// the O3 build's spilled values: (line key, line shown, why), most used first
+    spills: Vec<(String, String, String)>,
 }
 
 impl Side {
     fn new(label: String, name: String, addr: u64, insns: Vec<Insn>) -> Side {
         let n = insns.len();
-        Side { label, name, addr, insns, at: vec![u32::MAX; n], inl: vec![(String::new(), 0); n], callee: vec![None; n], samples: vec![0; n], below: vec![0; n], count: vec![None; n], lines: Vec::new(), check: vec![None; n], why: vec![None; n], ext: vec![None; n] }
+        Side { label, name, addr, insns, at: vec![u32::MAX; n], inl: vec![(String::new(), 0); n], callee: vec![None; n], samples: vec![0; n], below: vec![0; n], count: vec![None; n], lines: Vec::new(), check: vec![None; n], why: vec![None; n], ext: vec![None; n], spills: Vec::new() }
     }
 
     fn line_index(&mut self, idx: &mut HashMap<String, u32>, key: String, show: String) -> u32 {
@@ -266,7 +268,17 @@ fn our_sides(q: &str, max: usize) -> Result<(Vec<(u32, Side)>, Vec<String>), Str
         let mut sides = Vec::new();
         let mut notes = Vec::new();
         let mut res = super::codever::Resolver::new();
-        for id in found {
+        // the slots whose code holds an inlined copy of the fn: candidates too (the hot copy of a
+        // small fn usually lives in its caller)
+        let tl = super::codever::target_lines(u, &found.iter().map(|&i| (i, None)).collect::<Vec<_>>());
+        let mut all = found.clone();
+        for (c, _, state) in super::codever::holders(u, &tl, &found, false) {
+            if state == "installed" && !all.contains(&c) && all.len() < found.len() + 8 {
+                all.push(c);
+            }
+        }
+        for id in all {
+            let holder = !found.contains(&id);
             let f = &u.fns[id as usize];
             let bodies = super::codever::bodies(u, id);
             if bodies.is_empty() {
@@ -292,7 +304,10 @@ fn our_sides(q: &str, max: usize) -> Result<(Vec<(u32, Side)>, Vec<String>), Str
             let pos_counts = super::remarks::counts_of(id);
             for b in bodies {
                 let kind = super::codever::kind_at(u, b.start);
-                let label = format!("ours {} {}{}", kind.tier_name(), kind.origin_name(), if b.state == "installed" { String::new() } else { format!(" ({})", b.state) });
+                if holder && b.state != "installed" {
+                    continue;
+                }
+                let label = format!("ours {} {}{}{}", kind.tier_name(), kind.origin_name(), if b.state == "installed" { String::new() } else { format!(" ({})", b.state) }, if holder { " (holds it inlined)" } else { "" });
                 let code = unsafe { std::slice::from_raw_parts(b.start as *const u8, b.len as usize) };
                 let insns = dis::decode(Arch::host(), code, b.start);
                 let mut s = Side::new(label, super::display_name(u, id, 0), b.start, insns);
@@ -356,6 +371,14 @@ fn our_sides(q: &str, max: usize) -> Result<(Vec<(u32, Side)>, Vec<String>), Str
                 }
                 drop(code_tab);
                 s.find_checks();
+                let mut sp = super::remarks::spills_of(id);
+                sp.sort_by_key(|r| (std::cmp::Reverse(r.uses), r.pos));
+                for r in sp {
+                    if let Some((file, line)) = super::codever::pos_line(u, r.pos) {
+                        let path = u.prog.file_paths.get(file as usize).cloned().unwrap_or_default();
+                        s.spills.push((format!("{}:{}", path_key(&path), line), format!("{}:{}", file_name(&path), line), r.describe(super::remarks::usable_regs(r.flt))));
+                    }
+                }
                 sides.push((id, s));
             }
         }
@@ -772,6 +795,10 @@ fn findings(a: &Side, b: &Side, j: &Joined) -> Vec<(f64, String)> {
         let d_sp = ours.spill() as i64 - theirs.spill() as i64;
         if d_sp > 0 {
             what.push(format!("+{} stack loads/stores (spills/reloads: ours {}, rustc {})", d_sp, ours.spill(), theirs.spill()));
+            let sp: Vec<String> = a.spills.iter().filter(|x| keys.contains(&x.0)).take(2).map(|x| format!("value of {} spilled: {}", x.1, x.2)).collect();
+            if !sp.is_empty() {
+                what.push(sp.join("; "));
+            }
         }
         let d_mov = (ours.get(Class::MovReg) + ours.get(Class::MovImm)) as i64 - (theirs.get(Class::MovReg) + theirs.get(Class::MovImm)) as i64;
         if d_mov > 1 {
@@ -928,10 +955,14 @@ pub fn cmd_asm(req: &Req, out: &mut Out) {
         attach_samples(s, &pcs);
     }
     // the body to show: the one with the most samples, else the installed one with the most code
-    sides.sort_by_key(|(_, s)| (std::cmp::Reverse(s.total_samples()), !s.label.ends_with(')') as u8 ^ 1, std::cmp::Reverse(s.insns.len())));
+    // the hottest body; without samples the fn's own installed code before holders and older bodies
+    sides.sort_by_key(|(_, s)| (std::cmp::Reverse(s.total_samples()), s.label.contains('('), std::cmp::Reverse(s.insns.len())));
     let others = sides.len() - 1;
     let others_samples: u64 = sides[1..].iter().map(|s| s.1.total_samples()).sum();
     let (slot, a) = sides.swap_remove(0);
+    if a.label.ends_with("(holds it inlined)") {
+        notes.insert(0, format!("`{}` runs inlined here: shown is the code of `{}` (@{}), which holds the hottest copy; its lines of the fn are the ones from its source file", q, short(&a.name, 80), slot));
+    }
     let b = if vs {
         match native_path(req).and_then(|p| with_native(&p, |nb| rustc_side(nb, &a.name, a.insns.last().map_or(0, |i| i.off as usize + i.len as usize))).and_then(|r| r)) {
             Ok((s, more)) => {
