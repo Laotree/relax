@@ -836,6 +836,9 @@ fn keeps_rax(options: &relax_session::Options, i: &Inst) -> bool {
         Inst::IBin(op, ..) => matches!(op, IOp::Add | IOp::Sub | IOp::And | IOp::Or | IOp::Xor | IOp::Mul) || (matches!(op, IOp::Shl | IOp::Shr) && host_bmi2(options)),
         Inst::SlotAddr(..) | Inst::FnAddr(..) | Inst::Mov(..) | Inst::Load(..) | Inst::Store(..) | Inst::LoadX(..) | Inst::StoreX(..) => true,
         Inst::Conv(Conv::IntToInt(_), ..) | Inst::Sel(..) => true,
+        // scalar float arithmetic (Gen::inst arms and Gen::fma): float registers, r10 / r11 only;
+        // vector ops (Gen::vinst, index_operands) and int <-> float conversions use rax
+        Inst::Fconst(..) | Inst::FBin(..) | Inst::FUnary(..) | Inst::FCmp(..) | Inst::FMulAdd(..) => true,
         _ => false,
     }
 }
