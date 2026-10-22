@@ -1014,6 +1014,8 @@ struct Gen<'a> {
     pads: Vec<(usize, Vec<(VReg, i32)>, u32)>,
     /// (return offset, landing stub offset) of each invoked call
     unwind_tab: Vec<(u32, u32)>,
+    /// (instruction position, return offset) of every call: the variable table's sites (dbgloc)
+    var_calls: Vec<(u32, u32)>,
 }
 
 impl<'a> Gen<'a> {
@@ -2125,6 +2127,7 @@ impl<'a> Gen<'a> {
         }
         // a C-unwind call is invoked like a Relax one: its landing stub is keyed by this address
         self.last_call_ret = self.a.pos();
+        self.var_calls.push((self.cur_pos, self.a.pos() as u32));
         if stack_bytes > 0 {
             // add rsp, imm32
             self.a.byte(0x48);
@@ -3213,15 +3216,17 @@ impl<'a> Gen<'a> {
                     FOp::Max | FOp::MaxGt => 0x5f,
                 };
                 let other = if *b == cv { *a } else { *b };
-                let xo = self.use_f(other, XS);
-                let xd = self.def_f(*d, XS);
                 if self.avx {
-                    // vop xd, xo, [rip + c]
-                    let at = self.a.vex_rip(if *f64_ { 3 } else { 2 }, 1, false, opc, xd, xo);
+                    // vop xd, xo, [rip + c] (EVEX for xmm16..31: read and written in place)
+                    let xo = self.use_fx(other, XS);
+                    let xd = self.def_fx(*d, XS);
+                    let at = if xd >= 16 || xo >= 16 { self.a.evex_rip(if *f64_ { 3 } else { 2 }, 1, *f64_, opc, xd, xo) } else { self.a.vex_rip(if *f64_ { 3 } else { 2 }, 1, false, opc, xd, xo) };
                     self.fpool.push((at, bits));
                     self.fin_f(*d, xd);
                     return;
                 }
+                let xo = self.use_f(other, XS);
+                let xd = self.def_f(*d, XS);
                 self.a.movf_rr(*f64_, xd, xo);
                 self.a.byte(pfx);
                 self.a.rex(false, xd, 0, 0, false);
@@ -5327,6 +5332,20 @@ impl<'a> Gen<'a> {
                 self.f_to_int(rd, it);
                 self.fin_i(d, rd);
             }
+            // AVX: vcvtss2sd / vcvtsd2ss xd, xs, xs -- the upper lanes come from the source, so
+            // no dependency-breaking xorps first (LLVM's form), and xmm16..31 in place (EVEX)
+            Conv::F32ToF64 if self.avx => {
+                let xs = self.use_fx(s, XS);
+                let xd = self.def_fx(d, XS);
+                self.a.vex_rr_any(2, 1, false, 0x5a, xd, xs, xs);
+                self.fin_f(d, xd);
+            }
+            Conv::F64ToF32 if self.avx => {
+                let xs = self.use_fx(s, XS);
+                let xd = self.def_fx(d, XS);
+                self.a.vex_rr_any(3, 1, true, 0x5a, xd, xs, xs);
+                self.fin_f(d, xd);
+            }
             Conv::F32ToF64 => {
                 let xs = self.use_f(s, XS);
                 let xd = self.def_f(d, XS);
@@ -5533,6 +5552,7 @@ impl<'a> Gen<'a> {
             Callee::CHost(..) | Callee::CIndirect(..) | Callee::CFn(..) | Callee::Asm(..) => {}
         }
         self.last_call_ret = self.a.pos();
+        self.var_calls.push((self.cur_pos, self.a.pos() as u32));
         if stack_bytes > 0 {
             // add rsp, imm32
             self.a.byte(0x48);
@@ -5988,6 +6008,12 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // compares next to the selects that read them (the cmov takes the flags)
     let sunk = if env.opt_regs || f.full { regalloc::sink_compares(f) } else { None };
     let f = sunk.as_ref().unwrap_or(f);
+    // counter steps after the last read of the old value (no copy per iteration)
+    let stepped = if env.opt_regs || f.full { regalloc::sink_increments(options, f) } else { None };
+    let f = stepped.as_ref().unwrap_or(f);
+    // branch compares at the end of their block (fused into cmp + jcc)
+    let brs = if env.opt_regs || f.full { regalloc::sink_branch_compares(options, f) } else { None };
+    let f = brs.as_ref().unwrap_or(f);
     let mut cfg = reg_config(options);
     cfg.sym_class = env.sym_class;
     let _cost_ra = crate::probe::phase(9);
@@ -6088,6 +6114,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         ymm: f.vregs.iter().any(|c| *c == Cls::V256),
         pads: Vec::new(),
         unwind_tab: Vec::new(),
+        var_calls: Vec::new(),
     };
     g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
     if env.opt_regs || g.f.full {
@@ -6110,7 +6137,21 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     let text_len = g.text_len;
     crate::stats::pass_time(12, t_emit);
     crate::probe::code(g.a.b.len());
-    Ok(Compiled { code: g.a.b, pc_map: g.pc_map, frame_size: frame, text_len, alloc_sig, relocs: g.relocs, rir_emitted: if g.rir_map_on { g.f.dump() } else { String::new() }, rir_map: g.rir_map })
+    // where the named locals are at each call (makepad inspect `locals`; side metadata)
+    let mut pc_map = std::mem::take(&mut g.pc_map);
+    if !g.frameless && !g.f.dbg.is_empty() {
+        let (saved, slot_off) = (g.saved, &g.slot_off);
+        let spill = |o: i32| -(saved + o);
+        let slot = |s: u32| -(saved + slot_off[s as usize]);
+        let fr = crate::dbgloc::Frame { callee_int: &cfg.int_callee, callee_flt: &cfg.flt_callee, arg_regs: &[RDI, RSI, RDX, RCX, R8, R9], captured: &[RDI, RSI, RDX, RCX, R8, R9], call_writes: &[RAX, R10, R11], spill_fp: &spill, slot_fp: &slot };
+        let vars = crate::dbgloc::build(g.f, &g.al, &fr, &g.var_calls);
+        let e = crate::dbgloc::pc_entries(&vars, g.f.file);
+        crate::dbgloc::note_stats(&pc_map, &e, vars.len());
+        pc_map.extend(e);
+    } else {
+        crate::dbgloc::note_stats(&pc_map, &[], 0);
+    }
+    Ok(Compiled { code: g.a.b, pc_map, frame_size: frame, text_len, alloc_sig, relocs: g.relocs, rir_emitted: if g.rir_map_on { g.f.dump() } else { String::new() }, rir_map: g.rir_map })
 }
 
 /// `jmp target` through r11 (caller-saved, never an argument register): every argument

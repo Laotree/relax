@@ -47,7 +47,7 @@ pub(crate) fn pos_line(u: &Unit, p: u64) -> Option<(u32, u32)> {
     if p == 0 {
         return None;
     }
-    let file = (p >> 32) as u32;
+    let file = relax_backend::rir::pos_file(p);
     let f = u.prog.files.get(file as usize)?;
     Some((file, f.line_col(p as u32).0 as u32))
 }
@@ -74,8 +74,9 @@ impl Lines {
 /// Whether a code body's pc map has an instruction in `lines`.
 pub(crate) fn map_holds(u: &Unit, map: &PcMap, lines: &[Lines]) -> bool {
     let mut hit = false;
-    map.each(|_, p| {
-        if lines.iter().any(|l| l.holds(u, p)) {
+    map.each(|o, p| {
+        // (the variable table's entries hold no positions)
+        if o != relax_backend::dbgloc::PC_VARS && lines.iter().any(|l| l.holds(u, p)) {
             hit = true;
             return false;
         }
@@ -275,8 +276,13 @@ pub(crate) struct PcCode {
 pub(crate) struct Inlined {
     /// its slot, when the code's inlined slots name it
     pub slot: Option<u32>,
-    pub def: Option<crate::program::DefId>,
     pub name: String,
+    /// the inline stack (the code's line table), innermost first: (fn, its def, file:line:col);
+    /// the last level is the slot's own fn at the outermost call site. Empty: code made before
+    /// the line table kept inline stacks (the fn was found by its source span)
+    pub stack: Vec<(String, Option<crate::program::DefId>, String)>,
+    /// a chain deeper than the context field holds
+    pub lost: bool,
 }
 
 /// Finds which fn an inlined position belongs to: the slots the code inlined (O3 bodies record
@@ -292,14 +298,14 @@ impl Resolver {
 
     fn file_fns(&mut self, u: &Unit, file: u32) -> &[(u32, u32, crate::program::DefId)] {
         self.by_file.entry(file).or_insert_with(|| {
+            // every fn item of the file (a fn that only runs inlined into code from the disk
+            // cache has no slot of its own)
             let mut v = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for f in u.fns.iter() {
-                if let FnKey::Inst(d, _) = &f.key {
-                    if u.prog.def(*d).file == file && seen.insert(*d) {
-                        if let Some((_, lo, hi)) = def_lines(u, *d) {
-                            v.push((lo, hi, *d));
-                        }
+            for &d in u.prog.defs_in_file(file) {
+                let d = crate::program::DefId(d);
+                if matches!(u.prog.def(d).kind, crate::program::DefKind::Fn | crate::program::DefKind::AssocFn) {
+                    if let Some((_, lo, hi)) = def_lines(u, d) {
+                        v.push((lo, hi, d));
                     }
                 }
             }
@@ -308,6 +314,57 @@ impl Resolver {
     }
 
     /// The fn a position inside slot `id`'s code at `start` comes from, when not its own.
+    /// The innermost fn item spanning a position (by its file's fn items).
+    pub fn fn_at(&mut self, u: &Unit, p: u64) -> Option<crate::program::DefId> {
+        let (pf, pl) = pos_line(u, p)?;
+        let mut inner: Option<(u32, crate::program::DefId)> = None;
+        for &(lo, hi, d) in self.file_fns(u, pf) {
+            if pl >= lo && pl <= hi && inner.map_or(true, |x| hi - lo < x.0) {
+                inner = Some((hi - lo, d));
+            }
+        }
+        inner.map(|x| x.1)
+    }
+
+    /// The inline stack of position `p` in a body whose pc map is `map` (its inline entries,
+    /// rir::inline_pc_entries): None when `p` is the body's own code.
+    pub fn inline_stack(&mut self, u: &Unit, id: u32, map: &PcMap, p: u64) -> Option<Inlined> {
+        use relax_backend::rir::{pos_ctx, POS_CTX_LOST};
+        if pos_ctx(p) == 0 {
+            return None;
+        }
+        let mut table: Vec<u64> = Vec::new();
+        map.each(|o, q| {
+            if o == u32::MAX {
+                table.push(q);
+            }
+            true
+        });
+        let pstr = |q: u64| u.pos_str(relax_backend::rir::pos_file(q), q as u32);
+        let mut stack = Vec::new();
+        let mut cur = p;
+        let mut lost = false;
+        for _ in 0..256 {
+            let c = pos_ctx(cur);
+            if c == 0 {
+                break;
+            }
+            if c == POS_CTX_LOST || (c as usize) * 2 > table.len() {
+                lost = true;
+                break;
+            }
+            let (call, anchor) = (table[(c as usize - 1) * 2], table[(c as usize - 1) * 2 + 1]);
+            let def = self.fn_at(u, anchor);
+            let name = def.map_or_else(|| "(inlined fn)".to_string(), |d| crate::lower::display_path(&u.prog, d));
+            stack.push((name, def, pstr(cur)));
+            cur = call;
+        }
+        stack.push((super::display_name(u, id, 0), None, pstr(cur)));
+        let (name, def) = (stack[0].0.clone(), stack[0].1);
+        let slot = def.and_then(|d| u.fns.iter().position(|f| matches!(&f.key, FnKey::Inst(x, _) if *x == d)).map(|i| i as u32));
+        Some(Inlined { slot, name, stack, lost })
+    }
+
     pub fn inlined_fn(&mut self, u: &Unit, id: u32, start: u64, p: u64) -> Option<Inlined> {
         let (pf, pl) = pos_line(u, p)?;
         let own = fn_lines(u, id);
@@ -346,11 +403,7 @@ impl Resolver {
             }
         }
         if let Some((c, _)) = best {
-            let def = match &u.fns[c as usize].key {
-                FnKey::Inst(d, _) => Some(*d),
-                _ => None,
-            };
-            return Some(Inlined { slot: Some(c), def, name: super::display_name(u, c, 0) });
+            return Some(Inlined { slot: Some(c), name: super::display_name(u, c, 0), stack: Vec::new(), lost: false });
         }
         // any fn item of the file that spans the line (innermost)
         let mut inner: Option<(u32, crate::program::DefId)> = None;
@@ -360,8 +413,8 @@ impl Resolver {
             }
         }
         match inner {
-            Some((_, d)) => Some(Inlined { slot: None, def: Some(d), name: crate::lower::display_path(&u.prog, d) }),
-            None => Some(Inlined { slot: None, def: None, name: format!("(inlined code of {}:{})", u.prog.file_paths.get(pf as usize).map(String::as_str).unwrap_or("?"), pl) }),
+            Some((_, d)) => Some(Inlined { slot: None, name: crate::lower::display_path(&u.prog, d), stack: Vec::new(), lost: false }),
+            None => Some(Inlined { slot: None, name: format!("(inlined code of {}:{})", u.prog.file_paths.get(pf as usize).map(String::as_str).unwrap_or("?"), pl), stack: Vec::new(), lost: false }),
         }
     }
 }
@@ -378,10 +431,11 @@ pub(crate) fn describe_pc(u: &Unit, r: &mut Resolver, pc: u64) -> Option<PcCode>
     };
     let pos = map.and_then(|m| m.lookup((pc - start) as u32));
     let at = match pos {
-        Some(p) => u.pos_str((p >> 32) as u32, p as u32),
+        Some(p) => u.pos_str(relax_backend::rir::pos_file(p), p as u32),
         None => u.prog.file_paths.get(u.fns[id as usize].file as usize).cloned().unwrap_or_default(),
     };
-    let inlined = pos.and_then(|p| r.inlined_fn(u, id, start, p));
+    // the line table's inline stack, else (older code) the fn whose span holds the position
+    let inlined = pos.and_then(|p| map.and_then(|m| r.inline_stack(u, id, m, p)).or_else(|| r.inlined_fn(u, id, start, p)));
     Some(PcCode { slot: id, start, len, kind, state, gen, at, inlined })
 }
 
@@ -412,14 +466,23 @@ pub(crate) fn frame_fields(u: &Unit, c: &PcCode) -> (String, String, String, Str
     }
     let name = match &c.inlined {
         Some(i) => {
-            module.push_str(&format!(" inlined into {}", short(&slot_name, 80)));
             code.push_str(&format!(",\"inlined_into\":{}", json_str(&short(&slot_name, 140))));
             if let Some(cs) = i.slot {
                 code.push_str(&format!(",\"inlined_slot\":{}", cs));
             }
-            // (the line table keeps no inline stack yet: which call site of the slot's fn this copy
-            // is for is not known, and a guess from neighbouring lines misleads)
-            code.push_str(",\"call_site\":\"not recorded (no inline stack in the line table)\"");
+            if i.stack.is_empty() {
+                module.push_str(&format!(" inlined into {}", short(&slot_name, 80)));
+                // code made before the line table kept inline stacks
+                code.push_str(",\"call_site\":\"not recorded (code without an inline stack)\"");
+            } else {
+                let call = &i.stack[i.stack.len() - 1].2;
+                module.push_str(&format!(" inlined at {} in {}", call, short(&slot_name, 80)));
+                let levels: Vec<String> = i.stack.iter().map(|(n, _, at)| format!("{{\"fn\":{},\"at\":{}}}", json_str(&short(n, 140)), json_str(at))).collect();
+                code.push_str(&format!(",\"call_site\":{},\"inline_stack\":[{}]", json_str(call), levels.join(",")));
+                if i.lost {
+                    code.push_str(",\"inline_stack_cut\":true");
+                }
+            }
             i.name.clone()
         }
         None => slot_name,
