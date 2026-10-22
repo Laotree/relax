@@ -4243,7 +4243,7 @@ mod tests {
     }
 
     #[test]
-    fn sroa_u32_read_as_two_u16_halves_is_packed() {
+    fn sroa_u32_read_as_two_u16_halves_stays_in_memory() {
         let (mut f, base) = sroa_fixture(4);
         let value = f.vreg(Cls::I);
         let low = f.vreg(Cls::I);
@@ -4255,10 +4255,7 @@ mod tests {
             Inst::Load(Mem::Int(2, false), low, base, 0), Inst::Load(Mem::Int(2, false), high, base, 2),
         ]);
         f.blocks[0].term = Term::Ret(vec![low, high]);
-        sroa_promote(&mut f);
-        assert!(!f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Load(..) | Inst::Store(..))));
-        // the high half: shift right 16, then the u16
-        assert!(f.blocks[0].insts.iter().any(|i| matches!(i, Inst::IBinI(IOp::Shr, _, _, _, 16))));
+        sroa_rejects(&mut f, SroaReject::KindMix);
     }
 
     #[test]
@@ -4466,8 +4463,7 @@ mod tests {
 
     #[test]
     fn sroa_partial_access_or_copy_cut_stays_in_memory() {
-        // (a u16 inside the u64 alone is a packed cell now: sroa_u32_read_as_two_u16_halves_is_packed)
-        for (m, off, why) in [(Mem::Int(2, false), 2, SroaReject::CopyCut), (Mem::Int(8, true), 0, SroaReject::CopyCut)] {
+        for (m, off, why) in [(Mem::Int(2, false), 2, SroaReject::Overlap), (Mem::Int(8, true), 0, SroaReject::CopyCut)] {
             let (mut f, base) = sroa_fixture(8);
             let dst = f.vreg(Cls::I);
             let value = f.vreg(Cls::I);
@@ -4506,9 +4502,7 @@ mod tests {
             f.blocks[0].insts.push(Inst::Copy(dst, other, 64));
             f.blocks[0].term = Term::Ret(rets);
             if field_off != 0 {
-                // a u16 inside each u64 cell: packed integer cells (shift + truncate)
-                sroa_promote(&mut f);
-                assert!(!f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Load(_, _, b, _) if *b == other)));
+                sroa_rejects(&mut f, SroaReject::Overlap);
                 continue;
             }
             sroa_promote(&mut f);
