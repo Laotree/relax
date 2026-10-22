@@ -14,9 +14,8 @@ pub(super) struct Images {
     pending: Vec<NewEntry>,
     keys: HashSet<u128>,
     definitions: HashMap<usize, (u128, usize)>,
-    main: HashMap<u128, Option<(&'static [u8], &'static [Tok])>>,
+    main: HashMap<u128, Option<&'static [u8]>>,
     reused_src: usize,
-    reused_toks: usize,
     written: usize,
 }
 
@@ -24,7 +23,7 @@ impl Images {
     pub(super) fn open(dir: &std::path::Path, name: String) -> Option<Self> {
         let path = dir.join(&name);
         Some(Self { name, store: Arc::new(Store::open(&path)?), path,
-            pending: Vec::new(), keys: HashSet::new(), definitions: HashMap::new(), main: HashMap::new(), reused_src: 0, reused_toks: 0, written: 0 })
+            pending: Vec::new(), keys: HashSet::new(), definitions: HashMap::new(), main: HashMap::new(), reused_src: 0, written: 0 })
     }
 
     fn add(&mut self, key: u128, image: Writer<'_>) {
@@ -38,8 +37,7 @@ impl Images {
 
     pub(super) fn finish(self, profile: bool, name: &str) -> Option<()> {
         if profile {
-            eprintln!("rust-demand-image-bytes: crate={name} reused_src={} reused_toks={} added={}",
-                self.reused_src, self.reused_toks, self.written);
+            eprintln!("rust-demand-image-bytes: crate={name} reused_src={} added={}", self.reused_src, self.written);
         }
         if !self.pending.is_empty() { crate::store::append(&self.path, self.pending, false).ok()?; }
         Some(())
@@ -50,40 +48,29 @@ impl DemandWriter for Images {
     fn store_name(&self) -> &str { &self.name }
 
     fn surface(&mut self, path: &str, hash: u128, src: &[u8], toks: &[Tok]) -> Option<(DemandSlice, DemandSlice)> {
+        // The source is the file's own image's (a crate store reference to it, front_run.rs)
+        // when that holds the same bytes; the scan's tokens are always stored here: a file image
+        // keeps its tokens packed (PackedToks), the planner reads plain `Tok` slices.
         let main = Cache::front_key(path, hash);
         let image = *self.main.entry(main).or_insert_with(|| {
             let ix = self.store.index.binary_search_by_key(&main, |e| e.key).ok()?;
-            let r = Reader::new(checked_front_entry(&self.store, ix, main)?)?;
-            Some((r.slice::<u8>(0, 1)?, r.slice::<Tok>(1, 2)?))
+            Reader::new(checked_front_entry(&self.store, ix, main)?)?.slice::<u8>(0, 1)
         });
         let src_hash = crate::crate_image::file_hash("", src);
         let toks_hash = crate::crate_image::demand_token_hash(toks);
-        let same_src = image.is_some_and(|(s, _)| s.starts_with(src));
-        let token_start = image.and_then(|(_, ts)| {
-            if toks.is_empty() { return Some(0); }
-            // Source positions make the first token selective even for large files.
-            // Compare fields, never padding in the native Tok representation.
-            ts.iter().enumerate().find_map(|(i, t)| {
-                if (t.kind, t.lo, t.hi) != (toks[0].kind, toks[0].lo, toks[0].hi) { return None; }
-                let candidate = ts.get(i..i.checked_add(toks.len())?)?;
-                candidate.iter().zip(toks).all(|(a, b)| (a.kind, a.lo, a.hi) == (b.kind, b.lo, b.hi)).then_some(i)
-            })
-        });
+        let same_src = image.is_some_and(|s| s.starts_with(src));
         let mut key = Sip128::new();
-        key.str("demand-front-surface-v1"); key.str(path); key.u128(hash);
+        key.str("demand-front-surface-v2"); key.str(path); key.u128(hash);
         key.u128(src_hash); key.u128(toks_hash);
-        key.u8(same_src as u8); key.u8(token_start.is_some() as u8);
+        key.u8(same_src as u8);
         let key = key.finish128();
-        if !same_src || token_start.is_none() {
-            let mut image = Writer::default();
-            image.add(1, if same_src { &[] } else { src });
-            image.add(2, if token_start.is_some() { &[] } else { toks });
-            self.add(key, image);
-        }
+        let mut part = Writer::default();
+        part.add(1, if same_src { &[] } else { src });
+        part.add(2, toks);
+        self.add(key, part);
         if same_src { self.reused_src += src.len(); }
-        if token_start.is_some() { self.reused_toks += std::mem::size_of_val(toks); }
         Some((DemandSlice { image: if same_src { main } else { key }, start: 0, len: src.len(), hash: src_hash },
-            DemandSlice { image: if token_start.is_some() { main } else { key }, start: token_start.unwrap_or(0), len: toks.len(), hash: toks_hash }))
+            DemandSlice { image: key, start: 0, len: toks.len(), hash: toks_hash }))
     }
 
     fn definition(&mut self, def: &crate::macros::MacroDef) -> Option<(u128, usize)> {
