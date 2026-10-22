@@ -1757,6 +1757,7 @@ struct EvictInfo {
     /// (block, instruction index) of a vreg's only definition (u32::MAX: none or several, or a
     /// value live into the entry)
     def_at: Vec<(u32, u32)>,
+    trace: bool,
 }
 
 impl EvictInfo {
@@ -1768,7 +1769,7 @@ impl EvictInfo {
         let mut occupants: Vec<Vec<u32>> = vec![Vec::new(); nb];
         let mut def_at = vec![(u32::MAX, 0u32); nv];
         if !hot.iter().any(|h| *h) {
-            return EvictInfo { hot, occupants, def_at };
+            return EvictInfo { hot, occupants, def_at, trace: trace_on(f) };
         }
         let block_of = |p: u32| block_start.partition_point(|&s| s <= p) - 1;
         for v in 0..nv {
@@ -1803,7 +1804,7 @@ impl EvictInfo {
                 def_at[v] = (u32::MAX, 0);
             }
         }
-        EvictInfo { hot, occupants, def_at }
+        EvictInfo { hot, occupants, def_at, trace: trace_on(f) }
     }
 
     /// Block-local eviction for the window runs of block `bi` that found no register: a register
@@ -1878,6 +1879,9 @@ impl EvictInfo {
         // evictions made in this block: (register index, s, r)
         let mut made: Vec<(usize, u32, u32)> = Vec::new();
         let recomputed = |g: u32| matches!(remat0.get(g as usize), Some(Remat::Const(_) | Remat::Addr(_) | Remat::FnAddr(_) | Remat::Slot(_)));
+        // diagnostics (MAKEPAD_RUN_RA_TRACE): gaps looked at, with a holder, with runs fitting
+        let mut diag = [0u32; 4];
+        let nfails = fails.len();
         for _round in 0..8 {
             if fails.is_empty() {
                 break;
@@ -1895,6 +1899,7 @@ impl EvictInfo {
                     let s = prev.map_or(0, |p| p + 2);
                     prev = rf.get(t).copied();
                     let r = next.min(n.saturating_sub(2));
+                    diag[0] += 1;
                     if r < s + 3 {
                         continue;
                     }
@@ -1908,10 +1913,12 @@ impl EvictInfo {
                     // the one value held over the whole gap, live at the reload
                     let hold = bs + 2 * r + 1;
                     let Some(&g) = self.occupants[bi].iter().find(|&&g| loc[g as usize] == Loc::Reg(c) && ranges.of(g).iter().any(|&(a, z)| a <= fa && z >= hold)) else { continue };
+                    diag[1] += 1;
                     let mut fit: Vec<usize> = (0..fails.len()).filter(|&j| fails[j].a0 >= fa && fails[j].z <= fz).collect();
                     if fit.is_empty() {
                         continue;
                     }
+                    diag[2] += 1;
                     fit.sort_by(|&x, &y| fails[y].gain.partial_cmp(&fails[x].gain).unwrap_or(std::cmp::Ordering::Equal).then(x.cmp(&y)));
                     let mut take: Vec<usize> = Vec::new();
                     let mut gain = 0.0;
@@ -1969,6 +1976,7 @@ impl EvictInfo {
             let store = if rm || st.prestored.contains(&g) { u32::MAX } else { bs + 2 * s + 1 };
             st.evicts.push(Evict { v: g, reg: c, slot, remat: if rm { remat0[g as usize] } else { Remat::No }, store, reload: bs + 2 * r + 1, free: (fa, fz) });
             made.push((ix, s, r));
+            diag[3] += 1;
             // runs that fit in the freed part that is still free (no further eviction needed)
             let mut j = 0;
             while j < fails.len() {
@@ -1986,6 +1994,11 @@ impl EvictInfo {
                     j += 1;
                 }
             }
+        }
+        if self.trace {
+            let fl: Vec<String> = fails.iter().take(12).map(|x| format!("v{}{}[{}..{}]+{}", x.v, if x.def { "d" } else { "" }, x.a0 - bs, x.z - bs, x.gain)).collect();
+            let rf: Vec<String> = regs.iter().zip(&refs).map(|(c, r)| format!("r{}:{}", c, r.len())).collect();
+            eprintln!("ra-evblk {} b{} n {} w {:.1} fails {} -> {} gaps {} held {} fit {} made {} | left {} | refs {}", f.name, bi, n, w, nfails, fails.len(), diag[0], diag[1], diag[2], diag[3], fl.join(" "), rf.join(" "));
         }
     }
 }
