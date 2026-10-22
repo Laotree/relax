@@ -1922,10 +1922,16 @@ impl<'a> Parser<'a> {
             // expansions for statement macros nested through blocks (nom's alt_trait_inner! /
             // succ! chains of depth 21 took every byte of memory under `makepad check`)
             let macros = self.macros.take();
+            let undo = self.tok_undo.len();
             let one_expr = self.outer_attrs().is_ok() && self.expr().is_ok() && self.kind() == T::Semi && self.nth(1) == T::Eof;
             self.macros = macros;
             let semi = self.lo();
             self.pos = save;
+            // the `>>` / `>=` this look-ahead split are whole again for the real parse below
+            while self.tok_undo.len() > undo {
+                let (k, t) = self.tok_undo.pop().unwrap();
+                self.toks.edit(k as usize, |x| *x = t);
+            }
             if one_expr {
                 let file = self.bctx.as_ref().map_or("", |c| c.path.as_str()).to_string();
                 crate::macros::uses::trailing_semi(&file, semi, lo, &def.def_file);
