@@ -179,3 +179,28 @@ fn many_live_fma_operands() {
         }
     }
 }
+
+#[test]
+fn block_copies_of_every_size() {
+    // Copy of 32..=512 bytes (ymm31 on AVX-512VL hosts, xmm / gpr pieces otherwise)
+    for n in [32u32, 33, 47, 48, 63, 64, 100, 200, 255, 256, 300, 511, 512] {
+        let mut f = Func::new("copy".into(), 0);
+        let (ps, pd) = (f.vreg(Cls::I), f.vreg(Cls::I));
+        f.params = vec![ps, pd];
+        f.block();
+        let insts = vec![Inst::Copy(pd, ps, n)];
+        f.blocks[0].pos = vec![0; insts.len()];
+        f.blocks[0].insts = insts;
+        f.blocks[0].term = Term::Ret(vec![]);
+        f.verify().unwrap();
+        let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+        let c = relax_backend::x64::compile(&options(), &f, &env).unwrap();
+        let code = Code::new(&c.code).unwrap();
+        let run: Entry = unsafe { std::mem::transmute(code.ptr()) };
+        let src: Vec<u8> = (0..n + 16).map(|i| (i * 7 + 3) as u8).collect();
+        let mut dst = vec![0xeeu8; n as usize + 16];
+        run(src.as_ptr(), dst.as_mut_ptr());
+        assert_eq!(&dst[..n as usize], &src[..n as usize], "copy {}", n);
+        assert!(dst[n as usize..].iter().all(|b| *b == 0xee), "copy {} wrote past its end", n);
+    }
+}
