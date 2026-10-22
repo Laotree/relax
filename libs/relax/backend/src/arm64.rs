@@ -792,6 +792,9 @@ struct Gen<'a> {
     slot_pos: Vec<i64>,
     block_pos: Vec<usize>,
     next_block: Vec<u32>,
+    /// counted code: per block its PGO count or the estimate from the nearest counted block
+    /// (profile::estimates), for the direction of two-way branches
+    block_est: Option<Vec<f64>>,
     fixups: Vec<(usize, u32)>,
     /// float literal pool: (ldr word index, bits)
     fpool: Vec<(usize, u64)>,
@@ -1228,6 +1231,7 @@ impl<'a> Gen<'a> {
         let nb = self.f.blocks.len();
         self.block_pos = vec![0; nb];
         self.next_block = vec![u32::MAX; nb];
+        self.block_est = if crate::stats::opt_env_off("-a64backedge") { None } else { crate::profile::estimates(self.f) };
         let mut prev: Option<usize> = None;
         for bi in 0..nb {
             if reach[bi] {
@@ -3621,9 +3625,9 @@ impl<'a> Gen<'a> {
         // taken b.cond is one instruction, a not-taken one plus the b two). Counted code (PGO
         // block counts) says which; static code takes the back edge, and of two targets laid out
         // before the nearer one (the innermost loop's header; an exit placed before the loop is
-        // further back).
-        let (ct, cf) = (self.f.blocks[tt as usize].count, self.f.blocks[ff as usize].count);
-        let ff_cond = if ct >= 0.0 && cf >= 0.0 && ct != cf && !crate::stats::opt_env_off("-a64backedge") { cf > ct } else { back(ff) && (!back(tt) || ff > tt) };
+        // further back). A target's count stands for the edge's (most blocks have one hot way in).
+        let est = self.block_est.as_ref().map(|e| (e[tt as usize], e[ff as usize])).filter(|(t, f)| t != f);
+        let ff_cond = match est { Some((t, f)) => f > t, None => back(ff) && (!back(tt) || ff > tt) };
         if tt == next || ff != next && ff_cond {
             self.cond_branch(no, ff);
             self.jump_to(tt, bi);
@@ -5318,6 +5322,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         slot_pos: Vec::new(),
         block_pos: Vec::new(),
         next_block: Vec::new(),
+        block_est: None,
         fixups: Vec::new(),
         fconst_isel: isel_flags(options) & A64_FCONST != 0,
         qcopy: isel_flags(options) & A64_QCOPY != 0,
