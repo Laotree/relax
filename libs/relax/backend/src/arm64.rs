@@ -792,9 +792,8 @@ struct Gen<'a> {
     slot_pos: Vec<i64>,
     block_pos: Vec<usize>,
     next_block: Vec<u32>,
-    /// counted code: per block the share of its predecessors' counts that reaches it (PGO counts,
-    /// profile::estimates for blocks without one), for the direction of two-way branches
-    block_est: Option<Vec<f64>>,
+    /// the function carries PGO block counts (the direction of two-way branches follows them)
+    counted: bool,
     fixups: Vec<(usize, u32)>,
     /// float literal pool: (ldr word index, bits)
     fpool: Vec<(usize, u64)>,
@@ -1231,21 +1230,7 @@ impl<'a> Gen<'a> {
         let nb = self.f.blocks.len();
         self.block_pos = vec![0; nb];
         self.next_block = vec![u32::MAX; nb];
-        // per block: its estimated count over its predecessors' (profile::layout's edge split), so
-        // the edge b -> t weighs est[b] * share[t]
-        self.block_est = if crate::stats::opt_env_off("-a64backedge") { None } else {
-            crate::profile::estimates(self.f).map(|est| {
-                let mut pred = vec![0.0f64; nb];
-                for (b, blk) in self.f.blocks.iter().enumerate() {
-                    if reach[b] {
-                        for t in blk.term.succs() {
-                            pred[t as usize] += est[b];
-                        }
-                    }
-                }
-                est.iter().zip(&pred).map(|(e, p)| if *p > 0.0 { e / p } else { 0.0 }).collect()
-            })
-        };
+        self.counted = crate::profile::has_counts(self.f);
         let mut prev: Option<usize> = None;
         for bi in 0..nb {
             if reach[bi] {
@@ -3633,20 +3618,17 @@ impl<'a> Gen<'a> {
     /// plus a taken b.
     fn branch_pair(&mut self, yes: CondBr, no: CondBr, tt: u32, ff: u32, bi: usize) {
         let next = self.next_block[bi];
-        // (MAKEPAD_RUN_OPT=-a64backedge: off, A/B)
-        let back = |b: u32| b as usize <= bi && !crate::stats::opt_env_off("-a64backedge");
         // neither falls through: the conditional branch goes where the code goes more often (a
-        // taken b.cond is one instruction, a not-taken one plus the b two). Counted code (PGO
-        // block counts) says which; static code takes the back edge, and of two targets laid out
-        // before the nearer one (the innermost loop's header; an exit placed before the loop is
-        // further back).
-        let ff_cond = match self.block_est.as_ref() {
-            Some(e) => {
-                let (t, f) = (self.f.blocks[tt as usize].count, self.f.blocks[ff as usize].count);
-                if crate::stats::opt_env_off("-a64edgesplit") { t >= 0.0 && f >= 0.0 && f > t } else { e[ff as usize] > e[tt as usize] }
-            }
-            None => !crate::stats::opt_env_off("-a64backstatic") && back(ff) && (!back(tt) || ff > tt),
-        };
+        // taken b.cond is one instruction, a not-taken one plus the b two). Counted code follows
+        // the counts of the two targets when both have one (the estimates of uncounted blocks,
+        // inlined callees, are worse than the lowering's then-first order: +0.7% instructions on
+        // rust_tokenize); static code takes the back edge, and of two targets laid out before
+        // the nearer one (the innermost loop's header; an exit placed before the loop is further
+        // back). (MAKEPAD_RUN_OPT=-a64backedge: off, A/B)
+        let on = !crate::stats::opt_env_off("-a64backedge");
+        let back = |b: u32| b as usize <= bi;
+        let (ct, cf) = (self.f.blocks[tt as usize].count, self.f.blocks[ff as usize].count);
+        let ff_cond = on && if self.counted { ct >= 0.0 && cf >= 0.0 && cf > ct } else { back(ff) && (!back(tt) || ff > tt) };
         if tt == next || ff != next && ff_cond {
             self.cond_branch(no, ff);
             self.jump_to(tt, bi);
@@ -5341,7 +5323,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         slot_pos: Vec::new(),
         block_pos: Vec::new(),
         next_block: Vec::new(),
-        block_est: None,
+        counted: false,
         fixups: Vec::new(),
         fconst_isel: isel_flags(options) & A64_FCONST != 0,
         qcopy: isel_flags(options) & A64_QCOPY != 0,
