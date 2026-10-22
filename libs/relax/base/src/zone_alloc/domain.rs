@@ -493,6 +493,37 @@ mod tests {
     }
 
     #[test]
+    fn ended_threads_hand_their_chunks_back() {
+        // A program thread that ends inside its domain heap (no leave) gives its chunks back
+        // from its thread-local destructors (DomainExitGuard). Before, each ended thread kept
+        // one 2 MB chunk per size class it had used: Sandbox's thread churn used up the heap's
+        // reservation (exit -6 in a thread start on macOS).
+        symbol(b"relax_alloc");
+        let heap = DomainHeap::new().unwrap();
+        let addr = &*heap as *const DomainHeap as usize;
+        let sizes = [16usize, 48, 100, 300, 1000, 4000, 20_000, 100_000];
+        for _ in 0..64 {
+            std::thread::spawn(move || unsafe {
+                enter(addr as *const DomainHeap);
+                let blocks: Vec<*mut u8> = sizes.iter().map(|&n| program_alloc(n, 8)).collect();
+                for (p, &n) in blocks.into_iter().zip(&sizes) {
+                    std::ptr::write_bytes(p, 1, n);
+                    program_dealloc(p, n, 8);
+                }
+                // one block stays live: its chunk must go back to the shared lists, not stay
+                // attached to a thread that is gone
+                let _live = program_alloc(64, 8);
+            })
+            .join()
+            .unwrap();
+        }
+        // 64 threads x 8 classes kept attached would be ~1 GB committed; handed back, the
+        // live blocks share a few chunks and the emptied ones sit on the bounded warm list
+        let committed = heap.stats().1;
+        assert!(committed <= 64 << 20, "ended threads kept their chunks: {} MB committed", committed >> 20);
+    }
+
+    #[test]
     fn cross_thread_free_realloc_and_native_state() {
         symbol(b"relax_alloc");
         let first = DomainHeap::new().unwrap();

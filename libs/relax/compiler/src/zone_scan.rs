@@ -450,6 +450,14 @@ pub(crate) fn stale_roots(old: u64) {
         scan_words(start, len, old, |a| format!("{name}+{:#x}", a - base), &mut hits);
     }
     print_hits("STALE statics before destroy", &hits, &format!(" (generation {old})"));
+    // what each stale word points at (the generation is still mapped): 32 bytes, so a string, a
+    // table or a box can be told apart and the static named
+    for h in hits.iter().take(64) {
+        let b = unsafe { std::slice::from_raw_parts(h.target as *const u8, 32) };
+        let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        let text: String = b.iter().map(|&x| if (0x20..0x7f).contains(&x) { x as char } else { '.' }).collect();
+        eprintln!("makepad-run zone:   {} holds {hex} {text}", h.place);
+    }
 }
 
 /// (module, load base, start, len) of every writable data range of the executable and, when

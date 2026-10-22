@@ -169,6 +169,9 @@ thread_local! {
     /// This thread has a destructor registered that hands its chunks back when it ends.
     static EXIT_REGISTERED: Cell<bool> = const { Cell::new(false) };
     static EXIT_GUARD: ExitGuard = const { ExitGuard };
+    /// Armed when the thread enters a domain arena: hands the chunks it holds there back when
+    /// the thread ends (`DomainExitGuard`).
+    static DOMAIN_EXIT_GUARD: DomainExitGuard = const { DomainExitGuard };
     /// The domain arena this thread is inside and its chunk cache of it (`DomainTls`).
     static DOMAIN: DomainTls = const {
         DomainTls { arena: Cell::new(std::ptr::null()), id: Cell::new(0), current: Cell::new([NO_CURRENT; CLASSES]) }
@@ -309,6 +312,27 @@ impl Drop for ExitGuard {
     fn drop(&mut self) {
         DEFAULT.detach_thread();
         let _ = EXITED.try_with(|e| e.set(true));
+    }
+}
+
+/// Hands a program thread's chunks of the domain arena it is inside back when the thread ends,
+/// from its thread-local destructor round: `DOMAIN` (the chunk cache) is gone after it. macOS frees
+/// a thread's thread-local variables in dyld's own pthread key destructor, which runs before the
+/// JIT's (jit.rs `tls_exit`, which leaves the domain at the end of the program's destructors): a
+/// detach from there read a fresh `DOMAIN` with no chunks, every chunk an exited thread held
+/// stayed attached for good, and Sandbox's thread churn (thousands of short pool and scope
+/// threads, ~10 attached 2 MB chunks each) used up the program heap's 64 GB reservation: "memory
+/// allocation of 68 bytes failed" in a thread start, an abort (exit -6). The thread is still
+/// registered in its domain here, so the arena is alive. A program destructor that allocates
+/// after this takes fresh chunks, handed back by the JIT's leave at the end of its round.
+struct DomainExitGuard;
+impl Drop for DomainExitGuard {
+    fn drop(&mut self) {
+        if let Ok(a) = DOMAIN.try_with(|t| t.arena.get()) {
+            if let Some(a) = unsafe { a.as_ref() } {
+                a.detach_thread();
+            }
+        }
     }
 }
 
@@ -696,6 +720,7 @@ mod os {
 /// allocated at the address of a dropped one.
 static NEXT_ARENA_ID: AtomicUsize = AtomicUsize::new(1);
 
+
 pub struct Arena {
     dynamic: bool,
     id: usize,
@@ -843,6 +868,9 @@ impl Arena {
     }
     /// The calling thread is now inside this domain arena (`enter_domain`).
     fn enter_thread(&self) {
+        // (first access arms the destructor; past the thread's destructor round it fails: the
+        // JIT's leave hands the chunks back then)
+        let _ = DOMAIN_EXIT_GUARD.try_with(|_| {});
         let t = domain_tls();
         t.arena.set(self);
         t.id.set(self.id);
@@ -1270,6 +1298,102 @@ impl Arena {
             let _ = EXIT_GUARD.try_with(|_| {});
         }
     }
+    /// An allocation of a program (domain) arena failed: one line on stderr naming the step
+    /// (no allocation: the program's own report of the failure follows).
+    #[cold]
+    #[inline(never)]
+    fn alloc_failed(&self, step: u32, l: Layout) {
+        if !self.dynamic {
+            return;
+        }
+        extern "C" {
+            fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+        }
+        let mut b = [0u8; 900];
+        let mut k = 0;
+        let mut put = |s: &[u8]| {
+            for &c in s {
+                if k < b.len() {
+                    b[k] = c;
+                    k += 1;
+                }
+            }
+        };
+        let num = |mut v: usize, out: &mut [u8; 20]| -> usize {
+            let mut i = out.len();
+            loop {
+                i -= 1;
+                out[i] = b'0' + (v % 10) as u8;
+                v /= 10;
+                if v == 0 {
+                    break i;
+                }
+            }
+        };
+        let mut t = [0u8; 20];
+        put(b"makepad-run alloc: program arena ");
+        let i = num(self.id, &mut t);
+        put(&t[i..]);
+        put(b" refused ");
+        let i = num(l.size(), &mut t);
+        put(&t[i..]);
+        put(b" bytes at step ");
+        let i = num(step as usize, &mut t);
+        put(&t[i..]);
+        put(b", committed ");
+        let i = num(self.committed.load(Ordering::Relaxed) >> 20, &mut t);
+        put(&t[i..]);
+        put(b" MB");
+        // the first failure also says what holds the arena (one header walk)
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            let (mut small, mut large, mut large_units, mut large_bytes, mut released, mut warmish) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+            let (mut attached, mut touched, mut live_slots, mut empty, mut listed) = (0usize, 0usize, 0usize, 0usize, 0usize);
+            for h in self.headers.iter() {
+                let st = lock(&h.state);
+                if st.committed == 0 {
+                    continue;
+                }
+                if st.released {
+                    released += 1;
+                }
+                if st.stride == 0 {
+                    large += 1;
+                    large_units += 1 << st.order;
+                    large_bytes += st.committed;
+                    if h.live.load(Ordering::Relaxed) == 0 {
+                        warmish += 1;
+                    }
+                } else {
+                    small += 1;
+                    if st.attached {
+                        attached += 1;
+                        let o = h.owned.get();
+                        unsafe {
+                            touched += (*o).bump.load(Ordering::Relaxed).min(CHUNK);
+                            live_slots += (*o).live.load(Ordering::Relaxed);
+                        }
+                    } else {
+                        touched += st.bump.min(CHUNK);
+                        live_slots += h.live.load(Ordering::Relaxed);
+                        if h.live.load(Ordering::Relaxed) == 0 {
+                            empty += 1;
+                        }
+                    }
+                    if h.in_part.load(Ordering::Relaxed) {
+                        listed += 1;
+                    }
+                }
+            }
+            for (label, v) in [(&b"; small chunks "[..], small), (b"; large blocks ", large), (b" spanning ", large_units), (b" chunks, committed MB ", large_bytes >> 20), (b"; released-but-committed ", released), (b"; large with no live ", warmish), (b"; small attached ", attached), (b", touched MB ", touched >> 20), (b", live slots ", live_slots), (b", empty unattached ", empty), (b", listed ", listed)] {
+                put(label);
+                let i = num(v, &mut t);
+                put(&t[i..]);
+            }
+        }
+        put(b"\n");
+        unsafe { write(2, b.as_ptr(), k) };
+    }
     #[cold]
     unsafe fn alloc_slow(&self, l: Layout, small: bool, class: usize, requested: usize) -> *mut u8 {
         let stride = if small { STRIDE[class] } else { 0 };
@@ -1290,13 +1414,13 @@ impl Arena {
         } else {
             match l.size().checked_add(PAGE - 1) {
                 Some(n) => n & !(PAGE - 1),
-                None => return null_mut(),
+                None => { self.alloc_failed(1, l); return null_mut(); },
             }
         };
         // Extra virtual space allows alignments above 2 MB; only the payload is committed.
         let span = match committed.checked_add(l.align().saturating_sub(CHUNK)) {
             Some(n) if n <= RESERVE => n,
-            _ => return null_mut(),
+            _ => { self.alloc_failed(2, l); return null_mut(); },
         };
         let units = (span + CHUNK - 1) / CHUNK;
         let order = units.next_power_of_two().trailing_zeros() as usize;
@@ -1309,7 +1433,7 @@ impl Arena {
             Some(i) => i,
             None => match lock(&self.pool).take(order) {
                 Some(i) => i,
-                None => return null_mut(),
+                None => { self.alloc_failed(3, l); return null_mut(); },
             },
         };
         let start = self.base.load(Ordering::Relaxed) + run * CHUNK;
@@ -1321,7 +1445,7 @@ impl Arena {
         }
         if warm.is_none() && !os::commit(p, committed) {
             lock(&self.pool).release(run, order);
-            return null_mut();
+            { self.alloc_failed(4, l); return null_mut(); }
         }
         if warm_large.is_some() && committed > kept && !os::commit((address + kept) as *mut u8, committed - kept) {
             // the run cannot grow: it goes back to the pool decommitted (zero), and this alloc fails over
@@ -1333,7 +1457,7 @@ impl Arena {
                 drop(s);
                 lock(&self.pool).release(run, order);
             }
-            return null_mut();
+            { self.alloc_failed(5, l); return null_mut(); }
         }
         // a warm large run keeps what it had committed beyond this block (resize_in_place trims it)
         let committed = committed.max(kept);
