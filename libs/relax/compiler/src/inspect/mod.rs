@@ -36,6 +36,7 @@ pub mod remarks;
 pub mod timeline;
 pub mod vars;
 pub mod vsnative;
+pub mod watch;
 pub(crate) mod symbols;
 pub mod threads;
 
@@ -56,6 +57,7 @@ pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
     probes::scan_kept(a);
     codever::scan_kept(a);
     remarks::scan_kept(a);
+    watch::scan_kept(a);
 }
 
 /// The inspect thread runs (a socket is listening).
@@ -161,6 +163,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("resume", "", "after pause: the program runs again (`resume P<n> panic` releases a parked panic)"),
     ("gpu", "[top [by=bytes|owner|site|churn] [n=15]|idle [frames=1800] [n=15]|snap <name>|diff <a> <b|now>|path <session>:<kind>:<index>:<generation>]", "HAL GPU memory: totals per session, kind and owner against the device (native apps: MAKEPAD_INSPECT=1 or MAKEPAD_REMOTE=1)"),
     ("hal", "pump", "HAL pump loop per session: turns and wake causes, totals and per second since the last call (an idle app shows none)"),
+    ("writes", "<Type::field> | (none: the watches) | W<n> [n=20] | rm <W<n>|all>", "who writes a struct field: the compiled fns that assign `x.field` (`=`, `op=`) are rebuilt to record every write: its site (fn, file:line), the value written and the field's address; `writes W<n>` reads the sites and the latest writes"),
     ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
     ("threads", "", "every thread: name, role, state, CPU time, what it waits on"),
     ("stacks", "[thread=<name|tid|main|owner|all>] [depth=12]", "symbolised stacks (identical stacks folded)"),
@@ -229,6 +232,7 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         // Commands the program registered (`relax_register_inspect`), scoped to its domain.
         c if provider(c).is_some() => cmd_provided(req, out),
         "probe" => probes::cmd(req, out),
+        "writes" => watch::cmd(req, out),
         "eval" => eval::cmd_eval(req, out),
         "static" => eval::cmd_static(req, out),
         "locals" => eval::cmd_locals(req, out),

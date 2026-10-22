@@ -463,6 +463,69 @@ fn find_in(u: &crate::jit::Unit, query: &str, max: usize, inlined_too: bool) -> 
     Vec::new()
 }
 
+/// What a fn query that matched nothing could have meant: `; closest: a, b (not called yet)`
+/// (empty when nothing is close). Fns are ranked by their last path segment (equal, then edit
+/// distance <= 2), then by the segment before it (the type), so `ActorSystem::follower_travel`
+/// finds `ActorKit::follower_travel`; a `file:line` query lists the files of that name. Run on
+/// the owner.
+pub(super) fn closest(u: &crate::jit::Unit, query: &str) -> String {
+    let q = query.trim();
+    if let Some((file, _)) = q.rsplit_once(':').filter(|(f, l)| !f.ends_with(':') && l.parse::<u32>().is_ok()) {
+        let base = file.rsplit('/').next().unwrap_or(file);
+        let mut files: Vec<String> = u.prog.file_paths.iter().filter(|p| p.ends_with(base)).map(|p| p.to_string()).collect();
+        files.sort();
+        files.dedup();
+        if files.iter().any(|p| p.ends_with(file)) {
+            return "; the file is loaded but no fn with code spans that line (a fn not called yet has none)".into();
+        }
+        files.truncate(5);
+        return if files.is_empty() { format!("; no loaded file ends with `{}`", base) } else { format!("; files of that name: {}", files.join(", ")) };
+    }
+    let segs = |s: &str| -> Vec<String> { collapse_qself(s).split("::").map(|x| x.split('<').next().unwrap_or(x).trim().to_string()).filter(|x| !x.is_empty()).collect() };
+    let qs = segs(q);
+    let Some(q_last) = qs.last().cloned() else { return String::new() };
+    let q_ty = if qs.len() >= 2 { qs[qs.len() - 2].clone() } else { String::new() };
+    let mut best: Vec<(usize, usize, String, bool)> = Vec::new();
+    for f in u.fns.iter() {
+        if f.name.is_empty() {
+            continue;
+        }
+        let ns = segs(&f.name);
+        let Some(n_last) = ns.last() else { continue };
+        let d = if *n_last == q_last { 0 } else { edit_distance(n_last, &q_last) };
+        if d > 2 || (d > 0 && q_last.len() < 4) {
+            continue;
+        }
+        let ty = if ns.len() >= 2 { edit_distance(&ns[ns.len() - 2], &q_ty).min(9) } else { 9 };
+        if best.iter().any(|b| b.2 == *f.name) {
+            continue;
+        }
+        best.push((d, ty, f.name.to_string(), targetable(f, true)));
+    }
+    best.sort_by(|a, b| (a.0, a.1, !a.3).cmp(&(b.0, b.1, !b.3)).then(a.2.len().cmp(&b.2.len())));
+    let n = best.len();
+    let shown: Vec<String> = best.iter().take(6).map(|(_, _, name, live)| if *live { name.clone() } else { format!("{} (not called yet: no code)", name) }).collect();
+    if shown.is_empty() {
+        return "; nothing close by name (try a shorter `Type::method`, or `top` for the hot fns)".into();
+    }
+    format!("; closest: {}{}", shown.join(", "), if n > 6 { format!(" (+{} more)", n - 6) } else { String::new() })
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 #[derive(PartialEq, Debug)]
 pub(super) enum Match {
     None,
@@ -923,7 +986,7 @@ fn add_to(kind: Kind, target: Target, time: bool, low: bool) -> Result<(u32, Vec
             Target::Slot(id) => vec![(id, None, u.fns[id as usize].name.to_string())],
         };
         if found.is_empty() {
-            return Err(format!("no compiled fn or line matches `{}` (a fn not called yet has no code to patch)", query));
+            return Err(format!("no compiled fn or line matches `{}` (a fn not called yet has no code to patch){}", query, closest(u, &query)));
         }
         // a slot and its SPEC-V twin run the same fn (unverified callers call the twin): both are
         // instrumented, into one site each (a twin compiled later joins on its first install)

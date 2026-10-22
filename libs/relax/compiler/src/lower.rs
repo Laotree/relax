@@ -59,9 +59,26 @@ pub struct ProbePoint {
     pub params: Vec<(String, TyId)>,
 }
 
+/// makepad inspect's field watch (inspect/watch.rs): every assignment `x.field = v` / `x.field op= v`
+/// to field `field` of struct `adt` in slot `slot`'s body is followed by a call of the runtime's
+/// watch hit with the field's address (`idx`: the watch). Set (thread-local) around a re-lowering of
+/// the slot on the owner thread, as PROBE_POINTS; the lines it instrumented go to WATCH_RESULTS.
+#[derive(Clone)]
+pub struct WatchField {
+    pub slot: u32,
+    pub adt: DefId,
+    pub field: u32,
+    pub idx: u64,
+    /// the runtime's hit fn: `hit(idx, field address, (kind << 32) | size, source position)`
+    pub hit: u64,
+}
+
 crate::gen_local! {
     pub static PROBE_POINTS: std::cell::RefCell<Vec<ProbePoint>>;
     pub static PROBE_RESULTS: std::cell::RefCell<Vec<(u32, Result<(), String>)>>;
+    pub static WATCH_FIELDS: std::cell::RefCell<Vec<WatchField>>;
+    /// (slot, source position) of every write the watches instrumented
+    pub static WATCH_RESULTS: std::cell::RefCell<Vec<(u32, u64)>>;
 }
 
 /// A place matched by a slice pattern (see Lcx::slice_pat).
@@ -274,6 +291,7 @@ pub struct Lcx<'a> {
     /// makepad inspect: probe points of this body (and whether each was placed), and the `let`
     /// locals in scope while lowering (innermost last)
     probe_pts: Vec<(ProbePoint, bool)>,
+    watch_fields: Vec<WatchField>,
     probe_scope: Vec<u32>,
     /// or-pattern alternatives fixed at compile time (a guarded arm tried one alternative
     /// combination at a time, rustc's per-candidate guard evaluation)
@@ -501,6 +519,7 @@ impl<'a> Lcx<'a> {
             or_sel: HashMap::default(),
             probe_pts: PROBE_POINTS.try_with(|p| p.borrow().iter().filter(|x| x.slot == cur_fn).map(|x| (x.clone(), false)).collect()).unwrap_or_default(),
             probe_scope: Vec::new(),
+            watch_fields: WATCH_FIELDS.try_with(|p| p.borrow().iter().filter(|x| x.slot == cur_fn).cloned().collect()).unwrap_or_default(),
             or_force: HashMap::default(),
             defer_moves: None,
             drop_misaligned: false,
@@ -2789,7 +2808,9 @@ impl<'a> Lcx<'a> {
         }
         let mut args = Vec::new();
         for (name, want) in &pt.params {
-            let li = self.probe_scope.iter().rev().chain(params.iter()).copied().find(|&li| self.u.prog.syms.str(self.b.locals[li as usize].name) == name.as_str());
+            // a probe parameter cannot be called `self`: `self_` (or `this`) names the receiver
+            let name = if matches!(name.as_str(), "self_" | "this") { "self" } else { name.as_str() };
+            let li = self.probe_scope.iter().rev().chain(params.iter()).copied().find(|&li| self.u.prog.syms.str(self.b.locals[li as usize].name) == name);
             let Some(li) = li else {
                 let mut names: Vec<String> = self.probe_scope.iter().chain(params.iter()).map(|&li| self.u.prog.syms.str(self.b.locals[li as usize].name).to_string()).collect();
                 names.sort();
@@ -2797,9 +2818,25 @@ impl<'a> Lcx<'a> {
                 return Err(format!("no local or parameter `{}` in scope at line {} (in scope: {})", name, pt.line, names.join(", ")));
             };
             let t = self.u.tcx.tys.erase_regions(self.monomorphize(self.b.locals[li as usize].ty));
+            // a reference local (`self: &mut ActorKit`) is also read through: the probe's `&T` of
+            // its target is the reference's own value (read-only for the probe)
+            if let crate::types::TyKind::Ref(_, inner, _) = self.u.tcx.tys.kind(t) {
+                let inner = *inner;
+                if self.u.tcx.tys.erase_all_regions(inner) == *want && self.u.tcx.tys.erase_all_regions(t) != *want {
+                    let place = self.local_place(li);
+                    let Val::L(v) = self.read_place(&place, t) else { return Err(format!("`{}`: a reference held in memory", name)) };
+                    if v.is_empty() {
+                        return Err(format!("`{}`: a reference without a value", name));
+                    }
+                    // a thin reference is one register, a wide one (slice, dyn) two: as the probe's `&T`
+                    args.extend(v);
+                    continue;
+                }
+            }
             // the same type modulo regions (`want` has none: probes.rs by_name_params)
             if self.u.tcx.tys.erase_all_regions(t) != *want {
-                return Err(format!("`{}` is `{}` at line {}, the probe takes `&{}`", name, crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t), pt.line, crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, *want)));
+                let shown = if name == "self" { "self (name it `self_` in the probe)".to_string() } else { format!("`{}`", name) };
+                return Err(format!("{} is `{}` at line {}, the probe takes `&{}`", shown, crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t), pt.line, crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, *want)));
             }
             let addr = match self.local_place(li) {
                 Place::Mem(a, 0) => a,
@@ -5712,9 +5749,54 @@ impl<'a> Lcx<'a> {
                     }
                     // into the place itself (a register-held local's address is a spill copy)
                     self.write_place(&pl, pt, v);
+                    self.watch_write(a, &pl, pt);
                     return;
                 }
                 self.write_place(&pl, pt, v);
+                self.watch_write(a, &pl, pt);
+    }
+
+    /// makepad inspect's field watch: after a write to the place of assignee `a`, the watch hit
+    /// when `a` is a watched field (`x.field`, through any autoderef of references and boxes).
+    fn watch_write(&mut self, a: ExprId, pl: &Place, pt: TyId) {
+        if self.watch_fields.is_empty() {
+            return;
+        }
+        let ae = strip_paren(self.ast(), a);
+        let ExprKind::Field(x, _) = &self.ast().expr(ae).kind else { return };
+        let x = *x;
+        let Some(&(derefs, fi)) = self.b.field_idx.get(&ae.0) else { return };
+        let mut t = self.body_ty(x);
+        for _ in 0..derefs {
+            t = match self.kind(t) {
+                TyKind::Ref(_, inner, _) | TyKind::Ptr(_, inner) => inner,
+                _ => match self.box_inner(t) {
+                    Some(inner) => inner,
+                    None => return,
+                },
+            };
+        }
+        let TyKind::Adt(def, _, _) = self.kind(t) else { return };
+        let Some(w) = self.watch_fields.iter().find(|w| w.adt == def && w.field == fi).cloned() else { return };
+        // what the hit reads at the address: 1 f32, 2 f64, 3 bool, 4 signed, 5 unsigned, 0 bytes
+        let size = self.layout(pt).size as u64;
+        let (kind, size) = match self.kind(pt) {
+            TyKind::Float(Prim::F32) => (1u64, 4u64),
+            TyKind::Float(_) => (2, 8),
+            TyKind::Bool => (3, 1),
+            TyKind::Int(Prim::I8 | Prim::I16 | Prim::I32 | Prim::I64 | Prim::Isize) => (4, size),
+            TyKind::Int(Prim::U8 | Prim::U16 | Prim::U32 | Prim::U64 | Prim::Usize) | TyKind::Char => (5, size),
+            _ => (0, size.min(64)),
+        };
+        let addr = self.place_addr(pl, pt);
+        let pos = ((self.b.file as u64) << 32) | self.pos as u64;
+        let sym = self.u.syms.intern(crate::syms::SymKind::Rt("watch_hit"), w.hit);
+        let (iv, kv, pv) = (self.f.vreg(Cls::I), self.f.vreg(Cls::I), self.f.vreg(Cls::I));
+        self.emit(Inst::Iconst(iv, w.idx as i64));
+        self.emit(Inst::Iconst(kv, ((kind << 32) | size) as i64));
+        self.emit(Inst::Iconst(pv, pos as i64));
+        self.emit(Inst::Call(Callee::Host(sym), vec![iv, addr, kv, pv], Vec::new()));
+        let _ = WATCH_RESULTS.try_with(|r| r.borrow_mut().push((w.slot, pos)));
     }
 
     /// Assigns the parts of the value at `pl: t` to the assignee expression `a` (tuple, array,
@@ -6341,6 +6423,7 @@ impl<'a> Lcx<'a> {
                 let cur = self.to_leaves(cur, pt);
                 let r = self.arith(*op, pt, cur[0], rv[0], bt);
                 self.write_place(&pl, pt, Val::L(vec![r]));
+                self.watch_write(*a, &pl, pt);
                 self.unit()
             }
             ExprKind::Cast(x, _) => {
