@@ -5085,6 +5085,9 @@ impl<'a> Gen<'a> {
                 self.load_spill(r, disp);
                 r
             }
+            // the dividend / multiplicand goes to rax anyway: a spilled or recomputed one is read
+            // straight into it (was `mov r10, [slot]; mov rax, r10`)
+            _ if matches!(op, IOp::Div | IOp::Rem | IOp::MulHi) => self.use_i(options, a, RAX),
             _ => self.use_i(options, a, R10),
         };
         // a spilled second operand is read by the operation itself: op rd, [rbp - o]
@@ -5145,8 +5148,9 @@ impl<'a> Gen<'a> {
                     self.a.mov_ri(RDX, 0);
                     self.a.grp3(6, rb2);
                 }
-                self.a.mov_rr(rd, if op == IOp::Div { RAX } else { RDX });
-                self.a.extend(rd, it.bits, it.signed);
+                // the quotient / remainder narrowed in one move (`mov r9d, eax`, not `mov r9, rax;
+                // mov r9d, r9d`)
+                self.a.extend_from(rd, if op == IOp::Div { RAX } else { RDX }, it.bits, it.signed);
                 self.fin_i(d, rd);
                 return;
             }
