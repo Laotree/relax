@@ -204,7 +204,14 @@ fn add(query: &str) -> Result<(Arc<Watch>, Vec<String>), String> {
             }
             seen_paths.push(path);
             let file = &u.prog.files[fi];
-            let text = file.bytes(0, file.src_len);
+            // a file loaded from the front image holds no text: its source on disk
+            let disk;
+            let text: &[u8] = if file.src_len > 0 {
+                file.bytes(0, file.src_len)
+            } else {
+                disk = std::fs::read(path).unwrap_or_default();
+                &disk
+            };
             let mut k = 0;
             while k + nb.len() <= text.len() {
                 if &text[k..k + nb.len()] == nb && text.get(k + nb.len()).map_or(true, |c| !(c.is_ascii_alphanumeric() || *c == b'_')) && assigns(&text[k + nb.len()..]) {
