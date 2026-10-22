@@ -1844,7 +1844,10 @@ fn second_chance(
             let mut cost = 0.0;
             if !rm && !prestored.contains_key(&g) {
                 let (db, di) = def_at[gi];
-                if db == u32::MAX || ndefs[gi] != 1 || ranges.of(g).first().map_or(true, |x| x.0 == 0) || di as usize + 2 >= f.blocks[db as usize].insts.len() {
+                // (no call right after the definition: its restore of g may be skipped -- nothing
+                // reads the register before the next call, Alloc::restore_skip -- and the prestore
+                // would store whatever the call left there)
+                if db == u32::MAX || ndefs[gi] != 1 || ranges.of(g).first().map_or(true, |x| x.0 == 0) || di as usize + 2 >= f.blocks[db as usize].insts.len() || matches!(f.blocks[db as usize].insts[di as usize + 1], Inst::Call(..)) {
                     continue;
                 }
                 cost += wts[db as usize];
@@ -1874,6 +1877,11 @@ fn second_chance(
                     }
                 }
                 if to_succs {
+                    // the register holds v up to the block's end: g must not be read or written there
+                    if z != block_end[bi] && refpos[gi].iter().any(|&p| p > z && p < block_end[bi]) {
+                        ok = false;
+                        break;
+                    }
                     for s in b.term.succs() {
                         let s = s as usize;
                         if !reach[s] || enters(v, s) || !live_at(g, block_start[s]) {
