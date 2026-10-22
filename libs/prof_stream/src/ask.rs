@@ -1148,7 +1148,8 @@ fn other_side(p: &Profile, other: usize, ws: &[(u64, u64)]) -> String {
             format!("busy {} ms", ms(busy))
         }
     } else {
-        format!("serving {}", parts.join(", "))
+        let own = if roots.first().is_some_and(|r| p.s(r.0).contains(" for main at ")) { " (the UI's own requests: its lazy compiles and links)" } else { "" };
+        format!("serving {}{}", parts.join(", "), own)
     };
     if !parts.is_empty() && gap > total / 10 {
         let what = if lane.thread.role == role::OWNER { "between requests (taking the next one, wakes)" } else { "outside its marked spans" };
@@ -1172,9 +1173,6 @@ fn other_side(p: &Profile, other: usize, ws: &[(u64, u64)]) -> String {
     let mut lg = Legend::default();
     let hot_s: Vec<String> = hot.iter().take(3).map(|(f, w)| format!("{} {}%", lg.name(p.s(*f)), pct(*w, sw))).collect();
     let mut s = format!("{} was {}", p.lane_name(other), doing);
-    if roots.first().is_some_and(|r| p.s(r.0).contains(" for main at ")) {
-        s.push_str(" (the UI's own requests: its lazy compiles and links)");
-    }
     if !inner_s.is_empty() {
         s.push_str(&format!("; inside: {}", inner_s.join(", ")));
     }

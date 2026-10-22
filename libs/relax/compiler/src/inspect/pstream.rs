@@ -78,7 +78,7 @@ const GROW_NS: u64 = 60_000_000_000;
 pub(super) const RINGS_MAX_BYTES: usize = 48 << 20;
 /// a span shorter than this with nothing recorded inside it is dropped at its end (most of a
 /// frame's widget draws: the rings keep minutes instead of seconds); 0: keep all
-static ELIDE_NS: AtomicU64 = AtomicU64::new(100_000);
+static ELIDE_NS: AtomicU64 = AtomicU64::new(250_000);
 
 pub(super) struct Ring {
     recs: Box<[UnsafeCell<Rec>]>,
