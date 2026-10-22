@@ -94,6 +94,8 @@ pub struct JitEv {
     pub origin: u8,
     pub a: u64,
     pub b: u64,
+    /// string id of the fn's `path:line` (0: unknown)
+    pub src: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -254,7 +256,7 @@ impl Profile {
                 for _ in 0..n {
                     let t = d.d(prev)?;
                     prev = t;
-                    let e = JitEv { t, tid: d.u()? as u32, ev: d.u()? as u8, name: d.u()? as u32, tier: d.u()? as u8, origin: d.u()? as u8, a: d.u()?, b: d.u()? };
+                    let e = JitEv { t, tid: d.u()? as u32, ev: d.u()? as u8, name: d.u()? as u32, tier: d.u()? as u8, origin: d.u()? as u8, a: d.u()?, b: d.u()?, src: d.u()? as u32 };
                     self.see(t);
                     self.jit.push(e);
                 }

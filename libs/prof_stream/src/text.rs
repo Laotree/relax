@@ -63,14 +63,24 @@ pub fn pct(part: u64, whole: u64) -> String {
 pub struct Table {
     pub head: Vec<String>,
     pub rows: Vec<Vec<String>>,
+    /// per row, a query it leads to (Scope makes the row clickable); empty: none
+    pub links: Vec<Option<String>>,
 }
 
 impl Table {
     pub fn new(head: &[&str]) -> Table {
-        Table { head: head.iter().map(|s| s.to_string()).collect(), rows: Vec::new() }
+        Table { head: head.iter().map(|s| s.to_string()).collect(), rows: Vec::new(), links: Vec::new() }
     }
     pub fn row(&mut self, cells: Vec<String>) {
         self.rows.push(cells);
+    }
+    /// A row that leads to `query` when clicked.
+    pub fn row_link(&mut self, cells: Vec<String>, query: Option<String>) {
+        while self.links.len() < self.rows.len() {
+            self.links.push(None);
+        }
+        self.rows.push(cells);
+        self.links.push(query);
     }
     pub fn render(&self) -> String {
         let n = self.head.len();

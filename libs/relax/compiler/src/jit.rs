@@ -3051,7 +3051,8 @@ impl Unit {
         let kind = code_as_now().unwrap_or_else(|| self.default_code_kind(id));
         self.code.write().unwrap_or_else(|e| e.into_inner()).add(at, len, id, unwind, kind);
         if crate::inspect::pstream::on() {
-            crate::inspect::pstream::jit_install(&self.fns[id as usize].name, id, len, kind.tier, kind.origin);
+            let src = crate::inspect::codever::fn_lines(self, id).and_then(|(f, lo, _)| self.prog.file_paths.get(f as usize).map(|p| format!("{}:{}", p, lo))).unwrap_or_default();
+            crate::inspect::pstream::jit_install(&self.fns[id as usize].name, src, id, len, kind.tier, kind.origin);
         }
     }
 

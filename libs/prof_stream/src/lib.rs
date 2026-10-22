@@ -322,6 +322,8 @@ pub struct JitRec {
     pub origin: u8,
     pub a: u64,
     pub b: u64,
+    /// the fn's source: a string id of `path:line` (0: unknown)
+    pub src: u32,
 }
 
 /// The JIT payload of a batch (events in time order).
@@ -331,7 +333,7 @@ pub fn jit_payload(recs: &[JitRec]) -> Vec<u8> {
     let mut prev = recs.first().map_or(0, |r| r.t);
     e.u(prev);
     for r in recs {
-        e.d(r.t, prev).u(r.tid as u64).u(r.ev as u64).u(r.name as u64).u(r.tier as u64).u(r.origin as u64).u(r.a).u(r.b);
+        e.d(r.t, prev).u(r.tid as u64).u(r.ev as u64).u(r.name as u64).u(r.tier as u64).u(r.origin as u64).u(r.a).u(r.b).u(r.src as u64);
         prev = r.t;
     }
     e.0

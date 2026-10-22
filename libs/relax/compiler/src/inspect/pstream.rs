@@ -116,6 +116,7 @@ impl<T: Clone> Log<T> {
 
 #[derive(Clone)]
 struct JitE {
+    src: String,
     t: u64,
     os_id: u64,
     ev: u8,
@@ -132,9 +133,9 @@ static GPU: Mutex<Log<(u64, u64, &'static str)>> = Mutex::new(Log::new());
 
 /// A code body was installed (jit index_code): slot `id` named `name`, `len` bytes, at `tier`
 /// from `origin`.
-pub fn jit_install(name: &str, id: u32, len: u32, tier: u8, origin: u8) {
+pub fn jit_install(name: &str, src: String, id: u32, len: u32, tier: u8, origin: u8) {
     let _k = crate::zone_alloc::kept();
-    let e = JitE { t: crate::clock::wall_ns(), os_id: super::threads::self_os_id(), ev: ps::jit::INSTALL, name: name.to_string(), tier, origin, a: len as u64, b: id as u64 };
+    let e = JitE { src, t: crate::clock::wall_ns(), os_id: super::threads::self_os_id(), ev: ps::jit::INSTALL, name: name.to_string(), tier, origin, a: len as u64, b: id as u64 };
     JIT.lock().unwrap_or_else(|e| e.into_inner()).push(e);
 }
 
@@ -320,7 +321,8 @@ fn serve(ch: &makepad_remote::Channel, args: &str) {
         let mut jit = Vec::new();
         for e in jev {
             let tid = known.iter().find(|k| k.ring.os_id == e.os_id).map_or(0, |k| k.tid);
-            jit.push(ps::JitRec { t: map(e.t), tid, ev: e.ev, name: strings.id(&e.name), tier: e.tier, origin: e.origin, a: e.a, b: e.b });
+            let src = if e.src.is_empty() { 0 } else { strings.id(&e.src) };
+            jit.push(ps::JitRec { t: map(e.t), tid, ev: e.ev, name: strings.id(&e.name), tier: e.tier, origin: e.origin, a: e.a, b: e.b, src });
         }
         jit.sort_by_key(|e| e.t);
         if jlost > 0 {

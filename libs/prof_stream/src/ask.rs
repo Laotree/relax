@@ -126,7 +126,7 @@ impl Q {
     }
 }
 
-pub const HELP: &str = "queries: summary | frames [n=10] [sort=slow|time] | frame F<n> | top [cpu|jit|gpu] [lane=main|all|T<n>] [range=R<a>-<b>] [n=12] | hitches [ms=<n>] | timeline F<n>|R<a>-<b> [width=100] | lanes | why-slow [F<n>|R<a>-<b>] | diff (needs a baseline: B) | gpu <frames|frame F<n>|top by=shader|owner|pass|util>  (ids: F<n> frame, T<n> lane, R<a>-<b> ms range from the start)";
+pub const HELP: &str = "compare two recordings: `diff` with base=<A.mkpf> (B is the one asked). queries: summary | frames [n=10] [sort=slow|time] | frame F<n> | top [cpu|jit|gpu] [lane=main|all|T<n>] [range=R<a>-<b>] [n=12] | hitches [ms=<n>] | timeline F<n>|R<a>-<b> [width=100] | lanes | why-slow [F<n>|R<a>-<b>] | diff (needs a baseline: B) | gpu <frames|frame F<n>|top by=shader|owner|pass|util>  (ids: F<n> frame, T<n> lane, R<a>-<b> ms range from the start)";
 
 /// Answers `query` on `p` (`base`: the baseline recording of a diff).
 pub fn ask(p: &Profile, query: &str, base: Option<&Profile>) -> Ans {
@@ -228,7 +228,7 @@ fn run_parts(p: &Profile, lane: usize, t0: u64, t1: u64) -> Vec<(String, u64)> {
     let covered: u64 = p.lanes[lane].segs_in(0, t0, t1).iter().filter(|s| !s.wait).map(|s| s.t1.min(t1).saturating_sub(s.t0.max(t0))).sum();
     let gap = (t1 - t0).saturating_sub(covered);
     if gap > 0 {
-        v.push((if main { "idle".to_string() } else { "unmarked work".to_string() }, gap));
+        v.push((if main { "idle".to_string() } else { "busy outside its marked spans".to_string() }, gap));
     }
     if !main {
         let ln = p.lane_name(lane);
@@ -571,8 +571,9 @@ fn top_jit(p: &Profile, t0: u64, t1: u64, wname: &str, n: usize) -> Ans {
     if ev.is_empty() {
         return format!("no JIT events in {wname} (a native app, or nothing compiled)\nmore: summary").into();
     }
-    // per fn: compile ns, installs, last tier
+    // per fn: compile ns, installs, last tier, code bytes; its source
     let mut per: HashMap<u32, (u64, usize, u8, u64)> = HashMap::new();
+    let mut src: HashMap<u32, u32> = HashMap::new();
     let mut open: HashMap<(u32, u32), u64> = HashMap::new();
     for e in ev {
         match e.ev {
@@ -589,6 +590,9 @@ fn top_jit(p: &Profile, t0: u64, t1: u64, wname: &str, n: usize) -> Ans {
                 x.1 += 1;
                 x.2 = e.tier;
                 x.3 += e.a;
+                if e.src != 0 {
+                    src.insert(e.name, e.src);
+                }
             }
             _ => {}
         }
@@ -600,14 +604,24 @@ fn top_jit(p: &Profile, t0: u64, t1: u64, wname: &str, n: usize) -> Ans {
     let mut out = Ans::new(format!("{} installs in {} ({}), {} ms in compile jobs off the main lane", installs, wname, tiers_text(&tiers), ms(cns)));
     // per-fn compile time only where the producer sent compile begin / end events
     let timed = v.iter().any(|x| x.1 .0 > 0);
-    let mut t = if timed { Table::new(&["fn", "compile ms", "installs", "tier now", "code KB"]) } else { Table::new(&["fn", "installs", "tier now", "code KB"]) };
+    let mut head = vec!["fn"];
+    if timed {
+        head.push("compile ms");
+    }
+    head.extend(["installs", "tier now", "code KB", "source"]);
+    let mut t = Table::new(&head);
     for (name, (ns, k, tier, bytes)) in v.iter().take(n) {
         let mut row = vec![lg.name(p.s(*name))];
         if timed {
             row.push(ms(*ns));
         }
-        row.extend([k.to_string(), Profile::tier_name(*tier).to_string(), sig(*bytes as f64 / 1024.0)]);
-        t.row(row);
+        // the file's name and line (the full path is the row's link)
+        let full = src.get(name).map(|s| p.s(*s)).unwrap_or("");
+        let parts: Vec<&str> = full.rsplit('/').take(2).collect();
+        let shown = parts.into_iter().rev().collect::<Vec<_>>().join("/");
+        row.extend([k.to_string(), Profile::tier_name(*tier).to_string(), sig(*bytes as f64 / 1024.0), shown]);
+        let link = (!full.is_empty()).then(|| format!("source {} {}", full, p.s(*name)));
+        t.row_link(row, link);
     }
     out.table(t);
     if v.len() > n {
