@@ -1896,9 +1896,7 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
         trace_opt(f, "thread");
         changed |= threaded;
         if if_conv_on(options) {
-            // TEMP bisect: MAKEPAD_RUN_IFSPEC_SKIP=<substr,...> no speculation in matching fns
-            let skip = std::env::var("MAKEPAD_RUN_IFSPEC_SKIP").map(|v| v.split(',').any(|p| !p.is_empty() && f.name.contains(p))).unwrap_or(false);
-            changed |= if_convert(f, !opt_off(options, "-ifspec") && !skip);
+            changed |= if_convert(f, !opt_off(options, "-ifspec"));
         }
         changed |= merge_blocks(f);
         trace_opt(f, "merge");
