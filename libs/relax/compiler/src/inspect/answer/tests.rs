@@ -90,3 +90,16 @@ fn unknown_commands_fall_back_to_tables() {
     );
     assert!(r.starts_with("HAL pump\n| session | turns | wake ms |\n|---|---|---|\n| 1 | 12 | 3.5 |\n| 2 | 4 | 0.25 |"), "{}", r);
 }
+
+#[test]
+fn thread_pools_fold_into_one_row() {
+    let mut l = String::from("{\"measured\":\"threads\",\"at_ms\":1,\"source\":\"os\",\"partial\":[]}\n");
+    l.push_str("{\"id\":\"T1\",\"name\":\"main\",\"role\":\"main\",\"state\":\"running\",\"cpu_ms\":900}\n");
+    for i in 0..4 {
+        l.push_str(&format!("{{\"id\":\"T{}\",\"name\":\"makepad-pool-{}\",\"role\":\"program\",\"state\":\"waiting\",\"cpu_ms\":10}}\n", i + 2, i));
+    }
+    l.push_str("{\"id\":\"T9\",\"name\":\"run-owner\",\"role\":\"owner\",\"state\":\"waiting\",\"cpu_ms\":5}\n");
+    let r = render("threads", &lines(&l));
+    assert!(r.contains("| T2..T5 | makepad-pool* (4 threads) | program | 0 running | 0.04 |"), "{}", r);
+    assert!(r.starts_with("6 threads: 5 of the program, 1 of makepad run."), "{}", r);
+}

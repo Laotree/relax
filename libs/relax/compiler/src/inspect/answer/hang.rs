@@ -117,8 +117,35 @@ pub fn threads(a: &mut Answer) {
     }
     a.head = head;
     let mut t = Table::new(&["id", "name", "role", "state", "CPU s", "waits"]);
+    // a pool (3+ threads named `<base>-<n>` / `<base><n>`, none waiting) is one row
+    let base = |n: &str| n.trim_end_matches(|c: char| c.is_ascii_digit()).trim_end_matches(['-', '_', ' ']).to_string();
+    let mut pools: Vec<(String, Vec<&Value>)> = Vec::new();
     for r in &prog {
-        let name = if s(r, "name").is_empty() { "(unnamed)" } else { s(r, "name") };
+        let n = s(r, "name");
+        if n.is_empty() || !s(r, "waits").is_empty() || !n.ends_with(|c: char| c.is_ascii_digit()) {
+            continue;
+        }
+        let b = base(n);
+        match pools.iter_mut().find(|p| p.0 == b) {
+            Some(p) => p.1.push(r),
+            None => pools.push((b, vec![r])),
+        }
+    }
+    pools.retain(|p| p.1.len() >= 3);
+    let mut done: Vec<String> = Vec::new();
+    for r in &prog {
+        let n = s(r, "name");
+        if let Some(p) = pools.iter().find(|p| p.1.iter().any(|x| s(x, "id") == s(r, "id"))) {
+            if done.contains(&p.0) {
+                continue;
+            }
+            done.push(p.0.clone());
+            let ids: Vec<&str> = p.1.iter().map(|x| s(x, "id")).collect();
+            let running = p.1.iter().filter(|x| s(x, "state") == "running").count();
+            t.row(vec![format!("{}..{}", ids[0], ids[ids.len() - 1]), format!("{}* ({} threads)", p.0, ids.len()), s(r, "role").into(), format!("{} running", running), sig(p.1.iter().map(|x| f(x, "cpu_ms")).sum::<f64>() / 1000.0), String::new()]);
+            continue;
+        }
+        let name = if n.is_empty() { "(unnamed)" } else { n };
         t.row(vec![s(r, "id").into(), name.into(), s(r, "role").into(), s(r, "state").into(), sig(f(r, "cpu_ms") / 1000.0), a.names.text(s(r, "waits"))]);
     }
     // makepad run's threads: one row per role, a busy one (5% or more of the CPU) on its own

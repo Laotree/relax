@@ -26,6 +26,11 @@ fn usage() -> i32 {
 }
 
 pub fn main(args: &[String]) -> i32 {
+    // `as=json` is the client's own option: it never goes into the request (an `eval` expression
+    // or a probe's code would take it as text)
+    let text_out = !json_wanted(args);
+    let args: Vec<String> = args.iter().filter(|w| *w != "as=json" && *w != "--json").cloned().collect();
+    let args = &args[..];
     let Some(target) = args.first() else { return usage() };
     // `file=<x.mkgp> gpu prof <query>`: a saved GPU recording, no app
     if let Some(path) = target.strip_prefix("file=") {
@@ -42,7 +47,7 @@ pub fn main(args: &[String]) -> i32 {
     }
     if let Some((host, app)) = target.split_once(':') {
         let line = request_line(&args[1..]);
-        return remote::main(host, app, &line, !json_wanted(&args[1..]));
+        return remote::main(host, app, &line, text_out);
     }
     if target == "schema" {
         println!("{}", super::schema());
@@ -50,7 +55,7 @@ pub fn main(args: &[String]) -> i32 {
     }
     let line = request_line(&args[1..]);
     let cmd = line.split_whitespace().next().unwrap_or("").to_string();
-    let text = !json_wanted(&args[1..]);
+    let text = text_out;
     if target == "all" {
         return all(&line, &cmd, text);
     }
