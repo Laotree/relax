@@ -824,7 +824,7 @@ fn critical(ths: &[Thread], ui: usize, t0: u64, t1: u64) -> Vec<(usize, u64, u64
                 }
                 match s.woke_by.and_then(|(h, at)| ths.iter().position(|x| x.handle == h).map(|i| (i, at))) {
                     Some((i, at)) if i != th && at > s.t0 => {
-                        path.push((th, at.max(s.t0), end, format!("{} (ended by T{})", s.what, ths[i].os_id)));
+                        path.push((th, at.max(s.t0), end, format!("{} (ended by {})", s.what, super::tid_label(ths[i].os_id))));
                         th = i;
                         t = at.max(t0);
                     }
@@ -856,7 +856,9 @@ fn frames_cmd(req: &Req, out: &mut Out) {
     let mut sorted = durs.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let pct = |p: f64| sorted.get(((sorted.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(0.0);
-    out.line(&format!("{{\"frame_ms\":{{\"n\":{},\"median\":{:.2},\"p95\":{:.2},\"max\":{:.2}}}}}", durs.len(), pct(0.5), pct(0.95), pct(1.0)));
+    // every frame's duration in order (a sparkline's data), 0.1 ms resolution
+    let series: Vec<String> = durs.iter().map(|d| format!("{:.1}", d)).collect();
+    out.line(&format!("{{\"frame_ms\":{{\"n\":{},\"median\":{:.2},\"p95\":{:.2},\"max\":{:.2}}},\"series_ms\":[{}]}}", durs.len(), pct(0.5), pct(0.95), pct(1.0), series.join(",")));
     let n = req.num("n", 30) as usize;
     let mut idx: Vec<usize> = (0..fr.len()).collect();
     idx.sort_by(|a, b| durs[*b].partial_cmp(&durs[*a]).unwrap().then(a.cmp(b)));
@@ -932,7 +934,7 @@ fn frame_cmd(req: &Req, out: &mut Out) {
             _ => steps.push((*th, b - a, what)),
         }
     }
-    let st: Vec<String> = steps.iter().take(16).map(|(th, d, w)| format!("{{\"thread\":\"T{}\",\"ms\":{:.2},\"what\":{}}}", ths[*th].os_id, *d as f64 / 1e6, json_str(&short(w, 120)))).collect();
+    let st: Vec<String> = steps.iter().take(16).map(|(th, d, w)| format!("{{\"thread\":\"{}\",\"ms\":{:.2},\"what\":{}}}", super::tid_label(ths[*th].os_id), *d as f64 / 1e6, json_str(&short(w, 120)))).collect();
     out.line(&format!("{{\"critical_path_busy_ms\":{:.2},\"steps\":[{}]}}", total as f64 / 1e6, st.join(",")));
     // the UI thread's waits in the frame, longest first, with who ended them
     let mut waits: Vec<(u64, String, Option<u64>)> = Vec::new();
@@ -944,7 +946,7 @@ fn frame_cmd(req: &Req, out: &mut Out) {
     let w: Vec<String> = waits
         .iter()
         .take(10)
-        .map(|(d, what, by)| format!("{{\"ms\":{:.2},\"what\":{}{}}}", *d as f64 / 1e6, json_str(&short(what, 100)), by.map(|b| format!(",\"ended_by\":\"T{}\"", b)).unwrap_or_default()))
+        .map(|(d, what, by)| format!("{{\"ms\":{:.2},\"what\":{}{}}}", *d as f64 / 1e6, json_str(&short(what, 100)), by.map(|b| format!(",\"ended_by\":\"{}\"", super::tid_label(b))).unwrap_or_default()))
         .collect();
     out.line(&format!("{{\"ui_waits\":[{}]}}", w.join(",")));
     // the GPU lane: passes overlapping the frame
@@ -963,15 +965,27 @@ fn frame_cmd(req: &Req, out: &mut Out) {
         let ps: Vec<String> = per.iter().take(8).map(|(n, d)| format!("[{},{:.2}]", json_str(n), *d as f64 / 1e6)).collect();
         out.line(&format!("{{\"gpu\":{{\"busy_ms\":{:.2},\"passes_ms\":[{}]}}}}", busy as f64 / 1e6, ps.join(",")));
     }
-    // per thread busy / wait in the frame
+    // per thread busy / wait in the frame, with its lane: one column per 1/60 of the frame,
+    // `█` busy most of it, `▄` busy some, `░` waiting, ` ` not recorded (idle or unmarked)
+    let cols = 60u64;
+    let os_threads = super::threads::list();
+    let tname = |id: u64| os_threads.iter().find(|t| t.os_id == id).map(|t| t.name.clone()).unwrap_or_default();
     let mut per: Vec<String> = Vec::new();
     for th in &ths {
         let (b, wt) = busy_in(th, t0, t1);
         if b > 0 {
-            per.push(format!("{{\"thread\":\"T{}\",\"busy_ms\":{:.2},\"wait_ms\":{:.2}}}", th.os_id, b as f64 / 1e6, wt as f64 / 1e6));
+            let step = ((t1 - t0) / cols).max(1);
+            let lane: String = (0..cols)
+                .map(|c| {
+                    let (a, z) = (t0 + c * step, (t0 + (c + 1) * step).min(t1));
+                    let (cb, cw) = busy_in(th, a, z);
+                    if cb * 2 >= z - a { '█' } else if cb > 0 { '▄' } else if cw * 2 >= z - a { '░' } else { ' ' }
+                })
+                .collect();
+            per.push(format!("{{\"thread\":\"{}\",\"name\":{},\"busy_ms\":{:.2},\"wait_ms\":{:.2},\"lane\":{}}}", super::tid_label(th.os_id), json_str(&tname(th.os_id)), b as f64 / 1e6, wt as f64 / 1e6, json_str(&lane)));
         }
     }
-    out.line(&format!("{{\"threads\":[{}]}}", per.join(",")));
+    out.line(&format!("{{\"threads\":[{}],\"frame_ms\":{:.2}}}", per.join(","), (t1 - t0) as f64 / 1e6));
 }
 
 /// Chrome trace-event JSON (Perfetto, chrome://tracing, speedscope): complete events per segment,
@@ -987,7 +1001,7 @@ fn save_cmd(out: &mut Out) {
     let mut flow = 0u64;
     for th in &ths {
         let nm = names.iter().find(|t| t.os_id == th.os_id).map(|t| t.name.clone()).unwrap_or_default();
-        ev.push(format!("{{\"ph\":\"M\",\"pid\":{},\"tid\":{},\"name\":\"thread_name\",\"args\":{{\"name\":{}}}}}", pid, th.os_id, json_str(&format!("{} T{}", nm, th.os_id))));
+        ev.push(format!("{{\"ph\":\"M\",\"pid\":{},\"tid\":{},\"name\":\"thread_name\",\"args\":{{\"name\":{}}}}}", pid, th.os_id, json_str(&format!("{} {}", nm, super::tid_label(th.os_id)))));
         for s in &th.segs {
             let ts = s.t0.saturating_sub(t0) as f64 / 1000.0;
             let dur = (s.t1 - s.t0) as f64 / 1000.0;
