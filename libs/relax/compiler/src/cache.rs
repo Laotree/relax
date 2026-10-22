@@ -1810,6 +1810,11 @@ impl Cache {
         }
     }
 
+    /// makepad inspect (`versions`): the cache key of slot `id`'s code entry.
+    pub(crate) fn inspect_key(&mut self, u: &Unit, id: u32) -> Option<u128> {
+        self.slot_key(u, id)
+    }
+
     /// The cache key of slot `id`'s O1 code, and the function's identity bytes.
     fn slot_key(&mut self, u: &Unit, id: u32) -> Option<u128> {
         if let Some(k) = self.slot_keys.get(&id) {

@@ -489,17 +489,36 @@ pub fn cmd_locals(req: &Req, out: &mut Out) {
             Some(k) => k,
             None => program_frame(u, &frames).map_or(0, |x| x.0),
         };
-        for (k, &pc) in frames.iter().enumerate() {
-            let (name, at) = match u.pc_to_src(pc) {
-                Some((s, at)) => (u.fns[s as usize].name.to_string(), at),
-                None => ("-".to_string(), String::new()),
+        // each frame names its code version (and, in an inlined copy, the inlined fn)
+        let mut res = super::codever::Resolver::new();
+        let described: Vec<Option<super::codever::PcCode>> = frames.iter().map(|&pc| super::codever::describe_pc(u, &mut res, pc)).collect();
+        for (k, d) in described.iter().enumerate() {
+            let (name, at, code) = match d {
+                Some(c) => {
+                    let (n, at, _, code) = super::codever::frame_fields(u, c);
+                    (n, at, code)
+                }
+                None => ("-".to_string(), String::new(), "null".to_string()),
             };
-            rows.push(format!("{{\"frame\":{},\"fn\":{},\"at\":{}{}}}", k, json_str(&short(&name, 160)), json_str(&at), if k == chosen { ",\"chosen\":true" } else { "" }));
+            rows.push(format!("{{\"frame\":{},\"fn\":{},\"at\":{},\"code\":{}{}}}", k, json_str(&short(&name, 160)), json_str(&at), code, if k == chosen { ",\"chosen\":true" } else { "" }));
         }
         let pc = *frames.get(chosen).ok_or("no such frame")?;
         let slot = u.find_fn(pc).ok_or("frame is not JIT code")?;
-        let FnKey::Inst(d, args) = &u.fns[slot as usize].key else { return Err("the frame is not a fn instance (a closure or glue): its locals are not listed".into()) };
         let at = u.pc_to_src(pc).map(|x| x.1).unwrap_or_default();
+        // an inlined copy: the locals are the inlined fn's (its generic arguments are not known
+        // from the copy: a generic one is listed as its definition's)
+        let inl = described.get(chosen).and_then(|d| d.as_ref()).and_then(|c| c.inlined.as_ref());
+        let inl_note = inl.map(|i| format!(",\"inlined_into\":{},\"note\":{}", json_str(&short(&u.fns[slot as usize].name, 160)), json_str(&format!("this pc is in a copy of {} inlined into slot {}'s code: the line and locals are the inlined fn's", i.name, slot))));
+        let key = match inl {
+            Some(i) => match (i.slot.map(|s| u.fns[s as usize].key.clone()), i.def) {
+                (Some(k @ FnKey::Inst(..)), _) => k,
+                // an instance of the def (a generic fn's copy names no instance: the first one found)
+                (_, Some(d)) => u.fns.iter().find_map(|f| matches!(&f.key, FnKey::Inst(x, _) if *x == d).then(|| f.key.clone())).ok_or("the inlined fn has no instance slot: its locals are not known")?,
+                _ => return Err("the frame is an inlined copy whose fn is not identified: no locals".into()),
+            },
+            None => u.fns[slot as usize].key.clone(),
+        };
+        let FnKey::Inst(d, args) = &key else { return Err("the frame is not a fn instance (a closure or glue): its locals are not listed".into()) };
         // "file:line:col"
         let mut parts = at.rsplitn(3, ':');
         let (_col, line, file_name) = (parts.next(), parts.next().and_then(|l| l.parse::<u32>().ok()).unwrap_or(0), parts.next().unwrap_or("").to_string());
@@ -515,11 +534,12 @@ pub fn cmd_locals(req: &Req, out: &mut Out) {
             ls.push(format!("{{\"name\":{},\"type\":{}}}", json_str(n), json_str(&crate::typeck::ty_to_string(false, &u.prog, &u.tcx, t))));
         }
         rows.push(format!(
-            "{{\"panic\":\"P{}\",\"frame\":{},\"fn\":{},\"line\":{},\"locals\":[{}],\"values\":{},\"more\":[{}]}}",
+            "{{\"panic\":\"P{}\",\"frame\":{},\"fn\":{},\"line\":{}{},\"locals\":[{}],\"values\":{},\"more\":[{}]}}",
             id,
             chosen,
-            json_str(&u.fns[slot as usize].name),
+            json_str(&crate::lower::display_path(&u.prog, *d)),
             line,
+            inl_note.unwrap_or_default(),
             ls.join(","),
             json_str("the JIT keeps no variable locations: values come from a by-name probe at this line (it runs at the next pass, e.g. after `resume restart`)"),
             json_str(&format!("probe add {}:{} 'fn probe(<name>: &<type>, ..) {{ std::relax::probe::emit((<name>, ..)) }}'", file_name, line))
