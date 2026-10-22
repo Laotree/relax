@@ -51,6 +51,13 @@ static REPORT_PATH: relax_session::sync::Mutex<String> = relax_session::sync::Mu
 /// The package's root crate and manifest dir (MAKEPAD_RUN_MAIN_COMPILE_LOG's header).
 static ROOT_DIR: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
 
+/// The running program's root crate name and package dir (makepad inspect `asm`'s native build).
+pub(crate) fn root_package() -> Option<(String, String)> {
+    let g = ROOT_DIR.lock().unwrap();
+    let (n, d) = g.split_once(' ')?;
+    Some((n.to_string(), d.to_string()))
+}
+
 fn phase(name: &str, t: Instant) {
     phase_ms(name, t.elapsed().as_secs_f64() * 1e3);
 }
@@ -113,6 +120,13 @@ pub(crate) fn report(kind: &str, text: &str) {
         let text: String = text.chars().map(|c| if c == '\n' || c == '\t' || c == '\r' { ' ' } else { c }).collect();
         let _ = f.write_all(format!("{}\t{}\t{:.0}\n", kind, text, crate::clock::ms_since_start()).as_bytes());
     }
+}
+
+/// A start that ends before `main` (an unreachable store, a resolve error): its reason and exit
+/// code for the launcher following it.
+pub fn report_failed(error: &str, code: i32) {
+    report("error", error);
+    report("exit", &code.to_string());
 }
 
 pub(crate) fn reporting() -> bool {
@@ -766,6 +780,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         Err(e) => {
             if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&e, "resolve")); }
             eprintln!("makepad-run: {e}");
+            // a launcher following the start (--report-to) learns why it ended
+            report_failed(&e, 1);
             return 1;
         }
     };
@@ -2158,6 +2174,10 @@ fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
     retired.is_some()
 }
 
+/// The background loop's reclamation pass (jit::settle_drop) runs at most this often after the
+/// first present.
+const SETTLE_DROP_EVERY_NS: u64 = 2_000_000_000;
+
 fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::options::Options) {
     let present_forward = std::env::var_os("MAKEPAD_RUN_REPORT_TO");
     let mut present = match present_report() {
@@ -2167,7 +2187,8 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
     let (runtime, options, present_forward) = crate::zone_alloc::kept_with(|| (runtime.clone(), options.clone(), present_forward.clone()));
     let _k = crate::zone_alloc::kept();
     { let _k = crate::zone_alloc::kept();
-    std::thread::spawn(move || {
+    // named: inspect lists it as makepad run's, not the program's
+    let _ = std::thread::Builder::new().name("run-monitor".into()).spawn(move || {
         let runtime = &runtime;
         let options = &options;
         // A measurement harness requests an allocator snapshot at its own landmark
@@ -2183,6 +2204,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let mut settle_note: &'static str = "";
         let mut drops = jit::SettleDrops::default();
         let mut reclaimed = None;
+        let mut last_drop_ns = 0u64;
         let mut reclaim_requested = false;
         let mut present_bytes = Vec::new();
         let (mut quiet, mut seen, mut trimmed) = (0u32, 0u64, 0u64);
@@ -2304,8 +2326,12 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 // inputs stay through the startup frame: evicting them earlier just makes
                 // subsequent startup callers rebuild them. After present, retry shared
                 // reclamation as compilation progresses, without a global quiet gate.
+                // at most every SETTLE_DROP_EVERY_NS (a request goes at once): each pass scans every
+                // slot on the owner, and an O3 tail bumped the generation with every install
+                let now_ns = jit::wall_ns();
                 let settled_d = if (FIRST_PRESENT_WALL.load(Ordering::Acquire) != 0 || reclaim_requested)
-                    && (reclaimed != Some(n) || reclaim_requested) {
+                    && (reclaimed != Some(n) && now_ns.saturating_sub(last_drop_ns) >= SETTLE_DROP_EVERY_NS || reclaim_requested) {
+                    last_drop_ns = now_ns;
                     crate::owner::call_within(crate::owner::Class::Background, 0, || unsafe { jit::settle_drop(RUN_UNIT) })
                 } else { None };
                 if let Some(mut d) = settled_d {
