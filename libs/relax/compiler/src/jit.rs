@@ -12495,6 +12495,10 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
     ensure_altstack();
     lower_worker_priority(runtime);
     loop {
+        // PGO: every worker closes the counting windows that are over before it picks its next
+        // build (the first worker's poll alone waited out its own builds: hot slots came out of
+        // the window one at a time behind a long O3 build)
+        pgo_poll();
         let (id, why, queued_at, _) = {
             let mut q = TIER_QUEUE.lock().unwrap();
             loop {
