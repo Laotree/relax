@@ -10996,6 +10996,19 @@ fn sampler_thread() {
     const IDLE_WAKES: u32 = 50;
     const IDLE_MS: u64 = 20;
     let mut idle_wakes = 0u32;
+    // Settled: no lazy compile, no O3 queue push and no O3 install for SETTLED_AFTER. The
+    // samples of a settled program find nothing to promote, yet at SAMPLE_MS they suspended
+    // every JIT thread 500 times a second (an animating Stage: the sampler thread alone used
+    // ~25 ms of CPU per second, after the O3 queue had drained). Settled, it looks every
+    // SETTLED_MS (each sample weighs the elapsed time, capped at 16 SAMPLE_MS: full credit at
+    // 32 ms), so a loop that turns hot is still promoted after one or two looks, and the
+    // first compile, push or install puts it back on SAMPLE_MS. Diagnostic cadences
+    // (MAKEPAD_RUN_SAMPLE_MS) are kept as given.
+    const SETTLED_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+    let settle_on = std::env::var_os("MAKEPAD_RUN_SAMPLE_MS").is_none();
+    let activity = || (COMPILE_LAST.load(Ordering::Relaxed), TIER_PUSHES.load(Ordering::Relaxed), TIER1_INSTALLS.load(Ordering::Relaxed));
+    let mut last_activity = activity();
+    let mut active_at = std::time::Instant::now();
     loop {
         let period = periods[period_index];
         period_index = (period_index + 1) % periods.len();
@@ -11003,6 +11016,20 @@ fn sampler_thread() {
         // often enough to avoid overflowing the ring even for long intervals.
         let sleep_ms = if cfg!(target_os = "linux") && periods.len() > 1 { period.min(32) } else { period };
         let sleep_ms = if idle_wakes >= IDLE_WAKES { sleep_ms.max(IDLE_MS) } else { sleep_ms };
+        let now_activity = activity();
+        if now_activity != last_activity {
+            last_activity = now_activity;
+            active_at = std::time::Instant::now();
+        }
+        let settled = settle_on && active_at.elapsed() >= SETTLED_AFTER;
+        if settled != SAMPLER_SETTLED.load(Ordering::Relaxed) {
+            SAMPLER_SETTLED.store(settled, Ordering::Relaxed);
+            let ms = if settled { SETTLED_MS } else { SAMPLE_MS };
+            for (_, _, h) in SAMPLED.lock().unwrap().iter() {
+                os::sample::set_period(h, ms);
+            }
+        }
+        let sleep_ms = if settled { sleep_ms.max(SETTLED_MS) } else { sleep_ms };
         wait.sleep(sleep_ms);
         if TIER_STOP.load(Ordering::SeqCst) { break; }
         o3_progress_write(&mut last_progress);
@@ -11706,7 +11733,21 @@ pub(crate) fn guard_relink(id: u32) {
     tier_push(id, Q_RETIER, 0);
 }
 
+/// O3 queue pushes so far (any reason): the sampler's settled test (sampler_thread)
+static TIER_PUSHES: AtomicU64 = AtomicU64::new(0);
+/// The settled sampler's period (sampler_thread)
+const SETTLED_MS: u64 = 32;
+/// The sampler is settled: sources sample every SETTLED_MS (os::sample::set_period)
+static SAMPLER_SETTLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The sampling period a newly opened source starts with at least (ms; Linux: the kernel's period)
+#[cfg(target_os = "linux")]
+pub(crate) fn sampler_period_floor() -> u64 {
+    if SAMPLER_SETTLED.load(Ordering::Relaxed) { SETTLED_MS } else { SAMPLE_MS }
+}
+
 fn tier_push(id: u32, why: u8, rate: u64) {
+    TIER_PUSHES.fetch_add(1, Ordering::Relaxed);
     let mut q = TIER_QUEUE.lock().unwrap();
     q.push((id, why, wall_ns(), rate));
     if tier1_trace() {
