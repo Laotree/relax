@@ -144,8 +144,8 @@ fn inlined_fn_versions_probes_and_pins() {
         let (name, at, module, json) = codever::frame_fields(&u, &d);
         assert!(name.ends_with("leaf"), "inlined frame names the inlined fn: {}", name);
         assert!(at.contains("input.rs:"), "{}", at);
-        assert!(module.contains("O3 fresh") && module.contains("inlined into") && module.contains("caller"), "{}", module);
-        assert!(json.contains("\"tier\":\"O3\"") && json.contains("\"inlined_into\"") && json.contains(&format!("\"inlined_slot\":{}", leaf)), "{}", json);
+        assert!(module.contains("O3 fresh") && module.contains("inlined at") && module.contains("input.rs:11:") && module.contains("caller"), "{}", module);
+        assert!(json.contains("\"tier\":\"O3\"") && json.contains("\"inlined_into\"") && json.contains(&format!("\"inlined_slot\":{}", leaf)) && json.contains("\"inline_stack\":[{\"fn\":\"inspect_tiers::leaf\""), "{}", json);
         // and without the owner: the code tables alone name the version
         let (_, _, m2, j2) = codever::frame_fields_no_owner(&u, pc).unwrap();
         assert!(m2.contains("O3 fresh") && j2.contains(&format!("{:#x}", code)), "{} {}", m2, j2);
