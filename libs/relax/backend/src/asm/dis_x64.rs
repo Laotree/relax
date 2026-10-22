@@ -137,6 +137,8 @@ enum Rk {
     V,
     X,
     H,
+    /// an opmask register (compare results)
+    K,
 }
 
 /// How much memory an operand reads or writes, relative to the vector length.
@@ -214,6 +216,10 @@ impl Ent {
     }
     fn mem(mut self) -> Ent {
         self.memonly = true;
+        self
+    }
+    fn k(mut self) -> Ent {
+        self.dk = Rk::K;
         self
     }
     fn mmx(mut self) -> Ent {
@@ -495,6 +501,10 @@ struct Dec<'a> {
     aaa: u8,
     zero: bool,
     bcast: bool,
+    /// EVEX.L'L as sent (the rounding mode of a register-register broadcast bit)
+    ll: u8,
+    /// a memory operand's `{1toN}` broadcast count (0: none)
+    bcn: u16,
     // VEX / EVEX
     vex: bool,
     evex: bool,
@@ -536,6 +546,8 @@ impl<'a> Dec<'a> {
             aaa: 0,
             zero: false,
             bcast: false,
+            ll: 0,
+            bcn: 0,
             vex: false,
             evex: false,
             vl: 0,
@@ -698,8 +710,8 @@ impl<'a> Dec<'a> {
 
     /// Vector register `n`: kind 0 xmm, 1 ymm, 2 zmm, 3 mmx.
     fn w_v(&self, o: &mut String, n: u8, k: u8) {
-        o.push_str(["xmm", "ymm", "zmm", "mm"][k as usize]);
-        push_dec(o, if k == 3 { n as u32 & 7 } else { n as u32 });
+        o.push_str(["xmm", "ymm", "zmm", "mm", "k"][k as usize]);
+        push_dec(o, if k >= 3 { n as u32 & 7 } else { n as u32 });
     }
 
     fn w_reg(&self, o: &mut String, bits: u16) {
@@ -745,7 +757,9 @@ impl<'a> Dec<'a> {
             push_dec(o, m.scale as u32);
             first = false;
         }
-        let d = m.disp as i64 * if self.mode == 1 { dsc } else { 1 };
+        // EVEX compresses an 8 bit displacement by the size of the access
+        let _ = dsc;
+        let d = m.disp as i64 * if self.mode == 1 && self.evex { (bits.max(8) / 8) as i64 } else { 1 };
         if first {
             // absolute address
             w_simm(o, d);
@@ -755,6 +769,11 @@ impl<'a> Dec<'a> {
             push_hex(o, d.unsigned_abs());
         }
         o.push(']');
+        if self.bcn != 0 {
+            o.push_str("{1to");
+            push_dec(o, self.bcn as u32);
+            o.push('}');
+        }
     }
 
     /// Side of a memory access as a class.
@@ -1701,6 +1720,7 @@ impl<'a> Dec<'a> {
                     0
                 }
             }
+            Rk::K => 4,
         }
     }
 
@@ -1763,11 +1783,39 @@ impl<'a> Dec<'a> {
             return Ok(i);
         }
         let imm = if map == 3 || (map == 1 && matches!(op, 0x70 | 0xC2 | 0xC4 | 0xC5 | 0xC6)) { 1 } else { 0 };
-        let en = match tab(map, pp, op, self.w) {
+        let found = if self.evex { tab_evex(map, pp, op, self.w).or_else(|| tab(map, pp, op, self.w)) } else { tab(map, pp, op, self.w) };
+        let en = match found {
             Some(e) if !e.n.is_empty() && !(e.vo && !self.vex && !self.evex) && !(e.mmx && (self.vex || self.evex)) => e,
             _ => return self.unk(imm),
         };
         self.gen_vec(en)
+    }
+
+    /// ` {k1}{z}` after the destination operand of an EVEX instruction.
+    fn w_mask(&self, o: &mut String) {
+        if self.evex && self.aaa != 0 {
+            o.push_str(" {k");
+            push_dec(o, self.aaa as u32);
+            o.push('}');
+            if self.zero {
+                o.push_str("{z}");
+            }
+        }
+    }
+
+    /// The EVEX broadcast bit: `{1toN}` on a memory operand, embedded rounding / exception
+    /// suppression (`, {rn-sae}`) on a register operand, which also makes the length 512. Returns
+    /// the text to append after the last operand.
+    fn evex_b(&mut self, elem_bits: u16) -> &'static str {
+        if !(self.evex && self.bcast) {
+            return "";
+        }
+        if self.is_reg() {
+            self.vl = 2;
+            return [", {rn-sae}", ", {rd-sae}", ", {ru-sae}", ", {rz-sae}"][self.ll as usize & 3];
+        }
+        self.bcn = (128u16 << self.vl) / elem_bits;
+        ""
     }
 
     fn gen_vec(&mut self, en: Ent) -> R<Insn> {
@@ -1777,27 +1825,34 @@ impl<'a> Dec<'a> {
             return self.unk(imm as usize);
         }
         let mmx = en.mmx && !self.vex && !self.evex;
+        // broadcast: only entries whose memory operand is a full vector of 32 / 64 bit elements
+        let elem = if self.w { 64 } else { 32 };
+        let tail = if en.ms == Ms::V && matches!(en.f, Fm::Rvm | Fm::RvmI | Fm::Rm | Fm::RmI) { self.evex_b(elem) } else if self.evex && self.bcast { return self.unk(imm as usize) } else { "" };
         let dk = self.rkind(en.dk, mmx);
         let sk = self.rkind(en.sk, mmx);
-        let msbits = self.ms_bits(en.ms, mmx);
+        let vk = if dk == 4 { self.vl } else { dk };
+        let msbits = if self.bcn != 0 { elem } else { self.ms_bits(en.ms, mmx) };
         let mut o = String::new();
         match en.f {
             Fm::Rvm | Fm::RvmI => {
                 self.w_xreg(&mut o, dk);
+                self.w_mask(&mut o);
                 if self.vex || self.evex {
                     o.push_str(", ");
-                    self.w_vvvv(&mut o, dk);
+                    self.w_vvvv(&mut o, vk);
                 }
                 o.push_str(", ");
                 self.w_xrm(&mut o, sk, msbits);
             }
             Fm::Rm | Fm::RmI => {
                 self.w_xreg(&mut o, dk);
+                self.w_mask(&mut o);
                 o.push_str(", ");
                 self.w_xrm(&mut o, sk, msbits);
             }
             Fm::Mr | Fm::MrI => {
                 self.w_xrm(&mut o, dk, msbits);
+                self.w_mask(&mut o);
                 o.push_str(", ");
                 self.w_xreg(&mut o, sk);
             }
@@ -1807,11 +1862,12 @@ impl<'a> Dec<'a> {
             o.push_str(", ");
             w_uimm(&mut o, v as u64);
         }
+        o.push_str(tail);
         let mut cls = en.cls;
         if en.mv {
             cls = self.mv_cls(matches!(en.f, Fm::Mr | Fm::MrI));
         }
-        if matches!(en.n.as_str(), "pxor" | "xorps" | "xorpd") && en.f == Fm::Rvm && self.is_reg() && self.rm_n() == self.reg_n() && (!(self.vex || self.evex) || self.vvvv | self.vv2 << 4 == self.reg_n()) {
+        if matches!(en.n.as_str(), "pxor" | "xorps" | "xorpd" | "pxord" | "pxorq") && en.f == Fm::Rvm && self.is_reg() && self.rm_n() == self.reg_n() && self.aaa == 0 && (!(self.vex || self.evex) || self.vvvv | self.vv2 << 4 == self.reg_n()) {
             cls = Class::MovImm;
         }
         let n = self.vname(&en.n);
@@ -1977,6 +2033,21 @@ impl<'a> Dec<'a> {
             (1, 0x71 | 0x72 | 0x73) if pp < 2 => {
                 self.modrm()?;
                 let name = match (op, self.reg) {
+                    (0x72, 0) if self.evex => {
+                        if self.w {
+                            "prorq"
+                        } else {
+                            "prord"
+                        }
+                    }
+                    (0x72, 1) if self.evex => {
+                        if self.w {
+                            "prolq"
+                        } else {
+                            "prold"
+                        }
+                    }
+                    (0x72, 4) if self.evex && self.w => "psraq",
                     (0x71, 2) => "psrlw",
                     (0x71, 4) => "psraw",
                     (0x71, 6) => "psllw",
@@ -1996,6 +2067,7 @@ impl<'a> Dec<'a> {
                 let mut o = String::new();
                 if vx {
                     self.w_vvvv(&mut o, k);
+                    self.w_mask(&mut o);
                     o.push_str(", ");
                 }
                 self.w_v(&mut o, self.rm_n(), k);
@@ -2014,9 +2086,13 @@ impl<'a> Dec<'a> {
             }
             (1, 0xC2) => {
                 self.modrm()?;
+                if self.evex && self.bcast {
+                    return self.unk(1).map(Some);
+                }
                 let k = if pp >= 2 { 0 } else { self.vl };
                 let mut o = String::new();
-                self.w_xreg(&mut o, k);
+                self.w_xreg(&mut o, if self.evex { 4 } else { k });
+                self.w_mask(&mut o);
                 if vx {
                     o.push_str(", ");
                     self.w_vvvv(&mut o, k);
@@ -2206,9 +2282,163 @@ impl<'a> Dec<'a> {
                 let n = self.vname(["blendvps", "blendvpd", "pblendvb"][(op - 0x4A) as usize]);
                 self.fin(&n, o, Class::Vector)?
             }
+            (2, 0x7A | 0x7B | 0x7C) if pp == 1 && self.evex => {
+                self.modrm()?;
+                let (name, bits) = match op {
+                    0x7A => ("pbroadcastb", 32),
+                    0x7B => ("pbroadcastw", 32),
+                    _ => {
+                        if self.w {
+                            ("pbroadcastq", 64)
+                        } else {
+                            ("pbroadcastd", 32)
+                        }
+                    }
+                };
+                if self.is_mem() {
+                    return Err(Bad::Inval);
+                }
+                let mut o = String::new();
+                self.w_xreg(&mut o, self.vl);
+                self.w_mask(&mut o);
+                o.push_str(", ");
+                self.w_g(&mut o, self.rm_n(), bits);
+                let n = self.vname(name);
+                self.fin(&n, o, Class::MovReg)?
+            }
+            (1, 0x41 | 0x42 | 0x44 | 0x45 | 0x46 | 0x47 | 0x4A | 0x4B | 0x90 | 0x91 | 0x92 | 0x93 | 0x98 | 0x99) if self.vex => return self.kop(pp, op).map(Some),
+            (3, 0x30..=0x33) if self.vex && pp == 1 => {
+                self.modrm()?;
+                if self.is_mem() {
+                    return self.unk(1).map(Some);
+                }
+                let name = match (op, self.w) {
+                    (0x30, false) => "kshiftrb",
+                    (0x30, true) => "kshiftrw",
+                    (0x31, false) => "kshiftrd",
+                    (0x31, true) => "kshiftrq",
+                    (0x32, false) => "kshiftlb",
+                    (0x32, true) => "kshiftlw",
+                    (0x33, false) => "kshiftld",
+                    _ => "kshiftlq",
+                };
+                let mut o = String::new();
+                self.w_v(&mut o, self.reg_n(), 4);
+                o.push_str(", ");
+                self.w_v(&mut o, self.rm_n(), 4);
+                let v = self.u8()?;
+                o.push_str(", ");
+                w_uimm(&mut o, v as u64);
+                self.fin(name, o, Class::Alu)?
+            }
             _ => return Ok(None),
         };
         Ok(Some(r))
+    }
+
+    /// AVX-512 opmask instructions (VEX encoded): kmov, kand, kortest, ...
+    fn kop(&mut self, pp: u8, op: u8) -> R<Insn> {
+        self.modrm()?;
+        // element width letter: w (none, W0), b (66, W0), q (none, W1), d (66, W1)
+        let l = match (pp, self.w) {
+            (0, false) => 'w',
+            (1, false) => 'b',
+            (0, true) => 'q',
+            (1, true) => 'd',
+            _ => ' ',
+        };
+        let mut o = String::new();
+        let kk = |s: &Self, o: &mut String, n: u8| s.w_v(o, n, 4);
+        match op {
+            0x90 | 0x91 => {
+                if l == ' ' {
+                    return Err(Bad::Unk);
+                }
+                let bits = match l {
+                    'w' => 16,
+                    'b' => 8,
+                    'q' => 64,
+                    _ => 32,
+                };
+                let st = op == 0x91;
+                if st && self.is_reg() {
+                    return Err(Bad::Unk);
+                }
+                if st {
+                    self.w_mem(&mut o, bits, 1);
+                    o.push_str(", ");
+                    kk(self, &mut o, self.reg_n());
+                } else {
+                    kk(self, &mut o, self.reg_n());
+                    o.push_str(", ");
+                    if self.is_mem() {
+                        self.w_mem(&mut o, bits, 1);
+                    } else {
+                        kk(self, &mut o, self.rm_n());
+                    }
+                }
+                let c = self.mv_cls(st);
+                self.fin(&format!("kmov{}", l), o, c)
+            }
+            0x92 | 0x93 => {
+                // kmov k, r / kmov r, k: the letter comes from the prefix F2 (d, q) or none / 66 (w, b)
+                let (l, bits) = match (pp, self.w) {
+                    (0, false) => ('w', 32),
+                    (1, false) => ('b', 32),
+                    (3, false) => ('d', 32),
+                    (3, true) => ('q', 64),
+                    _ => return Err(Bad::Unk),
+                };
+                if self.is_mem() {
+                    return Err(Bad::Unk);
+                }
+                if op == 0x92 {
+                    kk(self, &mut o, self.reg_n());
+                    o.push_str(", ");
+                    self.w_g(&mut o, self.rm_n(), bits);
+                } else {
+                    self.w_g(&mut o, self.reg_n(), bits);
+                    o.push_str(", ");
+                    kk(self, &mut o, self.rm_n());
+                }
+                self.fin(&format!("kmov{}", l), o, Class::MovReg)
+            }
+            _ => {
+                if l == ' ' || self.is_mem() {
+                    return Err(Bad::Unk);
+                }
+                let (stem, three, cls) = match op {
+                    0x41 => ("kand", true, Class::Alu),
+                    0x42 => ("kandn", true, Class::Alu),
+                    0x44 => ("knot", false, Class::Alu),
+                    0x45 => ("kor", true, Class::Alu),
+                    0x46 => ("kxnor", true, Class::Alu),
+                    0x47 => ("kxor", true, Class::Alu),
+                    0x4A => ("kadd", true, Class::Alu),
+                    0x4B => ("kunpck", true, Class::Alu),
+                    0x98 => ("kortest", false, Class::Cmp),
+                    _ => ("ktest", false, Class::Cmp),
+                };
+                let name = if op == 0x4B {
+                    match (pp, self.w) {
+                        (1, false) => "kunpckbw".to_string(),
+                        (0, false) => "kunpckwd".to_string(),
+                        (0, true) => "kunpckdq".to_string(),
+                        _ => return Err(Bad::Unk),
+                    }
+                } else {
+                    format!("{}{}", stem, l)
+                };
+                kk(self, &mut o, self.reg_n());
+                if three {
+                    o.push_str(", ");
+                    kk(self, &mut o, self.vvvv);
+                }
+                o.push_str(", ");
+                kk(self, &mut o, self.rm_n());
+                self.fin(&name, o, cls)
+            }
+        }
     }
 
     /// BMI1 / BMI2 (VEX-encoded general purpose instructions).
@@ -2287,12 +2517,134 @@ impl<'a> Dec<'a> {
     }
 
     fn evexp(&mut self) -> R<Insn> {
-        // AVX-512: length-only until the EVEX tables land
-        let _ = self.u8()?;
-        let _ = self.u8()?;
-        let _ = self.u8()?;
+        let (p0, p1, p2) = (self.u8()?, self.u8()?, self.u8()?);
+        if p0 & 0x08 != 0 || p1 & 4 == 0 {
+            return Err(Bad::Inval);
+        }
+        let map = p0 & 7;
+        if !(1..=3).contains(&map) {
+            return Err(Bad::Inval);
+        }
+        self.evex = true;
+        self.rr = (!p0 >> 7) & 1;
+        self.rx = (!p0 >> 6) & 1;
+        self.rb = (!p0 >> 5) & 1;
+        self.rr2 = (!p0 >> 4) & 1;
+        self.w = p1 & 0x80 != 0;
+        self.vvvv = (!p1 >> 3) & 15;
+        let pp = p1 & 3;
+        self.pp = pp;
+        self.zero = p2 & 0x80 != 0;
+        self.ll = (p2 >> 5) & 3;
+        self.bcast = p2 & 0x10 != 0;
+        self.vv2 = (!p2 >> 3) & 1;
+        self.aaa = p2 & 7;
+        if self.ll == 3 && !self.bcast {
+            return Err(Bad::Inval);
+        }
+        self.vl = self.ll.min(2);
         let op = self.u8()?;
-        let _ = op;
-        self.unk(0)
+        self.vec_op(map, pp, op)
     }
+}
+
+/// Where the EVEX encoding gives an opcode another meaning than the VEX / legacy table does
+/// (element-size variants chosen by EVEX.W, compares that write an opmask) and the AVX-512 only
+/// instructions.
+fn tab_evex(map: u8, pp: u8, op: u8, w: bool) -> Option<Ent> {
+    use Fm::*;
+    let e = Ent::new;
+    let dq = |d: &str, q: &str| if w { q.to_string() } else { d.to_string() };
+    Some(match (map, pp, op) {
+        (1, 1, 0x6F | 0x7F) => e(&dq("movdqa32", "movdqa64"), if op == 0x6F { Rm } else { Mr }).mv(),
+        (1, 2, 0x6F | 0x7F) => e(&dq("movdqu32", "movdqu64"), if op == 0x6F { Rm } else { Mr }).mv(),
+        (1, 3, 0x6F | 0x7F) => e(&dq("movdqu8", "movdqu16"), if op == 0x6F { Rm } else { Mr }).mv(),
+        (1, 1, 0xDB) => e(&dq("pandd", "pandq"), Rvm),
+        (1, 1, 0xDF) => e(&dq("pandnd", "pandnq"), Rvm),
+        (1, 1, 0xEB) => e(&dq("pord", "porq"), Rvm),
+        (1, 1, 0xEF) => e(&dq("pxord", "pxorq"), Rvm),
+        (1, 1, 0x74 | 0x75 | 0x76) => e(["pcmpeqb", "pcmpeqw", "pcmpeqd"][(op - 0x74) as usize], Rvm).k(),
+        (1, 1, 0x64 | 0x65 | 0x66) => e(["pcmpgtb", "pcmpgtw", "pcmpgtd"][(op - 0x64) as usize], Rvm).k(),
+        (2, 1, 0x29) => e("pcmpeqq", Rvm).k(),
+        (2, 1, 0x37) => e("pcmpgtq", Rvm).k(),
+        (1, 1, 0xE2) if w => e("psraq", Rvm).src(Rk::X).ms(Ms::B(128)),
+        (2, 1, 0x40) if w => e("pmullq", Rvm),
+        (2, 1, 0x39) => e(&dq("pminsd", "pminsq"), Rvm),
+        (2, 1, 0x3B) => e(&dq("pminud", "pminuq"), Rvm),
+        (2, 1, 0x3D) => e(&dq("pmaxsd", "pmaxsq"), Rvm),
+        (2, 1, 0x3F) => e(&dq("pmaxud", "pmaxuq"), Rvm),
+        (2, 1, 0x1F) if w => e("pabsq", Rm),
+        (2, 1, 0x36) => e(&dq("permd", "permq"), Rvm),
+        (2, 1, 0x16) => e(&dq("permps", "permpd"), Rvm),
+        (2, 1, 0x75) => e(&dq("permi2b", "permi2w"), Rvm),
+        (2, 1, 0x76) => e(&dq("permi2d", "permi2q"), Rvm),
+        (2, 1, 0x77) => e(&dq("permi2ps", "permi2pd"), Rvm),
+        (2, 1, 0x7D) => e(&dq("permt2b", "permt2w"), Rvm),
+        (2, 1, 0x7E) => e(&dq("permt2d", "permt2q"), Rvm),
+        (2, 1, 0x7F) => e(&dq("permt2ps", "permt2pd"), Rvm),
+        (2, 1, 0x8D) => e(&dq("permb", "permw"), Rvm),
+        (2, 1, 0x64) => e(&dq("pblendmd", "pblendmq"), Rvm),
+        (2, 1, 0x65) => e(&dq("blendmps", "blendmpd"), Rvm),
+        (2, 1, 0x66) => e(&dq("pblendmb", "pblendmw"), Rvm),
+        (2, 1, 0x59) if !w => e("broadcasti32x2", Rm).src(Rk::X).ms(Ms::B(64)).mv(),
+        (2, 1, 0x19) if !w => e("broadcastf32x2", Rm).src(Rk::X).ms(Ms::B(64)).mv(),
+        (2, 1, 0x1A) => e(&dq("broadcastf32x4", "broadcastf64x2"), Rm).src(Rk::X).ms(Ms::B(128)).mv().mem(),
+        (2, 1, 0x1B) => e(&dq("broadcastf32x8", "broadcastf64x4"), Rm).src(Rk::H).ms(Ms::B(256)).mv().mem(),
+        (2, 1, 0x5A) => e(&dq("broadcasti32x4", "broadcasti64x2"), Rm).src(Rk::X).ms(Ms::B(128)).mv().mem(),
+        (2, 1, 0x5B) => e(&dq("broadcasti32x8", "broadcasti64x4"), Rm).src(Rk::H).ms(Ms::B(256)).mv().mem(),
+        (2, 1, 0x4C) => e(&dq("rcp14ps", "rcp14pd"), Rm),
+        (2, 1, 0x4E) => e(&dq("rsqrt14ps", "rsqrt14pd"), Rm),
+        (2, 1, 0x2C) => e(&dq("scalefps", "scalefpd"), Rvm),
+        (2, 1, 0x54) => e(&dq("popcntb", "popcntw"), Rm),
+        (2, 1, 0x55) => e(&dq("popcntd", "popcntq"), Rm),
+        (2, 1, 0x44) => e(&dq("plzcntd", "plzcntq"), Rm),
+        (2, 1, 0xC4) => e(&dq("pconflictd", "pconflictq"), Rm),
+        (2, 1, 0x50) => e("pdpbusd", Rvm),
+        (2, 1, 0x51) => e("pdpbusds", Rvm),
+        (2, 1, 0x52) => e("pdpwssd", Rvm),
+        (2, 1, 0x53) => e("pdpwssds", Rvm),
+        (2, 1, 0xB4) if w => e("pmadd52luq", Rvm),
+        (2, 1, 0xB5) if w => e("pmadd52huq", Rvm),
+        (2, 1, 0x27) => e(&dq("ptestmd", "ptestmq"), Rvm).k(),
+        (2, 2, 0x27) => e(&dq("ptestnmd", "ptestnmq"), Rvm).k(),
+        (2, 1, 0x26) => e(&dq("ptestmb", "ptestmw"), Rvm).k(),
+        (2, 2, 0x26) => e(&dq("ptestnmb", "ptestnmw"), Rvm).k(),
+        (2, 2, 0x10..=0x15 | 0x20..=0x25 | 0x30..=0x35) => {
+            let base = ["wb", "db", "qb", "dw", "qw", "qd"][(op & 15) as usize];
+            let pre = match op >> 4 {
+                1 => "pmovus",
+                2 => "pmovs",
+                _ => "pmov",
+            };
+            let (dk, ms) = match base {
+                "wb" | "dw" | "qd" => (Rk::H, Ms::H),
+                "db" | "qw" => (Rk::X, Ms::Q),
+                _ => (Rk::X, Ms::E),
+            };
+            e(&format!("{}{}", pre, base), Mr).dst(dk).ms(ms)
+        }
+        (3, 1, 0x25) => e(&dq("pternlogd", "pternlogq"), RvmI),
+        (3, 1, 0x03) => e(&dq("alignd", "alignq"), RvmI),
+        (3, 1, 0x1E) => e(&dq("pcmpud", "pcmpuq"), RvmI).k(),
+        (3, 1, 0x1F) => e(&dq("pcmpd", "pcmpq"), RvmI).k(),
+        (3, 1, 0x3E) => e(&dq("pcmpub", "pcmpuw"), RvmI).k(),
+        (3, 1, 0x3F) => e(&dq("pcmpb", "pcmpw"), RvmI).k(),
+        (3, 1, 0x43) => e(&dq("shufi32x4", "shufi64x2"), RvmI),
+        (3, 1, 0x23) => e(&dq("shuff32x4", "shuff64x2"), RvmI),
+        (3, 1, 0x18) => e(&dq("insertf32x4", "insertf64x2"), RvmI).src(Rk::X).ms(Ms::B(128)),
+        (3, 1, 0x1A) => e(&dq("insertf32x8", "insertf64x4"), RvmI).src(Rk::H).ms(Ms::B(256)),
+        (3, 1, 0x38) => e(&dq("inserti32x4", "inserti64x2"), RvmI).src(Rk::X).ms(Ms::B(128)),
+        (3, 1, 0x3A) => e(&dq("inserti32x8", "inserti64x4"), RvmI).src(Rk::H).ms(Ms::B(256)),
+        (3, 1, 0x19) => e(&dq("extractf32x4", "extractf64x2"), MrI).dst(Rk::X).ms(Ms::B(128)),
+        (3, 1, 0x1B) => e(&dq("extractf32x8", "extractf64x4"), MrI).dst(Rk::H).ms(Ms::B(256)),
+        (3, 1, 0x39) => e(&dq("extracti32x4", "extracti64x2"), MrI).dst(Rk::X).ms(Ms::B(128)),
+        (3, 1, 0x3B) => e(&dq("extracti32x8", "extracti64x4"), MrI).dst(Rk::H).ms(Ms::B(256)),
+        (3, 1, 0x08) => e("rndscaleps", RmI),
+        (3, 1, 0x09) => e("rndscalepd", RmI),
+        (3, 1, 0x0A) => e("rndscaless", RvmI).sc(false),
+        (3, 1, 0x0B) => e("rndscalesd", RvmI).sc(true),
+        // 64 bit integer / quad conversions are not spelled
+        (1, 0, 0x5B) | (1, 2 | 3, 0xE6) if w => Ent { n: String::new(), ..e("", Rm) },
+        _ => return None,
+    })
 }
