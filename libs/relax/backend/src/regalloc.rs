@@ -4699,10 +4699,14 @@ pub fn sink_increments(options: &relax_session::Options, f: &Func) -> Option<Fun
                 };
                 let on: Vec<u32> = succ.iter().copied().filter(|&s| s as usize != bi && preds[s as usize].len() == 1 && preds[s as usize][0] == c).collect();
                 // an Invoke continues at its normal successor only (its call is the block's last instruction)
+                // (of two such successors, the one that still needs v: the other is a side exit)
                 let next = match &blk.term {
                     Term::Invoke(t, _) => on.contains(t).then_some(*t),
                     _ if on.len() == 1 => Some(on[0]),
-                    _ => None,
+                    _ => {
+                        let live: Vec<u32> = on.iter().copied().filter(|&s| live_in(cur, s, v)).collect();
+                        (live.len() == 1).then(|| live[0])
+                    }
                 };
                 let Some(next) = next else { break end };
                 if succ.iter().any(|&s| s != next && live_in(cur, s, v)) {
