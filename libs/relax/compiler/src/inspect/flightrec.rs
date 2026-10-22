@@ -33,7 +33,7 @@ pub fn on() -> bool {
 
 /// UI waits on the JIT longer than this are sampled (both sides)
 const STALL_NS: u64 = 150_000_000;
-/// frames running longer than this are sampled
+/// a UI phase (one event's dispatch, a draw) running longer than this is sampled
 const FRAME_STALL_NS: u64 = 250_000_000;
 /// auto dumps at most this often, and how far back they reach
 const DUMP_GAP_NS: u64 = 30_000_000_000;
@@ -322,16 +322,18 @@ pub fn frame(t0: u64, t1: u64, idle: u64, compile_ns: u64, compiles: u32, wait_n
         return;
     }
     frames().push(Fr { t0, t1, idle, compile_ns, wait_ns, owner_ns, compiles, waits });
-    FRAME_OPEN.store(0, Relaxed);
 }
 
-/// wall ns the UI thread's current frame began (0: between frames)
-static FRAME_OPEN: AtomicU64 = AtomicU64::new(0);
+/// wall ns the UI thread entered its current root phase (0: between phases: idle in the event
+/// loop, or between a frame's phases)
+static UI_BUSY_SINCE: AtomicU64 = AtomicU64::new(0);
 
-/// A UI frame began (timeline's frame watch).
+/// The UI thread entered a root phase (`t`) or left it (0) (timeline's frame watch).
 #[inline]
-pub fn frame_begin(t0: u64) {
-    FRAME_OPEN.store(t0, Relaxed);
+pub fn ui_root(t: u64) {
+    if crate::jit::current_thread_id() == crate::jit::MAIN_TID.load(Relaxed) {
+        UI_BUSY_SINCE.store(t, Relaxed);
+    }
 }
 
 /// A frame of `ms` ms ended (a hitch over the timeline's threshold): an event, and a recording
@@ -489,7 +491,7 @@ fn watch() {
         }
         // a UI wait on the JIT or a frame that runs long: sample both sides until it ends
         let stalled = || {
-            let f = FRAME_OPEN.load(Relaxed);
+            let f = UI_BUSY_SINCE.load(Relaxed);
             crate::postframe::ui_stall_ns() >= STALL_NS || (f != 0 && crate::clock::wall_ns().saturating_sub(f) >= FRAME_STALL_NS)
         };
         if stalled() {

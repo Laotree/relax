@@ -265,12 +265,14 @@ fn frame_watch(begin: bool, name: &'static str) {
                 if l.wait_depth > 0 {
                     l.wait_t0 = now;
                 }
-                super::flightrec::frame_begin(now);
                 if HITCH_NS.load(Relaxed) > 0 && super::instrument::any_counters() {
                     l.probes0 = super::instrument::counters();
                 }
             } else if l.depth == 0 && l.last_root_end > l.start && now.saturating_sub(l.last_root_end) > GAP_NS {
                 l.idle += now - l.last_root_end;
+            }
+            if l.depth == 0 {
+                super::flightrec::ui_root(now);
             }
             l.depth += 1;
             frame_rec(l, 1, name, "");
@@ -282,6 +284,7 @@ fn frame_watch(begin: bool, name: &'static str) {
         }
         if l.depth == 0 {
             l.last_root_end = now;
+            super::flightrec::ui_root(0);
         }
         if name != "Draw" || l.start == 0 {
             return None;
