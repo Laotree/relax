@@ -12397,8 +12397,8 @@ unsafe fn counted_build(up: *mut Unit, id: u32) -> bool {
     };
     let (needs, key, front) = owner::call(owner::Class::Background, || (needs_rir(up), (&*up).fns[id as usize].key.clone(), (&*up).front.clone()));
     if needs && !owner::is_owner() {
-        while !tier1_quiet() {
-            job_sleep(std::time::Duration::from_millis(50));
+        while !tier1_workers_ready() {
+            job_sleep(TIER1_POLL);
         }
         if let FnKey::Inst(d, args) = key {
             let _preemptible = crate::preempt::Preemptible::on();
