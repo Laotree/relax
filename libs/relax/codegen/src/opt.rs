@@ -6339,13 +6339,17 @@ pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> b
         if captured {
             continue;
         }
-        // the fields: exact (offset, type) accesses through p itself
-        let mut fields: Vec<(i32, Mem)> = Vec::new();
+        // the fields: exact (offset, type) accesses through p or a constant offset of it
+        let po = param_offsets(f, p, &ndef);
+        let at = |base: VReg, off: i32| -> Option<i64> { po.get(base.0 as usize).copied().flatten().map(|k| k + off as i64) };
+        let mut fields: Vec<(i64, Mem)> = Vec::new();
         for b in &f.blocks {
             for i in &b.insts {
                 if let Inst::Load(m, _, base, off) | Inst::Store(m, base, off, _) = *i {
-                    if base == p && !fields.contains(&(off, m)) && fields.len() < 64 {
-                        fields.push((off, m));
+                    if let Some(o) = at(base, off) {
+                        if !fields.contains(&(o, m)) && fields.len() < 64 {
+                            fields.push((o, m));
+                        }
                     }
                 }
             }
@@ -6354,8 +6358,8 @@ pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> b
             continue;
         }
         let nf = fields.len();
-        let overlap = |a: (i32, Mem), b: (i32, Mem)| a.0 < b.0 + mem_size(b.1) && b.0 < a.0 + mem_size(a.1);
-        let field_of = |m: Mem, off: i32| fields.iter().position(|x| *x == (off, m));
+        let overlap = |a: (i64, Mem), b: (i64, Mem)| a.0 < b.0 + mem_size(b.1) as i64 && b.0 < a.0 + mem_size(a.1) as i64;
+        let field_of = |m: Mem, base: VReg, off: i32| at(base, off).and_then(|o| fields.iter().position(|x| *x == (o, m)));
         // the effect of one instruction on the known fields (bit k: field k known)
         #[derive(Clone, Copy)]
         enum Eff {
@@ -6367,15 +6371,15 @@ pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> b
         let all: u64 = if nf == 64 { u64::MAX } else { (1u64 << nf) - 1 };
         let eff = |i: &Inst| -> Eff {
             match *i {
-                Inst::Load(m, _, base, off) if base == p => match field_of(m, off) {
+                Inst::Load(m, _, base, off) if at(base, off).is_some() => match field_of(m, base, off) {
                     Some(k) => Eff::Gen(k, 0),
                     None => Eff::None,
                 },
-                Inst::Store(m, base, off, _) if base == p => {
-                    let k = field_of(m, off).unwrap();
+                Inst::Store(m, base, off, _) if at(base, off).is_some() => {
+                    let Some(k) = field_of(m, base, off) else { return Eff::KillAll };
                     let mut kill = 0u64;
                     for (j, x) in fields.iter().enumerate() {
-                        if j != k && overlap(*x, (off, m)) {
+                        if j != k && overlap(*x, fields[k]) {
                             kill |= 1 << j;
                         }
                     }
@@ -6437,8 +6441,8 @@ pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> b
             let mut st = inn[bi];
             for (k, i) in f.blocks[bi].insts.iter().enumerate() {
                 if let Inst::Load(m, _, base, off) = *i {
-                    if base == p {
-                        if let Some(j) = field_of(m, off) {
+                    if at(base, off).is_some() {
+                        if let Some(j) = field_of(m, base, off) {
                             if st & (1 << j) != 0 {
                                 fwd.push((bi, k, j));
                                 used[j] = true;
@@ -6474,8 +6478,8 @@ pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> b
             let mut pos = Vec::with_capacity(old.len() + 4);
             for (k, (i, ps)) in old.into_iter().zip(old_pos).enumerate() {
                 match i {
-                    Inst::Load(m, d, base, off) if base == p && field_of(m, off).map_or(false, |j| vars[j].is_some()) => {
-                        let v = vars[field_of(m, off).unwrap()].unwrap();
+                    Inst::Load(m, d, base, off) if field_of(m, base, off).map_or(false, |j| vars[j].is_some()) => {
+                        let v = vars[field_of(m, base, off).unwrap()].unwrap();
                         if fwd.iter().any(|x| x.0 == bi && x.1 == k) {
                             ins.push(Inst::Mov(d, v));
                             pos.push(ps);
@@ -6486,8 +6490,8 @@ pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> b
                             pos.push(ps);
                         }
                     }
-                    Inst::Store(m, base, off, x) if base == p && field_of(m, off).map_or(false, |j| vars[j].is_some()) => {
-                        let v = vars[field_of(m, off).unwrap()].unwrap();
+                    Inst::Store(m, base, off, x) if field_of(m, base, off).map_or(false, |j| vars[j].is_some()) => {
+                        let v = vars[field_of(m, base, off).unwrap()].unwrap();
                         ins.push(i);
                         pos.push(ps);
                         // the value a load of this type returns
@@ -6509,6 +6513,37 @@ pub fn forward_param_fields(options: &relax_session::Options, f: &mut Func) -> b
         changed = true;
     }
     changed
+}
+
+/// For each vreg, `Some(k)` when it holds `p + k`: p itself, or a single-definition copy or constant
+/// add of such a vreg (`&mut s.br` handed on as a base), followed through any order of definitions.
+fn param_offsets(f: &Func, p: VReg, ndef: &[u32]) -> Vec<Option<i64>> {
+    let nv = f.vregs.len();
+    let mut off: Vec<Option<i64>> = vec![None; nv];
+    off[p.0 as usize] = Some(0);
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for b in &f.blocks {
+            for i in &b.insts {
+                let (d, a, k) = match *i {
+                    Inst::Mov(d, a) => (d, a, 0),
+                    Inst::IBinI(IOp::Add, it, d, a, k) if it.bits == 64 => (d, a, k),
+                    Inst::IBinI(IOp::Sub, it, d, a, k) if it.bits == 64 && k != i64::MIN => (d, a, -k),
+                    _ => continue,
+                };
+                if ndef[d.0 as usize] == 1 && off[d.0 as usize].is_none() {
+                    if let Some(o) = off[a.0 as usize] {
+                        if let Some(x) = o.checked_add(k).filter(|x| (i32::MIN as i64..=i32::MAX as i64).contains(x)) {
+                            off[d.0 as usize] = Some(x);
+                            grew = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    off
 }
 
 /// Dead stores to a `noalias` parameter's fields (LLVM DSE): a store to `[p + off]` that every
@@ -6585,12 +6620,16 @@ pub fn dead_param_field_stores(options: &relax_session::Options, f: &mut Func) -
         if captured {
             continue;
         }
-        let mut fields: Vec<(i32, Mem)> = Vec::new();
+        let po = param_offsets(f, p, &ndef);
+        let at = |base: VReg, off: i32| -> Option<i64> { po.get(base.0 as usize).copied().flatten().map(|k| k + off as i64) };
+        let mut fields: Vec<(i64, Mem)> = Vec::new();
         for b in &f.blocks {
             for i in &b.insts {
                 if let Inst::Store(m, base, off, _) = *i {
-                    if base == p && !fields.contains(&(off, m)) && fields.len() < 64 {
-                        fields.push((off, m));
+                    if let Some(o) = at(base, off) {
+                        if !fields.contains(&(o, m)) && fields.len() < 64 {
+                            fields.push((o, m));
+                        }
                     }
                 }
             }
@@ -6600,9 +6639,9 @@ pub fn dead_param_field_stores(options: &relax_session::Options, f: &mut Func) -
         }
         let nf = fields.len();
         let all: u64 = if nf == 64 { u64::MAX } else { (1u64 << nf) - 1 };
-        let overlap = |a: (i32, i32), b: (i32, Mem)| a.0 < b.0 + mem_size(b.1) && b.0 < a.0 + a.1;
-        // the fields an access reading bytes [off, off + n) through p makes live
-        let reads = |off: i32, n: i32| -> u64 {
+        let overlap = |a: (i64, i64), b: (i64, Mem)| a.0 < b.0 + mem_size(b.1) as i64 && b.0 < a.0 + a.1;
+        // the fields an access reading bytes [off, off + n) of p's pointee makes live
+        let reads = |off: i64, n: i64| -> u64 {
             let mut m = 0u64;
             for (j, x) in fields.iter().enumerate() {
                 if overlap((off, n), *x) {
@@ -6618,11 +6657,11 @@ pub fn dead_param_field_stores(options: &relax_session::Options, f: &mut Func) -
         // backward: (kill = a store of exactly this field, gen = fields read)
         let step = |live: u64, i: &Inst| -> u64 {
             match *i {
-                Inst::Store(m, base, off, _) if base == p => {
-                    let k = fields.iter().position(|x| *x == (off, m)).unwrap();
-                    live & !(1u64 << k)
-                }
-                Inst::Load(m, _, base, off) if base == p => live | reads(off, mem_size(m)),
+                Inst::Store(m, base, off, _) if at(base, off).is_some() => match fields.iter().position(|x| *x == (at(base, off).unwrap(), m)) {
+                    Some(k) => live & !(1u64 << k),
+                    None => all,
+                },
+                Inst::Load(m, _, base, off) if at(base, off).is_some() => live | reads(at(base, off).unwrap(), mem_size(m) as i64),
                 Inst::Call(ref c, ref args, _) => {
                     if args.iter().any(|a| based[a.0 as usize]) || unwinds(c) || matches!(c, Callee::Asm(_)) {
                         all
@@ -6679,8 +6718,7 @@ pub fn dead_param_field_stores(options: &relax_session::Options, f: &mut Func) -
             let mut dead: Vec<usize> = Vec::new();
             for (k, i) in b.insts.iter().enumerate().rev() {
                 if let Inst::Store(m, base, off, _) = *i {
-                    if base == p {
-                        let j = fields.iter().position(|x| *x == (off, m)).unwrap();
+                    if let Some(j) = at(base, off).and_then(|o| fields.iter().position(|x| *x == (o, m))) {
                         if live & (1u64 << j) == 0 {
                             dead.push(k);
                         }

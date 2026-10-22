@@ -136,3 +136,22 @@ fn an_overwritten_field_store_is_dead() {
     let mut f = build(false, true);
     assert!(!dead_param_field_stores(&o, &mut f));
 }
+
+/// A field reached through `q = p + 16` (`&mut s.br`) is the same field as `[p + 16]`.
+#[test]
+fn a_field_through_an_offset_base_is_one_field() {
+    let mut f = Func::new("offset".into(), 0);
+    let (p, x) = (f.vreg(Cls::I), f.vreg(Cls::I));
+    f.params = vec![p, x];
+    f.noalias = vec![p];
+    f.rets = vec![Cls::I];
+    f.block();
+    let (q, r) = (f.vreg(Cls::I), f.vreg(Cls::I));
+    push(&mut f, 0, Inst::IBinI(IOp::Add, U64, q, p, 16));
+    push(&mut f, 0, Inst::Store(Mem::Int(8, false), q, 0, x));
+    push(&mut f, 0, Inst::Load(Mem::Int(8, false), r, p, 16));
+    f.blocks[0].term = Term::Ret(vec![r]);
+    f.verify().unwrap();
+    assert!(forward_param_fields(&relax_session::Options::default(), &mut f));
+    assert_eq!(loads_of(&f, 0), 0, "{}", f.dump());
+}
