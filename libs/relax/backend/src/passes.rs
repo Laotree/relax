@@ -3708,7 +3708,8 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
             for_defs(i, |d| defs.push(d));
             let temp = defs.len() == 1 && {
                 let d = defs[0];
-                ndef[d.0 as usize] == 1 && nuse[d.0 as usize] > 0 && local_uses.iter().any(|e| e.0 == d && e.1 == nuse[d.0 as usize])
+                // (temporaries this pass made for an earlier diamond are past the counts: not temps here)
+                ndef.get(d.0 as usize) == Some(&1) && nuse.get(d.0 as usize).map_or(false, |&n| n > 0 && local_uses.iter().any(|e| e.0 == d && e.1 == n))
             };
             match i {
                 _ if temp && speculatable(i) && mv.is_empty() => spec.push(i.clone()),
