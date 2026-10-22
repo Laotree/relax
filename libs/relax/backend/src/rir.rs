@@ -871,7 +871,9 @@ pub enum Inst {
     /// d = c != 0 ? a : b (c an integer vreg; a, b, d of one class)
     Sel(VReg, VReg, VReg, VReg), // d, c, a, b
     /// fused multiply-add, one rounding: d = (neg_prod ? -a : a) * b + (neg_add ? -c : c), the
-    /// negations those of the operands (a NaN's sign flips: `(-a).mul_add(b, c)`).
+    /// negations those of the operands (a NaN's sign flips: `(-a).mul_add(b, c)`). A NaN result
+    /// is [`fma_nan_f32`] / [`fma_nan_f64`] of the negated operands on every tier and register
+    /// assignment (each back end keeps one operand placement).
     /// The only fusion RIR has (the optimiser never fuses).
     FMulAdd(bool, bool, bool, VReg, VReg, VReg, VReg), // neg_prod, neg_add, f64?, d, a, b, c
     /// atomic load (Mem::Int only; the value is extended by signedness)
@@ -900,8 +902,8 @@ pub enum Inst {
     // ---- 128-bit vectors (Cls::V128; four 32-bit lanes)
     /// d = bitwise m ? a : b (m: lane masks)
     VSel(VReg, VReg, VReg, VReg), // d, m, a, b
-    /// f32 lanes, one rounding: (neg_prod ? -a : a) * b + (neg_add ? -c : c) (operand negations,
-    /// as `FMulAdd`)
+    /// f32 lanes, one rounding: (neg_prod ? -a : a) * b + (neg_add ? -c : c) (operand negations
+    /// and NaN lanes as `FMulAdd`)
     VFma(bool, bool, VReg, VReg, VReg, VReg), // neg_prod, neg_add, d, a, b, c
     /// every lane = the low 32 bits of s (an I or F32 vreg)
     VSplat(VReg, VReg),
@@ -1642,6 +1644,60 @@ impl Func {
 }
 
 /// `v` re-extended to integer type `it` (how RIR keeps narrow integers in registers).
+/// The NaN result of `FMulAdd` / `VFma` lanes: `fma(a, b, c)` with the operands already negated
+/// (`neg_prod` / `neg_add`), on this host (Rust leaves it unspecified; the back ends fix it so
+/// that every tier and register assignment gives the same bits, and compute kernels match their
+/// interpreter, makepad_script_compute::ir::fma_nan):
+/// - x86-64: the first NaN of b, a, c, quieted (vfmadd213 with a in the destination, b in vvvv,
+///   c in r/m -- glibc's fma/fmaf, what rustc calls without the fma feature; the vf*231/132 forms
+///   keep b first too); no NaN operand (inf * 0, inf - inf): the negative default NaN.
+/// - AArch64 (fmadd/fmla: Rn = a, Rm = b, addend c; Arm's FPMulAdd): the first signaling NaN of
+///   c, a, b, else the first quiet NaN of c, a, b, quieted -- except that a quiet NaN c with
+///   inf * 0 gives the default NaN; none: the positive default NaN.
+/// - wasm: as the engine's f64 multiply then add pass NaNs on (`b * a + c`, the x86-64 order on
+///   x86-64 engines); wasm itself leaves NaN signs nondeterministic.
+/// `None` when the result is not a NaN.
+pub fn fma_nan_f32(a: f32, b: f32, c: f32) -> Option<u32> {
+    let r = a.mul_add(b, c);
+    fma_nan(a.to_bits() as u64, b.to_bits() as u64, c.to_bits() as u64, 23, 8, r.is_nan()).map(|x| x as u32)
+}
+
+/// [`fma_nan_f32`] for f64.
+pub fn fma_nan_f64(a: f64, b: f64, c: f64) -> Option<u64> {
+    let r = a.mul_add(b, c);
+    fma_nan(a.to_bits(), b.to_bits(), c.to_bits(), 52, 11, r.is_nan())
+}
+
+/// m mantissa and e exponent bits; `is_nan`: the result's value is a NaN
+fn fma_nan(a: u64, b: u64, c: u64, m: u32, e: u32, is_nan: bool) -> Option<u64> {
+    if !is_nan {
+        return None;
+    }
+    let exp = ((1u64 << e) - 1) << m;
+    let abs = |x: u64| x & (exp | ((1 << m) - 1));
+    let nan = |x: u64| abs(x) > exp;
+    let quiet = 1u64 << (m - 1);
+    let default = exp | quiet;
+    #[cfg(target_arch = "aarch64")]
+    {
+        let snan = |x: u64| nan(x) && x & quiet == 0;
+        if let Some(&x) = [c, a, b].iter().find(|&&x| snan(x)) {
+            return Some(x | quiet);
+        }
+        let (inf, zero) = (|x: u64| abs(x) == exp, |x: u64| abs(x) == 0);
+        if nan(c) && ((inf(a) && zero(b)) || (zero(a) && inf(b))) {
+            return Some(default);
+        }
+        Some([c, a, b].iter().find(|&&x| nan(x)).map_or(default, |&x| x | quiet))
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let sign = 1u64 << (m + e);
+        let default = if cfg!(target_arch = "x86_64") { sign | default } else { default };
+        Some([b, a, c].iter().find(|&&x| nan(x)).map_or(default, |&x| x | quiet))
+    }
+}
+
 pub fn extend_const(v: i64, it: IntTy) -> i64 {
     match (it.bits, it.signed) {
         (8, true) => v as i8 as i64,
