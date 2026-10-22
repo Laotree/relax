@@ -3640,8 +3640,13 @@ impl<'a> Gen<'a> {
         // block counts) says which; static code takes the back edge, and of two targets laid out
         // before the nearer one (the innermost loop's header; an exit placed before the loop is
         // further back).
-        let est = self.block_est.as_ref().map(|e| (e[tt as usize], e[ff as usize])).filter(|(t, f)| t != f);
-        let ff_cond = match est { Some((t, f)) => f > t, None => !crate::stats::opt_env_off("-a64backstatic") && back(ff) && (!back(tt) || ff > tt) };
+        let ff_cond = match self.block_est.as_ref() {
+            Some(e) => {
+                let (t, f) = (self.f.blocks[tt as usize].count, self.f.blocks[ff as usize].count);
+                if crate::stats::opt_env_off("-a64edgesplit") { t >= 0.0 && f >= 0.0 && f > t } else { e[ff as usize] > e[tt as usize] }
+            }
+            None => !crate::stats::opt_env_off("-a64backstatic") && back(ff) && (!back(tt) || ff > tt),
+        };
         if tt == next || ff != next && ff_cond {
             self.cond_branch(no, ff);
             self.jump_to(tt, bi);
