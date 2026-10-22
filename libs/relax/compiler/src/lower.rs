@@ -407,6 +407,47 @@ const BOX_STEP: u32 = u32::MAX;
 /// a move-path step into element i of a fixed-length array: (ARRAY_STEP, i)
 const ARRAY_STEP: u32 = u32::MAX - 1;
 
+/// A value the block `insts` defines from constants (SIMD selectors, `str_eq` lengths): an Iconst,
+/// copies/int casts of one, or and/or/xor/shift/add/sub with an immediate or another
+/// constant (`MASK & 0x0f` of a const generic), or a product of constants (a slice length in bytes)
+fn const_of(insts: &[Inst], upto: usize, r: VReg) -> Option<i64> {
+    for (at, i) in insts[..upto].iter().enumerate().rev() {
+        match i {
+            Inst::Iconst(d, x) if *d == r => return Some(*x),
+            Inst::Mov(d, a) | Inst::Conv(Conv::IntToInt(_), d, a) if *d == r => return const_of(insts, at, *a),
+            Inst::IBinI(op, _, d, a, imm) if *d == r => {
+                let x = const_of(insts, at, *a)?;
+                return match op {
+                    IOp::And => Some(x & imm),
+                    IOp::Or => Some(x | imm),
+                    IOp::Xor => Some(x ^ imm),
+                    IOp::Shl => Some(x.wrapping_shl(*imm as u32)),
+                    IOp::Shr => Some(((x as u64) >> (*imm as u32 & 63)) as i64),
+                    IOp::Add => Some(x.wrapping_add(*imm)),
+                    IOp::Sub => Some(x.wrapping_sub(*imm)),
+                    _ => None,
+                };
+            }
+            Inst::IBin(op, _, d, a, b) if *d == r => {
+                let (x, y) = (const_of(insts, at, *a)?, const_of(insts, at, *b)?);
+                return match op {
+                    IOp::And => Some(x & y),
+                    IOp::Or => Some(x | y),
+                    IOp::Xor => Some(x ^ y),
+                    IOp::Shl => Some(x.wrapping_shl(y as u32)),
+                    IOp::Shr => Some(((x as u64) >> (y as u32 & 63)) as i64),
+                    IOp::Add => Some(x.wrapping_add(y)),
+                    IOp::Sub => Some(x.wrapping_sub(y)),
+                    IOp::Mul => Some(x.wrapping_mul(y)),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 impl<'a> Lcx<'a> {
     /// `cur_fn`: the slot this body is built for (its closures' parent).
     pub fn new(u: &'a Unit, b: &'a Body, name: String, cur_fn: u32) -> Lcx<'a> {
@@ -1090,6 +1131,41 @@ impl<'a> Lcx<'a> {
             }
             None => Val::M(base, off),
         }
+    }
+
+    /// The byte every byte of a repeated element `v` (one scalar leaf of kind `m`, no padding)
+    /// holds, as a vreg for memset: the value itself for a byte-sized element, else a constant
+    /// whose bytes are all equal (rustc codegen_rvalue Repeat: `const_to_opt_u128` bytes all the
+    /// first, or an i8 immediate). None: store per element.
+    fn repeat_fill_byte(&mut self, v: &Val, m: Mem) -> Option<VReg> {
+        let Val::L(regs) = v else { return None };
+        if regs.len() != 1 {
+            return None;
+        }
+        let r = regs[0];
+        let n = match m {
+            Mem::Int(1, _) => return Some(r),
+            Mem::Int(n, _) => n as usize,
+            Mem::F32 => 4,
+            Mem::F64 => 8,
+        };
+        // the constant defining r in the current block (lowering just emitted it)
+        let b = &self.f.blocks[self.cur as usize];
+        let bits = b.insts.iter().rev().find_map(|i| match *i {
+            Inst::Iconst(d, k) if d == r => Some(Some(k as u64)),
+            Inst::Fconst(d, k, _) if d == r => Some(Some(k)),
+            _ => {
+                let mut def = false;
+                relax_backend::regalloc::for_defs(i, |d| def |= d == r);
+                def.then_some(None)
+            }
+        })??;
+        let bytes = bits.to_le_bytes();
+        let first = bytes[0];
+        if bytes[1..n].iter().any(|&x| x != first) {
+            return None;
+        }
+        Some(self.iconst(first as i64))
     }
 
     fn store_val(&mut self, base: VReg, off: i32, t: TyId, v: Val) {
@@ -2493,6 +2569,14 @@ impl<'a> Lcx<'a> {
                 // self-referential future, may be aliased through itself)
                 if let TyKind::Ref(true, inner, _) = self.kind(t) {
                     if !self.unsized_ty(inner) && regs.len() == 1 && self.u.is_unpin(inner) {
+                        self.f.noalias.push(regs[0]);
+                    }
+                }
+                // and `&T` for T: Freeze (rustc_ty_utils abi.rs: PointerKind::SharedRef { frozen }
+                // -> noalias + readonly): nothing writes the memory during the call, so its loads
+                // are loop-invariant (quicksort's pivot under partition's stores)
+                if let TyKind::Ref(false, inner, _) = self.kind(t) {
+                    if !self.unsized_ty(inner) && regs.len() == 1 && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), inner) {
                         self.f.noalias.push(regs[0]);
                     }
                 }
@@ -5186,6 +5270,65 @@ impl<'a> Lcx<'a> {
         self.switch(ok);
     }
 
+    /// Byte equality of `la` bytes at `pa` and `lb` bytes at `pb` (`str` / byte-slice / byte-array
+    /// patterns and `==`), inline where it is cheap: unequal lengths are unequal without a call (most
+    /// arms of a `match s { "lit" => .. }`), a length known here of up to 16 bytes compares one or two
+    /// overlapping words of each side (the literal's words fold to immediates from read-only data), and
+    /// only equal lengths beyond that, or unknown ones, call `rt_str_eq`.
+    fn bytes_eq(&mut self, pa: VReg, la: VReg, pb: VReg, lb: VReg) -> VReg {
+        let (ka, kb) = {
+            let insts = &self.f.blocks[self.cur as usize].insts;
+            (const_of(insts, insts.len(), la), const_of(insts, insts.len(), lb))
+        };
+        let n = match (ka, kb) {
+            (Some(x), Some(y)) if x != y => return self.iconst(0),
+            (Some(x), _) | (_, Some(x)) => Some(x),
+            _ => None,
+        };
+        let res = self.f.vreg(Cls::I);
+        let same_len = match (ka, kb) {
+            (Some(_), Some(_)) => None,
+            _ => Some(self.icmp(Cond::Eq, false, la, lb)),
+        };
+        let join = self.f.block();
+        if let Some(c) = same_len {
+            self.emit(Inst::Iconst(res, 0));
+            let eq = self.f.block();
+            self.term(Term::Branch(c, eq, join));
+            self.switch(eq);
+        }
+        let r = match n {
+            Some(0) => self.iconst(1),
+            Some(n @ 1..=16) => {
+                let w: i64 = if n >= 8 { 8 } else if n >= 4 { 4 } else if n >= 2 { 2 } else { 1 };
+                let word = |s: &mut Self, off: i64| {
+                    let x = s.f.vreg(Cls::I);
+                    let y = s.f.vreg(Cls::I);
+                    s.emit(Inst::Load(Mem::Int(w as u8, false), x, pa, off as i32));
+                    s.emit(Inst::Load(Mem::Int(w as u8, false), y, pb, off as i32));
+                    s.icmp(Cond::Eq, false, x, y)
+                };
+                let e0 = word(self, 0);
+                if n > w {
+                    let e1 = word(self, n - w);
+                    self.ibin(IOp::And, false, e0, e1)
+                } else {
+                    e0
+                }
+            }
+            _ => {
+                let rt = self.u.rs.str_eq;
+                let c = self.f.vreg(Cls::I);
+                self.emit(Inst::Call(Callee::Host(rt), vec![pa, la, pb, lb], vec![c]));
+                c
+            }
+        };
+        self.emit(Inst::Mov(res, r));
+        self.goto(join);
+        self.switch(join);
+        res
+    }
+
     fn eq_vals(&mut self, a: Val, b: Val, t: TyId) -> VReg {
         let k = self.kind(t);
         match k {
@@ -5209,10 +5352,7 @@ impl<'a> Lcx<'a> {
                 let k = self.iconst(es);
                 let la = self.ibin(IOp::Mul, false, a[1], k);
                 let lb = self.ibin(IOp::Mul, false, b[1], k);
-                let rt = self.u.rs.str_eq;
-                let c = self.f.vreg(Cls::I);
-                self.emit(Inst::Call(Callee::Host(rt), vec![a[0], la, b[0], lb], vec![c]));
-                c
+                self.bytes_eq(a[0], la, b[0], lb)
             }
             // `&[u8; N]` against a byte-string pattern (`match &tag { b"head" => .. }`): the bytes
             // (Reference patterns.md [patterns.literal]: compared by value; it compared pointers)
@@ -5221,18 +5361,12 @@ impl<'a> Lcx<'a> {
                 let a = self.to_leaves(a, t);
                 let b = self.to_leaves(b, t);
                 let n = self.iconst(size);
-                let rt = self.u.rs.str_eq;
-                let c = self.f.vreg(Cls::I);
-                self.emit(Inst::Call(Callee::Host(rt), vec![a[0], n, b[0], n], vec![c]));
-                c
+                self.bytes_eq(a[0], n, b[0], n)
             }
             TyKind::Ref(_, inner, _) if matches!(self.kind_ref(inner), TyKind::Str) => {
                 let a = self.to_leaves(a, t);
                 let b = self.to_leaves(b, t);
-                let rt = self.u.rs.str_eq;
-                let c = self.f.vreg(Cls::I);
-                self.emit(Inst::Call(Callee::Host(rt), vec![a[0], a[1], b[0], b[1]], vec![c]));
-                c
+                self.bytes_eq(a[0], a[1], b[0], b[1])
             }
             _ => {
                 let a = self.to_leaves(a, t);
@@ -5312,6 +5446,24 @@ impl<'a> Lcx<'a> {
         let xt = self.body_ty(x);
         if self.unsized_ty(xt) {
             return None;
+        }
+        // `&CONST` (shared, no interior mutability): the constant's own evaluated allocation,
+        // which is immutable (rustc interns it; const_val copies out of it for every by-value
+        // use). Not a writable static refilled with a copy of it at every evaluation.
+        let xs = strip_paren(self.ast(), x);
+        if shared && matches!(self.ast().expr(xs).kind, ExprKind::Path(_)) && self.layout(xt).size > 0 && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), xt) {
+            if let Some(Res::Def(d)) = self.b.res.get(&xs.0).copied() {
+                if matches!(self.u.prog.def(d).kind, DefKind::Const | DefKind::AssocConst) {
+                    let args = self.b.res_args.get(&xs.0).copied().unwrap_or_default();
+                    let args = self.mono_list(args);
+                    if let Some(addr) = self.u.const_addr_shared(d, args) {
+                        let s = self.u.data_sym(addr);
+                        let p = self.f.vreg(Cls::I);
+                        self.emit(Inst::Addr(p, s));
+                        return Some(p);
+                    }
+                }
+            }
         }
         let (blk0, at0) = (self.cur, self.f.blocks[self.cur as usize].insts.len());
         let v = self.lower_expr(x);
@@ -6357,6 +6509,8 @@ impl<'a> Lcx<'a> {
                 };
                 let el = self.layout(et);
                 let stride = crate::layout::round_up(el.size, el.align);
+                // a single scalar filling the whole element: memset candidate
+                let fill_mem = el.leaves.as_ref().and_then(|l| (l.len() == 1 && l[0].off == 0 && stride == el.size).then(|| l[0].mem));
                 let a = self.new_slot_for(t);
                 // the operand coerced to the element type (`[&[]; 4]` as `[&[i16]; 4]`)
                 let val = self.lower_expr_coerced(*x, et);
@@ -6375,6 +6529,13 @@ impl<'a> Lcx<'a> {
                     for i in 0..n {
                         self.store_val(a, (i as u32 * stride) as i32, et, val.clone());
                     }
+                } else if let Some(byte) = fill_mem.and_then(|m| self.repeat_fill_byte(&val, m)) {
+                    // every byte of the array is one value (a byte element, or zero of any
+                    // scalar element): memset, as rustc's lowering of a repeat (MIR Rvalue::Repeat
+                    // -> `memset` for a byte-sized or all-zero operand); `[0u8; 1024]` buffers
+                    let len = self.iconst((n * stride as u64) as i64);
+                    let rt = self.u.rs.memset;
+                    self.emit(Inst::Call(Callee::Host(rt), vec![a, byte, len], Vec::new()));
                 } else {
                     // loop: i in 0..n
                     let i = self.f.vreg(Cls::I);
@@ -10291,8 +10452,8 @@ impl<'a> Lcx<'a> {
     fn vx_intrinsic(&mut self, name: &str, vals: &[(Val, TyId)], t: TyId) -> Val {
         let arity = match name {
             "vx_binary" | "vx_unary" | "vx_ternary" => 4,
-            "vx_splat" | "vx_store" | "vx_narrow" | "vx_table" => 2,
-            "vx_load" | "vx_mask" | "vx_sha1h" => 1,
+            "vx_splat" | "vx_store" | "vx_narrow" | "vx_table" | "vx_mask" => 2,
+            "vx_load" | "vx_sha1h" => 1,
             "vx_blend" | "vx_sha1rnds4" => 3,
             _ => {
                 self.err(self.pos, "unknown SIMD intrinsic".into());
@@ -10308,45 +10469,6 @@ impl<'a> Lcx<'a> {
             return self.dummy_val(t);
         }
         let scalar = |s: &mut Self, k: usize| s.to_leaves(vals[k].0.clone(), vals[k].1)[0];
-        // the selector's value when the current block defines it from constants: an Iconst,
-        // copies/int casts of one, or and/or/xor/shift/add/sub with an immediate or another
-        // constant (`MASK & 0x0f` of a const generic)
-        fn const_of(insts: &[Inst], upto: usize, r: VReg) -> Option<i64> {
-            for (at, i) in insts[..upto].iter().enumerate().rev() {
-                match i {
-                    Inst::Iconst(d, x) if *d == r => return Some(*x),
-                    Inst::Mov(d, a) | Inst::Conv(Conv::IntToInt(_), d, a) if *d == r => return const_of(insts, at, *a),
-                    Inst::IBinI(op, _, d, a, imm) if *d == r => {
-                        let x = const_of(insts, at, *a)?;
-                        return match op {
-                            IOp::And => Some(x & imm),
-                            IOp::Or => Some(x | imm),
-                            IOp::Xor => Some(x ^ imm),
-                            IOp::Shl => Some(x.wrapping_shl(*imm as u32)),
-                            IOp::Shr => Some(((x as u64) >> (*imm as u32 & 63)) as i64),
-                            IOp::Add => Some(x.wrapping_add(*imm)),
-                            IOp::Sub => Some(x.wrapping_sub(*imm)),
-                            _ => None,
-                        };
-                    }
-                    Inst::IBin(op, _, d, a, b) if *d == r => {
-                        let (x, y) = (const_of(insts, at, *a)?, const_of(insts, at, *b)?);
-                        return match op {
-                            IOp::And => Some(x & y),
-                            IOp::Or => Some(x | y),
-                            IOp::Xor => Some(x ^ y),
-                            IOp::Shl => Some(x.wrapping_shl(y as u32)),
-                            IOp::Shr => Some(((x as u64) >> (y as u32 & 63)) as i64),
-                            IOp::Add => Some(x.wrapping_add(y)),
-                            IOp::Sub => Some(x.wrapping_sub(y)),
-                            _ => None,
-                        };
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
         let constant = |s: &mut Self, k: usize| -> i64 {
             let r = scalar(s, k);
             let insts = &s.f.blocks[s.cur as usize].insts;
@@ -10464,9 +10586,19 @@ impl<'a> Lcx<'a> {
             self.emit(Inst::VX(VX::Or, indices, b, bad));
             self.emit(Inst::VX(VX::ByteShuffle, d, a, indices));
         } else if name == "vx_mask" {
+            // the top bit of each lane of the given width (pmovmskb / movmskps / movmskpd)
+            let op = match constant(self, 1) {
+                8 => VX::MoveMaskB,
+                32 => VX::MoveMask(VW::S),
+                64 => VX::MoveMask(VW::D),
+                _ => {
+                    self.err(self.pos, "invalid SIMD mask lane width".into());
+                    return self.dummy_val(t);
+                }
+            };
             let a = vector(self, 0);
             let r = self.f.vreg(Cls::I);
-            self.emit(Inst::VX(VX::MoveMaskB, r, a, a));
+            self.emit(Inst::VX(op, r, a, a));
             return Val::L(vec![r]);
         } else if name == "vx_blend" {
             let a = vector(self, 0);
@@ -10729,6 +10861,9 @@ impl<'a> Lcx<'a> {
                 "ceil" => FUn::Ceil,
                 "trunc" => FUn::Trunc,
                 "rint" => FUn::RoundEven,
+                // round half away from zero (Rust `round`): inline on both backends (x64
+                // trunc(x + copysign(0.5 - ulp/2, x)), arm64 frinta), not a libm call
+                "round" => FUn::RoundAway,
                 _ => return None,
             })
         };

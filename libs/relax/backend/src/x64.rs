@@ -578,6 +578,15 @@ impl Asm {
         self.byte(op);
         self.modrm_rr(reg, rm);
     }
+    /// VEX register form, or EVEX (same opcode, W given) when a register is xmm16..31: for ops
+    /// whose EVEX encoding exists with the same W (scalar FMA, ...)
+    fn vex_rr_any(&mut self, pp: u8, map: u8, w: bool, op: u8, reg: u8, vvvv: u8, rm: u8) {
+        if reg >= 16 || vvvv >= 16 || rm >= 16 {
+            self.evex_rr(pp, map, w, false, op, reg, vvvv, rm);
+        } else {
+            self.vex_rr(pp, map, w, op, reg, vvvv, rm);
+        }
+    }
     /// VEX (3-byte) register form with the vector length: `y` = 256-bit (L = 1)
     fn vex_l(&mut self, pp: u8, map: u8, w: bool, y: bool, op: u8, reg: u8, vvvv: u8, rm: u8) {
         if (reg >= 16 || rm >= 16) && pp == 0 && map == 1 && op == 0x28 && vvvv == 0 {
@@ -795,6 +804,10 @@ fn evex_direct(pp: u8, map: u8, op: u8) -> Option<bool> {
         (1, _, 0x58 | 0x59 | 0x5c | 0x5e | 0x5d | 0x5f) => Some(pp == 1 || pp == 3),
         (1, 1, 0xfe | 0xfa | 0xdb | 0xdf | 0xeb | 0xef) => Some(false),
         (1, 1, 0xd4 | 0xfb) => Some(true),
+        // vinsertps (EVEX.128.66.0F3A.W0 21)
+        (3, 1, 0x21) => Some(false),
+        // vpshufd (EVEX.128.66.0F.W0 70 /r ib; no vvvv operand)
+        (1, 1, 0x70) => Some(false),
         _ => None,
     }
 }
@@ -825,6 +838,8 @@ fn keeps_xmm01(options: &relax_session::Options, f: &Func, i: &Inst) -> bool {
         Inst::FCmp(..) => true,
         // Gen::fma's VEX / EVEX form (the destination register or XS takes a)
         Inst::FMulAdd(..) => options.cpu.avx,
+        // Gen::vinst's vinsertps form
+        Inst::VInsert(_, _, _, s) => options.cpu.avx && f.vregs[s.0 as usize] != Cls::I,
         // the 128-bit float lane ops that go straight to v3's VEX / EVEX three-operand form
         Inst::VX(op, d, ..) if options.cpu.avx && !y(d) => matches!(
             op,
@@ -939,6 +954,9 @@ struct Gen<'a> {
     text_len: u32,
     /// a single-use float constant whose use (the next FBin) reads it from the pool
     mem_const: Option<(VReg, u64)>,
+    /// (t, base, off): a float Load of t that the next instruction (an AVX FBin or FMulAdd, t's
+    /// only use) reads as its memory operand instead
+    mem_load: Option<(VReg, VReg, i32)>,
     /// the block ends `t = x & K; t ==/!= 0; branch`: emitted as test x, K (the And skipped)
     test_fuse: Option<(VReg, i64)>,
     /// the block ends `s = m >> t; c = s & 1; branch c` (s, c used once): emitted as bt m, t
@@ -1043,6 +1061,14 @@ impl<'a> Gen<'a> {
         -(self.saved + off)
     }
 
+    /// rbp displacement of a scalar float value that lives in its spill slot
+    fn spill_of(&self, v: VReg) -> Option<i32> {
+        match self.al.loc[v.0 as usize] {
+            Loc::Stack(o) if matches!(self.f.vregs[v.0 as usize], Cls::F32 | Cls::F64) => Some(self.spill_disp(o)),
+            _ => None,
+        }
+    }
+
     /// Integer operand in a register (loads spills into `scratch`).
     fn use_i(&mut self, options: &relax_session::Options, v: VReg, scratch: u8) -> u8 {
         match self.al.loc[v.0 as usize] {
@@ -1052,7 +1078,8 @@ impl<'a> Gen<'a> {
                 if let Some(ws) = self.win.get(&v.0) {
                     let p = self.cur_pos;
                     if let Some(&(_, _, r)) = ws.iter().find(|(a, z, _)| *a <= p && p <= *z) {
-                        if check_windows(options) {
+                        // (a value with dead stores home has a stale slot: not checked)
+                        if check_windows(options) && !self.al.store_skip.iter().any(|x| x.1 == v.0) {
                             // the slot stays the value's home: the register must still equal it
                             // (pushfq; cmp r, [rbp+d]; je +2; ud2; popfq -- flags kept)
                             let d = self.spill_disp(o);
@@ -1156,14 +1183,30 @@ impl<'a> Gen<'a> {
     fn def_i(&self, v: VReg, scratch: u8) -> u8 {
         match self.al.loc[v.0 as usize] {
             Loc::Reg(r) => r,
+            // a window that starts at this definition (regalloc def windows): computed into its
+            // register, which keeps the value after fin_i stores it home
+            Loc::Stack(_) => self.win.get(&v.0).and_then(|ws| ws.iter().find(|w| w.0 == self.cur_pos + 1)).map_or(scratch, |w| w.2),
             _ => scratch,
         }
     }
     fn fin_i(&mut self, v: VReg, r: u8) {
         if let Loc::Stack(o) = self.al.loc[v.0 as usize] {
+            // nobody reads this store home (Alloc::store_skip): the window's register only
+            if self.al.store_skip.contains(&(self.cur_pos, v.0)) {
+                self.def_win_copy(v, r);
+                return;
+            }
             let d = self.spill_disp(o);
             self.a.store64(RBP, d, r);
             self.last_spill = Some((d, r, self.a.pos()));
+            self.def_win_copy(v, r);
+        }
+    }
+    /// A window that starts at this definition (def windows, regions over redefining blocks)
+    /// holds the result: computed elsewhere (a scratch), it is copied there.
+    fn def_win_copy(&mut self, v: VReg, r: u8) {
+        if let Some(c) = self.win.get(&v.0).and_then(|ws| ws.iter().find(|w| w.0 == self.cur_pos + 1)).map(|w| w.2) {
+            self.a.mov_rr(c, r);
         }
     }
     /// dst = the spill slot at disp: a register move (or nothing) when the slot was stored from a
@@ -1530,6 +1573,9 @@ impl<'a> Gen<'a> {
             // the flags of the ALU op that ended the block above (a jump arrives with other ones)
             self.last_spill = None;
             self.last_alu = None;
+            // window lookups of this block never see the previous block's last position (an empty
+            // block's terminator reads at its start: no window there, the slot is read)
+            self.cur_pos = self.al.block_start[bi];
             for (ii, inst) in b.insts.iter().enumerate() {
                 self.pc_map.push((self.a.pos() as u32, b.pos[ii]));
                 if self.rir_map_on {
@@ -1586,6 +1632,35 @@ impl<'a> Gen<'a> {
                                 self.sel_flags = Some((cd, icc(*cc, *sg)));
                                 continue;
                             }
+                            // an ordered float compare (ucomis[sd], operands swapped for Lt / Le:
+                            // `a` / `ae`, false when unordered): an argmax's index select
+                            if let Inst::FCmp(cc @ (Cond::Lt | Cond::Le | Cond::Gt | Cond::Ge), ..) = inst {
+                                let fcc = if matches!(cc, Cond::Lt | Cond::Gt) { CC_A } else { CC_AE };
+                                self.inst(options, inst);
+                                self.sel_flags = Some((cd, fcc));
+                                continue;
+                            }
+                        }
+                    }
+                }
+                // a float Load used once, by the next instruction: an AVX FBin's second operand
+                // (either operand of a commutative op) or an FMA's addend / factor, read straight
+                // from memory (vmulss xd, xa, [base + off]; vfmadd213ss xd, xb, [base + off])
+                if let Inst::Load(m @ (Mem::F32 | Mem::F64), t, base, off) = inst {
+                    if self.avx && self.al.uses[t.0 as usize] == 1 && ii + 1 < n && !(fused && ii + 1 == n - 1) {
+                        let w = *m == Mem::F64;
+                        let ok = match &b.insts[ii + 1] {
+                            Inst::FBin(op @ (FOp::Add | FOp::Sub | FOp::Mul | FOp::Div), w2, _, x, y) => {
+                                *w2 == w && ((y == t && x != t) || (matches!(op, FOp::Add | FOp::Mul) && x == t && y != t))
+                            }
+                            Inst::FMulAdd(_, _, w2, _, a, b2, c) => *w2 == w && [*a, *b2, *c].iter().filter(|v| **v == *t).count() == 1,
+                            // vinsertps xd, xv, [m], lane << 4
+                            Inst::VInsert(_, _, _, s2) => !w && s2 == t,
+                            _ => false,
+                        };
+                        if ok {
+                            self.mem_load = Some((*t, *base, *off));
+                            continue;
                         }
                     }
                 }
@@ -1636,6 +1711,18 @@ impl<'a> Gen<'a> {
             self.pc_map.push((self.a.pos() as u32, b.term_pos));
             if self.rir_map_on {
                 self.rir_map.push((self.a.pos() as u32, bi as u32, u32::MAX));
+            }
+            // region windows entered from here: loaded before the terminator (regalloc edge loads)
+            if matches!(b.term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..)) {
+                let tp = self.al.block_end[bi] - 1;
+                if let Some(ls) = self.win_start.get(&tp).cloned() {
+                    for (v, r) in ls {
+                        if let Loc::Stack(o) = self.al.loc[v as usize] {
+                            let d = self.spill_disp(o);
+                            self.load_spill(r, d);
+                        }
+                    }
+                }
             }
             let fuse_inst = if fused { Some(b.insts[n - 1].clone()) } else { None };
             self.term(options, &b.term, bi, fuse_inst);
@@ -2547,7 +2634,8 @@ impl<'a> Gen<'a> {
             let b = &self.f.blocks[bi];
             let Term::Jump(t) = b.term else { continue };
             // the block that reads the domain base is not skipped, whatever else it holds
-            if !reach[bi] || t as usize == bi || self.dom_read.get(bi) == Some(&true) {
+            // nor a block that loads a region window before its jump
+            if !reach[bi] || t as usize == bi || self.dom_read.get(bi) == Some(&true) || self.win_start.contains_key(&(self.al.block_end[bi] - 1)) {
                 continue;
             }
             let silent = b.insts.iter().enumerate().all(|(ii, i)| match *i {
@@ -2582,6 +2670,12 @@ impl<'a> Gen<'a> {
     fn jump_to(&mut self, target: u32, bi: usize) {
         let target = self.thru(target);
         if self.thru(self.next_block[bi]) != target {
+            // a backward jump (loop back edge) to a placed block in rel8 range: jmp rel8
+            if let Some(rel) = self.short_back(target) {
+                self.a.byte(0xeb);
+                self.a.byte(rel as u8);
+                return;
+            }
             let p = self.a.jmp32();
             self.fixups.push((p, target));
         }
@@ -2589,8 +2683,23 @@ impl<'a> Gen<'a> {
 
     fn jcc_to(&mut self, cc: u8, target: u32) {
         let target = self.thru(target);
+        if let Some(rel) = self.short_back(target) {
+            self.a.byte(0x70 | cc);
+            self.a.byte(rel as u8);
+            return;
+        }
         let p = self.a.jcc32(cc);
         self.fixups.push((p, target));
+    }
+
+    /// rel8 of a two-byte jump emitted here to an already placed block, when it fits (forward
+    /// targets are not placed yet: they keep rel32 and a fixup)
+    fn short_back(&self, target: u32) -> Option<i8> {
+        let at = *self.block_pos.get(target as usize)?;
+        if at == usize::MAX {
+            return None;
+        }
+        i8::try_from(at as i64 - (self.a.pos() as i64 + 2)).ok()
     }
 
     /// cmp r, imm32 (sign-extended)
@@ -2757,9 +2866,16 @@ impl<'a> Gen<'a> {
                     }
                 };
                 let cc = icond.unwrap();
+                // a target laid out at or before this block: a loop's back edge (taken while it runs)
+                let back = |s: &Self, b: u32| s.block_pos.get(s.thru(b) as usize).map_or(false, |p| *p != usize::MAX);
                 if self.thru(*tt) == self.thru(next) {
                     // fall into the true block: branch on the inverted condition
                     self.jcc_to(cc ^ 1, *ff);
+                } else if self.thru(*ff) != self.thru(next) && back(self, *ff) && (!back(self, *tt) || (self.thru(*ff) == bi as u32 && self.thru(*tt) != bi as u32)) {
+                    // neither falls through and the false edge loops: the conditional jump takes the
+                    // back edge (one taken branch per iteration instead of a not-taken jcc + jmp)
+                    self.jcc_to(cc ^ 1, *ff);
+                    self.jump_to(*tt, bi);
                 } else {
                     self.jcc_to(cc, *tt);
                     self.jump_to(*ff, bi);
@@ -2767,8 +2883,11 @@ impl<'a> Gen<'a> {
             }
             Term::Switch(x, tab) => {
                 // rax = x - min; if rax >u len - 1 { default }; jump through the table
-                let r = self.use_i(options, *x, R10);
-                self.a.mov_rr(RAX, r);
+                // a spilled value loads straight into rax
+                let r = self.use_i(options, *x, RAX);
+                if r != RAX {
+                    self.a.mov_rr(RAX, r);
+                }
                 if tab.min == 0 {
                 } else if tab.min as i32 as i64 == tab.min {
                     // sub rax, imm32
@@ -2874,7 +2993,7 @@ impl<'a> Gen<'a> {
             }
             Inst::VX(op, d, a, b) => self.vx(options, *op, *d, *a, *b),
             Inst::VX3(op, d, a, b, c) => self.vx3(*op, *d, *a, *b, *c),
-            Inst::FMulAdd(np, na, w, d, a, b, c) => self.fma(*np, *na, *w, *d, *a, *b, *c),
+            Inst::FMulAdd(np, na, w, d, a, b, c) => self.fma(options, *np, *na, *w, *d, *a, *b, *c),
             Inst::AtomicLoad(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..) => self.atomic(options, i),
             Inst::TlsAddr(d, off) => self.tls_addr(*d, *off),
             Inst::TlsStatic(d, off) => self.tls_static(*d, *off),
@@ -2930,8 +3049,11 @@ impl<'a> Gen<'a> {
                 Cls::I => match (self.al.loc[d.0 as usize], self.uloc(*s)) {
                     // straight between a register and a spill slot
                     (Loc::Stack(o), Loc::Reg(r)) => {
-                        let disp = self.spill_disp(o);
-                        self.a.store64(RBP, disp, r);
+                        if !self.al.store_skip.contains(&(self.cur_pos, d.0)) {
+                            let disp = self.spill_disp(o);
+                            self.a.store64(RBP, disp, r);
+                        }
+                        self.def_win_copy(*d, r);
                     }
                     (Loc::Reg(r), Loc::Stack(o)) => {
                         let disp = self.spill_disp(o);
@@ -3056,6 +3178,28 @@ impl<'a> Gen<'a> {
                 self.a.movf_rr(true, xd, 0);
                 self.fin_f(*d, xd);
             }
+            Inst::FBin(op, f64_, d, a, b) if self.mem_load.is_some() => {
+                // the other operand in a register, the loaded one as [base + off] (VEX / EVEX)
+                let (t, base, off) = self.mem_load.take().unwrap();
+                let opc = match op {
+                    FOp::Add => 0x58,
+                    FOp::Mul => 0x59,
+                    FOp::Sub => 0x5c,
+                    FOp::Div => 0x5e,
+                    _ => unreachable!("x64: memory operand for {:?}", op),
+                };
+                let other = if *b == t { *a } else { *b };
+                let xo = self.use_fx(other, XS);
+                let xd = self.def_fx(*d, XS);
+                let (rb, disp) = self.base_disp(options, base, R11, off);
+                let pp = if *f64_ { 3 } else { 2 };
+                if xd >= 16 || xo >= 16 {
+                    self.a.evex_m(pp, 1, *f64_, false, opc, xd, xo, rb, disp);
+                } else {
+                    self.a.vex_lm(pp, 1, false, false, opc, xd, xo, rb, disp);
+                }
+                self.fin_f(*d, xd);
+            }
             Inst::FBin(op, f64_, d, a, b) if self.mem_const.is_some() => {
                 // one operand is a constant folded into a [rip + pool] memory operand
                 let (cv, bits) = self.mem_const.take().unwrap();
@@ -3087,6 +3231,29 @@ impl<'a> Gen<'a> {
                 let at = self.a.pos();
                 self.a.u32(0);
                 self.fpool.push((at, bits));
+                self.fin_f(*d, xd);
+            }
+            Inst::FBin(op, f64_, d, a, b) if self.avx && a != b && (self.spill_of(*b).is_some() || (matches!(op, FOp::Add | FOp::Mul) && self.spill_of(*a).is_some())) => {
+                // a spilled operand straight from its slot (vop xd, xa, [rbp - k]); a commutative
+                // op takes either operand from memory
+                let (x, m) = if self.spill_of(*b).is_some() { (*a, *b) } else { (*b, *a) };
+                let disp = self.spill_of(m).unwrap();
+                let opc = match op {
+                    FOp::Add => 0x58,
+                    FOp::Mul => 0x59,
+                    FOp::Sub => 0x5c,
+                    FOp::Div => 0x5e,
+                    FOp::Min | FOp::MinLt => 0x5d,
+                    FOp::Max | FOp::MaxGt => 0x5f,
+                };
+                let xa = self.use_fx(x, XS);
+                let xd = self.def_fx(*d, XS);
+                let pp = if *f64_ { 3 } else { 2 };
+                if xd >= 16 || xa >= 16 {
+                    self.a.evex_m(pp, 1, *f64_, false, opc, xd, xa, RBP, disp);
+                } else {
+                    self.a.vex_lm(pp, 1, false, false, opc, xd, xa, RBP, disp);
+                }
                 self.fin_f(*d, xd);
             }
             Inst::FBin(op, f64_, d, a, b) => {
@@ -3206,13 +3373,8 @@ impl<'a> Gen<'a> {
             }
             Inst::Conv(c, d, s) => self.conv(options, *c, *d, *s),
             Inst::LoadX(m, d, base, idx, sh, off) => {
-                let ri = self.use_i(options, *idx, R10);
-                let ri = if ri == R10 {
-                    self.a.mov_rr(RAX, R10);
-                    RAX
-                } else {
-                    ri
-                };
+                // a spilled index loads straight into rax (base: r11, value: r10)
+                let ri = self.use_i(options, *idx, RAX);
                 let (rb, off) = self.base_disp(options, *base, R11, *off);
                 match m {
                     Mem::Int(n, signed) => {
@@ -3230,13 +3392,8 @@ impl<'a> Gen<'a> {
                 }
             }
             Inst::StoreX(m, base, idx, sh, off, src) => {
-                let ri = self.use_i(options, *idx, R10);
-                let ri = if ri == R10 {
-                    self.a.mov_rr(RAX, R10);
-                    RAX
-                } else {
-                    ri
-                };
+                // a spilled index loads straight into rax (base: r11, value: r10)
+                let ri = self.use_i(options, *idx, RAX);
                 let (rb, off) = self.base_disp(options, *base, R11, *off);
                 match m {
                     Mem::Int(n, _) => {
@@ -4002,11 +4159,20 @@ impl<'a> Gen<'a> {
                 self.fin_f(d, xd);
             }
             VX::ShufS(k) => {
-                let xa = self.use_f(a, XS);
-                let xd = self.def_f(d, XS);
-                self.a.sse_rr(0x66, 0x70, xd, xa, false);
-                self.a.byte(k);
-                self.fin_f(d, xd);
+                if self.avx {
+                    // vpshufd (VEX, or EVEX for xmm16..31: no trip through the scratch register)
+                    let xa = self.use_fx(a, XS);
+                    let xd = self.def_fx(d, XS);
+                    self.a.vex_rr(1, 1, false, 0x70, xd, 0, xa);
+                    self.a.byte(k);
+                    self.fin_f(d, xd);
+                } else {
+                    let xa = self.use_f(a, XS);
+                    let xd = self.def_f(d, XS);
+                    self.a.sse_rr(0x66, 0x70, xd, xa, false);
+                    self.a.byte(k);
+                    self.fin_f(d, xd);
+                }
             }
             VX::BytesShrI(k) | VX::BytesShlI(k) => {
                 let xa = self.use_f(a, XS);
@@ -4229,13 +4395,7 @@ impl<'a> Gen<'a> {
     /// The index and base registers (and displacement) of an indexed access, as LoadX takes them:
     /// a spilled index in rax (r10 is the base's scratch).
     fn index_operands(&mut self, options: &relax_session::Options, base: VReg, idx: VReg, off: i32) -> (u8, u8, i32) {
-        let ri = self.use_i(options, idx, R10);
-        let ri = if ri == R10 {
-            self.a.mov_rr(RAX, R10);
-            RAX
-        } else {
-            ri
-        };
+        let ri = self.use_i(options, idx, RAX);
         let (rb, off) = self.base_disp(options, base, R11, off);
         (ri, rb, off)
     }
@@ -4457,12 +4617,40 @@ impl<'a> Gen<'a> {
                     self.a.byte(lane);
                     self.a.extend(rd, 32, true);
                     self.fin_i(d, rd);
+                } else if lane == 0 {
+                    // lane 0 is the f32 already (the upper lanes are don't-care for a scalar)
+                    let xd = self.def_f(d, XS2);
+                    self.a.movf_rr(false, xd, xv);
+                    self.fin_f(d, xd);
                 } else {
                     let xd = self.def_f(d, XS2);
                     self.a.sse_rr(0x66, 0x70, xd, xv, false); // pshufd: lane -> lane 0
                     self.a.byte(lane);
                     self.fin_f(d, xd);
                 }
+            }
+            Inst::VInsert(d, v, lane, _) if self.mem_load.is_some() => {
+                // the inserted f32 straight from memory (its Load folded here)
+                let (_, base, off) = self.mem_load.take().unwrap();
+                let xv = self.use_fx(v, XS);
+                let xd = self.def_fx(d, XS);
+                let (rb, disp) = self.base_disp(options, base, R11, off);
+                if xd >= 16 || xv >= 16 {
+                    self.a.evex_m(1, 3, false, false, 0x21, xd, xv, rb, disp);
+                } else {
+                    self.a.vex_lm(1, 3, false, false, 0x21, xd, xv, rb, disp);
+                }
+                self.a.byte(lane << 4);
+                self.fin_f(d, xd);
+            }
+            Inst::VInsert(d, v, lane, s) if options.cpu.avx && self.f.vregs[s.0 as usize] != Cls::I => {
+                // vinsertps xd, xv, xs, lane << 4 (VEX; EVEX for xmm16..31)
+                let xv = self.use_fx(v, XS);
+                let xs = self.use_fx(s, XS2);
+                let xd = self.def_fx(d, XS);
+                self.a.vex_rr(1, 3, false, 0x21, xd, xv, xs);
+                self.a.byte(lane << 4);
+                self.fin_f(d, xd);
             }
             Inst::VInsert(d, v, lane, s) => {
                 let xv = self.use_f(v, XS);
@@ -4481,13 +4669,14 @@ impl<'a> Gen<'a> {
                 self.fin_f(d, xd);
             }
             Inst::VLoad(d, base, off) => {
-                let rb = self.use_i(options, base, R11);
+                // a slot address without a register is rbp + k (base_disp), as for scalar loads
+                let (rb, off) = self.base_disp(options, base, R11, off);
                 let xd = self.def_fx(d, XS);
                 self.a.sse_rm(0, 0x10, xd, rb, off);
                 self.fin_f(d, xd);
             }
             Inst::VStore(base, off, v) => {
-                let rb = self.use_i(options, base, R11);
+                let (rb, off) = self.base_disp(options, base, R11, off);
                 let xv = self.use_fx(v, XS);
                 self.a.sse_rm(0, 0x11, xv, rb, off);
             }
@@ -4707,13 +4896,45 @@ impl<'a> Gen<'a> {
 
     /// Fused multiply-add (FMA3, one rounding): xmm0 = c, then vf[n]m{add,sub}231 xmm0, a, b.
     #[allow(clippy::too_many_arguments)]
-    fn fma(&mut self, neg_prod: bool, neg_add: bool, w: bool, d: VReg, a: VReg, b: VReg, c: VReg) {
+    fn fma(&mut self, options: &relax_session::Options, neg_prod: bool, neg_add: bool, w: bool, d: VReg, a: VReg, b: VReg, c: VReg) {
         let op = match (neg_prod, neg_add) {
             (false, false) => 0xa9, // vfmadd213
             (false, true) => 0xab,  // vfmsub213
             (true, false) => 0xad,  // vfnmadd213
             (true, true) => 0xaf,   // vfnmsub213
         };
+        if let Some((t, base, off)) = self.mem_load.take() {
+            // one operand comes from memory ([base + off], its Load folded here; AVX only)
+            let (rb, disp) = self.base_disp(options, base, R11, off);
+            let xd = self.def_fx(d, XS);
+            if t == c {
+                // 213: t = a (d's register unless that holds b), vvvv = b, r/m = [c]
+                let xa = self.use_fx(a, XS);
+                let xb = self.use_fx(b, XS2);
+                let r = if xd == xa || xd != xb { xd } else { XS };
+                self.a.movf_rr(true, r, xa);
+                self.a.vex_m_fma(w, op, r, xb, rb, disp);
+                self.a.movf_rr(true, xd, r);
+                self.fin_f(d, xd);
+                return;
+            }
+            // a factor from memory (the product commutes): the other factor f
+            let f = if t == b { a } else { b };
+            let xf = self.use_fx(f, XS);
+            let xc = self.use_fx(c, XS2);
+            if xd == xc && xd != xf {
+                // 231: d (= c) += f * [m]
+                self.a.vex_m_fma(w, op + 0x10, xd, xf, rb, disp);
+            } else {
+                // 132: r = f; r = r * [m] + c
+                let r = if xd == xf || xd != xc { xd } else { XS };
+                self.a.movf_rr(true, r, xf);
+                self.a.vex_m_fma(w, op - 0x10, r, xc, rb, disp);
+                self.a.movf_rr(true, xd, r);
+            }
+            self.fin_f(d, xd);
+            return;
+        }
         if self.avx {
             // the same operand placement as below (a in the destination, b in vvvv, c in r/m), with
             // the destination register t = d's own (unless that is b's or c's) or XS: no xmm0 /
@@ -4733,6 +4954,24 @@ impl<'a> Gen<'a> {
                 l => panic!("x64 fma: c at {:?}", l),
             };
             let xd = self.def_fx(d, XS);
+            // d in c's register (an accumulation: the allocator hints d to c): vfmadd231 d, a, b
+            // (d = a * b + d); d in b's: 213 with a and b swapped (the product commutes). Only a
+            // NaN result's payload choice among several NaN inputs differs from the 213 form, which
+            // Rust leaves unspecified (LLVM picks the form by register too).
+            if xd != xa && mc.is_none() && xd == xc && xd != xb {
+                self.a.vex_rr_any(1, 2, w, op + 0x10, xd, xa, xb);
+                self.fin_f(d, xd);
+                return;
+            }
+            if xd != xa && xd == xb && (mc.is_some() || xd != xc) {
+                if let Some(disp) = mc {
+                    self.a.vex_m_fma(w, op, xd, xa, RBP, disp);
+                } else {
+                    self.a.vex_rr_any(1, 2, w, op, xd, xa, xc);
+                }
+                self.fin_f(d, xd);
+                return;
+            }
             let t = if xd == xa || (xd != xb && (mc.is_some() || xd != xc)) { xd } else { XS };
             // t is written with a first: it must not hold b or c unless it holds a (the same value)
             assert!(t == xa || (t != xb && (mc.is_some() || t != xc)), "x64 fma: destination {} vs a {} b {} c {}", t, xa, xb, xc);
@@ -5014,12 +5253,15 @@ impl<'a> Gen<'a> {
                 self.fin_i(d, rd);
             }
             Conv::IntToF(from, to64) => {
-                let rs = self.use_i(options, s, R10);
+                // a spilled value loads straight into rax (the u64 path works there)
+                let rs = self.use_i(options, s, RAX);
                 let xd = self.def_f(d, XS);
                 let pfx = if to64 { 0xf2 } else { 0xf3 };
                 if from.bits == 64 && !from.signed {
                     // u64 -> float: if negative as i64, halve with sticky bit, convert, double
-                    self.a.mov_rr(RAX, rs);
+                    if rs != RAX {
+                        self.a.mov_rr(RAX, rs);
+                    }
                     self.a.test_rr(RAX, RAX);
                     let p = self.a.jcc32(0x8); // js
                     self.a.break_dep(xd, 0xff);
@@ -5752,6 +5994,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         tail: Vec::new(),
         text_len: 0,
         mem_const: None,
+        mem_load: None,
         test_fuse: None,
         bt_fuse: None,
         load_fuse: None,

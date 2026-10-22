@@ -902,14 +902,32 @@ impl<'a> Gen<'a> {
     fn def_i(&self, v: VReg, scratch: u8) -> u8 {
         match self.al.loc[v.0 as usize] {
             Loc::Reg(r) => r,
+            // a window that starts at this definition (regalloc def windows): computed into its
+            // register, which keeps the value after fin_i stores it home
+            Loc::Stack(_) => self.win.get(&v.0).and_then(|ws| ws.iter().find(|w| w.0 == self.cur_pos + 1)).map_or(scratch, |w| w.2),
             _ => scratch,
         }
     }
     fn fin_i(&mut self, v: VReg, r: u8) {
         if let Loc::Stack(o) = self.al.loc[v.0 as usize] {
+            // nobody reads this store home (Alloc::store_skip): the window's register only
+            if self.al.store_skip.contains(&(self.cur_pos, v.0)) {
+                self.def_win_copy(v, r);
+                return;
+            }
             let off = self.spill_sp(o);
             self.a.ldst(STRX, 8, r, SP, off);
             self.last_spill = Some((off, r, self.a.pos()));
+            self.def_win_copy(v, r);
+        }
+    }
+    /// A window that starts at this definition (def windows, regions over redefining blocks)
+    /// holds the result: computed elsewhere (a scratch), it is copied there.
+    fn def_win_copy(&mut self, v: VReg, r: u8) {
+        if let Some(c) = self.win.get(&v.0).and_then(|ws| ws.iter().find(|w| w.0 == self.cur_pos + 1)).map(|w| w.2) {
+            if c != r {
+                self.a.mov(c, r);
+            }
         }
     }
     fn use_f(&mut self, v: VReg, scratch: u8) -> u8 {
@@ -1153,6 +1171,9 @@ impl<'a> Gen<'a> {
             // nor flags: the previous block's terminator (a fused cmp + b.cond) or another
             // predecessor set them, not the compare a select chain was started for
             self.sel_chain = None;
+            // window lookups of this block never see the previous block's last position (an empty
+            // block's terminator reads at its start: no window there, the slot is read)
+            self.cur_pos = self.al.block_start[bi];
             for (ii, inst) in b.insts.iter().enumerate() {
                 self.pc_map.push(((self.a.pos() * 4) as u32, b.pos[ii]));
                 self.cur_pos = self.al.inst_pos(bi, ii);
@@ -1235,6 +1256,18 @@ impl<'a> Gen<'a> {
             // a sibling call ended the block: its Ret is the callee's
             if self.tail.get(bi).is_some_and(|t| t.is_some()) {
                 continue;
+            }
+            // region windows entered from here: loaded before the terminator (regalloc edge loads)
+            if matches!(b.term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..)) {
+                let tp = self.al.block_end[bi] - 1;
+                if let Some(ls) = self.win_start.get(&tp).cloned() {
+                    for (v, r) in ls {
+                        if let Loc::Stack(o) = self.al.loc[v as usize] {
+                            let off = self.spill_sp(o);
+                            self.a.ldst(LDRX, 8, r, SP, off);
+                        }
+                    }
+                }
             }
             self.pc_map.push(((self.a.pos() * 4) as u32, b.term_pos));
             let fuse_inst = if fused { Some(b.insts[n - 1].clone()) } else { None };
@@ -3375,8 +3408,11 @@ impl<'a> Gen<'a> {
                     // straight between a register and a spill slot
                     match (self.al.loc[d.0 as usize], self.al.loc[s.0 as usize]) {
                         (Loc::Stack(o), Loc::Reg(r)) => {
-                            let off = self.spill_sp(o);
-                            self.a.ldst(STRX, 8, r, SP, off);
+                            if !self.al.store_skip.contains(&(self.cur_pos, d.0)) {
+                                let off = self.spill_sp(o);
+                                self.a.ldst(STRX, 8, r, SP, off);
+                            }
+                            self.def_win_copy(*d, r);
                         }
                         (Loc::Reg(r), Loc::Stack(o)) => {
                             let off = self.spill_sp(o);
@@ -4726,7 +4762,7 @@ mod tests {
 
     /// A branch on one bit (`x & 1 << k` against zero) is tbz / tbnz, for bits in either word;
     /// past their +-32 KB range the function is emitted again with tst + b.cond, and both
-    /// versions take the right side.
+    /// versions take the right side (run on arm64 hosts).
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn single_bit_branches_use_tbz_and_fall_back_past_its_range() {
@@ -4760,6 +4796,10 @@ mod tests {
             let w: Vec<u32> = r.code[..r.text_len as usize].chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             let has_tbz = w.iter().any(|x| x & 0x7E00_0000 == 0x3600_0000);
             assert_eq!(has_tbz, filler == 0, "bit {bit} filler {filler}: tbz {has_tbz}");
+            // the code is arm64: it runs only on an arm64 host (an x64 host checks the encoding only)
+            if !cfg!(target_arch = "aarch64") {
+                continue;
+            }
             let code = crate::exec::Code::new(&r.code).unwrap();
             let run: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
             let x = 0x5a5a_0000_0000_1234u64 & !(1u64 << bit);

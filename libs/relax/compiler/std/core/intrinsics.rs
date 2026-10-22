@@ -15,6 +15,8 @@ pub mod intrinsics {
         pub fn trunc_f32(x: f32) -> f32;
         pub fn rint_f64(x: f64) -> f64;
         pub fn rint_f32(x: f32) -> f32;
+        pub fn round_f64(x: f64) -> f64;
+        pub fn round_f32(x: f32) -> f32;
         pub fn fabs_f64(x: f64) -> f64;
         pub fn fabs_f32(x: f32) -> f32;
         pub fn fmin_f64(x: f64, y: f64) -> f64;
@@ -301,7 +303,7 @@ pub mod intrinsics_vx {
         pub fn vx_store<T>(p: *mut u8, a: T);
         pub fn vx_narrow<T, U>(a: T, op: u32) -> U;
         pub fn vx_table<T, U>(a: T, b: U) -> T;
-        pub fn vx_mask<T>(a: T) -> i32;
+        pub fn vx_mask<T>(a: T, width: u32) -> i32;
         pub fn vx_blend<T>(a: T, b: T, mask: T) -> T;
     }
 }
