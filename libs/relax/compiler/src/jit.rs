@@ -7324,18 +7324,29 @@ fn note_slow_base(u: &Unit, id: u32) {
     TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime, &u.prog.session.options));
 }
 
-/// The first O3 worker's poll (no lock held): SLOW_BASE's O2 builds.
+/// The first O3 worker's poll (no lock held): SLOW_BASE's O2 builds, and (at most once a second)
+/// the parked counting entries whose counted code is gone.
 fn drain_slow_base() {
+    static LAST_FORGET: AtomicU64 = AtomicU64::new(0);
     let ids = std::mem::take(&mut *SLOW_BASE.lock().unwrap_or_else(|e| e.into_inner()));
+    let now = wall_ns();
+    let forget = now.saturating_sub(LAST_FORGET.load(Ordering::Relaxed)) >= PGO_WORK_NS
+        && COUNTING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|e| e.parked);
     let up = TIER_UNIT.load(Ordering::Acquire);
-    if ids.is_empty() || up.is_null() {
+    if ids.is_empty() && !forget || up.is_null() {
         return;
+    }
+    if forget {
+        LAST_FORGET.store(now, Ordering::Relaxed);
     }
     owner::call(owner::Class::Background, || unsafe {
         for id in ids {
             if (id as usize) < (&*up).fns.len() {
                 base_running(up, id);
             }
+        }
+        if forget {
+            pgo_forget(&*up);
         }
     });
 }
@@ -11185,7 +11196,7 @@ fn o3_progress_write(last: &mut std::time::Instant) {
     *last = std::time::Instant::now();
     // (PGO: slots in their counting window are O3 builds to come)
     let pending = TIER_QUEUE.lock().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len()) + usize::from(startup_holds_tier1())
-        + COUNTING.lock().map_or(0, |c| c.len());
+        + COUNTING.lock().map_or(0, |c| c.iter().filter(|e| !e.parked).count());
     let line = format!("{} {}\n", pending, TIER1_INSTALLS.load(Ordering::Relaxed));
     let tmp = format!("{}.tmp", path);
     if std::fs::write(&tmp, line).is_ok() {
@@ -11599,7 +11610,9 @@ fn rt_loop_hot(counter: u64, fp: u64) {
             let Some(c) = found else { break };
             if c != at {
                 let st = (*tier_rec(&u.slots, c).add(3)).load(Ordering::Relaxed);
-                if st == T_QUEUED {
+                // a lukewarm slot in its counting window: the loop under it is its work (credited:
+                // pgo_poll ends its window); any other slot that turned hot ends the walk
+                if st == T_QUEUED && !pgo_credit(c) {
                     break;
                 }
                 queue_loop(u, c, rate);
@@ -11637,6 +11650,12 @@ const LOOP_CALLERS: usize = 64;
 /// UI everything called once per frame reached 2000 within a minute and O3 never went
 /// quiet (Stage playing P(DOOM): 3 O3 threads busy at 90 s).
 const CALL_WINDOW_NS: u64 = 1_000_000_000;
+/// TIER1_CALLS calls within this: hot without the counted window's evidence of work (lukewarm)
+const CALL_FAST_NS: u64 = 10_000_000;
+/// O1 code at most this big tiers up on its call rate alone, with no counted evidence of work
+/// (a 12-byte `as_ptr` shows little, and a O1 kernel calling it then stayed 6x rustc --
+/// bench_rt rc_refcell); its build is cheap either way
+const SMALL_CODE: u64 = 256;
 const T_COUNTING: u64 = 1;
 const T_QUEUED: u64 = 2;
 // A loop counter cannot queue a recorded instance before its first call.
@@ -12492,8 +12511,33 @@ const PGO_MS: u64 = 250;
 const PGO_IDLE_MS: u64 = 2000;
 /// how often the first O3 worker looks at the counting slots while there are any
 const PGO_POLL: std::time::Duration = std::time::Duration::from_millis(5);
-/// slots running counted code: (slot, counters, installed at wall_ns)
-static COUNTING: relax_session::sync::Mutex<Vec<(u32, &'static [AtomicU64], u64)>> = relax_session::sync::Mutex::new(Vec::new());
+/// A slot running counted code.
+struct Counting {
+    id: u32,
+    counters: &'static [AtomicU64],
+    /// instructions per block (the work a block's count stands for)
+    weights: &'static [u32],
+    /// installed at wall_ns
+    at: u64,
+    /// its calls came at a rate that says nothing about its CPU (rt_hot: not within CALL_FAST_NS,
+    /// bigger than SMALL_CODE): O3 only once the counts show it working (PGO_MIN_WORK)
+    lukewarm: bool,
+    /// (work, wall_ns) at the start of the current work window
+    mark: (u64, u64),
+    /// a lukewarm slot whose last window showed too little work: it stays in its counted code
+    /// (not pending for O3_PROGRESS, looked at on the usual poll)
+    parked: bool,
+    /// a hot loop ran under one of its frames (rt_loop_hot): the work is its callees'
+    credited: bool,
+}
+/// slots running counted code
+static COUNTING: relax_session::sync::Mutex<Vec<Counting>> = relax_session::sync::Mutex::new(Vec::new());
+/// A lukewarm slot's counted code goes to O3 once a window of at least PGO_MS shows this many
+/// RIR instructions per second of its own code (~0.05% of a core; its callees are not in its counts); a window of PGO_WORK_NS with less parks it.
+/// The counted tier's measurement replaces the sampler's CPU samples, which made the same call
+/// ("many calls, little CPU: a O3 build would cost more than it saves").
+const PGO_MIN_WORK: u64 = 1_000_000;
+const PGO_WORK_NS: u64 = 1_000_000_000;
 /// counted builds installed, their build CPU ns, dropped (not built or not installed)
 pub static PGO_STATS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
@@ -12501,39 +12545,91 @@ pub static PGO_STATS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), At
 fn pgo_poll() {
     let now = wall_ns();
     let mut ready: Vec<(u32, u64)> = Vec::new();
+    let mut parked_now: Vec<u32> = Vec::new();
     {
         let mut g = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_empty() {
             return;
         }
-        g.retain(|&(id, ctr, at)| {
+        g.retain_mut(|e| {
+            let ctr = e.counters;
             let entries = ctr.first().map_or(0, |c| c.load(Ordering::Relaxed));
+            let el = now.saturating_sub(e.at);
+            let rate = (entries as u128 * 1_000_000_000 / el.max(1) as u128).min(u64::MAX as u128) as u64;
+            if e.lukewarm && e.credited {
+                ready.push((e.id, rate));
+                return false;
+            }
+            if e.lukewarm {
+                // (a parked slot is looked at once per PGO_WORK_NS window)
+                let win = now.saturating_sub(e.mark.1);
+                if win < if e.parked { PGO_WORK_NS } else { PGO_MS * 1_000_000 } {
+                    return true;
+                }
+                let work: u64 = ctr.iter().zip(e.weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
+                let per_s = ((work - e.mark.0.min(work)) as u128 * 1_000_000_000 / win as u128) as u64;
+                if per_s >= PGO_MIN_WORK {
+                    ready.push((e.id, rate));
+                    return false;
+                }
+                if win >= PGO_WORK_NS {
+                    e.mark = (work, now);
+                    if !e.parked {
+                        e.parked = true;
+                        parked_now.push(e.id);
+                    }
+                }
+                return true;
+            }
             let mut sum = 0u64;
             for c in ctr {
                 sum = sum.saturating_add(c.load(Ordering::Relaxed));
                 if sum >= PGO_BLOCKS { break; }
             }
-            let el = now.saturating_sub(at);
             let done = entries >= PGO_ENTRIES || sum >= PGO_BLOCKS || (sum > 0 && el >= PGO_MS * 1_000_000) || el >= PGO_IDLE_MS * 1_000_000;
             if done {
-                ready.push((id, (entries as u128 * 1_000_000_000 / el.max(1) as u128).min(u64::MAX as u128) as u64));
+                ready.push((e.id, rate));
             }
             !done
         });
+    }
+    if tier1_trace() {
+        for id in &parked_now {
+            eprintln!("O3c @{:.3} #{} parked in counted code (under {} insts/s)", now as f64 / 1e9, id, PGO_MIN_WORK);
+        }
     }
     for (id, rate) in ready {
         tier_push(id, Q_PROFILED, rate);
     }
 }
 
+/// A hot loop ran under a frame of slot `id` (rt_loop_hot, no unit lock): true if `id` is a
+/// lukewarm counting slot, whose window that credit ends.
+fn pgo_credit(id: u32) -> bool {
+    let mut g = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
+    match g.iter_mut().find(|e| e.id == id && e.lukewarm) {
+        Some(e) => {
+            e.credited = true;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Some slot's counting window is open (parked slots are not waited for).
 fn pgo_counting() -> bool {
-    !COUNTING.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    COUNTING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|e| !e.parked)
+}
+
+/// The counting entries of slots whose counted code is gone (patched, rebuilt): dropped (unit read).
+fn pgo_forget(u: &Unit) {
+    COUNTING.lock().unwrap_or_else(|e| e.into_inner()).retain(|e| !e.parked || u.frequency_profiles.contains_key(&e.id));
 }
 
 /// Slot `id` turned hot: builds and installs its counted code (O3 worker). False: no counted build
 /// for it (not a plain instance or closure, no RIR, already counted, PGO off, or it failed) -- its
 /// O3 build goes ahead now.
-unsafe fn counted_build(up: *mut Unit, id: u32) -> bool {
+unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
     let session = (*std::ptr::addr_of!((*up).prog.session)).clone();
     let options = &session.options;
     if !pgo_on(options) {
@@ -12638,7 +12734,9 @@ unsafe fn counted_build(up: *mut Unit, id: u32) -> bool {
                 });
                 crate::zone_alloc::kept_with(|| {
                     u.frequency_profiles.insert(id, profile);
-                    COUNTING.lock().unwrap_or_else(|e| e.into_inner()).push((id, counters, wall_ns()));
+                    let weights: &'static [u32] = Box::leak(rir.blocks.iter().map(|b| b.insts.len() as u32 + 1).collect::<Vec<_>>().into_boxed_slice());
+                    let at = wall_ns();
+                    COUNTING.lock().unwrap_or_else(|e| e.into_inner()).push(Counting { id, counters, weights, at, lukewarm, mark: (0, at), parked: false, credited: false });
                 });
                 true
             }
@@ -12765,7 +12863,7 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
         // build (the first worker's poll alone waited out its own builds: hot slots came out of
         // the window one at a time behind a long O3 build)
         pgo_poll();
-        let (id, why, queued_at, _) = {
+        let (id, why, queued_at, rate) = {
             let mut q = TIER_QUEUE.lock().unwrap();
             loop {
                 if TIER_STOP.load(Ordering::SeqCst) { return; }
@@ -12810,8 +12908,16 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
         let _job = compile_job();
         if why == Q_CALLS || why == Q_LOOP {
             owner::call(owner::Class::Background, || unsafe { o2_hot(up, id) });
+            // calls that came slower than CALL_FAST_NS into code bigger than SMALL_CODE: lukewarm
+            // until its counts show the work (a hot loop under it queues it as Q_LOOP instead)
+            let lukewarm = why == Q_CALLS && unsafe {
+                let u = &*up;
+                let calls = u.tier1.as_ref().map_or(0, |t| t.calls);
+                (rate as u128) * (CALL_FAST_NS as u128) < (calls as u128) * 1_000_000_000
+                    && (*tier_rec(&u.slots, id).add(5)).load(Ordering::Relaxed) & !REARMED > SMALL_CODE
+            };
             // PGO: its counted build first; the O3 build follows once that code has run
-            if unsafe { counted_build(up, id) } {
+            if unsafe { counted_build(up, id, lukewarm) } {
                 continue;
             }
         }
