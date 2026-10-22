@@ -1646,7 +1646,7 @@ impl<'a> Gen<'a> {
                     }
                 }
                 // a float Load used once, by the next instruction: an AVX FBin's second operand
-                // (either operand of a commutative op) or an FMA's addend / factor, read straight
+                // (either operand of a commutative op) or an FMA's addend / factor a, read straight
                 // from memory (vmulss xd, xa, [base + off]; vfmadd213ss xd, xb, [base + off])
                 if let Inst::Load(m @ (Mem::F32 | Mem::F64), t, base, off) = inst {
                     if self.avx && self.al.uses[t.0 as usize] == 1 && ii + 1 < n && !(fused && ii + 1 == n - 1) {
@@ -1655,7 +1655,9 @@ impl<'a> Gen<'a> {
                             Inst::FBin(op @ (FOp::Add | FOp::Sub | FOp::Mul | FOp::Div), w2, _, x, y) => {
                                 *w2 == w && ((y == t && x != t) || (matches!(op, FOp::Add | FOp::Mul) && x == t && y != t))
                             }
-                            Inst::FMulAdd(_, _, w2, _, a, b2, c) => *w2 == w && [*a, *b2, *c].iter().filter(|v| **v == *t).count() == 1,
+                            // not b: the forms reading memory as a factor (231, 132) put it second, and
+                            // b must stay the first factor (a NaN result is b's first: rir::fma_nan_f32)
+                            Inst::FMulAdd(_, _, w2, _, a, b2, c) => *w2 == w && *b2 != *t && [*a, *c].iter().filter(|v| **v == *t).count() == 1,
                             // vinsertps xd, xv, [m], lane << 4
                             Inst::VInsert(_, _, _, s2) => !w && s2 == t,
                             _ => false,
@@ -4470,19 +4472,25 @@ impl<'a> Gen<'a> {
                     (true, false) => 4,
                     (true, true) => 6,
                 };
+                // b stays the first factor, a the second (a NaN lane is b's, a's, then c's first:
+                // rir::fma_nan_f32, as the scalar forms)
                 if xd != xa && xd != xb {
-                    // d = c; d (+-)= a*b: vf..231ps
+                    // d = c; d (+-)= b*a: vf..231ps d, b, a
                     if xd != xc {
                         self.a.vex_l(0, 1, false, true, 0x28, xd, 0, xc);
                     }
-                    self.a.vex_l(1, 2, false, true, 0xb8 + k, xd, xa, xb);
+                    self.a.vex_l(1, 2, false, true, 0xb8 + k, xd, xb, xa);
                 } else if xd != xc {
-                    // d is a factor: vf..213ps d, other, c (d = d*other +- c)
-                    let other = if xd == xa { xb } else { xa };
-                    self.a.vex_l(1, 2, false, true, 0xa8 + k, xd, other, xc);
+                    if xd == xa {
+                        // d is a: vf..213ps d, b, c (d = b*d +- c)
+                        self.a.vex_l(1, 2, false, true, 0xa8 + k, xd, xb, xc);
+                    } else {
+                        // d is b: vf..132ps d, c, a (d = d*a +- c)
+                        self.a.vex_l(1, 2, false, true, 0x98 + k, xd, xc, xa);
+                    }
                 } else {
                     self.a.vex_l(0, 1, false, true, 0x28, 0, 0, xc);
-                    self.a.vex_l(1, 2, false, true, 0xb8 + k, 0, xa, xb);
+                    self.a.vex_l(1, 2, false, true, 0xb8 + k, 0, xb, xa);
                     self.a.vex_l(0, 1, false, true, 0x28, xd, 0, 0);
                 }
                 self.fin_f(d, xd);
@@ -4585,7 +4593,9 @@ impl<'a> Gen<'a> {
                         (true, false) => 0xbc,
                         (true, true) => 0xbe,
                     };
-                    self.a.vex_rr(1, 2, false, op, xd0, xa, xb);
+                    // vf..231ps d, b, a: b the first factor (a NaN lane: b's, a's, then c's;
+                    // rir::fma_nan_f32)
+                    self.a.vex_rr(1, 2, false, op, xd0, xb, xa);
                     self.fin_f(d, xd0);
                     return;
                 }
@@ -4596,7 +4606,7 @@ impl<'a> Gen<'a> {
                     (true, false) => 0xbc,
                     (true, true) => 0xbe,
                 };
-                self.a.vex_rr(1, 2, false, op, 0, xa, xb); // vf[n]m{add,sub}231ps xmm0, a, b
+                self.a.vex_rr(1, 2, false, op, 0, xb, xa); // vf[n]m{add,sub}231ps xmm0, b, a
                 let xd = self.def_f(d, XS);
                 self.a.movf_rr(true, xd, 0);
                 self.fin_f(d, xd);
@@ -4899,7 +4909,11 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// Fused multiply-add (FMA3, one rounding): xmm0 = c, then vf[n]m{add,sub}231 xmm0, a, b.
+    /// Fused multiply-add (FMA3, one rounding). Every form keeps b as the first factor, a as the
+    /// second and c as the addend: a NaN result is then the first NaN of b, a, c, whatever the
+    /// registers (rir::fma_nan_f32; the C library's fmaf, what rustc calls without the fma
+    /// feature). 213 = vvvv * d + r/m (d holds a), 231 = vvvv * r/m + d (d holds c), 132 =
+    /// d * r/m + vvvv (d holds b); a memory operand is c (213) or a (231, 132), never b.
     #[allow(clippy::too_many_arguments)]
     fn fma(&mut self, options: &relax_session::Options, neg_prod: bool, neg_add: bool, w: bool, d: VReg, a: VReg, b: VReg, c: VReg) {
         let op = match (neg_prod, neg_add) {
@@ -4923,15 +4937,15 @@ impl<'a> Gen<'a> {
                 self.fin_f(d, xd);
                 return;
             }
-            // a factor from memory (the product commutes): the other factor f
-            let f = if t == b { a } else { b };
-            let xf = self.use_fx(f, XS);
+            // a from memory (b never is: the fold's guard): b * [a] + c
+            debug_assert!(t == a && t != b);
+            let xf = self.use_fx(b, XS);
             let xc = self.use_fx(c, XS2);
             if xd == xc && xd != xf {
-                // 231: d (= c) += f * [m]
+                // 231: d (= c) += b * [a]
                 self.a.vex_m_fma(w, op + 0x10, xd, xf, rb, disp);
             } else {
-                // 132: r = f; r = r * [m] + c
+                // 132: r = b; r = r * [a] + c
                 let r = if xd == xf || xd != xc { xd } else { XS };
                 self.a.movf_rr(true, r, xf);
                 self.a.vex_m_fma(w, op - 0x10, r, xc, rb, disp);
@@ -4959,21 +4973,16 @@ impl<'a> Gen<'a> {
                 l => panic!("x64 fma: c at {:?}", l),
             };
             let xd = self.def_fx(d, XS);
-            // d in c's register (an accumulation: the allocator hints d to c): vfmadd231 d, a, b
-            // (d = a * b + d); d in b's: 213 with a and b swapped (the product commutes). Only a
-            // NaN result's payload choice among several NaN inputs differs from the 213 form, which
-            // Rust leaves unspecified (LLVM picks the form by register too).
+            // d in c's register (an accumulation: the allocator hints d to c): vfmadd231 d, b, a
+            // (d = b * a + d); d in b's: 132 d, c, a (d = d * a + c). No move either way, and the
+            // factors keep their places (b first: the NaN rule above).
             if xd != xa && mc.is_none() && xd == xc && xd != xb {
-                self.a.vex_rr_any(1, 2, w, op + 0x10, xd, xa, xb);
+                self.a.vex_rr_any(1, 2, w, op + 0x10, xd, xb, xa);
                 self.fin_f(d, xd);
                 return;
             }
-            if xd != xa && xd == xb && (mc.is_some() || xd != xc) {
-                if let Some(disp) = mc {
-                    self.a.vex_m_fma(w, op, xd, xa, RBP, disp);
-                } else {
-                    self.a.vex_rr_any(1, 2, w, op, xd, xa, xc);
-                }
+            if xd != xa && xd == xb && mc.is_none() && xd != xc {
+                self.a.vex_rr_any(1, 2, w, op - 0x10, xd, xc, xa);
                 self.fin_f(d, xd);
                 return;
             }
