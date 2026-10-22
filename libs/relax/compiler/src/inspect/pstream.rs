@@ -217,8 +217,77 @@ fn detail(b: u64) -> &'static str {
     unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p as *const u8, n)) }
 }
 
+/// The stream's CPU stack sampler (open args `hz=N [ev=cpu|cycles|instructions|...]`): one thread
+/// per viewer samples every program thread in 250 ms windows (inspect prof) and hands the
+/// expanded stacks (JIT inline levels as frames, tier per frame) to the viewer's thread.
+struct Sampler {
+    queue: std::sync::Arc<Mutex<Vec<(u64, u64, Vec<super::calltree::XFrame>, u64)>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ev: u8,
+    /// ns of CPU one CPU-time sample stands for
+    ns_per: u64,
+}
+
+impl Drop for Sampler {
+    fn drop(&mut self) {
+        self.stop.store(true, Relaxed);
+    }
+}
+
+fn start_sampler(args: &str) -> Option<Sampler> {
+    let get = |k: &str| args.split_whitespace().find_map(|a| a.strip_prefix(k)).map(str::to_string);
+    let hz = get("hz=").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0).min(4000);
+    if hz == 0 {
+        return None;
+    }
+    let ev = super::prof::Ev::parse(&get("ev=").unwrap_or_else(|| "cpu".into())).unwrap_or(super::prof::Ev::Cpu);
+    let queue = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (q, st) = (queue.clone(), stop.clone());
+    let _k = crate::zone_alloc::kept();
+    std::thread::Builder::new()
+        .name("run-inspect-psamp".into())
+        .spawn(move || {
+            super::heap::exclude_this_thread();
+            while !st.load(Relaxed) {
+                let run = super::prof::collect_ev(0.25, hz, ev, &|_| true, &|| st.load(Relaxed));
+                let mut partial = Vec::new();
+                let v = super::calltree::expanded_raw(&run, &mut partial);
+                let mut g = q.lock().unwrap_or_else(|e| e.into_inner());
+                // a viewer that stopped reading: keep the newest 64k samples
+                if g.len() > 1 << 16 {
+                    let n = g.len() - (1 << 16);
+                    g.drain(..n);
+                }
+                g.extend(v);
+            }
+        })
+        .ok()?;
+    let ev_code = match ev {
+        super::prof::Ev::Cpu => 0,
+        super::prof::Ev::Cycles => 1,
+        super::prof::Ev::Instructions => 2,
+        super::prof::Ev::BranchMisses => 3,
+        super::prof::Ev::CacheMisses => 4,
+    };
+    Some(Sampler { queue, stop, ev: ev_code, ns_per: 1_000_000_000 / hz.max(1) })
+}
+
+fn tier_code(t: &str) -> u8 {
+    match t {
+        "native" => ps::tier::NATIVE,
+        "baseline" => ps::tier::BASELINE,
+        "O1" => ps::tier::O1,
+        "O2" => ps::tier::O2,
+        "inl" => ps::tier::INLINED,
+        t if t.starts_with("O3") => ps::tier::O3,
+        _ => ps::tier::OTHER,
+    }
+}
+
 fn serve(ch: &makepad_remote::Channel, args: &str) {
     let gpu_on = !args.split_whitespace().any(|a| a == "gpu=0");
+    let sampler = start_sampler(args);
     let mut strings = ps::Interner::default();
     // (label ptr, len, detail word) -> string id: one hash lookup per record, no formatting
     let mut by_ptr: std::collections::HashMap<(u64, u16, u64), u32> = std::collections::HashMap::new();
@@ -242,6 +311,8 @@ fn serve(ch: &makepad_remote::Channel, args: &str) {
     let mut last_clock = std::time::Instant::now();
     let mut names: Vec<(u64, String)> = Vec::new();
     let mut recs: Vec<ps::SpanRec> = Vec::new();
+    // threads that sent samples but have no timeline ring: (os id, stream tid)
+    let mut extra_lanes: Vec<(u64, u32)> = Vec::new();
     loop {
         // the viewer closed the channel
         match ch.try_recv() {
@@ -348,6 +419,40 @@ fn serve(ch: &makepad_remote::Channel, args: &str) {
                 new_threads.push(ps::thread_payload(gpu_tid, 0, 0, ps::role::GPU, sid));
             }
         }
+        // CPU stack samples (hz=): per thread one SAMPLES batch; a thread without a lane gets one
+        let mut samples: Vec<Vec<u8>> = Vec::new();
+        if let Some(sm) = &sampler {
+            let got: Vec<(u64, u64, Vec<super::calltree::XFrame>, u64)> = std::mem::take(&mut *sm.queue.lock().unwrap_or_else(|e| e.into_inner()));
+            let mut per: Vec<(u32, Vec<ps::SampleRec>)> = Vec::new();
+            for (os_id, t, frames, w) in got {
+                let tid = match known.iter().find(|k| k.ring.os_id == os_id).map(|k| k.tid).or_else(|| extra_lanes.iter().find(|x| x.0 == os_id).map(|x| x.1)) {
+                    Some(t) => t,
+                    None => {
+                        let tid = next_tid;
+                        next_tid += 1;
+                        if names.iter().all(|n| n.0 != os_id) {
+                            let mut list = super::threads::list();
+                            super::name_handles(&mut list);
+                            names = list.iter().map(|t| (t.os_id, t.name.clone())).collect();
+                        }
+                        let name = names.iter().find(|n| n.0 == os_id).map(|n| n.1.clone()).unwrap_or_default();
+                        let sid = strings.id(&name);
+                        new_threads.push(ps::thread_payload(tid, os_id, 0, role_of(0, &name), sid));
+                        extra_lanes.push((os_id, tid));
+                        tid
+                    }
+                };
+                let rec = ps::SampleRec { t: map(t), weight: if sm.ev == 0 { w * sm.ns_per } else { w }, frames: frames.iter().map(|f| (strings.id(&f.name), tier_code(&f.tier))).collect() };
+                match per.iter_mut().find(|x| x.0 == tid) {
+                    Some(x) => x.1.push(rec),
+                    None => per.push((tid, vec![rec])),
+                }
+            }
+            for (tid, mut v) in per {
+                v.sort_by_key(|r| r.t);
+                samples.push(ps::samples_payload(tid, sm.ev, &v));
+            }
+        }
         // the message: strings first (every id below refers to them), then lanes, then data
         if let Some(s) = strings.take_new() {
             ps::record(&mut body, ps::kind::STRINGS, &s);
@@ -365,6 +470,9 @@ fn serve(ch: &makepad_remote::Channel, args: &str) {
         }
         if !jit.is_empty() {
             ps::record(&mut body, ps::kind::JIT, &ps::jit_payload(&jit));
+        }
+        for p in &samples {
+            ps::record(&mut body, ps::kind::SAMPLES, p);
         }
         for (lane, lost) in drops {
             ps::record(&mut body, ps::kind::DROP, &ps::drop_payload(lane, lost));
