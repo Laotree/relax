@@ -112,6 +112,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     }
     u.prog.own_crates = own.clone();
     errors.extend(u.prog.strict_import_errors(&own));
+    errors.extend(relax_types::lint::import_resolution_diags(&mut u.prog, &own));
     // every checked definition's signature, on MAKEPAD_RUN_JOBS threads (queries over the shared
     // context); errors in definition order
     {
@@ -133,6 +134,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     errors.extend(relax_types::item_checks::private_assoc_types(&u.prog, &u.tcx, &own));
     errors.extend(relax_types::item_checks::gated_syntax(&u.prog, &own));
     errors.extend(relax_types::item_checks::node_attribute_targets(&u.prog, &own));
+    errors.extend(relax_types::item_checks::param_attributes(&u.prog, &own));
     errors.extend(relax_types::item_checks::foreign_blocks(&u.prog, &own));
     errors.extend(relax_types::item_checks::duplicate_symbols(&u.prog, &own));
     errors.extend(relax_types::item_checks::global_allocators_and_lang_items(&u.prog, &own));
@@ -509,11 +511,11 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     unsafe { crate::jit::backend_bench(up) };
     if std::env::var("MAKEPAD_RUN_PASS_TIMES").is_ok() || std::env::var("MAKEPAD_RUN_OPT_HIST").is_ok() {
         let mut passes = String::new();
-        for i in 0..crate::opt::PASS_NAMES.len() {
-            passes.push_str(&format!("{} {:.0}  ", crate::opt::PASS_NAMES[i], crate::opt::PASS_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6));
+        for i in 0..relax_backend::stats::PASS_NAMES.len() {
+            passes.push_str(&format!("{} {:.0}  ", relax_backend::stats::PASS_NAMES[i], relax_backend::stats::PASS_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6));
         }
         eprintln!("makepad check: passes (cpu ms): {}", passes);
-        eprintln!("makepad check: opt ms by size (<16,<64,<256,<1k,<4k,more) {:?} fns {:?}", crate::opt::HIST[..6].iter().map(|x| x.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000).collect::<Vec<_>>(), crate::opt::HIST[6..].iter().map(|x| x.load(std::sync::atomic::Ordering::Relaxed)).collect::<Vec<_>>());
+        eprintln!("makepad check: opt ms by size (<16,<64,<256,<1k,<4k,more) {:?} fns {:?}", relax_codegen::opt::HIST[..6].iter().map(|x| x.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000).collect::<Vec<_>>(), relax_codegen::opt::HIST[6..].iter().map(|x| x.load(std::sync::atomic::Ordering::Relaxed)).collect::<Vec<_>>());
     }
     let _ = checked;
     crate::relaxed::finish_check();
@@ -763,11 +765,13 @@ fn eval_items(up: *mut Unit, own: &[bool]) {
     }
 }
 
-/// rustc's collect_and_partition_mono_items for a binary, reduced to its constants: every
-/// instance of the checked crates' fns reachable from `main` is lowered (not compiled), which
-/// evaluates the constants it names with its type arguments; a failing one is reported
-/// (E0080) as rustc's codegen reports it. Library code is not entered: its constants are not
-/// the program's diagnostics.
+/// rustc's collect_and_partition_mono_items for a binary, reduced to its constants and its recursion
+/// limit: every instance of the checked crates' fns reachable from `main` is lowered (not compiled),
+/// which evaluates the constants it names with its type arguments; a failing one is reported
+/// (E0080) as rustc's codegen reports it. An instance more than `recursion_limit` instances of the same
+/// definition deep (polymorphic recursion that grows its types) is "reached the recursion limit while
+/// instantiating" (rustc_monomorphize collector `check_recursion_limit`). Library code is not entered:
+/// its constants are not the program's diagnostics.
 fn mono_check(up: *mut Unit, own: &[bool], root: u32) {
     let u = unsafe { &mut *up };
     let main = (0..u.prog.defs.len()).map(|i| crate::program::DefId(i as u32)).find(|&d| {
@@ -776,24 +780,45 @@ fn mono_check(up: *mut Unit, own: &[bool], root: u32) {
             && def.parent == u.prog.mods[u.prog.crates[root as usize].root_mod as usize].def
     });
     let Some(main) = main else { return };
+    let limit = u.prog.crates[root as usize].recursion_limit as usize;
     let _job = jit::compile_job();
-    let mut work: Vec<u32> = vec![crate::owner::call(crate::owner::Class::App, || unsafe { (&mut *up).fn_id(FnKey::Inst(main, Vec::new())) })];
-    let mut seen = std::collections::HashSet::new();
-    while let Some(id) = work.pop() {
-        if !seen.insert(id) { continue; }
+    // (instance, the instance it was reached from): the chain of a reached instance is its DFS stack
+    let mut work: Vec<(u32, Option<u32>)> = vec![(crate::owner::call(crate::owner::Class::App, || unsafe { (&mut *up).fn_id(FnKey::Inst(main, Vec::new())) }), None)];
+    let mut parents: std::collections::HashMap<u32, Option<u32>> = std::collections::HashMap::new();
+    while let Some((id, parent)) = work.pop() {
+        if parents.contains_key(&id) { continue; }
+        parents.insert(id, parent);
+        let (def_of, mine) = {
+            let u = unsafe { &*up };
+            let def_of = |i: u32| match &u.fns[i as usize].key { FnKey::Inst(d, _) => Some(*d), _ => None };
+            (def_of(id), match &u.fns[id as usize].key { FnKey::Inst(d, _) => own[u.prog.def(*d).krate as usize], _ => false })
+        };
+        // collector.rs check_recursion_limit: the active instances of this definition on the stack
+        let mut same_def = 0usize;
+        if let Some(d) = def_of {
+            let u = unsafe { &*up };
+            let mut at = parent;
+            while let Some(a) = at {
+                if matches!(&u.fns[a as usize].key, FnKey::Inst(x, _) if *x == d) { same_def += 1; }
+                at = parents.get(&a).copied().flatten();
+            }
+            if same_def > limit {
+                let def = u.prog.def(d);
+                let pos = u.prog.files[def.file as usize].ast.item(def.item).lo;
+                let name = u.fns[id as usize].name.clone();
+                let msg = u.prog.record_uncoded_error(def.file, pos, "mono", format!("reached the recursion limit while instantiating `{}`", name));
+                unsafe { (&mut *up).errors.push(msg); }
+                continue;
+            }
+        }
         let callees = crate::owner::call(crate::owner::Class::App, || unsafe {
-            let u = &*up;
-            let mine = match &u.fns[id as usize].key {
-                FnKey::Inst(d, _) => own[u.prog.def(*d).krate as usize],
-                _ => false,
-            };
             if !mine { return Vec::new(); }
             // (a fn taking or returning a value of hundreds of MB is not lowered: its frame would
             // be allocated for real)
             // (instances over deeply nested types -- closures wrapped in closures -- cost more to
-            // lower than a constants check is worth)
+            // lower than a constants check is worth; one that recurses into itself is followed to the limit)
             if let FnKey::Inst(_, args) = &(&*up).fns[id as usize].key {
-                if args.iter().any(|t| (&*up).tcx.tys.depth(*t) > 6) { return Vec::new(); }
+                if same_def < 2 && args.iter().any(|t| (&*up).tcx.tys.depth(*t) > 6) { return Vec::new(); }
             }
             if let FnKey::Inst(d, _) = &(&*up).fns[id as usize].key {
                 let uu = &*up;
@@ -817,13 +842,25 @@ fn mono_check(up: *mut Unit, own: &[bool], root: u32) {
             })).unwrap_or(true);
             if huge { return Vec::new(); }
             let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| jit::build_rir(up, id)));
+            // (the lowering's own limit on how deep the type arguments of an instance may nest is the same one)
+            if let Ok(Err(msg)) = &built {
+                if msg.starts_with("reached the recursion limit while instantiating") {
+                    let u = &mut *up;
+                    if let FnKey::Inst(d, _) = &u.fns[id as usize].key {
+                        let def = u.prog.def(*d);
+                        let pos = u.prog.files[def.file as usize].ast.item(def.item).lo;
+                        let msg = u.prog.record_uncoded_error(def.file, pos, "mono", msg.clone());
+                        u.errors.push(msg);
+                    }
+                }
+            }
             if !matches!(built, Ok(Ok(()))) { return Vec::new(); }
             let mut out = Vec::new();
             if let Some(f) = &(&*up).fns[id as usize].rir {
                 for b in &f.blocks {
                     for i in &b.insts {
                         match i {
-                            crate::rir::Inst::Call(crate::rir::Callee::Fn(c) | crate::rir::Callee::CFn(c, _), _, _) => out.push(*c),
+                            relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c) | relax_backend::rir::Callee::CFn(c, _), _, _) => out.push(*c),
                             _ => {}
                         }
                     }
@@ -831,7 +868,7 @@ fn mono_check(up: *mut Unit, own: &[bool], root: u32) {
             }
             out
         });
-        work.extend(callees);
+        work.extend(callees.into_iter().map(|c| (c, Some(id))));
     }
 }
 

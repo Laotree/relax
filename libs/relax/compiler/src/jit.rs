@@ -17,9 +17,9 @@ use crate::types::{TyId, TyKind};
 // arch backend dispatch (arm64 lane): both backends expose the same API; the OS services the
 // runtime needs are in crate::os (one module per concern)
 #[cfg(target_arch = "aarch64")]
-use crate::arm64 as x64;
+use relax_backend::arm64 as x64;
 #[cfg(not(target_arch = "aarch64"))]
-use crate::x64;
+use relax_backend::x64;
 use crate::os;
 use crate::owner;
 use std::collections::HashMap;
@@ -82,7 +82,7 @@ pub struct FnEntry {
     pub history: Option<Box<SlotHistory>>,
     /// optimised RIR (input to inlining into callers, tier-up, recompiles)
     /// shared: O3 builds snapshot callees' RIR and optimise off the unit
-    pub rir: Option<std::sync::Arc<crate::rir::Func>>,
+    pub rir: Option<std::sync::Arc<relax_backend::rir::Func>>,
     /// One slot per site (duplicates matter). Kept when RIR is evicted/invalidated so
     /// a rebuild subtracts the old body's contributions before adding its new ones.
     rir_refs: Box<[u32]>,
@@ -130,6 +130,8 @@ pub struct FnEntry {
     /// `noalias` dropped, no promotion and no inlining into verified code until the verdict is clean
     /// (`Unit::refresh_verified`). Kept (the swap keeps the code, so it keeps its status).
     pub unverified: AtomicBool,
+    /// Relaxed Rust D3: the slot's RIR was lowered with its verdict's run-time disjoint-index checks.
+    pub d3_lowered: AtomicBool,
 }
 
 /// SPEC-V: a body's standing with the borrow checker.
@@ -148,7 +150,7 @@ pub(crate) enum Verdict {
 pub struct SpecCode {
     pub code: Vec<u8>,
     pub map: Vec<(u32, u64)>,
-    pub relocs: Vec<crate::rir::RelocAt>,
+    pub relocs: Vec<relax_backend::rir::RelocAt>,
     /// Whether the disk cache records it: false for code that came from the cache.
     pub record: bool,
 }
@@ -213,29 +215,29 @@ pub struct Rt {
 #[derive(Clone, Copy)]
 pub struct RtSyms {
     /// the start of every thread's thread-local block (offset 0): `Inst::TlsAddr` of it is the block's address
-    pub tls_base: crate::rir::Sym,
-    pub fmt_str: crate::rir::Sym,
-    pub fmt_int: crate::rir::Sym,
-    pub fmt_float: crate::rir::Sym,
-    pub fmt_print: crate::rir::Sym,
-    pub panic_site: crate::rir::Sym,
-    pub panic_bounds: crate::rir::Sym,
-    pub str_eq: crate::rir::Sym,
-    pub fmod: crate::rir::Sym,
-    pub fmodf: crate::rir::Sym,
-    pub panic_impl: crate::rir::Sym,
-    pub thread_run: crate::rir::Sym,
-    pub catch_panic: crate::rir::Sym,
-    pub args: crate::rir::Sym,
-    pub memcpy: crate::rir::Sym,
-    pub memmove: crate::rir::Sym,
-    pub memset: crate::rir::Sym,
-    pub fmt_push: crate::rir::Sym,
-    pub fmt_pop: crate::rir::Sym,
-    pub resume: crate::rir::Sym,
-    pub land: crate::rir::Sym,
-    pub panicking: crate::rir::Sym,
-    pub rethrow: crate::rir::Sym,
+    pub tls_base: relax_backend::rir::Sym,
+    pub fmt_str: relax_backend::rir::Sym,
+    pub fmt_int: relax_backend::rir::Sym,
+    pub fmt_float: relax_backend::rir::Sym,
+    pub fmt_print: relax_backend::rir::Sym,
+    pub panic_site: relax_backend::rir::Sym,
+    pub panic_bounds: relax_backend::rir::Sym,
+    pub str_eq: relax_backend::rir::Sym,
+    pub fmod: relax_backend::rir::Sym,
+    pub fmodf: relax_backend::rir::Sym,
+    pub panic_impl: relax_backend::rir::Sym,
+    pub thread_run: relax_backend::rir::Sym,
+    pub catch_panic: relax_backend::rir::Sym,
+    pub args: relax_backend::rir::Sym,
+    pub memcpy: relax_backend::rir::Sym,
+    pub memmove: relax_backend::rir::Sym,
+    pub memset: relax_backend::rir::Sym,
+    pub fmt_push: relax_backend::rir::Sym,
+    pub fmt_pop: relax_backend::rir::Sym,
+    pub resume: relax_backend::rir::Sym,
+    pub land: relax_backend::rir::Sym,
+    pub panicking: relax_backend::rir::Sym,
+    pub rethrow: relax_backend::rir::Sym,
 }
 
 
@@ -245,13 +247,7 @@ pub struct Site {
     pub msg: String,
 }
 
-#[cfg(not(target_arch = "aarch64"))]
-const THUNK_SIZE: usize = 16;
-#[cfg(not(target_arch = "aarch64"))]
-const STUB_SIZE: usize = 32;
-#[cfg(target_arch = "aarch64")]
 const THUNK_SIZE: usize = x64::THUNK_SIZE;
-#[cfg(target_arch = "aarch64")]
 const STUB_SIZE: usize = x64::STUB_SIZE;
 
 /// Reverse slot identities, maintained at slot creation (including lazy/background slots).
@@ -290,6 +286,7 @@ pub(crate) struct ZoneTaken {
     o2_queue: Vec<(usize, u32)>,
     o2_base: std::collections::VecDeque<(usize, u32)>,
     o2_seen: Option<std::collections::HashSet<(usize, u32)>>,
+    prep_shared: HashMap<u32, Vec<std::sync::Arc<PrepShared>>>,
 }
 
 pub(crate) fn zone_take() -> ZoneTaken {
@@ -312,6 +309,7 @@ pub(crate) fn zone_take() -> ZoneTaken {
         o2_queue: take!(O2_QUEUE => is_empty),
         o2_base: take!(O2_BASE => is_empty),
         o2_seen: take!(O2_SEEN => is_none),
+        prep_shared: take!(PREP_SHARED => is_empty),
     }
 }
 
@@ -329,6 +327,7 @@ pub(crate) fn zone_put_back(taken: ZoneTaken) {
     put(&O2_QUEUE, taken.o2_queue);
     put(&O2_BASE, taken.o2_base);
     put(&O2_SEEN, taken.o2_seen);
+    put(&PREP_SHARED, taken.prep_shared);
 }
 
 /// Heap classes (memlane zones, DESIGN-zones.md F). KEPT (system heap; built and grown under
@@ -381,6 +380,8 @@ pub struct Unit {
     /// cache's dependency certificates are its transitive closure (cache.rs).
     pub body_deps: crate::fxhash::HashMap<u32, Vec<u32>>,
     pub statics: crate::fxhash::HashMap<DefId, u64>,
+    /// `#[thread_local]` statics: where each thread's copy lives (thread_local_place)
+    pub tls_places: crate::fxhash::HashMap<DefId, TlsPlace>,
     /// the statics' storage by address: start -> (static, size), so a pointer into a static
     /// (`&S.field`, `&S[3]`) in constant data is that static's symbol plus an offset
     pub static_spans: std::collections::BTreeMap<u64, (DefId, u64)>,
@@ -410,7 +411,7 @@ pub struct Unit {
     pub old_bodies: crate::fxhash::HashMap<(u32, u32), std::sync::Arc<Body>>,
     /// coroutine poll functions lowered to find their state layout (coro_frame): the build of
     /// the slot takes this RIR, so the layout callers saw and the code agree
-    pub coro_rir: crate::conc::MemoMap<u32, crate::rir::Func>,
+    pub coro_rir: crate::conc::MemoMap<u32, relax_backend::rir::Func>,
     /// coroutine types whose body is being lowered for its layout (on the owner thread)
     pub coro_busy: relax_session::sync::Mutex<Vec<TyId>>,
     /// slots queued for speculation whose code the disk cache has: their worker links it and
@@ -420,6 +421,9 @@ pub struct Unit {
     /// (`Box::pin(f(n - 1)).await` builds the callee future, of the same type, before the frame
     /// is known): the lowering is done again with the frame in place (coro_frame)
     pub coro_selfref: relax_session::sync::Mutex<Vec<TyId>>,
+    /// slots of coroutine poll functions being lowered again (coro_frame): they skip `coro_rir`,
+    /// which holds the first lowering made with the layout so far
+    pub coro_relower: relax_session::sync::Mutex<Vec<u32>>,
     /// drop_may_unwind answers
     pub unwind_drop_cache: crate::conc::MemoMap<TyId, bool>,
     /// types whose drop_may_unwind / is_unpin answer is being computed, per thread
@@ -440,13 +444,15 @@ pub struct Unit {
     exec_base: u64,
     exec_size: u64,
     /// where every slot's thunk, stub, table word and tier record are (segments, reserved as ids reach them)
-    pub slots: Box<crate::rir::SlotTable>,
+    pub slots: Box<relax_backend::rir::SlotTable>,
     lazy_entry: u64,
     pub enter: u64,
     pub leave: u64,
     /// bump allocators of code / read-only data / static memory (lock-free: lowering threads
     /// allocate too)
     code_next: AtomicU64,
+    /// branch veneers in the code area by target (`Unit::veneer`): the last one placed for each
+    veneers: relax_session::sync::Mutex<HashMap<u64, u64>>,
     data_next: AtomicU64,
     /// (bytes, align) of str / byte-string / C-string literals and promoted constants -> their
     /// one read-only copy
@@ -456,7 +462,7 @@ pub struct Unit {
     pub ro_base: u64,
     rw_next: AtomicU64,
     rw_end: u64,
-    pub opt: crate::opt::OptCfg,
+    pub opt: relax_codegen::opt::OptCfg,
     pub env: x64::Env,
     pub stats: Stats,
     pub patch_log: Vec<(u32, u32)>, // (slot, generation)
@@ -465,6 +471,9 @@ pub struct Unit {
     pub tls_next: u32,
     /// panicking stand-ins for foreign fns this host lacks, by symbol
     missing_stubs: relax_session::sync::Mutex<HashMap<String, u64>>,
+    /// the symbols the program's global_asm! defines, placed on the first foreign lookup
+    /// (global_asm.rs)
+    pub(crate) global_asm: std::sync::OnceLock<HashMap<String, u64>>,
     /// tier-up policy (None: O1 only) and its per-slot records / hot glue
     pub tier1: Option<Tier1Cfg>,
     /// O3 left calls to callees that had never run (ATTR_COLD): callee -> those O3
@@ -486,7 +495,7 @@ pub struct Unit {
 
 #[derive(Default)]
 pub struct Stats {
-    pub inline_rules: [u32; crate::opt::RULE_NAMES.len()],
+    pub inline_rules: [u32; relax_codegen::opt::RULE_NAMES.len()],
     pub compiled: u32,
     pub opt_ns: u64,
     pub rir_insts: u64,
@@ -512,6 +521,8 @@ pub struct Stats {
     pub tier1_drop_why: std::collections::BTreeMap<&'static str, u32>,
     pub tier1_locked_ns: u64,
     pub tier1_free_ns: u64,
+    /// O3 machine code bytes installed
+    pub tier1_code_bytes: u64,
     /// constant initializers evaluated to data / compiled and run; cpu of the evaluations
     pub ctfe_data: u32,
     pub ctfe_code: u32,
@@ -527,7 +538,7 @@ pub struct CodeTables {
     /// (emit_code allocates upward; sandbox code spaces lie below later unit code)
     pub index: Vec<(u64, u32, u32)>,
     /// unwind info (callee-saved register saves, frame size, landing stubs) by code start
-    pub unwind: HashMap<u64, crate::rir::UnwindInfo>,
+    pub unwind: HashMap<u64, relax_backend::rir::UnwindInfo>,
     /// unwind trailers of code installed from the startup image, read in place there (code
     /// start, trailer address and length; ascending): parsed when a frame of that code
     /// unwinds. `image_keep` keeps the image mapped.
@@ -536,11 +547,11 @@ pub struct CodeTables {
 }
 
 impl CodeTables {
-    fn add(&mut self, at: u64, len: u32, id: u32, unwind: Option<crate::rir::UnwindInfo>) {
+    fn add(&mut self, at: u64, len: u32, id: u32, unwind: Option<relax_backend::rir::UnwindInfo>) {
         // identity state (panics and faults walk it): the tables are the program's
         let _k = crate::zone_alloc::kept();
         if let Some(i) = unwind {
-            let own = crate::rir::UnwindInfo { saved: i.saved.clone(), pads: i.pads.clone(), sp_off: i.sp_off };
+            let own = relax_backend::rir::UnwindInfo { saved: i.saved.clone(), pads: i.pads.clone(), sp_off: i.sp_off };
             self.unwind.insert(at, own);
         }
         if self.index.last().map_or(true, |l| l.0 < at) {
@@ -583,19 +594,20 @@ impl CodeTables {
     }
 
     /// The unwind info of the startup image code at `start` (its trailer, parsed now).
-    fn image_unwind_at(&self, start: u64) -> Option<crate::rir::UnwindInfo> {
+    fn image_unwind_at(&self, start: u64) -> Option<relax_backend::rir::UnwindInfo> {
         let k = self.image_unwind.partition_point(|x| x.0 < start);
         let &(at, t, n) = self.image_unwind.get(k)?;
         if at != start {
             return None;
         }
-        unsafe { crate::rir::read_unwind_info(t, n as u64) }
+        unsafe { relax_backend::rir::read_unwind_info(t, n as u64) }
     }
 }
 
 // ------------------------------------------------------------ OS memory
 
-pub use crate::clock::{cpu_ns, wall_ns};
+use relax_backend::cpu_ns;
+pub use crate::clock::wall_ns;
 
 /// Lowering runs on `&Unit` (phase B2): every Unit state it changes is behind interior
 /// mutability, so the unit is Sync.
@@ -618,12 +630,42 @@ const TLS_CAP: usize = 1 << 20;
 const TLS_FIRST_FREE: u32 = 16;
 static TLS_KEY: AtomicU64 = AtomicU64::new(u64::MAX);
 
-extern "C" fn tls_dtor(p: *mut u8) {
+thread_local! {
+    /// This thread exits: the program's thread-local destructors run (tls_exit). (const, no
+    /// destructor: readable at every point of the thread's exit)
+    static THREAD_EXIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This thread is exiting and runs the program's thread-local destructors. They run after the
+/// host's own thread-locals are destroyed (glibc runs pthread key destructors after
+/// __call_tls_dtors; Windows' guard is one of the host's), so compiler work for this thread (a
+/// destructor's lazy compile) must not touch those: it runs on the owner thread (rt_compile).
+pub(crate) fn in_thread_exit() -> bool {
+    THREAD_EXIT.try_with(|e| e.get()).unwrap_or(true)
+}
+
+/// The OS key's destructor: the thread exits. Its program thread-locals are destroyed, then the
+/// runtime's own (no program code runs on the thread after that).
+extern "C" fn tls_exit(p: *mut u8) {
+    let _ = THREAD_EXIT.try_with(|e| e.set(true));
+    tls_dtor(p);
+    free_runtime_tls();
+}
+
+/// Runs the program's thread-local destructors of block `p` and frees it (thread exit, or the end
+/// of a native worker's callback: domain_callback).
+fn tls_dtor(p: *mut u8) {
     // pthread clears its key before calling us. Reinstall it while Relax std destructors run.
     os::tls::set(tls_key(), p);
     let registrations = unsafe { crate::domain_threads::finish(p as u64) };
     os::tls::set(tls_key(), std::ptr::null_mut());
-    os::mem::free(p as u64, TLS_CAP);
+    if crate::web32::on() {
+        // its shadow stack (web32.rs) goes back with it
+        crate::web32::thread_exit(p as u64);
+        crate::web32::free(p as u64, TLS_CAP);
+    } else {
+        os::mem::free(p as u64, TLS_CAP);
+    }
     for (base, token) in registrations { crate::domain::thread_finished(base, token); }
 }
 
@@ -636,7 +678,7 @@ fn tls_key() -> u64 {
     static CREATE: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
     let _g = CREATE.lock().unwrap_or_else(|e| e.into_inner());
     if TLS_KEY.load(Ordering::Acquire) == u64::MAX {
-        TLS_KEY.store(os::tls::key_create(tls_dtor), Ordering::Release);
+        TLS_KEY.store(os::tls::key_create(tls_exit), Ordering::Release);
     }
     TLS_KEY.load(Ordering::Acquire)
 }
@@ -646,16 +688,20 @@ fn tls_key() -> u64 {
 pub(crate) fn domain_callback<R>(base: u64, token: u64, f: impl FnOnce() -> R) -> R {
     let _kept = crate::zone_alloc::kept();
     let previous = tls_block();
-    struct Restore(u64);
+    struct Restore(u64, Vec<u64>);
     impl Drop for Restore {
         fn drop(&mut self) {
             tls_dtor(os::tls::get(tls_key()));
             os::tls::set(tls_key(), self.0 as *mut u8);
+            os::tls::static_tls_swap(&mut self.1);
             crate::domain::enter(unsafe { *(self.0 as *const u64) });
         }
     }
     os::tls::set(tls_key(), std::ptr::null_mut());
-    let _restore = Restore(previous);
+    // the program's thread-locals in static TLS start fresh too (the thread's come back after)
+    let mut saved = Vec::new();
+    os::tls::static_tls_swap(&mut saved);
+    let _restore = Restore(previous, saved);
     crate::domain::relax_domain_enter(base, token);
     f()
 }
@@ -690,7 +736,8 @@ fn rt_tls_block() -> u64 {
     if !b.is_null() {
         return b as u64;
     }
-    let b = os::mem::alloc_rw(TLS_CAP);
+    // the wasm32 program's thread-local blocks are in its window (`&THREAD_LOCAL` is an offset)
+    let b = if crate::web32::on() { crate::web32::alloc(TLS_CAP) } else { os::mem::alloc_rw(TLS_CAP) };
     // a thread nothing assigned a domain to (one native code started, or the first use of a
     // thread JIT code started before its start put it in its parent's domain): the default
     unsafe { *(b as *mut u64) = crate::domain::default_base() };
@@ -745,7 +792,23 @@ pub fn main_post_present_wait() -> (f64, String) {
 
 /// O3 drops by reason (on the owner thread).
 unsafe fn drop_why(up: *mut Unit, why: &'static str) {
+    crate::boot_stats::O3_SUPERSEDED.fetch_add(1, Ordering::Relaxed);
     crate::zone_alloc::kept_with(|| *(&mut *up).stats.tier1_drop_why.entry(why).or_insert(0) += 1);
+}
+
+/// The boot window's arm of slot `id` (boot_stats): the crate of the function it is an instance of.
+fn boot_arm(u: &Unit, id: u32) -> usize {
+    let krate = match &u.fns[id as usize].key {
+        FnKey::Inst(d, _) => u.prog.def(*d).krate,
+        FnKey::Closure(file, ..) => match u.prog.file_crate.get(*file as usize) {
+            Some(k) => *k,
+            None => return crate::boot_stats::REST,
+        },
+        _ => return crate::boot_stats::REST,
+    };
+    crate::boot_stats::arm_of(krate, || {
+        crate::boot_stats::name_bytes(u.prog.crates.get(krate as usize).map_or("", |c| u.prog.syms.str(c.name)))
+    })
 }
 
 /// A recursive #[relax(O3)] build with a larger stack frame is not recorded in the disk cache
@@ -769,7 +832,7 @@ pub unsafe fn spec_seed_manifest(up: *mut Unit) {
     // after the first present: what the earlier run installed after its first present (the
     // slots before it were linked as this run's start called them)
     let list = owner::call_quick(owner::Class::App, || (&mut *up).cache.as_ref().map(|c| c.manifest[c.manifest_present..].to_vec()).unwrap_or_default());
-    if list.is_empty() || !pipelined() {
+    if list.is_empty() || !pipelined() || !ahead_policy().spec_cached {
         return;
     }
     struct P(*mut Unit);
@@ -1081,17 +1144,53 @@ fn fork_child() {
 }
 
 
+/// A thread-local of the runtime that program code reaches (format buffers, the panic being
+/// raised). Program code runs during thread exit -- its thread-locals' destructors (tls_exit),
+/// after the host's own thread-locals are destroyed -- so std must never destroy these: the
+/// value has no destructor (none is registered), and tls_exit frees it once the thread's last
+/// program code has run.
+struct ExitCell<T>(std::cell::RefCell<std::mem::ManuallyDrop<T>>);
+
+impl<T> ExitCell<T> {
+    const fn new(v: T) -> Self {
+        ExitCell(std::cell::RefCell::new(std::mem::ManuallyDrop::new(v)))
+    }
+    fn borrow(&self) -> std::cell::Ref<'_, T> {
+        std::cell::Ref::map(self.0.borrow(), |v| &**v)
+    }
+    fn borrow_mut(&self) -> std::cell::RefMut<'_, T> {
+        std::cell::RefMut::map(self.0.borrow_mut(), |v| &mut **v)
+    }
+}
+
+impl<T: Default> ExitCell<T> {
+    /// Frees the value (a default, which owns nothing, takes its place: a later use still works).
+    fn free(&self) {
+        if let Ok(mut v) = self.0.try_borrow_mut() {
+            drop(std::mem::take(&mut **v));
+        }
+    }
+}
+
 thread_local! {
     /// saved host context of this thread's innermost `enter` (sp); 0 = no recovery point
     static CTX: std::cell::UnsafeCell<[u64; 2]> = const { std::cell::UnsafeCell::new([0; 2]) };
     /// stack of format buffers: format!/write! to non-Formatter targets push one
     // (the outer buffer is kept-heap: a thread-local past the compiler generations)
-    static FMT: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(crate::zone_alloc::kept_with(|| vec![String::new()]));
+    static FMT: ExitCell<Vec<String>> = ExitCell::new(crate::zone_alloc::kept_with(|| vec![String::new()]));
     /// the last popped buffer (valid until the next pop)
-    static FMT_POPPED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
-    static PANIC: std::cell::RefCell<Option<PanicInfo>> = const { std::cell::RefCell::new(None) };
+    static FMT_POPPED: ExitCell<String> = const { ExitCell::new(String::new()) };
+    static PANIC: ExitCell<Option<PanicInfo>> = const { ExitCell::new(None) };
     /// "file:line:col" of a panic raised through panic_impl (std's own panics)
-    static PANIC_LOC: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static PANIC_LOC: ExitCell<String> = const { ExitCell::new(String::new()) };
+}
+
+/// Frees this thread's runtime thread-locals (tls_exit: no program code runs on it any more).
+fn free_runtime_tls() {
+    let _ = FMT.try_with(|c| c.free());
+    let _ = FMT_POPPED.try_with(|c| c.free());
+    let _ = PANIC.try_with(|c| c.free());
+    let _ = PANIC_LOC.try_with(|c| c.free());
 }
 
 crate::gen_local! {
@@ -1113,7 +1212,7 @@ fn install_ice_hook() {
         if owner::is_owner() {
             if let Some(l) = info.location() {
                 let s = format!(" (at {}:{})", l.file(), l.line());
-                ICE_LOC.with(|c| *c.borrow_mut() = s);
+                let _ = ICE_LOC.try_with(|c| *c.borrow_mut() = s);
             }
             // MAKEPAD_RUN_ICE_BT=1: the compiler's own backtrace of an internal error
             if std::env::var_os("MAKEPAD_RUN_ICE_BT").is_some() {
@@ -1123,7 +1222,9 @@ fn install_ice_hook() {
         }
         // speculative work on an ahead helper: its panics are caught and the locked build redoes
         // (and reports) that body, so they are not diagnostics
-        if std::thread::current().name().is_some_and(|n| n.starts_with("run-ahead")) { return; }
+        // (the pthread name: std::thread::current() aborts on a thread whose locals are destroyed,
+        // and a program's thread-local destructor may panic there)
+        if crate::os::thread::name(crate::os::thread::current()).starts_with("run-ahead") { return; }
         prev(info);
     }));
 }
@@ -1143,7 +1244,7 @@ fn positioned_fatal(u: &Unit, id: u32, msg: &str) -> String {
 }
 
 pub fn take_ice_location() -> String {
-    ICE_LOC.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    ICE_LOC.try_with(|c| std::mem::take(&mut *c.borrow_mut())).unwrap_or_default()
 }
 
 /// A fault at or just below the stack pointer: the stack's guard page was hit (frames
@@ -1266,7 +1367,7 @@ fn spec_pad(body: String, spec: u64, numeric: bool) -> String {
 }
 
 rt_fn! {
-fn rt_fmt_str(p: *const u8, len: u64, spec: u64) {
+pub(crate) fn rt_fmt_str(p: *const u8, len: u64, spec: u64) {
     let s = unsafe { std::slice::from_raw_parts(p, len as usize) };
     let s = String::from_utf8_lossy(s).into_owned();
     let ty = ((spec >> 40) & 0xff) as u8;
@@ -1412,7 +1513,7 @@ pub fn tls_block() -> u64 {
 }
 
 rt_fn! {
-fn rt_fmt_pop() -> StrRet {
+pub(crate) fn rt_fmt_pop() -> StrRet {
     let s = FMT.with(|f| {
         let mut v = f.borrow_mut();
         let s = v.pop().unwrap_or_default();
@@ -1442,7 +1543,7 @@ fn rt_fmt_print(stream: u64) {
 }
 
 rt_fn! {
-fn rt_str_eq(p1: *const u8, l1: u64, p2: *const u8, l2: u64) -> u64 {
+pub(crate) fn rt_str_eq(p1: *const u8, l1: u64, p2: *const u8, l2: u64) -> u64 {
     if l1 != l2 {
         return 0;
     }
@@ -1653,7 +1754,7 @@ fn rt_panic_bounds(idx: u64, len: u64, site: u64, _a3: u64, _a4: u64, _a5: u64, 
 
 rt_fn! {
 #[allow(clippy::too_many_arguments)]
-fn rt_panic_impl(msg: *const u8, len: u64, file: *const u8, file_len: u64, line: u64, col: u64, regs: *const u64, _a7: u64) {
+pub(crate) fn rt_panic_impl(msg: *const u8, len: u64, file: *const u8, file_len: u64, line: u64, col: u64, regs: *const u64, _a7: u64) {
     let m = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(msg, len as usize)).into_owned() };
     let f = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(file, file_len as usize)).into_owned() };
     PANIC_LOC.with(|l| *l.borrow_mut() = format!("{}:{}:{}", f, line as u32, col as u32));
@@ -1853,8 +1954,8 @@ pub fn set_program_args(args: Vec<Vec<u8>>) {
 
 #[repr(C)]
 pub struct ArgsRet {
-    argc: u64,
-    argv: u64,
+    pub(crate) argc: u64,
+    pub(crate) argv: u64,
 }
 
 rt_fn! {
@@ -1914,7 +2015,7 @@ fn fatal_compile_error(p: &PanicInfo, report: &str) {
 }
 
 rt_fn! {
-fn rt_thread_run(entry: u64, arg: u64) -> u64 {
+pub(crate) fn rt_thread_run(entry: u64, arg: u64) -> u64 {
     ensure_altstack();
     let u = unsafe { UNIT };
     // runs on the calling thread, in the domain it is in
@@ -1936,7 +2037,7 @@ rt_fn! {
 /// core::intrinsics_rt::catch_panic: `f(data)` under a recovery point (std::panic::
 /// catch_unwind, std::thread's start routine). The panic message itself was printed by
 /// std's hook; the report adds where it happened.
-fn rt_catch_panic(f: u64, data: u64) -> u64 {
+pub(crate) fn rt_catch_panic(f: u64, data: u64) -> u64 {
     ensure_altstack();
     let u = unsafe { UNIT };
     // a recovery point inside running code: the domain of that code, not the unit's own
@@ -1960,6 +2061,13 @@ fn rt_compile(slot: u64) -> u64 {
     // own OS calls must not change it
     let _keep = os::proc::KeepLastError::new();
     ensure_altstack();
+    // a destructor of the program's thread-locals, first called at thread exit: this thread's
+    // compiler thread-locals are gone, so the whole build runs on the owner (only the request
+    // touches this thread's state, through try_with)
+    if in_thread_exit() && !owner::is_owner() {
+        return owner::call(owner::program_class(), || unsafe { compile_slot(UNIT, slot as u32) });
+    }
+    let _frame = crate::inspect::timeline::CompileMark::begin();
     unsafe {
         let _exec_call = profile_path().map(|_| crate::exec_profile::call(UNIT as usize, slot as u32));
         if profile_path().is_some() { (&*UNIT).exec_event(slot as u32, "call"); }
@@ -1971,57 +2079,9 @@ fn rt_compile(slot: u64) -> u64 {
 // ------------------------------------------------------------ compiler stack
 
 // A compile runs on the program's thread (lazy compile from a stub), and constant evaluation
-// runs program code inside it, which compiles again: `T::NUM + 1` over a type nested 1000 deep
-// nests 1000 compiles. rustc runs the compiler on its own stack and grows it on demand
-// (rustc_data_structures::stack::ensure_sufficient_stack: a 100 KiB red zone, new 1 MiB+
-// segments via stacker); Relax does the same here, so neither deep constant evaluation nor a
-// lazy compile reached near the end of a deep program recursion overflows the thread's stack.
-
-/// Run the compiler on a fresh segment when less than this is left
-const STACK_RED_ZONE: usize = 1 << 20;
-/// Size of a fresh segment (virtual; pages are touched on use)
-const STACK_SEGMENT: usize = 64 << 20;
-
-thread_local! {
-    /// lowest usable address of the stack this thread runs on now (0: not known yet)
-    static STACK_LO: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Runs `f` on a fresh stack segment when this thread's stack is nearly used up.
-fn ensure_sufficient_stack<R, F: FnOnce() -> R>(f: F) -> R {
-    let here = &f as *const _ as usize;
-    let mut lo = STACK_LO.with(|c| c.get());
-    if lo == 0 {
-        lo = os::thread::stack_lo();
-        STACK_LO.with(|c| c.set(lo));
-    }
-    if lo == 0 || here.saturating_sub(lo) >= STACK_RED_ZONE {
-        return f();
-    }
-    struct Job<F, R> {
-        f: Option<F>,
-        r: Option<std::thread::Result<R>>,
-    }
-    extern "C" fn run<F: FnOnce() -> R, R>(p: *mut u8) {
-        let job = unsafe { &mut *(p as *mut Job<F, R>) };
-        let f = job.f.take().unwrap();
-        // a Rust panic must not unwind through the stack switch (no unwind info for it)
-        job.r = Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)));
-    }
-    let seg = match os::mem::stack_segment(STACK_SEGMENT) {
-        Some(seg) => seg,
-        None => return f(),
-    };
-    let mut job: Job<F, R> = Job { f: Some(f), r: None };
-    STACK_LO.with(|c| c.set(seg.lo));
-    unsafe { os::mem::call_on_segment(&seg, run::<F, R>, &mut job as *mut Job<F, R> as *mut u8) };
-    STACK_LO.with(|c| c.set(lo));
-    os::mem::free_segment(seg);
-    match job.r.take().unwrap() {
-        Ok(r) => r,
-        Err(e) => std::panic::resume_unwind(e),
-    }
-}
+// runs program code inside it, which compiles again: base/src/stack.rs grows the stack onto
+// fresh segments (rustc's ensure_sufficient_stack).
+use crate::stack::ensure_sufficient_stack;
 
 /// Where the OS cannot run a handler on a looping thread (Windows: no signals), the watching
 /// thread redirects it into this glue (x64::hang_tramp in front of rt_hang); 0 = none.
@@ -2045,6 +2105,7 @@ rt_fn! {
 }
 
 /// (exec, data, rw, syms, end) bases of the program unit's reservation (diagnostics: inspect memory).
+#[cfg(target_os = "macos")]
 pub(crate) fn unit_areas() -> Option<[u64; 5]> {
     unsafe {
         if UNIT.is_null() { return None; }
@@ -2392,11 +2453,17 @@ impl Unit {
                 });
             }
         }
-        let exec_size: u64 = 768 << 20;
-        let data_size: u64 = UNIT_DATA_SIZE;
+        // the wasm32 web target's program: the unit lives in the linear memory's window (web32.rs)
+        let w32 = prog.ptr_bytes == 4;
+        let exec_size: u64 = if w32 { crate::web32::UNIT_CODE } else { 768 << 20 };
+        let data_size: u64 = if w32 { crate::web32::UNIT_DATA } else { UNIT_DATA_SIZE };
         let rw_size: u64 = UNIT_RW_SIZE;
         let syms_size = (crate::syms::SYM_CAP * 8) as u64;
-        let exec_base = os::mem::reserve(exec_size as usize, (data_size + rw_size + syms_size) as usize);
+        let exec_base = if w32 {
+            crate::web32::reserve_unit(exec_size as usize, (data_size + rw_size + syms_size) as usize)
+        } else {
+            os::mem::reserve(exec_size as usize, (data_size + rw_size + syms_size) as usize)
+        };
         let misc = exec_base;
         let data_base = exec_base + exec_size;
         let rw_base = data_base + data_size;
@@ -2410,9 +2477,9 @@ impl Unit {
         let provided_types = crate::zone_alloc::kept_clone(&provided_types);
         let slots = crate::zone_alloc::kept_with(|| {
             if no_codegen {
-                Box::new(crate::rir::SlotTable::new(NC_STRIDE as u64, NC_STRIDE as u64, 8, TIER_REC as u64))
+                Box::new(relax_backend::rir::SlotTable::new(NC_STRIDE as u64, NC_STRIDE as u64, 8, TIER_REC as u64))
             } else {
-                Box::new(crate::rir::SlotTable::new(THUNK_SIZE as u64, STUB_SIZE as u64, 8, TIER_REC as u64))
+                Box::new(relax_backend::rir::SlotTable::new(THUNK_SIZE as u64, STUB_SIZE as u64, 8, TIER_REC as u64))
             }
         });
         // no-codegen: segment 0 is the precompiled thunk and stub pools and the static table
@@ -2425,7 +2492,7 @@ impl Unit {
             relax_codegen::interp::set_static_thunks(g.thunks, NC_STRIDE as u64, static_glue::SLOTS as u64, g.table);
             relax_codegen::interp::set_tls_fn(static_glue::tls_block_c);
         }
-        let slots_ptr = crate::rir::SlotsPtr(&*slots);
+        let slots_ptr = relax_backend::rir::SlotsPtr(&*slots);
         let unit = Unit {
             prog,
             tcx,
@@ -2444,10 +2511,11 @@ impl Unit {
             const_readers: Default::default(),
             body_deps: Default::default(),
             statics: Default::default(),
+            tls_places: Default::default(),
             static_spans: Default::default(),
             sites: Default::default(),
             site_ix: Default::default(),
-            rs: RtSyms { tls_base: crate::rir::Sym::new(0), fmt_str: crate::rir::Sym::new(0), fmt_int: crate::rir::Sym::new(0), fmt_float: crate::rir::Sym::new(0), fmt_print: crate::rir::Sym::new(0), panic_site: crate::rir::Sym::new(0), panic_bounds: crate::rir::Sym::new(0), str_eq: crate::rir::Sym::new(0), fmod: crate::rir::Sym::new(0), fmodf: crate::rir::Sym::new(0), panic_impl: crate::rir::Sym::new(0), thread_run: crate::rir::Sym::new(0), catch_panic: crate::rir::Sym::new(0), args: crate::rir::Sym::new(0), memcpy: crate::rir::Sym::new(0), memmove: crate::rir::Sym::new(0), memset: crate::rir::Sym::new(0), fmt_push: crate::rir::Sym::new(0), fmt_pop: crate::rir::Sym::new(0), resume: crate::rir::Sym::new(0), land: crate::rir::Sym::new(0), panicking: crate::rir::Sym::new(0), rethrow: crate::rir::Sym::new(0) },
+            rs: RtSyms { tls_base: relax_backend::rir::Sym::new(0), fmt_str: relax_backend::rir::Sym::new(0), fmt_int: relax_backend::rir::Sym::new(0), fmt_float: relax_backend::rir::Sym::new(0), fmt_print: relax_backend::rir::Sym::new(0), panic_site: relax_backend::rir::Sym::new(0), panic_bounds: relax_backend::rir::Sym::new(0), str_eq: relax_backend::rir::Sym::new(0), fmod: relax_backend::rir::Sym::new(0), fmodf: relax_backend::rir::Sym::new(0), panic_impl: relax_backend::rir::Sym::new(0), thread_run: relax_backend::rir::Sym::new(0), catch_panic: relax_backend::rir::Sym::new(0), args: relax_backend::rir::Sym::new(0), memcpy: relax_backend::rir::Sym::new(0), memmove: relax_backend::rir::Sym::new(0), memset: relax_backend::rir::Sym::new(0), fmt_push: relax_backend::rir::Sym::new(0), fmt_pop: relax_backend::rir::Sym::new(0), resume: relax_backend::rir::Sym::new(0), land: relax_backend::rir::Sym::new(0), panicking: relax_backend::rir::Sym::new(0), rethrow: relax_backend::rir::Sym::new(0) },
             syms: crate::syms::Syms::new(syms_base, rw_base),
             cache: None,
             pending_cache_records: Vec::new(),
@@ -2460,6 +2528,7 @@ impl Unit {
             coro_busy: Default::default(),
             spec_cached: Default::default(),
             coro_selfref: Default::default(),
+            coro_relower: Default::default(),
             unwind_drop_cache: Default::default(),
             cycle_inprog: Default::default(),
             vtables: crate::conc::MemoMap::new_kept(16),
@@ -2477,6 +2546,7 @@ impl Unit {
             enter: 0,
             leave: 0,
             code_next: AtomicU64::new(misc),
+            veneers: Default::default(),
             data_next: AtomicU64::new(data_base),
             lit_data: Default::default(),
             data_end: data_base + data_size,
@@ -2484,14 +2554,15 @@ impl Unit {
             // the first bytes stay unused: no domain symbol has the offset 0 (0 marks a static that failed)
             rw_next: AtomicU64::new(rw_base + 64),
             rw_end: rw_base + rw_size,
-            opt: crate::opt::OptCfg::from_options(options),
-            env: x64::Env { slots: slots_ptr, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: false, syms: 0, sym_class: 0 },
+            opt: relax_codegen::opt::OptCfg::from_options(options),
+            env: x64::Env { slots: slots_ptr, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: false, syms: 0, sym_class: 0, near: true },
             stats: Stats::default(),
             patch_log: Vec::new(),
             patch_gen: 0,
             // slot 0 of the block: the thread's domain static block (domain.rs)
             tls_next: TLS_FIRST_FREE,
             missing_stubs: Default::default(),
+            global_asm: std::sync::OnceLock::new(),
             tier1: {
                 let t = Tier1Cfg::from_options(options);
                 TIER1_ENABLED.store(t.is_some(), Ordering::Relaxed);
@@ -2574,9 +2645,22 @@ impl Unit {
             let ld = x64::land();
             u.rt.land = u.emit_code(&ld);
         }
+        if w32 {
+            // the wasm32 program's runtime entries take and return offsets (web32.rs)
+            u.rt.fmt_str = crate::web32::w32_fmt_str as *const () as usize as u64;
+            u.rt.str_eq = crate::web32::w32_str_eq as *const () as usize as u64;
+            u.rt.thread_run = crate::web32::w32_thread_run as *const () as usize as u64;
+            u.rt.catch_panic = crate::web32::w32_catch_panic as *const () as usize as u64;
+            u.rt.args = crate::web32::w32_args as *const () as usize as u64;
+            u.rt.memcpy = crate::web32::w32_memcpy as *const () as usize as u64;
+            u.rt.memmove = crate::web32::w32_memmove as *const () as usize as u64;
+            u.rt.memset = crate::web32::w32_memset as *const () as usize as u64;
+            u.rt.fmt_pop = crate::web32::w32_fmt_pop as *const () as usize as u64;
+            u.rt.panic_impl = u.emit_code(&panic_tramp(crate::web32::w32_panic_impl as *const () as usize as u64));
+        }
         u.env.resume = u.rt.resume;
         if os::fault::NEEDS_HANG_TRAMP {
-            HANG_TRAMP.store(u.emit_code(&crate::x64::hang_tramp(rt_hang as *const () as usize as u64)), Ordering::Relaxed);
+            HANG_TRAMP.store(u.emit_code(&relax_backend::x64::hang_tramp(rt_hang as *const () as usize as u64)), Ordering::Relaxed);
         }
         u.env.syms = u.syms.vals;
         u.env.sym_class = u.syms.classes;
@@ -2605,7 +2689,15 @@ impl Unit {
             panicking: u.syms.intern(crate::syms::SymKind::Rt("panicking"), u.rt.panicking),
             rethrow: u.syms.intern(crate::syms::SymKind::Rt("rethrow"), u.rt.rethrow),
         };
-        crate::opt::set_mem_fns(u.rs.memcpy, u.rs.memmove);
+        relax_codegen::opt::set_mem_fns(u.rs.memcpy, u.rs.memmove);
+        if w32 {
+            // the shadow stacks' thread-local words, and the code transform (relax_codegen::web32)
+            let off = u.tls_alloc(16, 8);
+            crate::web32::set_ss_off(off);
+            let ss = u.syms.intern(crate::syms::SymKind::Rt("w32_ss"), off as u64);
+            let grow = u.syms.intern(crate::syms::SymKind::Rt("w32_stack"), crate::web32::rt_w32_stack as *const () as usize as u64);
+            relax_codegen::web32::configure(relax_codegen::web32::Cfg { syms: u.syms.vals, base: crate::web32::BASE, ss, grow });
+        }
         // runtime symbols lowering interns on first use: a cached entry may name them before any
         // function of this run was lowered (the cache links them by name)
         let _ = u.syms.intern(crate::syms::SymKind::Rt("divrem128"), crate::lower::divrem128_addr());
@@ -2626,7 +2718,7 @@ impl Unit {
             }
         }
         // a call of a panic entry inlined into an invoked call's body unwinds into its pad
-        crate::opt::set_unwind_hosts(vec![u.rs.panic_site, u.rs.panic_bounds, u.rs.panic_impl]);
+        relax_codegen::opt::set_unwind_hosts(vec![u.rs.panic_site, u.rs.panic_bounds, u.rs.panic_impl]);
         u.init_tls();
         // layouts normalize projections in field types (`struct P(<P as Flags>::Internal)`)
         // provided crates' trusted types: Relax's layout must be rustc's, else the type is used
@@ -2700,15 +2792,37 @@ impl Unit {
     }
 
     /// Whether `code` would link anywhere in the code area (O3 checks before installing).
-    pub fn link_check(&self, code: &[u8], relocs: &[crate::rir::RelocAt]) -> bool {
+    pub fn link_check(&self, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> bool {
         let mut c = code.to_vec();
         let lo = self.code_next.load(Ordering::Relaxed);
-        crate::rir::link(&mut c, lo, relocs, &|r| self.env.reloc_value(r)).is_ok() && crate::rir::link(&mut c, self.exec_base + self.exec_size - 16, relocs, &|r| self.env.reloc_value(r)).is_ok()
+        // a branch out of reach gets a veneer next to the code when it is placed
+        let near = |_: relax_backend::rir::RelocKind, _: u64, pc: u64| Some(pc);
+        relax_backend::rir::link_with(&mut c, lo, relocs, &|r| self.env.reloc_value(r), &near).is_ok() && relax_backend::rir::link_with(&mut c, self.exec_base + self.exec_size - 16, relocs, &|r| self.env.reloc_value(r), &near).is_ok()
+    }
+
+    /// Links `code` to run at `at`, branches out of reach through veneers (`veneer`).
+    pub(crate) fn link_code(&self, code: &mut [u8], at: u64, relocs: &[relax_backend::rir::RelocAt]) -> Result<(), String> {
+        relax_backend::rir::link_with(code, at, relocs, &|r| self.env.reloc_value(r), &|k, t, pc| self.veneer(k, t, pc))
+    }
+
+    /// Code in reach of the branch at `pc` that jumps to `target` (a host function, a runtime
+    /// entry, a thunk past an arm64 `bl`'s 128 MB): the last veneer placed for `target` while it is
+    /// in reach, else a new one from the code area, which is next to the code being linked.
+    pub(crate) fn veneer(&self, kind: relax_backend::rir::RelocKind, target: u64, pc: u64) -> Option<u64> {
+        let mut m = self.veneers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&v) = m.get(&target) {
+            if relax_backend::rir::branch_reaches(kind, pc, v) {
+                return Some(v);
+            }
+        }
+        let v = self.emit_code(&x64::veneer(target));
+        crate::zone_alloc::kept_with(|| m.insert(target, v));
+        Some(v)
     }
 
     /// Records code at `at` in the address-ordered index (sandbox code spaces lie below later
     /// unit code: inserted in order).
-    pub(crate) fn index_code(&mut self, at: u64, len: u32, id: u32, unwind: Option<crate::rir::UnwindInfo>) {
+    pub(crate) fn index_code(&mut self, at: u64, len: u32, id: u32, unwind: Option<relax_backend::rir::UnwindInfo>) {
         self.code.write().unwrap_or_else(|e| e.into_inner()).add(at, len, id, unwind);
     }
 
@@ -2725,9 +2839,9 @@ impl Unit {
     }
 
     /// Links code for `at` (the caller placed it there).
-    pub(crate) fn link_at(&self, at: u64, code: &[u8], relocs: &[crate::rir::RelocAt]) -> Result<Vec<u8>, String> {
+    pub(crate) fn link_at(&self, at: u64, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Result<Vec<u8>, String> {
         let mut c = code.to_vec();
-        crate::rir::link(&mut c, at, relocs, &|r| self.env.reloc_value(r))?;
+        self.link_code(&mut c, at, relocs)?;
         Ok(c)
     }
 
@@ -2739,10 +2853,10 @@ impl Unit {
     /// Code at a fresh address with its relocated fields linked for that address.
     /// no-codegen mode: the address a slot takes for `code` (which must be a plain jump with no
     /// relocations: an interpreter entry or a foreign function); other machine code is an error.
-    fn no_codegen_target(&self, code: &[u8], relocs: &[crate::rir::RelocAt], what: &str) -> Result<u64, String> {
+    fn no_codegen_target(&self, code: &[u8], relocs: &[relax_backend::rir::RelocAt], what: &str) -> Result<u64, String> {
         if relax_codegen::interp::blob::is_blob(code) {
             let mut c = code.to_vec();
-            crate::rir::link(&mut c, 0, relocs, &|r| self.env.reloc_value(r))?;
+            relax_backend::rir::link(&mut c, 0, relocs, &|r| self.env.reloc_value(r))?;
             return relax_codegen::interp::install_linked(&c, self.env.tls_slow, self.env.resume);
         }
         match relax_codegen::interp::redirect_target(code) {
@@ -2753,7 +2867,7 @@ impl Unit {
 
     /// Code for an address that is not a slot (error stubs): written to code memory, or in
     /// no-codegen mode the target of its jump.
-    fn emit_or_redirect(&self, code: &[u8], relocs: &[crate::rir::RelocAt], what: &str) -> Result<u64, String> {
+    fn emit_or_redirect(&self, code: &[u8], relocs: &[relax_backend::rir::RelocAt], what: &str) -> Result<u64, String> {
         if self.prog.session.options.no_codegen || relax_codegen::interp::blob::is_blob(code) {
             self.no_codegen_target(code, relocs, what)
         } else {
@@ -2761,10 +2875,10 @@ impl Unit {
         }
     }
 
-    fn emit_linked(&self, code: &[u8], relocs: &[crate::rir::RelocAt]) -> Result<u64, String> {
+    fn emit_linked(&self, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Result<u64, String> {
         let at = bump(&self.code_next, code.len() as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
         let mut c = code.to_vec();
-        crate::rir::link(&mut c, at, relocs, &|r| self.env.reloc_value(r))?;
+        self.link_code(&mut c, at, relocs)?;
         unsafe { os::mem::write_code(at, &c) };
         Ok(at)
     }
@@ -2776,6 +2890,15 @@ impl Unit {
         // filled whole right away (the startup image's code)
         os::mem::prefault(at, len as usize);
         at
+    }
+
+    /// `len` bytes of code memory (global_asm.rs places a block whose fields need its address
+    /// before it is written: write_reserved_code).
+    pub(crate) fn reserve_asm_code(&self, len: u64, align: u64) -> u64 {
+        bump(&self.code_next, len.max(1), align.max(16), self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory")
+    }
+    pub(crate) fn write_reserved_code(&self, at: u64, b: &[u8]) {
+        unsafe { os::mem::write_code(at, b) };
     }
 
     fn emit_code(&self, b: &[u8]) -> u64 {
@@ -2812,7 +2935,7 @@ impl Unit {
     }
 
     /// The symbol of the data object at `addr` (an address `data` / `lit_data` returned).
-    pub fn data_sym(&self, addr: u64) -> crate::rir::Sym {
+    pub fn data_sym(&self, addr: u64) -> relax_backend::rir::Sym {
         match self.syms.data_at(addr).or_else(|| self.syms.rw_syms.lock().unwrap_or_else(|e| e.into_inner()).get(&addr).copied()) {
             Some(s) => s,
             None => panic!("makepad: {:#x} is not the start of a data object (unsymbolised address)", addr),
@@ -2820,19 +2943,19 @@ impl Unit {
     }
 
     /// A string literal's bytes as a symbol.
-    pub fn lit_sym(&self, b: &[u8]) -> crate::rir::Sym {
+    pub fn lit_sym(&self, b: &[u8]) -> relax_backend::rir::Sym {
         let a = self.lit_data(b);
         self.data_sym(a)
     }
 
     /// A panic site as a symbol (its value is the site's index).
-    pub fn site_sym(&self, file: u32, pos: u32, msg: &str) -> crate::rir::Sym {
+    pub fn site_sym(&self, file: u32, pos: u32, msg: &str) -> relax_backend::rir::Sym {
         let i = self.site(file, pos, msg);
         self.syms.intern(crate::syms::SymKind::Site(i as u32), i)
     }
 
     /// A static's memory as a symbol.
-    pub fn static_sym(&mut self, d: DefId) -> crate::rir::Sym {
+    pub fn static_sym(&mut self, d: DefId) -> relax_backend::rir::Sym {
         let a = self.static_addr(d);
         self.syms.intern(crate::syms::SymKind::Static(d), a)
     }
@@ -2841,7 +2964,7 @@ impl Unit {
     /// offset into it. Statics' storage has no gap between them (unlike data objects), so one
     /// past a static's end may be the next block's start (another static, a writable block a
     /// fn's code owns): such a pointer is not attributed.
-    pub fn static_sym_at(&self, addr: u64) -> Option<crate::rir::Sym> {
+    pub fn static_sym_at(&self, addr: u64) -> Option<relax_backend::rir::Sym> {
         let (&start, &(d, size)) = self.static_spans.range(..=addr).next_back()?;
         if (addr != start && addr >= start + size) || self.statics.get(&d) != Some(&start) {
             return None;
@@ -2853,7 +2976,7 @@ impl Unit {
 
     /// A C symbol (function or foreign static) as a symbol; a fn this host lacks is its
     /// panicking stand-in.
-    pub fn foreign_sym(&self, d: DefId) -> Option<crate::rir::Sym> {
+    pub fn foreign_sym(&self, d: DefId) -> Option<relax_backend::rir::Sym> {
         let a = self.foreign_addr(d)?;
         let name = self.link_name(d);
         let missing = self.missing_stubs.lock().unwrap_or_else(|e| e.into_inner()).get(&name) == Some(&a);
@@ -2866,37 +2989,46 @@ impl Unit {
         Some(s)
     }
 
-    /// On a target whose libm has a combined `sincos` routine (Darwin arm64), registers it with the
-    /// optimiser once the program names both `sinf` and `cosf` (or `sin` and `cos`): rustc's LLVM
-    /// calls it for a sin and a cos of the same value in one block (opt::fuse_sincos).
+    /// On a target whose libm has a combined `sincos` routine, registers it with the optimiser once
+    /// the program names both `sinf` and `cosf` (or `sin` and `cos`): rustc's LLVM calls it for a
+    /// sin and a cos of the same value in one block (passes::fuse_sincos). Darwin arm64:
+    /// `__sincos_stret` / `__sincosf_stret` (two floats in d0/s0, d1/s1). x86-64 glibc: `sincos` /
+    /// `sincosf` (results through pointers), called through `sincos_pair` / `sincosf_pair`, which
+    /// return the two results in xmm0 and xmm1 as the combined call expects.
     fn note_sincos(&self, name: &str) {
-        if !cfg!(all(target_vendor = "apple", target_arch = "aarch64")) {
+        if !SINCOS_TARGET {
             return;
         }
         let (sin, cos, both, wide) = match name {
-            "sinf" | "cosf" => ("sinf", "cosf", "__sincosf_stret", false),
-            "sin" | "cos" => ("sin", "cos", "__sincos_stret", true),
+            "sinf" | "cosf" => ("sinf", "cosf", if cfg!(target_vendor = "apple") { "__sincosf_stret" } else { "relax_sincosf_pair" }, false),
+            "sin" | "cos" => ("sin", "cos", if cfg!(target_vendor = "apple") { "__sincos_stret" } else { "relax_sincos_pair" }, true),
             _ => return,
         };
         let (Some(sn), Some(cs)) = (self.syms.find_foreign(sin), self.syms.find_foreign(cos)) else { return };
-        let p = unsafe { os::proc::find(format!("{}\0", both).as_ptr()) };
+        let p = if cfg!(target_vendor = "apple") {
+            unsafe { os::proc::find(format!("{}\0", both).as_ptr()) }
+        } else if wide {
+            sincos_pair as *mut u8
+        } else {
+            sincosf_pair as *mut u8
+        };
         if p.is_null() {
             return;
         }
-        crate::opt::set_sincos(wide, sn, cs, self.syms.intern(crate::syms::SymKind::Foreign(both.to_string()), p as u64));
+        relax_codegen::opt::set_sincos(wide, sn, cs, self.syms.intern(crate::syms::SymKind::Foreign(both.to_string()), p as u64));
     }
 
     /// Whether `func` calls std's `sin` and `cos` methods (before inlining): such a function is
     /// optimised from its first compile, because only the optimiser pairs the calls like rustc's
     /// LLVM, and a baseline version would compute other bits than the optimised one.
-    fn pairs_sincos(&self, func: &crate::rir::Func) -> bool {
-        if !cfg!(all(target_vendor = "apple", target_arch = "aarch64")) {
+    fn pairs_sincos(&self, func: &relax_backend::rir::Func) -> bool {
+        if !SINCOS_TARGET {
             return false;
         }
         let (mut sin, mut cos) = (false, false);
         for b in &func.blocks {
             for i in &b.insts {
-                let crate::rir::Inst::Call(crate::rir::Callee::Fn(c), a, r) = i else { continue };
+                let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), a, r) = i else { continue };
                 if a.len() != 1 || r.len() != 1 {
                     continue;
                 }
@@ -2931,8 +3063,8 @@ impl Unit {
     }
 
     /// Constant-load folding for the optimiser (syms.rs ro_read).
-    pub fn ro_reader(&self) -> Option<crate::opt::RoReader> {
-        Some(crate::opt::RoReader::new(crate::syms::ro_read, self as *const Unit as usize))
+    pub fn ro_reader(&self) -> Option<relax_backend::passes::RoReader> {
+        Some(relax_backend::passes::RoReader::new(crate::syms::ro_read, self as *const Unit as usize))
     }
 
     /// The bytes of a string literal: one copy per content (rustc allocate_bytes_dedup for
@@ -2962,7 +3094,7 @@ impl Unit {
     /// A fresh anonymous mutable block (promoted temporaries) as a symbol. `ty`: the value it
     /// holds, when lowering made it (a block linked from the disk cache is untyped): a constant
     /// value pointing into it can then store the block's bytes (syms.rs promoted_copy).
-    pub fn rw_sym(&self, size: u64, align: u64, ty: Option<TyId>) -> crate::rir::Sym {
+    pub fn rw_sym(&self, size: u64, align: u64, ty: Option<TyId>) -> relax_backend::rir::Sym {
         let a = self.rw_data(size, align);
         let _k = crate::zone_alloc::kept();
         let k = {
@@ -3014,6 +3146,53 @@ impl Unit {
         at
     }
 
+    /// A `#[thread_local]` static's per-thread storage (Reference items/static-items: each thread
+    /// has its own copy, initialised to the static's value, never dropped). Its initializer runs
+    /// as any static's does: the result is the image every thread starts from. It goes in the
+    /// executable's static TLS (os::tls::static_tls: a fixed offset from the thread pointer,
+    /// `Inst::TlsStatic`, as rustc's local-exec model) where the platform has one and it fits,
+    /// otherwise in the thread-local block (`Inst::TlsAddr`); both start as zeros on every
+    /// thread, so a non-zero image is copied in on the thread's first access behind a flag
+    /// byte. None: the initializer failed (reported as its own error).
+    pub fn thread_local_place(&mut self, d: DefId) -> Option<TlsPlace> {
+        if let Some(p) = self.tls_places.get(&d) {
+            return Some(*p);
+        }
+        let image = self.static_addr(d);
+        if image == 0 {
+            return None;
+        }
+        let t = self.tcx.const_ty(&self.prog, d)?;
+        let l = self.layout_of(t);
+        let (size, align) = (l.size.max(1) as u32, l.align.max(1) as u32);
+        let zero = unsafe { std::slice::from_raw_parts(image as *const u8, size as usize) }.iter().all(|b| *b == 0);
+        // a non-zero image: the flag byte right after the value
+        let bytes = if zero { size } else { size + 1 };
+        let init = (!zero).then_some(size);
+        let fixed = if self.static_tls_ok() { os::tls::static_tls_alloc(bytes, align) } else { None };
+        let value = match fixed {
+            Some(off) => off as u32 as u64,
+            None => self.tls_alloc(bytes, align) as u64,
+        };
+        let place = TlsPlace { sym: self.syms.intern(crate::syms::SymKind::ThreadLocal(d), value), fixed: fixed.is_some(), init };
+        // MAKEPAD_RUN_TLS_TRACE=1: where each `#[thread_local]` static went
+        if std::env::var_os("MAKEPAD_RUN_TLS_TRACE").is_some() {
+            eprintln!("thread_local {}: {} bytes align {}, {} at {:#x}{}", self.prog.def_path(d), size, align, if place.fixed { "static TLS" } else { "block" }, value, if zero { "" } else { ", copied on first access" });
+        }
+        crate::zone_alloc::kept_with(|| self.tls_places.insert(d, place));
+        Some(place)
+    }
+
+    pub fn thread_local_place_shared(&self, d: DefId) -> Option<TlsPlace> {
+        owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).thread_local_place(d) })
+    }
+
+    /// Code of this unit may address the executable's static TLS (`Inst::TlsStatic`): native
+    /// code generation on a host that has it (MAKEPAD_RUN_OPT=-statictls: never).
+    fn static_tls_ok(&self) -> bool {
+        !self.prog.session.options.no_codegen && !crate::web32::on() && os::tls::static_tls_base().is_some() && !relax_backend::stats::opt_off(&self.prog.session.options, "-statictls")
+    }
+
     /// Thread-local blocks: one OS key per process holds each thread's block; compiled code
     /// reads it through the OS's fast path (os::tls::jit_offset), else calls tls_slow.
     fn init_tls(&mut self) {
@@ -3025,6 +3204,7 @@ impl Unit {
             return;
         }
         let key = tls_key();
+        os::tls::static_tls_init(&|b| self.emit_code(b));
         let off = os::tls::jit_offset(key, &|b| self.emit_code(b));
         self.env.tls_key = off;
         self.env.tls_slow = self.emit_code(&x64::tls_slow(rt_tls_block as *const () as usize as u64, off));
@@ -3123,6 +3303,38 @@ impl Unit {
             self.unpin_cache.insert(t, r);
         }
         r
+    }
+
+    /// The program's `#[global_allocator]` static and its type (rustc_metadata creader
+    /// inject_allocator_crate: at most one per program, item_checks reports a second), which the
+    /// allocator shim (intrinsics_rt::rust_alloc & co) calls; None: the default allocator. Files
+    /// with the attribute are global roots of the demand plan (front lazy.rs), so the static is
+    /// loaded before any code allocates.
+    pub fn global_allocator(&self) -> Option<(DefId, TyId)> {
+        let prog = &self.prog;
+        let d = self.global_allocator_static()?;
+        let t = self.tcx.const_ty(prog, d)?;
+        Some((d, self.tcx.normalize_erasing_regions(prog, crate::tcx::TypingEnv::fully_monomorphized(prog), t)))
+    }
+
+    /// The `#[global_allocator]` static (global_allocator without its type).
+    pub fn global_allocator_static(&self) -> Option<DefId> {
+        let prog = &self.prog;
+        (0..prog.defs.len() as u32).map(DefId).find(|&d| {
+            let def = prog.def(d);
+            def.kind == DefKind::Static && prog.item_defs.get(&(def.file, def.item.0)) == Some(&d) && {
+                let ast = &prog.files[def.file as usize].ast;
+                crate::lang_items::has_attr(prog, def.file, ast.list(ast.item(def.item).attrs), "global_allocator")
+            }
+        })
+    }
+
+    /// Whether `d` is one of the fns whose bodies call the allocator shim (core::heap's alloc,
+    /// alloc_zeroed, dealloc, realloc): their code depends on the program's global allocator.
+    pub fn calls_allocator_shim(&self, d: DefId) -> bool {
+        let def = self.prog.def(d);
+        def.krate == self.core_crate && def.kind == DefKind::Fn && matches!(self.prog.name(d), "alloc" | "alloc_zeroed" | "dealloc" | "realloc")
+            && ["alloc", "alloc_zeroed", "dealloc", "realloc"].iter().any(|n| self.core_path(&["heap", n]) == Some(d))
     }
 
     /// Deferred diagnostic items and Relax runtime helpers, not language-item identities.
@@ -3244,7 +3456,9 @@ impl Unit {
         };
         if again && r.is_ok() && unsafe { (&*up).tcx.coro_frames.get(&ct).is_some() } {
             unsafe { (&mut *up).coro_selfref.lock().unwrap_or_else(|e| e.into_inner()).push(ct) };
+            unsafe { (&*up).coro_relower.lock().unwrap_or_else(|e| e.into_inner()).push(id) };
             r = unsafe { build_rir_lowered(up, id) };
+            unsafe { (&*up).coro_relower.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| *x != id) };
             unsafe { (&*up).coro_selfref.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| *x != ct) };
         }
         let u = unsafe { &mut *up };
@@ -3387,6 +3601,17 @@ impl Unit {
         None
     }
 
+    /// size_of::<usize>() of the program's target (4 on wasm32).
+    pub fn ptr_bytes(&self) -> u32 {
+        self.tcx.tys.ptr_bytes
+    }
+
+    /// A pointer or usize word as the program stores it: `ptr_bytes` little-endian bytes (an
+    /// address in the wasm32 window as its offset, its low 32 bits).
+    pub fn ptr_word(&self, v: u64) -> Vec<u8> {
+        if self.ptr_bytes() == 4 { (v as u32).to_le_bytes().to_vec() } else { v.to_le_bytes().to_vec() }
+    }
+
     /// vtable of `src` as `dy` (built once): [drop, size, align, methods...]
     pub fn vtable(&self, src: TyId, dy: TyId) -> Result<u64, String> {
         let src = self.tcx.tys.erase_regions(src);
@@ -3401,7 +3626,7 @@ impl Unit {
         let l = self.layout_of(src);
         let mut words: Vec<u64> = Vec::new();
         // per word: the symbol of a pointer (thunks, supertrait vtables), None for integers
-        let mut wsyms: Vec<Option<crate::rir::Sym>> = Vec::new();
+        let mut wsyms: Vec<Option<relax_backend::rir::Sym>> = Vec::new();
         let drop = if self.needs_drop_glue(src) {
             let id = self.fn_id(FnKey::Glue(GLUE_DROP, src));
             self.entry(id)
@@ -3449,11 +3674,12 @@ impl Unit {
                 words.push(address); wsyms.push(Some(self.data_sym(address)));
             }
         }
-        let mut bytes = Vec::with_capacity(words.len() * 8);
+        let pb = self.ptr_bytes();
+        let mut bytes = Vec::with_capacity(words.len() * pb as usize);
         for w in &words {
-            bytes.extend_from_slice(&w.to_le_bytes());
+            bytes.extend_from_slice(&self.ptr_word(*w));
         }
-        let a = self.data(&bytes, 8, crate::syms::DataKind::Words(wsyms));
+        let a = self.data(&bytes, pb as u64, crate::syms::DataKind::Words(wsyms));
         self.syms.set_data_name(a, format!("vtable:{}:{}", crate::syms::stable_ty(self, src), crate::syms::stable_ty(self, dy)));
         // a racing builder of the same vtable: everyone uses the first (one symbol per vtable)
         let a = self.vtables.insert_first((src, dy), a);
@@ -3582,46 +3808,63 @@ impl Unit {
         } else if let Some(id) = self.fn_map.get(&key) {
             return id;
         }
-        let _g = self.fn_create.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(id) = self.fn_map.get(&key) {
-            return id;
-        }
+        // fn_create is a leaf lock: nothing under it waits for a query, the owner or a pump
+        // (owner::Leaf). The slot's name is made before it, its ahead work queued after it
+        // (is_cold_def reads the signature: a query).
+        let name = {
+            let _k = crate::zone_alloc::kept();
+            fn_name(self, &key)
+        };
+        let id = {
+            let _g = self.fn_create.lock().unwrap_or_else(|e| e.into_inner());
+            let _leaf = crate::owner::Leaf::enter();
+            if let Some(id) = self.fn_map.get(&key) {
+                return id;
+            }
+            self.fn_create_locked(&key, name)
+        };
+        self.slot_ahead(id, &key);
+        id
+    }
+
+    /// fn_id's new slot `id` for `key` (the caller holds fn_create).
+    fn fn_create_locked(&self, key: &FnKey, name: String) -> u32 {
         let id = self.fns.len() as u32;
         self.ensure_slots(id, 1);
         // identity state: the slot's key and name (and the map's copy of the key) are the
         // program's, not the compiler arena's
-        let (entry_key, map_key, name) = {
+        let (entry_key, map_key) = {
             let _k = crate::zone_alloc::kept();
-            (key.clone(), key.clone(), fn_name(self, &key))
+            (key.clone(), key.clone())
         };
-        let file = self.key_file(&key);
+        let file = self.key_file(key);
         let stub_addr = self.slots.stub(id);
         let stub = x64::stub(id, self.lazy_entry);
         let slot_addr = self.slots.table(id);
         unsafe {
             // (no-codegen: the precompiled pools already hold slot `id`'s thunk and stub)
             if !self.prog.session.options.no_codegen {
-                let thunk = x64::thunk(slot_addr, THUNK_SIZE);
+                let thunk = x64::thunk(slot_addr);
                 os::mem::write_code(stub_addr, &stub);
                 os::mem::write_code(self.slots.thunk(id), &thunk);
             }
             *(slot_addr as *mut u64) = stub_addr;
         }
-        self.slot_named(id, &key);
+        self.slot_named(id, key);
         self.fns.push(Self::new_entry(entry_key, name, file, stub_addr, stub.len() as u32));
         if let Some(index) = self.reload_slots.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            index.insert(&key, id);
+            index.insert(key, id);
         }
         self.fn_map.insert(map_key, id);
         id
     }
 
-    fn exec_context(&self, demand: bool) -> crate::exec_census::Context {
-        crate::exec_census::Context::new(self.front.census_id, demand)
+    fn exec_context(&self, demand: bool) -> relax_codegen::exec_census::Context {
+        relax_codegen::exec_census::Context::new(self.front.census_id, demand)
     }
 
     fn exec_event(&self, id: u32, event: &str) {
-        crate::exec_census::note(self.front.census_id, id, event);
+        relax_codegen::exec_census::note(self.front.census_id, id, event);
     }
 
     /// Body ownership follows FnEntry::file (including closures), never the
@@ -3659,13 +3902,13 @@ impl Unit {
         // most slots (the startup image's thousands) are never asked.
         let entry_ref = matches!(key, FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_)) && !matches!(key, FnKey::Glue(GLUE_UNNAMED, _));
         let name = crate::zone_alloc::kept_with(|| name.into_boxed_str());
-        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), calls: Box::default() }
+        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), calls: Box::default() }
     }
 
     /// Slot `id` has its key: the front's slot keys and its ahead check (before the slot is
     /// pushed or renamed: the ahead helpers read the key by id), the demand trace.
     fn slot_named(&self, id: u32, key: &FnKey) {
-        if crate::exec_census::active() {
+        if relax_codegen::exec_census::active() {
             let mut owner = key;
             while let FnKey::Closure(_, _, parent) | FnKey::Sandbox(parent) | FnKey::Plain(parent) = owner {
                 if *parent as usize >= self.fns.len() { break; }
@@ -3674,11 +3917,11 @@ impl Unit {
             let mut meta = if let FnKey::Inst(d, _) = owner {
                 exec_metadata(&self.prog, *d, format!("{} [slot={id}]", fn_name(self, key)))
             } else {
-                crate::exec_census::Metadata { name: fn_name(self, key), krate: "<generated>".into(), module: "<generated>".into(), initializer: "" }
+                relax_codegen::exec_census::Metadata { name: fn_name(self, key), krate: "<generated>".into(), module: "<generated>".into(), initializer: "" }
             };
             if !matches!(key, FnKey::Inst(..)) { meta.initializer = ""; }
             let instance = match key { FnKey::Inst(d, a) => Some((d.0, a.iter().map(|t| t.0).collect())), _ => None };
-            crate::exec_census::register(self.front.census_id, Some(id), instance, meta);
+            relax_codegen::exec_census::register(self.front.census_id, Some(id), instance, meta);
         }
         if crate::why::enabled() {
             if let FnKey::Inst(d, _) = key {
@@ -3687,8 +3930,22 @@ impl Unit {
             }
         }
         self.front.slot_keys.insert(id, key.clone());
-        if self.front.helpers > 0 && startup_phase() {
-            self.front.queue.lock().unwrap_or_else(|e| e.into_inner()).push_back(AheadWork::Slot(id));
+    }
+
+    /// Slot `id` (named `key`, pushed) goes to the lowering-ahead helpers' queue. Not under
+    /// fn_create: is_cold_def reads the signature (a query, which may wait).
+    fn slot_ahead(&self, id: u32, key: &FnKey) {
+        // after the first present only the slots the program's own builds make (their callees),
+        // not a speculative or tier-up build's, and no cold callee (panics, formatting): what
+        // the UI thread's next calls most likely meet
+        if self.front.helpers > 0 && (startup_phase() || ahead_policy().post_present_helpers > 0 && ahead_foreground() && !match key {
+            FnKey::Inst(d, _) => is_cold_def(&self.prog, &self.tcx, *d) || is_cold_name(&self.prog.def_path(*d)),
+            _ => true,
+        }) {
+            let mut q = self.front.queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.push_back(AheadWork::Slot(id));
+            if !startup_phase() { spawn_helpers(&self.front, &q); }
+            drop(q);
             self.front.wake.notify_one();
         }
     }
@@ -3701,11 +3958,11 @@ impl Unit {
         if last > u32::MAX as u64 {
             panic!("more than 4 billion function instances");
         }
-        let (last_seg, _) = crate::rir::SlotTable::locate(last as u32);
+        let (last_seg, _) = relax_backend::rir::SlotTable::locate(last as u32);
         // no-codegen: segment 0 is precompiled and static (installed by Unit::new)
         if self.prog.session.options.no_codegen {
             if last_seg > 0 {
-                panic!("makepad run: no-codegen mode: more than {} function slots (the precompiled thunk pool)", crate::rir::SlotTable::seg_slots(0));
+                panic!("makepad run: no-codegen mode: more than {} function slots (the precompiled thunk pool)", relax_backend::rir::SlotTable::seg_slots(0));
             }
             return;
         }
@@ -3713,19 +3970,29 @@ impl Unit {
             if self.slots.has_seg(seg) {
                 continue;
             }
-            let count = crate::rir::SlotTable::seg_slots(seg);
-            let code = count * (THUNK_SIZE + STUB_SIZE);
-            let base = os::mem::reserve(code, count * (8 + TIER_REC));
-            let thunk = base;
-            let stub = thunk + (count * THUNK_SIZE) as u64;
-            let table = base + code as u64;
+            let count = relax_backend::rir::SlotTable::seg_slots(seg);
+            let (thunk, stub, table) = if self.prog.ptr_bytes == 4 {
+                // the 32-bit web target: thunks are what function pointers name, so thunks, stubs,
+                // table words and tier records all live in the program's 4 GB window
+                let code = count * (THUNK_SIZE + STUB_SIZE);
+                let base = crate::web32::reserve_slots(code, count * (8 + TIER_REC));
+                (base, base + (count * THUNK_SIZE) as u64, base + code as u64)
+            } else {
+                // the thunks are in the unit's code area, so calls reach them with a direct branch
+                // and their heads reach the code (calls.DESIGN.md); the lazy stubs, table words and
+                // tier records are a reservation of their own
+                let thunk = bump(&self.code_next, (count * THUNK_SIZE) as u64, 1 << 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+                let code = count * STUB_SIZE;
+                let stub = os::mem::reserve(code, count * (8 + TIER_REC));
+                (thunk, stub, stub + code as u64)
+            };
             let tier = table + (count * 8) as u64;
             self.slots.install(seg, thunk, stub, table, tier);
         }
         let mut id = first as u64;
         while id <= last {
-            let (seg, ix) = crate::rir::SlotTable::locate(id as u32);
-            let run = (crate::rir::SlotTable::seg_slots(seg) - ix).min((last - id + 1) as usize) as u64;
+            let (seg, ix) = relax_backend::rir::SlotTable::locate(id as u32);
+            let run = (relax_backend::rir::SlotTable::seg_slots(seg) - ix).min((last - id + 1) as usize) as u64;
             let id32 = id as u32;
             os::mem::commit(self.slots.thunk(id32), (run * THUNK_SIZE as u64) as usize);
             os::mem::commit(self.slots.stub(id32), (run * STUB_SIZE as u64) as usize);
@@ -3750,8 +4017,8 @@ impl Unit {
             // a run per segment: its slots are contiguous
             let mut id = first as usize;
             while id < first as usize + n {
-                let (seg, ix) = crate::rir::SlotTable::locate(id as u32);
-                let run = (crate::rir::SlotTable::seg_slots(seg) - ix).min(first as usize + n - id);
+                let (seg, ix) = relax_backend::rir::SlotTable::locate(id as u32);
+                let run = (relax_backend::rir::SlotTable::seg_slots(seg) - ix).min(first as usize + n - id);
                 let id0 = id as u32;
                 os::mem::fill_code(self.slots.stub(id0), run * STUB_SIZE, |buf| {
                     for i in 0..run {
@@ -3761,7 +4028,7 @@ impl Unit {
                 });
                 os::mem::fill_code(self.slots.thunk(id0), run * THUNK_SIZE, |buf| {
                     for i in 0..run {
-                        let b = x64::thunk(self.slots.table(id0 + i as u32), THUNK_SIZE);
+                        let b = x64::thunk(self.slots.table(id0 + i as u32));
                         buf[i * THUNK_SIZE..(i + 1) * THUNK_SIZE].copy_from_slice(&b);
                     }
                 });
@@ -3787,6 +4054,7 @@ impl Unit {
         let name = crate::zone_alloc::kept_with(|| fn_name(self, &key).into_boxed_str());
         let file = self.key_file(&key);
         self.slot_named(id, &key);
+        self.slot_ahead(id, &key);
         let f = &mut self.fns[id as usize];
         f.key = crate::zone_alloc::kept_clone(&key);
         f.name = name;
@@ -3829,13 +4097,13 @@ impl Unit {
     }
 
     /// All O1 RIR installations, including sandbox twins, pass through here.
-    fn set_rir(&mut self, id: u32, func: crate::rir::Func) {
+    fn set_rir(&mut self, id: u32, func: relax_backend::rir::Func) {
         if func.cabi.is_some() {
             self.fns[id as usize].entry_ref.store(true, Ordering::Relaxed);
         }
-        let mut fn_addrs: HashMap<crate::rir::VReg, Vec<u32>> = HashMap::new();
+        let mut fn_addrs: HashMap<relax_backend::rir::VReg, Vec<u32>> = HashMap::new();
         for i in func.blocks.iter().flat_map(|b| &b.insts) {
-            if let crate::rir::Inst::FnAddr(v, c) = i { fn_addrs.entry(*v).or_default().push(*c); }
+            if let relax_backend::rir::Inst::FnAddr(v, c) = i { fn_addrs.entry(*v).or_default().push(*c); }
         }
         if !fn_addrs.is_empty() {
             let escape = |v| {
@@ -3850,27 +4118,27 @@ impl Unit {
                     // Passing/storing/returning its value escapes; untracked aliases
                     // (including moves) conservatively escape too.
                     let local_call = match i {
-                        crate::rir::Inst::Call(crate::rir::Callee::Indirect(v), args, _) if !args.contains(v) => Some(*v),
+                        relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Indirect(v), args, _) if !args.contains(v) => Some(*v),
                         _ => None,
                     };
-                    relax_codegen::regalloc::for_uses(i, |v| {
+                    relax_backend::regalloc::for_uses(i, |v| {
                         if Some(v) != local_call { escape(v); }
                     });
                 }
                 term_uses.clear();
-                relax_codegen::regalloc::term_uses(&b.term, &mut term_uses);
+                relax_backend::regalloc::term_uses(&b.term, &mut term_uses);
                 for v in &term_uses { escape(*v); }
             }
         }
         for i in func.blocks.iter().flat_map(|b| &b.insts) {
             let escaped = match i {
-                crate::rir::Inst::Addr(_, s) => match self.syms.kind(s.id) {
+                relax_backend::rir::Inst::Addr(_, s) => match self.syms.kind(s.id) {
                     Some(crate::syms::SymKind::Thunk(c)) => Some(c),
                     _ => None,
                 },
                 // C ABI references cannot be represented by the direct-Rust-call
                 // oracle; conservatively give their slots an extra reference.
-                crate::rir::Inst::Call(crate::rir::Callee::CFn(c, _), _, _) => Some(*c),
+                relax_backend::rir::Inst::Call(relax_backend::rir::Callee::CFn(c, _), _, _) => Some(*c),
                 _ => None,
             };
             if let Some(c) = escaped {
@@ -3879,7 +4147,7 @@ impl Unit {
             }
         }
         let refs = func.blocks.iter().flat_map(|b| &b.insts).filter_map(|i| match i {
-            crate::rir::Inst::Call(crate::rir::Callee::Fn(c), _, _) | crate::rir::Inst::FnAddr(_, c) => Some(*c),
+            relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) | relax_backend::rir::Inst::FnAddr(_, c) => Some(*c),
             _ => None,
         }).collect::<Vec<_>>().into_boxed_slice();
         let old = std::mem::replace(&mut self.fns[id as usize].rir_refs, refs);
@@ -4009,6 +4277,9 @@ impl Unit {
         if let Some(a) = lookup_interposer(&link) {
             return Some(a);
         }
+        if let Some(&a) = self.global_asm.get().and_then(|m| m.get(&link)) {
+            return Some(a);
+        }
         if let Some(a) = loader_symbol(link.as_bytes()) {
             return Some(a as u64);
         }
@@ -4024,9 +4295,23 @@ impl Unit {
     /// on a miss).
     pub fn foreign_addr(&self, d: DefId) -> Option<u64> {
         let link = self.link_name(d);
+        // the wasm32 web target imports only what web32.rs gives in the offset ABI; anything
+        // else is missing there, as in a browser
+        if self.prog.ptr_bytes == 4 {
+            if let Some(a) = crate::web32::symbol(link.as_bytes()) {
+                return Some(a as u64);
+            }
+            return (self.prog.def(d).kind == DefKind::ForeignFn).then(|| self.missing_foreign_stub(d));
+        }
         // dlsym / GetProcAddress answer the symbols the loader provides to programs (loader_symbol) first
         if let Some(a) = lookup_interposer(&link) {
             return Some(a);
+        }
+        // the program's own global_asm! labels
+        if !self.prog.global_asms.is_empty() {
+            if let Some(&a) = crate::global_asm::symbols(self).get(&link) {
+                return Some(a);
+            }
         }
         if let Some(a) = loader_symbol(link.as_bytes()) {
             return Some(a as u64);
@@ -4099,6 +4384,12 @@ impl Unit {
     /// it is a unit call.
     pub fn const_addr_shared(&self, d: DefId, args: Vec<TyId>) -> Option<u64> {
         owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).const_addr(d, args) })
+    }
+
+    /// An inline const block's value from shared lowering (ctfe::eval_const_block, a unit call
+    /// as const_addr_shared).
+    pub fn const_block_shared(&self, body: &crate::typeck::Body, bl: crate::ast::BlockId, t: TyId) -> Option<Vec<u8>> {
+        owner::call(owner::Class::Job, || unsafe { crate::ctfe::eval_const_block(&mut *self.self_ptr.0, body, bl, t) })
     }
 
     /// static_addr from shared lowering (a unit call, as const_addr_shared).
@@ -4203,12 +4494,15 @@ impl Unit {
             // its initializer needed a module the post-boot loader has loaded since: run it
             // again into the same storage (its symbol already names that address)
             if DEFERRED_STATICS.lock().unwrap_or_else(|e| e.into_inner()).remove(&d.0) {
-                if self.run_init(d, Vec::new(), a).is_none() {
+                let pending = PendingInit::arm(d);
+                let r = self.run_init(d, Vec::new(), a);
+                pending.disarm();
+                if r.is_none() {
                     if DEFERRED_ABORT.with(|f| f.get()) { crate::zone_alloc::kept_with(|| DEFERRED_STATICS.lock().unwrap_or_else(|e| e.into_inner()).insert(d.0)); }
                     return a;
                 }
                 let sym = self.syms.intern(crate::syms::SymKind::Static(d), a);
-                crate::sandbox::capture_initial_data(self, sym);
+                crate::domain::capture_static(self, sym);
                 crate::domain::materialize(self, sym);
             }
             return a;
@@ -4234,9 +4528,15 @@ impl Unit {
         // object is an immutable snapshot taken immediately after pure CTFE,
         // never the static's later (possibly mutated) contents.
         let cached = unsafe { crate::cache::const_value(self.self_ptr.0, d, &[]) };
+        let ran = cached.is_none().then(|| {
+            let pending = PendingInit::arm(d);
+            let r = self.run_init(d, Vec::new(), buf);
+            pending.disarm();
+            r
+        });
         if let Some(initial) = cached {
             unsafe { std::ptr::copy_nonoverlapping(initial as *const u8, buf as *mut u8, l.size as usize); }
-        } else if self.run_init(d, Vec::new(), buf).is_none() {
+        } else if ran.flatten().is_none() {
             // needs a skipped module: evaluated again (same storage) once the outer compile
             // loaded it; the build using it fails meanwhile (DEFERRED_ABORT)
             if DEFERRED_ABORT.with(|a| a.get()) {
@@ -4250,7 +4550,7 @@ impl Unit {
             self.validate_final(d, t, buf);
         }
         let sym = self.syms.intern(crate::syms::SymKind::Static(d), buf);
-        crate::sandbox::capture_initial_data(self, sym);
+        crate::domain::capture_static(self, sym);
         // every other live domain gets its own copy of the new static (none: nothing to do)
         crate::domain::materialize(self, sym);
         buf
@@ -4578,13 +4878,20 @@ impl Unit {
     /// Installs new code for a slot, keeping the previous version for rollback.
     /// `gen` > 0 marks the install as part of patch group `gen`.
     /// Links `code` (emitted with its relocated fields zeroed) where it lands, then installs it.
-    pub fn install(&mut self, id: u32, code: &[u8], relocs: &[crate::rir::RelocAt], pc_map: Vec<(u32, u64)>, gen: u32) -> Result<u64, String> {
+    pub fn install(&mut self, id: u32, code: &[u8], relocs: &[relax_backend::rir::RelocAt], pc_map: Vec<(u32, u64)>, gen: u32) -> Result<u64, String> {
         // `makepad run --check-first`: a body's first code is installed only once its checker
         // accepts it (a live patch, gen > 0, passed reload's gate instead). Off by default:
         // Gandalf checks lazily in the background and the JIT never waits for it.
         if gen == 0 && CHECK_FIRST.load(Ordering::Relaxed) && !self.fns[id as usize].compiled {
             if let Some(e) = self.refused_by_check(id) {
                 return Ok(unsafe { install_error(self, id, &e) });
+            }
+            // D3: code lowered before the verdict lacks its run-time disjoint-index checks: it runs
+            // as unverified code and is built again with them
+            if !self.fns[id as usize].d3_lowered.load(Ordering::Relaxed) && self.disjoint_checks(id).is_some() {
+                self.fns[id as usize].unverified.store(true, Ordering::Relaxed);
+                self.fns[id as usize].rir = None;
+                tier_push(id, Q_RETIER, 0);
             }
         }
         self.install_unchecked(id, code, relocs, pc_map, gen)
@@ -4596,13 +4903,22 @@ impl Unit {
     /// checker rejects, whatever the background checker reached. Some(error) refuses it: the
     /// errors are printed here and the slot gets the error stub (the call ends the run).
     fn refused_by_check(&mut self, id: u32) -> Option<String> {
+        let events = self.check_first_events(id);
+        let first = events.first()?;
+        for ev in &events { eprintln!("{}", ev.error.render()); }
+        Some(format!("{} (the borrow checker rejects this body, so makepad run does not execute it)", first.error.one_line()))
+    }
+
+    /// `--check-first`: slot `id`'s owner checked now (or its verdict from this run / the disk cache); the
+    /// errors that refuse it.
+    fn check_first_events(&mut self, id: u32) -> Vec<crate::borrowck::event::GandalfEvent> {
         let options = &self.prog.session.clone().options;
-        if !crate::borrowck::lazy::gandalf_enabled(options) { return None; }
+        if !crate::borrowck::lazy::gandalf_enabled(options) { return Vec::new(); }
         let d = match &self.fns[id as usize].key {
             FnKey::Inst(d, _) if crate::borrowck::event::admit(&self.prog, self.prog.def(*d).krate) => *d,
-            _ => return None,
+            _ => return Vec::new(),
         };
-        crate::borrowck::body::CheckedBody::item(&self.prog, d)?;
+        if crate::borrowck::body::CheckedBody::item(&self.prog, d).is_none() { return Vec::new(); }
         let mut c = self.cache.take();
         let key = c.as_mut().and_then(|c| c.borrowck_key(self, id));
         let cached = match (&c, key) {
@@ -4617,20 +4933,38 @@ impl Unit {
             }
         }
         let src: std::sync::Arc<dyn crate::borrowck::lazy::FrontSource> = std::sync::Arc::new(BorrowckFront(self.front.clone()));
-        let events = crate::borrowck::lazy::check_before_run(&self.prog, &self.tcx, &src, d, epoch, key, cached);
-        let first = events.first()?;
-        for ev in &events { eprintln!("{}", ev.error.render()); }
-        Some(format!("{} (the borrow checker rejects this body, so makepad run does not execute it)", first.error.one_line()))
+        crate::borrowck::lazy::check_before_run(&self.prog, &self.tcx, &src, d, epoch, key, cached)
     }
 
-    fn install_unchecked(&mut self, id: u32, code: &[u8], relocs: &[crate::rir::RelocAt], pc_map: Vec<(u32, u64)>, gen: u32) -> Result<u64, String> {
-        let _cost_install = crate::fncost::phase(6);
+    /// `--check-first` in a crate with relaxed Rust's `disjoint-index`: the check runs before the first
+    /// lowering of slot `id`, so its first code makes the verdict's run-time disjoint-index checks (the
+    /// install then takes this verdict).
+    pub(crate) fn check_before_lowering(&mut self, id: u32) {
+        if !CHECK_FIRST.load(Ordering::Relaxed) || self.fns[id as usize].compiled { return; }
+        let FnKey::Inst(d, _) = &self.fns[id as usize].key else { return };
+        let k = self.prog.def(*d).krate as usize;
+        if !self.prog.crates[k].relaxed(&self.prog).iter().any(|f| f == "disjoint-index") { return; }
+        let _ = self.check_first_events(id);
+    }
+
+    fn install_unchecked(&mut self, id: u32, code: &[u8], relocs: &[relax_backend::rir::RelocAt], pc_map: Vec<(u32, u64)>, gen: u32) -> Result<u64, String> {
+        let _cost_install = relax_codegen::fncost::phase(6);
+        // makepad inspect: new code for an instrumented slot (a live patch, a verdict's rebuild,
+        // a lazy recompile) replaces its counters and probes, and the first code of a slot whose
+        // SPEC-V twin (or base) is instrumented runs the same fn: either way the instruments are
+        // put into the new code on the owner afterwards
+        let sibling = match self.fns[id as usize].key {
+            FnKey::Plain(b) => Some(b),
+            FnKey::Inst(..) | FnKey::Closure(..) => self.plain_twin_of(id),
+            _ => None,
+        };
+        crate::inspect::patches::replaced(id, sibling);
         let options = &self.prog.session.clone().options;
         // an interpreted function (its relocatable form) or, in no-codegen mode, a jump (a
         // foreign function's veneer): the slot takes the entry itself, nothing is written
         let interp = relax_codegen::interp::blob::is_blob(code);
         // the unwind trailer is kept beside the code, not in it
-        let (n, info) = if interp { (code.len(), None) } else { crate::rir::split_unwind_info(code) };
+        let (n, info) = if interp { (code.len(), None) } else { relax_backend::rir::split_unwind_info(code) };
         let code = &code[..n];
         let twin = matches!(self.fns[id as usize].key, FnKey::Sandbox(_));
         let redirect = if interp || options.no_codegen { Some(self.no_codegen_target(code, relocs, &self.fns[id as usize].name)?) } else { None };
@@ -4673,10 +5007,7 @@ impl Unit {
         if (first && gen == 0 || gen > 0) && crate::borrowck::lazy::gandalf_enabled(options) {
             self.note_first_borrowck(id, (gen > 0).then_some(0));
         }
-        unsafe {
-            let slot = self.slots.table(id) as *const AtomicU64;
-            (*slot).store(at, Ordering::SeqCst);
-        }
+        SlotWord::of(&self.slots, id).store(at, Ordering::SeqCst);
         // its first run: O3 code that kept a call to it as never-run is built again
         if first && !self.cold_users.is_empty() {
             if let Some(users) = self.cold_users.remove(&id) {
@@ -4723,7 +5054,9 @@ impl Unit {
             trace_stored_verdict(&self.prog, d, "instance", cached.as_ref());
             let src: std::sync::Arc<dyn crate::borrowck::lazy::FrontSource> = std::sync::Arc::new(BorrowckFront(self.front.clone()));
             let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
-            crate::borrowck::lazy::note_program(options, &src, epoch);
+            if borrowck_discovery() {
+                crate::borrowck::lazy::note_program(options, &src, epoch);
+            }
             crate::borrowck::lazy::note_compiled(options, &src, crate::borrowck::lazy::NoteFn {
                 def: d, args: a, cache_key: key, epoch, rank, cached,
             });
@@ -4749,12 +5082,20 @@ impl Unit {
             FnKey::Inst(d, args) => {
                 if !crate::borrowck::event::admit(&self.prog, self.prog.def(*d).krate) || crate::borrowck::body::CheckedBody::item(&self.prog, *d).is_none() { return Verdict::Clean; }
                 let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
-                match crate::borrowck::lazy::verdict(std::sync::Arc::as_ptr(&self.front) as usize, *d, args, epoch) {
-                    FnVerdict::Clean => Verdict::Clean,
-                    FnVerdict::Errors(events) => Verdict::Failed(events),
+                let pending = match crate::borrowck::lazy::verdict(std::sync::Arc::as_ptr(&self.front) as usize, *d, args, epoch) {
+                    FnVerdict::Clean => return Verdict::Clean,
+                    FnVerdict::Errors(events) => return Verdict::Failed(events),
                     FnVerdict::Pending => Verdict::Pending,
                     FnVerdict::Unchecked(why) if matches!(why.as_str(), "stale" | "not queued" | "changed") => Verdict::Pending,
-                    FnVerdict::Unchecked(why) => Verdict::Unverifiable(why),
+                    FnVerdict::Unchecked(why) => return Verdict::Unverifiable(why),
+                };
+                // not checked in this run yet: the owner's verdict stored by an earlier run (the one the
+                // background checker reuses when it reaches this body; it waits for the start, so a warm
+                // launch would otherwise lower every app body it compiles as unverified code)
+                match self.stored_owner_verdict(*d, epoch) {
+                    Some(crate::borrowck::lazy::StoredVerdict::Clean) => Verdict::Clean,
+                    Some(crate::borrowck::lazy::StoredVerdict::Unchecked(why)) => Verdict::Unverifiable(why),
+                    None => pending,
                 }
             }
             FnKey::Closure(_, _, parent) => self.verdict_state(*parent),
@@ -4764,9 +5105,44 @@ impl Unit {
         }
     }
 
+    /// SPEC-V: the verdict an earlier run stored for owner `d` under the current sources (cache.rs
+    /// OwnerVerdicts: the crate fingerprints and the definition), if any.
+    /// Looked up once per owner and epoch (sweep_verdicts asks again for every waiting slot).
+    fn stored_owner_verdict(&self, d: DefId, epoch: u64) -> Option<crate::borrowck::lazy::StoredVerdict> {
+        if let Some(v) = self.front.stored_owner.get(&(epoch, d)) {
+            return v;
+        }
+        let c = self.cache.as_ref()?;
+        let v = match self.front.owner_verdicts.get(&epoch) {
+            Some(v) => v,
+            None => crate::zone_alloc::kept_with(|| self.front.owner_verdicts.insert_first(epoch, std::sync::Arc::new(c.owner_verdicts(epoch)))),
+        };
+        let found = v.lookup(&self.prog, d, epoch).1;
+        crate::zone_alloc::kept_with(|| self.front.stored_owner.insert_first((epoch, d), found))
+    }
+
+    /// Relaxed Rust D3: the run-time disjoint-index checks slot `id`'s clean verdict asks its code
+    /// to make (the borrow checker accepted index borrows as disjoint without a proof). A closure is
+    /// checked with its parent. None: no such checks (or no verdict yet: unverified code has none).
+    pub(crate) fn disjoint_checks(&self, id: u32) -> Option<std::sync::Arc<Vec<(relax_types::mir::Span, relax_types::mir::Span)>>> {
+        match &self.fns[id as usize].key {
+            FnKey::Inst(d, _) => {
+                let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
+                crate::borrowck::lazy::disjoint_checks(std::sync::Arc::as_ptr(&self.front) as usize, *d, epoch)
+            }
+            FnKey::Closure(_, _, parent) => self.disjoint_checks(*parent),
+            _ => None,
+        }
+    }
+
     /// SPEC-V: the unverified-mode twin of slot `id` (created on first use); `id` itself when it has
     /// none (only fn instances and closures are built from a body).
     pub(crate) fn plain_twin(&self, id: u32) -> u32 {
+        // a callee a helper's ahead lowering has only a temporary reference to (no slot yet): the
+        // twin is keyed by the real slot, so the body is built on the locked path instead
+        if lower_ahead_fn_key(id).is_some() {
+            lower_ahead_needs_unit();
+        }
         match self.fns[id as usize].key {
             FnKey::Inst(..) | FnKey::Closure(..) => self.fn_id(FnKey::Plain(id)),
             _ => id,
@@ -4776,6 +5152,19 @@ impl Unit {
     /// SPEC-V: the twin of `id`, if one exists.
     pub(crate) fn plain_twin_of(&self, id: u32) -> Option<u32> {
         self.fn_map.get(&FnKey::Plain(id))
+    }
+
+    /// SPEC-V: whether slot `id` may get O3 code. Verified code does; so does unverified code (twins,
+    /// bodies whose verdict is pending or will never come), built from its unverified lowering as it
+    /// is: `noalias` withheld, its aliasing-prone calls still going to twins, never inlined, never
+    /// cached, built again once its verdict is clean (sweep_verdicts). Not while a live patch awaits
+    /// its verdict, and never for the code of a patch without a clean verdict: a rejected patch group
+    /// is rolled back to the code it replaced, as a whole.
+    pub(crate) fn o3_allowed(&self, id: u32) -> bool {
+        if self.refresh_verified(id) { return true; }
+        let body = match self.fns[id as usize].key { FnKey::Plain(b) => b, _ => id };
+        crate::reload::observations_verified()
+            && (self.fns[id as usize].patch_gen == 0 && self.fns[body as usize].patch_gen == 0 || self.verdict_clean(body))
     }
 
     /// SPEC-V: whether slot `id`'s code is verified. A flagged slot whose verdict has become clean
@@ -4805,10 +5194,7 @@ impl Unit {
         f.pc_map = pc_map;
         f.compiled = true;
         f.version += 1;
-        unsafe {
-            let slot = self.slots.table(id) as *const AtomicU64;
-            (*slot).store(at, Ordering::SeqCst);
-        }
+        SlotWord::of(&self.slots, id).store(at, Ordering::SeqCst);
         if !self.cold_users.is_empty() {
             if let Some(users) = self.cold_users.remove(&id) {
                 for t in users {
@@ -4845,10 +5231,7 @@ impl Unit {
             let f = &mut self.fns[id as usize];
             f.version += 1;
             let at = f.code;
-            unsafe {
-                let slot = self.slots.table(id) as *const AtomicU64;
-                (*slot).store(at, Ordering::SeqCst);
-            }
+            SlotWord::of(&self.slots, id).store(at, Ordering::SeqCst);
         }
     }
 
@@ -4870,16 +5253,14 @@ impl Unit {
             f.pc_map = prev.2;
             f.patch_gen = prev.3;
             f.rir = None;
+            crate::inspect::patches::replaced(id as u32, None);
             // SPEC-V: the previous code is what ran before the group (its own status is rebuilt with it)
             f.unverified.store(false, Ordering::Relaxed);
             f.version += 1;
             if prev.1 == 0 {
                 f.compiled = false;
             }
-            unsafe {
-                let slot = self.slots.table(id as u32) as *const AtomicU64;
-                (*slot).store(prev.0, Ordering::SeqCst);
-            }
+            SlotWord::of(&self.slots, id as u32).store(prev.0, Ordering::SeqCst);
             self.frequency_profiles.remove(&(id as u32));
             out.push(id as u32);
         }
@@ -5015,10 +5396,10 @@ pub fn watchdog_done() {
 }
 
 /// Attribute methods and closures to their declaration module, not their callers.
-fn exec_metadata(prog: &Program, d: DefId, name: String) -> crate::exec_census::Metadata {
+fn exec_metadata(prog: &Program, d: DefId, name: String) -> relax_codegen::exec_census::Metadata {
     let def = prog.def(d);
     let module = &prog.mods[prog.mods[def.scope as usize].normal as usize];
-    crate::exec_census::Metadata {
+    relax_codegen::exec_census::Metadata {
         name,
         krate: prog.syms.str(prog.crates[def.krate as usize].name).to_owned(),
         module: prog.def_path(module.def),
@@ -5028,12 +5409,12 @@ fn exec_metadata(prog: &Program, d: DefId, name: String) -> crate::exec_census::
 
 /// Diagnostic metadata is read only in a unit call (the slot table is the owner's).
 unsafe fn cost_name(up: *mut Unit, id: u32) {
-    if !crate::fncost::enabled() && !crate::warm::enabled() { return; }
+    if !relax_codegen::fncost::enabled() && !relax_codegen::warm::enabled() { return; }
     let f = &(&*up).fns[id as usize];
-    crate::fncost::name(id, &f.name);
-    if crate::warm::enabled() { crate::warm::name(id, &crate::syms::stable_fn_name(&*up, id)); }
+    relax_codegen::fncost::name(id, &f.name);
+    if relax_codegen::warm::enabled() { relax_codegen::warm::name(id, &crate::syms::stable_fn_name(&*up, id)); }
     if let FnKey::Inst(d, args) = &f.key {
-        crate::fncost::instance(id, d.0, &args.iter().map(|t| t.0).collect::<Vec<_>>());
+        relax_codegen::fncost::instance(id, d.0, &args.iter().map(|t| t.0).collect::<Vec<_>>());
     }
 }
 
@@ -5097,6 +5478,17 @@ pub struct MainCompile {
     pub cpu: [u64; 3],
     /// RIR instructions entering optimisation (after the front's inlining) and entering codegen
     pub insts: [u32; 2],
+    /// the longest owner-queue wait of its requests (ns), and what the owner served when that
+    /// request was queued: class + 1 (0: idle) and requester
+    pub behind_ns: u64,
+    pub behind: u8,
+    pub behind_from: u64,
+    /// where that served request was made (its owner::call site)
+    pub behind_site: Option<&'static std::panic::Location<'static>>,
+    /// compile jobs running at its start, and the queued speculative, O2 and O3 builds (after the
+    /// first present only: postframe.rs)
+    pub jobs: u32,
+    pub queued: [u32; 3],
 }
 
 pub const MAIN_HOW_NAMES: [&str; 6] = ["done", "cache", "spec", "inflight", "split", "plain"];
@@ -5130,6 +5522,19 @@ fn main_rec(f: impl FnOnce(&mut MainCompile)) {
         f(&mut r);
         c.set(Some(r));
     }
+}
+
+/// A request of the main thread's compile waited `queue` ns in the owner's queue, queued while the
+/// owner served class `class` (u8::MAX: idle) for thread `from` (owner.rs, on the requester).
+pub(crate) fn main_rec_behind(queue: u64, class: u8, from: u64, site: Option<&'static std::panic::Location<'static>>) {
+    main_rec(|r| {
+        if queue > r.behind_ns {
+            r.behind_ns = queue;
+            r.behind = if class == u8::MAX { 0 } else { class + 1 };
+            r.behind_from = from;
+            r.behind_site = site;
+        }
+    });
 }
 
 fn main_how(how: u8) {
@@ -5174,6 +5579,7 @@ unsafe fn compile_slot_on_stack(up: *mut Unit, id: u32) -> u64 {
             owner::post(owner::Class::Main, move || unsafe { realtime_reach(upn as *mut Unit, vec![id], "miss") });
         }
         let dt = wall_ns() - t;
+        crate::postframe::rt_compile(t, dt);
         let n = RT_LAZY.fetch_add(1, Ordering::Relaxed);
         RT_LAZY_NS.fetch_add(dt, Ordering::Relaxed);
         // the first few and every long stall by name; the total at exit (run.rs summary)
@@ -5187,19 +5593,30 @@ unsafe fn compile_slot_on_stack(up: *mut Unit, id: u32) -> u64 {
 }
 
 unsafe fn compile_slot_on_stack_rt(up: *mut Unit, id: u32) -> u64 {
-    let _census_context = (&*up).exec_context(crate::exec_census::active() && crate::exec_profile::is_call(up as usize, id));
+    let _census_context = (&*up).exec_context(relax_codegen::exec_census::active() && crate::exec_profile::is_call(up as usize, id));
 
-    let cost_origin = if crate::fncost::enabled() && crate::clock::TYS_ORIGIN.try_with(|o| o.get() == "fncost-ahead").unwrap_or(false) { "ahead" } else { "lazy-on-call" };
-    let _cost = crate::fncost::Record::new(id, 0, cost_origin);
-    crate::fncost::event("call", id);
+    let cost_origin = if relax_codegen::fncost::enabled() && crate::clock::TYS_ORIGIN.try_with(|o| o.get() == "fncost-ahead").unwrap_or(false) { "ahead" } else { "lazy-on-call" };
+    let _cost = relax_codegen::fncost::Record::new(id, 0, cost_origin);
+    relax_codegen::fncost::event("call", id);
     let on_main = MAIN_TID.load(Ordering::Relaxed) == me() && !owner::is_owner();
     if on_main {
-        MAIN_REC.with(|c| c.set(Some(MainCompile { start: wall_ns(), slot: id, how: u8::MAX, ..Default::default() })));
+        let mut rec = MainCompile { start: wall_ns(), slot: id, how: u8::MAX, ..Default::default() };
+        if FIRST_PRESENT.load(Ordering::Relaxed) {
+            rec.jobs = BG_ACTIVE.load(Ordering::Relaxed);
+            let len = |n: Option<usize>| n.map_or(u32::MAX, |n| n as u32);
+            rec.queued = [len(SPEC_Q.try_lock().ok().map(|q| q.len())), len(O2_QUEUE.try_lock().ok().map(|q| q.len())), len(TIER_QUEUE.try_lock().ok().map(|q| q.len()))];
+        }
+        MAIN_REC.with(|c| c.set(Some(rec)));
+    }
+    if on_main {
+        crate::postframe::ui_wait_begin();
     }
     let r = compile_slot_on_stack_inner(up, id);
     if on_main {
+        crate::postframe::ui_wait_end();
         if let Some(mut rec) = MAIN_REC.with(|c| c.take()) {
             rec.end = wall_ns();
+            crate::postframe::main_compile(&(&*up).fns[id as usize].name, &rec);
             MAIN_COMPILES.lock().unwrap().push(rec);
         }
     }
@@ -5259,6 +5676,14 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
             main_rec(|r| r.ns[1] += wall_ns() - t);
             let w0 = wall_ns();
             COMPILE_LAST.store(w0, Ordering::Relaxed);
+            if crate::postframe::log_on() && FIRST_PRESENT.load(Ordering::Relaxed) {
+                let mut mine = false;
+                main_rec(|_| mine = true);
+                if mine {
+                    let k = crate::zone_alloc::kept_with(|| slot_key(&*up, id));
+                    *crate::postframe::LOG_KEY.lock().unwrap() = k;
+                }
+            }
             let r = compile_slot_locked(up, id, true);
             if let Compiled::Code(_) = r {
                 compile_note(up, id, w0);
@@ -5292,10 +5717,30 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
 /// After an outer compile of slot `id` that began at `w0` installed it (unit call): the
 /// execution profile's call and the compile-wall statistics.
 unsafe fn compile_note(up: *mut Unit, id: u32, w0: u64) {
+    if QUIT_SEEN.load(Ordering::Relaxed) {
+        quit_compile_note(&*up, id, w0);
+    }
     if (&*up).prog.session.runtime.profile && crate::exec_profile::is_call(up as usize, id) && (&*up).fns[id as usize].compiled && (&*up).fns[id as usize].build_err.is_none() {
         (&*up).exec_note(id, crate::exec_profile::CALL);
     }
     compile_wall_add(up, w0);
+}
+
+/// Lazy compiles after the app asked to quit: count, wall ns (the quit waits for them). The exit
+/// summary reports them; MAKEPAD_RUN_QUIT_LOG=<path> also lists each (ms, thread, slot).
+pub static QUIT_COMPILES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn quit_compile_note(u: &Unit, id: u32, w0: u64) {
+    let dt = wall_ns().saturating_sub(w0);
+    QUIT_COMPILES[0].fetch_add(1, Ordering::Relaxed);
+    QUIT_COMPILES[1].fetch_add(dt, Ordering::Relaxed);
+    static LOG: std::sync::OnceLock<Option<relax_session::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let log = LOG.get_or_init(|| std::env::var_os("MAKEPAD_RUN_QUIT_LOG").and_then(|p| crate::zone_alloc::kept_with(|| std::fs::OpenOptions::new().create(true).append(true).open(p).ok().map(relax_session::sync::Mutex::new))));
+    if let Some(f) = log {
+        use std::io::Write;
+        let line = format!("{:.3} {} {}\n", dt as f64 / 1e6, crate::os::thread::name(me()), u.fns[id as usize].name);
+        let _ = f.lock().unwrap_or_else(|e| e.into_inner()).write_all(line.as_bytes());
+    }
 }
 
 /// Compile-wall statistics for one outer compile that began at `w0` (on the owner thread).
@@ -5431,7 +5876,7 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
             // another thread optimises / generates it off the unit: wait for that build
             // instead of making a second one (its finish is served meanwhile)
             let w = wall_ns();
-            { let _cost_wait = crate::fncost::phase(8); wait_inflight(up, id); }
+            { let _cost_wait = relax_codegen::fncost::phase(8); wait_inflight(up, id); }
             let w1 = wall_ns();
             SPLIT_NS[3].fetch_add(w1 - w, Ordering::Relaxed);
             main_how(3);
@@ -5524,12 +5969,32 @@ impl Unit {
     }
 }
 
+/// A background drain of the deferred cache records is queued (one at a time)
+static RECORD_DRAIN: AtomicBool = AtomicBool::new(false);
+
+/// After the first present: the deferred cache records are encoded in batches of
+/// POST_PRESENT_BATCH, each its own Background request (a program thread's request is served
+/// between two), until none is left.
+fn drain_cache_records() {
+    if RECORD_DRAIN.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    owner::post_queued(owner::Class::Background, || {
+        let up = SPEC_UNIT.load(Ordering::Acquire);
+        let more = !SPEC_STOP.load(Ordering::SeqCst) && !up.is_null() && unsafe { (&mut *up).record_cache_batch(POST_PRESENT_BATCH) };
+        RECORD_DRAIN.store(false, Ordering::Release);
+        if more {
+            drain_cache_records();
+        }
+    });
+}
+
 /// Installs a slot's compiled code (on the owner thread): perf map, O3 counter, and the
 /// speculative builds of its callees.
 /// Links and installs a slot's code (`relocs` are the code's own; `record`: the disk cache
 /// stores it -- false for code that came from the cache).
-unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[crate::rir::RelocAt], record: bool) -> u64 {
-    let _cost_install = crate::fncost::phase(6);
+unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[relax_backend::rir::RelocAt], record: bool) -> u64 {
+    let _cost_install = relax_codegen::fncost::phase(6);
     // check-before-run (Unit::install), before the code is recorded: a refused body's code
     // never reaches the disk cache or the startup image (a warm start would run it unchecked)
     if CHECK_FIRST.load(Ordering::Relaxed) && (&*up).fns[id as usize].patch_gen == 0 && !(&*up).fns[id as usize].compiled {
@@ -5555,16 +6020,27 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
             let u = &mut *up;
             if record {
                 if let Some(mut c) = u.cache.take() {
-                    // before the first present the main thread waits for this install: its
-                    // entry (slot keys, dependency certificate) is encoded after the present
-                    let deferred = if startup_phase() && !FIRST_PRESENT.load(Ordering::Acquire) && owner::for_main() {
+                    // a program thread waits for this install (the main thread's before the first
+                    // present, every program thread's after it): its entry (slot keys, dependency
+                    // certificate) is encoded later, in background batches (drain_cache_records)
+                    let foreground = if FIRST_PRESENT.load(Ordering::Acquire) {
+                        matches!(owner::serving().0, owner::Class::Main | owner::Class::App | owner::Class::Finish)
+                    } else {
+                        startup_phase() && owner::for_main()
+                    };
+                    let deferred = if foreground {
                         c.defer_record(u, id, code, relocs, &map)
                     } else {
                         c.record(u, id, code, relocs, &map);
                         None
                     };
                     u.cache = Some(c);
-                    if let Some(p) = deferred { u.pending_cache_records.push(Some(p)); }
+                    if let Some(p) = deferred {
+                        u.pending_cache_records.push(Some(p));
+                        if FIRST_PRESENT.load(Ordering::Acquire) {
+                            drain_cache_records();
+                        }
+                    }
                 }
             }
             let u = &mut *up;
@@ -5584,10 +6060,14 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                     ORDER_PRESENT_LEN.store(u.start_order.len(), Ordering::Relaxed);
                 }
             }
+            let linked_from_cache = !record && !u.fns[id as usize].compiled && !u.fns[id as usize].o3.load(Ordering::Relaxed);
             let a = match u.install_unchecked(id, code, relocs, map, 0) {
                 Ok(a) => a,
                 Err(e) => return install_error(up, id, &format!("link: {}", e)),
             };
+            if linked_from_cache {
+                crate::boot_stats::fn_installed(boot_arm(u, id));
+            }
             if perf_map_on() {
                 // the code's level: cached O3 / baseline / O2 (cached or marked) / O1
                 let tier = if u.fns[id as usize].o3.load(Ordering::Relaxed) {
@@ -5676,7 +6156,7 @@ fn note_const_reader(u: &Unit, d: DefId, slot: u32) {
 
 /// Hot reload (reload.rs): installs the first code of a slot as a lazy compile would (cache
 /// record, O3 counter, speculation of its callees).
-pub(crate) unsafe fn install_first(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[crate::rir::RelocAt]) -> u64 {
+pub(crate) unsafe fn install_first(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[relax_backend::rir::RelocAt]) -> u64 {
     install_compiled(up, id, code, map, relocs, true)
 }
 
@@ -5687,7 +6167,7 @@ pub(crate) unsafe fn install_failed(up: *mut Unit, id: u32, e: &str) -> u64 {
 
 /// Hot reload: installs a patched slot's code as part of patch group `gen` (kept for rollback),
 /// with a fresh O3 counter.
-pub(crate) unsafe fn install_patched(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[crate::rir::RelocAt], gen: u32) -> Result<u64, String> {
+pub(crate) unsafe fn install_patched(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[relax_backend::rir::RelocAt], gen: u32) -> Result<u64, String> {
     let u = &mut *up;
     let a = u.install(id, code, relocs, map, gen)?;
     if matches!(u.fns[id as usize].key, FnKey::Sandbox(_)) {
@@ -5753,28 +6233,28 @@ fn perf_map(addr: u64, len: usize, name: &str) {
     }
 }
 
-fn error_stub(u: &mut Unit, msg: &str) -> (Vec<u8>, Vec<crate::rir::RelocAt>) {
+fn error_stub(u: &mut Unit, msg: &str) -> (Vec<u8>, Vec<relax_backend::rir::RelocAt>) {
     let options = &u.prog.session.clone().options;
-    let mut f = crate::rir::Func::new("error".to_string(), 0);
+    let mut f = relax_backend::rir::Func::new("error".to_string(), 0);
     let b = f.block();
     let addr = u.data(msg.as_bytes(), 1, crate::syms::DataKind::Bytes);
     let addr = u.data_sym(addr);
-    let p = f.vreg(crate::rir::Cls::I);
-    let l = f.vreg(crate::rir::Cls::I);
-    let z = f.vreg(crate::rir::Cls::I);
-    let s = f.vreg(crate::rir::Cls::I);
+    let p = f.vreg(relax_backend::rir::Cls::I);
+    let l = f.vreg(relax_backend::rir::Cls::I);
+    let z = f.vreg(relax_backend::rir::Cls::I);
+    let s = f.vreg(relax_backend::rir::Cls::I);
     let blk = &mut f.blocks[b as usize];
-    blk.insts.push(crate::rir::Inst::Addr(p, addr));
-    blk.insts.push(crate::rir::Inst::Iconst(l, msg.len() as i64));
-    blk.insts.push(crate::rir::Inst::Iconst(z, 0));
-    blk.insts.push(crate::rir::Inst::Call(crate::rir::Callee::Host(u.rs.fmt_str), vec![p, l, z], Vec::new()));
-    blk.insts.push(crate::rir::Inst::Iconst(s, u64::MAX as i64));
-    blk.insts.push(crate::rir::Inst::Call(crate::rir::Callee::Host(u.rs.panic_site), vec![s], Vec::new()));
+    blk.insts.push(relax_backend::rir::Inst::Addr(p, addr));
+    blk.insts.push(relax_backend::rir::Inst::Iconst(l, msg.len() as i64));
+    blk.insts.push(relax_backend::rir::Inst::Iconst(z, 0));
+    blk.insts.push(relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Host(u.rs.fmt_str), vec![p, l, z], Vec::new()));
+    blk.insts.push(relax_backend::rir::Inst::Iconst(s, u64::MAX as i64));
+    blk.insts.push(relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Host(u.rs.panic_site), vec![s], Vec::new()));
     for _ in 0..blk.insts.len() {
         blk.pos.push(0);
     }
-    blk.term = crate::rir::Term::Unreachable;
-    x64::compile(options, &f, &u.env).map(|c| (c.code, c.relocs)).unwrap_or_default()
+    blk.term = relax_backend::rir::Term::Unreachable;
+    relax_codegen::native::compile(options, &f, &u.env).map(|c| (c.code, c.relocs)).unwrap_or_default()
 }
 
 fn why_function(u: &Unit, id: u32, phase: &str) -> Option<crate::why::Scope> {
@@ -5789,11 +6269,11 @@ fn why_function(u: &Unit, id: u32, phase: &str) -> Option<crate::why::Scope> {
 fn why_compile(u: &Unit, id: u32) -> Option<crate::why::Scope> { why_function(u, id, "compile") }
 
 /// Builds (or reuses) a slot's optimised RIR, then generates machine code.
-pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u64)>, Vec<crate::rir::RelocAt>), String> {
-    let _census_context = (&*up).exec_context(crate::exec_census::active() && crate::exec_profile::is_call(up as usize, id));
+pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>), String> {
+    let _census_context = (&*up).exec_context(relax_codegen::exec_census::active() && crate::exec_profile::is_call(up as usize, id));
 
     let _why = why_compile(&*up, id);
-    let _cost = crate::fncost::Record::ensure(id, 0, "ahead");
+    let _cost = relax_codegen::fncost::Record::ensure(id, 0, "ahead");
     cost_name(up, id);
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
@@ -5806,7 +6286,7 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
             let u = &mut *up;
             return match u.foreign_addr(d) {
                 // a jump to the C address (the cache neither records nor looks up foreign fns)
-                Some(a) => { let _warm = crate::warm::Scope::slot(id, "foreign veneer emission"); let code = x64::jump_to(a); crate::fncost::code(code.len()); Ok((code, Vec::new(), Vec::new())) },
+                Some(a) => { let _warm = relax_codegen::warm::Scope::slot(id, "foreign veneer emission"); let code = x64::jump_to(a); relax_codegen::fncost::code(code.len()); Ok((code, Vec::new(), Vec::new())) },
                 None => Err(format!("unknown foreign function `{}` -- link its library (#[link])", u.prog.name(d))),
             };
         }
@@ -5835,29 +6315,30 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
     let rir = twin_func.as_ref().unwrap_or_else(|| u.fns[id as usize].rir.as_ref().unwrap());
     let cg = tier0_codegen_rir(options, rir, u.opt.fold, u.opt.layout);
     let func = &cg;
+    crate::wasm_export::capture(id, func);
     // without O3 these are the only compiles: allocate thoroughly
     let env_full;
     let env = if func.baseline || (TIER1_ENABLED.load(Ordering::Relaxed) && !func.full) {
         &u.env
     } else {
         let e = &u.env;
-        env_full = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class };
+        env_full = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class, near: e.near };
         &env_full
     };
-    compile_watch(Some((&format!("codegen {}", func.name), crate::opt::inst_count(func))));
+    compile_watch(Some((&format!("codegen {}", func.name), relax_codegen::opt::inst_count(func))));
     let mps = crate::memstat::peak_start();
     let c = crate::memstat::tagged(crate::memstat::Tag::Codegen, || {
         let _scratch = crate::zone_alloc::scratch(runtime);
-        x64::compile(options, func, env)
+        relax_codegen::native::compile(options, func, env)
     });
     crate::memstat::note_big("codegen", &func.name, mps, || cg_shape(func));
     compile_watch(None);
     let c = c?;
     note_frame(id, c.frame_size, slot_bytes(func), false);
-    code_sig(id, func, &c.code, c.alloc_sig);
+    code_sig(id, func, &c.code, c.alloc_sig, false);
     crate::syms::reloc_sig(u, || crate::syms::stable_fn_name(u, id), &c.code, &c.relocs, &c.pc_map);
     dump_o1(func, &c);
-    let n = crate::opt::inst_count(func) as u32;
+    let n = relax_codegen::opt::inst_count(func) as u32;
     let t3 = cpu_ns();
     main_rec(|r| {
         r.cpu[2] += t3 - t0;
@@ -5867,6 +6348,7 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
     u.fns[id as usize].cg_ns = cpu_ns() - t0;
     u.stats.compiled += 1;
     COMPILED_FNS.fetch_add(1, Ordering::Relaxed);
+    crate::boot_stats::fn_installed(boot_arm(u, id));
     Ok((c.code, c.pc_map, c.relocs))
 }
 
@@ -5874,7 +6356,7 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
 /// (probe calls added), then installed as part of patch group `gen` -- `rollback_gen(gen)`
 /// restores the code it replaced. Nothing is recorded in the disk cache and the slot's RIR stays
 /// the plain one (O3 and O2 installs skip instrumented slots: inspect::instrument::active).
-pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, base: Option<crate::rir::Func>, edit: &mut dyn FnMut(&mut crate::rir::Func, &Unit)) -> Result<u64, String> {
+pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, base: Option<relax_backend::rir::Func>, edit: &mut dyn FnMut(&mut relax_backend::rir::Func, &Unit)) -> Result<u64, String> {
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
     let runtime = &session.runtime;
@@ -5887,7 +6369,7 @@ pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, base
         build_rir(up, id)?;
     }
     let u = &mut *up;
-    let mut f: crate::rir::Func = match base {
+    let mut f: relax_backend::rir::Func = match base {
         Some(f) => f,
         None => {
             let Some(rir) = u.fns[id as usize].rir.clone() else { return Err("no RIR for this slot".into()) };
@@ -5898,7 +6380,7 @@ pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, base
     let cg = tier0_codegen_rir(options, &f, u.opt.fold, u.opt.layout);
     let c = {
         let _scratch = crate::zone_alloc::scratch(runtime);
-        x64::compile(options, &cg, &u.env)
+        relax_codegen::native::compile(options, &cg, &u.env)
     }?;
     note_frame(id, c.frame_size, slot_bytes(&cg), false);
     u.install(id, &c.code, &c.relocs, c.pc_map, gen)
@@ -5907,7 +6389,7 @@ pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, base
 /// makepad inspect's by-name probes: slot `id`'s body lowered again with probe calls at `points`
 /// (lower.rs ProbePoint), as baseline RIR (no inlining of user fns: the probe calls stay calls
 /// for probes.rs to guard). The slot's own RIR is untouched. What each point found comes back.
-pub(crate) unsafe fn relower_with_probes(up: *mut Unit, id: u32, points: Vec<crate::lower::ProbePoint>) -> Result<(crate::rir::Func, Vec<(u32, Result<(), String>)>), String> {
+pub(crate) unsafe fn relower_with_probes(up: *mut Unit, id: u32, points: Vec<crate::lower::ProbePoint>) -> Result<(relax_backend::rir::Func, Vec<(u32, Result<(), String>)>), String> {
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
     let _ = crate::lower::PROBE_POINTS.try_with(|p| *p.borrow_mut() = points);
@@ -5947,7 +6429,7 @@ fn note_frame(id: u32, frame: u32, slots: u32, tier1: bool) {
 
 /// bytes of a function's stack slots (aggregates, address-taken locals) after slot colouring;
 /// the rest of a frame is spill slots, saved registers and call staging
-fn slot_bytes(f: &crate::rir::Func) -> u32 {
+fn slot_bytes(f: &relax_backend::rir::Func) -> u32 {
     f.slots.iter().map(|s| (s.size + s.align - 1) / s.align * s.align).sum()
 }
 
@@ -5955,7 +6437,9 @@ fn slot_bytes(f: &crate::rir::Func) -> u32 {
 pub static FRAME_SLOTS: relax_session::sync::Mutex<Vec<(u32, u32)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// MAKEPAD_RUN_CODE_SIG=<file>: one line per compiled function (its stable name -- instance type
-/// arguments included, syms::stable_fn_name --, code bytes, RIR hash + allocation signature):
+/// arguments included, syms::stable_fn_name --, ` [O3]` / ` [baseline]` after it for an O3 /
+/// baseline-tier build, code bytes,
+/// RIR hash + allocation signature):
 /// back-end refactors compare these between builds for equal output, and two runs of one
 /// program compare them for build-order independence (tools/hrcheck/fe/sigcmp.py).
 /// A slot's name in MAKEPAD_RUN_CODE_SIG output: its stable name, with the DefId of an instance (two
@@ -5975,11 +6459,11 @@ fn sig_dir() -> Option<std::ffi::OsString> {
     D.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var_os("MAKEPAD_RUN_CODE_SIG_DIR"))).clone()
 }
 
-fn code_sig(id: u32, f: &crate::rir::Func, code: &[u8], alloc: u64) {
+fn code_sig(id: u32, f: &relax_backend::rir::Func, code: &[u8], alloc: u64, o3: bool) {
     static F: std::sync::OnceLock<Option<relax_session::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     if let Some(m) = F.get_or_init(|| {
         let f = std::env::var("MAKEPAD_RUN_CODE_SIG").ok().and_then(|p| std::fs::File::create(p).ok()).map(relax_session::sync::Mutex::new);
-        crate::regalloc::SIG_ON.store(f.is_some(), Ordering::Relaxed);
+        relax_backend::regalloc::SIG_ON.store(f.is_some(), Ordering::Relaxed);
         f
     }) {
         use std::io::Write;
@@ -6014,10 +6498,15 @@ fn code_sig(id: u32, f: &crate::rir::Func, code: &[u8], alloc: u64) {
                 i += 1;
             }
         }
-        let name = match crate::syms::unit() {
+        let mut name = match crate::syms::unit() {
             Some(u) => sig_name(u, id),
             None => f.name.clone(),
         };
+        if o3 {
+            name.push_str(" [O3]");
+        } else if f.baseline {
+            name.push_str(" [baseline]");
+        }
         // MAKEPAD_RUN_CODE_SIG_DIR=<dir>: each signed RIR too, as <dir>/<name hash>-<RIR hash>.rir (first line
         // the stable name): two runs' dirs diff function by function
         if let Some(dir) = sig_dir() {
@@ -6090,9 +6579,9 @@ fn inline_source_wanted(u: &Unit, id: u32, full: bool) -> bool {
     };
     let src = src_size(u, id);
     crate::simd::covered(options, &u.fns[id as usize].name)
-        || attr & crate::opt::ATTR_ALWAYS != 0
+        || attr & relax_codegen::opt::ATTR_ALWAYS != 0
         || src <= inline_src_toks(options, u.tier1.is_some() && !full)
-        || (attr & crate::opt::ATTR_HINT != 0 && src <= INLINE_HINT_SRC_TOKS)
+        || (attr & relax_codegen::opt::ATTR_HINT != 0 && src <= INLINE_HINT_SRC_TOKS)
 }
 
 /// Source size of a slot's function in tokens (cheap pre-filter for inlining: comments, doc
@@ -6148,19 +6637,32 @@ fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &cra
             // core's small fns (real std marks them #[inline]) and, at O3, user fns too:
             // LLVM inlines small same-crate fns by cost, #[inline] or not
             if core_hint && !nohint_env(options).map_or(false, |p| name_matches(&fns[c as usize].name, p)) {
-                a |= crate::opt::ATTR_HINT;
+                a |= relax_codegen::opt::ATTR_HINT;
             }
             if core && args.iter().any(|t| has_closure(tcx, *t, 0)) {
-                a |= crate::opt::ATTR_CHAIN;
+                a |= relax_codegen::opt::ATTR_CHAIN;
             }
             if core && crate::simd::covered(options, &fns[c as usize].name) {
-                a |= crate::opt::ATTR_ALWAYS;
+                a |= relax_codegen::opt::ATTR_ALWAYS;
             }
             a
         }
         // a closure body is usually called from the one adapter instance made for it; with
         // the core hint (O3) it inlines like #[inline]
-        FnKey::Closure(..) if core_hint => crate::opt::ATTR_HINT,
+        FnKey::Closure(..) if core_hint => relax_codegen::opt::ATTR_HINT,
+        // drop glue at O3 as any other generated instance: rustc leaves drop_in_place unhinted
+        // (Instance::requires_inline) and LLVM inlines it by cost like an unhinted same-crate fn.
+        // Without it an enum's glue (Result<f32, E>: the error payload's drops on the Err arm)
+        // inlined only through the hot-site rule, so any change in which round reached the site
+        // left a per-element drop call (llm_host's `.map(Ok).collect::<Result<Vec<f32>, _>>()`)
+        FnKey::Glue(..) if core_hint => relax_codegen::opt::ATTR_HINT,
+        // shims (reify, fn pointer, vtable, closure-once, clone, fn-pointer address) are hinted:
+        // rustc_codegen_llvm/src/attributes.rs:418 gives InlineAttr::Hint to every instance whose
+        // InstanceKind::requires_inline (rustc_middle/src/ty/instance.rs:291), which every shim
+        // kind Relax has does. Bottom-up, a shim's priced body holds the callee it forwards to,
+        // and unhinted it stayed a call per element (ttf_parser's `FromData::parse` shim in
+        // binary_search_by: 48% of text_shape_raster)
+        FnKey::Shim(_) if core_hint => relax_codegen::opt::ATTR_HINT,
         FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Closure(..) => 0,
         // twins are never inlined into anything (their callers are twins built from RIR)
         FnKey::Sandbox(_) | FnKey::Plain(_) => return None,
@@ -6201,10 +6703,10 @@ pub(crate) fn inline_attrs(prog: &crate::program::Program, d: DefId) -> u8 {
             if (a.toks.lo..a.toks.hi).any(|i| f.tok_text(i) == "never") {
                 return 0;
             }
-            r |= crate::opt::ATTR_HINT;
+            r |= relax_codegen::opt::ATTR_HINT;
             for i in a.toks.lo..a.toks.hi {
                 if f.tok_text(i) == "always" {
-                    r |= crate::opt::ATTR_ALWAYS;
+                    r |= relax_codegen::opt::ATTR_ALWAYS;
                 }
             }
         }
@@ -6302,6 +6804,40 @@ fn relax_mark(u: &Unit, id: u32) -> u8 {
         l = level_of(def.parent);
     }
     l
+}
+
+/// Whether slot `id`'s fn (or its impl block) carries `#[relax(keep_reachable)]`.
+pub fn keep_reachable(u: &Unit, id: u32) -> bool {
+    let d = match &u.fns[id as usize].key {
+        FnKey::Inst(d, _) => *d,
+        _ => return false,
+    };
+    let def = u.prog.def(d);
+    if !matches!(def.kind, DefKind::Fn | DefKind::AssocFn) {
+        return false;
+    }
+    let marked = |d: DefId| -> bool {
+        let def = u.prog.def(d);
+        let f = &u.prog.files[def.file as usize];
+        let text = |k: usize| f.tok_text(k as u32).to_string();
+        f.ast.list(f.ast.item(def.item).attrs).iter().any(|a| {
+            let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+            hi > lo + 1 && f.tok_text(lo as u32) == "relax" && crate::builtins::relax_keep_toks(&text, &f.toks, lo + 1, hi)
+        })
+    };
+    marked(d) || (def.parent.0 != u32::MAX && (def.parent.0 as usize) < u.prog.defs.len() && u.prog.def(def.parent).kind == DefKind::Impl && marked(def.parent))
+}
+
+/// The RIR a wasm export takes for slot `id` (built now if the run never built it): what its
+/// baseline code would be compiled from.
+pub unsafe fn export_rir(up: *mut Unit, id: u32) -> Result<relax_backend::rir::Func, String> {
+    if (&*up).fns[id as usize].rir.is_none() {
+        build_rir(up, id)?;
+    }
+    let u = &*up;
+    let session = u.prog.session.clone();
+    let rir = u.fns[id as usize].rir.clone().ok_or("no RIR for this slot")?;
+    Ok(tier0_codegen_rir(&session.options, &rir, u.opt.fold, u.opt.layout).into_owned())
 }
 
 thread_local! {
@@ -6527,7 +7063,7 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
             });
             if let Some((up, w)) = begin {
                 let done = w.run();
-                owner::call(owner::Class::Finish, || o2_finish(up, done));
+                owner::call(owner::Class::FinishBackground, || o2_finish(up, done));
             }
         }));
         if r.is_err() {
@@ -6546,7 +7082,7 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
 /// cache entry, so warm launches link full O2 code at the first call.
 unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     let _census_context = (&*up).exec_context(false);
-    let _cost = crate::fncost::Record::new(id, 0, "O2");
+    let _cost = relax_codegen::fncost::Record::new(id, 0, "O2");
     let t0 = cpu_ns();
     let epoch = PATCH_EPOCH.load(Ordering::SeqCst);
     let snapshot = !FIRST_PRESENT.load(Ordering::Acquire);
@@ -6561,8 +7097,9 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
         O2_STATS[2].fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    if snapshot && (f.building || f.inflight || f.rir.as_ref().map_or(true, |r| r.full)) {
-        // no RIR to copy yet (or a build open): its full build after the present
+    if snapshot && (f.building || f.inflight || f.rir.as_ref().map_or(true, |r| r.full || r.plain_calls)) {
+        // no RIR to copy yet (or a build open, or SPEC-V: an unverified lowering that calls twins,
+        // which is lowered again): its full build after the present
         crate::zone_alloc::kept_with(|| O2_LATER.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id)));
         return None;
     }
@@ -6570,7 +7107,8 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     // served meanwhile)
     wait_inflight(up, id);
     let f = &(&*up).fns[id as usize];
-    let lowered = f.rir.as_ref().map(|r| (**r).clone());
+    // (SPEC-V: an unverified lowering that calls twins is lowered again, as verified code)
+    let lowered = f.rir.as_ref().filter(|r| !r.plain_calls).map(|r| (**r).clone());
     if begin_build(up, id).is_err() {
         O2_STATS[2].fetch_add(1, Ordering::Relaxed);
         return None;
@@ -6604,7 +7142,7 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     let u = &*up;
     let session = (*std::ptr::addr_of!(u.prog.session)).clone();
     let e = &u.env;
-    let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class };
+    let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class, near: e.near };
     let (fold, layout) = (u.opt.fold, u.opt.layout);
     Some(O2Work { id, prep, epoch, snapshot, session, env, fold, layout, t0 })
 }
@@ -6627,7 +7165,7 @@ struct O2Done {
     epoch: u64,
     snapshot: bool,
     t0: u64,
-    built: std::thread::Result<Result<(crate::rir::Func, Vec<(u32, usize)>, x64::Compiled), String>>,
+    built: std::thread::Result<Result<(relax_backend::rir::Func, Vec<(u32, usize)>, x64::Compiled), String>>,
     done: Vec<Deferred>,
 }
 
@@ -6639,8 +7177,9 @@ impl O2Work {
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let (func, inlined) = optimize_tree(options, id, prep, &mut done)?;
             let cg = tier0_codegen_rir(options, &func, fold, layout);
+            crate::wasm_export::capture(id, &cg);
             let _scratch = crate::zone_alloc::scratch(&session.runtime);
-            let c = x64::compile(options, &cg, &env)?;
+            let c = relax_codegen::native::compile(options, &cg, &env)?;
             Ok::<_, String>((func, inlined, c))
         }));
         O2Done { id, epoch, snapshot, t0, built, done }
@@ -6665,7 +7204,7 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
     let u = &mut *up;
     let c = match built {
         Ok(Ok((func, inlined, c))) if !stale && {
-            let n = if relax_codegen::interp::blob::is_blob(&c.code) { c.code.len() } else { crate::rir::split_unwind_info(&c.code).0 };
+            let n = if relax_codegen::interp::blob::is_blob(&c.code) { c.code.len() } else { relax_backend::rir::split_unwind_info(&c.code).0 };
             u.link_check(&c.code[..n], &c.relocs)
         } => {
             // O3 starts from this RIR
@@ -6684,7 +7223,11 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
         cache.record_o2(u, id, &c.code, &c.relocs, &c.pc_map);
         u.cache = Some(cache);
     }
-    if u.fns[id as usize].o3.load(Ordering::Relaxed) || crate::inspect::instrument::active(id) {
+    // an O3 build of the slot is running (queued with this one: tier1_thread's o2_hot): this install
+    // would change the slot under it, and it would be dropped and built again (cold Stage: 1.8k O3
+    // builds dropped so) -- the O2 code stays the cache entry, the O3 code runs
+    let o3_building = u.fns[id as usize].compiled && TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).contains(&id);
+    if u.fns[id as usize].o3.load(Ordering::Relaxed) || o3_building || crate::inspect::instrument::active(id) {
         O2_STATS[2].fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -6963,7 +7506,7 @@ pub struct SettleDrops {
     pub spec: u64,
     pub max_sweep_ns: u64,
     pub front_pending: bool,
-    retired_rir: Vec<std::sync::Arc<crate::rir::Func>>,
+    retired_rir: Vec<std::sync::Arc<relax_backend::rir::Func>>,
 }
 
 impl SettleDrops {
@@ -7060,6 +7603,8 @@ pub unsafe fn settle_drop(up: *mut Unit) -> SettleDrops {
     let queue = TIER_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     let active = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     let mut pinned: std::collections::HashSet<u32> = queue.iter().map(|x| x.0).chain(active.iter().copied()).collect();
+    // aot: the slots whose callees are speculated after the burst keep their RIR until then
+    pinned.extend(AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|x| x.0 == up as usize).map(|x| x.1));
     // Queued jobs have not enumerated their inline snapshots yet. Their known RIR
     // dependency graph is still pending input too; dropping it would make each queued
     // caller recheck shared callees. The edges survive slot RIR eviction (warm rebuilds).
@@ -7223,32 +7768,36 @@ unsafe fn build_rir_mode(up: *mut Unit, id: u32, mode: RirMode) -> Result<(), St
     }
 }
 
+/// RIR a Normal build replaces: baseline code, or (SPEC-V) an unverified lowering (noalias withheld,
+/// calls to twins) -- upgraded only once the body's verdict is clean.
+fn upgradable(r: &relax_backend::rir::Func) -> bool {
+    r.baseline || r.plain_calls || !r.withheld_noalias.is_empty()
+}
+
 unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(), String> {
     let normal = mode == RirMode::Normal;
+    (&mut *up).check_before_lowering(id);
     // SPEC-V: no upgrade of a body without a clean verdict (its RIR stays baseline)
     if normal && !(&*up).refresh_verified(id) {
         return Ok(());
     }
     let mut lowered = None;
-    let mut relower = false;
     {
         let u = &mut *up;
         if let Some(r) = &u.fns[id as usize].rir {
             let to_o2 = normal && o2_build() && !r.full;
-            if !normal || !(r.baseline || to_o2) || u.fns[id as usize].building || u.fns[id as usize].inflight {
+            if !normal || !(upgradable(r) || to_o2) || u.fns[id as usize].building || u.fns[id as usize].inflight {
                 return Ok(());
             }
-            if r.plain_calls {
-                // SPEC-V: its aliasing-prone calls go to twins: lowered again, now as verified code
-                relower = true;
+            // the verdict is clean (checked above). An unverified lowering is lowered again (below)
+            // instead of upgraded when it sends calls to unverified-mode twins (SPEC-V: verified code
+            // calls the slots themselves) or lacks the run-time disjoint-index checks the verdict
+            // asks for (D3); otherwise it is reused (prepare_rir_from gives it its noalias facts back)
+            if r.plain_calls || !u.fns[id as usize].d3_lowered.load(Ordering::Relaxed) && u.disjoint_checks(id).is_some() {
+                u.fns[id as usize].rir = None;
+            } else {
+                lowered = Some((**r).clone());
             }
-            let mut f = (**r).clone();
-            // SPEC-V: the verdict is clean (checked above): the body gets its noalias facts back
-            if !f.withheld_noalias.is_empty() {
-                let w = std::mem::take(&mut f.withheld_noalias);
-                f.noalias.extend(w);
-            }
-            if !relower { lowered = Some(f); }
         }
         if let Some(e) = &u.fns[id as usize].build_err {
             return Err(e.to_string());
@@ -7260,7 +7809,7 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
         (&mut *up).set_rir(id, f);
         return Ok(());
     }
-    if lowered.is_none() && !relower && (&*up).fns[id as usize].rir.is_some() {
+    if lowered.is_none() && (&*up).fns[id as usize].rir.is_some() {
         return Ok(());
     }
     if let Some(e) = &(&*up).fns[id as usize].build_err {
@@ -7280,9 +7829,9 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
     res
 }
 
-unsafe fn build_rir_body(up: *mut Unit, id: u32, lowered: Option<crate::rir::Func>, mode: RirMode) -> Result<(), String> {
+unsafe fn build_rir_body(up: *mut Unit, id: u32, lowered: Option<relax_backend::rir::Func>, mode: RirMode) -> Result<(), String> {
     let _census_context = (&*up).exec_context(false);
-    let _census = crate::exec_census::Record::new(id, 0, "ahead", true);
+    let _census = relax_codegen::exec_census::Record::new(id, 0, "ahead", true);
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
     let prep = prepare_rir_from(up, id, false, lowered, mode)?;
@@ -7295,16 +7844,30 @@ unsafe fn build_rir_body(up: *mut Unit, id: u32, lowered: Option<crate::rir::Fun
 /// What the optimisation of one function needs, taken under the unit lock: its lowered RIR,
 /// the options, the inlinable callees' RIR (shared), the read-only data range. With it,
 /// `optimize_rir` runs without the lock (pipelined compiles, compile_split).
+/// Where a `#[thread_local]` static lives (Unit::thread_local_place).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TlsPlace {
+    /// its offset (SymKind::ThreadLocal): from the thread pointer when `fixed`, else in the
+    /// thread-local block
+    pub sym: relax_backend::rir::Sym,
+    pub fixed: bool,
+    /// Some(size): a non-zero image, copied from the static's own storage on a thread's first
+    /// access; its flag byte follows the value
+    pub init: Option<u32>,
+}
+
 pub struct Prep {
-    func: crate::rir::Func,
-    cfg: crate::opt::OptCfg,
-    callees: Vec<(u32, std::sync::Arc<crate::rir::Func>, u8)>,
-    ro: Option<crate::opt::RoReader>,
+    func: relax_backend::rir::Func,
+    cfg: relax_codegen::opt::OptCfg,
+    callees: Vec<(u32, std::sync::Arc<relax_backend::rir::Func>, u8)>,
+    ro: Option<relax_backend::passes::RoReader>,
     relayout: bool,
     name: String,
     /// inline candidates whose own optimisation is deferred to the back end (split compiles):
     /// (slot, inline attributes if inlinable, their preparation)
     deferred: Vec<(u32, Option<u8>, Prep)>,
+    /// nounwind answers for its tail-shaped invokes (tail_nounwind_facts)
+    facts: Vec<(u32, bool)>,
 }
 
 /// Type check + lower `id`, and build the RIR of the callees O1 may inline (under the
@@ -7313,13 +7876,13 @@ unsafe fn prepare_rir(up: *mut Unit, id: u32, defer: bool) -> Result<(Prep, u64)
     prepare_rir_from(up, id, defer, None, RirMode::Tier0)
 }
 
-unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<crate::rir::Func>, mode: RirMode) -> Result<(Prep, u64), String> {
-    let _census_context = (&*up).exec_context(crate::exec_census::active() && crate::exec_profile::is_call(up as usize, id));
+unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<relax_backend::rir::Func>, mode: RirMode) -> Result<(Prep, u64), String> {
+    let _census_context = (&*up).exec_context(relax_codegen::exec_census::active() && crate::exec_profile::is_call(up as usize, id));
 
     let _why = why_function(&*up, id, "lower-fn");
-    let _cost = crate::fncost::Record::ensure(id, 0, "ahead");
+    let _cost = relax_codegen::fncost::Record::ensure(id, 0, "ahead");
     cost_name(up, id);
-    let _cost_opt = crate::fncost::phase(4);
+    let _cost_opt = relax_codegen::fncost::phase(4);
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
     // Freeze the mode before lowering, which may release the lock or cross present.
@@ -7329,7 +7892,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     (&*up).fns[id as usize].unverified.store(unverified, Ordering::Relaxed);
     let baseline = unverified || mode == RirMode::Baseline || mode == RirMode::Tier0 && !o2_build() && !RT_KEEP.with(|k| k.get()) && match options.t0_baseline {
         crate::options::Tier0Baseline::Off => false,
-        crate::options::Tier0Baseline::Startup => startup_phase() || (&*up).fns[id as usize].baseline_hint.load(Ordering::Relaxed),
+        crate::options::Tier0Baseline::Startup => startup_phase() || warmup_foreground() || (&*up).fns[id as usize].baseline_hint.load(Ordering::Relaxed),
         crate::options::Tier0Baseline::Always => true,
     };
     let r = match lowered { Some(f) => Ok(f), None => build_rir_inner(up, id) };
@@ -7338,7 +7901,10 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
         (&mut *up).fns[id as usize].build_err = Some(e.as_str().into());
     }
     let mut func = r?;
-    crate::fncost::size(true, &func);
+    if crate::coverage::on() {
+        crate::coverage::instrument(up, id, &mut func);
+    }
+    relax_codegen::fncost::size(true, &func);
     // Keep the wrapper's sandbox calls in the saved RIR, not just its O1 codegen
     // copy. O3 and callers inlining this wrapper must also call the twins; base
     // slots of module functions are RIR sources, not patchable host implementations.
@@ -7350,7 +7916,13 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     let u = &mut *up;
     let baseline = baseline && !u.pairs_sincos(&func);
     func.baseline = baseline;
-    if unverified { func.withheld_noalias = std::mem::take(&mut func.noalias); }
+    if unverified {
+        func.withheld_noalias = std::mem::take(&mut func.noalias);
+    } else if !func.withheld_noalias.is_empty() {
+        // SPEC-V: an unverified lowering reused now that the verdict is clean gets its facts back
+        let w = std::mem::take(&mut func.withheld_noalias);
+        func.noalias.extend(w);
+    }
     // O2: a `#[relax(O2)]` fn built by the O2 worker (o2_thread) compiles as O1 does without
     // O3; its on-demand builds on the program's threads stay O1
     let full = !baseline && o2_build() && marked_hot(u, id);
@@ -7388,7 +7960,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     let mut callees = Vec::new();
     for b in &func.blocks {
         for i in &b.insts {
-            if let crate::rir::Inst::Call(crate::rir::Callee::Fn(c), _, _) = i {
+            if let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) = i {
                 if *c != id && !callees.contains(c) {
                     callees.push(*c);
                 }
@@ -7406,7 +7978,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                 continue;
             }
             for i in &b.insts {
-                if let crate::rir::Inst::Call(crate::rir::Callee::Fn(c), _, _) = i {
+                if let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) = i {
                     if !w.contains(c) {
                         w.push(*c);
                     }
@@ -7539,7 +8111,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                 }
                 nested_ns += cpu_ns() - tn;
             }
-            if want && !baseline && (&*up).fns[*c as usize].rir.as_ref().is_some_and(|r| r.baseline) {
+            if want && !baseline && (&*up).fns[*c as usize].rir.as_ref().is_some_and(|r| upgradable(r)) {
                 let tn = cpu_ns();
                 let _ = build_rir_mode(up, *c, RirMode::Normal);
                 nested_ns += cpu_ns() - tn;
@@ -7592,8 +8164,233 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     }
     let name = u.fns[id as usize].name.to_string();
     let relayout = layout_for(options, &name);
+    // (their builds count as nested, like the inline candidates')
+    let tn = cpu_ns();
+    let mode = if baseline { RirMode::Baseline } else { RirMode::Tier0 };
+    let mut func = func;
+    // MAKEPAD_RUN_OPT=-tailfacts: no facts asked (calls in tail position after invokes and frame
+    // addresses passed to calls then stay calls)
+    let facts = if relax_backend::stats::opt_off(options, "-tailfacts") { Vec::new() } else { tail_nounwind_facts(up, &func, mode) };
+    if !facts.is_empty() || !relax_backend::stats::opt_off(options, "-tailfacts") {
+        tail_nocapture_facts(up, id, &mut func, mode, &snap, &facts, cfg.inline);
+    }
+    nested_ns += cpu_ns() - tn;
     let prep_ns = (cpu_ns() - t0).saturating_sub(nested_ns);
-    Ok((Prep { func, cfg, callees: snap, ro: u.ro_reader(), relayout, name, deferred }, prep_ns))
+    let u = &*up;
+    Ok((Prep { func, cfg, callees: snap, ro: u.ro_reader(), relayout, name, deferred, facts }, prep_ns))
+}
+
+/// Answers for the callees of tail-shaped invokes -- the call's results go straight to the Ret
+/// and its unwind edge only aborts: an `extern "C"` body's cannot-unwind guard.
+/// A callee known not to unwind makes the invoke a plain call, which the back end then makes a
+/// sibling call (relax_backend::tail): LLVM's FunctionAttrs nounwind + invoke-to-call, which is
+/// what keeps a threaded interpreter of `extern "C"` handlers (makepad_stitch) in constant stack.
+/// A callee and the warm callees it reaches (depth-limited) get their RIR built for the answer, as
+/// inline candidates do (the call runs right before this body returns): the answer depends on
+/// the source, not on what happened to be compiled first. Every answer consulted, transitively,
+/// becomes a nounwind input of the body (store_rir notes them, the cache certifies them).
+/// Recursive and unbuildable callees are false, and so is any panic path.
+unsafe fn tail_nounwind_facts(up: *mut Unit, f: &relax_backend::rir::Func, mode: RirMode) -> Vec<(u32, bool)> {
+    use relax_backend::rir::{Callee, Inst, Term};
+    let mut facts = Vec::new();
+    for b in &f.blocks {
+        let Term::Invoke(n, pad) = b.term else { continue };
+        let Some(Inst::Call(Callee::Fn(c), _, rets)) = b.insts.last() else { continue };
+        if !terminates(f, pad) || !relax_backend::tail::returns_results(f, n as usize, 0, rets) {
+            continue;
+        }
+        known_nounwind(up, *c, 3, mode, &mut facts);
+    }
+    facts.sort_unstable();
+    facts
+}
+
+/// For a C ABI body with a call in tail position: which of the calls that pass it a frame address
+/// keep no copy of it (`Func::nocapture`; codegen opt::param_nocapture over the callee's RIR,
+/// built for the answer as for tail_nounwind_facts, depth-limited) -- a frame address that
+/// reaches no callee but these does not stop the sibling call (LLVM: nocapture from
+/// FunctionAttrs, or the call inlined away). The bodies read are dependencies of this one.
+unsafe fn tail_nocapture_facts(up: *mut Unit, id: u32, func: &mut relax_backend::rir::Func, mode: RirMode, snap: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], nounwind: &[(u32, bool)], inline: bool) {
+    use relax_backend::rir::Callee;
+    use relax_backend::tail::Escape;
+    // (C ABI bodies only: a chain of `extern "C"` handlers needs its sibling calls for its
+    // stack to stay bounded; other bodies keep their frames, without the builds this asks for)
+    if func.cabi.is_none() || relax_backend::tail::tail_shaped(func, &relax_backend::regalloc::reachable(func)).is_empty() {
+        return;
+    }
+    // the calls the back end sees: with the inline candidates inlined, as optimize_rir does
+    let mut inl = func.clone();
+    let f = &mut inl;
+    if inline && !snap.is_empty() {
+        let options = &(&*up).prog.session.options;
+        let get = |c: u32| -> Option<(*const relax_backend::rir::Func, u8)> { snap.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const relax_backend::rir::Func, x.2)) };
+        let lim = if mode == RirMode::Baseline { relax_codegen::opt::InlineLimits::baseline() } else { relax_codegen::opt::InlineLimits::tier0(options) };
+        relax_codegen::opt::inline_calls(options, f, id, &get, &|c| nounwind.iter().any(|x| x.0 == c && x.1), &lim);
+    }
+    relax_codegen::opt::demote_invokes(f, &|c| nounwind.iter().any(|x| x.0 == c && x.1));
+    let reach = relax_backend::regalloc::reachable(f);
+    let targets = relax_backend::tail::tail_shaped(f, &reach);
+    if targets.is_empty() {
+        return;
+    }
+    let (mut memo, mut reads) = (Vec::new(), Vec::new());
+    // a call that returns the address it got makes its result one: ask again with what is known
+    for _ in 0..4 {
+        let d = relax_backend::tail::frame_derived(f, &reach);
+        let asks = relax_backend::tail::escapes(f, &reach, &d, &targets);
+        if asks.contains(&Escape::Other) {
+            return;
+        }
+        let mut new = false;
+        for e in asks {
+            let Escape::Arg(c, k) = e else { continue };
+            if f.nocapture.iter().any(|x| x.0 == c && x.1 as usize == k) {
+                continue;
+            }
+            let r = match &c {
+                Callee::Fn(x) => known_nocapture(up, *x, k, 3, mode, &mut memo, &mut reads),
+                Callee::Host(s) => host_nocapture(&*up, *s).then_some(false),
+                _ => None,
+            };
+            let Some(returns) = r else {
+                // an escape is left: no sibling call here, the other answers are not needed
+                return;
+            };
+            f.nocapture.push((c, k as u32, returns));
+            new = true;
+        }
+        if !new {
+            reads.sort_unstable();
+            reads.dedup();
+            note_body_deps(&mut *up, id, reads.into_iter());
+            func.nocapture = std::mem::take(&mut f.nocapture);
+            return;
+        }
+    }
+}
+
+/// Runtime entries that keep no copy of their pointer arguments.
+fn host_nocapture(u: &Unit, s: relax_backend::rir::Sym) -> bool {
+    [u.rs.memcpy, u.rs.memmove, u.rs.memset, u.rs.str_eq].iter().any(|x| x.id == s.id)
+}
+
+unsafe fn known_nocapture(up: *mut Unit, c: u32, k: usize, depth: u32, mode: RirMode, memo: &mut Vec<(u32, usize, Option<bool>)>, reads: &mut Vec<u32>) -> Option<bool> {
+    if let Some(&(_, _, v)) = memo.iter().find(|x| x.0 == c && x.1 == k) {
+        return v;
+    }
+    // asked while its own answer is open (recursion): it may keep it
+    memo.push((c, k, None));
+    let v = match rir_for_fact(up, c, mode) {
+        Some(r) => {
+            reads.push(c);
+            let memo_c = std::cell::RefCell::new(std::mem::take(memo));
+            let reads_c = std::cell::RefCell::new(std::mem::take(reads));
+            let v = relax_codegen::opt::param_escape(&r, k, &|c2, k2| match c2 {
+                relax_backend::rir::Callee::Fn(x) if depth > 0 => known_nocapture(up, *x, k2, depth - 1, mode, &mut memo_c.borrow_mut(), &mut reads_c.borrow_mut()),
+                relax_backend::rir::Callee::Host(s) => host_nocapture(&*up, *s).then_some(false),
+                _ => None,
+            });
+            *memo = memo_c.into_inner();
+            *reads = reads_c.into_inner();
+            v
+        }
+        None => None,
+    };
+    if let Some(e) = memo.iter_mut().find(|x| x.0 == c && x.1 == k) {
+        e.2 = v;
+    }
+    v
+}
+
+/// Callee `c`'s RIR for a fact about it, built if it has none yet (as an inline candidate's:
+/// waiting for one in flight, never re-entering one being built on this request). None when it
+/// cannot be had.
+unsafe fn rir_for_fact(up: *mut Unit, c: u32, mode: RirMode) -> Option<std::sync::Arc<relax_backend::rir::Func>> {
+    if (c as usize) >= (&*up).fns.len() || matches!((&*up).fns[c as usize].key, FnKey::Sandbox(_) | FnKey::Plain(_)) {
+        return None;
+    }
+    if (&*up).fns[c as usize].rir.is_none() {
+        let e = &(&*up).fns[c as usize];
+        if e.build_err.is_some() {
+            return None;
+        }
+        if e.inflight {
+            wait_inflight(up, c);
+        }
+        let e = &(&*up).fns[c as usize];
+        if e.rir.is_none() && e.building {
+            // open in an earlier request lower on the owner's stack: this build depends on that timing
+            if !open_here(c) {
+                TAINTED.with(|t| t.set(true));
+            }
+            return None;
+        }
+        if e.rir.is_none() && build_rir_mode(up, c, mode).is_err() {
+            return None;
+        }
+    }
+    (&*up).fns[c as usize].rir.clone()
+}
+
+/// Whether unwind pad `b` aborts (rustc's UnwindAction::Terminate: the cannot-unwind guard of a
+/// nounwind ABI body, a call that must not unwind) rather than running cleanups and resuming.
+fn terminates(f: &relax_backend::rir::Func, mut b: u32) -> bool {
+    use relax_backend::rir::Term;
+    for _ in 0..8 {
+        let blk = &f.blocks[b as usize];
+        match blk.term {
+            Term::Unreachable => return true,
+            Term::Jump(t) if blk.insts.is_empty() => b = t,
+            _ => return false,
+        }
+    }
+    false
+}
+
+unsafe fn known_nounwind(up: *mut Unit, c: u32, depth: u32, mode: RirMode, facts: &mut Vec<(u32, bool)>) -> bool {
+    use relax_backend::rir::{Callee, Inst, Term};
+    if let Some(&(_, v)) = facts.iter().find(|x| x.0 == c) {
+        return v;
+    }
+    // asked while its own answer is open (recursion): false
+    facts.push((c, false));
+    let v = 'v: {
+        let Some(r) = rir_for_fact(up, c, mode) else { break 'v false };
+        let reach = relax_backend::regalloc::reachable(&r);
+        let cold = cold_blocks(&*up, &r);
+        // first what needs no callee: a Resume, a call that may unwind, any call on a panic path
+        let mut fns = Vec::new();
+        for (bi, b) in r.blocks.iter().enumerate() {
+            if !reach[bi] {
+                continue;
+            }
+            if matches!(b.term, Term::Resume) {
+                break 'v false;
+            }
+            let n = b.insts.len();
+            for (k, i) in b.insts.iter().enumerate() {
+                let Inst::Call(callee, _, _) = i else { continue };
+                if k + 1 == n && matches!(b.term, Term::Invoke(..)) {
+                    continue;
+                }
+                match callee {
+                    Callee::Fn(x) if !cold[bi] && depth > 0 => fns.push(*x),
+                    _ if relax_codegen::opt::may_unwind(callee, &|x| r.nounwind_inputs.iter().any(|f| f.0 == x && f.1)) => break 'v false,
+                    _ => {}
+                }
+            }
+        }
+        for x in fns {
+            if !known_nounwind(up, x, depth - 1, mode, facts) {
+                break 'v false;
+            }
+        }
+        true
+    };
+    if let Some(e) = facts.iter_mut().find(|x| x.0 == c) {
+        e.1 = v;
+    }
+    v
 }
 
 /// Callee `c` calls caller `id` back directly (mutual recursion: derived impls of mutually
@@ -7616,7 +8413,7 @@ fn backend_bench_on() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *B.get_or_init(|| std::env::var_os("MAKEPAD_RUN_BACKEND_BENCH").is_some())
 }
-static BENCH_CAPTURE: relax_session::sync::Mutex<Vec<(crate::rir::Func, crate::opt::OptCfg, Option<crate::opt::RoReader>, bool)>> = relax_session::sync::Mutex::new(Vec::new());
+static BENCH_CAPTURE: relax_session::sync::Mutex<Vec<(relax_backend::rir::Func, relax_codegen::opt::OptCfg, Option<relax_backend::passes::RoReader>, bool)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// Replays the captured back ends `reps` times; prints the best rep's cpu ms, per 1k fns
 /// and by function size (instructions entering the pipeline).
@@ -7630,8 +8427,8 @@ pub unsafe fn backend_bench(up: *mut Unit) {
     }
     let u = &*up;
     let full = !TIER1_ENABLED.load(Ordering::Relaxed);
-    let env = x64::Env { slots: u.env.slots, tls_key: u.env.tls_key, tls_slow: u.env.tls_slow, resume: u.env.resume, opt_regs: full, syms: u.env.syms, sym_class: u.env.sym_class };
-    let bucket = |f: &crate::rir::Func| -> usize {
+    let env = x64::Env { slots: u.env.slots, tls_key: u.env.tls_key, tls_slow: u.env.tls_slow, resume: u.env.resume, opt_regs: full, syms: u.env.syms, sym_class: u.env.sym_class, near: u.env.near };
+    let bucket = |f: &relax_backend::rir::Func| -> usize {
         match f.blocks.iter().map(|b| b.insts.len()).sum::<usize>() {
             0..=15 => 0,
             16..=63 => 1,
@@ -7655,13 +8452,13 @@ pub unsafe fn backend_bench(up: *mut Unit) {
             let mut f = f0.clone();
             opt_pipeline(options, &mut f, *ro, cfg, *relayout, full, &|c| f0.nounwind_inputs.iter().find(|x| x.0 == c).is_some_and(|x| x.1));
             if cfg.fold {
-                crate::opt::addr_modes(&mut f);
+                relax_backend::passes::addr_modes(&mut f);
             }
             if cfg.layout && *relayout {
-                crate::opt::rotate_loops(&mut f);
+                relax_backend::passes::rotate_loops(&mut f);
             }
             let t1 = cpu_ns();
-            let _ = x64::compile(options, &f, &env);
+            let _ = relax_codegen::native::compile(options, &f, &env);
             let t2 = cpu_ns();
             opt_ns += t1 - t0;
             cg_ns += t2 - t1;
@@ -7687,22 +8484,26 @@ pub unsafe fn backend_bench(up: *mut Unit) {
     );
 }
 
-fn optimize_rir(options: &crate::options::Options, id: u32, prep: Prep) -> Result<(crate::rir::Func, Vec<(u32, usize)>), String> {
-    let _census_opt = crate::exec_census::phase(4);
-    let Prep { func, cfg, callees, ro, relayout, name, deferred } = prep;
+fn optimize_rir(options: &crate::options::Options, id: u32, prep: Prep) -> Result<(relax_backend::rir::Func, Vec<(u32, usize)>), String> {
+    let _census_opt = relax_codegen::exec_census::phase(4);
+    let Prep { func, cfg, callees, ro, relayout, name, deferred, facts } = prep;
     debug_assert!(deferred.is_empty());
     if func.baseline {
         let mut func = func;
+        if !facts.is_empty() {
+            relax_codegen::opt::demote_invokes(&mut func, &|c| facts.iter().any(|x| x.0 == c && x.1));
+            func.nounwind_inputs = facts;
+        }
         let mut inlined = Vec::new();
         if cfg.inline && !callees.is_empty() {
-            let get = |c: u32| -> Option<(*const crate::rir::Func, u8)> { callees.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const crate::rir::Func, x.2)) };
-            let ti = crate::opt::pass_clock();
+            let get = |c: u32| -> Option<(*const relax_backend::rir::Func, u8)> { callees.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const relax_backend::rir::Func, x.2)) };
+            let ti = relax_backend::stats::pass_clock();
             // Candidates can be baseline bodies too: conservatively keep their unwind edges.
-            inlined = crate::opt::inline_calls(options, &mut func, id, &get, &|_| false, &crate::opt::InlineLimits::baseline());
-            crate::opt::pass_time(5, ti);
+            inlined = relax_codegen::opt::inline_calls(options, &mut func, id, &get, &|_| false, &relax_codegen::opt::InlineLimits::baseline());
+            relax_backend::stats::pass_time(5, ti);
         }
         baseline_rir(options, &mut func, ro);
-        // No callee facts were queried: missing nounwind answers conservatively mean false.
+        // Only tail_nounwind_facts were asked: other missing answers conservatively mean false.
         verify_pass(&func, "baseline");
         if let Some(w) = debug_env().0.as_deref() {
             if dump_rir_match(&name, w) { eprintln!("{}", func.dump()); }
@@ -7712,12 +8513,15 @@ fn optimize_rir(options: &crate::options::Options, id: u32, prep: Prep) -> Resul
     let queries = crate::nounwind::QueryCx::new(&callees);
     let mut capture = None;
     let result = queries.optimize(id, func, &mut |func, nounwind| {
+        // the candidates' answers, and the tail-shaped invokes' (tail_nounwind_facts)
+        let known = |c: u32| nounwind(c) || facts.iter().any(|x| x.0 == c && x.1);
+        let nounwind: &dyn Fn(u32) -> bool = &known;
         let mut inlined = Vec::new();
         if cfg.inline {
-            let get = |c: u32| -> Option<(*const crate::rir::Func, u8)> { callees.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const crate::rir::Func, x.2)) };
-            let ti = crate::opt::pass_clock();
-            inlined = crate::opt::inline_calls(options, func, id, &get, nounwind, &crate::opt::InlineLimits::tier0(options));
-            crate::opt::pass_time(5, ti);
+            let get = |c: u32| -> Option<(*const relax_backend::rir::Func, u8)> { callees.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const relax_backend::rir::Func, x.2)) };
+            let ti = relax_backend::stats::pass_clock();
+            inlined = relax_codegen::opt::inline_calls(options, func, id, &get, nounwind, &relax_codegen::opt::InlineLimits::tier0(options));
+            relax_backend::stats::pass_time(5, ti);
         }
         static HIST_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if backend_bench_on() {
@@ -7729,22 +8533,32 @@ fn optimize_rir(options: &crate::options::Options, id: u32, prep: Prep) -> Resul
         if t_dbg != 0 {
             let n: usize = func.blocks.iter().map(|b| b.insts.len()).sum();
             let bucket = match n { 0..=15 => 0, 16..=63 => 1, 64..=255 => 2, 256..=1023 => 3, 1024..=4095 => 4, _ => 5 };
-            crate::opt::HIST[bucket].fetch_add(cpu_ns() - t_dbg, Ordering::Relaxed);
-            crate::opt::HIST[6 + bucket].fetch_add(1, Ordering::Relaxed);
+            relax_codegen::opt::HIST[bucket].fetch_add(cpu_ns() - t_dbg, Ordering::Relaxed);
+            relax_codegen::opt::HIST[6 + bucket].fetch_add(1, Ordering::Relaxed);
         }
         if let Some(w) = debug_env().0.as_deref() {
             if dump_rir_match(&name, w) {
                 eprintln!("{}", func.dump());
             }
         }
-        let tv = crate::opt::pass_clock();
+        let tv = relax_backend::stats::pass_clock();
         let v = func.verify();
-        crate::opt::pass_time(13, tv);
+        relax_backend::stats::pass_time(13, tv);
         if let Err(e) = v {
             return Err(format!("RIR verify after opt: {}\n{}", e, func.dump()));
         }
         Ok(inlined)
     });
+    let mut result = result;
+    if let Ok((optimized, _)) = &mut result {
+        for &(c, v) in &facts {
+            match optimized.nounwind_inputs.iter_mut().find(|x| x.0 == c) {
+                Some(x) => x.1 |= v,
+                None => optimized.nounwind_inputs.push((c, v)),
+            }
+        }
+        optimized.nounwind_inputs.sort_unstable();
+    }
     if let (Some(mut input), Ok((optimized, _))) = (capture, &result) {
         input.nounwind_inputs = optimized.nounwind_inputs.clone();
         BENCH_CAPTURE.lock().unwrap().push((input, cfg, ro, relayout));
@@ -7753,14 +8567,14 @@ fn optimize_rir(options: &crate::options::Options, id: u32, prep: Prep) -> Resul
 }
 
 /// A deferred inline candidate's back-end result, stored under the lock afterwards.
-type Deferred = (u32, Result<(crate::rir::Func, Vec<(u32, usize)>), String>);
+type Deferred = (u32, Result<(relax_backend::rir::Func, Vec<(u32, usize)>), String>);
 
 /// optimize_rir after optimising the deferred inline candidates (bottom-up), which then
 /// inline like candidates that were ready. Their results come back for store_rir.
-fn optimize_tree(options: &crate::options::Options, id: u32, mut prep: Prep, done: &mut Vec<Deferred>) -> Result<(crate::rir::Func, Vec<(u32, usize)>), String> {
-    let _cost = crate::fncost::Record::ensure(id, 0, "ahead");
-    crate::fncost::size(true, &prep.func);
-    let _cost_opt = crate::fncost::phase(4);
+fn optimize_tree(options: &crate::options::Options, id: u32, mut prep: Prep, done: &mut Vec<Deferred>) -> Result<(relax_backend::rir::Func, Vec<(u32, usize)>), String> {
+    let _cost = relax_codegen::fncost::Record::ensure(id, 0, "ahead");
+    relax_codegen::fncost::size(true, &prep.func);
+    let _cost_opt = relax_codegen::fncost::phase(4);
     let _mem = crate::memstat::tag(crate::memstat::Tag::Opt);
     for (c, attrs, p) in std::mem::take(&mut prep.deferred) {
         match optimize_tree(options, c, p, done) {
@@ -7788,7 +8602,7 @@ fn deferred_slots(prep: &Prep, out: &mut Vec<u32>) {
 }
 
 /// Records an optimised RIR (under the lock): inlining links, stats, the slot's RIR.
-unsafe fn store_rir(up: *mut Unit, id: u32, func: crate::rir::Func, inlined: Vec<(u32, usize)>, opt_ns: u64) {
+unsafe fn store_rir(up: *mut Unit, id: u32, func: relax_backend::rir::Func, inlined: Vec<(u32, usize)>, opt_ns: u64) {
     let u = &mut *up;
     note_body_deps(u, id, inlined.iter().map(|x| x.0).chain(func.nounwind_inputs.iter().filter(|x| x.1).map(|x| x.0)));
     for (c, rule) in inlined {
@@ -7804,7 +8618,7 @@ unsafe fn store_rir(up: *mut Unit, id: u32, func: crate::rir::Func, inlined: Vec
         }
     }
     u.stats.opt_ns += opt_ns;
-    u.stats.rir_insts += crate::opt::inst_count(&func) as u64;
+    u.stats.rir_insts += relax_codegen::opt::inst_count(&func) as u64;
     u.set_rir(id, func);
     if TAINTED.with(|t| t.get()) {
         TAINT_BUILT.with(|b| b.borrow_mut().push((up as usize, id)));
@@ -7889,7 +8703,7 @@ static WATCH_ROUND: AtomicU64 = AtomicU64::new(0);
 /// Lowering already produces legal RIR for both backends. Only oversized stack
 /// aggregates require rewriting here: constructing them through temporary copies
 /// can overflow application threads' stacks even before their code becomes hot.
-fn baseline_rir(options: &crate::options::Options, func: &mut crate::rir::Func, ro: Option<crate::opt::RoReader>) {
+fn baseline_rir(options: &crate::options::Options, func: &mut relax_backend::rir::Func, ro: Option<relax_backend::passes::RoReader>) {
     if !func.slots.iter().any(|s| s.size >= BIG_SLOT) {
         return;
     }
@@ -7899,40 +8713,40 @@ fn baseline_rir(options: &crate::options::Options, func: &mut crate::rir::Func, 
     for s in func.slots.iter_mut() {
         s.born = false;
     }
-    crate::opt::simplify(options, func, ro, true, false);
+    relax_backend::passes::simplify(options, func, ro, true, false);
     for _ in 0..3 {
-        let mut changed = crate::opt::forward_slot_dests(func);
-        changed |= crate::opt::forward_slot_dests_x(options, func, BIG_SLOT);
-        changed |= crate::opt::forward_slot_copies(func);
+        let mut changed = relax_codegen::opt::forward_slot_dests(func);
+        changed |= relax_codegen::opt::forward_slot_dests_x(options, func, BIG_SLOT);
+        changed |= relax_codegen::opt::forward_slot_copies(func);
         if !changed { break; }
-        crate::opt::simplify(options, func, ro, true, false);
+        relax_backend::passes::simplify(options, func, ro, true, false);
     }
-    crate::opt::compact_slots(func);
+    relax_codegen::opt::compact_slots(func);
 }
 
 /// Baseline codegen borrows the saved RIR directly. Normal O1 keeps its
 /// addressing/layout rewrites separate from the immutable O3 input.
-fn tier0_codegen_rir<'a>(options: &crate::options::Options, rir: &'a crate::rir::Func, fold: bool, rotate: bool) -> std::borrow::Cow<'a, crate::rir::Func> {
+fn tier0_codegen_rir<'a>(options: &crate::options::Options, rir: &'a relax_backend::rir::Func, fold: bool, rotate: bool) -> std::borrow::Cow<'a, relax_backend::rir::Func> {
     if rir.baseline { return std::borrow::Cow::Borrowed(rir); }
     let mut cg = rir.clone();
     // field promotion belongs to the code made from the RIR, not to the RIR callers inline: it
     // makes a function bigger, and the inliner reads sizes
-    if fold && !crate::opt::opt_off(options, "-promote") { crate::opt::promote_loop_memory(&mut cg); }
-    if fold { crate::opt::addr_modes(&mut cg); }
-    if rotate && layout_for(options, &cg.name) { crate::opt::rotate_loops(&mut cg); }
+    if fold && !relax_backend::stats::opt_off(options, "-promote") { relax_codegen::opt::promote_loop_memory(&mut cg); }
+    if fold { relax_backend::passes::addr_modes(&mut cg); }
+    if rotate && layout_for(options, &cg.name) { relax_backend::passes::rotate_loops(&mut cg); }
     std::borrow::Cow::Owned(cg)
 }
 
-fn opt_pipeline(options: &crate::options::Options, func: &mut crate::rir::Func, ro: Option<crate::opt::RoReader>, cfg: &crate::opt::OptCfg, relayout: bool, full: bool, nounwind: &dyn Fn(u32) -> bool) {
+fn opt_pipeline(options: &crate::options::Options, func: &mut relax_backend::rir::Func, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, relayout: bool, full: bool, nounwind: &dyn Fn(u32) -> bool) {
     let _mem = crate::memstat::tag(crate::memstat::Tag::Opt);
-    compile_watch(Some((&func.name, crate::opt::inst_count(func))));
+    compile_watch(Some((&func.name, relax_codegen::opt::inst_count(func))));
     let mps = crate::memstat::peak_start();
     opt_pipeline_inner(options, func, ro, cfg, relayout, full, nounwind);
     crate::memstat::note_big("opt", &func.name, mps, || cg_shape(func));
     compile_watch(None);
 }
 
-fn opt_pipeline_inner(options: &crate::options::Options, func: &mut crate::rir::Func, ro: Option<crate::opt::RoReader>, cfg: &crate::opt::OptCfg, relayout: bool, full: bool, nounwind: &dyn Fn(u32) -> bool) {
+fn opt_pipeline_inner(options: &crate::options::Options, func: &mut relax_backend::rir::Func, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, relayout: bool, full: bool, nounwind: &dyn Fn(u32) -> bool) {
     verify_pass(func, "input (lowering / inlining)");
     // MAKEPAD_RUN_DUMP_INPUT=<name suffix>: the RIR entering the optimiser
     if let Ok(w) = std::env::var("MAKEPAD_RUN_DUMP_INPUT") {
@@ -7941,31 +8755,31 @@ fn opt_pipeline_inner(options: &crate::options::Options, func: &mut crate::rir::
         }
     }
     // calls of callees learnt not to unwind, and empty pads: plain calls
-    crate::opt::demote_invokes(func, nounwind);
+    relax_codegen::opt::demote_invokes(func, nounwind);
     if cfg.sroa {
-        crate::opt::forward_const_slots(func, ro);
+        relax_codegen::opt::forward_const_slots(func, ro);
         verify_pass(func, "forward_const_slots");
     }
     if cfg.fold {
         if pipeline_variant(options) >= 1 {
             // SROA on the lowered code first: one simplify (with CSE) then sees the scalars
-            let t = crate::opt::pass_clock();
+            let t = relax_backend::stats::pass_clock();
             if full && cfg.sroa {
-                crate::opt::forward_slot_copies(func);
+                relax_codegen::opt::forward_slot_copies(func);
                 verify_pass(func, "forward_slot_copies");
-                crate::opt::forward_slot_loads(func);
+                relax_codegen::opt::forward_slot_loads(func);
                 verify_pass(func, "forward_slot_loads");
             }
-            let s1 = cfg.sroa && crate::opt::sroa(func);
-            crate::opt::pass_time(8, t);
+            let s1 = cfg.sroa && relax_backend::passes::sroa(func);
+            relax_backend::stats::pass_time(8, t);
             verify_pass(func, "sroa");
             if s1 {
-                let t = crate::opt::pass_clock();
-                crate::opt::live_dce(func);
-                crate::opt::pass_time(9, t);
+                let t = relax_backend::stats::pass_clock();
+                relax_backend::passes::live_dce(func);
+                relax_backend::stats::pass_time(9, t);
                 verify_pass(func, "live_dce");
             }
-            crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+            relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
             verify_pass(func, "simplify");
             // big values moved through temporaries (a struct literal with a large array, then
             // Box::new): build them in place, at every tier -- these frames overflow threads'
@@ -7979,92 +8793,92 @@ fn opt_pipeline_inner(options: &crate::options::Options, func: &mut crate::rir::
                 if !(cfg.sroa && func.slots.iter().any(|s| s.size >= BIG_SLOT)) {
                     break;
                 }
-                let mut ch = crate::opt::forward_slot_dests(func);
+                let mut ch = relax_codegen::opt::forward_slot_dests(func);
                 verify_pass(func, "forward_slot_dests");
-                ch |= crate::opt::forward_slot_dests_x(options, func, BIG_SLOT);
+                ch |= relax_codegen::opt::forward_slot_dests_x(options, func, BIG_SLOT);
                 verify_pass(func, "forward_slot_dests_x");
                 if !full {
-                    ch |= crate::opt::forward_slot_copies(func);
+                    ch |= relax_codegen::opt::forward_slot_copies(func);
                     verify_pass(func, "forward_slot_copies");
                 }
                 if !ch {
                     break;
                 }
-                crate::opt::simplify(options, func, ro, cfg.imm, false);
+                relax_backend::passes::simplify(options, func, ro, cfg.imm, false);
                 verify_pass(func, "simplify");
             }
-            let t = crate::opt::pass_clock();
+            let t = relax_backend::stats::pass_clock();
             // copy prop has merged the slot address copies: chains the first pass could not
             // follow
-            let mut fw = cfg.sroa && crate::opt::forward_const_slots(func, ro);
+            let mut fw = cfg.sroa && relax_codegen::opt::forward_const_slots(func, ro);
             verify_pass(func, "forward_const_slots");
             if full && cfg.sroa {
-                fw |= crate::opt::forward_slot_copies(func);
+                fw |= relax_codegen::opt::forward_slot_copies(func);
                 verify_pass(func, "forward_slot_copies");
-                fw |= crate::opt::forward_slot_loads(func);
+                fw |= relax_codegen::opt::forward_slot_loads(func);
                 verify_pass(func, "forward_slot_loads");
             }
-            let s2 = full && pipeline_variant(options) == 1 && cfg.sroa && crate::opt::sroa(func);
-            crate::opt::pass_time(8, t);
+            let s2 = full && pipeline_variant(options) == 1 && cfg.sroa && relax_backend::passes::sroa(func);
+            relax_backend::stats::pass_time(8, t);
             verify_pass(func, "sroa");
             if s2 {
-                let t = crate::opt::pass_clock();
-                crate::opt::live_dce(func);
-                crate::opt::pass_time(9, t);
+                let t = relax_backend::stats::pass_clock();
+                relax_backend::passes::live_dce(func);
+                relax_backend::stats::pass_time(9, t);
                 verify_pass(func, "live_dce");
             }
             if s2 || fw {
-                crate::opt::simplify(options, func, ro, cfg.imm, false);
+                relax_backend::passes::simplify(options, func, ro, cfg.imm, false);
                 verify_pass(func, "simplify");
             }
-            let t = crate::opt::pass_clock();
-            let l = cfg.licm && crate::opt::licm(func);
-            crate::opt::pass_time(10, t);
+            let t = relax_backend::stats::pass_clock();
+            let l = cfg.licm && relax_backend::passes::licm(options, func);
+            relax_backend::stats::pass_time(10, t);
             verify_pass(func, "licm");
             if l {
-                crate::opt::simplify(options, func, ro, cfg.imm, false);
+                relax_backend::passes::simplify(options, func, ro, cfg.imm, false);
                 verify_pass(func, "simplify");
             }
         } else {
-            crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+            relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
             verify_pass(func, "simplify");
-            if cfg.sroa && crate::opt::sroa(func) {
+            if cfg.sroa && relax_backend::passes::sroa(func) {
                 verify_pass(func, "sroa");
                 // the cells' entry zeros that a write always precedes are dead by liveness only
-                crate::opt::live_dce(func);
+                relax_backend::passes::live_dce(func);
                 verify_pass(func, "live_dce");
-                crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+                relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
                 verify_pass(func, "simplify");
             }
-            if cfg.licm && crate::opt::licm(func) {
+            if cfg.licm && relax_backend::passes::licm(options, func) {
                 verify_pass(func, "licm");
-                crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+                relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
                 verify_pass(func, "simplify");
             }
         }
     }
-    let ts = crate::opt::pass_clock();
+    let ts = relax_backend::stats::pass_clock();
     if cfg.fold {
-        crate::opt::sink_consts(func);
+        relax_backend::passes::sink_consts(func);
         verify_pass(func, "sink_consts");
     }
-    crate::opt::pass_time(6, ts);
-    let ts = crate::opt::pass_clock();
+    relax_backend::stats::pass_time(6, ts);
+    let ts = relax_backend::stats::pass_clock();
     if cfg.layout && relayout {
-        crate::opt::relayout(func);
+        relax_backend::passes::relayout(func);
         verify_pass(func, "relayout");
     }
-    crate::opt::pass_time(7, ts);
+    relax_backend::stats::pass_time(7, ts);
     // slots with disjoint lifetimes share stack where the backend lays out the frame
-    // (opt::slot_layout, every tier)
-    crate::opt::compact_slots(func);
+    // (relax_backend::frame::slot_layout, every tier)
+    relax_codegen::opt::compact_slots(func);
 }
 
 /// slots from this size up make O1 forward big copies too
 const BIG_SLOT: u32 = 4096;
 
 /// MAKEPAD_RUN_VERIFY_PASSES=1: verify the RIR after every pass (names the pass that broke it).
-fn verify_pass(func: &crate::rir::Func, pass: &str) {
+fn verify_pass(func: &relax_backend::rir::Func, pass: &str) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_VERIFY_PASSES").is_ok()) {
         if let Err(e) = func.verify() {
@@ -8108,7 +8922,7 @@ pub unsafe fn lower_for_audit(up: *mut Unit, id: u32) -> Result<(), String> {
 
 /// Canonical, uninlined RIR for deterministic sandbox metering. Never take the
 /// tier-dependent optimized base-slot RIR as the meter's input.
-pub(crate) unsafe fn sandbox_source_rir(up: *mut Unit, id: u32) -> Result<crate::rir::Func, String> {
+pub(crate) unsafe fn sandbox_source_rir(up: *mut Unit, id: u32) -> Result<relax_backend::rir::Func, String> {
     build_rir_inner(up, id)
 }
 
@@ -8122,6 +8936,29 @@ static DEFERRED_MISSING: relax_session::sync::Mutex<Vec<(u32, (u32, String))>> =
 /// Statics whose initializer failed for a module not loaded yet (by DefId): their storage
 /// stays; static_addr runs the initializer again.
 static DEFERRED_STATICS: relax_session::sync::Mutex<std::collections::BTreeSet<u32>> = relax_session::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// A static's initializer in progress. The static's address is recorded before it runs (statics
+/// may name each other cyclically), so an initializer that unwinds -- a nested owner request
+/// cancelled with OwnerBusy and posted again, a preemption -- would leave the address with no
+/// value, and the retried request would read the zeroed storage as the static (Sandbox's race
+/// kit read every slice of its `static RACE_DEF` as empty). Unwinding marks it like a deferred
+/// static instead: the next static_addr runs the initializer again into the same storage.
+struct PendingInit(u32);
+
+impl PendingInit {
+    fn arm(d: DefId) -> PendingInit {
+        PendingInit(d.0)
+    }
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for PendingInit {
+    fn drop(&mut self) {
+        crate::zone_alloc::kept_with(|| DEFERRED_STATICS.lock().unwrap_or_else(|e| e.into_inner()).insert(self.0));
+    }
+}
 
 /// Whether static `d`'s initializer is waiting for a module the post-boot loader has still to
 /// load (its storage holds no value yet). A cached entry naming it is not linked: the slot is
@@ -8164,7 +9001,7 @@ impl Drop for BuildFrame {
     }
 }
 
-unsafe fn build_rir_inner(up: *mut Unit, id: u32) -> Result<crate::rir::Func, String> {
+unsafe fn build_rir_inner(up: *mut Unit, id: u32) -> Result<relax_backend::rir::Func, String> {
     let frame = BuildFrame::enter();
     let r = build_rir_inner_body(up, id);
     let mine = DEFERRED_ABORT.with(|a| a.get());
@@ -8383,7 +9220,7 @@ impl Drop for Reloading {
     fn drop(&mut self) { RELOADING.fetch_sub(1, Ordering::Release); }
 }
 
-unsafe fn build_rir_inner_body(up: *mut Unit, id: u32) -> Result<crate::rir::Func, String> {
+unsafe fn build_rir_inner_body(up: *mut Unit, id: u32) -> Result<relax_backend::rir::Func, String> {
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
     let f = build_rir_lowered(up, id)?;
@@ -8403,7 +9240,7 @@ unsafe fn build_rir_inner_body(up: *mut Unit, id: u32) -> Result<crate::rir::Fun
                 let value = v.try_to_value(&u.tcx.tys).ok_or("intrinsic const argument did not evaluate")?;
                 let scalar = value.valtree.try_to_leaf().ok_or("intrinsic const argument is not scalar")?;
                 let (size, signed) = match u.tcx.tys.kind(value.ty) {
-                    TyKind::Int(p) => crate::types::Types::int_info(*p),
+                    TyKind::Int(p) => u.tcx.tys.int_info(*p),
                     TyKind::Bool => (1, false),
                     TyKind::Char => (4, false),
                     _ => return Err("intrinsic const argument has a non-scalar type".into()),
@@ -8426,7 +9263,7 @@ unsafe fn build_rir_inner_body(up: *mut Unit, id: u32) -> Result<crate::rir::Fun
 /// H>` / `core::fmt::__relax_opaque_debug::<T>` / `__relax_opaque_display::<T>`, whose
 /// `__relax_opaque_hash_into::<T>` / `__relax_opaque_fmt_into::<T>` are bridged here to the
 /// ops `#[relax_api(handle, hash, debug, display)]` generates for T (rustc runs the impl; bytes / text come back by callback).
-unsafe fn provided_fmt_hash(u: &mut Unit, d: DefId, args: &[TyId], id: u32) -> Result<Option<crate::rir::Func>, String> {
+unsafe fn provided_fmt_hash(u: &mut Unit, d: DefId, args: &[TyId], id: u32) -> Result<Option<relax_backend::rir::Func>, String> {
     let opaque = |u: &Unit, t: TyId| match u.tcx.tys.kind(t) {
         TyKind::Adt(ad, aa, _) if aa.is_empty() && u.provided_types.contains_key(ad) => Some(*ad),
         _ => None,
@@ -8495,7 +9332,7 @@ unsafe fn provided_fmt_hash(u: &mut Unit, d: DefId, args: &[TyId], id: u32) -> R
     Ok(Some(crate::lower::forward_func(u, &ps, ret, name, callee)))
 }
 
-fn provided_bridge(u: &Unit, d: DefId) -> Result<Option<crate::rir::Func>, String> {
+fn provided_bridge(u: &Unit, d: DefId) -> Result<Option<relax_backend::rir::Func>, String> {
     let krate = u.prog.def(d).krate;
     let Some((_, pc)) = u.provided.iter().find(|(k, _)| *k == krate) else {
         return Ok(None);
@@ -8554,7 +9391,7 @@ thread_local! {
 }
 
 /// Lowers slot `id`. An unverified-mode twin is its base slot's body lowered again as unverified code.
-unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, String> {
+unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<relax_backend::rir::Func, String> {
     if let FnKey::Plain(base) = (&*up).fns[id as usize].key {
         let prev = PLAIN_LOWER.with(|c| c.replace(Some(base)));
         let r = build_rir_lowered_as(up, base);
@@ -8564,15 +9401,17 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
     build_rir_lowered_as(up, id)
 }
 
-unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<crate::rir::Func, String> {
+unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::rir::Func, String> {
     let plain = PLAIN_LOWER.with(|c| c.get()) == Some(id);
     let _why = why_function(&*up, id, "lower-fn");
-    let _cost_lower = crate::fncost::phase(3);
+    let _cost_lower = relax_codegen::fncost::phase(3);
     let _mem = crate::memstat::tag(crate::memstat::Tag::Lower);
-    if let Some(f) = (&*up).coro_rir.get(&id) {
-        return Ok(f.clone());
+    if !(&*up).coro_relower.lock().unwrap_or_else(|e| e.into_inner()).contains(&id) {
+        if let Some(f) = (&*up).coro_rir.get(&id) {
+            return Ok(f.clone());
+        }
     }
-    let _warm = crate::warm::Scope::slot(id, "lowering");
+    let _warm = relax_codegen::warm::Scope::slot(id, "lowering");
     let key = (&*up).fns[id as usize].key.clone();
     let fname = {
         let u = &*up;
@@ -8594,6 +9433,7 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<crate::rir::Fun
         key
     };
     if matches!(key, FnKey::Glue(GLUE_UNNAMED, _)) {
+        crate::cache::image_broken_unit(up, id);
         return Err(format!("slot {} of the startup image has no identity (its key did not decode)", id));
     }
     if let FnKey::Shim(ref shim) = key {
@@ -8786,7 +9626,7 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<crate::rir::Fun
 
 /// The same unoptimised RIR on the locked path and the ahead helpers. Publishing a helper's
 /// result does not optimise it: prepare_rir still applies the caller's normal inline policy.
-fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(crate::rir::Func, bool), String> {
+fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(relax_backend::rir::Func, bool), String> {
     let name = u.fns[id as usize].name.to_string();
     trace("lower", &name);
     let mut lcx = Lcx::new(u, body, name.clone(), id);
@@ -8796,6 +9636,7 @@ fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(cr
         FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) => {}
     }
     lcx.finish();
+    u.fns[id as usize].d3_lowered.store(lcx.lowers_disjoint_checks(), Ordering::Relaxed);
     // A branch on a known constant was folded (check only) on the strength of registers written
     // once so far; registers are not SSA, so a later write (a loop assigning the variable) voids
     // the proof: the body is lowered again as written.
@@ -8829,6 +9670,41 @@ fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(cr
 }
 
 /// Finds `#[test]` functions of a crate.
+/// Targets whose rustc build combines a sin and a cos of one value into one libm call
+/// (`note_sincos`): Darwin arm64 and x86-64 glibc.
+const SINCOS_TARGET: bool = cfg!(any(all(target_vendor = "apple", target_arch = "aarch64"), all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")));
+
+/// glibc's `sincos` with both results returned in registers: a struct of two doubles comes back
+/// in xmm0 and xmm1 (SysV), where the optimiser's combined call reads them.
+#[repr(C)]
+struct SinCos(f64, f64);
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+extern "C" {
+    fn sincos(x: f64, s: *mut f64, c: *mut f64);
+    fn sincosf(x: f32, s: *mut f32, c: *mut f32);
+}
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+extern "C" fn sincos_pair(x: f64) -> SinCos {
+    let (mut s, mut c) = (0.0, 0.0);
+    unsafe { sincos(x, &mut s, &mut c) };
+    SinCos(s, c)
+}
+/// `sincosf`: each f32 result in the low 32 bits of its register (the bits an f32 value reads)
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+extern "C" fn sincosf_pair(x: f32) -> SinCos {
+    let (mut s, mut c) = (0.0f32, 0.0f32);
+    unsafe { sincosf(x, &mut s, &mut c) };
+    SinCos(f64::from_bits(s.to_bits() as u64), f64::from_bits(c.to_bits() as u64))
+}
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+extern "C" fn sincos_pair(_: f64) -> SinCos {
+    unreachable!()
+}
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+extern "C" fn sincosf_pair(_: f32) -> SinCos {
+    unreachable!()
+}
+
 pub fn find_tests(prog: &Program, krate: u32) -> Vec<DefId> {
     let mut out = Vec::new();
     for (i, d) in prog.defs.iter().enumerate() {
@@ -8876,7 +9752,7 @@ pub struct Tier1Cfg {
     /// calls through the slot before a function is queued for O3
     pub calls: u64,
     /// optimisation of the O3 build (inlining over every callee that has RIR by then)
-    pub opt: crate::opt::OptCfg,
+    pub opt: relax_codegen::opt::OptCfg,
     /// callees that have no RIR yet are built for inlining up to this many source tokens
     pub src_toks: u32,
 }
@@ -8892,7 +9768,7 @@ impl Tier1Cfg {
             return None;
         }
         let calls = options.tier1_calls;
-        Some(Tier1Cfg { calls, opt: crate::opt::OptCfg::from_options(options), src_toks: TIER1_SRC_TOKS })
+        Some(Tier1Cfg { calls, opt: relax_codegen::opt::OptCfg::from_options(options), src_toks: TIER1_SRC_TOKS })
     }
 }
 
@@ -8904,118 +9780,114 @@ fn t1_quick_ra(options: &crate::options::Options) -> bool {
     options.t1_quick_ra
 }
 
-fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func, id: u32, name: &str, get: &dyn Fn(u32) -> Option<(*const crate::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<crate::opt::RoReader>, cfg: &crate::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &crate::rir::Func) -> Option<Vec<f32>>) -> Vec<(u32, usize)> {
-    let _cost_opt = crate::fncost::phase(4);
-    crate::fncost::size(true, func);
+/// How many calls deep the O3 nocapture oracle follows a parameter: at 4, `self.members.push(c)`
+/// captured `self` and kept every `self.spectra` load in decode_spectra's loops (MAKEPAD_RUN_OPT=-nocap8: 4).
+const NOCAP_DEPTH: u32 = 8;
+
+fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, snap: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, hot: bool) -> Vec<(u32, usize)> {
+    let _cost_opt = relax_codegen::fncost::phase(4);
+    relax_codegen::fncost::size(true, func);
     func.baseline = false;
     // sroa may keep a slot in registers across a call that provably keeps no pointer to it
     // (the callee's RIR in the snapshot; its own calls one level down); removed below
     struct NocapGuard;
     impl Drop for NocapGuard {
         fn drop(&mut self) {
-            crate::opt::set_sroa_nocapture(None);
+            relax_backend::passes::set_sroa_nocapture(None);
         }
     }
+    // what a bottom-up preparation reads (InlineBodies::prepare): recorded while one runs
+    let reads: std::cell::RefCell<Vec<PrepReads>> = std::cell::RefCell::new(Vec::new());
     let _guard = NocapGuard;
     {
-        // SAFETY: the oracle borrows `get` only while this function runs: the guard removes it
+        // SAFETY: the oracle borrows `get` and `reads` only while this function runs: the guard removes it
         // before `get` goes out of scope, also when the optimiser panics
-        let get_static: &'static dyn Fn(u32) -> Option<(*const crate::rir::Func, u8)> = unsafe { std::mem::transmute(get) };
-        // callees' params, depth-limited (a Vec's push -> reserve -> grow -> realloc chain);
-        // false while a query is in progress (recursion), memoised per (callee, param)
-        fn nocap(get: &dyn Fn(u32) -> Option<(*const crate::rir::Func, u8)>, memo: &std::cell::RefCell<HashMap<(u32, usize), Option<bool>>>, cid: u32, k: usize, depth: u32) -> bool {
-            if let Some(r) = memo.borrow().get(&(cid, k)) {
-                return r.unwrap_or(false);
-            }
+        let get_static: &'static dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)> = unsafe { std::mem::transmute(get) };
+        // callees' params, depth-limited (NOCAP_DEPTH: a Vec's push -> grow_one -> grow_amortized ->
+        // finish_grow -> allocator chain is 5 calls deep);
+        // false for a query already in progress (recursion). Memoised per (callee, param, depth)
+        // only when no answer below came from an in-progress query, so every answer is the one a
+        // fresh query gives, whatever was asked before; each answer keeps the slots it read, which
+        // a bottom-up preparation's read set takes in (PrepShared). Returns (answer, depended on an
+        // in-progress query); `out` gets the slots read.
+        type NocapMemo = std::cell::RefCell<HashMap<(u32, usize, u32), Option<(bool, Vec<u32>)>>>;
+        fn nocap(get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, memo: &NocapMemo, cid: u32, k: usize, depth: u32, out: &mut Vec<u32>) -> (bool, bool) {
             if depth == 0 {
-                return false;
+                return (false, false);
             }
-            let Some((fp, _)) = get(cid) else { return false };
-            memo.borrow_mut().insert((cid, k), None);
+            match memo.borrow().get(&(cid, k, depth)) {
+                Some(Some((r, reads))) => { out.extend_from_slice(reads); return (*r, false); }
+                Some(None) => return (false, true),
+                None => {}
+            }
+            let mut reads = vec![cid];
+            let Some((fp, _)) = get(cid) else { out.push(cid); return (false, false) };
+            memo.borrow_mut().insert((cid, k, depth), None);
             let f2 = unsafe { &*fp };
-            let sub = |c2: &crate::rir::Callee, k2: usize| -> bool {
+            let tainted = std::cell::Cell::new(false);
+            let sub_reads = std::cell::RefCell::new(Vec::new());
+            let sub = |c2: &relax_backend::rir::Callee, k2: usize| -> bool {
                 match c2 {
-                    crate::rir::Callee::Fn(i2) => nocap(get, memo, *i2, k2, depth - 1),
+                    relax_backend::rir::Callee::Fn(i2) => {
+                        let (r, t) = nocap(get, memo, *i2, k2, depth - 1, &mut sub_reads.borrow_mut());
+                        if t { tainted.set(true); }
+                        r
+                    }
                     _ => false,
                 }
             };
-            let r = crate::opt::param_nocapture(f2, k, &sub);
-            memo.borrow_mut().insert((cid, k), Some(r));
-            r
+            let r = relax_codegen::opt::param_nocapture(f2, k, &sub);
+            reads.extend(sub_reads.into_inner());
+            reads.sort_unstable();
+            reads.dedup();
+            out.extend_from_slice(&reads);
+            if tainted.get() {
+                memo.borrow_mut().remove(&(cid, k, depth));
+            } else {
+                memo.borrow_mut().insert((cid, k, depth), Some((r, reads)));
+            }
+            (r, tainted.get())
         }
-        let memo: std::cell::RefCell<HashMap<(u32, usize), Option<bool>>> = std::cell::RefCell::new(HashMap::new());
-        crate::opt::set_sroa_nocapture(Some(Box::new(move |c: &crate::rir::Callee, k: usize| -> bool {
-            let crate::rir::Callee::Fn(cid) = c else { return false };
-            nocap(get_static, &memo, *cid, k, 4)
+        let memo: NocapMemo = std::cell::RefCell::new(HashMap::new());
+        let reads_static: &'static std::cell::RefCell<Vec<PrepReads>> = unsafe { std::mem::transmute(&reads) };
+        relax_backend::passes::set_sroa_nocapture(Some(Box::new(move |c: &relax_backend::rir::Callee, k: usize| -> bool {
+            let relax_backend::rir::Callee::Fn(cid) = c else { return false };
+            let mut rd = Vec::new();
+            let r = nocap(get_static, &memo, *cid, k, if relax_backend::stats::opt_env_off("-nocap8") { 4 } else { NOCAP_DEPTH }, &mut rd).0;
+            if let Some(rec) = reads_static.borrow_mut().last_mut() { rec.bodies.extend(rd); }
+            r
         })));
     }
     static INLINE_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let mut inline_stats = (*INLINE_STATS.get_or_init(|| std::env::var("MAKEPAD_RUN_INLINE_STATS").map_or(false, |v| v == "1"))).then(crate::opt::InlineStats::default);
-    let mut limits = crate::opt::InlineLimits::tier1_for(func);
-    let mut inlined: Vec<(u32, usize)> = Vec::new();
-    if cfg.inline {
-        let ti = crate::opt::pass_clock();
-        let freqs = frequencies(0, func);
-        for (c, rule) in crate::opt::inline_calls_ordered(options, func, id, get, single, nounwind, &limits, freqs.as_deref(), inline_stats.as_mut()) {
-            // a single-caller body moved into this fn: the second round's ceiling includes it
-            if rule == crate::opt::RULE_SINGLE {
-                if let (Some(g), Some((p, _))) = (limits.growth_limit.as_mut(), get(c)) {
-                    *g = g.saturating_add(crate::opt::inst_count(unsafe { &*p }));
-                }
-            }
-            if !inlined.iter().any(|x| x.0 == c) {
-                inlined.push((c, rule));
-            }
-        }
-        crate::opt::pass_time(5, ti);
-    }
-    opt_pipeline(options, func, ro, cfg, layout_for(options, name), true, nounwind);
-    // optimisation exposes calls inlining could not see (a call through a known fn address
-    // became a direct call: `.map(GlyphId)`): one more inlining round for them
-    if cfg.inline {
-        let ti = crate::opt::pass_clock();
-        let freqs = frequencies(1, func);
-        let more = crate::opt::inline_calls_ordered(options, func, id, get, single, nounwind, &limits, freqs.as_deref(), inline_stats.as_mut());
-        crate::opt::pass_time(5, ti);
-        if !more.is_empty() {
-            for (c, rule) in more {
-                if !inlined.iter().any(|x| x.0 == c) {
-                    inlined.push((c, rule));
-                }
-            }
-            crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
-            // simplify merges the blocks a copy and its reads were split over: forward again
-            for _ in 0..2 {
-                if !(cfg.sroa && (crate::opt::forward_const_slots(func, ro) | crate::opt::forward_slot_copies(func) | crate::opt::forward_slot_dests(func) | crate::opt::forward_slot_dests_x(options, func, BIG_SLOT) | crate::opt::forward_slot_loads(func))) {
-                    break;
-                }
-                crate::opt::simplify(options, func, ro, cfg.imm, false);
-            }
-        }
-    }
-    // post-inline cleanup (codegen2's copy-elimination finding + LLVM SROA's whole-slot slicing):
-    // small aggregate temporaries the inlined bodies copy through (Option payloads, sret results)
-    // are forwarded from 32 bytes up, then groups copied in and out are tiled into registers;
-    // later wider loads of narrower stores otherwise fail store forwarding (layout_widgets)
-    if cfg.sroa && !crate::opt::opt_off(options, "-postinline") {
-        for _ in 0..3 {
-            let ch = crate::opt::forward_slot_dests(func) | crate::opt::forward_slot_dests_x(options, func, 32);
-            let ch = ch | crate::opt::split_wide_slot_accesses(func);
-            let ch = ch | crate::opt::sroa_post_inline(func);
-            if !ch {
-                break;
-            }
-            crate::opt::forward_slot_copies(func);
-            crate::opt::forward_slot_loads(func);
-            crate::opt::simplify(options, func, ro, cfg.imm, false);
-        }
-    }
+    // MAKEPAD_RUN_INLINE_STATS=1: per O3 build; =prep: also per bottom-up preparation
+    let mut inline_stats = (*INLINE_STATS.get_or_init(|| std::env::var("MAKEPAD_RUN_INLINE_STATS").map_or(false, |v| v == "1" || v == "prep"))).then(relax_codegen::opt::InlineStats::default);
+    // Bottom-up, as LLVM's CGSCC inliner: every callee in the snapshot is simplified first, its
+    // own inlining included; a site takes that body when its optimised form passes the rules and
+    // fits, else the snapshot body (top-down). A pure function of the snapshot, so replay stays
+    // exact.
+    let get_rec = |c: u32| {
+        if let Some(r) = reads.borrow_mut().last_mut() { r.bodies.push(c); }
+        get(c)
+    };
+    let bodies = InlineBodies::new(options, id, snap, &get_rec, &reads, single, ro, cfg, nounwind);
+    let prep_ns = std::cell::Cell::new(0u64);
+    let prepared = |c: u32| {
+        if !cfg.inline { return None; }
+        let tp = cpu_ns();
+        let r = bodies.prepared(c);
+        prep_ns.set(prep_ns.get() + cpu_ns() - tp);
+        r
+    };
+    let mut inlined = tier1_simplify(options, func, id, name, get, &prepared, single, ro, cfg, nounwind, frequencies, inline_stats.as_mut(), None, None, hot);
+    bodies.expand(&mut inlined);
+    TIER1_PREP[0].fetch_add(prep_ns.get(), Ordering::Relaxed);
+    TIER1_PREP[2].fetch_add(bodies.index.borrow().values().filter(|b| b.is_some()).count() as u64, Ordering::Relaxed);
     // array iterators (a slot read at runtime offsets): their scalar fields in registers, so
     // the iteration counter can drive full unrolling below
-    if cfg.fold && cfg.sroa && crate::opt::promote_dyn_read_slots(func) {
+    if cfg.fold && cfg.sroa && relax_codegen::opt::promote_dyn_read_slots(func) {
         // the cells' entry zeros that a write always precedes are dead by liveness only
-        crate::opt::live_dce(func);
-        crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+        relax_backend::passes::live_dce(func);
+        relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
     }
     // loops with a small constant trip count: fully unrolled (each copy's counter a constant);
     // a second round reaches the loop around an unrolled inner one
@@ -9023,49 +9895,86 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
         if !(cfg.fold && relax_codegen::loops::unroll_const_loops(options, func)) {
             break;
         }
-        crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+        relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
         // the original loops the copies replaced: unreachable now, emptied for the passes below
         relax_codegen::loops::clear_unreachable(func);
+        // an unrolled byte fill (`[0u8; 8]`) is word stores: one cell for sroa below
+        relax_codegen::loops::merge_stores(options, func);
         // unrolled reads at constant offsets: the slots they read can now go to registers (a
         // write-through counter's stores nobody reads go first, then the copy chains)
-        if cfg.sroa && crate::opt::drop_unread_slot_stores(func) {
-            crate::opt::forward_slot_copies(func);
+        if cfg.sroa && relax_codegen::opt::dead_slot_stores(func) {
+            relax_codegen::opt::forward_slot_copies(func);
         }
-        if cfg.sroa && crate::opt::sroa(func) {
-            crate::opt::live_dce(func);
-            crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+        // a store and its load that the unrolled loop sat between are one block now: forward
+        // (`data[i..i + 8].try_into().unwrap_or([0; 8])`: the Result's tag stored, the default's
+        // fill loop, the tag loaded -- the always-Ok branch and the payload's slot chain stayed)
+        if cfg.sroa && relax_codegen::opt::forward_slot_loads(func) {
+            relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
+            relax_codegen::opt::dead_slot_stores(func);
         }
+        if cfg.sroa && relax_backend::passes::sroa(func) {
+            relax_backend::passes::live_dce(func);
+            relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
+        }
+    }
+    // a copy of a stepped pointer's previous value (partition's gap, insertion's hole) read as
+    // the pointer minus its step: accesses through both share one base (load forwarding)
+    if cfg.fold && relax_codegen::version::prev_iv_copies(options, func) {
+        verify_pass(func, "prev_iv_copies");
+        relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
     }
     // iterator steps: the element pointer's accesses read the advanced cursor, one register
     if cfg.fold {
-        crate::opt::fold_post_increments(func);
+        relax_codegen::opt::fold_post_increments(func);
     }
     // Rust min/max with an operand that is never NaN: one minss/maxss (bounding boxes)
     if cfg.fold {
-        crate::opt::min_max_non_nan(func);
+        relax_codegen::opt::min_max_non_nan(func);
     }
     // compares value ranges decide (bounds checks of masked / branch-limited indices)
     if cfg.fold && relax_codegen::ranges::fold_ranges(options, func) {
-        crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+        relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
+    }
+    // bounds checks the counted loop's range implies once a guard in front of it holds: a
+    // check-free clone (rotation, unrolling, vectorisation take it), the original as fallback
+    if cfg.fold && relax_codegen::version::version_bounds_loops(options, func) {
+        verify_pass(func, "version_bounds_loops");
+        relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
+    }
+    // a branch on a loop-invariant condition: one small loop per outcome, chosen once in front
+    if cfg.fold && relax_codegen::version::unswitch_loops(options, func) {
+        verify_pass(func, "unswitch_loops");
+        relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
     }
     // Run after both inlining rounds and before small slots share storage:
     // aggregate ABI halves and partial byte buffers still name distinct slots.
     if cfg.fold && cfg.sroa && relax_codegen::opt::promote_vector_slots(func) {
         verify_pass(func, "promote_vector_slots");
-        crate::opt::live_dce(func);
-        crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
-        if crate::opt::sroa(func) {
-            crate::opt::live_dce(func);
-            crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+        relax_backend::passes::live_dce(func);
+        relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
+        if relax_backend::passes::sroa(func) {
+            relax_backend::passes::live_dce(func);
+            relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
         }
         verify_pass(func, "vector slot cleanup");
     }
-    crate::opt::compact_slots(func);
-    if cfg.licm && !crate::opt::opt_off(options, "-promote") && crate::opt::promote_loop_memory(func) {
+    // values built in a temporary and copied into place: stored there directly (the
+    // temporary's stores die below)
+    if cfg.fold && cfg.sroa && relax_codegen::opt::stores_for_copies(func) {
+        verify_pass(func, "stores_for_copies");
+    }
+    relax_codegen::opt::compact_slots(func);
+    // stores into slot bytes nobody reads back: the forwarding passes above left them behind
+    // (a `[0u8; 8]` buffer filled by copy_from_slice and read by from_le_bytes, the load
+    // forwarded from the source: zero-fill and copy stores, every refill)
+    if cfg.sroa && relax_codegen::opt::dead_slot_stores(func) {
+        relax_backend::passes::live_dce(func);
+    }
+    if cfg.licm && !relax_backend::stats::opt_off(options, "-promote") && relax_codegen::opt::promote_loop_memory(func) {
         verify_pass(func, "promote_loop_memory");
     }
     if cfg.layout && layout_for(options, name) {
-        crate::opt::rotate_loops(func);
+        relax_backend::passes::rotate_loops(func);
     }
     // hot code: small counted single-block loops unrolled (rotation made them single blocks;
     // address modes then fold the copies' i + j into displacements)
@@ -9075,16 +9984,410 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
     relax_codegen::loops::unroll_loops(options, func);
     // byte stores of one value's bytes -> one wide store (before address modes)
     relax_codegen::loops::merge_stores(options, func);
+    // f32 lane stores of one 16 bytes -> one vector store
+    relax_codegen::loops::merge_lane_stores(options, func);
     if cfg.fold {
         // steps of an unrolled copy hang off the first value (offsets fold into address modes)
         if relax_codegen::loops::flatten_step_chains(func) {
-            crate::opt::live_dce(func);
+            relax_backend::passes::live_dce(func);
         }
-        crate::opt::addr_modes(func);
+        relax_backend::passes::addr_modes(func);
         // results computed early for one later use move next to it (O3)
-        crate::opt::sink_single_uses(func);
+        relax_codegen::opt::sink_single_uses(func);
+        // masks and casts whose results are read only within the kept bits: copies, read
+        // through within their blocks (the allocator joins a copy only with a value in no unit)
+        if relax_codegen::opt::drop_undemanded_masks(options, func) {
+            relax_backend::passes::local_copy_prop(func);
+            relax_backend::passes::dce(func);
+        }
+        // accesses through a constant offset of a base that is still live read the base
+        if relax_codegen::opt::fold_offset_bases(options, func) {
+            relax_backend::passes::dce(func);
+        }
+        // reads of a temporary a variable was copied from read the variable: one register
+        relax_codegen::opt::reuse_copied_variables(options, func);
+        // copies the late folds left unread (an unrolled pointer's per-copy values once address
+        // modes read the base: `lea rcx,[rdi+1]; mov r8,rcx` before r8 is loaded over)
+        if !relax_backend::stats::opt_off(options, "-latedce") {
+            relax_backend::passes::live_dce(func);
+        }
     }
     if let Some(stats) = inline_stats { stats.report(name); }
+    inlined
+}
+
+/// The snapshot callees as a caller's O3 build inlines them: bottom-up over the snapshot's call
+/// graph (strongly connected components, callees first, as LLVM's CGSCC inliner), each callee
+/// gets `tier1_simplify` against its callees' prepared bodies, so a caller inlines the callee with
+/// that callee's own inlining (apply_layout_table keeps pair_pos::apply when a closure inlines
+/// it), and its rules and costs see the callee's optimised body. What moves is the body after the
+/// callee's first inlining round, unoptimised: the caller's pipeline then runs once over it, as it
+/// does over snapshot bodies (inlining the optimised body, png_decode lost its vectorised row
+/// filter: the second simplify left a rotated loop that fold_post_increments and the stream
+/// vectoriser do not match; 1.79x). Members of one component see each other's snapshot bodies.
+/// Everything here is a function of the snapshot alone (frequencies are structural), so replay
+/// stays exact, and the O3 builds of one run share a callee's preparation while its inputs are
+/// the same (`PREP_SHARED`).
+struct InlineBodies<'a> {
+    options: &'a crate::options::Options,
+    root: u32,
+    get: &'a dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>,
+    reads: &'a std::cell::RefCell<Vec<PrepReads>>,
+    single: &'a dyn Fn(u32, u32) -> bool,
+    ro: Option<relax_backend::passes::RoReader>,
+    cfg: &'a relax_codegen::opt::OptCfg,
+    nounwind: &'a dyn Fn(u32) -> bool,
+    /// snapshot slot -> (its component in the call graph outside cold blocks, it calls a snapshot body)
+    node: HashMap<u32, (usize, bool)>,
+    arc_of: HashMap<u32, &'a std::sync::Arc<relax_backend::rir::Func>>,
+    /// the preparations made or taken so far (None: none for that slot)
+    index: std::cell::RefCell<HashMap<u32, Option<std::sync::Arc<Prepared>>>>,
+}
+
+/// One callee prepared bottom-up.
+struct Prepared {
+    /// the first inlining round's output, unoptimised: what a site inlines
+    raw: relax_backend::rir::Func,
+    /// the optimised body: what prices the site
+    priced: relax_backend::rir::Func,
+    /// every slot whose body `raw` took, transitively
+    deps: Vec<u32>,
+}
+
+/// What one bottom-up preparation read: snapshot bodies (and absent slots) by slot, through the
+/// inliner, its chain and size queries, nounwind and the nocapture oracle; other callees'
+/// preparations; single-caller facts.
+#[derive(Default)]
+struct PrepReads {
+    bodies: Vec<u32>,
+    prepared: Vec<(u32, usize)>,
+    singles: Vec<(u32, u32, bool)>,
+}
+
+/// A callee's preparation, kept for the next O3 build of this run whose snapshot gives the same
+/// answers to everything it read (LLVM processes a callee once, bottom-up over the whole program;
+/// O3 builds see per-caller snapshots, so a callee's preparation is shared when its reads agree).
+/// Bodies are named by address, preparations by the address of their `Prepared`: `_pins` keep
+/// those allocations, so no other body or preparation can take an address while the entry lives.
+struct PrepShared {
+    /// (slot, body address or 0 when absent, attributes)
+    bodies: Vec<(u32, usize, u8)>,
+    /// (slot, its preparation's address or 0 when it had none)
+    prepared: Vec<(u32, usize)>,
+    singles: Vec<(u32, u32, bool)>,
+    _pins: (Vec<std::sync::Weak<relax_backend::rir::Func>>, Vec<std::sync::Weak<Prepared>>),
+    /// None: its first round inlined nothing (its callers take the snapshot body)
+    body: Option<std::sync::Arc<Prepared>>,
+    /// the nounwind answers the preparation consulted: asked again when the entry is taken, so
+    /// the build's recorded nounwind inputs are the ones a fresh preparation records
+    nounwind: Vec<u32>,
+}
+
+/// Preparations kept per slot (callers whose snapshots differ below it)
+const PREP_SHARED_PER_SLOT: usize = 4;
+
+static PREP_SHARED: std::sync::LazyLock<relax_session::sync::Mutex<HashMap<u32, Vec<std::sync::Arc<PrepShared>>>>> = std::sync::LazyLock::new(|| relax_session::sync::Mutex::new(HashMap::new()));
+
+/// Strongly connected components of a graph (Tarjan, iterative): callees first.
+fn sccs(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let n = edges.len();
+    let (mut index, mut low, mut on) = (vec![usize::MAX; n], vec![0; n], vec![false; n]);
+    let (mut stack, mut out, mut next): (Vec<usize>, Vec<Vec<usize>>, usize) = (Vec::new(), Vec::new(), 0);
+    for s in 0..n {
+        if index[s] != usize::MAX { continue; }
+        let mut work: Vec<(usize, usize)> = vec![(s, 0)];
+        index[s] = next; low[s] = next; next += 1; stack.push(s); on[s] = true;
+        while let Some(&mut (v, ref mut ei)) = work.last_mut() {
+            if *ei < edges[v].len() {
+                let w = edges[v][*ei];
+                *ei += 1;
+                if index[w] == usize::MAX {
+                    index[w] = next; low[w] = next; next += 1; stack.push(w); on[w] = true;
+                    work.push((w, 0));
+                } else if on[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+            } else {
+                work.pop();
+                if let Some(&(p, _)) = work.last() { low[p] = low[p].min(low[v]); }
+                if low[v] == index[v] {
+                    let mut scc = Vec::new();
+                    loop {
+                        let w = stack.pop().unwrap();
+                        on[w] = false;
+                        scc.push(w);
+                        if w == v { break; }
+                    }
+                    out.push(scc);
+                }
+            }
+        }
+    }
+    out
+}
+
+impl<'a> InlineBodies<'a> {
+    /// The call graph of the snapshot; nothing is prepared yet (`prepared` prepares on demand).
+    fn new(options: &'a crate::options::Options, root: u32, snap: &'a [(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], get: &'a dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, reads: &'a std::cell::RefCell<Vec<PrepReads>>, single: &'a dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &'a relax_codegen::opt::OptCfg, nounwind: &'a dyn Fn(u32) -> bool) -> Self {
+        use relax_backend::rir::{Callee, Inst, Term};
+        // nodes: the snapshot, deduplicated in order (the lookup takes the first)
+        let mut ids: Vec<u32> = Vec::new();
+        let mut at: HashMap<u32, usize> = HashMap::new();
+        let mut arc_of: HashMap<u32, &std::sync::Arc<relax_backend::rir::Func>> = HashMap::new();
+        for (c, body, _) in snap {
+            arc_of.entry(*c).or_insert(body);
+            if *c != root && !at.contains_key(c) {
+                at.insert(*c, ids.len());
+                ids.push(*c);
+            }
+        }
+        // the calls a preparation inlines (outside cold blocks)
+        let edges: Vec<Vec<usize>> = ids.iter().enumerate().map(|(k, &c)| {
+            let mut e = Vec::new();
+            for b in &unsafe { &*get(c).unwrap().0 }.blocks {
+                if matches!(b.term, Term::Unreachable | Term::Resume) { continue; }
+                for i in &b.insts {
+                    if let Inst::Call(Callee::Fn(x), _, _) | Inst::FnAddr(_, x) = i {
+                        if let Some(&n) = at.get(x) {
+                            if n != k && !e.contains(&n) { e.push(n); }
+                        }
+                    }
+                }
+            }
+            e
+        }).collect();
+        let mut node = HashMap::new();
+        for (ci, comp) in sccs(&edges).iter().enumerate() {
+            for &k in comp { node.insert(ids[k], (ci, !edges[k].is_empty())); }
+        }
+        InlineBodies { options, root, get, reads, single, ro, cfg, nounwind, node, arc_of, index: Default::default() }
+    }
+
+    /// (the body to inline, the body that prices it): `c` prepared bottom-up on its first
+    /// request; members of one component see each other's snapshot bodies.
+    fn prepared(&self, c: u32) -> Option<(*const relax_backend::rir::Func, *const relax_backend::rir::Func)> {
+        self.get_prepared(c).map(|b| (&b.raw as *const relax_backend::rir::Func, &b.priced as *const relax_backend::rir::Func))
+    }
+
+    fn get_prepared(&self, c: u32) -> Option<std::sync::Arc<Prepared>> {
+        if let Some(r) = self.index.borrow().get(&c) {
+            return r.clone();
+        }
+        let r = ensure_sufficient_stack(|| self.prepare_one(c));
+        self.index.borrow_mut().insert(c, r.clone());
+        r
+    }
+
+    fn prepare_one(&self, c: u32) -> Option<std::sync::Arc<Prepared>> {
+        let (options, get, single, nounwind) = (self.options, self.get, self.single, self.nounwind);
+        let &(comp, calls) = self.node.get(&c)?;
+        let (p, attrs) = get(c)?;
+        let o1 = unsafe { &*p };
+        // a body above the largest size any rule admits (site_rule) is not prepared (one that
+        // optimises down into its own rules' range still is: piano_render, brotli_decode)
+        let max_insts = if relax_codegen::opt::single_on(options) { relax_codegen::opt::INLINE_SINGLE_INSTS } else { relax_codegen::opt::InlineLimits::tier1().always_insts };
+        if attrs & relax_codegen::opt::ATTR_COLD != 0 || !calls || relax_codegen::opt::inst_count(o1) > max_insts {
+            return None;
+        }
+        let sub = |x: u32| if self.node.get(&x).is_some_and(|n| n.0 == comp) { None } else { self.get_prepared(x) };
+        let addr = |b: &Option<std::sync::Arc<Prepared>>| b.as_ref().map_or(0, |b| std::sync::Arc::as_ptr(b) as usize);
+        // a preparation of this slot whose reads this snapshot answers the same way
+        let agrees = |e: &PrepShared| {
+            e.bodies.iter().all(|&(x, a, at)| get(x).map_or(a == 0, |(q, qa)| q as usize == a && qa == at))
+                && e.prepared.iter().all(|&(x, a)| addr(&sub(x)) == a)
+                && e.singles.iter().all(|&(o, x, v)| single(o, x) == v)
+        };
+        let entries: Vec<std::sync::Arc<PrepShared>> = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner()).get(&c).cloned().unwrap_or_default();
+        let shared = entries.iter().find(|e| agrees(e)).cloned();
+        if !entries.is_empty() && shared.is_none() { TIER1_PREP[4].fetch_add(1, Ordering::Relaxed); }
+        let verify = shared.is_some() && std::env::var_os("MAKEPAD_RUN_PREP_VERIFY").is_some();
+        if let Some(e) = shared.as_ref().filter(|_| !verify) {
+            TIER1_PREP[3].fetch_add(1, Ordering::Relaxed);
+            for &x in &e.nounwind { nounwind(x); }
+            return e.body.clone();
+        }
+        self.reads.borrow_mut().push(PrepReads { bodies: vec![c], ..Default::default() });
+        let sub_prepared = |x: u32| {
+            let b = sub(x);
+            if let Some(r) = self.reads.borrow_mut().last_mut() { r.prepared.push((x, addr(&b))); }
+            b.map(|b| (&b.raw as *const relax_backend::rir::Func, &b.priced as *const relax_backend::rir::Func))
+        };
+        let single_rec = |o: u32, x: u32| {
+            let v = single(o, x);
+            if let Some(r) = self.reads.borrow_mut().last_mut() { r.singles.push((o, x, v)); }
+            v
+        };
+        let asked = std::cell::RefCell::new(Vec::new());
+        let recording = |x: u32| {
+            let mut a = asked.borrow_mut();
+            if !a.contains(&x) { a.push(x); }
+            drop(a);
+            if let Some(r) = self.reads.borrow_mut().last_mut() { r.bodies.push(x); }
+            nounwind(x)
+        };
+        let mut f = o1.clone();
+        f.baseline = false;
+        let mut raw = (relax_backend::rir::Func::new(String::new(), 0), Vec::new());
+        let mut stats = std::env::var("MAKEPAD_RUN_INLINE_STATS").is_ok_and(|v| v == "prep").then(relax_codegen::opt::InlineStats::default);
+        let mut structural = |_: usize, f: &relax_backend::rir::Func| (!options.no_block_freq).then(|| inline_structural_freqs(f));
+        // a preparation only serves while its priced body stays admissible: it grows to the
+        // largest size its rules admit, not to a caller's growth room
+        let cap = relax_codegen::opt::max_admitted_insts(options, attrs);
+        tier1_simplify(options, &mut f, c, &o1.name, get, &sub_prepared, &single_rec, self.ro, self.cfg, &recording, &mut structural, stats.as_mut(), Some(&mut raw), Some(cap), false);
+        let rd = self.reads.borrow_mut().pop().unwrap();
+        TIER1_PREP[1].fetch_add(1, Ordering::Relaxed);
+        if let Some(st) = stats { st.report(&format!("prep:{} (root {})", o1.name, self.root)); }
+        let (raw, mut taken) = raw;
+        // shared preparations outlive this build: they live in the compiler arena (the
+        // generation the snapshot bodies are in; a zone swap takes them with it), not in the
+        // build's scratch
+        let prepared = (!taken.is_empty()).then(|| {
+            self.expand(&mut taken);
+            let deps: Vec<u32> = taken.into_iter().map(|x| x.0).collect();
+            crate::zone_alloc::outside_scratch(|| std::sync::Arc::new(Prepared { raw: raw.clone(), priced: f.clone(), deps: deps.clone() }))
+        });
+        let mut slots = rd.bodies;
+        slots.sort_unstable();
+        slots.dedup();
+        let mut pins = (Vec::new(), Vec::new());
+        let bodies: Vec<(u32, usize, u8)> = slots.iter().map(|&x| match get(x) {
+            Some((q, at)) => {
+                if let Some(a) = self.arc_of.get(&x) { pins.0.push(std::sync::Arc::downgrade(a)); }
+                (x, q as usize, at)
+            }
+            None => (x, 0, 0),
+        }).collect();
+        let mut prepared_reads = rd.prepared;
+        prepared_reads.sort_unstable();
+        prepared_reads.dedup();
+        for &(x, _) in &prepared_reads {
+            if let Some(b) = sub(x) { pins.1.push(std::sync::Arc::downgrade(&b)); }
+        }
+        let mut singles = rd.singles;
+        singles.sort_unstable();
+        singles.dedup();
+        let asked = asked.into_inner();
+        if let Some(old) = shared.filter(|_| verify) {
+            // MAKEPAD_RUN_PREP_VERIFY=1: a shared preparation is made again and compared
+            let h = |b: &Option<std::sync::Arc<Prepared>>| b.as_ref().map(|b| (t1_norm_hash(&b.raw), t1_norm_hash(&b.priced), b.deps.clone()));
+            if h(&old.body) != h(&prepared) || old.nounwind != asked {
+                eprintln!("PREP-VERIFY mismatch {} (root {}): reads {} / {}, nounwind {} / {}", o1.name, self.root, old.bodies.len(), bodies.len(), old.nounwind.len(), asked.len());
+            } else {
+                TIER1_PREP[3].fetch_add(1, Ordering::Relaxed);
+            }
+            return prepared;
+        }
+        crate::zone_alloc::outside_scratch(|| {
+            let e = std::sync::Arc::new(PrepShared { bodies: bodies.clone(), prepared: prepared_reads.clone(), singles: singles.clone(), _pins: (pins.0.clone(), pins.1.clone()), body: prepared.clone(), nounwind: asked.clone() });
+            let mut g = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner());
+            let v = g.entry(c).or_default();
+            if v.len() >= PREP_SHARED_PER_SLOT { v.remove(0); }
+            v.push(e);
+        });
+        prepared
+    }
+
+    /// Adds the bodies the inlined prepared callees took (hot reload and the cache's
+    /// dependency certificates name every body the code was made from). A site that took the
+    /// snapshot body instead adds them too: a superset only recompiles more on an edit.
+    fn expand(&self, inlined: &mut Vec<(u32, usize)>) {
+        let mut k = 0;
+        while k < inlined.len() {
+            let (c, rule) = inlined[k];
+            let b = self.index.borrow().get(&c).cloned().flatten();
+            if let Some(b) = b {
+                for &d in &b.deps {
+                    if !inlined.iter().any(|x| x.0 == d) { inlined.push((d, rule)); }
+                }
+            }
+            k += 1;
+        }
+    }
+}
+
+/// O3's simplification (both inlining rounds, the pipeline between them, the post-inline
+/// slot cleanup): what a caller's build inlines when it takes this function bottom-up.
+/// `inlined_only`: receives the body after the first inlining round, before any optimisation,
+/// with the callees that round inlined.
+fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, prepared: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, *const relax_backend::rir::Func)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, mut inline_stats: Option<&mut relax_codegen::opt::InlineStats>, inlined_only: Option<&mut (relax_backend::rir::Func, Vec<(u32, usize)>)>, growth_cap: Option<usize>, hot: bool) -> Vec<(u32, usize)> {
+    let mut limits = relax_codegen::opt::InlineLimits::tier1_for(func, hot);
+    if let (Some(cap), Some(g)) = (growth_cap, limits.growth_limit.as_mut()) {
+        *g = (*g).min(cap.max(relax_codegen::opt::inst_count(func)));
+    }
+    let mut inlined: Vec<(u32, usize)> = Vec::new();
+    if cfg.inline {
+        let ti = relax_backend::stats::pass_clock();
+        let freqs = frequencies(0, func);
+        for (c, rule) in relax_codegen::opt::inline_calls_ordered(options, func, id, get, prepared, single, nounwind, &limits, freqs.as_deref(), inline_stats.as_deref_mut()) {
+            // a single-caller body moved into this fn: the second round's ceiling includes it
+            if rule == relax_codegen::opt::RULE_SINGLE {
+                if let (Some(g), Some((p, _))) = (limits.growth_limit.as_mut(), get(c)) {
+                    *g = g.saturating_add(relax_codegen::opt::inst_count(unsafe { &*p }));
+                }
+            }
+            if !inlined.iter().any(|x| x.0 == c) {
+                inlined.push((c, rule));
+            }
+        }
+        // the code must not depend on the order the sites were taken in
+        relax_backend::passes::renumber_rpo(func);
+        relax_backend::stats::pass_time(5, ti);
+    }
+    // speculation (the root build only): probes / guards on the indirect calls the first round
+    // left or exposed; the second round inlines the guarded direct calls
+    if inlined_only.is_none() {
+        crate::guards::apply(func, id);
+    }
+    if let Some(raw) = inlined_only {
+        *raw = (func.clone(), inlined.clone());
+    }
+    opt_pipeline(options, func, ro, cfg, layout_for(options, name), true, nounwind);
+    // optimisation exposes calls inlining could not see (a call through a known fn address
+    // became a direct call: `.map(GlyphId)`): one more inlining round for them
+    if cfg.inline {
+        let ti = relax_backend::stats::pass_clock();
+        let freqs = frequencies(1, func);
+        let more = relax_codegen::opt::inline_calls_ordered(options, func, id, get, prepared, single, nounwind, &limits, freqs.as_deref(), inline_stats.as_deref_mut());
+        relax_backend::stats::pass_time(5, ti);
+        if !more.is_empty() {
+            relax_backend::passes::renumber_rpo(func);
+            for (c, rule) in more {
+                if !inlined.iter().any(|x| x.0 == c) {
+                    inlined.push((c, rule));
+                }
+            }
+            relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
+            // simplify merges the blocks a copy and its reads were split over: forward again
+            for _ in 0..2 {
+                if !(cfg.sroa && (relax_codegen::opt::forward_const_slots(func, ro) | relax_codegen::opt::forward_slot_copies(func) | relax_codegen::opt::forward_slot_dests(func) | relax_codegen::opt::forward_slot_dests_x(options, func, BIG_SLOT) | relax_codegen::opt::forward_slot_loads(func))) {
+                    break;
+                }
+                relax_backend::passes::simplify(options, func, ro, cfg.imm, false);
+            }
+        }
+    }
+    // post-inline cleanup (codegen2's copy-elimination finding + LLVM SROA's whole-slot slicing):
+    // small aggregate temporaries the inlined bodies copy through (Option payloads, sret results)
+    // are forwarded from 32 bytes up, then groups copied in and out are tiled into registers;
+    // later wider loads of narrower stores otherwise fail store forwarding (layout_widgets)
+    if cfg.sroa && !relax_backend::stats::opt_off(options, "-postinline") {
+        for _ in 0..3 {
+            // zero fills a copy overwrites before any read go first: the copy's stores are
+            // then the only writes of those bytes, so the reads after it can be forwarded
+            let ch = relax_codegen::opt::dead_slot_stores(func);
+            let ch = ch | relax_codegen::opt::forward_slot_dests(func) | relax_codegen::opt::forward_slot_dests_x(options, func, 32);
+            // slots joined along whole copies by byte liveness (loops too); MAKEPAD_RUN_OPT=-slotcoal
+            let ch = ch | (!relax_backend::stats::opt_off(options, "-slotcoal") && relax_codegen::opt::coalesce_slot_copies(func));
+            let ch = ch | relax_codegen::opt::split_wide_slot_accesses(func);
+            let ch = ch | relax_codegen::opt::sroa_post_inline(func);
+            if !ch {
+                break;
+            }
+            relax_codegen::opt::forward_slot_copies(func);
+            relax_codegen::opt::forward_slot_loads(func);
+            relax_backend::passes::simplify(options, func, ro, cfg.imm, false);
+        }
+    }
     inlined
 }
 
@@ -9113,6 +10416,10 @@ pub(crate) fn sample_periods() -> &'static [u64] {
     })
 }
 const SAMPLES_HOT: u32 = 5;
+/// The sampler hands what it read to the owner at most this often (sampler_thread) ...
+const SAMPLE_BATCH: std::time::Duration = std::time::Duration::from_millis(16);
+/// ... or once this many samples wait
+const SAMPLE_BATCH_PCS: usize = 2048;
 /// callers credited with a sample too (a loop calling a hot callee is hot itself)
 #[cfg(not(target_os = "android"))]
 pub(crate) const SAMPLE_CALLERS: usize = 2;
@@ -9168,16 +10475,23 @@ fn dump_base(name: &str) -> Option<String> {
     static DUMP: std::sync::OnceLock<Option<(Vec<String>, String)>> = std::sync::OnceLock::new();
     let (wants, dir) = DUMP.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_DUMP").ok().map(|w| (w.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect(), std::env::var("MAKEPAD_RUN_DUMP_DIR").unwrap_or_else(|_| "/tmp".to_string()))))).as_ref()?;
     let w = wants.iter().find(|w| name.ends_with(w.as_str()))?;
+    // MAKEPAD_RUN_DUMP_EACH=1: every build its own files (instances of one generic share a name)
+    static EACH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *EACH.get_or_init(|| std::env::var_os("MAKEPAD_RUN_DUMP_EACH").is_some()) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Some(format!("{}/relax_dump_{}.{}", dir, w.replace("::", "_"), n));
+    }
     Some(format!("{}/relax_dump_{}", dir, w.replace("::", "_")))
 }
 
 /// MAKEPAD_RUN_DUMP of an O1 / baseline build: its code (.bin), the RIR it was emitted from (.rir) and
 /// its frame size and slots (.frame: `frame <bytes>`, then `slot <n> <size> <align>` per slot)
-fn dump_o1(func: &crate::rir::Func, c: &x64::Compiled) {
+fn dump_o1(func: &relax_backend::rir::Func, c: &x64::Compiled) {
     if let Some(base) = dump_base(&func.name) {
         let _ = std::fs::write(format!("{}.bin", base), &c.code[..c.text_len as usize]);
         let _ = std::fs::write(format!("{}.rir", base), func.dump());
-        let (at, end) = crate::opt::slot_layout(func, 0, true);
+        let (at, end) = relax_backend::frame::slot_layout(func, 0, true);
         let mut m = format!("frame {} slot-area {} of {}\n", c.frame_size, end, slot_bytes(func));
         for (k, sl) in func.slots.iter().enumerate() {
             m.push_str(&format!("slot {} {} {} at {}{}\n", k, sl.size, sl.align, at[k], if sl.arg { " arg" } else { "" }));
@@ -9215,11 +10529,11 @@ struct FrequencyProfile {
     queued: bool,
 }
 
-fn inline_structural_freqs(f: &crate::rir::Func) -> Vec<f32> {
+fn inline_structural_freqs(f: &relax_backend::rir::Func) -> Vec<f32> {
     let nb = f.blocks.len();
     if nb == 0 { return Vec::new(); }
-    let reach = crate::regalloc::reachable(f);
-    let depth = crate::regalloc::loop_depths(f, &reach);
+    let reach = relax_backend::regalloc::reachable(f);
+    let depth = relax_backend::regalloc::loop_depths(f, &reach);
     // Propagate path probability over the forward CFG. Reverse postorder
     // cuts feedback edges; loop depth supplies their repeat weight instead.
     let mut seen = vec![false; nb];
@@ -9241,7 +10555,7 @@ fn inline_structural_freqs(f: &crate::rir::Func) -> Vec<f32> {
     mass[0] = 1.0;
     for &b in &order {
         let forward = |to: &u32| rank[*to as usize] > rank[b]
-            && !matches!(f.blocks[*to as usize].term, crate::rir::Term::Unreachable | crate::rir::Term::Resume);
+            && !matches!(f.blocks[*to as usize].term, relax_backend::rir::Term::Unreachable | relax_backend::rir::Term::Resume);
         let n = f.blocks[b].term.succs().filter(forward).count();
         if n > 0 {
             let share = mass[b] / n as f32;
@@ -9256,7 +10570,7 @@ fn inline_structural_freqs(f: &crate::rir::Func) -> Vec<f32> {
 /// Allocation weights use the frozen evidence directly. A missing PC observation
 /// is unknown, never proof that a block is unexecuted: retain a positive floor
 /// so the allocator can still split its loops. Inlining uses the CFG estimate.
-fn sampled_freqs(f: &crate::rir::Func, h: &HashMap<u64, u32>) -> Vec<f32> {
+fn sampled_freqs(f: &relax_backend::rir::Func, h: &HashMap<u64, u32>) -> Vec<f32> {
     let counts: Vec<u32> = f.blocks.iter().map(|b| {
         b.pos.iter().chain(std::iter::once(&b.term_pos))
             .map(|p| h.get(p).copied().unwrap_or(0)).max().unwrap_or(0)
@@ -9453,14 +10767,23 @@ fn sampler_thread() {
     let mut last = std::time::Instant::now();
     let mut last_write = std::time::Instant::now();
     let mut last_progress = std::time::Instant::now();
+    let mut last_batch = std::time::Instant::now();
     let periods = sample_periods();
     let mut period_index = 0;
+    // wakes in a row in which no sampled thread was on a CPU (macOS: an idle app); past
+    // IDLE_WAKES the sampler sleeps IDLE_MS between looks instead of SAMPLE_MS (a 500 Hz
+    // suspend / resume of every JIT thread of an idle Stage cost ~8% of a core). A sample's
+    // weight is capped by the thread's CPU time, so the longer sleep does not over-credit it.
+    const IDLE_WAKES: u32 = 50;
+    const IDLE_MS: u64 = 20;
+    let mut idle_wakes = 0u32;
     loop {
         let period = periods[period_index];
         period_index = (period_index + 1) % periods.len();
         // Linux selects irregular observations from its perf stream. Drain
         // often enough to avoid overflowing the ring even for long intervals.
         let sleep_ms = if cfg!(target_os = "linux") && periods.len() > 1 { period.min(32) } else { period };
+        let sleep_ms = if idle_wakes >= IDLE_WAKES { sleep_ms.max(IDLE_MS) } else { sleep_ms };
         wait.sleep(sleep_ms);
         if TIER_STOP.load(Ordering::SeqCst) { break; }
         o3_progress_write(&mut last_progress);
@@ -9475,9 +10798,11 @@ fn sampler_thread() {
         let (lo, hi) = (EXEC_LO.load(Ordering::Relaxed), EXEC_HI.load(Ordering::Relaxed));
         {
             let g = SAMPLED.lock().unwrap();
+            let mut on_cpu = false;
             for (_, _, h) in g.iter() {
-                os::sample::read(h, &mut pcs, &mut selfs, lo, hi, weight);
+                on_cpu |= os::sample::read(h, &mut pcs, &mut selfs, lo, hi, weight);
             }
+            idle_wakes = if on_cpu { 0 } else { idle_wakes.saturating_add(1) };
         }
         if sample_trace() {
             static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -9485,6 +10810,25 @@ fn sampler_thread() {
             let threads = SAMPLED.lock().map(|g| g.len()).unwrap_or(0);
             eprintln!("sampler: t={:.1} ms, {} threads, {} pcs", t, threads, pcs.len());
         }
+        // Decay even with no samples or a busy unit lock. Otherwise yesterday's hot code
+        // retains its priority during an idle spell. Catch up after delayed sampler wakes.
+        let now = wall_ns();
+        let halves = now.saturating_sub(last_half) / HEAT_HALF_NS;
+        if halves > 0 {
+            last_half += halves * HEAT_HALF_NS;
+            if let Some(counts) = HEAT.lock().unwrap().as_mut() {
+                counts.retain(|_, c| {
+                    *c = c.checked_shr(halves.min(32) as u32).unwrap_or(0);
+                    *c > 0
+                });
+            }
+        }
+        // the samples go to the owner in batches, one unit call per SAMPLE_BATCH (not one per
+        // 2 ms wake: an animating Stage at idle woke the owner 500 times a second for them)
+        if !TIER_STOP.load(Ordering::SeqCst) && last_batch.elapsed() < SAMPLE_BATCH && pcs.len() < SAMPLE_BATCH_PCS && selfs.len() < SAMPLE_BATCH_PCS {
+            continue;
+        }
+        last_batch = std::time::Instant::now();
         // Train only after the first structural O3 installation. Sampling
         // retired code would mix the old and new code shapes during long calls.
         if !selfs.is_empty() && !TIER_STOP.load(Ordering::SeqCst) {
@@ -9565,19 +10909,6 @@ fn sampler_thread() {
             });
         }
         selfs.clear();
-        // Decay even with no samples or a busy unit lock. Otherwise yesterday's hot code
-        // retains its priority during an idle spell. Catch up after delayed sampler wakes.
-        let now = wall_ns();
-        let halves = now.saturating_sub(last_half) / HEAT_HALF_NS;
-        if halves > 0 {
-            last_half += halves * HEAT_HALF_NS;
-            if let Some(counts) = HEAT.lock().unwrap().as_mut() {
-                counts.retain(|_, c| {
-                    *c = c.checked_shr(halves.min(32) as u32).unwrap_or(0);
-                    *c > 0
-                });
-            }
-        }
         if pcs.is_empty() || TIER_STOP.load(Ordering::SeqCst) {
             pcs.clear();
             continue;
@@ -9592,6 +10923,10 @@ fn sampler_thread() {
             let counts = heat.get_or_insert_with(std::collections::HashMap::new);
             for &os::sample::Sample { pc, weight } in &pcs {
                 let Some(id) = u.find_fn(pc) else { continue };
+                // SPEC-V: a twin's samples heat its base slot too: the body is hot whichever lowering
+                // of it runs, and verified callers lowered again (hot_twin_callers) call the base
+                let base = match u.fns[id as usize].key { FnKey::Plain(b) => Some(b), _ => None };
+                for id in std::iter::once(id).chain(base) {
                 unsafe { base_sampled(up, id) };
                 let (before, count) = crate::zone_alloc::kept_with(|| {
                     let c = counts.entry(id).or_insert(0);
@@ -9599,12 +10934,17 @@ fn sampler_thread() {
                     *c += weight;
                     (before, *c)
                 });
-                if before < SAMPLES_HOT && count >= SAMPLES_HOT {
+                // a slot counted again after it went cold (tier_revalidate) is queued at its first
+                // sample: it runs again, so its earlier hotness counts (steady lukewarm UI code never
+                // crosses SAMPLES_HOT twice)
+                let rearmed = before == 0 && unsafe { (*tier_rec(&u.slots, id).add(5)).load(Ordering::Relaxed) & REARMED != 0 };
+                if before < SAMPLES_HOT && count >= SAMPLES_HOT || rearmed {
                     if sample_trace() {
                         eprintln!("sampler: {} hot", u.fns[id as usize].name);
                     }
                     // (the sampler's own vector grows here, on the owner: kept, it outlives the compiler arena)
                     crate::zone_alloc::kept_with(|| hot.push(id));
+                }
                 }
             }
             // HEAT before TIER_QUEUE nowhere (tier_pop holds the queue, then reads HEAT)
@@ -9623,6 +10963,7 @@ fn sampler_thread() {
 /// holding the lock from here on (never released: the process is ending) stops them.
 impl Drop for Unit {
     fn drop(&mut self) {
+        crate::guards::dump(&|id| if (id as usize) < self.fns.len() { self.fns[id as usize].name.to_string() } else { String::new() });
         crate::domain::forget_tls_keys(self.syms.dom0());
         let options = &self.prog.session.clone().options;
         if !self.retired {
@@ -9672,11 +11013,12 @@ impl Drop for Unit {
         if self.retired {
             let rest = UNIT_DATA_SIZE + UNIT_RW_SIZE + (crate::syms::SYM_CAP * 8) as u64;
             os::mem::release(self.exec_base, self.exec_size as usize, rest as usize);
-            // the slot segments: thunks and stubs first, then the table words and tier records
-            for seg in 0..crate::rir::SLOT_SEGS {
+            // the slot segments: stubs first, then the table words and tier records (the thunks
+            // went with the code area)
+            for seg in 0..relax_backend::rir::SLOT_SEGS {
                 if self.slots.has_seg(seg) {
-                    let count = crate::rir::SlotTable::seg_slots(seg);
-                    os::mem::release(self.slots.seg_base(0, seg), count * (THUNK_SIZE + STUB_SIZE), count * (8 + TIER_REC));
+                    let count = relax_backend::rir::SlotTable::seg_slots(seg);
+                    os::mem::release(self.slots.seg_base(1, seg), count * STUB_SIZE, count * (8 + TIER_REC));
                 }
             }
         }
@@ -9743,8 +11085,8 @@ unsafe fn queue_marked(u: &Unit, id: u32) {
     let code = (*rec.add(1)).load(Ordering::Relaxed);
     let stub = (*rec.add(2)).load(Ordering::Relaxed);
     if (*rec.add(3)).compare_exchange(T_COUNTING, T_QUEUED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-        let s = u.slots.table(id) as *const AtomicU64;
-        let _ = (*s).compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
+        let s = SlotWord::of(&u.slots, id);
+        let _ = s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
         TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
         tier_push(id, Q_MARKED, 0);
         TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime, &u.prog.session.options));
@@ -9757,8 +11099,8 @@ unsafe fn queue_hot(u: &Unit, id: u32) {
     let code = (*rec.add(1)).load(Ordering::Relaxed);
     let stub = (*rec.add(2)).load(Ordering::Relaxed);
     if (*rec.add(3)).compare_exchange(T_COUNTING, T_QUEUED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-        let s = u.slots.table(id) as *const AtomicU64;
-        let _ = (*s).compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
+        let s = SlotWord::of(&u.slots, id);
+        let _ = s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
         TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
         churn_queued(id);
         tier_push(id, Q_SAMPLES, call_rate(rec, u.tier1.as_ref().map_or(0, |t| t.calls), wall_ns()));
@@ -9786,7 +11128,76 @@ const T_QUEUED: u64 = 2;
 // The sampler cannot queue a recorded instance before its first call.
 const T_REPLAY: u64 = 3;
 
-fn tier_rec(slots: &crate::rir::SlotTable, id: u32) -> *const AtomicU64 {
+/// Slot `id`'s table word: what a call of the slot runs. Every write goes through `store` /
+/// `compare_exchange`, which bring the slot's thunk head in step (calls.DESIGN.md): calls go
+/// `call thunk` -> `jmp code`, direct both, whatever the word is set to (tier-up, patch,
+/// rollback, count stubs, twins).
+pub(crate) struct SlotWord<'a> {
+    slots: &'a relax_backend::rir::SlotTable,
+    id: u32,
+}
+
+impl<'a> SlotWord<'a> {
+    pub(crate) fn of(slots: &'a relax_backend::rir::SlotTable, id: u32) -> Self {
+        SlotWord { slots, id }
+    }
+    fn word(&self) -> &AtomicU64 {
+        unsafe { &*(self.slots.table(self.id) as *const AtomicU64) }
+    }
+    pub(crate) fn load(&self, o: Ordering) -> u64 {
+        self.word().load(o)
+    }
+    pub(crate) fn store(&self, v: u64, o: Ordering) {
+        self.word().store(v, o);
+        sync_thunk(self.slots, self.id);
+    }
+    pub(crate) fn compare_exchange(&self, cur: u64, new: u64, ok: Ordering, err: Ordering) -> Result<u64, u64> {
+        let r = self.word().compare_exchange(cur, new, ok, err);
+        if r.is_ok() {
+            sync_thunk(self.slots, self.id);
+        }
+        r
+    }
+}
+
+/// Slot `id`'s thunk head for its table word's value: a direct jump when in reach, else the
+/// thunk's table-word path. Racing writers converge: each writes the head for the value it read
+/// and reads the word again until the two agree, so the last head written is for the last value.
+/// A thread still running the old head reaches the old target, which stays valid code.
+fn sync_thunk(slots: &relax_backend::rir::SlotTable, id: u32) {
+    if os::mem::no_codegen() {
+        return;
+    }
+    let word = unsafe { &*(slots.table(id) as *const AtomicU64) };
+    let at = slots.thunk(id);
+    let mut v = word.load(Ordering::SeqCst);
+    loop {
+        // (the head as it is, read through the executable view: no write when it already fits)
+        unsafe {
+            #[cfg(target_arch = "aarch64")]
+            {
+                let h = x64::thunk_head(at, v);
+                if std::ptr::read_volatile(at as *const u32) != h {
+                    os::mem::patch_code_u32(at, h);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let h = x64::thunk_head(at, v);
+                if std::ptr::read_volatile(at as *const u64) != h {
+                    os::mem::patch_code_u64(at, h);
+                }
+            }
+        }
+        let now = word.load(Ordering::SeqCst);
+        if now == v {
+            return;
+        }
+        v = now;
+    }
+}
+
+fn tier_rec(slots: &relax_backend::rir::SlotTable, id: u32) -> *const AtomicU64 {
     slots.tier(id) as *const AtomicU64
 }
 
@@ -9857,7 +11268,9 @@ fn await_verdict(id: u32, w: Await) {
 /// verified, and the promotions that waited for them run. A no-op until `lazy::RECORDED` or the patch
 /// epoch changes. Any thread; the unit is read under a unit call.
 pub fn sweep_verdicts() {
-    let now = crate::borrowck::lazy::RECORDED.load(Ordering::Acquire).wrapping_mul(1 << 20).wrapping_add(PATCH_EPOCH.load(Ordering::SeqCst));
+    // (the pending patches too: unverified O3 builds wait for none to be pending)
+    let now = crate::borrowck::lazy::RECORDED.load(Ordering::Acquire).wrapping_mul(1 << 20).wrapping_add(PATCH_EPOCH.load(Ordering::SeqCst))
+        .wrapping_add((crate::reload::UNVERIFIED_PATCHES.load(Ordering::Acquire) as u64) << 48);
     if SWEPT.swap(now, Ordering::Relaxed) == now {
         return;
     }
@@ -9868,15 +11281,35 @@ pub fn sweep_verdicts() {
     let verified = owner::call(owner::Class::Background, || unsafe {
         let u = &*up;
         let mut n = 0u32;
+        let mut relower = Vec::new();
+        let mut verified = Vec::new();
         for id in 0..u.fns.len() {
             if u.fns[id].unverified.load(Ordering::Relaxed) && u.refresh_verified(id as u32) {
                 n += 1;
+                // D3: the installed code lacks the verdict's disjoint-index checks; O3 code built
+                // while unverified lacks its noalias facts: built again
+                if u.fns[id].compiled && (u.fns[id].o3.load(Ordering::Relaxed) || !u.fns[id].d3_lowered.load(Ordering::Relaxed) && u.disjoint_checks(id as u32).is_some()) {
+                    relower.push(id as u32);
+                } else {
+                    verified.push(id as u32);
+                }
             }
         }
+        // ... and warm ones whose unverified lowering calls hot twins
+        relower.extend(hot_twin_callers(u, Some(&verified), None));
+        for id in relower { tier_push(id, Q_RETIER, 0); }
         let released: Vec<(u32, Await)> = {
             let mut a = AWAIT_VERDICT.lock().unwrap_or_else(|e| e.into_inner());
-            let (go, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *a).into_iter().partition(|(id, _)| !u.fns[*id as usize].unverified.load(Ordering::Relaxed));
-            crate::zone_alloc::kept_with(|| *a = keep);
+            // the list outlives the compiler zone (a swap destroys it): the kept part is allocated
+            // in the kept heap (assigning a Vec made outside kept_with kept its zone buffer, and
+            // the next await_verdict after a swap faulted reading it)
+            // an O3 build of unverified code waits only for a live patch's verdict (Unit::o3_allowed)
+            let all = std::mem::take(&mut *a);
+            let (go, keep): (Vec<_>, Vec<_>) = crate::zone_alloc::kept_with(|| all.into_iter().partition(|(id, w)| match w {
+                Await::Tier(..) => u.o3_allowed(*id),
+                Await::O2 => !u.fns[*id as usize].unverified.load(Ordering::Relaxed),
+            }));
+            *a = keep;
             go
         };
         for (id, w) in released {
@@ -9891,6 +11324,111 @@ pub fn sweep_verdicts() {
         n
     });
     let _ = verified;
+}
+
+/// SPEC-V: the slots among `cands` (None: every slot the sampler saw lately) that are verified, warm
+/// (in HEAT) and still run an unverified lowering whose calls go to `twin` (None: to any twin that is
+/// hot or has O3 code). Built again (retier), they are lowered as verified code, so the hot chain
+/// under them reaches the slots themselves: noalias, inlining, cache entries. Unit read; HEAT is
+/// taken here and released before the caller queues them (tier_pop reads HEAT under the queue).
+fn hot_twin_callers(u: &Unit, cands: Option<&[u32]>, twin: Option<u32>) -> Vec<u32> {
+    let heat = HEAT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(h) = heat.as_ref() else { return Vec::new() };
+    let hot = |t: u32| matches!(u.fns[t as usize].key, FnKey::Plain(_)) && match twin {
+        Some(w) => t == w,
+        None => u.fns[t as usize].o3.load(Ordering::Relaxed) || h.get(&t).is_some_and(|n| *n >= SAMPLES_HOT),
+    };
+    let calls_hot = |c: u32| {
+        let f = &u.fns[c as usize];
+        h.contains_key(&c) && f.compiled && !f.unverified.load(Ordering::Relaxed) && !matches!(f.key, FnKey::Plain(_) | FnKey::Sandbox(_))
+            && f.rir.as_ref().is_some_and(|r| r.plain_calls && r.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(t), _, _) if hot(*t)))))
+    };
+    match cands {
+        Some(c) => c.iter().copied().filter(|&c| calls_hot(c)).collect(),
+        None => h.keys().copied().filter(|&c| (c as usize) < u.fns.len() && calls_hot(c)).collect(),
+    }
+}
+
+/// Tier record word 5 (O1 code bytes): the slot was counted again once (tier_revalidate) and
+/// queued since: its next build goes ahead whatever its age.
+const REARMED: u64 = 1 << 63;
+/// A calls / samples entry older than this whose slot is not hot now (fewer than SAMPLES_HOT recent
+/// samples: under ~0.5% of a thread) is counted again (tier_revalidate).
+const REVALIDATE_NS: u64 = 1_000_000_000;
+/// O3 queue entries counted again (they had gone cold before their build)
+pub static TIER_REVALIDATED: AtomicU64 = AtomicU64::new(0);
+
+/// The O3 queue's backlog of code that has gone cold (queue lock held): an entry queued by its
+/// calls or samples REVALIDATE_NS ago or earlier, whose slot is not hot now, goes back to counting
+/// (its count stub in the slot again) instead of being built. Hot code is queued again within its
+/// count window and built then (REARMED: whatever its age); startup code that was busy once (a
+/// cold Stage queued 2k slots before its first present) and lukewarm UI code never builds. The
+/// level's policy (o3_revalidate).
+fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
+    if q.is_empty() || !ahead_policy().o3_revalidate {
+        return;
+    }
+    let now = wall_ns();
+    if !q.iter().any(|e| matches!(e.1, Q_CALLS | Q_SAMPLES) && now.saturating_sub(e.2) >= REVALIDATE_NS) {
+        return;
+    }
+    let up = TIER_UNIT.load(Ordering::Acquire);
+    if up.is_null() {
+        return;
+    }
+    let u = unsafe { &*up };
+    // (profile replay builds what its profile names, as recorded)
+    if t1prof_replay(&u.prog.session.options) {
+        return;
+    }
+    let Some(calls) = u.tier1.as_ref().map(|t| t.calls) else { return };
+    let heat = HEAT.lock().unwrap();
+    // no samples at all (no sampler on this platform): no evidence either way, the count decides
+    let Some(h) = heat.as_ref() else { return };
+    let mut n = 0u64;
+    q.retain(|&(id, why, at, _)| {
+        // still hot: as many recent samples (decayed) as make a slot hot
+        if !matches!(why, Q_CALLS | Q_SAMPLES) || now.saturating_sub(at) < REVALIDATE_NS || h.get(&id).copied().unwrap_or(0) >= SAMPLES_HOT {
+            return true;
+        }
+        unsafe {
+            let rec = tier_rec(&u.slots, id);
+            let len = (*rec.add(5)).load(Ordering::Relaxed);
+            if len & REARMED != 0 || (*rec.add(3)).load(Ordering::Acquire) != T_QUEUED {
+                return true;
+            }
+            let code = (*rec.add(1)).load(Ordering::Relaxed);
+            let stub = (*rec.add(2)).load(Ordering::Relaxed);
+            (*rec).store(calls, Ordering::Relaxed);
+            (*rec.add(4)).store(now, Ordering::Relaxed);
+            (*rec.add(5)).store(len | REARMED, Ordering::Relaxed);
+            (*rec.add(3)).store(T_COUNTING, Ordering::Release);
+            let s = SlotWord::of(&u.slots, id);
+            // other code was installed meanwhile (O2, a patch): the stub is not its entry; build it
+            if s.compare_exchange(code, stub, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                (*rec.add(3)).store(T_QUEUED, Ordering::Release);
+                return true;
+            }
+        }
+        n += 1;
+        false
+    });
+    if n > 0 {
+        TIER_REVALIDATED.fetch_add(n, Ordering::Relaxed);
+        if tier1_trace() {
+            eprintln!("O3q @{:.3} {} cold entries counted again, q={}", now as f64 / 1e9, n, q.len());
+        }
+    }
+}
+
+/// A speculation site of slot `id` changed state (crate::guards): rebuild its O3 code. Called
+/// from program threads (no unit lock), as rt_hot queues.
+pub(crate) fn guard_relink(id: u32) {
+    // one rebuild decides every ready site of the slot: no second entry while one waits
+    if TIER_QUEUE.lock().unwrap().iter().any(|e| e.0 == id && e.1 == Q_RETIER) {
+        return;
+    }
+    tier_push(id, Q_RETIER, 0);
 }
 
 fn tier_push(id: u32, why: u8, rate: u64) {
@@ -9933,7 +11471,8 @@ fn spawn_tier1_threads(runtime: &crate::options::RuntimeOptions, options: &crate
     } else if runtime.tier1_adaptive {
         (3.min(cap), 3.max(cores / 2).min(cap))
     } else {
-        (3.min(cap), 3.min(cap))
+        let n = 3.min(cap).min(ahead_policy().o3_threads);
+        (n, n)
     };
     for k in 0..max {
         let runtime = crate::zone_alloc::kept_clone(runtime);
@@ -9998,14 +11537,14 @@ impl Tier1Measure {
     fn phase(&mut self, phase: usize, now: u64) {
         self.phases[self.phase] += now.saturating_sub(self.last);
         if self.phase == 1 {
-            let end = crate::opt::pass_local();
+            let end = relax_backend::stats::pass_local();
             for i in 0..16 { self.passes[i] += end[i] - self.pass_start[i]; }
         }
         self.phase = phase;
         self.last = now;
         if phase == 1 {
-            crate::opt::pass_timing_on();
-            self.pass_start = crate::opt::pass_local();
+            relax_backend::stats::pass_timing_on();
+            self.pass_start = relax_backend::stats::pass_local();
         }
     }
 }
@@ -10035,7 +11574,7 @@ pub(crate) fn tier1_stats_report() {
     let ms = |ns: u64| ns as f64 / 1e6;
     eprintln!("makepad-run o3-stats: builds={} cpu_ms={:.3} max_threads={} in_flight={} (completed attempts; Windows CPU is cycle-estimated)", s.builds, ms(s.cpu), s.max_active, s.active);
     eprintln!("makepad-run o3-stats: phases_cpu_ms snapshot={:.3} backend={:.3} install={:.3}", ms(s.phases[0]), ms(s.phases[1]), ms(s.phases[2]));
-    let passes: Vec<String> = crate::opt::PASS_NAMES.iter().enumerate().map(|(i, n)| format!("{}={:.3}", n, ms(s.passes[i]))).collect();
+    let passes: Vec<String> = relax_backend::stats::PASS_NAMES.iter().enumerate().map(|(i, n)| format!("{}={:.3}", n, ms(s.passes[i]))).collect();
     eprintln!("makepad-run o3-stats: backend_pass_ms {} (pass slots can overlap; MAKEPAD_RUN_PASS_TIMES=wall selects wall time)", passes.join(" "));
     let mut waits = s.waits.clone();
     waits.sort_unstable();
@@ -10088,6 +11627,14 @@ impl Drop for StartupCompile {
 // Recheck for every job: renewed foreground compilation immediately throttles new builds
 // back to worker zero. In-flight builds always finish and install, even during startup.
 const TIER1_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+/// ns since the program threads' last lazy compile ended; 0 while one runs (owner.rs's headroom).
+pub(crate) fn demand_quiet_ns() -> u64 {
+    if DEMAND_COMPILES.load(Ordering::SeqCst) != 0 {
+        return 0;
+    }
+    wall_ns().saturating_sub(DEMAND_LAST.load(Ordering::SeqCst))
+}
+
 fn tier1_workers_ready() -> bool {
     DEMAND_COMPILES.load(Ordering::SeqCst) == 0
         && wall_ns().saturating_sub(DEMAND_LAST.load(Ordering::SeqCst)) >= TIER1_POLL.as_nanos() as u64
@@ -10119,7 +11666,9 @@ impl Unit {
             FnKey::Inst(d, _) => self.prog.def(*d).kind != DefKind::ForeignFn,
             FnKey::Closure(..) => true,
             FnKey::Sandbox(base) => *base != u32::MAX,
-            FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Plain(_) => false,
+            // SPEC-V: twins tier up too (Unit::o3_allowed); the sampler queues only counted slots
+            FnKey::Plain(_) => true,
+            FnKey::Shim(_) | FnKey::Glue(..) => false,
         };
         self.arm_counter_as(id, code, counted);
     }
@@ -10144,7 +11693,10 @@ impl Unit {
             return;
         }
         let now = wall_ns();
-        let mut buf = Vec::with_capacity(ids.len() * 48);
+        // the block's place first: each stub jumps to its O1 code pc-relatively
+        let cs = x64::COUNT_STUB_SIZE;
+        let at = bump(&self.code_next, (ids.len() * cs) as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+        let mut buf = Vec::with_capacity(ids.len() * cs);
         let mut stubs = Vec::with_capacity(ids.len());
         unsafe {
             for &(id, code) in ids {
@@ -10156,20 +11708,21 @@ impl Unit {
                 (*rec.add(4)).store(now, Ordering::Relaxed);
                 (*rec.add(5)).store(self.fns[id as usize].code_len as u64, Ordering::Relaxed);
                 (*rec.add(1)).store(code, Ordering::Relaxed);
-                buf.resize((buf.len() + 15) & !15, 0xcc);
-                stubs.push((id, buf.len() as u64));
-                buf.extend_from_slice(&x64::count_stub(rec as u64, id, code, self.hot_entry));
+                let off = buf.len() as u64;
+                stubs.push((id, off));
+                buf.extend_from_slice(&x64::count_stub(at + off, rec as u64, id, code, self.hot_entry));
+                buf.resize(off as usize + cs, 0xcc);
             }
             if stubs.is_empty() {
                 return;
             }
-            let at = self.emit_code(&buf);
+            os::mem::write_code(at, &buf);
             for (id, off) in stubs {
                 let rec = tier_rec(&self.slots, id);
                 (*rec.add(2)).store(at + off, Ordering::Relaxed);
                 (*rec.add(3)).store(T_COUNTING, Ordering::Release);
-                let slot = self.slots.table(id) as *const AtomicU64;
-                (*slot).store(at + off, Ordering::SeqCst);
+                let slot = SlotWord::of(&self.slots, id);
+                slot.store(at + off, Ordering::SeqCst);
             }
         }
         let me = self as *mut Unit;
@@ -10207,12 +11760,12 @@ impl Unit {
             // Once the threshold-one stub has fired, another caller must also enter
             // rt_hot and wait for the build, rather than underflowing into O1.
             let fallback = if recorded { self.emit_code(&x64::stub(id, self.hot_entry)) } else { code };
-            let stub = x64::count_stub(rec as u64, id, fallback, self.hot_entry);
-            let at = self.emit_code(&stub);
+            let at = bump(&self.code_next, x64::COUNT_STUB_SIZE as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+            os::mem::write_code(at, &x64::count_stub(at, rec as u64, id, fallback, self.hot_entry));
             (*rec.add(2)).store(at, Ordering::Relaxed);
             (*rec.add(3)).store(if recorded { T_REPLAY } else { T_COUNTING }, Ordering::Release);
-            let slot = self.slots.table(id) as *const AtomicU64;
-            (*slot).store(at, Ordering::SeqCst);
+            let slot = SlotWord::of(&self.slots, id);
+            slot.store(at, Ordering::SeqCst);
         }
         // tier-up state is process-wide (TIER_UNIT, the hot queue, the sampler: slot ids with
         // no unit attached): a second tiering unit would get its hot slots built against the
@@ -10257,12 +11810,12 @@ fn rt_hot(slot: u64) -> u64 {
         let rec = tier_rec(&u.slots, slot as u32);
         let code = (*rec.add(1)).load(Ordering::Relaxed);
         let stub = (*rec.add(2)).load(Ordering::Relaxed);
-        let s = u.slots.table(slot as u32) as *const AtomicU64;
+        let s = SlotWord::of(&u.slots, slot as u32);
         if (*rec.add(3)).load(Ordering::Acquire) == T_REPLAY {
             if startup_holds_tier1() {
                 if (*rec.add(3)).compare_exchange(T_REPLAY, T_QUEUED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                     TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
-                    let _ = (*s).compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
+                    let _ = s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
                     tier_push(slot as u32, Q_CALLS, 0);
                     TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime, &u.prog.session.options));
                 }
@@ -10280,17 +11833,17 @@ fn rt_hot(slot: u64) -> u64 {
                             // (a cancelled nested build too: the O1 code stays; never unwound
                             // through the JIT frames that called rt_hot)
                             t1prof_divergence("first-call-build", &t1_key(up, slot as u32));
-                            (*s).store(code, Ordering::SeqCst);
+                            s.store(code, Ordering::SeqCst);
                         } else if !matches!(ok, Ok(true)) {
                             t1prof_divergence("first-call-build", &t1_key(up, slot as u32));
-                            (*s).store(code, Ordering::SeqCst);
+                            s.store(code, Ordering::SeqCst);
                         }
                         (*rec.add(3)).store(T_QUEUED, Ordering::Release);
                         t1prof_finish_quiet();
                     }
                 });
             });
-            return (*s).load(Ordering::SeqCst);
+            return s.load(Ordering::SeqCst);
         }
         let now = wall_ns();
         // the sampler has not seen it lately: many calls, little CPU (a cheap function a
@@ -10300,7 +11853,7 @@ fn rt_hot(slot: u64) -> u64 {
         let took = now.saturating_sub((*rec.add(4)).load(Ordering::Relaxed));
         // ... unless the calls came very fast (a tight loop: hot before the sampler's first
         // ticks see it -- bench_rt rc_refcell's cold run stayed at O1, 6x rustc)
-        let small = (*rec.add(5)).load(Ordering::Relaxed) <= SMALL_CODE;
+        let small = (*rec.add(5)).load(Ordering::Relaxed) & !REARMED <= SMALL_CODE;
         if (*rec.add(3)).load(Ordering::Relaxed) == T_COUNTING && (took > CALL_WINDOW_NS || (took > CALL_FAST_NS && !small && unseen())) {
             // too slow a rate, or no CPU to show: count again from now (the stub stays)
             if let Some(t) = &u.tier1 {
@@ -10310,14 +11863,14 @@ fn rt_hot(slot: u64) -> u64 {
             return code;
         }
         // a patch may have replaced the stub in the meantime: then that code runs
-        let _ = (*s).compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
+        let _ = s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
         if (*rec.add(3)).compare_exchange(T_COUNTING, T_QUEUED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
             churn_queued(slot as u32);
             tier_push(slot as u32, Q_CALLS, call_rate(rec, u.tier1.as_ref().map_or(0, |t| t.calls), now));
             TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime, &u.prog.session.options));
         }
-        (*s).load(Ordering::SeqCst)
+        s.load(Ordering::SeqCst)
     }
 }
 }
@@ -10335,6 +11888,11 @@ pub fn lower_this_thread_priority(runtime: &crate::options::RuntimeOptions) {
 }
 
 fn lower_worker_priority(runtime: &crate::options::RuntimeOptions) {
+    // aot-min: every background compile thread in the OS background class
+    if ahead_policy().background_class {
+        os::thread::background();
+        return;
+    }
     let mode = runtime.worker_qos as u8;
     if mode == 0 {
         return;
@@ -10355,6 +11913,7 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
                 // queue during startup. Already-running builds finish when demand drops.
                 let ready = tier1_workers_ready();
                 if !startup_holds_tier1() && (k == 0 || ready) && (k < normal || q.len() > 32) {
+                    tier_revalidate(&mut q);
                     if let Some(e) = tier_pop(&mut q) {
                         TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(e.0);
                         break e;
@@ -10414,6 +11973,8 @@ struct T1Entry {
     freq: Option<Vec<f32>>,
     // Frequencies before each inlining round; backend frequencies describe a later RIR.
     inline_freq: Option<[Option<Vec<f32>>; 2]>,
+    /// the sampler found the function hot (its O3 build gets the large growth room)
+    hot: bool,
     input: u64,
     code: u64,
 }
@@ -10440,7 +12001,7 @@ fn t1prof_on(options: &crate::options::Options) -> bool {
             Some(t) if !t.is_empty() => {
                 for l in t.lines() {
                     let x: Vec<&str> = l.split('\t').collect();
-                    if x.len() != 6 && x.len() != 8 && x.len() != 9 {
+                    if x.len() != 10 {
                         continue;
                     }
                     let list = |t: &str| -> Vec<String> { if t.is_empty() { Vec::new() } else { t.split('\u{1f}').map(|c| c.to_string()).collect() } };
@@ -10449,8 +12010,8 @@ fn t1prof_on(options: &crate::options::Options) -> bool {
                     let inline_freq = (x.len() >= 8).then(|| [parse_freq(x[6]), parse_freq(x[7])]);
                     // Append single-reference keys after both rounds; older profiles
                     // have no single-reference facts to replay.
-                    let single = x.get(8).map_or_else(Vec::new, |s| list(s));
-                    map.insert(x[0].to_string(), T1Entry { cold: list(x[1]), snap: list(x[2]), single, freq, inline_freq, input: u64::from_str_radix(x[4], 16).unwrap_or(0), code: u64::from_str_radix(x[5], 16).unwrap_or(0) });
+                    let single = list(x[8]);
+                    map.insert(x[0].to_string(), T1Entry { cold: list(x[1]), snap: list(x[2]), single, freq, inline_freq, hot: x[9] == "1", input: u64::from_str_radix(x[4], 16).unwrap_or(0), code: u64::from_str_radix(x[5], 16).unwrap_or(0) });
                 }
                 true
             }
@@ -10492,7 +12053,7 @@ unsafe fn t1_key(up: *const Unit, id: u32) -> String {
 
 /// Hash of a RIR dump without fn slot numbers, symbol ids and host addresses (they differ
 /// between runs).
-fn t1_norm_hash(rir: &crate::rir::Func) -> u64 {
+fn t1_norm_hash(rir: &relax_backend::rir::Func) -> u64 {
     let d = rir.dump();
     // The key already identifies the instance. Closure display names include the
     // parent's process-local slot ("{closure#n}@slot"), which is not a code input.
@@ -10587,7 +12148,7 @@ fn t1prof_finish() {
             None => "-".to_string(),
         };
         let inline = e.inline_freq.as_ref().expect("recorded inlining frequencies");
-        out.push_str(&format!("{}\t{}\t{}\t{}\t{:016x}\t{:016x}\t{}\t{}\t{}\n", k, e.cold.join("\u{1f}"), e.snap.join("\u{1f}"), fmt_freq(&e.freq), e.input, e.code, fmt_freq(&inline[0]), fmt_freq(&inline[1]), e.single.join("\u{1f}")));
+        out.push_str(&format!("{}\t{}\t{}\t{}\t{:016x}\t{:016x}\t{}\t{}\t{}\t{}\n", k, e.cold.join("\u{1f}"), e.snap.join("\u{1f}"), fmt_freq(&e.freq), e.input, e.code, fmt_freq(&inline[0]), fmt_freq(&inline[1]), e.single.join("\u{1f}"), if e.hot { "1" } else { "0" }));
     }
     let _ = std::fs::write(&p.path, out);
     if !p.differ.is_empty() {
@@ -10685,9 +12246,9 @@ fn trace_tier1_phase(id: u32, phase: &str) {
 }
 
 pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
-    let _census_context = (&*up).exec_context(crate::exec_census::active() && crate::exec_profile::is_call(up as usize, id));
+    let _census_context = (&*up).exec_context(relax_codegen::exec_census::active() && crate::exec_profile::is_call(up as usize, id));
 
-    let _cost = crate::fncost::Record::new(id, 1, "O3");
+    let _cost = relax_codegen::fncost::Record::new(id, 1, "O3");
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
     let runtime = &session.runtime;
@@ -10696,8 +12257,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     if t1prof_replay(options) && !owner::is_owner() {
         return owner::call(owner::Class::Background, || compile_tier1(up, id));
     }
-    // SPEC-V: O3 needs the body's clean verdict
-    if !owner::call(owner::Class::Background, || (&*up).refresh_verified(id)) {
+    // SPEC-V: unverified code gets O3 code too, built as it is (Unit::o3_allowed)
+    if !owner::call(owner::Class::Background, || (&*up).o3_allowed(id)) {
         await_verdict(id, Await::Tier(Q_SAMPLES, 0));
         return false;
     }
@@ -10718,7 +12279,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let (needs, key, front) = owner::call(owner::Class::Background, || (needs_rir(up), (&*up).fns[id as usize].key.clone(), (&*up).front.clone()));
     if needs && !t1prof_replay(options) && !owner::is_owner() {
         while !tier1_quiet() {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            job_sleep(std::time::Duration::from_millis(50));
         }
         // its type check runs first, off the unit (the build takes the checked body): one
         // solver search there took seconds, and every thread needing a lazy compile -- the UI
@@ -10727,11 +12288,29 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         if let FnKey::Inst(d, args) = key {
             let _preemptible = crate::preempt::Preemptible::on();
             typeck_ahead(&front, d, args, 0, false, false);
+            // and its lowering: the snapshot below only takes the RIR
+            if pipelined() { lower_ahead(&front, id, true); }
         }
     }
-    drop(front);
     let gave_way = std::cell::Cell::new(false);
+    let mut spec_ctx: Option<crate::guards::Ctx> = None;
+    // The inline candidates' front ends (type check, lowering) run on this thread, not on the
+    // owner: a snapshot that meets a candidate without RIR whose front this build has not run
+    // yet hands it back (`fronts`) instead of building it; this thread checks and lowers those
+    // off the unit (typeck_ahead, lower_ahead) and asks again, one traversal level per round.
+    // The owner's build then only takes the lowered RIR (O1 optimisation and the candidate's own
+    // small inline candidates stay there). Warm Stage: single snapshots of 100-680 ms on the owner.
+    let prefront = !owner::is_owner() && !t1prof_replay(options) && pipelined();
+    let mut fronted: std::collections::HashSet<u32> = Default::default();
+    let fronts: std::cell::RefCell<Vec<(u32, DefId, Vec<TyId>)>> = Default::default();
+    // owner cpu of the snapshot requests (cpu_ns is per thread: read on the owner)
+    let owner_ns = std::cell::Cell::new(0u64);
+    // candidate RIR built off the owner is stored only if no patch landed meanwhile
+    let epoch0 = PATCH_EPOCH.load(Ordering::SeqCst);
+    let snapped = loop {
+    fronts.borrow_mut().clear();
     let snapped = owner::call(owner::Class::Background, || {
+    let s0 = cpu_ns();
         trace_tier1_phase(id, "snapshot");
         cost_name(up, id);
         compile_watch(Some((&format!("tier1 locked: {}", (&*up).fns[id as usize].name), 0)));
@@ -10741,7 +12320,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             TIER1_RIR_REBUILT[0].fetch_add(1, Ordering::Relaxed);
             TIER1_RIR_REBUILT[1].fetch_add(wall_ns() - t, Ordering::Relaxed);
         }
-        if (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline) {
+        if (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| upgradable(r)) {
             let _ = build_rir_mode(up, id, RirMode::Normal);
         }
         // A caller's version alone cannot protect an in-flight build: a patch may change
@@ -10788,7 +12367,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let mut callees: Vec<u32> = Vec::new();
         for b in &rir.blocks {
             for i in &b.insts {
-                if let crate::rir::Inst::Call(crate::rir::Callee::Fn(c), _, _) | crate::rir::Inst::FnAddr(_, c) = i {
+                if let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) | relax_backend::rir::Inst::FnAddr(_, c) = i {
                     // The transform already confined this body. Inlining a host API here
                     // would introduce unconfined memory operations after that boundary.
                     if !sandboxed && *c != id && !callees.contains(c) {
@@ -10796,6 +12375,18 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     }
                 }
             }
+        }
+        // speculation: sites of this slot that finished profiling are decided now; the guessed
+        // targets join the snapshot (their RIR inlines into the guarded call)
+        if crate::guards::enabled() && !sandboxed && !(&*up).fns[id as usize].unverified.load(Ordering::Relaxed) {
+            let u = &*up;
+            let slots = crate::guards::decide(id, &|a| u.thunk_slot(a));
+            for &(_, s) in &slots {
+                if s != id && !callees.contains(&s) {
+                    callees.push(s);
+                }
+            }
+            spec_ctx = Some(crate::guards::Ctx { root: id, syms: crate::guards::syms(u), slots, emitted: std::cell::Cell::new(false) });
         }
         // callees the O3 policy wants inlinable get their RIR built, one per lock hold;
         // then their callees (outside cold blocks), 16 levels (a binary search closure sits ~10 deep), built the same way: an inlined
@@ -10824,7 +12415,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         input_pins.push(TierActive(c));
         let u = &mut *up;
         u.sync_entry_ref(c);
-        if u.fns[c as usize].rir.as_ref().is_some_and(|r| r.baseline) {
+        if u.fns[c as usize].rir.as_ref().is_some_and(|r| upgradable(r)) {
             let _ = build_rir_mode(up, c, RirMode::Normal);
         }
         let u = &mut *up;
@@ -10850,15 +12441,26 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         // a callee that ran with code from the disk cache has no RIR: in a cold run its own
         // compile left one (inlinable whatever its size), so build it here as well
         let cached_code = f.compiled;
-        let single = crate::opt::single_on(options) && u.single_ref(c)
+        let single = relax_codegen::opt::single_on(options) && u.single_ref(c)
             && (u.fns[id as usize].rir_refs.contains(&c)
                 || callers.iter().any(|p| u.fns[*p as usize].rir.is_some() && u.fns[*p as usize].rir_refs.contains(&c)));
         let source_size = src_size(u, c);
-        if force || cached_code || source_size <= src_toks || attr & crate::opt::ATTR_ALWAYS != 0
+        if force || cached_code || source_size <= src_toks || attr & relax_codegen::opt::ATTR_ALWAYS != 0
             || (single && source_size <= TIER1_SINGLE_SRC_TOKS) {
+            if prefront && !fronted.contains(&c) {
+                if let FnKey::Inst(d, args) = &u.fns[c as usize].key {
+                    if matches!(u.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn) {
+                        fronts.borrow_mut().push((c, *d, args.clone()));
+                        return;
+                    }
+                }
+            }
+            let t = wall_ns();
             compile_watch(Some((&format!("O3 snapshot: build_rir {}", u.fns[c as usize].name), 0)));
             let _ = build_rir(up, c);
             compile_watch(None);
+            TIER1_SNAP_BUILT[0].fetch_add(1, Ordering::Relaxed);
+            TIER1_SNAP_BUILT[1].fetch_add(wall_ns() - t, Ordering::Relaxed);
         }
     };
     let mut frontier = callees.clone();
@@ -10884,21 +12486,21 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     Some((cold, _, _)) => cold.contains(&t1_key(up, c)),
                     None => !cf.compiled && cf.history().inlined_into.is_empty(),
                 };
-                let cost_admits = !crate::opt::opt_off(options, "-costmodel")
+                let cost_admits = !relax_backend::stats::opt_off(options, "-costmodel")
                     && callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, true)
-                        .map_or(false, |attrs| crate::opt::rustc_inline_cost(r, c) <= crate::opt::rustc_inline_threshold(r, attrs));
-                if never_run && crate::opt::inst_count(r) > crate::opt::INLINE_FREE_INSTS && !cost_admits {
+                        .map_or(false, |attrs| relax_codegen::opt::rustc_inline_cost(r, c) <= relax_codegen::opt::rustc_inline_threshold(r, attrs));
+                if never_run && relax_codegen::opt::inst_count(r) > relax_codegen::opt::INLINE_FREE_INSTS && !cost_admits {
                     continue;
                 }
                 for b in &r.blocks {
-                    if matches!(b.term, crate::rir::Term::Unreachable | crate::rir::Term::Resume) {
+                    if matches!(b.term, relax_backend::rir::Term::Unreachable | relax_backend::rir::Term::Resume) {
                         continue;
                     }
                     for i in &b.insts {
                         // calls, and functions whose address is taken (a call through it becomes
                         // a direct call in O3: `.map(GlyphId)`)
                         let x = match i {
-                            crate::rir::Inst::Call(crate::rir::Callee::Fn(x), _, _) | crate::rir::Inst::FnAddr(_, x) => x,
+                            relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(x), _, _) | relax_backend::rir::Inst::FnAddr(_, x) => x,
                             _ => continue,
                         };
                         {
@@ -10928,7 +12530,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             seen = end;
         }
     }
-    if gave_way.get() {
+    // candidates whose fronts this thread runs first: asked again after them
+    if gave_way.get() || !fronts.borrow().is_empty() {
+        owner_ns.set(owner_ns.get() + cpu_ns() - s0);
         return None;
     }
     for &c in &callees { (&mut *up).sync_entry_ref(c); }
@@ -10936,7 +12540,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     if std::env::var_os("MAKEPAD_RUN_O3_TRACE").is_some() {
         eprintln!("O3 snapshot of {}: {} callees", u.fns[id as usize].name, callees.len());
     }
-    let mut snap: Vec<(u32, std::sync::Arc<crate::rir::Func>, u8)> = Vec::new();
+    let mut snap: Vec<(u32, std::sync::Arc<relax_backend::rir::Func>, u8)> = Vec::new();
     let mut t1_cold_keys: Vec<String> = Vec::new();
     let mut t1_snap_keys: Vec<String> = Vec::new();
     for &c in &callees {
@@ -10968,7 +12572,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 }
                 None => live_cold,
             };
-            let attrs = if cold { attrs | crate::opt::ATTR_COLD } else { attrs };
+            let attrs = if cold { attrs | relax_codegen::opt::ATTR_COLD } else { attrs };
             snap.push((c, r.clone(), attrs));
         }
     }
@@ -10988,7 +12592,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let mut owners = HashMap::new();
     for (owner, body) in std::iter::once((id, &*rir)).chain(snap.iter().map(|x| (x.0, &*x.1))) {
         for i in body.blocks.iter().flat_map(|b| &b.insts) {
-            if let crate::rir::Inst::Call(crate::rir::Callee::Fn(c), _, _) | crate::rir::Inst::FnAddr(_, c) = i {
+            if let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) | relax_backend::rir::Inst::FnAddr(_, c) = i {
                 let entry = owners.entry(*c).or_insert((owner, 0usize));
                 entry.1 += 1;
             }
@@ -11023,12 +12627,21 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         if p.replay { p.map.get(k).map(|e| e.inline_freq.clone()) } else { None }
     });
     let ro = u.ro_reader();
-    let env = x64::Env { slots: u.env.slots, tls_key: u.env.tls_key, tls_slow: u.env.tls_slow, resume: u.env.resume, opt_regs: !t1_quick_ra(options), syms: u.env.syms, sym_class: u.env.sym_class };
+    let env = x64::Env { slots: u.env.slots, tls_key: u.env.tls_key, tls_slow: u.env.tls_slow, resume: u.env.resume, opt_regs: !t1_quick_ra(options), syms: u.env.syms, sym_class: u.env.sym_class, near: u.env.near };
     let cfg = u.tier1.as_ref().unwrap().opt;
     let name = u.fns[id as usize].name.to_string();
     // One immutable sample input for register allocation. Both inlining rounds
     // use structural frequencies from their current CFG, independent of when
     // the sampler reaches this evidence threshold.
+    // hot: the sampler measured it (its frequencies are sampled); replay: as recorded
+    let hot_root = match t1key.as_ref().and_then(|k| {
+        let g = T1PROF.lock().unwrap();
+        let p = g.as_ref().unwrap();
+        if p.replay { p.map.get(k).map(|e| e.hot) } else { None }
+    }) {
+        Some(h) => h,
+        None => u.frequency_profiles.get(&id).is_some_and(|h| h.samples >= FREQUENCY_SAMPLES),
+    };
     let sampled_positions = if options.no_block_freq || t1prof_replay(options) { None } else {
         u.frequency_profiles.get(&id).filter(|h| h.samples >= FREQUENCY_SAMPLES)
             .map(|h| h.positions.clone())
@@ -11038,10 +12651,52 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             crate::clock::ms_since_start(), if sampled_positions.is_some() { "sampled" } else { "structural" },
             u.frequency_profiles.get(&id).map_or(0, |h| h.samples), name);
     }
-    let t1 = cpu_ns();
-    Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, sampled_positions, t1))
+    owner_ns.set(owner_ns.get() + cpu_ns() - s0);
+    Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, sampled_positions, hot_root))
     });
-    let Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, sampled_positions, t1)) = snapped else {
+    let more = std::mem::take(&mut *fronts.borrow_mut());
+    if snapped.is_some() || gave_way.get() || more.is_empty() {
+        break snapped;
+    }
+    // this round's candidates: their type checks and lowering here, off the unit
+    let tf = cpu_ns();
+    TIER1_SNAP_FRONTS[0].fetch_add(more.len() as u64, Ordering::Relaxed);
+    let mut ids = Vec::with_capacity(more.len());
+    for (c, d, args) in more {
+        fronted.insert(c);
+        ids.push(c);
+        let _preemptible = crate::preempt::Preemptible::on();
+        typeck_ahead(&front, d, args, 1, false, true);
+        lower_ahead(&front, c, true);
+    }
+    TIER1_SNAP_FRONTS[1].fetch_add(cpu_ns() - tf, Ordering::Relaxed);
+    // and their O1 builds as an O2 build makes its own (o2_begin / o2_finish): the front -- which
+    // takes the RIR lowered above -- on the owner, giving way to a program thread between bodies;
+    // the optimisation here; the RIR stored by a finish. What gave way or failed is built by the
+    // snapshot as before.
+    let (preps, gave): (Vec<(u32, Prep)>, Vec<u32>) = owner::call(owner::Class::Background, || o3_candidates_begin(up, &ids));
+    for c in gave { fronted.remove(&c); }
+    if !preps.is_empty() {
+        let to = cpu_ns();
+        let mut done: Vec<Deferred> = Vec::new();
+        for (c, prep) in preps {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize_tree(options, c, prep, &mut done)));
+            if let Ok(r) = r { done.push((c, r)); }
+        }
+        TIER1_SNAP_OFF[0].fetch_add(done.len() as u64, Ordering::Relaxed);
+        TIER1_SNAP_OFF[1].fetch_add(cpu_ns() - to, Ordering::Relaxed);
+        owner::call(owner::Class::FinishBackground, || o3_candidates_finish(up, epoch0, done));
+    }
+    };
+    // lowerings ahead that no snapshot build took (a candidate built meanwhile, or given way):
+    // not kept for the rest of the run
+    if !fronted.is_empty() {
+        let mut lowered = front.lowered.lock().unwrap_or_else(|e| e.into_inner());
+        for c in &fronted { lowered.remove(c); }
+    }
+    drop(front);
+    let t1 = cpu_ns();
+    let Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, sampled_positions, hot_root)) = snapped else {
         if gave_way.get() {
             tier_push(id, Q_RETIER, 0);
         }
@@ -11053,15 +12708,15 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
         let _scratch = crate::zone_alloc::scratch(runtime);
         let mut func = (*rir).clone();
-        let get = |c: u32| snap.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const crate::rir::Func, x.2));
+        let get = |c: u32| snap.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const relax_backend::rir::Func, x.2));
         let single = |owner: u32, c: u32| singles.get(&c) == Some(&owner);
         let trace = tier1_trace();
         if trace {
-            crate::opt::pass_timing_on();
+            relax_backend::stats::pass_timing_on();
         }
-        let (p0, n0) = if trace { (crate::opt::pass_local(), crate::opt::inst_count(&func)) } else { ([0; 16], 0) };
+        let (p0, n0) = if trace { (relax_backend::stats::pass_local(), relax_codegen::opt::inst_count(&func)) } else { ([0; 16], 0) };
         let mut inline_freq = [None, None];
-        let mut frequencies = |round: usize, f: &crate::rir::Func| {
+        let mut frequencies = |round: usize, f: &relax_backend::rir::Func| {
             let freq = match &t1_inline_freq {
                 Some(Some(fr)) => match &fr[round] {
                     Some(v) if v.len() != f.blocks.len() => {
@@ -11081,10 +12736,17 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             freq
         };
         let queries = crate::nounwind::QueryCx::new(&snap);
-        let (optimized, inline_rules) = queries.optimize(id, func, &mut |func, nounwind| {
-            Ok(tier1_optimize(options, func, id, &name, &get, &single, ro, &cfg, nounwind, &mut frequencies))
-        })?;
+        let optimize = || queries.optimize(id, func, &mut |func, nounwind| {
+            Ok(tier1_optimize(options, func, id, &name, &snap, &get, &single, ro, &cfg, nounwind, &mut frequencies, hot_root))
+        });
+        let (optimized, inline_rules) = match &spec_ctx {
+            Some(ctx) => crate::guards::with_ctx(ctx, optimize),
+            None => optimize(),
+        }?;
         func = optimized;
+        if let Some(ctx) = &spec_ctx {
+            crate::guards::probe(ctx, &mut func);
+        }
         let mut inlined = Vec::with_capacity(inline_rules.len());
         for (c, _) in inline_rules { inlined.push(c); }
         let nounwind_used = func.nounwind_inputs.clone();
@@ -11093,9 +12755,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 eprintln!("O3 RIR:\n{}", func.dump());
             }
         }
-        let tv = crate::opt::pass_clock();
+        let tv = relax_backend::stats::pass_clock();
         let verified = func.verify();
-        crate::opt::pass_time(13, tv);
+        relax_backend::stats::pass_time(13, tv);
         verified.map_err(|e| format!("RIR verify after O3: {}", e))?;
         let freq = match &t1_freq {
             Some(Some(fr)) if fr.len() == func.blocks.len() => Some(fr.clone()),
@@ -11112,13 +12774,14 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             // tools/run/tools/asmcmp: code offset -> RIR block/instruction of the dumped fn
             x64::set_rir_map(true);
         }
-        let c = crate::memstat::tagged(crate::memstat::Tag::Codegen, || x64::compile_freq(options, &func, &env, freq.as_deref()));
+        let c = crate::memstat::tagged(crate::memstat::Tag::Codegen, || relax_codegen::native::compile_freq(options, &func, &env, freq.as_deref()));
         crate::memstat::note_big("codegen O3", &func.name, mps, || cg_shape(&func));
         let c = c?;
+        code_sig(id, &func, &c.code, c.alloc_sig, true);
         let mut profile_entry = None;
         if let Some(k) = &t1key {
             let bits = |f: &Option<Vec<f32>>| f.as_ref().map(|f| f.iter().map(|x| x.to_bits()).collect::<Vec<u32>>());
-            let input = t1_hash(&(t1_cold_keys.clone(), t1_snap_keys.clone(), t1_single_keys.clone(), bits(&freq), inline_freq.iter().map(bits).collect::<Vec<_>>()));
+            let input = t1_hash(&(t1_cold_keys.clone(), t1_snap_keys.clone(), t1_single_keys.clone(), bits(&freq), inline_freq.iter().map(bits).collect::<Vec<_>>(), hot_root));
             // the optimised RIR (normalised) and the code size: code bytes hold slot numbers that
             // differ between runs
             let code = t1_norm_hash(&func) ^ (c.text_len as u64).rotate_left(48);
@@ -11131,14 +12794,14 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 _ => {}
             }
             if !p.replay {
-                profile_entry = Some(T1Entry { cold: t1_cold_keys.clone(), snap: t1_snap_keys.clone(), single: t1_single_keys.clone(), freq: freq.clone(), inline_freq: Some(inline_freq.clone()), input, code });
+                profile_entry = Some(T1Entry { cold: t1_cold_keys.clone(), snap: t1_snap_keys.clone(), single: t1_single_keys.clone(), freq: freq.clone(), inline_freq: Some(inline_freq.clone()), hot: hot_root, input, code });
             }
         }
         note_frame(id, c.frame_size, slot_bytes(&func), true);
         if trace && cpu_ns() - t1 > 1_000_000_000 {
             // a slow build: where its time went (passes, sizes)
-            let p1 = crate::opt::pass_local();
-            let mut v: Vec<(u64, &str)> = (0..16).map(|i| (p1[i] - p0[i], crate::opt::PASS_NAMES[i])).collect();
+            let p1 = relax_backend::stats::pass_local();
+            let mut v: Vec<(u64, &str)> = (0..16).map(|i| (p1[i] - p0[i], relax_backend::stats::PASS_NAMES[i])).collect();
             v.sort_by(|a, b| b.0.cmp(&a.0));
             let split: Vec<String> = v.iter().take(6).map(|(ns, n)| format!("{} {:.0}ms", n, *ns as f64 / 1e6)).collect();
             eprintln!(
@@ -11147,22 +12810,26 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 (cpu_ns() - t1) as f64 / 1e6,
                 n0,
                 rir.blocks.len(),
-                crate::opt::inst_count(&func),
+                relax_codegen::opt::inst_count(&func),
                 func.blocks.len(),
                 inlined.len(),
                 snap.len(),
                 c.code.len(),
                 split.join(", ")
             );
-            let r = crate::regalloc::ra_stats();
+            let r = relax_backend::regalloc::ra_stats();
             eprintln!(
                 "  regalloc: first {:.0} ms, cold-call split {:.0} ms, loop split {:.0} ms; vregs {} blocks {} -> vregs {} blocks {}; {} spilled; frame {} bytes",
                 r[0] as f64 / 1e6, r[1] as f64 / 1e6, r[2] as f64 / 1e6, r[3], r[4], r[5], r[6], r[7], c.frame_size
             );
         }
         if let Some(base) = dump_base(&name) {
+            // MAKEPAD_RUN_DUMP_EACH=1: one set of files per O3 build, named by its code size too
+            // (the instances of a generic fn share a name; the perf map's sizes tell them apart)
+            static EACH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let base = if *EACH.get_or_init(|| std::env::var("MAKEPAD_RUN_DUMP_EACH").is_ok()) { format!("{}_{}", base, c.text_len) } else { base };
             let _ = std::fs::write(format!("{}.t1.bin", base), &c.code[..c.text_len as usize]);
-            let _ = std::fs::write(format!("{}.t1.frame", base), format!("frame {} slot-area {} of {}\n", c.frame_size, crate::opt::slot_layout(&func, 0, true).1, slot_bytes(&func)));
+            let _ = std::fs::write(format!("{}.t1.frame", base), format!("frame {} slot-area {} of {}\n", c.frame_size, relax_backend::frame::slot_layout(&func, 0, true).1, slot_bytes(&func)));
             let _ = std::fs::write(format!("{}.t1.rir", base), func.dump());
             // offset<TAB>block<TAB>instruction (- = terminator)<TAB>source position, per emitted RIR
             // instruction (tools/run/tools/asmcmp); the RIR is the emitted function (after back-end splits)
@@ -11184,14 +12851,14 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         // calls left to callees that had never run; whether the code calls itself (the disk
         // cache's frame limit for recursive code)
         let mut cold_left: Vec<u32> = Vec::new();
-        let self_call = func.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, crate::rir::Inst::Call(crate::rir::Callee::Fn(c), _, _) if *c == id)));
+        let self_call = func.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) if *c == id)));
         for b in &func.blocks {
-            if matches!(b.term, crate::rir::Term::Unreachable | crate::rir::Term::Resume) {
+            if matches!(b.term, relax_backend::rir::Term::Unreachable | relax_backend::rir::Term::Resume) {
                 continue;
             }
             for i in &b.insts {
-                if let crate::rir::Inst::Call(crate::rir::Callee::Fn(c), _, _) = i {
-                    if get(*c).map_or(false, |x| x.1 & crate::opt::ATTR_COLD != 0) && !cold_left.contains(c) {
+                if let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) = i {
+                    if get(*c).map_or(false, |x| x.1 & relax_codegen::opt::ATTR_COLD != 0) && !cold_left.contains(c) {
                         cold_left.push(*c);
                     }
                 }
@@ -11201,9 +12868,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let mut left: Vec<(u32, bool, u8)> = Vec::new();
         if std::env::var_os("MAKEPAD_RUN_O3_TRACE").is_some() {
             for b in &func.blocks {
-                let cold = matches!(b.term, crate::rir::Term::Unreachable | crate::rir::Term::Resume);
+                let cold = matches!(b.term, relax_backend::rir::Term::Unreachable | relax_backend::rir::Term::Resume);
                 for i in &b.insts {
-                    if let crate::rir::Inst::Call(crate::rir::Callee::Fn(c), _, _) = i {
+                    if let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) = i {
                         left.push((*c, cold, get(*c).map_or(255, |x| x.1)));
                     }
                 }
@@ -11214,15 +12881,16 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let t2 = cpu_ns();
     if let Some(m) = measure.as_mut() { m.phase(2, t2); }
     trace_tier1_phase(id, "built");
-    let ok = owner::call(owner::Class::Finish, || {
+    // (an O3-always first build is a program thread's lazy compile: its finish is foreground)
+    let ok = owner::call(if o3_first() { owner::Class::Finish } else { owner::Class::FinishBackground }, || {
         trace_tier1_phase(id, "install");
-        let _cost_install = crate::fncost::phase(6);
+        let _cost_install = relax_codegen::fncost::phase(6);
         let u = &mut *up;
-        u.stats.tier1_locked_ns += (t1 - t0) + (cpu_ns() - t2);
+        u.stats.tier1_locked_ns += owner_ns.get();
         u.stats.tier1_free_ns += t2 - t1;
         let ok = match built {
             Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, frame_size, self_call, nounwind_used, profile_entry)))) if PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && !crate::inspect::instrument::active(id) && {
-                let n = if relax_codegen::interp::blob::is_blob(&code) { code.len() } else { crate::rir::split_unwind_info(&code).0 };
+                let n = if relax_codegen::interp::blob::is_blob(&code) { code.len() } else { relax_backend::rir::split_unwind_info(&code).0 };
                 u.link_check(&code[..n], &relocs)
             } => {
                 // Sign O3 machine bytes and symbolic relocations while the unit is locked.
@@ -11239,7 +12907,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // it a panic through the frame skipped its cleanups.
                 let recursive = self_call || inlined.contains(&id);
                 let frame_max = if recursive { TIER1_CACHE_FRAME_MAX } else { TIER1_CACHE_FRAME_MAX_FLAT };
-                if frame_size <= frame_max {
+                // SPEC-V: unverified O3 code is never the slot's entry (it is built again once verified)
+                let unverified = u.fns[id as usize].unverified.load(Ordering::Relaxed);
+                // speculative code holds this run's site records (crate::guards): never cached
+                let speculative = spec_ctx.as_ref().is_some_and(|c| c.emitted.get());
+                if frame_size <= frame_max && !unverified && !speculative {
                     if let Some(mut c) = u.cache.take() {
                         c.record_o3(u, id, &code, &relocs, &map, &inlined, &nounwind_used);
                         u.cache = Some(c);
@@ -11261,13 +12933,14 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     }
                     u.stats.tier1_installed += 1;
                     TIER1_INSTALLS.fetch_add(1, Ordering::Relaxed);
+                    crate::boot_stats::o3_installed(boot_arm(u, id), id);
                     let a = install_compiled(up, id, &code, map, &relocs, false);
                     O3_FIRST_AT.with(|c| c.set(a));
                     true
                 } else {
                 // an interpreted function's O3 build is its relocatable form (interp/blob.rs)
                 let blob = relax_codegen::interp::blob::is_blob(&code);
-                let (n, info) = if blob { (code.len(), None) } else { crate::rir::split_unwind_info(&code) };
+                let (n, info) = if blob { (code.len(), None) } else { relax_backend::rir::split_unwind_info(&code) };
                 let code = code[..n].to_vec();
                 let u = &mut *up;
                 let at = if blob {
@@ -11295,8 +12968,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 f.code_len = code.len() as u32;
                 f.pc_map = PcMap::new(&map);
                 f.version += 1;
-                let slot = u.slots.table(id) as *const AtomicU64;
-                (*slot).store(at, Ordering::SeqCst);
+                let slot = SlotWord::of(&u.slots, id);
+                slot.store(at, Ordering::SeqCst);
                 // a patch of an inlined callee recompiles this slot (live.rs)
                 let n_inl = inlined.len();
                 for c in inlined {
@@ -11334,9 +13007,18 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 if again && !(t1prof_on(options) && T1PROF.lock().unwrap().as_ref().map_or(false, |p| p.replay)) {
                     u.retier(id);
                 }
+                // SPEC-V: a twin tiered up: its warm callers that are verified by now are lowered
+                // again, so they call the base slot (which the twin's samples heat as well)
+                if matches!(u.fns[id as usize].key, FnKey::Plain(_)) {
+                    for c in hot_twin_callers(u, None, Some(id)) {
+                        u.retier(c);
+                    }
+                }
                 u.stats.code_bytes += code.len() as u64;
+                u.stats.tier1_code_bytes += code.len() as u64;
                 u.stats.tier1_installed += 1;
                 TIER1_INSTALLS.fetch_add(1, Ordering::Relaxed);
+                crate::boot_stats::o3_installed(boot_arm(u, id), id);
                 // deterministic O3, replay: installed (a build whose install was refused is retried
                 // by the next trigger)
                 if let Some(k) = &t1key {
@@ -11355,10 +13037,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     trace_build(u, id, "installed", t2 - t1);
                 }
                 if std::env::var("MAKEPAD_RUN_O3_TRACE").is_ok() {
-                    eprintln!("tier1: {} installed ({} bytes, {} callees inlined, {:.1} ms build, {:.1} ms snapshot)", u.fns[id as usize].name, code.len(), n_inl, (t2 - t1) as f64 / 1e6, (t1 - t0) as f64 / 1e6);
+                    eprintln!("tier1: {} installed ({} bytes, {} callees inlined, {:.1} ms build, {:.1} ms snapshot)", u.fns[id as usize].name, code.len(), n_inl, (t2 - t1) as f64 / 1e6, owner_ns.get() as f64 / 1e6);
                     let mut left = Vec::new();
                     for (c, cold, snap) in &left_calls {
-                        let n = u.fns[*c as usize].rir.as_ref().map(|r| crate::opt::inst_count(r)).unwrap_or(0);
+                        let n = u.fns[*c as usize].rir.as_ref().map(|r| relax_codegen::opt::inst_count(r)).unwrap_or(0);
                         let s = if *snap == 255 { format!(" nosnap{}", if u.fns[*c as usize].rir.is_none() { "(norir)" } else { "" }) } else { format!(" a{}", snap) };
                         left.push(format!("{}[{}]{}{}", u.fns[*c as usize].name, n, s, if *cold { " (cold)" } else { "" }));
                     }
@@ -11479,6 +13161,38 @@ fn startup_phase() -> bool {
     STARTUP_PHASE.load(Ordering::Acquire) == 1
 }
 
+/// The warm-up after the first present: the burst of lazy compiles the first frames make (a cold
+/// Stage: thousands in the first seconds, one at a time on the UI thread). It ends once the UI
+/// thread has gone WARMUP_QUIET_NS without waiting on the JIT, or WARMUP_MAX_NS after the present.
+const WARMUP_QUIET_NS: u64 = AHEAD_BURST_QUIET_NS;
+const WARMUP_MAX_NS: u64 = 30_000_000_000;
+static WARMUP_OVER: AtomicBool = AtomicBool::new(false);
+
+fn warmup() -> bool {
+    if !FIRST_PRESENT.load(Ordering::Acquire) || WARMUP_OVER.load(Ordering::Relaxed) {
+        return false;
+    }
+    let since = wall_ns().saturating_sub(FIRST_PRESENT_NS.load(Ordering::Relaxed));
+    if since >= WARMUP_MAX_NS || crate::postframe::ui_idle_ns() >= WARMUP_QUIET_NS {
+        WARMUP_OVER.store(true, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
+/// A build for a program thread (not a speculative or tier-up worker's) after the first present.
+fn ahead_foreground() -> bool {
+    let class = if owner::is_owner() { owner::serving().0 } else { owner::program_class() };
+    FIRST_PRESENT.load(Ordering::Acquire) && matches!(class, owner::Class::Main | owner::Class::App) && !IS_WORKER.try_with(|w| w.get()).unwrap_or(false)
+}
+
+/// A program thread's lazy compile in the warm-up: built as the startup's are (baseline code, no
+/// inline candidates; hot code tiers up as startup code does), the cheapest code that runs.
+fn warmup_foreground() -> bool {
+    let class = if owner::is_owner() { owner::serving().0 } else { owner::program_class() };
+    matches!(class, owner::Class::Main | owner::Class::App) && !IS_WORKER.try_with(|w| w.get()).unwrap_or(false) && warmup()
+}
+
 fn startup_holds_tier1() -> bool {
     matches!(STARTUP_PHASE.load(Ordering::Acquire), 1 | 2)
 }
@@ -11507,7 +13221,7 @@ extern "C" fn relax_first_present() {
         FIRST_PRESENT_NS.store(wall_ns(), Ordering::Release);
         for i in 0..8 { AHEAD_AT_PRESENT[i].store(AHEAD_STATS[i].load(Ordering::Relaxed), Ordering::Relaxed); }
         crate::solver_work::report();
-        crate::exec_census::first_present();
+        relax_codegen::exec_census::first_present();
         crate::tcx::Tcx::report_declaration_counters();
         if profile_path().is_some() { crate::exec_profile::first_present(); }
         // the startup manifest's window ends 1 s after the first present at the latest, so the
@@ -11515,20 +13229,20 @@ extern "C" fn relax_first_present() {
         ORDER_UNTIL_NS.fetch_min(wall_ns() + 1_000_000_000, Ordering::Relaxed);
         crate::tui::finish(true);
         crate::tui::print_slowest();
-        crate::fncost::mark("first present");
+        relax_codegen::fncost::mark("first present");
         o2_release_later();
         if o2_trace() {
             let n = |k: usize| O2_STATS[k].load(Ordering::Relaxed);
             let hit = BASE.lock().map_or(0, |g| g.hit.len());
             eprintln!("makepad-run O2 at first present: {} installed ({:.1} ms worker cpu), {} dropped; main thread waited {:.2} ms in {} unit-lock waits on the O2 worker; {} baseline slots sampled (queued)", n(0), n(1) as f64 / 1e6, n(2), n(3) as f64 / 1e6, n(4), hit);
         }
-        crate::warm::first_present();
+        relax_codegen::warm::first_present();
         // the boot's crate records and front graph (cold front end: queued, not written, at load)
         crate::cache::start_deferred_front();
         if let Some(t) = STARTUP_THREAD.get() {
             t.unpark();
         }
-        crate::exec_census::report();
+        relax_codegen::exec_census::report();
         if profile_path().is_some() { crate::exec_profile::report(true); }
     }
 }
@@ -11567,12 +13281,12 @@ pub fn startup_main(runtime: &crate::options::RuntimeOptions) {
         }
         LIVE_STARTUP_DONE.store(true, Ordering::Release);
         if !startup_phase() { return; }
-        crate::fncost::mark(if FIRST_PRESENT.load(Ordering::Acquire) {
+        relax_codegen::fncost::mark(if FIRST_PRESENT.load(Ordering::Acquire) {
             "startup released: present"
         } else {
             "startup released: quiet"
         });
-        crate::exec_census::startup_release(FIRST_PRESENT.load(Ordering::Acquire));
+        relax_codegen::exec_census::startup_release(FIRST_PRESENT.load(Ordering::Acquire));
         STARTUP_PHASE.store(2, Ordering::Release);
         SPEC_WAKE.notify_all();
         set_worker();
@@ -11686,6 +13400,113 @@ pub fn bump_patch_epoch() {
     PATCH_EPOCH.fetch_add(1, Ordering::SeqCst);
 }
 
+// ------------------------------------------------------------ compile-ahead policy
+//
+// One knob, `makepad run --ahead=<level>` / MAKEPAD_RUN_AHEAD (RuntimeOptions::ahead), sets how much
+// is compiled for code that has not run yet. Every level compiles what runs on its first call, links
+// the previous run's startup image, and builds O3 for what is measurably hot. The levels are budgets
+// of the one set of mechanisms below, not separate paths:
+// - speculation: the callees of what was built (spec_enqueue_calls), the cached callees of what was
+//   linked (spec_enqueue_cached), the previous run's post-present manifest (spec_seed_manifest);
+// - the ahead helpers after the first present (they check and lower the callees the UI's builds
+//   make, slot_named);
+// - teardown built ahead (prepare_teardown), Gandalf's whole-app discovery (note_program), the
+//   previous run's fns compiled on a worker (run.rs start_ahead);
+// - the O3 queue: an entry queued long ago for code that has gone cold is counted again
+//   (tier_pop), so a backlog of once-busy startup code never builds unless it runs hot again.
+// Cold Stage on the old default (aot without these bounds, 165): 27k teardown builds (85% never
+// called, 4.6 s), Gandalf 4.4k app bodies (8.4 s; 13.8 s warm, 5.3k bodies), a 2k-entry O3 backlog
+// at the first present, 1.8k O3 builds dropped behind their own O2 build: 2-4 cores busy for 25 s+.
+
+static AHEAD_LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+/// The run's level (the driver sets it from `--ahead=` / MAKEPAD_RUN_AHEAD before main).
+pub fn set_ahead_level(l: crate::options::AheadLevel) {
+    AHEAD_LEVEL.store(l as u8, Ordering::Relaxed);
+}
+
+pub fn ahead_level() -> crate::options::AheadLevel {
+    match AHEAD_LEVEL.load(Ordering::Relaxed) {
+        0 => crate::options::AheadLevel::Minimal,
+        2 => crate::options::AheadLevel::AotMax,
+        3 => crate::options::AheadLevel::AotMin,
+        _ => crate::options::AheadLevel::Balanced,
+    }
+}
+
+/// What a level allows (see the section comment).
+pub(crate) struct AheadPolicy {
+    /// callees of built code are speculated (spec_enqueue_calls)
+    spec_calls: bool,
+    /// cached callees of linked code, and the previous run's post-present manifest, are linked ahead
+    spec_cached: bool,
+    /// speculation depth (None: MAKEPAD_RUN_SPEC_DEPTH)
+    spec_depth: Option<u8>,
+    /// from this depth on only fall-through calls (None: MAKEPAD_RUN_SPEC_HOT_FROM)
+    spec_hot_from: Option<u8>,
+    /// fn pointers and vtables of code that ran are followed (MAKEPAD_RUN_SPEC_DYN)
+    spec_dyn: bool,
+    /// speculative workers at most
+    spec_jobs: usize,
+    /// built-ahead results nobody called expire (MAKEPAD_RUN_SPEC_TTL_MS)
+    spec_expire: bool,
+    /// ahead helpers after the first present (0: the UI's builds check and lower their own bodies)
+    post_present_helpers: u32,
+    /// the program's teardown is built ahead
+    teardown: bool,
+    /// Gandalf checks every body of the app, not only the ones that ran
+    borrowck_discovery: bool,
+    /// the previous run's startup fns are compiled on a worker
+    pub(crate) last_run: bool,
+    /// O3 queue entries of code gone cold are counted again
+    o3_revalidate: bool,
+    /// O3 workers at most
+    o3_threads: usize,
+    /// an AOT level: builds made during a UI burst have their callees speculated after it
+    /// (aot_drain), speculation does not follow only the fall-through path on battery
+    aot: bool,
+    /// every background compile thread runs in the OS's background class (os::thread::background)
+    background_class: bool,
+}
+
+pub(crate) fn ahead_policy() -> &'static AheadPolicy {
+    use crate::options::AheadLevel;
+    const MINIMAL: AheadPolicy = AheadPolicy {
+        spec_calls: false, spec_cached: false, spec_depth: Some(0), spec_hot_from: Some(0), spec_dyn: false, spec_jobs: 1, spec_expire: true,
+        post_present_helpers: 0, teardown: false, borrowck_discovery: false, last_run: false, o3_revalidate: true, o3_threads: 2,
+        aot: false, background_class: false,
+    };
+    const BALANCED: AheadPolicy = AheadPolicy {
+        spec_calls: true, spec_cached: true, spec_depth: None, spec_hot_from: None, spec_dyn: true, spec_jobs: 2, spec_expire: true,
+        post_present_helpers: u32::MAX, teardown: false, borrowck_discovery: false, last_run: false, o3_revalidate: true, o3_threads: 2,
+        aot: false, background_class: false,
+    };
+    const AOT_MAX: AheadPolicy = AheadPolicy {
+        spec_calls: true, spec_cached: true, spec_depth: Some(AOT_DEPTH), spec_hot_from: Some(AOT_DEPTH), spec_dyn: true, spec_jobs: usize::MAX, spec_expire: false,
+        post_present_helpers: u32::MAX, teardown: true, borrowck_discovery: true, last_run: true, o3_revalidate: false, o3_threads: 3,
+        aot: true, background_class: false,
+    };
+    const AOT_MIN: AheadPolicy = AheadPolicy {
+        spec_calls: true, spec_cached: true, spec_depth: Some(AOT_DEPTH), spec_hot_from: Some(AOT_DEPTH), spec_dyn: true, spec_jobs: 2, spec_expire: false,
+        post_present_helpers: u32::MAX, teardown: true, borrowck_discovery: true, last_run: true, o3_revalidate: false, o3_threads: 2,
+        aot: true, background_class: true,
+    };
+    match ahead_level() {
+        AheadLevel::Minimal => &MINIMAL,
+        AheadLevel::Balanced => &BALANCED,
+        AheadLevel::AotMax => &AOT_MAX,
+        AheadLevel::AotMin => &AOT_MIN,
+    }
+}
+
+/// aot: speculation follows every call of what it built (a depth no call chain reaches)
+const AOT_DEPTH: u8 = 250;
+
+/// Whether Gandalf's whole-app discovery runs (the level's policy).
+pub(crate) fn borrowck_discovery() -> bool {
+    ahead_policy().borrowck_discovery
+}
+
 /// MAKEPAD_RUN_SPEC_ORDER=lifo: newest queued first (the callees of the latest compile)
 fn spec_lifo(options: &crate::options::Options) -> bool {
     options.spec_order
@@ -11700,7 +13521,7 @@ fn spec_yield(options: &crate::options::Options) -> bool {
 /// Default: fall-through only while the machine runs on battery (less work built ahead that
 /// is never called), every warm call on mains power. MAKEPAD_RUN_SPEC_HOT=1/0 overrides.
 pub fn spec_hot_only(options: &crate::options::Options) -> bool {
-    options.spec_hot.unwrap_or_else(on_battery)
+    options.spec_hot.unwrap_or_else(|| !ahead_policy().aot && on_battery())
 }
 
 /// Is the machine running on battery power (read once, at the first speculation)?
@@ -11710,15 +13531,15 @@ pub fn on_battery() -> bool {
 
 /// MAKEPAD_RUN_SPEC_HOT_FROM=n: from depth n on only fall-through calls are speculated (default 2)
 fn spec_hot_from(options: &crate::options::Options) -> u8 {
-    options.spec_hot_from
+    ahead_policy().spec_hot_from.unwrap_or(options.spec_hot_from)
 }
 
 fn spec_depth_max(options: &crate::options::Options) -> u8 {
-    options.spec_depth
+    ahead_policy().spec_depth.unwrap_or(options.spec_depth)
 }
 
 fn spec_jobs(options: &crate::options::Options) -> usize {
-    options.spec_jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(1).clamp(1, 6))
+    options.spec_jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(1).clamp(1, 6).min(ahead_policy().spec_jobs))
 }
 
 static SPEC_UNIT: std::sync::atomic::AtomicPtr<Unit> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
@@ -11736,6 +13557,11 @@ const YIELDED: &str = "(background build gave way)";
 /// relock wait, waits for in-flight builds]; and the same front/back cpu on workers
 pub static SPLIT_NS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
+/// Slots queued to be built ahead (postframe::ahead_progress; 1 while the queue is locked).
+pub(crate) fn ahead_queued() -> u64 {
+    SPEC_Q.try_lock().map_or(1, |q| q.len() as u64)
+}
+
 /// Queues the not-inlined direct callees of slot `id` (lock held), one level deeper.
 unsafe fn spec_enqueue(up: *mut Unit, id: u32, depth: u8) {
     if pipelined() && defer_startup_root(up, id, depth) { return; }
@@ -11749,11 +13575,11 @@ unsafe fn spec_enqueue(up: *mut Unit, id: u32, depth: u8) {
         Some(r) => r.clone(),
         None => return,
     };
-    spec_enqueue_calls(up, &rir, &[], depth);
+    spec_enqueue_calls(up, id, &rir, &[], depth);
 }
 
 fn note_entered(_u: &Unit, id: u32) {
-    crate::fncost::event("call", id);
+    relax_codegen::fncost::event("call", id);
 }
 
 /// A slot's key that stays the same across runs, and across edits that do not touch the fn
@@ -11803,8 +13629,8 @@ fn slot_key_inner(u: &Unit, id: u32) -> String {
 /// panic / failure / formatting path, or lead only to cold blocks -- error paths the program
 /// rarely takes. Speculation does not build their callees ahead, and O1 does not build them as
 /// inline candidates (rustc's inliner skips cleanup blocks, inline.rs process_blocks).
-fn cold_blocks(u: &Unit, func: &crate::rir::Func) -> Vec<bool> {
-    use crate::rir::{Callee, Inst, Term};
+fn cold_blocks(u: &Unit, func: &relax_backend::rir::Func) -> Vec<bool> {
+    use relax_backend::rir::{Callee, Inst, Term};
     let mut cold: Vec<bool> = func.blocks.iter().map(|b| {
         matches!(b.term, Term::Unreachable)
             || b.insts.iter().any(|i| matches!(i, Inst::Call(Callee::Fn(c), _, _) if is_cold_fn(u, *c)))
@@ -11831,15 +13657,59 @@ fn cold_blocks(u: &Unit, func: &crate::rir::Func) -> Vec<bool> {
     }
 }
 
-/// Queues the slots `func` calls (but not `skip`) at depth + 1 (lock held).
-unsafe fn spec_enqueue_calls(up: *mut Unit, func: &crate::rir::Func, skip: &[u32], depth: u8) {
-    if startup_phase() { return; }
+/// MAKEPAD_RUN_SPEC_DYN=0: speculation follows direct calls only, not fn pointers and vtables
+fn spec_dyn() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    ahead_policy().spec_dyn && *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_SPEC_DYN").map_or(true, |v| v != "0"))
+}
+
+/// aot: slots (unit, slot, depth) built in a UI burst whose callees are speculated after it
+static AOT_DEFERRED: relax_session::sync::Mutex<Vec<(usize, u32, u8)>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// aot: once the UI's burst is over, the callees of the slots built during it are speculated (any
+/// thread; the monitor's tick).
+pub fn aot_drain() {
+    if !ahead_policy().aot || ui_burst() || startup_phase() {
+        return;
+    }
+    let roots = std::mem::take(&mut *AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()));
+    if roots.is_empty() {
+        return;
+    }
+    let _job = compile_job();
+    owner::call(owner::Class::Background, || {
+        let up = SPEC_UNIT.load(Ordering::Acquire);
+        if SPEC_STOP.load(Ordering::SeqCst) || up.is_null() {
+            return;
+        }
+        for (unit, id, depth) in roots {
+            if unit == up as usize && (id as usize) < unsafe { (&*up).fns.len() } {
+                unsafe { spec_enqueue(up, id, depth) };
+            }
+        }
+    });
+}
+
+/// Queues the slots `func` (slot `id`'s RIR) calls (but not `skip`) at depth + 1 (lock held).
+unsafe fn spec_enqueue_calls(up: *mut Unit, id: u32, func: &relax_backend::rir::Func, skip: &[u32], depth: u8) {
+    if startup_phase() || !ahead_policy().spec_calls { return; }
+    // nor in a burst of the UI thread's lazy compiles after the present: the ahead helpers check
+    // and lower the callees its builds make (cheaper than whole speculative builds, of which
+    // a burst called few: 119 of 14.9k compiles in a cold Stage's first 10 s after present);
+    // aot speculates them after the burst (aot_drain)
+    if ui_burst() {
+        if ahead_policy().aot {
+            SPEC_UNIT.store(up, Ordering::Release);
+            crate::zone_alloc::kept_with(|| AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id, depth)));
+        }
+        return;
+    }
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
     if !pipelined() || depth >= spec_depth_max(options) {
         return;
     }
-    use crate::rir::{Callee, Inst, Term};
+    use relax_backend::rir::{Callee, Inst, Term};
     let u = &mut *up;
     let nb = func.blocks.len();
     let cold = cold_blocks(u, func);
@@ -11863,14 +13733,36 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, func: &crate::rir::Func, skip: &[u32
     }
     let mut front = Vec::new();
     let mut back = Vec::new();
+    let dyn_on = spec_dyn() && depth + 1 < spec_hot_from(options);
+    let mut dyn_refs: Vec<u32> = Vec::new();
+    let mut seen_dyn = crate::fxhash::HashSet::default();
     for (bi, b) in func.blocks.iter().enumerate() {
         if cold[bi] {
             SPEC_COLD_SKIPPED.fetch_add(b.insts.iter().filter(|i| matches!(i, Inst::Call(Callee::Fn(_), _, _))).count() as u64, Ordering::Relaxed);
             continue;
         }
         for i in &b.insts {
-            if let Inst::Call(Callee::Fn(c), _, _) = i {
-                if skip.contains(c) {
+            // what it calls, and (spec_dyn) the fns it can reach through data: fn pointers it takes,
+            // the methods of the vtables it makes (a widget's draw / event paths, which the program
+            // reaches only through `dyn`)
+            dyn_refs.clear();
+            let direct = match i {
+                Inst::Call(Callee::Fn(c), _, _) => Some(*c),
+                Inst::FnAddr(_, c) if dyn_on => { dyn_refs.push(*c); None }
+                Inst::Addr(_, sym) if dyn_on => {
+                    match u.syms.kind(sym.id) {
+                        Some(crate::syms::SymKind::Thunk(c)) => dyn_refs.push(c),
+                        Some(crate::syms::SymKind::Data(_)) => crate::syms::data_thunks(u, u.syms.value(relax_backend::rir::Sym { id: sym.id, off: 0 }), &mut dyn_refs),
+                        _ => {}
+                    }
+                    None
+                }
+                _ => None,
+            };
+            for &c in direct.iter().chain(dyn_refs.iter()) {
+                let is_dyn = direct.is_none();
+                let c = &c;
+                if skip.contains(c) || is_dyn && !seen_dyn.insert(*c) {
                     continue;
                 }
                 let f = &u.fns[*c as usize];
@@ -11887,12 +13779,13 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, func: &crate::rir::Func, skip: &[u32
                 if !ok {
                     continue;
                 }
-                // deeper levels follow only the fall-through path (they are a guess on a guess)
-                if !hot[bi] && (spec_hot_only(options) || depth + 1 >= spec_hot_from(options)) {
+                // deeper levels follow only the fall-through path (they are a guess on a guess);
+                // what is reachable through data only from the code that ran
+                if (!hot[bi] || is_dyn) && (spec_hot_only(options) || depth + 1 >= spec_hot_from(options)) {
                     continue;
                 }
                 u.fns[*c as usize].spec_depth = depth + 1;
-                if hot[bi] {
+                if hot[bi] && !is_dyn {
                     front.push(*c);
                 } else {
                     back.push(*c);
@@ -11945,7 +13838,7 @@ fn skip_initializer_seed(u: &Unit, id: u32) -> bool {
 /// startup manifest. Seeds do not fan out further
 /// (their depth is the speculation limit); slots already built or queued are skipped.
 pub unsafe fn spec_seed(up: *mut Unit, ids: &[u32]) {
-    for &id in ids { crate::fncost::hint(id); }
+    for &id in ids { relax_codegen::fncost::hint(id); }
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
     if !pipelined() {
@@ -11990,6 +13883,50 @@ pub unsafe fn spec_seed(up: *mut Unit, ids: &[u32]) {
 
 /// Teardown preparation: (slots built ahead, thread cpu ns)
 pub static TEARDOWN_STATS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// The teardown-ahead thread runs (prepare_teardown)
+static TEARDOWN_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// The aot levels' ahead set is built: no speculation, O3, teardown or Gandalf work queued or
+/// running, and nothing new compiled or checked for AHEAD_QUIET_NS.
+static AHEAD_COMPLETE: AtomicBool = AtomicBool::new(false);
+const AHEAD_QUIET_NS: u64 = 2_000_000_000;
+/// (activity counter at the last change, wall ns of that change)
+static AHEAD_SEEN: relax_session::sync::Mutex<(u64, u64)> = relax_session::sync::Mutex::new((u64::MAX, 0));
+
+/// aot-max / aot-min: once the ahead set is fully built, one line says so ("ahead complete: N
+/// fns, T s"); its products are in the warm cache by then (the monitor's mid-run cache writes,
+/// spill_cache), so a quit halfway keeps what was built. The monitor's tick calls this.
+pub fn ahead_complete_tick() {
+    if !ahead_policy().aot || AHEAD_COMPLETE.load(Ordering::Relaxed) || !FIRST_PRESENT.load(Ordering::Acquire) || startup_phase() {
+        return;
+    }
+    let fns = COMPILED_FNS.load(Ordering::Relaxed) + TIER1_INSTALLS.load(Ordering::Relaxed);
+    let activity = fns + crate::borrowck::lazy::checked();
+    let now = wall_ns();
+    let mut seen = AHEAD_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.0 != activity {
+        *seen = (activity, now);
+        return;
+    }
+    drop(seen);
+    // one lock at a time (each its own statement: no two held together)
+    let spec = SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let tier = TIER_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let tier_active = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let deferred = AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let checks = crate::borrowck::lazy::queued();
+    let queued = spec + tier + tier_active + deferred + checks > 0
+        || TEARDOWN_RUNNING.load(Ordering::SeqCst)
+        || BG_ACTIVE.load(Ordering::SeqCst) > JOB_DEPTH.with(|d| (d.get() > 0) as u32);
+    let since = AHEAD_SEEN.lock().unwrap_or_else(|e| e.into_inner()).1;
+    if queued || now.saturating_sub(since) < AHEAD_QUIET_NS {
+        return;
+    }
+    AHEAD_COMPLETE.store(true, Ordering::Relaxed);
+    let t = crate::clock::ms_since_start() as f64 / 1e3 - AHEAD_QUIET_NS as f64 / 1e9;
+    eprintln!("makepad-run: ahead complete ({}): {} fns, {:.1} s", ahead_level().name(), fns, t);
+}
+
 /// Calls below a drop glue followed when preparing teardown (Drop impls and what they call:
 /// `<Vec as Drop>::drop` -> its element loop, a platform's `Drop` -> its destroy fns).
 const TEARDOWN_DEPTH: u8 = 3;
@@ -12004,7 +13941,7 @@ const TEARDOWN_DEPTH: u8 = 3;
 /// teardown runs once, at the end. As a speculative worker's, each build takes the unit lock
 /// only when no thread waits for it (lock_bg), at a lowered priority; the thread stops at exit.
 pub unsafe fn prepare_teardown(up: *mut Unit) {
-    if !pipelined() {
+    if !pipelined() || !ahead_policy().teardown {
         return;
     }
     struct P(*mut Unit);
@@ -12012,7 +13949,11 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
     let p = P(up);
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     { let _k = crate::zone_alloc::kept();
+    TEARDOWN_RUNNING.store(true, Ordering::SeqCst);
     let _ = std::thread::Builder::new().name("run-teardown".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+        struct Done;
+        impl Drop for Done { fn drop(&mut self) { TEARDOWN_RUNNING.store(false, Ordering::SeqCst); } }
+        let _done = Done;
         let p = p;
         let up = p.0;
         ensure_altstack();
@@ -12077,7 +14018,7 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
                     let Some(rir) = u.fns[id as usize].rir.clone() else { return };
                     for b in &rir.blocks {
                         for i in &b.insts {
-                            let crate::rir::Inst::Call(crate::rir::Callee::Fn(c), _, _) = i else { continue };
+                            let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) = i else { continue };
                             let c = *c;
                             let d = match &u.fns[c as usize].key {
                                 FnKey::Glue(GLUE_DROP | GLUE_EXT_DROP, _) => 0,
@@ -12110,6 +14051,73 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
 /// O3 had to build a slot's RIR again (code linked from the disk cache has none):
 /// (count, wall ns)
 pub static TIER1_RIR_REBUILT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// O3 bottom-up preparation (InlineBodies::prepare): thread cpu ns, bodies simplified, bodies kept, shared preparations taken, simplified although the slot had shared ones (reads disagreed)
+pub static TIER1_PREP: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// O3 snapshots: inline candidates built on the owner (count, wall ns), and the candidates whose
+/// fronts the O3 thread ran off the owner first (count, cpu ns)
+pub static TIER1_SNAP_BUILT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+pub static TIER1_SNAP_FRONTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// O3 snapshots: inline candidates whose O1 optimisation ran on the O3 thread (count, cpu ns)
+pub static TIER1_SNAP_OFF: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// An O3 build's inline candidates (`ids`, their bodies checked and lowered ahead): the fronts of
+/// their O1 builds, deferring the optimisation (unit call; o2_begin's pattern). Returns the
+/// preparations, and the slots left out because a program thread's request arrived (they give way).
+unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[u32]) -> (Vec<(u32, Prep)>, Vec<u32>) {
+    let mut preps = Vec::new();
+    let mut gave = Vec::new();
+    for (i, &c) in ids.iter().enumerate() {
+        if owner::urgent() {
+            gave.extend_from_slice(&ids[i..]);
+            break;
+        }
+        let u = &*up;
+        let f = &u.fns[c as usize];
+        if f.rir.is_some() || f.building || f.inflight || f.build_err.is_some() {
+            continue;
+        }
+        match &f.key {
+            FnKey::Inst(_, args) if !args.iter().any(|t| u.tcx.tys.depth(*t) > INSTANCE_DEPTH_LIMIT) => {}
+            _ => continue,
+        }
+        (&mut *up).check_before_lowering(c);
+        if begin_build(up, c).is_err() {
+            continue;
+        }
+        let depth0 = BUILD_STACK.try_with(|s| s.borrow().len()).unwrap_or(0);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare_rir_from(up, c, true, None, RirMode::Tier0)));
+        if r.is_err() {
+            let open: Vec<u32> = BUILD_STACK.try_with(|s| s.borrow()[depth0.min(s.borrow().len())..].to_vec()).unwrap_or_default();
+            for x in open.into_iter().rev() {
+                end_build(up, x);
+            }
+        }
+        end_build(up, c);
+        match r {
+            Ok(Ok((p, _))) => preps.push((c, p)),
+            Ok(Err(e)) if e == YIELDED => gave.push(c),
+            Err(p) if p.is::<crate::preempt::OwnerBusy>() => std::panic::resume_unwind(p),
+            _ => {}
+        }
+    }
+    (preps, gave)
+}
+
+/// Stores the RIR o3_candidates_begin's builds made off the owner (unit call), where nobody built
+/// it meanwhile and no patch landed since `epoch`.
+unsafe fn o3_candidates_finish(up: *mut Unit, epoch: u64, done: Vec<Deferred>) {
+    if PATCH_EPOCH.load(Ordering::SeqCst) != epoch {
+        return;
+    }
+    for (c, r) in done {
+        if let Ok((f, inl)) = r {
+            let x = &(&*up).fns[c as usize];
+            if x.rir.is_none() && !x.building && x.build_err.is_none() {
+                store_rir(up, c, f, inl, 0);
+            }
+        }
+    }
+}
 
 /// Speculative results waiting for their first call: (slot, wall ns when built). A result
 /// nobody called within MAKEPAD_RUN_SPEC_TTL_MS (default 2000; 0 = keep forever) is dropped with its
@@ -12120,7 +14128,7 @@ static SPEC_BUILT: relax_session::sync::Mutex<Vec<(u32, u64)>> = relax_session::
 pub static SPEC_EXPIRED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 fn note_spec_built(options: &crate::options::Options, id: u32) {
-    if spec_ttl_ns(options) != 0 {
+    if spec_ttl_ns(options) != 0 && ahead_policy().spec_expire {
         SPEC_BUILT.lock().unwrap().push((id, wall_ns()));
     }
 }
@@ -12139,7 +14147,7 @@ pub fn expire_spec(options: &crate::options::Options) {
     // headless program (released on quiet, startup_main) keeps what it built.
     if startup_phase() || !FIRST_PRESENT.load(Ordering::Acquire) { return; }
     let ttl = spec_ttl_ns(options);
-    if ttl == 0 {
+    if ttl == 0 || !ahead_policy().spec_expire {
         return;
     }
     let now = wall_ns();
@@ -12167,12 +14175,12 @@ pub fn expire_spec(options: &crate::options::Options) {
                 if let Some(spec) = f.spec.take() {
                     let SpecCode { code, map, relocs, .. } = *spec;
                     u.reload_specs.remove(&id);
-                    bytes += (std::mem::size_of::<SpecCode>() + code.capacity() + map.capacity() * 16 + relocs.capacity() * std::mem::size_of::<crate::rir::RelocAt>()) as u64;
+                    bytes += (std::mem::size_of::<SpecCode>() + code.capacity() + map.capacity() * 16 + relocs.capacity() * std::mem::size_of::<relax_backend::rir::RelocAt>()) as u64;
                     f.spec_state = 3;
                     n += 1;
                     if f.history().inlined_into.is_empty() {
                         if let Some(r) = f.rir.take() {
-                            bytes += crate::opt::inst_count(&r) as u64 * 80;
+                            bytes += relax_codegen::opt::inst_count(&r) as u64 * 80;
                         }
                     }
                 }
@@ -12213,12 +14221,17 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions, options: &crate::option
         // a panic escaping the build (outside its own catch_unwind) must not leave the unit
         // lock held by a thread that is gone: every lazy compile would wait for it forever
         let _census_context = unsafe { (&*up).exec_context(false) };
-        let _cost = crate::fncost::Record::new(id, 0, crate::fncost::spec_origin(id));
+        let _cost = relax_codegen::fncost::Record::new(id, 0, relax_codegen::fncost::spec_origin(id));
         let _startup = StartupCompile::new();
         if !unsafe { (&*up).spec_cached.contains(&id) } {
             unsafe { typeck_ahead_slot(up, id) };
         }
+        crate::postframe::AHEAD_RUNNING.fetch_add(1, Ordering::Relaxed);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { spec_build(up, id) }));
+        crate::postframe::AHEAD_RUNNING.fetch_sub(1, Ordering::Relaxed);
+        if FIRST_PRESENT.load(Ordering::Relaxed) && matches!(r, Ok(true)) {
+            crate::postframe::AHEAD_DONE.fetch_add(1, Ordering::Relaxed);
+        }
         match r {
             // gave way to a program thread: first in line again
             Ok(false) => SPEC_Q.lock().unwrap().push_front(id),
@@ -12390,6 +14403,15 @@ impl Drop for JobIdle {
     }
 }
 
+/// A compile job's sleep that waits for no owner request (a poll): the job is not running meanwhile
+/// (JobIdle), so an allocator swap or a fork never waits for it -- what the poll waits for may be
+/// held up by that very swap (a job polling for quiet compiles, while the jobs the swap parked keep
+/// their startup-compile counts, waited for the swap's whole length: the swap for it, forever).
+pub(crate) fn job_sleep(d: std::time::Duration) {
+    let _idle = JobIdle::enter();
+    std::thread::sleep(d);
+}
+
 /// The thread compile jobs are paused for (an allocator swap, a fork), 0: none.
 pub(crate) fn paused_for() -> u64 {
     // Only the pauser's requests are served while the jobs are paused, for as long as the pause
@@ -12427,8 +14449,8 @@ fn pause_compile_jobs(trace: bool) {
     while BG_ACTIVE.load(Ordering::SeqCst) > mine || owner::busy_for_other(me()) {
         if t0.elapsed().as_millis() >= next_log {
             next_log += 5000;
-            eprintln!("makepad: the allocator swap waits for compile jobs ({:.0} s): jobs active {}, waiting for the owner {}, owner busy for another thread {}",
-                t0.elapsed().as_secs_f64(), BG_ACTIVE.load(Ordering::SeqCst), BG_IDLE.load(Ordering::SeqCst), owner::busy_for_other(me()));
+            eprintln!("makepad: the allocator swap waits for compile jobs ({:.0} s): jobs active {}, waiting for the owner {}, owner busy for another thread {}; queued: {}",
+                t0.elapsed().as_secs_f64(), BG_ACTIVE.load(Ordering::SeqCst), BG_IDLE.load(Ordering::SeqCst), owner::busy_for_other(me()), owner::queued_detail());
         }
         std::thread::sleep(std::time::Duration::from_micros(200));
     }
@@ -12505,7 +14527,7 @@ extern "C" fn recorded_exit(code: i32) -> ! {
 }
 
 /// Symbols the loader provides to the programs it runs (found through dlsym).
-fn loader_symbol(name: &[u8]) -> Option<usize> {
+pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
     match name {
         #[cfg(unix)]
         b"exit" => Some(recorded_exit as *const () as usize),
@@ -12513,7 +14535,11 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"fork" => Some(relax_fork as *const () as usize),
         b"relax_allocator_swap" => Some(relax_allocator_swap as *const () as usize),
         b"relax_first_present" => Some(relax_first_present as *const () as usize),
+        b"relax_frame_done" => Some(crate::postframe::relax_frame_done as *const () as usize),
+        b"relax_zone_swaps" => Some(zone_swap::relax_zone_swaps as *const () as usize),
         b"relax_quit_requested" => Some(crate::run::relax_quit_requested as *const () as usize),
+        b"relax_quit_started" => Some(crate::run::relax_quit_started as *const () as usize),
+        b"__relax_main_hosted" => Some(crate::run::relax_main_hosted as *const () as usize),
         b"__relax_guard_enter" => Some(__relax_guard_enter as *const () as usize),
         b"__relax_guard_leave" => Some(__relax_guard_leave as *const () as usize),
         // Relax's std reads virtual files (git runs) through these (vfs.rs)
@@ -12536,6 +14562,7 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"relax_retry_take" => Some(crate::inspect::events::relax_retry_take as *const () as usize),
         // makepad inspect's probes: std::relax::probe (Relax std relax.rs)
         b"__relax_probe_emit" => Some(crate::inspect::probes::relax_probe_emit as *const () as usize),
+        b"__relax_probe_result" => Some(crate::inspect::eval::relax_probe_result as *const () as usize),
         b"__relax_probe_count" => Some(crate::inspect::probes::relax_probe_count as *const () as usize),
         b"__relax_probe_hist" => Some(crate::inspect::probes::relax_probe_hist as *const () as usize),
         b"__relax_probe_sample" => Some(crate::inspect::probes::relax_probe_sample as *const () as usize),
@@ -12559,13 +14586,15 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_domain_reserve" => Some(crate::domain::relax_domain_reserve as *const () as usize),
         b"__relax_domain_failed" => Some(crate::domain::thread_finished as *const () as usize),
         b"__relax_domain_name" => Some(crate::domain::relax_domain_name as *const () as usize),
+        b"__relax_tls_fixed" => Some(os::tls::relax_tls_fixed as *const () as usize),
         b"__relax_key_create" => Some(crate::domain_threads::key_create as *const () as usize),
         b"__relax_key_delete" => Some(crate::domain_threads::key_delete as *const () as usize),
         b"__relax_key_get" => Some(crate::domain_threads::key_get as *const () as usize),
         b"__relax_key_set" => Some(crate::domain_threads::key_set as *const () as usize),
-        // run-time modules (modules.rs; Relax's std::relax); the C allocator through relax
-        // inspect's heap veneers (one indirect jump; tracking patches the word)
-        _ => crate::inspect::heap::veneer(name).or_else(|| crate::modules::symbol(name)),
+        // the web target's runtime and its embedder's page side (web.rs), then run-time modules
+        // (modules.rs; Relax's std::relax); the C allocator through relax inspect's heap veneers
+        // (one indirect jump; tracking patches the word)
+        _ => crate::web::symbol(name).or_else(|| crate::inspect::heap::veneer(name)).or_else(|| crate::modules::symbol(name)),
     }
 }
 
@@ -12660,7 +14689,7 @@ extern "C" fn relax_dlsym(handle: *mut u8, name: *const u8) -> *mut u8 {
 /// The front end of a split compile (lock held): the slot's RIR exists already (an inline
 /// candidate) -> code generation only; else a preparation for optimize_rir.
 enum Front {
-    Codegen(std::sync::Arc<crate::rir::Func>),
+    Codegen(std::sync::Arc<relax_backend::rir::Func>),
     Opt(Prep, u64),
 }
 
@@ -12669,11 +14698,11 @@ enum Front {
 /// `threads` threads, so program threads keep compiling and running meanwhile. Nothing is
 /// installed. The caller holds the unit lock (as it does on return). Slots in flight are marked
 /// (a program thread needing one waits for its build, as for pipelined compiles).
-pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads: usize) -> Vec<(u32, Result<(Vec<u8>, Vec<(u32, u64)>, Vec<crate::rir::RelocAt>), String>)> {
+pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads: usize) -> Vec<(u32, Result<(Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>), String>)> {
     let census_unit = (&*up).front.census_id;
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
-    let mut out: Vec<(u32, Result<(Vec<u8>, Vec<(u32, u64)>, Vec<crate::rir::RelocAt>), String>)> = Vec::new();
+    let mut out: Vec<(u32, Result<(Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>), String>)> = Vec::new();
     // fronts, under the lock; each front's slots go in flight at once (no other thread starts
     // them meanwhile). A later front of this batch that inlines one of them does not wait for it
     // (wait_inflight skips BATCH_FLIGHT): its back end starts only after the last front.
@@ -12706,10 +14735,10 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
     let (env, fold, rotate) = {
         let u = &*up;
         let e = &u.env;
-        (x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: !TIER1_ENABLED.load(Ordering::Relaxed), syms: e.syms, sym_class: e.sym_class }, u.opt.fold, u.opt.layout)
+        (x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: !TIER1_ENABLED.load(Ordering::Relaxed), syms: e.syms, sym_class: e.sym_class, near: e.near }, u.opt.fold, u.opt.layout)
     };
     // back ends, off the unit (on helper threads; the owner serves requests meanwhile)
-    type Built = (u32, Result<(Option<(std::sync::Arc<crate::rir::Func>, Vec<(u32, usize)>, u64)>, Vec<u8>, Vec<(u32, u64)>, Vec<crate::rir::RelocAt>), String>, Vec<Deferred>);
+    type Built = (u32, Result<(Option<(std::sync::Arc<relax_backend::rir::Func>, Vec<(u32, usize)>, u64)>, Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>), String>, Vec<Deferred>);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results: relax_session::sync::Mutex<Vec<Built>> = relax_session::sync::Mutex::new(Vec::new());
     let work_cells: Vec<relax_session::sync::Mutex<Option<(u32, Front, String)>>> = work.into_iter().map(|w| relax_session::sync::Mutex::new(Some(w))).collect();
@@ -12733,9 +14762,9 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                         break;
                     }
                     let Some((id, front, name)) = work_cells[k].lock().unwrap().take() else { continue };
-                    let _census_context = crate::exec_census::Context::new(census_unit, false);
-                    let _cost = crate::fncost::Record::new(id, 0, "ahead");
-                    crate::fncost::name(id, &name);
+                    let _census_context = relax_codegen::exec_census::Context::new(census_unit, false);
+                    let _cost = relax_codegen::fncost::Record::new(id, 0, "ahead");
+                    relax_codegen::fncost::name(id, &name);
                     let mut done: Vec<Deferred> = Vec::new();
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
                         let t0 = cpu_ns();
@@ -12749,9 +14778,10 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                             }
                         };
                         let cg = tier0_codegen_rir(options, &rir, fold, rotate);
+                        crate::wasm_export::capture(id, &cg);
                         let e = &env;
-                        let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: e.opt_regs && !rir.baseline, syms: e.syms, sym_class: e.sym_class };
-                        let c = x64::compile(options, &cg, &env)?;
+                        let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: e.opt_regs && !rir.baseline, syms: e.syms, sym_class: e.sym_class, near: e.near };
+                        let c = relax_codegen::native::compile(options, &cg, &env)?;
                         note_frame(id, c.frame_size, slot_bytes(&cg), false);
                         dump_o1(&cg, &c);
                         Ok((opt, c.code, c.pc_map, c.relocs))
@@ -12879,7 +14909,7 @@ pub(crate) struct BackDone {
     spec: bool,
     slots: Vec<u32>,
     epoch: u64,
-    built: Result<(Option<(std::sync::Arc<crate::rir::Func>, Vec<(u32, usize)>, u64)>, Vec<u8>, Vec<(u32, u64)>, Vec<crate::rir::RelocAt>, u64), String>,
+    built: Result<(Option<(std::sync::Arc<relax_backend::rir::Func>, Vec<(u32, usize)>, u64)>, Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>, u64), String>,
     done: Vec<Deferred>,
 }
 
@@ -12950,7 +14980,7 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
         skip.extend(p.deferred.iter().map(|x| x.0));
         let depth = if spec { (&*up).fns[id as usize].spec_depth } else { 0 };
         if !pipelined() || !defer_startup_root(up, id, depth) {
-            spec_enqueue_calls(up, &p.func, &skip, depth);
+            spec_enqueue_calls(up, id, &p.func, &skip, depth);
         }
     }
     let u = &mut *up;
@@ -12958,7 +14988,7 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
         u.fns[x as usize].inflight = true;
     }
     let e = &u.env;
-    let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: !TIER1_ENABLED.load(Ordering::Relaxed), syms: e.syms, sym_class: e.sym_class };
+    let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: !TIER1_ENABLED.load(Ordering::Relaxed), syms: e.syms, sym_class: e.sym_class, near: e.near };
     let (fold, rotate) = (u.opt.fold, u.opt.layout);
     let name = u.fns[id as usize].name.to_string();
     let w1 = wall_ns();
@@ -12987,7 +15017,7 @@ impl BackWork {
                 Front::Opt(p, prep_ns) => {
                     let mut done: Vec<Deferred> = Vec::new();
                     if !spec {
-                        let n = crate::opt::inst_count(&p.func) as u32;
+                        let n = relax_codegen::opt::inst_count(&p.func) as u32;
                         main_rec(|r| r.insts[0] += n);
                     }
                     let r = optimize_tree(options, id, p, &mut done);
@@ -13000,26 +15030,27 @@ impl BackWork {
             };
             let t1 = cpu_ns();
             let cg = tier0_codegen_rir(options, &rir, fold, rotate);
+            crate::wasm_export::capture(id, &cg);
             let mut env = env;
             env.opt_regs &= !rir.baseline;
-            compile_watch(Some((&format!("codegen {}", cg.name), crate::opt::inst_count(&cg))));
+            compile_watch(Some((&format!("codegen {}", cg.name), relax_codegen::opt::inst_count(&cg))));
             let mps = crate::memstat::peak_start();
             let c = crate::memstat::tagged(crate::memstat::Tag::Codegen, || {
                 let _scratch = crate::zone_alloc::scratch(runtime);
-                x64::compile(options, &cg, &env)
+                relax_codegen::native::compile(options, &cg, &env)
             });
             crate::memstat::note_big("codegen", &cg.name, mps, || cg_shape(&cg));
             compile_watch(None);
             let c = c?;
             note_frame(id, c.frame_size, slot_bytes(&cg), false);
             dump_o1(&cg, &c);
-            code_sig(id, &cg, &c.code, c.alloc_sig);
+            code_sig(id, &cg, &c.code, c.alloc_sig, false);
             if let Some(u) = crate::syms::unit() {
                 crate::syms::reloc_sig(u, || crate::syms::stable_fn_name(u, id), &c.code, &c.relocs, &c.pc_map);
             }
             let t2 = cpu_ns();
             if !spec {
-                let n = crate::opt::inst_count(&cg) as u32;
+                let n = relax_codegen::opt::inst_count(&cg) as u32;
                 main_rec(|r| {
                     r.cpu[1] += t1 - t0;
                     r.cpu[2] += t2 - t1;
@@ -13052,7 +15083,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
     let BackDone { id, spec, slots, epoch, built, done } = d;
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
-    let _cost_install = crate::fncost::phase(6);
+    let _cost_install = relax_codegen::fncost::phase(6);
     let stale = PATCH_EPOCH.load(Ordering::SeqCst) != epoch;
     {
         // the deferred inline candidates' RIR; then the slots are no longer in flight
@@ -13097,6 +15128,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
             }
             u.stats.compiled += 1;
             COMPILED_FNS.fetch_add(1, Ordering::Relaxed);
+            crate::boot_stats::fn_installed(boot_arm(u, id));
             if spec {
                 // a speculative build is valid code whether or not it gets called: cache it now
                 // (not an O2 fn's O1 code: the O2 worker records its entry)
@@ -13146,7 +15178,7 @@ unsafe fn spec_build(up: *mut Unit, id: u32) -> bool {
     match b {
         Begin::Back(w) => {
             let d = w.run();
-            owner::call(owner::Class::Finish, || split_finish(up, d));
+            owner::call(owner::Class::FinishBackground, || split_finish(up, d));
             COMPILE_LAST.store(wall_ns(), Ordering::Relaxed);
             true
         }
@@ -13253,6 +15285,8 @@ pub struct FrontShared {
     alive: AtomicBool,
     pub(crate) warm_cache: AtomicBool,
     owner_verdicts: crate::conc::MemoMap<u64, std::sync::Arc<crate::cache::OwnerVerdicts>>,
+    /// SPEC-V: the stored owner verdicts looked up so far, by (epoch, owner) (Unit::stored_owner_verdict)
+    stored_owner: crate::conc::MemoMap<(u64, DefId), Option<crate::borrowck::lazy::StoredVerdict>>,
     /// slot -> key (the fns table moves when it grows)
     slot_keys: crate::conc::MemoMap<u32, FnKey>,
     /// checked bodies with the collect epoch they were checked at
@@ -13266,8 +15300,15 @@ pub struct FrontShared {
     lowered: relax_session::sync::Mutex<HashMap<u32, Option<LoweredAhead>>>,
     /// Until the first present, `helpers` threads type-check every new slot's body ahead (queue
     /// of slots): a cold start's main thread finds most bodies it calls checked
-    /// (MAKEPAD_RUN_AHEAD_HELPERS=n; default ahead_helpers())
+    /// (MAKEPAD_RUN_AHEAD_HELPERS=n; default ahead_helpers()). After it they serve the UI
+    /// thread's bursts of lazy compiles (ahead_phase): started by a burst's first queued slot,
+    /// ended once the queue is empty and the burst over (no thread stays: a zone swap needs none)
     helpers: u32,
+    /// helper threads running (changed with `queue` locked)
+    live_helpers: std::sync::atomic::AtomicU32,
+    /// bodies checked ahead after the first present: those no build took are dropped when a
+    /// burst ends (ahead_helper), not kept for the rest of the run
+    ahead_post: relax_session::sync::Mutex<Vec<AheadKey>>,
     queue: relax_session::sync::Mutex<std::collections::VecDeque<AheadWork>>,
     wake: relax_session::sync::Condvar,
 }
@@ -13284,7 +15325,7 @@ impl FrontShared {
     fn new(sess: &std::sync::Arc<crate::Session>) -> Self {
         let options = &sess.options;
         FrontShared {
-            census_id: crate::exec_census::new_unit(),
+            census_id: relax_codegen::exec_census::new_unit(),
             session: sess.clone(),
             prog: Default::default(),
             tcx: Default::default(),
@@ -13294,12 +15335,15 @@ impl FrontShared {
             alive: AtomicBool::new(false),
             warm_cache: AtomicBool::new(false),
             owner_verdicts: Default::default(),
+            stored_owner: Default::default(),
             slot_keys: crate::conc::MemoMap::with_bits(16),
             ahead: Default::default(),
             inprog: Default::default(),
             built: crate::conc::MemoMap::with_bits(16),
             lowered: Default::default(),
             helpers: if options.tyck_ahead { options.ahead_helpers.unwrap_or_else(ahead_helpers) } else { 0 },
+            live_helpers: std::sync::atomic::AtomicU32::new(0),
+            ahead_post: Default::default(),
             queue: Default::default(),
             wake: Default::default(),
         }
@@ -13393,10 +15437,24 @@ fn set_shared_front(u: &mut Unit, core_crate: u32) {
     f.core_crate.store(core_crate, Ordering::SeqCst);
     f.src_toks.store(inline_src_toks(options, tier1).max(inline_src_toks(options, !tier1)), Ordering::SeqCst);
     f.alive.store(true, Ordering::SeqCst);
-    for i in 0..if startup_phase() { f.helpers } else { 0 } {
-        let f = u.front.clone();
-        { let _k = crate::zone_alloc::kept();
-        let _ = std::thread::Builder::new().name(format!("run-ahead{}", i)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); ahead_helper(f) });
+    if startup_phase() {
+        let q = f.queue.lock().unwrap_or_else(|e| e.into_inner());
+        spawn_helpers(f, &q);
+    }
+}
+
+/// Starts the ahead helpers unless they run (`q`: the queue's lock, held).
+fn spawn_helpers(f: &std::sync::Arc<FrontShared>, _q: &std::collections::VecDeque<AheadWork>) {
+    if f.live_helpers.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let _k = crate::zone_alloc::kept();
+    // after the startup: the level's share of them (they serve the UI's bursts)
+    let n = if startup_phase() { f.helpers } else { f.helpers.min(ahead_policy().post_present_helpers) };
+    for i in 0..n {
+        let f2 = f.clone();
+        if std::thread::Builder::new().name(format!("run-ahead{}", i)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); ahead_helper(f2, i) }).is_ok() {
+            f.live_helpers.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -13407,14 +15465,62 @@ fn ahead_helpers() -> u32 {
     std::thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(2).clamp(1, 4) as u32
 }
 
-/// A helper thread: checks and lowers queued slots' bodies ahead until the first present (then
-/// speculative workers check what they build ahead) or until the unit is dropped.
-fn ahead_helper(f: std::sync::Arc<FrontShared>) {
+/// The ahead helpers run: the startup, and the warm-up after the first present (its burst of lazy
+/// compiles on the UI thread type-checks each new body there, one at a time, unless a helper has
+/// checked it since the slot was made -- when its caller was lowered).
+fn ahead_phase() -> bool {
+    startup_phase() || FIRST_PRESENT.load(Ordering::Acquire)
+}
+
+/// After the first present the helpers serve bursts: the UI thread waited on the JIT within
+/// AHEAD_BURST_QUIET_NS (a page's first visit compiles thousands of bodies in a row). Between
+/// bursts the lowered bodies no build took are dropped (they are kept only for the next calls).
+const AHEAD_BURST_QUIET_NS: u64 = 2_000_000_000;
+
+fn ahead_burst() -> bool {
+    crate::postframe::ui_idle_ns() < AHEAD_BURST_QUIET_NS
+}
+
+/// After the first present, the UI thread is in a burst of JIT waits (ahead_burst).
+pub fn ui_burst() -> bool {
+    FIRST_PRESENT.load(Ordering::Acquire) && ahead_burst()
+}
+
+/// A helper thread: checks and lowers queued slots' bodies ahead through the startup and the
+/// warm-up after the first present (then speculative workers check what they build ahead) or
+/// until the unit is dropped.
+fn ahead_helper(f: std::sync::Arc<FrontShared>, index: u32) {
     loop {
         let id = {
             let mut q = f.queue.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if !f.alive.load(Ordering::SeqCst) || !startup_phase() {
+                // a startup helper past the level's post-present share ends at the present (the
+                // others serve the UI's bursts; the last one out drops what no build took)
+                if !startup_phase() && FIRST_PRESENT.load(Ordering::Acquire) && index >= ahead_policy().post_present_helpers.max(1) {
+                    f.live_helpers.fetch_sub(1, Ordering::Relaxed);
+                    return;
+                }
+                let burst_over = !startup_phase() && FIRST_PRESENT.load(Ordering::Acquire) && q.is_empty() && !ahead_burst();
+                if !f.alive.load(Ordering::SeqCst) || !ahead_phase() || burst_over {
+                    if burst_over {
+                        let keys = std::mem::take(&mut *f.ahead_post.lock().unwrap_or_else(|e| e.into_inner()));
+                        let unused: Vec<_> = keys.iter().filter_map(|k| f.ahead.remove(k).map(|b| (k.0, b))).collect();
+                        AHEAD_DROPPED.fetch_add(unused.len() as u64, Ordering::Relaxed);
+                        // (its line after the count: it reports the drops)
+                        crate::postframe::ahead_over();
+                        drop(keys);
+                        drop(q);
+                        if ahead_trace() {
+                            let _r = front_read("ahead_trace");
+                            let prog = unsafe { &*f.prog.load(Ordering::Relaxed) };
+                            for (d, _) in &unused { eprintln!("ahead-dropped {}", prog.def_path(*d)); }
+                        }
+                        drop(unused);
+                        q = f.queue.lock().unwrap_or_else(|e| e.into_inner());
+                        // a slot queued meanwhile: this burst goes on
+                        if !q.is_empty() { continue; }
+                    }
+                    f.live_helpers.fetch_sub(1, Ordering::Relaxed);
                     q.clear();
                     drop(q);
                     // Unused raw RIR is startup work only. Drop it on a helper, outside the
@@ -13441,21 +15547,28 @@ fn ahead_helper(f: std::sync::Arc<FrontShared>) {
             AheadWork::Body((d, args), normal) => (d, args, None, normal),
         };
         let _job = compile_job();
-        let _census_context = crate::exec_census::Context::new(f.census_id, false);
-        let _cost = slot.map(|id| crate::fncost::Record::new(id, 0, "ahead"));
+        let _census_context = relax_codegen::exec_census::Context::new(f.census_id, false);
+        let _cost = slot.map(|id| relax_codegen::fncost::Record::new(id, 0, "ahead"));
         let t0 = cpu_ns();
         typeck_ahead(&f, d, args, 1, true, normal);
         AHEAD_STATS[4].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
         if let Some(id) = slot {
-            lower_ahead(&f, id);
+            lower_ahead(&f, id, false);
         }
     }
+}
+
+/// MAKEPAD_RUN_AHEAD_TRACE: also one line per body the helpers check after the present (its typeck
+/// cpu ns), per body a build takes and per body dropped untaken at a burst's end (their precision).
+fn ahead_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_AHEAD_TRACE").is_some())
 }
 
 struct LoweredAhead {
     epoch: u64,
     file: u32,
-    func: crate::rir::Func,
+    func: relax_backend::rir::Func,
     /// Closures share their owner's body, installed only by the locked build.
     body: Option<std::sync::Arc<Body>>,
     /// New callees in the order normal lowering would discover them. Helpers do not create
@@ -13527,9 +15640,16 @@ pub(crate) fn lower_ahead_needs_unit() {
     }
 }
 
-fn lower_ahead(f: &FrontShared, id: u32) {
+/// Lowers slot `id`'s checked body off the unit (its build takes the RIR, take_lowered_ahead): the
+/// startup helpers' work, and after it the thread about to build `id` itself (`own`: the owner's
+/// front then only takes the RIR, so lowering runs on the program's threads in parallel, not on
+/// the one owner thread every lazy compile queues for).
+fn lower_ahead(f: &FrontShared, id: u32, own: bool) {
+    // not inside another lowering ahead (a compile its constant evaluation reached): this one's
+    // guard would end the outer one's temporary callee identities under it
+    if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(true) { return; }
     let _r = front_read("lower_ahead");
-    if !f.alive.load(Ordering::SeqCst) || !startup_phase() { return; }
+    if !f.alive.load(Ordering::SeqCst) || !own && !ahead_phase() { return; }
     let Some(FnKey::Inst(d, args)) = f.slot_keys.get(&id) else { return; };
     let key = (d, args);
     if f.built.contains(&key) { return; }
@@ -13558,7 +15678,7 @@ fn lower_ahead(f: &FrontShared, id: u32) {
         pending.insert(id, None);
     }
     let t0 = cpu_ns();
-    let _cost_lower = crate::fncost::phase(3);
+    let _cost_lower = relax_codegen::fncost::phase(3);
     let _mem = crate::memstat::tag(crate::memstat::Tag::Lower);
     let _ = crate::program::take_missing();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -13596,7 +15716,7 @@ fn lower_ahead(f: &FrontShared, id: u32) {
 
 /// Unit lock held. Never wait for lowering: taking an unfinished reservation cancels its
 /// publication, and this build uses the already checked body through the ordinary path.
-fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<crate::rir::Func> {
+fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func> {
     let mut lowered = u.front.lowered.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)??;
     if crate::boundary::on()
         || lowered.epoch != u.tcx.collect_epoch.load(Ordering::SeqCst)
@@ -13605,7 +15725,7 @@ fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<crate::rir::Func> {
     AHEAD_STATS[6].fetch_add(1, Ordering::Relaxed);
     if let FnKey::Inst(d, args) = &u.fns[id as usize].key {
         let key = (*d, args.clone());
-        u.front.built.insert(key.clone(), ());
+        if !u.front.built.contains(&key) { u.front.built.insert(key.clone(), ()); }
         u.front.ahead.remove(&key);
     }
     if let Some(body) = lowered.body { u.put_body(id, body); }
@@ -13620,7 +15740,7 @@ fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<crate::rir::Func> {
         }
         for block in &mut lowered.func.blocks {
             for inst in &mut block.insts {
-                use crate::rir::{Inst, Callee};
+                use relax_backend::rir::{Inst, Callee};
                 if let Inst::Call(Callee::Fn(c) | Callee::CFn(c, _), _, _) | Inst::FnAddr(_, c) = inst {
                     *c = resolved(*c, &ids);
                 }
@@ -13651,10 +15771,14 @@ fn publish_ahead(f: &FrontShared, key: AheadKey, epoch: u64, body: std::sync::Ar
     let before = crate::memstat::live_total();
     let claim = f.inprog.lock().unwrap_or_else(|e| e.into_inner());
     if !f.built.contains(&key) {
+        if f.helpers > 0 && FIRST_PRESENT.load(Ordering::Acquire) {
+            crate::zone_alloc::kept_with(|| f.ahead_post.lock().unwrap_or_else(|e| e.into_inner()).push(key.clone()));
+        }
         f.ahead.insert(key, (epoch, body));
     } else {
         // The build took over. Drop outside the claim lock, including large bodies.
         drop(claim);
+        if FIRST_PRESENT.load(Ordering::Relaxed) { AHEAD_LATE.fetch_add(1, Ordering::Relaxed); }
         drop(body);
         DONE_BODY_BYTES.fetch_add(freed_since(before), Ordering::Relaxed);
     }
@@ -13664,6 +15788,10 @@ fn publish_ahead(f: &FrontShared, key: AheadKey, epoch: u64, body: std::sync::Ar
 /// checks ahead on callers' threads and on the speculative workers; bodies lowered ahead,
 /// lowered bodies a build took (the other builds lowered their own or never ran), cpu ns lowering
 pub static AHEAD_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// bodies checked ahead after the first present that no build took by the end of their burst
+pub static AHEAD_DROPPED: AtomicU64 = AtomicU64::new(0);
+/// bodies checked ahead after the first present whose build had begun meanwhile (checked twice)
+pub static AHEAD_LATE: AtomicU64 = AtomicU64::new(0);
 /// AHEAD_STATS as they stood at the first present (the helpers end there).
 pub static AHEAD_AT_PRESENT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
@@ -13678,7 +15806,8 @@ fn take_ahead(prog: &Program, f: &FrontShared, tcx: &Tcx, d: DefId, args: &[TyId
     }
     let key = (d, args.to_vec());
     let claim = f.inprog.lock().unwrap_or_else(|e| e.into_inner());
-    f.built.insert(key.clone(), ());
+    // (MemoMap::insert does not replace: a rebuild's insert would add a duplicate node)
+    if !f.built.contains(&key) { f.built.insert(key.clone(), ()); }
     let result = f.ahead.remove(&key).ok_or_else(|| if claim.contains(&key) { "inprog" } else { "absent" });
     drop(claim);
     let (epoch, b) = result?;
@@ -13687,6 +15816,9 @@ fn take_ahead(prog: &Program, f: &FrontShared, tcx: &Tcx, d: DefId, args: &[TyId
         return Err("epoch");
     }
     AHEAD_STATS[1].fetch_add(1, Ordering::Relaxed);
+    if ahead_trace() && FIRST_PRESENT.load(Ordering::Relaxed) {
+        eprintln!("ahead-taken {}", prog.def_path(d));
+    }
     if *b.args == *args { return Ok(b); }
     Ok(crate::typeck::codegen_body(prog, tcx, d, args))
 }
@@ -13732,9 +15864,9 @@ fn ahead_check_diag(u: &Unit, id: u32, reason: &str, ns: u64) {
 /// FrontShared (a field never written after the unit is set up).
 pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
     if up.is_null() { return; }
-    let _census_context = (&*up).exec_context(crate::exec_census::active() && crate::exec_profile::is_call(up as usize, id));
+    let _census_context = (&*up).exec_context(relax_codegen::exec_census::active() && crate::exec_profile::is_call(up as usize, id));
 
-    let _cost = crate::fncost::Record::ensure(id, 0, "ahead");
+    let _cost = relax_codegen::fncost::Record::ensure(id, 0, "ahead");
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
     if !ahead_on(options) {
@@ -13745,13 +15877,20 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
     // cached callees. The normal build checks a missing body on demand. After a
     // live edit the edited code is not cached: speculation helps again.
     if f.warm_cache.load(Ordering::Relaxed) && crate::reload::edited_crates().is_empty() { return; }
-    if let Some(FnKey::Inst(d, args)) = f.slot_keys.get(&id) {
+    // an unverified-mode twin (SPEC-V) is built from its base slot's body: that body is checked
+    let key = match f.slot_keys.get(&id) {
+        Some(FnKey::Plain(base)) => f.slot_keys.get(&base),
+        k => k,
+    };
+    if let Some(FnKey::Inst(d, args)) = key {
         let t0 = cpu_ns();
         let key = (d, args.clone());
         typeck_ahead(&f, d, args, 3, false, false);
         // a helper is checking this very body: wait for its result rather than check it again
         // under the unit lock (not while holding that lock: a constant evaluation's call)
         if !owner::is_owner() && f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
+            // (a wait for another thread: not a running job meanwhile, job_sleep's reason)
+            let _idle = JobIdle::enter();
             let mut g = AHEAD_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
             while f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) && f.alive.load(Ordering::SeqCst) {
                 g = AHEAD_DONE.1.wait_timeout(g, std::time::Duration::from_millis(5)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
@@ -13759,6 +15898,10 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
         }
         let w = IS_WORKER.try_with(|w| w.get()).unwrap_or(false);
         AHEAD_STATS[if w { 4 } else { 3 }].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
+        // after the startup (its helpers lower then), the thread about to build the slot lowers it
+        if !owner::is_owner() && !startup_phase() && pipelined() {
+            lower_ahead(&f, id, true);
+        }
     }
 }
 
@@ -13772,7 +15915,7 @@ fn inprog_end(f: &FrontShared, key: &AheadKey) {
 }
 
 fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: bool, normal: bool) {
-    let _census_context = crate::exec_census::Context::new(f.census_id, false);
+    let _census_context = relax_codegen::exec_census::Context::new(f.census_id, false);
     let core = f.core_crate.load(Ordering::Relaxed);
     let src_toks = f.src_toks.load(Ordering::Relaxed);
     let mut todo = vec![(d, args, depth, normal)];
@@ -13801,11 +15944,15 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
         }
         let epoch = tcx.collect_epoch.load(Ordering::SeqCst);
         let _o = crate::clock::origin("ahead");
+        let t_trace = if ahead_trace() && FIRST_PRESENT.load(Ordering::Relaxed) { cpu_ns() } else { 0 };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _p = crate::preempt::Preemptible::on();
             crate::preempt::point();
             tcx.typeck(prog, key.0)
         }));
+        if t_trace != 0 {
+            eprintln!("ahead-checked {} {}", cpu_ns() - t_trace, prog.def_path(key.0));
+        }
         if r.as_ref().is_err_and(|p| crate::preempt::is_preempted(&**p)) {
             inprog_end(f, &key);
             if crate::preempt::is_stopped() { return; }
@@ -13853,9 +16000,9 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
             let it = prog.files[cd.file as usize].ast.item(cd.item);
             let toks = &prog.files[cd.file as usize].toks;
             let src = (toks.partition_point(|t| t.lo < it.hi) - toks.partition_point(|t| t.lo < it.lo)) as u32;
-            let baseline = !normal && startup_phase() && f.session.options.t0_baseline != crate::options::Tier0Baseline::Off;
+            let baseline = !normal && (startup_phase() || warmup_foreground()) && f.session.options.t0_baseline != crate::options::Tier0Baseline::Off;
             let want = if baseline { src <= BASE_INLINE_SRC_TOKS } else {
-                attr & crate::opt::ATTR_ALWAYS != 0 || src <= src_toks || (attr & crate::opt::ATTR_HINT != 0 && src <= INLINE_HINT_SRC_TOKS)
+                attr & relax_codegen::opt::ATTR_ALWAYS != 0 || src <= src_toks || (attr & relax_codegen::opt::ATTR_HINT != 0 && src <= INLINE_HINT_SRC_TOKS)
             };
             if want {
                 // fn_id keys codegen instances with erased regions too.
@@ -13999,14 +16146,14 @@ pub fn count_cache_ahead() {
 }
 
 /// The disk cache's code for slot `id`, linked (unit lock held); None: compile it.
-pub(crate) unsafe fn cache_lookup(up: *mut Unit, id: u32) -> Option<(Vec<u8>, Vec<(u32, u64)>, Vec<crate::rir::RelocAt>)> {
+pub(crate) unsafe fn cache_lookup(up: *mut Unit, id: u32) -> Option<(Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>)> {
     let _mem = crate::memstat::tag(crate::memstat::Tag::CacheLoad);
     let u = &mut *up;
     if matches!(u.fns[id as usize].key, FnKey::Inst(d, _) if u.prog.def(d).kind == DefKind::ForeignFn) {
-        crate::warm::reason(id, "foreign veneer");
+        relax_codegen::warm::reason(id, "foreign veneer");
         return None;
     }
-    if u.cache.is_none() { crate::warm::reason(id, "cache absent during nested lookup"); }
+    if u.cache.is_none() { relax_codegen::warm::reason(id, "cache absent during nested lookup"); }
     crate::cache::lookup_unit(up, id)
 }
 
@@ -14088,7 +16235,7 @@ unsafe fn spec_enqueue_cached(up: *mut Unit, ids: &[u32], depth: u8) {
     }
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
-    if !pipelined() || ids.is_empty() || depth >= spec_depth_max(options) {
+    if !pipelined() || ids.is_empty() || depth >= spec_depth_max(options) || !ahead_policy().spec_cached {
         return;
     }
     let u = &mut *up;
@@ -14262,8 +16409,8 @@ pub fn start_background_coherence(u: &Unit) {
 }
 
 /// MAKEPAD_RUN_MEM_REPORT's size line of a function: instructions, vregs, blocks, slots.
-fn cg_shape(f: &crate::rir::Func) -> String {
-    format!("{} insts, {} vregs, {} blocks, {} slots", crate::opt::inst_count(f), f.vregs.len(), f.blocks.len(), f.slots.len())
+fn cg_shape(f: &relax_backend::rir::Func) -> String {
+    format!("{} insts, {} vregs, {} blocks, {} slots", relax_codegen::opt::inst_count(f), f.vregs.len(), f.blocks.len(), f.slots.len())
 }
 
 /// Notes which of `ids` (about to be queued for speculation; unit lock held) the disk cache
@@ -14886,15 +17033,15 @@ unsafe fn realtime_refs(up: *mut Unit, id: u32) -> (Vec<u32>, Vec<u32>) {
     r.unwrap_or_default()
 }
 
-fn realtime_rir_refs(u: &Unit, f: &crate::rir::Func, slots: &mut Vec<u32>, dyns: &mut Vec<u32>) {
-    use crate::rir::{Callee, Inst};
+fn realtime_rir_refs(u: &Unit, f: &relax_backend::rir::Func, slots: &mut Vec<u32>, dyns: &mut Vec<u32>) {
+    use relax_backend::rir::{Callee, Inst};
     for b in &f.blocks {
         for i in &b.insts {
             match i {
                 Inst::Call(Callee::Fn(c) | Callee::CFn(c, _), _, _) | Inst::FnAddr(_, c) => slots.push(*c),
                 Inst::Addr(_, sym) => match u.syms.kind(sym.id) {
                     Some(crate::syms::SymKind::Thunk(c)) => slots.push(c),
-                    Some(crate::syms::SymKind::Data(_)) => crate::syms::data_thunks(u, u.syms.value(crate::rir::Sym { id: sym.id, off: 0 }), slots),
+                    Some(crate::syms::SymKind::Data(_)) => crate::syms::data_thunks(u, u.syms.value(relax_backend::rir::Sym { id: sym.id, off: 0 }), slots),
                     _ => {}
                 },
                 _ => {}

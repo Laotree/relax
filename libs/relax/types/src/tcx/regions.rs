@@ -240,7 +240,7 @@ impl Tcx {
         seen.pop();
     }
 
-    pub(super) fn object_region_with_bounds(&self, infcx: Option<&crate::infer::InferCtxt<'_>>, prog: &Program, file: u32, env: &GenEnv, bounds: &[ast::Bound], td: DefId, rs: RegionArgsId, source_ty: Option<ast::TyId>) -> RegionId {
+    pub(super) fn object_region_with_bounds(&self, infcx: Option<&crate::infer::InferCtxt<'_>>, prog: &Program, file: u32, env: &GenEnv, bounds: &[ast::Bound], td: DefId, rs: RegionArgsId, source_ty: Option<ast::TyId>, ambiguous: &mut bool) -> RegionId {
         if !env.regions.enabled { return RegionId::ERASED; }
         let explicit = bounds.iter().find_map(|b| match b { ast::Bound::Lifetime(n) => Some(*n), _ => None });
         if let Some(n) = explicit {
@@ -252,7 +252,11 @@ impl Tcx {
         // escaping the existential predicate binder is not an object bound.
         derived.retain(|r| !matches!(self.tys.region_kind(*r), RegionKind::ReBound(..)));
         if let Some(r) = derived.iter().find(|r| self.tys.region_kind(**r) == RegionKind::ReStatic) { return *r; }
-        if let Some(r) = derived.first() { return *r; }
+        if let Some(r) = derived.first() {
+            // compute_object_lifetime_bound: more than one distinct bound and no `'static` (E0227)
+            *ambiguous = derived[1..].iter().any(|r1| r1 != r);
+            return *r;
+        }
         self.object_region(infcx, prog, file, env, bounds, source_ty)
     }
 }
@@ -447,7 +451,7 @@ mod tests {
         let TyKind::FnPtr(ps, r, _, n) = tcx.tys.kind(explicit_output.bound) else { panic!("fn") };
         assert_eq!(*n, 1);
         assert_eq!(region(tcx.tys.list(*ps)[0]), RegionKind::ReBound(0, BoundVar(0)));
-        assert!(matches!(region(*r), RegionKind::ReVar(_)));
+        assert!(matches!(region(*r), RegionKind::ReErased)); // (writeback erases the typeck's region variables)
         // rustc rejects this deferred closure as not general enough; it does
         // not acquire a higher-ranked signature from a previous use of `g`.
         assert!(check("deferred_closure_rejected").errors.iter().any(|error| error.contains("E0277") || error.contains("E0271")));
@@ -464,7 +468,7 @@ mod tests {
                 assert!(!tcx.tys.has_infer(sig.bound));
                 let (supplied, expected) = sig.annotation_eq.unwrap();
                 let TyKind::FnPtr(ps, _, _, _) = tcx.tys.kind(supplied) else { panic!("fn") };
-                assert!(matches!(region(tcx.tys.list(*ps)[0]), RegionKind::ReVar(_) | RegionKind::ReLateParam(..)));
+                assert!(matches!(region(tcx.tys.list(*ps)[0]), RegionKind::ReErased | RegionKind::ReLateParam(..)));
                 assert!(tcx.tys.eq_mod_regions(supplied, expected));
             }
         }

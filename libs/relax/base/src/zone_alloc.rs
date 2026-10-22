@@ -48,6 +48,7 @@
 mod burst {
     pub const COMPILER: bool = false;
     pub const LABEL: &std::ffi::CStr = c"makepad-run-burst";
+    const WEB_AT: usize = 0;
     include!("zone_alloc/arena.rs");
     #[cfg(test)]
     include!("zone_alloc/arena_tests.rs");
@@ -57,8 +58,20 @@ mod burst {
 mod compiler {
     pub const COMPILER: bool = true;
     pub const LABEL: &std::ffi::CStr = c"makepad-run-compiler";
+    const WEB_AT: usize = 0;
     include!("zone_alloc/arena.rs");
 }
+/// The web target's linear memory (web.rs): the compiler arena's allocator over one fixed range.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(dead_code)]
+mod web_arena {
+    pub const COMPILER: bool = true;
+    pub const LABEL: &std::ffi::CStr = c"makepad-run-web-memory";
+    const WEB_AT: usize = super::web::BASE + super::web::ARENA_OFFSET;
+    include!("zone_alloc/arena.rs");
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod web;
 
 // No TLS, reservation, environment read, or routing on wasm/unsupported targets.
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android", windows)))]
@@ -69,6 +82,10 @@ mod disabled {
     #[inline]
     pub fn scratch(_: &crate::options::RuntimeOptions) -> ScratchGuard {
         ScratchGuard
+    }
+    #[inline]
+    pub fn outside_scratch<R>(f: impl FnOnce() -> R) -> R {
+        f()
     }
     #[inline]
     pub fn active() -> bool {
@@ -137,7 +154,7 @@ use disabled as burst;
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android", windows)))]
 use disabled as compiler;
 
-pub use burst::{scratch, stats as burst_stats, trim as burst_trim, ScratchGuard};
+pub use burst::{outside_scratch, scratch, stats as burst_stats, trim as burst_trim, ScratchGuard};
 pub use relax_session::phase::{in_compiler, PhaseGuard};
 
 use relax_session::phase::ROUTING as MODE;
@@ -606,14 +623,21 @@ unsafe impl GlobalAlloc for RelaxAlloc {
     }
 }
 
+/// Tests that read the arenas' process-wide counters (committed bytes, chunks) run one at a time,
+/// and so do the tests whose threads allocate in the compiler arena meanwhile (pool.rs: its
+/// workers are compiler threads and hand their chunks back after every task).
+#[cfg(test)]
+pub(crate) fn test_serial() -> relax_session::sync::MutexGuard<'static, ()> {
+    static SERIAL: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(all(test, any(target_os = "macos", target_os = "linux", target_os = "android", windows)))]
 mod routing_tests {
     use super::*;
 
-    static SERIAL: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
-
     fn serial() -> relax_session::sync::MutexGuard<'static, ()> {
-        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+        test_serial()
     }
 
     unsafe fn put(size: usize, align: usize, byte: u8) -> (*mut u8, Layout) {

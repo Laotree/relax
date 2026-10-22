@@ -59,7 +59,7 @@ pub fn parked_events(domain: u32) -> Option<Vec<std::sync::Arc<str>>> {
         .map(|p| p.event.clone()).collect())
 }
 
-pub const KINDS: &[&str] = &["panic", "hang", "deadlock", "mem", "spike", "rtstall", "scripterr", "patchrefused", "patchverified", "patchreverted"];
+pub const KINDS: &[&str] = &["panic", "hang", "deadlock", "mem", "spike", "hitch", "rtstall", "scripterr", "patchrefused", "patchverified", "patchreverted"];
 
 /// Records an event (`fields`: the kind-specific JSON members, without braces). Returns its seq,
 /// or 0 when it repeated one sent in the last 30 s.
@@ -68,6 +68,7 @@ pub fn emit(kind: &'static str, key: &str, fields: &str) -> u64 {
 }
 
 fn emit_record(kind: &'static str, key: &str, fields: &str) -> (u64, std::sync::Arc<str>) {
+    let _k = crate::zone_alloc::kept();
     let mut q = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(e) = q.iter().rev().find(|e| e.kind == kind && e.key == key) {
         if e.at.elapsed().as_secs() < 30 {
@@ -164,6 +165,10 @@ pub fn cmd_watch(req: &Req, out: &mut Out) {
         if timeout > 0 && t0.elapsed().as_secs() >= timeout {
             break None;
         }
+        // the client went away: the watch ends (it counted as a watcher)
+        if out.cancelled() {
+            break None;
+        }
         q = NEW.wait_timeout(q, std::time::Duration::from_millis(500)).unwrap_or_else(|e| e.into_inner()).0;
     };
     drop(q);
@@ -171,6 +176,9 @@ pub fn cmd_watch(req: &Req, out: &mut Out) {
         super::timeline::set_frame_watch(false);
     }
     retry_update();
+    if found.is_none() && out.cancelled() {
+        return;
+    }
     match found {
         Some((seq, json)) => out.line(&format!("{},\"rearm\":\"watch since={}\"}}", &json[..json.len() - 1], seq)),
         None => out.line(&format!("{{\"event\":\"none\",\"waited_s\":{},\"rearm\":\"watch since={}\"}}", timeout, since)),
@@ -200,12 +208,12 @@ pub fn cmd_events(req: &Req, out: &mut Out) {
             out.line(j);
             since = *seq;
         }
-        if !follow || !out.flush() {
+        if !follow || !out.flush() || out.cancelled() {
             break;
         }
         let q = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
         if q.back().map_or(true, |e| e.seq <= since) {
-            let _ = NEW.wait_timeout(q, std::time::Duration::from_secs(5));
+            let _ = NEW.wait_timeout(q, std::time::Duration::from_millis(500));
         }
         // a heartbeat-free stream: a closed client is noticed at the next write
     }
@@ -229,6 +237,19 @@ struct Parked {
     event: std::sync::Arc<str>,
     /// (thread name, message, location): why-hung's verdict names the parked panic
     what: (String, String, String),
+    /// its frames, innermost first (lookup pcs): `eval`'s default scope, `locals`
+    frames: Vec<u64>,
+}
+
+/// Parked panic `id` (the newest with None): (id, its domain, its frames as lookup pcs, its
+/// thread's os id).
+pub fn parked_frames(id: Option<u64>) -> Option<(u64, Option<crate::domain::DomainId>, Vec<u64>, u64)> {
+    let list = PARKED.lock().unwrap_or_else(|e| e.into_inner());
+    let p = match id {
+        Some(k) => list.iter().find(|p| p.id == k)?,
+        None => list.iter().max_by_key(|p| p.id)?,
+    };
+    Some((p.id, p.domain, p.frames.clone(), p.os_id))
 }
 
 // ---- retry boundaries (DESIGN.md §10b): makepad's event dispatch runs inside one while an agent
@@ -291,7 +312,8 @@ pub fn release_domain(domain: crate::domain::DomainId) {
 }
 
 pub fn on_panic(info: &crate::jit::PanicInfo, unwinds: bool) {
-    if !super::STARTED.load(Relaxed) || crate::owner::is_owner() || super::probes::in_probe() {
+    let _k = crate::zone_alloc::kept();
+    if !super::STARTED.load(Relaxed) || crate::owner::is_owner() || super::probes::in_probe() || super::eval::in_eval() {
         return;
     }
     let domain = crate::domain::current_app_domain();
@@ -357,7 +379,7 @@ pub fn on_panic(info: &crate::jit::PanicInfo, unwinds: bool) {
     // Do not park a new cleanup panic after that release.
     if domain.is_some_and(crate::domain::cancelled) { return; }
     let (seq, event) = emit_record("panic", &format!("P{}", id), &fields);
-    let p = std::sync::Arc::new(Parked { id, seq, os_id: super::threads::self_os_id(), domain, decision: AtomicU32::new(0), words: Mutex::new(Vec::new()), event, what: (thread.clone(), info.message.clone(), location.clone()) });
+    let p = std::sync::Arc::new(Parked { id, seq, os_id: super::threads::self_os_id(), domain, decision: AtomicU32::new(0), words: Mutex::new(Vec::new()), event, what: (thread.clone(), info.message.clone(), location.clone()), frames: info.frames.iter().copied().take(64).collect() });
     list.push(p.clone());
     parked_changed();
     if !watched {

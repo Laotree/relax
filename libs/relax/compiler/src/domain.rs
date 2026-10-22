@@ -31,7 +31,7 @@
 //! static. A scalar pointer constant needs nothing: lowering emits its target's symbol.
 
 use crate::jit::Unit;
-use crate::rir::Sym;
+use relax_backend::rir::Sym;
 use crate::sandbox::{initial_bytes, provenance_words};
 use crate::syms::SymKind;
 use std::collections::HashSet;
@@ -55,6 +55,24 @@ pub(crate) fn rehome_const(u: &Unit, addr: u64) -> u64 {
 pub(crate) fn const_copy(u: &Unit, addr: u64) -> u64 {
     let mut seen = std::collections::HashMap::new();
     rehome(u, addr, &mut seen, true)
+}
+
+/// Captures static `sym`'s initial image (just evaluated into its storage) and the image of
+/// every anonymous mutable block its words point into, then (the caller) materializes it. A
+/// static initializer that runs as code fills its promoted temporaries (`&CONST` /
+/// `&[..]` borrows lowered as a per-domain block written by the initializer, lower.rs
+/// promote_rvalue) in the compile domain only; without their images every other domain's copy
+/// of the static pointed at zeroed blocks (Sandbox's race kit read each event payload's
+/// FieldDefs as zeros: no names). `rehome` does the same for constants.
+pub(crate) fn capture_static(u: &Unit, sym: Sym) {
+    crate::sandbox::capture_initial_data(u, sym);
+    let Ok(bytes) = initial_bytes(u, sym.id) else { return };
+    let mut seen = HashSet::new();
+    for w in bytes.chunks_exact(8).map(|w| u64::from_le_bytes(w.try_into().unwrap())) {
+        if let Some(rw) = u.syms.rw_sym_at(w) {
+            capture_rw(u, rw.id, &mut seen);
+        }
+    }
 }
 
 /// Gives anonymous mutable block `id` (made by constant evaluation: a promoted temporary) and
@@ -94,13 +112,14 @@ fn rehome(u: &Unit, addr: u64, seen: &mut std::collections::HashMap<u64, u64>, f
     // block took it off the shared data for nothing (and the disk cache named the copy as a
     // fresh, zeroed block: the warm run read a length of 0). An object whose kind cannot tell
     // is scanned word by word, as before.
+    let pw = u.ptr_bytes() as usize;
     let words: Vec<usize> = match crate::syms::pointer_offsets(u, start) {
-        Some(offs) => offs.into_iter().map(|o| o as usize).filter(|&o| o + 8 <= bytes.len()).collect(),
-        None => (0..bytes.len() / 8).map(|i| i * 8).collect(),
+        Some(offs) => offs.into_iter().map(|o| o as usize).filter(|&o| o + pw <= bytes.len()).collect(),
+        None => (0..bytes.len() / pw).map(|i| i * pw).collect(),
     };
     let mut reaches = false;
     for &k in &words {
-        let w = u64::from_le_bytes(bytes[k..k + 8].try_into().unwrap());
+        let w = crate::syms::word_in(u, &bytes, k);
         if (lo..hi).contains(&w) {
             // a static (materialized when laid out) or an anonymous mutable block: one constant
             // evaluation made (a promoted temporary) has no initial image yet -- every domain needs it
@@ -116,7 +135,7 @@ fn rehome(u: &Unit, addr: u64, seen: &mut std::collections::HashMap<u64, u64>, f
         }
         let moved = rehome(u, cs, seen, false);
         if moved != cs {
-            bytes[k..k + 8].copy_from_slice(&(moved + (w - cs)).to_le_bytes());
+            bytes[k..k + pw].copy_from_slice(&u.ptr_word(moved + (w - cs)));
             reaches = true;
         }
     }
@@ -130,9 +149,9 @@ fn rehome(u: &Unit, addr: u64, seen: &mut std::collections::HashMap<u64, u64>, f
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), new as *mut u8, bytes.len()) };
     // a word pointing into the object itself (a self-referential constant) points at the copy
     for &k in &words {
-        let w = u64::from_le_bytes(bytes[k..k + 8].try_into().unwrap());
+        let w = crate::syms::word_in(u, &bytes, k);
         if (start..start + len).contains(&w) {
-            unsafe { *((new + k as u64) as *mut u64) = new + (w - start) };
+            unsafe { crate::syms::write_ptr(u, new + k as u64, new + (w - start)) };
         }
     }
     seen.insert(addr, new);
@@ -310,7 +329,7 @@ fn materialize_in(u: &Unit, base: u64, sym: u32, seen: &mut HashSet<u32>) {
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
     for (o, t) in provenance_words(u, &bytes) {
         if let Some(to) = offset_of(u, t) {
-            unsafe { *((at + o as u64) as *mut u64) = base + to };
+            unsafe { crate::syms::write_ptr(u, at + o as u64, base + to) };
             if !matches!(u.syms.kind(t.id), Some(SymKind::Static(_) | SymKind::Rw(_))) {
                 materialize_in(u, base, t.id, seen);
             }
@@ -321,7 +340,8 @@ fn materialize_in(u: &Unit, base: u64, sym: u32, seen: &mut HashSet<u32>) {
 /// Makes a new domain's block: reserved once (it never moves), holding the initial image of
 /// every static laid out so far. Returns its base.
 pub fn create(u: &Unit) -> u64 {
-    let base = crate::os::mem::alloc_rw(BLOCK_SIZE);
+    // a wasm32 program's statics are in its window (web32.rs)
+    let base = if crate::web32::on() { crate::web32::alloc(BLOCK_SIZE) } else { crate::os::mem::alloc_rw(BLOCK_SIZE) };
     let ids: Vec<u32> = u.syms.initial_data.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
     let mut seen = HashSet::new();
     for id in ids {
@@ -338,7 +358,7 @@ pub fn create(u: &Unit) -> u64 {
 pub fn destroy(base: u64) {
     forget_tls_keys(base);
     BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|b| *b != base);
-    crate::os::mem::free(base, BLOCK_SIZE);
+    if crate::web32::on() { crate::web32::free(base, BLOCK_SIZE) } else { crate::os::mem::free(base, BLOCK_SIZE) }
 }
 
 /// A static was just laid out (jit.rs `static_addr`, after its initial image was captured): copy
@@ -711,8 +731,9 @@ pub(crate) fn compile_phase(id: DomainId, phase: &str) -> Result<(), String> {
 
 // Keys are domain-local records, not OS keys that survive each restart. Domain 0 also owns
 // keys for native callback threads; every ThreadData holds only its own values.
-static TLS_KEYS: Mutex<Vec<(u64, Vec<Option<usize>>)>> = Mutex::new(Vec::new());
-pub(crate) fn tls_key_create(base: u64, dtor: usize) -> u32 {
+/// Per key: its destructor and whether it is late (domain_threads::key_create).
+static TLS_KEYS: Mutex<Vec<(u64, Vec<Option<(usize, bool)>>)>> = Mutex::new(Vec::new());
+pub(crate) fn tls_key_create(base: u64, dtor: usize, late: bool) -> u32 {
     let _kept = crate::zone_alloc::kept();
     let mut keys = TLS_KEYS.lock().unwrap_or_else(|e| e.into_inner());
     let i = match keys.iter().position(|k| k.0 == base) {
@@ -721,7 +742,7 @@ pub(crate) fn tls_key_create(base: u64, dtor: usize) -> u32 {
     };
     let values = &mut keys[i].1;
     let key = values.len() as u32;
-    values.push(Some(dtor));
+    values.push(Some((dtor, late)));
     key
 }
 pub(crate) fn tls_key_delete(base: u64, key: u32) {
@@ -730,7 +751,7 @@ pub(crate) fn tls_key_delete(base: u64, key: u32) {
         if let Some(k) = values.get_mut(key as usize) { *k = None; }
     }
 }
-pub(crate) fn tls_destructor(base: u64, key: u32) -> Option<usize> {
+pub(crate) fn tls_destructor(base: u64, key: u32) -> Option<(usize, bool)> {
     TLS_KEYS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|k| k.0 == base)?.1.get(key as usize).copied().flatten()
 }
 pub(crate) fn forget_tls_keys(base: u64) {
@@ -1029,7 +1050,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     if compile_phase(id, "link").is_err() { return Ok(id); }
     let t2 = std::time::Instant::now();
     // the libraries the new crates link
-    let (_, missing) = crate::run::link_libraries(unsafe { &(*up).prog }, &g.link_libs, first_file);
+    let (_, missing) = crate::run::link_libraries(unsafe { &(*up).prog }, &g.link_libs, g.native.as_ref(), first_file);
     if !missing.is_empty() && crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
         eprintln!("makepad-run domain: libraries not found: {:?}", missing);
     }
@@ -1205,7 +1226,7 @@ pub fn start_in_run(spec: AppSpec) -> Result<DomainId, Vec<String>> {
 unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize], cfgs: &[crate::cfg::CfgSet], idents: &[u64], id: DomainId, reread: bool) -> Result<(u32, usize, Vec<String>, usize), Vec<String>> {
     use crate::modules::{Dep, NewCrate};
     let u = &mut *up;
-    let std_count = crate::std_pre_crates(&u.prog.session.clone()).len();
+    let std_count = crate::std_pre_crates(&u.prog.session.clone(), u.prog.std_simd).len();
     let std_deps: Vec<(String, Dep)> = (0..std_count).map(|k| (u.prog.syms.str(u.prog.crates[k].name).to_string(), Dep::Existing(k as u32))).collect();
     let mut crate_of = vec![u32::MAX; g.crates.len()];
     let mut batch_of = vec![usize::MAX; g.crates.len()];
@@ -1231,12 +1252,25 @@ unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize]
                 if let Some(path) = u.prog.file_paths.get(file) { current.insert((krate, path), file); }
             }
         }
+        // every changed file, with the bytes on disk now: the program's source registry keeps the
+        // first snapshot of a path for good (source ids name paths across revisions), so the new
+        // revision reads these through an overlay -- without it a second relaunch after an edit
+        // loaded the first relaunch's text again
+        let mut fresh: Vec<(String, Vec<u8>)> = Vec::new();
         for ((krate, path), file) in current {
-            if path.is_empty() || changed.contains(&krate) { continue; }
+            if path.is_empty() { continue; }
             let pf = &u.prog.files[file];
-            if !crate::vfs::read(path).is_ok_and(|src| src.as_slice() == &pf.src[..pf.src_len as usize]) {
-                changed.insert(krate);
+            match crate::vfs::read(path) {
+                Ok(src) if src.as_slice() == &pf.src[..pf.src_len as usize] => {}
+                Ok(src) => {
+                    changed.insert(krate);
+                    if !fresh.iter().any(|f| &f.0 == path) { fresh.push((path.clone(), src)); }
+                }
+                Err(_) => { changed.insert(krate); }
             }
+        }
+        for (path, src) in fresh {
+            u.prog.sources = std::sync::Arc::new(u.prog.sources.overlay(&path, src.into()));
         }
     }
     for &ci in order {

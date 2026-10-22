@@ -150,16 +150,23 @@ impl<'a> Cx<'a> {
         self.root.scope_tree.temporary_scope(e)
     }
 
+    /// The scope `e`'s temporaries die in from edition 2024, when that differs (the lint
+    /// `tail_expr_drop_order`).
+    pub(super) fn bid_scope(&self, e: ast::ExprId) -> Option<ScopeId> {
+        self.scope_of(Node::Expr(e.0), ScopeData::Node)?;
+        self.root.scope_tree.temp_lifetime(e).1
+    }
+
     // ---- arena
     pub(super) fn push(&mut self, expr: Expr) -> ExprId {
         self.thir.alloc_expr(expr)
     }
     /// An expression of `e`'s temporary scope and span.
     pub(super) fn mk(&self, e: ast::ExprId, kind: ExprKind, ty: TyId) -> Expr {
-        Expr { kind, ty, temp_scope: self.temp_scope(e), span: self.espan(e) }
+        Expr { kind, ty, temp_scope: self.temp_scope(e), bid: self.bid_scope(e), span: self.espan(e) }
     }
     pub(super) fn mk_at(&self, e: ast::ExprId, span: Span, kind: ExprKind, ty: TyId) -> Expr {
-        Expr { kind, ty, temp_scope: self.temp_scope(e), span }
+        Expr { kind, ty, temp_scope: self.temp_scope(e), bid: self.bid_scope(e), span }
     }
 
     // ---- generic arguments
@@ -214,6 +221,18 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// The liberated output of the function's signature when it names an opaque type (the body's value defines
+    /// it), as the borrow checker's universal regions have it.
+    fn declared_output(&self, def: crate::program::DefId) -> Option<TyId> {
+        let tcx = self.tcx();
+        let sig = tcx.fn_item_sig(self.prog(), def)?;
+        // (only an `impl Trait` output differs from the typeck's own, normalized signature)
+        if !tcx.tys.has_opaque(sig.ret) { return None; }
+        let late = |v: crate::types::BoundVar| tcx.tys.intern_region(crate::types::RegionKind::ReLateParam(crate::types::RegionScope::Item(def), crate::types::LateParamKind::Anon(v.0)));
+        let mut f = crate::types::fold::BoundVarReplacer::new(late, |_| panic!("signature bound type"));
+        Some(f.instantiate(&tcx.tys, sig.ret))
+    }
+
     // ---- bodies
     /// rustc `thir_body`.
     pub fn thir_body(mut self) -> BuildResult<ThirBody> {
@@ -255,15 +274,19 @@ impl<'a> Cx<'a> {
                     let root = self.closure_aggregate_at(crate::tcx::ASYNC_FN_BODY | body.0, None, body_span, coroutine_ty, Some(crate::mir::Movability::Static))?;
                     let expr = self.push(root);
                                 let ret_span = self.span(b.lo, b.lo);
-                    return Ok(ThirBody { thir: self.thir, params, expr, body_ty: BodyTy::Fn { output: tb.ret, rust_call: false }, span: item_span, ret_span, coroutine: None, fn_scopes: scopes, prologue: Vec::new() });
+                    let output = self.declared_output(self.owner.owner).unwrap_or(tb.ret);
+                    return Ok(ThirBody { thir: self.thir, params, expr, body_ty: BodyTy::Fn { output, rust_call: false }, span: item_span, ret_span, coroutine: None, fn_scopes: scopes, prologue: Vec::new() });
                 }
                 let b = ast.block(body);
                 let params = self.fn_params(sig, item.lo)?;
                 let block = self.mirror_block(body)?;
-                let root = Expr { kind: ExprKind::Block { block }, ty: tb.ret, temp_scope: None, span: self.span(b.lo, b.hi) };
+                let root = Expr { kind: ExprKind::Block { block }, ty: tb.ret, temp_scope: None, bid: None, span: self.span(b.lo, b.hi) };
                 let scopes = fn_scopes(&self, Node::Block(body.0), item_span)?;
                 let rust_call = false;
-                (params, self.push(root), BodyTy::Fn { output: tb.ret, rust_call }, item_span, self.span(b.lo, b.lo), scopes)
+                // the return place has the signature's declared output (an `impl Trait` stays the opaque type, which
+                // the body's value defines: rustc `construct_fn` takes `fn_sig.output()`)
+                let output = self.declared_output(self.owner.owner).unwrap_or(tb.ret);
+                (params, self.push(root), BodyTy::Fn { output, rust_call }, item_span, self.span(b.lo, b.lo), scopes)
             }
             OwnerKind::Const | OwnerKind::Static | OwnerKind::AssocConst => {
                 let init = match &item.kind {
@@ -290,7 +313,7 @@ impl<'a> Cx<'a> {
                 let Some(&ty) = tb.inline_const_types.get(&e.0) else { return self.unresolved(self.espan(e), "inline const type") };
                 let block = self.mirror_block(b)?;
                 let blk = ast.block(b);
-                let root = Expr { kind: ExprKind::Block { block }, ty, temp_scope: None, span: self.span(blk.lo, blk.hi) };
+                let root = Expr { kind: ExprKind::Block { block }, ty, temp_scope: None, bid: None, span: self.span(blk.lo, blk.hi) };
                 (Vec::new(), self.push(root), BodyTy::Const(ty), self.espan(e), self.espan(e), None)
             }
             OwnerKind::Closure(ce) if ce.0 & crate::tcx::ASYNC_FN_BODY != 0 => {
@@ -319,7 +342,7 @@ impl<'a> Cx<'a> {
                 let pat = self.binding_pat(task_context, "_task_context", resume_ty, true, item_span);
                 let resume = self.thir.alloc_param(Param { pat: Some(Box::new(pat)), ty: resume_ty, ty_span: None, self_kind: None, node: None });
                 let block = self.mirror_block(b)?;
-                let root = Expr { kind: ExprKind::Block { block }, ty: output, temp_scope: None, span: body_span };
+                let root = Expr { kind: ExprKind::Block { block }, ty: output, temp_scope: None, bid: None, span: body_span };
                 let kind = crate::mir::CoroutineKind::Desugared(crate::mir::CoroutineDesugaring::Async, crate::mir::CoroutineSource::Fn);
                 coroutine = Some(CoroutineThir { kind, yield_ty: tcx.tys.unit, resume_ty });
                 (vec![env, resume], self.push(root), BodyTy::Fn { output, rust_call: false }, item_span, self.span(blk.lo, blk.lo), scopes)
@@ -340,7 +363,7 @@ impl<'a> Cx<'a> {
                     let resume = self.thir.alloc_param(Param { pat: Some(Box::new(pat)), ty: resume_ty, ty_span: None, self_kind: None, node: None });
                     let block = self.mirror_block(b)?;
                     let blk = ast.block(b);
-                    let root = Expr { kind: ExprKind::Block { block }, ty: output, temp_scope: None, span: self.span(blk.lo, blk.hi) };
+                    let root = Expr { kind: ExprKind::Block { block }, ty: output, temp_scope: None, bid: None, span: self.span(blk.lo, blk.hi) };
                     let kind = crate::mir::CoroutineKind::Desugared(crate::mir::CoroutineDesugaring::Async, crate::mir::CoroutineSource::Block);
                     coroutine = Some(CoroutineThir { kind, yield_ty: tcx.tys.unit, resume_ty });
                     (vec![env, resume], self.push(root), BodyTy::Fn { output, rust_call: false }, ce_span, self.span(blk.lo, blk.lo), scopes)

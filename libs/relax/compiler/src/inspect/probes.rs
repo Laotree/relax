@@ -1,8 +1,10 @@
 //! Injected Rust probes (DESIGN.md §10a): an agent's Rust fn runs at a hook point of a running
-//! program. The probe is the agent's own text, loaded as a trusted run-time module (modules.rs:
-//! front, type check, compile) that depends on the hooked fn's crate and that crate's deps; it
-//! is not spliced into anything. Its `probe` fn takes the hooked fn's parameters (same order and
-//! types; a non-Copy by-value parameter is declared `ManuallyDrop<T>`: the same ABI and no drop),
+//! program. The probe is the agent's own text, compiled as a new private child module of the
+//! hooked fn's module (modules.rs load_in_module: front, type check, compile): the module's
+//! private items, its `use`s and `crate::` paths are the probe's, as for any child module with
+//! `use super::*`; it is not spliced into anything. Its `probe` fn takes the hooked fn's
+//! parameters (same order, types modulo lifetimes; a non-Copy by-value parameter is declared
+//! `ManuallyDrop<T>`: the same ABI and no drop),
 //! so the instrumented build of the hooked slot calls it with the slot's own parameter values.
 //! The call is guarded (a disabled probe is skipped) and an invoke whose unwind edge disables
 //! the probe and continues: a panicking probe never unwinds into the program.
@@ -39,8 +41,8 @@ struct Aggregates {
     emit_window: (u64, u64),
 }
 
-struct Probe {
-    id: u32,
+pub(super) struct Probe {
+    pub(super) id: u32,
     hook: String,
     /// the slots it is hooked into (empty: removed)
     slots: Mutex<Vec<u32>>,
@@ -126,6 +128,7 @@ fn text<'a>(p: *const u8, n: usize) -> &'a str {
 }
 
 pub extern "C" fn relax_probe_emit(t: *const u8, n: usize) {
+    let _k = crate::zone_alloc::kept();
     let Some(p) = current() else { return };
     let line = short(text(t, n), 1000);
     let send = {
@@ -152,10 +155,12 @@ pub extern "C" fn relax_probe_emit(t: *const u8, n: usize) {
 
 pub extern "C" fn relax_probe_count(k: *const u8, n: usize) {
     let Some(p) = current() else { return };
+    let _k = crate::zone_alloc::kept();
     *p.agg.lock().unwrap_or_else(|e| e.into_inner()).counts.entry(text(k, n).to_string()).or_default() += 1;
 }
 
 pub extern "C" fn relax_probe_hist(k: *const u8, n: usize, x: f64) {
+    let _k = crate::zone_alloc::kept();
     let Some(p) = current() else { return };
     let mut a = p.agg.lock().unwrap_or_else(|e| e.into_inner());
     let h = a.hists.entry(text(k, n).to_string()).or_default();
@@ -172,6 +177,7 @@ pub extern "C" fn relax_probe_hist(k: *const u8, n: usize, x: f64) {
 }
 
 pub extern "C" fn relax_probe_sample(k: *const u8, n: usize, t: *const u8, tn: usize, keep: usize) {
+    let _k = crate::zone_alloc::kept();
     let Some(p) = current() else { return };
     let mut a = p.agg.lock().unwrap_or_else(|e| e.into_inner());
     let e = a.samples.entry(text(k, n).to_string()).or_default();
@@ -199,7 +205,7 @@ pub extern "C" fn relax_probe_pause() {
 // ------------------------------------------------------------------ adding a probe
 
 /// The probe call at the hook (entry: line None) with the hooked fn's own parameters.
-pub(super) fn edit(f: &mut crate::rir::Func, u: &crate::jit::Unit, idx: u64, probe_slot: u32, line: Option<u32>) -> bool {
+pub(super) fn edit(f: &mut relax_backend::rir::Func, u: &crate::jit::Unit, idx: u64, probe_slot: u32, line: Option<u32>) -> bool {
     // where: block b before instruction k
     let (b, k) = match line {
         None => (0usize, 0usize),
@@ -219,15 +225,15 @@ pub(super) fn edit(f: &mut crate::rir::Func, u: &crate::jit::Unit, idx: u64, pro
             }
         }
     };
-    let args: Vec<crate::rir::VReg> = f.params.iter().copied().filter(|v| Some(*v) != f.sret).collect();
+    let args: Vec<relax_backend::rir::VReg> = f.params.iter().copied().filter(|v| Some(*v) != f.sret).collect();
     place_call(f, u, idx, probe_slot, b, k, args);
     true
 }
 
 /// A by-name probe's calls, lowered into the body already (lower.rs ProbePoint): each becomes the
 /// guarded invoke.
-pub(super) fn wrap_calls(f: &mut crate::rir::Func, u: &crate::jit::Unit, idx: u64, probe_slot: u32) -> bool {
-    use crate::rir::{Callee, Inst, Term};
+pub(super) fn wrap_calls(f: &mut relax_backend::rir::Func, u: &crate::jit::Unit, idx: u64, probe_slot: u32) -> bool {
+    use relax_backend::rir::{Callee, Inst, Term};
     let mut found = false;
     let mut b = 0;
     while b < f.blocks.len() {
@@ -251,8 +257,8 @@ pub(super) fn wrap_calls(f: &mut crate::rir::Func, u: &crate::jit::Unit, idx: u6
 
 /// In block `b` before instruction `k`: `enter` guard, the probe as an invoke with `args`, `leave`
 /// on the normal path, `failed` on the unwind path; both go on with the rest of the block.
-fn place_call(f: &mut crate::rir::Func, u: &crate::jit::Unit, idx: u64, probe_slot: u32, b: usize, k: usize, args: Vec<crate::rir::VReg>) {
-    use crate::rir::{Callee, Cls, Inst, Term};
+fn place_call(f: &mut relax_backend::rir::Func, u: &crate::jit::Unit, idx: u64, probe_slot: u32, b: usize, k: usize, args: Vec<relax_backend::rir::VReg>) {
+    use relax_backend::rir::{Callee, Cls, Inst, Term};
     let pos = f.blocks[b].pos.get(k).copied().unwrap_or(f.blocks[b].term_pos);
     let sym = |name: &'static str, a: u64| u.syms.intern(crate::syms::SymKind::Rt(name), a);
     let (enter, leave, failed) = (
@@ -312,8 +318,8 @@ fn by_name_params(u: &crate::jit::Unit, probe: crate::program::DefId) -> Option<
     }
     let mut out = Vec::new();
     for (n, t) in names.iter().zip(sig.params.iter()) {
-        match u.tcx.tys.kind(u.tcx.tys.erase_regions(*t)) {
-            TyKind::Ref(false, inner, _) => out.push((n.clone(), u.tcx.tys.erase_regions(*inner))),
+        match u.tcx.tys.kind(u.tcx.tys.erase_all_regions(*t)) {
+            TyKind::Ref(false, inner, _) => out.push((n.clone(), *inner)),
             _ => return None,
         }
     }
@@ -330,9 +336,26 @@ fn check_params(u: &crate::jit::Unit, hooked: u32, probe: crate::program::DefId,
     if ps.n_generics != 0 {
         return Err("the probe fn must not be generic".into());
     }
-    let hp: Vec<crate::types::TyId> = hs.params.iter().map(|t| u.tcx.tys.erase_regions(u.tcx.tys.subst(*t, gargs))).collect();
-    let pp: Vec<crate::types::TyId> = ps.params.iter().map(|t| u.tcx.tys.erase_regions(*t)).collect();
+    // types modulo regions (late-bound ones included: the probe's `&[u8]` is the hooked fn's
+    // `&'a [u8]`), aliases normalized: the same values in the same registers
+    let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
+    let key = |t: crate::types::TyId| u.tcx.tys.erase_all_regions(u.tcx.normalize_erasing_late_bound_regions(&u.prog, env, t));
+    let hp: Vec<crate::types::TyId> = hs.params.iter().map(|t| key(u.tcx.tys.subst(*t, gargs))).collect();
+    let pp: Vec<crate::types::TyId> = ps.params.iter().map(|t| key(*t)).collect();
     let show = |t: crate::types::TyId| crate::typeck::ty_to_string(false, &u.prog, &u.tcx, t);
+    // two types that print the same: where they differ (another crate revision of the same item,
+    // ...), with crate and definition ids
+    let differ = |h: crate::types::TyId, p: crate::types::TyId| {
+        let (a, b) = (show(h), show(p));
+        if a != b {
+            return (a, b);
+        }
+        let (a, b) = (crate::typeck::ty_to_string_paths(&u.prog, &u.tcx, h), crate::typeck::ty_to_string_paths(&u.prog, &u.tcx, p));
+        if a != b {
+            return (a, b);
+        }
+        (format!("{} (type #{})", a, h.0), format!("{} (type #{})", b, p.0))
+    };
     if hp.len() != pp.len() {
         let want: Vec<String> = hp.iter().map(|t| show(*t)).collect();
         return Err(format!("the probe takes {} parameter(s), the hooked fn {}: ({})", pp.len(), hp.len(), want.join(", ")));
@@ -344,7 +367,8 @@ fn check_params(u: &crate::jit::Unit, hooked: u32, probe: crate::program::DefId,
             _ => false,
         };
         if !same && !wrapped {
-            return Err(format!("parameter {}: the hooked fn has `{}`, the probe `{}`", k + 1, show(*h), show(*p)));
+            let (a, b) = differ(*h, *p);
+            return Err(format!("parameter {}: the hooked fn has `{}`, the probe `{}`", k + 1, a, b));
         }
         if same && u.needs_drop_glue(*h) {
             return Err(format!("parameter {}: `{}` is dropped by the hooked fn -- declare it `std::mem::ManuallyDrop<{}>` in the probe", k + 1, show(*h), show(*h)));
@@ -362,10 +386,9 @@ fn add(hook: &str, src: Vec<u8>, mutate: bool) -> Result<(Arc<Probe>, Vec<String
         return Err("no running unit".into());
     }
     let id = NEXT.fetch_add(1, SeqCst) as u32;
-    let dir = std::env::temp_dir().join(format!("relax-probes-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join(format!("probe_{}.rs", id));
-    std::fs::write(&path, &src).map_err(|e| format!("cannot stage the probe: {}", e))?;
+    let path = super::staged_path(&format!("probe_{}.rs", id));
+    // (on disk too: an error's line is the agent's own text)
+    let _ = std::fs::write(&path, &src);
     let hook = hook.to_string();
     let r = crate::owner::call_within(crate::owner::Class::App, 30_000, move || -> Result<(Arc<Probe>, Vec<String>), String> {
         let u = unsafe { &mut *up };
@@ -373,19 +396,18 @@ fn add(hook: &str, src: Vec<u8>, mutate: bool) -> Result<(Arc<Probe>, Vec<String
         if found.is_empty() {
             return Err(format!("no compiled fn or line matches `{}`", hook));
         }
-        // the module depends on the hooked fn's crate and that crate's deps
-        let krate = match &u.fns[found[0].0 as usize].key {
-            crate::jit::FnKey::Inst(d, _) => u.prog.def(*d).krate,
+        // the probe is a child module of the hooked fn's module: its private items, its `use`s
+        // and `crate::` paths are the probe's too
+        let scope = match &u.fns[found[0].0 as usize].key {
+            crate::jit::FnKey::Inst(d, _) => crate::modules::scope_of(u, *d),
             _ => return Err("the hooked slot is not a fn instance".into()),
         };
-        let mut deps = vec![u.prog.syms.str(u.prog.crates[krate as usize].name).to_string()];
-        deps.extend(u.prog.crates[krate as usize].deps.iter().map(|(n, _)| u.prog.syms.str(*n).to_string()));
-        let name = format!("relax_probe_{}", id);
-        let (pk, _, _) = unsafe { crate::modules::load_trusted(up, &name, &path.to_string_lossy(), &deps) }.map_err(|e| e.join("\n"))?;
+        let name = format!("__relax_probe_{}", id);
+        let v = u.prog.child_parse_snapshot(scope, &name, &path).parse(src).map_err(|e| format!("{}: {}", path, e))?;
+        let (child, _) = unsafe { crate::modules::load_in_module(up, scope, &name, v) }.map_err(|e| e.join("\n"))?;
         let u = unsafe { &mut *up };
-        let root = u.prog.crates[pk as usize].root_mod;
         let sym = u.prog.syms.get("probe").ok_or("the probe module has no `fn probe`")?;
-        let pd = *u.prog.mods[root as usize].values.get(&sym).ok_or("the probe module has no `fn probe`")?;
+        let pd = *u.prog.mods[child as usize].values.get(&sym).ok_or("the probe module has no `fn probe`")?;
         let probe_slot = u.fn_id(crate::jit::FnKey::Inst(pd, Vec::new()));
         let mut lines = Vec::new();
         let mut slots = Vec::new();
@@ -407,22 +429,10 @@ fn add(hook: &str, src: Vec<u8>, mutate: bool) -> Result<(Arc<Probe>, Vec<String
                 },
             }
         }
-        let p = Arc::new(Probe {
-            id,
-            hook: hook.clone(),
-            slots: Mutex::new(Vec::new()),
-            on: AtomicBool::new(true),
-            hits: AtomicU64::new(0),
-            ns: AtomicU64::new(0),
-            timed: AtomicU64::new(0),
-            failed: Mutex::new(None),
-            agg: Mutex::new(Aggregates::default()),
-        });
-        let idx = {
-            let mut ps = PROBES.lock().unwrap_or_else(|e| e.into_inner());
-            ps.push(p.clone());
-            ps.len() as u64 - 1
-        };
+        // the probe's record and the edits that name it are kept state: they outlive the
+        // compiler arena (a settle swap destroys it; the probe code keeps calling in)
+        let _kept = crate::zone_alloc::kept();
+        let (p, idx) = register_probe(id, &hook);
         for (slot, line) in ok {
             let fname = u.fns[slot as usize].name.clone();
             let edit = match (&by_name, line) {
@@ -445,6 +455,73 @@ fn add(hook: &str, src: Vec<u8>, mutate: bool) -> Result<(Arc<Probe>, Vec<String
         Ok((p, lines))
     });
     r.unwrap_or_else(|| Err(format!("the owner did not take the request in 30 s ({})", crate::owner::serving_note())))
+}
+
+pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
+    let Ok(ps) = PROBES.try_lock() else { return };
+    a.field("inspect.probes");
+    a.vec(&ps);
+    for p in ps.iter() {
+        a.arc(p);
+        a.string(&p.hook);
+        if let Ok(s) = p.slots.try_lock() {
+            a.vec(&s);
+        }
+        if let Ok(g) = p.agg.try_lock() {
+            a.map(&g.counts, |a, k, _| a.string(k));
+            a.map(&g.hists, |a, k, _| a.string(k));
+            a.map(&g.samples, |a, k, v| {
+                a.string(k);
+                a.vec(&v.1);
+                for x in &v.1 {
+                    a.string(x);
+                }
+            });
+        }
+    }
+}
+
+/// A new probe's record (its index): kept state whatever the caller's phase.
+fn register_probe(id: u32, hook: &str) -> (Arc<Probe>, u64) {
+    let _k = crate::zone_alloc::kept();
+    let p = Arc::new(Probe {
+        id,
+        hook: hook.to_string(),
+        slots: Mutex::new(Vec::new()),
+        on: AtomicBool::new(true),
+        hits: AtomicU64::new(0),
+        ns: AtomicU64::new(0),
+        timed: AtomicU64::new(0),
+        failed: Mutex::new(None),
+        agg: Mutex::new(Aggregates::default()),
+    });
+    let mut ps = PROBES.lock().unwrap_or_else(|e| e.into_inner());
+    ps.push(p.clone());
+    (p, ps.len() as u64 - 1)
+}
+
+#[cfg(test)]
+pub(super) fn register_probe_for_test(id: u32, hook: &str) -> (Arc<Probe>, u64) {
+    register_probe(id, hook)
+}
+
+/// Any live injected probe?
+pub fn any() -> bool {
+    PROBES.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.on.load(Relaxed))
+}
+
+/// The live probes' counters: ("P<n> <hook>", hits, ns estimated from the timed hits) and their
+/// `count` keys ("P<n> count <key>", n, 0).
+pub fn counters(out: &mut Vec<(String, u64, u64)>) {
+    let ps: Vec<Arc<Probe>> = PROBES.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|p| p.on.load(Relaxed)).cloned().collect();
+    for p in ps {
+        let (hits, ns, timed) = (p.hits.load(Relaxed), p.ns.load(Relaxed), p.timed.load(Relaxed));
+        out.push((format!("P{} {}", p.id, p.hook), hits, if timed > 0 { ns * hits / timed } else { 0 }));
+        let a = p.agg.lock().unwrap_or_else(|e| e.into_inner());
+        for (k, v) in a.counts.iter() {
+            out.push((format!("P{} count {}", p.id, k), *v, 0));
+        }
+    }
 }
 
 fn remove(id: Option<u32>) -> usize {
@@ -501,14 +578,16 @@ fn read_json(p: &Probe) -> Vec<String> {
 pub fn cmd(req: &Req, out: &mut Out) {
     match req.pos.first().map(String::as_str).unwrap_or("list") {
         "add" => {
-            let (Some(hook), Some(src)) = (req.pos.get(1), req.pos.get(2)) else {
+            // the client sends the code (or a file's path) as `code`; a typed line has it as words
+            let src = req.get("code").map(str::to_string).or_else(|| (req.pos.len() > 2).then(|| req.pos[2..].join(" ")));
+            let (Some(hook), Some(src)) = (req.pos.get(1), src) else {
                 out.err("usage: probe add <fn|file:line> <probe.rs file | code with `fn probe(..)`> [mutate=1]");
                 return;
             };
-            // a file path, else the rest of the line is the code
-            let code = match std::fs::read(src) {
+            // a file path, else the code itself
+            let code = match std::fs::read(src.trim()) {
                 Ok(b) => b,
-                Err(_) => req.pos[2..].join(" ").into_bytes(),
+                Err(_) => src.into_bytes(),
             };
             match add(hook, code, req.get("mutate") == Some("1")) {
                 Ok((p, lines)) => {

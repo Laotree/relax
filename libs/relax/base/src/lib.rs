@@ -6,7 +6,6 @@
 
 #![recursion_limit = "1024"]
 
-pub use relax_codegen::{arm64, exec_census, fncost, warm, opt, regalloc, rir, x64};
 
 pub mod fxhash;
 pub mod memstat;
@@ -15,6 +14,7 @@ pub mod conc;
 pub mod pool;
 pub mod query;
 pub mod preempt;
+pub mod stack;
 pub mod arena;
 pub mod json;
 pub mod diag;
@@ -29,6 +29,7 @@ pub mod vfs;
 pub mod packsrc;
 pub mod progress;
 pub mod run_state;
+pub mod boot_stats;
 pub mod dirs;
 pub use relax_lex::tokens as pm_tokens;
 pub mod pm;

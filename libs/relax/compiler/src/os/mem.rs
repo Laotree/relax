@@ -9,8 +9,6 @@
 //! - `alloc_rw(len)`: zeroed read-write pages; `free(addr, len)` returns them.
 //! - `write_code(addr, bytes)`: copies machine code into code memory (macOS: through the
 //!   writable view; aarch64 Linux/Android: a plain copy, then the icache flush).
-//! - `stack_segment(len)` / `call_on_segment`: a fresh stack with a guard page at its low end
-//!   for the compiler's deep recursions (jit.rs ensure_sufficient_stack).
 
 include!("../rt_abi.rs");
 pub use imp::*;
@@ -90,12 +88,20 @@ fn refuse_code(what: &str, addr: u64, len: usize) -> ! {
     panic!("makepad run: no-codegen mode: {} of {} bytes at {:#x} (machine code is not allowed in this mode)", what, len, addr)
 }
 
-/// A stack segment: usable [lo, top), mapped [base, base + len).
-pub struct Segment {
-    pub base: usize,
-    pub len: usize,
-    pub lo: usize,
-    pub top: usize,
+/// Replaces the 8 code bytes at `addr` (8-aligned) with one atomic store: a thread executing
+/// them meanwhile runs the old or the new instruction, never a mix (x64 thunk heads).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub unsafe fn patch_code_u64(addr: u64, w: u64) {
+    debug_assert!(addr & 7 == 0, "patch_code_u64: unaligned {:#x}", addr);
+    fill_code(addr, 8, |b| (*(b.as_mut_ptr() as *const std::sync::atomic::AtomicU64)).store(w, std::sync::atomic::Ordering::Release));
+}
+
+/// Replaces the instruction at `addr` (4-aligned) with one atomic store, then makes the
+/// instruction cache see it (arm64 thunk heads: a `b` may be modified while it runs).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub unsafe fn patch_code_u32(addr: u64, w: u32) {
+    debug_assert!(addr & 3 == 0, "patch_code_u32: unaligned {:#x}", addr);
+    fill_code(addr, 4, |b| (*(b.as_mut_ptr() as *const std::sync::atomic::AtomicU32)).store(w, std::sync::atomic::Ordering::Release));
 }
 
 #[cfg(unix)]
@@ -181,59 +187,11 @@ mod unix {
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let _ = (addr, len);
     }
-
-    /// Guard bytes below a stack segment.
-    const GUARD: usize = 16384;
-
-    pub fn stack_segment(len: usize) -> Option<super::Segment> {
-        let seg = unsafe { mmap(std::ptr::null_mut(), len, PROT_RW, MAP_PRIVATE_ANON, -1, 0) };
-        if seg as isize == -1 {
-            return None;
-        }
-        // a guard page at the low end: an overflow faults instead of writing below the segment
-        unsafe { mprotect(seg, GUARD, 0) };
-        crate::memstat::name_mapping(seg as usize, len, c"makepad-run-stack");
-        Some(super::Segment { base: seg as usize, len, lo: seg as usize + GUARD, top: (seg as usize + len) & !15 })
-    }
-
-    pub fn free_segment(s: super::Segment) {
-        free(s.base as u64, s.len);
-    }
-
-    /// Calls `f(data)` with the stack pointer at the segment's top, back on this stack after.
-    #[inline(never)]
-    pub unsafe fn call_on_segment(s: &super::Segment, f: extern "C" fn(*mut u8), data: *mut u8) {
-        let sp = s.top;
-        #[cfg(target_arch = "aarch64")]
-        std::arch::asm!(
-            "mov x20, sp",
-            "mov sp, {sp}",
-            "blr {f}",
-            "mov sp, x20",
-            sp = in(reg) sp,
-            f = in(reg) f,
-            in("x0") data,
-            out("x20") _,
-            clobber_abi("C"),
-        );
-        #[cfg(target_arch = "x86_64")]
-        std::arch::asm!(
-            "mov r12, rsp",
-            "mov rsp, {sp}",
-            "call {f}",
-            "mov rsp, r12",
-            sp = in(reg) sp,
-            f = in(reg) f,
-            in("rdi") data,
-            out("r12") _,
-            clobber_abi("C"),
-        );
-    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp {
-    pub use super::unix::{alloc_rw, call_on_segment, commit, free, free_segment, mem_fns, prefault, stack_segment, CODE_TAIL};
+    pub use super::unix::{alloc_rw, commit, free, mem_fns, prefault, CODE_TAIL};
     use super::unix::{mprotect, PROT_RWX};
 
     pub fn reserve(code: usize, rest: usize) -> u64 {
@@ -250,6 +208,22 @@ mod imp {
             panic!("reservation: mprotect RWX failed");
         }
         base
+    }
+
+    /// `reserve` at exactly `at` (the wasm32 web target's window, web32.rs); 0 when the range is
+    /// taken.
+    pub fn reserve_at(at: u64, code: usize, rest: usize) -> u64 {
+        const MAP_FIXED_NOREPLACE: i32 = 0x100000;
+        let p = unsafe { super::unix::mmap(at as *mut u8, code + rest, super::unix::PROT_RW, super::unix::MAP_PRIVATE_ANON | MAP_FIXED_NOREPLACE, -1, 0) };
+        if p as isize == -1 || p as u64 != at {
+            return 0;
+        }
+        crate::memstat::name_mapping(at as usize, code, c"makepad-run-jit-code");
+        crate::memstat::name_mapping(at as usize + code, rest, c"makepad-run-jit-data");
+        if unsafe { mprotect(at as *mut u8, code, PROT_RWX) } != 0 {
+            panic!("reservation: mprotect RWX failed");
+        }
+        at
     }
 
     /// Gives a reservation back.
@@ -313,7 +287,7 @@ mod imp {
 /// that call.
 #[cfg(target_os = "macos")]
 mod imp {
-    pub use super::unix::{alloc_rw, call_on_segment, commit, free, free_segment, mem_fns, prefault, stack_segment, CODE_TAIL};
+    pub use super::unix::{alloc_rw, commit, free, mem_fns, prefault, CODE_TAIL};
     use super::unix::mprotect;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -378,6 +352,25 @@ mod imp {
             }
             let at = code_alloc_at(code, base);
             assert_eq!(at, base, "reservation: code view not at the base");
+            base
+        }
+    }
+
+    /// `reserve` at exactly `at` (the wasm32 web target's window, web32.rs); 0 when the range is
+    /// taken.
+    pub fn reserve_at(at: u64, code: usize, rest: usize) -> u64 {
+        const VM_FLAGS_FIXED: i32 = 0;
+        unsafe {
+            let task = mach_task_self();
+            let mut base: u64 = at;
+            if mach_vm_allocate(task, &mut base, (code + rest) as u64, VM_FLAGS_FIXED) != 0 || base != at {
+                return 0;
+            }
+            if super::no_codegen() {
+                return base;
+            }
+            let c = code_alloc_at(code, base);
+            assert_eq!(c, base, "reservation: code view not at the base");
             base
         }
     }
@@ -675,53 +668,5 @@ mod imp {
     /// memcpy / memmove / memset in Relax's convention (SysV): the C runtime's are Win64.
     pub fn mem_fns() -> (u64, u64, u64) {
         (rt_memcpy as *const () as usize as u64, rt_memmove as *const () as usize as u64, rt_memset as *const () as usize as u64)
-    }
-
-    const GUARD: usize = 65536;
-
-    /// A committed segment with a no-access guard at its low end.
-    pub fn stack_segment(len: usize) -> Option<super::Segment> {
-        let seg = unsafe { VirtualAlloc(std::ptr::null_mut(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
-        if seg.is_null() {
-            return None;
-        }
-        let mut old = 0u32;
-        unsafe { VirtualProtect(seg, GUARD, PAGE_NOACCESS, &mut old) };
-        Some(super::Segment { base: seg as usize, len, lo: seg as usize + GUARD, top: (seg as usize + len) & !15 })
-    }
-
-    pub fn free_segment(s: super::Segment) {
-        free(s.base as u64, s.len);
-    }
-
-    /// Calls `f(data)` (Win64: data in rcx, 32 bytes of shadow space) on the segment. The TEB's
-    /// stack bounds (NT_TIB StackBase gs:[8], StackLimit gs:[16], DeallocationStack gs:[0x1478])
-    /// describe the segment for the call: the exception dispatcher and RtlUnwindEx check frames
-    /// against them (a Rust panic caught inside `f` unwinds there), as for a fiber's stack.
-    #[inline(never)]
-    pub unsafe fn call_on_segment(s: &super::Segment, f: extern "C" fn(*mut u8), data: *mut u8) {
-        std::arch::asm!(
-            "push qword ptr gs:[8]",
-            "push qword ptr gs:[16]",
-            "push qword ptr gs:[0x1478]",
-            "mov r12, rsp",
-            "mov gs:[8], {top}",
-            "mov gs:[16], {lo}",
-            "mov gs:[0x1478], {base}",
-            "mov rsp, {top}",
-            "sub rsp, 32",
-            "call {f}",
-            "mov rsp, r12",
-            "pop qword ptr gs:[0x1478]",
-            "pop qword ptr gs:[16]",
-            "pop qword ptr gs:[8]",
-            top = in(reg) s.top,
-            lo = in(reg) s.lo,
-            base = in(reg) s.base,
-            f = in(reg) f,
-            in("rcx") data,
-            out("r12") _,
-            clobber_abi("C"),
-        );
     }
 }

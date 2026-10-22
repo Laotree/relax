@@ -382,7 +382,10 @@ pub fn take() -> (Vec<String>, Vec<String>) {
     let all = std::mem::take(&mut *SINK.lock().unwrap_or_else(|e| e.into_inner()));
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
+    // (a diagnostic reported twice -- a body checked again by the second borrowck -- is one)
+    let mut seen = std::collections::HashSet::new();
     for (l, s) in all {
+        if !seen.insert(s.clone()) { continue; }
         if l >= Level::Deny { errors.push(s) } else { warnings.push(s) }
     }
     (errors, warnings)
@@ -415,7 +418,7 @@ pub fn check_literals(prog: &Program, tcx: &crate::tcx::Tcx, body: &crate::typec
         let neg = negated.contains(&e.0);
         match (kind, tcx.tys.kind(t)) {
             (LitKind::Int, TyKind::Int(p)) => {
-                let (bytes, signed) = crate::types::Types::int_info(*p);
+                let (bytes, signed) = tcx.tys.int_info(*p);
                 let Some(v) = crate::const_fold::parse_int_lit(text) else { continue };
                 let bits = bytes * 8;
                 let (max, min_abs) = if signed { ((1u128 << (bits - 1)) - 1, 1u128 << (bits - 1)) } else { (if bits == 128 { u128::MAX } else { (1u128 << bits) - 1 }, 0) };
@@ -544,6 +547,44 @@ fn stmt_attrs_around(prog: &Program, owner: DefId, file: u32, item: crate::ast::
     f.found.unwrap_or_default()
 }
 
+/// The attributes of the statements, arms and blocks around the expression the macro call written at
+/// `call` expanded to, in the body of `owner` (outermost first): rustc's lint level builder sees them
+/// at the call's expansion.
+pub fn attrs_at_call(prog: &Program, owner: DefId, file: u32, call: u32) -> Vec<Attr> {
+    use crate::ast::*;
+    use crate::ast_visit::{self, Visitor};
+    struct Find<'a> { ast: &'a Ast, pf: &'a crate::parser::ParsedFile, call: u32, stack: Vec<Attr>, found: Option<Vec<Attr>> }
+    impl<'a> Visitor<'a> for Find<'a> {
+        fn ast(&self) -> &'a Ast { self.ast }
+        fn enter_attrs(&mut self, attrs: List<Attr>) { self.stack.extend_from_slice(self.ast.list(attrs)); }
+        fn leave_attrs(&mut self, attrs: List<Attr>) {
+            let n = self.ast.list(attrs).len();
+            self.stack.truncate(self.stack.len() - n);
+        }
+        fn expr(&mut self, e: ExprId) {
+            if self.found.is_some() { return; }
+            let lo = self.ast.expr(e).lo;
+            if lo as usize >= self.pf.src_len as usize && self.pf.diagnostic_pos(lo) == self.call { self.found = Some(self.stack.clone()); return; }
+            ast_visit::walk_expr(self, e);
+        }
+    }
+    let od = prog.def(owner);
+    if od.file != file || od.item.0 == u32::MAX { return Vec::new(); }
+    let pf = &prog.files[od.file as usize];
+    let ast = &pf.ast;
+    let mut f = Find { ast, pf, call: pf.diagnostic_pos(call), stack: Vec::new(), found: None };
+    match ast.item(od.item).kind {
+        ItemKind::Fn(..) => {
+            if let Ok(Some(b)) = prog.fn_body(od.file, od.item) { f.block(b); }
+        }
+        ItemKind::Const(..) | ItemKind::Static(..) => {
+            if let Ok(Some(e)) = prog.const_body(od.file, od.item) { f.expr(e); }
+        }
+        _ => {}
+    }
+    f.found.unwrap_or_default()
+}
+
 /// Whether impl `d` is the output of `#[derive]` (`#[automatically_derived]`; Relax expands
 /// derives as built-in macro output).
 pub fn is_automatically_derived(prog: &Program, d: DefId) -> bool {
@@ -631,6 +672,32 @@ pub fn privacy_diag(prog: &Program, file: u32, pos: u32, e: &crate::program::Pri
         emit(prog, def, &AMBIGUOUS_GLOB_IMPORTS, file, pos, &format!("`{n}` is ambiguous"));
     }
     None
+}
+
+pub const AMBIGUOUS_IMPORT_VISIBILITIES: Lint = lint("ambiguous_import_visibilities");
+
+/// What rustc's import resolution reports beyond Relax's own import errors (the replay in
+/// front's program/rsim.rs): errors, and the lints `ambiguous_glob_imports` /
+/// `ambiguous_import_visibilities` under the levels in force at the import.
+pub fn import_resolution_diags(prog: &mut Program, own: &[bool]) -> Vec<String> {
+    use relax_front::program::SimKind;
+    let mut errors = Vec::new();
+    if prog.sim_diags.is_none() { prog.own_crates = own.to_vec(); prog.run_import_sim(own); }
+    let diags = prog.sim_diags.take().unwrap_or_default();
+    let prog: &Program = prog;
+    for d in diags {
+        match d.kind {
+            SimKind::Error if d.msg.starts_with("E0") => errors.push(prog.record_error(d.file, d.pos, "resolve", d.msg)),
+            SimKind::Error => errors.push(prog.record_uncoded_error(d.file, d.pos, "resolve", d.msg)),
+            SimKind::Lint(name) => {
+                if !enabled() { continue; }
+                let def = def_at(prog, d.file, d.pos);
+                let l = match name { "ambiguous_import_visibilities" => AMBIGUOUS_IMPORT_VISIBILITIES, _ => AMBIGUOUS_GLOB_IMPORTS };
+                emit(prog, def, &l, d.file, d.pos, &d.msg);
+            }
+        }
+    }
+    errors
 }
 
 #[cfg(test)]

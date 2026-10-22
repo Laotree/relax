@@ -57,6 +57,8 @@ pub struct FnSigT {
     pub is_const: bool,
     /// Explicit promotion permission, from the resolved definition's attribute.
     pub rustc_promotable: bool,
+    /// `#[rustc_intrinsic]` (rustc `tcx.intrinsic(def_id)`): not coercible to a function pointer
+    pub rustc_intrinsic: bool,
     pub header: FnHeader,
     /// `#[track_caller]`: takes the caller's `&'static Location` as an implicit last argument
     /// (rustc's implicit caller-location parameter)
@@ -137,6 +139,8 @@ impl AdtFlags {
     pub const IS_UNSAFE_PINNED: Self = Self(1 << 7);
     pub const HAS_CTOR: Self = Self(1 << 8);
     pub const IS_VARIANT_LIST_NON_EXHAUSTIVE: Self = Self(1 << 9);
+    /// `#[repr(simd)]`: a vector type (layout: size rounded up to a power of two, aligned to it)
+    pub const IS_SIMD: Self = Self(1 << 10);
     pub fn contains(self, flag: Self) -> bool { self.0 & flag.0 == flag.0 }
     fn insert(&mut self, flag: Self) { self.0 |= flag.0; }
 }
@@ -145,6 +149,7 @@ impl AdtT {
     pub fn is_enum(&self) -> bool { self.flags.contains(AdtFlags::IS_ENUM) }
     pub fn is_union(&self) -> bool { self.flags.contains(AdtFlags::IS_UNION) }
     pub fn is_struct(&self) -> bool { self.flags.contains(AdtFlags::IS_STRUCT) }
+    pub fn is_simd(&self) -> bool { self.flags.contains(AdtFlags::IS_SIMD) }
     pub fn is_box(&self) -> bool { self.flags.contains(AdtFlags::IS_BOX) }
     pub fn is_phantom_data(&self) -> bool { self.flags.contains(AdtFlags::IS_PHANTOM_DATA) }
     pub fn is_manually_drop(&self) -> bool { self.flags.contains(AdtFlags::IS_MANUALLY_DROP) }
@@ -245,6 +250,12 @@ pub struct Tcx {
     /// `mir_coroutine_witnesses` reduced to what dropck asks (whether any local live across a suspension
     /// point needs drop), per coroutine (file, expr), set when borrowck has built the coroutine's MIR.
     pub coroutine_witness_needs_drop: crate::conc::MemoMap<(u32, u32), bool>,
+    /// `coroutine_hidden_types` (rustc mir_coroutine_witnesses): the regions-erased types of the locals live
+    /// across any suspension point, per coroutine (file, expr), in terms of its owner's generics.
+    pub coroutine_hidden_types: crate::conc::MemoMap<(u32, u32), std::sync::Arc<Vec<TyId>>>,
+    /// `TypeckResults::coroutine_stalled_predicates`, per typeck root: the goals that were stalled on a
+    /// coroutine of that body (regions erased), proven once the coroutines' witnesses are known.
+    pub coroutine_stalled_predicates: relax_session::sync::Mutex<crate::fxhash::HashMap<DefId, Vec<(crate::next_solver::Goal, u32)>>>,
     /// a coroutine type's saved locals after its upvars: (end offset, alignment), made when its
     /// poll function is lowered (coroutine_transform)
     pub coro_frames: crate::conc::MemoMap<TyId, (u32, u32)>,
@@ -415,6 +426,8 @@ impl Tcx {
             destructor_impls: Default::default(),
             coroutines: crate::conc::MemoMap::with_bits(10),
             coroutine_witness_needs_drop: crate::conc::MemoMap::with_bits(10),
+            coroutine_hidden_types: crate::conc::MemoMap::new_kept(10),
+            coroutine_stalled_predicates: Default::default(),
             coro_frames: Default::default(),
             coro_shapes: Default::default(),
             coro_slot_ty: Default::default(),
@@ -772,6 +785,7 @@ impl Tcx {
     /// Collects impls and ADTs; registers functions and constants for their declaration
     /// queries. Coherence is not checked (check_coherence / report_coherence).
     pub fn collect_declarations(&mut self, prog: &Program) {
+        self.tys.ptr_bytes = prog.ptr_bytes;
         self.declarations = Default::default();
         self.queries.register_files(prog.files.len());
         self.queries.register_crates(prog.crates.len());
@@ -1401,6 +1415,7 @@ impl Tcx {
                         n_parent_generics: if adt.is_enum { n } else { 0 },
                         is_const: false,
                         rustc_promotable: false,
+                        rustc_intrinsic: false,
                         header: FnHeader::RUST,
                         track_caller: false,
                         target_features: Vec::new(),
@@ -1425,7 +1440,8 @@ impl Tcx {
         let it = ast.item(def.item);
         let mut repr_c = false;
         let mut repr_int = None;
-        let (repr_align, repr_packed) = read_repr(prog, file, ast.list(it.attrs), &mut repr_c, &mut repr_int);
+        let mut repr_simd = false;
+        let (repr_align, repr_packed) = read_repr(prog, file, ast.list(it.attrs), &mut repr_c, &mut repr_int, &mut repr_simd);
         let (valid_start, valid_end, no_niche) = read_layout_attrs(prog, file, ast.list(it.attrs));
         let param_maybe_unsized = match &it.kind {
             k @ (ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Union(_)) => maybe_unsized_params(prog, file, ast.kind_generics(k).unwrap()),
@@ -1438,6 +1454,9 @@ impl Tcx {
         };
         if matches!(it.kind, ItemKind::Struct(r) if matches!(ast.row(r).data, VariantData::Unit | VariantData::Tuple(_))) {
             flags.insert(AdtFlags::HAS_CTOR);
+        }
+        if repr_simd && matches!(it.kind, ItemKind::Struct(..)) {
+            flags.insert(AdtFlags::IS_SIMD);
         }
         if matches!(it.kind, ItemKind::Enum(..)) && crate::lang_items::has_attr(prog, file, ast.list(it.attrs), "non_exhaustive") {
             flags.insert(AdtFlags::IS_VARIANT_LIST_NON_EXHAUSTIVE);
@@ -1539,7 +1558,9 @@ impl Tcx {
 
     #[cold]
     fn init_signature<'a>(&'a self, prog: &Program, d: DefId, cell: &'a std::sync::OnceLock<Box<SigParts>>) -> &'a SigParts {
-        cell.get_or_init(|| {
+        // (computed outside the cell's Once: relax_base::query::init_once)
+        let diagnostics = std::cell::Cell::new(None);
+        let value: &Box<_> = crate::query::init_once(cell, || {
             if crate::why::enabled() && prog.files.get(prog.def(d).file as usize)
                 .and_then(|f| f.ast.items.get(prog.def(d).item.0 as usize)).is_some() {
                 let cause = prog.why_def(d, "signature-demand");
@@ -1551,16 +1572,19 @@ impl Tcx {
             typing_env.limit = RecursionLimit::for_item(prog, d);
             let cx = EvalCx::new(prog, self, typing_env, &state);
             let checkpoint = self.dcx.checkpoint();
-            let mut parts = self.sig_parts_captured(&cx, prog, d);
+            let parts = self.sig_parts_captured(&cx, prog, d);
             if !parts.errors.is_empty() { cx.errors().note_reported_error(); }
-            let (errors, warnings) = cx.errors().take_since(checkpoint);
+            diagnostics.set(Some(cx.errors().take_since(checkpoint)));
+            Box::new(parts)
+        }, |parts| {
+            let (errors, warnings) = diagnostics.take().unwrap_or_default();
             for error in errors {
                 let owner = if error.cause.body_id == NO_DEF { d } else { error.cause.body_id };
                 parts.errors.push(prog.record_error(prog.def(owner).file, error.cause.span, "signature", error.message));
             }
             for warning in warnings { eprintln!("warning: {}", warning.message); }
-            Box::new(parts)
-        })
+        });
+        value
     }
 
     /// fn_sig(d).header.abi without lowering the signature: lower_fn_header reads it from
@@ -1975,6 +1999,9 @@ impl Tcx {
                 rustc_promotable: sig.konst && ast.list(ast.item(def.item).attrs).iter().any(|a| {
                     a.toks.hi > a.toks.lo && crate::cfg::tok_str(prog.src(file), a.toks.lo as usize) == b"rustc_promotable"
                 }),
+                rustc_intrinsic: ast.list(ast.item(def.item).attrs).iter().any(|a| {
+                    a.toks.hi > a.toks.lo && crate::cfg::tok_str(prog.src(file), a.toks.lo as usize) == b"rustc_intrinsic"
+                }),
                 header,
                 track_caller: {
                     let has = |d2: DefId| {
@@ -2181,7 +2208,9 @@ impl Tcx {
 
     #[cold]
     fn init_const_decl<'a>(&'a self, prog: &Program, d: DefId, cell: &'a std::sync::OnceLock<Box<ConstDecl>>) -> &'a ConstDecl {
-        cell.get_or_init(|| {
+        // (computed outside the cell's Once: relax_base::query::init_once)
+        let diagnostics = std::cell::Cell::new(None);
+        let value: &Box<_> = crate::query::init_once(cell, || {
             let _mem = crate::memstat::tag(crate::memstat::Tag::Sigs);
             let state = EvalState::new();
             let cx = EvalCx::new(prog, self, TypingEnv::fully_monomorphized(prog), &state);
@@ -2193,14 +2222,17 @@ impl Tcx {
             crate::program::missing_restore(enclosing);
             decl.errors = cx.state.errors.replace(outer).unwrap_or_default();
             if !decl.errors.is_empty() { cx.errors().note_reported_error(); }
-            let (errors, warnings) = cx.errors().take_since(checkpoint);
+            diagnostics.set(Some(cx.errors().take_since(checkpoint)));
+            Box::new(decl)
+        }, |decl| {
+            let (errors, warnings) = diagnostics.take().unwrap_or_default();
             for error in errors {
                 let owner = if error.cause.body_id == NO_DEF { d } else { error.cause.body_id };
                 decl.errors.push(prog.record_error(prog.def(owner).file, error.cause.span, "signature", error.message));
             }
             for warning in warnings { eprintln!("warning: {}", warning.message); }
-            Box::new(decl)
-        })
+        });
+        value
     }
 
     fn const_decl_uncached(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, d: DefId) -> ConstDecl {
@@ -2249,7 +2281,17 @@ impl Tcx {
             ast::Ty::Array(x, n) => {
                 let inner = self.lower_ty(cx, prog, file, module, env, *x);
                 if is_infer_len(ast, *n) {
-                    let length = match cx.infcx { Some(infcx) => infcx.next_const_var(), None => self.tys.intern_const(crate::consts::ConstKind::Error) };
+                    let length = match cx.infcx {
+                        Some(infcx) => infcx.next_const_var(),
+                        None => {
+                            // ItemCtxt::ct_infer: no `_` length in an item's signature either
+                            if self.validates(prog, file) {
+                                let pos = env.owner.filter(|o| prog.def(*o).file == file).map_or(0, |o| ast.item(prog.def(o).item).lo);
+                                self.err(cx, prog, file, pos, "E0121: the placeholder `_` is not allowed within types on item signatures".to_string());
+                            }
+                            self.tys.intern_const(crate::consts::ConstKind::Error)
+                        }
+                    };
                     return self.tys.mk_array(inner, length);
                 }
                 let lt = self.lower_const_arg(prog, file, env, *n, self.tys.usize_);
@@ -2358,11 +2400,11 @@ impl Tcx {
         if let (Some(literal), TyKind::Int(prim)) = (literal, self.tys.kind(expected_ty)) {
             let le = pf.ast.expr(literal);
             let text = std::str::from_utf8(pf.bytes(le.lo, le.hi)).unwrap_or("");
-            let (bytes, signed) = crate::types::Types::int_info(*prim);
+            let (bytes, signed) = self.tys.int_info(*prim);
             let matches = match crate::const_fold::int_suffix(text) {
                 None => signed || !neg,
                 Some(suffix) => crate::program::PRIMS.iter().find(|(n, _)| *n == suffix)
-                    .is_some_and(|(_, p)| crate::types::Types::int_info(*p) == (bytes, signed) && (signed || !neg)),
+                    .is_some_and(|(_, p)| self.tys.int_info(*p) == (bytes, signed) && (signed || !neg)),
             };
             if let (true, Some(value)) = (matches, crate::const_fold::parse_int_lit(text)) {
                 let value = if neg { value.wrapping_neg() } else { value };
@@ -2540,7 +2582,11 @@ impl Tcx {
             predicate_env.regions = env.regions.with_binder(Some(resolve_bound_vars::BinderId::Trait(path.segs.lo)));
             let env = &predicate_env;
             let regions = self.lower_region_args(cx.infcx, prog, file, module, env, path);
-            let region = self.object_region_with_bounds(cx.infcx, prog, file, outer_env, bounds, td, regions, source_ty);
+            let mut ambiguous = false;
+            let region = self.object_region_with_bounds(cx.infcx, prog, file, outer_env, bounds, td, regions, source_ty, &mut ambiguous);
+            if ambiguous && self.validates(prog, file) {
+                self.err(cx, prog, file, lo, "E0227: ambiguous lifetime bound, explicit lifetime bound required".to_string());
+            }
             self.report_indeterminate_object_default(cx, prog, file, outer_env, region, source_ty, lo);
             let last = f.ast.segs(path.segs).last().unwrap();
             if !matches!(f.ast.gargs(last.args()), Some(GenericArgs::Paren(..))) {
@@ -3324,6 +3370,13 @@ impl Tcx {
                     let last = prog.files[file as usize].text(ast.segs(p.segs)[p.segs.len() - 1].name);
                     let parent = prog.files[file as usize].text(ast.segs(p.segs)[p.segs.len() - 2].name);
                     self.err(cx, prog, file, p.lo, format!("E0405: cannot find trait `{}` in `{}`", last, parent));
+                } else if ast.segs(p.segs)[0].kind() == SegKind::Ident {
+                    // the path starts with a name that is nothing in scope: no module, no crate
+                    let first = prog.files[file as usize].text(ast.segs(p.segs)[0].name);
+                    let known = prog.syms.get(first).is_some_and(|s| env.names.contains(&s) || prog.lookup_in_scope(module, s, true).is_some() || prog.lookup_in_scope(module, s, false).is_some() || prog.crates[prog.mods[module as usize].krate as usize].deps.iter().any(|d| d.0 == s));
+                    if !known {
+                        self.err(cx, prog, file, p.lo, format!("E0433: failed to resolve: use of unresolved module or unlinked crate `{}`", first));
+                    }
                 }
             }
             return None;
@@ -3482,7 +3535,7 @@ fn maybe_unsized_params(prog: &Program, file: u32, g: &ast::Generics) -> Vec<boo
     out
 }
 
-fn read_repr(prog: &Program, file: u32, attrs: &[ast::Attr], repr_c: &mut bool, repr_int: &mut Option<Prim>) -> (u32, u32) {
+fn read_repr(prog: &Program, file: u32, attrs: &[ast::Attr], repr_c: &mut bool, repr_int: &mut Option<Prim>, repr_simd: &mut bool) -> (u32, u32) {
     let f = &prog.files[file as usize];
     let (mut align, mut packed) = (0u32, 0u32);
     for a in attrs {
@@ -3495,6 +3548,9 @@ fn read_repr(prog: &Program, file: u32, attrs: &[ast::Attr], repr_c: &mut bool, 
             // the type out of live layout edits, layout.rs live_editable)
             if t == "C" || t == "transparent" {
                 *repr_c = true;
+            }
+            if t == "simd" {
+                *repr_simd = true;
             }
             if t == "align" || t == "packed" {
                 // `align(N)` / `packed(N)` / bare `packed`

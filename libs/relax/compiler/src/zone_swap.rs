@@ -262,6 +262,12 @@ pub(crate) fn swapped() -> bool {
     SWAPS.load(Ordering::Relaxed) > 0
 }
 
+/// Loader symbol `relax_zone_swaps`: the swaps done so far. A test program (diffpkg `zone_swap`)
+/// waits on it to first use statics after the swap; a rustc build has no such symbol.
+pub(crate) extern "C" fn relax_zone_swaps() -> u32 {
+    SWAPS.load(Ordering::Acquire)
+}
+
 pub(crate) static LAST_SWAP_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Runs the swap. Called by the monitor thread once the settle is done and this run's collected
@@ -418,7 +424,9 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     let t = Instant::now();
     crate::zone_alloc::compiler_begin_generation();
     trace("generation begun");
-    let taken = zone_scan::zone_take_all();
+    let Some(taken) = zone_scan::zone_take_all() else {
+        return abort("an owner request arrived after the quiesce".into());
+    };
     trace("statics taken");
     let fresh = {
         let _c = crate::zone_alloc::compiler();
@@ -471,8 +479,9 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     crate::memstat::trim();
     crate::pack::release_resident();
     let rss1 = crate::memstat::resident();
-    SWAPS.fetch_add(1, Ordering::Relaxed);
+    SWAPS.fetch_add(1, Ordering::Release);
     LAST_SWAP_MS.store(wall_ns() / 1_000_000, Ordering::Relaxed);
+    crate::boot_stats::swap_done(tl.chunks, rss0, rss1);
     eprintln!("makepad-run zone: swap {}->{} at t={:.0} ms (attempt {}): quiesce {:.1} ms, front images {:.1} ms, encode {:.1} ms, store {:.1} ms, restore {:.1} ms (cache {:.1} ms), commit {:.1} ms, total {:.1} ms; destroyed {} chunks ({:.1} MB touched); {} speculative codes moved to the kept heap ({:.1} MB); rss {:.0} -> {:.0} MB",
         old_gen, old_gen + 1, crate::clock::ms_since_start(), n + 1, tl.quiesce, tl.front_images, tl.encode, tl.store, tl.restore, tl.cache, tl.commit, ms(t_all),
         tl.chunks, tl.touched as f64 / 1048576.0, tl.specs.0, tl.specs.1 as f64 / 1048576.0, rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0);
@@ -607,6 +616,7 @@ unsafe fn commit(up: *mut Unit, f: Fresh) -> (usize, usize, (usize, usize)) {
     put(&mut u.coro_rir, Default::default());
     put(&mut u.coro_busy, Default::default());
     put(&mut u.coro_selfref, Default::default());
+    put(&mut u.coro_relower, Default::default());
     put(&mut u.spec_cached, Default::default());
     put(&mut u.unwind_drop_cache, Default::default());
     put(&mut u.cycle_inprog, Default::default());
@@ -632,7 +642,7 @@ unsafe fn commit(up: *mut Unit, f: Fresh) -> (usize, usize, (usize, usize)) {
             let spec = crate::zone_alloc::kept_clone(&e.spec);
             if let Some(s) = &spec {
                 specs += 1;
-                spec_bytes += std::mem::size_of::<SpecCode>() + s.code.len() + s.relocs.len() * std::mem::size_of::<crate::rir::RelocAt>();
+                spec_bytes += std::mem::size_of::<SpecCode>() + s.code.len() + s.relocs.len() * std::mem::size_of::<relax_backend::rir::RelocAt>();
             }
             put(&mut e.spec, spec);
         }

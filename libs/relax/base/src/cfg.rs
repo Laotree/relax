@@ -24,6 +24,7 @@ impl CfgSet {
             crate::options::CheckTarget::MacosArm64 => CfgSet::macos_arm64(sess, features),
             crate::options::CheckTarget::LinuxX64 => CfgSet::linux_x64(sess, features),
             crate::options::CheckTarget::AndroidArm64 => CfgSet::android_arm64(sess, features),
+            crate::options::CheckTarget::Web(w) => CfgSet::web(sess, w, features),
             // machine() adds the extra cfgs itself
             crate::options::CheckTarget::Host => return CfgSet::machine(sess, features),
         };
@@ -192,9 +193,37 @@ impl CfgSet {
         }
         CfgSet { session: sess.clone(), set }
     }
+    /// A web target as the trace host runs it: `rustc --print cfg --target wasm32-unknown-unknown`
+    /// (1.98; wasm64-unknown-unknown for `PtrWidth::W64`), plus `atomics` of makepad's threaded web
+    /// build (cargo makepad wasm's default: `+atomics,+bulk-memory,+mutable-globals`). std/core/alloc
+    /// are read with this set too (lib.rs `std_cfg`, plus `relax_web`): Relax std's web layer is
+    /// rustc's wasm32-unknown-unknown std.
+    pub fn web(sess: &std::sync::Arc<crate::Session>, w: crate::options::PtrWidth, features: &[String]) -> CfgSet {
+        let (arch, width) = match w {
+            crate::options::PtrWidth::W32 => ("target_arch=wasm32", "target_pointer_width=32"),
+            crate::options::PtrWidth::W64 => ("target_arch=wasm64", "target_pointer_width=64"),
+        };
+        let mut set: Vec<String> = [
+            arch, "target_os=unknown", "target_family=wasm", "target_env=", "target_abi=",
+            "target_vendor=unknown", width, "target_endian=little", "panic=abort",
+            "target_feature=bulk-memory", "target_feature=multivalue", "target_feature=mutable-globals",
+            "target_feature=nontrapping-fptoint", "target_feature=reference-types", "target_feature=sign-ext",
+            "target_has_atomic=8", "target_has_atomic=16", "target_has_atomic=32", "target_has_atomic=64",
+            "target_has_atomic=ptr", "target_feature=atomics",
+        ].iter().map(|s| s.to_string()).collect();
+        for f in features {
+            set.push(format!("feature={}", f));
+        }
+        CfgSet { session: sess.clone(), set }
+    }
+
     /// The target triple of this cfg set (build scripts' TARGET / HOST).
     pub fn triple(&self) -> &'static str {
-        if self.has("target_os=windows") {
+        if self.has("target_arch=wasm32") {
+            crate::options::CheckTarget::web_triple(crate::options::PtrWidth::W32)
+        } else if self.has("target_arch=wasm64") {
+            crate::options::CheckTarget::web_triple(crate::options::PtrWidth::W64)
+        } else if self.has("target_os=windows") {
             "x86_64-pc-windows-gnu"
         } else if self.has("target_os=android") {
             "aarch64-linux-android"

@@ -3,10 +3,11 @@
 //!
 //! - `current()`: the calling thread's id (nonzero; pthread_t on unix).
 //! - `name(t)`: a thread's name for diagnostics.
-//! - `stack_lo()`: lowest usable address of the calling thread's stack (0: unknown).
 //! - `kick(t)`: interrupts thread `t` for the hang watchdog / MAKEPAD_RUN_COMPILE_WATCH: the fault
 //!   layer's handler then runs on that thread (jit::on_watchdog decides what it does).
 //! - `lower_priority(utility)`: background compile workers below the program's threads.
+//! - `background()`: the OS background class (aot-min's compile workers: macOS QOS_CLASS_BACKGROUND,
+//!   Linux SCHED_IDLE, Windows EcoQoS).
 //! - `interactive()`: the sampler thread asks not to have its timers coalesced.
 //! - `realtime()`: the calling thread runs under a real-time policy (an audio callback thread:
 //!   SCHED_FIFO/RR on Linux, a time-constraint policy on macOS).
@@ -56,25 +57,6 @@ mod unix {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp {
     pub use super::unix::{current, exit_now, fork, kick, name};
-    use super::unix::pthread_self;
-
-    pub fn stack_lo() -> usize {
-        extern "C" {
-            fn pthread_getattr_np(t: usize, attr: *mut u64) -> i32;
-            fn pthread_attr_getstack(attr: *const u64, addr: *mut usize, size: *mut usize) -> i32;
-            fn pthread_attr_destroy(attr: *mut u64) -> i32;
-        }
-        unsafe {
-            let mut attr = [0u64; 16];
-            if pthread_getattr_np(pthread_self(), attr.as_mut_ptr()) != 0 {
-                return 0;
-            }
-            let (mut addr, mut size) = (0usize, 0usize);
-            pthread_attr_getstack(attr.as_ptr(), &mut addr, &mut size);
-            pthread_attr_destroy(attr.as_mut_ptr());
-            addr
-        }
-    }
 
     pub fn lower_priority(_utility: bool) {
         extern "C" {
@@ -83,6 +65,20 @@ mod imp {
         // who 0: the calling thread (Linux nices threads one by one)
         unsafe {
             setpriority(0, 0, 5);
+        }
+    }
+
+    /// The OS background class for this thread: SCHED_IDLE (runs only when a CPU is otherwise idle).
+    pub fn background() {
+        #[repr(C)]
+        struct SchedParam { priority: i32 }
+        extern "C" {
+            fn sched_setscheduler(pid: i32, policy: i32, param: *const SchedParam) -> i32;
+        }
+        const SCHED_IDLE: i32 = 5;
+        // pid 0: the calling thread
+        unsafe {
+            sched_setscheduler(0, SCHED_IDLE, &SchedParam { priority: 0 });
         }
     }
 
@@ -103,16 +99,7 @@ mod imp {
     use super::unix::pthread_self;
 
     extern "C" {
-        fn pthread_get_stackaddr_np(t: usize) -> *mut u8;
-        fn pthread_get_stacksize_np(t: usize) -> usize;
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
-    }
-
-    pub fn stack_lo() -> usize {
-        unsafe {
-            let t = pthread_self();
-            pthread_get_stackaddr_np(t) as usize - pthread_get_stacksize_np(t)
-        }
     }
 
     pub fn lower_priority(utility: bool) {
@@ -124,6 +111,15 @@ mod imp {
             } else {
                 pthread_set_qos_class_self_np(QOS_CLASS_DEFAULT, -15);
             }
+        }
+    }
+
+    /// The OS background class for this thread: QOS_CLASS_BACKGROUND (efficiency cores,
+    /// throttled, low power).
+    pub fn background() {
+        const QOS_CLASS_BACKGROUND: u32 = 0x09;
+        unsafe {
+            pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
         }
     }
 
@@ -180,16 +176,6 @@ mod imp {
         }
     }
 
-    pub fn stack_lo() -> usize {
-        let (mut lo, mut hi) = (0usize, 0usize);
-        unsafe { GetCurrentThreadStackLimits(&mut lo, &mut hi) };
-        // the reservation's base; its lowest pages are the guard region
-        if lo == 0 {
-            0
-        } else {
-            lo + 3 * 4096 + 65536
-        }
-    }
 
     /// The watchdog / MAKEPAD_RUN_COMPILE_WATCH interrupt: the thread is suspended and its context read
     /// from this (the watching) thread; the fault layer decides (os::fault::interrupt).
@@ -201,6 +187,21 @@ mod imp {
         const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
         unsafe {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        }
+    }
+
+    /// The OS background class for this thread: EcoQoS (execution-speed power throttling) at idle
+    /// priority.
+    pub fn background() {
+        #[repr(C)]
+        struct ThreadPowerThrottlingState { version: u32, control_mask: u32, state_mask: u32 }
+        const THREAD_POWER_THROTTLING: i32 = 3;
+        const THREAD_POWER_THROTTLING_EXECUTION_SPEED: u32 = 1;
+        const THREAD_PRIORITY_IDLE: i32 = -15;
+        let state = ThreadPowerThrottlingState { version: 1, control_mask: THREAD_POWER_THROTTLING_EXECUTION_SPEED, state_mask: THREAD_POWER_THROTTLING_EXECUTION_SPEED };
+        unsafe {
+            SetThreadInformation(GetCurrentThread(), THREAD_POWER_THROTTLING, &state as *const _ as *const u8, std::mem::size_of::<ThreadPowerThrottlingState>() as u32);
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
         }
     }
 

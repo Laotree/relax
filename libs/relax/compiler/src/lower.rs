@@ -17,12 +17,14 @@ use crate::jit::{FnKey, Unit, ShimInstance};
 use relax_types::instance::{Instance, InstanceKind, ShimKind};
 use crate::layout::{Layout, Leaf};
 use crate::program::{DefId, DefKind, Prim};
-use crate::rir::*;
+use relax_backend::rir::*;
 use crate::typeck::{Body, Coerce, Res};
 use crate::types::{TyId, TyKind};
 use crate::fxhash::HashMap;
 
+mod asm;
 mod match_tree;
+mod simd;
 
 /// vtable layout: [drop_in_place (0 when no drop), size, align, methods...]
 pub const VT_DROP: u32 = 0;
@@ -186,6 +188,10 @@ pub struct Lcx<'a> {
     /// SPEC-V: this body is unverified code: calls that pass `&mut` beside another pointer-holding
     /// argument go to the callee's unverified-mode twin
     plain_calls: bool,
+    /// Relaxed Rust D3: the run-time disjoint-index checks of this body's clean verdict ((earlier,
+    /// later) index expressions), and the slot each earlier index is kept in (by its span).
+    d3: Option<std::sync::Arc<Vec<(relax_types::mir::Span, relax_types::mir::Span)>>>,
+    d3_slots: HashMap<(u32, u32, u32), u32>,
     /// lowering a const/static initializer: borrowed temporaries live in static memory
     /// (rustc's constant promotion), not on the initializer's stack
     const_init: bool,
@@ -248,6 +254,8 @@ pub struct Lcx<'a> {
     /// the next indirect call is a virtual call of a #[track_caller] trait method: it passes
     /// the caller location (the vtable holds the tracked fn itself)
     indirect_tracked: bool,
+    /// integer SIMD values evaluated at compile time: (slot base, offset) -> their bytes
+    pub(crate) simd_consts: HashMap<(u32, i32), Vec<u8>>,
     /// temporaries whose lifetime a `let` extends to the end of its block (`let r = &make();`),
     /// one list per drop scope (parallel to `scopes`)
     /// temporaries living to the end of a scope (let-extended; `while let` scrutinees), with
@@ -317,9 +325,74 @@ pub struct Lcx<'a> {
     tail_marks: Vec<Option<usize>>,
 }
 
+/// A definition's path as source names it: an impl's item is named through its self type
+/// (`ttf_parser::Face::parse`; a trait impl's `ttf_parser::<Face as Trait>::method`), not by the
+/// impl's empty name (`def_path`'s `ttf_parser::::parse`). From the impl's syntax only: no
+/// resolution (every new slot is named).
+pub fn display_path(prog: &crate::program::Program, d: crate::program::DefId) -> String {
+    use crate::program::DefKind;
+    let def = prog.def(d);
+    if def.parent == crate::program::NO_DEF || prog.def(def.parent).kind != DefKind::Impl {
+        return prog.def_path(d);
+    }
+    let imp = prog.def(def.parent);
+    let file = &prog.files[imp.file as usize];
+    let Some(ii) = file.ast.as_impl(&file.ast.item(imp.item).kind) else { return prog.def_path(d) };
+    let mut s = if imp.parent == crate::program::NO_DEF { String::new() } else { display_path(prog, imp.parent) };
+    if !s.is_empty() {
+        s.push_str("::");
+    }
+    let self_ty = ty_label(file, ii.self_ty, 0);
+    match &ii.trait_ {
+        Some(t) => {
+            s.push('<');
+            s.push_str(&self_ty);
+            s.push_str(" as ");
+            s.push_str(&path_label(file, t));
+            s.push('>');
+        }
+        None => s.push_str(&self_ty),
+    }
+    s.push_str("::");
+    s.push_str(prog.syms.str(def.name));
+    s
+}
+
+/// A path as written, without its generic arguments.
+fn path_label(file: &crate::parser::ParsedFile, p: &crate::ast::Path) -> String {
+    let mut s = String::new();
+    for (k, seg) in file.ast.segs(p.segs).iter().enumerate() {
+        if k > 0 || p.segs.global() {
+            s.push_str("::");
+        }
+        s.push_str(file.text(seg.name));
+    }
+    s
+}
+
+/// A type as written (generic arguments and lengths left out), for names.
+fn ty_label(file: &crate::parser::ParsedFile, t: crate::ast::TyId, depth: u32) -> String {
+    use crate::ast::Ty;
+    if depth > 6 {
+        return "_".into();
+    }
+    match file.ast.ty(t) {
+        Ty::Path(p) => path_label(file, p),
+        Ty::Ref(_, m, inner) => format!("&{}{}", if *m { "mut " } else { "" }, ty_label(file, *inner, depth + 1)),
+        Ty::Ptr(m, inner) => format!("*{} {}", if *m { "mut" } else { "const" }, ty_label(file, *inner, depth + 1)),
+        Ty::Slice(inner) => format!("[{}]", ty_label(file, *inner, depth + 1)),
+        Ty::Array(inner, _) => format!("[{}; _]", ty_label(file, *inner, depth + 1)),
+        Ty::Paren(inner) => ty_label(file, *inner, depth + 1),
+        Ty::Tuple(l) => format!("({})", file.ast.list(*l).iter().map(|x| ty_label(file, *x, depth + 1)).collect::<Vec<_>>().join(", ")),
+        Ty::Never => "!".into(),
+        Ty::DynTrait(..) => "dyn _".into(),
+        _ => "_".into(),
+    }
+}
+
 pub fn fn_name(u: &Unit, key: &FnKey) -> String {
     match key {
-        FnKey::Inst(d, _) => u.prog.def_path(*d),
+        FnKey::Inst(d, _) => display_path(&u.prog, *d),
         FnKey::Closure(_, e, p) => format!("{{closure#{}}}@{}", e, p),
         FnKey::Shim(shim) => shim_name(&u.prog, &u.tcx, shim),
         FnKey::Glue(k, t) => format!("glue{}<{}>", k, crate::typeck::ty_to_string(false, &u.prog, &u.tcx, *t)),
@@ -334,6 +407,47 @@ const BOX_STEP: u32 = u32::MAX;
 /// a move-path step into element i of a fixed-length array: (ARRAY_STEP, i)
 const ARRAY_STEP: u32 = u32::MAX - 1;
 
+/// A value the block `insts` defines from constants (SIMD selectors, `str_eq` lengths): an Iconst,
+/// copies/int casts of one, or and/or/xor/shift/add/sub with an immediate or another
+/// constant (`MASK & 0x0f` of a const generic), or a product of constants (a slice length in bytes)
+fn const_of(insts: &[Inst], upto: usize, r: VReg) -> Option<i64> {
+    for (at, i) in insts[..upto].iter().enumerate().rev() {
+        match i {
+            Inst::Iconst(d, x) if *d == r => return Some(*x),
+            Inst::Mov(d, a) | Inst::Conv(Conv::IntToInt(_), d, a) if *d == r => return const_of(insts, at, *a),
+            Inst::IBinI(op, _, d, a, imm) if *d == r => {
+                let x = const_of(insts, at, *a)?;
+                return match op {
+                    IOp::And => Some(x & imm),
+                    IOp::Or => Some(x | imm),
+                    IOp::Xor => Some(x ^ imm),
+                    IOp::Shl => Some(x.wrapping_shl(*imm as u32)),
+                    IOp::Shr => Some(((x as u64) >> (*imm as u32 & 63)) as i64),
+                    IOp::Add => Some(x.wrapping_add(*imm)),
+                    IOp::Sub => Some(x.wrapping_sub(*imm)),
+                    _ => None,
+                };
+            }
+            Inst::IBin(op, _, d, a, b) if *d == r => {
+                let (x, y) = (const_of(insts, at, *a)?, const_of(insts, at, *b)?);
+                return match op {
+                    IOp::And => Some(x & y),
+                    IOp::Or => Some(x | y),
+                    IOp::Xor => Some(x ^ y),
+                    IOp::Shl => Some(x.wrapping_shl(y as u32)),
+                    IOp::Shr => Some(((x as u64) >> (y as u32 & 63)) as i64),
+                    IOp::Add => Some(x.wrapping_add(y)),
+                    IOp::Sub => Some(x.wrapping_sub(y)),
+                    IOp::Mul => Some(x.wrapping_mul(y)),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 impl<'a> Lcx<'a> {
     /// `cur_fn`: the slot this body is built for (its closures' parent).
     pub fn new(u: &'a Unit, b: &'a Body, name: String, cur_fn: u32) -> Lcx<'a> {
@@ -346,11 +460,16 @@ impl<'a> Lcx<'a> {
         let ret = u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), b.ret);
         let mut closure_storage = HashMap::default();
         for &ce in b.min_captures.keys() { closure_storage.insert(ce, crate::layout::ClosureStorage::for_codegen(&u.prog, &u.tcx, b, ce)); }
+        // the verdict's disjoint-index checks belong in verified code only (unverified code and its
+        // twins run as written, SPEC-V)
+        let d3 = if plain_calls || (cur_fn as usize) >= u.fns.len() { None } else { u.disjoint_checks(cur_fn) };
         Lcx {
             closure_storage,
             u,
             cur_fn,
             plain_calls,
+            d3,
+            d3_slots: HashMap::default(),
             b,
             f,
             cur: entry,
@@ -390,6 +509,7 @@ impl<'a> Lcx<'a> {
             guard_flags: HashMap::default(),
             cond_rescope: None,
             indirect_tracked: false,
+            simd_consts: HashMap::default(),
             extend_ops: Default::default(),
             pat_path: None,
             field_moved: HashMap::default(),
@@ -744,32 +864,33 @@ impl<'a> Lcx<'a> {
     }
     /// The pointer stored at `cs + off` in a constant: its symbol, a run-independent small
     /// value (dangling / null), or a load from the constant at run time; None without `cs`.
-    fn const_ptr_val(&mut self, cs: Option<crate::rir::Sym>, off: u32) -> Option<VReg> {
+    fn const_ptr_val(&mut self, cs: Option<relax_backend::rir::Sym>, off: u32) -> Option<VReg> {
         let at = cs?.plus(off as i64);
-        Some(match crate::syms::read_leaf(self.u, at, Mem::Int(8, false)) {
-            crate::opt::RoRead::Ptr(p) => self.sym_val(p),
-            crate::opt::RoRead::Bytes(v) if v < 4096 => self.iconst(v as i64),
+        let pm = self.pmem();
+        Some(match crate::syms::read_leaf(self.u, at, pm) {
+            relax_backend::passes::RoRead::Ptr(p) => self.sym_val(p),
+            relax_backend::passes::RoRead::Bytes(v) if v < 4096 => self.iconst(v as i64),
             _ => {
                 let a = self.sym_val(at);
                 let d = self.f.vreg(Cls::I);
-                self.emit(Inst::Load(Mem::Int(8, false), d, a, 0));
+                self.emit(Inst::Load(pm, d, a, 0));
                 d
             }
         })
     }
     /// A symbol's value (an address, a site index) in a vreg (syms.rs).
-    fn sym_val(&mut self, s: crate::rir::Sym) -> VReg {
+    fn sym_val(&mut self, s: relax_backend::rir::Sym) -> VReg {
         let d = self.f.vreg(Cls::I);
         self.emit(Inst::Addr(d, s));
         d
     }
     /// A leaf of a constant's data as a vreg: an integer / float folds to an immediate, a
     /// pointer to its symbol; None when the bytes cannot be read as either (syms.rs).
-    fn const_leaf_at(&mut self, at: crate::rir::Sym, lf: crate::layout::Leaf) -> Option<VReg> {
+    fn const_leaf_at(&mut self, at: relax_backend::rir::Sym, lf: crate::layout::Leaf) -> Option<VReg> {
         match crate::syms::read_leaf(self.u, at, lf.mem) {
-            crate::opt::RoRead::Bytes(raw) => Some(self.const_leaf(raw, lf)),
-            crate::opt::RoRead::Ptr(t) => Some(self.sym_val(t)),
-            crate::opt::RoRead::No | crate::opt::RoRead::Range(_) => None,
+            relax_backend::passes::RoRead::Bytes(raw) => Some(self.const_leaf(raw, lf)),
+            relax_backend::passes::RoRead::Ptr(t) => Some(self.sym_val(t)),
+            relax_backend::passes::RoRead::No | relax_backend::passes::RoRead::Range(_) => None,
         }
     }
     fn addr_add(&mut self, base: VReg, off: i32) -> VReg {
@@ -855,10 +976,18 @@ impl<'a> Lcx<'a> {
         self.trait_methods.entry(d).or_default().insert(args.to_vec(), found.clone());
         found
     }
+    /// size_of::<usize>() of the target (4 on the wasm32 web target).
+    fn pb(&self) -> u32 {
+        self.u.tcx.tys.ptr_bytes
+    }
+    /// A pointer-sized word in memory (pointers, usize, vtable entries).
+    fn pmem(&self) -> Mem {
+        Mem::Int(self.u.tcx.tys.ptr_bytes as u8, false)
+    }
     fn int_ty(&self, t: TyId) -> IntTy {
         match self.u.tcx.tys.kind(t) {
             TyKind::Int(p) => {
-                let (b, s) = crate::types::Types::int_info(*p);
+                let (b, s) = self.u.tcx.tys.int_info(*p);
                 IntTy { bits: (b * 8) as u8, signed: s }
             }
             TyKind::Bool => IntTy { bits: 8, signed: false },
@@ -981,12 +1110,20 @@ impl<'a> Lcx<'a> {
                 // a pointer-sized leaf the type's niche keeps from 0 (references, Box, NonNull,
                 // a Vec's buffer pointer): codegen folds its null tests (Func::nonnull)
                 let nn = l.niche.filter(|n| n.bytes == 8 && n.start >= 1 && n.start <= n.end).map(|n| n.off);
+                // an unsigned scalar leaf the niche limits to start..=end (char, bool, enum
+                // tags): value ranges decide its niche tests (Func::ranged)
+                let rg = l.niche.filter(|n| n.bytes < 8 && n.start <= n.end && (n.start > 0 || n.end < (1u128 << (8 * n.bytes)) - 1));
                 let mut v = Vec::with_capacity(leaves.len());
                 for lf in leaves {
                     let d = self.f.vreg(lf.cls);
                     self.emit(Inst::Load(lf.mem, d, base, off + lf.off as i32));
-                    if nn == Some(lf.off) && matches!(lf.mem, crate::rir::Mem::Int(8, _)) {
+                    if nn == Some(lf.off) && matches!(lf.mem, relax_backend::rir::Mem::Int(n, _) if n as u32 == self.pb()) {
                         self.f.nonnull.push(d);
+                    }
+                    if let (Some(n), relax_backend::rir::Mem::Int(b, false)) = (rg, lf.mem) {
+                        if n.off == lf.off && n.bytes == b as u32 {
+                            self.f.ranged.push((d, b, n.start as u64, n.end as u64));
+                        }
                     }
                     v.push(d);
                 }
@@ -994,6 +1131,41 @@ impl<'a> Lcx<'a> {
             }
             None => Val::M(base, off),
         }
+    }
+
+    /// The byte every byte of a repeated element `v` (one scalar leaf of kind `m`, no padding)
+    /// holds, as a vreg for memset: the value itself for a byte-sized element, else a constant
+    /// whose bytes are all equal (rustc codegen_rvalue Repeat: `const_to_opt_u128` bytes all the
+    /// first, or an i8 immediate). None: store per element.
+    fn repeat_fill_byte(&mut self, v: &Val, m: Mem) -> Option<VReg> {
+        let Val::L(regs) = v else { return None };
+        if regs.len() != 1 {
+            return None;
+        }
+        let r = regs[0];
+        let n = match m {
+            Mem::Int(1, _) => return Some(r),
+            Mem::Int(n, _) => n as usize,
+            Mem::F32 => 4,
+            Mem::F64 => 8,
+        };
+        // the constant defining r in the current block (lowering just emitted it)
+        let b = &self.f.blocks[self.cur as usize];
+        let bits = b.insts.iter().rev().find_map(|i| match *i {
+            Inst::Iconst(d, k) if d == r => Some(Some(k as u64)),
+            Inst::Fconst(d, k, _) if d == r => Some(Some(k)),
+            _ => {
+                let mut def = false;
+                relax_backend::regalloc::for_defs(i, |d| def |= d == r);
+                def.then_some(None)
+            }
+        })??;
+        let bytes = bits.to_le_bytes();
+        let first = bytes[0];
+        if bytes[1..n].iter().any(|&x| x != first) {
+            return None;
+        }
+        Some(self.iconst(first as i64))
     }
 
     fn store_val(&mut self, base: VReg, off: i32, t: TyId, v: Val) {
@@ -1161,7 +1333,8 @@ impl<'a> Lcx<'a> {
             // bit 0: built by code that knows dead slots (removed or retyped fields) and does
             // not set them -- the drop glue then leaves them alone (lower.rs ext_drop_fn)
             let z = self.iconst(has_dead_slots(self.u, t) as i64);
-            self.emit(Inst::Store(Mem::Int(8, false), a, off + e as i32, z));
+            let pm = self.pmem();
+            self.emit(Inst::Store(pm, a, off + e as i32, z));
         }
     }
 
@@ -1354,7 +1527,8 @@ impl<'a> Lcx<'a> {
                     let pa = if packed > 0 { pa.min(packed) } else { pa };
                     let x = crate::layout::round_up(unaligned, pa);
                     let va0 = self.f.vreg(Cls::I);
-                    self.emit(Inst::Load(Mem::Int(8, false), va0, r[1], 16));
+                    let pm = self.pmem();
+                    self.emit(Inst::Load(pm, va0, r[1], (VT_ALIGN * self.pb()) as i32));
                     let va = if packed > 0 {
                         let pn = self.iconst(packed as i64);
                         let c0 = self.f.vreg(Cls::I);
@@ -1509,7 +1683,8 @@ impl<'a> Lcx<'a> {
             for s in self.f.slots.iter_mut() {
                 s.born = false;
             }
-            match coroutine_transform(&mut self.f, &c) {
+            let ptr_bytes = self.pb();
+            match coroutine_transform(&mut self.f, &c, ptr_bytes) {
                 Ok((sz, al, shape)) => {
                     let area = (sz, al);
                     if self.errors.is_empty() {
@@ -1597,6 +1772,14 @@ impl<'a> Lcx<'a> {
             }
             let cs = crate::cabi::c_sig(self.u, &ptys, ret, None, abi);
             self.f.cabi = Some(Box::new(cs));
+        }
+        // `#[unsafe(naked)]`: the body is its naked_asm! and nothing else (lower/asm.rs)
+        if self.is_naked(prog_def_item) {
+            if !c_abi {
+                self.err(ast.item(prog_def_item).lo, "naked functions with the Rust ABI are not supported by Relax (give it an explicit ABI such as `extern \"C\"`)".to_string());
+            }
+            self.lower_naked(body);
+            return;
         }
         let c_agg_ret = match &self.f.cabi {
             Some(cs) => Some(cs.ret.is_some()),
@@ -1800,7 +1983,8 @@ impl<'a> Lcx<'a> {
                     self.addr_add(env, off)
                 } else {
                     let d = self.f.vreg(Cls::I);
-                    self.emit(Inst::Load(Mem::Int(8, false), d, env, off));
+                    let pm = self.pmem();
+                    self.emit(Inst::Load(pm, d, env, off));
                     d
                 };
                 self.locals[*li as usize] = Some(LocalSt::Slot(a));
@@ -1985,7 +2169,8 @@ impl<'a> Lcx<'a> {
                 self.addr_add(env, off)
             } else {
                 let d = self.f.vreg(Cls::I);
-                self.emit(Inst::Load(Mem::Int(8, false), d, env, off));
+                let pm = self.pmem();
+                self.emit(Inst::Load(pm, d, env, off));
                 d
             };
             self.locals[*li as usize] = Some(LocalSt::Slot(a));
@@ -2258,7 +2443,7 @@ impl<'a> Lcx<'a> {
 
     fn abi_param_c(&mut self, t: TyId, c: bool) -> (Vec<VReg>, bool) {
         if c && self.layout(t).size > 0 {
-            if let crate::rir::CArg::Agg(_) = crate::cabi::c_arg(self.u, t) {
+            if let relax_backend::rir::CArg::Agg(_) = crate::cabi::c_arg(self.u, t) {
                 let p = self.f.vreg(Cls::I);
                 self.f.params.push(p);
                 self.f.noalias.push(p);
@@ -2387,6 +2572,14 @@ impl<'a> Lcx<'a> {
                         self.f.noalias.push(regs[0]);
                     }
                 }
+                // and `&T` for T: Freeze (rustc_ty_utils abi.rs: PointerKind::SharedRef { frozen }
+                // -> noalias + readonly): nothing writes the memory during the call, so its loads
+                // are loop-invariant (quicksort's pivot under partition's stores)
+                if let TyKind::Ref(false, inner, _) = self.kind(t) {
+                    if !self.unsized_ty(inner) && regs.len() == 1 && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), inner) {
+                        self.f.noalias.push(regs[0]);
+                    }
+                }
                 // a reference's (or fat reference's data) pointer is never null (rustc `nonnull`
                 // on reference parameters): the niche tests of iterators over a slice parameter
                 // fold
@@ -2410,8 +2603,10 @@ impl<'a> Lcx<'a> {
             None => {
                 let p = self.f.vreg(Cls::I);
                 self.f.params.push(p);
-                // by-pointer aggregate params point to the caller's private copy
+                // by-pointer aggregate params point to the caller's private copy, which this
+                // function owns (Func::owned)
                 self.f.noalias.push(p);
+                self.f.owned.push(p);
                 if l.size > 0 {
                     self.f.deref.push((p, l.size));
                 }
@@ -2544,7 +2739,8 @@ impl<'a> Lcx<'a> {
                 return Err(format!("no local or parameter `{}` in scope at line {} (in scope: {})", name, pt.line, names.join(", ")));
             };
             let t = self.u.tcx.tys.erase_regions(self.monomorphize(self.b.locals[li as usize].ty));
-            if t != *want {
+            // the same type modulo regions (`want` has none: probes.rs by_name_params)
+            if self.u.tcx.tys.erase_all_regions(t) != *want {
                 return Err(format!("`{}` is `{}` at line {}, the probe takes `&{}`", name, crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t), pt.line, crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, *want)));
             }
             let addr = match self.local_place(li) {
@@ -3043,7 +3239,7 @@ impl<'a> Lcx<'a> {
     }
 
     /// `base[i]` through `Index::index` / `IndexMut::index_mut`.
-    fn overloaded_index(&mut self, m: DefId, args: Vec<TyId>, pl: Place, pt: TyId, i: ExprId, t: TyId) -> (Place, TyId) {
+    fn overloaded_index(&mut self, m: DefId, args: Vec<TyId>, pl: Place, pt: TyId, i: ExprId, t: TyId, span: (u32, u32)) -> (Place, TyId) {
         let mut def = m;
         let mut mutbl = false;
         if self.want_mut {
@@ -3070,6 +3266,10 @@ impl<'a> Lcx<'a> {
         };
         let iv = self.lower_expr_coerced(i, it);
         self.want_mut = saved;
+        if self.d3.is_some() && it == self.u.tcx.tys.usize_ {
+            let leaves = self.to_leaves(iv.clone(), it);
+            self.disjoint_index(span.0, span.1, leaves[0]);
+        }
         let addr = self.place_addr(&pl, pt);
         // an array indexed through its slice's impl: `&[T; N]` unsizes to `&[T]`
         let (self_v, self_t) = match (self.kind(pt), self.kind(args[0])) {
@@ -3404,7 +3604,8 @@ impl<'a> Lcx<'a> {
                 let mut sub = prefix.to_vec();
                 sub.push((BOX_STEP, 0));
                 let ptr = self.f.vreg(Cls::I);
-                self.emit(Inst::Load(Mem::Int(8, false), ptr, addr, 0));
+                let pm = self.pmem();
+                self.emit(Inst::Load(pm, ptr, addr, 0));
                 self.drop_tree(entries, ptr, inner, &sub);
                 if let Some(free) = self.u.core_path(&["boxed", "box_free_after_move"]) {
                     let id = self.u.fn_id(FnKey::Inst(free, vec![inner]));
@@ -4342,7 +4543,8 @@ impl<'a> Lcx<'a> {
             TyKind::Dyn(..) => {
                 // a `dyn` tail: through the vtable's drop entry (0 when nothing to drop)
                 let fp = self.f.vreg(Cls::I);
-                self.emit(Inst::Load(Mem::Int(8, false), fp, len, (VT_DROP * 8) as i32));
+                let pm = self.pmem();
+                self.emit(Inst::Load(pm, fp, len, (VT_DROP * self.pb()) as i32));
                 let yes = self.f.block();
                 let join = self.f.block();
                 self.term(Term::Branch(fp, yes, join));
@@ -4814,7 +5016,7 @@ impl<'a> Lcx<'a> {
     /// `cs` is the same address as a symbol (syms.rs) when known: integers, tags and lengths are
     /// read at compile time from `c`; a pointer value the test compares comes from `cs` (its
     /// symbol, or a load from the constant at run time), never as a bare number.
-    fn test_const_value(&mut self, place: &Place, t: TyId, c: u64, cs: Option<crate::rir::Sym>, fail: u32, depth: u32) {
+    fn test_const_value(&mut self, place: &Place, t: TyId, c: u64, cs: Option<relax_backend::rir::Sym>, fail: u32, depth: u32) {
         if depth > 32 {
             return;
         }
@@ -4846,14 +5048,17 @@ impl<'a> Lcx<'a> {
             }
             TyKind::Ref(_, inner, _) => {
                 let unsized_ = self.unsized_ty(inner);
-                let cp = unsafe { read_raw(c, Mem::Int(8, false)) };
-                let cps = cs.and_then(|s| match crate::syms::read_leaf(self.u, s, Mem::Int(8, false)) {
-                    crate::opt::RoRead::Ptr(p) => Some(p),
+                // pointer-sized words (a wasm32 word holds the window offset: syms::read_ptr)
+                let pb = self.pb() as u64;
+                let pm = self.pmem();
+                let cp = crate::syms::read_ptr(self.u, c);
+                let cps = cs.and_then(|s| match crate::syms::read_leaf(self.u, s, pm) {
+                    relax_backend::passes::RoRead::Ptr(p) => Some(p),
                     _ => None,
                 });
                 match self.kind(inner) {
                     TyKind::Str => {
-                        let cl = unsafe { read_raw(c + 8, Mem::Int(8, false)) };
+                        let cl = unsafe { read_raw(c + pb, pm) };
                         let v = self.read_place(place, t);
                         let a = match self.const_ptr_val(cs, 0) {
                             Some(a) => a,
@@ -4864,7 +5069,7 @@ impl<'a> Lcx<'a> {
                         branch(self, r);
                     }
                     TyKind::Slice(el) => {
-                        let cl = unsafe { read_raw(c + 8, Mem::Int(8, false)) };
+                        let cl = unsafe { read_raw(c + pb, pm) };
                         let v = self.read_place(place, t);
                         let v = self.to_leaves(v, t);
                         let n = self.iconst(cl as i64);
@@ -5065,6 +5270,65 @@ impl<'a> Lcx<'a> {
         self.switch(ok);
     }
 
+    /// Byte equality of `la` bytes at `pa` and `lb` bytes at `pb` (`str` / byte-slice / byte-array
+    /// patterns and `==`), inline where it is cheap: unequal lengths are unequal without a call (most
+    /// arms of a `match s { "lit" => .. }`), a length known here of up to 16 bytes compares one or two
+    /// overlapping words of each side (the literal's words fold to immediates from read-only data), and
+    /// only equal lengths beyond that, or unknown ones, call `rt_str_eq`.
+    fn bytes_eq(&mut self, pa: VReg, la: VReg, pb: VReg, lb: VReg) -> VReg {
+        let (ka, kb) = {
+            let insts = &self.f.blocks[self.cur as usize].insts;
+            (const_of(insts, insts.len(), la), const_of(insts, insts.len(), lb))
+        };
+        let n = match (ka, kb) {
+            (Some(x), Some(y)) if x != y => return self.iconst(0),
+            (Some(x), _) | (_, Some(x)) => Some(x),
+            _ => None,
+        };
+        let res = self.f.vreg(Cls::I);
+        let same_len = match (ka, kb) {
+            (Some(_), Some(_)) => None,
+            _ => Some(self.icmp(Cond::Eq, false, la, lb)),
+        };
+        let join = self.f.block();
+        if let Some(c) = same_len {
+            self.emit(Inst::Iconst(res, 0));
+            let eq = self.f.block();
+            self.term(Term::Branch(c, eq, join));
+            self.switch(eq);
+        }
+        let r = match n {
+            Some(0) => self.iconst(1),
+            Some(n @ 1..=16) => {
+                let w: i64 = if n >= 8 { 8 } else if n >= 4 { 4 } else if n >= 2 { 2 } else { 1 };
+                let word = |s: &mut Self, off: i64| {
+                    let x = s.f.vreg(Cls::I);
+                    let y = s.f.vreg(Cls::I);
+                    s.emit(Inst::Load(Mem::Int(w as u8, false), x, pa, off as i32));
+                    s.emit(Inst::Load(Mem::Int(w as u8, false), y, pb, off as i32));
+                    s.icmp(Cond::Eq, false, x, y)
+                };
+                let e0 = word(self, 0);
+                if n > w {
+                    let e1 = word(self, n - w);
+                    self.ibin(IOp::And, false, e0, e1)
+                } else {
+                    e0
+                }
+            }
+            _ => {
+                let rt = self.u.rs.str_eq;
+                let c = self.f.vreg(Cls::I);
+                self.emit(Inst::Call(Callee::Host(rt), vec![pa, la, pb, lb], vec![c]));
+                c
+            }
+        };
+        self.emit(Inst::Mov(res, r));
+        self.goto(join);
+        self.switch(join);
+        res
+    }
+
     fn eq_vals(&mut self, a: Val, b: Val, t: TyId) -> VReg {
         let k = self.kind(t);
         match k {
@@ -5088,10 +5352,7 @@ impl<'a> Lcx<'a> {
                 let k = self.iconst(es);
                 let la = self.ibin(IOp::Mul, false, a[1], k);
                 let lb = self.ibin(IOp::Mul, false, b[1], k);
-                let rt = self.u.rs.str_eq;
-                let c = self.f.vreg(Cls::I);
-                self.emit(Inst::Call(Callee::Host(rt), vec![a[0], la, b[0], lb], vec![c]));
-                c
+                self.bytes_eq(a[0], la, b[0], lb)
             }
             // `&[u8; N]` against a byte-string pattern (`match &tag { b"head" => .. }`): the bytes
             // (Reference patterns.md [patterns.literal]: compared by value; it compared pointers)
@@ -5100,18 +5361,12 @@ impl<'a> Lcx<'a> {
                 let a = self.to_leaves(a, t);
                 let b = self.to_leaves(b, t);
                 let n = self.iconst(size);
-                let rt = self.u.rs.str_eq;
-                let c = self.f.vreg(Cls::I);
-                self.emit(Inst::Call(Callee::Host(rt), vec![a[0], n, b[0], n], vec![c]));
-                c
+                self.bytes_eq(a[0], n, b[0], n)
             }
             TyKind::Ref(_, inner, _) if matches!(self.kind_ref(inner), TyKind::Str) => {
                 let a = self.to_leaves(a, t);
                 let b = self.to_leaves(b, t);
-                let rt = self.u.rs.str_eq;
-                let c = self.f.vreg(Cls::I);
-                self.emit(Inst::Call(Callee::Host(rt), vec![a[0], a[1], b[0], b[1]], vec![c]));
-                c
+                self.bytes_eq(a[0], a[1], b[0], b[1])
             }
             _ => {
                 let a = self.to_leaves(a, t);
@@ -5191,6 +5446,24 @@ impl<'a> Lcx<'a> {
         let xt = self.body_ty(x);
         if self.unsized_ty(xt) {
             return None;
+        }
+        // `&CONST` (shared, no interior mutability): the constant's own evaluated allocation,
+        // which is immutable (rustc interns it; const_val copies out of it for every by-value
+        // use). Not a writable static refilled with a copy of it at every evaluation.
+        let xs = strip_paren(self.ast(), x);
+        if shared && matches!(self.ast().expr(xs).kind, ExprKind::Path(_)) && self.layout(xt).size > 0 && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), xt) {
+            if let Some(Res::Def(d)) = self.b.res.get(&xs.0).copied() {
+                if matches!(self.u.prog.def(d).kind, DefKind::Const | DefKind::AssocConst) {
+                    let args = self.b.res_args.get(&xs.0).copied().unwrap_or_default();
+                    let args = self.mono_list(args);
+                    if let Some(addr) = self.u.const_addr_shared(d, args) {
+                        let s = self.u.data_sym(addr);
+                        let p = self.f.vreg(Cls::I);
+                        self.emit(Inst::Addr(p, s));
+                        return Some(p);
+                    }
+                }
+            }
         }
         let (blk0, at0) = (self.cur, self.f.blocks[self.cur as usize].insts.len());
         let v = self.lower_expr(x);
@@ -5715,7 +5988,8 @@ impl<'a> Lcx<'a> {
                 }
                 let Some(slot) = self.u.tcx.supertrait_vtable_slot(&self.u.prog, sd, dd) else { return Val::L(p) };
                 let vt = self.f.vreg(Cls::I);
-                self.emit(Inst::Load(Mem::Int(8, false), vt, p[1], (slot * 8) as i32));
+                let pm = self.pmem();
+                self.emit(Inst::Load(pm, vt, p[1], (slot * self.pb() as usize) as i32));
                 let _ = target;
                 Val::L(vec![p[0], vt])
             }
@@ -6042,6 +6316,11 @@ impl<'a> Lcx<'a> {
             }
             ExprKind::Unsafe(b) => self.lower_block(*b),
             ExprKind::ConstBlock(b) => {
+                // an integer SIMD vector (simd_shuffle's index, `const { .. }` in core::simd's
+                // swizzles): evaluated here, its lanes known to the SIMD intrinsics
+                if let Some(v) = self.simd_const_block(*b, t) {
+                    return v;
+                }
                 let previous = self.overflow_checks;
                 self.overflow_checks = true;
                 let value = self.lower_block(*b);
@@ -6230,6 +6509,8 @@ impl<'a> Lcx<'a> {
                 };
                 let el = self.layout(et);
                 let stride = crate::layout::round_up(el.size, el.align);
+                // a single scalar filling the whole element: memset candidate
+                let fill_mem = el.leaves.as_ref().and_then(|l| (l.len() == 1 && l[0].off == 0 && stride == el.size).then(|| l[0].mem));
                 let a = self.new_slot_for(t);
                 // the operand coerced to the element type (`[&[]; 4]` as `[&[i16]; 4]`)
                 let val = self.lower_expr_coerced(*x, et);
@@ -6248,6 +6529,13 @@ impl<'a> Lcx<'a> {
                     for i in 0..n {
                         self.store_val(a, (i as u32 * stride) as i32, et, val.clone());
                     }
+                } else if let Some(byte) = fill_mem.and_then(|m| self.repeat_fill_byte(&val, m)) {
+                    // every byte of the array is one value (a byte element, or zero of any
+                    // scalar element): memset, as rustc's lowering of a repeat (MIR Rvalue::Repeat
+                    // -> `memset` for a byte-sized or all-zero operand); `[0u8; 1024]` buffers
+                    let len = self.iconst((n * stride as u64) as i64);
+                    let rt = self.u.rs.memset;
+                    self.emit(Inst::Call(Callee::Host(rt), vec![a, byte, len], Vec::new()));
                 } else {
                     // loop: i in 0..n
                     let i = self.f.vreg(Cls::I);
@@ -6598,10 +6886,7 @@ impl<'a> Lcx<'a> {
                 if !self.u.provided.is_empty() {
                     self.check_provided_static(d, t);
                 }
-                let addr = self.static_addr(d);
-                let addr = self.u.syms.intern(crate::syms::SymKind::Static(d), addr);
-                let p = self.f.vreg(Cls::I);
-                self.emit(Inst::Addr(p, addr));
+                let p = self.static_ptr(d);
                 self.read_place(&Place::Mem(p, 0), t)
             }
             DefKind::ForeignStatic => match self.u.foreign_sym(d) {
@@ -6630,6 +6915,46 @@ impl<'a> Lcx<'a> {
             // fn items are zero-sized values; calls resolve them directly
             _ => self.unit(),
         }
+    }
+
+    /// The address of static `d`: the calling thread's copy of a `#[thread_local]` one
+    /// (Unit::thread_local_place), any other's storage in the running domain.
+    fn static_ptr(&mut self, d: DefId) -> VReg {
+        let p = self.f.vreg(Cls::I);
+        let def = self.u.prog.def(d);
+        let ast = &self.u.prog.files[def.file as usize].ast;
+        if crate::lang_items::has_attr(&self.u.prog, def.file, ast.list(ast.item(def.item).attrs), "thread_local") {
+            let Some(pl) = self.u.thread_local_place_shared(d) else {
+                self.err(self.pos, format!("could not evaluate static {} -- see its own error", self.u.prog.def_path(d)));
+                self.emit(Inst::Iconst(p, 0));
+                return p;
+            };
+            self.emit(if pl.fixed { Inst::TlsStatic(p, pl.sym) } else { Inst::TlsAddr(p, pl.sym) });
+            if let Some(size) = pl.init {
+                // the thread's first access: its copy starts as the static's value (the image in
+                // the static's own storage, rebased for the running domain), then the flag is set
+                let flag = self.f.vreg(Cls::I);
+                self.emit(Inst::Load(Mem::Int(1, false), flag, p, size as i32));
+                let init = self.f.block();
+                let done = self.f.block();
+                self.term(Term::Branch(flag, done, init));
+                self.switch(init);
+                let image = self.static_addr(d);
+                let image = self.u.syms.intern(crate::syms::SymKind::Static(d), image);
+                let src = self.f.vreg(Cls::I);
+                self.emit(Inst::Addr(src, image));
+                self.emit(Inst::Copy(p, src, size));
+                let one = self.iconst(1);
+                self.emit(Inst::Store(Mem::Int(1, false), p, size as i32, one));
+                self.goto(done);
+                self.switch(done);
+            }
+            return p;
+        }
+        let addr = self.static_addr(d);
+        let addr = self.u.syms.intern(crate::syms::SymKind::Static(d), addr);
+        self.emit(Inst::Addr(p, addr));
+        p
     }
 
     /// Static `d`'s storage. Its initializer failed (address 0, reported as its own error):
@@ -6690,7 +7015,7 @@ impl<'a> Lcx<'a> {
                 d
             }
             // type layouts never have vector leaves
-            Cls::F64 | Cls::V128 => {
+            Cls::F64 | Cls::V128 | Cls::V256 => {
                 let d = self.f.vreg(Cls::F64);
                 self.emit(Inst::Fconst(d, raw, true));
                 d
@@ -6833,7 +7158,7 @@ impl<'a> Lcx<'a> {
                 }
             }
         }
-        if root.is_none() {
+        if root.is_none() && !self.base_is_borrowed_place(bx) {
             // a temporary base: its fields that were not taken are dropped with it
             // (the base temporary itself is not dropped as a whole: its taken fields moved)
             let ba = self.place_addr(&bp, bt);
@@ -6857,7 +7182,8 @@ impl<'a> Lcx<'a> {
             if let Some(e) = self.layout(bt).ext {
                 let ba = self.place_addr(&bp, bt);
                 let blk = self.f.vreg(Cls::I);
-                self.emit(Inst::Load(Mem::Int(8, false), blk, ba, e as i32));
+                let pm = self.pmem();
+                self.emit(Inst::Load(pm, blk, ba, e as i32));
                 let blk = {
                     let m = self.iconst(!1i64);
                     self.ibin(IOp::And, false, blk, m)
@@ -6892,10 +7218,7 @@ impl<'a> Lcx<'a> {
                     if !self.u.provided.is_empty() {
                         self.check_provided_static(d, t);
                     }
-                    let addr = self.static_addr(d);
-                    let addr = self.u.syms.intern(crate::syms::SymKind::Static(d), addr);
-                    let p = self.f.vreg(Cls::I);
-                    self.emit(Inst::Addr(p, addr));
+                    let p = self.static_ptr(d);
                     (Place::Mem(p, 0), t)
                 }
                 Some(Res::Def(d)) if self.u.prog.def(d).kind == DefKind::ForeignStatic => match self.u.foreign_sym(d) {
@@ -6971,7 +7294,7 @@ impl<'a> Lcx<'a> {
                     if let Some(k) = (alo..ilo).find(|&k| src.get(k as usize) == Some(&b'[')) {
                         self.pos = k;
                     }
-                    return self.overloaded_index(m, args, pl, pt, *i, t);
+                    return self.overloaded_index(m, args, pl, pt, *i, t, (ex.lo, ex.hi));
                 }
                 let it = self.body_ty(*i);
                 let iv = self.lower_expr(*i);
@@ -6996,6 +7319,7 @@ impl<'a> Lcx<'a> {
                     }
                 };
                 self.bounds_check(iv[0], len);
+                self.disjoint_index(ex.lo, ex.hi, iv[0]);
                 let el = self.layout(elem);
                 let stride = crate::layout::round_up(el.size, el.align);
                 let s = self.iconst(stride as i64);
@@ -7043,6 +7367,49 @@ impl<'a> Lcx<'a> {
         match self.kind(self.body_ty(i)) {
             TyKind::Adt(d, _, _) => matches!(self.u.tcx.lang_items.by_def.get(&d), Some(LangItem::Range | LangItem::RangeFrom | LangItem::RangeTo | LangItem::RangeFull | LangItem::RangeInclusiveStruct | LangItem::RangeToInclusive)),
             _ => false,
+        }
+    }
+
+    /// Whether this lowering makes its verdict's run-time disjoint-index checks (D3).
+    pub fn lowers_disjoint_checks(&self) -> bool { self.d3.is_some() }
+
+    /// Relaxed Rust D3 (the verdict's run-time disjoint-index checks): the index `idx` of the index
+    /// expression at `lo..hi` is kept when a later borrow is checked against it, and compared with
+    /// every earlier index it must differ from; an overlap panics as `get_disjoint_mut(..).unwrap()`
+    /// does (the checker proved the earlier expression runs first on every path to this one).
+    fn disjoint_index(&mut self, lo: u32, hi: u32, idx: VReg) {
+        let Some(checks) = self.d3.clone() else { return };
+        let file = self.b.file;
+        let at = |s: &relax_types::mir::Span| s.file == file && s.lo == lo && s.hi == hi;
+        let slot_of = |this: &mut Self, s: &relax_types::mir::Span| -> u32 {
+            *this.d3_slots.entry((s.file, s.lo, s.hi)).or_insert_with(|| this.f.slot(8, 8))
+        };
+        for (first, second) in checks.iter() {
+            if at(second) {
+                let s = slot_of(self, first);
+                let a = self.f.vreg(Cls::I);
+                self.emit(Inst::SlotAddr(a, s));
+                let v = self.f.vreg(Cls::I);
+                self.emit(Inst::Load(Mem::Int(8, false), v, a, 0));
+                let c = self.f.vreg(Cls::I);
+                self.emit(Inst::ICmp(Cond::Eq, false, c, idx, v));
+                let ok = self.f.block();
+                let bad = self.f.block();
+                self.term(Term::Branch(c, bad, ok));
+                self.switch(bad);
+                let site = self.u.site_sym(self.b.file, lo, "called `Result::unwrap()` on an `Err` value: OverlappingIndices");
+                let sv = self.sym_val(site);
+                let rt = self.u.rs.panic_site;
+                self.emit(Inst::Call(Callee::Host(rt), vec![sv], Vec::new()));
+                self.term(Term::Unreachable);
+                self.switch(ok);
+            }
+        }
+        if checks.iter().any(|(first, _)| at(first)) {
+            let s = slot_of(self, &relax_types::mir::Span { file, lo, hi });
+            let a = self.f.vreg(Cls::I);
+            self.emit(Inst::SlotAddr(a, s));
+            self.emit(Inst::Store(Mem::Int(8, false), a, 0, idx));
         }
     }
 
@@ -7398,33 +7765,33 @@ impl<'a> Lcx<'a> {
 
     fn popcount64(&mut self, x: VReg) -> VReg {
         let d = self.f.vreg(Cls::I);
-        self.emit(Inst::IBit(crate::rir::BitOp::Popcnt, d, x));
+        self.emit(Inst::IBit(relax_backend::rir::BitOp::Popcnt, d, x));
         d
     }
 
     /// leading zeros of a 64-bit value (64 for 0)
     fn clz64(&mut self, x: VReg) -> VReg {
         let d = self.f.vreg(Cls::I);
-        self.emit(Inst::IBit(crate::rir::BitOp::Clz, d, x));
+        self.emit(Inst::IBit(relax_backend::rir::BitOp::Clz, d, x));
         d
     }
 
     /// trailing zeros of a 64-bit value (64 for 0)
     fn ctz64(&mut self, x: VReg) -> VReg {
         let d = self.f.vreg(Cls::I);
-        self.emit(Inst::IBit(crate::rir::BitOp::Ctz, d, x));
+        self.emit(Inst::IBit(relax_backend::rir::BitOp::Ctz, d, x));
         d
     }
 
     fn rev64(&mut self, x: VReg) -> VReg {
         let d = self.f.vreg(Cls::I);
-        self.emit(Inst::IBit(crate::rir::BitOp::Rev, d, x));
+        self.emit(Inst::IBit(relax_backend::rir::BitOp::Rev, d, x));
         d
     }
 
     fn bswap64(&mut self, x: VReg) -> VReg {
         let d = self.f.vreg(Cls::I);
-        self.emit(Inst::IBit(crate::rir::BitOp::Bswap, d, x));
+        self.emit(Inst::IBit(relax_backend::rir::BitOp::Bswap, d, x));
         d
     }
 
@@ -8137,7 +8504,7 @@ impl<'a> Lcx<'a> {
                 let addr = self.place_addr(&place, from);
                 let Some(mut words) = self.load_disc(addr, 0, from) else { return self.unit(); };
                 let repr = self.u.tcx.adts[&d].repr_int.unwrap_or(Prim::Isize);
-                let signed = crate::types::Types::int_info(repr).1;
+                let signed = self.u.tcx.tys.int_info(repr).1;
                 if self.is_wide(to) {
                     if words.len() == 1 {
                         let hi = if signed { { let shift = self.iconst(63); self.ibin(IOp::Shr, true, words[0], shift) } } else { self.iconst(0) };
@@ -8193,6 +8560,25 @@ impl<'a> Lcx<'a> {
                 let mut v = v;
                 v.truncate(n);
                 Val::L(v)
+            }
+            (TyKind::Int(_), TyKind::Ptr(..)) if crate::web::BASE != 0 && self.int_ty(from).bits == 32 && self.u.prog.session.options.check_target == crate::options::CheckTarget::Web(crate::options::PtrWidth::W64) => {
+                // the wasm64 web target: a 32-bit integer cast to a pointer is a wasm address, the
+                // offset into the linear memory's 4 GB window (web.rs); on wasm32 a pointer is that
+                // offset already
+                let x = if self.int_ty(from).signed {
+                    let z = self.f.vreg(Cls::I);
+                    self.emit(Inst::IBinI(IOp::And, U64, z, x, 0xffff_ffff));
+                    z
+                } else { x };
+                let d = self.f.vreg(Cls::I);
+                self.emit(Inst::IBinI(IOp::Or, U64, d, x, crate::web::BASE as i64));
+                Val::L(vec![d])
+            }
+            (TyKind::Int(_), TyKind::Ptr(..)) if self.pb() == 4 && self.int_ty(from).bits > 32 => {
+                // wasm32: an address is 32 bits; a wider integer truncates (as rustc's inttoptr)
+                let d = self.f.vreg(Cls::I);
+                self.emit(Inst::Conv(Conv::IntToInt(relax_backend::rir::U32), d, x));
+                Val::L(vec![d])
             }
             (TyKind::FnPtr(..), _) | (TyKind::Int(_), TyKind::Ptr(..)) => Val::L(v),
             _ => Val::L(v),
@@ -8384,6 +8770,27 @@ impl<'a> Lcx<'a> {
         match self.box_inner(self.body_ty(x)) {
             Some(inner) => self.needs_drop_glue(inner),
             None => false,
+        }
+    }
+
+    /// A struct update base that names memory the update does not own: a place reached through a
+    /// reference or raw pointer (`..*self`, `..self.layout`, `..v[i]`) or a static. Its remaining
+    /// fields are copied out (typeck requires them Copy: moving out of a borrow is E0507) and nothing
+    /// of it is dropped; only a value expression's temporary owns what the update leaves behind.
+    fn base_is_borrowed_place(&self, e: ExprId) -> bool {
+        match &self.ast().expr(e).kind {
+            ExprKind::Paren(x) => self.base_is_borrowed_place(*x),
+            ExprKind::Path(_) => self.is_place_expr(e),
+            ExprKind::Field(x, _) | ExprKind::TupleField(x, _) => {
+                // auto-deref through a reference makes the projection a borrowed place
+                let derefs = self.b.field_idx.get(&e.0).map_or(0, |&(d, _)| d);
+                (derefs > 0 && self.box_inner(self.body_ty(*x)).is_none()) || self.base_is_borrowed_place(*x)
+            }
+            // `v[i]` through the Index trait is `*v.index(i)`: borrowed; an array's element is part of the array
+            ExprKind::Index(x, _) => self.base_is_borrowed_place(*x) || !matches!(self.kind_ref(self.body_ty(*x)), TyKind::Array(..)),
+            // `*r` of a reference or pointer: borrowed; `*b` of a Box temporary owns its contents
+            ExprKind::Unary(UnOp::Deref, x) => self.box_inner(self.body_ty(*x)).is_none() || self.base_is_borrowed_place(*x),
+            _ => false,
         }
     }
 
@@ -8588,6 +8995,34 @@ impl<'a> Lcx<'a> {
     /// The matched place and its owner for move tracking; with a temporary owner
     /// (MatchRoot::Temp) also the temporary for the caller to register (its address and type)
     /// and the scrutinee's field path in it.
+    /// `matches!(x, pat if guard)` / `assert_matches!`: core expands both to a `match` with the
+    /// pattern's arm and a fallback, so `x` is a match scrutinee like `lower_match`'s (rustc
+    /// region.rs: no terminating scope; an rvalue -- or the base of a field of one, such as the
+    /// guard in `matches!(m.lock().unwrap().phase, ..)` -- is a temporary of the enclosing
+    /// statement, dropped at its end), and the pattern's bindings and the guard's temporaries
+    /// belong to the arm. Returns the scrutinee place and the blocks entered on a match (arm
+    /// left) and on no match / a failed guard; the current block is dead afterwards.
+    fn lower_macro_match(&mut self, x: ExprId, pat: Option<PatId>, guard: Option<ExprId>) -> (Place, TyId, u32, u32) {
+        self.want_mut = pat.map_or(false, |p| self.pat_binds_mut_ref(p));
+        let (place, pt, root, temp) = self.scrutinee(x);
+        self.want_mut = false;
+        if let (Some(MatchRoot::Temp(fl)), Some(tp)) = (root, &temp) {
+            self.stmt_temps.push((tp.addr, tp.ty, Some(fl)));
+        }
+        let ok = self.f.block();
+        let fail = self.f.block();
+        if let Some(p) = pat {
+            let gmark = self.stmt_temps.len();
+            let combos = if guard.is_some() { self.or_combos(p, 1024) } else { None };
+            self.enter_arm(x, p, guard, combos, true, &place, pt, root, &temp, fail, gmark);
+            self.drop_stmt_temps_from(gmark);
+            self.pop_scope();
+            self.pop_scope();
+        }
+        self.goto(ok);
+        (place, pt, ok, fail)
+    }
+
     fn scrutinee(&mut self, x: ExprId) -> (Place, TyId, Option<MatchRoot>, Option<ScrutTemp>) {
         let xt = self.body_ty(x);
         // `*tmp_box` of a temporary Box is the owned contents (temp_box_deref), not a place:
@@ -8626,6 +9061,121 @@ impl<'a> Lcx<'a> {
                 return (place, xt, root, Some(ScrutTemp { addr: a, ty: xt, path: Vec::new() }));
             }
             (place, xt, root, None)
+        }
+    }
+
+    /// Enters a match arm whose pattern `pat` is tested against the scrutinee `place: pt` (unless
+    /// `test` is false: a decision tree already did), failing to `next`: binds the pattern (moves
+    /// out of the scrutinee tracked through `root` / `temp`) and runs the guard. Leaves two
+    /// scopes pushed -- the pattern's bindings, then the guard's -- with the current block at the
+    /// arm body; the caller pops them (see `lower_match`). `gmark`: the arm's first statement
+    /// temporary. `combos`: the guarded arm's or-alternative candidates (`or_combos`).
+    #[allow(clippy::too_many_arguments)]
+    fn enter_arm(&mut self, x: ExprId, pat: PatId, guard: Option<ExprId>, combos: Option<Vec<Vec<(u32, usize)>>>, test: bool, place: &Place, pt: TyId, root: Option<MatchRoot>, temp: &Option<ScrutTemp>, next: u32, gmark: usize) {
+        if let (Some(g), Some(combos)) = (guard, combos) {
+            // a guarded arm (rustc match lowering): each or-alternative combination is a
+            // candidate of its own -- test it, bind (moves deferred), run the guard; a
+            // failing guard tries the next alternative, then the next arm, with the
+            // scrutinee untouched
+            let body = self.f.block();
+            let arm_depth = self.scopes.len();
+            self.push_scope();
+            let mut lis = Vec::new();
+            self.pat_binding_locals(pat, &mut lis);
+            for li in &lis {
+                self.local_place(*li);
+                // the pattern's bindings belong to the arm scope (registered before the
+                // guard's scope is pushed)
+                let lt = self.monomorphize(self.b.locals[*li as usize].ty);
+                if self.needs_drop_glue(lt) && !self.foreign[*li as usize] {
+                    self.flag_of(*li);
+                }
+            }
+            // the guard's `let` bindings: a scope of their own, dropped before the guard's
+            // temporaries and the pattern's bindings (rustc if-let guard scopes)
+            self.push_scope();
+            let n = combos.len();
+            for (ci, combo) in combos.into_iter().enumerate() {
+                let alt_fail = if ci + 1 == n { next } else { self.f.block() };
+                self.or_force = combo.into_iter().collect();
+                self.test_pat(pat, place, pt, alt_fail);
+                let saved = (self.match_root, self.pat_path.take());
+                self.match_root = root;
+                self.pat_path = self.root_path(x, root, temp);
+                self.defer_moves = Some(Vec::new());
+                self.bind_pat_place(pat, place, pt);
+                let pend = self.defer_moves.take().unwrap_or_default();
+                self.match_root = saved.0;
+                self.pat_path = saved.1;
+                self.or_force.clear();
+                let gok = self.f.block();
+                let gfail = self.f.block();
+                // a guard is a temporary scope: its `let` scrutinee temporaries drop with its
+                // bindings, in creation order
+                let saved_rescope = self.cond_rescope.replace(self.scopes.len() - 1);
+                self.lower_cond(g, gok, gfail);
+                self.cond_rescope = saved_rescope;
+                // (an if-let guard's temporaries: dropped when it fails, else at the
+                // arm's end)
+                // guard failed: the bindings were copies, nothing was moved; the guard's
+                // own `let` bindings drop here
+                self.switch(gfail);
+                for li in &lis {
+                    if let Some(f) = self.drop_flags[*li as usize] {
+                        self.emit(Inst::Iconst(f, 0));
+                    }
+                }
+                self.drop_scopes_from(arm_depth);
+                self.clear_scope_temp_flags(arm_depth + 1);
+                self.drop_stmt_temps_here(gmark);
+                self.goto(alt_fail);
+                self.switch(gok);
+                for mv in pend {
+                    self.do_move(mv);
+                }
+                self.goto(body);
+                if ci + 1 < n {
+                    self.switch(alt_fail);
+                }
+            }
+            self.switch(body);
+        } else {
+            if test {
+                self.test_pat(pat, place, pt, next);
+            }
+            let arm_depth = self.scopes.len();
+            self.push_scope();
+            let saved = (self.match_root, self.pat_path.take());
+            self.match_root = root;
+            self.pat_path = self.root_path(x, root, temp);
+            // (a guarded arm here has too many or-candidates to try one by one: its moves
+            // happen before the guard, as a dynamic or-dispatch has no single move set; a
+            // failing guard then leaks the moved parts, never drops them twice)
+            self.bind_pat_place(pat, place, pt);
+            self.match_root = saved.0;
+            self.pat_path = saved.1;
+            // the guard's scope (see the candidate path above)
+            self.push_scope();
+            if let Some(g) = guard {
+                let body = self.f.block();
+                let gfail = self.f.block();
+                let saved_rescope = self.cond_rescope.replace(self.scopes.len() - 1);
+                self.lower_cond(g, body, gfail);
+                self.cond_rescope = saved_rescope;
+                self.switch(gfail);
+                let mut lis = Vec::new();
+                self.pat_binding_locals(pat, &mut lis);
+                for li in &lis {
+                    if let Some(f) = self.drop_flags[*li as usize] {
+                        self.emit(Inst::Iconst(f, 0));
+                    }
+                }
+                self.drop_scopes_from(arm_depth);
+                self.clear_scope_temp_flags(arm_depth + 1);
+                self.drop_stmt_temps_here(gmark);
+                self.goto(next);
+                self.switch(body);
+            }
         }
     }
 
@@ -8753,111 +9303,7 @@ impl<'a> Lcx<'a> {
             }
             // the guard's temporaries (if-let guards) belong to the arm
             let gmark = self.stmt_temps.len();
-            if let (Some(g), Some(combos)) = (arm.guard, combos[k].clone()) {
-                // a guarded arm (rustc match lowering): each or-alternative combination is a
-                // candidate of its own -- test it, bind (moves deferred), run the guard; a
-                // failing guard tries the next alternative, then the next arm, with the
-                // scrutinee untouched
-                let body = self.f.block();
-                let arm_depth = self.scopes.len();
-                self.push_scope();
-                let mut lis = Vec::new();
-                self.pat_binding_locals(arm.pat, &mut lis);
-                for li in &lis {
-                    self.local_place(*li);
-                    // the pattern's bindings belong to the arm scope (registered before the
-                    // guard's scope is pushed)
-                    let lt = self.monomorphize(self.b.locals[*li as usize].ty);
-                    if self.needs_drop_glue(lt) && !self.foreign[*li as usize] {
-                        self.flag_of(*li);
-                    }
-                }
-                // the guard's `let` bindings: a scope of their own, dropped before the guard's
-                // temporaries and the pattern's bindings (rustc if-let guard scopes)
-                self.push_scope();
-                let n = combos.len();
-                for (ci, combo) in combos.into_iter().enumerate() {
-                    let alt_fail = if ci + 1 == n { next } else { self.f.block() };
-                    self.or_force = combo.into_iter().collect();
-                    self.test_pat(arm.pat, &place, pt, alt_fail);
-                    let saved = (self.match_root, self.pat_path.take());
-                    self.match_root = root;
-                    self.pat_path = self.root_path(x, root, &temp);
-                    self.defer_moves = Some(Vec::new());
-                    self.bind_pat_place(arm.pat, &place, pt);
-                    let pend = self.defer_moves.take().unwrap_or_default();
-                    self.match_root = saved.0;
-                    self.pat_path = saved.1;
-                    self.or_force.clear();
-                    let gok = self.f.block();
-                    let gfail = self.f.block();
-                    // a guard is a temporary scope: its `let` scrutinee temporaries drop with its
-                    // bindings, in creation order
-                    let saved_rescope = self.cond_rescope.replace(self.scopes.len() - 1);
-                    self.lower_cond(g, gok, gfail);
-                    self.cond_rescope = saved_rescope;
-                    // (an if-let guard's temporaries: dropped when it fails, else at the
-                    // arm's end)
-                    // guard failed: the bindings were copies, nothing was moved; the guard's
-                    // own `let` bindings drop here
-                    self.switch(gfail);
-                    for li in &lis {
-                        if let Some(f) = self.drop_flags[*li as usize] {
-                            self.emit(Inst::Iconst(f, 0));
-                        }
-                    }
-                    self.drop_scopes_from(arm_depth);
-                    self.clear_scope_temp_flags(arm_depth + 1);
-                    self.drop_stmt_temps_here(gmark);
-                    self.goto(alt_fail);
-                    self.switch(gok);
-                    for mv in pend {
-                        self.do_move(mv);
-                    }
-                    self.goto(body);
-                    if ci + 1 < n {
-                        self.switch(alt_fail);
-                    }
-                }
-                self.switch(body);
-            } else {
-                if !tree_mode {
-                    self.test_pat(arm.pat, &place, pt, next);
-                }
-                let arm_depth = self.scopes.len();
-                self.push_scope();
-                let saved = (self.match_root, self.pat_path.take());
-                self.match_root = root;
-                self.pat_path = self.root_path(x, root, &temp);
-                // (a guarded arm here has too many or-candidates to try one by one: its moves
-                // happen before the guard, as a dynamic or-dispatch has no single move set; a
-                // failing guard then leaks the moved parts, never drops them twice)
-                self.bind_pat_place(arm.pat, &place, pt);
-                self.match_root = saved.0;
-                self.pat_path = saved.1;
-                // the guard's scope (see the candidate path above)
-                self.push_scope();
-                if let Some(g) = arm.guard {
-                    let body = self.f.block();
-                    let gfail = self.f.block();
-                    let saved_rescope = self.cond_rescope.replace(self.scopes.len() - 1);
-                    self.lower_cond(g, body, gfail);
-                    self.cond_rescope = saved_rescope;
-                    self.switch(gfail);
-                    let mut lis = Vec::new();
-                    self.pat_binding_locals(arm.pat, &mut lis);
-                    for li in &lis {
-                        if let Some(f) = self.drop_flags[*li as usize] {
-                            self.emit(Inst::Iconst(f, 0));
-                        }
-                    }
-                    self.drop_scopes_from(arm_depth);
-                    self.clear_scope_temp_flags(arm_depth + 1);
-                    self.drop_stmt_temps_here(gmark);
-                    self.goto(next);
-                    self.switch(body);
-                }
-            }
+            self.enter_arm(x, arm.pat, arm.guard, combos[k].clone(), !tree_mode, &place, pt, root, &temp, next, gmark);
             let mark = self.stmt_temps.len();
             let v = self.lower_expr_coerced(arm.body, t);
             if !self.is_never(t) {
@@ -9021,7 +9467,7 @@ impl<'a> Lcx<'a> {
         }
         for (v, t) in args.into_iter() {
             let l = self.layout(t);
-            let c_agg = csig.is_some() && l.size > 0 && matches!(crate::cabi::c_arg(self.u, t), crate::rir::CArg::Agg(_));
+            let c_agg = csig.is_some() && l.size > 0 && matches!(crate::cabi::c_arg(self.u, t), relax_backend::rir::CArg::Agg(_));
             match l.leaves {
                 Some(_) if !c_agg => {
                     let r = self.to_leaves(v, t);
@@ -9066,11 +9512,9 @@ impl<'a> Lcx<'a> {
         let callee = match callee {
             Callee::Fn(id) if to_twin => {
                 let twin = self.u.plain_twin(id);
-                if twin != id {
-                    self.f.plain_calls = true;
-                    if sret.is_some() && !self.f.sret_callees.contains(&twin) {
-                        self.f.sret_callees.push(twin);
-                    }
+                if twin != id { self.f.plain_calls = true; }
+                if sret.is_some() && !self.f.sret_callees.contains(&twin) {
+                    self.f.sret_callees.push(twin);
                 }
                 Callee::Fn(twin)
             }
@@ -9124,7 +9568,8 @@ impl<'a> Lcx<'a> {
                 let receiver = self.to_leaves(vals[0].0.clone(), vals[0].1);
                 assert_eq!(receiver.len(), 2, "virtual receiver metadata");
                 let ptr = self.f.vreg(Cls::I);
-                self.emit(Inst::Load(Mem::Int(8, false), ptr, receiver[1], (index * 8) as i32));
+                let pm = self.pmem();
+                self.emit(Inst::Load(pm, ptr, receiver[1], (index * self.pb() as usize) as i32));
                 vals[0] = (Val::L(vec![receiver[0]]), self.u.tcx.tys.usize_);
                 self.indirect_tracked = self.u.tcx.fn_sig(&self.u.prog, d).is_some_and(|s| s.track_caller);
                 if self.u.tcx.fn_sig(&self.u.prog, d).is_some_and(|s| s.header.abi == crate::types::Abi::RustCall) { self.spread_tuple_argument(&mut vals); }
@@ -9466,7 +9911,7 @@ impl<'a> Lcx<'a> {
     /// `core::intrinsics_atomic::*`. Orderings are `Ordering as u8` (0 Relaxed, 1 Release,
     /// 2 Acquire, 3 AcqRel, 4 SeqCst); one that is not a constant here becomes SeqCst.
     fn atomic_intrinsic(&mut self, name: &str, gargs: &[TyId], vals: &[(Val, TyId)]) -> Val {
-        use crate::rir::{AtomOrd, RmwOp};
+        use relax_backend::rir::{AtomOrd, RmwOp};
         let mut a: Vec<VReg> = Vec::new();
         for (v, ty) in vals {
             let r = self.to_leaves(v.clone(), *ty);
@@ -9501,10 +9946,10 @@ impl<'a> Lcx<'a> {
                         let it = self.int_ty(g);
                         Mem::Int(it.bits / 8, it.signed)
                     }
-                    _ => Mem::Int(8, false),
+                    _ => self.pmem(),
                 }
             }
-            None => Mem::Int(8, false),
+            None => self.pmem(),
         };
         let rmw = |n: &str| -> Option<RmwOp> {
             Some(match n {
@@ -9623,7 +10068,8 @@ impl<'a> Lcx<'a> {
                     if let TyKind::Dyn(..) = self.kind(g) {
                         // through the vtable's drop entry (0 when the type has no drop)
                         let fp = self.f.vreg(Cls::I);
-                        self.emit(Inst::Load(Mem::Int(8, false), fp, p[1], (VT_DROP * 8) as i32));
+                        let pm = self.pmem();
+                        self.emit(Inst::Load(pm, fp, p[1], (VT_DROP * self.pb()) as i32));
                         let yes = self.f.block();
                         let join = self.f.block();
                         self.term(Term::Branch(fp, yes, join));
@@ -9676,7 +10122,8 @@ impl<'a> Lcx<'a> {
                     TyKind::Dyn(..) => {
                         let d = self.f.vreg(Cls::I);
                         let w = if size { VT_SIZE } else { VT_ALIGN };
-                        self.emit(Inst::Load(Mem::Int(8, false), d, p[1], (w * 8) as i32));
+                        let pm = self.pmem();
+                        self.emit(Inst::Load(pm, d, p[1], (w * self.pb()) as i32));
                         d
                     }
                     TyKind::Slice(e) if size => {
@@ -9747,9 +10194,10 @@ impl<'a> Lcx<'a> {
                                     m as i64
                                 };
                                 let vs = self.f.vreg(Cls::I);
-                                self.emit(Inst::Load(Mem::Int(8, false), vs, p[1], (VT_SIZE * 8) as i32));
+                                let pm = self.pmem();
+                                self.emit(Inst::Load(pm, vs, p[1], (VT_SIZE * self.pb()) as i32));
                                 let va0 = self.f.vreg(Cls::I);
-                                self.emit(Inst::Load(Mem::Int(8, false), va0, p[1], (VT_ALIGN * 8) as i32));
+                                self.emit(Inst::Load(pm, va0, p[1], (VT_ALIGN * self.pb()) as i32));
                                 // `repr(packed(n))`: the tail's alignment is capped at n (rustc:
                                 // packed structs clamp every field's alignment, the dynamic one too)
                                 let packed = match self.kind(g) {
@@ -9825,14 +10273,14 @@ impl<'a> Lcx<'a> {
             // merges, forwards or reorders. A larger value: a volatile access of its first byte
             // keeps the access (and its fault) in place, the value moves as an ordinary read/write.
             "volatile_load" | "volatile_store" => {
-                use crate::rir::AtomOrd;
+                use relax_backend::rir::AtomOrd;
                 let p = leaf(self, 0);
                 let g = g0?;
                 let size = self.layout(g).size;
                 let kind = self.kind(g);
                 let scalar = match kind {
                     TyKind::Int(_) | TyKind::Bool | TyKind::Char => Some((Mem::Int(self.int_ty(g).bits / 8, self.int_ty(g).signed), None)),
-                    TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::Ref(..) if size == 8 => Some((Mem::Int(8, false), None)),
+                    TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::Ref(..) if size == self.pb() => Some((self.pmem(), None)),
                     TyKind::Float(_) if size == 4 || size == 8 => Some((Mem::Int(size as u8, false), Some(size == 8))),
                     _ => None,
                 };
@@ -10012,8 +10460,8 @@ impl<'a> Lcx<'a> {
     fn vx_intrinsic(&mut self, name: &str, vals: &[(Val, TyId)], t: TyId) -> Val {
         let arity = match name {
             "vx_binary" | "vx_unary" | "vx_ternary" => 4,
-            "vx_splat" | "vx_store" | "vx_narrow" | "vx_table" => 2,
-            "vx_load" | "vx_mask" | "vx_sha1h" => 1,
+            "vx_splat" | "vx_store" | "vx_narrow" | "vx_table" | "vx_mask" => 2,
+            "vx_load" | "vx_sha1h" => 1,
             "vx_blend" | "vx_sha1rnds4" => 3,
             _ => {
                 self.err(self.pos, "unknown SIMD intrinsic".into());
@@ -10029,45 +10477,6 @@ impl<'a> Lcx<'a> {
             return self.dummy_val(t);
         }
         let scalar = |s: &mut Self, k: usize| s.to_leaves(vals[k].0.clone(), vals[k].1)[0];
-        // the selector's value when the current block defines it from constants: an Iconst,
-        // copies/int casts of one, or and/or/xor/shift/add/sub with an immediate or another
-        // constant (`MASK & 0x0f` of a const generic)
-        fn const_of(insts: &[Inst], upto: usize, r: VReg) -> Option<i64> {
-            for (at, i) in insts[..upto].iter().enumerate().rev() {
-                match i {
-                    Inst::Iconst(d, x) if *d == r => return Some(*x),
-                    Inst::Mov(d, a) | Inst::Conv(Conv::IntToInt(_), d, a) if *d == r => return const_of(insts, at, *a),
-                    Inst::IBinI(op, _, d, a, imm) if *d == r => {
-                        let x = const_of(insts, at, *a)?;
-                        return match op {
-                            IOp::And => Some(x & imm),
-                            IOp::Or => Some(x | imm),
-                            IOp::Xor => Some(x ^ imm),
-                            IOp::Shl => Some(x.wrapping_shl(*imm as u32)),
-                            IOp::Shr => Some(((x as u64) >> (*imm as u32 & 63)) as i64),
-                            IOp::Add => Some(x.wrapping_add(*imm)),
-                            IOp::Sub => Some(x.wrapping_sub(*imm)),
-                            _ => None,
-                        };
-                    }
-                    Inst::IBin(op, _, d, a, b) if *d == r => {
-                        let (x, y) = (const_of(insts, at, *a)?, const_of(insts, at, *b)?);
-                        return match op {
-                            IOp::And => Some(x & y),
-                            IOp::Or => Some(x | y),
-                            IOp::Xor => Some(x ^ y),
-                            IOp::Shl => Some(x.wrapping_shl(y as u32)),
-                            IOp::Shr => Some(((x as u64) >> (y as u32 & 63)) as i64),
-                            IOp::Add => Some(x.wrapping_add(y)),
-                            IOp::Sub => Some(x.wrapping_sub(y)),
-                            _ => None,
-                        };
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
         let constant = |s: &mut Self, k: usize| -> i64 {
             let r = scalar(s, k);
             let insts = &s.f.blocks[s.cur as usize].insts;
@@ -10185,9 +10594,19 @@ impl<'a> Lcx<'a> {
             self.emit(Inst::VX(VX::Or, indices, b, bad));
             self.emit(Inst::VX(VX::ByteShuffle, d, a, indices));
         } else if name == "vx_mask" {
+            // the top bit of each lane of the given width (pmovmskb / movmskps / movmskpd)
+            let op = match constant(self, 1) {
+                8 => VX::MoveMaskB,
+                32 => VX::MoveMask(VW::S),
+                64 => VX::MoveMask(VW::D),
+                _ => {
+                    self.err(self.pos, "invalid SIMD mask lane width".into());
+                    return self.dummy_val(t);
+                }
+            };
             let a = vector(self, 0);
             let r = self.f.vreg(Cls::I);
-            self.emit(Inst::VX(VX::MoveMaskB, r, a, a));
+            self.emit(Inst::VX(op, r, a, a));
             return Val::L(vec![r]);
         } else if name == "vx_blend" {
             let a = vector(self, 0);
@@ -10300,26 +10719,26 @@ impl<'a> Lcx<'a> {
                         }
                         40..=53 | 60..=63 => {
                             let fop = match op {
-                                40 => VOp::FAddIntel,
-                                60 => VOp::FAddNeon,
-                                41 => VOp::FSubIntel,
-                                61 => VOp::FSubNeon,
-                                42 => VOp::FMulIntel,
-                                62 => VOp::FMulNeon,
-                                43 => VOp::FDivIntel,
-                                63 => VOp::FDivNeon,
-                                44 => VOp::FMinLt,
-                                45 => VOp::FMaxGt,
-                                46 => VOp::FCmp(Cond::Eq),
-                                47 => VOp::FCmp(Cond::Ne),
-                                48 => VOp::FCmp(Cond::Lt),
-                                49 => VOp::FCmp(Cond::Le),
-                                50 => VOp::FCmp(Cond::Gt),
-                                52 => VOp::FMinNeon,
-                                53 => VOp::FMaxNeon,
-                                _ => VOp::FCmp(Cond::Ge),
+                                40 => VX::FAdd(VW::S, NanBits::Intel),
+                                60 => VX::FAdd(VW::S, NanBits::Neon),
+                                41 => VX::FSub(VW::S, NanBits::Intel),
+                                61 => VX::FSub(VW::S, NanBits::Neon),
+                                42 => VX::FMul(VW::S, NanBits::Intel),
+                                62 => VX::FMul(VW::S, NanBits::Neon),
+                                43 => VX::FDiv(VW::S, NanBits::Intel),
+                                63 => VX::FDiv(VW::S, NanBits::Neon),
+                                44 => VX::FMinLt(VW::S),
+                                45 => VX::FMaxGt(VW::S),
+                                46 => VX::FCmp(Cond::Eq, VW::S),
+                                47 => VX::FCmp(Cond::Ne, VW::S),
+                                48 => VX::FCmp(Cond::Lt, VW::S),
+                                49 => VX::FCmp(Cond::Le, VW::S),
+                                50 => VX::FCmp(Cond::Gt, VW::S),
+                                52 => VX::FMinNeon(VW::S),
+                                53 => VX::FMaxNeon(VW::S),
+                                _ => VX::FCmp(Cond::Ge, VW::S),
                             };
-                            self.emit(Inst::VBin(fop, d, a, b));
+                            self.emit(Inst::VX(fop, d, a, b));
                             return self.vx_result(d, t);
                         }
                         _ => {
@@ -10349,11 +10768,11 @@ impl<'a> Lcx<'a> {
                         5 => VX::BytesShrI(k),
                         6 => VX::BytesShlI(k),
                         7 | 9 => {
-                            self.emit(Inst::VUn(if op == 7 { VUn::FSqrtIntel } else { VUn::FSqrtNeon }, d, a));
+                            self.emit(Inst::VX(VX::FSqrt(VW::S, if op == 7 { NanBits::Intel } else { NanBits::Neon }), d, a, a));
                             return self.vx_result(d, t);
                         }
                         8 => {
-                            self.emit(Inst::VUn(VUn::FAbs, d, a));
+                            self.emit(Inst::VX(VX::FAbs(VW::S), d, a, a));
                             return self.vx_result(d, t);
                         }
                         _ => {
@@ -10378,6 +10797,41 @@ impl<'a> Lcx<'a> {
         Val::M(base, 0)
     }
 
+    /// The allocator shim (rustc_codegen_ssa base.rs allocator_shim / codegen_allocator: `__rust_<op>`
+    /// calls `__rg_<op>` of the program's `#[global_allocator]`, else the default `__rdl_<op>`):
+    /// core::heap::__rg_<op>::<A>(&STATIC, args) or core::heap::__rdl_<op>(args).
+    fn allocator_shim(&mut self, op: &str, vals: &[(Val, TyId)], t: TyId) -> Val {
+        let mut args = vals.to_vec();
+        let id = match self.u.global_allocator() {
+            Some((s, a)) => {
+                let Some(shim) = self.u.core_path(&["heap", &format!("__rg_{op}")]) else {
+                    self.err(self.pos, format!("core has no heap::__rg_{op} (the global allocator shim)"));
+                    return self.dummy_val(t);
+                };
+                // the static as a place, as a path to it lowers (lower_def_value)
+                crate::boundary::note_static(self.u, self.b.def, &self.b.args, s);
+                if !self.u.provided.is_empty() {
+                    self.check_provided_static(s, a);
+                }
+                let addr = self.static_addr(s);
+                let addr = self.u.syms.intern(crate::syms::SymKind::Static(s), addr);
+                let p = self.f.vreg(Cls::I);
+                self.emit(Inst::Addr(p, addr));
+                let r = self.u.tcx.tys.intern(TyKind::Ref(false, a, crate::types::RegionId::ERASED));
+                args.insert(0, (Val::L(vec![p]), r));
+                self.u.fn_id(FnKey::Inst(shim, vec![a]))
+            }
+            None => {
+                let Some(default) = self.u.core_path(&["heap", &format!("__rdl_{op}")]) else {
+                    self.err(self.pos, format!("core has no heap::__rdl_{op} (the default allocator)"));
+                    return self.dummy_val(t);
+                };
+                self.u.fn_id(FnKey::Inst(default, Vec::new()))
+            }
+        };
+        self.emit_call(Callee::Fn(id), args, t)
+    }
+
     fn intrinsic(&mut self, d: DefId, gargs: &[TyId], vals: &[(Val, TyId)], t: TyId) -> Option<Val> {
         if self.u.prog.def(d).kind != DefKind::ForeignFn || !self.u.is_intrinsic(d) {
             return None;
@@ -10386,11 +10840,19 @@ impl<'a> Lcx<'a> {
         if name.starts_with("vx_") {
             return Some(self.vx_intrinsic(&name, vals, t));
         }
+        if name.starts_with("simd_") {
+            if let Some(v) = self.simd_intrinsic(&name, vals, t) {
+                return Some(v);
+            }
+        }
         if name.starts_with("atomic_") || name == "spin_loop_hint" {
             return Some(self.atomic_intrinsic(&name, gargs, vals));
         }
         if let Some(v) = self.mem_intrinsic(&name, gargs, vals, t) {
             return Some(v);
+        }
+        if let Some(op) = name.strip_prefix("rust_").filter(|op| matches!(*op, "alloc" | "alloc_zeroed" | "dealloc" | "realloc")) {
+            return Some(self.allocator_shim(op, vals, t));
         }
         let mut a = Vec::new();
         for (v, ty) in vals {
@@ -10407,6 +10869,9 @@ impl<'a> Lcx<'a> {
                 "ceil" => FUn::Ceil,
                 "trunc" => FUn::Trunc,
                 "rint" => FUn::RoundEven,
+                // round half away from zero (Rust `round`): inline on both backends (x64
+                // trunc(x + copysign(0.5 - ulp/2, x)), arm64 frinta), not a libm call
+                "round" => FUn::RoundAway,
                 _ => return None,
             })
         };
@@ -10706,11 +11171,8 @@ impl<'a> Lcx<'a> {
         let margs = ast.mac_arg(m.args);
         let mexprs = ast.list(margs.exprs);
         match name {
-            "asm" => {
-                // rejected by typeck (no assembler in Relax)
-                self.err(self.pos, "inline assembly is not supported; use core::arch intrinsics".to_string());
-                self.unit()
-            }
+            // assembled unless `--no-asm` (typeck reports the block then)
+            "asm" => self.lower_asm(margs),
             "assert" => {
                 let c = mexprs[0];
                 let ok = self.f.block();
@@ -10795,23 +11257,9 @@ impl<'a> Lcx<'a> {
             "assert_matches" => {
                 // rustc core panicking::assert_matches_failed: the value in Debug and the
                 // pattern's source text
-                let x = mexprs[0];
-                let xt = self.body_ty(x);
-                let v = self.lower_expr(x);
-                let place = self.val_to_place(v.clone());
-                let ok = self.f.block();
-                let bad = self.f.block();
-                if let Some(p) = margs.pat {
-                    self.test_pat(p, &place, xt, bad);
-                    self.bind_pat_place(p, &place, xt);
-                    if let Some(g) = margs.guard {
-                        let g_ok = self.f.block();
-                        self.lower_cond(g, g_ok, bad);
-                        self.switch(g_ok);
-                    }
-                }
-                self.goto(ok);
+                let (place, xt, ok, bad) = self.lower_macro_match(mexprs[0], margs.pat, margs.guard);
                 self.switch(bad);
+                let v = self.read_place(&place, xt);
                 // the pattern's tokens: after the first top-level comma up to its `if` / comma
                 let u = self.u;
                 let src = u.prog.src(self.b.file);
@@ -10856,22 +11304,10 @@ impl<'a> Lcx<'a> {
                 self.unit()
             }
             "matches" => {
-                let x = mexprs[0];
-                let xt = self.body_ty(x);
-                let v = self.lower_expr(x);
-                let place = self.val_to_place(v);
+                let (_, _, ok, fail) = self.lower_macro_match(mexprs[0], margs.pat, margs.guard);
                 let res = self.f.vreg(Cls::I);
-                let fail = self.f.block();
                 let join = self.f.block();
-                if let Some(p) = margs.pat {
-                    self.test_pat(p, &place, xt, fail);
-                    self.bind_pat_place(p, &place, xt);
-                    if let Some(g) = margs.guard {
-                        let ok = self.f.block();
-                        self.lower_cond(g, ok, fail);
-                        self.switch(ok);
-                    }
-                }
+                self.switch(ok);
                 self.emit(Inst::Iconst(res, 1));
                 self.goto(join);
                 self.switch(fail);
@@ -11141,7 +11577,7 @@ pub fn closure_map(_b: &Body) -> HashMap<u32, u32> {
 /// Compiler-generated helper functions per type. GLUE_DROP: `fn(p: *mut T)` runs T's Drop
 /// impl (if any) and then drops every field that needs it, in declaration order.
 /// Static `core::panic::Location { file, line, col }` data (memoized per site).
-pub fn location_const(u: &Unit, path: &str, line: u32, col: u32) -> crate::rir::Sym {
+pub fn location_const(u: &Unit, path: &str, line: u32, col: u32) -> relax_backend::rir::Sym {
     let a = location_addr(u, path, line, col);
     if a == 0 {
         return u.syms.intern(crate::syms::SymKind::Rt("null"), 0);
@@ -11178,14 +11614,15 @@ fn location_addr(u: &Unit, path: &str, line: u32, col: u32) -> u64 {
             blob[o..o + b.len()].copy_from_slice(b);
         }
     };
-    put(&mut blob, lay.fields[0], &fa.to_le_bytes());
-    put(&mut blob, lay.fields[0] + 8, &(file_bytes.len() as u64).to_le_bytes());
+    let pb = u.ptr_bytes();
+    put(&mut blob, lay.fields[0], &u.ptr_word(fa));
+    put(&mut blob, lay.fields[0] + pb, &u.ptr_word(file_bytes.len() as u64));
     put(&mut blob, lay.fields[1], &line.to_le_bytes());
     put(&mut blob, lay.fields[2], &col.to_le_bytes());
     // pointer words: the file name's bytes; the rest integers
-    let mut words = vec![None; (blob.len() + 7) / 8];
-    assert!(lay.fields[0] % 8 == 0, "Location's file field is not 8-aligned");
-    words[(lay.fields[0] / 8) as usize] = Some(u.data_sym(fa));
+    let mut words = vec![None; (blob.len() + pb as usize - 1) / pb as usize];
+    assert!(lay.fields[0] % pb == 0, "Location's file field is not pointer-aligned");
+    words[(lay.fields[0] / pb) as usize] = Some(u.data_sym(fa));
     let a = u.data(&blob, lay.align.max(1) as u64, crate::syms::DataKind::Words(words));
     u.syms.set_data_name(a, format!("loc:{}:{}:{}", path, line, col));
     // another thread may have made this location meanwhile (the memo is not held while the
@@ -11214,7 +11651,7 @@ pub fn takes_caller_loc(u: &Unit, id: u32) -> bool {
 /// array, the shim moves them out and writes the result to the result slot (or the caller's
 /// result address). A shim that caught a panic returns 1: its text is read through the crate's
 /// `__host_last_panic` and raised here as a Relax panic.
-pub fn bridge_func(u: &Unit, d: DefId, name: String, shim: crate::rir::Sym, last_panic: crate::rir::Sym) -> Option<Func> {
+pub fn bridge_func(u: &Unit, d: DefId, name: String, shim: relax_backend::rir::Sym, last_panic: relax_backend::rir::Sym) -> Option<Func> {
     let s = u.tcx.fn_sig(&u.prog, d).cloned()?;
     let ps: Vec<TyId> = s.params.iter().map(|p| u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), *p)).collect();
     let ret = u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), s.ret);
@@ -11222,7 +11659,7 @@ pub fn bridge_func(u: &Unit, d: DefId, name: String, shim: crate::rir::Sym, last
 }
 
 /// bridge_func for an explicit signature (a derived method of an opaque type).
-pub fn bridge_func_sig(u: &Unit, ps: &[TyId], ret: TyId, name: String, shim: crate::rir::Sym, last_panic: crate::rir::Sym) -> Func {
+pub fn bridge_func_sig(u: &Unit, ps: &[TyId], ret: TyId, name: String, shim: relax_backend::rir::Sym, last_panic: relax_backend::rir::Sym) -> Func {
     let mut f = Func::new(name, 0);
     let b = f.block();
     let rl = u.lay.of(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, ret);
@@ -11291,7 +11728,7 @@ pub fn bridge_func_sig(u: &Unit, ps: &[TyId], ret: TyId, name: String, shim: cra
     let out = f.vreg(Cls::I);
     let out_len = f.vreg(Cls::I);
     push(&mut f, bad, Inst::SlotAddr(out, out_slot));
-    push(&mut f, bad, Inst::IBinI(IOp::Add, crate::rir::I64, out_len, out, 8));
+    push(&mut f, bad, Inst::IBinI(IOp::Add, relax_backend::rir::I64, out_len, out, 8));
     let lp_sig = crate::cabi::c_sig(u, &[usize_, usize_], u.tcx.tys.unit, None, crate::types::Abi::C);
     push(&mut f, bad, Inst::Call(Callee::CHost(last_panic, Box::new(lp_sig)), vec![out, out_len], Vec::new()));
     let (mp, ml, z, site) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
@@ -11513,7 +11950,7 @@ pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>,
             let d = f.vreg(Cls::I);
             let discr = adt.discriminant_for_variant(&u.tcx, &u.prog, v)?;
             push_at(f, b, pos, Inst::Iconst(d, discr.signed_value() as i64));
-            if crate::types::Types::int_info(discr.ty).0 == 16 {
+            if u.tcx.tys.int_info(discr.ty).0 == 16 {
                 let hi = f.vreg(Cls::I);
                 push_at(f, b, pos, Inst::Iconst(hi, (discr.val >> 64) as i64));
                 vec![d, hi]
@@ -11662,7 +12099,10 @@ pub fn decode_tag_const(u: &Unit, raw: i128, l: &Layout, adt: &crate::tcx::AdtT)
     use crate::layout::TagEnc;
     if l.uninhabited { return None; }
     Some(match l.enc {
-        TagEnc::Direct => crate::tcx::Discr { val: raw as u128, ty: adt.repr_int.unwrap_or(Prim::Isize) }.signed_value(),
+        TagEnc::Direct => {
+            let ty = adt.repr_int.unwrap_or(Prim::Isize);
+            crate::tcx::Discr { val: raw as u128, ty, bytes: u.tcx.tys.int_info(ty).0 }.signed_value()
+        }
         TagEnc::Single(v) => adt.discriminant_for_variant(&u.tcx, &u.prog, v)?.signed_value(),
         TagEnc::Niche { untagged, lo, hi, start } => {
             let bytes = match l.tag {
@@ -12216,8 +12656,8 @@ fn rt_divrem128(mode: u64, alo: u64, ahi: u64, blo: u64, bhi: u64) -> WideRet {
 /// State word (rustc's discriminant): 0 unresumed, 1 returned, 2 poisoned (running: a panic
 /// leaves it), 3 + k suspended at point k. A poll with a null context (the coroutine dropped)
 /// runs the drops of its suspension point.
-fn coroutine_transform(f: &mut Func, c: &Coro) -> Result<(u32, u32, u64), String> {
-    use crate::regalloc::{term_uses, uses_defs};
+fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32) -> Result<(u32, u32, u64), String> {
+    use relax_backend::regalloc::{term_uses, uses_defs};
     // drop flags whose value is known where they are tested (a value moved out before a
     // suspension point: rustc's maybe-initialized analysis) -- the dead drop would keep the
     // value's slot saved across it
@@ -12343,9 +12783,9 @@ fn coroutine_transform(f: &mut Func, c: &Coro) -> Result<(u32, u32, u64), String
                             changed = true;
                         }
                     }
-                    // a narrower value is never an address
-                    Inst::Load(m, ..) | Inst::Store(m, ..) | Inst::AtomicLoad(m, ..) | Inst::AtomicStore(m, ..) if *m != Mem::Int(8, false) && *m != Mem::Int(8, true) => {}
-                    Inst::IBin(_, it, ..) | Inst::IBinI(_, it, ..) if it.bits < 64 => {}
+                    // a value narrower than a pointer is never an address (4 bytes on wasm32)
+                    Inst::Load(m, ..) | Inst::Store(m, ..) | Inst::AtomicLoad(m, ..) | Inst::AtomicStore(m, ..) if !matches!(m, Mem::Int(n, _) if *n as u32 >= ptr_bytes) => {}
+                    Inst::IBin(_, it, ..) | Inst::IBinI(_, it, ..) if (it.bits as u32) < ptr_bytes * 8 => {}
                     Inst::ICmp(..) | Inst::ICmpI(..) | Inst::FCmp(..) | Inst::FBin(..) | Inst::FUnary(..) => {}
                     Inst::Load(_, d, base, _) | Inst::VLoad(d, base, _) | Inst::AtomicLoad(_, _, d, base) => {
                         let r = read_through(&pts, &content, &uset, *base);
@@ -12963,7 +13403,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro) -> Result<(u32, u32, u64), String
                 Inst::Iconst(_, x) if (0..1 << 32).contains(x) => Some((4, false)),
                 Inst::ICmp(..) | Inst::ICmpI(..) | Inst::FCmp(..) => Some((1, false)),
                 // narrow integers are kept extended in registers
-                Inst::IBin(_, it, ..) | Inst::IBinI(_, it, ..) | Inst::INeg(it, ..) | Inst::INot(it, ..) | Inst::Conv(crate::rir::Conv::IntToInt(it), ..) if it.bits < 64 => Some((((it.bits + 7) / 8).max(1) as u8, it.signed)),
+                Inst::IBin(_, it, ..) | Inst::IBinI(_, it, ..) | Inst::INeg(it, ..) | Inst::INot(it, ..) | Inst::Conv(relax_backend::rir::Conv::IntToInt(it), ..) if it.bits < 64 => Some((((it.bits + 7) / 8).max(1) as u8, it.signed)),
                 _ => None,
             };
             for d in &ds {
@@ -13045,7 +13485,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro) -> Result<(u32, u32, u64), String
         }
     }
     let pos0 = f.blocks[0].pos.first().copied().unwrap_or(0);
-    let push = |b: &mut crate::rir::Block, i: Inst| {
+    let push = |b: &mut relax_backend::rir::Block, i: Inst| {
         b.insts.push(i);
         b.pos.push(pos0);
     };
@@ -13071,7 +13511,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro) -> Result<(u32, u32, u64), String
         pb.pos = ps;
         for (target, list) in [(resume, &mut resume_blocks), (cancel, &mut cancel_blocks)] {
             let nbk = f.block();
-            let mut b = crate::rir::Block { insts: Vec::new(), pos: Vec::new(), term: Term::Jump(target), term_pos: pos0 };
+            let mut b = relax_backend::rir::Block { insts: Vec::new(), pos: Vec::new(), term: Term::Jump(target), term_pos: pos0 };
             for &(v, x) in &const_at[k] {
                 push(&mut b, Inst::Iconst(v, x));
             }
@@ -13117,7 +13557,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro) -> Result<(u32, u32, u64), String
     }
     // the dispatcher becomes the entry; the old entry continues at `start`
     let start = f.block();
-    let old = std::mem::replace(&mut f.blocks[0], crate::rir::Block { insts: Vec::new(), pos: Vec::new(), term: Term::Unreachable, term_pos: pos0 });
+    let old = std::mem::replace(&mut f.blocks[0], relax_backend::rir::Block { insts: Vec::new(), pos: Vec::new(), term: Term::Unreachable, term_pos: pos0 });
     f.blocks[start as usize] = old;
     for b in f.blocks.iter_mut() {
         b.term.map_succs(|t| if t == 0 { start } else { t });
@@ -13223,7 +13663,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro) -> Result<(u32, u32, u64), String
 /// `flags`: the flag vregs (each initialized to 0 by an entry instruction). Not for
 /// coroutine bodies (their suspension edges are outside the CFG: CoroFlags).
 fn elaborate_drop_flags(f: &mut Func, flags: &[VReg]) {
-    use crate::regalloc::{for_defs, for_uses, term_uses};
+    use relax_backend::regalloc::{for_defs, for_uses, term_uses};
     if flags.is_empty() {
         return;
     }
@@ -13525,7 +13965,7 @@ impl CoroFlags {
                 match i {
                     Inst::Iconst(_, x) if *x != CF_UNSEEN && *x != CF_ANY => {}
                     _ => {
-                        crate::regalloc::uses_defs(i, &mut us, &mut ds);
+                        relax_backend::regalloc::uses_defs(i, &mut us, &mut ds);
                         for d in &ds {
                             flaglike[d.0 as usize] = false;
                         }
@@ -13871,7 +14311,7 @@ fn arithmetic_overflow_message(op: BinOp) -> &'static str {
 
 /// The runtime helpers lowering interns on first use, by symbol name: a cached entry naming one links
 /// before any lowering has run.
-pub(crate) fn intern_lazy_rt(u: &mut Unit, name: &str) -> Option<crate::rir::Sym> {
+pub(crate) fn intern_lazy_rt(u: &mut Unit, name: &str) -> Option<relax_backend::rir::Sym> {
     let (kind, addr) = match name {
         "ext_free" => { let f: rt_fn_ty!(fn(u64)) = rt_ext_free; ("ext_free", f as usize as u64) }
         "ext_get" => { let f: rt_fn_ty!(fn(u64, u64, u64) -> u64) = rt_ext_get; ("ext_get", f as usize as u64) }
@@ -13890,11 +14330,13 @@ pub(crate) fn intern_lazy_rt(u: &mut Unit, name: &str) -> Option<crate::rir::Sym
 /// `Term::Resume` becomes the terminate call. The terminate pad calls `rt_cannot_unwind`, which
 /// reports and aborts as rustc's panic_cannot_unwind does. (Calls the optimiser learns cannot
 /// unwind go back to plain calls: opt::demote_invokes.)
-pub(crate) fn abort_unwinding_calls(f: &mut crate::rir::Func, terminate: crate::rir::Sym) {
-    use crate::rir::{Callee, Inst, Term};
+pub(crate) fn abort_unwinding_calls(f: &mut relax_backend::rir::Func, terminate: relax_backend::rir::Sym) {
+    use relax_backend::rir::{Callee, Inst, Term};
     let may_unwind = |i: &Inst| match i {
         Inst::Call(Callee::Host(s), _, _) => *s != terminate,
         Inst::Call(Callee::CHost(_, sig) | Callee::CIndirect(_, sig) | Callee::CFn(_, sig), _, _) => sig.unwinds,
+        // asm! without may_unwind never unwinds (Relax rejects may_unwind)
+        Inst::Call(Callee::Asm(_), _, _) => false,
         Inst::Call(..) => true,
         _ => false,
     };

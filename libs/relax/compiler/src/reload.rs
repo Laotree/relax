@@ -68,7 +68,7 @@ fn trace_stage(name: &'static str) {
             *s.stages.entry(name).or_default() += (now - last).as_secs_f64() * 1000.;
             s.last = Some(now);
             s.sub_last = Some(now);
-            let cpu = crate::clock::cpu_ns();
+            let cpu = relax_backend::cpu_ns();
             let elapsed = cpu.saturating_sub(s.cpu_last) as f64 / 1e6;
             *s.cpu.entry(name).or_default() += elapsed;
             s.cpu_last = cpu;
@@ -116,7 +116,7 @@ impl TraceTransaction {
         if std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some() {
             let now = Instant::now();
             let (watch, read, scanned) = TRACE_INPUT.with(|s| s.replace((0.0, 0.0, 0)));
-            let mut state = ReloadTrace { started: Some(now), last: Some(now), cpu_last: crate::clock::cpu_ns(), ..Default::default() };
+            let mut state = ReloadTrace { started: Some(now), last: Some(now), cpu_last: relax_backend::cpu_ns(), ..Default::default() };
             state.stages.insert("watch", watch);
             state.stages.insert("read", read);
             state.counts.insert("watch_files", scanned);
@@ -1371,12 +1371,12 @@ fn layout_edit(u: &Unit, d: DefId, fresh: &crate::tcx::AdtT, running_discriminan
         use crate::types::TyKind::*;
         match (u.tcx.tys.kind(from), u.tcx.tys.kind(to)) {
             (Int(a), Int(b)) => {
-                let (sa, ga) = crate::types::Types::int_info(*a);
-                let (sb, gb) = crate::types::Types::int_info(*b);
+                let (sa, ga) = u.tcx.tys.int_info(*a);
+                let (sb, gb) = u.tcx.tys.int_info(*b);
                 (ga == gb && sb >= sa) || (!ga && gb && sb > sa)
             }
             (Float(a), Float(b)) => fsize(*a) <= fsize(*b),
-            (Int(a), Float(b)) => crate::types::Types::int_info(*a).0 < fsize(*b),
+            (Int(a), Float(b)) => u.tcx.tys.int_info(*a).0 < fsize(*b),
             _ => false,
         }
     };
@@ -1665,7 +1665,7 @@ fn def_name(prog: &crate::program::Program, d: DefId) -> String {
 /// field offsets fold to). Ok(true): one of them is in `changed`. Err: the set is not exactly
 /// computable (an indirect call, a trait's associated constant, a RIR build failure).
 unsafe fn discriminant_deps_changed(up: *mut Unit, anon: DefId, changed: &[DefId], layout_defs: &[DefId]) -> Result<bool, String> {
-    use crate::rir::{Callee, Inst};
+    use relax_backend::rir::{Callee, Inst};
     let mut todo = vec![(&*up).fn_id(FnKey::Inst(anon, Vec::new()))];
     let mut seen: Vec<u32> = Vec::new();
     while let Some(s) = todo.pop() {
@@ -1714,16 +1714,16 @@ unsafe fn discriminant_deps_changed(up: *mut Unit, anon: DefId, changed: &[DefId
 }
 
 /// Slots referenced by compiled code (calls and fn values: table words and thunks).
-fn referenced_slots(relocs: &[crate::rir::RelocAt], out: &mut Vec<u32>) {
+fn referenced_slots(relocs: &[relax_backend::rir::RelocAt], out: &mut Vec<u32>) {
     for r in relocs {
         match r.target {
-            crate::rir::Reloc::Slot(id) | crate::rir::Reloc::Thunk(id) => out.push(id),
+            relax_backend::rir::Reloc::Slot(id) | relax_backend::rir::Reloc::Thunk(id) | relax_backend::rir::Reloc::Call(id) => out.push(id),
             _ => {}
         }
     }
 }
 
-type Code = (Vec<u8>, Vec<(u32, u64)>, Vec<crate::rir::RelocAt>);
+type Code = (Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>);
 
 /// A closure's identity across versions of its parent: its ordinal among the closure
 /// expressions of the parent's item (source order), with its signature, captures and owner

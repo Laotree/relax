@@ -106,6 +106,22 @@ pub fn duplicate_exported_macros(prog: &Program, own: &[bool]) -> Vec<String> {
             }
             seen.push((krate, file as u32, kpos));
         }
+        // a macro the crate root imports under the same name (`pub use std::panic;`) is the same name
+        // in the macro namespace (E0255)
+        let sym = prog.syms.get(name);
+        for d in defs.iter().map(|d| &**d).filter(|d| d.exported && d.builtin == 0 && !d.def_file.is_empty()) {
+            let Some(file) = prog.file_paths.iter().position(|p| *p == d.def_file) else { continue };
+            let krate = prog.file_crate.get(file).copied().unwrap_or(u32::MAX);
+            if !own.get(krate as usize).copied().unwrap_or(false) || d.def_pos >= prog.files[file].src_len { continue; }
+            let root = prog.crates[krate as usize].root_mod;
+            let clash = prog.imports_iter().any(|im| im.module == root && !im.glob && !im.ext && im.bind == sym && sym.is_some()
+                && im.segs.len() > 1 && im.segs.last().map(|s| s.1) == sym
+                && (crate::program::BUILTIN_MACROS.contains(&name.as_str()) || relax_front::builtins::is_macro_name(name)));
+            if clash {
+                errors.push(prog.record_error(file as u32, d.def_pos, "resolve", format!(
+                    "E0255: the name `{}` is defined multiple times -- note: `{}` must be defined only once in the macro namespace of this module", name, name)));
+            }
+        }
     }
     errors
 }
@@ -194,6 +210,32 @@ pub fn impl_trait_path_privacy(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<S
     errors
 }
 
+/// A `pub(in path)` visibility path with a segment that names no module in the middle (rustc
+/// `resolve_path`: "cannot find module `String` in `string`" when it is a struct).
+fn vis_path_segments(prog: &Program, file: u32, scope: u32, p: crate::ast::Row<crate::ast::Path>, errors: &mut Vec<String>) {
+    use crate::ast::SegKind;
+    let ast = &prog.files[file as usize].ast;
+    let pf = &prog.files[file as usize];
+    let p = ast.row(p);
+    let segs = crate::program::path_segs(prog, file, p);
+    let written = ast.segs(p.segs);
+    let from = prog.mods[scope as usize].normal;
+    for k in 1..segs.len().saturating_sub(1) {
+        if written[k].kind() != SegKind::Ident { continue; }
+        match prog.resolve_mod_path(from, p.global(), &segs[..=k], false, false) {
+            Some(m) if prog.def(m).kind != DefKind::Mod => {
+                let at = written[k].name.lo;
+                if at < pf.src_len {
+                    errors.push(prog.record_error(file, at, "resolve", format!("E0433: cannot find module `{}` in `{}`", pf.text(written[k].name), pf.text(written[k - 1].name))));
+                }
+                break;
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+}
+
 /// E0433 `too many leading `super` keywords`: a `pub(super)` / `pub(in super::super)` visibility
 /// (also one a macro expansion wrote) with fewer enclosing modules than `super`s; and a global
 /// `::super::x` path in a `use` (rustc_resolve: global paths cannot start with `super`).
@@ -220,11 +262,22 @@ pub fn super_paths(prog: &Program, own: &[bool]) -> Vec<String> {
         };
         if too_many {
             errors.push(prog.record_error(def.file, item.lo, "resolve", "E0433: failed to resolve: too many leading `super` keywords".to_string()));
+        } else if let Vis::In(p) = item.vis {
+            vis_path_segments(prog, def.file, scope, p, &mut errors);
         }
     }
+    let mut seen_items = crate::fxhash::HashSet::default();
     for im in prog.imports_iter() {
         let krate = prog.mods[im.module as usize].krate;
-        if !own.get(krate as usize).copied().unwrap_or(false) || im.ext || !im.global || im.segs.first().map(|s| s.0) != Some(SegKind::Super) { continue; }
+        if !own.get(krate as usize).copied().unwrap_or(false) { continue; }
+        // the visibility path of the `use` / `extern crate` item this import came from
+        if im.pos < prog.files[im.file as usize].src_len && seen_items.insert((im.file, im.pos)) {
+            let ast = &prog.files[im.file as usize].ast;
+            if let Some(item) = ast.items.iter().find(|it| it.lo == im.pos && matches!(it.kind, crate::ast::ItemKind::Use { .. } | crate::ast::ItemKind::ExternCrate(_))) {
+                if let Vis::In(p) = item.vis { vis_path_segments(prog, im.file, im.module, p, &mut errors); }
+            }
+        }
+        if im.ext || !im.global || im.segs.first().map(|s| s.0) != Some(SegKind::Super) { continue; }
         if im.pos >= prog.files[im.file as usize].src_len { continue; }
         errors.push(prog.record_error(im.file, im.pos, "resolve", "E0433: failed to resolve: global paths cannot start with `super`".to_string()));
     }
@@ -1030,6 +1083,12 @@ fn attribute_args_error(p: crate::cfg::Src<'_>, lo: usize, hi: usize, name: &[u8
         }
         if start < hi - 1 { entries.push((start, hi - 1)); }
     }
+    // `NoArgsAttributeParser`s (+ `global_allocator`): any argument is malformed input
+    const NO_ARGS: &[&[u8]] = &[b"non_exhaustive", b"no_core", b"no_std", b"no_main", b"panic_runtime", b"needs_panic_runtime", b"profiler_runtime", b"no_builtins",
+        b"default_lib_allocator", b"may_dangle", b"coroutine", b"no_implicit_prelude", b"pin_v2", b"automatically_derived", b"macro_escape", b"allow_internal_unsafe",
+        b"no_link", b"cold", b"track_caller", b"no_mangle", b"thread_local", b"marker", b"fundamental", b"export_stable", b"ffi_const", b"ffi_pure",
+        b"needs_allocator", b"compiler_builtins", b"proc_macro", b"proc_macro_attribute", b"panic_handler", b"global_allocator"];
+    if n < hi && NO_ARGS.contains(&name) { return Some((lo, "E0565")); }
     match name {
         b"inline" if list => {
             if entries.len() != 1 { return Some((lo, "E0805")); }
@@ -1396,7 +1455,9 @@ pub fn assoc_const_elision(prog: &Program, d: DefId) -> Vec<String> {
     }
     let itext = |i: crate::ast::Ident| -> &str { std::str::from_utf8(prog.files[imp.file as usize].bytes(i.lo, i.hi)).unwrap_or("") };
     let ctext = |i: crate::ast::Ident| -> &str { std::str::from_utf8(pf.bytes(i.lo, i.hi)).unwrap_or("") };
-    let header = anon(iast, &itext, im.self_ty, false, 0)
+    // a lifetime is in scope: one the impl declares (`impl<'a>`), or an anonymous one its header names
+    let declared = iast.list(im.generics.params).iter().any(|p| matches!(p.kind, crate::ast::GenericParamKind::Lifetime(_)));
+    let header = declared || anon(iast, &itext, im.self_ty, false, 0)
         || im.trait_.as_ref().is_some_and(|p| iast.segs(p.segs).iter().any(|s| match iast.gargs(s.args()) {
             Some(GenericArgs::Angle(v)) => iast.list(*v).iter().any(|a| matches!(a, GenericArg::Lifetime(l) if itext(*l) == "'_")),
             _ => false,
@@ -1451,6 +1512,7 @@ fn attribute_target_error(prog: &Program, d: DefId, name: &[u8]) -> Option<&'sta
         b"export_name" => static_like && def.kind == K::Static || (fn_like && def.kind != K::ForeignFn && !trait_fn_no_body),
         b"debugger_visualizer" => def.kind == K::Mod,
         b"link_ordinal" => matches!(def.kind, K::ForeignFn | K::ForeignStatic),
+        b"proc_macro" | b"proc_macro_attribute" | b"proc_macro_derive" => def.kind == K::Fn,
         _ => return None,
     };
     if ok { None } else { Some(what) }
@@ -1730,6 +1792,7 @@ pub fn gated_syntax(prog: &Program, own: &[bool]) -> Vec<String> {
                 "stmt_expr_attributes" => "attributes on expressions are experimental",
                 "coroutines" => "coroutine syntax is experimental",
                 "async_trait_bounds" => "`async` trait bounds are unstable",
+                "closure_track_caller" => "`#[track_caller]` on closures is currently unstable",
                 _ => continue,
             };
             errors.push(prog.record_error(f as u32, pos, "typeck", format!("E0658: {msg}")));
@@ -1769,6 +1832,52 @@ pub fn node_attribute_targets(prog: &Program, own: &[bool]) -> Vec<String> {
             if !prog.item_defs.contains_key(&(f as u32, i as u32)) { continue; }
             for v in ast.list(ast.row(r).variants) {
                 check(ast.list(v.attrs), "enum variants");
+            }
+        }
+    }
+    errors
+}
+
+/// rustc_ast_passes `check_decl_attrs` (+ rustc_resolve): the attributes of a function parameter
+/// are `cfg`, `cfg_attr` and the lint attributes, or non-builtin ones; a built-in attribute macro
+/// (`#[test]`) is not a non-macro attribute.
+pub fn param_attributes(prog: &Program, own: &[bool]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (f, pf) in prog.files.iter().enumerate() {
+        let krate = prog.file_crate.get(f).copied().unwrap_or(u32::MAX);
+        if !own.get(krate as usize).copied().unwrap_or(false) { continue; }
+        let ast = &pf.ast;
+        let p = prog.src(f as u32);
+        // rustc_resolve: enum variants and struct fields take only non-macro attributes (struct-pattern
+        // fields, match arms and struct-expression fields are the parser's)
+        for a in ast.variants.iter().flat_map(|v| ast.list(v.attrs)).chain(ast.field_defs.iter().flat_map(|fd| ast.list(fd.attrs))) {
+            let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+            if hi <= lo { continue; }
+            let t = p.tok(lo);
+            if t.lo >= pf.src_len { continue; }
+            if hi > lo + 1 && !matches!(crate::cfg::tok_str(p, lo + 1), b"(" | b"=") { continue; }
+            let name = String::from_utf8_lossy(crate::cfg::tok_str(p, lo)).into_owned();
+            if matches!(name.as_str(), "test" | "bench" | "test_case" | "derive" | "global_allocator" | "cfg_eval" | "alloc_error_handler" | "derive_const") {
+                errors.push(prog.record_uncoded_error(f as u32, t.lo, "resolve", format!("expected non-macro attribute, found attribute macro `{name}`")));
+            }
+        }
+        for prm in ast.params.iter() {
+            for a in ast.list(prm.attrs) {
+                let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+                if hi <= lo { continue; }
+                let t = p.tok(lo);
+                if t.lo >= pf.src_len { continue; }
+                // a plain one-segment path
+                if hi > lo + 1 && !matches!(crate::cfg::tok_str(p, lo + 1), b"(" | b"=") { continue; }
+                let name = String::from_utf8_lossy(crate::cfg::tok_str(p, lo)).into_owned();
+                match name.as_str() {
+                    "allow" | "cfg" | "cfg_attr" | "deny" | "expect" | "forbid" | "warn" => {}
+                    "test" | "bench" | "test_case" | "derive" | "global_allocator" | "cfg_eval" | "alloc_error_handler" | "derive_const" =>
+                        errors.push(prog.record_uncoded_error(f as u32, t.lo, "resolve", format!("expected non-macro attribute, found attribute macro `{name}`"))),
+                    n if crate::builtin_attrs::is_builtin_attr(n) =>
+                        errors.push(prog.record_uncoded_error(f as u32, t.lo, "typeck", "allow, cfg, cfg_attr, deny, expect, forbid, and warn are the only allowed built-in attributes in function parameters".to_string())),
+                    _ => {}
+                }
             }
         }
     }

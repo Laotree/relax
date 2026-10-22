@@ -323,6 +323,9 @@ fn specv_aliased_call_from_unverified_body() {
     }
     use std::sync::atomic::Ordering;
     crate::jit::CHECK_FIRST.store(false, Ordering::Relaxed);
+    // `through_raw` must have its clean verdict before its first run: the checker's whole-app discovery
+    // (`--ahead=aot-max`; the levels below aot check only the bodies that ran)
+    crate::jit::set_ahead_level(crate::options::AheadLevel::AotMax);
     std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::env::temp_dir().join(format!("relax-specv-alias-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("app/src")).unwrap();
@@ -331,6 +334,7 @@ fn specv_aliased_call_from_unverified_body() {
     let original = "pub fn callee(a: &mut u32, b: &mut u32) -> u32 { *a = 1; *b = 2; *a }\n\
         pub fn through_raw(out: &mut u32) { let mut x = 0u32; let p = &mut x as *mut u32; *out = callee(unsafe { &mut *p }, unsafe { &mut *p }); }\n\
         pub fn value(out: &mut u32) { *out = 11; }\n\
+        pub fn early(out: &mut u32) { let mut x = 0u32; let p = &mut x as *mut u32; *out = callee(unsafe { &mut *p }, unsafe { &mut *p }); }\n\
         pub fn value_ptr(out: &mut u32) { *out = 11; }\n\
         pub trait Go { fn go(&self, a: &mut u32, b: &mut u32) -> u32; }\n\
         pub struct S;\n\
@@ -347,7 +351,7 @@ fn specv_aliased_call_from_unverified_body() {
         let id = crate::program::DefId(i as u32);
         (d.krate == app_crate && prog.name(id) == name).then_some(id)
     }).unwrap();
-    let (callee_def, raw_def, value_def) = (find("callee"), find("through_raw"), find("value"));
+    let (callee_def, raw_def, value_def, early_def) = (find("callee"), find("through_raw"), find("value"), find("early"));
     let (ptr_def, dyn_def) = (find("value_ptr"), find("value_dyn"));
     let mut tcx = crate::tcx::Tcx::new();
     tcx.collect(&prog);
@@ -359,30 +363,43 @@ fn specv_aliased_call_from_unverified_body() {
         let c = u.fn_id(crate::jit::FnKey::Inst(callee_def, vec![]));
         let r = u.fn_id(crate::jit::FnKey::Inst(raw_def, vec![]));
         let v = u.fn_id(crate::jit::FnKey::Inst(value_def, vec![]));
-        let p = u.fn_id(crate::jit::FnKey::Inst(ptr_def, vec![]));
-        let d = u.fn_id(crate::jit::FnKey::Inst(dyn_def, vec![]));
-        (c, r, v, u.entry(r), u.entry(v), p, d)
+        let e = u.fn_id(crate::jit::FnKey::Inst(early_def, vec![]));
+        (c, r, v, u.entry(r), u.entry(v), e, u.entry(e))
     });
-    let (callee, raw, value, raw_entry, value_entry, value_ptr, value_dyn) = ids;
+    let (callee, raw, value, raw_entry, value_entry, early, early_entry) = ids;
+    let (value_ptr, value_dyn) = crate::owner::call(crate::owner::Class::App, || {
+        (u.fn_id(crate::jit::FnKey::Inst(ptr_def, vec![])), u.fn_id(crate::jit::FnKey::Inst(dyn_def, vec![])))
+    });
     let (ptr_entry, dyn_entry) = crate::owner::call(crate::owner::Class::App, || (u.entry(value_ptr), u.entry(value_dyn)));
     let run = |label: &str, entry, expected| {
         let mut result = 0u32;
         unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
         assert_eq!(result, expected, "{label}");
     };
-    // the checker queues the program at the first compile; wait until the originals are verified
+    // the checker queues the program at the first compile; wait until the originals are verified.
+    // `early` runs before its verdict: unverified code, its aliasing call goes to the twin (2)
     run("value", value_entry, 11);
+    run("early", early_entry, 2);
+    assert!(u.fns[early as usize].rir.as_ref().is_some_and(|r| r.plain_calls), "the unverified lowering calls the twin");
     let t0 = std::time::Instant::now();
     loop {
         crate::borrowck::settle().recv().unwrap();
-        if [callee, raw, value, value_ptr, value_dyn].iter().all(|&i| u.verdict_clean(i)) { break; }
+        if [callee, raw, value, early, value_ptr, value_dyn].iter().all(|&i| u.verdict_clean(i)) { break; }
         assert!(t0.elapsed().as_secs() < 20, "the originals never got a clean verdict");
+    }
+    // verified now: its promotion lowers it again, calling `callee` itself (no twin calls left)
+    assert!(u.refresh_verified(early));
+    unsafe { crate::jit::build_normal(up, early) }.unwrap();
+    {
+        let r = u.fns[early as usize].rir.as_ref().expect("RIR");
+        assert!(!r.plain_calls && !r.baseline, "verified: lowered again without twin calls");
+        let twin = u.plain_twin_of(callee).expect("the twin of callee");
+        assert!(!r.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(t), _, _) if *t == twin))));
     }
     // verified code: `callee` is compiled with noalias, and a call that aliases (through raw pointers, so
     // the checker accepts it) gets the answer the noalias code computes
     run("raw", raw_entry, 1);
     assert!(!u.fns[callee as usize].unverified.load(Ordering::Relaxed));
-    assert!(u.plain_twin_of(callee).is_none(), "verified code does not use twins");
     // an unverified body that aliases the same way, safely written (a borrow error)
     let patched = "pub fn callee(a: &mut u32, b: &mut u32) -> u32 { *a = 1; *b = 2; *a }\n\
         pub fn through_raw(out: &mut u32) { let mut x = 0u32; let p = &mut x as *mut u32; *out = callee(unsafe { &mut *p }, unsafe { &mut *p }); }\n\
@@ -401,6 +418,12 @@ fn specv_aliased_call_from_unverified_body() {
     run("dyn", dyn_entry, 2);
     let twin = u.plain_twin_of(callee).expect("the aliasing call went to the callee's twin");
     assert!(u.fns[twin as usize].compiled);
+    // the twin tiers up (O3, built without noalias): the aliasing call still gets the machine's answer
+    assert!(unsafe { crate::jit::compile_tier1(up, twin) }, "the twin gets O3 code");
+    assert!(u.fns[twin as usize].o3.load(Ordering::Relaxed) && u.fns[twin as usize].unverified.load(Ordering::Relaxed));
+    run("value", value_entry, 2);
+    // ... but the patched body itself, awaiting its verdict, does not
+    assert!(!unsafe { crate::jit::compile_tier1(up, value) }, "no O3 build of a patch without its verdict");
     // the verdict rejects the patch: it reverts
     let mut undos = vec![outcome.undo.unwrap()];
     let mut pending = vec![crate::reload::PendingPatch { group: outcome.group, what: "lib.rs".into(), ids: vec![value, value_ptr, value_dyn], event_seq: crate::inspect::events::last_seq() }];
@@ -416,6 +439,104 @@ fn specv_aliased_call_from_unverified_body() {
     run("dyn", dyn_entry, 11);
     // the twin is never promoted
     assert!(u.fns[twin as usize].unverified.load(Ordering::Relaxed));
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Relaxed Rust D3: a pair of index borrows the checker accepts only with a run-time check
+/// (`&mut v[i]`, `&mut v[j]`). Before the verdict the body runs as written (SPEC-V: unverified);
+/// once it is clean, the verified code is lowered with the check: an overlap panics as
+/// `get_disjoint_mut(..).unwrap()` does, distinct indices run as before. Without the relaxed feature
+/// the verdict is an error and no check is lowered.
+#[test]
+fn d3_disjoint_check_lowered_from_the_verdict() {
+    const CHILD: &str = "MAKEPAD_RUN_D3_TEST";
+    let Ok(case) = std::env::var(CHILD) else {
+        for case in ["relaxed", "strict", "check-first"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "lazy_reload_tests::d3_disjoint_check_lowered_from_the_verdict", "--nocapture", "--test-threads=1", "--format=terse"])
+                .env(CHILD, case).env("MAKEPAD_RUN_GANDALF_ALL", "0")
+                .output().unwrap();
+            assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
+        return;
+    };
+    use std::sync::atomic::Ordering;
+    // `makepad run --check-first`: the check runs before the first lowering, so the first code has the check
+    crate::jit::CHECK_FIRST.store(case == "check-first", Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-d3-{}-{}", case, std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    // io = [i, j, result]
+    // io = [i, j, result]; `pair` indexes an array (built-in), `pair_vec` a Vec (IndexMut)
+    std::fs::write(dir.join("app/src/lib.rs"), "pub fn pair(io: &mut [usize; 3]) {\n    let (i, j) = (io[0], io[1]);\n    let mut v = [1usize, 2, 3];\n    let a = &mut v[i];\n    let b = &mut v[j];\n    *a += 10;\n    *b += 100;\n    io[2] = v[0] + v[1] + v[2];\n}\n\
+        pub fn pair_vec(io: &mut [usize; 3]) {\n    let (i, j) = (io[0], io[1]);\n    let mut v = vec![1usize, 2, 3];\n    let a = &mut v[i];\n    let b = &mut v[j];\n    *a += 10;\n    *b += 100;\n    io[2] = v[0] + v[1] + v[2];\n}\n").unwrap();
+    std::env::set_var("MAKEPAD_RUN_LIVE_LOG", dir.join("live.jsonl"));
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let mut session = crate::Session::default();
+    session.options.relaxed = Some(if case == "strict" { "none" } else { "disjoint-index" }.to_string());
+    let session = Arc::new(session);
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "d3_app", false).unwrap();
+    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display(), crate::diag::quote(&app));
+    let roots = crate::reload::gandalf_app_roots(&crate::unitgraph::Units::from_json(graph.as_bytes()).unwrap(), dir.join("app").to_str().unwrap());
+    let find = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let defs = [find("pair"), find("pair_vec")];
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    crate::borrowck::event::set_app_scope(roots);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    for def in defs {
+    let (id, entry) = crate::owner::call(crate::owner::Class::App, || {
+        let id = u.fn_id(crate::jit::FnKey::Inst(def, vec![]));
+        (id, u.entry(id))
+    });
+    let run = |i: usize, j: usize| -> Result<usize, String> {
+        let mut io = [i, j, 0usize];
+        unsafe { crate::jit::call_jit(up, entry, &mut io as *mut [usize; 3] as u64) }.map(|_| io[2]).map_err(|p| p.message)
+    };
+    if case == "check-first" {
+        assert_eq!(run(0, 1), Ok(116));
+        assert!(u.fns[id as usize].d3_lowered.load(Ordering::Relaxed), "checked before the first lowering");
+        assert!(run(1, 1).expect_err("the first code checks").contains("OverlappingIndices"));
+        continue;
+    }
+    // unverified: the code runs as written (an overlap writes the one element twice). (The program's
+    // other fns are checked in the background meanwhile: a later fn may have its verdict before
+    // its first call, and then its first code is verified code.)
+    assert_eq!(run(0, 1), Ok(116));
+    if !u.fns[id as usize].d3_lowered.load(Ordering::Relaxed) {
+        assert_eq!(run(1, 1), Ok(116));
+    }
+    let t0 = std::time::Instant::now();
+    loop {
+        crate::borrowck::settle().recv().unwrap();
+        if !matches!(u.verdict_state(id), crate::jit::Verdict::Pending) { break; }
+        assert!(t0.elapsed().as_secs() < 20, "no verdict");
+    }
+    if case == "strict" {
+        assert!(matches!(u.verdict_state(id), crate::jit::Verdict::Failed(_)), "strict: NLL rejects the pair");
+        assert!(u.disjoint_checks(id).is_none());
+    } else {
+        assert!(u.verdict_clean(id), "relaxed: accepted with a run-time check");
+        let checks = u.disjoint_checks(id).expect("the verdict asks for the check");
+        assert_eq!(checks.len(), 1);
+        assert!(u.refresh_verified(id));
+        // the verified code: lowered again with the check, and installed
+        let _ = run(0, 1);
+        assert!(unsafe { crate::jit::compile_tier1(up, id) }, "O3 build of the verified body");
+        assert!(u.fns[id as usize].d3_lowered.load(Ordering::Relaxed), "the verified code was lowered with the verdict's checks");
+        assert_eq!(run(0, 1), Ok(116));
+        assert_eq!(run(2, 0), Ok(116));
+        let overlap = run(1, 1).expect_err("an overlap panics");
+        assert!(overlap.contains("OverlappingIndices"), "{overlap}");
+    }
+    }
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }

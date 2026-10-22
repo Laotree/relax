@@ -15,6 +15,8 @@ pub mod intrinsics {
         pub fn trunc_f32(x: f32) -> f32;
         pub fn rint_f64(x: f64) -> f64;
         pub fn rint_f32(x: f32) -> f32;
+        pub fn round_f64(x: f64) -> f64;
+        pub fn round_f32(x: f32) -> f32;
         pub fn fabs_f64(x: f64) -> f64;
         pub fn fabs_f32(x: f32) -> f32;
         pub fn fmin_f64(x: f64, y: f64) -> f64;
@@ -31,6 +33,95 @@ pub mod intrinsics {
         pub fn fma_f32(a: f32, b: f32, c: f32) -> f32;
         /// true when this target (arm64; x86-64 with FMA3) fuses in hardware: a constant per run
         pub fn fma_native() -> bool;
+    }
+    pub use super::intrinsics_simd as simd;
+    /// rustc's `intrinsics::assume` (UB when false): hint::assert_unchecked
+    pub use crate::hint::assert_unchecked as assume;
+}
+
+/// rustc's generic SIMD intrinsics (`core::intrinsics::simd`) on `#[repr(simd)]` types, lane-wise
+/// (lowered per 16-byte chunk to Relax's vector IR; lower/simd.rs). Signatures as rustc's.
+pub mod intrinsics_simd {
+    extern "relax-intrinsic" {
+        pub fn simd_add<T>(x: T, y: T) -> T;
+        pub fn simd_sub<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_mul<T>(x: T, y: T) -> T;
+        pub fn simd_div<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_shl<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_shr<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_and<T>(x: T, y: T) -> T;
+        pub fn simd_or<T>(x: T, y: T) -> T;
+        pub fn simd_xor<T>(x: T, y: T) -> T;
+        pub fn simd_neg<T>(x: T) -> T;
+        pub fn simd_fabs<T>(x: T) -> T;
+        pub fn simd_fsqrt<T>(x: T) -> T;
+        pub fn simd_floor<T>(x: T) -> T;
+        pub fn simd_ceil<T>(x: T) -> T;
+        pub fn simd_trunc<T>(x: T) -> T;
+        pub fn simd_round<T>(x: T) -> T;
+        pub fn simd_minimum_number_nsz<T>(x: T, y: T) -> T;
+        pub fn simd_maximum_number_nsz<T>(x: T, y: T) -> T;
+        pub fn simd_saturating_add<T>(x: T, y: T) -> T;
+        pub fn simd_saturating_sub<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_eq<T, U>(x: T, y: T) -> U;
+        pub fn simd_ne<T, U>(x: T, y: T) -> U;
+        pub fn simd_lt<T, U>(x: T, y: T) -> U;
+        pub fn simd_le<T, U>(x: T, y: T) -> U;
+        pub fn simd_gt<T, U>(x: T, y: T) -> U;
+        pub fn simd_ge<T, U>(x: T, y: T) -> U;
+        pub fn simd_select<M, T>(mask: M, if_true: T, if_false: T) -> T;
+        // lane by lane in scalar code (lower/simd.rs simd_per_lane)
+        pub fn simd_rem<T>(lhs: T, rhs: T) -> T;
+        pub fn simd_ctpop<T>(x: T) -> T;
+        pub fn simd_ctlz<T>(x: T) -> T;
+        pub fn simd_cttz<T>(x: T) -> T;
+        pub fn simd_bswap<T>(x: T) -> T;
+        pub fn simd_bitreverse<T>(x: T) -> T;
+        pub fn simd_round_ties_even<T>(x: T) -> T;
+        pub fn simd_fma<T>(x: T, y: T, z: T) -> T;
+        pub fn simd_relaxed_fma<T>(x: T, y: T, z: T) -> T;
+        pub fn simd_cast<T, U>(x: T) -> U;
+        pub fn simd_as<T, U>(x: T) -> U;
+        pub fn simd_splat<T, U>(value: U) -> T;
+        pub fn simd_extract<T, U>(x: T, idx: u32) -> U;
+        pub fn simd_extract_dyn<T, U>(x: T, idx: u32) -> U;
+        pub fn simd_insert<T, U>(x: T, idx: u32, val: U) -> T;
+        pub fn simd_insert_dyn<T, U>(x: T, idx: u32, val: U) -> T;
+        pub fn simd_shuffle<T, U, V>(x: T, y: T, idx: U) -> V;
+        pub fn simd_bitmask<T, U>(x: T) -> U;
+        pub fn simd_select_bitmask<M, T>(m: M, yes: T, no: T) -> T;
+        pub fn simd_reduce_add_ordered<T, U>(x: T, y: U) -> U;
+        pub fn simd_reduce_add_unordered<T, U>(x: T) -> U;
+        pub fn simd_reduce_mul_ordered<T, U>(x: T, y: U) -> U;
+        pub fn simd_reduce_mul_unordered<T, U>(x: T) -> U;
+        pub fn simd_reduce_all<T>(x: T) -> bool;
+        pub fn simd_reduce_any<T>(x: T) -> bool;
+        pub fn simd_reduce_max<T, U>(x: T) -> U;
+        pub fn simd_reduce_min<T, U>(x: T) -> U;
+        pub fn simd_reduce_and<T, U>(x: T) -> U;
+        pub fn simd_reduce_or<T, U>(x: T) -> U;
+        pub fn simd_reduce_xor<T, U>(x: T) -> U;
+        pub fn simd_gather<T, U, V>(val: T, ptr: U, mask: V) -> T;
+        pub fn simd_scatter<T, U, V>(val: T, ptr: U, mask: V);
+        pub fn simd_masked_load<V, U, T, const ALIGN: SimdAlign>(mask: V, ptr: U, val: T) -> T;
+        pub fn simd_masked_store<V, U, T, const ALIGN: SimdAlign>(mask: V, ptr: U, val: T);
+        pub fn simd_arith_offset<T, U>(ptr: T, offset: U) -> T;
+        pub fn simd_cast_ptr<T, U>(ptr: T) -> U;
+        pub fn simd_expose_provenance<T, U>(ptr: T) -> U;
+        pub fn simd_with_exposed_provenance<T, U>(addr: T) -> U;
+        pub fn simd_funnel_shl<T>(a: T, b: T, shift: T) -> T;
+        pub fn simd_funnel_shr<T>(a: T, b: T, shift: T) -> T;
+    }
+
+    /// Alignment options of the masked load/store intrinsics (rustc core/src/intrinsics/simd)
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum SimdAlign {
+        /// No alignment requirements on the pointer
+        Unaligned = 0,
+        /// The pointer must be aligned to the element type of the SIMD vector
+        Element = 1,
+        /// The pointer must be aligned to the SIMD vector type
+        Vector = 2,
     }
 }
 
@@ -149,6 +240,13 @@ pub mod intrinsics_rt {
         /// Writes this thread's floating-point control register (flush-to-zero,
         /// denormals-are-zero, rounding, ...).
         pub fn fp_env_set(x: u64);
+        /// The allocator shim (rustc_codegen_ssa allocator shim: `__rust_alloc` and the others):
+        /// a call of core::heap's `__rg_*::<A>(&STATIC, ..)` when the program has a
+        /// `#[global_allocator] static STATIC: A`, else of the default `__rdl_*` (System).
+        pub fn rust_alloc(size: usize, align: usize) -> *mut u8;
+        pub fn rust_alloc_zeroed(size: usize, align: usize) -> *mut u8;
+        pub fn rust_dealloc(ptr: *mut u8, size: usize, align: usize);
+        pub fn rust_realloc(ptr: *mut u8, old_size: usize, align: usize, new_size: usize) -> *mut u8;
     }
 }
 
@@ -205,7 +303,7 @@ pub mod intrinsics_vx {
         pub fn vx_store<T>(p: *mut u8, a: T);
         pub fn vx_narrow<T, U>(a: T, op: u32) -> U;
         pub fn vx_table<T, U>(a: T, b: U) -> T;
-        pub fn vx_mask<T>(a: T) -> i32;
+        pub fn vx_mask<T>(a: T, width: u32) -> i32;
         pub fn vx_blend<T>(a: T, b: T, mask: T) -> T;
     }
 }

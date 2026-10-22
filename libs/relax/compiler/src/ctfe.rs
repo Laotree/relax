@@ -40,7 +40,7 @@ struct Ctx<'a> {
 pub fn eval_into(u: &mut Unit, d: crate::program::DefId, args: &[TyId], buf: u64) -> bool {
     let options = &u.prog.session.clone().options;
     let _mem = crate::memstat::tag(crate::memstat::Tag::Ctfe);
-    if off(options) {
+    if off(options) || u.ptr_bytes() != 8 {
         return false;
     }
     let init = match relax_types::const_eval::const_body(&u.prog, d) { Some(e) => e, None => return false };
@@ -75,6 +75,18 @@ pub fn eval_into(u: &mut Unit, d: crate::program::DefId, args: &[TyId], buf: u64
     }
     unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), buf as *mut u8, size) };
     true
+}
+
+/// Evaluates the inline const block `bl` of the (instantiated) body `body` to the bytes of its
+/// value of type `t`; None outside the subset (lowering then runs the block).
+pub fn eval_const_block(u: &mut Unit, body: &Body, bl: crate::ast::BlockId, t: TyId) -> Option<Vec<u8>> {
+    if off(&u.prog.session.clone().options) || u.ptr_bytes() != 8 {
+        return None;
+    }
+    let mut cx = Ctx { u, steps: 0, depth: 0, trace: false, reason: None };
+    let mut env: Vec<Option<Vec<u8>>> = Vec::new();
+    let v = cx.block(body, &mut env, bl)?;
+    (v.len() == cx.size(t) as usize).then_some(v)
 }
 
 /// A successful N01 body is complete: constant queries resolve synchronously or unwind.
@@ -151,7 +163,7 @@ pub fn same_value(u: &mut Unit, t: TyId, a: u64, b: u64, depth: u32) -> bool {
             }
             let vi = if adt.is_enum {
                 // same tag bytes, then that variant's fields
-                if let Some((toff, crate::rir::Mem::Int(n, _))) = l.tag {
+                if let Some((toff, relax_backend::rir::Mem::Int(n, _))) = l.tag {
                     if bytes(a + toff as u64, n as usize) != bytes(b + toff as u64, n as usize) {
                         return false;
                     }
@@ -227,7 +239,7 @@ pub fn defined_mask(u: &mut Unit, t: TyId, a: u64, mask: &mut [u8], off: usize, 
             };
             let vi = if adt.is_enum {
                 match l.tag {
-                    Some((toff, crate::rir::Mem::Int(n, _))) => {
+                    Some((toff, relax_backend::rir::Mem::Int(n, _))) => {
                         for b in mask.iter_mut().skip(off + toff as usize).take(n as usize) {
                             *b = 1;
                         }
@@ -325,6 +337,8 @@ pub fn zero_undefined(u: &mut Unit, t: TyId, a: u64) {
 }
 
 /// MAKEPAD_RUN_CTFE=0: every initializer is compiled and run (the reference behaviour).
+/// (The evaluator models 8-byte pointer and usize words: a wasm32 program's initializers run as
+/// code, web32.rs, whatever the option says.)
 fn off(options: &crate::options::Options) -> bool {
     options.ctfe == crate::options::Ctfe::Off
 }
@@ -353,7 +367,7 @@ impl<'a> Ctx<'a> {
     fn int_of(&self, t: TyId) -> Option<(usize, bool)> {
         match self.u.tcx.tys.kind(t) {
             TyKind::Int(p) => {
-                let (b, s) = crate::types::Types::int_info(*p);
+                let (b, s) = self.u.tcx.tys.int_info(*p);
                 Some((b as usize, s))
             }
             TyKind::Bool => Some((1, false)),
@@ -732,6 +746,26 @@ impl<'a> Ctx<'a> {
             ExprKind::ConstBlock(bl) => self.offset_of(b, e, bl).or_else(|| self.block(b, env, bl)),
             ExprKind::Block(bl, l) if l.is_none() => self.block(b, env, bl),
             ExprKind::Unsafe(bl) => self.block(b, env, bl),
+            ExprKind::While(row) => {
+                // `while cond { body }` (no label, no `while let`): body blocks without break or
+                // continue (those are outside the subset and end the evaluation)
+                let crate::ast::WhileRow { cond, body, label } = *self.u.prog.files[file].ast.row(row);
+                if label.is_some() || matches!(self.u.prog.files[file].ast.expr(cond).kind, ExprKind::Let(..)) {
+                    return None;
+                }
+                loop {
+                    self.steps += 1;
+                    if self.steps > STEP_BUDGET {
+                        return None;
+                    }
+                    let cv = self.eval(b, env, cond)?;
+                    if *cv.first()? & 1 == 0 {
+                        break;
+                    }
+                    self.block(b, env, body)?;
+                }
+                Some(Vec::new())
+            }
             ExprKind::If(c, then, els) => {
                 let cv = self.eval(b, env, c)?;
                 if *cv.first()? & 1 == 1 {
@@ -1229,7 +1263,7 @@ impl<'a> Ctx<'a> {
                 let l = self.layout(from);
                 if l.uninhabited { return None; }
                 let disc = match l.tag {
-                    Some((toff, crate::rir::Mem::Int(tn, ts))) => {
+                    Some((toff, relax_backend::rir::Mem::Int(tn, ts))) => {
                         let raw = load_int(v.get(toff as usize..(toff + tn as u32) as usize)?, tn as usize, ts);
                         crate::lower::decode_tag_const(self.u, raw, &l, &adt)?
                     }
@@ -1355,7 +1389,7 @@ impl<'a> Ctx<'a> {
         }
         if adt.is_enum {
             // the tag (lower::emit_store_disc)
-            if let Some((toff, crate::rir::Mem::Int(tn, _))) = l.tag {
+            if let Some((toff, relax_backend::rir::Mem::Int(tn, _))) = l.tag {
                 let tv = match l.enc {
                     crate::layout::TagEnc::Direct => Some(adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi)?.val),
                     crate::layout::TagEnc::Single(_) => None,

@@ -8,7 +8,7 @@ pub use closure::ClosureStorage;
 use crate::next_solver::TraitRef;
 use crate::consts::GenericArg;
 use crate::program::Prim;
-use crate::rir::{Cls, Mem};
+use relax_backend::rir::{Cls, Mem};
 use crate::tcx::Tcx;
 use crate::types::{TyId, TyKind};
 
@@ -248,6 +248,9 @@ pub struct Layouts {
     /// provided crates' opaque types (provided.rs): rustc's size and align, no fields Relax
     /// may read; set once when the unit is made
     pub opaque: std::collections::HashMap<crate::program::DefId, (u32, u32)>,
+    /// a field type that does not normalize stays as written (transmute's size skeletons erase
+    /// parameters to `()`, so `PhantomData<<() as Tr>::Assoc>` need not project)
+    lenient_fields: bool,
 }
 
 unsafe impl Send for Layouts {}
@@ -363,7 +366,22 @@ fn tz(x: u64) -> u64 {
 
 impl Layouts {
     pub fn new() -> Layouts {
-        Layouts { closure_storage: Default::default(), table: std::sync::atomic::AtomicPtr::new(Box::into_raw(LTable::new())), retired: Default::default(), ents: crate::conc::AppendVec::with_capacity(1 << 24), pool: Default::default(), opaque: Default::default() }
+        Layouts { closure_storage: Default::default(), table: std::sync::atomic::AtomicPtr::new(Box::into_raw(LTable::new())), retired: Default::default(), ents: crate::conc::AppendVec::with_capacity(1 << 24), pool: Default::default(), opaque: Default::default(), lenient_fields: false }
+    }
+
+    /// Layouts of types whose parameters were erased (see `lenient_fields`).
+    pub fn erased_generics() -> Layouts {
+        let mut l = Layouts::new();
+        l.lenient_fields = true;
+        l
+    }
+
+    fn field_ty(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, d: crate::program::DefId, variant: u32, field: u32, args: &[TyId]) -> TyId {
+        let env = crate::tcx::TypingEnv::fully_monomorphized(lcx.prog);
+        if !self.lenient_fields { return tcx.field_ty(lcx.prog, env, d, variant, field, args); }
+        let decl = tcx.adts[&d].variants[variant as usize].fields[field as usize].ty;
+        let ty = tcx.tys.subst(decl, args);
+        tcx.try_normalize_erasing_regions(lcx.prog, env, ty).unwrap_or(ty)
     }
 
     pub fn closure_storage(&self, prog: &crate::program::Program, tcx: &Tcx, ty: TyId) -> ClosureStorage {
@@ -599,8 +617,10 @@ impl Layouts {
 
     fn compute(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, t: TyId) -> Layout {
         let k = tcx.tys.kind(t).clone();
-        let ptr = Mem::Int(8, false);
-        let nonnull = |off: u32| Some(Niche { off, bytes: 8, start: 1, end: u64::MAX as u128 });
+        // a thin pointer (and usize) is `pb` bytes: 8, or 4 on the wasm32 web target
+        let pb = tcx.tys.ptr_bytes;
+        let ptr = Mem::Int(pb as u8, false);
+        let nonnull = |off: u32| Some(Niche { off, bytes: pb, start: 1, end: if pb == 8 { u64::MAX as u128 } else { u32::MAX as u128 } });
         match k {
             TyKind::Bool => {
                 let mut l = scalar(1, Mem::Int(1, false), Cls::I);
@@ -613,7 +633,7 @@ impl Layouts {
                 l
             }
             TyKind::Int(p) => {
-                let (b, s) = crate::types::Types::int_info(p);
+                let (b, s) = tcx.tys.int_info(p);
                 if b == 16 {
                     // i128/u128: two words (low, high), lowered as word pairs
                     return plain(16, 16, Some(vec![Leaf { off: 0, mem: Mem::Int(8, false), cls: Cls::I }, Leaf { off: 8, mem: Mem::Int(8, s), cls: Cls::I }]));
@@ -625,16 +645,16 @@ impl Layouts {
             TyKind::Ref(_, inner, _) | TyKind::Ptr(_, inner) => {
                 let is_ref = matches!(k, TyKind::Ref(..));
                 let mut l = if self.is_unsized(lcx, tcx, inner) && !matches!(tcx.tys.kind(self.struct_tail_for_codegen(lcx, tcx, inner)), TyKind::Foreign(_)) {
-                    let mut l = plain(16, 8, Some(vec![Leaf { off: 0, mem: ptr, cls: Cls::I }, Leaf { off: 8, mem: ptr, cls: Cls::I }]));
-                    l.fields = vec![0, 8];
+                    let mut l = plain(2 * pb, pb, Some(vec![Leaf { off: 0, mem: ptr, cls: Cls::I }, Leaf { off: pb, mem: ptr, cls: Cls::I }]));
+                    l.fields = vec![0, pb];
                     // A dyn pointer's vtable is non-null even when its data pointer is raw.
                     // Slice metadata is a length and has no invalid values.
                     if matches!(tcx.tys.kind(self.struct_tail_for_codegen(lcx, tcx, inner)), TyKind::Dyn(..)) {
-                        l.niche = nonnull(8);
+                        l.niche = nonnull(pb);
                     }
                     l
                 } else {
-                    scalar(8, ptr, Cls::I)
+                    scalar(pb, ptr, Cls::I)
                 };
                 // references are never null (rustc: the data pointer's valid range starts at 1;
                 // of a fat reference's two scalars the first wins a tie)
@@ -644,7 +664,7 @@ impl Layouts {
                 l
             }
             TyKind::FnPtr(..) => {
-                let mut l = scalar(8, ptr, Cls::I);
+                let mut l = scalar(pb, ptr, Cls::I);
                 l.niche = nonnull(0);
                 l
             }
@@ -691,9 +711,10 @@ impl Layouts {
                 let el = self.of(lcx, tcx, e);
                 let stride = self.rup(lcx, el.size, el.align);
                 let full = (stride as u64).saturating_mul(n);
-                // rustc_abi obj_size_bound: 2^61 bytes on a 64-bit target; a larger value type has no
+                // rustc_abi obj_size_bound: 2^61 bytes on a 64-bit target (2^31 on a 32-bit one); a larger value type has no
                 // layout (E0080 "values of the type `..` are too big for the target architecture")
-                if (stride as u128) * (n as u128) >= 1u128 << 61 {
+                let bound = if tcx.tys.ptr_bytes == 4 { 1u128 << 31 } else { 1u128 << 61 };
+                if (stride as u128) * (n as u128) >= bound {
                     tcx.dcx.report(crate::next_solver::fulfill::ObligationCause { body_id: crate::program::NO_DEF, span: 0 },
                         format!("E0080: values of the type `{}` are too big for the target architecture", crate::typeck::ty_to_string(false, lcx.prog, tcx, t)));
                 }
@@ -723,16 +744,16 @@ impl Layouts {
                 if !adt.is_enum {
                     let mut fts = Vec::new();
                     for fi in 0..adt.variants[0].fields.len() {
-                        fts.push(tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), d, 0, fi as u32, tcx.tys.list(args)));
+                        fts.push(self.field_ty(lcx, tcx, d, 0, fi as u32, tcx.tys.list(args)));
                     }
                     // a live-editable struct (M10): its first version's fields, then the hidden
                     // extension word; the fields edits added live in the extension block
                     if !adt.is_union && self.live_editable(lcx, tcx, d, &adt, t) {
                         let n_base = (adt.ext_from as usize).min(fts.len());
                         let mut l = self.struct_layout(lcx, tcx, &fts[..n_base], repr, Kind::AlwaysSized);
-                        let ext = self.rup(lcx, l.size, 8);
-                        l.align = l.align.max(8);
-                        l.size = self.rup(lcx, ext + 8, l.align);
+                        let ext = self.rup(lcx, l.size, pb);
+                        l.align = l.align.max(pb);
+                        l.size = self.rup(lcx, ext + pb, l.align);
                         l.ext = Some(ext);
                         l.leaves = None;
                         l.fields.resize(fts.len(), u32::MAX);
@@ -761,6 +782,14 @@ impl Layouts {
                         eprintln!("makepad: layout of `{}` with an unsized last field, but its definition requires that field sized (rustc: E0277); declare the parameter `?Sized`", name);
                     }
                     let mut l = self.struct_layout(lcx, tcx, &fts, repr, kind);
+                    if adt.is_simd() {
+                        // rustc's vector layout (x86-64, AArch64): the lanes' size rounded up to a
+                        // power of two, aligned to that size; passed in memory here
+                        let size = l.size.max(1).next_power_of_two();
+                        l.size = size;
+                        l.align = size;
+                        l.leaves = None;
+                    }
                     if adt.no_niche {
                         l.niche = None;
                     } else if adt.valid_start.is_some() || adt.valid_end.is_some() {
@@ -959,7 +988,7 @@ impl Layouts {
         for (vi, v) in adt.variants.iter().enumerate() {
             let mut fts = Vec::new();
             for fi in 0..v.fields.len() {
-                fts.push(tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), d, vi as u32, fi as u32, args));
+                fts.push(self.field_ty(lcx, tcx, d, vi as u32, fi as u32, args));
             }
             let (fl, ls) = self.field_ls(lcx, tcx, &fts);
             vfl.push(fl);
@@ -1065,12 +1094,12 @@ impl Layouts {
         ds.sort();
         ds.dedup();
         let discr_signed = match adt.repr_int {
-            Some(p) => crate::types::Types::int_info(p).1,
+            Some(p) => tcx.tys.int_info(p).1,
             None => true,
         };
         let discr_bytes = match adt.repr_int {
-            Some(p) => crate::types::Types::int_info(p).0,
-            None => 8,
+            Some(p) => tcx.tys.int_info(p).0,
+            None => tcx.tys.ptr_bytes,
         };
         let dmax = if discr_bytes >= 16 { u128::MAX } else { (1u128 << (discr_bytes * 8)) - 1 };
         let smax: u128 = if discr_bytes >= 16 { i128::MAX as u128 } else { (1u128 << (discr_bytes * 8 - 1)) - 1 };
@@ -1092,7 +1121,7 @@ impl Layouts {
         // rustc_middle discr_range_of_repr
         let (min_bytes, signed) = match adt.repr_int {
             Some(p) => {
-                let (b, s) = crate::types::Types::int_info(p);
+                let (b, s) = tcx.tys.int_info(p);
                 (b, s)
             }
             None => {
@@ -1215,7 +1244,7 @@ impl Layouts {
                         if !self.decl_maybe_unsized(lcx, tcx, d2, depth + 1) {
                             return false;
                         }
-                        let s = tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), d2, 0, adt2.variants[0].fields.len() as u32 - 1, tcx.tys.list(a2));
+                        let s = self.field_ty(lcx, tcx, d2, 0, adt2.variants[0].fields.len() as u32 - 1, tcx.tys.list(a2));
                         self.ty_maybe_unsized(lcx, tcx, s, params, depth + 1)
                     }
                 }
@@ -1259,7 +1288,7 @@ impl Layouts {
                 Some(adt) if !adt.is_enum && (!adt.is_union || adt.variants[0].fields.len() == 1) => match adt.variants[0].fields.last() {
                     Some(_) => {
                         // a projection tail (`A::Dyn` with `type Dyn = DynRef`) normalized first
-                        let ft = tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), *d, 0, adt.variants[0].fields.len() as u32 - 1, tcx.tys.list(*args));
+                        let ft = self.field_ty(lcx, tcx, *d, 0, adt.variants[0].fields.len() as u32 - 1, tcx.tys.list(*args));
                         self.is_unsized(lcx, tcx, ft)
                     }
                     None => false,
@@ -1281,7 +1310,7 @@ impl Layouts {
                 TyKind::Adt(def, args, _) => {
                     let Some(adt) = tcx.adts.get(def) else { return ty };
                     if adt.is_enum || adt.is_union || adt.variants[0].fields.is_empty() { return ty; }
-                    tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), *def, 0, adt.variants[0].fields.len() as u32 - 1, tcx.tys.list(*args))
+                    self.field_ty(lcx, tcx, *def, 0, adt.variants[0].fields.len() as u32 - 1, tcx.tys.list(*args))
                 }
                 _ => return ty,
             };
@@ -1309,7 +1338,7 @@ impl Layouts {
                     return None;
                 }
                 adt.variants[0].fields.last()?;
-                let ft = tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), d, 0, adt.variants[0].fields.len() as u32 - 1, tcx.tys.list(args));
+                let ft = self.field_ty(lcx, tcx, d, 0, adt.variants[0].fields.len() as u32 - 1, tcx.tys.list(args));
                 let (o, tail) = self.unsized_tail(lcx, tcx, ft)?;
                 let l = self.of(lcx, tcx, t);
                 Some((l.fields[adt.variants[0].fields.len() - 1] + o, tail))

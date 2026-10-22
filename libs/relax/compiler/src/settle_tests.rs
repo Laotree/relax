@@ -16,7 +16,7 @@ fn fn_entry_size() {
         prev: Vec<(u64, u32, PcMap, u32)>,
         compiled: bool,
         patch_gen: u32,
-        rir: Option<std::sync::Arc<crate::rir::Func>>,
+        rir: Option<std::sync::Arc<relax_backend::rir::Func>>,
         refs: u32,
         rir_refs: Box<[u32]>,
         entry_ref: AtomicBool,
@@ -29,7 +29,7 @@ fn fn_entry_size() {
         version: u32,
         retired: Vec<(u64, u32, PcMap)>,
         inflight: bool,
-        spec: Option<(Vec<u8>, Vec<(u32, u64)>, Vec<crate::rir::RelocAt>, bool)>,
+        spec: Option<(Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>, bool)>,
         spec_state: u8,
         spec_depth: u8,
         baseline_hint: AtomicBool,
@@ -37,6 +37,7 @@ fn fn_entry_size() {
         o3: AtomicBool,
         base_code: AtomicBool,
         unverified: AtomicBool,
+        d3_lowered: AtomicBool,
         calls: Box<[u32]>,
     }
     let before = std::mem::size_of::<InlineFnEntry>();
@@ -192,12 +193,47 @@ fn owner_front_write_serves_waiting_readers() {
         crate::owner::call(crate::owner::Class::Job, || {});
     });
     ready_rx.recv().unwrap();
-    let start = std::time::Instant::now();
+    // without the pump the two wait for each other forever (the test hangs, which the harness
+    // reports); how long the serving takes is the machine's (a JIT-run test compiles on first use)
     crate::owner::call(crate::owner::Class::App, || {
         let _writer = front_write();
     });
     reader.join().unwrap();
-    assert!(start.elapsed().as_secs() < 5, "the owner's front write waited for a reader waiting for the owner");
+}
+
+#[test]
+fn allocator_swap_serves_background_finish() {
+    isolated_test!(allocator_swap_serves_background_finish);
+    // A background build's job (O2, speculation, O3) that reaches its finish while an allocator
+    // swap pauses the jobs: the finish keeps the job running (Class::keeps_job), so the owner
+    // serves it for the job's thread and the swap's wait ends. Held back, the swap waited forever.
+    crate::owner::call(crate::owner::Class::App, || {});
+    let (began_tx, began_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let job = std::thread::spawn(move || {
+        let _job = compile_job();
+        began_tx.send(()).unwrap();
+        go_rx.recv().unwrap();
+        crate::owner::call(crate::owner::Class::FinishBackground, || {});
+        for class in [crate::owner::Class::Finish, crate::owner::Class::Job] {
+            crate::owner::call(class, || {});
+        }
+    });
+    began_rx.recv().unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let pauser = std::thread::spawn(move || {
+        pause_compile_jobs(false);
+        done_tx.send(()).unwrap();
+        resume_compile_jobs(false);
+    });
+    while !BG_PAUSE.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    go_tx.send(()).unwrap();
+    assert!(done_rx.recv_timeout(std::time::Duration::from_secs(20)).is_ok(),
+        "the allocator swap waits for a job whose finish the pause holds back");
+    pauser.join().unwrap();
+    job.join().unwrap();
 }
 
 #[test]

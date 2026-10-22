@@ -53,7 +53,7 @@ pub fn borrowck_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
     let (mut roots, mut checked_bodies, mut errors_total, mut typeck_fail) = (0usize, 0usize, 0usize, 0usize);
     let (mut errors, mut region_errors, mut mir_bugs, mut unchecked, mut panics) =
         (Inventory::default(), Inventory::default(), Inventory::default(), Inventory::default(), Inventory::default());
-    let t0 = crate::clock::cpu_ns();
+    let t0 = relax_backend::cpu_ns();
     for owner in body::owners(prog) {
         let d = prog.def(owner.owner);
         if !with_std && std_crates.contains(&d.krate) {
@@ -104,7 +104,7 @@ pub fn borrowck_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
     }
     eprintln!(
         "makepad-run mir-borrowck: {roots} roots ({typeck_fail} failed typeck), {checked_bodies} bodies checked, {errors_total} errors, {} region errors, {} MIR bugs, {} unchecked, {} panicked; cpu {:.1} ms",
-        region_errors.total(), mir_bugs.total(), unchecked.total(), panics.total(), (crate::clock::cpu_ns() - t0) as f64 / 1e6
+        region_errors.total(), mir_bugs.total(), unchecked.total(), panics.total(), (relax_backend::cpu_ns() - t0) as f64 / 1e6
     );
     errors.print("ERROR");
     region_errors.print("REGION ERROR");
@@ -197,7 +197,7 @@ fn check_root(prog: &Program, tcx: &Tcx, owner: CheckedBody, tb: &crate::typeck:
                             out.unchecked.push(("enclosing closure without a recorded signature".into(), at));
                             return out;
                         };
-                        match SignatureRegions::closure_in(tcx, prog, tb.def, pe.0, psigs, owner_sig.clone()) {
+                        match SignatureRegions::closure_in(tcx, prog, tb.def, pe.0, psigs, None, owner_sig.clone()) {
                             Some(s) => s,
                             None => {
                                 out.unchecked.push(("enclosing closure has no signature regions".into(), at));
@@ -206,7 +206,8 @@ fn check_root(prog: &Program, tcx: &Tcx, owner: CheckedBody, tb: &crate::typeck:
                         }
                     }
                 };
-                let Some(sig) = SignatureRegions::closure_in(tcx, prog, tb.def, e.0, sigs, parent_sig) else {
+                let plan = crate::borrowck::universal_regions::coroutine_closure_upvars(tb, e.0);
+                let Some(sig) = SignatureRegions::closure_in(tcx, prog, tb.def, e.0, sigs, plan.as_ref().map(|p| (p, mir.local_decls[1].ty)), parent_sig) else {
                     out.unchecked.push(("closure has no signature regions".into(), at));
                     return out;
                 };
