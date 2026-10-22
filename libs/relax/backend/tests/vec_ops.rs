@@ -12,7 +12,7 @@ type Entry = extern "C" fn(*const u8, *const u8, *mut u8);
 
 #[cfg(target_arch = "x86_64")]
 fn compile(options: &relax_session::Options, f: &Func) -> (Code, u32) {
-    let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+    let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
     let c = relax_backend::x64::compile(options, f, &env).unwrap();
     assert!(c.relocs.is_empty());
     (Code::new(&c.code).unwrap(), c.text_len)
@@ -25,7 +25,7 @@ fn native(options: &relax_session::Options, op: VX) -> bool {
 
 #[cfg(target_arch = "aarch64")]
 fn compile(options: &relax_session::Options, f: &Func) -> (Code, u32) {
-    let env = relax_backend::arm64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+    let env = relax_backend::arm64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
     let c = relax_backend::arm64::compile(options, f, &env).unwrap();
     assert!(c.relocs.is_empty());
     (Code::new(&c.code).unwrap(), c.text_len)
@@ -341,6 +341,12 @@ fn reference(op: VX, a: &[u8; 16], b: &[u8; 16]) -> ([u8; 16], VW, Vec<Cmp>) {
             }
             (d, VW::S, vec![Cmp::NanAny; 4])
         }
+        VX::ShufS(k) => {
+            for j in 0..4 {
+                put(&mut d, VW::S, j, get(a, VW::S, (k as usize >> (2 * j)) & 3));
+            }
+            (d, VW::S, vec![Cmp::Exact; 4])
+        }
         VX::MoveMask(w) => {
             let mut r = 0u64;
             for j in 0..lanes(w) {
@@ -375,6 +381,7 @@ fn width(op: VX) -> VW {
         VX::FMinLt(w) | VX::FMaxGt(w) | VX::FMinNum(w) | VX::FMaxNum(w) | VX::FCmp(_, w) => w,
         VX::FNeg(w) | VX::FAbs(w) | VX::FSqrt(w, _) | VX::FRound(w, _) | VX::FToI(w) | VX::IToF(w) => w,
         VX::Narrow(w) | VX::MoveMask(w) => w,
+        VX::ShufS(_) => VW::S,
         VX::FCvtLo => VW::S,
         VX::FCvtNarrow => VW::D,
         _ => unreachable!("{op:?}"),
@@ -449,6 +456,7 @@ fn int_ops() -> Vec<VX> {
         v.push(VX::MoveMask(w));
     }
     v.extend([VX::AvgU(VW::B), VX::AvgU(VW::H)]);
+    v.extend([0x00, 0x1b, 0x55, 0xc9, 0xd2, 0xe4].map(VX::ShufS));
     v.extend([VX::Narrow(VW::H), VX::Narrow(VW::S), VX::Narrow(VW::D)]);
     v
 }
