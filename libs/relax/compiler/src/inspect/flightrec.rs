@@ -38,8 +38,10 @@ const FRAME_STALL_NS: u64 = 250_000_000;
 /// auto dumps at most this often, and how far back they reach
 const DUMP_GAP_NS: u64 = 30_000_000_000;
 const DUMP_LAST_NS: u64 = 120_000_000_000;
+/// a hitch's recording reaches back this far (it is written right after the hitch)
+const HITCH_LAST_NS: u64 = 60_000_000_000;
 /// automatic recordings kept in the folder (older `auto-` files are removed)
-const AUTO_KEEP: usize = 24;
+const AUTO_KEEP: usize = 12;
 
 static DUMP_MS: AtomicU64 = AtomicU64::new(1000);
 /// how the run was started (a replay starts the same): (args, cwd, MAKEPAD_* environment)
@@ -475,7 +477,7 @@ fn watch() {
             let gap = if why == Why::Panic { DUMP_GAP_NS / 3 } else { DUMP_GAP_NS };
             if last == 0 || now.saturating_sub(last) >= gap {
                 LAST_AUTO.store(now, Relaxed);
-                match save(DUMP_LAST_NS, why, None, true) {
+                match save(if why == Why::Hitch { HITCH_LAST_NS } else { DUMP_LAST_NS }, why, None, true) {
                     Ok((path, n)) => eprintln!("makepad-run flightrec: {} recorded: {} ({} KB; makepad inspect file={} pf brief)", why.name(), path.display(), n / 1024, path.display()),
                     Err(e) => eprintln!("makepad-run flightrec: cannot write the {} recording: {}", why.name(), e),
                 }
