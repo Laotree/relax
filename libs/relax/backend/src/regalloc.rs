@@ -2058,7 +2058,20 @@ pub fn check_alloc(options: &relax_session::Options, f: &Func, cfg: &RegConfig, 
         let mut check = |st: &St, u: u32, p: u32, what: &str, out: &mut Vec<String>| {
             if let Some((v, c)) = reg_of(u) {
                 if !st[c as usize].contains(&v) && reported.insert((p, v)) {
-                    out.push(format!("ra-check {}: {} of v{} (via v{}) at {} (b{} +{}) reads r{} holding {:?}", f.name, what, v, u, p, bi, p - bs, c, st[c as usize]));
+                    // how the holders and the read value were defined (diagnosing the checker)
+                    let mut defs = String::new();
+                    for &h in st[c as usize].iter().chain(std::iter::once(&v)) {
+                        for (b2, blk) in f.blocks.iter().enumerate() {
+                            for (k, i) in blk.insts.iter().enumerate() {
+                                let mut is = false;
+                                for_defs(i, |d| is |= d.0 == h);
+                                if is {
+                                    defs.push_str(&format!(" | v{} def b{}:{} {:?}", h, b2, k, i));
+                                }
+                            }
+                        }
+                    }
+                    out.push(format!("ra-check {}: {} of v{} (via v{}) at {} (b{} +{}) reads r{} holding {:?}{}", f.name, what, v, u, p, bi, p - bs, c, st[c as usize], defs));
                 }
             }
         };
