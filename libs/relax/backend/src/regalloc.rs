@@ -1353,7 +1353,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         }
     }
     // second chance for spilled values (O3, second_chance). MAKEPAD_RUN_OPT=-evict: off
-    let evict_on = thorough && !crate::stats::opt_off(options, "-evict");
+    let evict_on = thorough && !crate::stats::opt_off(options, "-evict") && evict_bis(f);
     let (evicts, prestores, lent) = if evict_on && loc.iter().any(|l| matches!(l, Loc::Stack(_))) {
         // values in a coalesced unit, passed-through loop pieces and recomputed ones keep their place
         let skip: Vec<bool> = (0..nv).map(|v| unit_members(v).is_some() || parent[v as usize] != v || is_low(v) || remat[v as usize].is_some()).collect();
@@ -1901,8 +1901,9 @@ fn second_chance(
             }
             rl.sort_unstable();
             rl.dedup();
-            // a reload position inside v's range would overwrite v
-            if rl.iter().any(|&p| r.iter().any(|&(a, z)| a <= p && p <= z)) {
+            // a reload position inside v's range, or where the register is lent to another value,
+            // would overwrite that value
+            if rl.iter().any(|&p| r.iter().any(|&(a, z)| a <= p && p <= z) || (!lent[ci].is_empty() && bits_any(&lent[ci], p.saturating_sub(1), (p + 1).min(maxp)))) {
                 continue;
             }
             for &p in &rl {
@@ -3701,6 +3702,27 @@ fn allocate_split_inner(options: &relax_session::Options, f: &Func, cfg: &RegCon
 /// save / restore happens on the cold path only. (Without this, every value live across such a
 /// call -- an Rc drop_slow, a Vec grow inlined into the loop -- needs a callee-saved register for
 /// the whole loop or spills: x64 has five.) Returns the rewritten copy, or None.
+/// TEMPORARY bisection: MAKEPAD_RUN_EVICT_BIS=lo-hi enables second_chance only in functions whose
+/// name hash mod 4096 is in lo..hi
+fn evict_bis(f: &Func) -> bool {
+    match std::env::var("MAKEPAD_RUN_EVICT_BIS") {
+        Ok(w) => {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for b in f.name.bytes() {
+                h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+            }
+            let k = (h % 4096) as u32;
+            let (lo, hi) = w.split_once('-').map(|(a, b)| (a.parse().unwrap_or(0), b.parse().unwrap_or(4096))).unwrap_or((0, 4096));
+            let on = lo <= k && k < hi;
+            if on && std::env::var("MAKEPAD_RUN_EVICT_BIS_LOG").is_ok() {
+                eprintln!("evict-bis {} {}", k, f.name);
+            }
+            on
+        }
+        Err(_) => true,
+    }
+}
+
 fn trace_on(f: &Func) -> bool {
     match std::env::var("MAKEPAD_RUN_RA_TRACE") {
         Ok(w) => f.name.ends_with(w.as_str()),
