@@ -2034,6 +2034,49 @@ pub fn check_alloc(options: &relax_session::Options, f: &Func, cfg: &RegConfig, 
     };
     let (mut us, mut ds) = (Vec::new(), Vec::new());
     let mut tu = Vec::new();
+    // values defined on every path to a block start (a value read where some path never defined
+    // it holds anything: RIR leaves such reads on infeasible paths, and coalescing shares registers
+    // with them): must-analysis by intersection
+    let nvw = (f.vregs.len() + 63) / 64;
+    let mut defd: Vec<Option<Vec<u64>>> = vec![None; nb];
+    {
+        let mut e = vec![0u64; nvw];
+        for p in &f.params {
+            e[p.0 as usize / 64] |= 1 << (p.0 % 64);
+        }
+        defd[0] = Some(e);
+        let mut wl: Vec<usize> = vec![0];
+        while let Some(bi) = wl.pop() {
+            let Some(mut d) = defd[bi].clone() else { continue };
+            for i in &f.blocks[bi].insts {
+                for_defs(i, |v| d[v.0 as usize / 64] |= 1 << (v.0 % 64));
+            }
+            for t in f.blocks[bi].term.succs() {
+                let t = t as usize;
+                if !reach[t] {
+                    continue;
+                }
+                let ch = match &mut defd[t] {
+                    None => {
+                        defd[t] = Some(d.clone());
+                        true
+                    }
+                    Some(o) => {
+                        let mut ch = false;
+                        for w in 0..nvw {
+                            let x = o[w] & d[w];
+                            ch |= x != o[w];
+                            o[w] = x;
+                        }
+                        ch
+                    }
+                };
+                if ch {
+                    wl.push(t);
+                }
+            }
+        }
+    }
     let mut work: Vec<usize> = vec![0];
     let mut rounds = 0usize;
     let mut reported = std::collections::HashSet::new();
@@ -2044,6 +2087,7 @@ pub fn check_alloc(options: &relax_session::Options, f: &Func, cfg: &RegConfig, 
             break;
         }
         let Some(mut st) = state_in[bi].clone() else { continue };
+        let mut dd = defd[bi].clone().unwrap_or_else(|| vec![0u64; nvw]);
         let b = &f.blocks[bi];
         let n = b.insts.len();
         let bs = al.block_start[bi];
@@ -2055,9 +2099,9 @@ pub fn check_alloc(options: &relax_session::Options, f: &Func, cfg: &RegConfig, 
                 st[r].clear();
             }
         };
-        let mut check = |st: &St, u: u32, p: u32, what: &str, out: &mut Vec<String>| {
+        let mut check = |st: &St, dd: &[u64], u: u32, p: u32, what: &str, out: &mut Vec<String>| {
             if let Some((v, c)) = reg_of(u) {
-                if !st[c as usize].contains(&v) && reported.insert((p, v)) {
+                if dd[v as usize / 64] & (1 << (v % 64)) != 0 && !st[c as usize].contains(&v) && reported.insert((p, v)) {
                     // how the holders and the read value were defined (diagnosing the checker)
                     let mut defs = String::new();
                     for &h in st[c as usize].iter().chain(std::iter::once(&v)) {
@@ -2080,7 +2124,7 @@ pub fn check_alloc(options: &relax_session::Options, f: &Func, cfg: &RegConfig, 
             // a prestore stores the register: it must hold its value
             if let Some(vs) = prestore_at.get(&p) {
                 for &v in vs {
-                    check(&st, v, p, "prestore", &mut out);
+                    check(&st, &dd, v, p, "prestore", &mut out);
                 }
             }
             if let Some(rs) = reload_at.get(&p) {
@@ -2092,7 +2136,7 @@ pub fn check_alloc(options: &relax_session::Options, f: &Func, cfg: &RegConfig, 
             if ii == n {
                 term_uses(&b.term, &mut tu);
                 for &u in &tu {
-                    check(&st, u.0, p, "terminator read", &mut out);
+                    check(&st, &dd, u.0, p, "terminator read", &mut out);
                 }
                 break;
             }
@@ -2100,7 +2144,7 @@ pub fn check_alloc(options: &relax_session::Options, f: &Func, cfg: &RegConfig, 
             uses_defs(i, &mut us, &mut ds);
             for u in &us {
                 if reg_of(u.0).map_or(false, |(v, c)| !st[c as usize].contains(&v)) {
-                    check(&st, u.0, p, &format!("read by {:?}", i), &mut out);
+                    check(&st, &dd, u.0, p, &format!("read by {:?}", i), &mut out);
                 }
             }
             if let Some(cl) = cfg.clobbers {
@@ -2124,6 +2168,7 @@ pub fn check_alloc(options: &relax_session::Options, f: &Func, cfg: &RegConfig, 
                 _ => None,
             };
             for d in &ds {
+                dd[d.0 as usize / 64] |= 1 << (d.0 % 64);
                 if let Loc::Reg(c) = al.loc[d.0 as usize] {
                     if f.vregs[d.0 as usize] != Cls::I {
                         continue;
