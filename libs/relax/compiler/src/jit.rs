@@ -9638,6 +9638,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     }
     // stores to those fields that every path overwrites before anything may read them
     if cfg.fold && relax_codegen::opt::dead_param_field_stores(options, func) {
+        relax_backend::passes::dce(func);
         relax_backend::passes::live_dce(func);
     }
     // bounds checks the counted loop's range implies once a guard in front of it holds: a
@@ -9707,7 +9708,9 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         // reads of a temporary a variable was copied from read the variable: one register
         relax_codegen::opt::reuse_copied_variables(options, func);
         // bit readers' `x & ((1 << n) - 1)`: one bzhi (x64 BMI2) / bic of a shifted -1 (arm64)
-        relax_codegen::opt::form_bzhi(options, func);
+        if relax_codegen::opt::form_bzhi(options, func) {
+            relax_backend::passes::dce(func);
+        }
         // copies the late folds left unread (an unrolled pointer's per-copy values once address
         // modes read the base: `lea rcx,[rdi+1]; mov r8,rcx` before r8 is loaded over)
         if !relax_backend::stats::opt_off(options, "-latedce") {
