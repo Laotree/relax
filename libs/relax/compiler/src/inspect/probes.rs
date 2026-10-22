@@ -477,7 +477,8 @@ fn by_name_params(u: &crate::jit::Unit, probe: crate::program::DefId) -> Option<
 /// type that needs dropping declared `ManuallyDrop<T>`, `&mut` only with `mutate`.
 fn check_params(u: &crate::jit::Unit, hooked: u32, probe: crate::program::DefId, mutate: bool) -> Result<(), String> {
     use crate::types::TyKind;
-    let crate::jit::FnKey::Inst(d, gargs) = &u.fns[hooked as usize].key else { return Err("the hooked slot is not a fn instance".into()) };
+    // a SPEC-V twin (`[unverified]`) runs its base slot's fn: same signature
+    let crate::jit::FnKey::Inst(d, gargs) = super::instrument::base_key(u, hooked) else { return Err("the hooked slot is not a fn instance".into()) };
     let hs = u.tcx.fn_sig(&u.prog, *d).ok_or("the hooked fn has no signature")?;
     let ps = u.tcx.fn_sig(&u.prog, probe).ok_or("the probe fn has no signature")?;
     if ps.n_generics != 0 {
@@ -546,7 +547,7 @@ fn add(hook: &str, src: Vec<u8>, mutate: bool, low: bool) -> Result<(Arc<Probe>,
         }
         // the probe is a child module of the hooked fn's module: its private items, its `use`s
         // and `crate::` paths are the probe's too
-        let scope = match &u.fns[found[0].0 as usize].key {
+        let scope = match super::instrument::base_key(u, found[0].0) {
             crate::jit::FnKey::Inst(d, _) => crate::modules::scope_of(u, *d),
             _ => return Err("the hooked slot is not a fn instance".into()),
         };

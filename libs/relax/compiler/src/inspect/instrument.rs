@@ -235,10 +235,20 @@ enum Shape {
     Other,
 }
 
+/// A slot's fn key, through a SPEC-V twin (`FnKey::Plain`, named `[unverified]`) to the slot it
+/// twins: the twin is the same fn body, so its item, scope and signature are the base's. (Probes
+/// and line hooks of unverified code -- most of a relaxed app -- refused "not a fn instance".)
+pub(super) fn base_key(u: &crate::jit::Unit, id: u32) -> &crate::jit::FnKey {
+    match &u.fns[id as usize].key {
+        crate::jit::FnKey::Plain(b) => &u.fns[*b as usize].key,
+        k => k,
+    }
+}
+
 /// The parameters of slot `id` (on the owner) and how they map onto `f`'s integer parameter words.
 fn arg_plan(u: &crate::jit::Unit, id: u32, f: &relax_backend::rir::Func) -> ArgPlan {
     use crate::types::TyKind;
-    let crate::jit::FnKey::Inst(d, gargs) = &u.fns[id as usize].key else { return ArgPlan::default() };
+    let crate::jit::FnKey::Inst(d, gargs) = base_key(u, id) else { return ArgPlan::default() };
     let Some(sig) = u.tcx.fn_sig(&u.prog, *d) else { return ArgPlan::default() };
     let mut names: Vec<String> = Vec::new();
     {
