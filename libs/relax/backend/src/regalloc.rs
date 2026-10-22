@@ -585,23 +585,6 @@ fn bits_any(o: &[u64], a: u32, b: u32) -> bool {
     o[wa + 1..wb].iter().any(|w| *w != 0)
 }
 
-/// Clears positions a..=b
-#[inline]
-fn bits_clear(o: &mut [u64], a: u32, b: u32) {
-    let (wa, wb) = ((a / 64) as usize, (b / 64) as usize);
-    let ma = !0u64 << (a % 64);
-    let mb = !0u64 >> (63 - b % 64);
-    if wa == wb {
-        o[wa] &= !(ma & mb);
-        return;
-    }
-    o[wa] &= !ma;
-    o[wb] &= !mb;
-    for w in &mut o[wa + 1..wb] {
-        *w = 0;
-    }
-}
-
 /// Sets positions a..=b
 #[inline]
 fn bits_fill(o: &mut [u64], a: u32, b: u32) {
