@@ -9624,6 +9624,10 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     if cfg.fold && relax_codegen::ranges::fold_ranges(options, func) {
         relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
     }
+    // compares a small set of possible operand values decides (tuple `lt` through Ordering)
+    if cfg.fold && !relax_backend::stats::opt_off(options, "-smallsets") && relax_codegen::opt::fold_small_sets(func) {
+        relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
+    }
     // bounds checks the counted loop's range implies once a guard in front of it holds: a
     // check-free clone (rotation, unrolling, vectorisation take it), the original as fallback
     if cfg.fold && relax_codegen::version::version_bounds_loops(options, func) {

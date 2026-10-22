@@ -6247,6 +6247,135 @@ pub fn promote_dyn_read_slots(f: &mut Func) -> bool {
     true
 }
 
+/// The few values a single-def integer vreg can hold, when its definition chain makes them a
+/// small set: constants, compare results (0 / 1), selects of such values, and unary maps of them
+/// (integer conversions, operations with a constant). At most four values, eight definitions deep.
+fn small_set(f: &Func, def_at: &[(u32, u32)], v: VReg, depth: u32, out: &mut Vec<i64>) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    let (bi, k) = def_at[v.0 as usize];
+    if bi == u32::MAX {
+        return false;
+    }
+    let push = |out: &mut Vec<i64>, x: i64| -> bool {
+        if !out.contains(&x) {
+            if out.len() == 4 {
+                return false;
+            }
+            out.push(x);
+        }
+        true
+    };
+    match f.blocks[bi as usize].insts[k as usize] {
+        Inst::Iconst(_, c) => push(out, c),
+        // a compare of small sets: its outcomes; else either
+        Inst::ICmpI(cc, sg, _, x, c) => {
+            let mut xs = Vec::new();
+            if small_set(f, def_at, x, depth - 1, &mut xs) {
+                xs.into_iter().all(|a| push(out, cmp_i(cc, sg, a, c) as i64))
+            } else {
+                push(out, 0) && push(out, 1)
+            }
+        }
+        Inst::ICmp(cc, sg, _, x, y) => {
+            let (mut xs, mut ys) = (Vec::new(), Vec::new());
+            if small_set(f, def_at, x, depth - 1, &mut xs) && small_set(f, def_at, y, depth - 1, &mut ys) {
+                xs.iter().all(|&a| ys.iter().all(|&b| push(out, cmp_i(cc, sg, a, b) as i64)))
+            } else {
+                push(out, 0) && push(out, 1)
+            }
+        }
+        Inst::FCmp(..) => push(out, 0) && push(out, 1),
+        Inst::Mov(_, a) => small_set(f, def_at, a, depth - 1, out),
+        Inst::Sel(_, _, a, b) => small_set(f, def_at, a, depth - 1, out) && small_set(f, def_at, b, depth - 1, out),
+        Inst::Conv(Conv::IntToInt(it), _, a) => {
+            let mut xs = Vec::new();
+            small_set(f, def_at, a, depth - 1, &mut xs) && xs.into_iter().all(|x| push(out, extend_const(x, it)))
+        }
+        Inst::IBinI(op, it, _, a, c) if !matches!(op, IOp::Div | IOp::Rem) => {
+            let mut xs = Vec::new();
+            small_set(f, def_at, a, depth - 1, &mut xs) && xs.into_iter().all(|x| fold_ibin(op, it, x, c).map_or(false, |y| push(out, y)))
+        }
+        _ => false,
+    }
+}
+
+/// Compares and selects decided by the small value sets of their operands (LLVM's fold of a
+/// compare of a select of constants, InstCombine `foldCmpLoadFromIndexedGlobal`'s set form):
+/// tuple `lt` compares fields through `Ordering` as an i8 (`lt ? -1 : (eq ^ 1)`) and tests the
+/// sign-extended byte against `ControlFlow`'s niche (254), which no value of the set is: the
+/// branch is always taken. A compare all of whose operand values give one outcome becomes that
+/// constant; a select on a condition with one possible value becomes a copy. Returns whether
+/// anything changed (simplify then folds the branches).
+pub fn fold_small_sets(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 2;
+    }
+    let mut def_at = vec![(u32::MAX, 0u32); nv];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            for_defs(i, |d| {
+                ndef[d.0 as usize] += 1;
+                def_at[d.0 as usize] = (bi as u32, k as u32);
+            });
+        }
+    }
+    for v in 0..nv {
+        if ndef[v] != 1 {
+            def_at[v] = (u32::MAX, 0);
+        }
+    }
+    let mut edits: Vec<(usize, usize, Inst)> = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            let (d, cc, sg, x, y) = match *i {
+                Inst::ICmpI(cc, sg, d, x, c) => (d, cc, sg, x, Err(c)),
+                Inst::ICmp(cc, sg, d, x, y) => (d, cc, sg, x, Ok(y)),
+                Inst::Sel(d, c, a, b2) => {
+                    let mut cs = Vec::new();
+                    if small_set(f, &def_at, c, 8, &mut cs) && !cs.is_empty() {
+                        let t = cs.iter().all(|&x| x != 0);
+                        if t || cs.iter().all(|&x| x == 0) {
+                            edits.push((bi, k, Inst::Mov(d, if t { a } else { b2 })));
+                        }
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            let mut xs = Vec::new();
+            if !small_set(f, &def_at, x, 8, &mut xs) || xs.is_empty() {
+                continue;
+            }
+            let ys = match y {
+                Err(c) => vec![c],
+                Ok(y) => {
+                    let mut ys = Vec::new();
+                    if !small_set(f, &def_at, y, 8, &mut ys) || ys.is_empty() {
+                        continue;
+                    }
+                    ys
+                }
+            };
+            let r0 = cmp_i(cc, sg, xs[0], ys[0]);
+            if xs.iter().all(|&a| ys.iter().all(|&b| cmp_i(cc, sg, a, b) == r0)) {
+                // a single-value pair is a constant compare simplify folds itself
+                if xs.len() > 1 || ys.len() > 1 {
+                    edits.push((bi, k, Inst::Iconst(d, r0 as i64)));
+                }
+            }
+        }
+    }
+    let changed = !edits.is_empty();
+    for (bi, k, i) in edits {
+        f.blocks[bi].insts[k] = i;
+    }
+    changed
+}
+
 /// Bit-tracking dead code for masks and casts (LLVM's BDCE): per integer vreg, the bits any of
 /// its uses reads (a fixed point over every use, so multi-definition variables -- a bit
 /// reader's `bitsleft`, read only as `bitsleft as u8` and `(bitsleft >> 3) & 7` -- are covered);
