@@ -66,6 +66,12 @@ impl NativeBin {
         Vec::new()
     }
 
+    /// The function containing `addr`.
+    pub fn fn_at(&self, addr: u64) -> Option<&NativeFn> {
+        let k = self.fns.partition_point(|f| f.addr <= addr);
+        self.fns[..k].last().filter(|f| addr < f.addr + f.size.max(1))
+    }
+
     /// The code bytes of `f`.
     pub fn code(&self, f: &NativeFn) -> &[u8] {
         let _ = f;

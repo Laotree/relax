@@ -8,6 +8,7 @@
 //! and lines of JIT frames ask the owner (Job class: served inside its pumps too), with a short
 //! timeout after which the reply says what it could not resolve.
 
+pub mod asm;
 pub mod client;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod cfi;
@@ -23,6 +24,8 @@ pub mod probes;
 pub mod mem;
 pub mod natbin;
 mod prof;
+pub mod reliability;
+pub mod remarks;
 pub mod timeline;
 pub mod vars;
 pub(crate) mod symbols;
@@ -44,6 +47,7 @@ pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
     patches::scan_kept(a);
     probes::scan_kept(a);
     codever::scan_kept(a);
+    remarks::scan_kept(a);
 }
 
 /// The inspect thread runs (a socket is listening).
@@ -122,6 +126,8 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("frame", "<n|slowest>", "one frame of the last timeline: UI phases, critical path, waits and who ended them (alias of timeline frame)"),
     ("path", "<H<n>|R<n>>", "the full stack of a heap site id"),
     ("count", "<fn> [time=1] [tier=o1]", "exact call counts (and inclusive time) of every slot of a fn: its code is rebuilt with probes at the tier of the code it replaces (O3 code gets an O3 instrumented build; tier=o1 asks for O1) and installed as a probe group G<n>; every slot whose code holds an inlined copy of the fn is rebuilt at its tier without that inlining, so it calls the counted code; each row names the code version replaced and the one now, later installs with an inlined copy are rebuilt too (a `probe` event)"),
+    ("asm", "<fn|@slot> [vs=rustc] [native=<binary>] [s=2] [view=summary|lines|listing|ours] [line=<n>] | top vs=rustc [s=3] [n=15]", "the JIT's machine code of a fn next to rustc's for the same fn (native=: a release build with line tables), aligned by source line, with CPU samples and PGO counts per line and a diff summary first: excess instructions, spill traffic, kept bounds checks, calls rustc inlined, loops rustc vectorised; `asm top vs=rustc` ranks the hottest fns by the time their excess instructions cost"),
+    ("remarks", "<fn|@slot> [n=20]", "the O3 tier's optimisation remarks for the fn: every call its last O3 build kept (hot sites first) and why (no rule, budget, growth ceiling, cold, recursive, no body) with the numbers, and the tiers of its code"),
     ("versions", "<fn|file:line>", "every code version of the fn: per slot its installed, replaced and retired code (tier baseline/O1/O2/O3/O3-guarded/instrumented, origin fresh/warm-cache/warm-image/live-patch/inspect, address, patch generation, cache key and build), which threads run in which, and the slots whose code holds an inlined copy of it"),
     ("tier", "<fn|file:line> o1|o3|auto [fresh=1] | (none: the pins)", "pins the fn and every slot that inlined it to a tier in the live process (A/B a suspected miscompile): o1 = O1 code generation, kept until `tier <fn> auto`; o3 = the o1 pin goes and they get O3 builds now (fresh=1: rebuild O3 code even where it runs, e.g. warm-cache code)"),
     ("break", "<fn>|<file>:<line> [tier=o1]", "breakpoint: a hit parks the thread at the call (stack intact) and raises a `break` event K<n>"),
@@ -193,6 +199,8 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "heap" => heap::cmd_heap(req, out),
         "vms" => cmd_vms(out),
         "versions" => codever::cmd_versions(req, out),
+        "asm" => asm::cmd_asm(req, out),
+        "remarks" => remarks::cmd_remarks(req, out),
         "tier" => codever::cmd_tier(req, out),
         // Host-native providers outlive app domains and never enter program code.
         _ if cmd_host_provided(req, out) => {},

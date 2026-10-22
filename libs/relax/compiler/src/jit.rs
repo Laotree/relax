@@ -10176,7 +10176,9 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     }
     static INLINE_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // MAKEPAD_RUN_INLINE_STATS=1: per O3 build; =prep: also per bottom-up preparation
-    let mut inline_stats = (*INLINE_STATS.get_or_init(|| std::env::var("MAKEPAD_RUN_INLINE_STATS").map_or(false, |v| v == "1" || v == "prep"))).then(relax_codegen::opt::InlineStats::default);
+    // the census (env) or only the optimisation remarks (always: makepad inspect `asm`, `remarks`)
+    let census = *INLINE_STATS.get_or_init(|| std::env::var("MAKEPAD_RUN_INLINE_STATS").map_or(false, |v| v == "1" || v == "prep"));
+    let mut inline_stats = Some(if census { relax_codegen::opt::InlineStats::default() } else { relax_codegen::opt::InlineStats::remarks() });
     // Bottom-up, as LLVM's CGSCC inliner: every callee in the snapshot is simplified first, its
     // own inlining included; a site takes that body when its optimised form passes the rules and
     // fits, else the snapshot body (top-down). A pure function of the snapshot, so replay stays
@@ -10195,6 +10197,9 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         r
     };
     let mut inlined = tier1_simplify(options, func, id, name, get, &prepared, single, ro, cfg, nounwind, frequencies, inline_stats.as_mut(), None, None, hot);
+    if let Some(st) = inline_stats.as_mut() {
+        crate::inspect::remarks::record_inline(id, std::mem::take(&mut st.remarks));
+    }
     bodies.expand(&mut inlined);
     TIER1_PREP[0].fetch_add(prep_ns.get(), Ordering::Relaxed);
     TIER1_PREP[2].fetch_add(bodies.index.borrow().values().filter(|b| b.is_some()).count() as u64, Ordering::Relaxed);
@@ -10336,7 +10341,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
             relax_backend::passes::live_dce(func);
         }
     }
-    if let Some(stats) = inline_stats { stats.report(name); }
+    if let Some(stats) = inline_stats.filter(|s| !s.remarks_only) { stats.report(name); }
     inlined
 }
 
@@ -10859,6 +10864,16 @@ struct FrequencyProfile {
     /// kept-heap words the counted code increments (never freed: retired counted code may still
     /// run on another thread)
     counters: &'static [AtomicU64],
+}
+
+impl Unit {
+    /// Slot `id`'s PGO counts as (source position, executions of the counted block holding it),
+    /// for makepad inspect `asm` (None: the slot has no counted build). The positions are the
+    /// counted (pre-O3) RIR's: the fn's own code, not what O3 inlines into it later.
+    pub(crate) fn pgo_counts(&self, id: u32) -> Option<Vec<(u64, u64)>> {
+        let p = self.frequency_profiles.get(&id)?;
+        Some(p.pos_blocks.iter().filter(|(_, b)| p.counted.get(*b as usize).copied().unwrap_or(false)).map(|&(pos, b)| (pos, p.counters[b as usize].load(Ordering::Relaxed))).collect())
+    }
 }
 
 impl FrequencyProfile {
