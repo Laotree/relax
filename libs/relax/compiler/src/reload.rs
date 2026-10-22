@@ -2648,6 +2648,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 }
             }
         }
+        // the defs the commits made (closures and anonymous constants of the edited bodies)
+        u.tcx.grow_to(&u.prog);
         // imports the added items brought (`use`, an inline `mod`'s): resolved now, only theirs
         if u.prog.imports.len() > imports0 {
             u.prog.resolve_imports_from_in(imports0, &visible_crates);
@@ -4568,7 +4570,7 @@ mod use_edit_tests {
         isolated_test!(editing_a_use_of_a_same_module_item_patches);
         const CHILD: &str = "MAKEPAD_RUN_USE_EDIT_CASE";
         let Ok(case) = std::env::var(CHILD) else {
-            for case in ["enum_variants", "fn_rename", "use_in_closure"] {
+            for case in ["enum_variants", "fn_rename", "use_in_closure", "closure_added"] {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "reload::use_edit_tests::editing_a_use_of_a_same_module_item_patches", "--nocapture", "--test-threads=1"])
                     .env(CHILD, case).env("MAKEPAD_RUN_CTFE", "0").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0")
@@ -4585,6 +4587,10 @@ mod use_edit_tests {
                 "enum M { A, B }\nuse M::{B, A};\nfn main() { let _ = (A, B); }\n"),
             // a `use` and a fn added inside a closure body (LIVEDEBUG2: their defs were never
             // collected, so the declaration table the borrow checker reads stopped short of them)
+            // a body edit that adds a closure: def_collector gives it a def at the commit
+            "closure_added" => (
+                "fn main() { let _ = 1u32; }\n",
+                "fn main() { let f = || 2u32; let g = move |x: u32| x + f(); let _ = g(1); }\n"),
             "use_in_closure" => (
                 "mod m { pub fn g() -> u32 { 1 } }\nfn main() { let f = || 1u32; let _ = f(); }\n",
                 "mod m { pub fn g() -> u32 { 1 } }\nfn main() { let f = || { use self::m::g as h; fn k() -> u32 { 2 } h() + k() }; let _ = f(); }\n"),
@@ -4611,9 +4617,12 @@ mod use_edit_tests {
         let outcome = unsafe { apply(up, vec![Edit { file, path: path.to_string_lossy().into_owned(), src: new.as_bytes().to_vec() }]) };
         assert_eq!(outcome.rung, Rung::Patch, "{case}: {:?}", outcome.lines);
         if case == "use_in_closure" {
-            // the body's new fn `k` has a def and its declarations are reachable
-            let k = (0..unit.prog.defs.len() as u32).map(DefId).find(|d| unit.prog.def(*d).krate == krate && unit.prog.name(*d) == "k").expect("k collected");
-            let _ = unit.tcx.generic_indices_of(&unit.prog, k);
+            // the body's new fn `k` has a def
+            assert!((0..unit.prog.defs.len() as u32).map(DefId).any(|d| unit.prog.def(d).krate == krate && unit.prog.name(d) == "k"), "k collected");
+        }
+        if case == "use_in_closure" || case == "closure_added" {
+            // every def of the crate, the edit's new ones too, has its declarations (the borrow
+            // checker of the edited fn asks for its closures')
             for d in (0..unit.prog.defs.len() as u32).map(DefId).filter(|d| unit.prog.def(*d).krate == krate) {
                 let _ = unit.tcx.generic_indices_of(&unit.prog, d);
             }
