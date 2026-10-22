@@ -7373,7 +7373,8 @@ fn drain_slow_base() {
     let forget = now.saturating_sub(LAST_FORGET.load(Ordering::Relaxed)) >= PGO_WORK_NS
         && COUNTING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|e| e.parked);
     let up = TIER_UNIT.load(Ordering::Acquire);
-    if ids.is_empty() && !forget || up.is_null() {
+    let twins = !TWIN_PENDING.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+    if ids.is_empty() && !forget && !twins || up.is_null() {
         return;
     }
     if forget {
@@ -7387,6 +7388,9 @@ fn drain_slow_base() {
         }
         if forget {
             pgo_forget(&*up);
+        }
+        if twins {
+            drain_twin_pending(up);
         }
     });
 }
@@ -11677,6 +11681,12 @@ fn rt_loop_hot(counter: u64, fp: u64) {
                 eprintln!("O3q loop #{}: caller {:?} (state {})", at, found, found.map_or(0, |c| (*tier_rec(&u.slots, c).add(3)).load(Ordering::Relaxed)));
             }
             let Some(c) = found else { break };
+            // SPEC-V: a frame calling a twin is that twin's caller (indirect and helper-lowered
+            // calls leave no record at lowering): recorded, and if the twin is hot its caller is
+            // brought to the base slot (twin_seen)
+            if c != at && matches!(u.fns[at as usize].key, FnKey::Plain(_)) {
+                twin_seen(u, c, at);
+            }
             if c != at {
                 let st = (*tier_rec(&u.slots, c).add(3)).load(Ordering::Relaxed);
                 // a lukewarm slot in its counting window: the loop under it is its work (credited:
@@ -12146,6 +12156,56 @@ pub(crate) fn note_twin_user(u: &Unit, caller: u32, twin: u32) {
             v.push(caller);
         }
     });
+}
+
+/// SPEC-V: callers of hot twins seen at run time (rt_loop_hot's frame walk), for the first O3 worker's
+/// poll (drain_slow_base)
+static TWIN_PENDING: relax_session::sync::Mutex<Vec<(usize, u32)>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// SPEC-V: `caller`'s frame called twin `twin` (a program thread: never waits on a lock)
+fn twin_seen(u: &Unit, caller: u32, twin: u32) {
+    let key = (u as *const Unit as usize, twin);
+    let Ok(mut m) = TWIN_USERS.try_lock() else { return };
+    let new = crate::zone_alloc::kept_with(|| {
+        let v = m.entry(key).or_default();
+        let new = !v.contains(&caller);
+        if new {
+            v.push(caller);
+        }
+        new
+    });
+    drop(m);
+    if new && u.fns[twin as usize].o3.load(Ordering::Relaxed) {
+        if let Ok(mut p) = TWIN_PENDING.try_lock() {
+            crate::zone_alloc::kept_with(|| p.push((key.0, caller)));
+        }
+    }
+}
+
+/// SPEC-V: the run-time-seen callers of hot twins (TWIN_PENDING): classified and brought to the base
+/// slots as at a twin's O3 install (unit read on the owner)
+unsafe fn drain_twin_pending(up: *mut Unit) {
+    let ids: Vec<u32> = std::mem::take(&mut *TWIN_PENDING.lock().unwrap_or_else(|e| e.into_inner())).into_iter().filter(|e| e.0 == up as usize).map(|e| e.1).collect();
+    if ids.is_empty() {
+        return;
+    }
+    let u = &*up;
+    let mut tc = TwinCallers::default();
+    for c in ids {
+        let f = &u.fns[c as usize];
+        if !f.compiled || matches!(f.key, FnKey::Plain(_) | FnKey::Sandbox(_) | FnKey::Glue(..) | FnKey::Shim(_)) {
+            continue;
+        }
+        if f.unverified.load(Ordering::Relaxed) { tc.unverified.push(c) } else if f.o3.load(Ordering::Relaxed) { tc.o3.push(c) } else { tc.below.push(c) }
+    }
+    if specv_trace() {
+        let l = |v: &Vec<u32>| format!("{} [{}]", v.len(), v.iter().take(4).map(|&c| format!("#{} {}", c, short_name(&u.fns[c as usize].name))).collect::<Vec<_>>().join(", "));
+        eprintln!("specv @{:.3} twin callers seen: unverified {} / verified-O3 {} / verified-below-O3 {}", wall_ns() as f64 / 1e9, l(&tc.unverified), l(&tc.o3), l(&tc.below));
+    }
+    for &c in &tc.o3 {
+        tier_push(c, Q_RETIER, 0);
+    }
+    relower_twin_callers(up, &tc);
 }
 
 /// SPEC-V: brings twin callers below O3 to the base slots (twin_callers; the O3 ones are the
