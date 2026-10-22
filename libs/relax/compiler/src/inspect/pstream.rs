@@ -532,7 +532,7 @@ impl StreamEnc {
         self.next_tid += 1;
         let mut name = name_of(os_id, handle);
         if name.is_empty() {
-            name = super::threads::list().into_iter().find(|t| t.os_id == os_id).map(|t| t.name).unwrap_or_default();
+            name = super::threads::list().iter().find(|t| t.os_id == os_id).map(|t| t.name.clone()).unwrap_or_default();
         }
         let sid = self.strings.id(&name);
         self.new_threads.push(ps::thread_payload(tid, os_id, handle, role_of(handle, &name), sid));
