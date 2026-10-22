@@ -681,6 +681,27 @@ pub fn vx_peep(f: &mut Func, ndef: &[u32]) {
             }
         }
     }
+    // vectors whose every use reads only their low 64 bits (lane extracts there), and the lane-wise
+    // results only such extracts read: the operands of those may be any vector with the same low
+    // half (NEON 8-byte group compares widened to 16-byte vectors: `FromLo64(Extract(D, 0, v))`)
+    let mut uses = vec![0u32; nv];
+    let mut low_uses = vec![0u32; nv];
+    for b in &f.blocks {
+        for i in &b.insts {
+            crate::regalloc::for_uses(i, |u| uses[u.0 as usize] += 1);
+            if let Inst::VX(VX::Extract(w, lane), _, a, _) = *i {
+                if (lane as u32 + 1) * w.bits() <= 64 {
+                    low_uses[a.0 as usize] += 1;
+                }
+            }
+        }
+        let mut t = Vec::new();
+        crate::regalloc::term_uses(&b.term, &mut t);
+        for u in t {
+            uses[u.0 as usize] += 1;
+        }
+    }
+    let low_only = |v: VReg| uses[v.0 as usize] > 0 && uses[v.0 as usize] == low_uses[v.0 as usize];
     // the vector whose low 64 bits `x` holds
     let low = |x: VReg| -> VReg {
         if let Some((VX::FromLo64, t)) = def[x.0 as usize] {
@@ -765,10 +786,20 @@ pub fn vx_peep(f: &mut Func, ndef: &[u32]) {
                     VX::Extract(w, lane) if (lane as u32 + 1) * w.bits() <= 64 => {
                         *a = low(*a);
                         *bb = *a;
+                        // lane 0 of [x, 0] is x
+                        if let (VX::Extract(VW::D, 0), Some((VX::FromLo64, x))) = (*op, def[a.0 as usize]) {
+                            let d = *d;
+                            *i = Inst::Mov(d, x);
+                            continue;
+                        }
+                    }
+                    // lane-wise ops whose result is only read in its low half: so are their operands
+                    VX::CmpEq(_) | VX::CmpGtS(_) | VX::And | VX::Or | VX::Xor | VX::AndNot | VX::Add(_) | VX::Sub(_) if low_only(*d) => {
+                        *a = low(*a);
+                        *bb = low(*bb);
                     }
                     _ => {}
                 }
-                let _ = d;
             }
         }
     }
