@@ -4730,6 +4730,90 @@ pub fn sink_increments(options: &relax_session::Options, f: &Func) -> Option<Fun
     g
 }
 
+/// A compare whose one use is its block's branch moves to the end of the block (with the pure
+/// instruction right before it that computes its one-use operand, `t = x & K`), so the emitters
+/// fuse it into cmp + jcc / b.cond instead of materialising it (`setne; movzx; test; jne` when a
+/// constant or a copy sat between them: `while let Some(ix) = cur`). Not past a call (its
+/// operands would cross it). MAKEPAD_RUN_OPT=-sinkbr off.
+pub fn sink_branch_compares(options: &relax_session::Options, f: &Func) -> Option<Func> {
+    if crate::stats::opt_off(options, "-sinkbr") {
+        return None;
+    }
+    let nv = f.vregs.len();
+    let mut uses = vec![0u32; nv];
+    let mut tu: Vec<VReg> = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_uses(i, |u| uses[u.0 as usize] += 1);
+        }
+        tu.clear();
+        term_uses(&b.term, &mut tu);
+        for u in &tu {
+            uses[u.0 as usize] += 1;
+        }
+    }
+    let mut g: Option<Func> = None;
+    for bi in 0..f.blocks.len() {
+        let b = &f.blocks[bi];
+        let Term::Branch(c, _, _) = b.term else { continue };
+        let n = b.insts.len();
+        if n < 2 || uses[c.0 as usize] != 1 {
+            continue;
+        }
+        let Some(j) = (0..n).rev().find(|&k| {
+            let mut d = false;
+            for_defs(&b.insts[k], |x| d |= x == c);
+            d
+        }) else {
+            continue;
+        };
+        if j + 1 == n {
+            continue;
+        }
+        let ops: Vec<VReg> = match b.insts[j] {
+            Inst::ICmp(_, _, _, x, y) | Inst::FCmp(_, _, _, x, y) => vec![x, y],
+            Inst::ICmpI(_, _, _, x, _) => vec![x],
+            _ => continue,
+        };
+        // the pure one-use operand computed right before it travels along
+        let mut lo = j;
+        if j > 0 {
+            let p = &b.insts[j - 1];
+            let mut d1 = Vec::new();
+            for_defs(p, |x| d1.push(x));
+            if d1.len() == 1 && ops.contains(&d1[0]) && uses[d1[0].0 as usize] == 1 && matches!(p, Inst::IBinI(..) | Inst::IBin(..) | Inst::Conv(Conv::IntToInt(_), ..)) {
+                lo = j - 1;
+            }
+        }
+        let mut reads: Vec<VReg> = Vec::new();
+        let mut writes: Vec<VReg> = Vec::new();
+        for k in lo..=j {
+            for_uses(&b.insts[k], |u| reads.push(u));
+            for_defs(&b.insts[k], |d| writes.push(d));
+        }
+        let blocked = (j + 1..n).any(|k| {
+            let i = &b.insts[k];
+            if matches!(i, Inst::Call(..)) {
+                return true;
+            }
+            let mut bad = false;
+            for_defs(i, |d| bad |= reads.contains(&d) || writes.contains(&d));
+            for_uses(i, |u| bad |= writes.contains(&u));
+            bad
+        });
+        if blocked {
+            continue;
+        }
+        let gf = g.get_or_insert_with(|| f.clone());
+        let blk = &mut gf.blocks[bi];
+        let moved: Vec<Inst> = blk.insts.drain(lo..=j).collect();
+        let mpos: Vec<u64> = blk.pos.drain(lo..=j).collect();
+        blk.insts.extend(moved);
+        blk.pos.extend(mpos);
+    }
+    g
+}
+
 pub fn sink_compares(f: &Func) -> Option<Func> {
     let mut g: Option<Func> = None;
     for bi in 0..f.blocks.len() {

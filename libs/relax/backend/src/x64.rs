@@ -5991,6 +5991,9 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // counter steps after the last read of the old value (no copy per iteration)
     let stepped = if env.opt_regs || f.full { regalloc::sink_increments(options, f) } else { None };
     let f = stepped.as_ref().unwrap_or(f);
+    // branch compares at the end of their block (fused into cmp + jcc)
+    let brs = if env.opt_regs || f.full { regalloc::sink_branch_compares(options, f) } else { None };
+    let f = brs.as_ref().unwrap_or(f);
     let mut cfg = reg_config(options);
     cfg.sym_class = env.sym_class;
     let _cost_ra = crate::probe::phase(9);
