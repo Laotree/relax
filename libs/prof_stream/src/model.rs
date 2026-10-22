@@ -110,7 +110,7 @@ pub struct Event {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Input {
     pub t: u64,
-    /// the program's UI frame (presented frames) it arrived in
+    /// the program's UI frame (draw events since its start) it arrived in
     pub frame: u64,
     /// injected by makepad remote (an agent's click), not the person's
     pub injected: bool,

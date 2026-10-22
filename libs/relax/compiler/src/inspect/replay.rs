@@ -63,7 +63,7 @@ pub fn file_main(path: &str, words: &[String]) -> i32 {
     let seed = ev("seed.script").map(|e| e.a).filter(|&s| s != 0);
     let window = p.events.iter().find(|e| p.s(e.cat) == "window.geom" && e.a == 0).or_else(|| ev("window.geom")).map(|e| e.text.clone());
     // the input file the program plays back: `<ms> <frame since start> <command>`
-    let mut txt = String::from("# makepad input v1: <ms since record start> <presented frame since start> <command> (flight recorder replay)\n");
+    let mut txt = String::from("# makepad input v1: <ms since record start> <drawn frame since start> <command> (flight recorder replay)\n");
     let t0 = inputs.first().map_or(0, |i| i.t);
     for i in &inputs {
         txt.push_str(&format!("{:.1} {} {}\n", i.t.saturating_sub(t0) as f64 / 1e6, i.frame, i.command));
