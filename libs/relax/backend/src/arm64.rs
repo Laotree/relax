@@ -154,6 +154,30 @@ fn keeps_v0_7(f: &Func, i: &Inst) -> bool {
 
 static RIR_MAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Stack storage alignment floor (frame::slot_layout_aligned): ldr / str x and ldp / stp scale
+/// their immediate by the access size, so an 8-byte field of a 4-aligned aggregate past the
+/// unscaled range needs `mov ip, #off; ldr [sp, ip]`, and q pairs on 16 need a 16-aligned base
+fn a64_slot_align(size: u32) -> u32 {
+    if size >= 16 {
+        16
+    } else if size >= 8 {
+        8
+    } else {
+        1
+    }
+}
+
+/// The emitted function's RIR, then `# counts` with each block's profile count (-1 = not counted)
+fn emitted_dump(f: &Func) -> String {
+    let mut s = f.dump();
+    s.push_str("# counts");
+    for b in &f.blocks {
+        s.push_str(&format!(" {}", b.count));
+    }
+    s.push('\n');
+    s
+}
+
 /// Record `Compiled::rir_map` (code offset -> RIR block/instruction) in later compiles (asm dumps)
 pub fn set_rir_map(on: bool) {
     RIR_MAP.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -1096,7 +1120,7 @@ impl<'a> Gen<'a> {
         // only slots something addresses take space (SROA and inlining leave many unreferenced:
         // the Splash VM's O3 opcode() had 1749 slots, 515 in use); slots whose lifetimes cannot
         // overlap share it (frame::slot_layout)
-        let (slot_fp, mut off) = crate::frame::slot_layout(self.f, self.saved + self.al.spill_bytes as i64, !crate::stats::opt_off(options, "-slotcolor"));
+        let (slot_fp, mut off) = crate::frame::slot_layout_aligned(self.f, self.saved + self.al.spill_bytes as i64, !crate::stats::opt_off(options, "-slotcolor"), if crate::stats::opt_off(options, "-a64slotalign") { |_| 1 } else { a64_slot_align });
         self.slot_pos = crate::frame::slot_addr_positions(self.f, &slot_fp);
         // C ABI body: buffers that rebuild aggregate params from their registers, and the
         // buffer an aggregate result is written to before Ret loads it into registers
@@ -4027,22 +4051,41 @@ impl<'a> Gen<'a> {
                 }
             }
             Inst::Copy(dst, src, size) => {
-                let rd = self.use_i(*dst, S0);
-                let rs = self.use_i(*src, S1);
                 let size = *size as i64;
+                let q = size >= 32 && self.qcopy;
+                // a slot or `base + k` end is addressed off sp / the base with its offset (no `add`
+                // first) when every piece's offset encodes: q pairs a multiple of 16 in -1024..=1008
+                // (scaled imm7), else the 8/4/1-byte pieces' unsigned scaled or unscaled range
+                let fits = |o: i64| if q { o % 16 == 0 && o >= -1024 && o + size - 16 <= 1008 } else { o >= 0 && o % 8 == 0 && o + size <= 4096 * 4 || o >= -256 && o + size <= 256 };
+                let (rd, od) = {
+                    let (b, o) = self.resolve_off(*dst, 0);
+                    match self.slot_base(b) {
+                        Some(so) if fits(so + o) => (SP, so + o),
+                        _ if o != 0 && fits(o) && self.slot_base(b).is_none() => (self.use_i(b, S0), o),
+                        _ => (self.use_i(*dst, S0), 0),
+                    }
+                };
+                let (rs, os) = {
+                    let (b, o) = self.resolve_off(*src, 0);
+                    match self.slot_base(b) {
+                        Some(so) if fits(so + o) => (SP, so + o),
+                        _ if o != 0 && fits(o) && self.slot_base(b).is_none() => (self.use_i(b, S1), o),
+                        _ => (self.use_i(*src, S1), 0),
+                    }
+                };
                 let mut o = 0i64;
-                if size >= 32 && self.qcopy {
+                if q {
                     // 16-byte vector moves through the float scratch (an `ldp`/`stp` pair moves 32
                     // bytes in two instructions): a 160-byte struct move is 10 instructions, not 40
-                    let pair = |o: i64| o <= 1008;
-                    while o + 32 <= size && pair(o) {
-                        self.a.e(0xAD40_0000 | (((o / 16) as u32) & 0x7f) << 15 | (FS1 as u32) << 10 | (rs as u32) << 5 | FS0 as u32);
-                        self.a.e(0xAD00_0000 | (((o / 16) as u32) & 0x7f) << 15 | (FS1 as u32) << 10 | (rd as u32) << 5 | FS0 as u32);
+                    let pair = |x: i64| x % 16 == 0 && (-1024..=1008).contains(&x);
+                    while o + 32 <= size && pair(os + o) && pair(od + o) {
+                        self.a.e(0xAD40_0000 | ((((os + o) / 16) as u32) & 0x7f) << 15 | (FS1 as u32) << 10 | (rs as u32) << 5 | FS0 as u32);
+                        self.a.e(0xAD00_0000 | ((((od + o) / 16) as u32) & 0x7f) << 15 | (FS1 as u32) << 10 | (rd as u32) << 5 | FS0 as u32);
                         o += 32;
                     }
                     while o + 16 <= size {
-                        self.vldst(true, FS0, rs, o);
-                        self.vldst(false, FS0, rd, o);
+                        self.vldst(true, FS0, rs, os + o);
+                        self.vldst(false, FS0, rd, od + o);
                         o += 16;
                     }
                     // the tail falls through to the 8/4/1-byte pieces below, not one overlapping
@@ -4051,18 +4094,18 @@ impl<'a> Gen<'a> {
                     // overlapping tail made the next copy's load span two stores)
                 }
                 while o + 8 <= size {
-                    self.a.ldst(LDRX, 8, IP0, rs, o);
-                    self.a.ldst(STRX, 8, IP0, rd, o);
+                    self.a.ldst(LDRX, 8, IP0, rs, os + o);
+                    self.a.ldst(STRX, 8, IP0, rd, od + o);
                     o += 8;
                 }
                 while o + 4 <= size {
-                    self.a.ldst(LDRW, 4, IP0, rs, o);
-                    self.a.ldst(STRW, 4, IP0, rd, o);
+                    self.a.ldst(LDRW, 4, IP0, rs, os + o);
+                    self.a.ldst(STRW, 4, IP0, rd, od + o);
                     o += 4;
                 }
                 while o < size {
-                    self.a.ldst(LDRB, 1, IP0, rs, o);
-                    self.a.ldst(STRB, 1, IP0, rd, o);
+                    self.a.ldst(LDRB, 1, IP0, rs, os + o);
+                    self.a.ldst(STRB, 1, IP0, rd, od + o);
                     o += 1;
                 }
             }
@@ -5164,7 +5207,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     } else {
         crate::dbgloc::note_stats(&pc_map, &[], 0);
     }
-    return Ok(Compiled { code, pc_map, frame_size: frame, text_len, alloc_sig, relocs: g.relocs, rir_emitted: if g.rir_map_on { g.f.dump() } else { String::new() }, rir_map: g.rir_map });
+    return Ok(Compiled { code, pc_map, frame_size: frame, text_len, alloc_sig, relocs: g.relocs, rir_emitted: if g.rir_map_on { emitted_dump(g.f) } else { String::new() }, rir_map: g.rir_map });
     }
 }
 
