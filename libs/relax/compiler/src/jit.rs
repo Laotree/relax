@@ -2498,7 +2498,7 @@ impl Unit {
         if let Some(x) = m.iter().find(|x| x.0 == me && x.1 == target) {
             return Some(x.2);
         }
-        let at = self.emit_code(&regs_call_tramp(target));
+        let at = self.emit_code(&regs_call_tramp(target), "relax::regs_call_tramp");
         let _k = crate::zone_alloc::kept();
         m.push((me, target, at));
         Some(at)
@@ -2810,11 +2810,11 @@ impl Unit {
             }
         } else {
             let lazy = x64::lazy_entry(rt_compile as *const () as usize as u64);
-            u.lazy_entry = u.emit_code(&lazy);
+            u.lazy_entry = u.emit_code(&lazy, "relax::lazy_entry");
             let hot = x64::lazy_entry(rt_hot as *const () as usize as u64);
-            u.hot_entry = u.emit_code(&hot);
+            u.hot_entry = u.emit_code(&hot, "relax::hot_entry");
             let (el, leave_off) = x64::enter_leave();
-            u.enter = u.emit_code(&el);
+            u.enter = u.emit_code(&el, "relax::enter_leave");
             u.leave = u.enter + leave_off as u64;
         }
         let ps = panic_tramp(rt_panic_site as *const () as usize as u64);
@@ -2856,13 +2856,13 @@ impl Unit {
             }
             let _ = (ps, pb, pi);
         } else {
-            u.rt.panic_site = u.emit_code(&ps);
-            u.rt.panic_bounds = u.emit_code(&pb);
-            u.rt.panic_impl = u.emit_code(&pi);
+            u.rt.panic_site = u.emit_code(&ps, "relax::panic_site");
+            u.rt.panic_bounds = u.emit_code(&pb, "relax::panic_bounds");
+            u.rt.panic_impl = u.emit_code(&pi, "relax::panic_impl");
             let rs = panic_tramp(rt_resume_unwind as *const () as usize as u64);
-            u.rt.resume = u.emit_code(&rs);
+            u.rt.resume = u.emit_code(&rs, "relax::resume");
             let ld = x64::land();
-            u.rt.land = u.emit_code(&ld);
+            u.rt.land = u.emit_code(&ld, "relax::land");
         }
         if w32 {
             // the wasm32 program's runtime entries take and return offsets (web32.rs)
@@ -2875,11 +2875,11 @@ impl Unit {
             u.rt.memmove = crate::web32::w32_memmove as *const () as usize as u64;
             u.rt.memset = crate::web32::w32_memset as *const () as usize as u64;
             u.rt.fmt_pop = crate::web32::w32_fmt_pop as *const () as usize as u64;
-            u.rt.panic_impl = u.emit_code(&panic_tramp(crate::web32::w32_panic_impl as *const () as usize as u64));
+            u.rt.panic_impl = u.emit_code(&panic_tramp(crate::web32::w32_panic_impl as *const () as usize as u64), "relax::panic_impl");
         }
         u.env.resume = u.rt.resume;
         if os::fault::NEEDS_HANG_TRAMP {
-            HANG_TRAMP.store(u.emit_code(&relax_backend::x64::hang_tramp(rt_hang as *const () as usize as u64)), Ordering::Relaxed);
+            HANG_TRAMP.store(u.emit_code(&relax_backend::x64::hang_tramp(rt_hang as *const () as usize as u64), "relax::hang_tramp"), Ordering::Relaxed);
         }
         u.env.syms = u.syms.vals;
         u.env.sym_class = u.syms.classes;
@@ -3055,7 +3055,7 @@ impl Unit {
                 return Some(v);
             }
         }
-        let v = self.emit_code(&x64::veneer(target));
+        let v = self.emit_code(&x64::veneer(target), "relax::veneer");
         crate::zone_alloc::kept_with(|| m.insert(target, v));
         Some(v)
     }
@@ -3164,9 +3164,13 @@ impl Unit {
         unsafe { os::mem::write_code(at, b) };
     }
 
-    fn emit_code(&self, b: &[u8]) -> u64 {
+    /// Glue code (`what` names it in the perf map: veneers, trampolines, entries, stubs).
+    fn emit_code(&self, b: &[u8], what: &str) -> u64 {
         let at = bump(&self.code_next, b.len() as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
         unsafe { os::mem::write_code(at, b) };
+        if perf_map_on() {
+            perf_map(at, b.len(), what);
+        }
         at
     }
 
@@ -3467,10 +3471,10 @@ impl Unit {
             return;
         }
         let key = tls_key();
-        os::tls::static_tls_init(&|b| self.emit_code(b));
-        let off = os::tls::jit_offset(key, &|b| self.emit_code(b));
+        os::tls::static_tls_init(&|b| self.emit_code(b, "relax::static_tls"));
+        let off = os::tls::jit_offset(key, &|b| self.emit_code(b, "relax::tls_offset"));
         self.env.tls_key = off;
-        self.env.tls_slow = self.emit_code(&x64::tls_slow(rt_tls_block as *const () as usize as u64, off));
+        self.env.tls_slow = self.emit_code(&x64::tls_slow(rt_tls_block as *const () as usize as u64, off), "relax::tls_slow");
     }
 
     pub fn site(&self, file: u32, pos: u32, msg: &str) -> u64 {
@@ -4248,6 +4252,9 @@ impl Unit {
                 // and their heads reach the code (calls.DESIGN.md); the lazy stubs, table words and
                 // tier records are a reservation of their own
                 let thunk = bump(&self.code_next, (count * THUNK_SIZE) as u64, 1 << 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+                if perf_map_on() {
+                    perf_map(thunk, count * THUNK_SIZE, &format!("relax::thunks (segment {})", seg));
+                }
                 let code = count * STUB_SIZE;
                 let stub = os::mem::reserve(code, count * (8 + TIER_REC));
                 (thunk, stub, stub + code as u64)
@@ -4651,7 +4658,7 @@ impl Unit {
             relax_codegen::interp::const_call_entry(self.rt.panic_site, site)
         } else {
             let code = x64::jump_with_arg0(site, self.rt.panic_site);
-            self.emit_code(&code)
+            self.emit_code(&code, "relax::missing_foreign_fn")
         };
         crate::zone_alloc::kept_with(|| m.insert(name.clone(), a));
         a
@@ -6434,7 +6441,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
 
 /// A slot's name in the perf map: impl methods' names lack the self type, so the source line and
 /// the type arguments are added.
-fn perf_name(u: &Unit, id: u32) -> String {
+pub(crate) fn perf_name(u: &Unit, id: u32) -> String {
     let mut name = u.fns[id as usize].name.to_string();
     if let FnKey::Inst(d, args) = &u.fns[id as usize].key {
         let def = u.prog.def(*d);
@@ -6536,7 +6543,7 @@ pub(crate) fn perf_map_on() -> bool {
     *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_PERF_MAP").is_ok())
 }
 
-fn perf_map(addr: u64, len: usize, name: &str) {
+pub(crate) fn perf_map(addr: u64, len: usize, name: &str) {
     static MAP: std::sync::OnceLock<Option<relax_session::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     let f = MAP.get_or_init(|| {
         if std::env::var("MAKEPAD_RUN_PERF_MAP").is_err() {
@@ -12261,6 +12268,11 @@ impl Unit {
                 return;
             }
             os::mem::write_code(at, &buf);
+            if perf_map_on() {
+                for &(id, off) in &stubs {
+                    perf_map(at + off, cs, &format!("count {}", perf_name(self, id)));
+                }
+            }
             for (id, off) in stubs {
                 let rec = tier_rec(&self.slots, id);
                 (*rec.add(2)).store(at + off, Ordering::Relaxed);
@@ -12303,9 +12315,12 @@ impl Unit {
             (*rec.add(1)).store(code, Ordering::Relaxed);
             // Once the threshold-one stub has fired, another caller must also enter
             // rt_hot and wait for the build, rather than underflowing into O1.
-            let fallback = if recorded { self.emit_code(&x64::stub(id, self.hot_entry)) } else { code };
+            let fallback = if recorded { self.emit_code(&x64::stub(id, self.hot_entry), "relax::hot_stub") } else { code };
             let at = bump(&self.code_next, x64::COUNT_STUB_SIZE as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
             os::mem::write_code(at, &x64::count_stub(at, rec as u64, id, fallback, self.hot_entry));
+            if perf_map_on() {
+                perf_map(at, x64::COUNT_STUB_SIZE, &format!("count {}", perf_name(self, id)));
+            }
             (*rec.add(2)).store(at, Ordering::Relaxed);
             (*rec.add(3)).store(if recorded { T_REPLAY } else { T_COUNTING }, Ordering::Release);
             let slot = SlotWord::of(&self.slots, id);

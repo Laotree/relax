@@ -90,9 +90,6 @@ pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
     if let Ok(v) = NOTES.try_lock() {
         a.field("inspect.patch_notes");
         a.vec(&v);
-        for x in v.iter() {
-            a.string(&x.1);
-        }
     }
     if let Ok(v) = ACTIVE.try_lock() {
         a.field("inspect.patch_active");
@@ -442,7 +439,7 @@ unsafe fn rebuild(up: *mut crate::jit::Unit, id: u32, edits: &[(Owner, Edit)], u
         if pinned {
             None
         } else if !o3able {
-            Some("a by-name probe or restart landing is built at O1 only: the O3 code it replaced does not run while it is installed".to_string())
+            Some("a by-name probe or restart landing is built at O1 only: the O3 code it replaced does not run while it is installed")
         } else {
             let plain = edits.iter().all(|e| matches!(e.1, Edit::Uninline));
             let mut ed = |f: &mut relax_backend::rir::Func, u: &crate::jit::Unit| {
@@ -454,14 +451,15 @@ unsafe fn rebuild(up: *mut crate::jit::Unit, id: u32, edits: &[(Owner, Edit)], u
             if ok {
                 None
             } else {
-                Some("its O3 instrumented build was dropped (not verified, outdated, or it failed): it runs the O1 instrumented build, and the O3 code it replaced does not run while it is installed".to_string())
+                Some("its O3 instrumented build was dropped (not verified, outdated, or it failed): it runs the O1 instrumented build, and the O3 code it replaced does not run while it is installed")
             }
         }
     } else if o3_under && low {
-        Some("tier=o1 asked: built at O1; the O3 code it replaced does not run while it is installed".to_string())
+        Some("tier=o1 asked: built at O1; the O3 code it replaced does not run while it is installed")
     } else {
         None
     };
+    // (static text: the note outlives the compiler generation this build ran in)
     let _k = crate::zone_alloc::kept();
     let mut n = NOTES.lock().unwrap_or_else(|e| e.into_inner());
     n.retain(|x| x.0 != id);
@@ -472,10 +470,10 @@ unsafe fn rebuild(up: *mut crate::jit::Unit, id: u32, edits: &[(Owner, Edit)], u
 }
 
 /// Why a slot's inspect build is not at the tier of the code it replaced (patched_row says it).
-static NOTES: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
+static NOTES: Mutex<Vec<(u32, &'static str)>> = Mutex::new(Vec::new());
 
 pub(crate) fn tier_note(id: u32) -> Option<String> {
-    NOTES.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|x| x.0 == id).map(|x| x.1.clone())
+    NOTES.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|x| x.0 == id).map(|x| x.1.to_string())
 }
 
 thread_local! {
