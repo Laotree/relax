@@ -516,7 +516,7 @@ struct Phdr {
     align: u64,
 }
 
-/// macOS: the __DATA segments of the main image (makepad binary or the library that contains it).
+/// macOS: the writable __DATA segments of the main image (makepad binary or the library that contains it).
 #[cfg(target_os = "macos")]
 fn data_regions() -> Vec<(String, usize, usize, usize)> {
     use std::ffi::c_char;
@@ -529,7 +529,9 @@ fn data_regions() -> Vec<(String, usize, usize, usize)> {
     if h.is_null() {
         return out;
     }
-    for seg in [c"__DATA", c"__DATA_CONST", c"__DATA_DIRTY"] {
+    // (__DATA_CONST is read-only once dyld has bound it: it holds no heap pointer, and its
+    // constant tables' integers that happen to look like arena addresses were false hits)
+    for seg in [c"__DATA", c"__DATA_DIRTY"] {
         let mut size = 0usize;
         let p = unsafe { getsegmentdata(h, seg.as_ptr(), &mut size) };
         if !p.is_null() && size > 0 {
