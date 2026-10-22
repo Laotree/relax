@@ -1161,6 +1161,9 @@ impl<'a> Gen<'a> {
             // nor flags: the previous block's terminator (a fused cmp + b.cond) or another
             // predecessor set them, not the compare a select chain was started for
             self.sel_chain = None;
+            // window lookups of this block never see the previous block's last position (an empty
+            // block's terminator reads at its start: no window there, the slot is read)
+            self.cur_pos = self.al.block_start[bi];
             for (ii, inst) in b.insts.iter().enumerate() {
                 self.pc_map.push(((self.a.pos() * 4) as u32, b.pos[ii]));
                 self.cur_pos = self.al.inst_pos(bi, ii);
@@ -1238,7 +1241,6 @@ impl<'a> Gen<'a> {
             if matches!(b.term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..)) {
                 let tp = self.al.block_end[bi] - 1;
                 if let Some(ls) = self.win_start.get(&tp).cloned() {
-                    self.cur_pos = tp;
                     for (v, r) in ls {
                         if let Loc::Stack(o) = self.al.loc[v as usize] {
                             let off = self.spill_sp(o);

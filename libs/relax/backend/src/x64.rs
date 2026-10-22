@@ -1539,6 +1539,9 @@ impl<'a> Gen<'a> {
             // the flags of the ALU op that ended the block above (a jump arrives with other ones)
             self.last_spill = None;
             self.last_alu = None;
+            // window lookups of this block never see the previous block's last position (an empty
+            // block's terminator reads at its start: no window there, the slot is read)
+            self.cur_pos = self.al.block_start[bi];
             for (ii, inst) in b.insts.iter().enumerate() {
                 self.pc_map.push((self.a.pos() as u32, b.pos[ii]));
                 if self.rir_map_on {
@@ -1640,7 +1643,6 @@ impl<'a> Gen<'a> {
             if matches!(b.term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..)) {
                 let tp = self.al.block_end[bi] - 1;
                 if let Some(ls) = self.win_start.get(&tp).cloned() {
-                    self.cur_pos = tp;
                     for (v, r) in ls {
                         if let Loc::Stack(o) = self.al.loc[v as usize] {
                             let d = self.spill_disp(o);
