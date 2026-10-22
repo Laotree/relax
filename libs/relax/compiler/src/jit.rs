@@ -11580,7 +11580,7 @@ unsafe fn loop_syms(u: &Unit, id: u32) -> Option<(relax_backend::rir::Sym, relax
 /// use, also by a warm start's link: lower::intern_lazy_rt).
 pub(crate) fn loop_hot_sym(u: &Unit) -> relax_backend::rir::Sym {
     static TRAMP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let at = *TRAMP.get_or_init(|| u.emit_code(&loop_tramp(rt_loop_hot as *const () as usize as u64)));
+    let at = *TRAMP.get_or_init(|| u.emit_code(&loop_tramp(rt_loop_hot as *const () as usize as u64), "relax::loop_hot"));
     u.syms.intern(crate::syms::SymKind::Rt("loop_hot"), at)
 }
 
