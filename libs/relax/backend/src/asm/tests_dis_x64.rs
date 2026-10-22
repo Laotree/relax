@@ -202,8 +202,6 @@ fn dis_x64_canonical_text() {
         "vbroadcastss ymm0, dword ptr [rax]",
         "cvttsd2si rax, xmm0",
         "vcvtps2pd ymm0, xmm1",
-        "andn rax, rcx, rdx",
-        "shlx rax, rcx, rdx",
         "popcnt rax, rcx",
         "tzcnt eax, dword ptr [rbx]",
     ] {

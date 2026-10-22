@@ -509,7 +509,6 @@ struct Dec<'a> {
     vex: bool,
     evex: bool,
     vl: u8,
-    pp: u8,
     vvvv: u8,
     // modrm
     have_modrm: bool,
@@ -551,7 +550,6 @@ impl<'a> Dec<'a> {
             vex: false,
             evex: false,
             vl: 0,
-            pp: 0,
             vvvv: 0,
             have_modrm: false,
             mode: 0,
@@ -1017,7 +1015,9 @@ impl<'a> Dec<'a> {
             0x86 | 0x87 => {
                 self.modrm()?;
                 let bits = if op == 0x86 { 8 } else { self.osz() };
-                let o = self.o_er(bits);
+                // either operand order encodes the same swap; the lower register number first
+                // keeps the text stable across an assembler's choice
+                let o = if self.is_reg() && self.reg | self.rr << 3 < self.rm_n() { self.o_re(bits) } else { self.o_er(bits) };
                 let c = if self.is_mem() { Class::Atomic } else { Class::Alu };
                 self.fin("xchg", o, c)
             }
@@ -2077,6 +2077,16 @@ impl<'a> Dec<'a> {
                 let n = self.vname(name);
                 self.fin(&n, o, Class::Vector)?
             }
+            (1, 0xAE) if pp == 0 && self.vex => {
+                self.modrm()?;
+                if self.is_reg() || !(2..=3).contains(&self.reg) {
+                    return Err(Bad::Unk);
+                }
+                let mut o = String::new();
+                self.w_mem(&mut o, 32, 1);
+                let c = self.side(self.reg == 3);
+                self.fin(if self.reg == 2 { "vldmxcsr" } else { "vstmxcsr" }, o, c)?
+            }
             (1, 0x77) if pp == 0 => {
                 if vx {
                     self.fin(if self.vl == 0 { "vzeroupper" } else { "vzeroall" }, String::new(), Class::Vector)?
@@ -2508,7 +2518,6 @@ impl<'a> Dec<'a> {
             self.vl = (b2 >> 2) & 1;
             pp = b2 & 3;
         }
-        self.pp = pp;
         let op = self.u8()?;
         if !(1..=3).contains(&map) {
             return Err(Bad::Inval);
@@ -2533,7 +2542,6 @@ impl<'a> Dec<'a> {
         self.w = p1 & 0x80 != 0;
         self.vvvv = (!p1 >> 3) & 15;
         let pp = p1 & 3;
-        self.pp = pp;
         self.zero = p2 & 0x80 != 0;
         self.ll = (p2 >> 5) & 3;
         self.bcast = p2 & 0x10 != 0;
