@@ -12188,9 +12188,13 @@ unsafe fn counted_build(up: *mut Unit, id: u32) -> bool {
         let rir = f.rir.as_ref().filter(|r| !r.plain_calls && !r.naked && !r.blocks.is_empty())?.clone();
         let e = &u.env;
         let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class, near: e.near };
-        Some((rir, env, u.opt.fold, u.opt.layout, PATCH_EPOCH.load(Ordering::SeqCst), f.version))
+        // BEYOND2's dyn-target profile runs in the counted code too: its O3 build then decides
+        // the guards from the start (no PROFILE O3 build and relink)
+        let gctx = (crate::guards::enabled() && !f.unverified.load(Ordering::Relaxed))
+            .then(|| crate::guards::Ctx { root: id, syms: crate::guards::syms(u), slots: Vec::new(), emitted: std::cell::Cell::new(false) });
+        Some((rir, env, u.opt.fold, u.opt.layout, PATCH_EPOCH.load(Ordering::SeqCst), f.version, gctx))
     });
-    let Some((rir, env, fold, layout, epoch, version)) = begin else {
+    let Some((rir, env, fold, layout, epoch, version, gctx)) = begin else {
         return false;
     };
     let n = rir.blocks.len();
@@ -12199,6 +12203,9 @@ unsafe fn counted_build(up: *mut Unit, id: u32) -> bool {
         let _scratch = crate::zone_alloc::scratch(&session.runtime);
         let mut func = (*rir).clone();
         let counted = relax_backend::profile::instrument(&mut func, counters.as_ptr() as u64);
+        if let Some(g) = &gctx {
+            crate::guards::probe(g, &mut func);
+        }
         let cg = tier0_codegen_rir(options, &func, fold, layout);
         relax_codegen::native::compile(options, &cg, &env).map(|c| (c, counted))
     }));

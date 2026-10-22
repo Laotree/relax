@@ -568,6 +568,20 @@ fn site_rule(options: &relax_session::Options, callee: &Func, id: u32, nargs: us
     })
 }
 
+/// PGO: a site the counts saw run at least this often per call of the function being inlined
+/// into (profile::inline_freqs units: 0.1 per run) is very hot: any body up to the
+/// inline(always) size may inline there (LLVM's hot-callsite threshold, which rustc PGO uses: it
+/// inlines html_parse's process_entity).
+const PGO_VERY_HOT: f32 = 1.0;
+
+fn pgo_site_limits(lim: &InlineLimits, counted: bool, priority: u32) -> InlineLimits {
+    if counted && f32::from_bits(priority) >= PGO_VERY_HOT {
+        InlineLimits { hot_insts: lim.hot_insts.max(lim.always_insts), ..*lim }
+    } else {
+        *lim
+    }
+}
+
 /// Frequencies must describe this exact RIR. New blocks inherit the site's priority.
 /// The queue uses stable block/instruction indices: splitting invalidates only the tail,
 /// whose calls are enqueued again in the new continuation block.
@@ -581,6 +595,8 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
     use std::collections::BinaryHeap;
     let depths = relax_backend::regalloc::loop_depths(f, &reachable(f));
     let freqs = freqs.filter(|v| v.len() == f.blocks.len());
+    // PGO: a counted body's frequencies are per entry (profile::inline_freqs: 0.1 per run per call)
+    let counted = freqs.is_some() && relax_backend::profile::has_counts(f);
     let mut priorities: Vec<(u32, bool, bool)> = depths.iter().enumerate().map(|(b, d)| {
         freqs.map_or((*d, *d >= 1 && f.blocks.len() <= 64, false), |v| (v[b].max(0.0).to_bits(), v[b] >= HOT_FREQ, v[b] == 0.0))
     }).collect();
@@ -718,7 +734,8 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
             // ... and one no bigger than the call itself costs nothing: no allowance at all.
             let no_growth = cost == 0;
             let attrs = found.unwrap().1;
-            let rule = site_rule(options, shape, id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), id), ancestry[bi].len() - 1, multi_depths[bi], lim);
+            let lim_b = pgo_site_limits(lim, counted, priorities[bi].0);
+            let rule = site_rule(options, shape, id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), id), ancestry[bi].len() - 1, multi_depths[bi], &lim_b);
             // New admissions respect the actual growth ceiling, including ABI moves.
             let growth = size.saturating_add(args.len()).saturating_add(
                 shape.blocks.iter().filter(|b| matches!(b.term, Term::Ret(_))).count().saturating_mul(rets.len())
@@ -805,7 +822,8 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
                     0
                 } else if let Some((_, attrs)) = found {
                     let c = callee.unwrap();
-                    let rule = site_rule(options, c, *id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), *id), ancestry[bi].len() - 1, multi_depths[bi], lim);
+                    let lim_b = pgo_site_limits(lim, counted, priorities[bi].0);
+                    let rule = site_rule(options, c, *id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), *id), ancestry[bi].len() - 1, multi_depths[bi], &lim_b);
                     if ancestry[bi].contains(id) || rule.is_none() {
                         2
                     } else if attrs & ATTR_COLD != 0 && rule != Some(RULE_COST) && !(inline_inst_count(c) <= INLINE_FREE_INSTS && inline_inst_count(c) <= free_budget) {
