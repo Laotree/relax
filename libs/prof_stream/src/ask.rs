@@ -80,21 +80,56 @@ impl Ans {
     }
 }
 
-/// A short answer from text: line 1 the finding, `more: ` the drill-downs, other lines notes.
+/// An answer from its text (a short message, or a rendered [`crate::answer`]): line 1 the
+/// finding, `more: ` the drill-downs, markdown tables (a header row, then a `|---|` rule) as
+/// tables, other lines notes.
 impl From<String> for Ans {
     fn from(s: String) -> Ans {
         let mut a = Ans::default();
-        for (i, l) in s.lines().enumerate() {
+        let lines: Vec<&str> = s.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let l = lines[i];
             if i == 0 {
                 a.finding = l.to_string();
             } else if let Some(m) = l.strip_prefix("more: ") {
-                a.more(m);
+                // queries separated by two spaces (ask) or ` · ` (inspect's answers)
+                m.split(" · ").for_each(|q| a.more(q));
+            } else if let (Some(head), Some(true)) = (md_cells(l), lines.get(i + 1).map(|r| is_md_rule(r))) {
+                let mut t = Table::new(&head.iter().map(String::as_str).collect::<Vec<_>>());
+                i += 2;
+                while let Some(cells) = lines.get(i).and_then(|r| md_cells(r)) {
+                    t.row(cells);
+                    i += 1;
+                }
+                a.table(t);
+                continue;
             } else {
                 a.note(l);
             }
+            i += 1;
         }
         a
     }
+}
+
+/// The cells of a markdown table row (`| a | b\|c |`), unescaped and trimmed.
+fn md_cells(l: &str) -> Option<Vec<String>> {
+    let inner = l.strip_prefix('|')?.strip_suffix('|')?;
+    let mut cells = vec![String::new()];
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'|') => cells.last_mut()?.push(chars.next()?),
+            '|' => cells.push(String::new()),
+            c => cells.last_mut()?.push(c),
+        }
+    }
+    Some(cells.into_iter().map(|c| c.trim().to_string()).collect())
+}
+
+fn is_md_rule(l: &str) -> bool {
+    l.starts_with('|') && l.contains('-') && l.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
 }
 
 impl From<&str> for Ans {

@@ -10,7 +10,9 @@
 //! - [`model::Profile`] is the profile built from the records (lanes, spans, waits, frames, JIT
 //!   events, GPU frames), live or loaded; [`ask`] answers queries on it as compact text, and
 //!   [`text`] renders the tables, timelines and sparklines those answers use.
+//! - [`answer`] renders `makepad inspect`'s JSON answers as text (the inspect client and Scope).
 
+pub mod answer;
 pub mod ask;
 pub mod model;
 pub mod text;
