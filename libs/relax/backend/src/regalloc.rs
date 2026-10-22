@@ -1548,8 +1548,10 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                 let a = block_start[bi] + 2 * di as u32 + 2; // the definition
                 let z = block_start[bi] + 2 * *us.last().unwrap() as u32 + 1;
                 // free over the defining instruction's operands and the one before it too (deferred
-                // fused compares read at the next instruction)
-                let a0 = if di > 0 { a - 5 } else { a - 1 };
+                // fused compares read at the next instruction); saturating: the entry block's second
+                // instruction has a = 4 (a - 5 wrapped to u32::MAX and indexed far past the bit set:
+                // Stage's kernels, compute's x64 fuzzers)
+                let a0 = if di > 0 { a.saturating_sub(5) } else { a - 1 };
                 for &c in &regs {
                     let o = &mut occ[c as usize];
                     if !o.is_empty() && bits_any(o, a0, z) {
