@@ -11123,11 +11123,9 @@ fn profile_write() {
 /// for a benchmark that times only once the optimised code has settled: `pending` = builds queued or
 /// running or counting (PGO), plus one while the startup phase holds the workers; `installs` = O3 installs so far.
 /// The file exists from the first write on; a program that never reads it pays nothing.
-/// The O3 state for the settling indicator (postframe::settle_progress): builds queued or
-/// running now, and O3 installs so far.
-pub(crate) fn o3_settle_state() -> (u64, u64) {
-    let pending = TIER_QUEUE.lock().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len());
-    (pending as u64, TIER1_INSTALLS.load(Ordering::Relaxed))
+/// O3 builds queued or running now (postframe::activity, the run's activity badge).
+pub(crate) fn o3_pending() -> u64 {
+    (TIER_QUEUE.lock().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len())) as u64
 }
 
 fn o3_progress_write(last: &mut std::time::Instant) {

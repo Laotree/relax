@@ -127,11 +127,25 @@ pub fn ahead_progress() -> (u64, u64) {
     (AHEAD_DONE.load(Relaxed), crate::jit::ahead_queued() + AHEAD_RUNNING.load(Relaxed))
 }
 
-/// The O3 tier's settling (the run's settling indicator): builds queued or running now, and O3
-/// installs so far (a monotonic count; the indicator's percentage is installs since it showed over
-/// those plus the pending ones).
-pub fn settle_progress() -> (u64, u64) {
-    crate::jit::o3_settle_state()
+/// The JIT's work in flight, for the run's activity badge (a look, not a measurement).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Activity {
+    /// O3 builds queued or running now
+    pub o3: u64,
+    /// functions queued or building ahead now
+    pub ahead: u64,
+    /// ns the UI thread has spent in JIT waits so far, its open one included (monotonic: the
+    /// difference between two looks over their interval is its JIT duty cycle)
+    pub ui_wait_ns: u64,
+}
+
+/// What the JIT is doing now (one lock of the O3 queue; the rest atomics).
+pub fn activity() -> Activity {
+    let mut ui_wait_ns = UI_WAIT_SUM.load(Relaxed);
+    if UI_WAITING.load(Relaxed) > 0 {
+        ui_wait_ns += wall_ns().saturating_sub(UI_WAIT_START.load(Relaxed));
+    }
+    Activity { o3: crate::jit::o3_pending(), ahead: ahead_progress().1, ui_wait_ns }
 }
 
 /// The app is ready after its first present (false before it): the UI thread has not waited on the JIT for
