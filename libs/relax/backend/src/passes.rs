@@ -5327,6 +5327,11 @@ pub struct SroaCell {
     // stores at lane offsets): those become VExtract / VInsert of the vector (LLVM SROA's vector
     // promotion; core::arch `_mm_setr_ps` / lane setters build a vector through memory).
     pub lanes: bool,
+    // Integer accesses of different widths and offsets inside one cell of at most 8 bytes (a
+    // Result<u32, E> copied into a Result<&[T], E> on the `?` path: a 4-byte payload store and
+    // 8-byte loads and copies at one offset): loads shift and truncate, narrower stores merge
+    // their bits in (LLVM SROA's integer widening).
+    pub packed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -5711,12 +5716,20 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                 && size == 16
                 && cells[start..end].iter().any(|c| c.1 == lo && c.2 == SROA_V128)
                 && cells[start..end].iter().all(|c| (c.1 == lo && c.2 == SROA_V128) || ((c.1 - lo) % 4 == 0 && matches!(c.2, Mem::F32 | Mem::Int(4, _))));
+            // packed: integer accesses only (no vector), spanning 2, 4 or 8 bytes
+            let packed = !pure
+                && !lanes
+                && matches!(size, 2 | 4 | 8)
+                && cells[start..end].iter().all(|c| matches!(c.2, Mem::Int(n, _) if n <= 8))
+                && !crate::stats::opt_env_off("-sroapack");
             if lanes {
-                gcells[g as usize].push(SroaCell { off: lo, mem: SROA_V128, widened: false, lanes: true });
+                gcells[g as usize].push(SroaCell { off: lo, mem: SROA_V128, widened: false, lanes: true, packed: false });
+            } else if packed {
+                gcells[g as usize].push(SroaCell { off: lo, mem: Mem::Int(size as u8, false), widened: true, lanes: false, packed: true });
             } else if !pure {
                 bad[g as usize].get_or_insert(if kind_mix { SroaReject::KindMix } else { SroaReject::Overlap });
             } else {
-                gcells[g as usize].push(SroaCell { off: lo, mem: if widened { Mem::Int(size as u8, false) } else { m }, widened, lanes: false });
+                gcells[g as usize].push(SroaCell { off: lo, mem: if widened { Mem::Int(size as u8, false) } else { m }, widened, lanes: false, packed: false });
             }
             start = end;
         }
@@ -5768,7 +5781,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                                 while off % n as i64 != 0 || off + n as i64 > end {
                                     n /= 2;
                                 }
-                                gaps.push(SroaCell { off, mem: Mem::Int(n, false), widened: false, lanes: false });
+                                gaps.push(SroaCell { off, mem: Mem::Int(n, false), widened: false, lanes: false, packed: false });
                                 off += n as i64;
                             }
                         }
@@ -6007,6 +6020,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
         let k = match gcells[g].binary_search_by_key(&roff, |c| c.off) {
             Ok(k) => k,
             Err(k) if k > 0 && gcells[g][k - 1].lanes && roff < gcells[g][k - 1].off + 16 => k - 1,
+            Err(k) if k > 0 && gcells[g][k - 1].packed && roff < gcells[g][k - 1].off + mem_size(gcells[g][k - 1].mem) as i64 => k - 1,
             Err(_) => panic!("sroa cell"),
         };
         let c = gcells[g][k];
@@ -6050,6 +6064,15 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
     };
     // invoked reload sites: the reloads go on both edges (blocks made below)
     let mut edge_reloads: Vec<(usize, u32, VReg)> = Vec::new();
+    // temporaries of packed cells' shifts and merges (f.blocks is borrowed below)
+    struct NewRegs<'a>(&'a mut Vec<Cls>);
+    impl NewRegs<'_> {
+        fn vreg(&mut self, c: Cls) -> VReg {
+            self.0.push(c);
+            VReg(self.0.len() as u32 - 1)
+        }
+    }
+    let mut new_vregs = NewRegs(&mut f.vregs);
     for (bi, (b, _)) in f.blocks.iter_mut().zip(dirty.iter()).enumerate().filter(|x| *x.1 .1) {
         let mut out: Vec<Inst> = Vec::with_capacity(b.insts.len());
         let mut pos: Vec<u64> = Vec::with_capacity(b.pos.len());
@@ -6065,6 +6088,18 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                         if *m == Mem::Int(4, false) {
                             pos.push(p);
                             out.push(Inst::Conv(Conv::IntToInt(IntTy { bits: 32, signed: false }), *d, *d));
+                        }
+                    } else if c.packed && o + *off as i64 > c.off {
+                        // the access's bytes sit higher in the cell: shift them down first
+                        let sh = (o + *off as i64 - c.off) * 8;
+                        let Mem::Int(n, signed) = *m else { unreachable!("sroa packed cell") };
+                        if n < 8 {
+                            let t = new_vregs.vreg(Cls::I);
+                            out.push(Inst::IBinI(IOp::Shr, U64, t, r, sh));
+                            pos.push(p);
+                            out.push(Inst::Conv(Conv::IntToInt(IntTy { bits: n * 8, signed }), *d, t));
+                        } else {
+                            out.push(Inst::IBinI(IOp::Shr, U64, *d, r, sh));
                         }
                     } else if c.widened {
                         out.push(match *m {
@@ -6092,6 +6127,32 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                     let (r, c) = cell_at(sl, o + *off as i64);
                     if c.lanes {
                         out.push(Inst::VInsert(r, r, ((o + *off as i64 - c.off) / 4) as u8, *v));
+                    } else if c.packed {
+                        // the cell holds the memory bytes zero-extended from its size: a narrower
+                        // store merges its bytes in, a full-width one replaces them
+                        let size = mem_size(c.mem) as i64;
+                        let b = o + *off as i64 - c.off;
+                        let Mem::Int(n, _) = *m else { unreachable!("sroa packed cell") };
+                        if n as i64 == size {
+                            out.push(if n < 8 { Inst::Conv(Conv::IntToInt(IntTy { bits: n * 8, signed: false }), r, *v) } else { Inst::Mov(r, *v) });
+                        } else {
+                            let t = new_vregs.vreg(Cls::I);
+                            out.push(Inst::Conv(Conv::IntToInt(IntTy { bits: n * 8, signed: false }), t, *v));
+                            pos.push(p);
+                            let t = if b > 0 {
+                                let t2 = new_vregs.vreg(Cls::I);
+                                out.push(Inst::IBinI(IOp::Shl, U64, t2, t, b * 8));
+                                pos.push(p);
+                                t2
+                            } else {
+                                t
+                            };
+                            let keep = !((((1u64 << (n as u32 * 8)) - 1) << (b * 8)) as i64);
+                            let k = new_vregs.vreg(Cls::I);
+                            out.push(Inst::IBinI(IOp::And, U64, k, r, keep));
+                            pos.push(p);
+                            out.push(Inst::IBin(IOp::Or, U64, r, k, t));
+                        }
                     } else if c.widened {
                         out.push(match m {
                             Mem::F32 | Mem::F64 => Inst::Conv(Conv::FToBits(*m == Mem::F64), r, *v),
