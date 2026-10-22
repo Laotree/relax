@@ -4318,6 +4318,12 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // indexed accesses with displacements on one base and index: one address register
     let shared = regalloc::share_index_bases(f);
     let f = shared.as_ref().unwrap_or(f);
+    // counter steps after the last read of the old value (no copy per iteration)
+    let stepped = if env.opt_regs || f.full { regalloc::sink_increments(options, f) } else { None };
+    let f = stepped.as_ref().unwrap_or(f);
+    // branch compares at the end of their block (fused into cmp + b.cond)
+    let brs = if env.opt_regs || f.full { regalloc::sink_branch_compares(options, f) } else { None };
+    let f = brs.as_ref().unwrap_or(f);
     // a function that calls nothing and returns no float may keep values in v0-v3 too (they
     // carry float arguments and results, and calls' aggregate results, only around calls)
     let mut cfg = RegConfig { sym_class: env.sym_class, ..reg_config() };

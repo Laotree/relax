@@ -3795,6 +3795,17 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
         if npred[x as usize] != 1 || b.insts.len() > MAX_MOVS + MAX_SPEC {
             return None;
         }
+        // a block an earlier conversion rewrote holds its fresh temporaries (vregs made after the
+        // def / use counts): no counts to judge it by, so it is no arm this time (ndef[d] was out
+        // of bounds: O3 panic compiling wasm::Fx::expr under counted frequencies)
+        let mut fresh = false;
+        for i in &b.insts {
+            for_defs(i, |d| fresh |= d.0 as usize >= nv);
+            for_uses(i, |u| fresh |= u.0 as usize >= nv);
+        }
+        if fresh {
+            return None;
+        }
         let j = match b.term {
             Term::Jump(j) if j != x => j,
             _ => return None,
@@ -4069,7 +4080,7 @@ pub fn merge_blocks(f: &mut Func) -> bool {
                 Term::Jump(t) if t as usize != bi && preds[t as usize] == 1 => t as usize,
                 _ => break,
             };
-            let tb = std::mem::replace(&mut f.blocks[t], Block { insts: Vec::new(), pos: Vec::new(), term: Term::Unreachable, term_pos: 0 });
+            let tb = std::mem::replace(&mut f.blocks[t], Block { insts: Vec::new(), pos: Vec::new(), term: Term::Unreachable, term_pos: 0, count: -1.0 });
             let b = &mut f.blocks[bi];
             b.insts.extend(tb.insts);
             b.pos.extend(tb.pos);
@@ -6400,7 +6411,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
             }
             let np = insts.len();
             let nb = f.blocks.len() as u32;
-            f.blocks.push(Block { insts, pos: vec![p; np], term: Term::Jump(*t), term_pos: p });
+            f.blocks.push(Block { insts, pos: vec![p; np], term: Term::Jump(*t), term_pos: p, count: -1.0 });
             *t = nb;
         }
         f.blocks[bi].term = Term::Invoke(targets[0], targets[1]);
@@ -7498,7 +7509,7 @@ pub fn rotate_loops(f: &mut Func) {
         };
         if branch_latch {
             let nb = f.blocks.len() as u32;
-            f.blocks.push(Block { insts, pos: hb.pos.clone(), term, term_pos: hb.term_pos });
+            f.blocks.push(Block { insts, pos: hb.pos.clone(), term, term_pos: hb.term_pos, count: hb.count });
             if let Term::Branch(_, _, ref mut e) = f.blocks[l].term {
                 *e = nb;
             }
