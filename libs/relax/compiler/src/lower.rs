@@ -9414,7 +9414,8 @@ impl<'a> Lcx<'a> {
     /// This is deliberately not a native stack slot: an optimiser must never forward a host
     /// destination as a sandboxed callee's sret pointer. The wrapper's __SbFrame reclaims it.
     fn sandbox_result_slot(&mut self, size: u32, align: u32) -> VReg {
-        let alloc = self.u.syms.intern(crate::syms::SymKind::Rt("sb_alloca"), crate::modules::__relax_sb_alloca as *const () as u64);
+        let f: rt_fn_ty!(fn(u64, u64) -> u64) = rt_sb_alloca;
+        let alloc = self.u.syms.intern(crate::syms::SymKind::Rt("sb_alloca"), f as usize as u64);
         let size = self.iconst(size as i64);
         let align = self.iconst(align as i64);
         let p = self.f.vreg(Cls::I);
@@ -14450,6 +14451,14 @@ rt_fn! {
 /// A loop head of a checked program (Options::const_fuel).
 fn rt_const_fuel() {
     crate::jit::const_fuel_tick();
+}
+}
+
+rt_fn! {
+/// The sandboxed callee's result slot (`sandbox_result_slot`): `__relax_sb_alloca` in Relax's
+/// convention (std calls that one through its C declaration).
+fn rt_sb_alloca(size: u64, align: u64) -> u64 {
+    crate::sandbox::alloca(size, align)
 }
 }
 
