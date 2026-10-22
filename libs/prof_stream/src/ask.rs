@@ -889,7 +889,21 @@ fn gpu(p: &Profile, q: &Q) -> Ans {
 fn brief(p: &Profile) -> Ans {
     let ws = why_slow(p, &Q::parse("why-slow"));
     let mut out = Ans::new(format!("{} (pid {}): {}", if p.info.app.is_empty() { "the app" } else { &p.info.app }, p.info.pid, ws.finding));
+    // the shape of the recording in two lines: who works most, what the main lane does per frame
+    let span = p.t_max.saturating_sub(p.t_min).max(1);
+    let mut busy: Vec<(usize, u64)> = (0..p.lanes.len()).filter(|&i| !p.lanes[i].rows.is_empty()).map(|i| (i, p.busy_in(i, p.t_min, p.t_max + 1).0)).collect();
+    busy.sort_by(|a, b| b.1.cmp(&a.1));
+    let lanes: Vec<String> = busy.iter().take(4).map(|(i, ns)| format!("T{} {} ({}) {}%", p.lanes[*i].thread.tid, p.lane_name(*i), role::NAMES.get(p.lanes[*i].thread.role as usize).unwrap_or(&"?"), pct(*ns, span))).collect();
+    out.note(format!("busiest lanes (busy % of {} s): {}", sig(span as f64 / 1e9), lanes.join(", ")));
+    if let Some(main) = p.main_lane() {
+        let n = p.frames.len().max(1) as u64;
+        let ex: Vec<String> = p.exclusive(main, p.t_min, p.t_max + 1).into_iter().filter(|x| !x.1).take(4).map(|(nm, _, ns)| format!("{} {}", p.s(nm), ms(ns / n))).collect();
+        out.note(format!("main lane self time per frame (ms, {} frames): {}", p.frames.len(), ex.join(", ")));
+    }
     out.blocks.extend(ws.blocks);
+    if out.text().contains("busy outside its marked spans") {
+        out.note("busy outside its marked spans = a lane working where it has no profiler span (no phase marker covers it); name it by sampling that lane's CPU (see the commands below)");
+    }
     if let Some(id) = p.frames.iter().max_by_key(|f| f.dur()).map(|f| f.id) {
         let fr = frame(p, &format!("F{id}"));
         out.title(format!("slowest frame: {}", fr.finding));

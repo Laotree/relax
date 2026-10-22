@@ -73,6 +73,25 @@ pub fn main(args: &[String]) -> i32 {
     if args.get(1).map(String::as_str) == Some("pf") {
         return super::pf::live_main(app, &args[2..]);
     }
+    // `as=md`: the answer as compact text (finding, tables, drill-downs) instead of JSON lines
+    if args.iter().any(|a| a == "as=md") {
+        let words: Vec<String> = args[1..].iter().filter(|a| *a != "as=md").cloned().collect();
+        let line = request_line(&words);
+        let mut lines = Vec::new();
+        let r = ask(app, &line, &mut |l| {
+            lines.push(l.to_string());
+            true
+        });
+        println!("{}", makepad_prof_stream::jsonview::render(&cmd, &lines).text());
+        return match r {
+            Ok(false) => 0,
+            Ok(true) => 1,
+            Err(e) => {
+                eprintln!("makepad inspect: {} (pid {}): {}", app.app, app.pid, e);
+                2
+            }
+        };
+    }
     match ask(app, &line, &mut |l| {
         println!("{}", l);
         true

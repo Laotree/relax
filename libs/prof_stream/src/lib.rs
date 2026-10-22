@@ -12,6 +12,7 @@
 //!   [`text`] renders the tables, timelines and sparklines those answers use.
 
 pub mod ask;
+pub mod jsonview;
 pub mod model;
 pub mod text;
 

@@ -9,3 +9,4 @@ publish = false
 
 [dependencies]
 makepad-gpu-trace = { path = "../gpu_trace" }
+makepad-strict-json = { path = "../strict_json" }
