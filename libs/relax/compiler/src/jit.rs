@@ -3175,6 +3175,10 @@ impl Unit {
             None => self.tls_alloc(bytes, align) as u64,
         };
         let place = TlsPlace { sym: self.syms.intern(crate::syms::SymKind::ThreadLocal(d), value), fixed: fixed.is_some(), init };
+        // MAKEPAD_RUN_TLS_TRACE=1: where each `#[thread_local]` static went
+        if std::env::var_os("MAKEPAD_RUN_TLS_TRACE").is_some() {
+            eprintln!("thread_local {}: {} bytes align {}, {} at {:#x}{}", self.prog.def_path(d), size, align, if place.fixed { "static TLS" } else { "block" }, value, if zero { "" } else { ", copied on first access" });
+        }
         crate::zone_alloc::kept_with(|| self.tls_places.insert(d, place));
         Some(place)
     }
@@ -3184,9 +3188,9 @@ impl Unit {
     }
 
     /// Code of this unit may address the executable's static TLS (`Inst::TlsStatic`): native
-    /// code generation on a host that has it.
+    /// code generation on a host that has it (MAKEPAD_RUN_OPT=-statictls: never).
     fn static_tls_ok(&self) -> bool {
-        !self.prog.session.options.no_codegen && !crate::web32::on() && os::tls::static_tls_base().is_some()
+        !self.prog.session.options.no_codegen && !crate::web32::on() && os::tls::static_tls_base().is_some() && !relax_backend::stats::opt_off(&self.prog.session.options, "-statictls")
     }
 
     /// Thread-local blocks: one OS key per process holds each thread's block; compiled code
@@ -8163,9 +8167,13 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     // (their builds count as nested, like the inline candidates')
     let tn = cpu_ns();
     let mode = if baseline { RirMode::Baseline } else { RirMode::Tier0 };
-    let facts = tail_nounwind_facts(up, &func, mode);
     let mut func = func;
-    tail_nocapture_facts(up, id, &mut func, mode, &snap, &facts, cfg.inline);
+    // MAKEPAD_RUN_OPT=-tailfacts: no facts asked (calls in tail position after invokes and frame
+    // addresses passed to calls then stay calls)
+    let facts = if relax_backend::stats::opt_off(options, "-tailfacts") { Vec::new() } else { tail_nounwind_facts(up, &func, mode) };
+    if !facts.is_empty() || !relax_backend::stats::opt_off(options, "-tailfacts") {
+        tail_nocapture_facts(up, id, &mut func, mode, &snap, &facts, cfg.inline);
+    }
     nested_ns += cpu_ns() - tn;
     let prep_ns = (cpu_ns() - t0).saturating_sub(nested_ns);
     let u = &*up;
@@ -14484,6 +14492,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_domain_reserve" => Some(crate::domain::relax_domain_reserve as *const () as usize),
         b"__relax_domain_failed" => Some(crate::domain::thread_finished as *const () as usize),
         b"__relax_domain_name" => Some(crate::domain::relax_domain_name as *const () as usize),
+        b"__relax_tls_fixed" => Some(os::tls::relax_tls_fixed as *const () as usize),
         b"__relax_key_create" => Some(crate::domain_threads::key_create as *const () as usize),
         b"__relax_key_delete" => Some(crate::domain_threads::key_delete as *const () as usize),
         b"__relax_key_get" => Some(crate::domain_threads::key_get as *const () as usize),

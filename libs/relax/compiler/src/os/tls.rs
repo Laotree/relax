@@ -56,15 +56,29 @@ mod imp {
     pub fn jit_offset(_key: u64, emit: &dyn Fn(&[u8]) -> u64) -> u64 {
         let reader = emit(&relax_backend::x64::fs_reader());
         let fs_base: rt_fn_ty!(fn() -> u64) = unsafe { std::mem::transmute(reader as usize) };
-        let offset = move || TLS_BLOCK.with(|c| c as *const std::cell::Cell<u64> as u64).wrapping_sub(fs_base()) as i64;
-        let off = offset();
-        // under Relax the cell is the outer program's thread-local: in its static TLS when it
-        // placed it there, else in a block of this thread only, which another thread's offset shows
-        let fixed = !cfg!(relax) || std::thread::spawn(offset).join().ok() == Some(off);
-        if off < i32::MIN as i64 || off > i32::MAX as i64 || !fixed {
+        let cell = TLS_BLOCK.with(|c| c as *const std::cell::Cell<u64> as u64);
+        let off = cell.wrapping_sub(fs_base()) as i64;
+        if off < i32::MIN as i64 || off > i32::MAX as i64 || !static_cell(cell) {
             panic!("thread-local block cell is not in static TLS (offset {:#x})", off);
         }
         off as u64
+    }
+
+    /// Under Relax the cell is the outer program's thread-local: in the outer runtime's static TLS
+    /// when it placed it there (`__relax_tls_fixed`), else in a block of this thread only.
+    fn static_cell(cell: u64) -> bool {
+        #[cfg(relax)]
+        {
+            extern "C" {
+                fn __relax_tls_fixed(addr: u64) -> u32;
+            }
+            unsafe { __relax_tls_fixed(cell) != 0 }
+        }
+        #[cfg(not(relax))]
+        {
+            let _ = cell;
+            true
+        }
     }
 }
 
@@ -77,7 +91,7 @@ mod imp {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod fixed {
     use std::cell::Cell;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     const RESERVE: usize = 16 << 10;
     /// 64-aligned: the thread pointer is aligned to the executable's TLS alignment, so a variable
@@ -101,6 +115,7 @@ mod fixed {
             }
             let reader = emit(&relax_backend::x64::fs_reader());
             let fs_base: rt_fn_ty!(fn() -> u64) = unsafe { std::mem::transmute(reader as usize) };
+            FS_BASE.store(reader, Ordering::Release);
             let off = (reserve() as u64).wrapping_sub(fs_base()) as i64;
             (off >= i32::MIN as i64 && off + RESERVE as i64 <= i32::MAX as i64).then_some(off as i32)
         });
@@ -108,6 +123,21 @@ mod fixed {
 
     pub fn static_tls_base() -> Option<i32> {
         BASE.get().copied().flatten()
+    }
+
+    static FS_BASE: AtomicU64 = AtomicU64::new(0);
+
+    /// For a runtime running under this one (`__relax_tls_fixed`, os/tls.rs static_cell):
+    /// whether `addr` is a variable this runtime placed in static TLS (as seen from the calling
+    /// thread), i.e. at the same offset from the thread pointer on every thread.
+    pub extern "C" fn relax_tls_fixed(addr: u64) -> u32 {
+        let (Some(base), r) = (static_tls_base(), FS_BASE.load(Ordering::Acquire)) else { return 0 };
+        if r == 0 {
+            return 0;
+        }
+        let fs_base: rt_fn_ty!(fn() -> u64) = unsafe { std::mem::transmute(r as usize) };
+        let off = addr.wrapping_sub(fs_base()) as i64;
+        (off >= base as i64 && off < base as i64 + NEXT.load(Ordering::Acquire) as i64) as u32
     }
 
     pub fn static_tls_alloc(size: u32, align: u32) -> Option<i32> {
@@ -153,6 +183,9 @@ mod fixed {
         None
     }
     pub fn static_tls_swap(_saved: &mut Vec<u64>) {}
+    pub extern "C" fn relax_tls_fixed(_addr: u64) -> u32 {
+        0
+    }
 }
 pub use fixed::*;
 
