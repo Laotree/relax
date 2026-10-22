@@ -3641,7 +3641,7 @@ impl<'a> Gen<'a> {
         // before the nearer one (the innermost loop's header; an exit placed before the loop is
         // further back).
         let est = self.block_est.as_ref().map(|e| (e[tt as usize], e[ff as usize])).filter(|(t, f)| t != f);
-        let ff_cond = match est { Some((t, f)) => f > t, None => back(ff) && (!back(tt) || ff > tt) };
+        let ff_cond = match est { Some((t, f)) => f > t, None => !crate::stats::opt_env_off("-a64backstatic") && back(ff) && (!back(tt) || ff > tt) };
         if tt == next || ff != next && ff_cond {
             self.cond_branch(no, ff);
             self.jump_to(tt, bi);
