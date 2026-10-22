@@ -239,15 +239,27 @@ pub(crate) fn report(run: &super::prof::Run, req: &Req, out: &mut Out) {
     let mut cut_n = 0usize;
     let mut stack: Vec<(usize, usize)> = tree.kids_sorted(0).into_iter().rev().map(|k| (k, 0)).collect();
     let mut legend: Vec<String> = Vec::new();
-    while let Some((k, d)) = stack.pop() {
-        let nd = &tree.nodes[k];
-        if (nd.total as f64) * 100.0 < min * root_total as f64 || rows >= n || d > 48 {
-            cut += nd.selfw;
+    while let Some((k0, d)) = stack.pop() {
+        let nd0 = &tree.nodes[k0];
+        if (nd0.total as f64) * 100.0 < min * root_total as f64 || rows >= n || d > 48 {
+            cut += nd0.selfw;
             cut_n += 1;
             continue;
         }
         rows += 1;
-        let name = super::asm_plain(&nd.name);
+        // a chain of single callees with all of the time (startup frames, wrappers): one row
+        let mut k = k0;
+        let mut chain = 0usize;
+        while tree.nodes[k].selfw == 0 && tree.nodes[k].kids.len() == 1 {
+            let c = *tree.nodes[k].kids.values().next().unwrap();
+            if tree.nodes[c].total != tree.nodes[k].total || tree.nodes[c].tier != tree.nodes[k].tier {
+                break;
+            }
+            k = c;
+            chain += 1;
+        }
+        let nd = &tree.nodes[k];
+        let name = if chain > 0 { format!("{} > ({} frames) > {}", short(&super::asm_plain(&nd0.name), 40), chain.saturating_sub(1), super::asm_plain(&nd.name)) } else { super::asm_plain(&nd.name) };
         let shown = if name.len() > 70 {
             legend.push(format!("[{}] {}", legend.len() + 1, nd.name));
             format!("{} [{}]", short(&name, 60), legend.len())

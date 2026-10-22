@@ -510,7 +510,7 @@ fn with_native<R>(path: &str, f: impl FnOnce(&NativeBin) -> R) -> Result<R, Stri
 
 /// rustc's code of the fn named `ours` (a JIT display name): the symbol of the same path, the
 /// instance whose generic arguments match, else the one closest in size; and how many others.
-fn rustc_side(nb: &NativeBin, ours: &str, our_bytes: usize) -> Result<(Side, usize), String> {
+fn rustc_side(nb: &NativeBin, ours: &str, our_bytes: usize, callers: &[String]) -> Result<(Side, usize), String> {
     let plain = plain_name(ours);
     let mut cands = nb.find(&plain);
     if cands.is_empty() {
@@ -519,7 +519,17 @@ fn rustc_side(nb: &NativeBin, ours: &str, our_bytes: usize) -> Result<(Side, usi
         cands = nb.find(&tail);
     }
     if cands.is_empty() {
-        return Err(format!("rustc has no symbol for `{}` in {} (it inlined every call, or the path differs); try: asm <its caller> vs=rustc", short(&plain, 100), file_name(&nb.path)));
+        // rustc inlined every call: its copy inside a caller (the callers the samples saw first)
+        for c in callers {
+            let Some(cf) = nb.find(&plain_name(c)).into_iter().next() else { continue };
+            let ranges: Vec<(u64, u64)> = nb.inlined(cf.addr, cf.addr + cf.size).into_iter().filter(|i| { let p = plain_name(&i.name); p == plain || p.ends_with(&format!("::{}", plain.rsplit("::").next().unwrap_or(&plain))) && callee_key(&p) == callee_key(&plain) }).flat_map(|i| i.ranges).collect();
+            if !ranges.is_empty() {
+                let mut s = native_side(nb, cf, Some(&ranges));
+                s.label = format!("rustc (inlined into {})", short(&plain_name(&cf.name), 60));
+                return Ok((s, 0));
+            }
+        }
+        return Err(format!("rustc has no symbol for `{}` in {} and no inlined copy in {} (or the path differs); try: asm <its caller> vs=rustc", short(&plain, 100), file_name(&nb.path), if callers.is_empty() { "the callers (no samples named them)".to_string() } else { callers.iter().take(3).map(|c| format!("`{}`", short(&plain_name(c), 50))).collect::<Vec<_>>().join(", ") }));
     }
     let squash = |s: &str| s.replace(' ', "");
     let exact: Vec<_> = cands.iter().filter(|c| squash(&c.name) == squash(ours)).collect();
@@ -528,8 +538,20 @@ fn rustc_side(nb: &NativeBin, ours: &str, our_bytes: usize) -> Result<(Side, usi
     } else {
         *cands.iter().min_by_key(|c| (c.size as i64 - our_bytes as i64).unsigned_abs()).unwrap()
     };
+    Ok((native_side(nb, pick, None), cands.len() - 1))
+}
+
+/// rustc's code of `pick` (only the instructions in `keep`, when given: an inlined copy), with
+/// its lines, inline levels, callees and checks.
+fn native_side(nb: &NativeBin, pick: &super::natbin::NativeFn, keep: Option<&[(u64, u64)]>) -> Side {
     let code = nb.code(pick);
-    let insns = dis::decode(nb.arch, code, pick.addr);
+    let mut insns = dis::decode(nb.arch, code, pick.addr);
+    if let Some(r) = keep {
+        insns.retain(|i| {
+            let a = pick.addr + i.off as u64;
+            r.iter().any(|&(lo, hi)| a >= lo && a < hi)
+        });
+    }
     let mut s = Side::new("rustc".into(), pick.name.clone(), pick.addr, insns);
     // lines
     let rows = nb.lines(pick.addr, pick.addr + pick.size);
@@ -563,7 +585,7 @@ fn rustc_side(nb: &NativeBin, ours: &str, our_bytes: usize) -> Result<(Side, usi
         }
     }
     s.find_checks();
-    Ok((s, cands.len() - 1))
+    s
 }
 
 // ------------------------------------------------------------------ samples
@@ -578,6 +600,34 @@ fn sample(secs: f64, hz: u64, ev: super::prof::Ev, out: &Out) -> (Vec<(u64, u64,
     let run = super::prof::collect_ev(secs, hz, ev, &|_| true, &*gone);
     let v = run.samples.iter().filter_map(|s| s.frames.first().map(|&pc| (pc, s.frames.get(1).copied().unwrap_or(0), s.weight.max(1)))).collect();
     (v, run.secs, run.notes, run.ev)
+}
+
+/// The fns that called `s`'s code in the samples (by their return addresses), most often first.
+fn callers_of(s: &Side, pcs: &[(u64, u64, u64)]) -> Vec<String> {
+    let lo = s.addr;
+    let hi = s.addr + s.insns.last().map_or(0, |i| i.off as u64 + i.len as u64);
+    let mut rets: Vec<u64> = pcs.iter().filter(|x| x.0 >= lo && x.0 < hi && x.1 != 0).map(|x| x.1.wrapping_sub(1)).collect();
+    rets.sort_unstable();
+    let mut frames = Vec::new();
+    let mut i = 0;
+    while i < rets.len() && frames.len() < 64 {
+        frames.push(vec![0, rets[i]]);
+        let v = rets[i];
+        while i < rets.len() && rets[i] == v {
+            i += 1;
+        }
+    }
+    let mut partial = Vec::new();
+    let named = super::symbolise_within(&frames, &mut partial, 2000);
+    let mut out: Vec<String> = Vec::new();
+    for f in named {
+        if let Some(fr) = f.get(1) {
+            if !out.contains(&fr.name) {
+                out.push(fr.name.clone());
+            }
+        }
+    }
+    out
 }
 
 fn attach_samples(s: &mut Side, pcs: &[(u64, u64, u64)]) {
@@ -964,7 +1014,8 @@ pub fn cmd_asm(req: &Req, out: &mut Out) {
         notes.insert(0, format!("`{}` runs inlined here: shown is the code of `{}` (@{}), which holds the hottest copy; its lines of the fn are the ones from its source file", q, short(&a.name, 80), slot));
     }
     let b = if vs {
-        match native_path(req).and_then(|p| with_native(&p, |nb| rustc_side(nb, &a.name, a.insns.last().map_or(0, |i| i.off as usize + i.len as usize))).and_then(|r| r)) {
+        let callers = callers_of(&a, &pcs);
+        match native_path(req).and_then(|p| with_native(&p, |nb| rustc_side(nb, &a.name, a.insns.last().map_or(0, |i| i.off as usize + i.len as usize), &callers)).and_then(|r| r)) {
             Ok((s, more)) => {
                 if more > 0 {
                     notes.push(format!("rustc has {} more instance(s) of the name; picked the closest in size", more));
@@ -993,11 +1044,12 @@ fn render(out: &mut Out, slot: u32, a: &Side, b: Option<&Side>, view: &str, line
         Some(b) => {
             let d = a.insns.len() as i64 - b.insns.len() as i64;
             format!(
-                "`{}`: ours {} instr ({}, {} B) vs rustc {} ({} B): {:+} ({:+.0}%){}",
+                "`{}`: ours {} instr ({}, {} B) vs {} {} ({} B): {:+} ({:+.0}%){}",
                 short(&a.name, 100),
                 a.insns.len(),
                 a.label.trim_start_matches("ours "),
                 bytes(a),
+                b.label,
                 b.insns.len(),
                 bytes(b),
                 d,
@@ -1200,7 +1252,7 @@ fn cmd_top(req: &Req, out: &mut Out) {
     for (id, c, st, len, name, tier) in hot.iter() {
         let code = unsafe { std::slice::from_raw_parts(*st as *const u8, *len as usize) };
         let ours = dis::decode(Arch::host(), code, *st).len();
-        let theirs = native.as_deref().and_then(|p| with_native(p, |nb| rustc_side(nb, name, *len as usize).ok().map(|s| s.0.insns.len())).ok().flatten());
+        let theirs = native.as_deref().and_then(|p| with_native(p, |nb| rustc_side(nb, name, *len as usize, &[]).ok().map(|s| s.0.insns.len())).ok().flatten());
         if vs && theirs.is_none() {
             missing += 1;
         }

@@ -129,8 +129,15 @@ pub fn cmd_remarks(req: &Req, out: &mut Out) {
             let f = &u.fns[id as usize];
             let mut v = inline_of(id);
             let tiers: Vec<String> = super::codever::bodies(u, id).iter().map(|b| format!("{} ({})", super::codever::label(super::codever::kind_at(u, b.start)), b.state)).collect();
+            let built = INLINE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.contains_key(&id));
             if v.is_empty() && spills_of(id).is_empty() {
-                rows.push(format!("`{}` (@{}): no O3 remarks (no O3 build in this run{}); code: {}", short(&f.name, 100), id, if tiers.is_empty() { "" } else { ", or every call was inlined and nothing spilled" }, if tiers.is_empty() { "none".into() } else { tiers.join(", ") }));
+                rows.push(format!(
+                    "`{}` (@{}): {}; code: {}",
+                    short(&f.name, 100),
+                    id,
+                    if built { "its last O3 build kept no call as a call and spilled no value" } else { "no O3 build recorded in this run (O3 code from the disk cache or the startup image carries no remarks: `tier <fn> o3 fresh=1` builds it again)" },
+                    if tiers.is_empty() { "none".into() } else { tiers.join(", ") }
+                ));
                 continue;
             }
             v.sort_by_key(|r| (!r.hot, r.pos));
