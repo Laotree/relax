@@ -2335,7 +2335,7 @@ impl<'a> Gen<'a> {
                 }
                 self.fin_f(d, xd);
             }
-            VX::ShlV(w) | VX::ShrSV(w) | VX::ShrUV(w) | VX::ICmp(_, w) | VX::UCmp(_, w) => {
+            VX::ShlV(w) | VX::ShrSV(w) | VX::ShrUV(w) | VX::ArmUShl(w) | VX::ArmSShl(w) | VX::ICmp(_, w) | VX::UCmp(_, w) => {
                 let xa = self.use_f(a, FS0);
                 let xb = self.use_f(b, FS1);
                 let xd = self.def_f(d, FS0);
@@ -2345,7 +2345,8 @@ impl<'a> Gen<'a> {
                     _ => (CMGT & s4 | s, CMGE & s4 | s, CMEQ & s4 | s),
                 };
                 match op {
-                    VX::ShlV(_) => self.v3(USHL & s4 | s, xd, xa, xb),
+                    VX::ShlV(_) | VX::ArmUShl(_) => self.v3(USHL & s4 | s, xd, xa, xb),
+                    VX::ArmSShl(_) => self.v3(SSHL & s4 | s, xd, xa, xb),
                     VX::ShrSV(_) | VX::ShrUV(_) => {
                         self.v2(NEG & s4 | s, FS2, xb);
                         self.v3(if let VX::ShrSV(_) = op { SSHL } else { USHL } & s4 | s, xd, xa, FS2);
@@ -4162,6 +4163,108 @@ pub fn compile(options: &relax_session::Options, f: &Func, env: &Env) -> Result<
 /// encodes by element (`fmla vd.4s, vn.4s, vm.s[0]`). A splat whose every use is folded goes. The
 /// product of `VFma` commutes, so a splat first operand is swapped in; `FMul`'s operand order
 /// picks the NaN for the Neon flavour, so only its second operand is folded unless the NaN is the host's.
+/// Right shifts by per-lane amounts (`ShrUV` / `ShrSV`, 32-bit lanes) are `neg` + `ushl` / `sshl`
+/// on NEON. Where the amount is `y + c` (`c` a constant splat, the sum read only by the shift: a
+/// hash's `x >> ((x >> 28) + 4)`), the amount becomes `-c - y` -- the add a `sub` from the
+/// constant `-c`, built next to `c` -- and the shift `ArmUShl` / `ArmSShl` by it; `y - c` becomes
+/// `c - y` (no new constant). One instruction fewer per shift.
+fn fold_shift_amounts(f: &Func) -> Option<Func> {
+    let n = f.vregs.len();
+    let mut ndef = vec![0u32; n];
+    let mut nuse = vec![0u32; n];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut any = false;
+    for b in &f.blocks {
+        for i in &b.insts {
+            i.defs(|d| ndef[d.0 as usize] += 1);
+            regalloc::for_uses(i, |u| nuse[u.0 as usize] += 1);
+            any |= matches!(i, Inst::VX(VX::ShrUV(VW::S) | VX::ShrSV(VW::S), ..));
+        }
+        let mut tu = Vec::new();
+        regalloc::term_uses(&b.term, &mut tu);
+        for u in tu {
+            nuse[u.0 as usize] += 1;
+        }
+    }
+    if !any {
+        return None;
+    }
+    // single-definition values: their defining instruction (block, index); constants' bits
+    let mut at: Vec<(u32, u32)> = vec![(u32::MAX, 0); n];
+    let mut konst: Vec<Option<u32>> = vec![None; n];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (ii, i) in b.insts.iter().enumerate() {
+            i.defs(|d| {
+                if ndef[d.0 as usize] == 1 {
+                    at[d.0 as usize] = (bi as u32, ii as u32);
+                }
+            });
+            if let Inst::VConst(d, k) = i {
+                if ndef[d.0 as usize] == 1 {
+                    konst[d.0 as usize] = Some(*k);
+                }
+            }
+        }
+    }
+    let is_k = |v: VReg| konst[v.0 as usize].is_some();
+    let mut g = f.clone();
+    // constant vreg -> its negation's vreg (built right after it)
+    let mut neg: Vec<(VReg, VReg)> = Vec::new();
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        for ii in 0..f.blocks[bi].insts.len() {
+            let Inst::VX(op @ (VX::ShrUV(VW::S) | VX::ShrSV(VW::S)), d, x, a) = f.blocks[bi].insts[ii] else { continue };
+            if ndef[a.0 as usize] != 1 || nuse[a.0 as usize] != 1 || at[a.0 as usize].0 == u32::MAX {
+                continue;
+            }
+            let (ab, ai) = at[a.0 as usize];
+            let amount = match f.blocks[ab as usize].insts[ai as usize] {
+                // -(y + c) = (-c) - y
+                Inst::VX(VX::Add(VW::S), _, y, k) if is_k(k) && !is_k(y) => Some((y, k, true)),
+                Inst::VX(VX::Add(VW::S), _, k, y) if is_k(k) && !is_k(y) => Some((y, k, true)),
+                // -(y - c) = c - y
+                Inst::VX(VX::Sub(VW::S), _, y, k) if is_k(k) && !is_k(y) => Some((y, k, false)),
+                _ => None,
+            };
+            let Some((y, k, negate)) = amount else { continue };
+            let from = if negate {
+                match neg.iter().find(|e| e.0 == k) {
+                    Some(e) => e.1,
+                    None => {
+                        let m = g.vreg(Cls::V128);
+                        neg.push((k, m));
+                        m
+                    }
+                }
+            } else {
+                k
+            };
+            g.blocks[ab as usize].insts[ai as usize] = Inst::VX(VX::Sub(VW::S), a, from, y);
+            let sh = if let VX::ShrUV(_) = op { VX::ArmUShl(VW::S) } else { VX::ArmSShl(VW::S) };
+            g.blocks[bi].insts[ii] = Inst::VX(sh, d, x, a);
+            changed = true;
+        }
+    }
+    if !changed {
+        return None;
+    }
+    // the negated constants, each right after its constant (it dominates every use of that one);
+    // later positions of a block first, so earlier indices stay valid
+    let mut ins: Vec<(u32, u32, Inst)> = neg.iter().map(|&(k, m)| (at[k.0 as usize].0, at[k.0 as usize].1 + 1, Inst::VConst(m, konst[k.0 as usize].unwrap().wrapping_neg()))).collect();
+    ins.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+    for (bi, ii, i) in ins {
+        let b = &mut g.blocks[bi as usize];
+        if b.pos.len() == b.insts.len() {
+            let p = b.pos[ii as usize - 1];
+            b.pos.insert(ii as usize, p);
+        }
+        b.insts.insert(ii as usize, i);
+    }
+    Some(g)
+}
+
 fn fold_lane_splats(f: &Func) -> Option<Func> {
     let n = f.vregs.len();
     let mut splat: Vec<Option<VReg>> = vec![None; n];
@@ -4312,6 +4415,9 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // f32 splats read only by multiplies: the by-element forms (fmla / fmls / fmul v, v, v.s[0])
     let lanes = fold_lane_splats(f);
     let f = lanes.as_ref().unwrap_or(f);
+    // right shifts by `y + c`: ushl / sshl by `-c - y` (no neg per shift)
+    let shifts = fold_shift_amounts(f);
+    let f = shifts.as_ref().unwrap_or(f);
     // immediates arm64 cannot encode and float constants, inside loops: registers set up once
     let hoisted = regalloc::hoist_loop_consts(f, &imm_fits, true, true, freq);
     let f = hoisted.as_ref().unwrap_or(f);

@@ -815,7 +815,8 @@ pub fn allocate(options: &relax_session::Options, f: &Func, cfg: &RegConfig) -> 
     allocate_with(options, f, cfg, true, None)
 }
 
-/// `allocate`; `thorough` adds copy coalescing (allocate_split adds live-range splitting).
+/// `allocate`; `thorough` (or `options.ra_quick_coalesce`) adds copy coalescing (allocate_split adds
+/// live-range splitting, thorough only).
 pub fn allocate_with(options: &relax_session::Options, f: &Func, cfg: &RegConfig, thorough: bool, freq: Option<&[f32]>) -> Alloc {
     allocate_low(options, f, cfg, thorough, freq, None, None)
 }
@@ -938,7 +939,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     let is_low = |v: u32| low.map_or(false, |lw| lw.get(v as usize).copied().unwrap_or(false));
     let mut parent: Vec<u32> = (0..nv).collect();
     let mut merged: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
-    if thorough && coalesce_on(options) {
+    if (thorough || options.ra_quick_coalesce) && coalesce_on(options) {
         fn find(p: &mut [u32], mut x: u32) -> u32 {
             while p[x as usize] != x {
                 let g = p[p[x as usize] as usize];
@@ -1547,8 +1548,10 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                 let a = block_start[bi] + 2 * di as u32 + 2; // the definition
                 let z = block_start[bi] + 2 * *us.last().unwrap() as u32 + 1;
                 // free over the defining instruction's operands and the one before it too (deferred
-                // fused compares read at the next instruction)
-                let a0 = if di > 0 { a - 5 } else { a - 1 };
+                // fused compares read at the next instruction); saturating: the entry block's second
+                // instruction has a = 4 (a - 5 wrapped to u32::MAX and indexed far past the bit set:
+                // Stage's kernels, compute's x64 fuzzers)
+                let a0 = if di > 0 { a.saturating_sub(5) } else { a - 1 };
                 for &c in &regs {
                     let o = &mut occ[c as usize];
                     if !o.is_empty() && bits_any(o, a0, z) {

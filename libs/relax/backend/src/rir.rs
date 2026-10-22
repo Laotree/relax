@@ -171,6 +171,11 @@ pub enum VX {
     ArmSha256H,
     ArmSha256H2,
     ArmSha256Su1,
+    /// shift by the signed amount in each lane (NEON USHL / SSHL): left by n >= 0, right by -n
+    /// (logical / arithmetic) for n < 0, |n| below the lane bits. Made by the arm64 back end only
+    /// (a right shift by `y + c` is `ushl` by `-c - y`: one `sub`, no `neg`).
+    ArmUShl(VW),
+    ArmSShl(VW),
     // ---- unary, V128 -> V128
     FNeg(VW),
     FAbs(VW),

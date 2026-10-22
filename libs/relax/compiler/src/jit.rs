@@ -5152,6 +5152,7 @@ impl Unit {
             // as unverified code and is built again with them
             if !self.fns[id as usize].d3_lowered.load(Ordering::Relaxed) && self.disjoint_checks(id).is_some() {
                 self.fns[id as usize].unverified.store(true, Ordering::Relaxed);
+                note_unverified(self, id);
                 self.fns[id as usize].rir = None;
                 tier_push(id, Q_RETIER, 0);
             }
@@ -5335,6 +5336,16 @@ impl Unit {
     /// only (cheap, any thread that may read the unit).
     pub(crate) fn verdict_clean(&self, id: u32) -> bool {
         matches!(self.verdict_state(id), Verdict::Clean)
+    }
+
+    /// SPEC-V: the owner whose recorded verdict decides slot `id`'s (`verdict_state`): a fn
+    /// instance's item, a closure's parent's. None: a slot no verdict changes.
+    pub(crate) fn verdict_owner(&self, id: u32) -> Option<DefId> {
+        match &self.fns[id as usize].key {
+            FnKey::Inst(d, _) => Some(*d),
+            FnKey::Closure(_, _, parent) => self.verdict_owner(*parent),
+            _ => None,
+        }
     }
 
     /// SPEC-V: where slot `id`'s body stands with the borrow checker (see `verdict_clean`).
@@ -8197,6 +8208,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     // SPEC-V: a body without a clean verdict is baseline code with its `noalias` facts dropped
     let unverified = !(&*up).verdict_clean(id);
     (&*up).fns[id as usize].unverified.store(unverified, Ordering::Relaxed);
+    if unverified { note_unverified(&*up, id); }
     let baseline = unverified || mode == RirMode::Baseline || mode == RirMode::Tier0 && !o2_build() && !RT_KEEP.with(|k| k.get()) && match options.t0_baseline {
         crate::options::Tier0Baseline::Off => false,
         crate::options::Tier0Baseline::Startup => startup_phase() || warmup_foreground() || (&*up).fns[id as usize].baseline_hint.load(Ordering::Relaxed),
@@ -11648,6 +11660,22 @@ static AWAIT_VERDICT: relax_session::sync::Mutex<Vec<(u32, Await)>> = relax_sess
 /// the verdict/patch state the last sweep saw (a new waiting promotion resets it)
 static SWEPT: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// SPEC-V: what the last sweep looked at (its unit, patch state and collect epoch: any change makes the
+/// next sweep look at every flagged slot) and the slots flagged since (unit, slot).
+struct SweepState {
+    unit: usize,
+    patches: u64,
+    epoch: u64,
+    flagged: Vec<(usize, u32)>,
+}
+static SWEEP_STATE: relax_session::sync::Mutex<SweepState> = relax_session::sync::Mutex::new(SweepState { unit: 0, patches: 0, epoch: 0, flagged: Vec::new() });
+
+/// SPEC-V: slot `id` of `u` was flagged unverified (its next sweep looks at it).
+pub(crate) fn note_unverified(u: &Unit, id: u32) {
+    let mut st = SWEEP_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    crate::zone_alloc::kept_with(|| st.flagged.push((u as *const Unit as usize, id)));
+}
+
 fn await_verdict(id: u32, w: Await) {
     SWEPT.store(u64::MAX, Ordering::Relaxed);
     let mut a = AWAIT_VERDICT.lock().unwrap_or_else(|e| e.into_inner());
@@ -11670,12 +11698,40 @@ pub fn sweep_verdicts() {
     if up.is_null() {
         return;
     }
+    let patches = PATCH_EPOCH.load(Ordering::SeqCst).wrapping_add((crate::reload::UNVERIFIED_PATCHES.load(Ordering::Acquire) as u64) << 48);
     let verified = owner::call(owner::Class::Background, || unsafe {
         let u = &*up;
         let mut n = 0u32;
         let mut relower = Vec::new();
         let mut verified = Vec::new();
+        // A flagged slot's verdict turns clean only when its owner's verdict is recorded, or with a
+        // patch / a new collect epoch (then every flagged slot is looked at again). Its flag may be
+        // raised after its owner's record was taken: a slot flagged since the last sweep is looked at.
+        let owners = crate::borrowck::lazy::take_recorded_owners();
+        let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
+        let fresh = {
+            let mut st = SWEEP_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            let full = owners.is_none() || st.unit != up as usize || st.patches != patches || st.epoch != epoch;
+            st.unit = up as usize;
+            st.patches = patches;
+            st.epoch = epoch;
+            let fresh = std::mem::take(&mut st.flagged);
+            if full { None } else { Some(fresh) }
+        };
+        let look: Option<crate::fxhash::HashSet<u32>> = fresh.map(|fresh| {
+            let owners: crate::fxhash::HashSet<DefId> = owners.unwrap_or_default().into_iter().collect();
+            let mut look: crate::fxhash::HashSet<u32> = fresh.into_iter().filter(|&(unit, _)| unit == up as usize).map(|(_, id)| id).collect();
+            if !owners.is_empty() {
+                for id in 0..u.fns.len() {
+                    if u.fns[id].unverified.load(Ordering::Relaxed) && u.verdict_owner(id as u32).is_some_and(|d| owners.contains(&d)) {
+                        look.insert(id as u32);
+                    }
+                }
+            }
+            look
+        });
         for id in 0..u.fns.len() {
+            if look.as_ref().is_some_and(|l| !l.contains(&(id as u32))) { continue; }
             if u.fns[id].unverified.load(Ordering::Relaxed) && u.refresh_verified(id as u32) {
                 n += 1;
                 // D3: the installed code lacks the verdict's disjoint-index checks; O3 code built
@@ -16581,8 +16637,9 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
         }
         let w = IS_WORKER.try_with(|w| w.get()).unwrap_or(false);
         AHEAD_STATS[if w { 4 } else { 3 }].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
-        // after the startup (its helpers lower then), the thread about to build the slot lowers it
-        if !owner::is_owner() && !startup_phase() && pipelined() {
+        // the thread about to build the slot lowers it (off the owner: the owner's front then only
+        // takes the RIR), also during the startup, when the helpers have not got to it yet
+        if !owner::is_owner() && pipelined() {
             lower_ahead(&f, id, true);
         }
     }
