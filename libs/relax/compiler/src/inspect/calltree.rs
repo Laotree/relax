@@ -69,6 +69,12 @@ fn expand_pcs(pcs: &[u64], partial: &mut Vec<String>) -> HashMap<u64, Vec<XFrame
 
 /// Every sample as its expanded stack, outermost first, with its thread name and weight.
 pub(crate) fn expanded(run: &super::prof::Run, partial: &mut Vec<String>) -> Vec<(String, Vec<XFrame>, u64)> {
+    let tname = |id: u64| run.threads.iter().find(|t| t.os_id == id).map(|t| if t.name.is_empty() { format!("T{}", id) } else { format!("{} (T{})", t.name, id) }).unwrap_or_else(|| format!("T{}", id));
+    expanded_raw(run, partial).into_iter().map(|(os, _, f, w)| (tname(os), f, w)).collect()
+}
+
+/// `expanded` with each sample's thread os id and time: (os id, t, frames outermost first, weight).
+pub(crate) fn expanded_raw(run: &super::prof::Run, partial: &mut Vec<String>) -> Vec<(u64, u64, Vec<XFrame>, u64)> {
     let mut pcs: Vec<u64> = Vec::new();
     for s in &run.samples {
         for (i, &pc) in s.frames.iter().enumerate() {
@@ -78,7 +84,6 @@ pub(crate) fn expanded(run: &super::prof::Run, partial: &mut Vec<String>) -> Vec
     pcs.sort_unstable();
     pcs.dedup();
     let names = expand_pcs(&pcs, partial);
-    let tname = |id: u64| run.threads.iter().find(|t| t.os_id == id).map(|t| if t.name.is_empty() { format!("T{}", id) } else { format!("{} (T{})", t.name, id) }).unwrap_or_else(|| format!("T{}", id));
     run.samples
         .iter()
         .map(|s| {
@@ -90,7 +95,7 @@ pub(crate) fn expanded(run: &super::prof::Run, partial: &mut Vec<String>) -> Vec
                     v.extend(f.iter().rev().cloned());
                 }
             }
-            (tname(s.os_id), v, s.weight.max(1))
+            (s.os_id, s.t, v, s.weight.max(1))
         })
         .collect()
 }

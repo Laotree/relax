@@ -564,9 +564,68 @@ fn top(p: &Profile, q: &Q) -> Ans {
             out
         }
         "jit" => top_jit(p, t0, t1, &wname, n),
+        "fn" | "samples" => top_fn(p, t0, t1, &wname, n),
         "gpu" => gpu(p, &Q::parse(&format!("gpu top {}", q.kv.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")))),
-        other => format!("top {other}? top cpu | top jit | top gpu").into(),
+        other => format!("top {other}? top cpu | top fn | top jit | top gpu").into(),
     }
+}
+
+/// `top fn`: the CPU stack samples (SAMPLES, the producer's `hz=` sampler): fns by self and
+/// inclusive weight, each with the tier it ran at (JIT inline levels are frames of their own).
+fn top_fn(p: &Profile, t0: u64, t1: u64, wname: &str, n: usize) -> Ans {
+    let v: Vec<&(u32, u8, crate::SampleRec)> = p.samples.iter().filter(|s| s.2.t >= t0 && s.2.t < t1).collect();
+    if v.is_empty() {
+        return format!("no CPU samples in {wname}: the stream samples stacks only when opened with hz=N (`pf ... hz=1000`)\nmore: top cpu  summary").into();
+    }
+    let tier = |t: u8| match t {
+        crate::tier::NATIVE => "native",
+        crate::tier::BASELINE => "baseline",
+        crate::tier::O1 => "O1",
+        crate::tier::O2 => "O2",
+        crate::tier::O3 => "O3",
+        crate::tier::INLINED => "inl",
+        _ => "other",
+    };
+    let total: u64 = v.iter().map(|s| s.2.weight.max(1)).sum();
+    let mut selfw: HashMap<(u32, u8), u64> = HashMap::new();
+    let mut incl: HashMap<u32, u64> = HashMap::new();
+    for s in &v {
+        let w = s.2.weight.max(1);
+        if let Some(&(f, t)) = s.2.frames.last() {
+            *selfw.entry((f, t)).or_default() += w;
+        }
+        let mut seen: Vec<u32> = Vec::new();
+        for &(f, _) in &s.2.frames {
+            if !seen.contains(&f) {
+                seen.push(f);
+                *incl.entry(f).or_default() += w;
+            }
+        }
+    }
+    let mut rows: Vec<((u32, u8), u64)> = selfw.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut lg = Legend::default();
+    let first = &rows[0];
+    let ev = match v[0].1 {
+        0 => "CPU",
+        1 => "cycles",
+        2 => "instructions",
+        3 => "branch-miss",
+        _ => "cache-miss",
+    };
+    let mut out = Ans::new(format!("hottest fn in {} ({} samples, {} weighted): {} [{}] {}% self", wname, v.len(), ev, lg.name(p.s(first.0 .0)), tier(first.0 .1), pct(first.1, total)));
+    let mut t = Table::new(&["fn", "tier", "self %", "incl %"]);
+    for ((f, tr), w) in rows.iter().take(n) {
+        t.row(vec![lg.name(p.s(*f)), tier(*tr).to_string(), pct(*w, total), pct(incl.get(f).copied().unwrap_or(0), total)]);
+    }
+    out.table(t);
+    if rows.len() > n {
+        let rest: u64 = rows[n..].iter().map(|x| x.1).sum();
+        out.note(format!("+{} smaller, {}% self", rows.len() - n, pct(rest, total)));
+    }
+    out.note(lg.render());
+    out.more("top cpu  top jit  summary");
+    out
 }
 
 fn top_jit(p: &Profile, t0: u64, t1: u64, wname: &str, n: usize) -> Ans {

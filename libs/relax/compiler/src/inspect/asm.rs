@@ -896,12 +896,19 @@ fn findings(a: &Side, b: &Side, j: &Joined) -> Vec<(f64, String)> {
     let mut seen_lines: Vec<std::collections::HashSet<String>> = Vec::new();
     let mut ranked: Vec<(f64, usize, usize)> = loops.iter().map(|&(h, t)| ((h..=t).map(|k| a.weight(k, by_samples, by_count)).sum::<f64>(), h, t)).collect();
     ranked.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut reported: Vec<(usize, usize)> = Vec::new();
     for &(w, h, t) in ranked.iter().take(6) {
         let keys: std::collections::HashSet<String> = (h..=t).filter_map(|k| a.lines.get(a.at[k] as usize).map(|l| l.key.clone())).collect();
-        // a loop whose lines an earlier (hotter, inner) loop already covered adds nothing
+        // a loop whose lines an earlier (hotter, inner) loop already covered adds nothing; an
+        // outer loop whose own weight (outside the inner ones reported) is small neither
         if keys.is_empty() || seen_lines.iter().any(|s| keys.is_subset(s)) {
             continue;
         }
+        let own: f64 = (h..=t).filter(|k| !reported.iter().any(|&(a0, b0)| *k >= a0 && *k <= b0)).map(|k| a.weight(k, by_samples, by_count)).sum();
+        if !reported.is_empty() && own < tot_w * 0.1 {
+            continue;
+        }
+        reported.push((h, t));
         seen_lines.push(keys.clone());
         let mut ours = Tally::default();
         for k in h..=t {
@@ -1475,6 +1482,22 @@ mod tests {
         assert_eq!(plain_name("core::ptr::drop_in_place<alloc::string::String>"), "core::ptr::drop_in_place");
         assert_eq!(plain_name("foo::bar::h0123456789abcdef"), "foo::bar");
         assert_eq!(callee_key("<alloc::vec::Vec<T> as core::ops::Drop>::drop"), "Vec::drop");
+    }
+
+    #[test]
+    fn checks_and_tail_data() {
+        assert_eq!(check_kind("core::panicking::panic_bounds_check (via the panic trampoline)"), Some("bounds"));
+        assert_eq!(check_kind("core::slice::index::slice_end_index_len_fail"), Some("bounds"));
+        assert_eq!(check_kind("core::panicking::panic_const::panic_const_add_overflow"), Some("overflow"));
+        assert_eq!(check_kind("core::option::unwrap_failed"), Some("unwrap"));
+        assert_eq!(check_kind("alloc::vec::Vec::push"), None);
+        // arm64: ret; udf (a noreturn call's end); then pool words
+        let words: [u32; 5] = [0xd65f03c0, 0x00000000, 0x00000000, 0x00000026, 0x00000000];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut v = dis::decode(Arch::Arm64, &bytes, 0x1000);
+        let dropped = trim_tail_data(&mut v);
+        assert_eq!(v.len(), 2, "{:?}", v.iter().map(|i| i.text()).collect::<Vec<_>>());
+        assert_eq!(dropped, 12);
     }
 
     #[test]

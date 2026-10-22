@@ -19,6 +19,8 @@ pub struct Sample {
     /// events this sample stands for (hardware events: the period the kernel sampled at; CPU
     /// time: 1)
     pub weight: u64,
+    /// when it was taken (clock::wall_ns; Linux: when its ring was drained, within 10 ms)
+    pub t: u64,
 }
 
 /// What a sample counts. CPU time works everywhere; the hardware events need Linux perf_event
@@ -43,6 +45,19 @@ impl Ev {
             _ => return Err(format!("ev={}: cpu | cycles | instructions | branch-misses | cache-misses", s)),
         })
     }
+    /// The sampling period of a hardware event for about `hz` samples per second of a busy
+    /// thread (~4 G cycles or instructions a second; misses far fewer). Linux only (perf_event).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn period(self, hz: u64) -> u64 {
+        let per_s: u64 = match self {
+            Ev::Cpu => 1_000_000_000,
+            Ev::Cycles | Ev::Instructions => 4_000_000_000,
+            Ev::BranchMisses => 40_000_000,
+            Ev::CacheMisses => 4_000_000,
+        };
+        (per_s / hz.max(1)).max(1)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Ev::Cpu => "CPU time",
@@ -131,8 +146,10 @@ mod imp {
                     _ => 5, // branch misses
                 };
                 put(&mut attr, 8, &config.to_ne_bytes());
-                put(&mut attr, 16, &hz.max(1).to_ne_bytes()); // sample_freq (freq bit below)
-                flags |= 1u64 << 10; // freq
+                // a fixed period (each sample stands for exactly that many events: weights stay
+                // exact when the kernel throttles the stack-copying samples, which freq mode's
+                // adapted periods do not), about `hz` samples a second of a busy thread
+                put(&mut attr, 16, &super::Ev::period(hw, hz).to_ne_bytes());
             }
         }
         put(&mut attr, 4, &128u32.to_ne_bytes());
@@ -211,7 +228,7 @@ mod imp {
         };
         let mut buf = [0u64; 96];
         let n = crate::inspect::threads::walk_regs_with(&mut regs, &mut buf, &read);
-        Some(Sample { os_id, frames: buf[..n].to_vec(), weight })
+        Some(Sample { os_id, frames: buf[..n].to_vec(), weight, t: crate::clock::wall_ns() })
     }
 
     pub fn collect(threads: Vec<crate::inspect::threads::Thread>, secs: f64, hz: u64, ev: super::Ev, cancel: &dyn Fn() -> bool) -> Run {
@@ -307,7 +324,7 @@ mod imp {
                     continue;
                 }
                 if crate::inspect::threads::capture(now, &mut raw).is_ok() && raw.n > 0 {
-                    samples.push(Sample { os_id: t.os_id, frames: raw.frames().to_vec(), weight: 1 });
+                    samples.push(Sample { os_id: t.os_id, frames: raw.frames().to_vec(), weight: 1, t: crate::clock::wall_ns() });
                 }
             }
             drop(_g);

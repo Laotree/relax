@@ -44,7 +44,7 @@ mod imp {
     fn open(tid: i32, ev: crate::inspect::prof::Ev, hz: u64) -> Option<Ring> {
         let mut attr = [0u8; 128];
         let put = |a: &mut [u8; 128], off: usize, v: &[u8]| a[off..off + v.len()].copy_from_slice(v);
-        let mut flags = (1u64 << 5) | (1u64 << 6) | (1u64 << 10); // exclude_kernel | exclude_hv | freq
+        let flags = (1u64 << 5) | (1u64 << 6); // exclude_kernel | exclude_hv
         let (ty, config) = match ev {
             crate::inspect::prof::Ev::Cpu => (1u32, 1u64),
             crate::inspect::prof::Ev::Cycles => (0, 0),
@@ -52,12 +52,8 @@ mod imp {
             crate::inspect::prof::Ev::CacheMisses => (0, 3),
             crate::inspect::prof::Ev::BranchMisses => (0, 5),
         };
-        if ty == 1 {
-            flags &= !(1u64 << 10);
-            put(&mut attr, 16, &(1_000_000_000 / hz.max(1)).to_ne_bytes());
-        } else {
-            put(&mut attr, 16, &hz.to_ne_bytes());
-        }
+        // a fixed period, the same as this process's own sampling (prof::Ev::period)
+        put(&mut attr, 16, &ev.period(hz).to_ne_bytes());
         put(&mut attr, 0, &ty.to_ne_bytes());
         put(&mut attr, 4, &128u32.to_ne_bytes());
         put(&mut attr, 8, &config.to_ne_bytes());
