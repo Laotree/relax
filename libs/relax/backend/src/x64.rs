@@ -1057,6 +1057,14 @@ impl<'a> Gen<'a> {
         -(self.saved + off)
     }
 
+    /// rbp displacement of a scalar float value that lives in its spill slot
+    fn spill_of(&self, v: VReg) -> Option<i32> {
+        match self.al.loc[v.0 as usize] {
+            Loc::Stack(o) if matches!(self.f.vregs[v.0 as usize], Cls::F32 | Cls::F64) => Some(self.spill_disp(o)),
+            _ => None,
+        }
+    }
+
     /// Integer operand in a register (loads spills into `scratch`).
     fn use_i(&mut self, options: &relax_session::Options, v: VReg, scratch: u8) -> u8 {
         match self.al.loc[v.0 as usize] {
@@ -3042,6 +3050,29 @@ impl<'a> Gen<'a> {
                 let at = self.a.pos();
                 self.a.u32(0);
                 self.fpool.push((at, bits));
+                self.fin_f(*d, xd);
+            }
+            Inst::FBin(op, f64_, d, a, b) if self.avx && a != b && (self.spill_of(*b).is_some() || (matches!(op, FOp::Add | FOp::Mul) && self.spill_of(*a).is_some())) => {
+                // a spilled operand straight from its slot (vop xd, xa, [rbp - k]); a commutative
+                // op takes either operand from memory
+                let (x, m) = if self.spill_of(*b).is_some() { (*a, *b) } else { (*b, *a) };
+                let disp = self.spill_of(m).unwrap();
+                let opc = match op {
+                    FOp::Add => 0x58,
+                    FOp::Mul => 0x59,
+                    FOp::Sub => 0x5c,
+                    FOp::Div => 0x5e,
+                    FOp::Min | FOp::MinLt => 0x5d,
+                    FOp::Max | FOp::MaxGt => 0x5f,
+                };
+                let xa = self.use_fx(x, XS);
+                let xd = self.def_fx(*d, XS);
+                let pp = if *f64_ { 3 } else { 2 };
+                if xd >= 16 || xa >= 16 {
+                    self.a.evex_m(pp, 1, *f64_, false, opc, xd, xa, RBP, disp);
+                } else {
+                    self.a.vex_lm(pp, 1, false, false, opc, xd, xa, RBP, disp);
+                }
                 self.fin_f(*d, xd);
             }
             Inst::FBin(op, f64_, d, a, b) => {
