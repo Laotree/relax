@@ -563,7 +563,9 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
     loop {
         if stopping() { return; }
         let quiet = src.quiet_ns();
-        if quiet < QUIET_NS {
+        // rank 0 (hot code waiting for its verdict, set_ranks) runs while compiles go on
+        let urgent = || QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 == 0);
+        if quiet < QUIET_NS && !urgent() {
             std::thread::sleep(std::time::Duration::from_millis(((QUIET_NS - quiet) / 1_000_000).clamp(20, 500)));
             continue;
         }

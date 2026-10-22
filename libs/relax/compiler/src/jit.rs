@@ -11981,7 +11981,20 @@ pub fn sweep_verdicts() {
             }
         }
         // ... and the ones whose unverified lowering calls hot twins
-        let tc = twin_callers(u, Some(&verified), None);
+        let mut tc = twin_callers(u, Some(&verified), None);
+        {
+            // (unverified callers of hot twins that were waiting for this)
+            let mut a = TWIN_AWAIT.lock().unwrap_or_else(|e| e.into_inner());
+            a.retain(|&(k, c)| {
+                if k != up as usize || !verified.contains(&c) && !relower.contains(&c) {
+                    return k == up as usize;
+                }
+                if !relower.contains(&c) && !tc.below.contains(&c) && !tc.o3.contains(&c) {
+                    if u.fns[c as usize].o3.load(Ordering::Relaxed) { tc.o3.push(c) } else { tc.below.push(c) }
+                }
+                false
+            });
+        }
         relower.extend(tc.o3.iter().copied());
         relower_twin_callers(up, &tc);
         for id in relower { tier_push(id, Q_RETIER, 0); }
@@ -12061,13 +12074,9 @@ fn twin_callers(u: &Unit, cands: Option<&[u32]>, twin: Option<u32>) -> TwinCalle
         None => u.fns[t as usize].o3.load(Ordering::Relaxed),
     };
     let mut out = TwinCallers::default();
-    let mut look = |c: u32| {
+    let classify = |out: &mut TwinCallers, c: u32| {
         let f = &u.fns[c as usize];
-        if !f.compiled || matches!(f.key, FnKey::Plain(_) | FnKey::Sandbox(_) | FnKey::Glue(..) | FnKey::Shim(_)) {
-            return;
-        }
-        let calls = f.rir.as_ref().is_some_and(|r| r.plain_calls && r.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(t), _, _) if hot(*t)))));
-        if !calls {
+        if !f.compiled || matches!(f.key, FnKey::Plain(_) | FnKey::Sandbox(_) | FnKey::Glue(..) | FnKey::Shim(_)) || out.o3.contains(&c) || out.below.contains(&c) || out.unverified.contains(&c) {
             return;
         }
         if f.unverified.load(Ordering::Relaxed) {
@@ -12078,25 +12087,86 @@ fn twin_callers(u: &Unit, cands: Option<&[u32]>, twin: Option<u32>) -> TwinCalle
             out.below.push(c);
         }
     };
+    let rir_calls = |c: u32| u.fns[c as usize].rir.as_ref().is_some_and(|r| r.plain_calls && r.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(t), _, _) if hot(*t)))));
     match cands {
-        Some(c) => c.iter().copied().for_each(&mut look),
-        None => (0..u.fns.len() as u32).for_each(&mut look),
+        Some(c) => c.iter().copied().filter(|&c| rir_calls(c)).for_each(|c| classify(&mut out, c)),
+        None => (0..u.fns.len() as u32).filter(|&c| rir_calls(c)).for_each(|c| classify(&mut out, c)),
+    }
+    // the lowerings that called `twin` (TWIN_USERS, kept when their RIR is dropped): a twin's
+    // callers are mostly twins themselves (a twin calls twins), so the chain is walked up to the
+    // bodies that are not twins
+    if let Some(t) = twin {
+        let users = TWIN_USERS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = vec![t];
+        let mut todo = vec![t];
+        while let Some(t) = todo.pop() {
+            for &c in users.get(&(u as *const Unit as usize, t)).map_or(&[][..], |v| &v[..]) {
+                if seen.contains(&c) || (c as usize) >= u.fns.len() {
+                    continue;
+                }
+                seen.push(c);
+                if matches!(u.fns[c as usize].key, FnKey::Plain(_)) {
+                    if seen.len() < 256 { todo.push(c); }
+                } else {
+                    classify(&mut out, c);
+                }
+            }
+        }
     }
     out
 }
 
+/// SPEC-V: (unit, twin) -> the slots whose lowering called the twin (lower.rs records them); entries
+/// go when the caller is lowered again for it (relower_twin_callers)
+static TWIN_USERS: std::sync::LazyLock<relax_session::sync::Mutex<HashMap<(usize, u32), Vec<u32>>>> = std::sync::LazyLock::new(Default::default);
+/// SPEC-V: unverified callers of hot twins: lowered again once their verdict is clean (sweep_verdicts)
+static TWIN_AWAIT: relax_session::sync::Mutex<Vec<(usize, u32)>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// SPEC-V: slot `caller`'s lowering sends a call to `twin` (lower.rs; any lowering thread)
+pub(crate) fn note_twin_user(u: &Unit, caller: u32, twin: u32) {
+    if caller == twin || (caller as usize) >= u.fns.len() {
+        return;
+    }
+    let mut m = TWIN_USERS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::zone_alloc::kept_with(|| {
+        let v = m.entry((u as *const Unit as usize, twin)).or_default();
+        if !v.contains(&caller) {
+            v.push(caller);
+        }
+    });
+}
+
 /// SPEC-V: brings twin callers below O3 to the base slots (twin_callers; the O3 ones are the
 /// caller's to retier): an O2 build lowers them again; unverified ones have their owners' verdicts
-/// checked first.
+/// checked first (Gandalf rank 0: it runs them even while compiles go on) and wait for them.
 unsafe fn relower_twin_callers(up: *mut Unit, tc: &TwinCallers) {
+    let key = up as usize;
+    if !tc.o3.is_empty() || !tc.below.is_empty() {
+        let mut m = TWIN_USERS.lock().unwrap_or_else(|e| e.into_inner());
+        for v in m.iter_mut().filter(|(k, _)| k.0 == key).map(|(_, v)| v) {
+            v.retain(|c| !tc.o3.contains(c) && !tc.below.contains(c));
+        }
+    }
     for &c in tc.below.iter().filter(|_| !pgo3_off("o2")) {
-        O2_SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).remove(&(up as usize, c));
+        O2_SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).remove(&(key, c));
         o2_base(up, c);
     }
     let u = &*up;
     if !tc.unverified.is_empty() && !pgo3_off("rank") {
-        let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
-        let ranks: Vec<(DefId, Vec<TyId>, u32)> = tc.unverified.iter().filter_map(|&c| Some((u.verdict_owner(c)?, Vec::new(), 0))).collect();
+        {
+            let mut a = TWIN_AWAIT.lock().unwrap_or_else(|e| e.into_inner());
+            crate::zone_alloc::kept_with(|| for &c in &tc.unverified { if !a.contains(&(key, c)) { a.push((key, c)); } });
+        }
+        prioritize_verdicts(u, &tc.unverified);
+    }
+}
+
+/// SPEC-V: the owners of `ids` go first in the background checker's queue (rank 0 runs without
+/// waiting for quiet compiles): hot code waits seconds for its verdict, not the whole backlog
+fn prioritize_verdicts(u: &Unit, ids: &[u32]) {
+    let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
+    let ranks: Vec<(DefId, Vec<TyId>, u32)> = ids.iter().filter_map(|&c| Some((u.verdict_owner(c)?, Vec::new(), 0))).collect();
+    if !ranks.is_empty() {
         crate::borrowck::lazy::set_ranks(std::sync::Arc::as_ptr(&u.front) as usize, epoch, &ranks);
     }
 }
@@ -13421,6 +13491,16 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     if !owner::call(owner::Class::Background, || (&*up).o3_allowed(id)) {
         await_verdict(id, Await::Tier(Q_LOOP, 0));
         return false;
+    }
+    // SPEC-V: hot code without a verdict yet: its check goes first (its O3 build is rebuilt once
+    // verified: noalias, inlining into callers, counts)
+    if !pgo3_off("rank") {
+        owner::call(owner::Class::Background, || {
+            let u = &*up;
+            if u.fns[id as usize].unverified.load(Ordering::Relaxed) && matches!(u.verdict_state(id), Verdict::Pending) {
+                prioritize_verdicts(u, &[id]);
+            }
+        });
     }
     trace_tier1_phase(id, "start");
     // Also pin direct callers (cache verification / embedders), not only queue workers.
