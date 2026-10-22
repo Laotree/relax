@@ -709,6 +709,9 @@ pub struct Arena {
     headers: [Chunk; N],
     pool: Mutex<Pool>,
     partial: Mutex<Partial>,
+    /// MAKEPAD_RUN_HEAP_CHECK (program heaps): one bit per 16 bytes of the reservation, set while
+    /// a block starts there (0: off). See `heap_check_on`.
+    live_bits: AtomicUsize,
 }
 static DEFAULT: Arena = Arena::new();
 impl Arena {
@@ -772,6 +775,7 @@ impl Arena {
                 },
                 3,
             ),
+            live_bits: AtomicUsize::new(0),
         }
     }
 
@@ -797,6 +801,9 @@ impl Arena {
             pool.prev.fill(NONE);
             pool.order.fill(u8::MAX);
             pool.order[0] = MAX_ORDER as u8;
+            if heap_check_on() {
+                a.live_bits.store(os_bits_map(), Ordering::Relaxed);
+            }
             let a = Box::from_raw(p);
             if a.init() {
                 Some(a)
@@ -856,7 +863,39 @@ impl Arena {
     }
     /// `cache_fast`, and the thread is not past its TLS destructors (it would never hand a new chunk back).
     fn cache_here(&self) -> bool {
-        self.cache_fast() && (self.dynamic || !EXITED.with(|e| e.get()))
+        // a checked program heap has no thread chunk caches: every block goes through the
+        // locked paths, which keep the live bits
+        self.cache_fast() && (self.dynamic || !EXITED.with(|e| e.get())) && self.live_bits.load(Ordering::Relaxed) == 0
+    }
+    /// MAKEPAD_RUN_HEAP_CHECK: sets (`live`) or clears the live bit of the block at `p`; returns
+    /// whether it was set before. No-op (true for a clear, false for a set) when the check is off.
+    #[inline]
+    fn mark(&self, p: usize, live: bool) -> bool {
+        let bits = self.live_bits.load(Ordering::Relaxed);
+        if bits == 0 {
+            return !live;
+        }
+        let k = (p - self.base.load(Ordering::Relaxed)) / 16;
+        let w = unsafe { &*((bits + (k / 64) * 8) as *const AtomicU64) };
+        let m = 1u64 << (k % 64);
+        let old = if live { w.fetch_or(m, Ordering::Relaxed) } else { w.fetch_and(!m, Ordering::Relaxed) };
+        old & m != 0
+    }
+    /// MAKEPAD_RUN_HEAP_CHECK: a block marked in `committed` bytes of chunk `index` (one being
+    /// released), or None.
+    fn live_in(&self, index: usize, committed: usize) -> Option<usize> {
+        let bits = self.live_bits.load(Ordering::Relaxed);
+        if bits == 0 {
+            return None;
+        }
+        let k0 = index * CHUNK / 16;
+        for wi in k0 / 64..(k0 + committed / 16 + 63) / 64 {
+            let v = unsafe { &*((bits + wi * 8) as *const AtomicU64) }.load(Ordering::Relaxed);
+            if v != 0 {
+                return Some(self.base.load(Ordering::Relaxed) + (wi * 64 + v.trailing_zeros() as usize) * 16);
+            }
+        }
+        None
     }
     pub fn requested_bytes(&self) -> usize {
         // Owner stores and remote additions avoid an RMW on the owner's path. Counters are
@@ -924,6 +963,9 @@ impl Arena {
     }
     unsafe fn release_empty(&self, index: usize, s: &mut State) {
         let h = &self.headers[index];
+        if let Some(p) = self.live_in(index, s.committed) {
+            heap_check_fail(b"a chunk with no live block by its count still holds the block at", p, index, s.stride);
+        }
         s.released = true;
         if h.in_part.load(Ordering::Relaxed) {
             lock(&self.partial).unlink(index, &self.headers);
@@ -1281,6 +1323,9 @@ impl Arena {
             while let Some(i) = self.partial_pop(class) {
                 let p = self.from_partial(i, stride, class, requested, cache);
                 if !p.is_null() {
+                    if self.mark(p as usize, true) {
+                        heap_check_fail(b"the allocator handed out a live block at", p as usize, i, stride);
+                    }
                     return p;
                 }
             }
@@ -1379,6 +1424,9 @@ impl Arena {
         }
         if cache {
             self.set_current(class, Current { index, stamp: if COMPILER { epoch } else { generation } });
+        }
+        if self.mark(p as usize, true) {
+            heap_check_fail(b"the allocator handed out a live block at", p as usize, index, stride);
         }
         p
     }
@@ -1533,6 +1581,9 @@ impl Arena {
     unsafe fn dealloc_slow(&self, p: *mut u8, l: Layout, requested: usize, index: usize) {
         let address = self.base.load(Ordering::Relaxed) + index * CHUNK;
         let h = &self.headers[index];
+        if !self.mark(p as usize, false) {
+            heap_check_fail(b"free of a block that is not live (a double free, or not a block start) at", p as usize, index, lock(&h.state).stride);
+        }
         if COMPILER {
             // Publish accounting before the block: after publication the owner may recycle
             // the slot or even release its mapping, so this producer never touches it again.
@@ -1901,6 +1952,111 @@ impl Drop for Arena {
         if self.dynamic && base != 0 {
             unsafe { os::unreserve(base, RESERVE) };
         }
+        let bits = self.live_bits.load(Ordering::Relaxed);
+        if bits != 0 {
+            unsafe { os::unreserve(bits, RESERVE / 128) };
+        }
+    }
+}
+
+/// 0 = not read, 1 = off, 2 = MAKEPAD_RUN_HEAP_CHECK is set.
+static HEAP_CHECK: AtomicU8 = AtomicU8::new(0);
+
+/// MAKEPAD_RUN_HEAP_CHECK=1: every program heap (domain arena) made from then on keeps a live bit
+/// per block and runs without thread chunk caches; a free of a block that is not live (double
+/// free, a pointer into a block), a live block handed out again, or a chunk released while a block
+/// in it is live aborts at once with one line naming the address (and the JIT's abort report
+/// with the frames). Off: no cost outside the slow paths (one load there).
+pub fn heap_check_on() -> bool {
+    match HEAP_CHECK.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            #[cfg(unix)]
+            let on = unsafe {
+                extern "C" {
+                    fn getenv(name: *const u8) -> *const u8;
+                }
+                !getenv(c"MAKEPAD_RUN_HEAP_CHECK".as_ptr().cast()).is_null()
+            };
+            #[cfg(not(unix))]
+            let on = false;
+            HEAP_CHECK.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// The live-bit map of one program heap: RESERVE / 16 bits, mapped readable and writable (the OS
+/// backs only the pages that are touched). 0 when the mapping is refused (the check stays off).
+fn os_bits_map() -> usize {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    unsafe {
+        let b = os::reserve(RESERVE / 128, GRANULE, c"makepad-run heap check");
+        if b != 0 && !os::commit(b as *mut u8, RESERVE / 128) {
+            os::unreserve(b, RESERVE / 128);
+            return 0;
+        }
+        b
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+    0
+}
+
+/// A MAKEPAD_RUN_HEAP_CHECK failure: one line with `write(2)` (no allocation: this runs inside
+/// the allocator, under its locks), then abort.
+#[cold]
+#[inline(never)]
+fn heap_check_fail(what: &[u8], p: usize, index: usize, stride: usize) -> ! {
+    let mut buf = [0u8; 256];
+    let mut n = 0;
+    let mut put = |bytes: &[u8]| {
+        for &b in bytes {
+            if n < buf.len() {
+                buf[n] = b;
+                n += 1;
+            }
+        }
+    };
+    let num = |v: usize, hex: bool, out: &mut [u8; 20]| -> usize {
+        let (mut v, r, mut k) = (v, if hex { 16 } else { 10 }, 20);
+        loop {
+            k -= 1;
+            let d = (v % r) as u8;
+            out[k] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+            v /= r;
+            if v == 0 {
+                break;
+            }
+        }
+        k
+    };
+    let mut d = [0u8; 20];
+    put(b"makepad-run heap check: ");
+    put(what);
+    put(b" 0x");
+    let k = num(p, true, &mut d);
+    put(&d[k..]);
+    put(b" (chunk ");
+    let k = num(index, false, &mut d);
+    put(&d[k..]);
+    put(b", slot size ");
+    let k = num(stride, false, &mut d);
+    put(&d[k..]);
+    put(b")\n");
+    #[cfg(unix)]
+    unsafe {
+        extern "C" {
+            fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+            fn abort() -> !;
+        }
+        write(2, buf.as_ptr(), n);
+        abort();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = n;
+        std::process::abort();
     }
 }
 
