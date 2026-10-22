@@ -3612,12 +3612,14 @@ impl<'a> Gen<'a> {
     /// (to `ff`). A target that is the next block falls through. When neither is, the conditional
     /// branch takes the loop's back edge (a target laid out at or before this block) and the
     /// unconditional one the other: one taken branch per iteration instead of a not-taken b.cond
-    /// plus a taken b (as x64's term).
+    /// plus a taken b.
     fn branch_pair(&mut self, yes: CondBr, no: CondBr, tt: u32, ff: u32, bi: usize) {
         let next = self.next_block[bi];
         // (MAKEPAD_RUN_OPT=-a64backedge: off, A/B)
         let back = |b: u32| b as usize <= bi && !crate::stats::opt_env_off("-a64backedge");
-        if tt == next || ff != next && back(ff) && (!back(tt) || ff as usize == bi && tt as usize != bi) {
+        // both laid out before: the nearer one is the innermost loop's header (an exit placed
+        // before the loop is further back)
+        if tt == next || ff != next && back(ff) && (!back(tt) || ff > tt) {
             self.cond_branch(no, ff);
             self.jump_to(tt, bi);
         } else {
