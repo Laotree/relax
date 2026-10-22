@@ -755,6 +755,9 @@ struct Gen<'a> {
     fnmul_ins: Option<(VReg, VReg)>,
     /// vregs defined once, as a zero vector (VConst 0 / FromLo64 of a constant 0)
     zero_vec: Vec<bool>,
+    /// single-definition integer / float / vector zeros (Iconst 0, Fconst +0.0, VConst 0, a zero
+    /// vector from FromLo64 of an integer 0): stores of them store zr
+    zero_val: Vec<bool>,
     /// vregs defined once, by an f32 load (a register holding one has its upper 96 bits zero)
     f32_load: Vec<bool>,
     /// single-def +0.0 constants read only by float compares: never built (fcmp #0.0)
@@ -1278,6 +1281,8 @@ impl<'a> Gen<'a> {
                 }
             }
             let mut skip_next = false;
+            // instructions before this were stored by one zero run (zero_run)
+            let mut skip_to = 0usize;
             let mut deferred: Option<usize> = None;
             // a block start can be a jump target: no spill store before it carries over
             self.last_spill = None;
@@ -1332,6 +1337,9 @@ impl<'a> Gen<'a> {
                     skip_next = false;
                     continue;
                 }
+                if ii < skip_to {
+                    continue;
+                }
                 // the second instruction of a deferred pair: both are emitted here, at its position
                 // (after its window loads): its result's def window starts after it, its store_skip
                 // is keyed by it, and the register allocator keeps the first one's operands
@@ -1341,6 +1349,15 @@ impl<'a> Gen<'a> {
                     let done = self.shifted_operand(options, first, inst, true).is_some() || self.narrow_bswap(options, first, inst, true).is_some() || self.mul_add(options, first, inst, true).is_some();
                     debug_assert!(done, "a deferred pair no longer matches");
                     continue;
+                }
+                // three or more zero stores off one base in a row: the widest zr stores over their bytes
+                let limit = if test_pair { n - 2 } else if fused { n - 1 } else { n };
+                if ii + 2 < limit && isel_flags(options) & A64_FUSE != 0 {
+                    let k = self.zero_run(bi, ii, limit);
+                    if k > 0 {
+                        skip_to = ii + k;
+                        continue;
+                    }
                 }
                 if ii + 1 < n && !(fused && ii + 1 == n - 1) {
                     // a shift by a constant feeding only the next add/sub/and/or/xor: the shifted
@@ -3363,11 +3380,18 @@ impl<'a> Gen<'a> {
             _ => return None,
         };
         let vec = matches!(i1, Inst::VLoad(..) | Inst::VStore(..));
-        if m1 != m2 || b1 != b2 || v1 == v2 {
+        // two zero stores of one width pair as `stp wzr / xzr` whatever their types
+        let zeros = !load && !vec && self.zero_val[v1.0 as usize] && self.zero_val[v2.0 as usize] && mem_op(m1, false).1 == mem_op(m2, false).1;
+        if !zeros && m1 != m2 || b1 != b2 || load && v1 == v2 {
             return None;
         }
         // (pair opcode, width, float?)
         let (op, w, fp) = match (m1, load) {
+            _ if zeros => match mem_op(m1, false).1 {
+                8 => (0xA900_0000u32, 8i64, false),
+                4 => (0x2900_0000, 4, false),
+                _ => return None,
+            },
             _ if vec => (if load { 0xAD40_0000u32 } else { 0xAD00_0000 }, 16i64, true),
             (Mem::Int(8, _), true) => (0xA940_0000u32, 8i64, false),
             (Mem::Int(8, _), false) => (0xA900_0000, 8, false),
@@ -3408,16 +3432,90 @@ impl<'a> Gen<'a> {
             },
         };
         let reg_of = |s: &Self, v: VReg| match (s.al.loc[v.0 as usize], fp) {
+            _ if zeros => Some(ZR),
+            // an integer zero store: zr (its register may not even hold it here)
+            (_, false) if !load && s.zero_val[v.0 as usize] => Some(ZR),
             (Loc::Reg(r), false) | (Loc::Flt(r), true) => Some(r),
             _ => None,
         };
         let (t1, t2) = (reg_of(self, lo_v)?, reg_of(self, hi_v)?);
-        if t1 == t2 {
+        if load && t1 == t2 {
             return None;
         }
         let imm = ((rb.1 / w) as u32) & 0x7f;
         self.a.e(op | imm << 15 | (t2 as u32) << 10 | (rb.0 as u32) << 5 | t1 as u32);
         Some(())
+    }
+
+    /// Instructions `ii..` that store zero (zero_values) off one base (after resolve_off), with no
+    /// region window starting among them: when there are at least three, their byte ranges are
+    /// stored with the widest zr stores (stp xzr, xzr per 16 bytes; a zeroed struct's 4-byte
+    /// fields were one `str wzr` each, its vectors a movi + str q) and the count is returned.
+    fn zero_run(&mut self, bi: usize, ii: usize, limit: usize) -> usize {
+        let b = &self.f.blocks[bi];
+        let zero = |s: &Self, v: VReg| s.zero_val[v.0 as usize] || s.al.loc[v.0 as usize] == Loc::None && matches!(s.al.remat[v.0 as usize], Remat::Const(0) | Remat::FConst(0, _) | Remat::VConst(0));
+        let mut root: Option<VReg> = None;
+        let mut spans: Vec<(i64, i64)> = Vec::new();
+        let mut k = ii;
+        while k < limit {
+            let (base, off, size) = match b.insts[k] {
+                Inst::Store(m, base, off, v) if zero(self, v) => (base, off as i64, mem_op(m, false).1 as i64),
+                Inst::VStore(base, off, v) if zero(self, v) => (base, off as i64, 16),
+                _ => break,
+            };
+            if k > ii && self.win_start.contains_key(&self.al.inst_pos(bi, k)) {
+                break;
+            }
+            let (r, o) = self.resolve_off(base, off);
+            if root.is_some_and(|x| x != r) {
+                break;
+            }
+            root = Some(r);
+            spans.push((o, o + size));
+            k += 1;
+        }
+        if k - ii < 3 {
+            return 0;
+        }
+        let root = root.unwrap();
+        let (rb, add) = match self.slot_base(root) {
+            Some(so) => (SP, so),
+            None => (self.use_i(root, S1), 0),
+        };
+        spans.sort();
+        let mut merged: Vec<(i64, i64)> = Vec::new();
+        for (lo, hi) in spans {
+            match merged.last_mut() {
+                Some(m) if lo <= m.1 => m.1 = m.1.max(hi),
+                _ => merged.push((lo, hi)),
+            }
+        }
+        for (lo, hi) in merged {
+            let (mut p, e) = (lo + add, hi + add);
+            while p < e {
+                let left = e - p;
+                if left >= 16 && p % 8 == 0 && (-512..=504).contains(&p) {
+                    self.a.stp(false, ZR, ZR, rb, p as i32);
+                    p += 16;
+                } else if left >= 8 && p % 8 == 0 {
+                    self.a.ldst(STRX, 8, ZR, rb, p);
+                    p += 8;
+                } else if left >= 8 && p % 4 == 0 && (-256..=252).contains(&p) {
+                    self.a.e(0x2900_0000 | (((p / 4) as u32) & 0x7f) << 15 | (ZR as u32) << 10 | (rb as u32) << 5 | ZR as u32);
+                    p += 8;
+                } else if left >= 4 && p % 4 == 0 {
+                    self.a.ldst(STRW, 4, ZR, rb, p);
+                    p += 4;
+                } else if left >= 2 && p % 2 == 0 {
+                    self.a.ldst(STRH, 2, ZR, rb, p);
+                    p += 2;
+                } else {
+                    self.a.ldst(STRB, 1, ZR, rb, p);
+                    p += 1;
+                }
+            }
+        }
+        k - ii
     }
 
     /// Sets the flags for a fused compare and returns the condition for "true".
@@ -4736,6 +4834,25 @@ fn zero_vectors(f: &Func) -> (Vec<bool>, Vec<bool>) {
     ((0..n).map(|v| zvec[v] && defs[v] == 1).collect(), (0..n).map(|v| fload[v] && defs[v] == 1).collect())
 }
 
+/// Single-definition values that are zero in every bit (zero_vectors' vectors, Iconst 0, Fconst +0.0)
+fn zero_values(f: &Func, zero_vec: &[bool]) -> Vec<bool> {
+    let n = f.vregs.len();
+    let mut defs = vec![0u32; n];
+    let mut z = zero_vec.to_vec();
+    for p in &f.params {
+        defs[p.0 as usize] += 1;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            i.defs(|d| defs[d.0 as usize] += 1);
+            if let Inst::Iconst(d, 0) | Inst::Fconst(d, 0, _) = *i {
+                z[d.0 as usize] = true;
+            }
+        }
+    }
+    (0..n).map(|v| z[v] && defs[v] == 1).collect()
+}
+
 fn words_to_bytes(w: &[u32]) -> Vec<u8> {
     let mut b = Vec::with_capacity(w.len() * 4);
     for x in w {
@@ -4772,6 +4889,70 @@ pub fn compile(options: &relax_session::Options, f: &Func, env: &Env) -> Result<
 /// hash's `x >> ((x >> 28) + 4)`), the amount becomes `-c - y` -- the add a `sub` from the
 /// constant `-c`, built next to `c` -- and the shift `ArmUShl` / `ArmSShl` by it; `y - c` becomes
 /// `c - y` (no new constant). One instruction fewer per shift.
+/// A single-definition `VConst(d, k)` after another single-definition `VConst(c, k)` in the same
+/// block: d's uses read c (dominated by c's definition, as d's are), d's definition goes. One
+/// movi per block instead of one per use site: the unrolled `[T; N]` inits of box3d stored a
+/// fresh zero vector per element. A constant of a long range is still rebuilt at its uses when
+/// the allocator spills it (Remat::VConst).
+fn share_vconsts(f: &Func) -> Option<Func> {
+    let n = f.vregs.len();
+    let mut ndef = vec![0u32; n];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut any = 0usize;
+    for b in &f.blocks {
+        for i in &b.insts {
+            i.defs(|d| ndef[d.0 as usize] += 1);
+            any += matches!(i, Inst::VConst(..)) as usize;
+        }
+    }
+    if any < 2 {
+        return None;
+    }
+    let mut to: Vec<u32> = (0..n as u32).collect();
+    let mut drop: Vec<(usize, usize)> = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        let mut seen: Vec<(u32, VReg)> = Vec::new();
+        for (ii, i) in b.insts.iter().enumerate() {
+            if let Inst::VConst(d, k) = *i {
+                if ndef[d.0 as usize] != 1 {
+                    continue;
+                }
+                match seen.iter().find(|e| e.0 == k) {
+                    Some(&(_, c)) => {
+                        to[d.0 as usize] = c.0;
+                        drop.push((bi, ii));
+                    }
+                    None => seen.push((k, d)),
+                }
+            }
+        }
+    }
+    if drop.is_empty() {
+        return None;
+    }
+    let mut g = f.clone();
+    for &(bi, ii) in drop.iter().rev() {
+        g.blocks[bi].insts.remove(ii);
+        g.blocks[bi].pos.remove(ii);
+    }
+    let m = |v: VReg| if (v.0 as usize) < n { VReg(to[v.0 as usize]) } else { v };
+    for b in g.blocks.iter_mut() {
+        for i in b.insts.iter_mut() {
+            *i = crate::passes::rename(i, &m);
+        }
+        b.term = match &b.term {
+            Term::Branch(c, x, y) => Term::Branch(m(*c), *x, *y),
+            Term::Ret(v) => Term::Ret(v.iter().map(|x| m(*x)).collect()),
+            Term::Switch(c, t) => Term::Switch(m(*c), t.clone()),
+            other => other.clone(),
+        };
+    }
+    g.dbg_map_vregs(&|v| Some(m(v)));
+    Some(g)
+}
+
 fn fold_shift_amounts(f: &Func) -> Option<Func> {
     let n = f.vregs.len();
     let mut ndef = vec![0u32; n];
@@ -5045,6 +5226,10 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // f32 splats read only by multiplies: the by-element forms (fmla / fmls / fmul v, v, v.s[0])
     let lanes = fold_lane_splats(f);
     let f = lanes.as_ref().unwrap_or(f);
+    // a vector constant made again in its block (an unrolled array init's zero per element):
+    // the first one's register
+    let vk = if crate::stats::opt_off(options, "-a64vconst") { None } else { share_vconsts(f) };
+    let f = vk.as_ref().unwrap_or(f);
     // right shifts by `y + c`: ushl / sshl by `-c - y` (no neg per shift)
     let shifts = fold_shift_amounts(f);
     let f = shifts.as_ref().unwrap_or(f);
@@ -5100,6 +5285,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         zero_ins: None,
         fnmul_ins: None,
         zero_vec: Vec::new(),
+        zero_val: Vec::new(),
         f32_load: Vec::new(),
         zero_cmp: Vec::new(),
         jt_fix: Vec::new(),
@@ -5161,6 +5347,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     };
     g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
     (g.zero_vec, g.f32_load) = zero_vectors(g.f);
+    g.zero_val = zero_values(g.f, &g.zero_vec);
     g.zero_cmp = zero_compare_consts(g.f);
     if env.opt_regs || g.f.full {
         g.copy_reg = regalloc::copy_reuse(options, g.f, &g.al);
