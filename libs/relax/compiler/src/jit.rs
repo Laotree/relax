@@ -11635,6 +11635,7 @@ fn rt_loop_hot(counter: u64, fp: u64) {
         // LOOP_BIG_CALLERS of them (the sampler's pc + two callers); small frames between them
         // (iterator adaptors, wrappers) are inlined anyway and do not count
         let mut big = 0;
+        let limit = if pgo3_off("walk") { usize::MAX } else { LOOP_BIG_CALLERS };
         for _ in 0..LOOP_CALLERS {
             if fp == 0 || fp % 8 != 0 {
                 break;
@@ -11657,7 +11658,7 @@ fn rt_loop_hot(counter: u64, fp: u64) {
                 }
                 if (*tier_rec(&u.slots, c).add(5)).load(Ordering::Relaxed) & CODE_BYTES > SMALL_CODE {
                     big += 1;
-                    if big >= LOOP_BIG_CALLERS {
+                    if big >= limit {
                         break;
                     }
                 }
@@ -12012,6 +12013,12 @@ pub fn sweep_verdicts() {
     let _ = verified;
 }
 
+/// (PGO3 screening, temporary) MAKEPAD_RUN_PGO3_OFF=walk,stub,o2,rank switches a follow-up off
+fn pgo3_off(k: &str) -> bool {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| std::env::var("MAKEPAD_RUN_PGO3_OFF").unwrap_or_default()).split(',').any(|x| x == k)
+}
+
 /// MAKEPAD_RUN_SPECV_TRACE=1: SPEC-V verdict sweeps (slots turning verified) and twins tiering up,
 /// with the callers whose lowering still calls them.
 fn specv_trace() -> bool {
@@ -12082,12 +12089,12 @@ fn twin_callers(u: &Unit, cands: Option<&[u32]>, twin: Option<u32>) -> TwinCalle
 /// caller's to retier): an O2 build lowers them again; unverified ones have their owners' verdicts
 /// checked first.
 unsafe fn relower_twin_callers(up: *mut Unit, tc: &TwinCallers) {
-    for &c in &tc.below {
+    for &c in tc.below.iter().filter(|_| !pgo3_off("o2")) {
         O2_SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).remove(&(up as usize, c));
         o2_base(up, c);
     }
     let u = &*up;
-    if !tc.unverified.is_empty() {
+    if !tc.unverified.is_empty() && !pgo3_off("rank") {
         let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
         let ranks: Vec<(DefId, Vec<TyId>, u32)> = tc.unverified.iter().filter_map(|&c| Some((u.verdict_owner(c)?, Vec::new(), 0))).collect();
         crate::borrowck::lazy::set_ranks(std::sync::Arc::as_ptr(&u.front) as usize, epoch, &ranks);
@@ -12946,7 +12953,7 @@ fn rt_hot(slot: u64) -> u64 {
             // UI cycles). Its loop counters still queue it; new code (a patch, O2) counts again.
             let w = (*rec.add(5)).load(Ordering::Relaxed);
             let slow = (w >> SLOW_SHIFT) & 0xf;
-            if slow + 1 >= SLOW_RETIRE {
+            if slow + 1 >= SLOW_RETIRE && !pgo3_off("stub") {
                 if s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                     STUBS_RETIRED.fetch_add(1, Ordering::Relaxed);
                 }
