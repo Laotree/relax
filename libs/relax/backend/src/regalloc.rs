@@ -3950,7 +3950,7 @@ fn split_loops(f: &mut Func, spilled: &[bool], inreg: Option<&[bool]>, hot: Opti
             } else {
                 let nbk = f.blocks.len() as u32;
                 let n = ins.len();
-                f.blocks.push(Block { insts: ins, pos: vec![tp; n], term: Term::Jump(header), term_pos: tp });
+                f.blocks.push(Block { insts: ins, pos: vec![tp; n], term: Term::Jump(header), term_pos: tp, count: -1.0 });
                 alias.push(header);
                 // member of the loops holding the header and every entering block, except this one
                 let mut m: Vec<u16> = member[header as usize].iter().copied().filter(|x| *x != li as u16).collect();
@@ -4000,7 +4000,7 @@ fn split_loops(f: &mut Func, spilled: &[bool], inreg: Option<&[bool]>, hot: Opti
             let nbk = f.blocks.len() as u32;
             let tp = f.blocks[to as usize].term_pos;
             let n = per_edge[k].len();
-            f.blocks.push(Block { insts: per_edge[k].clone(), pos: vec![tp; n], term: Term::Jump(to), term_pos: tp });
+            f.blocks.push(Block { insts: per_edge[k].clone(), pos: vec![tp; n], term: Term::Jump(to), term_pos: tp, count: -1.0 });
             alias.push(to);
             let m: Vec<u16> = member[from as usize].iter().copied().filter(|x| member[to as usize].contains(x)).collect();
             for &x in &m {

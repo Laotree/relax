@@ -533,6 +533,29 @@ pub fn cmd_locals(req: &Req, out: &mut Out) {
             let t = u.tcx.tys.erase_regions(u.tcx.tys.subst(l.ty, args));
             ls.push(format!("{{\"name\":{},\"type\":{}}}", json_str(n), json_str(&crate::typeck::ty_to_string(false, &u.prog, &u.tcx, t))));
         }
+        // every level of the inline stack: its fn and line, its named locals (outer levels: the
+        // fn's own locals; a generic fn's instance is the first one found)
+        if let Some(i) = inl {
+            for (k, (name, def, at)) in i.stack.iter().enumerate().skip(1) {
+                let key = match def {
+                    Some(d) => u.fns.iter().find_map(|f| matches!(&f.key, FnKey::Inst(x, _) if x == d).then(|| f.key.clone())),
+                    None => Some(u.fns[slot as usize].key.clone()),
+                };
+                let names = match &key {
+                    Some(FnKey::Inst(d, args)) => {
+                        let b = crate::typeck::instantiate_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, *d, args);
+                        b.locals.iter().filter_map(|l| {
+                            let n = u.prog.syms.str(l.name);
+                            if n.is_empty() || n.starts_with("__") { return None; }
+                            let t = u.tcx.tys.erase_regions(u.tcx.tys.subst(l.ty, args));
+                            Some(format!("{{\"name\":{},\"type\":{}}}", json_str(n), json_str(&crate::typeck::ty_to_string(false, &u.prog, &u.tcx, t))))
+                        }).collect::<Vec<_>>()
+                    }
+                    _ => Vec::new(),
+                };
+                rows.push(format!("{{\"panic\":\"P{}\",\"frame\":{},\"inline_level\":{},\"fn\":{},\"at\":{},\"locals\":[{}]}}", id, chosen, k, json_str(&short(name, 160)), json_str(at), names.join(",")));
+            }
+        }
         rows.push(format!(
             "{{\"panic\":\"P{}\",\"frame\":{},\"fn\":{},\"line\":{}{},\"locals\":[{}],\"values\":{},\"more\":[{}]}}",
             id,

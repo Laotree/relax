@@ -1112,6 +1112,10 @@ pub struct Block {
     pub pos: Vec<u64>,
     pub term: Term,
     pub term_pos: u64,
+    /// how often the block ran in the slot's counted build (PGO: the counted tier's exact
+    /// count of the O3 input block this one came from; copies keep it), negative = unknown.
+    /// A frequency for layout and register allocation only: never a correctness fact.
+    pub count: f32,
 }
 
 #[derive(Clone)]
@@ -1204,18 +1208,55 @@ pub struct Func {
     /// a `#[unsafe(naked)]` fn: its one block is its `naked_asm!` (a noreturn Callee::Asm) and
     /// the backend emits no prologue, no epilogue, nothing but the block
     pub naked: bool,
+    /// The inline stack (`pos_ctx`): context k (1-based) is entry k-1, (the call's position -- its
+    /// own context is the parent's --, a position inside the inlined fn naming it). Machine code
+    /// carries it in its pc map (`inline_pc_entries`).
+    pub inl: Vec<(u64, u64)>,
+}
+
+/// Source positions are `(file << 32) | byte`, with the inline context in bits 48..63 (0: the
+/// function's own body; k: inlined through `Func::inl[k - 1]`). File indices stay below 1 << 16.
+pub const POS_CTX_SHIFT: u32 = 48;
+/// An inline chain deeper / wider than 16 bits: the context is lost (positions still name lines).
+pub const POS_CTX_LOST: u64 = 0xffff;
+
+/// The inline context of a position.
+pub fn pos_ctx(p: u64) -> u64 {
+    p >> POS_CTX_SHIFT
+}
+
+/// A position without its inline context: what names a source place (keys, lookups).
+pub fn pos_plain(p: u64) -> u64 {
+    p & ((1u64 << POS_CTX_SHIFT) - 1)
+}
+
+/// The file index of a position.
+pub fn pos_file(p: u64) -> u32 {
+    ((p >> 32) & 0xffff) as u32
+}
+
+/// `p` with inline context `ctx`.
+pub fn pos_with_ctx(p: u64, ctx: u64) -> u64 {
+    pos_plain(p) | (ctx.min(POS_CTX_LOST) << POS_CTX_SHIFT)
+}
+
+/// The pc-map entries carrying `f`'s inline stack: two per context, at code offset u32::MAX
+/// (after every instruction's entry; a lookup never reaches them): the call position, then the
+/// position naming the inlined fn. Positions both, so caches translate their files as any other.
+pub fn inline_pc_entries(f: &Func) -> impl Iterator<Item = (u32, u64)> + '_ {
+    f.inl.iter().flat_map(|&(call, callee)| [(u32::MAX, call), (u32::MAX, callee)])
 }
 
 impl Func {
     pub fn new(name: String, file: u32) -> Func {
-        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nocapture: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, owned: Vec::new(), nonnull: Vec::new(), ranged: Vec::new(), dyn_calls: Vec::new(), naked: false }
+        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nocapture: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, owned: Vec::new(), nonnull: Vec::new(), ranged: Vec::new(), dyn_calls: Vec::new(), naked: false, inl: Vec::new() }
     }
     pub fn vreg(&mut self, c: Cls) -> VReg {
         self.vregs.push(c);
         VReg(self.vregs.len() as u32 - 1)
     }
     pub fn block(&mut self) -> u32 {
-        self.blocks.push(Block { insts: Vec::new(), pos: Vec::new(), term: Term::Unreachable, term_pos: 0 });
+        self.blocks.push(Block { insts: Vec::new(), pos: Vec::new(), term: Term::Unreachable, term_pos: 0, count: -1.0 });
         self.blocks.len() as u32 - 1
     }
     pub fn slot(&mut self, size: u32, align: u32) -> u32 {
