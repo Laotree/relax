@@ -8,12 +8,19 @@
 //! and lines of JIT frames ask the owner (Job class: served inside its pumps too), with a short
 //! timeout after which the reply says what it could not resolve.
 
+pub mod answer;
+pub mod asm;
+pub(crate) use asm::plain_name as asm_plain;
+pub mod calltree;
 pub mod client;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod cfi;
 pub mod codever;
+pub mod counters;
 pub mod eval;
 pub mod events;
+pub mod experiments;
+pub mod flightrec;
 pub mod gpuprof;
 mod hang;
 pub mod heap;
@@ -21,8 +28,17 @@ pub mod instrument;
 pub mod patches;
 pub mod probes;
 pub mod mem;
+pub mod natbin;
 mod prof;
+pub mod pf;
+pub mod pstream;
+pub mod reliability;
+pub mod remarks;
+pub mod replay;
 pub mod timeline;
+pub mod vars;
+pub mod vsnative;
+pub mod watch;
 pub(crate) mod symbols;
 pub mod threads;
 
@@ -42,6 +58,8 @@ pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
     patches::scan_kept(a);
     probes::scan_kept(a);
     codever::scan_kept(a);
+    remarks::scan_kept(a);
+    watch::scan_kept(a);
 }
 
 /// The inspect thread runs (a socket is listening).
@@ -83,7 +101,11 @@ pub fn start(app: &str) {
     // SPEC-V: every answer says whether the code it observed has its borrow-check verdict
     endpoint.set_end_fields(|s| s.push_str(if crate::reload::observations_verified() { ",\"verified\":true" } else { ",\"verified\":false" }));
     let _ = WATCH.set(endpoint.register_watch_with(events::remote_watcher_opened, events::remote_watcher_closed));
+    pstream::register(&endpoint);
     serve_first_services(&endpoint);
+    for (name, version, factory) in HOST_SERVICES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        endpoint.register(name, *version, factory.clone());
+    }
     *ENDPOINT.lock().unwrap_or_else(|e| e.into_inner()) = Some(endpoint.clone());
     let sock = match endpoint.listen_unix(&extra) {
         Ok(s) => s,
@@ -95,6 +117,7 @@ pub fn start(app: &str) {
     eprintln!("makepad-remote: pid {} app {} socket {} (makepad inspect {} help)", pid, app, sock.display(), pid);
     events::start();
     timeline::hitch_init();
+    flightrec::init();
     if AGENT.load(Relaxed) {
         timeline::set_frame_watch(true);
     }
@@ -106,8 +129,10 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("session", "relaunch", "restart the app domain in this process, keeping its host window and GPU device"),
     ("why-hung", "[probe_ms=200]", "is it stuck and why: verdict (deadlock / blocked / busy / idle), the wait chain or cycle, stacks of the threads in it"),
     ("why-slow", "[s=3]", "where the time goes: ranked findings -- the main thread's CPU split (program / compiles / makepad run runtime / system), its hot fns, the owner's service, other busy threads"),
-    ("prof", "[s=3] [hz=200] [threads=all|main|owner|program|compiler|<name>] [n=15] [save=1]", "sampling CPU profile of JIT and host frames: per-thread CPU, activity split, top fns by self time with their hottest line, inclusive fns; save=1 writes folded stacks"),
-    ("timeline", "start [max_s=30] | stop | frames [n=30] | frame <n|slowest> | save", "dataflow timeline: record UI phases, owner service, waits and wakes; per frame the critical path, work vs critical path vs wall, longest waits and who ended them; save = Chrome trace JSON"),
+    ("prof", "[s=3] [hz=200] [threads=all|main|owner|program|compiler|<name>] [ev=cpu|cycles|instructions|branch-misses|cache-misses] [view=top|tree|callers|flame] [focus=<fn>] [fn=<fn>] [min=1] [n=15] [save=1]", "sampling profile of JIT and host frames: per-thread CPU, activity split, top fns by self time with their hottest line, inclusive fns; view=tree: the call tree with the JIT's inline levels as frames and each frame's tier (focus= re-roots at a fn, view=callers fn= inverts); save=1 / view=flame writes folded stacks; ev= samples a hardware event (Linux)"),
+    ("pf", "<summary|frames|frame F<n>|top cpu|jit|gpu|hitches|timeline F<n>|lanes|why-slow|diff> [s=3] [save=x.mkpf] [base=y.mkpf]", "the profiler for agents: the client records the app's live `prof` stream (lanes, phases, waits, compile jobs, JIT installs with tiers, GPU passes) for s seconds and answers as compact text: finding first, tables, drill-down ids; file=<x.mkpf> pf ... answers on a recording"),
+    ("rec", "status | save [last=60s|5m|all] [path=<file>] | mark <text> | on | off | replay (file=<x.mkpf>: client side)", "the flight recorder (always on, bounded memory): the last minutes of frames, every thread's spans and waits, the owner's requests with requester and call site, JIT installs, events (app marks, logs, panics, script errors, hitches, zone swaps), input; save = a .mkpf recording for `pf` queries and Scope; automatic recordings on a hitch over 1 s, a panic, a fatal fault"),
+    ("timeline", "start [max_s=30] | stop | frames [n=30] | frame <n|slowest> | waits [s=3] [n=15] | save", "dataflow timeline: record UI phases, owner service, waits and wakes; per frame the critical path, work vs critical path vs wall, longest waits and who ended them; waits = contention by what was waited on; save = a .mkpf profile recording (Scope, `pf` queries)"),
     ("watch", "[on=panic,hang,...] [since=<seq>] [timeout_s=N]", "block until the next event (panic, hang, ...) and answer it as one JSON line; re-arm with since=<seq>"),
     ("events", "[follow=1] [since=<seq>] [on=...]", "the recent events (follow=1: stream one JSON line per new event)"),
     ("panics", "", "panics parked now, waiting for a decision"),
@@ -115,11 +140,17 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("memory", "[compiler=1] [n=24]", "where the memory is and why: RSS by mapping kind, malloc in use vs held free, makepad run's own parts, findings, growth since the last `memory`"),
     ("diff", "<snap a> <snap b|now>", "memory growth between two snapshots, largest first"),
     ("mem", "snap <name> | timeline [from_ms= to_ms=]", "keep a named memory snapshot; resident size over time with phase markers and the peak's phase"),
-    ("heap", "start [rate=65536] [ttl_s=600] | top [by=live|alloc|freed|peak] | snap <name> | diff <a> <b|now> | path H<id> | stop | status", "program heap by allocation stack (JIT-patched allocator hooks, byte-sampled): live, allocated, freed; growth and leaks between snapshots"),
+    ("heap", "start [rate=65536] [ttl_s=600] | top [by=live|alloc|freed|peak] | frame [s=2] [n=12] | snap <name> | diff <a> <b|now> | path H<id> | stop | status", "program heap by allocation stack (JIT-patched allocator hooks, byte-sampled): live, allocated, freed; growth and leaks between snapshots"),
     ("top", "by=time|alloc|bytes|live [s=3] [n=15]", "the top functions by CPU time (prof) or allocation sites by allocated / live bytes (heap)"),
     ("frame", "<n|slowest>", "one frame of the last timeline: UI phases, critical path, waits and who ended them (alias of timeline frame)"),
     ("path", "<H<n>|R<n>>", "the full stack of a heap site id"),
     ("count", "<fn> [time=1] [tier=o1]", "exact call counts (and inclusive time) of every slot of a fn: its code is rebuilt with probes at the tier of the code it replaces (O3 code gets an O3 instrumented build; tier=o1 asks for O1) and installed as a probe group G<n>; every slot whose code holds an inlined copy of the fn is rebuilt at its tier without that inlining, so it calls the counted code; each row names the code version replaced and the one now, later installs with an inlined copy are rebuilt too (a `probe` event)"),
+    ("asm", "<fn|@slot> [vs=rustc] [native=<binary>] [s=2] [ev=cpu|cycles|instructions|branch-misses|cache-misses] [view=summary|lines|listing|code] [line=<n>] | top vs=rustc [s=3] [n=15]", "the JIT's machine code of a fn next to rustc's for the same fn (native=: a release build with line tables), aligned by source line, with CPU samples and PGO counts per line and a diff summary first: excess instructions, spill traffic, kept bounds checks, calls rustc inlined, loops rustc vectorised; `asm top vs=rustc` ranks the hottest fns by the time their excess instructions cost"),
+    ("vsnative", "[native=<bin>] [args=a,b] [s=5] [warm_ms=3000] [ev=instructions|cycles|cpu] [n=20]", "the program's rustc release build run next to this process for the same window, both sampled with the same event, diffed per fn: events/s here and native, ratio, shares, the JIT tier (Linux)"),
+    ("ab", "<fn|@slot> b=<base|o1|opt:<tok>,..|inline:<callee>|noinline:<callee>> [a=base] [rounds=5] [s=1] [metric=incl|self] [per=s|frame|call] [ev=cpu|cycles|instructions] [keep=a|b]", "a live A/B of one fn: the variants' builds installed in turn (ABAB rounds), each round's cost rate of the fn measured alike; answer: medians, spread, permutation-test p, verdict (real / no difference beyond noise)"),
+    ("contention", "[s=3] [n=15]", "lock / condvar / park / owner waits grouped by what was waited on: total and longest wait, per frame, waiting threads, who ended them (records s seconds of timeline first; alias of timeline waits)"),
+    ("counters", "[s=1] [n=12]", "hardware counters over a window: Linux per thread (cycles, instructions, IPC, branch and cache misses); macOS the process's instructions and cycles (all a non-root process gets)"),
+    ("remarks", "<fn|@slot> [n=20]", "the O3 tier's optimisation remarks for the fn: every call its last O3 build kept (hot sites first) and why (no rule, budget, growth ceiling, cold, recursive, no body) with the numbers, and the tiers of its code"),
     ("versions", "<fn|file:line>", "every code version of the fn: per slot its installed, replaced and retired code (tier baseline/O1/O2/O3/O3-guarded/instrumented, origin fresh/warm-cache/warm-image/live-patch/inspect, address, patch generation, cache key and build), which threads run in which, and the slots whose code holds an inlined copy of it"),
     ("tier", "<fn|file:line> o1|o3|auto [fresh=1] | (none: the pins)", "pins the fn and every slot that inlined it to a tier in the live process (A/B a suspected miscompile): o1 = O1 code generation, kept until `tier <fn> auto`; o3 = the o1 pin goes and they get O3 builds now (fresh=1: rebuild O3 code even where it runs, e.g. warm-cache code)"),
     ("break", "<fn>|<file>:<line> [tier=o1]", "breakpoint: a hit parks the thread at the call (stack intact) and raises a `break` event K<n>"),
@@ -127,7 +158,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("probe", "add <fn|file:line> <probe.rs|code> [mutate=1] [tier=o1] | list | read P<n> | rm <P<n>|all>", "injected Rust probes: your `fn probe(<the hooked fn's params>)` runs at the hook, compiled as a child module of the hooked fn's module (its private items, `use`s and `crate::` paths are in scope); std::relax::probe::{emit, count, hist, sample, pause} record for it. A fn is named by its path: `krate::Type::method`, `Type::method`, `crate::Type::method`, `<Type as Trait>::method`"),
     ("eval", "[in=<krate::module>] [panic=P<n>] [mutate=1] <expr>", "evaluates a Rust expression in a module's scope (default: a parked panic's innermost program frame) in the app's domain: its type and {:#?} (bytes when not Debug); reads only unless mutate=1"),
     ("static", "<krate::module::NAME> [debug=1]", "a static's address, type and bytes in the app's domain; a reference or pointer is followed to its target allocation, with whether what it describes fits there"),
-    ("locals", "[panic=P<n>] [frame=N]", "a parked panic's frames; frame N's fn, line and named locals with their types, and the by-name probe that reads their values"),
+    ("locals", "[panic=P<n>|break=K<n>|thread=T<n>] [frame=N]", "a stop's frames (a parked panic, a breakpoint hit, a paused thread); per frame and inline level its fn, line and named locals with their VALUES where the code keeps them at that call ({:#?}, else bytes; 'optimised out' where it does not)"),
     ("probes", "[since=<seq>]", "installed probes and counts with hits and time, parked breakpoints, pause state; each answer is snapshot <seq>: since=<seq> gives every counter's change, rate and started / stopped since then"),
     ("hitch", "[ms=<n>|off]", "frames over the threshold (default 50 ms, always on) are `hitch` events with phases, waits, lazy compiles, critical path and probe deltas: `events on=hitch`, `watch on=hitch`"),
     ("rm", "<G<n>|all>", "removes probe groups: the code they replaced comes back (no recompile)"),
@@ -136,6 +167,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("resume", "", "after pause: the program runs again (`resume P<n> panic` releases a parked panic)"),
     ("gpu", "[top [by=bytes|owner|site|churn] [n=15]|idle [frames=1800] [n=15]|snap <name>|diff <a> <b|now>|path <session>:<kind>:<index>:<generation>]", "HAL GPU memory: totals per session, kind and owner against the device (native apps: MAKEPAD_INSPECT=1 or MAKEPAD_REMOTE=1)"),
     ("hal", "pump", "HAL pump loop per session: turns and wake causes, totals and per second since the last call (an idle app shows none)"),
+    ("writes", "<Type::field> | (none: the watches) | W<n> [n=20] | rm <W<n>|all>", "who writes a struct field: the compiled fns that assign `x.field` (`=`, `op=`) are rebuilt to record every write: its site (fn, file:line), the value written and the field's address; `writes W<n>` reads the sites and the latest writes"),
     ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
     ("threads", "", "every thread: name, role, state, CPU time, what it waits on"),
     ("stacks", "[thread=<name|tid|main|owner|all>] [depth=12]", "symbolised stacks (identical stacks folded)"),
@@ -157,12 +189,23 @@ fn dispatch_command(req: &Req, out: &mut Out) {
     match req.cmd.as_str() {
         "session" => match req.pos.first().map(String::as_str) {
             Some("relaunch") => match crate::run::relaunch() {
-                Ok(()) => out.line(&format!("{{\"relaunch\":\"queued\",\"pid\":{},\"window_kept\":true}}", std::process::id())),
+                Ok(()) => {
+                    crate::reload::clear_restart_pending();
+                    out.line(&format!("{{\"relaunch\":\"queued\",\"pid\":{},\"window_kept\":true}}", std::process::id()))
+                }
                 Err(e) => out.err(&e),
             },
-            _ => out.err("session relaunch"),
+            None | Some("pending") => {
+                let p = crate::reload::restart_pending();
+                out.line(&format!("{{\"restart_pending\":{},\"note\":\"edits that cannot apply live wait here; the app runs the code before them until `session relaunch`\"}}", p.len()));
+                for w in p {
+                    out.line(&format!("{{\"waits\":{}}}", json_str(&w)));
+                }
+            }
+            _ => out.err("session [pending] | session relaunch"),
         },
         "help" => help(req, out),
+        "pf" => out.err("pf is answered by the client: makepad inspect <app> pf <query> (it attaches to the app's prof stream)"),
         "ping" => out.line(&format!("{{\"pid\":{},\"app\":{},\"ms\":{}}}", std::process::id(), json_str(&APP.lock().unwrap()), now_ms())),
         "threads" => cmd_threads(out),
         "stacks" => cmd_stacks(req, out),
@@ -173,9 +216,11 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "prof" => prof::cmd_prof(req, out),
         "timeline" => timeline::cmd_timeline(req, out),
         "hitch" => timeline::cmd_hitch(req, out),
+        "rec" => flightrec::cmd(req, out),
         // question-shaped aliases (DESIGN.md §2.1)
         "frame" => timeline::cmd_timeline(&shifted(req, "frame"), out),
         "frames" => timeline::cmd_timeline(&shifted(req, "frames"), out),
+        "contention" => timeline::cmd_timeline(&shifted(req, "waits"), out),
         "top" => match req.get("by").unwrap_or("time") {
             "time" | "cpu" => prof::cmd_prof(req, out),
             "alloc" | "bytes" | "live" | "churn" => heap::cmd_heap(&shifted(&with_by(req), "top"), out),
@@ -191,12 +236,18 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "heap" => heap::cmd_heap(req, out),
         "vms" => cmd_vms(out),
         "versions" => codever::cmd_versions(req, out),
+        "asm" => asm::cmd_asm(req, out),
+        "remarks" => remarks::cmd_remarks(req, out),
+        "counters" => counters::cmd_counters(req, out),
+        "ab" => experiments::cmd_ab(req, out),
+        "vsnative" => vsnative::cmd_vsnative(req, out),
         "tier" => codever::cmd_tier(req, out),
         // Host-native providers outlive app domains and never enter program code.
         _ if cmd_host_provided(req, out) => {},
         // Commands the program registered (`relax_register_inspect`), scoped to its domain.
         c if provider(c).is_some() => cmd_provided(req, out),
         "probe" => probes::cmd(req, out),
+        "writes" => watch::cmd(req, out),
         "eval" => eval::cmd_eval(req, out),
         "static" => eval::cmd_static(req, out),
         "locals" => eval::cmd_locals(req, out),
@@ -235,7 +286,8 @@ fn help(req: &Req, out: &mut Out) {
         return;
     }
     out.measured("commands", "static", &[]);
-    for (name, args, what) in COMMANDS.iter().chain(makepad_gpu_trace::query::COMMANDS) {
+    let host = host_commands();
+    for (name, args, what) in COMMANDS.iter().chain(makepad_gpu_trace::query::COMMANDS).chain(host.iter()) {
         if let Some(w) = req.pos.first() {
             if w != name {
                 continue;
@@ -248,7 +300,8 @@ fn help(req: &Req, out: &mut Out) {
 /// A tool definition for agent / MCP-style clients: one tool, `relax_inspect`, whose `command`
 /// is one line of this protocol.
 pub fn schema() -> String {
-    let cmds: Vec<String> = COMMANDS.iter().chain(makepad_gpu_trace::query::COMMANDS).map(|(n, a, w)| format!("{} {} -- {}", n, a, w)).collect();
+    let host = host_commands();
+    let cmds: Vec<String> = COMMANDS.iter().chain(makepad_gpu_trace::query::COMMANDS).chain(host.iter()).map(|(n, a, w)| format!("{} {} -- {}", n, a, w)).collect();
     format!(
         "{{\"name\":\"relax_inspect\",\"description\":{},\"input_schema\":{{\"type\":\"object\",\"properties\":{{\"target\":{{\"type\":\"string\",\"description\":\"pid, app name, or all\"}},\"command\":{{\"type\":\"string\",\"description\":\"one request line, e.g. `why-hung` or `stacks thread=main`\"}}}},\"required\":[\"target\",\"command\"]}}}}",
         json_str(&format!("Ask a running makepad app about itself. Run as `makepad inspect <target> <command>`. Commands:\n{}", cmds.join("\n")))
@@ -269,8 +322,10 @@ fn role(name: &str, os_id: u64, handle: u64) -> &'static str {
     let _ = os_id;
     match name {
         n if n.starts_with("run-inspect") || n.starts_with("makepad-remote") => "inspect",
-        n if n.starts_with("run-spec") || n.starts_with("run-O2") || n.starts_with("run-o3") || n.starts_with("run-ahead") || n == "gandalf" || n.starts_with("run-check") => "compiler",
+        n if n.starts_with("run-spec") || n.starts_with("run-O2") || n.starts_with("run-o3") || n.starts_with("run-ahead") || n.starts_with("gandalf") || n.starts_with("run-check") => "compiler",
         n if n.starts_with("run-") => "makepad run",
+        // an unnamed thread: the OS's dispatch workers, or a program thread spawned without a name
+        "" => "unnamed",
         _ => "program",
     }
 }
@@ -362,7 +417,7 @@ pub mod capture {
         }
         let ms = crate::clock::wall_ns().saturating_sub(SINCE_NS.load(Relaxed)) / 1_000_000;
         let doing = super::activity::describe(h).map(|d| format!(": {}", d)).unwrap_or_default();
-        Some(format!("capture lock held for {} by T{} for {:.1} s{}", super::activity::unpack(WHAT.load(Relaxed)), h, ms as f64 / 1000.0, doing))
+        Some(format!("capture lock held for {} by {} for {:.1} s{}", super::activity::unpack(WHAT.load(Relaxed)), super::tid_label(h), ms as f64 / 1000.0, doing))
     }
 }
 
@@ -457,7 +512,7 @@ pub mod activity {
         let ph = unpack(s.phase.load(Relaxed));
         let pms = now.saturating_sub(s.phase_ns.load(Relaxed)) / 1_000_000;
         let d = s.detail.load(Relaxed);
-        let on = if d != 0 { format!(" T{}", d) } else { String::new() };
+        let on = if d != 0 { format!(" {}", super::tid_label(d)) } else { String::new() };
         let mut t = format!("{} for {:.1} s; now: {}{} for {} ms", cmd, since, ph, on, pms);
         if ph == "waiting for the owner" {
             t.push_str(&format!(" (owner serves {})", crate::owner::serving_note()));
@@ -508,6 +563,11 @@ pub struct Frame {
     pub module: String,
     /// JIT frames: the code version as a JSON object (codever::frame_fields); else empty
     pub code: String,
+    /// JIT frames: the slot whose code it is (the physical fn)
+    pub slot: Option<u32>,
+    /// an inlined copy: its logical frames, innermost first, ending with the physical fn at the
+    /// call site (fn, file:line:col); empty for a fn's own code
+    pub levels: Vec<(String, String)>,
 }
 
 /// Names for raw pcs: JIT frames by the unit (one owner Job request; on timeout `slot#id+off`),
@@ -539,12 +599,12 @@ pub fn symbolise_within(frames: &[Vec<u64>], partial: &mut Vec<String>, ms: u64)
                 .map(|(i, &pc)| {
                     let look = if i == 0 { pc } else { pc.wrapping_sub(1) };
                     if let Ok(k) = jit_pcs.binary_search(&look) {
-                        let (name, at, tier, code) = names[k].clone();
-                        Frame { pc, name, at, module: tier, code }
+                        let n = names[k].clone();
+                        Frame { pc, name: n.name, at: n.at, module: n.module, code: n.code, slot: n.slot, levels: n.levels }
                     } else {
                         match symbols::host_symbol(look) {
-                            Some((name, module, _)) => Frame { pc, name, at: String::new(), module, code: String::new() },
-                            None => Frame { pc, name: format!("{:#x}", pc), at: String::new(), module: "?".into(), code: String::new() },
+                            Some((name, module, _)) => Frame { pc, name, at: String::new(), module, code: String::new(), slot: None, levels: Vec::new() },
+                            None => Frame { pc, name: format!("{:#x}", pc), at: String::new(), module: "?".into(), code: String::new(), slot: None, levels: Vec::new() },
                         }
                     }
                 })
@@ -553,13 +613,33 @@ pub fn symbolise_within(frames: &[Vec<u64>], partial: &mut Vec<String>, ms: u64)
         .collect()
 }
 
+/// A JIT pc's frame fields.
+#[derive(Clone)]
+struct JitName {
+    name: String,
+    at: String,
+    module: String,
+    code: String,
+    slot: Option<u32>,
+    levels: Vec<(String, String)>,
+}
+
+impl JitName {
+    fn of(t: (String, String, String, String), slot: Option<u32>, levels: Vec<(String, String)>) -> JitName {
+        JitName { name: t.0, at: t.1, module: t.2, code: t.3, slot, levels }
+    }
+    fn unknown(pc: u64) -> JitName {
+        JitName::of((format!("jit {:#x}", pc), String::new(), "jit".into(), String::new()), None, Vec::new())
+    }
+}
+
 /// (name, file:line:col, module label, code version JSON) of JIT pcs: the code version (slot,
 /// tier, origin, address, installed / replaced / retired) and, for a pc in an inlined copy, the
-/// inlined fn's name with "inlined into <slot>".
-fn jit_names(pcs: &[u64], partial: &mut Vec<String>, ms: u64) -> Vec<(String, String, String, String)> {
+/// inlined fn's name with "inlined into <slot>" and its logical frames.
+fn jit_names(pcs: &[u64], partial: &mut Vec<String>, ms: u64) -> Vec<JitName> {
     let up = crate::jit::current_unit();
     if pcs.is_empty() || up.is_null() {
-        return pcs.iter().map(|pc| (format!("jit {:#x}", pc), String::new(), "jit".into(), String::new())).collect();
+        return pcs.iter().map(|&pc| JitName::unknown(pc)).collect();
     }
     let pcs_v = pcs.to_vec();
     activity::phase("waiting for the owner", 0);
@@ -570,8 +650,11 @@ fn jit_names(pcs: &[u64], partial: &mut Vec<String>, ms: u64) -> Vec<(String, St
         pcs_v
             .iter()
             .map(|&pc| match codever::describe_pc(u, &mut res, pc) {
-                Some(c) => codever::frame_fields(u, &c),
-                None => (format!("jit {:#x}", pc), String::new(), "jit".into(), String::new()),
+                Some(c) => {
+                    let levels = c.inlined.as_ref().map(|i| i.stack.iter().map(|(n, _, at)| (n.clone(), at.clone())).collect()).unwrap_or_default();
+                    JitName::of(codever::frame_fields(u, &c), Some(c.slot), levels)
+                }
+                None => JitName::unknown(pc),
             })
             .collect::<Vec<_>>()
     });
@@ -582,7 +665,7 @@ fn jit_names(pcs: &[u64], partial: &mut Vec<String>, ms: u64) -> Vec<(String, St
             // the code index is a leaf lock: slot ids and code versions without the owner
             let u = unsafe { &*up };
             pcs.iter()
-                .map(|&pc| codever::frame_fields_no_owner(u, pc).unwrap_or_else(|| (format!("jit {:#x}", pc), String::new(), "jit".into(), String::new())))
+                .map(|&pc| codever::frame_fields_no_owner(u, pc).map(|t| JitName::of(t, None, Vec::new())).unwrap_or_else(|| JitName::unknown(pc)))
                 .collect()
         }
     }
@@ -624,6 +707,18 @@ pub(crate) fn staged_path(name: &str) -> String {
     dir.join(name).to_string_lossy().into_owned()
 }
 
+/// A frame of Relax's std / core (by its fn path; the line table of generated std glue can point
+/// anywhere), not the program's.
+pub(crate) fn is_std_fn(name: &str) -> bool {
+    let n = name.strip_prefix("{closure} in ").unwrap_or(name).trim_start_matches('<');
+    ["core::", "std::", "alloc::"].iter().any(|p| n.starts_with(p))
+}
+
+/// The program's own JIT frame: not std, not a JIT trampoline, not an unidentified inline level.
+pub(crate) fn is_program_frame(f: &Frame) -> bool {
+    f.module.starts_with("jit") && !is_std_fn(&f.name) && !f.name.starts_with("jit 0x") && !f.name.starts_with("(inlined") && !f.name.starts_with("slot#")
+}
+
 /// One frame as a short JSON object.
 pub fn frame_json(f: &Frame) -> String {
     let code = if f.code.is_empty() { String::new() } else { format!(",\"code\":{}", f.code) };
@@ -645,13 +740,54 @@ pub fn short(s: &str, n: usize) -> String {
     format!("{}..", &s[..k])
 }
 
+/// Short thread ids (`T3`): numbered in the order inspect first saw each thread (the threads alive
+/// at the first answer in OS id order, so main is T1), stable for the life of the process. Every
+/// answer names threads by them and every `thread=` argument takes them.
+static TIDS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+fn tid_index(os_id: u64) -> usize {
+    let mut t = TIDS.lock().unwrap_or_else(|e| e.into_inner());
+    if t.is_empty() {
+        let mut all: Vec<u64> = threads::list().iter().map(|x| x.os_id).collect();
+        all.sort_unstable();
+        // the process's first thread first (Linux: os id == pid)
+        let pid = std::process::id() as u64;
+        if let Some(i) = all.iter().position(|&x| x == pid) {
+            all.remove(i);
+            all.insert(0, pid);
+        }
+        *t = all;
+    }
+    match t.iter().position(|&x| x == os_id) {
+        Some(i) => i + 1,
+        None => {
+            t.push(os_id);
+            t.len()
+        }
+    }
+}
+
+/// `T<n>` of an OS thread id.
+pub fn tid_label(os_id: u64) -> String {
+    format!("T{}", tid_index(os_id))
+}
+
+/// The OS thread id a `T<n>` names (None: not a thread id inspect gave out).
+pub fn tid_of(label: &str) -> Option<u64> {
+    let n: usize = label.strip_prefix('T')?.parse().ok()?;
+    if TIDS.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        tid_index(0);
+    }
+    TIDS.lock().unwrap_or_else(|e| e.into_inner()).get(n.checked_sub(1)?).copied()
+}
+
 /// The thread a registry handle names, as a short label.
 pub fn thread_label(handle: u64, threads: &[threads::Thread]) -> String {
     if handle == 0 {
         return "?".into();
     }
     match threads.iter().find(|t| t.handle == handle) {
-        Some(t) => format!("{} (T{})", if t.name.is_empty() { "-" } else { &t.name }, t.os_id),
+        Some(t) => format!("{} ({})", if t.name.is_empty() { "-" } else { &t.name }, tid_label(t.os_id)),
         None => format!("thread {:#x}", handle),
     }
 }
@@ -684,8 +820,8 @@ fn cmd_threads(out: &mut Out) {
             wait.push_str(&format!(",\"inspect\":{}", json_str(&d)));
         }
         out.line(&format!(
-            "{{\"id\":\"T{}\",\"name\":{},\"role\":\"{}\",\"state\":\"{}\",\"cpu_ms\":{}{}}}",
-            t.os_id,
+            "{{\"id\":\"{}\",\"name\":{},\"role\":\"{}\",\"state\":\"{}\",\"cpu_ms\":{}{}}}",
+            tid_label(t.os_id),
             json_str(&t.name),
             role(&t.name, t.os_id, t.handle),
             t.state,
@@ -696,22 +832,33 @@ fn cmd_threads(out: &mut Out) {
 }
 
 pub fn wait_text(w: &crate::waits::Wait, list: &[threads::Thread]) -> String {
-    let ms = crate::clock::wall_ns().saturating_sub(w.since_ns) / 1_000_000;
+    let ms_n = crate::clock::wall_ns().saturating_sub(w.since_ns) / 1_000_000;
+    // "for 812 ms", "for 40.9 s"
+    let ms = if ms_n >= 10_000 { format!("{:.1} s", ms_n as f64 / 1000.0) } else { format!("{} ms", ms_n) };
     let kind = crate::waits::KIND_NAMES[w.kind as usize];
     match w.kind {
-        crate::waits::Kind::Futex => format!("{} {:#x} for {} ms", if w.label.is_empty() { "futex" } else { w.label }, w.object, ms),
-        crate::waits::Kind::Owner => format!("owner ({} request) for {} ms; owner serves {}", w.label, ms, crate::owner::serving_note()),
-        _ => format!("{} held by {} for {} ms", kind, thread_label(w.holder, list), ms),
+        crate::waits::Kind::Futex => {
+            // a mutex names its holder by a stack page: the thread whose stack holds it
+            let page = (w.holder >> 1) & 0x3fff_ffff;
+            let held = (w.holder != 0)
+                .then(|| list.iter().find(|t| t.stack.0 != 0 && (t.stack.0 >> 12..=t.stack.1 >> 12).any(|p| p & 0x3fff_ffff == page)))
+                .flatten()
+                .map(|t| format!(" held by {} ({})", if t.name.is_empty() { "-" } else { &t.name }, tid_label(t.os_id)))
+                .unwrap_or_default();
+            format!("{} {:#x}{} for {}", if w.label.is_empty() { "futex" } else { w.label }, w.object, held, ms)
+        }
+        crate::waits::Kind::Owner => format!("owner ({} request) for {}; owner serves {}", w.label, ms, crate::owner::serving_note()),
+        _ => format!("{} held by {} for {}", kind, thread_label(w.holder, list), ms),
     }
 }
 
-fn pick_threads(sel: &str) -> Box<dyn Fn(&threads::Thread) -> bool> {
+pub(crate) fn pick_threads(sel: &str) -> Box<dyn Fn(&threads::Thread) -> bool> {
     let sel = sel.to_string();
     Box::new(move |t: &threads::Thread| match sel.as_str() {
         "all" | "" => true,
         "main" => t.handle != 0 && t.handle == crate::jit::MAIN_TID.load(Relaxed) || t.os_id == std::process::id() as u64,
         "owner" => t.handle != 0 && t.handle == crate::owner::owner_tid(),
-        s => s.trim_start_matches('T').parse::<u64>().map_or(false, |id| id == t.os_id) || t.name.starts_with(s),
+        s => tid_of(s).is_some_and(|id| id == t.os_id) || t.name.starts_with(s),
     })
 }
 
@@ -736,7 +883,7 @@ fn cmd_stacks(req: &Req, out: &mut Out) {
         }
     }
     for (key, members) in &groups {
-        let names: Vec<String> = members.iter().map(|&i| json_str(&format!("{} (T{})", caps[i].t.name, caps[i].t.os_id))).collect();
+        let names: Vec<String> = members.iter().map(|&i| json_str(&format!("{} ({})", caps[i].t.name, tid_label(caps[i].t.os_id)))).collect();
         let c = &caps[members[0]];
         let mut err = c.err.map(|e| format!(",\"err\":{}", json_str(e))).unwrap_or_default();
         if c.t.handle != 0 && instrument::stopped(&c.t) {
@@ -754,7 +901,7 @@ fn cmd_waits(out: &mut Out) {
     // inspect's own command threads (a stuck command says on what) and the capture lock
     for (tid, d) in activity::all() {
         let name = list.iter().find(|t| t.os_id == tid).map(|t| t.name.as_str()).unwrap_or("makepad-remote-cmd");
-        out.line(&format!("{{\"thread\":{},\"inspect\":{}}}", json_str(&format!("{} (T{})", name, tid)), json_str(&d)));
+        out.line(&format!("{{\"thread\":{},\"inspect\":{}}}", json_str(&format!("{} ({})", name, tid_label(tid))), json_str(&d)));
     }
     if let Some(h) = capture::holder_note() {
         out.line(&format!("{{\"capture_lock\":{}}}", json_str(&h)));
@@ -823,10 +970,64 @@ static HOST_PROVIDERS: Mutex<Vec<(&'static str, HostQuery)>> = Mutex::new(Vec::n
 
 /// Registers a process-lifetime provider (for example the HAL's GPU ledger). The loader calls
 /// this before starting inspect or any app; domain teardown only removes program providers.
+/// A binary service the host itself serves on the inspect socket (the HAL's `gpuprof` stream),
+/// registered before or after the endpoint starts.
+pub fn register_host_service(name: &'static str, version: u32, factory: makepad_remote::endpoint::Factory) {
+    HOST_SERVICES.lock().unwrap_or_else(|e| e.into_inner()).push((name, version, factory.clone()));
+    if let Some(ep) = ENDPOINT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        ep.register(name, version, factory);
+    }
+}
+
+static HOST_SERVICES: std::sync::Mutex<Vec<(&'static str, u32, makepad_remote::endpoint::Factory)>> = std::sync::Mutex::new(Vec::new());
+
 pub fn register_host_inspect(name: &'static str, query: HostQuery) {
     let mut providers = HOST_PROVIDERS.lock().unwrap_or_else(|e| e.into_inner());
     providers.retain(|(n, _)| *n != name);
     providers.push((name, query));
+}
+
+/// Command tables of host providers (`help` and `schema` list them with the built-in ones).
+type CommandTable = &'static [(&'static str, &'static str, &'static str)];
+static HOST_COMMANDS: Mutex<Vec<CommandTable>> = Mutex::new(Vec::new());
+
+/// Registers the command table of a host provider for `help` / `schema`.
+pub fn register_host_commands(table: CommandTable) {
+    let mut t = HOST_COMMANDS.lock().unwrap_or_else(|e| e.into_inner());
+    if !t.iter().any(|x| std::ptr::eq(*x, table)) {
+        t.push(table);
+    }
+}
+
+fn host_commands() -> Vec<(&'static str, &'static str, &'static str)> {
+    HOST_COMMANDS.lock().unwrap_or_else(|e| e.into_inner()).iter().flat_map(|t| t.iter().copied()).collect()
+}
+
+/// `makepad inspect file=<path> <cmd> ...` for a file a host provider reads (a frame capture):
+/// the provider of `<cmd>` answers with `file=<path>` added; None when no provider has `<cmd>`.
+pub fn host_file_query(path: &str, words: &[String]) -> Option<i32> {
+    let cmd = words.first()?;
+    if !HOST_PROVIDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(n, _)| n == cmd) {
+        return None;
+    }
+    let line = format!("{} file={}", words.join(" "), path);
+    fn dispatch(req: &Req, out: &mut Out) {
+        if !cmd_host_provided(req, out) {
+            out.err("no provider answered");
+        }
+    }
+    let (bytes, _) = makepad_remote::cmd::answer(dispatch, &line);
+    let text = String::from_utf8_lossy(&bytes);
+    print!("{text}");
+    Some(if text.lines().any(|l| l.starts_with("{\"err\":")) { 1 } else { 0 })
+}
+
+/// Answers `req` with the host provider of command `name` (the Splash VM's `sprobe` for a
+/// `probe` on a .splash line); false when the host has none or it did not answer.
+pub(crate) fn host_query(name: &str, req: &Req, out: &mut Out) -> bool {
+    let query = HOST_PROVIDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(n, _)| *n == name).map(|(_, query)| *query);
+    let r = Req { cmd: name.to_string(), pos: req.pos.clone(), kv: req.kv.clone() };
+    query.is_some_and(|query| query(&r, out))
 }
 
 fn cmd_host_provided(req: &Req, out: &mut Out) -> bool {

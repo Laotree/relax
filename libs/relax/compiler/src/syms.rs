@@ -12,6 +12,8 @@
 //! pointer: a pointer word folds to a symbolic address, never to a bare number; a word whose
 //! meaning is unknown does not fold.
 
+include!("rt_abi.rs");
+
 use crate::jit::Unit;
 use crate::program::DefId;
 use relax_backend::rir::{Mem, Sym, SymClass};
@@ -431,15 +433,18 @@ impl Syms {
 
 static UNIT_PTR: AtomicPtr<Unit> = AtomicPtr::new(std::ptr::null_mut());
 
+rt_fn! {
 /// SPEC-V: the address an indirect call from unverified code goes to: the unverified-mode twin's entry
-/// when `addr` is the entry of a fn instance or closure, else `addr` itself.
-pub extern "C" fn relax_alias_entry(addr: u64) -> u64 {
+/// when `addr` is the entry of a fn instance or closure, else `addr` itself. A `Callee::Host`
+/// entry: Relax's convention (SysV on Windows too, where "C" would read the argument from rcx).
+pub fn relax_alias_entry(addr: u64) -> u64 {
     let up = UNIT_PTR.load(Ordering::Acquire);
     if up.is_null() { return addr; }
     let u = unsafe { &*up };
     let Some(id) = u.thunk_slot(addr) else { return addr };
     let twin = u.plain_twin(id);
     if twin == id { addr } else { u.slots.callable(twin) }
+}
 }
 
 pub fn set_unit(u: *mut Unit) {
@@ -1045,8 +1050,8 @@ pub fn reloc_sig(u: &Unit, name: impl FnOnce() -> String, code: &[u8], relocs: &
     for x in &rs {
         h.str(x);
     }
-    // (the inline stack entries and contexts are not code: left out)
-    for (o, pos) in pc_map.iter().filter(|x| x.0 != u32::MAX) {
+    // (the variable table, the inline stack entries and contexts are not code: left out)
+    for (o, pos) in pc_map.iter().filter(|x| x.0 < relax_backend::dbgloc::PC_VARS) {
         h.u32(*o);
         h.str(u.prog.file_paths.get(relax_backend::rir::pos_file(*pos) as usize).map_or("", |p| p.as_str()));
         h.u32(*pos as u32);
@@ -1063,7 +1068,7 @@ pub fn reloc_sig(u: &Unit, name: impl FnOnce() -> String, code: &[u8], relocs: &
                 format!("{}:{:?}={:#x}", o, r, v)
             }).collect();
             let _ = m.lock().unwrap_or_else(|e| e.into_inner()).write_all(format!("POOL\t{}\t{}\n", name, vals.join(" ")).as_bytes());
-            let pcs: Vec<String> = pc_map.iter().map(|(o, p)| format!("{}:{}:{}", o, relax_backend::rir::pos_file(*p), *p as u32)).collect();
+            let pcs: Vec<String> = pc_map.iter().filter(|x| x.0 < relax_backend::dbgloc::PC_VARS).map(|(o, p)| format!("{}:{}:{}", o, relax_backend::rir::pos_file(*p), *p as u32)).collect();
             let _ = m.lock().unwrap_or_else(|e| e.into_inner()).write_all(format!("CODE\t{}\t{}\t{}\n", name, hex, pcs.join(" ")).as_bytes());
         }
     }

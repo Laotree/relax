@@ -43,11 +43,9 @@ static UI_WAITING: AtomicU64 = AtomicU64::new(0);
 static UI_WAIT_START: AtomicU64 = AtomicU64::new(0);
 /// wall ns the last UI-thread JIT wait ended
 static UI_WAIT_END: AtomicU64 = AtomicU64::new(0);
-/// the UI thread's last ended outermost JIT waits after the first present, a ring: each one
-/// `(end ms after the present) << 24 | (length in us, at most 2^24 - 1)` (one atomic, never torn)
-const WAITS: usize = 256;
-static UI_WAITS: [AtomicU64; WAITS] = [const { AtomicU64::new(0) }; WAITS];
-static UI_WAITS_NEXT: AtomicU64 = AtomicU64::new(0);
+/// ns the UI thread spent in (outermost) JIT waits so far, and that sum at its last frame
+static UI_WAIT_SUM: AtomicU64 = AtomicU64::new(0);
+static UI_WAIT_SUM_AT_FRAME: AtomicU64 = AtomicU64::new(0);
 /// builds ahead (speculative / prepared) finished after the first present, and running now
 pub(crate) static AHEAD_DONE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static AHEAD_RUNNING: AtomicU64 = AtomicU64::new(0);
@@ -77,14 +75,37 @@ pub fn on_ui_wait(hook: fn()) {
 }
 pub(crate) fn ui_wait_end() {
     let now = wall_ns();
-    let fp = present_ns();
-    if UI_WAITING.load(Relaxed) == 1 && fp != 0 && now > fp {
-        let us = (now.saturating_sub(UI_WAIT_START.load(Relaxed)) / 1000).min((1 << 24) - 1);
-        let at = UI_WAITS_NEXT.fetch_add(1, Relaxed) as usize % WAITS;
-        UI_WAITS[at].store((now - fp) / 1_000_000 << 24 | us, Relaxed);
-    }
     UI_WAIT_END.store(now, Relaxed);
-    UI_WAITING.fetch_sub(1, Relaxed);
+    if UI_WAITING.fetch_sub(1, Relaxed) == 1 {
+        UI_WAIT_SUM.fetch_add(now.saturating_sub(UI_WAIT_START.load(Relaxed)), Relaxed);
+    }
+}
+
+/// How long the UI thread's open JIT wait has lasted (0: none open, or before the first present):
+/// the whole UI stalls on the JIT, no frame. Atomics only.
+pub fn ui_stall_ns() -> u64 {
+    if present_ns() == 0 || UI_WAITING.load(Relaxed) == 0 {
+        return 0;
+    }
+    wall_ns().saturating_sub(UI_WAIT_START.load(Relaxed))
+}
+
+/// How long the UI has been hanging on the JIT: the time since its last frame (or the first present)
+/// when the UI thread spent at least half of it in JIT waits (one long lazy compile, or a level
+/// load's thousands of short ones back to back: no frame either way); 0 otherwise. Atomics only.
+pub fn ui_hang_ns() -> u64 {
+    let fp = present_ns();
+    if fp == 0 {
+        return 0;
+    }
+    let now = wall_ns();
+    let last = LAST_FRAME.load(Relaxed).max(fp);
+    let span = now.saturating_sub(last);
+    let mut waited = UI_WAIT_SUM.load(Relaxed).saturating_sub(UI_WAIT_SUM_AT_FRAME.load(Relaxed));
+    if UI_WAITING.load(Relaxed) > 0 {
+        waited += now.saturating_sub(UI_WAIT_START.load(Relaxed).max(last));
+    }
+    if span > 0 && waited.saturating_mul(2) >= span { span } else { 0 }
 }
 
 /// ns since the UI thread last waited on the JIT: 0 while it waits, u64::MAX before the first
@@ -100,36 +121,31 @@ pub fn ui_idle_ns() -> u64 {
     wall_ns().saturating_sub(UI_WAIT_END.load(Relaxed).max(fp))
 }
 
-/// How long the UI thread waited on the JIT in the last `window_ns` (after the first present,
-/// its open wait included): the host's JIT loader shows for sustained waiting, not for one
-/// hiccup. Atomics only (waits older than the ring's are not counted).
-pub fn ui_waited_within(window_ns: u64) -> u64 {
-    let fp = present_ns();
-    if fp == 0 {
-        return 0;
-    }
-    let now = wall_ns();
-    let from = now.saturating_sub(window_ns).max(fp);
-    let mut waited = 0;
-    for w in &UI_WAITS {
-        let w = w.load(Relaxed);
-        if w == 0 {
-            continue;
-        }
-        let end = fp + (w >> 24) * 1_000_000;
-        let start = end.saturating_sub((w & ((1 << 24) - 1)) * 1000);
-        waited += end.min(now).saturating_sub(start.max(from));
-    }
-    if UI_WAITING.load(Relaxed) > 0 {
-        waited += now.saturating_sub(UI_WAIT_START.load(Relaxed).max(from));
-    }
-    waited
-}
-
 /// Functions built ahead since the first present, and those still queued or building (the
 /// speculative / prepare queue; a queue being changed right now reads as 1 more).
 pub fn ahead_progress() -> (u64, u64) {
     (AHEAD_DONE.load(Relaxed), crate::jit::ahead_queued() + AHEAD_RUNNING.load(Relaxed))
+}
+
+/// The JIT's work in flight, for the run's activity badge (a look, not a measurement).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Activity {
+    /// O3 builds queued or running now
+    pub o3: u64,
+    /// functions queued or building ahead now
+    pub ahead: u64,
+    /// ns the UI thread has spent in JIT waits so far, its open one included (monotonic: the
+    /// difference between two looks over their interval is its JIT duty cycle)
+    pub ui_wait_ns: u64,
+}
+
+/// What the JIT is doing now (one lock of the O3 queue; the rest atomics).
+pub fn activity() -> Activity {
+    let mut ui_wait_ns = UI_WAIT_SUM.load(Relaxed);
+    if UI_WAITING.load(Relaxed) > 0 {
+        ui_wait_ns += wall_ns().saturating_sub(UI_WAIT_START.load(Relaxed));
+    }
+    Activity { o3: crate::jit::o3_pending(), ahead: ahead_progress().1, ui_wait_ns }
 }
 
 /// The app is ready after its first present (false before it): the UI thread has not waited on the JIT for
@@ -282,6 +298,7 @@ pub(crate) extern "C" fn relax_frame_done() {
     let now = wall_ns();
     let fp = present_ns();
     let last = LAST_FRAME.swap(now, Relaxed);
+    UI_WAIT_SUM_AT_FRAME.store(UI_WAIT_SUM.load(Relaxed), Relaxed);
     let compiled = MAIN_COMPILE_NS.load(Relaxed);
     static COMPILED_AT_LAST: AtomicU64 = AtomicU64::new(0);
     let compiled_before = COMPILED_AT_LAST.swap(compiled, Relaxed);

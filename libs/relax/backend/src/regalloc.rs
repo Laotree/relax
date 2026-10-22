@@ -38,6 +38,9 @@ pub struct RegConfig {
     /// constant in up to four (movz / movk). A recomputation dearer than a reload ranks with the
     /// instructions it costs, crosses calls in a register, and spills when no register is left
     pub remat_cost: fn(&Remat) -> u8,
+    /// spill windows for float / vector values too (the emitter reads Alloc::windows in its float
+    /// operand path and loads / recomputes them at a window's start: arm64)
+    pub float_windows: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -875,7 +878,8 @@ pub fn allocate(options: &relax_session::Options, f: &Func, cfg: &RegConfig) -> 
     allocate_with(options, f, cfg, true, None)
 }
 
-/// `allocate`; `thorough` adds copy coalescing (allocate_split adds live-range splitting).
+/// `allocate`; `thorough` (or `options.ra_quick_coalesce`) adds copy coalescing (allocate_split adds
+/// live-range splitting, thorough only).
 pub fn allocate_with(options: &relax_session::Options, f: &Func, cfg: &RegConfig, thorough: bool, freq: Option<&[f32]>) -> Alloc {
     allocate_low(options, f, cfg, thorough, freq, None, None)
 }
@@ -998,7 +1002,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     let is_low = |v: u32| low.map_or(false, |lw| lw.get(v as usize).copied().unwrap_or(false));
     let mut parent: Vec<u32> = (0..nv).collect();
     let mut merged: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
-    if thorough && coalesce_on(options) {
+    if (thorough || options.ra_quick_coalesce) && coalesce_on(options) {
         fn find(p: &mut [u32], mut x: u32) -> u32 {
             while p[x as usize] != x {
                 let g = p[p[x as usize] as usize];
@@ -1543,6 +1547,18 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     if thorough && windows_on(options) {
         let regs: Vec<u8> = cfg.int_caller.iter().chain(used_callee_int.iter()).copied().collect();
         let callee_set = used_callee_int.clone();
+        // float / vector windows (RegConfig::float_windows): runs of >= 2 uses of a spilled (or
+        // recomputed constant) float value in instructions that read it through the emitter's
+        // float operand path, in a float register free over the run
+        let fregs: Vec<u8> = cfg.flt_caller.iter().chain(used_callee_flt.iter()).copied().collect();
+        let fsimple = |i: &Inst| {
+            cfg.float_windows
+                && matches!(
+                    i,
+                    Inst::FBin(..) | Inst::FUnary(..) | Inst::FCmp(..) | Inst::FMulAdd(..) | Inst::Store(..) | Inst::StoreX(..) | Inst::VStore(..) | Inst::VStoreX(..) | Inst::VX(..) | Inst::Sel(..) | Inst::Conv(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) | Inst::VSel(..) | Inst::VFma(..) | Inst::Mov(..)
+                )
+        };
+        let fwin = |v: usize| f.vregs[v] != Cls::I && (matches!(loc[v], Loc::Stack(_)) || (loc[v] == Loc::None && matches!(remat[v], Remat::FConst(..) | Remat::VConst(_))));
         let simple = |i: &Inst| matches!(i, Inst::IBin(..) | Inst::IBinI(..) | Inst::ICmp(..) | Inst::ICmpI(..) | Inst::Load(..) | Inst::Store(..) | Inst::LoadX(..) | Inst::StoreX(..) | Inst::Conv(..) | Inst::Mov(..));
         // blocks heaviest first: hot runs get the free registers first
         let mut bo: Vec<usize> = (0..nb).filter(|b| reach[*b]).collect();
@@ -1561,9 +1577,14 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             // after its store home: no reload for the reads after it in the block): (def index, uses)
             let mut druns: HashMap<u32, (usize, Vec<usize>)> = HashMap::new();
             let mut ddone: Vec<(u32, usize, Vec<usize>)> = Vec::new();
+            let mut fruns: HashMap<u32, Vec<usize>> = HashMap::new();
+            let mut fdone: Vec<(u32, Vec<usize>)> = Vec::new();
             for ii in 0..lim {
                 let i = &b.insts[ii];
                 if matches!(i, Inst::Call(..)) {
+                    for (v, r) in fruns.drain() {
+                        fdone.push((v, r));
+                    }
                     for (v, r) in runs.drain() {
                         done.push((v, r));
                     }
@@ -1574,6 +1595,16 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                 }
                 let mut ds = Vec::new();
                 for_defs(i, |d| ds.push(d.0));
+                if fsimple(i) {
+                    for_uses(i, |u| {
+                        if fwin(u.0 as usize) && !ds.contains(&u.0) {
+                            let e = fruns.entry(u.0).or_default();
+                            if e.last() != Some(&ii) {
+                                e.push(ii);
+                            }
+                        }
+                    });
+                }
                 if simple(i) {
                     let stored = match i {
                         Inst::Store(_, _, _, s2) | Inst::StoreX(_, _, _, _, _, s2) => match remat[s2.0 as usize] {
@@ -1607,6 +1638,9 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                     });
                 }
                 for d in &ds {
+                    if let Some(r) = fruns.remove(d) {
+                        fdone.push((*d, r));
+                    }
                     if let Some(r) = runs.remove(d) {
                         done.push((*d, r));
                     }
@@ -1631,6 +1665,32 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             for (v, (di, r)) in druns.drain() {
                 ddone.push((v, di, r));
             }
+            for (v, r) in fruns.drain() {
+                fdone.push((v, r));
+            }
+            fdone.sort_by_key(|x| (std::cmp::Reverse(x.1.len()), x.0));
+            for (v, us) in fdone {
+                if us.len() < 2 {
+                    continue;
+                }
+                let a = block_start[bi] + 2 * us[0] as u32;
+                let z = block_start[bi] + 2 * *us.last().unwrap() as u32 + 1;
+                // free over the previous instruction too (fused pairs read their operands at the
+                // second instruction)
+                let a0 = if us[0] > 0 { a - 2 } else { a };
+                for &c in &fregs {
+                    let o = &mut occ[32 + c as usize];
+                    if !o.is_empty() && bits_any(o, a0, z) {
+                        continue;
+                    }
+                    if o.is_empty() {
+                        o.resize(pos_words, 0);
+                    }
+                    bits_fill(o, a0, z);
+                    windows.push((v, a + 1, z, c));
+                    break;
+                }
+            }
             ddone.sort_by_key(|x| (std::cmp::Reverse(x.2.len()), x.0));
             for (v, di, us) in ddone {
                 if us.is_empty() || in_region.contains(&(v, bi as u32)) {
@@ -1639,8 +1699,10 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                 let a = block_start[bi] + 2 * di as u32 + 2; // the definition
                 let z = block_start[bi] + 2 * *us.last().unwrap() as u32 + 1;
                 // free over the defining instruction's operands and the one before it too (deferred
-                // fused compares read at the next instruction)
-                let a0 = if di > 0 { a - 5 } else { a - 1 };
+                // fused compares read at the next instruction); saturating: the entry block's second
+                // instruction has a = 4 (a - 5 wrapped to u32::MAX and indexed far past the bit set:
+                // Stage's kernels, compute's x64 fuzzers)
+                let a0 = if di > 0 { a.saturating_sub(5) } else { a - 1 };
                 for &c in &regs {
                     let o = &mut occ[c as usize];
                     if !o.is_empty() && bits_any(o, a0, z) {
@@ -2054,7 +2116,8 @@ pub fn check_alloc(options: &relax_session::Options, f: &Func, cfg: &RegConfig, 
         prestore_at.entry(p).or_default().push(v);
     }
     // positions where a window occupies a register
-    let wins: Vec<(u32, u32, u8)> = al.windows.iter().chain(al.chained.iter()).map(|&(_, a, z, r)| (a, z, r)).collect();
+    // (integer windows only: a float window's register number names a float register)
+    let wins: Vec<(u32, u32, u8)> = al.windows.iter().chain(al.chained.iter()).filter(|w| f.vregs[w.0 as usize] == Cls::I).map(|&(_, a, z, r)| (a, z, r)).collect();
     let win_regs = |p: u32| -> u64 {
         let mut m = 0u64;
         for &(a, z, r) in &wins {
@@ -4094,6 +4157,7 @@ fn split_cold_calls(f: &Func, freq: &[f32], cand: &[bool]) -> Option<Func> {
     let nv0 = f.vregs.len();
     let mut g = f.clone();
     let mut changed = false;
+    let mut pieces: Vec<(VReg, VReg)> = Vec::new();
     for bi in 0..f.blocks.len() {
         if !cold[bi] {
             continue;
@@ -4162,6 +4226,7 @@ fn split_cold_calls(f: &Func, freq: &[f32], cand: &[bool]) -> Option<Func> {
             let mut call = g.blocks[bi].insts[ii].clone();
             for v in across {
                 let t = g.vreg(f.vregs[v.0 as usize]);
+                pieces.push((t, v));
                 before.push(Inst::Mov(t, v));
                 after.push(Inst::Mov(v, t));
                 if let Inst::Call(_, args, _) = &mut call {
@@ -4190,6 +4255,7 @@ fn split_cold_calls(f: &Func, freq: &[f32], cand: &[bool]) -> Option<Func> {
         }
     }
     if changed {
+        g.dbg_add_pieces(&pieces);
         Some(g)
     } else {
         None
@@ -4288,6 +4354,9 @@ fn allocate_split_loops_inner(options: &relax_session::Options, f: &Func, al: Al
             }
         }
     }
+    // the pieces that stay hold their originals' values (debug locations follow them)
+    let pairs: Vec<(VReg, VReg)> = (n_orig..g.vregs.len()).filter(|&v| back[v] as usize == v && origin[v] != u32::MAX).map(|v| (VReg(v as u32), VReg(origin[v]))).collect();
+    g.dbg_add_pieces(&pairs);
     let gf: Option<Vec<f32>> = gfreq.map(|x| x.to_vec());
     (Some(g), al2, through, gf)
 }
@@ -5117,7 +5186,7 @@ pub fn share_index_bases(f: &Func) -> Option<Func> {
         let mut open: Vec<usize> = Vec::new(); // indices into groups still valid
         for (k, i) in b.insts.iter().enumerate() {
             let key = match i {
-                Inst::LoadX(_, _, base, x, sh, _) | Inst::StoreX(_, base, x, sh, _, _) => Some((*base, *x, *sh)),
+                Inst::LoadX(_, _, base, x, sh, _) | Inst::StoreX(_, base, x, sh, _, _) | Inst::VLoadX(_, base, x, sh, _) | Inst::VStoreX(base, x, sh, _, _) => Some((*base, *x, *sh)),
                 _ => None,
             };
             if let Some(key) = key {
@@ -5140,7 +5209,7 @@ pub fn share_index_bases(f: &Func) -> Option<Func> {
         }
         let worth: Vec<&((VReg, VReg, u8), Vec<usize>)> = groups
             .iter()
-            .filter(|(_, ks)| ks.len() >= 2 && ks.iter().any(|k| matches!(b.insts[*k], Inst::LoadX(_, _, _, _, _, o) | Inst::StoreX(_, _, _, _, o, _) if o != 0)))
+            .filter(|(_, ks)| ks.len() >= 2 && ks.iter().any(|k| matches!(b.insts[*k], Inst::LoadX(_, _, _, _, _, o) | Inst::StoreX(_, _, _, _, o, _) | Inst::VLoadX(_, _, _, _, o) | Inst::VStoreX(_, _, _, o, _) if o != 0)))
             .collect();
         if worth.is_empty() {
             continue;
@@ -5167,6 +5236,8 @@ pub fn share_index_bases(f: &Func) -> Option<Func> {
                 blk.insts[*k] = match blk.insts[*k] {
                     Inst::LoadX(m, d, _, _, _, o) => Inst::Load(m, d, p, o),
                     Inst::StoreX(m, _, _, _, o, v) => Inst::Store(m, p, o, v),
+                    Inst::VLoadX(d, _, _, _, o) => Inst::VLoad(d, p, o),
+                    Inst::VStoreX(_, _, _, o, v) => Inst::VStore(p, o, v),
                     ref other => other.clone(),
                 };
             }
