@@ -11043,8 +11043,15 @@ fn pgo_inline() -> bool {
 
 /// O3 code of a counted body: blocks in profile order, then the counts' frequencies.
 fn counted_freqs(func: &mut relax_backend::rir::Func) -> Option<Vec<f32>> {
+    if tier1_trace() {
+        let kept = func.blocks.iter().filter(|b| b.count >= 0.0).count();
+        eprintln!("O3-counts {}: {} of {} blocks counted after O3", func.name, kept, func.blocks.len());
+    }
     if pgo_layout() {
-        relax_backend::profile::layout(func);
+        let moved = relax_backend::profile::layout(func);
+        if tier1_trace() {
+            eprintln!("O3-layout {}: {}", func.name, if moved { "reordered" } else { "unchanged" });
+        }
     }
     relax_backend::profile::freqs(func).or_else(|| Some(inline_structural_freqs(func)))
 }
@@ -11143,7 +11150,8 @@ unsafe fn counted_build(up: *mut Unit, id: u32) -> bool {
         }
         let u = &*up;
         let f = &u.fns[id as usize];
-        let rir = f.rir.as_ref().filter(|r| !r.plain_calls && !r.blocks.is_empty())?.clone();
+        // (a naked fn is its assembly alone: a counter would clobber its argument registers)
+        let rir = f.rir.as_ref().filter(|r| !r.plain_calls && !r.naked && !r.blocks.is_empty())?.clone();
         let e = &u.env;
         let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class };
         Some((rir, env, u.opt.fold, u.opt.layout, PATCH_EPOCH.load(Ordering::SeqCst), f.version))
