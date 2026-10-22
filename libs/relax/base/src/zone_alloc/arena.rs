@@ -1930,6 +1930,10 @@ impl Arena {
         (s.committed != 0).then_some(s.epoch)
     }
     fn points_into(&self, p: usize, g: u64) -> bool {
+        self.points_into_range(p, g, g + 1)
+    }
+    /// `points_into` for any generation in [lo, hi).
+    fn points_into_range(&self, p: usize, lo: u64, hi: u64) -> bool {
         let base = self.base.load(Ordering::Relaxed);
         if base == 0 || p.wrapping_sub(base) >= RESERVE {
             return false;
@@ -1939,7 +1943,7 @@ impl Arena {
             return false;
         }
         let s = lock(&self.headers[index].state);
-        if s.committed == 0 || s.epoch != g {
+        if s.committed == 0 || s.epoch < lo || s.epoch >= hi {
             return false;
         }
         let off = p - (base + index * CHUNK);
@@ -2182,6 +2186,10 @@ pub fn epoch_of(p: *const u8) -> Option<u64> {
 /// small chunk's carved part, a large block's committed part)? Takes the chunk lock.
 pub fn points_into(p: usize, g: u64) -> bool {
     DEFAULT.points_into(p, g)
+}
+/// `points_into` for any generation in [lo, hi).
+pub fn points_into_range(p: usize, lo: u64, hi: u64) -> bool {
+    DEFAULT.points_into_range(p, lo, hi)
 }
 /// The arena's own statics (address ranges): its header table's free lists and its base address
 /// hold addresses into the arena, which a scan of the process's statics must not count.
