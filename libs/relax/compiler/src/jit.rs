@@ -445,14 +445,14 @@ pub struct Unit {
     exec_size: u64,
     /// where every slot's thunk, stub, table word and tier record are (segments, reserved as ids reach them)
     pub slots: Box<relax_backend::rir::SlotTable>,
-    lazy_entry: u64,
+    pub(crate) lazy_entry: u64,
     pub enter: u64,
     pub leave: u64,
     /// bump allocators of code / read-only data / static memory (lock-free: lowering threads
     /// allocate too)
     code_next: AtomicU64,
     /// branch veneers in the code area by target (`Unit::veneer`): the last one placed for each
-    veneers: relax_session::sync::Mutex<HashMap<u64, u64>>,
+    pub(crate) veneers: relax_session::sync::Mutex<HashMap<u64, u64>>,
     data_next: AtomicU64,
     /// (bytes, align) of str / byte-string / C-string literals and promoted constants -> their
     /// one read-only copy
@@ -482,7 +482,7 @@ pub struct Unit {
     /// O3 rebuilds per slot for that reason (bounded)
     retiers: HashMap<u32, u8>,
     frequency_profiles: HashMap<u32, FrequencyProfile>,
-    hot_entry: u64,
+    pub(crate) hot_entry: u64,
     /// state the type checks ahead share with this unit (no owner thread call needed to reach it)
     pub front: std::sync::Arc<FrontShared>,
     /// Instantiated const-fn bodies retained by the data evaluator at their declaration epoch.

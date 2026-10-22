@@ -57,12 +57,14 @@ struct Side {
     ext: Vec<Option<String>>,
     /// the O3 build's spilled values: (line key, line shown, why), most used first
     spills: Vec<(String, String, String)>,
+    /// bytes after the code that are not instructions (padding, constant pool)
+    data: u32,
 }
 
 impl Side {
     fn new(label: String, name: String, addr: u64, insns: Vec<Insn>) -> Side {
         let n = insns.len();
-        Side { label, name, addr, insns, at: vec![u32::MAX; n], inl: vec![(String::new(), 0); n], callee: vec![None; n], samples: vec![0; n], below: vec![0; n], count: vec![None; n], lines: Vec::new(), check: vec![None; n], why: vec![None; n], ext: vec![None; n], spills: Vec::new() }
+        Side { label, name, addr, insns, at: vec![u32::MAX; n], inl: vec![(String::new(), 0); n], callee: vec![None; n], samples: vec![0; n], below: vec![0; n], count: vec![None; n], lines: Vec::new(), check: vec![None; n], why: vec![None; n], ext: vec![None; n], spills: Vec::new(), data: 0 }
     }
 
     fn line_index(&mut self, idx: &mut HashMap<String, u32>, key: String, show: String) -> u32 {
@@ -126,6 +128,11 @@ impl Side {
                 continue;
             }
             if let Some(h) = i.target.filter(|t| *t <= self.addr + i.off as u64).and_then(|t| self.at_addr(t)) {
+                // a head block that returns (an epilogue placed before the loop) is no loop head
+                let end = (h..=k).find(|&j| self.insns[j].class.ends_block()).unwrap_or(k);
+                if matches!(self.insns[end].class, Class::Ret | Class::Trap | Class::IndirectBranch) {
+                    continue;
+                }
                 v.push((h, k));
             }
         }
@@ -309,8 +316,10 @@ fn our_sides(q: &str, max: usize) -> Result<(Vec<(u32, Side)>, Vec<String>), Str
                 }
                 let label = format!("ours {} {}{}{}", kind.tier_name(), kind.origin_name(), if b.state == "installed" { String::new() } else { format!(" ({})", b.state) }, if holder { " (holds it inlined)" } else { "" });
                 let code = unsafe { std::slice::from_raw_parts(b.start as *const u8, b.len as usize) };
-                let insns = dis::decode(Arch::host(), code, b.start);
+                let mut insns = dis::decode(Arch::host(), code, b.start);
+                let data = trim_tail_data(&mut insns);
                 let mut s = Side::new(label, super::display_name(u, id, 0), b.start, insns);
+                s.data = data;
                 let entries: Vec<(u32, u64)> = b.map.entries().into_iter().filter(|e| e.0 < b.len).collect();
                 let mut idx = HashMap::new();
                 let mut pos_cache: HashMap<u64, (u32, (String, u8), Option<u64>)> = HashMap::new();
@@ -346,21 +355,46 @@ fn our_sides(q: &str, max: usize) -> Result<(Vec<(u32, Side)>, Vec<String>), Str
                     s.count[k] = cnt;
                 }
                 // call targets: JIT slots (by their thunk or code), host fns (symbol tables); the
-                // same for branches that leave the body (panic stubs, tail calls)
+                // same for branches that leave the body (panic stubs, tail calls). A veneer or a
+                // far-call stub (`ldr x16, =target; br x16`, `jmp [rip+target]`) is followed to
+                // what it jumps to.
                 let code_tab = u.code.read().unwrap_or_else(|e| e.into_inner());
+                let veneers: HashMap<u64, u64> = u.veneers.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(t, v)| (*v, *t)).collect();
+                // the unit's own runtime entries (trampolines in front of host fns)
+                let rt = &u.rt;
+                let entries: [(u64, &str); 13] = [
+                    (rt.panic_bounds, "core::panicking::panic_bounds_check (via the panic trampoline)"),
+                    (rt.panic_site, "core::panicking::panic (via the panic trampoline)"),
+                    (rt.panic_impl, "core::panicking::panic_impl (via the panic trampoline)"),
+                    (rt.resume, "unwind: resume (via the panic trampoline)"),
+                    (rt.land, "unwind: landing glue"),
+                    (rt.memcpy, "memcpy"),
+                    (rt.memmove, "memmove"),
+                    (rt.memset, "memset"),
+                    (rt.str_eq, "str equality (runtime)"),
+                    (rt.panicking, "std::thread::panicking"),
+                    (u.lazy_entry, "makepad run: lazy compile entry (first call of a slot)"),
+                    (u.hot_entry, "makepad run: tier-up counter entry"),
+                    (u.env.tls_slow, "makepad run: thread-local slow path"),
+                ];
                 let (lo, hi) = (b.start, b.start + b.len as u64);
                 for k in 0..s.insns.len() {
                     let call = s.insns[k].class == Class::Call;
-                    let Some(t) = s.insns[k].target else { continue };
-                    if !call && t >= lo && t < hi {
+                    let Some(t0) = s.insns[k].target else { continue };
+                    if !call && t0 >= lo && t0 < hi {
                         continue;
                     }
-                    let name = match u.slots.find(0, t) {
-                        Some((c, 0)) if (c as usize) < u.fns.len() => Some(super::display_name(u, c, 0)),
-                        _ => match code_tab.entry_at(t) {
-                            Some((st, _, c)) if !(st == lo && !call) => Some(super::display_name(u, c, 0)),
-                            Some(_) => None,
-                            None => super::symbols::host_symbol(t).map(|x| x.0),
+                    let t = veneers.get(&t0).copied().or_else(|| follow_stub(t0)).unwrap_or(t0);
+                    // a slot's thunk, lazy stub, table word or tier stub
+                    let name = match entries.iter().find(|e| e.0 != 0 && (e.0 == t || e.0 == t0)) {
+                        Some(e) => Some(e.1.to_string()),
+                        None => match (0..4).find_map(|kind| u.slots.find(kind, t)) {
+                            Some((c, _)) if (c as usize) < u.fns.len() => Some(super::display_name(u, c, 0)),
+                            _ => match code_tab.entry_at(t) {
+                                Some((st, _, c)) if !(st == lo && !call) => Some(super::display_name(u, c, 0)),
+                                Some(_) => None,
+                                None => super::symbols::host_symbol(t).map(|x| x.0),
+                            },
                         },
                     };
                     if call {
@@ -385,6 +419,39 @@ fn our_sides(q: &str, max: usize) -> Result<(Vec<(u32, Side)>, Vec<String>), Str
         Ok((sides, notes))
     });
     r.unwrap_or_else(|| Err(format!("the owner did not answer in 10 s ({})", crate::owner::serving_note())))
+}
+
+/// Where a small jump stub at `t` (JIT code: a veneer, a far-call stub) goes: an indirect jump
+/// through a literal the stub loads. None: not such a stub.
+fn follow_stub(t: u64) -> Option<u64> {
+    if !crate::jit::in_jit_code(t) || !crate::jit::in_jit_code(t + 16) {
+        return None;
+    }
+    let code = unsafe { std::slice::from_raw_parts(t as *const u8, 16) };
+    let ins = dis::decode(Arch::host(), code, t);
+    let lit = ins.iter().take(2).find_map(|i| i.pc_ref)?;
+    let jumps = ins.iter().take(3).any(|i| i.class == Class::IndirectBranch);
+    if !jumps || !crate::jit::in_jit_code(lit) || !crate::jit::in_jit_code(lit + 8) {
+        return None;
+    }
+    let v = unsafe { std::ptr::read_unaligned(lit as *const u64) };
+    (v != 0).then_some(v)
+}
+
+/// Drops what follows a body's last instruction that is not code: a run of traps / undecodable
+/// words after the first trap past the last real instruction (padding, constant pools). Returns
+/// the dropped byte count.
+fn trim_tail_data(insns: &mut Vec<Insn>) -> u32 {
+    let real = insns.iter().rposition(|i| !matches!(i.class, Class::Trap | Class::Unknown | Class::Nop));
+    let Some(r) = real else { return 0 };
+    // keep one trap right after it (the end of a noreturn call)
+    let keep = if insns.get(r + 1).is_some_and(|i| i.class == Class::Trap) { r + 2 } else { r + 1 };
+    if keep >= insns.len() {
+        return 0;
+    }
+    let bytes: u32 = insns[keep..].iter().map(|i| i.len as u32).sum();
+    insns.truncate(keep);
+    bytes
 }
 
 // ------------------------------------------------------------------ rustc's side
@@ -522,7 +589,12 @@ fn rustc_side(nb: &NativeBin, ours: &str, our_bytes: usize, callers: &[String]) 
         // rustc inlined every call: its copy inside a caller (the callers the samples saw first)
         for c in callers {
             let Some(cf) = nb.find(&plain_name(c)).into_iter().next() else { continue };
-            let ranges: Vec<(u64, u64)> = nb.inlined(cf.addr, cf.addr + cf.size).into_iter().filter(|i| { let p = plain_name(&i.name); p == plain || p.ends_with(&format!("::{}", plain.rsplit("::").next().unwrap_or(&plain))) && callee_key(&p) == callee_key(&plain) }).flat_map(|i| i.ranges).collect();
+            let ranges: Vec<(u64, u64)> = nb.inlined(cf.addr, cf.addr + cf.size).into_iter().filter(|i| {
+                // the inline tree may name the fn by its last segment only
+                let p = plain_name(&i.name);
+                let last = |x: &str| x.rsplit("::").next().unwrap_or("").to_string();
+                p == plain || last(&p) == last(&plain) && (!p.contains("::") || callee_key(&p) == callee_key(&plain))
+            }).flat_map(|i| i.ranges).collect();
             if !ranges.is_empty() {
                 let mut s = native_side(nb, cf, Some(&ranges));
                 s.label = format!("rustc (inlined into {})", short(&plain_name(&cf.name), 60));
@@ -546,6 +618,7 @@ fn rustc_side(nb: &NativeBin, ours: &str, our_bytes: usize, callers: &[String]) 
 fn native_side(nb: &NativeBin, pick: &super::natbin::NativeFn, keep: Option<&[(u64, u64)]>) -> Side {
     let code = nb.code(pick);
     let mut insns = dis::decode(nb.arch, code, pick.addr);
+    let data = trim_tail_data(&mut insns);
     if let Some(r) = keep {
         insns.retain(|i| {
             let a = pick.addr + i.off as u64;
@@ -553,6 +626,7 @@ fn native_side(nb: &NativeBin, pick: &super::natbin::NativeFn, keep: Option<&[(u
         });
     }
     let mut s = Side::new("rustc".into(), pick.name.clone(), pick.addr, insns);
+    s.data = data;
     // lines
     let rows = nb.lines(pick.addr, pick.addr + pick.size);
     let mut idx = HashMap::new();
@@ -1181,6 +1255,9 @@ fn render(out: &mut Out, slot: u32, a: &Side, b: Option<&Side>, view: &str, line
     }
     if unknown > 0 {
         tail.push(format!("{} instructions the decoder does not know (shown as .byte/.word)", unknown));
+    }
+    if a.data > 0 || b.is_some_and(|b| b.data > 0) {
+        tail.push(format!("not counted: data after the code (padding, constant pool): ours {} B{}", a.data, b.map_or(String::new(), |b| format!(", rustc {} B", b.data))));
     }
     if !pcs.is_empty() && ts == 0 {
         tail.push(format!("no samples in this code in {:.1} s ({} samples elsewhere): is it running? (PGO counts still show)", took, pcs.len()));
