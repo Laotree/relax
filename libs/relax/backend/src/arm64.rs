@@ -3682,6 +3682,8 @@ impl<'a> Gen<'a> {
             }
             Inst::AtomicLoad(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..) => self.atomic(i),
             Inst::TlsAddr(d, off) => self.tls_addr(*d, *off),
+            // static TLS is placed for x86-64 Linux only (compiler os/tls.rs)
+            Inst::TlsStatic(..) => unreachable!("arm64: no static TLS placement"),
             Inst::Cpuid(..) | Inst::Xgetbv(..) => unreachable!("x86 CPU query rejected before arm64 emission"),
             Inst::FpEnv(true, x) => {
                 // msr fpcr, xt

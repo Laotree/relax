@@ -2332,6 +2332,27 @@ impl<'a> Gen<'a> {
         self.fin_i(d, rd);
     }
 
+    /// d = the thread pointer + off: `mov rd, fs:[0]` (the TCB's self pointer is the thread
+    /// pointer, x86-64 TLS ABI) then `lea rd, [rd + off]` (off a symbol: assigned per process).
+    fn tls_static(&mut self, d: VReg, off: Sym) {
+        let rd = self.def_i(d, R10);
+        // mov rd, fs:[0] (absolute disp32 through a SIB with no base and no index)
+        self.a.byte(0x64);
+        self.a.rex(true, rd, 0, 0, false);
+        self.a.b.extend_from_slice(&[0x8b, 0x04 | ((rd & 7) << 3), 0x25, 0, 0, 0, 0]);
+        // lea rd, [rd + disp32] (rsp / r12 as a base take a SIB)
+        self.a.rex(true, rd, 0, rd, false);
+        self.a.byte(0x8d);
+        self.a.byte(0x80 | ((rd & 7) << 3) | (rd & 7));
+        if rd & 7 == 4 {
+            self.a.byte(0x24);
+        }
+        let at = self.a.pos();
+        self.a.u32(0);
+        self.relocs.push(RelocAt { at: at as u32, kind: RelocKind::Imm32, target: Reloc::Sym(off) });
+        self.fin_i(d, rd);
+    }
+
     /// The running thread's domain base (slot 0 of its thread-local block) into the frame's domain
     /// slot: the inline TLS read, the shared routine only for a thread that has no block yet.
     fn dom_base(&mut self) {
@@ -2856,6 +2877,7 @@ impl<'a> Gen<'a> {
             Inst::FMulAdd(np, na, w, d, a, b, c) => self.fma(*np, *na, *w, *d, *a, *b, *c),
             Inst::AtomicLoad(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..) => self.atomic(options, i),
             Inst::TlsAddr(d, off) => self.tls_addr(*d, *off),
+            Inst::TlsStatic(d, off) => self.tls_static(*d, *off),
             Inst::FpEnv(set, v) => self.fp_env(options, *set, *v),
             Inst::Cpuid(ds, a, b) => self.cpuid(options, *ds, *a, *b),
             Inst::Xgetbv(d, a) => self.xgetbv(options, *d, *a),

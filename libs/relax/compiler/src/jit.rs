@@ -380,6 +380,8 @@ pub struct Unit {
     /// cache's dependency certificates are its transitive closure (cache.rs).
     pub body_deps: crate::fxhash::HashMap<u32, Vec<u32>>,
     pub statics: crate::fxhash::HashMap<DefId, u64>,
+    /// `#[thread_local]` statics: where each thread's copy lives (thread_local_place)
+    pub tls_places: crate::fxhash::HashMap<DefId, TlsPlace>,
     /// the statics' storage by address: start -> (static, size), so a pointer into a static
     /// (`&S.field`, `&S[3]`) in constant data is that static's symbol plus an offset
     pub static_spans: std::collections::BTreeMap<u64, (DefId, u64)>,
@@ -686,16 +688,20 @@ fn tls_key() -> u64 {
 pub(crate) fn domain_callback<R>(base: u64, token: u64, f: impl FnOnce() -> R) -> R {
     let _kept = crate::zone_alloc::kept();
     let previous = tls_block();
-    struct Restore(u64);
+    struct Restore(u64, Vec<u64>);
     impl Drop for Restore {
         fn drop(&mut self) {
             tls_dtor(os::tls::get(tls_key()));
             os::tls::set(tls_key(), self.0 as *mut u8);
+            os::tls::static_tls_swap(&mut self.1);
             crate::domain::enter(unsafe { *(self.0 as *const u64) });
         }
     }
     os::tls::set(tls_key(), std::ptr::null_mut());
-    let _restore = Restore(previous);
+    // the program's thread-locals in static TLS start fresh too (the thread's come back after)
+    let mut saved = Vec::new();
+    os::tls::static_tls_swap(&mut saved);
+    let _restore = Restore(previous, saved);
     crate::domain::relax_domain_enter(base, token);
     f()
 }
@@ -2505,6 +2511,7 @@ impl Unit {
             const_readers: Default::default(),
             body_deps: Default::default(),
             statics: Default::default(),
+            tls_places: Default::default(),
             static_spans: Default::default(),
             sites: Default::default(),
             site_ix: Default::default(),
@@ -3139,6 +3146,48 @@ impl Unit {
         at
     }
 
+    /// A `#[thread_local]` static's per-thread storage (Reference items/static-items: each thread
+    /// has its own copy, initialised to the static's value, never dropped). Its initializer runs
+    /// as any static's does: the result is the image every thread starts from. An all-zero image
+    /// of a small type goes in the executable's static TLS (os::tls::static_tls: a fixed offset
+    /// from the thread pointer, `Inst::TlsStatic`, as rustc's local-exec model), where the
+    /// platform has one; otherwise in the thread-local block (`Inst::TlsAddr`, zeroed per thread),
+    /// a non-zero image copied in on the thread's first access behind a flag byte. None: the
+    /// initializer failed (reported as its own error).
+    pub fn thread_local_place(&mut self, d: DefId) -> Option<TlsPlace> {
+        if let Some(p) = self.tls_places.get(&d) {
+            return Some(*p);
+        }
+        let image = self.static_addr(d);
+        if image == 0 {
+            return None;
+        }
+        let t = self.tcx.const_ty(&self.prog, d)?;
+        let l = self.layout_of(t);
+        let (size, align) = (l.size.max(1) as u32, l.align.max(1) as u32);
+        let zero = unsafe { std::slice::from_raw_parts(image as *const u8, size as usize) }.iter().all(|b| *b == 0);
+        let fixed = if zero && self.static_tls_ok() { os::tls::static_tls_alloc(size, align) } else { None };
+        let (value, init) = match fixed {
+            Some(off) => (off as u32 as u64, None),
+            None if zero => (self.tls_alloc(size, align) as u64, None),
+            // the flag byte right after the value
+            None => (self.tls_alloc(size + 1, align) as u64, Some(size)),
+        };
+        let place = TlsPlace { sym: self.syms.intern(crate::syms::SymKind::ThreadLocal(d), value), fixed: fixed.is_some(), init };
+        crate::zone_alloc::kept_with(|| self.tls_places.insert(d, place));
+        Some(place)
+    }
+
+    pub fn thread_local_place_shared(&self, d: DefId) -> Option<TlsPlace> {
+        owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).thread_local_place(d) })
+    }
+
+    /// Code of this unit may address the executable's static TLS (`Inst::TlsStatic`): native
+    /// code generation on a host that has it.
+    fn static_tls_ok(&self) -> bool {
+        !self.prog.session.options.no_codegen && !crate::web32::on() && os::tls::static_tls_base().is_some()
+    }
+
     /// Thread-local blocks: one OS key per process holds each thread's block; compiled code
     /// reads it through the OS's fast path (os::tls::jit_offset), else calls tls_slow.
     fn init_tls(&mut self) {
@@ -3150,6 +3199,7 @@ impl Unit {
             return;
         }
         let key = tls_key();
+        os::tls::static_tls_init(&|b| self.emit_code(b));
         let off = os::tls::jit_offset(key, &|b| self.emit_code(b));
         self.env.tls_key = off;
         self.env.tls_slow = self.emit_code(&x64::tls_slow(rt_tls_block as *const () as usize as u64, off));
@@ -7789,6 +7839,18 @@ unsafe fn build_rir_body(up: *mut Unit, id: u32, lowered: Option<relax_backend::
 /// What the optimisation of one function needs, taken under the unit lock: its lowered RIR,
 /// the options, the inlinable callees' RIR (shared), the read-only data range. With it,
 /// `optimize_rir` runs without the lock (pipelined compiles, compile_split).
+/// Where a `#[thread_local]` static lives (Unit::thread_local_place).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TlsPlace {
+    /// its offset (SymKind::ThreadLocal): from the thread pointer when `fixed`, else in the
+    /// thread-local block
+    pub sym: relax_backend::rir::Sym,
+    pub fixed: bool,
+    /// Some(size): a non-zero image, copied from the static's own storage on a thread's first
+    /// access; its flag byte follows the value
+    pub init: Option<u32>,
+}
+
 pub struct Prep {
     func: relax_backend::rir::Func,
     cfg: relax_codegen::opt::OptCfg,
@@ -8099,7 +8161,10 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     let relayout = layout_for(options, &name);
     // (their builds count as nested, like the inline candidates')
     let tn = cpu_ns();
-    let facts = tail_nounwind_facts(up, &func, if baseline { RirMode::Baseline } else { RirMode::Tier0 });
+    let mode = if baseline { RirMode::Baseline } else { RirMode::Tier0 };
+    let facts = tail_nounwind_facts(up, &func, mode);
+    let mut func = func;
+    tail_nocapture_facts(up, id, &mut func, mode, &snap, &facts, cfg.inline);
     nested_ns += cpu_ns() - tn;
     let prep_ns = (cpu_ns() - t0).saturating_sub(nested_ns);
     let u = &*up;
@@ -8107,7 +8172,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
 }
 
 /// Answers for the callees of tail-shaped invokes -- the call's results go straight to the Ret
-/// and only its unwind edge runs code here, as an `extern "C"` body's cannot-unwind guard does.
+/// and its unwind edge only aborts: an `extern "C"` body's cannot-unwind guard.
 /// A callee known not to unwind makes the invoke a plain call, which the back end then makes a
 /// sibling call (relax_backend::tail): LLVM's FunctionAttrs nounwind + invoke-to-call, which is
 /// what keeps a threaded interpreter of `extern "C"` handlers (makepad_stitch) in constant stack.
@@ -8120,15 +8185,157 @@ unsafe fn tail_nounwind_facts(up: *mut Unit, f: &relax_backend::rir::Func, mode:
     use relax_backend::rir::{Callee, Inst, Term};
     let mut facts = Vec::new();
     for b in &f.blocks {
-        let Term::Invoke(n, _) = b.term else { continue };
+        let Term::Invoke(n, pad) = b.term else { continue };
         let Some(Inst::Call(Callee::Fn(c), _, rets)) = b.insts.last() else { continue };
-        if !relax_backend::tail::returns_results(f, n as usize, 0, rets) {
+        if !terminates(f, pad) || !relax_backend::tail::returns_results(f, n as usize, 0, rets) {
             continue;
         }
         known_nounwind(up, *c, 3, mode, &mut facts);
     }
     facts.sort_unstable();
     facts
+}
+
+/// For a C ABI body with a call in tail position: which of the calls that pass it a frame address
+/// keep no copy of it (`Func::nocapture`; codegen opt::param_nocapture over the callee's RIR,
+/// built for the answer as for tail_nounwind_facts, depth-limited) -- a frame address that
+/// reaches no callee but these does not stop the sibling call (LLVM: nocapture from
+/// FunctionAttrs, or the call inlined away). The bodies read are dependencies of this one.
+unsafe fn tail_nocapture_facts(up: *mut Unit, id: u32, func: &mut relax_backend::rir::Func, mode: RirMode, snap: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], nounwind: &[(u32, bool)], inline: bool) {
+    use relax_backend::rir::Callee;
+    use relax_backend::tail::Escape;
+    // (C ABI bodies only: a chain of `extern "C"` handlers needs its sibling calls for its
+    // stack to stay bounded; other bodies keep their frames, without the builds this asks for)
+    if func.cabi.is_none() || relax_backend::tail::tail_shaped(func, &relax_backend::regalloc::reachable(func)).is_empty() {
+        return;
+    }
+    // the calls the back end sees: with the inline candidates inlined, as optimize_rir does
+    let mut inl = func.clone();
+    let f = &mut inl;
+    if inline && !snap.is_empty() {
+        let options = &(&*up).prog.session.options;
+        let get = |c: u32| -> Option<(*const relax_backend::rir::Func, u8)> { snap.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const relax_backend::rir::Func, x.2)) };
+        let lim = if mode == RirMode::Baseline { relax_codegen::opt::InlineLimits::baseline() } else { relax_codegen::opt::InlineLimits::tier0(options) };
+        relax_codegen::opt::inline_calls(options, f, id, &get, &|c| nounwind.iter().any(|x| x.0 == c && x.1), &lim);
+    }
+    relax_codegen::opt::demote_invokes(f, &|c| nounwind.iter().any(|x| x.0 == c && x.1));
+    let reach = relax_backend::regalloc::reachable(f);
+    let targets = relax_backend::tail::tail_shaped(f, &reach);
+    if targets.is_empty() {
+        return;
+    }
+    let (mut memo, mut reads) = (Vec::new(), Vec::new());
+    // a call that returns the address it got makes its result one: ask again with what is known
+    for _ in 0..4 {
+        let d = relax_backend::tail::frame_derived(f, &reach);
+        let asks = relax_backend::tail::escapes(f, &reach, &d, &targets);
+        if asks.contains(&Escape::Other) {
+            return;
+        }
+        let mut new = false;
+        for e in asks {
+            let Escape::Arg(c, k) = e else { continue };
+            if f.nocapture.iter().any(|x| x.0 == c && x.1 as usize == k) {
+                continue;
+            }
+            let r = match &c {
+                Callee::Fn(x) => known_nocapture(up, *x, k, 3, mode, &mut memo, &mut reads),
+                Callee::Host(s) => host_nocapture(&*up, *s).then_some(false),
+                _ => None,
+            };
+            let Some(returns) = r else {
+                // an escape is left: no sibling call here, the other answers are not needed
+                return;
+            };
+            f.nocapture.push((c, k as u32, returns));
+            new = true;
+        }
+        if !new {
+            reads.sort_unstable();
+            reads.dedup();
+            note_body_deps(&mut *up, id, reads.into_iter());
+            func.nocapture = std::mem::take(&mut f.nocapture);
+            return;
+        }
+    }
+}
+
+/// Runtime entries that keep no copy of their pointer arguments.
+fn host_nocapture(u: &Unit, s: relax_backend::rir::Sym) -> bool {
+    [u.rs.memcpy, u.rs.memmove, u.rs.memset, u.rs.str_eq].iter().any(|x| x.id == s.id)
+}
+
+unsafe fn known_nocapture(up: *mut Unit, c: u32, k: usize, depth: u32, mode: RirMode, memo: &mut Vec<(u32, usize, Option<bool>)>, reads: &mut Vec<u32>) -> Option<bool> {
+    if let Some(&(_, _, v)) = memo.iter().find(|x| x.0 == c && x.1 == k) {
+        return v;
+    }
+    // asked while its own answer is open (recursion): it may keep it
+    memo.push((c, k, None));
+    let v = match rir_for_fact(up, c, mode) {
+        Some(r) => {
+            reads.push(c);
+            let memo_c = std::cell::RefCell::new(std::mem::take(memo));
+            let reads_c = std::cell::RefCell::new(std::mem::take(reads));
+            let v = relax_codegen::opt::param_escape(&r, k, &|c2, k2| match c2 {
+                relax_backend::rir::Callee::Fn(x) if depth > 0 => known_nocapture(up, *x, k2, depth - 1, mode, &mut memo_c.borrow_mut(), &mut reads_c.borrow_mut()),
+                relax_backend::rir::Callee::Host(s) => host_nocapture(&*up, *s).then_some(false),
+                _ => None,
+            });
+            *memo = memo_c.into_inner();
+            *reads = reads_c.into_inner();
+            v
+        }
+        None => None,
+    };
+    if let Some(e) = memo.iter_mut().find(|x| x.0 == c && x.1 == k) {
+        e.2 = v;
+    }
+    v
+}
+
+/// Callee `c`'s RIR for a fact about it, built if it has none yet (as an inline candidate's:
+/// waiting for one in flight, never re-entering one being built on this request). None when it
+/// cannot be had.
+unsafe fn rir_for_fact(up: *mut Unit, c: u32, mode: RirMode) -> Option<std::sync::Arc<relax_backend::rir::Func>> {
+    if (c as usize) >= (&*up).fns.len() || matches!((&*up).fns[c as usize].key, FnKey::Sandbox(_) | FnKey::Plain(_)) {
+        return None;
+    }
+    if (&*up).fns[c as usize].rir.is_none() {
+        let e = &(&*up).fns[c as usize];
+        if e.build_err.is_some() {
+            return None;
+        }
+        if e.inflight {
+            wait_inflight(up, c);
+        }
+        let e = &(&*up).fns[c as usize];
+        if e.rir.is_none() && e.building {
+            // open in an earlier request lower on the owner's stack: this build depends on that timing
+            if !open_here(c) {
+                TAINTED.with(|t| t.set(true));
+            }
+            return None;
+        }
+        if e.rir.is_none() && build_rir_mode(up, c, mode).is_err() {
+            return None;
+        }
+    }
+    (&*up).fns[c as usize].rir.clone()
+}
+
+/// Whether unwind pad `b` aborts (rustc's UnwindAction::Terminate: the cannot-unwind guard of a
+/// nounwind ABI body, a call that must not unwind) rather than running cleanups and resuming.
+fn terminates(f: &relax_backend::rir::Func, mut b: u32) -> bool {
+    use relax_backend::rir::Term;
+    for _ in 0..8 {
+        let blk = &f.blocks[b as usize];
+        match blk.term {
+            Term::Unreachable => return true,
+            Term::Jump(t) if blk.insts.is_empty() => b = t,
+            _ => return false,
+        }
+    }
+    false
 }
 
 unsafe fn known_nounwind(up: *mut Unit, c: u32, depth: u32, mode: RirMode, facts: &mut Vec<(u32, bool)>) -> bool {
@@ -8139,30 +8346,7 @@ unsafe fn known_nounwind(up: *mut Unit, c: u32, depth: u32, mode: RirMode, facts
     // asked while its own answer is open (recursion): false
     facts.push((c, false));
     let v = 'v: {
-        if (c as usize) >= (&*up).fns.len() || matches!((&*up).fns[c as usize].key, FnKey::Sandbox(_) | FnKey::Plain(_)) {
-            break 'v false;
-        }
-        if (&*up).fns[c as usize].rir.is_none() {
-            let e = &(&*up).fns[c as usize];
-            if e.build_err.is_some() {
-                break 'v false;
-            }
-            if e.inflight {
-                wait_inflight(up, c);
-            }
-            let e = &(&*up).fns[c as usize];
-            if e.rir.is_none() && e.building {
-                // open in an earlier request lower on the owner's stack: this build depends on that timing
-                if !open_here(c) {
-                    TAINTED.with(|t| t.set(true));
-                }
-                break 'v false;
-            }
-            if e.rir.is_none() && build_rir_mode(up, c, mode).is_err() {
-                break 'v false;
-            }
-        }
-        let Some(r) = (&*up).fns[c as usize].rir.clone() else { break 'v false };
+        let Some(r) = rir_for_fact(up, c, mode) else { break 'v false };
         let reach = relax_backend::regalloc::reachable(&r);
         let cold = cold_blocks(&*up, &r);
         // first what needs no callee: a Resume, a call that may unwind, any call on a panic path

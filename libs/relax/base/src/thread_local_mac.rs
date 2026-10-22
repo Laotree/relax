@@ -5,11 +5,12 @@
 //! `$(#[$attr])* $vis const $name: LocalKey<$t> = thread_local_inner!(@key $t, [const] $init);`,
 //! where the key is a value whose `with` reaches this thread's slot, initialised on first use
 //! (`= expr`) or from the constant (`= const { .. }`).
-//! Relax's std (std/thread/local.rs, coord.md F-OS2) keeps a lazily created OS key inside the
-//! `LocalKey`, so the key must be one place: the expansion is a `static` holding
-//! `LocalKey::new(init)`, with `init` a plain fn returning the initial value. Both forms initialise
-//! on the thread's first access, which is observably the same for `const` initialisers (they have
-//! no side effects).
+//! Relax's expansion has the same shape: a `const` key whose fn returns the thread's value. A
+//! `const` initialiser of a type without drop glue is a `#[thread_local]` static, as std's
+//! (the compiler places it at a fixed offset from the thread pointer where it can); every other
+//! key keeps a lazily created runtime key (std/thread/local.rs `LazyKey`) in a `static` of its fn,
+//! initialised on the thread's first access, which is observably the same for `const`
+//! initialisers (they have no side effects).
 
 use crate::lexer::T;
 use crate::tg;
@@ -74,7 +75,8 @@ pub fn expand(toks: &[(T, &[u8])], edition: u16) -> Result<TokBuf, String> {
             ty.punct(T::Gt);
         }
         let mut k = j + 1;
-        if k < toks.len() && toks[k].0 == T::KwConst {
+        let konst = k < toks.len() && toks[k].0 == T::KwConst;
+        if konst {
             k += 1;
         }
         let e0 = k;
@@ -91,8 +93,33 @@ pub fn expand(toks: &[(T, &[u8])], edition: u16) -> Result<TokBuf, String> {
         let mut init = TokBuf::new(edition);
         copy(&mut init, &toks[e0..k]);
         copy(&mut out, &toks[start..i]);
-        tg!(&mut out; static #word(&name) : #std() :: thread :: LocalKey < #append(&ty) > = #std() :: thread :: LocalKey :: new
-            ({ fn __relax_thread_local_init () -> #append(&ty) { #append(&init) } __relax_thread_local_init }) ;);
+        if konst {
+            // std: `const` + no drop glue is the value itself in a `#[thread_local]` static; with
+            // drop glue (EagerStorage there) a runtime key whose value starts as the constant
+            tg!(&mut out; const #word(&name) : #std() :: thread :: LocalKey < #append(&ty) > = {
+                const __RELAX_TLS_INIT : #append(&ty) = #append(&init) ;
+                fn __relax_tls_get () -> #std() :: option :: Option < * const #append(&ty) > {
+                    if #std() :: mem :: needs_drop :: < #append(&ty) > () {
+                        fn __relax_tls_init () -> #append(&ty) { __RELAX_TLS_INIT }
+                        static __RELAX_TLS_KEY : #std() :: thread :: LazyKey < #append(&ty) > = #std() :: thread :: LazyKey :: new () ;
+                        __RELAX_TLS_KEY . get ( __relax_tls_init )
+                    } else {
+                        #[thread_local] static __RELAX_TLS_VAL : #append(&ty) = __RELAX_TLS_INIT ;
+                        #std() :: option :: Option :: Some ( & raw const __RELAX_TLS_VAL )
+                    }
+                }
+                #std() :: thread :: LocalKey :: new ( __relax_tls_get )
+            } ;);
+        } else {
+            tg!(&mut out; const #word(&name) : #std() :: thread :: LocalKey < #append(&ty) > = {
+                fn __relax_tls_init () -> #append(&ty) { #append(&init) }
+                fn __relax_tls_get () -> #std() :: option :: Option < * const #append(&ty) > {
+                    static __RELAX_TLS_KEY : #std() :: thread :: LazyKey < #append(&ty) > = #std() :: thread :: LazyKey :: new () ;
+                    __RELAX_TLS_KEY . get ( __relax_tls_init )
+                }
+                #std() :: thread :: LocalKey :: new ( __relax_tls_get )
+            } ;);
+        }
         i = k + 1;
     }
     Ok(out)
