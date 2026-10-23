@@ -13,7 +13,7 @@ function instance() {
 if (process.argv[3] === 'probes') {
     for (let n=0; n<13; n++) {
         const x=instance();
-        assert.throws(() => x.panic_probe(BigInt(n)), WebAssembly.RuntimeError);
+        assert.throws(() => x.panic_probe(n), WebAssembly.RuntimeError);
     }
 } else {
     const x=instance(); (x.t0 || x.run)();

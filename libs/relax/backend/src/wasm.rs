@@ -88,6 +88,35 @@ pub struct FnType {
     pub results: Vec<Val>,
 }
 
+/// The external C ABI has wasm value widths, independent of RIR's i64 integer
+/// registers. Aggregates already use CSig's private-copy/sret pointer convention;
+/// trivial scalar aggregates are classified as Scalar by the frontend.
+fn boundary_type(sig: &CSig, internal: &FnType, memory64: bool) -> Result<FnType, String> {
+    let pointer = if memory64 { Val::I64 } else { Val::I32 };
+    let mut params = Vec::new();
+    if sig.ret.is_some() { params.push(pointer); }
+    for arg in &sig.args {
+        params.push(match arg {
+            CArg::Scalar(Mem::Int(n, _)) => if *n <= 4 { Val::I32 } else { Val::I64 },
+            CArg::Scalar(Mem::F32) => Val::F32,
+            CArg::Scalar(Mem::F64) => Val::F64,
+            CArg::Agg(_) => pointer,
+        });
+    }
+    if params.len() != internal.params.len() {
+        return Err("C boundary parameter count differs from its RIR signature".into());
+    }
+    let mut results = internal.results.clone();
+    if sig.ret_narrow.is_some() && results == [Val::I64] { results[0] = Val::I32; }
+    Ok(FnType { params, results })
+}
+
+fn boundary_signed(sig: &CSig, index: usize) -> bool {
+    index.checked_sub(usize::from(sig.ret.is_some()))
+        .and_then(|i| sig.args.get(i))
+        .is_some_and(|a| matches!(a, CArg::Scalar(Mem::Int(_, true))))
+}
+
 // ------------------------------------------------------------ link interface
 
 /// How a host symbol (`Callee::Host` / `Callee::CHost`) is bound in the module.
@@ -426,6 +455,46 @@ impl<'a> Module<'a> {
                 }
             }
         }
+        // Export wrappers alone adapt the ABI. The function table and all internal
+        // direct/indirect calls continue to name the original RIR bodies.
+        let mut export_ix = HashMap::new();
+        for (_, id) in &self.exports {
+            if export_ix.contains_key(id) { continue; }
+            let u = self.fn_ix[id];
+            let f = funcs[u as usize].1;
+            let Some(sig) = &f.cabi else { export_ix.insert(*id, u); continue; };
+            let external = func_type(f).and_then(|t| boundary_type(sig, &t, opts.memory64));
+            match external {
+                Ok(t) => {
+                    let mut bytes = vec![0]; // no locals
+                    for (i, p) in t.params.iter().enumerate() {
+                        bytes.push(0x20);
+                        uleb(&mut bytes, i as u64);
+                        if *p == Val::I32 {
+                            bytes.push(if boundary_signed(sig, i) { 0xAC } else { 0xAD });
+                            if let Some(CArg::Scalar(Mem::Int(n, signed))) = i.checked_sub(usize::from(sig.ret.is_some())).and_then(|i| sig.args.get(i)) {
+                                if *n < 4 {
+                                    if *signed {
+                                        bytes.push(if *n == 1 { 0xC2 } else { 0xC3 });
+                                    } else {
+                                        bytes.push(0x42);
+                                        sleb(&mut bytes, (1i64 << (*n * 8)) - 1);
+                                        bytes.push(0x83);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    bytes.push(0x10);
+                    let fix = vec![(bytes.len() as u32, Fix::Func(FRef::User(u)))];
+                    if t.results == [Val::I32] { bytes.push(0xA7); }
+                    bytes.push(0x0B);
+                    export_ix.insert(*id, bodies.len() as u32);
+                    bodies.push(Body { bytes, fix, ty: self.sh.ty(t) });
+                }
+                Err(e) => { failed.push((*id, e)); export_ix.insert(*id, u); }
+            }
+        }
         // helpers (bodies made on demand; a helper may ask for another)
         if self.sh.helpers.iter().any(|h| matches!(h, Helper::Builtin(Builtin::KeyCreate | Builtin::KeyGet | Builtin::KeySet, _))) {
             self.sh.keys_base = self.place(8 * 256, 8);
@@ -523,7 +592,7 @@ impl<'a> Module<'a> {
         }
         // imports: by use; defined functions: by use (exports and table entries count too)
         for (_, id) in &self.exports {
-            if let Some(&u) = self.fn_ix.get(id) {
+            if let Some(&u) = export_ix.get(id) {
                 fuse[canon[ni + u as usize]] += 1;
             }
         }
@@ -538,7 +607,7 @@ impl<'a> Module<'a> {
             let body = |g: usize| -> &[u8] { if g < ni + n_user { &bodies[g - ni].bytes } else { &helper_bodies[g - ni - n_user].bytes } };
             dord.sort_by(|a, b| body(*a).cmp(body(*b)).then(a.cmp(b)));
         } else if opts.order_by_name {
-            let key = |g: usize| if g < ni + n_user { funcs[g - ni].1.name.as_str() } else { "\u{10FFFF}" };
+            let key = |g: usize| if g < ni + funcs.len() { funcs[g - ni].1.name.as_str() } else { "\u{10FFFF}" };
             dord.sort_by(|a, b| key(*a).cmp(key(*b)).then(a.cmp(b)));
         } else {
             dord.sort_by(|a, b| fuse[*b].cmp(&fuse[*a]).then(a.cmp(b)));
@@ -672,7 +741,7 @@ impl<'a> Module<'a> {
         for (nm, id) in &self.exports {
             name(&mut s, nm);
             s.push(0);
-            let u = self.fn_ix[id];
+            let u = export_ix[id];
             uleb(&mut s, fmap[ni + u as usize] as u64);
         }
         let b0 = out.len();
@@ -2601,11 +2670,27 @@ impl<'a> Fx<'a> {
             },
             Callee::Host(s) | Callee::CHost(s, _) => match self.link.host(s.id) {
                 HostBind::Import(m, f) => {
-                    let t = sig(self)?;
-                    let ty = self.sh.ty(t);
+                    let internal = sig(self)?;
+                    let cs = match callee { Callee::CHost(_, cs) => Some(cs.as_ref()), _ => None };
+                    let t = match cs {
+                        Some(cs) => boundary_type(cs, &internal, self.o.memory64)?,
+                        None => internal,
+                    };
+                    let ty = self.sh.ty(t.clone());
+                    if let Some(&i) = self.sh.import_ix.get(&(m.clone(), f.clone())) {
+                        if self.sh.imports[i as usize].2 != ty {
+                            return Err(format!("import {m}.{f} called with conflicting boundary signatures"));
+                        }
+                    }
                     let i = self.sh.import(&m, &f, ty);
-                    push_args(self)?;
+                    for (a, p) in args.iter().zip(&t.params) {
+                        self.value(b, *a, Want::Nat)?;
+                        if *p == Val::I32 { self.op(WRAP); }
+                    }
                     self.call(FRef::Import(i));
+                    if t.results == [Val::I32] {
+                        self.op(if cs.and_then(|s| s.ret_narrow).is_some_and(|it| it.signed) { EXT_S } else { EXT_U });
+                    }
                 }
                 HostBind::Builtin(bi) => {
                     let t = sig(self)?;

@@ -904,9 +904,95 @@ fn web_builtin(builtin: Builtin, arity: usize, assertion: &str) {
 fn web_memory_size_builtin() {
     web_builtin(Builtin::MemorySize, 1, "assert.equal(x.run(0n), BigInt(x.memory.buffer.byteLength / 65536));");
 }
+
+/// A real module boundary uses JS Numbers for <=32-bit integers and wasm32
+/// pointers, BigInts for u64 and memory64 pointers; table calls remain internal.
+#[test]
+fn web_c_boundary_numbers_and_bigints() {
+    for memory64 in [false, true] {
+        let pointer_bytes = if memory64 { 8 } else { 4 };
+        let signature = CSig {
+            conv: CConv::Host,
+            args: vec![CArg::Scalar(Mem::Int(4, false)), CArg::Scalar(Mem::Int(pointer_bytes, false)),
+                CArg::Scalar(Mem::Int(pointer_bytes, false)), CArg::Scalar(Mem::Int(8, false)), CArg::Scalar(Mem::F64)],
+            ret: None, n_fixed: u32::MAX, ret_narrow: Some(U32), unwinds: false,
+        };
+        let mut f = B::new(&[Cls::I, Cls::I, Cls::I, Cls::I, Cls::F64], &[Cls::I]);
+        f.f.cabi = Some(Box::new(signature.clone()));
+        let result = f.v(Cls::I);
+        f.i(Inst::Call(Callee::CHost(Sym::new(1), Box::new(signature.clone())), f.f.params.clone(), vec![result]));
+        f.term(Term::Ret(vec![result]));
+        let mut indirect = B::new(&[Cls::I, Cls::I, Cls::I, Cls::I, Cls::F64], &[Cls::I]);
+        indirect.f.cabi = Some(Box::new(signature.clone()));
+        let pointer = indirect.v(Cls::I);
+        indirect.i(Inst::FnAddr(pointer, 0));
+        let result = indirect.v(Cls::I);
+        indirect.i(Inst::Call(Callee::CIndirect(pointer, Box::new(signature)), indirect.f.params.clone(), vec![result]));
+        indirect.term(Term::Ret(vec![result]));
+        let fs = [f.done(), indirect.done()];
+        let (bytes, _) = build(&fs, Options { memory64, ..opts() });
+        let script = format!(r#"
+            const assert = require('node:assert/strict');
+            const bytes = require('node:fs').readFileSync(0);
+            assert(WebAssembly.validate(bytes));
+            const pointer = {memory64} ? 4294967297n : 4294967295;
+            let calls = 0;
+            const x = new WebAssembly.Instance(new WebAssembly.Module(bytes), {{env: {{add7(a,b,c,d,e) {{
+                assert.equal(a >>> 0, 0xfedcba98);
+                assert.equal(b, {memory64} ? pointer : -1);
+                assert.equal(c, {memory64} ? pointer : -1);
+                assert.equal(d, 0x123456789abcdefn);
+                assert.equal(e, 1.25);
+                calls++;
+                return 0xf1234567;
+            }}}}}}).exports;
+            for (const f of [x.f0, x.f1]) assert.equal(f(0xfedcba98, pointer, pointer, 0x123456789abcdefn, 1.25) >>> 0, 0xf1234567);
+            assert.equal(calls, 2);
+        "#);
+        use std::io::Write;
+        let mut child = std::process::Command::new("node").args(["-e", &script]).stdin(std::process::Stdio::piped()).spawn().expect("Node is required for wasm ABI tests");
+        child.stdin.take().unwrap().write_all(&bytes).unwrap();
+        assert!(child.wait().unwrap().success(), "memory64={memory64}");
+    }
+}
 #[test]
 fn web_memory_grow_builtin() {
     web_builtin(Builtin::MemoryGrow, 2, "const old=BigInt(x.memory.buffer.byteLength/65536); assert.equal(x.run(0n,1n),old); assert.equal(BigInt(x.memory.buffer.byteLength/65536),old+1n); assert.equal(x.run(0n,0n),old+1n); assert.equal(x.run(0n,-1n),memory64?-1n:4294967295n);");
+}
+
+#[test]
+fn web_c_boundary_aggregate_indirect() {
+    for memory64 in [false, true] {
+        let aggregate = CAgg { size: 16, align: 8, fields: vec![(0, Mem::Int(8, false)), (8, Mem::Int(8, false))] };
+        let signature = CSig { conv: CConv::Host, args: vec![CArg::Agg(aggregate.clone())], ret: Some(aggregate),
+            n_fixed: u32::MAX, ret_narrow: None, unwinds: false };
+        let mut f = B::new(&[Cls::I, Cls::I], &[]);
+        f.f.cabi = Some(Box::new(signature.clone()));
+        f.i(Inst::Call(Callee::CHost(Sym::new(1), Box::new(signature)), f.f.params.clone(), vec![]));
+        f.term(Term::Ret(vec![]));
+        let (bytes, _) = build(&[f.done()], Options { memory64, ..opts() });
+        let script = format!(r#"
+            const assert=require('node:assert/strict');
+            const bytes=require('node:fs').readFileSync(0);
+            assert(WebAssembly.validate(bytes));
+            let x;
+            x=new WebAssembly.Instance(new WebAssembly.Module(bytes),{{env:{{add7(out,arg){{
+                assert.equal(out,{memory64}?512n:512);
+                assert.equal(arg,{memory64}?256n:256);
+                const view=new DataView(x.memory.buffer);
+                view.setBigUint64(Number(out),view.getBigUint64(Number(arg),true)+7n,true);
+                view.setBigUint64(Number(out)+8,view.getBigUint64(Number(arg)+8,true),true);
+            }}}}}}).exports;
+            const view=new DataView(x.memory.buffer);
+            view.setBigUint64(256,123n,true);view.setBigUint64(264,456n,true);
+            assert.equal(x.f0({memory64}?512n:512,{memory64}?256n:256),undefined);
+            assert.equal(view.getBigUint64(512,true),130n);assert.equal(view.getBigUint64(520,true),456n);
+        "#);
+        use std::io::Write;
+        let mut child=std::process::Command::new("node").args(["-e", &script]).stdin(std::process::Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(&bytes).unwrap();
+        assert!(child.wait().unwrap().success(), "memory64={memory64}");
+    }
 }
 #[test]
 fn web_atomic_notify_builtin() {
