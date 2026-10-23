@@ -12720,7 +12720,8 @@ fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
     }
     let u = unsafe { &*up };
     // (profile replay builds what its profile names, as recorded)
-    if t1prof_replay(&u.prog.session.options) {
+    // (T1PROF is set only when profiling: no program read off the owner here)
+    if T1PROF.lock().unwrap().as_ref().is_some_and(|p| p.replay) {
         return;
     }
     let Some(calls) = u.tier1.as_ref().map(|t| t.calls) else { return };
