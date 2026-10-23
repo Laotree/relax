@@ -597,7 +597,12 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     let options = u.prog.session.options.clone();
     // the web player's profile: panics abort, one thread (TLS keys and waits built in)
     // untraced calls are a bare trap (option untraced: env.u(id) first, for a message)
-    let mut opts = wasm::Options { panic_abort: true, untraced_import: false, ..wasm::Options::default() };
+    let mut opts = wasm::Options {
+        panic_abort: true,
+        untraced_import: false,
+        memory64: options.check_target.web() == Some(crate::options::PtrWidth::W64),
+        ..wasm::Options::default()
+    };
     let mut single = true;
     // off by default: under brotli the merged module is LARGER (P(DOOM), block-shaken: raw -360 KB,
     // 23,345 -> 18,620 functions, br11 +5.0 KB): the compressor already shares near-identical
@@ -747,7 +752,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     host_syms.dedup();
     let mut vals: HashMap<u32, u64> = HashMap::new();
     let mut host: HashMap<u32, HostBind> = HashMap::new();
-    let web = u.prog.session.options.check_target == crate::options::CheckTarget::Web;
+    let web = options.check_target.web().is_some();
     for id in host_syms {
         let b = match u.syms.kind(id) {
             Some(SymKind::Rt(n)) => match n {
@@ -830,7 +835,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
                         _ => None,
                     };
                     if let Some(nv) = nv {
-                        bytes[k..k + pw].copy_from_slice(&nv.to_le_bytes()[..pw]);
+                        unsafe { crate::syms::write_ptr(u, bytes[k..k + pw].as_mut_ptr() as u64, nv) };
                         n_ptrs += 1;
                     }
                 }
