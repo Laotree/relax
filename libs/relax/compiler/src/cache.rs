@@ -3167,7 +3167,7 @@ impl Cache {
     /// Indexes the code and data entries this run's spills wrote to this cache's stores
     /// (WRITTEN): the store file is opened again (mapped) and its new entries replace what the
     /// index had for their keys, as the file's own index does.
-    fn index_written(&mut self) {
+    pub(crate) fn index_written(&mut self) {
         let mine: Vec<(PathBuf, Vec<u128>)> = {
             let mut w = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
             // (what stays is another cache's, kept as it was: the list lives in the kept heap)

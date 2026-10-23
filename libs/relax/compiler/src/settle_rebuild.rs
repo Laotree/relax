@@ -289,8 +289,16 @@ pub(crate) fn run(up: *mut Unit) -> Outcome {
     let mut old = old;
     if let Some(s) = old.spill.take() {
         let _z = crate::zone_alloc::compiler();
-        if let Err(e) = s.write() {
-            eprintln!("makepad-run cache: spill at the settle rebuild: {e}");
+        match s.write() {
+            // the new cache opened its stores before these entries were in them: it indexes them
+            // now (without, every slot they hold was compiled again, and Scope's settled compile
+            // state grew back to 18k RIR bodies and 140k query nodes)
+            Ok(_) => owner::publish(|| unsafe {
+                if let Some(c) = (*up).cache.as_mut() {
+                    c.index_written();
+                }
+            }),
+            Err(e) => eprintln!("makepad-run cache: spill at the settle rebuild: {e}"),
         }
     }
     drop(old);
