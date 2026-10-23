@@ -56,3 +56,15 @@ pub fn compiler() -> PhaseGuard {
 pub fn kept() -> PhaseGuard {
     enter(KEPT)
 }
+
+/// An environment variable read once into `cell`; unset or empty = None. The value lives in the
+/// kept heap (a zone swap never resets the static), and the static holds a String, never an
+/// `Option`: a `None` written into an inline payload carries a stack temporary's bytes, which
+/// MAKEPAD_RUN_ZONE_CHECK=2 reports as stale compiler words.
+pub fn env_once(cell: &'static std::sync::OnceLock<String>, name: &str) -> Option<&'static str> {
+    let s = cell.get_or_init(|| {
+        let _k = kept();
+        std::env::var(name).unwrap_or_default()
+    });
+    (!s.is_empty()).then_some(s.as_str())
+}
