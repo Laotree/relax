@@ -2867,6 +2867,7 @@ pub(crate) struct AttrNode<'a> {
     pub macro_use_target: bool,
 }
 
+pub const ILL_FORMED_ATTRIBUTE_INPUT: Lint = lint::lint("ill_formed_attribute_input");
 pub const MALFORMED_DIAGNOSTIC_FORMAT_LITERALS: Lint = lint::lint("malformed_diagnostic_format_literals");
 
 /// rustc_parse_format (ParseMode::Diagnostic) over the string literal at `pos` (its source bytes
@@ -3018,6 +3019,12 @@ pub(crate) fn attr_checks(prog: &Program, n: &AttrNode) {
                     diagnostic_format_lints(*pos, tok, trait_params.as_ref(), &mut |at, msg| emit(&MALFORMED_DIAGNOSTIC_FORMAT_LITERALS, at, msg));
                 }
             }
+        }
+        // ---- test_attrs.rs IgnoreParser: `#[ignore]` or `#[ignore = "reason"]`; a list, or a value
+        // that is no string, is ill-formed input (a future-incompatibility lint, deny by default)
+        if word.as_deref() == Some("ignore") {
+            let bad = match args { Args::None => false, Args::Value { tok, .. } => !(tok.first() == Some(&b'"') || tok.starts_with(b"r\"") || tok.starts_with(b"r#")), Args::List { .. } => true };
+            if bad { emit(&ILL_FORMED_ATTRIBUTE_INPUT, apos, "valid forms for the attribute are `#[ignore = \"reason\"]` and `#[ignore]`"); }
         }
         // ---- lint attributes: empty lists, `reason` only, crate-level-only lints
         if matches!(word.as_deref(), Some("allow" | "warn" | "deny" | "forbid" | "expect")) {
