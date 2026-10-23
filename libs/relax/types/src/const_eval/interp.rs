@@ -213,7 +213,80 @@ pub fn check_item(prog: &Program, tcx: &Tcx, def: DefId) -> Outcome {
     }
 }
 
+/// valtrees.rs const_to_valtree_inner over the value of non-generic constant `def`: the type in it
+/// that has no value tree -- a union, a raw pointer that is not an integer or is wide, a function
+/// pointer, a trait object, a closure. None: the value has one, or the interpreter cannot tell
+/// (const_to_pat then judges the type alone).
+pub fn valtree_failure(prog: &Program, tcx: &Tcx, def: DefId) -> Option<TyId> {
+    let mut it = Interp { prog, tcx, lay: crate::layout::Layouts::new(), allocs: Vec::new(), frames: Vec::new(), steps: 0, consts: HashMap::new(), ps: tcx.tys.ptr_bytes as u64, frames_root_ty: None, nesting: 0,
+        statics: HashMap::new(), static_root: None, mut_global_ok: false, in_progress: Vec::new(), validating: false };
+    let ty = tcx.const_ty(prog, def)?;
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> R<Option<TyId>> {
+        let a = it.eval_const(def, &[], false, false)?;
+        it.validating = true;
+        it.valtree_walk(MPlace { ptr: Ptr { prov: Some(Prov { alloc: a, shared: true }), off: 0 }, meta: None, ty, variant: None, packed: None }, 0)
+    }));
+    match r {
+        Ok(Ok(bad)) => bad,
+        Ok(Err(_)) => None,
+        Err(p) => { if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); } None }
+    }
+}
+
 impl<'a> Interp<'a> {
+    /// valtrees.rs const_to_valtree_inner: the first type without a value tree in the value at `p`.
+    fn valtree_walk(&mut self, p: MPlace, depth: u32) -> R<Option<TyId>> {
+        if depth > 64 { return unsupported("deep value tree"); }
+        let tys = &self.tcx.tys;
+        match tys.kind(p.ty).clone() {
+            TyKind::FnDef(..) | TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) | TyKind::Char => Ok(None),
+            // (only raw pointers that are integers in disguise; never wide ones)
+            TyKind::Ptr(_, pointee) => {
+                if self.is_fat(pointee)? { return Ok(Some(p.ty)); }
+                let v = self.read_place(p)?;
+                Ok((!v.ptrs.is_empty() || !v.frags.is_empty()).then_some(p.ty))
+            }
+            TyKind::FnPtr(..) | TyKind::Dyn(..) | TyKind::Closure(..) | TyKind::Alias(..) => Ok(Some(p.ty)),
+            TyKind::Ref(_, pointee, _) => {
+                let v = self.read_place(p)?;
+                let q = self.ptr_of(&v, 0)?;
+                let meta = if self.is_fat(pointee)? { Some(self.int_of(&v.slice(self.ps, self.ps, self.ps))? as u64) } else { None };
+                self.valtree_walk(MPlace { ptr: q, meta, ty: pointee, variant: None, packed: None }, depth + 1)
+            }
+            TyKind::Str => Ok(None),
+            TyKind::Slice(_) | TyKind::Array(..) => {
+                let n = self.len_of(p)?;
+                for i in 0..n { let e = self.index(p, i)?; if let Some(b) = self.valtree_walk(e, depth + 1)? { return Ok(Some(b)); } }
+                Ok(None)
+            }
+            TyKind::Tuple(l) => {
+                let l2: Vec<TyId> = tys.list(l).to_vec();
+                let lay = self.layout(p.ty)?;
+                for (i, t) in l2.iter().enumerate() {
+                    let f = MPlace { ptr: Ptr { off: p.ptr.off + lay.fields[i] as u64, ..p.ptr }, meta: None, ty: *t, variant: None, packed: None };
+                    if let Some(b) = self.valtree_walk(f, depth + 1)? { return Ok(Some(b)); }
+                }
+                Ok(None)
+            }
+            TyKind::Adt(d, args, _) => {
+                let Some(adt) = self.tcx.adts.get(&d) else { return unsupported("adt") };
+                if adt.is_union { return Ok(Some(p.ty)); }
+                let lay = self.layout(p.ty)?;
+                let args: Vec<TyId> = tys.list(args).to_vec();
+                let (vi, offs) = if adt.is_enum { let v = self.read_variant(p)? as usize; (v, lay.variant_fields.get(v).cloned().unwrap_or_default()) } else { (0, lay.fields.clone()) };
+                let fields: Vec<TyId> = adt.variants[vi].fields.iter().map(|f| self.tcx.tys.subst_erasing_regions(f.ty, &args)).collect();
+                for (i, t) in fields.into_iter().enumerate() {
+                    let Some(&o) = offs.get(i) else { return unsupported("field offset") };
+                    if o == u32::MAX { return unsupported("extension field"); }
+                    let f = MPlace { ptr: Ptr { off: p.ptr.off + o as u64, ..p.ptr }, meta: None, ty: t, variant: None, packed: None };
+                    if let Some(b) = self.valtree_walk(f, depth + 1)? { return Ok(Some(b)); }
+                }
+                Ok(None)
+            }
+            _ => Ok(Some(p.ty)),
+        }
+    }
+
     // ---- bodies and frames
 
     /// The MIR of `def` at `args` (instantiated typeck, built, promoted).
