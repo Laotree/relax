@@ -1155,9 +1155,10 @@ impl Cache {
     /// warm_count's RETIER_*_OVER) by the tier of its entry in the opened stores.
     pub(crate) fn note_retier_over(&mut self, u: &Unit, id: u32, base: usize) {
         if !self.has_code_entries() { return; }
-        let rank = self.slot_key(u, id).and_then(|k| self.entry_tier(k)).map_or(0, |t| tier_rank(t) as usize + 1);
+        let key = self.slot_key(u, id);
+        let rank = key.and_then(|k| self.entry_tier(k)).map_or(0, |t| tier_rank(t) as usize + 1);
         warm_count::add(base + rank, 1);
-        if trace_on() { trace_lookup(u, id, &format!("fresh-{}-over:{}", if base == warm_count::RETIER_O3_OVER { "O3" } else { "O2" }, ["none", "base", "O1", "O2", "O3"][rank])); }
+        if trace_on() { trace_keyed(u, id, &format!("fresh-{}-over:{}", if base == warm_count::RETIER_O3_OVER { "O3" } else { "O2" }, ["none", "base", "O1", "O2", "O3"][rank]), key); }
     }
 
     fn index_at(&self, key: u128) -> Option<(u32, u32)> {
@@ -2602,7 +2603,7 @@ impl Cache {
         }
         if let Some(t) = payload_tier(&payload) {
             self.rec_tier.insert(key, t);
-            if trace_on() { trace_lookup(u, id, &format!("rec:{}", ["O1", "O3", "O2", "base"].get(t as usize).copied().unwrap_or("?"))); }
+            if trace_on() { trace_keyed(u, id, &format!("rec:{}", ["O1", "O3", "O2", "base"].get(t as usize).copied().unwrap_or("?")), Some(key)); }
         }
         let kc = self.cur_crate;
         self.push_pending(kc, NewEntry { key, kind: KIND_CODE, payload });
@@ -3845,6 +3846,11 @@ pub(crate) fn trace_on() -> bool {
 }
 
 pub(crate) fn trace_lookup(u: &Unit, id: u32, what: &str) {
+    trace_keyed(u, id, what, None)
+}
+
+/// trace_lookup with the code key given (a record runs with the cache taken out of the unit).
+pub(crate) fn trace_keyed(u: &Unit, id: u32, what: &str, code_key: Option<u128>) {
     if !trace_on() {
         return;
     }
@@ -3857,6 +3863,7 @@ pub(crate) fn trace_lookup(u: &Unit, id: u32, what: &str) {
     // the code key and the identity of the fn (its key bytes without interfaces and bodies): the same
     // identity under another key in two runs is a function the cache failed to share
     let (key, ident) = u.cache.as_ref().map_or((0, 0), |c| (c.slot_keys.get(&id).copied().flatten().unwrap_or(0), c.fnkey_bytes.get(&id).and_then(|b| b.as_ref()).map_or(0, |b| identity_hash(b))));
+    let key = code_key.unwrap_or(key);
     let line = format!("{:.1}\t{}\t{}\t{}\t{}\t{}\t{:032x}\t{:032x}\n", crate::jit::wall_ns() as f64 / 1e6, what, if on_main { "main" } else { "worker" }, krate, u.fns[id as usize].name, crate::syms::stable_fn_name(u, id), key, ident);
     crate::zone_alloc::kept_with(|| TRACE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(String::new).push_str(&line));
 }
@@ -3864,6 +3871,8 @@ pub(crate) fn trace_lookup(u: &Unit, id: u32, what: &str) {
 /// Writes MAKEPAD_RUN_CACHE_TRACE (at exit).
 pub fn write_trace() {
     if let Ok(p) = std::env::var("MAKEPAD_RUN_CACHE_TRACE") {
+        // ({pid}: one file per process -- a program's build scripts run under the same env)
+        let p = p.replace("{pid}", &std::process::id().to_string());
         if let Some(t) = TRACE.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = std::fs::write(p, t);
         }
