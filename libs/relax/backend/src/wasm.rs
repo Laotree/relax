@@ -220,6 +220,8 @@ pub struct Stats {
 pub struct Output {
     pub bytes: Vec<u8>,
     pub stats: Stats,
+    /// Actual function imports, including those requested by generated helpers.
+    pub imports: Vec<(String, String)>,
 }
 
 // ------------------------------------------------------------ module
@@ -775,7 +777,8 @@ impl<'a> Module<'a> {
         st.untraced_calls = untraced_calls;
         // a folded copy emits no body: 0 bytes
         st.fn_sizes = funcs.iter().zip(bodies.iter()).enumerate().map(|(k, ((id, f), b))| (*id, f.name.clone(), if canon[ni + k] == ni + k { b.bytes.len() } else { 0 })).collect();
-        Output { bytes: out, stats: st }
+        let imports = self.sh.imports.iter().map(|(module, name, _)| (module.clone(), name.clone())).collect();
+        Output { bytes: out, stats: st, imports }
     }
 }
 
