@@ -1928,6 +1928,21 @@ pub(crate) fn collect_frames(rbp: u64, pc: u64, pc_is_ret: bool) -> Vec<u64> {
 
 /// `collect_frames` over return addresses already read (a fault handler's record): JIT frames,
 /// and the C frames above a stop inside C code up to the JIT code that called it.
+/// A stale access's frames (stale.rs): the pc, then the JIT return addresses of the raw walk.
+pub(crate) fn stale_frames(pc: u64, raw: &[u64]) -> Vec<u64> {
+    frames_from_raw(pc, false, raw)
+}
+
+/// A stale access's crash report (stale.rs; off the faulting thread: the owner is asked with a
+/// deadline, since the faulting thread may be the owner itself).
+pub(crate) fn stale_report(message: &str, frames: &[u64], addr: u64) -> String {
+    if unsafe { UNIT.is_null() } {
+        return String::from("{}");
+    }
+    let info = PanicInfo { kind: "stale access".to_string(), message: message.to_string(), site: u64::MAX, frames: frames.to_vec(), fault_addr: addr, location: String::new() };
+    owner::call_within(owner::Class::Job, 2000, || unsafe { (&*UNIT).report(&info) }).unwrap_or_else(|| format!("{{\"message\":\"(the owner did not answer: raw frames {:x?})\"}}", frames))
+}
+
 fn frames_from_raw(pc: u64, pc_is_ret: bool, raw: &[u64]) -> Vec<u64> {
     let mut frames = vec![pc.wrapping_sub(pc_is_ret as u64)];
     if unsafe { UNIT.is_null() } {
@@ -2617,7 +2632,15 @@ unsafe fn on_fault_locked(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os:
     let safe = FAULT_SAFE.try_with(|c| c.get()).unwrap_or(0) > 0;
     // (leaf_of_jit reads the stack: only asked when it decides)
     let leaf = || !jit && !safe && has_unit && has_ctx && leaf_of_jit(f);
-    match containment(jit, at_leave, has_unit, has_ctx, hooks.chained, safe, leaf) {
+    // an access into memory the JIT retired for good (an unloaded module's window, invalidated
+    // code: reserved, inaccessible, never reused): a stale pointer, never contained (stale.rs;
+    // lock-free lookup of the data address, and of the pc for a jump into retired code)
+    let stale = if matches!(f.kind, Kind::Segv | Kind::Bus) { crate::stale::lookup(fault).or_else(|| crate::stale::lookup(pc)) } else { None };
+    match containment(jit, at_leave, has_unit, has_ctx, hooks.chained, safe, stale.is_some(), leaf) {
+        Containment::Stale => {
+            let r = stale.expect("stale range");
+            crate::stale::on_fault(f, r, |out| walk_fp_bounded(f.fp, f.sp, out))
+        }
         Containment::FatalReport => {
             note_tombstone_fault(f);
             fatal_report(f)
@@ -2653,12 +2676,18 @@ enum Containment {
     Die,
     /// recorded and resumed at the recovery point
     Contain,
+    /// an access into retired memory (stale.rs): the thread parks, the app pauses, the user
+    /// decides -- whatever code made it and whatever recovery point is there
+    Stale,
 }
 
 /// Which faults are contained: only those in JIT code, in FaultSafe host code, or in a leaf JIT
 /// code called. A fault in other Rust or C code may leave locks held and state half made
 /// (a longjmp runs no cleanup): it ends the process (JITSAFE fix 7).
-fn containment(jit: bool, at_leave: bool, has_unit: bool, has_ctx: bool, chained: bool, safe: bool, leaf: impl FnOnce() -> bool) -> Containment {
+fn containment(jit: bool, at_leave: bool, has_unit: bool, has_ctx: bool, chained: bool, safe: bool, stale: bool, leaf: impl FnOnce() -> bool) -> Containment {
+    if stale {
+        return Containment::Stale;
+    }
     if has_unit && (jit && !has_ctx || at_leave) {
         return Containment::FatalReport;
     }
@@ -2684,20 +2713,24 @@ mod containment_tests {
     #[test]
     fn only_jit_faultsafe_and_leaf_faults_are_contained() {
         // (jit, at_leave, unit, ctx, chained, safe, leaf)
-        assert_eq!(containment(true, false, true, true, false, false, || false), Contain);
-        assert_eq!(containment(false, false, true, true, false, true, || false), Contain);
-        assert_eq!(containment(false, false, true, true, false, false, || true), Contain);
+        assert_eq!(containment(true, false, true, true, false, false, false, || false), Contain);
+        assert_eq!(containment(false, false, true, true, false, true, false, || false), Contain);
+        assert_eq!(containment(false, false, true, true, false, false, false, || true), Contain);
         // Rust/C host code with a recovery point: the process ends, never a longjmp past it
-        assert_eq!(containment(false, false, true, true, false, false, || false), Die);
+        assert_eq!(containment(false, false, true, true, false, false, false, || false), Die);
         // a library's own handler sees faults in its code first
-        assert_eq!(containment(false, false, true, true, true, false, || true), PassOn);
-        assert_eq!(containment(true, false, true, true, true, false, || false), Contain);
+        assert_eq!(containment(false, false, true, true, true, false, false, || true), PassOn);
+        assert_eq!(containment(true, false, true, true, true, false, false, || false), Contain);
         // JIT code without a recovery point, or at the recovery entry: fatal report
-        assert_eq!(containment(true, false, true, false, false, false, || false), FatalReport);
-        assert_eq!(containment(false, true, true, true, false, false, || true), FatalReport);
+        assert_eq!(containment(true, false, true, false, false, false, false, || false), FatalReport);
+        assert_eq!(containment(false, true, true, true, false, false, false, || true), FatalReport);
         // no unit / no recovery point outside JIT code: not ours
-        assert_eq!(containment(false, false, false, false, false, false, || true), PassOn);
-        assert_eq!(containment(false, false, true, false, false, false, || true), PassOn);
+        assert_eq!(containment(false, false, false, false, false, false, false, || true), PassOn);
+        assert_eq!(containment(false, false, true, false, false, false, false, || true), PassOn);
+        // an access into retired memory: never contained, from any code
+        assert_eq!(containment(true, false, true, true, false, false, true, || false), Stale);
+        assert_eq!(containment(false, false, true, true, false, true, true, || true), Stale);
+        assert_eq!(containment(false, false, true, true, true, false, true, || false), Stale);
     }
 
     #[test]
@@ -3451,38 +3484,6 @@ impl Unit {
         CodeKind::new(t, origin::FRESH)
     }
 
-    /// Drops the index entries of code in [lo, hi) (a recycled sandbox code space).
-    pub(crate) fn unindex_range(&mut self, lo: u64, hi: u64) {
-        let mut t = self.code.write().unwrap_or_else(|e| e.into_inner());
-        let t = &mut *t;
-        let keep: Vec<bool> = t.index.iter().map(|x| x.0 < lo || x.0 >= hi).collect();
-        let mut k = 0;
-        t.kinds.retain(|_| {
-            k += 1;
-            keep[k - 1]
-        });
-        t.index.retain(|x| x.0 < lo || x.0 >= hi);
-        t.unwind.retain(|a, _| *a < lo || *a >= hi);
-        t.inlined.retain(|a, _| *a < lo || *a >= hi);
-    }
-
-    /// Reserves code memory without writing it (sandbox code spaces).
-    pub(crate) fn reserve_code(&self, len: u64) -> u64 {
-        bump(&self.code_next, len, 1 << 16, self.exec_base + self.exec_size, "out of code memory")
-    }
-
-    /// Links code for `at` (the caller placed it there).
-    pub(crate) fn link_at(&self, at: u64, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Result<Vec<u8>, String> {
-        let mut c = code.to_vec();
-        self.link_code(&mut c, at, relocs)?;
-        Ok(c)
-    }
-
-    /// The lazy stub of slot `id` (what its table word holds before its first compile).
-    pub(crate) fn stub_of(&self, id: u32) -> u64 {
-        self.slots.stub(id)
-    }
-
     /// Code at a fresh address with its relocated fields linked for that address.
     /// no-codegen mode: the address a slot takes for `code` (which must be a plain jump with no
     /// relocations: an interpreter entry or a foreign function); other machine code is an error.
@@ -3508,7 +3509,7 @@ impl Unit {
         }
     }
 
-    fn emit_linked(&self, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Result<u64, String> {
+    pub(crate) fn emit_linked(&self, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Result<u64, String> {
         let at = bump(&self.code_next, code.len() as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
         let mut c = code.to_vec();
         self.link_code(&mut c, at, relocs)?;
@@ -5746,21 +5747,18 @@ impl Unit {
         let code = &code[..n];
         let twin = matches!(self.fns[id as usize].key, FnKey::Sandbox(_));
         let redirect = if interp || options.no_codegen { Some(self.no_codegen_target(code, relocs, &self.fns[id as usize].name)?) } else { None };
-        // a sandboxed twin's code goes to the sandbox code space (recycled as a whole)
+        // (code is append-only: a replaced version stays mapped, twins' too)
         let at = match redirect {
             Some(t) => t,
-            None => match if twin { crate::sandbox::emit_twin(self, code, relocs) } else { None } {
-                Some(a) => a,
-                None => self.emit_linked(code, relocs)?,
-            },
+            None => self.emit_linked(code, relocs)?,
         };
         if redirect.is_none() {
             self.index_code(at, code.len() as u32, id, info);
         }
-        let f = &mut self.fns[id as usize];
-        if twin && f.compiled {
-            crate::sandbox::note_dead(f.code_len as u64);
+        if redirect.is_none() {
+            code_growth(if twin { GROW_MODULE } else if gen > 0 { GROW_PATCH } else { GROW_FIRST }, code.len());
         }
+        let f = &mut self.fns[id as usize];
         if f.compiled {
             let old_map = std::mem::take(&mut f.pc_map);
             crate::zone_alloc::kept_with(|| f.history.get_or_insert_with(Default::default).prev.push((f.code, f.code_len, old_map, f.patch_gen)));
@@ -6790,6 +6788,7 @@ impl Unit {
         }
         self.cache = Some(cache);
         PENDING_RECORDS.store(self.pending_cache_records.len() - self.pending_cache_cursor, Ordering::Relaxed);
+        crate::cache::warm_count::N[crate::cache::warm_count::RECORDS_WAITING].store((self.pending_cache_records.len() - self.pending_cache_cursor) as u64, Ordering::Relaxed);
         if self.pending_cache_cursor == self.pending_cache_records.len() {
             self.pending_cache_records = Vec::new();
             self.pending_cache_cursor = 0;
@@ -6821,6 +6820,13 @@ pub(crate) fn drain_records_bounded() {
         let _job = compile_job();
         let more = owner::publish(|| {
             let up = SPEC_UNIT.load(Ordering::Acquire);
+            {
+                // (diagnostic: why the last drain stopped)
+                use crate::cache::warm_count as wc;
+                let why = if SPEC_STOP.load(Ordering::SeqCst) { 1 } else if up.is_null() { 2 } else if unsafe { (&*up).cache.is_none() } { 3 } else if up != TIER_UNIT.load(Ordering::Acquire) { 4 } else { 5 };
+                wc::N[wc::DRAIN_WHY].store(why, Ordering::Relaxed);
+                if !up.is_null() { wc::N[wc::DRAIN_LEN].store(unsafe { (&*up).pending_cache_records.len() - (&*up).pending_cache_cursor } as u64, Ordering::Relaxed); }
+            }
             !SPEC_STOP.load(Ordering::SeqCst) && !up.is_null() && unsafe { (&mut *up).record_cache_batch(RECORD_BATCH) }
         });
         if !more { break; }
@@ -6878,6 +6884,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                     if let Some(p) = deferred {
                         u.pending_cache_records.push(Some(p));
                         PENDING_RECORDS.fetch_add(1, Ordering::Relaxed);
+                        crate::cache::warm_count::add(crate::cache::warm_count::RECORDS_WAITING, 1);
                     }
                 }
             }
@@ -8157,6 +8164,7 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
     if snapshot {
         crate::zone_alloc::kept_with(|| O2_LATER.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id)));
     } else if let Some(mut cache) = u.cache.take() {
+        cache.note_retier_over(u, id, crate::cache::warm_count::RETIER_O2_OVER);
         cache.record_o2(u, id, &c.code, &c.relocs, &c.pc_map);
         u.cache = Some(cache);
     }
@@ -12778,6 +12786,7 @@ pub fn sweep_verdicts() {
                     if f.compiled && (f.o3.load(Ordering::Relaxed) || !f.d3_lowered.load(Ordering::Relaxed) && u.disjoint_checks(id as u32).is_some()) {
                         relower.push(id as u32);
                     } else {
+                        if f.compiled { crate::cache::warm_count::add(crate::cache::warm_count::SPECV_LATE, 1); }
                         verified.push(id as u32);
                     }
                 } else if looked && matches!(u.verdict_state(id as u32), Verdict::Failed(_)) {
@@ -14247,6 +14256,10 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
         // build (the first worker's poll alone waited out its own builds: hot slots came out of
         // the window one at a time behind a long O3 build)
         pgo_poll();
+        // the deferred cache records (its O3 installs' among them) are encoded here too, not only
+        // by the run monitor: cold races where the monitor stopped draining at ~40 s left 12k
+        // records (4k of them O3 code) for the quit write, and the warm launch re-tiered them
+        if records_due() { drain_records_bounded(); }
         let (id, why, queued_at, rate) = {
             let mut q = tier_queue().unwrap_or_else(|e| e.into_inner());
             loop {
@@ -15469,16 +15482,22 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // speculative code holds this run's site records (crate::guards): never cached
                 let speculative = spec_ctx.as_ref().is_some_and(|c| c.emitted.get());
                 // (inspect's builds are this session's: never cached)
+                {
+                    use crate::cache::warm_count as wc;
+                    wc::add(if unverified { wc::O3_UNVERIFIED } else if speculative || inspect_o3_on() { wc::O3_SPEC } else if frame_size > frame_max { wc::O3_FRAME } else { wc::O3_QUEUED }, 1);
+                }
                 if frame_size <= frame_max && !unverified && !speculative && !inspect_o3_on() {
                     // its key and certificate encoding in the bounded record batches (records_due),
                     // not in this publish
-                    if let Some(c) = u.cache.take() {
+                    if let Some(mut c) = u.cache.take() {
+                        c.note_retier_over(u, id, crate::cache::warm_count::RETIER_O3_OVER);
                         let tr = cpu_ns();
                         let p = c.defer_record_o3(u, id, &code, &relocs, &map, &inlined, &nounwind_used);
                         u.cache = Some(c);
                         if let Some(p) = p {
                             u.pending_cache_records.push(Some(p));
                             PENDING_RECORDS.fetch_add(1, Ordering::Relaxed);
+                        crate::cache::warm_count::add(crate::cache::warm_count::RECORDS_WAITING, 1);
                         }
                         O3_INSTALL_REC[0].fetch_add(1, Ordering::Relaxed);
                         O3_INSTALL_REC[1].fetch_add(cpu_ns() - tr, Ordering::Relaxed);
@@ -15522,13 +15541,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 let at = if blob {
                     u.emit_or_redirect(&code, &relocs, "O3").expect("O3 interpreted code installs")
                 } else {
-                    match if sandboxed { crate::sandbox::emit_twin(u, &code, &relocs) } else { None } {
-                        Some(at) => at,
-                        None => u.emit_linked(&code, &relocs).expect("O3 code links (checked)"),
-                    }
+                    u.emit_linked(&code, &relocs).expect("O3 code links (checked)")
                 };
-                if sandboxed {
-                    crate::sandbox::note_dead(u.fns[id as usize].code_len as u64);
+                if !blob {
+                    code_growth(if sandboxed { GROW_MODULE } else if u.retiers.contains_key(&id) { GROW_REOPT } else { GROW_TIERUP }, code.len());
                 }
                 o3_owner(2, te);
                 let tx = cpu_ns();
@@ -19728,12 +19744,28 @@ pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body, warm_only: bool,
 
 /// Bump allocation in [*next, end): `size` bytes at `align` (lock-free: lowering threads and
 /// the lock holder allocate concurrently).
+/// The unit's code window is full: there is nowhere left to put code (it is append-only). A clear
+/// report, then a real crash (never an unwind a fault containment could swallow).
+#[cold]
+fn code_full(size: u64) -> ! {
+    let mut msg = format!("makepad run: the JIT code window is full ({} bytes asked); code is never freed. Installed code by source:", size);
+    for k in 0..GROW_NAMES.len() {
+        msg += &format!(" {} {:.1} MB ({} installs);", GROW_NAMES[k], CODE_GROWTH[k].load(Ordering::Relaxed) as f64 / 1048576.0, CODE_INSTALLS[k].load(Ordering::Relaxed));
+    }
+    eprintln!("{}", msg);
+    std::process::abort();
+}
+
 fn bump(next: &AtomicU64, size: u64, align: u64, end: u64, full: &str) -> u64 {
     let a = align.max(1);
     let mut cur = next.load(Ordering::Relaxed);
     loop {
         let at = (cur + a - 1) / a * a;
         if at + size > end {
+            if full == "out of code memory" {
+                // code is append-only (every version stays mapped): nowhere is left to put code
+                code_full(size);
+            }
             // (a constant that asks for more memory than the compiler has is a constant-evaluation
             // error, not a compiler bug: rustc's `MemoryExhausted`)
             std::panic::resume_unwind(Box::new(crate::infer::diagnostics::FatalError(format!("E0080: tried to allocate more memory than available to compiler ({full})"))));
@@ -19747,6 +19779,23 @@ fn bump(next: &AtomicU64, size: u64, align: u64, end: u64, full: &str) -> u64 {
             Err(x) => cur = x,
         }
     }
+}
+
+/// Code bytes installed by source (append-only code: makepad inspect `code`): a slot's first
+/// code, an O3 tier-up, an O3 rebuild (re-optimize), a hot patch, a run-time module's twins.
+pub(crate) const GROW_FIRST: usize = 0;
+pub(crate) const GROW_TIERUP: usize = 1;
+pub(crate) const GROW_REOPT: usize = 2;
+pub(crate) const GROW_PATCH: usize = 3;
+pub(crate) const GROW_MODULE: usize = 4;
+pub(crate) const GROW_NAMES: [&str; 5] = ["first", "tier-up", "re-optimize", "patch", "module"];
+pub(crate) static CODE_GROWTH: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// ... and the number of installs of each
+pub(crate) static CODE_INSTALLS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+fn code_growth(source: usize, bytes: usize) {
+    CODE_GROWTH[source].fetch_add(bytes as u64, Ordering::Relaxed);
+    CODE_INSTALLS[source].fetch_add(1, Ordering::Relaxed);
 }
 
 /// A unit's own address (see Unit::self_ptr).

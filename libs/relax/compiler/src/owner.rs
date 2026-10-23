@@ -579,7 +579,8 @@ pub fn forbid_in_publish(what: &'static str, slot: u32) {
             let at = std::panic::Location::caller();
             eprintln!("makepad-run: BUG: {} inside a publish to the compiler's owner at {}:{} (rule I-PUB), slot {}", what, at.file(), at.line(), slot);
             crate::inspect::flightrec::event("ipub.violation", what, slot as u64, at.line() as u64);
-            panic!("makepad: {} inside a publish to the compiler's owner (rule I-PUB: a publish is bounded and never runs a front, an initializer, JIT code or a wait)", what)
+            // (with the stack: where the publish was entered from)
+            panic!("makepad: {} inside a publish to the compiler's owner at {} (rule I-PUB: a publish is bounded and never runs a front, an initializer, JIT code or a wait)\n{}", what, at, std::backtrace::Backtrace::force_capture())
         }
     }
 }
