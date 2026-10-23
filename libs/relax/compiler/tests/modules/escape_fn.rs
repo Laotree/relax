@@ -38,7 +38,13 @@ fn escape_fn() {
     ];
     if std::env::var("SAFE2_ESCAPE_CALL").is_ok_and(|v| v == "1") {
         // the repro: before the fix this loads, and the host calls module code from a bare thread
-        let m = load(cases[0].0, cases[0].1).unwrap();
+        let m = match load(cases[0].0, cases[0].1) {
+            Ok(m) => m,
+            Err(e) => {
+                println!("out escaping fn value refused at load: {}", e.contains("host API"));
+                return;
+            }
+        };
         let reg: fn() -> u64 = m.get("reg").unwrap();
         reg();
         let p = KEPT.load(Ordering::SeqCst);

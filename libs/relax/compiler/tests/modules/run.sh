@@ -61,6 +61,18 @@ if [ "$GOT" = "$(cat "$D/expect-contain.out")" ]; then echo "modules contain: PA
 OUT=$(MAKEPAD_RUN_WATCHDOG_MS=120000 "$1" test "$D/reclaim_threads.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$GOT" = "$(cat "$D/expect-reclaim.out")" ]; then echo "modules reclaim threads: PASS ($(echo "$OUT" | grep -o 'reclaim_threads: .*'))"; else echo "modules reclaim threads: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
+# Arena reclamation: a module unloaded while a thread is inside keeps its window until it left (SAFE2 F2).
+OUT=$(MAKEPAD_RUN_WATCHDOG_MS=120000 "$1" test "$D/unload_inside.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = "$(cat "$D/expect-unload-inside.out")" ]; then echo "modules unload inside: PASS ($(echo "$OUT" | grep -o 'unload_inside: .*'))"; else echo "modules unload inside: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
+# Module code handed to the host as a value is refused at the host API boundary (SAFE2 F3).
+OUT=$("$1" test "$D/escape_fn.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = $'out escaping fn values refused: true\nout plain data to host API: true' ]; then echo "modules escape fn: PASS"; else echo "modules escape fn: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
+# Shadow stacks, result slots and fuel per thread and entry (SAFE2 F4).
+OUT=$(MAKEPAD_RUN_MODULE_FUEL=2000000 "$1" test "$D/shadow_threads.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = "$(cat "$D/expect-shadow-threads.out")" ]; then echo "modules shadow threads: PASS"; else echo "modules shadow threads: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
 # This case compiles/edits 400 modules; its harness deadline includes compilation.
 OUT=$(MAKEPAD_RUN_WATCHDOG_MS=120000 "$1" test "$D/recycle.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
