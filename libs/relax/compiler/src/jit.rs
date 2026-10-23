@@ -7426,14 +7426,18 @@ pub fn src_size(u: &Unit, id: u32) -> u32 {
 /// #[inline]/#[inline(always)], rule 4 (core instances made for a closure / fn item), and
 /// with `core_hint` the implicit #[inline] of Relax core's functions (real std marks its
 /// small methods #[inline]). User code only with `inline_all`.
-fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &crate::conc::AppendVec<FnEntry>, core_crate: u32, c: u32, inline_all: bool, core_hint: bool) -> Option<u8> {
+///
+/// `into_unverified`: the build is unverified code itself (an O3 build of an unverified body or of
+/// a twin: never cached, rebuilt once verified): it may take in unverified callees too, and then
+/// stays unverified (O3Assembled::unverified_in). A verified build never holds unverified code.
+fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &crate::conc::AppendVec<FnEntry>, core_crate: u32, c: u32, inline_all: bool, core_hint: bool, into_unverified: bool) -> Option<u8> {
     let options = &prog.session.clone().options;
     // a sandboxed module's code is never inlined into host code (it runs only as twins)
     if crate::sandbox::is_sandboxed_crate_key(prog, &fns[c as usize].key) {
         return None;
     }
-    // SPEC-V: unverified code is never inlined into other code
-    if fns[c as usize].unverified.load(Ordering::Relaxed) {
+    // SPEC-V: unverified code is inlined only into unverified code
+    if !into_unverified && fns[c as usize].unverified.load(Ordering::Relaxed) {
         return None;
     }
     // makepad inspect: an instrumented or pinned fn runs as its own code (a copy would run
@@ -9037,7 +9041,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             // refused callees (#[inline(never)], sandboxed, user code without inline_all,
             // MAKEPAD_RUN_NOINL) are not built for inlining: decided before the build, not after
             let want = (baseline && matches!(u.fns[*c as usize].key, FnKey::Glue(..)) || inline_source_wanted(u, *c, full))
-                && callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint).is_some()
+                && callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false).is_some()
                 && !noinl_callee.is_some_and(|p| name_matches(&u.fns[*c as usize].name, p));
             if want && O2_SNAPSHOT.try_with(|c| c.get()).unwrap_or(false) {
                 // a snapshot O2 build makes no front end under the lock: candidates with RIR only
@@ -9095,7 +9099,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     if let Ok(Front::Opt(p, _)) = r {
                         let u = &*up;
                         // built (its RIR is stored) but not inlined when it calls this fn back
-                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint) };
+                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false) };
                         if attrs.is_none() && sig_dir().is_some() && inline_cycle(u, id, *c) {
                             skipped.push((*c, "cycle"));
                         }
@@ -9114,7 +9118,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     // (off the owner); its RIR replaces the baseline RIR at the finish
                     if let Some(Some(p)) = collect_fronts(&mut needs, || split_upgrade(up, *c)) {
                         let u = &*up;
-                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint) };
+                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false) };
                         deferred.push((*c, attrs, p));
                     }
                 } else {
@@ -9131,7 +9135,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             if !wanted.contains(&c) || deferred.iter().any(|x| x.0 == c) {
                 continue;
             }
-            let attrs = match callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, core_hint) {
+            let attrs = match callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, core_hint, false) {
                 Some(a) => a,
                 None => continue,
             };
@@ -12803,6 +12807,17 @@ pub fn sweep_verdicts() {
                 }
             }
         }
+        // unverified O3 code that inlined a rejected callee: built again without it
+        let mut rejected_in = Vec::new();
+        if !failed.is_empty() {
+            let mut a = UNVERIFIED_IN.lock().unwrap_or_else(|e| e.into_inner());
+            a.retain(|&(k, c, r)| {
+                if k != up as usize { return false; }
+                if !failed.contains(&c) { return true; }
+                if !rejected_in.contains(&r) { rejected_in.push(r); }
+                false
+            });
+        }
         // ... and the ones whose unverified lowering calls hot twins
         let mut tc = twin_callers(u, &verified, None);
         {
@@ -12842,6 +12857,12 @@ pub fn sweep_verdicts() {
         }
         relower_twin_callers(up, &tc);
         for &id in &relower { tier_push(id, Q_RETIER, 0); }
+        for &r in &rejected_in {
+            if specv_trace() {
+                eprintln!("specv @{:.3} O3 #{} {} built again: it inlined a callee the borrow checker rejected", wall_ns() as f64 / 1e9, r, short_name(&u.fns[r as usize].name));
+            }
+            (&mut *up).retier(r);
+        }
         for &r in &again {
             if specv_trace() {
                 eprintln!("specv @{:.3} O3 #{} {} built again: a callee it left out unverified is verified", wall_ns() as f64 / 1e9, r, short_name(&u.fns[r as usize].name));
@@ -12955,6 +12976,16 @@ static TWIN_USERS: std::sync::LazyLock<relax_session::sync::Mutex<HashMap<(usize
 /// unverified (never inlined before its verdict): `root` is built again once it is verified
 /// (sweep_verdicts, or its own install when the verdict came first)
 static UNVERIFIED_LEFT: relax_session::sync::Mutex<Vec<(usize, u32, u32)>> = relax_session::sync::Mutex::new(Vec::new());
+/// SPEC-V: (unit, callee, root): the installed O3 code of `root` (an unverified build) inlined
+/// `callee` while it was unverified: a failed verdict of `callee` builds `root` again without it
+static UNVERIFIED_IN: relax_session::sync::Mutex<Vec<(usize, u32, u32)>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// SPEC-V: whether an unverified callee among `inlined` (of the snapshot's `unverified_in`) was
+/// rejected by the borrow checker since the snapshot (owner)
+fn inlined_rejected(u: &Unit, unverified_in: &[u32], inlined: &[u32]) -> bool {
+    unverified_in.iter().any(|c| inlined.contains(c) && matches!(u.verdict_state(*c), Verdict::Failed(_)))
+}
+
 /// SPEC-V: unverified callers of hot twins: lowered again once their verdict is clean (sweep_verdicts)
 static TWIN_AWAIT: relax_session::sync::Mutex<Vec<(usize, u32)>> = relax_session::sync::Mutex::new(Vec::new());
 
@@ -15220,7 +15251,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         owner::publish(|| o3_assemble_owner(up, options, &mut a, &t1key, &t1_rec));
         a
     });
-    let O3Assembled { mut snap, singles, cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: t1_single_keys, snap_counts, unverified_left, .. } = assembled;
+    let O3Assembled { mut snap, singles, cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: t1_single_keys, snap_counts, unverified_left, root_unverified, unverified_in, .. } = assembled;
     if let Some(m) = measure.as_mut() { m.phase(1, t1); }
     trace_tier1_phase(id, "backend");
     // PGO: counted inline candidates carry their counts into the inliner (it scales them to the
@@ -15458,7 +15489,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         u.stats.tier1_locked_ns += owner_ns.get();
         u.stats.tier1_free_ns += t2 - t1;
         let ok = match built {
-            Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, absent, frame_size, self_call, nounwind_used, profile_entry)))) if PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && (!crate::inspect::instrument::active(id) || inspect_o3_on()) && {
+            Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, absent, frame_size, self_call, nounwind_used, profile_entry)))) if PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && (!crate::inspect::instrument::active(id) || inspect_o3_on()) && !inlined_rejected(u, &unverified_in, &inlined) && {
                 let n = if relax_codegen::interp::blob::is_blob(&code) { code.len() } else { relax_backend::rir::split_unwind_info(&code).0 };
                 let tl = cpu_ns();
                 let ok = u.link_check(&code[..n], &relocs);
@@ -15498,7 +15529,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                             incomplete = true;
                             continue;
                         }
-                        if f.build_err.is_some() || callee_attrs(&u.prog, &u.tcx, &u.fns, core, c, inline_all, true).is_none() {
+                        if f.build_err.is_some() || callee_attrs(&u.prog, &u.tcx, &u.fns, core, c, inline_all, true, root_unverified).is_none() {
                             continue;
                         }
                         if !f.compiled && f.rir.is_none() {
@@ -15544,7 +15575,13 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 }
                 let frame_max = if recursive { TIER1_CACHE_FRAME_MAX } else { TIER1_CACHE_FRAME_MAX_FLAT };
                 // SPEC-V: unverified O3 code is never the slot's entry (it is built again once verified)
-                let unverified = u.fns[id as usize].unverified.load(Ordering::Relaxed);
+                // (an unverified root's build, or one that took in unverified callees, is unverified
+                // code even when the root's verdict came while it was built: built again then)
+                let unverified_now = u.fns[id as usize].unverified.load(Ordering::Relaxed);
+                let unverified_inl: Vec<u32> = unverified_in.iter().copied().filter(|c| inlined.contains(c)).collect();
+                // (a twin is unverified by kind: its own O3 code is treated as before)
+                let built_unverified = root_unverified && !matches!(u.fns[id as usize].key, FnKey::Plain(_)) || !unverified_inl.is_empty();
+                let unverified = unverified_now || built_unverified;
                 // speculative code holds this run's site records (crate::guards): never cached
                 let speculative = spec_ctx.as_ref().is_some_and(|c| c.emitted.get());
                 // (inspect's builds are this session's: never cached)
@@ -15568,6 +15605,13 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                         O3_INSTALL_REC[0].fetch_add(1, Ordering::Relaxed);
                         O3_INSTALL_REC[1].fetch_add(cpu_ns() - tr, Ordering::Relaxed);
                     }
+                }
+                // SPEC-V: the unverified callees this code holds: a failed verdict of one makes it
+                // built again (sweep_verdicts); the root's earlier builds' entries go
+                {
+                    let mut a = UNVERIFIED_IN.lock().unwrap_or_else(|e| e.into_inner());
+                    a.retain(|&(k, _, r)| k != up as usize || r != id);
+                    crate::zone_alloc::kept_with(|| for &c in &unverified_inl { a.push((up as usize, c, id)); });
                 }
                 u.fns[id as usize].o3.store(true, Ordering::Relaxed);
                 if o3_first() {
@@ -15677,6 +15721,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                         false
                     });
                 }
+                // unverified code whose root was verified while it was built: built again as
+                // verified code (the verdict sweep saw no O3 code to relower yet)
+                if built_unverified && !unverified_now && !matches!(u.fns[id as usize].key, FnKey::Plain(_)) && u.verdict_clean(id) {
+                    again = true;
+                }
                 if again && !(t1prof_on(options) && T1PROF.lock().unwrap().as_ref().map_or(false, |p| p.replay)) {
                     u.retier(id);
                 }
@@ -15738,6 +15787,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     Ok(Err(_)) => "codegen error",
                     Ok(Ok(_)) if PATCH_EPOCH.load(Ordering::SeqCst) != epoch || PATCH_OPEN.load(Ordering::SeqCst) => "patch changed meanwhile",
                     Ok(Ok(_)) if u.fns[id as usize].version != version => "slot changed meanwhile",
+                    Ok(Ok((_, _, _, (inlined, ..)))) if inlined_rejected(u, &unverified_in, inlined) => "inlined a rejected callee",
                     Ok(Ok(_)) => "link check failed",
                 };
                 drop_why(up, why);
@@ -15758,6 +15808,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // steady state). Build it again from the new version (retier: RETIERS times at most
                 // per slot, so a slot a patch keeps changing is not chased).
                 if why == "slot changed meanwhile" && !u.fns[id as usize].o3.load(Ordering::Relaxed) {
+                    u.retier(id);
+                }
+                // SPEC-V: a callee it took in unverified was rejected meanwhile: built again
+                // without it (the snapshot leaves a rejected callee out)
+                if why == "inlined a rejected callee" {
                     u.retier(id);
                 }
                 // Replay never retries according to install order; expose a refused install.
@@ -16931,7 +16986,7 @@ unsafe fn o3_next_level(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &
                 None => !v.compiled && v.uninlined,
             };
             let cost_admits = !relax_backend::stats::opt_off(options, "-costmodel")
-                && callee_attrs(prog, tcx, fns, core, c, inline_all, true)
+                && callee_attrs(prog, tcx, fns, core, c, inline_all, true, unverified_root(fns, id))
                     .map_or(false, |attrs| relax_codegen::opt::rustc_inline_cost(r, c) <= relax_codegen::opt::rustc_inline_threshold(r, attrs));
             if never_run && relax_codegen::opt::inst_count(r) > relax_codegen::opt::INLINE_FREE_INSTS && !cost_admits {
                 continue;
@@ -16973,8 +17028,22 @@ struct O3Assembled {
     /// SPEC-V: callees left out as unverified (never inlined before their verdict): the build is
     /// queued again once they are verified (UNVERIFIED_LEFT, owner part), their verdicts first
     unverified_left: Vec<u32>,
+    /// SPEC-V: the build is unverified code (`unverified_root` at the snapshot): it may inline
+    /// unverified callees (`unverified_in`), never cached, rebuilt once its root is verified
+    root_unverified: bool,
+    /// SPEC-V: unverified callees in the snapshot (only into an unverified root; one whose verdict
+    /// failed is taken out by the owner part): a failed verdict of one invalidates the build's code
+    /// (UNVERIFIED_IN)
+    unverified_in: Vec<u32>,
     /// the build's root slot
     root: u32,
+}
+
+/// SPEC-V: whether slot `id`'s builds are unverified code: a body without a clean verdict yet
+/// (flagged) or an unverified-mode twin.
+fn unverified_root(fns: &crate::conc::AppendVec<FnEntry>, id: u32) -> bool {
+    let f = &fns[id as usize];
+    f.unverified.load(Ordering::Relaxed) || matches!(f.key, FnKey::Plain(_))
 }
 
 /// The snapshot from the walk's views (the views, immutable slot keys, prog/tcx and the replay
@@ -16989,9 +17058,11 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &cr
     // PGO: block counts of counted inline candidates (slot, key when profiling, counts)
     let mut snap_counts: Vec<(u32, Option<String>, Vec<f32>)> = Vec::new();
     let mut unverified_left: Vec<u32> = Vec::new();
+    let mut unverified_in: Vec<u32> = Vec::new();
+    let root_unverified = unverified_root(fns, id);
     for &c in callees {
         let Some(v) = views.get(&c) else { continue };
-        let attrs = match callee_attrs(prog, tcx, fns, core, c, inline_all, true) {
+        let attrs = match callee_attrs(prog, tcx, fns, core, c, inline_all, true, root_unverified) {
             Some(a) if xcrate_unavailable(prog, fns, core, id, c) => (a & !relax_codegen::opt::ATTR_HINT) | relax_codegen::opt::ATTR_XCRATE,
             Some(a) => a,
             None => {
@@ -17037,6 +17108,9 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &cr
                     snap_counts.push((c, ck, cc));
                 }
             }
+            if root_unverified && fns[c as usize].unverified.load(Ordering::Relaxed) {
+                unverified_in.push(c);
+            }
             snap.push((c, r.clone(), attrs));
         }
     }
@@ -17066,7 +17140,7 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &cr
         _ => None,
     }).collect();
     TIER1_TAKE_PARTS[5].fetch_add(cpu_ns() - ta, Ordering::Relaxed);
-    O3Assembled { snap, single_cands, singles: HashMap::new(), cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: Vec::new(), snap_counts, unverified_left, root: id }
+    O3Assembled { snap, single_cands, singles: HashMap::new(), cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: Vec::new(), snap_counts, unverified_left, root_unverified, unverified_in, root: id }
 }
 
 /// The owner part of a snapshot (a publish: O(candidates), recursive_fn walks a candidate's calls):
@@ -17074,6 +17148,18 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &cr
 /// PGO block counts.
 unsafe fn o3_assemble_owner(up: *mut Unit, options: &crate::options::Options, a: &mut O3Assembled, t1key: &Option<String>, t1_rec: &Option<(Vec<String>, Vec<String>, Vec<String>)>) {
     let t = cpu_ns();
+    // SPEC-V: an unverified callee the borrow checker rejected is never optimised into other code
+    // (o3_allowed's rule for its own code)
+    if !a.unverified_in.is_empty() {
+        let u = &*up;
+        let failed: Vec<u32> = a.unverified_in.iter().copied().filter(|&c| matches!(u.verdict_state(c), Verdict::Failed(_))).collect();
+        if !failed.is_empty() {
+            a.snap.retain(|x| !failed.contains(&x.0));
+            a.single_cands.retain(|x| !failed.contains(&x.0));
+            a.snap_counts.retain(|x| !failed.contains(&x.0));
+            a.unverified_in.retain(|c| !failed.contains(c));
+        }
+    }
     if !a.unverified_left.is_empty() {
         {
             let mut l = UNVERIFIED_LEFT.lock().unwrap_or_else(|e| e.into_inner());
