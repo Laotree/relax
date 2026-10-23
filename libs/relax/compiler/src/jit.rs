@@ -837,6 +837,144 @@ pub(crate) fn domain_callback<R>(base: u64, token: u64, f: impl FnOnce() -> R) -
 
 thread_local! {
     static ALTSTACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// the top of this thread's stack (recorded by ensure_altstack; 0: unknown): frame walks
+    /// read only [sp, STACK_HI)
+    static STACK_HI: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// inside our fault handler on this thread: a second fault there is fatal, never handled again
+    static IN_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// host code that may fault and holds nothing a fault could leave behind (no lock, no
+    /// half-made value): the sandbox's arena-checked memory helpers (FaultSafe)
+    static FAULT_SAFE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// the fault the handler contained, recorded with no allocation or lock; made into a
+    /// PanicInfo (policy, report, poisoned note) at the recovery point (`materialize_fault`)
+    static FAULT_REC: std::cell::UnsafeCell<FaultRec> = const { std::cell::UnsafeCell::new(FaultRec::EMPTY) };
+}
+
+/// Frames a fault handler records (raw return addresses, outermost last).
+const FAULT_FRAMES: usize = 64;
+
+/// A fault the handler contained (async-signal-safe: plain data in a thread-local).
+#[derive(Clone, Copy)]
+struct FaultRec {
+    /// 0: none, 2: a fault (leave code 2), 3: a watchdog hang (leave code 3)
+    pending: u8,
+    kind: os::fault::Kind,
+    sig: i32,
+    pc: u64,
+    sp: u64,
+    fp: u64,
+    addr: u64,
+    /// the thread's guard / const-evaluation depth at the fault (the policy reads them later)
+    guard_depth: u32,
+    const_eval_depth: u32,
+    n: usize,
+    raw: [u64; FAULT_FRAMES],
+}
+
+impl FaultRec {
+    const EMPTY: FaultRec = FaultRec { pending: 0, kind: os::fault::Kind::Other, sig: 0, pc: 0, sp: 0, fp: 0, addr: 0, guard_depth: 0, const_eval_depth: 0, n: 0, raw: [0; FAULT_FRAMES] };
+}
+
+/// Host code that may fault where its JIT caller's code would have (the sandbox's checked memory
+/// helpers): a fault inside it is contained like one in JIT code. Only for code that holds no lock
+/// and leaves no half-made state on any path.
+pub(crate) struct FaultSafe;
+
+impl FaultSafe {
+    #[inline]
+    pub(crate) fn enter() -> FaultSafe {
+        FAULT_SAFE.with(|c| c.set(c.get() + 1));
+        FaultSafe
+    }
+}
+
+impl Drop for FaultSafe {
+    #[inline]
+    fn drop(&mut self) {
+        FAULT_SAFE.with(|c| c.set(c.get() - 1));
+    }
+}
+
+/// The frame-pointer chain from `fp`, bounded to this thread's stack [lo, STACK_HI): only
+/// aligned, strictly rising frame addresses inside it are read, so a corrupt chain ends the walk
+/// instead of faulting (signal-safe: no allocation, no lock). Returns the count written.
+fn walk_fp_bounded(mut fp: u64, lo: u64, out: &mut [u64]) -> usize {
+    let hi = STACK_HI.try_with(|c| c.get()).unwrap_or(0);
+    let mut n = 0;
+    while n < out.len() {
+        if hi == 0 || fp & 7 != 0 || fp < lo || fp.saturating_add(16) > hi {
+            break;
+        }
+        let ret = unsafe { *((fp + 8) as *const u64) };
+        out[n] = ret;
+        n += 1;
+        let next = unsafe { *(fp as *const u64) };
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    n
+}
+
+/// A fault outside JIT code: is its function a leaf JIT code called directly, with nothing of its
+/// own on the stack yet (libc memcpy/memset with a bad pointer)? Such a function holds no lock and
+/// leaves no state: containing the fault is as safe as in JIT code. x86_64: the return address is
+/// still at [sp]. arm64: the link register returns into JIT code and the function made no frame
+/// record of its own (a non-leaf stores x30 in its record, so [fp+8] would equal it).
+fn leaf_of_jit(f: &os::fault::Fault) -> bool {
+    let hi = STACK_HI.try_with(|c| c.get()).unwrap_or(0);
+    if hi == 0 || f.sp & 7 != 0 || f.sp.saturating_add(8) > hi {
+        return false;
+    }
+    if cfg!(target_arch = "aarch64") {
+        if !in_jit_code(f.lr) {
+            return false;
+        }
+        let own_record = f.fp & 7 == 0 && f.fp >= f.sp && f.fp.saturating_add(16) <= hi && unsafe { *((f.fp + 8) as *const u64) } == f.lr;
+        !own_record
+    } else {
+        in_jit_code(unsafe { *(f.sp as *const u64) })
+    }
+}
+
+/// Writes "<prefix><hex>" pieces to stderr in one call, from a fault handler (no allocation).
+fn raw_report(f: &os::fault::Fault, what: &str) {
+    let mut buf = [0u8; 512];
+    let mut n = 0;
+    let mut put = |b: &[u8], n: &mut usize| {
+        let k = b.len().min(buf.len() - *n);
+        buf[*n..*n + k].copy_from_slice(&b[..k]);
+        *n += k;
+    };
+    let hex = |v: u64| {
+        let mut h = [0u8; 18];
+        h[0] = b'0';
+        h[1] = b'x';
+        for i in 0..16 {
+            let d = ((v >> (60 - 4 * i)) & 15) as u8;
+            h[2 + i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+        }
+        h
+    };
+    put(b"makepad-run: ", &mut n);
+    put(what.as_bytes(), &mut n);
+    put(b" (signal ", &mut n);
+    let sig = [b'0' + ((f.sig / 10) % 10) as u8, b'0' + (f.sig % 10) as u8];
+    put(&sig, &mut n);
+    put(b") pc ", &mut n);
+    put(&hex(f.pc), &mut n);
+    put(b" addr ", &mut n);
+    put(&hex(f.addr), &mut n);
+    put(b" frames", &mut n);
+    let mut raw = [0u64; 16];
+    let k = walk_fp_bounded(f.fp, f.sp, &mut raw);
+    for r in &raw[..k] {
+        put(b" ", &mut n);
+        put(&hex(*r), &mut n);
+    }
+    put(b"\n", &mut n);
+    os::fault::raw_stderr(&buf[..n]);
 }
 
 /// Our fault handlers back on top if a library of the program replaced them (it stays chained
@@ -852,6 +990,7 @@ pub(crate) fn ensure_altstack() {
     if ALTSTACK.with(|a| a.replace(true)) {
         return;
     }
+    STACK_HI.with(|c| c.set(os::fault::stack_hi_of_self()));
     os::fault::this_thread();
 }
 
@@ -1463,13 +1602,14 @@ pub fn poisoned_note() -> Option<String> {
     POISONED.lock().ok().and_then(|g| g.clone())
 }
 
-/// A hardware fault in JIT code with a recovery point (from the signal handler, on the faulting thread).
-/// Returns true when the process must end: the report is printed and the caller restores the
-/// signal's default action and returns, so the faulting instruction faults again and the
-/// process dies by the signal (exit status 128 + signal, as a rustc build's would). Otherwise
+/// A hardware fault in JIT code with a recovery point, at the recovery point after the handler
+/// contained it (normal context; `guard_depth` / `const_eval_depth` as they were at the fault).
+/// Returns true when the process must end: the report is printed and the caller ends the
+/// process by the fault's signal (os::fault::die_by: exit status 128 + signal, as a rustc
+/// build's would). Otherwise
 /// the fault is contained (the caller resumes at the recovery point) and the process is marked
 /// poisoned.
-pub(crate) unsafe fn fault_policy(label: &str, info: &PanicInfo) -> bool {
+pub(crate) unsafe fn fault_policy(label: &str, info: &PanicInfo, guard_depth: u32, const_eval_depth: u32) -> bool {
     let u = &*UNIT;
     let tname = os::thread::name(os::thread::current());
     let at = owner::call(owner::Class::Job, || info.frames.first().and_then(|f| u.pc_to_src(*f)).map(|(id, loc)| format!("{} ({})", u.fns[id as usize].name, loc)).unwrap_or_else(|| format!("{:#x}", info.frames.first().copied().unwrap_or(0))));
@@ -1477,12 +1617,12 @@ pub(crate) unsafe fn fault_policy(label: &str, info: &PanicInfo) -> bool {
     // overflow from unbounded recursion, an abort): the evaluation fails, which rustc reports
     // as E0080 (the interpreter rejects the same accesses); the initializer's caller reports it.
     // In `makepad run` it can only be a miscompile (or a generated const): the crash report stays
-    if CONST_EVAL_DEPTH.try_with(|g| g.get()).unwrap_or(0) > 0 && u.prog.session.options.const_fuel {
+    if const_eval_depth > 0 && u.prog.session.options.const_fuel {
         return false;
     }
     // a guarded run-time module call (std::relax::guard): the fault is contained to the call
     // and reported; the caller marks the module failed
-    if GUARD_DEPTH.with(|g| g.get()) > 0 {
+    if guard_depth > 0 {
         eprintln!("makepad: {} ({}, address {:#x}) inside a guarded module call on thread '{}' at {}: contained, the call returns an error", info.kind, label, info.fault_addr, tname, at);
         return false;
     }
@@ -1771,33 +1911,40 @@ fn rt_fmodf(a: f32, b: f32) -> f32 {
 /// address is taken minus one, as unwinders do -- a call that never returns can be the
 /// last instruction of its function, and its return address is then the next function.
 pub(crate) fn collect_frames(rbp: u64, pc: u64, pc_is_ret: bool) -> Vec<u64> {
+    // the chain is read only inside this thread's stack (from here up): a corrupt frame pointer
+    // ends the walk instead of faulting
+    let here = &rbp as *const u64 as u64;
+    if STACK_HI.try_with(|c| c.get()).unwrap_or(0) == 0 {
+        let _ = STACK_HI.try_with(|c| c.set(os::fault::stack_hi_of_self()));
+    }
+    let mut raw = [0u64; FAULT_FRAMES + 16];
+    let n = walk_fp_bounded(rbp, here.min(rbp), &mut raw);
+    frames_from_raw(pc, pc_is_ret, &raw[..n])
+}
+
+/// `collect_frames` over return addresses already read (a fault handler's record): JIT frames,
+/// and the C frames above a stop inside C code up to the JIT code that called it.
+fn frames_from_raw(pc: u64, pc_is_ret: bool, raw: &[u64]) -> Vec<u64> {
     let mut frames = vec![pc.wrapping_sub(pc_is_ret as u64)];
-    let mut bp = rbp;
+    if unsafe { UNIT.is_null() } {
+        return frames;
+    }
     let u = unsafe { &*UNIT };
-    // a stop inside C code (a libc abort/trap): walk its frames (frame pointers are kept on
-    // both targets) up to the JIT code that called it
+    // a stop inside C code (a libc abort/trap): its frames (frame pointers are kept on both
+    // targets) are skipped up to the JIT code that called it
     let mut in_c = u.find_fn(frames[0]).is_none();
     let mut c_frames = 0;
-    for _ in 0..64 {
-        if bp == 0 || bp & 7 != 0 {
-            break;
-        }
-        let ra = unsafe { *((bp + 8) as *const u64) }.wrapping_sub(1);
+    for r in raw {
+        let ra = r.wrapping_sub(1);
         if u.find_fn(ra).is_none() {
             c_frames += 1;
             if !in_c || c_frames > 16 {
                 break;
             }
-            let next = unsafe { *(bp as *const u64) };
-            if next <= bp {
-                break;
-            }
-            bp = next;
             continue;
         }
         in_c = false;
         frames.push(ra);
-        bp = unsafe { *(bp as *const u64) };
     }
     frames
 }
@@ -2314,7 +2461,7 @@ rt_fn! {
     /// (leave(ctx, 3)), else the thread continues where it was (return 0).
     fn rt_hang(regs: *const u64) -> u64 {
         let r = unsafe { std::slice::from_raw_parts(regs, 17) };
-        let f = os::fault::Fault { kind: os::fault::Kind::Watchdog, sig: 0, pc: r[16], sp: regs as u64 + 136, fp: r[10], addr: 0 };
+        let f = os::fault::Fault { kind: os::fault::Kind::Watchdog, sig: 0, pc: r[16], sp: regs as u64 + 136, fp: r[10], addr: 0, lr: 0 };
         match on_fault(&f, &os::fault::Hooks { prepare: &|| {}, chained: false, debug: &|| {} }) {
             os::fault::Action::Resume { pc, a0, a1 } => unsafe {
                 let leave: rt_fn_ty!(fn(u64, u64) -> !) = std::mem::transmute(pc as usize);
@@ -2367,14 +2514,28 @@ pub(crate) fn fn_name_at(pc: u64) -> String {
 /// A fault or the watchdog's interrupt on this thread (os::fault's handler): what to do with it.
 /// The code tables are read under their own leaf lock; reports are unit calls. A watchdog kick
 /// on a thread inside the compiler (a unit call) is skipped.
+/// Signal context: the containment path allocates nothing, takes no lock and asks no owner (the
+/// fault may be inside malloc or under a lock); it records the fault (FAULT_REC) and resumes at
+/// the recovery point, where `materialize_fault` applies the policy. Only faults whose pc is in
+/// JIT code (or in a leaf JIT code called, or in FaultSafe host code) are contained; any other
+/// fault passes to a chained handler or ends the process with a raw report. A fault inside the
+/// handler itself is fatal.
 pub(crate) fn on_fault(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os::fault::Action {
     if f.kind == os::fault::Kind::Watchdog && owner::is_owner() {
         return os::fault::Action::Ignore;
     }
-    note_tombstone_fault(f);
-    ensure_altstack();
+    if IN_FAULT.try_with(|c| c.replace(true)).unwrap_or(true) {
+        // nested: a fault while handling one (a corrupt frame chain, a bug here) -- never resumed
+        if f.kind == os::fault::Kind::Watchdog {
+            return os::fault::Action::Ignore;
+        }
+        raw_report(f, "fault inside the fault handler, the process ends");
+        return os::fault::Action::Die;
+    }
     (hooks.prepare)();
-    unsafe { on_fault_locked(f, hooks) }
+    let a = unsafe { on_fault_locked(f, hooks) };
+    let _ = IN_FAULT.try_with(|c| c.set(false));
+    a
 }
 
 /// A fault inside the address range of a destroyed compiler generation (memlane step 1b): a
@@ -2407,10 +2568,10 @@ fn note_tombstone_fault(f: &os::fault::Fault) {
 
 unsafe fn on_fault_locked(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os::fault::Action {
     use os::fault::{Action, Kind};
-    let (pc, fp, fault) = (f.pc, f.fp, f.addr);
+    let (pc, fault) = (f.pc, f.addr);
     if f.kind == Kind::Watchdog {
         // hang watchdog: only act when JIT code is running and not inside the compiler
-        if UNIT.is_null() || *ctx_ptr() == 0 || (&*UNIT).find_fn(pc).is_none() {
+        if UNIT.is_null() || *ctx_ptr() == 0 || !in_jit_code(pc) {
             return Action::Ignore;
         }
         // An enclosing timeout is already moving through inner guard cleanups. A
@@ -2442,34 +2603,165 @@ unsafe fn on_fault_locked(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os:
         if !expired {
             return Action::Ignore;
         }
-        let u = &*UNIT;
-        let frames = collect_frames(fp, pc, false);
-        PANIC.with(|p| *p.borrow_mut() = Some(PanicInfo { kind: "hang".to_string(), message: "watchdog: the call did not return in time".to_string(), site: u64::MAX, frames, fault_addr: 0, location: String::new() }));
-        return Action::Resume { pc: u.leave, a0: ctx_ptr() as u64, a1: 3 };
+        record_fault(f, 3);
+        return Action::Resume { pc: (*UNIT).leave, a0: ctx_ptr() as u64, a1: 3 };
     }
-    if !UNIT.is_null() {
-        let u = &*UNIT;
-        if *ctx_ptr() == 0 && u.find_fn(pc).is_some() {
-            fatal_report(f);
+    let jit = in_jit_code(pc);
+    let has_unit = !UNIT.is_null();
+    let at_leave = has_unit && (pc == (*UNIT).leave || (fault == pc && matches!(f.kind, Kind::Segv | Kind::Bus) && jit));
+    let has_ctx = *ctx_ptr() != 0;
+    let safe = FAULT_SAFE.try_with(|c| c.get()).unwrap_or(0) > 0;
+    // (leaf_of_jit reads the stack: only asked when it decides)
+    let leaf = || !jit && !safe && has_unit && has_ctx && leaf_of_jit(f);
+    match containment(jit, at_leave, has_unit, has_ctx, hooks.chained, safe, leaf) {
+        Containment::FatalReport => {
+            note_tombstone_fault(f);
+            fatal_report(f)
         }
-        // a fault at the recovery entry itself, or an instruction fetch fault in code memory
-        // (the code is not executable): resuming would fault again forever -- report and end
-        if pc == u.leave || (fault == pc && matches!(f.kind, Kind::Segv | Kind::Bus) && in_jit_code(pc)) {
-            fatal_report(f);
+        Containment::PassOn => {
+            // not ours: the handler we replaced (a library's), else the default action
+            if !hooks.chained && f.kind != Kind::Trap {
+                raw_report(f, "fault outside JIT code, not contained: the process ends");
+            }
+            Action::PassOn
+        }
+        Containment::Die => {
+            raw_report(f, "fault in host code (not JIT code), not contained: the process ends");
+            Action::Die
+        }
+        Containment::Contain => {
+            (hooks.debug)();
+            record_fault(f, 2);
+            // resume at `leave(ctx, 2)`; the recovery point reports it (materialize_fault)
+            Action::Resume { pc: (*UNIT).leave, a0: ctx_ptr() as u64, a1: 2 }
         }
     }
-    if UNIT.is_null() || *ctx_ptr() == 0 {
-        // not ours: the handler we replaced (a library's), else the default action
-        return Action::PassOn;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Containment {
+    /// JIT code with no recovery point, or a fault at the recovery entry / fetching code: the
+    /// full report, then abort
+    FatalReport,
+    /// not ours (no unit, no recovery point; or a library's chained handler first)
+    PassOn,
+    /// host code: never contained, the process ends by the signal with a raw report
+    Die,
+    /// recorded and resumed at the recovery point
+    Contain,
+}
+
+/// Which faults are contained: only those in JIT code, in FaultSafe host code, or in a leaf JIT
+/// code called. A fault in other Rust or C code may leave locks held and state half made
+/// (a longjmp runs no cleanup): it ends the process (JITSAFE fix 7).
+fn containment(jit: bool, at_leave: bool, has_unit: bool, has_ctx: bool, chained: bool, safe: bool, leaf: impl FnOnce() -> bool) -> Containment {
+    if has_unit && (jit && !has_ctx || at_leave) {
+        return Containment::FatalReport;
     }
-    let u = &*UNIT;
+    if !has_unit || !has_ctx {
+        return Containment::PassOn;
+    }
     // a fault outside JIT code (inside a library the program called) goes to that library's
     // handler first when it installed one, as in a rustc build (Chromium handles its own)
-    if hooks.chained && u.find_fn(pc).is_none() {
-        return Action::PassOn;
+    if chained && !jit && !safe {
+        return Containment::PassOn;
     }
-    let kind = match f.kind {
-        Kind::Segv | Kind::Bus if is_stack_fault(fault, f.sp) => "stack overflow",
+    if jit || safe || leaf() {
+        Containment::Contain
+    } else {
+        Containment::Die
+    }
+}
+
+#[cfg(test)]
+mod containment_tests {
+    use super::{containment, walk_fp_bounded, Containment::*};
+
+    #[test]
+    fn only_jit_faultsafe_and_leaf_faults_are_contained() {
+        // (jit, at_leave, unit, ctx, chained, safe, leaf)
+        assert_eq!(containment(true, false, true, true, false, false, || false), Contain);
+        assert_eq!(containment(false, false, true, true, false, true, || false), Contain);
+        assert_eq!(containment(false, false, true, true, false, false, || true), Contain);
+        // Rust/C host code with a recovery point: the process ends, never a longjmp past it
+        assert_eq!(containment(false, false, true, true, false, false, || false), Die);
+        // a library's own handler sees faults in its code first
+        assert_eq!(containment(false, false, true, true, true, false, || true), PassOn);
+        assert_eq!(containment(true, false, true, true, true, false, || false), Contain);
+        // JIT code without a recovery point, or at the recovery entry: fatal report
+        assert_eq!(containment(true, false, true, false, false, false, || false), FatalReport);
+        assert_eq!(containment(false, true, true, true, false, false, || true), FatalReport);
+        // no unit / no recovery point outside JIT code: not ours
+        assert_eq!(containment(false, false, false, false, false, false, || true), PassOn);
+        assert_eq!(containment(false, false, true, false, false, false, || true), PassOn);
+    }
+
+    #[test]
+    fn frame_walk_stays_inside_the_stack() {
+        super::ensure_altstack();
+        // a chain of three records on this stack; the third points far outside it
+        let mut recs = [[0u64; 2]; 3];
+        let base = recs.as_ptr() as u64;
+        recs[0] = [base + 16, 0x1111];
+        recs[1] = [base + 32, 0x2222];
+        recs[2] = [0x10, 0x3333];
+        let mut out = [0u64; 8];
+        let n = walk_fp_bounded(base, base, &mut out);
+        assert_eq!(&out[..n], &[0x1111, 0x2222, 0x3333]);
+        // a frame pointer below the walk's floor, misaligned, or above the stack: nothing read
+        assert_eq!(walk_fp_bounded(base + 3, base, &mut out), 0);
+        assert_eq!(walk_fp_bounded(base, base + 64, &mut out), 0);
+        assert_eq!(walk_fp_bounded(u64::MAX - 15, base, &mut out), 0);
+        // a chain that does not rise ends the walk
+        recs[1] = [base, 0x2222];
+        std::hint::black_box(&recs);
+        assert_eq!(walk_fp_bounded(base, base, &mut out), 2);
+    }
+}
+
+/// Records fault `f` (leave code `code`) for the recovery point: plain stores into this thread's
+/// FAULT_REC and a bounded frame walk (signal-safe).
+unsafe fn record_fault(f: &os::fault::Fault, code: u8) {
+    let _ = FAULT_REC.try_with(|r| {
+        let r = &mut *r.get();
+        r.pending = code;
+        r.kind = f.kind;
+        r.sig = f.sig;
+        r.pc = f.pc;
+        r.sp = f.sp;
+        r.fp = f.fp;
+        r.addr = f.addr;
+        r.guard_depth = GUARD_DEPTH.try_with(|g| g.get()).unwrap_or(0);
+        r.const_eval_depth = CONST_EVAL_DEPTH.try_with(|g| g.get()).unwrap_or(0);
+        // a fault in a leaf JIT code called: its caller is the JIT frame the fp chain misses
+        let mut k = 0;
+        if !in_jit_code(f.pc) && leaf_of_jit(f) {
+            r.raw[0] = if cfg!(target_arch = "aarch64") { f.lr } else { *(f.sp as *const u64) };
+            k = 1;
+        }
+        r.n = k + walk_fp_bounded(f.fp, f.sp, &mut r.raw[k..]);
+    });
+}
+
+/// At the recovery point after `leave` (normal context, on the thread's own stack): the fault
+/// the handler recorded becomes the PanicInfo, with the policy applied here -- poisoned note,
+/// report, or the end of the process by the fault's signal.
+unsafe fn materialize_fault() {
+    use os::fault::Kind;
+    let rec = match FAULT_REC.try_with(|r| { let v = *r.get(); (*r.get()).pending = 0; v }) {
+        Ok(v) if v.pending != 0 => v,
+        _ => return,
+    };
+    ensure_altstack();
+    let frames = frames_from_raw(rec.pc, false, &rec.raw[..rec.n]);
+    if rec.pending == 3 {
+        PANIC.with(|p| *p.borrow_mut() = Some(PanicInfo { kind: "hang".to_string(), message: "watchdog: the call did not return in time".to_string(), site: u64::MAX, frames, fault_addr: 0, location: String::new() }));
+        return;
+    }
+    let f = os::fault::Fault { kind: rec.kind, sig: rec.sig, pc: rec.pc, sp: rec.sp, fp: rec.fp, addr: rec.addr, lr: 0 };
+    note_tombstone_fault(&f);
+    let kind = match rec.kind {
+        Kind::Segv | Kind::Bus if is_stack_fault(rec.addr, rec.sp) => "stack overflow",
         Kind::Segv => "segfault",
         Kind::Bus => "bus error",
         Kind::Ill => "illegal instruction",
@@ -2477,18 +2769,13 @@ unsafe fn on_fault_locked(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os:
         Kind::Trap => "trap",
         _ => "signal",
     };
-    (hooks.debug)();
-    let frames = collect_frames(fp, pc, false);
     let label = f.label();
-    let pinfo = PanicInfo { kind: kind.to_string(), message: format!("{} at {:#x}", label, fault), site: u64::MAX, frames, fault_addr: fault, location: String::new() };
-    if fault_policy(&label, &pinfo) {
-        // the default action: the instruction faults again and the process ends by the signal
+    let pinfo = PanicInfo { kind: kind.to_string(), message: format!("{} at {:#x}", label, rec.addr), site: u64::MAX, frames, fault_addr: rec.addr, location: String::new() };
+    if fault_policy(&label, &pinfo, rec.guard_depth, rec.const_eval_depth) {
         crate::inspect::flightrec::fault_dump(&format!("{} {}", kind, pinfo.message));
-        return Action::Die;
+        os::fault::die_by(rec.sig);
     }
     PANIC.with(|p| *p.borrow_mut() = Some(pinfo));
-    // resume at `leave(ctx, 2)`
-    Action::Resume { pc: u.leave, a0: ctx_ptr() as u64, a1: 2 }
 }
 
 /// JIT trampoline in front of a (never returning) host panic function: passes the caller's
@@ -5815,6 +6102,10 @@ unsafe fn call_jit_inner(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, Pani
     let r = enter(entry, arg, ctx);
     *ctx = saved_ctx[0];
     *ctx.add(1) = saved_ctx[1];
+    if r != 0 {
+        // a fault or watchdog hang the handler contained: its report and policy run here
+        materialize_fault();
+    }
     if r == 0 {
         Ok(0)
     } else {
