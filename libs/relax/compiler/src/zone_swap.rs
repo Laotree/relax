@@ -17,9 +17,11 @@
 //!    types, definitions and files came after it) -- encoded BEFORE step 2, on this thread under
 //!    a front read and committed to the store, with the gate open (OWNERARCH.DESIGN.md 6.6 c1):
 //!    one owner publish copies the cache fields the encode reads; the encode stops when a front
-//!    writer waits; it is kept only if the interners' counts did not move during it. After the
-//!    quiesce, the counts and the front-write epoch must still be those of the encode (a writer
-//!    or an intern in between drops the attempt: CPU only);
+//!    writer waits. Compiles keep interning types meanwhile: the image is consistent up to the
+//!    interner counts it read, and the restore (5) copies the rows interned since from the paused
+//!    program (Types::top_up_from). After the quiesce, the program's other counts and the
+//!    front-write epoch must still be those of the encode (a front write in between drops the
+//!    attempt: CPU only);
 //! 5. generation g+1 begins; the Z statics are taken for rollback; the image is restored
 //!    (`warm_front`), the cache is opened as a warm start opens it and the front state is rebuilt,
 //!    all in g+1; the counts and sampled rows are compared with the running program. An abort
