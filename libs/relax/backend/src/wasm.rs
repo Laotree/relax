@@ -2570,7 +2570,7 @@ impl<'a> Fx<'a> {
                     let want = sig(self)?;
                     let have = func_type(self.funcs[u as usize].1)?;
                     if want != have {
-                        return Err(format!("call of slot {} with a signature unlike its body's", id));
+                        return Err(format!("call of slot {} ({}) with a signature unlike its body's: call {:?}, body {:?}", id, self.funcs[u as usize].1.name, want, have));
                     }
                     push_args(self)?;
                     self.call(FRef::User(u));

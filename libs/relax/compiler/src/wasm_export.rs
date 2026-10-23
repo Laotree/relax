@@ -723,6 +723,9 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
             Some(SymKind::Rt("tls_base")) => tls,
             _ => {
                 n_unlinked += 1;
+                if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
+                    eprintln!("wasm export: unlinked symbol {}: {}", id, crate::syms::describe(u, Sym::new(id)));
+                }
                 u.syms.value(Sym::new(id))
             }
         };
@@ -825,6 +828,17 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     }
     if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
         let s = &out.stats;
+        for id in &reached {
+            for (block, b) in funcs[id].blocks.iter().enumerate() {
+                for i in &b.insts {
+                    if let Inst::Call(relax_backend::rir::Callee::Fn(t) | relax_backend::rir::Callee::CFn(t, _), _, _) = i {
+                        if !reached.contains(t) {
+                            eprintln!("wasm export: untraced call {} ({}) block {} -> {} ({})", id, funcs[id].name, block, t, crate::syms::stable_fn_name(u, *t));
+                        }
+                    }
+                }
+            }
+        }
         eprintln!(
             "wasm export: {} bytes ({} functions captured, {} in module, {} types, {} imports): code {} data {} types {} imports {} funcs {} elems {} other {}; {} data objects, {} pointer words linked, {} symbols unlinked, {} untraced call sites, {} functions failed, {} folded into identical ones",
             s.total, nf, s.n_funcs, s.n_types, s.n_imports, s.code, s.data, s.types, s.imports, s.funcs, s.elems, s.other, n_data, n_ptrs, n_unlinked, s.untraced_sites, s.failed.len(), s.n_folded
@@ -857,7 +871,8 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
             eprintln!("  data {:9} {}", b, n.chars().take(140).collect::<String>());
         }
         let mut why: HashMap<String, usize> = HashMap::new();
-        for (_, e) in &s.failed {
+        for (id, e) in &s.failed {
+            eprintln!("wasm export: failed function {} ({}): {}", id, funcs[id].name, e);
             let k: String = e.chars().take(60).collect();
             *why.entry(k).or_insert(0) += 1;
         }
