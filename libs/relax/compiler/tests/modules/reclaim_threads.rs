@@ -48,20 +48,27 @@ fn reclaim_threads() {
     while !PARKED.load(Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    // other threads call module code all along (they enter and leave many times)
+    // other threads call module code all along (they enter and leave many times); one module
+    // each: concurrent calls into one module's arena share its shadow stack (as guard_threads)
     let stop = Arc::new(AtomicBool::new(false));
     let bad = Arc::new(AtomicU64::new(0));
     let calls = Arc::new(AtomicU64::new(0));
     let mut hammers = Vec::new();
+    let mut own = Vec::new();
     for h in 0..3u64 {
         let (stop, bad, calls) = (stop.clone(), bad.clone(), calls.clone());
+        let m = Module::load_source(&format!("hammer{}", h), &format!("hammer{}.rs", h), &quick_src(1), &[]).unwrap();
+        let quick: fn(u64) -> u64 = m.get("quick").unwrap();
+        own.push(m);
         hammers.push(std::thread::spawn(move || {
             let mut x = h;
             while !stop.load(Ordering::SeqCst) {
                 let r = quick(x);
                 // the module text is 1 throughout (edits go to another module)
                 if r != quick_want(x, 1) {
-                    bad.fetch_add(1, Ordering::SeqCst);
+                    if bad.fetch_add(1, Ordering::SeqCst) < 5 {
+                        eprintln!("reclaim_threads: bad quick({}) = {} want {}", x, r, quick_want(x, 1));
+                    }
                 }
                 calls.fetch_add(1, Ordering::Relaxed);
                 x = x.wrapping_add(7);
@@ -107,9 +114,13 @@ fn reclaim_threads() {
         h.join().unwrap();
     }
     let s = std::relax::sandbox_stats(false).unwrap();
+    eprintln!("reclaim_threads: bad {} quick(9) {} want {}", bad.load(Ordering::SeqCst), quick(9), quick_want(9, 1));
     eprintln!("reclaim_threads: {} hammer calls, {} recycle tries for 10 reuses, stats {:?}", calls.load(Ordering::SeqCst), tries, s);
     println!("out reuse after it left: {}", reused == 10);
     println!("out results under recycles: {}", bad.load(Ordering::SeqCst) == 0 && quick(9) == quick_want(9, 1));
+    for m in own {
+        m.unload();
+    }
     worker.unload();
     parker.unload();
 }
