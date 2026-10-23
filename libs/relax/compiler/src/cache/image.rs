@@ -1416,11 +1416,12 @@ impl Linker {
         if !in_range || !im.flat[s.crates.0..s.crates.1].iter().all(|&c| im.crate_ok.get(c as usize) == Some(&true)) || !self.cache().has_index(&s.entry) {
             return false;
         }
-        // an O2/O3 build of the slot replaced its entry after this image was made: the slot is
-        // left lazy, the first call links the entry (O2 code, marked: no build of it again).
-        // Prelinking the image's lower-tier code would run it and build the entry's code again
-        // on every launch (the image is made again past 2% of such slots: record_manifest).
-        if matches!(s.tier, TIER_O1 | TIER_BASE) && self.cache().entry_tier(s.entry).is_some_and(|t| t == TIER_O2 || t == TIER_O3) {
+        // a build of the slot at a higher tier replaced its entry after this image was made (O2/O3,
+        // or a verified O1 rebuild of baseline code): the slot is left lazy, the first call links
+        // the entry (O2 code, marked: no build of it again). Prelinking the image's lower-tier code
+        // would run it and build the entry's code again on every launch (the image is made again
+        // when an image slot's entry moves up: record_manifest).
+        if self.cache().entry_tier(s.entry).is_some_and(|t| super::tier_rank(t) > super::tier_rank(s.tier)) {
             return false;
         }
         let nk = need.len();
@@ -1663,6 +1664,7 @@ impl Linker {
             }
         }
         let first = self.img_place(u, &mut im, ready);
+        self.cache().image_members.extend(first.iter().map(|s| s.id));
         let mut n = first.len();
         install(u, first);
         let mut ready = Vec::with_capacity(later.len());
@@ -1673,6 +1675,7 @@ impl Linker {
             }
         }
         let second = self.img_place(u, &mut im, ready);
+        self.cache().image_members.extend(second.iter().map(|s| s.id));
         n += second.len();
         install(u, second);
         let c = self.cache();

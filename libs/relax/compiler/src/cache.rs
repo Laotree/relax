@@ -298,7 +298,20 @@ pub mod warm_count {
     /// and entry stay the unverified lowering)
     pub const REC_UNVERIFIED: usize = 38;
     pub const SPECV_LATE: usize = 39;
-    pub static N: [AtomicU64; 40] = [const { AtomicU64::new(0) }; 40];
+    /// verified O1 rebuilds (jit.rs o1v): queued because the verdict came late / because O3
+    /// inlined a slot with no standalone code; built; written as the slot's entry; dropped
+    /// (not verified, O3 meanwhile, entry already O1+, build failed)
+    pub const O1V_LATE: usize = 40;
+    pub const O1V_INLINED: usize = 41;
+    pub const O1V_BUILT: usize = 42;
+    pub const O1V_WRITTEN: usize = 43;
+    pub const O1V_DROPPED: usize = 44;
+    /// image slots whose entry moved up a tier, and startup images written again for them mid-run
+    pub const IMG_TIERUPS: usize = 45;
+    pub const IMG_REWRITES: usize = 46;
+    /// of IMG_TIERUPS, those an image written since covers
+    pub const IMG_TIERUPS_COVERED: usize = 47;
+    pub static N: [AtomicU64; 48] = [const { AtomicU64::new(0) }; 48];
     #[inline]
     pub fn add(k: usize, n: u64) {
         N[k].fetch_add(n, Relaxed);
@@ -306,6 +319,11 @@ pub mod warm_count {
     pub fn get(k: usize) -> u64 {
         N[k].load(Relaxed)
     }
+}
+
+/// Image slots' entries moved up a tier since the startup image was last written (any thread).
+pub fn image_tierups_pending() -> bool {
+    warm_count::get(warm_count::IMG_TIERUPS) > warm_count::get(warm_count::IMG_TIERUPS_COVERED)
 }
 
 /// The warm cache this session in one paragraph (answer first: hits vs misses by reason).
@@ -343,6 +361,10 @@ pub fn warm_summary() -> String {
     if g(O3_QUEUED) + g(O3_UNVERIFIED) + g(O3_FRAME) + g(O3_SPEC) > 0 {
         s.push_str(&format!("; O3 installs kept as entries: {} queued (written {}, same as stored {}, not encodable {}, stale {}, dropped {}; {} deferred records waiting, last drain {} with {}), not kept: unverified {}, frame too big {}, speculative/inspect {}; O2 entries written {}",
             k(g(O3_QUEUED)), k(g(O3_WRITTEN)), k(g(O3_SAME)), k(g(O3_UNENCODABLE)), k(g(O3_STALE)), k(g(O3_DROPPED)), k(g(RECORDS_WAITING)), g(DRAIN_WHY), k(g(DRAIN_LEN)), k(g(O3_UNVERIFIED)), k(g(O3_FRAME)), k(g(O3_SPEC)), k(g(O2_WRITTEN))));
+    }
+    if g(O1V_LATE) + g(O1V_INLINED) + g(IMG_TIERUPS) > 0 {
+        s.push_str(&format!("; verified O1 rebuilds: queued {} (verdict late) + {} (inlined-only), built {}, written {}, dropped {}; image slots tiered up {}, images rewritten {}",
+            k(g(O1V_LATE)), k(g(O1V_INLINED)), k(g(O1V_BUILT)), k(g(O1V_WRITTEN)), k(g(O1V_DROPPED)), k(g(IMG_TIERUPS)), g(IMG_REWRITES)));
     }
     if g(NO_ENTRY) > 0 && g(KEY_CHANGED) + g(ENTRY_GONE) + g(NOT_RECORDED) == 0 {
         s.push_str(" (why an entry is missing -- key changed, never recorded, not flushed -- needs a MAKEPAD_RUN_WARM_STRICT=1 cold run then warm run)");
@@ -609,6 +631,15 @@ pub struct Cache {
     /// carries a fresh image
     image_slots: usize,
     image_stale: usize,
+    /// the slots of this run's startup image: placed from the loaded one, or written by this run's
+    /// record_manifest. An entry of one of them moving up a tier (baseline -> O1 too) makes the
+    /// image be written again (`image_tierups`, the run monitor's quiet mid-run write)
+    image_members: HashSet<u32>,
+    /// image slots whose entry moved up a tier since the image was last written
+    image_tierups: u32,
+    /// the tier of each code entry this run recorded (by key), pending or written: a verified O1
+    /// rebuild replaces only an entry below O1
+    rec_tier: HashMap<u128, u8>,
     /// code reached a slot of the loaded image without an identity (`image_broken`): the
     /// manifest carries no image from now on (written at once, at exit too), so no later run
     /// starts from it
@@ -838,6 +869,9 @@ impl Cache {
             manifest_done: false,
             image_slots: 0,
             image_stale: 0,
+            image_members: HashSet::new(),
+            image_tierups: 0,
+            rec_tier: HashMap::new(),
             image_bad: false,
             manifest_root: None,
             linked_key: HashMap::new(),
@@ -1123,6 +1157,7 @@ impl Cache {
         if !self.has_code_entries() { return; }
         let rank = self.slot_key(u, id).and_then(|k| self.entry_tier(k)).map_or(0, |t| tier_rank(t) as usize + 1);
         warm_count::add(base + rank, 1);
+        if trace_on() { trace_lookup(u, id, &format!("fresh-{}-over:{}", if base == warm_count::RETIER_O3_OVER { "O3" } else { "O2" }, ["none", "base", "O1", "O2", "O3"][rank])); }
     }
 
     fn index_at(&self, key: u128) -> Option<(u32, u32)> {
@@ -2390,7 +2425,7 @@ impl Cache {
     /// `code` is the backend's output (relocated fields zeroed), `relocs` its relocations.
     pub fn record(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)]) {
         if u.fns[id as usize].unverified.load(std::sync::atomic::Ordering::Relaxed) { warm_count::add(warm_count::REC_UNVERIFIED, 1); }
-        self.record_entry(u, id, code, relocs, pc_map, None, false, None)
+        self.record_entry(u, id, code, relocs, pc_map, None, RecKind::First, None)
     }
 
     /// What the install of slot `id` leaves for its entry's encoding later (the main thread's
@@ -2447,7 +2482,7 @@ impl Cache {
         }
         let previous = std::mem::replace(&mut self.recording_pending, true);
         let o3 = p.o3.as_ref().map(|(i, n)| (i.as_slice(), n.as_slice()));
-        self.record_entry(u, p.id, &p.code, &p.relocs, &p.pc_map, o3, false, Some(p));
+        self.record_entry(u, p.id, &p.code, &p.relocs, &p.pc_map, o3, RecKind::First, Some(p));
         self.recording_pending = previous;
     }
 
@@ -2459,14 +2494,35 @@ impl Cache {
         // The O2 worker can finish after O3 installed (or linked from the cache). Never
         // downgrade its entry, even when that O3 build itself was too large to cache.
         if u.fns[id as usize].o3.load(std::sync::atomic::Ordering::Relaxed) { return; }
-        self.record_entry(u, id, code, relocs, pc_map, None, true, None)
+        self.record_entry(u, id, code, relocs, pc_map, None, RecKind::O2, None)
+    }
+
+    /// Records verified O1 code of slot `id` (jit.rs o1v: a slot whose SPEC-V verdict came clean
+    /// after its unverified -- baseline -- code was built, or a slot only ever inlined into O3
+    /// code) as its entry, replacing an entry below O1 (baseline), never one at O1 or above:
+    /// the cache keeps the session's final verified code. False: nothing was recorded.
+    pub fn record_o1_verified(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)]) -> bool {
+        if u.fns[id as usize].o3.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+        let before = warm_count::get(warm_count::O1V_WRITTEN);
+        self.record_entry(u, id, code, relocs, pc_map, None, RecKind::O1Up, None);
+        warm_count::get(warm_count::O1V_WRITTEN) != before
+    }
+
+    /// The tier rank (baseline 0, O1 1, O2 2, O3 3) of slot `id`'s newest entry, recorded this run
+    /// or stored: None when the slot has no storable key, Some(None) when it has no entry.
+    pub(crate) fn slot_entry_rank(&mut self, u: &Unit, id: u32) -> Option<Option<u8>> {
+        let key = self.slot_key(u, id)?;
+        if self.cert_rejected.contains(&key) && !self.pending_keys.contains(&key) { return Some(None); }
+        Some(self.rec_tier.get(&key).copied().or_else(|| self.entry_tier(key)).map(tier_rank))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn record_entry(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], o3: Option<(&[u32], &[(u32, bool)])>, o2: bool, pending: Option<&PendingRecord>) {
+    fn record_entry(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], o3: Option<(&[u32], &[(u32, bool)])>, kind: RecKind, pending: Option<&PendingRecord>) {
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
-        // O3 and O2 code replace the slot's entry; O1 code is recorded once
-        let replace = o3.is_some() || o2;
+        let o2 = kind == RecKind::O2;
+        // O3 and O2 code replace the slot's entry, verified O1 code a baseline one; O1 code is
+        // recorded once
+        let replace = o3.is_some() || kind != RecKind::First;
         let f = &u.fns[id as usize];
         if self.mode == Mode::ReadOnly || f.patch_gen != 0 || u.prog.is_edit_version(f.file) || (!replace && self.linked.contains(&id)) {
             trace_lookup(u, id, "norecord:mode/patch/linked");
@@ -2500,7 +2556,12 @@ impl Cache {
             trace_lookup(u, id, "norecord:exists");
             return;
         }
-        let Some(payload) = self.encode_entry(u, id, code, relocs, pc_map, o3, o2, pending) else {
+        // a verified O1 rebuild never replaces an entry at O1 or above
+        if kind == RecKind::O1Up && existing && self.rec_tier.get(&key).copied().or_else(|| self.entry_tier(key)).is_some_and(|t| tier_rank(t) >= tier_rank(TIER_O1)) {
+            trace_lookup(u, id, "norecord:o1v-not-below");
+            return;
+        }
+        let Some(payload) = self.encode_entry(u, id, code, relocs, pc_map, o3, kind, pending) else {
             if o3.is_some() { warm_count::add(warm_count::O3_UNENCODABLE, 1); }
             let w = self.last_why;
             trace_lookup(u, id, &format!("norecord:encode:{}", w));
@@ -2522,14 +2583,26 @@ impl Cache {
         // rewritten past 2%); an O3 payload replacing an O3 entry neither (PGO-driven O3 code
         // differs run to run; every warm run rewrote the whole image)
         if replace && (existing || self.linked.contains(&id)) {
-            match self.entry_tier(key) {
+            match self.rec_tier.get(&key).copied().or_else(|| self.entry_tier(key)) {
                 None => {
                     self.image_rewrite = true;
                     self.stats.rewrite_why[0] += 1;
                 }
-                Some(old) if payload_tier(&payload).is_some_and(|new| tier_rank(new) > tier_rank(old)) => self.stats.rewrite_why[1] += 1,
+                Some(old) if payload_tier(&payload).is_some_and(|new| tier_rank(new) > tier_rank(old)) => {
+                    self.stats.rewrite_why[1] += 1;
+                    // an image slot's entry moved up a tier: the image is written again (the run
+                    // monitor's next quiet write), so the next start places the better code
+                    if self.image_members.contains(&id) {
+                        self.image_tierups += 1;
+                        warm_count::add(warm_count::IMG_TIERUPS, 1);
+                    }
+                }
                 Some(_) => {}
             }
+        }
+        if let Some(t) = payload_tier(&payload) {
+            self.rec_tier.insert(key, t);
+            if trace_on() { trace_lookup(u, id, &format!("rec:{}", ["O1", "O3", "O2", "base"].get(t as usize).copied().unwrap_or("?"))); }
         }
         let kc = self.cur_crate;
         self.push_pending(kc, NewEntry { key, kind: KIND_CODE, payload });
@@ -2537,6 +2610,7 @@ impl Cache {
         warm_count::add(warm_count::RECORDED, 1);
         if o3.is_some() { warm_count::add(warm_count::O3_WRITTEN, 1); }
         if o2 { warm_count::add(warm_count::O2_WRITTEN, 1); }
+        if kind == RecKind::O1Up { warm_count::add(warm_count::O1V_WRITTEN, 1); }
         if o3.is_none() { self.remember_outcome(u, id, Some(key), "recorded"); }
     }
 
@@ -2617,7 +2691,8 @@ impl Cache {
     /// The payload of a code entry (O1, or O3 with its inlined slots);
     /// None: it cannot be stored (`last_why` says why).
     #[allow(clippy::too_many_arguments)]
-    fn encode_entry(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], o3: Option<(&[u32], &[(u32, bool)])>, o2: bool, pending: Option<&PendingRecord>) -> Option<Vec<u8>> {
+    fn encode_entry(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], o3: Option<(&[u32], &[(u32, bool)])>, kind: RecKind, pending: Option<&PendingRecord>) -> Option<Vec<u8>> {
+        let o2 = kind == RecKind::O2;
         // unlinked code only: a pool word must still be zero (linked code holds this run's values)
         for rl in relocs {
             let o = rl.at as usize;
@@ -2645,7 +2720,7 @@ impl Cache {
         e.u32(ENTRY_VERSION);
         e.str(&u.fns[id as usize].name);
         // the code's level (TIER_O1 / TIER_O3 / TIER_O2 / TIER_BASE); O3: the inlined slots (by key)
-        let base = o3.is_none() && !o2 && match pending {
+        let base = o3.is_none() && kind == RecKind::First && match pending {
             Some(p) => p.baseline,
             None => u.fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline),
         };
@@ -2785,6 +2860,19 @@ impl Cache {
 
     /// This program's startup manifest was loaded: an earlier run of it reached main with this cache.
     /// The loaded startup manifest carries a startup image (prelink's input).
+    /// Image slots whose entry moved up a tier since the image was last written (the run monitor
+    /// writes the manifest again at its next quiet write: run.rs mid_flush).
+    pub fn image_tierups(&self) -> u32 {
+        self.image_tierups
+    }
+
+    /// The tier-ups a manifest write left (it wrote no image: read-only, a dropped image, no
+    /// slots): no further quiet write is made for them.
+    pub fn forget_image_tierups(&mut self) {
+        warm_count::add(warm_count::IMG_TIERUPS_COVERED, self.image_tierups as u64);
+        self.image_tierups = 0;
+    }
+
     pub fn has_startup_image(&self) -> bool {
         self.image.is_some()
     }
@@ -2846,6 +2934,9 @@ impl Cache {
         self.base_linked = old.base_linked.clone();
         self.cert_rejected = old.cert_rejected.clone();
         self.pending_keys = old.pending_keys.clone();
+        self.rec_tier = old.rec_tier.clone();
+        self.image_members = old.image_members.clone();
+        self.image_tierups = old.image_tierups;
         self.pending_verdicts = old.pending_verdicts.clone();
         self.manifest_done = old.manifest_done;
         self.collected_committed = true;
@@ -2926,7 +3017,8 @@ impl Cache {
             }
         }
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
-        if self.mode == Mode::ReadOnly || order.is_empty() || (self.manifest_done && !self.image_rewrite && self.stats.rewrite_why[1] as usize * 50 <= self.image_slots) {
+        // (an image slot whose entry moved up a tier: the image is written again)
+        if self.mode == Mode::ReadOnly || order.is_empty() || (self.manifest_done && !self.image_rewrite && self.image_tierups == 0 && self.stats.rewrite_why[1] as usize * 50 <= self.image_slots) {
             return true;
         }
         // at exit the slots' keys can no longer be made: after the mid-run manifest the exit
@@ -2961,7 +3053,7 @@ impl Cache {
         let new = list.iter().filter(|b| !old.contains(b.0.as_slice())).count();
         // the same start as before (within 2%), the loaded manifest still valid and its image
         // current (within 2%, and covering all but 2% of its cached slots): no new one
-        let image_current = !self.image_rewrite
+        let image_current = !self.image_rewrite && self.image_tierups == 0
             && (self.image_slots == 0 || ((self.image_stale + self.stats.rewrite_why[1] as usize) * 50 <= self.image_slots && self.image_slots * 50 >= self.manifest_present_cached * 49));
         if self.startup_manifest_valid() && new * 50 <= list.len() && image_current {
             self.manifest_done = true;
@@ -2971,6 +3063,7 @@ impl Cache {
             eprintln!("makepad-run cache: startup manifest rewritten: valid {} (missing {}), {} new of {}, image rewrite {} (replacements without a stored entry {}, tier-ups {}), image slots {} stale {} cached at present {}",
                 self.startup_manifest_valid(), self.manifest_missing, new, list.len(), self.image_rewrite, self.stats.rewrite_why[0], self.stats.rewrite_why[1], self.image_slots, self.image_stale, self.manifest_present_cached);
         }
+        let tierups = self.image_tierups;
         let img = if self.mode != Mode::Verify && !self.image_bad {
             match self.build_image(u, &present_ids, stop) { Err(()) => return false, Ok(img) => img }
         } else { None };
@@ -3005,6 +3098,17 @@ impl Cache {
         f.u128(if crate::reload::edited_crates().is_empty() { self.sources_fp() } else { 0 });
         self.push_pending(root, NewEntry { key: self.manifest_sources_key(key), kind: KIND_MANIFEST, payload: f.0 });
         self.image_rewrite = false;
+        // the image now holds these slots' newest entries
+        if n_img > 0 {
+            self.image_members = present_ids.iter().copied().collect();
+            self.image_slots = n_img;
+            self.image_stale = 0;
+        }
+        self.image_tierups -= tierups;
+        if tierups > 0 {
+            warm_count::add(warm_count::IMG_REWRITES, 1);
+            warm_count::add(warm_count::IMG_TIERUPS_COVERED, tierups as u64);
+        }
         true
     }
 
@@ -3205,6 +3309,11 @@ impl Cache {
         }
     }
 }
+
+/// What a code record is: a first record (O1 / baseline / O3: recorded once, O3 replaces), an O2
+/// build (replaces), a verified O1 rebuild (replaces only an entry below O1)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecKind { First, O2, O1Up }
 
 /// A stored tier's order (the tier bytes are not in tier order): baseline < O1 < O2 < O3.
 fn tier_rank(t: u8) -> u8 {
