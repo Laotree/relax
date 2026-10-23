@@ -140,6 +140,56 @@ const I8: IntTy = IntTy { bits: 8, signed: true };
 const I16: IntTy = IntTy { bits: 16, signed: true };
 
 #[test]
+fn static_tls_uses_linked_storage_and_symbol_offsets() {
+    let mut f = B::new(&[], &[Cls::I, Cls::I]);
+    let base = f.v(Cls::I);
+    f.i(Inst::TlsStatic(base, Sym::new(0)));
+    let field = f.v(Cls::I);
+    f.i(Inst::TlsStatic(field, Sym { id: 0, off: 8 }));
+    let initial = f.v(Cls::I);
+    f.i(Inst::Load(Mem::Int(8, false), initial, field, 0));
+    let value = f.iconst(123);
+    f.i(Inst::Store(Mem::Int(8, false), base, 8, value));
+    let read = f.v(Cls::I);
+    f.i(Inst::Load(Mem::Int(8, false), read, field, 0));
+    f.term(Term::Ret(vec![initial, read]));
+    let fs = [f.done()];
+    for memory64 in [false, true] {
+        for remat in [false, true] {
+            let o = Options { memory64, remat, heap_pages: 32, ..opts() };
+            assert_eq!(run_o(&fs, 0, &[], o).unwrap(), vec![0, 123]);
+        }
+    }
+}
+
+#[test]
+fn mismatched_call_signatures_remain_errors() {
+    let mut callee = B::new(&[Cls::I], &[Cls::I]);
+    callee.f.name = "integer_identity".into();
+    callee.term(Term::Ret(vec![callee.p(0)]));
+    let mut caller = B::new(&[], &[]);
+    caller.i(Inst::Call(Callee::Fn(0), vec![], vec![]));
+    caller.term(Term::Ret(vec![]));
+    let functions = [callee.done(), caller.done()];
+    for memory64 in [false, true] {
+        let mut module = Module::new(Options { memory64, ..opts() });
+        for (id, f) in functions.iter().enumerate() {
+            module.add_func(id as u32, f);
+            module.export_func(id as u32, &format!("f{id}"));
+        }
+        let out = module.finish(&relax_session::Options::default(), &L);
+        assert_eq!(out.stats.failed.len(), 1);
+        assert_eq!(out.stats.failed[0].0, 1);
+        assert!(out.stats.failed[0].1.contains("integer_identity"));
+        assert!(out.stats.failed[0].1.contains("params: []"));
+        assert!(out.stats.failed[0].1.contains("params: [I64]"));
+        let mut instance = inst(&out.bytes);
+        assert_eq!(instance.call_export("f0", &[17]).unwrap(), vec![17]);
+        assert!(instance.call_export("f1", &[]).is_err());
+    }
+}
+
+#[test]
 fn integer_ops_and_narrow_types() {
     let cases: Vec<(IOp, IntTy, u64, u64, u64)> = vec![
         (IOp::Add, I64, 5, 7, 12),

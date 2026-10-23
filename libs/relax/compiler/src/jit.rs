@@ -490,6 +490,8 @@ pub struct Unit {
     pub(crate) hot_entry: u64,
     /// state the type checks ahead share with this unit (no owner thread call needed to reach it)
     pub front: std::sync::Arc<FrontShared>,
+    /// Unique export namespace; unit addresses and function slots can be reused.
+    pub wasm_export_id: usize,
     /// Instantiated const-fn bodies retained by the data evaluator at their declaration epoch.
     pub ctfe_fn_bodies: relax_session::sync::Mutex<crate::fxhash::HashMap<(DefId, Vec<TyId>), (u64, std::sync::Arc<Body>)>>,
 
@@ -2810,6 +2812,7 @@ impl Unit {
             frequency_profiles: HashMap::new(),
             hot_entry: 0,
             front: std::sync::Arc::new(FrontShared::new(&sess)),
+            wasm_export_id: crate::wasm_export::new_unit(),
             ctfe_fn_bodies: Default::default(),
             self_ptr: UnitPtr(std::ptr::null_mut()),
         };
@@ -6752,7 +6755,7 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
     main_rec(|r| r.cpu[0] += t0 - tb);
     let rir = twin_func.as_ref().unwrap_or_else(|| u.fns[id as usize].rir.as_ref().unwrap());
     let cg = tier0_codegen_rir(options, rir, u.opt.fold, u.opt.layout);
-    crate::wasm_export::capture(id, &cg);
+    crate::wasm_export::capture(u.wasm_export_id, id, &cg);
     let cg = with_loop_counters(cg, loop_syms(u, id));
     let func = &cg;
     // without O3 these are the only compiles: allocate thoroughly
@@ -7664,12 +7667,13 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class, near: e.near };
     let (fold, layout) = (u.opt.fold, u.opt.layout);
     let lc = loop_syms(u, id);
-    Some(O2Work { id, prep, epoch, snapshot, session, env, fold, layout, lc, t0 })
+    Some(O2Work { id, capture_unit: u.wasm_export_id, prep, epoch, snapshot, session, env, fold, layout, lc, t0 })
 }
 
 /// An O2 build's optimisation and code generation (no unit state).
 struct O2Work {
     id: u32,
+    capture_unit: usize,
     prep: Prep,
     epoch: u64,
     snapshot: bool,
@@ -7693,13 +7697,13 @@ struct O2Done {
 
 impl O2Work {
     fn run(self) -> O2Done {
-        let O2Work { id, prep, epoch, snapshot, session, env, fold, layout, lc, t0 } = self;
+        let O2Work { id, capture_unit, prep, epoch, snapshot, session, env, fold, layout, lc, t0 } = self;
         let options = &session.options;
         let mut done: Vec<Deferred> = Vec::new();
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let (func, inlined) = optimize_tree(options, id, prep, &mut done)?;
             let cg = tier0_codegen_rir(options, &func, fold, layout);
-            crate::wasm_export::capture(id, &cg);
+            crate::wasm_export::capture(capture_unit, id, &cg);
             let cg = with_loop_counters(cg, lc);
             let _scratch = crate::zone_alloc::scratch(&session.runtime);
             let c = relax_codegen::native::compile(options, &cg, &env)?;
@@ -16758,6 +16762,7 @@ enum Front {
 /// (a program thread needing one waits for its build, as for pipelined compiles).
 pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads: usize) -> Vec<(u32, Result<(Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>), String>)> {
     let census_unit = (&*up).front.census_id;
+    let export_unit = (&*up).wasm_export_id;
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
     let mut out: Vec<(u32, Result<(Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>), String>)> = Vec::new();
@@ -16837,7 +16842,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                             }
                         };
                         let cg = tier0_codegen_rir(options, &rir, fold, rotate);
-                        crate::wasm_export::capture(id, &cg);
+                        crate::wasm_export::capture(export_unit, id, &cg);
                         let cg = with_loop_counters(cg, lc);
                         let e = &env;
                         let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: e.opt_regs && !rir.baseline, syms: e.syms, sym_class: e.sym_class, near: e.near };
@@ -16998,6 +17003,7 @@ unsafe fn split_front_as(up: *mut Unit, id: u32, mode: RirMode) -> Result<Front,
 /// requesting program thread, a speculative worker.
 pub(crate) struct BackWork {
     id: u32,
+    capture_unit: usize,
     spec: bool,
     front: Front,
     /// the slot and its deferred inline candidates, in flight until the finish
@@ -17115,13 +17121,13 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
     }
     let lc = loop_syms(u, id);
     let memo = bmemo::worthy(&*up, id);
-    Begin::Back(BackWork { id, spec, front, slots, epoch, env, fold, rotate, lc, session, name, w1, memo })
+    Begin::Back(BackWork { id, capture_unit: u.wasm_export_id, spec, front, slots, epoch, env, fold, rotate, lc, session, name, w1, memo })
 }
 
 impl BackWork {
     /// Optimises and generates the code (any thread, no unit state).
     pub(crate) fn run(self) -> BackDone {
-        let BackWork { id, spec, front, slots, epoch, env, fold, rotate, lc, session, name, w1, memo: worthy } = self;
+        let BackWork { id, capture_unit, spec, front, slots, epoch, env, fold, rotate, lc, session, name, w1, memo: worthy } = self;
         let options = &session.options;
         let runtime = &session.runtime;
         let done_out: relax_session::sync::Mutex<Vec<Deferred>> = relax_session::sync::Mutex::new(Vec::new());
@@ -17164,7 +17170,7 @@ impl BackWork {
             };
             let t1 = cpu_ns();
             let cg = tier0_codegen_rir(options, &rir, fold, rotate);
-            crate::wasm_export::capture(id, &cg);
+            crate::wasm_export::capture(capture_unit, id, &cg);
             let cg = with_loop_counters(cg, lc);
             let mut env = env;
             env.opt_regs &= !rir.baseline;

@@ -125,7 +125,7 @@ pub enum Builtin {
 
 /// What the link step tells the backend about the symbols code names.
 pub trait Link {
-    /// the value of symbol `id` as `Inst::Addr` / `Inst::TlsAddr` use it (a linear-memory
+    /// the value of symbol `id` as `Inst::Addr`, `Inst::TlsAddr` or `Inst::TlsStatic` use it (a linear-memory
     /// address or a plain number; the backend adds `Sym::off`)
     fn sym(&self, id: u32) -> u64;
     /// how a call to host symbol `id` is bound
@@ -1447,7 +1447,7 @@ impl<'a> Fx<'a> {
                 }
                 let d = match x {
                     Inst::Iconst(d, k) if self.o.remat && small(*k) => *d,
-                    Inst::Addr(d, s) | Inst::TlsAddr(d, s) if self.o.remat && small(self.link.sym(s.id).wrapping_add(s.off as u64) as i64) => *d,
+                    Inst::Addr(d, s) | Inst::TlsAddr(d, s) | Inst::TlsStatic(d, s) if self.o.remat && small(self.link.sym(s.id).wrapping_add(s.off as u64) as i64) => *d,
                     Inst::SlotAddr(d, _) if self.o.remat_slots && self.uses[d.0 as usize] <= 2 * base_uses[d.0 as usize] + 1 => *d,
                     _ => continue,
                 };
@@ -2260,7 +2260,7 @@ impl<'a> Fx<'a> {
                 }
                 self.from_nat(want)
             }
-            Inst::Addr(_, s) | Inst::TlsAddr(_, s) => {
+            Inst::Addr(_, s) | Inst::TlsAddr(_, s) | Inst::TlsStatic(_, s) => {
                 let v = self.sym_val(*s);
                 if let Want::Addr(off) = want {
                     let a = v.wrapping_add(off);

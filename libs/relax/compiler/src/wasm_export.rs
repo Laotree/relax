@@ -18,7 +18,18 @@ use relax_backend::wasm::{self, Builtin, HostBind, Link, Module};
 use relax_session::sync::Mutex;
 use std::collections::{BTreeMap, HashMap};
 
-static CAPTURED: Mutex<Option<BTreeMap<u32, Func>>> = Mutex::new(None);
+struct Captured {
+    entry: u32,
+    funcs: BTreeMap<u32, Func>,
+}
+
+// Slot and symbol ids belong to a unit. The proc-macro host compiles in the
+// same process, with its own numbering; its code must never replace program RIR.
+static CAPTURED: Mutex<Option<BTreeMap<usize, Captured>>> = Mutex::new(None);
+pub fn new_unit() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    if enabled() { NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) } else { 0 }
+}
 /// the first captured slot: the run's entry (the test fn, main)
 static ENTRY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 
@@ -316,7 +327,7 @@ static FINISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// finish() has begun (the union's compiles still capture)
 static FORCING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-pub fn capture(id: u32, f: &Func) {
+pub fn capture(unit: usize, id: u32, f: &Func) {
     if !enabled() || FINISHED.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
@@ -333,11 +344,12 @@ pub fn capture(id: u32, f: &Func) {
             fn atexit(f: extern "C" fn()) -> i32;
         }
         unsafe { atexit(at_exit) };
-        ENTRY.store(id, std::sync::atomic::Ordering::Relaxed);
     }
     // on the kept heap: a zone swap frees the compile arenas while the run goes on
     crate::zone_alloc::kept_with(|| {
-        g.get_or_insert_with(BTreeMap::new).insert(id, f.clone());
+        g.get_or_insert_with(BTreeMap::new).entry(unit)
+            .or_insert_with(|| Captured { entry: id, funcs: BTreeMap::new() })
+            .funcs.insert(id, f.clone());
     });
 }
 
@@ -415,7 +427,8 @@ fn force_union(up: *mut Unit) -> std::collections::BTreeSet<u32> {
         // the slots the captured set names that it lacks
         let want: Vec<u32> = {
             let g = CAPTURED.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(funcs) = g.as_ref() else { return forced };
+            let Some(captured) = g.as_ref().and_then(|g| g.get(&u.wasm_export_id)) else { return forced };
+            let funcs = &captured.funcs;
             let mut named: Vec<u32> = Vec::new();
             address_taken(u, funcs, &mut named);
             for f in funcs.values() {
@@ -467,7 +480,9 @@ pub fn finish(u: &Unit) {
     }
     // `%p`: the process id (a run's child processes capture their own sets)
     let path = path.replace("%p", &std::process::id().to_string());
-    let Some(mut funcs) = CAPTURED.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let Some(captured) = CAPTURED.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|g| g.remove(&u.wasm_export_id)) else { return };
+    ENTRY.store(captured.entry, std::sync::atomic::Ordering::Relaxed);
+    let mut funcs = captured.funcs;
     // the trace: slots whose code was installed (called); a build made ahead of a call that
     // never came is not part of it
     let n_cap = funcs.len();
@@ -642,6 +657,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     // symbols the code names
     let mut addr_syms: Vec<u32> = Vec::new();
     let mut tls_syms: Vec<u32> = Vec::new();
+    let mut static_tls_syms = std::collections::BTreeSet::new();
     let mut host_syms: Vec<u32> = Vec::new();
     for f in reached.iter().map(|id| &funcs[id]) {
         for b in &f.blocks {
@@ -649,6 +665,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
                 match i {
                     Inst::Addr(_, s) => addr_syms.push(s.id),
                     Inst::TlsAddr(_, s) => tls_syms.push(s.id),
+                    Inst::TlsStatic(_, s) => { static_tls_syms.insert(s.id); }
                     Inst::Call(relax_backend::rir::Callee::Host(s) | relax_backend::rir::Callee::CHost(s, _), _, _) => host_syms.push(s.id),
                     _ => {}
                 }
@@ -689,7 +706,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
         host.insert(id, b);
     }
     // data: placed on first reference, pointer words translated (worklist)
-    let tls = m.place(64 * 1024, 64);
+    let tls = m.place(u.tls_next.max(1) as u64, 64);
     let mut placed: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut pending: Vec<u32> = Vec::new();
     let mut images: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -706,13 +723,26 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     // a thread-local symbol holds its offset in the thread's block: one block (one thread)
     tls_syms.sort_unstable();
     tls_syms.dedup();
-    let tls_size = 64 * 1024u64;
     for &id in &tls_syms {
         let off = u.syms.value(Sym::new(id));
-        if off >= tls_size {
-            eprintln!("wasm export: thread-local offset {} past the {} byte block", off, tls_size);
-        }
         vals.insert(id, tls + off);
+    }
+    // Native static TLS offsets are signed offsets from the host's thread pointer,
+    // not offsets in the dynamic TLS block. Give each static its own zeroed image
+    // for the web profile's one thread; its existing first-use code initializes it.
+    for id in static_tls_syms {
+        let Some(SymKind::ThreadLocal(d)) = u.syms.kind(id) else {
+            eprintln!("wasm export: invalid static TLS symbol {}", id);
+            return;
+        };
+        let Some(ty) = u.tcx.const_ty(&u.prog, d) else {
+            eprintln!("wasm export: no layout for static TLS {}", u.prog.def_path(d));
+            return;
+        };
+        let layout = u.layout_of(ty);
+        let flag = u.tls_places.get(&d).is_some_and(|p| p.init.is_some());
+        let addr = m.place(u64::from(layout.size.max(1)) + u64::from(flag), u64::from(layout.align.max(1)));
+        vals.insert(id, addr);
     }
     let mut n_unlinked = 0usize;
     for &id in &addr_syms {
