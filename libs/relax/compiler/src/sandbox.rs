@@ -365,9 +365,12 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
             }
             if crate_of(u, base).map_or(false, |k| s.dead_crates.contains(&k)) {
                 dead.push(t);
-            } else {
+            } else if s.spaces.iter().any(|sp| (sp.0..sp.0 + sp.1).contains(&u.fns[t as usize].code)) {
                 live.push(t);
             }
+            // (a live twin outside both spaces stays where it is: emit_twin could not link it
+            // into a space -- e.g. a host call beyond arm64 branch reach, which needs the unit
+            // code's veneers -- so it went to the unit's code memory, which is never reused)
         }
         (target, s.spaces[target].0, s.spaces[target].1, s.spaces[target].2, live, dead)
     };
