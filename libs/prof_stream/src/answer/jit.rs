@@ -58,9 +58,9 @@ pub fn versions(a: &mut Answer) {
         for w in why.iter().filter(|w| super::num(w.get("tier_why")).map(|x| x as i64) == Some(id)) {
             a.line(&format!("tier: {}", s(w, "verdict")));
         }
-        a.more(format!("why-tier @{}", id));
         a.more(format!("count S{}", id));
         a.more(format!("tier S{} o1|o3|auto", id));
+        a.more(format!("why-tier @{}", id));
     }
     a.head = format!("{}.", head.join(". "));
     let n = inl.as_ref().map_or(0.0, |x| f(x, "inliners"));

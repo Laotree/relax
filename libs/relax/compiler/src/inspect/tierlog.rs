@@ -393,6 +393,6 @@ mod tests {
         assert_eq!(h.n[ev::SLOW as usize], 2);
         assert_eq!(h.n[ev::ARM as usize], 1);
         assert_eq!(h.windows, vec![(0x1000, 0, 2), (0x2000, 1, 0)]);
-        assert_eq!(h.recent.len(), 3);
+        assert_eq!(h.recent.len(), 4);
     }
 }
