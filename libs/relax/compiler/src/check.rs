@@ -157,7 +157,12 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         for e in par_map(&defs, |&d| {
             let mut tries = 0;
             loop {
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| relax_types::wfcheck::obligations::check_def(prog, tcx, d)));
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut v = relax_types::wfcheck::obligations::check_def(prog, tcx, d);
+                    // rustc_privacy check_mod_privacy: the types of the item's signature
+                    v.extend(relax_types::privacy_types::check_item(prog, tcx, d));
+                    v
+                }));
                 match r {
                     Ok(v) => break v,
                     Err(p) if (crate::preempt::is_preempted(&*p) || p.is::<crate::preempt::NeedsLoad>() || p.is::<crate::preempt::OwnerBusy>()) && tries < 100 => { tries += 1; std::thread::yield_now(); }
@@ -228,7 +233,8 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     for anon in crates.iter().flat_map(|&k| crate::borrowck::body::signature_anon_consts(&u.prog, &u.tcx, k)).collect::<Vec<_>>() {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let body = u.tcx.typeck(&u.prog, anon);
-            let mut errs = body.errors.to_vec();
+            let errs = body.errors.to_vec();
+            let mut diags = Vec::new();
             if errs.is_empty() {
                 relax_types::lint::check_literals(&u.prog, &u.tcx, &body);
                 relax_types::lint_pass::check_body(&u.prog, &u.tcx, &body);
@@ -238,18 +244,21 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
                 if let Some((_, relax_front::def_collector::NodeId::AnonConst(expr))) = u.prog.def_id_to_node_id.get(&anon) {
                     let state = crate::tcx::EvalState::new();
                     let cx = crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &state);
-                    for e in crate::borrowck::check_anon_const(&cx, &u.prog, &u.tcx, &body, *expr) {
-                        errs.push(e.render());
+                    let errs = crate::borrowck::check_anon_const(&cx, &u.prog, &u.tcx, &body, *expr);
+                    if !errs.is_empty() {
+                        diags.extend(crate::borrowck::lazy::report_checked(&u.prog, 0, u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), anon, &body.args, errs, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
                     }
                 }
             }
-            errs
+            (errs, diags)
         }));
         match r {
-            Ok(e) => {
+            Ok((e, diags)) => {
+                let e_ok = e.is_empty() && diags.is_empty();
+                borrow_diagnostics.extend(diags);
                 // rustc evaluates every array length / const argument written in a signature (used
                 // or not): one that fails is reported there (E0080)
-                if e.is_empty() && u.tcx.generic_indices_of(&u.prog, anon).types_consts.is_empty() && !matches!(u.prog.def(u.prog.def(anon).parent).kind, DefKind::Trait | DefKind::TypeAlias) {
+                if e_ok && u.tcx.generic_indices_of(&u.prog, anon).types_consts.is_empty() && !matches!(u.prog.def(u.prog.def(anon).parent).kind, DefKind::Trait | DefKind::TypeAlias) {
                     let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
                     let before = u.tcx.dcx.err_count();
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.tcx.const_eval_resolve(&u.prog, env, anon, &[])));
@@ -288,6 +297,11 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             let unsafety = relax_types::unsafety::check_body(prog, tcx, &body);
             if !unsafety.is_empty() {
                 return (unsafety, Vec::new());
+            }
+            // rustc_privacy check_mod_privacy: the types of the body's expressions and patterns
+            let privacy = relax_types::privacy_types::check_body(prog, tcx, &body);
+            if !privacy.is_empty() {
+                return (privacy, Vec::new());
             }
             // E0004 / E0005 and the pattern lints (rustc check_match: its errors stop the body
             // before borrowck); an internal failure of the analysis reports nothing
@@ -755,6 +769,19 @@ fn eval_items(up: *mut Unit, own: &[bool], tainted: &std::collections::HashSet<c
     let _job = jit::compile_job();
     for (d, is_static) in items {
         if tainted.contains(&d) || !u.tcx.typeck(&u.prog, d).errors.is_empty() { continue; }
+        // the check-mode interpreter: rustc's CTFE undefined-behaviour and final-value checks
+        // (diagnostics only; an evaluation it rejects is not run by the JIT, as rustc stops there)
+        match crate::owner::call(crate::owner::Class::App, || relax_types::const_eval::interp::check_item(&u.prog, &u.tcx, d)) {
+            relax_types::const_eval::interp::Outcome::Error(span, msg) => {
+                let e = if msg.starts_with('E') { u.prog.record_error(span.file, span.lo, "typeck", msg) } else { u.prog.record_uncoded_error(span.file, span.lo, "typeck", msg) };
+                u.errors.push(e);
+                continue;
+            }
+            relax_types::const_eval::interp::Outcome::Unsupported(why) => {
+                if std::env::var_os("MAKEPAD_RUN_INTERP_TRACE").is_some() { eprintln!("interp: {}: unsupported: {why}", u.prog.def_path(d)); }
+            }
+            relax_types::const_eval::interp::Outcome::Ok => {}
+        }
         let before = unsafe { (&*up).errors.len() };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::owner::call(crate::owner::Class::App, || unsafe {
             let u = &mut *up;
