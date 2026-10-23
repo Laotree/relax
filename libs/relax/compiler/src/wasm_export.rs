@@ -52,7 +52,7 @@ fn shake_blocks(f: &mut Func, hits: &HashMap<(u64, u64), bool>, trap: bool, keep
     use relax_backend::rir::Term;
     let cov = |i: &Inst| -> Option<bool> {
         match i {
-            Inst::Coverage { word, mask } => hits.get(&(*word, *mask)).copied(),
+            Inst::Coverage { word, mask, .. } => hits.get(&(*word, *mask)).copied(),
             _ => None,
         }
     };
@@ -496,6 +496,13 @@ fn force_union(up: *mut Unit, hits: &HashMap<String, std::collections::HashSet<(
     let mut missing: Vec<&str> = hits.keys().filter(|k| !captured_keys.contains(*k)).map(String::as_str).collect();
     missing.sort_unstable();
     if !missing.is_empty() {
+        if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
+            for key in &missing {
+                let slots: Vec<_> = (0..u.fns.len() as u32).filter(|id| crate::jit::slot_key(u, *id) == *key)
+                    .map(|id| (id, u.fns[id as usize].compiled, tried.contains(&id))).collect();
+                eprintln!("wasm export: missing union key {key}: slots (id, compiled, tried) {slots:?}");
+            }
+        }
         return Err(format!("union: {} training functions were not captured:\n{}", missing.len(), missing.join("\n")));
     }
     // Ahead/inlined bodies can already have RIR without installed native code.

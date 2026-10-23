@@ -214,6 +214,8 @@ pub struct Rt {
 pub struct RtSyms {
     /// the start of every thread's thread-local block (offset 0): `Inst::TlsAddr` of it is the block's address
     pub tls_base: relax_backend::rir::Sym,
+    /// Per-thread mask for probes while executing compiler initializers.
+    pub coverage_disabled: relax_backend::rir::Sym,
     pub fmt_str: relax_backend::rir::Sym,
     pub fmt_int: relax_backend::rir::Sym,
     pub fmt_float: relax_backend::rir::Sym,
@@ -700,8 +702,10 @@ unsafe fn write_bytes(addr: u64, b: &[u8]) {
 /// Size of each thread's thread-local block (virtual; pages are touched on use).
 const TLS_CAP: usize = 1 << 20;
 /// Offset of the first thread-local variable: slot 0 is the domain base; slot 1 owns runtime
-/// thread registrations and Relax std TLS values, drained before the block is freed.
-const TLS_FIRST_FREE: u32 = 16;
+/// thread registrations and Relax std TLS values, drained before the block is freed;
+/// slot 2 separates compiler initializer execution from runtime coverage.
+const TLS_COVERAGE_DISABLED: u32 = 16;
+const TLS_FIRST_FREE: u32 = 24;
 static TLS_KEY: AtomicU64 = AtomicU64::new(u64::MAX);
 
 thread_local! {
@@ -1974,7 +1978,7 @@ pub(crate) fn const_fuel_tick() {
 }
 
 /// One evaluation's own counter: the enclosing evaluation's is saved and comes back.
-struct ConstEvalScope { saved_fuel: (u64, u64) }
+struct ConstEvalScope { saved_fuel: (u64, u64), saved_coverage: Option<(*mut u64, u64)> }
 
 impl ConstEvalScope {
     fn enter(prog: &Program, d: DefId) -> ConstEvalScope {
@@ -1982,12 +1986,19 @@ impl ConstEvalScope {
         let limit = if level >= relax_types::lint::Level::Deny { LINT_TERMINATOR_LIMIT } else { u64::MAX };
         let saved_fuel = CONST_FUEL.try_with(|c| c.replace((0, limit))).unwrap_or((0, LINT_TERMINATOR_LIMIT));
         let _ = CONST_EVAL_DEPTH.try_with(|g| g.set(g.get() + 1));
-        ConstEvalScope { saved_fuel }
+        let saved_coverage = crate::coverage::on().then(|| unsafe {
+            let mask = (rt_tls_block() + TLS_COVERAGE_DISABLED as u64) as *mut u64;
+            let previous = *mask;
+            *mask = u64::MAX;
+            (mask, previous)
+        });
+        ConstEvalScope { saved_fuel, saved_coverage }
     }
 }
 
 impl Drop for ConstEvalScope {
     fn drop(&mut self) {
+        if let Some((mask, previous)) = self.saved_coverage { unsafe { *mask = previous; } }
         let _ = CONST_EVAL_DEPTH.try_with(|g| g.set(g.get().saturating_sub(1)));
         let _ = CONST_FUEL.try_with(|c| c.set(self.saved_fuel));
     }
@@ -3047,7 +3058,7 @@ impl Unit {
             static_spans: Default::default(),
             sites: Default::default(),
             site_ix: Default::default(),
-            rs: RtSyms { tls_base: relax_backend::rir::Sym::new(0), fmt_str: relax_backend::rir::Sym::new(0), fmt_int: relax_backend::rir::Sym::new(0), fmt_float: relax_backend::rir::Sym::new(0), fmt_print: relax_backend::rir::Sym::new(0), panic_site: relax_backend::rir::Sym::new(0), panic_bounds: relax_backend::rir::Sym::new(0), str_eq: relax_backend::rir::Sym::new(0), fmod: relax_backend::rir::Sym::new(0), fmodf: relax_backend::rir::Sym::new(0), panic_impl: relax_backend::rir::Sym::new(0), thread_run: relax_backend::rir::Sym::new(0), catch_panic: relax_backend::rir::Sym::new(0), args: relax_backend::rir::Sym::new(0), memcpy: relax_backend::rir::Sym::new(0), memmove: relax_backend::rir::Sym::new(0), memset: relax_backend::rir::Sym::new(0), fmt_push: relax_backend::rir::Sym::new(0), fmt_pop: relax_backend::rir::Sym::new(0), resume: relax_backend::rir::Sym::new(0), land: relax_backend::rir::Sym::new(0), panicking: relax_backend::rir::Sym::new(0), rethrow: relax_backend::rir::Sym::new(0) },
+            rs: RtSyms { tls_base: relax_backend::rir::Sym::new(0), coverage_disabled: relax_backend::rir::Sym::new(0), fmt_str: relax_backend::rir::Sym::new(0), fmt_int: relax_backend::rir::Sym::new(0), fmt_float: relax_backend::rir::Sym::new(0), fmt_print: relax_backend::rir::Sym::new(0), panic_site: relax_backend::rir::Sym::new(0), panic_bounds: relax_backend::rir::Sym::new(0), str_eq: relax_backend::rir::Sym::new(0), fmod: relax_backend::rir::Sym::new(0), fmodf: relax_backend::rir::Sym::new(0), panic_impl: relax_backend::rir::Sym::new(0), thread_run: relax_backend::rir::Sym::new(0), catch_panic: relax_backend::rir::Sym::new(0), args: relax_backend::rir::Sym::new(0), memcpy: relax_backend::rir::Sym::new(0), memmove: relax_backend::rir::Sym::new(0), memset: relax_backend::rir::Sym::new(0), fmt_push: relax_backend::rir::Sym::new(0), fmt_pop: relax_backend::rir::Sym::new(0), resume: relax_backend::rir::Sym::new(0), land: relax_backend::rir::Sym::new(0), panicking: relax_backend::rir::Sym::new(0), rethrow: relax_backend::rir::Sym::new(0) },
             syms: crate::syms::Syms::new(syms_base, rw_base),
             cache: None,
             pending_cache_records: Vec::new(),
@@ -3210,6 +3221,7 @@ impl Unit {
             fmodf: u.syms.intern(crate::syms::SymKind::Rt("fmodf"), u.rt.fmodf),
             panic_impl: u.syms.intern(crate::syms::SymKind::Rt("panic_impl"), u.rt.panic_impl),
             tls_base: u.syms.intern(crate::syms::SymKind::Rt("tls_base"), 0),
+            coverage_disabled: u.syms.intern(crate::syms::SymKind::Rt("coverage_disabled"), TLS_COVERAGE_DISABLED as u64),
             thread_run: u.syms.intern(crate::syms::SymKind::Rt("thread_run"), u.rt.thread_run),
             catch_panic: u.syms.intern(crate::syms::SymKind::Rt("catch_panic"), u.rt.catch_panic),
             args: u.syms.intern(crate::syms::SymKind::Rt("args"), u.rt.args),
@@ -5315,7 +5327,8 @@ impl Unit {
                     let entry = self.entry(id);
                     self.exec_note(id, crate::exec_profile::CALL);
                     self.exec_event(id, "call");
-                    match unsafe { call_jit(self as *mut Unit, entry, buf) } {
+                    let result = { let _scope = ConstEvalScope::enter(&self.prog, d); unsafe { call_jit(self as *mut Unit, entry, buf) } };
+                    match result {
                         Ok(_) if crate::ctfe::same_value(self, t, tmp, buf, 0) => return Some(buf),
                         Ok(_) => self.note_error(format!("CTFE MISMATCH in {}", self.prog.def_path(d))),
                         // Use the normal deferred-initialization retry and error path.

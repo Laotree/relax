@@ -429,8 +429,8 @@ pub enum RelocKind {
     A64MovzMovk,
     /// An arm64 coverage probe's leading NOP. `target` is the bitmap word;
     /// after bit `bit` is set, the embedder may atomically replace the NOP
-    /// with a branch over the seven-instruction probe. Not a cached fixup.
-    A64CoverageBit(u8),
+    /// with a branch over `words` instructions. Not a cached fixup.
+    A64CoverageBit { bit: u8, words: u32 },
     /// x64: the disp32 of a `call`/`jmp` at `at` (ends the instruction): value - (base + at + 4);
     /// a target out of reach is branched to through a veneer (`link_with`)
     X64Branch32,
@@ -625,8 +625,8 @@ pub fn link_with(code: &mut [u8], base: u64, relocs: &[RelocAt], value: &dyn Fn(
         };
         let wr32 = |c: &mut [u8], o: usize, w: u32| c[o..o + 4].copy_from_slice(&w.to_le_bytes());
         match r.kind {
-            RelocKind::A64CoverageBit(bit) => {
-                if bit >= 64 || at % 4 != 0 || at + 28 > code.len() || rd32(code, at)? != 0xD503_201F {
+            RelocKind::A64CoverageBit { bit, words } => {
+                if bit >= 64 || words == 0 || words >= 1 << 25 || at % 4 != 0 || at + words as usize * 4 > code.len() || rd32(code, at)? != 0xD503_201F {
                     return Err(format!("invalid coverage probe at {}", at));
                 }
             }
@@ -850,7 +850,9 @@ pub enum Inst {
     /// must outlive the code and must not alias program memory. This is an
     /// observable trace effect, but does not invalidate program loads. Native
     /// backends lower it after optimisation; it is never persisted in a cache.
-    Coverage { word: u64, mask: u64 },
+    /// `disabled` names a thread-local u64: zero during runtime execution,
+    /// all ones while the compiler evaluates an initializer on this thread.
+    Coverage { word: u64, mask: u64, disabled: Sym },
     Iconst(VReg, i64),
     Fconst(VReg, u64, bool),
     Mov(VReg, VReg),
