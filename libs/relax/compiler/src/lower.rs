@@ -5609,7 +5609,11 @@ impl<'a> Lcx<'a> {
             Mem::F32 => 4,
             Mem::F64 => 8,
         };
-        let mut buf = vec![0u8; l.size as usize];
+        // (fallible, as rustc's interpreter allocates: a value too large for the compiler's memory is left to the
+        // static allocation, which reports "tried to allocate more memory than available to compiler")
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(l.size as usize).ok()?;
+        buf.resize(l.size as usize, 0u8);
         match v {
             Val::L(regs) => {
                 let leaves = l.leaves.as_ref()?;
