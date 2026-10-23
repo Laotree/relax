@@ -306,16 +306,18 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             // E0004 / E0005 and the pattern lints (rustc check_match: its errors stop the body
             // before borrowck); an internal failure of the analysis reports nothing
             let pats = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| relax_types::pattern_analysis::check_body(prog, tcx, &body)));
+            // (binding conflicts of `x @ pat` do not end the checks: borrowck runs after them)
+            let mut at_patterns = Vec::new();
             match pats {
-                Ok(e) if !e.is_empty() => return (e, Vec::new()),
-                Ok(_) => {}
+                Ok(r) if !r.errors.is_empty() => { let mut e = r.errors; e.extend(r.at_patterns); return (e, Vec::new()) }
+                Ok(r) => at_patterns = r.at_patterns,
                 Err(p) if p.is::<crate::preempt::NeedsLoad>() || crate::preempt::is_preempted(&*p) => std::panic::resume_unwind(p),
                 Err(_) => {
                     if std::env::var_os("MAKEPAD_RUN_CHECK_TRACE").is_some() { std::eprintln!("makepad check: pattern analysis failed in {}", prog.def_path(d)); }
                 }
             }
             if !crate::borrowck::enabled(options) {
-                return (Vec::new(), Vec::new());
+                return (at_patterns, Vec::new());
             }
             let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &crate::tcx::EvalState::new()), prog, tcx, &body);
             crate::borrowck::note_verdict(&v);
@@ -324,7 +326,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             }
             let args: Vec<_> = if owner.kind == crate::borrowck::body::BodyKind::Function && !generic { Vec::new() } else { body.args.to_vec() };
             let diags = crate::borrowck::lazy::report_checked(prog, 0, tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &args, v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()).collect();
-            (Vec::new(), diags)
+            (at_patterns, diags)
             };
             let (mut errs, diags) = inner();
             errs.extend(gates);
@@ -769,19 +771,6 @@ fn eval_items(up: *mut Unit, own: &[bool], tainted: &std::collections::HashSet<c
     let _job = jit::compile_job();
     for (d, is_static) in items {
         if tainted.contains(&d) || !u.tcx.typeck(&u.prog, d).errors.is_empty() { continue; }
-        // the check-mode interpreter: rustc's CTFE undefined-behaviour and final-value checks
-        // (diagnostics only; an evaluation it rejects is not run by the JIT, as rustc stops there)
-        match crate::owner::call(crate::owner::Class::App, || relax_types::const_eval::interp::check_item(&u.prog, &u.tcx, d)) {
-            relax_types::const_eval::interp::Outcome::Error(span, msg) => {
-                let e = if msg.starts_with('E') { u.prog.record_error(span.file, span.lo, "typeck", msg) } else { u.prog.record_uncoded_error(span.file, span.lo, "typeck", msg) };
-                u.errors.push(e);
-                continue;
-            }
-            relax_types::const_eval::interp::Outcome::Unsupported(why) => {
-                if std::env::var_os("MAKEPAD_RUN_INTERP_TRACE").is_some() { eprintln!("interp: {}: unsupported: {why}", u.prog.def_path(d)); }
-            }
-            relax_types::const_eval::interp::Outcome::Ok => {}
-        }
         let before = unsafe { (&*up).errors.len() };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::owner::call(crate::owner::Class::App, || unsafe {
             let u = &mut *up;
