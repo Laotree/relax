@@ -275,7 +275,10 @@ pub fn type_check_body(tcx: &Tcx, prog: &Program, infcx: &mut dyn RegionDriverOp
     let closure_slots = if matches!(body.source.kind, BodyKind::Closure(_)) { body.local_decls.get(1).map_or(vec![], |env| {
         let env = match tcx.tys.kind(env.ty) { TyKind::Ref(_, t, _) => *t, _ => env.ty };
         free_regions_in_order(tcx, env)
-    }) } else { vec![] };
+    }) } else if matches!(body.source.kind, BodyKind::InlineConst) {
+        // an inline constant's own argument is its type (InlineConstArgs `ty`): the creator instantiates it
+        free_regions_in_order(tcx, body.local_decls[0].ty)
+    } else { vec![] };
 
     let closure_sig_erased_offset = if matches!(body.source.kind, BodyKind::Closure(_)) { body.local_decls.get(1).map_or(0, |env| {
         let env = match tcx.tys.kind(env.ty) { TyKind::Ref(_, t, _) => *t, _ => env.ty };

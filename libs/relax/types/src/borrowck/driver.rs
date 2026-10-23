@@ -67,6 +67,24 @@ fn closure_extent(ast: &crate::ast::Ast, c: u32) -> (u32, u32) {
     }
 }
 
+/// The inline constants a body (and its promoted bodies) uses: constant operands of their definitions.
+fn created_inline_consts(prog: &Program, mir: &Body, out: &mut Vec<u32>) {
+    use crate::mir::{Const, Location, Operand};
+    struct V<'a> { prog: &'a Program, out: &'a mut Vec<u32> }
+    impl crate::mir::visit::Visitor for V<'_> {
+        fn visit_operand(&mut self, op: &Operand, _: Location) {
+            if let Operand::Constant(c) = op {
+                if let Const::Unevaluated { def, promoted: None, .. } = &c.const_ {
+                    if let Some((_, relax_front::def_collector::NodeId::InlineConst(e))) = self.prog.def_id_to_node_id.get(def) { self.out.push(e.0); }
+                }
+            }
+        }
+    }
+    use crate::mir::visit::Visitor;
+    V { prog, out }.visit_body(mir);
+    for p in &mir.promoted { created_inline_consts(prog, p, out); }
+}
+
 /// The closures a body (and its promoted bodies) creates.
 fn created_closures(mir: &Body, out: &mut Vec<u32>) {
     use crate::mir::{AggregateKind, Rvalue, StatementKind};
@@ -101,6 +119,9 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
     let closure_order = closures_inner_first(prog, tcx, typeck);
     for &c in &closure_order {
         owners.push(CheckedBody { owner: typeck.def, kind: OwnerKind::Closure(crate::ast::ExprId(c)) });
+    }
+    for c in body::inline_const_children(prog, tcx, typeck) {
+        owners.push(CheckedBody { owner: typeck.def, kind: OwnerKind::InlineConst(crate::ast::ExprId(c)) });
     }
     let Some(item) = CheckedBody::item(prog, typeck.def) else {
         let d = prog.def(typeck.def);
@@ -308,14 +329,15 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
     // expansions give nested closures equal spans. Inner bodies come first, as do_mir_borrowck requires.
     let mut creator: crate::fxhash::HashMap<u32, Option<u32>> = Default::default();
     for (owner, mir) in &built {
-        let by = match owner.kind { OwnerKind::Closure(e) => Some(e.0), _ => None };
+        let by = match owner.kind { OwnerKind::Closure(e) | OwnerKind::InlineConst(e) => Some(e.0), _ => None };
         let mut created = vec![];
         created_closures(mir, &mut created);
+        created_inline_consts(prog, mir, &mut created);
         for c in created { creator.insert(c, by); }
     }
     let depth = |c: u32| { let (mut d, mut at) = (1usize, c); while let Some(Some(p)) = creator.get(&at) { d += 1; at = *p; if d > creator.len() + 1 { break; } } d };
-    built.sort_by_key(|(o, _)| std::cmp::Reverse(match o.kind { OwnerKind::Closure(e) => depth(e.0), _ => 0 }));
-    let closure_order: Vec<u32> = built.iter().filter_map(|(o, _)| match o.kind { OwnerKind::Closure(e) => Some(e.0), _ => None }).collect();
+    built.sort_by_key(|(o, _)| std::cmp::Reverse(match o.kind { OwnerKind::Closure(e) | OwnerKind::InlineConst(e) => depth(e.0), _ => 0 }));
+    let closure_order: Vec<u32> = built.iter().filter_map(|(o, _)| match o.kind { OwnerKind::Closure(e) | OwnerKind::InlineConst(e) => Some(e.0), _ => None }).collect();
     // `mir_coroutine_witnesses` of the coroutines of this root: dropck of their creators, auto traits.
     publish_coroutine_witnesses(prog, tcx, env, typeck, &built);
     check_coroutine_obligations(prog, tcx, env, typeck, v);
@@ -331,6 +353,14 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
     // run inner-first, so this is a pass of its own over the built bodies).
     let mut closure_sigs: crate::fxhash::HashMap<u32, SignatureRegions> = Default::default();
     for &c in closure_order.iter().rev() {
+        let parent = match creator.get(&c).copied().flatten().and_then(|p| closure_sigs.get(&p)) {
+            Some(p) => p.clone(),
+            None => item_sig.clone(),
+        };
+        if let Some(&ty) = typeck.inline_const_types.get(&c).filter(|_| built.iter().any(|(o, _)| matches!(o.kind, OwnerKind::InlineConst(e) if e.0 == c))) {
+            closure_sigs.insert(c, SignatureRegions::inline_const_in(tcx, prog, typeck.def, c, ty, parent));
+            continue;
+        }
         let Some((_, mir)) = built.iter().find(|(o, _)| matches!(o.kind, OwnerKind::Closure(e) if e.0 == c)) else { continue };
         // A coroutine (async block, async fn body) has no written signature: rustc's
         // `DefiningTy::Coroutine` has the resume argument as its one input and the return type as
@@ -344,10 +374,6 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
                 &synthesized
             }
             (None, None) => { v.unchecked.push(format!("{name}: closure without a signature")); return; }
-        };
-        let parent = match creator.get(&c).copied().flatten().and_then(|p| closure_sigs.get(&p)) {
-            Some(p) => p.clone(),
-            None => item_sig.clone(),
         };
         let env_ty = mir.local_decls.get(1).map_or(tcx.tys.unit, |d| d.ty);
         let plan = super::universal_regions::coroutine_closure_upvars(typeck, c);
@@ -363,6 +389,11 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
                 let id = ClosureId { file: typeck.file, expr: e.0 };
                 let key = if mir.coroutine.is_some() { ClauseOwner::Coroutine(id) } else { ClauseOwner::Closure(id) };
                 (sig, key, true)
+            }
+            OwnerKind::InlineConst(e) => {
+                let Some(sig) = closure_sigs.get(&e.0).cloned() else { v.unchecked.push(format!("{name}: inline const without universal regions")); return; };
+                let Some(&def) = prog.node_id_to_def_id.get(&(typeck.file, relax_front::def_collector::NodeId::InlineConst(e))) else { v.unchecked.push(format!("{name}: inline const definition")); return; };
+                (sig, ClauseOwner::Def(def), true)
             }
             _ => (item_sig.clone(), ClauseOwner::Def(typeck.def), false),
         };
