@@ -2000,6 +2000,7 @@ impl<'a> Parser<'a> {
                         return Ok(());
                     }
                     self.pos = at;
+                    self.record_mac_call_attrs(&attrs);
                     if self.stmt_macro(stmts)? {
                         return Ok(());
                     }
@@ -2015,6 +2016,20 @@ impl<'a> Parser<'a> {
         }
         stmts.push(s);
         Ok(())
+    }
+
+    /// The attributes on a macro call (makepad check): judged by the feature gates (rustc_expand
+    /// check_attributes -> feature_gate::check_attribute).
+    fn record_mac_call_attrs(&self, attrs: &[Attr]) {
+        if attrs.is_empty() || !crate::macros::uses::recording() { return; }
+        let file = self.bctx.as_ref().map_or("", |c| c.path.as_str());
+        for a in attrs {
+            if a.toks.hi <= a.toks.lo { continue; }
+            let t = self.toks.at(a.toks.lo as usize);
+            if !matches!(t.kind, T::Ident) { continue; }
+            let name = String::from_utf8_lossy(self.tok_text(t)).into_owned();
+            crate::macros::uses::mac_call_attr(file, t.lo, &name);
+        }
     }
 
     /// A statement-position `macro_rules!` call at the cursor: its statements splice into the
@@ -2156,6 +2171,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if !self.pending_shape.is_empty() { self.check_pending_attrs()?; }
+            if !attrs.is_empty() && self.mac_ahead() { self.record_mac_call_attrs(&attrs); }
             if let Some(v) = self.try_expand_rules(|p, _, _| p.items_until(T::Eof))? {
                 items.extend(v);
                 continue;
