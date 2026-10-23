@@ -2695,7 +2695,7 @@ fn adopt_collected_tables() -> bool {
     let t = Instant::now();
     // a front write (try only): structural, a program-class request
     let Some(done) = crate::owner::call(crate::owner::Class::Program, || {
-        let Ok(_front) = jit::FRONT_RW.try_write() else { return None };
+        let Some(_front) = jit::front_try_write() else { return None };
         let u = unsafe { &mut *up };
         if !front_recordable() { return Some(None); }
         let cache = u.cache.as_ref()?;
@@ -2731,7 +2731,7 @@ fn drop_program_memos() -> bool {
     let t = Instant::now();
     // a front write (try only): structural, a program-class request
     let Some(()) = crate::owner::call(crate::owner::Class::Program, || {
-        let Ok(_front) = jit::FRONT_RW.try_write() else { return None };
+        let Some(_front) = jit::front_try_write() else { return None };
         let u = unsafe { &mut *up };
         unsafe { u.prog.detach_caches(&mut retired) };
         retired.push(u.tcx.retire_solver_cache());

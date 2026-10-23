@@ -139,6 +139,8 @@ impl Interner {
     }
     /// load-time names (not the late ones)
     pub fn len(&self) -> usize { self.image.as_ref().map_or(0, |m| m.len()) + self.strs.len() }
+    /// Names interned late (through a shared reference, `late`): the settle swap's change check.
+    pub fn late_len(&self) -> usize { self.late.lock().unwrap_or_else(|e| e.into_inner()).1.len() }
     /// load-time names in id order
     pub fn names(&self) -> impl Iterator<Item = &str> + '_ { (0..self.len() as Sym).map(|i| self.str(i)) }
     /// (names, heap bytes: both copies of every string plus the map's and list's tables)

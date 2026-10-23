@@ -8113,7 +8113,7 @@ pub unsafe fn retire_type_side(up: *mut Unit) -> Option<(usize, usize)> {
     // A settle-swap run waits (the owner serves while it does) for the readers that overlap
     // without a gap in a big app (Scope cold: ahead checkers and the lazy file loader), which
     // try_write never wins; writers waiting make new checks stop at their next point.
-    let _front = if zone_swap::enabled() { front_write_within(150)? } else { FRONT_RW.try_write().ok()? };
+    let _front = if zone_swap::enabled() { front_write_within(150)? } else { front_try_write()? };
     Some((*up).tcx.retire_settled())
 }
 
@@ -8211,7 +8211,7 @@ pub unsafe fn settle_drop(up: *mut Unit) -> SettleDrops {
     drops.typeck += freed_since(before);
     // RIR and checked body ownership belong to the unit, not the off-lock front.
     // A busy checker only postpones shared memo-node reclamation.
-    let Ok(_front) = FRONT_RW.try_write() else {
+    let Some(_front) = front_try_write() else {
         drops.front_pending = true;
         drops.max_sweep_ns = wall_ns().saturating_sub(started);
         return drops;
@@ -16341,6 +16341,13 @@ static SWAP_HARD: AtomicBool = AtomicBool::new(false);
 static BG_IDLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// wall ns since which the program's main thread waits at the job gate (0: it does not)
 static GATED_MAIN: AtomicU64 = AtomicU64::new(0);
+/// The main thread's waits at the job gate: [count, total ns, longest ns] (the swap's report line)
+static GATED_MAIN_SUM: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// (waits, total ns, longest ns) of the main thread at the job gate so far.
+pub(crate) fn gated_main() -> (u64, u64, u64) {
+    (GATED_MAIN_SUM[0].load(Ordering::Relaxed), GATED_MAIN_SUM[1].load(Ordering::Relaxed), GATED_MAIN_SUM[2].load(Ordering::Relaxed))
+}
 
 /// A compile job in progress (outermost guard per thread counts).
 pub struct JobGuard;
@@ -16393,7 +16400,13 @@ fn job_gate(reenter: bool) -> JobGuard {
             g = BG_CV.wait_timeout(g, std::time::Duration::from_millis(50)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
         }
         if is_main {
-            GATED_MAIN.store(0, Ordering::SeqCst);
+            let since = GATED_MAIN.swap(0, Ordering::SeqCst);
+            if since != 0 {
+                let ns = wall_ns().saturating_sub(since);
+                GATED_MAIN_SUM[0].fetch_add(1, Ordering::Relaxed);
+                GATED_MAIN_SUM[1].fetch_add(ns, Ordering::Relaxed);
+                GATED_MAIN_SUM[2].fetch_max(ns, Ordering::Relaxed);
+            }
         }
         if shut() {
             drop(g);
@@ -17583,6 +17596,30 @@ unsafe fn build_rir_or_skip(up: *mut Unit, id: u32, mode: RirMode) -> Option<Res
 /// or to collected signatures / types.
 pub static FRONT_RW: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
+/// Bumped by every front write as it takes FRONT_RW (front_write, front_write_within,
+/// front_try_write): work that read the program and type context under a front read compares it
+/// later to know that no writer ran meanwhile (the settle swap's encode off the pause, zone_swap.rs).
+/// Read it while holding a front read: no writer can bump it then.
+static FRONT_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn front_epoch() -> u64 {
+    FRONT_EPOCH.load(Ordering::Acquire)
+}
+
+fn front_wrote(g: std::sync::RwLockWriteGuard<'static, ()>) -> std::sync::RwLockWriteGuard<'static, ()> {
+    FRONT_EPOCH.fetch_add(1, Ordering::Release);
+    g
+}
+
+/// FRONT_RW's write lock if it is free now (no wait, no pump).
+pub fn front_try_write() -> Option<std::sync::RwLockWriteGuard<'static, ()>> {
+    match FRONT_RW.try_write() {
+        Ok(g) => Some(front_wrote(g)),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(front_wrote(e.into_inner())),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 /// The front end's write lock within `ms`, or None: the exit's last writes give up rather than
 /// wait for a reader (an app thread that parked for good holding a type check's read lock:
 /// EXITING parks every other thread that asks for the unit lock).
@@ -17591,10 +17628,8 @@ pub fn front_write_within(ms: u64) -> Option<std::sync::RwLockWriteGuard<'static
     let _waiting = crate::preempt::WriterWaiting::new();
     let t0 = std::time::Instant::now();
     loop {
-        match FRONT_RW.try_write() {
-            Ok(g) => return Some(g),
-            Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => {}
+        if let Some(g) = front_try_write() {
+            return Some(g);
         }
         if t0.elapsed().as_millis() as u64 >= ms {
             return None;
@@ -17614,17 +17649,16 @@ pub fn front_write() -> std::sync::RwLockWriteGuard<'static, ()> {
     // point instead of finishing first (relax_types::preempt)
     let _waiting = crate::preempt::WriterWaiting::new();
     if !owner::is_owner() {
-        return FRONT_RW.write().unwrap_or_else(|e| e.into_inner());
+        return front_wrote(FRONT_RW.write().unwrap_or_else(|e| e.into_inner()));
     }
     // the owner: a reader may be waiting for one of its answers (a constant for a type check),
     // so it serves them while it waits; a request served nested inside another's wait gives
     // way instead (that request's own readers may be what holds the front)
     owner::busy_if_nested();
     loop {
-        match FRONT_RW.try_write() {
-            Ok(g) => return g,
-            Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => owner::pump_wait(&|| FRONT_RW.try_write().is_ok()),
+        match front_try_write() {
+            Some(g) => return g,
+            None => owner::pump_wait(&|| FRONT_RW.try_write().is_ok()),
         }
     }
 }
