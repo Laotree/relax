@@ -146,7 +146,16 @@ mod unix {
         #[cfg(target_os = "macos")]
         const MAP_FIXED_NORESERVE: i32 = 0x10 | 0x40;
         unsafe {
-            mmap(addr as *mut u8, len, 0, MAP_PRIVATE_ANON | MAP_FIXED_NORESERVE, -1, 0);
+            if mmap(addr as *mut u8, len, 0, MAP_PRIVATE_ANON | MAP_FIXED_NORESERVE, -1, 0) as u64 == addr {
+                return;
+            }
+            // the pages stay committed, but nothing can execute or name them for other code
+            if mprotect(addr as *mut u8, len, 0) != 0 {
+                // (a failed MAP_FIXED may already have removed the old mapping: the range could be
+                // handed out again while stale return addresses name it. Never contained: abort)
+                eprintln!("makepad run: retired code memory at {:#x} ({} bytes) could not be made unreachable", addr, len);
+                std::process::abort();
+            }
         }
     }
 
