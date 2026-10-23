@@ -6431,6 +6431,7 @@ impl Unit {
         }
         self.cache = Some(cache);
         PENDING_RECORDS.store(self.pending_cache_records.len() - self.pending_cache_cursor, Ordering::Relaxed);
+        crate::cache::warm_count::N[crate::cache::warm_count::RECORDS_WAITING].store((self.pending_cache_records.len() - self.pending_cache_cursor) as u64, Ordering::Relaxed);
         if self.pending_cache_cursor == self.pending_cache_records.len() {
             self.pending_cache_records = Vec::new();
             self.pending_cache_cursor = 0;
@@ -6462,6 +6463,13 @@ pub(crate) fn drain_records_bounded() {
         let _job = compile_job();
         let more = owner::publish(|| {
             let up = SPEC_UNIT.load(Ordering::Acquire);
+            {
+                // (diagnostic: why the last drain stopped)
+                use crate::cache::warm_count as wc;
+                let why = if SPEC_STOP.load(Ordering::SeqCst) { 1 } else if up.is_null() { 2 } else if unsafe { (&*up).cache.is_none() } { 3 } else if up != TIER_UNIT.load(Ordering::Acquire) { 4 } else { 5 };
+                wc::N[wc::DRAIN_WHY].store(why, Ordering::Relaxed);
+                if !up.is_null() { wc::N[wc::DRAIN_LEN].store(unsafe { (&*up).pending_cache_records.len() - (&*up).pending_cache_cursor } as u64, Ordering::Relaxed); }
+            }
             !SPEC_STOP.load(Ordering::SeqCst) && !up.is_null() && unsafe { (&mut *up).record_cache_batch(RECORD_BATCH) }
         });
         if !more { break; }
@@ -6519,6 +6527,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                     if let Some(p) = deferred {
                         u.pending_cache_records.push(Some(p));
                         PENDING_RECORDS.fetch_add(1, Ordering::Relaxed);
+                        crate::cache::warm_count::add(crate::cache::warm_count::RECORDS_WAITING, 1);
                     }
                 }
             }
@@ -7798,6 +7807,7 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
     if snapshot {
         crate::zone_alloc::kept_with(|| O2_LATER.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id)));
     } else if let Some(mut cache) = u.cache.take() {
+        cache.note_retier_over(u, id, crate::cache::warm_count::RETIER_O2_OVER);
         cache.record_o2(u, id, &c.code, &c.relocs, &c.pc_map);
         u.cache = Some(cache);
     }
@@ -12422,6 +12432,7 @@ pub fn sweep_verdicts() {
                     if f.compiled && (f.o3.load(Ordering::Relaxed) || !f.d3_lowered.load(Ordering::Relaxed) && u.disjoint_checks(id as u32).is_some()) {
                         relower.push(id as u32);
                     } else {
+                        if f.compiled { crate::cache::warm_count::add(crate::cache::warm_count::SPECV_LATE, 1); }
                         verified.push(id as u32);
                     }
                 }
@@ -13872,6 +13883,10 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
         // build (the first worker's poll alone waited out its own builds: hot slots came out of
         // the window one at a time behind a long O3 build)
         pgo_poll();
+        // the deferred cache records (its O3 installs' among them) are encoded here too, not only
+        // by the run monitor: cold races where the monitor stopped draining at ~40 s left 12k
+        // records (4k of them O3 code) for the quit write, and the warm launch re-tiered them
+        if records_due() { drain_records_bounded(); }
         let (id, why, queued_at, rate) = {
             let mut q = tier_queue().unwrap();
             loop {
@@ -15093,16 +15108,22 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // speculative code holds this run's site records (crate::guards): never cached
                 let speculative = spec_ctx.as_ref().is_some_and(|c| c.emitted.get());
                 // (inspect's builds are this session's: never cached)
+                {
+                    use crate::cache::warm_count as wc;
+                    wc::add(if unverified { wc::O3_UNVERIFIED } else if speculative || inspect_o3_on() { wc::O3_SPEC } else if frame_size > frame_max { wc::O3_FRAME } else { wc::O3_QUEUED }, 1);
+                }
                 if frame_size <= frame_max && !unverified && !speculative && !inspect_o3_on() {
                     // its key and certificate encoding in the bounded record batches (records_due),
                     // not in this publish
-                    if let Some(c) = u.cache.take() {
+                    if let Some(mut c) = u.cache.take() {
+                        c.note_retier_over(u, id, crate::cache::warm_count::RETIER_O3_OVER);
                         let tr = cpu_ns();
                         let p = c.defer_record_o3(u, id, &code, &relocs, &map, &inlined, &nounwind_used);
                         u.cache = Some(c);
                         if let Some(p) = p {
                             u.pending_cache_records.push(Some(p));
                             PENDING_RECORDS.fetch_add(1, Ordering::Relaxed);
+                        crate::cache::warm_count::add(crate::cache::warm_count::RECORDS_WAITING, 1);
                         }
                         O3_INSTALL_REC[0].fetch_add(1, Ordering::Relaxed);
                         O3_INSTALL_REC[1].fetch_add(cpu_ns() - tr, Ordering::Relaxed);

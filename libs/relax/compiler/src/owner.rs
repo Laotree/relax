@@ -573,7 +573,9 @@ pub fn forbid_in_publish(what: &'static str, slot: u32) {
             }
             std::panic::resume_unwind(Box::new(PublishBail { what, slots: if slot == u32::MAX { Vec::new() } else { vec![slot] } }))
         }
-        _ => panic!("makepad: {} inside a publish to the compiler's owner (rule I-PUB: a publish is bounded and never runs a front, an initializer, JIT code or a wait)", what),
+        // (a bug: where, with the stack -- the thread's panic hook may print nothing, and a
+        // runtime thread unwound by it ended silently: the run monitor, PGO7)
+        _ => panic!("makepad: {} inside a publish to the compiler's owner at {} (rule I-PUB: a publish is bounded and never runs a front, an initializer, JIT code or a wait)\n{}", what, std::panic::Location::caller(), std::backtrace::Backtrace::force_capture()),
     }
 }
 
