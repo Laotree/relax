@@ -4438,6 +4438,15 @@ impl Unit {
             relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) | relax_backend::rir::Inst::FnAddr(_, c) => Some(*c),
             _ => None,
         }).collect::<Vec<_>>().into_boxed_slice();
+        // SPEC-V: calls to twins its lowering did not make (in bodies it inlined) are recorded as
+        // the lowering's are, so a twin's install finds every caller in TWIN_USERS (twin_callers)
+        if func.plain_calls {
+            for &c in refs.iter() {
+                if c != id && matches!(self.fns[c as usize].key, FnKey::Plain(_)) {
+                    note_twin_user(self, id, c);
+                }
+            }
+        }
         let old = std::mem::replace(&mut self.fns[id as usize].rir_refs, refs);
         for c in old {
             let n = &mut self.fns[c as usize].refs;
@@ -8484,11 +8493,14 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
         crate::options::Tier0Baseline::Always => true,
     };
     let from_ahead = lowered.is_none();
+    if owner::bailing() { O3_OWNER[20].fetch_add(1, Ordering::Relaxed); }
     let r = match lowered {
         Some(f) => Ok(f),
         None => {
             let prev = PREP_LOWER.with(|p| p.replace(true));
+            let tl = if owner::bailing() { cpu_ns() } else { 0 };
             let r = build_rir_inner(up, id);
+            if tl != 0 { o3_owner(19, tl); }
             PREP_LOWER.with(|p| p.set(prev));
             r
         }
@@ -12368,7 +12380,7 @@ pub fn sweep_verdicts() {
         let Some(up) = live() else { return };
         let u = &*up;
         // ... and the ones whose unverified lowering calls hot twins
-        let mut tc = twin_callers(u, Some(&verified), None);
+        let mut tc = twin_callers(u, &verified, None);
         {
             // (unverified callers of hot twins that were waiting for this)
             let mut a = TWIN_AWAIT.lock().unwrap_or_else(|e| e.into_inner());
@@ -12440,7 +12452,10 @@ fn short_name(n: &str) -> &str {
 #[derive(Default)]
 struct TwinCallers { o3: Vec<u32>, below: Vec<u32>, unverified: Vec<u32> }
 
-fn twin_callers(u: &Unit, cands: Option<&[u32]>, twin: Option<u32>) -> TwinCallers {
+/// SPEC-V: the callers of hot twins to bring to the base slots: those of `cands` whose RIR calls an
+/// O3 twin, and (`twin`) the lowerings that called `twin` (TWIN_USERS: every RIR with calls to a
+/// twin is recorded there, set_rir: no scan of every slot's RIR at a twin's install).
+fn twin_callers(u: &Unit, cands: &[u32], twin: Option<u32>) -> TwinCallers {
     let hot = |t: u32| matches!(u.fns[t as usize].key, FnKey::Plain(_)) && match twin {
         Some(w) => t == w,
         None => u.fns[t as usize].o3.load(Ordering::Relaxed),
@@ -12460,10 +12475,7 @@ fn twin_callers(u: &Unit, cands: Option<&[u32]>, twin: Option<u32>) -> TwinCalle
         }
     };
     let rir_calls = |c: u32| u.fns[c as usize].rir.as_ref().is_some_and(|r| r.plain_calls && r.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(t), _, _) if hot(*t)))));
-    match cands {
-        Some(c) => c.iter().copied().filter(|&c| rir_calls(c)).for_each(|c| classify(&mut out, c)),
-        None => (0..u.fns.len() as u32).filter(|&c| rir_calls(c)).for_each(|c| classify(&mut out, c)),
-    }
+    cands.iter().copied().filter(|&c| rir_calls(c)).for_each(|c| classify(&mut out, c));
     // the lowerings that called `twin` (TWIN_USERS, kept when their RIR is dropped): a twin's
     // callers are mostly twins themselves (a twin calls twins), so the chain is walked up to the
     // bodies that are not twins
@@ -12494,7 +12506,8 @@ static TWIN_USERS: std::sync::LazyLock<relax_session::sync::Mutex<HashMap<(usize
 /// SPEC-V: unverified callers of hot twins: lowered again once their verdict is clean (sweep_verdicts)
 static TWIN_AWAIT: relax_session::sync::Mutex<Vec<(usize, u32)>> = relax_session::sync::Mutex::new(Vec::new());
 
-/// SPEC-V: slot `caller`'s lowering sends a call to `twin` (lower.rs; any lowering thread)
+/// SPEC-V: slot `caller`'s RIR sends a call to `twin`: its lowering (lower.rs; any lowering thread),
+/// or a body it inlined (set_rir)
 pub(crate) fn note_twin_user(u: &Unit, caller: u32, twin: u32) {
     if caller == twin || (caller as usize) >= u.fns.len() {
         return;
@@ -15026,7 +15039,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // SPEC-V: a twin tiered up: its warm callers that are verified by now are lowered
                 // again, so they call the base slot (which the twin's samples heat as well)
                 if matches!(u.fns[id as usize].key, FnKey::Plain(_)) {
-                    let tc = twin_callers(u, None, Some(id));
+                    let tc = twin_callers(u, &[], Some(id));
                     if specv_trace() {
                         let l = |v: &Vec<u32>| format!("{} [{}]", v.len(), v.iter().take(4).map(|&c| format!("#{} {}", c, short_name(&u.fns[c as usize].name))).collect::<Vec<_>>().join(", "));
                         eprintln!("specv @{:.3} twin O3 #{} {}: callers unverified {} / verified-O3 {} / verified-below-O3 {}", wall_ns() as f64 / 1e9, id, short_name(&u.fns[id as usize].name), l(&tc.unverified), l(&tc.o3), l(&tc.below));
@@ -16098,6 +16111,8 @@ unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u3
     }
     for &(c, mode) in ids {
         let outcome = Outcome(cpu_ns(), std::cell::Cell::new(10));
+        let preps0 = O3_OWNER[20].load(Ordering::Relaxed);
+        let count_preps = |i: usize| { O3_OWNER[i].fetch_add(O3_OWNER[20].load(Ordering::Relaxed) - preps0, Ordering::Relaxed); };
         let u = &*up;
         let f = &u.fns[c as usize];
         if f.building || f.inflight || f.build_err.is_some() {
@@ -16150,8 +16165,8 @@ unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u3
         }
         end_build(up, c);
         match r {
-            Ok(Ok((p, _))) => { cand_skip(13); outcome.1.set(8); preps.push((c, p)) }
-            Ok(Err(e)) if e == YIELDED || e == NEEDS_FRONT => { cand_skip(10); outcome.1.set(9); gave.push(c) }
+            Ok(Ok((p, _))) => { cand_skip(13); outcome.1.set(8); count_preps(18); preps.push((c, p)) }
+            Ok(Err(e)) if e == YIELDED || e == NEEDS_FRONT => { cand_skip(10); outcome.1.set(9); count_preps(17); gave.push(c) }
             // the fronts it needs go to the snapshot's next round (owner::take_needs)
             Err(p) if p.is::<crate::preempt::PublishBail>() => {
                 if let Ok(b) = p.downcast::<crate::preempt::PublishBail>() {
@@ -16159,6 +16174,7 @@ unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u3
                 }
                 cand_skip(11);
                 outcome.1.set(9);
+                count_preps(17);
                 gave.push(c);
             }
             Err(p) if p.is::<crate::preempt::OwnerBusy>() => std::panic::resume_unwind(p),
@@ -16183,7 +16199,7 @@ pub static O3_INSTALL_REC: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0
 pub static O3_OWNER: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
 const O3_OWNER_NAMES: [&str; 24] = ["install", "link-check", "emit", "index", "inlined", "twin-callers", "retier", "refused",
     "cand-take prepped", "cand-take bailed", "cand-take skipped", "cand-finish", "root-t0 not-split", "root-t0 split-tried", "root-up not-split", "root-up split-tried",
-    "", "", "", "", "", "", "", ""];
+    "", "preps in bailed cand-takes#", "preps in prepped cand-takes#", "lowering taken in takes", "preps in takes#", "", "", ""];
 /// O3_OWNER[i] += this thread's cpu since `t`
 #[inline]
 fn o3_owner(i: usize, t: u64) {
@@ -16191,7 +16207,10 @@ fn o3_owner(i: usize, t: u64) {
 }
 pub(crate) fn o3_owner_summary() -> String {
     O3_OWNER_NAMES.iter().enumerate().filter(|(i, n)| !n.is_empty() && O3_OWNER[*i].load(Ordering::Relaxed) > 0)
-        .map(|(i, n)| format!("{} {:.0} ms", n, O3_OWNER[i].load(Ordering::Relaxed) as f64 / 1e6)).collect::<Vec<_>>().join(", ")
+        .map(|(i, n)| match n.strip_suffix('#') {
+            Some(n) => format!("{} {}", n, O3_OWNER[i].load(Ordering::Relaxed)),
+            None => format!("{} {:.0} ms", n, O3_OWNER[i].load(Ordering::Relaxed) as f64 / 1e6),
+        }).collect::<Vec<_>>().join(", ")
 }
 
 pub(crate) fn cand_skip_summary() -> String {
