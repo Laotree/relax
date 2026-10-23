@@ -870,6 +870,22 @@ fn size_basics() {
     assert!(st2.names > 0);
 }
 
+/// Run `script` in Node with `bytes` on stdin. The wasm runner tests run on the Linux
+/// pool, where Node is required; on other hosts (the Macs, where Node is not run) they
+/// are reported as skipped. Returns None when skipped.
+fn node_run(script: &str, bytes: &[u8]) -> Option<bool> {
+    use std::io::Write;
+    let mut cmd = std::process::Command::new("node");
+    cmd.args(["-e", script]).stdin(std::process::Stdio::piped());
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipped: wasm runner tests need Node, which runs on the Linux pool only");
+        return None;
+    }
+    let mut child = cmd.spawn().expect("Node is required for the wasm runner tests on Linux");
+    child.stdin.take().unwrap().write_all(bytes).unwrap();
+    Some(child.wait().unwrap().success())
+}
+
 /// Exercise the architecture bindings in a real wasm validator/runtime, including
 /// memory64 and shared memory (which the small in-tree interpreter does not model).
 fn web_builtin(builtin: Builtin, arity: usize, assertion: &str) {
@@ -892,10 +908,8 @@ fn web_builtin(builtin: Builtin, arity: usize, assertion: &str) {
             assert!(out.stats.failed.is_empty(), "{:?}", out.stats.failed);
             dump(&out.bytes);
             let script = format!("const assert=require('node:assert/strict'); const b=require('node:fs').readFileSync(0); assert(WebAssembly.validate(b)); const x=new WebAssembly.Instance(new WebAssembly.Module(b), {{}}).exports; const shared={shared}; const memory64={memory64}; {assertion}");
-            use std::io::Write;
-            let mut child = std::process::Command::new("node").args(["-e", &script]).stdin(std::process::Stdio::piped()).spawn().expect("Node is required for wasm architecture tests");
-            child.stdin.take().unwrap().write_all(&out.bytes).unwrap();
-            assert!(child.wait().unwrap().success(), "{builtin:?}, memory64={memory64}, shared={shared}");
+            let Some(ok) = node_run(&script, &out.bytes) else { return };
+            assert!(ok, "{builtin:?}, memory64={memory64}, shared={shared}");
         }
     }
 }
@@ -949,10 +963,8 @@ fn web_c_boundary_numbers_and_bigints() {
             for (const f of [x.f0, x.f1]) assert.equal(f(0xfedcba98, pointer, pointer, 0x123456789abcdefn, 1.25) >>> 0, 0xf1234567);
             assert.equal(calls, 2);
         "#);
-        use std::io::Write;
-        let mut child = std::process::Command::new("node").args(["-e", &script]).stdin(std::process::Stdio::piped()).spawn().expect("Node is required for wasm ABI tests");
-        child.stdin.take().unwrap().write_all(&bytes).unwrap();
-        assert!(child.wait().unwrap().success(), "memory64={memory64}");
+        let Some(ok) = node_run(&script, &bytes) else { return };
+        assert!(ok, "memory64={memory64}");
     }
 }
 #[test]
@@ -988,10 +1000,8 @@ fn web_c_boundary_aggregate_indirect() {
             assert.equal(x.f0({memory64}?512n:512,{memory64}?256n:256),undefined);
             assert.equal(view.getBigUint64(512,true),130n);assert.equal(view.getBigUint64(520,true),456n);
         "#);
-        use std::io::Write;
-        let mut child=std::process::Command::new("node").args(["-e", &script]).stdin(std::process::Stdio::piped()).spawn().unwrap();
-        child.stdin.take().unwrap().write_all(&bytes).unwrap();
-        assert!(child.wait().unwrap().success(), "memory64={memory64}");
+        let Some(ok) = node_run(&script, &bytes) else { return };
+        assert!(ok, "memory64={memory64}");
     }
 }
 #[test]
