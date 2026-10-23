@@ -113,6 +113,7 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
     for child in body::const_children(prog, tcx, typeck) {
         check_group(&g, &[child], true, &mut v);
     }
+    tcx.potentially_region_dependent_goals.lock().unwrap_or_else(|e| e.into_inner()).remove(&typeck.def);
     v
 }
 
@@ -149,7 +150,7 @@ fn publish_coroutine_witnesses(prog: &Program, tcx: &Tcx, env: TypingEnv, typeck
 /// rustc `check_coroutine_obligations`: the goals the root's typeck stalled on its coroutines are proven now
 /// that the witnesses are known (mode `borrowck`, regions ignored); what does not hold is a normal error.
 fn check_coroutine_obligations(prog: &Program, tcx: &Tcx, env: TypingEnv, typeck: &typeck::Body, v: &mut Verdict) {
-    use crate::next_solver::fulfill::{NextSolverError, ObligationCause, ObligationCtxt};
+    use crate::next_solver::fulfill::{ObligationCause, ObligationCtxt};
     let goals = tcx.coroutine_stalled_predicates.lock().unwrap_or_else(|e| e.into_inner()).remove(&typeck.def);
     let Some(goals) = goals else { return };
     let infcx = crate::infer::InferCtxt::for_item(tcx, prog, env.mode, typeck.def);
@@ -158,13 +159,43 @@ fn check_coroutine_obligations(prog: &Program, tcx: &Tcx, env: TypingEnv, typeck
         ocx.cause = ObligationCause { span, body_id: typeck.def };
         ocx.register_obligation(goal);
     }
-    for error in ocx.engine.evaluate_obligations_error_on_ambiguity(&infcx, prog) {
+    let errors = ocx.engine.evaluate_obligations_error_on_ambiguity(&infcx, prog);
+    report_fulfillment_errors(prog, tcx, &infcx, typeck, errors, v);
+}
+
+/// rustc_hir_analysis check.rs check_potentially_region_dependent_goals (asked by a failing type op of the
+/// root's borrow check, custom.rs scrape_region_constraints): the goals HIR typeck proved that may depend on
+/// the identity of their regions, each region a fresh variable, proven again in the borrowck typing mode
+/// with region constraints ignored; what fails or stays ambiguous is reported.
+fn check_potentially_region_dependent_goals(prog: &Program, tcx: &Tcx, env: TypingEnv, typeck: &typeck::Body, goals: Vec<(crate::next_solver::Goal, u32)>, v: &mut Verdict) {
+    use crate::next_solver::fulfill::{ObligationCause, ObligationCtxt};
+    struct FreshRegions<'i, 'a>(&'i crate::infer::InferCtxt<'a>);
+    impl crate::types::fold::TypeFolder for FreshRegions<'_, '_> {
+        fn fold_region(&mut self, tys: &crate::types::Types, r: crate::types::RegionId, depth: u32) -> crate::types::RegionId {
+            if matches!(tys.region_kind(r), crate::types::RegionKind::ReBound(db, _) if db < depth) { r } else { self.0.next_region_var() }
+        }
+    }
+    let infcx = crate::infer::InferCtxt::for_item(tcx, prog, env.mode, typeck.def);
+    let mut ocx = ObligationCtxt::new(&infcx, prog);
+    for (goal, span) in goals {
+        let predicate = crate::next_solver::fold::fold_predicate(&tcx.tys, &goal.predicate, &mut FreshRegions(&infcx));
+        ocx.cause = ObligationCause { span, body_id: typeck.def };
+        ocx.register_obligation(crate::next_solver::Goal { param_env: goal.param_env, predicate });
+    }
+    let errors = ocx.engine.evaluate_obligations_error_on_ambiguity(&infcx, prog);
+    report_fulfillment_errors(prog, tcx, &infcx, typeck, errors, v);
+}
+
+/// report_fulfillment_errors of goals proven for the borrow check of `typeck`'s root.
+fn report_fulfillment_errors(prog: &Program, tcx: &Tcx, infcx: &crate::infer::InferCtxt<'_>, typeck: &typeck::Body, errors: Vec<crate::next_solver::fulfill::NextSolverError>, v: &mut Verdict) {
+    use crate::next_solver::fulfill::NextSolverError;
+    for error in errors {
         let (code, o) = match error {
             NextSolverError::TrueError(o) => ("E0277", o),
             NextSolverError::Ambiguity(o) => ("E0283", o),
             NextSolverError::Overflow(o) => ("E0275", o),
         };
-        if crate::wfcheck::obligations::predicate_mentions_error(&infcx, &o.goal.predicate) { continue; }
+        if crate::wfcheck::obligations::predicate_mentions_error(infcx, &o.goal.predicate) { continue; }
         let message = match &o.goal.predicate.kind {
             crate::next_solver::PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(p)) => {
                 let message = typeck::trait_error_message(prog, tcx, code, p, &mut |t| typeck::ty_to_string(false, prog, tcx, t));
@@ -173,7 +204,7 @@ fn check_coroutine_obligations(prog: &Program, tcx: &Tcx, env: TypingEnv, typeck
                     "future cannot be sent between threads safely".to_string()
                 } else { message }
             }
-            predicate => crate::wfcheck::obligations::fulfillment_message(&infcx, prog, code, &o.goal).unwrap_or_else(|| format!("unsatisfied obligation {predicate:?}")),
+            predicate => crate::wfcheck::obligations::fulfillment_message(infcx, prog, code, &o.goal).unwrap_or_else(|| format!("unsatisfied obligation {predicate:?}")),
         };
         let span = Span { file: typeck.file, lo: o.cause.span, hi: o.cause.span };
         let mut d = diagnostics::Diag::new(code, span, message);
@@ -347,6 +378,11 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
             }
         };
         prepared.push(Prepared { owner, key, nested, mir, moves, sig, infcx, typeck: Some(tc) });
+    }
+    // A failing type op asks for the root's potentially region-dependent goals (a query: once per root).
+    if prepared.iter().any(|p| p.infcx.type_op_failed.get()) {
+        let goals = tcx.potentially_region_dependent_goals.lock().unwrap_or_else(|e| e.into_inner()).remove(&typeck.def);
+        if let Some(goals) = goals { check_potentially_region_dependent_goals(prog, tcx, env, typeck, goals, v); }
     }
 
     // The type check's own findings (E0161 and friends) and its internal-error reports.

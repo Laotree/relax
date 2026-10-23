@@ -342,7 +342,7 @@ impl RegionDriverOps for super::infer_ctxt::BorrowckInferCtxt<'_> {
         match super::type_check::canonical::fully_perform_op_raw(self, universals, &self.region_bound_pairs, &self.param_env.clauses, out,
             super::type_check::Locations::All(span), span, super::constraints::ConstraintCategory::Internal, op) {
             Ok(ty) => ty,
-            Err(_) => { self.tainted_by_errors.set(true); self.tcx.tys.error }
+            Err(_) => { self.tainted_by_errors.set(true); self.type_op_failed.set(true); self.tcx.tys.error }
         }
     }
 }
