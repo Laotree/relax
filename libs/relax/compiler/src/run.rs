@@ -2302,9 +2302,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 let record = left && jit::FIRST_PRESENT.load(Ordering::Acquire) && since >= 1_000;
                 // a trickle of first compiles counts as quiet (SettleWatch: a game keeps reaching code)
                 let mid_still = mid_quiet >= 20 || settle_watch.slow(jit::demand_compiled());
-                // (image slots tiered up since the image was written: a quiet write writes it again)
-                let tierups = MID_MANIFEST_DONE.load(Ordering::Relaxed) && crate::cache::image_tierups_pending();
-                let due = n != mid_flushed && ((mid_still && since >= 5_000) || since >= 10_000) || (left || tierups) && mid_still && since >= 5_000;
+                let due = n != mid_flushed && ((mid_still && since >= 5_000) || since >= 10_000) || left && mid_still && since >= 5_000;
                 // not while the UI thread is in a burst of lazy compiles after the present: the
                 // write's unit calls cannot be interrupted once served (one held the owner 620 ms
                 // in front of a tab's first visit); it goes in the next pause
@@ -2940,21 +2938,6 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
                 if !c.record_manifest(u, crate::layout::root_crate(), &order, present, &stop) {
                     MID_MANIFEST_DONE.store(false, Ordering::Relaxed);
                     verbose!("makepad-run cache: startup manifest yielded to the main thread; retried later");
-                }
-            }
-            u.cache = cache;
-        } else if quiet && MID_MANIFEST_DONE.load(Ordering::Relaxed) && u.cache.as_ref().is_some_and(|c| c.image_tierups() > 0) {
-            // image slots' entries moved up a tier since the image was written (O2/O3 builds, verified
-            // O1 rebuilds of baseline code): the image is written again once the run is quiet, so the
-            // next start places that code instead of building it again
-            let (order, present) = jit::manifest_order(u.start_order.clone(), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
-            let mut cache = u.cache.take();
-            if let Some(c) = cache.as_mut() {
-                let stop = || crate::owner::main_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed);
-                if !c.record_manifest(u, crate::layout::root_crate(), &order, present, &stop) {
-                    verbose!("makepad-run cache: startup image rewrite yielded to the main thread; retried later");
-                } else if c.image_tierups() > 0 {
-                    c.forget_image_tierups();
                 }
             }
             u.cache = cache;

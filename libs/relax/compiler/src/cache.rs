@@ -306,12 +306,7 @@ pub mod warm_count {
     pub const O1V_BUILT: usize = 42;
     pub const O1V_WRITTEN: usize = 43;
     pub const O1V_DROPPED: usize = 44;
-    /// image slots whose entry moved up a tier, and startup images written again for them mid-run
-    pub const IMG_TIERUPS: usize = 45;
-    pub const IMG_REWRITES: usize = 46;
-    /// of IMG_TIERUPS, those an image written since covers
-    pub const IMG_TIERUPS_COVERED: usize = 47;
-    pub static N: [AtomicU64; 48] = [const { AtomicU64::new(0) }; 48];
+    pub static N: [AtomicU64; 45] = [const { AtomicU64::new(0) }; 45];
     #[inline]
     pub fn add(k: usize, n: u64) {
         N[k].fetch_add(n, Relaxed);
@@ -319,11 +314,6 @@ pub mod warm_count {
     pub fn get(k: usize) -> u64 {
         N[k].load(Relaxed)
     }
-}
-
-/// Image slots' entries moved up a tier since the startup image was last written (any thread).
-pub fn image_tierups_pending() -> bool {
-    warm_count::get(warm_count::IMG_TIERUPS) > warm_count::get(warm_count::IMG_TIERUPS_COVERED)
 }
 
 /// The warm cache this session in one paragraph (answer first: hits vs misses by reason).
@@ -362,9 +352,9 @@ pub fn warm_summary() -> String {
         s.push_str(&format!("; O3 installs kept as entries: {} queued (written {}, same as stored {}, not encodable {}, stale {}, dropped {}; {} deferred records waiting, last drain {} with {}), not kept: unverified {}, frame too big {}, speculative/inspect {}; O2 entries written {}",
             k(g(O3_QUEUED)), k(g(O3_WRITTEN)), k(g(O3_SAME)), k(g(O3_UNENCODABLE)), k(g(O3_STALE)), k(g(O3_DROPPED)), k(g(RECORDS_WAITING)), g(DRAIN_WHY), k(g(DRAIN_LEN)), k(g(O3_UNVERIFIED)), k(g(O3_FRAME)), k(g(O3_SPEC)), k(g(O2_WRITTEN))));
     }
-    if g(O1V_LATE) + g(O1V_INLINED) + g(IMG_TIERUPS) > 0 {
-        s.push_str(&format!("; verified O1 rebuilds: queued {} (verdict late) + {} (inlined-only), built {}, written {}, dropped {}; image slots tiered up {}, images rewritten {}",
-            k(g(O1V_LATE)), k(g(O1V_INLINED)), k(g(O1V_BUILT)), k(g(O1V_WRITTEN)), k(g(O1V_DROPPED)), k(g(IMG_TIERUPS)), g(IMG_REWRITES)));
+    if g(O1V_LATE) + g(O1V_INLINED) > 0 {
+        s.push_str(&format!("; verified O1 rebuilds: queued {} (verdict late) + {} (inlined-only), built {}, written {}, dropped {}",
+            k(g(O1V_LATE)), k(g(O1V_INLINED)), k(g(O1V_BUILT)), k(g(O1V_WRITTEN)), k(g(O1V_DROPPED))));
     }
     if g(NO_ENTRY) > 0 && g(KEY_CHANGED) + g(ENTRY_GONE) + g(NOT_RECORDED) == 0 {
         s.push_str(" (why an entry is missing -- key changed, never recorded, not flushed -- needs a MAKEPAD_RUN_WARM_STRICT=1 cold run then warm run)");
@@ -631,12 +621,6 @@ pub struct Cache {
     /// carries a fresh image
     image_slots: usize,
     image_stale: usize,
-    /// the slots of this run's startup image: placed from the loaded one, or written by this run's
-    /// record_manifest. An entry of one of them moving up a tier (baseline -> O1 too) makes the
-    /// image be written again (`image_tierups`, the run monitor's quiet mid-run write)
-    image_members: HashSet<u32>,
-    /// image slots whose entry moved up a tier since the image was last written
-    image_tierups: u32,
     /// the tier of each code entry this run recorded (by key), pending or written: a verified O1
     /// rebuild replaces only an entry below O1
     rec_tier: HashMap<u128, u8>,
@@ -869,8 +853,6 @@ impl Cache {
             manifest_done: false,
             image_slots: 0,
             image_stale: 0,
-            image_members: HashSet::new(),
-            image_tierups: 0,
             rec_tier: HashMap::new(),
             image_bad: false,
             manifest_root: None,
@@ -2584,20 +2566,12 @@ impl Cache {
         // rewritten past 2%); an O3 payload replacing an O3 entry neither (PGO-driven O3 code
         // differs run to run; every warm run rewrote the whole image)
         if replace && (existing || self.linked.contains(&id)) {
-            match self.rec_tier.get(&key).copied().or_else(|| self.entry_tier(key)) {
+            match self.entry_tier(key) {
                 None => {
                     self.image_rewrite = true;
                     self.stats.rewrite_why[0] += 1;
                 }
-                Some(old) if payload_tier(&payload).is_some_and(|new| tier_rank(new) > tier_rank(old)) => {
-                    self.stats.rewrite_why[1] += 1;
-                    // an image slot's entry moved up a tier: the image is written again (the run
-                    // monitor's next quiet write), so the next start places the better code
-                    if self.image_members.contains(&id) {
-                        self.image_tierups += 1;
-                        warm_count::add(warm_count::IMG_TIERUPS, 1);
-                    }
-                }
+                Some(old) if payload_tier(&payload).is_some_and(|new| tier_rank(new) > tier_rank(old)) => self.stats.rewrite_why[1] += 1,
                 Some(_) => {}
             }
         }
@@ -2861,19 +2835,6 @@ impl Cache {
 
     /// This program's startup manifest was loaded: an earlier run of it reached main with this cache.
     /// The loaded startup manifest carries a startup image (prelink's input).
-    /// Image slots whose entry moved up a tier since the image was last written (the run monitor
-    /// writes the manifest again at its next quiet write: run.rs mid_flush).
-    pub fn image_tierups(&self) -> u32 {
-        self.image_tierups
-    }
-
-    /// The tier-ups a manifest write left (it wrote no image: read-only, a dropped image, no
-    /// slots): no further quiet write is made for them.
-    pub fn forget_image_tierups(&mut self) {
-        warm_count::add(warm_count::IMG_TIERUPS_COVERED, self.image_tierups as u64);
-        self.image_tierups = 0;
-    }
-
     pub fn has_startup_image(&self) -> bool {
         self.image.is_some()
     }
@@ -2936,8 +2897,6 @@ impl Cache {
         self.cert_rejected = old.cert_rejected.clone();
         self.pending_keys = old.pending_keys.clone();
         self.rec_tier = old.rec_tier.clone();
-        self.image_members = old.image_members.clone();
-        self.image_tierups = old.image_tierups;
         self.pending_verdicts = old.pending_verdicts.clone();
         self.manifest_done = old.manifest_done;
         self.collected_committed = true;
@@ -3018,8 +2977,7 @@ impl Cache {
             }
         }
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
-        // (an image slot whose entry moved up a tier: the image is written again)
-        if self.mode == Mode::ReadOnly || order.is_empty() || (self.manifest_done && !self.image_rewrite && self.image_tierups == 0 && self.stats.rewrite_why[1] as usize * 50 <= self.image_slots) {
+        if self.mode == Mode::ReadOnly || order.is_empty() || (self.manifest_done && !self.image_rewrite && self.stats.rewrite_why[1] as usize * 50 <= self.image_slots) {
             return true;
         }
         // at exit the slots' keys can no longer be made: after the mid-run manifest the exit
@@ -3054,7 +3012,7 @@ impl Cache {
         let new = list.iter().filter(|b| !old.contains(b.0.as_slice())).count();
         // the same start as before (within 2%), the loaded manifest still valid and its image
         // current (within 2%, and covering all but 2% of its cached slots): no new one
-        let image_current = !self.image_rewrite && self.image_tierups == 0
+        let image_current = !self.image_rewrite
             && (self.image_slots == 0 || ((self.image_stale + self.stats.rewrite_why[1] as usize) * 50 <= self.image_slots && self.image_slots * 50 >= self.manifest_present_cached * 49));
         if self.startup_manifest_valid() && new * 50 <= list.len() && image_current {
             self.manifest_done = true;
@@ -3064,7 +3022,6 @@ impl Cache {
             eprintln!("makepad-run cache: startup manifest rewritten: valid {} (missing {}), {} new of {}, image rewrite {} (replacements without a stored entry {}, tier-ups {}), image slots {} stale {} cached at present {}",
                 self.startup_manifest_valid(), self.manifest_missing, new, list.len(), self.image_rewrite, self.stats.rewrite_why[0], self.stats.rewrite_why[1], self.image_slots, self.image_stale, self.manifest_present_cached);
         }
-        let tierups = self.image_tierups;
         let img = if self.mode != Mode::Verify && !self.image_bad {
             match self.build_image(u, &present_ids, stop) { Err(()) => return false, Ok(img) => img }
         } else { None };
@@ -3099,17 +3056,6 @@ impl Cache {
         f.u128(if crate::reload::edited_crates().is_empty() { self.sources_fp() } else { 0 });
         self.push_pending(root, NewEntry { key: self.manifest_sources_key(key), kind: KIND_MANIFEST, payload: f.0 });
         self.image_rewrite = false;
-        // the image now holds these slots' newest entries
-        if n_img > 0 {
-            self.image_members = present_ids.iter().copied().collect();
-            self.image_slots = n_img;
-            self.image_stale = 0;
-        }
-        self.image_tierups -= tierups;
-        if tierups > 0 {
-            warm_count::add(warm_count::IMG_REWRITES, 1);
-            warm_count::add(warm_count::IMG_TIERUPS_COVERED, tierups as u64);
-        }
         true
     }
 
