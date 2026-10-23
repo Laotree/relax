@@ -10484,8 +10484,9 @@ impl<'a> Lcx<'a> {
                 let n = leaf(self, 1);
                 let (sz, al) = elem(self);
                 let stride = crate::layout::round_up(sz, al) as i64;
+                let k = self.iconst(stride);
                 let off = self.f.vreg(Cls::I);
-                self.emit(Inst::IBinI(IOp::Mul, U64, off, n[0], stride));
+                self.emit(Inst::IBin(IOp::Mul, U64, off, n[0], k));
                 let d = self.f.vreg(Cls::I);
                 self.emit(Inst::IBin(IOp::Sub, U64, d, p[0], off));
                 Val::L(vec![d])
