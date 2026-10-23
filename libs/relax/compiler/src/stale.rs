@@ -364,6 +364,8 @@ fn restart_process() {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        // fd 2 back to where it went before the session log took it (its forwarder ends with exec)
+        crate::tui::finish(false);
         let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
         if let Ok(exe) = std::env::current_exe() {
             let e = std::process::Command::new(exe).args(&args[1..]).exec();

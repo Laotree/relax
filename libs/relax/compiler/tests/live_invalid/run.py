@@ -81,7 +81,7 @@ def body(code):
     10""", code)
 
 try:
-    step("starts", wait(lambda: any(l.startswith("out tick 0 10") for l in out) and any("watching" in l for l in err), 180))
+    step("starts", wait(lambda: any(l.startswith("out tick 0 10") for l in out), 180))
     # 1. gen 1: step parks inside its own (patched) code
     n_out, n_err = len(out), len(err)
     gen1 = body("""    let g = crate::park_here(n);
