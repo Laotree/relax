@@ -381,6 +381,7 @@ fn relax_parts(s: &mut Snap, compiler: bool, partial: &mut Vec<String>) {
     s.add("makepad-run/job arena/jobs ended", jobs as u64);
     s.add("makepad-run/job arena/jobs that left survivors", survivor_jobs as u64);
     s.add("makepad-run/job arena/survivor bytes (not copied out)", survivor_bytes as u64);
+    s.add("makepad-run/settle rebuilds", crate::jit::settle_rebuild::rebuilds() as u64);
     let (ccommitted, clive, cchunks) = crate::zone_alloc::compiler_stats();
     s.add("makepad-run/compiler arena committed", ccommitted as u64);
     s.add("makepad-run/compiler arena live", clive as u64);
@@ -460,6 +461,7 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
     let ev = crate::zone_alloc::compiler_events();
     let jobs = crate::zone_alloc::job_stats();
     // the three heaps apart (zone_alloc.rs): the program's malloc, the compiler's own arena, the JIT's mappings
+    out.line(&format!("{{\"trims\":{},\"last_trim_ms\":{}}}", crate::memstat::TRIMS.load(std::sync::atomic::Ordering::Relaxed), crate::memstat::LAST_TRIM_MS.load(std::sync::atomic::Ordering::Relaxed)));
     out.line(&format!(
         "{{\"split\":{{\"routing\":{},\"program_heap_in_use_mb\":{},\"program_heap_held_free_mb\":{},\"compiler_arena_committed_mb\":{},\"compiler_arena_live_mb\":{},\"jit_code_mb\":{},\"jit_ro_data_mb\":{},\"program_statics_mb\":{},\"burst_arena_committed_mb\":{},\"compiler_arena_touched_mb\":{},\"compiler_arena_live_slots_mb\":{},\"compiler_arena_large_mb\":{},\"compiler_arena_chunks_listed\":{},\"compiler_arena_events\":{{\"contended_chunk\":{},\"contended_pool\":{},\"contended_warm\":{},\"contended_partial\":{},\"yields\":{},\"commits\":{},\"decommits\":{},\"pushes\":{},\"pops\":{}}},\"job_arena\":{{\"jobs\":{},\"survivor_jobs\":{},\"survivor_bytes\":{}}}}}}}",
         json_str(if crate::zone_alloc::compiler_arena_enabled() { "compiler arena" } else { "off (MAKEPAD_RUN_COMPILER_ARENA=0)" }),
@@ -478,6 +480,13 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
         ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8],
         jobs.0, jobs.1, jobs.2,
     ));
+    // the arenas' census: committed bytes by small chunk / large run, and how much of the small
+    // chunks' touched pages a few surviving blocks pin
+    let (cc, bc) = crate::zone_alloc::arena_census();
+    for (name, c) in [("compiler", cc), ("burst", bc)] {
+        out.line(&format!("{{\"arena\":{},\"small_chunks\":{},\"small_touched_mb\":{},\"small_live_blocks\":{},\"small_live_slots_mb\":{},\"pinned_by_le4_blocks_mb\":{},\"large_runs\":{},\"large_mb\":{},\"largest_mb\":[{},{},{},{}]}}",
+            json_str(name), c[0], mb(c[1] as u64), c[2], mb(c[3] as u64), mb(c[4] as u64), c[5], mb(c[6] as u64), mb(c[7] as u64), mb(c[8] as u64), mb(c[9] as u64), mb(c[10] as u64)));
+    }
     // the tree: every node, ranked within its parent, top `n`
     let mut rows: Vec<&(String, u64)> = snap.nodes.iter().filter(|x| x.0.contains('/') && x.1 >= 1 << 20).collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -518,6 +527,18 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
 /// `mem snap <name>` / `mem timeline [step_ms=]` / `mem marks`.
 pub fn cmd_mem(req: &Req, out: &mut Out) {
     match req.pos.first().map(String::as_str) {
+        Some("trim") => {
+            // what a trim gives back now (the monitor trims after 1 s without compiles and at
+            // every 256 MB of growth)
+            let r0 = crate::memstat::resident();
+            let b0 = crate::zone_alloc::arena_census();
+            let t = std::time::Instant::now();
+            crate::memstat::trim();
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            let r1 = crate::memstat::resident();
+            out.line(&format!("{{\"trim\":\"done\",\"rss_before_mb\":{},\"rss_after_mb\":{},\"ms\":{:.1},\"burst_small_chunks\":{},\"compiler_small_chunks\":{}}}",
+                mb(r0), mb(r1), ms, b0.1[0], b0.0[0]));
+        }
         Some("snap") => {
             let name = req.pos.get(1).cloned().unwrap_or_else(|| format!("s{}", now_ms()));
             let mut partial = Vec::new();
