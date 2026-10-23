@@ -4397,7 +4397,8 @@ impl<'a> Fcx<'a> {
         let mut found = None;
         for &imp in self.tcx.inherent.get(&key)? {
             if !self.prog.impls[self.prog.def(imp).sub as usize].items.iter().any(|&item| self.prog.def(item).name == name && self.item_visible(item)) { continue; }
-            let applicable = self.infcx.probe(|_| {
+            let applicable = self.infcx.probe(|snapshot| {
+                let universe = self.infcx.universe();
                 let full = self.infcx.fresh_args_for_item(self.prog, imp);
                 let self_ty = self.tcx.instantiate_ty(self.prog, imp, &full, self.tcx.impl_self[&imp]);
                 let mut ocx = crate::next_solver::fulfill::ObligationCtxt::new(&self.infcx, self.prog);
@@ -4405,7 +4406,9 @@ impl<'a> Fcx<'a> {
                 for clause in self.tcx.clauses_of(self.prog, imp) {
                     ocx.register_obligation(Goal { param_env: self.param_env.clone(), predicate: self.tcx.instantiate_predicate(self.prog, imp, &full, &clause) });
                 }
-                ocx.engine.try_evaluate_obligations(&self.infcx, self.prog).is_empty()
+                // probe.rs consider_probe: the leak check (`B::<for<'a> fn(&'a ())>::f` is no
+                // item of `impl B<fn(&'static ())>`: methods/receiver-equality)
+                ocx.engine.try_evaluate_obligations(&self.infcx, self.prog).is_empty() && self.infcx.leak_check(universe, Some(snapshot)).is_ok()
             });
             if !applicable { continue; }
             for &item in &self.prog.impls[self.prog.def(imp).sub as usize].items {
