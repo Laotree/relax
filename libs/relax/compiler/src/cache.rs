@@ -1127,6 +1127,12 @@ impl Cache {
         self.stores[p as usize].get_at(e as usize, key)
     }
 
+    /// `get` with the payload checksum verified (payloads linked as code or data).
+    fn get_checked(&self, key: u128) -> Option<(u32, &[u8])> {
+        let (p, e) = self.index_at(key)?;
+        self.stores[p as usize].get_checked_at(e as usize, key)
+    }
+
     /// The crate whose store file an entry keyed by `crates` goes to: the deepest in the
     /// dependency graph (it depends on the others when there is a chain: its version covers
     /// theirs), ties by crate index.
@@ -2800,7 +2806,8 @@ impl Cache {
         self.manifest_root = Some(root);
         let Some(key) = self.manifest_key(root) else { return };
         if let Some(pk) = self.stores.iter().find(|st| st.path == self.code_path[root as usize]).cloned() {
-            if let Some((KIND_MANIFEST, p)) = pk.get(key) {
+            // checksummed before use: its image section becomes executable code (prelink)
+            if let Some((KIND_MANIFEST, p)) = pk.get_checked(key) {
                 let mut d = D { b: p, p: 0 };
                 let mut out = Vec::new();
                 let mut keys = Vec::new();
@@ -6987,7 +6994,7 @@ impl Linker {
         }
         if !self.cache().linking_data.insert(key) { return None; }
         let _link = LinkGuard { cache: self.cache, key, data: true };
-        let (kind, payload) = { let c = self.cache(); let (k, p) = c.get(key)?; (k, p.to_vec()) };
+        let (kind, payload) = { let c = self.cache(); let (k, p) = c.get_checked(key)?; (k, p.to_vec()) };
         if kind != KIND_DATA {
             return None;
         }
@@ -7049,7 +7056,8 @@ impl Linker {
         // the pack stays alive by its Arc: the payload is read in place
         let at = self.cache().index_at(key);
         let pack = at.map(|(p, _)| self.cache().stores[p as usize].clone());
-        if let Some((KIND_CODE, payload)) = pack.as_ref().and_then(|pk| pk.get_at(at.map_or(0, |a| a.1) as usize, key)) {
+        // checksummed before it is linked into executable memory: a corrupt entry is a miss
+        if let Some((KIND_CODE, payload)) = pack.as_ref().and_then(|pk| pk.get_checked_at(at.map_or(0, |a| a.1) as usize, key)) {
             // a slot its code took in changed: not this run's code (compiled and recorded anew)
             // (an undecodable payload is link_entry's failure, as before)
             if self.cert_valid(u, payload) == Some(false) {
