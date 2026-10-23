@@ -130,9 +130,9 @@ pub mod intrinsics_mem {
     extern "relax-intrinsic" {
         pub fn size_of<T>() -> usize;
         pub fn align_of<T>() -> usize;
-        /// Size/alignment of the value behind a (possibly fat) reference: slices, str, dyn.
-        pub fn size_of_val<T: ?Sized>(v: &T) -> usize;
-        pub fn align_of_val<T: ?Sized>(v: &T) -> usize;
+        /// Size/alignment from a (possibly fat) raw pointer, as in rustc's intrinsics.
+        pub fn size_of_val<T: ?Sized>(v: *const T) -> usize;
+        pub fn align_of_val<T: ?Sized>(v: *const T) -> usize;
         pub fn needs_drop<T>() -> bool;
         /// `T: Copy` for this instantiation (a constant per instance): std's Copy fast paths
         /// (real std specializes Clone-for-Copy into memcpy)

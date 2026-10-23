@@ -376,6 +376,31 @@ pub unsafe extern "C" fn program_aligned_free(p: *mut u8) {
     }
 }
 
+/// The program asks its allocator for its free pages back (glibc `malloc_trim`, macOS
+/// `malloc_zone_pressure_relief`): the heap of the domain the calling thread is in gives back its
+/// warm chunks and the free pages of its chunks (what the settle swap's trim does for the compiler
+/// arena), then the system heap does its own.
+#[cfg(target_os = "linux")]
+pub unsafe extern "C" fn program_malloc_trim(pad: usize) -> i32 {
+    extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    if let Some(a) = compiler::domain_here() {
+        a.trim();
+    }
+    malloc_trim(pad)
+}
+#[cfg(target_os = "macos")]
+pub unsafe extern "C" fn program_pressure_relief(zone: *const u8, goal: usize) -> usize {
+    extern "C" {
+        fn malloc_zone_pressure_relief(zone: *const u8, goal: usize) -> usize;
+    }
+    if let Some(a) = compiler::domain_here() {
+        a.trim();
+    }
+    malloc_zone_pressure_relief(zone, goal)
+}
+
 /// The same targets are used by heap inspection with sampling on or off.
 pub fn symbol(name: &[u8]) -> Option<usize> {
     compiler::bind_program_tls();
@@ -393,6 +418,10 @@ pub fn symbol(name: &[u8]) -> Option<usize> {
         b"realloc" => program_realloc as *const () as usize,
         b"free" => program_free as *const () as usize,
         b"posix_memalign" => program_memalign as *const () as usize,
+        #[cfg(target_os = "linux")]
+        b"malloc_trim" => program_malloc_trim as *const () as usize,
+        #[cfg(target_os = "macos")]
+        b"malloc_zone_pressure_relief" => program_pressure_relief as *const () as usize,
         #[cfg(windows)]
         b"_aligned_malloc" => program_aligned_malloc as *const () as usize,
         #[cfg(windows)]
@@ -488,6 +517,27 @@ mod tests {
             // the trim gives the warm runs back
             heap.inner.arena.trim();
             assert!(heap.stats().1 < committed, "trim decommits the warm large runs");
+            enter(std::ptr::null());
+        }
+    }
+
+    /// The program's `malloc_trim` trims the heap of the domain it runs in.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn program_malloc_trim_trims_the_domain_heap() {
+        symbol(b"relax_alloc");
+        let heap = DomainHeap::new().unwrap();
+        unsafe {
+            enter(&*heap);
+            let p = program_alloc(600_000, 8);
+            std::ptr::write_bytes(p, 0xAB, 600_000);
+            let committed = heap.stats().1;
+            program_dealloc(p, 600_000, 8);
+            assert_eq!(heap.stats().1, committed, "the run stays committed (warm)");
+            let trim = symbol(b"malloc_trim").expect("malloc_trim is the program's");
+            let trim: unsafe extern "C" fn(usize) -> i32 = std::mem::transmute(trim);
+            trim(0);
+            assert!(heap.stats().1 < committed, "the program's malloc_trim decommits the warm run");
             enter(std::ptr::null());
         }
     }

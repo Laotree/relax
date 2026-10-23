@@ -3630,14 +3630,10 @@ impl<'a> Lcx<'a> {
         }
         let id = self.u.fn_id(FnKey::Glue(crate::jit::GLUE_DROP, t));
         let may = self.u.drop_may_unwind(t);
-        self.tree_leaf_call_may(Callee::Fn(id), a, may);
+        self.tree_leaf_call_may(Callee::Fn(id), vec![a], may);
     }
 
-    fn tree_leaf_call(&mut self, c: Callee, a: VReg) {
-        self.tree_leaf_call_may(c, a, false);
-    }
-
-    fn tree_leaf_call_may(&mut self, c: Callee, a: VReg, may: bool) {
+    fn tree_leaf_call_may(&mut self, c: Callee, args: Vec<VReg>, may: bool) {
         let (k, skip, building) = match self.tree_cx.as_mut() {
             Some(tc) => {
                 let k = tc.counter;
@@ -3646,7 +3642,7 @@ impl<'a> Lcx<'a> {
             }
             None => {
                 self.nounwind += 1;
-                self.emit(Inst::Call(c, vec![a], Vec::new()));
+                self.emit(Inst::Call(c, args, Vec::new()));
                 self.nounwind -= 1;
                 return;
             }
@@ -3678,12 +3674,12 @@ impl<'a> Lcx<'a> {
         match pad {
             Some(pb) => {
                 let saved = self.pad_fixed.replace(Some(pb));
-                self.emit(Inst::Call(c, vec![a], Vec::new()));
+                self.emit(Inst::Call(c, args, Vec::new()));
                 self.pad_fixed = saved;
             }
             None => {
                 self.nounwind += 1;
-                self.emit(Inst::Call(c, vec![a], Vec::new()));
+                self.emit(Inst::Call(c, args, Vec::new()));
                 self.nounwind -= 1;
             }
         }
@@ -3712,13 +3708,14 @@ impl<'a> Lcx<'a> {
                 // the allocation without dropping them again
                 let mut sub = prefix.to_vec();
                 sub.push((BOX_STEP, 0));
-                let ptr = self.f.vreg(Cls::I);
-                let pm = self.pmem();
-                self.emit(Inst::Load(pm, ptr, addr, 0));
+                // Read the Box's complete pointer layout, including metadata when present.
+                let pointer = self.load_val(addr, 0, t);
+                let pointer = self.to_leaves(pointer, t);
+                let ptr = pointer[0];
                 self.drop_tree(entries, ptr, inner, &sub);
                 if let Some(free) = self.u.core_path(&["boxed", "box_free_after_move"]) {
                     let id = self.u.fn_id(FnKey::Inst(free, vec![inner]));
-                    self.tree_leaf_call(Callee::Fn(id), ptr);
+                    self.tree_leaf_call_may(Callee::Fn(id), pointer, false);
                 }
                 if let Some(j) = skip {
                     self.goto(j);
@@ -6314,7 +6311,7 @@ impl<'a> Lcx<'a> {
                         if let Some(free) = self.u.core_path(&["boxed", "box_free_after_move"]) {
                             let id = self.u.fn_id(FnKey::Inst(free, vec![inner]));
                             self.nounwind += 1;
-                            self.emit(Inst::Call(Callee::Fn(id), vec![b[0]], Vec::new()));
+                            self.emit(Inst::Call(Callee::Fn(id), b, Vec::new()));
                             self.nounwind -= 1;
                         }
                         v
