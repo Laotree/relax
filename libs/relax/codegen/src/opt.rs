@@ -87,9 +87,17 @@ pub const ATTR_CHAIN: u8 = 4;
 /// the caller knows this callee is cold (a JIT: it has never run, so its call sits on a path
 /// the program has not taken): it stays a call unless tiny or admitted by the cost model
 pub const ATTR_COLD: u8 = 8;
+/// rustc --release has no copy of this callee where the caller is compiled (a non-generic,
+/// non-#[inline] fn of another crate, no LTO): LLVM only calls it. It inlines only where rustc's
+/// cross_crate_inlinable would have made it available anyway: a body no bigger than the call, or
+/// a small leaf that cannot unwind (rustc_mir_transform/src/cross_crate_inline.rs: no calls, no
+/// landing pads or resumes, <= 100 statements)
+pub const ATTR_XCRATE: u8 = 16;
 /// size limit of rule 4 (fused chains; the callee may call: its callees were inlined bottom-up)
 pub const INLINE_CHAIN_INSTS: usize = 120;
 pub const INLINE_SINGLE_INSTS: usize = 3000;
+/// ATTR_XCRATE: largest leaf (RIR instructions) taken as rustc's 100-statement cross-crate bound
+pub const XCRATE_LEAF_INSTS: usize = 100;
 const HISTORY_DEPTH_LIMIT: usize = 20;
 const TOP_DOWN_DEPTH_LIMIT: usize = 5;
 
@@ -602,6 +610,14 @@ fn site_rule(options: &relax_session::Options, callee: &Func, id: u32, nargs: us
     if callee.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Call(Callee::Fn(c), _, _) if *c == id)))
         || !callee.blocks.iter().any(|b| matches!(b.term, Term::Ret(_))) {
         return None;
+    }
+    if attrs & ATTR_XCRATE != 0 {
+        let (n, leaf, _) = callee_shape(callee, id);
+        if n <= nargs + nrets + 2 && callee.blocks.len() <= 2 {
+            return Some(RULE_TINY);
+        }
+        let unwinds = callee.blocks.iter().any(|b| matches!(b.term, Term::Resume | Term::Invoke(..)));
+        return (leaf && !unwinds && n <= XCRATE_LEAF_INSTS && callee.blocks.len() <= lim.leaf_blocks).then_some(RULE_SMALL_LEAF);
     }
     if single && single_on(options) && attrs & ATTR_COLD == 0 && inline_inst_count(callee) <= INLINE_SINGLE_INSTS {
         return Some(RULE_SINGLE);
@@ -3964,6 +3980,106 @@ fn slot_derivation(f: &Func) -> Option<(Vec<u32>, Vec<bool>)> {
 /// the loop body). The operands must not be redefined after the definition in its block nor
 /// before the use in the using block, and the defining block's terminator must not read the
 /// result. Returns whether anything moved.
+/// A load whose value only one successor's region reads moves to that successor's start (O3,
+/// after the loop passes): the scan loop `for input in inputs { let offset = input.offset; if
+/// input.id == uniform { .. offset .. } }` loaded `offset` every iteration in the loop header,
+/// where rustc loads it only on the matching path. The successor has the block as its only
+/// predecessor and dominates every use; nothing after the load in its block writes memory or
+/// redefines its operands, so the moved load reads the same value.
+pub fn sink_loads_to_successor(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    let nb = f.blocks.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    // per vreg: the blocks that read it (u32::MAX: none yet, MANY: in more than a few)
+    let mut uses: Vec<Vec<u32>> = vec![Vec::new(); nv];
+    let mut tu = Vec::new();
+    let mut any_load = false;
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for i in &b.insts {
+            any_load |= matches!(i, Inst::Load(..) | Inst::LoadX(..));
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            for_uses(i, |u| {
+                let v = &mut uses[u.0 as usize];
+                if v.last() != Some(&(bi as u32)) { v.push(bi as u32); }
+            });
+        }
+        term_uses(&b.term, &mut tu);
+        for u in &tu {
+            let v = &mut uses[u.0 as usize];
+            if v.last() != Some(&(bi as u32)) { v.push(bi as u32); }
+        }
+    }
+    if !any_load {
+        return false;
+    }
+    let mut npred = vec![0u32; nb];
+    for b in &f.blocks {
+        for s in b.term.succs() {
+            npred[s as usize] += 1;
+        }
+    }
+    let (pre, post, _) = relax_backend::dom::dom_numbers(&relax_backend::dom::idoms(f));
+    let dominates = |a: usize, b: usize| pre[a] != u32::MAX && pre[b] != u32::MAX && pre[a] <= pre[b] && post[b] <= post[a];
+    let mut changed = false;
+    let mut arrivals: Vec<Vec<(Inst, u64)>> = vec![Vec::new(); nb];
+    for bi in 0..nb {
+        let Term::Branch(_, t, e) = f.blocks[bi].term else { continue };
+        if t == e {
+            continue;
+        }
+        let mut k = f.blocks[bi].insts.len();
+        // backwards: a load moves when nothing after it in the block writes memory
+        let mut later_defs: Vec<VReg> = Vec::new();
+        let mut mem_after = false;
+        let mut remove = Vec::new();
+        term_uses(&f.blocks[bi].term, &mut tu);
+        let branch_uses = tu.clone();
+        while k > 0 {
+            k -= 1;
+            let i = &f.blocks[bi].insts[k];
+            let cand = match *i {
+                Inst::Load(_, d, base, _) => Some((d, vec![base])),
+                Inst::LoadX(_, d, base, idx, _, _) => Some((d, vec![base, idx])),
+                _ => None,
+            };
+            if let Some((d, ops)) = cand {
+                let dv = d.0 as usize;
+                let ub = &uses[dv];
+                let target = [t as usize, e as usize].into_iter().find(|&s| s != bi && npred[s] == 1 && !ub.is_empty() && ub.iter().all(|&u| dominates(s, u as usize)));
+                if let Some(s) = target {
+                    if !mem_after && ndef[dv] == 1 && !ops.contains(&d) && !branch_uses.contains(&d)
+                        && !ops.iter().any(|o| later_defs.contains(o)) && !ub.contains(&(bi as u32))
+                    {
+                        remove.push((k, s));
+                        for_defs(i, |x| later_defs.push(x));
+                        continue;
+                    }
+                }
+            }
+            mem_after |= relax_backend::passes::is_mem_effect(i);
+            for_defs(i, |x| later_defs.push(x));
+        }
+        for &(k, s) in &remove {
+            let i = f.blocks[bi].insts.remove(k);
+            let p = f.blocks[bi].pos.remove(k);
+            arrivals[s].push((i, p));
+            changed = true;
+        }
+    }
+    for (b, incoming) in f.blocks.iter_mut().zip(arrivals) {
+        if !incoming.is_empty() {
+            // (collected backwards per source block: reversed back into program order)
+            let (insts, pos): (Vec<_>, Vec<_>) = incoming.into_iter().rev().unzip();
+            b.insts.splice(0..0, insts);
+            b.pos.splice(0..0, pos);
+        }
+    }
+    changed
+}
+
 pub fn sink_single_uses(f: &mut Func) -> bool {
     let nv = f.vregs.len();
     let nb = f.blocks.len();
