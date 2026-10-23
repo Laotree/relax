@@ -706,7 +706,9 @@ impl<'a> Interp<'a> {
         let len = self.len_of(p)?;
         if i >= len { return ub(format!("indexing out of bounds: the len is {len} but the index is {i}")); }
         let (size, _) = self.size_align(elem)?;
-        Ok(MPlace { ptr: Ptr { off: p.ptr.off + i * size, ..p.ptr }, meta: None, ty: elem, variant: None, packed: p.packed })
+        // (projection.rs: the offset of the element is pointer arithmetic)
+        let Some(o) = i.checked_mul(size).filter(|o| *o <= i64::MAX as u64) else { return ub("overflowing pointer arithmetic: the total offset in bytes does not fit in an `isize`") };
+        Ok(MPlace { ptr: Ptr { off: p.ptr.off.wrapping_add(o), ..p.ptr }, meta: None, ty: elem, variant: None, packed: p.packed })
     }
 
     // ---- operands and constants

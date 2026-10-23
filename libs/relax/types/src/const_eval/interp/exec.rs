@@ -660,6 +660,10 @@ impl Interp<'_> {
                 let q = if name == "arith_offset" { Ptr { off: p.off.wrapping_add((n as u64).wrapping_mul(size)), ..p } } else { self.offset_inbounds(p, n, size)? };
                 self.ptr_val(q, None)
             }
+            // fat pointers from their parts and back
+            "slice_from_raw" | "slice_from_raw_mut" | "str_from_raw" => { let p = self.ptr_of(&vals[0], 0)?; let n = self.int_of(&vals[1])? as u64; self.ptr_val(p, Some(n)) }
+            "slice_ptr" => { let p = self.ptr_of(&vals[0], 0)?; self.ptr_val(p, None) }
+            "slice_len" => { if vals[0].size() != 2 * ps { return unsupported("slice_len"); } vals[0].slice(ps, ps, ps) }
             "ptr_offset_from" => {
                 let elem = t0.unwrap();
                 let (size, _) = self.size_align(elem)?;
