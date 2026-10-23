@@ -4918,6 +4918,10 @@ impl<'a> Parser<'a> {
             T::Ident | T::RawIdent | T::PathSep | T::Lt | T::Shl | T::KwSelfValue | T::KwSelfType | T::KwSuper | T::KwCrate => {
                 let path = self.path(true)?;
                 if self.kind() == T::Not && matches!(self.nth(1), T::OpenParen | T::OpenBracket | T::OpenBrace) {
+                    // rustc_parse expr.rs parse_expr_path_start: MacroInvocationWithQualifiedPath
+                    if !path.no_qself() && crate::lexer::validation_enabled() {
+                        return Err(PErr { pos: lo, msg: "macros cannot use qualified paths".to_string() });
+                    }
                     self.pos += 1;
                     let (delim, toks) = self.delim_tt()?;
                     if let Some(def) = self.rules_macro(&path) {
