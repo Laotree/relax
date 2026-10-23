@@ -2955,7 +2955,8 @@ impl Unit {
             for file in 0..prog.file_paths.len() { prog.exec_profile_file(file as u32); }
         }
         let options = &sess.options;
-        let web_target = prog.crates[core_crate as usize].cfg.set.iter().any(|s| s == "relax_web");
+        // a unit without a core crate (unit tests' programs) is not a web build
+        let web_target = prog.crates.get(core_crate as usize).is_some_and(|c| c.cfg.set.iter().any(|s| s == "relax_web"));
         if web_target {
             crate::web::activate().expect("reserve web linear memory");
         }

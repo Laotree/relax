@@ -2458,20 +2458,25 @@ impl<'a> Gen<'a> {
 
     // Repair the ARM arithmetic result to SSE's NaN selection, all in vectors.
     // a/b remain intact even if the allocated result aliases an operand.
-    fn intel_nan(&mut self, result: u8, a: u8, b: u8) {
-        const FCMEQ: u32 = 0x4E20_E400;
+    fn intel_nan(&mut self, w: VW, result: u8, a: u8, b: u8) {
         const NOT: u32 = 0x6E20_5800;
         const BSL: u32 = 0x6E60_1C00;
         const ORR: u32 = 0x4EA0_1C00;
-        self.const128(5, 0xffc00000ffc00000, 0xffc00000ffc00000);
-        self.v3(FCMEQ, FS2, result, result);
+        // fcmeq .4s / .2d; the negative default NaN and the quiet bit of the lane type
+        let (fcmeq, nan, quiet) = if w == VW::D {
+            (0x4E60_E400, 0xfff8_0000_0000_0000u64, 0x0008_0000_0000_0000u64)
+        } else {
+            (0x4E20_E400, 0xffc0_0000_ffc0_0000, 0x0040_0000_0040_0000)
+        };
+        self.const128(5, nan, nan);
+        self.v3(fcmeq, FS2, result, result);
         self.v2(NOT, FS2, FS2);
         self.v3(BSL, FS2, 5, result);
         self.vmov(result, FS2);
-        self.const128(5, 0x0040000000400000, 0x0040000000400000);
+        self.const128(5, quiet, quiet);
         for input in [b, a] {
             self.v3(ORR, 6, input, 5);
-            self.v3(FCMEQ, FS2, input, input);
+            self.v3(fcmeq, FS2, input, input);
             self.v2(NOT, FS2, FS2);
             self.v3(BSL, FS2, 6, result);
             self.vmov(result, FS2);
@@ -2567,15 +2572,15 @@ impl<'a> Gen<'a> {
                     VX::FDiv(_, NanBits::Host | NanBits::Neon) => self.v3(FDIV | f, xd, xa, xb),
                     VX::FMinNeon(_) => self.v3(0x4EA0_F400 | f, xd, xa, xb),
                     VX::FMaxNeon(_) => self.v3(0x4E20_F400 | f, xd, xa, xb),
-                    VX::FAdd(VW::S, NanBits::Intel) | VX::FSub(VW::S, NanBits::Intel) | VX::FMul(VW::S, NanBits::Intel) | VX::FDiv(VW::S, NanBits::Intel) => {
+                    VX::FAdd(_, NanBits::Intel) | VX::FSub(_, NanBits::Intel) | VX::FMul(_, NanBits::Intel) | VX::FDiv(_, NanBits::Intel) => {
                         let opc = match op {
                             VX::FAdd(..) => FADD,
                             VX::FSub(..) => FSUB,
                             VX::FMul(..) => FMUL,
                             _ => FDIV,
                         };
-                        self.v3(opc, 4, xa, xb);
-                        self.intel_nan(4, xa, xb);
+                        self.v3(opc | f, 4, xa, xb);
+                        self.intel_nan(w, 4, xa, xb);
                         self.vmov(xd, 4);
                     }
                     VX::FMinLt(_) | VX::FMaxGt(_) | VX::MinS(_) | VX::MaxS(_) | VX::MinU(_) | VX::MaxU(_) => {
@@ -2652,9 +2657,9 @@ impl<'a> Gen<'a> {
             VX::FNeg(w) | VX::FAbs(w) | VX::FSqrt(w, _) | VX::FRound(w, _) | VX::FToI(w) | VX::IToF(w) if matches!(w, VW::S | VW::D) => {
                 let xa = self.use_f(a, FS0);
                 let xd = self.def_f(d, FS0);
-                if op == VX::FSqrt(VW::S, NanBits::Intel) {
-                    self.v2(0x6EA1_F800, 4, xa);
-                    self.intel_nan(4, xa, xa);
+                if op == VX::FSqrt(w, NanBits::Intel) {
+                    self.v2(0x6EA1_F800 | sz(w), 4, xa);
+                    self.intel_nan(w, 4, xa, xa);
                     self.vmov(xd, 4);
                     self.fin_f(d, xd);
                     return true;
@@ -2667,6 +2672,7 @@ impl<'a> Gen<'a> {
                     VX::FRound(_, RoundTo::Ceil) => 0x4EA1_8800,
                     VX::FRound(_, RoundTo::Trunc) => 0x4EA1_9800,
                     VX::FRound(_, RoundTo::Away) => 0x6E21_8800,
+                    VX::FRound(_, RoundTo::Even) => 0x4E21_8800, // frintn
                     VX::FToI(_) => 0x4EA1_B800,
                     VX::IToF(_) => 0x4E21_D800,
                     _ => unreachable!("vx {:?}", op),
@@ -5299,7 +5305,7 @@ pub fn vx_native(op: VX) -> bool {
         VX::MulLo(w) | VX::AvgU(w) => w != D,
         VX::ShlI(..) | VX::ShrUI(..) | VX::ShrSI(..) | VX::ShlV(_) | VX::ShrSV(_) | VX::ShrUV(_) => true,
         VX::ICmp(..) | VX::UCmp(..) => true,
-        VX::FAdd(w, n) | VX::FSub(w, n) | VX::FMul(w, n) | VX::FDiv(w, n) | VX::FSqrt(w, n) => w == S || (w == D && n != NanBits::Intel),
+        VX::FAdd(w, _) | VX::FSub(w, _) | VX::FMul(w, _) | VX::FDiv(w, _) | VX::FSqrt(w, _) => matches!(w, S | D),
         VX::FMinLt(w) | VX::FMaxGt(w) | VX::FMinNeon(w) | VX::FMaxNeon(w) | VX::FMinNum(w) | VX::FMaxNum(w) | VX::FCmp(_, w) => matches!(w, S | D),
         VX::FNeg(w) | VX::FAbs(w) | VX::FRound(w, _) | VX::FToI(w) | VX::IToF(w) => matches!(w, S | D),
         VX::Narrow(w) => w != B,
