@@ -409,7 +409,7 @@ fn data_of(u: &Unit, id: u32) -> Option<(Vec<u8>, u64, u64)> {
 /// Storage without a described layout retains the conservative symbol scan.
 fn data_refs(u: &Unit, id: u32, bytes: &[u8]) -> Vec<(usize, Sym)> {
     let pw = u.ptr_bytes() as usize;
-    let offsets: Vec<usize> = crate::syms::pointer_offsets(u, u.syms.addr(Sym::new(id)))
+    let offsets: Vec<usize> = crate::syms::pointer_offsets(u, u.syms.addr(Sym::new(id)), bytes)
         .map(|offsets| offsets.into_iter().map(|o| o as usize).collect())
         .unwrap_or_else(|| (0..bytes.len() / pw).map(|i| i * pw).collect());
     offsets.into_iter().filter_map(|k| {
