@@ -14019,10 +14019,16 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // a round's walk state between its publishes, and "the last publish stopped mid-walk"
     let walk = std::cell::RefCell::new(None);
     let resume = std::cell::Cell::new(false);
+    // what the walk's publishes copied of each visited slot (o3_view): the level scans and the
+    // assembly read these, off the owner when prefronted; and "the publish stopped at a level end"
+    let views: std::cell::RefCell<HashMap<u32, O3View>> = Default::default();
+    let scan = std::cell::Cell::new(false);
+    let no_block_freq = options.no_block_freq;
     let snapped = loop {
     if !resume.replace(false) {
     fronts.borrow_mut().clear();
     splits.borrow_mut().clear();
+    views.borrow_mut().clear();
     rounds += 1;
     // the fronts the last round's left-out candidates needed, made here (each once)
     for s in std::mem::take(&mut needs) {
@@ -14242,52 +14248,26 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             let force = t1_rec.as_ref().is_some_and(|(_, snap, _)| snap.contains(&t1_key(up, c)));
             let te = cpu_ns();
             ensure_rir(c, force, &callees);
-            TIER1_TAKE_PARTS[1].fetch_add(cpu_ns() - te, Ordering::Relaxed);
+            let tv = cpu_ns();
+            TIER1_TAKE_PARTS[1].fetch_add(tv - te, Ordering::Relaxed);
+            views.borrow_mut().insert(c, o3_view(&*up, c, no_block_freq));
+            TIER1_TAKE_PARTS[4].fetch_add(cpu_ns() - tv, Ordering::Relaxed);
             idx += 1;
         }
         if level == LEVELS - 1 {
             break;
         }
-        let ts = cpu_ns();
-        let u = &*up;
-        let mut next = Vec::new();
-        for &c in &frontier {
-            let cf = &u.fns[c as usize];
-            if let Some(r) = &cf.rir {
-                // Cost-model admissions also expose calls in never-run bodies.
-                let never_run = match &t1_rec {
-                    Some((cold, _, _)) => cold.contains(&t1_key(up, c)),
-                    None => !cf.compiled && cf.history().inlined_into.is_empty(),
-                };
-                let cost_admits = !relax_backend::stats::opt_off(options, "-costmodel")
-                    && callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, true)
-                        .map_or(false, |attrs| relax_codegen::opt::rustc_inline_cost(r, c) <= relax_codegen::opt::rustc_inline_threshold(r, attrs));
-                if never_run && relax_codegen::opt::inst_count(r) > relax_codegen::opt::INLINE_FREE_INSTS && !cost_admits {
-                    continue;
-                }
-                for b in &r.blocks {
-                    if matches!(b.term, relax_backend::rir::Term::Unreachable | relax_backend::rir::Term::Resume) {
-                        continue;
-                    }
-                    for i in &b.insts {
-                        // calls, and functions whose address is taken (a call through it becomes
-                        // a direct call in O3: `.map(GlyphId)`)
-                        let x = match i {
-                            relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(x), _, _) | relax_backend::rir::Inst::FnAddr(_, x) => x,
-                            _ => continue,
-                        };
-                        if *x != id && callees.len() < 1024 && seen.insert(*x) {
-                            callees.push(*x);
-                            next.push(*x);
-                        }
-                    }
-                }
-            }
+        // the level's scan (o3_next_level): off the owner when prefronted, then the walk resumes
+        if prefront {
+            *walk.borrow_mut() = Some((epoch, rir, version, t1key, sandboxed, callees, seen, src_toks, inline_all, t1_rec, frontier, level, idx));
+            resume.set(true);
+            scan.set(true);
+            owner_ns.set(owner_ns.get() + cpu_ns() - s0);
+            return None;
         }
-        frontier = next;
+        frontier = o3_next_level(up, options, id, inline_all, &frontier, &views.borrow(), &t1_rec, &mut callees, &mut seen);
         level += 1;
         idx = 0;
-        TIER1_TAKE_PARTS[2].fetch_add(cpu_ns() - ts, Ordering::Relaxed);
     }
     // Recorded descendants can be absent from the live traversal (different
     // O1 inlining). Resolve all known keys, repeating when lowering adds slots.
@@ -14298,6 +14278,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             for c in done..end {
                 if recorded.contains(&t1_key(up, c as u32)) {
                     ensure_rir(c as u32, true, &callees);
+                    views.borrow_mut().insert(c as u32, o3_view(&*up, c as u32, no_block_freq));
                     if seen.insert(c as u32) { callees.push(c as u32); }
                 }
             }
@@ -14315,97 +14296,14 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     if std::env::var_os("MAKEPAD_RUN_O3_TRACE").is_some() {
         eprintln!("O3 snapshot of {}: {} callees", u.fns[id as usize].name, callees.len());
     }
-    let mut snap: Vec<(u32, std::sync::Arc<relax_backend::rir::Func>, u8)> = Vec::new();
-    let mut t1_cold_keys: Vec<String> = Vec::new();
-    let mut t1_snap_keys: Vec<String> = Vec::new();
-    // PGO: block counts of counted inline candidates (slot, key when profiling, counts)
-    let mut snap_counts: Vec<(u32, Option<String>, Vec<f32>)> = Vec::new();
-    for &c in &callees {
-        let f = &u.fns[c as usize];
-        let attrs = match callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, true) {
-            Some(a) => a,
-            None => continue,
-        };
-        let live_cold = !f.compiled && f.history().inlined_into.is_empty();
-        if let Some(r) = &f.rir {
-            let cold = match &t1key {
-                Some(k) => {
-                    let ck = t1_key(up, c);
-                    // replay: exactly the recorded snapshot
-                    if let Some((_, rs, _)) = &t1_rec {
-                        if !rs.contains(&ck) {
-                            continue;
-                        }
-                    }
-                    t1_snap_keys.push(ck.clone());
-                    let g = T1PROF.lock().unwrap();
-                    let p = g.as_ref().unwrap();
-                    let cold = if p.replay { p.map.get(k).map_or(live_cold, |e| e.cold.contains(&ck)) } else { live_cold };
-                    drop(g);
-                    if cold {
-                        t1_cold_keys.push(ck);
-                    }
-                    cold
-                }
-                None => live_cold,
-            };
-            let attrs = if cold { attrs | relax_codegen::opt::ATTR_COLD } else { attrs };
-            if !options.no_block_freq {
-                let ck = t1key.as_ref().map(|_| t1_key(up, c));
-                let cc = if t1prof_replay(options) {
-                    let g = T1PROF.lock().unwrap();
-                    let p = g.as_ref().unwrap();
-                    t1key.as_ref().and_then(|k| p.map.get(k)).and_then(|e| e.callee_counts.iter().find(|x| Some(&x.0) == ck.as_ref()).map(|x| x.1.clone()))
-                } else {
-                    u.frequency_profiles.get(&c).and_then(|p| p.counts_for(r))
-                };
-                if let Some(cc) = cc.filter(|v| v.len() == r.blocks.len()) {
-                    snap_counts.push((c, ck, cc));
-                }
-            }
-            snap.push((c, r.clone(), attrs));
+    // the singles as of now (an entry reference may have escaped since the view), then the
+    // assembly: here when the walk ran on the owner, else off it after this publish
+    for (c, v) in views.borrow_mut().iter_mut() {
+        if v.single && !u.single_ref(*c) {
+            v.single = false;
         }
     }
-    t1_cold_keys.sort();
-    t1_cold_keys.dedup();
-    t1_snap_keys.sort();
-    t1_snap_keys.dedup();
-    if let Some((_, recorded, _)) = &t1_rec {
-        for k in recorded {
-            if !t1_snap_keys.contains(k) { t1prof_divergence("snapshot-missing", k); }
-        }
-    }
-    // Freeze both the single-reference fact and its O1 owner before unlocking.
-    // An exposed call is eligible only while inlining that owner's body, never just
-    // because an unrelated snapshot body happened to reference the same slot.
-    let mut owners = HashMap::new();
-    for (owner, body) in std::iter::once((id, &*rir)).chain(snap.iter().map(|x| (x.0, &*x.1))) {
-        for i in body.blocks.iter().flat_map(|b| &b.insts) {
-            if let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) | relax_backend::rir::Inst::FnAddr(_, c) = i {
-                let entry = owners.entry(*c).or_insert((owner, 0usize));
-                entry.1 += 1;
-            }
-        }
-    }
-    let mut singles = HashMap::new();
-    let mut t1_single_keys = Vec::new();
-    for &(c, _, _) in &snap {
-        let key = t1_key(up, c);
-        let tr = cpu_ns();
-        let is_single = match &t1_rec {
-            Some((_, _, recorded)) => recorded.contains(&key),
-            None => u.single_ref(c) && !u.recursive_fn(c),
-        };
-        TIER1_TAKE_PARTS[4].fetch_add(cpu_ns() - tr, Ordering::Relaxed);
-        if !is_single { continue; }
-        if let Some(&(owner, 1)) = owners.get(&c) {
-            if owner != c {
-                singles.insert(c, owner);
-                t1_single_keys.push(key);
-            }
-        }
-    }
-    t1_single_keys.sort();
+    let assembled = (!prefront).then(|| o3_assemble(up, options, id, &rir, &t1key, &t1_rec, &callees, &views.borrow(), inline_all));
     // recorded frequencies (replay)
     let t1_freq: Option<Option<Vec<f32>>> = t1key.as_ref().and_then(|k| {
         let g = T1PROF.lock().unwrap();
@@ -14444,7 +14342,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     }
     TIER1_TAKE_PARTS[3].fetch_add(cpu_ns() - ta, Ordering::Relaxed);
     owner_ns.set(owner_ns.get() + cpu_ns() - s0);
-    Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, counts, snap_counts, hot_root))
+    Some((rir, version, epoch, t1key, sandboxed, assembled, callees, t1_rec, inline_all, t1_freq, t1_inline_freq, ro, env, cfg, name, counts, hot_root))
     })();
     (r, owner::take_needs())
     });
@@ -14479,6 +14377,17 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
     };
     if resume.get() {
+        if scan.replace(false) {
+            let ts = cpu_ns();
+            let _front = front_read("O3 snapshot walk");
+            let mut w = walk.borrow_mut();
+            let w = w.as_mut().unwrap();
+            let frontier = std::mem::take(&mut w.10);
+            w.10 = o3_next_level(up, options, id, w.8, &frontier, &views.borrow(), &w.9, &mut w.5, &mut w.6);
+            w.11 += 1;
+            w.12 = 0;
+            TIER1_TAKE_PARTS[2].fetch_add(cpu_ns() - ts, Ordering::Relaxed);
+        }
         continue;
     }
     let more = std::mem::take(&mut *fronts.borrow_mut());
@@ -14559,9 +14468,14 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     }
     drop(front);
     let t1 = cpu_ns();
-    let Some((rir, version, epoch, t1key, sandboxed, mut snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, counts, snap_counts, hot_root)) = snapped else {
+    let Some((rir, version, epoch, t1key, sandboxed, assembled, callees, t1_rec, inline_all, t1_freq, t1_inline_freq, ro, env, cfg, name, counts, hot_root)) = snapped else {
         return false;
     };
+    let assembled = assembled.unwrap_or_else(|| {
+        let _front = front_read("O3 snapshot assembly");
+        o3_assemble(up, options, id, &rir, &t1key, &t1_rec, &callees, &views.borrow(), inline_all)
+    });
+    let O3Assembled { mut snap, singles, cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: t1_single_keys, snap_counts } = assembled;
     if let Some(m) = measure.as_mut() { m.phase(1, t1); }
     trace_tier1_phase(id, "backend");
     // PGO: counted inline candidates carry their counts into the inliner (it scales them to the
@@ -15960,10 +15874,10 @@ pub static TIER1_PREP: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 /// O3 snapshots: inline candidates built on the owner (count, wall ns), and the candidates whose
 /// fronts the O3 thread ran off the owner first (count, cpu ns)
 pub static TIER1_SNAP_BUILT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-/// (instrument) owner cpu ns of the O3 snapshot take by part: the root's preparation, the
-/// candidates' ensure_rir, the levels' callee scans, the snapshot's assembly, and (inside the
-/// assembly) the single-reference / recursion checks
-pub static TIER1_TAKE_PARTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// (instrument) cpu ns of the O3 snapshot take by part: on the owner the root's preparation, the
+/// candidates' ensure_rir, the take's tail (sync, singles re-check, root data) and the views
+/// (o3_view, incl. recursive_fn); off it when prefronted the levels' callee scans and the assembly
+pub static TIER1_TAKE_PARTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 pub static TIER1_SNAP_FRONTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// O3 snapshots: inline candidates whose O1 optimisation ran on the O3 thread (count, cpu ns)
 pub static TIER1_SNAP_OFF: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -16078,6 +15992,188 @@ fn splits_off_owner(u: &Unit, c: u32, upgrade: bool) -> bool {
 
 /// Callees one publish of an O3 snapshot's walk visits (the round goes on in the next publish)
 const WALK_ITEMS: usize = 128;
+
+/// What an O3 snapshot's walk copies of a slot it visited, in its publish (after ensure_rir): the
+/// level scans and the assembly read only these, the RIR (immutable) and prog/tcx, so they run off
+/// the owner when the build is prefronted (o3_next_level, o3_assemble).
+struct O3View {
+    rir: Option<std::sync::Arc<relax_backend::rir::Func>>,
+    compiled: bool,
+    /// no O3 build inlined it yet (with !compiled: never ran)
+    uninlined: bool,
+    /// the PGO block counts for `rir`
+    counts: Option<Vec<f32>>,
+    /// referenced once and not recursive (single_ref is checked again at the take's end)
+    single: bool,
+}
+
+/// The owner's copy of slot `c` for the walk (a publish: O(1) but for recursive_fn's walk of the
+/// slot's call graph, done only for slots with RIR).
+fn o3_view(u: &Unit, c: u32, no_block_freq: bool) -> O3View {
+    let f = &u.fns[c as usize];
+    let rir = f.rir.clone();
+    O3View {
+        compiled: f.compiled,
+        uninlined: f.history().inlined_into.is_empty(),
+        counts: if no_block_freq { None } else { rir.as_ref().and_then(|r| u.frequency_profiles.get(&c).and_then(|p| p.counts_for(r))) },
+        single: rir.is_some() && u.single_ref(c) && !u.recursive_fn(c),
+        rir,
+    }
+}
+
+/// The next level of an O3 snapshot's walk: the calls (and taken addresses) in the frontier's RIR
+/// outside cold blocks, skipping never-run bodies the cost model does not admit. Reads only the
+/// views, immutable slot keys and prog/tcx (off the owner: under a front read).
+unsafe fn o3_next_level(up: *mut Unit, options: &crate::options::Options, id: u32, inline_all: bool, frontier: &[u32], views: &HashMap<u32, O3View>,
+    t1_rec: &Option<(Vec<String>, Vec<String>, Vec<String>)>, callees: &mut Vec<u32>, seen: &mut std::collections::HashSet<u32>) -> Vec<u32> {
+    let (prog, tcx, fns, core) = (&*std::ptr::addr_of!((*up).prog), &*std::ptr::addr_of!((*up).tcx), &*std::ptr::addr_of!((*up).fns), *std::ptr::addr_of!((*up).core_crate));
+    let mut next = Vec::new();
+    for &c in frontier {
+        let Some(v) = views.get(&c) else { continue };
+        if let Some(r) = &v.rir {
+            // Cost-model admissions also expose calls in never-run bodies.
+            let never_run = match t1_rec {
+                Some((cold, _, _)) => cold.contains(&t1_key(up, c)),
+                None => !v.compiled && v.uninlined,
+            };
+            let cost_admits = !relax_backend::stats::opt_off(options, "-costmodel")
+                && callee_attrs(prog, tcx, fns, core, c, inline_all, true)
+                    .map_or(false, |attrs| relax_codegen::opt::rustc_inline_cost(r, c) <= relax_codegen::opt::rustc_inline_threshold(r, attrs));
+            if never_run && relax_codegen::opt::inst_count(r) > relax_codegen::opt::INLINE_FREE_INSTS && !cost_admits {
+                continue;
+            }
+            for b in &r.blocks {
+                if matches!(b.term, relax_backend::rir::Term::Unreachable | relax_backend::rir::Term::Resume) {
+                    continue;
+                }
+                for i in &b.insts {
+                    // calls, and functions whose address is taken (a call through it becomes
+                    // a direct call in O3: `.map(GlyphId)`)
+                    let x = match i {
+                        relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(x), _, _) | relax_backend::rir::Inst::FnAddr(_, x) => x,
+                        _ => continue,
+                    };
+                    if *x != id && callees.len() < 1024 && seen.insert(*x) {
+                        callees.push(*x);
+                        next.push(*x);
+                    }
+                }
+            }
+        }
+    }
+    next
+}
+
+/// An O3 snapshot: the inline candidates (slot, RIR, attrs), the single-reference ones with
+/// their one owner, the deterministic-O3 key lists, the candidates' PGO counts.
+struct O3Assembled {
+    snap: Vec<(u32, std::sync::Arc<relax_backend::rir::Func>, u8)>,
+    singles: HashMap<u32, u32>,
+    cold_keys: Vec<String>,
+    snap_keys: Vec<String>,
+    single_keys: Vec<String>,
+    snap_counts: Vec<(u32, Option<String>, Vec<f32>)>,
+}
+
+/// The snapshot from the walk's views (the views, immutable slot keys, prog/tcx and the replay
+/// profile; off the owner: under a front read).
+unsafe fn o3_assemble(up: *mut Unit, options: &crate::options::Options, id: u32, rir: &relax_backend::rir::Func, t1key: &Option<String>,
+    t1_rec: &Option<(Vec<String>, Vec<String>, Vec<String>)>, callees: &[u32], views: &HashMap<u32, O3View>, inline_all: bool) -> O3Assembled {
+    let ta = cpu_ns();
+    let (prog, tcx, fns, core) = (&*std::ptr::addr_of!((*up).prog), &*std::ptr::addr_of!((*up).tcx), &*std::ptr::addr_of!((*up).fns), *std::ptr::addr_of!((*up).core_crate));
+    let mut snap: Vec<(u32, std::sync::Arc<relax_backend::rir::Func>, u8)> = Vec::new();
+    let mut t1_cold_keys: Vec<String> = Vec::new();
+    let mut t1_snap_keys: Vec<String> = Vec::new();
+    // PGO: block counts of counted inline candidates (slot, key when profiling, counts)
+    let mut snap_counts: Vec<(u32, Option<String>, Vec<f32>)> = Vec::new();
+    for &c in callees {
+        let Some(v) = views.get(&c) else { continue };
+        let attrs = match callee_attrs(prog, tcx, fns, core, c, inline_all, true) {
+            Some(a) => a,
+            None => continue,
+        };
+        let live_cold = !v.compiled && v.uninlined;
+        if let Some(r) = &v.rir {
+            let cold = match t1key {
+                Some(k) => {
+                    let ck = t1_key(up, c);
+                    // replay: exactly the recorded snapshot
+                    if let Some((_, rs, _)) = t1_rec {
+                        if !rs.contains(&ck) {
+                            continue;
+                        }
+                    }
+                    t1_snap_keys.push(ck.clone());
+                    let g = T1PROF.lock().unwrap();
+                    let p = g.as_ref().unwrap();
+                    let cold = if p.replay { p.map.get(k).map_or(live_cold, |e| e.cold.contains(&ck)) } else { live_cold };
+                    drop(g);
+                    if cold {
+                        t1_cold_keys.push(ck);
+                    }
+                    cold
+                }
+                None => live_cold,
+            };
+            let attrs = if cold { attrs | relax_codegen::opt::ATTR_COLD } else { attrs };
+            if !options.no_block_freq {
+                let ck = t1key.as_ref().map(|_| t1_key(up, c));
+                let cc = if t1prof_replay(options) {
+                    let g = T1PROF.lock().unwrap();
+                    let p = g.as_ref().unwrap();
+                    t1key.as_ref().and_then(|k| p.map.get(k)).and_then(|e| e.callee_counts.iter().find(|x| Some(&x.0) == ck.as_ref()).map(|x| x.1.clone()))
+                } else {
+                    v.counts.clone()
+                };
+                if let Some(cc) = cc.filter(|v| v.len() == r.blocks.len()) {
+                    snap_counts.push((c, ck, cc));
+                }
+            }
+            snap.push((c, r.clone(), attrs));
+        }
+    }
+    t1_cold_keys.sort();
+    t1_cold_keys.dedup();
+    t1_snap_keys.sort();
+    t1_snap_keys.dedup();
+    if let Some((_, recorded, _)) = t1_rec {
+        for k in recorded {
+            if !t1_snap_keys.contains(k) { t1prof_divergence("snapshot-missing", k); }
+        }
+    }
+    // Freeze both the single-reference fact and its O1 owner before unlocking.
+    // An exposed call is eligible only while inlining that owner's body, never just
+    // because an unrelated snapshot body happened to reference the same slot.
+    let mut owners = HashMap::new();
+    for (owner, body) in std::iter::once((id, rir)).chain(snap.iter().map(|x| (x.0, &*x.1))) {
+        for i in body.blocks.iter().flat_map(|b| &b.insts) {
+            if let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) | relax_backend::rir::Inst::FnAddr(_, c) = i {
+                let entry = owners.entry(*c).or_insert((owner, 0usize));
+                entry.1 += 1;
+            }
+        }
+    }
+    let mut singles = HashMap::new();
+    let mut t1_single_keys = Vec::new();
+    for &(c, _, _) in &snap {
+        // (the key lists exist for deterministic O3 only)
+        let key = (t1key.is_some() || t1_rec.is_some()).then(|| t1_key(up, c));
+        let is_single = match t1_rec {
+            Some((_, _, recorded)) => key.as_ref().is_some_and(|k| recorded.contains(k)),
+            None => views.get(&c).is_some_and(|v| v.single),
+        };
+        if !is_single { continue; }
+        if let Some(&(owner, 1)) = owners.get(&c) {
+            if owner != c {
+                singles.insert(c, owner);
+                if let Some(k) = key { t1_single_keys.push(k); }
+            }
+        }
+    }
+    t1_single_keys.sort();
+    TIER1_TAKE_PARTS[5].fetch_add(cpu_ns() - ta, Ordering::Relaxed);
+    O3Assembled { snap, singles, cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: t1_single_keys, snap_counts }
+}
 
 /// O1 builds one take of an O3 snapshot prepares (o3_candidates_begin): a publish's item bound
 const CAND_TAKE: usize = 8;
