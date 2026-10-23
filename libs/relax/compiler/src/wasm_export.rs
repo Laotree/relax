@@ -1,7 +1,8 @@
 //! Trace-driven wasm export (`MAKEPAD_RUN_WASM_EXPORT=<file.wasm>`): every function the run
 //! compiles is captured as the RIR its code is made from; at the end of the run the captured
-//! set is one module (relax_backend::wasm): calls to functions the run never compiled go to the
-//! shared untraced stub. The data the captured code names (literals, vtables, statics' initial
+//! set and its static call/data-pointer closure become one module (relax_backend::wasm).
+//! Every function ships whole; MAKEPAD_RUN_WASM_EXPORT_BLOCKS=1 opts into the smaller
+//! trace-specific profile with untraced block/function stubs. The data the code names (literals, vtables, statics' initial
 //! images, writable blocks) is placed in linear memory with pointer words translated: data
 //! pointers to their wasm addresses, function pointers to table indices. Runtime entries become
 //! imports `r.<name>` in native diagnostic captures (memcpy/memmove/memset/catch_panic
@@ -34,6 +35,7 @@ pub fn new_unit() -> usize {
 /// the first captured slot: the run's entry (the test fn, main)
 static ENTRY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CLOSURE_ORIGINS: Mutex<BTreeMap<u32, &'static str>> = Mutex::new(BTreeMap::new());
 
 /// Process start (the loader's main): `MAKEPAD_RUN_WASM_EXPORT_BLOCKS=1` turns block coverage on
 /// before the program loads (code cache off), so the export drops the blocks the run never entered.
@@ -518,7 +520,12 @@ pub fn finish(u: &Unit) {
     }
     let (union, forced) = match read_union().and_then(|hits| force_union(u as *const Unit as *mut Unit, &hits).map(|forced| (hits, forced))) {
         Ok(result) => result,
-        Err(e) => { eprintln!("wasm export: {e}"); return; }
+        Err(e) => {
+            eprintln!("wasm export: {e}; no module written");
+            FAILED.store(true, std::sync::atomic::Ordering::Release);
+            let _ = std::fs::remove_file(path.replace("%p", &std::process::id().to_string()));
+            return;
+        }
     };
     if FINISHED.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
@@ -544,7 +551,15 @@ pub fn finish(u: &Unit) {
     }
     // Union bodies are present before discovering retained roots and traversing
     // their calls/vtables. Snapshot coverage only after that closure is lowered.
-    let (kept, kept_failed) = keep_closure(&mut funcs, u);
+    let (kept, kept_failed) = match keep_closure(&mut funcs, u, !block_profile()) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("wasm export: {error}; no module written");
+            FAILED.store(true, std::sync::atomic::Ordering::Release);
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+    };
     let hits = crate::coverage::export_hits(u, &union);
     // MAKEPAD_RUN_WASM_EXPORT_VARIANTS="a=opts;b=opts": one module per variant from this capture
     // (<path>.a.wasm, ...) for size work; else one module with MAKEPAD_RUN_WASM_OPT
@@ -582,7 +597,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     // bodies, the callers' extra constants cost more. Kept as an option for raw size / compile time.
     let mut merge = false;
     let mut splash = true;
-    let mut blocks = crate::coverage::on();
+    let blocks = block_profile() && crate::coverage::on();
     // -tee,-remat,...: switch size techniques off (or on) to measure them
     {
         for t in optv.split(',').filter(|t| !t.is_empty()) {
@@ -606,7 +621,6 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
                 "exnref" => opts.exnref = on,
                 "merge" => merge = on,
                 "splash" => splash = on,
-                "blocks" => blocks = on && crate::coverage::on(),
                 _ => eprintln!("wasm export: unknown option {}", n),
             }
         }
@@ -661,6 +675,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     // that ran but is named only by direct calls its callers' later builds inlined is dropped.
     let mut seeds: Vec<u32> = roots.iter().map(|r| r.0).collect();
     seeds.extend(forced.iter().copied());
+    if !block_profile() { seeds.extend(funcs.keys().copied()); }
     address_taken(u, funcs.values(), &mut seeds, &mut std::collections::HashSet::new());
     seeds.sort_unstable();
     seeds.dedup();
@@ -878,6 +893,18 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     let link = Linked { vals, host };
     let nf = reached.len();
     let out = m.finish(&options, &link);
+    if !block_profile() && (n_unlinked != 0 || !out.stats.failed.is_empty() || !out.stats.untraced_calls.is_empty()) {
+        for (id, error) in &out.stats.failed {
+            eprintln!("wasm export: shipping function {} failed: {error}", funcs[id].name);
+        }
+        for (id, target) in &out.stats.untraced_calls {
+            eprintln!("wasm export: shipping call {} -> {} is unresolved", funcs[id].name, crate::syms::stable_fn_name(u, *target));
+        }
+        eprintln!("wasm export: incomplete shipping closure ({n_unlinked} unlinked symbols); no module written");
+        FAILED.store(true, std::sync::atomic::Ordering::Release);
+        let _ = std::fs::remove_file(path);
+        return;
+    }
     if web {
         let mut unsupported: Vec<String> = out.imports.iter()
             .filter(|(module, name)| module != "env" || !name.starts_with("js_"))
@@ -901,6 +928,34 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
         eprintln!("wasm export: {}: {}", std::path::Path::new(&path).display(), e);
         return;
     }
+    if let Ok(manifest) = std::env::var("MAKEPAD_RUN_WASM_EXPORT_FUNCTIONS") {
+        let keys = reached.iter().map(|id| crate::jit::slot_key(u, *id)).collect::<Vec<_>>();
+        if let Err(error) = std::fs::write(&manifest, format!("makepad-shipped-functions/1\n{}\n", keys.join("\n"))) {
+            eprintln!("wasm export: function manifest {manifest}: {error}");
+            FAILED.store(true, std::sync::atomic::Ordering::Release);
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+    }
+    let origins = CLOSURE_ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut growth: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    let mut closure_rows = String::from("edge\tgeneric\tslot\tbytes\tkey\n");
+    for (id, _, bytes) in &out.stats.fn_sizes {
+        if let Some(edge) = origins.get(id) {
+            let generic = matches!(&u.fns[*id as usize].key, crate::jit::FnKey::Inst(_, args) if !args.is_empty());
+            let entry = growth.entry(edge).or_default();
+            entry.0 += 1; entry.1 += bytes;
+            if generic { let entry = growth.entry("generic (overlaps edges)").or_default(); entry.0 += 1; entry.1 += bytes; }
+            closure_rows.push_str(&format!("{edge}\t{generic}\t{id}\t{bytes}\t{}\n", crate::jit::slot_key(u, *id)));
+        }
+    }
+    if let Ok(path) = std::env::var("MAKEPAD_RUN_WASM_EXPORT_FNLIST") {
+        let _ = std::fs::write(format!("{}.closure", path.replace("%p", &std::process::id().to_string())), closure_rows);
+    }
+    for (edge, (count, bytes)) in growth {
+        eprintln!("wasm export: closure growth {edge}: {count} functions, {bytes} code bytes");
+    }
+    drop(origins);
     // MAKEPAD_RUN_WASM_EXPORT_FNLIST=<file>: one line per module function for size analysis:
     // slot, wasm bytes (0: folded into an identical one), RIR insts, blocks, direct call sites to
     // it in the module, address taken, kept (keep_reachable, not traced), name
@@ -945,7 +1000,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
         let mut sz = s.fn_sizes.clone();
         sz.sort_by(|a, b| b.2.cmp(&a.2));
         let kept_bytes: usize = s.fn_sizes.iter().filter(|x| kept.contains(&x.0)).map(|x| x.2).sum();
-        eprintln!("wasm export: keep_reachable closure: {} functions not traced, {} code bytes ({} failed to build)", kept.len(), kept_bytes, kept_failed);
+        eprintln!("wasm export: whole-function closure: {} retained functions, {} code bytes ({} failed to build)", kept.len(), kept_bytes, kept_failed);
         for (_, n, b) in sz.iter().take(top) {
             eprintln!("  {:7} {}", b, n);
         }
@@ -1094,10 +1149,17 @@ fn single_thread(name: &str) -> Option<HostBind> {
     })
 }
 
-/// Callees the traced code names but never ran that carry `#[relax(keep_reachable)]` (a GC, a
-/// growth path), built now with their whole static call closure: (the slots added, how many
-/// could not be built).
-fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit) -> (std::collections::BTreeSet<u32>, usize) {
+/// One profile switch for capture, closure, emission and gate semantics.
+fn block_profile() -> bool {
+    std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_BLOCKS").is_some_and(|v| v != "0")
+}
+
+/// Shipping closes all captured roots. Size mode closes only annotated roots.
+/// export_rir uses the same tier0_codegen_rir pipeline as captured baseline bodies,
+/// and build_rir registers monomorphic calls and vtables on demand. The worklist
+/// follows those new slots until no static edge remains. A shipping build never
+/// substitutes a trap for a body that fails to lower or emit.
+fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Result<(std::collections::BTreeSet<u32>, usize), String> {
     use relax_backend::rir::Callee;
     let callees = |f: &Func, out: &mut Vec<u32>| {
         for b in &f.blocks {
@@ -1113,34 +1175,52 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit) -> (std::collections:
         callees(f, &mut work);
     }
     work.extend(funcs.keys().copied());
-    work.retain(|id| (*id as usize) < u.fns.len() && crate::jit::keep_reachable(u, *id));
+    work.retain(|id| (*id as usize) < u.fns.len() && (whole || crate::jit::keep_reachable(u, *id)));
     let mut kept = std::collections::BTreeSet::new();
     let mut visited = std::collections::BTreeSet::new();
     let mut data_seen = std::collections::HashSet::new();
     let mut failed = 0;
+    let original: std::collections::BTreeSet<u32> = funcs.keys().copied().collect();
+    let mut origins = CLOSURE_ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
+    origins.clear();
+    let mut expand = |f: &Func, work: &mut Vec<u32>, data_seen: &mut std::collections::HashSet<u32>| {
+        let start = work.len();
+        callees(f, work);
+        for id in &work[start..] { if !original.contains(id) { origins.entry(*id).or_insert("direct-call"); } }
+        let start = work.len();
+        address_taken(u, std::iter::once(f), work, data_seen);
+        for id in &work[start..] { if !original.contains(id) { origins.insert(*id, "function-pointer/vtable"); } }
+    };
     let up = crate::jit::current_unit();
     while let Some(id) = work.pop() {
-        if !visited.insert(id) || (id as usize) >= u.fns.len() {
+        if !visited.insert(id) {
+            continue;
+        }
+        if (id as usize) >= u.fns.len() {
+            if whole { return Err(format!("shipping closure names unknown function slot {id}")); }
             continue;
         }
         // A traced root still needs its unexecuted grow/error branches and their
         // full call closure. Previously only untraced roots were expanded.
         if let Some(f) = funcs.get(&id) {
-            callees(f, &mut work);
-            address_taken(u, std::iter::once(f), &mut work, &mut data_seen);
+            expand(f, &mut work, &mut data_seen);
             kept.insert(id);
             continue;
         }
-        let r = crate::owner::call(crate::owner::Class::Program, || crate::zone_alloc::kept_with(|| unsafe { crate::jit::export_rir(up, id) }));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+            crate::owner::call(crate::owner::Class::Program, || crate::zone_alloc::kept_with(|| unsafe { crate::jit::export_rir(up, id) }))
+        )).unwrap_or_else(|_| Err("compiler panicked".into()));
         match r {
             Ok(f) => {
-                callees(&f, &mut work);
-                address_taken(u, std::iter::once(&f), &mut work, &mut data_seen);
+                expand(&f, &mut work, &mut data_seen);
                 funcs.insert(id, f);
                 kept.insert(id);
             }
-            Err(_) => failed += 1,
+            Err(error) => {
+                if whole { return Err(format!("shipping closure cannot compile {} at export tier: {error}", crate::jit::slot_key(u, id))); }
+                failed += 1;
+            }
         }
     }
-    (kept, failed)
+    Ok((kept, failed))
 }
