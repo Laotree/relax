@@ -4586,7 +4586,10 @@ impl<'a> Fcx<'a> {
         }
         type_dependencies(self.tcx, lt, &mut self.b.dependencies);
         // rustc_hir_typeck/src/fn_ctxt/mod.rs lower_ty: every written type must be well formed
-        if self.tcx.validates(self.prog, self.file) && lowered_clean && !self.tcx.tys.has_error(lt) { self.register_wf(lt, self.last_lo); }
+        if self.tcx.validates(self.prog, self.file) && lowered_clean && !self.tcx.tys.has_error(lt) {
+            let lo = crate::wfcheck::obligations::ty_pos(&prog.files[self.file as usize].ast, t).unwrap_or(self.last_lo);
+            self.register_wf(lt, lo);
+        }
         lt
     }
 
@@ -7450,7 +7453,8 @@ impl<'a> Fcx<'a> {
             }
             // rustc maybe_report_ambiguity: an ambiguous subtype / coercion predicate relates two still unknown
             // types (the first is named): "type annotations needed" (E0282), not an unsatisfied obligation.
-            if code == "E0283" && matches!(predicate.kind, PredicateKind::Subtype(_) | PredicateKind::Coerce(_)) {
+            // An ambiguous `WellFormed(term)` likewise (ambiguity.rs: emit_inference_failure_err E0282).
+            if code == "E0283" && matches!(predicate.kind, PredicateKind::Subtype(_) | PredicateKind::Coerce(_) | PredicateKind::Clause(crate::next_solver::ClauseKind::WellFormed(_))) {
                 self.err(obligation.cause.span, "E0282: type annotations needed".to_string());
                 continue;
             }

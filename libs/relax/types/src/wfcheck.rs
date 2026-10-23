@@ -1184,7 +1184,7 @@ pub mod obligations {
     }
 
     /// Where a written type starts: types carry no span of their own, a path its position.
-    fn ty_pos(ast: &ast::Ast, t: ast::TyId) -> Option<u32> {
+    pub(crate) fn ty_pos(ast: &ast::Ast, t: ast::TyId) -> Option<u32> {
         match ast.ty(t) {
             ast::Ty::Path(p) => Some(p.lo),
             ast::Ty::Ref(_, _, i) | ast::Ty::Ptr(_, i) | ast::Ty::Slice(i) | ast::Ty::Array(i, _) | ast::Ty::Paren(i) => ty_pos(ast, *i),
