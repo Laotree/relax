@@ -657,6 +657,12 @@ pub fn compact_vregs(f: &mut Func) {
     }
     // (the debug table follows; a vreg no instruction mentions is gone: its leaf is no longer held)
     f.dbg_map_vregs(&|v| map.get(v.0 as usize).filter(|x| **x != NONE).map(|x| VReg(*x)));
+    // (the halves hint keeps the pairs whose both vregs remain)
+    let live = |v: VReg| map.get(v.0 as usize).is_some_and(|x| *x != NONE);
+    f.halves.retain(|(a, b)| live(*a) && live(*b));
+    for p in f.halves.iter_mut() {
+        *p = (m(p.0), m(p.1));
+    }
     f.vregs = cls;
 }
 
@@ -1541,7 +1547,9 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                     // x * 1.0, 1.0 * x, x / 1.0, x - 0.0, x + -0.0, -0.0 + x: x itself (exact in
                     // IEEE arithmetic, a NaN's payload aside, which Rust leaves unspecified;
                     // LLVM's instsimplify does the same) -- `Vec4 { w: 1.0, .. }` through a matrix
-                    if let Inst::FBin(op, w, d, x, y) = new {
+                    // (not under Options::nan_exact: the op quiets a signaling NaN, the fold would not)
+                    if let (Inst::FBin(op, w, d, x, y), false) = (&new, options.nan_exact) {
+                        let (op, w, d, x, y) = (*op, *w, *d, *x, *y);
                         let kf = |v: VReg| match kn[v.0 as usize] {
                             Some(K::F(b, _)) => Some(b),
                             _ => None,

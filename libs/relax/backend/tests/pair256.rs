@@ -25,13 +25,13 @@ fn compile(options: &relax_session::Options, f: &Func) -> Code {
 
 fn caps() -> Option<relax_backend::pair256::Caps> {
     let o = options(true);
-    o.cpu.avx.then_some(relax_backend::pair256::Caps { avx2: o.cpu.avx2, fma: o.cpu.fma })
+    o.cpu.avx.then_some(relax_backend::pair256::Caps { avx2: o.cpu.avx2, fma: o.cpu.fma, ints: false })
 }
 
 /// the pass fuses `f` (on any host: a CPU with AVX2 and FMA assumed)
 fn fires(f: &Func) -> bool {
     let mut g = f.clone();
-    relax_backend::pair256::pair256(&mut g, relax_backend::pair256::Caps { avx2: true, fma: true }) && g.vregs.contains(&Cls::V256)
+    relax_backend::pair256::pair256(&mut g, relax_backend::pair256::Caps { avx2: true, fma: true, ints: false }) && g.vregs.contains(&Cls::V256)
 }
 
 #[test]
