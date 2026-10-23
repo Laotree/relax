@@ -106,7 +106,9 @@ static REC: [Rec; RECS] = [const {
 }; RECS];
 
 /// The watcher's wake-up pipe (unix: write end, read end); -1 before it runs.
+#[cfg(unix)]
 static WAKE_W: AtomicI32 = AtomicI32::new(-1);
+#[cfg(unix)]
 static WAKE_R: AtomicI32 = AtomicI32::new(-1);
 
 #[cfg(unix)]

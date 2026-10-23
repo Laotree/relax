@@ -4378,6 +4378,27 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// A rotate's source: an 8/16-bit value replicated across 32 bits in IP1 (a 32-bit rotate of
+    /// it rotates every copy, so the low bits are the narrow rotate for any count), else `ra`.
+    fn rot_src(&mut self, bits: u8, ra: u8) -> u8 {
+        if bits >= 32 {
+            return ra;
+        }
+        self.a.extend(IP1, ra, bits, false);
+        let mut w = bits as u32;
+        while w < 32 {
+            // orr w17, w17, w17, lsl #w
+            self.a.e(0x2A00_0000 | (IP1 as u32) << 16 | w << 10 | (IP1 as u32) << 5 | IP1 as u32);
+            w *= 2;
+        }
+        IP1
+    }
+    /// A rotate result in the type's canonical form: W forms zero-extend (u32 done).
+    fn rot_ext(&mut self, it: IntTy, rd: u8, ext: bool) {
+        if it.bits < 64 && it != U32 && ext {
+            self.a.extend(rd, rd, it.bits, it.signed);
+        }
+    }
     /// `ext`: re-extend a narrow result (false: nobody reads its upper bits, passes::low_bits_only)
     fn ibin_rr(&mut self, op: IOp, it: IntTy, rd: u8, ra: u8, rb: u8, ext: bool) {
         if op == IOp::Bzhi {
@@ -4388,9 +4409,12 @@ impl<'a> Gen<'a> {
             return;
         }
         if op == IOp::Rotl {
-            // rotate left by b = rorv by -b (rorv takes the count mod the width; W form for u32)
+            // rotate left by b = rorv by -b (rorv takes the count mod the width; W form below 64
+            // bits, an 8/16-bit value replicated across the W register first: passes::rotl)
             self.a.e(0xCB00_03E0 | (rb as u32) << 16 | IP0 as u32);
-            self.a.rrr(if it.bits == 32 { 0x1AC0_2C00 } else { 0x9AC0_2C00 }, rd, ra, IP0);
+            let src = self.rot_src(it.bits, ra);
+            self.a.rrr(if it.bits < 64 { 0x1AC0_2C00 } else { 0x9AC0_2C00 }, rd, src, IP0);
+            self.rot_ext(it, rd, ext);
             return;
         }
         if it == U32 && !matches!(op, IOp::Div | IOp::Rem | IOp::MulHi) {
@@ -4443,11 +4467,15 @@ impl<'a> Gen<'a> {
         let ra = self.use_i(a, S0);
         let rd = self.def_i(d, S0);
         if op == IOp::Rotl {
-            // rotate left by k = ror by (w - k) = extr rd, ra, ra, #(w - k)
-            let w = if it.bits == 32 { 32u32 } else { 64 };
-            let r = (w - (imm as u32 % w)) % w;
+            // rotate left by k = ror by (w - k) = extr rd, ra, ra, #(w - k) (W form below 64 bits,
+            // an 8/16-bit value replicated across the W register first: passes::rotl)
+            let w = if it.bits < 64 { 32u32 } else { 64 };
+            let r = (w - ((imm as u64 % it.bits as u64) as u32 % w)) % w;
             let base = if w == 32 { 0x1380_0000u32 } else { 0x93C0_0000 };
-            self.a.e(base | (ra as u32) << 16 | r << 10 | (ra as u32) << 5 | rd as u32);
+            let src = self.rot_src(it.bits, ra);
+            self.a.e(base | (src as u32) << 16 | r << 10 | (src as u32) << 5 | rd as u32);
+            let ext = !self.low_only[d.0 as usize];
+            self.rot_ext(it, rd, ext);
             self.fin_i(d, rd);
             return;
         }
@@ -5381,10 +5409,10 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     crate::stats::pass_time(11, t_ra);
     drop(_cost_ra);
     let alloc_sig = regalloc::alloc_sig(&al0);
-    if crate::stats::opt_env_off("+checkra") {
-        for l in regalloc::check_alloc(options, f, &cfg, &al0) {
-            eprintln!("{}", l);
-        }
+    regalloc::trace_alloc(f, &al0);
+    // the allocation checker (MAKEPAD_RUN_OPT=+checkra; gates, fuzzer): a finding fails the compile
+    if regalloc::check_on(options) {
+        regalloc::check_or_fail(options, f, &cfg, &al0, env.opt_regs || f.full)?;
     }
     // a function past the branch ranges is emitted again in long mode: from the same
     // allocation (allocating twice doubled a 3.7 s allocation)

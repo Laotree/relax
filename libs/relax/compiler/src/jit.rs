@@ -1337,16 +1337,23 @@ extern "C" fn relax_fork() -> i32 {
 fn fork_prepare() {
     pause_compile_jobs(false);
     owner::fork_prepare();
+    // (every code writer paused: the child's copy of the W^X code views is consistent)
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    os::mem::fork_prepare();
 }
 
 #[cfg(unix)]
 fn fork_parent() {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    os::mem::fork_parent();
     owner::fork_parent();
     resume_compile_jobs(false);
 }
 
 #[cfg(unix)]
 fn fork_child() {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    os::mem::fork_child();
     owner::fork_child();
     PIPELINE.store(false, Ordering::SeqCst);
     SPEC_STOP.store(true, Ordering::SeqCst);
