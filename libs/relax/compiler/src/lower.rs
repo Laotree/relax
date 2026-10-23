@@ -7116,7 +7116,8 @@ impl<'a> Lcx<'a> {
         let p = self.f.vreg(Cls::I);
         let def = self.u.prog.def(d);
         let ast = &self.u.prog.files[def.file as usize].ast;
-        if crate::lang_items::has_attr(&self.u.prog, def.file, ast.list(ast.item(def.item).attrs), "thread_local") {
+        let no_threads = self.u.web_target && !self.u.prog.crates[def.krate as usize].cfg.set.iter().any(|s| s == "target_feature=atomics");
+        if !no_threads && crate::lang_items::has_attr(&self.u.prog, def.file, ast.list(ast.item(def.item).attrs), "thread_local") {
             let Some(pl) = self.u.thread_local_place_shared(d) else {
                 self.err(self.pos, format!("could not evaluate static {} -- see its own error", self.u.prog.def_path(d)));
                 self.emit(Inst::Iconst(p, 0));
