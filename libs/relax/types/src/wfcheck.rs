@@ -412,6 +412,8 @@ pub mod obligations {
         ocx: ObligationCtxt<'a, 'tcx>,
         env: ParamEnvId,
         def: DefId,
+        /// the item whose position the errors take (`def`, or an RPITIT's fn)
+        at: DefId,
         /// errors of checks that are not obligations (region outlives)
         extra: Vec<String>,
         /// rustc `assumed_wf_types`: the types whose well-formedness the item's regions may assume
@@ -558,7 +560,7 @@ pub mod obligations {
                 for e in self.infcx.resolve_regions_with_outlives_env(self.prog, &outlives) {
                     if let crate::infer::lexical_region_resolve::RegionResolutionError::GenericBoundFailure(ty, sub, span) = e {
                         if let Some(msg) = self.generic_bound_failure(ty, sub) {
-                            let span = if span == 0 { self.prog.files[file as usize].ast.item(self.prog.def(self.def).item).lo } else { span };
+                            let span = if span == 0 { self.prog.files[file as usize].ast.item(self.prog.def(self.at).item).lo } else { span };
                             if seen.insert((span, msg.clone())) { out.push(self.prog.record_error(file, span, "typeck", msg)); }
                         }
                     } else if !region_failed {
@@ -567,7 +569,7 @@ pub mod obligations {
                         // constraints carry no SubregionOrigin, so the error is reported once per item,
                         // without the origin's code (E0308 lifetime mismatch, E0478, E0491, E0803 ..)
                         region_failed = true;
-                        let span = self.prog.files[file as usize].ast.item(self.prog.def(self.def).item).lo;
+                        let span = self.prog.files[file as usize].ast.item(self.prog.def(self.at).item).lo;
                         out.push(self.prog.record_error(file, span, "typeck", "lifetime mismatch: the item's region constraints cannot be satisfied".to_string()));
                     }
                 }
@@ -714,6 +716,26 @@ pub mod obligations {
             if let Some(args) = tcx.impl_trait_args.get(&imp) { v.extend_from_slice(args); }
             v
         };
+        // a trait's RPITIT associated type assumes its fn's types, the fn's late-bound lifetimes
+        // the opaque captures mapped to the RPITIT's own early-bound copies of them (its
+        // early-bound ones are tied to their copies by the bidirectional outlives clauses)
+        if let Some(&relax_front::assoc::ImplTraitInTraitData::Trait { fn_def_id, opaque_def_id }) = prog.impl_trait_in_trait_data.get(&def) {
+            use crate::types::RegionKind;
+            let data = tcx.opaque_generics(prog, opaque_def_id);
+            let offset = (data.parent.lifetimes.len() + data.parent.types_consts.len()) as u32;
+            let mut mapping = std::collections::HashMap::new();
+            for (index, &orig) in tcx.opaque_captured_parent_lifetimes(prog, opaque_def_id).iter().enumerate() {
+                if matches!(tcx.tys.region_kind(orig), RegionKind::ReLateParam(..)) {
+                    mapping.insert(orig, tcx.tys.intern_region(RegionKind::ReEarlyParam(offset + index as u32)));
+                }
+            }
+            struct Remap<'m>(&'m std::collections::HashMap<crate::types::RegionId, crate::types::RegionId>);
+            impl crate::types::fold::TypeFolder for Remap<'_> {
+                fn fold_region(&mut self, _: &crate::types::Types, r: crate::types::RegionId, _: u32) -> crate::types::RegionId { self.0.get(&r).copied().unwrap_or(r) }
+            }
+            use crate::types::fold::TypeFolder;
+            return assumed_wf_types(w, fn_def_id).into_iter().map(|t| Remap(&mapping).fold_ty(&tcx.tys, t, 0)).collect();
+        }
         let parent_impl = (d.parent != crate::program::NO_DEF && prog.def(d.parent).kind == DefKind::Impl).then_some(d.parent);
         match d.kind {
             // (a foreign fn is rustc's DefKind::Fn)
@@ -733,13 +755,20 @@ pub mod obligations {
     }
 
     fn with_wfcx(prog: &Program, tcx: &Tcx, def: DefId, f: impl FnOnce(&mut Wfcx<'_, '_>)) -> Vec<String> {
+        with_wfcx_of(prog, tcx, def, def, f)
+    }
+
+    /// enter_wf_checking_ctxt for `def`; its errors are reported at `item` (a synthesized RPITIT
+    /// associated type has no item of its own: its fn's). The false global bounds of an RPITIT are
+    /// its fn's, which the fn's own check reports (rustc reports the same diagnostic once).
+    fn with_wfcx_of(prog: &Program, tcx: &Tcx, def: DefId, item: DefId, f: impl FnOnce(&mut Wfcx<'_, '_>)) -> Vec<String> {
         let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), def);
         let env = tcx.param_env_id(prog, def);
-        let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env, def, extra: Vec::new(), assumed_wf: Vec::new(), normalized: Default::default() };
+        let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env, def, at: item, extra: Vec::new(), assumed_wf: Vec::new(), normalized: Default::default() };
         w.assumed_wf = assumed_wf_types(&mut w, def);
-        w.check_false_global_bounds();
+        if def == item { w.check_false_global_bounds(); }
         f(&mut w);
-        w.finish(prog.def(def).file)
+        w.finish(prog.def(item).file)
     }
 
     /// check_well_formed for one definition (a body-less, header-level check: bodies are the
@@ -752,28 +781,23 @@ pub mod obligations {
         match def.kind {
             DefKind::Struct | DefKind::Enum | DefKind::Union => with_wfcx(prog, tcx, did, |w| { check_type_defn(w, ast, item); check_defaults(w, ast, item); }),
             DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => {
-                // the associated types a trait method's `impl Trait` returns become
-                // (ImplTraitInTraitData::Trait): wfcheck.rs check_associated_type_bounds -- their
-                // bounds are well formed, under the method's assumptions (assumed_wf_types of an
-                // RPITIT are its fn's)
-                let mut opaques: Vec<DefId> = Vec::new();
+                // wfcheck.rs check_trait_item: the associated types a trait method's `impl Trait`s
+                // become (ImplTraitInTraitData::Trait) are checked as associated items of their own
+                // (check_associated_item: check_associated_type_bounds), each under its own
+                // environment -- the fn's clauses and the bidirectional outlives clauses between the
+                // captured lifetimes and their copies -- and assumed well-formed types
+                let mut rpitits: Vec<DefId> = Vec::new();
                 if def.kind == DefKind::AssocFn && prog.def(def.parent).kind == DefKind::Trait {
-                    opaques = prog.impl_trait_in_trait_data.iter().filter_map(|(_, v)| match v {
-                        relax_front::assoc::ImplTraitInTraitData::Trait { fn_def_id, opaque_def_id } if *fn_def_id == did => Some(*opaque_def_id),
+                    rpitits = prog.impl_trait_in_trait_data.iter().filter_map(|(&a, v)| match v {
+                        relax_front::assoc::ImplTraitInTraitData::Trait { fn_def_id, .. } if *fn_def_id == did => Some(a),
                         _ => None,
                     }).collect();
-                    opaques.sort_unstable_by_key(|d| d.0);
+                    rpitits.sort_unstable_by_key(|d| d.0);
                 }
                 let mut errors = with_wfcx(prog, tcx, did, |w| check_fn(w, ast, item));
-                if errors.is_empty() {
-                    for &o in &opaques {
-                        let bounds = tcx.explicit_item_bounds(prog, o).to_vec();
-                        // (the bounds name the RPITIT's own copies of the fn's lifetimes, whose
-                        // relation to the fn's where-clauses this environment does not have: their
-                        // region obligations are not judged here)
-                        errors.extend(with_wfcx(prog, tcx, did, |w| for b in &bounds { w.clause_obligations(b, item.lo) })
-                            .into_iter().filter(|e| !e.contains("E0309") && !e.contains("E0310") && !e.contains("lifetime")));
-                    }
+                for &a in &rpitits {
+                    let bounds = tcx.explicit_item_bounds(prog, a).to_vec();
+                    errors.extend(with_wfcx_of(prog, tcx, a, did, |w| for b in &bounds { w.clause_obligations(b, item.lo) }));
                 }
                 if def.kind != DefKind::ForeignFn { errors.extend(check_opaque_cycles(prog, tcx, did, item.lo)); }
                 if matches!(item.kind, ItemKind::Fn(sig, _, _) if ast.fn_sig(sig).asyncness) { errors.extend(check_async_recursion(prog, tcx, did, item.lo)); }
