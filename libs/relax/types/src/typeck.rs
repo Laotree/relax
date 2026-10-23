@@ -1432,6 +1432,14 @@ impl<'a> Fcx<'a> {
             let PredicateKind::Clause(ClauseKind::Trait(c)) = &p.kind else { continue };
             let Some(crate::consts::GenericArg::Type(self_ty)) = c.trait_ref.args.first() else { continue };
             if !self.tcx.tys.eq_mod_regions(*self_ty, t) { continue; }
+            // probe.rs WhereClauseCandidate: a higher-ranked bound's vars become fresh regions
+            // (`T: for<'a> Trait<&'a ()>` then `T::f()`)
+            let kind;
+            let c = if p.bound_vars.is_empty() { c } else {
+                kind = self.infcx.instantiate_predicate_binder_with_infer(p);
+                let PredicateKind::Clause(ClauseKind::Trait(c)) = &kind else { continue };
+                c
+            };
             let mut args = Vec::new();
             for a in &c.trait_ref.args[1..] {
                 match a {
