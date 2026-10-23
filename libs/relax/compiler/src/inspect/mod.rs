@@ -52,16 +52,6 @@ pub mod cfi {
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use relax_session::sync::Mutex;
 
-/// The kept-state scan (zone_scan.rs, MAKEPAD_RUN_ZONE_CHECK=1) of inspect's records that
-/// outlive the compiler arena: instrumented and probed code calls into them after a settle swap.
-pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
-    instrument::scan_kept(a);
-    patches::scan_kept(a);
-    probes::scan_kept(a);
-    codever::scan_kept(a);
-    remarks::scan_kept(a);
-    watch::scan_kept(a);
-}
 
 /// The inspect thread runs (a socket is listening).
 static STARTED: AtomicBool = AtomicBool::new(false);
@@ -147,7 +137,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("path", "<H<n>|R<n>>", "the full stack of a heap site id"),
     ("count", "<fn> [time=1] [tier=o1]", "exact call counts (and inclusive time) of every slot of a fn: its code is rebuilt with probes at the tier of the code it replaces (O3 code gets an O3 instrumented build; tier=o1 asks for O1) and installed as a probe group G<n>; every slot whose code holds an inlined copy of the fn is rebuilt at its tier without that inlining, so it calls the counted code; each row names the code version replaced and the one now, later installs with an inlined copy are rebuilt too (a `probe` event)"),
     ("asm", "<fn|@slot> [vs=rustc] [native=<binary>] [s=2] [ev=cpu|cycles|instructions|branch-misses|cache-misses] [view=summary|lines|listing|code] [line=<n>] [at=<off> [n=24]] | top vs=rustc [s=3] [n=15]", "the JIT's machine code of a fn next to rustc's for the same fn (native=: a release build with line tables), aligned by source line, with CPU samples and PGO counts per line and a diff summary first: excess instructions, spill traffic, kept bounds checks, calls rustc inlined, loops rustc vectorised; at=: the n instructions either side of one code offset (a fault's `off` in decimal, or 0x hex), the one at it marked; `asm top vs=rustc` ranks the hottest fns by the time their excess instructions cost"),
-    ("vsnative", "[native=<bin>] [args=a,b] [s=5] [warm_ms=3000] [ev=instructions|cycles|cpu] [n=20] | pid=<native pid> [s=10] [hz=1000] [threads=main] [nthreads=<name>|busy] [roots=a,b] [tree=<depth>] [min=0.1] [save=1]", "the program's rustc release build run next to this process for the same window, both sampled with the same event, diffed per fn: events/s here and native, ratio, shares, the JIT tier (Linux); pid=: an already-running native build sampled WITH STACKS (its CFI + DWARF inline tree) next to this process: self and inclusive time per source fn on both sides, cut at roots= (what a meter times), a merged call tree -- the JIT-vs-native attribution table (x86_64 Linux)"),
+    ("vsnative", "[native=<bin>] [args=a,b] [s=5] [warm_ms=3000] [ev=instructions|cycles|cpu] [n=20]", "the program's rustc release build run next to this process for the same window, both sampled with the same event, diffed per fn: events/s here and native, ratio, shares, the JIT tier (Linux)"),
     ("ab", "<fn|@slot> b=<base|o1|opt:<tok>,..|inline:<callee>|noinline:<callee>> [a=base] [rounds=5] [s=1] [metric=incl|self] [per=s|frame|call] [ev=cpu|cycles|instructions] [keep=a|b]", "a live A/B of one fn: the variants' builds installed in turn (ABAB rounds), each round's cost rate of the fn measured alike; answer: medians, spread, permutation-test p, verdict (real / no difference beyond noise)"),
     ("contention", "[s=3] [n=15]", "lock / condvar / park / owner waits grouped by what was waited on: total and longest wait, per frame, waiting threads, who ended them (records s seconds of timeline first; alias of timeline waits)"),
     ("counters", "[s=1] [n=12]", "hardware counters over a window: Linux per thread (cycles, instructions, IPC, branch and cache misses); macOS the process's instructions and cycles (all a non-root process gets)"),
@@ -888,11 +878,19 @@ pub fn wait_text(w: &crate::waits::Wait, list: &[threads::Thread]) -> String {
     }
 }
 
+/// The program's main lane: the thread running the program's `main` (`MAIN_TID`). Under a
+/// domain that is not the process's first thread, which then only runs makepad run's / the HAL's
+/// event pump; the process thread counts as main only while no program main is known.
+pub(crate) fn is_program_main(t: &threads::Thread) -> bool {
+    let main = crate::jit::MAIN_TID.load(Relaxed);
+    if main != 0 { t.handle == main } else { t.os_id == std::process::id() as u64 }
+}
+
 pub(crate) fn pick_threads(sel: &str) -> Box<dyn Fn(&threads::Thread) -> bool> {
     let sel = sel.to_string();
     Box::new(move |t: &threads::Thread| match sel.as_str() {
         "all" | "" => true,
-        "main" => t.handle != 0 && t.handle == crate::jit::MAIN_TID.load(Relaxed) || t.os_id == std::process::id() as u64,
+        "main" => is_program_main(t),
         "owner" => t.handle != 0 && t.handle == crate::owner::owner_tid(),
         s => tid_of(s).is_some_and(|id| id == t.os_id) || t.name.starts_with(s),
     })

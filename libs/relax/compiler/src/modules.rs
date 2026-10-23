@@ -24,8 +24,8 @@ struct Module {
 
 static MODULES: relax_session::sync::Mutex<Vec<Module>> = relax_session::sync::Mutex::new(Vec::new());
 
-crate::gen_local! {
-    static LAST_ERROR: std::cell::RefCell<String>;
+thread_local! {
+    static LAST_ERROR: std::cell::RefCell<String> = Default::default();
 }
 
 fn set_error(e: String) {
@@ -237,7 +237,6 @@ pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool,
             let loaded = u.prog.load_crate_deferred(&nc.name, &nc.path, nc.edition, nc.cfg.clone(), dep_list);
             for k in first..u.prog.crates.len() {
                 u.prog.crates[k].proc_macro = nc.proc_macro;
-                if up == crate::run::running_unit() { jit::zone_swap::remember_runtime(&u.prog, k as u32); }
             }
             match loaded {
                 Ok(k) => {
@@ -268,7 +267,7 @@ pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool,
     let mine: Vec<String> = (f0..u.prog.files.len()).map(|f| u.prog.file_paths[f].clone()).collect();
     let mut errs: Vec<String> = u.prog.errors[e0..].iter().filter(|e| mine.iter().any(|p| e.starts_with(p.as_str()))).cloned().collect();
     {
-        // (Program.errors is read off the owner under a front read: the swap's encode)
+        // (Program.errors is read off the owner under a front read: a mid-run encode)
         let _fw = jit::front_write();
         u.prog.errors.truncate(e0);
         u.prog.errors.extend(errs.iter().cloned());
@@ -308,7 +307,7 @@ pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool,
 /// Parses, resolves, collects and type-checks a crate loaded at run time (on the owner thread);
 /// `sandbox`: the compile-time refusal applies. On an error nothing of it stays reachable.
 unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox: bool) -> Result<(u32, u32, Vec<DefId>), Vec<String>> {
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let sess = &session;
     let u = &mut *up;
     let mut dep_list = Vec::new();
@@ -778,7 +777,7 @@ fn wrapper_source(u: &Unit, krate: u32, modname: &str, idx: u32, defs: &[DefId])
 /// defs and the wrapper's, wrapper crate, arena, unsupported exports).
 #[allow(clippy::type_complexity)]
 unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: &[String]) -> Result<(u32, u32, Vec<DefId>, u32, std::sync::Arc<crate::sandbox::Arena>, Vec<String>), Vec<String>> {
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let sess = &session;
     let runtime = &sess.runtime;
     let options = &sess.options;
@@ -917,7 +916,7 @@ pub(crate) fn stream_applied(h: u64, file: u32) {
 pub extern "C" fn __relax_module_load_stream(name: *const u8, nlen: usize, path: *const u8, plen: usize, src: *const u8, slen: usize, deps: *const u8, dlen: usize) -> u64 {
     let up = jit::current_unit();
     if up.is_null() { set_error("no running unit".to_string()); return 0; }
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let sess = &session;
     let path_text = unsafe { String::from_utf8_lossy(bytes(path, plen)) };
     let text = crate::reload::complete_prefix(sess, &path_text, unsafe { bytes(src, slen) }, 2021);
@@ -994,7 +993,7 @@ fn load_src_inner(name: *const u8, nlen: usize, path: *const u8, plen: usize, sr
         set_error("no running unit".to_string());
         return 0;
     }
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     // MAKEPAD_RUN_MODULES_TRUSTED=1: a trusted module (host code, no sandbox; diagnosis only)
     let trusted = options.modules_trusted;
@@ -1204,8 +1203,8 @@ struct HostEntry {
     busy: bool,
 }
 
-crate::gen_local! {
-    static HOSTS: std::cell::RefCell<Vec<HostEntry>>;
+thread_local! {
+    static HOSTS: std::cell::RefCell<Vec<HostEntry>> = Default::default();
 }
 static NEXT_HOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
