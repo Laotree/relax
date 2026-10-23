@@ -1029,9 +1029,12 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
         let tier = if tier1 { " [O3]" } else if s.base { " [B]" } else if s.o2 { " [O2]" } else { " [O1]" };
         perf_map(s.at, s.len as usize, &format!("{}{}", perf_name(u, s.id), tier));
     }
-    // an instance or a closure (image slots are never foreign fns: their code is not stored):
-    // its call counter, armed with the others of the block (arm_counters)
-    if s.kind <= 1 {
+    // an instance, a closure or an unverified-mode twin (image slots are never foreign fns: their
+    // code is not stored): its call counter, armed with the others of the block (arm_counters), as
+    // arm_counter arms them. (A twin left out had no count stub and tier state 0, so neither its
+    // calls nor its loop counters could tier it up: a warm launch whose image held the previous
+    // run's unverified callers ran their twins' baseline code for the whole session, MICKEYGAP.)
+    if matches!(s.kind, 0 | 1 | 4) {
         arm.push((s.id, s.at));
     } else {
         u.frequency_profiles.remove(&s.id);
@@ -12539,7 +12542,7 @@ unsafe fn relower_twin_callers(up: *mut Unit, tc: &TwinCallers) {
             let mut a = TWIN_AWAIT.lock().unwrap_or_else(|e| e.into_inner());
             crate::zone_alloc::kept_with(|| for &c in &tc.unverified { if !a.contains(&(key, c)) { a.push((key, c)); } });
         }
-        prioritize_verdicts(u, &tc.unverified);
+        prioritize_verdicts(up, &tc.unverified);
         if specv_trace() {
             for &c in &tc.unverified {
                 let v = match u.verdict_state(c) { Verdict::Clean => "clean".to_string(), Verdict::Failed(e) => format!("failed ({} events)", e.len()), Verdict::Pending => "pending".to_string(), Verdict::Unverifiable(w) => format!("unverifiable: {}", w) };
@@ -12550,8 +12553,14 @@ unsafe fn relower_twin_callers(up: *mut Unit, tc: &TwinCallers) {
 }
 
 /// SPEC-V: the owners of `ids` go first in the background checker's queue (rank 0 runs without
-/// waiting for quiet compiles): hot code waits seconds for its verdict, not the whole backlog
-fn prioritize_verdicts(u: &Unit, ids: &[u32]) {
+/// waiting for quiet compiles): hot code waits seconds for its verdict, not the whole backlog. An
+/// owner the checker never got (a closure's parent with no code of its own, a slot whose first code
+/// took a path that queues nothing: 39 of the city's rank requests) is queued here (owner thread).
+unsafe fn prioritize_verdicts(up: *mut Unit, ids: &[u32]) {
+    for &c in ids {
+        (&mut *up).note_first_borrowck(c, Some(0));
+    }
+    let u = &*up;
     let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
     let ranks: Vec<(DefId, Vec<TyId>, u32)> = ids.iter().filter_map(|&c| Some((u.verdict_owner(c)?, Vec::new(), 0))).collect();
     if !ranks.is_empty() {
@@ -13905,7 +13914,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     owner::publish(|| {
         let u = &*up;
         if u.fns[id as usize].unverified.load(Ordering::Relaxed) && matches!(u.verdict_state(id), Verdict::Pending) {
-            prioritize_verdicts(u, &[id]);
+            prioritize_verdicts(up, &[id]);
         }
     });
     trace_tier1_phase(id, "start");
