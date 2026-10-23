@@ -67,7 +67,7 @@ impl DomainHeap {
         self.inner.arena.detail()
     }
     /// Chunk states with resident bytes (arena.rs `states`).
-    pub fn states(&self) -> [usize; 21] {
+    pub fn states(&self) -> [usize; 24] {
         self.inner.arena.states()
     }
     pub fn range(&self) -> (usize, usize) {
@@ -567,6 +567,37 @@ mod tests {
             let trim: unsafe extern "C" fn(usize) -> i32 = std::mem::transmute(trim);
             trim(0);
             assert!(heap.stats().1 < committed, "the program's malloc_trim decommits the warm run");
+            enter(std::ptr::null());
+        }
+    }
+
+    /// Only dense chunks of a program heap get huge pages (`densify`): a chunk half full of live
+    /// blocks is marked once, a sparse one never, and one that turned sparse loses its mark.
+    #[test]
+    fn densify_marks_dense_chunks_only() {
+        symbol(b"relax_alloc");
+        let heap = DomainHeap::new().unwrap();
+        unsafe {
+            enter(&*heap);
+            // a sparse class: one block of 48 bytes; a dense one: 1.5 MB of 1000-byte blocks
+            let sparse = program_alloc(48, 8);
+            let dense: Vec<*mut u8> = (0..1500).map(|_| program_alloc(1000, 8)).collect();
+            for &p in &dense {
+                std::ptr::write_bytes(p, 1, 1000);
+            }
+            let first = heap.inner.arena.densify(64);
+            let again = heap.inner.arena.densify(64);
+            if cfg!(any(target_os = "linux", target_os = "android")) {
+                assert!(first >= 1, "the dense chunk is marked");
+            } else {
+                assert_eq!(first, 0);
+            }
+            assert_eq!(again, 0, "a marked chunk is not collapsed twice");
+            for p in dense {
+                program_dealloc(p, 1000, 8);
+            }
+            program_dealloc(sparse, 48, 8);
+            assert_eq!(heap.inner.arena.densify(64), 0);
             enter(std::ptr::null());
         }
     }

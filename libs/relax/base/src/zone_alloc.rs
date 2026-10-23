@@ -74,6 +74,13 @@ pub mod web;
 mod disabled {
     use std::alloc::Layout;
     pub struct ScratchGuard;
+    pub struct FreshGuard;
+    impl Drop for FreshGuard {
+        fn drop(&mut self) {}
+    }
+    pub fn fresh_chunks() -> FreshGuard {
+        FreshGuard
+    }
     #[inline]
     pub fn enter_scratch() -> ScratchGuard {
         ScratchGuard
@@ -104,8 +111,12 @@ mod disabled {
     pub fn census() -> [usize; 11] {
         [0; 11]
     }
-    pub fn states() -> [usize; 21] {
-        [0; 21]
+    pub fn states() -> [usize; 24] {
+        [0; 24]
+    }
+    pub fn mark_old() {}
+    pub fn is_old(_: *const u8) -> bool {
+        false
     }
     pub fn trim() {}
     pub fn detach_thread() {}
@@ -271,8 +282,25 @@ pub fn arena_census() -> ([usize; 11], [usize; 11]) {
 }
 
 /// The compiler and burst arenas' chunk states with resident bytes (arena.rs `states`).
-pub fn arena_states() -> ([usize; 21], [usize; 21]) {
+pub fn arena_states() -> ([usize; 24], [usize; 24]) {
     (compiler::states(), burst::states())
+}
+
+/// The compiler arena's committed chunks are old from now on (`arena_states`' old row).
+pub fn compiler_mark_old() {
+    compiler::mark_old()
+}
+
+/// Where block `p` lives: 0 a compiler-arena chunk marked old, 1 another compiler-arena chunk,
+/// 2 the burst arena, 3 any other heap (diagnostics: `memory compiler=1` placement rows).
+pub fn placement(p: *const u8) -> usize {
+    if compiler::owns(p as *mut u8) {
+        if compiler::is_old(p) { 0 } else { 1 }
+    } else if burst::owns(p as *mut u8) {
+        2
+    } else {
+        3
+    }
 }
 
 pub fn compiler_detail() -> (usize, usize, usize, usize) {
@@ -290,6 +318,12 @@ pub fn compiler_events() -> [usize; 9] {
 /// it emptied is released, as when a thread ends).
 pub fn compiler_hand_back() {
     compiler::detach_thread()
+}
+
+/// Compiler-arena blocks of the calling thread come from fresh chunks only until the guard drops
+/// (arena.rs `fresh_chunks`: a settle rebuild's new state, kept compact).
+pub fn compiler_fresh() -> impl Drop {
+    compiler::fresh_chunks()
 }
 
 /// `compiler_hand_back` for a thread about to wait (a worker with no work, a program thread

@@ -15376,7 +15376,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
         // the result leaves the job arena; the job's own copies die with it
         let c = copied_out(c);
-        let (left, cold_left) = crate::zone_alloc::copy_out(|| (left.clone(), cold_left.clone()));
+        let (left, cold_left, inlined, nounwind_used) = crate::zone_alloc::copy_out(|| (left.clone(), cold_left.clone(), inlined.clone(), nounwind_used.clone()));
         Ok((c.code, c.pc_map, c.relocs, (inlined, left, cold_left, c.frame_size, self_call, nounwind_used, profile_entry)))
     }));
     let t2 = cpu_ns();
@@ -20239,6 +20239,14 @@ impl PcMap {
         match &self.0 {
             PcBytes::Own(b) => b.len(),
             PcBytes::Mapped(..) => 0,
+        }
+    }
+
+    /// The map's own bytes, if it has any (memory placement reports).
+    pub fn own_ptr(&self) -> Option<*const u8> {
+        match &self.0 {
+            PcBytes::Own(b) if !b.is_empty() => Some(b.as_ptr()),
+            _ => None,
         }
     }
 }

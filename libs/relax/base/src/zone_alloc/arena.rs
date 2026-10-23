@@ -150,6 +150,8 @@ static HAND_BACK: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     /// The `HAND_BACK` epoch this thread's current chunks were last handed back at.
     static HAND_SEEN: Cell<u64> = const { Cell::new(0) };
+    /// This thread takes only fresh chunks, never ones listed with free slots (`fresh_chunks`).
+    static FRESH: Cell<bool> = const { Cell::new(false) };
     static DEPTH: Cell<usize> = const { Cell::new(0) };
     static CURRENT: Cell<[Current; CLASSES]> = const { Cell::new([NO_CURRENT; CLASSES]) };
     /// The thread's TLS destructors have started: its chunks are handed back and it takes no new
@@ -419,6 +421,22 @@ pub fn scratch(runtime: &crate::options::RuntimeOptions) -> ScratchGuard {
     enter_scratch()
 }
 
+/// Until the guard drops, this thread's compiler-arena blocks come from fresh chunks only: state
+/// built to replace old state (a settle rebuild's restore and replace) is not scattered into the
+/// old state's partly free chunks, which would then hold it -- one live block per page -- once the
+/// old state is dropped. The thread's current chunks are handed back at both ends.
+pub struct FreshGuard(bool, PhantomData<*mut ()>);
+impl Drop for FreshGuard {
+    fn drop(&mut self) {
+        DEFAULT.detach_thread();
+        let _ = FRESH.try_with(|f| f.set(self.0));
+    }
+}
+pub fn fresh_chunks() -> FreshGuard {
+    DEFAULT.detach_thread();
+    FreshGuard(FRESH.try_with(|f| f.replace(true)).unwrap_or(false), PhantomData)
+}
+
 /// A guard that enters nothing (the job arena is off).
 pub fn no_scratch() -> ScratchGuard {
     ScratchGuard(false, PhantomData)
@@ -465,6 +483,9 @@ struct Chunk {
     /// Domain heaps: the chunk's pages are marked for huge pages (`densify`). The mark belongs to
     /// the address range, not to one use of the chunk: it is cleared when the pages go back.
     huge: AtomicBool,
+    /// Committed before the last `mark_old` (a settle rebuild): `states` counts what such chunks
+    /// still hold apart (the cold state's survivors). Cleared when the chunk is carved anew.
+    old: AtomicBool,
     state: Mutex<State>,
 }
 unsafe impl Sync for Chunk {}
@@ -587,7 +608,13 @@ impl Partial {
     }
 }
 
-/// Granule of the page release: a multiple of every OS page size in use (4 KB, 16 KB).
+/// Granule of the page release: the OS page on x86-64 (4 KB), else a multiple of every page
+/// size in use there (4 KB, 16 KB). A chunk that keeps a few scattered blocks pins one granule
+/// each: after a settle rebuild the compiler arena held 120-220 MB live in 575-720 MB resident
+/// (Sandbox race) at 16 KB.
+#[cfg(target_arch = "x86_64")]
+const GRANULE: usize = 4 << 10;
+#[cfg(not(target_arch = "x86_64"))]
 const GRANULE: usize = 16 << 10;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
@@ -834,6 +861,7 @@ impl Arena {
                     live: AtomicUsize::new(0),
                     in_part: AtomicBool::new(false),
                     huge: AtomicBool::new(false),
+                    old: AtomicBool::new(false),
                     state: Mutex::new(State {
                         released: true,
                         generation: 0,
@@ -1246,9 +1274,23 @@ impl Arena {
     /// (mincore): rows [attached to a thread, listed for reuse, released (warm), detached and
     /// unlisted (full)], columns [chunks, touched bytes, live slot bytes, resident bytes]; then
     /// [large runs, committed, resident]; then [sparse chunks (live slots under 1/8 of touched),
-    /// their resident bytes] (`memory`'s arena states).
-    pub fn states(&self) -> [usize; 21] {
-        let mut c = [0usize; 21];
+    /// their resident bytes]; then [chunks committed before the last `mark_old`, their live slot
+    /// bytes, their resident bytes] (`memory`'s arena states).
+    /// Does block `p` (of this arena) lie in a chunk marked old (`mark_old`)?
+    pub fn is_old(&self, p: *const u8) -> bool {
+        let base = self.base.load(Ordering::Relaxed);
+        let off = (p as usize).wrapping_sub(base);
+        base != 0 && off < RESERVE && self.headers[off / CHUNK].old.load(Ordering::Relaxed)
+    }
+    /// Every committed chunk is old from now on (`states`' last row; a settle rebuild calls it).
+    pub fn mark_old(&self) {
+        for h in self.headers.iter() {
+            let s = lock(&h.state);
+            h.old.store(s.committed != 0, Ordering::Relaxed);
+        }
+    }
+    pub fn states(&self) -> [usize; 24] {
+        let mut c = [0usize; 24];
         let base = self.base.load(Ordering::Relaxed);
         if base == 0 {
             return c;
@@ -1283,6 +1325,11 @@ impl Arena {
             if row != 2 && live * s.stride * 8 < bump {
                 c[19] += 1;
                 c[20] += res;
+            }
+            if row != 2 && h.old.load(Ordering::Relaxed) {
+                c[21] += 1;
+                c[22] += live * s.stride;
+                c[23] += res;
             }
         }
         c
@@ -1651,7 +1698,7 @@ impl Arena {
         if cache && COMPILER && !self.dynamic {
             self.register_exit();
         }
-        if small && COMPILER {
+        if small && COMPILER && !(!self.dynamic && FRESH.try_with(|f| f.get()).unwrap_or(false)) {
             while let Some(i) = self.partial_pop(class) {
                 let p = self.from_partial(i, stride, class, requested, cache);
                 if !p.is_null() {
@@ -1734,6 +1781,7 @@ impl Arena {
                 dirty: warm_large.is_some(),
             };
             h.live.store(1, Ordering::Relaxed);
+            h.old.store(false, Ordering::Relaxed);
             if warm.is_none() {
                 self.committed.fetch_add(committed, Ordering::Relaxed);
                 self.chunks.fetch_add((committed + CHUNK - 1) / CHUNK, Ordering::Relaxed);
@@ -2389,8 +2437,14 @@ pub fn detail() -> (usize, usize, usize, usize) {
 pub fn census() -> [usize; 11] {
     DEFAULT.census()
 }
-pub fn states() -> [usize; 21] {
+pub fn states() -> [usize; 24] {
     DEFAULT.states()
+}
+pub fn mark_old() {
+    DEFAULT.mark_old()
+}
+pub fn is_old(p: *const u8) -> bool {
+    DEFAULT.is_old(p)
 }
 #[inline(always)]
 pub unsafe fn alloc(l: Layout) -> *mut u8 {

@@ -253,8 +253,13 @@ pub(crate) fn run(up: *mut Unit) -> Outcome {
 
     // 2. the restore (the image and the stores only)
     let t = Instant::now();
+    // what the old state's chunks still hold after the rebuild is counted apart (`memory` arena
+    // states: "old"); the new state goes into chunks carved from here on
+    crate::zone_alloc::compiler_mark_old();
     let fresh = {
         let _c = crate::zone_alloc::compiler();
+        // the new state in fresh chunks: compact, not in the old state's partly free ones
+        let _f = crate::zone_alloc::compiler_fresh();
         let restored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let images = crate::cache::FrontImages::open(&sess.options)?;
             images.restore_collected(&sess, &pre)
@@ -310,6 +315,7 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     let Some(_front) = super::front_write_within(1000) else {
         return Err("a front reader held on for 1 s".into());
     };
+    let _f = crate::zone_alloc::compiler_fresh();
     let u = &mut *up;
     let now = Counts::of(&u.prog, &u.tcx);
     if !before.same_program(&now) {
