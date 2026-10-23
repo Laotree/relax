@@ -274,14 +274,40 @@ fn run_parts(p: &Profile, lane: usize, t0: u64, t1: u64) -> Vec<(String, u64)> {
     let mut v: Vec<(String, u64)> = p.exclusive(lane, t0, t1).into_iter().filter(|x| !x.1).map(|(n, _, ns)| (p.s(n).to_string(), ns)).collect();
     let covered: u64 = p.lanes[lane].segs_in(0, t0, t1).iter().filter(|s| !s.wait).map(|s| s.t1.min(t1).saturating_sub(s.t0.max(t0))).sum();
     let mut gap = (t1 - t0).saturating_sub(covered);
-    if main {
-        let known = main_known_from(p, lane);
-        if t0 < known {
-            let cut = t1.min(known);
+    // before the lane's first kept record nothing is known about it (its ring wrapped): the main
+    // lane's frames say what it did; another lane's time there is not recorded (not idle, not
+    // "between requests")
+    let known = main_known_from(p, lane);
+    if t0 < known {
+        let cut = t1.min(known);
+        if main {
             for (what, ns) in summary_parts(p, t0, cut) {
                 add_part(&mut v, &what, ns);
             }
-            gap = gap.saturating_sub(cut - t0);
+        } else {
+            add_part(&mut v, "not recorded (before its first kept record)", cut - t0);
+        }
+        gap = gap.saturating_sub(cut - t0);
+    }
+    if gap > 0 && main {
+        // the frames' summaries know the idle time (gaps longer than the recorder's threshold
+        // between UI phases): a gap past it is UI work outside the phases' spans
+        let fs: Vec<&Frame> = p.frames[p.frames.partition_point(|f| f.t1 <= t0)..].iter().take_while(|f| f.t0 < t1).collect();
+        if !fs.is_empty() && fs.iter().all(|f| f.summary) {
+            let mut idle = 0u64;
+            let mut inside = 0u64;
+            for f in &fs {
+                let span = f.t1.saturating_sub(f.t0).max(1);
+                let o = f.t1.min(t1).saturating_sub(f.t0.max(t0));
+                inside += o;
+                idle += (f.idle as u128 * o as u128 / span as u128) as u64;
+            }
+            // (time between frames is the event loop waiting)
+            idle += (t1 - t0).saturating_sub(inside);
+            let idle = idle.min(gap);
+            add_part(&mut v, "idle", idle);
+            add_part(&mut v, "UI work without spans", gap - idle);
+            gap = 0;
         }
     }
     if gap > 0 {
@@ -314,7 +340,7 @@ fn add_part(v: &mut Vec<(String, u64)>, what: &str, ns: u64) {
     }
 }
 
-/// The main lane's spans are known from here on: its first kept record (a lane with none: never).
+/// A lane's spans are known from here on: its first kept record (a lane with none: never).
 fn main_known_from(p: &Profile, lane: usize) -> u64 {
     match p.lanes[lane].first_t {
         0 => u64::MAX,
@@ -643,16 +669,38 @@ fn frame(p: &Profile, w: &str) -> Ans {
             }
         }
     }
-    let mut t = Table::new(&["#", "lane", "ms", "critical path step"]);
-    let shown = steps.len().min(12);
-    for (k, (l, what, ns)) in steps.iter().enumerate().take(shown) {
-        t.row(vec![(k + 1).to_string(), format!("T{}", p.lanes[*l].thread.tid), ms(*ns), lg.name(what)]);
-    }
-    out.title("critical path (oldest first)");
-    out.table(t);
-    if steps.len() > shown {
-        let rest: u64 = steps[shown..].iter().map(|x| x.2).sum();
-        out.note(format!("+{} steps, {} ms", steps.len() - shown, ms(rest)));
+    // a long path (thousands of short waits on the owner) reads best summed by step
+    let many = steps.len() > 12;
+    if many {
+        let n = steps.len();
+        let mut by: Vec<(usize, String, u64, usize)> = Vec::new();
+        for (l, what, ns) in steps.drain(..) {
+            match by.iter_mut().find(|x| x.0 == l && x.1 == what) {
+                Some(x) => {
+                    x.2 += ns;
+                    x.3 += 1;
+                }
+                None => by.push((l, what, ns, 1)),
+            }
+        }
+        by.sort_by(|a, b| b.2.cmp(&a.2));
+        let mut t = Table::new(&["lane", "ms", "times", "critical path step"]);
+        for (l, what, ns, k) in by.iter().take(12) {
+            t.row(vec![format!("T{}", p.lanes[*l].thread.tid), ms(*ns), k.to_string(), lg.name(what)]);
+        }
+        out.title(format!("critical path by step ({} steps, largest first)", n));
+        out.table(t);
+        if by.len() > 12 {
+            let rest: u64 = by[12..].iter().map(|x| x.2).sum();
+            out.note(format!("+{} kinds of steps, {} ms", by.len() - 12, ms(rest)));
+        }
+    } else {
+        let mut t = Table::new(&["#", "lane", "ms", "critical path step"]);
+        for (k, (l, what, ns)) in steps.iter().enumerate() {
+            t.row(vec![(k + 1).to_string(), format!("T{}", p.lanes[*l].thread.tid), ms(*ns), lg.name(what)]);
+        }
+        out.title("critical path (oldest first)");
+        out.table(t);
     }
     // a frame from before the main lane's first kept span: what its summary says
     if f.t0 < main_known_from(p, main) {
@@ -696,7 +744,8 @@ fn frame(p: &Profile, w: &str) -> Ans {
     let (inst, cns, tiers) = jit_counts(p, f.t0, f.t1);
     let main_compile = p.compile_ns_in(main, f.t0, f.t1);
     if inst > 0 || main_compile > 0 {
-        out.note(format!("jit in frame: {} installs ({}), main lane compiling {} ms, worker compiles {} ms", inst, tiers_text(&tiers), ms(main_compile), ms(cns)));
+        let (prov, _, replaced) = provenance(p, f.t0, f.t1);
+        out.note(format!("jit in frame: {} installs ({}; from: {}; {} replaced earlier code), main lane compiling {} ms, worker compiles {} ms", inst, tiers_text(&tiers), provenance_text(&prov), replaced, ms(main_compile), ms(cns)));
     }
     let (gp, gbusy) = p.gpu_lane_busy(f.t0, f.t1);
     if gbusy > 0 {
@@ -836,13 +885,51 @@ fn top_fn(p: &Profile, t0: u64, t1: u64, wname: &str, n: usize, tids: Option<&[u
     out
 }
 
+fn origin_name(o: u8) -> &'static str {
+    jit::ORIGINS.get(o as usize).copied().filter(|n| *n != "?").unwrap_or("unknown")
+}
+
+/// Where the installs of [t0, t1) came from: per origin (fresh compile, warm cache, warm image,
+/// live patch, inspect) the installs by tier; and the installs that replaced code the slot had
+/// earlier in the recording, by (tier origin before -> after).
+fn provenance(p: &Profile, t0: u64, t1: u64) -> (Vec<(u8, usize, HashMap<u8, usize>)>, Vec<(String, usize)>, usize) {
+    let mut by: HashMap<u8, (usize, HashMap<u8, usize>)> = HashMap::new();
+    // the code each slot had before (the whole recording up to t1: what an install replaced)
+    let mut had: HashMap<u64, (u8, u8)> = HashMap::new();
+    let mut moves: HashMap<String, usize> = HashMap::new();
+    let mut replaced = 0;
+    for e in p.jit_in(p.t_min.min(t0), t1).iter().filter(|e| e.ev == jit::INSTALL) {
+        let prev = had.insert(e.b, (e.tier, e.origin));
+        if e.t < t0 {
+            continue;
+        }
+        let x = by.entry(e.origin).or_default();
+        x.0 += 1;
+        *x.1.entry(e.tier).or_default() += 1;
+        if let Some((pt, po)) = prev {
+            replaced += 1;
+            *moves.entry(format!("{} {} -> {} {}", Profile::tier_name(pt), origin_name(po), Profile::tier_name(e.tier), origin_name(e.origin))).or_default() += 1;
+        }
+    }
+    let mut v: Vec<(u8, usize, HashMap<u8, usize>)> = by.into_iter().map(|(o, (n, t))| (o, n, t)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut m: Vec<(String, usize)> = moves.into_iter().collect();
+    m.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    (v, m, replaced)
+}
+
+/// `fresh 9k, warm-cache 30k` for an answer's line.
+fn provenance_text(v: &[(u8, usize, HashMap<u8, usize>)]) -> String {
+    v.iter().map(|(o, n, _)| format!("{} {}", origin_name(*o), n)).collect::<Vec<_>>().join(", ")
+}
+
 fn top_jit(p: &Profile, t0: u64, t1: u64, wname: &str, n: usize) -> Ans {
     let ev = p.jit_in(t0, t1);
     if ev.is_empty() {
         return format!("no JIT events in {wname} (a native app, or nothing compiled)\nmore: summary").into();
     }
-    // per fn: compile ns, installs, last tier, code bytes; its source
-    let mut per: HashMap<u32, (u64, usize, u8, u64)> = HashMap::new();
+    // per fn: compile ns, installs, last tier, code bytes, installs by origin; its source
+    let mut per: HashMap<u32, (u64, usize, u8, u64, HashMap<u8, usize>)> = HashMap::new();
     let mut src: HashMap<u32, u32> = HashMap::new();
     let mut open: HashMap<(u32, u32), u64> = HashMap::new();
     for e in ev {
@@ -860,6 +947,7 @@ fn top_jit(p: &Profile, t0: u64, t1: u64, wname: &str, n: usize) -> Ans {
                 x.1 += 1;
                 x.2 = e.tier;
                 x.3 += e.a;
+                *x.4.entry(e.origin).or_default() += 1;
                 if e.src != 0 {
                     src.insert(e.name, e.src);
                 }
@@ -868,28 +956,64 @@ fn top_jit(p: &Profile, t0: u64, t1: u64, wname: &str, n: usize) -> Ans {
         }
     }
     let (installs, cns, tiers) = jit_counts(p, t0, t1);
-    let mut v: Vec<(u32, (u64, usize, u8, u64))> = per.into_iter().collect();
-    v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(b.1 .1.cmp(&a.1 .1)));
+    let (prov, moves, replaced) = provenance(p, t0, t1);
+    let mut v: Vec<(u32, (u64, usize, u8, u64, HashMap<u8, usize>))> = per.into_iter().collect();
+    v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(b.1 .1.cmp(&a.1 .1)).then(a.0.cmp(&b.0)));
     let mut lg = Legend::default();
-    let mut out = Ans::new(format!("{} installs in {} ({}), {} ms in compile jobs off the main lane", installs, wname, tiers_text(&tiers), ms(cns)));
+    let mut out = Ans::new(format!("{} installs in {} ({}; from: {}), {} ms in compile jobs off the main lane", installs, wname, tiers_text(&tiers), provenance_text(&prov), ms(cns)));
+    // where the code came from, by tier (fresh = compiled in this run)
+    let mut tier_ids: Vec<u8> = tiers.keys().copied().collect();
+    tier_ids.sort();
+    let mut head: Vec<String> = vec!["from".into()];
+    head.extend(tier_ids.iter().map(|t| Profile::tier_name(*t).to_string()));
+    head.push("all".into());
+    let hr: Vec<&str> = head.iter().map(String::as_str).collect();
+    let mut t = Table::new(&hr);
+    for (o, k, by) in &prov {
+        let mut row = vec![origin_name(*o).to_string()];
+        row.extend(tier_ids.iter().map(|t| by.get(t).copied().unwrap_or(0).to_string()));
+        row.push(k.to_string());
+        t.row(row);
+    }
+    out.table(t);
+    if prov.iter().any(|x| x.0 == 0) {
+        out.note("unknown = the producer did not say where the code came from");
+    }
+    // the producer's warm-cache outcomes (flight recordings: misses by reason)
+    if let Some(e) = p.events.iter().rev().find(|e| p.s(e.cat) == "jit.cache") {
+        out.note(e.text.clone());
+    }
+    if replaced > 0 {
+        let m: Vec<String> = moves.iter().take(5).map(|(w, k)| format!("{w} {k}")).collect();
+        out.note(format!("{} installs replaced code their slot had earlier in the recording: {}{}", replaced, m.join(", "), if moves.len() > 5 { format!(" (+{} kinds)", moves.len() - 5) } else { String::new() }));
+    }
     // per-fn compile time only where the producer sent compile begin / end events
     let timed = v.iter().any(|x| x.1 .0 > 0);
     let mut head = vec!["fn"];
     if timed {
         head.push("compile ms");
     }
-    head.extend(["installs", "tier now", "code KB", "source"]);
+    head.extend(["installs", "tier now", "from", "code KB"]);
+    let files = !src.is_empty();
+    if files {
+        head.push("file");
+    }
     let mut t = Table::new(&head);
-    for (name, (ns, k, tier, bytes)) in v.iter().take(n) {
+    for (name, (ns, k, tier, bytes, origins)) in v.iter().take(n) {
         let mut row = vec![lg.name(p.s(*name))];
         if timed {
             row.push(ms(*ns));
         }
+        let mut o: Vec<(&u8, &usize)> = origins.iter().collect();
+        o.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let from = o.iter().map(|(o, k)| format!("{} {}", origin_name(**o), k)).collect::<Vec<_>>().join(", ");
+        row.extend([k.to_string(), Profile::tier_name(*tier).to_string(), from, sig(*bytes as f64 / 1024.0)]);
         // the file's name and line (the full path is the row's link)
         let full = src.get(name).map(|s| p.s(*s)).unwrap_or("");
-        let parts: Vec<&str> = full.rsplit('/').take(2).collect();
-        let shown = parts.into_iter().rev().collect::<Vec<_>>().join("/");
-        row.extend([k.to_string(), Profile::tier_name(*tier).to_string(), sig(*bytes as f64 / 1024.0), shown]);
+        if files {
+            let parts: Vec<&str> = full.rsplit('/').take(2).collect();
+            row.push(parts.into_iter().rev().collect::<Vec<_>>().join("/"));
+        }
         let link = (!full.is_empty()).then(|| format!("source {} {}", full, p.s(*name)));
         t.row_link(row, link);
     }
@@ -898,7 +1022,7 @@ fn top_jit(p: &Profile, t0: u64, t1: u64, wname: &str, n: usize) -> Ans {
         out.note(format!("+{} fns not shown", v.len() - n));
     }
     out.note(lg.render());
-    out.more("top cpu lane=compiler  frames");
+    out.more("top cpu lane=compiler  frames  events cat=cache");
     out
 }
 

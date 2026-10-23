@@ -964,3 +964,56 @@ pub(crate) fn owner_rows(owners: Vec<(super::patches::Owner, String)>) -> Option
         rows
     })
 }
+
+/// `cache`: where this session's code came from -- the warm cache's lookups by outcome (misses by
+/// reason), the startup image, and the installed code by tier and origin (fresh = compiled in this
+/// run). Markdown, answer first.
+pub fn cmd_cache(_req: &Req, out: &mut Out) {
+    let up = crate::jit::current_unit();
+    if up.is_null() {
+        return out.err("no running unit");
+    }
+    let r = crate::owner::call_within(crate::owner::Class::Job, 10_000, move || -> Vec<String> {
+        let u = unsafe { &*up };
+        // installed code by (origin, tier)
+        let mut by: std::collections::BTreeMap<(u8, u8), u64> = Default::default();
+        let mut tiers: std::collections::BTreeSet<u8> = Default::default();
+        for id in 0..u.fns.len() as u32 {
+            let f = &u.fns[id as usize];
+            if f.compiled && f.code_len > 0 {
+                let k = kind_at(u, f.code);
+                *by.entry((k.origin, k.tier)).or_default() += 1;
+                tiers.insert(k.tier);
+            }
+        }
+        let mut rows = vec![crate::cache::warm_summary()];
+        rows.push(String::new());
+        let mut head = vec!["installed code from".to_string()];
+        head.extend(tiers.iter().map(|t| crate::jit::CodeKind::new(*t, 0).tier_name().to_string()));
+        head.push("all".into());
+        rows.push(format!("| {} |", head.join(" | ")));
+        rows.push(format!("|{}", "---|".repeat(head.len())));
+        let origins: std::collections::BTreeSet<u8> = by.keys().map(|k| k.0).collect();
+        for o in origins {
+            let mut row = vec![crate::jit::CodeKind::new(0, o).origin_name().to_string()];
+            let mut all = 0;
+            for t in &tiers {
+                let n = by.get(&(o, *t)).copied().unwrap_or(0);
+                all += n;
+                row.push(n.to_string());
+            }
+            row.push(all.to_string());
+            rows.push(format!("| {} |", row.join(" | ")));
+        }
+        rows
+    });
+    match r {
+        Some(rows) => {
+            for l in rows {
+                out.line(&l);
+            }
+            out.always("more: pf jit  versions <fn>  why-tier <fn>");
+        }
+        None => out.err(&format!("the owner did not answer in 10 s ({})", crate::owner::serving_note())),
+    }
+}

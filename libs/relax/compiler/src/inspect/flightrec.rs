@@ -613,6 +613,8 @@ pub(super) fn encode(cur: &mut Cursors, enc: &mut super::pstream::StreamEnc, min
         cur.run_sent = true;
         if let Some((args, cwd, env)) = RUN.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             run_evs = vec![("run.args", args), ("run.cwd", cwd), ("run.env", env), ("run.home", crate::gitstore::relax_home().display().to_string())];
+            // where the session's code came from, as of this recording (warm-cache outcomes)
+            run_evs.push(("jit.cache", crate::cache::warm_summary()));
         }
     }
     let mut ev_payload = None;
