@@ -11,6 +11,8 @@ impl Interp<'_> {
         while let Some(a) = todo.pop() {
             if !seen.insert(a) { continue; }
             let al = &self.allocs[a as usize];
+            // (memory already in tcx -- another constant's or a static's -- is interned already)
+            if al.global { continue; }
             if !al.frags.is_empty() { return Err(Stop::Item(format!("encountered partial pointer in final value of {what}"))); }
             for &(_, p) in &al.ptrs {
                 let t = &self.allocs[p.alloc as usize];
@@ -21,7 +23,10 @@ impl Interp<'_> {
         let ty = self.frames_root_ty.unwrap_or_else(|| self.tcx.tys.unit);
         let place = MPlace { ptr: Ptr { prov: Some(Prov { alloc: root, shared: false }), off: 0 }, meta: None, ty, variant: None, packed: None };
         let mut visited = std::collections::HashSet::new();
-        match self.validate(place, String::new(), 0, &mut visited) {
+        self.validating = true;
+        let r = self.validate(place, String::new(), 0, &mut visited);
+        self.validating = false;
+        match r {
             Err(Stop::Item(m)) => Err(Stop::Item(format!("E0080: constructing invalid value of type {}: {m}", self.ty_str(ty)))),
             Err(Stop::Ub(_)) => unsupported("validity read"),
             r => r,
@@ -89,6 +94,9 @@ impl Interp<'_> {
                         if q.off + size > a.size() { return self.invalid(&path, "a dangling reference (going beyond the bounds of its allocation)".into()); }
                         if align > 1 && (a.align < align || q.off % align != 0) { return self.invalid(&path, format!("an unaligned reference (required {align} byte alignment but found {})", a.align.min(1u64 << q.off.trailing_zeros().min(63)))); }
                         if matches!(a.kind, Kind::Function(_)) { return self.invalid(&path, "a reference pointing to a function".into()); }
+                        // validity.rs check_safe_pointer: a static is checked on its own (static mode);
+                        // a constant does not look into mutable memory of one
+                        if let Kind::Static(_) = a.kind { if self.static_root.is_some() || a.mutable { return Ok(()); } }
                     }
                 }
                 if !visited.insert((q.prov.unwrap().alloc, q.off, pointee)) { return Ok(()); }

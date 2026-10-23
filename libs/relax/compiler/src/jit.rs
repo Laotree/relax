@@ -958,7 +958,7 @@ pub unsafe fn spec_seed_manifest(up: *mut Unit) {
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     // after the first present: what the earlier run installed after its first present (the
     // slots before it were linked as this run's start called them)
-    let list = owner::call_quick(owner::Class::App, || (&mut *up).cache.as_ref().map(|c| c.manifest[c.manifest_present..].to_vec()).unwrap_or_default());
+    let list = owner::call_quick(owner::Class::Program, || (&mut *up).cache.as_ref().map(|c| c.manifest[c.manifest_present..].to_vec()).unwrap_or_default());
     if list.is_empty() || !pipelined() || !ahead_policy().spec_cached {
         return;
     }
@@ -1055,7 +1055,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
     if std::env::var_os("MAKEPAD_RUN_PRELINK").map_or(false, |v| v == "0") || std::env::var_os("MAKEPAD_RUN_HINTS_RECORD").is_some() {
         return 0;
     }
-    let prelinked = owner::call(owner::Class::App, || {
+    let prelinked = owner::call(owner::Class::Program, || {
         let usable = (&*up).cache.as_ref().map_or(false, |c| c.mode != crate::cache::Mode::Verify && c.startup_manifest_valid());
         if !usable {
             return None;
@@ -1188,7 +1188,7 @@ fn ids_pending_here() -> bool {
     if owner::is_owner() {
         return true;
     }
-    owner::call(owner::Class::App, || ());
+    owner::call(owner::Class::Program, || ());
     false
 }
 
@@ -2228,7 +2228,7 @@ fn rt_compile(slot: u64) -> u64 {
     // compiler thread-locals are gone, so the whole build runs on the owner (only the request
     // touches this thread's state, through try_with)
     if in_thread_exit() && !owner::is_owner() {
-        return owner::call(owner::program_class(), || unsafe { compile_slot(UNIT, slot as u32) });
+        return owner::call(owner::Class::Program, || unsafe { compile_slot(UNIT, slot as u32) });
     }
     let _frame = crate::inspect::timeline::CompileMark::begin();
     unsafe {
@@ -4947,10 +4947,34 @@ impl Unit {
         }
     }
 
+    /// relax_types::const_eval::interp for a non-generic constant, static or anonymous constant of a
+    /// validated crate; false when it reported an error.
+    fn check_initializer(&mut self, d: DefId) -> bool {
+        use relax_types::const_eval::interp::{check_item, Outcome};
+        let def = self.prog.def(d);
+        if !self.prog.crates[def.krate as usize].validate || !matches!(def.kind, DefKind::Const | DefKind::Static | DefKind::AnonConst) { return true; }
+        match check_item(&self.prog, &self.tcx, d) {
+            Outcome::Error(span, msg) => {
+                let e = if msg.starts_with('E') { self.prog.record_error(span.file, span.lo, "typeck", msg) } else { self.prog.record_uncoded_error(span.file, span.lo, "typeck", msg) };
+                self.errors.push(e);
+                false
+            }
+            Outcome::Unsupported(why) => {
+                if std::env::var_os("MAKEPAD_RUN_INTERP_TRACE").is_some() { eprintln!("interp: {}: unsupported: {why}", self.prog.def_path(d)); }
+                true
+            }
+            Outcome::Ok => true,
+        }
+    }
+
     /// Runs the initializer of const/static `d` into `buf`.
     fn run_init(&mut self, d: DefId, args: Vec<TyId>, buf: u64) -> Option<u64> {
         owner::pure_note(owner::PURE_BG_EVAL);
         owner::forbid_in_publish("initializer", u32::MAX);
+        // `makepad check`: the check-mode interpreter first (rustc's CTFE undefined-behaviour,
+        // mutable-global and final-value checks; diagnostics only). An evaluation it rejects is not
+        // run here, as rustc stops at the error.
+        if self.prog.session.options.const_fuel && args.is_empty() && !self.check_initializer(d) { return None; }
         let _census_context = self.exec_context(false);
         let options = &self.prog.session.clone().options;
         // Initializers outside the CTFE subset already have cached executable
@@ -5963,7 +5987,7 @@ unsafe fn compile_slot_on_stack(up: *mut Unit, id: u32) -> u64 {
         let a = compile_slot_on_stack_rt(up, id);
         let upn = up as usize;
         if realtime_on() {
-            owner::post(owner::Class::Main, move || unsafe { realtime_reach(upn as *mut Unit, vec![id], "miss") });
+            owner::post(owner::Class::Program, move || unsafe { realtime_reach(upn as *mut Unit, vec![id], "miss") });
         }
         let dt = wall_ns() - t;
         crate::postframe::rt_compile(t, dt);
@@ -6029,7 +6053,7 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
         };
     }
     let _startup = StartupCompile::foreground();
-    let class = owner::program_class();
+    let class = owner::Class::Program;
     // the slot's body (and its small callees') type check runs before its front: other threads
     // keep compiling meanwhile. Code linked ahead or found in the disk cache needs no front end:
     // that is tried first (in a unit call: a check without it saw no cache and type-checked
@@ -6426,7 +6450,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                     // present, every program thread's after it): its entry (slot keys, dependency
                     // certificate) is encoded later, in background batches (drain_cache_records)
                     let foreground = if FIRST_PRESENT.load(Ordering::Acquire) {
-                        matches!(owner::serving().0, owner::Class::Main | owner::Class::App) || owner::serving().0 == owner::Class::Publish && !owner::serving_background()
+                        owner::serving().0 == owner::Class::Program || owner::serving().0 == owner::Class::Publish && !owner::serving_background()
                     } else {
                         startup_phase() && owner::for_main()
                     };
@@ -9788,7 +9812,7 @@ pub fn start_completion(up: *mut Unit, runtime: &crate::options::RuntimeOptions)
             // Completion is speculative: let demanded code (including the quit
             // handler and destructors) run between files (one file per request). A load is
             // structural work (a front write), so it is a program-class request, not a publish.
-            let reloading = owner::call(owner::Class::App, || {
+            let reloading = owner::call(owner::Class::Program, || {
                 let reloading = RELOADING.load(Ordering::Acquire) > 0;
                 unsafe {
                     if !reloading && !crate::preempt::is_stopped() && tier1_workers_ready() && !owner::nested() && (*up).prog.skipped_files.contains_key(&m) { load_modules(up, &[m], "completion"); }
@@ -9804,7 +9828,7 @@ pub fn start_completion(up: *mut Unit, runtime: &crate::options::RuntimeOptions)
 
 /// `makepad check` checks every body: the skipped files are loaded first (unit lock).
 pub unsafe fn load_all_skipped(up: *mut Unit) {
-    owner::call(owner::Class::App, || {
+    owner::call(owner::Class::Program, || {
         // a loaded file's own skipped `mod` children are skipped files in turn
         loop {
             let mods: Vec<u32> = (*up).prog.skipped_files.keys().copied().collect();
@@ -9818,7 +9842,7 @@ pub unsafe fn load_all_skipped(up: *mut Unit) {
 /// reads); other crates' files stay skipped unless a check needs them (check.rs loads them all
 /// and checks again then).
 pub unsafe fn load_skipped_of(up: *mut Unit, crates: &[u32]) {
-    owner::call(owner::Class::App, || loop {
+    owner::call(owner::Class::Program, || loop {
         let prog = &(*up).prog;
         let mods: Vec<u32> = prog.skipped_files.keys().copied().filter(|m| crates.contains(&prog.mods[*m as usize].krate)).collect();
         if mods.is_empty() { break; }
@@ -11666,7 +11690,7 @@ impl Drop for Unit {
                 while !TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
                     std::thread::yield_now();
                 }
-                owner::call(owner::Class::App, || {
+                owner::call(owner::Class::Program, || {
                     if unsafe { UNIT } == me {
                         unsafe { UNIT = std::ptr::null_mut() };
                     }
@@ -11697,7 +11721,7 @@ impl Drop for Unit {
 /// alone. Called with no unit lock held.
 pub unsafe fn retire_unit(up: *mut Unit) {
     pause_compile_jobs(false);
-    owner::call(owner::Class::App, || {
+    owner::call(owner::Class::Program, || {
         (&mut *up).flush_cache_records();
         (&mut *up).retired = true;
         if SPEC_UNIT.load(Ordering::Acquire) == up {
@@ -13408,7 +13432,7 @@ fn rt_hot(slot: u64) -> u64 {
             ensure_sufficient_stack(|| {
                 // One unit call for the whole build, its back end included. Concurrent
                 // callers wait for it.
-                owner::call(owner::program_class(), || {
+                owner::call(owner::Class::Program, || {
                     if (*rec.add(3)).load(Ordering::Acquire) == T_REPLAY {
                         TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
                         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_tier1(up, slot as u32)));
@@ -13904,7 +13928,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // exception to rule I-PUB (OWNERARCH.DESIGN.md: deterministic A/Bs only): a program-class
     // request, not a publish.
     if t1prof_replay(options) && !owner::is_owner() {
-        return owner::call(owner::Class::App, || compile_tier1(up, id));
+        return owner::call(owner::Class::Program, || compile_tier1(up, id));
     }
     // SPEC-V: unverified code gets O3 code too, built as it is (Unit::o3_allowed)
     if !owner::publish(|| (&*up).o3_allowed(id)) {
@@ -13982,7 +14006,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let epoch0 = PATCH_EPOCH.load(Ordering::SeqCst);
     let mut rounds = 0u32;
     let mut needs: Vec<u32> = Vec::new();
+    // a round's walk state between its publishes, and "the last publish stopped mid-walk"
+    let walk = std::cell::RefCell::new(None);
+    let resume = std::cell::Cell::new(false);
     let snapped = loop {
+    if !resume.replace(false) {
     fronts.borrow_mut().clear();
     splits.borrow_mut().clear();
     rounds += 1;
@@ -13991,6 +14019,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         if fronted.insert(s) {
             prefront_slot(&front, s);
         }
+    }
     }
     // a take (rule I-PUB): what needs a front the snapshot cannot hand back as `fronts` bails it
     // (the root's own front: fronted here once more; else the build is dropped)
@@ -14009,6 +14038,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         trace_tier1_phase(id, "snapshot");
         cost_name(up, id);
         compile_watch(Some((&format!("tier1 locked: {}", (&*up).fns[id as usize].name), 0)));
+        // a round's walk resumed where the last publish of the round stopped (WALK_ITEMS)
+        let resumed = walk.borrow_mut().take();
+        let (epoch, rir, version, t1key, sandboxed, mut callees, mut seen, src_toks, inline_all, t1_rec, mut frontier, mut level, mut idx) = if let Some(w) = resumed { w } else {
         if needs_rir(up) {
             if splittable(up, id, false) && split_tried.borrow_mut().insert((id, false)) {
                 splits.borrow_mut().push((id, RirMode::Tier0));
@@ -14107,11 +14139,13 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             let p = g.as_ref().unwrap();
             if p.replay { p.map.get(k).map(|e| (e.cold.clone(), e.snap.clone(), e.single.clone())) } else { None }
     });
-    let mut input_pins = Vec::new();
-    let mut ensure_rir = |c: u32, force: bool, callers: &[u32]| {
-        // Each prepared callee stays readable until the final Arc snapshots exist.
-        TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(c);
-        input_pins.push(TierActive(c));
+        let seen: std::collections::HashSet<u32> = callees.iter().copied().collect();
+        let frontier = callees.clone();
+        (epoch, rir, version, t1key, sandboxed, callees, seen, src_toks, inline_all, t1_rec, frontier, 0usize, 0usize)
+        };
+    // (no TIER_ACTIVE pins for the callees: the walk and the snapshot's Arc clones are one publish,
+    // and what reads TIER_ACTIVE to keep RIR (settle_drop, the O2 install) are publishes too)
+    let ensure_rir = |c: u32, force: bool, callers: &[u32]| {
         let u = &mut *up;
         u.sync_entry_ref(c);
         if u.fns[c as usize].rir.as_ref().is_some_and(|r| upgradable(r)) {
@@ -14180,15 +14214,23 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             TIER1_SNAP_BUILT[1].fetch_add(wall_ns() - t, Ordering::Relaxed);
         }
     };
-    let mut frontier = callees.clone();
     const LEVELS: usize = 16;
-    for level in 0..LEVELS {
-        if frontier.is_empty() {
-            break;
-        }
-        for &c in &frontier {
+    // a publish visits at most WALK_ITEMS callees (rule I-PUB: bounded by its item count); the
+    // round's next publish goes on from there (off the owner: replay walks a round in one)
+    let mut budget = if prefront { WALK_ITEMS } else { usize::MAX };
+    while level < LEVELS && !frontier.is_empty() {
+        while idx < frontier.len() {
+            if budget == 0 {
+                *walk.borrow_mut() = Some((epoch, rir, version, t1key, sandboxed, callees, seen, src_toks, inline_all, t1_rec, frontier, level, idx));
+                resume.set(true);
+                owner_ns.set(owner_ns.get() + cpu_ns() - s0);
+                return None;
+            }
+            budget -= 1;
+            let c = frontier[idx];
             let force = t1_rec.as_ref().is_some_and(|(_, snap, _)| snap.contains(&t1_key(up, c)));
             ensure_rir(c, force, &callees);
+            idx += 1;
         }
         if level == LEVELS - 1 {
             break;
@@ -14220,31 +14262,31 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                             relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(x), _, _) | relax_backend::rir::Inst::FnAddr(_, x) => x,
                             _ => continue,
                         };
-                        {
-                            if *x != id && !callees.contains(x) && callees.len() < 1024 {
-                                callees.push(*x);
-                                next.push(*x);
-                            }
+                        if *x != id && callees.len() < 1024 && seen.insert(*x) {
+                            callees.push(*x);
+                            next.push(*x);
                         }
                     }
                 }
             }
         }
         frontier = next;
+        level += 1;
+        idx = 0;
     }
     // Recorded descendants can be absent from the live traversal (different
     // O1 inlining). Resolve all known keys, repeating when lowering adds slots.
     if let Some((_, recorded, _)) = &t1_rec {
-        let mut seen = 0;
-        while seen < (&*up).fns.len() {
+        let mut done = 0;
+        while done < (&*up).fns.len() {
             let end = (&*up).fns.len();
-            for c in seen..end {
+            for c in done..end {
                 if recorded.contains(&t1_key(up, c as u32)) {
                     ensure_rir(c as u32, true, &callees);
-                    if !callees.contains(&(c as u32)) { callees.push(c as u32); }
+                    if seen.insert(c as u32) { callees.push(c as u32); }
                 }
             }
-            seen = end;
+            done = end;
         }
     }
     // candidates whose fronts (or O1 builds) this thread runs first: asked again after them
@@ -14309,7 +14351,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
     }
     t1_cold_keys.sort();
-    drop(input_pins);
     t1_cold_keys.dedup();
     t1_snap_keys.sort();
     t1_snap_keys.dedup();
@@ -14392,7 +14433,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     const O3_TAKE_ROUNDS: u32 = 16;
     let snapped = match taken {
         Ok((s, n)) => {
-            needs = n;
+            needs.extend(n);
             s
         }
         // the root's own front (its RIR was dropped since) or its O1 inline candidates': fronted
@@ -14418,6 +14459,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             break None;
         }
     };
+    if resume.get() {
+        continue;
+    }
     let more = std::mem::take(&mut *fronts.borrow_mut());
     let ups = std::mem::take(&mut *splits.borrow_mut());
     if snapped.is_some() || more.is_empty() && ups.is_empty() {
@@ -14442,11 +14486,21 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // optimisation here; the RIR stored by a finish. What was left out or failed is built by the
     // snapshot as before, or left out of it.
     // (a take: a candidate needing a front bails alone, inside, and is left to the snapshot)
-    let (preps, gave, more_needs): (Vec<(u32, Prep)>, Vec<u32>, Vec<u32>) = owner::publish_or_bail(|| {
-        let (p, g) = o3_candidates_begin(up, &ids);
-        (p, g, owner::take_needs())
-    }).unwrap_or_else(|_| (Vec::new(), ids.iter().map(|x| x.0).collect(), Vec::new()));
-    needs.extend(more_needs);
+    // (CAND_TAKE candidates per take: a publish is bounded by its item count)
+    let (mut preps, mut gave): (Vec<(u32, Prep)>, Vec<u32>) = (Vec::new(), Vec::new());
+    for chunk in ids.chunks(CAND_TAKE) {
+        match owner::publish_or_bail(|| {
+            let (p, g) = o3_candidates_begin(up, chunk);
+            (p, g, owner::take_needs())
+        }) {
+            Ok((p, g, n)) => {
+                preps.extend(p);
+                gave.extend(g);
+                needs.extend(n);
+            }
+            Err(_) => gave.extend(chunk.iter().map(|x| x.0)),
+        }
+    }
     {
         let mut so = split_out.borrow_mut();
         for x in &ids { so.insert(x.0, 3); }
@@ -14733,9 +14787,18 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 let speculative = spec_ctx.as_ref().is_some_and(|c| c.emitted.get());
                 // (inspect's builds are this session's: never cached)
                 if frame_size <= frame_max && !unverified && !speculative && !inspect_o3_on() {
-                    if let Some(mut c) = u.cache.take() {
-                        c.record_o3(u, id, &code, &relocs, &map, &inlined, &nounwind_used);
+                    // its key and certificate encoding in the bounded record batches (records_due),
+                    // not in this publish
+                    if let Some(c) = u.cache.take() {
+                        let tr = cpu_ns();
+                        let p = c.defer_record_o3(u, id, &code, &relocs, &map, &inlined, &nounwind_used);
                         u.cache = Some(c);
+                        if let Some(p) = p {
+                            u.pending_cache_records.push(Some(p));
+                            PENDING_RECORDS.fetch_add(1, Ordering::Relaxed);
+                        }
+                        O3_INSTALL_REC[0].fetch_add(1, Ordering::Relaxed);
+                        O3_INSTALL_REC[1].fetch_add(cpu_ns() - tr, Ordering::Relaxed);
                     }
                 }
                 u.fns[id as usize].o3.store(true, Ordering::Relaxed);
@@ -15014,15 +15077,15 @@ fn warmup() -> bool {
 
 /// A build for a program thread (not a speculative or tier-up worker's) after the first present.
 fn ahead_foreground() -> bool {
-    let class = if owner::is_owner() { owner::serving().0 } else { owner::program_class() };
-    FIRST_PRESENT.load(Ordering::Acquire) && matches!(class, owner::Class::Main | owner::Class::App) && !IS_WORKER.try_with(|w| w.get()).unwrap_or(false)
+    let class = if owner::is_owner() { owner::serving().0 } else { owner::Class::Program };
+    FIRST_PRESENT.load(Ordering::Acquire) && class == owner::Class::Program && !IS_WORKER.try_with(|w| w.get()).unwrap_or(false)
 }
 
 /// A program thread's lazy compile in the warm-up: built as the startup's are (baseline code, no
 /// inline candidates; hot code tiers up as startup code does), the cheapest code that runs.
 fn warmup_foreground() -> bool {
-    let class = if owner::is_owner() { owner::serving().0 } else { owner::program_class() };
-    matches!(class, owner::Class::Main | owner::Class::App) && !IS_WORKER.try_with(|w| w.get()).unwrap_or(false) && warmup()
+    let class = if owner::is_owner() { owner::serving().0 } else { owner::Class::Program };
+    class == owner::Class::Program && !IS_WORKER.try_with(|w| w.get()).unwrap_or(false) && warmup()
 }
 
 fn startup_holds_tier1() -> bool {
@@ -15966,6 +16029,9 @@ pub static CAND_SKIP: [AtomicU64; 27] = [const { AtomicU64::new(0) }; 27];
 fn cand_skip(i: usize) {
     CAND_SKIP[i].fetch_add(1, Ordering::Relaxed);
 }
+/// (instrument) O3 installs' cache records made inside the install publish: (count, owner cpu ns)
+pub static O3_INSTALL_REC: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
 pub(crate) fn cand_skip_summary() -> String {
     const N: [&str; 27] = ["building", "inflight", "build-err", "key", "unverified", "no-rir", "not-upgradable", "relower", "has-rir", "begin-err", "needs-front", "bail", "other", "PREPPED", "fin-epoch", "fin-building", "fin-not-replacing", "FIN-STORED", "fin-opt-err",
         "owner-up:no-split", "owner-up:gave", "owner-up:prepped", "owner-up:skipped", "owner-t0:no-split", "owner-t0:gave", "owner-t0:prepped", "owner-t0:skipped"];
@@ -15985,6 +16051,12 @@ fn splits_off_owner(u: &Unit, c: u32, upgrade: bool) -> bool {
         FnKey::Sandbox(_) => false,
     }
 }
+
+/// Callees one publish of an O3 snapshot's walk visits (the round goes on in the next publish)
+const WALK_ITEMS: usize = 128;
+
+/// O1 builds one take of an O3 snapshot prepares (o3_candidates_begin): a publish's item bound
+const CAND_TAKE: usize = 8;
 
 /// Takes an O3 snapshot gives a candidate whose preparation needed fronts: each round fronts the
 /// level of inline candidates the last one revealed (each round walks the frontier again)
@@ -19206,7 +19278,7 @@ mod allocator_swap_tests {
         let served = std::sync::Arc::new(AtomicBool::new(false));
         let s2 = served.clone();
         let other = std::thread::spawn(move || {
-            owner::call(owner::Class::App, || ());
+            owner::call(owner::Class::Program, || ());
             s2.store(true, Ordering::SeqCst);
         });
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -19352,7 +19424,7 @@ extern "C" fn __relax_realtime(root: usize, data: usize, meta: usize) {
         return;
     }
     let upn = up as usize;
-    owner::call(owner::program_class(), move || unsafe { realtime_mark(upn as *mut Unit, root as u64, data as u64, meta as u64) });
+    owner::call(owner::Class::Program, move || unsafe { realtime_mark(upn as *mut Unit, root as u64, data as u64, meta as u64) });
 }
 
 unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64) {
