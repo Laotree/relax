@@ -1653,12 +1653,12 @@ pub fn precise_capture_params(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String
     let ItemKind::Fn(sig, _, _) = ast.item(def.item).kind else { return Vec::new() };
     let Some(ret) = ast.fn_sig(sig).ret else { return Vec::new() };
     // the `use<..>` lists of the opaque types written in the return type
-    fn walk(ast: &crate::ast::Ast, t: crate::ast::TyId, out: &mut Vec<crate::ast::GenericArgsId>, depth: u32) {
+    fn walk(ast: &crate::ast::Ast, t: crate::ast::TyId, out: &mut Vec<(crate::ast::GenericArgsId, crate::ast::TyId)>, depth: u32) {
         if depth > 16 { return; }
-        let bounds = |bs: crate::ast::List<Bound>, out: &mut Vec<crate::ast::GenericArgsId>| {
+        let bounds = |bs: crate::ast::List<Bound>, out: &mut Vec<(crate::ast::GenericArgsId, crate::ast::TyId)>| {
             for b in ast.list(bs) {
                 match b {
-                    Bound::Use(a) => out.push(*a),
+                    Bound::Use(a) => out.push((*a, t)),
                     Bound::Trait { path, .. } => for s in ast.segs(path.segs) {
                         if let Some(GenericArgs::Angle(v)) = ast.gargs(s.args()) {
                             for a in ast.list(*v) { if let GenericArg::Type(x) | GenericArg::Binding(_, _, x) = a { walk(ast, *x, out, depth + 1); } }
@@ -1686,7 +1686,7 @@ pub fn precise_capture_params(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String
     if uses.is_empty() { return Vec::new(); }
     let env = tcx.declaration_env(prog, d);
     let mut errors = Vec::new();
-    for args in uses {
+    for (args, opaque_ty) in uses {
         let Some(GenericArgs::Angle(list)) = ast.gargs(args) else { continue };
         let mut listed: Vec<&str> = Vec::new();
         for a in ast.list(*list) {
@@ -1708,7 +1708,56 @@ pub fn precise_capture_params(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String
             };
             errors.push(prog.record_uncoded_error(def.file, ast.item(def.item).lo, "typeck", msg.to_string()));
         }
+        // check.rs check_opaque_precise_captures, lifetimes: a lifetime of the opaque that its bounds
+        // mention (a duplicated one the bounds named, or the parent's through `Self` / a projection,
+        // variances_of(opaque) Invariant) must be listed; the parent's copy of a listed one is shadowed
+        if matches!(ast.ty(opaque_ty), Ty::ImplTrait(_)) {
+            if let Some(&opaque) = prog.node_id_to_def_id.get(&(def.file, relax_front::def_collector::NodeId::OpaqueTy(opaque_ty))) {
+                errors.extend(precise_capture_lifetimes(prog, tcx, d, opaque, &listed, def.file, ast.item(def.item).lo));
+            }
+        }
     }
+    errors
+}
+
+fn precise_capture_lifetimes(prog: &Program, tcx: &Tcx, owner: DefId, opaque: DefId, listed: &[&str], file: u32, pos: u32) -> Vec<String> {
+    use crate::types::RegionKind;
+    const MSG: &str = "`impl Trait` captures lifetime parameter, but it is not mentioned in `use<...>` precise captures list";
+    let table = tcx.resolve_bound_vars(prog, owner);
+    let names = table.opaque_capture_names(opaque);
+    let parents = tcx.opaque_captured_parent_lifetimes(prog, opaque);
+    let mut errors = Vec::new();
+    let mut shadowed = Vec::new();
+    for (name, parent) in names.iter().zip(&parents) {
+        match name {
+            Some(n) if listed.contains(&n.as_str()) => shadowed.push(*parent),
+            Some(_) => if errors.is_empty() { errors.push(prog.record_uncoded_error(file, pos, "typeck", MSG.to_string())); },
+            None => {}
+        }
+    }
+    if !errors.is_empty() { return errors; }
+    // the parent's lifetimes the bounds mention (the opaque self type's own arguments aside)
+    let parent_lifetimes = tcx.opaque_generics(prog, opaque).parent.lifetimes.clone();
+    let found = std::cell::RefCell::new(Vec::new());
+    let visit = |t: TyId| { tcx.tys.map_regions(t, &|r, _| { if let RegionKind::ReEarlyParam(i) = tcx.tys.region_kind(r) { if parent_lifetimes.contains(&i) { found.borrow_mut().push(r); } } r }, 0); };
+    let arg = |a: &crate::consts::GenericArg| match *a {
+        crate::consts::GenericArg::Type(t) => visit(t),
+        crate::consts::GenericArg::Lifetime(r) => visit(tcx.tys.intern(TyKind::Ref(false, tcx.tys.unit, r))),
+        crate::consts::GenericArg::Const(c) => visit(tcx.tys.intern(TyKind::Const(c))),
+    };
+    for p in tcx.item_bounds(prog, opaque) {
+        match &p.kind {
+            crate::next_solver::PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(t)) => t.trait_ref.args.iter().skip(1).for_each(arg),
+            crate::next_solver::PredicateKind::Clause(crate::next_solver::ClauseKind::Projection(pc)) => {
+                if let crate::next_solver::AliasTerm::Ty(a) = pc.projection_term {
+                    if let TyKind::Alias(_, alias) = tcx.tys.kind(a) { tcx.tys.list(alias.args).iter().skip(1).for_each(|&t| visit(t)); }
+                }
+                if let crate::next_solver::Term::Ty(t) = pc.term { visit(t); }
+            }
+            _ => {}
+        }
+    }
+    if found.into_inner().iter().any(|r| !shadowed.contains(r)) { errors.push(prog.record_uncoded_error(file, pos, "typeck", MSG.to_string())); }
     errors
 }
 
