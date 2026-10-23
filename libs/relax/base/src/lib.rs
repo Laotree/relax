@@ -35,7 +35,7 @@ macro_rules! print {
 
 pub mod fxhash;
 pub mod memstat;
-pub use relax_session::{gen_local, options, sip, Session};
+pub use relax_session::{memo_local, options, sip, Session};
 pub mod conc;
 pub mod lockfree;
 pub mod pool;
