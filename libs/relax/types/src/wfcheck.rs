@@ -1086,7 +1086,10 @@ pub mod obligations {
             let env = crate::tcx::TypingEnv::fully_monomorphized(w.prog);
             let bad = crate::types::TypeFlags::HAS_PARAM | crate::types::TypeFlags::HAS_ERROR | crate::types::TypeFlags::HAS_INFER | crate::types::TypeFlags::HAS_ALIAS;
             if let Ok(t) = w.tcx.try_normalize_erasing_regions(w.prog, env, ty) {
-                if !w.tcx.tys.flags(t).intersects(bad) && crate::layout::Layouts::new().size_overflows(&crate::layout::LayoutCx::new(w.prog), w.tcx, t) {
+                // (a field type that does not normalize has no layout: rustc's layout_of fails with
+                // NormalizationFailure, which this check leaves to the well-formedness errors)
+                if !w.tcx.tys.flags(t).intersects(bad) && fields_normalize(w.prog, w.tcx, env, t, &mut Default::default())
+                    && crate::layout::Layouts::new().size_overflows(&crate::layout::LayoutCx::new(w.prog), w.tcx, t) {
                     let file = w.prog.def(w.def).file;
                     w.extra.push(w.prog.record_uncoded_error(file, item.lo, "typeck", "extern static is too large for the target architecture".to_string()));
                     return;
@@ -1107,6 +1110,29 @@ pub mod obligations {
         if !*mutable && !thread_local {
             let sync = w.tcx.lang_items.get(crate::lang_items::LangItem::Sync);
             w.register_bound(ty, sync, item.name.lo);
+        }
+    }
+
+    /// Do the field types a layout of `t` reads normalize?
+    fn fields_normalize(prog: &Program, tcx: &Tcx, env: crate::tcx::TypingEnv, t: TyId, seen: &mut crate::fxhash::HashSet<TyId>) -> bool {
+        if !seen.insert(t) { return true; }
+        match tcx.tys.kind(t).clone() {
+            TyKind::Adt(d, args, _) => {
+                let Some(adt) = tcx.adts.get(&d) else { return true };
+                let args = tcx.tys.list(args).to_vec();
+                for v in &adt.variants {
+                    for f in &v.fields {
+                        match tcx.try_normalize_erasing_regions(prog, env, tcx.tys.subst(f.ty, &args)) {
+                            Ok(ft) => { if !fields_normalize(prog, tcx, env, ft, seen) { return false; } }
+                            Err(_) => return false,
+                        }
+                    }
+                }
+                true
+            }
+            TyKind::Array(e, _) | TyKind::Slice(e) => fields_normalize(prog, tcx, env, e, seen),
+            TyKind::Tuple(ts) => tcx.tys.list(ts).to_vec().into_iter().all(|x| fields_normalize(prog, tcx, env, x, seen)),
+            _ => true,
         }
     }
 
