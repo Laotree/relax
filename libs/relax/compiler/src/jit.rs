@@ -5332,6 +5332,14 @@ impl Unit {
         // only the running app's own crates are checked in the background (event::admit,
         // the app-crate rule of the live-edit gate): framework, dependency and std
         // instances are not queued, and their verdict keys are not computed
+        // a closure is checked with its parent (verdict_owner): its first code queues the parent, which
+        // may never get code of its own (inlined into its callers; a closure handed to a thread or a
+        // stream): its verdict stayed pending for the whole run, and the closure ran unverified code
+        let mut id = id;
+        while let FnKey::Closure(_, _, parent) = self.fns[id as usize].key {
+            if parent as usize >= self.fns.len() { return; }
+            id = parent;
+        }
         if let Some((d, a)) = match &self.fns[id as usize].key {
             FnKey::Inst(d, a) if crate::borrowck::event::admit(&self.prog, self.prog.def(*d).krate) => Some((*d, a.clone())),
             _ => None,
@@ -12061,12 +12069,6 @@ pub fn sweep_verdicts() {
     let _ = verified;
 }
 
-/// (PGO3 screening, temporary) MAKEPAD_RUN_PGO3_OFF=walk,stub,o2,rank switches a follow-up off
-fn pgo3_off(k: &str) -> bool {
-    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    V.get_or_init(|| std::env::var("MAKEPAD_RUN_PGO3_OFF").unwrap_or_default()).split(',').any(|x| x == k)
-}
-
 /// MAKEPAD_RUN_SPECV_TRACE=1: SPEC-V verdict sweeps (slots turning verified) and twins tiering up,
 /// with the callers whose lowering still calls them.
 fn specv_trace() -> bool {
@@ -12219,12 +12221,12 @@ unsafe fn relower_twin_callers(up: *mut Unit, tc: &TwinCallers) {
             v.retain(|c| !tc.o3.contains(c) && !tc.below.contains(c));
         }
     }
-    for &c in tc.below.iter().filter(|_| !pgo3_off("o2")) {
+    for &c in &tc.below {
         O2_SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).remove(&(key, c));
         o2_base(up, c);
     }
     let u = &*up;
-    if !tc.unverified.is_empty() && !pgo3_off("rank") {
+    if !tc.unverified.is_empty() {
         {
             let mut a = TWIN_AWAIT.lock().unwrap_or_else(|e| e.into_inner());
             crate::zone_alloc::kept_with(|| for &c in &tc.unverified { if !a.contains(&(key, c)) { a.push((key, c)); } });
@@ -13125,7 +13127,7 @@ fn rt_hot(slot: u64) -> u64 {
             // UI cycles). Its loop counters still queue it; new code (a patch, O2) counts again.
             let w = (*rec.add(5)).load(Ordering::Relaxed);
             let slow = (w >> SLOW_SHIFT) & 0xf;
-            if slow + 1 >= SLOW_RETIRE && !pgo3_off("stub") {
+            if slow + 1 >= SLOW_RETIRE {
                 if s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                     STUBS_RETIRED.fetch_add(1, Ordering::Relaxed);
                 }
@@ -13596,14 +13598,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     }
     // SPEC-V: hot code without a verdict yet: its check goes first (its O3 build is rebuilt once
     // verified: noalias, inlining into callers, counts)
-    if !pgo3_off("rank") {
-        owner::call(owner::Class::Background, || {
-            let u = &*up;
-            if u.fns[id as usize].unverified.load(Ordering::Relaxed) && matches!(u.verdict_state(id), Verdict::Pending) {
-                prioritize_verdicts(u, &[id]);
-            }
-        });
-    }
+    owner::call(owner::Class::Background, || {
+        let u = &*up;
+        if u.fns[id as usize].unverified.load(Ordering::Relaxed) && matches!(u.verdict_state(id), Verdict::Pending) {
+            prioritize_verdicts(u, &[id]);
+        }
+    });
     trace_tier1_phase(id, "start");
     // Also pin direct callers (cache verification / embedders), not only queue workers.
     TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(id);

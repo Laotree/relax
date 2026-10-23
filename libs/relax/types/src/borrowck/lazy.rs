@@ -268,7 +268,8 @@ pub fn set_ranks(src: usize, epoch: u64, ranks: &[(DefId, Vec<TyId>, u32)]) {
     let q = guard.get_or_insert_with(Queue::default);
     let epoch = q.canon(src, epoch);
     if !q.advance(src, epoch) { return; }
-    let trace = std::env::var_os("MAKEPAD_RUN_SPECV_TRACE").is_some();
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let trace = *TRACE.get_or_init(|| std::env::var_os("MAKEPAD_RUN_SPECV_TRACE").is_some());
     for (def, _, rank) in ranks {
         let key = (src, *def, epoch);
         if trace {
