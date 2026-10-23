@@ -769,19 +769,6 @@ fn eval_items(up: *mut Unit, own: &[bool], tainted: &std::collections::HashSet<c
     let _job = jit::compile_job();
     for (d, is_static) in items {
         if tainted.contains(&d) || !u.tcx.typeck(&u.prog, d).errors.is_empty() { continue; }
-        // the check-mode interpreter: rustc's CTFE undefined-behaviour and final-value checks
-        // (diagnostics only; an evaluation it rejects is not run by the JIT, as rustc stops there)
-        match crate::owner::call(crate::owner::Class::App, || relax_types::const_eval::interp::check_item(&u.prog, &u.tcx, d)) {
-            relax_types::const_eval::interp::Outcome::Error(span, msg) => {
-                let e = if msg.starts_with('E') { u.prog.record_error(span.file, span.lo, "typeck", msg) } else { u.prog.record_uncoded_error(span.file, span.lo, "typeck", msg) };
-                u.errors.push(e);
-                continue;
-            }
-            relax_types::const_eval::interp::Outcome::Unsupported(why) => {
-                if std::env::var_os("MAKEPAD_RUN_INTERP_TRACE").is_some() { eprintln!("interp: {}: unsupported: {why}", u.prog.def_path(d)); }
-            }
-            relax_types::const_eval::interp::Outcome::Ok => {}
-        }
         let before = unsafe { (&*up).errors.len() };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::owner::call(crate::owner::Class::App, || unsafe {
             let u = &mut *up;

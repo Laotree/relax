@@ -4941,10 +4941,34 @@ impl Unit {
         }
     }
 
+    /// relax_types::const_eval::interp for a non-generic constant, static or anonymous constant of a
+    /// validated crate; false when it reported an error.
+    fn check_initializer(&mut self, d: DefId) -> bool {
+        use relax_types::const_eval::interp::{check_item, Outcome};
+        let def = self.prog.def(d);
+        if !self.prog.crates[def.krate as usize].validate || !matches!(def.kind, DefKind::Const | DefKind::Static | DefKind::AnonConst) { return true; }
+        match check_item(&self.prog, &self.tcx, d) {
+            Outcome::Error(span, msg) => {
+                let e = if msg.starts_with('E') { self.prog.record_error(span.file, span.lo, "typeck", msg) } else { self.prog.record_uncoded_error(span.file, span.lo, "typeck", msg) };
+                self.errors.push(e);
+                false
+            }
+            Outcome::Unsupported(why) => {
+                if std::env::var_os("MAKEPAD_RUN_INTERP_TRACE").is_some() { eprintln!("interp: {}: unsupported: {why}", self.prog.def_path(d)); }
+                true
+            }
+            Outcome::Ok => true,
+        }
+    }
+
     /// Runs the initializer of const/static `d` into `buf`.
     fn run_init(&mut self, d: DefId, args: Vec<TyId>, buf: u64) -> Option<u64> {
         owner::pure_note(owner::PURE_BG_EVAL);
         owner::forbid_in_publish("initializer", u32::MAX);
+        // `makepad check`: the check-mode interpreter first (rustc's CTFE undefined-behaviour,
+        // mutable-global and final-value checks; diagnostics only). An evaluation it rejects is not
+        // run here, as rustc stops at the error.
+        if self.prog.session.options.const_fuel && args.is_empty() && !self.check_initializer(d) { return None; }
         let _census_context = self.exec_context(false);
         let options = &self.prog.session.clone().options;
         // Initializers outside the CTFE subset already have cached executable

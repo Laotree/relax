@@ -229,7 +229,10 @@ impl<'a> Interp<'a> {
         let env = crate::tcx::TypingEnv { limit: crate::tcx::RecursionLimit::for_item(prog, body.def), param_env: body.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::borrowck(tcx, prog, body.def) };
         let eval = crate::tcx::EvalCx::new(prog, tcx, env, &state);
         let root = match BuildRoot::new(BuildCx { prog, tcx, env, eval: &eval }, &body) { Ok(r) => r, Err(e) => return unsupported(format!("build root: {e}")) };
-        let Some(owner) = crate::borrowck::body::CheckedBody::item(prog, def) else { return unsupported("not a body owner") };
+        let owner = match prog.def_id_to_node_id.get(&def) {
+            Some((_, relax_front::def_collector::NodeId::AnonConst(expr))) if prog.def(def).kind == DefKind::AnonConst => crate::borrowck::body::CheckedBody { owner: def, kind: crate::borrowck::body::BodyKind::AnonConst(*expr) },
+            _ => match crate::borrowck::body::CheckedBody::item(prog, def) { Some(o) => o, None => return unsupported("not a body owner") },
+        };
         let mut mir = match build_mir(&root, owner) { Ok(m) => m, Err(e) => return unsupported(format!("build: {:?}", e.reason)) };
         let provider = crate::mir::build::driver::BuildProvider { prog, tcx, memo: Default::default() };
         if let Err(e) = crate::mir::transform::mir_promoted(prog, tcx, env, &provider, &mut mir) { return unsupported(format!("promote: {}", e.0)); }
