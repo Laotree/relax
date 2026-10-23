@@ -258,6 +258,8 @@ pub fn mode_from_env(options: &crate::options::Options) -> Option<Mode> {
 
 #[derive(Default, Debug, Clone)]
 pub struct CacheStats {
+    /// replacements that made the startup image be written again: [no stored entry, tier up]
+    pub rewrite_why: [u64; 2],
     pub hits: u64,
     pub misses: u64,
     pub link_fail: u64,
@@ -1021,10 +1023,7 @@ impl Cache {
     fn entry_tier(&self, key: u128) -> Option<u8> {
         let (kind, p) = self.get(key)?;
         if kind != KIND_CODE { return None; }
-        let mut d = D { b: p, p: 0 };
-        if d.u32()? != ENTRY_VERSION { return None; }
-        d.str()?;
-        d.u8()
+        payload_tier(p)
     }
 
     fn get(&self, key: u128) -> Option<(u32, &[u8])> {
@@ -2339,8 +2338,15 @@ impl Cache {
             return;
         }
         self.pending_keys.insert(key);
+        // the startup image is written again only when a replacement moves its slot's tier up (O1 ->
+        // O2/O3): an O3 payload replacing an O3 entry does not (PGO-driven O3 code differs run to
+        // run; every warm run rewrote the whole image), the next tier-up rewrite takes the newest
         if replace && (existing || self.linked.contains(&id)) {
-            self.image_rewrite = true;
+            let old = self.entry_tier(key);
+            if old.is_none_or(|old| payload_tier(&payload).is_some_and(|new| tier_rank(new) > tier_rank(old))) {
+                self.image_rewrite = true;
+                self.stats.rewrite_why[old.is_some() as usize] += 1;
+            }
         }
         let kc = self.cur_crate;
         self.push_pending(kc, NewEntry { key, kind: KIND_CODE, payload });
@@ -2774,6 +2780,10 @@ impl Cache {
             self.manifest_done = true;
             return true;
         }
+        if self.verbose {
+            eprintln!("makepad-run cache: startup manifest rewritten: valid {} (missing {}), {} new of {}, image rewrite {} (replacements without a stored entry {}, tier-ups {}), image slots {} stale {} cached at present {}",
+                self.startup_manifest_valid(), self.manifest_missing, new, list.len(), self.image_rewrite, self.stats.rewrite_why[0], self.stats.rewrite_why[1], self.image_slots, self.image_stale, self.manifest_present_cached);
+        }
         let img = if self.mode != Mode::Verify && !self.image_bad {
             match self.build_image(u, &present_ids, stop) { Err(()) => return false, Ok(img) => img }
         } else { None };
@@ -3007,6 +3017,19 @@ impl Cache {
             if n != 0 { self.stores.push(std::sync::Arc::new(st)); }
         }
     }
+}
+
+/// A stored tier's order (the tier bytes are not in tier order): baseline < O1 < O2 < O3.
+fn tier_rank(t: u8) -> u8 {
+    match t { TIER_BASE => 0, TIER_O1 => 1, TIER_O2 => 2, TIER_O3 => 3, _ => 0 }
+}
+
+/// A code entry payload's tier byte.
+fn payload_tier(p: &[u8]) -> Option<u8> {
+    let mut d = D { b: p, p: 0 };
+    if d.u32()? != ENTRY_VERSION { return None; }
+    d.str()?;
+    d.u8()
 }
 
 /// Whether a pack's recorded late macro inputs (include!/env! contents) still have the same
