@@ -103,7 +103,8 @@ fn lifetime_lints(prog: &Program, d: DefId) {
     // a lifetime is written with a quote; the code a derive writes is not the user's
     if !pf.bytes(item.lo, item.hi).contains(&b'\'') || lint::external(prog, def.file, item.lo) { return; }
     let mut w = W::new(prog, def.file, d);
-    w.lt = Some(LtCx { ribs: vec![LRib::Item], scopes: Vec::new(), next: 0 });
+    let anon_in_impl_trait = prog.crates[def.krate as usize].features(prog).has("anonymous_lifetime_in_impl_trait");
+    w.lt = Some(LtCx { ribs: vec![LRib::Item], scopes: Vec::new(), next: 0, anon_in_impl_trait });
     match def.kind {
         DefKind::Fn | DefKind::ForeignFn => w.lt_fn(def.item),
         DefKind::Impl => w.lt_impl(d, def.item),
@@ -224,6 +225,15 @@ fn attr_lints(prog: &Program, d: DefId) {
                 && matches!(item.kind, ItemKind::Fn(sig, None, _) if ast.fn_sig(sig).lazy_body.is_none());
             if bodiless_trait_method { emit("`#[inline]` attribute cannot be used on required trait methods"); }
             else if def.kind == DefKind::ForeignFn { emit("`#[inline]` attribute cannot be used on foreign functions"); }
+        }
+        // codegen_attrs.rs ColdParser: AllowListWarnRest (fns, methods with a body, foreign fns, closures)
+        if name == b"cold" {
+            if item.is_none() { continue; }
+            if let Some((what, fn_like, trait_fn_no_body, _)) = crate::item_checks::attribute_target(prog, d) {
+                if trait_fn_no_body || !fn_like {
+                    emit(&format!("`#[cold]` attribute cannot be used on {}", if trait_fn_no_body { "required trait methods" } else { what }));
+                }
+            }
         }
     }
     attr_checks(prog, &AttrNode { d, inner: &[], attrs: &all, is_crate: is_root, macro_use_target: is_root || named_mod });
@@ -451,6 +461,8 @@ struct LtCx {
     ribs: Vec<LRib>,
     scopes: Vec<LtScope>,
     next: u32,
+    /// `#![feature(anonymous_lifetime_in_impl_trait)]`: an `impl Trait` rib lets the search go on outward
+    anon_in_impl_trait: bool,
 }
 
 pub(crate) struct W<'a> {
@@ -1150,6 +1162,15 @@ impl<'a> W<'a> {
                 // the lint attributes of an expression statement survive cfg stripping
                 let attrs = ast.stmt_attrs(e);
                 self.enter(attrs);
+                // codegen_attrs.rs ColdParser (AllowListWarnRest): an expression is no target of `#[cold]`
+                if self.lt.is_none() && !matches!(self.kind(e), ExprKind::Closure(..)) {
+                    for a in ast.list(attrs) {
+                        if a.toks.hi > a.toks.lo && lint::attr_path(self.prog, self.file, a) == b"cold" {
+                            let pos = attr_pos(self.pf, a);
+                            if !lint::external(self.prog, self.file, pos) { emit(self.prog, self.def, &UNUSED_ATTRIBUTES, self.file, pos, "`#[cold]` attribute cannot be used on expressions"); }
+                        }
+                    }
+                }
                 // (`#[cfg(..)]` stays on the node in rustc: a value with attributes is not linted)
                 if !semi && attrs.len() == 0 { self.both(e, Ctx::BlockRetValue, false); }
                 self.expr(e);
@@ -1649,6 +1670,7 @@ impl<'a> W<'a> {
         for r in c.ribs.iter().rev() {
             match r {
                 LRib::Generics => continue,
+                LRib::ImplTrait if c.anon_in_impl_trait => continue,
                 LRib::Anon(b) => { state = if *b == binder { 1 } else { 2 }; break; }
                 LRib::Item | LRib::Fail | LRib::ImplTrait => { state = 2; break; }
             }

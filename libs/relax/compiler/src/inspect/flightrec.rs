@@ -481,7 +481,9 @@ fn watch() {
             if last == 0 || now.saturating_sub(last) >= gap {
                 LAST_AUTO.store(now, Relaxed);
                 match save(if why == Why::Hitch { HITCH_LAST_NS } else { DUMP_LAST_NS }, why, None, true) {
-                    Ok((path, n)) => eprintln!("makepad-run flightrec: {} recorded: {} ({} KB; makepad inspect file={} pf brief)", why.name(), path.display(), n / 1024, path.display()),
+                    // a hitch (a cold start has some) is named with --verbose; panics and faults always
+                    Ok((path, n)) if why != Why::Hitch || crate::run::VERBOSE.load(Relaxed) => eprintln!("makepad-run flightrec: {} recorded: {} ({} KB; makepad inspect file={} pf brief)", why.name(), path.display(), n / 1024, path.display()),
+                    Ok(_) => {}
                     Err(e) => eprintln!("makepad-run flightrec: cannot write the {} recording: {}", why.name(), e),
                 }
             }

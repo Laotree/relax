@@ -634,6 +634,14 @@ pub mod obligations {
                 for p in crate::borrowck::implied_bounds::ImpliedBounds::inferred_outlives(tcx, self.prog, self.def) {
                     match p {
                         OutlivesPredicate::Region(a, b) => bounds.push(OutlivesBound::RegionSubRegion(b, a)),
+                        // (rustc's param env is normalized: normalize_param_env_or_error turns an inferred
+                        // `<X as Tr>::A: 'a` into the bound its normalization names)
+                        OutlivesPredicate::Type(t, r) if tys.flags(t).intersects(crate::types::TypeFlags::HAS_ALIAS) => {
+                            let normalized = self.infcx.probe(|_| crate::next_solver::fulfill::ObligationCtxt::new(self.infcx, self.prog).deeply_normalize_ty(&self.env, t).ok()).unwrap_or(t);
+                            let mut parts = Vec::new();
+                            crate::infer::outlives::components::push_outlives_components(tcx, self.prog, normalized, &mut parts);
+                            crate::next_solver::implied_outlives_bounds::push_component_bounds(&mut pairs, r, parts);
+                        }
                         OutlivesPredicate::Type(t, r) => pairs.push(if matches!(tys.kind(t), TyKind::Alias(..)) { OutlivesBound::RegionSubAlias(r, t) } else { OutlivesBound::RegionSubParam(r, t) }),
                     }
                 }
