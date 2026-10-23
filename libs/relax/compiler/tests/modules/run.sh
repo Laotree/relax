@@ -4,9 +4,13 @@ D=$(cd "$(dirname "$0")" && pwd)
 # Instruction counts are identical with tiering disabled and after a low-threshold tier-up.
 BASE_BUDGET=""
 for TIER in 0 1; do
-OUT=$(MAKEPAD_RUN_O3=$TIER MAKEPAD_RUN_O3_CALLS=100 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/budget.rs" 2>&1)
+# (stdout and stderr apart: an O3 trace line on stderr can land inside an `out` line of stdout)
+SO=$(mktemp); SE=$(mktemp)
+MAKEPAD_RUN_O3=$TIER MAKEPAD_RUN_O3_CALLS=100 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/budget.rs" >"$SO" 2>"$SE"
 STATUS=$?
-GOT=$(echo "$OUT" | grep '^out ')
+GOT=$(grep '^out ' "$SO")
+OUT="$(cat "$SO" "$SE")"
+rm -f "$SO" "$SE"
 if [ "$STATUS" != 0 ] || ! echo "$GOT" | grep -q '^out owned string results: true$'; then
     echo "modules budget (tier1=$TIER): FAIL"; echo "$OUT" | tail -50; exit 1
 fi
