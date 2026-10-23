@@ -1336,18 +1336,28 @@ crate::gen_local! {
     static ICE_LOC: std::cell::RefCell<String>;
 }
 
-/// Installs (once) a panic hook that stays silent for panics inside the compiler (they
-/// become compile errors) and records their location; other panics print as usual.
-fn install_ice_hook() {
+/// Installs (once) the process's one panic hook. It records every panic's position on its thread
+/// (lifeline::note_panic_at: no allocation, no lock) and stays silent for panics that become
+/// compile errors: inside a build (`IceScope`, this thread only), in a request served on the
+/// owner, and on ahead helpers. Every other panic prints as usual -- including the owner's own
+/// panics outside a request (a dead owner hangs every requester). Nothing ever swaps it.
+pub(crate) fn install_ice_hook() {
     static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.swap(true, Ordering::SeqCst) {
+    if DONE.load(Ordering::Relaxed) || DONE.swap(true, Ordering::SeqCst) {
         return;
     }
     let prev = std::panic::take_hook();
     // the hook lives as long as the process: the program's heap
     let _kept = crate::zone_alloc::kept();
     std::panic::set_hook(Box::new(move |info| {
-        if owner::is_owner() {
+        if let Some(l) = info.location() {
+            crate::lifeline::note_panic_at(l.file(), l.line());
+        }
+        // a build on this thread: the panic becomes its compile error (the report carries the position)
+        if ICE_SCOPE.try_with(|c| c.get()).unwrap_or(0) > 0 {
+            return;
+        }
+        if owner::is_owner() && owner::serving_request() {
             if let Some(l) = info.location() {
                 let s = format!(" (at {}:{})", l.file(), l.line());
                 let _ = ICE_LOC.try_with(|c| *c.borrow_mut() = s);
@@ -1365,6 +1375,52 @@ fn install_ice_hook() {
         if crate::os::thread::name(crate::os::thread::current()).starts_with("run-ahead") { return; }
         prev(info);
     }));
+}
+
+thread_local! {
+    /// builds running on this thread (build_rir_mode): their panics are compile errors, silent
+    static ICE_SCOPE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A build on this thread: the panic hook stays silent for its panics (this thread only).
+struct IceScope;
+
+impl IceScope {
+    fn enter() -> IceScope {
+        let _ = ICE_SCOPE.try_with(|c| c.set(c.get() + 1));
+        IceScope
+    }
+}
+
+impl Drop for IceScope {
+    fn drop(&mut self) {
+        let _ = ICE_SCOPE.try_with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+#[cfg(test)]
+mod ice_scope_tests {
+    /// A build's silent scope is its own thread's: another thread's panic during it is not
+    /// silenced (the old per-build hook swap silenced every thread) and records its own position.
+    #[test]
+    fn ice_scope_is_per_thread_and_the_hook_is_never_swapped() {
+        super::install_ice_hook();
+        let _s = super::IceScope::enter();
+        crate::lifeline::clear_panic_at();
+        assert!(super::ICE_SCOPE.with(|c| c.get()) > 0);
+        let other = std::thread::spawn(|| {
+            let in_scope = super::ICE_SCOPE.with(|c| c.get()) > 0;
+            let r = std::panic::catch_unwind(|| panic!("ice-scope test panic"));
+            (in_scope, r.is_err(), crate::lifeline::panic_at())
+        })
+        .join()
+        .unwrap();
+        assert!(!other.0, "another thread inherited the build's silent scope");
+        assert!(other.1);
+        assert!(other.2.starts_with("jit.rs:"), "the hook recorded no position: {:?}", other.2);
+        // the build thread's own record is untouched by the other thread's panic
+        assert_eq!(crate::lifeline::panic_at(), "");
+    }
 }
 
 /// " (at src/file.rs:line)" of the last panic caught inside the compiler, once.
@@ -7443,7 +7499,7 @@ unsafe fn o2_start(up: *mut Unit) {
     let runtime = crate::zone_alloc::kept_clone(&(&*up).prog.session.runtime);
     O2_THREAD.call_once(move || {
         { let _k = crate::zone_alloc::kept();
-        let _ = std::thread::Builder::new().name("run-O2".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); o2_thread(&runtime) });
+        crate::lifeline::spawn("run-O2".into(), crate::lifeline::OnPanic::Restart, None, move || { let _z = crate::zone_alloc::compiler_thread(); o2_thread(&runtime) });
         }
     });
 }
@@ -8299,20 +8355,16 @@ unsafe fn build_rir_mode(up: *mut Unit, id: u32, mode: RirMode) -> Result<(), St
             return Err(format!("reached the recursion limit while instantiating `{}` (type arguments nested deeper than {})", u.fns[id as usize].name, INSTANCE_DEPTH_LIMIT));
         }
     }
-    // record where an internal panic happened (no stderr noise; the report carries it)
-    static ICE_AT: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|info| {
-        if let Some(l) = info.location() {
-            if let Ok(mut g) = ICE_AT.lock() {
-                *g = crate::zone_alloc::kept_with(|| format!("{}:{}", l.file().rsplit('/').next().unwrap_or(""), l.line()));
-            }
-        }
-    }));
+    // where an internal panic happened is recorded by the one panic hook, per thread, silently
+    // inside this scope (the report carries it). The hook is never swapped: a per-build swap
+    // silenced every other thread's panics, could lose the hook, and blocked on std's hook lock.
+    install_ice_hook();
+    crate::lifeline::clear_panic_at();
+    let scope = IceScope::enter();
     let depth0 = BUILD_STACK.try_with(|s| s.borrow().len()).unwrap_or(0);
     let child0 = BUILD_CHILD.try_with(|c| c.borrow().len()).unwrap_or(0);
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_rir_unguarded(up, id, mode)));
-    std::panic::set_hook(prev);
+    drop(scope);
     if r.is_err() {
         // the unwound builds' bookkeeping
         let open: Vec<u32> = BUILD_STACK.try_with(|s| s.borrow()[depth0.min(s.borrow().len())..].to_vec()).unwrap_or_default();
@@ -8335,7 +8387,7 @@ unsafe fn build_rir_mode(up: *mut Unit, id: u32, mode: RirMode) -> Result<(), St
                 "panic".to_string()
             };
             let u = &mut *up;
-            let at = ICE_AT.lock().map(|g| g.clone()).unwrap_or_default();
+            let at = crate::lifeline::panic_at();
             Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() { positioned_fatal(u, id, &fatal.0) } else { format!("internal compiler error in {} (makepad run {}): {} -- makepad run bug, report it", u.fns[id as usize].name, at, msg) })
         }
     }
@@ -11193,7 +11245,7 @@ fn sampler_enter(exec_base: u64, exec_size: u64) {
     }
     SAMPLER.call_once(|| {
         { let _k = crate::zone_alloc::kept();
-        let _ = std::thread::Builder::new().name("run-sampler".to_string()).spawn(sampler_thread);
+        crate::lifeline::spawn("run-sampler".to_string(), crate::lifeline::OnPanic::Restart, None, sampler_thread);
         }
     });
 }
@@ -11594,6 +11646,7 @@ fn sampler_thread() {
     let mut last_activity = activity();
     let mut active_at = std::time::Instant::now();
     loop {
+        crate::lifeline::beat();
         let period = periods[period_index];
         period_index = (period_index + 1) % periods.len();
         // Linux selects irregular observations from its perf stream. Drain
@@ -11810,7 +11863,7 @@ fn trace_build(u: &Unit, id: u32, what: &str, build_ns: u64) {
         Q_WHY.get(why as usize).copied().unwrap_or("?"),
         now.saturating_sub(at) as f64 / 1e6,
         build_ns as f64 / 1e6,
-        tier_queue().unwrap().len()
+        tier_queue().unwrap_or_else(|e| e.into_inner()).len()
     );
 }
 
@@ -12788,7 +12841,7 @@ fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
 /// from program threads (no unit lock), as rt_hot queues.
 pub(crate) fn guard_relink(id: u32) {
     // one rebuild decides every ready site of the slot: no second entry while one waits
-    if tier_queue().unwrap().iter().any(|e| e.0 == id && e.1 == Q_RETIER) {
+    if tier_queue().unwrap_or_else(|e| e.into_inner()).iter().any(|e| e.0 == id && e.1 == Q_RETIER) {
         return;
     }
     tier_push(id, Q_RETIER, 0);
@@ -12950,7 +13003,7 @@ pub(crate) fn tier_explain(u: &Unit, id: u32) -> (String, Vec<(String, String)>)
 
 fn tier_push(id: u32, why: u8, rate: u64) {
     crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::QUEUE, why, rate, 0);
-    let mut q = tier_queue().unwrap();
+    let mut q = tier_queue().unwrap_or_else(|e| e.into_inner());
     tier_push_locked(&mut *q, id, why, rate, wall_ns());
     drop(q);
     tier_wake();
@@ -13000,7 +13053,7 @@ fn spawn_tier1_threads(runtime: &crate::options::RuntimeOptions, options: &crate
     for k in 0..max {
         let runtime = crate::zone_alloc::kept_clone(runtime);
         { let _k = crate::zone_alloc::kept();
-        let _ = std::thread::Builder::new().name(format!("run-o3-{}", k)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); tier1_thread(&runtime, k, normal) });
+        crate::lifeline::spawn(format!("run-o3-{}", k), crate::lifeline::OnPanic::Restart, None, move || { let _z = crate::zone_alloc::compiler_thread(); tier1_thread(&runtime, k, normal) });
         }
     }
 }
@@ -13811,12 +13864,15 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
     lower_worker_priority(runtime);
     TIER_SLEEPERS.register(k);
     loop {
+        if k == 0 {
+            crate::lifeline::beat();
+        }
         // PGO: every worker closes the counting windows that are over before it picks its next
         // build (the first worker's poll alone waited out its own builds: hot slots came out of
         // the window one at a time behind a long O3 build)
         pgo_poll();
         let (id, why, queued_at, rate) = {
-            let mut q = tier_queue().unwrap();
+            let mut q = tier_queue().unwrap_or_else(|e| e.into_inner());
             loop {
                 if TIER_STOP.load(Ordering::SeqCst) { return; }
                 // Recheck admission on every wake and pop, including a wake from an empty
@@ -13841,6 +13897,7 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
                 let ready = || TIER_GEN.load(Ordering::SeqCst) != seen || TIER_STOP.load(Ordering::SeqCst);
                 if parked { TIER_SLEEPERS.sleep(k, ready) } else { TIER_SLEEPERS.sleep_timeout(k, poll, ready) }
                 if k == 0 {
+                    crate::lifeline::beat();
                     crate::inspect::tierlog::drain();
                     // SPEC-V: verdicts that arrived release the promotions that waited for them
                     sweep_verdicts();
@@ -13851,7 +13908,7 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
                     // retired count stubs whose backoff is over: counted again
                     rearm_retired();
                 }
-                q = tier_queue().unwrap();
+                q = tier_queue().unwrap_or_else(|e| e.into_inner());
             }
         };
         let _active = TierActive(id);
@@ -15934,7 +15991,7 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, id: u32, func: &relax_backend::rir::
     mark_spec_cached(u, &front);
     mark_spec_cached(u, &back);
     {
-        let mut q = SPEC_Q.lock().unwrap();
+        let mut q = SPEC_Q.lock().unwrap_or_else(|e| e.into_inner());
         for c in front.into_iter().rev() {
             q.push_front(c);
         }
@@ -15945,7 +16002,7 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, id: u32, func: &relax_backend::rir::
             for k in 0..spec_jobs(options) {
                 let session = session.clone();
             { let _k = crate::zone_alloc::kept();
-            let _ = std::thread::Builder::new().name(format!("run-spec{}", k)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime, &session.options) });
+            crate::lifeline::spawn(format!("run-spec{}", k), crate::lifeline::OnPanic::Restart, None, move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime, &session.options) });
             }
             }
         });
@@ -16006,12 +16063,12 @@ pub unsafe fn spec_seed(up: *mut Unit, ids: &[u32]) {
     mark_spec_cached(u, &add);
     SEED_PROBE_NS.fetch_add(cpu_ns() - probe, Ordering::Relaxed);
     SEED_QUEUED.fetch_add(add.len() as u64, Ordering::Relaxed);
-    SPEC_Q.lock().unwrap().extend(add);
+    SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).extend(add);
     SPEC_START.call_once(|| {
         for k in 0..spec_jobs(options) {
             let session = session.clone();
             { let _k = crate::zone_alloc::kept();
-            let _ = std::thread::Builder::new().name(format!("run-spec{}", k)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime, &session.options) });
+            crate::lifeline::spawn(format!("run-spec{}", k), crate::lifeline::OnPanic::Restart, None, move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime, &session.options) });
             }
         }
     });
@@ -16708,7 +16765,7 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions, options: &crate::option
     set_worker();
     loop {
         let id = {
-            let mut q = SPEC_Q.lock().unwrap();
+            let mut q = SPEC_Q.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if SPEC_STOP.load(Ordering::SeqCst) {
                     return;
@@ -16717,7 +16774,7 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions, options: &crate::option
                 if let Some(id) = next {
                     break id;
                 }
-                q = SPEC_WAKE.wait(q).unwrap();
+                q = SPEC_WAKE.wait(q).unwrap_or_else(|e| e.into_inner());
             }
         };
         let _job = compile_job();
@@ -16744,7 +16801,7 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions, options: &crate::option
         }
         match r {
             // gave way to a program thread: first in line again
-            Ok(false) => SPEC_Q.lock().unwrap().push_front(id),
+            Ok(false) => SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).push_front(id),
             Ok(true) => {}
             Err(_) => {
                 SPEC_PANICS.fetch_add(1, Ordering::Relaxed);
@@ -19391,7 +19448,7 @@ unsafe fn spec_enqueue_cached(up: *mut Unit, ids: &[u32], depth: u8) {
     }
     SPEC_UNIT.store(up, Ordering::Release);
     {
-        let mut q = SPEC_Q.lock().unwrap();
+        let mut q = SPEC_Q.lock().unwrap_or_else(|e| e.into_inner());
         for id in add.into_iter().rev() {
             q.push_front(id);
         }
@@ -19400,7 +19457,7 @@ unsafe fn spec_enqueue_cached(up: *mut Unit, ids: &[u32], depth: u8) {
         for k in 0..spec_jobs(options) {
             let session = session.clone();
             { let _k = crate::zone_alloc::kept();
-            let _ = std::thread::Builder::new().name(format!("run-spec{}", k)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime, &session.options) });
+            crate::lifeline::spawn(format!("run-spec{}", k), crate::lifeline::OnPanic::Restart, None, move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime, &session.options) });
             }
         }
     });

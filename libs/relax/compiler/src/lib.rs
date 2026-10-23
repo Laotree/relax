@@ -61,6 +61,7 @@ pub mod web;
 pub mod web32;
 pub mod coverage;
 pub mod owner;
+pub mod lifeline;
 pub mod postframe;
 mod nounwind;
 pub mod os;
