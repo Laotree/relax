@@ -202,13 +202,16 @@ impl Counts {
 /// None names the boot image, whose counts are recorded only before runtime crates arrive.
 /// The front-write epoch (jit::front_epoch) goes with the counts: equal counts and epoch with
 /// interners that only grew mean the image plus a top-up is the program.
-static IMAGE: relax_session::sync::Mutex<Option<(Counts, u64, Option<crate::cache::CollectedWritten>)>> = relax_session::sync::Mutex::new(None);
+/// Boxed (kept heap): a `None` written into an inline payload copies the payload bytes of a stack
+/// temporary, and those can name a compiler block (MAKEPAD_RUN_ZONE_CHECK=2 reports them as stale).
+static IMAGE: relax_session::sync::Mutex<Option<Box<(Counts, u64, Option<crate::cache::CollectedWritten>)>>> = relax_session::sync::Mutex::new(None);
 
 pub(crate) fn note_image(prog: &Program, tcx: &Tcx) {
     // A mid-run writer may publish the frozen boot after runtime crates were appended.
     // Its image then describes the boot snapshot, not these live counts.
     if RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
-        *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some((counts(prog, tcx), front_epoch(), None));
+        let image = crate::zone_alloc::kept_with(|| Box::new((counts(prog, tcx), front_epoch(), None)));
+        *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(image);
     }
 }
 
@@ -486,7 +489,7 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     tl.commit = ms(t);
     trace("commit done");
     crate::zone_alloc::kept_with(|| {
-        *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some((before, epoch, swap_image.clone()));
+        *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new((before, epoch, swap_image.clone())));
     });
     tl.specs = specs;
     let pause = ms(t_pause);
@@ -559,10 +562,10 @@ fn encode_off(up: *mut Unit, pre: &[crate::preload::PreCrate], extra: &[crate::p
     if pre.len() + extra.len() != before.crates {
         return Err(format!("recipe has {} crates, program has {}", pre.len() + extra.len(), before.crates));
     }
-    let saved = IMAGE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|(c, e, _)| *e == epoch && c.same_program(&before))
+    let saved = IMAGE.lock().unwrap_or_else(|e| e.into_inner()).as_deref().filter(|(c, e, _)| *e == epoch && c.same_program(&before))
         .map(|(c, _, image)| (*c, crate::zone_alloc::kept_clone(image)));
     if saved.is_none() {
-        if let Some((c, e, _)) = IMAGE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if let Some((c, e, _)) = IMAGE.lock().unwrap_or_else(|e| e.into_inner()).as_deref() {
             trace(&format!("the collected image is not current: its counts {c:?} (front epoch {e}), now {before:?} (epoch {epoch})"));
         }
     }

@@ -3805,8 +3805,8 @@ impl Cache {
 
 /// MAKEPAD_RUN_CACHE_DUMP=<name substring>: link details of matching entries (read once).
 fn dump_filter() -> Option<&'static str> {
-    static F: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    F.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_CACHE_DUMP").ok())).as_deref()
+    static F: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    relax_session::phase::env_once(&F, "MAKEPAD_RUN_CACHE_DUMP")
 }
 
 fn kind_code(k: RelocKind) -> u8 {

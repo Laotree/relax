@@ -6910,8 +6910,8 @@ fn sig_name(u: &Unit, id: u32) -> String {
 }
 
 fn sig_dir() -> Option<std::ffi::OsString> {
-    static D: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
-    D.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var_os("MAKEPAD_RUN_CODE_SIG_DIR"))).clone()
+    static D: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    relax_session::phase::env_once(&D, "MAKEPAD_RUN_CODE_SIG_DIR").map(std::ffi::OsString::from)
 }
 
 fn code_sig(id: u32, f: &relax_backend::rir::Func, code: &[u8], alloc: u64, o3: bool) {
@@ -11187,8 +11187,12 @@ fn sample_trace() -> bool {
 /// (a SPEC-V twin's too: named `.<n>.twin` with MAKEPAD_RUN_DUMP_EACH, else it shares the fn's files).
 /// (tools: bench_rt/asmdiff.py)
 fn dump_base(name: &str) -> Option<String> {
-    static DUMP: std::sync::OnceLock<Option<(Vec<String>, String)>> = std::sync::OnceLock::new();
-    let (wants, dir) = DUMP.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_DUMP").ok().map(|w| (w.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect(), std::env::var("MAKEPAD_RUN_DUMP_DIR").unwrap_or_else(|_| "/tmp".to_string()))))).as_ref()?;
+    // no suffixes = off; not an Option: a `None` would carry a stack temporary's payload bytes (zone check 2)
+    static DUMP: std::sync::OnceLock<(Vec<String>, String)> = std::sync::OnceLock::new();
+    let (wants, dir) = DUMP.get_or_init(|| crate::zone_alloc::kept_with(|| match std::env::var("MAKEPAD_RUN_DUMP") {
+        Ok(w) => (w.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect(), std::env::var("MAKEPAD_RUN_DUMP_DIR").unwrap_or_else(|_| "/tmp".to_string())),
+        Err(_) => (Vec::new(), String::new()),
+    }));
     // a SPEC-V twin (`<fn> [unverified]`, which runs first) dumps under its fn's suffix too
     let plain = name.strip_suffix(" [unverified]").unwrap_or(name);
     let w = wants.iter().find(|w| plain.ends_with(w.as_str()))?;
@@ -11221,8 +11225,8 @@ fn dump_o1(func: &relax_backend::rir::Func, c: &x64::Compiled) {
 /// rewrites <path> every 0.5 s (and when the unit is dropped): `samples<TAB>tier<TAB>code bytes<TAB>name`, hottest first.
 /// A profile of steady-state hot code for the asm-diff ranking (bench_rt/rank.py), not a timing.
 fn profile_path() -> Option<&'static str> {
-    static P: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    P.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_PROFILE").ok().filter(|s| !s.is_empty()))).as_deref()
+    static P: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    relax_session::phase::env_once(&P, "MAKEPAD_RUN_PROFILE")
 }
 
 /// MAKEPAD_RUN_PROFILE_FROM_MS=<ms>: count samples only after that long since the first sample (steady state of
@@ -11343,8 +11347,8 @@ fn pc_source_pos(u: &Unit, pc: u64) -> Option<u64> {
 /// size<TAB>struct align<TAB>fixed layout (repr C/packed/int)`, samples = the steady samples on the
 /// site's source line. A measurement of how scattered hot fields are (no timing, no counters).
 pub fn field_prof_on() -> bool {
-    static E: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    E.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_FIELD_PROF").ok().filter(|s| !s.is_empty()))).is_some()
+    static E: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    relax_session::phase::env_once(&E, "MAKEPAD_RUN_FIELD_PROF").is_some()
 }
 
 #[derive(Clone)]
@@ -11503,8 +11507,8 @@ pub(crate) fn o3_pending() -> u64 {
 }
 
 fn o3_progress_write(last: &mut std::time::Instant) {
-    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let Some(path) = PATH.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_O3_PROGRESS").ok().filter(|s| !s.is_empty()))) else { return };
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let Some(path) = relax_session::phase::env_once(&PATH, "MAKEPAD_RUN_O3_PROGRESS") else { return };
     if last.elapsed() < std::time::Duration::from_millis(100) {
         return;
     }
