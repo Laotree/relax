@@ -3293,7 +3293,7 @@ fn summary_inner(why: &str) {
         let q = jit::TIER_QUEUED.load(Ordering::Relaxed);
         if q > 0 {
             verbose!(
-                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); snapshots {:.0} ms cpu on the owner ({} inline candidates built there, {:.0} ms; {} fronts off it, {:.0} ms cpu; {} optimised off it, {:.0} ms cpu), back ends {:.0} ms cpu off it; bottom-up preparation {:.0} ms cpu ({} bodies simplified, {} kept, {} shared, {} of the simplified had disagreeing shared ones: body {} attrs {} presence {} preparation {} single {}); {} code bytes",
+                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); snapshots {:.0} ms cpu on the owner (root {:.0}, candidates {:.0}, callee scans {:.0}, assembly {:.0} of which singles {:.0} ms; {} inline candidates built there, {:.0} ms; {} fronts off it, {:.0} ms cpu; {} optimised off it, {:.0} ms cpu), back ends {:.0} ms cpu off it; bottom-up preparation {:.0} ms cpu ({} bodies simplified, {} kept, {} shared, {} of the simplified had disagreeing shared ones: body {} attrs {} presence {} preparation {} single {}); {} code bytes",
                 jit::ahead_level().name(),
                 q,
                 jit::TIER_REVALIDATED.load(Ordering::Relaxed),
@@ -3304,6 +3304,11 @@ fn summary_inner(why: &str) {
                 jit::TIER1_RIR_REBUILT[0].load(Ordering::Relaxed),
                 jit::TIER1_RIR_REBUILT[1].load(Ordering::Relaxed) as f64 / 1e6,
                 s.tier1_locked_ns as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[0].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[1].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[2].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[3].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[4].load(Ordering::Relaxed) as f64 / 1e6,
                 jit::TIER1_SNAP_BUILT[0].load(Ordering::Relaxed),
                 jit::TIER1_SNAP_BUILT[1].load(Ordering::Relaxed) as f64 / 1e6,
                 jit::TIER1_SNAP_FRONTS[0].load(Ordering::Relaxed),

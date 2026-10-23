@@ -14151,6 +14151,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     });
         let seen: std::collections::HashSet<u32> = callees.iter().copied().collect();
         let frontier = callees.clone();
+        TIER1_TAKE_PARTS[0].fetch_add(cpu_ns() - s0, Ordering::Relaxed);
         (epoch, rir, version, t1key, sandboxed, callees, seen, src_toks, inline_all, t1_rec, frontier, 0usize, 0usize)
         };
     // (no TIER_ACTIVE pins for the callees: the walk and the snapshot's Arc clones are one publish,
@@ -14239,12 +14240,15 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             budget -= 1;
             let c = frontier[idx];
             let force = t1_rec.as_ref().is_some_and(|(_, snap, _)| snap.contains(&t1_key(up, c)));
+            let te = cpu_ns();
             ensure_rir(c, force, &callees);
+            TIER1_TAKE_PARTS[1].fetch_add(cpu_ns() - te, Ordering::Relaxed);
             idx += 1;
         }
         if level == LEVELS - 1 {
             break;
         }
+        let ts = cpu_ns();
         let u = &*up;
         let mut next = Vec::new();
         for &c in &frontier {
@@ -14283,6 +14287,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         frontier = next;
         level += 1;
         idx = 0;
+        TIER1_TAKE_PARTS[2].fetch_add(cpu_ns() - ts, Ordering::Relaxed);
     }
     // Recorded descendants can be absent from the live traversal (different
     // O1 inlining). Resolve all known keys, repeating when lowering adds slots.
@@ -14304,6 +14309,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         owner_ns.set(owner_ns.get() + cpu_ns() - s0);
         return None;
     }
+    let ta = cpu_ns();
     for &c in &callees { (&mut *up).sync_entry_ref(c); }
     let u = &*up;
     if std::env::var_os("MAKEPAD_RUN_O3_TRACE").is_some() {
@@ -14385,10 +14391,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let mut t1_single_keys = Vec::new();
     for &(c, _, _) in &snap {
         let key = t1_key(up, c);
+        let tr = cpu_ns();
         let is_single = match &t1_rec {
             Some((_, _, recorded)) => recorded.contains(&key),
             None => u.single_ref(c) && !u.recursive_fn(c),
         };
+        TIER1_TAKE_PARTS[4].fetch_add(cpu_ns() - tr, Ordering::Relaxed);
         if !is_single { continue; }
         if let Some(&(owner, 1)) = owners.get(&c) {
             if owner != c {
@@ -14434,6 +14442,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         eprintln!("O3-frequency input @{:.3} ms {} {}", crate::clock::ms_since_start(),
             match &counts { Some(c) => format!("counted entries={} blocks={}", c.first().copied().unwrap_or(0.0), c.iter().filter(|x| **x > 0.0).count()), None => "structural".to_string() }, name);
     }
+    TIER1_TAKE_PARTS[3].fetch_add(cpu_ns() - ta, Ordering::Relaxed);
     owner_ns.set(owner_ns.get() + cpu_ns() - s0);
     Some((rir, version, epoch, t1key, sandboxed, snap, singles, t1_cold_keys, t1_snap_keys, t1_single_keys, t1_freq, t1_inline_freq, ro, env, cfg, name, counts, snap_counts, hot_root))
     })();
@@ -15951,6 +15960,10 @@ pub static TIER1_PREP: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 /// O3 snapshots: inline candidates built on the owner (count, wall ns), and the candidates whose
 /// fronts the O3 thread ran off the owner first (count, cpu ns)
 pub static TIER1_SNAP_BUILT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// (instrument) owner cpu ns of the O3 snapshot take by part: the root's preparation, the
+/// candidates' ensure_rir, the levels' callee scans, the snapshot's assembly, and (inside the
+/// assembly) the single-reference / recursion checks
+pub static TIER1_TAKE_PARTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 pub static TIER1_SNAP_FRONTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// O3 snapshots: inline candidates whose O1 optimisation ran on the O3 thread (count, cpu ns)
 pub static TIER1_SNAP_OFF: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
