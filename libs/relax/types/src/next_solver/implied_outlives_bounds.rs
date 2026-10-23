@@ -29,7 +29,7 @@ pub fn query_compute_implied_outlives_bounds(ocx: &mut ObligationCtxt<'_, '_>, e
     Ok(bounds)
 }
 /// implied_bounds_from_components
-fn push_component_bounds(out: &mut Vec<OutlivesBound>, r: crate::types::RegionId, parts: Vec<Component>) {
+pub(crate) fn push_component_bounds(out: &mut Vec<OutlivesBound>, r: crate::types::RegionId, parts: Vec<Component>) {
     for part in parts { match part {
         Component::Region(s) => out.push(OutlivesBound::RegionSubRegion(r,s)),
         Component::Param(t) => out.push(OutlivesBound::RegionSubParam(r,t)),
