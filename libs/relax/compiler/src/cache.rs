@@ -2729,6 +2729,32 @@ impl Cache {
         h.finish128()
     }
 
+    /// The settle rebuild's new cache (opened as a warm start opens it, from the same stores) takes
+    /// over what the old one learned about this process: which data objects and slots were
+    /// linked from which entries (a second link of the same data object must find its address,
+    /// not place a copy), the entries it rejected, the counters, and that the collected program
+    /// was committed (the exit does not encode it again). The old cache has nothing pending
+    /// (`pending_entries`).
+    pub(crate) fn inherit_run_state(&mut self, old: &Cache) {
+        self.data_addr = old.data_addr.clone();
+        self.const_copy = old.const_copy.clone();
+        self.data_key = old.data_key.clone();
+        self.linked = old.linked.clone();
+        self.linked_key = old.linked_key.clone();
+        self.base_linked = old.base_linked.clone();
+        self.cert_rejected = old.cert_rejected.clone();
+        self.pending_keys = old.pending_keys.clone();
+        self.pending_verdicts = old.pending_verdicts.clone();
+        self.manifest_done = old.manifest_done;
+        self.collected_committed = true;
+        self.stats = old.stats.clone();
+    }
+
+    /// Entries recorded and not yet spilled (the settle rebuild waits for none).
+    pub(crate) fn pending_entries(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Reads the newest startup manifest of the program rooted at crate `root` (and its
     /// prelinked startup image, if it has one).
     pub fn load_manifest(&mut self, root: u32) {
@@ -5301,7 +5327,7 @@ mod cold_tests {
         assert!(matches!(cache.encode_collected(&unit.prog, &unit.tcx, &|| false), CollectedRecord::Current));
 
         let images = FrontImages { dir: store.clone(), ..Default::default() };
-        let (saved, saved_tcx, proof) = images.restore_collected(sess, &pre, None).expect("restore only the boot");
+        let (saved, saved_tcx, proof) = images.restore_collected(sess, &pre).expect("restore only the boot");
         assert_eq!(saved.crates.len(), pre.len());
         assert_eq!(saved.defs.len(), boot_defs);
         assert_eq!(saved.file_paths, boot_files);
@@ -5393,21 +5419,21 @@ mod cold_tests {
             cache.record_collected(&unit.prog, &unit.tcx).expect("record collected graph");
         };
         record(&images);
-        let (whole, _, proof) = images.restore_collected(sess, &pre, None).expect("unchanged sources restore");
+        let (whole, _, proof) = images.restore_collected(sess, &pre).expect("unchanged sources restore");
         assert_eq!(whole.crates.len(), names.len());
         assert!(proof.is_some());
         // a body edit of the top crate: everything below it stays, `top` and the clean `late`
         // after it are collected again
         std::fs::write(&pre[5].root, "pub fn top() -> u32 { mid::mid() + 2 }").unwrap();
-        let (kept, _, proof) = images.restore_collected(sess, &pre, None).expect("prefix restore");
+        let (kept, _, proof) = images.restore_collected(sess, &pre).expect("prefix restore");
         assert_eq!(kept.crates.len(), 5, "crates below the edited one");
         assert!(proof.is_none(), "a partial restore has no whole-graph proof");
         // the next run after recording the edited sources restores everything again
         record(&images);
-        assert_eq!(images.restore_collected(sess, &pre, None).unwrap().0.crates.len(), names.len());
+        assert_eq!(images.restore_collected(sess, &pre).unwrap().0.crates.len(), names.len());
         // a signature change in a lower crate: it and everything above it are collected again
         std::fs::write(&pre[3].root, "pub fn value() -> u64 { 7 }").unwrap();
-        let (kept, _, _) = images.restore_collected(sess, &pre, None).expect("prefix restore");
+        let (kept, _, _) = images.restore_collected(sess, &pre).expect("prefix restore");
         assert_eq!(kept.crates.len(), 3, "only the crates below the changed one");
         std::fs::remove_dir_all(dir).unwrap();
     }

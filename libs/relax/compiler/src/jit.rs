@@ -271,6 +271,8 @@ impl ReloadSlots {
 
 #[path = "bmemo.rs"]
 pub(crate) mod bmemo;
+#[path = "settle_rebuild.rs"]
+pub(crate) mod settle_rebuild;
 
 
 /// Heaps (MEMSAFE.DESIGN.md: placement only, never lifetime -- every block is freed by its owner's
@@ -14463,7 +14465,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             owner_ns.set(owner_ns.get() + cpu_ns() - s0);
             return None;
         }
-        frontier = o3_next_level(up, options, id, inline_all, &frontier, &views.borrow(), &t1_rec, &mut callees, &mut seen);
+        frontier = o3_next_level(up, owner_front(up), options, id, inline_all, &frontier, &views.borrow(), &t1_rec, &mut callees, &mut seen);
         level += 1;
         idx = 0;
     }
@@ -14497,7 +14499,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // the assembly and its owner part: here when the walk ran on the owner, else the assembly off
     // it after this publish and the owner part in one more
     let assembled = (!prefront).then(|| {
-        let mut a = o3_assemble(up, options, id, &rir, &t1key, &t1_rec, &callees, &views.borrow(), inline_all);
+        let mut a = o3_assemble(up, owner_front(up), options, id, &rir, &t1key, &t1_rec, &callees, &views.borrow(), inline_all);
         o3_assemble_owner(up, options, &mut a, &t1key, &t1_rec);
         a
     });
@@ -14577,11 +14579,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     if resume.get() {
         if scan.replace(false) {
             let ts = cpu_ns();
-            let _front = front_read("O3 snapshot walk");
+            let front = front_read("O3 snapshot walk");
             let mut w = walk.borrow_mut();
             let w = w.as_mut().unwrap();
             let frontier = std::mem::take(&mut w.10);
-            w.10 = o3_next_level(up, options, id, w.8, &frontier, &views.borrow(), &w.9, &mut w.5, &mut w.6);
+            w.10 = o3_next_level(up, front.unit(up), options, id, w.8, &frontier, &views.borrow(), &w.9, &mut w.5, &mut w.6);
             w.11 += 1;
             w.12 = 0;
             TIER1_TAKE_PARTS[2].fetch_add(cpu_ns() - ts, Ordering::Relaxed);
@@ -14671,8 +14673,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     };
     let assembled = assembled.unwrap_or_else(|| {
         let mut a = {
-            let _front = front_read("O3 snapshot assembly");
-            o3_assemble(up, options, id, &rir, &t1key, &t1_rec, &callees, &views.borrow(), inline_all)
+            let front = front_read("O3 snapshot assembly");
+            o3_assemble(up, front.unit(up), options, id, &rir, &t1key, &t1_rec, &callees, &views.borrow(), inline_all)
         };
         owner::publish(|| o3_assemble_owner(up, options, &mut a, &t1key, &t1_rec));
         a
@@ -16273,9 +16275,9 @@ fn o3_view(u: &Unit, c: u32) -> O3View {
 /// The next level of an O3 snapshot's walk: the calls (and taken addresses) in the frontier's RIR
 /// outside cold blocks, skipping never-run bodies the cost model does not admit. Reads only the
 /// views, immutable slot keys and prog/tcx (off the owner: under a front read).
-unsafe fn o3_next_level(up: *mut Unit, options: &crate::options::Options, id: u32, inline_all: bool, frontier: &[u32], views: &HashMap<u32, O3View>,
+unsafe fn o3_next_level(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &crate::options::Options, id: u32, inline_all: bool, frontier: &[u32], views: &HashMap<u32, O3View>,
     t1_rec: &Option<(Vec<String>, Vec<String>, Vec<String>)>, callees: &mut Vec<u32>, seen: &mut std::collections::HashSet<u32>) -> Vec<u32> {
-    let (prog, tcx, fns, core) = (&*std::ptr::addr_of!((*up).prog), &*std::ptr::addr_of!((*up).tcx), &*std::ptr::addr_of!((*up).fns), *std::ptr::addr_of!((*up).core_crate));
+    let (fns, core) = (&*std::ptr::addr_of!((*up).fns), *std::ptr::addr_of!((*up).core_crate));
     let mut next = Vec::new();
     for &c in frontier {
         let Some(v) = views.get(&c) else { continue };
@@ -16329,10 +16331,10 @@ struct O3Assembled {
 
 /// The snapshot from the walk's views (the views, immutable slot keys, prog/tcx and the replay
 /// profile; off the owner: under a front read).
-unsafe fn o3_assemble(up: *mut Unit, options: &crate::options::Options, id: u32, rir: &relax_backend::rir::Func, t1key: &Option<String>,
+unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &crate::options::Options, id: u32, rir: &relax_backend::rir::Func, t1key: &Option<String>,
     t1_rec: &Option<(Vec<String>, Vec<String>, Vec<String>)>, callees: &[u32], views: &HashMap<u32, O3View>, inline_all: bool) -> O3Assembled {
     let ta = cpu_ns();
-    let (prog, tcx, fns, core) = (&*std::ptr::addr_of!((*up).prog), &*std::ptr::addr_of!((*up).tcx), &*std::ptr::addr_of!((*up).fns), *std::ptr::addr_of!((*up).core_crate));
+    let (fns, core) = (&*std::ptr::addr_of!((*up).fns), *std::ptr::addr_of!((*up).core_crate));
     let mut snap: Vec<(u32, std::sync::Arc<relax_backend::rir::Func>, u8)> = Vec::new();
     let mut t1_cold_keys: Vec<String> = Vec::new();
     let mut t1_snap_keys: Vec<String> = Vec::new();
@@ -18016,17 +18018,60 @@ impl Drop for FrontRead {
         }
     }
 }
+impl FrontRead {
+    /// The program and type context of unit `up` for as long as this front read is held. The
+    /// settle rebuild replaces them under a front write (settle_rebuild.rs), so every thread but
+    /// the owner reads them through a front read: the references cannot outlive it.
+    pub(crate) fn unit(&self, up: *const Unit) -> (&Program, &Tcx) {
+        unsafe { (&*std::ptr::addr_of!((*up).prog), &*std::ptr::addr_of!((*up).tcx)) }
+    }
+
+    /// `unit` through a front state's pointers (type checks ahead, lowering ahead, Gandalf).
+    pub(crate) fn of<'g>(&'g self, f: &FrontShared) -> (&'g Program, &'g Tcx) {
+        f.ptrs.get(self)
+    }
+}
+
+/// The program and type context of unit `up` on the owner thread: the only thread that replaces
+/// them (the settle rebuild is an owner request), so its own reads need no front read.
+unsafe fn owner_front<'u>(up: *const Unit) -> (&'u Program, &'u Tcx) {
+    debug_assert!(owner::is_owner());
+    (&*std::ptr::addr_of!((*up).prog), &*std::ptr::addr_of!((*up).tcx))
+}
+
 pub fn front_read(site: &'static str) -> FrontRead {
     let g = FRONT_RW.read().unwrap_or_else(|e| e.into_inner());
     FrontRead { _g: g, traced: front_trace().then(|| (site, std::time::Instant::now())) }
 }
 /// What type checks ahead need of a unit, reachable without its lock: the program and type
 /// context (shared, Sync), slot keys, and the checked bodies waiting for their builds.
+mod front_ptrs {
+    use super::{FrontRead, Program, Tcx};
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    /// A front state's pointers to its unit's program and type context. The fields are private:
+    /// the only way to the program off the owner is `get` with a front read, whose lifetime the
+    /// references take, so none outlives the read the settle rebuild's front write waits for.
+    #[derive(Default)]
+    pub(crate) struct FrontPtrs {
+        prog: AtomicPtr<Program>,
+        tcx: AtomicPtr<Tcx>,
+    }
+    impl FrontPtrs {
+        pub(crate) fn set(&self, prog: &Program, tcx: &Tcx) {
+            self.prog.store(prog as *const Program as *mut Program, Ordering::SeqCst);
+            self.tcx.store(tcx as *const Tcx as *mut Tcx, Ordering::SeqCst);
+        }
+        pub(crate) fn get<'g>(&self, _read: &'g FrontRead) -> (&'g Program, &'g Tcx) {
+            unsafe { (&*self.prog.load(Ordering::Acquire), &*self.tcx.load(Ordering::Acquire)) }
+        }
+    }
+}
+
 pub struct FrontShared {
     census_id: usize,
     session: std::sync::Arc<crate::Session>,
-    prog: std::sync::atomic::AtomicPtr<Program>,
-    tcx: std::sync::atomic::AtomicPtr<Tcx>,
+    /// the unit's program and type context: read only through a front read (`FrontRead::of`)
+    ptrs: front_ptrs::FrontPtrs,
     unit: std::sync::atomic::AtomicPtr<Unit>,
     core_crate: std::sync::atomic::AtomicU32,
     src_toks: std::sync::atomic::AtomicU32,
@@ -18104,8 +18149,7 @@ impl FrontShared {
         FrontShared {
             census_id: relax_codegen::exec_census::new_unit(),
             session: sess.clone(),
-            prog: Default::default(),
-            tcx: Default::default(),
+            ptrs: front_ptrs::FrontPtrs::default(),
             unit: Default::default(),
             core_crate: Default::default(),
             src_toks: Default::default(),
@@ -18145,8 +18189,8 @@ fn canon_slots(d: String) -> String {
         Some(f) => f,
         None => return d,
     };
-    let _r = front_read("canon_slots");
-    let (prog, tcx) = unsafe { (&*f.prog.load(Ordering::Relaxed), &*f.tcx.load(Ordering::Relaxed)) };
+    let r = front_read("canon_slots");
+    let (prog, tcx) = r.of(f);
     let name_of = |id: u32| -> Option<String> {
         Some(match f.slot_keys.get(&id)? {
             FnKey::Inst(d, a) => {
@@ -18212,8 +18256,7 @@ fn set_shared_front(u: &mut Unit, core_crate: u32) {
     let up = u as *mut Unit;
     let f = &u.front;
     f.unit.store(up, Ordering::SeqCst);
-    f.prog.store(&u.prog as *const Program as *mut Program, Ordering::SeqCst);
-    f.tcx.store(&u.tcx as *const Tcx as *mut Tcx, Ordering::SeqCst);
+    f.ptrs.set(&u.prog, &u.tcx);
     f.core_crate.store(core_crate, Ordering::SeqCst);
     f.src_toks.store(inline_src_toks(options, tier1).max(inline_src_toks(options, !tier1)), Ordering::SeqCst);
     f.alive.store(true, Ordering::SeqCst);
@@ -18291,8 +18334,8 @@ fn ahead_helper(f: std::sync::Arc<FrontShared>, index: u32) {
                         drop(keys);
                         drop(q);
                         if ahead_trace() {
-                            let _r = front_read("ahead_trace");
-                            let prog = unsafe { &*f.prog.load(Ordering::Relaxed) };
+                            let r = front_read("ahead_trace");
+                            let (prog, _) = r.of(f);
                             for (d, _) in &unused { eprintln!("ahead-dropped {}", prog.def_path(*d)); }
                         }
                         drop(unused);
@@ -19283,11 +19326,11 @@ impl crate::borrowck::lazy::FrontSource for BorrowckFront {
     }
     fn with_front(&self, f: &mut dyn FnMut(&Program, &Tcx, &crate::tcx::EvalCx<'_>)) -> bool {
         let _job = compile_job();
-        let _r = front_read("gandalf");
+        let r = front_read("gandalf");
         if !self.0.alive.load(Ordering::SeqCst) {
             return false;
         }
-        let (prog, tcx) = unsafe { (&*self.0.prog.load(Ordering::Relaxed), &*self.0.tcx.load(Ordering::Relaxed)) };
+        let (prog, tcx) = r.of(&self.0);
         let cx_state = crate::tcx::EvalState::new();
         let cx = crate::tcx::EvalCx::new(prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &cx_state);
         f(prog, tcx, &cx);
@@ -19338,9 +19381,9 @@ pub fn start_background_coherence(u: &Unit) {
             if SPEC_STOP.load(Ordering::SeqCst) || crate::preempt::is_stopped() { return; }
             let r = {
                 let _job = compile_job();
-                let _r = front_read("coherence");
+                let r = front_read("coherence");
                 if !front.alive.load(Ordering::SeqCst) { return; }
-                let (prog, tcx) = unsafe { (&*front.prog.load(Ordering::Relaxed), &*front.tcx.load(Ordering::Relaxed)) };
+                let (prog, tcx) = r.of(&front);
                 let t0 = std::time::Instant::now();
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let _p = crate::preempt::Preemptible::on();

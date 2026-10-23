@@ -367,6 +367,13 @@ pub fn kept_clone<T: Clone>(v: &T) -> T {
     v.clone()
 }
 
+/// Does `p` lie in the compiler arena? (Placement only: which heap holds a block decides the
+/// footprint, never its lifetime.)
+#[inline]
+pub fn compiler_owns(p: *const u8) -> bool {
+    compiler::owns(p as *mut u8)
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
 pub mod domain;
 

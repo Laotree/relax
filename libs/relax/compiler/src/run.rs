@@ -825,6 +825,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     crate::borrowck::event::set_app_scope(app_roots);
     // `makepad check` borrow-checks every crate it loads: all keep their user-written types
     if check { crate::borrowck::event::set_check_scope(); }
+    jit::settle_rebuild::remember_boot(&pre);
     let front_images = crate::cache::FrontImages::open(options);
     prog.record_front = front_images.is_some();
     prog.front_sink = front_images.as_ref().and_then(|images| images.sink());
@@ -2179,6 +2180,10 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         // whatever compiles run meanwhile (tools/run/fixture/settle_stress.sh)
         let settle_stress = std::env::var("MAKEPAD_RUN_SETTLE_STRESS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&ms| ms > 0);
         let mut last_stress = Instant::now();
+        // the settle rebuild (jit settle_rebuild.rs): once per settled compile count, retried while
+        // its preconditions fail
+        let (mut rebuild_over, mut rebuild_round, mut rebuild_done) = (!jit::settle_rebuild::enabled(), None, false);
+        let (mut rebuild_next, mut rebuild_tries, mut rebuild_said) = (Instant::now(), 0u32, String::new());
         let mut present_bytes = Vec::new();
         let (mut quiet, mut seen, mut trimmed) = (0u32, 0u64, 0u64);
         // growth relief (below): the resident size after the last trim and when it ran
@@ -2291,6 +2296,8 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                     if last_stress.elapsed().as_millis() as u64 >= ms {
                         last_stress = Instant::now();
                         SETTLE_REQUESTED.store(true, Ordering::Release);
+                        // and a rebuild after it
+                        rebuild_done = false;
                     }
                 }
                 let requested = SETTLE_REQUESTED.swap(false, Ordering::AcqRel);
@@ -2355,6 +2362,38 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                         crate::owner::call(crate::owner::Class::Program, || {
                             crate::memstat::print("after the settle and the adoption", &crate::memreport::unit_sizes(unsafe { &*up }));
                         });
+                    }
+                }
+            }
+            let settled = settle_watch.settled.filter(|&n| n == jit::COMPILED_FNS.load(Ordering::Relaxed));
+            if settled.is_some() && rebuild_round != settled {
+                rebuild_round = settled;
+                rebuild_done = false;
+                rebuild_tries = 0;
+                rebuild_next = Instant::now();
+            }
+            let rebuild_block: Option<&'static str> = if rebuild_over || rebuild_done || Instant::now() < rebuild_next { Some("") }
+                else if settled.is_none() { Some("not settled") }
+                else if !(COLLECTED_CURRENT.load(Ordering::Relaxed) || COLLECTED_RESTORED.load(Ordering::Relaxed)) { Some("the collected image is not current") }
+                else if COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).is_some() { Some("the collected image's tables are not adopted yet") }
+                else if !MID_MANIFEST_DONE.load(Ordering::Relaxed) { Some("the mid-run manifest is not written") }
+                else if crate::cache::front_graph_pending() { Some("front graphs are pending") }
+                else if mid_busy.load(Ordering::SeqCst) { Some("a mid-run cache write is running") }
+                else if !teardown_started { Some("the teardown is not scheduled") }
+                else if jit::QUIT_SEEN.load(Ordering::Relaxed) { Some("the run is quitting") }
+                else { None };
+            if rebuild_block.is_none() {
+                let up = unsafe { RUN_UNIT };
+                if !up.is_null() {
+                    rebuild_tries += 1;
+                    match jit::settle_rebuild::run(up) {
+                        jit::settle_rebuild::Outcome::Done => rebuild_done = true,
+                        jit::settle_rebuild::Outcome::Refused(why) => { verbose!("makepad-run settle rebuild refused: {why}"); rebuild_over = true; }
+                        jit::settle_rebuild::Outcome::Retry(why) => {
+                            if why != rebuild_said { verbose!("makepad-run settle rebuild deferred (try {rebuild_tries}): {why}"); rebuild_said = why; }
+                            rebuild_next = Instant::now() + std::time::Duration::from_secs(1);
+                            if rebuild_tries >= 40 { rebuild_done = true; }
+                        }
                     }
                 }
             }
@@ -2430,6 +2469,11 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
 }
 
 static RUN_DIAGNOSTICS: relax_session::sync::Mutex<Option<relax_types::infer::diagnostics::DiagCtxt>> = relax_session::sync::Mutex::new(None);
+
+/// The diagnostics context the run reports through (a settle rebuild installs its new one).
+pub(crate) fn set_diagnostics(dcx: relax_types::infer::diagnostics::DiagCtxt) {
+    *RUN_DIAGNOSTICS.lock().unwrap_or_else(|e| e.into_inner()) = Some(dcx);
+}
 
 
 extern "C" fn at_exit() {

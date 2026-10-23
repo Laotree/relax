@@ -290,7 +290,35 @@ struct Encoder<'a> {
 
 
 
+/// The cache fields the collected encode reads, copied in one owner request: the settle rebuild
+/// (jit settle_rebuild.rs) then encodes the program on its own thread under a front read. The
+/// owner may `take()` the cache meanwhile.
+pub(crate) struct CollectedInputs {
+    mode: Mode,
+    dir: PathBuf,
+    fps: Vec<u128>,
+    iface_plain: Vec<u128>,
+    crate_path: Vec<PathBuf>,
+    crate_ident: Vec<u128>,
+}
+
+impl CollectedInputs {
+    /// The collected image of the program as it is now: neither a committed mark nor a frozen
+    /// boot snapshot short-circuits it, so the image covers every type, definition and file
+    /// added since the first encode (the settle rebuild restores from it, and compares the counts).
+    pub(crate) fn encode_now(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool) -> CollectedRecord {
+        Encoder { mode: self.mode, dir: &self.dir, fps: &self.fps, iface_plain: &self.iface_plain,
+            crate_path: &self.crate_path, crate_ident: &self.crate_ident, boot: None, committed: false }
+            .encode_as(prog, tcx, stop, true)
+    }
+}
+
 impl Cache {
+    pub(crate) fn collected_inputs(&self) -> CollectedInputs {
+        CollectedInputs { mode: self.mode, dir: self.dir.clone(), fps: self.fps.clone(), iface_plain: self.iface_plain.clone(),
+            crate_path: self.crate_path.clone(), crate_ident: self.crate_ident.clone() }
+    }
+
     fn encoder(&self) -> Encoder<'_> {
         Encoder { mode: self.mode, dir: &self.dir, fps: &self.fps, iface_plain: &self.iface_plain,
             crate_path: &self.crate_path, crate_ident: &self.crate_ident, boot: self.collected_boot.as_ref(),
@@ -352,7 +380,7 @@ impl Cache {
     /// record never holds a frame up; the caller retries later. The store write
     /// (commit_collected) needs no lock.
     pub fn encode_collected(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool) -> CollectedRecord {
-        self.encoder().encode_as(prog, tcx, stop)
+        self.encoder().encode_as(prog, tcx, stop, false)
     }
 }
 
@@ -409,13 +437,13 @@ impl Encoder<'_> {
         Some(image)
     }
 
-    fn encode_as(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool) -> CollectedRecord {
+    fn encode_as(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool, fresh: bool) -> CollectedRecord {
         if !enabled() || self.mode == Mode::ReadOnly { return CollectedRecord::Failed; }
-        if self.committed { return CollectedRecord::Current; }
+        if self.committed && !fresh { return CollectedRecord::Current; }
         let mut why = "recipe";
         let mut yielded = false;
         let recorded = (|| {
-        let frozen = self.boot;
+        let frozen = self.boot.filter(|_| !fresh);
         let recipe = frozen.map(|boot| &boot.recipe).or(prog.front_graph.as_ref())?;
         why = "graph certificate";
         let graph = read_front_graph(self.dir, recipe.identity)?;

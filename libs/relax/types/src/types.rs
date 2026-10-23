@@ -529,7 +529,17 @@ impl Types {
         self.len.load(std::sync::atomic::Ordering::Acquire) as usize
     }
 
+    /// (interned regions, interned region lists): the settle rebuild compares them before and
+    /// after the restore (type ids and region ids must come back identical).
+    pub fn region_counts(&self) -> (usize, usize) {
+        (self.regions.kinds.len(), self.regions.args.len())
+    }
 
+    /// (list arena words, interned constants): with `len` and `region_counts`, what the settle
+    /// rebuild compares (only the interners may grow between its encode and its replace).
+    pub fn list_const_counts(&self) -> (usize, usize) {
+        (self.lists.end(), self.const_count())
+    }
 
     /// Memory report lines: the arena, the list arena, and the part that holds inference
     /// variables (types only one body's check can use).
