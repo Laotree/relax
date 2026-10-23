@@ -315,12 +315,15 @@ fn main() {}
         assert_eq!(result, 19900);
         assert!(unsafe { compile_tier1(up, id) });
         let recorded = crate::owner::call(crate::owner::Class::App, || {
+            // (an O3 install's record is encoded in the record batches)
+            u.flush_cache_records();
             let recorded = u.cache.as_ref().unwrap().stats.recorded;
             // A retier replaces the first O3 entry too.
             recorded
         });
         assert!(unsafe { compile_tier1(up, id) });
         let spill = crate::owner::call(crate::owner::Class::App, || {
+            u.flush_cache_records();
             assert_eq!(u.cache.as_ref().unwrap().stats.recorded, recorded + 1);
             let mut cache = u.cache.take().unwrap();
             let recorded = cache.stats.recorded;

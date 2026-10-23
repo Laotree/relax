@@ -219,17 +219,20 @@ static NOW_T0: AtomicU64 = AtomicU64::new(0);
 pub struct SiteAcc {
     site: std::sync::atomic::AtomicPtr<std::panic::Location<'static>>,
     class: AtomicU8,
-    /// [requests, owner ns, O1 optimisation ns on the owner, main's queue ns behind it, main waits behind it]
-    pub acc: [AtomicU64; 5],
+    /// [requests, owner ns, O1 optimisation ns on the owner, main's queue ns behind it, main waits behind it,
+    /// services of 1 ms or more, the longest service ns]
+    pub acc: [AtomicU64; 7],
 }
 
 const SITES_N: usize = 96;
-pub static SITES: [SiteAcc; SITES_N] = [const { SiteAcc { site: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), class: AtomicU8::new(0), acc: [const { AtomicU64::new(0) }; 5] } }; SITES_N];
+pub static SITES: [SiteAcc; SITES_N] = [const { SiteAcc { site: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), class: AtomicU8::new(0), acc: [const { AtomicU64::new(0) }; 7] } }; SITES_N];
 pub const SITE_REQS: usize = 0;
 pub const SITE_NS: usize = 1;
 pub const SITE_OPT_NS: usize = 2;
 pub const SITE_BEHIND_NS: usize = 3;
 pub const SITE_BEHIND_N: usize = 4;
+pub const SITE_LONG_N: usize = 5;
+pub const SITE_MAX_NS: usize = 6;
 /// main's queue delay (after the first present) by what the owner served when it asked: per class,
 /// and the owner idle (last row): [waits, ns]
 pub static MAIN_BEHIND: [[AtomicU64; 2]; CLASSES + 1] = [const { [const { AtomicU64::new(0) }; 2] }; CLASSES + 1];
@@ -286,8 +289,8 @@ pub fn sites_summary(n: usize) -> String {
             None => "other".to_string(),
         };
         let c = CLASS_NAMES[row.class.load(Ordering::Relaxed) as usize % CLASSES];
-        rows.push((a(SITE_NS).max(a(SITE_BEHIND_NS)), format!("{} {} {}x {:.0} ms (O1 opt {:.0} ms), main behind it {}x {:.0} ms",
-            c, name, a(SITE_REQS), a(SITE_NS) as f64 / 1e6, a(SITE_OPT_NS) as f64 / 1e6, a(SITE_BEHIND_N), a(SITE_BEHIND_NS) as f64 / 1e6)));
+        rows.push((a(SITE_NS).max(a(SITE_BEHIND_NS)), format!("{} {} {}x {:.0} ms (O1 opt {:.0} ms, {} of 1 ms or more, longest {:.1} ms), main behind it {}x {:.0} ms",
+            c, name, a(SITE_REQS), a(SITE_NS) as f64 / 1e6, a(SITE_OPT_NS) as f64 / 1e6, a(SITE_LONG_N), a(SITE_MAX_NS) as f64 / 1e6, a(SITE_BEHIND_N), a(SITE_BEHIND_NS) as f64 / 1e6)));
     }
     let mut by_behind: Vec<(u64, String)> = Vec::new();
     for row in SITES.iter() {
@@ -1209,6 +1212,10 @@ fn serve(r: usize) {
     let row = site_acc(req.site, req.class);
     row.acc[SITE_REQS].fetch_add(1, Ordering::Relaxed);
     row.acc[SITE_NS].fetch_add(t1.saturating_sub(t0), Ordering::Relaxed);
+    if t1.saturating_sub(t0) >= 1_000_000 {
+        row.acc[SITE_LONG_N].fetch_add(1, Ordering::Relaxed);
+    }
+    row.acc[SITE_MAX_NS].fetch_max(t1.saturating_sub(t0), Ordering::Relaxed);
     note_served(req.class, req.from, req.site, t0, t1);
     crate::postframe::owner_served(req.class as usize, req.site, req.from, t0, t1, FOREGROUND.load(Ordering::Relaxed));
     // the process is ending on another thread: this request is never answered (its requester

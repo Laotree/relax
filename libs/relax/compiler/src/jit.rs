@@ -13856,11 +13856,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             let p = g.as_ref().unwrap();
             if p.replay { p.map.get(k).map(|e| (e.cold.clone(), e.snap.clone(), e.single.clone())) } else { None }
     });
-    let mut input_pins = Vec::new();
-    let mut ensure_rir = |c: u32, force: bool, callers: &[u32]| {
-        // Each prepared callee stays readable until the final Arc snapshots exist.
-        TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(c);
-        input_pins.push(TierActive(c));
+    // (no TIER_ACTIVE pins for the callees: the walk and the snapshot's Arc clones are one publish,
+    // and what reads TIER_ACTIVE to keep RIR (settle_drop, the O2 install) are publishes too)
+    let ensure_rir = |c: u32, force: bool, callers: &[u32]| {
         let u = &mut *up;
         u.sync_entry_ref(c);
         if u.fns[c as usize].rir.as_ref().is_some_and(|r| upgradable(r)) {
@@ -14058,7 +14056,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
     }
     t1_cold_keys.sort();
-    drop(input_pins);
     t1_cold_keys.dedup();
     t1_snap_keys.sort();
     t1_snap_keys.dedup();
@@ -14184,11 +14181,21 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // optimisation here; the RIR stored by a finish. What was left out or failed is built by the
     // snapshot as before, or left out of it.
     // (a take: a candidate needing a front bails alone, inside, and is left to the snapshot)
-    let (preps, gave, more_needs): (Vec<(u32, Prep)>, Vec<u32>, Vec<u32>) = owner::publish_or_bail(|| {
-        let (p, g) = o3_candidates_begin(up, &ids);
-        (p, g, owner::take_needs())
-    }).unwrap_or_else(|_| (Vec::new(), ids.iter().map(|x| x.0).collect(), Vec::new()));
-    needs.extend(more_needs);
+    // (CAND_TAKE candidates per take: a publish is bounded by its item count)
+    let (mut preps, mut gave): (Vec<(u32, Prep)>, Vec<u32>) = (Vec::new(), Vec::new());
+    for chunk in ids.chunks(CAND_TAKE) {
+        match owner::publish_or_bail(|| {
+            let (p, g) = o3_candidates_begin(up, chunk);
+            (p, g, owner::take_needs())
+        }) {
+            Ok((p, g, n)) => {
+                preps.extend(p);
+                gave.extend(g);
+                needs.extend(n);
+            }
+            Err(_) => gave.extend(chunk.iter().map(|x| x.0)),
+        }
+    }
     {
         let mut so = split_out.borrow_mut();
         for x in &ids { so.insert(x.0, 3); }
@@ -14475,9 +14482,18 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 let speculative = spec_ctx.as_ref().is_some_and(|c| c.emitted.get());
                 // (inspect's builds are this session's: never cached)
                 if frame_size <= frame_max && !unverified && !speculative && !inspect_o3_on() {
-                    if let Some(mut c) = u.cache.take() {
-                        c.record_o3(u, id, &code, &relocs, &map, &inlined, &nounwind_used);
+                    // its key and certificate encoding in the bounded record batches (records_due),
+                    // not in this publish
+                    if let Some(c) = u.cache.take() {
+                        let tr = cpu_ns();
+                        let p = c.defer_record_o3(u, id, &code, &relocs, &map, &inlined, &nounwind_used);
                         u.cache = Some(c);
+                        if let Some(p) = p {
+                            u.pending_cache_records.push(Some(p));
+                            PENDING_RECORDS.fetch_add(1, Ordering::Relaxed);
+                        }
+                        O3_INSTALL_REC[0].fetch_add(1, Ordering::Relaxed);
+                        O3_INSTALL_REC[1].fetch_add(cpu_ns() - tr, Ordering::Relaxed);
                     }
                 }
                 u.fns[id as usize].o3.store(true, Ordering::Relaxed);
@@ -15702,6 +15718,9 @@ pub static CAND_SKIP: [AtomicU64; 27] = [const { AtomicU64::new(0) }; 27];
 fn cand_skip(i: usize) {
     CAND_SKIP[i].fetch_add(1, Ordering::Relaxed);
 }
+/// (instrument) O3 installs' cache records made inside the install publish: (count, owner cpu ns)
+pub static O3_INSTALL_REC: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
 pub(crate) fn cand_skip_summary() -> String {
     const N: [&str; 27] = ["building", "inflight", "build-err", "key", "unverified", "no-rir", "not-upgradable", "relower", "has-rir", "begin-err", "needs-front", "bail", "other", "PREPPED", "fin-epoch", "fin-building", "fin-not-replacing", "FIN-STORED", "fin-opt-err",
         "owner-up:no-split", "owner-up:gave", "owner-up:prepped", "owner-up:skipped", "owner-t0:no-split", "owner-t0:gave", "owner-t0:prepped", "owner-t0:skipped"];
@@ -15721,6 +15740,9 @@ fn splits_off_owner(u: &Unit, c: u32, upgrade: bool) -> bool {
         FnKey::Sandbox(_) => false,
     }
 }
+
+/// O1 builds one take of an O3 snapshot prepares (o3_candidates_begin): a publish's item bound
+const CAND_TAKE: usize = 8;
 
 /// Takes an O3 snapshot gives a candidate whose preparation needed fronts: each round fronts the
 /// level of inline candidates the last one revealed (each round walks the frontier again)
