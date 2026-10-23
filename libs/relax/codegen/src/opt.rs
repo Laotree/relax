@@ -7593,7 +7593,26 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
                 }
             }
         }
-        let tracked: Vec<bool> = (0..ns).map(|s2| f.slots[s2].size > 0 && (!sc.esc[s2] || sret_call[s2].is_some())).collect();
+        // a slot whose address goes only to calls that keep no copy of it and do not return it
+        // (`f.nocapture`: LLVM's nocapture from FunctionAttrs; reconcile's entries reached
+        // Arc::drop_slow on the cold path of their `Option<Arc>` field): tracked, each such call
+        // reading the whole slot and maybe writing any of it
+        let nocap = |c: &Callee, k: u32| f.nocapture.iter().any(|x| x.0 == *c && x.1 == k && !x.2);
+        let nc_only: Vec<bool> = (0..ns).map(|s2| sc.esc[s2] && !sc.esc_other[s2] && sret_call[s2].is_none()
+            && sc.call_args[s2].iter().all(|&(bi, ii, k)| matches!(&f.blocks[bi].insts[ii], Inst::Call(c, _, _) if nocap(c, k)))).collect();
+        let tracked: Vec<bool> = (0..ns).map(|s2| f.slots[s2].size > 0 && (!sc.esc[s2] || sret_call[s2].is_some() || nc_only[s2])).collect();
+        // (block, inst) of a nocapture call -> the tracked slots it is passed
+        let mut nc_at: std::collections::HashMap<(usize, usize), Vec<u32>> = std::collections::HashMap::new();
+        for s2 in 0..ns {
+            if nc_only[s2] && tracked[s2] {
+                for &(bi, ii, _) in &sc.call_args[s2] {
+                    let v = nc_at.entry((bi, ii)).or_default();
+                    if !v.contains(&(s2 as u32)) {
+                        v.push(s2 as u32);
+                    }
+                }
+            }
+        }
         // copies that joined slots made into a slot's bytes onto themselves: gone
         let mut selfs: Vec<(usize, usize)> = Vec::new();
         for (bi, b) in f.blocks.iter().enumerate() {
@@ -7775,6 +7794,11 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
                 for (ii, i) in f.blocks[bi].insts.iter().enumerate().rev() {
                     let (rd, wr) = acc(i, bi, ii);
                     xfer(&mut cur, rd, wr);
+                    if let Some(v) = nc_at.get(&(bi, ii)) {
+                        for &s2 in v {
+                            xfer(&mut cur, Some((s2, 0, i64::MAX)), None);
+                        }
+                    }
                 }
                 if live_in[bi * w..bi * w + w] != cur[..] {
                     live_in[bi * w..bi * w + w].copy_from_slice(&cur);
@@ -7802,9 +7826,11 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
             }
             for ii in (0..f.blocks[bi].insts.len()).rev() {
                 let (rd, wr) = acc(&f.blocks[bi].insts[ii], bi, ii);
+                // a nocapture call may write any byte of the slots it is passed
+                let ncw: Vec<(u32, i64, i64)> = nc_at.get(&(bi, ii)).map_or(Vec::new(), |v| v.iter().map(|&s2| (s2, 0, i64::MAX)).collect());
                 // `cur` is live after this instruction: a write of one candidate slot needs the
                 // partner's same bytes dead here
-                if let Some((s2, lo, hi)) = wr {
+                for (s2, lo, hi) in wr.into_iter().chain(ncw.iter().copied()) {
                     for &k in &of_slot[s2 as usize] {
                         let (cb, ci, bs, cs) = cands[k];
                         if (cb, ci) == (bi, ii) || bad[k] {
@@ -7831,6 +7857,9 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
                     }
                 }
                 xfer(&mut cur, rd, wr);
+                for &(s2, _, _) in &ncw {
+                    xfer(&mut cur, Some((s2, 0, i64::MAX)), None);
+                }
             }
         }
         if slotcoal_trace() {

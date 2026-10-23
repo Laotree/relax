@@ -9285,7 +9285,7 @@ unsafe fn tail_nocapture_facts(up: *mut Unit, id: u32, func: &mut relax_backend:
                 continue;
             }
             let r = match &c {
-                Callee::Fn(x) => known_nocapture(up, *x, k, 3, mode, &mut memo, &mut reads),
+                Callee::Fn(x) => known_nocapture(up, *x, k, 3, &|c| rir_for_fact(up, c, mode), &mut memo, &mut reads),
                 Callee::Host(s) => host_nocapture(&*up, *s).then_some(false),
                 _ => None,
             };
@@ -9311,19 +9311,22 @@ fn host_nocapture(u: &Unit, s: relax_backend::rir::Sym) -> bool {
     [u.rs.memcpy, u.rs.memmove, u.rs.memset, u.rs.str_eq].iter().any(|x| x.id == s.id)
 }
 
-unsafe fn known_nocapture(up: *mut Unit, c: u32, k: usize, depth: u32, mode: RirMode, memo: &mut Vec<(u32, usize, Option<bool>)>, reads: &mut Vec<u32>) -> Option<bool> {
+/// Whether callee `c` keeps no copy of its pointer argument `k` (Some: and whether it may return
+/// it), from its RIR (`rir`; None: not known, it may), calls it passes the pointer to asked in
+/// turn `depth` deep. The bodies read go to `reads` (dependencies of the asking body).
+unsafe fn known_nocapture(up: *mut Unit, c: u32, k: usize, depth: u32, rir: &dyn Fn(u32) -> Option<std::sync::Arc<relax_backend::rir::Func>>, memo: &mut Vec<(u32, usize, Option<bool>)>, reads: &mut Vec<u32>) -> Option<bool> {
     if let Some(&(_, _, v)) = memo.iter().find(|x| x.0 == c && x.1 == k) {
         return v;
     }
     // asked while its own answer is open (recursion): it may keep it
     memo.push((c, k, None));
-    let v = match rir_for_fact(up, c, mode) {
+    let v = match rir(c) {
         Some(r) => {
             reads.push(c);
             let memo_c = std::cell::RefCell::new(std::mem::take(memo));
             let reads_c = std::cell::RefCell::new(std::mem::take(reads));
             let v = relax_codegen::opt::param_escape(&r, k, &|c2, k2| match c2 {
-                relax_backend::rir::Callee::Fn(x) if depth > 0 => known_nocapture(up, *x, k2, depth - 1, mode, &mut memo_c.borrow_mut(), &mut reads_c.borrow_mut()),
+                relax_backend::rir::Callee::Fn(x) if depth > 0 => known_nocapture(up, *x, k2, depth - 1, rir, &mut memo_c.borrow_mut(), &mut reads_c.borrow_mut()),
                 relax_backend::rir::Callee::Host(s) => host_nocapture(&*up, *s).then_some(false),
                 _ => None,
             });
@@ -9337,6 +9340,85 @@ unsafe fn known_nocapture(up: *mut Unit, c: u32, k: usize, depth: u32, mode: Rir
         e.2 = v;
     }
     v
+}
+
+/// O3: the calls of a build's root and inline candidates that pass a pointer from a parameter or
+/// a stack slot (callee, argument index), callees the snapshot cannot inline: the questions
+/// for `o3_nocapture_facts`. Pure (off the owner).
+fn o3_nocapture_asks(root: &relax_backend::rir::Func, snap: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)]) -> Vec<(u32, u32)> {
+    use relax_backend::rir::{Callee, Inst, IOp};
+    let mut asks: Vec<(u32, u32)> = Vec::new();
+    for f in std::iter::once(root).chain(snap.iter().map(|x| &*x.1)) {
+        let mut ptr = vec![false; f.vregs.len()];
+        for p in &f.params {
+            ptr[p.0 as usize] = true;
+        }
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for i in f.blocks.iter().flat_map(|b| &b.insts) {
+                let d = match i {
+                    Inst::SlotAddr(d, _) => *d,
+                    Inst::Mov(d, x) | Inst::IBinI(IOp::Add, _, d, x, _) if ptr[x.0 as usize] => *d,
+                    _ => continue,
+                };
+                if !ptr[d.0 as usize] {
+                    ptr[d.0 as usize] = true;
+                    grew = true;
+                }
+            }
+        }
+        for i in f.blocks.iter().flat_map(|b| &b.insts) {
+            if let Inst::Call(Callee::Fn(c), args, _) = i {
+                if snap.iter().any(|x| x.0 == *c) {
+                    continue;
+                }
+                for (k, a) in args.iter().enumerate() {
+                    if ptr[a.0 as usize] && !asks.contains(&(*c, k as u32)) {
+                        asks.push((*c, k as u32));
+                    }
+                }
+            }
+        }
+    }
+    asks
+}
+
+/// O3: the nocapture facts (`Func::nocapture`) of `asks` from the RIR the slots have (a publish:
+/// nothing is built here), the bodies they were read from noted as `id`'s dependencies. The
+/// second result: callees whose RIR the answers needed and that have none (the caller builds
+/// them off the owner and asks again). coalesce_slot_copies joins the slots handed only to such
+/// calls (reconcile's entries reached Arc::drop_slow, which never runs, on the cold path of an
+/// `Option<Arc>` field; LLVM knows it nocapture from FunctionAttrs).
+unsafe fn o3_nocapture_facts(up: *mut Unit, id: u32, asks: &[(u32, u32)]) -> (Vec<(relax_backend::rir::Callee, u32, bool)>, Vec<u32>) {
+    let missing = std::cell::RefCell::new(Vec::new());
+    let have = |c: u32| -> Option<std::sync::Arc<relax_backend::rir::Func>> {
+        let u = &*up;
+        if (c as usize) >= u.fns.len() || matches!(u.fns[c as usize].key, FnKey::Sandbox(_) | FnKey::Plain(_)) {
+            return None;
+        }
+        let e = &u.fns[c as usize];
+        match &e.rir {
+            Some(r) => Some(r.clone()),
+            None => {
+                if e.build_err.is_none() && !e.building && !missing.borrow().contains(&c) {
+                    missing.borrow_mut().push(c);
+                }
+                None
+            }
+        }
+    };
+    let (mut memo, mut reads) = (Vec::new(), Vec::new());
+    let mut facts = Vec::new();
+    for &(c, k) in asks {
+        if let Some(returns) = known_nocapture(up, c, k as usize, 3, &have, &mut memo, &mut reads) {
+            facts.push((relax_backend::rir::Callee::Fn(c), k, returns));
+        }
+    }
+    reads.sort_unstable();
+    reads.dedup();
+    note_body_deps(&mut *up, id, reads.into_iter());
+    (facts, missing.into_inner())
 }
 
 /// Callee `c`'s RIR for a fact about it, built if it has none yet (as an inline candidate's:
@@ -15308,6 +15390,20 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         a
     });
     let O3Assembled { mut snap, singles, cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: t1_single_keys, snap_counts, unverified_left, root_unverified, unverified_in, .. } = assembled;
+    // nocapture facts for the calls the build keeps (coalesce_slot_copies); the callees the answers
+    // need RIR of are built off the owner first (a foreground build takes what exists)
+    let nocapture = if relax_backend::stats::opt_off(options, "-o3nocap") { Vec::new() } else {
+        let asks = o3_nocapture_asks(&rir, &snap);
+        let mut round = 0;
+        loop {
+            let (facts, missing) = owner::publish(|| o3_nocapture_facts(up, id, &asks));
+            round += 1;
+            if missing.is_empty() || round == 3 || owner::is_owner() {
+                break facts;
+            }
+            build_off_owner(up, &missing.iter().map(|&c| (c, RirMode::Tier0)).collect::<Vec<_>>());
+        }
+    };
     if let Some(m) = measure.as_mut() { m.phase(1, t1); }
     trace_tier1_phase(id, "backend");
     // PGO: counted inline candidates carry their counts into the inliner (it scales them to the
@@ -15325,6 +15421,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
         let _arena = crate::zone_alloc::job("O3", runtime.burst_arena);
         let mut func = (*rir).clone();
+        for x in &nocapture {
+            if !func.nocapture.contains(x) {
+                func.nocapture.push(x.clone());
+            }
+        }
         if let Some(c) = &counts {
             for (b, n) in func.blocks.iter_mut().zip(c) {
                 b.count = *n;

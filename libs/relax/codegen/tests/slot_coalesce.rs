@@ -293,3 +293,57 @@ fn interfering_prefix_slots_stay_apart() {
     // B is written after the copy while C holds its bytes: apart; D = C[..16] still joins
     assert_eq!(copies(&f), 1, "{}", f.dump());
 }
+
+/// B = (n, 1); g(&B); C = B; [g(&B)]; return C.0 + C.1 -- `g` keeps no copy of its argument
+/// (f.nocapture) or may (no fact). `again`: B is handed to g once more while C is live (g may
+/// write B: they interfere).
+fn nocapture_build(fact: bool, again: bool) -> Func {
+    let mut f = Func::new("slot_coalesce_nocapture".into(), 0);
+    let n = f.vreg(Cls::I);
+    f.params.push(n);
+    f.rets.push(Cls::I);
+    let (sb, sc_) = (f.slot(16, 8), f.slot(16, 8));
+    f.block();
+    let v = |f: &mut Func| f.vreg(Cls::I);
+    let (pb, pc, one, a, b, s) = (v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f));
+    let g = Callee::Fn(5);
+    push(&mut f, 0, Inst::SlotAddr(pb, sb));
+    push(&mut f, 0, Inst::SlotAddr(pc, sc_));
+    push(&mut f, 0, Inst::Iconst(one, 1));
+    push(&mut f, 0, Inst::Store(Mem::Int(8, false), pb, 0, n));
+    push(&mut f, 0, Inst::Store(Mem::Int(8, false), pb, 8, one));
+    push(&mut f, 0, Inst::Call(g.clone(), vec![pb], vec![]));
+    push(&mut f, 0, Inst::Copy(pc, pb, 16));
+    if again {
+        push(&mut f, 0, Inst::Call(g.clone(), vec![pb], vec![]));
+    }
+    push(&mut f, 0, Inst::Load(Mem::Int(8, false), a, pc, 0));
+    push(&mut f, 0, Inst::Load(Mem::Int(8, false), b, pc, 8));
+    push(&mut f, 0, Inst::IBin(IOp::Add, U64, s, a, b));
+    f.blocks[0].term = Term::Ret(vec![s]);
+    if fact {
+        f.nocapture.push((g, 0, false));
+    }
+    f
+}
+
+#[test]
+fn slots_passed_to_nocapture_calls_join() {
+    let mut f = nocapture_build(true, false);
+    assert!(opt::coalesce_slot_copies(&mut f, true));
+    assert_eq!(copies(&f), 0, "the copy of a slot only handed to a nocapture call goes");
+}
+
+#[test]
+fn slots_passed_to_capturing_calls_stay_apart() {
+    let mut f = nocapture_build(false, false);
+    assert!(!opt::coalesce_slot_copies(&mut f, true));
+    assert_eq!(copies(&f), 1);
+}
+
+#[test]
+fn nocapture_call_writing_a_slot_while_its_partner_lives_keeps_them_apart() {
+    let mut f = nocapture_build(true, true);
+    assert!(!opt::coalesce_slot_copies(&mut f, true));
+    assert_eq!(copies(&f), 1);
+}
