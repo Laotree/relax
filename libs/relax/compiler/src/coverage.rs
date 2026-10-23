@@ -105,7 +105,7 @@ pub fn on() -> bool {
 /// Instrument the source blocks, sharing bits when a slot is lowered again.
 /// Storage grows with the traced program; no table capacity can discard hits.
 pub fn instrument(up: *const Unit, slot: u32, f: &mut Func) {
-    if f.blocks.is_empty() {
+    if f.blocks.is_empty() || !runtime_function(unsafe { &*up }, slot) {
         return;
     }
     let _k = crate::zone_alloc::kept();
@@ -141,6 +141,19 @@ pub fn instrument(up: *const Unit, slot: u32, f: &mut Func) {
     }
     drop(record);
     retire(f);
+}
+
+/// Initializer slots are an implementation detail of evaluation, not Rust
+/// runtime functions. run_init may interpret the same item to data or execute
+/// its lowered body (including after NeedsLoad); neither creates a runtime root.
+fn runtime_function(u: &Unit, slot: u32) -> bool {
+    use crate::program::DefKind;
+    match u.fns[slot as usize].key {
+        crate::jit::FnKey::Inst(d, _) => !matches!(u.prog.def(d).kind,
+            DefKind::Const | DefKind::AssocConst | DefKind::AnonConst | DefKind::Static),
+        crate::jit::FnKey::Plain(base) | crate::jit::FnKey::Sandbox(base) => runtime_function(u, base),
+        _ => true,
+    }
 }
 
 /// Retire already-covered probes before optimising a new tier, including
@@ -235,7 +248,7 @@ pub unsafe fn functions(up: *const Unit) -> Vec<FnCoverage> {
             let bit = r.bit[b];
             r.bits[bit / 64].load(Ordering::Relaxed) & (1 << (bit % 64)) != 0
         };
-        if !hit(0) {
+        if !hit(0) || !runtime_function(u, r.slot) {
             continue;
         }
         let lc = |p: u64| -> (String, usize, usize) {

@@ -4,8 +4,9 @@
 //! shared untraced stub. The data the captured code names (literals, vtables, statics' initial
 //! images, writable blocks) is placed in linear memory with pointer words translated: data
 //! pointers to their wasm addresses, function pointers to table indices. Runtime entries become
-//! imports `r.<name>` (memcpy/memmove/memset/catch_panic are built in), C symbols `c.<name>`,
-//! provided-crate entries `p.<key>`.
+//! imports `r.<name>` in native diagnostic captures (memcpy/memmove/memset/catch_panic
+//! are built in), C symbols `c.<name>`, provided-crate entries `p.<key>`. Web exports
+//! require module implementations and reject every import except `env.js_*`.
 //!
 //! First version for size work: run with a fresh cache (no code from disk) and
 //! `MAKEPAD_RUN_O1=always MAKEPAD_RUN_O3=0` so every function passes the capture.
@@ -32,6 +33,7 @@ pub fn new_unit() -> usize {
 }
 /// the first captured slot: the run's entry (the test fn, main)
 static ENTRY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Process start (the loader's main): `MAKEPAD_RUN_WASM_EXPORT_BLOCKS=1` turns block coverage on
 /// before the program loads (code cache off), so the export drops the blocks the run never entered.
@@ -338,6 +340,17 @@ pub fn capture(unit: usize, id: u32, f: &Func) {
             let u = crate::jit::current_unit();
             if !u.is_null() {
                 finish(unsafe { &*u });
+                if FAILED.load(std::sync::atomic::Ordering::Acquire) {
+                    // The CLI forwards fd 2 from its session log asynchronously.
+                    // Drain that log before terminating, so the entry names are
+                    // visible to the caller as well as retained in the transcript.
+                    crate::tui::exit_code(1);
+                    crate::tui::finish(false);
+                    // We are already inside exit's callbacks. Calling exit
+                    // recursively is undefined; terminate with the failing code.
+                    extern "C" { fn _exit(status: i32) -> !; }
+                    unsafe { _exit(1) };
+                }
             }
         }
         extern "C" {
@@ -865,6 +878,25 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     let link = Linked { vals, host };
     let nf = reached.len();
     let out = m.finish(&options, &link);
+    if web {
+        let mut unsupported: Vec<String> = out.imports.iter()
+            .filter(|(module, name)| module != "env" || !name.starts_with("js_"))
+            .map(|(module, name)| format!("{module}.{name}")).collect();
+        unsupported.sort();
+        unsupported.dedup();
+        if !unsupported.is_empty() {
+            eprintln!("wasm export: unsupported web imports: {}; no module written", unsupported.join(", "));
+            FAILED.store(true, std::sync::atomic::Ordering::Release);
+            // A previous successful export at this path must not masquerade as
+            // the result of this failed capture.
+            if let Err(e) = std::fs::remove_file(path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("wasm export: could not remove stale module {path}: {e}");
+                }
+            }
+            return;
+        }
+    }
     if let Err(e) = std::fs::write(path, &out.bytes) {
         eprintln!("wasm export: {}: {}", std::path::Path::new(&path).display(), e);
         return;

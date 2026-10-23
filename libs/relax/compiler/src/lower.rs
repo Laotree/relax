@@ -708,7 +708,7 @@ impl<'a> Lcx<'a> {
                 Inst::Call(Callee::Host(s), mut args, rets) => {
                     let name = match self.u.syms.kind(s.id) { Some(crate::syms::SymKind::Rt(n)) => n, _ => "" };
                     match name {
-                        "str_eq" | "divrem128" => Inst::Call(self.web_helper("web_runtime", name), args, rets),
+                        "str_eq" | "divrem128" | "wide_f32" | "wide_f64" => Inst::Call(self.web_helper("web_runtime", name), args, rets),
                         "fmod" | "fmodf" => Inst::Call(self.web_helper("libm", name), args, rets),
                         "panic_site" | "panic_bounds" => {
                             let site_reg = args.pop().expect("panic site argument");
@@ -8436,7 +8436,18 @@ impl<'a> Lcx<'a> {
                         let lo0 = self.f.vreg(Cls::I);
                         self.emit(Inst::Conv(Conv::FToInt(true, IntTy { bits: 64, signed: false }), lo0, r));
                         let (lo, hi) = match neg {
-                            None => (lo0, hi0),
+                            None => {
+                                // At 2^128 the saturated high limb converts back to
+                                // 2^64, so the subtraction above gives zero, not the
+                                // required all-ones low limb. Saturate both limbs
+                                // explicitly; this also handles positive infinity.
+                                let limit = fk(self, 340282366920938463463374607431768211456.0);
+                                let big = self.f.vreg(Cls::I);
+                                self.emit(Inst::FCmp(Cond::Ge, true, big, x, limit));
+                                let zero = self.iconst(0);
+                                let mask = self.ibin(IOp::Sub, false, zero, big);
+                                (self.ibin(IOp::Or, false, lo0, mask), self.ibin(IOp::Or, false, hi0, mask))
+                            }
                             Some(n) => {
                                 // positives above i128::MAX saturate: hi >= 2^63 -> MAX
                                 let big = self.f.vreg(Cls::I);
