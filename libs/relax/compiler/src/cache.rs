@@ -258,7 +258,8 @@ pub fn mode_from_env(options: &crate::options::Options) -> Option<Mode> {
 
 #[derive(Default, Debug, Clone)]
 pub struct CacheStats {
-    /// replacements that made the startup image be written again: [no stored entry, tier up]
+    /// replacing records: [without a stored entry (the startup image is written again), moving the
+    /// slot's tier up (counted like stale image slots)]
     pub rewrite_why: [u64; 2],
     pub hits: u64,
     pub misses: u64,
@@ -2338,14 +2339,18 @@ impl Cache {
             return;
         }
         self.pending_keys.insert(key);
-        // the startup image is written again only when a replacement moves its slot's tier up (O1 ->
-        // O2/O3): an O3 payload replacing an O3 entry does not (PGO-driven O3 code differs run to
-        // run; every warm run rewrote the whole image), the next tier-up rewrite takes the newest
+        // a replacement without a stored entry makes the startup image be written again; one that
+        // moves its slot's tier up (O1 -> O2/O3) counts like a stale image slot (record_manifest:
+        // rewritten past 2%); an O3 payload replacing an O3 entry neither (PGO-driven O3 code
+        // differs run to run; every warm run rewrote the whole image)
         if replace && (existing || self.linked.contains(&id)) {
-            let old = self.entry_tier(key);
-            if old.is_none_or(|old| payload_tier(&payload).is_some_and(|new| tier_rank(new) > tier_rank(old))) {
-                self.image_rewrite = true;
-                self.stats.rewrite_why[old.is_some() as usize] += 1;
+            match self.entry_tier(key) {
+                None => {
+                    self.image_rewrite = true;
+                    self.stats.rewrite_why[0] += 1;
+                }
+                Some(old) if payload_tier(&payload).is_some_and(|new| tier_rank(new) > tier_rank(old)) => self.stats.rewrite_why[1] += 1,
+                Some(_) => {}
             }
         }
         let kc = self.cur_crate;
@@ -2739,7 +2744,7 @@ impl Cache {
             }
         }
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
-        if self.mode == Mode::ReadOnly || order.is_empty() || (self.manifest_done && !self.image_rewrite) {
+        if self.mode == Mode::ReadOnly || order.is_empty() || (self.manifest_done && !self.image_rewrite && self.stats.rewrite_why[1] as usize * 50 <= self.image_slots) {
             return true;
         }
         // at exit the slots' keys can no longer be made: after the mid-run manifest the exit
@@ -2775,7 +2780,7 @@ impl Cache {
         // the same start as before (within 2%), the loaded manifest still valid and its image
         // current (within 2%, and covering all but 2% of its cached slots): no new one
         let image_current = !self.image_rewrite
-            && (self.image_slots == 0 || (self.image_stale * 50 <= self.image_slots && self.image_slots * 50 >= self.manifest_present_cached * 49));
+            && (self.image_slots == 0 || ((self.image_stale + self.stats.rewrite_why[1] as usize) * 50 <= self.image_slots && self.image_slots * 50 >= self.manifest_present_cached * 49));
         if self.startup_manifest_valid() && new * 50 <= list.len() && image_current {
             self.manifest_done = true;
             return true;
