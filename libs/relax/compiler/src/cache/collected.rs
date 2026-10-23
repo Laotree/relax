@@ -306,7 +306,59 @@ impl FrontImages {
     }
 }
 
+/// What the collected encode reads of a Cache: `Cache::encoder` borrows the cache's own fields
+/// (the owner's records), `CollectedInputs::encoder` an owned copy of them.
+struct Encoder<'a> {
+    mode: Mode,
+    dir: &'a std::path::Path,
+    fps: &'a [u128],
+    iface_plain: &'a [u128],
+    crate_path: &'a [PathBuf],
+    crate_ident: &'a [u128],
+    boot: Option<&'a CollectedBoot>,
+    committed: bool,
+}
+
+/// The cache fields the collected encode reads, copied in one owner request: the settle swap
+/// then encodes the program on its own thread under a front read, outside its pause
+/// (zone_swap.rs; OWNERARCH.DESIGN.md 6.2 fix 1). The owner may `take()` the cache meanwhile.
+pub(crate) struct CollectedInputs {
+    mode: Mode,
+    dir: PathBuf,
+    fps: Vec<u128>,
+    iface_plain: Vec<u128>,
+    crate_path: Vec<PathBuf>,
+    crate_ident: Vec<u128>,
+}
+
+impl CollectedInputs {
+    fn encoder(&self) -> Encoder<'_> {
+        Encoder { mode: self.mode, dir: &self.dir, fps: &self.fps, iface_plain: &self.iface_plain,
+            crate_path: &self.crate_path, crate_ident: &self.crate_ident, boot: None, committed: false }
+    }
+
+    /// The collected image of the program as it is now: neither a committed mark nor a frozen
+    /// boot snapshot short-circuits it, so the image covers every type, definition and file
+    /// added since the first encode (the settle swap restores from it, and compares the counts).
+    pub(crate) fn encode_now(&self, prog: &Program, tcx: &Tcx, pre: &[crate::preload::PreCrate], extra: &[crate::preload::PreCrate], stop: &dyn Fn() -> bool) -> CollectedRecord {
+        let e = self.encoder();
+        if !extra.is_empty() { return e.encode_swap(prog, tcx, pre, extra, stop); }
+        e.encode_as(prog, tcx, stop, true)
+    }
+}
+
 impl Cache {
+    fn encoder(&self) -> Encoder<'_> {
+        Encoder { mode: self.mode, dir: &self.dir, fps: &self.fps, iface_plain: &self.iface_plain,
+            crate_path: &self.crate_path, crate_ident: &self.crate_ident, boot: self.collected_boot.as_ref(),
+            committed: self.collected_committed }
+    }
+
+    pub(crate) fn collected_inputs(&self) -> CollectedInputs {
+        CollectedInputs { mode: self.mode, dir: self.dir.clone(), fps: self.fps.clone(), iface_plain: self.iface_plain.clone(),
+            crate_path: self.crate_path.clone(), crate_ident: self.crate_ident.clone() }
+    }
+
     /// Both the unit and front-end write locks are held. This only encodes metadata:
     /// crate stores, the graph certificate and the collected store are still published
     /// by the ordinary post-present/exit writer. Repeated module loads reuse the snapshot.
@@ -314,7 +366,7 @@ impl Cache {
         if self.collected_committed || self.collected_boot.is_some() || !enabled() || self.mode == Mode::ReadOnly { return; }
         let started = std::time::Instant::now();
         let mut why = "recipe";
-        self.collected_boot = self.capture_collected_boot(prog, tcx, &|| false, &mut why);
+        self.collected_boot = self.encoder().capture_boot(prog, tcx, &|| false, &mut why);
         if crate::preload::trace() {
             match &self.collected_boot {
                 Some(boot) => eprintln!("makepad-run collected: boot snapshot {} crates, {} definitions, {} types, {} files, {} bytes in {:.1} ms",
@@ -325,56 +377,8 @@ impl Cache {
         }
     }
 
-    fn capture_collected_boot(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool, why: &mut &'static str) -> Option<CollectedBoot> {
-        *why = "recipe";
-        let recipe = prog.front_graph.as_ref()?;
-        if recipe.crates.len() != prog.crates.len() || recipe.crates.iter().zip(&prog.crates)
-            .any(|(key, c)| prog.syms.str(c.name) != key.0 || c.root_path() != key.1) { return None; }
-        *why = "Program";
-        let program = Arc::new(prog.collected_writer()?.into_owned());
-        if stop() { return None; }
-        *why = "Tcx";
-        let types = Arc::new(tcx.collected_writer_with(stop)?.into_owned());
-        if stop() { return None; }
-        *why = "definitions";
-        let definitions = Arc::new(self.collected_definitions(prog, tcx, stop)?);
-        if stop() { return None; }
-        *why = "interfaces";
-        if self.iface_plain.len() != recipe.crates.len() { return None; }
-        let interfaces = self.iface_plain.iter().map(|&k| MappedKey::new(k)).collect();
-        let files = prog.files.iter().enumerate().map(|(f, file)| {
-            let path = prog.file_paths.get(f)?;
-            Some((*prog.file_crate.get(f)?, path.clone(), file.source_hash(path)))
-        }).collect::<Option<Vec<_>>>()?;
-        Some(CollectedBoot { recipe: recipe.clone(), program, types, definitions, files, interfaces })
-    }
-
     pub(crate) fn collected_crates(&self, prog: &Program) -> usize {
         self.collected_boot.as_ref().map_or(prog.crates.len(), |boot| boot.recipe.crates.len())
-    }
-
-    fn collected_definitions(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool) -> Option<crate::image::Writer<'static>> {
-        let mut memo = HashMap::new();
-        let mut files = HashMap::new();
-        let mut maps = vec![std::collections::BTreeMap::new(); prog.crates.len()];
-        let mut duplicates = HashSet::new();
-        for i in 0..prog.defs.len() {
-            if i % 1024 == 1023 && stop() { return None; }
-            let d = DefId(i as u32);
-            let c = prog.def(d).krate as usize;
-            let k = def_key_in(prog, tcx, &self.crate_ident, &mut memo, &mut files, d);
-            if maps[c].insert(k, d).is_some() { duplicates.insert((c, k)); }
-        }
-        for (c, k) in duplicates { maps[c].remove(&k); }
-        let mut image = crate::image::Writer::default();
-        let keys: Vec<MappedKey> = (0..prog.defs.len()).map(|i| MappedKey::new(memo[&DefId(i as u32)])).collect();
-        image.add_owned(0, &keys);
-        for (c, map) in maps.into_iter().enumerate() {
-            let (keys, defs): (Vec<MappedKey>, Vec<u32>) = map.into_iter().map(|(k, d)| (MappedKey::new(k), d.0)).unzip();
-            image.add_owned(1 + c as u32 * 2, &keys);
-            image.add_owned(2 + c as u32 * 2, &defs);
-        }
-        Some(image)
     }
 
     pub(super) fn restore_collected_definitions(&mut self, prog: &Program, bytes: &'static [u8]) -> bool {
@@ -409,20 +413,62 @@ impl Cache {
     /// record never holds a frame up; the caller retries later. The store write
     /// (commit_collected) needs no lock.
     pub fn encode_collected(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool) -> CollectedRecord {
-        self.encode_collected_as(prog, tcx, stop, false)
+        self.encoder().encode_as(prog, tcx, stop, false)
+    }
+}
+
+impl Encoder<'_> {
+    fn capture_boot(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool, why: &mut &'static str) -> Option<CollectedBoot> {
+        *why = "recipe";
+        let recipe = prog.front_graph.as_ref()?;
+        if recipe.crates.len() != prog.crates.len() || recipe.crates.iter().zip(&prog.crates)
+            .any(|(key, c)| prog.syms.str(c.name) != key.0 || c.root_path() != key.1) { return None; }
+        *why = "Program";
+        let program = Arc::new(prog.collected_writer()?.into_owned());
+        if stop() { return None; }
+        *why = "Tcx";
+        let types = Arc::new(tcx.collected_writer_with(stop)?.into_owned());
+        if stop() { return None; }
+        *why = "definitions";
+        let definitions = Arc::new(self.definitions(prog, tcx, stop)?);
+        if stop() { return None; }
+        *why = "interfaces";
+        if self.iface_plain.len() != recipe.crates.len() { return None; }
+        let interfaces = self.iface_plain.iter().map(|&k| MappedKey::new(k)).collect();
+        let files = prog.files.iter().enumerate().map(|(f, file)| {
+            let path = prog.file_paths.get(f)?;
+            Some((*prog.file_crate.get(f)?, path.clone(), file.source_hash(path)))
+        }).collect::<Option<Vec<_>>>()?;
+        Some(CollectedBoot { recipe: recipe.clone(), program, types, definitions, files, interfaces })
     }
 
-    /// `encode_collected` of the program as it is now: neither the committed mark nor the frozen
-    /// boot snapshot short-circuits it, so the image covers every type, definition and file
-    /// added since the first encode (the settle swap restores from it, and asserts the counts).
-    pub(crate) fn encode_collected_now(&self, prog: &Program, tcx: &Tcx, pre: &[crate::preload::PreCrate], extra: &[crate::preload::PreCrate], stop: &dyn Fn() -> bool) -> CollectedRecord {
-        if !extra.is_empty() { return self.encode_collected_swap(prog, tcx, pre, extra, stop); }
-        self.encode_collected_as(prog, tcx, stop, true)
+    fn definitions(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool) -> Option<crate::image::Writer<'static>> {
+        let mut memo = HashMap::new();
+        let mut files = HashMap::new();
+        let mut maps = vec![std::collections::BTreeMap::new(); prog.crates.len()];
+        let mut duplicates = HashSet::new();
+        for i in 0..prog.defs.len() {
+            if i % 1024 == 1023 && stop() { return None; }
+            let d = DefId(i as u32);
+            let c = prog.def(d).krate as usize;
+            let k = def_key_in(prog, tcx, self.crate_ident, &mut memo, &mut files, d);
+            if maps[c].insert(k, d).is_some() { duplicates.insert((c, k)); }
+        }
+        for (c, k) in duplicates { maps[c].remove(&k); }
+        let mut image = crate::image::Writer::default();
+        let keys: Vec<MappedKey> = (0..prog.defs.len()).map(|i| MappedKey::new(memo[&DefId(i as u32)])).collect();
+        image.add_owned(0, &keys);
+        for (c, map) in maps.into_iter().enumerate() {
+            let (keys, defs): (Vec<MappedKey>, Vec<u32>) = map.into_iter().map(|(k, d)| (MappedKey::new(k), d.0)).unzip();
+            image.add_owned(1 + c as u32 * 2, &keys);
+            image.add_owned(2 + c as u32 * 2, &defs);
+        }
+        Some(image)
     }
 
     /// A whole-program snapshot private to this run. Keep the boot cache's identities and
     /// stores unchanged: runtime files are referenced directly instead of extending that cache.
-    fn encode_collected_swap(&self, prog: &Program, tcx: &Tcx, pre: &[crate::preload::PreCrate], extra: &[crate::preload::PreCrate], stop: &dyn Fn() -> bool) -> CollectedRecord {
+    fn encode_swap(&self, prog: &Program, tcx: &Tcx, pre: &[crate::preload::PreCrate], extra: &[crate::preload::PreCrate], stop: &dyn Fn() -> bool) -> CollectedRecord {
         if !enabled() || self.mode == Mode::ReadOnly { return CollectedRecord::Failed; }
         let mut why = "recipe";
         let recorded = (|| {
@@ -440,10 +486,10 @@ impl Cache {
             image.add_image(2, Arc::new(tcx.collected_writer_with(stop)?.into_owned()));
             if stop() { return None; }
             why = "definitions";
-            image.add_image(3, Arc::new(self.collected_definitions(prog, tcx, stop)?));
+            image.add_image(3, Arc::new(self.definitions(prog, tcx, stop)?));
             if stop() { return None; }
             why = "index snapshot";
-            image.add_bytes(4, MappedIndexes::record(&self.crate_path, &[])?);
+            image.add_bytes(4, MappedIndexes::record(self.crate_path, &[])?);
             image.add_owned(5, &self.iface_plain.iter().map(|&k| MappedKey::new(k)).collect::<Vec<_>>());
             why = "file images";
             let files = prog.files.iter().map(|f| {
@@ -474,16 +520,16 @@ impl Cache {
         })
     }
 
-    fn encode_collected_as(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool, fresh: bool) -> CollectedRecord {
+    fn encode_as(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool, fresh: bool) -> CollectedRecord {
         if !enabled() || self.mode == Mode::ReadOnly { return CollectedRecord::Failed; }
-        if self.collected_committed && !fresh { return CollectedRecord::Current; }
+        if self.committed && !fresh { return CollectedRecord::Current; }
         let mut why = "recipe";
         let mut yielded = false;
         let recorded = (|| {
-        let frozen = self.collected_boot.as_ref().filter(|_| !fresh);
+        let frozen = self.boot.filter(|_| !fresh);
         let recipe = frozen.map(|boot| &boot.recipe).or(prog.front_graph.as_ref())?;
         why = "graph certificate";
-        let graph = read_front_graph(&self.dir, recipe.identity)?;
+        let graph = read_front_graph(self.dir, recipe.identity)?;
         why = "fingerprints";
         if graph.crates.iter().map(|(key, _)| key).ne(recipe.crates.iter())
             || graph.crates.iter().map(|(_, fp)| fp).ne(self.fps.iter()) { return None; }
@@ -491,7 +537,7 @@ impl Cache {
         let captured;
         let boot = match frozen {
             Some(boot) => boot,
-            None => { captured = self.capture_collected_boot(prog, tcx, stop, &mut why)?; &captured }
+            None => { captured = self.capture_boot(prog, tcx, stop, &mut why)?; &captured }
         };
         check()?;
         let mut image = crate::image::Writer::default();
@@ -499,11 +545,11 @@ impl Cache {
         image.add_image(1, boot.program.clone()); image.add_image(2, boot.types.clone());
         image.add_image(3, boot.definitions.clone());
         why = "index snapshot";
-        image.add_bytes(4, MappedIndexes::record(&self.crate_path, &boot.files)?);
+        image.add_bytes(4, MappedIndexes::record(self.crate_path, &boot.files)?);
         image.add_owned(5, &boot.interfaces);
         check()?;
         let payload = image;
-        let dest = path(&self.dir, recipe.identity);
+        let dest = path(self.dir, recipe.identity);
         Some(CollectedRecord::Ready((dest, key(recipe.identity)), payload))
         })();
         match recorded {
@@ -517,7 +563,9 @@ impl Cache {
             }
         }
     }
+}
 
+impl Cache {
     /// `report`: the crate count to print (verbose). The entry as the store now holds it.
     pub fn commit_collected(report: Option<usize>, (dest, key): (PathBuf, u128), payload: crate::image::Writer<'static>) -> Option<CollectedWritten> {
         // A swap can reference runtime files whose images have no crate-store spill.

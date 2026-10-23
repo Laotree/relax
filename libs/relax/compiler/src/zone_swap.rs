@@ -13,9 +13,13 @@
 //!    none waiting for the owner, the owner idle, no thread alive that took `compiler_thread()`
 //!    except the long-lived workers that hold nothing across their idle wait (`ALLOWED`);
 //! 3. one owner request records the front images the store lacks; this thread writes them;
-//! 4. one owner request encodes the collected image of the program AS IT IS NOW (the first
-//!    encode of the run is older: types, definitions and files came after it); this thread
-//!    commits it to the store;
+//! 4. the collected image of the program AS IT IS NOW (the first encode of the run is older:
+//!    types, definitions and files came after it) -- encoded BEFORE step 2, on this thread under
+//!    a front read and committed to the store, with the gate open (OWNERARCH.DESIGN.md 6.6 c1):
+//!    one owner publish copies the cache fields the encode reads; the encode stops when a front
+//!    writer waits; it is kept only if the interners' counts did not move during it. After the
+//!    quiesce, the counts and the front-write epoch must still be those of the encode (a writer
+//!    or an intern in between drops the attempt: CPU only);
 //! 5. generation g+1 begins; the Z statics are taken for rollback; the image is restored
 //!    (`warm_front`), the cache is opened as a warm start opens it and the front state is rebuilt,
 //!    all in g+1; the counts and sampled rows are compared with the running program. An abort
@@ -173,6 +177,9 @@ struct Counts {
     tys: usize,
     regions: (usize, usize),
     syms: usize,
+    /// (late symbols, list arena words, interned constants): appended through shared
+    /// references, so only their counts show that the encode off the pause missed one
+    late: (usize, usize, usize),
 }
 
 /// The counts of the program the store's collected image describes (set when this run restored
@@ -190,7 +197,9 @@ pub(crate) fn note_image(prog: &Program, tcx: &Tcx) {
 }
 
 fn counts(prog: &Program, tcx: &Tcx) -> Counts {
-    Counts { defs: prog.defs.len(), files: prog.files.len(), crates: prog.crates.len(), mods: prog.mods.len(), tys: tcx.tys.len(), regions: tcx.tys.region_counts(), syms: prog.syms.len() }
+    let (words, consts) = tcx.tys.list_const_counts();
+    Counts { defs: prog.defs.len(), files: prog.files.len(), crates: prog.crates.len(), mods: prog.mods.len(), tys: tcx.tys.len(), regions: tcx.tys.region_counts(), syms: prog.syms.len(),
+        late: (prog.syms.late_len(), words, consts) }
 }
 
 /// Counts equal, and rows sampled across the tables: a restore that renumbered anything shows
@@ -243,10 +252,10 @@ struct Fresh {
 /// A swap's numbers (the report line).
 #[derive(Default)]
 struct Timeline {
+    /// the encode and its store write, before the quiesce (gate open)
+    encode_off: f64,
     quiesce: f64,
     front_images: f64,
-    encode: f64,
-    store: f64,
     restore: f64,
     cache: f64,
     commit: f64,
@@ -358,25 +367,42 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     let mut tl = Timeline::default();
     let options = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let Some(mode) = crate::cache::mode_from_env(&options.options) else { return Outcome::Refused("the cache mode is off".into()) };
-    let abort = |why: String| Outcome::Retry(why);
+
+    let pre = BOOT.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap();
+    let extra = RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let gated0 = gated_main();
+    let gated = || { let (n, ns, max) = gated_main(); (n - gated0.0, (ns - gated0.1) as f64 / 1e6, max as f64 / 1e6) };
+    let abort = |why: String| { let (n, ms, max) = gated(); Outcome::Retry(if n == 0 { why } else { format!("{why} (main gated {n}x {ms:.1} ms, longest so far {max:.1} ms)") }) };
+
+    // 4 (first). the collected image, off the owner and with the gate open
+    let t = Instant::now();
+    let (before, epoch, swap_image) = match encode_off(up, &pre, &extra) {
+        Ok(x) => x,
+        Err(e) => return abort(format!("encode: {e}")),
+    };
+    tl.encode_off = ms(t);
 
     // 2. quiesce
+    let t_pause = Instant::now();
     let gate = match quiesce(Duration::from_millis(2000)) {
         Ok(g) => g,
-        Err(e) => return Outcome::Retry(format!("quiesce: {e}")),
+        Err(e) => return abort(format!("quiesce: {e}")),
     };
-    tl.quiesce = ms(t_all);
+    tl.quiesce = ms(t_pause);
     // the main thread waiting at the gate ends the swap at the next step, as in the quiesce (30 ms):
     // 250 ms here let a swap hold the UI for its encode + restore (the user's Sandbox: 2.1 s swap)
-    let hurry = || ms(t_all) > 2500.0 || { let s = GATED_MAIN.load(Ordering::SeqCst); s != 0 && wall_ns().saturating_sub(s) > 30_000_000 };
+    let hurry = || ms(t_pause) > 2500.0 || { let s = GATED_MAIN.load(Ordering::SeqCst); s != 0 && wall_ns().saturating_sub(s) > 30_000_000 };
 
     // 3. the front images the store does not have yet
     let t = Instant::now();
     let prepared = owner::call(owner::Class::Program, || unsafe { prepare(up) });
-    let (spill, now) = match prepared {
+    let (spill, now, epoch_now) = match prepared {
         Ok(s) => s,
         Err(e) => return abort(format!("prepare: {e}")),
     };
+    if now != before || epoch_now != epoch {
+        return abort(format!("the program changed after the encode ({})", if epoch_now != epoch { "a front write" } else { "an intern" }));
+    }
     if let Some(s) = spill {
         if let Err(e) = s.write() {
             return abort(format!("store write: {e}"));
@@ -386,33 +412,6 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
         return abort("the front graph could not be written".into());
     }
     tl.front_images = ms(t);
-
-    // 4. the collected image of the program as it is now (unless the store's is that already)
-    let before = now;
-    let pre = BOOT.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap();
-    let extra = RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if pre.len() + extra.len() != now.crates {
-        return abort(format!("recipe has {} crates, program has {}", pre.len() + extra.len(), now.crates));
-    }
-    let saved = IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone().filter(|(c, _)| *c == now);
-    let mut swap_image = saved.as_ref().and_then(|(_, image)| image.clone());
-    if saved.is_some() {
-        trace("the collected image is current: not encoded again");
-    } else {
-        let t = Instant::now();
-        let encoded = owner::call(owner::Class::Program, || unsafe { encode(up, &pre, &extra) });
-        let (dest, payload, _) = match encoded {
-            Ok(x) => x,
-            Err(e) => return abort(format!("encode: {e}")),
-        };
-        tl.encode = ms(t);
-        let t = Instant::now();
-        let Some(written) = crate::cache::Cache::commit_collected(None, dest, payload) else {
-            return abort("the collected image could not be written".into());
-        };
-        if !extra.is_empty() { swap_image = Some(written); }
-        tl.store = ms(t);
-    }
     if hurry() {
         return abort("too slow before the restore".into());
     }
@@ -485,16 +484,17 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     SWAPS.fetch_add(1, Ordering::Release);
     LAST_SWAP_MS.store(wall_ns() / 1_000_000, Ordering::Relaxed);
     crate::boot_stats::swap_done(tl.chunks, rss0, rss1);
-    eprintln!("makepad-run zone: swap {}->{} at t={:.0} ms (attempt {}): quiesce {:.1} ms, front images {:.1} ms, encode {:.1} ms, store {:.1} ms, restore {:.1} ms (cache {:.1} ms), commit {:.1} ms, total {:.1} ms; destroyed {} chunks ({:.1} MB touched); {} speculative codes moved to the kept heap ({:.1} MB); rss {:.0} -> {:.0} MB",
-        old_gen, old_gen + 1, crate::clock::ms_since_start(), n + 1, tl.quiesce, tl.front_images, tl.encode, tl.store, tl.restore, tl.cache, tl.commit, ms(t_all),
+    let (gn, gms, gmax) = gated();
+    eprintln!("makepad-run zone: swap {}->{} at t={:.0} ms (attempt {}): encode + store off the pause {:.1} ms; pause: quiesce {:.1} ms, front images {:.1} ms, restore {:.1} ms (cache {:.1} ms), commit {:.1} ms, pause {:.1} ms; main gated {}x {:.1} ms (longest so far {:.1} ms); total {:.1} ms; destroyed {} chunks ({:.1} MB touched); {} speculative codes moved to the kept heap ({:.1} MB); rss {:.0} -> {:.0} MB",
+        old_gen, old_gen + 1, crate::clock::ms_since_start(), n + 1, tl.encode_off, tl.quiesce, tl.front_images, tl.restore, tl.cache, tl.commit, ms(t_pause), gn, gms, gmax, ms(t_all),
         tl.chunks, tl.touched as f64 / 1048576.0, tl.specs.0, tl.specs.1 as f64 / 1048576.0, rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0);
-    crate::inspect::flightrec::event("zone.swap", &format!("gen {}->{}: total {:.0} ms (quiesce {:.0}, encode {:.0}, restore {:.0}, commit {:.0}); rss {:.0} -> {:.0} MB", old_gen, old_gen + 1, ms(t_all), tl.quiesce, tl.encode, tl.restore, tl.commit, rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0), (ms(t_all) * 1e6) as u64, 0);
+    crate::inspect::flightrec::event("zone.swap", &format!("gen {}->{}: pause {:.0} ms (quiesce {:.0}, restore {:.0}, commit {:.0}), encode off the pause {:.0}; rss {:.0} -> {:.0} MB", old_gen, old_gen + 1, ms(t_pause), tl.quiesce, tl.restore, tl.commit, tl.encode_off, rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0), (ms(t_pause) * 1e6) as u64, 0);
     Outcome::Done
 }
 
 /// Owner request: the slots are settled, the front images of the program's files and the crate
 /// records are queued for the store. The entries are returned to be written off the owner.
-unsafe fn prepare(up: *mut Unit) -> Result<(Option<crate::cache::Spill>, Counts), String> {
+unsafe fn prepare(up: *mut Unit) -> Result<(Option<crate::cache::Spill>, Counts, u64), String> {
     let u = &mut *up;
     for (i, f) in u.fns.iter().enumerate() {
         if f.building || f.inflight {
@@ -512,21 +512,52 @@ unsafe fn prepare(up: *mut Unit) -> Result<(Option<crate::cache::Spill>, Counts)
     crate::run::push_front_images(&u.prog, c);
     c.record_front_crates(&u.prog);
     let spill = c.spill_take();
-    Ok((spill, counts(&u.prog, &u.tcx)))
+    Ok((spill, counts(&u.prog, &u.tcx), front_epoch()))
 }
 
-/// Owner request: the collected image of the program now, and its counts.
-unsafe fn encode(up: *mut Unit, pre: &[crate::preload::PreCrate], extra: &[crate::preload::PreCrate]) -> Result<((std::path::PathBuf, u128), crate::image::Writer<'static>, Counts), String> {
-    let _front = super::front_write_within(200).ok_or("the front end is busy")?;
-    let u = &*up;
-    let c = u.cache.as_ref().ok_or("no cache")?;
-    let stop = || GATED_MAIN.load(Ordering::SeqCst) != 0;
-    match c.encode_collected_now(&u.prog, &u.tcx, pre, extra, &stop) {
-        crate::cache::CollectedRecord::Ready(dest, payload) => Ok((dest, payload, counts(&u.prog, &u.tcx))),
-        crate::cache::CollectedRecord::Current => Err("the store already holds the image (nothing to restore from)".into()),
-        crate::cache::CollectedRecord::Yielded => Err("yielded to the main thread".into()),
-        crate::cache::CollectedRecord::Failed => Err("the program is not recordable (see MAKEPAD_RUN_BOOT_TRACE)".into()),
+/// The collected image of the program now, encoded on this thread under a front read with the
+/// job gate open, and committed to the store: (its counts, the front-write epoch it was read at,
+/// the swap-only image when runtime crates exist). Unless the store's image is current already
+/// (IMAGE): then nothing is encoded. The encode stops when a front writer waits, and is dropped
+/// when an interner grew during it (a row or bucket head past the counts read at its start).
+fn encode_off(up: *mut Unit, pre: &[crate::preload::PreCrate], extra: &[crate::preload::PreCrate]) -> Result<(Counts, u64, Option<crate::cache::CollectedWritten>), String> {
+    // the cache's fields, copied by the owner (the cache is owner-only state)
+    let inputs = owner::publish(|| unsafe { (*up).cache.as_ref().map(|c| c.collected_inputs()) }).ok_or("no cache")?;
+    // what the encode allocates dies with it, before the generation ends; the store entry is kept
+    let _c = crate::zone_alloc::compiler();
+    let front = front_read("zone-swap encode");
+    let epoch = front_epoch();
+    let u = unsafe { &*up };
+    let before = counts(&u.prog, &u.tcx);
+    if pre.len() + extra.len() != before.crates {
+        return Err(format!("recipe has {} crates, program has {}", pre.len() + extra.len(), before.crates));
     }
+    let saved = IMAGE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|(c, _)| *c == before).map(|(_, image)| crate::zone_alloc::kept_clone(image));
+    if saved.is_none() {
+        if let Some((c, _)) = IMAGE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            trace(&format!("the collected image is not current: its counts {c:?}, now {before:?}"));
+        }
+    }
+    if let Some(image) = saved {
+        trace("the collected image is current: not encoded again");
+        return Ok((before, epoch, image));
+    }
+    let stop = || crate::preempt::writer_waiting() || crate::preempt::is_stopped();
+    let encoded = inputs.encode_now(&u.prog, &u.tcx, pre, extra, &stop);
+    let after = counts(&u.prog, &u.tcx);
+    drop(front);
+    let (dest, payload) = match encoded {
+        crate::cache::CollectedRecord::Ready(dest, payload) => (dest, payload),
+        crate::cache::CollectedRecord::Current => return Err("the store already holds the image (nothing to restore from)".into()),
+        crate::cache::CollectedRecord::Yielded => return Err("yielded to a front writer".into()),
+        crate::cache::CollectedRecord::Failed => return Err("the program is not recordable (see MAKEPAD_RUN_BOOT_TRACE)".into()),
+    };
+    if after != before {
+        return Err("the program grew during the encode".into());
+    }
+    let written = crate::cache::Cache::commit_collected(None, dest, payload).ok_or("the collected image could not be written")?;
+    trace("encoded and stored");
+    Ok((before, epoch, if extra.is_empty() { None } else { Some(crate::zone_alloc::kept_clone(&written)) }))
 }
 
 /// Builds the next generation's compile state from the committed image (this thread, in the
