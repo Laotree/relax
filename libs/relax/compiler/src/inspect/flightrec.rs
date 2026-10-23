@@ -666,7 +666,7 @@ pub(super) fn encode(cur: &mut Cursors, enc: &mut super::pstream::StreamEnc, min
     let mut samples = Vec::new();
     if !raw.is_empty() {
         let run = super::prof::Run {
-            samples: raw.into_iter().map(|s| super::prof::Sample { os_id: s.os_id, frames: s.pcs, weight: s.w, t: s.t }).collect(),
+            samples: raw.into_iter().map(|s| super::prof::Sample { os_id: s.os_id, frames: s.pcs, weight: s.w, t: s.t, on_cpu: true }).collect(),
             threads: Vec::new(),
             secs: 0.0,
             hz: 200,
