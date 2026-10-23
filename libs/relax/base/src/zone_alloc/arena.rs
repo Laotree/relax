@@ -2009,6 +2009,21 @@ impl Arena {
         let (chunks, touched, _) = self.destroy_generations(g, g + 1);
         (chunks, touched)
     }
+    /// Requested live bytes in the chunks and runs carved for generation `g` (a diagnostic: one
+    /// header walk taking each chunk lock; MAKEPAD_RUN_ZONE_TRACE only).
+    fn generation_live(&self, g: u64) -> usize {
+        if !self.gen_on() || self.base.load(Ordering::Relaxed) == 0 {
+            return 0;
+        }
+        let mut n = 0usize;
+        for h in self.headers.iter() {
+            let s = lock(&h.state);
+            if s.committed != 0 && s.epoch == g {
+                n = n.wrapping_add(h.account.load(Ordering::Relaxed).wrapping_sub(h.remote_bytes.load(Ordering::Relaxed)));
+            }
+        }
+        (n as isize).max(0) as usize
+    }
     fn destroy_older(&self) -> (usize, usize) {
         if !self.gen_on() {
             return (0, 0);
@@ -2475,4 +2490,8 @@ pub fn destroy_generation(g: u64) -> (usize, usize) {
 /// those generations must be quiesced. Retained chunks keep their generation eligible to retry.
 pub fn destroy_older() -> (usize, usize) {
     DEFAULT.destroy_older()
+}
+/// See `Arena::generation_live`.
+pub fn generation_live(g: u64) -> usize {
+    DEFAULT.generation_live(g)
 }

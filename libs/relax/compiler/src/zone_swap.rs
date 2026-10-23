@@ -375,6 +375,16 @@ fn trace(what: &str) {
     }
 }
 
+/// `trace` with the requested live bytes of the current compiler generation (what it holds so far:
+/// the restore's state, and before the take what running compiles allocated into it).
+fn trace_live(what: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_ZONE_TRACE").is_some()) {
+        let g = crate::zone_alloc::compiler_generation();
+        trace(&format!("{what}; generation {g} holds {:.1} MB", crate::zone_alloc::compiler_generation_live(g) as f64 / 1e6));
+    }
+}
+
 fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
@@ -448,7 +458,7 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     let Some(taken) = zone_scan::zone_take_all() else {
         return abort("an owner request arrived after the quiesce".into());
     };
-    trace("statics taken");
+    trace_live("statics taken");
     zone_scan::stale_after_take(crate::zone_alloc::compiler_generation());
     let fresh = {
         let _c = crate::zone_alloc::compiler();
@@ -472,7 +482,7 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
         }
     };
     tl.restore = ms(t);
-    trace("restored and compared");
+    trace_live("restored and compared");
     if hurry() {
         // Both generations stay live: the old compile state resumes allocating in g+1.
         drop(fresh);
@@ -487,7 +497,7 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     taken.forget();
     let specs = owner::call(owner::Class::Program, || unsafe { commit(up, fresh) });
     tl.commit = ms(t);
-    trace("commit done");
+    trace_live("commit done");
     crate::zone_alloc::kept_with(|| {
         *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new((before, epoch, swap_image.clone())));
     });
@@ -609,7 +619,7 @@ fn build(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: crate::cach
         if crate::sip::late_hash(content.as_deref()) != *hash { return Err(format!("a late input changed: {name}")); }
         crate::sip::note_late_input(c, *kind, name, content.as_deref());
     }
-    trace("build: restored");
+    trace_live("build: restored");
     crate::program::share_std_end();
     let collected = collected.ok_or("only a prefix of the program was restored")?;
     let after = counts(&prog, &tcx);
