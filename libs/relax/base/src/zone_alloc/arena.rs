@@ -622,7 +622,7 @@ mod os {
     }
     /// Linux with transparent huge pages "always": the first touch of a 2 MB-aligned chunk
     /// faults in a whole huge page, so a chunk with a few KB carved (or a few survivors after
-    /// `release`) stays 2 MB resident. The arenas opt out (Scope cold, x64: 2 GB of
+    /// `release`) stays 2 MB resident. Relax's own arenas opt out (Scope cold, x64: 2 GB of
     /// AnonHugePages; the compiler mapping 1.36 GB resident for 254 MB carved). Other targets: nothing.
     pub unsafe fn no_huge_pages(base: usize, size: usize) {
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1044,9 +1044,11 @@ impl Arena {
                         os::reserve(RESERVE, CHUNK, if self.dynamic { c"makepad-run-domain" } else { LABEL })
                     }
                 };
-                // every arena: their chunks are thread-owned per size class, so most are sparse
-                // (Scope's domain heap: 100 MB in use, 2.5 GB committed, 1.2 GB resident with THP)
-                if base != 0 {
+                // the compiler and burst arenas. A domain heap (the program's heap, as its malloc
+                // would be) keeps them: without, Sandbox race warm frames took +4% UI-thread CPU
+                // and cold start +5 s node (timed A/B, JITMEM.REPORT.md); Scope's domain heap is
+                // then ~1 GB resident for 100 MB in use on such a Linux box
+                if base != 0 && !self.dynamic {
                     unsafe { os::no_huge_pages(base, RESERVE) };
                 }
                 self.base.store(base, Ordering::Release);
