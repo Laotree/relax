@@ -344,6 +344,39 @@ mod tests {
         assert!(again.kind(new) == restored.kind(new));
     }
 
+    /// The settle swap's restore: an image taken while the interner was still growing (here: the
+    /// rows interned after it), topped up from the live interner, equals it -- same ids, lookups
+    /// find the topped-up rows, lists and constants interned later resolve.
+    #[test]
+    fn restored_interner_topped_up_from_the_live_one() {
+        let tys = Types::new();
+        let r = tys.intern_region(RegionKind::ReStatic);
+        let base = tys.intern(TyKind::Ref(false, tys.u8_, r));
+        let early: Vec<TyId> = (0..3_000u64).map(|i| tys.mk_array(base, tys.const_usize(i))).collect();
+        let image = tys.collected_image().unwrap();
+        let late: Vec<TyId> = (3_000..9_000u64).map(|i| {
+            let a = tys.mk_array(base, tys.const_usize(i));
+            tys.intern(TyKind::Tuple(tys.mk_list(&[a, base])))
+        }).collect();
+        let late_region = tys.intern_region_args(&[r, tys.intern_region(RegionKind::ReEarlyParam(3))]);
+        let mut restored = Types::restore_collected(Box::leak(image.into_boxed_slice())).unwrap();
+        assert!(restored.len() < tys.len());
+        restored.top_up_from(&tys).unwrap();
+        assert_eq!(restored.len(), tys.len());
+        assert_eq!(restored.region_counts(), tys.region_counts());
+        assert_eq!(restored.list_const_counts(), tys.list_const_counts());
+        for &t in early.iter().chain(&late) {
+            assert!(restored.kind(t) == tys.kind(t));
+            assert_eq!(restored.intern(*tys.kind(t)), t);
+        }
+        assert_eq!(restored.region_args(late_region), tys.region_args(late_region));
+        assert_eq!(restored.const_usize(8_999), tys.const_usize(8_999));
+        let last = *late.last().unwrap();
+        let TyKind::Tuple(l) = *tys.kind(last) else { panic!() };
+        assert_eq!(restored.mk_list(tys.list(l)), l);
+        assert_eq!(restored.len(), tys.len(), "nothing interned twice");
+    }
+
     #[test]
     fn running_interner_adopts_its_image_and_keeps_interning() {
         use crate::collected::Adopt;
