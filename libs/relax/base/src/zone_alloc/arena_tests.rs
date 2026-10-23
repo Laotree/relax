@@ -36,7 +36,7 @@ mod tests {
         let before = stats();
         let mut blocks = Vec::new();
         {
-            let _scope = scratch(&crate::options::RuntimeOptions::default());
+            let _scope = enter_scratch();
             assert!(active());
             for size in [
                 1,
@@ -75,7 +75,7 @@ mod tests {
         }
         trim();
         assert_eq!(stats(), before);
-        let _scope = scratch(&crate::options::RuntimeOptions::default());
+        let _scope = enter_scratch();
         unsafe {
             for size in [16, 2048, 262145, CHUNK + 1] {
                 let l = Layout::from_size_align(size, 64).unwrap();
@@ -99,8 +99,8 @@ mod tests {
             let heap = RelaxAlloc.alloc(l);
             assert!(!heap.is_null() && !owns(heap));
             std::ptr::write_bytes(heap, 0x3c, l.size());
-            let outer = scratch(&crate::options::RuntimeOptions::default());
-            let inner = scratch(&crate::options::RuntimeOptions::default());
+            let outer = enter_scratch();
+            let inner = enter_scratch();
             drop(outer); // depth also tolerates guards dropped out of order
             assert!(active());
             let arena = RelaxAlloc.realloc(heap, l, 3000);
@@ -128,7 +128,7 @@ mod tests {
             RelaxAlloc.dealloc(heap, Layout::from_size_align(200, 64).unwrap());
         }
         let _ = std::panic::catch_unwind(|| {
-            let _scope = scratch(&crate::options::RuntimeOptions::default());
+            let _scope = enter_scratch();
             assert!(active());
             panic!("test scope unwind");
         });
@@ -142,7 +142,7 @@ mod tests {
         let _serial = lock(&TEST_LOCK);
         trim();
         let before = stats();
-        let _scope = scratch(&crate::options::RuntimeOptions::default());
+        let _scope = enter_scratch();
         unsafe {
             let (p, l) = checked(64, 16);
             let index = (p as usize - DEFAULT.base.load(Ordering::Relaxed)) / CHUNK;
@@ -161,7 +161,7 @@ mod tests {
             let remote_barrier = barrier.clone();
             let old_address = p as usize;
             let remote = std::thread::spawn(move || {
-                let _scope = scratch(&crate::options::RuntimeOptions::default());
+                let _scope = enter_scratch();
                 let (other, layout) = checked(64, 16);
                 assert_eq!(other as usize, old_address);
                 remote_barrier.wait();
@@ -200,7 +200,7 @@ mod tests {
                 });
                 let mut escaped = Vec::new();
                 {
-                    let _scope = scratch(&crate::options::RuntimeOptions::default());
+                    let _scope = enter_scratch();
                     for i in 0..12000 {
                         unsafe {
                             let (p, l) = checked(16 << (i % 9), 16);
@@ -236,7 +236,7 @@ mod tests {
         let _serial = lock(&TEST_LOCK);
         trim();
         let before = stats();
-        let _scope = scratch(&crate::options::RuntimeOptions::default());
+        let _scope = enter_scratch();
         unsafe {
             // a compile-like scope: a few classes, all freed at the end
             let mut blocks = Vec::new();
@@ -284,7 +284,7 @@ mod tests {
         let before = stats();
         let mut blocks = Vec::new();
         {
-            let _scope = scratch(&crate::options::RuntimeOptions::default());
+            let _scope = enter_scratch();
             unsafe {
                 for _ in 0..(CHUNK / 2048 + 17) {
                     blocks.push(checked(2048, 16));
@@ -311,7 +311,7 @@ mod tests {
         let _serial = lock(&TEST_LOCK);
         trim();
         let before = stats();
-        let _scope = scratch(&crate::options::RuntimeOptions::default());
+        let _scope = enter_scratch();
         // Requesting more than the reservation must fail without altering pool state.
         let huge = Layout::from_size_align(RESERVE + CHUNK, 16).unwrap();
         assert!(unsafe { alloc(huge) }.is_null());

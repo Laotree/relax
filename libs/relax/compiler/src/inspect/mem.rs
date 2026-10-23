@@ -377,6 +377,10 @@ fn relax_parts(s: &mut Snap, compiler: bool, partial: &mut Vec<String>) {
     let (committed, live, _) = crate::zone_alloc::burst_stats();
     s.add("makepad-run/burst arena committed", committed as u64);
     s.add("makepad-run/burst arena live", live as u64);
+    let (jobs, survivor_jobs, survivor_bytes) = crate::zone_alloc::job_stats();
+    s.add("makepad-run/job arena/jobs ended", jobs as u64);
+    s.add("makepad-run/job arena/jobs that left survivors", survivor_jobs as u64);
+    s.add("makepad-run/job arena/survivor bytes (not copied out)", survivor_bytes as u64);
     let (ccommitted, clive, cchunks) = crate::zone_alloc::compiler_stats();
     s.add("makepad-run/compiler arena committed", ccommitted as u64);
     s.add("makepad-run/compiler arena live", clive as u64);

@@ -6779,8 +6779,8 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
     compile_watch(Some((&format!("codegen {}", func.name), relax_codegen::opt::inst_count(func))));
     let mps = crate::memstat::peak_start();
     let c = crate::memstat::tagged(crate::memstat::Tag::Codegen, || {
-        let _scratch = crate::zone_alloc::scratch(runtime);
-        relax_codegen::native::compile(options, func, env)
+        let _arena = crate::zone_alloc::job("codegen", runtime.burst_arena);
+        relax_codegen::native::compile(options, func, env).map(copied_out)
     });
     crate::memstat::note_big("codegen", &func.name, mps, || cg_shape(func));
     compile_watch(None);
@@ -6840,8 +6840,8 @@ pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, base
     edit(&mut f, u);
     let cg = tier0_codegen_rir(options, &f, u.opt.fold, u.opt.layout);
     let c = {
-        let _scratch = crate::zone_alloc::scratch(runtime);
-        relax_codegen::native::compile(options, &cg, &u.env)
+        let _arena = crate::zone_alloc::job("instrumented codegen", runtime.burst_arena);
+        relax_codegen::native::compile(options, &cg, &u.env).map(copied_out)
     }?;
     note_frame(id, c.frame_size, slot_bytes(&cg), false);
     let _as = code_as(kind);
@@ -7720,8 +7720,8 @@ impl O2Work {
             let cg = tier0_codegen_rir(options, &func, fold, layout);
             crate::wasm_export::capture(capture_unit, id, &cg);
             let cg = with_loop_counters(cg, lc);
-            let _scratch = crate::zone_alloc::scratch(&session.runtime);
-            let c = relax_codegen::native::compile(options, &cg, &env)?;
+            let _arena = crate::zone_alloc::job("O2 codegen", session.runtime.burst_arena);
+            let c = copied_out(relax_codegen::native::compile(options, &cg, &env)?);
             Ok::<_, String>((func, inlined, c))
         }));
         O2Done { id, epoch, snapshot, t0, built, done }
@@ -10980,7 +10980,7 @@ impl<'a> InlineBodies<'a> {
         let prepared = (!taken.is_empty()).then(|| {
             self.expand(&mut taken);
             let deps: Vec<u32> = taken.into_iter().map(|x| x.0).collect();
-            crate::zone_alloc::outside_scratch(|| std::sync::Arc::new(Prepared { raw: raw.clone(), priced: f.clone(), deps: deps.clone() }))
+            crate::zone_alloc::copy_out(|| std::sync::Arc::new(Prepared { raw: raw.clone(), priced: f.clone(), deps: deps.clone() }))
         });
         let mut slots = rd.bodies;
         slots.sort_unstable();
@@ -11013,7 +11013,7 @@ impl<'a> InlineBodies<'a> {
             }
             return prepared;
         }
-        crate::zone_alloc::outside_scratch(|| {
+        crate::zone_alloc::copy_out(|| {
             let e = std::sync::Arc::new(PrepShared { bodies: bodies.clone(), prepared: prepared_reads.clone(), singles: singles.clone(), _pins: (pins.0.clone(), pins.1.clone()), body: prepared.clone(), nounwind: asked.clone() });
             let mut g = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner());
             let v = g.entry(c).or_default();
@@ -11236,6 +11236,22 @@ fn dump_base(name: &str) -> Option<String> {
 
 /// MAKEPAD_RUN_DUMP of an O1 / baseline build: its code (.bin), the RIR it was emitted from (.rir) and
 /// its frame size and slots (.frame: `frame <bytes>`, then `slot <n> <size> <align>` per slot)
+/// A back-end job's result leaves its job arena (zone_alloc::copy_out): code, pc map and relocations
+/// are copied into the heap of the thread's phase; the job's own copies die with the job.
+fn copied_out(c: x64::Compiled) -> x64::Compiled {
+    let x64::Compiled { code, pc_map, frame_size, text_len, alloc_sig, relocs, rir_map, rir_emitted } = c;
+    crate::zone_alloc::copy_out(|| x64::Compiled {
+        code: code.clone(),
+        pc_map: pc_map.clone(),
+        frame_size,
+        text_len,
+        alloc_sig,
+        relocs: relocs.clone(),
+        rir_map: rir_map.clone(),
+        rir_emitted: rir_emitted.clone(),
+    })
+}
+
 fn dump_o1(func: &relax_backend::rir::Func, c: &x64::Compiled) {
     if let Some(base) = dump_base(&func.name) {
         let _ = std::fs::write(format!("{}.bin", base), &c.code[..c.text_len as usize]);
@@ -13600,7 +13616,7 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
     let n = rir.blocks.len();
     let counters: &'static [AtomicU64] = crate::zone_alloc::kept_with(|| Box::leak((0..n).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice()));
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _scratch = crate::zone_alloc::scratch(&session.runtime);
+        let _arena = crate::zone_alloc::job("counted codegen", session.runtime.burst_arena);
         let mut func = (*rir).clone();
         let counted = relax_backend::profile::instrument(&mut func, counters.as_ptr() as u64);
         if let Some(g) = &gctx {
@@ -13609,7 +13625,7 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
         let cg = tier0_codegen_rir(options, &func, fold, layout);
         relax_codegen::native::compile(options, &cg, &env).map(|c| {
             dump_o1(&cg, &c);
-            (c, counted)
+            (copied_out(c), crate::zone_alloc::copy_out(|| counted.clone()))
         })
     }));
     let Ok(Ok((c, counted))) = built else {
@@ -14774,7 +14790,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     }
     // optimise and generate code without the lock
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
-        let _scratch = crate::zone_alloc::scratch(runtime);
+        let _arena = crate::zone_alloc::job("O3", runtime.burst_arena);
         let mut func = (*rir).clone();
         if let Some(c) = &counts {
             for (b, n) in func.blocks.iter_mut().zip(c) {
@@ -14967,6 +14983,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 }
             }
         }
+        // the result leaves the job arena; the job's own copies die with it
+        let c = copied_out(c);
+        let (left, cold_left) = crate::zone_alloc::copy_out(|| (left.clone(), cold_left.clone()));
         Ok((c.code, c.pc_map, c.relocs, (inlined, left, cold_left, c.frame_size, self_call, nounwind_used, profile_entry)))
     }));
     let t2 = cpu_ns();
@@ -17630,8 +17649,8 @@ impl BackWork {
             compile_watch(Some((&format!("codegen {}", cg.name), relax_codegen::opt::inst_count(&cg))));
             let mps = crate::memstat::peak_start();
             let c = crate::memstat::tagged(crate::memstat::Tag::Codegen, || {
-                let _scratch = crate::zone_alloc::scratch(runtime);
-                relax_codegen::native::compile(options, &cg, &env)
+                let _arena = crate::zone_alloc::job("back-end job", runtime.burst_arena);
+                relax_codegen::native::compile(options, &cg, &env).map(copied_out)
             });
             crate::memstat::note_big("codegen", &cg.name, mps, || cg_shape(&cg));
             compile_watch(None);

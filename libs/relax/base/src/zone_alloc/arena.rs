@@ -407,10 +407,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
-/// Runs `f` with this thread's scratch routing off (nested scopes included): what it allocates
-/// outlives the compile it runs in -- state the compiler keeps from one compile to the next, in
-/// the compiler arena on a compiler thread.
-pub fn outside_scratch<R>(f: impl FnOnce() -> R) -> R {
+/// A job's result leaves its job arena: `f` runs with this thread's scratch routing off (nested
+/// scopes included), so what it builds -- typically a clone of something the job made -- lives in
+/// the heap of the thread's phase (the compiler arena on a compiler thread) and outlives the job.
+/// A result that skips this stays in the job arena: it is still freed by its owner's Drop, it only
+/// pins a job-arena chunk (counted as a job survivor, MAKEPAD_RUN_JOB_CHECK).
+pub fn copy_out<R>(f: impl FnOnce() -> R) -> R {
     struct Restore(usize);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -425,6 +427,16 @@ pub fn scratch(runtime: &crate::options::RuntimeOptions) -> ScratchGuard {
     if !runtime.burst_arena {
         return ScratchGuard(false, PhantomData);
     }
+    enter_scratch()
+}
+
+/// A guard that enters nothing (the job arena is off).
+pub fn no_scratch() -> ScratchGuard {
+    ScratchGuard(false, PhantomData)
+}
+
+/// `scratch` without the options (the job scope decides once from the environment).
+pub fn enter_scratch() -> ScratchGuard {
     let entered = init() && DEPTH.try_with(|d| d.set(d.get() + 1)).is_ok();
     ScratchGuard(entered, PhantomData)
 }
