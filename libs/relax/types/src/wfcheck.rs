@@ -816,7 +816,15 @@ pub mod obligations {
         let ast = &prog.files[def.file as usize].ast;
         let item = ast.item(def.item);
         match def.kind {
-            DefKind::Struct | DefKind::Enum | DefKind::Union => with_wfcx(prog, tcx, did, |w| { check_type_defn(w, ast, item); check_defaults(w, ast, item); }),
+            DefKind::Struct | DefKind::Enum | DefKind::Union => {
+                // rustc implicit_infer.rs `infer_predicates`: a set of inferred outlives predicates that
+                // still grows at the recursion limit is a fatal error at the ADT
+                let _ = crate::borrowck::implied_bounds::ImpliedBounds::inferred_outlives(tcx, prog, did);
+                if tcx.inferred_outlives_overflow.contains_key(&did) {
+                    return vec![prog.record_error(def.file, item.lo, "typeck", format!("overflow computing implied lifetime bounds for `{}`", tcx.def_path_str(prog, did)))];
+                }
+                with_wfcx(prog, tcx, did, |w| { check_type_defn(w, ast, item); check_defaults(w, ast, item); })
+            }
             DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => {
                 // wfcheck.rs check_trait_item: the associated types a trait method's `impl Trait`s
                 // become (ImplTraitInTraitData::Trait) are checked as associated items of their own
