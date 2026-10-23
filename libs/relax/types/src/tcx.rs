@@ -278,6 +278,8 @@ pub struct Tcx {
     /// rustc `inferred_outlives_of` (a query there): the outlives requirements an ADT's fields put on its own
     /// parameters, computed once per ADT; cleared whenever declarations change.
     pub inferred_outlives: crate::conc::ShardMap<DefId, std::sync::Arc<Vec<outlives::OutlivesPredicate>>>,
+    /// the ADTs whose `inferred_outlives` still grew at the recursion limit (rustc: a fatal overflow error)
+    pub inferred_outlives_overflow: crate::conc::ShardMap<DefId, ()>,
     /// each trait with its supertraits, transitively (a trait object implements all of them)
     pub trait_closure: ImageMap<DefId, Vec<DefId>>,
     pub queries: crate::type_queries::QueryCx,
@@ -440,6 +442,7 @@ impl Tcx {
             future_defs: Default::default(),
             opaques: Default::default(),
             inferred_outlives: Default::default(),
+            inferred_outlives_overflow: Default::default(),
             trait_closure: Default::default(),
             queries: crate::type_queries::QueryCx::new(),
             collect_epoch: Default::default(),
@@ -1105,6 +1108,7 @@ impl Tcx {
         self.declarations.invalidate(gone);
         self.alias_tys.clear();
         self.inferred_outlives.clear();
+        self.inferred_outlives_overflow.clear();
         if gone.is_empty() { self.publish_collected(); return; }
         let gone: crate::fxhash::HashSet<_> = gone.iter().copied().collect();
         self.sigs.retain(|d, _| !gone.contains(d));
