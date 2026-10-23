@@ -2886,12 +2886,14 @@ fn quit_mark() {
     let _ = std::thread::Builder::new().name("run-quit-write".to_string()).spawn(|| { let _z = crate::zone_alloc::compiler_thread();
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
         let t = Instant::now();
-        // the owner thread is busy while the app's shutdown compiles: retry for a bounded time
+        // the owner thread is busy while the app's shutdown compiles: retried until it is written
+        // (no time cap: the session's final code must reach the cache; the exit ends this thread)
         let mut r = None;
-        while t.elapsed().as_millis() < 4000 {
+        loop {
             r = mid_flush(true, true).or(r);
             if r.is_some() && (COLLECTED_CURRENT.load(Ordering::Relaxed) || MID_COLLECTED_TRIED.load(Ordering::Relaxed)) { break; }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            // written, the collected program still waiting for the front-end lock: retried less often
+            std::thread::sleep(std::time::Duration::from_millis(if r.is_some() { 100 } else { 10 }));
         }
         // the generations the write replaced go now: the exit summary may never run (a harness
         // kills the app, a framework ends the process)

@@ -153,6 +153,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("counters", "[s=1] [n=12]", "hardware counters over a window: Linux per thread (cycles, instructions, IPC, branch and cache misses); macOS the process's instructions and cycles (all a non-root process gets)"),
     ("remarks", "<fn|@slot> [n=20]", "the O3 tier's optimisation remarks for the fn: every call its last O3 build kept (hot sites first) and why (no rule, budget, growth ceiling, cold, recursive, no body) with the numbers, and the tiers of its code"),
     ("cache", "", "where this session's code came from: the warm cache's lookups (hits; misses by reason: no entry for the key, invalidated, did not link, not storable), the startup image (placed / stale / failed), stores opened, entries recorded, and the installed code by tier and origin (fresh / warm-cache / warm-image / live-patch / inspect)"),
+    ("code", "[n=<top>]", "JIT code growth (code is append-only, never freed): bytes and installs by source (first, tier-up, re-optimize, patch, module) and the fns with the most versions"),
     ("versions", "<fn|file:line>", "every code version of the fn: per slot its installed, replaced and retired code (tier baseline/O1/O2/O3/O3-guarded/instrumented, origin fresh/warm-cache/warm-image/live-patch/inspect, address, patch generation, cache key and build), which threads run in which, and the slots whose code holds an inlined copy of it"),
     ("why-tier", "<fn|file:line|@slot>", "why a fn is (not) at O3, answer first: per slot its count stub (armed / retired after slow windows, re-arms), calls left in the count window, the loop counter, count windows by code version, the O3 queue (position, reason, age), the counted (PGO) window, the verdict, O3 builds installed / dropped / refused with reasons, retiers left, pins, and its last tier-up decisions"),
     ("tier", "<fn|file:line> o1|o3|auto [fresh=1] | (none: the pins)", "pins the fn and every slot that inlined it to a tier in the live process (A/B a suspected miscompile): o1 = O1 code generation, kept until `tier <fn> auto`; o3 = the o1 pin goes and they get O3 builds now (fresh=1: rebuild O3 code even where it runs, e.g. warm-cache code)"),
@@ -166,6 +167,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("hitch", "[ms=<n>|off]", "frames over the threshold (default 50 ms, always on) are `hitch` events with phases, waits, lazy compiles, critical path and probe deltas: `events on=hitch`, `watch on=hitch`"),
     ("rm", "<G<n>|all>", "removes probe groups: the code they replaced comes back (no recompile)"),
     ("continue", "[K<n>|all]", "lets parked breakpoint hits go"),
+    ("stale", "[n=8]", "stale accesses (into memory the JIT retired for good: unloaded modules, invalidated code), answer first: who touched what, where in it, when and why it was retired, the report; then the retired ranges. A stale access parks its thread and pauses the app until `resume P<n> restart | stop`"),
     ("pause", "", "stops the program's threads (makepad run's and inspect's keep running); stacks work while paused"),
     ("resume", "", "after pause: the program runs again (`resume P<n> panic` releases a parked panic)"),
     ("gpu", "[top [by=bytes|owner|site|churn] [n=15]|idle [frames=1800] [n=15]|snap <name>|diff <a> <b|now>|path <session>:<kind>:<index>:<generation>]", "HAL GPU memory: totals per session, kind and owner against the device (native apps: MAKEPAD_INSPECT=1 or MAKEPAD_REMOTE=1)"),
@@ -239,6 +241,7 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "heap" => heap::cmd_heap(req, out),
         "vms" => cmd_vms(out),
         "versions" => codever::cmd_versions(req, out),
+        "code" => codever::cmd_code(req, out),
         "why-tier" => tierlog::cmd_why_tier(req, out),
         "cache" => codever::cmd_cache(req, out),
         "asm" => asm::cmd_asm(req, out),
@@ -259,6 +262,7 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "watch" => events::cmd_watch(req, out),
         "events" => events::cmd_events(req, out),
         "panics" => events::cmd_panics(out),
+        "stale" => crate::stale::cmd(req, out),
         "resume" if !req.pos.is_empty() => events::cmd_resume(req, out),
         "count" | "break" | "restartable" | "probes" | "rm" | "continue" | "pause" | "resume" => instrument::cmd(req, out),
         "" => out.err("empty request"),
@@ -902,7 +906,9 @@ fn cmd_stacks(req: &Req, out: &mut Out) {
         Err(e) => return out.err(&e),
     };
     let mut partial = Vec::new();
-    let frames: Vec<Vec<u64>> = caps.iter().map(|c| c.frames.iter().copied().take(depth.max(1) + 1).collect()).collect();
+    // a thread parked at a stale access waits in its fault handler: its program frames are the
+    // ones recorded at the fault (stale.rs)
+    let frames: Vec<Vec<u64>> = caps.iter().map(|c| events::stale_frames_of(c.t.os_id).unwrap_or_else(|| c.frames.clone()).into_iter().take(depth.max(1) + 1).collect()).collect();
     let syms = symbolise(&frames, &mut partial);
     out.measured(&format!("stacks of {} thread(s), captured now", caps.len()), "os capture (no owner)", &partial);
     // identical stacks folded
