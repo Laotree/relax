@@ -2068,7 +2068,7 @@ fn fv_session_keep(transaction: u64, cx: std::rc::Rc<crate::borrowck::field_view
 
 unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Result<crate::program::FileVersion, String>>>, t0: Instant, partial: u8, retries: usize, module: bool) -> Outcome {
     let transaction = TRANSACTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     let u = &mut *up;
     let olds: Vec<u32> = edits.iter().map(|e| e.file).collect();
@@ -3452,7 +3452,7 @@ pub extern "C" fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize {
     }
     let up = jit::current_unit();
     if up.is_null() { return usize::MAX; }
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let runtime = &session.runtime;
     static STATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let s = STATE.get_or_init(|| {
@@ -4022,7 +4022,7 @@ mod inputs;
 pub use inputs::Inputs;
 
 pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     struct P(*mut Unit);
     unsafe impl Send for P {}
     let p = P(up);

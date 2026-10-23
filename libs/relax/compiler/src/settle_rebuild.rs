@@ -215,10 +215,7 @@ pub(crate) fn run(up: *mut Unit) -> Outcome {
     let t_all = Instant::now();
     let rss0 = crate::memstat::resident();
     let pre = BOOT.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap();
-    let sess = {
-        let r = front_read("settle rebuild session");
-        r.unit(up).0.session.clone()
-    };
+    let sess = unsafe { unit_session(up) };
     let Some(mode) = crate::cache::mode_from_env(&sess.options) else { return Outcome::Refused("the cache mode is off".into()) };
 
     // 1. the collected image of the program now, under a front read (compiles go on)

@@ -283,6 +283,9 @@ pub(crate) mod settle_rebuild;
 /// old_bodies, coro_*, spec_cached, the unwind/unpin/cycle/core-path memos, const_failed, cache,
 /// front, ctfe_fn_bodies, query_errors, reload_*.
 pub struct Unit {
+    /// the run's session: never replaced (a settle rebuild replaces `prog`), so any thread reads it
+    /// without a front read (`unit_session`)
+    pub session: std::sync::Arc<crate::Session>,
     pub query_errors: relax_types::infer::diagnostics::DiagCtxt,
     /// retired (retire_unit): an auxiliary unit going away mid-run (the proc-macro world);
     /// dropping it leaves the process-wide machinery (background borrowck, O3) alone
@@ -896,7 +899,7 @@ pub static ORDER_PRESENT_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic
 /// order that run installed the slots: they link the cached code ahead of the main thread.
 /// The keys are decoded on a thread of their own, a chunk per unit call.
 pub unsafe fn spec_seed_manifest(up: *mut Unit) {
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     // after the first present: what the earlier run installed after its first present (the
     // slots before it were linked as this run's start called them)
     let list = owner::call_quick(owner::Class::Program, || (&mut *up).cache.as_ref().map(|c| c.manifest[c.manifest_present..].to_vec()).unwrap_or_default());
@@ -2641,6 +2644,7 @@ impl Unit {
         }
         let slots_ptr = relax_backend::rir::SlotsPtr(&*slots);
         let unit = Unit {
+            session: crate::zone_alloc::kept_with(|| prog.session.clone()),
             prog,
             tcx,
             provided_shared: std::sync::OnceLock::new(),
@@ -6668,7 +6672,7 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
     let _why = why_compile(&*up, id);
     let _cost = relax_codegen::fncost::Record::ensure(id, 0, "ahead");
     cost_name(up, id);
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     let runtime = &session.runtime;
     // a foreign fn reached through its slot (a fn-pointer value made before the front end
@@ -6751,7 +6755,7 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
 /// restores the code it replaced. Nothing is recorded in the disk cache and the slot's RIR stays
 /// the plain one (O3 and O2 installs skip instrumented slots: inspect::instrument::active).
 pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, base: Option<relax_backend::rir::Func>, kind: CodeKind, edit: &mut dyn FnMut(&mut relax_backend::rir::Func, &Unit)) -> Result<u64, String> {
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     let runtime = &session.runtime;
     match (&*up).fns[id as usize].key.clone() {
@@ -6797,7 +6801,7 @@ pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, base
 /// Field watches (lower.rs WatchField) are lowered in the same pass: the writes they instrumented
 /// come back as (slot, source position).
 pub(crate) unsafe fn relower_with_probes(up: *mut Unit, id: u32, points: Vec<crate::lower::ProbePoint>, watches: Vec<crate::lower::WatchField>) -> Result<(relax_backend::rir::Func, Vec<(u32, Result<(), String>)>, Vec<(u32, u64)>), String> {
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     let _ = crate::lower::PROBE_POINTS.try_with(|p| *p.borrow_mut() = points);
     let _ = crate::lower::PROBE_RESULTS.try_with(|p| p.borrow_mut().clear());
@@ -7620,7 +7624,7 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
         }
     };
     let u = &*up;
-    let session = (*std::ptr::addr_of!(u.prog.session)).clone();
+    let session = u.session.clone();
     let e = &u.env;
     let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class, near: e.near };
     let (fold, layout) = (u.opt.fold, u.opt.layout);
@@ -8088,7 +8092,7 @@ pub unsafe fn retire_type_side(up: *mut Unit) -> Option<(usize, usize)> {
 /// their own inputs, not the entire unit. MemoMap::get returns owned clones; no node borrow
 /// crosses a front's unit-lock yield.
 pub unsafe fn settle_drop(up: *mut Unit) -> SettleDrops {
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     let u = &mut *up;
     let started = wall_ns();
@@ -8340,7 +8344,7 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
 unsafe fn build_rir_body(up: *mut Unit, id: u32, lowered: Option<relax_backend::rir::Func>, mode: RirMode) -> Result<(), String> {
     let _census_context = (&*up).exec_context(false);
     let _census = relax_codegen::exec_census::Record::new(id, 0, "ahead", true);
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     let given = lowered.is_some();
     let prep = prepare_rir_from(up, id, false, lowered, mode)?;
@@ -8434,7 +8438,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     let _cost = relax_codegen::fncost::Record::ensure(id, 0, "ahead");
     cost_name(up, id);
     let _cost_opt = relax_codegen::fncost::phase(4);
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     // Freeze the mode before lowering, which may release the lock or cross present.
     // (real-time code is never baseline: it runs against a device's deadline)
@@ -9026,7 +9030,7 @@ static BENCH_CAPTURE: relax_session::sync::Mutex<Vec<(relax_backend::rir::Func, 
 /// Replays the captured back ends `reps` times; prints the best rep's cpu ms, per 1k fns
 /// and by function size (instructions entering the pipeline).
 pub unsafe fn backend_bench(up: *mut Unit) {
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     let reps: usize = std::env::var("MAKEPAD_RUN_BACKEND_BENCH").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
     let fns = std::mem::take(&mut *BENCH_CAPTURE.lock().unwrap());
@@ -9842,7 +9846,7 @@ impl Drop for Reloading {
 }
 
 unsafe fn build_rir_inner_body(up: *mut Unit, id: u32) -> Result<relax_backend::rir::Func, String> {
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     let f = build_rir_lowered(up, id)?;
     let u = &*up;
@@ -13521,7 +13525,7 @@ fn pgo_forget(u: &Unit) {
 /// for it (not a plain instance or closure, no RIR, already counted, PGO off, or it failed) -- its
 /// O3 build goes ahead now.
 unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
-    let session = (*std::ptr::addr_of!((*up).prog.session)).clone();
+    let session = crate::jit::unit_session(up);
     let options = &session.options;
     if !pgo_on(options) {
         return false;
@@ -14183,7 +14187,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let _census_context = (&*up).exec_context(relax_codegen::exec_census::active() && crate::exec_profile::is_call(up as usize, id));
 
     let _cost = relax_codegen::fncost::Record::new(id, 1, "O3");
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     // makepad inspect `ab`: an experiment's extra MAKEPAD_RUN_OPT tokens for this slot's inspect
     // O3 build (never cached: inspect builds are not)
     let exp_options;
@@ -15712,7 +15716,7 @@ pub(crate) fn ahead_queued() -> u64 {
 /// Queues the not-inlined direct callees of slot `id` (lock held), one level deeper.
 unsafe fn spec_enqueue(up: *mut Unit, id: u32, depth: u8) {
     if pipelined() && defer_startup_root(up, id, depth) { return; }
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     if !pipelined() || depth >= spec_depth_max(options) {
         return;
@@ -15851,7 +15855,7 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, id: u32, func: &relax_backend::rir::
         }
         return;
     }
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     if !pipelined() || depth >= spec_depth_max(options) {
         return;
@@ -15986,7 +15990,7 @@ fn skip_initializer_seed(u: &Unit, id: u32) -> bool {
 /// (their depth is the speculation limit); slots already built or queued are skipped.
 pub unsafe fn spec_seed(up: *mut Unit, ids: &[u32]) {
     for &id in ids { relax_codegen::fncost::hint(id); }
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     if !pipelined() {
         return;
@@ -16094,7 +16098,7 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
     struct P(*mut Unit);
     unsafe impl Send for P {}
     let p = P(up);
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     { let _k = crate::zone_alloc::kept();
     TEARDOWN_RUNNING.store(true, Ordering::SeqCst);
     let _ = std::thread::Builder::new().name("run-teardown".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
@@ -16569,7 +16573,7 @@ unsafe fn build_off_owner(up: *mut Unit, ids: &[(u32, RirMode)]) {
     if owner::is_owner() || ids.is_empty() {
         return;
     }
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     let epoch0 = PATCH_EPOCH.load(Ordering::SeqCst);
     let front = owner::publish(|| (&*up).front.clone());
@@ -17221,7 +17225,7 @@ enum Front {
 pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads: usize) -> Vec<(u32, Result<(Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>), String>)> {
     let census_unit = (&*up).front.census_id;
     let export_unit = (&*up).wasm_export_id;
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     let mut out: Vec<(u32, Result<(Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>), String>)> = Vec::new();
     // fronts, under the lock; each front's slots go in flight at once (no other thread starts
@@ -17505,7 +17509,7 @@ pub(crate) enum Begin {
 unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
     let _why = why_compile(&*up, id);
     cost_name(up, id);
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     // the disk cache first (unit lock held): a speculative build of a cached fn only links it
     if spec {
@@ -17687,7 +17691,7 @@ impl BackWork {
 /// source). Never runs a front.
 unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
     let BackDone { id, spec, slots, epoch, built, done } = d;
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     let _cost_install = relax_codegen::fncost::phase(6);
     let stale = PATCH_EPOCH.load(Ordering::SeqCst) != epoch;
@@ -17851,7 +17855,8 @@ fn prefront_slot(front: &FrontShared, id: u32) -> bool {
         let why = if why == AF_OK { AF_OTHER } else { why };
         PREFRONT_FAIL[why as usize].fetch_add(1, Ordering::Relaxed);
         if tier1_trace() {
-            eprintln!("O3 front of #{} not made off the owner: {} ({})", id, PREFRONT_FAIL_NAMES[why as usize], unsafe { (&*front.unit.load(Ordering::Relaxed)).prog.def_path(d) });
+            let r = front_read("O3 front trace");
+            eprintln!("O3 front of #{} not made off the owner: {} ({})", id, PREFRONT_FAIL_NAMES[why as usize], r.unit_of(front).prog.def_path(d));
         }
     }
     ok
@@ -17868,8 +17873,8 @@ fn prefront_closure(front: &FrontShared, id: u32) -> bool {
     if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(true) {
         return false;
     }
-    let _r = front_read("lower_ahead");
-    let u = unsafe { &*up };
+    let r = front_read("lower_ahead");
+    let u = r.unit_of(front);
     // the parent's checked body is gone (dropped once its own code was complete, or its code came
     // from the disk cache): made again here, as lower_ahead_as makes an instance's. The closures of
     // a parent built long ago are what turns hot later (a benchmark's or a frame's callback): their
@@ -18161,6 +18166,17 @@ impl FrontRead {
     pub(crate) fn of<'g>(&'g self, f: &FrontShared) -> (&'g Program, &'g Tcx) {
         f.ptrs.get(self)
     }
+
+    /// A front state's unit, for as long as this front read is held (lowering ahead reads the
+    /// program and type context through it).
+    pub(crate) fn unit_of<'g>(&'g self, f: &FrontShared) -> &'g Unit {
+        unsafe { &*f.unit.load(Ordering::Acquire) }
+    }
+}
+
+/// The session of unit `up` (any thread).
+pub(crate) unsafe fn unit_session(up: *const Unit) -> std::sync::Arc<crate::Session> {
+    (*std::ptr::addr_of!((*up).session)).clone()
 }
 
 /// The program and type context of unit `up` on the owner thread: the only thread that replaces
@@ -18623,13 +18639,13 @@ fn lower_ahead(f: &FrontShared, id: u32, own: bool) -> u8 {
     // not inside another lowering ahead (a compile its constant evaluation reached): this one's
     // guard would end the outer one's temporary callee identities under it
     if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(true) { return AF_OTHER; }
-    let _r = front_read("lower_ahead");
+    let r = front_read("lower_ahead");
     if !f.alive.load(Ordering::SeqCst) || !own && !ahead_phase() { return AF_OTHER; }
     let Some(FnKey::Inst(d, args)) = f.slot_keys.get(&id) else { return AF_NOT_BODY; };
     let key = (d, args);
     if f.is_built(&key) { return AF_BUILT; }
     let Some((epoch, body)) = f.ahead.get(&key) else { return AF_UNCHECKED; };
-    let u = unsafe { &*f.unit.load(Ordering::Relaxed) };
+    let u = r.unit_of(f);
     let fn_key = FnKey::Inst(d, key.1.clone());
     // fn_map publishes after the slot's fields (including a decoded image identity).
     // The ahead queue can contain the id before fn_id/name_slot finishes publishing it.
@@ -18794,11 +18810,11 @@ fn prefront_twin(front: &FrontShared, twin: u32, base: u32) -> bool {
         return false;
     }
     let Some(FnKey::Inst(d, args)) = front.slot_keys.get(&base) else { return false };
-    let _r = front_read("lower_ahead");
+    let r = front_read("lower_ahead");
     if !front.alive.load(Ordering::SeqCst) {
         return false;
     }
-    let u = unsafe { &*front.unit.load(Ordering::Relaxed) };
+    let u = r.unit_of(front);
     {
         let _preemptible = crate::preempt::Preemptible::on();
         typeck_ahead(front, d, args.clone(), 0, false, false);
@@ -19024,7 +19040,7 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
     let _census_context = (&*up).exec_context(relax_codegen::exec_census::active() && crate::exec_profile::is_call(up as usize, id));
 
     let _cost = relax_codegen::fncost::Record::ensure(id, 0, "ahead");
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     if !ahead_on(options) {
         return;
@@ -19400,7 +19416,7 @@ unsafe fn spec_enqueue_cached(up: *mut Unit, ids: &[u32], depth: u8) {
             return;
         }
     }
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     if !pipelined() || ids.is_empty() || depth >= spec_depth_max(options) || !ahead_policy().spec_cached {
         return;

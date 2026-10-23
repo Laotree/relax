@@ -294,7 +294,7 @@ pub fn recycle_due() -> bool {
 
 /// Starts a recycle on a background thread when one is due.
 pub fn maybe_recycle(up: *mut Unit) {
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     if !recycle_due() || RECYCLING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
@@ -1333,7 +1333,7 @@ fn c_policy(name: &str) -> Option<Option<(&'static str, u64)>> {
 /// Rewrites a twin's RIR for sandboxed execution (on the owner thread). Errors name what a module
 /// cannot do (a C function, data it cannot reach), never a crash.
 pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(), String> {
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     sb_init(up)?;
     let u = &mut *up;

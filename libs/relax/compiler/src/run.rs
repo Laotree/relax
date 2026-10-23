@@ -3061,7 +3061,7 @@ fn summary_inner(why: &str) {
     if up.is_null() {
         return;
     }
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     // at the end of the run the background compilers stop (a mid-run
     // "stats" summary keeps them going); the summary reads the owner thread

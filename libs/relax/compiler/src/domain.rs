@@ -1024,7 +1024,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     let boot_resolved = if crate::run::app_domain() == Some(id) { crate::run::take_boot_resolved() } else { None };
     if cancelled(id) { return Ok(id); }
     set_state(id, DomainState::Compiling("package graph".into()));
-    let sess = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let sess = unsafe { crate::jit::unit_session(up) };
     let workspace = crate::run::workspace_dir();
     let target_dir = crate::dirs::relax_dir().display().to_string();
     let std_dir = crate::std_dir();
