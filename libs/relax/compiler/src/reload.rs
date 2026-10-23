@@ -26,7 +26,7 @@ use crate::jit::{self, FnKey, Unit};
 use crate::program::{DefId, DefKind, Program};
 use crate::types::TyId;
 use std::time::Instant;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 #[path = "reload_watch.rs"]
 mod watch_events;
 
@@ -950,8 +950,8 @@ fn item_keys_memo(pf: &crate::parser::ParsedFile) -> std::rc::Rc<Vec<String>> {
     pf.ast.items.len().hash(&mut h);
     for it in &pf.ast.items { (it.lo, it.hi).hash(&mut h); }
     let id = h.finish();
-    crate::gen_local! {
-        static LAST: std::cell::RefCell<Vec<(u64, std::rc::Rc<Vec<String>>)>>;
+    thread_local! {
+        static LAST: std::cell::RefCell<Vec<(u64, std::rc::Rc<Vec<String>>)>> = Default::default();
     }
     if let Some(keys) = LAST.with(|last| last.borrow().iter().find(|(k, _)| *k == id).map(|(_, keys)| keys.clone())) { return keys; }
     let keys = std::rc::Rc::new(item_keys(pf));
@@ -2051,10 +2051,10 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, partial: u8, module: bool)
 /// Live edit transactions so far: a field-view summary context kept by one transaction is
 /// used by the next only when no other transaction ran in between.
 static TRANSACTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-crate::gen_local! {
+thread_local! {
     /// The field-view summaries of the program as the last patched edit left it (the
     /// transaction number it was kept by).
-    static FV_SESSION: std::cell::RefCell<Option<(u64, std::rc::Rc<crate::borrowck::field_views::SummaryCx>)>>;
+    static FV_SESSION: std::cell::RefCell<Option<(u64, std::rc::Rc<crate::borrowck::field_views::SummaryCx>)>> = Default::default();
 }
 fn fv_session_take(transaction: u64) -> std::rc::Rc<crate::borrowck::field_views::SummaryCx> {
     match FV_SESSION.with(|s| s.borrow_mut().take()) {
@@ -2068,7 +2068,7 @@ fn fv_session_keep(transaction: u64, cx: std::rc::Rc<crate::borrowck::field_view
 
 unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Result<crate::program::FileVersion, String>>>, t0: Instant, partial: u8, retries: usize, module: bool) -> Outcome {
     let transaction = TRANSACTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     let u = &mut *up;
     let olds: Vec<u32> = edits.iter().map(|e| e.file).collect();
@@ -3387,8 +3387,7 @@ pub fn domain_stopping(id: u32) {
 
 pub(crate) fn domain_loaded(inputs: Option<Inputs>) {
     *DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner()) = DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).take();
-    // the swap (zone_swap) may destroy the compiler generation this was built in before the watcher takes it
-    *DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = inputs.as_ref().map(crate::zone_alloc::kept_clone);
+    *DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = inputs;
     DOMAIN_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
     DOMAIN_LOADING.store(false, std::sync::atomic::Ordering::Release);
 }
@@ -3453,7 +3452,7 @@ pub extern "C" fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize {
     }
     let up = jit::current_unit();
     if up.is_null() { return usize::MAX; }
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     let runtime = &session.runtime;
     static STATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let s = STATE.get_or_init(|| {
@@ -4022,25 +4021,12 @@ pub extern "C" fn __relax_live_stream(p: *const u8, n: usize, t: *const u8, len:
 mod inputs;
 pub use inputs::Inputs;
 
-/// The inputs the watcher started with (kept: the settle swap restarts the watcher with them),
-/// whether the watcher thread runs, and the swap's request that it ends.
-static WATCH_INPUTS: relax_session::sync::Mutex<Option<Inputs>> = relax_session::sync::Mutex::new(None);
-static WATCH_RUNNING: AtomicBool = AtomicBool::new(false);
-static WATCH_STOP: AtomicBool = AtomicBool::new(false);
-
 pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
-    *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::zone_alloc::kept_clone(&inputs));
-    spawn_watcher(up, inputs, false);
-}
-
-fn spawn_watcher(up: *mut Unit, inputs: Inputs, quiet: bool) {
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let session = unsafe { crate::jit::unit_session(up) };
     struct P(*mut Unit);
     unsafe impl Send for P {}
     let p = P(up);
-    WATCH_STOP.store(false, Ordering::SeqCst);
-    WATCH_RUNNING.store(true, Ordering::SeqCst);
-    let spawned = std::thread::Builder::new()
+    let _ = std::thread::Builder::new()
         .name("run-live".to_string())
         .spawn(move || { let _z = crate::zone_alloc::compiler_thread();
             let runtime = &session.runtime;
@@ -4048,38 +4034,12 @@ fn spawn_watcher(up: *mut Unit, inputs: Inputs, quiet: bool) {
             jit::lower_this_thread_priority(runtime);
             // a panic here (the ICE hook is silent on the compiler's owner thread) would end
             // live editing without a word: say so
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { watch(p.0, inputs, quiet) }));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { watch(p.0, inputs) }));
             if let Err(e) = r {
                 let why = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_default();
                 eprintln!("makepad live: the watcher stopped: {why}{}; saves are no longer applied -- restart `makepad run`", jit::take_ice_location());
             }
-            WATCH_RUNNING.store(false, Ordering::SeqCst);
         });
-    if spawned.is_err() { WATCH_RUNNING.store(false, Ordering::SeqCst); }
-}
-
-/// The settle swap (jit zone_swap): ends the watcher thread, which holds compiler-generation
-/// state for its whole life, and waits for it (its locals are freed on the way out). Some(true):
-/// it ran and has ended, so `swap_restart_watcher` starts it again; Some(false): there was none;
-/// None: it did not end within `ms` (it is running again).
-pub fn swap_stop_watcher(ms: u64) -> Option<bool> {
-    if !WATCH_RUNNING.load(Ordering::SeqCst) { return Some(false); }
-    WATCH_STOP.store(true, Ordering::SeqCst);
-    let t = Instant::now();
-    while WATCH_RUNNING.load(Ordering::SeqCst) {
-        if t.elapsed().as_millis() as u64 > ms {
-            WATCH_STOP.store(false, Ordering::SeqCst);
-            return None;
-        }
-        std::thread::sleep(std::time::Duration::from_micros(500));
-    }
-    Some(true)
-}
-
-/// Starts the watcher again with the inputs it started with, after `swap_stop_watcher` ended it.
-pub fn swap_restart_watcher(up: *mut Unit) {
-    let inputs = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if let Some(inputs) = inputs { spawn_watcher(up, inputs, true); }
 }
 
 pub(crate) fn stamp(path: &str) -> Option<(std::time::SystemTime, u64)> {
@@ -4094,7 +4054,7 @@ fn gate_note(g: u8) {
     }
 }
 
-unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
+unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
     // (path, running file index, last stamp)
     // the program's own source files (not std, registry or git dependencies), loaded so far
@@ -4124,7 +4084,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
     // edit made before it is simply what the load read)
     let mut loads_seen = jit::DEFERRED_LOADS.load(std::sync::atomic::Ordering::Relaxed);
     let mut events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str()));
-    if !quiet && crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) { eprintln!("makepad live: watching {} source files; session log {}", files.len(), live_log_path()); }
+    if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) { eprintln!("makepad live: watching {} source files; session log {}", files.len(), live_log_path()); }
     let mut undos: Vec<Undo> = Vec::new();
     // SPEC-V: patches that ran before their verdict
     let mut pending: Vec<PendingPatch> = Vec::new();
@@ -4154,13 +4114,11 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
     let mut revision = 0;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(5));
-        if WATCH_STOP.load(Ordering::SeqCst) { return; }
         if DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire) { gate_note(1); continue; }
         let latest = DOMAIN_REVISION.load(std::sync::atomic::Ordering::Acquire);
         if latest != revision {
             revision = latest;
             if let Some(next) = DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::zone_alloc::kept_clone(&next));
                 inputs = next;
             }
             let loaded = crate::owner::call_quick(crate::owner::Class::Program, || own_files(&*up));
