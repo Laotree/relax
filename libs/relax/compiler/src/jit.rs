@@ -14023,7 +14023,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // assembly read these, off the owner when prefronted; and "the publish stopped at a level end"
     let views: std::cell::RefCell<HashMap<u32, O3View>> = Default::default();
     let scan = std::cell::Cell::new(false);
-    let no_block_freq = options.no_block_freq;
     let snapped = loop {
     if !resume.replace(false) {
     fronts.borrow_mut().clear();
@@ -14248,10 +14247,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             let force = t1_rec.as_ref().is_some_and(|(_, snap, _)| snap.contains(&t1_key(up, c)));
             let te = cpu_ns();
             ensure_rir(c, force, &callees);
-            let tv = cpu_ns();
-            TIER1_TAKE_PARTS[1].fetch_add(tv - te, Ordering::Relaxed);
-            views.borrow_mut().insert(c, o3_view(&*up, c, no_block_freq));
-            TIER1_TAKE_PARTS[4].fetch_add(cpu_ns() - tv, Ordering::Relaxed);
+            views.borrow_mut().insert(c, o3_view(&*up, c));
+            TIER1_TAKE_PARTS[1].fetch_add(cpu_ns() - te, Ordering::Relaxed);
             idx += 1;
         }
         if level == LEVELS - 1 {
@@ -14278,7 +14275,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             for c in done..end {
                 if recorded.contains(&t1_key(up, c as u32)) {
                     ensure_rir(c as u32, true, &callees);
-                    views.borrow_mut().insert(c as u32, o3_view(&*up, c as u32, no_block_freq));
+                    views.borrow_mut().insert(c as u32, o3_view(&*up, c as u32));
                     if seen.insert(c as u32) { callees.push(c as u32); }
                 }
             }
@@ -14296,14 +14293,13 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     if std::env::var_os("MAKEPAD_RUN_O3_TRACE").is_some() {
         eprintln!("O3 snapshot of {}: {} callees", u.fns[id as usize].name, callees.len());
     }
-    // the singles as of now (an entry reference may have escaped since the view), then the
-    // assembly: here when the walk ran on the owner, else off it after this publish
-    for (c, v) in views.borrow_mut().iter_mut() {
-        if v.single && !u.single_ref(*c) {
-            v.single = false;
-        }
-    }
-    let assembled = (!prefront).then(|| o3_assemble(up, options, id, &rir, &t1key, &t1_rec, &callees, &views.borrow(), inline_all));
+    // the assembly and its owner part: here when the walk ran on the owner, else the assembly off
+    // it after this publish and the owner part in one more
+    let assembled = (!prefront).then(|| {
+        let mut a = o3_assemble(up, options, id, &rir, &t1key, &t1_rec, &callees, &views.borrow(), inline_all);
+        o3_assemble_owner(up, options, &mut a, &t1key, &t1_rec);
+        a
+    });
     // recorded frequencies (replay)
     let t1_freq: Option<Option<Vec<f32>>> = t1key.as_ref().and_then(|k| {
         let g = T1PROF.lock().unwrap();
@@ -14472,10 +14468,14 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         return false;
     };
     let assembled = assembled.unwrap_or_else(|| {
-        let _front = front_read("O3 snapshot assembly");
-        o3_assemble(up, options, id, &rir, &t1key, &t1_rec, &callees, &views.borrow(), inline_all)
+        let mut a = {
+            let _front = front_read("O3 snapshot assembly");
+            o3_assemble(up, options, id, &rir, &t1key, &t1_rec, &callees, &views.borrow(), inline_all)
+        };
+        owner::publish(|| o3_assemble_owner(up, options, &mut a, &t1key, &t1_rec));
+        a
     });
-    let O3Assembled { mut snap, singles, cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: t1_single_keys, snap_counts } = assembled;
+    let O3Assembled { mut snap, singles, cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: t1_single_keys, snap_counts, .. } = assembled;
     if let Some(m) = measure.as_mut() { m.phase(1, t1); }
     trace_tier1_phase(id, "backend");
     // PGO: counted inline candidates carry their counts into the inliner (it scales them to the
@@ -16001,24 +16001,12 @@ struct O3View {
     compiled: bool,
     /// no O3 build inlined it yet (with !compiled: never ran)
     uninlined: bool,
-    /// the PGO block counts for `rir`
-    counts: Option<Vec<f32>>,
-    /// referenced once and not recursive (single_ref is checked again at the take's end)
-    single: bool,
 }
 
-/// The owner's copy of slot `c` for the walk (a publish: O(1) but for recursive_fn's walk of the
-/// slot's call graph, done only for slots with RIR).
-fn o3_view(u: &Unit, c: u32, no_block_freq: bool) -> O3View {
+/// The owner's copy of slot `c` for the walk (O(1), in the walk's publish).
+fn o3_view(u: &Unit, c: u32) -> O3View {
     let f = &u.fns[c as usize];
-    let rir = f.rir.clone();
-    O3View {
-        compiled: f.compiled,
-        uninlined: f.history().inlined_into.is_empty(),
-        counts: if no_block_freq { None } else { rir.as_ref().and_then(|r| u.frequency_profiles.get(&c).and_then(|p| p.counts_for(r))) },
-        single: rir.is_some() && u.single_ref(c) && !u.recursive_fn(c),
-        rir,
-    }
+    O3View { rir: f.rir.clone(), compiled: f.compiled, uninlined: f.history().inlined_into.is_empty() }
 }
 
 /// The next level of an O3 snapshot's walk: the calls (and taken addresses) in the frontier's RIR
@@ -16068,6 +16056,9 @@ unsafe fn o3_next_level(up: *mut Unit, options: &crate::options::Options, id: u3
 /// their one owner, the deterministic-O3 key lists, the candidates' PGO counts.
 struct O3Assembled {
     snap: Vec<(u32, std::sync::Arc<relax_backend::rir::Func>, u8)>,
+    /// called once in the snapshot, by (candidate, its owner): singles if referenced once and not
+    /// recursive (owner state: o3_assemble_owner)
+    single_cands: Vec<(u32, u32)>,
     singles: HashMap<u32, u32>,
     cold_keys: Vec<String>,
     snap_keys: Vec<String>,
@@ -16118,12 +16109,13 @@ unsafe fn o3_assemble(up: *mut Unit, options: &crate::options::Options, id: u32,
             let attrs = if cold { attrs | relax_codegen::opt::ATTR_COLD } else { attrs };
             if !options.no_block_freq {
                 let ck = t1key.as_ref().map(|_| t1_key(up, c));
+                // (live counts are owner state: o3_assemble_owner)
                 let cc = if t1prof_replay(options) {
                     let g = T1PROF.lock().unwrap();
                     let p = g.as_ref().unwrap();
                     t1key.as_ref().and_then(|k| p.map.get(k)).and_then(|e| e.callee_counts.iter().find(|x| Some(&x.0) == ck.as_ref()).map(|x| x.1.clone()))
                 } else {
-                    v.counts.clone()
+                    None
                 };
                 if let Some(cc) = cc.filter(|v| v.len() == r.blocks.len()) {
                     snap_counts.push((c, ck, cc));
@@ -16153,26 +16145,41 @@ unsafe fn o3_assemble(up: *mut Unit, options: &crate::options::Options, id: u32,
             }
         }
     }
-    let mut singles = HashMap::new();
-    let mut t1_single_keys = Vec::new();
-    for &(c, _, _) in &snap {
+    let single_cands = snap.iter().filter_map(|&(c, _, _)| match owners.get(&c) {
+        Some(&(owner, 1)) if owner != c => Some((c, owner)),
+        _ => None,
+    }).collect();
+    TIER1_TAKE_PARTS[5].fetch_add(cpu_ns() - ta, Ordering::Relaxed);
+    O3Assembled { snap, single_cands, singles: HashMap::new(), cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: Vec::new(), snap_counts }
+}
+
+/// The owner part of a snapshot (a publish: O(candidates), recursive_fn walks a candidate's calls):
+/// which single-call candidates are referenced once and not recursive, and the candidates' live
+/// PGO block counts.
+unsafe fn o3_assemble_owner(up: *mut Unit, options: &crate::options::Options, a: &mut O3Assembled, t1key: &Option<String>, t1_rec: &Option<(Vec<String>, Vec<String>, Vec<String>)>) {
+    let t = cpu_ns();
+    let u = &*up;
+    for &(c, owner) in &a.single_cands {
         // (the key lists exist for deterministic O3 only)
         let key = (t1key.is_some() || t1_rec.is_some()).then(|| t1_key(up, c));
         let is_single = match t1_rec {
             Some((_, _, recorded)) => key.as_ref().is_some_and(|k| recorded.contains(k)),
-            None => views.get(&c).is_some_and(|v| v.single),
+            None => u.single_ref(c) && !u.recursive_fn(c),
         };
-        if !is_single { continue; }
-        if let Some(&(owner, 1)) = owners.get(&c) {
-            if owner != c {
-                singles.insert(c, owner);
-                if let Some(k) = key { t1_single_keys.push(k); }
+        if is_single {
+            a.singles.insert(c, owner);
+            if let Some(k) = key { a.single_keys.push(k); }
+        }
+    }
+    a.single_keys.sort();
+    if !options.no_block_freq && !t1prof_replay(options) {
+        for (c, r, _) in &a.snap {
+            if let Some(cc) = u.frequency_profiles.get(c).and_then(|p| p.counts_for(r)).filter(|v| v.len() == r.blocks.len()) {
+                a.snap_counts.push((*c, t1key.as_ref().map(|_| t1_key(up, *c)), cc));
             }
         }
     }
-    t1_single_keys.sort();
-    TIER1_TAKE_PARTS[5].fetch_add(cpu_ns() - ta, Ordering::Relaxed);
-    O3Assembled { snap, singles, cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: t1_single_keys, snap_counts }
+    TIER1_TAKE_PARTS[4].fetch_add(cpu_ns() - t, Ordering::Relaxed);
 }
 
 /// O1 builds one take of an O3 snapshot prepares (o3_candidates_begin): a publish's item bound
