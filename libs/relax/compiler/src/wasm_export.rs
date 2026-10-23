@@ -430,7 +430,7 @@ fn force_union(up: *mut Unit) -> std::collections::BTreeSet<u32> {
             let Some(captured) = g.as_ref().and_then(|g| g.get(&u.wasm_export_id)) else { return forced };
             let funcs = &captured.funcs;
             let mut named: Vec<u32> = Vec::new();
-            address_taken(u, funcs, &mut named);
+            address_taken(u, funcs.values(), &mut named, &mut std::collections::HashSet::new());
             for f in funcs.values() {
                 for b in &f.blocks {
                     for i in &b.insts {
@@ -525,6 +525,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
         panic_abort: true,
         untraced_import: false,
         memory64: options.check_target.web() == Some(crate::options::PtrWidth::W64),
+        heap_pages: 0,
         ..wasm::Options::default()
     };
     let mut single = true;
@@ -593,13 +594,28 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     if roots.is_empty() {
         roots.push((ENTRY.load(std::sync::atomic::Ordering::Relaxed), None));
     }
+    // Captured explicit exports remain callable without an embedder's --exports
+    // registration (standalone fixtures and exported cold panic probes).
+    if let Ok(exports) = crate::run::exported_fns(&u.prog, &[String::new()]) {
+        let names: HashMap<_, _> = exports.into_iter().map(|(name, def)| (def, name)).collect();
+        for id in funcs.keys() {
+            if roots.iter().any(|r| r.0 == *id) { continue; }
+            if let crate::jit::FnKey::Inst(def, args) = &u.fns[*id as usize].key {
+                if args.is_empty() {
+                    if let Some(name) = names.get(def) { roots.push((*id, Some(name.clone()))); }
+                }
+            }
+        }
+    }
     roots.retain(|r| funcs.contains_key(&r.0));
     // roots: the entry and every function whose address any traced code takes (directly or in
     // the data it names): the program enters those through pointers made at run time (callbacks
     // a provided crate holds, vtables), which the static walk from the entry does not see. A slot
     // that ran but is named only by direct calls its callers' later builds inlined is dropped.
     let mut seeds: Vec<u32> = roots.iter().map(|r| r.0).collect();
-    address_taken(u, funcs, &mut seeds);
+    address_taken(u, funcs.values(), &mut seeds, &mut std::collections::HashSet::new());
+    seeds.sort_unstable();
+    seeds.dedup();
     let reached = reach(u, funcs, &seeds);
     if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
         eprintln!("wasm export: {} roots (entry + address-taken), {} of {} captured reached", seeds.len(), reached.len(), funcs.len());
@@ -678,7 +694,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     host_syms.dedup();
     let mut vals: HashMap<u32, u64> = HashMap::new();
     let mut host: HashMap<u32, HostBind> = HashMap::new();
-    let web = options.check_target.web().is_some();
+    let web = u.web_target;
     for id in host_syms {
         let b = match u.syms.kind(id) {
             Some(SymKind::Rt(n)) => match n {
@@ -690,7 +706,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
                 "rethrow" if abort => HostBind::Trap,
                 n => HostBind::Import("r".into(), n.to_string()),
             },
-            Some(SymKind::Foreign(n)) => match single.then(|| single_thread(&n)).flatten() {
+            Some(SymKind::Foreign(n)) => match web.then(|| web_binding(&n)).flatten().or_else(|| single.then(|| single_thread(&n)).flatten()) {
                 Some(b) => b,
                 // the web target: the module rustc imports it from (the page's `env.js_*`); a
                 // native capture's C symbols are `c.<name>`
@@ -751,6 +767,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
             Some(SymKind::Thunk(slot)) => m.table_index(slot) as u64,
             Some(SymKind::Site(i)) => i as u64,
             Some(SymKind::Rt("tls_base")) => tls,
+            Some(SymKind::Rt("web_memory_base")) => 0,
             _ => {
                 n_unlinked += 1;
                 if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
@@ -908,10 +925,9 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
 
 /// Slots whose address the captured code takes: `FnAddr`, thunk addresses, and function pointers
 /// in the data those functions name (vtables, statics), followed through data pointers.
-fn address_taken(u: &Unit, funcs: &BTreeMap<u32, Func>, out: &mut Vec<u32>) {
-    let mut data_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+fn address_taken<'a>(u: &Unit, funcs: impl IntoIterator<Item = &'a Func>, out: &mut Vec<u32>, data_seen: &mut std::collections::HashSet<u32>) {
     let mut dwork: Vec<u32> = Vec::new();
-    for f in funcs.values() {
+    for f in funcs {
         for b in &f.blocks {
             for i in &b.insts {
                 match i {
@@ -945,8 +961,6 @@ fn address_taken(u: &Unit, funcs: &BTreeMap<u32, Func>, out: &mut Vec<u32>) {
             }
         }
     }
-    out.sort_unstable();
-    out.dedup();
 }
 
 /// The captured functions the entry reaches: by calls, function addresses, and function pointers
@@ -998,6 +1012,22 @@ fn reach(u: &Unit, funcs: &BTreeMap<u32, Func>, roots: &[u32]) -> Vec<u32> {
     seen.into_iter().collect()
 }
 
+/// Web host binding table. Only page services remain imports. Arithmetic/string
+/// helpers and panics lower to core web code, System to the web dlmalloc port,
+/// and SPEC-V dispatch is absent before capture. These four architecture calls
+/// become instructions here. Atomic helpers select shared-memory instructions
+/// from Options::shared_max_pages; today's page profile is single-threaded,
+/// panic=abort (notify=0; wait traps on equality, returns 1 otherwise).
+fn web_binding(name: &str) -> Option<HostBind> {
+    Some(HostBind::Builtin(match name {
+        "relax_web_memory_size" => Builtin::MemorySize,
+        "relax_web_memory_grow" => Builtin::MemoryGrow,
+        "relax_web_atomic_wait32" => Builtin::AtomicWait32,
+        "relax_web_atomic_notify" => Builtin::AtomicNotify,
+        _ => return None,
+    }))
+}
+
 /// A single-threaded program's binding of the threading C symbols: no threads are started,
 /// waits and wakes do nothing, thread-local keys are a table in linear memory.
 fn single_thread(name: &str) -> Option<HostBind> {
@@ -1035,18 +1065,30 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit) -> (std::collections:
     for f in funcs.values() {
         callees(f, &mut work);
     }
-    work.retain(|id| !funcs.contains_key(id) && (*id as usize) < u.fns.len() && crate::jit::keep_reachable(u, *id));
+    work.extend(funcs.keys().copied());
+    work.retain(|id| (*id as usize) < u.fns.len() && crate::jit::keep_reachable(u, *id));
     let mut kept = std::collections::BTreeSet::new();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut data_seen = std::collections::HashSet::new();
     let mut failed = 0;
     let up = crate::jit::current_unit();
     while let Some(id) = work.pop() {
-        if funcs.contains_key(&id) || (id as usize) >= u.fns.len() {
+        if !visited.insert(id) || (id as usize) >= u.fns.len() {
+            continue;
+        }
+        // A traced root still needs its unexecuted grow/error branches and their
+        // full call closure. Previously only untraced roots were expanded.
+        if let Some(f) = funcs.get(&id) {
+            callees(f, &mut work);
+            address_taken(u, std::iter::once(f), &mut work, &mut data_seen);
+            kept.insert(id);
             continue;
         }
         let r = crate::owner::call(crate::owner::Class::Program, || crate::zone_alloc::kept_with(|| unsafe { crate::jit::export_rir(up, id) }));
         match r {
             Ok(f) => {
                 callees(&f, &mut work);
+                address_taken(u, std::iter::once(&f), &mut work, &mut data_seen);
                 funcs.insert(id, f);
                 kept.insert(id);
             }

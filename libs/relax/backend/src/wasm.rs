@@ -103,6 +103,14 @@ pub enum HostBind {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Builtin {
+    /// (memory_index) -> pages, using the module's address width.
+    MemorySize,
+    /// (memory_index, delta_pages) -> previous pages, or usize::MAX.
+    MemoryGrow,
+    /// (address, expected, timeout_ns) -> wait status. Unshared memory traps on equality.
+    AtomicWait32,
+    /// (address, count) -> number woken (zero for unshared memory).
+    AtomicNotify,
     /// (dst, src, n) -> [dst]: memory.copy
     Memcpy,
     /// (dst, src, n) -> [dst]: memory.copy (overlap-safe)
@@ -137,6 +145,8 @@ pub struct Options {
     /// 64-bit linear memory (memory64: addresses are i64, no wraps); the wasm64 target. Default:
     /// 32-bit memory (wasm32)
     pub memory64: bool,
+    /// A shared memory requires a maximum in pages. None is the single-thread page profile.
+    pub shared_max_pages: Option<u64>,
     /// bytes of shadow stack (at the bottom of memory, growing down)
     pub stack_size: u32,
     /// pages (64 KiB) of heap after the data, in the initial memory size
@@ -177,7 +187,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { memory64: false, stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, remat_slots: false, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true, order_by_bytes: true }
+        Options { memory64: false, shared_max_pages: None, stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, remat_slots: false, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true, order_by_bytes: true }
     }
 }
 
@@ -615,8 +625,11 @@ impl<'a> Module<'a> {
         };
         let pages = (heap_base + 0xFFFF) / 0x10000 + opts.heap_pages as u64;
         // limits flags: 0x04 = 64-bit addresses
-        let mut s = vec![1, if opts.memory64 { 0x04 } else { 0x00 }];
+        let mut s = vec![1, (if opts.memory64 { 0x04 } else { 0x00 }) | if opts.shared_max_pages.is_some() { 3 } else { 0 }];
         uleb(&mut s, pages);
+        if let Some(max) = opts.shared_max_pages {
+            uleb(&mut s, max);
+        }
         let b0 = out.len();
         section(&mut out, 5, &s);
         sz(&mut st, &out, b0, 5);
@@ -3432,6 +3445,34 @@ fn helper_body(o: &Options, h: Helper, sh: &mut Shared, fn_ix: &HashMap<u32, u32
             };
             let (acst, aty) = if o.memory64 { (I64C, I64) } else { (I32C, I32) };
             match bi {
+                Builtin::MemorySize | Builtin::MemoryGrow => {
+                    // The std ABI uses i64 RIR registers, including wasm32 usize.
+                    if bi == Builtin::MemoryGrow {
+                        aw(&mut c, 1);
+                    }
+                    c.extend_from_slice(&[if bi == Builtin::MemoryGrow { 0x40 } else { 0x3f }, 0]);
+                    if !o.memory64 {
+                        c.push(0xad); // i64.extend_i32_u (including wasm32 usize::MAX)
+                    }
+                }
+                Builtin::AtomicWait32 | Builtin::AtomicNotify => {
+                    if o.shared_max_pages.is_some() {
+                        aw(&mut c, 0);
+                        g(&mut c, 1);
+                        c.push(WRAP);
+                        if bi == Builtin::AtomicWait32 { g(&mut c, 2); }
+                        c.extend_from_slice(&[0xfe, if bi == Builtin::AtomicWait32 { 1 } else { 0 }, 2, 0]);
+                        c.push(0xad);
+                    } else if bi == Builtin::AtomicNotify {
+                        c.extend_from_slice(&[I64C, 0]);
+                    } else {
+                        aw(&mut c, 0);
+                        c.extend_from_slice(&[0x28, 2, 0]); // i32.load
+                        g(&mut c, 1);
+                        c.extend_from_slice(&[WRAP, 0x46, 0x04, 0x40, 0x00, 0x0b]);
+                        c.extend_from_slice(&[I64C, 1]);
+                    }
+                }
                 Builtin::Memcpy | Builtin::Memmove | Builtin::Memset => {
                     aw(&mut c, 0);
                     if bi == Builtin::Memset {

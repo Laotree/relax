@@ -1,6 +1,6 @@
 // The web layer of Relax's std (std/sys/web.rs, fs_web.rs, process_web.rs, env_web.rs, ...) against
 // rustc's std for wasm32-unknown-unknown. `run()` prints one line per observation through the
-// host's `relax_web_print`; the output must equal the one of the same program built by rustc for
+// host's `js_console_log`; the output must equal the one of the same program built by rustc for
 // wasm32 and run in node (host.js). Panics do not unwind in the rustc build, so the observations of
 // panicking calls are Relax-only (`relax_only`, lines prefixed `RELAX-ONLY`), checked against
 // relax_only.expected. Driver: run.sh.
@@ -19,11 +19,11 @@ use std::sync::{Arc, Barrier, Condvar, LazyLock, Mutex, Once, OnceLock, RwLock};
 use std::time::Duration;
 
 extern "C" {
-    fn relax_web_print(ptr: *const u8, len: usize);
+    fn js_console_log(ptr: *const u8, len: usize);
 }
 
 fn p(s: &str) {
-    unsafe { relax_web_print(s.as_ptr(), s.len()) }
+    unsafe { js_console_log(s.as_ptr(), s.len()) }
 }
 
 macro_rules! out {
@@ -373,7 +373,7 @@ fn misc_section() {
     out!("misc: {:?}", std::panic::catch_unwind(|| ()).is_ok());
 }
 
-pub fn run() {
+fn body() {
     out!("web_std start");
     fmt_section();
     str_section();
@@ -389,45 +389,47 @@ pub fn run() {
     net_section();
     time_section();
     misc_section();
-    #[cfg(relax)]
-    relax_only();
     out!("web_std end");
 }
 
-// Observations of calls that panic on rustc's wasm32 (it aborts there: no unwinding), caught here.
-#[cfg(relax)]
-fn relax_only() {
-    fn caught<F: FnOnce() + std::panic::UnwindSafe>(name: &str, f: F) {
-        std::panic::set_hook(Box::new(|_| {}));
-        let r = std::panic::catch_unwind(f);
-        let _ = std::panic::take_hook();
-        match r {
-            Ok(()) => out!("RELAX-ONLY {name}: returned"),
-            Err(e) => {
-                let m = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()));
-                out!("RELAX-ONLY {name}: panicked {:?}", m);
-            }
-        }
-    }
-    caught("Instant::now", || drop(std::time::Instant::now()));
-    caught("SystemTime::now", || drop(std::time::SystemTime::now()));
-    caught("set_var", || std::env::set_var("K", "V"));
-    caught("remove_var", || std::env::remove_var("K"));
-    caught("vars", || drop(std::env::vars()));
-    caught("vars_os", || drop(std::env::vars_os()));
-    caught("temp_dir", || drop(std::env::temp_dir()));
-    caught("split_paths", || drop(std::env::split_paths("a:b")));
-    caught("process::id", || drop(std::process::id()));
-    caught("File::open unwrap", || drop(std::fs::File::open("x").unwrap()));
-}
-
-#[cfg(relax)]
-fn main() {
-    run();
-}
-
-#[cfg(not(relax))]
+// Each abort probe runs in a fresh Node instance. Keep its closure even when the
+// capture only executes the non-panicking sentinel; the hook must precede the trap.
+#[cfg(not(std_reference))]
 #[no_mangle]
-pub extern "C" fn run_export() {
-    run();
+#[relax(keep_reachable)]
+pub extern "C" fn panic_probe(probe: u32) {
+    fn caught<F: FnOnce() + std::panic::UnwindSafe>(name: &'static str, f: F) {
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info.location().expect("panic hook location");
+            assert!(location.line() > 0 && !location.file().is_empty());
+            out!("RELAX-ONLY {name}: panicked {:?}", info.payload_as_str());
+        }));
+        let _ = std::panic::catch_unwind(f);
+        out!("RELAX-ONLY {name}: returned");
+    }
+    match probe {
+        0 => caught("Instant::now", || drop(std::time::Instant::now())),
+        1 => caught("SystemTime::now", || drop(std::time::SystemTime::now())),
+        2 => caught("set_var", || std::env::set_var("K", "V")),
+        3 => caught("remove_var", || std::env::remove_var("K")),
+        4 => caught("vars", || drop(std::env::vars())),
+        5 => caught("vars_os", || drop(std::env::vars_os())),
+        6 => caught("temp_dir", || drop(std::env::temp_dir())),
+        7 => caught("split_paths", || drop(std::env::split_paths("a:b"))),
+        8 => caught("process::id", || drop(std::process::id())),
+        9 => caught("File::open unwrap", || drop(std::fs::File::open("x").unwrap())),
+        10 => caught("bounds", || drop([0u8; 1][std::hint::black_box(2)])),
+        11 => caught("divide zero", || drop(42u64 / std::hint::black_box(0))),
+        12 => caught("wide overflow", || drop(i128::MIN / std::hint::black_box(-1))),
+        _ => {}
+    }
 }
+
+fn main() {
+    body();
+    #[cfg(not(std_reference))]
+    panic_probe(13);
+}
+
+#[no_mangle]
+pub extern "C" fn run() { main(); }

@@ -2,7 +2,7 @@
 // wasm32-unknown-unknown cdylib run in node for wasm32; a host binary for wasm64, whose data
 // layout is x86_64's) and from Relax running it as the web target in the trace host's mode
 // (MAKEPAD_RUN_CHECK_TARGET=wasm{32,64}-unknown-unknown). Output goes through the page-side
-// import `relax_web_print` (a page has no stdout). Pointer-heavy on purpose: fat pointers,
+// import `js_console_log` (a page has no stdout). Pointer-heavy on purpose: fat pointers,
 // trait objects, vtables, statics holding pointers, Box/Rc/Vec/String, enums with pointer niches,
 // fn pointers, closures, unaligned/packed fields, 64- and 128-bit math, atomics.
 #![allow(dead_code)]
@@ -15,11 +15,11 @@ use std::sync::Mutex;
 
 #[cfg(target_family = "wasm")]
 extern "C" {
-    fn relax_web_print(ptr: *const u8, len: usize);
+    fn js_console_log(ptr: *const u8, len: usize);
 }
 #[cfg(target_family = "wasm")]
 fn out(s: &str) {
-    unsafe { relax_web_print(s.as_ptr(), s.len()) }
+    unsafe { js_console_log(s.as_ptr(), s.len()) }
 }
 #[cfg(not(target_family = "wasm"))]
 fn out(s: &str) {
@@ -241,6 +241,7 @@ fn coverage_hot() {
 }
 
 fn body() {
+    web_runtime_cases();
     coverage_hot();
     c_aggregates();
     say!("usize {} ptr {} fat {} dyn {} opt_box {} vec {} string {}",
@@ -356,4 +357,55 @@ pub extern "C" fn run() {
 
 fn main() {
     body()
+}
+
+fn web_runtime_cases() {
+    use std::hint::black_box;
+    let unsigned = [0u128, 1, u64::MAX as u128, 1u128 << 64, 1u128 << 127, u128::MAX];
+    let mut sum = 0u128;
+    for a in unsigned {
+        for b in unsigned {
+            if b != 0 {
+                let a = black_box(a);
+                let b = black_box(b);
+                sum = sum.wrapping_add(a / b).wrapping_add(a % b);
+            }
+        }
+    }
+    let signed = [i128::MIN, -123456789012345678901i128, -1, 0, 1, i128::MAX];
+    for a in signed {
+        for b in signed {
+            if b != 0 && !(a == i128::MIN && b == -1) {
+                let a = black_box(a);
+                let b = black_box(b);
+                sum = sum.wrapping_add((a / b) as u128).wrapping_add((a % b) as u128);
+            }
+        }
+    }
+    let text = String::from("a runtime string longer than sixteen bytes");
+    let same = text.clone();
+    let mut different = text.clone();
+    different.push('!');
+    assert!(black_box(text.as_str()) == black_box(same.as_str()));
+    assert!(black_box(text.as_str()) != black_box(different.as_str()));
+    different.pop();
+    different.replace_range(20..21, "X");
+    assert!(black_box(text.as_str()) != black_box(different.as_str()));
+    unsafe {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        let layout = Layout::from_size_align(131072, 256).unwrap();
+        let p = System.alloc_zeroed(layout);
+        assert!(!p.is_null());
+        assert_eq!(p as usize % 256, 0);
+        for i in 0..layout.size() { assert_eq!(*p.add(i), 0); *p.add(i) = (i % 251) as u8; }
+        let q = System.realloc(p, layout, 393216);
+        assert!(!q.is_null());
+        for i in 0..layout.size() { assert_eq!(*q.add(i), (i % 251) as u8); }
+        let large = Layout::from_size_align(393216, 256).unwrap();
+        let p = System.realloc(q, large, 65536);
+        assert!(!p.is_null());
+        for i in 0..65536 { assert_eq!(*p.add(i), (i % 251) as u8); }
+        System.dealloc(p, Layout::from_size_align(65536, 256).unwrap());
+    }
+    say!("web_runtime {sum}");
 }
