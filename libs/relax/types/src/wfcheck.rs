@@ -1221,8 +1221,20 @@ pub mod obligations {
         let ret = ocx.normalize_ty(&env, sig.ret);
         ocx.register_obligation(Goal { param_env: env.clone(), predicate: collect::trait_predicate(term, vec![GenericArg::Type(ret)]) });
         let bad = ocx.try_evaluate_obligations().into_iter().any(|e| matches!(e, NextSolverError::TrueError(_)));
-        if !bad { return Vec::new(); }
         let pos = ast.fn_sig(*s).ret.and_then(|t| ty_pos(ast, t)).unwrap_or(item.name.lo);
+        if !bad {
+            // the region constraints of the `Termination` proof hold too (resolve_regions; a
+            // placeholder one is "implementation of `..` is not general enough")
+            let errors = infcx.resolve_regions(prog, env, &[]);
+            if errors.is_empty() { return Vec::new(); }
+            let placeholder = errors.iter().any(|e| matches!(e, crate::infer::lexical_region_resolve::RegionResolutionError::UpperBoundUniverseConflict(..)))
+                || errors.iter().any(|e| match e {
+                    crate::infer::lexical_region_resolve::RegionResolutionError::ConcreteFailure(_, a, b) => [a, b].iter().any(|r| matches!(tcx.tys.region_kind(**r), crate::types::RegionKind::RePlaceholder { .. })),
+                    _ => false,
+                });
+            let msg = if placeholder { "higher-ranked lifetime error" } else { "lifetime may not live long enough" };
+            return vec![prog.record_uncoded_error(def.file, pos, "typeck", msg.to_string())];
+        }
         let shown = crate::typeck::ty_to_string(false, prog, tcx, infcx.deeply_resolve_ignoring_regions(ret));
         vec![prog.record_error(def.file, pos, "typeck", format!("E0277: `main` has invalid return type `{}`", shown))]
     }
