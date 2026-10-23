@@ -510,6 +510,15 @@ impl<'a> Interp<'a> {
         ub(msg.to_string())
     }
 
+    /// allocation.rs read_scalar without read_provenance: a typed read of an integer, float, bool or
+    /// char finds no provenance in its bytes (ReadPointerAsInt). `program`: the read is the program's
+    /// own (a `ptr_read` of its memory), not one of Relax's std pointer casts.
+    pub(super) fn check_int_read(&self, v: &Val, ty: TyId, program: bool) -> R<()> {
+        if !matches!(self.tcx.tys.kind(ty), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char) || (v.ptrs.is_empty() && v.frags.is_empty()) { return Ok(()); }
+        if program { return ub("unable to turn pointer into integer"); }
+        self.ptr_int_ub("unable to turn pointer into integer")
+    }
+
     /// An integer: initialised, no provenance.
     fn int_of(&self, v: &Val) -> R<u128> {
         if v.init.iter().any(|b| !b) { return Err(self.uninit_err(v, "")); }
@@ -643,6 +652,7 @@ impl<'a> Interp<'a> {
                 // ... and a pointer is read with its provenance (allocation.rs read_scalar with
                 // read_provenance: provenance_map.rs read_ptr rejects bytes of different pointers)
                 if matches!(self.tcx.tys.kind(p.ty), TyKind::Ref(..) | TyKind::Ptr(..) | TyKind::FnPtr(..)) && v.size() >= self.ps { self.ptr_of(&v, 0)?; }
+                self.check_int_read(&v, p.ty, false)?;
                 Ok((v, p.ty))
             }
             Operand::Constant(c) => { let t = c.const_.ty(&self.tcx.tys); Ok((self.eval_const_operand(&c.const_)?, t)) }

@@ -532,7 +532,10 @@ impl Interp<'_> {
             "ptr_read" | "read_via_copy" => {
                 let p = self.ptr_of(&vals[0], 0)?;
                 let (size, align) = self.size_align(dest.ty)?;
-                self.read(p, size, align)?
+                let v = self.read(p, size, align)?;
+                // (a typed read of the program's memory, as rustc's read_via_copy)
+                self.check_int_read(&v, dest.ty, true)?;
+                v
             }
             "ptr_write" | "write_via_move" => {
                 let p = self.ptr_of(&vals[0], 0)?;
