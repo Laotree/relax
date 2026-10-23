@@ -1266,6 +1266,7 @@ fn owner_loop() -> ! {
                     break r;
                 }
                 OWNER_ASLEEP.store(true, Ordering::SeqCst);
+                crate::zone_alloc::compiler_hand_back_idle();
                 q = WAKE.wait(q).unwrap_or_else(|e| e.into_inner());
                 OWNER_ASLEEP.store(false, Ordering::SeqCst);
             }

@@ -5644,10 +5644,10 @@ pub fn sroa_reject_slot(ok: &mut [bool], sl: usize, why: SroaReject, stats: &mut
     }
 }
 
-thread_local! {
+relax_session::memo_local! {
     /// sroa's answer to "does this call keep or return a pointer passed as argument k?":
     /// set by the O3 driver from the callees' RIR (param_nocapture), None elsewhere
-    static SROA_NOCAP: std::cell::RefCell<Option<Box<dyn Fn(&Callee, usize) -> bool>>> = Default::default();
+    static SROA_NOCAP: std::cell::RefCell<Option<Box<dyn Fn(&Callee, usize) -> bool>>>;
 }
 
 pub fn sroa_nocapture(c: &Callee, k: usize) -> bool {

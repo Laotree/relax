@@ -2227,8 +2227,8 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         // whatever compiles run meanwhile (tools/run/fixture/settle_stress.sh)
         let settle_stress = std::env::var("MAKEPAD_RUN_SETTLE_STRESS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&ms| ms > 0);
         let mut last_stress = Instant::now();
-        // the settle rebuild (jit settle_rebuild.rs): once per settled compile count, retried while
-        // its preconditions fail
+        // the settle rebuild (jit settle_rebuild.rs): once per first present, retried while its
+        // preconditions fail
         let (mut rebuild_over, mut rebuild_round, mut rebuild_done) = (!jit::settle_rebuild::enabled(), None, false);
         let (mut rebuild_next, mut rebuild_tries, mut rebuild_said) = (Instant::now(), 0u32, String::new());
         let mut present_bytes = Vec::new();
@@ -2418,9 +2418,11 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                     }
                 }
             }
+            // one rebuild per first present (the run's, then each domain's) once its compiles have
+            // settled: a later burst (tier-up) does not rebuild again (MAKEPAD_RUN_SETTLE_STRESS does)
             let settled = settle_watch.settled_now(jit::demand_compiled());
-            if settled.is_some() && rebuild_round != settled {
-                rebuild_round = settled;
+            if settled.is_some() && rebuild_round != Some(settle_present) {
+                rebuild_round = Some(settle_present);
                 rebuild_done = false;
                 rebuild_tries = 0;
                 rebuild_next = Instant::now();

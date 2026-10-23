@@ -80,12 +80,12 @@ fn lowers_slot(u: &Unit, slot: u32, cur_fn: u32) -> bool {
     slot == cur_fn || (slot as usize) < u.fns.len() && matches!(u.fns[slot as usize].key, crate::jit::FnKey::Plain(b) if b == cur_fn)
 }
 
-thread_local! {
-    pub static PROBE_POINTS: std::cell::RefCell<Vec<ProbePoint>> = Default::default();
-    pub static PROBE_RESULTS: std::cell::RefCell<Vec<(u32, Result<(), String>)>> = Default::default();
-    pub static WATCH_FIELDS: std::cell::RefCell<Vec<WatchField>> = Default::default();
+crate::memo_local! {
+    pub static PROBE_POINTS: std::cell::RefCell<Vec<ProbePoint>>;
+    pub static PROBE_RESULTS: std::cell::RefCell<Vec<(u32, Result<(), String>)>>;
+    pub static WATCH_FIELDS: std::cell::RefCell<Vec<WatchField>>;
     /// (slot, source position) of every write the watches instrumented
-    pub static WATCH_RESULTS: std::cell::RefCell<Vec<(u32, u64)>> = Default::default();
+    pub static WATCH_RESULTS: std::cell::RefCell<Vec<(u32, u64)>>;
 }
 
 /// A place matched by a slice pattern (see Lcx::slice_pat).

@@ -10,8 +10,8 @@ struct Semantic {
     types: *const Types,
     hashes: Vec<Option<u128>>,
 }
-thread_local! {
-    static SEMANTIC: std::cell::RefCell<Option<Semantic>> = Default::default();
+crate::memo_local! {
+    static SEMANTIC: std::cell::RefCell<Option<Semantic>>;
 }
 struct SemanticGuard(Option<Semantic>);
 impl Drop for SemanticGuard {

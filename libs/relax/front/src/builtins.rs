@@ -56,8 +56,8 @@ fn crate_meta(path: &str) -> (String, String, String, String) {
 }
 
 fn crate_meta_uncached(path: &str) -> (String, String, String, String) {
-    thread_local! {
-        static CACHE: std::cell::RefCell<crate::fxhash::HashMap<String, (String, String, String, String)>> = Default::default();
+    crate::memo_local! {
+        static CACHE: std::cell::RefCell<crate::fxhash::HashMap<String, (String, String, String, String)>>;
     }
     let mut dir = std::path::Path::new(path).parent().map(|p| p.to_path_buf());
     let mut manifest: Option<std::path::PathBuf> = None;
@@ -364,8 +364,8 @@ pub fn lookup(name: &str) -> Builtin {
 /// `bitflags!` (MAKEPAD_RUN_NATIVE_BITFLAGS=0 keeps the crate's macro_rules, for A/B measurement).
 pub fn override_rules(options: &crate::options::Options, d: crate::macros::MacroRef) -> crate::macros::MacroRef {
     if d.name == "bitflags" && d.krate == "bitflags" && options.native_bitflags {
-        thread_local! {
-            static BF: std::cell::OnceCell<crate::macros::MacroRef> = Default::default();
+        crate::memo_local! {
+            static BF: std::cell::OnceCell<crate::macros::MacroRef>;
         }
         return BF.with(|b| b.get_or_init(|| std::sync::Arc::new(crate::macros::MacroDef { name: "bitflags".to_string(), krate: "bitflags".to_string(), exported: true, arms: Vec::new(), builtin: Builtin::Bitflags as u8, def_file: String::new(), def_pos: 0, def_mod: String::new(), input: None })).clone());
     }
@@ -401,8 +401,8 @@ pub fn from_u8(x: u8) -> Builtin {
     Builtin::None
 }
 
-thread_local! {
-    static DEFS: std::cell::RefCell<Vec<Option<crate::macros::MacroRef>>> = Default::default();
+crate::memo_local! {
+    static DEFS: std::cell::RefCell<Vec<Option<crate::macros::MacroRef>>>;
 }
 
 /// The macro definition standing for built-in `name` (no arms; `builtin` set), if any.
@@ -1653,9 +1653,9 @@ fn single_punct(c: char) -> Option<T> {
     })
 }
 
-thread_local! {
+crate::memo_local! {
     /// derive expansions computed ahead in parallel (pre_expand_derives): (file, item byte range)
-    static PRE: std::cell::RefCell<crate::fxhash::HashMap<(String, u32, u32), Result<Option<Expansion>, (u32, String)>>> = Default::default();
+    static PRE: std::cell::RefCell<crate::fxhash::HashMap<(String, u32, u32), Result<Option<Expansion>, (u32, String)>>>;
 }
 
 

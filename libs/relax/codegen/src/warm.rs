@@ -42,9 +42,9 @@ fn state() -> (relax_session::phase::PhaseGuard, relax_session::sync::MutexGuard
     let s = STATE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
     (k, s)
 }
-thread_local! {
-    static SLOTS: RefCell<Vec<(u32, u8)>> = Default::default();
-    static CHILD_CPU: RefCell<Vec<u64>> = Default::default();
+relax_session::memo_local! {
+    static SLOTS: RefCell<Vec<(u32, u8)>>;
+    static CHILD_CPU: RefCell<Vec<u64>>;
 }
 pub struct Context(bool);
 impl Context {

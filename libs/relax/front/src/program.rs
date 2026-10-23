@@ -5441,6 +5441,17 @@ impl Drop for WorldWait {
 
 /// The program's std crates are loaded: a world still waiting for a file the program did not
 /// load parses it itself.
+/// Drops the std parses shared during the load (a settle rebuild; a later proc-macro world parses
+/// what it needs again). Nothing while a load shares them.
+pub fn drop_shared_std() {
+    let m = {
+        let mut g = SHARED_STD.lock().unwrap_or_else(|e| e.into_inner());
+        if SHARING.load(std::sync::atomic::Ordering::Acquire) { return; }
+        g.take()
+    };
+    drop(m);
+}
+
 pub fn share_std_end() {
     let _g = SHARED_STD.lock().unwrap_or_else(|e| e.into_inner());
     SHARING.store(false, std::sync::atomic::Ordering::Release);
@@ -5844,9 +5855,9 @@ struct TraitQuery {
     hits: Vec<(u32, std::sync::Arc<Vec<(DefId, BindVis)>>)>,
 }
 
-thread_local! {
+crate::memo_local! {
     /// (skipped module, name) pairs a lookup on this thread missed since the last take_missing.
-    static MISSING: std::cell::RefCell<Vec<(u32, String)>> = Default::default();
+    static MISSING: std::cell::RefCell<Vec<(u32, String)>>;
 }
 thread_local! {
     /// The latest missing_mark: a note is deduplicated only against the notes from there on,
@@ -5854,11 +5865,11 @@ thread_local! {
     /// noted before the mark (an earlier lookup of the same name).
     static MISSING_FROM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
-thread_local! {
+crate::memo_local! {
     /// The notes of MISSING[from..] as a set (push_missing's dedup), valid for (generation,
     /// from, len); a body's bound-variable walk notes thousands of misses in one window, and
     /// a scan of the window per note made that quadratic.
-    static MISSING_SEEN: std::cell::RefCell<(u64, usize, usize, std::collections::HashSet<(u32, String)>)> = Default::default();
+    static MISSING_SEEN: std::cell::RefCell<(u64, usize, usize, std::collections::HashSet<(u32, String)>)>;
 }
 thread_local! {
     /// bumped whenever MISSING is replaced (save, restore, take)

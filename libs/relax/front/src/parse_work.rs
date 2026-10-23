@@ -18,8 +18,8 @@ struct Reusing {
     next: Reuse,
     hits: usize,
 }
-thread_local! {
-    static REUSE: RefCell<Option<Reusing>> = Default::default();
+crate::memo_local! {
+    static REUSE: RefCell<Option<Reusing>>;
 }
 pub struct Session;
 impl Session {

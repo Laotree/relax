@@ -64,6 +64,12 @@ pub struct ResolveBoundVars {
 
 static TRIVIAL: relax_session::sync::Mutex<Option<std::collections::HashMap<crate::types::variance::GenericIndices, std::sync::Arc<ResolveBoundVars>>>> = relax_session::sync::Mutex::new(None);
 
+/// Drops the shared trivial answers (a settle rebuild: they are made again on demand).
+pub(crate) fn drop_trivial() {
+    let t = TRIVIAL.lock().unwrap_or_else(|e| e.into_inner()).take();
+    drop(t);
+}
+
 impl ResolveBoundVars {
     /// An item without lifetimes: its answer depends only on its generic indices, so equal
     /// ones are one shared value (most items; each distinct index set is stored once).

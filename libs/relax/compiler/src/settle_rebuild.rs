@@ -274,8 +274,13 @@ pub(crate) fn run(up: *mut Unit) -> Outcome {
     // 4. the old state goes by value, off the owner (on this, the monitor's, thread)
     let t = Instant::now();
     drop(old);
+    // the process-wide memos that only grow go too (made again on demand)
+    drop_compile_memos();
+    relax_types::tcx::drop_process_memos();
+    crate::program::drop_shared_std();
     let drop_ms = ms(t);
     crate::memstat::trim();
+    crate::pack::release_resident();
     let rss1 = crate::memstat::resident();
     REBUILDS.fetch_add(1, Ordering::Relaxed);
     if crate::run::VERBOSE.load(Ordering::Relaxed) || crate::memstat::enabled() { eprintln!("makepad-run settle rebuild at t={:.0} ms: encode {:.1} ms, restore {:.1} ms, replace on the owner {:.1} ms, old state dropped in {:.1} ms; total {:.1} ms; rss {:.0} -> {:.0} MB",
@@ -327,6 +332,7 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     let const_failed = u.const_failed.clone();
     let query_errors = tcx.dcx.clone();
     // the replace: nothing can fail from here
+    u.front.retire_memos();
     let mut rir = Vec::new();
     for e in u.fns.iter_mut() {
         if let Some(r) = e.rir.take() {
@@ -360,5 +366,7 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     u.tcx.publish_collected();
     set_shared_front(u, u.core_crate);
     crate::run::set_diagnostics(u.tcx.dcx.clone());
+    // every thread's compiler memos go at its next access (dropped there, by value)
+    relax_session::memo_local::retire_all();
     Ok(old)
 }

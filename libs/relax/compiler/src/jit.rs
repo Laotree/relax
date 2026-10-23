@@ -841,8 +841,8 @@ struct WatchdogCall {
 }
 static WATCHDOG_CALLS: relax_session::sync::Mutex<Vec<std::sync::Arc<WatchdogCall>>> = relax_session::sync::Mutex::new(Vec::new());
 static WATCHDOG_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
-thread_local! {
-    static WATCHDOG_STACK: std::cell::RefCell<Vec<std::sync::Arc<WatchdogCall>>> = Default::default();
+crate::memo_local! {
+    static WATCHDOG_STACK: std::cell::RefCell<Vec<std::sync::Arc<WatchdogCall>>>;
 }
 thread_local! {
     // The signal handler must not borrow a RefCell interrupted during enter/leave.
@@ -1273,9 +1273,9 @@ fn free_runtime_tls() {
     let _ = PANIC_LOC.try_with(|c| c.free());
 }
 
-thread_local! {
+crate::memo_local! {
     /// source location of the last panic caught inside the compiler (one-line diagnostics)
-    static ICE_LOC: std::cell::RefCell<String> = Default::default();
+    static ICE_LOC: std::cell::RefCell<String>;
 }
 
 /// Installs (once) a panic hook that stays silent for panics inside the compiler (they
@@ -2438,14 +2438,14 @@ impl Unit {
 
 // ------------------------------------------------------------ the unit
 
-thread_local! {
+crate::memo_local! {
     /// The memoized recursive type queries in progress on this thread (drop_may_unwind 1,
     /// is_unpin 2; outermost first) and the outermost entry a cycle was cut
     /// at (usize::MAX: none). An answer computed below a cut of an entry still in progress
     /// further out is provisional (it misses what that entry's other parts contribute) and is not
     /// memoized: memoizing it made the answer depend on which type was asked first, and with it
     /// the lowered code (Call vs Invoke, drop glue) -- O1 RIR that depended on build order.
-    static CYC_AT: std::cell::RefCell<Vec<(u8, TyId)>> = Default::default();
+    static CYC_AT: std::cell::RefCell<Vec<(u8, TyId)>>;
 }
 thread_local! {
     static CYC_CUT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
@@ -5794,7 +5794,11 @@ pub unsafe fn compile_slot(up: *mut Unit, id: u32) -> u64 {
     // a slot of the startup image is built by its key
     ids_name(up, id);
     let _job = compile_job();
-    ensure_sufficient_stack(|| compile_slot_on_stack(up, id))
+    let code = ensure_sufficient_stack(|| compile_slot_on_stack(up, id));
+    // a program thread compiles in bursts: its chunks go back between them (frees from other
+    // threads into them are taken then; at most twice a second)
+    crate::zone_alloc::compiler_hand_back_idle();
+    code
 }
 
 /// The thread that runs the program's main (run.rs), and its compile intervals (wall ns, owner
@@ -7524,6 +7528,7 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
                 if let Some(x) = O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).pop_front() {
                     break x;
                 }
+                crate::zone_alloc::compiler_hand_back_idle();
                 q = O2_WAKE.wait(q).unwrap_or_else(|e| e.into_inner());
             }
         };
@@ -7781,12 +7786,12 @@ fn inline_src_toks(options: &crate::options::Options, tier1: bool) -> u32 {
     options.inline_src.unwrap_or(if tier1 { INLINE_SRC_TOKS_WITH_TIER1 } else { INLINE_SRC_TOKS_DEFAULT })
 }
 
-thread_local! {
+crate::memo_local! {
     /// CPU time of the builds nested in each running build of this thread (innermost last):
     /// phases count exclusive time, without the callees and CTFE compiles they wait for
-    static BUILD_CHILD: std::cell::RefCell<Vec<u64>> = Default::default();
+    static BUILD_CHILD: std::cell::RefCell<Vec<u64>>;
     /// slots this thread is building (begin_build .. end_build), innermost last
-    static BUILD_STACK: std::cell::RefCell<Vec<u32>> = Default::default();
+    static BUILD_STACK: std::cell::RefCell<Vec<u32>>;
 }
 thread_local! {
     /// a speculative worker: its fronts may suspend between bodies (prepare_rir)
@@ -7873,9 +7878,9 @@ unsafe fn wait_inflight(up: *mut Unit, id: u32) {
     owner::pump_wait(&|| !(&*up).fns[id as usize].inflight);
 }
 
-thread_local! {
+crate::memo_local! {
     /// Slots the running compile_batch_off_lock on this thread marked in flight during its fronts.
-    static BATCH_FLIGHT: std::cell::RefCell<Vec<u32>> = Default::default();
+    static BATCH_FLIGHT: std::cell::RefCell<Vec<u32>>;
 }
 
 /// Bumped whenever a build ends (reclaim_generation).
@@ -7924,9 +7929,9 @@ thread_local! {
     /// owner's stack: its builds depend on timing (owner frames)
     static TAINTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-thread_local! {
+crate::memo_local! {
     /// (unit, slot) whose RIR such a request stored: dropped when it ends (its code stays)
-    static TAINT_BUILT: std::cell::RefCell<Vec<(usize, u32)>> = Default::default();
+    static TAINT_BUILT: std::cell::RefCell<Vec<(usize, u32)>>;
 }
 thread_local! {
     /// a compile reached from JIT code in this request was cancelled (OwnerBusy) and got a
@@ -10768,6 +10773,14 @@ struct PrepShared {
 const PREP_SHARED_PER_SLOT: usize = 4;
 
 static PREP_SHARED: std::sync::LazyLock<relax_session::sync::Mutex<HashMap<u32, Vec<std::sync::Arc<PrepShared>>>>> = std::sync::LazyLock::new(|| relax_session::sync::Mutex::new(HashMap::new()));
+
+/// Drops the compile memos that only grow (O3's shared preparations, the back-end memo), by value:
+/// a settle rebuild's (they are made again on demand).
+pub(crate) fn drop_compile_memos() {
+    let prep = std::mem::take(&mut *PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner()));
+    let memo = std::mem::take(&mut *bmemo::MEMO.lock().unwrap_or_else(|e| e.into_inner()));
+    drop((prep, memo));
+}
 
 /// Strongly connected components of a graph (Tarjan, iterative): callees first.
 fn sccs(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
@@ -13821,6 +13834,7 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
                 // (the queue counter read under the lock: a push after it wakes this worker)
                 let seen = TIER_GEN.load(Ordering::SeqCst);
                 drop(q);
+                crate::zone_alloc::compiler_hand_back_idle();
                 let ready = || TIER_GEN.load(Ordering::SeqCst) != seen || TIER_STOP.load(Ordering::SeqCst);
                 if parked { TIER_SLEEPERS.sleep(k, ready) } else { TIER_SLEEPERS.sleep_timeout(k, poll, ready) }
                 if k == 0 {
@@ -16747,6 +16761,7 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions, options: &crate::option
                 if let Some(id) = next {
                     break id;
                 }
+                crate::zone_alloc::compiler_hand_back_idle();
                 q = SPEC_WAKE.wait(q).unwrap();
             }
         };
@@ -17133,8 +17148,8 @@ thread_local! {
     /// guarded run-time module calls this thread is inside (std::relax::guard)
     static GUARD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
-thread_local! {
-    static GUARD_MARKS: std::cell::RefCell<Vec<crate::modules::GuardMark>> = Default::default();
+crate::memo_local! {
+    static GUARD_MARKS: std::cell::RefCell<Vec<crate::modules::GuardMark>>;
 }
 
 /// std::relax::guard: enters a guarded call (faults inside it are contained), with a deadline
@@ -18266,6 +18281,16 @@ pub struct FrontShared {
 
 impl FrontShared {
     /// A build took instance `key`'s checked body (the helpers check and lower it no more).
+    /// A settle rebuild retired this front state (the Unit has a new one): the bodies checked
+    /// ahead and the lowerings it holds go by value, so a thread still holding the Arc (a queued
+    /// borrow check) keeps only the shell.
+    pub(crate) fn retire_memos(&self) {
+        self.ahead.clear();
+        let lowered = std::mem::take(&mut *self.lowered.lock().unwrap_or_else(|e| e.into_inner()));
+        let post = std::mem::take(&mut *self.ahead_post.lock().unwrap_or_else(|e| e.into_inner()));
+        drop((lowered, post));
+    }
+
     fn is_built(&self, key: &AheadKey) -> bool {
         self.built.get(key).unwrap_or(false)
     }
@@ -18506,6 +18531,7 @@ fn ahead_helper(f: std::sync::Arc<FrontShared>, index: u32) {
                 if let Some(id) = q.pop_front() {
                     break id;
                 }
+                crate::zone_alloc::compiler_hand_back_idle();
                 q = f.wake.wait_timeout(q, std::time::Duration::from_millis(50)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
             }
         };
@@ -18557,8 +18583,8 @@ struct LoweredAhead {
 thread_local! {
     static LOWERING_AHEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-thread_local! {
-    static LOWER_AHEAD_IDS: std::cell::RefCell<AheadFnIds> = Default::default();
+crate::memo_local! {
+    static LOWER_AHEAD_IDS: std::cell::RefCell<AheadFnIds>;
 }
 
 #[derive(Default)]

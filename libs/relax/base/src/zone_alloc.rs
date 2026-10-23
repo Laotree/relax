@@ -293,6 +293,17 @@ pub fn compiler_hand_back() {
     compiler::detach_thread()
 }
 
+/// `compiler_hand_back` for a thread about to wait (a worker with no work, a program thread
+/// after its lazy compile). A thread's current chunks are its own: frees from other threads only
+/// queue on them (the remote lists) until it allocates in them again, so a thread that goes quiet
+/// would keep every block freed into them -- a settle rebuild's dropped state among them --
+/// resident. Handed back, the chunks take those frees under their lock and an emptied one is
+/// released. A thread with no current chunk (it allocated nothing since) pays one pass over its
+/// class table.
+pub fn compiler_hand_back_idle() {
+    compiler::detach_thread();
+}
+
 /// Decommits the compiler arena's warm chunks (settle's heap trim).
 pub fn compiler_trim() {
     compiler::trim()

@@ -2,6 +2,7 @@
 pub mod options;
 pub mod phase;
 pub mod sip;
+pub mod memo_local;
 pub mod sync;
 /// The one Win32 declaration module of makepad run; every relax crate depends on relax-session.
 #[cfg(windows)]
