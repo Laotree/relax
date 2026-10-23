@@ -319,6 +319,7 @@ fn lane_ref(op: VX, w: VW, x: u64, y: u64) -> (u64, Cmp) {
                 RoundTo::Ceil => f1(f32::ceil, f64::ceil),
                 RoundTo::Trunc => f1(f32::trunc, f64::trunc),
                 RoundTo::Away => f1(f32::round, f64::round),
+                RoundTo::Even => f1(f32::round_ties_even, f64::round_ties_even),
             };
             return (r, Cmp::NanAny);
         }
@@ -514,7 +515,7 @@ fn float_ops() -> Vec<VX> {
         v.extend([VX::FAdd(w, i), VX::FSub(w, i), VX::FMul(w, i), VX::FDiv(w, i), VX::FSqrt(w, i)]);
         v.extend([VX::FMinLt(w), VX::FMaxGt(w), VX::FMinNum(w), VX::FMaxNum(w), VX::FNeg(w), VX::FAbs(w)]);
         v.extend([VX::FToI(w), VX::IToF(w)]);
-        for t in [RoundTo::Floor, RoundTo::Ceil, RoundTo::Trunc, RoundTo::Away] {
+        for t in [RoundTo::Floor, RoundTo::Ceil, RoundTo::Trunc, RoundTo::Away, RoundTo::Even] {
             v.push(VX::FRound(w, t));
         }
         for c in C {

@@ -305,7 +305,8 @@ pub mod intrinsics_vx {
     // vx_sha1h: Arm, scalar u32 -> u32 through lane 0 of a V128.
     // Unary: 0 abs, 1 shl, 2 unsigned shr, 3 signed shr, 4 shuffle i32,
     // 5/6 byte shift right/left, 7 SSE sqrt, 8 float abs, 9 NEON sqrt f32, 10 float neg
-    // (7/8/10: width 32 f32, 64 f64). Narrow: 19/20/21 as above,
+    // 11 SSE4.1 round to integral, imm & 3 = nearest-even / down / up / toward zero
+    // (7/8/10/11: width 32 f32, 64 f64). Narrow: 19/20/21 as above,
     // 30 unsigned u16->u8. Narrow results are 8 bytes, all other vectors 16.
 
     extern "relax-intrinsic" {

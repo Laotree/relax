@@ -70,6 +70,8 @@ pub enum RoundTo {
     Trunc,
     /// half away from zero
     Away,
+    /// to nearest, ties to even (roundps/roundpd imm 0, frintn)
+    Even,
 }
 
 /// Lane-typed 128-bit vector ops (`Inst::VX(op, d, a, b)`): the core::arch intrinsics'

@@ -2672,6 +2672,7 @@ impl<'a> Gen<'a> {
                     VX::FRound(_, RoundTo::Ceil) => 0x4EA1_8800,
                     VX::FRound(_, RoundTo::Trunc) => 0x4EA1_9800,
                     VX::FRound(_, RoundTo::Away) => 0x6E21_8800,
+                    VX::FRound(_, RoundTo::Even) => 0x4E21_8800, // frintn
                     VX::FToI(_) => 0x4EA1_B800,
                     VX::IToF(_) => 0x4E21_D800,
                     _ => unreachable!("vx {:?}", op),

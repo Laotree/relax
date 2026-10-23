@@ -10917,7 +10917,7 @@ impl<'a> Lcx<'a> {
                 } else {
                     match op {
                         0..=3 => true,
-                        7 | 8 | 10 => matches!(w, VW::S | VW::D),
+                        7 | 8 | 10 | 11 => matches!(w, VW::S | VW::D),
                         4 | 9 => w == VW::S,
                         5 | 6 => w == VW::B,
                         _ => false,
@@ -11038,6 +11038,12 @@ impl<'a> Lcx<'a> {
                         }
                         10 => {
                             self.emit(Inst::VX(VX::FNeg(w), d, a, a));
+                            return self.vx_result(d, t);
+                        }
+                        11 => {
+                            // SSE4.1 roundps/roundpd immediate rounding (imm & 3)
+                            let r = [RoundTo::Even, RoundTo::Floor, RoundTo::Ceil, RoundTo::Trunc][(k & 3) as usize];
+                            self.emit(Inst::VX(VX::FRound(w, r), d, a, a));
                             return self.vx_result(d, t);
                         }
                         _ => {
