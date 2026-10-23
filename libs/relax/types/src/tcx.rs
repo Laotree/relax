@@ -1813,8 +1813,11 @@ impl Tcx {
         Some(prog.record_uncoded_error(def.file, pos, "signature", msg))
     }
 
+    /// Signatures computed and resident: a mapped image's entries count once decoded (reading
+    /// all of them here decoded the whole map into the heap: `memory compiler=1` grew the compiler
+    /// arena by 15 MB per call in a Sandbox race).
     pub fn signature_count(&self) -> usize {
-        self.sigs.values().filter(|cell| cell.get().is_some()).count()
+        self.sigs.decoded_values().filter(|cell| cell.get().is_some()).count()
     }
 
     pub fn signature_bytes(&self) -> usize {

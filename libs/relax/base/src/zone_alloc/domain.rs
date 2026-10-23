@@ -166,6 +166,35 @@ unsafe fn owner(p: *mut u8) -> Option<Arc<Heap>> {
     None
 }
 
+/// Every live domain heap returns its free pages (warm chunks, all-free granules of detached
+/// chunks; memstat::trim): a program heap is trimmed like the compiler's (Scope: 100 MB in use,
+/// 226 MB resident). The heaps are leased under the registry lock and trimmed outside it.
+pub fn trim_all() {
+    // no allocation under the registry lock (a free taken there would wait for it): a fixed
+    // lease table, the heaps past it wait for the next trim
+    const MAX: usize = 64;
+    let mut heaps: [Option<Arc<Heap>>; MAX] = [const { None }; MAX];
+    {
+        let _registry = Registry::lock();
+        let mut h = HEAD.load(Ordering::Relaxed);
+        let mut n = 0;
+        unsafe {
+            while let Some(heap) = h.as_ref() {
+                if n == MAX {
+                    break;
+                }
+                Arc::increment_strong_count(h);
+                heaps[n] = Some(Arc::from_raw(h));
+                n += 1;
+                h = *heap.next.get();
+            }
+        }
+    }
+    for h in heaps.iter().flatten() {
+        h.arena.trim();
+    }
+}
+
 /// Also used by the native global allocator: a provided crate may drop a JIT-owned buffer.
 pub unsafe fn dealloc(p: *mut u8) -> bool {
     // The common free is of a block of the heap this thread is inside (alive while the thread

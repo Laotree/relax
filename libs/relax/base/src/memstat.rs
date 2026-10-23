@@ -833,6 +833,8 @@ pub fn trim() {
     LAST_TRIM_MS.store(crate::clock::ms_since_start() as u64, Relaxed);
     crate::zone_alloc::burst_trim();
     crate::zone_alloc::compiler_trim();
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
+    crate::zone_alloc::domain::trim_all();
     #[cfg(target_os = "linux")]
     {
         extern "C" {
