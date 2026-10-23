@@ -3099,11 +3099,6 @@ impl Unit {
         CodeKind::new(t, origin::FRESH)
     }
 
-    /// The lazy stub of slot `id` (what its table word holds before its first compile).
-    pub(crate) fn stub_of(&self, id: u32) -> u64 {
-        self.slots.stub(id)
-    }
-
     /// Code at a fresh address with its relocated fields linked for that address.
     /// no-codegen mode: the address a slot takes for `code` (which must be a plain jump with no
     /// relocations: an interpreter entry or a foreign function); other machine code is an error.
