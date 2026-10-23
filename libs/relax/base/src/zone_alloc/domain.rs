@@ -396,7 +396,7 @@ pub unsafe extern "C" fn program_aligned_free(p: *mut u8) {
 
 /// The program asks its allocator for its free pages back (glibc `malloc_trim`, macOS
 /// `malloc_zone_pressure_relief`): the heap of the domain the calling thread is in gives back its
-/// warm chunks and the free pages of its chunks (what the settle swap's trim does for the compiler
+/// warm chunks and the free pages of its chunks (what the settle's trim does for the compiler
 /// arena), then the system heap does its own.
 #[cfg(target_os = "linux")]
 pub unsafe extern "C" fn program_malloc_trim(pad: usize) -> i32 {

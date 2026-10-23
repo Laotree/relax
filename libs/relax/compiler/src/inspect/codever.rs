@@ -762,16 +762,6 @@ pub fn cmd_versions(req: &Req, out: &mut Out) {
 static PINS: relax_session::sync::Mutex<Vec<(u32, String, &'static str, Vec<u32>)>> = relax_session::sync::Mutex::new(Vec::new());
 static NEXT_PIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
-pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
-    if let Ok(p) = PINS.try_lock() {
-        a.field("inspect.pins");
-        a.vec(&p);
-        for x in p.iter() {
-            a.string(&x.1);
-            a.vec(&x.3);
-        }
-    }
-}
 
 /// The pin a slot is under: "o1 (pin<n>)" / "o3 (pin<n>)".
 pub(crate) fn pin_of(id: u32) -> Option<String> {

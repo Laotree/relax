@@ -92,40 +92,6 @@ pub fn inline_of(id: u32) -> Vec<SiteRemark> {
     INLINE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&id).cloned()).unwrap_or_default()
 }
 
-pub(crate) fn scan_kept(a: &mut crate::jit::zone_scan::Acc) {
-    if let Ok(g) = INLINE.try_lock() {
-        if let Some(m) = g.as_ref() {
-            a.field("inspect.remarks");
-            for v in m.values() {
-                a.vec(v);
-            }
-        }
-    }
-    if let Ok(g) = LOOPS.try_lock() {
-        if let Some(m) = g.as_ref() {
-            a.field("inspect.loops");
-            for v in m.values() {
-                a.vec(v);
-            }
-        }
-    }
-    if let Ok(g) = SPILLS.try_lock() {
-        if let Some(m) = g.as_ref() {
-            a.field("inspect.spills");
-            for v in m.values() {
-                a.vec(v);
-            }
-        }
-    }
-    if let Ok(g) = COUNTS.try_lock() {
-        if let Some(m) = g.as_ref() {
-            a.field("inspect.counts");
-            for v in m.values() {
-                a.vec(v);
-            }
-        }
-    }
-}
 
 /// `remarks <fn|@slot> [n=20]`: the O3 decisions of the fn's slots: the calls the inliner kept
 /// (hot sites first) with the refusal and its numbers, the tier history of its code.
