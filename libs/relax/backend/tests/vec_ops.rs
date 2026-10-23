@@ -259,6 +259,27 @@ fn lane_ref(op: VX, w: VW, x: u64, y: u64) -> (u64, Cmp) {
         VX::ShrSI(_, k) => (sx >> (k as i64).min(b - 1)) as u64 & m,
         VX::Neg(_) => x.wrapping_neg() & m,
         VX::Abs(_) => sx.unsigned_abs() & m,
+        // SSE NaN results, exactly: the first NaN operand quieted, else the negative default NaN
+        VX::FAdd(_, NanBits::Intel) | VX::FSub(_, NanBits::Intel) | VX::FMul(_, NanBits::Intel) | VX::FDiv(_, NanBits::Intel) | VX::FSqrt(_, NanBits::Intel) => {
+            let (r, y) = match op {
+                VX::FAdd(..) => (f2(|a, b| a + b, |a, b| a + b), y),
+                VX::FSub(..) => (f2(|a, b| a - b, |a, b| a - b), y),
+                VX::FMul(..) => (f2(|a, b| a * b, |a, b| a * b), y),
+                VX::FDiv(..) => (f2(|a, b| a / b, |a, b| a / b), y),
+                _ => (f1(f32::sqrt, f64::sqrt), x),
+            };
+            let quiet = 1u64 << (if w == VW::D { 51 } else { 22 });
+            let r = if is_nan(w, x) {
+                x | quiet
+            } else if is_nan(w, y) {
+                y | quiet
+            } else if is_nan(w, r) {
+                if w == VW::D { 0xfff8_0000_0000_0000 } else { 0xffc0_0000 }
+            } else {
+                r
+            };
+            return (r, Cmp::Exact);
+        }
         VX::FAdd(..) => return (f2(|a, b| a + b, |a, b| a + b), Cmp::NanAny),
         VX::FSub(..) => return (f2(|a, b| a - b, |a, b| a - b), Cmp::NanAny),
         VX::FMul(..) => return (f2(|a, b| a * b, |a, b| a * b), Cmp::NanAny),
@@ -489,6 +510,8 @@ fn float_ops() -> Vec<VX> {
     for w in F {
         let h = NanBits::Host;
         v.extend([VX::FAdd(w, h), VX::FSub(w, h), VX::FMul(w, h), VX::FDiv(w, h), VX::FSqrt(w, h)]);
+        let i = NanBits::Intel;
+        v.extend([VX::FAdd(w, i), VX::FSub(w, i), VX::FMul(w, i), VX::FDiv(w, i), VX::FSqrt(w, i)]);
         v.extend([VX::FMinLt(w), VX::FMaxGt(w), VX::FMinNum(w), VX::FMaxNum(w), VX::FNeg(w), VX::FAbs(w)]);
         v.extend([VX::FToI(w), VX::IToF(w)]);
         for t in [RoundTo::Floor, RoundTo::Ceil, RoundTo::Trunc, RoundTo::Away] {
