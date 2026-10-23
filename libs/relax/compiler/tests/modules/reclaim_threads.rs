@@ -30,7 +30,7 @@ fn quick_want(x: u64, k: u64) -> u64 {
 }
 
 /// A recycle now; Err while the proof refuses it.
-fn recycle() -> Result<[u64; 7], String> {
+fn recycle() -> Result<[u64; 8], String> {
     std::relax::sandbox_stats(true)
 }
 

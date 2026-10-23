@@ -48,23 +48,33 @@ const RO_BASE: u32 = 64 << 10;
 const RO_END: u32 = 96 << 20;
 const RW_BASE: u32 = 96 << 20;
 const RW_END: u32 = 128 << 20;
-/// shadow stack [SS_LO, SS_HI), growing down
-const SS_LO: u32 = 128 << 20;
-const SS_HI: u32 = 136 << 20;
-/// scratch for runtime results the module reads (formatted text)
-const SCRATCH: u32 = 136 << 20;
+/// per-thread segments [SEGS, SEGS + NSEG * SEG): one per thread inside the module (claimed at its
+/// first entry, given back when its last frame there leaves; mapped on first use). Each is a
+/// guard (never mapped), the thread's scratch for runtime results the module reads (formatted
+/// text), then its shadow stack, growing down. Threads never share shadow frames, wrapper
+/// argument copies or result slots (MEMRECLAIM.REVIEW F4).
+const SEGS: u32 = 128 << 20;
+const SEG: u32 = 8 << 20;
+const NSEG: u32 = 64;
+const SEG_GUARD: u32 = 64 << 10;
 const SCRATCH_LEN: u32 = 1 << 20;
-const HEAP_BASE: u32 = 256 << 20;
-/// The module's instruction fuel word inside the window's image region.
-const FUEL_OFF: u32 = RW_END - 64;
+/// a segment's shadow stack: [SEG_GUARD + SCRATCH_LEN, SEG)
+const STACK_LO: u32 = SEG_GUARD + SCRATCH_LEN;
+const HEAP_BASE: u32 = SEGS + NSEG * SEG;
 const HEAP_END: u32 = 0xffff_0000;
 /// sandbox thunks (a power of two of them)
 const SBT_N: u32 = 1 << 16;
 
 /// Offsets of the sandbox words in each thread's Relax TLS block (relative to `Sb::tls`):
-/// the current arena base, the shadow stack pointer, fuel left, the host arena state.
+/// the current arena base, the shadow stack pointer, the fuel at entry (budget accounting), the
+/// host arena state, the fuel left (the twins' meter: per thread, out of the module's reach), the
+/// shadow stack's lower bound.
 const W_ARENA: i64 = 0;
 const W_SSP: i64 = 8;
+const W_FUEL: i64 = 32;
+const W_SSLO: i64 = 40;
+/// sandbox words per thread (`Saved`)
+const NWORDS: usize = 6;
 
 /// One module's arena, as the host keeps it (the module never sees this).
 pub struct Arena {
@@ -76,6 +86,9 @@ pub struct Arena {
     /// fuel per call (0: none)
     pub fuel: i64,
     pub alive: std::sync::atomic::AtomicBool,
+    /// per-thread segments in use / ever mapped (bit k: segment k)
+    segs: std::sync::atomic::AtomicU64,
+    segs_mapped: std::sync::atomic::AtomicU64,
 }
 
 struct Heap {
@@ -110,6 +123,9 @@ struct Sb {
     /// (window offset, absolute value): words holding a code address (sandbox thunks)
     abs: Vec<(u32, u64)>,
     arenas: Vec<Arc<Arena>>,
+    /// unloaded arenas still mapped: (arena, the reclaim epoch it was unlinked at). Freed by
+    /// `reap_arenas` once no thread can still be inside since before that epoch (reclaim.rs)
+    dying: Vec<(Arc<Arena>, u64)>,
     /// twin -> slots its code refers to without a relocation (fn pointer constants)
     refs: HashMap<u32, Vec<u32>>,
     /// the two code spaces twins are installed in: (base, size, next); `active` gets new code,
@@ -121,6 +137,8 @@ struct Sb {
     /// crates of unloaded modules (their twins are dead)
     dead_crates: HashSet<u32>,
     recycles: u32,
+    /// host API fns checked at the boundary ((def, collect epoch) -> the refusal, None: allowed)
+    api_checked: HashMap<(u32, u64), Option<String>>,
 }
 
 /// bytes of each sandbox code space
@@ -176,7 +194,7 @@ unsafe fn sb_init(up: *mut Unit) -> Result<(), String> {
         return Ok(());
     }
     let u = &mut *up;
-    let tls = u.tls_alloc(32, 8);
+    let tls = u.tls_alloc(8 * NWORDS as u32, 8);
     let tls_sym = u.syms.intern(SymKind::Rt("sb_tls"), tls as u64);
     let ts = jit::thunk_size() as u64;
     let bytes = (SBT_N as u64 * ts) as usize;
@@ -206,12 +224,14 @@ unsafe fn sb_init(up: *mut Unit) -> Result<(), String> {
         rel: Vec::new(),
         abs: Vec::new(),
         arenas: Vec::new(),
+        dying: Vec::new(),
         refs: HashMap::new(),
         spaces: [(s0, SPACE, s0), (s1, SPACE, s1)],
         active: 0,
         abandoned: [0, 0],
         dead_crates: HashSet::new(),
         recycles: 0,
+        api_checked: HashMap::new(),
     });
     Ok(())
 }
@@ -796,7 +816,7 @@ pub fn new_arena(module: u32, mem: u64, fuel: i64) -> Result<Arc<Arena>, String>
         if p + span > hi {
             munmap(hi as *mut u8, (p + span - hi) as usize);
         }
-        if !map_rw(base + RO_BASE as u64, (RW_END - RO_BASE) as u64) || !map_rw(base + SS_LO as u64, (SCRATCH + SCRATCH_LEN - SS_LO) as u64) {
+        if !map_rw(base + RO_BASE as u64, (RW_END - RO_BASE) as u64) {
             munmap(lo as *mut u8, (hi - lo) as usize);
             return Err("cannot map an arena".to_string());
         }
@@ -807,31 +827,80 @@ pub fn new_arena(module: u32, mem: u64, fuel: i64) -> Result<Arc<Arena>, String>
             synced: Mutex::new((0, 0, 0, 0)),
             fuel: if (&*jit::current_unit()).prog.session.options.sandbox_fuel { fuel } else { 0 },
             alive: std::sync::atomic::AtomicBool::new(true),
+            segs: std::sync::atomic::AtomicU64::new(0),
+            segs_mapped: std::sync::atomic::AtomicU64::new(0),
         });
         let mut g = SB.lock().unwrap_or_else(|e| e.into_inner());
         let s = g.as_mut().ok_or("sandbox not initialised")?;
         sync_arena(s, &a);
         s.arenas.push(a.clone());
         if (module as usize) < MAX_MODULES {
-            ARENAS[module as usize].store(Arc::as_ptr(&a) as *mut Arena, std::sync::atomic::Ordering::Release);
+            ARENAS[module as usize].store(Arc::as_ptr(&a) as *mut Arena, std::sync::atomic::Ordering::SeqCst);
         }
+        reap_locked(s);
         Ok(a)
     }
 }
 
-/// Frees a module's arena (its window is unmapped: stale pointers into it fault).
+/// Unloads a module's arena: unlink -> prove quiescence -> free (as the code spaces, reclaim.rs).
+/// Unlink: the module index no longer names it and every entry refuses it; the stamp after that
+/// is the epoch it was unlinked at. A thread inside since before the stamp (parked in a host call
+/// the module made, or running there) keeps using the window and the `Arena` -- both stay valid --
+/// until it has left; only then are the window unmapped and the `Arena` dropped (`reap_arenas`).
+/// The window stays mapped meanwhile instead of turning PROT_NONE: runtime entries (allocator,
+/// formatting, result copies) touch it from host code on behalf of the thread still inside.
 pub fn free_arena(a: &Arc<Arena>) {
+    let mut g = SB.lock().unwrap_or_else(|e| e.into_inner());
+    // (SeqCst: the stores are ordered before the stamp; an entry records its epoch, fences, then
+    // loads them -- store buffering with barriers on both sides, reclaim.rs)
     a.alive.store(false, std::sync::atomic::Ordering::SeqCst);
     if (a.module as usize) < MAX_MODULES {
-        ARENAS[a.module as usize].store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+        let _ = ARENAS[a.module as usize].compare_exchange(Arc::as_ptr(a) as *mut Arena, std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst);
     }
-    unsafe {
-        munmap((a.base - GUARD) as *mut u8, (WINDOW + 2 * GUARD) as usize);
+    let stamp = crate::reclaim::advance();
+    match g.as_mut() {
+        Some(s) => {
+            let had = s.arenas.len();
+            s.arenas.retain(|x| !Arc::ptr_eq(x, a));
+            if s.arenas.len() != had {
+                s.dying.push((a.clone(), stamp));
+            }
+            reap_locked(s);
+        }
+        // (no sandbox state: nothing can have entered it)
+        None => unsafe { unmap_window(a) },
     }
+}
+
+unsafe fn unmap_window(a: &Arena) {
+    munmap((a.base - GUARD) as *mut u8, (WINDOW + 2 * GUARD) as usize);
+}
+
+/// Frees the unloaded arenas no thread can still be inside (see free_arena). Returns how many
+/// are still waiting for a thread to leave.
+pub fn reap_arenas() -> usize {
     let mut g = SB.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(s) = g.as_mut() {
-        s.arenas.retain(|x| !Arc::ptr_eq(x, a));
+    match g.as_mut() {
+        Some(s) => reap_locked(s),
+        None => 0,
     }
+}
+
+fn reap_locked(s: &mut Sb) -> usize {
+    s.dying.retain(|(a, stamp)| {
+        if !crate::reclaim::quiescent_since(*stamp) {
+            return true;
+        }
+        unsafe { unmap_window(a) };
+        false
+    });
+    s.dying.len()
+}
+
+/// Unloaded arenas still mapped because a thread may be inside (memory report, tests).
+pub fn dying_arenas() -> usize {
+    let g = SB.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().map_or(0, |s| s.dying.len())
 }
 
 impl Heap {
@@ -949,9 +1018,9 @@ fn fits(p: u64, len: u64) -> bool {
     (p & 0xffff_ffff) + len <= WINDOW
 }
 
-/// The state a guarded call or a wrapper restores (arena, shadow sp, fuel, arena state).
+/// The state a guarded call or a wrapper restores (the sandbox words, W_*).
 #[derive(Clone, Copy)]
-pub struct Saved(pub [i64; 4]);
+pub struct Saved(pub [i64; NWORDS]);
 
 struct Account {
     base: u64,
@@ -974,7 +1043,7 @@ fn budget_flush() {
             let w = words();
             let base = *w as u64;
             if base == 0 { return; }
-            let left = *((base + FUEL_OFF as u64) as *const i64);
+            let left = *w.add(4);
             let spent = (*w.add(2)).saturating_sub(left).max(0) as u64;
             for a in accounts.iter_mut().filter(|a| a.base == base) {
                 a.data[0] = a.data[0].saturating_sub(spent);
@@ -993,7 +1062,7 @@ fn budget_reload() {
         let base = *w as u64;
         if let Some(left) = accounts.borrow().iter().filter(|a| a.base == base).map(|a| a.data[0]).min() {
             let left = left.min(i64::MAX as u64) as i64;
-            *((base + FUEL_OFF as u64) as *mut i64) = left;
+            *w.add(4) = left;
             *w.add(2) = left;
         }
     });
@@ -1041,8 +1110,17 @@ fn budget_growth(base: u64, bytes: u64, commit: bool) -> bool {
 }
 
 pub fn entry_depth() -> u64 { crate::reclaim::depth() }
-/// A contained fault or deadline unwound past the wrappers: their frames are gone.
-pub fn entry_recover(depth: u64) { crate::reclaim::recover(depth) }
+/// A contained fault or deadline unwound past the wrappers: their frames are gone (the words
+/// were restored by the guard; the entries and segments of the frames that left go too).
+pub fn entry_recover(depth: u64) {
+    let _ = ENTRIES.try_with(|es| {
+        let mut es = es.borrow_mut();
+        while es.len() as u64 > depth {
+            pop_entry(&mut es);
+        }
+    });
+    crate::reclaim::recover(depth)
+}
 
 pub fn budget_depth() -> usize { ACCOUNTS.with(|s| s.borrow().len()) }
 pub fn budget_recover(depth: usize) {
@@ -1071,10 +1149,14 @@ pub unsafe fn string_copy(p: u64, len: u64, out: *mut u8) -> bool {
 
 pub fn save() -> Saved {
     if !sb_ready() {
-        return Saved([0; 4]);
+        return Saved([0; NWORDS]);
     }
     let w = words();
-    unsafe { Saved([*w, *w.add(1), *w.add(2), *w.add(3)]) }
+    let mut s = [0; NWORDS];
+    for (k, v) in s.iter_mut().enumerate() {
+        *v = unsafe { *w.add(k) };
+    }
+    Saved(s)
 }
 
 pub fn restore(s: Saved) {
@@ -1084,63 +1166,182 @@ pub fn restore(s: Saved) {
     budget_flush();
     let w = words();
     unsafe {
-        for k in 0..4 {
+        for k in 0..NWORDS {
             *w.add(k) = s.0[k];
         }
     }
     budget_reload();
 }
 
-/// Enters module `idx`'s arena on this thread (a wrapper's call): the state before, or None
-/// for an unloaded module. Lock-free.
-pub fn enter_module(idx: u32) -> Option<Saved> {
+/// Why an entry failed.
+pub enum EnterError {
+    Unloaded,
+    /// every per-thread segment of the module is in use
+    Busy,
+}
+
+/// One entry of this thread into a module (a wrapper's call), innermost last. The words before
+/// it live here, not in the wrapper's frame: a leave restores them, and a re-entry finds the
+/// arena's live shadow stack and fuel in them.
+struct Entry {
+    prev: [i64; NWORDS],
+    arena: *const Arena,
+    /// the arena's segment this entry runs on
+    seg: u32,
+    /// this entry claimed the segment (its first frame in the arena on this thread)
+    claimed: bool,
+    /// where the fuel this entry spends goes back to when it leaves (it continues that call)
+    carry: Carry,
+}
+
+#[derive(Clone, Copy)]
+enum Carry {
+    /// a fresh call: its own fuel
+    None,
+    /// nested in a call into the same arena: the words this entry restores
+    Same,
+    /// a re-entry (A -> host -> B -> host -> A) continues the state saved in that outer entry's `prev`
+    Outer(usize),
+}
+
+thread_local! {
+    static ENTRIES: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Enters module `idx`'s arena on this thread (a wrapper's call). Lock-free.
+pub fn enter_module(idx: u32) -> Result<(), EnterError> {
     if idx as usize >= MAX_MODULES {
-        return None;
+        return Err(EnterError::Unloaded);
     }
-    let p = ARENAS[idx as usize].load(std::sync::atomic::Ordering::Acquire);
+    // recorded before the arena (and any twin's slot word) is loaded: either free_arena's proof
+    // sees this thread inside, or this load sees the unlink (reclaim.rs). The `Arena` behind the
+    // pointer stays valid while this thread is inside: it is freed only after the proof.
+    crate::reclaim::enter();
+    let p = ARENAS[idx as usize].load(std::sync::atomic::Ordering::SeqCst);
     if p.is_null() {
-        return None;
+        crate::reclaim::leave();
+        return Err(EnterError::Unloaded);
     }
-    // the Arc in the module table keeps it alive until free_arena clears this entry first
-    enter_raw(unsafe { &*p }).ok()
+    let r = enter_raw(unsafe { &*p });
+    if r.is_err() {
+        crate::reclaim::leave();
+    }
+    r
 }
 
-/// Enters arena `a` on this thread (a wrapper's call into its module).
-pub fn enter(a: &Arc<Arena>) -> Result<Saved, String> {
-    enter_raw(a)
-}
-
-fn enter_raw(a: &Arena) -> Result<Saved, String> {
-    if !a.alive.load(std::sync::atomic::Ordering::Acquire) {
-        return Err("the module was unloaded".to_string());
+/// The entry proper (the thread's reclaim record is already taken).
+fn enter_raw(a: &Arena) -> Result<(), EnterError> {
+    if !a.alive.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(EnterError::Unloaded);
     }
     budget_flush();
-    // recorded before the wrapper loads any twin's slot word (reclaim.rs)
-    crate::reclaim::enter();
     let w = words();
-    let prev = unsafe { Saved([*w, *w.add(1), *w.add(2), *w.add(3)]) };
-    unsafe {
-        // nested entry into the same arena continues its shadow stack
-        let same = *w == a.base as i64;
-        *w = a.base as i64;
-        if !same {
-            *w.add(1) = (a.base + SS_HI as u64) as i64;
+    let prev = save().0;
+    let fuel = if a.fuel > 0 { a.fuel } else { i64::MAX };
+    let r = ENTRIES.try_with(|es| {
+        let mut es = es.borrow_mut();
+        // where this thread's state in the arena is: the current one (a nested entry), saved in an
+        // outer entry (A -> host -> B -> host -> A: continue below A's live frames), or none yet
+        let (ssp, sslo, left, seg, claimed, carry) = if prev[0] == a.base as i64 {
+            let seg = es.last().map_or(0, |e| e.seg);
+            (prev[1], prev[5], prev[4], seg, false, Carry::Same)
+        } else if let Some(i) = es.iter().rposition(|e| e.prev[0] == a.base as i64) {
+            // (es[i - 1] is the entry into the arena that es[i] left)
+            let e = &es[i];
+            let seg = es[..i].iter().rev().find(|o| std::ptr::eq(o.arena, a)).map_or(0, |o| o.seg);
+            (e.prev[1], e.prev[5], e.prev[4], seg, false, Carry::Outer(i))
+        } else {
+            let seg = claim_seg(a).ok_or(EnterError::Busy)?;
+            let at = a.base + SEGS as u64 + seg as u64 * SEG as u64;
+            ((at + SEG as u64) as i64, (at + STACK_LO as u64) as i64, fuel, seg, true, Carry::None)
+        };
+        es.push(Entry { prev, arena: a as *const Arena, seg, claimed, carry });
+        unsafe {
+            *w = a.base as i64;
+            *w.add(1) = ssp;
+            *w.add(2) = fuel;
+            *w.add(3) = a as *const Arena as i64;
+            // (a fresh entry starts with the module's fuel per call; a nested or resumed one
+            // continues the outer call's)
+            *w.add(4) = left;
+            *w.add(5) = sslo;
         }
-        *w.add(2) = if a.fuel > 0 { a.fuel } else { i64::MAX };
-        *w.add(3) = a as *const Arena as i64;
-        // the twins' fuel word (in the window: the module could only raise its own budget, and
-        // only with unsafe code the compile-time check refuses)
-        if !same {
-            *((a.base + FUEL_OFF as u64) as *mut i64) = if a.fuel > 0 { a.fuel } else { i64::MAX };
+        Ok(())
+    });
+    match r {
+        Ok(Ok(())) => {
+            budget_reload();
+            Ok(())
         }
+        Ok(Err(e)) => Err(e),
+        // (this thread is past its TLS destructors)
+        Err(_) => Err(EnterError::Busy),
     }
-    budget_reload();
-    Ok(prev)
+}
+
+/// A free segment of arena `a` for this thread, mapped (None: all in use).
+fn claim_seg(a: &Arena) -> Option<u32> {
+    use std::sync::atomic::Ordering;
+    let mut cur = a.segs.load(Ordering::Acquire);
+    let k = loop {
+        if cur == u64::MAX {
+            return None;
+        }
+        let k = (!cur).trailing_zeros();
+        match a.segs.compare_exchange_weak(cur, cur | 1 << k, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break k,
+            Err(c) => cur = c,
+        }
+    };
+    if a.segs_mapped.load(Ordering::Acquire) & 1 << k == 0 {
+        let at = a.base + SEGS as u64 + k as u64 * SEG as u64;
+        if !map_rw(at + SEG_GUARD as u64, (SEG - SEG_GUARD) as u64) {
+            a.segs.fetch_and(!(1 << k), Ordering::AcqRel);
+            return None;
+        }
+        a.segs_mapped.fetch_or(1 << k, Ordering::AcqRel);
+    }
+    Some(k)
+}
+
+/// Pops this thread's innermost entry (its words are restored by the caller).
+fn pop_entry(es: &mut Vec<Entry>) -> Option<[i64; NWORDS]> {
+    let e = es.pop()?;
+    if e.claimed {
+        // (the arena is valid: this thread is still inside, reclaim.rs)
+        unsafe { (*e.arena).segs.fetch_and(!(1u64 << e.seg), std::sync::atomic::Ordering::AcqRel) };
+    }
+    Some(e.prev)
 }
 
 /// A wrapper's call returns (or unwinds): the state before it comes back.
-pub fn leave(prev: Saved) {
-    restore(prev);
+pub fn leave() {
+    budget_flush();
+    let w = words();
+    let prev = ENTRIES.try_with(|es| {
+        let mut es = es.borrow_mut();
+        let carry = es.last().map_or(Carry::None, |e| e.carry);
+        let mut prev = pop_entry(&mut es);
+        // a nested or resumed call's fuel left goes back to the call it continued
+        let left = unsafe { *w.add(4) };
+        match carry {
+            Carry::None => {}
+            Carry::Same => {
+                if let Some(p) = prev.as_mut() {
+                    p[4] = left;
+                }
+            }
+            Carry::Outer(i) => {
+                if let Some(o) = es.get_mut(i) {
+                    o.prev[4] = left;
+                }
+            }
+        }
+        prev
+    }).ok().flatten();
+    if let Some(p) = prev {
+        restore(Saved(p));
+    }
     crate::reclaim::leave();
 }
 
@@ -1150,8 +1351,9 @@ pub fn alloca(size: u64, align: u64) -> u64 {
     unsafe {
         let a = *w as u64;
         let sp = *w.add(1) as u64;
+        let lo = *w.add(5) as u64;
         let at = (sp.saturating_sub(size)) & !(align.max(1) - 1);
-        if a == 0 || at < a + SS_LO as u64 {
+        if a == 0 || at < lo {
             return 0;
         }
         *w.add(1) = at as i64;
@@ -1332,9 +1534,11 @@ fn sb_fmt_pop() -> jit::StrRet {
     let r = f();
     let Some(a) = cur_arena() else { return r };
     let (p, n) = r.parts();
-    let dst = if n <= SCRATCH_LEN as u64 { a.base + SCRATCH as u64 } else { a.heap.lock().unwrap_or_else(|e| e.into_inner()).alloc(a.base, n, 16) };
+    // this thread's scratch: just below its shadow stack (W_SSLO)
+    let scratch = unsafe { *words().add(5) } as u64 - SCRATCH_LEN as u64;
+    let dst = if n <= SCRATCH_LEN as u64 { scratch } else { a.heap.lock().unwrap_or_else(|e| e.into_inner()).alloc(a.base, n, 16) };
     if dst == 0 {
-        return jit::StrRet::new(a.base + SCRATCH as u64, 0);
+        return jit::StrRet::new(scratch, 0);
     }
     unsafe { std::ptr::copy_nonoverlapping(p as *const u8, dst as *mut u8, n as usize) };
     jit::StrRet::new(dst, n)
@@ -1465,13 +1669,17 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
         nb + nbs.len() as u32 - 1
     };
     if has_frame {
-        push0(&mut b0, Inst::TlsAddr(t_ssp, tls_sym.plus(W_SSP)));
+        push0(&mut b0, Inst::IBinI(IOp::Add, U64, t_ssp, t_arena, W_SSP - W_ARENA));
         push0(&mut b0, Inst::Load(relax_backend::rir::Mem::Int(8, false), ssp0, t_ssp, 0));
         push0(&mut b0, Inst::IBinI(IOp::Sub, U64, nsp, ssp0, frame as i64));
+        // this thread's segment: nsp - lo must be in [0, stack size] (below lo wraps; a thread
+        // with no entry has ssp = lo = 0, which wraps too)
+        let lo = f.vreg(Cls::I);
         let rel = f.vreg(Cls::I);
         let c = f.vreg(Cls::I);
-        push0(&mut b0, Inst::IBin(IOp::Sub, U64, rel, nsp, ar));
-        push0(&mut b0, Inst::ICmpI(Cond::Lt, false, c, rel, SS_LO as i64));
+        push0(&mut b0, Inst::Load(relax_backend::rir::Mem::Int(8, false), lo, t_arena, (W_SSLO - W_ARENA) as i32));
+        push0(&mut b0, Inst::IBin(IOp::Sub, U64, rel, nsp, lo));
+        push0(&mut b0, Inst::ICmpI(Cond::Gt, false, c, rel, (SEG - STACK_LO) as i64));
         let t = trap(f, &mut new_blocks, site_stack);
         // the store of the new shadow sp happens in a continuation block
         let cont = relax_backend::rir::Block { insts: vec![Inst::Store(relax_backend::rir::Mem::Int(8, false), t_ssp, 0, nsp)], pos: vec![pos0], term: Term::Jump(entry + 1), term_pos: pos0, count: -1.0 };
@@ -1656,7 +1864,7 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
     f.blocks.extend(out_blocks);
     f.blocks.extend(new_blocks);
     f.slots.clear();
-    add_fuel(f, ar, site_fuel, panic_site, pos0, &costs);
+    add_fuel(f, t_arena, site_fuel, panic_site, pos0, &costs);
     with_sb(|s| s.refs.insert(twin_id, refs));
     f.verify().map_err(|e| format!("{}: sandbox transform made invalid RIR: {}", f.name, e))?;
     // the masks the transform added: common ones merged, loop-invariant ones hoisted. Only
@@ -1712,12 +1920,72 @@ unsafe fn call_target(up: *mut Unit, id: u32, sandboxed: &HashSet<u32>) -> Resul
                 if !args.is_empty() {
                     return Err(format!("calls the generic host API fn `{}`: API fns called by modules must be concrete", u.prog.def_path(*d)));
                 }
+                if let Some(why) = host_api_escape(u, *d) {
+                    return Err(why);
+                }
                 return Ok(id);
             }
             Ok(twin(up, id))
         }
         FnKey::Sandbox(_) => Ok(id),
         _ => Ok(twin(up, id)),
+    }
+}
+
+/// Whether calling host API fn `d` could hand module code to the host: a parameter whose type
+/// holds a fn pointer, a trait object or a closure anywhere inside (through references, boxes,
+/// fields). The host could keep such a value and call it later -- on any thread, outside every
+/// wrapper -- and twin code would run with no arena entered (its masked accesses relative to
+/// arena 0, i.e. host memory) and no reclaim record (frames the code reclaimer cannot see).
+/// So the boundary refuses them: modules pass data to the host; the host calls modules only
+/// through their exports' wrappers. (MEMRECLAIM.REVIEW F3.) Some(the refusal) or None.
+fn host_api_escape(u: &Unit, d: crate::program::DefId) -> Option<String> {
+    // (keyed by the collect epoch too: a host edit may change the signature)
+    let key = (d.0, u.tcx.collect_epoch.load(std::sync::atomic::Ordering::Relaxed));
+    {
+        let g = SB.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = g.as_ref().and_then(|s| s.api_checked.get(&key)) {
+            return r.clone();
+        }
+    }
+    let r = match u.tcx.fn_sig(&u.prog, d) {
+        None => Some(format!("calls the host API fn `{}`, whose signature is not known", u.prog.def_path(d))),
+        Some(sig) => sig.params.iter().enumerate().find_map(|(k, &t)| {
+            let mut seen = HashSet::new();
+            carries_code(u, t, &mut seen).map(|what| format!(
+                "passes {} to the host API fn `{}` (parameter {}, `{}`): module code cannot be handed to the host -- pass data, and let the host call the module through its exports",
+                what, u.prog.def_path(d), k + 1, crate::typeck::type_name(&u.prog, &u.tcx, t)))
+        }),
+    };
+    let mut g = SB.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = g.as_mut() {
+        s.api_checked.insert(key, r.clone());
+    }
+    r
+}
+
+/// What in type `t` can carry callable module code (None: plain data, references to it, boxes of it).
+fn carries_code(u: &Unit, t: crate::types::TyId, seen: &mut HashSet<crate::types::TyId>) -> Option<&'static str> {
+    use crate::types::TyKind;
+    if !seen.insert(t) {
+        return None;
+    }
+    match u.tcx.tys.kind(t).clone() {
+        TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Int(_) | TyKind::Float(_) | TyKind::Never | TyKind::Foreign(_) | TyKind::Const(_) => None,
+        TyKind::FnPtr(..) => Some("a fn pointer"),
+        TyKind::FnDef(..) => Some("a fn item"),
+        TyKind::Closure(..) => Some("a closure"),
+        TyKind::Dyn(..) => Some("a trait object (`dyn`)"),
+        TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Ref(_, e, _) | TyKind::Ptr(_, e) => carries_code(u, e, seen),
+        TyKind::Tuple(v) => u.tcx.tys.list(v).iter().find_map(|x| carries_code(u, *x, seen)),
+        TyKind::Adt(d, args, _) => {
+            let Some(a) = u.tcx.adts.get(&d) else { return Some("a value of a type not known concretely") };
+            let args = u.tcx.tys.list(args);
+            let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
+            a.variants.iter().enumerate().find_map(|(vi, v)| (0..v.fields.len()).find_map(|fi| carries_code(u, u.tcx.field_ty(&u.prog, env, d, vi as u32, fi as u32, args), seen)))
+        }
+        // not concrete: refused rather than guessed
+        _ => Some("a value of a type not known concretely"),
     }
 }
 
@@ -1734,8 +2002,9 @@ unsafe fn fn_target(up: *mut Unit, id: u32, sandboxed: &HashSet<u32>) -> Result<
 }
 
 /// Charge each original block before executing it. Metering blocks and confinement
-/// instructions have no charge. Stores/checks remain observable in both tiers.
-fn add_fuel(f: &mut Func, arena: VReg, site: Sym, panic_site: Sym, pos0: u64, costs: &[i64]) {
+/// instructions have no charge. Stores/checks remain observable in both tiers. The fuel word is
+/// this thread's (W_FUEL in its sandbox words, `words` the TLS address of W_ARENA).
+fn add_fuel(f: &mut Func, words: VReg, site: Sym, panic_site: Sym, pos0: u64, costs: &[i64]) {
     let trap_ix = f.blocks.len() as u32;
     let tv = f.vreg(Cls::I);
     f.blocks.push(relax_backend::rir::Block { insts: vec![Inst::Addr(tv, site), Inst::Call(Callee::Host(panic_site), vec![tv], Vec::new())], pos: vec![pos0, pos0], term: Term::Unreachable, term_pos: pos0, count: -1.0 });
@@ -1747,7 +2016,7 @@ fn add_fuel(f: &mut Func, arena: VReg, site: Sym, panic_site: Sym, pos0: u64, co
         let c = f.vreg(Cls::I);
         let cont_ix = f.blocks.len() as u32;
         let insts = vec![
-            Inst::IBinI(IOp::Add, U64, t, arena, FUEL_OFF as i64),
+            Inst::IBinI(IOp::Add, U64, t, words, W_FUEL - W_ARENA),
             Inst::Load(relax_backend::rir::Mem::Int(8, true), v, t, 0),
             Inst::IBinI(IOp::Sub, U64, v2, v, cost),
             Inst::Store(relax_backend::rir::Mem::Int(8, true), t, 0, v2),

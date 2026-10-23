@@ -77,10 +77,10 @@ extern "C" {
     fn __relax_module_error(buf: *mut u8, cap: usize) -> usize;
     fn __relax_guard_enter(deadline_ms: u64) -> u64;
     fn __relax_guard_leave(token: u64);
-    fn __relax_sb_enter(module: u32, out: *mut [i64; 4]) -> u32;
-    fn __relax_sb_leave(prev: *const [i64; 4]);
+    fn __relax_sb_enter(module: u32) -> u32;
+    fn __relax_sb_leave();
     fn __relax_sb_alloca(size: usize, align: usize) -> usize;
-    fn __relax_sb_stats(out: *mut [u64; 7], recycle: u32) -> u32;
+    fn __relax_sb_stats(out: *mut [u64; 8], recycle: u32) -> u32;
     fn __relax_domain_id() -> u32;
     fn __relax_restart_supported();
     fn __relax_restart_requested() -> u32;
@@ -234,10 +234,11 @@ pub fn restored_state() -> Option<String> {
 
 /// Sandbox code and data statistics: [recycles, code bytes in use, dead code bytes pending,
 /// image read-only bytes, image read-write bytes, live arenas, recycles refused because a thread
-/// was still inside the space to reuse]. `recycle`: rebuild the live
+/// was still inside the space to reuse, unloaded arenas still mapped because a thread may be
+/// inside]. `recycle`: rebuild the live
 /// module code first (blocking; Err when frames may still run in the space it would reuse).
-pub fn sandbox_stats(recycle: bool) -> Result<[u64; 7], String> {
-    let mut out = [0u64; 7];
+pub fn sandbox_stats(recycle: bool) -> Result<[u64; 8], String> {
+    let mut out = [0u64; 8];
     if unsafe { __relax_sb_stats(&mut out, recycle as u32) } == 0 {
         return Err(last_error());
     }
@@ -276,21 +277,21 @@ impl Inst {
 }
 
 #[doc(hidden)]
-pub struct __SbFrame([i64; 4]);
+pub struct __SbFrame(());
 
 impl Drop for __SbFrame {
     fn drop(&mut self) {
-        unsafe { __relax_sb_leave(&self.0) }
+        unsafe { __relax_sb_leave() }
     }
 }
 
 #[doc(hidden)]
 pub fn __sb_enter(module: u32) -> __SbFrame {
-    let mut prev = [0i64; 4];
-    if unsafe { __relax_sb_enter(module, &mut prev) } != 0 {
-        panic!("the module was unloaded");
+    match unsafe { __relax_sb_enter(module) } {
+        0 => __SbFrame(()),
+        1 => panic!("the module was unloaded"),
+        _ => panic!("too many threads inside the module at once"),
     }
-    __SbFrame(prev)
 }
 
 fn sb_alloca<T>(n: usize) -> *mut T {

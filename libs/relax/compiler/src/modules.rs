@@ -1153,21 +1153,19 @@ pub extern "C" fn __relax_module_error(buf: *mut u8, cap: usize) -> usize {
     })
 }
 
-/// A wrapper enters module `idx`'s arena (0; the state before goes to `out`), or finds it
-/// unloaded (1).
-pub extern "C" fn __relax_sb_enter(idx: u32, out: *mut [i64; 4]) -> u32 {
+/// A wrapper enters module `idx`'s arena: 0, or 1 (the module was unloaded), or 2 (every
+/// per-thread segment of the module is in use).
+pub extern "C" fn __relax_sb_enter(idx: u32) -> u32 {
     match crate::sandbox::enter_module(idx) {
-        Some(prev) => {
-            unsafe { *out = prev.0 };
-            0
-        }
-        None => 1,
+        Ok(()) => 0,
+        Err(crate::sandbox::EnterError::Unloaded) => 1,
+        Err(crate::sandbox::EnterError::Busy) => 2,
     }
 }
 
 /// A wrapper leaves: the state before its entry comes back.
-pub extern "C" fn __relax_sb_leave(prev: *const [i64; 4]) {
-    crate::sandbox::leave(crate::sandbox::Saved(unsafe { *prev }));
+pub extern "C" fn __relax_sb_leave() {
+    crate::sandbox::leave();
 }
 
 pub extern "C" fn __relax_sb_alloca(size: usize, align: usize) -> usize {
@@ -1287,9 +1285,10 @@ pub fn guard_reset(m: GuardMark) {
 }
 
 /// Sandbox statistics for tests and memory reports: [recycles, code bytes in the active space,
-/// dead code bytes pending, image ro bytes, image rw bytes, arenas live, recycles refused]. `recycle`
+/// dead code bytes pending, image ro bytes, image rw bytes, arenas live, recycles refused, unloaded
+/// arenas still mapped because a thread may be inside]. `recycle`
 /// != 0 runs a recycle now (blocking).
-pub extern "C" fn __relax_sb_stats(out: *mut [u64; 7], recycle: u32) -> u32 {
+pub extern "C" fn __relax_sb_stats(out: *mut [u64; 8], recycle: u32) -> u32 {
     let mut ok = 1;
     if recycle != 0 {
         let up = jit::current_unit();
@@ -1303,7 +1302,8 @@ pub extern "C" fn __relax_sb_stats(out: *mut [u64; 7], recycle: u32) -> u32 {
     }
     let (r, used, dead) = crate::sandbox::code_stats();
     let (ro, rw, n) = crate::sandbox::stats();
-    unsafe { *out = [r as u64, used, dead, ro as u64, rw as u64, n as u64, crate::sandbox::refused_recycles()] };
+    let dying = crate::sandbox::reap_arenas();
+    unsafe { *out = [r as u64, used, dead, ro as u64, rw as u64, n as u64, crate::sandbox::refused_recycles(), dying as u64] };
     ok
 }
 
