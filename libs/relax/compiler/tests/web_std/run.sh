@@ -23,7 +23,7 @@ mkdir -p "$T/u"
 cat > "$T/u/units.json" <<J
 {"version":1,"roots":[0],"units":[{"pkg_id":"path+file://$T#web_std@0.0.0","target":{"kind":["bin"],"name":"web_std","src_path":"$H/web_std.rs","edition":"2021"},"mode":"build","features":[],"dependencies":[]}]}
 J
-MAKEPAD_RUN_CHECK_TARGET=$TRIPLE MAKEPAD_RUN_STD=$H/../../std MAKEPAD_RUN_CACHE_DIR=$T/tgt "$B" run --quiet --units "$T/u/units.json" web_std > "$T/relax.stdout" 2>"$T/relax.err"
+MAKEPAD_RUN_CHECK_TARGET=$TRIPLE MAKEPAD_RUN_STD=$H/../../std MAKEPAD_RUN_CACHE_DIR=$T/tgt "$B" run --quiet --units "$T/u/units.json" web_std --release > "$T/relax.stdout" 2>"$T/relax.err"
 rc=$?
 sed -n '/^web_std start/,/^web_std end/p' "$T/relax.err" > "$T/relax.all"
 # (the runner's panic-park notices are on the same stream)
@@ -43,7 +43,7 @@ else
   exit 1
 fi
 
-MAKEPAD_RUN_WASM_EXPORT=$T/relax.wasm MAKEPAD_RUN_SPEC=0 MAKEPAD_RUN_O1=always MAKEPAD_RUN_O3=0 MAKEPAD_RUN_CHECK_TARGET=$TRIPLE MAKEPAD_RUN_STD=$H/../../std MAKEPAD_RUN_CACHE_DIR=$T/tgt-export "$B" run --quiet --no-live --units "$T/u/units.json" web_std > /dev/null 2> "$T/export.err" || { tail -40 "$T/export.err"; exit 1; }
+MAKEPAD_RUN_WASM_EXPORT=$T/relax.wasm MAKEPAD_RUN_SPEC=0 MAKEPAD_RUN_O1=always MAKEPAD_RUN_O3=0 MAKEPAD_RUN_CHECK_TARGET=$TRIPLE MAKEPAD_RUN_STD=$H/../../std MAKEPAD_RUN_CACHE_DIR=$T/tgt-export "$B" run --quiet --no-live --units "$T/u/units.json" web_std --release > /dev/null 2> "$T/export.err" || { tail -40 "$T/export.err"; exit 1; }
 node "$H/host.js" "$T/relax.wasm" > "$T/export.out" || exit 1
 diff "$T/ref.out" "$T/export.out" || exit 1
 node "$H/host.js" "$T/relax.wasm" probes > "$T/export.only" || exit 1

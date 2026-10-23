@@ -708,7 +708,7 @@ impl<'a> Lcx<'a> {
                 Inst::Call(Callee::Host(s), mut args, rets) => {
                     let name = match self.u.syms.kind(s.id) { Some(crate::syms::SymKind::Rt(n)) => n, _ => "" };
                     match name {
-                        "str_eq" | "divrem128" => Inst::Call(self.web_helper("web_runtime", name), args, rets),
+                        "str_eq" | "divrem128" | "wide_f32" | "wide_f64" => Inst::Call(self.web_helper("web_runtime", name), args, rets),
                         "fmod" | "fmodf" => Inst::Call(self.web_helper("libm", name), args, rets),
                         "panic_site" | "panic_bounds" => {
                             let site_reg = args.pop().expect("panic site argument");
@@ -1007,7 +1007,12 @@ impl<'a> Lcx<'a> {
         if too_big {
             let t = u.tcx.tys.erase_regions(t);
             let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-            self.err(self.pos, format!("type `{}` is 4 GiB or larger, which makepad run does not lay out yet", ts));
+            // (rustc: a layout of at least obj_size_bound bytes is a SizeOverflow error)
+            if u.size_overflows(t) {
+                self.err(self.pos, format!("{}values of the type `{}` are too big for the target architecture", relax_front::diagnostics::UNCODED_PREFIX, ts));
+            } else {
+                self.err(self.pos, format!("type `{}` is 4 GiB or larger, which makepad run does not lay out yet", ts));
+            }
         }
         l
     }
@@ -5652,7 +5657,11 @@ impl<'a> Lcx<'a> {
             Mem::F32 => 4,
             Mem::F64 => 8,
         };
-        let mut buf = vec![0u8; l.size as usize];
+        // (fallible, as rustc's interpreter allocates: a value too large for the compiler's memory is left to the
+        // static allocation, which reports "tried to allocate more memory than available to compiler")
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(l.size as usize).ok()?;
+        buf.resize(l.size as usize, 0u8);
         match v {
             Val::L(regs) => {
                 let leaves = l.leaves.as_ref()?;
@@ -8427,7 +8436,18 @@ impl<'a> Lcx<'a> {
                         let lo0 = self.f.vreg(Cls::I);
                         self.emit(Inst::Conv(Conv::FToInt(true, IntTy { bits: 64, signed: false }), lo0, r));
                         let (lo, hi) = match neg {
-                            None => (lo0, hi0),
+                            None => {
+                                // At 2^128 the saturated high limb converts back to
+                                // 2^64, so the subtraction above gives zero, not the
+                                // required all-ones low limb. Saturate both limbs
+                                // explicitly; this also handles positive infinity.
+                                let limit = fk(self, 340282366920938463463374607431768211456.0);
+                                let big = self.f.vreg(Cls::I);
+                                self.emit(Inst::FCmp(Cond::Ge, true, big, x, limit));
+                                let zero = self.iconst(0);
+                                let mask = self.ibin(IOp::Sub, false, zero, big);
+                                (self.ibin(IOp::Or, false, lo0, mask), self.ibin(IOp::Or, false, hi0, mask))
+                            }
                             Some(n) => {
                                 // positives above i128::MAX saturate: hi >= 2^63 -> MAX
                                 let big = self.f.vreg(Cls::I);

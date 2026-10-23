@@ -261,6 +261,7 @@ fn coverage_hot() {
 }
 
 fn body() {
+    numeric_casts();
     web_runtime_cases();
     coverage_hot();
     c_aggregates();
@@ -434,4 +435,36 @@ fn web_runtime_cases() {
         System.dealloc(p, Layout::from_size_align(65536, 256).unwrap());
     }
     say!("web_runtime {sum}");
+}
+
+fn numeric_casts() {
+    use std::hint::black_box;
+    // Both signednesses and precisions, including halfway values on either side
+    // of an even significand and carries into the next exponent (f32 infinity).
+    for value in [0u128, 1, (1u128 << 24) + 1, (1u128 << 24) + 3,
+        (1u128 << 53) + 1, (1u128 << 53) + 3, 1u128 << 63,
+        u64::MAX as u128, 1u128 << 64, (1u128 << 100) + (1u128 << 76) + 1,
+        (1u128 << 100) + (1u128 << 47) + 1, 1u128 << 127, u128::MAX] {
+        let x = black_box(value);
+        let y = black_box(value as i128);
+        say!("wide_cast {} {} {} {} {}", x, (x as f32).to_bits(), (x as f64).to_bits(),
+            (y as f32).to_bits(), (y as f64).to_bits());
+        let n = black_box(y.wrapping_neg());
+        say!("wide_negative {} {} {}", n, (n as f32).to_bits(), (n as f64).to_bits());
+        let x = black_box(value as u64);
+        let y = black_box(value as i64);
+        say!("int_cast {} {} {} {} {}", x, (x as f32).to_bits(), (x as f64).to_bits(),
+            (y as f32).to_bits(), (y as f64).to_bits());
+    }
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0, 0.0, -1.0, 1.5,
+        -129.0, 256.0, -32769.0, 65536.0, -2147483649.0, 4294967296.0,
+        9007199254740992.0, 9223372036854775808.0, 18446744073709551616.0,
+        170141183460469231731687303715884105728.0, 340282366920938463463374607431768211456.0] {
+        let x = black_box(value);
+        let y = black_box(value as f32);
+        say!("f64_cast {} {} {} {} {} {} {} {} {} {}", x as i8, x as u8, x as i16,
+            x as u16, x as i32, x as u32, x as i64, x as u64, x as i128, x as u128);
+        say!("f32_cast {} {} {} {} {} {} {} {} {} {}", y as i8, y as u8, y as i16,
+            y as u16, y as i32, y as u32, y as i64, y as u64, y as i128, y as u128);
+    }
 }
