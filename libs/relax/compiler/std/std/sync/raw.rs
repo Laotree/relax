@@ -13,13 +13,17 @@ extern "C" {
     fn __relax_wait_enter(kind: u32, addr: usize, holder: usize);
     fn __relax_wait_leave();
     // makepad inspect's timeline: a wake is an edge that ends someone's wait (recorded only while
-    // a client records; the flag is the loader's)
+    // a client records; the flag is the loader's). Web programs are never recorded by the
+    // host timeline, so neither the hook nor its flag belongs to the web ABI.
+    #[cfg(not(relax_web))]
     fn __relax_wake(addr: usize);
+    #[cfg(not(relax_web))]
     static __relax_recording: core::sync::atomic::AtomicBool;
 }
 
 /// futex_wake, noted on makepad inspect's timeline while it records.
 pub(crate) fn futex_wake(futex: &AtomicU32) -> bool {
+    #[cfg(not(relax_web))]
     if unsafe { __relax_recording.load(Relaxed) } {
         unsafe { __relax_wake(futex.as_ptr() as usize) };
     }
@@ -28,6 +32,7 @@ pub(crate) fn futex_wake(futex: &AtomicU32) -> bool {
 
 /// futex_wake_all, noted like futex_wake.
 pub(crate) fn futex_wake_all(futex: &AtomicU32) {
+    #[cfg(not(relax_web))]
     if unsafe { __relax_recording.load(Relaxed) } {
         unsafe { __relax_wake(futex.as_ptr() as usize) };
     }

@@ -7761,6 +7761,43 @@ mod rotate_tests {
         assert_eq!(f.blocks.iter().filter(|b| b.term.succs().any(|x| x == t)).count(), 1);
         assert!(matches!(f.blocks[t as usize].term, Term::Branch(..)));
     }
+
+    /// inflate's block loop: the header picks a fast or a slow refill, both in the loop, and the
+    /// exit is further down. A copy of that test in the latch would enter the loop at both refills
+    /// (two entries: no natural loop); the header stays the loop's one entry.
+    #[test]
+    fn rotation_keeps_a_header_that_does_not_exit() {
+        let mut f = Func::new("rotin".into(), 0);
+        let n0 = f.vreg(Cls::I);
+        f.params.push(n0);
+        f.rets.push(Cls::I);
+        let (n, c, e) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        for _ in 0..6 {
+            f.block();
+        }
+        f.blocks[0].insts = vec![Inst::Mov(n, n0)];
+        f.blocks[0].term = Term::Jump(1);
+        f.blocks[1].insts = vec![Inst::ICmpI(Cond::Ge, false, c, n, 8)];
+        f.blocks[1].term = Term::Branch(c, 2, 3);
+        f.blocks[2].insts = vec![Inst::IBinI(IOp::Sub, U64T, n, n, 8)];
+        f.blocks[2].term = Term::Jump(4);
+        f.blocks[3].insts = vec![Inst::IBinI(IOp::Sub, U64T, n, n, 1)];
+        f.blocks[3].term = Term::Jump(4);
+        f.blocks[4].insts = vec![Inst::ICmpI(Cond::Eq, false, e, n, 0)];
+        f.blocks[4].term = Term::Branch(e, 5, 1);
+        f.blocks[5].term = Term::Ret(vec![n]);
+        for b in &mut f.blocks {
+            b.pos = vec![0; b.insts.len()];
+        }
+        rotate_loops(&mut f);
+        f.verify().unwrap();
+        // nothing but the header branches to the refills
+        for t in [2u32, 3] {
+            let into: Vec<usize> = (0..f.blocks.len()).filter(|&b| f.blocks[b].term.succs().any(|x| x == t)).collect();
+            assert_eq!(into.len(), 1, "b{} entered from {:?}", t, into);
+            assert!(matches!(f.blocks[into[0]].insts[..], [Inst::ICmpI(Cond::Ge, false, _, x, 8)] if x == n));
+        }
+    }
 }
 
 #[cfg(test)]
