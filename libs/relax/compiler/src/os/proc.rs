@@ -26,7 +26,7 @@ static ARGS: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 /// host library started from a loader (Android: bionic hands a cdylib's std no argv, the APK's
 /// executable passes its own).
 pub fn set_args(args: Vec<Vec<u8>>) {
-    // process state: rebuilt in the kept heap (the settle swap destroys the compiler arena's generation)
+    // process state: rebuilt in the kept heap
     let args = crate::zone_alloc::kept_with(|| args.clone());
     let _ = ARGS.set(args);
 }
@@ -353,7 +353,7 @@ mod imp {
     static POOL: relax_session::sync::Mutex<Option<Pool>> = relax_session::sync::Mutex::new(None);
 
     pub fn set_trampolines(base: u64, table: *mut u64, count: usize) {
-        // process state: kept heap (the settle swap destroys the compiler zone)
+        // process state: kept heap
         let _k = crate::zone_alloc::kept();
         *POOL.lock().unwrap_or_else(|e| e.into_inner()) = Some(Pool { base, table, count, used: std::collections::HashMap::new() });
     }
@@ -368,8 +368,7 @@ mod imp {
             return a;
         }
         // called while compiling (c_callable_hook): the map is process state, so its growth goes
-        // to the kept heap -- in the compiler zone it was gone after the settle swap and the
-        // first new C callback (a touch handler on the phone) faulted
+        // to the kept heap
         let _k = crate::zone_alloc::kept();
         let i = pool.used.len();
         assert!(i < pool.count, "the host library's {} C-callable stubs are all in use", pool.count);
