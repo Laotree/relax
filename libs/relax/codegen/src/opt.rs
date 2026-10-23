@@ -7547,7 +7547,9 @@ pub fn dead_slot_stores(f: &mut Func) -> bool {
 }
 
 /// Slot coalescing along whole copies (O3): `Copy(C <- B)` of one slot's bytes into an equal slot
-/// joins B and C into one slot when they do not interfere -- at every write of B the written bytes of
+/// (or of the whole of the smaller one into, or out of, the start of a larger one: an `Option<T>`
+/// payload or a tuple's first field moved to a slot of its own -- the smaller slot becomes the
+/// larger one's prefix) joins B and C into one slot when they do not interfere -- at every write of B the written bytes of
 /// C are dead, and at every write of C those of B are, by backward byte liveness over the CFG (the
 /// copy itself writes C with B's bytes and is exempt). The copy then vanishes. LLVM's SROA and
 /// stack colouring reach this through SSA values; here the slots meet directly, also around
@@ -7556,8 +7558,9 @@ pub fn dead_slot_stores(f: &mut Func) -> bool {
 /// (call result -> peek slot -> current slot -> match scrutinee) on every item.
 /// A slot handed to calls only as the result buffer of an sret callee counts as fully written there
 /// (the callee writes the value; bytes it leaves are padding or an inactive variant's, which Rust
-/// leaves undefined). Returns whether any copy went.
-pub fn coalesce_slot_copies(f: &mut Func) -> bool {
+/// leaves undefined). `prefix`: the smaller-into-larger joins too (MAKEPAD_RUN_OPT=-slotprefix
+/// turns them off). Returns whether any copy went.
+pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
     const NONE: u32 = u32::MAX;
     let mut any = false;
     for _round in 0..8 {
@@ -7585,7 +7588,29 @@ pub fn coalesce_slot_copies(f: &mut Func) -> bool {
             }
         }
         let tracked: Vec<bool> = (0..ns).map(|s2| f.slots[s2].size > 0 && (!sc.esc[s2] || sret_call[s2].is_some())).collect();
-        // candidate copies: whole equal-size slots, both tracked
+        // copies that joined slots made into a slot's bytes onto themselves: gone
+        let mut selfs: Vec<(usize, usize)> = Vec::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for (ii, i) in b.insts.iter().enumerate() {
+                if let Inst::Copy(d, s2, _) = *i {
+                    if sl(d) != NONE && vs[d.0 as usize] == vs[s2.0 as usize] {
+                        selfs.push((bi, ii));
+                    }
+                }
+            }
+        }
+        if !selfs.is_empty() {
+            for &(bi, ii) in selfs.iter().rev() {
+                f.blocks[bi].insts.remove(ii);
+                if ii < f.blocks[bi].pos.len() {
+                    f.blocks[bi].pos.remove(ii);
+                }
+            }
+            any = true;
+            continue;
+        }
+        // candidate copies: the whole of one slot to the start of the other (equal sizes, or the
+        // smaller one's every byte), both tracked
         let mut cands: Vec<(usize, usize, u32, u32)> = Vec::new();
         for (bi, b) in f.blocks.iter().enumerate() {
             for (ii, i) in b.insts.iter().enumerate() {
@@ -7593,7 +7618,7 @@ pub fn coalesce_slot_copies(f: &mut Func) -> bool {
                     let (cs, bs) = (sl(d), sl(s2));
                     if cs != NONE && bs != NONE && cs != bs && vs[d.0 as usize].1 == 0 && vs[s2.0 as usize].1 == 0 && tracked[cs as usize] && tracked[bs as usize] {
                         let (zc, zb) = (f.slots[cs as usize].size, f.slots[bs as usize].size);
-                        if n == zc && n == zb {
+                        if n == zc.min(zb) && (prefix || zc == zb) {
                             cands.push((bi, ii, bs, cs));
                         }
                     }
@@ -7749,11 +7774,18 @@ pub fn coalesce_slot_copies(f: &mut Func) -> bool {
                             continue;
                         }
                         let other = if s2 == bs { cs } else { bs };
-                        let hit = match bits(other, lo, hi) {
-                            Some((over, _)) => anyb(&cur, over.0, over.1),
-                            None => {
-                                let (x, y) = whole(other);
-                                anyb(&cur, x, y)
+                        // the same bytes of the partner (a smaller partner is the prefix: a
+                        // write past its end meets none of its bytes)
+                        let osize = f.slots[other as usize].size as i64;
+                        let hit = if hi != i64::MAX && lo >= osize {
+                            false
+                        } else {
+                            match bits(other, lo, if hi == i64::MAX { hi } else { hi.min(osize) }) {
+                                Some((over, _)) => anyb(&cur, over.0, over.1),
+                                None => {
+                                    let (x, y) = whole(other);
+                                    anyb(&cur, x, y)
+                                }
                             }
                         };
                         if hit {
@@ -7774,9 +7806,11 @@ pub fn coalesce_slot_copies(f: &mut Func) -> bool {
             }
             used[bs as usize] = true;
             used[cs as usize] = true;
-            to[bs as usize] = cs;
+            // (the smaller slot becomes the start of the larger one)
+            let (from, into) = if f.slots[bs as usize].size <= f.slots[cs as usize].size { (bs, cs) } else { (cs, bs) };
+            to[from as usize] = into;
             let al = f.slots[bs as usize].align.max(f.slots[cs as usize].align);
-            f.slots[cs as usize].align = al;
+            f.slots[into as usize].align = al;
             dels.push((cb, ci));
         }
         if dels.is_empty() {

@@ -11489,7 +11489,7 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
             let ch = relax_codegen::opt::dead_slot_stores(func);
             let ch = ch | relax_codegen::opt::forward_slot_dests(func) | relax_codegen::opt::forward_slot_dests_x(options, func, 32);
             // slots joined along whole copies by byte liveness (loops too); MAKEPAD_RUN_OPT=-slotcoal
-            let ch = ch | (!relax_backend::stats::opt_off(options, "-slotcoal") && relax_codegen::opt::coalesce_slot_copies(func));
+            let ch = ch | (!relax_backend::stats::opt_off(options, "-slotcoal") && relax_codegen::opt::coalesce_slot_copies(func, !relax_backend::stats::opt_off(options, "-slotprefix")));
             let ch = ch | relax_codegen::opt::split_wide_slot_accesses(func);
             let ch = ch | relax_codegen::opt::sroa_post_inline(func);
             if !ch {
@@ -15413,7 +15413,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             static EACH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let base = if *EACH.get_or_init(|| std::env::var("MAKEPAD_RUN_DUMP_EACH").is_ok()) { format!("{}_{}", base, c.text_len) } else { base };
             let _ = std::fs::write(format!("{}.t1.bin", base), &c.code[..c.text_len as usize]);
-            let _ = std::fs::write(format!("{}.t1.frame", base), format!("frame {} slot-area {} of {}\n", c.frame_size, relax_backend::frame::slot_layout(&func, 0, true).1, slot_bytes(&func)));
+            let _ = std::fs::write(format!("{}.t1.frame", base), format!("frame {} slot-area {} of {}\nslots (size/align): {}\n", c.frame_size, relax_backend::frame::slot_layout(&func, 0, true).1, slot_bytes(&func),
+                func.slots.iter().enumerate().map(|(i, x)| format!("{}:{}/{}", i, x.size, x.align)).collect::<Vec<_>>().join(" ")));
             let _ = std::fs::write(format!("{}.t1.rir", base), func.dump());
             // offset<TAB>block<TAB>instruction (- = terminator)<TAB>source position, per emitted RIR
             // instruction (tools/run/tools/asmcmp); the RIR is the emitted function (after back-end splits)
