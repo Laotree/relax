@@ -53,6 +53,7 @@ pub mod live;
 pub mod reload;
 pub mod modules;
 pub mod sandbox;
+pub mod reclaim;
 pub mod domain;
 pub(crate) mod domain_threads;
 pub mod jit;

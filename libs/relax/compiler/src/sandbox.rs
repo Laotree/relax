@@ -116,6 +116,8 @@ struct Sb {
     /// a recycle rebuilds every live twin into the other one and swaps
     spaces: [(u64, u64, u64); 2],
     active: usize,
+    /// per space: the reclaim epoch it was unlinked at (reclaim.rs; 0: never held code that ran)
+    abandoned: [u64; 2],
     /// crates of unloaded modules (their twins are dead)
     dead_crates: HashSet<u32>,
     recycles: u32,
@@ -126,9 +128,8 @@ const SPACE: u64 = 64 << 20;
 /// dead twin code (replaced or of unloaded modules) that starts a recycle
 static DEAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const RECYCLE_AT: u64 = 16 << 20;
-/// wrapper calls in flight (a space retired by a recycle is reused only when none were)
-static INFLIGHT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-static QUIESCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// recycles refused because a thread may still run in the space to reuse (reclaim.rs)
+static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static RECYCLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 static SB: Mutex<Option<Sb>> = Mutex::new(None);
@@ -208,6 +209,7 @@ unsafe fn sb_init(up: *mut Unit) -> Result<(), String> {
         refs: HashMap::new(),
         spaces: [(s0, SPACE, s0), (s1, SPACE, s1)],
         active: 0,
+        abandoned: [0, 0],
         dead_crates: HashSet::new(),
         recycles: 0,
     });
@@ -287,21 +289,28 @@ fn crate_of(u: &Unit, id: u32) -> Option<u32> {
     }
 }
 
-/// Whether a recycle is due (dead twin code past the threshold) and none is running.
+/// MAKEPAD_RUN_RECLAIM_STRESS=1: every twin install asks for a recycle, so the spaces are reused
+/// as often as the quiescence proof allows (JITREFMEM L6, V8's stress_wasm_code_gc).
+pub fn reclaim_stress() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_RECLAIM_STRESS").is_some_and(|v| v != "0"))
+}
+
+/// Whether a recycle is due (dead twin code past the threshold, or stress) and none is running.
 pub fn recycle_due() -> bool {
-    DEAD_BYTES.load(std::sync::atomic::Ordering::Relaxed) >= RECYCLE_AT && !RECYCLING.load(std::sync::atomic::Ordering::Relaxed)
+    (reclaim_stress() || DEAD_BYTES.load(std::sync::atomic::Ordering::Relaxed) >= RECYCLE_AT) && !RECYCLING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Starts a recycle on a background thread when one is due.
 pub fn maybe_recycle(up: *mut Unit) {
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     if !recycle_due() || RECYCLING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
+    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     struct P(*mut Unit);
     unsafe impl Send for P {}
     let p = P(up);
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("run-sandbox-recycle".to_string())
         .spawn(move || {
             let runtime = &session.runtime;
@@ -309,25 +318,39 @@ pub fn maybe_recycle(up: *mut Unit) {
             jit::lower_this_thread_priority(runtime);
             let r = unsafe { recycle(p.0) };
             if let Err(e) = r {
-                eprintln!("makepad: sandbox recycle skipped: {}", e);
+                if !reclaim_stress() {
+                    eprintln!("makepad: sandbox recycle skipped: {}", e);
+                }
             }
             RECYCLING.store(false, std::sync::atomic::Ordering::SeqCst);
-        })
-        .ok();
+        });
+    if spawned.is_err() {
+        RECYCLING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Rebuilds every live twin into the other sandbox code space and swaps (a unit call
 /// here): dead twins (unloaded modules, replaced versions) are left behind, and the space they
-/// were in is reused by the next recycle. Returns (twins moved, bytes now used).
+/// were in is reused by the next recycle once no thread can still run in it (reclaim.rs).
+/// Returns (twins moved, bytes now used).
 pub unsafe fn recycle(up: *mut Unit) -> Result<(usize, u64), String> {
     crate::owner::call(crate::owner::Class::Program, || recycle_locked(up))
 }
 
 unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
-    if INFLIGHT.load(std::sync::atomic::Ordering::SeqCst) != 0 && !QUIESCED.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err("the space to reuse may still hold running frames".to_string());
+    // prove: the space to reuse was unlinked at `abandoned`; a thread inside since before that
+    // may still run there (or return into it): then nothing is reused now
+    {
+        let g = SB.lock().unwrap_or_else(|e| e.into_inner());
+        let s = g.as_ref().ok_or("no sandbox")?;
+        let stamp = s.abandoned[1 - s.active];
+        let n = crate::reclaim::blockers(stamp);
+        if n != 0 {
+            REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(format!("{} thread(s) may still run in the space to reuse", n));
+        }
     }
-    let (target, tbase, tsize, live, dead) = {
+    let (target, tbase, tsize, old_hw, live, dead) = {
         let g = SB.lock().unwrap_or_else(|e| e.into_inner());
         let s = g.as_ref().ok_or("no sandbox")?;
         let target = 1 - s.active;
@@ -344,7 +367,7 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
                 live.push(t);
             }
         }
-        (target, s.spaces[target].0, s.spaces[target].1, live, dead)
+        (target, s.spaces[target].0, s.spaces[target].1, s.spaces[target].2, live, dead)
     };
     // the target space's old code is gone from every index (its frames are quiescent)
     {
@@ -373,10 +396,22 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
         let linked = u.link_at(at, code, &relocs)?;
         built.push((t, at, linked, map, info));
     }
-    // swap: each live twin's table word points to its new code; dead twins back to their stubs
+    // free: the old code goes (traps where nothing new lands), the new code is written, and
+    // every core of the process synchronises its instruction stream before a reused address
+    // is published (no core may still hold the old instructions)
+    if old_hw > tbase {
+        zap_code(tbase, old_hw - tbase);
+    }
+    for (_, at, code, _, _) in &built {
+        crate::os::mem::write_code(*at, code);
+    }
+    if old_hw > tbase && !crate::os::mem::sync_cores() {
+        REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Err("this OS cannot synchronise the other cores before code memory is reused".to_string());
+    }
+    // unlink: each live twin's table word points to its new code; dead twins back to their stubs
     let u = &mut *up;
     for (t, at, code, map, info) in built {
-        crate::os::mem::write_code(at, &code);
         u.index_code(at, code.len() as u32, t, info);
         if jit::perf_map_on() {
             jit::perf_map(at, code.len(), &format!("{} [sandbox]", jit::perf_name(u, t)));
@@ -408,14 +443,35 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
     }
     let used = next - tbase;
     let n = live.len();
+    // the space left behind is stamped after its last slot word moved: threads entering from
+    // now on cannot reach it (reclaim.rs)
+    let stamp = crate::reclaim::advance();
     with_sb(|s| {
+        s.abandoned[1 - target] = stamp;
         s.active = target;
         s.spaces[target].2 = next;
         s.recycles += 1;
     });
     DEAD_BYTES.store(0, std::sync::atomic::Ordering::SeqCst);
-    QUIESCED.store(INFLIGHT.load(std::sync::atomic::Ordering::SeqCst) == 0, std::sync::atomic::Ordering::SeqCst);
     Ok((n, used))
+}
+
+/// Fills code memory nobody can reach any more with traps: a stale jump faults instead of
+/// running old code (JITREFMEM L6: zap freed code).
+unsafe fn zap_code(at: u64, len: u64) {
+    crate::os::mem::fill_code(at, len as usize, |b| {
+        #[cfg(target_arch = "aarch64")]
+        for w in b.chunks_exact_mut(4) {
+            w.copy_from_slice(&0xd420_0000u32.to_le_bytes()); // brk #0
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        b.fill(0xcc); // int3
+    });
+}
+
+/// Recycles refused by the quiescence proof (a thread still inside the space to reuse).
+pub fn refused_recycles() -> u64 {
+    REFUSED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// (recycles done, bytes used in the active code space, dead bytes pending).
@@ -972,8 +1028,9 @@ pub fn entry_recover(depth: u64) {
     ENTRY_DEPTH.with(|d| {
         let skipped = d.get().saturating_sub(depth);
         d.set(depth);
-        if skipped != 0 && INFLIGHT.fetch_sub(skipped as i64, std::sync::atomic::Ordering::SeqCst) == skipped as i64 {
-            QUIESCED.store(true, std::sync::atomic::Ordering::SeqCst);
+        // a contained fault or deadline unwound past the wrappers: their frames are gone
+        if skipped != 0 && depth == 0 {
+            crate::reclaim::left();
         }
     });
 }
@@ -1049,8 +1106,13 @@ fn enter_raw(a: &Arena) -> Result<Saved, String> {
         return Err("the module was unloaded".to_string());
     }
     budget_flush();
-    INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    ENTRY_DEPTH.with(|d| d.set(d.get() + 1));
+    // recorded before the wrapper loads any twin's slot word (reclaim.rs)
+    ENTRY_DEPTH.with(|d| {
+        if d.get() == 0 {
+            crate::reclaim::enter_outermost();
+        }
+        d.set(d.get() + 1)
+    });
     let w = words();
     let prev = unsafe { Saved([*w, *w.add(1), *w.add(2), *w.add(3)]) };
     unsafe {
@@ -1075,10 +1137,13 @@ fn enter_raw(a: &Arena) -> Result<Saved, String> {
 /// A wrapper's call returns (or unwinds): the state before it comes back.
 pub fn leave(prev: Saved) {
     restore(prev);
-    ENTRY_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-    if INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-        QUIESCED.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
+    ENTRY_DEPTH.with(|d| {
+        let n = d.get().saturating_sub(1);
+        d.set(n);
+        if n == 0 {
+            crate::reclaim::left();
+        }
+    });
 }
 
 /// Shadow-stack bytes for a wrapper's argument copy or result slot (0: no room).

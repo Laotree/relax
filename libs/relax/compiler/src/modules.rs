@@ -1287,9 +1287,9 @@ pub fn guard_reset(m: GuardMark) {
 }
 
 /// Sandbox statistics for tests and memory reports: [recycles, code bytes in the active space,
-/// dead code bytes pending, image ro bytes, image rw bytes, arenas live]. `recycle` != 0 runs a
-/// recycle now (blocking).
-pub extern "C" fn __relax_sb_stats(out: *mut [u64; 6], recycle: u32) -> u32 {
+/// dead code bytes pending, image ro bytes, image rw bytes, arenas live, recycles refused]. `recycle`
+/// != 0 runs a recycle now (blocking).
+pub extern "C" fn __relax_sb_stats(out: *mut [u64; 7], recycle: u32) -> u32 {
     let mut ok = 1;
     if recycle != 0 {
         let up = jit::current_unit();
@@ -1303,7 +1303,7 @@ pub extern "C" fn __relax_sb_stats(out: *mut [u64; 6], recycle: u32) -> u32 {
     }
     let (r, used, dead) = crate::sandbox::code_stats();
     let (ro, rw, n) = crate::sandbox::stats();
-    unsafe { *out = [r as u64, used, dead, ro as u64, rw as u64, n as u64] };
+    unsafe { *out = [r as u64, used, dead, ro as u64, rw as u64, n as u64, crate::sandbox::refused_recycles()] };
     ok
 }
 

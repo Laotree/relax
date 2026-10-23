@@ -5377,6 +5377,10 @@ impl Unit {
         if redirect.is_none() {
             self.index_code(at, code.len() as u32, id, info);
         }
+        if twin && crate::sandbox::reclaim_stress() {
+            // MAKEPAD_RUN_RECLAIM_STRESS: reclaim after every install (a background recycle)
+            crate::sandbox::maybe_recycle(self as *mut Unit);
+        }
         let f = &mut self.fns[id as usize];
         if twin && f.compiled {
             crate::sandbox::note_dead(f.code_len as u64);
@@ -15072,6 +15076,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 };
                 if sandboxed {
                     crate::sandbox::note_dead(u.fns[id as usize].code_len as u64);
+                    if crate::sandbox::reclaim_stress() {
+                        crate::sandbox::maybe_recycle(up);
+                    }
                 }
                 o3_owner(2, te);
                 let tx = cpu_ns();

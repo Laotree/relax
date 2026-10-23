@@ -57,6 +57,10 @@ if [ "$GOT" = "$(cat "$D/expect-scale.out")" ]; then echo "modules scale: PASS (
 OUT=$(MAKEPAD_RUN_SANDBOX_NOCHECK=1 "$1" test "$D/contain.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$GOT" = "$(cat "$D/expect-contain.out")" ]; then echo "modules contain: PASS"; else echo "modules contain: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; exit 1; fi
+# Code reclamation: a thread parked inside a module blocks reuse of its space (MEMRECLAIM).
+OUT=$(MAKEPAD_RUN_WATCHDOG_MS=120000 "$1" test "$D/reclaim_threads.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = "$(cat "$D/expect-reclaim.out")" ]; then echo "modules reclaim threads: PASS ($(echo "$OUT" | grep -o 'reclaim_threads: .*'))"; else echo "modules reclaim threads: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
 # This case compiles/edits 400 modules; its harness deadline includes compilation.
 OUT=$(MAKEPAD_RUN_WATCHDOG_MS=120000 "$1" test "$D/recycle.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')

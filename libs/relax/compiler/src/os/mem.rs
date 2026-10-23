@@ -104,6 +104,82 @@ pub unsafe fn patch_code_u32(addr: u64, w: u32) {
     fill_code(addr, 4, |b| (*(b.as_mut_ptr() as *const std::sync::atomic::AtomicU32)).store(w, std::sync::atomic::Ordering::Release));
 }
 
+/// Every other thread of the process runs a context-synchronising event before it executes
+/// code written before this call (code memory about to be reused: no core may still hold the
+/// old instructions in its pipeline). false: this OS cannot do it -- the caller must not reuse.
+/// Linux/Android: membarrier(PRIVATE_EXPEDITED_SYNC_CORE). macOS: each thread is interrupted to
+/// read its registers (the exception return synchronises its core; CoreCLR's
+/// FlushProcessWriteBuffers on Apple platforms).
+pub fn sync_cores() -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        extern "C" {
+            fn syscall(n: i64, ...) -> i64;
+        }
+        #[cfg(target_arch = "x86_64")]
+        const SYS_MEMBARRIER: i64 = 324;
+        #[cfg(target_arch = "aarch64")]
+        const SYS_MEMBARRIER: i64 = 283;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        const SYS_MEMBARRIER: i64 = -1;
+        const PRIVATE_EXPEDITED_SYNC_CORE: i64 = 1 << 5;
+        const REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: i64 = 1 << 6;
+        if SYS_MEMBARRIER < 0 {
+            return false;
+        }
+        static REGISTERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*REGISTERED.get_or_init(|| unsafe { syscall(SYS_MEMBARRIER, REGISTER_PRIVATE_EXPEDITED_SYNC_CORE, 0i64, 0i64) } == 0) {
+            return false;
+        }
+        unsafe { syscall(SYS_MEMBARRIER, PRIVATE_EXPEDITED_SYNC_CORE, 0i64, 0i64) == 0 }
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        extern "C" {
+            static mach_task_self_: u32;
+            fn mach_thread_self() -> u32;
+            fn task_threads(task: u32, list: *mut *mut u32, count: *mut u32) -> i32;
+            fn thread_get_register_pointer_values(thread: u32, sp: *mut usize, length: *mut usize, values: *mut usize) -> i32;
+            fn mach_port_deallocate(task: u32, name: u32) -> i32;
+            fn vm_deallocate(task: u32, addr: usize, size: usize) -> i32;
+        }
+        const KERN_SUCCESS: i32 = 0;
+        const KERN_INVALID_ARGUMENT: i32 = 4;
+        const KERN_TERMINATED: i32 = 37;
+        const KERN_INSUFFICIENT_BUFFER_SIZE: i32 = 52;
+        const MACH_SEND_INVALID_DEST: i32 = 0x10000003;
+        let task = mach_task_self_;
+        let me = mach_thread_self();
+        let mut list: *mut u32 = std::ptr::null_mut();
+        let mut n: u32 = 0;
+        if task_threads(task, &mut list, &mut n) != KERN_SUCCESS {
+            mach_port_deallocate(task, me);
+            return false;
+        }
+        let mut ok = true;
+        for i in 0..n as usize {
+            let t = *list.add(i);
+            if t != me {
+                let mut sp = 0usize;
+                let mut regs = [0usize; 128];
+                let mut len = regs.len();
+                match thread_get_register_pointer_values(t, &mut sp, &mut len, regs.as_mut_ptr()) {
+                    KERN_SUCCESS | KERN_INSUFFICIENT_BUFFER_SIZE => {}
+                    // the thread ended meanwhile: it runs nothing
+                    KERN_TERMINATED | KERN_INVALID_ARGUMENT | MACH_SEND_INVALID_DEST => {}
+                    _ => ok = false,
+                }
+            }
+            mach_port_deallocate(task, t);
+        }
+        vm_deallocate(task, list as usize, n as usize * 4);
+        mach_port_deallocate(task, me);
+        ok
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    false
+}
+
 #[cfg(unix)]
 mod unix {
     extern "C" {
@@ -139,7 +215,13 @@ mod unix {
         #[cfg(target_os = "macos")]
         const MAP_FIXED_NORESERVE: i32 = 0x10 | 0x40;
         unsafe {
-            mmap(addr as *mut u8, len, 0, MAP_PRIVATE_ANON | MAP_FIXED_NORESERVE, -1, 0);
+            if mmap(addr as *mut u8, len, 0, MAP_PRIVATE_ANON | MAP_FIXED_NORESERVE, -1, 0) as u64 == addr {
+                return;
+            }
+            // the pages stay committed, but nothing can execute or name them for other code
+            if mprotect(addr as *mut u8, len, 0) != 0 {
+                panic!("makepad run: retired code memory at {:#x} ({} bytes) could not be made unreachable", addr, len);
+            }
         }
     }
 
