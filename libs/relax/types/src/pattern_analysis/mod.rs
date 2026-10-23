@@ -1223,18 +1223,28 @@ impl Cx<'_> {
 struct Checker<'a> {
     cx: Cx<'a>,
     errors: Vec<String>,
+    at_patterns: Vec<String>,
 }
 
-/// Checks the matches, lets and parameters of a type-checked body: the errors (E0004 /
-/// E0005, located); lints go to the lint sink.
-pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) -> Vec<String> {
+/// What check_match found in a body.
+pub struct BodyErrors {
+    /// check_match's own failure (E0004, E0005, a constant that is no pattern): the body's checks end
+    pub errors: Vec<String>,
+    /// binding conflicts in `x @ pat` patterns: emitted without failing check_match, so borrowck
+    /// still runs (check_borrow_conflicts_in_at_patterns only emits)
+    pub at_patterns: Vec<String>,
+}
+
+/// Checks the matches, lets and parameters of a type-checked body (located errors); lints go to
+/// the lint sink.
+pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) -> BodyErrors {
     let cx = body_cx(prog, tcx, body);
-    let mut ck = Checker { cx, errors: Vec::new() };
+    let mut ck = Checker { cx, errors: Vec::new(), at_patterns: Vec::new() };
     ck.run();
     let mut const_errors = std::mem::take(&mut ck.cx.const_errors);
     const_errors.dedup();
     ck.errors.extend(const_errors);
-    ck.errors
+    BodyErrors { errors: ck.errors, at_patterns: ck.at_patterns }
 }
 
 impl<'a> Checker<'a> {
@@ -1656,7 +1666,7 @@ impl<'a> Checker<'a> {
                 else { return }
             }
         };
-        self.errors.push(self.cx.prog.record_uncoded_error(self.cx.body.file, pos, "typeck", msg.to_string()));
+        self.at_patterns.push(self.cx.prog.record_uncoded_error(self.cx.body.file, pos, "typeck", msg.to_string()));
     }
 
     fn check_binding_is_irrefutable(&mut self, p: PatId, origin: &str, scrut: Option<ExprId>, fallback: Option<u32>) {
