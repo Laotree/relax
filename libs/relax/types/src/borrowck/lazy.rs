@@ -268,8 +268,14 @@ pub fn set_ranks(src: usize, epoch: u64, ranks: &[(DefId, Vec<TyId>, u32)]) {
     let q = guard.get_or_insert_with(Queue::default);
     let epoch = q.canon(src, epoch);
     if !q.advance(src, epoch) { return; }
+    let trace = std::env::var_os("MAKEPAD_RUN_SPECV_TRACE").is_some();
     for (def, _, rank) in ranks {
         let key = (src, *def, epoch);
+        if trace {
+            let state = if q.rank_of.contains_key(&key) { "queued" } else if q.seen.contains_key(&key) { "seen" } else { "not queued" };
+            let v = VERDICTS.lock().unwrap_or_else(|e| e.into_inner()).get(def).map(|m| m.len()).unwrap_or(0);
+            eprintln!("gandalf: rank {} for {:?} epoch {}: {} ({} verdict entries, {} items queued)", rank, def, epoch, state, v, q.order.len());
+        }
         if let Some(at) = q.rank_of.remove(&key) {
             q.order.remove(&at);
             let item = q.items.remove(&at).unwrap();

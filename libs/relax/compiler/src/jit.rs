@@ -12230,6 +12230,12 @@ unsafe fn relower_twin_callers(up: *mut Unit, tc: &TwinCallers) {
             crate::zone_alloc::kept_with(|| for &c in &tc.unverified { if !a.contains(&(key, c)) { a.push((key, c)); } });
         }
         prioritize_verdicts(u, &tc.unverified);
+        if specv_trace() {
+            for &c in &tc.unverified {
+                let v = match u.verdict_state(c) { Verdict::Clean => "clean".to_string(), Verdict::Failed(e) => format!("failed ({} events)", e.len()), Verdict::Pending => "pending".to_string(), Verdict::Unverifiable(w) => format!("unverifiable: {}", w) };
+                eprintln!("specv twin caller #{} {} verdict {}", c, u.fns[c as usize].name, v);
+            }
+        }
     }
 }
 
