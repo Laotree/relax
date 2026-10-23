@@ -321,11 +321,7 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
             None => return Err(vec![format!("{}: dependency `{}` is not a crate of the running program", path, c)]),
         }
     }
-    let cfg = {
-        let mut c = crate::cfg::CfgSet::host(sess, &[]);
-        c.set.push("relax".to_string());
-        c
-    };
+    let cfg = crate::program_cfg(sess, &[]);
     let tr = std::env::var_os("MAKEPAD_RUN_MODULE_TRACE").is_some();
     let mut marks: Vec<(&str, std::time::Instant)> = vec![("", std::time::Instant::now())];
     let added = add_crates(up, &[NewCrate { name: name.to_string(), path: path.to_string(), edition: 2021, cfg, deps: dep_list, proc_macro: false }], false, None)?;
