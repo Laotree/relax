@@ -1084,6 +1084,44 @@ impl Arena {
         }
         (touched, slots, large, listed)
     }
+    /// Where the committed bytes are (`memory`'s arena census): [small chunks, their touched bytes,
+    /// their live blocks, their live slot bytes, touched bytes of small chunks with <= 4 live
+    /// blocks (pinned by a few survivors), large runs, large committed bytes, the 4 largest runs].
+    pub fn census(&self) -> [usize; 11] {
+        let mut c = [0usize; 11];
+        for h in self.headers.iter() {
+            let s = lock(&h.state);
+            if s.committed == 0 {
+                continue;
+            }
+            if s.stride == 0 {
+                c[5] += 1;
+                c[6] += s.committed;
+                let mut v = s.committed;
+                for k in 7..11 {
+                    if v > c[k] {
+                        std::mem::swap(&mut v, &mut c[k]);
+                    }
+                }
+                continue;
+            }
+            let (bump, live) = if COMPILER && s.attached {
+                // the owner thread updates these without the lock: a racy, approximate read
+                let o = h.owned.get();
+                unsafe { ((*o).bump.load(Ordering::Relaxed).min(CHUNK), (*o).live.load(Ordering::Relaxed)) }
+            } else {
+                (s.bump.min(CHUNK), h.live.load(Ordering::Relaxed))
+            };
+            c[0] += 1;
+            c[1] += bump;
+            c[2] += live;
+            c[3] += live * s.stride;
+            if live <= 4 {
+                c[4] += bump;
+            }
+        }
+        c
+    }
     fn partial_push(&self, i: usize, class: usize) {
         let mut p = lock(&self.partial);
         // a chunk that emptied meanwhile is on its way to the pool: never list it
@@ -1834,9 +1872,10 @@ impl Arena {
             self.detach_thread();
         }
         self.warm_drain();
-        if COMPILER {
-            self.release_free_pages();
-        }
+        // burst arena too: blocks that outlived their compile pin the chunks they were carved
+        // in (Sandbox race: 925 MB touched in 636 chunks held 6.5 MB of live blocks); the free
+        // granules around them go back
+        self.release_free_pages();
     }
     fn warm_drain(&self) {
         loop {
@@ -1880,7 +1919,7 @@ impl Arena {
             lock(&self.pool).release(run, order);
         }
     }
-    /// Compiler arena: gives the OS every granule of a small chunk whose slots are all free. Such a
+    /// Gives the OS every granule of a small chunk whose slots are all free. Such a
     /// granule's slots leave the free list for good (the chunk stays attached to its live blocks and
     /// is released whole when they are gone); the rest of the free list is relinked. What malloc_trim
     /// does for the system heap.
@@ -2303,6 +2342,9 @@ pub fn stats() -> (usize, usize, usize) {
 }
 pub fn detail() -> (usize, usize, usize, usize) {
     DEFAULT.detail()
+}
+pub fn census() -> [usize; 11] {
+    DEFAULT.census()
 }
 #[inline(always)]
 pub unsafe fn alloc(l: Layout) -> *mut u8 {

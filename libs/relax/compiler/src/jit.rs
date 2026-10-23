@@ -5851,6 +5851,14 @@ pub static MAIN_TID: AtomicU64 = AtomicU64::new(0);
 /// Functions compiled so far (= Stats::compiled), readable off the unit: progress
 /// reports (run.rs `--report-to`) poll it while the owner thread is busy.
 pub static COMPILED_FNS: AtomicU64 = AtomicU64::new(0);
+/// Of COMPILED_FNS, the speculative ones (the ahead workers' builds of code nobody called yet):
+/// the monitor's settle counts the others, the compiles the program asked for.
+pub static SPEC_FNS: AtomicU64 = AtomicU64::new(0);
+
+/// First compiles the program asked for (lazy stubs hit, not speculation): what the settle waits on.
+pub fn demand_compiled() -> u64 {
+    COMPILED_FNS.load(Ordering::Relaxed).saturating_sub(SPEC_FNS.load(Ordering::Relaxed))
+}
 
 /// Display-only snapshot. Never wait for a compiler or call the owner thread to draw
 /// progress: a busy queue is reported as busy and sampled again on the next tick.
@@ -17257,6 +17265,9 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
                 return if spec { Split::Spec } else { Split::Installed(u.fns[id as usize].code) };
             }
             u.stats.compiled += 1;
+            if spec {
+                SPEC_FNS.fetch_add(1, Ordering::Relaxed);
+            }
             COMPILED_FNS.fetch_add(1, Ordering::Relaxed);
             crate::boot_stats::fn_installed(boot_arm(u, id));
             if spec {

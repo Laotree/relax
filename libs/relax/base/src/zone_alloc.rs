@@ -102,6 +102,9 @@ mod disabled {
     pub fn stats() -> (usize, usize, usize) {
         (0, 0, 0)
     }
+    pub fn census() -> [usize; 11] {
+        [0; 11]
+    }
     pub fn trim() {}
     pub fn detach_thread() {}
     pub fn generation() -> u64 {
@@ -172,6 +175,11 @@ pub fn compiler_stats() -> (usize, usize, usize) {
 }
 
 /// (touched bytes of small chunks, bytes in their live slots, bytes of large blocks, chunks listed for reuse).
+/// The compiler and burst arenas' census (arena.rs `census`): where their committed bytes are.
+pub fn arena_census() -> ([usize; 11], [usize; 11]) {
+    (compiler::census(), burst::census())
+}
+
 pub fn compiler_detail() -> (usize, usize, usize, usize) {
     compiler::detail()
 }
@@ -421,6 +429,12 @@ pub fn kept_clone<T: Clone>(v: &T) -> T {
 #[inline]
 pub fn compiler_owns(p: *const u8) -> bool {
     compiler::owns(p as *mut u8)
+}
+
+/// Does `p` lie in the burst (scratch) arena?
+#[inline]
+pub fn burst_owns(p: *const u8) -> bool {
+    burst::owns(p as *mut u8)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
