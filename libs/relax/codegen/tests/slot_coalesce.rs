@@ -184,8 +184,11 @@ fn build_prefix(clobber: bool) -> Func {
     for o in [0, 8, 16] {
         push(&mut f, 0, Inst::Store(Mem::Int(8, false), pc, o, z));
     }
-    push(&mut f, 0, Inst::Store(Mem::Int(8, false), pb, 0, z));
-    push(&mut f, 0, Inst::Store(Mem::Int(8, false), pb, 8, z));
+    if clobber {
+        // B is read in every iteration: zero it as Rust's reference does
+        push(&mut f, 0, Inst::Store(Mem::Int(8, false), pb, 0, z));
+        push(&mut f, 0, Inst::Store(Mem::Int(8, false), pb, 8, z));
+    }
     push(&mut f, 0, Inst::Iconst(acc, 0));
     push(&mut f, 0, Inst::Iconst(i, 0));
     f.blocks[0].term = Term::Jump(1);
