@@ -256,6 +256,10 @@ pub struct Tcx {
     /// `TypeckResults::coroutine_stalled_predicates`, per typeck root: the goals that were stalled on a
     /// coroutine of that body (regions erased), proven once the coroutines' witnesses are known.
     pub coroutine_stalled_predicates: relax_session::sync::Mutex<crate::fxhash::HashMap<DefId, Vec<(crate::next_solver::Goal, u32)>>>,
+    /// `TypeckResults::potentially_region_dependent_goals`, per typeck root of a checked crate: the goals HIR
+    /// typeck proved that may depend on the identity of their regions (regions erased, deduplicated), with
+    /// their spans; re-proven when a type op of the root's borrow check fails.
+    pub potentially_region_dependent_goals: relax_session::sync::Mutex<crate::fxhash::HashMap<DefId, Vec<(crate::next_solver::Goal, u32)>>>,
     /// a coroutine type's saved locals after its upvars: (end offset, alignment), made when its
     /// poll function is lowered (coroutine_transform)
     pub coro_frames: crate::conc::MemoMap<TyId, (u32, u32)>,
@@ -428,6 +432,7 @@ impl Tcx {
             coroutine_witness_needs_drop: crate::conc::MemoMap::with_bits(10),
             coroutine_hidden_types: crate::conc::MemoMap::new_kept(10),
             coroutine_stalled_predicates: Default::default(),
+            potentially_region_dependent_goals: Default::default(),
             coro_frames: Default::default(),
             coro_shapes: Default::default(),
             coro_slot_ty: Default::default(),

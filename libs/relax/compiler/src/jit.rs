@@ -3158,6 +3158,7 @@ impl Unit {
         let mut c = code.to_vec();
         self.link_code(&mut c, at, relocs)?;
         unsafe { os::mem::write_code(at, &c) };
+        crate::coverage::installed(self, at, relocs);
         Ok(at)
     }
 
@@ -6852,7 +6853,10 @@ pub(crate) unsafe fn relower_with_probes(up: *mut Unit, id: u32, points: Vec<cra
     let _ = crate::lower::WATCH_FIELDS.try_with(|p| p.borrow_mut().clear());
     let results = crate::lower::PROBE_RESULTS.try_with(|p| std::mem::take(&mut *p.borrow_mut())).unwrap_or_default();
     let watched = crate::lower::WATCH_RESULTS.try_with(|p| std::mem::take(&mut *p.borrow_mut())).unwrap_or_default();
-    let lowered = lowered?;
+    let mut lowered = lowered?;
+    if crate::coverage::on() {
+        crate::coverage::instrument(up, id, &mut lowered);
+    }
     let (prep, _) = prepare_rir_from(up, id, false, Some(lowered), RirMode::Baseline)?;
     let (func, _) = optimize_rir(options, id, prep)?;
     Ok((func, results, watched))
@@ -8510,7 +8514,10 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     // take bails after this point (its candidates' fronts, its build budget), so the next round
     // takes it again instead of needing it fronted again
     let mut give_back = GiveBack(up, id, (from_ahead && owner::bailing() && matches!((&*up).fns[id as usize].key, FnKey::Inst(..) | FnKey::Closure(..) | FnKey::Plain(..))).then(|| func.clone()));
-    if crate::coverage::on() {
+    // Reused RIR already carries its source probes, including inlinees.
+    // GiveBack retains the fresh lowering before probes are added, so a
+    // deferred front retry is instrumented once when it is taken again.
+    if from_ahead && crate::coverage::on() {
         crate::coverage::instrument(up, id, &mut func);
     }
     relax_codegen::fncost::size(true, &func);
@@ -9396,6 +9403,7 @@ fn opt_pipeline(options: &crate::options::Options, func: &mut relax_backend::rir
 }
 
 fn opt_pipeline_inner(options: &crate::options::Options, func: &mut relax_backend::rir::Func, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, relayout: bool, full: bool, nounwind: &dyn Fn(u32) -> bool) {
+    crate::coverage::retire(func);
     verify_pass(func, "input (lowering / inlining)");
     // MAKEPAD_RUN_DUMP_INPUT=<name suffix>: the RIR entering the optimiser
     if let Ok(w) = std::env::var("MAKEPAD_RUN_DUMP_INPUT") {
@@ -11711,6 +11719,7 @@ impl Drop for Unit {
         }
         // a retired unit's code and data go with it (nothing calls into it any more); the
         // program's own unit lives to process exit
+        crate::coverage::forget(self);
         if !std::thread::panicking() { self.flush_query_errors(true); }
         if self.retired {
             let rest = UNIT_DATA_SIZE + UNIT_RW_SIZE + (crate::syms::SYM_CAP * 8) as u64;
@@ -13324,10 +13333,13 @@ impl Unit {
 // carry them (Block::count) to the profile-driven block layout and the register allocator's
 // block weights. Counts live in this process only (no profile files).
 
-/// MAKEPAD_RUN_PGO=0: no counted tier (hot slots go straight to O3 with static frequencies; A/B)
+/// MAKEPAD_RUN_PGO=0: no counted tier (hot slots go straight to O3 with static frequencies; A/B).
+/// Never for a W32 web program (codegen web32.rs): it addresses only its window, and the block
+/// counters (profile::instrument) are host memory its masked loads/stores would miss.
 fn pgo_on(options: &crate::options::Options) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_PGO").map_or(true, |v| v != "0")) && !options.no_block_freq && !t1prof_replay(options)
+        && relax_codegen::web32::cfg().is_none()
 }
 
 /// MAKEPAD_RUN_PGO_HOLD=1: counted code stays installed (no counting window ends): with
@@ -15294,7 +15306,8 @@ fn defer_startup_root(up: *mut Unit, id: u32, depth: u8) -> bool {
 /// Whether the program has presented its first frame (the boot screen goes away then).
 pub fn first_present_seen() -> bool { FIRST_PRESENT.load(Ordering::Acquire) }
 
-extern "C" fn relax_first_present() {
+/// Notify the loader that the application or its embedder presented a frame.
+pub extern "C" fn relax_first_present() {
     crate::domain::first_present();
     if !FIRST_PRESENT.swap(true, Ordering::AcqRel) {
         if EXEC_CHECK.load(Ordering::Relaxed) {

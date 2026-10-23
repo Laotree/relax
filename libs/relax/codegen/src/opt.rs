@@ -1209,7 +1209,7 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
 
 /// Instructions with effects beyond their result vregs (memory writes, calls, ordering).
 pub fn is_mem_effect_pub(i: &Inst) -> bool {
-    is_mem_effect(i)
+    !relax_backend::passes::is_pure(i)
 }
 
 pub fn set_sincos(wide: bool, sin: Sym, cos: Sym, both: Sym) {

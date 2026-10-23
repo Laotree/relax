@@ -1957,6 +1957,16 @@ pub mod uses {
     static INCOMPLETE_INCLUDE: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
     pub fn incomplete_include(file: &str, call: u32) { INCOMPLETE_INCLUDE.lock().unwrap_or_else(|e| e.into_inner()).push((file.to_string(), call)); }
     pub fn take_incomplete_include() -> Vec<(String, u32)> { std::mem::take(&mut *INCOMPLETE_INCLUDE.lock().unwrap_or_else(|e| e.into_inner())) }
+    /// rustc_parse parse_param_general: a C-variadic `...` without a pattern where the parameter needs
+    /// one (lint varargs_without_pattern, buffered for the crate root): the file and the `...`.
+    static VARARGS_WITHOUT_PATTERN: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+    pub fn varargs_without_pattern(file: &str, pos: u32) { VARARGS_WITHOUT_PATTERN.lock().unwrap_or_else(|e| e.into_inner()).push((file.to_string(), pos)); }
+    pub fn take_varargs_without_pattern() -> Vec<(String, u32)> { std::mem::take(&mut *VARARGS_WITHOUT_PATTERN.lock().unwrap_or_else(|e| e.into_inner())) }
+    /// rustc_expand InvocationCollector::check_attributes: the attributes written on a macro call (the
+    /// file, the attribute's position, its name), whose feature gates are judged as an item's are.
+    static MAC_CALL_ATTRS: Mutex<Vec<(String, u32, String)>> = Mutex::new(Vec::new());
+    pub fn mac_call_attr(file: &str, pos: u32, name: &str) { MAC_CALL_ATTRS.lock().unwrap_or_else(|e| e.into_inner()).push((file.to_string(), pos, name.to_string())); }
+    pub fn mac_call_attrs() -> Vec<(String, u32, String)> { MAC_CALL_ATTRS.lock().unwrap_or_else(|e| e.into_inner()).clone() }
     static CFG_ATTR_EMPTY: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
     pub fn cfg_attr_empty(file: &str, pos: u32) { CFG_ATTR_EMPTY.lock().unwrap_or_else(|e| e.into_inner()).push((file.to_string(), pos)); }
     pub fn take_cfg_attr_empty() -> Vec<(String, u32)> { std::mem::take(&mut *CFG_ATTR_EMPTY.lock().unwrap_or_else(|e| e.into_inner())) }

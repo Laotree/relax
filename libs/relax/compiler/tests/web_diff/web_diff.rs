@@ -61,6 +61,26 @@ thread_local! {
 fn dbl(x: u32) -> u32 { x * 2 }
 fn sqr(x: u32) -> u32 { x * x }
 
+struct OnceState<const N: usize>([u8; N]);
+impl<const N: usize> Drop for OnceState<N> {
+    fn drop(&mut self) { ONCE_DROPS.fetch_add(1, Ordering::SeqCst); }
+}
+static ONCE_DROPS: AtomicUsize = AtomicUsize::new(0);
+#[inline(never)]
+fn take_once<const N: usize>(state: OnceState<N>) -> usize {
+    state.0.iter().map(|&x| x as usize).sum()
+}
+#[inline(never)]
+fn call_once_box(f: Box<dyn FnOnce() -> usize>) -> usize { f() }
+fn once_size<const N: usize>() -> usize {
+    let state = OnceState([3; N]);
+    call_once_box(Box::new(move || take_once(state)))
+}
+#[repr(align(256))]
+struct OnceAligned(OnceState<24>);
+#[inline(never)]
+fn take_aligned(state: OnceAligned) -> usize { take_once(state.0) }
+
 #[derive(Debug, Clone, PartialEq)]
 enum Node {
     Leaf(i64),
@@ -258,6 +278,12 @@ fn body() {
     fs.push(Box::new(move |x| { st += x; st }));
     let r: Vec<u64> = (0..3).map(|i| { let a = fs[0](i); fs[1](a) }).collect();
     say!("closures {} {:?}", acc, r);
+    // Box<dyn FnOnce> moves its environment out before freeing the allocation. Its
+    // compiler-called free helper must retain the vtable on both wasm pointer widths.
+    let state = OnceAligned(OnceState([7; 24]));
+    let aligned = call_once_box(Box::new(move || take_aligned(state)));
+    say!("box once {} {} {} {} {} drops {}", once_size::<0>(), once_size::<1>(),
+        once_size::<24>(), once_size::<4096>(), aligned, ONCE_DROPS.load(Ordering::SeqCst));
     // strings, chars, formatting
     let mut s = String::from("Grüße, wasm32!");
     s.push_str(" ✓");

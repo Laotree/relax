@@ -31,50 +31,19 @@ pub fn startup() {
     }
 }
 
-/// Block shaking: the coverage stores in a captured body (a byte store of 1 to a coverage table
-/// address, the address an `Iconst`) are removed; a block whose stores all name blocks that never
-/// ran becomes a trap when `trap` (its code never ran in the trace: the same contract as an
-/// untraced function). Returns (blocks trapped, coverage stores removed).
+/// Block shaking: remove native coverage effects from the captured RIR and
+/// optionally trap blocks whose source probes never ran. Required callees and
+/// their predecessor paths retain work's keep-reachable behavior.
+/// Returns (blocks trapped, coverage effects removed).
 fn shake_blocks(f: &mut Func, trap: bool, keep: &dyn Fn(u32) -> bool, mut stub: Option<&mut u32>) -> (usize, usize) {
-    use relax_backend::rir::{Mem, Term, VReg};
-    // single-definition Iconsts
-    let mut defs: HashMap<VReg, (u32, i64)> = HashMap::new();
-    for b in &f.blocks {
-        for i in &b.insts {
-            if let Some(d) = def_of(i) {
-                let e = defs.entry(d).or_insert((0, 0));
-                e.0 += 1;
-                if let Inst::Iconst(_, v) = i {
-                    e.1 = *v;
-                } else {
-                    e.1 = i64::MIN;
-                }
-            }
-        }
-    }
-    for p in &f.params {
-        defs.entry(*p).or_insert((0, 0)).0 += 1;
-    }
-    // a coverage store, possibly merged by the optimiser with its neighbours (consecutive blocks
-    // have consecutive bytes: two byte stores become one 2-, 4- or 8-byte store of 0x0101..):
-    // Some(any of its bytes' blocks ran)
+    use relax_backend::rir::Term;
     let cov = |i: &Inst| -> Option<bool> {
-        if let Inst::Store(Mem::Int(w, _), base, off, _) = i {
-            let (n, v) = defs.get(base).copied()?;
-            if n == 1 && v != i64::MIN {
-                let a = (v as u64).wrapping_add(*off as i64 as u64);
-                let mut any = None;
-                for k in 0..(*w as u64).max(1) {
-                    if let Some(h) = crate::coverage::hit_at(a + k) {
-                        any = Some(any.unwrap_or(false) || h);
-                    }
-                }
-                return any;
-            }
+        match i {
+            Inst::Coverage { word, mask } => crate::coverage::hit(*word, *mask),
+            _ => None,
         }
-        None
     };
-    // per block: Some(entered) when it holds coverage stores (entered when any of them ran)
+    // A block is entered when any of its source probes ran in any lowering.
     let state: Vec<Option<bool>> = f
         .blocks
         .iter()
@@ -146,58 +115,8 @@ fn shake_blocks(f: &mut Func, trap: bool, keep: &dyn Fn(u32) -> bool, mut stub: 
             });
         }
     }
-    // the other shapes the optimiser leaves (a coverage base reached through Mov/IBinI/IBin, an
-    // indexed store): every store whose address derives from a coverage-table constant goes
-    {
-        use std::collections::HashSet;
-        let mut cvr: HashSet<VReg> = HashSet::new();
-        loop {
-            let n0 = cvr.len();
-            for b in &f.blocks {
-                for i in &b.insts {
-                    match i {
-                        Inst::Iconst(d, v) if crate::coverage::hit_at(*v as u64).is_some() => {
-                            cvr.insert(*d);
-                        }
-                        Inst::Mov(d, a) | Inst::IBinI(_, _, d, a, _) if cvr.contains(a) => {
-                            cvr.insert(*d);
-                        }
-                        Inst::IBin(relax_backend::rir::IOp::Add, _, d, a, c) if cvr.contains(a) || cvr.contains(c) => {
-                            cvr.insert(*d);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if cvr.len() == n0 {
-                break;
-            }
-        }
-        if !cvr.is_empty() {
-            for b in f.blocks.iter_mut() {
-                let keep: Vec<bool> = b.insts.iter().map(|i| !matches!(i, Inst::Store(_, a, _, _) | Inst::StoreX(_, a, _, _, _, _) | Inst::AtomicStore(_, _, a, _) if cvr.contains(a))).collect();
-                if keep.iter().all(|k| *k) {
-                    continue;
-                }
-                removed += keep.iter().filter(|k| !**k).count();
-                let positioned = b.pos.len() == b.insts.len();
-                let mut k = 0;
-                b.insts.retain(|_| { k += 1; keep[k - 1] });
-                if positioned {
-                    let mut k = 0;
-                    b.pos.retain(|_| { k += 1; keep[k - 1] });
-                }
-            }
-        }
-    }
     if removed > 0 {
         relax_backend::passes::dce(f);
-        // a coverage address still named: a store shape this pass does not know (it would write
-        // into linear memory at a wrapped address): say so
-        let left = f.blocks.iter().flat_map(|b| b.insts.iter()).filter(|i| matches!(i, Inst::Iconst(_, v) if crate::coverage::hit_at(*v as u64).is_some())).count();
-        if left > 0 {
-            eprintln!("wasm export: {}: {} coverage addresses left after the strip", f.name, left);
-        }
     }
     (trapped, removed)
 }
@@ -331,16 +250,6 @@ fn succs(t: &relax_backend::rir::Term) -> Vec<u32> {
         Term::Branch(_, a, b) | Term::Invoke(a, b) => vec![*a, *b],
         Term::Switch(_, tab) => tab.targets.iter().copied().chain(std::iter::once(tab.default)).collect(),
         Term::Ret(_) | Term::Unreachable | Term::Resume => Vec::new(),
-    }
-}
-
-fn def_of(i: &Inst) -> Option<relax_backend::rir::VReg> {
-    match i {
-        Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::Mov(d, _) | Inst::IBin(_, _, d, _, _) | Inst::IBinI(_, _, d, _, _) | Inst::INeg(_, d, _) | Inst::INot(_, d, _) | Inst::IBit(_, d, _) | Inst::ICmp(_, _, d, _, _) | Inst::ICmpI(_, _, d, _, _) | Inst::FBin(_, _, d, _, _) | Inst::FUnary(_, _, d, _) | Inst::FCmp(_, _, d, _, _) | Inst::Conv(_, d, _) | Inst::Load(_, d, _, _) | Inst::LoadX(_, d, _, _, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::Sel(d, _, _, _) | Inst::TlsAddr(d, _) | Inst::TlsStatic(d, _) => Some(*d),
-        // anything else defining a vreg counts as "not a plain constant": the vreg is reported
-        // as defined (several times) so a base it defines is never read as a coverage address
-        Inst::Call(_, _, r) => r.first().copied(),
-        _ => None,
     }
 }
 

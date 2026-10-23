@@ -678,7 +678,9 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
     let n_expr = (n_expr1 + ranges2.map_or(0, |r| r[1] - r[0])) as usize;
     let n_pat = (n_pat1 + ranges2.map_or(0, |r| r[3] - r[2])) as usize;
     let error = tcx.tys.error;
-    let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::Typeck { defining_opaque_types_and_generators: tcx.opaque_types_defined_by(prog, def) }, def);
+    let mut infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::Typeck { defining_opaque_types_and_generators: tcx.opaque_types_defined_by(prog, def) }, def);
+    // (the goals it records are only re-proven by the borrow check of a checked crate)
+    infcx.in_hir_typeck = tcx.validates(prog, file);
 
     let mut fcx = Fcx {
         cx: cx.body(),
@@ -2044,6 +2046,7 @@ impl<'a> Fcx<'a> {
             }
         }
         self.record_stalled_coroutine_goals();
+        self.visit_potentially_region_dependent_goals();
         self.detect_opaque_types_added_during_writeback();
     }
 
@@ -5934,7 +5937,11 @@ impl<'a> Fcx<'a> {
             ExprKind::Mac(m) => self.check_mac(e, self.ast().row(*m), expected, lo),
             ExprKind::Try(x) => self.check_try(e, *x, lo),
             ExprKind::Async(mode, b) => self.check_async_block(e, *mode, *b),
-            ExprKind::Await(x) => self.check_await(*x, lo),
+            ExprKind::Await(x) => {
+                let out = self.check_await(*x, lo);
+                self.check_await_coerces(out, expected, lo);
+                out
+            }
             ExprKind::Yield(_) | ExprKind::Box(_) => {
                 self.err(lo, "unsupported expression (yield, box)".to_string());
                 error
@@ -6747,6 +6754,21 @@ impl<'a> Fcx<'a> {
 
     /// `x.await`: `IntoFuture::into_future(x)` polled to completion; its type is
     /// `<X as IntoFuture>::Output` (rustc lowering of `.await`, Reference await-expr.md).
+    /// rustc lowers `e.await` to a loop whose `break result` coerces to the loop's expected type
+    /// (check_expr_loop: `coerce_to = expected.coercion_target_type`): an output that cannot coerce to
+    /// the type the context demands is E0308 there, before any coercion of the context.
+    fn check_await_coerces(&mut self, out: TyId, expected: Option<TyId>, lo: u32) {
+        let Some(t) = expected else { return };
+        // (diagnostics only: the crates whose errors are reported)
+        if out == self.tcx.tys.error || !self.tcx.validates(self.prog, self.file) { return; }
+        let snap = self.start_snapshot();
+        let n_dd = self.deferred_dyn.len();
+        let ok = self.coerce(out, t, None, lo, false).is_some();
+        self.rollback_to(snap);
+        self.deferred_dyn.truncate(n_dd);
+        if !ok { self.coerce_or_unify(out, t, None, lo); }
+    }
+
     fn check_await(&mut self, x: ExprId, lo: u32) -> TyId {
         let t = self.check_expr(x, None);
         if self.async_depth == 0 {
@@ -7428,6 +7450,25 @@ impl<'a> Fcx<'a> {
             goals.push((Goal { param_env: obligation.goal.param_env, predicate }, obligation.cause.span));
         }
         self.tcx.coroutine_stalled_predicates.lock().unwrap_or_else(|e| e.into_inner()).insert(self.b.def, goals);
+    }
+
+    /// writeback.rs visit_potentially_region_dependent_goals: the goals recorded while type-checking, resolved and
+    /// with their regions erased, for the borrow check of this body (only recorded for checked crates).
+    fn visit_potentially_region_dependent_goals(&mut self) {
+        let obligations = self.infcx.take_hir_typeck_potentially_region_dependent_goals();
+        if obligations.is_empty() || !self.b.errors.is_empty() || self.infcx.tainted_by_errors() { return; }
+        let mut resolver = crate::infer::resolve::DeepVariableResolver::new(&self.infcx);
+        let mut goals: Vec<(Goal, u32)> = Vec::new();
+        let mut seen: crate::fxhash::HashSet<Goal> = Default::default();
+        for obligation in obligations {
+            let predicate = crate::next_solver::fold::fold_predicate(&self.tcx.tys, &obligation.goal.predicate, &mut resolver);
+            // (an inference variable left after writeback: rustc's delayed bug)
+            if predicate.flags(&self.tcx.tys) & crate::types::TypeFlags::HAS_NON_REGION_INFER.bits() != 0 { continue; }
+            let predicate = crate::next_solver::fold::fold_predicate(&self.tcx.tys, &predicate, &mut EraseFreeRegions);
+            let goal = Goal { param_env: obligation.goal.param_env, predicate };
+            if seen.insert(goal.clone()) { goals.push((goal, obligation.cause.span)); }
+        }
+        self.tcx.potentially_region_dependent_goals.lock().unwrap_or_else(|e| e.into_inner()).insert(self.b.def, goals);
     }
 
     fn register_goal(&mut self, goal: Goal, lo: u32) {
