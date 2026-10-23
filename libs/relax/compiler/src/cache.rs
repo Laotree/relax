@@ -258,6 +258,9 @@ pub fn mode_from_env(options: &crate::options::Options) -> Option<Mode> {
 
 #[derive(Default, Debug, Clone)]
 pub struct CacheStats {
+    /// replacing records: [without a stored entry (the startup image is written again), moving the
+    /// slot's tier up (counted like stale image slots)]
+    pub rewrite_why: [u64; 2],
     pub hits: u64,
     pub misses: u64,
     pub link_fail: u64,
@@ -1021,10 +1024,7 @@ impl Cache {
     fn entry_tier(&self, key: u128) -> Option<u8> {
         let (kind, p) = self.get(key)?;
         if kind != KIND_CODE { return None; }
-        let mut d = D { b: p, p: 0 };
-        if d.u32()? != ENTRY_VERSION { return None; }
-        d.str()?;
-        d.u8()
+        payload_tier(p)
     }
 
     fn get(&self, key: u128) -> Option<(u32, &[u8])> {
@@ -2339,8 +2339,19 @@ impl Cache {
             return;
         }
         self.pending_keys.insert(key);
+        // a replacement without a stored entry makes the startup image be written again; one that
+        // moves its slot's tier up (O1 -> O2/O3) counts like a stale image slot (record_manifest:
+        // rewritten past 2%); an O3 payload replacing an O3 entry neither (PGO-driven O3 code
+        // differs run to run; every warm run rewrote the whole image)
         if replace && (existing || self.linked.contains(&id)) {
-            self.image_rewrite = true;
+            match self.entry_tier(key) {
+                None => {
+                    self.image_rewrite = true;
+                    self.stats.rewrite_why[0] += 1;
+                }
+                Some(old) if payload_tier(&payload).is_some_and(|new| tier_rank(new) > tier_rank(old)) => self.stats.rewrite_why[1] += 1,
+                Some(_) => {}
+            }
         }
         let kc = self.cur_crate;
         self.push_pending(kc, NewEntry { key, kind: KIND_CODE, payload });
@@ -2733,7 +2744,7 @@ impl Cache {
             }
         }
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
-        if self.mode == Mode::ReadOnly || order.is_empty() || (self.manifest_done && !self.image_rewrite) {
+        if self.mode == Mode::ReadOnly || order.is_empty() || (self.manifest_done && !self.image_rewrite && self.stats.rewrite_why[1] as usize * 50 <= self.image_slots) {
             return true;
         }
         // at exit the slots' keys can no longer be made: after the mid-run manifest the exit
@@ -2744,6 +2755,8 @@ impl Cache {
             return true;
         }
         let Some(key) = self.manifest_key(root) else { self.manifest_done = true; return true };
+        // what earlier spills of this run wrote: the image takes those entries too
+        self.index_written();
         let mut list: Vec<(Vec<u8>, u128)> = Vec::with_capacity(order.len());
         let mut before_present = 0;
         let mut present_ids = Vec::new();
@@ -2767,10 +2780,14 @@ impl Cache {
         // the same start as before (within 2%), the loaded manifest still valid and its image
         // current (within 2%, and covering all but 2% of its cached slots): no new one
         let image_current = !self.image_rewrite
-            && (self.image_slots == 0 || (self.image_stale * 50 <= self.image_slots && self.image_slots * 50 >= self.manifest_present_cached * 49));
+            && (self.image_slots == 0 || ((self.image_stale + self.stats.rewrite_why[1] as usize) * 50 <= self.image_slots && self.image_slots * 50 >= self.manifest_present_cached * 49));
         if self.startup_manifest_valid() && new * 50 <= list.len() && image_current {
             self.manifest_done = true;
             return true;
+        }
+        if self.verbose {
+            eprintln!("makepad-run cache: startup manifest rewritten: valid {} (missing {}), {} new of {}, image rewrite {} (replacements without a stored entry {}, tier-ups {}), image slots {} stale {} cached at present {}",
+                self.startup_manifest_valid(), self.manifest_missing, new, list.len(), self.image_rewrite, self.stats.rewrite_why[0], self.stats.rewrite_why[1], self.image_slots, self.image_stale, self.manifest_present_cached);
         }
         let img = if self.mode != Mode::Verify && !self.image_bad {
             match self.build_image(u, &present_ids, stop) { Err(()) => return false, Ok(img) => img }
@@ -2937,6 +2954,7 @@ impl Spill {
         pack::ensure_private_dir(&self.dir)?;
         let mut n = 0;
         for (path, stale, mut entries) in self.files {
+            let code: Vec<u128> = entries.iter().filter(|e| e.kind == KIND_CODE || e.kind == KIND_DATA).map(|e| e.key).collect();
             let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let cname = name.rsplit_once('-').map_or("", |x| x.0).to_string();
             let mut e = E::default();
@@ -2951,9 +2969,72 @@ impl Spill {
             n += entries.len();
             entries.insert(0, NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload: e.0 }.into());
             append_store(&path, entries, stale, &self.marks)?;
+            if !code.is_empty() {
+                // the list outlives the compiler zone (a settle swap destroys it): kept heap
+                let mut w = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+                crate::zone_alloc::kept_with(|| w.push((self.dir.clone(), path.clone(), code.clone())));
+            }
         }
         Ok(n)
     }
+}
+
+/// Code and data entries this run's spills wrote, by store file (cache dir, store, keys): the
+/// owning cache indexes them (`Cache::index_written`) so the startup image is built from every code
+/// entry the store has, not only the ones still pending. A cold run's first mid-run write spills
+/// its code before the manifest window closes: its image covered 23-392 of ~45k slots, and the
+/// first warm run rewrote the whole image (~435 ms on the owner) and started unprelinked.
+static WRITTEN: relax_session::sync::Mutex<Vec<(PathBuf, PathBuf, Vec<u128>)>> = relax_session::sync::Mutex::new(Vec::new());
+
+impl Cache {
+    /// Indexes the code and data entries this run's spills wrote to this cache's stores
+    /// (WRITTEN): the store file is opened again (mapped) and its new entries replace what the
+    /// index had for their keys, as the file's own index does.
+    fn index_written(&mut self) {
+        let mine: Vec<(PathBuf, Vec<u128>)> = {
+            let mut w = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+            // (what stays is another cache's, kept as it was: the list lives in the kept heap)
+            let mut mine = Vec::new();
+            let mut i = 0;
+            while i < w.len() {
+                if w[i].0 == self.dir {
+                    let (_, path, keys) = &w[i];
+                    mine.push((path.clone(), keys.clone()));
+                    crate::zone_alloc::kept_with(|| drop(w.swap_remove(i)));
+                } else {
+                    i += 1;
+                }
+            }
+            mine
+        };
+        for (path, keys) in mine {
+            let Some(st) = Store::open(&path) else { continue };
+            let keys: HashSet<u128> = keys.into_iter().collect();
+            let si = self.stores.len() as u32;
+            let mut n = 0;
+            for (e, ix) in st.index.iter().enumerate() {
+                let key = ix.key;
+                if keys.contains(&key) {
+                    self.index.insert(key, (si, e as u32));
+                    n += 1;
+                }
+            }
+            if n != 0 { self.stores.push(std::sync::Arc::new(st)); }
+        }
+    }
+}
+
+/// A stored tier's order (the tier bytes are not in tier order): baseline < O1 < O2 < O3.
+fn tier_rank(t: u8) -> u8 {
+    match t { TIER_BASE => 0, TIER_O1 => 1, TIER_O2 => 2, TIER_O3 => 3, _ => 0 }
+}
+
+/// A code entry payload's tier byte.
+fn payload_tier(p: &[u8]) -> Option<u8> {
+    let mut d = D { b: p, p: 0 };
+    if d.u32()? != ENTRY_VERSION { return None; }
+    d.str()?;
+    d.u8()
 }
 
 /// Whether a pack's recorded late macro inputs (include!/env! contents) still have the same
@@ -5451,6 +5532,9 @@ mod cold_tests {
         again.loaded_in(&mut prog, 2, dir.clone());
         assert_fingerprints(&again, &prog);
         assert!(again.pending.is_empty());
+        // its writers write the three records again; they finish before the folder goes
+        again.finish_in(&mut prog, dir.clone());
+        assert_eq!(again.records, 3);
         // Repeated completion/finalization must not write a crate's record twice.
         cold.loaded_in(&mut prog, 0, dir.clone());
         cold.finish_in(&mut prog, dir.clone());
