@@ -194,7 +194,6 @@ struct Jit {
     origin: u8,
 }
 
-#[derive(Clone, Copy)]
 /// A UI frame's summary (timeline's frame watch): its span, the idle gaps in it, its lazy
 /// compiles, its waits (of them on the owner) and the waits made inside the lazy compiles (of
 /// them on the owner: compile and wait times overlap by these).
