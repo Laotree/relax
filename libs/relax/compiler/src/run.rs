@@ -2679,7 +2679,8 @@ pub(crate) fn preserve_collected_boot(u: &mut jit::Unit) {
 }
 /// The boot collected entry this run wrote mid-run (not one a warm restore mapped): the
 /// settle makes the program's tables views of it (adopt_collected_tables).
-static COLLECTED_WRITTEN: relax_session::sync::Mutex<Option<crate::cache::CollectedWritten>> = relax_session::sync::Mutex::new(None);
+/// Boxed (kept heap) for the same reason as zone_swap's IMAGE: no inline payload left behind by a `None`.
+static COLLECTED_WRITTEN: relax_session::sync::Mutex<Option<Box<crate::cache::CollectedWritten>>> = relax_session::sync::Mutex::new(None);
 
 /// A cold run holds what a warm run maps: once the collected image is written and the program
 /// is quiet, the heap tables it was encoded from become views of it, decoded entry by entry on
@@ -2688,7 +2689,7 @@ static COLLECTED_WRITTEN: relax_session::sync::Mutex<Option<crate::cache::Collec
 fn adopt_collected_tables() -> bool {
     let up = unsafe { RUN_UNIT };
     if up.is_null() { return true; }
-    let Some(written) = COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return true };
+    let Some(written) = COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_deref().cloned() else { return true };
     let mut retired: Vec<Box<dyn Send>> = Vec::new();
     let mut notes: Vec<(&'static str, crate::collected::Adopt)> = Vec::new();
     let before = crate::memstat::live_total();
@@ -3014,7 +3015,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             if let Some((report, dest, payload)) = ready {
                 if let Some(written) = crate::cache::Cache::commit_collected(report, dest, payload) {
                     COLLECTED_CURRENT.store(true, Ordering::Relaxed);
-                    crate::zone_alloc::kept_with(|| *COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(written.clone()));
+                    crate::zone_alloc::kept_with(|| *COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(written.clone())));
                     let retired_boot = crate::owner::call(crate::owner::Class::Program, || unsafe { &mut *up }.cache.as_mut().map(|c| c.finish_collected()));
                     drop(retired_boot);
                 }
@@ -3292,7 +3293,7 @@ fn summary_inner(why: &str) {
         let q = jit::TIER_QUEUED.load(Ordering::Relaxed);
         if q > 0 {
             verbose!(
-                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); snapshots {:.0} ms cpu on the owner ({} inline candidates built there, {:.0} ms; {} fronts off it, {:.0} ms cpu; {} optimised off it, {:.0} ms cpu), back ends {:.0} ms cpu off it; bottom-up preparation {:.0} ms cpu ({} bodies simplified, {} kept, {} shared, {} of the simplified had disagreeing shared ones: body {} attrs {} presence {} preparation {} single {}); {} code bytes",
+                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); snapshots {:.0} ms cpu on the owner (root {:.0}, candidates {:.0}, take tails {:.0}, singles + counts {:.0} ms; callee scans {:.0}, assembly {:.0} ms off it; {} inline candidates built there, {:.0} ms; {} fronts off it, {:.0} ms cpu; {} optimised off it, {:.0} ms cpu), back ends {:.0} ms cpu off it; bottom-up preparation {:.0} ms cpu ({} bodies simplified, {} kept, {} shared, {} of the simplified had disagreeing shared ones: body {} attrs {} presence {} preparation {} single {}); {} code bytes",
                 jit::ahead_level().name(),
                 q,
                 jit::TIER_REVALIDATED.load(Ordering::Relaxed),
@@ -3303,6 +3304,12 @@ fn summary_inner(why: &str) {
                 jit::TIER1_RIR_REBUILT[0].load(Ordering::Relaxed),
                 jit::TIER1_RIR_REBUILT[1].load(Ordering::Relaxed) as f64 / 1e6,
                 s.tier1_locked_ns as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[0].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[1].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[3].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[4].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[2].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[5].load(Ordering::Relaxed) as f64 / 1e6,
                 jit::TIER1_SNAP_BUILT[0].load(Ordering::Relaxed),
                 jit::TIER1_SNAP_BUILT[1].load(Ordering::Relaxed) as f64 / 1e6,
                 jit::TIER1_SNAP_FRONTS[0].load(Ordering::Relaxed),

@@ -122,7 +122,9 @@ impl FrontImages {
             Some(graph) => (graph, pre.len()),
             None => {
                 stale = read_front_graph(&self.dir, GraphRecipe::new(pre).identity)?;
-                if !session.options.source_eager && session.options.rs_lazy {
+                // (not for the swap's restore ahead of its pause: a whole program is restored, and
+                // the plan's worker thread would write the running generation's statics)
+                if !session.options.source_eager && session.options.rs_lazy && !relax_session::phase::ahead() {
                     // Restore the immutable Program/Tcx while the demand worker
                     // computes the new selection. Nothing is retained or exposed
                     // to collection until that selection has been validated.
@@ -150,8 +152,7 @@ impl FrontImages {
         let at = st.index.binary_search_by(|e| { let k = e.key; k.cmp(&key(graph.identity)) }).ok()?;
         let (kind, bytes) = st.get_at(at, key(graph.identity))?;
         if kind != KIND_COLLECTED { return None; }
-        FRONT_STORES.lock().unwrap_or_else(|e| e.into_inner()).push(st.clone());
-        FRONT_USED.lock().unwrap_or_else(|e| e.into_inner()).push((st.clone(), at));
+        pin_front(&st, Some(at));
         // The checked, immutable mapping is pinned for the Program's mapped definition arena.
         let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
         let image = crate::image::Reader::new(bytes)?;
@@ -285,8 +286,7 @@ impl FrontImages {
         let ix = st.index[at];
         if { ix.len } != written.len || { ix.sum } != written.sum || { ix.kind } != KIND_COLLECTED { return None; }
         let (_, bytes) = st.get_at(at, written.key)?;
-        FRONT_STORES.lock().unwrap_or_else(|e| e.into_inner()).push(st.clone());
-        FRONT_USED.lock().unwrap_or_else(|e| e.into_inner()).push((st.clone(), at));
+        pin_front(&st, Some(at));
         let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
         let image = crate::image::Reader::new(bytes)?;
         let recipe = GraphRecipe::new(pre);
@@ -628,8 +628,7 @@ impl Cache {
         if { ix.len } != written.len || { ix.sum } != written.sum || { ix.kind } != KIND_COLLECTED { return None; }
         let (_, bytes) = st.get_at(at, written.key)?;
         // the mapping is pinned for the rest of the process: the tables point into it
-        FRONT_STORES.lock().unwrap_or_else(|e| e.into_inner()).push(st.clone());
-        FRONT_USED.lock().unwrap_or_else(|e| e.into_inner()).push((st.clone(), at));
+        pin_front(&st, Some(at));
         let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
         let image = crate::image::Reader::new(bytes)?;
         if image.len() != 6 { return None; }
