@@ -9909,12 +9909,11 @@ fn opt_pipeline_inner(options: &crate::options::Options, func: &mut relax_backen
 const BIG_SLOT: u32 = 4096;
 
 /// MAKEPAD_RUN_VERIFY_PASSES=1: verify the RIR after every pass (names the pass that broke it).
+/// Fatal: a broken function panics with the pass's name (an ICE for the build: the body is
+/// never compiled from broken RIR). The gates' diff_fast legs turn it on.
 fn verify_pass(func: &relax_backend::rir::Func, pass: &str) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_VERIFY_PASSES").is_ok()) {
-        if let Err(e) = func.verify() {
-            eprintln!("makepad: RIR broken by {}: {}\n{}", pass, e, func.dump());
-        }
+    if let Err(e) = func.verify_after(pass) {
+        panic!("makepad: {}\n{}", e, func.dump());
     }
 }
 
@@ -13977,6 +13976,7 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
         if let Some(g) = &gctx {
             crate::guards::probe(g, &mut func);
         }
+        func.verify_after("profile::instrument / guards::probe")?;
         let cg = tier0_codegen_rir(options, &func, fold, layout);
         relax_codegen::native::compile(options, &cg, &env).map(|c| {
             dump_o1(&cg, &c);
