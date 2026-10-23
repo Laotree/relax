@@ -254,7 +254,8 @@ fn top_level_as(inner: &str) -> bool {
 /// and rustc's `<T>::m` as `T::m`, the JIT's `{closure} in f` as rustc's `f::{closure#k}`, every
 /// closure as `{closure}`, Relax's `__relax_crate_core` as `core`.
 pub(crate) fn match_segs(n: &str) -> Vec<String> {
-    let n = n.trim().trim_start_matches("::");
+    // a SPEC-V twin is its fn's code
+    let n = n.trim().trim_end_matches(" [unverified]").trim_start_matches("::");
     if let Some(rest) = n.strip_prefix("{closure").and_then(|r| r.find("} in ").map(|k| &r[k + 5..])) {
         let mut v = match_segs(rest);
         v.push("{closure}".into());
@@ -1602,6 +1603,7 @@ mod tests {
         assert_eq!(match_key("{closure} in makepad_sandbox::app_main"), "makepad_sandbox::app_main::{closure}");
         assert_eq!(match_segs("<makepad_platform::cx::Cx>::hal_pump_events")[0], "makepad_platform");
         assert_ne!(match_key("a::Foo::new"), match_key("a::Bar::new"));
+        assert_eq!(match_key("makepad_render::clustered::ClusteredLights::build [unverified]"), "ClusteredLights::build");
     }
 
     #[test]
