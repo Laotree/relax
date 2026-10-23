@@ -171,6 +171,18 @@ pub fn carry_epoch(src: usize, from: u64, to: u64, keep: &dyn Fn(DefId) -> bool)
     q.pending_order.retain(|k| k.0 != src || keep(k.1));
 }
 
+/// The program behind `src` was rebuilt unchanged (the settle rebuild: a restored program and
+/// type context, identical to the running ones) and moved from collect epoch `from` to `to`:
+/// every verdict, queued check and the discovery pass stay as they are. Front-end write lock
+/// held (no check is running).
+pub fn carry_whole(src: usize, from: u64, to: u64) {
+    let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(q) = guard.as_mut() else { return };
+    let base = q.canon(src, from);
+    if from == to || q.epoch.get(&src) != Some(&base) { return; }
+    q.alias.insert((src, to), base);
+}
+
 /// A source of the program / type context for the worker (the unit's shared front end).
 pub trait FrontSource: Send + Sync {
     /// Wait for the runner to admit background checking (once, before any work).

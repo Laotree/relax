@@ -1460,7 +1460,7 @@ pub(crate) fn crates_seeing_edit(prog: &crate::program::Program, files: impl Ite
 /// instead of re-checking the whole program (borrowck::lazy::carry_epoch). Front-end write
 /// lock held (on the owner thread).
 fn carry_gandalf(u: &Unit, from: u64, visible: &[bool], files: Option<&[u32]>) {
-    let src = std::sync::Arc::as_ptr(&u.front) as usize;
+    let src = u.front.checker_id;
     let prog = &u.prog;
     crate::borrowck::lazy::carry_epoch(src, from, u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), &|d: DefId| {
         if let Some(files) = files { !files.contains(&prog.def(d).file) }

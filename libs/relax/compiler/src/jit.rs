@@ -5809,7 +5809,7 @@ impl Unit {
             FnKey::Inst(d, args) => {
                 if !crate::borrowck::event::admit(&self.prog, self.prog.def(*d).krate) || crate::borrowck::body::CheckedBody::item(&self.prog, *d).is_none() { return Verdict::Clean; }
                 let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
-                let pending = match crate::borrowck::lazy::verdict(std::sync::Arc::as_ptr(&self.front) as usize, *d, args, epoch) {
+                let pending = match crate::borrowck::lazy::verdict(self.front.checker_id, *d, args, epoch) {
                     FnVerdict::Clean => return Verdict::Clean,
                     FnVerdict::Errors(events) => return Verdict::Failed(events),
                     FnVerdict::Pending => Verdict::Pending,
@@ -5855,7 +5855,7 @@ impl Unit {
         match &self.fns[id as usize].key {
             FnKey::Inst(d, _) => {
                 let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
-                crate::borrowck::lazy::disjoint_checks(std::sync::Arc::as_ptr(&self.front) as usize, *d, epoch)
+                crate::borrowck::lazy::disjoint_checks(self.front.checker_id, *d, epoch)
             }
             FnKey::Closure(_, _, parent) => self.disjoint_checks(*parent),
             _ => None,
@@ -13097,7 +13097,7 @@ unsafe fn prioritize_verdicts(up: *mut Unit, ids: &[u32]) {
     let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
     let ranks: Vec<(DefId, Vec<TyId>, u32)> = ids.iter().filter_map(|&c| Some((u.verdict_owner(c)?, Vec::new(), 0))).collect();
     if !ranks.is_empty() {
-        crate::borrowck::lazy::set_ranks(std::sync::Arc::as_ptr(&u.front) as usize, epoch, &ranks);
+        crate::borrowck::lazy::set_ranks(u.front.checker_id, epoch, &ranks);
     }
 }
 
@@ -18850,6 +18850,13 @@ mod front_ptrs {
 
 pub struct FrontShared {
     census_id: usize,
+    /// The background borrow checker's name for this unit's front end (lazy::FrontSource::identity:
+    /// its verdicts, queue and epochs are keyed by it). The settle rebuild hands it to the front
+    /// state it makes, as it does census_id: the program is the same one (settle_rebuild::compare),
+    /// so the verdicts reached and the checks queued before the rebuild stay this unit's. (Keyed by
+    /// the front's address, every verdict was lost at the rebuild -- the SIMD wrappers of a fractal
+    /// kernel stayed unverified, and out of their verified caller, for the rest of the run.)
+    pub(crate) checker_id: usize,
     session: std::sync::Arc<crate::Session>,
     /// the unit's program and type context: read only through a front read (`FrontRead::of`)
     ptrs: front_ptrs::FrontPtrs,
@@ -18942,6 +18949,10 @@ impl FrontShared {
         let options = &sess.options;
         FrontShared {
             census_id: relax_codegen::exec_census::new_unit(),
+            checker_id: {
+                static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            },
             session: sess.clone(),
             ptrs: front_ptrs::FrontPtrs::default(),
             unit: Default::default(),
@@ -20198,7 +20209,7 @@ impl crate::borrowck::lazy::FrontSource for BorrowckFront {
         }
     }
     fn identity(&self) -> usize {
-        std::sync::Arc::as_ptr(&self.0) as usize
+        self.0.checker_id
     }
     fn with_front(&self, f: &mut dyn FnMut(&Program, &Tcx, &crate::tcx::EvalCx<'_>)) -> bool {
         let _job = compile_job();
