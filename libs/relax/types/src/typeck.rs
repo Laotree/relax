@@ -5937,7 +5937,11 @@ impl<'a> Fcx<'a> {
             ExprKind::Mac(m) => self.check_mac(e, self.ast().row(*m), expected, lo),
             ExprKind::Try(x) => self.check_try(e, *x, lo),
             ExprKind::Async(mode, b) => self.check_async_block(e, *mode, *b),
-            ExprKind::Await(x) => self.check_await(*x, lo),
+            ExprKind::Await(x) => {
+                let out = self.check_await(*x, lo);
+                self.check_await_coerces(out, expected, lo);
+                out
+            }
             ExprKind::Yield(_) | ExprKind::Box(_) => {
                 self.err(lo, "unsupported expression (yield, box)".to_string());
                 error
@@ -6750,6 +6754,21 @@ impl<'a> Fcx<'a> {
 
     /// `x.await`: `IntoFuture::into_future(x)` polled to completion; its type is
     /// `<X as IntoFuture>::Output` (rustc lowering of `.await`, Reference await-expr.md).
+    /// rustc lowers `e.await` to a loop whose `break result` coerces to the loop's expected type
+    /// (check_expr_loop: `coerce_to = expected.coercion_target_type`): an output that cannot coerce to
+    /// the type the context demands is E0308 there, before any coercion of the context.
+    fn check_await_coerces(&mut self, out: TyId, expected: Option<TyId>, lo: u32) {
+        let Some(t) = expected else { return };
+        // (diagnostics only: the crates whose errors are reported)
+        if out == self.tcx.tys.error || !self.tcx.validates(self.prog, self.file) { return; }
+        let snap = self.start_snapshot();
+        let n_dd = self.deferred_dyn.len();
+        let ok = self.coerce(out, t, None, lo, false).is_some();
+        self.rollback_to(snap);
+        self.deferred_dyn.truncate(n_dd);
+        if !ok { self.coerce_or_unify(out, t, None, lo); }
+    }
+
     fn check_await(&mut self, x: ExprId, lo: u32) -> TyId {
         let t = self.check_expr(x, None);
         if self.async_depth == 0 {
