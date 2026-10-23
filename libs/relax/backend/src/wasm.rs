@@ -125,7 +125,7 @@ pub enum Builtin {
 
 /// What the link step tells the backend about the symbols code names.
 pub trait Link {
-    /// the value of symbol `id` as `Inst::Addr` / `Inst::TlsAddr` use it (a linear-memory
+    /// the value of symbol `id` as `Inst::Addr`, `Inst::TlsAddr` or `Inst::TlsStatic` use it (a linear-memory
     /// address or a plain number; the backend adds `Sym::off`)
     fn sym(&self, id: u32) -> u64;
     /// how a call to host symbol `id` is bound
@@ -199,6 +199,8 @@ pub struct Stats {
     /// functions whose body could not be lowered (id, why): they trap
     pub failed: Vec<(u32, String)>,
     pub untraced_sites: usize,
+    /// (caller slot, target slot) for each untraced call encountered while lowering.
+    pub untraced_calls: Vec<(u32, u32)>,
     /// function bodies folded into an identical one
     pub n_folded: usize,
     /// (slot id, function name, body bytes) of every chosen function
@@ -263,7 +265,7 @@ struct Shared {
     table: Vec<Option<FRef>>,
     table_ix: HashMap<u32, u32>,
     untraced_entry: Option<u32>,
-    untraced_sites: usize,
+    untraced_targets: Vec<u32>,
     uses_tag: bool,
     uses_table: bool,
     /// the thread-local key table (Builtin::Key*)
@@ -334,7 +336,7 @@ impl<'a> Module<'a> {
                 table: vec![None],
                 table_ix: HashMap::new(),
                 untraced_entry: None,
-                untraced_sites: 0,
+                untraced_targets: Vec::new(),
                 uses_tag: false,
                 uses_table: false,
                 keys_base: 0,
@@ -399,9 +401,12 @@ impl<'a> Module<'a> {
         // user function types first (their indices are needed by every call)
         let mut bodies: Vec<Body> = Vec::with_capacity(self.funcs.len());
         let mut failed = Vec::new();
+        let mut untraced_calls = Vec::new();
         let funcs = std::mem::take(&mut self.funcs);
         for (id, f) in &funcs {
+            let first = self.sh.untraced_targets.len();
             let r = lower_func(&opts, options, f, &self.fn_ix, &funcs, link, &mut self.sh);
+            untraced_calls.extend(self.sh.untraced_targets[first..].iter().map(|target| (*id, *target)));
             match r {
                 Ok(b) => bodies.push(b),
                 Err(e) => {
@@ -753,7 +758,8 @@ impl<'a> Module<'a> {
         st.n_types = tord.len();
         st.n_imports = ni;
         st.failed = failed;
-        st.untraced_sites = self.sh.untraced_sites;
+        st.untraced_sites = untraced_calls.len();
+        st.untraced_calls = untraced_calls;
         // a folded copy emits no body: 0 bytes
         st.fn_sizes = funcs.iter().zip(bodies.iter()).enumerate().map(|(k, ((id, f), b))| (*id, f.name.clone(), if canon[ni + k] == ni + k { b.bytes.len() } else { 0 })).collect();
         Output { bytes: out, stats: st }
@@ -1447,7 +1453,7 @@ impl<'a> Fx<'a> {
                 }
                 let d = match x {
                     Inst::Iconst(d, k) if self.o.remat && small(*k) => *d,
-                    Inst::Addr(d, s) | Inst::TlsAddr(d, s) if self.o.remat && small(self.link.sym(s.id).wrapping_add(s.off as u64) as i64) => *d,
+                    Inst::Addr(d, s) | Inst::TlsAddr(d, s) | Inst::TlsStatic(d, s) if self.o.remat && small(self.link.sym(s.id).wrapping_add(s.off as u64) as i64) => *d,
                     Inst::SlotAddr(d, _) if self.o.remat_slots && self.uses[d.0 as usize] <= 2 * base_uses[d.0 as usize] + 1 => *d,
                     _ => continue,
                 };
@@ -2260,7 +2266,7 @@ impl<'a> Fx<'a> {
                 }
                 self.from_nat(want)
             }
-            Inst::Addr(_, s) | Inst::TlsAddr(_, s) => {
+            Inst::Addr(_, s) | Inst::TlsAddr(_, s) | Inst::TlsStatic(_, s) => {
                 let v = self.sym_val(*s);
                 if let Want::Addr(off) = want {
                     let a = v.wrapping_add(off);
@@ -2570,7 +2576,7 @@ impl<'a> Fx<'a> {
                     let want = sig(self)?;
                     let have = func_type(self.funcs[u as usize].1)?;
                     if want != have {
-                        return Err(format!("call of slot {} with a signature unlike its body's", id));
+                        return Err(format!("call of slot {} ({}) with a signature unlike its body's: call {:?}, body {:?}", id, self.funcs[u as usize].1.name, want, have));
                     }
                     push_args(self)?;
                     self.call(FRef::User(u));
@@ -2621,7 +2627,7 @@ impl<'a> Fx<'a> {
     }
 
     fn untraced(&mut self, id: u32) {
-        self.sh.untraced_sites += 1;
+        self.sh.untraced_targets.push(id);
         if self.o.untraced_import {
             self.i32c(id as i32);
             self.helper(Helper::Untraced);

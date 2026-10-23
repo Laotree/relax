@@ -490,6 +490,8 @@ pub struct Unit {
     pub(crate) hot_entry: u64,
     /// state the type checks ahead share with this unit (no owner thread call needed to reach it)
     pub front: std::sync::Arc<FrontShared>,
+    /// Unique export namespace; unit addresses and function slots can be reused.
+    pub wasm_export_id: usize,
     /// Instantiated const-fn bodies retained by the data evaluator at their declaration epoch.
     pub ctfe_fn_bodies: relax_session::sync::Mutex<crate::fxhash::HashMap<(DefId, Vec<TyId>), (u64, std::sync::Arc<Body>)>>,
 
@@ -2810,6 +2812,7 @@ impl Unit {
             frequency_profiles: HashMap::new(),
             hot_entry: 0,
             front: std::sync::Arc::new(FrontShared::new(&sess)),
+            wasm_export_id: crate::wasm_export::new_unit(),
             ctfe_fn_bodies: Default::default(),
             self_ptr: UnitPtr(std::ptr::null_mut()),
         };
@@ -4439,6 +4442,15 @@ impl Unit {
             relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) | relax_backend::rir::Inst::FnAddr(_, c) => Some(*c),
             _ => None,
         }).collect::<Vec<_>>().into_boxed_slice();
+        // SPEC-V: calls to twins its lowering did not make (in bodies it inlined) are recorded as
+        // the lowering's are, so a twin's install finds every caller in TWIN_USERS (twin_callers)
+        if func.plain_calls {
+            for &c in refs.iter() {
+                if c != id && matches!(self.fns[c as usize].key, FnKey::Plain(_)) {
+                    note_twin_user(self, id, c);
+                }
+            }
+        }
         let old = std::mem::replace(&mut self.fns[id as usize].rir_refs, refs);
         for c in old {
             let n = &mut self.fns[c as usize].refs;
@@ -6752,7 +6764,7 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
     main_rec(|r| r.cpu[0] += t0 - tb);
     let rir = twin_func.as_ref().unwrap_or_else(|| u.fns[id as usize].rir.as_ref().unwrap());
     let cg = tier0_codegen_rir(options, rir, u.opt.fold, u.opt.layout);
-    crate::wasm_export::capture(id, &cg);
+    crate::wasm_export::capture(u.wasm_export_id, id, &cg);
     let cg = with_loop_counters(cg, loop_syms(u, id));
     let func = &cg;
     // without O3 these are the only compiles: allocate thoroughly
@@ -7670,12 +7682,13 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class, near: e.near };
     let (fold, layout) = (u.opt.fold, u.opt.layout);
     let lc = loop_syms(u, id);
-    Some(O2Work { id, prep, epoch, snapshot, session, env, fold, layout, lc, t0 })
+    Some(O2Work { id, capture_unit: u.wasm_export_id, prep, epoch, snapshot, session, env, fold, layout, lc, t0 })
 }
 
 /// An O2 build's optimisation and code generation (no unit state).
 struct O2Work {
     id: u32,
+    capture_unit: usize,
     prep: Prep,
     epoch: u64,
     snapshot: bool,
@@ -7699,13 +7712,13 @@ struct O2Done {
 
 impl O2Work {
     fn run(self) -> O2Done {
-        let O2Work { id, prep, epoch, snapshot, session, env, fold, layout, lc, t0 } = self;
+        let O2Work { id, capture_unit, prep, epoch, snapshot, session, env, fold, layout, lc, t0 } = self;
         let options = &session.options;
         let mut done: Vec<Deferred> = Vec::new();
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let (func, inlined) = optimize_tree(options, id, prep, &mut done)?;
             let cg = tier0_codegen_rir(options, &func, fold, layout);
-            crate::wasm_export::capture(id, &cg);
+            crate::wasm_export::capture(capture_unit, id, &cg);
             let cg = with_loop_counters(cg, lc);
             let _scratch = crate::zone_alloc::scratch(&session.runtime);
             let c = relax_codegen::native::compile(options, &cg, &env)?;
@@ -8492,11 +8505,14 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
         crate::options::Tier0Baseline::Always => true,
     };
     let from_ahead = lowered.is_none();
+    if owner::bailing() { O3_OWNER[20].fetch_add(1, Ordering::Relaxed); }
     let r = match lowered {
         Some(f) => Ok(f),
         None => {
             let prev = PREP_LOWER.with(|p| p.replace(true));
+            let tl = if owner::bailing() { cpu_ns() } else { 0 };
             let r = build_rir_inner(up, id);
+            if tl != 0 { o3_owner(19, tl); }
             PREP_LOWER.with(|p| p.set(prev));
             r
         }
@@ -11224,6 +11240,7 @@ fn dump_o1(func: &relax_backend::rir::Func, c: &x64::Compiled) {
     if let Some(base) = dump_base(&func.name) {
         let _ = std::fs::write(format!("{}.bin", base), &c.code[..c.text_len as usize]);
         let _ = std::fs::write(format!("{}.rir", base), func.dump());
+        let _ = std::fs::write(format!("{}.emit.rir", base), &c.rir_emitted);
         let (at, end) = relax_backend::frame::slot_layout(func, 0, true);
         let mut m = format!("frame {} slot-area {} of {}\n", c.frame_size, end, slot_bytes(func));
         for (k, sl) in func.slots.iter().enumerate() {
@@ -12381,7 +12398,7 @@ pub fn sweep_verdicts() {
         let Some(up) = live() else { return };
         let u = &*up;
         // ... and the ones whose unverified lowering calls hot twins
-        let mut tc = twin_callers(u, Some(&verified), None);
+        let mut tc = twin_callers(u, &verified, None);
         {
             // (unverified callers of hot twins that were waiting for this)
             let mut a = TWIN_AWAIT.lock().unwrap_or_else(|e| e.into_inner());
@@ -12453,7 +12470,10 @@ fn short_name(n: &str) -> &str {
 #[derive(Default)]
 struct TwinCallers { o3: Vec<u32>, below: Vec<u32>, unverified: Vec<u32> }
 
-fn twin_callers(u: &Unit, cands: Option<&[u32]>, twin: Option<u32>) -> TwinCallers {
+/// SPEC-V: the callers of hot twins to bring to the base slots: those of `cands` whose RIR calls an
+/// O3 twin, and (`twin`) the lowerings that called `twin` (TWIN_USERS: every RIR with calls to a
+/// twin is recorded there, set_rir: no scan of every slot's RIR at a twin's install).
+fn twin_callers(u: &Unit, cands: &[u32], twin: Option<u32>) -> TwinCallers {
     let hot = |t: u32| matches!(u.fns[t as usize].key, FnKey::Plain(_)) && match twin {
         Some(w) => t == w,
         None => u.fns[t as usize].o3.load(Ordering::Relaxed),
@@ -12473,10 +12493,7 @@ fn twin_callers(u: &Unit, cands: Option<&[u32]>, twin: Option<u32>) -> TwinCalle
         }
     };
     let rir_calls = |c: u32| u.fns[c as usize].rir.as_ref().is_some_and(|r| r.plain_calls && r.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(t), _, _) if hot(*t)))));
-    match cands {
-        Some(c) => c.iter().copied().filter(|&c| rir_calls(c)).for_each(|c| classify(&mut out, c)),
-        None => (0..u.fns.len() as u32).filter(|&c| rir_calls(c)).for_each(|c| classify(&mut out, c)),
-    }
+    cands.iter().copied().filter(|&c| rir_calls(c)).for_each(|c| classify(&mut out, c));
     // the lowerings that called `twin` (TWIN_USERS, kept when their RIR is dropped): a twin's
     // callers are mostly twins themselves (a twin calls twins), so the chain is walked up to the
     // bodies that are not twins
@@ -12507,7 +12524,8 @@ static TWIN_USERS: std::sync::LazyLock<relax_session::sync::Mutex<HashMap<(usize
 /// SPEC-V: unverified callers of hot twins: lowered again once their verdict is clean (sweep_verdicts)
 static TWIN_AWAIT: relax_session::sync::Mutex<Vec<(usize, u32)>> = relax_session::sync::Mutex::new(Vec::new());
 
-/// SPEC-V: slot `caller`'s lowering sends a call to `twin` (lower.rs; any lowering thread)
+/// SPEC-V: slot `caller`'s RIR sends a call to `twin`: its lowering (lower.rs; any lowering thread),
+/// or a body it inlined (set_rir)
 pub(crate) fn note_twin_user(u: &Unit, caller: u32, twin: u32) {
     if caller == twin || (caller as usize) >= u.fns.len() {
         return;
@@ -14323,7 +14341,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 return None;
             }
             let t = wall_ns();
+            let tc = cpu_ns();
             let _ = build_rir(up, id);
+            o3_owner(if splittable(up, id, false) { 13 } else { 12 }, tc);
             TIER1_RIR_REBUILT[0].fetch_add(1, Ordering::Relaxed);
             TIER1_RIR_REBUILT[1].fetch_add(wall_ns() - t, Ordering::Relaxed);
         }
@@ -14333,7 +14353,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 owner_ns.set(owner_ns.get() + cpu_ns() - s0);
                 return None;
             }
+            let tc = cpu_ns();
             let _ = build_rir_mode(up, id, RirMode::Normal);
+            o3_owner(if splittable(up, id, true) { 15 } else { 14 }, tc);
         }
         // A caller's version alone cannot protect an in-flight build: a patch may change
         // a callee before this build has registered its inlined_into edge. Capture the
@@ -14952,6 +14974,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     trace_tier1_phase(id, "built");
     // (an O3-always first build is a program thread's lazy compile: its finish is foreground)
     let ok = owner::publish(|| {
+        let ti0 = cpu_ns();
+        struct InstallTotal(u64);
+        impl Drop for InstallTotal {
+            fn drop(&mut self) { o3_owner(0, self.0); }
+        }
+        let _total = InstallTotal(ti0);
         trace_tier1_phase(id, "install");
         let _cost_install = relax_codegen::fncost::phase(6);
         let u = &mut *up;
@@ -14960,7 +14988,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let ok = match built {
             Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, frame_size, self_call, nounwind_used, profile_entry)))) if PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && (!crate::inspect::instrument::active(id) || inspect_o3_on()) && {
                 let n = if relax_codegen::interp::blob::is_blob(&code) { code.len() } else { relax_backend::rir::split_unwind_info(&code).0 };
-                u.link_check(&code[..n], &relocs)
+                let tl = cpu_ns();
+                let ok = u.link_check(&code[..n], &relocs);
+                o3_owner(1, tl);
+                ok
             } => {
                 // Sign O3 machine bytes and symbolic relocations while the unit is locked.
                 // The ordinary signature path only covers foreground/O1 compilation.
@@ -15030,6 +15061,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 let (n, info) = if blob { (code.len(), None) } else { relax_backend::rir::split_unwind_info(&code) };
                 let code = code[..n].to_vec();
                 let u = &mut *up;
+                let te = cpu_ns();
                 let at = if blob {
                     u.emit_or_redirect(&code, &relocs, "O3").expect("O3 interpreted code installs")
                 } else {
@@ -15041,6 +15073,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 if sandboxed {
                     crate::sandbox::note_dead(u.fns[id as usize].code_len as u64);
                 }
+                o3_owner(2, te);
+                let tx = cpu_ns();
                 // Twin spaces can precede the last host code in the address index.
                 if !blob {
                     let _as = code_as(inspect_o3_kind().unwrap_or(CodeKind::new(if speculative { tier::GUARDED } else { tier::O3 }, origin::FRESH)));
@@ -15060,6 +15094,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 crate::inspect::patches::code_installed(u, id);
                 let slot = SlotWord::of(&u.slots, id);
                 slot.store(at, Ordering::SeqCst);
+                o3_owner(3, tx);
+                let tn = cpu_ns();
                 // a patch of an inlined callee recompiles this slot (live.rs)
                 let n_inl = inlined.len();
                 for c in inlined {
@@ -15074,6 +15110,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     crate::zone_alloc::kept_with(|| T1PROF.lock().unwrap().as_mut().unwrap().map.insert(k.clone(), entry));
                     t1prof_finish();
                 }
+                o3_owner(4, tn);
+                let tr = cpu_ns();
                 // never-run callees kept as calls: rebuilt when one first runs (or already has)
                 let mut again = false;
                 for c in cold_left {
@@ -15091,10 +15129,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 if again && !(t1prof_on(options) && T1PROF.lock().unwrap().as_ref().map_or(false, |p| p.replay)) {
                     u.retier(id);
                 }
+                o3_owner(6, tr);
+                let tt = cpu_ns();
                 // SPEC-V: a twin tiered up: its warm callers that are verified by now are lowered
                 // again, so they call the base slot (which the twin's samples heat as well)
                 if matches!(u.fns[id as usize].key, FnKey::Plain(_)) {
-                    let tc = twin_callers(u, None, Some(id));
+                    let tc = twin_callers(u, &[], Some(id));
                     if specv_trace() {
                         let l = |v: &Vec<u32>| format!("{} [{}]", v.len(), v.iter().take(4).map(|&c| format!("#{} {}", c, short_name(&u.fns[c as usize].name))).collect::<Vec<_>>().join(", "));
                         eprintln!("specv @{:.3} twin O3 #{} {}: callers unverified {} / verified-O3 {} / verified-below-O3 {}", wall_ns() as f64 / 1e9, id, short_name(&u.fns[id as usize].name), l(&tc.unverified), l(&tc.o3), l(&tc.below));
@@ -15104,6 +15144,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     }
                     relower_twin_callers(up, &tc);
                 }
+                o3_owner(5, tt);
                 u.stats.code_bytes += code.len() as u64;
                 u.stats.tier1_code_bytes += code.len() as u64;
                 u.stats.tier1_installed += 1;
@@ -16159,7 +16200,15 @@ pub static TIER1_SNAP_OFF: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0
 unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u32, Prep)>, Vec<u32>) {
     let mut preps = Vec::new();
     let mut gave = Vec::new();
+    // (instrument) owner cpu per candidate by outcome: prepared, gave back (bailed), skipped
+    struct Outcome(u64, std::cell::Cell<usize>);
+    impl Drop for Outcome {
+        fn drop(&mut self) { o3_owner(self.1.get(), self.0); }
+    }
     for &(c, mode) in ids {
+        let outcome = Outcome(cpu_ns(), std::cell::Cell::new(10));
+        let preps0 = O3_OWNER[20].load(Ordering::Relaxed);
+        let count_preps = |i: usize| { O3_OWNER[i].fetch_add(O3_OWNER[20].load(Ordering::Relaxed) - preps0, Ordering::Relaxed); };
         let u = &*up;
         let f = &u.fns[c as usize];
         if f.building || f.inflight || f.build_err.is_some() {
@@ -16212,14 +16261,16 @@ unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u3
         }
         end_build(up, c);
         match r {
-            Ok(Ok((p, _))) => { cand_skip(13); preps.push((c, p)) }
-            Ok(Err(e)) if e == YIELDED || e == NEEDS_FRONT => { cand_skip(10); gave.push(c) }
+            Ok(Ok((p, _))) => { cand_skip(13); outcome.1.set(8); count_preps(18); preps.push((c, p)) }
+            Ok(Err(e)) if e == YIELDED || e == NEEDS_FRONT => { cand_skip(10); outcome.1.set(9); count_preps(17); gave.push(c) }
             // the fronts it needs go to the snapshot's next round (owner::take_needs)
             Err(p) if p.is::<crate::preempt::PublishBail>() => {
                 if let Ok(b) = p.downcast::<crate::preempt::PublishBail>() {
                     owner::note_needs(b.slots);
                 }
                 cand_skip(11);
+                outcome.1.set(9);
+                count_preps(17);
                 gave.push(c);
             }
             Err(p) if p.is::<crate::preempt::OwnerBusy>() => std::panic::resume_unwind(p),
@@ -16239,6 +16290,24 @@ fn cand_skip(i: usize) {
 }
 /// (instrument) O3 installs' cache records made inside the install publish: (count, owner cpu ns)
 pub static O3_INSTALL_REC: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// (instrument) owner cpu ns of the O3 install publish by part (O3_OWNER_NAMES), and of the
+/// candidate takes by outcome, and the O1 builds of an O3 build's root inside its take
+pub static O3_OWNER: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
+const O3_OWNER_NAMES: [&str; 24] = ["install", "link-check", "emit", "index", "inlined", "twin-callers", "retier", "refused",
+    "cand-take prepped", "cand-take bailed", "cand-take skipped", "cand-finish", "root-t0 not-split", "root-t0 split-tried", "root-up not-split", "root-up split-tried",
+    "", "preps in bailed cand-takes#", "preps in prepped cand-takes#", "lowering taken in takes", "preps in takes#", "", "", ""];
+/// O3_OWNER[i] += this thread's cpu since `t`
+#[inline]
+fn o3_owner(i: usize, t: u64) {
+    O3_OWNER[i].fetch_add(cpu_ns().saturating_sub(t), Ordering::Relaxed);
+}
+pub(crate) fn o3_owner_summary() -> String {
+    O3_OWNER_NAMES.iter().enumerate().filter(|(i, n)| !n.is_empty() && O3_OWNER[*i].load(Ordering::Relaxed) > 0)
+        .map(|(i, n)| match n.strip_suffix('#') {
+            Some(n) => format!("{} {}", n, O3_OWNER[i].load(Ordering::Relaxed)),
+            None => format!("{} {:.0} ms", n, O3_OWNER[i].load(Ordering::Relaxed) as f64 / 1e6),
+        }).collect::<Vec<_>>().join(", ")
+}
 
 pub(crate) fn cand_skip_summary() -> String {
     const N: [&str; 27] = ["building", "inflight", "build-err", "key", "unverified", "no-rir", "not-upgradable", "relower", "has-rir", "begin-err", "needs-front", "bail", "other", "PREPPED", "fin-epoch", "fin-building", "fin-not-replacing", "FIN-STORED", "fin-opt-err",
@@ -16504,6 +16573,12 @@ unsafe fn build_off_owner(up: *mut Unit, ids: &[(u32, RirMode)]) {
 /// it meanwhile and no patch landed since `epoch`: a fresh build where the slot still has no RIR,
 /// an upgrade where the slot's RIR is still upgradable (upgrade_replaces).
 unsafe fn o3_candidates_finish(up: *mut Unit, epoch: u64, done: Vec<Deferred>) {
+    let t = cpu_ns();
+    struct Fin(u64);
+    impl Drop for Fin {
+        fn drop(&mut self) { o3_owner(11, self.0); }
+    }
+    let _fin = Fin(t);
     if PATCH_EPOCH.load(Ordering::SeqCst) != epoch {
         CAND_SKIP[14].fetch_add(done.len() as u64, Ordering::Relaxed);
         return;
@@ -17140,6 +17215,7 @@ enum Front {
 /// (a program thread needing one waits for its build, as for pipelined compiles).
 pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads: usize) -> Vec<(u32, Result<(Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>), String>)> {
     let census_unit = (&*up).front.census_id;
+    let export_unit = (&*up).wasm_export_id;
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
     let mut out: Vec<(u32, Result<(Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>), String>)> = Vec::new();
@@ -17219,7 +17295,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                             }
                         };
                         let cg = tier0_codegen_rir(options, &rir, fold, rotate);
-                        crate::wasm_export::capture(id, &cg);
+                        crate::wasm_export::capture(export_unit, id, &cg);
                         let cg = with_loop_counters(cg, lc);
                         let e = &env;
                         let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: e.opt_regs && !rir.baseline, syms: e.syms, sym_class: e.sym_class, near: e.near };
@@ -17380,6 +17456,7 @@ unsafe fn split_front_as(up: *mut Unit, id: u32, mode: RirMode) -> Result<Front,
 /// requesting program thread, a speculative worker.
 pub(crate) struct BackWork {
     id: u32,
+    capture_unit: usize,
     spec: bool,
     front: Front,
     /// the slot and its deferred inline candidates, in flight until the finish
@@ -17497,13 +17574,13 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
     }
     let lc = loop_syms(u, id);
     let memo = bmemo::worthy(&*up, id);
-    Begin::Back(BackWork { id, spec, front, slots, epoch, env, fold, rotate, lc, session, name, w1, memo })
+    Begin::Back(BackWork { id, capture_unit: u.wasm_export_id, spec, front, slots, epoch, env, fold, rotate, lc, session, name, w1, memo })
 }
 
 impl BackWork {
     /// Optimises and generates the code (any thread, no unit state).
     pub(crate) fn run(self) -> BackDone {
-        let BackWork { id, spec, front, slots, epoch, env, fold, rotate, lc, session, name, w1, memo: worthy } = self;
+        let BackWork { id, capture_unit, spec, front, slots, epoch, env, fold, rotate, lc, session, name, w1, memo: worthy } = self;
         let options = &session.options;
         let runtime = &session.runtime;
         let done_out: relax_session::sync::Mutex<Vec<Deferred>> = relax_session::sync::Mutex::new(Vec::new());
@@ -17546,7 +17623,7 @@ impl BackWork {
             };
             let t1 = cpu_ns();
             let cg = tier0_codegen_rir(options, &rir, fold, rotate);
-            crate::wasm_export::capture(id, &cg);
+            crate::wasm_export::capture(capture_unit, id, &cg);
             let cg = with_loop_counters(cg, lc);
             let mut env = env;
             env.opt_regs &= !rir.baseline;

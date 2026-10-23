@@ -334,13 +334,13 @@ impl ImpliedBounds {
 }
 /// `ContainsBevyParamSet`: `ParamSet<T>` of crate `bevy_ecs`, or a reference to one (references only; the
 /// arguments of other types are not searched).
-fn contains_bevy_param_set(tcx: &Tcx, prog: &crate::program::Program, mut ty: TyId) -> bool {
+pub(crate) fn contains_bevy_param_set(tcx: &Tcx, prog: &crate::program::Program, mut ty: TyId) -> bool {
     loop {
         match tcx.tys.kind(ty) {
             TyKind::Ref(_,inner,_) => ty = *inner,
             TyKind::Adt(d,_,_) => {
                 let def = prog.def(*d);
-                return prog.name(*d) == "ParamSet" && prog.syms.str(prog.crates[def.krate as usize].name) == "bevy_ecs";
+                return prog.name(*d) == "ParamSet" && prog.crates[def.krate as usize].crate_name(prog) == "bevy_ecs";
             }
             _ => return false,
         }

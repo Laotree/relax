@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 #[cfg(target_family = "wasm")]
 extern "C" {
@@ -235,7 +236,32 @@ fn c_aggregates() {
     say!("c_spill {} {} {} {} {} {} {}", s.a, s.b, s.c, vm.words[7], vm.words[83], props.sum, props.calls);
 }
 
+// Coverage probes execute between pointer uses in these small callees and in
+// the string/lock implementations. Keep them hot and cross call boundaries.
+#[inline(never)]
+fn coverage_chars(text: &str, total: &Mutex<u64>, count: &AtomicUsize) -> u64 {
+    let mut sum = 0u64;
+    for (offset, ch) in text.char_indices() {
+        sum = sum.wrapping_add(ch as u64 + offset as u64);
+        count.fetch_or(1 << (offset % 16), Ordering::Relaxed);
+    }
+    *total.lock().unwrap() += sum;
+    sum + count.load(Ordering::Acquire) as u64
+}
+
+fn coverage_hot() {
+    let total = Mutex::new(0u64);
+    let count = AtomicUsize::new(0);
+    let texts = [String::from("ASCII"), String::from("Grüße ✓ 🦀"), String::new()];
+    let mut sum = 0u64;
+    for i in 0..4096 {
+        sum += coverage_chars(&texts[i % texts.len()], &total, &count);
+    }
+    say!("coverage {} {} {}", sum, *total.lock().unwrap(), count.load(Ordering::Relaxed));
+}
+
 fn body() {
+    coverage_hot();
     c_aggregates();
     say!("usize {} ptr {} fat {} dyn {} opt_box {} vec {} string {}",
         std::mem::size_of::<usize>(), std::mem::size_of::<*const u8>(), std::mem::size_of::<&[u8]>(),
