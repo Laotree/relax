@@ -88,12 +88,12 @@ pub(super) struct Slots<T: Copy> {
 unsafe impl<T: Copy + Send> Sync for Slots<T> {}
 
 impl<T: Copy> Slots<T> {
-    fn new(n: usize) -> Slots<T> {
+    pub(super) fn new(n: usize) -> Slots<T> {
         assert!(n.is_power_of_two());
         Slots { head: AtomicU64::new(0), seq: (0..n).map(|_| AtomicU64::new(0)).collect(), data: (0..n).map(|_| UnsafeCell::new(std::mem::MaybeUninit::uninit())).collect() }
     }
 
-    fn push(&self, v: T) {
+    pub(super) fn push(&self, v: T) {
         let n = self.head.fetch_add(1, Relaxed);
         let i = n as usize & (self.seq.len() - 1);
         self.seq[i].store(0, Relaxed);
@@ -104,7 +104,7 @@ impl<T: Copy> Slots<T> {
 
     /// Entries `from..` (at most a ring back): `f(n, entry)`. Returns the cursor to read from next
     /// time and the entries lost (overwritten before or while they were read).
-    fn read(&self, from: u64, f: &mut dyn FnMut(u64, T)) -> (u64, u64) {
+    pub(super) fn read(&self, from: u64, f: &mut dyn FnMut(u64, T)) -> (u64, u64) {
         let len = self.seq.len() as u64;
         let head = self.head.load(Acquire);
         let mut lost = 0;

@@ -657,6 +657,8 @@ pub fn cmd_versions(req: &Req, out: &mut Out) {
                 line.map_or(String::new(), |l| format!(",\"line\":{}", l)),
                 pin.map_or(String::new(), |p| format!(",\"pinned\":{}", json_str(&p))),
             ));
+            // why it is (not) at O3, one line (`why-tier` has the evidence)
+            rows.push(format!("{{\"tier_why\":{},\"verdict\":{}}}", id, json_str(&crate::jit::tier_explain(u, *id).0)));
             for b in bodies(u, *id) {
                 let mut j = body_json(u, *id, b.start, b.len, b.state, b.gen);
                 j.pop();
