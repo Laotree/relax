@@ -347,3 +347,64 @@ fn nocapture_call_writing_a_slot_while_its_partner_lives_keeps_them_apart() {
     assert!(!opt::coalesce_slot_copies(&mut f, true));
     assert_eq!(copies(&f), 1);
 }
+
+/// f(n): A = (n, 2n); C = A (a move); flag = `moved`; C.0 = n + 5; then `if flag == 0 { A.0 }
+/// else { C.0 + C.1 }` -- A's read sits behind the drop flag, as a moved-from value's drop in an
+/// unwind cleanup does. `moved`: the flag is 1 at C's write, so A is dead there and A and C join;
+/// else A's read runs and they stay apart.
+fn build_flagged(moved: bool) -> Func {
+    let mut f = Func::new("slot_coalesce_flag".into(), 0);
+    let n = f.vreg(Cls::I);
+    f.params.push(n);
+    f.rets.push(Cls::I);
+    let (sa, sc_) = (f.slot(16, 8), f.slot(16, 8));
+    for _ in 0..4 {
+        f.block();
+    }
+    let v = |f: &mut Func| f.vreg(Cls::I);
+    let (pa, pc, flag, n2, n5, x, y, z, s) = (v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f));
+    push(&mut f, 0, Inst::SlotAddr(pa, sa));
+    push(&mut f, 0, Inst::SlotAddr(pc, sc_));
+    push(&mut f, 0, Inst::Iconst(flag, 0));
+    push(&mut f, 0, Inst::Store(Mem::Int(8, false), pa, 0, n));
+    push(&mut f, 0, Inst::IBinI(IOp::Mul, U64, n2, n, 2));
+    push(&mut f, 0, Inst::Store(Mem::Int(8, false), pa, 8, n2));
+    push(&mut f, 0, Inst::Copy(pc, pa, 16));
+    push(&mut f, 0, Inst::Iconst(flag, if moved { 1 } else { 0 }));
+    push(&mut f, 0, Inst::IBinI(IOp::Add, U64, n5, n, 5));
+    push(&mut f, 0, Inst::Store(Mem::Int(8, false), pc, 0, n5));
+    f.blocks[0].term = Term::Jump(1);
+    f.blocks[1].term = Term::Branch(flag, 3, 2);
+    push(&mut f, 2, Inst::Load(Mem::Int(8, false), x, pa, 0));
+    f.blocks[2].term = Term::Ret(vec![x]);
+    push(&mut f, 3, Inst::Load(Mem::Int(8, false), y, pc, 0));
+    push(&mut f, 3, Inst::Load(Mem::Int(8, false), z, pc, 8));
+    push(&mut f, 3, Inst::IBin(IOp::Add, U64, s, y, z));
+    f.blocks[3].term = Term::Ret(vec![s]);
+    f
+}
+
+#[test]
+fn a_read_behind_a_set_drop_flag_does_not_keep_the_moved_from_slot_live() {
+    let f = build_flagged(true);
+    f.verify().unwrap();
+    let want = run(&f, 10);
+    assert_eq!(want, 15 + 20);
+    let mut g = f.clone();
+    assert!(opt::coalesce_slot_copies(&mut g, true));
+    g.verify().unwrap();
+    assert_eq!(copies(&g), 0);
+    assert_eq!(run(&g, 10), want);
+}
+
+#[test]
+fn a_read_behind_a_clear_drop_flag_keeps_the_slots_apart() {
+    let f = build_flagged(false);
+    f.verify().unwrap();
+    let want = run(&f, 10);
+    assert_eq!(want, 10);
+    let mut g = f.clone();
+    opt::coalesce_slot_copies(&mut g, true);
+    assert_eq!(copies(&g), 1);
+    assert_eq!(run(&g, 10), want);
+}
