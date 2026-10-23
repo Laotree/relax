@@ -1694,7 +1694,7 @@ pub fn poisoned_note() -> Option<String> {
 pub(crate) unsafe fn fault_policy(label: &str, info: &PanicInfo, guard_depth: u32, const_eval_depth: u32) -> bool {
     let u = &*UNIT;
     let tname = os::thread::name(os::thread::current());
-    let at = owner::call(owner::Class::Job, || info.frames.first().and_then(|f| u.pc_to_src(*f)).map(|(id, loc)| format!("{} ({})", u.fns[id as usize].name, loc)).unwrap_or_else(|| { let pc = info.frames.first().copied().unwrap_or(0); match crate::inspect::symbols::host_symbol(pc) { Some((name, image, off)) => format!("{:#x} (host {}+{:#x}, {})", pc, name, off, image), None => format!("{:#x}", pc) } }));
+    let at = owner::call(owner::Class::Job, || info.frames.first().and_then(|f| u.pc_to_src(*f)).map(|(id, loc)| format!("{} ({})", u.fns[id as usize].name, loc)).unwrap_or_else(|| { let pc = info.frames.first().copied().unwrap_or(0); match crate::inspect::symbols::host_symbol(pc) { Some((name, image, 0)) => format!("{:#x} (host {}, {})", pc, name, image), Some((name, image, off)) => format!("{:#x} (host {}+{:#x}, {})", pc, name, off, image), None => format!("{:#x}", pc) } }));
     // a fault while a constant is evaluated in a check (a null or dangling dereference, a stack
     // overflow from unbounded recursion, an abort): the evaluation fails, which rustc reports
     // as E0080 (the interpreter rejects the same accesses); the initializer's caller reports it.
