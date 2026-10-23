@@ -222,6 +222,15 @@ impl<'a> Parser<'a> {
                 // core's panic_2015/panic_2021 arms are blocks `({ ..; })`: the semicolon ends the
                 // format temporaries' lives inside the macro
                 g.open_brace();
+                // panic_2015/panic_2021 `("{}", $arg:expr $(,)?) => ({ $crate::panicking::panic_display(&$arg); })`,
+                // the single-argument case of const panics
+                if name == "panic" && c.direct && c.first.is_none() && c.named.is_empty() && c.pos.len() == 1 && c.fmt.as_ref().is_some_and(|(f, _)| f == "{}") {
+                    let arg = c.pos[0];
+                    tg!(&mut g; #core() :: panicking :: panic_display (& #expr(arg)));
+                    g.punct(T::Semi);
+                    g.close_brace();
+                    return Ok(g);
+                }
                 tg!(&mut g; #core() :: panicking :: panic_at #open());
                 let empty = c.fmt.is_none() && c.first.is_none();
                 if empty {
