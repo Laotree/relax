@@ -5492,6 +5492,9 @@ mod cold_tests {
         again.loaded_in(&mut prog, 2, dir.clone());
         assert_fingerprints(&again, &prog);
         assert!(again.pending.is_empty());
+        // its writers write the three records again; they finish before the folder goes
+        again.finish_in(&mut prog, dir.clone());
+        assert_eq!(again.records, 3);
         // Repeated completion/finalization must not write a crate's record twice.
         cold.loaded_in(&mut prog, 0, dir.clone());
         cold.finish_in(&mut prog, dir.clone());
