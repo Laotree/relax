@@ -12399,9 +12399,9 @@ const TIER_LOOP: u64 = 64;
 const CALL_COST: u64 = 20;
 /// a call's weight grows by one unit per this many bytes of the counted code beyond CALL_COST's
 /// (an estimate of its straight-line work: bigger bodies cost more per call). Race A/B (165, warm,
-/// tier-up installs vs 1404 at the old call windows): 8 -> 2153, 16 -> see TIERCOST.REPORT.md,
-/// 32 -> 1986 (Hud::draw_walk, 14 KB at 60 calls/s, right at the threshold), 128 -> 1530 (it stays
-/// below O3)
+/// 1 s half-life, tier-up installs vs 1404 at the old call windows): 8 -> 2153, 32 -> 1986
+/// (Hud::draw_walk, 14 KB at 60 calls/s, right at the threshold), 128 -> 1530 (it stays below O3).
+/// At 16 and the ln 2 s half-life Hud::draw_walk clears the threshold by 1.36x.
 const WEIGHT_BYTES: u64 = 16;
 /// ... up to this (16 KB of code): at the default threshold a fn needs at least ~40 calls/s to tier
 /// up by its calls, a 60 Hz one ~10 KB of baseline code (the race's Hud::draw_walk: 14 KB), and one
