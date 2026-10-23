@@ -10334,6 +10334,7 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
 /// The same unoptimised RIR on the locked path and the ahead helpers. Publishing a helper's
 /// result does not optimise it: prepare_rir still applies the caller's normal inline policy.
 fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(relax_backend::rir::Func, bool), String> {
+    want_body_consts(u, body);
     let name = u.fns[id as usize].name.to_string();
     trace("lower", &name);
     let mut lcx = Lcx::new(u, body, name.clone(), id);
@@ -14283,8 +14284,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let prefront = !owner::is_owner() && !t1prof_replay(options) && pipelined();
     let mut fronted: std::collections::HashSet<u32> = Default::default();
     // slots whose front named a constant or thread-local the owner had not made yet (noted for
-    // its const_drain): fronted once more in the next round, each once
-    let mut refronted: std::collections::HashSet<u32> = Default::default();
+    // its const_drain): fronted again in the next round, each up to REFRONTS times
+    let mut refronted: HashMap<u32, u8> = Default::default();
+    const REFRONTS: u8 = 3;
     let fronts: std::cell::RefCell<Vec<(u32, DefId, Vec<TyId>)>> = Default::default();
     // O1 builds a round's walk met that this thread prepares through a take and optimises itself
     // (o3_candidates_begin / o3_candidates_finish), not on the owner: upgrades of baseline RIR to
@@ -14722,6 +14724,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
     }
     t1_single_keys.sort();
+    if trace_outs {
+        let mut v: Vec<String> = singles.keys().map(|&c| format!("{}(refs {})", u.fns[c as usize].name, u.fns[c as usize].refs)).collect();
+        v.sort();
+        eprintln!("O3 snapshot of {}: single-reference {}", u.fns[id as usize].name, v.join(", "));
+    }
     // recorded frequencies (replay)
     let t1_freq: Option<Option<Vec<f32>>> = t1key.as_ref().and_then(|k| {
         let g = T1PROF.lock().unwrap();
@@ -14782,7 +14789,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         Err(b) if rounds < O3_TAKE_ROUNDS && !b.slots.is_empty() && b.slots.iter().fold(true, |ok, &s| {
             let noted = want_notes();
             let made = fronted.insert(s) && prefront_slot(&front, s);
-            let again = !made && want_notes() != noted && refronted.insert(s);
+            let again = !made && want_notes() != noted && {
+                let n = refronted.entry(s).or_insert(0);
+                *n += 1;
+                *n <= REFRONTS
+            };
             if again {
                 fronted.remove(&s);
             } else if !made && s != id {
@@ -18557,11 +18568,27 @@ fn provided_source_body(u: &Unit, d: DefId) -> bool {
             || !pc.shims.contains_key(crate::provided::key(&u.prog, &u.tcx, d).as_str()))
 }
 
-/// Every static checked body `body` names is initialized (FrontShared::consts).
+/// Every static checked body `body` names is initialized (FrontShared::consts). In a background
+/// build's front (WANT_CONSTS) the missing ones are noted for the owner's const_drain, which
+/// initializes them as its own lowering would: a warm run's disk-cache code initializes none of
+/// them, so a body naming one never lowered off the owner (race: ModelDraw::set_material's closure
+/// stayed baseline, its O3 take bailing on its own front every time).
 fn statics_ready(u: &Unit, body: &Body) -> bool {
-    !body.res.values().chain(body.pat_res.values()).chain(body.fmt_named.values()).any(|r| {
-        matches!(r, Res::Def(d) if u.prog.def(*d).kind == DefKind::Static && u.front.consts.get(&(*d, Vec::new())).is_none())
-    })
+    let want_them = WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false);
+    let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
+    let mut ready = true;
+    for r in body.res.values().chain(body.pat_res.values()).chain(body.fmt_named.values()) {
+        if let Res::Def(d) = r {
+            if u.prog.def(*d).kind == DefKind::Static && u.front.consts.get(&(*d, Vec::new())).is_none() {
+                ready = false;
+                if !want_them {
+                    break;
+                }
+                want(Wanted::Static(*d), epoch);
+            }
+        }
+    }
+    ready
 }
 
 /// Lowers instance `d<args>`'s checked body off the unit (FRONT_RW read held) for slot `into`:
@@ -20136,6 +20163,25 @@ thread_local! {
 fn want_notes() -> u32 {
     WANT_NOTES.try_with(|n| n.get()).unwrap_or(0)
 }
+/// A background build's front (WANT_CONSTS, lowering ahead): every free constant the body names
+/// that nobody evaluated yet is noted at once. Lowering stops at the first one it meets, so a body
+/// naming N of them took N fronts and drains, one per take round (Car::tick_sim_inner's twin named
+/// TIRE_RATE_RATIO, TIRE_LOAD_MAX_G, UNSPRUNG_FRACTION, ... and was dropped at O3 for the run).
+/// (A free constant has no generic arguments: its key is the one const_addr_shared asks for.)
+fn want_body_consts(u: &Unit, body: &Body) {
+    if !LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) || !WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
+        return;
+    }
+    let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
+    let mut seen: crate::fxhash::HashSet<DefId> = Default::default();
+    for r in body.res.values().chain(body.pat_res.values()).chain(body.fmt_named.values()) {
+        if let Res::Def(d) = r {
+            if u.prog.def(*d).kind == DefKind::Const && seen.insert(*d) && u.front.consts.get(&(*d, Vec::new())).is_none() {
+                want(Wanted::Const(*d, Vec::new()), epoch);
+            }
+        }
+    }
+}
 /// Notes `w` for the owner's const_drain.
 fn want(w: Wanted, epoch: u64) {
     crate::zone_alloc::kept_with(|| CONSTS_WANTED.lock().unwrap_or_else(|e| e.into_inner()).push((w, epoch)));
@@ -20168,6 +20214,7 @@ static CONSTS_WANTED: relax_session::sync::Mutex<Vec<(Wanted, u64)>> = relax_ses
 enum Wanted {
     Const(DefId, Vec<TyId>),
     Tls(DefId),
+    Static(DefId),
 }
 
 /// Owner, before each request: the constants CONSTS_WANTED names, evaluated into FrontShared::consts
@@ -20202,6 +20249,13 @@ pub(crate) fn const_drain() {
                     continue;
                 }
                 (d, matches!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.thread_local_place(d))), Ok(Some(_))))
+            }
+            // (Unit::static_addr publishes an initialized static into FrontShared::consts)
+            Wanted::Static(d) => {
+                if u.front.consts.get(&(d, Vec::new())).is_some() {
+                    continue;
+                }
+                (d, std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.static_addr(d))).is_ok_and(|a| a != 0))
             }
         };
         if ahead_trace() {
