@@ -236,7 +236,10 @@ pub fn code_installed(u: &crate::jit::Unit, id: u32) {
         first
     };
     if first {
-        crate::owner::post(crate::owner::Class::Program, || {
+        // queued also on the owner: an install inside a publish (a counted build's, an O3 build's)
+        // must not run the rebuild's front there (rule I-PUB; zone_swap's probe of path_dump, whose
+        // inliner got a counted build: "front inside a publish")
+        crate::owner::post_queued(crate::owner::Class::Program, || {
             let up = crate::jit::current_unit();
             if !up.is_null() {
                 unsafe { cover_new_inliners(up) };

@@ -337,7 +337,7 @@ pub fn cmd_why_tier(req: &super::Req, out: &mut super::Out) {
                         rows.push(format!("| {} | {} |", at_s(e.t), describe(e, &kind)));
                     }
                 }
-                None => rows.push("decisions: none recorded beyond being armed (no slow window, queue, build or drop)".into()),
+                None => rows.push("decisions: none recorded beyond being armed (no cost check, queue, build or drop)".into()),
             }
             rows.push(String::new());
         }
