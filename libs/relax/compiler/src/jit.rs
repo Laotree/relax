@@ -1193,7 +1193,8 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
 /// call. Slots whose crates changed, whose identities do not resolve or that have code already
 /// stay lazy. MAKEPAD_RUN_PRELINK=0 turns it off. Returns the slots installed.
 pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
-    if std::env::var_os("MAKEPAD_RUN_PRELINK").map_or(false, |v| v == "0") || std::env::var_os("MAKEPAD_RUN_HINTS_RECORD").is_some() {
+    // (--check-first: every slot passes the borrow checker before its first code, cached or not)
+    if CHECK_FIRST.load(Ordering::Relaxed) || std::env::var_os("MAKEPAD_RUN_PRELINK").map_or(false, |v| v == "0") || std::env::var_os("MAKEPAD_RUN_HINTS_RECORD").is_some() {
         return 0;
     }
     let prelinked = owner::call(owner::Class::Program, || {
@@ -19641,6 +19642,12 @@ pub(crate) unsafe fn cache_lookup(up: *mut Unit, id: u32) -> Option<(Vec<u8>, Ve
         return None;
     }
     if u.cache.is_none() { relax_codegen::warm::reason(id, "cache absent during nested lookup"); }
+    // --check-first: cached code is no way around the check (a refused body is built, and its
+    // build installs the error stub: install_built)
+    if CHECK_FIRST.load(Ordering::Relaxed) && u.fns[id as usize].patch_gen == 0 && !u.fns[id as usize].compiled && !u.check_first_events(id).is_empty() {
+        relax_codegen::warm::reason(id, "check-first refused");
+        return None;
+    }
     crate::cache::lookup_unit(up, id)
 }
 

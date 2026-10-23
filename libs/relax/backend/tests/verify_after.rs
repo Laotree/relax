@@ -1,6 +1,6 @@
 //! JITSAFE 19: with MAKEPAD_RUN_VERIFY_PASSES the backend verifies the RIR its internal rewrites
 //! hand to the register allocator, and a broken function is an error naming the pass -- never
-//! compiled. (Its own test binary: the switch is read once per process.)
+//! compiled.
 #![cfg(any(all(target_arch = "x86_64", unix), all(target_arch = "aarch64", unix)))]
 use relax_backend::rir::*;
 
@@ -20,7 +20,7 @@ fn compile(f: &Func) -> Result<(), String> {
 
 #[test]
 fn broken_rir_never_reaches_the_allocator() {
-    std::env::set_var("MAKEPAD_RUN_VERIFY_PASSES", "1");
+    relax_backend::rir::force_verify_passes();
     // a function that returns one value but whose block returns none
     let mut f = Func::new("broken".into(), 0);
     let a = f.vreg(Cls::I);

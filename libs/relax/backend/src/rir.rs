@@ -2036,8 +2036,17 @@ mod slot_table_tests {
     }
 }
 
-/// MAKEPAD_RUN_VERIFY_PASSES (any value) or a debug build: `Func::verify_after` checks.
+/// MAKEPAD_RUN_VERIFY_PASSES (any value), `force_verify_passes`, or a debug build:
+/// `Func::verify_after` checks.
 pub fn verify_passes_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    cfg!(debug_assertions) || *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_VERIFY_PASSES").is_some())
+    cfg!(debug_assertions) || FORCE_VERIFY.load(std::sync::atomic::Ordering::Relaxed) || *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_VERIFY_PASSES").is_some())
+}
+
+static FORCE_VERIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns `verify_after` on for the rest of the process (tests: the environment switch is read once
+/// per process, and test targets may share one).
+pub fn force_verify_passes() {
+    FORCE_VERIFY.store(true, std::sync::atomic::Ordering::Relaxed);
 }
