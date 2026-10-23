@@ -32,7 +32,9 @@ fn recycle() {
         ok &= kf(0.5) == want;
     }
     // force one more so the numbers below are after a recycle
-    let _ = std::relax::sandbox_stats(true);
+    if let Err(e) = std::relax::sandbox_stats(true) {
+        eprintln!("recycle: the forced recycle failed: {}", e);
+    }
     // Recycling replaces O3 code with freshly compiled confined code and must
     // rearm counters against the new space, never a stale count-stub target.
     for _ in 0..10000 { assert_eq!(kf(0.5), want); }

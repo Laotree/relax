@@ -318,7 +318,9 @@ pub fn maybe_recycle(up: *mut Unit) {
             jit::lower_this_thread_priority(runtime);
             let r = unsafe { recycle(p.0) };
             if let Err(e) = r {
-                if !reclaim_stress() {
+                // (stress: the first few only -- refusals are the expected common case there)
+                static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if !reclaim_stress() || SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
                     eprintln!("makepad: sandbox recycle skipped: {}", e);
                 }
             }
