@@ -3,7 +3,7 @@
 # rustc's build of it: wasm32 = a wasm32-unknown-unknown cdylib run in node (host.js); wasm64 = a
 # host binary (wasm64's data layout is x86_64's). Prints "web_diff <w>: N lines equal" or the diff.
 # wasm32 with node on the machine: also Relax's own wasm export of the run (MAKEPAD_RUN_WASM_EXPORT)
-# run in node (relax_host.js), against the same reference: "web_diff w32 export: ...".
+# run in node (relax_host.js), against the same reference: "web_diff $W export: ...".
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
 B=$1
@@ -34,14 +34,14 @@ else
   echo "web_diff $W: DIFFERENT (log $T/relax.err)"
   exit 1
 fi
-if [ "$W" = w32 ] && command -v node > /dev/null; then
+if command -v node > /dev/null; then
   MAKEPAD_RUN_WASM_EXPORT=$T/relax.wasm MAKEPAD_RUN_SPEC=0 MAKEPAD_RUN_O1=always MAKEPAD_RUN_O3=0 MAKEPAD_RUN_CHECK_TARGET=$TRIPLE MAKEPAD_RUN_STD=$H/../../std MAKEPAD_RUN_CACHE_DIR=$T/tgt-export "$B" run --quiet --no-live --units "$T/u/units.json" web_diff > /dev/null 2> "$T/export.err"
   node "$H/relax_host.js" "$T/relax.wasm" 2> "$T/export.txt"
   if diff "$T/ref.txt" "$T/export.txt" > "$T/export.diff"; then
-    echo "web_diff w32 export: $(wc -l < "$T/ref.txt" | tr -d ' ') lines equal ($(wc -c < "$T/relax.wasm" | tr -d ' ') bytes of wasm)"
+    echo "web_diff $W export: $(wc -l < "$T/ref.txt" | tr -d ' ') lines equal ($(wc -c < "$T/relax.wasm" | tr -d ' ') bytes of wasm)"
   else
     head -20 "$T/export.diff"
-    echo "web_diff w32 export: DIFFERENT (log $T/export.err)"
+    echo "web_diff $W export: DIFFERENT (log $T/export.err)"
     exit 1
   fi
 fi

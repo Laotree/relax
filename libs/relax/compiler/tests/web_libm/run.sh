@@ -28,14 +28,14 @@ else
   echo "web_libm $W: DIFFERENT (log $T/relax.err)"
   exit 1
 fi
-if [ "$W" = w32 ] && command -v node > /dev/null; then
+if command -v node > /dev/null; then
   MAKEPAD_RUN_WASM_EXPORT=$T/relax.wasm MAKEPAD_RUN_SPEC=0 MAKEPAD_RUN_O1=always MAKEPAD_RUN_O3=0 MAKEPAD_RUN_CHECK_TARGET=$TRIPLE MAKEPAD_RUN_STD=$H/../../std MAKEPAD_RUN_CACHE_DIR=$T/tgt-export "$B" run --quiet --no-live --units "$T/u/units.json" web_libm > /dev/null 2> "$T/export.err" || { cat "$T/export.err"; exit 1; }
   node "$H/../web_diff/relax_host.js" "$T/relax.wasm" 2> "$T/export.txt" || { tail -40 "$T/export.txt"; exit 1; }
   if diff "$T/ref.txt" "$T/export.txt" > "$T/export.diff"; then
-    echo "web_libm w32 export: $(wc -l < "$T/ref.txt" | tr -d ' ') lines equal ($(wc -c < "$T/relax.wasm" | tr -d ' ') bytes of wasm)"
+    echo "web_libm $W export: $(wc -l < "$T/ref.txt" | tr -d ' ') lines equal ($(wc -c < "$T/relax.wasm" | tr -d ' ') bytes of wasm)"
   else
     head -20 "$T/export.diff"
-    echo "web_libm w32 export: DIFFERENT (log $T/export.err)"
+    echo "web_libm $W export: DIFFERENT (log $T/export.err)"
     exit 1
   fi
 fi

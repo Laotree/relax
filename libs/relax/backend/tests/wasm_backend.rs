@@ -869,3 +869,50 @@ fn size_basics() {
     let (_, st2) = build(&fs, Options { names: true, ..opts() });
     assert!(st2.names > 0);
 }
+
+/// Exercise the architecture bindings in a real wasm validator/runtime, including
+/// memory64 and shared memory (which the small in-tree interpreter does not model).
+fn web_builtin(builtin: Builtin, arity: usize, assertion: &str) {
+    struct Binding(Builtin);
+    impl Link for Binding {
+        fn sym(&self, _: u32) -> u64 { 0 }
+        fn host(&self, _: u32) -> HostBind { HostBind::Builtin(self.0) }
+    }
+    for memory64 in [false, true] {
+        for shared in [false, true] {
+            let mut f = B::new(&vec![Cls::I; arity], &[Cls::I]);
+            let result = f.v(Cls::I);
+            f.i(Inst::Call(Callee::Host(Sym::new(0)), f.f.params.clone(), vec![result]));
+            f.term(Term::Ret(vec![result]));
+            let mut m = Module::new(Options { memory64, shared_max_pages: shared.then_some(16), ..opts() });
+            let f = f.done();
+            m.add_func(0, &f);
+            m.export_func(0, "run");
+            let out = m.finish(&relax_session::Options::default(), &Binding(builtin));
+            assert!(out.stats.failed.is_empty(), "{:?}", out.stats.failed);
+            dump(&out.bytes);
+            let script = format!("const assert=require('node:assert/strict'); const b=require('node:fs').readFileSync(0); assert(WebAssembly.validate(b)); const x=new WebAssembly.Instance(new WebAssembly.Module(b), {{}}).exports; const shared={shared}; const memory64={memory64}; {assertion}");
+            use std::io::Write;
+            let mut child = std::process::Command::new("node").args(["-e", &script]).stdin(std::process::Stdio::piped()).spawn().expect("Node is required for wasm architecture tests");
+            child.stdin.take().unwrap().write_all(&out.bytes).unwrap();
+            assert!(child.wait().unwrap().success(), "{builtin:?}, memory64={memory64}, shared={shared}");
+        }
+    }
+}
+
+#[test]
+fn web_memory_size_builtin() {
+    web_builtin(Builtin::MemorySize, 1, "assert.equal(x.run(0n), BigInt(x.memory.buffer.byteLength / 65536));");
+}
+#[test]
+fn web_memory_grow_builtin() {
+    web_builtin(Builtin::MemoryGrow, 2, "const old=BigInt(x.memory.buffer.byteLength/65536); assert.equal(x.run(0n,1n),old); assert.equal(BigInt(x.memory.buffer.byteLength/65536),old+1n); assert.equal(x.run(0n,0n),old+1n); assert.equal(x.run(0n,-1n),memory64?-1n:4294967295n);");
+}
+#[test]
+fn web_atomic_notify_builtin() {
+    web_builtin(Builtin::AtomicNotify, 2, "assert.equal(x.run(0n,1n),0n);");
+}
+#[test]
+fn web_atomic_wait32_builtin() {
+    web_builtin(Builtin::AtomicWait32, 3, "assert.equal(x.run(0n,1n,0n),1n); if(shared) assert.equal(x.run(0n,0n,0n),2n); else assert.throws(()=>x.run(0n,0n,0n),WebAssembly.RuntimeError);");
+}
