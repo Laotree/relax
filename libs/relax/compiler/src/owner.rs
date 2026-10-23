@@ -1277,15 +1277,12 @@ fn owner_loop() -> ! {
                 OWNER_ASLEEP.store(false, Ordering::SeqCst);
             }
         };
-        // before a top-level request: the constants and thread-locals background builds' fronts
-        // found missing (the request is often such a build's next take, which then finds them)
-        let frame = crate::jit::frame_enter(std::ptr::null());
-        let _ = std::panic::catch_unwind(crate::jit::const_drain);
-        crate::jit::frame_leave(frame);
         serve(r);
         // between top-level requests: the vtables made for real-time trait-object types
         let frame = crate::jit::frame_enter(std::ptr::null());
         let _ = std::panic::catch_unwind(crate::jit::realtime_drain);
+        // ... and the constants background builds' fronts found unevaluated
+        let _ = std::panic::catch_unwind(crate::jit::const_drain);
         crate::jit::frame_leave(frame);
     }
 }
