@@ -2955,7 +2955,9 @@ impl Spill {
             entries.insert(0, NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload: e.0 }.into());
             append_store(&path, entries, stale, &self.marks)?;
             if !code.is_empty() {
-                WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).push((self.dir.clone(), path, code));
+                // the list outlives the compiler zone (a settle swap destroys it): kept heap
+                let mut w = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+                crate::zone_alloc::kept_with(|| w.push((self.dir.clone(), path.clone(), code.clone())));
             }
         }
         Ok(n)
@@ -2976,9 +2978,19 @@ impl Cache {
     fn index_written(&mut self) {
         let mine: Vec<(PathBuf, Vec<u128>)> = {
             let mut w = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-            let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *w).into_iter().partition(|x| x.0 == self.dir);
-            *w = rest;
-            mine.into_iter().map(|x| (x.1, x.2)).collect()
+            // (what stays is another cache's, kept as it was: the list lives in the kept heap)
+            let mut mine = Vec::new();
+            let mut i = 0;
+            while i < w.len() {
+                if w[i].0 == self.dir {
+                    let (_, path, keys) = &w[i];
+                    mine.push((path.clone(), keys.clone()));
+                    crate::zone_alloc::kept_with(|| drop(w.swap_remove(i)));
+                } else {
+                    i += 1;
+                }
+            }
+            mine
         };
         for (path, keys) in mine {
             let Some(st) = Store::open(&path) else { continue };
