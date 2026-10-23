@@ -464,7 +464,7 @@ pub fn park_stale(os_id: u64, domain: Option<crate::domain::DomainId>, message: 
     let sym = super::symbolise_within(&[as_raw], &mut partial, 500).pop().unwrap_or_default();
     let location = sym.first().map(|f| f.at.clone()).unwrap_or_default();
     let fr: Vec<String> = sym.iter().map(super::frame_json).collect();
-    let thread = super::threads::list().into_iter().find(|t| t.os_id == os_id).map(|t| t.name).unwrap_or_else(|| os_id.to_string());
+    let thread = super::threads::list().into_iter().find(|t| t.os_id == os_id).map(|t| t.name.clone()).unwrap_or_else(|| os_id.to_string());
     let primary = domain.is_some() && domain == crate::run::app_domain();
     let fields = format!(
         "\"id\":\"P{}\",\"kind\":\"stale access\",\"message\":{},\"location\":{},\"thread\":{},\"frames\":[{}],\"parked_s\":null{},\"more\":[\"stacks\",\"why-hung\",{}\"resume P{} stop\"]",

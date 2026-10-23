@@ -246,7 +246,7 @@ fn handle(rec: &Rec) {
     crate::inspect::flightrec::fault_dump(&format!("stale.access {} {} at {:#x} pc {:#x}", r.kind, r.name, addr, pc));
     let domain = crate::domain::id_of_base(rec.domain_base.load(Ordering::Relaxed));
     let os_id = rec.os_id.load(Ordering::Relaxed);
-    let thread = crate::inspect::threads::list().into_iter().find(|t| t.os_id == os_id).map(|t| t.name).unwrap_or_else(|| os_id.to_string());
+    let thread = crate::inspect::threads::list().into_iter().find(|t| t.os_id == os_id).map(|t| t.name.clone()).unwrap_or_else(|| os_id.to_string());
     let into = where_in(r, addr);
     let age_ms = crate::clock::wall_ns().saturating_sub(r.retired_ns) / 1_000_000;
     let verdict = format!(
