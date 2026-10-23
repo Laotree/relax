@@ -506,7 +506,11 @@ impl Interp<'_> {
             self.intrinsic(self.prog.name(d).to_string(), &fargs, &vals, &tys, dest)?;
             match target { Some(t) => { self.goto(t); return Ok(()); } None => return ub("entering unreachable code") }
         }
-        if path.starts_with("core::panicking::") || path.contains("::panicking::") { return unsupported("panic"); }
+        // machine.rs hook_special_const_fn: a panic ends the evaluation with its message
+        let lang = &self.tcx.lang_items;
+        // (Relax lowers `panic!` to panic_at(args, location), panic_fmt's body)
+        if lang.get(crate::lang_items::LangItem::PanicFmt) == Some(d) || path == "core::panicking::panic_at" { let m = self.const_panic_fmt(&vals[0], tys[0])?; return ub(format!("evaluation panicked: {m}")); }
+        if lang.get(crate::lang_items::LangItem::PanicDisplay) == Some(d) { let m = self.panic_display(&vals[0], fargs.first().copied())?; return ub(format!("evaluation panicked: {m}")); }
         let env = crate::tcx::TypingEnv::fully_monomorphized(self.prog);
         let inst = match self.tcx.resolve_instance_raw(self.prog, env, d, &fargs) { Ok(i) => i, Err(_) => return unsupported("instance") };
         let crate::instance::InstanceKind::Item(callee) = inst.def else { return unsupported("shim call") };
@@ -515,6 +519,104 @@ impl Interp<'_> {
         let body = self.body_of(callee, &cargs)?;
         if body.arg_count as usize != vals.len() || body.spread_arg.is_some() { return unsupported("call arity"); }
         self.push_frame(body, vals, Some((dest, target)))
+    }
+
+    /// core's const_panic_fmt, which rustc's hook calls for panic_fmt: `fmt.as_str()` (Relax's std's
+    /// own `Arguments::as_str`, interpreted) and its text; arguments that need formatting are
+    /// unreachable there (rustc lowers a const `panic!("{}", s)` to panic_display).
+    fn const_panic_fmt(&mut self, args: &Val, args_ty: TyId) -> R<String> {
+        let key = crate::tcx::ty_key(&self.tcx.tys, args_ty);
+        let as_str = self.tcx.inherent.get(&key).and_then(|imps| imps.iter().flat_map(|&imp| self.prog.impls[self.prog.def(imp).sub as usize].items.iter().copied()).find(|&it| self.prog.name(it) == "as_str"));
+        let Some(as_str) = as_str else { return unsupported("Arguments::as_str") };
+        let body = self.body_of(as_str, &[])?;
+        let (size, align) = self.size_align(args_ty)?;
+        let tmp = self.alloc(Alloc::new(size, align, Kind::Stack));
+        let ps = self.ps; self.allocs[tmp as usize].put(0, args, ps);
+        let this = self.ptr_val(Ptr { prov: Some(Prov { alloc: tmp, shared: true }), off: 0 }, None);
+        let ret_ty = body.local_decls[0].ty;
+        let ret = self.call_to_completion(body, vec![this])?;
+        // Option<&'static str>
+        let place = MPlace { ptr: Ptr { prov: Some(Prov { alloc: ret, shared: false }), off: 0 }, meta: None, ty: ret_ty, variant: None, packed: None };
+        let v = self.read_variant(place)?;
+        let TyKind::Adt(od, oargs, _) = self.tcx.tys.kind(ret_ty).clone() else { return unsupported("as_str result") };
+        let Some(adt) = self.tcx.adts.get(&od) else { return unsupported("as_str result") };
+        if self.prog.syms.str(adt.variants[v as usize].name) != "Some" { return unsupported("formatted const panic"); }
+        let l = self.layout(ret_ty)?;
+        let off = match l.variant_fields.get(v as usize).and_then(|f| f.first()) { Some(&o) => o as u64, None => l.fields.first().map_or(0, |&o| o as u64) };
+        let sty = self.tcx.tys.subst_erasing_regions(adt.variants[v as usize].fields[0].ty, &self.tcx.tys.list(oargs).to_vec());
+        let sv = self.read_place(MPlace { ptr: Ptr { off, ..place.ptr }, meta: None, ty: sty, variant: None, packed: None })?;
+        self.read_str(&sv)
+    }
+
+    /// rustc's hook for panic_display: its argument is a `&&str`.
+    fn panic_display(&mut self, arg: &Val, t: Option<TyId>) -> R<String> {
+        let Some(t) = t else { return unsupported("panic_display") };
+        if !matches!(self.tcx.tys.kind(t), TyKind::Ref(_, s, _) if matches!(self.tcx.tys.kind(*s), TyKind::Str)) { return unsupported("panic_display of a non-str"); }
+        let p = self.ptr_of(arg, 0)?;
+        let ps = self.ps;
+        let sv = self.read(p, 2 * ps, ps)?;
+        self.read_str(&sv)
+    }
+
+    /// intrinsics.rs caller_location: the `Location` of the innermost frame that is not
+    /// #[track_caller] (find_closest_untracked_caller_location), at its current call, as global memory.
+    fn caller_location(&mut self, ref_ty: TyId) -> R<u32> {
+        let TyKind::Ref(_, loc_ty, _) = self.tcx.tys.kind(ref_ty).clone() else { return unsupported("caller_location type") };
+        let span = self.frames.iter().rev().find_map(|f| {
+            let tracked = matches!(f.body.source.kind, mir::BodyKind::Fn) && self.tcx.fn_sig(self.prog, f.body.source.owner).is_some_and(|s| s.track_caller);
+            if tracked { return None; }
+            let bb = &f.body.basic_blocks[f.block.0 as usize];
+            Some(if f.stmt < bb.statements.len() { bb.statements[f.stmt].source_info.span } else { bb.terminator.as_ref()?.source_info.span })
+        });
+        let Some(span) = span else { return unsupported("caller_location span") };
+        let (Some(file), Some(path)) = (self.prog.files.get(span.file as usize), self.prog.file_paths.get(span.file as usize)) else { return unsupported("caller_location file") };
+        let (line, col) = file.line_col(span.lo);
+        let mut name = path.as_bytes().to_vec();
+        name.push(0);
+        let n = name.len() as u64;
+        let mut fa = Alloc::new(n, 1, Kind::Global);
+        fa.bytes = name; fa.init = vec![true; n as usize]; fa.mutable = false; fa.global = true;
+        let fa = self.alloc(fa);
+        let TyKind::Adt(d, ..) = self.tcx.tys.kind(loc_ty).clone() else { return unsupported("Location") };
+        let Some(adt) = self.tcx.adts.get(&d) else { return unsupported("Location") };
+        let names: Vec<String> = adt.variants[0].fields.iter().map(|f| self.prog.syms.str(f.name).to_string()).collect();
+        let l = self.layout(loc_ty)?;
+        let mut v = Alloc::new(l.size as u64, l.align as u64, Kind::Global);
+        let ps = self.ps;
+        for (i, name) in names.iter().enumerate() {
+            let Some(&o) = l.fields.get(i) else { return unsupported("Location field") };
+            let fv = match name.as_str() {
+                "file_bytes_with_nul" => self.ptr_val(Ptr { prov: Some(Prov { alloc: fa, shared: true }), off: 0 }, Some(n)),
+                "line" => val_bytes(line as u128, 4),
+                "col" => val_bytes(col as u128, 4),
+                _ => return unsupported("Location field"),
+            };
+            v.put(o as u64, &fv, ps);
+        }
+        v.mutable = false; v.global = true;
+        Ok(self.alloc(v))
+    }
+
+    /// The text a `&str` value points to.
+    fn read_str(&mut self, v: &Val) -> R<String> {
+        let p = self.ptr_of(v, 0)?;
+        let n = self.int_of(&v.slice(self.ps, self.ps, self.ps))? as u64;
+        let b = self.read(p, n, 1)?;
+        if b.init.iter().any(|x| !x) { return Err(self.uninit_err(&b, "")); }
+        Ok(String::from_utf8_lossy(&b.bytes).into_owned())
+    }
+
+    /// Calls `body` with `args` on a stack of its own and runs it to its return; the allocation of
+    /// the return value.
+    fn call_to_completion(&mut self, body: Rc<Body>, args: Vec<Val>) -> R<u32> {
+        let ty = body.local_decls[0].ty;
+        let (size, align) = self.size_align(ty)?;
+        let ret = self.alloc(Alloc::new(size, align, Kind::Stack));
+        let place = MPlace { ptr: Ptr { prov: Some(Prov { alloc: ret, shared: false }), off: 0 }, meta: None, ty, variant: None, packed: None };
+        let depth = self.frames.len();
+        self.push_frame(body, args, Some((place, None)))?;
+        while self.frames.len() > depth { self.step()?; }
+        Ok(ret)
     }
 
     /// intrinsics.rs emulate_intrinsic over Relax's intrinsic set.
@@ -558,9 +660,10 @@ impl Interp<'_> {
                 let q = self.offset_inbounds(p, n, size)?;
                 self.ptr_val(q, None)
             }
+            "caller_location" => { let loc = self.caller_location(dest.ty)?; self.ptr_val(Ptr { prov: Some(Prov { alloc: loc, shared: true }), off: 0 }, None) }
             "unreachable" => return ub("entering unreachable code"),
             "abort" => return ub("the program aborted execution"),
-            _ => return unsupported(format!("intrinsic {name}")),
+            _ => return unsupported(format!("intrinsic {name} in {}", self.prog.def_path(self.frames.last().unwrap().body.source.owner))),
         };
         self.write_val(dest, &v)
     }
