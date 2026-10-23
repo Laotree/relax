@@ -943,7 +943,6 @@ struct Account {
 }
 
 thread_local! {
-    static ENTRY_DEPTH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ACCOUNTS: std::cell::RefCell<Vec<Account>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -1023,17 +1022,9 @@ fn budget_growth(base: u64, bytes: u64, commit: bool) -> bool {
     })
 }
 
-pub fn entry_depth() -> u64 { ENTRY_DEPTH.with(|d| d.get()) }
-pub fn entry_recover(depth: u64) {
-    ENTRY_DEPTH.with(|d| {
-        let skipped = d.get().saturating_sub(depth);
-        d.set(depth);
-        // a contained fault or deadline unwound past the wrappers: their frames are gone
-        if skipped != 0 && depth == 0 {
-            crate::reclaim::left();
-        }
-    });
-}
+pub fn entry_depth() -> u64 { crate::reclaim::depth() }
+/// A contained fault or deadline unwound past the wrappers: their frames are gone.
+pub fn entry_recover(depth: u64) { crate::reclaim::recover(depth) }
 
 pub fn budget_depth() -> usize { ACCOUNTS.with(|s| s.borrow().len()) }
 pub fn budget_recover(depth: usize) {
@@ -1107,12 +1098,7 @@ fn enter_raw(a: &Arena) -> Result<Saved, String> {
     }
     budget_flush();
     // recorded before the wrapper loads any twin's slot word (reclaim.rs)
-    ENTRY_DEPTH.with(|d| {
-        if d.get() == 0 {
-            crate::reclaim::enter_outermost();
-        }
-        d.set(d.get() + 1)
-    });
+    crate::reclaim::enter();
     let w = words();
     let prev = unsafe { Saved([*w, *w.add(1), *w.add(2), *w.add(3)]) };
     unsafe {
@@ -1137,13 +1123,7 @@ fn enter_raw(a: &Arena) -> Result<Saved, String> {
 /// A wrapper's call returns (or unwinds): the state before it comes back.
 pub fn leave(prev: Saved) {
     restore(prev);
-    ENTRY_DEPTH.with(|d| {
-        let n = d.get().saturating_sub(1);
-        d.set(n);
-        if n == 0 {
-            crate::reclaim::left();
-        }
-    });
+    crate::reclaim::leave();
 }
 
 /// Shadow-stack bytes for a wrapper's argument copy or result slot (0: no room).

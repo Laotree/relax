@@ -30,9 +30,16 @@ struct Rec {
 /// Every record ever made (push-only list: records are never unlinked, so a walk needs no lock).
 static HEAD: AtomicPtr<Rec> = AtomicPtr::new(std::ptr::null_mut());
 
+/// This thread's entry state (const, no destructor: readable during thread exit).
+struct Here {
+    /// guarded entries in progress (nested wrapper calls)
+    depth: std::cell::Cell<u64>,
+    /// this thread's record (null until its first entry)
+    rec: std::cell::Cell<*const Rec>,
+}
+
 thread_local! {
-    /// this thread's record (const, no destructor: readable during thread exit)
-    static MINE: std::cell::Cell<*const Rec> = const { std::cell::Cell::new(std::ptr::null()) };
+    static HERE: Here = const { Here { depth: std::cell::Cell::new(0), rec: std::cell::Cell::new(std::ptr::null()) } };
     /// gives the record back when the thread exits
     static OWNER: Owner = const { Owner };
 }
@@ -41,7 +48,7 @@ struct Owner;
 
 impl Drop for Owner {
     fn drop(&mut self) {
-        let r = MINE.with(|m| m.replace(std::ptr::null()));
+        let r = HERE.with(|h| h.rec.replace(std::ptr::null()));
         if !r.is_null() {
             // only an exiting thread gets here: it holds no frame of reclaimable code
             unsafe {
@@ -52,11 +59,9 @@ impl Drop for Owner {
     }
 }
 
-fn mine() -> &'static Rec {
-    let r = MINE.with(|m| m.get());
-    if !r.is_null() {
-        return unsafe { &*r };
-    }
+/// This thread's first entry: a record a finished thread gave back, or a new one.
+#[cold]
+fn mine(h: &Here) -> *const Rec {
     // a record a finished thread gave back, or a new one
     let mut p = HEAD.load(Ordering::Acquire) as *const Rec;
     let r = loop {
@@ -79,27 +84,64 @@ fn mine() -> &'static Rec {
         }
         p = rec.next;
     };
-    MINE.with(|m| m.set(r));
+    h.rec.set(r);
     // registers the give-back (a thread already past its TLS destructors keeps the record: it
     // reads 0 once the thread leaves, so it blocks nothing)
     let _ = OWNER.try_with(|_| ());
-    unsafe { &*r }
+    r
 }
 
-/// This thread enters reclaimable code from outside (its depth went 0 -> 1). Must run before
-/// any slot word of that code is loaded.
+/// A guarded entry into reclaimable code (a wrapper's call into a module). The outermost one
+/// records the epoch before any slot word of that code is loaded.
 #[inline]
-pub fn enter_outermost() {
-    let r = mine();
-    r.entered.store(EPOCH.load(Ordering::SeqCst), Ordering::SeqCst);
-    fence(Ordering::SeqCst);
+pub fn enter() {
+    HERE.with(|h| {
+        let d = h.depth.get();
+        h.depth.set(d + 1);
+        if d == 0 {
+            let mut r = h.rec.get();
+            if r.is_null() {
+                r = mine(h);
+            }
+            unsafe { (*r).entered.store(EPOCH.load(Ordering::SeqCst), Ordering::SeqCst) };
+            fence(Ordering::SeqCst);
+        }
+    })
 }
 
-/// This thread holds no frame of reclaimable code any more (depth back to 0: a return, an
-/// unwind, or a guard's recovery after a contained fault).
+/// The guarded call returns (or unwinds); back at depth 0 the thread holds no frame of
+/// reclaimable code.
 #[inline]
-pub fn left() {
-    let r = MINE.with(|m| m.get());
+pub fn leave() {
+    HERE.with(|h| {
+        let d = h.depth.get().saturating_sub(1);
+        h.depth.set(d);
+        if d == 0 {
+            released(h);
+        }
+    })
+}
+
+/// Guarded entries in progress on this thread.
+pub fn depth() -> u64 {
+    HERE.with(|h| h.depth.get())
+}
+
+/// A guard's recovery after a contained fault or deadline unwound past wrappers: back to `depth`.
+pub fn recover(depth: u64) {
+    HERE.with(|h| {
+        if h.depth.get() > depth {
+            h.depth.set(depth);
+            if depth == 0 {
+                released(h);
+            }
+        }
+    })
+}
+
+#[inline]
+fn released(h: &Here) {
+    let r = h.rec.get();
     if !r.is_null() {
         unsafe { (*r).entered.store(0, Ordering::Release) };
     }
@@ -141,18 +183,18 @@ mod tests {
         let go = std::sync::Arc::new(std::sync::Barrier::new(2));
         let (i2, g2) = (inside.clone(), go.clone());
         let t = std::thread::spawn(move || {
-            enter_outermost();
+            enter();
             i2.wait();
             g2.wait();
-            left();
+            leave();
         });
         inside.wait();
         let stamp = advance();
         assert!(!quiescent_since(stamp), "a thread inside since before the stamp must block");
         // a thread entering after the stamp does not block it
-        enter_outermost();
+        enter();
         assert_eq!(blockers(stamp), 1);
-        left();
+        leave();
         go.wait();
         t.join().unwrap();
         assert!(quiescent_since(stamp));
@@ -166,10 +208,10 @@ mod tests {
             while !p.is_null() { n += 1; p = unsafe { (*p).next }; }
             n
         };
-        std::thread::spawn(|| { enter_outermost(); left(); }).join().unwrap();
+        std::thread::spawn(|| { enter(); leave(); }).join().unwrap();
         let n0 = count();
         for _ in 0..64 {
-            std::thread::spawn(|| { enter_outermost(); left(); }).join().unwrap();
+            std::thread::spawn(|| { enter(); leave(); }).join().unwrap();
         }
         // other tests may run threads at once: growth stays bounded by them, not by the 64 joins
         assert!(count() <= n0 + 8, "records leak per thread: {} -> {}", n0, count());
