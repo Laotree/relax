@@ -63,7 +63,7 @@ impl<T> *const T {
     }
     // (core: in-bounds `offset` / `add` / `sub` and wrapping `arith_offset`, all keeping provenance)
     pub const unsafe fn sub(self, count: usize) -> *const T {
-        im::ptr_add(self, count.wrapping_neg())
+        im::ptr_sub(self, count)
     }
     pub const unsafe fn offset(self, count: isize) -> *const T {
         im::ptr_add(self, count as usize)
@@ -207,7 +207,7 @@ impl<T> *mut T {
         im::ptr_add_mut(self, count)
     }
     pub const unsafe fn sub(self, count: usize) -> *mut T {
-        im::ptr_add_mut(self, count.wrapping_neg())
+        im::ptr_sub(self as *const T, count) as *mut T
     }
     pub const unsafe fn offset(self, count: isize) -> *mut T {
         im::ptr_add_mut(self, count as usize)

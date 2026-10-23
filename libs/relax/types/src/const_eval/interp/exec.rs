@@ -651,11 +651,12 @@ impl Interp<'_> {
                 let n = self.int_of(&vals[2])? as u64;
                 return self.copy(s, d, elem, n, name == "copy_nonoverlapping");
             }
-            "offset" | "ptr_add" | "ptr_add_mut" | "arith_offset" => {
+            "offset" | "ptr_add" | "ptr_add_mut" | "arith_offset" | "ptr_sub" => {
                 let elem = match self.tcx.tys.kind(tys[0]) { TyKind::Ptr(_, t) => *t, _ => return unsupported("offset pointee") };
                 let (size, _) = self.size_align(elem)?;
                 let p = self.ptr_of(&vals[0], 0)?;
                 let n = self.int_of(&vals[1])? as u64 as i64;
+                let n = if name == "ptr_sub" { n.wrapping_neg() } else { n };
                 // (arith_offset: wrapping, provenance kept, no bounds)
                 let q = if name == "arith_offset" { Ptr { off: p.off.wrapping_add((n as u64).wrapping_mul(size)), ..p } } else { self.offset_inbounds(p, n, size)? };
                 self.ptr_val(q, None)

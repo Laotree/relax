@@ -149,6 +149,8 @@ pub mod intrinsics_mem {
         /// `p + n * size_of::<T>()`
         pub fn ptr_add<T>(p: *const T, n: usize) -> *const T;
         pub fn ptr_add_mut<T>(p: *mut T, n: usize) -> *mut T;
+        /// `p` moved back by `n` elements, in bounds (core's `sub`: `offset` by `-n`)
+        pub fn ptr_sub<T>(p: *const T, n: usize) -> *const T;
         /// `p` moved by `n` elements with wrapping arithmetic, keeping its provenance (core::intrinsics::arith_offset)
         pub fn arith_offset<T>(p: *const T, n: isize) -> *const T;
         /// `(p - origin) / size_of::<T>()` of two pointers into one allocation (core::intrinsics::ptr_offset_from)
