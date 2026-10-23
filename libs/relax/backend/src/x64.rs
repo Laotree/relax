@@ -307,6 +307,24 @@ impl Asm {
         self.byte(0xd3);
         self.modrm_rr(ext, r);
     }
+    /// rol of the low `bits` (8, 16, 32 or 64) of r by cl (k None) or by k: the operand size
+    /// follows the type; upper bits: 32-bit form zero, 8/16-bit forms keep r's (re-extend after)
+    fn rol(&mut self, bits: u8, r: u8, k: Option<i64>) {
+        if bits == 16 {
+            self.byte(0x66);
+        }
+        self.rex(bits == 64, 0, 0, r, bits == 8 && r >= 4);
+        self.byte(match (bits == 8, k.is_some()) {
+            (true, false) => 0xd2,
+            (false, false) => 0xd3,
+            (true, true) => 0xc0,
+            (false, true) => 0xc1,
+        });
+        self.modrm_rr(0, r);
+        if let Some(k) = k {
+            self.byte((k as u64 % bits as u64) as u8);
+        }
+    }
     fn cqo(&mut self) {
         self.byte(0x48);
         self.byte(0x99);
@@ -3793,12 +3811,13 @@ impl<'a> Gen<'a> {
                         self.a.sse_rr(0, if matches!(op, VX::FSqrt(..)) { 0x51 } else { 0x5b }, xd, xa, false);
                         self.fin_f(d, xd);
                     }
-                    VX::FRound(_, RoundTo::Floor | RoundTo::Ceil | RoundTo::Trunc) => {
+                    VX::FRound(_, RoundTo::Floor | RoundTo::Ceil | RoundTo::Trunc | RoundTo::Even) => {
                         let xd = self.def_f(d, XS);
                         self.a.sse_ext(0x66, 0x3a, 0x08, xd, xa); // roundps
                         self.a.byte(match op {
                             VX::FRound(_, RoundTo::Floor) => 9,
                             VX::FRound(_, RoundTo::Ceil) => 10,
+                            VX::FRound(_, RoundTo::Even) => 8,
                             _ => 11,
                         });
                         self.fin_f(d, xd);
@@ -3961,6 +3980,7 @@ impl<'a> Gen<'a> {
                         self.a.byte(match t {
                             RoundTo::Floor => 9,
                             RoundTo::Ceil => 10,
+                            RoundTo::Even => 8,
                             _ => 11,
                         });
                     }
@@ -5272,12 +5292,13 @@ impl<'a> Gen<'a> {
                 return;
             }
             IOp::Rotl => {
-                // rol by cl (32-bit form for u32: zero-extends)
+                // rol by cl in the type's width (passes::rotl), then the canonical extension
                 self.a.mov_rr(RCX, rb);
                 self.a.mov_rr(RAX, ra);
-                self.a.rex(it != U32, 0, 0, RAX, false);
-                self.a.byte(0xd3);
-                self.a.modrm_rr(0, RAX);
+                self.a.rol(it.bits, RAX, None);
+                if it.bits < 64 && it != U32 {
+                    self.a.extend(RAX, it.bits, it.signed);
+                }
                 self.a.mov_rr(rd, RAX);
                 self.fin_i(d, rd);
                 return;
@@ -5934,12 +5955,9 @@ impl<'a> Gen<'a> {
                 self.a.u32(k as i32 as u32);
             }
             IOp::Rotl => {
-                // rol r64, imm8
+                // rol by k in the type's width (passes::rotl); narrow results are re-extended below
                 self.a.mov_rr(rd, ra);
-                self.a.rex(true, 0, 0, rd, false);
-                self.a.byte(0xc1);
-                self.a.modrm_rr(0, rd);
-                self.a.byte((k & 63) as u8);
+                self.a.rol(it.bits, rd, Some(k));
             }
             IOp::Shl | IOp::Shr => {
                 self.a.mov_rr(rd, ra);
@@ -6216,10 +6234,10 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     crate::stats::pass_time(11, t_ra);
     drop(_cost_ra);
     let alloc_sig = regalloc::alloc_sig(&al);
-    if crate::stats::opt_env_off("+checkra") {
-        for l in regalloc::check_alloc(options, f, &cfg, &al) {
-            eprintln!("{}", l);
-        }
+    regalloc::trace_alloc(f, &al);
+    // the allocation checker (MAKEPAD_RUN_OPT=+checkra; gates, fuzzer): a finding fails the compile
+    if regalloc::check_on(options) {
+        regalloc::check_or_fail(options, f, &cfg, &al, env.opt_regs || f.full)?;
     }
     let _cost_emit = crate::probe::phase(10);
     let t_emit = crate::stats::pass_clock();

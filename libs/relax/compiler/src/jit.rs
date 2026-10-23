@@ -1337,16 +1337,23 @@ extern "C" fn relax_fork() -> i32 {
 fn fork_prepare() {
     pause_compile_jobs(false);
     owner::fork_prepare();
+    // (every code writer paused: the child's copy of the W^X code views is consistent)
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    os::mem::fork_prepare();
 }
 
 #[cfg(unix)]
 fn fork_parent() {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    os::mem::fork_parent();
     owner::fork_parent();
     resume_compile_jobs(false);
 }
 
 #[cfg(unix)]
 fn fork_child() {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    os::mem::fork_child();
     owner::fork_child();
     PIPELINE.store(false, Ordering::SeqCst);
     SPEC_STOP.store(true, Ordering::SeqCst);
@@ -2948,7 +2955,8 @@ impl Unit {
             for file in 0..prog.file_paths.len() { prog.exec_profile_file(file as u32); }
         }
         let options = &sess.options;
-        let web_target = prog.crates[core_crate as usize].cfg.set.iter().any(|s| s == "relax_web");
+        // a unit without a core crate (unit tests' programs) is not a web build
+        let web_target = prog.crates.get(core_crate as usize).is_some_and(|c| c.cfg.set.iter().any(|s| s == "relax_web"));
         if web_target {
             crate::web::activate().expect("reserve web linear memory");
         }
