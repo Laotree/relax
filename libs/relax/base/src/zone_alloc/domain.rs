@@ -66,6 +66,10 @@ impl DomainHeap {
     pub fn detail(&self) -> (usize, usize, usize, usize) {
         self.inner.arena.detail()
     }
+    /// Chunk states with resident bytes (arena.rs `states`).
+    pub fn states(&self) -> [usize; 21] {
+        self.inner.arena.states()
+    }
     pub fn range(&self) -> (usize, usize) {
         self.inner.arena.range()
     }
@@ -170,6 +174,19 @@ unsafe fn owner(p: *mut u8) -> Option<Arc<Heap>> {
 /// chunks; memstat::trim): a program heap is trimmed like the compiler's (Scope: 100 MB in use,
 /// 226 MB resident). The heaps are leased under the registry lock and trimmed outside it.
 pub fn trim_all() {
+    for h in lease().iter().flatten() {
+        h.arena.trim();
+    }
+}
+
+/// Every live domain heap gives its dense chunks huge pages and takes them from sparse ones
+/// (arena.rs `densify`); at most `budget` collapses per heap. Returns the collapses done.
+pub fn densify_all(budget: usize) -> usize {
+    lease().iter().flatten().map(|h| h.arena.densify(budget)).sum()
+}
+
+/// The live domain heaps, leased (at most 64; the rest wait for the next call).
+fn lease() -> [Option<Arc<Heap>>; 64] {
     // no allocation under the registry lock (a free taken there would wait for it): a fixed
     // lease table, the heaps past it wait for the next trim
     const MAX: usize = 64;
@@ -190,9 +207,7 @@ pub fn trim_all() {
             }
         }
     }
-    for h in heaps.iter().flatten() {
-        h.arena.trim();
-    }
+    heaps
 }
 
 /// Also used by the native global allocator: a provided crate may drop a JIT-owned buffer.

@@ -113,6 +113,9 @@ mod disabled {
     pub fn census() -> [usize; 11] {
         [0; 11]
     }
+    pub fn states() -> [usize; 21] {
+        [0; 21]
+    }
     pub fn trim() {}
     pub fn detach_thread() {}
     pub unsafe fn alloc(_: Layout) -> *mut u8 {
@@ -274,6 +277,11 @@ pub fn compiler_stats() -> (usize, usize, usize) {
 /// The compiler and burst arenas' census (arena.rs `census`): where their committed bytes are.
 pub fn arena_census() -> ([usize; 11], [usize; 11]) {
     (compiler::census(), burst::census())
+}
+
+/// The compiler and burst arenas' chunk states with resident bytes (arena.rs `states`).
+pub fn arena_states() -> ([usize; 21], [usize; 21]) {
+    (compiler::states(), burst::states())
 }
 
 pub fn compiler_detail() -> (usize, usize, usize, usize) {

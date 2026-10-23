@@ -20,9 +20,11 @@
 //!    only the image and the stores);
 //! 3. one owner request under a front write: the counts must be those of the encode (only the
 //!    interners may have grown: the new interner is topped up from the live one, so type ids stay
-//!    identical), the cache is opened as a warm start opens it and inherits what the old one
-//!    learned, and the Unit's compile fields are replaced; the old ones are returned;
-//! 4. the old values are dropped on the monitor's thread, then the heap is trimmed.
+//!    identical), the old cache's unspilled entries are taken out, the cache is opened as a warm
+//!    start opens it and inherits what the old one learned, and the Unit's compile fields are
+//!    replaced; the old ones are returned;
+//! 4. the taken entries are written, the old values are dropped on the monitor's thread, then the
+//!    heap is trimmed.
 //! `MAKEPAD_RUN_SETTLE_REBUILD=0` turns it off.
 
 use super::*;
@@ -187,6 +189,8 @@ struct Old {
     _ctfe_fn_bodies: relax_session::sync::Mutex<crate::fxhash::HashMap<(DefId, Vec<TyId>), (u64, std::sync::Arc<Body>)>>,
     _query_errors: relax_types::infer::diagnostics::DiagCtxt,
     _rir: Vec<std::sync::Arc<relax_backend::rir::Func>>,
+    /// the old cache's pending entries, written before the old state is dropped
+    spill: Option<crate::cache::Spill>,
 }
 // SAFETY: every value in `Old` was moved out of the Unit under a front write on the owner; no
 // thread holds a reference into it (off-owner readers go through a front read, the owner's own
@@ -218,6 +222,10 @@ pub(crate) fn run(up: *mut Unit) -> Outcome {
     let sess = unsafe { unit_session(up) };
     let Some(mode) = crate::cache::mode_from_env(&sess.options) else { return Outcome::Refused("the cache mode is off".into()) };
 
+    // a slot being built would defer the replace: ask before paying for the encode and restore
+    if let Some(i) = owner::publish(|| unsafe { (*up).fns.iter().position(|f| f.building || f.inflight) }) {
+        return Outcome::Retry(format!("slot {i} is being built"));
+    }
     // 1. the collected image of the program now, under a front read (compiles go on)
     let t = Instant::now();
     let Some(inputs) = owner::publish(|| unsafe { (*up).cache.as_ref().map(|c| c.collected_inputs()) }) else {
@@ -273,6 +281,13 @@ pub(crate) fn run(up: *mut Unit) -> Outcome {
 
     // 4. the old state goes by value, off the owner (on this, the monitor's, thread)
     let t = Instant::now();
+    let mut old = old;
+    if let Some(s) = old.spill.take() {
+        let _z = crate::zone_alloc::compiler();
+        if let Err(e) = s.write() {
+            eprintln!("makepad-run cache: spill at the settle rebuild: {e}");
+        }
+    }
     drop(old);
     // the process-wide memos that only grow go too (made again on demand)
     drop_compile_memos();
@@ -305,11 +320,11 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
             return Err(format!("slot {i} is being built"));
         }
     }
+    // the old cache's unspilled entries are taken here and written after the replace, off the
+    // owner, as a mid-run spill writes them (the new cache inherits their keys and indexes the
+    // written entries like any spill's); a rebuild never waits for spills
     u.flush_cache_records();
-    let pending = u.cache.as_ref().map_or(0, |c| c.pending_entries());
-    if pending > 0 {
-        return Err(format!("the cache has {pending} entries to spill"));
-    }
+    let spill = u.cache.as_mut().and_then(|c| c.spill_take());
     let Fresh { prog, mut tcx, collected } = fresh;
     // the types interned since the encode, copied from the live interner: ids stay identical
     tcx.tys.top_up_from(&u.tcx.tys).ok_or("the image holds more types than the program")?;
@@ -357,6 +372,7 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
         _ctfe_fn_bodies: std::mem::replace(&mut u.ctfe_fn_bodies, Default::default()),
         _query_errors: std::mem::replace(&mut u.query_errors, query_errors),
         _rir: rir,
+        spill,
     };
     // what Unit::new does with a restored program, again for the new one
     u.tcx.const_eval_provider = Some(relax_types::const_eval::ConstEvalProvider {

@@ -439,6 +439,19 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
             d.id, json_str(&d.package), json_str(&format!("{:?}", d.state)), d.arena_in_use, d.arena_committed, d.arena_detail.0, d.arena_detail.1, d.arena_detail.2, d.static_committed, d.threads,
             d.thread_names.iter().map(|s| json_str(s)).collect::<Vec<_>>().join(",")));
     }
+    // chunk states with resident bytes (MB): attached / listed / released / full, then large, then sparse
+    let st = |a: &[usize; 21]| {
+        let mb = |b: usize| format!("{:.1}", b as f64 / 1048576.0);
+        let row = |r: usize| format!("{{\"chunks\":{},\"touched_mb\":{},\"live_slots_mb\":{},\"resident_mb\":{}}}", a[r * 4], mb(a[r * 4 + 1]), mb(a[r * 4 + 2]), mb(a[r * 4 + 3]));
+        format!("\"attached\":{},\"listed\":{},\"released\":{},\"full\":{},\"large\":{{\"runs\":{},\"committed_mb\":{},\"resident_mb\":{}}},\"sparse\":{{\"chunks\":{},\"resident_mb\":{}}}",
+            row(0), row(1), row(2), row(3), a[16], mb(a[17]), mb(a[18]), a[19], mb(a[20]))
+    };
+    for (id, a) in crate::domain::heap_states() {
+        out.line(&format!("{{\"arena_states\":\"domain {id:?}\",{}}}", st(&a)));
+    }
+    let (cs, bs) = crate::zone_alloc::arena_states();
+    out.line(&format!("{{\"arena_states\":\"compiler\",{}}}", st(&cs)));
+    out.line(&format!("{{\"arena_states\":\"burst\",{}}}", st(&bs)));
     let compiler = req.get("compiler") == Some("1");
     let n = req.num("n", 24) as usize;
     let mut partial = Vec::new();
