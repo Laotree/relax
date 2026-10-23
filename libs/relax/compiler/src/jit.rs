@@ -958,7 +958,7 @@ pub unsafe fn spec_seed_manifest(up: *mut Unit) {
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     // after the first present: what the earlier run installed after its first present (the
     // slots before it were linked as this run's start called them)
-    let list = owner::call_quick(owner::Class::App, || (&mut *up).cache.as_ref().map(|c| c.manifest[c.manifest_present..].to_vec()).unwrap_or_default());
+    let list = owner::call_quick(owner::Class::Program, || (&mut *up).cache.as_ref().map(|c| c.manifest[c.manifest_present..].to_vec()).unwrap_or_default());
     if list.is_empty() || !pipelined() || !ahead_policy().spec_cached {
         return;
     }
@@ -1052,7 +1052,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
     if std::env::var_os("MAKEPAD_RUN_PRELINK").map_or(false, |v| v == "0") || std::env::var_os("MAKEPAD_RUN_HINTS_RECORD").is_some() {
         return 0;
     }
-    let prelinked = owner::call(owner::Class::App, || {
+    let prelinked = owner::call(owner::Class::Program, || {
         let usable = (&*up).cache.as_ref().map_or(false, |c| c.mode != crate::cache::Mode::Verify && c.startup_manifest_valid());
         if !usable {
             return None;
@@ -1185,7 +1185,7 @@ fn ids_pending_here() -> bool {
     if owner::is_owner() {
         return true;
     }
-    owner::call(owner::Class::App, || ());
+    owner::call(owner::Class::Program, || ());
     false
 }
 
@@ -2225,7 +2225,7 @@ fn rt_compile(slot: u64) -> u64 {
     // compiler thread-locals are gone, so the whole build runs on the owner (only the request
     // touches this thread's state, through try_with)
     if in_thread_exit() && !owner::is_owner() {
-        return owner::call(owner::program_class(), || unsafe { compile_slot(UNIT, slot as u32) });
+        return owner::call(owner::Class::Program, || unsafe { compile_slot(UNIT, slot as u32) });
     }
     let _frame = crate::inspect::timeline::CompileMark::begin();
     unsafe {
@@ -5949,7 +5949,7 @@ unsafe fn compile_slot_on_stack(up: *mut Unit, id: u32) -> u64 {
         let a = compile_slot_on_stack_rt(up, id);
         let upn = up as usize;
         if realtime_on() {
-            owner::post(owner::Class::Main, move || unsafe { realtime_reach(upn as *mut Unit, vec![id], "miss") });
+            owner::post(owner::Class::Program, move || unsafe { realtime_reach(upn as *mut Unit, vec![id], "miss") });
         }
         let dt = wall_ns() - t;
         crate::postframe::rt_compile(t, dt);
@@ -6015,7 +6015,7 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
         };
     }
     let _startup = StartupCompile::foreground();
-    let class = owner::program_class();
+    let class = owner::Class::Program;
     // the slot's body (and its small callees') type check runs before its front: other threads
     // keep compiling meanwhile. Code linked ahead or found in the disk cache needs no front end:
     // that is tried first (in a unit call: a check without it saw no cache and type-checked
@@ -6412,7 +6412,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                     // present, every program thread's after it): its entry (slot keys, dependency
                     // certificate) is encoded later, in background batches (drain_cache_records)
                     let foreground = if FIRST_PRESENT.load(Ordering::Acquire) {
-                        matches!(owner::serving().0, owner::Class::Main | owner::Class::App) || owner::serving().0 == owner::Class::Publish && !owner::serving_background()
+                        owner::serving().0 == owner::Class::Program || owner::serving().0 == owner::Class::Publish && !owner::serving_background()
                     } else {
                         startup_phase() && owner::for_main()
                     };
@@ -9770,7 +9770,7 @@ pub fn start_completion(up: *mut Unit, runtime: &crate::options::RuntimeOptions)
             // Completion is speculative: let demanded code (including the quit
             // handler and destructors) run between files (one file per request). A load is
             // structural work (a front write), so it is a program-class request, not a publish.
-            let reloading = owner::call(owner::Class::App, || {
+            let reloading = owner::call(owner::Class::Program, || {
                 let reloading = RELOADING.load(Ordering::Acquire) > 0;
                 unsafe {
                     if !reloading && !crate::preempt::is_stopped() && tier1_workers_ready() && !owner::nested() && (*up).prog.skipped_files.contains_key(&m) { load_modules(up, &[m], "completion"); }
@@ -9786,7 +9786,7 @@ pub fn start_completion(up: *mut Unit, runtime: &crate::options::RuntimeOptions)
 
 /// `makepad check` checks every body: the skipped files are loaded first (unit lock).
 pub unsafe fn load_all_skipped(up: *mut Unit) {
-    owner::call(owner::Class::App, || {
+    owner::call(owner::Class::Program, || {
         // a loaded file's own skipped `mod` children are skipped files in turn
         loop {
             let mods: Vec<u32> = (*up).prog.skipped_files.keys().copied().collect();
@@ -9800,7 +9800,7 @@ pub unsafe fn load_all_skipped(up: *mut Unit) {
 /// reads); other crates' files stay skipped unless a check needs them (check.rs loads them all
 /// and checks again then).
 pub unsafe fn load_skipped_of(up: *mut Unit, crates: &[u32]) {
-    owner::call(owner::Class::App, || loop {
+    owner::call(owner::Class::Program, || loop {
         let prog = &(*up).prog;
         let mods: Vec<u32> = prog.skipped_files.keys().copied().filter(|m| crates.contains(&prog.mods[*m as usize].krate)).collect();
         if mods.is_empty() { break; }
@@ -11648,7 +11648,7 @@ impl Drop for Unit {
                 while !TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
                     std::thread::yield_now();
                 }
-                owner::call(owner::Class::App, || {
+                owner::call(owner::Class::Program, || {
                     if unsafe { UNIT } == me {
                         unsafe { UNIT = std::ptr::null_mut() };
                     }
@@ -11679,7 +11679,7 @@ impl Drop for Unit {
 /// alone. Called with no unit lock held.
 pub unsafe fn retire_unit(up: *mut Unit) {
     pause_compile_jobs(false);
-    owner::call(owner::Class::App, || {
+    owner::call(owner::Class::Program, || {
         (&mut *up).flush_cache_records();
         (&mut *up).retired = true;
         if SPEC_UNIT.load(Ordering::Acquire) == up {
@@ -13189,7 +13189,7 @@ fn rt_hot(slot: u64) -> u64 {
             ensure_sufficient_stack(|| {
                 // One unit call for the whole build, its back end included. Concurrent
                 // callers wait for it.
-                owner::call(owner::program_class(), || {
+                owner::call(owner::Class::Program, || {
                     if (*rec.add(3)).load(Ordering::Acquire) == T_REPLAY {
                         TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
                         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_tier1(up, slot as u32)));
@@ -13673,7 +13673,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // exception to rule I-PUB (OWNERARCH.DESIGN.md: deterministic A/Bs only): a program-class
     // request, not a publish.
     if t1prof_replay(options) && !owner::is_owner() {
-        return owner::call(owner::Class::App, || compile_tier1(up, id));
+        return owner::call(owner::Class::Program, || compile_tier1(up, id));
     }
     // SPEC-V: unverified code gets O3 code too, built as it is (Unit::o3_allowed)
     if !owner::publish(|| (&*up).o3_allowed(id)) {
@@ -14766,15 +14766,15 @@ fn warmup() -> bool {
 
 /// A build for a program thread (not a speculative or tier-up worker's) after the first present.
 fn ahead_foreground() -> bool {
-    let class = if owner::is_owner() { owner::serving().0 } else { owner::program_class() };
-    FIRST_PRESENT.load(Ordering::Acquire) && matches!(class, owner::Class::Main | owner::Class::App) && !IS_WORKER.try_with(|w| w.get()).unwrap_or(false)
+    let class = if owner::is_owner() { owner::serving().0 } else { owner::Class::Program };
+    FIRST_PRESENT.load(Ordering::Acquire) && class == owner::Class::Program && !IS_WORKER.try_with(|w| w.get()).unwrap_or(false)
 }
 
 /// A program thread's lazy compile in the warm-up: built as the startup's are (baseline code, no
 /// inline candidates; hot code tiers up as startup code does), the cheapest code that runs.
 fn warmup_foreground() -> bool {
-    let class = if owner::is_owner() { owner::serving().0 } else { owner::program_class() };
-    matches!(class, owner::Class::Main | owner::Class::App) && !IS_WORKER.try_with(|w| w.get()).unwrap_or(false) && warmup()
+    let class = if owner::is_owner() { owner::serving().0 } else { owner::Class::Program };
+    class == owner::Class::Program && !IS_WORKER.try_with(|w| w.get()).unwrap_or(false) && warmup()
 }
 
 fn startup_holds_tier1() -> bool {
@@ -18906,7 +18906,7 @@ mod allocator_swap_tests {
         let served = std::sync::Arc::new(AtomicBool::new(false));
         let s2 = served.clone();
         let other = std::thread::spawn(move || {
-            owner::call(owner::Class::App, || ());
+            owner::call(owner::Class::Program, || ());
             s2.store(true, Ordering::SeqCst);
         });
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -19052,7 +19052,7 @@ extern "C" fn __relax_realtime(root: usize, data: usize, meta: usize) {
         return;
     }
     let upn = up as usize;
-    owner::call(owner::program_class(), move || unsafe { realtime_mark(upn as *mut Unit, root as u64, data as u64, meta as u64) });
+    owner::call(owner::Class::Program, move || unsafe { realtime_mark(upn as *mut Unit, root as u64, data as u64, meta as u64) });
 }
 
 unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64) {
