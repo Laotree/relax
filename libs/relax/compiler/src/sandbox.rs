@@ -80,6 +80,8 @@ const NWORDS: usize = 6;
 pub struct Arena {
     pub base: u64,
     pub module: u32,
+    /// the module's name (fault reports)
+    pub name: String,
     heap: Mutex<Heap>,
     /// image bytes / relocations already copied into this window
     synced: Mutex<(u32, u32, usize, usize)>,
@@ -123,9 +125,8 @@ struct Sb {
     /// (window offset, absolute value): words holding a code address (sandbox thunks)
     abs: Vec<(u32, u64)>,
     arenas: Vec<Arc<Arena>>,
-    /// unloaded arenas still mapped: (arena, the reclaim epoch it was unlinked at). Freed by
-    /// `reap_arenas` once no thread can still be inside since before that epoch (reclaim.rs)
-    dying: Vec<(Arc<Arena>, u64)>,
+    /// unloaded modules' arenas: tombstones, never freed (free_arena)
+    dead: Vec<Arc<Arena>>,
     /// twin -> slots its code refers to without a relocation (fn pointer constants)
     refs: HashMap<u32, Vec<u32>>,
     /// the two code spaces twins are installed in: (base, size, next); `active` gets new code,
@@ -224,7 +225,7 @@ unsafe fn sb_init(up: *mut Unit) -> Result<(), String> {
         rel: Vec::new(),
         abs: Vec::new(),
         arenas: Vec::new(),
-        dying: Vec::new(),
+        dead: Vec::new(),
         refs: HashMap::new(),
         spaces: [(s0, SPACE, s0), (s1, SPACE, s1)],
         active: 0,
@@ -795,7 +796,7 @@ pub fn any_live() -> bool {
     SB.lock().map(|g| g.is_some()).unwrap_or(true) || ARENAS.iter().any(|a| !a.load(std::sync::atomic::Ordering::Acquire).is_null())
 }
 
-pub fn new_arena(module: u32, mem: u64, fuel: i64) -> Result<Arc<Arena>, String> {
+pub fn new_arena(module: u32, name: &str, mem: u64, fuel: i64) -> Result<Arc<Arena>, String> {
     if cfg!(windows) {
         return Err("sandboxed run-time modules are not available on Windows yet".to_string());
     }
@@ -823,6 +824,7 @@ pub fn new_arena(module: u32, mem: u64, fuel: i64) -> Result<Arc<Arena>, String>
         let a = Arc::new(Arena {
             base,
             module,
+            name: name.to_string(),
             heap: Mutex::new(Heap { top: HEAP_BASE, mapped: HEAP_BASE, budget: mem, used: 0, free: vec![Vec::new(); 17], large_free: Vec::new(), sizes: HashMap::new() }),
             synced: Mutex::new((0, 0, 0, 0)),
             fuel: if (&*jit::current_unit()).prog.session.options.sandbox_fuel { fuel } else { 0 },
@@ -837,70 +839,80 @@ pub fn new_arena(module: u32, mem: u64, fuel: i64) -> Result<Arc<Arena>, String>
         if (module as usize) < MAX_MODULES {
             ARENAS[module as usize].store(Arc::as_ptr(&a) as *mut Arena, std::sync::atomic::Ordering::SeqCst);
         }
-        reap_locked(s);
         Ok(a)
     }
 }
 
-/// Unloads a module's arena: unlink -> prove quiescence -> free (as the code spaces, reclaim.rs).
-/// Unlink: the module index no longer names it and every entry refuses it; the stamp after that
-/// is the epoch it was unlinked at. A thread inside since before the stamp (parked in a host call
-/// the module made, or running there) keeps using the window and the `Arena` -- both stay valid --
-/// until it has left; only then are the window unmapped and the `Arena` dropped (`reap_arenas`).
-/// The window stays mapped meanwhile instead of turning PROT_NONE: runtime entries (allocator,
-/// formatting, result copies) touch it from host code on behalf of the thread still inside.
+/// Unloads a module's arena. Its address range is never used again (proving that no stale
+/// pointer into it is left -- a parked thread's frames, a host copy of a result pointer -- is not
+/// tractable): its pages go back to the OS and the range stays reserved, PROT_NONE, for the life
+/// of the process, so a late access traps and can never reach memory a later allocation got. Such
+/// a fault is never contained: the thread parks, the app pauses and the user decides (stale.rs).
+/// The `Arena` stays too, as a tombstone that refuses entry: a pointer to it (the module index, a
+/// thread's sandbox words) never dangles.
 pub fn free_arena(a: &Arc<Arena>) {
     let mut g = SB.lock().unwrap_or_else(|e| e.into_inner());
-    // (SeqCst: the stores are ordered before the stamp; an entry records its epoch, fences, then
-    // loads them -- store buffering with barriers on both sides, reclaim.rs)
     a.alive.store(false, std::sync::atomic::Ordering::SeqCst);
     if (a.module as usize) < MAX_MODULES {
         let _ = ARENAS[a.module as usize].compare_exchange(Arc::as_ptr(a) as *mut Arena, std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst);
     }
-    let stamp = crate::reclaim::advance();
-    match g.as_mut() {
-        Some(s) => {
-            let had = s.arenas.len();
-            s.arenas.retain(|x| !Arc::ptr_eq(x, a));
-            if s.arenas.len() != had {
-                s.dying.push((a.clone(), stamp));
-            }
-            reap_locked(s);
+    // registered before the range turns inaccessible: a fault there finds its module
+    crate::stale::register(a.base - GUARD, a.base + WINDOW + GUARD, "unloaded module", a.name.clone(), a.module as u64, format!("Module::unload of module #{} (`{}`): its window is reserved and inaccessible for good", a.module, a.name));
+    // the window's pages go, its addresses stay taken
+    if !retire_window(a.base - GUARD, WINDOW + 2 * GUARD) {
+        eprintln!("makepad: an unloaded module's memory at {:#x} could not be made inaccessible", a.base);
+        std::process::abort();
+    }
+    // (the heap's bookkeeping is the only sizeable part of the tombstone)
+    *a.heap.lock().unwrap_or_else(|e| e.into_inner()) = Heap { top: HEAP_END, mapped: HEAP_END, budget: 0, used: 0, free: Vec::new(), large_free: Vec::new(), sizes: HashMap::new() };
+    if let Some(s) = g.as_mut() {
+        let had = s.arenas.len();
+        s.arenas.retain(|x| !Arc::ptr_eq(x, a));
+        if s.arenas.len() != had {
+            s.dead.push(a.clone());
         }
-        // (no sandbox state: nothing can have entered it)
-        None => unsafe { unmap_window(a) },
     }
 }
 
-unsafe fn unmap_window(a: &Arena) {
-    munmap((a.base - GUARD) as *mut u8, (WINDOW + 2 * GUARD) as usize);
+/// [at, at + len) gives its pages back and stays reserved, inaccessible: one mmap over it
+/// (MAP_FIXED replaces the mapping in one step, NORESERVE: no commit charge).
+fn retire_window(at: u64, len: u64) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const MAP_FIXED_NORESERVE: i32 = 0x10 | 0x4000;
+    #[cfg(target_os = "macos")]
+    const MAP_FIXED_NORESERVE: i32 = 0x10 | 0x40;
+    #[cfg(windows)]
+    const MAP_FIXED_NORESERVE: i32 = 0;
+    unsafe { mmap(at as *mut u8, len as usize, 0, MAP_ANON_PRIV | MAP_FIXED_NORESERVE, -1, 0) as u64 == at }
 }
 
-/// Frees the unloaded arenas no thread can still be inside (see free_arena). Returns how many
-/// are still waiting for a thread to leave.
-pub fn reap_arenas() -> usize {
-    let mut g = SB.lock().unwrap_or_else(|e| e.into_inner());
-    match g.as_mut() {
-        Some(s) => reap_locked(s),
-        None => 0,
+/// What lies at `off` in a module's (window + guards) range: names the data a stale pointer
+/// pointed to (stale.rs).
+pub fn describe_window_offset(off: u64) -> String {
+    if off < GUARD || off >= GUARD + WINDOW {
+        return "a guard page next to the window".to_string();
+    }
+    let o = (off - GUARD) as u32;
+    if o < RO_BASE {
+        "the null page".to_string()
+    } else if o < RO_END {
+        format!("read-only data image +{:#x}", o - RO_BASE)
+    } else if o < RW_END {
+        format!("statics image +{:#x}", o - RW_BASE)
+    } else if o < SEGS + NSEG * SEG {
+        let k = (o - SEGS) / SEG;
+        let w = (o - SEGS) % SEG;
+        let part = if w < SEG_GUARD { "guard" } else if w < STACK_LO { "runtime scratch" } else { "shadow stack" };
+        format!("thread segment {} {} +{:#x}", k, part, w)
+    } else {
+        format!("heap +{:#x}", o - HEAP_BASE)
     }
 }
 
-fn reap_locked(s: &mut Sb) -> usize {
-    s.dying.retain(|(a, stamp)| {
-        if !crate::reclaim::quiescent_since(*stamp) {
-            return true;
-        }
-        unsafe { unmap_window(a) };
-        false
-    });
-    s.dying.len()
-}
-
-/// Unloaded arenas still mapped because a thread may be inside (memory report, tests).
-pub fn dying_arenas() -> usize {
+/// Unloaded modules' windows (reserved, inaccessible, never reused) (memory report, tests).
+pub fn dead_arenas() -> usize {
     let g = SB.lock().unwrap_or_else(|e| e.into_inner());
-    g.as_ref().map_or(0, |s| s.dying.len())
+    g.as_ref().map_or(0, |s| s.dead.len())
 }
 
 impl Heap {
@@ -1109,7 +1121,8 @@ fn budget_growth(base: u64, bytes: u64, commit: bool) -> bool {
     })
 }
 
-pub fn entry_depth() -> u64 { crate::reclaim::depth() }
+/// This thread's wrapper entries in progress.
+pub fn entry_depth() -> u64 { ENTRIES.try_with(|es| es.borrow().len() as u64).unwrap_or(0) }
 /// A contained fault or deadline unwound past the wrappers: their frames are gone (the words
 /// were restored by the guard; the entries and segments of the frames that left go too).
 pub fn entry_recover(depth: u64) {
@@ -1119,7 +1132,6 @@ pub fn entry_recover(depth: u64) {
             pop_entry(&mut es);
         }
     });
-    crate::reclaim::recover(depth)
 }
 
 pub fn budget_depth() -> usize { ACCOUNTS.with(|s| s.borrow().len()) }
@@ -1213,23 +1225,15 @@ pub fn enter_module(idx: u32) -> Result<(), EnterError> {
     if idx as usize >= MAX_MODULES {
         return Err(EnterError::Unloaded);
     }
-    // recorded before the arena (and any twin's slot word) is loaded: either free_arena's proof
-    // sees this thread inside, or this load sees the unlink (reclaim.rs). The `Arena` behind the
-    // pointer stays valid while this thread is inside: it is freed only after the proof.
-    crate::reclaim::enter();
-    let p = ARENAS[idx as usize].load(std::sync::atomic::Ordering::SeqCst);
+    // (an `Arena` is never freed: an unloaded one is a tombstone that refuses entry)
+    let p = ARENAS[idx as usize].load(std::sync::atomic::Ordering::Acquire);
     if p.is_null() {
-        crate::reclaim::leave();
         return Err(EnterError::Unloaded);
     }
-    let r = enter_raw(unsafe { &*p });
-    if r.is_err() {
-        crate::reclaim::leave();
-    }
-    r
+    enter_raw(unsafe { &*p })
 }
 
-/// The entry proper (the thread's reclaim record is already taken).
+/// The entry proper.
 fn enter_raw(a: &Arena) -> Result<(), EnterError> {
     if !a.alive.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(EnterError::Unloaded);
@@ -1308,7 +1312,7 @@ fn claim_seg(a: &Arena) -> Option<u32> {
 fn pop_entry(es: &mut Vec<Entry>) -> Option<[i64; NWORDS]> {
     let e = es.pop()?;
     if e.claimed {
-        // (the arena is valid: this thread is still inside, reclaim.rs)
+        // (an `Arena` is never freed)
         unsafe { (*e.arena).segs.fetch_and(!(1u64 << e.seg), std::sync::atomic::Ordering::AcqRel) };
     }
     Some(e.prev)
@@ -1342,7 +1346,6 @@ pub fn leave() {
     if let Some(p) = prev {
         restore(Saved(p));
     }
-    crate::reclaim::leave();
 }
 
 /// Shadow-stack bytes for a wrapper's argument copy or result slot (0: no room).

@@ -65,10 +65,16 @@ if [ "$GOT" = "$(cat "$D/expect-contain.out")" ]; then echo "modules contain: PA
 OUT=$(MAKEPAD_RUN_WATCHDOG_MS=120000 "$1" test "$D/reclaim_threads.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$GOT" = "$(cat "$D/expect-reclaim.out")" ]; then echo "modules reclaim threads: PASS ($(echo "$OUT" | grep -o 'reclaim_threads: .*'))"; else echo "modules reclaim threads: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
-# Arena reclamation: a module unloaded while a thread is inside keeps its window until it left (SAFE2 F2).
-OUT=$(MAKEPAD_RUN_WATCHDOG_MS=120000 "$1" test "$D/unload_inside.rs" 2>&1)
+# Module unload: the window is never reused; a stale access into it ends the process, named (SAFE2 F2).
+OUT=$("$1" test "$D/unload_inside.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$GOT" = "$(cat "$D/expect-unload-inside.out")" ]; then echo "modules unload inside: PASS ($(echo "$OUT" | grep -o 'unload_inside: .*'))"; else echo "modules unload inside: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
+if [ "$GOT" = "$(cat "$D/expect-unload-inside.out")" ]; then echo "modules unload: PASS"; else echo "modules unload: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
+for CASE in parked host; do
+OUT=$(SAFE2_UNLOAD_CRASH=$CASE "$1" test "$D/unload_inside.rs" 2>&1)
+STATUS=$?
+if [ "$STATUS" != 0 ] && ! echo "$OUT" | grep -q '^out ' && echo "$OUT" | grep -q 'stale access into the unloaded module `parker`'; then echo "modules stale access ($CASE) ends the process: PASS"; else echo "modules stale access ($CASE): FAIL (status $STATUS)"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
+done
+python3 "$D/stale_park.py" "$1" || exit 1
 # Module code handed to the host as a value is refused at the host API boundary (SAFE2 F3).
 OUT=$("$1" test "$D/escape_fn.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')

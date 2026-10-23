@@ -166,6 +166,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("hitch", "[ms=<n>|off]", "frames over the threshold (default 50 ms, always on) are `hitch` events with phases, waits, lazy compiles, critical path and probe deltas: `events on=hitch`, `watch on=hitch`"),
     ("rm", "<G<n>|all>", "removes probe groups: the code they replaced comes back (no recompile)"),
     ("continue", "[K<n>|all]", "lets parked breakpoint hits go"),
+    ("stale", "[n=8]", "stale accesses (into memory the JIT retired for good: unloaded modules, invalidated code), answer first: who touched what, where in it, when and why it was retired, the report; then the retired ranges. A stale access parks its thread and pauses the app until `resume P<n> restart | stop`"),
     ("pause", "", "stops the program's threads (makepad run's and inspect's keep running); stacks work while paused"),
     ("resume", "", "after pause: the program runs again (`resume P<n> panic` releases a parked panic)"),
     ("gpu", "[top [by=bytes|owner|site|churn] [n=15]|idle [frames=1800] [n=15]|snap <name>|diff <a> <b|now>|path <session>:<kind>:<index>:<generation>]", "HAL GPU memory: totals per session, kind and owner against the device (native apps: MAKEPAD_INSPECT=1 or MAKEPAD_REMOTE=1)"),
@@ -259,6 +260,7 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "watch" => events::cmd_watch(req, out),
         "events" => events::cmd_events(req, out),
         "panics" => events::cmd_panics(out),
+        "stale" => crate::stale::cmd(req, out),
         "resume" if !req.pos.is_empty() => events::cmd_resume(req, out),
         "count" | "break" | "restartable" | "probes" | "rm" | "continue" | "pause" | "resume" => instrument::cmd(req, out),
         "" => out.err("empty request"),
@@ -902,7 +904,9 @@ fn cmd_stacks(req: &Req, out: &mut Out) {
         Err(e) => return out.err(&e),
     };
     let mut partial = Vec::new();
-    let frames: Vec<Vec<u64>> = caps.iter().map(|c| c.frames.iter().copied().take(depth.max(1) + 1).collect()).collect();
+    // a thread parked at a stale access waits in its fault handler: its program frames are the
+    // ones recorded at the fault (stale.rs)
+    let frames: Vec<Vec<u64>> = caps.iter().map(|c| events::stale_frames_of(c.t.os_id).unwrap_or_else(|| c.frames.clone()).into_iter().take(depth.max(1) + 1).collect()).collect();
     let syms = symbolise(&frames, &mut partial);
     out.measured(&format!("stacks of {} thread(s), captured now", caps.len()), "os capture (no owner)", &partial);
     // identical stacks folded

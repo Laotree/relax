@@ -234,8 +234,8 @@ pub fn restored_state() -> Option<String> {
 
 /// Sandbox code and data statistics: [recycles, code bytes in use, dead code bytes pending,
 /// image read-only bytes, image read-write bytes, live arenas, recycles refused because a thread
-/// was still inside the space to reuse, unloaded arenas still mapped because a thread may be
-/// inside]. `recycle`: rebuild the live
+/// was still inside the space to reuse, unloaded modules' windows (reserved, inaccessible, never
+/// reused)]. `recycle`: rebuild the live
 /// module code first (blocking; Err when frames may still run in the space it would reuse).
 pub fn sandbox_stats(recycle: bool) -> Result<[u64; 8], String> {
     let mut out = [0u64; 8];

@@ -1925,6 +1925,21 @@ pub(crate) fn collect_frames(rbp: u64, pc: u64, pc_is_ret: bool) -> Vec<u64> {
 
 /// `collect_frames` over return addresses already read (a fault handler's record): JIT frames,
 /// and the C frames above a stop inside C code up to the JIT code that called it.
+/// A stale access's frames (stale.rs): the pc, then the JIT return addresses of the raw walk.
+pub(crate) fn stale_frames(pc: u64, raw: &[u64]) -> Vec<u64> {
+    frames_from_raw(pc, false, raw)
+}
+
+/// A stale access's crash report (stale.rs; off the faulting thread: the owner is asked with a
+/// deadline, since the faulting thread may be the owner itself).
+pub(crate) fn stale_report(message: &str, frames: &[u64], addr: u64) -> String {
+    if unsafe { UNIT.is_null() } {
+        return String::from("{}");
+    }
+    let info = PanicInfo { kind: "stale access".to_string(), message: message.to_string(), site: u64::MAX, frames: frames.to_vec(), fault_addr: addr, location: String::new() };
+    owner::call_within(owner::Class::Job, 2000, || unsafe { (&*UNIT).report(&info) }).unwrap_or_else(|| format!("{{\"message\":\"(the owner did not answer: raw frames {:x?})\"}}", frames))
+}
+
 fn frames_from_raw(pc: u64, pc_is_ret: bool, raw: &[u64]) -> Vec<u64> {
     let mut frames = vec![pc.wrapping_sub(pc_is_ret as u64)];
     if unsafe { UNIT.is_null() } {
@@ -2614,7 +2629,15 @@ unsafe fn on_fault_locked(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os:
     let safe = FAULT_SAFE.try_with(|c| c.get()).unwrap_or(0) > 0;
     // (leaf_of_jit reads the stack: only asked when it decides)
     let leaf = || !jit && !safe && has_unit && has_ctx && leaf_of_jit(f);
-    match containment(jit, at_leave, has_unit, has_ctx, hooks.chained, safe, leaf) {
+    // an access into memory the JIT retired for good (an unloaded module's window, invalidated
+    // code: reserved, inaccessible, never reused): a stale pointer, never contained (stale.rs;
+    // lock-free lookup of the data address, and of the pc for a jump into retired code)
+    let stale = if matches!(f.kind, Kind::Segv | Kind::Bus) { crate::stale::lookup(fault).or_else(|| crate::stale::lookup(pc)) } else { None };
+    match containment(jit, at_leave, has_unit, has_ctx, hooks.chained, safe, stale.is_some(), leaf) {
+        Containment::Stale => {
+            let r = stale.expect("stale range");
+            crate::stale::on_fault(f, r, |out| walk_fp_bounded(f.fp, f.sp, out))
+        }
         Containment::FatalReport => {
             note_tombstone_fault(f);
             fatal_report(f)
@@ -2650,12 +2673,18 @@ enum Containment {
     Die,
     /// recorded and resumed at the recovery point
     Contain,
+    /// an access into retired memory (stale.rs): the thread parks, the app pauses, the user
+    /// decides -- whatever code made it and whatever recovery point is there
+    Stale,
 }
 
 /// Which faults are contained: only those in JIT code, in FaultSafe host code, or in a leaf JIT
 /// code called. A fault in other Rust or C code may leave locks held and state half made
 /// (a longjmp runs no cleanup): it ends the process (JITSAFE fix 7).
-fn containment(jit: bool, at_leave: bool, has_unit: bool, has_ctx: bool, chained: bool, safe: bool, leaf: impl FnOnce() -> bool) -> Containment {
+fn containment(jit: bool, at_leave: bool, has_unit: bool, has_ctx: bool, chained: bool, safe: bool, stale: bool, leaf: impl FnOnce() -> bool) -> Containment {
+    if stale {
+        return Containment::Stale;
+    }
     if has_unit && (jit && !has_ctx || at_leave) {
         return Containment::FatalReport;
     }
@@ -2681,20 +2710,24 @@ mod containment_tests {
     #[test]
     fn only_jit_faultsafe_and_leaf_faults_are_contained() {
         // (jit, at_leave, unit, ctx, chained, safe, leaf)
-        assert_eq!(containment(true, false, true, true, false, false, || false), Contain);
-        assert_eq!(containment(false, false, true, true, false, true, || false), Contain);
-        assert_eq!(containment(false, false, true, true, false, false, || true), Contain);
+        assert_eq!(containment(true, false, true, true, false, false, false, || false), Contain);
+        assert_eq!(containment(false, false, true, true, false, true, false, || false), Contain);
+        assert_eq!(containment(false, false, true, true, false, false, false, || true), Contain);
         // Rust/C host code with a recovery point: the process ends, never a longjmp past it
-        assert_eq!(containment(false, false, true, true, false, false, || false), Die);
+        assert_eq!(containment(false, false, true, true, false, false, false, || false), Die);
         // a library's own handler sees faults in its code first
-        assert_eq!(containment(false, false, true, true, true, false, || true), PassOn);
-        assert_eq!(containment(true, false, true, true, true, false, || false), Contain);
+        assert_eq!(containment(false, false, true, true, true, false, false, || true), PassOn);
+        assert_eq!(containment(true, false, true, true, true, false, false, || false), Contain);
         // JIT code without a recovery point, or at the recovery entry: fatal report
-        assert_eq!(containment(true, false, true, false, false, false, || false), FatalReport);
-        assert_eq!(containment(false, true, true, true, false, false, || true), FatalReport);
+        assert_eq!(containment(true, false, true, false, false, false, false, || false), FatalReport);
+        assert_eq!(containment(false, true, true, true, false, false, false, || true), FatalReport);
         // no unit / no recovery point outside JIT code: not ours
-        assert_eq!(containment(false, false, false, false, false, false, || true), PassOn);
-        assert_eq!(containment(false, false, true, false, false, false, || true), PassOn);
+        assert_eq!(containment(false, false, false, false, false, false, false, || true), PassOn);
+        assert_eq!(containment(false, false, true, false, false, false, false, || true), PassOn);
+        // an access into retired memory: never contained, from any code
+        assert_eq!(containment(true, false, true, true, false, false, true, || false), Stale);
+        assert_eq!(containment(false, false, true, true, false, true, true, || true), Stale);
+        assert_eq!(containment(false, false, true, true, true, false, true, || false), Stale);
     }
 
     #[test]

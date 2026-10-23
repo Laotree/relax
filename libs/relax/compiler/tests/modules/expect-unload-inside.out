@@ -1,4 +1,2 @@
-out unload while inside defers the free: true
-out parked call returns through its window: true
-out freed once it left: true
-out racing unloads: true
+out calls after unload are refused: true
+out dead windows stay reserved: true

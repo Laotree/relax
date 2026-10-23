@@ -796,7 +796,7 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
     }
     let mem: u64 = runtime.module_mem_mb << 20;
     let fuel: i64 = runtime.module_fuel;
-    let arena = match crate::sandbox::new_arena(idx, mem, fuel) {
+    let arena = match crate::sandbox::new_arena(idx, name, mem, fuel) {
         Ok(a) => a,
         Err(e) => return Err(fail(up, &defs, vec![e])),
     };
@@ -1286,7 +1286,7 @@ pub fn guard_reset(m: GuardMark) {
 
 /// Sandbox statistics for tests and memory reports: [recycles, code bytes in the active space,
 /// dead code bytes pending, image ro bytes, image rw bytes, arenas live, recycles refused, unloaded
-/// arenas still mapped because a thread may be inside]. `recycle`
+/// modules' windows (reserved, inaccessible, never reused)]. `recycle`
 /// != 0 runs a recycle now (blocking).
 pub extern "C" fn __relax_sb_stats(out: *mut [u64; 8], recycle: u32) -> u32 {
     let mut ok = 1;
@@ -1302,8 +1302,7 @@ pub extern "C" fn __relax_sb_stats(out: *mut [u64; 8], recycle: u32) -> u32 {
     }
     let (r, used, dead) = crate::sandbox::code_stats();
     let (ro, rw, n) = crate::sandbox::stats();
-    let dying = crate::sandbox::reap_arenas();
-    unsafe { *out = [r as u64, used, dead, ro as u64, rw as u64, n as u64, crate::sandbox::refused_recycles(), dying as u64] };
+    unsafe { *out = [r as u64, used, dead, ro as u64, rw as u64, n as u64, crate::sandbox::refused_recycles(), crate::sandbox::dead_arenas() as u64] };
     ok
 }
 
