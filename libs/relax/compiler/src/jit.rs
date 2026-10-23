@@ -14759,7 +14759,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // the fronts the last round's left-out candidates needed, made here (each once)
     for s in std::mem::take(&mut needs) {
         if fronted.insert(s) {
-            prefront_drained(&front, s);
+            prefront_slot(&front, s);
         }
     }
     }
@@ -15147,13 +15147,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let _preemptible = crate::preempt::Preemptible::on();
         typeck_ahead(&front, d, args, 1, false, true);
         let _want = WantConsts::on();
-        let noted = want_notes();
-        if lower_ahead(&front, c, true) != AF_OK && want_notes() != noted {
-            // its constants evaluated by the owner meanwhile (prefront_drained)
-            owner::publish(|| ());
-            owner::publish(|| ());
-            lower_ahead(&front, c, true);
-        }
+        lower_ahead(&front, c, true);
     }
     TIER1_SNAP_FRONTS[1].fetch_add(cpu_ns() - tf, Ordering::Relaxed);
     ids.extend(ups);
@@ -18415,23 +18409,6 @@ fn prefront_slot(front: &FrontShared, id: u32) -> bool {
     ok
 }
 
-/// `prefront_slot`, and once more after the owner's const_drain when its lowering named constants
-/// (or thread-locals) nobody had evaluated yet: the owner evaluates them between requests, so two
-/// empty publishes later they are there (the first's drain runs before the second is served).
-/// An O3 snapshot's candidates otherwise needed a round per such front, and were left out first.
-fn prefront_drained(front: &FrontShared, id: u32) -> bool {
-    let noted = want_notes();
-    if prefront_slot(front, id) {
-        return true;
-    }
-    if want_notes() == noted || owner::is_owner() {
-        return false;
-    }
-    owner::publish(|| ());
-    owner::publish(|| ());
-    prefront_slot(front, id)
-}
-
 /// `prefront_slot` of a closure: lowered here from its parent's checked body, which the owner hands
 /// over in a publish (an Arc; the parent's own build or the disk cache's check put it there). The
 /// take checks the parent still has that body (take_lowered_ahead). False: the parent has no
@@ -19242,9 +19219,7 @@ fn lower_ahead(f: &FrontShared, id: u32, own: bool) -> u8 {
     let r = lower_ahead_as(u, id, id, d, &key.1, epoch, None);
     let why = r.as_ref().err().copied().unwrap_or(AF_OK);
     let mut pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
-    // (a failed lowering leaves no entry: a later front tries again -- after the owner evaluated
-    // the constants it named, prefront_drained -- instead of reading "failed before")
-    if f.is_built(&key) || r.is_err() {
+    if f.is_built(&key) {
         pending.remove(&id);
     } else if let Some(slot) = pending.get_mut(&id) {
         *slot = r.ok();
