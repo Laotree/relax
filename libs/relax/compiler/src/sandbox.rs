@@ -386,7 +386,8 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
         }
     }
     // build everything first: nothing changes unless every live twin rebuilt
-    let mut built: Vec<(u32, u64, Vec<u8>, Vec<(u32, u64)>, Option<relax_backend::rir::UnwindInfo>)> = Vec::new();
+    // (twin, address, linked code, already written, pc map, unwind info)
+    let mut built: Vec<(u32, u64, Vec<u8>, bool, Vec<(u32, u64)>, Option<relax_backend::rir::UnwindInfo>)> = Vec::new();
     let mut next = tbase;
     for &t in &live {
         let (code, map, relocs) = jit::compile_fn(up, t)?;
@@ -396,10 +397,20 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
         if at + code.len() as u64 > tbase + tsize {
             return Err("the live twins do not fit one sandbox code space".to_string());
         }
-        next = at + code.len() as u64;
         let u = &*up;
-        let linked = u.link_at(at, code, &relocs)?;
-        built.push((t, at, linked, map, info));
+        match u.link_at(at, code, &relocs) {
+            Ok(linked) => {
+                next = at + code.len() as u64;
+                built.push((t, at, linked, false, map, info));
+            }
+            // as emit_twin: code the space cannot link (a host call beyond arm64 branch reach
+            // needs the unit code's veneers) goes to the unit's code memory, written now (fresh,
+            // unreachable until its slot word moves) and never reused
+            Err(_) => {
+                let at = u.emit_linked(code, &relocs)?;
+                built.push((t, at, code.to_vec(), true, map, info));
+            }
+        }
     }
     // free: the old code goes (traps where nothing new lands), the new code is written, and
     // every core of the process synchronises its instruction stream before a reused address
@@ -407,8 +418,10 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
     if old_hw > tbase {
         zap_code(tbase, old_hw - tbase);
     }
-    for (_, at, code, _, _) in &built {
-        crate::os::mem::write_code(*at, code);
+    for (_, at, code, written, _, _) in &built {
+        if !written {
+            crate::os::mem::write_code(*at, code);
+        }
     }
     if old_hw > tbase && !crate::os::mem::sync_cores() {
         REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -416,7 +429,7 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
     }
     // unlink: each live twin's table word points to its new code; dead twins back to their stubs
     let u = &mut *up;
-    for (t, at, code, map, info) in built {
+    for (t, at, code, _, map, info) in built {
         u.index_code(at, code.len() as u32, t, info);
         if jit::perf_map_on() {
             jit::perf_map(at, code.len(), &format!("{} [sandbox]", jit::perf_name(u, t)));
