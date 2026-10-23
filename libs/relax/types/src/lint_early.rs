@@ -2867,6 +2867,80 @@ pub(crate) struct AttrNode<'a> {
     pub macro_use_target: bool,
 }
 
+pub const ILL_FORMED_ATTRIBUTE_INPUT: Lint = lint::lint("ill_formed_attribute_input");
+pub const MALFORMED_DIAGNOSTIC_FORMAT_LITERALS: Lint = lint::lint("malformed_diagnostic_format_literals");
+
+/// rustc_parse_format (ParseMode::Diagnostic) over the string literal at `pos` (its source bytes
+/// `tok`), with rustc_attr_parsing's warnings on its arguments and check_attr's unknown
+/// parameter of a trait (`trait_params`: the trait's name and its type/const parameters).
+/// Positions are those of the source (escapes and `\` line continuations mapped back). A literal
+/// that does not parse gets rustc's parse error only, which is not reported here.
+fn diagnostic_format_lints(pos: u32, tok: &[u8], trait_params: Option<&(String, Vec<String>)>, emit: &mut dyn FnMut(u32, &str)) {
+    let Ok(src) = std::str::from_utf8(tok) else { return };
+    // the literal's characters with their source offsets
+    let mut chars: Vec<(char, u32)> = Vec::new();
+    if let Some(rest) = src.strip_prefix('r') {
+        let hashes = rest.bytes().take_while(|&b| b == b'#').count();
+        let start = 1 + hashes + 1;
+        let end = src.len().saturating_sub(1 + hashes);
+        if start > end { return; }
+        for (i, c) in src[start..end].char_indices() { chars.push((c, (start + i) as u32)); }
+    } else if src.starts_with('"') && src.len() >= 2 {
+        let body = &src[1..src.len() - 1];
+        let mut it = body.char_indices().peekable();
+        while let Some((i, c)) = it.next() {
+            let at = (1 + i) as u32;
+            if c != '\\' { chars.push((c, at)); continue; }
+            match it.next() {
+                Some((_, '\n')) => { while matches!(it.peek(), Some((_, ' ' | '\t' | '\n' | '\r'))) { it.next(); } }
+                Some((_, 'x')) => { it.next(); it.next(); chars.push(('?', at)); }
+                Some((_, 'u')) => { while let Some((_, c)) = it.next() { if c == '}' { break; } } chars.push(('?', at)); }
+                Some((_, c)) => chars.push((if c == '{' || c == '}' { c } else { '?' }, at)),
+                None => return,
+            }
+        }
+    } else { return; }
+    let ch = |i: usize| chars.get(i).map(|c| c.0);
+    let mut warnings: Vec<(u32, String)> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i].0 {
+            '{' if ch(i + 1) == Some('{') => i += 2,
+            '}' if ch(i + 1) == Some('}') => i += 2,
+            '}' => return,
+            '{' => {
+                i += 1;
+                while ch(i).is_some_and(|c| c.is_whitespace()) { i += 1; }
+                let at = chars.get(i).map_or(pos, |c| pos + c.1);
+                if ch(i).is_some_and(|c| c.is_ascii_digit()) {
+                    while ch(i).is_some_and(|c| c.is_ascii_digit()) { i += 1; }
+                    warnings.push((at, "indexed format arguments are not permitted in diagnostic attributes".into()));
+                } else if ch(i).is_some_and(|c| c == '_' || c.is_alphabetic()) && !(ch(i) == Some('_') && !ch(i + 1).is_some_and(|c| c == '_' || c.is_alphanumeric())) {
+                    let mut name = String::new();
+                    while let Some(c) = ch(i).filter(|&c| c == '_' || c.is_alphanumeric()) { name.push(c); i += 1; }
+                    if let Some((tr, params)) = trait_params {
+                        if name != "Self" && !params.contains(&name) { warnings.push((at, format!("there is no parameter `{}` on trait `{}`", name, tr))); }
+                    }
+                } else {
+                    warnings.push((at, "positional arguments are not permitted in diagnostic attributes".into()));
+                }
+                while ch(i).is_some_and(|c| c.is_whitespace()) { i += 1; }
+                if ch(i) == Some(':') {
+                    i += 1;
+                    let ty_at = chars.get(i).map_or(pos, |c| pos + c.1);
+                    let start = i;
+                    while ch(i).is_some_and(|c| c != '{' && c != '}') { i += 1; }
+                    if i > start { warnings.push((ty_at, "format specifiers are not permitted in diagnostic attributes".into())); }
+                }
+                if ch(i) != Some('}') { return; }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    for (at, msg) in warnings { emit(at, &msg); }
+}
+
 const DIAGNOSTIC_ATTRIBUTES: &[(&str, Option<&str>)] = &[
     ("on_unimplemented", None), ("do_not_recommend", None), ("on_move", Some("diagnostic_on_move")),
     ("on_const", Some("diagnostic_on_const")), ("on_unknown", Some("diagnostic_on_unknown")),
@@ -2925,6 +2999,32 @@ pub(crate) fn attr_checks(prog: &Program, n: &AttrNode) {
                 while i < hi && pf.bytes(pf.tok(i as u32).lo, pf.tok(i as u32).hi) != b"::" { i += 1; }
                 emit(&UNKNOWN_DIAGNOSTIC_ATTRIBUTES, pf.tok((i + 1).min(hi - 1) as u32).lo, "unknown diagnostic attribute");
             }
+        }
+        // ---- the format literals of `message`, `label` and `note` (rustc_attr_parsing
+        // diagnostic/mod.rs parse_format_string; check_attr.rs check_diagnostic_on_unimplemented)
+        if path.len() == 2 && path[0] == b"diagnostic" && matches!(&path[1][..], b"on_unimplemented" | b"on_const" | b"on_move")
+            && DIAGNOSTIC_ATTRIBUTES.iter().any(|(k, f)| k.as_bytes() == &path[1][..] && f.is_none_or(|f| feature_enabled(prog, krate, f))) {
+            if let Args::List { items } = args {
+                // a trait's own `#[diagnostic::on_unimplemented]`: its type and const parameters
+                let trait_params = (path[1] == b"on_unimplemented" && prog.def(d).kind == DefKind::Trait).then(|| {
+                    let def = prog.def(d);
+                    let tf = &prog.files[def.file as usize];
+                    let names: Vec<String> = tf.ast.kind_generics(&tf.ast.item(def.item).kind).map(|g| tf.ast.list(g.params).iter()
+                        .filter(|p| !matches!(p.kind, GenericParamKind::Lifetime(_))).map(|p| tf.text(p.name).to_string()).collect()).unwrap_or_default();
+                    (prog.name(d).to_string(), names)
+                });
+                for m in items {
+                    let Meta::Item { path: key, args: Args::Value { pos, tok }, .. } = m else { continue };
+                    if !(key.len() == 1 && matches!(&key[0][..], b"message" | b"label" | b"note")) { continue; }
+                    diagnostic_format_lints(*pos, tok, trait_params.as_ref(), &mut |at, msg| emit(&MALFORMED_DIAGNOSTIC_FORMAT_LITERALS, at, msg));
+                }
+            }
+        }
+        // ---- test_attrs.rs IgnoreParser: `#[ignore]` or `#[ignore = "reason"]`; a list, or a value
+        // that is no string, is ill-formed input (a future-incompatibility lint, deny by default)
+        if word.as_deref() == Some("ignore") {
+            let bad = match args { Args::None => false, Args::Value { tok, .. } => !(tok.first() == Some(&b'"') || tok.starts_with(b"r\"") || tok.starts_with(b"r#")), Args::List { .. } => true };
+            if bad { emit(&ILL_FORMED_ATTRIBUTE_INPUT, apos, "valid forms for the attribute are `#[ignore = \"reason\"]` and `#[ignore]`"); }
         }
         // ---- lint attributes: empty lists, `reason` only, crate-level-only lints
         if matches!(word.as_deref(), Some("allow" | "warn" | "deny" | "forbid" | "expect")) {
