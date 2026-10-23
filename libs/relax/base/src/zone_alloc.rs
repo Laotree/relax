@@ -119,6 +119,9 @@ mod disabled {
     pub fn destroy_older() -> (usize, usize) {
         (0, 0)
     }
+    pub fn generation_live(_: u64) -> usize {
+        0
+    }
     pub fn epoch_of(_: *const u8) -> Option<u64> {
         None
     }
@@ -224,6 +227,11 @@ pub fn compiler_destroy_generation(g: u64) -> (usize, usize) {
 /// Returns (chunks, touched bytes); every user of those generations must be quiesced.
 pub fn compiler_destroy_older() -> (usize, usize) {
     compiler::destroy_older()
+}
+
+/// Requested live bytes of compiler generation `g` (a diagnostic header walk).
+pub fn compiler_generation_live(g: u64) -> usize {
+    compiler::generation_live(g)
 }
 
 /// The generation of the live compiler block at `p` (None: not a live arena address).

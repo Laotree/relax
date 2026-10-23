@@ -12,7 +12,7 @@ mod collected;
 mod privacy;
 pub use privacy::PrivacyError;
 mod rsim;
-pub use rsim::{SimDiag, SimKind};
+pub use rsim::{MacBinding, MacRes, SimDiag, SimKind};
 mod attrs;
 mod validate;
 
@@ -449,6 +449,21 @@ fn recursion_limit(file: &ParsedFile) -> usize {
 }
 
 impl CrateInfo {
+    /// rustc `tcx.crate_name(krate)`: the root's `#![crate_name = ".."]` when it has one (rustc_session
+    /// output.rs find_crate_name: the attribute names a crate built without `--crate-name`; with it, the two
+    /// must agree), else the name the crate was loaded under. Read from the root attributes on each call:
+    /// only rustc's crate-name special cases ask.
+    pub fn crate_name<'p>(&'p self, prog: &'p Program) -> std::borrow::Cow<'p, str> {
+        let file = &prog.files[prog.mods[self.root_mod as usize].file as usize];
+        for attr in &file.ast.root_attrs {
+            if attr.toks.hi == attr.toks.lo + 3 && file.tok_text(attr.toks.lo) == "crate_name" && file.tok_text(attr.toks.lo + 1) == "="
+                && matches!(file.tok(attr.toks.lo + 2).kind, crate::lexer::T::Str | crate::lexer::T::RawStr) {
+                return std::borrow::Cow::Owned(crate::lit::unescape_str(file.tok_text(attr.toks.lo + 2)));
+            }
+        }
+        std::borrow::Cow::Borrowed(prog.syms.str(self.name))
+    }
+
     /// The crate's `#![feature(..)]` declarations.
     pub fn features(&self, prog: &Program) -> &crate::features::Features {
         self.features.get_or_init(|| crate::features::Features::read(prog, prog.mods[self.root_mod as usize].file, &self.cfg))
@@ -571,6 +586,8 @@ pub struct Program {
     pub sim_ambiguity: Option<HashMap<(u32, Sym, bool), u8>>,
     /// what the replay reported, until the check emits it
     pub sim_diags: Option<Vec<SimDiag>>,
+    /// the import replay's macro namespace of the checked modules (rsim.rs `macro_table`)
+    pub sim_macros: Option<HashMap<(u32, Sym), rsim::MacBinding>>,
     /// lexical lookups (`lookup_in_scope`) once imports are resolved: (module, name, ns_type);
     /// cleared whenever a binding is defined or imports are resolved again
     scope_cache: crate::conc::MemoMap<(u32, Sym, bool), Option<DefId>>,
@@ -906,6 +923,7 @@ impl Program {
             own_crates: Vec::new(),
             sim_ambiguity: None,
             sim_diags: None,
+            sim_macros: None,
             scope_cache: Default::default(),
             import_used: Default::default(),
             glob_used: Default::default(),
