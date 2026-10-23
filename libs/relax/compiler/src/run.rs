@@ -460,8 +460,7 @@ pub(crate) fn resolve_package(
     let order = crate::crates::topo_order(&g.crates);
     let mut cfgs: Vec<crate::cfg::CfgSet> = Vec::with_capacity(g.crates.len());
     for (ci, c) in g.crates.iter().enumerate() {
-        let mut cs = crate::cfg::CfgSet::host(sess, &c.features);
-        cs.set.push("relax".to_string());
+        let mut cs = crate::program_cfg(sess, &c.features);
         for x in &g.cfgs[ci] {
             cs.set.push(x.replace('"', ""));
         }
@@ -1624,6 +1623,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         for (name, d) in &export_defs {
             let en = crate::owner::call(crate::owner::Class::Program, || {
                 let id = u.fn_id(FnKey::Inst(*d, Vec::new()));
+                crate::wasm_export::export(id, name);
                 u.entry_direct(id)
             });
             crate::zone_alloc::kept_with(|| addrs.push((name.clone(), en)));
@@ -3248,6 +3248,7 @@ fn summary_inner(why: &str) {
             verbose!("makepad-run: publish O1 on the owner by kind: {}", jit::publish_opt_summary());
             verbose!("makepad-run: O3 candidate takes: {}", jit::cand_skip_summary());
             verbose!("makepad-run: O3 install records on the owner: {}x {:.0} ms", jit::O3_INSTALL_REC[0].load(std::sync::atomic::Ordering::Relaxed), jit::O3_INSTALL_REC[1].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6);
+            verbose!("makepad-run: O3 owner cpu by part: {}", jit::o3_owner_summary());
         }
         if !SILENT.load(Ordering::Relaxed) {
             let b = |i: usize| crate::owner::PURE_BAILS[i].load(Ordering::Relaxed);
@@ -3293,7 +3294,7 @@ fn summary_inner(why: &str) {
         let q = jit::TIER_QUEUED.load(Ordering::Relaxed);
         if q > 0 {
             verbose!(
-                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); snapshots {:.0} ms cpu on the owner ({} inline candidates built there, {:.0} ms; {} fronts off it, {:.0} ms cpu; {} optimised off it, {:.0} ms cpu), back ends {:.0} ms cpu off it; bottom-up preparation {:.0} ms cpu ({} bodies simplified, {} kept, {} shared, {} of the simplified had disagreeing shared ones: body {} attrs {} presence {} preparation {} single {}); {} code bytes",
+                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); snapshots {:.0} ms cpu on the owner (root {:.0}, candidates {:.0}, take tails {:.0}, singles + counts {:.0} ms; callee scans {:.0}, assembly {:.0} ms off it; {} inline candidates built there, {:.0} ms; {} fronts off it, {:.0} ms cpu; {} optimised off it, {:.0} ms cpu), back ends {:.0} ms cpu off it; bottom-up preparation {:.0} ms cpu ({} bodies simplified, {} kept, {} shared, {} of the simplified had disagreeing shared ones: body {} attrs {} presence {} preparation {} single {}); {} code bytes",
                 jit::ahead_level().name(),
                 q,
                 jit::TIER_REVALIDATED.load(Ordering::Relaxed),
@@ -3304,6 +3305,12 @@ fn summary_inner(why: &str) {
                 jit::TIER1_RIR_REBUILT[0].load(Ordering::Relaxed),
                 jit::TIER1_RIR_REBUILT[1].load(Ordering::Relaxed) as f64 / 1e6,
                 s.tier1_locked_ns as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[0].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[1].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[3].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[4].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[2].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_TAKE_PARTS[5].load(Ordering::Relaxed) as f64 / 1e6,
                 jit::TIER1_SNAP_BUILT[0].load(Ordering::Relaxed),
                 jit::TIER1_SNAP_BUILT[1].load(Ordering::Relaxed) as f64 / 1e6,
                 jit::TIER1_SNAP_FRONTS[0].load(Ordering::Relaxed),

@@ -3478,6 +3478,20 @@ fn cfg_attr_empties(prog: &Program, own: &[bool]) {
     }
 }
 
+pub const VARARGS_WITHOUT_PATTERN: Lint = lint::lint("varargs_without_pattern");
+
+/// rustc_parse parse_param_general: `...` without a pattern in a fn that needs parameter names (the
+/// parser records it under `makepad check`, cfg'd-out code included: a pre-expansion lint of the crate root).
+fn varargs_without_patterns(prog: &Program, own: &[bool]) {
+    let mut seen = std::collections::HashSet::new();
+    for (path, pos) in crate::macros::uses::take_varargs_without_pattern() {
+        let Some(file) = prog.file_paths.iter().position(|p| *p == path) else { continue };
+        let krate = prog.file_crate.get(file).copied().unwrap_or(u32::MAX);
+        if !own.get(krate as usize).copied().unwrap_or(false) || !seen.insert((file, pos)) { continue; }
+        emit(prog, crate_root(prog, krate), &VARARGS_WITHOUT_PATTERN, file as u32, pos, "missing pattern for `...` argument");
+    }
+}
+
 pub const NAMED_ARGUMENTS_USED_POSITIONALLY: Lint = lint::lint("named_arguments_used_positionally");
 
 fn named_args_positional(prog: &Program, own: &[bool]) {
@@ -3602,6 +3616,7 @@ pub fn finish(prog: &Program, own: &[bool]) {
     incomplete_includes(prog, own);
     meta_variable_misuse(prog, own);
     cfg_attr_empties(prog, own);
+    varargs_without_patterns(prog, own);
     named_args_positional(prog, own);
     crate_attr_lints(prog, own);
     let (defs, used) = crate::macros::uses::take();
