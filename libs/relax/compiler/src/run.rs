@@ -2446,13 +2446,13 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 let up = unsafe { RUN_UNIT };
                 if !up.is_null() {
                     rebuild_tries += 1;
-                    match jit::settle_rebuild::run(up) {
+                    match jit::settle_rebuild::run(up, settle_stress.is_none() && rebuild_tries <= jit::settle_rebuild::TAIL_WAIT) {
                         jit::settle_rebuild::Outcome::Done => rebuild_done = true,
                         jit::settle_rebuild::Outcome::Refused(why) => { verbose!("makepad-run settle rebuild refused: {why}"); rebuild_over = true; }
                         jit::settle_rebuild::Outcome::Retry(why) => {
                             if why != rebuild_said { verbose!("makepad-run settle rebuild deferred (try {rebuild_tries}): {why}"); rebuild_said = why; }
                             rebuild_next = Instant::now() + std::time::Duration::from_secs(1);
-                            if rebuild_tries >= 40 { rebuild_done = true; }
+                            if rebuild_tries >= jit::settle_rebuild::TAIL_WAIT + 40 { rebuild_done = true; }
                         }
                     }
                 }

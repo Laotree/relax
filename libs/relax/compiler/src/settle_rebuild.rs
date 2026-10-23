@@ -51,6 +51,9 @@ pub(crate) fn rebuilds() -> u32 {
     REBUILDS.load(Ordering::Relaxed)
 }
 
+/// How many monitor tries (one a second) a rebuild waits for the tier-up tail before it runs anyway.
+pub(crate) const TAIL_WAIT: u32 = 60;
+
 pub(crate) enum Outcome {
     Done,
     /// not now: the monitor tries again
@@ -205,12 +208,23 @@ struct Fresh {
 
 /// Runs the rebuild. Called by the monitor thread once the run has settled and its collected
 /// image is current; `up` is the run's unit.
-pub(crate) fn run(up: *mut Unit) -> Outcome {
+/// `patient`: the rebuild may still wait for the tier-up tail (`TAIL_WAIT`).
+pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     if let Some(why) = refuse(up) {
         return Outcome::Refused(why);
     }
     if let Some(why) = not_now() {
         return Outcome::Retry(why);
+    }
+    // the tier-up tail first: a rebuild drops every slot's RIR, and each O3 build still queued
+    // then lowers its callees again, which stay pinned while they tier up (Sandbox race rebuilt
+    // during the tail: 18-22k RIR bodies and 190k query nodes regrown, 400 MB live, against 2k
+    // and 250 MB after a rebuild behind it)
+    if patient {
+        let queued = tier_queue().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len());
+        if queued > 0 {
+            return Outcome::Retry("O3 builds are queued".into());
+        }
     }
     // the recipe, the session, the images: process state
     let _k = crate::zone_alloc::kept();
