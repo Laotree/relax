@@ -46,6 +46,7 @@ mod items;
 mod demand;
 mod front_run;
 pub use front_run::FrontSink;
+pub(crate) use front_run::ahead_end;
 #[cfg(test)]
 use front_run::commit_runs;
 
@@ -152,6 +153,23 @@ const KIND_WARM_OUTCOME: u32 = 10;
 static FRONT_STORES: relax_session::sync::Mutex<Vec<std::sync::Arc<Store>>> = relax_session::sync::Mutex::new(Vec::new());
 /// front images this run mapped (store, index entry): checksummed in the background
 static FRONT_USED: relax_session::sync::Mutex<Vec<(std::sync::Arc<Store>, usize)>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// Pins a store a front image or collected image was mapped from (FRONT_STORES), and with `used`
+/// queues that entry's background checksum (FRONT_USED). A restore ahead of the swap's pause
+/// defers it to after the swap's take (relax_session::phase::defer).
+fn pin_front(st: &std::sync::Arc<Store>, used: Option<usize>) {
+    let st = st.clone();
+    relax_session::phase::defer(move || {
+        let mut keep = FRONT_STORES.lock().unwrap_or_else(|x| x.into_inner());
+        if !keep.iter().any(|k| std::sync::Arc::ptr_eq(k, &st)) {
+            keep.push(st.clone());
+        }
+        drop(keep);
+        if let Some(i) = used {
+            FRONT_USED.lock().unwrap_or_else(|x| x.into_inner()).push((st, i));
+        }
+    });
+}
 
 pub(crate) struct ZoneTaken {
     front_run: front_run::ZoneTaken,
@@ -4871,12 +4889,7 @@ fn front_entry(st: &std::sync::Arc<Store>, e: usize, key: u128, check: bool) -> 
             Some((Some(loc), img))
         }
         KIND_FRONT => {
-            let mut keep = FRONT_STORES.lock().unwrap_or_else(|x| x.into_inner());
-            if !keep.iter().any(|k| std::sync::Arc::ptr_eq(k, st)) {
-                keep.push(st.clone());
-            }
-            drop(keep);
-            if !check { FRONT_USED.lock().unwrap_or_else(|x| x.into_inner()).push((st.clone(), e)); }
+            pin_front(st, (!check).then_some(e));
             // SAFETY: the store (and its mapping) is kept alive above for the rest of the
             // process, and a committed payload never changes (store.rs)
             Some((None, unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) }))

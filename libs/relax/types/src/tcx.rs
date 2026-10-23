@@ -2731,7 +2731,23 @@ impl Tcx {
                 args.push(if declaration.consts.iter().any(|c| c.0 as usize == i) { self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))) } else { self.tys.error });
             }
             let bound = u16::try_from(bound).expect("dyn principal bound-region count");
-            return self.tys.intern(TyKind::Dyn(td, self.tys.mk_list(&args), self.tys.mk_list(&binds), regions, region, bound, self.tys.mk_list(&autos)));
+            let object = self.tys.intern(TyKind::Dyn(td, self.tys.mk_list(&args), self.tys.mk_list(&binds), regions, region, bound, self.tys.mk_list(&autos)));
+            // dyn_trait.rs check_elaborated_projection_mentions_input_lifetimes: a projection a
+            // supertrait fixes may not mention a late-bound region of the principal that its
+            // trait's input types do not (E0582: `dyn for<'a> A<&'a _>` with `trait A<T>: B<T = T>`)
+            if bound > 0 && self.validates(prog, file) {
+                let principal = self.object_predicates(prog, object).swap_remove(0);
+                for p in self.supertraits(prog, principal) {
+                    use crate::next_solver::{PredicateKind, ClauseKind, AliasTerm, Term};
+                    let PredicateKind::Clause(ClauseKind::Projection(proj)) = &p.kind else { continue };
+                    let (AliasTerm::Ty(alias), Term::Ty(term)) = (&proj.projection_term, &proj.term) else { continue };
+                    let TyKind::Alias(_, a) = self.tys.kind(*alias).clone() else { continue };
+                    let mut input: Vec<crate::consts::GenericArg> = self.tys.list(a.args).iter().map(|&t| crate::consts::GenericArg::Type(t)).collect();
+                    input.extend(self.tys.region_args(a.regions).iter().map(|&r| crate::consts::GenericArg::Lifetime(r)));
+                    self.validate_late_bound_regions(cx, prog, file, path.lo, &input, &[], *term);
+                }
+            }
+            return object;
         }
         // only auto traits (`dyn Send`, `dyn Send + Sync`): a trait object without a principal
         // (rustc: its vtable is drop, size and align alone); the first auto trait stands for it
