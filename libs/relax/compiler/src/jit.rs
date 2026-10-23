@@ -13773,7 +13773,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let epoch0 = PATCH_EPOCH.load(Ordering::SeqCst);
     let mut rounds = 0u32;
     let mut needs: Vec<u32> = Vec::new();
+    // a round's walk state between its publishes, and "the last publish stopped mid-walk"
+    let walk = std::cell::RefCell::new(None);
+    let resume = std::cell::Cell::new(false);
     let snapped = loop {
+    if !resume.replace(false) {
     fronts.borrow_mut().clear();
     splits.borrow_mut().clear();
     rounds += 1;
@@ -13782,6 +13786,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         if fronted.insert(s) {
             prefront_slot(&front, s);
         }
+    }
     }
     // a take (rule I-PUB): what needs a front the snapshot cannot hand back as `fronts` bails it
     // (the root's own front: fronted here once more; else the build is dropped)
@@ -13800,6 +13805,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         trace_tier1_phase(id, "snapshot");
         cost_name(up, id);
         compile_watch(Some((&format!("tier1 locked: {}", (&*up).fns[id as usize].name), 0)));
+        // a round's walk resumed where the last publish of the round stopped (WALK_ITEMS)
+        let resumed = walk.borrow_mut().take();
+        let (epoch, rir, version, t1key, sandboxed, mut callees, mut seen, src_toks, inline_all, t1_rec, mut frontier, mut level, mut idx) = if let Some(w) = resumed { w } else {
         if needs_rir(up) {
             if splittable(up, id, false) && split_tried.borrow_mut().insert((id, false)) {
                 splits.borrow_mut().push((id, RirMode::Tier0));
@@ -13898,6 +13906,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             let p = g.as_ref().unwrap();
             if p.replay { p.map.get(k).map(|e| (e.cold.clone(), e.snap.clone(), e.single.clone())) } else { None }
     });
+        let seen: std::collections::HashSet<u32> = callees.iter().copied().collect();
+        let frontier = callees.clone();
+        (epoch, rir, version, t1key, sandboxed, callees, seen, src_toks, inline_all, t1_rec, frontier, 0usize, 0usize)
+        };
     // (no TIER_ACTIVE pins for the callees: the walk and the snapshot's Arc clones are one publish,
     // and what reads TIER_ACTIVE to keep RIR (settle_drop, the O2 install) are publishes too)
     let ensure_rir = |c: u32, force: bool, callers: &[u32]| {
@@ -13969,15 +13981,23 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             TIER1_SNAP_BUILT[1].fetch_add(wall_ns() - t, Ordering::Relaxed);
         }
     };
-    let mut frontier = callees.clone();
     const LEVELS: usize = 16;
-    for level in 0..LEVELS {
-        if frontier.is_empty() {
-            break;
-        }
-        for &c in &frontier {
+    // a publish visits at most WALK_ITEMS callees (rule I-PUB: bounded by its item count); the
+    // round's next publish goes on from there (off the owner: replay walks a round in one)
+    let mut budget = if prefront { WALK_ITEMS } else { usize::MAX };
+    while level < LEVELS && !frontier.is_empty() {
+        while idx < frontier.len() {
+            if budget == 0 {
+                *walk.borrow_mut() = Some((epoch, rir, version, t1key, sandboxed, callees, seen, src_toks, inline_all, t1_rec, frontier, level, idx));
+                resume.set(true);
+                owner_ns.set(owner_ns.get() + cpu_ns() - s0);
+                return None;
+            }
+            budget -= 1;
+            let c = frontier[idx];
             let force = t1_rec.as_ref().is_some_and(|(_, snap, _)| snap.contains(&t1_key(up, c)));
             ensure_rir(c, force, &callees);
+            idx += 1;
         }
         if level == LEVELS - 1 {
             break;
@@ -14009,31 +14029,31 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                             relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(x), _, _) | relax_backend::rir::Inst::FnAddr(_, x) => x,
                             _ => continue,
                         };
-                        {
-                            if *x != id && !callees.contains(x) && callees.len() < 1024 {
-                                callees.push(*x);
-                                next.push(*x);
-                            }
+                        if *x != id && callees.len() < 1024 && seen.insert(*x) {
+                            callees.push(*x);
+                            next.push(*x);
                         }
                     }
                 }
             }
         }
         frontier = next;
+        level += 1;
+        idx = 0;
     }
     // Recorded descendants can be absent from the live traversal (different
     // O1 inlining). Resolve all known keys, repeating when lowering adds slots.
     if let Some((_, recorded, _)) = &t1_rec {
-        let mut seen = 0;
-        while seen < (&*up).fns.len() {
+        let mut done = 0;
+        while done < (&*up).fns.len() {
             let end = (&*up).fns.len();
-            for c in seen..end {
+            for c in done..end {
                 if recorded.contains(&t1_key(up, c as u32)) {
                     ensure_rir(c as u32, true, &callees);
-                    if !callees.contains(&(c as u32)) { callees.push(c as u32); }
+                    if seen.insert(c as u32) { callees.push(c as u32); }
                 }
             }
-            seen = end;
+            done = end;
         }
     }
     // candidates whose fronts (or O1 builds) this thread runs first: asked again after them
@@ -14180,7 +14200,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     const O3_TAKE_ROUNDS: u32 = 16;
     let snapped = match taken {
         Ok((s, n)) => {
-            needs = n;
+            needs.extend(n);
             s
         }
         // the root's own front (its RIR was dropped since) or its O1 inline candidates': fronted
@@ -14206,6 +14226,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             break None;
         }
     };
+    if resume.get() {
+        continue;
+    }
     let more = std::mem::take(&mut *fronts.borrow_mut());
     let ups = std::mem::take(&mut *splits.borrow_mut());
     if snapped.is_some() || more.is_empty() && ups.is_empty() {
@@ -15789,6 +15812,9 @@ fn splits_off_owner(u: &Unit, c: u32, upgrade: bool) -> bool {
         FnKey::Sandbox(_) => false,
     }
 }
+
+/// Callees one publish of an O3 snapshot's walk visits (the round goes on in the next publish)
+const WALK_ITEMS: usize = 128;
 
 /// O1 builds one take of an O3 snapshot prepares (o3_candidates_begin): a publish's item bound
 const CAND_TAKE: usize = 8;
