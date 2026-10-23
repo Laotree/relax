@@ -811,8 +811,11 @@ impl Options {
         h.u8(*ra_order as u8);
         h.str("ra_quick_coalesce");
         h.u8(*ra_quick_coalesce as u8);
-        h.str("nan_exact");
-        h.u8(*nan_exact as u8);
+        // (only when set: the default key stays the key it was before the option existed)
+        if *nan_exact {
+            h.str("nan_exact");
+            h.u8(1);
+        }
         h.str("spec_order");
         h.u8(*spec_order as u8);
         h.str("o3_profile");

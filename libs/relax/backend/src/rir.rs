@@ -1423,7 +1423,11 @@ impl Func {
             m(*x).hash(h);
             v.hash(h);
         }
-        (baseline, full, owned, nonnull, ranged, dyn_calls, naked, inl, dbg, halves).hash(h);
+        (baseline, full, owned, nonnull, ranged, dyn_calls, naked, inl, dbg).hash(h);
+        // (only when present: bodies without the hint keep the hash they had before it existed)
+        if !halves.is_empty() {
+            halves.hash(h);
+        }
     }
 
     /// Maps the debug table through a vreg renaming (`map(v)` None: v is gone).

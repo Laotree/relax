@@ -224,6 +224,10 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
         return false;
     }
     let seeds = std::mem::take(&mut f.halves);
+    // kernel mode (`Caps::ints`, compute's eight-lane kernels): also destination votes, lane
+    // extracts of low halves in place, VAny of a pair, one Half per block and definition. Relax's
+    // tiers (ints off) keep the pass as it was until these are measured on its workloads.
+    let km = caps.ints;
     let nv = f.vregs.len();
     let mut cx = Cx { sh: Vec::new(), defs: vec![Vec::new(); nv], uses: vec![Vec::new(); nv], bcast: HashMap::new() };
     let mut any = false;
@@ -328,7 +332,7 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
                         _ => {}
                     }
                     // a seed pair's definitions: their destinations say which is the low half
-                    if let (Some(x), Some(y)) = (si.dest, sj.dest) {
+                    if let (true, Some(x), Some(y)) = (km, si.dest, sj.dest) {
                         let vote = if vp.get(&x.0) == Some(&(x, y)) {
                             Some(true)
                         } else if vp.get(&y.0) == Some(&(y, x)) {
@@ -565,7 +569,7 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
     // one 256-bit test of the pair (vptest ymm)
     let lo_of = |v: u32| vp.get(&v).map(|e| e.0 .0 == v).unwrap_or(true);
     let mut any_of: HashMap<u32, u32> = HashMap::new();
-    for (bi, b) in f.blocks.iter().enumerate() {
+    for (bi, b) in f.blocks.iter().enumerate().filter(|_| km) {
         for (k, i) in b.insts.iter().enumerate() {
             let Inst::VX(VX::Or, t, x, y) = *i else { continue };
             // read once, by the next instruction (no definition of the pair between)
@@ -577,7 +581,7 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
             }
         }
     }
-    let free_read = |b: u32, k: u32, v: u32| lo_of(v) && matches!(f.blocks[b as usize].insts.get(k as usize), Some(Inst::VExtract(..)));
+    let free_read = |b: u32, k: u32, v: u32| km && lo_of(v) && matches!(f.blocks[b as usize].insts.get(k as usize), Some(Inst::VExtract(..)));
     let mut halves: Vec<(u32, u32, u32)> = Vec::new();
     for v in 0..nv {
         if fused(&von, VReg(v as u32)).is_none() {
@@ -618,7 +622,7 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
                 cached.remove(&defs[at].2);
                 at += 1;
             }
-            if cached.insert(v) {
+            if cached.insert(v) || !km {
                 half_n += 1;
             }
         }
@@ -744,7 +748,7 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
             let (mut uu, mut dd) = (Vec::new(), Vec::new());
             uses_defs(i, &mut uu, &mut dd);
             for x in &uu {
-                if matches!(i, Inst::VExtract(..)) && big.contains_key(&x.0) && lo_of(x.0) && vp.get(&x.0).is_some_and(|e| big.get(&e.0 .0) == big.get(&x.0)) {
+                if km && lo_of(x.0) && matches!(i, Inst::VExtract(..)) && big.contains_key(&x.0) {
                     // the register's low lanes, read as they are
                     ren.push((*x, big[&x.0]));
                     continue;
@@ -756,7 +760,9 @@ pub fn pair256(f: &mut Func, caps: Caps) -> bool {
                             let t = f.vreg(Cls::V128);
                             out.push(Inst::VX(VX::Half(!lo_of(x.0)), t, big[&x.0], big[&x.0]));
                             pos.push(ps);
-                            hcache.insert(x.0, t);
+                            if km {
+                                hcache.insert(x.0, t);
+                            }
                             t
                         }
                     };
