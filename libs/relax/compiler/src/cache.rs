@@ -417,7 +417,7 @@ pub struct CacheCell(std::cell::UnsafeCell<Cache>);
 unsafe impl Sync for CacheCell {}
 impl CacheCell {
     pub fn new(cache: Cache) -> Self { Self(std::cell::UnsafeCell::new(cache)) }
-    fn get(&self) -> *mut Cache { self.0.get() }
+    pub(crate) fn get(&self) -> *mut Cache { self.0.get() }
 }
 impl std::ops::Deref for CacheCell {
     type Target = Cache;
@@ -507,6 +507,8 @@ pub struct Cache {
     code_stale: Vec<bool>,
     /// code keys whose entry this run rejected (a dependency's key changed): recorded again
     cert_rejected: HashSet<u128>,
+    /// code keys of bodies the borrow checker rejected this run (reject_verdict): never recorded
+    verdict_rejected: HashSet<u128>,
     /// per slot: the crates its key names (a certificate's fast path)
     slot_crates: HashMap<u32, Vec<u32>>,
     /// while a key is encoded: the definitions it names (their local bodies join the key)
@@ -790,6 +792,7 @@ impl Cache {
             code_path: Vec::new(),
             code_stale: Vec::new(),
             cert_rejected: HashSet::new(),
+            verdict_rejected: HashSet::new(),
             slot_crates: HashMap::new(),
             enc_defs: None,
             crate_by_ident,
@@ -1127,11 +1130,45 @@ impl Cache {
         self.stores[p as usize].get_at(e as usize, key)
     }
 
+    /// `get` with the payload checksum verified (payloads linked as code or data).
+    fn get_checked(&self, key: u128) -> Option<(u32, &[u8])> {
+        let (p, e) = self.index_at(key)?;
+        self.stores[p as usize].get_checked_at(e as usize, key)
+    }
+
     /// The crate whose store file an entry keyed by `crates` goes to: the deepest in the
     /// dependency graph (it depends on the others when there is a chain: its version covers
     /// theirs), ties by crate index.
     fn dominant(&self, crates: &[u32]) -> u32 {
         crates.iter().copied().max_by_key(|&c| (self.depth.get(c as usize).copied().unwrap_or(0), c)).unwrap_or(0)
+    }
+
+    /// SPEC-V: slot `id`'s body failed the borrow checker. Its code stays out of the cache: a record
+    /// not yet written is dropped, later records of it are refused, and an entry that may be on disk
+    /// already is replaced by an empty one (newest wins; an empty code payload is a miss), so a
+    /// later run never links code the checker refused.
+    pub fn reject_verdict(&mut self, u: &Unit, id: u32) {
+        if self.mode == Mode::ReadOnly {
+            return;
+        }
+        let Some(key) = self.slot_key(u, id) else { return };
+        if !self.verdict_rejected.insert(key) {
+            return;
+        }
+        let before = self.pending.len();
+        let mut freed = 0;
+        self.pending.retain(|(_, e)| {
+            let drop = e.key == key && e.kind == KIND_CODE;
+            if drop { freed += e.payload.len() + 32; }
+            !drop
+        });
+        self.pending_bytes -= freed.min(self.pending_bytes);
+        let krate = self.key_crate.get(&key).copied().unwrap_or(0);
+        if self.verbose {
+            eprintln!("makepad-run cache: slot {} {} failed the borrow checker: its code entry is dropped ({} pending)", id, u.fns[id as usize].name, before - self.pending.len());
+        }
+        self.pending_keys.insert(key);
+        self.push_pending(krate, NewEntry { key, kind: KIND_CODE, payload: Vec::new() });
     }
 
     fn push_pending(&mut self, krate: u32, e: NewEntry) {
@@ -2432,6 +2469,11 @@ impl Cache {
             self.remember_outcome(u, id, None, "cold record-rejected:fn key");
             return;
         };
+        // a body the borrow checker rejected (reject_verdict): never stored
+        if self.verdict_rejected.contains(&key) {
+            trace_lookup(u, id, "norecord:verdict failed");
+            return;
+        }
         // the entry's store file (its data objects go there too)
         self.cur_crate = self.key_crate.get(&key).copied().unwrap_or(0);
         // an entry this run rejected (a slot its code took in changed) is replaced
@@ -2800,7 +2842,8 @@ impl Cache {
         self.manifest_root = Some(root);
         let Some(key) = self.manifest_key(root) else { return };
         if let Some(pk) = self.stores.iter().find(|st| st.path == self.code_path[root as usize]).cloned() {
-            if let Some((KIND_MANIFEST, p)) = pk.get(key) {
+            // checksummed before use: its image section becomes executable code (prelink)
+            if let Some((KIND_MANIFEST, p)) = pk.get_checked(key) {
                 let mut d = D { b: p, p: 0 };
                 let mut out = Vec::new();
                 let mut keys = Vec::new();
@@ -6987,7 +7030,7 @@ impl Linker {
         }
         if !self.cache().linking_data.insert(key) { return None; }
         let _link = LinkGuard { cache: self.cache, key, data: true };
-        let (kind, payload) = { let c = self.cache(); let (k, p) = c.get(key)?; (k, p.to_vec()) };
+        let (kind, payload) = { let c = self.cache(); let (k, p) = c.get_checked(key)?; (k, p.to_vec()) };
         if kind != KIND_DATA {
             return None;
         }
@@ -7049,7 +7092,9 @@ impl Linker {
         // the pack stays alive by its Arc: the payload is read in place
         let at = self.cache().index_at(key);
         let pack = at.map(|(p, _)| self.cache().stores[p as usize].clone());
-        if let Some((KIND_CODE, payload)) = pack.as_ref().and_then(|pk| pk.get_at(at.map_or(0, |a| a.1) as usize, key)) {
+        // checksummed before it is linked into executable memory: a corrupt entry is a miss
+        // (an empty payload: a rejected body's entry, reject_verdict -- a miss)
+        if let Some((KIND_CODE, payload)) = pack.as_ref().and_then(|pk| pk.get_checked_at(at.map_or(0, |a| a.1) as usize, key)).filter(|(_, p)| !p.is_empty()) {
             // a slot its code took in changed: not this run's code (compiled and recorded anew)
             // (an undecodable payload is link_entry's failure, as before)
             if self.cert_valid(u, payload) == Some(false) {

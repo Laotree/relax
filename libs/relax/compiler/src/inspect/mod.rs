@@ -172,7 +172,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("hal", "pump", "HAL pump loop per session: turns and wake causes, totals and per second since the last call (an idle app shows none)"),
     ("writes", "<Type::field> | (none: the watches) | W<n> [n=20] | rm <W<n>|all>", "who writes a struct field: the compiled fns that assign `x.field` (`=`, `op=`) are rebuilt to record every write: its site (fn, file:line), the value written and the field's address; `writes W<n>` reads the sites and the latest writes"),
     ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
-    ("threads", "", "every thread: name, role, state, CPU time, what it waits on"),
+    ("threads", "", "every thread: name, role, state, CPU time, what it waits on; JIT threads: alive/restarting/dead, panics, heartbeat"),
     ("stacks", "[thread=<name|tid|main|owner|all>] [depth=12]", "symbolised stacks (identical stacks folded)"),
     ("waits", "", "the wait registry: who waits for what, held by whom"),
     ("owner", "", "the owner thread: what it serves, for whom, queue"),
@@ -820,6 +820,7 @@ fn cmd_threads(out: &mut Out) {
     let mut list = threads::list();
     name_handles(&mut list);
     let waits = crate::waits::snapshot();
+    let jit_rows = crate::lifeline::snapshot();
     out.measured("threads", "os+registry", &[]);
     for t in &list {
         let w = waits.iter().find(|w| w.thread == t.handle && t.handle != 0);
@@ -829,6 +830,9 @@ fn cmd_threads(out: &mut Out) {
         };
         if let Some(d) = activity::describe(t.os_id) {
             wait.push_str(&format!(",\"inspect\":{}", json_str(&d)));
+        }
+        if let Some(r) = jit_rows.iter().find(|r| r.os_id == t.os_id) {
+            wait.push_str(&lifeline_fields(r));
         }
         out.line(&format!(
             "{{\"id\":\"{}\",\"name\":{},\"role\":\"{}\",\"state\":\"{}\",\"cpu_ms\":{}{}}}",
@@ -840,6 +844,23 @@ fn cmd_threads(out: &mut Out) {
             wait
         ));
     }
+    // registered JIT threads the OS no longer lists: gone (dead after panics, or ended)
+    for r in jit_rows.iter().filter(|r| !list.iter().any(|t| t.os_id == r.os_id)) {
+        out.line(&format!("{{\"id\":\"{}\",\"name\":{},\"role\":\"jit\",\"state\":\"gone\"{}}}", tid_label(r.os_id), json_str(&r.name), lifeline_fields(r)));
+    }
+}
+
+/// The JIT thread registry's view of a thread (lifeline.rs): alive / restarting / dead / exited,
+/// panics, the last one, and how long ago it last beat.
+fn lifeline_fields(r: &crate::lifeline::Row) -> String {
+    let mut f = format!(",\"jit\":\"{}\",\"on_panic\":\"{}\"", crate::lifeline::STATE_NAMES[r.state as usize & 3], if r.policy == crate::lifeline::OnPanic::Fatal { "fatal" } else { "restart" });
+    if r.beat_ns != 0 {
+        f.push_str(&format!(",\"beat_ms_ago\":{}", crate::clock::wall_ns().saturating_sub(r.beat_ns) / 1_000_000));
+    }
+    if r.restarts != 0 {
+        f.push_str(&format!(",\"panics\":{},\"last_panic\":{}", r.restarts, json_str(&r.last_panic)));
+    }
+    f
 }
 
 pub fn wait_text(w: &crate::waits::Wait, list: &[threads::Thread]) -> String {
