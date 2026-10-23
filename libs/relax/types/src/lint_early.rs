@@ -103,7 +103,8 @@ fn lifetime_lints(prog: &Program, d: DefId) {
     // a lifetime is written with a quote; the code a derive writes is not the user's
     if !pf.bytes(item.lo, item.hi).contains(&b'\'') || lint::external(prog, def.file, item.lo) { return; }
     let mut w = W::new(prog, def.file, d);
-    w.lt = Some(LtCx { ribs: vec![LRib::Item], scopes: Vec::new(), next: 0 });
+    let anon_in_impl_trait = prog.crates[def.krate as usize].features(prog).has("anonymous_lifetime_in_impl_trait");
+    w.lt = Some(LtCx { ribs: vec![LRib::Item], scopes: Vec::new(), next: 0, anon_in_impl_trait });
     match def.kind {
         DefKind::Fn | DefKind::ForeignFn => w.lt_fn(def.item),
         DefKind::Impl => w.lt_impl(d, def.item),
@@ -451,6 +452,8 @@ struct LtCx {
     ribs: Vec<LRib>,
     scopes: Vec<LtScope>,
     next: u32,
+    /// `#![feature(anonymous_lifetime_in_impl_trait)]`: an `impl Trait` rib lets the search go on outward
+    anon_in_impl_trait: bool,
 }
 
 pub(crate) struct W<'a> {
@@ -1649,6 +1652,7 @@ impl<'a> W<'a> {
         for r in c.ribs.iter().rev() {
             match r {
                 LRib::Generics => continue,
+                LRib::ImplTrait if c.anon_in_impl_trait => continue,
                 LRib::Anon(b) => { state = if *b == binder { 1 } else { 2 }; break; }
                 LRib::Item | LRib::Fail | LRib::ImplTrait => { state = 2; break; }
             }
