@@ -272,6 +272,10 @@ struct Fresh {
 struct Timeline {
     /// the encode and its store write, before the quiesce (gate open)
     encode_off: f64,
+    /// the collected image restored into the next generation, before the quiesce (gate open)
+    restore_ahead: f64,
+    /// that restore failed (stores prepare had not written yet): the pause restored
+    ahead_failed: bool,
     quiesce: f64,
     front_images: f64,
     restore: f64,
@@ -412,6 +416,25 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     };
     tl.encode_off = ms(t);
 
+    // 5 (ahead of the pause). the next generation, and the collected image restored into it. The
+    // program keeps compiling meanwhile, in g+1 as well: what its old state allocates there is
+    // left until the next swap (an abort from here on keeps both generations live, as below). The
+    // restore's writes to the statics, which hold generation g's state until the take, wait for
+    // the take (relax_session::phase::defer).
+    let old_gen = crate::zone_alloc::compiler_generation();
+    let t = Instant::now();
+    crate::zone_alloc::compiler_begin_generation();
+    trace("generation begun");
+    // Err: the stores it reads were not all written yet (prepare writes them in the pause: a cold
+    // run's first swap); the pause restores then, after prepare, as before
+    let ahead = restore_ahead(&options, &pre, &extra, swap_image.as_ref());
+    tl.restore_ahead = ms(t);
+    tl.ahead_failed = ahead.is_err();
+    match &ahead {
+        Ok(_) => trace_live("restored ahead of the pause"),
+        Err(e) => trace(&format!("not restored ahead of the pause ({e}): the pause restores")),
+    }
+
     // 2. quiesce
     let t_pause = Instant::now();
     let gate = match quiesce(Duration::from_millis(2000)) {
@@ -450,11 +473,8 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     // collected tables' counts still match an older image (a body can add only a late input).
     let late = if extra.is_empty() { Vec::new() } else { crate::sip::late_inputs() };
     trace("encoded and stored");
-    // 5. the next generation
-    let old_gen = crate::zone_alloc::compiler_generation();
+    // 5. the statics of generation g taken; the restore's writes to them made in the new ones
     let t = Instant::now();
-    crate::zone_alloc::compiler_begin_generation();
-    trace("generation begun");
     let Some(taken) = zone_scan::zone_take_all() else {
         return abort("an owner request arrived after the quiesce".into());
     };
@@ -462,12 +482,22 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     zone_scan::stale_after_take(crate::zone_alloc::compiler_generation());
     let fresh = {
         let _c = crate::zone_alloc::compiler();
+        let (restored, deferred) = match ahead.or_else(|_| restore_ahead(&options, &pre, &extra, swap_image.as_ref())) {
+            Ok(x) => x,
+            Err(e) => {
+                taken.put_back();
+                return abort(format!("restore: {e}"));
+            }
+        };
+        for write in deferred {
+            write();
+        }
         // live edits after the swap expand the program's derives and macro calls as before it
         if let Err(e) = taken.reinstall_macro_registry(&options) {
             taken.put_back();
             return abort(format!("macro registry: {e}"));
         }
-        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(up, &options, mode, &pre, &extra, swap_image.as_ref(), &late, now, &mut tl)));
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(up, &options, mode, restored, &late, now, &mut tl)));
         match built {
             Ok(Ok(f)) => f,
             Ok(Err(e)) => {
@@ -524,8 +554,8 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     LAST_SWAP_MS.store(wall_ns() / 1_000_000, Ordering::Relaxed);
     crate::boot_stats::swap_done(tl.chunks, rss0, rss1);
     let (gn, gms, gmax) = gated();
-    eprintln!("makepad-run zone: swap {}->{} at t={:.0} ms (attempt {}): encode + store off the pause {:.1} ms; pause: quiesce {:.1} ms, front images {:.1} ms, restore {:.1} ms (cache {:.1} ms), commit {:.1} ms, pause {:.1} ms; destroy after the pause {:.1} ms; main gated {}x {:.1} ms (longest so far {:.1} ms); total {:.1} ms; destroyed {} chunks ({:.1} MB touched); {} speculative codes moved to the kept heap ({:.1} MB); rss {:.0} -> {:.0} MB",
-        old_gen, old_gen + 1, crate::clock::ms_since_start(), n + 1, tl.encode_off, tl.quiesce, tl.front_images, tl.restore, tl.cache, tl.commit, pause, tl.destroy, gn, gms, gmax, ms(t_all),
+    eprintln!("makepad-run zone: swap {}->{} at t={:.0} ms (attempt {}): encode + store off the pause {:.1} ms, restore off the pause {:.1} ms{}; pause: quiesce {:.1} ms, front images {:.1} ms, restore {:.1} ms (cache {:.1} ms), commit {:.1} ms, pause {:.1} ms; destroy after the pause {:.1} ms; main gated {}x {:.1} ms (longest so far {:.1} ms); total {:.1} ms; destroyed {} chunks ({:.1} MB touched); {} speculative codes moved to the kept heap ({:.1} MB); rss {:.0} -> {:.0} MB",
+        old_gen, old_gen + 1, crate::clock::ms_since_start(), n + 1, tl.encode_off, tl.restore_ahead, if tl.ahead_failed { " (failed: restored in the pause)" } else { "" }, tl.quiesce, tl.front_images, tl.restore, tl.cache, tl.commit, pause, tl.destroy, gn, gms, gmax, ms(t_all),
         tl.chunks, tl.touched as f64 / 1048576.0, tl.specs.0, tl.specs.1 as f64 / 1048576.0, rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0);
     crate::inspect::flightrec::event("zone.swap", &format!("gen {}->{}: pause {:.0} ms (quiesce {:.0}, restore {:.0}, commit {:.0}), encode off the pause {:.0}; rss {:.0} -> {:.0} MB", old_gen, old_gen + 1, pause, tl.quiesce, tl.restore, tl.commit, tl.encode_off, rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0), (pause * 1e6) as u64, 0);
     Outcome::Done
@@ -598,16 +628,37 @@ fn encode_off(up: *mut Unit, pre: &[crate::preload::PreCrate], extra: &[crate::p
     Ok((before, epoch, if extra.is_empty() { None } else { Some(crate::zone_alloc::kept_clone(&written)) }))
 }
 
-/// Builds the next generation's compile state from the committed image (this thread, in the
-/// compiler phase of generation g+1). The running state is only read.
-fn build(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: crate::cache::Mode,
-    pre: &[crate::preload::PreCrate], extra: &[crate::preload::PreCrate], swap_image: Option<&crate::cache::CollectedWritten>,
+/// The program and type context restored from the committed image (this thread, in the compiler
+/// phase of generation g+1), before the pause: the restore reads only the image and the stores,
+/// and its writes to the statics are returned to be made after the take. Ends the thread's
+/// restore-ahead mode on every path (also a panic).
+fn restore_ahead(sess: &std::sync::Arc<crate::Session>, pre: &[crate::preload::PreCrate], extra: &[crate::preload::PreCrate],
+    swap_image: Option<&crate::cache::CollectedWritten>) -> Result<(Restored, Vec<Box<dyn FnOnce()>>), String> {
+    let _c = crate::zone_alloc::compiler();
+    relax_session::phase::ahead_begin();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        trace("build: opening the images");
+        let images = crate::cache::FrontImages::open(&sess.options).ok_or("the front images cannot be opened")?;
+        trace("build: restoring");
+        crate::run::warm_front(&images, sess, pre, extra, swap_image).ok_or("the collected image was not restored")
+    }));
+    let deferred = relax_session::phase::ahead_end();
+    crate::cache::ahead_end();
+    match r {
+        Ok(Ok(x)) => Ok((x, deferred)),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(p) => Err(format!("panicked: {}", p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default())),
+    }
+}
+
+type Restored = (crate::program::Program, crate::tcx::Tcx, Option<crate::cache::CollectedCache>);
+
+/// Builds the next generation's compile state from the restored image (this thread, in the
+/// compiler phase of generation g+1, in the pause). The running state is only read.
+fn build(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: crate::cache::Mode, restored: Restored,
     late: &[(String, u8, String, u128)], now: Counts, tl: &mut Timeline) -> Result<Fresh, String> {
     let u = unsafe { &*up };
-    trace("build: opening the images");
-    let images = crate::cache::FrontImages::open(&sess.options).ok_or("the front images cannot be opened")?;
-    trace("build: restoring");
-    let (prog, mut tcx, collected) = crate::run::warm_front(&images, sess, pre, extra, swap_image).ok_or("the collected image was not restored")?;
+    let (prog, mut tcx, collected) = restored;
     // the types interned since the image was encoded (compiles ran meanwhile): copied from the
     // paused program, so ids and chains are its own
     let t = Instant::now();
