@@ -1294,6 +1294,8 @@ fn owner_loop() -> ! {
         // between top-level requests: the vtables made for real-time trait-object types
         let frame = crate::jit::frame_enter(std::ptr::null());
         let _ = std::panic::catch_unwind(crate::jit::realtime_drain);
+        // ... and the constants background builds' fronts found unevaluated
+        let _ = std::panic::catch_unwind(crate::jit::const_drain);
         crate::jit::frame_leave(frame);
     }
 }

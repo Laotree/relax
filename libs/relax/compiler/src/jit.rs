@@ -4692,6 +4692,12 @@ impl Unit {
             if ahead_trace() {
                 eprintln!("ahead-lower: constant {} not evaluated yet", self.prog.def_path(d));
             }
+            // a background build's own front (prefront_slot): the owner evaluates it between
+            // requests (const_drain) and the build's next take finds it
+            if WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
+                let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
+                crate::zone_alloc::kept_with(|| CONSTS_WANTED.lock().unwrap_or_else(|e| e.into_inner()).push((d, args.clone(), epoch)));
+            }
         }
         owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).const_addr(d, args) })
     }
@@ -14477,6 +14483,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         ids.push((c, RirMode::Tier0));
         let _preemptible = crate::preempt::Preemptible::on();
         typeck_ahead(&front, d, args, 1, false, true);
+        let _want = WantConsts::on();
         lower_ahead(&front, c, true);
     }
     TIER1_SNAP_FRONTS[1].fetch_add(cpu_ns() - tf, Ordering::Relaxed);
@@ -17327,6 +17334,8 @@ fn prefront_slot(front: &FrontShared, id: u32) -> bool {
     if owner::is_owner() {
         return false;
     }
+    // (constants its lowering finds unevaluated go to the owner: const_drain)
+    let _want = WantConsts::on();
     match front.slot_keys.get(&id) {
         Some(FnKey::Closure(..)) => return prefront_closure(front, id),
         Some(FnKey::Plain(base)) => return prefront_twin(front, id, base),
@@ -19704,6 +19713,57 @@ pub fn manifest_order(order: Vec<u32>, present: usize) -> (Vec<u32>, usize) {
     let n = out.len();
     out.extend(order[present..].iter().copied().filter(|id| !addset.contains(id)));
     (out, n)
+}
+
+thread_local! {
+    /// (a background build's front, prefront_slot) a constant its lowering ahead finds unevaluated
+    /// is noted for the owner (CONSTS_WANTED)
+    static WANT_CONSTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+struct WantConsts(bool);
+impl WantConsts {
+    fn on() -> WantConsts {
+        WantConsts(WANT_CONSTS.with(|w| w.replace(true)))
+    }
+}
+impl Drop for WantConsts {
+    fn drop(&mut self) {
+        let _ = WANT_CONSTS.try_with(|w| w.set(self.0));
+    }
+}
+
+/// Constants a background build's lowering ahead needed and nobody had evaluated in this run (with
+/// the collect epoch they were named under): a warm run links its code from the disk cache, so the
+/// owner's lowerings that evaluate them in a cold run never happen, and every O3 build whose body
+/// names one (`EPS`, `usize::MAX`, `Vec::ZERO`) bailed on its own front for the whole run (mickey:
+/// mirror::walk_hurt_changed / reconcile ran their warm-cache baseline code). Rule I-PURE keeps
+/// CTFE on the owner: it evaluates them between requests (const_drain), nobody waits for it.
+static CONSTS_WANTED: relax_session::sync::Mutex<Vec<(DefId, Vec<TyId>, u64)>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// Owner, between requests: the constants CONSTS_WANTED names, evaluated into FrontShared::consts
+/// (Unit::const_addr publishes there). One that fails is not asked for again by this drain; a
+/// build that needs it bails as before (the owner's lowering reports it).
+pub(crate) fn const_drain() {
+    let want = std::mem::take(&mut *CONSTS_WANTED.lock().unwrap_or_else(|e| e.into_inner()));
+    if want.is_empty() {
+        return;
+    }
+    let up = unsafe { UNIT };
+    if up.is_null() {
+        return;
+    }
+    let u = unsafe { &mut *up };
+    let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
+    let mut seen: crate::fxhash::HashSet<(DefId, Vec<TyId>)> = Default::default();
+    for (d, args, e) in want {
+        if e != epoch || u.front.consts.get(&(d, args.clone())).is_some() || !seen.insert((d, args.clone())) {
+            continue;
+        }
+        let a = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.const_addr(d, args)));
+        if ahead_trace() {
+            eprintln!("const-drain: {} {}", u.prog.def_path(d), if matches!(a, Ok(Some(_))) { "evaluated" } else { "failed" });
+        }
+    }
 }
 
 /// Owner, between requests: the methods of the vtables realtime_vtable noted.
