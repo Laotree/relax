@@ -17786,7 +17786,9 @@ impl FrontShared {
             built: crate::conc::MemoMap::with_bits(16),
             lowered: Default::default(),
             consts: crate::conc::MemoMap::with_bits(12),
-            helpers: if options.tyck_ahead { options.ahead_helpers.unwrap_or_else(ahead_helpers) } else { 0 },
+            // (`makepad check` (const_fuel) only reports diagnostics: no lowering ahead -- an ahead
+            // helper's lowering of main raced the exit with its layout errors, limits/issue-55878)
+            helpers: if options.tyck_ahead && !options.const_fuel { options.ahead_helpers.unwrap_or_else(ahead_helpers) } else { 0 },
             live_helpers: std::sync::atomic::AtomicU32::new(0),
             ahead_post: Default::default(),
             queue: Default::default(),
