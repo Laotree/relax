@@ -12,7 +12,7 @@ mod collected;
 mod privacy;
 pub use privacy::PrivacyError;
 mod rsim;
-pub use rsim::{SimDiag, SimKind};
+pub use rsim::{MacBinding, MacRes, SimDiag, SimKind};
 mod attrs;
 mod validate;
 
@@ -586,6 +586,8 @@ pub struct Program {
     pub sim_ambiguity: Option<HashMap<(u32, Sym, bool), u8>>,
     /// what the replay reported, until the check emits it
     pub sim_diags: Option<Vec<SimDiag>>,
+    /// the import replay's macro namespace of the checked modules (rsim.rs `macro_table`)
+    pub sim_macros: Option<HashMap<(u32, Sym), rsim::MacBinding>>,
     /// lexical lookups (`lookup_in_scope`) once imports are resolved: (module, name, ns_type);
     /// cleared whenever a binding is defined or imports are resolved again
     scope_cache: crate::conc::MemoMap<(u32, Sym, bool), Option<DefId>>,
@@ -921,6 +923,7 @@ impl Program {
             own_crates: Vec::new(),
             sim_ambiguity: None,
             sim_diags: None,
+            sim_macros: None,
             scope_cache: Default::default(),
             import_used: Default::default(),
             glob_used: Default::default(),

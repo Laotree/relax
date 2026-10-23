@@ -1168,6 +1168,14 @@ fn end(id: DomainId, st: DomainState) {
     }
 }
 
+/// The app domain whose block is `base` (None: the compile domain, or none).
+pub(crate) fn id_of_base(base: u64) -> Option<DomainId> {
+    if base == 0 {
+        return None;
+    }
+    domains().iter().find(|d| d.info.base == base && d.info.id != 0).map(|d| d.info.id)
+}
+
 /// The id of the app domain whose block is the calling thread's (None: the compile domain, or a
 /// thread that is in none).
 pub(crate) fn current_app_domain() -> Option<DomainId> {

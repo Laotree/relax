@@ -140,8 +140,8 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("resume", "<panic id> panic|retry|restart|return <v>[,<v>]", "decide a parked panic: unwind, retry, restart the hosted app domain (otherwise its restartable fn), or return the values"),
     ("memory", "[compiler=1] [n=24]", "where the memory is and why: RSS by mapping kind, malloc in use vs held free, makepad run's own parts, findings, growth since the last `memory`"),
     ("diff", "<snap a> <snap b|now>", "memory growth between two snapshots, largest first"),
-    ("mem", "snap <name> | timeline [from_ms= to_ms=]", "keep a named memory snapshot; resident size over time with phase markers and the peak's phase"),
-    ("heap", "start [rate=65536] [ttl_s=600] | top [by=live|alloc|freed|peak] | frame [s=2] [n=12] | snap <name> | diff <a> <b|now> | path H<id> | stop | status", "program heap by allocation stack (JIT-patched allocator hooks, byte-sampled): live, allocated, freed; growth and leaks between snapshots"),
+    ("mem", "snap <name> | timeline [from_ms= to_ms=] | trim", "keep a named memory snapshot; resident size over time with phase markers and the peak's phase; trim: return the allocators' free pages now (RSS before/after)"),
+    ("heap", "start [rate=65536] [ttl_s=600] | top [by=live|alloc|freed|peak] [zone=burst|compiler|other] | frame [s=2] [n=12] | snap <name> | diff <a> <b|now> | path H<id> | stop | status", "program heap by allocation stack (JIT-patched allocator hooks, byte-sampled): live, allocated, freed; growth and leaks between snapshots"),
     ("top", "by=time|alloc|bytes|live [s=3] [n=15]", "the top functions by CPU time (prof) or allocation sites by allocated / live bytes (heap)"),
     ("frame", "<n|slowest>", "one frame of the last timeline: UI phases, critical path, waits and who ended them (alias of timeline frame)"),
     ("path", "<H<n>|R<n>>", "the full stack of a heap site id"),
@@ -167,13 +167,14 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("hitch", "[ms=<n>|off]", "frames over the threshold (default 50 ms, always on) are `hitch` events with phases, waits, lazy compiles, critical path and probe deltas: `events on=hitch`, `watch on=hitch`"),
     ("rm", "<G<n>|all>", "removes probe groups: the code they replaced comes back (no recompile)"),
     ("continue", "[K<n>|all]", "lets parked breakpoint hits go"),
+    ("stale", "[n=8]", "stale accesses (into memory the JIT retired for good: unloaded modules, invalidated code), answer first: who touched what, where in it, when and why it was retired, the report; then the retired ranges. A stale access parks its thread and pauses the app until `resume P<n> restart | stop`"),
     ("pause", "", "stops the program's threads (makepad run's and inspect's keep running); stacks work while paused"),
     ("resume", "", "after pause: the program runs again (`resume P<n> panic` releases a parked panic)"),
     ("gpu", "[top [by=bytes|owner|site|churn] [n=15]|idle [frames=1800] [n=15]|snap <name>|diff <a> <b|now>|path <session>:<kind>:<index>:<generation>]", "HAL GPU memory: totals per session, kind and owner against the device (native apps: MAKEPAD_INSPECT=1 or MAKEPAD_REMOTE=1)"),
     ("hal", "pump", "HAL pump loop per session: turns and wake causes, totals and per second since the last call (an idle app shows none)"),
     ("writes", "<Type::field> | (none: the watches) | W<n> [n=20] | rm <W<n>|all>", "who writes a struct field: the compiled fns that assign `x.field` (`=`, `op=`) are rebuilt to record every write: its site (fn, file:line), the value written and the field's address; `writes W<n>` reads the sites and the latest writes"),
     ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
-    ("threads", "", "every thread: name, role, state, CPU time, what it waits on"),
+    ("threads", "", "every thread: name, role, state, CPU time, what it waits on; JIT threads: alive/restarting/dead, panics, heartbeat"),
     ("stacks", "[thread=<name|tid|main|owner|all>] [depth=12]", "symbolised stacks (identical stacks folded)"),
     ("waits", "", "the wait registry: who waits for what, held by whom"),
     ("owner", "", "the owner thread: what it serves, for whom, queue"),
@@ -261,6 +262,7 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "watch" => events::cmd_watch(req, out),
         "events" => events::cmd_events(req, out),
         "panics" => events::cmd_panics(out),
+        "stale" => crate::stale::cmd(req, out),
         "resume" if !req.pos.is_empty() => events::cmd_resume(req, out),
         "count" | "break" | "restartable" | "probes" | "rm" | "continue" | "pause" | "resume" => instrument::cmd(req, out),
         "" => out.err("empty request"),
@@ -822,6 +824,7 @@ fn cmd_threads(out: &mut Out) {
     let mut list = threads::list();
     name_handles(&mut list);
     let waits = crate::waits::snapshot();
+    let jit_rows = crate::lifeline::snapshot();
     out.measured("threads", "os+registry", &[]);
     for t in &list {
         let w = waits.iter().find(|w| w.thread == t.handle && t.handle != 0);
@@ -831,6 +834,9 @@ fn cmd_threads(out: &mut Out) {
         };
         if let Some(d) = activity::describe(t.os_id) {
             wait.push_str(&format!(",\"inspect\":{}", json_str(&d)));
+        }
+        if let Some(r) = jit_rows.iter().find(|r| r.os_id == t.os_id) {
+            wait.push_str(&lifeline_fields(r));
         }
         out.line(&format!(
             "{{\"id\":\"{}\",\"name\":{},\"role\":\"{}\",\"state\":\"{}\",\"cpu_ms\":{}{}}}",
@@ -842,6 +848,23 @@ fn cmd_threads(out: &mut Out) {
             wait
         ));
     }
+    // registered JIT threads the OS no longer lists: gone (dead after panics, or ended)
+    for r in jit_rows.iter().filter(|r| !list.iter().any(|t| t.os_id == r.os_id)) {
+        out.line(&format!("{{\"id\":\"{}\",\"name\":{},\"role\":\"jit\",\"state\":\"gone\"{}}}", tid_label(r.os_id), json_str(&r.name), lifeline_fields(r)));
+    }
+}
+
+/// The JIT thread registry's view of a thread (lifeline.rs): alive / restarting / dead / exited,
+/// panics, the last one, and how long ago it last beat.
+fn lifeline_fields(r: &crate::lifeline::Row) -> String {
+    let mut f = format!(",\"jit\":\"{}\",\"on_panic\":\"{}\"", crate::lifeline::STATE_NAMES[r.state as usize & 3], if r.policy == crate::lifeline::OnPanic::Fatal { "fatal" } else { "restart" });
+    if r.beat_ns != 0 {
+        f.push_str(&format!(",\"beat_ms_ago\":{}", crate::clock::wall_ns().saturating_sub(r.beat_ns) / 1_000_000));
+    }
+    if r.restarts != 0 {
+        f.push_str(&format!(",\"panics\":{},\"last_panic\":{}", r.restarts, json_str(&r.last_panic)));
+    }
+    f
 }
 
 pub fn wait_text(w: &crate::waits::Wait, list: &[threads::Thread]) -> String {
@@ -883,7 +906,9 @@ fn cmd_stacks(req: &Req, out: &mut Out) {
         Err(e) => return out.err(&e),
     };
     let mut partial = Vec::new();
-    let frames: Vec<Vec<u64>> = caps.iter().map(|c| c.frames.iter().copied().take(depth.max(1) + 1).collect()).collect();
+    // a thread parked at a stale access waits in its fault handler: its program frames are the
+    // ones recorded at the fault (stale.rs)
+    let frames: Vec<Vec<u64>> = caps.iter().map(|c| events::stale_frames_of(c.t.os_id).unwrap_or_else(|| c.frames.clone()).into_iter().take(depth.max(1) + 1).collect()).collect();
     let syms = symbolise(&frames, &mut partial);
     out.measured(&format!("stacks of {} thread(s), captured now", caps.len()), "os capture (no owner)", &partial);
     // identical stacks folded

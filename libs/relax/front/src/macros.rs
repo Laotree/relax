@@ -1948,6 +1948,25 @@ pub mod uses {
         SYNTH.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&(file.to_string(), pos)))
     }
 
+    /// rustc_resolve ident.rs `resolve_ident_in_module_non_globs_unadjusted` (Shadowing::Unrestricted):
+    /// a call through a module path (`crate::m!`) of a `#[macro_export]` macro_rules! of the calling
+    /// crate: (calling file, call position, defining file, definition position). Whether the
+    /// definition is macro-expanded is answered with the program's files (lint_early).
+    static ABS_PATH_MACRO_CALLS: Mutex<Vec<(String, u32, String, u32)>> = Mutex::new(Vec::new());
+    pub fn abs_path_macro_call(file: &str, pos: u32, d: &MacroDef) {
+        if !recording() { return; }
+        ABS_PATH_MACRO_CALLS.lock().unwrap_or_else(|e| e.into_inner()).push((file.to_string(), pos, d.def_file.clone(), d.def_pos));
+    }
+    pub fn take_abs_path_macro_calls() -> Vec<(String, u32, String, u32)> { std::mem::take(&mut *ABS_PATH_MACRO_CALLS.lock().unwrap_or_else(|e| e.into_inner())) }
+    /// The single-name bang macro calls written in the checked crates (calling file, position, name):
+    /// rustc resolves them in the lexical scopes (`early_resolve_ident_in_lexical_scope`), where a glob
+    /// import's macro that an outer scope also provides is ambiguous (Program::macro_call_ambiguities).
+    static PLAIN_MACRO_CALLS: Mutex<Vec<(String, u32, String)>> = Mutex::new(Vec::new());
+    pub fn plain_macro_call(file: &str, pos: u32, name: &str) {
+        if !recording() { return; }
+        PLAIN_MACRO_CALLS.lock().unwrap_or_else(|e| e.into_inner()).push((file.to_string(), pos, name.to_string()));
+    }
+    pub fn take_plain_macro_calls() -> Vec<(String, u32, String)> { std::mem::take(&mut *PLAIN_MACRO_CALLS.lock().unwrap_or_else(|e| e.into_inner())) }
     static NAMED_POSITIONAL: Mutex<Vec<(String, u32, String)>> = Mutex::new(Vec::new());
     pub fn named_arg_positional(file: &str, pos: u32, name: &str) { NAMED_POSITIONAL.lock().unwrap_or_else(|e| e.into_inner()).push((file.to_string(), pos, name.to_string())); }
     pub fn take_named_arg_positional() -> Vec<(String, u32, String)> { std::mem::take(&mut *NAMED_POSITIONAL.lock().unwrap_or_else(|e| e.into_inner())) }

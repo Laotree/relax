@@ -53,6 +53,7 @@ pub mod live;
 pub mod reload;
 pub mod modules;
 pub mod sandbox;
+pub mod stale;
 pub mod domain;
 pub(crate) mod domain_threads;
 pub mod jit;
@@ -61,6 +62,7 @@ pub mod web;
 pub mod web32;
 pub mod coverage;
 pub mod owner;
+pub mod lifeline;
 pub mod postframe;
 mod nounwind;
 pub mod os;
@@ -436,6 +438,17 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
         // what each edit invalidates
         "check" => {
             crate::lexer::set_validation(true);
+            // rustc_interface util.rs `init_stack_size`: a batch compiler rejects a RUST_MIN_STACK that
+            // is set (not blank) but no number of bytes, before it reads any input
+            if let Some(v) = std::env::var_os("RUST_MIN_STACK") {
+                let v = v.to_string_lossy();
+                let s = v.trim();
+                if !s.is_empty() && s.parse::<usize>().is_err() {
+                    eprintln!("error: `RUST_MIN_STACK` should be a number of bytes, but was \"{s}\"");
+                    eprintln!("  = note: you can also unset `RUST_MIN_STACK` to use the default stack size");
+                    os::proc::exit(1);
+                }
+            }
             os::proc::exit(serve_rpc::check(sess, &args[2..]));
         }
         // `makepad selftest [--root-only] <package>`: a test of Relax itself -- every fn of the

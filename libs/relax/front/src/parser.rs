@@ -1522,6 +1522,9 @@ impl<'a> Parser<'a> {
         let m = self.macros.as_ref()?;
         let seg = self.ast.segs(path.segs).last()?;
         let name = String::from_utf8_lossy(self.bytes(seg.name.lo, seg.name.hi)).trim_start_matches("r#").to_string();
+        if path.segs.len() == 1 && !path.global() && (seg.name.lo as usize) < self.src.len() {
+            if let Some(c) = self.bctx.as_ref() { crate::macros::uses::plain_macro_call(&c.path, seg.name.lo, &name); }
+        }
         // a skipped body calls only built-ins (body_outline checked each call where it was)
         if self.lazy_part {
             return crate::builtins::macro_def(&name);
@@ -1575,6 +1578,15 @@ impl<'a> Parser<'a> {
         });
         if out_of_scope {
             r = None;
+        }
+        // a module-relative path (`crate::m!`, `self::m!`, `::k::m!`) to this crate's `#[macro_export]` macro:
+        // a macro-expanded one is the lint macro_expanded_macro_exports_accessed_by_absolute_paths (lint_early)
+        if qual.is_some() || path.global() {
+            if let (Some(d), Some(c)) = (r.as_ref(), self.bctx.as_ref()) {
+                if d.builtin == 0 && d.exported && d.krate == self.krate {
+                    crate::macros::uses::abs_path_macro_call(&c.path, seg.name.lo, d);
+                }
+            }
         }
         // Relax's built-in macros (builtins.rs) when no macro_rules! of that name is visible
         match r {

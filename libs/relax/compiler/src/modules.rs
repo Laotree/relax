@@ -796,7 +796,7 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
     }
     let mem: u64 = runtime.module_mem_mb << 20;
     let fuel: i64 = runtime.module_fuel;
-    let arena = match crate::sandbox::new_arena(idx, mem, fuel) {
+    let arena = match crate::sandbox::new_arena(idx, name, mem, fuel) {
         Ok(a) => a,
         Err(e) => return Err(fail(up, &defs, vec![e])),
     };
@@ -1144,21 +1144,19 @@ pub extern "C" fn __relax_module_error(buf: *mut u8, cap: usize) -> usize {
     })
 }
 
-/// A wrapper enters module `idx`'s arena (0; the state before goes to `out`), or finds it
-/// unloaded (1).
-pub extern "C" fn __relax_sb_enter(idx: u32, out: *mut [i64; 4]) -> u32 {
+/// A wrapper enters module `idx`'s arena: 0, or 1 (the module was unloaded), or 2 (every
+/// per-thread segment of the module is in use).
+pub extern "C" fn __relax_sb_enter(idx: u32) -> u32 {
     match crate::sandbox::enter_module(idx) {
-        Some(prev) => {
-            unsafe { *out = prev.0 };
-            0
-        }
-        None => 1,
+        Ok(()) => 0,
+        Err(crate::sandbox::EnterError::Unloaded) => 1,
+        Err(crate::sandbox::EnterError::Busy) => 2,
     }
 }
 
 /// A wrapper leaves: the state before its entry comes back.
-pub extern "C" fn __relax_sb_leave(prev: *const [i64; 4]) {
-    crate::sandbox::leave(crate::sandbox::Saved(unsafe { *prev }));
+pub extern "C" fn __relax_sb_leave() {
+    crate::sandbox::leave();
 }
 
 pub extern "C" fn __relax_sb_alloca(size: usize, align: usize) -> usize {
@@ -1250,6 +1248,7 @@ pub extern "C" fn __relax_sb_string_copy(p: u64, len: u64, out: *mut u8) -> u32 
 pub struct GuardMark {
     arena: crate::sandbox::Saved,
     budgets: usize,
+    entries: u64,
     hosts: Vec<(u64, bool)>,
 }
 
@@ -1257,6 +1256,7 @@ pub fn guard_mark() -> GuardMark {
     GuardMark {
         arena: crate::sandbox::save(),
         budgets: crate::sandbox::budget_depth(),
+        entries: crate::sandbox::entry_depth(),
         hosts: HOSTS.with(|s| s.borrow().iter().map(|e| (e.id, e.busy)).collect()),
     }
 }
@@ -1265,6 +1265,7 @@ pub fn guard_mark() -> GuardMark {
 pub fn guard_reset(m: GuardMark) {
     crate::sandbox::budget_recover(m.budgets);
     crate::sandbox::restore(m.arena);
+    crate::sandbox::entry_recover(m.entries);
     HOSTS.with(|s| {
         let mut s = s.borrow_mut();
         s.retain(|e| m.hosts.iter().any(|h| h.0 == e.id));
@@ -1275,10 +1276,11 @@ pub fn guard_reset(m: GuardMark) {
 }
 
 /// Sandbox statistics for tests and memory reports: [twin code bytes installed (append-only:
-/// every version stays), image ro bytes, image rw bytes, arenas live].
-pub extern "C" fn __relax_sb_stats(out: *mut [u64; 4]) {
+/// every version stays), image ro bytes, image rw bytes, arenas live, unloaded modules' windows
+/// (reserved, inaccessible, never reused)].
+pub extern "C" fn __relax_sb_stats(out: *mut [u64; 5]) {
     let (ro, rw, n) = crate::sandbox::stats();
-    unsafe { *out = [crate::sandbox::twin_code_bytes(), ro as u64, rw as u64, n as u64] };
+    unsafe { *out = [crate::sandbox::twin_code_bytes(), ro as u64, rw as u64, n as u64, crate::sandbox::dead_arenas() as u64] };
 }
 
 /// The `__relax_module_*` entries by name (jit::loader_symbol).
