@@ -78,9 +78,28 @@ fn storable(result: &Result<Option<super::Verdict>, String>) -> Option<StoredVer
 /// Counts the verdicts recorded: a consumer waiting on verdicts (SPEC-V: the JIT's unverified slots)
 /// looks again only when it moved.
 pub static RECORDED: AtomicU64 = AtomicU64::new(0);
+/// The owners recorded since the last `take_recorded_owners`, once a consumer asked for them
+/// (SPEC-V's sweep looks again only at the slots of these owners; None: nobody asked yet).
+static RECORDED_OWNERS: Mutex<Option<Vec<DefId>>> = Mutex::new(None);
 fn record(key: ItemKey, value: FnVerdict) {
     VERDICTS.lock().unwrap_or_else(|e| e.into_inner()).entry(key.1).or_default().insert(key, value);
+    if let Some(owners) = RECORDED_OWNERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        crate::zone_alloc::kept_with(|| owners.push(key.1));
+    }
     RECORDED.fetch_add(1, Ordering::Release);
+}
+
+/// The owners whose verdicts were recorded since the last call (None on the first call: from then on
+/// they are logged). Taken before `RECORDED` is read, an owner recorded meanwhile is in the next take.
+pub fn take_recorded_owners() -> Option<Vec<DefId>> {
+    let mut owners = RECORDED_OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+    match owners.as_mut() {
+        Some(v) => Some(std::mem::take(v)),
+        None => {
+            *owners = Some(Vec::new());
+            None
+        }
+    }
 }
 
 pub fn report_checked(prog: &Program, src: usize, epoch: u64, def: DefId, args: &[TyId], errors: Vec<BorrowError>, origin: Origin) -> Vec<GandalfEvent> {
@@ -249,8 +268,15 @@ pub fn set_ranks(src: usize, epoch: u64, ranks: &[(DefId, Vec<TyId>, u32)]) {
     let q = guard.get_or_insert_with(Queue::default);
     let epoch = q.canon(src, epoch);
     if !q.advance(src, epoch) { return; }
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let trace = *TRACE.get_or_init(|| std::env::var_os("MAKEPAD_RUN_SPECV_TRACE").is_some());
     for (def, _, rank) in ranks {
         let key = (src, *def, epoch);
+        if trace {
+            let state = if q.rank_of.contains_key(&key) { "queued" } else if q.seen.contains_key(&key) { "seen" } else { "not queued" };
+            let v = VERDICTS.lock().unwrap_or_else(|e| e.into_inner()).get(def).map(|m| m.len()).unwrap_or(0);
+            eprintln!("gandalf: rank {} for {:?} epoch {}: {} ({} verdict entries, {} items queued)", rank, def, epoch, state, v, q.order.len());
+        }
         if let Some(at) = q.rank_of.remove(&key) {
             q.order.remove(&at);
             let item = q.items.remove(&at).unwrap();
@@ -544,7 +570,9 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
     loop {
         if stopping() { return; }
         let quiet = src.quiet_ns();
-        if quiet < QUIET_NS {
+        // rank 0 (hot code waiting for its verdict, set_ranks) runs while compiles go on
+        let urgent = || QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 == 0);
+        if quiet < QUIET_NS && !urgent() {
             std::thread::sleep(std::time::Duration::from_millis(((QUIET_NS - quiet) / 1_000_000).clamp(20, 500)));
             continue;
         }

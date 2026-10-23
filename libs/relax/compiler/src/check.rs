@@ -138,6 +138,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     errors.extend(relax_types::item_checks::foreign_blocks(&u.prog, &own));
     errors.extend(relax_types::item_checks::duplicate_symbols(&u.prog, &own));
     errors.extend(relax_types::item_checks::global_allocators_and_lang_items(&u.prog, &own));
+    errors.extend(relax_types::proc_macro_harness::check(&u.prog, &u.tcx, &own));
     if u.prog.crates[root as usize].is_bin { errors.extend(relax_types::item_checks::entry_point(&u.prog, root)); }
     if u.prog.crates[root as usize].is_bin { errors.extend(relax_types::item_checks::entry_symbol_conflict(&u.prog, &own, root)); }
     errors.extend(relax_types::lint_levels::check(&u.prog, &own));
@@ -156,7 +157,12 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         for e in par_map(&defs, |&d| {
             let mut tries = 0;
             loop {
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| relax_types::wfcheck::obligations::check_def(prog, tcx, d)));
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut v = relax_types::wfcheck::obligations::check_def(prog, tcx, d);
+                    // rustc_privacy check_mod_privacy: the types of the item's signature
+                    v.extend(relax_types::privacy_types::check_item(prog, tcx, d));
+                    v
+                }));
                 match r {
                     Ok(v) => break v,
                     Err(p) if (crate::preempt::is_preempted(&*p) || p.is::<crate::preempt::NeedsLoad>() || p.is::<crate::preempt::OwnerBusy>()) && tries < 100 => { tries += 1; std::thread::yield_now(); }
@@ -227,7 +233,8 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     for anon in crates.iter().flat_map(|&k| crate::borrowck::body::signature_anon_consts(&u.prog, &u.tcx, k)).collect::<Vec<_>>() {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let body = u.tcx.typeck(&u.prog, anon);
-            let mut errs = body.errors.to_vec();
+            let errs = body.errors.to_vec();
+            let mut diags = Vec::new();
             if errs.is_empty() {
                 relax_types::lint::check_literals(&u.prog, &u.tcx, &body);
                 relax_types::lint_pass::check_body(&u.prog, &u.tcx, &body);
@@ -237,18 +244,21 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
                 if let Some((_, relax_front::def_collector::NodeId::AnonConst(expr))) = u.prog.def_id_to_node_id.get(&anon) {
                     let state = crate::tcx::EvalState::new();
                     let cx = crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &state);
-                    for e in crate::borrowck::check_anon_const(&cx, &u.prog, &u.tcx, &body, *expr) {
-                        errs.push(e.render());
+                    let errs = crate::borrowck::check_anon_const(&cx, &u.prog, &u.tcx, &body, *expr);
+                    if !errs.is_empty() {
+                        diags.extend(crate::borrowck::lazy::report_checked(&u.prog, 0, u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), anon, &body.args, errs, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
                     }
                 }
             }
-            errs
+            (errs, diags)
         }));
         match r {
-            Ok(e) => {
+            Ok((e, diags)) => {
+                let e_ok = e.is_empty() && diags.is_empty();
+                borrow_diagnostics.extend(diags);
                 // rustc evaluates every array length / const argument written in a signature (used
                 // or not): one that fails is reported there (E0080)
-                if e.is_empty() && u.tcx.generic_indices_of(&u.prog, anon).types_consts.is_empty() && !matches!(u.prog.def(u.prog.def(anon).parent).kind, DefKind::Trait | DefKind::TypeAlias) {
+                if e_ok && u.tcx.generic_indices_of(&u.prog, anon).types_consts.is_empty() && !matches!(u.prog.def(u.prog.def(anon).parent).kind, DefKind::Trait | DefKind::TypeAlias) {
                     let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
                     let before = u.tcx.dcx.err_count();
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.tcx.const_eval_resolve(&u.prog, env, anon, &[])));
@@ -288,19 +298,26 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             if !unsafety.is_empty() {
                 return (unsafety, Vec::new());
             }
+            // rustc_privacy check_mod_privacy: the types of the body's expressions and patterns
+            let privacy = relax_types::privacy_types::check_body(prog, tcx, &body);
+            if !privacy.is_empty() {
+                return (privacy, Vec::new());
+            }
             // E0004 / E0005 and the pattern lints (rustc check_match: its errors stop the body
             // before borrowck); an internal failure of the analysis reports nothing
             let pats = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| relax_types::pattern_analysis::check_body(prog, tcx, &body)));
+            // (binding conflicts of `x @ pat` do not end the checks: borrowck runs after them)
+            let mut at_patterns = Vec::new();
             match pats {
-                Ok(e) if !e.is_empty() => return (e, Vec::new()),
-                Ok(_) => {}
+                Ok(r) if !r.errors.is_empty() => { let mut e = r.errors; e.extend(r.at_patterns); return (e, Vec::new()) }
+                Ok(r) => at_patterns = r.at_patterns,
                 Err(p) if p.is::<crate::preempt::NeedsLoad>() || crate::preempt::is_preempted(&*p) => std::panic::resume_unwind(p),
                 Err(_) => {
                     if std::env::var_os("MAKEPAD_RUN_CHECK_TRACE").is_some() { std::eprintln!("makepad check: pattern analysis failed in {}", prog.def_path(d)); }
                 }
             }
             if !crate::borrowck::enabled(options) {
-                return (Vec::new(), Vec::new());
+                return (at_patterns, Vec::new());
             }
             let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &crate::tcx::EvalState::new()), prog, tcx, &body);
             crate::borrowck::note_verdict(&v);
@@ -309,7 +326,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             }
             let args: Vec<_> = if owner.kind == crate::borrowck::body::BodyKind::Function && !generic { Vec::new() } else { body.args.to_vec() };
             let diags = crate::borrowck::lazy::report_checked(prog, 0, tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &args, v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()).collect();
-            (Vec::new(), diags)
+            (at_patterns, diags)
             };
             let (mut errs, diags) = inner();
             errs.extend(gates);
@@ -377,7 +394,10 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         }
     }
     let mut seeds = Vec::new();
-    for (_, o) in outcomes {
+    // rustc: an item whose body failed its checks (borrowck included) is tainted: it is never evaluated
+    let mut tainted: std::collections::HashSet<crate::program::DefId> = std::collections::HashSet::new();
+    for (i, o) in outcomes {
+        if !o.errors.is_empty() || !o.diags.is_empty() { tainted.insert(fns[i].0.owner); }
         errors.extend(o.errors);
         borrow_diagnostics.extend(o.diags);
         if let Some(d) = o.seed { seeds.push(d); }
@@ -395,7 +415,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     // rustc_hir_analysis check_crate: every static and every non-generic, non-associated const
     // item of the checked crates is evaluated, used or not; one that cannot be evaluated is an
     // E0080 (the unit notes it, reported below with the builds' other notes)
-    eval_items(up, &own);
+    eval_items(up, &own, &tainted);
     // rustc_monomorphize: a program's `main` and what it reaches, instantiated -- the constants
     // generic code evaluates there (post-monomorphization E0080) -- in a check of a program
     if options.const_fuel && !compile && errors.is_empty() && borrow_diagnostics.is_empty() && unsafe { (&*up).errors.is_empty() } { mono_check(up, &own, root); }
@@ -404,7 +424,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     // of malloc free pages held after it)
     if compile { unsafe {
         let _job = jit::compile_job();
-        let mut d = crate::owner::call(crate::owner::Class::App, || jit::settle_drop(up));
+        let mut d = crate::owner::call(crate::owner::Class::Program, || jit::settle_drop(up));
         d.release_rir();
     } crate::memstat::trim(); }
     if crate::memstat::enabled() {
@@ -535,7 +555,7 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
     // (and the run's speculative callee builds)
     jit::enable_pipelining(&(*up).prog.session.clone().options);
     // (slots made before the seeds -- the root's main, constants' readers -- are compiled too)
-    crate::owner::call(crate::owner::Class::App, || {
+    crate::owner::call(crate::owner::Class::Program, || {
         for &d in seeds {
             (&mut *up).fn_id(FnKey::Inst(d, Vec::new()));
         }
@@ -567,7 +587,7 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
                     active.fetch_add(1, Ordering::SeqCst);
                     let pick = {
                         let _job = jit::compile_job();
-                        crate::owner::call(crate::owner::Class::App, || {
+                        crate::owner::call(crate::owner::Class::Program, || {
                             let n = (&(*up).fns).len();
                             let mut pick = None;
                             loop {
@@ -586,7 +606,7 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
                     };
                     let Some(id) = pick else {
                         active.fetch_sub(1, Ordering::SeqCst);
-                        if active.load(Ordering::SeqCst) == 0 && next.load(Ordering::SeqCst) >= crate::owner::call(crate::owner::Class::App, || (&(*up).fns).len()) {
+                        if active.load(Ordering::SeqCst) == 0 && next.load(Ordering::SeqCst) >= crate::owner::call(crate::owner::Class::Program, || (&(*up).fns).len()) {
                             break;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -603,7 +623,7 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
                     if n >= at + 2_000 && settled_at.compare_exchange(at, n, Ordering::AcqRel, Ordering::Relaxed).is_ok()
                         && crate::memstat::resident() as u64 > settled_rss.load(Ordering::Relaxed) + SETTLE_GROWTH {
                         let _job = jit::compile_job();
-                        let mut d = crate::owner::call(crate::owner::Class::App, || jit::settle_drop(up));
+                        let mut d = crate::owner::call(crate::owner::Class::Program, || jit::settle_drop(up));
                         d.release_rir();
                         crate::memstat::trim();
                         settled_rss.store(crate::memstat::resident() as u64, Ordering::Relaxed);
@@ -736,7 +756,7 @@ fn is_follow_on(e: &str) -> bool {
 
 /// Evaluates the checked crates' statics and non-generic const items (rustc evaluates them in
 /// `cargo check`, used or not). A body with type errors is skipped: those errors are reported.
-fn eval_items(up: *mut Unit, own: &[bool]) {
+fn eval_items(up: *mut Unit, own: &[bool], tainted: &std::collections::HashSet<crate::program::DefId>) {
     let u = unsafe { &mut *up };
     let items: Vec<(crate::program::DefId, bool)> = (0..u.prog.defs.len())
         .filter(|&i| own[u.prog.defs[i].krate as usize])
@@ -750,9 +770,9 @@ fn eval_items(up: *mut Unit, own: &[bool]) {
         .collect();
     let _job = jit::compile_job();
     for (d, is_static) in items {
-        if !u.tcx.typeck(&u.prog, d).errors.is_empty() { continue; }
+        if tainted.contains(&d) || !u.tcx.typeck(&u.prog, d).errors.is_empty() { continue; }
         let before = unsafe { (&*up).errors.len() };
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::owner::call(crate::owner::Class::App, || unsafe {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::owner::call(crate::owner::Class::Program, || unsafe {
             let u = &mut *up;
             if is_static { u.static_addr(d); } else { u.const_addr(d, Vec::new()); }
         })));
@@ -783,7 +803,7 @@ fn mono_check(up: *mut Unit, own: &[bool], root: u32) {
     let limit = u.prog.crates[root as usize].recursion_limit as usize;
     let _job = jit::compile_job();
     // (instance, the instance it was reached from): the chain of a reached instance is its DFS stack
-    let mut work: Vec<(u32, Option<u32>)> = vec![(crate::owner::call(crate::owner::Class::App, || unsafe { (&mut *up).fn_id(FnKey::Inst(main, Vec::new())) }), None)];
+    let mut work: Vec<(u32, Option<u32>)> = vec![(crate::owner::call(crate::owner::Class::Program, || unsafe { (&mut *up).fn_id(FnKey::Inst(main, Vec::new())) }), None)];
     let mut parents: std::collections::HashMap<u32, Option<u32>> = std::collections::HashMap::new();
     while let Some((id, parent)) = work.pop() {
         if parents.contains_key(&id) { continue; }
@@ -811,7 +831,7 @@ fn mono_check(up: *mut Unit, own: &[bool], root: u32) {
                 continue;
             }
         }
-        let callees = crate::owner::call(crate::owner::Class::App, || unsafe {
+        let callees = crate::owner::call(crate::owner::Class::Program, || unsafe {
             if !mine { return Vec::new(); }
             // (a fn taking or returning a value of hundreds of MB is not lowered: its frame would
             // be allocated for real)

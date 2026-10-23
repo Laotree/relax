@@ -111,8 +111,11 @@ pub enum Builtin {
     Memset,
     /// (f, data) -> u64: calls fn pointer `f(data)`; 0 when it returned, 1 when it unwound
     CatchPanic,
-    /// does nothing; its results are zero (single-threaded waits, wakes, thread ids)
+    /// does nothing; its results are zero (single-threaded waits and wakes)
     Nop,
+    /// does nothing; its integer results are 1: the one thread's id (never 0, the "no owner"
+    /// of locks), "is the main thread"
+    One,
     /// thread-local keys of a single-threaded program: (dtor) -> key, (key) -> value,
     /// (key, value); a table in linear memory
     KeyCreate,
@@ -165,11 +168,13 @@ pub struct Options {
     pub order_by_name: bool,
     /// identical function bodies are emitted once
     pub fold_identical: bool,
+    /// functions ordered by their body bytes (similar bodies adjacent for the compressor)
+    pub order_by_bytes: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, remat_slots: false, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true }
+        Options { stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, remat_slots: false, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true, order_by_bytes: true }
     }
 }
 
@@ -510,7 +515,11 @@ impl<'a> Module<'a> {
         let mut iord: Vec<usize> = (0..ni).collect();
         iord.sort_by(|a, b| fuse[*b].cmp(&fuse[*a]).then(a.cmp(b)));
         let mut dord: Vec<usize> = (ni..ni + n_user + n_help).filter(|g| canon[*g] == *g).collect();
-        if opts.order_by_name {
+        if opts.order_by_bytes {
+            // similar bodies next to each other (the compressor's window): by their bytes
+            let body = |g: usize| -> &[u8] { if g < ni + n_user { &bodies[g - ni].bytes } else { &helper_bodies[g - ni - n_user].bytes } };
+            dord.sort_by(|a, b| body(*a).cmp(body(*b)).then(a.cmp(b)));
+        } else if opts.order_by_name {
             let key = |g: usize| if g < ni + n_user { funcs[g - ni].1.name.as_str() } else { "\u{10FFFF}" };
             dord.sort_by(|a, b| key(*a).cmp(key(*b)).then(a.cmp(b)));
         } else {
@@ -734,7 +743,8 @@ impl<'a> Module<'a> {
         st.n_imports = ni;
         st.failed = failed;
         st.untraced_sites = self.sh.untraced_sites;
-        st.fn_sizes = funcs.iter().zip(bodies.iter()).map(|((id, f), b)| (*id, f.name.clone(), b.bytes.len())).collect();
+        // a folded copy emits no body: 0 bytes
+        st.fn_sizes = funcs.iter().zip(bodies.iter()).enumerate().map(|(k, ((id, f), b))| (*id, f.name.clone(), if canon[ni + k] == ni + k { b.bytes.len() } else { 0 })).collect();
         Output { bytes: out, stats: st }
     }
 }
@@ -1068,7 +1078,7 @@ fn lower_func(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &
         g
     });
     let f0: &Func = legal.as_ref().unwrap_or(f0);
-    let switched = crate::switch::lower_switches(options, f0);
+    let switched = crate::switch::lower_switches(options, f0, crate::switch::MIN_TABLE_CLUSTERS);
     let f: &Func = switched.as_ref().map(|s| &s.0).unwrap_or(f0);
     let ft = func_type(f)?;
     let ty = sh.ty(ft.clone());
@@ -1277,7 +1287,7 @@ fn inv(c: Cond) -> Cond {
 fn tree_def(i: &Inst) -> Option<VReg> {
     match i {
         Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::Mov(d, _) | Inst::IBin(_, _, d, _, _) | Inst::IBinI(_, _, d, _, _) | Inst::INeg(_, d, _) | Inst::INot(_, d, _) | Inst::IBit(_, d, _) | Inst::ICmp(_, _, d, _, _) | Inst::ICmpI(_, _, d, _, _) => Some(*d),
-        Inst::FBin(_, _, d, _, _) | Inst::FUnary(_, _, d, _) | Inst::FCmp(_, _, d, _, _) | Inst::Conv(_, d, _) | Inst::Load(_, d, _, _) | Inst::LoadX(_, d, _, _, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::TlsAddr(d, _) => Some(*d),
+        Inst::FBin(_, _, d, _, _) | Inst::FUnary(_, _, d, _) | Inst::FCmp(_, _, d, _, _) | Inst::Conv(_, d, _) | Inst::Load(_, d, _, _) | Inst::LoadX(_, d, _, _, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::TlsAddr(d, _) | Inst::TlsStatic(d, _) => Some(*d),
         Inst::Sel(d, _, _, _) | Inst::FMulAdd(_, _, _, d, _, _, _) | Inst::AtomicLoad(_, _, d, _) => Some(*d),
         Inst::VConst(d, _) | Inst::VSplat(d, _) | Inst::VExtract(d, _, _) | Inst::VInsert(d, _, _, _) | Inst::VLoad(d, _, _) | Inst::VLoadX(d, _, _, _, _) | Inst::VAny(d, _) | Inst::VSel(d, _, _, _) | Inst::VShuffle(d, _, _, _) => Some(*d),
         Inst::VX(op, d, _, _) if simd_op(*op).is_some() || matches!(op, VX::Splat(_) | VX::Extract(..) | VX::Insert(..) | VX::FromLo64) => Some(*d),
@@ -1327,6 +1337,7 @@ impl<'a> Fx<'a> {
                     Callee::Fn(id) | Callee::CFn(id, _) => self.fn_ix.contains_key(id),
                     Callee::Host(s) | Callee::CHost(s, _) => !matches!(self.link.host(s.id), HostBind::Trap),
                     Callee::Indirect(_) | Callee::CIndirect(..) => true,
+                    Callee::Asm(_) => false,
                 };
                 if !direct {
                     return vec![];
@@ -2091,14 +2102,16 @@ impl<'a> Fx<'a> {
                     }
                     self.helper(Helper::Fma64);
                 } else {
-                    // the f32 product is exact in f64; one more rounding of the sum
+                    // the f32 product is exact in f64; one more rounding of the sum. x * a' then
+                    // + c': a NaN operand comes out as the engine's f64 ops pass it on (the first
+                    // NaN of x, a', c' on x86-64 hosts, as the native fused op; rir::fma_nan_f32)
+                    self.value(b, *x, Want::Nat)?;
+                    self.op(F64_PROMOTE);
                     self.value(b, *a, Want::Nat)?;
                     self.op(F64_PROMOTE);
                     if *np {
                         self.op(0x9A);
                     }
-                    self.value(b, *x, Want::Nat)?;
-                    self.op(F64_PROMOTE);
                     self.op(0xA2);
                     self.value(b, *c, Want::Nat)?;
                     self.op(F64_PROMOTE);
@@ -2414,6 +2427,22 @@ impl<'a> Fx<'a> {
     }
 
     fn ibin(&mut self, b: u32, op: IOp, it: IntTy, a: VReg, x: Option<VReg>, imm: i64) -> Result<(), String> {
+        if op == IOp::Bzhi {
+            // a & !(-1 << (x mod 64))
+            self.value(b, a, Want::Nat)?;
+            self.i64c(-1);
+            match x {
+                Some(x) => {
+                    self.value(b, x, Want::Nat)?;
+                }
+                None => self.i64c(imm),
+            }
+            self.op(I64_SHL);
+            self.i64c(-1);
+            self.op(I64_XOR);
+            self.op(I64_AND);
+            return Ok(());
+        }
         let narrow32 = it.bits == 32 && !it.signed && matches!(op, IOp::Shl | IOp::Shr | IOp::Rotl);
         self.value(b, a, Want::Nat)?;
         if narrow32 {
@@ -2467,6 +2496,7 @@ impl<'a> Fx<'a> {
                 self.helper(Helper::MulHi(it.signed));
                 return Ok(());
             }
+            IOp::Bzhi => unreachable!("bzhi handled above"),
             IOp::Rotl => {
                 if it.bits != 64 {
                     return Err(format!("rotate of {}-bit {}", it.bits, if it.signed { "signed" } else { "unsigned" }));
@@ -2506,6 +2536,7 @@ impl<'a> Fx<'a> {
             _ => None,
         };
         match callee {
+            Callee::Asm(_) => return Err("inline assembly (asm!) has no wasm form".to_string()),
             Callee::Fn(id) | Callee::CFn(id, _) => match self.fn_ix.get(id) {
                 Some(&u) => {
                     let want = sig(self)?;
@@ -2656,6 +2687,9 @@ impl<'a> Fx<'a> {
                 }
             }
             Inst::AtomicRmw(op, m, _, d, addr, src) => {
+                // the address (and a min/max source) is read twice: a value just set must stay in
+                // its local (the tee shortcut would drop the set for a single counted use)
+                self.last_set.0 = usize::MAX;
                 let t = self.tmp64;
                 let (lop, lal) = self.load_op(*m)?;
                 let (sop, sal) = self.store_op(*m)?;
@@ -2704,6 +2738,7 @@ impl<'a> Fx<'a> {
                 self.set(*d);
             }
             Inst::AtomicCas(m, _, _, d, addr, exp, new) => {
+                self.last_set.0 = usize::MAX;
                 let t = self.tmp64;
                 let (lop, lal) = self.load_op(*m)?;
                 let (sop, sal) = self.store_op(*m)?;
@@ -2726,6 +2761,7 @@ impl<'a> Fx<'a> {
                 self.lget(t);
                 self.set(*d);
             }
+            Inst::Coverage { .. } => return Err("native coverage probe in wasm output".into()),
             Inst::Fence(..) => {}
             Inst::FpEnv(false, d) => {
                 self.i64c(0);
@@ -3285,9 +3321,10 @@ fn helper_body(o: &Options, h: Helper, sh: &mut Shared, fn_ix: &HashMap<u32, u32
             };
             split(&mut c, 0, 6, 7);
             split(&mut c, 1, 8, 9);
-            // p = a * b
-            g(&mut c, 0);
+            // p = b * a (a NaN operand: b's, a's, then c's first through the engine's f64 ops on
+            // x86-64, as the native fused op; rir::fma_nan_f64)
             g(&mut c, 1);
+            g(&mut c, 0);
             c.push(0xA2);
             c.push(LSET);
             c.push(3);
@@ -3376,11 +3413,12 @@ fn helper_body(o: &Options, h: Helper, sh: &mut Shared, fn_ix: &HashMap<u32, u32
                         g(&mut c, 0);
                     }
                 }
-                Builtin::Nop => {
+                Builtin::Nop | Builtin::One => {
+                    let k = (bi == Builtin::One) as u8;
                     for r in &t.results {
                         match r {
-                            I32 => c.extend_from_slice(&[I32C, 0]),
-                            I64 => c.extend_from_slice(&[I64C, 0]),
+                            I32 => c.extend_from_slice(&[I32C, k]),
+                            I64 => c.extend_from_slice(&[I64C, k]),
                             F32 => {
                                 c.push(F32C);
                                 c.extend_from_slice(&[0; 4]);

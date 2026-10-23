@@ -352,6 +352,8 @@ fn build_world(sess: &std::sync::Arc<crate::Session>) -> Result<World, String> {
     let mut prog = crate::program::Program::new(sess);
     // core/alloc/std: the program's own parses (program::SharedParse), not a second copy
     prog.std_from_shared = true;
+    // macros run on this machine: its pointer width, whatever the program's target
+    prog.ptr_bytes = 8;
     // macros run here: the machine's cfg, never MAKEPAD_RUN_CHECK_TARGET's
     let host = |f: &[String]| crate::cfg::CfgSet::machine(sess, f);
     let core = prog.load_crate_deferred("core", &format!("{}/core/lib.rs", std_dir), 2021, host(&[]), Vec::new())?;
@@ -448,7 +450,7 @@ fn entry_of(w: &World, unit: usize, fname: &str) -> Result<u64, String> {
         return Ok(*a);
     }
     let k = w.crate_of[unit];
-    let a = crate::owner::call(crate::owner::Class::App, || {
+    let a = crate::owner::call(crate::owner::Class::Program, || {
         let u = unsafe { &mut *w.u };
         let prog = &u.prog;
         let root = prog.mods[prog.crates[k as usize].root_mod as usize].def;
@@ -551,7 +553,7 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
     // the runtime's process-wide UNIT and TLS machinery. Preserve the original reload
     // serialization for this step. Cached script expansions never enter the host.
     let wait = crate::load_profile::span(sess.runtime.profile, "wait-macro-unit", &entry.fname);
-    crate::owner::call(crate::owner::Class::App, || -> Result<TokenStream, String> {
+    crate::owner::call(crate::owner::Class::Program, || -> Result<TokenStream, String> {
     drop(wait);
     let _held = crate::load_profile::span(sess.runtime.profile, "macro-unit-held", &entry.fname);
     if let Some(Some(e)) = w.refused.get(entry.unit) {
@@ -590,7 +592,7 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
                 x.call_ns += t0.elapsed().as_nanos() as u64;
                 s.set(x);
             });
-            let errs = crate::owner::call(crate::owner::Class::App, || {
+            let errs = crate::owner::call(crate::owner::Class::Program, || {
                 let u = unsafe { &mut *w.u };
                 let errs = std::mem::take(&mut u.errors);
                 if trace() {
@@ -619,7 +621,7 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
     let dec_ns = td.elapsed().as_nanos() as u64;
     let tz = std::time::Instant::now();
     // Macro calls can run while lazy/spec compilers update this unit's counters.
-    let (cns, cnt) = crate::owner::call(crate::owner::Class::App, || {
+    let (cns, cnt) = crate::owner::call(crate::owner::Class::Program, || {
         let st = unsafe { &(*w.u).stats };
         (st.typeck_ns + st.lower_ns + st.opt_ns + st.codegen_ns, st.compiled as u64)
     });
@@ -644,7 +646,7 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
 /// goes to the disk cache.
 pub fn flush_cache() {
     if let Some(Ok(w)) = world_now().as_deref() {
-        crate::owner::call(crate::owner::Class::App, || {
+        crate::owner::call(crate::owner::Class::Program, || {
             let u = unsafe { &mut *w.u };
             u.flush_cache_records();
             if let Some(c) = u.cache.as_mut() {

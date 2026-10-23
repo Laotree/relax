@@ -30,16 +30,6 @@ extern "C" {
     pub safe fn main_hosted() -> bool;
 }
 
-// The calling thread's FP control register (AArch64 FPCR): Relax compiles no inline assembly,
-// so the two instructions are the loader's. Scalars only.
-#[cfg(target_arch = "aarch64")]
-extern "C" {
-    #[link_name = "__relax_fpcr_read"]
-    pub safe fn fpcr_read() -> u64;
-    #[link_name = "__relax_fpcr_write"]
-    pub safe fn fpcr_write(v: u64);
-}
-
 extern "C" {
     fn __relax_realtime(root: usize, data: usize, meta: usize);
 }
@@ -681,7 +671,7 @@ pub mod probe {
     use crate::fmt::Debug;
 
     extern "C" {
-        fn __relax_probe_emit(text: *const u8, len: usize);
+        fn __relax_probe_emit(line: u32, text: *const u8, len: usize);
         fn __relax_probe_count(key: *const u8, klen: usize);
         fn __relax_probe_hist(key: *const u8, klen: usize, x: f64);
         fn __relax_probe_sample(key: *const u8, klen: usize, text: *const u8, len: usize, keep: usize);
@@ -713,10 +703,14 @@ pub mod probe {
         unsafe { __relax_probe_result(1, s.as_ptr(), s.len()) }
     }
 
-    /// Sends `v` (its Debug form) to the agent as one `probe` event (rate-limited).
+    /// Sends `v` (its Debug form) to the agent as one `probe` event (rate-limited) and keeps it
+    /// in the probe's recent values (`probe read`), named by the emit's own expression: the
+    /// elements of `emit((dist, config.near))` are the columns `dist`, `config.near`.
+    #[track_caller]
     pub fn emit<T: Debug>(v: T) {
+        let line = crate::panic::Location::caller().line();
         let s = crate::format!("{:?}", v);
-        unsafe { __relax_probe_emit(s.as_ptr(), s.len()) }
+        unsafe { __relax_probe_emit(line, s.as_ptr(), s.len()) }
     }
 
     /// Counts one hit under `key`.
