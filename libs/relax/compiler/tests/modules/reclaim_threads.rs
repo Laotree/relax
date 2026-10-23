@@ -91,7 +91,9 @@ fn reclaim_threads() {
         refused_while_parked &= recycle().is_err();
     }
     let refused = std::relax::sandbox_stats(false).unwrap()[6];
-    println!("out first recycle (fresh space): {}", first.is_ok());
+    // (under MAKEPAD_RUN_RECLAIM_STRESS background recycles may have used the fresh space already)
+    let stress = std::env::var("MAKEPAD_RUN_RECLAIM_STRESS").is_ok_and(|v| v != "0");
+    println!("out first recycle (fresh space): {}", first.is_ok() || stress);
     println!("out parked thread blocks reuse: {}", refused_while_parked && refused >= 20 && edits == 20);
     // T returns through its old frames (the space was never reused under it)
     RELEASE.store(true, Ordering::SeqCst);
