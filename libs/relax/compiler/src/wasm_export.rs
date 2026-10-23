@@ -858,16 +858,8 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     }
     if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
         let s = &out.stats;
-        for id in &reached {
-            for (block, b) in funcs[id].blocks.iter().enumerate() {
-                for i in &b.insts {
-                    if let Inst::Call(relax_backend::rir::Callee::Fn(t) | relax_backend::rir::Callee::CFn(t, _), _, _) = i {
-                        if !reached.contains(t) {
-                            eprintln!("wasm export: untraced call {} ({}) block {} -> {} ({})", id, funcs[id].name, block, t, crate::syms::stable_fn_name(u, *t));
-                        }
-                    }
-                }
-            }
+        for (id, target) in &s.untraced_calls {
+            eprintln!("wasm export: untraced call {} ({}) -> {} ({})", id, funcs[id].name, target, crate::syms::stable_fn_name(u, *target));
         }
         eprintln!(
             "wasm export: {} bytes ({} functions captured, {} in module, {} types, {} imports): code {} data {} types {} imports {} funcs {} elems {} other {}; {} data objects, {} pointer words linked, {} symbols unlinked, {} untraced call sites, {} functions failed, {} folded into identical ones",

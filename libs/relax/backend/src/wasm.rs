@@ -199,6 +199,8 @@ pub struct Stats {
     /// functions whose body could not be lowered (id, why): they trap
     pub failed: Vec<(u32, String)>,
     pub untraced_sites: usize,
+    /// (caller slot, target slot) for each untraced call encountered while lowering.
+    pub untraced_calls: Vec<(u32, u32)>,
     /// function bodies folded into an identical one
     pub n_folded: usize,
     /// (slot id, function name, body bytes) of every chosen function
@@ -263,7 +265,7 @@ struct Shared {
     table: Vec<Option<FRef>>,
     table_ix: HashMap<u32, u32>,
     untraced_entry: Option<u32>,
-    untraced_sites: usize,
+    untraced_targets: Vec<u32>,
     uses_tag: bool,
     uses_table: bool,
     /// the thread-local key table (Builtin::Key*)
@@ -334,7 +336,7 @@ impl<'a> Module<'a> {
                 table: vec![None],
                 table_ix: HashMap::new(),
                 untraced_entry: None,
-                untraced_sites: 0,
+                untraced_targets: Vec::new(),
                 uses_tag: false,
                 uses_table: false,
                 keys_base: 0,
@@ -399,9 +401,12 @@ impl<'a> Module<'a> {
         // user function types first (their indices are needed by every call)
         let mut bodies: Vec<Body> = Vec::with_capacity(self.funcs.len());
         let mut failed = Vec::new();
+        let mut untraced_calls = Vec::new();
         let funcs = std::mem::take(&mut self.funcs);
         for (id, f) in &funcs {
+            let first = self.sh.untraced_targets.len();
             let r = lower_func(&opts, options, f, &self.fn_ix, &funcs, link, &mut self.sh);
+            untraced_calls.extend(self.sh.untraced_targets[first..].iter().map(|target| (*id, *target)));
             match r {
                 Ok(b) => bodies.push(b),
                 Err(e) => {
@@ -753,7 +758,8 @@ impl<'a> Module<'a> {
         st.n_types = tord.len();
         st.n_imports = ni;
         st.failed = failed;
-        st.untraced_sites = self.sh.untraced_sites;
+        st.untraced_sites = untraced_calls.len();
+        st.untraced_calls = untraced_calls;
         // a folded copy emits no body: 0 bytes
         st.fn_sizes = funcs.iter().zip(bodies.iter()).enumerate().map(|(k, ((id, f), b))| (*id, f.name.clone(), if canon[ni + k] == ni + k { b.bytes.len() } else { 0 })).collect();
         Output { bytes: out, stats: st }
@@ -2621,7 +2627,7 @@ impl<'a> Fx<'a> {
     }
 
     fn untraced(&mut self, id: u32) {
-        self.sh.untraced_sites += 1;
+        self.sh.untraced_targets.push(id);
         if self.o.untraced_import {
             self.i32c(id as i32);
             self.helper(Helper::Untraced);
