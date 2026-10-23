@@ -4686,6 +4686,9 @@ impl Unit {
                 LOWER_AHEAD_IDS.with(|x| x.borrow_mut().consts.push((d, args, a)));
                 return Some(a);
             }
+            if ahead_trace() {
+                eprintln!("ahead-lower: constant {} not evaluated yet", self.prog.def_path(d));
+            }
         }
         owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).const_addr(d, args) })
     }
@@ -17173,22 +17176,50 @@ fn prefront_slot(front: &FrontShared, id: u32) -> bool {
 fn prefront_closure(front: &FrontShared, id: u32) -> bool {
     let Some(key @ FnKey::Closure(cfile, _, parent)) = front.slot_keys.get(&id) else { return false };
     let up = front.unit.load(Ordering::Relaxed);
-    let Some(body) = owner::publish(|| unsafe { (&*up).body_of(parent, cfile).cloned() }) else {
-        PREFRONT_FAIL[AF_NO_PARENT as usize].fetch_add(1, Ordering::Relaxed);
-        return false;
-    };
+    let kept = owner::publish(|| unsafe { (&*up).body_of(parent, cfile).cloned() });
     if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(true) {
         return false;
     }
     let _r = front_read("lower_ahead");
     let u = unsafe { &*up };
+    // the parent's checked body is gone (dropped once its own code was complete, or its code came
+    // from the disk cache): made again here, as lower_ahead_as makes an instance's. The closures of
+    // a parent built long ago are what turns hot later (a benchmark's or a frame's callback): their
+    // O3 builds bailed on this for the whole run and the closure ran baseline code
+    let body = match kept {
+        Some(b) => b,
+        None => {
+            let Some(FnKey::Inst(d, args)) = front.slot_keys.get(&parent) else {
+                PREFRONT_FAIL[AF_NO_PARENT as usize].fetch_add(1, Ordering::Relaxed);
+                return false;
+            };
+            let _preemptible = crate::preempt::Preemptible::on();
+            let _ = crate::program::take_missing();
+            let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::try_codegen_body(&u.prog, &u.tcx, d, &args)));
+            let missing = !crate::program::take_missing().is_empty();
+            match made {
+                Ok(Some(b)) if !missing && b.file == cfile => b,
+                Err(p) if !p.is::<crate::preempt::NeedsUnit>() && !crate::preempt::is_cancelled(&*p) => std::panic::resume_unwind(p),
+                _ => {
+                    PREFRONT_FAIL[AF_NO_PARENT as usize].fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+            }
+        }
+    };
     let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
     if !front.alive.load(Ordering::SeqCst) || !body.errors.is_empty() || !statics_ready(u, &body) {
+        if ahead_trace() {
+            eprintln!("ahead-lower of closure #{} not tried: alive {} body errors {} statics ready {}", id, front.alive.load(Ordering::SeqCst), body.errors.len(), statics_ready(u, &body));
+        }
         return false;
     }
     {
         let mut pending = front.lowered.lock().unwrap_or_else(|e| e.into_inner());
         if pending.contains_key(&id) {
+            if ahead_trace() {
+                eprintln!("ahead-lower of closure #{}: already {}", id, if pending.get(&id).is_some_and(|x| x.is_some()) { "lowered" } else { "pending/failed" });
+            }
             return pending.get(&id).is_some_and(|x| x.is_some());
         }
         pending.insert(id, None);
@@ -17212,7 +17243,11 @@ fn prefront_closure(front: &FrontShared, id: u32) -> bool {
             PREFRONT_FAIL[AF_NEEDS_UNIT as usize].fetch_add(1, Ordering::Relaxed);
             None
         }
-        _ => {
+        other => {
+            if ahead_trace() {
+                let why = match &other { Ok(Err(e)) => e.clone(), _ => "a callee or constant the lowering named is missing".to_string() };
+                eprintln!("ahead-lower of closure #{} made nothing: {}", id, why);
+            }
             PREFRONT_FAIL[AF_OTHER as usize].fetch_add(1, Ordering::Relaxed);
             None
         }
@@ -17809,8 +17844,17 @@ pub(crate) fn lower_ahead_fn_key(id: u32) -> Option<FnKey> {
 /// NeedsUnit is a cancellation: a constant evaluation it crosses (the solver normalizing an
 /// array length) is not cached as that constant's failure.
 #[inline]
+#[track_caller]
 pub(crate) fn lower_ahead_needs_unit() {
+    lower_ahead_needs_unit_at(std::panic::Location::caller());
+}
+
+/// lower_ahead_needs_unit for the site that asked (an owner request's caller)
+pub(crate) fn lower_ahead_needs_unit_at(site: &'static std::panic::Location<'static>) {
     if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) {
+        if ahead_trace() {
+            eprintln!("ahead-lower needs the unit at {}", site);
+        }
         std::panic::resume_unwind(Box::new(crate::preempt::NeedsUnit));
     }
 }
@@ -17924,7 +17968,7 @@ fn lower_ahead_as(u: &Unit, into: u32, base: u32, d: DefId, args: &[TyId], epoch
                 owner::pure_note(owner::PURE_AHEAD_BAIL);
                 Err(AF_NEEDS_UNIT)
             } else {
-                if std::env::var_os("MAKEPAD_RUN_AHEAD_TRACE").is_some() {
+                if ahead_trace() {
                     eprintln!("ahead-lower panic: {}", u.prog.def_path(d));
                 }
                 Err(AF_OTHER)
@@ -18026,12 +18070,20 @@ fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func>
     }
     // a closure lowered off the owner (prefront_closure): from the body its parent has now, and
     // the closure identity the disk cache's links agree with
+    // (a parent whose body was gone: prefront_closure made it again for this epoch -- the epoch is
+    // checked above -- and it is the parent's body from now on)
     if let FnKey::Closure(cfile, ce, parent) = u.fns[id as usize].key {
-        let same = lowered.body.as_ref().is_some_and(|b| u.body_of(parent, cfile).is_some_and(|p| std::sync::Arc::ptr_eq(p, b)));
+        let Some(b) = lowered.body.take() else { return None };
+        let same = match u.body_of(parent, cfile) {
+            Some(p) => std::sync::Arc::ptr_eq(p, &b),
+            None => b.file == cfile && (parent as usize) < u.fns.len(),
+        };
         if !same || !crate::cache::closure_identity_ok(u, cfile, ce) {
             return None;
         }
-        lowered.body = None;
+        if u.body_of(parent, cfile).is_none() {
+            u.put_body(parent, b);
+        }
     }
     AHEAD_STATS[6].fetch_add(1, Ordering::Relaxed);
     if let FnKey::Inst(d, args) = &u.fns[id as usize].key {
