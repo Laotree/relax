@@ -388,7 +388,7 @@ impl<'a> Interp<'a> {
 
     fn layout(&self, ty: TyId) -> R<&'static crate::layout::Layout> {
         let tys = &self.tcx.tys;
-        if tys.flags(ty).intersects(crate::types::TypeFlags::HAS_PARAM) || tys.has_infer(ty) || tys.has_error(ty) { return unsupported("generic layout"); }
+        if tys.flags(ty).intersects(crate::types::TypeFlags::HAS_TY_PARAM) || tys.has_infer(ty) || tys.has_error(ty) { return unsupported(format!("generic layout of {} in {}", crate::typeck::ty_to_string(false, self.prog, self.tcx, ty), self.frames.last().map_or(String::new(), |f| self.prog.def_path(f.body.source.owner)))); }
         if matches!(tys.kind(ty), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) { return unsupported("unsized layout"); }
         Ok(self.lay.of(&crate::layout::LayoutCx::new(self.prog), self.tcx, ty))
     }
@@ -400,7 +400,7 @@ impl<'a> Interp<'a> {
     }
 
     fn is_fat(&self, pointee: TyId) -> R<bool> {
-        if !self.tcx.tys.flags(pointee).intersects(crate::types::TypeFlags::HAS_PARAM) && matches!(self.tcx.tys.kind(pointee), TyKind::Adt(..)) && self.lay.is_unsized(&crate::layout::LayoutCx::new(self.prog), self.tcx, pointee) { return unsupported("unsized struct pointee"); }
+        if !self.tcx.tys.flags(pointee).intersects(crate::types::TypeFlags::HAS_TY_PARAM) && matches!(self.tcx.tys.kind(pointee), TyKind::Adt(..)) && self.lay.is_unsized(&crate::layout::LayoutCx::new(self.prog), self.tcx, pointee) { return unsupported("unsized struct pointee"); }
         Ok(match self.tcx.tys.kind(pointee) {
             TyKind::Slice(_) | TyKind::Str => true,
             TyKind::Dyn(..) => return unsupported("dyn pointer"),
