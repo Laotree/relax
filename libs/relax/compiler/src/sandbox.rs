@@ -1253,6 +1253,9 @@ extern "C" fn sb_memcpy(d: u64, s: u64, n: u64) -> u64 {
 }
 
 fn memcpy_in(d: u64, s: u64, n: u64) -> u64 {
+    // faults here are the module's (an unmapped arena page, the guard write below): contained
+    // like its own code's; nothing here holds a lock or half-made state
+    let _safe = crate::jit::FaultSafe::enter();
     let (dm, sm) = (m(d), m(s));
     if n > 0 && fits(dm, n) && fits(sm, n) {
         unsafe { std::ptr::copy(sm as *const u8, dm as *mut u8, n as usize) };
@@ -1268,6 +1271,7 @@ extern "C" fn sb_memset(d: u64, c: u64, n: u64) -> u64 {
 }
 
 fn memset_in(d: u64, c: u64, n: u64) -> u64 {
+    let _safe = crate::jit::FaultSafe::enter();
     let dm = m(d);
     if n > 0 && fits(dm, n) {
         unsafe { std::ptr::write_bytes(dm as *mut u8, c as u8, n as usize) };
@@ -1278,6 +1282,7 @@ fn memset_in(d: u64, c: u64, n: u64) -> u64 {
 }
 
 extern "C" fn sb_memcmp(a: u64, b: u64, n: u64) -> i32 {
+    let _safe = crate::jit::FaultSafe::enter();
     let (am, bm) = (m(a), m(b));
     if n == 0 || !fits(am, n) || !fits(bm, n) {
         return 0;
@@ -1291,6 +1296,7 @@ extern "C" fn sb_memcmp(a: u64, b: u64, n: u64) -> i32 {
 }
 
 extern "C" fn sb_strlen(p: u64) -> u64 {
+    let _safe = crate::jit::FaultSafe::enter();
     let pm = m(p);
     let mut n = 0;
     while fits(pm, n + 1) && unsafe { *((pm + n) as *const u8) } != 0 {

@@ -204,6 +204,13 @@ mod unix {
         p as u64
     }
 
+    /// Makes [addr, addr+len) inaccessible (a guard page).
+    pub fn guard_page(addr: u64, len: usize) {
+        unsafe {
+            mprotect(addr as *mut u8, len, 0);
+        }
+    }
+
     /// Gives a range's pages back but keeps its addresses taken (PROT_NONE, no reserve): a
     /// retired unit's code addresses are never handed out again, so nothing that names them --
     /// a stale code pointer, a profiler's perf map / symbol table written for that unit --
@@ -273,7 +280,7 @@ mod unix {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp {
-    pub use super::unix::{alloc_rw, commit, free, mem_fns, prefault, CODE_TAIL};
+    pub use super::unix::{alloc_rw, commit, free, guard_page, mem_fns, prefault, CODE_TAIL};
     use super::unix::{mprotect, PROT_RWX};
 
     pub fn reserve(code: usize, rest: usize) -> u64 {
@@ -388,7 +395,7 @@ mod imp {
 /// that call.
 #[cfg(target_os = "macos")]
 mod imp {
-    pub use super::unix::{alloc_rw, commit, free, mem_fns, prefault, CODE_TAIL};
+    pub use super::unix::{alloc_rw, commit, free, guard_page, mem_fns, prefault, CODE_TAIL};
     use super::unix::mprotect;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 

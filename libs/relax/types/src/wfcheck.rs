@@ -816,7 +816,15 @@ pub mod obligations {
         let ast = &prog.files[def.file as usize].ast;
         let item = ast.item(def.item);
         match def.kind {
-            DefKind::Struct | DefKind::Enum | DefKind::Union => with_wfcx(prog, tcx, did, |w| { check_type_defn(w, ast, item); check_defaults(w, ast, item); }),
+            DefKind::Struct | DefKind::Enum | DefKind::Union => {
+                // rustc implicit_infer.rs `infer_predicates`: a set of inferred outlives predicates that
+                // still grows at the recursion limit is a fatal error at the ADT
+                let _ = crate::borrowck::implied_bounds::ImpliedBounds::inferred_outlives(tcx, prog, did);
+                if tcx.inferred_outlives_overflow.contains_key(&did) {
+                    return vec![prog.record_error(def.file, item.lo, "typeck", format!("overflow computing implied lifetime bounds for `{}`", tcx.def_path_str(prog, did)))];
+                }
+                with_wfcx(prog, tcx, did, |w| { check_type_defn(w, ast, item); check_defaults(w, ast, item); })
+            }
             DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => {
                 // wfcheck.rs check_trait_item: the associated types a trait method's `impl Trait`s
                 // become (ImplTraitInTraitData::Trait) are checked as associated items of their own
@@ -1073,6 +1081,21 @@ pub mod obligations {
     fn check_static(w: &mut Wfcx<'_, '_>, ast: &ast::Ast, item: &ast::Item) {
         let ItemKind::Static(mutable, _, _) = &item.kind else { return };
         let Some(ty) = w.tcx.const_ty(w.prog, w.def) else { return };
+        if w.prog.def(w.def).kind == DefKind::ForeignStatic {
+            // rustc check.rs check_static_inhabited: an `extern` static whose layout is a SizeOverflow
+            let env = crate::tcx::TypingEnv::fully_monomorphized(w.prog);
+            let bad = crate::types::TypeFlags::HAS_PARAM | crate::types::TypeFlags::HAS_ERROR | crate::types::TypeFlags::HAS_INFER | crate::types::TypeFlags::HAS_ALIAS;
+            if let Ok(t) = w.tcx.try_normalize_erasing_regions(w.prog, env, ty) {
+                // (a field type that does not normalize has no layout: rustc's layout_of fails with
+                // NormalizationFailure, which this check leaves to the well-formedness errors)
+                if !w.tcx.tys.flags(t).intersects(bad) && fields_normalize(w.prog, w.tcx, env, t, &mut Default::default())
+                    && crate::layout::Layouts::new().size_overflows(&crate::layout::LayoutCx::new(w.prog), w.tcx, t) {
+                    let file = w.prog.def(w.def).file;
+                    w.extra.push(w.prog.record_uncoded_error(file, item.lo, "typeck", "extern static is too large for the target architecture".to_string()));
+                    return;
+                }
+            }
+        }
         // (a type with an unevaluated constant, `[u8; len(NAME)]`, is evaluated by the constant check)
         if w.tcx.tys.flags(ty).contains(crate::types::TypeFlags::HAS_ALIAS) { return; }
         let ty = w.normalize(ty);
@@ -1087,6 +1110,29 @@ pub mod obligations {
         if !*mutable && !thread_local {
             let sync = w.tcx.lang_items.get(crate::lang_items::LangItem::Sync);
             w.register_bound(ty, sync, item.name.lo);
+        }
+    }
+
+    /// Do the field types a layout of `t` reads normalize?
+    fn fields_normalize(prog: &Program, tcx: &Tcx, env: crate::tcx::TypingEnv, t: TyId, seen: &mut crate::fxhash::HashSet<TyId>) -> bool {
+        if !seen.insert(t) { return true; }
+        match tcx.tys.kind(t).clone() {
+            TyKind::Adt(d, args, _) => {
+                let Some(adt) = tcx.adts.get(&d) else { return true };
+                let args = tcx.tys.list(args).to_vec();
+                for v in &adt.variants {
+                    for f in &v.fields {
+                        match tcx.try_normalize_erasing_regions(prog, env, tcx.tys.subst(f.ty, &args)) {
+                            Ok(ft) => { if !fields_normalize(prog, tcx, env, ft, seen) { return false; } }
+                            Err(_) => return false,
+                        }
+                    }
+                }
+                true
+            }
+            TyKind::Array(e, _) | TyKind::Slice(e) => fields_normalize(prog, tcx, env, e, seen),
+            TyKind::Tuple(ts) => tcx.tys.list(ts).to_vec().into_iter().all(|x| fields_normalize(prog, tcx, env, x, seen)),
+            _ => true,
         }
     }
 
