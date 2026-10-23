@@ -41,6 +41,9 @@ pub struct Lane {
     pub instants: Vec<(u64, u32)>,
     /// the latest time seen on the lane
     pub last_t: u64,
+    /// the earliest record of the lane (0: none): a flight recording keeps each lane's last
+    /// records, so before this the lane's spans are unknown (not idle)
+    pub first_t: u64,
 }
 
 impl Lane {
@@ -85,6 +88,11 @@ pub struct Frame {
     pub wait_ns: u64,
     pub owner_ns: u64,
     pub waits: u32,
+    /// of the waits, the time inside the lazy compiles (of it on the owner): compile and wait
+    /// time overlap by this much (`overlap`: the producer reported it; older recordings did not)
+    pub cwait_ns: u64,
+    pub cowner_ns: u64,
+    pub overlap: bool,
 }
 
 impl Frame {
@@ -305,6 +313,11 @@ impl Profile {
                     f.wait_ns = d.u()?;
                     f.owner_ns = d.u()?;
                     f.waits = d.u()? as u32;
+                    if !d.done() {
+                        f.cwait_ns = d.u()?;
+                        f.cowner_ns = d.u()?;
+                        f.overlap = true;
+                    }
                 }
                 self.frames.push(f);
                 self.see(t0 + dur);
@@ -401,6 +414,9 @@ impl Profile {
             hi = hi.max(t);
             let lane = &mut self.lanes[li];
             lane.last_t = lane.last_t.max(t);
+            if lane.first_t == 0 || t < lane.first_t {
+                lane.first_t = t;
+            }
             match k {
                 span::BEGIN => lane.stack.push((t, name, false, 0)),
                 span::WAIT_BEGIN => lane.stack.push((t, name, true, a)),

@@ -195,15 +195,21 @@ struct Jit {
 }
 
 #[derive(Clone, Copy)]
-struct Fr {
-    t0: u64,
-    t1: u64,
-    idle: u64,
-    compile_ns: u64,
-    wait_ns: u64,
-    owner_ns: u64,
-    compiles: u32,
-    waits: u32,
+/// A UI frame's summary (timeline's frame watch): its span, the idle gaps in it, its lazy
+/// compiles, its waits (of them on the owner) and the waits made inside the lazy compiles (of
+/// them on the owner: compile and wait times overlap by these).
+#[derive(Clone, Copy)]
+pub struct Fr {
+    pub t0: u64,
+    pub t1: u64,
+    pub idle: u64,
+    pub compile_ns: u64,
+    pub wait_ns: u64,
+    pub owner_ns: u64,
+    pub compiles: u32,
+    pub waits: u32,
+    pub cwait_ns: u64,
+    pub cowner_ns: u64,
 }
 
 static EVENTS: std::sync::OnceLock<Slots<Ev>> = std::sync::OnceLock::new();
@@ -316,14 +322,12 @@ pub fn jit_install(id: u32, len: u32, tier: u8, origin: u8) {
     jits().push(Jit { t: crate::clock::wall_ns(), os_id: super::threads::self_os_id(), id, len, tier, origin });
 }
 
-/// A UI frame ended (timeline's frame watch): its span, the idle gaps in it, its lazy compiles
-/// and its waits (of them on the owner).
-#[allow(clippy::too_many_arguments)]
-pub fn frame(t0: u64, t1: u64, idle: u64, compile_ns: u64, compiles: u32, wait_ns: u64, owner_ns: u64, waits: u32) {
+/// A UI frame ended (timeline's frame watch): its summary.
+pub fn frame(f: Fr) {
     if !on() {
         return;
     }
-    frames().push(Fr { t0, t1, idle, compile_ns, wait_ns, owner_ns, compiles, waits });
+    frames().push(f);
 }
 
 /// wall ns the UI thread entered its current root phase (0: between phases: idle in the event
@@ -569,7 +573,7 @@ pub(super) fn encode(cur: &mut Cursors, enc: &mut super::pstream::StreamEnc, min
         let (pn, pt) = cur.prev_frame.unwrap_or((0, 0));
         // frame numbers count from the run's first frame (frame n is F<n+1>)
         e.u(n + 1 - pn.min(n + 1)).d(t0, pt).u(f.t1.saturating_sub(f.t0)).u(0).u(0).u(0);
-        e.u(f.idle).u(f.compile_ns).u(f.compiles as u64).u(f.wait_ns).u(f.owner_ns).u(f.waits as u64);
+        e.u(f.idle).u(f.compile_ns).u(f.compiles as u64).u(f.wait_ns).u(f.owner_ns).u(f.waits as u64).u(f.cwait_ns).u(f.cowner_ns);
         cur.prev_frame = Some((n + 1, t0));
         ps::record(&mut out, ps::kind::FRAME, &e.0);
     }
