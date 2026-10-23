@@ -122,6 +122,8 @@ pub struct Parser<'a> {
     ty_frags: crate::fxhash::HashSet<u32>,
     /// starts of the `$e:expr` / `$l:literal` substitutions of expansion text (check only): the kind
     meta_frags: crate::fxhash::HashMap<u32, &'static str>,
+    /// starts of the `$b:block` substitutions of expansion text (check only)
+    block_frags: crate::fxhash::HashSet<u32>,
     /// Offsets of the parens a transcription added around multi-token `$e:expr` fragments.
     synth_parens: crate::fxhash::HashSet<u32>,
     /// file context for built-in macros (file!, module_path!, env!, cfg of derive inputs)
@@ -210,6 +212,7 @@ impl<'a> Parser<'a> {
             frag_groups: Default::default(),
             ty_frags: Default::default(),
             meta_frags: Default::default(),
+            block_frags: Default::default(),
             synth_parens: Default::default(),
             bctx: None,
             mod_stack: Vec::new(),
@@ -289,6 +292,42 @@ impl<'a> Parser<'a> {
             pos: t.lo,
             msg: format!("{} (found {:?} `{}`)", msg, t.kind, text),
         })
+    }
+    /// rustc_span `Ident::is_reserved` of a lifetime/label name (without its quote): the special
+    /// identifiers (`_`), the keywords used always or reserved always, and the edition keywords
+    /// (`async`/`await`/`dyn`/`try` from 2018, `gen` from 2024).
+    fn reserved_name(name: &[u8], edition: u16) -> bool {
+        match name {
+            b"_" | b"as" | b"break" | b"const" | b"continue" | b"crate" | b"else" | b"enum" | b"extern" | b"false"
+            | b"fn" | b"for" | b"if" | b"impl" | b"in" | b"let" | b"loop" | b"match" | b"mod" | b"move" | b"mut"
+            | b"pub" | b"ref" | b"return" | b"self" | b"Self" | b"static" | b"struct" | b"super" | b"trait"
+            | b"true" | b"type" | b"unsafe" | b"use" | b"where" | b"while" | b"abstract" | b"become" | b"box"
+            | b"do" | b"final" | b"macro" | b"override" | b"priv" | b"typeof" | b"unsized" | b"virtual"
+            | b"yield" => true,
+            b"async" | b"await" | b"dyn" | b"try" => edition >= 2018,
+            b"gen" => edition >= 2024,
+            _ => false,
+        }
+    }
+    /// A lifetime token in a lifetime position (rustc_parse `expect_lifetime`): a non-raw
+    /// reserved name other than `'_` / `'static` is "lifetimes cannot use keyword names".
+    fn lifetime_tok(&mut self) -> PResult<Ident> {
+        let t = self.bump();
+        let name = &self.tok_text(t)[1..];
+        if !name.starts_with(b"r#") && !matches!(name, b"_" | b"static") && Self::reserved_name(name, self.edition) {
+            return Err(PErr { pos: t.lo, msg: "lifetimes cannot use keyword names".to_string() });
+        }
+        Ok(Ident { lo: t.lo, hi: t.hi })
+    }
+    /// A label (rustc_parse `eat_label`): any non-raw reserved name, `'_` and `'static` included,
+    /// is "labels cannot use keyword names".
+    fn label_tok(&mut self) -> PResult<Ident> {
+        let t = self.bump();
+        let name = &self.tok_text(t)[1..];
+        if !name.starts_with(b"r#") && Self::reserved_name(name, self.edition) {
+            return Err(PErr { pos: t.lo, msg: "labels cannot use keyword names".to_string() });
+        }
+        Ok(Ident { lo: t.lo, hi: t.hi })
     }
     fn expect(&mut self, k: T) -> PResult<Tok> {
         if self.kind() == k {
@@ -777,19 +816,26 @@ impl<'a> Parser<'a> {
                 self.pos += 2;
                 while self.kind() != T::CloseParen {
                     let t = self.bump();
-                    match self.text_of(t) {
-                        b"noreturn" => spec.options |= ASM_NORETURN,
-                        b"raw" => spec.options |= ASM_RAW,
-                        b"att_syntax" => spec.options |= ASM_ATT_SYNTAX,
-                        b"pure" => spec.options |= ASM_PURE,
-                        b"nomem" => spec.options |= ASM_NOMEM,
-                        b"readonly" => spec.options |= ASM_READONLY,
-                        b"preserves_flags" => spec.options |= ASM_PRESERVES_FLAGS,
-                        b"nostack" => spec.options |= ASM_NOSTACK,
-                        b"may_unwind" => spec.options |= ASM_MAY_UNWIND,
-                        b"," => {}
+                    let option = match self.text_of(t) {
+                        b"noreturn" => ASM_NORETURN,
+                        b"raw" => ASM_RAW,
+                        b"att_syntax" => ASM_ATT_SYNTAX,
+                        b"pure" => ASM_PURE,
+                        b"nomem" => ASM_NOMEM,
+                        b"readonly" => ASM_READONLY,
+                        b"preserves_flags" => ASM_PRESERVES_FLAGS,
+                        b"nostack" => ASM_NOSTACK,
+                        b"may_unwind" => ASM_MAY_UNWIND,
+                        b"," => continue,
                         _ => return self.err("unknown asm! option"),
+                    };
+                    // rustc_builtin_macros asm.rs validate_asm_args: an option given twice (in one
+                    // `options(..)` or across several)
+                    if spec.options & option != 0 && crate::lexer::validation_enabled() {
+                        let name = String::from_utf8_lossy(self.text_of(t)).into_owned();
+                        return Err(PErr { pos: t.lo, msg: format!("the `{}` option was already provided", name) });
                     }
+                    spec.options |= option;
                 }
                 self.expect(T::CloseParen)?;
             } else if self.is_word(0, b"clobber_abi") && self.nth(1) == T::OpenParen {
@@ -1773,6 +1819,9 @@ impl<'a> Parser<'a> {
             if b & crate::macros::TY_FRAG != 0 {
                 self.ty_frags.insert(base + a);
             }
+            if b & crate::macros::BLOCK_FRAG != 0 && crate::lexer::validation_enabled() {
+                self.block_frags.insert(base + a);
+            }
             if b & (crate::macros::EXPR_FRAG | crate::macros::LIT_FRAG) != 0 && crate::lexer::validation_enabled() {
                 self.meta_frags.insert(base + a, if b & crate::macros::EXPR_FRAG != 0 { "expr" } else { "literal" });
             }
@@ -1886,10 +1935,16 @@ impl<'a> Parser<'a> {
             // expansions for statement macros nested through blocks (nom's alt_trait_inner! /
             // succ! chains of depth 21 took every byte of memory under `makepad check`)
             let macros = self.macros.take();
+            let undo = self.tok_undo.len();
             let one_expr = self.outer_attrs().is_ok() && self.expr().is_ok() && self.kind() == T::Semi && self.nth(1) == T::Eof;
             self.macros = macros;
             let semi = self.lo();
             self.pos = save;
+            // the `>>` / `>=` this look-ahead split are whole again for the real parse below
+            while self.tok_undo.len() > undo {
+                let (k, t) = self.tok_undo.pop().unwrap();
+                self.toks.edit(k as usize, |x| *x = t);
+            }
             if one_expr {
                 let file = self.bctx.as_ref().map_or("", |c| c.path.as_str()).to_string();
                 crate::macros::uses::trailing_semi(&file, semi, lo, &def.def_file);
@@ -1901,6 +1956,15 @@ impl<'a> Parser<'a> {
         let r = r?;
         self.parse_cfg_select_rest(rest, if as_expr { 1 } else { 2 })?;
         Ok(Some(r))
+    }
+
+    /// After the one expression of an `include!` in expression position: tokens left are the
+    /// incomplete_include lint (reported at the call by the lint pass).
+    fn incomplete_include_check(&self) {
+        if self.kind() != T::Eof && crate::macros::uses::recording() {
+            let call = self.exp_map.floor(self.lo()).map_or(0, |(_, r)| r.2);
+            crate::macros::uses::incomplete_include(self.bctx.as_ref().map_or("", |c| c.path.as_str()), call);
+        }
     }
 
     /// Moves to the end of the current macro expansion's tokens.
@@ -1977,6 +2041,7 @@ impl<'a> Parser<'a> {
             // file is ignored (rustc_expand base.rs `ExpandInclude::make_expr`, lint incomplete_include)
             if include {
                 let e = p.expr()?;
+                p.incomplete_include_check();
                 p.skip_to_eof();
                 return Ok(vec![Stmt::Expr(e, false)]);
             }
@@ -2901,7 +2966,13 @@ impl<'a> Parser<'a> {
                 if self.nth(n2) == T::KwSelfValue && matches!(self.nth(n2 + 1), T::Comma | T::CloseParen) {
                     self.pos += n2 + 1;
                     let lt = match lt {
-                        Some(t) => Some(Ident { lo: t.lo, hi: t.hi }),
+                        Some(t) => {
+                            let name = &self.tok_text(t)[1..];
+                            if !name.starts_with(b"r#") && !matches!(name, b"_" | b"static") && Self::reserved_name(name, self.edition) {
+                                return Err(PErr { pos: t.lo, msg: "lifetimes cannot use keyword names".to_string() });
+                            }
+                            Some(Ident { lo: t.lo, hi: t.hi })
+                        }
                         None => None,
                     };
                     Ok(Some(SelfParam::Ref(lt, m)))
@@ -3166,19 +3237,19 @@ impl<'a> Parser<'a> {
             let attrs = self.outer_attrs()?;
             let attrs = self.ast.push_list(attrs);
             if self.kind() == T::Lifetime {
-                let t = self.bump();
+                let t = self.lifetime_tok()?;
                 let mut bounds = Vec::new();
                 if self.eat(T::Colon) {
                     while self.kind() == T::Lifetime {
-                        let b = self.bump();
-                        bounds.push(Ident { lo: b.lo, hi: b.hi });
+                        let b = self.lifetime_tok()?;
+                        bounds.push(b);
                         if !self.eat(T::Plus) {
                             break;
                         }
                     }
                 }
                 let bounds = self.ast.push_list(bounds);
-                params.push(GenericParam { attrs, name: Ident { lo: t.lo, hi: t.hi }, kind: GenericParamKind::Lifetime(bounds) });
+                params.push(GenericParam { attrs, name: t, kind: GenericParamKind::Lifetime(bounds) });
             } else if self.eat(T::KwConst) {
                 let name = self.ident_tok()?;
                 self.expect(T::Colon)?;
@@ -3234,18 +3305,18 @@ impl<'a> Parser<'a> {
             match self.kind() {
                 T::OpenBrace | T::Semi | T::Eq | T::Eof => break,
                 T::Lifetime => {
-                    let t = self.bump();
+                    let t = self.lifetime_tok()?;
                     self.expect(T::Colon)?;
                     let mut bs = Vec::new();
                     while self.kind() == T::Lifetime {
-                        let b = self.bump();
-                        bs.push(Ident { lo: b.lo, hi: b.hi });
+                        let b = self.lifetime_tok()?;
+                        bs.push(b);
                         if !self.eat(T::Plus) {
                             break;
                         }
                     }
                     let bs = self.ast.push_list(bs);
-                    preds.push(WherePred::Lifetime(Ident { lo: t.lo, hi: t.hi }, bs));
+                    preds.push(WherePred::Lifetime(t, bs));
                 }
                 _ => {
                     let hrtb = self.hrtb()?;
@@ -3301,8 +3372,7 @@ impl<'a> Parser<'a> {
 
     fn bound(&mut self) -> PResult<Bound> {
         if self.kind() == T::Lifetime {
-            let t = self.bump();
-            return Ok(Bound::Lifetime(Ident { lo: t.lo, hi: t.hi }));
+            return Ok(Bound::Lifetime(self.lifetime_tok()?));
         }
         if self.kind() == T::KwUse && self.nth(1) == T::Lt {
             self.pos += 1;
@@ -3432,8 +3502,7 @@ impl<'a> Parser<'a> {
             }
             let arg = match self.kind() {
                 T::Lifetime => {
-                    let t = self.bump();
-                    GenericArg::Lifetime(Ident { lo: t.lo, hi: t.hi })
+                    GenericArg::Lifetime(self.lifetime_tok()?)
                 }
                 T::Ident | T::RawIdent if self.nth(1) == T::Eq => {
                     let name = self.ident_tok()?;
@@ -3559,6 +3628,14 @@ impl<'a> Parser<'a> {
             T::KwFalse => LitKind::Bool(false),
             _ => return self.err("expected literal"),
         };
+        // a literal of an expansion was not cooked by the file's token validation (it was a macro
+        // argument): rustc reports its suffix when the parser consumes it
+        if self.exp_depth > 0 && matches!(k, LitKind::Int | LitKind::Float) {
+            let t = self.tok();
+            if let Err(msg) = crate::lexer::validate_number(self.tok_text(t), k == LitKind::Float) {
+                return Err(PErr { pos: t.lo, msg });
+            }
+        }
         self.pos += 1;
         Ok(self.mk_expr(ExprKind::Lit(k), lo))
     }
@@ -3605,8 +3682,7 @@ impl<'a> Parser<'a> {
             T::And | T::AndAnd => {
                 self.eat_amp();
                 let lt = if self.kind() == T::Lifetime {
-                    let t = self.bump();
-                    Some(Ident { lo: t.lo, hi: t.hi })
+                    Some(self.lifetime_tok()?)
                 } else {
                     None
                 };
@@ -4611,13 +4687,21 @@ impl<'a> Parser<'a> {
         Ok(if attrs.is_empty() || self.cfg_present(&attrs) { Some(e) } else { None })
     }
 
-    fn label(&mut self) -> Option<Ident> {
+    /// rustc_parse parse_expr_block: a labeled or unsafe block, or a closure body after its return
+    /// type, is written out, not a `$b:block` fragment.
+    fn no_block_frag(&self) -> PResult<()> {
+        if self.kind() == T::OpenBrace && !self.block_frags.is_empty() && self.block_frags.contains(&{ self.tok().lo }) {
+            return Err(PErr { pos: self.tok().lo, msg: "cannot use a `block` macro fragment here".to_string() });
+        }
+        Ok(())
+    }
+    fn label(&mut self) -> PResult<Option<Ident>> {
         if self.kind() == T::Lifetime && self.nth(1) == T::Colon {
-            let t = self.bump();
+            let t = self.label_tok()?;
             self.pos += 1;
-            Some(Ident { lo: t.lo, hi: t.hi })
+            Ok(Some(t))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -4694,6 +4778,7 @@ impl<'a> Parser<'a> {
             }
             T::KwUnsafe => {
                 self.pos += 1;
+                self.no_block_frag()?;
                 let b = self.block()?;
                 Ok(self.mk_expr(ExprKind::Unsafe(b), lo))
             }
@@ -4708,7 +4793,7 @@ impl<'a> Parser<'a> {
                 Ok(self.mk_expr(ExprKind::Block(b, OptIdent::NONE), lo))
             }
             T::Lifetime => {
-                let label = self.label();
+                let label = self.label()?;
                 if label.is_none() {
                     return self.err("unexpected lifetime");
                 }
@@ -4717,6 +4802,7 @@ impl<'a> Parser<'a> {
                     T::KwWhile => self.while_expr(label, lo),
                     T::KwFor => self.for_expr(label, lo),
                     T::OpenBrace => {
+                        self.no_block_frag()?;
                         let b = self.block()?;
                         Ok(self.mk_expr(ExprKind::Block(b, OptIdent::from(label)), lo))
                     }
@@ -4790,8 +4876,7 @@ impl<'a> Parser<'a> {
             T::KwBreak => {
                 self.pos += 1;
                 let label = if self.kind() == T::Lifetime {
-                    let t = self.bump();
-                    Some(Ident { lo: t.lo, hi: t.hi })
+                    Some(self.label_tok()?)
                 } else {
                     None
                 };
@@ -4801,8 +4886,7 @@ impl<'a> Parser<'a> {
             T::KwContinue => {
                 self.pos += 1;
                 let label = if self.kind() == T::Lifetime {
-                    let t = self.bump();
-                    Some(Ident { lo: t.lo, hi: t.hi })
+                    Some(self.label_tok()?)
                 } else {
                     None
                 };
@@ -4834,6 +4918,10 @@ impl<'a> Parser<'a> {
             T::Ident | T::RawIdent | T::PathSep | T::Lt | T::Shl | T::KwSelfValue | T::KwSelfType | T::KwSuper | T::KwCrate => {
                 let path = self.path(true)?;
                 if self.kind() == T::Not && matches!(self.nth(1), T::OpenParen | T::OpenBracket | T::OpenBrace) {
+                    // rustc_parse expr.rs parse_expr_path_start: MacroInvocationWithQualifiedPath
+                    if !path.no_qself() && crate::lexer::validation_enabled() {
+                        return Err(PErr { pos: lo, msg: "macros cannot use qualified paths".to_string() });
+                    }
                     self.pos += 1;
                     let (delim, toks) = self.delim_tt()?;
                     if let Some(def) = self.rules_macro(&path) {
@@ -4850,8 +4938,8 @@ impl<'a> Parser<'a> {
                                 let file = p.bctx.as_ref().map_or("", |c| c.path.as_str()).to_string();
                                 crate::macros::uses::trailing_semi(&file, p.lo(), lo, &def.def_file);
                             }
+                            if include { p.incomplete_include_check(); p.skip_to_eof(); }
                             p.eat(T::Semi);
-                            if include { p.skip_to_eof(); }
                             Ok(e)
                         })?;
                         self.parse_cfg_select_rest(rest, 0)?;
@@ -4938,6 +5026,7 @@ impl<'a> Parser<'a> {
         let (ret, body) = if self.eat(T::RArrow) {
             let ty = self.ty()?;
             let blo = self.lo();
+            self.no_block_frag()?;
             let b = self.block()?;
             (Some(ty), self.mk_expr(ExprKind::Block(b, OptIdent::NONE), blo))
         } else {

@@ -12,6 +12,8 @@
 //! pointer: a pointer word folds to a symbolic address, never to a bare number; a word whose
 //! meaning is unknown does not fold.
 
+include!("rt_abi.rs");
+
 use crate::jit::Unit;
 use crate::program::DefId;
 use relax_backend::rir::{Mem, Sym, SymClass};
@@ -40,12 +42,18 @@ pub enum SymKind {
     Site(u32),
     /// a function slot's permanent callable address (fn pointers stored in data)
     Thunk(u32),
+    /// a function slot's loop counter (its tier record's back-edge word: jit.rs `loop_counter`),
+    /// which the slot's own baseline / O1 / O2 code decrements per loop iteration
+    TierRec(u32),
     /// an anonymous mutable block (a promoted temporary lowering placed in static memory):
     /// index into `Syms::rw_blocks` (size, align)
     Rw(u32),
     /// an entry of a provided (host-built) crate: `shim:<key>`, `last_panic:<crate>`,
     /// `drop:<type def path>`
     Provided(String),
+    /// a `#[thread_local]` static's offset (jit.rs Unit::thread_local_place): from the thread
+    /// pointer, or in the thread-local block
+    ThreadLocal(DefId),
 }
 
 /// What the bytes of a data object hold.
@@ -428,6 +436,20 @@ impl Syms {
 
 static UNIT_PTR: AtomicPtr<Unit> = AtomicPtr::new(std::ptr::null_mut());
 
+rt_fn! {
+/// SPEC-V: the address an indirect call from unverified code goes to: the unverified-mode twin's entry
+/// when `addr` is the entry of a fn instance or closure, else `addr` itself. A `Callee::Host`
+/// entry: Relax's convention (SysV on Windows too, where "C" would read the argument from rcx).
+pub fn relax_alias_entry(addr: u64) -> u64 {
+    let up = UNIT_PTR.load(Ordering::Acquire);
+    if up.is_null() { return addr; }
+    let u = unsafe { &*up };
+    let Some(id) = u.thunk_slot(addr) else { return addr };
+    let twin = u.plain_twin(id);
+    if twin == id { addr } else { u.slots.callable(twin) }
+}
+}
+
 pub fn set_unit(u: *mut Unit) {
     UNIT_PTR.store(u, Ordering::SeqCst);
 }
@@ -463,11 +485,12 @@ pub fn read_obj(u: &Unit, s: Sym, n: u32) -> relax_backend::passes::RoRead {
         return RoRead::No;
     }
     let off = s.off as u32;
+    let pw = u.ptr_bytes();
     for (po, target) in ptrs.iter() {
-        // any overlap with a pointer word: only the exact 8-byte read of it folds (to a symbol)
-        if *po < off + n && off < po + 8 {
+        // any overlap with a pointer word: only the exact read of it folds (to a symbol)
+        if *po < off + n && off < po + pw {
             return match target {
-                Some(t) if *po == off && n == 8 => RoRead::Ptr(*t),
+                Some(t) if *po == off && n == pw => RoRead::Ptr(*t),
                 _ => RoRead::No,
             };
         }
@@ -538,12 +561,13 @@ fn obj_ptrs(u: &Unit, idx: u32) -> Option<(u64, u64, std::sync::Arc<Vec<(u32, Op
         DataKind::Words(w) => {
             // fewer words than the object holds: its pointer words are unknown (a cached object
             // whose pointers could not be attributed): never stored or folded
-            if (w.len() as u64) < len / 8 {
+            let pw = u.ptr_bytes() as u64;
+            if (w.len() as u64) < len / pw {
                 opaque = true;
             }
             for (i, x) in w.iter().enumerate() {
                 if let Some(t) = x {
-                    ptrs.push(((i * 8) as u32, Some(*t)));
+                    ptrs.push(((i as u64 * pw) as u32, Some(*t)));
                 }
             }
         }
@@ -553,7 +577,7 @@ fn obj_ptrs(u: &Unit, idx: u32) -> Option<(u64, u64, std::sync::Arc<Vec<(u32, Op
                 opaque = true;
             }
             for (off, pointee) in words {
-                let v = unsafe { ((start + off as u64) as *const u64).read_unaligned() };
+                let v = read_ptr(u, start + off as u64);
                 // Null/dangling pointers and negative ABI sentinels (macOS RTLD_DEFAULT is
                 // -2) live in the reserved end pages, never in a user allocation. They are
                 // fixed integers, not addresses to relocate. Do not infer this for other
@@ -752,6 +776,28 @@ mod provenance_tests {
 /// Collects the pointer words of a value of type `t` at `base + off`: (offset, whether a data
 /// pointer is `&mut` / `*mut`; None for a fn pointer or a vtable word). None: the value cannot
 /// be classified (union, unknown layout): the whole object is opaque.
+/// A pointer word of the program's data at native address `at`, as a native address (a wasm32
+/// word holds the offset into the window; null and small sentinels stay as they are).
+pub fn read_ptr(u: &Unit, at: u64) -> u64 {
+    if u.ptr_bytes() == 4 {
+        let v = unsafe { (at as *const u32).read_unaligned() } as u64;
+        if v < 4096 || v >= u32::MAX as u64 - 4095 { v } else { crate::web32::native(v) }
+    } else {
+        unsafe { (at as *const u64).read_unaligned() }
+    }
+}
+
+/// The pointer word at byte `k` of a data image, as a native address (see `read_ptr`).
+pub fn word_in(u: &Unit, b: &[u8], k: usize) -> u64 {
+    read_ptr(u, b[k..k + u.ptr_bytes() as usize].as_ptr() as u64)
+}
+
+/// Writes pointer word `v` (a native address, or a small integer) at native address `at`.
+pub unsafe fn write_ptr(u: &Unit, at: u64, v: u64) {
+    let w = u.ptr_word(v);
+    std::ptr::copy_nonoverlapping(w.as_ptr(), at as *mut u8, w.len());
+}
+
 fn walk(u: &Unit, t: TyId, base: u64, off: u32, out: &mut Vec<(u32, Option<bool>)>, depth: u32, discs: &mut Vec<(DefId, Vec<i128>)>) -> Option<()> {
     if depth > 24 {
         return None;
@@ -759,7 +805,6 @@ fn walk(u: &Unit, t: TyId, base: u64, off: u32, out: &mut Vec<(u32, Option<bool>
     // N:rustc_ty_utils/src/layout.rs:63-75 @8d1a764: inspect the normalized
     // type, including native array lengths, just as the layout query does.
     let t = u.tcx.try_normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), t).ok()?;
-    let rd = |o: u32| unsafe { ((base + o as u64) as *const u64).read_unaligned() };
     match u.tcx.tys.kind(t).clone() {
         TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Float(_) | TyKind::Never => Some(()),
         TyKind::Tuple(ts) if ts.is_empty() => Some(()),
@@ -768,18 +813,17 @@ fn walk(u: &Unit, t: TyId, base: u64, off: u32, out: &mut Vec<(u32, Option<bool>
             match u.tcx.tys.kind(inner).clone() {
                 // fat pointers: (ptr, len) or (ptr, vtable)
                 TyKind::Str | TyKind::Slice(_) => {}
-                TyKind::Dyn(..) => out.push((off + 8, None)),
+                TyKind::Dyn(..) => out.push((off + u.ptr_bytes(), None)),
                 // an unsized struct (`&CStr`, `&Path`): its tail's metadata, a length or a vtable
                 _ => match u.lay.unsized_tail(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, inner) {
                     Some((_, tail)) => match u.tcx.tys.kind(tail) {
                         TyKind::Str | TyKind::Slice(_) => {}
-                        TyKind::Dyn(..) => out.push((off + 8, None)),
+                        TyKind::Dyn(..) => out.push((off + u.ptr_bytes(), None)),
                         _ => return None,
                     },
                     None => {}
                 },
             }
-            let _ = rd;
             Some(())
         }
         TyKind::FnPtr(..) => {
@@ -888,6 +932,7 @@ pub fn describe(u: &Unit, s: Sym) -> String {
         None => format!("?{}", s.id),
         Some(SymKind::Rt(n)) => format!("rt:{}", n),
         Some(SymKind::Static(d)) => format!("static:{}", u.prog.def_path(d)),
+        Some(SymKind::ThreadLocal(d)) => format!("thread_local:{}", u.prog.def_path(d)),
         Some(SymKind::Foreign(n)) => format!("c:{}", n),
         Some(SymKind::Missing(n)) => format!("missing:{}", n),
         Some(SymKind::StaticAddr(d)) => format!("static-addr:{}", u.prog.def_path(d)),
@@ -899,6 +944,7 @@ pub fn describe(u: &Unit, s: Sym) -> String {
             }
         }
         Some(SymKind::Thunk(id)) => format!("thunk:{}", stable_fn_name(u, id)),
+        Some(SymKind::TierRec(id)) => format!("loop-counter:{}", stable_fn_name(u, id)),
         Some(SymKind::Provided(n)) => format!("provided:{}", n),
         Some(SymKind::Rw(k)) => {
             let b = u.syms.rw_blocks.lock().unwrap_or_else(|e| e.into_inner());
@@ -990,12 +1036,14 @@ pub fn reloc_sig(u: &Unit, name: impl FnOnce() -> String, code: &[u8], relocs: &
     for rl in relocs {
         let (off, r) = (&rl.at, &rl.target);
         let o = *off as usize;
-        if o + 8 <= c.len() {
-            c[o..o + 8].fill(0);
+        let w = if rl.kind == relax_backend::rir::RelocKind::Pool64 { 8 } else { 4 };
+        if o + w <= c.len() {
+            c[o..o + w].fill(0);
         }
         let d = match r {
             relax_backend::rir::Reloc::Sym(s) => describe(u, *s),
             relax_backend::rir::Reloc::Slot(id) => format!("slot:{}", stable_fn_name(u, *id)),
+            relax_backend::rir::Reloc::Call(id) => format!("call:{}", stable_fn_name(u, *id)),
             relax_backend::rir::Reloc::Thunk(id) => format!("thunk:{}", stable_fn_name(u, *id)),
             other => format!("{:?}", other),
         };
@@ -1006,9 +1054,10 @@ pub fn reloc_sig(u: &Unit, name: impl FnOnce() -> String, code: &[u8], relocs: &
     for x in &rs {
         h.str(x);
     }
-    for (o, pos) in pc_map {
+    // (the variable table, the inline stack entries and contexts are not code: left out)
+    for (o, pos) in pc_map.iter().filter(|x| x.0 < relax_backend::dbgloc::PC_VARS) {
         h.u32(*o);
-        h.str(u.prog.file_paths.get((pos >> 32) as usize).map_or("", |p| p.as_str()));
+        h.str(u.prog.file_paths.get(relax_backend::rir::pos_file(*pos) as usize).map_or("", |p| p.as_str()));
         h.u32(*pos as u32);
     }
     use std::io::Write;
@@ -1023,7 +1072,7 @@ pub fn reloc_sig(u: &Unit, name: impl FnOnce() -> String, code: &[u8], relocs: &
                 format!("{}:{:?}={:#x}", o, r, v)
             }).collect();
             let _ = m.lock().unwrap_or_else(|e| e.into_inner()).write_all(format!("POOL\t{}\t{}\n", name, vals.join(" ")).as_bytes());
-            let pcs: Vec<String> = pc_map.iter().map(|(o, p)| format!("{}:{}:{}", o, p >> 32, *p as u32)).collect();
+            let pcs: Vec<String> = pc_map.iter().filter(|x| x.0 < relax_backend::dbgloc::PC_VARS).map(|(o, p)| format!("{}:{}:{}", o, relax_backend::rir::pos_file(*p), *p as u32)).collect();
             let _ = m.lock().unwrap_or_else(|e| e.into_inner()).write_all(format!("CODE\t{}\t{}\t{}\n", name, hex, pcs.join(" ")).as_bytes());
         }
     }
@@ -1105,7 +1154,10 @@ pub(crate) fn pointer_offsets(u: &Unit, start: u64) -> Option<Vec<u32>> {
     match kind {
         DataKind::Bytes => Some(Vec::new()),
         DataKind::Relocs(p) => Some(p.iter().map(|(o, _)| *o).collect()),
-        DataKind::Words(w) => ((w.len() as u64) >= len / 8).then(|| w.iter().enumerate().filter(|(_, x)| x.is_some()).map(|(i, _)| (i * 8) as u32).collect()),
+        DataKind::Words(w) => {
+            let pw = u.ptr_bytes() as u64;
+            ((w.len() as u64) >= len / pw).then(|| w.iter().enumerate().filter(|(_, x)| x.is_some()).map(|(i, _)| (i as u64 * pw) as u32).collect())
+        }
         DataKind::Typed(t) => {
             let mut words = Vec::new();
             walk(u, t, start, 0, &mut words, 0, &mut Vec::new())?;
@@ -1140,7 +1192,8 @@ pub fn class_of(k: &SymKind) -> relax_backend::rir::SymClass {
         // storage every domain has its own copy of, at the same offset of its static block
         SymKind::Static(_) | SymKind::Rw(_) => SymClass::Domain,
         SymKind::Data(_) | SymKind::Thunk(_) | SymKind::Missing(_) => SymClass::Near,
-        SymKind::Foreign(_) | SymKind::Provided(_) | SymKind::StaticAddr(_) => SymClass::Far,
-        SymKind::Site(_) => SymClass::Imm,
+        // (the tier records are a reservation of their own, outside the code area)
+        SymKind::Foreign(_) | SymKind::Provided(_) | SymKind::StaticAddr(_) | SymKind::TierRec(_) => SymClass::Far,
+        SymKind::Site(_) | SymKind::ThreadLocal(_) => SymClass::Imm,
     }
 }

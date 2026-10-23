@@ -112,13 +112,14 @@ fn rehome(u: &Unit, addr: u64, seen: &mut std::collections::HashMap<u64, u64>, f
     // block took it off the shared data for nothing (and the disk cache named the copy as a
     // fresh, zeroed block: the warm run read a length of 0). An object whose kind cannot tell
     // is scanned word by word, as before.
+    let pw = u.ptr_bytes() as usize;
     let words: Vec<usize> = match crate::syms::pointer_offsets(u, start) {
-        Some(offs) => offs.into_iter().map(|o| o as usize).filter(|&o| o + 8 <= bytes.len()).collect(),
-        None => (0..bytes.len() / 8).map(|i| i * 8).collect(),
+        Some(offs) => offs.into_iter().map(|o| o as usize).filter(|&o| o + pw <= bytes.len()).collect(),
+        None => (0..bytes.len() / pw).map(|i| i * pw).collect(),
     };
     let mut reaches = false;
     for &k in &words {
-        let w = u64::from_le_bytes(bytes[k..k + 8].try_into().unwrap());
+        let w = crate::syms::word_in(u, &bytes, k);
         if (lo..hi).contains(&w) {
             // a static (materialized when laid out) or an anonymous mutable block: one constant
             // evaluation made (a promoted temporary) has no initial image yet -- every domain needs it
@@ -134,7 +135,7 @@ fn rehome(u: &Unit, addr: u64, seen: &mut std::collections::HashMap<u64, u64>, f
         }
         let moved = rehome(u, cs, seen, false);
         if moved != cs {
-            bytes[k..k + 8].copy_from_slice(&(moved + (w - cs)).to_le_bytes());
+            bytes[k..k + pw].copy_from_slice(&u.ptr_word(moved + (w - cs)));
             reaches = true;
         }
     }
@@ -148,9 +149,9 @@ fn rehome(u: &Unit, addr: u64, seen: &mut std::collections::HashMap<u64, u64>, f
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), new as *mut u8, bytes.len()) };
     // a word pointing into the object itself (a self-referential constant) points at the copy
     for &k in &words {
-        let w = u64::from_le_bytes(bytes[k..k + 8].try_into().unwrap());
+        let w = crate::syms::word_in(u, &bytes, k);
         if (start..start + len).contains(&w) {
-            unsafe { *((new + k as u64) as *mut u64) = new + (w - start) };
+            unsafe { crate::syms::write_ptr(u, new + k as u64, new + (w - start)) };
         }
     }
     seen.insert(addr, new);
@@ -328,7 +329,7 @@ fn materialize_in(u: &Unit, base: u64, sym: u32, seen: &mut HashSet<u32>) {
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
     for (o, t) in provenance_words(u, &bytes) {
         if let Some(to) = offset_of(u, t) {
-            unsafe { *((at + o as u64) as *mut u64) = base + to };
+            unsafe { crate::syms::write_ptr(u, at + o as u64, base + to) };
             if !matches!(u.syms.kind(t.id), Some(SymKind::Static(_) | SymKind::Rw(_))) {
                 materialize_in(u, base, t.id, seen);
             }
@@ -339,7 +340,8 @@ fn materialize_in(u: &Unit, base: u64, sym: u32, seen: &mut HashSet<u32>) {
 /// Makes a new domain's block: reserved once (it never moves), holding the initial image of
 /// every static laid out so far. Returns its base.
 pub fn create(u: &Unit) -> u64 {
-    let base = crate::os::mem::alloc_rw(BLOCK_SIZE);
+    // a wasm32 program's statics are in its window (web32.rs)
+    let base = if crate::web32::on() { crate::web32::alloc(BLOCK_SIZE) } else { crate::os::mem::alloc_rw(BLOCK_SIZE) };
     let ids: Vec<u32> = u.syms.initial_data.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
     let mut seen = HashSet::new();
     for id in ids {
@@ -356,7 +358,7 @@ pub fn create(u: &Unit) -> u64 {
 pub fn destroy(base: u64) {
     forget_tls_keys(base);
     BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|b| *b != base);
-    crate::os::mem::free(base, BLOCK_SIZE);
+    if crate::web32::on() { crate::web32::free(base, BLOCK_SIZE) } else { crate::os::mem::free(base, BLOCK_SIZE) }
 }
 
 /// A static was just laid out (jit.rs `static_addr`, after its initial image was captured): copy
@@ -568,6 +570,13 @@ fn with_block_memory(mut i: DomainInfo) -> DomainInfo {
 pub fn list() -> Vec<DomainInfo> {
     let snapshots: Vec<_> = domains().iter().map(snapshot).collect();
     snapshots.into_iter().map(with_block_memory).collect()
+}
+
+/// The app domain's heap: (requested live bytes, committed bytes), without the block walk of
+/// `info` (the flight recorder's 1-s counter).
+pub fn app_heap_stats() -> Option<(usize, usize)> {
+    let id = crate::run::app_domain()?;
+    domains().iter().find(|d| d.info.id == id).and_then(|d| d.heap.as_ref().map(|h| h.stats()))
 }
 
 pub fn state(id: DomainId) -> Option<DomainState> {
@@ -1037,7 +1046,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     let t1 = std::time::Instant::now();
     let upn = up as usize;
     // the owner thread: the program's tables change there
-    let loaded = crate::owner::call(crate::owner::Class::App, || unsafe { load_graph(upn as *mut Unit, &g, &order, &cfgs, &idents, id, !from_boot) });
+    let loaded = crate::owner::call(crate::owner::Class::Program, || unsafe { load_graph(upn as *mut Unit, &g, &order, &cfgs, &idents, id, !from_boot) });
     let (root, n_reused, new_names, first_file) = match loaded {
         Ok(x) => x,
         Err(e) => return fail(id, e),
@@ -1057,7 +1066,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
         std::thread::spawn(crate::memstat::trim);
     }
     if compile_phase(id, "main").is_err() { return Ok(id); }
-    let prepared = crate::owner::call(crate::owner::Class::App, || unsafe {
+    let prepared = crate::owner::call(crate::owner::Class::Program, || unsafe {
         if cancelled(id) { return Err("domain compilation cancelled".into()); }
         let u = &mut *(upn as *mut Unit);
         if crate::run::app_domain() == Some(id) { crate::layout::set_root_crate(root); }

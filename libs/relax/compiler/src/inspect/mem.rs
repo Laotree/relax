@@ -38,8 +38,9 @@ fn mb(v: u64) -> String {
     format!("{:.1}", v as f64 / MB)
 }
 
+/// A signed MB delta as a JSON number (no `+`: JSON has none).
 fn smb(v: i64) -> String {
-    format!("{:+.1}", v as f64 / MB)
+    format!("{:.1}", v as f64 / MB)
 }
 
 // ------------------------------------------------------------------ the timeline ring
@@ -53,6 +54,9 @@ const RING_MAX: usize = 4096;
 
 /// A detector tick: the resident size now (every `RING_STEP`-th tick once the ring halved).
 pub fn tick(n: u64, rss: u64) {
+    if n % 4 == 0 {
+        super::flightrec::counter("rss", rss as i64);
+    }
     let step = RING_STEP.load(std::sync::atomic::Ordering::Relaxed);
     if n % step != 0 {
         return;
@@ -391,7 +395,7 @@ fn relax_parts(s: &mut Snap, compiler: bool, partial: &mut Vec<String>) {
         }
     }
     if compiler && !up.is_null() {
-        let r = crate::owner::call_within(crate::owner::Class::Background, 3000, move || crate::memreport::unit_sizes(unsafe { &*up }));
+        let r = crate::owner::call_within(crate::owner::Class::Program, 3000, move || crate::memreport::unit_sizes(unsafe { &*up }));
         match r {
             Some(rows) => {
                 for (k, v) in rows {
@@ -492,7 +496,7 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
         let mut growth: Vec<(i64, &String)> = snap.nodes.iter().map(|(k, v)| (*v as i64 - p.iter().find(|x| &x.0 == k).map_or(0, |x| x.1 as i64), k)).filter(|x| x.0 >= 16 << 20 && x.1.contains('/')).collect();
         growth.sort_by(|a, b| b.0.cmp(&a.0));
         for (d, k) in growth.iter().take(3) {
-            f.push((*d as u64, format!("{} grew {} MB since the last `memory`", k, smb(*d))));
+            f.push((*d as u64, format!("{} grew +{} MB since the last `memory`", k, smb(*d))));
         }
     }
     let tracked = snap.get("malloc/in use/program (tracked stacks, est.)");

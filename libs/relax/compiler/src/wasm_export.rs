@@ -336,7 +336,7 @@ fn succs(t: &relax_backend::rir::Term) -> Vec<u32> {
 
 fn def_of(i: &Inst) -> Option<relax_backend::rir::VReg> {
     match i {
-        Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::Mov(d, _) | Inst::IBin(_, _, d, _, _) | Inst::IBinI(_, _, d, _, _) | Inst::INeg(_, d, _) | Inst::INot(_, d, _) | Inst::IBit(_, d, _) | Inst::ICmp(_, _, d, _, _) | Inst::ICmpI(_, _, d, _, _) | Inst::FBin(_, _, d, _, _) | Inst::FUnary(_, _, d, _) | Inst::FCmp(_, _, d, _, _) | Inst::Conv(_, d, _) | Inst::Load(_, d, _, _) | Inst::LoadX(_, d, _, _, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::Sel(d, _, _, _) | Inst::TlsAddr(d, _) => Some(*d),
+        Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::Mov(d, _) | Inst::IBin(_, _, d, _, _) | Inst::IBinI(_, _, d, _, _) | Inst::INeg(_, d, _) | Inst::INot(_, d, _) | Inst::IBit(_, d, _) | Inst::ICmp(_, _, d, _, _) | Inst::ICmpI(_, _, d, _, _) | Inst::FBin(_, _, d, _, _) | Inst::FUnary(_, _, d, _) | Inst::FCmp(_, _, d, _, _) | Inst::Conv(_, d, _) | Inst::Load(_, d, _, _) | Inst::LoadX(_, d, _, _, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::Sel(d, _, _, _) | Inst::TlsAddr(d, _) | Inst::TlsStatic(d, _) => Some(*d),
         // anything else defining a vreg counts as "not a plain constant": the vreg is reported
         // as defined (several times) so a base it defines is never read as a coverage address
         Inst::Call(_, _, r) => r.first().copied(),
@@ -817,10 +817,12 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     let mut n_ptrs = 0usize;
     while let Some(id) = pending.pop() {
         let Some((mut bytes, _, _)) = data_of(u, id) else { continue };
+        // pointer-sized words (4 bytes on wasm32, holding window offsets: crate::syms::word_in)
+        let pw = u.ptr_bytes() as usize;
         let mut k = 0;
-        while k + 8 <= bytes.len() {
-            let w = u64::from_le_bytes(bytes[k..k + 8].try_into().unwrap());
-            if w > 0x1_0000 {
+        while k + pw <= bytes.len() {
+            let w = crate::syms::word_in(u, &bytes, k);
+            if (if pw == 4 { w & 0xffff_ffff } else { w }) > 0x1_0000 {
                 if let Some(s) = u.syms.symbol_at(w, u) {
                     let nv = match u.syms.kind(s.id) {
                         Some(SymKind::Data(_) | SymKind::Rw(_) | SymKind::Static(_)) => place(&mut m, s.id, &mut placed, &mut pending).map(|a| a.wrapping_add(s.off as u64)),
@@ -828,12 +830,12 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
                         _ => None,
                     };
                     if let Some(nv) = nv {
-                        bytes[k..k + 8].copy_from_slice(&nv.to_le_bytes());
+                        bytes[k..k + pw].copy_from_slice(&nv.to_le_bytes()[..pw]);
                         n_ptrs += 1;
                     }
                 }
             }
-            k += 8;
+            k += pw;
         }
         images.push((id, bytes));
     }
@@ -978,9 +980,10 @@ fn address_taken(u: &Unit, funcs: &BTreeMap<u32, Func>, out: &mut Vec<u32>) {
             continue;
         }
         let Some((bytes, _, _)) = data_of(u, d) else { continue };
-        for w in bytes.chunks_exact(8) {
-            let w = u64::from_le_bytes(w.try_into().unwrap());
-            if w > 0x1_0000 {
+        let pw = u.ptr_bytes() as usize;
+        for k in (0..bytes.len() / pw).map(|i| i * pw) {
+            let w = crate::syms::word_in(u, &bytes, k);
+            if (if pw == 4 { w & 0xffff_ffff } else { w }) > 0x1_0000 {
                 if let Some(s) = u.syms.symbol_at(w, u) {
                     match u.syms.kind(s.id) {
                         Some(SymKind::Thunk(t)) => out.push(t),
@@ -1027,9 +1030,10 @@ fn reach(u: &Unit, funcs: &BTreeMap<u32, Func>, roots: &[u32]) -> Vec<u32> {
             continue;
         }
         let Some((bytes, _, _)) = data_of(u, d) else { continue };
-        for w in bytes.chunks_exact(8) {
-            let w = u64::from_le_bytes(w.try_into().unwrap());
-            if w > 0x1_0000 {
+        let pw = u.ptr_bytes() as usize;
+        for k in (0..bytes.len() / pw).map(|i| i * pw) {
+            let w = crate::syms::word_in(u, &bytes, k);
+            if (if pw == 4 { w & 0xffff_ffff } else { w }) > 0x1_0000 {
                 if let Some(s) = u.syms.symbol_at(w, u) {
                     match u.syms.kind(s.id) {
                         Some(SymKind::Thunk(t)) => work.push(t),
@@ -1088,7 +1092,7 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit) -> (std::collections:
         if funcs.contains_key(&id) || (id as usize) >= u.fns.len() {
             continue;
         }
-        let r = crate::owner::call(crate::owner::Class::App, || crate::zone_alloc::kept_with(|| unsafe { crate::jit::export_rir(up, id) }));
+        let r = crate::owner::call(crate::owner::Class::Program, || crate::zone_alloc::kept_with(|| unsafe { crate::jit::export_rir(up, id) }));
         match r {
             Ok(f) => {
                 callees(&f, &mut work);

@@ -51,6 +51,13 @@ static REPORT_PATH: relax_session::sync::Mutex<String> = relax_session::sync::Mu
 /// The package's root crate and manifest dir (MAKEPAD_RUN_MAIN_COMPILE_LOG's header).
 static ROOT_DIR: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
 
+/// The running program's root crate name and package dir (makepad inspect `asm`'s native build).
+pub(crate) fn root_package() -> Option<(String, String)> {
+    let g = ROOT_DIR.lock().unwrap();
+    let (n, d) = g.split_once(' ')?;
+    Some((n.to_string(), d.to_string()))
+}
+
 fn phase(name: &str, t: Instant) {
     phase_ms(name, t.elapsed().as_secs_f64() * 1e3);
 }
@@ -113,6 +120,13 @@ pub(crate) fn report(kind: &str, text: &str) {
         let text: String = text.chars().map(|c| if c == '\n' || c == '\t' || c == '\r' { ' ' } else { c }).collect();
         let _ = f.write_all(format!("{}\t{}\t{:.0}\n", kind, text, crate::clock::ms_since_start()).as_bytes());
     }
+}
+
+/// A start that ends before `main` (an unreachable store, a resolve error): its reason and exit
+/// code for the launcher following it.
+pub fn report_failed(error: &str, code: i32) {
+    report("error", error);
+    report("exit", &code.to_string());
 }
 
 pub(crate) fn reporting() -> bool {
@@ -285,6 +299,29 @@ pub(crate) fn clear_dead<T>(slot: &mut Option<T>) {
     }
 }
 
+/// rustc's crate locator finds `extern crate proc_macro;` in the sysroot for any crate (a
+/// `#![crate_type = "proc-macro"]` file checked on its own, a test's helper). Relax's sysroot is
+/// its std dir, whose `proc_macro` the app graph otherwise never loads (proc-macro crates run in the
+/// macro host): a check whose root unit declares the crate gets it as a dependency unit.
+fn with_sysroot_proc_macro(mut units: unitgraph::Units, std_dir: &str) -> unitgraph::Units {
+    let pm_root = format!("{}/proc_macro/lib.rs", std_dir);
+    if units.units.iter().any(|u| u.name == "proc_macro") || !crate::vfs::exists(&pm_root) { return units; }
+    let wants = |u: &unitgraph::GraphUnit| crate::vfs::read_shared(&u.src_path).is_ok_and(|src| {
+        const NEEDLE: &[u8] = b"extern crate proc_macro";
+        src.windows(NEEDLE.len()).any(|w| w == NEEDLE)
+    });
+    let roots: Vec<usize> = units.roots.iter().copied().filter(|&r| r < units.units.len() && !units.units[r].kind.iter().any(|k| k == "proc-macro") && wants(&units.units[r])).collect();
+    if roots.is_empty() { return units; }
+    let pm = units.units.len();
+    units.units.push(unitgraph::GraphUnit {
+        pkg_id: format!("path+file://{}/proc_macro#proc_macro@0.0.0", std_dir),
+        kind: vec!["lib".to_string()], name: "proc_macro".to_string(), src_path: pm_root, edition: "2021".to_string(),
+        host: false, mode: "build".to_string(), features: Vec::new(), deps: Vec::new(),
+    });
+    for r in roots { units.units[r].deps.push((pm, "proc_macro".to_string())); }
+    units
+}
+
 pub(crate) fn resolve_package(
     sess: &std::sync::Arc<crate::Session>,
     workspace: &str,
@@ -320,6 +357,7 @@ pub(crate) fn resolve_package(
     } else {
         std::fs::read(units_json).map_err(|e| format!("{}: {}", units_json, e)).and_then(|d| unitgraph::Units::from_json(&d))
     }?;
+    let units = if check_only { with_sysroot_proc_macro(units, std_dir) } else { units };
     let t_load = Instant::now();
     let mut g = unitgraph::load(&units, check_only)?;
     let t_loaded = Instant::now();
@@ -766,6 +804,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         Err(e) => {
             if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&e, "resolve")); }
             eprintln!("makepad-run: {e}");
+            // a launcher following the start (--report-to) learns why it ended
+            report_failed(&e, 1);
             return 1;
         }
     };
@@ -1205,7 +1245,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             let up: *mut Unit = &mut *u;
             let (rep, violations) = {
                 let _job = jit::compile_job();
-                crate::owner::call(crate::owner::Class::App, || crate::boundary::run(up))
+                crate::owner::call(crate::owner::Class::Program, || crate::boundary::run(up))
             };
             print!("{}", rep);
             std::mem::forget(u);
@@ -1426,7 +1466,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 if up.is_null() || !crate::memstat::enabled() {
                     continue;
                 }
-                crate::owner::call(crate::owner::Class::App, || {
+                crate::owner::call(crate::owner::Class::Program, || {
                     crate::memstat::print(&format!("at {} ms", ms), &crate::memreport::unit_sizes(unsafe { &*up }));
                 });
                 // MAKEPAD_RUN_MEM_AT_TRIM=1: the allocator's free pages back to the system, then the report
@@ -1435,7 +1475,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                     let t = std::time::Instant::now();
                     crate::memstat::trim();
                     let ns = t.elapsed().as_secs_f64() * 1e3;
-                    crate::owner::call(crate::owner::Class::App, || {
+                    crate::owner::call(crate::owner::Class::Program, || {
                         crate::memstat::print(&format!("at {} ms after a {:.1} ms trim", ms, ns), &crate::memreport::unit_sizes(unsafe { &*up }));
                     });
                 }
@@ -1449,7 +1489,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         { let _k = crate::zone_alloc::kept();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(ms));
-            crate::owner::call(crate::owner::Class::App, || summary("stats"));
+            crate::owner::call(crate::owner::Class::Program, || summary("stats"));
         });
         }
     }
@@ -1559,7 +1599,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     for (k, d) in entry_defs.iter().enumerate() {
         // speculative workers may be compiling (they add slots): the owner thread around fn_id
-        let en = crate::owner::call(crate::owner::Class::App, || {
+        let en = crate::owner::call(crate::owner::Class::Program, || {
             let id = u.fn_id(FnKey::Inst(*d, Vec::new()));
             u.entry(id)
         });
@@ -1568,7 +1608,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         match r {
             Ok(v) => verbose!("makepad-run: entry {} returned {:#x} (t={:.0} ms)", entries[k], v, crate::clock::ms_since_start()),
             Err(p) => {
-                let rep = crate::owner::call(crate::owner::Class::App, || u.report(&p));
+                let rep = crate::owner::call(crate::owner::Class::Program, || u.report(&p));
                 eprintln!("makepad-run: entry {} {}: {}\n  report: {}", entries[k], p.kind, p.message, rep);
             }
         }
@@ -1582,7 +1622,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // whatever thread calls it); the unit outlives this call as it does for `main`
         let mut addrs = crate::zone_alloc::kept_with(|| Vec::with_capacity(export_defs.len()));
         for (name, d) in &export_defs {
-            let en = crate::owner::call(crate::owner::Class::App, || {
+            let en = crate::owner::call(crate::owner::Class::Program, || {
                 let id = u.fn_id(FnKey::Inst(*d, Vec::new()));
                 crate::wasm_export::export(id, name);
                 u.entry_direct(id)
@@ -1965,7 +2005,7 @@ fn start_ahead(up: *mut Unit, defs: Vec<DefId>, runtime: &crate::options::Runtim
         let mut n = 0;
         for d in defs {
             let _job = jit::compile_job();
-            let (id, done) = crate::owner::call(crate::owner::Class::App, || {
+            let (id, done) = crate::owner::call(crate::owner::Class::Program, || {
                 let id = unsafe { (&mut *up).fn_id(FnKey::Inst(d, Vec::new())) };
                 let done = unsafe { (&*up).fns[id as usize].compiled };
                 (id, done)
@@ -2002,12 +2042,9 @@ fn flush_errors(block: bool) {
         to_report
     };
     let to_report = if block {
-        crate::owner::call(crate::owner::program_class(), body)
+        crate::owner::call(crate::owner::Class::Program, body)
     } else {
-        match crate::owner::call_within(crate::owner::Class::Background, 0, body) {
-            Some(r) => r,
-            None => return,
-        }
+        crate::owner::publish(body)
     };
     for e in to_report {
         report("error", &e);
@@ -2025,13 +2062,13 @@ fn spill_cache() {
     if lim == 0 || up.is_null() {
         return;
     }
-    let Some(spill) = crate::owner::call_within(crate::owner::Class::Background, 0, || {
+    let Some(spill) = Some(crate::owner::publish(|| {
         let u = unsafe { &mut *up };
         match u.cache.as_mut() {
             Some(c) if c.pending_bytes() >= lim => c.spill_take(),
             _ => None,
         }
-    }) else { return };
+    })) else { return };
     if let Some(s) = spill {
         // its own thread: the monitor loop's other duties (errors, trims) do not wait for the disk
         { let _k = crate::zone_alloc::kept();
@@ -2111,7 +2148,11 @@ static SETTLE_WHY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::ne
 fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
     let up = unsafe { RUN_UNIT };
     if up.is_null() { return false; }
-    let Some(Some((drops, pending, spill, at, landmark, retired))) = crate::owner::call_within(crate::owner::Class::Background, 0, || {
+    // the deferred cache records first, in bounded publishes (the type side they are keyed from
+    // is retired below: what installs add meanwhile is flushed in the request)
+    jit::drain_records_bounded();
+    // a front write: structural work, a program-class request (rule I-PUB: no publish)
+    let Some(Some((drops, pending, spill, at, landmark, retired))) = Some(crate::owner::call(crate::owner::Class::Program, || {
         if jit::COMPILED_FNS.load(Ordering::Relaxed) != compiled {
             SETTLE_WHY.store(1, Ordering::Relaxed);
             return None;
@@ -2134,7 +2175,7 @@ fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
             format!("latest first present +{:.0} ms", jit::wall_ns().saturating_sub(present) as f64 / 1e6)
         };
         Some((drops, pending, spill, at, landmark, retired))
-    }) else { return false };
+    })) else { return false };
     { let _k = crate::zone_alloc::kept();
     std::thread::spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         let result = spill.map(|s| s.write());
@@ -2159,6 +2200,10 @@ fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
     retired.is_some()
 }
 
+/// The background loop's reclamation pass (jit::settle_drop) runs at most this often after the
+/// first present.
+const SETTLE_DROP_EVERY_NS: u64 = 2_000_000_000;
+
 fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::options::Options) {
     let present_forward = std::env::var_os("MAKEPAD_RUN_REPORT_TO");
     let mut present = match present_report() {
@@ -2168,7 +2213,8 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
     let (runtime, options, present_forward) = crate::zone_alloc::kept_with(|| (runtime.clone(), options.clone(), present_forward.clone()));
     let _k = crate::zone_alloc::kept();
     { let _k = crate::zone_alloc::kept();
-    std::thread::spawn(move || {
+    // named: inspect lists it as makepad run's, not the program's
+    let _ = std::thread::Builder::new().name("run-monitor".into()).spawn(move || {
         let runtime = &runtime;
         let options = &options;
         // A measurement harness requests an allocator snapshot at its own landmark
@@ -2184,6 +2230,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let mut settle_note: &'static str = "";
         let mut drops = jit::SettleDrops::default();
         let mut reclaimed = None;
+        let mut last_drop_ns = 0u64;
         let mut reclaim_requested = false;
         let mut present_bytes = Vec::new();
         let (mut quiet, mut seen, mut trimmed) = (0u32, 0u64, 0u64);
@@ -2225,7 +2272,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                     // structure sizes too (who holds the tags' bytes), when accounting is on
                     let up = unsafe { RUN_UNIT };
                     if crate::memstat::enabled() && !up.is_null() {
-                        crate::owner::call(crate::owner::Class::App, || {
+                        crate::owner::call(crate::owner::Class::Program, || {
                             for (k, v) in crate::memreport::unit_sizes(unsafe { &*up }) {
                                 report.push_str(&format!("makepad-run mem: harness snapshot:   size {:<40} {:>9.1} MB\n", k, v as f64 / 1048576.0));
                             }
@@ -2289,6 +2336,8 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             let _job = jit::compile_job();
             jit::reassert_signals();
             flush_errors(false);
+            // the deferred cache records of this tick's installs (rule I-PUB: bounded publishes)
+            if jit::records_due() { jit::drain_records_bounded(); }
             if settle_on {
                 let present = FIRST_PRESENT_WALL.load(Ordering::Acquire).max(DOMAIN_PRESENT_WALL.load(Ordering::Acquire));
                 if present != settle_present {
@@ -2305,9 +2354,13 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 // inputs stay through the startup frame: evicting them earlier just makes
                 // subsequent startup callers rebuild them. After present, retry shared
                 // reclamation as compilation progresses, without a global quiet gate.
+                // at most every SETTLE_DROP_EVERY_NS (a request goes at once): each pass scans every
+                // slot on the owner, and an O3 tail bumped the generation with every install
+                let now_ns = jit::wall_ns();
                 let settled_d = if (FIRST_PRESENT_WALL.load(Ordering::Acquire) != 0 || reclaim_requested)
-                    && (reclaimed != Some(n) || reclaim_requested) {
-                    crate::owner::call_within(crate::owner::Class::Background, 0, || unsafe { jit::settle_drop(RUN_UNIT) })
+                    && (reclaimed != Some(n) && now_ns.saturating_sub(last_drop_ns) >= SETTLE_DROP_EVERY_NS || reclaim_requested) {
+                    last_drop_ns = now_ns;
+                    Some(crate::owner::publish(|| unsafe { jit::settle_drop(RUN_UNIT) }))
                 } else { None };
                 if let Some(mut d) = settled_d {
                     d.release_rir();
@@ -2357,7 +2410,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                     // MAKEPAD_RUN_MEM_AT_TRIM=1 (with MAKEPAD_RUN_MEM_REPORT): the report after the adoption's trim
                     let up = unsafe { RUN_UNIT };
                     if runtime.mem_at_trim && crate::memstat::enabled() && !up.is_null() {
-                        crate::owner::call(crate::owner::Class::App, || {
+                        crate::owner::call(crate::owner::Class::Program, || {
                             crate::memstat::print("after the settle and the adoption", &crate::memreport::unit_sizes(unsafe { &*up }));
                         });
                     }
@@ -2535,11 +2588,11 @@ fn start_exit_summary() {
         // calls, made only if the owner answers in time
         crate::owner::exit_helper();
         let up = unsafe { RUN_UNIT };
-        let got = !up.is_null() && crate::owner::call_within(crate::owner::Class::App, exit_quiesce_ms(), || ()).is_some();
+        let got = !up.is_null() && crate::owner::call_within(crate::owner::Class::Program, exit_quiesce_ms(), || ()).is_some();
         flush_errors(false);
         if let Some(p) = RUN_PANIC.get() {
             // the message itself was printed when main returned
-            let rep = if got { crate::owner::call(crate::owner::Class::App, || unsafe { (&*up).report(p) }) } else { "compiler busy; backtrace unavailable at exit".to_string() };
+            let rep = if got { crate::owner::call(crate::owner::Class::Program, || unsafe { (&*up).report(p) }) } else { "compiler busy; backtrace unavailable at exit".to_string() };
             eprintln!("makepad-run: main {} report: {}", p.kind, rep);
             report("panic", &format!("main {}: {} -- report: {}", p.kind, p.message, rep));
         }
@@ -2641,13 +2694,14 @@ fn adopt_collected_tables() -> bool {
     let mut notes: Vec<(&'static str, crate::collected::Adopt)> = Vec::new();
     let before = crate::memstat::live_total();
     let t = Instant::now();
-    let Some(done) = crate::owner::call_within(crate::owner::Class::Background, 0, || {
-        let Ok(_front) = jit::FRONT_RW.try_write() else { return None };
+    // a front write (try only): structural, a program-class request
+    let Some(done) = crate::owner::call(crate::owner::Class::Program, || {
+        let Some(_front) = jit::front_try_write() else { return None };
         let u = unsafe { &mut *up };
         if !front_recordable() { return Some(None); }
         let cache = u.cache.as_ref()?;
         Some(cache.adopt_collected(&mut u.prog, &mut u.tcx, &written, &mut retired, |name, how| notes.push((name, how))))
-    }).flatten() else { return false };
+    }) else { return false };
     let held = t.elapsed().as_secs_f64() * 1e3;
     drop(retired);
     let after = crate::memstat::live_total();
@@ -2676,13 +2730,14 @@ fn drop_program_memos() -> bool {
     let mut retired: Vec<Box<dyn Send>> = Vec::new();
     let before = crate::memstat::live_total();
     let t = Instant::now();
-    let Some(()) = crate::owner::call_within(crate::owner::Class::Background, 0, || {
-        let Ok(_front) = jit::FRONT_RW.try_write() else { return None };
+    // a front write (try only): structural, a program-class request
+    let Some(()) = crate::owner::call(crate::owner::Class::Program, || {
+        let Some(_front) = jit::front_try_write() else { return None };
         let u = unsafe { &mut *up };
         unsafe { u.prog.detach_caches(&mut retired) };
         retired.push(u.tcx.retire_solver_cache());
         Some(())
-    }).flatten() else { return false };
+    }) else { return false };
     let held = t.elapsed().as_secs_f64() * 1e3;
     drop(retired);
     verbose!("makepad-run mem: dropped the name-resolution memos and solver caches at t={:.0} ms: counted heap {:.1} -> {:.1} MB; locks held {:.1} ms",
@@ -2842,13 +2897,18 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     let up = unsafe { RUN_UNIT };
     // one unit call: waits for the unit when `wait`, else only if it is free now
     fn unit_call<R>(wait: bool, f: impl FnOnce() -> R) -> Option<R> {
-        // (the writer is a background thread: a program thread's request goes first either way)
-        if wait { Some(crate::owner::call(crate::owner::Class::Background, f)) } else { crate::owner::call_within(crate::owner::Class::Background, 0, f) }
+        // (front writes and whole-cache encodes: structural, a program-class request -- the main
+        // thread's requests go first; bounded record publishes are step 4 of OWNERARCH.DESIGN.md)
+        let _ = wait;
+        Some(crate::owner::call(crate::owner::Class::Program, f))
     }
     if up.is_null() {
         return None;
     }
-    let mut parts = [0f64; 3];
+    // the deferred cache records in bounded publishes (a program thread waits for one batch);
+    // the request below holds only what installs add meanwhile
+    jit::drain_records_bounded();
+    let mut parts = [0f64; 4];
     let mut n_imgs = 0;
     // the files whose front images this write holds: the collected program below is recorded
     // only if no file was loaded since (its restore maps every file from these images)
@@ -2858,6 +2918,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     let spill = {
         let u = unsafe { &mut *up };
         u.flush_cache_records();
+        parts[3] = held.elapsed().as_secs_f64() * 1e3;
         // the startup manifest, once its window has closed (first present + 5 s after main):
         // what the exit recorded before, so a killed or force-quit app starts warm too; the exit
         // writes it again only if O2 code replaced startup code since (record_manifest)
@@ -2949,19 +3010,20 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             }
             (ready, retired_boot, t)
         }) {
-            if std::env::var_os("MAKEPAD_RUN_CACHE_TRACE").is_some() { verbose!("makepad-run cache: collected record held the unit lock {:.1} ms", t.elapsed().as_secs_f64() * 1e3); }
+            verbose!("makepad-run cache: collected record held the owner {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
             drop(retired_boot);
             if let Some((report, dest, payload)) = ready {
                 if let Some(written) = crate::cache::Cache::commit_collected(report, dest, payload) {
                     COLLECTED_CURRENT.store(true, Ordering::Relaxed);
                     crate::zone_alloc::kept_with(|| *COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(written.clone()));
-                    let retired_boot = crate::owner::call(crate::owner::Class::App, || unsafe { &mut *up }.cache.as_mut().map(|c| c.finish_collected()));
+                    let retired_boot = crate::owner::call(crate::owner::Class::Program, || unsafe { &mut *up }.cache.as_mut().map(|c| c.finish_collected()));
                     drop(retired_boot);
                 }
             }
         }
     }
-    if std::env::var_os("MAKEPAD_RUN_CACHE_TRACE").is_some() { verbose!("makepad-run cache: mid write held the unit lock {:.1} ms (manifest to {:.1}, front images to {:.1}, crate records to {:.1}, then spill)", held1, parts[0], parts[1], parts[2]); }
+    verbose!("makepad-run cache: mid write held the owner {:.1} ms (records to {:.1}, manifest to {:.1}, front images to {:.1}, crate records to {:.1}, then spill)", held1, parts[3], parts[0], parts[1], parts[2]);
+    crate::inspect::flightrec::event("cache.write", &format!("mid write: {} records, {} images; held the owner {:.1} ms (manifest {:.1}, front images {:.1}, crate records {:.1})", n, n_imgs, held1, parts[0], parts[1], parts[2]), (held1 * 1e6) as u64, 0);
     // All temporary encoders and retired boot arrays are now outside compiler locks.
     crate::memstat::trim();
     Some((n, n_imgs))
@@ -3166,17 +3228,33 @@ fn summary_inner(why: &str) {
             }
             if built > 0 || n[0] > 0.0 {
                 verbose!(
-                    "makepad-run: pipelined compile: callers front {:.0} ms locked, back {:.0} ms unlocked, relock wait {:.0} ms, in-flight waits {:.0} ms; speculative {} built ({} called, {} unused; {} expired after MAKEPAD_RUN_SPEC_TTL_MS, {:.0} MB freed), workers front {:.0} ms back {:.0} ms, {} yields, {} cold calls skipped{}",
-                    n[0], n[1], n[2], n[3], built, used, built - used, jit::SPEC_EXPIRED[0].load(Ordering::Relaxed), jit::SPEC_EXPIRED[1].load(Ordering::Relaxed) as f64 / 1048576.0, n[4], n[5], jit::SPEC_YIELDS.load(Ordering::Relaxed), jit::SPEC_COLD_SKIPPED.load(Ordering::Relaxed), if jit::spec_hot_only(options) { " (fall-through only)" } else { "" }
+                    "makepad-run: pipelined compile: callers front {:.0} ms locked, back {:.0} ms unlocked, relock wait {:.0} ms, in-flight waits {:.0} ms; speculative {} built ({} called, {} unused; {} expired after MAKEPAD_RUN_SPEC_TTL_MS, {:.0} MB freed), workers front {:.0} ms back {:.0} ms, {} cold calls skipped{}",
+                    n[0], n[1], n[2], n[3], built, used, built - used, jit::SPEC_EXPIRED[0].load(Ordering::Relaxed), jit::SPEC_EXPIRED[1].load(Ordering::Relaxed) as f64 / 1048576.0, n[4], n[5], jit::SPEC_COLD_SKIPPED.load(Ordering::Relaxed), if jit::spec_hot_only(options) { " (fall-through only)" } else { "" }
                 );
             }
         }
         if !SILENT.load(Ordering::Relaxed) {
             let h = |i: usize| crate::owner::BUSY_NS[i].load(Ordering::Relaxed) as f64 / 1e6;
-            verbose!("makepad-run: owner thread busy: job {:.0} ms, finish {:.0} ms, main {:.0} ms, app {:.0} ms, background {:.0} ms (t={:.0} ms)", h(0), h(1), h(2), h(3), h(4), crate::clock::ms_since_start());
+            verbose!("makepad-run: owner thread busy: job {:.0} ms, publish {:.0} ms, program {:.0} ms (t={:.0} ms)", h(0), h(1), h(2), crate::clock::ms_since_start());
+            let b = |i: usize| crate::owner::BAILS[i].load(Ordering::Relaxed);
+            let pf = |i: usize| jit::PREFRONTS[i].load(Ordering::Relaxed);
+            let fail: Vec<String> = (1..jit::PREFRONT_FAIL.len()).map(|i| format!("{} {}", jit::PREFRONT_FAIL_NAMES[i], jit::PREFRONT_FAIL[i].load(Ordering::Relaxed))).collect();
+            verbose!("makepad-run: background takes (rule I-PURE): {} fronts run off the owner ({:.0} ms cpu; made nothing: {}); bails: front {}, initializer {}, jit {}, wait {}; builds dropped {}",
+                pf(0), pf(1) as f64 / 1e6, fail.join(", "), b(0), b(1), b(2), b(3), b(crate::owner::BAIL_DROPPED));
             let m = |i: usize| crate::owner::MAIN_ACC[i].load(Ordering::Relaxed);
             verbose!("makepad-run: main thread's {} owner requests: waited {:.0} ms (queue delay before service {:.0} ms, wake delay after completion {:.0} ms); by wait length <20us {} ({:.0} ms), <200us {} ({:.0} ms), <2ms {} ({:.0} ms), longer {} ({:.0} ms)",
                 m(0), m(1) as f64 / 1e6, m(2) as f64 / 1e6, m(3) as f64 / 1e6, m(4), m(5) as f64 / 1e6, m(6), m(7) as f64 / 1e6, m(8), m(9) as f64 / 1e6, m(10), m(11) as f64 / 1e6);
+            verbose!("makepad-run: owner by site: {}", crate::owner::sites_summary(14));
+            verbose!("makepad-run: publish O1 on the owner by kind: {}", jit::publish_opt_summary());
+            verbose!("makepad-run: O3 candidate takes: {}", jit::cand_skip_summary());
+            verbose!("makepad-run: O3 install records on the owner: {}x {:.0} ms", jit::O3_INSTALL_REC[0].load(std::sync::atomic::Ordering::Relaxed), jit::O3_INSTALL_REC[1].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6);
+        }
+        if !SILENT.load(Ordering::Relaxed) {
+            let b = |i: usize| crate::owner::PURE_BAILS[i].load(Ordering::Relaxed);
+            let p = |i: usize| crate::owner::PURE_AT_PRESENT[i].load(Ordering::Relaxed);
+            use crate::owner::{PURE_AHEAD_BAIL, PURE_BG_EVAL, PURE_BG_FRONT, PURE_BG_JIT, PURE_BG_JOB};
+            verbose!("makepad-run: pure-or-bail census (total / before the present): background fronts on the owner {} / {}, background initializer runs {} / {}, background JIT calls {} / {}, const requests of Relax threads {} / {}, lowering-ahead NeedsUnit bails {} / {}",
+                b(PURE_BG_FRONT), p(PURE_BG_FRONT), b(PURE_BG_EVAL), p(PURE_BG_EVAL), b(PURE_BG_JIT), p(PURE_BG_JIT), b(PURE_BG_JOB), p(PURE_BG_JOB), b(PURE_AHEAD_BAIL), p(PURE_AHEAD_BAIL));
         }
         let ah = |i: usize| jit::AHEAD_STATS[i].load(Ordering::Relaxed);
         if ah(0) + ah(2) > 0 && !SILENT.load(Ordering::Relaxed) {
@@ -3215,7 +3293,7 @@ fn summary_inner(why: &str) {
         let q = jit::TIER_QUEUED.load(Ordering::Relaxed);
         if q > 0 {
             verbose!(
-                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); snapshots {:.0} ms cpu on the owner ({} inline candidates built there, {:.0} ms; {} fronts off it, {:.0} ms cpu; {} optimised off it, {:.0} ms cpu), back ends {:.0} ms cpu off it",
+                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); snapshots {:.0} ms cpu on the owner ({} inline candidates built there, {:.0} ms; {} fronts off it, {:.0} ms cpu; {} optimised off it, {:.0} ms cpu), back ends {:.0} ms cpu off it; bottom-up preparation {:.0} ms cpu ({} bodies simplified, {} kept, {} shared, {} of the simplified had disagreeing shared ones: body {} attrs {} presence {} preparation {} single {}); {} code bytes",
                 jit::ahead_level().name(),
                 q,
                 jit::TIER_REVALIDATED.load(Ordering::Relaxed),
@@ -3233,6 +3311,17 @@ fn summary_inner(why: &str) {
                 jit::TIER1_SNAP_OFF[0].load(Ordering::Relaxed),
                 jit::TIER1_SNAP_OFF[1].load(Ordering::Relaxed) as f64 / 1e6,
                 s.tier1_free_ns as f64 / 1e6,
+                jit::TIER1_PREP[0].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::TIER1_PREP[1].load(Ordering::Relaxed),
+                jit::TIER1_PREP[2].load(Ordering::Relaxed),
+                jit::TIER1_PREP[3].load(Ordering::Relaxed),
+                jit::TIER1_PREP[4].load(Ordering::Relaxed),
+                jit::TIER1_PREP[5].load(Ordering::Relaxed),
+                jit::TIER1_PREP[6].load(Ordering::Relaxed),
+                jit::TIER1_PREP[7].load(Ordering::Relaxed),
+                jit::TIER1_PREP[8].load(Ordering::Relaxed),
+                jit::TIER1_PREP[9].load(Ordering::Relaxed),
+                s.tier1_code_bytes,
             );
         }
         let mut tl = String::new();
@@ -3249,6 +3338,14 @@ fn summary_inner(why: &str) {
             }
     if !SILENT.load(Ordering::Relaxed) {         verbose!("makepad-run: opt passes (cpu ms): {}", passes); }
             verbose!("makepad-run: invokes {} seen, {} made plain calls", relax_codegen::opt::INVOKES_SEEN.load(Ordering::Relaxed), relax_codegen::opt::INVOKES_DEMOTED.load(Ordering::Relaxed));
+        }
+        if relax_backend::dbgloc::stats_on() {
+            let st = &relax_backend::dbgloc::STATS;
+            let g = |k: usize| st[k].load(Ordering::Relaxed);
+            eprintln!(
+                "makepad-run: variable tables: {} of {} bodies, {} KB of tables, {} KB in pc maps (+{:.1}% on the code entries' {} KB), {:.0} B per body with a table",
+                g(0), g(1), g(2) / 1024, g(3) / 1024, 100.0 * g(3) as f64 / g(4).max(1) as f64, g(4) / 1024, g(3) as f64 / g(0).max(1) as f64
+            );
         }
         if relax_backend::rir::unwind_stats_on() {
             let st = &relax_backend::rir::UNWIND_STATS;
@@ -3346,10 +3443,10 @@ fn summary_inner(why: &str) {
         }
     };
     if why == "stats" {
-        if crate::owner::call_within(crate::owner::Class::App, 0, || { if preamble(true) { rest(); } }).is_none() {
+        if crate::owner::call_within(crate::owner::Class::Program, 0, || { if preamble(true) { rest(); } }).is_none() {
             preamble(false);
         }
-    } else if crate::owner::call_within(crate::owner::Class::App, exit_quiesce_ms(), || { if preamble(true) { rest(); } }).is_none() {
+    } else if crate::owner::call_within(crate::owner::Class::Program, exit_quiesce_ms(), || { if preamble(true) { rest(); } }).is_none() {
         preamble(false);
     }
 }

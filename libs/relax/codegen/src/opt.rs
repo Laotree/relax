@@ -16,7 +16,7 @@ pub static HIST: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic
 use relax_backend::rir::*;
 use relax_backend::passes::*;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OptCfg {
     /// O1: inline Relax core's builtins (scalar/math/slice helpers) into callers
     pub inline: bool,
@@ -219,6 +219,22 @@ impl InlineLimits {
     }
 }
 
+/// The largest body any O3 rule admits for a callee with these attributes (the cost rule's
+/// bodies are small: at most 25 instructions that are not moves or constants): a bottom-up
+/// preparation whose O1 body is already larger rarely optimises down into range, so it is not
+/// prepared and its sites decide on the snapshot body.
+pub fn max_admitted_insts(options: &relax_session::Options, attrs: u8) -> usize {
+    let lim = InlineLimits::tier1();
+    if single_on(options) {
+        return INLINE_SINGLE_INSTS;
+    }
+    let mut n = lim.leaf_insts.max(lim.hot_insts);
+    if attrs & ATTR_ALWAYS != 0 { n = n.max(lim.always_insts); }
+    if attrs & ATTR_HINT != 0 { n = n.max(lim.hint_insts); }
+    if attrs & ATTR_CHAIN != 0 { n = n.max(lim.chain_insts); }
+    n
+}
+
 pub fn inline_rule(f: &Func, callee_id: u32, nargs: usize, nrets: usize, attrs: u8, lim: &InlineLimits) -> Option<usize> {
     let (n, leaf, rec) = callee_shape(f, callee_id);
     // a naked fn is its asm only: never inlined (rustc: naked implies inline(never))
@@ -333,6 +349,8 @@ fn inline_inst_count(f: &Func) -> usize {
 #[derive(Default)]
 pub struct InlineStats {
     pub inlined: usize,
+    /// sites admitted only as their constant arguments price the callee
+    pub in_context: usize,
     pub rules: [usize; RULE_NAMES.len()],
     hot_inlined: usize,
     hot_left: usize,
@@ -342,9 +360,70 @@ pub struct InlineStats {
     pub rejected: std::collections::BTreeMap<(String, &'static str), usize>,
     /// calls left in hot blocks (not cold, not panic paths): name, reason, callee size
     pub hot_rejected: std::collections::BTreeMap<(String, &'static str, usize), usize>,
+    /// optimisation remarks (makepad inspect `asm`, `remarks`): every call site the queue kept as
+    /// a call, at its source position, with the refusal and its numbers
+    pub remarks: Vec<SiteRemark>,
+    /// record only `remarks` (every O3 build): the end-of-pass census reads callee bodies, which
+    /// would add to the build's recorded reads
+    pub remarks_only: bool,
+}
+
+/// Why the inliner kept one call site a call (an O3 optimisation remark).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SiteRemark {
+    /// the call's source position (RIR `Block::pos`, inline context bits included)
+    pub pos: u64,
+    pub callee: u32,
+    pub why: u8,
+    /// the site is in a hot block (loop / sampled hot)
+    pub hot: bool,
+    /// the callee's size as priced (instructions)
+    pub size: u32,
+    pub a: u32,
+    pub b: u32,
+}
+
+/// `SiteRemark::why` values.
+pub const WHY_NO_BODY: u8 = 1;
+pub const WHY_RECURSIVE: u8 = 2;
+pub const WHY_NO_RULE: u8 = 3;
+pub const WHY_COLD_ATTR: u8 = 4;
+pub const WHY_ARITY: u8 = 5;
+pub const WHY_FREE_SPENT: u8 = 6;
+pub const WHY_GROWTH: u8 = 7;
+pub const WHY_BUDGET: u8 = 8;
+/// an inspect experiment forbade it (`-inl@<slot>`)
+pub const WHY_FORBIDDEN: u8 = 9;
+
+impl SiteRemark {
+    /// The refusal in words, with its numbers.
+    pub fn describe(&self) -> String {
+        match self.why {
+            WHY_NO_BODY => "no optimised body of the callee yet (not compiled, or no RIR: a host / foreign fn)".into(),
+            WHY_RECURSIVE => "recursive: the callee is already being inlined on this path".into(),
+            WHY_NO_RULE => format!(
+                "no inline rule admits it: callee {} insts{}{} (rules: tiny <= call, #[inline]/always within their limits, small leaf, rustc cost model, single caller)",
+                self.size,
+                if self.a as u8 & ATTR_ALWAYS != 0 { ", #[inline(always)]" } else if self.a as u8 & ATTR_HINT != 0 { ", #[inline]" } else { ", no #[inline]" },
+                if self.hot { ", hot site" } else { ", site not hot" }
+            ),
+            WHY_COLD_ATTR => format!("callee is #[cold] and {} insts (above the free size)", self.size),
+            WHY_ARITY => "the call's arguments/results do not match the callee's signature (an ABI-lowered call)".into(),
+            WHY_FREE_SPENT => format!("the free-size allowance is spent: callee {} insts, {} left", self.size, self.a),
+            WHY_GROWTH => format!("growth ceiling: the caller would grow to {} insts, ceiling {} (callee {} insts)", self.a, self.b, self.size),
+            WHY_BUDGET => format!("inline budget spent: callee costs {} insts, {} left", self.a, self.b),
+            WHY_FORBIDDEN => "forbidden by an inspect experiment (noinline)".into(),
+            _ => "kept a call".into(),
+        }
+    }
 }
 
 impl InlineStats {
+    /// Stats that record only the optimisation remarks (every O3 build).
+    pub fn remarks() -> InlineStats {
+        InlineStats { remarks_only: true, ..Default::default() }
+    }
+
     fn reject(&mut self, name: String, reason: usize, hot: Option<usize>) {
         const REASONS: [&str; 5] = ["cold", "no-rir", "no-rule", "budget", "arity"];
         if let Some(size) = hot {
@@ -361,8 +440,8 @@ impl InlineStats {
             .filter(|(i, ((_, why), _))| *i < 5 || *why == "budget")
             .map(|(_, ((name, reason), n))| format!("{} ({}, {})", name, reason, n))
             .collect::<Vec<_>>().join("; ");
-        eprintln!("inline-stats {}: sites {}, inlined {}, hot {}, growth {}->{} insts, left: cold {}, no-rir {}, no-rule {}, budget {}, arity {}; top: {}",
-            name, self.inlined + self.left.iter().sum::<usize>(), self.inlined,
+        eprintln!("inline-stats {}: sites {}, inlined {} ({} priced in context), hot {}, growth {}->{} insts, left: cold {}, no-rir {}, no-rule {}, budget {}, arity {}; top: {}",
+            name, self.inlined + self.left.iter().sum::<usize>(), self.inlined, self.in_context,
             self.hot_inlined + self.hot_left, self.growth_before.unwrap_or(0), self.growth_after,
             self.left[0], self.left[1], self.left[2], self.left[3], self.left[4], top);
         if !self.hot_rejected.is_empty() {
@@ -372,19 +451,148 @@ impl InlineStats {
     }
 }
 
-/// O3's caller growth ceiling: max(4x, +8000) instructions. Bottom-up inlining (callees bring
-/// their own inlining, priced by their optimised bodies) made the room usable: max(2x, +4000)
-/// refused html_parse's and maps' hot sites for budget (html 0.66, maps 0.97, text_shape 0.985,
-/// geomean 0.969 vs 2x); top-down, the same room had cost text_shape 5% and Stage 4.6% (INL3).
-pub fn growth_ceiling(size: usize) -> usize {
-    size.saturating_mul(4).max(size.saturating_add(8000))
+/// O3's caller growth ceiling, scaled by the caller's measured hotness (HotSpot C2's frequent
+/// vs small limits, .NET's profile-boosted size tolerance): a caller the sampler found hot
+/// (its block frequencies are sampled) gets max(4x, +8000) instructions -- bottom-up inlining
+/// made that room usable, max(2x, +4000) refused html_parse's and maps' hot sites for budget
+/// (html 0.66, maps 0.97) --; every other caller max(2x, +4000): Stage's lukewarm UI functions
+/// grew 3x in code with the big room and its O3 compile CPU went up 4x.
+pub fn growth_ceiling(size: usize, hot: bool) -> usize {
+    if hot {
+        size.saturating_mul(4).max(size.saturating_add(8000))
+    } else {
+        size.saturating_mul(2).max(size.saturating_add(4000))
+    }
+}
+
+/// In-context pricing (LLVM InlineCost's simplified values): the body a site whose arguments
+/// include constants actually brings. Optimistic constant propagation over executable blocks
+/// (Wegman-Zadeck SCCP), integer operations only; RIR registers are not SSA, so a register's
+/// value is the meet of its definitions in executable blocks. In the result, an instruction
+/// whose value is a constant is an `Iconst`, a branch on a constant a jump, a block no executable
+/// edge reaches empty, and what nothing uses any more is gone. `consts`: per parameter, its
+/// constant. None: the constants change nothing. (`hash::fast::mix_bytes` with a constant
+/// length: the 16-byte loop and two of the three tails are dead.)
+pub fn specialize_for_args(callee: &Func, consts: &[Option<i64>]) -> Option<Func> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum V { Top, C(i64), Bot }
+    fn meet(a: V, b: V) -> V {
+        match (a, b) {
+            (V::Top, x) | (x, V::Top) => x,
+            (V::C(x), V::C(y)) if x == y => V::C(x),
+            _ => V::Bot,
+        }
+    }
+    if callee.blocks.is_empty() || !consts.iter().any(|c| c.is_some()) {
+        return None;
+    }
+    let mut val = vec![V::Top; callee.vregs.len()];
+    for (k, p) in callee.params.iter().enumerate() {
+        val[p.0 as usize] = meet(val[p.0 as usize], consts.get(k).copied().flatten().map_or(V::Bot, V::C));
+    }
+    let mut exec = vec![false; callee.blocks.len()];
+    exec[0] = true;
+    let bin = |op: IOp, it: IntTy, a: V, b: V| match (a, b) {
+        (V::C(x), V::C(y)) => fold_ibin(op, it, x, y).map_or(V::Bot, V::C),
+        (V::Bot, _) | (_, V::Bot) => V::Bot,
+        _ => V::Top,
+    };
+    loop {
+        let mut changed = false;
+        for bi in 0..callee.blocks.len() {
+            if !exec[bi] { continue; }
+            let b = &callee.blocks[bi];
+            for i in &b.insts {
+                let g = |v: &VReg| val[v.0 as usize];
+                let r = match i {
+                    Inst::Iconst(_, k) => V::C(*k),
+                    Inst::Mov(_, a) => g(a),
+                    Inst::IBin(op, it, _, a, b) => bin(*op, *it, g(a), g(b)),
+                    Inst::IBinI(op, it, _, a, k) => bin(*op, *it, g(a), V::C(*k)),
+                    Inst::INeg(it, _, a) => bin(IOp::Sub, *it, V::C(0), g(a)),
+                    Inst::INot(it, _, a) => bin(IOp::Xor, *it, g(a), V::C(-1)),
+                    Inst::ICmp(c, sg, _, a, b) => match (g(a), g(b)) {
+                        (V::C(x), V::C(y)) => V::C(cmp_i(*c, *sg, x, y) as i64),
+                        (V::Bot, _) | (_, V::Bot) => V::Bot,
+                        _ => V::Top,
+                    },
+                    Inst::ICmpI(c, sg, _, a, k) => match g(a) {
+                        V::C(x) => V::C(cmp_i(*c, *sg, x, *k) as i64),
+                        x => x,
+                    },
+                    Inst::Conv(c @ Conv::IntToInt(_), _, a) => match g(a) {
+                        V::C(x) => match fold_conv(*c, K::I(x)) { Some(K::I(y)) => V::C(y), _ => V::Bot },
+                        x => x,
+                    },
+                    Inst::Sel(_, c, a, b) => match g(c) {
+                        V::C(0) => g(b),
+                        V::C(_) => g(a),
+                        V::Top => V::Top,
+                        V::Bot => meet(g(a), g(b)),
+                    },
+                    _ => V::Bot,
+                };
+                i.defs(|d| {
+                    let m = meet(val[d.0 as usize], r);
+                    if m != val[d.0 as usize] { val[d.0 as usize] = m; changed = true; }
+                });
+            }
+            let mut mark = |t: u32, changed: &mut bool| if !exec[t as usize] { exec[t as usize] = true; *changed = true; };
+            match &b.term {
+                Term::Branch(c, t, e) => match val[c.0 as usize] {
+                    V::C(0) => mark(*e, &mut changed),
+                    V::C(_) => mark(*t, &mut changed),
+                    V::Top => {}
+                    V::Bot => { mark(*t, &mut changed); mark(*e, &mut changed); }
+                },
+                t => for s in t.succs() { mark(s, &mut changed); },
+            }
+        }
+        if !changed { break; }
+    }
+    let mut g = callee.clone();
+    let mut folded = false;
+    for (bi, b) in g.blocks.iter_mut().enumerate() {
+        if !exec[bi] {
+            if !b.insts.is_empty() || !matches!(b.term, Term::Unreachable) { folded = true; }
+            b.insts.clear();
+            b.pos.clear();
+            b.term = Term::Unreachable;
+            continue;
+        }
+        for i in b.insts.iter_mut() {
+            if matches!(i, Inst::Iconst(..)) || !is_pure(i) { continue; }
+            let mut one = None;
+            let mut n = 0;
+            i.defs(|d| { one = Some(d); n += 1; });
+            if let (1, Some(d)) = (n, one) {
+                if let V::C(k) = val[d.0 as usize] {
+                    if callee.vregs[d.0 as usize] == Cls::I {
+                        *i = Inst::Iconst(d, k);
+                        folded = true;
+                    }
+                }
+            }
+        }
+        if let Term::Branch(c, t, e) = b.term {
+            if let V::C(k) = val[c.0 as usize] {
+                b.term = Term::Jump(if k != 0 { t } else { e });
+                folded = true;
+            }
+        }
+    }
+    if !folded {
+        return None;
+    }
+    dce(&mut g);
+    Some(g)
 }
 
 impl InlineLimits {
-    pub fn tier1_for(f: &Func) -> Self {
+    pub fn tier1_for(f: &Func, hot: bool) -> Self {
         let mut lim = Self::tier1();
         let size = inline_inst_count(f);
-        lim.growth_limit = Some(growth_ceiling(size));
+        lim.growth_limit = Some(growth_ceiling(size, hot));
         lim
     }
 }
@@ -421,6 +629,51 @@ fn site_rule(options: &relax_session::Options, callee: &Func, id: u32, nargs: us
     })
 }
 
+/// PGO: a site the counts saw run at least this often per call of the function being inlined
+/// into (profile::inline_freqs units: 0.1 per run) is very hot: any body up to the
+/// inline(always) size may inline there (LLVM's hot-callsite threshold, which rustc PGO uses: it
+/// inlines html_parse's process_entity) -- if the body does not loop: what inlining saves is the
+/// call, and a body that iterates per call (sdf_glyphs' esdt over a row: +5.6% instructions when
+/// it went into each caller) pays for its call many times over.
+const PGO_VERY_HOT: f32 = 1.0;
+/// ... a body loops when it runs more instructions per call than this many times its size
+/// (HotSpot's back-edge / invocation ratio: a loop body is one that iterates about that often per
+/// call). Measured on the counts: llm_host's HostDecodeBench::step
+/// 3.9 (inlined: its caller specialises it), sdf_glyphs' esdt 31 (kept out of line).
+const PGO_LOOP_WORK: f64 = 8.0;
+
+/// A counted body's instructions executed per call over its size (1: straight-line code; a loop
+/// raises it by its trips). None: no counts.
+pub fn work_per_size(f: &Func) -> Option<f64> {
+    let entry = f.blocks.first().map_or(-1.0, |b| b.count);
+    if entry <= 0.0 {
+        return None;
+    }
+    let (mut work, mut size) = (0.0f64, 0usize);
+    for b in &f.blocks {
+        size += b.insts.len() + 1;
+        work += b.count.max(0.0) as f64 * (b.insts.len() + 1) as f64;
+    }
+    Some(work / entry as f64 / size.max(1) as f64)
+}
+
+fn pgo_site_limits(lim: &InlineLimits, counted: bool, priority: u32, callee: &Func) -> InlineLimits {
+    let loops = || match work_per_size(callee) {
+        Some(w) => w > PGO_LOOP_WORK,
+        None => relax_backend::regalloc::loop_depths(callee, &reachable(callee)).iter().any(|d| *d > 0),
+    };
+    if counted && f32::from_bits(priority) >= PGO_VERY_HOT && !loops() {
+        InlineLimits { hot_insts: lim.hot_insts.max(lim.always_insts), ..*lim }
+    } else {
+        *lim
+    }
+}
+
+fn inline_trace(name: &str) -> bool {
+    static T: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    T.get_or_init(|| std::env::var("MAKEPAD_RUN_INLINE_TRACE").ok().filter(|s| !s.is_empty())).as_deref().is_some_and(|t| name.ends_with(t))
+}
+
 /// Frequencies must describe this exact RIR. New blocks inherit the site's priority.
 /// The queue uses stable block/instruction indices: splitting invalidates only the tail,
 /// whose calls are enqueued again in the new continuation block.
@@ -434,16 +687,20 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
     use std::collections::BinaryHeap;
     let depths = relax_backend::regalloc::loop_depths(f, &reachable(f));
     let freqs = freqs.filter(|v| v.len() == f.blocks.len());
+    // PGO: a counted body's frequencies are per entry (profile::inline_freqs: 0.1 per run per call)
+    let counted = freqs.is_some() && relax_backend::profile::has_counts(f);
     let mut priorities: Vec<(u32, bool, bool)> = depths.iter().enumerate().map(|(b, d)| {
         freqs.map_or((*d, *d >= 1 && f.blocks.len() <= 64, false), |v| (v[b].max(0.0).to_bits(), v[b] >= HOT_FREQ, v[b] == 0.0))
     }).collect();
-    let mut loop_sites: Vec<bool> = depths.iter().map(|d| *d > 0).collect();
+    // PGO: a counted body's loop sites are the blocks the counts saw repeat per entry, not every
+    // block a loop holds (a loop that never iterates gets no bottom-up preparation)
+    let mut loop_sites: Vec<bool> = relax_backend::profile::repeated_blocks(f).unwrap_or_else(|| depths.iter().map(|d| *d > 0).collect());
     let mut ancestry = vec![vec![self_id]; f.blocks.len()];
     let mut multi_depths = vec![0; f.blocks.len()];
     let mut queue = BinaryHeap::new();
     let mut budget = lim.budget;
     let mut inst_count = inline_inst_count(f);
-    let mut growth_limit = lim.growth_limit.unwrap_or_else(|| growth_ceiling(inst_count));
+    let mut growth_limit = lim.growth_limit.unwrap_or_else(|| growth_ceiling(inst_count, false));
     // the size the ceiling sees: the actual size, but a priced callee counts its priced size
     let mut priced = inst_count;
     // Keep the separate raw-size free allowance.
@@ -455,6 +712,10 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
         s.left = [0; 5];
         s.rejected.clear();
         s.hot_rejected.clear();
+    }
+    // remarks of this round (a later round sees the calls the first one kept again)
+    if let Some(s) = stats.as_deref_mut() {
+        s.remarks.clear();
     }
     // Scalar closure combinators do not carry a per-element call penalty.
     // Look through adapter forwarding bodies for an actual loop before giving
@@ -483,7 +744,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
             for (ii, inst) in f.blocks[bi].insts.iter().enumerate() {
                 if let Inst::Call(Callee::Fn(id), _, _) = inst {
                     let found = get(*id);
-                    let size = found.map_or(usize::MAX, |(p, _)| inline_inst_count(unsafe { &*prepared(*id).map_or(p, |x| x.1) }));
+                    let size = found.map_or(usize::MAX, |(p, _)| inline_inst_count(unsafe { &*if loop_sites[bi] { prepared(*id).map_or(p, |x| x.1) } else { p } }));
                     // Closure adapters need to be fused as a chain. Importing
                     // their loop after unrelated work has spent the budget
                     // leaves an indirect/aggregate call on every iteration.
@@ -507,13 +768,59 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
         }
     };
     enqueue(f, 0, &priorities, &loop_sites, &mut queue);
+    // f's registers: (definitions, the constant of a single definition) -- a site's constant
+    // arguments price its callee in context (specialize_for_args); kept current as bodies move in
+    let mut kdef: Vec<(u32, Option<i64>)> = vec![(0, None); f.vregs.len()];
+    fn note_defs(kdef: &mut Vec<(u32, Option<i64>)>, insts: &[Inst], nv: usize) {
+        kdef.resize(nv, (0, None));
+        for i in insts {
+            let k = match i {
+                Inst::Iconst(_, k) => Some(*k),
+                Inst::Mov(_, a) if kdef[a.0 as usize].0 == 1 => kdef[a.0 as usize].1,
+                _ => None,
+            };
+            i.defs(|d| {
+                let e = &mut kdef[d.0 as usize];
+                e.0 += 1;
+                e.1 = if e.0 == 1 { k } else { None };
+            });
+        }
+    }
+    for p in &f.params { kdef[p.0 as usize].0 = 1; }
+    for b in 0..f.blocks.len() { note_defs(&mut kdef, &f.blocks[b].insts, f.vregs.len()); }
+    let mut specialized: std::collections::HashMap<(u32, bool, Vec<Option<i64>>), Option<Box<Func>>> = std::collections::HashMap::new();
+    // MAKEPAD_RUN_INLINE_TRACE=<suffix>: every site decision of the callers whose name ends with it
+    let trace = inline_trace(&f.name);
     while let Some((_, _, _, Reverse(bi), Reverse(ii))) = queue.pop() {
         let Some(Inst::Call(Callee::Fn(id), args, rets)) = f.blocks[bi].insts.get(ii) else { continue };
         let (id, args, rets) = (*id, args.clone(), rets.clone());
         let found = get(id);
-        // the bottom-up body first, then the snapshot body: (inlined body, priced body)
+        let consts: Vec<Option<i64>> = args.iter().map(|a| kdef.get(a.0 as usize).and_then(|e| if e.0 == 1 { e.1 } else { None })).collect();
+        // the bottom-up body first, then the snapshot body: (inlined body, priced body); each
+        // priced as written, then (constant arguments) as this site sees it
         let mut pick = None;
-        for (bottom_up, (body, shape)) in prepared(id).map(|x| (true, x)).into_iter().chain(found.map(|(p, _)| (false, (p, p)))) {
+        // bottom-up bodies serve sites in loops (where a callee's own inlining pays per
+        // iteration); elsewhere the snapshot body decides, top-down, and no preparation is made
+        let bottom = if loop_sites[bi] { prepared(id) } else { None };
+        let plain: Vec<(bool, *const Func, *const Func)> = bottom.map(|(b, s)| (true, b, s)).into_iter().chain(found.map(|(p, _)| (false, p, p))).collect();
+        // as written first; the constant-argument pricing only for a site those refused
+        let mut tries: Vec<(bool, bool, *const Func, *const Func)> = plain.iter().map(|&(u, b, s)| (u, false, b, s)).collect();
+        let any_const = consts.iter().any(|c| c.is_some());
+        let mut k = 0;
+        // the first try's refusal (the body as written): the site's remark when nothing is taken
+        let mut why: Option<SiteRemark> = None;
+        let want_why = stats.is_some();
+        loop {
+            if k == plain.len() && any_const {
+                for &(bottom_up, body, shape) in &plain {
+                    let spec = specialized.entry((id, bottom_up, consts.clone())).or_insert_with(|| specialize_for_args(unsafe { &*shape }, &consts).map(Box::new));
+                    if let Some(g) = spec {
+                        tries.push((bottom_up, true, body, &**g as *const Func));
+                    }
+                }
+            }
+            let Some(&(_, in_context, body, shape)) = tries.get(k) else { break };
+            k += 1;
             let (callee, shape) = unsafe { (&*body, &*shape) };
             let size = inline_inst_count(shape);
             let cost = size.saturating_sub(args.len() + rets.len() + 3);
@@ -528,7 +835,8 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
             // ... and one no bigger than the call itself costs nothing: no allowance at all.
             let no_growth = cost == 0;
             let attrs = found.unwrap().1;
-            let rule = site_rule(options, shape, id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), id), ancestry[bi].len() - 1, multi_depths[bi], lim);
+            let lim_b = pgo_site_limits(lim, counted, priorities[bi].0, shape);
+            let rule = site_rule(options, shape, id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), id), ancestry[bi].len() - 1, multi_depths[bi], &lim_b);
             // New admissions respect the actual growth ceiling, including ABI moves.
             let growth = size.saturating_add(args.len()).saturating_add(
                 shape.blocks.iter().filter(|b| matches!(b.term, Term::Ret(_))).count().saturating_mul(rets.len())
@@ -544,11 +852,62 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
                     _ => !free && (cost > budget || !tiny && priced > growth_limit),
                 };
             if !refused {
-                pick = Some((callee, rule.unwrap(), growth, size, cost, free, no_growth, bottom_up));
+                pick = Some((callee, rule.unwrap(), growth, size, cost, free, no_growth, in_context));
                 break;
             }
+            if want_why && why.is_none() {
+                let mk = |why: u8, a: usize, b: usize| SiteRemark { pos: f.blocks[bi].pos.get(ii).copied().unwrap_or(0), callee: id, why, hot: priorities[bi].1, size: size as u32, a: a.min(u32::MAX as usize) as u32, b: b.min(u32::MAX as usize) as u32 };
+                why = Some(if ancestry[bi].contains(&id) {
+                    mk(WHY_RECURSIVE, 0, 0)
+                } else if rule.is_none() {
+                    mk(WHY_NO_RULE, attrs as usize, 0)
+                } else if attrs & ATTR_COLD != 0 && !free && rule != Some(RULE_COST) {
+                    mk(WHY_COLD_ATTR, 0, 0)
+                } else if callee.params.len() != args.len() || callee.rets.len() != rets.len() {
+                    mk(WHY_ARITY, 0, 0)
+                } else {
+                    match rule.unwrap() {
+                        RULE_COST if size > free_budget => mk(WHY_FREE_SPENT, free_budget, 0),
+                        RULE_COST | RULE_SINGLE => mk(WHY_GROWTH, priced.saturating_add(growth), growth_limit),
+                        _ if cost > budget => mk(WHY_BUDGET, cost, budget),
+                        _ => mk(WHY_GROWTH, priced, growth_limit),
+                    }
+                });
+            }
         }
-        let Some((callee, rule, growth, size, cost, free, no_growth, bottom_up)) = pick else { continue };
+        // makepad inspect experiments (`ab <fn> b=inline:<callee>` / `noinline:`): MAKEPAD_RUN_OPT
+        // tokens `+inl@<slot>` / `-inl@<slot>` force or forbid this callee's sites
+        if !options.opt.is_empty() {
+            let tok = |p: &str| options.opt.iter().any(|t| t.strip_prefix(p).and_then(|x| x.parse::<u32>().ok()) == Some(id));
+            if tok("-inl@") {
+                pick = None;
+                why = Some(SiteRemark { pos: f.blocks[bi].pos.get(ii).copied().unwrap_or(0), callee: id, why: WHY_FORBIDDEN, hot: priorities[bi].1, size: 0, a: 0, b: 0 });
+            } else if pick.is_none() && tok("+inl@") && !ancestry[bi].contains(&id) {
+                if let Some((p, _)) = found {
+                    let callee: &Func = unsafe { &*p };
+                    if callee.params.len() == args.len() && callee.rets.len() == rets.len() && callee.blocks.iter().any(|b| matches!(b.term, Term::Ret(_))) {
+                        let size = inline_inst_count(callee);
+                        let growth = size.saturating_add(args.len()).saturating_sub(1);
+                        pick = Some((callee, RULE_ALWAYS, growth, size, size.saturating_sub(args.len() + rets.len() + 3), false, true, false));
+                    }
+                }
+            }
+        }
+        if pick.is_none() {
+            if let Some(s) = stats.as_deref_mut() {
+                let r = why.unwrap_or(SiteRemark { pos: f.blocks[bi].pos.get(ii).copied().unwrap_or(0), callee: id, why: WHY_NO_BODY, hot: priorities[bi].1, size: 0, a: 0, b: 0 });
+                s.remarks.push(r);
+            }
+        }
+        if trace {
+            let fq = f32::from_bits(priorities[bi].0);
+            let name = found.map_or_else(|| format!("fn#{}", id), |(p, _)| unsafe { &*p }.name.clone());
+            match &pick {
+                Some((c, r, g, sz, cost, free, _, ic)) => eprintln!("inline-trace {}: take {} freq {:.2} rule {} size {} (body {}) growth {} cost {} free {} ctx {} | budget {} priced {} limit {}", f.name, name, fq, r, sz, inline_inst_count(c), g, cost, free, ic, budget, priced, growth_limit),
+                None => eprintln!("inline-trace {}: left {} freq {:.2} tries {} work/size {:?} | budget {} priced {} limit {}", f.name, name, fq, tries.len(), found.and_then(|(p, _)| work_per_size(unsafe { &*p })), budget, priced, growth_limit),
+            }
+        }
+        let Some((callee, rule, growth, size, cost, free, no_growth, in_context)) = pick else { continue };
         let callee = Some(callee);
         let rule = Some(rule);
         match rule.unwrap() {
@@ -563,16 +922,26 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
         inlined.push((id, rule.unwrap()));
         if let Some(s) = stats.as_deref_mut() {
             s.inlined += 1;
+            s.in_context += usize::from(in_context);
             s.rules[rule.unwrap()] += 1;
             s.hot_inlined += usize::from(priorities[bi].1);
         }
         let start = f.blocks.len();
         let old_block_size = f.blocks[bi].insts.len();
         inline_site(f, bi, ii, callee.unwrap(), &args, &rets, nounwind);
+        // the call's results lose its definition; the parameter moves and the body add theirs
+        // (block `start` is the continuation: instructions that were there already)
+        for r in &rets { kdef[r.0 as usize].0 = kdef[r.0 as usize].0.saturating_sub(1); }
+        let nv = f.vregs.len();
+        note_defs(&mut kdef, &f.blocks[bi].insts[ii..], nv);
+        for b in start + 1..f.blocks.len() { note_defs(&mut kdef, &f.blocks[b].insts, nv); }
         let before = inst_count;
         inst_count = inst_count - old_block_size + f.blocks[bi].insts.len()
             + f.blocks[start..].iter().map(|b| b.insts.len()).sum::<usize>();
-        priced = if bottom_up { priced.saturating_add(growth) } else { priced + inst_count - before };
+        // the ceiling counts what moved in (a bottom-up body's unoptimised size: its priced size
+        // let collect_hybrid_decode_run take prepared bodies past the room top-down had, llm_host
+        // +2.1%), except a body priced in context (its constants fold it right away)
+        priced = if in_context { priced.saturating_add(growth) } else { priced + inst_count - before };
         priorities.resize(f.blocks.len(), priorities[bi]);
         let parent_loop = loop_sites[bi];
         loop_sites.resize(f.blocks.len(), parent_loop);
@@ -593,7 +962,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
         }
         enqueue(f, start, &priorities, &loop_sites, &mut queue);
     }
-    if let Some(s) = stats.as_deref_mut() {
+    if let Some(s) = stats.as_deref_mut().filter(|s| !s.remarks_only) {
         s.growth_after = inst_count;
         for (bi, block) in f.blocks.iter().enumerate() {
             for inst in &block.insts {
@@ -605,7 +974,8 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
                     0
                 } else if let Some((_, attrs)) = found {
                     let c = callee.unwrap();
-                    let rule = site_rule(options, c, *id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), *id), ancestry[bi].len() - 1, multi_depths[bi], lim);
+                    let lim_b = pgo_site_limits(lim, counted, priorities[bi].0, c);
+                    let rule = site_rule(options, c, *id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), *id), ancestry[bi].len() - 1, multi_depths[bi], &lim_b);
                     if ancestry[bi].contains(id) || rule.is_none() {
                         2
                     } else if attrs & ATTR_COLD != 0 && rule != Some(RULE_COST) && !(inline_inst_count(c) <= INLINE_FREE_INSTS && inline_inst_count(c) <= free_budget) {
@@ -670,6 +1040,11 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
             f.sret_callees.push(*c);
         }
     }
+    for c in &callee.nocapture {
+        if !f.nocapture.contains(c) {
+            f.nocapture.push(c.clone());
+        }
+    }
     // split the block after the call
     let blk = &mut f.blocks[bi];
     let tail = blk.insts.split_off(ii + 1);
@@ -678,6 +1053,8 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
     let call_pos = blk.pos.pop().unwrap_or(0);
     let mut old_term = std::mem::replace(&mut blk.term, Term::Unreachable);
     let old_term_pos = blk.term_pos;
+    // (the code after the call runs as often as the call)
+    let call_count = blk.count;
     // the invoked call itself (last in its block): its body continues at the normal
     // target, and whatever unwinds in it continues at the invoke's cleanup pad
     let mut unwind = None;
@@ -688,7 +1065,26 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
         }
     }
     let cont = f.blocks.len() as u32;
-    f.blocks.push(Block { insts: tail, pos: tail_pos, term: old_term, term_pos: old_term_pos });
+    f.blocks.push(Block { insts: tail, pos: tail_pos, term: old_term, term_pos: old_term_pos, count: call_count });
+    // the inline stack: the callee's body runs in a new context under the call's (its own
+    // contexts follow, renumbered); the callee is named by a position in its own body
+    let root = f.inl.len() as u64 + 1;
+    let anchor = callee.blocks.iter().flat_map(|b| b.pos.iter().copied().chain(std::iter::once(b.term_pos))).find(|&p| p != 0 && pos_ctx(p) == 0).unwrap_or(0);
+    f.inl.push((call_pos, anchor));
+    let base = f.inl.len() as u64;
+    // a callee position in the caller: its own body (context 0) under the new context, its
+    // context c (callee.inl[c - 1]) at f.inl[base + c - 1]
+    let ctx_of = move |p: u64| -> u64 {
+        match pos_ctx(p) {
+            _ if p == 0 => 0,
+            0 => pos_with_ctx(p, root),
+            POS_CTX_LOST => p,
+            c => pos_with_ctx(p, base + c),
+        }
+    };
+    for &(cp, a) in &callee.inl {
+        f.inl.push((ctx_of(cp), a));
+    }
     // map callee vregs and slots
     let mut vmap = Vec::with_capacity(callee.vregs.len());
     for c in &callee.vregs {
@@ -701,6 +1097,21 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
         f.ranged.push((vmap[v.0 as usize], n, lo, hi));
     }
     let slot_base = f.slots.len() as u32;
+    // the callee's named locals, in its new contexts (side metadata: makepad inspect `locals`)
+    for d in &callee.dbg {
+        let c = if d.ctx == 0 { root } else { base + d.ctx as u64 };
+        if c >= POS_CTX_LOST {
+            continue;
+        }
+        let mv = |v: VReg| if v == DBG_NONE { DBG_NONE } else { vmap[v.0 as usize] };
+        let loc = match &d.loc {
+            DbgLoc::Regs(r) => DbgLoc::Regs(r.iter().map(|v| mv(*v)).collect()),
+            DbgLoc::Slot(s, o) if *s != u32::MAX => DbgLoc::Slot(slot_base + s, *o),
+            DbgLoc::Slot(s, o) => DbgLoc::Slot(*s, *o),
+            DbgLoc::Mem(v, o) => DbgLoc::Mem(mv(*v), *o),
+        };
+        f.dbg.push(DbgVar { ctx: c as u16, local: d.local, loc, k: d.k.clone() });
+    }
     // an inlined body's SlotAddrs were moved by its own optimisation: not `born` here
     f.slots.extend(callee.slots.iter().map(|s| Slot { born: false, ..s.clone() }));
     let boff = f.blocks.len() as u32;
@@ -718,19 +1129,25 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
     // (blocks split this way are appended after the callee's)
     let mut extra: Vec<Block> = Vec::new();
     let nextra_base = boff + callee.blocks.len() as u32;
+    // PGO: a counted callee's block counts, scaled from its own entries to this call's
+    let scale = (call_count >= 0.0 && callee.blocks.first().is_some_and(|b| b.count > 0.0)).then(|| call_count / callee.blocks[0].count);
+    let scaled = |c: f32| match scale {
+        Some(k) if c >= 0.0 => c * k,
+        _ => -1.0,
+    };
     for cb in &callee.blocks {
         let mut insts = Vec::with_capacity(cb.insts.len());
         for x in &cb.insts {
             insts.push(map_inst(x, &m, slot_base));
         }
-        let mut pos = cb.pos.clone();
+        let mut pos: Vec<u64> = cb.pos.iter().map(|&p| ctx_of(p)).collect();
         let mut term = match &cb.term {
             Term::Jump(t) => Term::Jump(t + boff),
             Term::Branch(c, t, e) => Term::Branch(m(*c), t + boff, e + boff),
             Term::Ret(vals) => {
                 for (k, v) in vals.iter().enumerate() {
                     insts.push(Inst::Mov(rets[k], m(*v)));
-                    pos.push(cb.term_pos);
+                    pos.push(ctx_of(cb.term_pos));
                 }
                 Term::Jump(cont)
             }
@@ -744,7 +1161,7 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
                 None => Term::Resume,
             },
         };
-        let mut term_pos = cb.term_pos;
+        let mut term_pos = ctx_of(cb.term_pos);
         if let Some(u) = unwind {
             // split after every call that may unwind and is not already invoked
             let last_invoked = matches!(cb.term, Term::Invoke(..));
@@ -780,12 +1197,12 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
                 term_pos = pos.last().copied().unwrap_or(orig_pos);
                 for (k, (ik, pk)) in it.enumerate() {
                     let tp = pk.last().copied().unwrap_or(orig_pos);
-                    extra.push(Block { insts: ik, pos: pk, term: Term::Invoke(first_extra + k as u32 + 1, u), term_pos: tp });
+                    extra.push(Block { insts: ik, pos: pk, term: Term::Invoke(first_extra + k as u32 + 1, u), term_pos: tp, count: scaled(cb.count) });
                 }
-                extra.push(Block { insts: rest_i, pos: rest_p, term: orig_term, term_pos: orig_pos });
+                extra.push(Block { insts: rest_i, pos: rest_p, term: orig_term, term_pos: orig_pos, count: scaled(cb.count) });
             }
         }
-        f.blocks.push(Block { insts, pos, term, term_pos });
+        f.blocks.push(Block { insts, pos, term, term_pos, count: scaled(cb.count) });
     }
     f.blocks.extend(extra);
 }
@@ -969,6 +1386,59 @@ pub fn param_nocapture(f: &Func, k: usize, sub: &dyn Fn(&Callee, usize) -> bool)
         }
     }
     true
+}
+
+/// How `f` uses the pointer it gets as parameter `k`, as LLVM's capture tracking with `returned`:
+/// None when it may keep a copy (a derived value stored to memory, used as an indirect callee, or
+/// passed to a call `sub` cannot vouch for); Some(r) when it keeps none, `r` when a value derived
+/// from it may be returned. `sub(callee, arg)` answers the same for the calls it is passed to: a
+/// call that may return it gives a derived result. Loads, stores and copies through it are fine.
+pub fn param_escape(f: &Func, k: usize, sub: &dyn Fn(&Callee, usize) -> Option<bool>) -> Option<bool> {
+    let &p = f.params.get(k)?;
+    let mut t = vec![false; f.vregs.len()];
+    t[p.0 as usize] = true;
+    let mut returned = false;
+    for _ in 0..16 {
+        let mut more = false;
+        for b in &f.blocks {
+            for i in &b.insts {
+                let from = match i {
+                    Inst::Mov(_, x) | Inst::IBinI(_, _, _, x, _) | Inst::Conv(_, _, x) => t[x.0 as usize],
+                    Inst::IBin(_, _, _, x, y) | Inst::Sel(_, _, x, y) => t[x.0 as usize] || t[y.0 as usize],
+                    Inst::Store(_, _, _, v) | Inst::StoreX(_, _, _, _, _, v) | Inst::VStore(_, _, v) | Inst::AtomicStore(_, _, _, v) | Inst::AtomicRmw(_, _, _, _, _, v) if t[v.0 as usize] => return None,
+                    Inst::AtomicCas(_, _, _, _, _, e, n) if t[e.0 as usize] || t[n.0 as usize] => return None,
+                    Inst::Call(c, args, _) => {
+                        if matches!(c, Callee::Indirect(v) | Callee::CIndirect(v, _) if t[v.0 as usize]) || matches!(c, Callee::Asm(_)) && args.iter().any(|a| t[a.0 as usize]) {
+                            return None;
+                        }
+                        let mut r = false;
+                        for (j, a) in args.iter().enumerate() {
+                            if t[a.0 as usize] {
+                                r |= sub(c, j)?;
+                            }
+                        }
+                        r
+                    }
+                    _ => false,
+                };
+                if from {
+                    i.defs(|d| {
+                        if !t[d.0 as usize] {
+                            t[d.0 as usize] = true;
+                            more = true;
+                        }
+                    });
+                }
+            }
+            if let Term::Ret(vals) = &b.term {
+                returned |= vals.iter().any(|v| t[v.0 as usize]);
+            }
+        }
+        if !more {
+            return Some(returned);
+        }
+    }
+    None
 }
 
 /// Keep addressable 16-byte SIMD values in vector registers, including the
@@ -1442,7 +1912,11 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         }
         // profitability: a loop is worth it for a field it both loads and stores (the carried state:
         // a cursor index, a bit buffer); load-only fields come along, write-only ones are left
-        if !take.iter().any(|x| x.2 && x.3) {
+        // Load-only fields alone are LLVM LICM's invariant-load hoisting: a Vec's pointer and length
+        // read through `&mut self` in a loop that writes only through the heap pointer (vorbis
+        // `self.spectra[i] *= self.curves[i]` reloaded both headers every iteration).
+        // MAKEPAD_RUN_OPT=-promoteld: carried fields only.
+        if !take.iter().any(|x| x.2 && x.3) && (relax_backend::stats::opt_env_off("-promoteld") || !take.iter().any(|x| x.2)) {
             continue;
         }
         take.retain(|x| x.2);
@@ -1509,7 +1983,7 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         }
         let pre = f.blocks.len() as u32;
         let hp = f.blocks[h as usize].insts.first().map(|_| f.blocks[h as usize].pos[0]).unwrap_or(f.blocks[h as usize].term_pos);
-        f.blocks.push(Block { insts: Vec::new(), pos: Vec::new(), term: Term::Jump(h), term_pos: hp });
+        f.blocks.push(Block { insts: Vec::new(), pos: Vec::new(), term: Term::Jump(h), term_pos: hp, count: -1.0 });
         for &o in &outside {
             let t = &mut f.blocks[o as usize].term;
             retarget(t, h, pre);
@@ -1554,7 +2028,7 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
                 let tp = f.blocks.iter().enumerate().find(|(bi, b)| body[*bi] && b.term.succs().any(|s| s == t)).map(|(_, b)| b.term_pos).unwrap_or(0);
                 let ins: Vec<Inst> = stored.iter().map(|&k| Inst::Store(take[k].1, p, take[k].0, regs[k])).collect();
                 let np = ins.len();
-                f.blocks.push(Block { insts: ins, pos: vec![tp; np], term: Term::Jump(t), term_pos: tp });
+                f.blocks.push(Block { insts: ins, pos: vec![tp; np], term: Term::Jump(t), term_pos: tp, count: -1.0 });
                 for bi in 0..n {
                     if body[bi] {
                         retarget(&mut f.blocks[bi].term, t, x);
@@ -2014,6 +2488,10 @@ pub fn forward_slot_copies(f: &mut Func) -> bool {
                 }
             }
         }
+        f.dbg_map_slots(&|s| match to.get(s as usize) {
+            Some(&(a, None)) if a != NONE => Some(a),
+            _ => Some(s),
+        });
         if repl.iter().any(|r| r.4.is_some()) {
             for bi in 0..nb {
                 let insts = std::mem::take(&mut f.blocks[bi].insts);
@@ -2049,6 +2527,101 @@ pub fn forward_slot_copies(f: &mut Func) -> bool {
             }
         }
         any = true;
+    }
+    any
+}
+
+/// Copies of a value the same block just stored into a temporary: `Copy(d, t, n)` out of a
+/// non-escaping slot whose copied bytes the stores in front of it (same block) cover exactly
+/// becomes those stores' values stored at `d` (a value built in a temporary and moved into
+/// place: `[SimplexVertex::default(); 4]`, `vs[i] = Vertex { .. }`, a struct literal assigned
+/// to a field). The bytes are no longer read back through memory -- each 16-byte piece of the
+/// copy, read behind the narrower stores that just wrote it, failed store forwarding -- and the
+/// temporary's stores are left for dead_slot_stores. At most 16 stores per copy; a store
+/// reaching outside the copied bytes, an indexed or unknown write of the temporary, a value
+/// redefined before the copy, or a byte not stored in the block keeps the copy.
+pub fn stores_for_copies(f: &mut Func) -> bool {
+    if f.slots.is_empty() {
+        return false;
+    }
+    let SlotScan { vs, esc, .. } = slot_scan(f);
+    const NONE: u32 = u32::MAX;
+    const MAX_STORES: usize = 16;
+    let sl = |v: VReg| vs[v.0 as usize].0;
+    let mut any = false;
+    for bi in 0..f.blocks.len() {
+        let mut ii = 0;
+        while ii < f.blocks[bi].insts.len() {
+            let Inst::Copy(d, t, n) = f.blocks[bi].insts[ii] else { ii += 1; continue };
+            let ts = sl(t);
+            if ts == NONE || esc[ts as usize] || sl(d) == ts || n == 0 || n > 4096 {
+                ii += 1;
+                continue;
+            }
+            let (lo, hi) = (vs[t.0 as usize].1, vs[t.0 as usize].1 + n as i64);
+            // backwards from the copy: the latest store of every copied byte
+            let mut covered = vec![false; n as usize];
+            let mut left = n as usize;
+            let mut taken: Vec<(i64, Inst)> = Vec::new();
+            let mut defs: Vec<VReg> = Vec::new();
+            let mut ok = false;
+            for j in (0..ii).rev() {
+                let i = &f.blocks[bi].insts[j];
+                let st = match *i {
+                    Inst::Store(m, base, off, v) if sl(base) == ts => Some((vs[base.0 as usize].1 + off as i64, mem_size(m) as i64, v)),
+                    Inst::VStore(base, off, v) if sl(base) == ts => Some((vs[base.0 as usize].1 + off as i64, if f.vregs[v.0 as usize] == Cls::V256 { 32 } else { 16 }, v)),
+                    Inst::StoreX(_, base, ..) | Inst::VStoreX(base, ..) if sl(base) == ts => break,
+                    Inst::Copy(d2, _, _) if sl(d2) == ts => break,
+                    _ => None,
+                };
+                if let Some((a, sz, v)) = st {
+                    let b = a + sz;
+                    if b <= lo || a >= hi {
+                        // outside the copied bytes
+                    } else if a < lo || b > hi {
+                        break;
+                    } else {
+                        let r = (a - lo) as usize..(b - lo) as usize;
+                        let fresh = covered[r.clone()].iter().filter(|c| !**c).count();
+                        if fresh == r.len() {
+                            if defs.contains(&v) || taken.len() == MAX_STORES {
+                                break;
+                            }
+                            let rel = (a - lo) as i32;
+                            let ni = match *i {
+                                Inst::Store(m, ..) => Inst::Store(m, d, rel, v),
+                                _ => Inst::VStore(d, rel, v),
+                            };
+                            taken.push((a, ni));
+                            covered[r].iter_mut().for_each(|c| *c = true);
+                            left -= fresh;
+                            if left == 0 {
+                                ok = true;
+                                break;
+                            }
+                        } else if fresh != 0 {
+                            // partly overwritten by a later store
+                            break;
+                        }
+                    }
+                }
+                for_defs(i, |x| defs.push(x));
+            }
+            if !ok {
+                ii += 1;
+                continue;
+            }
+            taken.sort_by_key(|x| x.0);
+            let k = taken.len();
+            let pos = f.blocks[bi].pos.get(ii).copied();
+            let blk = &mut f.blocks[bi];
+            blk.insts.splice(ii..ii + 1, taken.into_iter().map(|x| x.1));
+            if let Some(p) = pos {
+                blk.pos.splice(ii..ii + 1, std::iter::repeat(p).take(k));
+            }
+            ii += k;
+            any = true;
+        }
     }
     any
 }
@@ -2553,6 +3126,71 @@ pub fn forward_slot_loads(f: &mut Func) -> bool {
 
 /// Vregs defined once, as a parameter or by moves and constant offsets of one (pointers into
 /// memory that existed before this frame did).
+/// The vregs holding addresses into slot `s` (its SlotAddr and moves / adds of it, constant or
+/// variable offsets), when every use of them is the address of a load, store or copy or makes
+/// another such address: None when the address leaks (stored, passed, returned, compared, ...).
+fn slot_derived(f: &Func, s: u32) -> Option<Vec<bool>> {
+    let nv = f.vregs.len();
+    let mut der = vec![false; nv];
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::SlotAddr(d, s2) = i {
+                if *s2 == s {
+                    der[d.0 as usize] = true;
+                }
+            }
+        }
+    }
+    loop {
+        let mut grew = false;
+        for b in &f.blocks {
+            for i in &b.insts {
+                let (d, a, b2) = match *i {
+                    Inst::Mov(d, a) | Inst::IBinI(IOp::Add | IOp::Sub, _, d, a, _) => (d, a, None),
+                    Inst::IBin(IOp::Add, _, d, a, b2) => (d, a, Some(b2)),
+                    _ => continue,
+                };
+                let from = der[a.0 as usize] || b2.map_or(false, |x| der[x.0 as usize]);
+                if from && !der[d.0 as usize] {
+                    der[d.0 as usize] = true;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    let mut tu = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            let ok = match *i {
+                Inst::Mov(..) | Inst::IBinI(IOp::Add | IOp::Sub, ..) => true,
+                Inst::IBin(IOp::Add, _, _, a, b2) => !(der[a.0 as usize] && der[b2.0 as usize]),
+                Inst::Load(..) | Inst::VLoad(..) => true,
+                Inst::LoadX(_, _, _, x, _, _) | Inst::VLoadX(_, _, x, _, _) => !der[x.0 as usize],
+                Inst::Store(_, _, _, v) | Inst::VStore(_, _, v) => !der[v.0 as usize],
+                Inst::StoreX(_, _, x, _, _, v) | Inst::VStoreX(_, x, _, _, v) => !der[x.0 as usize] && !der[v.0 as usize],
+                Inst::Copy(..) | Inst::SlotAddr(..) => true,
+                _ => {
+                    let mut bad = false;
+                    for_uses(i, |u| bad |= der[u.0 as usize]);
+                    !bad
+                }
+            };
+            if !ok {
+                return None;
+            }
+        }
+        tu.clear();
+        relax_backend::regalloc::term_uses(&b.term, &mut tu);
+        if tu.iter().any(|v| der[v.0 as usize]) {
+            return None;
+        }
+    }
+    Some(der)
+}
+
 fn param_based_vregs(f: &Func) -> Vec<bool> {
     let nv = f.vregs.len();
     let mut ndef = vec![0u32; nv];
@@ -2661,7 +3299,11 @@ pub fn forward_slot_dests(f: &mut Func) -> bool {
             if sc.esc[c as usize] && relax_backend::stats::opt_env_off("-fwdesc") {
                 continue;
             }
-            if sc.esc[c as usize] {
+            // C "escapes" only through address arithmetic slot_scan does not follow (a variable
+            // index: `simd_body.v.x.get(lane)` in a loop) and never leaks to memory, a call or a
+            // return: no other pointer can see it, only the derived addresses (checked below)
+            let derived = if sc.esc[c as usize] { slot_derived(f, c) } else { None };
+            if sc.esc[c as usize] && derived.is_none() {
                 let pb = param_based.get_or_insert_with(|| param_based_vregs(f));
                 let unseen = f.blocks[cb].insts[first..ci].iter().all(|i| match i {
                     Inst::Load(_, _, base, _) | Inst::Store(_, base, _, _) | Inst::VLoad(_, base, _) | Inst::VStore(base, _, _) | Inst::LoadX(_, _, base, ..) | Inst::StoreX(_, base, ..) => sl(*base) != NONE || pb[base.0 as usize],
@@ -2678,7 +3320,11 @@ pub fn forward_slot_dests(f: &mut Func) -> bool {
                     let (s, so) = vs[v.0 as usize];
                     s == c && so + off < o + n as i64 && o < so + off + k
                 };
+                // an access through a derived address of unknown offset may touch any byte of C
+                let unknown = |v: VReg| derived.as_ref().map_or(false, |dv| dv[v.0 as usize] && vs[v.0 as usize].0 != c);
                 clash |= match i {
+                    Inst::Load(_, _, base, _) | Inst::Store(_, base, _, _) | Inst::VLoad(_, base, _) | Inst::VStore(base, _, _) | Inst::LoadX(_, _, base, ..) | Inst::StoreX(_, base, ..) | Inst::VLoadX(_, base, ..) | Inst::VStoreX(base, ..) if unknown(*base) => true,
+                    Inst::Copy(d, s2, _) if unknown(*d) || unknown(*s2) => true,
                     Inst::Load(m, _, base, off) | Inst::Store(m, base, off, _) => hit(*base, *off as i64, mem_size(*m) as i64),
                     Inst::VLoad(_, base, off) | Inst::VStore(base, off, _) => hit(*base, *off as i64, 16),
                     Inst::LoadX(_, _, base, ..) | Inst::StoreX(_, base, ..) => sl(*base) == c,
@@ -3193,6 +3839,7 @@ pub fn compact_slots(f: &mut Func) -> u64 {
             }
         }
     }
+    f.dbg_map_slots(&|s| map.get(s as usize).copied().filter(|x| *x != u32::MAX));
     freed
 }
 
@@ -3232,7 +3879,7 @@ fn slot_derivation(f: &Func) -> Option<(Vec<u32>, Vec<bool>)> {
             for i in &b.insts {
                 let src = match i {
                     Inst::SlotAddr(_, s) => *s,
-                    Inst::Load(..) | Inst::LoadX(..) | Inst::VLoad(..) | Inst::AtomicLoad(..) | Inst::Iconst(..) | Inst::Fconst(..) | Inst::Addr(..) | Inst::FnAddr(..) | Inst::TlsAddr(..) | Inst::VConst(..) => NONE,
+                    Inst::Load(..) | Inst::LoadX(..) | Inst::VLoad(..) | Inst::AtomicLoad(..) | Inst::Iconst(..) | Inst::Fconst(..) | Inst::Addr(..) | Inst::FnAddr(..) | Inst::TlsAddr(..) | Inst::TlsStatic(..) | Inst::VConst(..) => NONE,
                     // stores, copies: no result (their operands are not joined)
                     _ => {
                         let mut has_def = false;
@@ -4923,25 +5570,93 @@ mod inline_priority_tests {
         f.verify().unwrap();
     }
 
+    /// `caller` with both calls in its loop (bottom-up bodies serve sites in loops)
+    fn caller_in_loop() -> Func {
+        let mut f = caller();
+        f.blocks[0].insts.clear();
+        f.blocks[0].pos.clear();
+        f.blocks[1].insts = vec![Inst::Call(Callee::Fn(1), vec![], vec![]), Inst::Call(Callee::Fn(2), vec![], vec![])];
+        f.blocks[1].pos = vec![0, 0];
+        f
+    }
+
     #[test]
     fn priced_body_decides_and_inlined_body_moves() {
         // bottom-up O3: the optimised body prices the site, the inlined-only body is inlined
         let options = &relax_session::Options::default();
         let (raw, opt) = (callee(400), callee(30));
         let get = |_: u32| Some((&raw as *const Func, 0));
-        let mut f = caller();
+        let mut f = caller_in_loop();
         let n = inline_inst_count(&f);
         assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some((&raw as *const Func, &opt as *const Func)), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).len(), 2);
         assert!(inline_inst_count(&f) > n + 2 * 390);
         f.verify().unwrap();
-        // refused bottom-up (priced too big), the snapshot body decides: here too big as well
+        // outside a loop the snapshot body decides (here: too big), inside one the bottom-up body
         let mut f = caller();
+        assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some((&raw as *const Func, &opt as *const Func)), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None), vec![(2, RULE_SMALL_LEAF)]);
+        // refused bottom-up (priced too big), the snapshot body decides: here too big as well
+        let mut f = caller_in_loop();
         assert!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some((&opt as *const Func, &raw as *const Func)), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).is_empty());
         // ... and here small enough: the snapshot body moves
         let get = |_: u32| Some((&opt as *const Func, 0));
-        let mut f = caller();
+        let mut f = caller_in_loop();
         assert_eq!(inline_calls_ordered(options, &mut f, 0, &get, &|_| Some((&raw as *const Func, &raw as *const Func)), &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).len(), 2);
         assert!(inline_inst_count(&f) < n + 2 * 40);
+    }
+
+    /// `fn(len) { let mut i = 0; while i + 16 <= len { <work>; i += 16 } if len - i >= 8 { <tail> } }`
+    fn counted_loop(work: usize) -> Func {
+        let mut f = Func::new("counted".into(), 0);
+        let len = f.vreg(Cls::I);
+        f.params.push(len);
+        let (i, t, c, r, c8, x) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        for _ in 0..6 { f.block(); }
+        let it = IntTy { bits: 64, signed: false };
+        let mut set = |b: usize, insts: Vec<Inst>, term: Term| { f.blocks[b].pos = vec![0; insts.len()]; f.blocks[b].insts = insts; f.blocks[b].term = term; };
+        set(0, vec![Inst::Iconst(i, 0)], Term::Jump(1));
+        set(1, vec![Inst::IBinI(IOp::Add, it, t, i, 16), Inst::ICmp(Cond::Le, false, c, t, len)], Term::Branch(c, 2, 3));
+        let mut body: Vec<Inst> = (0..work).map(|_| Inst::IBin(IOp::Mul, it, x, x, len)).collect();
+        body.push(Inst::IBinI(IOp::Add, it, i, i, 16));
+        set(2, body, Term::Jump(1));
+        set(3, vec![Inst::IBin(IOp::Sub, it, r, len, i), Inst::ICmpI(Cond::Ge, false, c8, r, 8)], Term::Branch(c8, 4, 5));
+        let tail: Vec<Inst> = (0..work).map(|_| Inst::IBin(IOp::Xor, it, x, x, r)).collect();
+        set(4, tail, Term::Ret(vec![]));
+        set(5, vec![], Term::Ret(vec![]));
+        f
+    }
+
+    #[test]
+    fn constant_arguments_price_in_context() {
+        let f = counted_loop(200);
+        // len = 4: the loop and the 8-byte tail are dead
+        let g = specialize_for_args(&f, &[Some(4)]).unwrap();
+        g.verify().unwrap();
+        assert!(inline_inst_count(&g) < 4, "{}", g.dump());
+        // len = 8: the loop is dead, the tail runs
+        let g = specialize_for_args(&f, &[Some(8)]).unwrap();
+        assert!(inline_inst_count(&g) >= 200 && inline_inst_count(&g) < 206, "{}", g.dump());
+        // len = 40: the loop runs, nothing decided (i is not a constant there)
+        assert!(specialize_for_args(&f, &[Some(40)]).map_or(true, |g| inline_inst_count(&g) > 400));
+        assert!(specialize_for_args(&f, &[None]).is_none());
+        // a site passing len = 4 inlines the 400-instruction body, one passing a variable keeps the call
+        let options = &relax_session::Options::default();
+        let get = |_: u32| Some((&f as *const Func, 0));
+        let site = |arg: Option<i64>| {
+            let mut c = Func::new("caller".into(), 0);
+            let a = c.vreg(Cls::I);
+            c.block();
+            c.blocks[0].insts = match arg { Some(k) => vec![Inst::Iconst(a, k)], None => vec![] };
+            if arg.is_none() { c.params.push(a); }
+            c.blocks[0].insts.push(Inst::Call(Callee::Fn(1), vec![a], vec![]));
+            c.blocks[0].pos = vec![0; c.blocks[0].insts.len()];
+            c.blocks[0].term = Term::Ret(vec![]);
+            c
+        };
+        let mut c = site(Some(4));
+        assert_eq!(inline_calls_ordered(options, &mut c, 0, &get, &|_| None, &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).len(), 1);
+        c.verify().unwrap();
+        let mut c = site(None);
+        assert!(inline_calls_ordered(options, &mut c, 0, &get, &|_| None, &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).is_empty());
     }
 
     #[test]
@@ -5081,7 +5796,7 @@ mod inline_priority_tests {
         let mut f = callee(0);
         f.blocks[0].insts = vec![Inst::Call(Callee::Fn(1), vec![], vec![]); 200];
         f.blocks[0].pos = vec![0; 200];
-        let mut lim = InlineLimits::tier1_for(&f);
+        let mut lim = InlineLimits::tier1_for(&f, true);
         lim.growth_limit = Some(4200);
         let mut stats = InlineStats::default();
         let inlined = inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &lim, None, Some(&mut stats));
@@ -5100,7 +5815,7 @@ mod inline_priority_tests {
         let free = callee(INLINE_FREE_INSTS);
         let get = |id: u32| Some((if id == 3 { &free } else { &paid } as *const Func, 0));
         let mut f = caller();
-        let lim = InlineLimits::tier1_for(&f);
+        let lim = InlineLimits::tier1_for(&f, true);
         assert_eq!(lim.growth_limit, Some(8002));
         // Model growth from the first round; the original ceiling must still apply.
         let v = f.vreg(Cls::I);
@@ -5118,10 +5833,10 @@ mod inline_priority_tests {
 
     #[test]
     fn budget_does_not_scale_with_caller() {
-        assert_eq!(InlineLimits::tier1_for(&callee(100)).budget, 4000);
-        assert_eq!(InlineLimits::tier1_for(&callee(16000)).budget, 4000);
-        assert_eq!(InlineLimits::tier1_for(&callee(30000)).budget, 4000);
-        assert_eq!(InlineLimits::tier1_for(&callee(16000)).growth_limit, Some(64000));
+        assert_eq!(InlineLimits::tier1_for(&callee(100), true).budget, 4000);
+        assert_eq!(InlineLimits::tier1_for(&callee(16000), true).budget, 4000);
+        assert_eq!(InlineLimits::tier1_for(&callee(30000), true).budget, 4000);
+        assert_eq!(InlineLimits::tier1_for(&callee(16000), true).growth_limit, Some(64000));
     }
 
     #[test]
@@ -5908,6 +6623,243 @@ pub fn promote_dyn_read_slots(f: &mut Func) -> bool {
     true
 }
 
+/// The mask idiom of bit readers, `x & ((1 << n) - 1)` (and `x & !(-1 << n)`) on 64-bit values,
+/// becomes `x bzhi n` (IOp::Bzhi) when the shift and the mask are read only there: x64 BMI2 `and`
+/// of the count + `bzhi` (was `mov 1; shlx; sub; and`, a three-deep chain), arm64 `movn; lslv;
+/// bic`. The shift and subtraction are left for DCE. The count must hold the same value at the
+/// mask as at the shift: one definition, or none between them in their block. Only where the
+/// target has the short form (x64 without BMI2 would expand it again). Returns whether anything
+/// changed.
+pub fn form_bzhi(options: &relax_session::Options, f: &mut Func) -> bool {
+    if opt_off(options, "-bzhi") || !(cfg!(target_arch = "aarch64") || options.cpu.bmi2) {
+        return false;
+    }
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    let mut nuse = vec![0u32; nv];
+    let mut def_at = vec![(u32::MAX, 0u32); nv];
+    // the constant every definition of a vreg assigns (a constant materialised on several paths)
+    let mut kval: Vec<Option<Option<i64>>> = vec![None; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+        kval[p.0 as usize] = Some(None);
+    }
+    let mut tu = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            let c = if let Inst::Iconst(_, c) = *i { Some(c) } else { None };
+            for_defs(i, |d| {
+                ndef[d.0 as usize] += 1;
+                def_at[d.0 as usize] = (bi as u32, k as u32);
+                let e = &mut kval[d.0 as usize];
+                *e = Some(match (*e, c) {
+                    (None, c) => c,
+                    (Some(Some(x)), Some(y)) if x == y => Some(x),
+                    _ => None,
+                });
+            });
+            for_uses(i, |u| nuse[u.0 as usize] += 1);
+        }
+        term_uses(&b.term, &mut tu);
+        for u in &tu {
+            nuse[u.0 as usize] += 1;
+        }
+    }
+    let single = |v: VReg| ndef[v.0 as usize] == 1 && def_at[v.0 as usize].0 != u32::MAX;
+    let def = |f: &Func, v: VReg| -> Inst { let (b, k) = def_at[v.0 as usize]; f.blocks[b as usize].insts[k as usize].clone() };
+    let konst = |_: &Func, v: VReg, want: i64| kval[v.0 as usize] == Some(Some(want));
+    // (shift's block, index, count) of `m` when it is the low-n-bits mask of a count n
+    let mask = |f: &Func, m: VReg| -> Option<(u32, u32, VReg)> {
+        if !single(m) || nuse[m.0 as usize] != 1 {
+            return None;
+        }
+        let (s, ones) = match def(f, m) {
+            Inst::IBinI(IOp::Sub, it, _, s, 1) if it.bits == 64 => (s, 1),
+            Inst::IBinI(IOp::Add, it, _, s, -1) if it.bits == 64 => (s, 1),
+            Inst::IBinI(IOp::Xor, it, _, s, -1) if it.bits == 64 => (s, -1),
+            _ => return None,
+        };
+        if !single(s) || nuse[s.0 as usize] != 1 {
+            return None;
+        }
+        match def(f, s) {
+            Inst::IBin(IOp::Shl, it, _, one, n) if it.bits == 64 && konst(f, one, ones) => {
+                let (b, k) = def_at[s.0 as usize];
+                Some((b, k, n))
+            }
+            _ => None,
+        }
+    };
+    let mut edits = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            let Inst::IBin(IOp::And, it, d, p, q) = *i else { continue };
+            if it.bits != 64 {
+                continue;
+            }
+            for (x, m) in [(p, q), (q, p)] {
+                let Some((sb, sk, n)) = mask(f, m) else { continue };
+                // n unchanged from the shift to here
+                let same = if single(n) || f.params.contains(&n) && ndef[n.0 as usize] == 1 {
+                    true
+                } else if sb as usize == bi && (sk as usize) < k {
+                    !b.insts[sk as usize + 1..k].iter().any(|j| {
+                        let mut w = false;
+                        for_defs(j, |v| w |= v == n);
+                        w
+                    })
+                } else {
+                    false
+                };
+                if same && x != m {
+                    edits.push((bi, k, Inst::IBin(IOp::Bzhi, U64, d, x, n)));
+                    break;
+                }
+            }
+        }
+    }
+    let changed = !edits.is_empty();
+    for (bi, k, i) in edits {
+        f.blocks[bi].insts[k] = i;
+    }
+    changed
+}
+
+/// The few values an integer vreg can hold where it is read, when its definitions make them a
+/// small set: constants, compare outcomes (0 / 1, or what the operands' sets give), selects of such
+/// values, and unary maps of them (integer conversions, operations with a constant). A vreg with
+/// several definitions (RIR is not SSA: a constant per path, `Iconst(v, 0)` in two blocks) holds
+/// one of their values. At most four values, eight definitions deep. `defs[v]` is empty for a
+/// parameter (unknown).
+fn small_set(f: &Func, defs: &[Vec<(u32, u32)>], v: VReg, depth: u32, out: &mut Vec<i64>, budget: &mut u32) -> bool {
+    if depth == 0 || defs[v.0 as usize].is_empty() || *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    defs[v.0 as usize].iter().all(|&(bi, k)| small_set_def(f, defs, &f.blocks[bi as usize].insts[k as usize], depth, out, budget))
+}
+
+fn small_set_def(f: &Func, defs: &[Vec<(u32, u32)>], i: &Inst, depth: u32, out: &mut Vec<i64>, budget: &mut u32) -> bool {
+    let push = |out: &mut Vec<i64>, x: i64| -> bool {
+        if !out.contains(&x) {
+            if out.len() == 4 {
+                return false;
+            }
+            out.push(x);
+        }
+        true
+    };
+    match *i {
+        Inst::Iconst(_, c) => push(out, c),
+        // a compare of small sets: its outcomes; else either
+        Inst::ICmpI(cc, sg, _, x, c) => {
+            let mut xs = Vec::new();
+            if small_set(f, defs, x, depth - 1, &mut xs, budget) {
+                xs.into_iter().all(|a| push(out, cmp_i(cc, sg, a, c) as i64))
+            } else {
+                push(out, 0) && push(out, 1)
+            }
+        }
+        Inst::ICmp(cc, sg, _, x, y) => {
+            let (mut xs, mut ys) = (Vec::new(), Vec::new());
+            if small_set(f, defs, x, depth - 1, &mut xs, budget) && small_set(f, defs, y, depth - 1, &mut ys, budget) {
+                xs.iter().all(|&a| ys.iter().all(|&b| push(out, cmp_i(cc, sg, a, b) as i64)))
+            } else {
+                push(out, 0) && push(out, 1)
+            }
+        }
+        Inst::FCmp(..) => push(out, 0) && push(out, 1),
+        Inst::Mov(_, a) => small_set(f, defs, a, depth - 1, out, budget),
+        Inst::Sel(_, _, a, b) => small_set(f, defs, a, depth - 1, out, budget) && small_set(f, defs, b, depth - 1, out, budget),
+        Inst::Conv(Conv::IntToInt(it), _, a) => {
+            let mut xs = Vec::new();
+            small_set(f, defs, a, depth - 1, &mut xs, budget) && xs.into_iter().all(|x| push(out, extend_const(x, it)))
+        }
+        Inst::IBinI(op, it, _, a, c) if !matches!(op, IOp::Div | IOp::Rem) => {
+            let mut xs = Vec::new();
+            small_set(f, defs, a, depth - 1, &mut xs, budget) && xs.into_iter().all(|x| fold_ibin(op, it, x, c).map_or(false, |y| push(out, y)))
+        }
+        _ => false,
+    }
+}
+
+/// Compares and selects decided by the small value sets of their operands (LLVM's fold of a
+/// compare of a select of constants, InstCombine `foldCmpLoadFromIndexedGlobal`'s set form):
+/// tuple `lt` compares fields through `Ordering` as an i8 (`lt ? -1 : (eq ^ 1)`) and tests the
+/// sign-extended byte against `ControlFlow`'s niche (254), which no value of the set is: the
+/// branch is always taken. A compare all of whose operand values give one outcome becomes that
+/// constant; a select on a condition with one possible value becomes a copy. Returns whether
+/// anything changed (simplify then folds the branches).
+pub fn fold_small_sets(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    let mut defs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nv];
+    let mut param = vec![false; nv];
+    for p in &f.params {
+        param[p.0 as usize] = true;
+    }
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            for_defs(i, |d| {
+                if !param[d.0 as usize] {
+                    defs[d.0 as usize].push((bi as u32, k as u32));
+                }
+            });
+        }
+    }
+    // a parameter (also when redefined) has values no definition shows
+    for v in 0..nv {
+        if param[v] {
+            defs[v].clear();
+        }
+    }
+    let mut edits: Vec<(usize, usize, Inst)> = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            let (d, cc, sg, x, y) = match *i {
+                Inst::ICmpI(cc, sg, d, x, c) => (d, cc, sg, x, Err(c)),
+                Inst::ICmp(cc, sg, d, x, y) => (d, cc, sg, x, Ok(y)),
+                Inst::Sel(d, c, a, b2) => {
+                    let mut cs = Vec::new();
+                    if small_set(f, &defs, c, 8, &mut cs, &mut 64) && !cs.is_empty() {
+                        let t = cs.iter().all(|&x| x != 0);
+                        if t || cs.iter().all(|&x| x == 0) {
+                            edits.push((bi, k, Inst::Mov(d, if t { a } else { b2 })));
+                        }
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            let mut xs = Vec::new();
+            if !small_set(f, &defs, x, 8, &mut xs, &mut 64) || xs.is_empty() {
+                continue;
+            }
+            let ys = match y {
+                Err(c) => vec![c],
+                Ok(y) => {
+                    let mut ys = Vec::new();
+                    if !small_set(f, &defs, y, 8, &mut ys, &mut 64) || ys.is_empty() {
+                        continue;
+                    }
+                    ys
+                }
+            };
+            let r0 = cmp_i(cc, sg, xs[0], ys[0]);
+            if xs.iter().all(|&a| ys.iter().all(|&b| cmp_i(cc, sg, a, b) == r0)) {
+                // a single-value pair is a constant compare simplify folds itself
+                if xs.len() > 1 || ys.len() > 1 {
+                    edits.push((bi, k, Inst::Iconst(d, r0 as i64)));
+                }
+            }
+        }
+    }
+    let changed = !edits.is_empty();
+    for (bi, k, i) in edits {
+        f.blocks[bi].insts[k] = i;
+    }
+    changed
+}
+
 /// Bit-tracking dead code for masks and casts (LLVM's BDCE): per integer vreg, the bits any of
 /// its uses reads (a fixed point over every use, so multi-definition variables -- a bit
 /// reader's `bitsleft`, read only as `bitsleft as u8` and `(bitsleft >> 3) & 7` -- are covered);
@@ -6476,6 +7428,261 @@ pub fn dead_slot_stores(f: &mut Func) -> bool {
         }
     }
     true
+}
+
+/// Slot coalescing along whole copies (O3): `Copy(C <- B)` of one slot's bytes into an equal slot
+/// joins B and C into one slot when they do not interfere -- at every write of B the written bytes of
+/// C are dead, and at every write of C those of B are, by backward byte liveness over the CFG (the
+/// copy itself writes C with B's bytes and is exempt). The copy then vanishes. LLVM's SROA and
+/// stack colouring reach this through SSA values; here the slots meet directly, also around
+/// loops, where the block-reachability tests of forward_slot_dests_x always see an access
+/// "after" the copy. pulldown-cmark's parse loop moved each 80-byte `Item` through three slots
+/// (call result -> peek slot -> current slot -> match scrutinee) on every item.
+/// A slot handed to calls only as the result buffer of an sret callee counts as fully written there
+/// (the callee writes the value; bytes it leaves are padding or an inactive variant's, which Rust
+/// leaves undefined). Returns whether any copy went.
+pub fn coalesce_slot_copies(f: &mut Func) -> bool {
+    const NONE: u32 = u32::MAX;
+    let mut any = false;
+    for _round in 0..8 {
+        let ns = f.slots.len();
+        if ns < 2 {
+            return any;
+        }
+        let sc = slot_scan(f);
+        let vs = &sc.vs;
+        let sl = |v: VReg| vs[v.0 as usize].0;
+        // a result buffer written by one sret call and accessed otherwise only by loads, stores and
+        // copies: tracked, with the call as a whole write
+        let mut sret_call: Vec<Option<(usize, usize)>> = vec![None; ns];
+        for s2 in 0..ns {
+            if let Some((bi, ii)) = sc.ret_call[s2] {
+                if bi == usize::MAX {
+                    continue;
+                }
+                if let Inst::Call(Callee::Fn(id), args, _) = &f.blocks[bi].insts[ii] {
+                    let ok = f.sret_callees.contains(id) && args.first().map_or(false, |a| vs[a.0 as usize] == (s2 as u32, 0)) && !args[1..].iter().any(|a| sl(*a) == s2 as u32);
+                    if ok {
+                        sret_call[s2] = Some((bi, ii));
+                    }
+                }
+            }
+        }
+        let tracked: Vec<bool> = (0..ns).map(|s2| f.slots[s2].size > 0 && (!sc.esc[s2] || sret_call[s2].is_some())).collect();
+        // candidate copies: whole equal-size slots, both tracked
+        let mut cands: Vec<(usize, usize, u32, u32)> = Vec::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for (ii, i) in b.insts.iter().enumerate() {
+                if let Inst::Copy(d, s2, n) = *i {
+                    let (cs, bs) = (sl(d), sl(s2));
+                    if cs != NONE && bs != NONE && cs != bs && vs[d.0 as usize].1 == 0 && vs[s2.0 as usize].1 == 0 && tracked[cs as usize] && tracked[bs as usize] {
+                        let (zc, zb) = (f.slots[cs as usize].size, f.slots[bs as usize].size);
+                        if n == zc && n == zb {
+                            cands.push((bi, ii, bs, cs));
+                        }
+                    }
+                }
+            }
+        }
+        if cands.is_empty() {
+            return any;
+        }
+        // byte liveness of the tracked slots (bits of up to 256 per slot, as dead_slot_stores)
+        let mut base = vec![NONE; ns];
+        let mut gran = vec![1i64; ns];
+        let mut nbits = vec![0i64; ns];
+        let mut tot = 0usize;
+        for s2 in 0..ns {
+            if !tracked[s2] {
+                continue;
+            }
+            let size = f.slots[s2].size as i64;
+            let g = (size + 255) / 256;
+            base[s2] = tot as u32;
+            gran[s2] = g;
+            nbits[s2] = (size + g - 1) / g;
+            tot += nbits[s2] as usize;
+        }
+        let w = (tot + 63) / 64;
+        // (slot, lo, hi) read / written by an instruction; hi = i64::MAX: anywhere in the slot
+        let acc = |i: &Inst, bi: usize, ii: usize| -> (Option<(u32, i64, i64)>, Option<(u32, i64, i64)>) {
+            let at = |v: VReg| vs[v.0 as usize].1;
+            let tr = |v: VReg| sl(v) != NONE && tracked[sl(v) as usize];
+            let vw = |v: VReg| if f.vregs[v.0 as usize] == Cls::V256 { 32 } else { 16 };
+            match *i {
+                Inst::Load(m, _, b, o) if tr(b) => (Some((sl(b), at(b) + o as i64, at(b) + o as i64 + mem_size(m) as i64)), None),
+                Inst::VLoad(d, b, o) if tr(b) => (Some((sl(b), at(b) + o as i64, at(b) + o as i64 + vw(d))), None),
+                Inst::LoadX(_, _, b, ..) | Inst::VLoadX(_, b, ..) if tr(b) => (Some((sl(b), 0, i64::MAX)), None),
+                Inst::Store(m, b, o, _) if tr(b) => (None, Some((sl(b), at(b) + o as i64, at(b) + o as i64 + mem_size(m) as i64))),
+                Inst::VStore(b, o, v) if tr(b) => (None, Some((sl(b), at(b) + o as i64, at(b) + o as i64 + vw(v)))),
+                Inst::StoreX(_, b, ..) | Inst::VStoreX(b, ..) if tr(b) => (None, Some((sl(b), 0, i64::MAX))),
+                Inst::Copy(d, s2, n) => (
+                    if tr(s2) { Some((sl(s2), at(s2), at(s2) + n as i64)) } else { None },
+                    if tr(d) { Some((sl(d), at(d), at(d) + n as i64)) } else { None },
+                ),
+                Inst::Call(..) => {
+                    let mut wr = None;
+                    for s2 in 0..ns {
+                        if sret_call[s2] == Some((bi, ii)) {
+                            wr = Some((s2 as u32, 0, f.slots[s2].size as i64));
+                        }
+                    }
+                    (None, wr)
+                }
+                _ => (None, None),
+            }
+        };
+        // a byte range as bits: (overlapping, fully covered); None: unknown offset (whole slot)
+        let bits = |s2: u32, lo: i64, hi: i64| -> Option<((usize, usize), (usize, usize))> {
+            let s2 = s2 as usize;
+            let (b0, g, n) = (base[s2] as i64, gran[s2], nbits[s2]);
+            if hi == i64::MAX || lo < 0 || hi > f.slots[s2].size as i64 || lo >= hi {
+                return None;
+            }
+            let over = ((b0 + lo / g) as usize, (b0 + (hi + g - 1) / g).min(b0 + n) as usize);
+            let full_hi = if hi == f.slots[s2].size as i64 { n } else { hi / g };
+            let cov = ((b0 + (lo + g - 1) / g) as usize, (b0 + full_hi) as usize);
+            Some((over, if cov.0 < cov.1 { cov } else { (0, 0) }))
+        };
+        let whole = |s2: u32| (base[s2 as usize] as usize, (base[s2 as usize] as i64 + nbits[s2 as usize]) as usize);
+        fn setb(s: &mut [u64], a: usize, b: usize) {
+            for i in a..b {
+                s[i / 64] |= 1 << (i % 64);
+            }
+        }
+        fn clrb(s: &mut [u64], a: usize, b: usize) {
+            for i in a..b {
+                s[i / 64] &= !(1 << (i % 64));
+            }
+        }
+        fn anyb(s: &[u64], a: usize, b: usize) -> bool {
+            (a..b).any(|i| s[i / 64] >> (i % 64) & 1 != 0)
+        }
+        let xfer = |live: &mut [u64], rd: Option<(u32, i64, i64)>, wr: Option<(u32, i64, i64)>| {
+            if let Some((s2, lo, hi)) = wr {
+                if let Some((_, cov)) = bits(s2, lo, hi) {
+                    clrb(live, cov.0, cov.1);
+                }
+            }
+            if let Some((s2, lo, hi)) = rd {
+                match bits(s2, lo, hi) {
+                    Some((over, _)) => setb(live, over.0, over.1),
+                    None => {
+                        let (x, y) = whole(s2);
+                        setb(live, x, y);
+                    }
+                }
+            }
+        };
+        let nb = f.blocks.len();
+        let reach = reachable(f);
+        let mut order = relax_backend::frame::block_rpo(f);
+        order.reverse();
+        let mut live_in = vec![0u64; nb * w];
+        let mut cur = vec![0u64; w];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in &order {
+                let bi = b as usize;
+                if !reach[bi] {
+                    continue;
+                }
+                cur.iter_mut().for_each(|x| *x = 0);
+                for t in f.blocks[bi].term.succs() {
+                    for j in 0..w {
+                        cur[j] |= live_in[t as usize * w + j];
+                    }
+                }
+                for (ii, i) in f.blocks[bi].insts.iter().enumerate().rev() {
+                    let (rd, wr) = acc(i, bi, ii);
+                    xfer(&mut cur, rd, wr);
+                }
+                if live_in[bi * w..bi * w + w] != cur[..] {
+                    live_in[bi * w..bi * w + w].copy_from_slice(&cur);
+                    changed = true;
+                }
+            }
+        }
+        // per candidate: interference found
+        let mut bad = vec![false; cands.len()];
+        // slot -> candidates it is in
+        let mut of_slot: Vec<Vec<usize>> = vec![Vec::new(); ns];
+        for (k, &(_, _, bs, cs)) in cands.iter().enumerate() {
+            of_slot[bs as usize].push(k);
+            of_slot[cs as usize].push(k);
+        }
+        for bi in 0..nb {
+            if !reach[bi] {
+                continue;
+            }
+            cur.iter_mut().for_each(|x| *x = 0);
+            for t in f.blocks[bi].term.succs() {
+                for j in 0..w {
+                    cur[j] |= live_in[t as usize * w + j];
+                }
+            }
+            for ii in (0..f.blocks[bi].insts.len()).rev() {
+                let (rd, wr) = acc(&f.blocks[bi].insts[ii], bi, ii);
+                // `cur` is live after this instruction: a write of one candidate slot needs the
+                // partner's same bytes dead here
+                if let Some((s2, lo, hi)) = wr {
+                    for &k in &of_slot[s2 as usize] {
+                        let (cb, ci, bs, cs) = cands[k];
+                        if (cb, ci) == (bi, ii) || bad[k] {
+                            continue;
+                        }
+                        let other = if s2 == bs { cs } else { bs };
+                        let hit = match bits(other, lo, hi) {
+                            Some((over, _)) => anyb(&cur, over.0, over.1),
+                            None => {
+                                let (x, y) = whole(other);
+                                anyb(&cur, x, y)
+                            }
+                        };
+                        if hit {
+                            bad[k] = true;
+                        }
+                    }
+                }
+                xfer(&mut cur, rd, wr);
+            }
+        }
+        // join the first good candidate per slot pair (slots may sit in several candidates)
+        let mut used = vec![false; ns];
+        let mut to: Vec<u32> = (0..ns as u32).collect();
+        let mut dels: Vec<(usize, usize)> = Vec::new();
+        for (k, &(cb, ci, bs, cs)) in cands.iter().enumerate() {
+            if bad[k] || used[bs as usize] || used[cs as usize] {
+                continue;
+            }
+            used[bs as usize] = true;
+            used[cs as usize] = true;
+            to[bs as usize] = cs;
+            let al = f.slots[bs as usize].align.max(f.slots[cs as usize].align);
+            f.slots[cs as usize].align = al;
+            dels.push((cb, ci));
+        }
+        if dels.is_empty() {
+            return any;
+        }
+        dels.sort_unstable_by(|x, y| y.cmp(x));
+        for (cb, ci) in dels {
+            f.blocks[cb].insts.remove(ci);
+            if ci < f.blocks[cb].pos.len() {
+                f.blocks[cb].pos.remove(ci);
+            }
+        }
+        for b in f.blocks.iter_mut() {
+            for i in b.insts.iter_mut() {
+                if let Inst::SlotAddr(_, s2) = i {
+                    *s2 = to[*s2 as usize];
+                }
+            }
+        }
+        any = true;
+    }
+    any
 }
 
 #[cfg(test)]

@@ -15,7 +15,22 @@ pub enum Borrowck { Off, Moves, Full }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BorrowckAll { Default, Nongeneric, Std, All }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CheckTarget { Host, MacosArm64, LinuxX64, WindowsX64, AndroidArm64, Web }
+pub enum CheckTarget { Host, MacosArm64, LinuxX64, WindowsX64, AndroidArm64, Web(PtrWidth) }
+/// The web target's pointer width, a parameter of the target (`wasm32-unknown-unknown` /
+/// `wasm64-unknown-unknown`): usize, isize and pointers are 4 or 8 bytes, every layout is rustc's
+/// for that triple, and the trace host runs the program in that mode (32: pointers are offsets into
+/// the linear memory's window; 64: native pointers inside it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PtrWidth { W32, W64 }
+impl PtrWidth {
+    /// size_of::<usize>() (and of a thin pointer)
+    pub fn bytes(self) -> u32 {
+        match self {
+            PtrWidth::W32 => 4,
+            PtrWidth::W64 => 8,
+        }
+    }
+}
 impl CheckTarget {
     /// The targets Relax runs on (and checks for), by triple: `MAKEPAD_RUN_CHECK_TARGET` and `makepad host-gen`.
     pub const TRIPLES: [(&'static str, CheckTarget); 4] = [
@@ -24,14 +39,25 @@ impl CheckTarget {
         ("x86_64-pc-windows-gnu", CheckTarget::WindowsX64),
         ("aarch64-linux-android", CheckTarget::AndroidArm64),
     ];
-    /// The web target (`wasm32-unknown-unknown`): the program's crates are read as a web build
-    /// reads them (cfg(target_arch = "wasm32"), the web platform backend) and run by this
-    /// machine's JIT; std stays the machine's (the trace host, `makepad-web-trace`). Not a
-    /// host-gen target.
-    pub const WEB_TRIPLE: &'static str = "wasm32-unknown-unknown";
+    /// The web targets, by pointer width: the program's crates are read as a web build reads
+    /// them (cfg(target_family = "wasm"), the web platform backend), every layout is rustc's for
+    /// the triple, and this machine's JIT runs them in the trace host (`makepad-web-trace`). Not
+    /// host-gen targets.
+    pub const WEB_TRIPLES: [(&'static str, PtrWidth); 2] = [("wasm32-unknown-unknown", PtrWidth::W32), ("wasm64-unknown-unknown", PtrWidth::W64)];
+    /// The web target's pointer width, None for the native targets.
+    pub fn web(self) -> Option<PtrWidth> {
+        match self {
+            CheckTarget::Web(w) => Some(w),
+            _ => None,
+        }
+    }
+    /// The triple of a web target.
+    pub fn web_triple(w: PtrWidth) -> &'static str {
+        Self::WEB_TRIPLES.iter().find(|(_, x)| *x == w).unwrap().0
+    }
     pub fn from_triple(triple: &str) -> Option<CheckTarget> {
-        if triple == Self::WEB_TRIPLE {
-            return Some(CheckTarget::Web);
+        if let Some((_, w)) = Self::WEB_TRIPLES.iter().find(|(t, _)| *t == triple) {
+            return Some(CheckTarget::Web(*w));
         }
         Self::TRIPLES.iter().find(|(t, _)| *t == triple).map(|(_, c)| *c)
     }
@@ -84,6 +110,9 @@ pub struct CpuFeatures {
     pub fma: bool,
     /// AVX2 next to AVX: per-lane variable vector shifts (vpsllv*, vpsrlv*, vpsravd)
     pub avx2: bool,
+    /// AVX-512F + AVX-512VL (OS-enabled): EVEX encodings reach xmm16..xmm31, so the register
+    /// allocator gets 16 more float/vector registers (x64 reg_config)
+    pub avx512: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +135,8 @@ pub struct Options {
     pub memconst: bool,
     /// `MAKEPAD_RUN_NO_AVX`; default `false`.
     pub no_avx: bool,
+    /// `MAKEPAD_RUN_NO_AVX512`; default `false`: no xmm16..31 (CpuFeatures::avx512).
+    pub no_avx512: bool,
     /// `MAKEPAD_RUN_NO_BITOPS`; default `false`.
     pub no_bitops: bool,
     /// `MAKEPAD_RUN_NO_BLOCK_FREQ`; default `false`.
@@ -182,8 +213,6 @@ pub struct Options {
     pub sandbox_fuel: bool,
     /// `MAKEPAD_RUN_SPEC`; default `true`.
     pub spec: bool,
-    /// `MAKEPAD_RUN_SPEC_YIELD`; default `true`.
-    pub spec_yield: bool,
     /// `MAKEPAD_RUN_O3`; default `true`.
     pub tier1: bool,
     /// `MAKEPAD_RUN_TYCK_AHEAD`; default `true`.
@@ -268,6 +297,9 @@ pub struct Options {
     pub ra_prio: Priority,
     /// `MAKEPAD_RUN_RA_ORDER`; default `false`.
     pub ra_order: bool,
+    /// `MAKEPAD_RUN_RA_QUICK_COALESCE`; default `false`: the quick allocation round (no live-range
+    /// splitting) also coalesces copies. Compute kernels set it.
+    pub ra_quick_coalesce: bool,
     /// `MAKEPAD_RUN_SPEC_ORDER`; default `false`.
     pub spec_order: bool,
     /// `MAKEPAD_RUN_O3_PROFILE`; default `None`.
@@ -292,6 +324,7 @@ impl Default for Options {
             gather: false,
             memconst: false,
             no_avx: false,
+            no_avx512: false,
             no_bitops: false,
             no_block_freq: false,
             no_bmi2: false,
@@ -328,7 +361,6 @@ impl Default for Options {
             pre_derives: true,
             sandbox_fuel: true,
             spec: true,
-            spec_yield: true,
             tier1: true,
             tyck_ahead: true,
             unwind: true,
@@ -367,6 +399,7 @@ impl Default for Options {
             freq_mode: Frequency::Blend,
             ra_prio: Priority::References,
             ra_order: false,
+            ra_quick_coalesce: false,
             spec_order: false,
             tier1_profile: None,
             tier1_profile_data: None,
@@ -399,6 +432,7 @@ impl Options {
             gather: { let os = get("MAKEPAD_RUN_GATHER"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
             memconst: { let os = get("MAKEPAD_RUN_MEMCONST"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
             no_avx: { let os = get("MAKEPAD_RUN_NO_AVX"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
+            no_avx512: { let os = get("MAKEPAD_RUN_NO_AVX512"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
             no_bitops: { let os = get("MAKEPAD_RUN_NO_BITOPS"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
             no_block_freq: { let os = get("MAKEPAD_RUN_NO_BLOCK_FREQ"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
             no_bmi2: { let os = get("MAKEPAD_RUN_NO_BMI2"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
@@ -444,7 +478,6 @@ impl Options {
             pre_derives: { let os = get("MAKEPAD_RUN_PRE_DERIVES"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             sandbox_fuel: { let os = get("MAKEPAD_RUN_SANDBOX_FUEL"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             spec: { let os = get("MAKEPAD_RUN_SPEC"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
-            spec_yield: { let os = get("MAKEPAD_RUN_SPEC_YIELD"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             tier1: { let os = get("MAKEPAD_RUN_O3"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") && !get("MAKEPAD_RUN_NO_CODEGEN").is_some_and(|v| !v.is_empty() && v != "0") },
             tyck_ahead: { let os = get("MAKEPAD_RUN_TYCK_AHEAD"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             unwind: { let os = get("MAKEPAD_RUN_UNWIND"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
@@ -483,6 +516,7 @@ impl Options {
             freq_mode: { let os = get("MAKEPAD_RUN_FREQ_MODE"); let v = os.and_then(|v| v.into_string().ok()); match v.as_deref() { Some("sampled") => Frequency::Sampled, Some("static") => Frequency::Static, _ => Frequency::Blend } },
             ra_prio: { let os = get("MAKEPAD_RUN_RA_PRIO"); let v = os.and_then(|v| v.into_string().ok()); match v.as_deref() { Some("len") => Priority::Length, Some("sqrt") => Priority::Sqrt, _ => Priority::References } },
             ra_order: { let os = get("MAKEPAD_RUN_RA_ORDER"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() == Some("start") },
+            ra_quick_coalesce: { let os = get("MAKEPAD_RUN_RA_QUICK_COALESCE"); os.is_some() },
             spec_order: { let os = get("MAKEPAD_RUN_SPEC_ORDER"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() == Some("lifo") },
             tier1_profile: { let os = get("MAKEPAD_RUN_O3_PROFILE"); os },
             tier1_profile_data: None,
@@ -504,6 +538,7 @@ impl Options {
             gather,
             memconst,
             no_avx,
+            no_avx512,
             no_bitops,
             no_block_freq,
             no_bmi2,
@@ -540,7 +575,6 @@ impl Options {
             pre_derives,
             sandbox_fuel,
             spec,
-            spec_yield,
             tier1,
             tyck_ahead,
             unwind,
@@ -579,6 +613,7 @@ impl Options {
             freq_mode,
             ra_prio,
             ra_order,
+            ra_quick_coalesce,
             spec_order,
             tier1_profile,
             tier1_profile_data, cfgs, target, cpu,
@@ -595,6 +630,8 @@ impl Options {
         h.u8(*memconst as u8);
         h.str("no_avx");
         h.u8(*no_avx as u8);
+        h.str("no_avx512");
+        h.u8(*no_avx512 as u8);
         h.str("no_bitops");
         h.u8(*no_bitops as u8);
         h.str("no_block_freq");
@@ -667,8 +704,6 @@ impl Options {
         h.u8(*sandbox_fuel as u8);
         h.str("spec");
         h.u8(*spec as u8);
-        h.str("spec_yield");
-        h.u8(*spec_yield as u8);
         h.str("o3");
         h.u8(*tier1 as u8);
         h.str("tyck_ahead");
@@ -736,7 +771,15 @@ impl Options {
         h.str("borrowck_all");
         h.u8(*borrowck_all as u8);
         h.str("check_target");
-        h.u8(*check_target as u8);
+        h.u8(match *check_target {
+            CheckTarget::Host => 0,
+            CheckTarget::MacosArm64 => 1,
+            CheckTarget::LinuxX64 => 2,
+            CheckTarget::WindowsX64 => 3,
+            CheckTarget::AndroidArm64 => 4,
+            CheckTarget::Web(PtrWidth::W32) => 5,
+            CheckTarget::Web(PtrWidth::W64) => 6,
+        });
         h.str("ctfe");
         h.u8(*ctfe as u8);
         h.str("const_fuel");
@@ -747,14 +790,16 @@ impl Options {
         h.u8(*ra_prio as u8);
         h.str("ra_order");
         h.u8(*ra_order as u8);
+        h.str("ra_quick_coalesce");
+        h.u8(*ra_quick_coalesce as u8);
         h.str("spec_order");
         h.u8(*spec_order as u8);
         h.str("o3_profile");
         match tier1_profile { Some(v) => { h.u8(1); h.u64(v.as_encoded_bytes().len() as u64); h.write(v.as_encoded_bytes()); }, None => h.u8(0) }
         match tier1_profile_data { Some(v) => { h.u8(1); h.str(v); }, None => h.u8(0) }
         h.str(target);
-        let CpuFeatures { avx, bmi2, popcnt, lzcnt, bmi1, fma, avx2 } = cpu;
-        for b in [avx, bmi2, popcnt, lzcnt, bmi1, fma, avx2] { h.u8(*b as u8); }
+        let CpuFeatures { avx, bmi2, popcnt, lzcnt, bmi1, fma, avx2, avx512 } = cpu;
+        for b in [avx, bmi2, popcnt, lzcnt, bmi1, fma, avx2, avx512] { h.u8(*b as u8); }
         h.finish128()
     }
 }
@@ -789,8 +834,9 @@ pub struct RuntimeOptions {
     pub settle_drop: bool,
     /// `MAKEPAD_RUN_BURST_ARENA`; default `true`.
     pub burst_arena: bool,
-    /// `MAKEPAD_RUN_O3_ADAPTIVE`; default `false`.
-    pub tier1_adaptive: bool,
+    /// `MAKEPAD_RUN_O3_BURST` (`0`: off, for A/Bs); default `true`: after the first present, while the O3
+    /// queue is not trivial, more O3 workers run (every performance core but one) until it drains.
+    pub tier1_burst: bool,
     /// `MAKEPAD_RUN_MODULE_FUEL`; default `4_000_000_000`.
     pub module_fuel: i64,
     /// `MAKEPAD_RUN_MODULE_MEM_MB`; default `256`.
@@ -827,7 +873,7 @@ impl Default for RuntimeOptions {
             mem_trim: true,
             settle_drop: true,
             burst_arena: true,
-            tier1_adaptive: false,
+            tier1_burst: true,
             module_fuel: 4_000_000_000,
             module_mem_mb: 256,
             repeat: 1,
@@ -869,7 +915,7 @@ impl RuntimeOptions {
             mem_trim: { let os = get("MAKEPAD_RUN_MEM_TRIM"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             settle_drop: { let os = get("MAKEPAD_RUN_SETTLE_DROP"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             burst_arena: { let os = get("MAKEPAD_RUN_BURST_ARENA"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
-            tier1_adaptive: { let os = get("MAKEPAD_RUN_O3_ADAPTIVE"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() == Some("1") },
+            tier1_burst: { let os = get("MAKEPAD_RUN_O3_BURST"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             module_fuel: { let os = get("MAKEPAD_RUN_MODULE_FUEL"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(4_000_000_000) },
             module_mem_mb: { let os = get("MAKEPAD_RUN_MODULE_MEM_MB"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(256) },
             repeat: { let os = get("MAKEPAD_RUN_REPEAT"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(1) },

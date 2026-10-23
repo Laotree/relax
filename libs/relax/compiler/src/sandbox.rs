@@ -25,6 +25,8 @@
 //! aggregate results also use an arena slot (lower.rs), copied out before leaving: a twin's
 //! sret stores must never receive a host destination.
 
+include!("rt_abi.rs");
+
 use crate::jit::{self, FnKey, Unit};
 use crate::program::DefKind;
 use relax_backend::rir::{Callee, Cls, Cond, Conv, Func, IOp, Inst, Sym, Term, VReg, U32, U64};
@@ -182,7 +184,7 @@ unsafe fn sb_init(up: *mut Unit) -> Result<(), String> {
     let trap_slot = u.fn_id(FnKey::Sandbox(u32::MAX));
     let s0 = u.reserve_code(SPACE);
     let s1 = u.reserve_code(SPACE);
-    let trap = tgt::thunk(u.slots.table(trap_slot), ts as usize);
+    let trap = tgt::thunk(u.slots.table(trap_slot));
     let mut all = Vec::with_capacity(bytes);
     for _ in 0..SBT_N {
         all.extend_from_slice(&trap);
@@ -318,7 +320,7 @@ pub fn maybe_recycle(up: *mut Unit) {
 /// here): dead twins (unloaded modules, replaced versions) are left behind, and the space they
 /// were in is reused by the next recycle. Returns (twins moved, bytes now used).
 pub unsafe fn recycle(up: *mut Unit) -> Result<(usize, u64), String> {
-    crate::owner::call(crate::owner::Class::App, || recycle_locked(up))
+    crate::owner::call(crate::owner::Class::Program, || recycle_locked(up))
 }
 
 unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
@@ -376,6 +378,9 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
     for (t, at, code, map, info) in built {
         crate::os::mem::write_code(at, &code);
         u.index_code(at, code.len() as u32, t, info);
+        if jit::perf_map_on() {
+            jit::perf_map(at, code.len(), &format!("{} [sandbox]", jit::perf_name(u, t)));
+        }
         let f = &mut u.fns[t as usize];
         let old = (f.code, f.code_len, std::mem::take(&mut f.pc_map), f.patch_gen);
         crate::zone_alloc::kept_with(|| {
@@ -387,8 +392,8 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
         f.code_len = code.len() as u32;
         f.pc_map = crate::jit::PcMap::new(&map);
         f.version += 1;
-        let slot = u.slots.table(t) as *const std::sync::atomic::AtomicU64;
-        (*slot).store(at, std::sync::atomic::Ordering::SeqCst);
+        let slot = crate::jit::SlotWord::of(&u.slots, t);
+        slot.store(at, std::sync::atomic::Ordering::SeqCst);
         u.rearm_sandbox_counter(t, at);
     }
     for t in dead {
@@ -398,8 +403,8 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
         f.rir = None;
         f.version += 1;
         if let Some(h) = &mut f.history { h.prev.clear(); }
-        let slot = u.slots.table(t) as *const std::sync::atomic::AtomicU64;
-        (*slot).store(stub, std::sync::atomic::Ordering::SeqCst);
+        let slot = crate::jit::SlotWord::of(&u.slots, t);
+        slot.store(stub, std::sync::atomic::Ordering::SeqCst);
     }
     let used = next - tbase;
     let n = live.len();
@@ -430,7 +435,14 @@ pub fn is_sandboxed_slot(u: &Unit, id: u32) -> bool {
     }
     let g = SB.lock().unwrap_or_else(|e| e.into_inner());
     let Some(s) = g.as_ref() else { return false };
-    let k = match &u.fns[id as usize].key {
+    // a lowering ahead's temporary callee identity (descending from u32::MAX) names its key there
+    let ahead = crate::jit::lower_ahead_fn_key(id);
+    let key = match &ahead {
+        Some(k) => k,
+        None if (id as usize) < u.fns.len() => &u.fns[id as usize].key,
+        None => return false,
+    };
+    let k = match key {
         FnKey::Inst(d, _) => u.prog.def(*d).krate,
         FnKey::Closure(f, _, _) => match u.prog.file_crate.get(*f as usize) {
             Some(k) => *k,
@@ -490,7 +502,7 @@ pub unsafe fn twin(up: *mut Unit, base: u32) -> u32 {
     if k >= SBT_N {
         panic!("makepad: sandbox thunk table full ({} functions)", SBT_N);
     }
-    crate::os::mem::write_code(sbt + k as u64 * ts, &tgt::thunk(u.slots.table(t), ts as usize));
+    crate::os::mem::write_code(sbt + k as u64 * ts, &tgt::thunk(u.slots.table(t)));
     t
 }
 
@@ -636,15 +648,16 @@ pub(crate) fn initial_bytes(u: &Unit, sym: u32) -> Result<Vec<u8>, String> {
 /// known data object, static or thunk). Never inspect a running host static here.
 pub(crate) fn provenance_words(u: &Unit, b: &[u8]) -> Vec<(u32, Sym)> {
     let mut out = Vec::new();
+    let pw = u.ptr_bytes() as usize;
     let mut i = 0;
-    while i + 8 <= b.len() {
-        let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        if w > 0x10000 {
+    while i + pw <= b.len() {
+        let w = crate::syms::word_in(u, b, i);
+        if (if pw == 4 { w & 0xffff_ffff } else { w }) > 0x10000 {
             if let Some(s) = u.syms.symbol_at(w, u) {
                 out.push((i as u32, s));
             }
         }
-        i += 8;
+        i += pw;
     }
     out
 }
@@ -1159,7 +1172,24 @@ extern "C" fn sb_posix_memalign(out: u64, align: u64, size: u64) -> i32 {
     0
 }
 
+// Callee::Host entries (rt_policy, the Copy transform) are in Relax's convention; the same
+// operations as C functions (c_policy) are C: they differ on Windows (SysV vs Win64)
+rt_fn! {
+fn sb_rt_memcpy(d: u64, s: u64, n: u64) -> u64 {
+    memcpy_in(d, s, n)
+}
+}
+rt_fn! {
+fn sb_rt_memset(d: u64, c: u64, n: u64) -> u64 {
+    memset_in(d, c, n)
+}
+}
+
 extern "C" fn sb_memcpy(d: u64, s: u64, n: u64) -> u64 {
+    memcpy_in(d, s, n)
+}
+
+fn memcpy_in(d: u64, s: u64, n: u64) -> u64 {
     let (dm, sm) = (m(d), m(s));
     if n > 0 && fits(dm, n) && fits(sm, n) {
         unsafe { std::ptr::copy(sm as *const u8, dm as *mut u8, n as usize) };
@@ -1171,6 +1201,10 @@ extern "C" fn sb_memcpy(d: u64, s: u64, n: u64) -> u64 {
 }
 
 extern "C" fn sb_memset(d: u64, c: u64, n: u64) -> u64 {
+    memset_in(d, c, n)
+}
+
+fn memset_in(d: u64, c: u64, n: u64) -> u64 {
     let dm = m(d);
     if n > 0 && fits(dm, n) {
         unsafe { std::ptr::write_bytes(dm as *mut u8, c as u8, n as usize) };
@@ -1202,14 +1236,17 @@ extern "C" fn sb_strlen(p: u64) -> u64 {
     n
 }
 
-extern "C" fn sb_fmt_str(p: u64, len: u64, spec: u64) {
+rt_fn! {
+fn sb_fmt_str(p: u64, len: u64, spec: u64) {
     let pm = m(p);
     let len = if fits(pm, len) { len } else { 0 };
-    let f: extern "C" fn(u64, u64, u64) = unsafe { std::mem::transmute(jit::rt_entry("fmt_str") as usize) };
+    let f: rt_fn_ty!(fn(u64, u64, u64)) = unsafe { std::mem::transmute(jit::rt_entry("fmt_str") as usize) };
     f(pm, len, spec)
 }
+}
 
-extern "C" fn sb_str_eq(p1: u64, l1: u64, p2: u64, l2: u64) -> u64 {
+rt_fn! {
+fn sb_str_eq(p1: u64, l1: u64, p2: u64, l2: u64) -> u64 {
     let (a, b) = (m(p1), m(p2));
     if l1 != l2 || !fits(a, l1) || !fits(b, l2) {
         return 0;
@@ -1217,10 +1254,12 @@ extern "C" fn sb_str_eq(p1: u64, l1: u64, p2: u64, l2: u64) -> u64 {
     let (x, y) = unsafe { (std::slice::from_raw_parts(a as *const u8, l1 as usize), std::slice::from_raw_parts(b as *const u8, l2 as usize)) };
     (x == y) as u64
 }
+}
 
+rt_fn! {
 /// fmt_pop for a module: the text is copied into the window's scratch (larger text into its heap).
-extern "C" fn sb_fmt_pop() -> jit::StrRet {
-    let f: extern "C" fn() -> jit::StrRet = unsafe { std::mem::transmute(jit::rt_entry("fmt_pop") as usize) };
+fn sb_fmt_pop() -> jit::StrRet {
+    let f: rt_fn_ty!(fn() -> jit::StrRet) = unsafe { std::mem::transmute(jit::rt_entry("fmt_pop") as usize) };
     let r = f();
     let Some(a) = cur_arena() else { return r };
     let (p, n) = r.parts();
@@ -1231,15 +1270,18 @@ extern "C" fn sb_fmt_pop() -> jit::StrRet {
     unsafe { std::ptr::copy_nonoverlapping(p as *const u8, dst as *mut u8, n as usize) };
     jit::StrRet::new(dst, n)
 }
+}
 
+rt_fn! {
 /// catch_unwind inside a module: the target and data are masked; the shadow stack comes back.
-extern "C" fn sb_catch_panic(f: u64, data: u64) -> u64 {
+fn sb_catch_panic(f: u64, data: u64) -> u64 {
     let s = save();
     let fm = mask_thunk(f);
-    let g: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(jit::rt_entry("catch_panic") as usize) };
+    let g: rt_fn_ty!(fn(u64, u64) -> u64) = unsafe { std::mem::transmute(jit::rt_entry("catch_panic") as usize) };
     let r = g(fm, m(data));
     restore(s);
     r
+}
 }
 
 fn mask_thunk(f: u64) -> u64 {
@@ -1256,8 +1298,8 @@ fn rt_policy(name: &str) -> Option<Option<(&'static str, u64)>> {
         "fmt_str" => Some(("sb_fmt_str", sb_fmt_str as *const () as u64)),
         "fmt_pop" => Some(("sb_fmt_pop", sb_fmt_pop as *const () as u64)),
         "str_eq" => Some(("sb_str_eq", sb_str_eq as *const () as u64)),
-        "memcpy" | "memmove" => Some(("sb_memcpy", sb_memcpy as *const () as u64)),
-        "memset" => Some(("sb_memset", sb_memset as *const () as u64)),
+        "memcpy" | "memmove" => Some(("sb_rt_memcpy", sb_rt_memcpy as *const () as u64)),
+        "memset" => Some(("sb_rt_memset", sb_rt_memset as *const () as u64)),
         "catch_panic" => Some(("sb_catch_panic", sb_catch_panic as *const () as u64)),
         _ => return None,
     })
@@ -1334,7 +1376,7 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
     let t_ssp = f.vreg(Cls::I);
     let ssp0 = f.vreg(Cls::I);
     let nsp = f.vreg(Cls::I);
-    let mut b0 = relax_backend::rir::Block { insts: Vec::new(), pos: Vec::new(), term: Term::Jump(entry), term_pos: pos0 };
+    let mut b0 = relax_backend::rir::Block { insts: Vec::new(), pos: Vec::new(), term: Term::Jump(entry), term_pos: pos0, count: -1.0 };
     let push0 = |b: &mut relax_backend::rir::Block, i: Inst| {
         b.insts.push(i);
         b.pos.push(pos0);
@@ -1350,7 +1392,7 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
     let nb = f.blocks.len() as u32 + 1; // index of the first appended block (after block 0 is inserted)
     let trap = |f: &mut Func, nbs: &mut Vec<relax_backend::rir::Block>, site: Sym| -> u32 {
         let v = f.vreg(Cls::I);
-        nbs.push(relax_backend::rir::Block { insts: vec![Inst::Addr(v, site), Inst::Call(Callee::Host(panic_site), vec![v], Vec::new())], pos: vec![pos0, pos0], term: Term::Unreachable, term_pos: pos0 });
+        nbs.push(relax_backend::rir::Block { insts: vec![Inst::Addr(v, site), Inst::Call(Callee::Host(panic_site), vec![v], Vec::new())], pos: vec![pos0, pos0], term: Term::Unreachable, term_pos: pos0, count: -1.0 });
         nb + nbs.len() as u32 - 1
     };
     if has_frame {
@@ -1363,7 +1405,7 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
         push0(&mut b0, Inst::ICmpI(Cond::Lt, false, c, rel, SS_LO as i64));
         let t = trap(f, &mut new_blocks, site_stack);
         // the store of the new shadow sp happens in a continuation block
-        let cont = relax_backend::rir::Block { insts: vec![Inst::Store(relax_backend::rir::Mem::Int(8, false), t_ssp, 0, nsp)], pos: vec![pos0], term: Term::Jump(entry + 1), term_pos: pos0 };
+        let cont = relax_backend::rir::Block { insts: vec![Inst::Store(relax_backend::rir::Mem::Int(8, false), t_ssp, 0, nsp)], pos: vec![pos0], term: Term::Jump(entry + 1), term_pos: pos0, count: -1.0 };
         new_blocks.push(cont);
         let cont_ix = nb + new_blocks.len() as u32 - 1;
         b0.term = Term::Branch(c, t, cont_ix);
@@ -1435,7 +1477,7 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                     refs.push(t);
                     emit(Inst::Iconst(d, sbthunk(t) as i64), &mut insts, &mut pos);
                 }
-                Inst::TlsAddr(..) => return Err(format!("{}: thread-local storage is not available to sandboxed modules", f.name)),
+                Inst::TlsAddr(..) | Inst::TlsStatic(..) => return Err(format!("{}: thread-local storage is not available to sandboxed modules", f.name)),
                 Inst::VGather(..) | Inst::VTbl(..) => return Err(format!("{}: vector gathers are not available to sandboxed modules", f.name)),
                 Inst::Load(mm, d, base, off) => {
                     let (b2, o2) = mask(f, &mut insts, &mut pos, &mut cache, base, off);
@@ -1475,7 +1517,7 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                         let n = f.vreg(Cls::I);
                         let r = f.vreg(Cls::I);
                         emit(Inst::Iconst(n, len as i64), &mut insts, &mut pos);
-                        let s = u.syms.intern(SymKind::Rt("sb_memcpy"), sb_memcpy as *const () as u64);
+                        let s = u.syms.intern(SymKind::Rt("sb_rt_memcpy"), sb_rt_memcpy as *const () as u64);
                         emit(Inst::Call(Callee::Host(s), vec![dst, src, n], vec![r]), &mut insts, &mut pos);
                     } else {
                         let (d2, _) = mask(f, &mut insts, &mut pos, &mut cache, dst, 0);
@@ -1536,7 +1578,7 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                 pos.push(b.term_pos);
             }
         }
-        out_blocks.push(relax_backend::rir::Block { insts, pos, term: b.term, term_pos: b.term_pos });
+        out_blocks.push(relax_backend::rir::Block { insts, pos, term: b.term, term_pos: b.term_pos, count: b.count });
     }
     let _ = nblocks;
     // assemble: block 0, the rewritten blocks, then the made ones
@@ -1627,7 +1669,7 @@ unsafe fn fn_target(up: *mut Unit, id: u32, sandboxed: &HashSet<u32>) -> Result<
 fn add_fuel(f: &mut Func, arena: VReg, site: Sym, panic_site: Sym, pos0: u64, costs: &[i64]) {
     let trap_ix = f.blocks.len() as u32;
     let tv = f.vreg(Cls::I);
-    f.blocks.push(relax_backend::rir::Block { insts: vec![Inst::Addr(tv, site), Inst::Call(Callee::Host(panic_site), vec![tv], Vec::new())], pos: vec![pos0, pos0], term: Term::Unreachable, term_pos: pos0 });
+    f.blocks.push(relax_backend::rir::Block { insts: vec![Inst::Addr(tv, site), Inst::Call(Callee::Host(panic_site), vec![tv], Vec::new())], pos: vec![pos0, pos0], term: Term::Unreachable, term_pos: pos0, count: -1.0 });
     for (k, &cost) in costs.iter().enumerate() {
         let b = k + 1; // block zero is the confinement prologue
         let t = f.vreg(Cls::I);
@@ -1642,7 +1684,7 @@ fn add_fuel(f: &mut Func, arena: VReg, site: Sym, panic_site: Sym, pos0: u64, co
             Inst::Store(relax_backend::rir::Mem::Int(8, true), t, 0, v2),
             Inst::ICmpI(Cond::Lt, true, c, v2, 0),
         ];
-        let meter = relax_backend::rir::Block { pos: vec![pos0; insts.len()], insts, term: Term::Branch(c, trap_ix, cont_ix), term_pos: pos0 };
+        let meter = relax_backend::rir::Block { pos: vec![pos0; insts.len()], insts, term: Term::Branch(c, trap_ix, cont_ix), term_pos: pos0, count: -1.0 };
         let old = std::mem::replace(&mut f.blocks[b], meter);
         f.blocks.push(old);
     }

@@ -15,6 +15,8 @@ pub mod intrinsics {
         pub fn trunc_f32(x: f32) -> f32;
         pub fn rint_f64(x: f64) -> f64;
         pub fn rint_f32(x: f32) -> f32;
+        pub fn round_f64(x: f64) -> f64;
+        pub fn round_f32(x: f32) -> f32;
         pub fn fabs_f64(x: f64) -> f64;
         pub fn fabs_f32(x: f32) -> f32;
         pub fn fmin_f64(x: f64, y: f64) -> f64;
@@ -147,6 +149,15 @@ pub mod intrinsics_mem {
         /// `p + n * size_of::<T>()`
         pub fn ptr_add<T>(p: *const T, n: usize) -> *const T;
         pub fn ptr_add_mut<T>(p: *mut T, n: usize) -> *mut T;
+        /// `p` moved back by `n` elements, in bounds (core's `sub`: `offset` by `-n`)
+        pub fn ptr_sub<T>(p: *const T, n: usize) -> *const T;
+        /// `p` moved by `n` elements with wrapping arithmetic, keeping its provenance (core::intrinsics::arith_offset)
+        pub fn arith_offset<T>(p: *const T, n: isize) -> *const T;
+        /// `(p - origin) / size_of::<T>()` of two pointers into one allocation (core::intrinsics::ptr_offset_from)
+        pub fn ptr_offset_from<T>(p: *const T, origin: *const T) -> isize;
+        /// `p` is null: its address at run time; in const evaluation `ptr_guaranteed_cmp(p, null)`, which may
+        /// not know (core::ptr is_null's const_eval_select)
+        pub fn ptr_is_null(p: *const u8) -> bool;
         pub fn slice_from_raw<'a, T>(p: *const T, len: usize) -> &'a [T];
         pub fn slice_from_raw_mut<'a, T>(p: *mut T, len: usize) -> &'a mut [T];
         pub fn slice_ptr<T>(s: &[T]) -> *const T;
@@ -238,6 +249,13 @@ pub mod intrinsics_rt {
         /// Writes this thread's floating-point control register (flush-to-zero,
         /// denormals-are-zero, rounding, ...).
         pub fn fp_env_set(x: u64);
+        /// The allocator shim (rustc_codegen_ssa allocator shim: `__rust_alloc` and the others):
+        /// a call of core::heap's `__rg_*::<A>(&STATIC, ..)` when the program has a
+        /// `#[global_allocator] static STATIC: A`, else of the default `__rdl_*` (System).
+        pub fn rust_alloc(size: usize, align: usize) -> *mut u8;
+        pub fn rust_alloc_zeroed(size: usize, align: usize) -> *mut u8;
+        pub fn rust_dealloc(ptr: *mut u8, size: usize, align: usize);
+        pub fn rust_realloc(ptr: *mut u8, old_size: usize, align: usize, new_size: usize) -> *mut u8;
     }
 }
 
@@ -276,11 +294,12 @@ pub mod intrinsics_vx {
     // 73 sha256msg1, 74 sha256msg2; 80 Arm sha1su1, 81 sha256su0.
     // Ternary: 0 x86 sha256rnds2; 1/2/3 Arm sha1c/p/m (b is u32),
     // 4 Arm sha1su0, 5 sha256h, 6 sha256h2, 7 sha256su1 (b is a vector).
-    // 8 / 9 NEON f32 fused a + b * c / a - b * c (FMLA / FMLS .4s).
+    // 8 / 9 NEON f32 fused a + b * c / a - b * c (FMLA / FMLS .4s); 10 bitwise select
+    // (a & b) | (!a & c) (BSL; a, the mask, is passed as T).
     // vx_sha1rnds4: x86, immediate FUNC in 0..=3, checked at lowering.
     // vx_sha1h: Arm, scalar u32 -> u32 through lane 0 of a V128.
     // Unary: 0 abs, 1 shl, 2 unsigned shr, 3 signed shr, 4 shuffle i32,
-    // 5/6 byte shift right/left, 7 sqrt f32, 8 abs f32, 9 NEON sqrt f32. Narrow: 19/20/21 as above,
+    // 5/6 byte shift right/left, 7 sqrt f32, 8 abs f32, 9 NEON sqrt f32, 10 neg f32. Narrow: 19/20/21 as above,
     // 30 unsigned u16->u8. Narrow results are 8 bytes, all other vectors 16.
 
     extern "relax-intrinsic" {
@@ -294,7 +313,7 @@ pub mod intrinsics_vx {
         pub fn vx_store<T>(p: *mut u8, a: T);
         pub fn vx_narrow<T, U>(a: T, op: u32) -> U;
         pub fn vx_table<T, U>(a: T, b: U) -> T;
-        pub fn vx_mask<T>(a: T) -> i32;
+        pub fn vx_mask<T>(a: T, width: u32) -> i32;
         pub fn vx_blend<T>(a: T, b: T, mask: T) -> T;
     }
 }

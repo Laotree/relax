@@ -113,11 +113,27 @@ static CHECK: AtomicU8 = AtomicU8::new(0);
 const WARM_MAX: usize = 256;
 const WARM_TOUCHED_MAX: usize = 256 << 10;
 const WARM_BYTES_MAX: usize = 32 << 20;
+/// Warm large runs (program heaps only): a freed large block's run (one exclusive allocation,
+/// above the small classes) stays committed for the next large block of the same order, instead
+/// of being decommitted and faulted in again. A program that builds a large Vec each frame (Sandbox:
+/// `collect_lm_movers`, 230 KB a frame by `push`) otherwise paid a commit, a decommit and a page
+/// fault per 4 KB on every growth step, every frame (~350 faults a frame; the system heap keeps
+/// such memory). Bounded like the small warm list; runs above WARM_LARGE_ONE_MAX go back at once.
+const WARM_LARGE_MAX: usize = 64;
+const WARM_LARGE_ONE_MAX: usize = 8 << 20;
+const WARM_LARGE_BYTES_MAX: usize = 32 << 20;
 /// An emptied chunk of a thread that was carved beyond this goes back to the shared state at once
 /// (the warm list or the OS); a lighter one stays the thread's for its next block.
 const OWNED_KEEP_MAX: usize = 32 << 10;
 struct Warm {
     runs: [(usize, usize); WARM_MAX], // (chunk index, touched bytes)
+    len: usize,
+    bytes: usize,
+}
+/// The warm large runs: (chunk index, committed bytes, order). The order is kept here so a take
+/// never locks a chunk while holding this list (a release holds its chunk, then takes the list).
+struct WarmLarge {
+    runs: [(usize, usize, usize); WARM_LARGE_MAX],
     len: usize,
     bytes: usize,
 }
@@ -153,6 +169,9 @@ thread_local! {
     /// This thread has a destructor registered that hands its chunks back when it ends.
     static EXIT_REGISTERED: Cell<bool> = const { Cell::new(false) };
     static EXIT_GUARD: ExitGuard = const { ExitGuard };
+    /// Armed when the thread enters a domain arena: hands the chunks it holds there back when
+    /// the thread ends (`DomainExitGuard`).
+    static DOMAIN_EXIT_GUARD: DomainExitGuard = const { DomainExitGuard };
     /// The domain arena this thread is inside and its chunk cache of it (`DomainTls`).
     static DOMAIN: DomainTls = const {
         DomainTls { arena: Cell::new(std::ptr::null()), id: Cell::new(0), current: Cell::new([NO_CURRENT; CLASSES]) }
@@ -296,6 +315,27 @@ impl Drop for ExitGuard {
     }
 }
 
+/// Hands a program thread's chunks of the domain arena it is inside back when the thread ends,
+/// from its thread-local destructor round: `DOMAIN` (the chunk cache) is gone after it. macOS frees
+/// a thread's thread-local variables in dyld's own pthread key destructor, which runs before the
+/// JIT's (jit.rs `tls_exit`, which leaves the domain at the end of the program's destructors): a
+/// detach from there read a fresh `DOMAIN` with no chunks, every chunk an exited thread held
+/// stayed attached for good, and Sandbox's thread churn (thousands of short pool and scope
+/// threads, ~10 attached 2 MB chunks each) used up the program heap's 64 GB reservation: "memory
+/// allocation of 68 bytes failed" in a thread start, an abort (exit -6). The thread is still
+/// registered in its domain here, so the arena is alive. A program destructor that allocates
+/// after this takes fresh chunks, handed back by the JIT's leave at the end of its round.
+struct DomainExitGuard;
+impl Drop for DomainExitGuard {
+    fn drop(&mut self) {
+        if let Ok(a) = DOMAIN.try_with(|t| t.arena.get()) {
+            if let Some(a) = unsafe { a.as_ref() } {
+                a.detach_thread();
+            }
+        }
+    }
+}
+
 /// Keeps routing active on the entering thread. Nested scopes and unwinding are safe.
 /// Deliberately !Send and !Sync: dropping it on another thread would alter the wrong TLS.
 pub struct ScratchGuard(bool, PhantomData<*mut ()>);
@@ -367,6 +407,20 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+/// Runs `f` with this thread's scratch routing off (nested scopes included): what it allocates
+/// outlives the compile it runs in -- state the compiler keeps from one compile to the next, in
+/// the compiler arena on a compiler thread.
+pub fn outside_scratch<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = DEPTH.try_with(|d| d.set(self.0));
+        }
+    }
+    let _r = Restore(DEPTH.try_with(|d| d.replace(0)).unwrap_or(0));
+    f()
+}
+
 pub fn scratch(runtime: &crate::options::RuntimeOptions) -> ScratchGuard {
     if !runtime.burst_arena {
         return ScratchGuard(false, PhantomData);
@@ -426,6 +480,9 @@ struct State {
     run: usize,
     order: usize,
     bytes: usize, // requested bytes live in this chunk (burst arena stats only)
+    /// A large block handed out from the warm large list: its pages hold old bytes, so
+    /// `alloc_zeroed` writes the zeros the pool's decommitted runs would have given.
+    dirty: bool,
 }
 
 // A buddy free-chunk list supports both single chunks and contiguous large mappings.
@@ -663,6 +720,7 @@ mod os {
 /// allocated at the address of a dropped one.
 static NEXT_ARENA_ID: AtomicUsize = AtomicUsize::new(1);
 
+
 pub struct Arena {
     dynamic: bool,
     id: usize,
@@ -671,9 +729,14 @@ pub struct Arena {
     committed: AtomicUsize,
     chunks: AtomicUsize,
     warm: Mutex<Warm>,
+    /// Warm large runs (program heaps): (chunk index, committed bytes); see WARM_LARGE_MAX.
+    warm_large: Mutex<WarmLarge>,
     headers: [Chunk; N],
     pool: Mutex<Pool>,
     partial: Mutex<Partial>,
+    /// MAKEPAD_RUN_HEAP_CHECK (program heaps): one bit per 16 bytes of the reservation, set while
+    /// a block starts there (0: off). See `heap_check_on`.
+    live_bits: AtomicUsize,
 }
 static DEFAULT: Arena = Arena::new();
 impl Arena {
@@ -688,6 +751,14 @@ impl Arena {
             warm: Mutex::with_id(
                 Warm {
                     runs: [(0, 0); WARM_MAX],
+                    len: 0,
+                    bytes: 0,
+                },
+                2,
+            ),
+            warm_large: Mutex::with_id(
+                WarmLarge {
+                    runs: [(0, 0, 0); WARM_LARGE_MAX],
                     len: 0,
                     bytes: 0,
                 },
@@ -715,6 +786,7 @@ impl Arena {
                         run: 0,
                         order: 0,
                         bytes: 0,
+                        dirty: false,
                     }),
                 }
             }; N],
@@ -728,6 +800,7 @@ impl Arena {
                 },
                 3,
             ),
+            live_bits: AtomicUsize::new(0),
         }
     }
 
@@ -753,6 +826,9 @@ impl Arena {
             pool.prev.fill(NONE);
             pool.order.fill(u8::MAX);
             pool.order[0] = MAX_ORDER as u8;
+            if heap_check_on() {
+                a.live_bits.store(os_bits_map(), Ordering::Relaxed);
+            }
             let a = Box::from_raw(p);
             if a.init() {
                 Some(a)
@@ -799,6 +875,9 @@ impl Arena {
     }
     /// The calling thread is now inside this domain arena (`enter_domain`).
     fn enter_thread(&self) {
+        // (first access arms the destructor; past the thread's destructor round it fails: the
+        // JIT's leave hands the chunks back then)
+        let _ = DOMAIN_EXIT_GUARD.try_with(|_| {});
         let t = domain_tls();
         t.arena.set(self);
         t.id.set(self.id);
@@ -812,7 +891,39 @@ impl Arena {
     }
     /// `cache_fast`, and the thread is not past its TLS destructors (it would never hand a new chunk back).
     fn cache_here(&self) -> bool {
-        self.cache_fast() && (self.dynamic || !EXITED.with(|e| e.get()))
+        // a checked program heap has no thread chunk caches: every block goes through the
+        // locked paths, which keep the live bits
+        self.cache_fast() && (self.dynamic || !EXITED.with(|e| e.get())) && self.live_bits.load(Ordering::Relaxed) == 0
+    }
+    /// MAKEPAD_RUN_HEAP_CHECK: sets (`live`) or clears the live bit of the block at `p`; returns
+    /// whether it was set before. No-op (true for a clear, false for a set) when the check is off.
+    #[inline]
+    fn mark(&self, p: usize, live: bool) -> bool {
+        let bits = self.live_bits.load(Ordering::Relaxed);
+        if bits == 0 {
+            return !live;
+        }
+        let k = (p - self.base.load(Ordering::Relaxed)) / 16;
+        let w = unsafe { &*((bits + (k / 64) * 8) as *const AtomicU64) };
+        let m = 1u64 << (k % 64);
+        let old = if live { w.fetch_or(m, Ordering::Relaxed) } else { w.fetch_and(!m, Ordering::Relaxed) };
+        old & m != 0
+    }
+    /// MAKEPAD_RUN_HEAP_CHECK: a block marked in `committed` bytes of chunk `index` (one being
+    /// released), or None.
+    fn live_in(&self, index: usize, committed: usize) -> Option<usize> {
+        let bits = self.live_bits.load(Ordering::Relaxed);
+        if bits == 0 {
+            return None;
+        }
+        let k0 = index * CHUNK / 16;
+        for wi in k0 / 64..(k0 + committed / 16 + 63) / 64 {
+            let v = unsafe { &*((bits + wi * 8) as *const AtomicU64) }.load(Ordering::Relaxed);
+            if v != 0 {
+                return Some(self.base.load(Ordering::Relaxed) + (wi * 64 + v.trailing_zeros() as usize) * 16);
+            }
+        }
+        None
     }
     pub fn requested_bytes(&self) -> usize {
         // Owner stores and remote additions avoid an RMW on the owner's path. Counters are
@@ -880,11 +991,17 @@ impl Arena {
     }
     unsafe fn release_empty(&self, index: usize, s: &mut State) {
         let h = &self.headers[index];
+        if let Some(p) = self.live_in(index, s.committed) {
+            heap_check_fail(b"a chunk with no live block by its count still holds the block at", p, index, s.stride);
+        }
         s.released = true;
         if h.in_part.load(Ordering::Relaxed) {
             lock(&self.partial).unlink(index, &self.headers);
         }
         if s.stride != 0 && s.bump <= WARM_TOUCHED_MAX && self.warm_put(index, s.bump) {
+            return;
+        }
+        if self.dynamic && s.stride == 0 && index == s.run && s.committed <= WARM_LARGE_ONE_MAX && self.warm_large_put(index, s.committed, s.order) {
             return;
         }
         event(E_DECOMMIT);
@@ -1223,6 +1340,102 @@ impl Arena {
             let _ = EXIT_GUARD.try_with(|_| {});
         }
     }
+    /// An allocation of a program (domain) arena failed: one line on stderr naming the step
+    /// (no allocation: the program's own report of the failure follows).
+    #[cold]
+    #[inline(never)]
+    fn alloc_failed(&self, step: u32, l: Layout) {
+        if !self.dynamic {
+            return;
+        }
+        extern "C" {
+            fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+        }
+        let mut b = [0u8; 900];
+        let mut k = 0;
+        let mut put = |s: &[u8]| {
+            for &c in s {
+                if k < b.len() {
+                    b[k] = c;
+                    k += 1;
+                }
+            }
+        };
+        let num = |mut v: usize, out: &mut [u8; 20]| -> usize {
+            let mut i = out.len();
+            loop {
+                i -= 1;
+                out[i] = b'0' + (v % 10) as u8;
+                v /= 10;
+                if v == 0 {
+                    break i;
+                }
+            }
+        };
+        let mut t = [0u8; 20];
+        put(b"makepad-run alloc: program arena ");
+        let i = num(self.id, &mut t);
+        put(&t[i..]);
+        put(b" refused ");
+        let i = num(l.size(), &mut t);
+        put(&t[i..]);
+        put(b" bytes at step ");
+        let i = num(step as usize, &mut t);
+        put(&t[i..]);
+        put(b", committed ");
+        let i = num(self.committed.load(Ordering::Relaxed) >> 20, &mut t);
+        put(&t[i..]);
+        put(b" MB");
+        // the first failure also says what holds the arena (one header walk)
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            let (mut small, mut large, mut large_units, mut large_bytes, mut released, mut warmish) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+            let (mut attached, mut touched, mut live_slots, mut empty, mut listed) = (0usize, 0usize, 0usize, 0usize, 0usize);
+            for h in self.headers.iter() {
+                let st = lock(&h.state);
+                if st.committed == 0 {
+                    continue;
+                }
+                if st.released {
+                    released += 1;
+                }
+                if st.stride == 0 {
+                    large += 1;
+                    large_units += 1 << st.order;
+                    large_bytes += st.committed;
+                    if h.live.load(Ordering::Relaxed) == 0 {
+                        warmish += 1;
+                    }
+                } else {
+                    small += 1;
+                    if st.attached {
+                        attached += 1;
+                        let o = h.owned.get();
+                        unsafe {
+                            touched += (*o).bump.load(Ordering::Relaxed).min(CHUNK);
+                            live_slots += (*o).live.load(Ordering::Relaxed);
+                        }
+                    } else {
+                        touched += st.bump.min(CHUNK);
+                        live_slots += h.live.load(Ordering::Relaxed);
+                        if h.live.load(Ordering::Relaxed) == 0 {
+                            empty += 1;
+                        }
+                    }
+                    if h.in_part.load(Ordering::Relaxed) {
+                        listed += 1;
+                    }
+                }
+            }
+            for (label, v) in [(&b"; small chunks "[..], small), (b"; large blocks ", large), (b" spanning ", large_units), (b" chunks, committed MB ", large_bytes >> 20), (b"; released-but-committed ", released), (b"; large with no live ", warmish), (b"; small attached ", attached), (b", touched MB ", touched >> 20), (b", live slots ", live_slots), (b", empty unattached ", empty), (b", listed ", listed)] {
+                put(label);
+                let i = num(v, &mut t);
+                put(&t[i..]);
+            }
+        }
+        put(b"\n");
+        unsafe { write(2, b.as_ptr(), k) };
+    }
     #[cold]
     unsafe fn alloc_slow(&self, l: Layout, small: bool, class: usize, requested: usize) -> *mut u8 {
         let stride = if small { STRIDE[class] } else { 0 };
@@ -1234,6 +1447,9 @@ impl Arena {
             while let Some(i) = self.partial_pop(class) {
                 let p = self.from_partial(i, stride, class, requested, cache);
                 if !p.is_null() {
+                    if self.mark(p as usize, true) {
+                        heap_check_fail(b"the allocator handed out a live block at", p as usize, i, stride);
+                    }
                     return p;
                 }
             }
@@ -1243,23 +1459,26 @@ impl Arena {
         } else {
             match l.size().checked_add(PAGE - 1) {
                 Some(n) => n & !(PAGE - 1),
-                None => return null_mut(),
+                None => { self.alloc_failed(1, l); return null_mut(); },
             }
         };
         // Extra virtual space allows alignments above 2 MB; only the payload is committed.
         let span = match committed.checked_add(l.align().saturating_sub(CHUNK)) {
             Some(n) if n <= RESERVE => n,
-            _ => return null_mut(),
+            _ => { self.alloc_failed(2, l); return null_mut(); },
         };
         let units = (span + CHUNK - 1) / CHUNK;
         let order = units.next_power_of_two().trailing_zeros() as usize;
-        // a warm chunk (committed, nothing live) serves a small class without an OS call
-        let warm = if small { self.warm_take() } else { None };
+        // a warm chunk (committed, nothing live) serves a small class without an OS call; a warm
+        // large run of the same order serves a large block (committing only what it lacks)
+        let warm_large = if !small && self.dynamic && l.align() <= CHUNK { self.warm_large_take(order) } else { None };
+        let warm = if small { self.warm_take() } else { warm_large.map(|w| w.0) };
+        let kept = warm_large.map_or(0, |w| w.1);
         let run = match warm {
             Some(i) => i,
             None => match lock(&self.pool).take(order) {
                 Some(i) => i,
-                None => return null_mut(),
+                None => { self.alloc_failed(3, l); return null_mut(); },
             },
         };
         let start = self.base.load(Ordering::Relaxed) + run * CHUNK;
@@ -1271,8 +1490,22 @@ impl Arena {
         }
         if warm.is_none() && !os::commit(p, committed) {
             lock(&self.pool).release(run, order);
-            return null_mut();
+            { self.alloc_failed(4, l); return null_mut(); }
         }
+        if warm_large.is_some() && committed > kept && !os::commit((address + kept) as *mut u8, committed - kept) {
+            // the run cannot grow: it goes back to the pool decommitted (zero), and this alloc fails over
+            let mut s = lock(&self.headers[index].state);
+            if os::decommit(p, kept, COMPILER) {
+                self.committed.fetch_sub(kept, Ordering::Relaxed);
+                self.chunks.fetch_sub((kept + CHUNK - 1) / CHUNK, Ordering::Relaxed);
+                s.committed = 0;
+                drop(s);
+                lock(&self.pool).release(run, order);
+            }
+            { self.alloc_failed(5, l); return null_mut(); }
+        }
+        // a warm large run keeps what it had committed beyond this block (resize_in_place trims it)
+        let committed = committed.max(kept);
         let h = &self.headers[index];
         let generation;
         let epoch = if self.gen_on() { EPOCH.load(Ordering::Relaxed) } else { 0 };
@@ -1292,11 +1525,15 @@ impl Arena {
                 run,
                 order,
                 bytes: 0,
+                dirty: warm_large.is_some(),
             };
             h.live.store(1, Ordering::Relaxed);
             if warm.is_none() {
                 self.committed.fetch_add(committed, Ordering::Relaxed);
                 self.chunks.fetch_add((committed + CHUNK - 1) / CHUNK, Ordering::Relaxed);
+            } else if warm_large.is_some() && committed > kept {
+                self.committed.fetch_add(committed - kept, Ordering::Relaxed);
+                self.chunks.fetch_add((committed + CHUNK - 1) / CHUNK - (kept + CHUNK - 1) / CHUNK, Ordering::Relaxed);
             }
             if COMPILER {
                 h.account.fetch_add(requested, Ordering::Relaxed);
@@ -1311,6 +1548,9 @@ impl Arena {
         }
         if cache {
             self.set_current(class, Current { index, stamp: if COMPILER { epoch } else { generation } });
+        }
+        if self.mark(p as usize, true) {
+            heap_check_fail(b"the allocator handed out a live block at", p as usize, index, stride);
         }
         p
     }
@@ -1345,8 +1585,20 @@ impl Arena {
     }
     pub unsafe fn alloc_zeroed_counted(&self, l: Layout, requested: usize) -> *mut u8 {
         let p = self.alloc_counted(l, requested);
-        if !p.is_null() && !(COMPILER && l.size().max(l.align()).max(16) > 1 << MAX_SHIFT) {
+        if p.is_null() {
+            return p;
+        }
+        if !(COMPILER && l.size().max(l.align()).max(16) > 1 << MAX_SHIFT) {
             std::ptr::write_bytes(p, 0, l.size());
+        } else if self.dynamic {
+            // a large block from the warm large list holds old bytes
+            let index = ((p as usize) - self.base.load(Ordering::Relaxed)) / CHUNK;
+            let mut s = lock(&self.headers[index].state);
+            if s.dirty {
+                s.dirty = false;
+                drop(s);
+                std::ptr::write_bytes(p, 0, l.size());
+            }
         }
         p
     }
@@ -1453,6 +1705,9 @@ impl Arena {
     unsafe fn dealloc_slow(&self, p: *mut u8, l: Layout, requested: usize, index: usize) {
         let address = self.base.load(Ordering::Relaxed) + index * CHUNK;
         let h = &self.headers[index];
+        if !self.mark(p as usize, false) {
+            heap_check_fail(b"free of a block that is not live (a double free, or not a block start) at", p as usize, index, lock(&h.state).stride);
+        }
         if COMPILER {
             // Publish accounting before the block: after publication the owner may recycle
             // the slot or even release its mapping, so this producer never touches it again.
@@ -1549,6 +1804,29 @@ impl Arena {
         w.bytes += touched;
         true
     }
+    /// Parks an emptied large run of a program heap committed (see WARM_LARGE_MAX).
+    fn warm_large_put(&self, index: usize, committed: usize, order: usize) -> bool {
+        let mut w = lock(&self.warm_large);
+        if w.len == WARM_LARGE_MAX || w.bytes + committed > WARM_LARGE_BYTES_MAX {
+            return false;
+        }
+        let n = w.len;
+        w.runs[n] = (index, committed, order);
+        w.len += 1;
+        w.bytes += committed;
+        true
+    }
+    /// The most recently parked warm large run of `order`, with its committed bytes.
+    fn warm_large_take(&self, order: usize) -> Option<(usize, usize)> {
+        let mut w = lock(&self.warm_large);
+        let n = w.len;
+        let k = (0..n).rev().find(|&k| w.runs[k].2 == order)?;
+        let e = w.runs[k];
+        w.runs[k] = w.runs[n - 1];
+        w.len -= 1;
+        w.bytes -= e.1;
+        Some((e.0, e.1))
+    }
     /// Decommits the warm chunks and returns them to the pool (settle's heap trim, tests).
     pub fn trim(&self) {
         // the calling thread's own current chunks go back first (the lists are what the trim walks)
@@ -1561,6 +1839,30 @@ impl Arena {
         }
     }
     fn warm_drain(&self) {
+        loop {
+            let e = {
+                let mut w = lock(&self.warm_large);
+                if w.len == 0 {
+                    break;
+                }
+                w.len -= 1;
+                let e = w.runs[w.len];
+                w.bytes -= e.1;
+                e
+            };
+            let mut s = lock(&self.headers[e.0].state);
+            let address = self.base.load(Ordering::Relaxed) + e.0 * CHUNK;
+            event(E_DECOMMIT);
+            if !unsafe { os::decommit(address as *mut u8, s.committed, COMPILER) } {
+                continue;
+            }
+            self.committed.fetch_sub(s.committed, Ordering::Relaxed);
+            self.chunks.fetch_sub((s.committed + CHUNK - 1) / CHUNK, Ordering::Relaxed);
+            s.committed = 0;
+            let (run, order) = (s.run, s.order);
+            drop(s);
+            lock(&self.pool).release(run, order);
+        }
         while let Some(index) = self.warm_take() {
             let h = &self.headers[index];
             let mut s = lock(&h.state);
@@ -1679,6 +1981,10 @@ impl Arena {
         (s.committed != 0).then_some(s.epoch)
     }
     fn points_into(&self, p: usize, g: u64) -> bool {
+        self.points_into_range(p, g, g + 1)
+    }
+    /// `points_into` for any generation in [lo, hi).
+    fn points_into_range(&self, p: usize, lo: u64, hi: u64) -> bool {
         let base = self.base.load(Ordering::Relaxed);
         if base == 0 || p.wrapping_sub(base) >= RESERVE {
             return false;
@@ -1688,7 +1994,7 @@ impl Arena {
             return false;
         }
         let s = lock(&self.headers[index].state);
-        if s.committed == 0 || s.epoch != g {
+        if s.committed == 0 || s.epoch < lo || s.epoch >= hi {
             return false;
         }
         let off = p - (base + index * CHUNK);
@@ -1774,6 +2080,111 @@ impl Drop for Arena {
         if self.dynamic && base != 0 {
             unsafe { os::unreserve(base, RESERVE) };
         }
+        let bits = self.live_bits.load(Ordering::Relaxed);
+        if bits != 0 {
+            unsafe { os::unreserve(bits, RESERVE / 128) };
+        }
+    }
+}
+
+/// 0 = not read, 1 = off, 2 = MAKEPAD_RUN_HEAP_CHECK is set.
+static HEAP_CHECK: AtomicU8 = AtomicU8::new(0);
+
+/// MAKEPAD_RUN_HEAP_CHECK=1: every program heap (domain arena) made from then on keeps a live bit
+/// per block and runs without thread chunk caches; a free of a block that is not live (double
+/// free, a pointer into a block), a live block handed out again, or a chunk released while a block
+/// in it is live aborts at once with one line naming the address (and the JIT's abort report
+/// with the frames). Off: no cost outside the slow paths (one load there).
+pub fn heap_check_on() -> bool {
+    match HEAP_CHECK.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            #[cfg(unix)]
+            let on = unsafe {
+                extern "C" {
+                    fn getenv(name: *const u8) -> *const u8;
+                }
+                !getenv(c"MAKEPAD_RUN_HEAP_CHECK".as_ptr().cast()).is_null()
+            };
+            #[cfg(not(unix))]
+            let on = false;
+            HEAP_CHECK.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// The live-bit map of one program heap: RESERVE / 16 bits, mapped readable and writable (the OS
+/// backs only the pages that are touched). 0 when the mapping is refused (the check stays off).
+fn os_bits_map() -> usize {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    unsafe {
+        let b = os::reserve(RESERVE / 128, GRANULE, c"makepad-run heap check");
+        if b != 0 && !os::commit(b as *mut u8, RESERVE / 128) {
+            os::unreserve(b, RESERVE / 128);
+            return 0;
+        }
+        b
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+    0
+}
+
+/// A MAKEPAD_RUN_HEAP_CHECK failure: one line with `write(2)` (no allocation: this runs inside
+/// the allocator, under its locks), then abort.
+#[cold]
+#[inline(never)]
+fn heap_check_fail(what: &[u8], p: usize, index: usize, stride: usize) -> ! {
+    let mut buf = [0u8; 256];
+    let mut n = 0;
+    let mut put = |bytes: &[u8]| {
+        for &b in bytes {
+            if n < buf.len() {
+                buf[n] = b;
+                n += 1;
+            }
+        }
+    };
+    let num = |v: usize, hex: bool, out: &mut [u8; 20]| -> usize {
+        let (mut v, r, mut k) = (v, if hex { 16 } else { 10 }, 20);
+        loop {
+            k -= 1;
+            let d = (v % r) as u8;
+            out[k] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+            v /= r;
+            if v == 0 {
+                break;
+            }
+        }
+        k
+    };
+    let mut d = [0u8; 20];
+    put(b"makepad-run heap check: ");
+    put(what);
+    put(b" 0x");
+    let k = num(p, true, &mut d);
+    put(&d[k..]);
+    put(b" (chunk ");
+    let k = num(index, false, &mut d);
+    put(&d[k..]);
+    put(b", slot size ");
+    let k = num(stride, false, &mut d);
+    put(&d[k..]);
+    put(b")\n");
+    #[cfg(unix)]
+    unsafe {
+        extern "C" {
+            fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+            fn abort() -> !;
+        }
+        write(2, buf.as_ptr(), n);
+        abort();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = n;
+        std::process::abort();
     }
 }
 
@@ -1931,6 +2342,10 @@ pub fn epoch_of(p: *const u8) -> Option<u64> {
 /// small chunk's carved part, a large block's committed part)? Takes the chunk lock.
 pub fn points_into(p: usize, g: u64) -> bool {
     DEFAULT.points_into(p, g)
+}
+/// `points_into` for any generation in [lo, hi).
+pub fn points_into_range(p: usize, lo: u64, hi: u64) -> bool {
+    DEFAULT.points_into_range(p, lo, hi)
 }
 /// The arena's own statics (address ranges): its header table's free lists and its base address
 /// hold addresses into the arena, which a scan of the process's statics must not count.

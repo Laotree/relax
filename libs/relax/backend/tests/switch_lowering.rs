@@ -8,14 +8,14 @@ use relax_backend::{exec::Code, rir::*, switch};
 
 #[cfg(target_arch = "x86_64")]
 fn compile(options: &relax_session::Options, f: &Func, regs: bool) -> Vec<u8> {
-    let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: regs, syms: 0, sym_class: 0 };
+    let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: regs, syms: 0, sym_class: 0, near: false };
     let c = relax_backend::x64::compile(options, f, &env).unwrap();
     c.code[..c.text_len as usize].to_vec()
 }
 
 #[cfg(target_arch = "aarch64")]
 fn compile(options: &relax_session::Options, f: &Func, regs: bool) -> Vec<u8> {
-    let env = relax_backend::arm64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: regs, syms: 0, sym_class: 0 };
+    let env = relax_backend::arm64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: regs, syms: 0, sym_class: 0, near: false };
     let c = relax_backend::arm64::compile(options, f, &env).unwrap();
     c.code[..c.text_len as usize].to_vec()
 }
@@ -172,7 +172,7 @@ fn switch_lowering_matches_the_compare_chain() {
         let signed = case % 3 != 0;
         let arms = rand_arms(&mut r, span, signed);
         let f = build(&arms);
-        if let Some((g, origin)) = switch::lower_switches(&options, &f) {
+        if let Some((g, origin)) = switch::lower_switches(&options, &f, switch::MIN_TABLE_CLUSTERS) {
             assert_eq!(origin.len(), g.blocks.len());
             g.verify().unwrap();
             switched += 1;

@@ -73,6 +73,7 @@ pub fn map_inst(x: &Inst, m: &dyn Fn(VReg) -> VReg, slot_base: u32) -> Inst {
         Inst::Cpuid(ds, a, b) => Inst::Cpuid(ds.map(m), m(*a), m(*b)),
         Inst::Xgetbv(d, a) => Inst::Xgetbv(m(*d), m(*a)),
         Inst::TlsAddr(d, off) => Inst::TlsAddr(m(*d), *off),
+        Inst::TlsStatic(d, off) => Inst::TlsStatic(m(*d), *off),
         Inst::Sel(d, c, a, b) => Inst::Sel(m(*d), m(*c), m(*a), m(*b)),
         Inst::VSel(d, k, a, b) => Inst::VSel(m(*d), m(*k), m(*a), m(*b)),
         Inst::VFma(np, na, d, a, b, c) => Inst::VFma(*np, *na, m(*d), m(*a), m(*b), m(*c)),
@@ -172,6 +173,14 @@ pub fn fold_ibin(op: IOp, it: IntTy, a: i64, b: i64) -> Option<i64> {
                 32 => (a as u32).rotate_left(k) as i64,
                 64 => (a as u64).rotate_left(k) as i64,
                 _ => return None,
+            }
+        }
+        IOp::Bzhi => {
+            let n = (b & 63) as u32;
+            if n == 0 {
+                0
+            } else {
+                a & (u64::MAX >> (64 - n)) as i64
             }
         }
         IOp::MulHi => {
@@ -612,6 +621,8 @@ pub fn compact_vregs(f: &mut Func) {
     for r in f.ranged.iter_mut() {
         r.0 = m(r.0);
     }
+    // (the debug table follows; a vreg no instruction mentions is gone: its leaf is no longer held)
+    f.dbg_map_vregs(&|v| map.get(v.0 as usize).filter(|x| **x != NONE).map(|x| VReg(*x)));
     f.vregs = cls;
 }
 
@@ -672,6 +683,27 @@ pub fn vx_peep(f: &mut Func, ndef: &[u32]) {
             }
         }
     }
+    // vectors whose every use reads only their low 64 bits (lane extracts there), and the lane-wise
+    // results only such extracts read: the operands of those may be any vector with the same low
+    // half (NEON 8-byte group compares widened to 16-byte vectors: `FromLo64(Extract(D, 0, v))`)
+    let mut uses = vec![0u32; nv];
+    let mut low_uses = vec![0u32; nv];
+    for b in &f.blocks {
+        for i in &b.insts {
+            crate::regalloc::for_uses(i, |u| uses[u.0 as usize] += 1);
+            if let Inst::VX(VX::Extract(w, lane), _, a, _) = *i {
+                if (lane as u32 + 1) * w.bits() <= 64 {
+                    low_uses[a.0 as usize] += 1;
+                }
+            }
+        }
+        let mut t = Vec::new();
+        crate::regalloc::term_uses(&b.term, &mut t);
+        for u in t {
+            uses[u.0 as usize] += 1;
+        }
+    }
+    let low_only = |v: VReg| uses[v.0 as usize] > 0 && uses[v.0 as usize] == low_uses[v.0 as usize];
     // the vector whose low 64 bits `x` holds
     let low = |x: VReg| -> VReg {
         if let Some((VX::FromLo64, t)) = def[x.0 as usize] {
@@ -740,14 +772,36 @@ pub fn vx_peep(f: &mut Func, ndef: &[u32]) {
                     VX::ZipLo(VW::D) => {
                         *a = low(*a);
                         *bb = low(*bb);
+                        // the low halves of two lane shuffles of one vector: one shuffle
+                        // (`_mm_shuffle_ps(a, a, m)` = pshufd a, m; cross products, dot splats)
+                        let src = |v: VReg| match def[v.0 as usize] {
+                            Some((VX::ShufS(k), x)) => (x, k),
+                            _ => (v, 0b11_10_01_00),
+                        };
+                        let ((x, k1), (y, k2)) = (src(*a), src(*bb));
+                        if x == y {
+                            *op = VX::ShufS((k1 & 0x0f) | ((k2 & 0x0f) << 4));
+                            *a = x;
+                            *bb = x;
+                        }
                     }
                     VX::Extract(w, lane) if (lane as u32 + 1) * w.bits() <= 64 => {
                         *a = low(*a);
                         *bb = *a;
+                        // lane 0 of [x, 0] is x
+                        if let (VX::Extract(VW::D, 0), Some((VX::FromLo64, x))) = (*op, def[a.0 as usize]) {
+                            let d = *d;
+                            *i = Inst::Mov(d, x);
+                            continue;
+                        }
+                    }
+                    // lane-wise ops whose result is only read in its low half: so are their operands
+                    VX::CmpEq(_) | VX::CmpGtS(_) | VX::And | VX::Or | VX::Xor | VX::AndNot | VX::Add(_) | VX::Sub(_) if low_only(*d) => {
+                        *a = low(*a);
+                        *bb = low(*bb);
                     }
                     _ => {}
                 }
-                let _ = d;
             }
         }
     }
@@ -766,6 +820,44 @@ pub fn fold_insert(f: &Func, edits: &mut Vec<FoldEdit>, block: usize, after: usi
     edits.push(FoldEdit { block, at: after + 1, remove: 0, insts: vec![inst], pos: f.blocks[block].pos[after] });
 }
 
+/// The one compare equal to `k1 || k2` for two compares of the same operands (same signedness;
+/// the second may name them swapped), when there is one (`Lt | Eq` = `Le`, `Lt | Gt` = `Ne`).
+fn cond_union(k1: (Cond, bool, VReg, i64, bool), k2: (Cond, bool, VReg, i64, bool)) -> Option<Cond> {
+    let (c1, s1, a1, b1, i1) = k1;
+    let (c2, s2, a2, b2, i2) = k2;
+    if s1 != s2 || i1 != i2 {
+        return None;
+    }
+    // outcome sets over {less, equal, greater} of `a ? b`
+    let set = |c: Cond| -> u8 {
+        match c {
+            Cond::Lt => 0b100,
+            Cond::Eq => 0b010,
+            Cond::Gt => 0b001,
+            Cond::Le => 0b110,
+            Cond::Ge => 0b011,
+            Cond::Ne => 0b101,
+        }
+    };
+    let swap = |m: u8| (m & 0b010) | ((m & 0b100) >> 2) | ((m & 0b001) << 2);
+    let m2 = if a2 == a1 && b2 == b1 {
+        set(c2)
+    } else if !i1 && a2.0 as i64 == b1 && b2 == a1.0 as i64 {
+        swap(set(c2))
+    } else {
+        return None;
+    };
+    match set(c1) | m2 {
+        0b100 => Some(Cond::Lt),
+        0b010 => Some(Cond::Eq),
+        0b001 => Some(Cond::Gt),
+        0b110 => Some(Cond::Le),
+        0b011 => Some(Cond::Ge),
+        0b101 => Some(Cond::Ne),
+        _ => None,
+    }
+}
+
 /// All definitions must be constants or copies of such values. Params and copy cycles
 /// fail too; at most four copy edges are followed.
 pub fn const_phi(f: &Func, def_at: &[Vec<(usize, usize)>], ndef: &[u32], v: VReg, depth: u32) -> bool {
@@ -776,8 +868,21 @@ pub fn const_phi(f: &Func, def_at: &[Vec<(usize, usize)>], ndef: &[u32], v: VReg
     ds.iter().all(|&(bi, ii)| match f.blocks[bi].insts[ii] {
         Inst::Iconst(..) => true,
         Inst::Mov(_, x) => const_phi(f, def_at, ndef, x, depth + 1),
+        Inst::Sel(_, _, a, b) => sel_const(f, def_at, ndef, a).is_some() && sel_const(f, def_at, ndef, b).is_some(),
         _ => false,
     })
+}
+
+/// The constant a select operand holds: a single-def vreg defined by an Iconst.
+fn sel_const(f: &Func, def_at: &[Vec<(usize, usize)>], ndef: &[u32], v: VReg) -> Option<i64> {
+    let ds = def_at.get(v.0 as usize)?;
+    if ds.len() != 1 || ndef[v.0 as usize] != 1 {
+        return None;
+    }
+    match f.blocks[ds[0].0].insts[ds[0].1] {
+        Inst::Iconst(_, k) => Some(k),
+        _ => None,
+    }
 }
 
 // Targets of DFS back edges, as in loop_depths. These include natural loop headers
@@ -864,6 +969,19 @@ pub fn phi_compare(
                 Some(K::I(kx)) => Inst::Iconst(b, cmp(kx)),
                 _ => Inst::Mov(b, phi_compare(f, def_at, kn, x, cc, signed, k, narrow, shadows, edits)),
             },
+            // c ? ka : kb compares as c ? cmp(ka) : cmp(kb) (read where the select read c)
+            Inst::Sel(_, c, x, y) => {
+                // const_phi checked both operands: single-def, defined by an Iconst
+                let konst = |v: VReg| match def_at[v.0 as usize].first().map(|&(b2, i2)| &f.blocks[b2].insts[i2]) {
+                    Some(Inst::Iconst(_, k)) => *k,
+                    _ => unreachable!(),
+                };
+                let (kx, ky) = (konst(x), konst(y));
+                let (tx, ty) = (f.vreg(Cls::I), f.vreg(Cls::I));
+                let pos = f.blocks[bi].pos[ii];
+                edits.push(FoldEdit { block: bi, at: ii + 1, remove: 0, insts: vec![Inst::Iconst(tx, cmp(kx)), Inst::Iconst(ty, cmp(ky)), Inst::Sel(b, c, tx, ty)], pos });
+                continue;
+            }
             _ => unreachable!(),
         };
         fold_insert(f, edits, bi, ii, inst);
@@ -1002,6 +1120,8 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
         let mut cmp_def: Vec<Option<(Cond, bool, VReg, i64, bool)>> = vec![None; nv];
         // single-def selects of single-def operands: (cond, a, b)
         let mut sel_def: Vec<Option<(VReg, VReg, VReg)>> = vec![None; nv];
+        // `d = a ^ 1` (single defs): a compare outcome's negation, seen through by the select-tree fold
+        let mut xor1_def: Vec<Option<VReg>> = vec![None; nv];
         // IntToInt definitions also retain their source location: RIR operands can be
         // reassigned between the inner conversion and its use.
         let mut conv_def: Vec<Option<(IntTy, VReg, usize, usize)>> = vec![None; if ic { nv } else { 0 }];
@@ -1030,6 +1150,24 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
         for p in &f.params {
             zw[p.0 as usize] = 64;
         }
+        // vregs read only by arithmetic and stores (not by copies, compares, selects or
+        // terminators, where a select of constants feeds the Ordering / phi folds): a 0/1 select
+        // of them becomes its condition
+        let mut arith_read = vec![true; nv];
+        {
+            let mut tu = Vec::new();
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if matches!(i, Inst::Mov(..) | Inst::ICmp(..) | Inst::ICmpI(..) | Inst::Sel(..)) {
+                        for_uses(i, |u| arith_read[u.0 as usize] = false);
+                    }
+                }
+                term_uses(&b.term, &mut tu);
+                for u in &tu {
+                    arith_read[u.0 as usize] = false;
+                }
+            }
+        }
         // single-def function addresses (devirtualised calls)
         let mut fn_def: Vec<u32> = vec![u32::MAX; nv];
         for (bi, b) in f.blocks.iter().enumerate() {
@@ -1048,6 +1186,9 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                 if ic {
                     match *i {
                         Inst::Iconst(d, _) | Inst::Mov(d, _) => phi_defs[d.0 as usize].push((bi, ii)),
+                        // a choice between two constants (an `Ordering` from `a == b`): an
+                        // assignment of the phi machinery too (const_phi / phi_compare)
+                        Inst::Sel(d, ..) => phi_defs[d.0 as usize].push((bi, ii)),
                         Inst::Conv(Conv::IntToInt(t), d, x) if single(d, &ndef) => conv_def[d.0 as usize] = Some((t, x, bi, ii)),
                         Inst::IBinI(op @ (IOp::Add | IOp::Sub | IOp::And), t, d, x, k) if single(d, &ndef) => bin_def[d.0 as usize] = Some((op, t, x, k, bi, ii)),
                         _ => {}
@@ -1062,6 +1203,7 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                     Inst::ICmpI(c, sg, d, a, k) if single(*d, &ndef) && single(*a, &ndef) => cmp_def[d.0 as usize] = Some((*c, *sg, *a, *k, true)),
                     Inst::ICmp(c, sg, d, a, b2) if single(*d, &ndef) && single(*a, &ndef) && single(*b2, &ndef) => cmp_def[d.0 as usize] = Some((*c, *sg, *a, b2.0 as i64, false)),
                     Inst::Sel(d, c, a, b2) if single(*d, &ndef) && single(*c, &ndef) && single(*a, &ndef) && single(*b2, &ndef) => sel_def[d.0 as usize] = Some((*c, *a, *b2)),
+                    Inst::IBinI(IOp::Xor, _, d, a, 1) if single(*d, &ndef) && single(*a, &ndef) => xor1_def[d.0 as usize] = Some(*a),
                     _ => {}
                 }
             }
@@ -1094,6 +1236,14 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                         }
                         Inst::IBinI(IOp::Shr, it, d, x, k) if !it.signed && it.bits == 64 && (0..64).contains(k) => {
                             let b = (64 - *k as u8).min(w(x, &zw));
+                            set(*d, b, &mut zw)
+                        }
+                        Inst::IBinI(IOp::Xor | IOp::Or, _, d, x, k) if *k >= 0 => {
+                            let b = ((64 - (*k as u64).leading_zeros()) as u8).max(w(x, &zw));
+                            set(*d, b, &mut zw)
+                        }
+                        Inst::Sel(d, _, a, b2) => {
+                            let b = w(a, &zw).max(w(b2, &zw));
                             set(*d, b, &mut zw)
                         }
                         Inst::Iconst(d, v) if *v >= 0 => set(*d, (64 - (*v as u64).leading_zeros()) as u8, &mut zw),
@@ -1145,6 +1295,17 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                 kn[v] = kn[alias[v] as usize];
             }
         }
+        if !f.dbg.is_empty() {
+            // the debug table follows the renaming (and keeps folded constants)
+            let named = f.dbg_vregs();
+            let copies: Vec<(VReg, VReg)> = named.iter().filter(|&&v| (v as usize) < nv && alias[v as usize] != v).map(|&v| (VReg(v), VReg(alias[v as usize]))).collect();
+            let consts: Vec<(VReg, i64)> = named.iter().filter(|&&v| (v as usize) < nv && single(VReg(v), &ndef)).filter_map(|&v| match kn[v as usize] {
+                Some(K::I(k)) => Some((VReg(v), k)),
+                Some(K::F(bits, _)) => Some((VReg(v), bits as i64)),
+                _ => None,
+            }).collect();
+            f.dbg_salvage(&copies, &consts);
+        }
         let mut changed = false;
         let mut edits = Vec::new();
         // memmoves of a known small size, expanded after the walk: (block, index, size)
@@ -1164,7 +1325,7 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                         break;
                     }
                 }
-                if !interesting && !matches!(f.blocks[bi].insts[ii], Inst::IBin(..) | Inst::ICmp(..) | Inst::IBinI(..) | Inst::ICmpI(..) | Inst::Conv(..) | Inst::Call(Callee::Indirect(_), ..)) {
+                if !interesting && !matches!(f.blocks[bi].insts[ii], Inst::IBin(..) | Inst::ICmp(..) | Inst::IBinI(..) | Inst::ICmpI(..) | Inst::Conv(..) | Inst::Sel(..) | Inst::Call(Callee::Indirect(_), ..)) {
                     continue;
                 }
                 let old = f.blocks[bi].insts[ii].clone();
@@ -1284,6 +1445,17 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                             _ => Inst::Mov(d, y),
                         },
                         Inst::Sel(d, _, x, y) if x == y => Inst::Mov(d, x),
+                        // c ? 1 : 0 of a 0/1 value (a compare): c itself, c ? 0 : 1 is c ^ 1
+                        // (`count += is_less as usize` after an Ordering became a select)
+                        Inst::Sel(d, c, x, y)
+                            if zw[c.0 as usize] == 1 && arith_read[d.0 as usize] && f.vregs[d.0 as usize] == Cls::I && !opt_off(options, "-sel01") && matches!((kn[x.0 as usize], kn[y.0 as usize]), (Some(K::I(1)), Some(K::I(0))) | (Some(K::I(0)), Some(K::I(1)))) =>
+                        {
+                            if kn[x.0 as usize] == Some(K::I(1)) {
+                                Inst::Mov(d, c)
+                            } else {
+                                Inst::IBinI(IOp::Xor, U64, d, c, 1)
+                            }
+                        }
                         Inst::IBin(op, it, d, x, y) if imm && op != IOp::Div && op != IOp::Rem && op != IOp::MulHi => {
                             let fits = |k: Option<K>| match k {
                                 Some(K::I(v)) if v >= i32::MIN as i64 && v <= i32::MAX as i64 => Some(v),
@@ -1313,6 +1485,25 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                         }
                         other => other,
                     };
+                    // (x + k) - x -> k and x - (x + k) -> -k (wrapping 64-bit arithmetic, x one
+                    // value; LLVM InstSimplify): `data[i..i + 8]` is 8 long, so `try_into::<[u8; 8]>`
+                    // is always Ok -- the Err path, its tag store and reload and the default's fill
+                    // stayed in every BitReader::peek
+                    if ic && !opt_off(options, "-subk") {
+                        if let Inst::IBin(IOp::Sub, it, d, a, b) = new {
+                            let off = |s: VReg, x: VReg| match bin_def[s.0 as usize] {
+                                Some((op @ (IOp::Add | IOp::Sub), t, y, k, _, _)) if y == x && t.bits == 64 && single(x, &ndef) => Some(if op == IOp::Add { k } else { k.wrapping_neg() }),
+                                _ => None,
+                            };
+                            let k = if it.bits != 64 { None } else if let Some(k) = off(a, b) { Some(k) } else { off(b, a).map(|k| k.wrapping_neg()) };
+                            if let Some(k) = k {
+                                new = Inst::Iconst(d, k);
+                                if single(d, &ndef) {
+                                    kn[d.0 as usize] = Some(K::I(k));
+                                }
+                            }
+                        }
+                    }
                     // x * 1.0, 1.0 * x, x / 1.0, x - 0.0, x + -0.0, -0.0 + x: x itself (exact in
                     // IEEE arithmetic, a NaN's payload aside, which Rust leaves unspecified;
                     // LLVM's instsimplify does the same) -- `Vec4 { w: 1.0, .. }` through a matrix
@@ -1391,6 +1582,12 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                             }
                         }
                     }
+                    // `(y ^ 1) ^ 1`: y
+                    if let Inst::IBinI(IOp::Xor, _, d, x, 1) = new {
+                        if let Some(y) = xor1_def[x.0 as usize] {
+                            new = Inst::Mov(d, y);
+                        }
+                    }
                     // a compare result (0 / 1) masked with 1
                     if let Inst::IBinI(IOp::And, _, d, x, 1) = new {
                         if cmp_def[x.0 as usize].is_some() {
@@ -1404,6 +1601,137 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                             (Cond::Gt, 0) | (Cond::Ge, 1) => Inst::ICmpI(Cond::Ne, false, d, x, 0),
                             _ => new,
                         };
+                    }
+                    // a compare of a two-level select tree of constants and compare outcomes (an
+                    // Ordering made branch-free: `c1 ? -1 : (c2 ? 0 : 1)` or `lt ? -1 : ne`, maybe
+                    // narrowed to i8 by a conversion or a low mask), against a constant: the tree
+                    // of the compare's outcomes, each a constant 0 / 1, an outcome or its negation
+                    // (LLVM foldICmpSelect); the select folds below merge it into one compare
+                    // (`ord == Greater` -> `!(a <= b)`), a tree of equal outcomes is a constant
+                    // (`(lt ? -1 : ne) as u8 != 254`, Option<Ordering>'s niche test)
+                    if let (Inst::ICmpI(cc, sg, d, x, k), false) = (&new, opt_off(options, "-selfold")) {
+                        let (cc, sg, d, x, k) = (*cc, *sg, *d, *x, *k);
+                        let low_mask = |m: i64| m > 0 && (m as u64 + 1).is_power_of_two();
+                        // the narrowing steps between the select and the compare (innermost last):
+                        // conversions below 64 bits and low masks (`ord as i8 as u8`)
+                        let mut narrow: Vec<IntTy> = Vec::new();
+                        let mut root = x;
+                        while narrow.len() < 4 && single(root, &ndef) {
+                            match (conv_def.get(root.0 as usize).copied().flatten(), bin_def.get(root.0 as usize).copied().flatten()) {
+                                (Some((t, y, _, _)), _) if t.bits < 64 => {
+                                    narrow.push(t);
+                                    root = y;
+                                }
+                                (_, Some((IOp::And, _, y, m, _, _))) if low_mask(m) => {
+                                    narrow.push(IntTy { bits: (64 - (m as u64).leading_zeros()) as u8, signed: false });
+                                    root = y;
+                                }
+                                _ => break,
+                            }
+                        }
+                        // a leaf's outcome: Ok(0 / 1) a constant, Err((v, negated)) the 0 / 1 value v
+                        // (a compare result) or its negation
+                        let cmp_k = |kv: i64| cmp_i(cc, sg, narrow.iter().rev().fold(kv, |v, t| crate::bitops::ext(v, *t)), k) as i64;
+                        let leaf = |v: VReg| -> Option<Result<i64, (VReg, bool)>> {
+                            match kn[v.0 as usize] {
+                                Some(K::I(kv)) => Some(Ok(cmp_k(kv))),
+                                _ if zw[v.0 as usize] == 1 && single(v, &ndef) => {
+                                    // `y ^ 1` of an outcome y: y, negated
+                                    let (v, neg) = match xor1_def[v.0 as usize] {
+                                        Some(y) if zw[y.0 as usize] == 1 => (y, true),
+                                        _ => (v, false),
+                                    };
+                                    match (cmp_k(0), cmp_k(1)) {
+                                        (o0, o1) if o0 == o1 => Some(Ok(o0)),
+                                        (0, _) => Some(Err((v, neg))),
+                                        _ => Some(Err((v, !neg))),
+                                    }
+                                }
+                                _ => None,
+                            }
+                        };
+                        // the outcome tree, four levels at most (`partial_cmp` of floats is three);
+                        // equal subtrees collapse
+                        fn otree(v: VReg, depth: u32, sel_def: &[Option<(VReg, VReg, VReg)>], ndef: &[u32], leaf: &dyn Fn(VReg) -> Option<Result<i64, (VReg, bool)>>) -> Option<OTree> {
+                            if let Some(l) = leaf(v) {
+                                return Some(OTree::L(l));
+                            }
+                            if depth == 0 {
+                                return None;
+                            }
+                            let (c, a, b) = sel_def[v.0 as usize].filter(|_| ndef[v.0 as usize] == 1)?;
+                            let (ta, tb) = (otree(a, depth - 1, sel_def, ndef, leaf)?, otree(b, depth - 1, sel_def, ndef, leaf)?);
+                            Some(if ta == tb { ta } else { OTree::N(c, Box::new(ta), Box::new(tb)) })
+                        }
+                        fn emit(f: &mut Func, insts: &mut Vec<Inst>, t: &OTree) -> VReg {
+                            let d = f.vreg(Cls::I);
+                            let i = match t {
+                                OTree::L(Ok(kv)) => Inst::Iconst(d, *kv),
+                                OTree::L(Err((v, false))) => Inst::Mov(d, *v),
+                                OTree::L(Err((v, true))) => Inst::IBinI(IOp::Xor, U64, d, *v, 1),
+                                OTree::N(c, a, b) => {
+                                    let (ta, tb) = (emit(f, insts, a), emit(f, insts, b));
+                                    Inst::Sel(d, *c, ta, tb)
+                                }
+                            };
+                            insts.push(i);
+                            d
+                        }
+                        if let Some((_, a1, b1)) = sel_def[root.0 as usize].filter(|_| single(root, &ndef)) {
+                            let konst = |v: VReg| matches!(kn[v.0 as usize], Some(K::I(_)));
+                            match otree(root, 4, &sel_def, &ndef, &leaf) {
+                                // every outcome the same: a constant
+                                Some(OTree::L(Ok(kv))) => {
+                                    new = Inst::Iconst(d, kv);
+                                    if single(d, &ndef) {
+                                        kn[d.0 as usize] = Some(K::I(kv));
+                                    }
+                                }
+                                // a select of two constants: the select-of-constants folds below (and
+                                // the phi distribution) take it
+                                Some(t) if !(konst(a1) && konst(b1)) => {
+                                    let pos = f.blocks[bi].pos[ii];
+                                    let mut insts = Vec::new();
+                                    let top = emit(f, &mut insts, &t);
+                                    edits.push(FoldEdit { block: bi, at: ii, remove: 0, insts, pos });
+                                    new = Inst::Mov(d, top);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    // a select on `c ? k1 : k2` (constants, one of them 0): a select on c, the
+                    // arms swapped when k1 is the 0
+                    if let (Inst::Sel(d, x, p, q), false) = (&new, opt_off(options, "-selfold")) {
+                        let (d, x, p, q) = (*d, *x, *p, *q);
+                        if let Some((c, a, b)) = sel_def[x.0 as usize] {
+                            if let (Some(K::I(ka)), Some(K::I(kb)), Some(_)) = (kn[a.0 as usize], kn[b.0 as usize], cmp_def[c.0 as usize]) {
+                                if ka == 0 && kb != 0 {
+                                    new = Inst::Sel(d, c, q, p);
+                                } else if kb == 0 && ka != 0 {
+                                    new = Inst::Sel(d, c, p, q);
+                                }
+                            }
+                        }
+                    }
+                    // `c1 ? v : (c2 ? v : w)` with c1, c2 compares of the same two operands:
+                    // `(c1 | c2) ? v : w`, the union one compare (`a < b || a == b` is `a <= b`:
+                    // an `Ordering` tested for one outcome, binary_search's step)
+                    if let (Inst::Sel(d, c1, v1, x), false) = (&new, opt_off(options, "-selfold")) {
+                        let (d, c1, v1, x) = (*d, *c1, *v1, *x);
+                        if let Some((v2, w, k1, k2)) = sel_def[x.0 as usize].and_then(|(c2, v2, w)| Some((v2, w, cmp_def[c1.0 as usize]?, cmp_def[c2.0 as usize]?))) {
+                            let same_v = v1 == v2 || matches!((kn[v1.0 as usize], kn[v2.0 as usize]), (Some(K::I(p)), Some(K::I(q))) if p == q);
+                            if same_v && single(x, &ndef) {
+                                if let Some(cu) = cond_union(k1, k2) {
+                                    let cm = f.vreg(Cls::I);
+                                    let (cc, sg, a, bk, imm) = k1;
+                                    let _ = cc;
+                                    let ci = if imm { Inst::ICmpI(cu, sg, cm, a, bk) } else { Inst::ICmp(cu, sg, cm, a, VReg(bk as u32)) };
+                                    edits.push(FoldEdit { block: bi, at: ii, remove: 0, insts: vec![ci], pos: f.blocks[bi].pos[ii] });
+                                    new = Inst::Sel(d, cm, v1, w);
+                                }
+                            }
+                        }
                     }
                     // `(c ? k1 : k2) == k` with constants k1 != k2: c itself (or !c); c is a
                     // compare result (0 / 1)
@@ -1577,6 +1905,10 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
             b.insts.splice(e.at..e.at + e.remove, e.insts);
             b.pos.splice(e.at..e.at + e.remove, std::iter::repeat(e.pos).take(n));
         }
+        // `x % c == 0` (unsigned, c constant): one multiply by c's inverse and a compare
+        if !crate::stats::opt_off(options, "-remzero") {
+            changed |= rem_eq_zero(f, &kn, nv);
+        }
         // unsigned division / remainder by a constant: multiply-high and shifts
         changed |= div_by_const(f, &kn, nv);
         if !crate::stats::opt_off(options, "-divrem") {
@@ -1607,13 +1939,16 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
         thread_jumps(f);
         trace_opt(f, "dce+jumps");
         changed |= ic_nn && fold_nonnull(f);
+        if !opt_off(options, "-unfoldsel") {
+            changed |= unfold_branch_selects(f);
+        }
         let tt = pass_clock();
         let threaded = thread_on(options) && thread_known(f);
         pass_time(15, tt);
         trace_opt(f, "thread");
         changed |= threaded;
         if if_conv_on(options) {
-            changed |= if_convert(f);
+            changed |= if_convert(f, !opt_off(options, "-ifspec"));
         }
         changed |= merge_blocks(f);
         trace_opt(f, "merge");
@@ -1653,6 +1988,10 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
     // branch on `c == 0` / `c != 0` / `c ^ 1` of a compare c: branch on c (swapping the targets)
     if branch_on_compare(f) {
         dce(f);
+    }
+    // a float load read only as its bits: an integer load (and the reverse)
+    if !opt_off(options, "-loadbits") && f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Conv(Conv::FToBits(_) | Conv::BitsToF(_) | Conv::IntToInt(_), ..)))) {
+        load_bits(f);
     }
     fuse_sincos(f);
 }
@@ -1947,6 +2286,83 @@ pub fn combine_rotates(f: &mut Func) -> bool {
         }
     }
     changed
+}
+
+/// Float loads read only as their bits (`f32::to_bits` of a loaded float: `total_cmp`, float
+/// hashing and radix keys) load the integer directly: `Load(F32, x); FToBits(d, x)` ->
+/// `Load(Int(4), t); Mov(d, t)` (F64: Int(8)), and integer loads read only through `BitsToF`
+/// load the float. One definition and one use of x; the load stays where it was, so no store
+/// can come between. Returns whether anything changed.
+pub fn load_bits(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    let mut nuse = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut tu = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            for_uses(i, |u| nuse[u.0 as usize] += 1);
+        }
+        term_uses(&b.term, &mut tu);
+        for u in &tu {
+            nuse[u.0 as usize] += 1;
+        }
+    }
+    // x -> the memory kind its one reader wants
+    let mut want: Vec<Option<Mem>> = vec![None; nv];
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::Conv(c, _, x) = *i {
+                let m = match c {
+                    Conv::FToBits(w) => Mem::Int(if w { 8 } else { 4 }, false),
+                    Conv::BitsToF(w) => if w { Mem::F64 } else { Mem::F32 },
+                    // a narrow integer load re-extended at its own width: the load extends
+                    // (`to_bits() as i32` of a loaded f32: movsxd from memory)
+                    Conv::IntToInt(t) if matches!(t.bits, 8 | 16 | 32) => Mem::Int(t.bits / 8, t.signed),
+                    _ => continue,
+                };
+                if ndef[x.0 as usize] == 1 && nuse[x.0 as usize] == 1 {
+                    want[x.0 as usize] = Some(m);
+                }
+            }
+        }
+    }
+    // the loads that qualify: x -> its replacement t (of the reader's class)
+    let mut repl: Vec<Option<VReg>> = vec![None; nv];
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        for ii in 0..f.blocks[bi].insts.len() {
+            let Inst::Load(m, x, base, off) = f.blocks[bi].insts[ii] else { continue };
+            let Some(w) = want[x.0 as usize] else { continue };
+            let ok = matches!((m, w), (Mem::F32, Mem::Int(4, _)) | (Mem::F64, Mem::Int(8, _)) | (Mem::Int(4, _), Mem::F32) | (Mem::Int(8, _), Mem::F64))
+                || matches!((m, w), (Mem::Int(a, _), Mem::Int(b, _)) if a == b && a < 8);
+            if !ok {
+                continue;
+            }
+            let cls = if matches!(w, Mem::Int(..)) { Cls::I } else if w == Mem::F32 { Cls::F32 } else { Cls::F64 };
+            let t = f.vreg(cls);
+            repl.resize(f.vregs.len(), None);
+            repl[x.0 as usize] = Some(t);
+            f.blocks[bi].insts[ii] = Inst::Load(w, t, base, off);
+            changed = true;
+        }
+    }
+    if !changed {
+        return false;
+    }
+    for b in f.blocks.iter_mut() {
+        for i in b.insts.iter_mut() {
+            if let Inst::Conv(Conv::FToBits(_) | Conv::BitsToF(_) | Conv::IntToInt(_), d, x) = *i {
+                if let Some(Some(t)) = repl.get(x.0 as usize) {
+                    *i = Inst::Mov(d, *t);
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Removes pure instructions whose results are dead by liveness: the definitions `dce`'s use
@@ -2246,7 +2662,7 @@ pub fn sink_to_successor(f: &mut Func) -> bool {
         for (ii, i) in b.insts.iter().enumerate().rev() {
             uses_defs(i, &mut uses, &mut defs);
             let load = matches!(i, Inst::Load(..));
-            let movable = is_pure(i) && !matches!(i, Inst::LoadX(..) | Inst::VLoad(..) | Inst::VLoadX(..) | Inst::VGather(..) | Inst::VTbl(..) | Inst::TlsAddr(..));
+            let movable = is_pure(i) && !matches!(i, Inst::LoadX(..) | Inst::VLoad(..) | Inst::VLoadX(..) | Inst::VGather(..) | Inst::VTbl(..) | Inst::TlsAddr(..) | Inst::TlsStatic(..));
             if movable && !fp_env && (!load || !memory_effect) && defs.len() == 1 && ndef[defs[0].0 as usize] == 1 {
                 let s = use_block[defs[0].0 as usize];
                 if s < nb && s != bi && s != 0 && npred[s] == 1 && b.term.succs().any(|t| t as usize == s)
@@ -2683,6 +3099,30 @@ pub fn dce(f: &mut Func) -> bool {
             }
         }
     }
+    if any && !f.dbg.is_empty() {
+        // removed copies / constants of single-definition values the debug table names: the
+        // table keeps their value (side metadata)
+        let named = f.dbg_vregs();
+        let single = |v: VReg| match def_at[v.0 as usize] {
+            (u32::MAX, _) => f.params.contains(&v),
+            (b, _) => b < MULTI && !f.params.contains(&v),
+        };
+        let (mut copies, mut consts) = (Vec::new(), Vec::new());
+        for (bi, rs) in removed.iter().enumerate() {
+            for (k, r) in rs.iter().enumerate() {
+                if !*r {
+                    continue;
+                }
+                match &f.blocks[bi].insts[k] {
+                    Inst::Mov(d, s) if d != s && named.binary_search(&d.0).is_ok() && single(*d) && single(*s) => copies.push((*d, *s)),
+                    Inst::Iconst(d, v) if named.binary_search(&d.0).is_ok() && single(*d) => consts.push((*d, *v)),
+                    Inst::Fconst(d, bits, _) if named.binary_search(&d.0).is_ok() && single(*d) => consts.push((*d, *bits as i64)),
+                    _ => {}
+                }
+            }
+        }
+        f.dbg_salvage(&copies, &consts);
+    }
     if any {
         for (bi, b) in f.blocks.iter_mut().enumerate() {
             let rs = &removed[bi];
@@ -2893,6 +3333,103 @@ pub fn udiv_magic(d: u64) -> (u64, u32, bool) {
     }
 }
 
+/// Divisibility tests: `x % c == 0` / `!= 0` for an unsigned 32- or 64-bit x and a constant c (not a
+/// power of two) whose remainder only these compares read. With c = c0 << s (c0 odd) and
+/// inv = c0^-1 mod 2^w, `x % c == 0` exactly when `rotr(x * inv, s) <= (2^w - 1) / c` (Granlund and
+/// Montgomery; LLVM's urem-seteq fold): one multiply (and a rotate) instead of a multiply-high
+/// division sequence (Vec::retain(|x| x % 3 != 0)).
+pub fn rem_eq_zero(f: &mut Func, kn: &[Option<K>], nv: usize) -> bool {
+    let mut uses = vec![0u32; f.vregs.len()];
+    let mut cmp_uses = vec![0u32; f.vregs.len()];
+    let mut ndef = vec![0u32; f.vregs.len()];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut tu = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_uses(i, |u| uses[u.0 as usize] += 1);
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            if let Inst::ICmpI(Cond::Eq | Cond::Ne, _, _, r, 0) = i {
+                cmp_uses[r.0 as usize] += 1;
+            }
+        }
+        term_uses(&b.term, &mut tu);
+        for u in tu.drain(..) {
+            uses[u.0 as usize] += 1;
+        }
+    }
+    // candidates: r = x % c (unsigned 32 / 64 bits, c > 1 not a power of two), r single-def, read
+    // only by `r == 0` / `r != 0`
+    let mut plan: Vec<(VReg, u64, u8)> = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::IBin(IOp::Rem, it, r, _, y) = *i {
+                if it.signed || !(it.bits == 32 || it.bits == 64) || (y.0 as usize) >= nv {
+                    continue;
+                }
+                let Some(K::I(c)) = kn[y.0 as usize] else { continue };
+                let c = c as u64;
+                if c < 3 || c.is_power_of_two() || (it.bits == 32 && c >> 32 != 0) {
+                    continue;
+                }
+                if ndef[r.0 as usize] == 1 && uses[r.0 as usize] > 0 && uses[r.0 as usize] == cmp_uses[r.0 as usize] {
+                    plan.push((r, c, it.bits));
+                }
+            }
+        }
+    }
+    if plan.is_empty() {
+        return false;
+    }
+    for bi in 0..f.blocks.len() {
+        let mut k = 0;
+        while k < f.blocks[bi].insts.len() {
+            match f.blocks[bi].insts[k] {
+                Inst::IBin(IOp::Rem, it, r, x, _) if plan.iter().any(|p| p.0 == r) => {
+                    let &(_, c, bits) = plan.iter().find(|p| p.0 == r).unwrap();
+                    let s = c.trailing_zeros();
+                    let c0 = c >> s;
+                    // Newton's iteration for the inverse of an odd c0 mod 2^64 (5 steps: 3 -> 96 bits)
+                    let mut inv: u64 = c0;
+                    for _ in 0..5 {
+                        inv = inv.wrapping_mul(2u64.wrapping_sub(c0.wrapping_mul(inv)));
+                    }
+                    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                    let inv = inv & mask;
+                    let pos = f.blocks[bi].pos[k];
+                    let kv = f.vreg(Cls::I);
+                    let mut seq = vec![Inst::Iconst(kv, inv as i64)];
+                    if s == 0 {
+                        seq.push(Inst::IBin(IOp::Mul, it, r, x, kv));
+                    } else {
+                        let m = f.vreg(Cls::I);
+                        seq.push(Inst::IBin(IOp::Mul, it, m, x, kv));
+                        seq.push(Inst::IBinI(IOp::Rotl, it, r, m, (bits - s as u8) as i64));
+                    }
+                    let n = seq.len();
+                    f.blocks[bi].insts.splice(k..k + 1, seq);
+                    f.blocks[bi].pos.splice(k..k + 1, std::iter::repeat(pos).take(n));
+                    k += n;
+                }
+                Inst::ICmpI(cc @ (Cond::Eq | Cond::Ne), _, d, r, 0) if plan.iter().any(|p| p.0 == r) => {
+                    let &(_, c, bits) = plan.iter().find(|p| p.0 == r).unwrap();
+                    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                    let lim = mask / c;
+                    let pos = f.blocks[bi].pos[k];
+                    let lv = f.vreg(Cls::I);
+                    let seq = vec![Inst::Iconst(lv, lim as i64), Inst::ICmp(if cc == Cond::Eq { Cond::Le } else { Cond::Gt }, false, d, r, lv)];
+                    f.blocks[bi].insts.splice(k..k + 1, seq);
+                    f.blocks[bi].pos.splice(k..k + 1, std::iter::repeat(pos).take(2));
+                    k += 2;
+                }
+                _ => k += 1,
+            }
+        }
+    }
+    true
+}
+
 /// `x / c` and `x % c` for an unsigned x and a constant c > 1: a power of two becomes a shift
 /// / mask, anything else multiply-high and shifts (libdivide's u64 algorithm, exact for every
 /// 64-bit x, so also for narrower zero-extended values). A divide takes 20-40 cycles.
@@ -2901,6 +3438,16 @@ pub fn div_by_const(f: &mut Func, kn: &[Option<K>], nv: usize) -> bool {
     for bi in 0..f.blocks.len() {
         let mut k = 0;
         while k < f.blocks[bi].insts.len() {
+            // by 1: x / 1 is x, x % 1 is 0 (any signedness; `len / size_of::<T>()` of byte
+            // slices, `n / step` of a step of 1)
+            if let Inst::IBin(op @ (IOp::Div | IOp::Rem), _, d, x, y) = f.blocks[bi].insts[k] {
+                if (y.0 as usize) < nv && kn[y.0 as usize] == Some(K::I(1)) {
+                    f.blocks[bi].insts[k] = if op == IOp::Div { Inst::Mov(d, x) } else { Inst::Iconst(d, 0) };
+                    changed = true;
+                    k += 1;
+                    continue;
+                }
+            }
             // signed by a power of two 2^s (s < 31): bias = (x >>a 63) >>u (64 - s) is 2^s - 1 for
             // negative x, else 0; t = x + bias; quotient t >>a s, remainder x - (t & -2^s) (x is
             // sign-extended to 64 bits, so 64-bit steps are exact; the last step re-extends)
@@ -3225,8 +3772,20 @@ pub fn combine_loads(f: &mut Func, ndef: &[u32]) -> bool {
 /// `x = c ? a : b` (Sel: cmov / csel) and a jump to the join -- no branch to mispredict
 /// (rustc / LLVM SimplifyCFG speculates such arms into selects). The arms must have the
 /// branch as their only predecessor, copy into distinct registers and read none of them.
-pub fn if_convert(f: &mut Func) -> bool {
+/// Where an if-converted arm's result comes from: a register, a constant, or a speculated compare /
+/// select (computed into a fresh temporary before the select).
+#[derive(Clone)]
+enum ArmSrc {
+    V(VReg),
+    K(i64),
+    I(Inst),
+}
+
+pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
     const MAX_MOVS: usize = 3;
+    // cheap pure instructions an arm may compute into its own temporaries (speculated: they run on
+    // both paths): an `Ordering` built from a compare (`if a < b { -1 } else { (a != b) as i8 }`)
+    const MAX_SPEC: usize = 6;
     let n = f.blocks.len();
     if n < 3 {
         return false;
@@ -3240,24 +3799,85 @@ pub fn if_convert(f: &mut Func) -> bool {
             }
         }
     }
-    // an arm: (copies, join) when block x is only copies then a jump, entered only from the branch
-    let arm = |f: &Func, npred: &[u32], x: u32| -> Option<(Vec<(VReg, VReg)>, u32)> {
+    let nv = f.vregs.len();
+    let (mut ndef, mut nuse) = (vec![0u32; nv], vec![0u32; nv]);
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut tu = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            for_uses(i, |u| nuse[u.0 as usize] += 1);
+        }
+        term_uses(&b.term, &mut tu);
+        for u in tu.drain(..) {
+            nuse[u.0 as usize] += 1;
+        }
+    }
+    // compares and selects only: the arms of a value choice (an Ordering), not general arithmetic
+    // (speculating sums cost iterator loops more instructions than their branches: iter_chain +27%)
+    // A float negation too: `if x < 0.0 { -x } else { x }` (box3d's scalar abs_v: -0.0 and NaN keep
+    // their sign, so no fabs) is fcmp + fneg + fcsel, not a branch around one fneg per lane
+    // (rustc's arm64 test_bounds_triangle_overlap has no such branches)
+    let speculatable = |i: &Inst| matches!(i, Inst::ICmp(..) | Inst::ICmpI(..) | Inst::Sel(..) | Inst::FUnary(FUn::Neg, ..));
+    // an arm: (speculated temporaries, copies (dest, source or constant), join) when block x is
+    // cheap temporaries (single-def, read only in x) then copies / constants into its results and a
+    // jump, entered only from the branch
+    let arm = |f: &Func, npred: &[u32], x: u32| -> Option<(Vec<Inst>, Vec<(VReg, ArmSrc)>, u32)> {
         let b = &f.blocks[x as usize];
-        if npred[x as usize] != 1 || b.insts.len() > MAX_MOVS {
+        if npred[x as usize] != 1 || b.insts.len() > MAX_MOVS + MAX_SPEC {
+            return None;
+        }
+        // a block an earlier conversion rewrote holds its fresh temporaries (vregs made after the
+        // def / use counts): no counts to judge it by, so it is no arm this time (ndef[d] was out
+        // of bounds: O3 panic compiling wasm::Fx::expr under counted frequencies)
+        let mut fresh = false;
+        for i in &b.insts {
+            for_defs(i, |d| fresh |= d.0 as usize >= nv);
+            for_uses(i, |u| fresh |= u.0 as usize >= nv);
+        }
+        if fresh {
             return None;
         }
         let j = match b.term {
             Term::Jump(j) if j != x => j,
             _ => return None,
         };
+        let mut spec = Vec::new();
         let mut mv = Vec::new();
+        let mut local_uses: Vec<(VReg, u32)> = Vec::new();
         for i in &b.insts {
+            for_uses(i, |u| match local_uses.iter_mut().find(|e| e.0 == u) {
+                Some(e) => e.1 += 1,
+                None => local_uses.push((u, 1)),
+            });
+        }
+        for i in &b.insts {
+            let mut defs = Vec::new();
+            for_defs(i, |d| defs.push(d));
+            let temp = defs.len() == 1 && {
+                let d = defs[0];
+                // temporaries this pass made for an earlier conversion (the block is now another
+                // branch's arm) are past the counts: one def, one use in their block
+                let (nd, nu) = (ndef.get(d.0 as usize).copied().unwrap_or(1), nuse.get(d.0 as usize).copied().unwrap_or(1));
+                nd == 1 && nu > 0 && local_uses.iter().any(|e| e.0 == d && e.1 == nu)
+            };
             match i {
-                Inst::Mov(d, s) if d != s && matches!(f.vregs[d.0 as usize], Cls::I | Cls::F32 | Cls::F64) => mv.push((*d, *s)),
+                _ if temp && speculatable(i) && mv.is_empty() => spec.push(i.clone()),
+                Inst::Iconst(..) if temp && mv.is_empty() => spec.push(i.clone()),
+                Inst::Mov(d, s) if d != s && matches!(f.vregs[d.0 as usize], Cls::I | Cls::F32 | Cls::F64) => mv.push((*d, ArmSrc::V(*s))),
+                Inst::Iconst(d, k) if f.vregs[d.0 as usize] == Cls::I => mv.push((*d, ArmSrc::K(*k))),
+                // a result computed by a select / compare (the phi machinery's boolean shadow):
+                // speculated into a fresh temporary, then copied (Spec)
+                Inst::Sel(d, ..) | Inst::ICmp(_, _, d, _, _) | Inst::ICmpI(_, _, d, _, _) if defs.len() == 1 && f.vregs[d.0 as usize] == Cls::I && { let mut clean = true; for_uses(i, |u| clean &= !mv.iter().any(|(md, _)| *md == u)); clean } => mv.push((*d, ArmSrc::I(i.clone()))),
                 _ => return None,
             }
         }
-        Some((mv, j))
+        if spec.len() > MAX_SPEC || mv.len() > MAX_MOVS || (!spec_on && (!spec.is_empty() || mv.iter().any(|(_, s)| !matches!(s, ArmSrc::V(_))))) {
+            return None;
+        }
+        Some((spec, mv, j))
     };
     let mut changed = false;
     for bi in 0..n {
@@ -3268,15 +3888,28 @@ pub fn if_convert(f: &mut Func) -> bool {
             Term::Branch(c, t, e) if t != e && t as usize != bi && e as usize != bi => (c, t, e),
             _ => continue,
         };
-        let (mt, me, j) = match (arm(f, &npred, t), arm(f, &npred, e)) {
-            (Some((mt, jt)), Some((me, je))) if jt == je => (mt, me, jt),
-            (Some((mt, jt)), _) if jt == e => (mt, Vec::new(), e),
-            (_, Some((me, je))) if je == t => (Vec::new(), me, t),
+        let (st, mt0, se, me0, j) = match (arm(f, &npred, t), arm(f, &npred, e)) {
+            (Some((st, mt, jt)), Some((se, me, je))) if jt == je => (st, mt, se, me, jt),
+            (Some((st, mt, jt)), _) if jt == e => (st, mt, Vec::new(), Vec::new(), e),
+            (_, Some((se, me, je))) if je == t => (Vec::new(), Vec::new(), se, me, t),
             _ => continue,
         };
-        if mt.is_empty() && me.is_empty() {
+        if mt0.is_empty() && me0.is_empty() {
             continue;
         }
+        let konst = |m: &Vec<(VReg, ArmSrc)>| m.iter().filter(|(_, s)| !matches!(s, ArmSrc::V(_))).count();
+        // speculation only for a choice between constants and compare outcomes (an Ordering-like
+        // value): an arm that also copies values keeps its branch (iterator loops: position / any /
+        // count arms speculated cost iter_chain +26% instructions)
+        let speculated = !st.is_empty() || !se.is_empty() || konst(&mt0) + konst(&me0) > 0;
+        if speculated && mt0.iter().chain(me0.iter()).any(|(_, s)| matches!(s, ArmSrc::V(v) if !st.iter().chain(se.iter()).any(|i| { let mut d = false; for_defs(i, |x| d |= x == *v); d }))) {
+            continue;
+        }
+        if st.len() + se.len() + konst(&mt0) + konst(&me0) > MAX_SPEC {
+            continue;
+        }
+        let as_movs = |m: &Vec<(VReg, ArmSrc)>| -> Vec<(VReg, VReg)> { m.iter().map(|(d, s)| (*d, if let ArmSrc::V(v) = s { *v } else { *d })).collect() };
+        let (mt, me) = (as_movs(&mt0), as_movs(&me0));
         // destinations, each once per arm; sources and the condition are not among them
         let mut dests: Vec<VReg> = Vec::new();
         let mut ok = true;
@@ -3290,7 +3923,7 @@ pub fn if_convert(f: &mut Func) -> bool {
                 }
             }
         }
-        if !ok || dests.contains(&c) || mt.iter().chain(me.iter()).any(|(_, s)| dests.contains(s)) {
+        if !ok || dests.contains(&c) || mt0.iter().chain(me0.iter()).any(|(_, s)| match s { ArmSrc::V(v) => dests.contains(v), ArmSrc::I(i) => { let mut r = false; for_uses(i, |u| r |= dests.contains(&u)); r } ArmSrc::K(_) => false }) {
             continue;
         }
         // a choice the join then branches on stays a branch: the branch can be threaded to
@@ -3327,6 +3960,38 @@ pub fn if_convert(f: &mut Func) -> bool {
             }
         }
         let pos = f.blocks[bi].term_pos;
+        // the speculated temporaries run here, both arms' (they only define arm-local values);
+        // an arm's constant goes through a fresh temporary
+        let mut mt = mt;
+        let mut me = me;
+        for i in st.iter().chain(se.iter()) {
+            f.blocks[bi].insts.push(i.clone());
+            f.blocks[bi].pos.push(pos);
+        }
+        for (src, dst) in [(&mt0, &mut mt), (&me0, &mut me)] {
+            for (k, (d, s2)) in src.iter().enumerate() {
+                let hoisted = match s2 {
+                    ArmSrc::V(_) => continue,
+                    ArmSrc::K(kv) => {
+                        let tmp = f.vreg(f.vregs[d.0 as usize]);
+                        (Inst::Iconst(tmp, *kv), tmp)
+                    }
+                    ArmSrc::I(i) => {
+                        let tmp = f.vreg(f.vregs[d.0 as usize]);
+                        let i2 = match i.clone() {
+                            Inst::Sel(_, c2, a2, b2) => Inst::Sel(tmp, c2, a2, b2),
+                            Inst::ICmp(cc, sg, _, a2, b2) => Inst::ICmp(cc, sg, tmp, a2, b2),
+                            Inst::ICmpI(cc, sg, _, a2, k2) => Inst::ICmpI(cc, sg, tmp, a2, k2),
+                            other => other,
+                        };
+                        (i2, tmp)
+                    }
+                };
+                f.blocks[bi].insts.push(hoisted.0);
+                f.blocks[bi].pos.push(pos);
+                dst[k] = (*d, hoisted.1);
+            }
+        }
         for d in dests {
             let a = mt.iter().find(|x| x.0 == d).map_or(d, |x| x.1);
             let b = me.iter().find(|x| x.0 == d).map_or(d, |x| x.1);
@@ -3342,6 +4007,82 @@ pub fn if_convert(f: &mut Func) -> bool {
         // the arms are entered from here only: now unreachable
         npred[t as usize] = 0;
         npred[e as usize] = npred[e as usize].saturating_sub(1);
+        changed = true;
+    }
+    changed
+}
+
+/// A compare's outcome over a select tree (simplify's select-tree fold): a leaf (Ok: constant 0 / 1,
+/// Err: a 0 / 1 value or its negation) or a select on a condition.
+#[derive(Clone, PartialEq)]
+enum OTree {
+    L(Result<i64, (VReg, bool)>),
+    N(VReg, Box<OTree>, Box<OTree>),
+}
+
+/// A branch on a select of constants and compare outcomes (`c ? k : x`, what if-conversion of a
+/// callee's `Ordering` / `Option<Ordering>` leaves once the caller tests it) branches on c, then
+/// on the chosen arm (LLVM JumpThreading's select unfolding): the arms' compares become branches
+/// edge facts and threading can decide (`a < b` re-tested on the other path). The select must be
+/// read only by the branch; a constant arm goes straight to its target.
+pub fn unfold_branch_selects(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    let (mut ndef, mut nuse) = (vec![0u32; nv], vec![0u32; nv]);
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    // single definitions: 0 = other, 1 = compare outcome, 2 = constant (value in kv)
+    let mut kind = vec![0u8; nv];
+    let mut kv = vec![0i64; nv];
+    let mut sel: Vec<Option<(usize, VReg, VReg, VReg)>> = vec![None; nv];
+    let mut tu = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            for_uses(i, |u| nuse[u.0 as usize] += 1);
+            match *i {
+                Inst::ICmp(_, _, d, ..) | Inst::ICmpI(_, _, d, ..) | Inst::FCmp(_, _, d, ..) => kind[d.0 as usize] = 1,
+                Inst::Iconst(d, k) => {
+                    kind[d.0 as usize] = 2;
+                    kv[d.0 as usize] = k;
+                }
+                Inst::Sel(d, c, a, x) if f.vregs[d.0 as usize] == Cls::I => sel[d.0 as usize] = Some((bi, c, a, x)),
+                _ => {}
+            }
+        }
+        term_uses(&b.term, &mut tu);
+        for u in tu.drain(..) {
+            nuse[u.0 as usize] += 1;
+        }
+    }
+    let reach = reachable(f);
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        if !reach.get(bi).copied().unwrap_or(false) {
+            continue;
+        }
+        let (v, t, e) = match f.blocks[bi].term {
+            Term::Branch(v, t, e) if t != e => (v, t, e),
+            _ => continue,
+        };
+        let Some((sb, c, a, x)) = sel[v.0 as usize] else { continue };
+        let ok = |w: VReg| ndef[w.0 as usize] == 1 && kind[w.0 as usize] != 0;
+        if sb != bi || ndef[v.0 as usize] != 1 || nuse[v.0 as usize] != 1 || ndef[c.0 as usize] != 1 || !ok(a) || !ok(x) {
+            continue;
+        }
+        let pos = f.blocks[bi].term_pos;
+        let target = |f: &mut Func, w: VReg| -> u32 {
+            if kind[w.0 as usize] == 2 {
+                return if kv[w.0 as usize] != 0 { t } else { e };
+            }
+            let nb = f.block();
+            f.blocks[nb as usize].term = Term::Branch(w, t, e);
+            f.blocks[nb as usize].term_pos = pos;
+            nb
+        };
+        let ta = target(f, a);
+        let tx = target(f, x);
+        f.blocks[bi].term = Term::Branch(c, ta, tx);
         changed = true;
     }
     changed
@@ -3373,7 +4114,7 @@ pub fn merge_blocks(f: &mut Func) -> bool {
                 Term::Jump(t) if t as usize != bi && preds[t as usize] == 1 => t as usize,
                 _ => break,
             };
-            let tb = std::mem::replace(&mut f.blocks[t], Block { insts: Vec::new(), pos: Vec::new(), term: Term::Unreachable, term_pos: 0 });
+            let tb = std::mem::replace(&mut f.blocks[t], Block { insts: Vec::new(), pos: Vec::new(), term: Term::Unreachable, term_pos: 0, count: -1.0 });
             let b = &mut f.blocks[bi];
             b.insts.extend(tb.insts);
             b.pos.extend(tb.pos);
@@ -4430,7 +5171,7 @@ pub fn local_cse(options: &relax_session::Options, f: &mut Func) -> bool {
                     uses_defs(&b.insts[k], &mut uses, &mut defs);
                 }
             }
-            let is_load = matches!(b.insts[k], Inst::Load(..));
+            let is_load = matches!(b.insts[k], Inst::Load(..) | Inst::VLoad(..));
             ops.clear();
             ops.extend_from_slice(&uses);
             let cand = match &b.insts[k] {
@@ -4625,6 +5366,8 @@ pub fn load_key_size(k0: u64) -> i64 {
         4
     } else if mk & (2 << 16) != 0 {
         8
+    } else if mk & (4 << 16) != 0 {
+        32
     } else {
         (mk & 0xff) as i64
     }
@@ -4696,7 +5439,7 @@ pub fn gvn_pure(f: &mut Func) -> bool {
                 changed = true;
             }
             let i = &b.insts[k];
-            if matches!(i, Inst::Load(..) | Inst::Iconst(..) | Inst::Fconst(..) | Inst::VConst(..) | Inst::Addr(..) | Inst::FnAddr(..)) {
+            if matches!(i, Inst::Load(..) | Inst::VLoad(..) | Inst::Iconst(..) | Inst::Fconst(..) | Inst::VConst(..) | Inst::Addr(..) | Inst::FnAddr(..)) {
                 continue;
             }
             // an operand: its constant (Iconst / VConst operands differ by value: tagged) or its vreg
@@ -4794,6 +5537,9 @@ pub fn cse_key(i: &Inst) -> Option<[u64; 3]> {
             };
             [13 | (mk << 8), v(b), *o as i64 as u64]
         }
+        // a vector load (16 or 32 bytes: load_key_size takes 32); the result class tells V128 and
+        // V256 apart where local_cse matches keys
+        Inst::VLoad(_, b, o) => [13 | ((4 << 16) << 8), v(b), *o as i64 as u64],
         Inst::Addr(_, x) => [14, x.id as u64, x.off as u64],
         Inst::FnAddr(_, x) => [15, *x as u64, 0],
         Inst::VExtract(_, a, l) => [16 | ((*l as u64) << 8), v(a), 0],
@@ -4832,6 +5578,10 @@ pub struct SroaCell {
     pub mem: Mem,
     // Different kinds at the same offset and size share unsigned integer bits.
     pub widened: bool,
+    // A 16-byte vector cell also accessed as its 32-bit lanes (f32 / 4-byte integer loads and
+    // stores at lane offsets): those become VExtract / VInsert of the vector (LLVM SROA's vector
+    // promotion; core::arch `_mm_setr_ps` / lane setters build a vector through memory).
+    pub lanes: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -5144,7 +5894,8 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
         let mut has_in = vec![false; ns];
         let mut has_out = vec![false; ns];
         let mut access_depth = vec![0u32; ns];
-        let mut copies: Vec<(u32, i64, i64, u32)> = Vec::new(); // (group, lo, hi, loop depth)
+        // (group, lo, hi, loop depth, internal: both ends in the group, so promoted it is register moves)
+        let mut copies: Vec<(u32, i64, i64, u32, bool)> = Vec::new();
         let okat = |v: VReg| -> Option<(u32, i64)> {
             let (sl, o) = at(v);
             if sl != u32::MAX && ok[sl as usize] {
@@ -5170,16 +5921,17 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                     }
                     Inst::Copy(d, s2, n) => {
                         let (ga, gc) = (okat(*d), okat(*s2));
+                        let internal = matches!((ga, gc), (Some((x, _)), Some((y, _))) if root[x as usize] == root[y as usize]);
                         if let Some((sl, o)) = ga {
                             let lo = o + delta[sl as usize];
-                            copies.push((root[sl as usize], lo, lo + *n as i64, depth[bi as usize]));
+                            copies.push((root[sl as usize], lo, lo + *n as i64, depth[bi as usize], internal));
                             if gc.is_none() {
                                 has_in[root[sl as usize] as usize] = true;
                             }
                         }
                         if let Some((sl, o)) = gc {
                             let lo = o + delta[sl as usize];
-                            copies.push((root[sl as usize], lo, lo + *n as i64, depth[bi as usize]));
+                            copies.push((root[sl as usize], lo, lo + *n as i64, depth[bi as usize], internal));
                             if ga.is_none() {
                                 has_out[root[sl as usize] as usize] = true;
                             }
@@ -5209,10 +5961,17 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
             let size = hi - lo;
             // pure: every access is at lo with the cell's size (only the kind differs: bitcasts)
             let pure = cells[start..end].iter().all(|c| c.1 == lo && mem_size(c.2) as i64 == size);
-            if !pure {
+            // lanes: one 16-byte vector access at lo, every other access a 32-bit lane of it
+            let lanes = !pure
+                && size == 16
+                && cells[start..end].iter().any(|c| c.1 == lo && c.2 == SROA_V128)
+                && cells[start..end].iter().all(|c| (c.1 == lo && c.2 == SROA_V128) || ((c.1 - lo) % 4 == 0 && matches!(c.2, Mem::F32 | Mem::Int(4, _))));
+            if lanes {
+                gcells[g as usize].push(SroaCell { off: lo, mem: SROA_V128, widened: false, lanes: true });
+            } else if !pure {
                 bad[g as usize].get_or_insert(if kind_mix { SroaReject::KindMix } else { SroaReject::Overlap });
             } else {
-                gcells[g as usize].push(SroaCell { off: lo, mem: if widened { Mem::Int(size as u8, false) } else { m }, widened });
+                gcells[g as usize].push(SroaCell { off: lo, mem: if widened { Mem::Int(size as u8, false) } else { m }, widened, lanes: false });
             }
             start = end;
         }
@@ -5264,7 +6023,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                                 while off % n as i64 != 0 || off + n as i64 > end {
                                     n /= 2;
                                 }
-                                gaps.push(SroaCell { off, mem: Mem::Int(n, false), widened: false });
+                                gaps.push(SroaCell { off, mem: Mem::Int(n, false), widened: false, lanes: false });
                                 off += n as i64;
                             }
                         }
@@ -5276,7 +6035,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                     // moves per copy (brotli ProcessCommandsInternal: +28% instructions). Keep
                     // the group in memory unless every copied range has at most two cells per
                     // 8-byte word (plus two for an unaligned tail).
-                    let dense = copies[ci..ce].iter().all(|&(_, lo, hi, _)| {
+                    let dense = copies[ci..ce].iter().all(|&(_, lo, hi, _, _)| {
                         let n = gcells[g].iter().filter(|c| c.off >= lo && c.off < hi).count() as i64;
                         n <= (hi - lo + 7) / 8 * 2 + 2
                     });
@@ -5290,7 +6049,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
         // A copy may not cut a cell in two. Keep large copies intact unless
         // promotion removes accesses in a deeper loop: initialization of a
         // compound iterator should not keep its state in memory per element.
-        for &(g, lo, hi, copy_depth) in &copies {
+        for &(g, lo, hi, copy_depth, internal) in &copies {
             let g = g as usize;
             let mut cnt = 0;
             for c in &gcells[g] {
@@ -5303,7 +6062,9 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                 }
             }
             let limit = if has_in[g] && has_out[g] { SROA_COPY_IN_OUT_CELLS } else { SROA_COPY_CELLS };
-            if cnt > limit && copy_depth >= access_depth[g] {
+            // a copy inside the group becomes one register move per cell (coalesced away mostly):
+            // only copies to or from memory cost a load / store per cell
+            if !internal && cnt > limit && copy_depth >= access_depth[g] {
                 bad[g].get_or_insert(SroaReject::CopyCells);
             }
         }
@@ -5446,7 +6207,6 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
     // write of it reads padding or an unwritten variant field: any value will do)
     let mut slot_regs: Vec<Vec<u32>> = vec![Vec::new(); ns];
     let mut init: Vec<Inst> = Vec::new();
-    let mut vzero = None;
     for sl in 0..ns {
         if !ok[sl] {
             continue;
@@ -5462,17 +6222,10 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                 continue;
             }
             if m == SROA_V128 {
-                let z = match vzero {
-                    Some(z) => z,
-                    None => {
-                        let z = f.vreg(Cls::I);
-                        init.push(Inst::Iconst(z, 0));
-                        vzero = Some(z);
-                        z
-                    }
-                };
+                // a constant (rematerialised at its uses: movi / pxor), not a register held
+                // from the entry on
                 let r = f.vreg(Cls::V128);
-                init.push(Inst::VX(VX::FromLo64, r, z, z));
+                init.push(Inst::VConst(r, 0));
                 regs.push(r.0);
                 continue;
             }
@@ -5497,7 +6250,12 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
     // Every promoted access names an entire cell, including mixed-kind scalar accesses.
     let cell_at = |sl: u32, roff: i64| -> (VReg, SroaCell) {
         let g = root[sl as usize] as usize;
-        let k = gcells[g].binary_search_by_key(&roff, |c| c.off).expect("sroa cell");
+        // a lane access names the vector cell that contains it
+        let k = match gcells[g].binary_search_by_key(&roff, |c| c.off) {
+            Ok(k) => k,
+            Err(k) if k > 0 && gcells[g][k - 1].lanes && roff < gcells[g][k - 1].off + 16 => k - 1,
+            Err(_) => panic!("sroa cell"),
+        };
         let c = gcells[g][k];
         let r = slot_regs[sl as usize][k];
         assert!(r != u32::MAX, "sroa cell outside its slot");
@@ -5548,7 +6306,14 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                 Inst::Load(m, d, base, off) if okat(*base).is_some() => {
                     let (sl, o) = okat(*base).unwrap();
                     let (r, c) = cell_at(sl, o + *off as i64);
-                    if c.widened {
+                    if c.lanes {
+                        let lane = ((o + *off as i64 - c.off) / 4) as u8;
+                        out.push(Inst::VExtract(*d, r, lane));
+                        if *m == Mem::Int(4, false) {
+                            pos.push(p);
+                            out.push(Inst::Conv(Conv::IntToInt(IntTy { bits: 32, signed: false }), *d, *d));
+                        }
+                    } else if c.widened {
                         out.push(match *m {
                             Mem::Int(n, signed) if n < 8 => Inst::Conv(Conv::IntToInt(IntTy { bits: n * 8, signed }), *d, r),
                             Mem::Int(..) => Inst::Mov(*d, r),
@@ -5572,7 +6337,9 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                 Inst::Store(m, base, off, v) if okat(*base).is_some() => {
                     let (sl, o) = okat(*base).unwrap();
                     let (r, c) = cell_at(sl, o + *off as i64);
-                    if c.widened {
+                    if c.lanes {
+                        out.push(Inst::VInsert(r, r, ((o + *off as i64 - c.off) / 4) as u8, *v));
+                    } else if c.widened {
                         out.push(match m {
                             Mem::F32 | Mem::F64 => Inst::Conv(Conv::FToBits(*m == Mem::F64), r, *v),
                             Mem::Int(..) => Inst::Mov(r, *v),
@@ -5670,7 +6437,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
             }
             let np = insts.len();
             let nb = f.blocks.len() as u32;
-            f.blocks.push(Block { insts, pos: vec![p; np], term: Term::Jump(*t), term_pos: p });
+            f.blocks.push(Block { insts, pos: vec![p; np], term: Term::Jump(*t), term_pos: p, count: -1.0 });
             *t = nb;
         }
         f.blocks[bi].term = Term::Invoke(targets[0], targets[1]);
@@ -5891,7 +6658,10 @@ pub fn licm(options: &relax_session::Options, f: &mut Func) -> bool {
     // check's verdict are not in `f.noalias`, so they hoist nothing.
     let mut na = if f.noalias.is_empty() || no_noalias(options) { None } else { Some(noalias_roots(f, &ndef)) };
     // a param handed to a call anywhere in the function may be kept by it (then reached later through a
-    // loaded pointer, which the roots take as not derived from the param): captured for the hoist
+    // loaded pointer, which the roots take as not derived from the param): captured for the hoist,
+    // unless the callee provably keeps no pointer it gets there (O3's param_nocapture oracle, as
+    // LLVM's `nocapture`: `f1.decode(&mut r, &self.setup.codebooks, y)` left every `self.spectra`
+    // load in decode_spectra's loops)
     if let Some((_, cap, taint)) = na.as_mut() {
         for b in &f.blocks {
             for i in &b.insts {
@@ -5900,8 +6670,14 @@ pub fn licm(options: &relax_session::Options, f: &mut Func) -> bool {
                         Callee::Indirect(x) | Callee::CIndirect(x, _) => Some(*x),
                         _ => None,
                     };
-                    for a in args.iter().copied().chain(ind) {
+                    for (k, a) in args.iter().copied().enumerate() {
                         let t = taint[a.0 as usize];
+                        if t != u32::MAX && !cap.contains(&t) && !(sroa_nocapture(c, k) && !opt_off(options, "-licmnocap")) {
+                            cap.push(t);
+                        }
+                    }
+                    if let Some(x) = ind {
+                        let t = taint[x.0 as usize];
                         if t != u32::MAX && !cap.contains(&t) {
                             cap.push(t);
                         }
@@ -6265,7 +7041,94 @@ pub fn unify_slot_addrs(f: &mut Func) {
 /// Copies of 1, 2, 4, 8 or 16 bytes become integer loads then stores, so address modes can fold
 /// their addresses (a stable-partition step `copy(sel + count * 8, src, 8)` keeps `count << 3` and
 /// the add as temporaries otherwise; as [base + index * 8] it is one store).
+/// A small copy whose source was just loaded whole (same block, or the end of its one
+/// predecessor, no write or call between): a store of that value. `retain`'s
+/// `if keep(&v[i]) { v[j] = v[i] }` reads the element once.
+fn copies_from_loaded(f: &mut Func) {
+    let n = f.blocks.len();
+    let mut npred = vec![0u32; n];
+    let mut pred = vec![u32::MAX; n];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for t in b.term.succs() {
+            npred[t as usize] += 1;
+            pred[t as usize] = bi as u32;
+        }
+    }
+    // single-def `v = b + k`: accesses at [b + k] read the same bytes as at [v]
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+        }
+    }
+    let mut add_def: Vec<Option<(VReg, i64)>> = vec![None; nv];
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::IBinI(IOp::Add, it, d, x, c) = *i {
+                if it.bits == 64 && ndef[d.0 as usize] == 1 && ndef[x.0 as usize] == 1 && c.abs() < 1 << 30 {
+                    add_def[d.0 as usize] = Some((x, c));
+                }
+            }
+        }
+    }
+    for bi in 0..n {
+        for k in 0..f.blocks[bi].insts.len() {
+            let Inst::Copy(d, src, sz @ (1 | 2 | 4 | 8)) = f.blocks[bi].insts[k] else { continue };
+            let (sb, sk) = add_def[src.0 as usize].unwrap_or((src, 0));
+            let at = |base: VReg, off: i32| -> Option<i64> {
+                if base == src {
+                    Some(sk + off as i64)
+                } else if base == sb {
+                    Some(off as i64)
+                } else {
+                    None
+                }
+            };
+            let mut seen: Vec<VReg> = Vec::new();
+            let mut found = None;
+            let (mut b, mut end) = (bi, k);
+            'scan: for hop in 0..2 {
+                for j in (0..end).rev() {
+                    let i = &f.blocks[b].insts[j];
+                    if let Inst::Load(Mem::Int(w, _), v, base, off) = *i {
+                        if at(base, off) == Some(sk) && w as u32 == sz && !seen.contains(&v) {
+                            found = Some(v);
+                            break 'scan;
+                        }
+                    }
+                    // a store through the source's own base beside the copied bytes leaves them
+                    let beside = matches!(*i, Inst::Store(m, base, off, _) if at(base, off).is_some_and(|o| o >= sk + sz as i64 || o + mem_size(m) as i64 <= sk));
+                    if !beside && matches!(i, Inst::Store(..) | Inst::StoreX(..) | Inst::VStore(..) | Inst::VStoreX(..) | Inst::Copy(..) | Inst::Call(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..)) {
+                        break 'scan;
+                    }
+                    let mut hit_src = false;
+                    for_defs(i, |x| {
+                        hit_src |= x == src || x == sb;
+                        seen.push(x);
+                    });
+                    if hit_src {
+                        break 'scan;
+                    }
+                }
+                if hop == 1 || npred[b] != 1 || pred[b] == u32::MAX || pred[b] as usize == b || matches!(f.blocks[pred[b] as usize].term, Term::Invoke(..)) {
+                    break;
+                }
+                b = pred[b] as usize;
+                end = f.blocks[b].insts.len();
+            }
+            if let Some(v) = found {
+                f.blocks[bi].insts[k] = Inst::Store(Mem::Int(sz as u8, false), d, 0, v);
+            }
+        }
+    }
+}
+
 pub fn expand_small_copies(f: &mut Func) {
+    copies_from_loaded(f);
     for bi in 0..f.blocks.len() {
         if !f.blocks[bi].insts.iter().any(|i| matches!(i, Inst::Copy(_, _, 1 | 2 | 4 | 8 | 16))) {
             continue;
@@ -6301,7 +7164,46 @@ pub fn expand_small_copies(f: &mut Func) {
     }
 }
 
+/// Late: `c ? 1 : 0` / `c ? 0 : 1` of a compare result c (0 / 1) is c / c ^ 1 (setcc instead of
+/// two constants and a cmov: `count += is_less as usize` after an Ordering became a select).
+/// Runs after the last simplify, whose Ordering / phi folds read selects of constants.
+pub fn bool_selects(f: &mut Func) {
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    let mut k01: Vec<Option<i64>> = vec![None; nv];
+    let mut is_cmp = vec![false; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            match *i {
+                Inst::Iconst(d, k @ (0 | 1)) => k01[d.0 as usize] = Some(k),
+                Inst::ICmp(_, _, d, ..) | Inst::ICmpI(_, _, d, ..) | Inst::FCmp(_, _, d, ..) => is_cmp[d.0 as usize] = true,
+                _ => {}
+            }
+        }
+    }
+    let one = |v: VReg, ndef: &[u32]| ndef[v.0 as usize] == 1;
+    for b in f.blocks.iter_mut() {
+        for i in b.insts.iter_mut() {
+            if let Inst::Sel(d, c, x, y) = *i {
+                if !one(c, &ndef) || !is_cmp[c.0 as usize] || !one(x, &ndef) || !one(y, &ndef) || f.vregs[d.0 as usize] != Cls::I {
+                    continue;
+                }
+                match (k01[x.0 as usize], k01[y.0 as usize]) {
+                    (Some(1), Some(0)) => *i = Inst::Mov(d, c),
+                    (Some(0), Some(1)) => *i = Inst::IBinI(IOp::Xor, U64, d, c, 1),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 pub fn addr_modes(f: &mut Func) {
+    bool_selects(f);
     unify_slot_addrs(f);
     fold_shift_masks(f);
     expand_small_copies(f);
@@ -6332,6 +7234,20 @@ pub fn addr_modes(f: &mut Func) {
         // index of the defining inst in this block for single-def vregs
         let mut def_at: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
         let mut dead = vec![false; n];
+        // x64: uses of a vreg as an access's base in this block; an address every use of which is
+        // such an access folds into each of them (SIB with any scale and displacement is free),
+        // so the add and shift go (lomuto partition: one element loaded and stored through
+        // [v + i*4])
+        let mut blk_base: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        if cfg!(target_arch = "x86_64") {
+            for i in &b.insts {
+                match i {
+                    Inst::Load(_, _, base, _) | Inst::Store(_, base, _, _) | Inst::VLoad(_, base, _) | Inst::VStore(base, _, _) => *blk_base.entry(base.0).or_insert(0) += 1,
+                    _ => {}
+                }
+            }
+            blk_base.retain(|v, c| *c == nuse[*v as usize]);
+        }
         for k in 0..n {
             let (m, base, off) = match &b.insts[k] {
                 Inst::Load(m, _, base, off) => (*m, *base, *off),
@@ -6352,7 +7268,7 @@ pub fn addr_modes(f: &mut Func) {
             // folded into each one that needs no displacement ([x, x{, lsl #size}] is free); the
             // add stays for the others and goes with its last use
             let ai = match def_at.get(&base.0) {
-                Some(&ai) if (nuse[base.0 as usize] == 1 || cfg!(target_arch = "aarch64")) && !dead[ai] => ai,
+                Some(&ai) if (nuse[base.0 as usize] == 1 || cfg!(target_arch = "aarch64") || blk_base.contains_key(&base.0)) && !dead[ai] => ai,
                 _ => continue,
             };
             let shared_add = nuse[base.0 as usize] > 1;
@@ -6403,7 +7319,7 @@ pub fn addr_modes(f: &mut Func) {
             let mut fold_at: Option<usize> = None;
             // a shift that stays for other uses keeps reading idx: no folding through it
             let shift_stays = shared_add || si.is_some_and(|si| matches!(b.insts[si], Inst::IBinI(_, _, sv, _, _) if nuse[sv.0 as usize] > 1));
-            if shared_add && (off != 0 || !(sh == 0 || sh as i64 == natural)) {
+            if shared_add && cfg!(target_arch = "aarch64") && (off != 0 || !(sh == 0 || sh as i64 == natural)) {
                 continue;
             }
             if let Some(&ii) = def_at.get(&idx.0).filter(|_| !shift_stays) {
@@ -6619,7 +7535,7 @@ pub fn rotate_loops(f: &mut Func) {
         };
         if branch_latch {
             let nb = f.blocks.len() as u32;
-            f.blocks.push(Block { insts, pos: hb.pos.clone(), term, term_pos: hb.term_pos });
+            f.blocks.push(Block { insts, pos: hb.pos.clone(), term, term_pos: hb.term_pos, count: hb.count });
             if let Term::Branch(_, _, ref mut e) = f.blocks[l].term {
                 *e = nb;
             }

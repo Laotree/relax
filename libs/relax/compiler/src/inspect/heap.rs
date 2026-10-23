@@ -705,7 +705,7 @@ fn start(host: bool, rate: u64) -> Result<(), &'static str> {
     #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
     {
         if REAL[0].load(Relaxed) == 0 {
-            return Err("the program has not called the allocator through makepad run yet");
+            return Err("the program has not called the allocator through makepad run yet: ask again in a second (it hooks the allocator on its first call)");
         }
         PROGRAM.on.store(false, Release);
         PROGRAM.tables.store(new_tables(rate), Release);
@@ -803,13 +803,29 @@ fn plumbing(name: &str) -> bool {
 }
 
 fn site_json(frames: &[super::Frame], depth: usize) -> String {
-    let skip = frames.iter().position(|f| !plumbing(&f.name)).unwrap_or(0);
-    let what = frames.get(..skip).and_then(|v| v.last()).map(|f| super::short(&f.name, 90)).unwrap_or_default();
-    let fr: Vec<String> = frames.iter().skip(skip).take(depth).map(super::frame_json).collect();
+    // the logical frames (an inlined copy's levels, innermost first) with their physical frame:
+    // the site is the first logical frame that is not allocator plumbing (an allocation in
+    // `format!` inlined into `render_label` is render_label's)
+    let logical: Vec<(usize, &str, &str)> = frames
+        .iter()
+        .enumerate()
+        .flat_map(|(i, f)| {
+            if f.levels.is_empty() {
+                vec![(i, f.name.as_str(), f.at.as_str())]
+            } else {
+                f.levels.iter().map(|(n, at)| (i, n.as_str(), at.as_str())).collect()
+            }
+        })
+        .collect();
+    let skip = logical.iter().position(|l| !plumbing(l.1) && !l.1.starts_with("(inlined")).unwrap_or(0);
+    let what = logical.get(..skip).and_then(|v| v.iter().rev().find(|l| !l.1.starts_with("(inlined"))).map(|l| super::short(l.1, 90)).unwrap_or_default();
+    let first = logical.get(skip).map_or(0, |l| l.0);
+    let fr: Vec<String> = frames.iter().skip(first).take(depth).map(super::frame_json).collect();
+    let site = logical.get(skip).map(|l| format!("\"site\":{},\"site_at\":{},", json_str(&super::short(l.1, 140)), json_str(l.2))).unwrap_or_default();
     if what.is_empty() {
-        format!("\"frames\":[{}]", fr.join(","))
+        format!("{}\"frames\":[{}]", site, fr.join(","))
     } else {
-        format!("\"via\":{},\"frames\":[{}]", json_str(&what), fr.join(","))
+        format!("{}\"via\":{},\"frames\":[{}]", site, json_str(&what), fr.join(","))
     }
 }
 
@@ -899,6 +915,10 @@ pub fn cmd_heap(req: &Req, out: &mut Out) {
             }
             let mut r = all;
             r.sort_by(|a, b| key(b).cmp(&key(a)).then(a.0.cmp(&b.0)));
+            // the totals, and what the cut leaves out
+            let (tl, ta) = r.iter().fold((0i64, 0i64), |s, x| (s.0 + x.1 as i64, s.1 + x.3 as i64));
+            let (rl, ra) = r.iter().skip(n).fold((0i64, 0i64), |s, x| (s.0 + x.1 as i64, s.1 + x.3 as i64));
+            let rest = format!("{{\"sites\":{},\"total_live_mb\":{},\"total_alloc_mb\":{},\"window_s\":{:.1},\"not_shown\":{},\"not_shown_live_mb\":{},\"not_shown_alloc_mb\":{}}}", r.len(), mbs(tl), mbs(ta), secs, r.len().saturating_sub(n), mbs(rl), mbs(ra));
             r.truncate(n);
             let ids: Vec<usize> = r.iter().map(|x| x.0).collect();
             let names = stack_names(t, &ids, &mut partial);
@@ -918,6 +938,7 @@ pub fn cmd_heap(req: &Req, out: &mut Out) {
                     site_json(&names[k], depth)
                 ));
             }
+            out.line(&rest);
         }
         "snap" => {
             let Some(t) = tr.tables() else {
@@ -933,6 +954,66 @@ pub fn cmd_heap(req: &Req, out: &mut Out) {
             s.push((name.clone(), host, now_ms(), rows(t)));
             super::mem::mark(&format!("heap snap {}", name));
             out.line(&format!("{{\"heap_snap\":{},\"of\":{},\"stacks\":{}}}", json_str(&name), json_str(what), t.used.load(Acquire)));
+        }
+        "frame" | "rate" => {
+            // allocation per frame: the tracked stacks' allocations over a window / the UI frames in it
+            let Some(t) = tr.tables() else {
+                out.err(&format!("no {} tracking: `heap start rate=4096` first (byte sampling: a smaller rate sees more small blocks)", what));
+                return;
+            };
+            let secs = req.get("s").and_then(|v| v.parse::<f64>().ok()).unwrap_or(2.0).clamp(0.2, 30.0);
+            let n = req.num("n", 12) as usize;
+            let a = rows(t);
+            let f0 = super::timeline::FRAMES.load(Relaxed);
+            let t0 = std::time::Instant::now();
+            let gone = out.gone();
+            while t0.elapsed().as_secs_f64() < secs && !gone() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let took = t0.elapsed().as_secs_f64();
+            let b = rows(t);
+            let frames = super::timeline::FRAMES.load(Relaxed).saturating_sub(f0);
+            let mut d: Vec<(usize, i64, i64)> = b.iter().map(|x| {
+                let (bytes0, blocks0) = a.get(x.0).map_or((0, 0), |y| (y.3, y.4));
+                (x.0, x.3 - bytes0, x.4 - blocks0)
+            }).filter(|x| x.2 > 0).collect();
+            d.sort_by(|x, y| y.2.cmp(&x.2).then(x.0.cmp(&y.0)));
+            let (tb, tn): (i64, i64) = d.iter().fold((0, 0), |s, x| (s.0 + x.1, s.1 + x.2));
+            let per = |v: i64| if frames > 0 { format!("{:.1}", v as f64 / frames as f64) } else { "-".into() };
+            out.always(&format!(
+                "{} allocations ({:.1} KB) in {:.1} s, {} frames: {} allocs/frame, {:.0} allocs/s (estimates from 1-in-{}-bytes sampling)",
+                tn, tb as f64 / 1024.0, took, frames, per(tn), tn as f64 / took.max(0.01), t.rate
+            ));
+            let ids: Vec<usize> = d.iter().take(n).map(|x| x.0).collect();
+            let mut partial = Vec::new();
+            let names = stack_names(t, &ids, &mut partial);
+            out.line("");
+            out.line("| site | allocs/frame | KB/frame | allocs/s | stack |");
+            out.line("|---|---:|---:|---:|---|");
+            for (k, x) in d.iter().take(n).enumerate() {
+                let fr = names.get(k).cloned().unwrap_or_default();
+                let site = fr.iter().find(|f| !plumbing(&f.name)).map(|f| format!("{} {}", super::short(&f.name, 70), f.at)).unwrap_or_else(|| "?".into());
+                let path: Vec<String> = fr.iter().filter(|f| !plumbing(&f.name)).take(3).map(|f| super::short(&super::asm_plain(&f.name), 40)).collect();
+                out.line(&format!(
+                    "| H{} {} | {} | {} | {:.0} | {} |",
+                    x.0,
+                    site.replace('|', "/"),
+                    per(x.2),
+                    if frames > 0 { format!("{:.2}", x.1 as f64 / 1024.0 / frames as f64) } else { "-".into() },
+                    x.2 as f64 / took.max(0.01),
+                    path.join(" < ").replace('|', "/")
+                ));
+            }
+            if d.len() > n {
+                out.line(&format!("+{} more sites", d.len() - n));
+            }
+            if frames == 0 {
+                out.always("note: no UI frames in the window (not a makepad UI app, or nothing redrew): per-second rates only");
+            }
+            for p in partial {
+                out.always(&format!("note: {}", p));
+            }
+            out.always("more: path H<n>  heap snap a; heap diff a now (leak candidates)  memory (fragmentation: malloc in use vs held free)");
         }
         "diff" => {
             let Some(t) = tr.tables() else {

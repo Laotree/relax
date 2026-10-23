@@ -91,7 +91,7 @@ fn call_traced<R>(at: &'static str, f: impl FnOnce() -> R) -> R {
     let traced = TRACE.with(|s| s.started.is_some());
     let holder = if traced { Some(crate::owner::serving_note()) } else { None };
     let t = Instant::now();
-    crate::owner::call(crate::owner::Class::App, || {
+    crate::owner::call(crate::owner::Class::Program, || {
         let waited = t.elapsed().as_secs_f64() * 1e3;
         if let Some(h) = holder.filter(|_| waited > 5.0) {
             eprintln!("reload-trace: unit call wait {waited:.1} ms before {at}: the owner was serving {h}");
@@ -442,7 +442,7 @@ fn publish_reload(u: &mut Unit, versions: &[(u32, u32)], full: bool, scope: Opti
 /// to their previous code, the files to their previous versions, the consts to their previous
 /// values. Returns the rolled-back functions' names. The caller makes a unit call.
 pub unsafe fn rollback(up: *mut Unit, undo: Undo) -> Vec<String> {
-    crate::owner::call(crate::owner::Class::App, || {
+    crate::owner::call(crate::owner::Class::Program, || {
         let u = &mut *up;
         u.flush_cache_records();
         jit::bump_patch_epoch();
@@ -1083,9 +1083,22 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
     // incrementally, apply_locked)
     let addable = |pf: &crate::parser::ParsedFile, k: &ItemKind| matches!(k, ItemKind::Fn(sig, _, _) if pf.ast.fn_sig(*sig).lazy_body.is_some()) || matches!(k, ItemKind::Fn(_, Some(_), _) | ItemKind::Const(..) | ItemKind::Static(..) | ItemKind::Struct(..) | ItemKind::Enum(..) | ItemKind::Union(..) | ItemKind::TypeAlias { .. } | ItemKind::Impl { .. } | ItemKind::Use { .. } | ItemKind::Mod(Some(_)));
     let inherent_impl = |pf: &crate::parser::ParsedFile, i: u32| matches!(&pf.ast.items[i as usize].kind, ItemKind::Impl(r) if pf.ast.row(*r).trait_.is_none());
+    // an item in a body (`use` in a fn or closure body, a nested fn): part of the edit of the
+    // paired item whose body holds it -- its body is checked again, and its blocks' items get
+    // their scopes when the version is committed (Program::collect_new_body_blocks)
+    let in_paired_body = |pf: &crate::parser::ParsedFile, side_new: bool, at: u32| -> bool {
+        pairs.iter().any(|&(i, j)| {
+            let k = if side_new { j } else { i };
+            let it = &pf.ast.items[k as usize];
+            matches!(it.kind, ItemKind::Fn(..) | ItemKind::Const(..) | ItemKind::Static(..)) && it.lo < at && at < it.hi
+        })
+    };
     for &j in &added {
         let it = &na.items[j as usize];
         let name = String::from_utf8_lossy(&new.src[it.name.lo as usize..it.name.hi as usize]).into_owned();
+        if !nreached[j as usize] && in_paired_body(new, true, it.lo) {
+            continue;
+        }
         // inside an added container: collected with it
         if let Some(p) = np[j as usize] {
             if added.contains(&p) {
@@ -1108,12 +1121,19 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
         // (a Drop impl changes needs_drop of its type: apply_locked rebuilds what dropped it)
         match at {
             Some(a) => plan_added.push((j, a)),
-            None => why.push(format!("{}: {} `{}` added here -- adding this kind of item is not applied live yet: restart the app", pos(new, it.lo), kind_name(&it.kind), name)),
+            None => {
+                let shown = if name.is_empty() { String::from_utf8_lossy(&new.src[it.lo as usize..(it.hi as usize).min(it.lo as usize + 80)]).split_whitespace().collect::<Vec<_>>().join(" ") } else { format!("`{}`", name) };
+                let place = if nreached[j as usize] { "" } else { " (inside a fn body)" };
+                why.push(format!("{}: {} {} added here{} -- adding this kind of item is not applied live yet: restart the app", pos(new, it.lo), kind_name(&it.kind), shown, place))
+            }
         }
     }
     for &i in &removed {
         let it = &oa.items[i as usize];
         let name = String::from_utf8_lossy(&old.src[it.name.lo as usize..it.name.hi as usize]).into_owned();
+        if !oreached[i as usize] && in_paired_body(old, false, it.lo) {
+            continue;
+        }
         if let Some(p) = op[i as usize] {
             if removed.contains(&p) && !matches!(&oa.items[p as usize].kind, ItemKind::Impl { .. }) {
                 continue;
@@ -1371,12 +1391,12 @@ fn layout_edit(u: &Unit, d: DefId, fresh: &crate::tcx::AdtT, running_discriminan
         use crate::types::TyKind::*;
         match (u.tcx.tys.kind(from), u.tcx.tys.kind(to)) {
             (Int(a), Int(b)) => {
-                let (sa, ga) = crate::types::Types::int_info(*a);
-                let (sb, gb) = crate::types::Types::int_info(*b);
+                let (sa, ga) = u.tcx.tys.int_info(*a);
+                let (sb, gb) = u.tcx.tys.int_info(*b);
                 (ga == gb && sb >= sa) || (!ga && gb && sb > sa)
             }
             (Float(a), Float(b)) => fsize(*a) <= fsize(*b),
-            (Int(a), Float(b)) => crate::types::Types::int_info(*a).0 < fsize(*b),
+            (Int(a), Float(b)) => u.tcx.tys.int_info(*a).0 < fsize(*b),
             _ => false,
         }
     };
@@ -1717,7 +1737,7 @@ unsafe fn discriminant_deps_changed(up: *mut Unit, anon: DefId, changed: &[DefId
 fn referenced_slots(relocs: &[relax_backend::rir::RelocAt], out: &mut Vec<u32>) {
     for r in relocs {
         match r.target {
-            relax_backend::rir::Reloc::Slot(id) | relax_backend::rir::Reloc::Thunk(id) => out.push(id),
+            relax_backend::rir::Reloc::Slot(id) | relax_backend::rir::Reloc::Thunk(id) | relax_backend::rir::Reloc::Call(id) => out.push(id),
             _ => {}
         }
     }
@@ -1769,7 +1789,7 @@ unsafe fn compile_guarded(up: *mut Unit, id: u32) -> Result<Code, String> {
         Ok(r) => r,
         Err(p) => {
             let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".to_string());
-            if p.is::<crate::preempt::OwnerBusy>() {
+            if p.is::<crate::preempt::OwnerBusy>() || p.is::<crate::preempt::PublishBail>() {
                 std::panic::resume_unwind(p);
             }
             let u = &mut *up;
@@ -2020,7 +2040,7 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, partial: u8, module: bool)
             Outcome { kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("internal compiler error applying the edit: {} -- makepad run bug, report it; restart the app", msg)], names: Vec::new(), changed: 0, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] }
         }
     };
-    crate::owner::call(crate::owner::Class::App, || {
+    crate::owner::call(crate::owner::Class::Program, || {
         (*up).reload_rir = None;
         jit::close_patch();
     });
@@ -2595,6 +2615,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     news_pairs.push(pairs);
                     let items: Vec<(crate::ast::ItemId, Result<u32, DefId>)> = added.iter().map(|&(j, at)| (crate::ast::ItemId(j), at)).collect();
                     trace_count("added_items", items.len());
+                    // items added inside a paired body (a `use` in a closure) got their defs at the
+                    // commit: the type context collects them with the other added items
+                    added_defs.extend(u.prog.take_body_added());
                     match u.prog.add_items(n, &items) {
                         Ok(ds) => added_defs.extend(ds),
                         Err(e) => add_errs.push(e),
@@ -2611,6 +2634,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     removed_defs.extend(removed);
                 }
                 Err(e) => {
+                    let _ = u.prog.take_body_added();
                     for (k, &(o, n)) in news.iter().enumerate().rev() {
                         u.prog.revert_version(o, n, &news_pairs[k]);
                     }
@@ -2624,6 +2648,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 }
             }
         }
+        // the defs the commits made (closures and anonymous constants of the edited bodies)
+        u.tcx.grow_to(&u.prog);
         // imports the added items brought (`use`, an inline `mod`'s): resolved now, only theirs
         if u.prog.imports.len() > imports0 {
             u.prog.resolve_imports_from_in(imports0, &visible_crates);
@@ -2925,6 +2951,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             // SPEC-V: the edited bodies have no verdict for their new text yet: flagged before any
             // caller of this batch looks at them (unverified code is not inlined)
             let unverified = !u.verdict_clean(id);
+            if unverified { crate::jit::note_unverified(u, id); }
             let f = &mut u.fns[id as usize];
             f.unverified.store(unverified, Ordering::Relaxed);
             f.rir = None;
@@ -3508,7 +3535,7 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
         // Some(None): verified, Some(Some(events)): rejected, None: not yet
         let mut unchecked: Vec<String> = Vec::new();
         let state: Option<Option<Vec<crate::borrowck::event::GandalfEvent>>> = unsafe {
-            crate::owner::call(crate::owner::Class::App, || {
+            crate::owner::call(crate::owner::Class::Program, || {
                 let u = &*up;
                 let mut failed = Vec::new();
                 let mut waiting = false;
@@ -3603,6 +3630,34 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
         }
     }
     back
+}
+
+/// MAKEPAD_RUN_AUTO_RELAUNCH=1: a change that cannot apply live relaunches the app domain at once
+/// (the old default). Off: it waits for `session relaunch`.
+fn auto_relaunch() -> bool {
+    std::env::var("MAKEPAD_RUN_AUTO_RELAUNCH").is_ok_and(|v| v == "1")
+}
+
+/// Edits waiting for a relaunch (`session` in inspect lists them).
+static RESTART_PENDING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn note_restart_pending(why: &str) {
+    let mut p = RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if !p.iter().any(|x| x == why) {
+        p.push(why.to_string());
+    }
+    if p.len() > 32 {
+        p.remove(0);
+    }
+}
+
+/// The edits that wait for a relaunch, oldest first (cleared by a relaunch).
+pub fn restart_pending() -> Vec<String> {
+    RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+pub fn clear_restart_pending() {
+    RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 fn patch_refused_event(what: &str, refused: bool, lines: &[String]) {
@@ -3810,7 +3865,7 @@ fn idle_outcome(file: Option<u32>, line: &str) -> Outcome {
 }
 
 unsafe fn stream_file(up: *mut Unit, path: &str) -> Option<u32> {
-    crate::owner::call(crate::owner::Class::App, || {
+    crate::owner::call(crate::owner::Class::Program, || {
         let prog = &(&*up).prog;
         prog.mods.iter().map(|m| m.file).find(|&f| prog.file_paths[f as usize] == path)
     })
@@ -3914,7 +3969,7 @@ unsafe fn drain_streams(up: *mut Unit) {
             s.reported = true;
             if let Some((file, path)) = target_file(up, target) {
                 let seen = Instant::now();
-                let (parsed, composed) = crate::owner::call(crate::owner::Class::App, || {
+                let (parsed, composed) = crate::owner::call(crate::owner::Class::Program, || {
                     let parsed = (&*up).prog.parse_version(file, &path, s.text.clone());
                     // A stall is diagnostic, not an instruction to delete the unstreamed tail.
                     let composed = if parsed.is_ok() && (path.ends_with(".rs") || matches!(target, StreamTarget::Module(_))) {
@@ -4051,7 +4106,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
     };
     // (the watcher's holds read the program's files only: lock_unit_quick)
     let mut files: Vec<(String, u32, Option<(std::time::SystemTime, u64)>)> = {
-        crate::owner::call_quick(crate::owner::Class::App, || {
+        crate::owner::call_quick(crate::owner::Class::Program, || {
             let loaded: std::collections::HashMap<_, _> = own_files(&*up).into_iter().collect();
             let mut v: Vec<_> = inputs.paths.iter().map(|(p, (stamp, _))| (p.clone(), loaded.get(p).copied().unwrap_or(u32::MAX), *stamp)).collect();
             for (p, i) in loaded {
@@ -4079,7 +4134,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
     // the hot set: the program's own package (its root crate's directory) and every file saved
     // this session, polled every 5 ms (a few stats); every file is polled every 100 ms
     let mut hot: Vec<usize> = {
-        let dir = crate::owner::call_quick(crate::owner::Class::App, || {
+        let dir = crate::owner::call_quick(crate::owner::Class::Program, || {
             let u = &*up;
             let root = crate::layout::root_crate() as usize;
             u.prog.crates.get(root).and_then(|c| u.prog.mods.get(c.root_mod as usize)).and_then(|m| u.prog.file_paths.get(m.file as usize)).and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_string_lossy().into_owned()))
@@ -4108,7 +4163,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
                 *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::zone_alloc::kept_clone(&next));
                 inputs = next;
             }
-            let loaded = crate::owner::call_quick(crate::owner::Class::App, || own_files(&*up));
+            let loaded = crate::owner::call_quick(crate::owner::Class::Program, || own_files(&*up));
             files = inputs.paths.iter().map(|(p, (s, _))| (p.clone(), u32::MAX, *s)).collect();
             for (path, file) in loaded {
                 if let Some(f) = files.iter_mut().find(|f| f.0 == path) { f.1 = file; }
@@ -4136,7 +4191,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
         if loads != loads_seen || rewatched {
             loads_seen = loads;
             let t_own = Instant::now();
-            let loaded = crate::owner::call_quick(crate::owner::Class::App, || own_files(&*up));
+            let loaded = crate::owner::call_quick(crate::owner::Class::Program, || own_files(&*up));
             if std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() { eprintln!("makepad live: rewatch (loads {loads}, startup scan {rewatched}): own files in {:.1} ms at t={:.0} ms", t_own.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
             let known: std::collections::HashMap<_, _> = files.iter().enumerate().map(|(i, f)| (f.0.clone(), i)).collect();
             let mut added = Vec::new();
@@ -4280,7 +4335,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
                 .then_some("sources outside the loaded program changed")
         });
         if let Some(reason) = reason {
-            if !inputs.host_restart_required(changed.iter().map(|&k| files[k].0.as_str())) && restart_domain(reason.to_string()) {
+            if auto_relaunch() && !inputs.host_restart_required(changed.iter().map(|&k| files[k].0.as_str())) && restart_domain(reason.to_string()) {
                 eprintln!("makepad live: {reason}; relaunching the app domain (window kept)");
                 restart_required = true;
                 stalled.clear();
@@ -4294,7 +4349,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
             } else {
                 format!("restart `makepad run {package}`")
             };
-            let message = format!("{} {what} changed: {reason}; {restart} to pick them up; keeping the running code", changed.len());
+            let message = format!("{} {what} changed: {reason}; {restart} (or `makepad inspect <app> session relaunch`) to pick them up; keeping the running code", changed.len());
+            note_restart_pending(&message);
             eprintln!("makepad live: {message}");
             live_log(&format!("{{\"restart_required\":true,\"message\":{}}}", json_str(&message)));
             restart_required = true;
@@ -4325,7 +4381,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
             };
             // unchanged text (touched, or saved back to the running version)
             let same = {
-                crate::owner::call(crate::owner::Class::App, || {
+                crate::owner::call(crate::owner::Class::Program, || {
                     let u = &*up;
                     let pf = &u.prog.files[f.1 as usize];
                     pf.src[..pf.src_len as usize] == src[..]
@@ -4376,17 +4432,23 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
                 o.ms.iter().sum::<f64>()
             ),
             Rung::Refuse => eprintln!("makepad live: {}: NOT applied (errors below); the app runs the previous code", what),
-            Rung::Restart if restart_domain(format!("{}: {}", what, o.lines.first().cloned().unwrap_or_default())) => {
+            // a change that cannot apply live never relaunches on its own (a relaunch lost the
+            // user's session): the old code keeps running until a relaunch is asked for
+            // (`session relaunch`, or MAKEPAD_RUN_AUTO_RELAUNCH=1)
+            Rung::Restart if auto_relaunch() && restart_domain(format!("{}: {}", what, o.lines.first().cloned().unwrap_or_default())) => {
                 restart_required = true;
                 eprintln!("makepad live: {what}: relaunching the app domain (window kept)");
             }
-            Rung::Restart if RESTART_SUPPORTED.load(std::sync::atomic::Ordering::SeqCst) => {
+            Rung::Restart if auto_relaunch() && RESTART_SUPPORTED.load(std::sync::atomic::Ordering::SeqCst) => {
                 // the program restarts itself at its next safe point, carrying its state over
                 *RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = format!("{}: {}", what, o.lines.first().cloned().unwrap_or_default());
                 RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
                 eprintln!("makepad live: {}: restarting with state at the app's next safe point (reasons below)", what);
             }
-            Rung::Restart => eprintln!("makepad live: {}: needs a restart (reasons below); the app runs the previous code", what),
+            Rung::Restart => {
+                note_restart_pending(&format!("{}: {}", what, o.lines.first().cloned().unwrap_or_default()));
+                eprintln!("makepad live: {}: restart to apply (reasons below); the app keeps running the previous code -- `makepad inspect <app> session relaunch` applies it", what)
+            }
         }
         for l in &o.lines {
             eprintln!("makepad live:   {}", l);
@@ -4403,7 +4465,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
             // SPEC-V: the slots this group installed without a clean verdict (all of them, unless
             // --check-first refused what failed before the install)
             let group = u.group;
-            let ids: Vec<u32> = crate::owner::call(crate::owner::Class::App, || {
+            let ids: Vec<u32> = crate::owner::call(crate::owner::Class::Program, || {
                 let up = &*up;
                 (0..up.fns.len() as u32).filter(|&id| up.fns[id as usize].patch_gen == group && up.fns[id as usize].unverified.load(Ordering::Relaxed)).collect()
             });
@@ -4508,7 +4570,7 @@ mod use_edit_tests {
         isolated_test!(editing_a_use_of_a_same_module_item_patches);
         const CHILD: &str = "MAKEPAD_RUN_USE_EDIT_CASE";
         let Ok(case) = std::env::var(CHILD) else {
-            for case in ["enum_variants", "fn_rename"] {
+            for case in ["enum_variants", "fn_rename", "use_in_closure", "closure_added"] {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "reload::use_edit_tests::editing_a_use_of_a_same_module_item_patches", "--nocapture", "--test-threads=1"])
                     .env(CHILD, case).env("MAKEPAD_RUN_CTFE", "0").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0")
@@ -4523,6 +4585,15 @@ mod use_edit_tests {
             "enum_variants" => (
                 "enum M { A, B }\nuse M::{A, B};\nfn main() { let _ = (A, B); }\n",
                 "enum M { A, B }\nuse M::{B, A};\nfn main() { let _ = (A, B); }\n"),
+            // a `use` and a fn added inside a closure body (LIVEDEBUG2: their defs were never
+            // collected, so the declaration table the borrow checker reads stopped short of them)
+            // a body edit that adds a closure: def_collector gives it a def at the commit
+            "closure_added" => (
+                "fn main() { let _ = 1u32; }\n",
+                "fn main() { let f = || 2u32; let g = move |x: u32| x + f(); let _ = g(1); }\n"),
+            "use_in_closure" => (
+                "mod m { pub fn g() -> u32 { 1 } }\nfn main() { let f = || 1u32; let _ = f(); }\n",
+                "mod m { pub fn g() -> u32 { 1 } }\nfn main() { let f = || { use self::m::g as h; fn k() -> u32 { 2 } h() + k() }; let _ = f(); }\n"),
             _ => (
                 "fn f() {}\nuse self::f as g;\nfn main() { g(); }\n",
                 "fn f() {}\nuse self::f as g;\nfn main() { g(); g(); }\n"),
@@ -4536,12 +4607,26 @@ mod use_edit_tests {
         let file = prog.defs.iter().find(|d| d.krate == krate && d.kind == DefKind::Fn).map(|d| d.file).unwrap();
         let mut tcx = crate::tcx::Tcx::new();
         tcx.collect(&prog);
+        // the declaration table exists before the edit (as in a running app)
+        let main = (0..prog.defs.len() as u32).map(DefId).find(|d| prog.def(*d).krate == krate && prog.name(*d) == "main").unwrap();
+        let _ = tcx.generic_indices_of(&prog, main);
         crate::layout::set_root_crate(krate);
         crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut unit = Unit::new(prog, tcx, core);
         let up = &mut *unit as *mut Unit;
         let outcome = unsafe { apply(up, vec![Edit { file, path: path.to_string_lossy().into_owned(), src: new.as_bytes().to_vec() }]) };
         assert_eq!(outcome.rung, Rung::Patch, "{case}: {:?}", outcome.lines);
+        if case == "use_in_closure" {
+            // the body's new fn `k` has a def
+            assert!((0..unit.prog.defs.len() as u32).map(DefId).any(|d| unit.prog.def(d).krate == krate && unit.prog.name(d) == "k"), "k collected");
+        }
+        if case == "use_in_closure" || case == "closure_added" {
+            // every def of the crate, the edit's new ones too, has its declarations (the borrow
+            // checker of the edited fn asks for its closures')
+            for d in (0..unit.prog.defs.len() as u32).map(DefId).filter(|d| unit.prog.def(*d).krate == krate) {
+                let _ = unit.tcx.generic_indices_of(&unit.prog, d);
+            }
+        }
         std::mem::forget(unit);
         std::fs::remove_file(path).unwrap();
     }
