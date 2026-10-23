@@ -9,6 +9,8 @@
 //! - `background()`: the OS background class (aot-min's compile workers: macOS QOS_CLASS_BACKGROUND,
 //!   Linux SCHED_IDLE, Windows EcoQoS).
 //! - `interactive()`: the sampler thread asks not to have its timers coalesced.
+//! - `performance_cores()`: logical CPUs of the performance class (macOS: hw.perflevel0; elsewhere
+//!   every CPU this process may run on).
 //! - `realtime()`: the calling thread runs under a real-time policy (an audio callback thread:
 //!   SCHED_FIFO/RR on Linux, a time-constraint policy on macOS).
 //! - `fork()`: the C library's fork (unix), for the fork the loader hands to programs.
@@ -31,12 +33,84 @@ mod unix {
         unsafe { pthread_self() as u64 }
     }
 
-    /// A thread's name (pthread), for diagnostics.
-    pub fn name(t: u64) -> String {
+    fn own_name(b: &mut [u8; 64]) -> usize {
+        unsafe { pthread_getname_np(pthread_self(), b.as_mut_ptr(), b.len()) };
+        b.iter().position(|&c| c == 0).unwrap_or(0)
+    }
+
+    /// Names of the threads that noted themselves (`note_current`), by handle. Another thread's
+    /// name is read from here and never through its handle: `pthread_getname_np` of a thread that
+    /// has ended reads its freed descriptor (glibc: `pd->tid` in the unmapped stack) -- the x64
+    /// UI-thread segfault in `pthread_getname_np` when a main-stall line named the thread whose
+    /// owner request the main thread had waited behind, after that thread ended. Fixed slots and
+    /// a spin lock: no allocation, any phase. A handle reused by a new thread is noted again.
+    mod names {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const N: usize = 1024;
+        pub const LEN: usize = 32;
+        struct Table {
+            lock: AtomicBool,
+            next: std::cell::UnsafeCell<usize>,
+            slots: std::cell::UnsafeCell<[(u64, [u8; LEN]); N]>,
+        }
+        unsafe impl Sync for Table {}
+        static TABLE: Table = Table { lock: AtomicBool::new(false), next: std::cell::UnsafeCell::new(0), slots: std::cell::UnsafeCell::new([(0, [0; LEN]); N]) };
+        fn with<R>(f: impl FnOnce(&mut usize, &mut [(u64, [u8; LEN]); N]) -> R) -> R {
+            while TABLE.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                std::hint::spin_loop();
+            }
+            let r = f(unsafe { &mut *TABLE.next.get() }, unsafe { &mut *TABLE.slots.get() });
+            TABLE.lock.store(false, Ordering::Release);
+            r
+        }
+        pub fn put(t: u64, name: &[u8]) {
+            let mut b = [0u8; LEN];
+            let k = name.len().min(LEN);
+            b[..k].copy_from_slice(&name[..k]);
+            with(|next, slots| match slots.iter().position(|s| s.0 == t) {
+                Some(i) => slots[i].1 = b,
+                None => {
+                    // (the oldest entry goes when the table is full: its thread most likely ended)
+                    slots[*next % N] = (t, b);
+                    *next += 1;
+                }
+            });
+        }
+        pub fn get(t: u64) -> Option<[u8; LEN]> {
+            with(|_, slots| slots.iter().find(|s| s.0 == t).map(|s| s.1))
+        }
+    }
+
+    thread_local! {
+        static NOTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Records the calling thread's name for `name` (once per thread; one thread-local read after).
+    #[inline]
+    pub fn note_current() {
+        if NOTED.try_with(|n| n.replace(true)).unwrap_or(true) {
+            return;
+        }
         let mut b = [0u8; 64];
-        unsafe { pthread_getname_np(t as usize, b.as_mut_ptr(), b.len()) };
-        let n = b.iter().position(|&c| c == 0).unwrap_or(0);
-        String::from_utf8_lossy(&b[..n]).into_owned()
+        let n = own_name(&mut b);
+        names::put(current(), &b[..n]);
+    }
+
+    /// A thread's name, for diagnostics: the calling thread's own, or what a thread noted
+    /// (`note_current`) while it ran ("thread <handle>" when it never did).
+    pub fn name(t: u64) -> String {
+        if t == current() {
+            let mut b = [0u8; 64];
+            let n = own_name(&mut b);
+            return String::from_utf8_lossy(&b[..n]).into_owned();
+        }
+        match names::get(t) {
+            Some(b) => {
+                let n = b.iter().position(|&c| c == 0).unwrap_or(names::LEN);
+                String::from_utf8_lossy(&b[..n]).into_owned()
+            }
+            None => format!("thread {t:#x}"),
+        }
     }
 
     pub fn kick(t: u64) {
@@ -56,7 +130,7 @@ mod unix {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp {
-    pub use super::unix::{current, exit_now, fork, kick, name};
+    pub use super::unix::{current, exit_now, fork, kick, name, note_current};
 
     pub fn lower_priority(_utility: bool) {
         extern "C" {
@@ -84,6 +158,10 @@ mod imp {
 
     pub fn interactive() {}
 
+    pub fn performance_cores() -> usize {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    }
+
     pub fn realtime() -> bool {
         extern "C" {
             fn sched_getscheduler(pid: i32) -> i32;
@@ -95,7 +173,7 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    pub use super::unix::{current, exit_now, fork, kick, name};
+    pub use super::unix::{current, exit_now, fork, kick, name, note_current};
     use super::unix::pthread_self;
 
     extern "C" {
@@ -131,6 +209,18 @@ mod imp {
         }
     }
 
+    /// Performance-core logical CPUs (hw.perflevel0.logicalcpu; Intel Macs have no levels: every CPU).
+    pub fn performance_cores() -> usize {
+        extern "C" {
+            fn sysctlbyname(name: *const u8, old: *mut u8, oldlen: *mut usize, new: *const u8, newlen: usize) -> i32;
+        }
+        let mut n: i32 = 0;
+        let mut len = std::mem::size_of::<i32>();
+        let r = unsafe { sysctlbyname(b"hw.perflevel0.logicalcpu\0".as_ptr(), &mut n as *mut i32 as *mut u8, &mut len, std::ptr::null(), 0) };
+        let all = std::thread::available_parallelism().map_or(1, |n| n.get());
+        if r == 0 && n > 0 { (n as usize).min(all) } else { all }
+    }
+
     /// A thread with a time-constraint policy (CoreAudio's IO threads, audio workgroups).
     pub fn realtime() -> bool {
         extern "C" {
@@ -153,6 +243,10 @@ mod imp {
     pub fn current() -> u64 {
         unsafe { GetCurrentThreadId() as u64 }
     }
+
+    /// (thread ids name ended threads safely: nothing to record)
+    #[inline]
+    pub fn note_current() {}
 
     /// A thread's description (SetThreadDescription; std names its threads with it).
     pub fn name(t: u64) -> String {
@@ -206,6 +300,10 @@ mod imp {
     }
 
     pub fn interactive() {}
+
+    pub fn performance_cores() -> usize {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    }
 
     /// A time-critical thread (WASAPI render threads run at THREAD_PRIORITY_TIME_CRITICAL or
     /// in an MMCSS task, which raises the thread into the real-time range).

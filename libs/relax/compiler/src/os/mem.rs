@@ -88,6 +88,22 @@ fn refuse_code(what: &str, addr: u64, len: usize) -> ! {
     panic!("makepad run: no-codegen mode: {} of {} bytes at {:#x} (machine code is not allowed in this mode)", what, len, addr)
 }
 
+/// Replaces the 8 code bytes at `addr` (8-aligned) with one atomic store: a thread executing
+/// them meanwhile runs the old or the new instruction, never a mix (x64 thunk heads).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub unsafe fn patch_code_u64(addr: u64, w: u64) {
+    debug_assert!(addr & 7 == 0, "patch_code_u64: unaligned {:#x}", addr);
+    fill_code(addr, 8, |b| (*(b.as_mut_ptr() as *const std::sync::atomic::AtomicU64)).store(w, std::sync::atomic::Ordering::Release));
+}
+
+/// Replaces the instruction at `addr` (4-aligned) with one atomic store, then makes the
+/// instruction cache see it (arm64 thunk heads: a `b` may be modified while it runs).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub unsafe fn patch_code_u32(addr: u64, w: u32) {
+    debug_assert!(addr & 3 == 0, "patch_code_u32: unaligned {:#x}", addr);
+    fill_code(addr, 4, |b| (*(b.as_mut_ptr() as *const std::sync::atomic::AtomicU32)).store(w, std::sync::atomic::Ordering::Release));
+}
+
 #[cfg(unix)]
 mod unix {
     extern "C" {
@@ -191,7 +207,42 @@ mod imp {
         if unsafe { mprotect(base as *mut u8, code, PROT_RWX) } != 0 {
             panic!("reservation: mprotect RWX failed");
         }
+        huge_code_pages(base, code);
         base
+    }
+
+    /// Code memory in 2-MB pages where the kernel gives them (MADV_HUGEPAGE: THP with direct
+    /// compaction for this range, khugepaged collapses the rest): the JIT's hot code is spread
+    /// over ~1.8x the 4-KB pages of a rustc binary's (installs land in time order, between cold
+    /// code), and the race's UI thread took 2.2x native's L1 iTLB misses (RACEPAR, Zen 5). With
+    /// THP `always` but defrag `madvise` the code region stayed all 4-KB pages. A no-op where THP
+    /// is off; costs up to one partly used 2-MB page per touched region in RSS.
+    /// MAKEPAD_RUN_HUGE_CODE=0 keeps 4-KB pages (A/B).
+    fn huge_code_pages(addr: u64, len: usize) {
+        if std::env::var_os("MAKEPAD_RUN_HUGE_CODE").is_some_and(|v| v == "0") {
+            return;
+        }
+        extern "C" {
+            fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+        }
+        const MADV_HUGEPAGE: i32 = 14;
+        unsafe { madvise(addr as *mut u8, len, MADV_HUGEPAGE) };
+    }
+
+    /// `reserve` at exactly `at` (the wasm32 web target's window, web32.rs); 0 when the range is
+    /// taken.
+    pub fn reserve_at(at: u64, code: usize, rest: usize) -> u64 {
+        const MAP_FIXED_NOREPLACE: i32 = 0x100000;
+        let p = unsafe { super::unix::mmap(at as *mut u8, code + rest, super::unix::PROT_RW, super::unix::MAP_PRIVATE_ANON | MAP_FIXED_NOREPLACE, -1, 0) };
+        if p as isize == -1 || p as u64 != at {
+            return 0;
+        }
+        crate::memstat::name_mapping(at as usize, code, c"makepad-run-jit-code");
+        crate::memstat::name_mapping(at as usize + code, rest, c"makepad-run-jit-data");
+        if unsafe { mprotect(at as *mut u8, code, PROT_RWX) } != 0 {
+            panic!("reservation: mprotect RWX failed");
+        }
+        at
     }
 
     /// Gives a reservation back.
@@ -320,6 +371,25 @@ mod imp {
             }
             let at = code_alloc_at(code, base);
             assert_eq!(at, base, "reservation: code view not at the base");
+            base
+        }
+    }
+
+    /// `reserve` at exactly `at` (the wasm32 web target's window, web32.rs); 0 when the range is
+    /// taken.
+    pub fn reserve_at(at: u64, code: usize, rest: usize) -> u64 {
+        const VM_FLAGS_FIXED: i32 = 0;
+        unsafe {
+            let task = mach_task_self();
+            let mut base: u64 = at;
+            if mach_vm_allocate(task, &mut base, (code + rest) as u64, VM_FLAGS_FIXED) != 0 || base != at {
+                return 0;
+            }
+            if super::no_codegen() {
+                return base;
+            }
+            let c = code_alloc_at(code, base);
+            assert_eq!(c, base, "reservation: code view not at the base");
             base
         }
     }
