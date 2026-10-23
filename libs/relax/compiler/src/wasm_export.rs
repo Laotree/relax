@@ -403,6 +403,23 @@ fn data_of(u: &Unit, id: u32) -> Option<(Vec<u8>, u64, u64)> {
     Some((bytes, len, align))
 }
 
+/// Registered data describes its pointer fields. In particular, byte literals
+/// (fonts, embedded files, strings) have none: their integer words can happen to
+/// match native addresses and must never be relocated or seed reachability.
+/// Storage without a described layout retains the conservative symbol scan.
+fn data_refs(u: &Unit, id: u32, bytes: &[u8]) -> Vec<(usize, Sym)> {
+    let pw = u.ptr_bytes() as usize;
+    let offsets: Vec<usize> = crate::syms::pointer_offsets(u, u.syms.addr(Sym::new(id)))
+        .map(|offsets| offsets.into_iter().map(|o| o as usize).collect())
+        .unwrap_or_else(|| (0..bytes.len() / pw).map(|i| i * pw).collect());
+    offsets.into_iter().filter_map(|k| {
+        if k + pw > bytes.len() { return None; }
+        let w = crate::syms::word_in(u, bytes, k);
+        if (if pw == 4 { w & 0xffff_ffff } else { w }) <= 0x1_0000 { return None; }
+        u.syms.symbol_at(w, u).map(|s| (k, s))
+    }).collect()
+}
+
 /// Functions and source blocks executed by the training runs in the same build
 /// configuration. A malformed or incomplete union must not produce a module.
 fn read_union() -> Result<HashMap<String, std::collections::HashSet<(usize, usize)>>, String> {
@@ -799,25 +816,17 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     let mut n_ptrs = 0usize;
     while let Some(id) = pending.pop() {
         let Some((mut bytes, _, _)) = data_of(u, id) else { continue };
-        // pointer-sized words (4 bytes on wasm32, holding window offsets: crate::syms::word_in)
         let pw = u.ptr_bytes() as usize;
-        let mut k = 0;
-        while k + pw <= bytes.len() {
-            let w = crate::syms::word_in(u, &bytes, k);
-            if (if pw == 4 { w & 0xffff_ffff } else { w }) > 0x1_0000 {
-                if let Some(s) = u.syms.symbol_at(w, u) {
-                    let nv = match u.syms.kind(s.id) {
-                        Some(SymKind::Data(_) | SymKind::Rw(_) | SymKind::Static(_)) => place(&mut m, s.id, &mut placed, &mut pending).map(|a| a.wrapping_add(s.off as u64)),
-                        Some(SymKind::Thunk(slot)) => Some(m.table_index(slot) as u64),
-                        _ => None,
-                    };
-                    if let Some(nv) = nv {
-                        unsafe { crate::syms::write_ptr(u, bytes[k..k + pw].as_mut_ptr() as u64, nv) };
-                        n_ptrs += 1;
-                    }
-                }
+        for (k, s) in data_refs(u, id, &bytes) {
+            let nv = match u.syms.kind(s.id) {
+                Some(SymKind::Data(_) | SymKind::Rw(_) | SymKind::Static(_)) => place(&mut m, s.id, &mut placed, &mut pending).map(|a| a.wrapping_add(s.off as u64)),
+                Some(SymKind::Thunk(slot)) => Some(m.table_index(slot) as u64),
+                _ => None,
+            };
+            if let Some(nv) = nv {
+                unsafe { crate::syms::write_ptr(u, bytes[k..k + pw].as_mut_ptr() as u64, nv) };
+                n_ptrs += 1;
             }
-            k += pw;
         }
         images.push((id, bytes));
     }
@@ -965,17 +974,11 @@ fn address_taken<'a>(u: &Unit, funcs: impl IntoIterator<Item = &'a Func>, out: &
             continue;
         }
         let Some((bytes, _, _)) = data_of(u, d) else { continue };
-        let pw = u.ptr_bytes() as usize;
-        for k in (0..bytes.len() / pw).map(|i| i * pw) {
-            let w = crate::syms::word_in(u, &bytes, k);
-            if (if pw == 4 { w & 0xffff_ffff } else { w }) > 0x1_0000 {
-                if let Some(s) = u.syms.symbol_at(w, u) {
-                    match u.syms.kind(s.id) {
-                        Some(SymKind::Thunk(t)) => out.push(t),
-                        Some(SymKind::Data(_) | SymKind::Rw(_) | SymKind::Static(_)) => dwork.push(s.id),
-                        _ => {}
-                    }
-                }
+        for (_, s) in data_refs(u, d, &bytes) {
+            match u.syms.kind(s.id) {
+                Some(SymKind::Thunk(t)) => out.push(t),
+                Some(SymKind::Data(_) | SymKind::Rw(_) | SymKind::Static(_)) => dwork.push(s.id),
+                _ => {}
             }
         }
     }
@@ -1013,17 +1016,11 @@ fn reach(u: &Unit, funcs: &BTreeMap<u32, Func>, roots: &[u32]) -> Vec<u32> {
             continue;
         }
         let Some((bytes, _, _)) = data_of(u, d) else { continue };
-        let pw = u.ptr_bytes() as usize;
-        for k in (0..bytes.len() / pw).map(|i| i * pw) {
-            let w = crate::syms::word_in(u, &bytes, k);
-            if (if pw == 4 { w & 0xffff_ffff } else { w }) > 0x1_0000 {
-                if let Some(s) = u.syms.symbol_at(w, u) {
-                    match u.syms.kind(s.id) {
-                        Some(SymKind::Thunk(t)) => work.push(t),
-                        Some(SymKind::Data(_) | SymKind::Rw(_) | SymKind::Static(_)) => dwork.push(s.id),
-                        _ => {}
-                    }
-                }
+        for (_, s) in data_refs(u, d, &bytes) {
+            match u.syms.kind(s.id) {
+                Some(SymKind::Thunk(t)) => work.push(t),
+                Some(SymKind::Data(_) | SymKind::Rw(_) | SymKind::Static(_)) => dwork.push(s.id),
+                _ => {}
             }
         }
     }
