@@ -7332,7 +7332,11 @@ unsafe fn compile_o3_always(up: *mut Unit, id: u32) -> Option<u64> {
     O3_FIRST.with(|c| c.set(false));
     let at = O3_FIRST_AT.with(|c| c.get());
     let u = &*up;
-    eprintln!("makepad-run O3 always: {} waited {:.1} ms for its O3 build{}", u.fns[id as usize].name, (wall_ns() - w0) as f64 / 1e6, if ok && at != 0 { "" } else { " (failed: compiled as usual)" });
+    // the wait is a --verbose diagnostic; a failed build always shows
+    let failed = !(ok && at != 0);
+    if failed || crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("makepad-run O3 always: {} waited {:.1} ms for its O3 build{}", u.fns[id as usize].name, (wall_ns() - w0) as f64 / 1e6, if failed { " (failed: compiled as usual)" } else { "" });
+    }
     (ok && at != 0 && u.fns[id as usize].compiled).then_some(at)
 }
 
