@@ -12449,13 +12449,26 @@ fn cost_decay(cost: u64, dt: u64) -> u64 {
     (cost as f64 * (-(dt as f64) / COST_HALF_LIFE_NS).exp2()) as u64
 }
 
-/// Slot record `rec`'s cost now: the decayed cost of its last check plus what was spent since
-/// (unit-lock free; a racing check makes it an estimate, which is all it is).
+/// `spent` cost that came evenly over the last `dt` ns, decayed as it came: spent x (1 - 2^-x) /
+/// (x ln 2) with x = dt / half-life. A steady rate r then converges on r x half-life / ln 2, and a
+/// burst (dt ~ 0) counts in full.
+fn cost_spread(spent: u64, dt: u64) -> u64 {
+    let x = dt as f64 / COST_HALF_LIFE_NS;
+    if x < 1e-6 {
+        return spent;
+    }
+    (spent as f64 * (1.0 - (-x).exp2()) / (x * std::f64::consts::LN_2)) as u64
+}
+
+/// Slot record `rec`'s cost now: the decayed cost of its last check plus what was spent since,
+/// decayed as it came (unit-lock free; a racing check makes it an estimate, which is all it is).
+/// Returns (cost, spent since the last check).
 unsafe fn tier_cost_now(rec: *const AtomicU64, threshold: u64, now: u64) -> (u64, u64) {
     let last = (*rec.add(9)).load(Ordering::Relaxed);
     let left = (*rec).load(Ordering::Relaxed) as i64;
     let spent = (tier_refill(threshold, last) as i64).saturating_sub(left).max(0) as u64;
-    (cost_decay(last, now.saturating_sub((*rec.add(4)).load(Ordering::Relaxed))).saturating_add(spent), spent)
+    let dt = now.saturating_sub((*rec.add(4)).load(Ordering::Relaxed));
+    (cost_decay(last, dt).saturating_add(cost_spread(spent, dt)), spent)
 }
 
 /// A slot's counting starts (again) from nothing at `now`.
@@ -12483,6 +12496,57 @@ unsafe fn tier_check(rec: *const AtomicU64, threshold: u64, now: u64) -> Option<
 /// Charges `cost` to a counting slot's budget (rt_loop_hot): its next call checks it.
 unsafe fn tier_charge(rec: *const AtomicU64, cost: u64) {
     (*rec).fetch_sub(cost, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tier_cost_tests {
+    use super::*;
+
+    /// A slot driven at `per_s` cost units per second in calls of `w` (the stub's budget, rt_hot's
+    /// checks) for `secs`: the time it is queued at, if it is.
+    fn drive(per_s: u64, w: u64, secs: u64) -> Option<f64> {
+        let th = 2000 * CALL_COST;
+        let rec: Vec<AtomicU64> = (0..10).map(|_| AtomicU64::new(0)).collect();
+        let r = rec.as_ptr();
+        let gap = (w * 1_000_000_000 / per_s).max(1);
+        unsafe {
+            tier_count_fresh(r, th, 1);
+            let mut t = 1u64;
+            while t < secs * 1_000_000_000 {
+                t += gap;
+                if ((*r).fetch_sub(w, Ordering::Relaxed) as i64) - (w as i64) <= 0 && tier_check(r, th, t).is_some() {
+                    return Some(t as f64 / 1e9);
+                }
+            }
+        }
+        None
+    }
+
+    /// The threshold is a rate: a steady rate over threshold x ln 2 / half-life tiers up, one under it
+    /// never does however long it runs (the old windowless counts reached any total), and a burst of
+    /// the threshold's cost tiers up at once.
+    #[test]
+    fn decayed_cost_is_a_rate_threshold() {
+        let th = (2000 * CALL_COST) as f64;
+        let rate = th * std::f64::consts::LN_2 / (COST_HALF_LIFE_NS / 1e9);
+        assert!(drive((rate * 0.85) as u64, 30, 120).is_none(), "under the rate: never");
+        assert!(drive((rate * 1.25) as u64, 30, 120).is_some(), "over the rate: tiers up");
+        // the race HUD: one call per frame of a big body
+        assert!(drive(60 * MAX_WEIGHT, MAX_WEIGHT, 30).is_some(), "a 60 Hz fn of max weight tiers up");
+        assert!(drive(10 * MAX_WEIGHT, MAX_WEIGHT, 120).is_none(), "a 10 Hz fn of max weight does not");
+        let t = drive(1_000_000_000, 20, 10).unwrap();
+        assert!(t < 0.01, "a burst tiers up at once ({t} s)");
+    }
+
+    /// Idle code decays to nothing (no work while it is idle: the decay is applied at its next check).
+    #[test]
+    fn idle_cost_decays() {
+        assert_eq!(cost_decay(40_000, 30_000_000_000), 0);
+        assert_eq!(cost_decay(40_000, 0), 40_000);
+        assert_eq!(cost_decay(40_000, COST_HALF_LIFE_NS as u64), 20_000);
+        assert_eq!(cost_spread(1000, 0), 1000);
+        assert!(call_weight(0) == CALL_COST as u32 && call_weight(1 << 30) == MAX_WEIGHT as u32);
+    }
 }
 const T_COUNTING: u64 = 1;
 const T_QUEUED: u64 = 2;
