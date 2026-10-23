@@ -134,6 +134,9 @@ pub trait Link {
 
 #[derive(Clone, Debug)]
 pub struct Options {
+    /// 64-bit linear memory (memory64: addresses are i64, no wraps); the wasm64 target. Default:
+    /// 32-bit memory (wasm32)
+    pub memory64: bool,
     /// bytes of shadow stack (at the bottom of memory, growing down)
     pub stack_size: u32,
     /// pages (64 KiB) of heap after the data, in the initial memory size
@@ -174,7 +177,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, remat_slots: false, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true, order_by_bytes: true }
+        Options { memory64: false, stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, remat_slots: false, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true, order_by_bytes: true }
     }
 }
 
@@ -606,7 +609,8 @@ impl<'a> Module<'a> {
             (stack_sz, (self.data_end + 15) & !15)
         };
         let pages = (heap_base + 0xFFFF) / 0x10000 + opts.heap_pages as u64;
-        let mut s = vec![1, 0x00];
+        // limits flags: 0x04 = 64-bit addresses
+        let mut s = vec![1, if opts.memory64 { 0x04 } else { 0x00 }];
         uleb(&mut s, pages);
         let b0 = out.len();
         section(&mut out, 5, &s);
@@ -619,25 +623,27 @@ impl<'a> Module<'a> {
             section(&mut out, 13, &s);
             sz(&mut st, &out, b0, 13);
         }
-        // globals: 0 = shadow stack pointer, 1 = heap base (immutable)
+        // globals (the address type): 0 = shadow stack pointer, 1 = heap base (immutable)
         let mut s = vec![2];
-        s.extend_from_slice(&[0x7F, 1, 0x41]);
+        let (aty, acst) = if opts.memory64 { (0x7E, 0x42) } else { (0x7F, 0x41) };
+        s.extend_from_slice(&[aty, 1, acst]);
         sleb(&mut s, stack_top as i64);
         s.push(0x0B);
-        s.extend_from_slice(&[0x7F, 0, 0x41]);
+        s.extend_from_slice(&[aty, 0, acst]);
         sleb(&mut s, heap_base as i64);
         s.push(0x0B);
         let b0 = out.len();
         section(&mut out, 6, &s);
         sz(&mut st, &out, b0, 6);
-        // exports: memory "m", heap base "h", tag "t", then the functions
+        // exports: memory "memory" (the name the web runtime and rustc's wasm modules use), heap
+        // base "h", tag "t", then the functions
         let mut s = Vec::new();
         let mut n = 2u64 + self.exports.len() as u64;
         if tag_ty.is_some() && opts.export_tag {
             n += 1;
         }
         uleb(&mut s, n);
-        name(&mut s, "m");
+        name(&mut s, "memory");
         s.extend_from_slice(&[2, 0]);
         name(&mut s, "h");
         s.extend_from_slice(&[3, 1]);
@@ -705,8 +711,13 @@ impl<'a> Module<'a> {
                 match d.addr {
                     Some(a) => {
                         s.push(0);
-                        s.push(0x41);
-                        sleb(&mut s, a as u32 as i32 as i64);
+                        if opts.memory64 {
+                            s.push(0x42);
+                            sleb(&mut s, a as i64);
+                        } else {
+                            s.push(0x41);
+                            sleb(&mut s, a as u32 as i32 as i64);
+                        }
                         s.push(0x0B);
                     }
                     None => s.push(1),
@@ -1145,7 +1156,7 @@ fn lower_func(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &
             uleb(&mut fx.out, l as u64);
         }
         fx.aconst(frame as i64);
-        fx.out.push(I32_SUB);
+        fx.a_op(I32_SUB, I64_SUB);
         fx.out.push(LTEE);
         let fp = fx.fp;
         uleb(&mut fx.out, fp as u64);
@@ -1694,7 +1705,7 @@ impl<'a> Fx<'a> {
             cuse.push(uses);
             ctype.len() as u32 - 1
         };
-        let aty = Val::I32;
+        let aty = if self.o.memory64 { Val::I64 } else { Val::I32 };
         let fpc = if want_fp { extra(aty, 1 << 20, &mut ctype, &mut cuse) } else { NONE };
         let sp0c = if want_sp0 { extra(aty, 1 << 19, &mut ctype, &mut cuse) } else { NONE };
         let needs_tmp = f.blocks.iter().any(|b| matches!(b.term, Term::Switch(..)) || b.insts.iter().any(|i| matches!(i, Inst::AtomicRmw(..) | Inst::AtomicCas(..))));
@@ -1755,8 +1766,25 @@ impl<'a> Fx<'a> {
         self.out.push(I32C);
         sleb(&mut self.out, v as i64);
     }
+    /// A constant of the address type (i32: wasm32, i64: memory64).
     fn aconst(&mut self, v: i64) {
-        self.i32c(v as i32)
+        if self.o.memory64 { self.i64c(v) } else { self.i32c(v as i32) }
+    }
+    /// The address type's form of a two-operand op (`I32_ADD` / `I64_ADD`).
+    fn a_op(&mut self, op32: u8, op64: u8) {
+        self.op(if self.o.memory64 { op64 } else { op32 });
+    }
+    /// The i64 on the stack as an address (wasm32: wrapped to i32).
+    fn a_wrap(&mut self) {
+        if !self.o.memory64 {
+            self.op(WRAP);
+        }
+    }
+    /// The address on the stack as an i64 (wasm32: zero-extended).
+    fn a_ext(&mut self) {
+        if !self.o.memory64 {
+            self.op(EXT_U);
+        }
     }
     fn lget(&mut self, l: u32) {
         self.out.push(LGET);
@@ -1886,10 +1914,10 @@ impl<'a> Fx<'a> {
                 if off < 0 || off > u32::MAX as i64 {
                     self.i64c(off);
                     self.op(I64_ADD);
-                    self.op(WRAP);
+                    self.a_wrap();
                     Ok(0)
                 } else {
-                    self.op(WRAP);
+                    self.a_wrap();
                     Ok(off as u64)
                 }
             }
@@ -1981,7 +2009,7 @@ impl<'a> Fx<'a> {
                 if let Want::Addr(off) = want {
                     let a = v.wrapping_add(off);
                     if (0..=u32::MAX as i64).contains(&a) {
-                        self.aconst(a as u32 as i32 as i64);
+                        self.aconst(a);
                         return Ok(0);
                     }
                 }
@@ -2225,7 +2253,7 @@ impl<'a> Fx<'a> {
                     }
                 }
                 self.lget(self.fp);
-                self.op(EXT_U);
+                self.a_ext();
                 if so != 0 {
                     self.i64c(so);
                     self.op(I64_ADD);
@@ -2237,7 +2265,7 @@ impl<'a> Fx<'a> {
                 if let Want::Addr(off) = want {
                     let a = v.wrapping_add(off);
                     if (0..=u32::MAX as i64).contains(&a) {
-                        self.aconst(a as u32 as i32 as i64);
+                        self.aconst(a);
                         return Ok(0);
                     }
                 }
@@ -2787,7 +2815,7 @@ impl<'a> Fx<'a> {
         let o = self.value(b, v, Want::Addr(0))?;
         if o != 0 {
             self.aconst(o as i64);
-            self.op(I32_ADD);
+            self.a_op(I32_ADD, I64_ADD);
         }
         Ok(())
     }
@@ -2813,7 +2841,7 @@ impl<'a> Fx<'a> {
         } else if self.frame > 0 {
             self.lget(self.fp);
             self.aconst(self.frame as i64);
-            self.op(I32_ADD);
+            self.a_op(I32_ADD, I64_ADD);
             self.out.extend_from_slice(&[GSET, 0]);
         }
     }
@@ -3387,11 +3415,15 @@ fn helper_body(o: &Options, h: Helper, sh: &mut Shared, fn_ix: &HashMap<u32, u32
         }
         Helper::Builtin(bi, ty) => {
             let t = sh.types[ty as usize].clone();
+            // an i64 argument as an address
             let aw = |c: &mut Vec<u8>, l: u8| {
                 c.push(LGET);
                 c.push(l);
-                c.push(WRAP);
+                if !o.memory64 {
+                    c.push(WRAP);
+                }
             };
+            let (acst, aty) = if o.memory64 { (I64C, I64) } else { (I32C, I32) };
             match bi {
                 Builtin::Memcpy | Builtin::Memmove | Builtin::Memset => {
                     aw(&mut c, 0);
@@ -3435,9 +3467,9 @@ fn helper_body(o: &Options, h: Helper, sh: &mut Shared, fn_ix: &HashMap<u32, u32
                     let kb = sh.keys_base as i64;
                     locals.push((1, I64));
                     let l = t.params.len() as u8;
-                    c.push(I32C);
+                    c.push(acst);
                     sleb(&mut c, kb);
-                    c.push(I32C);
+                    c.push(acst);
                     sleb(&mut c, kb);
                     c.extend_from_slice(&[0x29, 3, 0, I64C, 1, I64_ADD, LTEE, l, 0x37, 3, 0]);
                     g(&mut c, l);
@@ -3447,11 +3479,19 @@ fn helper_body(o: &Options, h: Helper, sh: &mut Shared, fn_ix: &HashMap<u32, u32
                 }
                 Builtin::KeyGet | Builtin::KeySet => {
                     let kb = sh.keys_base;
+                    // the key's word: key << 3 (an address)
                     g(&mut c, 0);
-                    if t.params[0] == I64 {
-                        c.push(WRAP);
+                    if o.memory64 {
+                        if t.params[0] == I32 {
+                            c.push(EXT_U);
+                        }
+                        c.extend_from_slice(&[I64C, 3, 0x86]);
+                    } else {
+                        if t.params[0] == I64 {
+                            c.push(WRAP);
+                        }
+                        c.extend_from_slice(&[I32C, 3, 0x74]);
                     }
-                    c.extend_from_slice(&[I32C, 3, 0x74]);
                     if bi == Builtin::KeySet {
                         g(&mut c, 1);
                         c.push(0x37);
@@ -3475,7 +3515,7 @@ fn helper_body(o: &Options, h: Helper, sh: &mut Shared, fn_ix: &HashMap<u32, u32
                 Builtin::CatchPanic => {
                     sh.uses_tag = true;
                     let fty = sh.ty(FnType { params: vec![I64], results: vec![] });
-                    locals.push((1, I32));
+                    locals.push((1, aty));
                     c.extend_from_slice(&[GGET, 0, LSET, 2]);
                     if o.exnref {
                         c.extend_from_slice(&[BLOCK, 0x40, TRY_TABLE, 0x40, 1, 2, 0]);

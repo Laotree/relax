@@ -7399,6 +7399,7 @@ unsafe fn o2_enqueue(up: *mut Unit, id: u32) {
         }
     }
     O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id));
+    crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O2_QUEUED, 1, 0, 0);
     O2_WAKE.notify_one();
     o2_start(up);
 }
@@ -7528,6 +7529,7 @@ unsafe fn o2_base(up: *mut Unit, id: u32) {
         }
     }
     u.fns[id as usize].hot_hint.store(true, Ordering::Relaxed);
+    crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O2_QUEUED, 0, 0, 0);
     {
         // under O2_QUEUE's lock: the worker checks both queues under it before it waits
         let _q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
@@ -11804,6 +11806,7 @@ unsafe fn queue_loop(u: &Unit, id: u32, rate: u64) {
         let _ = s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
         TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
         // a program thread (rt_loop_hot): queued without a lock, as rt_hot does (rule I-CALL)
+        crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::QUEUE, Q_LOOP, rate, code);
         tier_inbox_push(rec, id, Q_LOOP, rate);
         TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime, &u.prog.session.options));
     }
@@ -12613,6 +12616,68 @@ const SLOW_RETIRE: u64 = 4;
 const CODE_BYTES: u64 = (1 << SLOW_SHIFT) - 1;
 /// count stubs taken out of their slots after SLOW_RETIRE slow windows
 pub static STUBS_RETIRED: AtomicU64 = AtomicU64::new(0);
+/// ... and put back (rearm_retired)
+pub static STUBS_REARMED: AtomicU64 = AtomicU64::new(0);
+/// Tier record word 5, bits 52..56: how often the slot's stub was retired (rt_hot)
+const RETIRE_SHIFT: u64 = 52;
+/// A retired stub goes back into its slot this long after its retirement, doubled per retirement
+/// (at most RETIRE_BACKOFF_NS << RETIRE_BACKOFF_MAX): a fn that turned hot later is counted again
+/// within seconds; one that stays lukewarm pays SLOW_RETIRE slow windows of stub calls per period.
+const RETIRE_BACKOFF_NS: u64 = 2_000_000_000;
+const RETIRE_BACKOFF_MAX: u64 = 5;
+/// Slots whose count stub rt_hot retired (rearm_retired); capacity reserved by the poll, so rt_hot
+/// never grows it.
+static RETIRED: relax_session::sync::Mutex<Vec<u32>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// The first O3 worker's poll: retired count stubs whose backoff is over go back into their slots
+/// (counter and window fresh, the slow-window count reset); a slot that left counting meanwhile
+/// (queued by its loops, or other code with its own stub installed: rearm_counter) is dropped.
+fn rearm_retired() {
+    let up = TIER_UNIT.load(Ordering::Acquire);
+    if up.is_null() {
+        return;
+    }
+    let u = unsafe { &*up };
+    let Some(calls) = u.tier1.as_ref().map(|t| t.calls) else { return };
+    let now = wall_ns();
+    let mut r = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    if r.capacity() - r.len() < 256 {
+        crate::zone_alloc::kept_with(|| r.reserve(1024));
+    }
+    if r.is_empty() {
+        return;
+    }
+    let mut n = 0u64;
+    r.retain(|&id| unsafe {
+        if id as usize >= u.fns.len() {
+            return false;
+        }
+        let rec = tier_rec(&u.slots, id);
+        if (*rec.add(3)).load(Ordering::Acquire) != T_COUNTING {
+            return false;
+        }
+        let w = (*rec.add(5)).load(Ordering::Relaxed);
+        let level = ((w >> RETIRE_SHIFT) & 0xf).max(1);
+        if now.saturating_sub((*rec.add(4)).load(Ordering::Relaxed)) < RETIRE_BACKOFF_NS << (level - 1).min(RETIRE_BACKOFF_MAX) {
+            return true;
+        }
+        let code = (*rec.add(1)).load(Ordering::Relaxed);
+        let stub = (*rec.add(2)).load(Ordering::Relaxed);
+        (*rec).store(calls, Ordering::Relaxed);
+        (*rec.add(4)).store(now, Ordering::Relaxed);
+        (*rec.add(5)).store(w & !(0xf << SLOW_SHIFT), Ordering::Relaxed);
+        if SlotWord::of(&u.slots, id).compare_exchange(code, stub, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            n += 1;
+        }
+        false
+    });
+    if n > 0 {
+        STUBS_REARMED.fetch_add(n, Ordering::Relaxed);
+        if tier1_trace() {
+            eprintln!("O3q @{:.3} {} retired count stubs back in their slots", now as f64 / 1e9, n);
+        }
+    }
+}
 /// A calls / loop entry older than this is counted again (tier_revalidate).
 const REVALIDATE_NS: u64 = 1_000_000_000;
 /// O3 queue entries counted again (they had gone cold before their build)
@@ -12663,8 +12728,11 @@ fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
             // other code was installed meanwhile (O2, a patch): the stub is not its entry; build it
             if s.compare_exchange(code, stub, Ordering::SeqCst, Ordering::SeqCst).is_err() {
                 (*rec.add(3)).store(T_QUEUED, Ordering::Release);
+                crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::KEPT, 0, now.saturating_sub(at), 0);
                 return true;
             }
+            crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::REVALIDATE, 0, now.saturating_sub(at), code);
+            crate::inspect::tierlog::note_arm(id, crate::inspect::tierlog::ARM_REVALIDATE, code);
         }
         n += 1;
         false
@@ -12700,7 +12768,149 @@ pub(crate) fn sampler_period_floor() -> u64 {
     if SAMPLER_SETTLED.load(Ordering::Relaxed) { SETTLED_MS } else { SAMPLE_MS }
 }
 
+/// makepad inspect `why-tier retired`: slots still counting (T_COUNTING) whose count stub is not
+/// their entry: retired after slow windows (or replaced) -- their calls are not counted.
+pub(crate) fn tier_uncounted(u: &Unit) -> Vec<u32> {
+    if u.tier1.is_none() {
+        return Vec::new();
+    }
+    let mut v = Vec::new();
+    for id in 0..u.fns.len() as u32 {
+        if !u.fns[id as usize].compiled {
+            continue;
+        }
+        let (state, stub) = unsafe {
+            let rec = tier_rec(&u.slots, id);
+            ((*rec.add(3)).load(Ordering::Relaxed), (*rec.add(2)).load(Ordering::Relaxed))
+        };
+        if state == T_COUNTING && stub != 0 && slot_word(u, id) != stub {
+            v.push(id);
+        }
+    }
+    v
+}
+
+/// makepad inspect `why-tier`: slot `id`'s tier-up state now, in one verdict (why it is or is not at
+/// O3, answer first) and the evidence rows `(what, state)`: the tier record (count stub armed /
+/// retired, calls left, the window, slow windows in a row, the loop counter), the O3 queue, the
+/// counted (PGO) window, the verdict, retiers left, pins. The decision history is the tier log's
+/// (inspect/tierlog.rs). Unit read (owner job).
+pub(crate) fn tier_explain(u: &Unit, id: u32) -> (String, Vec<(String, String)>) {
+    use crate::inspect::tierlog as tl;
+    let mut rows: Vec<(String, String)> = Vec::new();
+    let f = &u.fns[id as usize];
+    let now = wall_ns();
+    let ms = |ns: u64| format!("{:.0} ms", ns as f64 / 1e6);
+    let kind = |a: u64| crate::inspect::codever::label(crate::inspect::codever::kind_at(u, a));
+    let installed = if f.compiled && f.code_len > 0 { Some(crate::inspect::codever::kind_at(u, f.code)) } else { None };
+    let (hist, _, _) = tl::history(id);
+    let n = |k: u8| hist.as_ref().map_or(0, |h| h.n[k as usize]);
+    let last_s = |k: u8| hist.as_ref().filter(|h| h.n[k as usize] > 0).map(|h| format!("{:.1} s", h.last_ms[k as usize] as f64 / 1e3));
+    let retiers = u.retiers.get(&id).copied().unwrap_or(0);
+    rows.push(("installed code".into(), installed.map_or("none (not compiled yet)".to_string(), |k| crate::inspect::codever::label(k))));
+    let Some(t1) = u.tier1.as_ref() else {
+        return ("O3 is off for this unit (no tier-up: no count stubs, no O3 queue)".into(), rows);
+    };
+    let threshold = t1.calls;
+    let (state, counter, code, stub, win, w5, loop_left, loop_win, rate_q) = unsafe {
+        let rec = tier_rec(&u.slots, id);
+        let w = |i: usize| (*rec.add(i)).load(Ordering::Relaxed);
+        (w(3), w(0), w(1), w(2), w(4), w(5), w(8), w(9), w(7))
+    };
+    let word = slot_word(u, id);
+    let slow = (w5 >> SLOW_SHIFT) & 0xf;
+    let stub_in = stub != 0 && word == stub;
+    let stub_state = if stub == 0 {
+        "never armed".to_string()
+    } else if state == T_QUEUED {
+        "out of the slot: tiered up (queued or built), calls not counted".to_string()
+    } else if stub_in {
+        format!("armed (counting {})", kind(code))
+    } else if slow >= SLOW_RETIRE - 1 && n(tl::ev::RETIRE) > 0 {
+        format!("RETIRED after {} slow windows in a row (last retirement {}): calls are not counted", slow + 1, last_s(tl::ev::RETIRE).unwrap_or_default())
+    } else {
+        "not in the slot (other code was installed over it, or retired)".to_string()
+    };
+    rows.push(("count stub".into(), format!("{}; retirements {}, re-arms {}{}", stub_state, n(tl::ev::RETIRE), n(tl::ev::ARM), last_s(tl::ev::ARM).map_or(String::new(), |t| format!(" (last {t})")))));
+    let st = match state { 0 => "not armed", T_COUNTING => "counting", T_QUEUED => "queued / tiered (calls not counted)", T_REPLAY => "replay", _ => "?" };
+    rows.push(("tier record".into(), format!("{}; calls left {} of {} (needs {} calls within 1 s); window opened {} ago; slow windows in a row {}; rearmed once {}", st, counter.min(threshold), threshold, threshold, ms(now.saturating_sub(win)), slow, w5 & REARMED != 0)));
+    if loop_win != 0 {
+        rows.push(("loop counter".into(), format!("{} back edges left of {}; window opened {} ago", loop_left, threshold.saturating_mul(LOOP_PER_CALL), ms(now.saturating_sub(loop_win)))));
+    }
+    if let Some(h) = &hist {
+        let w: Vec<String> = h.windows.iter().map(|(c, fast, sl)| format!("{}: {} fast (queued), {} timed out ({} calls each)", kind(*c), fast, sl, threshold)).collect();
+        if !w.is_empty() {
+            rows.push(("count windows by code".into(), w.join("; ")));
+        }
+    }
+    // the O3 queue and the build running now
+    let active = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).contains(&id);
+    let queued = {
+        let q = TIER_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        let inbox = !TIER_INBOX.is_empty();
+        q.iter().find(|e| e.0 == id).map(|&(_, why, at, rate)| {
+            let ahead = q.iter().filter(|e| (e.3, std::cmp::Reverse(e.2)) > (rate, std::cmp::Reverse(at))).count();
+            format!("waiting ({}, {}/s) for {}, {} of {} entries go first", Q_WHY[why as usize], rate, ms(now.saturating_sub(at)), ahead, q.len())
+        }).or_else(|| (inbox && state == T_QUEUED).then(|| "in rt_hot's inbox (moved into the queue by the next worker)".to_string()))
+    };
+    rows.push(("O3 queue".into(), match (&queued, active) { (_, true) => "its O3 build runs now".into(), (Some(q), _) => q.clone(), (None, _) => "not in it".into() }));
+    let counting = COUNTING.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|e| e.id == id).map(|e| (now.saturating_sub(e.at), e.counters.first().map_or(0, |c| c.load(Ordering::Relaxed)), e.lukewarm, e.parked));
+    if let Some((age, entries, luke, parked)) = counting {
+        rows.push(("counted (PGO) window".into(), format!("open {}, {} entries{}{}", ms(age), entries, if luke { ", lukewarm (needs work)" } else { "" }, if parked { ", PARKED (too little work)" } else { "" })));
+    } else if u.frequency_profiles.contains_key(&id) {
+        rows.push(("counted (PGO) window".into(), "closed: counts recorded for its O3 build".into()));
+    }
+    let allowed = u.o3_allowed(id);
+    let awaiting = AWAIT_VERDICT.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|x| x.0 == id);
+    if !allowed || awaiting {
+        rows.push(("verdict".into(), format!("O3 {}; {}", if allowed { "allowed" } else { "not allowed" }, match u.verdict_state(id) { Verdict::Clean => "clean".to_string(), Verdict::Failed(e) => format!("failed, {} events", e.len()), Verdict::Pending => "pending".to_string(), Verdict::Unverifiable(w) => format!("unverifiable: {}", w) })));
+    }
+    rows.push(("O3 builds".into(), format!("{} installed, {} dropped, {} not started, {} panicked; retiers used {} of 4", n(tl::ev::O3_INSTALLED), n(tl::ev::O3_DROPPED), n(tl::ev::O3_REFUSED), n(tl::ev::O3_PANIC), retiers)));
+    let pin = crate::inspect::codever::pin_of(id);
+    if let Some(p) = &pin {
+        rows.push(("pinned".into(), p.clone()));
+    }
+    if rate_q != 0 && state == T_QUEUED {
+        rows.push(("rate when queued".into(), format!("{}/s", rate_q)));
+    }
+    // the verdict, most specific first
+    let last_drop = hist.as_ref().and_then(|h| h.recent.iter().rev().find(|e| e.ev == tl::ev::O3_DROPPED || e.ev == tl::ev::O3_REFUSED).copied());
+    let at_o3 = installed.is_some_and(|k| matches!(k.tier, tier::O3 | tier::GUARDED | tier::INSTRUMENTED_O3));
+    let verdict = if at_o3 {
+        format!("runs {} code", crate::inspect::codever::label(installed.unwrap()))
+    } else if let Some(p) = pin.filter(|p| p.contains("o1")) {
+        format!("pinned by inspect: {}", p)
+    } else if !f.compiled {
+        "not compiled yet (a lazy stub)".into()
+    } else if active {
+        "its O3 build runs now".into()
+    } else if let Some(q) = queued {
+        format!("queued for O3: {}", q)
+    } else if let Some((age, _, luke, parked)) = counting {
+        if parked { format!("parked in its counted (PGO) build for {}: lukewarm code that showed under {} RIR insts/s of its own work", ms(age), PGO_MIN_WORK) } else { format!("in its counted (PGO) window for {}{}: O3 is queued when it closes", ms(age), if luke { " (lukewarm: closes once its counts show work)" } else { "" }) }
+    } else if !allowed {
+        "O3 not allowed: borrow-check verdict pending or a patch without a clean verdict".into()
+    } else if state == 0 {
+        "never armed: no count stub was put in front of its code (a kind that is not counted -- glue, shim, foreign fn -- or code installed without one), so its calls cannot queue O3; only `tier <fn> o3` builds it".into()
+    } else if state == T_COUNTING && !stub_in {
+        format!("NOT COUNTED: its count stub is out of the slot{} -- its calls are not counted, so it is never queued for O3 (only a hot loop in it can queue it)", if n(tl::ev::RETIRE) > 0 { format!(" (retired at {} after {} slow windows: {} calls took over 1 s each time)", last_s(tl::ev::RETIRE).unwrap_or_default(), slow + 1, threshold) } else { String::new() })
+    } else if state == T_COUNTING {
+        format!("counting: {} of {} calls left in a window opened {} ago (O3 is queued when {} calls come within 1 s){}", counter.min(threshold), threshold, ms(now.saturating_sub(win)), threshold, if slow > 0 { format!("; {} slow windows in a row so far ({} retires the stub)", slow, SLOW_RETIRE) } else { String::new() })
+    } else if state == T_QUEUED {
+        match last_drop {
+            Some(e) if retiers >= 4 => format!("STUCK below O3: its last O3 build was {} and its 4 retiers are used up; marked queued, so its calls are not counted again", tl::describe(&e, &kind).trim_start_matches("O3 build ")),
+            Some(e) => format!("STUCK below O3: marked queued (calls not counted) but in no queue; its last O3 attempt: {}", tl::describe(&e, &kind)),
+            None if n(tl::ev::O3_INSTALLED) > 0 => "was at O3; its code now is not (a patch, pin or rebuild replaced it) and it is marked queued, so its calls are not counted".into(),
+            None => "STUCK below O3: marked queued (calls not counted) but in no queue, and no O3 attempt recorded".into(),
+        }
+    } else {
+        format!("tier state {}", st)
+    };
+    (verdict, rows)
+}
+
 fn tier_push(id: u32, why: u8, rate: u64) {
+    crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::QUEUE, why, rate, 0);
     let mut q = tier_queue().unwrap();
     tier_push_locked(&mut *q, id, why, rate, wall_ns());
     drop(q);
@@ -12862,7 +13072,7 @@ pub(crate) fn tier1_stats_report() {
     let s = g.as_ref().unwrap_or(&empty);
     let ms = |ns: u64| ns as f64 / 1e6;
     eprintln!("makepad-run o3-stats: builds={} cpu_ms={:.3} max_threads={} in_flight={} (completed attempts; Windows CPU is cycle-estimated)", s.builds, ms(s.cpu), s.max_active, s.active);
-    eprintln!("makepad-run o3-stats: pgo counted_builds={} counted_cpu_ms={:.3} counted_dropped={} not_counted_no_rir_off_owner={} stubs_retired={}", PGO_STATS[0].load(Ordering::Relaxed), ms(PGO_STATS[1].load(Ordering::Relaxed)), PGO_STATS[2].load(Ordering::Relaxed), PGO_STATS[3].load(Ordering::Relaxed), STUBS_RETIRED.load(Ordering::Relaxed));
+    eprintln!("makepad-run o3-stats: pgo counted_builds={} counted_cpu_ms={:.3} counted_dropped={} not_counted_no_rir_off_owner={} stubs_retired={} stubs_rearmed={}", PGO_STATS[0].load(Ordering::Relaxed), ms(PGO_STATS[1].load(Ordering::Relaxed)), PGO_STATS[2].load(Ordering::Relaxed), PGO_STATS[3].load(Ordering::Relaxed), STUBS_RETIRED.load(Ordering::Relaxed), STUBS_REARMED.load(Ordering::Relaxed));
     eprintln!("makepad-run o3-stats: phases_cpu_ms snapshot={:.3} backend={:.3} install={:.3}", ms(s.phases[0]), ms(s.phases[1]), ms(s.phases[2]));
     let passes: Vec<String> = relax_backend::stats::PASS_NAMES.iter().enumerate().map(|(i, n)| format!("{}={:.3}", n, ms(s.passes[i]))).collect();
     eprintln!("makepad-run o3-stats: backend_pass_ms {} (pass slots can overlap; MAKEPAD_RUN_PASS_TIMES=wall selects wall time)", passes.join(" "));
@@ -12961,6 +13171,7 @@ impl Unit {
         if ids.is_empty() {
             return;
         }
+        crate::inspect::tierlog::init();
         // (profile replay arms slot by slot: the image is prelinked with names then)
         if t1prof_replay(&self.prog.session.options) {
             for &(id, code) in ids {
@@ -13004,6 +13215,7 @@ impl Unit {
                 (*rec.add(3)).store(T_COUNTING, Ordering::Release);
                 let slot = SlotWord::of(&self.slots, id);
                 slot.store(at + off, Ordering::SeqCst);
+                crate::inspect::tierlog::note_arm(id, crate::inspect::tierlog::ARM_IMAGE, (*rec.add(1)).load(Ordering::Relaxed));
             }
         }
         let me = self as *mut Unit;
@@ -13029,6 +13241,7 @@ impl Unit {
             (*rec.add(2)).store(at, Ordering::Release);
             SlotWord::of(&self.slots, id).store(at, Ordering::SeqCst);
         }
+        crate::inspect::tierlog::note_arm(id, crate::inspect::tierlog::ARM_REARM, code);
     }
 
     /// arm_counter for a slot whose kind the caller knows (`counted`: an instance that is not
@@ -13068,6 +13281,8 @@ impl Unit {
             let slot = SlotWord::of(&self.slots, id);
             slot.store(at, Ordering::SeqCst);
         }
+        crate::inspect::tierlog::init();
+        crate::inspect::tierlog::note_arm(id, crate::inspect::tierlog::ARM_NEW, code);
         // tier-up state is process-wide (TIER_UNIT, the hot queue, rt_loop_hot: slot ids with
         // no unit attached): a second tiering unit would get its hot slots built against the
         // first one's table (code installed into the wrong slots). One per process, loudly.
@@ -13089,9 +13304,11 @@ impl Unit {
         let _k = crate::zone_alloc::kept();
         let n = self.retiers.entry(id).or_insert(0);
         if *n >= RETIERS {
+            crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::RETIER_SPENT, 0, *n as u64, 0);
             return;
         }
         *n += 1;
+        crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::RETIER, 0, *n as u64, 0);
         self.stats.tier1_retier += 1;
         churn_queued(id);
         tier_push(id, Q_RETIER, 0);
@@ -13205,6 +13422,7 @@ fn pgo_poll() {
             let el = now.saturating_sub(e.at);
             let rate = (entries as u128 * 1_000_000_000 / el.max(1) as u128).min(u64::MAX as u128) as u64;
             if e.lukewarm && e.credited {
+                crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, crate::inspect::tierlog::WIN_CREDITED, rate, 0);
                 ready.push((e.id, rate));
                 return false;
             }
@@ -13217,6 +13435,7 @@ fn pgo_poll() {
                 let work: u64 = ctr.iter().zip(e.weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
                 let per_s = ((work - e.mark.0.min(work)) as u128 * 1_000_000_000 / win as u128) as u64;
                 if per_s >= PGO_MIN_WORK {
+                    crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, crate::inspect::tierlog::WIN_WORK, rate, 0);
                     ready.push((e.id, rate));
                     return false;
                 }
@@ -13225,6 +13444,7 @@ fn pgo_poll() {
                     if !e.parked {
                         e.parked = true;
                         parked_now.push(e.id);
+                        crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::PARKED, 0, per_s, 0);
                     }
                 }
                 return true;
@@ -13236,6 +13456,7 @@ fn pgo_poll() {
             }
             let done = !pgo_hold() && (entries >= PGO_ENTRIES || sum >= PGO_BLOCKS || (sum > 0 && el >= PGO_MS * 1_000_000) || el >= PGO_IDLE_MS * 1_000_000);
             if done {
+                crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, if entries >= PGO_ENTRIES || sum >= PGO_BLOCKS || sum > 0 { crate::inspect::tierlog::WIN_DONE } else { crate::inspect::tierlog::WIN_IDLE }, rate, 0);
                 ready.push((e.id, rate));
             }
             !done
@@ -13480,9 +13701,21 @@ fn rt_hot(slot: u64) -> u64 {
             // UI cycles). Its loop counters still queue it; new code (a patch, O2) counts again.
             let w = (*rec.add(5)).load(Ordering::Relaxed);
             let slow = (w >> SLOW_SHIFT) & 0xf;
+            crate::inspect::tierlog::note(slot as u32, crate::inspect::tierlog::ev::SLOW, (slow + 1).min(255) as u8, took, code);
             if slow + 1 >= SLOW_RETIRE {
-                if s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                    STUBS_RETIRED.fetch_add(1, Ordering::Relaxed);
+                // retired for a while, not for good: rearm_retired puts the stub back after a
+                // backoff. Retired for good, a fn lukewarm early stayed uncounted when it turned hot
+                // later (cold race: DrawVars::set_uniform, called through its twin until its
+                // callers' verdicts came, then ~500k calls/s at baseline / O2 for the session).
+                // (try_lock and no growth: rt_hot waits for nothing; busy or full, it stays armed)
+                if let Ok(mut r) = RETIRED.try_lock() {
+                    if r.len() < r.capacity() && s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                        r.push(slot as u32);
+                        let level = ((w >> RETIRE_SHIFT) & 0xf).min(14) + 1;
+                        (*rec.add(5)).store((w & !(0xf << RETIRE_SHIFT)) | level << RETIRE_SHIFT, Ordering::Relaxed);
+                        STUBS_RETIRED.fetch_add(1, Ordering::Relaxed);
+                        crate::inspect::tierlog::note(slot as u32, crate::inspect::tierlog::ev::RETIRE, (slow + 1).min(255) as u8, 0, code);
+                    }
                 }
             } else {
                 (*rec.add(5)).store((w & !(0xf << SLOW_SHIFT)) | (slow + 1) << SLOW_SHIFT, Ordering::Relaxed);
@@ -13495,7 +13728,9 @@ fn rt_hot(slot: u64) -> u64 {
             TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
             // queued without a lock (rule I-CALL): the rate in the record (published by the push's
             // release), the slot on TIER_INBOX; the workers move it into TIER_QUEUE (tier_drain)
-            tier_inbox_push(rec, slot as u32, Q_CALLS, call_rate(rec, u.tier1.as_ref().map_or(0, |t| t.calls), now));
+            let rate = call_rate(rec, u.tier1.as_ref().map_or(0, |t| t.calls), now);
+            crate::inspect::tierlog::note(slot as u32, crate::inspect::tierlog::ev::QUEUE, Q_CALLS, rate, code);
+            tier_inbox_push(rec, slot as u32, Q_CALLS, rate);
             TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime, &u.prog.session.options));
         }
         s.load(Ordering::SeqCst)
@@ -13564,17 +13799,22 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
                 let ready = || TIER_GEN.load(Ordering::SeqCst) != seen || TIER_STOP.load(Ordering::SeqCst);
                 if parked { TIER_SLEEPERS.sleep(k, ready) } else { TIER_SLEEPERS.sleep_timeout(k, poll, ready) }
                 if k == 0 {
+                    crate::inspect::tierlog::drain();
                     // SPEC-V: verdicts that arrived release the promotions that waited for them
                     sweep_verdicts();
                     // PGO: counted slots whose window is over go to the queue
                     pgo_poll();
                     // baseline code that ran slowly but long: its O2 builds
                     drain_slow_base();
+                    // retired count stubs whose backoff is over: counted again
+                    rearm_retired();
                 }
                 q = tier_queue().unwrap();
             }
         };
         let _active = TierActive(id);
+        crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::POP, why, wall_ns().saturating_sub(queued_at), 0);
+        crate::inspect::tierlog::drain();
         if tier1_trace() {
             crate::zone_alloc::kept_with(|| TRACE_WHY.lock().unwrap().insert(id, (why, queued_at)));
             eprintln!("O3p @{:.6} #{} worker={} phase=popped ready={} startup={} last_compile={:.6} demand={} last_demand={:.6}", wall_ns() as f64 / 1e9, id, k, tier1_workers_ready(), STARTUP_COMPILES.load(Ordering::SeqCst), COMPILE_LAST.load(Ordering::SeqCst) as f64 / 1e9, DEMAND_COMPILES.load(Ordering::SeqCst), DEMAND_LAST.load(Ordering::SeqCst) as f64 / 1e9);
@@ -13596,11 +13836,13 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
             };
             // PGO: its counted build first; the O3 build follows once that code has run
             if unsafe { counted_build(up, id, lukewarm) } {
+                crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::COUNTED, lukewarm as u8, 0, 0);
                 continue;
             }
         }
         // a counted slot patched (or rebuilt) since: its profile is gone, so is this build
         if why == Q_PROFILED && !owner::publish(|| unsafe { (&*up).frequency_profiles.contains_key(&id) }) {
+            crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_REFUSED, crate::inspect::tierlog::REFUSE_PROFILE_GONE, 0, 0);
             continue;
         }
         let _active = tier1_stats_on().then(|| Tier1Active::new(queued_at));
@@ -13610,6 +13852,7 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
         // silent: build_rir's hook)
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { compile_tier1(up, id) }));
         if let Err(p) = r {
+            crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_PANIC, 0, 0, 0);
             let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".to_string());
             let n = TIER1_PANICS.fetch_add(1, Ordering::Relaxed);
             if n < 3 {
@@ -13942,6 +14185,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     }
     // SPEC-V: unverified code gets O3 code too, built as it is (Unit::o3_allowed)
     if !owner::publish(|| (&*up).o3_allowed(id)) {
+        crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_REFUSED, crate::inspect::tierlog::REFUSE_VERDICT, 0, 0);
         await_verdict(id, Await::Tier(Q_LOOP, 0));
         return false;
     }
@@ -14366,6 +14610,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
         Err(b) => {
             owner::BAILS[owner::BAIL_DROPPED].fetch_add(1, Ordering::Relaxed);
+            crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_REFUSED, crate::inspect::tierlog::REFUSE_TAKE, 0, 0);
             if tier1_trace() {
                 eprintln!("O3 take of #{} bailed: {} (slots {:?})", id, b.what, b.slots);
             }
@@ -14848,6 +15093,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 u.stats.tier1_installed += 1;
                 TIER1_INSTALLS.fetch_add(1, Ordering::Relaxed);
                 crate::boot_stats::o3_installed(boot_arm(u, id), id);
+                crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_INSTALLED, 0, t2 - t1, at);
                 // deterministic O3, replay: installed (a build whose install was refused is retried
                 // by the next trigger)
                 if let Some(k) = &t1key {
@@ -14887,6 +15133,13 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     Ok(Ok(_)) => "link check failed",
                 };
                 drop_why(up, why);
+                crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_DROPPED, match why {
+                    "build panicked" => crate::inspect::tierlog::DROP_PANIC,
+                    "codegen error" => crate::inspect::tierlog::DROP_CODEGEN,
+                    "patch changed meanwhile" => crate::inspect::tierlog::DROP_PATCH,
+                    "slot changed meanwhile" => crate::inspect::tierlog::DROP_SLOT_CHANGED,
+                    _ => crate::inspect::tierlog::DROP_LINK,
+                }, 0, 0);
                 let u = &mut *up;
                 u.stats.tier1_dropped += 1;
                 // The slot got other code while this build ran -- nearly always its O2 build from
@@ -16759,6 +17012,8 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_key_delete" => Some(crate::domain_threads::key_delete as *const () as usize),
         b"__relax_key_get" => Some(crate::domain_threads::key_get as *const () as usize),
         b"__relax_key_set" => Some(crate::domain_threads::key_set as *const () as usize),
+        // the program's request for its allocator's free pages also trims its domain heap
+        b"malloc_trim" | b"malloc_zone_pressure_relief" => crate::zone_alloc::domain::symbol(name),
         // the web target's runtime and its embedder's page side (web.rs), then run-time modules
         // (modules.rs; Relax's std::relax); the C allocator through relax inspect's heap veneers
         // (one indirect jump; tracking patches the word)
@@ -17906,7 +18161,9 @@ impl FrontShared {
             built: crate::conc::MemoMap::with_bits(16),
             lowered: Default::default(),
             consts: crate::conc::MemoMap::with_bits(12),
-            helpers: if options.tyck_ahead { options.ahead_helpers.unwrap_or_else(ahead_helpers) } else { 0 },
+            // (`makepad check` (const_fuel) only reports diagnostics: no lowering ahead -- an ahead
+            // helper's lowering of main raced the exit with its layout errors, limits/issue-55878)
+            helpers: if options.tyck_ahead && !options.const_fuel { options.ahead_helpers.unwrap_or_else(ahead_helpers) } else { 0 },
             live_helpers: std::sync::atomic::AtomicU32::new(0),
             ahead_post: Default::default(),
             queue: Default::default(),

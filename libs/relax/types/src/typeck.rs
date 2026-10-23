@@ -4397,7 +4397,8 @@ impl<'a> Fcx<'a> {
         let mut found = None;
         for &imp in self.tcx.inherent.get(&key)? {
             if !self.prog.impls[self.prog.def(imp).sub as usize].items.iter().any(|&item| self.prog.def(item).name == name && self.item_visible(item)) { continue; }
-            let applicable = self.infcx.probe(|_| {
+            let applicable = self.infcx.probe(|snapshot| {
+                let universe = self.infcx.universe();
                 let full = self.infcx.fresh_args_for_item(self.prog, imp);
                 let self_ty = self.tcx.instantiate_ty(self.prog, imp, &full, self.tcx.impl_self[&imp]);
                 let mut ocx = crate::next_solver::fulfill::ObligationCtxt::new(&self.infcx, self.prog);
@@ -4405,7 +4406,9 @@ impl<'a> Fcx<'a> {
                 for clause in self.tcx.clauses_of(self.prog, imp) {
                     ocx.register_obligation(Goal { param_env: self.param_env.clone(), predicate: self.tcx.instantiate_predicate(self.prog, imp, &full, &clause) });
                 }
-                ocx.engine.try_evaluate_obligations(&self.infcx, self.prog).is_empty()
+                // probe.rs consider_probe: the leak check (`B::<for<'a> fn(&'a ())>::f` is no
+                // item of `impl B<fn(&'static ())>`: methods/receiver-equality)
+                ocx.engine.try_evaluate_obligations(&self.infcx, self.prog).is_empty() && self.infcx.leak_check(universe, Some(snapshot)).is_ok()
             });
             if !applicable { continue; }
             for &item in &self.prog.impls[self.prog.def(imp).sub as usize].items {
@@ -4586,7 +4589,10 @@ impl<'a> Fcx<'a> {
         }
         type_dependencies(self.tcx, lt, &mut self.b.dependencies);
         // rustc_hir_typeck/src/fn_ctxt/mod.rs lower_ty: every written type must be well formed
-        if self.tcx.validates(self.prog, self.file) && lowered_clean && !self.tcx.tys.has_error(lt) { self.register_wf(lt, self.last_lo); }
+        if self.tcx.validates(self.prog, self.file) && lowered_clean && !self.tcx.tys.has_error(lt) {
+            let lo = crate::wfcheck::obligations::ty_pos(&prog.files[self.file as usize].ast, t).unwrap_or(self.last_lo);
+            self.register_wf(lt, lo);
+        }
         lt
     }
 
@@ -7450,7 +7456,8 @@ impl<'a> Fcx<'a> {
             }
             // rustc maybe_report_ambiguity: an ambiguous subtype / coercion predicate relates two still unknown
             // types (the first is named): "type annotations needed" (E0282), not an unsatisfied obligation.
-            if code == "E0283" && matches!(predicate.kind, PredicateKind::Subtype(_) | PredicateKind::Coerce(_)) {
+            // An ambiguous `WellFormed(term)` likewise (ambiguity.rs: emit_inference_failure_err E0282).
+            if code == "E0283" && matches!(predicate.kind, PredicateKind::Subtype(_) | PredicateKind::Coerce(_) | PredicateKind::Clause(crate::next_solver::ClauseKind::WellFormed(_))) {
                 self.err(obligation.cause.span, "E0282: type annotations needed".to_string());
                 continue;
             }

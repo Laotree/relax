@@ -36,7 +36,21 @@ static RANGES: Mutex<Vec<Range>> = Mutex::new(Vec::new());
 /// Turns coverage on for the program loaded after this call (the code cache with it off).
 pub fn enable() {
     let _k = crate::zone_alloc::kept();
-    let t = unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(CAP, 4096).unwrap()) };
+    // Instrumented stores are program memory accesses too: wasm32 execution masks their
+    // addresses into the linear-memory window. A host-heap table would be truncated to an
+    // unrelated address, corrupting the program or faulting before its first real instruction.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let web = crate::zone_alloc::web::active();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let web = false;
+    let t = if web {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        { unsafe { crate::zone_alloc::web::web_alloc_zeroed(CAP, 4096) } }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        { unreachable!() }
+    } else {
+        unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(CAP, 4096).unwrap()) }
+    };
     assert!(!t.is_null(), "coverage table");
     TABLE.store(t, Ordering::Release);
     ON.store(true, Ordering::Release);

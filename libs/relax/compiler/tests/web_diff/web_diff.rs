@@ -98,7 +98,125 @@ fn walk(h: &Header) -> String {
     s
 }
 
+// C-unwind callbacks have the ScriptProtoPropsFn shape. Keep the table and its
+// invocation out of line so these exercise the indirect C ABI, including taking
+// the address of a by-value argument and returning an aggregate by value.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Object8 { index: u32, generation: u16 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Object12 { a: u32, b: u32, c: u32 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Object24 { a: u64, b: u64, c: u64 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ObjectMixed { a: f64, b: u32 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ObjectFloat24 { a: f64, b: f64, c: f64 }
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct ObjectPacked { a: u8, b: u32 }
+#[repr(C)]
+struct Vm { words: [u64; 96] }
+#[repr(C)]
+struct Props { sum: u64, calls: u32 }
+
+trait Object: Copy {
+    fn sum(&self) -> u64;
+    fn changed(self) -> Self;
+}
+impl Object for Object8 {
+    fn sum(&self) -> u64 { self.index as u64 + self.generation as u64 }
+    fn changed(self) -> Self { Self { index: self.index + 7, generation: self.generation + 3 } }
+}
+impl Object for Object12 {
+    fn sum(&self) -> u64 { self.a as u64 + self.b as u64 + self.c as u64 }
+    fn changed(self) -> Self { Self { a: self.a + 1, b: self.b + 2, c: self.c + 3 } }
+}
+impl Object for Object24 {
+    fn sum(&self) -> u64 { self.a + self.b + self.c }
+    fn changed(self) -> Self { Self { a: self.a + 4, b: self.b + 5, c: self.c + 6 } }
+}
+impl Object for ObjectMixed {
+    fn sum(&self) -> u64 { self.a as u64 + self.b as u64 }
+    fn changed(self) -> Self { Self { a: self.a + 0.5, b: self.b + 9 } }
+}
+impl Object for ObjectFloat24 {
+    fn sum(&self) -> u64 { (self.a + self.b + self.c) as u64 }
+    fn changed(self) -> Self { Self { a: self.a + 0.25, b: self.b + 0.5, c: self.c + 0.75 } }
+}
+impl Object for ObjectPacked {
+    fn sum(&self) -> u64 { self.a as u64 + self.b as u64 }
+    fn changed(self) -> Self { Self { a: self.a + 1, b: self.b + 19 } }
+}
+struct Callbacks<T> {
+    props: extern "C-unwind" fn(&mut Vm, T, &mut Props),
+    result: extern "C-unwind" fn(&mut Vm, T, &mut Props) -> T,
+}
+#[inline(never)]
+fn object_sum<T: Object>(object: &T) -> u64 { object.sum() }
+#[inline(never)]
+extern "C-unwind" fn proto_props_c<T: Object>(vm: &mut Vm, object: T, props: &mut Props) {
+    let n = object_sum(&object);
+    vm.words[83] += n;
+    props.sum += n * 3;
+    props.calls += 1;
+}
+#[inline(never)]
+extern "C-unwind" fn proto_return_c<T: Object>(vm: &mut Vm, object: T, props: &mut Props) -> T {
+    proto_props_c(vm, object, props);
+    object.changed()
+}
+#[inline(never)]
+fn call_callbacks<T: Object>(table: &Callbacks<T>, vm: &mut Vm, object: T, props: &mut Props) -> T {
+    (table.props)(vm, object, props);
+    (table.result)(vm, object, props)
+}
+struct SpillCallback {
+    f: extern "C-unwind" fn(&mut Vm, u64, u64, u64, u64, u64, Object12, &mut Props) -> Object12,
+}
+#[inline(never)]
+extern "C-unwind" fn proto_spill_c(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64, e: u64, object: Object12, props: &mut Props) -> Object12 {
+    // All six SysV integer registers are occupied before the 12-byte object.
+    vm.words[7] = a + b + c + d + e;
+    proto_return_c(vm, object, props)
+}
+#[inline(never)]
+fn call_spill(table: &SpillCallback, vm: &mut Vm, object: Object12, props: &mut Props) -> Object12 {
+    (table.f)(vm, 101, 203, 307, 409, 503, object, props)
+}
+fn c_aggregates() {
+    let mut vm = Vm { words: [0; 96] };
+    let mut props = Props { sum: 0, calls: 0 };
+    let a = call_callbacks(&Callbacks { props: proto_props_c, result: proto_return_c }, &mut vm,
+        Object8 { index: 0x12345678, generation: 0x4321 }, &mut props);
+    say!("c8 {} {} {} {} {}", a.index, a.generation, vm.words[83], props.sum, props.calls);
+    let b = call_callbacks(&Callbacks { props: proto_props_c, result: proto_return_c }, &mut vm,
+        Object12 { a: 11, b: 23, c: 47 }, &mut props);
+    say!("c12 {} {} {} {} {} {}", b.a, b.b, b.c, vm.words[83], props.sum, props.calls);
+    let c = call_callbacks(&Callbacks { props: proto_props_c, result: proto_return_c }, &mut vm,
+        Object24 { a: 1 << 40, b: 101, c: 203 }, &mut props);
+    say!("c24 {} {} {} {} {} {}", c.a, c.b, c.c, vm.words[83], props.sum, props.calls);
+    let m = call_callbacks(&Callbacks { props: proto_props_c, result: proto_return_c }, &mut vm,
+        ObjectMixed { a: 17.25, b: 31 }, &mut props);
+    say!("c_mixed {} {} {} {} {}", m.a, m.b, vm.words[83], props.sum, props.calls);
+    let f = call_callbacks(&Callbacks { props: proto_props_c, result: proto_return_c }, &mut vm,
+        ObjectFloat24 { a: 1.5, b: 2.25, c: 3.75 }, &mut props);
+    say!("c_float24 {} {} {} {} {} {}", f.a, f.b, f.c, vm.words[83], props.sum, props.calls);
+    let p = call_callbacks(&Callbacks { props: proto_props_c, result: proto_return_c }, &mut vm,
+        ObjectPacked { a: 3, b: 98765 }, &mut props);
+    let pb = p.b;
+    say!("c_packed {} {} {} {} {}", p.a, pb, vm.words[83], props.sum, props.calls);
+    let s = call_spill(&SpillCallback { f: proto_spill_c }, &mut vm,
+        Object12 { a: 17, b: 37, c: 73 }, &mut props);
+    say!("c_spill {} {} {} {} {} {} {}", s.a, s.b, s.c, vm.words[7], vm.words[83], props.sum, props.calls);
+}
+
 fn body() {
+    c_aggregates();
     say!("usize {} ptr {} fat {} dyn {} opt_box {} vec {} string {}",
         std::mem::size_of::<usize>(), std::mem::size_of::<*const u8>(), std::mem::size_of::<&[u8]>(),
         std::mem::size_of::<&dyn Shape>(), std::mem::size_of::<Option<Box<u8>>>(), std::mem::size_of::<Vec<u8>>(),
