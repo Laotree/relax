@@ -888,11 +888,19 @@ pub fn wait_text(w: &crate::waits::Wait, list: &[threads::Thread]) -> String {
     }
 }
 
+/// The program's main lane: the thread running the program's `main` (`MAIN_TID`). Under a
+/// domain that is not the process's first thread, which then only runs makepad run's / the HAL's
+/// event pump; the process thread counts as main only while no program main is known.
+pub(crate) fn is_program_main(t: &threads::Thread) -> bool {
+    let main = crate::jit::MAIN_TID.load(Relaxed);
+    if main != 0 { t.handle == main } else { t.os_id == std::process::id() as u64 }
+}
+
 pub(crate) fn pick_threads(sel: &str) -> Box<dyn Fn(&threads::Thread) -> bool> {
     let sel = sel.to_string();
     Box::new(move |t: &threads::Thread| match sel.as_str() {
         "all" | "" => true,
-        "main" => t.handle != 0 && t.handle == crate::jit::MAIN_TID.load(Relaxed) || t.os_id == std::process::id() as u64,
+        "main" => is_program_main(t),
         "owner" => t.handle != 0 && t.handle == crate::owner::owner_tid(),
         s => tid_of(s).is_some_and(|id| id == t.os_id) || t.name.starts_with(s),
     })
