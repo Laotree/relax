@@ -17346,7 +17346,11 @@ fn prefront_slot(front: &FrontShared, id: u32) -> bool {
     PREFRONTS[1].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
     let ok = front.lowered.lock().unwrap_or_else(|e| e.into_inner()).get(&id).is_some_and(|x| x.is_some());
     if !ok {
-        PREFRONT_FAIL[if why == AF_OK { AF_OTHER } else { why } as usize].fetch_add(1, Ordering::Relaxed);
+        let why = if why == AF_OK { AF_OTHER } else { why };
+        PREFRONT_FAIL[why as usize].fetch_add(1, Ordering::Relaxed);
+        if tier1_trace() {
+            eprintln!("O3 front of #{} not made off the owner: {} ({})", id, PREFRONT_FAIL_NAMES[why as usize], unsafe { (&*front.unit.load(Ordering::Relaxed)).prog.def_path(d) });
+        }
     }
     ok
 }
@@ -18112,16 +18116,33 @@ pub static PREFRONT_FAIL: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 /// `own`: the lowering of a build that reached the source-body lowering (its own lazy compile, a
 /// background take's front): the selections above take_lowered_ahead (trait shims) are made
 /// before it is taken, so a trait's provided method lowers ahead too. The helpers' speculative
-/// lowering leaves them out. A provided crate's fn never lowers ahead: its lowering reads the
-/// provided-type state the owner keeps (Stage: ScriptHeap::resolve_fields lowered ahead failed
-/// check_provided_field, which the owner's lowering passes, and the app lost its script VM).
+/// lowering leaves them out. A provided crate's fn lowers ahead only when the owner's build
+/// lowers its source body too (provided_source_body); its bridge and opaque-type forwards are the
+/// owner's. (A lowering ahead that fails a provided-crate check is deferred, never an error: the
+/// Stage incident, ScriptHeap::resolve_fields failing check_provided_field ahead, predates that.)
 fn lowers_ahead(u: &Unit, d: DefId, body: &Body, own: bool) -> bool {
     let def = u.prog.def(d);
     !(!matches!(def.kind, DefKind::Fn | DefKind::AssocFn)
         || !own && (def.parent != crate::program::NO_DEF && u.prog.def(def.parent).kind == DefKind::Trait)
         || crate::sandbox::is_wrapper_crate(def.krate)
-        || !u.provided.is_empty() && u.provided.iter().any(|(kr, _)| *kr == def.krate)
+        || !provided_source_body(u, d)
         || !statics_ready(u, body))
+}
+
+/// Whether the owner's build of `d` lowers its source body: true outside the provided crates; in
+/// one, false for a bound fn (provided_bridge: a shim under its key, unbound_reason none) and for
+/// a trait impl's method of an opaque provided type (provided_fmt_hash forwards or bridges it).
+/// The fns a provided crate does not mark (LiveId::from_bytes, the tokenizers' hashing) are the
+/// program's hot code like any other: refused here, their O3 builds bailed on their own front
+/// (owner step 2) and they ran baseline code for the whole run (rust_tokenize: 41% of samples).
+fn provided_source_body(u: &Unit, d: DefId) -> bool {
+    let def = u.prog.def(d);
+    let Some((_, pc)) = u.provided.iter().find(|(k, _)| *k == def.krate) else { return true };
+    let opaque_impl = def.kind == DefKind::AssocFn && u.prog.def(def.parent).kind == DefKind::Impl
+        && u.tcx.impl_self.get(&def.parent).is_some_and(|st| matches!(u.tcx.tys.kind(*st), TyKind::Adt(ad, aa, _) if aa.is_empty() && u.provided_types.contains_key(ad)));
+    !opaque_impl
+        && (crate::provided::unbound_reason(&u.prog, &u.tcx, def.krate, d, &|a| u.provided_types.contains_key(&a)).is_some()
+            || !pc.shims.contains_key(crate::provided::key(&u.prog, &u.tcx, d).as_str()))
 }
 
 /// Every static checked body `body` names is initialized (FrontShared::consts).
