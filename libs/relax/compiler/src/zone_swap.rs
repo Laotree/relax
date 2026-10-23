@@ -28,9 +28,10 @@
 //!    restores the old statics and leaves compiler TLS valid;
 //! 6. one owner request overwrites the compiler fields of the kept `Unit` box and of every slot in
 //!    place (`ptr::write` of the new value, `mem::forget` of the old one, never a drop) and
-//!    invalidates compiler TLS and destroys every older generation, including those retained by
-//!    aborted swaps;
-//! 7. the gate opens; the threads that ended restart.
+//!    invalidates compiler TLS;
+//! 7. the gate opens; then every older generation is destroyed, including those retained by
+//!    aborted swaps (no job holds one: they all ended before the quiesce and start in g+1 after
+//!    it); the threads that ended restart.
 
 use super::*;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -273,6 +274,8 @@ struct Timeline {
     restore: f64,
     cache: f64,
     commit: f64,
+    /// the older generations' destroy, with the gate open
+    destroy: f64,
     chunks: usize,
     touched: usize,
     specs: (usize, usize),
@@ -479,17 +482,26 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     let t = Instant::now();
     // The snapshot owns old-arena pointers: forget it on this thread before commit destroys them.
     taken.forget();
-    let (chunks, touched, specs) = owner::call(owner::Class::Program, || unsafe { commit(up, fresh) });
+    let specs = owner::call(owner::Class::Program, || unsafe { commit(up, fresh) });
     tl.commit = ms(t);
     trace("commit done");
     crate::zone_alloc::kept_with(|| {
         *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some((before, epoch, swap_image.clone()));
     });
-    tl.chunks = chunks;
-    tl.touched = touched;
     tl.specs = specs;
+    let pause = ms(t_pause);
     drop(gate);
     trace("gate open");
+
+    // the older generations go with the gate open: every job ended in them before the quiesce
+    // and every job since starts in g+1 (the commit moved every root and invalidated compiler
+    // TLS), so none holds a block of them; a free that still reaches one is a tombstone no-op
+    let t = Instant::now();
+    let (chunks, touched) = crate::zone_alloc::compiler_destroy_older();
+    tl.destroy = ms(t);
+    trace("older generations destroyed");
+    tl.chunks = chunks;
+    tl.touched = touched;
 
     // 7. the freed pages go back, then the numbers
     crate::memstat::trim();
@@ -499,10 +511,10 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     LAST_SWAP_MS.store(wall_ns() / 1_000_000, Ordering::Relaxed);
     crate::boot_stats::swap_done(tl.chunks, rss0, rss1);
     let (gn, gms, gmax) = gated();
-    eprintln!("makepad-run zone: swap {}->{} at t={:.0} ms (attempt {}): encode + store off the pause {:.1} ms; pause: quiesce {:.1} ms, front images {:.1} ms, restore {:.1} ms (cache {:.1} ms), commit {:.1} ms, pause {:.1} ms; main gated {}x {:.1} ms (longest so far {:.1} ms); total {:.1} ms; destroyed {} chunks ({:.1} MB touched); {} speculative codes moved to the kept heap ({:.1} MB); rss {:.0} -> {:.0} MB",
-        old_gen, old_gen + 1, crate::clock::ms_since_start(), n + 1, tl.encode_off, tl.quiesce, tl.front_images, tl.restore, tl.cache, tl.commit, ms(t_pause), gn, gms, gmax, ms(t_all),
+    eprintln!("makepad-run zone: swap {}->{} at t={:.0} ms (attempt {}): encode + store off the pause {:.1} ms; pause: quiesce {:.1} ms, front images {:.1} ms, restore {:.1} ms (cache {:.1} ms), commit {:.1} ms, pause {:.1} ms; destroy after the pause {:.1} ms; main gated {}x {:.1} ms (longest so far {:.1} ms); total {:.1} ms; destroyed {} chunks ({:.1} MB touched); {} speculative codes moved to the kept heap ({:.1} MB); rss {:.0} -> {:.0} MB",
+        old_gen, old_gen + 1, crate::clock::ms_since_start(), n + 1, tl.encode_off, tl.quiesce, tl.front_images, tl.restore, tl.cache, tl.commit, pause, tl.destroy, gn, gms, gmax, ms(t_all),
         tl.chunks, tl.touched as f64 / 1048576.0, tl.specs.0, tl.specs.1 as f64 / 1048576.0, rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0);
-    crate::inspect::flightrec::event("zone.swap", &format!("gen {}->{}: pause {:.0} ms (quiesce {:.0}, restore {:.0}, commit {:.0}), encode off the pause {:.0}; rss {:.0} -> {:.0} MB", old_gen, old_gen + 1, ms(t_pause), tl.quiesce, tl.restore, tl.commit, tl.encode_off, rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0), (ms(t_pause) * 1e6) as u64, 0);
+    crate::inspect::flightrec::event("zone.swap", &format!("gen {}->{}: pause {:.0} ms (quiesce {:.0}, restore {:.0}, commit {:.0}), encode off the pause {:.0}; rss {:.0} -> {:.0} MB", old_gen, old_gen + 1, pause, tl.quiesce, tl.restore, tl.commit, tl.encode_off, rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0), (pause * 1e6) as u64, 0);
     Outcome::Done
 }
 
@@ -647,9 +659,9 @@ fn build(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: crate::cach
 }
 
 /// Owner request, everything quiescent: the compile state of the kept `Unit` is overwritten by
-/// the new generation's, in place, and all older generations are destroyed. Returns (chunks, touched
-/// bytes) of the destroyed arena and (count, bytes) of the speculative codes moved to the kept heap.
-unsafe fn commit(up: *mut Unit, f: Fresh) -> (usize, usize, (usize, usize)) {
+/// the new generation's, in place (the caller destroys the older generations once the gate is
+/// open). Returns (count, bytes) of the speculative codes moved to the kept heap.
+unsafe fn commit(up: *mut Unit, f: Fresh) -> (usize, usize) {
     let _front = super::front_write_within(1000);
     trace("commit: entered");
     let u = &mut *up;
@@ -713,10 +725,7 @@ unsafe fn commit(up: *mut Unit, f: Fresh) -> (usize, usize, (usize, usize)) {
     // Only commit invalidates TLS; an aborted restore must keep the running state's TLS valid.
     relax_session::gen_local::bump();
     zone_scan::stale_roots(crate::zone_alloc::compiler_generation());
-    trace("commit: destroying");
-    let (chunks, touched) = crate::zone_alloc::compiler_destroy_older();
-    trace("commit: destroyed");
-    (chunks, touched, (specs, spec_bytes))
+    (specs, spec_bytes)
 }
 
 /// `set_shared_front` for a unit that already runs: the new FrontShared points at the unit's

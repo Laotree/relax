@@ -97,7 +97,6 @@ pub mod registry_net;
 
 /// Compiler statics held for rollback; forget them before destroying their generations.
 pub struct ZoneTaken {
-    owner: owner::ZoneTaken,
     native_macros: native_macros::ZoneTaken,
     cache: cache::ZoneTaken,
     jit: jit::ZoneTaken,
@@ -108,9 +107,10 @@ pub struct ZoneTaken {
 /// Takes this crate's compiler statics while every compiler thread is quiesced.
 /// None, taking nothing, when the owner has requests queued.
 pub fn zone_take() -> Option<ZoneTaken> {
-    let owner = owner::zone_take()?;
+    if !owner::queue_empty() {
+        return None;
+    }
     Some(ZoneTaken {
-        owner,
         native_macros: native_macros::zone_take(),
         cache: cache::zone_take(),
         jit: jit::zone_take(),
@@ -121,7 +121,6 @@ pub fn zone_take() -> Option<ZoneTaken> {
 
 /// Restores the statics after an aborted swap, forgetting the new generation's values.
 pub fn zone_put_back(taken: ZoneTaken) {
-    owner::zone_put_back(taken.owner);
     native_macros::zone_put_back(taken.native_macros);
     cache::zone_put_back(taken.cache);
     jit::zone_put_back(taken.jit);
