@@ -594,6 +594,15 @@ pub fn run_crate_impl_errors(prog: &Program, tcx: &Tcx, krate: u32) -> std::sync
     if let Some(e) = MEMO.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&(krate, epoch))) {
         return e.clone();
     }
+    // a body type-checked while these checks run (a constant a well-formedness check evaluates)
+    // does not start them again: that would ask for the query in progress (a false E0391)
+    thread_local! { static ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    if ACTIVE.with(|a| a.replace(true)) {
+        return std::sync::Arc::new(Vec::new());
+    }
+    struct Reset;
+    impl Drop for Reset { fn drop(&mut self) { ACTIVE.with(|a| a.set(false)); } }
+    let _reset = Reset;
     let mut out = Vec::new();
     for i in 0..prog.defs.len() {
         let d = DefId(i as u32);
