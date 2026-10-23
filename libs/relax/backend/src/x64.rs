@@ -3793,12 +3793,13 @@ impl<'a> Gen<'a> {
                         self.a.sse_rr(0, if matches!(op, VX::FSqrt(..)) { 0x51 } else { 0x5b }, xd, xa, false);
                         self.fin_f(d, xd);
                     }
-                    VX::FRound(_, RoundTo::Floor | RoundTo::Ceil | RoundTo::Trunc) => {
+                    VX::FRound(_, RoundTo::Floor | RoundTo::Ceil | RoundTo::Trunc | RoundTo::Even) => {
                         let xd = self.def_f(d, XS);
                         self.a.sse_ext(0x66, 0x3a, 0x08, xd, xa); // roundps
                         self.a.byte(match op {
                             VX::FRound(_, RoundTo::Floor) => 9,
                             VX::FRound(_, RoundTo::Ceil) => 10,
+                            VX::FRound(_, RoundTo::Even) => 8,
                             _ => 11,
                         });
                         self.fin_f(d, xd);
@@ -3961,6 +3962,7 @@ impl<'a> Gen<'a> {
                         self.a.byte(match t {
                             RoundTo::Floor => 9,
                             RoundTo::Ceil => 10,
+                            RoundTo::Even => 8,
                             _ => 11,
                         });
                     }
