@@ -3099,33 +3099,6 @@ impl Unit {
         CodeKind::new(t, origin::FRESH)
     }
 
-    /// Drops the index entries of code in [lo, hi) (a recycled sandbox code space).
-    pub(crate) fn unindex_range(&mut self, lo: u64, hi: u64) {
-        let mut t = self.code.write().unwrap_or_else(|e| e.into_inner());
-        let t = &mut *t;
-        let keep: Vec<bool> = t.index.iter().map(|x| x.0 < lo || x.0 >= hi).collect();
-        let mut k = 0;
-        t.kinds.retain(|_| {
-            k += 1;
-            keep[k - 1]
-        });
-        t.index.retain(|x| x.0 < lo || x.0 >= hi);
-        t.unwind.retain(|a, _| *a < lo || *a >= hi);
-        t.inlined.retain(|a, _| *a < lo || *a >= hi);
-    }
-
-    /// Reserves code memory without writing it (sandbox code spaces).
-    pub(crate) fn reserve_code(&self, len: u64) -> u64 {
-        bump(&self.code_next, len, 1 << 16, self.exec_base + self.exec_size, "out of code memory")
-    }
-
-    /// Links code for `at` (the caller placed it there).
-    pub(crate) fn link_at(&self, at: u64, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Result<Vec<u8>, String> {
-        let mut c = code.to_vec();
-        self.link_code(&mut c, at, relocs)?;
-        Ok(c)
-    }
-
     /// The lazy stub of slot `id` (what its table word holds before its first compile).
     pub(crate) fn stub_of(&self, id: u32) -> u64 {
         self.slots.stub(id)
@@ -5366,25 +5339,18 @@ impl Unit {
         let code = &code[..n];
         let twin = matches!(self.fns[id as usize].key, FnKey::Sandbox(_));
         let redirect = if interp || options.no_codegen { Some(self.no_codegen_target(code, relocs, &self.fns[id as usize].name)?) } else { None };
-        // a sandboxed twin's code goes to the sandbox code space (recycled as a whole)
+        // (code is append-only: a replaced version stays mapped, twins' too)
         let at = match redirect {
             Some(t) => t,
-            None => match if twin { crate::sandbox::emit_twin(self, code, relocs) } else { None } {
-                Some(a) => a,
-                None => self.emit_linked(code, relocs)?,
-            },
+            None => self.emit_linked(code, relocs)?,
         };
         if redirect.is_none() {
             self.index_code(at, code.len() as u32, id, info);
         }
-        if twin && crate::sandbox::reclaim_stress() {
-            // MAKEPAD_RUN_RECLAIM_STRESS: reclaim after every install (a background recycle)
-            crate::sandbox::maybe_recycle(self as *mut Unit);
+        if redirect.is_none() {
+            code_growth(if twin { GROW_MODULE } else if gen > 0 { GROW_PATCH } else { GROW_FIRST }, code.len());
         }
         let f = &mut self.fns[id as usize];
-        if twin && f.compiled {
-            crate::sandbox::note_dead(f.code_len as u64);
-        }
         if f.compiled {
             let old_map = std::mem::take(&mut f.pc_map);
             crate::zone_alloc::kept_with(|| f.history.get_or_insert_with(Default::default).prev.push((f.code, f.code_len, old_map, f.patch_gen)));
@@ -15069,16 +15035,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 let at = if blob {
                     u.emit_or_redirect(&code, &relocs, "O3").expect("O3 interpreted code installs")
                 } else {
-                    match if sandboxed { crate::sandbox::emit_twin(u, &code, &relocs) } else { None } {
-                        Some(at) => at,
-                        None => u.emit_linked(&code, &relocs).expect("O3 code links (checked)"),
-                    }
+                    u.emit_linked(&code, &relocs).expect("O3 code links (checked)")
                 };
-                if sandboxed {
-                    crate::sandbox::note_dead(u.fns[id as usize].code_len as u64);
-                    if crate::sandbox::reclaim_stress() {
-                        crate::sandbox::maybe_recycle(up);
-                    }
+                if !blob {
+                    code_growth(if sandboxed { GROW_MODULE } else if u.retiers.contains_key(&id) { GROW_REOPT } else { GROW_TIERUP }, code.len());
                 }
                 o3_owner(2, te);
                 let tx = cpu_ns();
@@ -19200,12 +19160,28 @@ pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body, warm_only: bool,
 
 /// Bump allocation in [*next, end): `size` bytes at `align` (lock-free: lowering threads and
 /// the lock holder allocate concurrently).
+/// The unit's code window is full: there is nowhere left to put code (it is append-only). A clear
+/// report, then a real crash (never an unwind a fault containment could swallow).
+#[cold]
+fn code_full(size: u64) -> ! {
+    let mut msg = format!("makepad run: the JIT code window is full ({} bytes asked); code is never freed. Installed code by source:", size);
+    for k in 0..GROW_NAMES.len() {
+        msg += &format!(" {} {:.1} MB ({} installs);", GROW_NAMES[k], CODE_GROWTH[k].load(Ordering::Relaxed) as f64 / 1048576.0, CODE_INSTALLS[k].load(Ordering::Relaxed));
+    }
+    eprintln!("{}", msg);
+    std::process::abort();
+}
+
 fn bump(next: &AtomicU64, size: u64, align: u64, end: u64, full: &str) -> u64 {
     let a = align.max(1);
     let mut cur = next.load(Ordering::Relaxed);
     loop {
         let at = (cur + a - 1) / a * a;
         if at + size > end {
+            if full == "out of code memory" {
+                // code is append-only (every version stays mapped): nowhere is left to put code
+                code_full(size);
+            }
             // (a constant that asks for more memory than the compiler has is a constant-evaluation
             // error, not a compiler bug: rustc's `MemoryExhausted`)
             std::panic::resume_unwind(Box::new(crate::infer::diagnostics::FatalError(format!("E0080: tried to allocate more memory than available to compiler ({full})"))));
@@ -19219,6 +19195,23 @@ fn bump(next: &AtomicU64, size: u64, align: u64, end: u64, full: &str) -> u64 {
             Err(x) => cur = x,
         }
     }
+}
+
+/// Code bytes installed by source (append-only code: makepad inspect `code`): a slot's first
+/// code, an O3 tier-up, an O3 rebuild (re-optimize), a hot patch, a run-time module's twins.
+pub(crate) const GROW_FIRST: usize = 0;
+pub(crate) const GROW_TIERUP: usize = 1;
+pub(crate) const GROW_REOPT: usize = 2;
+pub(crate) const GROW_PATCH: usize = 3;
+pub(crate) const GROW_MODULE: usize = 4;
+pub(crate) const GROW_NAMES: [&str; 5] = ["first", "tier-up", "re-optimize", "patch", "module"];
+pub(crate) static CODE_GROWTH: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// ... and the number of installs of each
+pub(crate) static CODE_INSTALLS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+fn code_growth(source: usize, bytes: usize) {
+    CODE_GROWTH[source].fetch_add(bytes as u64, Ordering::Relaxed);
+    CODE_INSTALLS[source].fetch_add(1, Ordering::Relaxed);
 }
 
 /// A unit's own address (see Unit::self_ptr).

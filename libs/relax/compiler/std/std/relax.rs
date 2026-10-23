@@ -80,7 +80,7 @@ extern "C" {
     fn __relax_sb_enter(module: u32, out: *mut [i64; 4]) -> u32;
     fn __relax_sb_leave(prev: *const [i64; 4]);
     fn __relax_sb_alloca(size: usize, align: usize) -> usize;
-    fn __relax_sb_stats(out: *mut [u64; 7], recycle: u32) -> u32;
+    fn __relax_sb_stats(out: *mut [u64; 4]);
     fn __relax_domain_id() -> u32;
     fn __relax_restart_supported();
     fn __relax_restart_requested() -> u32;
@@ -232,16 +232,12 @@ pub fn restored_state() -> Option<String> {
     }
 }
 
-/// Sandbox code and data statistics: [recycles, code bytes in use, dead code bytes pending,
-/// image read-only bytes, image read-write bytes, live arenas, recycles refused because a thread
-/// was still inside the space to reuse]. `recycle`: rebuild the live
-/// module code first (blocking; Err when frames may still run in the space it would reuse).
-pub fn sandbox_stats(recycle: bool) -> Result<[u64; 7], String> {
-    let mut out = [0u64; 7];
-    if unsafe { __relax_sb_stats(&mut out, recycle as u32) } == 0 {
-        return Err(last_error());
-    }
-    Ok(out)
+/// Sandbox code and data statistics: [twin code bytes installed (append-only: replaced versions
+/// stay mapped), image read-only bytes, image read-write bytes, live arenas].
+pub fn sandbox_stats() -> [u64; 4] {
+    let mut out = [0u64; 4];
+    unsafe { __relax_sb_stats(&mut out) };
+    out
 }
 
 // ---- used by the wrappers Relax generates for sandboxed modules (not an API)

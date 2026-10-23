@@ -112,25 +112,8 @@ struct Sb {
     arenas: Vec<Arc<Arena>>,
     /// twin -> slots its code refers to without a relocation (fn pointer constants)
     refs: HashMap<u32, Vec<u32>>,
-    /// the two code spaces twins are installed in: (base, size, next); `active` gets new code,
-    /// a recycle rebuilds every live twin into the other one and swaps
-    spaces: [(u64, u64, u64); 2],
-    active: usize,
-    /// per space: the reclaim epoch it was unlinked at (reclaim.rs; 0: never held code that ran)
-    abandoned: [u64; 2],
-    /// crates of unloaded modules (their twins are dead)
-    dead_crates: HashSet<u32>,
-    recycles: u32,
 }
 
-/// bytes of each sandbox code space
-const SPACE: u64 = 64 << 20;
-/// dead twin code (replaced or of unloaded modules) that starts a recycle
-static DEAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-const RECYCLE_AT: u64 = 16 << 20;
-/// recycles refused because a thread may still run in the space to reuse (reclaim.rs)
-static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static RECYCLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 static SB: Mutex<Option<Sb>> = Mutex::new(None);
 /// The TLS block offset of the sandbox words + 1 (0: no sandbox yet), read off the unit.
@@ -183,8 +166,6 @@ unsafe fn sb_init(up: *mut Unit) -> Result<(), String> {
     let sbt_base = crate::os::mem::reserve(bytes, 0);
     // the slot every unused sandbox thunk jumps through: its code panics with the reason
     let trap_slot = u.fn_id(FnKey::Sandbox(u32::MAX));
-    let s0 = u.reserve_code(SPACE);
-    let s1 = u.reserve_code(SPACE);
     let trap = tgt::thunk(u.slots.table(trap_slot));
     let mut all = Vec::with_capacity(bytes);
     for _ in 0..SBT_N {
@@ -207,11 +188,6 @@ unsafe fn sb_init(up: *mut Unit) -> Result<(), String> {
         abs: Vec::new(),
         arenas: Vec::new(),
         refs: HashMap::new(),
-        spaces: [(s0, SPACE, s0), (s1, SPACE, s1)],
-        active: 0,
-        abandoned: [0, 0],
-        dead_crates: HashSet::new(),
-        recycles: 0,
     });
     Ok(())
 }
@@ -239,266 +215,9 @@ pub fn add_wrapper_crate(krate: u32) {
     });
 }
 
-/// Places a twin's code in the active sandbox code space (None: full, the unit's own code
-/// memory takes it; a recycle is due).
-pub fn emit_twin(u: &Unit, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Option<u64> {
-    let at = {
-        let mut g = SB.lock().unwrap_or_else(|e| e.into_inner());
-        let s = g.as_mut()?;
-        let sp = &mut s.spaces[s.active];
-        let at = (sp.2 + 15) & !15;
-        if at + code.len() as u64 > sp.0 + sp.1 {
-            DEAD_BYTES.store(RECYCLE_AT, std::sync::atomic::Ordering::Relaxed);
-            return None;
-        }
-        sp.2 = at + code.len() as u64;
-        at
-    };
-    let c = u.link_at(at, code, relocs).ok()?;
-    unsafe { crate::os::mem::write_code(at, &c) };
-    Some(at)
-}
-
-/// Twin code that stopped being used (replaced by a patch).
-pub fn note_dead(bytes: u64) {
-    DEAD_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// A module's crate was unloaded: its twins are dead code.
-pub unsafe fn retire_crate(up: *mut Unit, krate: u32) {
-    let u = &*up;
-    let mut bytes = 0;
-    {
-        let mut g = SB.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(s) = g.as_mut() else { return };
-        s.dead_crates.insert(krate);
-        for (&base, &t) in s.twins.iter() {
-            if crate_of(u, base) == Some(krate) && u.fns[t as usize].compiled {
-                bytes += u.fns[t as usize].code_len as u64;
-            }
-        }
-    }
-    note_dead(bytes);
-}
-
-fn crate_of(u: &Unit, id: u32) -> Option<u32> {
-    match &u.fns[id as usize].key {
-        FnKey::Inst(d, _) => Some(u.prog.def(*d).krate),
-        FnKey::Closure(f, _, _) => u.prog.file_crate.get(*f as usize).copied(),
-        _ => None,
-    }
-}
-
-/// MAKEPAD_RUN_RECLAIM_STRESS=1: every twin install asks for a recycle, so the spaces are reused
-/// as often as the quiescence proof allows (JITREFMEM L6, V8's stress_wasm_code_gc).
-pub fn reclaim_stress() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_RECLAIM_STRESS").is_some_and(|v| v != "0"))
-}
-
-/// Whether a recycle is due (dead twin code past the threshold, or stress) and none is running.
-pub fn recycle_due() -> bool {
-    (reclaim_stress() || DEAD_BYTES.load(std::sync::atomic::Ordering::Relaxed) >= RECYCLE_AT) && !RECYCLING.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Starts a recycle on a background thread when one is due.
-pub fn maybe_recycle(up: *mut Unit) {
-    if !recycle_due() || RECYCLING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
-    }
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
-    struct P(*mut Unit);
-    unsafe impl Send for P {}
-    let p = P(up);
-    let spawned = std::thread::Builder::new()
-        .name("run-sandbox-recycle".to_string())
-        .spawn(move || {
-            let runtime = &session.runtime;
-            let p = p;
-            jit::lower_this_thread_priority(runtime);
-            let r = unsafe { recycle(p.0) };
-            if let Err(e) = r {
-                // (stress: the first few only -- refusals are the expected common case there)
-                static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if !reclaim_stress() || SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
-                    eprintln!("makepad: sandbox recycle skipped: {}", e);
-                }
-            }
-            RECYCLING.store(false, std::sync::atomic::Ordering::SeqCst);
-        });
-    if spawned.is_err() {
-        RECYCLING.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-/// Rebuilds every live twin into the other sandbox code space and swaps (a unit call
-/// here): dead twins (unloaded modules, replaced versions) are left behind, and the space they
-/// were in is reused by the next recycle once no thread can still run in it (reclaim.rs).
-/// Returns (twins moved, bytes now used).
-pub unsafe fn recycle(up: *mut Unit) -> Result<(usize, u64), String> {
-    crate::owner::call(crate::owner::Class::Program, || recycle_locked(up))
-}
-
-unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
-    // prove: the space to reuse was unlinked at `abandoned`; a thread inside since before that
-    // may still run there (or return into it): then nothing is reused now
-    {
-        let g = SB.lock().unwrap_or_else(|e| e.into_inner());
-        let s = g.as_ref().ok_or("no sandbox")?;
-        let stamp = s.abandoned[1 - s.active];
-        let n = crate::reclaim::blockers(stamp);
-        if n != 0 {
-            REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Err(format!("{} thread(s) may still run in the space to reuse", n));
-        }
-    }
-    let (target, tbase, tsize, old_hw, live, dead) = {
-        let g = SB.lock().unwrap_or_else(|e| e.into_inner());
-        let s = g.as_ref().ok_or("no sandbox")?;
-        let target = 1 - s.active;
-        let u = &*up;
-        let mut live = Vec::new();
-        let mut dead = Vec::new();
-        for (&base, &t) in s.twins.iter() {
-            if !u.fns[t as usize].compiled {
-                continue;
-            }
-            if crate_of(u, base).map_or(false, |k| s.dead_crates.contains(&k)) {
-                dead.push(t);
-            } else if s.spaces.iter().any(|sp| (sp.0..sp.0 + sp.1).contains(&u.fns[t as usize].code)) {
-                live.push(t);
-            }
-            // (a live twin outside both spaces stays where it is: emit_twin could not link it
-            // into a space -- e.g. a host call beyond arm64 branch reach, which needs the unit
-            // code's veneers -- so it went to the unit's code memory, which is never reused)
-        }
-        (target, s.spaces[target].0, s.spaces[target].1, s.spaces[target].2, live, dead)
-    };
-    // the target space's old code is gone from every index (its frames are quiescent)
-    {
-        let u = &mut *up;
-        u.unindex_range(tbase, tbase + tsize);
-        for f in u.fns.iter_mut() {
-            if let Some(h) = &mut f.history {
-                h.prev.retain(|p| p.0 < tbase || p.0 >= tbase + tsize);
-                h.retired.retain(|p| p.0 < tbase || p.0 >= tbase + tsize);
-            }
-        }
-    }
-    // build everything first: nothing changes unless every live twin rebuilt
-    // (twin, address, linked code, already written, pc map, unwind info)
-    let mut built: Vec<(u32, u64, Vec<u8>, bool, Vec<(u32, u64)>, Option<relax_backend::rir::UnwindInfo>)> = Vec::new();
-    let mut next = tbase;
-    for &t in &live {
-        let (code, map, relocs) = jit::compile_fn(up, t)?;
-        let (n, info) = relax_backend::rir::split_unwind_info(&code);
-        let code = &code[..n];
-        let at = (next + 15) & !15;
-        if at + code.len() as u64 > tbase + tsize {
-            return Err("the live twins do not fit one sandbox code space".to_string());
-        }
-        let u = &*up;
-        match u.link_at(at, code, &relocs) {
-            Ok(linked) => {
-                next = at + code.len() as u64;
-                built.push((t, at, linked, false, map, info));
-            }
-            // as emit_twin: code the space cannot link (a host call beyond arm64 branch reach
-            // needs the unit code's veneers) goes to the unit's code memory, written now (fresh,
-            // unreachable until its slot word moves) and never reused
-            Err(_) => {
-                let at = u.emit_linked(code, &relocs)?;
-                built.push((t, at, code.to_vec(), true, map, info));
-            }
-        }
-    }
-    // free: the old code goes (traps where nothing new lands), the new code is written, and
-    // every core of the process synchronises its instruction stream before a reused address
-    // is published (no core may still hold the old instructions)
-    if old_hw > tbase {
-        zap_code(tbase, old_hw - tbase);
-    }
-    for (_, at, code, written, _, _) in &built {
-        if !written {
-            crate::os::mem::write_code(*at, code);
-        }
-    }
-    if old_hw > tbase && !crate::os::mem::sync_cores() {
-        REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Err("this OS cannot synchronise the other cores before code memory is reused".to_string());
-    }
-    // unlink: each live twin's table word points to its new code; dead twins back to their stubs
-    let u = &mut *up;
-    for (t, at, code, _, map, info) in built {
-        u.index_code(at, code.len() as u32, t, info);
-        if jit::perf_map_on() {
-            jit::perf_map(at, code.len(), &format!("{} [sandbox]", jit::perf_name(u, t)));
-        }
-        let f = &mut u.fns[t as usize];
-        let old = (f.code, f.code_len, std::mem::take(&mut f.pc_map), f.patch_gen);
-        crate::zone_alloc::kept_with(|| {
-            let h = f.history.get_or_insert_with(Default::default);
-            h.retired.push((old.0, old.1, old.2));
-            h.prev.clear();
-        });
-        f.code = at;
-        f.code_len = code.len() as u32;
-        f.pc_map = crate::jit::PcMap::new(&map);
-        f.version += 1;
-        let slot = crate::jit::SlotWord::of(&u.slots, t);
-        slot.store(at, std::sync::atomic::Ordering::SeqCst);
-        u.rearm_sandbox_counter(t, at);
-    }
-    for t in dead {
-        let stub = u.stub_of(t);
-        let f = &mut u.fns[t as usize];
-        f.compiled = false;
-        f.rir = None;
-        f.version += 1;
-        if let Some(h) = &mut f.history { h.prev.clear(); }
-        let slot = crate::jit::SlotWord::of(&u.slots, t);
-        slot.store(stub, std::sync::atomic::Ordering::SeqCst);
-    }
-    let used = next - tbase;
-    let n = live.len();
-    // the space left behind is stamped after its last slot word moved: threads entering from
-    // now on cannot reach it (reclaim.rs)
-    let stamp = crate::reclaim::advance();
-    with_sb(|s| {
-        s.abandoned[1 - target] = stamp;
-        s.active = target;
-        s.spaces[target].2 = next;
-        s.recycles += 1;
-    });
-    DEAD_BYTES.store(0, std::sync::atomic::Ordering::SeqCst);
-    Ok((n, used))
-}
-
-/// Fills code memory nobody can reach any more with traps: a stale jump faults instead of
-/// running old code (JITREFMEM L6: zap freed code).
-unsafe fn zap_code(at: u64, len: u64) {
-    crate::os::mem::fill_code(at, len as usize, |b| {
-        #[cfg(target_arch = "aarch64")]
-        for w in b.chunks_exact_mut(4) {
-            w.copy_from_slice(&0xd420_0000u32.to_le_bytes()); // brk #0
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        b.fill(0xcc); // int3
-    });
-}
-
-/// Recycles refused by the quiescence proof (a thread still inside the space to reuse).
-pub fn refused_recycles() -> u64 {
-    REFUSED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// (recycles done, bytes used in the active code space, dead bytes pending).
-pub fn code_stats() -> (u32, u64, u64) {
-    let g = SB.lock().unwrap_or_else(|e| e.into_inner());
-    match g.as_ref() {
-        Some(s) => (s.recycles, s.spaces[s.active].2 - s.spaces[s.active].0, DEAD_BYTES.load(std::sync::atomic::Ordering::Relaxed)),
-        None => (0, 0, 0),
-    }
+/// Twin code bytes installed so far (append-only: every version stays mapped).
+pub fn twin_code_bytes() -> u64 {
+    jit::CODE_GROWTH[jit::GROW_MODULE].load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether slot `id` holds code of a sandboxed crate (never compiled or inlined as host code).
@@ -1040,10 +759,6 @@ fn budget_growth(base: u64, bytes: u64, commit: bool) -> bool {
     })
 }
 
-pub fn entry_depth() -> u64 { crate::reclaim::depth() }
-/// A contained fault or deadline unwound past the wrappers: their frames are gone.
-pub fn entry_recover(depth: u64) { crate::reclaim::recover(depth) }
-
 pub fn budget_depth() -> usize { ACCOUNTS.with(|s| s.borrow().len()) }
 pub fn budget_recover(depth: usize) {
     budget_flush();
@@ -1115,8 +830,6 @@ fn enter_raw(a: &Arena) -> Result<Saved, String> {
         return Err("the module was unloaded".to_string());
     }
     budget_flush();
-    // recorded before the wrapper loads any twin's slot word (reclaim.rs)
-    crate::reclaim::enter();
     let w = words();
     let prev = unsafe { Saved([*w, *w.add(1), *w.add(2), *w.add(3)]) };
     unsafe {
@@ -1141,7 +854,6 @@ fn enter_raw(a: &Arena) -> Result<Saved, String> {
 /// A wrapper's call returns (or unwinds): the state before it comes back.
 pub fn leave(prev: Saved) {
     restore(prev);
-    crate::reclaim::leave();
 }
 
 /// Shadow-stack bytes for a wrapper's argument copy or result slot (0: no room).
