@@ -2253,10 +2253,9 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
     let _k = crate::zone_alloc::kept();
     { let _k = crate::zone_alloc::kept();
     // named: inspect lists it as makepad run's, not the program's
-    let _ = std::thread::Builder::new().name("run-monitor".into()).spawn(move || {
-    // a panic here ended every later settle, swap and trim of the run without a word (the
-    // compiler's panic hook can be the silent one at that moment): it is said, with its payload
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+    // a panic here ended every later settle, swap and trim of the run without a word: the loop
+    // runs under the lifeline (reported with its position, restarted with fresh round state)
+    crate::lifeline::spawn("run-monitor".into(), crate::lifeline::OnPanic::Restart, None, move || {
         let runtime = &runtime;
         let options = &options;
         // A measurement harness requests an allocator snapshot at its own landmark
@@ -2294,6 +2293,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let mut swap_said_at = Instant::now();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
+            crate::lifeline::beat();
             if let Some(file) = present.as_mut() {
                 use std::io::{Read, Write};
                 let _ = file.read_to_end(&mut present_bytes);
@@ -2593,11 +2593,6 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 report("fns", &n.to_string());
             }
         }
-    }));
-    if let Err(e) = r {
-        let what = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_default();
-        eprintln!("makepad-run: the run monitor ended by a panic: {what} (no more settles, zone swaps or trims in this run)");
-    }
     });
     }
 }
@@ -2696,6 +2691,10 @@ fn finish_run(why: &'static str, code: Option<i32>) {
     // exit worker while it waits for it
     EXIT_CALLER_HOLDS.store(crate::owner::is_owner(), Ordering::SeqCst);
     jit::begin_exit();
+    // a JIT thread that panicked during the run is said once more at its end (inspect threads has the rows)
+    if let Some(l) = crate::lifeline::summary() {
+        eprintln!("makepad-run: {}", l);
+    }
     if exit.request.try_send((why, code)).is_err() { return; }
     // 100 ms for the cleanup, counted from the end of the cache write; the write itself only
     // has a hang guard (a store on a stalled disk must not keep the process forever)
