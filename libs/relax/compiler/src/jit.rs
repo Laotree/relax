@@ -10778,7 +10778,7 @@ pub fn find_tests(prog: &Program, krate: u32) -> Vec<DefId> {
 
 /// Tier-up policy (backend lane). `None` in `Unit::tier1`: O1 only.
 pub struct Tier1Cfg {
-    /// the decayed cost (CALL_COST units: MAKEPAD_RUN_O3_CALLS calls of a small fn) at which a
+    /// the decayed cost (MAKEPAD_RUN_O3_CALLS x O3_CALL_UNITS) at which a
     /// counted function is queued for O3
     pub threshold: u64,
     /// optimisation of the O3 build (inlining over every callee that has RIR by then)
@@ -10789,7 +10789,7 @@ pub struct Tier1Cfg {
 
 impl Tier1Cfg {
     /// On by default; MAKEPAD_RUN_O3=0 disables it. MAKEPAD_RUN_O3_CALLS=n sets the hotness threshold
-    /// (n small calls' cost).
+    /// (n x O3_CALL_UNITS: n calls of a ~160-byte fn).
     pub fn from_options(options: &crate::options::Options) -> Option<Tier1Cfg> {
         // on by default (MAKEPAD_RUN_O3=0: O1 only, which then also inlines Relax core's small
         // functions itself). Hot = calls through the slot (count stub) or CPU samples (loops
@@ -10798,7 +10798,7 @@ impl Tier1Cfg {
         if !options.tier1 {
             return None;
         }
-        let threshold = options.tier1_calls.saturating_mul(CALL_COST).max(1);
+        let threshold = tier_threshold(options.tier1_calls);
         Some(Tier1Cfg { threshold, opt: relax_codegen::opt::OptCfg::from_options(options), src_toks: TIER1_SRC_TOKS })
     }
 }
@@ -12329,9 +12329,13 @@ const TIER_REC: usize = 80;
 /// the loop counter's offset in the tier record (word 8)
 const TIER_LOOP: u64 = 64;
 /// Cost units: a back edge is 1, a call CALL_COST plus its code's size (call_weight). The O3
-/// threshold is MAKEPAD_RUN_O3_CALLS (default 2000) calls of a small fn: 40000 units, which a
-/// loop reaches in 40000 back edges (HotSpot's C2 Tier4BackEdgeThreshold, as before).
-const CALL_COST: u64 = 20;
+/// threshold is MAKEPAD_RUN_O3_CALLS (default 2000) x O3_CALL_UNITS = 40000 units, which a loop
+/// reaches in 40000 back edges (HotSpot's C2 Tier4BackEdgeThreshold, as before) and a tiny fn in
+/// 4000 calls: at 20 per call (the old windows' 2000 calls) a cold Calculator built 2x the O3 code
+/// after its first present, mostly core generics (RefCell::borrow, Vec::new, slice::end_of) that
+/// their O3 callers inline anyway.
+const O3_CALL_UNITS: u64 = 20;
+const CALL_COST: u64 = 10;
 /// a call's weight grows by one unit per this many bytes of the counted code beyond CALL_COST's
 /// (an estimate of its straight-line work: bigger bodies cost more per call). Race A/B (165, warm,
 /// 1 s half-life, tier-up installs vs 1404 at the old call windows): 8 -> 2153, 32 -> 1986
@@ -12343,13 +12347,15 @@ const WEIGHT_BYTES: u64 = 16;
 /// call of a huge startup fn is never enough
 const MAX_WEIGHT: u64 = 1024;
 /// The cost seen decays exponentially with this half-life: code tiers up when its cost rate keeps
-/// the decayed sum over the threshold (steady rate > threshold x ln 2 / half-life). At ln 2 s the
-/// steady rate is the threshold per second: 2000 small calls/s or 40000 back edges/s, the old
-/// windows' rates, and a 60 Hz fn of weight 667 or more (~10 KB); a burst of the threshold's cost
-/// tiers up at once (MAKEPAD_RUN_O3_CALLS=1: one call). Idle code decays to nothing. Decay is
-/// applied lazily at each check: no timer, no thread, no work while the program does not call the
-/// slot.
-const COST_HALF_LIFE_NS: f64 = std::f64::consts::LN_2 * 1e9;
+/// the decayed sum over the threshold. The threshold is the rate (MAKEPAD_RUN_O3_CALLS x
+/// O3_CALL_UNITS per second: 4000 tiny calls/s, 2000 of a ~160-byte fn, or 40000 back edges/s, the
+/// old windows' rates) times half-life / ln 2, the sum a steady rate converges on: a fn must keep
+/// its rate for about a half-life or two. A 60 Hz fn of weight 667 or more (~10 KB) gets there (the
+/// race's Hud::draw_walk, 894, in ~4 s); a startup burst of a few seconds of frames does not (a
+/// cold Calculator built hal_intake, fb_draw, fb_vec_texture -- 20-50 KB, 0.1-0.3 s builds each --
+/// from its first frames at a 0.7 s half-life). Idle code decays to nothing. Decay is applied
+/// lazily at each check: no timer, no thread, no work while the program does not call the slot.
+const COST_HALF_LIFE_NS: f64 = 2e9;
 /// rt_loop_hot takes the cost of this many back edges (threshold / LOOP_CHUNK_DIV) at once: fine
 /// enough that a loop under the threshold rate never adds up to it in one chunk
 const LOOP_CHUNK_DIV: u64 = 4;
@@ -12370,6 +12376,12 @@ const CALL_FAST_NS: u64 = 10_000_000;
 const SMALL_CODE: u64 = 256;
 /// Tier record word 5: a hot loop under the slot already charged its callers (rt_loop_hot)
 const LOOP_CHARGED: u64 = 1 << 62;
+
+/// The O3 threshold for MAKEPAD_RUN_O3_CALLS = `calls`: the cost a steady rate of `calls` x
+/// O3_CALL_UNITS per second converges on (COST_HALF_LIFE_NS).
+fn tier_threshold(calls: u64) -> u64 {
+    ((calls.saturating_mul(O3_CALL_UNITS) as f64 * COST_HALF_LIFE_NS / 1e9 / std::f64::consts::LN_2) as u64).max(1)
+}
 
 /// The count stub's per-call weight for counted code of `bytes` bytes.
 fn call_weight(bytes: u64) -> u32 {
@@ -12445,7 +12457,7 @@ mod tier_cost_tests {
     /// A slot driven at `per_s` cost units per second in calls of `w` (the stub's budget, rt_hot's
     /// checks) for `secs`: the time it is queued at, if it is.
     fn drive(per_s: u64, w: u64, secs: u64) -> Option<f64> {
-        let th = 2000 * CALL_COST;
+        let th = tier_threshold(2000);
         let rec: Vec<AtomicU64> = (0..10).map(|_| AtomicU64::new(0)).collect();
         let r = rec.as_ptr();
         let gap = (w * 1_000_000_000 / per_s).max(1);
@@ -12467,13 +12479,14 @@ mod tier_cost_tests {
     /// the threshold's cost tiers up at once.
     #[test]
     fn decayed_cost_is_a_rate_threshold() {
-        let th = (2000 * CALL_COST) as f64;
-        let rate = th * std::f64::consts::LN_2 / (COST_HALF_LIFE_NS / 1e9);
+        let rate = (2000 * O3_CALL_UNITS) as f64;
         assert!(drive((rate * 0.85) as u64, 30, 120).is_none(), "under the rate: never");
         assert!(drive((rate * 1.25) as u64, 30, 120).is_some(), "over the rate: tiers up");
         // the race HUD: one call per frame of a big body
         assert!(drive(60 * MAX_WEIGHT, MAX_WEIGHT, 30).is_some(), "a 60 Hz fn of max weight tiers up");
         assert!(drive(10 * MAX_WEIGHT, MAX_WEIGHT, 120).is_none(), "a 10 Hz fn of max weight does not");
+        assert!(drive(60 * MAX_WEIGHT, MAX_WEIGHT, 2).is_none(), "two seconds of a 60 Hz fn are not enough");
+        assert!(drive(60 * 894, 894, 10).is_some(), "the race's Hud::draw_walk (weight 894) tiers up within 10 s");
         let t = drive(1_000_000_000, 20, 10).unwrap();
         assert!(t < 0.01, "a burst tiers up at once ({t} s)");
     }
@@ -12481,7 +12494,7 @@ mod tier_cost_tests {
     /// Idle code decays to nothing (no work while it is idle: the decay is applied at its next check).
     #[test]
     fn idle_cost_decays() {
-        assert_eq!(cost_decay(40_000, 30_000_000_000), 0);
+        assert_eq!(cost_decay(40_000, 120_000_000_000), 0);
         assert_eq!(cost_decay(40_000, 0), 40_000);
         assert!((19_999..=20_000).contains(&cost_decay(40_000, COST_HALF_LIFE_NS as u64)));
         assert_eq!(cost_spread(1000, 0), 1000);
