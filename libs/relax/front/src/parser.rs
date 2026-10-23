@@ -1951,6 +1951,15 @@ impl<'a> Parser<'a> {
         Ok(Some(r))
     }
 
+    /// After the one expression of an `include!` in expression position: tokens left are the
+    /// incomplete_include lint (reported at the call by the lint pass).
+    fn incomplete_include_check(&self) {
+        if self.kind() != T::Eof && crate::macros::uses::recording() {
+            let call = self.exp_map.floor(self.lo()).map_or(0, |(_, r)| r.2);
+            crate::macros::uses::incomplete_include(self.bctx.as_ref().map_or("", |c| c.path.as_str()), call);
+        }
+    }
+
     /// Moves to the end of the current macro expansion's tokens.
     fn skip_to_eof(&mut self) {
         while self.kind() != T::Eof {
@@ -2025,6 +2034,7 @@ impl<'a> Parser<'a> {
             // file is ignored (rustc_expand base.rs `ExpandInclude::make_expr`, lint incomplete_include)
             if include {
                 let e = p.expr()?;
+                p.incomplete_include_check();
                 p.skip_to_eof();
                 return Ok(vec![Stmt::Expr(e, false)]);
             }
@@ -4917,8 +4927,8 @@ impl<'a> Parser<'a> {
                                 let file = p.bctx.as_ref().map_or("", |c| c.path.as_str()).to_string();
                                 crate::macros::uses::trailing_semi(&file, p.lo(), lo, &def.def_file);
                             }
+                            if include { p.incomplete_include_check(); p.skip_to_eof(); }
                             p.eat(T::Semi);
-                            if include { p.skip_to_eof(); }
                             Ok(e)
                         })?;
                         self.parse_cfg_select_rest(rest, 0)?;
