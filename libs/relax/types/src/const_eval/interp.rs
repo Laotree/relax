@@ -53,7 +53,7 @@ struct Prov { alloc: u32, shared: bool }
 struct Ptr { prov: Option<Prov>, off: u64 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind { Stack, Global, Function(DefId) }
+enum Kind { Stack, Global, Function(DefId), /** the lazy allocation of a static (GlobalAlloc::Static) */ Static(DefId) }
 
 /// allocation.rs Allocation (also the buffer of an operand's value: `Val`).
 #[derive(Clone, Debug)]
@@ -69,12 +69,17 @@ struct Alloc {
     mutable: bool,
     live: bool,
     kind: Kind,
+    /// tcx memory (interned: another constant's or static's, or a body's): accesses go through
+    /// machine.rs before_access_global
+    global: bool,
+    /// a static's allocation not evaluated yet (memory.rs get_global_alloc evaluates it on access)
+    lazy: bool,
 }
 type Val = Alloc;
 
 impl Alloc {
     fn new(size: u64, align: u64, kind: Kind) -> Alloc {
-        Alloc { bytes: vec![0; size as usize], init: vec![false; size as usize], ptrs: Vec::new(), frags: Vec::new(), align: align.max(1), mutable: true, live: true, kind }
+        Alloc { bytes: vec![0; size as usize], init: vec![false; size as usize], ptrs: Vec::new(), frags: Vec::new(), align: align.max(1), mutable: true, live: true, kind, global: false, lazy: false }
     }
     fn size(&self) -> u64 { self.bytes.len() as u64 }
     /// provenance_map.rs clear: the pointers overlapping `lo..hi` go, the bytes of them outside the
@@ -97,7 +102,7 @@ impl Alloc {
     /// a sub-range as a value of its own (provenance and init mask with it)
     fn slice(&self, lo: u64, len: u64, ps: u64) -> Val {
         let (l, h) = (lo as usize, (lo + len) as usize);
-        let mut v = Alloc { bytes: self.bytes[l..h].to_vec(), init: self.init[l..h].to_vec(), ptrs: Vec::new(), frags: Vec::new(), align: 1, mutable: true, live: true, kind: Kind::Stack };
+        let mut v = Alloc { bytes: self.bytes[l..h].to_vec(), init: self.init[l..h].to_vec(), ptrs: Vec::new(), frags: Vec::new(), align: 1, mutable: true, live: true, kind: Kind::Stack, global: false, lazy: false };
         for &(o, p) in &self.ptrs {
             if o >= lo && o + ps <= lo + len { v.ptrs.push((o - lo, p)); }
             else if o < lo + len && o + ps > lo {
@@ -172,6 +177,16 @@ struct Interp<'a> {
     /// the type of the checked item
     frames_root_ty: Option<TyId>,
     nesting: u32,
+    /// the lazy allocation of each static the evaluation points to (one AllocId per static)
+    statics: HashMap<DefId, u32>,
+    /// machine.rs static_root_ids: the static whose initializer runs (none for a constant)
+    static_root: Option<DefId>,
+    /// machine.rs can_access_mut_global: a static's initializer may read mutable global memory
+    mut_global_ok: bool,
+    /// statics whose initializers are running (a cycle is the query system's E0391)
+    in_progress: Vec<DefId>,
+    /// validity.rs runs with validation_in_progress: no before_alloc_access hook
+    validating: bool,
 }
 
 /// rustc machine.rs LINT_TERMINATOR_LIMIT: past it the JIT path reports long_running_const_eval.
@@ -179,8 +194,9 @@ const STEP_LIMIT: u64 = 2_000_000;
 
 /// Checks the initializer of const/static `def` (non-generic) of a validated crate.
 pub fn check_item(prog: &Program, tcx: &Tcx, def: DefId) -> Outcome {
-    let mut it = Interp { prog, tcx, lay: crate::layout::Layouts::new(), allocs: Vec::new(), frames: Vec::new(), steps: 0, consts: HashMap::new(), ps: tcx.tys.ptr_bytes as u64, frames_root_ty: None, nesting: 0 };
     let is_static = prog.def(def).kind == DefKind::Static;
+    let mut it = Interp { prog, tcx, lay: crate::layout::Layouts::new(), allocs: Vec::new(), frames: Vec::new(), steps: 0, consts: HashMap::new(), ps: tcx.tys.ptr_bytes as u64, frames_root_ty: None, nesting: 0,
+        statics: HashMap::new(), static_root: is_static.then_some(def), mut_global_ok: is_static, in_progress: if is_static { vec![def] } else { Vec::new() }, validating: false };
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| it.eval_const(def, &[], true, is_static)));
     let _ = &r;
     let span_of_item = || { let d = prog.def(def); let lo = prog.files[d.file as usize].ast.item(d.item).lo; mir::Span { file: d.file, lo, hi: lo } };
@@ -231,7 +247,6 @@ impl<'a> Interp<'a> {
     fn eval_const(&mut self, def: DefId, args: &[TyId], root: bool, is_static: bool) -> R<u32> {
         let key = (def, args.to_vec());
         if let Some(r) = self.consts.get(&key) { return r.map_err(|_| Stop::Referenced); }
-        if !root && is_static { return unsupported("reading a static"); }
         if self.nesting > 16 { return unsupported("nested constants"); }
         let body = self.body_of(def, args)?;
         if root { self.frames_root_ty = Some(body.local_decls[0].ty); }
@@ -242,7 +257,7 @@ impl<'a> Interp<'a> {
         self.nesting -= 1;
         if !root { self.frames = saved; }
         match r {
-            Ok(a) => { self.allocs[a as usize].mutable = false; self.consts.insert(key, Ok(a)); Ok(a) }
+            Ok(a) => { if !root { self.intern_nested(a, def, is_static); } self.consts.insert(key, Ok(a)); Ok(a) }
             Err(Stop::Ub(_)) if !root => { self.consts.insert(key, Err(())); Err(Stop::Referenced) }
             Err(e) => Err(e),
         }
@@ -262,6 +277,72 @@ impl<'a> Interp<'a> {
     }
 
     fn alloc(&mut self, a: Alloc) -> u32 { self.allocs.push(a); (self.allocs.len() - 1) as u32 }
+
+    /// intern.rs intern_const_alloc_recursive for a constant or static another one reads: its memory
+    /// becomes global with the interned mutability (a constant's is immutable; a static's root is
+    /// mutable when it is `static mut` or not `Freeze`, its inner memory only for `static mut`).
+    fn intern_nested(&mut self, root: u32, def: DefId, is_static: bool) {
+        let (base, inner) = if is_static { let (m, f) = self.static_mutability(def); (m || !f, m) } else { (false, false) };
+        let mut todo = vec![(root, base)];
+        while let Some((a, m)) = todo.pop() {
+            let al = &mut self.allocs[a as usize];
+            if al.global { continue; }
+            al.global = true;
+            al.mutable = m;
+            for &(_, p) in &al.ptrs.clone() { todo.push((p.alloc, inner)); }
+        }
+    }
+
+    /// (`static mut`, the type is `Freeze`)
+    fn static_mutability(&self, def: DefId) -> (bool, bool) {
+        let d = self.prog.def(def);
+        let m = matches!(self.prog.files[d.file as usize].ast.item(d.item).kind, relax_front::ast::ItemKind::Static(true, _, _));
+        let freeze = self.tcx.const_ty(self.prog, def).is_some_and(|t| self.is_freeze(t));
+        (m, freeze)
+    }
+
+    /// The lazy allocation of static `def` (GlobalAlloc::Static): its size and alignment are the
+    /// type's; it is evaluated when accessed.
+    fn static_alloc(&mut self, def: DefId) -> R<u32> {
+        if let Some(&a) = self.statics.get(&def) { return Ok(a); }
+        if self.prog.def(def).kind != DefKind::Static { return unsupported("extern static"); }
+        if crate::mir::transform::promote_consts::is_thread_local_static(self.prog, def) { return unsupported("thread-local static"); }
+        let Some(ty) = self.tcx.const_ty(self.prog, def) else { return unsupported("static type") };
+        let (size, align) = self.size_align(ty)?;
+        let (m, freeze) = self.static_mutability(def);
+        let mut a = Alloc::new(size, align, Kind::Static(def));
+        a.global = true;
+        a.lazy = true;
+        a.mutable = m || !freeze;
+        let a = self.alloc(a);
+        self.statics.insert(def, a);
+        Ok(a)
+    }
+
+    /// memory.rs get_global_alloc of a static: eval_static_initializer (its own evaluation, with
+    /// its own static_root_ids and mutable-global access), the result under the lazy id.
+    fn resolve_static(&mut self, a: u32) -> R<()> {
+        let Kind::Static(def) = self.allocs[a as usize].kind else { return Ok(()) };
+        if self.in_progress.contains(&def) { return unsupported("static cycle"); }
+        let saved = (self.static_root, self.mut_global_ok, self.validating);
+        self.static_root = Some(def);
+        self.mut_global_ok = true;
+        self.validating = false;
+        self.in_progress.push(def);
+        let r = self.eval_const(def, &[], false, true);
+        self.in_progress.pop();
+        (self.static_root, self.mut_global_ok, self.validating) = saved;
+        let v = r?;
+        let src = self.allocs[v as usize].clone();
+        if src.size() != self.allocs[a as usize].size() { return unsupported("static size"); }
+        let dst = &mut self.allocs[a as usize];
+        dst.bytes = src.bytes;
+        dst.init = src.init;
+        dst.ptrs = src.ptrs;
+        dst.frags = src.frags;
+        dst.lazy = false;
+        Ok(())
+    }
 
     fn push_frame(&mut self, body: Rc<Body>, args: Vec<Val>, ret: Option<(MPlace, Option<BasicBlock>)>) -> R<()> {
         if self.frames.len() > 64 { return unsupported("deep recursion"); }
@@ -328,8 +409,29 @@ impl<'a> Interp<'a> {
 
     fn alloc_name(&self, a: u32) -> String { format!("ALLOC{a}") }
 
-    /// memory.rs check_and_deref_ptr: the allocation `ptr` may access `size` bytes of.
-    fn check_access(&self, ptr: Ptr, size: u64, align: u64) -> R<Option<u32>> {
+    /// memory.rs check_and_deref_ptr: the allocation `ptr` may access `size` bytes of; then
+    /// get_global_alloc / before_access_global / before_alloc_access for global memory.
+    fn check_access(&mut self, ptr: Ptr, size: u64, align: u64, write: bool) -> R<Option<u32>> {
+        let a = self.check_bounds(ptr, size, align)?;
+        let Some(ai) = a else { return Ok(None) };
+        if let Kind::Static(d) = self.allocs[ai as usize].kind {
+            // machine.rs before_alloc_access: the static being initialized (a zero-sized write manifests nothing)
+            if !self.validating && Some(d) == self.static_root && (size > 0 || !write) { return ub("encountered static that tried to access itself during initialization"); }
+            // (a static's initializer evaluates every static it touches: the query detects cycles)
+            if self.allocs[ai as usize].lazy && (size > 0 || self.static_root.is_some()) { self.resolve_static(ai)?; }
+        }
+        let al = &self.allocs[ai as usize];
+        if size > 0 && al.global {
+            if write {
+                if al.mutable { return ub("modifying a static's initial value from another static's initializer"); }
+                return ub(format!("writing to {} which is read-only", self.alloc_name(ai)));
+            }
+            if al.mutable && !self.mut_global_ok { return ub("constant accesses mutable global memory"); }
+        }
+        Ok(a)
+    }
+
+    fn check_bounds(&self, ptr: Ptr, size: u64, align: u64) -> R<Option<u32>> {
         let Some(p) = ptr.prov else {
             if size == 0 && ptr.off != 0 { return Ok(None); }
             return ub(format!("memory access failed: attempting to access {size} byte{}, but got {:#x}[noalloc] which is a dangling pointer (it has no provenance)", if size == 1 { "" } else { "s" }, ptr.off));
@@ -353,8 +455,8 @@ impl<'a> Interp<'a> {
         match p.prov { Some(pr) if p.off == 0 => self.alloc_name(pr.alloc), Some(pr) => format!("{}+{:#x}", self.alloc_name(pr.alloc), p.off), None => format!("{:#x}[noalloc]", p.off) }
     }
 
-    fn read(&self, ptr: Ptr, size: u64, align: u64) -> R<Val> {
-        match self.check_access(ptr, size, align)? {
+    fn read(&mut self, ptr: Ptr, size: u64, align: u64) -> R<Val> {
+        match self.check_access(ptr, size, align, false)? {
             None => Ok(Alloc::new(size, 1, Kind::Stack)),
             Some(a) => Ok(self.allocs[a as usize].slice(ptr.off, size, self.ps)),
         }
@@ -363,16 +465,17 @@ impl<'a> Interp<'a> {
     /// machine.rs before_memory_write + memory.rs get_mut: the target is writable.
     fn write(&mut self, ptr: Ptr, v: &Val, align: u64) -> R<()> {
         let size = v.size();
-        let Some(a) = self.check_access(ptr, size, align)? else { return Ok(()) };
+        let Some(a) = self.check_access(ptr, size, align, true)? else { return Ok(()) };
         if size == 0 { return Ok(()); }
-        if ptr.prov.unwrap().shared { return ub("writing through a pointer that was derived from a shared (immutable) reference"); }
+        // (memory.rs get_alloc_raw_mut: read-only memory; then machine.rs before_memory_write)
         if !self.allocs[a as usize].mutable { return ub(format!("writing to {} which is read-only", self.alloc_name(a))); }
+        if ptr.prov.unwrap().shared { return ub("writing through a pointer that was derived from a shared (immutable) reference"); }
         let ps = self.ps;
         self.allocs[a as usize].put(ptr.off, v, ps);
         Ok(())
     }
 
-    fn read_place(&self, p: MPlace) -> R<Val> {
+    fn read_place(&mut self, p: MPlace) -> R<Val> {
         let (size, align) = self.size_align(p.ty)?;
         let align = p.packed.map_or(align, |a| a.min(align));
         self.read(p.ptr, size, align)
@@ -554,6 +657,7 @@ impl<'a> Interp<'a> {
         let a = match body.allocs.global(id) {
             Some(mir::GlobalAlloc::Memory(m)) => {
                 let mut a = Alloc::new(m.bytes.len() as u64, m.align, Kind::Global);
+                a.global = true;
                 a.bytes = m.bytes.clone();
                 a.init = if m.init_mask.len() == m.bytes.len() { m.init_mask.clone() } else { vec![true; m.bytes.len()] };
                 a.mutable = m.mutability == mir::Mutability::Mut;
@@ -565,7 +669,7 @@ impl<'a> Interp<'a> {
                 ai
             }
             Some(mir::GlobalAlloc::Function { def, .. }) => { let mut a = Alloc::new(0, 1, Kind::Function(*def)); a.mutable = false; self.alloc(a) }
-            Some(mir::GlobalAlloc::Static(_)) => return unsupported("pointer to a static"),
+            Some(mir::GlobalAlloc::Static(d)) => self.static_alloc(*d)?,
             None => return unsupported("unknown allocation"),
         };
         self.frames.last_mut().unwrap().imported.insert(id.0, a);

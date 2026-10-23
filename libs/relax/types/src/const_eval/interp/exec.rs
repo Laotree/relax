@@ -96,7 +96,7 @@ impl Interp<'_> {
                 let shared = matches!(kind, mir::BorrowKind::Shared) && self.is_freeze(p.ty);
                 let ptr = Ptr { prov: p.ptr.prov.map(|pr| Prov { shared: pr.shared || shared, ..pr }), off: p.ptr.off };
                 // (a reference must point to a live allocation; validity of the final value checks the rest)
-                self.check_access(ptr, 0, 1)?;
+                self.check_bounds(ptr, 0, 1)?;
                 self.ptr_val(ptr, p.meta)
             }
             Rvalue::RawPtr(_, place) => { let p = self.eval_place(place)?; self.ptr_val(p.ptr, p.meta) }
@@ -134,7 +134,7 @@ impl Interp<'_> {
 
     /// The type has no UnsafeCell outside indirection (rustc Ty::is_freeze; Relax marks UnsafeCell
     /// with `#[rustc_layout_no_niche]`).
-    fn is_freeze(&self, ty: TyId) -> bool {
+    pub(super) fn is_freeze(&self, ty: TyId) -> bool {
         let tys = &self.tcx.tys;
         match tys.kind(ty) {
             TyKind::Adt(d, args, _) => {
@@ -214,7 +214,7 @@ impl Interp<'_> {
     }
 
     /// The variant index of the enum value at `p` (discriminant.rs read_discriminant: "enum value has invalid tag").
-    pub(super) fn read_variant(&self, p: MPlace) -> R<u32> {
+    pub(super) fn read_variant(&mut self, p: MPlace) -> R<u32> {
         let l = self.layout(p.ty)?;
         if let crate::layout::TagEnc::Single(v) = l.enc { if l.uninhabited { return ub("enum value has uninhabited variant"); } return Ok(v); }
         let Some((off, mem)) = l.tag else { return Ok(0) };
@@ -234,7 +234,7 @@ impl Interp<'_> {
         }
     }
 
-    fn read_discriminant(&self, p: MPlace) -> R<u128> {
+    fn read_discriminant(&mut self, p: MPlace) -> R<u128> {
         let v = self.read_variant(p)?;
         Ok(self.adt_discrs(p.ty)?[v as usize])
     }
