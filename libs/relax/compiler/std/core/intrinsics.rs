@@ -149,6 +149,13 @@ pub mod intrinsics_mem {
         /// `p + n * size_of::<T>()`
         pub fn ptr_add<T>(p: *const T, n: usize) -> *const T;
         pub fn ptr_add_mut<T>(p: *mut T, n: usize) -> *mut T;
+        /// `p` moved by `n` elements with wrapping arithmetic, keeping its provenance (core::intrinsics::arith_offset)
+        pub fn arith_offset<T>(p: *const T, n: isize) -> *const T;
+        /// `(p - origin) / size_of::<T>()` of two pointers into one allocation (core::intrinsics::ptr_offset_from)
+        pub fn ptr_offset_from<T>(p: *const T, origin: *const T) -> isize;
+        /// `p` is null: its address at run time; in const evaluation `ptr_guaranteed_cmp(p, null)`, which may
+        /// not know (core::ptr is_null's const_eval_select)
+        pub fn ptr_is_null(p: *const u8) -> bool;
         pub fn slice_from_raw<'a, T>(p: *const T, len: usize) -> &'a [T];
         pub fn slice_from_raw_mut<'a, T>(p: *mut T, len: usize) -> &'a mut [T];
         pub fn slice_ptr<T>(s: &[T]) -> *const T;

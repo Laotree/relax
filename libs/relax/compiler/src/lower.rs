@@ -10478,6 +10478,40 @@ impl<'a> Lcx<'a> {
                 self.emit(Inst::IBin(IOp::Add, U64, d, p[0], off));
                 Val::L(vec![d])
             }
+            // wrapping element offset (two's complement: the same instructions as ptr_add)
+            "arith_offset" => {
+                let p = leaf(self, 0);
+                let n = leaf(self, 1);
+                let (sz, al) = elem(self);
+                let stride = crate::layout::round_up(sz, al) as i64;
+                let off = self.f.vreg(Cls::I);
+                self.emit(Inst::IBinI(IOp::Mul, U64, off, n[0], stride));
+                let d = self.f.vreg(Cls::I);
+                self.emit(Inst::IBin(IOp::Add, U64, d, p[0], off));
+                Val::L(vec![d])
+            }
+            // (p - origin) / stride, exact by contract (signed)
+            "ptr_offset_from" => {
+                let p = leaf(self, 0);
+                let o = leaf(self, 1);
+                let (sz, al) = elem(self);
+                let stride = crate::layout::round_up(sz, al).max(1) as i64;
+                let diff = self.f.vreg(Cls::I);
+                self.emit(Inst::IBin(IOp::Sub, U64, diff, p[0], o[0]));
+                if stride == 1 { Val::L(vec![diff]) } else {
+                    let k = self.iconst(stride);
+                    let d = self.f.vreg(Cls::I);
+                    self.emit(Inst::IBin(IOp::Div, I64, d, diff, k));
+                    Val::L(vec![d])
+                }
+            }
+            "ptr_is_null" => {
+                let p = leaf(self, 0);
+                let z = self.iconst(0);
+                let d = self.f.vreg(Cls::I);
+                self.emit(Inst::ICmp(Cond::Eq, false, d, p[0], z));
+                Val::L(vec![d])
+            }
             "slice_from_raw" | "slice_from_raw_mut" | "str_from_raw" => {
                 let p = leaf(self, 0);
                 let n = leaf(self, 1);
