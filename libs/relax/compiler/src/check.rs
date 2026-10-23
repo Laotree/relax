@@ -832,7 +832,14 @@ fn mono_check(up: *mut Unit, own: &[bool], root: u32) {
             }
         }
         let callees = crate::owner::call(crate::owner::Class::Program, || unsafe {
-            if !mine { return Vec::new(); }
+            // collector.rs: a library instance is lowered by rustc too; Relax lowers it only when a type argument
+            // is too big to lay out (its body's layout query is then rustc's SizeOverflow, reported where it is
+            // evaluated), and follows none of its callees
+            let library_overflow = !mine && matches!(&(&*up).fns[id as usize].key, FnKey::Inst(_, args) if args.iter().any(|t| {
+                let uu = &*up;
+                uu.tcx.tys.depth(*t) <= 6 && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| uu.size_overflows(*t))).unwrap_or(false)
+            }));
+            if !mine && !library_overflow { return Vec::new(); }
             // (a fn taking or returning a value of hundreds of MB is not lowered: its frame would
             // be allocated for real)
             // (instances over deeply nested types -- closures wrapped in closures -- cost more to
@@ -876,9 +883,12 @@ fn mono_check(up: *mut Unit, own: &[bool], root: u32) {
             }
             // (rustc's SizeOverflow of a type the instance lays out: lowering's error, at its use)
             if let Ok(Err(msg)) = &built {
-                if msg.ends_with("are too big for the target architecture") { (&mut *up).errors.push(msg.clone()); }
+                if msg.ends_with("are too big for the target architecture") {
+                    // (a library instance's error is reported once by its lowering, with no location in the library's source)
+                    if !library_overflow { (&mut *up).errors.push(msg.clone()); }
+                }
             }
-            if !matches!(built, Ok(Ok(()))) { return Vec::new(); }
+            if !matches!(built, Ok(Ok(()))) || library_overflow { return Vec::new(); }
             let mut out = Vec::new();
             if let Some(f) = &(&*up).fns[id as usize].rir {
                 for b in &f.blocks {
