@@ -458,9 +458,10 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
     total.push('}');
     out.line(&total);
     let ev = crate::zone_alloc::compiler_events();
+    let jobs = crate::zone_alloc::job_stats();
     // the three heaps apart (zone_alloc.rs): the program's malloc, the compiler's own arena, the JIT's mappings
     out.line(&format!(
-        "{{\"split\":{{\"routing\":{},\"program_heap_in_use_mb\":{},\"program_heap_held_free_mb\":{},\"compiler_arena_committed_mb\":{},\"compiler_arena_live_mb\":{},\"jit_code_mb\":{},\"jit_ro_data_mb\":{},\"program_statics_mb\":{},\"burst_arena_committed_mb\":{},\"compiler_arena_touched_mb\":{},\"compiler_arena_live_slots_mb\":{},\"compiler_arena_large_mb\":{},\"compiler_arena_chunks_listed\":{},\"compiler_arena_events\":{{\"contended_chunk\":{},\"contended_pool\":{},\"contended_warm\":{},\"contended_partial\":{},\"yields\":{},\"commits\":{},\"decommits\":{},\"pushes\":{},\"pops\":{},\"tombstone_frees\":{},\"generation\":{},\"tombstones\":{}}}{}}}}}",
+        "{{\"split\":{{\"routing\":{},\"program_heap_in_use_mb\":{},\"program_heap_held_free_mb\":{},\"compiler_arena_committed_mb\":{},\"compiler_arena_live_mb\":{},\"jit_code_mb\":{},\"jit_ro_data_mb\":{},\"program_statics_mb\":{},\"burst_arena_committed_mb\":{},\"compiler_arena_touched_mb\":{},\"compiler_arena_live_slots_mb\":{},\"compiler_arena_large_mb\":{},\"compiler_arena_chunks_listed\":{},\"compiler_arena_events\":{{\"contended_chunk\":{},\"contended_pool\":{},\"contended_warm\":{},\"contended_partial\":{},\"yields\":{},\"commits\":{},\"decommits\":{},\"pushes\":{},\"pops\":{}}},\"job_arena\":{{\"jobs\":{},\"survivor_jobs\":{},\"survivor_bytes\":{}}}}}}}",
         json_str(if crate::zone_alloc::compiler_arena_enabled() { "compiler arena" } else { "off (MAKEPAD_RUN_COMPILER_ARENA=0)" }),
         mb(inuse),
         mb(free),
@@ -475,8 +476,7 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
         mb(snap.get("makepad-run/compiler arena/large blocks")),
         snap.get("makepad-run/compiler arena/chunks listed for reuse"),
         ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8],
-        crate::zone_alloc::compiler_tombstone_frees(), crate::zone_alloc::compiler_generation(), crate::zone_alloc::compiler_tombstones(),
-        match crate::jit::zone_scan::last_total() { Some(n) => format!(",\"kept_in_compiler\":{n}"), None => String::new() },
+        jobs.0, jobs.1, jobs.2,
     ));
     // the tree: every node, ranked within its parent, top `n`
     let mut rows: Vec<&(String, u64)> = snap.nodes.iter().filter(|x| x.0.contains('/') && x.1 >= 1 << 20).collect();

@@ -16,8 +16,8 @@ struct Buffer { thread: std::thread::ThreadId, worker: String, events: Vec<Event
 static BUFFERS: Mutex<Vec<Arc<Mutex<Buffer>>>> = Mutex::new(Vec::new());
 
 /// Registers the calling thread's new generation of timeline events for flush().
-/// The registry, the buffers and their events are kept-heap state: they outlive the compiler
-/// generation of the span that wrote them (the settle swap destroys it; flush reads them later).
+/// The registry, the buffers and their events are kept-heap state: process state that flush
+/// reads later.
 struct LocalBuffer(Arc<Mutex<Buffer>>);
 impl Default for LocalBuffer {
     fn default() -> Self {
@@ -28,11 +28,11 @@ impl Default for LocalBuffer {
         Self(buffer)
     }
 }
-crate::gen_local! {
+thread_local! {
     // Exclusive CPU among the selected file spans: nested parse/lower work
     // belongs to its own file, not also to the enclosing parse.
-    static FILE_CHILD_CPU: std::cell::RefCell<Vec<u64>>;
-    static BUFFER: LocalBuffer;
+    static FILE_CHILD_CPU: std::cell::RefCell<Vec<u64>> = Default::default();
+    static BUFFER: LocalBuffer = Default::default();
 }
 
 pub fn span(enabled: bool, phase: &'static str, subject: &str) -> Option<Span> {

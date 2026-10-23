@@ -24,8 +24,8 @@ struct Module {
 
 static MODULES: relax_session::sync::Mutex<Vec<Module>> = relax_session::sync::Mutex::new(Vec::new());
 
-crate::gen_local! {
-    static LAST_ERROR: std::cell::RefCell<String>;
+thread_local! {
+    static LAST_ERROR: std::cell::RefCell<String> = Default::default();
 }
 
 fn set_error(e: String) {
@@ -237,7 +237,6 @@ pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool,
             let loaded = u.prog.load_crate_deferred(&nc.name, &nc.path, nc.edition, nc.cfg.clone(), dep_list);
             for k in first..u.prog.crates.len() {
                 u.prog.crates[k].proc_macro = nc.proc_macro;
-                if up == crate::run::running_unit() { jit::zone_swap::remember_runtime(&u.prog, k as u32); }
             }
             match loaded {
                 Ok(k) => {
@@ -268,7 +267,7 @@ pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool,
     let mine: Vec<String> = (f0..u.prog.files.len()).map(|f| u.prog.file_paths[f].clone()).collect();
     let mut errs: Vec<String> = u.prog.errors[e0..].iter().filter(|e| mine.iter().any(|p| e.starts_with(p.as_str()))).cloned().collect();
     {
-        // (Program.errors is read off the owner under a front read: the swap's encode)
+        // (Program.errors is read off the owner under a front read: a mid-run encode)
         let _fw = jit::front_write();
         u.prog.errors.truncate(e0);
         u.prog.errors.extend(errs.iter().cloned());
@@ -1215,8 +1214,8 @@ struct HostEntry {
     busy: bool,
 }
 
-crate::gen_local! {
-    static HOSTS: std::cell::RefCell<Vec<HostEntry>>;
+thread_local! {
+    static HOSTS: std::cell::RefCell<Vec<HostEntry>> = Default::default();
 }
 static NEXT_HOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 

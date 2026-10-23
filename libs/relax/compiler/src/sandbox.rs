@@ -696,7 +696,7 @@ fn sync_arena(s: &Sb, a: &Arena) {
 // ------------------------------------------------------------------ arenas
 
 /// Creates a module's arena (`mem` bytes of heap budget). Returns its index.
-/// Does any sandbox module live (the settle swap is refused meanwhile)?
+/// Does any sandbox module live?
 pub fn any_live() -> bool {
     SB.lock().map(|g| g.is_some()).unwrap_or(true) || ARENAS.iter().any(|a| !a.load(std::sync::atomic::Ordering::Acquire).is_null())
 }

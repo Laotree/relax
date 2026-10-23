@@ -660,9 +660,7 @@ pub fn compact_vregs(f: &mut Func) {
     f.vregs = cls;
 }
 
-// OnceLock cannot be reset through a shared static; see this crate's zone_take. The string is
-// leaked in the kept heap: it outlives every compiler generation (a settle swap destroys the
-// compiler phase's allocations).
+// Process state: the string is leaked in the kept heap.
 pub static T: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
 
 pub fn trace_opt(f: &Func, tag: &str) {
@@ -5646,10 +5644,10 @@ pub fn sroa_reject_slot(ok: &mut [bool], sl: usize, why: SroaReject, stats: &mut
     }
 }
 
-relax_session::gen_local! {
+thread_local! {
     /// sroa's answer to "does this call keep or return a pointer passed as argument k?":
     /// set by the O3 driver from the callees' RIR (param_nocapture), None elsewhere
-    static SROA_NOCAP: std::cell::RefCell<Option<Box<dyn Fn(&Callee, usize) -> bool>>>;
+    static SROA_NOCAP: std::cell::RefCell<Option<Box<dyn Fn(&Callee, usize) -> bool>>> = Default::default();
 }
 
 pub fn sroa_nocapture(c: &Callee, k: usize) -> bool {

@@ -2,7 +2,7 @@ use std::alloc::Layout;
 use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 /// A chunk holds one thread's blocks of one size class. The web target's linear memory takes
 /// 512 KB chunks: every thread keeps a current chunk per class, and at 2 MB the program's few
@@ -89,24 +89,6 @@ fn event(i: usize) {
     EVENTS[i].fetch_add(1, Ordering::Relaxed);
 }
 
-/// The current generation of the compiler arena (`DEFAULT`; the burst arena and the per-domain
-/// instances never bump it). Every chunk and large run records the generation it was carved for
-/// (`State::epoch`); allocation takes only chunks of the current one, frees work for any.
-/// `destroy_generation` tombstones one generation's chunks. Domain arenas are program memory
-/// (kept class): none of the generation/tombstone state below applies to them (`gen_on`).
-static EPOCH: AtomicU64 = AtomicU64::new(0);
-/// Lowest generation that may still own chunks; advanced only after a destroy sweep.
-static LOWEST_LIVE: AtomicU64 = AtomicU64::new(0);
-/// Number of tombstoned chunks (0: the free fast path skips the tombstone table).
-static TOMBS: AtomicUsize = AtomicUsize::new(0);
-/// Per chunk index of `DEFAULT`: generation + 1 of the destroyed run covering it, 0 = live address
-/// space. A static table outside the arena, readable from a signal handler.
-static TOMB: [AtomicU32; N] = [const { AtomicU32::new(0) }; N];
-/// Frees and reallocs that hit a tombstone (counted no-ops).
-static TOMB_FREES: AtomicUsize = AtomicUsize::new(0);
-/// 0 = not read, 1 = off, 2 = MAKEPAD_RUN_ZONE_CHECK is set (a tombstone free aborts).
-static CHECK: AtomicU8 = AtomicU8::new(0);
-
 /// Warm chunks: emptied small-class chunks kept committed for reuse (see the module doc).
 /// At most WARM_MAX of them, touched bytes summed at most WARM_BYTES_MAX; a chunk that had
 /// more than WARM_TOUCHED_MAX touched is decommitted as before.
@@ -138,9 +120,8 @@ struct WarmLarge {
     bytes: usize,
 }
 
-/// A thread's current chunk for one class. `stamp` is the chunk's generation (burst arena, checked
-/// under the chunk lock) or the arena epoch it was carved for (compiler arena: a thread whose
-/// stamp no longer matches the epoch hands the chunk back instead of allocating from it).
+/// A thread's current chunk for one class. `stamp` is the chunk's reuse count (the burst arena
+/// checks it under the chunk lock: a released and reused chunk is not the thread's any more).
 #[derive(Clone, Copy)]
 struct Current {
     index: usize,
@@ -479,8 +460,6 @@ unsafe impl Sync for Chunk {}
 struct State {
     released: bool,
     generation: u64,
-    /// The arena generation this chunk or run was carved for (compiler arena `DEFAULT` only).
-    epoch: u64,
     free: usize, // detached list; an attached chunk uses Owned instead
     bump: usize,
     stride: usize, // zero for an exclusive large allocation
@@ -788,7 +767,6 @@ impl Arena {
                     state: Mutex::new(State {
                         released: true,
                         generation: 0,
-                        epoch: 0,
                         free: 0,
                         bump: 0,
                         stride: 0,
@@ -973,18 +951,17 @@ impl Arena {
         s.attached = false;
         if o.live.load(Ordering::Relaxed) == 0 {
             self.release_empty(index, s);
-        } else if (s.free != 0 || s.bump + s.stride <= CHUNK) && (!self.gen_on() || s.epoch == EPOCH.load(Ordering::Relaxed)) {
+        } else if s.free != 0 || s.bump + s.stride <= CHUNK {
             self.partial_push(index, s.class);
         }
     }
-    /// The thread's cached chunk is not usable any more (an older generation: it takes no new
-    /// blocks; or destroyed): forget it, handing it back unless it is a tombstone.
+    /// The thread's cached chunk is not usable any more: forget it, handing it back.
     #[cold]
     #[inline(never)]
     unsafe fn abandon(&self, class: usize) {
         let c = self.current_of(class);
         self.set_current(class, NO_CURRENT);
-        if c.index == NONE || (self.gen_on() && TOMB[c.index].load(Ordering::Relaxed) != 0) {
+        if c.index == NONE {
             return;
         }
         let mut s = lock(&self.headers[c.index].state);
@@ -1132,9 +1109,6 @@ impl Arena {
         if s.stride != stride || s.committed != CHUNK || s.released || s.attached {
             return null_mut(); // reused for something else since it was listed
         }
-        if self.gen_on() && s.epoch != EPOCH.load(Ordering::Relaxed) {
-            return null_mut(); // an older generation: it takes no new blocks (and is off the list now)
-        }
         let p = if s.free != 0 {
             let p = s.free as *mut u8;
             s.free = *(p as *const usize);
@@ -1156,7 +1130,7 @@ impl Arena {
         }
         s.attached = true;
         self.attach(h, &s);
-        let stamp = s.epoch;
+        let stamp = s.generation;
         drop(s);
         self.set_current(class, Current { index: i, stamp });
         p
@@ -1175,11 +1149,6 @@ impl Arena {
             return null_mut();
         }
         if COMPILER {
-            // an older generation takes no new blocks: the thread moves on
-            if !self.dynamic && c.stamp != EPOCH.load(Ordering::Relaxed) {
-                self.abandon(class);
-                return null_mut();
-            }
             return self.pop_owned(c.index, class, accounted);
         }
         let h = &self.headers[c.index];
@@ -1305,8 +1274,8 @@ impl Arena {
         }
         alloc_in_slow(size, l.align(), self)
     }
-    /// `alloc_in`'s free of block `p` at `off` in this arena: a domain arena has no generations
-    /// (no tombstones); a block of the thread's current chunk of its class goes on the owned list.
+    /// `alloc_in`'s free of block `p` at `off` in this arena: a block of the thread's current
+    /// chunk of its class goes on the owned list.
     #[inline(always)]
     unsafe fn dealloc_in(&self, t: &DomainTls, p: *mut u8, off: usize, l: Layout) {
         let size = l.size();
@@ -1520,14 +1489,12 @@ impl Arena {
         let committed = committed.max(kept);
         let h = &self.headers[index];
         let generation;
-        let epoch = if self.gen_on() { EPOCH.load(Ordering::Relaxed) } else { 0 };
         {
             let mut s = lock(&h.state);
             generation = s.generation.wrapping_add(1);
             *s = State {
                 released: false,
                 generation,
-                epoch,
                 free: 0,
                 bump: stride,
                 stride,
@@ -1559,7 +1526,7 @@ impl Arena {
             }
         }
         if cache {
-            self.set_current(class, Current { index, stamp: if COMPILER { epoch } else { generation } });
+            self.set_current(class, Current { index, stamp: generation });
         }
         if self.mark(p as usize, true) {
             heap_check_fail(b"the allocator handed out a live block at", p as usize, index, stride);
@@ -1581,7 +1548,7 @@ impl Arena {
             return;
         };
         for c in slots.iter() {
-            if c.index == NONE || (self.gen_on() && TOMB[c.index].load(Ordering::Relaxed) != 0) {
+            if c.index == NONE {
                 continue;
             }
             let mut s = lock(&self.headers[c.index].state);
@@ -1625,10 +1592,6 @@ impl Arena {
             let need = old.size().max(old.align()).max(16);
             let c = if need <= 1 << MAX_SHIFT && self.cache_fast() { self.current_of(self.class_idx(need, old.align())) } else { NO_CURRENT };
             if c.index == index {
-                // a block of an older generation moves (the caller reallocates into the current one)
-                if !self.dynamic && c.stamp != EPOCH.load(Ordering::Relaxed) {
-                    return false;
-                }
                 let o = &mut *h.owned.get();
                 if new_size.max(old.align()) <= 1 << MAX_SHIFT && self.class_of(new_size, old.align()).1 == o.stride {
                     h.account.store(h.account.load(Ordering::Relaxed).wrapping_sub(old.size()).wrapping_add(new_size), Ordering::Relaxed);
@@ -1640,10 +1603,6 @@ impl Arena {
         let mut s = lock(&h.state);
         // another thread's current chunk: the block moves
         if COMPILER && s.attached {
-            return false;
-        }
-        // a block of an older generation moves (the caller reallocates into the current one)
-        if self.gen_on() && s.epoch != EPOCH.load(Ordering::Relaxed) {
             return false;
         }
         let need = new_size.max(old.align()).max(16);
@@ -1696,10 +1655,6 @@ impl Arena {
     #[inline(always)]
     pub unsafe fn dealloc_counted(&self, p: *mut u8, l: Layout, requested: usize) {
         let index = (p as usize - self.base.load(Ordering::Relaxed)) / CHUNK;
-        if self.gen_on() && TOMBS.load(Ordering::Relaxed) != 0 && TOMB[index].load(Ordering::Relaxed) != 0 {
-            tombstone_hit(p, "free");
-            return;
-        }
         if COMPILER {
             // a block of the thread's own current chunk of its class goes back on the owned list
             let need = l.size().max(l.align()).max(16);
@@ -1755,7 +1710,6 @@ impl Arena {
                 && s.stride != 0
                 && !s.attached
                 && !h.in_part.load(Ordering::Relaxed)
-                && (!self.gen_on() || s.epoch == EPOCH.load(Ordering::Relaxed))
             {
                 self.partial_push(index, s.class);
             }
@@ -1794,16 +1748,13 @@ impl Arena {
     }
     fn warm_take(&self) -> Option<usize> {
         let mut w = lock(&self.warm);
-        // a chunk destroyed after it was parked here must not be handed out
-        while w.len > 0 {
-            w.len -= 1;
-            let (i, touched) = w.runs[w.len];
-            w.bytes -= touched;
-            if !self.gen_on() || TOMB[i].load(Ordering::Relaxed) == 0 {
-                return Some(i);
-            }
+        if w.len == 0 {
+            return None;
         }
-        None
+        w.len -= 1;
+        let (i, touched) = w.runs[w.len];
+        w.bytes -= touched;
+        Some(i)
     }
     fn warm_put(&self, index: usize, touched: usize) -> bool {
         let mut w = lock(&self.warm);
@@ -1963,134 +1914,6 @@ impl Arena {
             }
             s.free = newhead;
         }
-    }
-    /// Generations and tombstones belong to the compiler arena instance only; a per-domain arena
-    /// is program memory that the settle swap never touches.
-    #[inline]
-    fn gen_on(&self) -> bool {
-        COMPILER && !self.dynamic
-    }
-    /// Starts a new generation and returns it: from now on allocation takes only chunks and runs
-    /// carved for it. A thread's cached chunk and the partial-list entries of an older generation
-    /// are skipped when met (a compare under the chunk lock); the warm chunks go back to the pool,
-    /// so the new generation starts on fresh, zero-or-trimmed address space. Frees of older blocks
-    /// keep working by address.
-    fn begin_generation(&self) -> u64 {
-        debug_assert!(self.gen_on());
-        let g = EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
-        self.warm_drain();
-        g
-    }
-    fn epoch_of(&self, p: *const u8) -> Option<u64> {
-        if !self.owns(p as *mut u8) {
-            return None;
-        }
-        let index = (p as usize - self.base.load(Ordering::Relaxed)) / CHUNK;
-        if TOMB[index].load(Ordering::Relaxed) != 0 {
-            return None;
-        }
-        let s = lock(&self.headers[index].state);
-        (s.committed != 0).then_some(s.epoch)
-    }
-    fn points_into(&self, p: usize, g: u64) -> bool {
-        self.points_into_range(p, g, g + 1)
-    }
-    /// `points_into` for any generation in [lo, hi).
-    fn points_into_range(&self, p: usize, lo: u64, hi: u64) -> bool {
-        let base = self.base.load(Ordering::Relaxed);
-        if base == 0 || p.wrapping_sub(base) >= RESERVE {
-            return false;
-        }
-        let index = (p - base) / CHUNK;
-        if TOMB[index].load(Ordering::Relaxed) != 0 {
-            return false;
-        }
-        let s = lock(&self.headers[index].state);
-        if s.committed == 0 || s.epoch < lo || s.epoch >= hi {
-            return false;
-        }
-        let off = p - (base + index * CHUNK);
-        // an attached chunk's carve point is its owner's (a racy read; the diagnostic scan runs quiesced)
-        let bump = if COMPILER && s.attached { unsafe { (*self.headers[index].owned.get()).bump.load(Ordering::Relaxed) } } else { s.bump };
-        if s.stride == 0 { off < s.committed } else { off < bump.min(CHUNK) }
-    }
-    fn destroy_generation(&self, g: u64) -> (usize, usize) {
-        if !self.gen_on() || g >= EPOCH.load(Ordering::Acquire) {
-            return (0, 0);
-        }
-        let (chunks, touched, _) = self.destroy_generations(g, g + 1);
-        (chunks, touched)
-    }
-    /// Requested live bytes in the chunks and runs carved for generation `g` (a diagnostic: one
-    /// header walk taking each chunk lock; MAKEPAD_RUN_ZONE_TRACE only).
-    fn generation_live(&self, g: u64) -> usize {
-        if !self.gen_on() || self.base.load(Ordering::Relaxed) == 0 {
-            return 0;
-        }
-        let mut n = 0usize;
-        for h in self.headers.iter() {
-            let s = lock(&h.state);
-            if s.committed != 0 && s.epoch == g {
-                n = n.wrapping_add(h.account.load(Ordering::Relaxed).wrapping_sub(h.remote_bytes.load(Ordering::Relaxed)));
-            }
-        }
-        (n as isize).max(0) as usize
-    }
-    fn destroy_older(&self) -> (usize, usize) {
-        if !self.gen_on() {
-            return (0, 0);
-        }
-        let current = EPOCH.load(Ordering::Acquire);
-        let (chunks, touched, lowest) = self.destroy_generations(LOWEST_LIVE.load(Ordering::Acquire), current);
-        LOWEST_LIVE.store(lowest, Ordering::Release);
-        (chunks, touched)
-    }
-    /// One header walk for [first, end), returning the oldest retained generation (end if none).
-    fn destroy_generations(&self, first: u64, end: u64) -> (usize, usize, u64) {
-        if !self.gen_on() || first >= end || self.base.load(Ordering::Relaxed) == 0 {
-            return (0, 0, end);
-        }
-        self.warm_drain();
-        let base = self.base.load(Ordering::Relaxed);
-        let (mut chunks, mut touched) = (0, 0);
-        let mut lowest = end;
-        for index in 0..N {
-            let h = &self.headers[index];
-            let mut s = lock(&h.state);
-            if s.committed == 0 || s.epoch < first || s.epoch >= end || TOMB[index].load(Ordering::Relaxed) != 0 {
-                continue;
-            }
-            if h.in_part.load(Ordering::Relaxed) {
-                lock(&self.partial).unlink(index, &self.headers);
-            }
-            let address = base + index * CHUNK;
-            event(E_DECOMMIT);
-            // zeroing form: the range never reads old bytes again, whoever maps it later
-            if !unsafe { os::decommit(address as *mut u8, s.committed, true) } {
-                lowest = lowest.min(s.epoch);
-                continue;
-            }
-            touched += if s.stride == 0 { s.committed } else { s.bump.min(CHUNK) };
-            self.committed.fetch_sub(s.committed, Ordering::Relaxed);
-            self.chunks.fetch_sub((s.committed + CHUNK - 1) / CHUNK, Ordering::Relaxed);
-            chunks += 1;
-            // the whole run is spent: its tail past the committed part was reserved for this block
-            let (run, order) = (s.run, s.order);
-            for i in run..run + (1usize << order) {
-                TOMB[i].store(s.epoch as u32 + 1, Ordering::Release);
-            }
-            TOMBS.fetch_add(1, Ordering::Release);
-            s.committed = 0;
-            s.free = 0;
-            s.bump = 0;
-            s.bytes = 0;
-            s.attached = false;
-            h.live.store(0, Ordering::Relaxed);
-            h.account.store(0, Ordering::Relaxed);
-            h.remote_bytes.store(0, Ordering::Relaxed);
-            h.remote.store(NONE, Ordering::Relaxed);
-        }
-        (chunks, touched, lowest)
     }
     /// (class, stride) of a small request.
     #[inline]
@@ -2350,160 +2173,4 @@ pub unsafe fn dealloc(p: *mut u8, l: Layout) {
 }
 pub fn trim() {
     DEFAULT.trim()
-}
-
-/// The current generation.
-pub fn generation() -> u64 {
-    EPOCH.load(Ordering::Relaxed)
-}
-/// See `Arena::begin_generation` (compiler arena only).
-pub fn begin_generation() -> u64 {
-    DEFAULT.begin_generation()
-}
-/// The generation (chunk or run) the block at `p` was carved for, None if `p` is outside the
-/// arena, in a tombstone or in a chunk that is not carved.
-pub fn epoch_of(p: *const u8) -> Option<u64> {
-    DEFAULT.epoch_of(p)
-}
-/// Exact test for the static scan: does `p` point into a live block area of generation `g` (a
-/// small chunk's carved part, a large block's committed part)? Takes the chunk lock.
-pub fn points_into(p: usize, g: u64) -> bool {
-    DEFAULT.points_into(p, g)
-}
-/// `points_into` for any generation in [lo, hi).
-pub fn points_into_range(p: usize, lo: u64, hi: u64) -> bool {
-    DEFAULT.points_into_range(p, lo, hi)
-}
-/// The arena's own statics (address ranges): its header table's free lists and its base address
-/// hold addresses into the arena, which a scan of the process's statics must not count.
-pub fn internal_ranges() -> [(usize, usize); 2] {
-    let a = &DEFAULT as *const Arena as usize;
-    [(a, a + std::mem::size_of::<Arena>()), (0, 0)]
-}
-/// Whether `addr` lies in the address range of a destroyed generation: its number. Lock-free and
-/// allocation-free (the fault handler asks).
-pub fn tombstone_of(addr: usize) -> Option<u64> {
-    let base = DEFAULT.base.load(Ordering::Relaxed);
-    if base == 0 || addr.wrapping_sub(base) >= RESERVE || TOMBS.load(Ordering::Relaxed) == 0 {
-        return None;
-    }
-    match TOMB[(addr - base) / CHUNK].load(Ordering::Relaxed) {
-        0 => None,
-        g => Some(g as u64 - 1),
-    }
-}
-/// Frees and reallocs of destroyed blocks so far (counted no-ops).
-pub fn tombstone_frees() -> usize {
-    TOMB_FREES.load(Ordering::Relaxed)
-}
-/// Chunks (and runs of chunks) tombstoned so far.
-pub fn tombstones() -> usize {
-    TOMBS.load(Ordering::Relaxed)
-}
-
-/// Frees of tombstoned blocks no longer abort under MAKEPAD_RUN_ZONE_CHECK (counted all the same).
-static TOMB_EXPECTED: AtomicBool = AtomicBool::new(false);
-
-pub fn tombstone_expected() {
-    TOMB_EXPECTED.store(true, Ordering::Relaxed);
-}
-
-fn check_on() -> bool {
-    match CHECK.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            // getenv: std::env would allocate, and this can run inside the allocator
-            #[cfg(unix)]
-            let on = unsafe {
-                extern "C" {
-                    fn getenv(name: *const u8) -> *const u8;
-                }
-                !getenv(c"MAKEPAD_RUN_ZONE_CHECK".as_ptr().cast()).is_null()
-            };
-            #[cfg(not(unix))]
-            let on = false;
-            CHECK.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// A free or realloc of a block in a destroyed generation: counted, and with MAKEPAD_RUN_ZONE_CHECK
-/// set an abort that names the address. Writes with `write(2)` and no allocation.
-#[cold]
-#[inline(never)]
-pub fn tombstone_hit(p: *mut u8, what: &str) {
-    TOMB_FREES.fetch_add(1, Ordering::Relaxed);
-    if check_on() && !TOMB_EXPECTED.load(Ordering::Relaxed) {
-        let g = tombstone_of(p as usize).unwrap_or(0);
-        let mut buf = [0u8; 160];
-        let mut n = 0;
-        let mut put = |bytes: &[u8]| {
-            for &b in bytes {
-                if n < buf.len() {
-                    buf[n] = b;
-                    n += 1;
-                }
-            }
-        };
-        put(b"makepad-run zone: ");
-        put(what.as_bytes());
-        put(b" of a block in the destroyed compiler generation ");
-        let mut digits = [0u8; 20];
-        let mut k = digits.len();
-        let mut v = g;
-        loop {
-            k -= 1;
-            digits[k] = b'0' + (v % 10) as u8;
-            v /= 10;
-            if v == 0 {
-                break;
-            }
-        }
-        put(&digits[k..]);
-        put(b" at 0x");
-        let a = p as usize;
-        for sh in (0..usize::BITS / 4).rev() {
-            let d = ((a >> (sh * 4)) & 15) as u8;
-            if d != 0 || a >> (sh * 4) != 0 {
-                put(&[if d < 10 { b'0' + d } else { b'a' + d - 10 }]);
-            }
-        }
-        put(b"\n");
-        #[cfg(unix)]
-        unsafe {
-            extern "C" {
-                fn write(fd: i32, buf: *const u8, n: usize) -> isize;
-                fn abort() -> !;
-            }
-            write(2, buf.as_ptr(), n);
-            abort();
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = n;
-            std::process::abort();
-        }
-    }
-}
-
-/// Destroys generation `g`: every chunk and large run carved for it is decommitted with the
-/// zeroing path (DESIGN H) and left PROT_NONE as a tombstone, never returned to the pool, the
-/// warm list or the partial list (the address space is spent). Returns (chunks, bytes that were
-/// touched). The caller has stopped every thread that allocates in `g`: a block of `g` that is
-/// still used afterwards faults, a free of one is a counted no-op (`tombstone_hit`).
-/// The current generation is refused (nothing is destroyed, (0, 0)).
-pub fn destroy_generation(g: u64) -> (usize, usize) {
-    DEFAULT.destroy_generation(g)
-}
-
-/// Destroys all older generations, including ones retained by aborted swaps. Every user of
-/// those generations must be quiesced. Retained chunks keep their generation eligible to retry.
-pub fn destroy_older() -> (usize, usize) {
-    DEFAULT.destroy_older()
-}
-/// See `Arena::generation_live`.
-pub fn generation_live(g: u64) -> usize {
-    DEFAULT.generation_live(g)
 }

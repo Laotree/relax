@@ -3,8 +3,8 @@
 //! computation, which rustc reports as E0391 (rustc_query_system cycle_error).
 use std::cell::RefCell;
 
-crate::gen_local! {
-    static ACTIVE: RefCell<Vec<(u8, u32, u32)>>;
+thread_local! {
+    static ACTIVE: RefCell<Vec<(u8, u32, u32)>> = Default::default();
 }
 
 /// What is being computed (a cycle needs the same kind and key to be entered twice).

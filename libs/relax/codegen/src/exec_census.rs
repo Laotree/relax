@@ -100,7 +100,7 @@ pub fn note(unit: usize, slot: u32, event: &str) {
 struct Frame { row: Row, tier: usize, reason: usize }
 #[derive(Default)]
 struct State { unit: usize, demand: bool, stack: Vec<Frame>, phase: usize, cpu: u64 }
-relax_session::gen_local! { static STATE: RefCell<State>; }
+thread_local! { static STATE: RefCell<State> = Default::default(); }
 impl State {
     fn tick(&mut self) {
         let now = relax_backend::cpu_ns();
