@@ -62,8 +62,9 @@ struct Alloc {
     init: Vec<bool>,
     /// pointer-sized provenance at byte offsets (provenance_map.rs ptrs)
     ptrs: Vec<(u64, Prov)>,
-    /// per-byte fragments of pointers copied apart: (offset, provenance, index of the byte in the pointer)
-    frags: Vec<(u64, Prov, u8)>,
+    /// per-byte fragments of pointers copied apart (provenance_map.rs PointerFrag): (offset, provenance,
+    /// index of the byte in the pointer, the raw bits of the whole pointer it is a byte of)
+    frags: Vec<(u64, Prov, u8, u64)>,
     align: u64,
     mutable: bool,
     live: bool,
@@ -82,10 +83,16 @@ impl Alloc {
         let mut keep = Vec::new();
         for &(o, p) in &self.ptrs {
             if o + ps <= lo || o >= hi { keep.push((o, p)); continue; }
-            for i in 0..ps { let b = o + i; if b < lo || b >= hi { self.frags.push((b, p, i as u8)); } }
+            let bits = self.ptr_bits(o, ps);
+            for i in 0..ps { let b = o + i; if b < lo || b >= hi { self.frags.push((b, p, i as u8, bits)); } }
         }
         self.ptrs = keep;
         self.frags.retain(|f| f.0 < lo || f.0 >= hi);
+    }
+    fn ptr_bits(&self, at: u64, ps: u64) -> u64 {
+        let mut bits = 0u64;
+        for i in 0..ps as usize { bits |= (self.bytes[at as usize + i] as u64) << (8 * i); }
+        bits
     }
     /// a sub-range as a value of its own (provenance and init mask with it)
     fn slice(&self, lo: u64, len: u64, ps: u64) -> Val {
@@ -94,20 +101,22 @@ impl Alloc {
         for &(o, p) in &self.ptrs {
             if o >= lo && o + ps <= lo + len { v.ptrs.push((o - lo, p)); }
             else if o < lo + len && o + ps > lo {
-                for i in 0..ps { let b = o + i; if b >= lo && b < lo + len { v.frags.push((b - lo, p, i as u8)); } }
+                let bits = self.ptr_bits(o, ps);
+                for i in 0..ps { let b = o + i; if b >= lo && b < lo + len { v.frags.push((b - lo, p, i as u8, bits)); } }
             }
         }
-        for &(o, p, i) in &self.frags { if o >= lo && o < lo + len { v.frags.push((o - lo, p, i)); } }
+        for &(o, p, i, bits) in &self.frags { if o >= lo && o < lo + len { v.frags.push((o - lo, p, i, bits)); } }
         v
     }
-    /// Fragments that make up a whole pointer again, in order, are that pointer (provenance_map.rs:
-    /// read_ptr merges them; interning sees one pointer).
+    /// Fragments that make up a whole pointer again -- in order, of the same provenance and the same
+    /// pointer bits -- are that pointer (provenance_map.rs provenance_merge_bytes; interning sees one
+    /// pointer).
     fn merge_frags(&mut self, ps: u64) {
         let mut i = 0;
         self.frags.sort_by_key(|f| f.0);
         while i < self.frags.len() {
-            let (o, p, idx) = self.frags[i];
-            if idx == 0 && i + ps as usize <= self.frags.len() && (0..ps as usize).all(|k| { let f = self.frags[i + k]; f.0 == o + k as u64 && f.1 == p && f.2 as usize == k }) {
+            let (o, p, idx, bits) = self.frags[i];
+            if idx == 0 && i + ps as usize <= self.frags.len() && (0..ps as usize).all(|k| { let f = self.frags[i + k]; f.0 == o + k as u64 && f.1 == p && f.2 as usize == k && f.3 == bits }) {
                 self.frags.drain(i..i + ps as usize);
                 self.ptrs.push((o, p));
             } else { i += 1; }
@@ -120,7 +129,7 @@ impl Alloc {
         self.bytes[l..h].copy_from_slice(&v.bytes);
         self.init[l..h].copy_from_slice(&v.init);
         for &(o, p) in &v.ptrs { self.ptrs.push((o + at, p)); }
-        for &(o, p, i) in &v.frags { self.frags.push((o + at, p, i)); }
+        for &(o, p, i, bits) in &v.frags { self.frags.push((o + at, p, i, bits)); }
         if !self.frags.is_empty() { self.merge_frags(ps); }
     }
 }
@@ -418,7 +427,9 @@ impl<'a> Interp<'a> {
         let overlapping = v.ptrs.iter().any(|&(o, _)| o < at + ps && o + ps > at);
         let frags: Vec<_> = v.frags.iter().filter(|f| f.0 >= at && f.0 < at + ps).collect();
         if !overlapping && frags.is_empty() { return Ok(Ptr { prov: None, off }); }
-        if !overlapping && frags.len() == ps as usize && frags.iter().all(|f| f.1 == frags[0].1 && (f.0 - at) == f.2 as u64) { return Ok(Ptr { prov: Some(frags[0].1), off }); }
+        // (provenance_map.rs read_ptr: every byte a fragment at its own index, all of one pointer:
+        // the same provenance and the same pointer bits)
+        if !overlapping && frags.len() == ps as usize && frags.iter().all(|f| f.1 == frags[0].1 && f.3 == frags[0].3 && (f.0 - at) == f.2 as u64) { return Ok(Ptr { prov: Some(frags[0].1), off }); }
         self.ptr_int_ub("unable to read parts of a pointer from memory")
     }
 
@@ -523,6 +534,9 @@ impl<'a> Interp<'a> {
                     let name = match p.ptr.prov { Some(pr) => format!("at {}", self.alloc_name(pr.alloc)), None => String::new() };
                     return Err(self.uninit_err(&v, &name));
                 }
+                // ... and a pointer is read with its provenance (allocation.rs read_scalar with
+                // read_provenance: provenance_map.rs read_ptr rejects bytes of different pointers)
+                if matches!(self.tcx.tys.kind(p.ty), TyKind::Ref(..) | TyKind::Ptr(..) | TyKind::FnPtr(..)) && v.size() >= self.ps { self.ptr_of(&v, 0)?; }
                 Ok((v, p.ty))
             }
             Operand::Constant(c) => { let t = c.const_.ty(&self.tcx.tys); Ok((self.eval_const_operand(&c.const_)?, t)) }
