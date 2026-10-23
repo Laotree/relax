@@ -82,7 +82,8 @@ pub(crate) fn group_of(u: &Unit, id: u32, gen: u32) -> Option<Group> {
         gen
     } else {
         match f.key {
-            FnKey::Plain(b) | FnKey::Sandbox(b) => f.patch_gen.max(u.fns[b as usize].patch_gen),
+            // (a twin's base may be no slot: the sandbox's invalid-fn-pointer stand-in)
+            FnKey::Plain(b) | FnKey::Sandbox(b) if (b as usize) < u.fns.len() => f.patch_gen.max(u.fns[b as usize].patch_gen),
             _ => f.patch_gen,
         }
     };
@@ -92,7 +93,7 @@ pub(crate) fn group_of(u: &Unit, id: u32, gen: u32) -> Option<Group> {
             FnKey::Inst(..) | FnKey::Closure(..) => id,
             _ => u32::MAX,
         };
-        if base != u32::MAX {
+        if (base as usize) < u.fns.len() {
             if let Some(k) = slot_crate(u, base).filter(|&k| crate::modules::is_module_crate(k)) {
                 return Some(Group::Module { krate: k, gen: g });
             }
