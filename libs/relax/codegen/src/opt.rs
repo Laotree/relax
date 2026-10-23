@@ -670,8 +670,8 @@ fn pgo_site_limits(lim: &InlineLimits, counted: bool, priority: u32, callee: &Fu
 }
 
 fn inline_trace(name: &str) -> bool {
-    static T: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    T.get_or_init(|| std::env::var("MAKEPAD_RUN_INLINE_TRACE").ok().filter(|s| !s.is_empty())).as_deref().is_some_and(|t| name.ends_with(t))
+    static T: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    relax_session::phase::env_once(&T, "MAKEPAD_RUN_INLINE_TRACE").is_some_and(|t| name.ends_with(t))
 }
 
 /// Frequencies must describe this exact RIR. New blocks inherit the site's priority.

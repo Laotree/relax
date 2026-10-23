@@ -1039,7 +1039,13 @@ pub mod obligations {
                 if matches!(&q.kind, PredicateKind::Clause(ClauseKind::Trait(u)) if matches!(u.trait_ref.args.first(), Some(GenericArg::Type(t)) if matches!(w.tcx.tys.kind(*t), TyKind::Alias(..)))) { continue; }
                 let q = w.tcx.instantiate_predicate(w.prog, def, &tc.trait_ref.args, &q);
                 if crate::next_solver::wf::predicate_has_escaping_bound_vars(&w.tcx.tys, &q) { continue; }
-                if matches!(&q.kind, PredicateKind::Clause(ClauseKind::Trait(u)) if u.trait_ref.def_id == def) { continue; }
+                // rustc predicates_of adds `Self: Trait` to a trait's predicates: the impl's own trait
+                // ref is proven (with the impl's where clauses as the environment). Its elaboration is
+                // the trait's supertrait clauses, which this loop registers by themselves.
+                if matches!(&q.kind, PredicateKind::Clause(ClauseKind::Trait(u)) if u.trait_ref.def_id == def) {
+                    w.register(Goal { param_env: w.env.clone(), predicate: q }, self_pos);
+                    continue;
+                }
                 // Elaborate::All: what the trait's bounds imply holds too
                 for e in w.tcx.supertraits(w.prog, q) {
                     if matches!(&e.kind, PredicateKind::Clause(ClauseKind::Trait(u)) if u.trait_ref.def_id == def) { continue; }
@@ -1178,7 +1184,7 @@ pub mod obligations {
     }
 
     /// Where a written type starts: types carry no span of their own, a path its position.
-    fn ty_pos(ast: &ast::Ast, t: ast::TyId) -> Option<u32> {
+    pub(crate) fn ty_pos(ast: &ast::Ast, t: ast::TyId) -> Option<u32> {
         match ast.ty(t) {
             ast::Ty::Path(p) => Some(p.lo),
             ast::Ty::Ref(_, _, i) | ast::Ty::Ptr(_, i) | ast::Ty::Slice(i) | ast::Ty::Array(i, _) | ast::Ty::Paren(i) => ty_pos(ast, *i),
@@ -1215,8 +1221,20 @@ pub mod obligations {
         let ret = ocx.normalize_ty(&env, sig.ret);
         ocx.register_obligation(Goal { param_env: env.clone(), predicate: collect::trait_predicate(term, vec![GenericArg::Type(ret)]) });
         let bad = ocx.try_evaluate_obligations().into_iter().any(|e| matches!(e, NextSolverError::TrueError(_)));
-        if !bad { return Vec::new(); }
         let pos = ast.fn_sig(*s).ret.and_then(|t| ty_pos(ast, t)).unwrap_or(item.name.lo);
+        if !bad {
+            // the region constraints of the `Termination` proof hold too (resolve_regions; a
+            // placeholder one is "implementation of `..` is not general enough")
+            let errors = infcx.resolve_regions(prog, env, &[]);
+            if errors.is_empty() { return Vec::new(); }
+            let placeholder = errors.iter().any(|e| matches!(e, crate::infer::lexical_region_resolve::RegionResolutionError::UpperBoundUniverseConflict(..)))
+                || errors.iter().any(|e| match e {
+                    crate::infer::lexical_region_resolve::RegionResolutionError::ConcreteFailure(_, a, b) => [a, b].iter().any(|r| matches!(tcx.tys.region_kind(**r), crate::types::RegionKind::RePlaceholder { .. })),
+                    _ => false,
+                });
+            let msg = if placeholder { "higher-ranked lifetime error" } else { "lifetime may not live long enough" };
+            return vec![prog.record_uncoded_error(def.file, pos, "typeck", msg.to_string())];
+        }
         let shown = crate::typeck::ty_to_string(false, prog, tcx, infcx.deeply_resolve_ignoring_regions(ret));
         vec![prog.record_error(def.file, pos, "typeck", format!("E0277: `main` has invalid return type `{}`", shown))]
     }
