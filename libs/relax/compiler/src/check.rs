@@ -138,6 +138,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     errors.extend(relax_types::item_checks::foreign_blocks(&u.prog, &own));
     errors.extend(relax_types::item_checks::duplicate_symbols(&u.prog, &own));
     errors.extend(relax_types::item_checks::global_allocators_and_lang_items(&u.prog, &own));
+    errors.extend(relax_types::proc_macro_harness::check(&u.prog, &u.tcx, &own));
     if u.prog.crates[root as usize].is_bin { errors.extend(relax_types::item_checks::entry_point(&u.prog, root)); }
     if u.prog.crates[root as usize].is_bin { errors.extend(relax_types::item_checks::entry_symbol_conflict(&u.prog, &own, root)); }
     errors.extend(relax_types::lint_levels::check(&u.prog, &own));
@@ -227,7 +228,8 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     for anon in crates.iter().flat_map(|&k| crate::borrowck::body::signature_anon_consts(&u.prog, &u.tcx, k)).collect::<Vec<_>>() {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let body = u.tcx.typeck(&u.prog, anon);
-            let mut errs = body.errors.to_vec();
+            let errs = body.errors.to_vec();
+            let mut diags = Vec::new();
             if errs.is_empty() {
                 relax_types::lint::check_literals(&u.prog, &u.tcx, &body);
                 relax_types::lint_pass::check_body(&u.prog, &u.tcx, &body);
@@ -237,18 +239,21 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
                 if let Some((_, relax_front::def_collector::NodeId::AnonConst(expr))) = u.prog.def_id_to_node_id.get(&anon) {
                     let state = crate::tcx::EvalState::new();
                     let cx = crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &state);
-                    for e in crate::borrowck::check_anon_const(&cx, &u.prog, &u.tcx, &body, *expr) {
-                        errs.push(e.render());
+                    let errs = crate::borrowck::check_anon_const(&cx, &u.prog, &u.tcx, &body, *expr);
+                    if !errs.is_empty() {
+                        diags.extend(crate::borrowck::lazy::report_checked(&u.prog, 0, u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), anon, &body.args, errs, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
                     }
                 }
             }
-            errs
+            (errs, diags)
         }));
         match r {
-            Ok(e) => {
+            Ok((e, diags)) => {
+                let e_ok = e.is_empty() && diags.is_empty();
+                borrow_diagnostics.extend(diags);
                 // rustc evaluates every array length / const argument written in a signature (used
                 // or not): one that fails is reported there (E0080)
-                if e.is_empty() && u.tcx.generic_indices_of(&u.prog, anon).types_consts.is_empty() && !matches!(u.prog.def(u.prog.def(anon).parent).kind, DefKind::Trait | DefKind::TypeAlias) {
+                if e_ok && u.tcx.generic_indices_of(&u.prog, anon).types_consts.is_empty() && !matches!(u.prog.def(u.prog.def(anon).parent).kind, DefKind::Trait | DefKind::TypeAlias) {
                     let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
                     let before = u.tcx.dcx.err_count();
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.tcx.const_eval_resolve(&u.prog, env, anon, &[])));
@@ -377,7 +382,10 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         }
     }
     let mut seeds = Vec::new();
-    for (_, o) in outcomes {
+    // rustc: an item whose body failed its checks (borrowck included) is tainted: it is never evaluated
+    let mut tainted: std::collections::HashSet<crate::program::DefId> = std::collections::HashSet::new();
+    for (i, o) in outcomes {
+        if !o.errors.is_empty() || !o.diags.is_empty() { tainted.insert(fns[i].0.owner); }
         errors.extend(o.errors);
         borrow_diagnostics.extend(o.diags);
         if let Some(d) = o.seed { seeds.push(d); }
@@ -395,7 +403,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     // rustc_hir_analysis check_crate: every static and every non-generic, non-associated const
     // item of the checked crates is evaluated, used or not; one that cannot be evaluated is an
     // E0080 (the unit notes it, reported below with the builds' other notes)
-    eval_items(up, &own);
+    eval_items(up, &own, &tainted);
     // rustc_monomorphize: a program's `main` and what it reaches, instantiated -- the constants
     // generic code evaluates there (post-monomorphization E0080) -- in a check of a program
     if options.const_fuel && !compile && errors.is_empty() && borrow_diagnostics.is_empty() && unsafe { (&*up).errors.is_empty() } { mono_check(up, &own, root); }
@@ -736,7 +744,7 @@ fn is_follow_on(e: &str) -> bool {
 
 /// Evaluates the checked crates' statics and non-generic const items (rustc evaluates them in
 /// `cargo check`, used or not). A body with type errors is skipped: those errors are reported.
-fn eval_items(up: *mut Unit, own: &[bool]) {
+fn eval_items(up: *mut Unit, own: &[bool], tainted: &std::collections::HashSet<crate::program::DefId>) {
     let u = unsafe { &mut *up };
     let items: Vec<(crate::program::DefId, bool)> = (0..u.prog.defs.len())
         .filter(|&i| own[u.prog.defs[i].krate as usize])
@@ -750,7 +758,7 @@ fn eval_items(up: *mut Unit, own: &[bool]) {
         .collect();
     let _job = jit::compile_job();
     for (d, is_static) in items {
-        if !u.tcx.typeck(&u.prog, d).errors.is_empty() { continue; }
+        if tainted.contains(&d) || !u.tcx.typeck(&u.prog, d).errors.is_empty() { continue; }
         let before = unsafe { (&*up).errors.len() };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::owner::call(crate::owner::Class::App, || unsafe {
             let u = &mut *up;
