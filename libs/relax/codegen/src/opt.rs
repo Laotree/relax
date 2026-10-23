@@ -7546,6 +7546,36 @@ pub fn dead_slot_stores(f: &mut Func) -> bool {
     true
 }
 
+/// Drop-flag-like vregs of `f` (at most 4): defined only by integer constants (at least once)
+/// and the condition of a branch. Their branches are what coalesce_slot_copies' liveness reads
+/// per flag value.
+fn drop_flag_vregs(f: &Func) -> Vec<VReg> {
+    let nv = f.vregs.len();
+    // 0 no def, 1 constants only, 2 another def
+    let mut kind = vec![0u8; nv];
+    for p in &f.params {
+        kind[p.0 as usize] = 2;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            let c = matches!(i, Inst::Iconst(..));
+            for_defs(i, |d| {
+                let k = &mut kind[d.0 as usize];
+                *k = if c && *k != 2 { 1 } else { 2 };
+            });
+        }
+    }
+    let mut out = Vec::new();
+    for b in &f.blocks {
+        if let Term::Branch(c, t, e) = b.term {
+            if t != e && kind[c.0 as usize] == 1 && f.vregs[c.0 as usize] == Cls::I && !out.contains(&c) && out.len() < 4 {
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
 /// MAKEPAD_RUN_SLOTCOAL_TRACE=1: coalesce_slot_copies' candidates and why copies are none
 fn slotcoal_trace() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -7573,6 +7603,9 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
         let ns = f.slots.len();
         if ns < 2 {
             return any;
+        }
+        if slotcoal_trace() && std::env::var("MAKEPAD_RUN_SLOTCOAL_DUMP").is_ok_and(|n| f.name.contains(&n)) {
+            eprintln!("slotcoal {}: round {} RIR\n{}", f.name, _round, f.dump());
         }
         let sc = slot_scan(f);
         let vs = &sc.vs;
@@ -7773,10 +7806,118 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
         };
         let nb = f.blocks.len();
         let reach = reachable(f);
-        let mut order = relax_backend::frame::block_rpo(f);
+        // Drop flags (a vreg set only by constants and branched on: rustc's drop flags as
+        // elaborate_drop_flags leaves the maybe ones): byte liveness is computed per known flag
+        // value as well, so a drop behind a flag that is 0 (or 1) on every path from a point
+        // keeps nothing live there. reconcile moved its entry out of the `(Option<Entry>, kind)`
+        // tuple and set the flag; the tuple's drop in the push's unwind cleanup sits behind it and
+        // kept the tuple slot live across every write of the entry. Mode 0 is plain liveness,
+        // mode 1 + 2j: flag j is 0, mode 2 + 2j: flag j is not 0.
+        let flags = drop_flag_vregs(f);
+        let nf = flags.len();
+        let nm = 1 + 2 * nf;
+        let flag_of = |v: VReg| flags.iter().position(|&x| x == v);
+        // the mode a constant definition of a flag leaves: (flag, mode)
+        let flag_def = |i: &Inst| match *i {
+            Inst::Iconst(d, k) => flag_of(d).map(|j| (j, if k == 0 { 1 + 2 * j } else { 2 + 2 * j })),
+            _ => None,
+        };
+        // forward: per block entry and flag, the flag's known value (0 unknown, 1 zero, 2 not
+        // zero, 3 not reached yet)
+        let order_f = relax_backend::frame::block_rpo(f);
+        let mut fin = vec![3u8; nb * nf.max(1)];
+        if nf > 0 {
+            let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
+            for (bi, b) in f.blocks.iter().enumerate() {
+                for t in b.term.succs() {
+                    preds[t as usize].push(bi);
+                }
+            }
+            let exit_facts = |fin: &[u8], bi: usize| -> Vec<u8> {
+                let mut st = fin[bi * nf..bi * nf + nf].to_vec();
+                for i in &f.blocks[bi].insts {
+                    if let Some((j, m)) = flag_def(i) {
+                        st[j] = if m == 1 + 2 * j { 1 } else { 2 };
+                    }
+                }
+                st
+            };
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for &b in &order_f {
+                    let bi = b as usize;
+                    let mut st: Vec<u8> = if bi == 0 { vec![0; nf] } else { vec![3; nf] };
+                    for &p in &preds[bi] {
+                        let mut e = exit_facts(&fin, p);
+                        if let Term::Branch(c, t, el) = f.blocks[p].term {
+                            if let Some(j) = flag_of(c) {
+                                if t != el {
+                                    if t as usize == bi { e[j] = if e[j] == 1 { 3 } else { 2 }; } else { e[j] = if e[j] == 2 { 3 } else { 1 }; }
+                                }
+                            }
+                        }
+                        for j in 0..nf {
+                            st[j] = match (st[j], e[j]) { (3, x) | (x, 3) => x, (x, y) if x == y => x, _ => 0 };
+                        }
+                    }
+                    if fin[bi * nf..bi * nf + nf] != st[..] {
+                        fin[bi * nf..bi * nf + nf].copy_from_slice(&st);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        // a block's live-out per mode from its successors' live-in (`li`: nb * nm * w)
+        let live_out = |li: &[u64], bi: usize, out: &mut [u64]| {
+            out.iter_mut().for_each(|x| *x = 0);
+            let term = &f.blocks[bi].term;
+            let fl = match *term { Term::Branch(c, t, e) if t != e => flag_of(c).map(|j| (j, t as usize, e as usize)), _ => None };
+            for m in 0..nm {
+                let o = &mut out[m * w..m * w + w];
+                match fl {
+                    Some((j, t, e)) => {
+                        // the taken edge says the flag is not 0, the other that it is 0
+                        let (from_t, from_e) = if m == 0 { (2 + 2 * j, 1 + 2 * j) } else if m == 1 + 2 * j { (usize::MAX, m) } else if m == 2 + 2 * j { (m, usize::MAX) } else { (m, m) };
+                        if from_t != usize::MAX {
+                            for x in 0..w { o[x] |= li[(t * nm + from_t) * w + x]; }
+                        }
+                        if from_e != usize::MAX {
+                            for x in 0..w { o[x] |= li[(e * nm + from_e) * w + x]; }
+                        }
+                    }
+                    None => {
+                        for t in term.succs() {
+                            for x in 0..w { o[x] |= li[(t as usize * nm + m) * w + x]; }
+                        }
+                    }
+                }
+            }
+        };
+        // one instruction backwards in every mode (a constant definition of flag j: before it,
+        // plain and j's modes take the after-state of the value it sets)
+        let step = |cur: &mut [u64], i: &Inst, bi: usize, ii: usize| {
+            if let Some((j, m)) = flag_def(i) {
+                let src = cur[m * w..m * w + w].to_vec();
+                cur[0..w].copy_from_slice(&src);
+                cur[(1 + 2 * j) * w..(2 + 2 * j) * w].copy_from_slice(&src);
+                cur[(2 + 2 * j) * w..(3 + 2 * j) * w].copy_from_slice(&src);
+            }
+            let (rd, wr) = acc(i, bi, ii);
+            for m in 0..nm {
+                let c = &mut cur[m * w..m * w + w];
+                xfer(c, rd, wr);
+                if let Some(v) = nc_at.get(&(bi, ii)) {
+                    for &s2 in v {
+                        xfer(c, Some((s2, 0, i64::MAX)), None);
+                    }
+                }
+            }
+        };
+        let mut order = order_f.clone();
         order.reverse();
-        let mut live_in = vec![0u64; nb * w];
-        let mut cur = vec![0u64; w];
+        let mut live_in = vec![0u64; nb * nm * w];
+        let mut cur = vec![0u64; nm * w];
         let mut changed = true;
         while changed {
             changed = false;
@@ -7785,29 +7926,22 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
                 if !reach[bi] {
                     continue;
                 }
-                cur.iter_mut().for_each(|x| *x = 0);
-                for t in f.blocks[bi].term.succs() {
-                    for j in 0..w {
-                        cur[j] |= live_in[t as usize * w + j];
-                    }
-                }
+                live_out(&live_in, bi, &mut cur);
                 for (ii, i) in f.blocks[bi].insts.iter().enumerate().rev() {
-                    let (rd, wr) = acc(i, bi, ii);
-                    xfer(&mut cur, rd, wr);
-                    if let Some(v) = nc_at.get(&(bi, ii)) {
-                        for &s2 in v {
-                            xfer(&mut cur, Some((s2, 0, i64::MAX)), None);
-                        }
-                    }
+                    step(&mut cur, i, bi, ii);
                 }
-                if live_in[bi * w..bi * w + w] != cur[..] {
-                    live_in[bi * w..bi * w + w].copy_from_slice(&cur);
+                if live_in[bi * nm * w..(bi + 1) * nm * w] != cur[..] {
+                    live_in[bi * nm * w..(bi + 1) * nm * w].copy_from_slice(&cur);
                     changed = true;
                 }
             }
         }
+        // the live set after an instruction: plain liveness cut by each flag's known value there
+        let mut eff = vec![0u64; w];
         // per candidate: interference found
         let mut bad = vec![false; cands.len()];
+        // (trace: where each candidate first interfered)
+        let mut bad_at: Vec<String> = vec![String::new(); cands.len()];
         // slot -> candidates it is in
         let mut of_slot: Vec<Vec<usize>> = vec![Vec::new(); ns];
         for (k, &(_, _, bs, cs)) in cands.iter().enumerate() {
@@ -7818,14 +7952,27 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
             if !reach[bi] {
                 continue;
             }
-            cur.iter_mut().for_each(|x| *x = 0);
-            for t in f.blocks[bi].term.succs() {
-                for j in 0..w {
-                    cur[j] |= live_in[t as usize * w + j];
+            live_out(&live_in, bi, &mut cur);
+            // the flags' known values after each instruction
+            let mut facts: Vec<Vec<u8>> = Vec::new();
+            if nf > 0 {
+                let mut st = fin[bi * nf..bi * nf + nf].to_vec();
+                for i in &f.blocks[bi].insts {
+                    if let Some((j, m)) = flag_def(i) {
+                        st[j] = if m == 1 + 2 * j { 1 } else { 2 };
+                    }
+                    facts.push(st.clone());
                 }
             }
             for ii in (0..f.blocks[bi].insts.len()).rev() {
-                let (rd, wr) = acc(&f.blocks[bi].insts[ii], bi, ii);
+                eff.copy_from_slice(&cur[0..w]);
+                if nf > 0 {
+                    for (j, &k) in facts[ii].iter().enumerate() {
+                        let m = match k { 1 => 1 + 2 * j, 2 => 2 + 2 * j, _ => continue };
+                        for x in 0..w { eff[x] &= cur[m * w + x]; }
+                    }
+                }
+                let (_, wr) = acc(&f.blocks[bi].insts[ii], bi, ii);
                 // a nocapture call may write any byte of the slots it is passed
                 let ncw: Vec<(u32, i64, i64)> = nc_at.get(&(bi, ii)).map_or(Vec::new(), |v| v.iter().map(|&s2| (s2, 0, i64::MAX)).collect());
                 // `cur` is live after this instruction: a write of one candidate slot needs the
@@ -7844,26 +7991,31 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
                             false
                         } else {
                             match bits(other, lo, if hi == i64::MAX { hi } else { hi.min(osize) }) {
-                                Some((over, _)) => anyb(&cur, over.0, over.1),
+                                Some((over, _)) => anyb(&eff, over.0, over.1),
                                 None => {
                                     let (x, y) = whole(other);
-                                    anyb(&cur, x, y)
+                                    anyb(&eff, x, y)
                                 }
                             }
                         };
                         if hit {
                             bad[k] = true;
+                            if slotcoal_trace() {
+                                bad_at[k] = format!(" at b{}#{} (write of {} [{}..{}))", bi, ii, s2, lo, if hi == i64::MAX { -1 } else { hi });
+                            }
                         }
                     }
                 }
-                xfer(&mut cur, rd, wr);
-                for &(s2, _, _) in &ncw {
-                    xfer(&mut cur, Some((s2, 0, i64::MAX)), None);
-                }
+                step(&mut cur, &f.blocks[bi].insts[ii], bi, ii);
             }
         }
         if slotcoal_trace() {
             eprintln!("slotcoal {}: candidates {}", f.name, cands.iter().zip(&bad).map(|(&(_, _, bs, cs), &b)| format!("{}->{}{}", bs, cs, if b { " interferes" } else { "" })).collect::<Vec<_>>().join(", "));
+            for (k, w) in bad_at.iter().enumerate() {
+                if !w.is_empty() {
+                    eprintln!("slotcoal {}:   {}->{} interferes{}", f.name, cands[k].2, cands[k].3, w);
+                }
+            }
         }
         // join the first good candidate per slot pair (slots may sit in several candidates)
         let mut used = vec![false; ns];
