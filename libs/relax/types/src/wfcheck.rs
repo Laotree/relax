@@ -1039,7 +1039,13 @@ pub mod obligations {
                 if matches!(&q.kind, PredicateKind::Clause(ClauseKind::Trait(u)) if matches!(u.trait_ref.args.first(), Some(GenericArg::Type(t)) if matches!(w.tcx.tys.kind(*t), TyKind::Alias(..)))) { continue; }
                 let q = w.tcx.instantiate_predicate(w.prog, def, &tc.trait_ref.args, &q);
                 if crate::next_solver::wf::predicate_has_escaping_bound_vars(&w.tcx.tys, &q) { continue; }
-                if matches!(&q.kind, PredicateKind::Clause(ClauseKind::Trait(u)) if u.trait_ref.def_id == def) { continue; }
+                // rustc predicates_of adds `Self: Trait` to a trait's predicates: the impl's own trait
+                // ref is proven (with the impl's where clauses as the environment). Its elaboration is
+                // the trait's supertrait clauses, which this loop registers by themselves.
+                if matches!(&q.kind, PredicateKind::Clause(ClauseKind::Trait(u)) if u.trait_ref.def_id == def) {
+                    w.register(Goal { param_env: w.env.clone(), predicate: q }, self_pos);
+                    continue;
+                }
                 // Elaborate::All: what the trait's bounds imply holds too
                 for e in w.tcx.supertraits(w.prog, q) {
                     if matches!(&e.kind, PredicateKind::Clause(ClauseKind::Trait(u)) if u.trait_ref.def_id == def) { continue; }
