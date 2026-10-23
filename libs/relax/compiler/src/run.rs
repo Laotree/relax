@@ -460,8 +460,7 @@ pub(crate) fn resolve_package(
     let order = crate::crates::topo_order(&g.crates);
     let mut cfgs: Vec<crate::cfg::CfgSet> = Vec::with_capacity(g.crates.len());
     for (ci, c) in g.crates.iter().enumerate() {
-        let mut cs = crate::cfg::CfgSet::host(sess, &c.features);
-        cs.set.push("relax".to_string());
+        let mut cs = crate::program_cfg(sess, &c.features);
         for x in &g.cfgs[ci] {
             cs.set.push(x.replace('"', ""));
         }
