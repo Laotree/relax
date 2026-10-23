@@ -1,0 +1,372 @@
+//! The settle rebuild (MEMSAFE.DESIGN.md R2): once a run has settled, the compile state its cold
+//! start built (the program and type context with every interned inference type, the query tables,
+//! the bodies, the RIR kept for inlining, the caches) is replaced by the warm-sized state a warm
+//! start would map, and the old state is dropped by value. The compiler arena then gets back whole
+//! chunks: what the dropped values held and the free slots that sat between them.
+//!
+//! Nothing is freed in bulk and no thread is quiesced. Safety rests on two rules:
+//! - every block is freed by its owner's Drop (the old values are moved out of the Unit and
+//!   dropped off the owner; whatever still holds an `Arc` into them keeps it alive);
+//! - off the owner, the program and type context are read only through a front read
+//!   (`FrontRead::unit` / `FrontRead::of`, whose references cannot outlive it), and the replace
+//!   runs on the owner under a front write: no reader holds a reference into the old values
+//!   while they are moved out. The owner's own readers are its request frames: the replace is a
+//!   Program request, which no pump serves (owner.rs `keeps_job`), so it never runs nested in one.
+//!
+//! Steps (driver: the run monitor, after a settle; retried while preconditions fail):
+//! 1. the collected image of the program as it is now, encoded under a front read (compiles go on)
+//!    and committed to the store;
+//! 2. the image restored into a new program and type context, on the monitor thread (it reads
+//!    only the image and the stores);
+//! 3. one owner request under a front write: the counts must be those of the encode (only the
+//!    interners may have grown: the new interner is topped up from the live one, so type ids stay
+//!    identical), the cache is opened as a warm start opens it and inherits what the old one
+//!    learned, and the Unit's compile fields are replaced; the old ones are returned;
+//! 4. the old values are dropped on the monitor's thread, then the heap is trimmed.
+//! `MAKEPAD_RUN_SETTLE_REBUILD=0` turns it off.
+
+use super::*;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
+
+/// On unless MAKEPAD_RUN_SETTLE_REBUILD=0.
+pub(crate) fn enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_SETTLE_REBUILD").map_or(true, |v| v != "0"))
+}
+
+/// The crate list of this launch (kept: the rebuild restores against it).
+static BOOT: relax_session::sync::Mutex<Option<Vec<crate::preload::PreCrate>>> = relax_session::sync::Mutex::new(None);
+
+pub(crate) fn remember_boot(pre: &[crate::preload::PreCrate]) {
+    *BOOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::zone_alloc::kept_with(|| pre.to_vec()));
+}
+
+static REBUILDS: AtomicU32 = AtomicU32::new(0);
+
+/// Settle rebuilds done so far.
+pub(crate) fn rebuilds() -> u32 {
+    REBUILDS.load(Ordering::Relaxed)
+}
+
+pub(crate) enum Outcome {
+    Done,
+    /// not now: the monitor tries again
+    Retry(String),
+    /// never in this run
+    Refused(String),
+}
+
+/// What must be equal between the encode and the replace (the interners may only grow).
+#[derive(PartialEq, Debug, Clone, Copy)]
+struct Counts {
+    defs: usize,
+    files: usize,
+    crates: usize,
+    mods: usize,
+    tys: usize,
+    regions: (usize, usize),
+    syms: usize,
+    late_syms: usize,
+    lists: (usize, usize),
+}
+
+impl Counts {
+    fn of(prog: &Program, tcx: &Tcx) -> Counts {
+        Counts { defs: prog.defs.len(), files: prog.files.len(), crates: prog.crates.len(), mods: prog.mods.len(), tys: tcx.tys.len(),
+            regions: tcx.tys.region_counts(), syms: prog.syms.len(), late_syms: prog.syms.late_len(), lists: tcx.tys.list_const_counts() }
+    }
+
+    /// Equal but for the interners, which only grew.
+    fn same_program(&self, o: &Counts) -> bool {
+        (self.defs, self.files, self.crates, self.mods, self.syms, self.late_syms) == (o.defs, o.files, o.crates, o.mods, o.syms, o.late_syms)
+            && self.tys <= o.tys && self.regions.0 <= o.regions.0 && self.regions.1 <= o.regions.1 && self.lists.0 <= o.lists.0 && self.lists.1 <= o.lists.1
+    }
+}
+
+/// Counts equal, and rows sampled across the tables: a restore that renumbered anything shows here.
+fn compare(old: (&Program, &Tcx), new: (&Program, &Tcx)) -> Result<(), String> {
+    let (a, b) = (Counts::of(old.0, old.1), Counts::of(new.0, new.1));
+    if a != b {
+        return Err(format!("counts differ: running {a:?}, restored {b:?}"));
+    }
+    if old.0.file_paths != new.0.file_paths {
+        return Err("file paths differ".into());
+    }
+    let step = |n: usize| (n / 96).max(1);
+    for i in (0..a.defs).step_by(step(a.defs)) {
+        let d = DefId(i as u32);
+        let (x, y) = (old.0.def(d), new.0.def(d));
+        if (x.kind, x.name, x.parent, x.file, x.krate, x.scope) != (y.kind, y.name, y.parent, y.file, y.krate, y.scope) || old.0.def_path(d) != new.0.def_path(d) {
+            return Err(format!("definition {i} differs"));
+        }
+    }
+    for i in (0..a.syms).step_by(step(a.syms)) {
+        if old.0.syms.str(i as u32) != new.0.syms.str(i as u32) {
+            return Err(format!("symbol {i} differs"));
+        }
+    }
+    for i in (0..a.tys).step_by(step(a.tys)) {
+        let t = TyId(i as u32);
+        if old.1.tys.kind(t) != new.1.tys.kind(t) {
+            return Err(format!("type {i} differs"));
+        }
+    }
+    Ok(())
+}
+
+/// Reasons the rebuild can never run in this process.
+fn refuse(up: *mut Unit) -> Option<String> {
+    if !crate::reload::edited_crates().is_empty() {
+        return Some("a live edit was applied (the collected image no longer describes the program)".into());
+    }
+    if crate::sandbox::any_live() {
+        return Some("a sandbox module exists".into());
+    }
+    let Some(boot) = BOOT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|b| b.len()) else {
+        return Some("no boot record".into());
+    };
+    let r = front_read("settle rebuild check");
+    let (prog, _) = r.unit(up);
+    if prog.crates.len() != boot {
+        return Some("crates were added at run time (the boot image does not describe them)".into());
+    }
+    if unsafe { (*up).retired } {
+        return Some("a retired unit".into());
+    }
+    None
+}
+
+/// Reasons not to start now.
+fn not_now() -> Option<String> {
+    if owner::main_waiting() {
+        return Some("the main thread waits for the owner".into());
+    }
+    if !FIRST_PRESENT.load(Ordering::Acquire) || startup_phase() {
+        return Some("still starting".into());
+    }
+    if RELOADING.load(Ordering::Acquire) > 0 {
+        return Some("a reload is in progress".into());
+    }
+    if IDS_PENDING.load(Ordering::Acquire) {
+        return Some("startup identities are still encoded".into());
+    }
+    if crate::pmhost::world_alive() {
+        return Some("the proc-macro world is alive".into());
+    }
+    None
+}
+
+fn trace(what: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_SETTLE_TRACE").is_some()) {
+        eprintln!("makepad-run settle rebuild: {what} (t={:.0} ms)", crate::clock::ms_since_start());
+    }
+}
+
+fn ms(t: Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1e3
+}
+
+/// The replaced compile state of the Unit, dropped by value off the owner. (The slot fields
+/// `calls`, `rir_refs` and `spec` are ids and code: they stay.)
+struct Old {
+    _prog: Program,
+    _tcx: Tcx,
+    _lay: crate::layout::Layouts,
+    _cache: Option<Box<crate::cache::CacheCell>>,
+    _front: std::sync::Arc<FrontShared>,
+    _const_failed: std::collections::HashSet<(DefId, Vec<TyId>)>,
+    _bodies: crate::fxhash::HashMap<u32, std::sync::Arc<Body>>,
+    _old_bodies: crate::fxhash::HashMap<(u32, u32), std::sync::Arc<Body>>,
+    _coro_rir: crate::conc::MemoMap<u32, relax_backend::rir::Func>,
+    _spec_cached: crate::conc::MemoMap<u32, ()>,
+    _unwind_drop_cache: crate::conc::MemoMap<TyId, bool>,
+    _unpin_cache: crate::conc::MemoMap<TyId, bool>,
+    _core_path_cache: crate::conc::MemoMap<String, Option<DefId>>,
+    _ctfe_fn_bodies: relax_session::sync::Mutex<crate::fxhash::HashMap<(DefId, Vec<TyId>), (u64, std::sync::Arc<Body>)>>,
+    _query_errors: relax_types::infer::diagnostics::DiagCtxt,
+    _rir: Vec<std::sync::Arc<relax_backend::rir::Func>>,
+}
+// SAFETY: every value in `Old` was moved out of the Unit under a front write on the owner; no
+// thread holds a reference into it (off-owner readers go through a front read, the owner's own
+// request frames are not nested under this one). What is shared with other threads is shared
+// through Arcs, whose counts are atomic.
+unsafe impl Send for Old {}
+
+/// The state built from the restored image, ready to be moved into the Unit.
+struct Fresh {
+    prog: Program,
+    tcx: Tcx,
+    collected: crate::cache::CollectedCache,
+}
+
+/// Runs the rebuild. Called by the monitor thread once the run has settled and its collected
+/// image is current; `up` is the run's unit.
+pub(crate) fn run(up: *mut Unit) -> Outcome {
+    if let Some(why) = refuse(up) {
+        return Outcome::Refused(why);
+    }
+    if let Some(why) = not_now() {
+        return Outcome::Retry(why);
+    }
+    // the recipe, the session, the images: process state
+    let _k = crate::zone_alloc::kept();
+    let t_all = Instant::now();
+    let rss0 = crate::memstat::resident();
+    let pre = BOOT.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap();
+    let sess = unsafe { unit_session(up) };
+    let Some(mode) = crate::cache::mode_from_env(&sess.options) else { return Outcome::Refused("the cache mode is off".into()) };
+
+    // 1. the collected image of the program now, under a front read (compiles go on)
+    let t = Instant::now();
+    let Some(inputs) = owner::publish(|| unsafe { (*up).cache.as_ref().map(|c| c.collected_inputs()) }) else {
+        return Outcome::Retry("the cache is not in the unit".into());
+    };
+    let (before, encoded) = {
+        let _c = crate::zone_alloc::compiler();
+        let r = front_read("settle rebuild encode");
+        let (prog, tcx) = r.unit(up);
+        let before = Counts::of(prog, tcx);
+        let stop = || crate::preempt::writer_waiting() || crate::preempt::is_stopped();
+        (before, inputs.encode_now(prog, tcx, &stop))
+    };
+    let (dest, payload) = match encoded {
+        crate::cache::CollectedRecord::Ready(dest, payload) => (dest, payload),
+        crate::cache::CollectedRecord::Current => return Outcome::Retry("the store already holds the image".into()),
+        crate::cache::CollectedRecord::Yielded => return Outcome::Retry("the encode yielded to a front writer".into()),
+        crate::cache::CollectedRecord::Failed => return Outcome::Refused("the program is not recordable".into()),
+    };
+    if crate::cache::Cache::commit_collected(None, dest, payload).is_none() {
+        return Outcome::Retry("the collected image could not be written".into());
+    }
+    let encode_ms = ms(t);
+    trace(&format!("encoded and stored in {encode_ms:.1} ms"));
+
+    // 2. the restore (the image and the stores only)
+    let t = Instant::now();
+    let fresh = {
+        let _c = crate::zone_alloc::compiler();
+        let restored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let images = crate::cache::FrontImages::open(&sess.options)?;
+            images.restore_collected(&sess, &pre)
+        }));
+        match restored {
+            Ok(Some((prog, tcx, Some(collected)))) => Fresh { prog, tcx, collected },
+            Ok(Some(_)) => return Outcome::Retry("only a prefix of the program was restored".into()),
+            Ok(None) => return Outcome::Retry("the collected image was not restored".into()),
+            Err(_) => return Outcome::Retry("the restore panicked".into()),
+        }
+    };
+    crate::program::share_std_end();
+    let restore_ms = ms(t);
+    trace(&format!("restored in {restore_ms:.1} ms"));
+
+    // 3. the replace, on the owner under a front write
+    let t = Instant::now();
+    let replaced = owner::call(owner::Class::Program, || unsafe { replace(up, &sess, mode, fresh, before) });
+    let old = match replaced {
+        Ok(old) => old,
+        Err(why) => return Outcome::Retry(why),
+    };
+    let replace_ms = ms(t);
+
+    // 4. the old state goes by value, off the owner (on this, the monitor's, thread)
+    let t = Instant::now();
+    drop(old);
+    // the process-wide memos that only grow go too (made again on demand)
+    drop_compile_memos();
+    relax_types::tcx::drop_process_memos();
+    crate::program::drop_shared_std();
+    let drop_ms = ms(t);
+    crate::memstat::trim();
+    crate::pack::release_resident();
+    let rss1 = crate::memstat::resident();
+    REBUILDS.fetch_add(1, Ordering::Relaxed);
+    if crate::run::VERBOSE.load(Ordering::Relaxed) || crate::memstat::enabled() { eprintln!("makepad-run settle rebuild at t={:.0} ms: encode {:.1} ms, restore {:.1} ms, replace on the owner {:.1} ms, old state dropped in {:.1} ms; total {:.1} ms; rss {:.0} -> {:.0} MB",
+        crate::clock::ms_since_start(), encode_ms, restore_ms, replace_ms, drop_ms, ms(t_all), rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0); }
+    Outcome::Done
+}
+
+/// Owner request under a front write: checks the program against the encode, finishes the new
+/// state (interner top-up, cache, front state) and moves it into the Unit. The old values come
+/// back to be dropped elsewhere.
+unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: crate::cache::Mode, fresh: Fresh, before: Counts) -> Result<Old, String> {
+    let Some(_front) = super::front_write_within(1000) else {
+        return Err("a front reader held on for 1 s".into());
+    };
+    let u = &mut *up;
+    let now = Counts::of(&u.prog, &u.tcx);
+    if !before.same_program(&now) {
+        return Err("the program changed after the encode".into());
+    }
+    for (i, f) in u.fns.iter().enumerate() {
+        if f.building || f.inflight {
+            return Err(format!("slot {i} is being built"));
+        }
+    }
+    u.flush_cache_records();
+    let pending = u.cache.as_ref().map_or(0, |c| c.pending_entries());
+    if pending > 0 {
+        return Err(format!("the cache has {pending} entries to spill"));
+    }
+    let Fresh { prog, mut tcx, collected } = fresh;
+    // the types interned since the encode, copied from the live interner: ids stay identical
+    tcx.tys.top_up_from(&u.tcx.tys).ok_or("the image holds more types than the program")?;
+    compare((&u.prog, &u.tcx), (&prog, &tcx))?;
+    // the cache, as the warm start opens it, and what the old one learned
+    let root = crate::layout::root_crate();
+    let mut cache = crate::cache::Cache::open_collected(u, mode, Some(&collected)).map_err(|e| format!("the cache did not open: {e}"))?;
+    cache.load_manifest(root);
+    if let Some(old) = u.cache.as_ref() {
+        cache.inherit_run_state(old);
+    }
+    let mut front = FrontShared::new(sess);
+    front.census_id = u.front.census_id;
+    front.warm_cache.store(u.front.warm_cache.load(Ordering::Relaxed), Ordering::Relaxed);
+    for (i, f) in u.fns.iter().enumerate() {
+        front.slot_keys.insert(i as u32, f.key.clone());
+    }
+    let mut lay = crate::layout::Layouts::new();
+    lay.opaque = u.lay.opaque.clone();
+    let const_failed = u.const_failed.clone();
+    let query_errors = tcx.dcx.clone();
+    // the replace: nothing can fail from here
+    u.front.retire_memos();
+    let mut rir = Vec::new();
+    for e in u.fns.iter_mut() {
+        if let Some(r) = e.rir.take() {
+            rir.push(r);
+        }
+        e.build_err = None;
+    }
+    let old = Old {
+        _prog: std::mem::replace(&mut u.prog, prog),
+        _tcx: std::mem::replace(&mut u.tcx, tcx),
+        _lay: std::mem::replace(&mut u.lay, lay),
+        _cache: std::mem::replace(&mut u.cache, Some(Box::new(crate::cache::CacheCell::new(cache)))),
+        _front: std::mem::replace(&mut u.front, std::sync::Arc::new(front)),
+        _const_failed: std::mem::replace(&mut u.const_failed, const_failed),
+        _bodies: std::mem::replace(&mut u.bodies, Default::default()),
+        _old_bodies: std::mem::replace(&mut u.old_bodies, Default::default()),
+        _coro_rir: std::mem::replace(&mut u.coro_rir, Default::default()),
+        _spec_cached: std::mem::replace(&mut u.spec_cached, Default::default()),
+        _unwind_drop_cache: std::mem::replace(&mut u.unwind_drop_cache, Default::default()),
+        _unpin_cache: std::mem::replace(&mut u.unpin_cache, Default::default()),
+        _core_path_cache: std::mem::replace(&mut u.core_path_cache, crate::conc::MemoMap::with_bits(8)),
+        _ctfe_fn_bodies: std::mem::replace(&mut u.ctfe_fn_bodies, Default::default()),
+        _query_errors: std::mem::replace(&mut u.query_errors, query_errors),
+        _rir: rir,
+    };
+    // what Unit::new does with a restored program, again for the new one
+    u.tcx.const_eval_provider = Some(relax_types::const_eval::ConstEvalProvider {
+        context: u.self_ptr.0 as usize, evaluate: const_eval_to_valtree,
+    });
+    u.prog.body_memos.store(true, Ordering::Relaxed);
+    u.tcx.publish_collected();
+    set_shared_front(u, u.core_crate);
+    crate::run::set_diagnostics(u.tcx.dcx.clone());
+    // every thread's compiler memos go at its next access (dropped there, by value)
+    relax_session::memo_local::retire_all();
+    Ok(old)
+}
