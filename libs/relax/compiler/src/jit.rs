@@ -445,6 +445,9 @@ pub struct Unit {
     unpin_cache: crate::conc::MemoMap<TyId, bool>,
     pub errors: Vec<String>,
     pub core_crate: u32,
+    /// This unit's std cfg, not the session target: proc macros share the session
+    /// but compile native core/std and must keep the native runtime helpers.
+    pub(crate) web_target: bool,
     // memory
     exec_base: u64,
     exec_size: u64,
@@ -3001,6 +3004,10 @@ impl Unit {
             for file in 0..prog.file_paths.len() { prog.exec_profile_file(file as u32); }
         }
         let options = &sess.options;
+        let web_target = prog.crates[core_crate as usize].cfg.set.iter().any(|s| s == "relax_web");
+        if web_target {
+            crate::web::activate().expect("reserve web linear memory");
+        }
         let _mem = crate::memstat::tag(crate::memstat::Tag::Unit);
         // One reservation, so code reaches everything of the unit pc-relatively (x64 rel32:
         // +-2 GB; arm64 adrp: +-4 GB): [code (glue, fns)][data][statics][symbol values]. Only
@@ -3119,6 +3126,7 @@ impl Unit {
             query_errors,
             errors: Vec::new(),
             core_crate,
+            web_target,
             exec_base,
             exec_size,
             slots,

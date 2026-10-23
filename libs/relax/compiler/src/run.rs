@@ -1748,7 +1748,7 @@ pub fn progress() -> (String, u32, u32) {
 /// The C-ABI fns carrying `#[no_mangle]` (symbol = the fn's name) or `#[export_name = ".."]` whose
 /// symbol starts with one of `prefixes`. A symbol defined twice is an error: the host would bind
 /// one of the two silently.
-fn exported_fns(prog: &crate::program::Program, prefixes: &[String]) -> Result<Vec<(String, DefId)>, String> {
+pub(crate) fn exported_fns(prog: &crate::program::Program, prefixes: &[String]) -> Result<Vec<(String, DefId)>, String> {
     let mut out: Vec<(String, DefId)> = Vec::new();
     for (di, d) in prog.defs.iter().enumerate() {
         if d.kind != DefKind::Fn {
