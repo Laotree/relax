@@ -7495,6 +7495,8 @@ pub fn rotate_loops(f: &mut Func) {
             nuse[u.0 as usize] += 1;
         }
     }
+    // the loops as they are before any rotation (a rotated latch changes the flow)
+    let loops = natural_loops(f).1;
     // latches ending in a branch whose false edge goes to the header get a new block with the
     // header's copy there (laid out after the latch below)
     let mut added = false;
@@ -7507,6 +7509,18 @@ pub fn rotate_loops(f: &mut Func) {
         let hb = f.blocks[h].clone();
         if hb.insts.len() > 4 || !matches!(hb.term, Term::Branch(..)) {
             continue;
+        }
+        // only a header that exits its loop (LLVM LoopRotate: `L->isLoopExiting(OrigHeader)`):
+        // when both of its edges stay inside (inflate's block loop tests `in_len - in_pos >= 8`
+        // for a fast or a slow refill), the latch's copy enters the loop at either target, the
+        // loop has two entries and is no natural loop any more -- the loop splitter, the
+        // cold-call split and loop depths no longer see it
+        let Term::Branch(_, ht, he) = hb.term else { unreachable!() };
+        // (a header whose own branch an earlier latch rotation sent to a new block is left alone)
+        match loops.iter().find(|(x, _)| *x as usize == h) {
+            Some((_, m)) if (ht as usize) < n && (he as usize) < n && m[ht as usize] != m[he as usize] => {}
+            _ if crate::stats::opt_env_off("-rotexit") => {}
+            _ => continue,
         }
         // header defs must be used only inside the header (they get fresh copies)
         let mut ok = true;
