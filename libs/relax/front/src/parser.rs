@@ -2886,6 +2886,15 @@ impl<'a> Parser<'a> {
             first = false;
             // `...` is last in a C-variadic function: rustc_ast_passes reports it elsewhere
             // only after cfg stripping, so a cfg-stripped function may continue after it
+            if self.kind() == T::DotDotDot && crate::macros::uses::recording() {
+                // parse_param_general: the name is required (fn items, impl items, trait items from
+                // edition 2018; not foreign items): `...` without a pattern is linted
+                let required = self.foreign_abi.is_none() && !(self.in_trait && self.in_assoc > 0 && self.edition < 2018);
+                if required {
+                    let file = self.bctx.as_ref().map_or("", |c| c.path.as_str()).to_string();
+                    crate::macros::uses::varargs_without_pattern(&file, self.tok().lo);
+                }
+            }
             if self.eat(T::DotDotDot) {
                 variadic = true;
                 if self.eat(T::Comma) && self.cfg_out > 0 { continue; }
