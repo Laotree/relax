@@ -279,30 +279,35 @@ pub unsafe fn functions(up: *const Unit) -> Vec<FnCoverage> {
     out
 }
 
-/// Whether a recorded coverage effect ran in any lowering of its source site.
-/// The exporter calls this after execution has finished; build the source-site
-/// union once, then look up each effect without scanning the whole record again.
-pub fn hit(word: u64, mask: u64) -> Option<bool> {
-    static UNION: std::sync::OnceLock<HashMap<(u64, u64), bool>> = std::sync::OnceLock::new();
-    UNION.get_or_init(|| {
-        let record = RECORD.lock().unwrap_or_else(|e| e.into_inner());
-        let mut ran = HashSet::new();
-        for r in &record.ranges {
-            for (b, &pos) in r.pos.iter().enumerate() {
-                let bit = r.bit[b];
-                if r.bits[bit / 64].load(Ordering::Relaxed) & (1 << (bit % 64)) != 0 {
-                    ran.insert((r.unit, r.slot, pos));
-                }
+/// Snapshot the export's probes after all union bodies have been lowered. Other
+/// runs use slot keys and source coordinates, never process-local bitmap addresses.
+/// This does not mark their blocks as executed by the current run.
+pub fn export_hits(u: &Unit, other: &HashMap<String, HashSet<(usize, usize)>>) -> HashMap<(u64, u64), bool> {
+    let record = RECORD.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = HashSet::new();
+    let mut keys = HashMap::new();
+    for r in record.ranges.iter().filter(|r| r.unit == u as *const Unit as usize) {
+        let key = keys.entry(r.slot).or_insert_with(|| crate::jit::slot_key(u, r.slot));
+        let external = other.get(key);
+        for (b, &pos) in r.pos.iter().enumerate() {
+            let bit = r.bit[b];
+            let lc = if pos == 0 { (0, 0) } else {
+                u.prog.files.get(relax_backend::rir::pos_file(pos) as usize)
+                    .map_or((0, 0), |f| f.line_col(pos as u32))
+            };
+            if r.bits[bit / 64].load(Ordering::Relaxed) & (1 << (bit % 64)) != 0
+                || external.is_some_and(|hit| hit.contains(&lc)) {
+                ran.insert((r.unit, r.slot, pos));
             }
         }
-        let mut hits = HashMap::new();
-        for r in &record.ranges {
-            for (b, &pos) in r.pos.iter().enumerate() {
-                let bit = r.bit[b];
-                let word = &r.bits[bit / 64] as *const AtomicU64 as u64;
-                hits.insert((word, 1 << (bit % 64)), ran.contains(&(r.unit, r.slot, pos)));
-            }
+    }
+    let mut hits = HashMap::new();
+    for r in &record.ranges {
+        for (b, &pos) in r.pos.iter().enumerate() {
+            let bit = r.bit[b];
+            let word = &r.bits[bit / 64] as *const AtomicU64 as u64;
+            hits.insert((word, 1 << (bit % 64)), ran.contains(&(r.unit, r.slot, pos)));
         }
-        hits
-    }).get(&(word, mask)).copied()
+    }
+    hits
 }
