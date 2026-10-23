@@ -6552,19 +6552,20 @@ pub fn veneer(target: u64) -> Vec<u8> {
 /// Bytes per count stub (`count_stub`; the stubs of a block are this far apart).
 pub const COUNT_STUB_SIZE: usize = 64;
 
-/// Per-slot call counter (tier-up) at `at` (0: not known yet): while a function runs at O1 its
-/// table slot points here. `*counter -= 1`; on reaching 0 jumps to `hot` (lazy_entry-style glue:
-/// rax = slot, returns the address to continue at), else to the O1 code: `jmp rel32` when in
-/// reach, else through r11. Uses rax and r11 only.
-pub fn count_stub(at: u64, counter: u64, slot: u32, code: u64, hot: u64) -> Vec<u8> {
+/// Per-slot cost budget (tier-up) at `at` (0: not known yet): while a function runs below O3 its
+/// table slot points here. `*budget -= weight` (the call's estimated cost); at or below 0 (signed)
+/// jumps to `hot` (lazy_entry-style glue: rax = slot, returns the address to continue at), else to
+/// the code: `jmp rel32` when in reach, else through r11. Uses rax and r11 only.
+pub fn count_stub(at: u64, counter: u64, slot: u32, code: u64, hot: u64, weight: u32) -> Vec<u8> {
     let mut a = Asm { b: Vec::with_capacity(COUNT_STUB_SIZE), sib: None };
     a.mov_ri(RAX, counter as i64);
-    // sub qword [rax], 1
-    for x in [0x48u8, 0x83, 0x28, 0x01] {
+    // sub qword [rax], imm32
+    for x in [0x48u8, 0x81, 0x28] {
         a.byte(x);
     }
-    // je hot (rel8, patched below)
-    a.byte(0x74);
+    a.u32(weight.min(i32::MAX as u32));
+    // jle hot (rel8, patched below)
+    a.byte(0x7e);
     a.byte(0);
     let je = a.b.len();
     let d = code.wrapping_sub(at + je as u64 + 5) as i64;

@@ -265,7 +265,8 @@ pub struct Options {
     pub spec_hot_from: u8,
     /// `MAKEPAD_RUN_SPEC_TTL_MS`; default `2000`.
     pub spec_ttl_ms: u64,
-    /// `MAKEPAD_RUN_O3_CALLS`; default `2000`.
+    /// `MAKEPAD_RUN_O3_CALLS`; default `2000`: the O3 threshold as the decayed cost of this many
+    /// calls of a small fn (jit.rs Tier1Cfg).
     pub tier1_calls: u64,
     /// `MAKEPAD_RUN_CORE_HINT`; default `None`.
     pub core_hint: Option<bool>,
