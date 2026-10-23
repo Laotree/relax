@@ -184,11 +184,16 @@ impl<'a> Parser<'a> {
                 tg!(&mut g; #close());
             }
             "print" | "println" | "eprint" | "eprintln" => {
+                // std's macros: `{ $crate::io::_print($crate::format_args!(..)); }` -- the statement
+                // ends the format temporaries' lives inside the macro's block
                 let c = self.fmt_call(hi, false)?;
                 let f = if name.starts_with('e') { "_eprint" } else { "_print" };
+                g.open_brace();
                 tg!(&mut g; #std() :: io :: #word(f) #open());
                 self.gen_args(&mut g, c, Vec::new(), Vec::new(), if name.ends_with("ln") { "\n" } else { "" })?;
                 tg!(&mut g; #close());
+                g.punct(T::Semi);
+                g.close_brace();
             }
             "write" | "writeln" => {
                 if self.pos >= hi {
@@ -214,6 +219,9 @@ impl<'a> Parser<'a> {
                     "unimplemented" => "not implemented",
                     _ => "",
                 };
+                // core's panic_2015/panic_2021 arms are blocks `({ ..; })`: the semicolon ends the
+                // format temporaries' lives inside the macro
+                g.open_brace();
                 tg!(&mut g; #core() :: panicking :: panic_at #open());
                 let empty = c.fmt.is_none() && c.first.is_none();
                 if empty {
@@ -229,6 +237,8 @@ impl<'a> Parser<'a> {
                     self.gen_pieces(&mut g, pieces, vec![Src::Nested(inner)], lo)?;
                 }
                 tg!(&mut g; , #caller_location() #close());
+                g.punct(T::Semi);
+                g.close_brace();
             }
             "assert" => {
                 let cond_lo = self.pos;
