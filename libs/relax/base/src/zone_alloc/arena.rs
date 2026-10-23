@@ -1227,10 +1227,11 @@ impl Arena {
     /// class, so a program with 37 threads held 1212 chunks with 166 MB carved (Scope); with huge
     /// pages everywhere, khugepaged turned every one of them into 2 MB resident (2-2.4 GB for 100
     /// MB in use), while huge pages are worth having on dense heap data (Sandbox race UI-thread
-    /// CPU). Each pass marks small chunks at least half full of live blocks, and large blocks of a
-    /// whole 2 MB or more, for huge pages and collapses them at once; a marked small chunk that fell
-    /// under 1/8 live loses its mark (the trim's page release then shrinks it). At most `budget`
-    /// collapses per pass. Returns the collapses done.
+    /// CPU). Each pass marks for huge pages, and collapses at once: a thread's current chunk carved
+    /// at least half way, another small chunk at least half full of live blocks, a large block of a
+    /// whole 2 MB or more. A marked chunk no thread allocates in that fell under 1/8 live loses its
+    /// mark (the trim's page release then shrinks it). At most `budget` collapses per pass.
+    /// Returns the collapses done.
     pub fn densify(&self, budget: usize) -> usize {
         let base = self.base.load(Ordering::Relaxed);
         if !self.dynamic || base == 0 || !os::THP {
@@ -1253,17 +1254,20 @@ impl Arena {
                 }
                 continue;
             }
-            let live = if s.attached && COMPILER {
+            // a thread's current chunk is hot whatever is live in it at this moment (a frame's
+            // temporaries come and go there): carved half way, it is dense enough
+            let attached = s.attached && COMPILER;
+            let dense = if attached {
                 // the owner thread updates it without the lock: a racy, approximate read
-                unsafe { (*h.owned.get()).live.load(Ordering::Relaxed) }
+                unsafe { (*h.owned.get()).bump.load(Ordering::Relaxed) >= CHUNK / 2 }
             } else {
-                h.live.load(Ordering::Relaxed)
-            } * s.stride;
-            if !huge && s.committed == CHUNK && live >= CHUNK / 2 && done < budget {
+                h.live.load(Ordering::Relaxed) * s.stride >= CHUNK / 2
+            };
+            if !huge && s.committed == CHUNK && dense && done < budget {
                 h.huge.store(true, Ordering::Relaxed);
                 unsafe { os::huge_pages(address, CHUNK, true) };
                 done += 1;
-            } else if huge && live < CHUNK / 8 {
+            } else if huge && !attached && h.live.load(Ordering::Relaxed) * s.stride < CHUNK / 8 {
                 h.huge.store(false, Ordering::Relaxed);
                 unsafe { os::huge_pages(address, CHUNK, false) };
             }

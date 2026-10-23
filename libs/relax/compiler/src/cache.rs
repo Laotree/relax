@@ -2835,8 +2835,8 @@ impl Cache {
     /// over what the old one learned about this process: which data objects and slots were
     /// linked from which entries (a second link of the same data object must find its address,
     /// not place a copy), the entries it rejected, the counters, and that the collected program
-    /// was committed (the exit does not encode it again). The old cache's pending entries were
-    /// taken out for writing (`spill_take`): their keys come along in `pending_keys`.
+    /// was committed (the exit does not encode it again). The old cache's recorded entries were
+    /// written to the stores before this one opened them (`spill_take`).
     pub(crate) fn inherit_run_state(&mut self, old: &Cache) {
         self.data_addr = old.data_addr.clone();
         self.const_copy = old.const_copy.clone();
@@ -3167,7 +3167,7 @@ impl Cache {
     /// Indexes the code and data entries this run's spills wrote to this cache's stores
     /// (WRITTEN): the store file is opened again (mapped) and its new entries replace what the
     /// index had for their keys, as the file's own index does.
-    pub(crate) fn index_written(&mut self) {
+    fn index_written(&mut self) {
         let mine: Vec<(PathBuf, Vec<u128>)> = {
             let mut w = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
             // (what stays is another cache's, kept as it was: the list lives in the kept heap)
