@@ -48,7 +48,12 @@ pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
     for i in 0..prog.defs.len() {
         let def = prog.defs[i];
         if !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
-        if lint::generated(prog, DefId(i as u32)) { continue; }
+        if lint::generated(prog, DefId(i as u32)) {
+            // (rustc's wfcheck lints a derive's impl too: its lifetime parameters carry the spans of the
+            // type's own, outside the expansion)
+            if def.kind == DefKind::Impl && lint::derived(prog, DefId(i as u32)) { redundant_lifetimes(prog, tcx, DefId(i as u32)); }
+            continue;
+        }
         attr_lints(prog, DefId(i as u32));
         check_def_item(prog, tcx, DefId(i as u32));
         if matches!(def.kind, DefKind::Fn | DefKind::ForeignFn | DefKind::Impl | DefKind::Trait | DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::TypeAlias | DefKind::Const | DefKind::Static) { lifetime_lints(prog, DefId(i as u32)); }
@@ -2716,6 +2721,12 @@ fn redundant_lifetimes(prog: &Program, tcx: &Tcx, d: DefId) {
         if let (Some(a), Some(b)) = (idx(a), idx(b)) { reach[a][b] = true; }
     }
     for k in 0..n { for i in 0..n { if reach[i][k] { for j in 0..n { if reach[k][j] { reach[i][j] = true; } } } } }
+    // a built-in derive's impl copies the type's generics with their spans (rustc deriving/generic):
+    // its parameter is reported where the type declares it
+    let derived_from = if def.kind == DefKind::Impl && lint::derived(prog, d) {
+        tcx.impl_self.get(&d).and_then(|t| match tcx.tys.kind(*t) { crate::types::TyKind::Adt(a, ..) => Some(*a), _ => None })
+            .map(|a| (prog.def(a).file, names(prog, tcx, a).named_in_scope()))
+    } else { None };
     let mut shadowed = vec![false; n];
     for c in 0..n {
         if shadowed[c] { continue; }
@@ -2724,8 +2735,12 @@ fn redundant_lifetimes(prog: &Program, tcx: &Tcx, d: DefId) {
             let _ = id;
             if !own || !(reach[c][v] && reach[v][c]) { continue; }
             shadowed[v] = true;
-            if lint::external(prog, def.file, span) { continue; }
-            emit(prog, d, &REDUNDANT_LIFETIMES, def.file, span, &format!("unnecessary lifetime parameter `{}`", name));
+            let (file, span) = match &derived_from {
+                Some((f, params)) => match params.iter().find(|p| p.3 && p.1 == *name) { Some(p) => (*f, p.2), None => continue },
+                None => (def.file, span),
+            };
+            if lint::external(prog, file, span) { continue; }
+            emit(prog, d, &REDUNDANT_LIFETIMES, file, span, &format!("unnecessary lifetime parameter `{}`", name));
         }
     }
 }
