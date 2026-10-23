@@ -226,6 +226,15 @@ fn attr_lints(prog: &Program, d: DefId) {
             if bodiless_trait_method { emit("`#[inline]` attribute cannot be used on required trait methods"); }
             else if def.kind == DefKind::ForeignFn { emit("`#[inline]` attribute cannot be used on foreign functions"); }
         }
+        // codegen_attrs.rs ColdParser: AllowListWarnRest (fns, methods with a body, foreign fns, closures)
+        if name == b"cold" {
+            if item.is_none() { continue; }
+            if let Some((what, fn_like, trait_fn_no_body, _)) = crate::item_checks::attribute_target(prog, d) {
+                if trait_fn_no_body || !fn_like {
+                    emit(&format!("`#[cold]` attribute cannot be used on {}", if trait_fn_no_body { "required trait methods" } else { what }));
+                }
+            }
+        }
     }
     attr_checks(prog, &AttrNode { d, inner: &[], attrs: &all, is_crate: is_root, macro_use_target: is_root || named_mod });
 }
@@ -1153,6 +1162,15 @@ impl<'a> W<'a> {
                 // the lint attributes of an expression statement survive cfg stripping
                 let attrs = ast.stmt_attrs(e);
                 self.enter(attrs);
+                // codegen_attrs.rs ColdParser (AllowListWarnRest): an expression is no target of `#[cold]`
+                if self.lt.is_none() && !matches!(self.kind(e), ExprKind::Closure(..)) {
+                    for a in ast.list(attrs) {
+                        if a.toks.hi > a.toks.lo && lint::attr_path(self.prog, self.file, a) == b"cold" {
+                            let pos = attr_pos(self.pf, a);
+                            if !lint::external(self.prog, self.file, pos) { emit(self.prog, self.def, &UNUSED_ATTRIBUTES, self.file, pos, "`#[cold]` attribute cannot be used on expressions"); }
+                        }
+                    }
+                }
                 // (`#[cfg(..)]` stays on the node in rustc: a value with attributes is not linted)
                 if !semi && attrs.len() == 0 { self.both(e, Ctx::BlockRetValue, false); }
                 self.expr(e);

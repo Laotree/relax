@@ -1464,12 +1464,32 @@ pub fn assoc_const_elision(prog: &Program, d: DefId) -> Vec<String> {
 /// plural target name when the attribute is not allowed on definition `d`.
 fn attribute_target_error(prog: &Program, d: DefId, name: &[u8]) -> Option<&'static str> {
     use crate::program::DefKind as K;
+    let def = prog.def(d);
+    let (what, fn_like, trait_fn_no_body, static_like) = attribute_target(prog, d)?;
+    let ok = match name {
+        // Fn, Method, Closure, Delegation (+ Warn: trait fn without body, foreign fn, assoc const, ...)
+        b"inline" => fn_like || def.kind == K::AssocConst,
+        b"track_caller" => fn_like,
+        b"target_feature" => fn_like && def.kind != K::ForeignFn && !trait_fn_no_body,
+        b"used" => def.kind == K::Static,
+        b"export_name" => static_like && def.kind == K::Static || (fn_like && def.kind != K::ForeignFn && !trait_fn_no_body),
+        b"debugger_visualizer" => def.kind == K::Mod,
+        b"link_ordinal" => matches!(def.kind, K::ForeignFn | K::ForeignStatic),
+        b"proc_macro" | b"proc_macro_attribute" | b"proc_macro_derive" => def.kind == K::Fn,
+        _ => return None,
+    };
+    if ok { None } else { Some(what) }
+}
+
+/// rustc_hir `Target` of an item definition: (plural name, is a fn-like target, is a trait fn without body,
+/// is static-like).
+pub(crate) fn attribute_target(prog: &Program, d: DefId) -> Option<(&'static str, bool, bool, bool)> {
+    use crate::program::DefKind as K;
     use crate::ast::ItemKind;
     let def = prog.def(d);
     let ast = &prog.files[def.file as usize].ast;
     let item = ast.item(def.item);
-    // (plural name, is a fn-like target with/without body, is static-like ...)
-    let (what, fn_like, trait_fn_no_body, static_like): (&'static str, bool, bool, bool) = match def.kind {
+    Some(match def.kind {
         K::Fn | K::AssocFn => {
             let body = matches!(item.kind, ItemKind::Fn(_, Some(_), _));
             let in_trait = def.kind == K::AssocFn && prog.def(def.parent).kind == K::Trait;
@@ -1489,20 +1509,7 @@ fn attribute_target_error(prog: &Program, d: DefId, name: &[u8]) -> Option<&'sta
         K::AssocTy => ("associated types", false, false, false),
         K::Mod => ("modules", false, false, false),
         _ => return None,
-    };
-    let ok = match name {
-        // Fn, Method, Closure, Delegation (+ Warn: trait fn without body, foreign fn, assoc const, ...)
-        b"inline" => fn_like || def.kind == K::AssocConst,
-        b"track_caller" => fn_like,
-        b"target_feature" => fn_like && def.kind != K::ForeignFn && !trait_fn_no_body,
-        b"used" => def.kind == K::Static,
-        b"export_name" => static_like && def.kind == K::Static || (fn_like && def.kind != K::ForeignFn && !trait_fn_no_body),
-        b"debugger_visualizer" => def.kind == K::Mod,
-        b"link_ordinal" => matches!(def.kind, K::ForeignFn | K::ForeignStatic),
-        b"proc_macro" | b"proc_macro_attribute" | b"proc_macro_derive" => def.kind == K::Fn,
-        _ => return None,
-    };
-    if ok { None } else { Some(what) }
+    })
 }
 
 /// rustc_codegen_ssa / rustc_monomorphize: two definitions of the checked crates that export
