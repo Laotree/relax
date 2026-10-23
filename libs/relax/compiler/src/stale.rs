@@ -236,6 +236,10 @@ fn start_watcher() {
                         handle(rec);
                     }
                 }
+                let held = std::mem::take(&mut *HELD.lock().unwrap_or_else(|e| e.into_inner()));
+                for h in held {
+                    handle_held(h);
+                }
             }
         });
         if let Err(e) = spawned {
@@ -260,6 +264,89 @@ fn wait() {
 /// Somebody can answer a parked stale access: the Run panel, an inspect watcher or agent.
 fn decidable() -> bool {
     std::env::var_os("MAKEPAD_RUN_STALE_PARK").is_some_and(|v| v != "0") || crate::inspect::events::can_decide()
+}
+
+/// A thread held for good without a fault (`park_held`), waiting for the watcher's report.
+struct Held {
+    os_id: u64,
+    /// its stack: pc, then return addresses (inspect capture order)
+    frames: Vec<u64>,
+    /// the frame that is in retired code (index into `frames`; usize::MAX: the word at sp)
+    at: usize,
+    /// "slot #12 `work::step` v1 code [0x.., 0x..)"
+    what: String,
+    /// why that code never runs again
+    reason: String,
+    /// false: it could not be held (the process ends after the report)
+    held: bool,
+}
+
+static HELD: relax_session::sync::Mutex<Vec<Held>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// A program thread with a frame in code that never runs again, but that this code is not
+/// protected against (a slot's first code shares its pages with other code: invalid.rs): a
+/// layout-changing patch found it in the stacks it captured while the program was paused, and
+/// holds it for good (inspect::instrument::hold_for_good) instead of letting it return there.
+/// Reported as a stale access is -- stderr, the flight recorder, `stale`, `panics`, the Run panel
+/// with `restart` | `stop` -- but there was no fault: the report is the captured stack. Returns at
+/// once (the watcher thread reports and waits for the decision). `held` false: the thread could
+/// not be held; the process ends after the report (it must not run that code).
+pub fn park_held(os_id: u64, frames: Vec<u64>, at: usize, what: String, reason: String, held: bool) {
+    start_watcher();
+    crate::inspect::flightrec::event("stale.held", &format!("tid {}: frame in {}: {}", os_id, what, reason), os_id, frames.get(at).copied().unwrap_or(0));
+    crate::zone_alloc::kept_with(|| HELD.lock().unwrap_or_else(|e| e.into_inner()).push(Held { os_id, frames, at, what, reason, held }));
+    #[cfg(unix)]
+    {
+        let w = WAKE_W.load(Ordering::Acquire);
+        if w >= 0 {
+            let _ = unsafe { write(w, b"h".as_ptr(), 1) };
+        }
+    }
+}
+
+fn handle_held(h: Held) {
+    let pc = h.frames.first().copied().unwrap_or(0);
+    let raw: Vec<u64> = h.frames.iter().skip(1).copied().collect();
+    let frames = crate::jit::stale_frames(pc, &raw);
+    let thread = crate::inspect::threads::list().into_iter().find(|t| t.os_id == h.os_id).map(|t| t.name.clone()).unwrap_or_else(|| h.os_id.to_string());
+    let frame = if h.at == usize::MAX { "the return address at its sp".to_string() } else { format!("frame #{}", h.at) };
+    let message = format!(
+        "stale access on a stack (no fault): thread `{}` (tid {}) has {} in {}: code that never runs again ({}); the thread is held where it was, nothing unwound",
+        thread, h.os_id, frame, h.what, h.reason
+    );
+    let report = crate::jit::stale_report(&message, &frames, frames.get(h.at.min(frames.len().saturating_sub(1))).copied().unwrap_or(0));
+    eprintln!("makepad: {}\n  report: {}", message, report);
+    crate::inspect::flightrec::fault_dump(&format!("stale.held tid {} {}", h.os_id, h.what));
+    let verdict = format!(
+        "stale access on a stack: thread `{}` (tid {}) {} at a layout-changing patch: its {} is in {} ({}). HOW: frame in first-version code at a layout patch (this code shares pages with other code, so it is not made inaccessible: the pause found the frame in the captured stacks and holds the thread before it returns there). {}",
+        thread,
+        h.os_id,
+        if h.held { "is held" } else { "could NOT be held" },
+        frame,
+        h.what,
+        h.reason,
+        if h.held { "The app paused" } else { "The process ends" }
+    );
+    eprintln!("makepad: {}", verdict);
+    crate::zone_alloc::kept_with(|| ANSWERS.lock().unwrap_or_else(|e| e.into_inner()).push((verdict.clone(), report.clone())));
+    if !h.held {
+        eprintln!("makepad: the thread could not be held: the process ends (it must not run that code)");
+        crate::os::fault::die_by(11);
+    }
+    if !decidable() {
+        eprintln!("makepad: nobody can decide on the stale access (no Run panel, inspect watcher or agent; MAKEPAD_RUN_STALE_PARK=1 parks): the process ends");
+        crate::os::fault::die_by(11);
+    }
+    crate::inspect::start("stale-access");
+    let paused = crate::inspect::instrument::pause_program();
+    eprintln!("makepad: the app is paused ({} threads held) -- decide: makepad inspect {} resume <id> restart | stop (the Run panel offers both)", paused, std::process::id());
+    // (no app domain: the held thread's domain is not known, so `restart` restarts the process)
+    let decision = crate::inspect::events::park_stale(h.os_id, None, &message, &frames);
+    if decision == crate::inspect::events::StaleDecision::Stop {
+        eprintln!("makepad: stale access on a stack: stopped");
+        crate::os::fault::die_by(11);
+    }
+    restart_process();
 }
 
 fn handle(rec: &Rec) {

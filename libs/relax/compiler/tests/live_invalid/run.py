@@ -15,6 +15,12 @@ Copies pkg/ to a temporary dir, runs it live with MAKEPAD_RUN_STALE_PARK=1 and e
                                                 -> REVERTED: its code is invalidated
   6. free the worker                            -> parked again (reason: the borrow checker)
   7. resume stop                                -> the process ends by the signal
+Then a second run from the base source (INVALID2: first-version code at a layout patch):
+  8. "hold0": the worker blocks inside step's FIRST version (gen 0: shared pages, never PROT_NONE)
+  9. layout edit                                -> the patch pauses the program, finds the worker's
+                                                 frame in the replaced gen-0 step and holds it for
+                                                 good: reported (stale, panics), the app waits
+ 10. resume restart                             -> the process starts again on the current source
 Prints PASS/FAIL per step; exit 1 on any FAIL.
 """
 import os, re, shutil, subprocess, sys, tempfile, threading, time
@@ -27,13 +33,16 @@ shutil.copytree(os.path.join(HERE, "pkg"), pkg)
 work = os.path.join(pkg, "src", "work.rs")
 base = open(work).read()
 env = dict(os.environ, MAKEPAD_RUN_CACHE="0", MAKEPAD_RUN_STALE_PARK="1")
-p = subprocess.Popen([mk, "run", "--quiet", "relax-live-invalid"], cwd=pkg, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 out, err = [], []
 def pump(f, acc):
     for line in f:
         acc.append(line.rstrip("\n"))
-threading.Thread(target=pump, args=(p.stdout, out), daemon=True).start()
-threading.Thread(target=pump, args=(p.stderr, err), daemon=True).start()
+def launch():
+    global p
+    p = subprocess.Popen([mk, "run", "--quiet", "relax-live-invalid"], cwd=pkg, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    threading.Thread(target=pump, args=(p.stdout, out), daemon=True).start()
+    threading.Thread(target=pump, args=(p.stderr, err), daemon=True).start()
+launch()
 
 def wait(pred, secs=30):
     t = time.time()
@@ -146,6 +155,40 @@ try:
     inspect("resume", pid2 or "P0", "stop")
     ok = wait(lambda: p.poll() is not None, 30)
     step("resume stop ends the process (status %s)" % p.poll(), ok and p.poll() != 0)
+    # 8. a second run from the base source: the worker blocks inside step's first version
+    save(base)
+    n_out, n_err = len(out), len(err)
+    launch()
+    step("second run starts", wait(lambda: since(out, n_out, r"^out tick 0 10$"), 180))
+    n_out = len(out)
+    send("hold0")
+    step("hold0: the worker blocks inside step's first version (gen 0)", wait(lambda: since(out, n_out, r"^out parked \d+$")))
+    # 9. a layout edit replaces it while the worker's frame is in it: held at the patch
+    n_err = len(err)
+    layout0 = base.replace("    pub a: u64,\n", "    pub a: u64,\n    pub b: u64,\n").replace("State { a: 1 }", "State { a: 1, b: 0 }").replace("""    s.a = s.a.wrapping_add(n & 1);
+    10""", """    s.b = s.b.wrapping_add(1);
+    s.a = s.a.wrapping_add(n & 1);
+    30""")
+    save(layout0)
+    ok = wait(lambda: parked_id(n_err) is not None, 60)
+    pid3 = parked_id(n_err)
+    step("the layout patch holds the worker (frame in gen-0 step) (%s)" % pid3, ok and since(err, n_err, r"stale access on a stack: thread .* is held at a layout-changing patch") and since(err, n_err, "patched"), "\n".join(err[n_err:][-30:]))
+    told = inspect("stale")
+    step("stale: HOW frame in first-version code at a layout patch, the slot, the layout patch, stacks",
+         "HOW: frame in first-version code at a layout patch" in told and "work::step" in told and "first-version code" in told and "layout-changing patch gen 1" in told and "every thread's stack" in told, told)
+    listed = inspect("panics")
+    step("listed as a parked stale access", (pid3 or "?") in listed and "stale access" in listed, listed)
+    n_out = len(out)
+    send("free")
+    time.sleep(0.5)
+    step("the held worker never runs on (freed, it stays held: no tick, no exit)", p.poll() is None and not since(out, n_out, r"^out tick"), "\n".join(out[n_out:]))
+    # 10. restart: the process runs again from the current source
+    n_out, n_err = len(out), len(err)
+    r = inspect("resume", pid3 or "P0", "restart")
+    ok = wait(lambda: since(out, n_out, "^out start$") and since(out, n_out, r"^out tick \d+ 30$"), 180)
+    step("resume restart: the process starts again on the current source", ok and "process restart" in r, r + "\n".join(err[n_err:][-20:]))
+    send("quit")
+    wait(lambda: p.poll() is not None, 30)
 finally:
     if p.poll() is None:
         p.kill()

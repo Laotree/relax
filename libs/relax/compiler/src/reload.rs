@@ -450,6 +450,16 @@ pub unsafe fn rollback(up: *mut Unit, undo: Undo, why: &str) -> Vec<String> {
         jit::bump_patch_epoch();
         let ids = u.rollback_gen(undo.group);
         let group = undo.group;
+        // code built after the patch that inlined its bodies is in its group (invalid::group_of);
+        // RIR built meanwhile that took them in and has no code yet is dropped (built anew from
+        // the restored source)
+        for &id in &ids {
+            for d in u.fns[id as usize].history().inlined_into.clone() {
+                if !u.fns[d as usize].compiled {
+                    u.fns[d as usize].rir = None;
+                }
+            }
+        }
         crate::invalid::invalidate(u, |g| g.gen() == group, group, "invalidated code", None, &format!("patch gen {} rolled back: {}", group, why));
         let names = ids.iter().map(|id| u.fns[*id as usize].name.to_string()).collect();
         {
@@ -3276,6 +3286,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let u = &mut *up;
     let gen = u.begin_patch();
     out.group = gen;
+    crate::zone_alloc::kept_with(|| for &(_, n) in &news { u.file_gen.insert(n, gen); });
     let mut rebind_code: Vec<(u32, Code)> = Vec::new();
     for (o, n) in &rebind {
         let c = pre.iter().find(|(id, _)| id == n).and_then(|(_, r)| r.as_ref().ok()).or_else(|| staged.iter().find(|(id, _)| id == n).map(|(_, c)| c));
@@ -3283,6 +3294,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             rebind_code.push((*o, c.clone()));
         }
     }
+    // a layout-changing patch: the program threads stand still while it installs, so their stacks
+    // show every frame in code it replaces (invalid::hold_old_frames, after the install)
+    let paused = !saved_adts.is_empty() && crate::inspect::instrument::pause_for_patch();
     for (id, r) in pre {
         match r {
             Ok(c) => {
@@ -3321,11 +3335,16 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     }
     // a layout-changing patch: the earlier patch versions of the slots it rebuilt were built for the
     // old fields or variants and never run again (invalid.rs; a slot's first code shares pages with
-    // other code and is not invalidated: only frames live at the patch can still reach it)
+    // other code and is not invalidated: only frames live at the patch can still reach it, and their
+    // threads are held for good, found in the stacks captured while the program is paused)
     if !layout_names.is_empty() {
         let rebuilt: std::collections::HashSet<u32> = u.patch_log.iter().filter(|(_, g)| *g == gen).map(|(id, _)| *id).collect();
         let why = format!("layout-changing patch gen {} (fields or variants of {}) replaced it: code built for the old layout never runs again", gen, layout_names.join(", "));
         crate::invalid::invalidate(u, |g| matches!(g, crate::invalid::Group::Patch { slot, gen: g0 } if g0 < gen && rebuilt.contains(&slot)), gen, "invalidated code", None, &why);
+        let held = crate::invalid::hold_old_frames(u, gen, &layout_names.join(", "), paused);
+        if held > 0 {
+            out.lines.push(format!("held: {} thread(s) with a frame in the first-version code of a rebuilt fn (makepad inspect {} stale; resume restart | stop)", held, std::process::id()));
+        }
     }
     let u = &mut *up;
     u.reload_rir = None;

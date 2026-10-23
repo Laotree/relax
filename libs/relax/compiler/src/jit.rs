@@ -477,6 +477,9 @@ pub struct Unit {
     pub stats: Stats,
     pub patch_log: Vec<(u32, u32)>, // (slot, generation)
     pub patch_gen: u32,
+    /// file version -> the patch generation that made it (invalid.rs: code built later from a
+    /// version's source is that generation's code)
+    pub file_gen: crate::fxhash::HashMap<u32, u32>,
     /// bytes of the per-thread block handed out by `tls_alloc`
     pub tls_next: u32,
     /// panicking stand-ins for foreign fns this host lacks, by symbol
@@ -3313,6 +3316,7 @@ impl Unit {
             stats: Stats::default(),
             patch_log: Vec::new(),
             patch_gen: 0,
+            file_gen: Default::default(),
             // slot 0 of the block: the thread's domain static block (domain.rs)
             tls_next: TLS_FIRST_FREE,
             missing_stubs: Default::default(),
@@ -4721,7 +4725,7 @@ impl Unit {
     }
 
     /// The source file of a slot keyed `key` (0: none).
-    fn key_file(&self, key: &FnKey) -> u32 {
+    pub(crate) fn key_file(&self, key: &FnKey) -> u32 {
         match key {
             FnKey::Inst(d, _) => self.prog.def(*d).file,
             FnKey::Closure(f, _, _) => *f,
@@ -5916,7 +5920,7 @@ impl Unit {
         let redirect = if interp || options.no_codegen { Some(self.no_codegen_target(code, relocs, &self.fns[id as usize].name)?) } else { None };
         // (code is append-only: a replaced version stays mapped, twins' too; code that may be
         // invalidated -- a patch generation's, a module's -- has pages of its own: invalid.rs)
-        let group = if redirect.is_none() { crate::invalid::group_of(self, id, gen) } else { None };
+        let group = if redirect.is_none() { crate::invalid::group_of(self, id, gen, &[]) } else { None };
         let at = match redirect {
             Some(t) => t,
             None => self.emit_grouped(group, code, relocs)?,
@@ -15641,7 +15645,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let ok = match built {
             Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, frame_size, self_call, nounwind_used, profile_entry)))) if PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && (!crate::inspect::instrument::active(id) || inspect_o3_on())
                 // (code of an invalidated group -- an unloaded module's -- is never built again)
-                && crate::invalid::group_of(u, id, 0).map_or(true, |g| !crate::invalid::is_dead(u, g)) && {
+                && crate::invalid::group_of(u, id, 0, &inlined).map_or(true, |g| !crate::invalid::is_dead(u, g)) && {
                 let n = if relax_codegen::interp::blob::is_blob(&code) { code.len() } else { relax_backend::rir::split_unwind_info(&code).0 };
                 let tl = cpu_ns();
                 let ok = u.link_check(&code[..n], &relocs);
@@ -15705,6 +15709,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     u.stats.tier1_installed += 1;
                     TIER1_INSTALLS.fetch_add(1, Ordering::Relaxed);
                     crate::boot_stats::o3_installed(boot_arm(u, id), id);
+                    // (what it inlined is what its code took in: its group follows their
+                    // generation, invalid::group_of)
+                    note_body_deps(u, id, inlined.iter().copied());
                     let a = {
                         let _as = code_as(CodeKind::new(if speculative { tier::GUARDED } else { tier::O3 }, origin::FRESH));
                         install_compiled(up, id, &code, map, &relocs, false)
@@ -15723,7 +15730,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 let code = code[..n].to_vec();
                 let u = &mut *up;
                 let te = cpu_ns();
-                let o3_group = if blob { None } else { crate::invalid::group_of(u, id, 0) };
+                let o3_group = if blob { None } else { crate::invalid::group_of(u, id, 0, &inlined) };
                 let at = if blob {
                     u.emit_or_redirect(&code, &relocs, "O3").expect("O3 interpreted code installs")
                 } else {

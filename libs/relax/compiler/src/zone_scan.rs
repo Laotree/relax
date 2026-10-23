@@ -317,6 +317,8 @@ pub(crate) fn kept_scan(u: &Unit) -> Vec<(&'static str, usize)> {
     }
     a.field("patch_log");
     a.vec(&u.patch_log);
+    a.field("file_gen");
+    a.map(&u.file_gen, |_, _, _| {});
     a.field("cold_users");
     a.map(&u.cold_users, |a, _, v| a.vec(v));
     a.field("retiers");
