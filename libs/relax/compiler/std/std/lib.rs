@@ -131,4 +131,5 @@ pub mod thread;
 pub mod time;
 // ---- end std-os modules ----
 /// Relax-only: run-time modules (hot-reload lane)
+#[cfg(not(relax_web))]
 pub mod relax;
