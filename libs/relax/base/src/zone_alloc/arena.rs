@@ -620,6 +620,16 @@ mod os {
         crate::memstat::name_mapping(base, size, label);
         base
     }
+    /// Linux with transparent huge pages "always": the first touch of a 2 MB-aligned chunk
+    /// faults in a whole huge page, so a chunk with a few KB carved (or a few survivors after
+    /// `release`) stays 2 MB resident. Relax's own arenas opt out (Scope cold, x64: 2 GB of
+    /// AnonHugePages; the compiler mapping 1.36 GB resident for 254 MB carved). Other targets: nothing.
+    pub unsafe fn no_huge_pages(base: usize, size: usize) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        madvise(base as *mut c_void, size, 15); // MADV_NOHUGEPAGE
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let _ = (base, size);
+    }
     /// Reserves exactly `[at, at + size)`, or nothing (0): never moved, never over a mapping.
     pub unsafe fn reserve_at(at: usize, size: usize, label: &'static std::ffi::CStr) -> usize {
         // Linux: MAP_FIXED_NOREPLACE; macOS has none: the hint, kept only when it was honoured
@@ -685,6 +695,7 @@ mod os {
 #[cfg(windows)]
 mod os {
     use relax_session::win32::{MemoryBasicInformation, VirtualAlloc, VirtualFree, VirtualQuery};
+    pub unsafe fn no_huge_pages(_base: usize, _size: usize) {}
     pub unsafe fn reserve(size: usize, align: usize, _label: &'static std::ffi::CStr) -> usize {
         let raw = VirtualAlloc(std::ptr::null_mut(), size + align, 0x2000, 1) as usize;
         if raw == 0 {
@@ -1026,16 +1037,18 @@ impl Arena {
             let mut tried = lock(&self.init);
             if !*tried {
                 *tried = true;
-                self.base.store(
-                    unsafe {
-                        if WEB_AT != 0 {
-                            os::reserve_at(WEB_AT, RESERVE, LABEL)
-                        } else {
-                            os::reserve(RESERVE, CHUNK, if self.dynamic { c"makepad-run-domain" } else { LABEL })
-                        }
-                    },
-                    Ordering::Release,
-                );
+                let base = unsafe {
+                    if WEB_AT != 0 {
+                        os::reserve_at(WEB_AT, RESERVE, LABEL)
+                    } else {
+                        os::reserve(RESERVE, CHUNK, if self.dynamic { c"makepad-run-domain" } else { LABEL })
+                    }
+                };
+                // the compiler and burst arenas (a domain heap is the program's: as its malloc)
+                if base != 0 && !self.dynamic {
+                    unsafe { os::no_huge_pages(base, RESERVE) };
+                }
+                self.base.store(base, Ordering::Release);
             }
         }
         self.base.load(Ordering::Relaxed) != 0
