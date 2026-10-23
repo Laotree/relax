@@ -177,29 +177,41 @@ struct Counts {
     tys: usize,
     regions: (usize, usize),
     syms: usize,
-    /// (late symbols, list arena words, interned constants): appended through shared
-    /// references, so only their counts show that the encode off the pause missed one
-    late: (usize, usize, usize),
+    late_syms: usize,
+    /// (list arena words, interned constants): with `tys` and `regions` the interners, which
+    /// grow through shared references while compiles run (the restore tops them up: `same_program`)
+    lists: (usize, usize),
+}
+
+impl Counts {
+    /// Equal but for the interners: the restored image, whose interner rows stop at its encode's
+    /// count, plus the rows interned since (Types::top_up_from) is this program, if no front write
+    /// came between (the epoch).
+    fn same_program(&self, o: &Counts) -> bool {
+        (self.defs, self.files, self.crates, self.mods, self.syms, self.late_syms) == (o.defs, o.files, o.crates, o.mods, o.syms, o.late_syms)
+            && self.tys <= o.tys && self.regions.0 <= o.regions.0 && self.regions.1 <= o.regions.1 && self.lists.0 <= o.lists.0 && self.lists.1 <= o.lists.1
+    }
 }
 
 /// The counts of the program the store's collected image describes (set when this run restored
 /// or recorded it, and by each swap): equal counts later mean nothing was added since, and the
 /// swap restores without encoding again. The optional entry names a kept, swap-only image;
 /// None names the boot image, whose counts are recorded only before runtime crates arrive.
-static IMAGE: relax_session::sync::Mutex<Option<(Counts, Option<crate::cache::CollectedWritten>)>> = relax_session::sync::Mutex::new(None);
+/// The front-write epoch (jit::front_epoch) goes with the counts: equal counts and epoch with
+/// interners that only grew mean the image plus a top-up is the program.
+static IMAGE: relax_session::sync::Mutex<Option<(Counts, u64, Option<crate::cache::CollectedWritten>)>> = relax_session::sync::Mutex::new(None);
 
 pub(crate) fn note_image(prog: &Program, tcx: &Tcx) {
     // A mid-run writer may publish the frozen boot after runtime crates were appended.
     // Its image then describes the boot snapshot, not these live counts.
     if RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
-        *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some((counts(prog, tcx), None));
+        *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some((counts(prog, tcx), front_epoch(), None));
     }
 }
 
 fn counts(prog: &Program, tcx: &Tcx) -> Counts {
-    let (words, consts) = tcx.tys.list_const_counts();
     Counts { defs: prog.defs.len(), files: prog.files.len(), crates: prog.crates.len(), mods: prog.mods.len(), tys: tcx.tys.len(), regions: tcx.tys.region_counts(), syms: prog.syms.len(),
-        late: (prog.syms.late_len(), words, consts) }
+        late_syms: prog.syms.late_len(), lists: tcx.tys.list_const_counts() }
 }
 
 /// Counts equal, and rows sampled across the tables: a restore that renumbered anything shows
@@ -400,8 +412,8 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
         Ok(s) => s,
         Err(e) => return abort(format!("prepare: {e}")),
     };
-    if now != before || epoch_now != epoch {
-        return abort(format!("the program changed after the encode ({})", if epoch_now != epoch { "a front write" } else { "an intern" }));
+    if !before.same_program(&now) || epoch_now != epoch {
+        return abort(format!("the program changed after the encode ({})", if epoch_now != epoch { "a front write" } else { "definitions, files or symbols" }));
     }
     if let Some(s) = spill {
         if let Err(e) = s.write() {
@@ -437,7 +449,7 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
             taken.put_back();
             return abort(format!("macro registry: {e}"));
         }
-        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(up, &options, mode, &pre, &extra, swap_image.as_ref(), &late, before, &mut tl)));
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(up, &options, mode, &pre, &extra, swap_image.as_ref(), &late, now, &mut tl)));
         match built {
             Ok(Ok(f)) => f,
             Ok(Err(e)) => {
@@ -469,7 +481,7 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     tl.commit = ms(t);
     trace("commit done");
     crate::zone_alloc::kept_with(|| {
-        *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some((before, swap_image.clone()));
+        *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some((before, epoch, swap_image.clone()));
     });
     tl.chunks = chunks;
     tl.touched = touched;
@@ -518,8 +530,9 @@ unsafe fn prepare(up: *mut Unit) -> Result<(Option<crate::cache::Spill>, Counts,
 /// The collected image of the program now, encoded on this thread under a front read with the
 /// job gate open, and committed to the store: (its counts, the front-write epoch it was read at,
 /// the swap-only image when runtime crates exist). Unless the store's image is current already
-/// (IMAGE): then nothing is encoded. The encode stops when a front writer waits, and is dropped
-/// when an interner grew during it (a row or bucket head past the counts read at its start).
+/// (IMAGE): then nothing is encoded. The encode stops when a front writer waits. Interners may
+/// grow during it: the image holds the rows up to the count read at its start, and the restore
+/// tops them up from the paused program (Types::top_up_from).
 fn encode_off(up: *mut Unit, pre: &[crate::preload::PreCrate], extra: &[crate::preload::PreCrate]) -> Result<(Counts, u64, Option<crate::cache::CollectedWritten>), String> {
     // the cache's fields, copied by the owner (the cache is owner-only state)
     let inputs = owner::publish(|| unsafe { (*up).cache.as_ref().map(|c| c.collected_inputs()) }).ok_or("no cache")?;
@@ -532,19 +545,19 @@ fn encode_off(up: *mut Unit, pre: &[crate::preload::PreCrate], extra: &[crate::p
     if pre.len() + extra.len() != before.crates {
         return Err(format!("recipe has {} crates, program has {}", pre.len() + extra.len(), before.crates));
     }
-    let saved = IMAGE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|(c, _)| *c == before).map(|(_, image)| crate::zone_alloc::kept_clone(image));
+    let saved = IMAGE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|(c, e, _)| *e == epoch && c.same_program(&before))
+        .map(|(c, _, image)| (*c, crate::zone_alloc::kept_clone(image)));
     if saved.is_none() {
-        if let Some((c, _)) = IMAGE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            trace(&format!("the collected image is not current: its counts {c:?}, now {before:?}"));
+        if let Some((c, e, _)) = IMAGE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            trace(&format!("the collected image is not current: its counts {c:?} (front epoch {e}), now {before:?} (epoch {epoch})"));
         }
     }
-    if let Some(image) = saved {
-        trace("the collected image is current: not encoded again");
-        return Ok((before, epoch, image));
+    if let Some((c, image)) = saved {
+        trace("the collected image is current (the restore tops up the interners): not encoded again");
+        return Ok((c, epoch, image));
     }
     let stop = || crate::preempt::writer_waiting() || crate::preempt::is_stopped();
     let encoded = inputs.encode_now(&u.prog, &u.tcx, pre, extra, &stop);
-    let after = counts(&u.prog, &u.tcx);
     drop(front);
     let (dest, payload) = match encoded {
         crate::cache::CollectedRecord::Ready(dest, payload) => (dest, payload),
@@ -552,11 +565,9 @@ fn encode_off(up: *mut Unit, pre: &[crate::preload::PreCrate], extra: &[crate::p
         crate::cache::CollectedRecord::Yielded => return Err("yielded to a front writer".into()),
         crate::cache::CollectedRecord::Failed => return Err("the program is not recordable (see MAKEPAD_RUN_BOOT_TRACE)".into()),
     };
-    if after != before {
-        return Err("the program grew during the encode".into());
-    }
+    let t = Instant::now();
     let written = crate::cache::Cache::commit_collected(None, dest, payload).ok_or("the collected image could not be written")?;
-    trace("encoded and stored");
+    trace(&format!("encoded and stored (store {:.1} ms)", ms(t)));
     Ok((before, epoch, if extra.is_empty() { None } else { Some(crate::zone_alloc::kept_clone(&written)) }))
 }
 
@@ -564,12 +575,17 @@ fn encode_off(up: *mut Unit, pre: &[crate::preload::PreCrate], extra: &[crate::p
 /// compiler phase of generation g+1). The running state is only read.
 fn build(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: crate::cache::Mode,
     pre: &[crate::preload::PreCrate], extra: &[crate::preload::PreCrate], swap_image: Option<&crate::cache::CollectedWritten>,
-    late: &[(String, u8, String, u128)], before: Counts, tl: &mut Timeline) -> Result<Fresh, String> {
+    late: &[(String, u8, String, u128)], now: Counts, tl: &mut Timeline) -> Result<Fresh, String> {
     let u = unsafe { &*up };
     trace("build: opening the images");
     let images = crate::cache::FrontImages::open(&sess.options).ok_or("the front images cannot be opened")?;
     trace("build: restoring");
-    let (prog, tcx, collected) = crate::run::warm_front(&images, sess, pre, extra, swap_image).ok_or("the collected image was not restored")?;
+    let (prog, mut tcx, collected) = crate::run::warm_front(&images, sess, pre, extra, swap_image).ok_or("the collected image was not restored")?;
+    // the types interned since the image was encoded (compiles ran meanwhile): copied from the
+    // paused program, so ids and chains are its own
+    let t = Instant::now();
+    tcx.tys.top_up_from(&u.tcx.tys).ok_or("the image holds more types than the program")?;
+    trace(&format!("build: interners topped up in {:.1} ms", ms(t)));
     for (c, kind, name, hash) in late {
         let content = if *kind == crate::sip::LATE_FILE { crate::vfs::read(name).ok() }
             else { crate::crates::crate_env_named(c, name).map(String::into_bytes) };
@@ -580,8 +596,8 @@ fn build(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: crate::cach
     crate::program::share_std_end();
     let collected = collected.ok_or("only a prefix of the program was restored")?;
     let after = counts(&prog, &tcx);
-    if after != before {
-        return Err(format!("counts differ: running {before:?}, restored {after:?}"));
+    if after != now {
+        return Err(format!("counts differ: running {now:?}, restored {after:?}"));
     }
     compare((&u.prog, &u.tcx), (&prog, &tcx))?;
     trace("build: compared");

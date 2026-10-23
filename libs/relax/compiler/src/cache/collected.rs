@@ -22,6 +22,26 @@ pub struct CollectedCache {
 }
 
 fn enabled() -> bool { std::env::var("MAKEPAD_RUN_COLLECTED").map_or(true, |v| v != "0") }
+
+/// MAKEPAD_RUN_ZONE_TRACE: the encode's parts, timed (the settle swap's encode off the pause).
+struct Parts(Option<(std::time::Instant, String)>);
+impl Parts {
+    fn new() -> Self {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        Parts(ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_ZONE_TRACE").is_some()).then(|| (std::time::Instant::now(), String::new())))
+    }
+    fn lap(&mut self, what: &str, bytes: usize) {
+        if let Some((t, line)) = &mut self.0 {
+            line.push_str(&format!(" {what} {:.1} ms ({:.1} MB);", t.elapsed().as_secs_f64() * 1e3, bytes as f64 / 1048576.0));
+            *t = std::time::Instant::now();
+        }
+    }
+}
+impl Drop for Parts {
+    fn drop(&mut self) {
+        if let Some((_, line)) = &self.0 { if !line.is_empty() { eprintln!("makepad-run collected: encode parts:{line}"); } }
+    }
+}
 fn key(identity: u128) -> u128 {
     let mut h = Sip128::new();
     h.str("collected-graph-v1"); h.u128(front_graph_key(identity)); h.finish128()
@@ -424,13 +444,17 @@ impl Encoder<'_> {
         if recipe.crates.len() != prog.crates.len() || recipe.crates.iter().zip(&prog.crates)
             .any(|(key, c)| prog.syms.str(c.name) != key.0 || c.root_path() != key.1) { return None; }
         *why = "Program";
-        let program = Arc::new(prog.collected_writer()?.into_owned());
+        let mut parts = Parts::new();
+        let program = Arc::new(prog.collected_writer_with(stop)?.into_owned());
+        parts.lap("Program", program.len());
         if stop() { return None; }
         *why = "Tcx";
         let types = Arc::new(tcx.collected_writer_with(stop)?.into_owned());
+        parts.lap("Tcx", types.len());
         if stop() { return None; }
         *why = "definitions";
         let definitions = Arc::new(self.definitions(prog, tcx, stop)?);
+        parts.lap("definitions", definitions.len());
         if stop() { return None; }
         *why = "interfaces";
         if self.iface_plain.len() != recipe.crates.len() { return None; }
@@ -479,14 +503,21 @@ impl Encoder<'_> {
                 || self.fps.len() != pre.len() || self.iface_plain.len() != pre.len() { return None; }
             let mut image = crate::image::Writer::default();
             image.add_bytes(0, recipe.identity.to_le_bytes().to_vec());
+            let mut parts = Parts::new();
             why = "Program";
-            image.add_image(1, Arc::new(prog.collected_writer()?.into_owned()));
+            let p = Arc::new(prog.collected_writer_with(stop)?.into_owned());
+            parts.lap("swap Program", p.len());
+            image.add_image(1, p);
             if stop() { return None; }
             why = "Tcx";
-            image.add_image(2, Arc::new(tcx.collected_writer_with(stop)?.into_owned()));
+            let t = Arc::new(tcx.collected_writer_with(stop)?.into_owned());
+            parts.lap("Tcx", t.len());
+            image.add_image(2, t);
             if stop() { return None; }
             why = "definitions";
-            image.add_image(3, Arc::new(self.definitions(prog, tcx, stop)?));
+            let d = Arc::new(self.definitions(prog, tcx, stop)?);
+            parts.lap("definitions", d.len());
+            image.add_image(3, d);
             if stop() { return None; }
             why = "index snapshot";
             image.add_bytes(4, MappedIndexes::record(self.crate_path, &[])?);
