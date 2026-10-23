@@ -8235,7 +8235,7 @@ pub unsafe fn settle_drop(up: *mut Unit) -> SettleDrops {
     // Force the existing TTL sweep now, under our reentrant unit lock; never evict young
     // speculative code or change what MAKEPAD_RUN_SPEC_TTL_MS=0 means.
     let before = crate::memstat::live_total();
-    expire_spec(options);
+    expire_spec_in_publish(options);
     drops.spec = freed_since(before);
     drops.max_sweep_ns = wall_ns().saturating_sub(started);
     drops
@@ -16168,55 +16168,73 @@ pub fn spec_ttl_ns(options: &crate::options::Options) -> u64 {
 /// RIR when no build inlined it and none is using it now): the slot is back to "not built"
 /// and compiles on its first call. Only when the unit lock is free right now (never waits).
 pub fn expire_spec(options: &crate::options::Options) {
+    if let Some((now, ttl)) = spec_expiry_due(options) {
+        owner::publish(|| expire_spec_now(now, ttl));
+    }
+}
+
+/// `expire_spec` for a caller already on the owner inside a publish (settle_drop): the sweep
+/// runs in place. (A nested publish there broke rule I-PUB: the panic ended the run monitor, and
+/// with it every later settle, zone swap and trim -- Scope cold, 10 s after the present.)
+fn expire_spec_in_publish(options: &crate::options::Options) {
+    if let Some((now, ttl)) = spec_expiry_due(options) {
+        expire_spec_now(now, ttl);
+    }
+}
+
+/// (now, ttl) when the oldest speculative result is past its TTL.
+fn spec_expiry_due(options: &crate::options::Options) -> Option<(u64, u64)> {
     // The startup manifest's slots are preparation for this frame. Do not discard them before
     // it arrives and make the main thread compile them again. Normal TTL
     // accounting resumes at the first present, including time already spent waiting. A
     // headless program (released on quiet, startup_main) keeps what it built.
-    if startup_phase() || !FIRST_PRESENT.load(Ordering::Acquire) { return; }
+    if startup_phase() || !FIRST_PRESENT.load(Ordering::Acquire) { return None; }
     let ttl = spec_ttl_ns(options);
     if ttl == 0 || !ahead_policy().spec_expire {
-        return;
+        return None;
     }
     let now = wall_ns();
-    {
-        let g = SPEC_BUILT.lock().unwrap();
-        if g.first().map_or(true, |x| now.saturating_sub(x.1) < ttl) {
-            return;
-        }
+    let g = SPEC_BUILT.lock().unwrap();
+    if g.first().map_or(true, |x| now.saturating_sub(x.1) < ttl) {
+        return None;
     }
-    owner::publish(|| {
-        let up = SPEC_UNIT.load(Ordering::Acquire);
-        if !up.is_null() {
-            let u = unsafe { &mut *up };
-            let mut g = SPEC_BUILT.lock().unwrap();
-            let cut = g.partition_point(|x| now.saturating_sub(x.1) >= ttl);
-            let (mut n, mut bytes) = (0u64, 0u64);
-            for &(id, _) in &g[..cut] {
-                if id as usize >= u.fns.len() {
-                    continue;
-                }
-                let f = &mut u.fns[id as usize];
-                if f.compiled || f.spec_state != 1 || f.inflight || f.building {
-                    continue;
-                }
-                if let Some(spec) = f.spec.take() {
-                    let SpecCode { code, map, relocs, .. } = *spec;
-                    u.reload_specs.remove(&id);
-                    bytes += (std::mem::size_of::<SpecCode>() + code.capacity() + map.capacity() * 16 + relocs.capacity() * std::mem::size_of::<relax_backend::rir::RelocAt>()) as u64;
-                    f.spec_state = 3;
-                    n += 1;
-                    if f.history().inlined_into.is_empty() {
-                        if let Some(r) = f.rir.take() {
-                            bytes += relax_codegen::opt::inst_count(&r) as u64 * 80;
-                        }
-                    }
+    Some((now, ttl))
+}
+
+/// The sweep (on the owner): speculative code older than the TTL and never called goes.
+fn expire_spec_now(now: u64, ttl: u64) {
+    let up = SPEC_UNIT.load(Ordering::Acquire);
+    if up.is_null() {
+        return;
+    }
+    let u = unsafe { &mut *up };
+    let mut g = SPEC_BUILT.lock().unwrap();
+    let cut = g.partition_point(|x| now.saturating_sub(x.1) >= ttl);
+    let (mut n, mut bytes) = (0u64, 0u64);
+    for &(id, _) in &g[..cut] {
+        if id as usize >= u.fns.len() {
+            continue;
+        }
+        let f = &mut u.fns[id as usize];
+        if f.compiled || f.spec_state != 1 || f.inflight || f.building {
+            continue;
+        }
+        if let Some(spec) = f.spec.take() {
+            let SpecCode { code, map, relocs, .. } = *spec;
+            u.reload_specs.remove(&id);
+            bytes += (std::mem::size_of::<SpecCode>() + code.capacity() + map.capacity() * 16 + relocs.capacity() * std::mem::size_of::<relax_backend::rir::RelocAt>()) as u64;
+            f.spec_state = 3;
+            n += 1;
+            if f.history().inlined_into.is_empty() {
+                if let Some(r) = f.rir.take() {
+                    bytes += relax_codegen::opt::inst_count(&r) as u64 * 80;
                 }
             }
-            g.drain(..cut);
-            SPEC_EXPIRED[0].fetch_add(n, Ordering::Relaxed);
-            SPEC_EXPIRED[1].fetch_add(bytes, Ordering::Relaxed);
         }
-    });
+    }
+    g.drain(..cut);
+    SPEC_EXPIRED[0].fetch_add(n, Ordering::Relaxed);
+    SPEC_EXPIRED[1].fetch_add(bytes, Ordering::Relaxed);
 }
 
 fn spec_worker(runtime: &crate::options::RuntimeOptions, options: &crate::options::Options) {

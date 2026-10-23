@@ -2169,9 +2169,14 @@ impl SettleWatch {
         (quiet && self.settled != Some(compiled)) || (slow && self.settled.map_or(true, |n| compiled > n + TRICKLE_MAX))
     }
 
+    /// Compiles since the oldest mark of the window (None before the window is covered).
+    fn window_delta(&self, compiled: u64) -> Option<u64> {
+        (self.marks_n >= 9).then(|| compiled.saturating_sub(self.marks[self.marks_n % 9].1))
+    }
+
     /// At most a trickle of compiles in the last window (as of the last `trickle` mark).
     fn slow(&self, compiled: u64) -> bool {
-        self.marks_n >= 9 && compiled.saturating_sub(self.marks[self.marks_n % 9].1) <= TRICKLE_MAX
+        self.window_delta(compiled).is_some_and(|d| d <= TRICKLE_MAX)
     }
 
     /// Settled, and still at most a trickle of compiles since: the swap may go.
@@ -2249,6 +2254,9 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
     { let _k = crate::zone_alloc::kept();
     // named: inspect lists it as makepad run's, not the program's
     let _ = std::thread::Builder::new().name("run-monitor".into()).spawn(move || {
+    // a panic here ended every later settle, swap and trim of the run without a word (the
+    // compiler's panic hook can be the silent one at that moment): it is said, with its payload
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let runtime = &runtime;
         let options = &options;
         // A measurement harness requests an allocator snapshot at its own landmark
@@ -2269,8 +2277,8 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let mut present_bytes = Vec::new();
         let (mut quiet, mut seen, mut trimmed) = (0u32, 0u64, 0u64);
         // growth relief (below): the resident size after the last trim and when it ran
-        // burst relief (below): the burst arena's committed bytes at the last pass, and when it ran
-        let (mut burst_from, mut burst_at) = (0usize, Instant::now());
+        // burst relief (below): the compile count at the last pass, and when it ran
+        let (mut burst_seen, mut burst_at) = (0u64, Instant::now());
         let (mut grown_from, mut grown_at) = (0u64, std::time::Instant::now().checked_sub(std::time::Duration::from_millis(500)).unwrap_or_else(std::time::Instant::now));
         // mid-run cache writes once main ran 3 s and something new was compiled: after 2 s without
         // compiles (5 s after the last write), or every 10 s while compiles go on
@@ -2283,6 +2291,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let (mut swap_over, mut swap_next, mut swap_tries) = (!jit::zone_swap::enabled(), Instant::now(), 0u32);
         let (mut swap_round, mut swap_done) = (None, None);
         let mut swap_wait_said = "";
+        let mut swap_said_at = Instant::now();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
             if let Some(file) = present.as_mut() {
@@ -2480,7 +2489,13 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 else if jit::QUIT_SEEN.load(Ordering::Relaxed) { Some("the run is quitting") }
                 else { None };
             if let Some(why) = swap_block.filter(|w| !w.is_empty()) {
-                if swap_wait_said != why { swap_wait_said = why; verbose!("makepad-run zone: swap waits: {why}"); }
+                // the reason when it changes, and every 10 s with the counts it is decided on
+                if swap_wait_said != why || swap_said_at.elapsed() >= std::time::Duration::from_secs(10) {
+                    swap_wait_said = why;
+                    swap_said_at = Instant::now();
+                    verbose!("makepad-run zone: swap waits: {why} (demand compiles {}, {:?} in the last 5 s; speculative {}; settled at {:?})",
+                        jit::demand_compiled(), settle_watch.window_delta(jit::demand_compiled()), jit::SPEC_FNS.load(Ordering::Relaxed), settle_watch.settled);
+                }
             }
             if !swap_over && swap_block.is_none()
             {
@@ -2519,19 +2534,16 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             // pages go back to the system (Calculator cold, 165: 350 MB at main start in 23 ms).
             // Burst relief: the scratch arena's chunks hold the few blocks that outlived their
             // compile (thread-kept buffers, results moved out), and a detached chunk's free slots
-            // are never handed out again; whenever its committed bytes grew 64 MB since the last
-            // pass (at most once a second), the free granules around them go back (a chunk walk
-            // under each chunk's lock, ~1 ms; Scope cold: 500 MB that waited for a quiet trim
-            // that the O3 tail never gave).
-            if runtime.mem_trim && burst_at.elapsed() >= std::time::Duration::from_secs(1) {
-                let committed = crate::zone_alloc::burst_stats().0;
-                if committed < burst_from {
-                    burst_from = committed;
-                } else if committed >= burst_from + (64 << 20) {
+            // are never handed out again; every 5 s in which something was compiled, the free
+            // granules around them go back (a walk of the chunk headers under each chunk's lock,
+            // a few ms; Scope cold: 450 MB that waited for a quiet trim the O3 tail never gave)
+            if runtime.mem_trim && burst_at.elapsed() >= std::time::Duration::from_secs(5) {
+                let n = jit::COMPILED_FNS.load(Ordering::Relaxed) + jit::TIER1_INSTALLS.load(Ordering::Relaxed);
+                if n != burst_seen {
+                    burst_seen = n;
                     crate::zone_alloc::burst_trim();
-                    burst_from = committed;
-                    burst_at = Instant::now();
                 }
+                burst_at = Instant::now();
             }
             if runtime.mem_trim && grown_at.elapsed() >= std::time::Duration::from_millis(500) {
                 static STEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -2581,6 +2593,11 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 report("fns", &n.to_string());
             }
         }
+    }));
+    if let Err(e) = r {
+        let what = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_default();
+        eprintln!("makepad-run: the run monitor ended by a panic: {what} (no more settles, zone swaps or trims in this run)");
+    }
     });
     }
 }
