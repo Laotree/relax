@@ -883,43 +883,179 @@ fn leaf_of_jit(f: &os::fault::Fault) -> bool {
     }
 }
 
-/// Writes "<prefix><hex>" pieces to stderr in one call, from a fault handler (no allocation).
-fn raw_report(f: &os::fault::Fault, what: &str) {
-    let mut buf = [0u8; 512];
-    let mut n = 0;
-    let mut put = |b: &[u8], n: &mut usize| {
-        let k = b.len().min(buf.len() - *n);
-        buf[*n..*n + k].copy_from_slice(&b[..k]);
-        *n += k;
-    };
-    let hex = |v: u64| {
+/// A fault report line built on the stack (fault handlers: no allocation, no lock).
+struct RawLine {
+    buf: [u8; 1024],
+    n: usize,
+}
+
+impl RawLine {
+    fn new() -> RawLine {
+        RawLine { buf: [0; 1024], n: 0 }
+    }
+    fn put(&mut self, b: &[u8]) -> &mut RawLine {
+        let k = b.len().min(self.buf.len() - self.n);
+        self.buf[self.n..self.n + k].copy_from_slice(&b[..k]);
+        self.n += k;
+        self
+    }
+    fn hex(&mut self, v: u64) -> &mut RawLine {
         let mut h = [0u8; 18];
         h[0] = b'0';
         h[1] = b'x';
-        for i in 0..16 {
-            let d = ((v >> (60 - 4 * i)) & 15) as u8;
+        let digits = (16 - (v.leading_zeros() as usize / 4)).max(1);
+        for i in 0..digits {
+            let d = ((v >> (4 * (digits - 1 - i))) & 15) as u8;
             h[2 + i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
         }
-        h
-    };
-    put(b"makepad-run: ", &mut n);
-    put(what.as_bytes(), &mut n);
-    put(b" (signal ", &mut n);
-    let sig = [b'0' + ((f.sig / 10) % 10) as u8, b'0' + (f.sig % 10) as u8];
-    put(&sig, &mut n);
-    put(b") pc ", &mut n);
-    put(&hex(f.pc), &mut n);
-    put(b" addr ", &mut n);
-    put(&hex(f.addr), &mut n);
-    put(b" frames", &mut n);
+        self.put(&h[..2 + digits])
+    }
+    fn dec(&mut self, v: u64) -> &mut RawLine {
+        let mut d = [0u8; 20];
+        let mut i = d.len();
+        let mut v = v;
+        loop {
+            i -= 1;
+            d[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        self.put(&d[i..])
+    }
+    fn flush(&mut self) {
+        self.put(b"\n");
+        os::fault::raw_stderr(&self.buf[..self.n]);
+        self.n = 0;
+    }
+}
+
+/// Names address `a` into `l` from a fault handler: JIT code (its fn, slot, the code version's
+/// tier and origin, the offset; a slot's thunk / lazy stub), the unit's areas, the compiler or
+/// burst arena, the faulting thread's stack, else the host image and symbol (dladdr: the process
+/// is ending, and the raw line with every number was written before). No allocation; the code
+/// tables only through try_read (the faulting thread may hold them).
+unsafe fn raw_name(l: &mut RawLine, a: u64, sp: u64) {
+    if a == 0 {
+        l.put(b"null");
+        return;
+    }
+    if !UNIT.is_null() {
+        let u = &*UNIT;
+        if in_jit_code(a) {
+            let Ok(t) = u.code.try_read() else {
+                l.put(b"JIT code (code tables busy)");
+                return;
+            };
+            if let Some((start, len, id)) = t.entry_at(a) {
+                let k = t.kind_of(start);
+                l.put(b"JIT ");
+                if (id as usize) < u.fns.len() {
+                    let name = u.fns[id as usize].name.as_bytes();
+                    l.put(&name[..name.len().min(300)]);
+                }
+                l.put(b" +").hex(a - start).put(b" (slot ").dec(id as u64).put(b", ").put(k.tier_name().as_bytes()).put(b" ").put(k.origin_name().as_bytes());
+                if t.slot_at(a) != Some(id) {
+                    l.put(b", replaced body");
+                }
+                l.put(b", code ").hex(start).put(b"+").hex(len as u64).put(b")");
+                return;
+            }
+            drop(t);
+            for (kind, what) in [(0usize, &b"JIT thunk of slot "[..]), (1, &b"JIT lazy stub of slot "[..])] {
+                if let Some((id, off)) = u.slots.find(kind, a).filter(|(id, _)| (*id as usize) < u.fns.len()) {
+                    let name = u.fns[id as usize].name.as_bytes();
+                    l.put(what).dec(id as u64).put(b" ").put(&name[..name.len().min(300)]).put(b" +").hex(off);
+                    return;
+                }
+            }
+            l.put(b"JIT code memory, no fn body (glue)");
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some([exec, ro, rw, syms, end]) = unit_areas() {
+            for (lo, hi, what) in [(exec, ro, &b"the unit's code reservation"[..]), (ro, rw, b"the unit's read-only data"), (rw, syms, b"the unit's statics"), (syms, end, b"the unit's symbol table")] {
+                if a >= lo && a < hi {
+                    l.put(what).put(b" +").hex(a - lo);
+                    return;
+                }
+            }
+        }
+    }
+    if crate::zone_alloc::compiler_owns(a as *const u8) {
+        l.put(b"the compiler arena");
+        return;
+    }
+    if crate::zone_alloc::burst_owns(a as *const u8) {
+        l.put(b"the burst (scratch) arena");
+        return;
+    }
+    let hi = STACK_HI.try_with(|c| c.get()).unwrap_or(0);
+    if hi != 0 && a < hi && a.saturating_add(8 << 20) >= hi {
+        l.put(b"this thread's stack");
+        if a < sp {
+            l.put(b" below sp");
+        }
+        return;
+    }
+    match os::proc::image_at_raw(a) {
+        Some((image, base, sym, sym_at)) => {
+            l.put(b"host ");
+            if !sym.is_empty() {
+                l.put(&sym[..sym.len().min(300)]).put(b"+").hex(a - sym_at).put(b" ");
+            }
+            l.put(b"(").put(image).put(b"+").hex(a - base).put(b")");
+        }
+        None => {
+            l.put(b"no image (heap or unmapped)");
+        }
+    }
+}
+
+/// A fault that ends the process (or a nested one), from the fault handler with no allocation:
+/// one line with every number (pc, faulting address, sp/fp/lr, the raw frames), then one line
+/// per address naming it (raw_name: the JIT fn and its code version, glue, unit areas, host
+/// symbols).
+fn raw_report(f: &os::fault::Fault, what: &str) {
+    let mut l = RawLine::new();
+    l.put(b"makepad-run: ").put(what.as_bytes()).put(b" (signal ").dec(f.sig as u64).put(b") on thread ").hex(os::thread::current());
+    l.put(b" pc ").hex(f.pc).put(b" addr ").hex(f.addr).put(b" sp ").hex(f.sp).put(b" fp ").hex(f.fp).put(b" lr ").hex(f.lr).put(b" frames");
     let mut raw = [0u64; 16];
     let k = walk_fp_bounded(f.fp, f.sp, &mut raw);
     for r in &raw[..k] {
-        put(b" ", &mut n);
-        put(&hex(*r), &mut n);
+        l.put(b" ").hex(*r);
     }
-    put(b"\n", &mut n);
-    os::fault::raw_stderr(&buf[..n]);
+    l.flush();
+    unsafe {
+        let kind: &[u8] = match f.kind {
+            os::fault::Kind::Segv | os::fault::Kind::Bus if is_stack_fault(f.addr, f.sp) => b"stack overflow",
+            os::fault::Kind::Segv => b"segfault",
+            os::fault::Kind::Bus => b"bus error",
+            os::fault::Kind::Ill => b"illegal instruction",
+            os::fault::Kind::Fpe => b"arithmetic fault",
+            os::fault::Kind::Trap => b"trap",
+            _ => b"signal",
+        };
+        l.put(b"makepad-run:   ").put(kind).put(b" at pc in ");
+        raw_name(&mut l, f.pc, f.sp);
+        l.flush();
+        if f.addr != f.pc {
+            l.put(b"makepad-run:   address ").hex(f.addr).put(b" in ");
+            raw_name(&mut l, f.addr, f.sp);
+            l.flush();
+        }
+        if f.lr != 0 {
+            l.put(b"makepad-run:   lr in ");
+            raw_name(&mut l, f.lr, f.sp);
+            l.flush();
+        }
+        for (i, r) in raw[..k].iter().enumerate() {
+            l.put(b"makepad-run:   frame ").dec(i as u64).put(b" ").hex(*r).put(b" in ");
+            raw_name(&mut l, r.wrapping_sub(1), f.sp);
+            l.flush();
+        }
+    }
 }
 
 /// Our fault handlers back on top if a library of the program replaced them (it stays chained
@@ -1596,6 +1732,8 @@ pub(crate) unsafe fn fault_policy(label: &str, info: &PanicInfo, guard_depth: u3
 }
 
 unsafe fn fatal_report(f: &os::fault::Fault) -> ! {
+    // first the signal-safe lines: the full report below allocates and is a unit call
+    raw_report(f, "fault in JIT code on a thread without a recovery point (or at the recovery entry)");
     let frames = collect_frames(f.fp, f.pc, false);
     let kind = if is_stack_fault(f.addr, f.sp) { "stack overflow" } else { "fault" };
     let info = PanicInfo { kind: kind.to_string(), message: format!("{} at {:#x}", f.label(), f.addr), site: u64::MAX, frames, fault_addr: f.addr, location: String::new() };
@@ -2561,11 +2699,14 @@ unsafe fn on_fault_locked(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os:
             // not ours: the handler we replaced (a library's), else the default action
             if !hooks.chained && f.kind != Kind::Trap {
                 raw_report(f, "fault outside JIT code, not contained: the process ends");
+                // MAKEPAD_RUN_FAULT_REGS (opt-in; allocates): after the raw lines
+                (hooks.debug)();
             }
             Action::PassOn
         }
         Containment::Die => {
             raw_report(f, "fault in host code (not JIT code), not contained: the process ends");
+            (hooks.debug)();
             Action::Die
         }
         Containment::Contain => {
