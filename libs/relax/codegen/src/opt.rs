@@ -7546,6 +7546,12 @@ pub fn dead_slot_stores(f: &mut Func) -> bool {
     true
 }
 
+/// MAKEPAD_RUN_SLOTCOAL_TRACE=1: coalesce_slot_copies' candidates and why copies are none
+fn slotcoal_trace() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var_os("MAKEPAD_RUN_SLOTCOAL_TRACE").is_some())
+}
+
 /// Slot coalescing along whole copies (O3): `Copy(C <- B)` of one slot's bytes into an equal slot
 /// (or of the whole of the smaller one into, or out of, the start of a larger one: an `Option<T>`
 /// payload or a tuple's first field moved to a slot of its own -- the smaller slot becomes the
@@ -7620,6 +7626,37 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
                         let (zc, zb) = (f.slots[cs as usize].size, f.slots[bs as usize].size);
                         if n == zc.min(zb) && (prefix || zc == zb) {
                             cands.push((bi, ii, bs, cs));
+                        }
+                    }
+                }
+            }
+        }
+        if slotcoal_trace() {
+            // every whole-slot copy and why it is no candidate
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if let Inst::Copy(d, s2, n) = *i {
+                        let (cs, bs) = (sl(d), sl(s2));
+                        if cs == NONE || bs == NONE || cands.iter().any(|c| c.2 == bs && c.3 == cs) {
+                            continue;
+                        }
+                        eprintln!("slotcoal {}: copy {}->{} ({} bytes of {}/{}, at {}/{}) not a candidate: tracked {}/{} escapes {}/{}", f.name, bs, cs, n, f.slots[bs as usize].size, f.slots[cs as usize].size,
+                            vs[s2.0 as usize].1, vs[d.0 as usize].1, tracked[bs as usize], tracked[cs as usize], sc.esc[bs as usize], sc.esc[cs as usize]);
+                        // the first use of an escaping slot's address that is no load/store base or copy operand
+                        for e in [bs, cs] {
+                            if !sc.esc[e as usize] {
+                                continue;
+                            }
+                            let hit = f.blocks.iter().enumerate().flat_map(|(bi, b)| b.insts.iter().map(move |i| (bi, i))).find(|(_, i)| {
+                                let mut u = false;
+                                match i {
+                                    Inst::Load(..) | Inst::VLoad(..) | Inst::Copy(..) | Inst::SlotAddr(..) | Inst::Mov(..) | Inst::IBinI(IOp::Add, ..) => {}
+                                    Inst::Store(_, _, _, v) | Inst::VStore(_, _, v) => u = sl(*v) == e,
+                                    _ => for_uses(i, |v| if sl(v) == e { u = true }),
+                                }
+                                u
+                            });
+                            eprintln!("slotcoal {}:   slot {} escapes at {:?}", f.name, e, hit.map(|(bi, i)| format!("b{} {:?}", bi, i)));
                         }
                     }
                 }
@@ -7795,6 +7832,9 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
                 }
                 xfer(&mut cur, rd, wr);
             }
+        }
+        if slotcoal_trace() {
+            eprintln!("slotcoal {}: candidates {}", f.name, cands.iter().zip(&bad).map(|(&(_, _, bs, cs), &b)| format!("{}->{}{}", bs, cs, if b { " interferes" } else { "" })).collect::<Vec<_>>().join(", "));
         }
         // join the first good candidate per slot pair (slots may sit in several candidates)
         let mut used = vec![false; ns];
