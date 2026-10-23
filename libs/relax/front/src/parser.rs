@@ -1576,6 +1576,15 @@ impl<'a> Parser<'a> {
         if out_of_scope {
             r = None;
         }
+        // a module-relative path (`crate::m!`, `self::m!`, `::k::m!`) to this crate's `#[macro_export]` macro:
+        // a macro-expanded one is the lint macro_expanded_macro_exports_accessed_by_absolute_paths (lint_early)
+        if qual.is_some() || path.global() {
+            if let (Some(d), Some(c)) = (r.as_ref(), self.bctx.as_ref()) {
+                if d.builtin == 0 && d.exported && d.krate == self.krate {
+                    crate::macros::uses::abs_path_macro_call(&c.path, seg.name.lo, d);
+                }
+            }
+        }
         // Relax's built-in macros (builtins.rs) when no macro_rules! of that name is visible
         match r {
             Some(d) => Some(crate::builtins::override_rules(&self.session.options, d)),

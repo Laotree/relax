@@ -3542,6 +3542,44 @@ fn named_args_positional(prog: &Program, own: &[bool]) {
     }
 }
 
+pub const MACRO_EXPANDED_MACRO_EXPORTS_ACCESSED_BY_ABSOLUTE_PATHS: Lint = lint::lint("macro_expanded_macro_exports_accessed_by_absolute_paths");
+
+/// rustc_resolve ident.rs (resolve_ident_in_module_non_globs_unadjusted, Shadowing::Unrestricted) and
+/// diagnostics.rs `report_errors`: a module-relative path (an import `use crate::m;`, a call `crate::m!()`)
+/// that finds a `#[macro_export]` macro_rules! of the current crate whose definition a macro expansion
+/// wrote. (A path resolved in the lexical scopes -- `m!()`, 2015's `use m;` -- is restricted shadowing:
+/// no lint.)
+fn macro_expanded_macro_exports(prog: &Program, own: &[bool]) {
+    const MSG: &str = "macro-expanded `macro_export` macros from the current crate cannot be referred to by absolute paths";
+    let expanded_def = |file: u32, pos: u32| prog.files.get(file as usize).is_some_and(|f| f.expansion_region_id(pos) != 0);
+    let mut seen = std::collections::HashSet::new();
+    // imports with a module part whose last name is such a macro of the importing crate's root
+    for im in &prog.imports {
+        if im.glob || im.ext || im.segs.len() < 2 || !own.get(prog.mods[im.module as usize].krate as usize).copied().unwrap_or(false) { continue; }
+        let krate = prog.mods[im.module as usize].krate;
+        let root = prog.crates[krate as usize].root_mod;
+        let Some(&(SegKind::Ident, last)) = im.segs.last() else { continue };
+        let Some(&mac) = prog.mods[root as usize].macros.get(&last) else { continue };
+        let edition = prog.crates[krate as usize].edition;
+        let Some(parent) = prog.resolve_mod_path(im.module, im.global, &im.segs[..im.segs.len() - 1], edition < 2018, true) else { continue };
+        if parent != prog.mods[root as usize].def { continue; }
+        let md = prog.def(mac);
+        let lo = prog.files[md.file as usize].ast.item(md.item).lo;
+        if !expanded_def(md.file, lo) || !seen.insert((im.file, im.pos)) { continue; }
+        let def = enclosing_def(prog, im.file, im.pos, krate);
+        emit(prog, def, &MACRO_EXPANDED_MACRO_EXPORTS_ACCESSED_BY_ABSOLUTE_PATHS, im.file, im.pos, MSG);
+    }
+    // macro calls through a module path (the parser records them under `makepad check`)
+    for (path, pos, def_path, def_pos) in crate::macros::uses::take_abs_path_macro_calls() {
+        let Some(file) = prog.file_paths.iter().position(|p| *p == path) else { continue };
+        let Some(def_file) = prog.file_paths.iter().position(|p| *p == def_path) else { continue };
+        let krate = prog.file_crate.get(file).copied().unwrap_or(u32::MAX);
+        if !own.get(krate as usize).copied().unwrap_or(false) || !expanded_def(def_file as u32, def_pos) || !seen.insert((file as u32, pos)) { continue; }
+        let def = enclosing_def(prog, file as u32, prog.files[file].lint_pos(pos), krate);
+        emit(prog, def, &MACRO_EXPANDED_MACRO_EXPORTS_ACCESSED_BY_ABSOLUTE_PATHS, file as u32, pos, MSG);
+    }
+}
+
 /// The crate-level attribute lints: `unknown_crate_types` (an invalid `#![crate_type]`) and the
 /// crate's `missing_docs`.
 fn crate_attr_lints(prog: &Program, own: &[bool]) {
@@ -3655,6 +3693,7 @@ pub fn finish(prog: &Program, own: &[bool]) {
     cfg_attr_empties(prog, own);
     varargs_without_patterns(prog, own);
     named_args_positional(prog, own);
+    macro_expanded_macro_exports(prog, own);
     crate_attr_lints(prog, own);
     let (defs, used) = crate::macros::uses::take();
     if defs.is_empty() { return; }
