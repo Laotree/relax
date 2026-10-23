@@ -1081,6 +1081,18 @@ pub mod obligations {
     fn check_static(w: &mut Wfcx<'_, '_>, ast: &ast::Ast, item: &ast::Item) {
         let ItemKind::Static(mutable, _, _) = &item.kind else { return };
         let Some(ty) = w.tcx.const_ty(w.prog, w.def) else { return };
+        if w.prog.def(w.def).kind == DefKind::ForeignStatic {
+            // rustc check.rs check_static_inhabited: an `extern` static whose layout is a SizeOverflow
+            let env = crate::tcx::TypingEnv::fully_monomorphized(w.prog);
+            let bad = crate::types::TypeFlags::HAS_PARAM | crate::types::TypeFlags::HAS_ERROR | crate::types::TypeFlags::HAS_INFER | crate::types::TypeFlags::HAS_ALIAS;
+            if let Ok(t) = w.tcx.try_normalize_erasing_regions(w.prog, env, ty) {
+                if !w.tcx.tys.flags(t).intersects(bad) && crate::layout::Layouts::new().size_overflows(&crate::layout::LayoutCx::new(w.prog), w.tcx, t) {
+                    let file = w.prog.def(w.def).file;
+                    w.extra.push(w.prog.record_uncoded_error(file, item.lo, "typeck", "extern static is too large for the target architecture".to_string()));
+                    return;
+                }
+            }
+        }
         // (a type with an unevaluated constant, `[u8; len(NAME)]`, is evaluated by the constant check)
         if w.tcx.tys.flags(ty).contains(crate::types::TypeFlags::HAS_ALIAS) { return; }
         let ty = w.normalize(ty);

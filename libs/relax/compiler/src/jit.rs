@@ -3660,6 +3660,13 @@ impl Unit {
         self.lay.closure_storage(&self.prog, &self.tcx, ty)
     }
 
+    /// rustc's `LayoutError::SizeOverflow` for `t` (layout::Layouts::size_overflows).
+    pub fn size_overflows(&self, t: TyId) -> bool {
+        let t = self.tcx.normalize_erasing_regions(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), t);
+        let lcx = crate::layout::LayoutCx::new(&self.prog);
+        self.lay.size_overflows(&lcx, &self.tcx, t)
+    }
+
     /// The layout of `t`. A coroutine's state area comes from its lowered poll function: the
     /// coroutines `t` contains whose body was not lowered yet are lowered first (rustc computes
     /// a coroutine's layout from its optimized MIR the same way, on demand).

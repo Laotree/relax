@@ -961,7 +961,12 @@ impl<'a> Lcx<'a> {
         if too_big {
             let t = u.tcx.tys.erase_regions(t);
             let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-            self.err(self.pos, format!("type `{}` is 4 GiB or larger, which makepad run does not lay out yet", ts));
+            // (rustc: a layout of at least obj_size_bound bytes is a SizeOverflow error)
+            if u.size_overflows(t) {
+                self.err(self.pos, format!("{}values of the type `{}` are too big for the target architecture", relax_front::diagnostics::UNCODED_PREFIX, ts));
+            } else {
+                self.err(self.pos, format!("type `{}` is 4 GiB or larger, which makepad run does not lay out yet", ts));
+            }
         }
         l
     }
