@@ -561,6 +561,9 @@ pub fn try_codegen_body(prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) ->
     let _cost_typeck = relax_codegen::fncost::phase(1);
     let _mem = crate::memstat::tag(crate::memstat::Tag::Typeck);
     let body = tcx.typeck(prog, def);
+    // run mode (no lints): the unsafety and impl-soundness errors `makepad check` reports are
+    // body errors here too (the slot gets the error stub, as for a type error), for the crates the
+    // borrow checker covers -- safe code may not dereference raw pointers or forge Send/Sync
     // an instance with the wrong number of type/const arguments (`fn main<T>()`, E0131) has no
     // body to monomorphize (instantiating it trips complete_args' assertion)
     if *body.args != *args && args.len() != tcx.generic_indices_of(prog, def).types_consts.len() {

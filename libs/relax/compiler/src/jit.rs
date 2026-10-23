@@ -5924,6 +5924,9 @@ impl Unit {
     pub(crate) fn o3_allowed(&self, id: u32) -> bool {
         if self.refresh_verified(id) { return true; }
         let body = match self.fns[id as usize].key { FnKey::Plain(b) => b, _ => id };
+        // a body the borrow checker rejected never reaches O3 (its first-run code included: the
+        // optimiser would trust values that rejected code may have made)
+        if matches!(self.verdict_state(body), Verdict::Failed(_)) { return false; }
         crate::reload::observations_verified()
             && (self.fns[id as usize].patch_gen == 0 && self.fns[body as usize].patch_gen == 0 || self.verdict_clean(body))
     }
@@ -12713,6 +12716,7 @@ pub fn sweep_verdicts() {
     }) else { return };
     let mut relower = Vec::new();
     let mut verified = Vec::new();
+    let mut failed = Vec::new();
     let mut at = 0;
     while at < n {
         let end = (at + SWEEP_CHUNK).min(n);
@@ -12739,6 +12743,8 @@ pub fn sweep_verdicts() {
                     } else {
                         verified.push(id as u32);
                     }
+                } else if looked && matches!(u.verdict_state(id as u32), Verdict::Failed(_)) {
+                    failed.push(id as u32);
                 }
             }
             true
@@ -12749,6 +12755,19 @@ pub fn sweep_verdicts() {
     owner::publish(|| unsafe {
         let Some(up) = live() else { return };
         let u = &*up;
+        // a rejected body's code stays out of the code cache (pending records dropped, a stored
+        // entry replaced by a miss): a later run never links code the checker refused
+        if !failed.is_empty() {
+            if let Some(c) = u.cache.as_ref() {
+                let c = &mut *c.get();
+                for &id in &failed {
+                    c.reject_verdict(u, id);
+                    if let Some(t) = u.plain_twin_of(id) {
+                        c.reject_verdict(u, t);
+                    }
+                }
+            }
+        }
         // ... and the ones whose unverified lowering calls hot twins
         let mut tc = twin_callers(u, &verified, None);
         {

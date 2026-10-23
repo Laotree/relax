@@ -305,7 +305,8 @@ impl Cache {
         }
         // (checksummed: a corrupt stored entry must not enter a fresh image's checksum)
         match self.get_checked(k) {
-            Some((KIND_CODE, p)) => Some(p),
+            // (empty: a rejected body's entry, reject_verdict)
+            Some((KIND_CODE, p)) if !p.is_empty() => Some(p),
             _ => None,
         }
     }
