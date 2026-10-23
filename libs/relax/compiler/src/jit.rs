@@ -12429,7 +12429,7 @@ pub(crate) fn tier1_stats_report() {
     let s = g.as_ref().unwrap_or(&empty);
     let ms = |ns: u64| ns as f64 / 1e6;
     eprintln!("makepad-run o3-stats: builds={} cpu_ms={:.3} max_threads={} in_flight={} (completed attempts; Windows CPU is cycle-estimated)", s.builds, ms(s.cpu), s.max_active, s.active);
-    eprintln!("makepad-run o3-stats: pgo counted_builds={} counted_cpu_ms={:.3} counted_dropped={}", PGO_STATS[0].load(Ordering::Relaxed), ms(PGO_STATS[1].load(Ordering::Relaxed)), PGO_STATS[2].load(Ordering::Relaxed));
+    eprintln!("makepad-run o3-stats: pgo counted_builds={} counted_cpu_ms={:.3} counted_dropped={} not_counted_no_rir_off_owner={}", PGO_STATS[0].load(Ordering::Relaxed), ms(PGO_STATS[1].load(Ordering::Relaxed)), PGO_STATS[2].load(Ordering::Relaxed), PGO_STATS[3].load(Ordering::Relaxed));
     eprintln!("makepad-run o3-stats: phases_cpu_ms snapshot={:.3} backend={:.3} install={:.3}", ms(s.phases[0]), ms(s.phases[1]), ms(s.phases[2]));
     let passes: Vec<String> = relax_backend::stats::PASS_NAMES.iter().enumerate().map(|(i, n)| format!("{}={:.3}", n, ms(s.passes[i]))).collect();
     eprintln!("makepad-run o3-stats: backend_pass_ms {} (pass slots can overlap; MAKEPAD_RUN_PASS_TIMES=wall selects wall time)", passes.join(" "));
@@ -12703,8 +12703,9 @@ const PGO_IDLE_MS: u64 = 2000;
 const PGO_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 /// slots running counted code: (slot, counters, installed at wall_ns)
 static COUNTING: relax_session::sync::Mutex<Vec<(u32, &'static [AtomicU64], u64)>> = relax_session::sync::Mutex::new(Vec::new());
-/// counted builds installed, their build CPU ns, dropped (not built or not installed)
-pub static PGO_STATS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// counted builds installed, their build CPU ns, dropped (not built or not installed), not counted
+/// (their normal RIR could not be built off the owner)
+pub static PGO_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Queues O3 for the counting slots whose window is over (first O3 worker, no lock held).
 fn pgo_poll() {
@@ -12773,9 +12774,6 @@ unsafe fn counted_build(up: *mut Unit, id: u32) -> bool {
         }
     }
     let begin = take_prefronted(&front, || {
-        if needs_rir(up) {
-            let _ = build_rir(up, id);
-        }
         let u = &mut *up;
         if !u.o3_allowed(id) {
             return None;
@@ -12785,9 +12783,13 @@ unsafe fn counted_build(up: *mut Unit, id: u32) -> bool {
             || f.building || f.inflight || f.unverified.load(Ordering::Relaxed) || u.frequency_profiles.contains_key(&id) || crate::inspect::instrument::active(id) {
             return None;
         }
-        // the RIR O3 will start from (compile_tier1's snapshot upgrades baseline RIR the same way)
-        if f.rir.as_ref().is_some_and(|r| upgradable(r)) {
-            let _ = build_rir_mode(up, id, RirMode::Normal);
+        // the RIR O3 will start from (normal RIR, as compile_tier1's snapshot upgrades baseline RIR)
+        // was built above, off the owner; where that could not be done (a front only the owner
+        // could run) the slot is not counted (rule I-PURE: no background O1 build on the owner)
+        // and its O3 build goes ahead
+        if needs_rir(up) || f.rir.as_ref().is_some_and(|r| upgradable(r)) {
+            PGO_STATS[3].fetch_add(1, Ordering::Relaxed);
+            return None;
         }
         let u = &*up;
         let f = &u.fns[id as usize];
@@ -13421,10 +13423,16 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let splits: std::cell::RefCell<Vec<(u32, RirMode)>> = Default::default();
     // (slot, upgrade): a slot's fresh O1 build and its upgrade are each tried once
     let split_tried: std::cell::RefCell<std::collections::HashSet<(u32, bool)>> = Default::default();
-    let splittable = |up: *mut Unit, c: u32| prefront && matches!(&(&*up).fns[c as usize].key, FnKey::Inst(d, _) if matches!((&*up).prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn));
+    let splittable = |up: *mut Unit, c: u32, upgrade: bool| prefront && splits_off_owner(&*up, c, upgrade);
     // candidates a round left out (their build needed fronts): tried once more after those fronts,
     // then left out of this snapshot (every round walks the whole frontier again)
     let left_out: std::cell::RefCell<HashMap<u32, u8>> = Default::default();
+    // (instrument) what the last take of a split did with it: 1 gave back, 2 prepared, 3 skipped
+    let split_out: std::cell::RefCell<HashMap<u32, u8>> = Default::default();
+    let owner_fallback = |c: u32, upgrade: bool, split: bool| {
+        let o = if split { split_out.borrow().get(&c).copied().unwrap_or(3) as usize } else { 0 };
+        cand_skip(19 + if upgrade { 0 } else { 4 } + o);
+    };
     // owner cpu of the snapshot requests (cpu_ns is per thread: read on the owner)
     let owner_ns = std::cell::Cell::new(0u64);
     // candidate RIR built off the owner is stored only if no patch landed meanwhile
@@ -13450,7 +13458,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         cost_name(up, id);
         compile_watch(Some((&format!("tier1 locked: {}", (&*up).fns[id as usize].name), 0)));
         if needs_rir(up) {
-            if splittable(up, id) && split_tried.borrow_mut().insert((id, false)) {
+            if splittable(up, id, false) && split_tried.borrow_mut().insert((id, false)) {
                 splits.borrow_mut().push((id, RirMode::Tier0));
                 owner_ns.set(owner_ns.get() + cpu_ns() - s0);
                 return None;
@@ -13461,7 +13469,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             TIER1_RIR_REBUILT[1].fetch_add(wall_ns() - t, Ordering::Relaxed);
         }
         if (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| upgradable(r)) {
-            if splittable(up, id) && split_tried.borrow_mut().insert((id, true)) {
+            if splittable(up, id, true) && split_tried.borrow_mut().insert((id, true)) {
                 splits.borrow_mut().push((id, RirMode::Normal));
                 owner_ns.set(owner_ns.get() + cpu_ns() - s0);
                 return None;
@@ -13555,15 +13563,16 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let u = &mut *up;
         u.sync_entry_ref(c);
         if u.fns[c as usize].rir.as_ref().is_some_and(|r| upgradable(r)) {
-            if splittable(up, c) && split_tried.borrow_mut().insert((c, true)) {
+            if splittable(up, c, true) && split_tried.borrow_mut().insert((c, true)) {
                 splits.borrow_mut().push((c, RirMode::Normal));
             } else {
+                owner_fallback(c, true, splittable(up, c, true));
                 let _ = build_rir_or_skip(up, c, RirMode::Normal);
             }
         }
         let u = &mut *up;
         let f = &u.fns[c as usize];
-        if f.rir.is_some() || f.building || f.build_err.is_some() || left_out.borrow().get(&c).is_some_and(|n| *n >= 2) {
+        if f.rir.is_some() || f.building || f.build_err.is_some() || left_out.borrow().get(&c).is_some_and(|n| *n >= SPLIT_TRIES) {
             return;
         }
         // a closure whose enclosing fn came from the disk cache: its body is checked here (a
@@ -13604,10 +13613,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 }
             }
             // fronted already (a take's needs) but not built: its O1 build on this thread too
-            if splittable(up, c) && split_tried.borrow_mut().insert((c, false)) {
+            if splittable(up, c, false) && split_tried.borrow_mut().insert((c, false)) {
                 splits.borrow_mut().push((c, RirMode::Tier0));
                 return;
             }
+            owner_fallback(c, false, splittable(up, c, false));
             let t = wall_ns();
             compile_watch(Some((&format!("O3 snapshot: build_rir {}", u.fns[c as usize].name), 0)));
             if build_rir_or_skip(up, c, RirMode::Tier0).is_none() {
@@ -13878,12 +13888,22 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         (p, g, owner::take_needs())
     }).unwrap_or_else(|_| (Vec::new(), ids.iter().map(|x| x.0).collect(), Vec::new()));
     needs.extend(more_needs);
+    {
+        let mut so = split_out.borrow_mut();
+        for x in &ids { so.insert(x.0, 3); }
+        for p in &preps { so.insert(p.0, 2); }
+        for c in &gave { so.insert(*c, 1); }
+    }
     for c in gave {
         let mut l = left_out.borrow_mut();
         let n = l.entry(c).or_insert(0);
         *n += 1;
-        if *n < 2 {
+        // tried once more after the fronts it needed (this round's `needs`), off the owner again:
+        // not built by the snapshot on the owner because its split was tried
+        if *n < SPLIT_TRIES {
             fronted.remove(&c);
+            split_tried.borrow_mut().remove(&(c, false));
+            split_tried.borrow_mut().remove(&(c, true));
         }
     }
     if !preps.is_empty() {
@@ -15307,11 +15327,12 @@ unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u3
         let u = &*up;
         let f = &u.fns[c as usize];
         if f.building || f.inflight || f.build_err.is_some() {
+            cand_skip(if f.building { 0 } else if f.inflight { 1 } else { 2 });
             continue;
         }
-        match &f.key {
-            FnKey::Inst(_, args) if !args.iter().any(|t| u.tcx.tys.depth(*t) > INSTANCE_DEPTH_LIMIT) => {}
-            _ => continue,
+        if !splits_off_owner(u, c, mode == RirMode::Normal) {
+            cand_skip(3);
+            continue;
         }
         // an upgrade of baseline (or SPEC-V unverified) RIR to normal RIR, as build_rir_unguarded
         // makes it: the lowering it reuses is the slot's own RIR; one it would lower again (calls to
@@ -15319,25 +15340,30 @@ unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u3
         // snapshot's own build
         let lowered = if mode == RirMode::Normal {
             if !u.refresh_verified(c) {
+                cand_skip(4);
                 continue;
             }
-            let Some(r) = &f.rir else { continue };
+            let Some(r) = &f.rir else { cand_skip(5); continue };
             if !upgradable(r) {
+                cand_skip(6);
                 continue;
             }
             if r.plain_calls || !f.d3_lowered.load(Ordering::Relaxed) && u.disjoint_checks(c).is_some() {
+                cand_skip(7);
                 gave.push(c);
                 continue;
             }
             Some((**r).clone())
         } else {
             if f.rir.is_some() {
+                cand_skip(8);
                 continue;
             }
             None
         };
         (&mut *up).check_before_lowering(c);
         if begin_build(up, c).is_err() {
+            cand_skip(9);
             continue;
         }
         let depth0 = BUILD_STACK.try_with(|s| s.borrow().len()).unwrap_or(0);
@@ -15350,21 +15376,54 @@ unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u3
         }
         end_build(up, c);
         match r {
-            Ok(Ok((p, _))) => preps.push((c, p)),
-            Ok(Err(e)) if e == YIELDED || e == NEEDS_FRONT => gave.push(c),
+            Ok(Ok((p, _))) => { cand_skip(13); preps.push((c, p)) }
+            Ok(Err(e)) if e == YIELDED || e == NEEDS_FRONT => { cand_skip(10); gave.push(c) }
             // the fronts it needs go to the snapshot's next round (owner::take_needs)
             Err(p) if p.is::<crate::preempt::PublishBail>() => {
                 if let Ok(b) = p.downcast::<crate::preempt::PublishBail>() {
                     owner::note_needs(b.slots);
                 }
+                cand_skip(11);
                 gave.push(c);
             }
             Err(p) if p.is::<crate::preempt::OwnerBusy>() => std::panic::resume_unwind(p),
-            _ => {}
+            _ => cand_skip(12),
         }
     }
     (preps, gave)
 }
+
+/// (instrument) what o3_candidates_begin / o3_candidates_finish did with each candidate: begin left
+/// it out (building, inflight, build error, key, unverified, no RIR, not upgradable, plain/disjoint
+/// lowered again, has RIR, begin_build failed, needs a front, publish bail, other), prepared;
+/// finish (epoch moved, building/error, not replacing, stored, optimisation failed). Verbose summary.
+pub static CAND_SKIP: [AtomicU64; 27] = [const { AtomicU64::new(0) }; 27];
+fn cand_skip(i: usize) {
+    CAND_SKIP[i].fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn cand_skip_summary() -> String {
+    const N: [&str; 27] = ["building", "inflight", "build-err", "key", "unverified", "no-rir", "not-upgradable", "relower", "has-rir", "begin-err", "needs-front", "bail", "other", "PREPPED", "fin-epoch", "fin-building", "fin-not-replacing", "FIN-STORED", "fin-opt-err",
+        "owner-up:no-split", "owner-up:gave", "owner-up:prepped", "owner-up:skipped", "owner-t0:no-split", "owner-t0:gave", "owner-t0:prepped", "owner-t0:skipped"];
+    N.iter().enumerate().filter_map(|(i, n)| { let v = CAND_SKIP[i].load(Ordering::Relaxed); (v > 0).then(|| format!("{} {}", n, v)) }).collect::<Vec<_>>().join(", ")
+}
+
+/// Slots whose O1 build (`upgrade`: of their baseline RIR to normal RIR) o3_candidates_begin
+/// prepares in a take and the caller optimises off the owner: fn instances, closures and
+/// unverified-mode twins (their fronts are made ahead: prefront_slot); an upgrade also of glue
+/// and shims (it reuses their RIR). Not sandbox twins (twin_rir), not instances past the depth limit.
+fn splits_off_owner(u: &Unit, c: u32, upgrade: bool) -> bool {
+    match &u.fns[c as usize].key {
+        FnKey::Inst(d, args) => matches!(u.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn)
+            && !args.iter().any(|t| u.tcx.tys.depth(*t) > INSTANCE_DEPTH_LIMIT),
+        FnKey::Closure(..) | FnKey::Plain(_) => true,
+        FnKey::Glue(..) | FnKey::Shim(_) => upgrade,
+        FnKey::Sandbox(_) => false,
+    }
+}
+
+/// Takes an O3 snapshot gives a candidate whose preparation needed fronts: each round fronts the
+/// level of inline candidates the last one revealed (each round walks the frontier again)
+const SPLIT_TRIES: u8 = 2;
 
 /// O1 builds of `ids` off the owner (their fronts made ahead): prepared in a take (a publish), optimised on
 /// this thread, stored by a finish (a publish). Rule I-PUB: a background build's O1 optimisation never
@@ -15376,16 +15435,35 @@ unsafe fn build_off_owner(up: *mut Unit, ids: &[(u32, RirMode)]) {
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
     let epoch0 = PATCH_EPOCH.load(Ordering::SeqCst);
-    let Ok((preps, _)) = owner::publish_or_bail(|| o3_candidates_begin(up, ids)) else { return };
-    if preps.is_empty() {
-        return;
+    let front = owner::publish(|| (&*up).front.clone());
+    let mut todo = ids.to_vec();
+    let mut fronted: Vec<u32> = Vec::new();
+    // a build whose preparation needed fronts (its inline candidates') is tried again after this
+    // thread made them (take_prefronted's rounds), not left to the caller's take on the owner
+    for _ in 0..PREFRONT_ROUNDS {
+        let Ok((preps, gave, needs)) = owner::publish_or_bail(|| {
+            let (p, g) = o3_candidates_begin(up, &todo);
+            (p, g, owner::take_needs())
+        }) else { return };
+        if !preps.is_empty() {
+            let mut done: Vec<Deferred> = Vec::new();
+            for (c, prep) in preps {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize_tree(options, c, prep, &mut done)));
+                if let Ok(r) = r { done.push((c, r)); }
+            }
+            owner::publish(|| o3_candidates_finish(up, epoch0, done));
+        }
+        todo.retain(|x| gave.contains(&x.0));
+        if todo.is_empty() || needs.is_empty() || needs.iter().any(|s| fronted.contains(s)) {
+            return;
+        }
+        for s in needs {
+            fronted.push(s);
+            if !prefront_slot(&front, s) {
+                return;
+            }
+        }
     }
-    let mut done: Vec<Deferred> = Vec::new();
-    for (c, prep) in preps {
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize_tree(options, c, prep, &mut done)));
-        if let Ok(r) = r { done.push((c, r)); }
-    }
-    owner::publish(|| o3_candidates_finish(up, epoch0, done));
 }
 
 /// Stores the RIR o3_candidates_begin's builds made off the owner (a publish), where nobody built
@@ -15393,21 +15471,25 @@ unsafe fn build_off_owner(up: *mut Unit, ids: &[(u32, RirMode)]) {
 /// an upgrade where the slot's RIR is still upgradable (upgrade_replaces).
 unsafe fn o3_candidates_finish(up: *mut Unit, epoch: u64, done: Vec<Deferred>) {
     if PATCH_EPOCH.load(Ordering::SeqCst) != epoch {
+        CAND_SKIP[14].fetch_add(done.len() as u64, Ordering::Relaxed);
         return;
     }
     for (c, r) in done {
-        if let Ok((f, inl)) = r {
-            let x = &(&*up).fns[c as usize];
-            if x.building || x.build_err.is_some() {
-                continue;
-            }
-            let store = match &x.rir {
-                None => true,
-                Some(r) => upgrade_replaces(r, &f),
-            };
-            if store {
-                store_rir(up, c, f, inl, 0);
-            }
+        let Ok((f, inl)) = r else { cand_skip(18); continue };
+        let x = &(&*up).fns[c as usize];
+        if x.building || x.build_err.is_some() {
+            cand_skip(15);
+            continue;
+        }
+        let store = match &x.rir {
+            None => true,
+            Some(r) => upgrade_replaces(r, &f),
+        };
+        if store {
+            cand_skip(17);
+            store_rir(up, c, f, inl, 0);
+        } else {
+            cand_skip(16);
         }
     }
 }
@@ -16693,6 +16775,7 @@ pub static PREFRONTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// front; a slot it needed a front for is fronted here (`prefront_slot`) and `take` runs again.
 /// None: the build bails (a front lowering ahead cannot make, an initializer, JIT code, a wait;
 /// counted in owner::BAILS), and is dropped whole.
+#[track_caller]
 fn take_prefronted<R>(front: &FrontShared, mut take: impl FnMut() -> R) -> Option<R> {
     let mut fronted: Vec<u32> = Vec::new();
     for _ in 0..PREFRONT_ROUNDS {
