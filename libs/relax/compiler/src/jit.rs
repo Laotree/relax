@@ -12403,16 +12403,18 @@ const CALL_COST: u64 = 20;
 /// 32 -> 1986 (Hud::draw_walk, 14 KB at 60 calls/s, right at the threshold), 128 -> 1530 (it stays
 /// below O3)
 const WEIGHT_BYTES: u64 = 16;
-/// ... up to this (16 KB of code): at the default threshold a fn needs at least ~27 calls/s to tier
-/// up by its calls, a 60 Hz one ~7 KB of baseline code (the race's Hud::draw_walk: 14 KB), and one
+/// ... up to this (16 KB of code): at the default threshold a fn needs at least ~40 calls/s to tier
+/// up by its calls, a 60 Hz one ~10 KB of baseline code (the race's Hud::draw_walk: 14 KB), and one
 /// call of a huge startup fn is never enough
 const MAX_WEIGHT: u64 = 1024;
-/// The cost seen decays exponentially with this half-life: code tiers up when its cost rate
-/// keeps the decayed sum over the threshold (steady rate > threshold * ln 2 / half-life: ~28k
-/// units/s at the default, ~1400 small calls/s or a ~27 calls/s per-frame fn of max weight), and
-/// idle code decays to nothing. Decay is applied lazily at each check: no timer, no thread, no
-/// work while the program does not call the slot.
-const COST_HALF_LIFE_NS: f64 = 1e9;
+/// The cost seen decays exponentially with this half-life: code tiers up when its cost rate keeps
+/// the decayed sum over the threshold (steady rate > threshold x ln 2 / half-life). At ln 2 s the
+/// steady rate is the threshold per second: 2000 small calls/s or 40000 back edges/s, the old
+/// windows' rates, and a 60 Hz fn of weight 667 or more (~10 KB); a burst of the threshold's cost
+/// tiers up at once (MAKEPAD_RUN_O3_CALLS=1: one call). Idle code decays to nothing. Decay is
+/// applied lazily at each check: no timer, no thread, no work while the program does not call the
+/// slot.
+const COST_HALF_LIFE_NS: f64 = std::f64::consts::LN_2 * 1e9;
 /// rt_loop_hot takes the cost of this many back edges (threshold / LOOP_CHUNK_DIV) at once: fine
 /// enough that a loop under the threshold rate never adds up to it in one chunk
 const LOOP_CHUNK_DIV: u64 = 4;
@@ -12546,7 +12548,7 @@ mod tier_cost_tests {
     fn idle_cost_decays() {
         assert_eq!(cost_decay(40_000, 30_000_000_000), 0);
         assert_eq!(cost_decay(40_000, 0), 40_000);
-        assert_eq!(cost_decay(40_000, COST_HALF_LIFE_NS as u64), 20_000);
+        assert!((19_999..=20_000).contains(&cost_decay(40_000, COST_HALF_LIFE_NS as u64)));
         assert_eq!(cost_spread(1000, 0), 1000);
         assert!(call_weight(0) == CALL_COST as u32 && call_weight(1 << 30) == MAX_WEIGHT as u32);
     }
