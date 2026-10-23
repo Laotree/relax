@@ -698,6 +698,9 @@ fn display_name(u: &crate::jit::Unit, id: u32, depth: u32) -> String {
             s
         }
         crate::jit::FnKey::Closure(_, _, p) if depth < 8 && (*p as usize) < u.fns.len() => format!("{{closure}} in {}", display_name(u, *p, depth + 1)),
+        // a SPEC-V twin: its base slot's name now (the twin's own copy was taken when it was made, before
+        // the base had one: `[unverified]` alone)
+        crate::jit::FnKey::Plain(b) if depth < 8 && (*b as usize) < u.fns.len() => format!("{} [unverified]", display_name(u, *b, depth + 1)),
         _ => f.name.to_string(),
     }
 }
