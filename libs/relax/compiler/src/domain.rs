@@ -113,7 +113,7 @@ fn rehome(u: &Unit, addr: u64, seen: &mut std::collections::HashMap<u64, u64>, f
     // fresh, zeroed block: the warm run read a length of 0). An object whose kind cannot tell
     // is scanned word by word, as before.
     let pw = u.ptr_bytes() as usize;
-    let words: Vec<usize> = match crate::syms::pointer_offsets(u, start) {
+    let words: Vec<usize> = match crate::syms::pointer_offsets(u, start, &bytes) {
         Some(offs) => offs.into_iter().map(|o| o as usize).filter(|&o| o + pw <= bytes.len()).collect(),
         None => (0..bytes.len() / pw).map(|i| i * pw).collect(),
     };
