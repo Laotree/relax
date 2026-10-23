@@ -3461,11 +3461,32 @@ impl Unit {
         if std::env::var_os("MAKEPAD_RUN_TLS_TRACE").is_some() {
             eprintln!("thread_local {}: {} bytes align {}, {} at {:#x}{}", self.prog.def_path(d), size, align, if place.fixed { "static TLS" } else { "block" }, value, if zero { "" } else { ", copied on first access" });
         }
-        crate::zone_alloc::kept_with(|| self.tls_places.insert(d, place));
+        crate::zone_alloc::kept_with(|| {
+            self.tls_places.insert(d, place);
+            // (FrontShared::tls: lowering ahead reads the place there)
+            self.front.tls.insert(d, place);
+        });
         Some(place)
     }
 
+    /// thread_local_place from shared lowering (a unit call: placing allocates TLS). Lowering
+    /// ahead reads a placed static from FrontShared::tls (checked at the take, as a constant);
+    /// one nobody placed yet in this run ends the lowering, and a background build's own front
+    /// notes it for the owner (const_drain), as an unevaluated constant.
     pub fn thread_local_place_shared(&self, d: DefId) -> Option<TlsPlace> {
+        if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) {
+            if let Some(p) = self.front.tls.get(&d) {
+                LOWER_AHEAD_IDS.with(|x| x.borrow_mut().tls.push((d, p)));
+                return Some(p);
+            }
+            if ahead_trace() {
+                eprintln!("ahead-lower: thread_local {} not placed yet", self.prog.def_path(d));
+            }
+            if WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
+                let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
+                want(Wanted::Tls(d), epoch);
+            }
+        }
         owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).thread_local_place(d) })
     }
 
@@ -4696,7 +4717,7 @@ impl Unit {
             // requests (const_drain) and the build's next take finds it
             if WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
                 let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
-                crate::zone_alloc::kept_with(|| CONSTS_WANTED.lock().unwrap_or_else(|e| e.into_inner()).push((d, args.clone(), epoch)));
+                want(Wanted::Const(d, args.clone()), epoch);
             }
         }
         owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).const_addr(d, args) })
@@ -12386,8 +12407,32 @@ pub fn sweep_verdicts() {
             });
         }
         relower.extend(tc.o3.iter().copied());
+        // O3 builds whose snapshot left out a callee as unverified: built again now that it is
+        // verified (it inlines); a root not at O3 yet checks at its install
+        let mut again = Vec::new();
+        {
+            let mut a = UNVERIFIED_LEFT.lock().unwrap_or_else(|e| e.into_inner());
+            a.retain(|&(k, c, r)| {
+                if k != up as usize {
+                    return false;
+                }
+                if !verified.contains(&c) && !relower.contains(&c) || !u.fns[r as usize].o3.load(Ordering::Relaxed) {
+                    return true;
+                }
+                if !again.contains(&r) && !relower.contains(&r) {
+                    again.push(r);
+                }
+                false
+            });
+        }
         relower_twin_callers(up, &tc);
         for &id in &relower { tier_push(id, Q_RETIER, 0); }
+        for &r in &again {
+            if specv_trace() {
+                eprintln!("specv @{:.3} O3 #{} {} built again: a callee it left out unverified is verified", wall_ns() as f64 / 1e9, r, short_name(&u.fns[r as usize].name));
+            }
+            (&mut *up).retier(r);
+        }
         let released: Vec<(u32, Await)> = {
             let mut a = AWAIT_VERDICT.lock().unwrap_or_else(|e| e.into_inner());
             // the list outlives the compiler zone (a swap destroys it): the kept part is allocated
@@ -12491,6 +12536,10 @@ fn twin_callers(u: &Unit, cands: Option<&[u32]>, twin: Option<u32>) -> TwinCalle
 /// SPEC-V: (unit, twin) -> the slots whose lowering called the twin (lower.rs records them); entries
 /// go when the caller is lowered again for it (relower_twin_callers)
 static TWIN_USERS: std::sync::LazyLock<relax_session::sync::Mutex<HashMap<(usize, u32), Vec<u32>>>> = std::sync::LazyLock::new(Default::default);
+/// SPEC-V: (unit, callee, root): O3 builds of `root` left `callee` out of the snapshot while it was
+/// unverified (never inlined before its verdict): `root` is built again once it is verified
+/// (sweep_verdicts, or its own install when the verdict came first)
+static UNVERIFIED_LEFT: relax_session::sync::Mutex<Vec<(usize, u32, u32)>> = relax_session::sync::Mutex::new(Vec::new());
 /// SPEC-V: unverified callers of hot twins: lowered again once their verdict is clean (sweep_verdicts)
 static TWIN_AWAIT: relax_session::sync::Mutex<Vec<(usize, u32)>> = relax_session::sync::Mutex::new(Vec::new());
 
@@ -14233,6 +14282,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // small inline candidates stay there). Warm Stage: single snapshots of 100-680 ms on the owner.
     let prefront = !owner::is_owner() && !t1prof_replay(options) && pipelined();
     let mut fronted: std::collections::HashSet<u32> = Default::default();
+    // slots whose front named a constant or thread-local the owner had not made yet (noted for
+    // its const_drain): fronted once more in the next round, each once
+    let mut refronted: std::collections::HashSet<u32> = Default::default();
     let fronts: std::cell::RefCell<Vec<(u32, DefId, Vec<TyId>)>> = Default::default();
     // O1 builds a round's walk met that this thread prepares through a take and optimises itself
     // (o3_candidates_begin / o3_candidates_finish), not on the owner: upgrades of baseline RIR to
@@ -14558,13 +14610,31 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let mut t1_snap_keys: Vec<String> = Vec::new();
     // PGO: block counts of counted inline candidates (slot, key when profiling, counts)
     let mut snap_counts: Vec<(u32, Option<String>, Vec<f32>)> = Vec::new();
+    // (MAKEPAD_RUN_O3_TRACE) callees left out of the snapshot, with why
+    let mut outs: Vec<String> = Vec::new();
+    let trace_outs = std::env::var_os("MAKEPAD_RUN_O3_TRACE").is_some();
+    // SPEC-V: callees left out as unverified (never inlined before their verdict): this build is
+    // queued again once they are verified (UNVERIFIED_LEFT), and their verdicts go first
+    let mut unverified_left: Vec<u32> = Vec::new();
     for &c in &callees {
         let f = &u.fns[c as usize];
         let attrs = match callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, true) {
             Some(a) => a,
-            None => continue,
+            None => {
+                let unverified = f.unverified.load(Ordering::Relaxed);
+                if unverified {
+                    unverified_left.push(c);
+                }
+                if trace_outs {
+                    outs.push(format!("{}({})", f.name, if unverified { "unverified" } else { "not inlinable" }));
+                }
+                continue;
+            }
         };
         let live_cold = !f.compiled && f.history().inlined_into.is_empty();
+        if trace_outs && f.rir.is_none() {
+            outs.push(format!("{}(no rir{}{})", f.name, if f.building { ", building" } else { "" }, if f.build_err.is_some() { ", build failed" } else { "" }));
+        }
         if let Some(r) = &f.rir {
             let cold = match &t1key {
                 Some(k) => {
@@ -14603,6 +14673,16 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             }
             snap.push((c, r.clone(), attrs));
         }
+    }
+    if trace_outs && !outs.is_empty() {
+        eprintln!("O3 snapshot of {}: left out {}", u.fns[id as usize].name, outs.join(", "));
+    }
+    if !unverified_left.is_empty() {
+        {
+            let mut a = UNVERIFIED_LEFT.lock().unwrap_or_else(|e| e.into_inner());
+            crate::zone_alloc::kept_with(|| for &c in &unverified_left { if !a.contains(&(up as usize, c, id)) { a.push((up as usize, c, id)); } });
+        }
+        prioritize_verdicts(up, &unverified_left);
     }
     t1_cold_keys.sort();
     t1_cold_keys.dedup();
@@ -14695,13 +14775,21 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         // is needed again after it: lowering ahead refused it) is left out of the snapshot; only
         // the root's own front failing drops the build. (Dropping the root for a candidate kept
         // warm-image code -- every body without its checked body -- at baseline: MICKEYGAP.)
+        // A front that named a constant or thread-local nobody made in this run yet noted it for the
+        // owner, who makes it before its next request (const_drain): that front is tried once more
+        // in the next round instead of leaving the candidate a call (or dropping the root) for the
+        // build -- nothing rebuilds a root for a callee that becomes inlinable later.
         Err(b) if rounds < O3_TAKE_ROUNDS && !b.slots.is_empty() && b.slots.iter().fold(true, |ok, &s| {
+            let noted = want_notes();
             let made = fronted.insert(s) && prefront_slot(&front, s);
-            if !made && s != id {
+            let again = !made && want_notes() != noted && refronted.insert(s);
+            if again {
+                fronted.remove(&s);
+            } else if !made && s != id {
                 // from the next round on, a candidate needing a front is left out (bail_for_fronts)
                 fronts_done.set(true);
             }
-            ok && (made || s != id)
+            ok && (made || again || s != id)
         }) => {
             continue;
         }
@@ -15148,6 +15236,18 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                             }
                         });
                     }
+                }
+                // callees its snapshot left out as unverified that are verified by now (the rest:
+                // sweep_verdicts queues this build again when their verdicts come)
+                {
+                    let mut a = UNVERIFIED_LEFT.lock().unwrap_or_else(|e| e.into_inner());
+                    a.retain(|&(k, c, r)| {
+                        if k != up as usize || r != id || u.fns[c as usize].unverified.load(Ordering::Relaxed) {
+                            return true;
+                        }
+                        again = true;
+                        false
+                    });
                 }
                 if again && !(t1prof_on(options) && T1PROF.lock().unwrap().as_ref().map_or(false, |p| p.replay)) {
                     u.retier(id);
@@ -17698,8 +17798,8 @@ fn prefront_closure(front: &FrontShared, id: u32) -> bool {
         LOWERING_AHEAD.with(|a| a.set(true));
         let _guard = LowerAheadGuard;
         let (func, _) = lower_checked_body(u, id, &key, &body)?;
-        let (callees, consts) = LOWER_AHEAD_IDS.with(|a| { let mut a = a.borrow_mut(); (std::mem::take(&mut a.keys), std::mem::take(&mut a.consts)) });
-        Ok::<_, String>(LoweredAhead { epoch, file: u.fns[id as usize].file, func, body: Some(body.clone()), callees, consts })
+        let (callees, consts, tls) = LOWER_AHEAD_IDS.with(|a| { let mut a = a.borrow_mut(); (std::mem::take(&mut a.keys), std::mem::take(&mut a.consts), std::mem::take(&mut a.tls)) });
+        Ok::<_, String>(LoweredAhead { epoch, file: u.fns[id as usize].file, func, body: Some(body.clone()), callees, consts, tls })
     }));
     let missing = !crate::program::take_missing().is_empty();
     let ready = match r {
@@ -17980,6 +18080,9 @@ pub struct FrontShared {
     /// checks each value it read against the unit's own tables (take_lowered_ahead), so a stale
     /// entry costs a bail, never a wrong constant.
     consts: crate::conc::MemoMap<(DefId, Vec<TyId>), u64>,
+    /// `#[thread_local]` statics the owner placed (Unit::thread_local_place), read by lowering
+    /// ahead as `consts` (checked at the take against Unit::tls_places)
+    tls: crate::conc::MemoMap<DefId, TlsPlace>,
     /// Until the first present, `helpers` threads type-check every new slot's body ahead (queue
     /// of slots): a cold start's main thread finds most bodies it calls checked
     /// (MAKEPAD_RUN_AHEAD_HELPERS=n; default ahead_helpers()). After it they serve the UI
@@ -18047,6 +18150,7 @@ impl FrontShared {
             consts: crate::conc::MemoMap::with_bits(12),
             // (`makepad check` (const_fuel) only reports diagnostics: no lowering ahead -- an ahead
             // helper's lowering of main raced the exit with its layout errors, limits/issue-55878)
+            tls: crate::conc::MemoMap::with_bits(8),
             helpers: if options.tyck_ahead && !options.const_fuel { options.ahead_helpers.unwrap_or_else(ahead_helpers) } else { 0 },
             live_helpers: std::sync::atomic::AtomicU32::new(0),
             ahead_post: Default::default(),
@@ -18282,6 +18386,8 @@ struct LoweredAhead {
     callees: Vec<FnKey>,
     /// the constants it read from FrontShared::consts, with their values (checked at the take)
     consts: Vec<(DefId, Vec<TyId>, u64)>,
+    /// the thread-local places it read from FrontShared::tls (checked at the take)
+    tls: Vec<(DefId, TlsPlace)>,
 }
 
 thread_local! {
@@ -18297,6 +18403,8 @@ struct AheadFnIds {
     ids: HashMap<FnKey, u32>,
     /// constants read from FrontShared::consts (LoweredAhead::consts)
     consts: Vec<(DefId, Vec<TyId>, u64)>,
+    /// thread-local places read from FrontShared::tls (LoweredAhead::tls)
+    tls: Vec<(DefId, TlsPlace)>,
 }
 
 struct LowerAheadGuard;
@@ -18473,9 +18581,9 @@ fn lower_ahead_as(u: &Unit, into: u32, base: u32, d: DefId, args: &[TyId], epoch
         let Some(body) = crate::typeck::try_codegen_body(&u.prog, &u.tcx, d, args) else { return Err("body does not normalize".to_string()) };
         if plain.is_some() && !lowers_ahead(u, d, &body, true) { return Err("not lowered ahead".to_string()) }
         let (func, closures) = lower_checked_body(u, base, &fn_key, &body)?;
-        let (callees, consts) = LOWER_AHEAD_IDS.with(|a| { let mut a = a.borrow_mut(); (std::mem::take(&mut a.keys), std::mem::take(&mut a.consts)) });
+        let (callees, consts, tls) = LOWER_AHEAD_IDS.with(|a| { let mut a = a.borrow_mut(); (std::mem::take(&mut a.keys), std::mem::take(&mut a.consts), std::mem::take(&mut a.tls)) });
         // a twin's closures are its base's (their bodies come with the base's own lowering)
-        Ok::<_, String>(LoweredAhead { epoch, file: if plain.is_some() { u.fns[into as usize].file } else { body.file }, func, body: (closures && plain.is_none()).then_some(body), callees, consts })
+        Ok::<_, String>(LoweredAhead { epoch, file: if plain.is_some() { u.fns[into as usize].file } else { body.file }, func, body: (closures && plain.is_none()).then_some(body), callees, consts, tls })
     }));
     let missing = !crate::program::take_missing().is_empty();
     let ready = match r {
@@ -18564,7 +18672,7 @@ fn give_back_lowered(u: &Unit, id: u32, func: relax_backend::rir::Func) {
         FnKey::Closure(cfile, _, parent) => u.body_of(parent, cfile).cloned(),
         _ => None,
     };
-    let back = LoweredAhead { epoch, file: u.fns[id as usize].file, func, body, callees: Vec::new(), consts: Vec::new() };
+    let back = LoweredAhead { epoch, file: u.fns[id as usize].file, func, body, callees: Vec::new(), consts: Vec::new(), tls: Vec::new() };
     u.front.lowered.lock().unwrap_or_else(|e| e.into_inner()).insert(id, Some(back));
 }
 
@@ -18584,6 +18692,11 @@ fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func>
         if !same {
             return None;
         }
+    }
+    // the thread-local places it read, as the unit has them now (a reset since: the build lowers
+    // its own)
+    if lowered.tls.iter().any(|(d, p)| u.tls_places.get(d) != Some(p)) {
+        return None;
     }
     // a closure lowered off the owner (prefront_closure): from the body its parent has now, and
     // the closure identity the disk cache's links agree with
@@ -20015,6 +20128,19 @@ thread_local! {
     /// is noted for the owner (CONSTS_WANTED)
     static WANT_CONSTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+thread_local! {
+    /// wants this thread noted (CONSTS_WANTED pushes): a front that failed for one is worth a retry
+    /// once the owner drained them
+    static WANT_NOTES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+fn want_notes() -> u32 {
+    WANT_NOTES.try_with(|n| n.get()).unwrap_or(0)
+}
+/// Notes `w` for the owner's const_drain.
+fn want(w: Wanted, epoch: u64) {
+    crate::zone_alloc::kept_with(|| CONSTS_WANTED.lock().unwrap_or_else(|e| e.into_inner()).push((w, epoch)));
+    let _ = WANT_NOTES.try_with(|n| n.set(n.get().wrapping_add(1)));
+}
 struct WantConsts(bool);
 impl WantConsts {
     fn on() -> WantConsts {
@@ -20033,11 +20159,21 @@ impl Drop for WantConsts {
 /// names one (`EPS`, `usize::MAX`, `Vec::ZERO`) bailed on its own front for the whole run (mickey:
 /// mirror::walk_hurt_changed / reconcile ran their warm-cache baseline code). Rule I-PURE keeps
 /// CTFE on the owner: it evaluates them between requests (const_drain), nobody waits for it.
-static CONSTS_WANTED: relax_session::sync::Mutex<Vec<(DefId, Vec<TyId>, u64)>> = relax_session::sync::Mutex::new(Vec::new());
+/// The same holds for a `#[thread_local]` static nobody placed in this run (Unit::thread_local_place
+/// allocates its TLS: csg_boolean's CURRENT_CANCEL getter ran baseline).
+static CONSTS_WANTED: relax_session::sync::Mutex<Vec<(Wanted, u64)>> = relax_session::sync::Mutex::new(Vec::new());
 
-/// Owner, between requests: the constants CONSTS_WANTED names, evaluated into FrontShared::consts
-/// (Unit::const_addr publishes there). One that fails is not asked for again by this drain; a
-/// build that needs it bails as before (the owner's lowering reports it).
+/// What a background build's front found missing (CONSTS_WANTED)
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Wanted {
+    Const(DefId, Vec<TyId>),
+    Tls(DefId),
+}
+
+/// Owner, before each request: the constants CONSTS_WANTED names, evaluated into FrontShared::consts
+/// (Unit::const_addr publishes there), and its thread-local statics, placed into FrontShared::tls.
+/// One that fails is not asked for again by this drain; a build that needs it bails as before
+/// (the owner's lowering reports it).
 pub(crate) fn const_drain() {
     let want = std::mem::take(&mut *CONSTS_WANTED.lock().unwrap_or_else(|e| e.into_inner()));
     if want.is_empty() {
@@ -20049,14 +20185,27 @@ pub(crate) fn const_drain() {
     }
     let u = unsafe { &mut *up };
     let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
-    let mut seen: crate::fxhash::HashSet<(DefId, Vec<TyId>)> = Default::default();
-    for (d, args, e) in want {
-        if e != epoch || u.front.consts.get(&(d, args.clone())).is_some() || !seen.insert((d, args.clone())) {
+    let mut seen: crate::fxhash::HashSet<Wanted> = Default::default();
+    for (w, e) in want {
+        if e != epoch || !seen.insert(w.clone()) {
             continue;
         }
-        let a = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.const_addr(d, args)));
+        let (d, ok) = match w {
+            Wanted::Const(d, args) => {
+                if u.front.consts.get(&(d, args.clone())).is_some() {
+                    continue;
+                }
+                (d, matches!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.const_addr(d, args))), Ok(Some(_))))
+            }
+            Wanted::Tls(d) => {
+                if u.front.tls.get(&d).is_some() {
+                    continue;
+                }
+                (d, matches!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.thread_local_place(d))), Ok(Some(_))))
+            }
+        };
         if ahead_trace() {
-            eprintln!("const-drain: {} {}", u.prog.def_path(d), if matches!(a, Ok(Some(_))) { "evaluated" } else { "failed" });
+            eprintln!("const-drain: {} {}", u.prog.def_path(d), if ok { "evaluated" } else { "failed" });
         }
     }
 }

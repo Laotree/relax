@@ -6,6 +6,10 @@
 // disk cache, not the startup image) name constants: in the warm run nothing lowers on the owner, so
 // nobody evaluates MIX_K / LATE_K unless a background build's front asks for them (const_drain).
 
+// TICKS (a `#[thread_local]` static under thread_local!): its getter's background O3 front asked
+// the owner for the static's TLS place and bailed on it every time (csg_boolean's CURRENT_CANCEL
+// getter ran baseline, PGO6): lowering ahead reads placed statics from FrontShared::tls.
+
 const MIX_K: u64 = 31;
 const LATE_K: u64 = 0x9e37_79b9_7f4a_7c15;
 const LATE_MS: u64 = 300;
@@ -32,6 +36,22 @@ fn late(acc: &mut [u64]) -> u64 {
     h
 }
 
+thread_local! {
+    static TICKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline(never)]
+fn tick() -> u64 {
+    let mut s = 0u64;
+    for i in 0..256u64 {
+        s ^= TICKS.with(|t| {
+            t.set(t.get().wrapping_add(i));
+            t.get()
+        });
+    }
+    s
+}
+
 fn main() {
     let once = std::env::var("PRELINK_ONCE").is_ok();
     let secs: u64 = std::env::var("TWIN_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
@@ -43,6 +63,7 @@ fn main() {
     loop {
         step(&mut acc, &data);
         n += 1;
+        h = h.wrapping_add(tick() & 1);
         if t0.elapsed().as_millis() as u64 >= LATE_MS {
             h ^= late(&mut acc);
             if once {
