@@ -2435,6 +2435,9 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 else if !teardown_started { Some("the teardown is not scheduled") }
                 else if jit::QUIT_SEEN.load(Ordering::Relaxed) { Some("the run is quitting") }
                 else { None };
+            if let Some(why) = rebuild_block.filter(|w| !w.is_empty()) {
+                if rebuild_said != why { verbose!("makepad-run settle rebuild waits: {why}"); rebuild_said = why.to_string(); }
+            }
             if rebuild_block.is_none() {
                 let up = unsafe { RUN_UNIT };
                 if !up.is_null() {
