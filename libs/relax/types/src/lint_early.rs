@@ -3542,6 +3542,26 @@ fn named_args_positional(prog: &Program, own: &[bool]) {
     }
 }
 
+pub const AMBIGUOUS_PANIC_IMPORTS: Lint = lint::lint("ambiguous_panic_imports");
+
+/// The single-name macro calls of the checked crates resolved in the lexical scopes over the import
+/// replay's macro namespace (front program/rsim.rs `macro_call_ambiguities`): E0659, or the lints
+/// `ambiguous_panic_imports` / `ambiguous_glob_imports`.
+fn macro_call_ambiguities(prog: &Program, own: &[bool]) {
+    let calls = crate::macros::uses::take_plain_macro_calls();
+    for (file, pos, lint_name, msg) in prog.macro_call_ambiguities(calls, own) {
+        match lint_name {
+            None => lint::hard_error(prog, file, pos, &msg),
+            Some(name) => {
+                let l = if name == "ambiguous_panic_imports" { AMBIGUOUS_PANIC_IMPORTS } else { lint::AMBIGUOUS_GLOB_IMPORTS };
+                let krate = prog.file_crate.get(file as usize).copied().unwrap_or(u32::MAX);
+                let def = enclosing_def(prog, file, pos, krate);
+                emit(prog, def, &l, file, pos, &msg);
+            }
+        }
+    }
+}
+
 pub const MACRO_EXPANDED_MACRO_EXPORTS_ACCESSED_BY_ABSOLUTE_PATHS: Lint = lint::lint("macro_expanded_macro_exports_accessed_by_absolute_paths");
 
 /// rustc_resolve ident.rs (resolve_ident_in_module_non_globs_unadjusted, Shadowing::Unrestricted) and
@@ -3694,6 +3714,7 @@ pub fn finish(prog: &Program, own: &[bool]) {
     varargs_without_patterns(prog, own);
     named_args_positional(prog, own);
     macro_expanded_macro_exports(prog, own);
+    macro_call_ambiguities(prog, own);
     crate_attr_lints(prog, own);
     let (defs, used) = crate::macros::uses::take();
     if defs.is_empty() { return; }

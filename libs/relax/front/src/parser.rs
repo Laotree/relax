@@ -1522,6 +1522,9 @@ impl<'a> Parser<'a> {
         let m = self.macros.as_ref()?;
         let seg = self.ast.segs(path.segs).last()?;
         let name = String::from_utf8_lossy(self.bytes(seg.name.lo, seg.name.hi)).trim_start_matches("r#").to_string();
+        if path.segs.len() == 1 && !path.global() && (seg.name.lo as usize) < self.src.len() {
+            if let Some(c) = self.bctx.as_ref() { crate::macros::uses::plain_macro_call(&c.path, seg.name.lo, &name); }
+        }
         // a skipped body calls only built-ins (body_outline checked each call where it was)
         if self.lazy_part {
             return crate::builtins::macro_def(&name);
