@@ -11185,8 +11185,12 @@ fn sample_trace() -> bool {
 /// (a SPEC-V twin's too: named `.<n>.twin` with MAKEPAD_RUN_DUMP_EACH, else it shares the fn's files).
 /// (tools: bench_rt/asmdiff.py)
 fn dump_base(name: &str) -> Option<String> {
-    static DUMP: std::sync::OnceLock<Option<(Vec<String>, String)>> = std::sync::OnceLock::new();
-    let (wants, dir) = DUMP.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_DUMP").ok().map(|w| (w.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect(), std::env::var("MAKEPAD_RUN_DUMP_DIR").unwrap_or_else(|_| "/tmp".to_string()))))).as_ref()?;
+    // no suffixes = off; not an Option: a `None` would carry a stack temporary's payload bytes (zone check 2)
+    static DUMP: std::sync::OnceLock<(Vec<String>, String)> = std::sync::OnceLock::new();
+    let (wants, dir) = DUMP.get_or_init(|| crate::zone_alloc::kept_with(|| match std::env::var("MAKEPAD_RUN_DUMP") {
+        Ok(w) => (w.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect(), std::env::var("MAKEPAD_RUN_DUMP_DIR").unwrap_or_else(|_| "/tmp".to_string())),
+        Err(_) => (Vec::new(), String::new()),
+    }));
     // a SPEC-V twin (`<fn> [unverified]`, which runs first) dumps under its fn's suffix too
     let plain = name.strip_suffix(" [unverified]").unwrap_or(name);
     let w = wants.iter().find(|w| plain.ends_with(w.as_str()))?;
