@@ -2744,6 +2744,8 @@ impl Cache {
             return true;
         }
         let Some(key) = self.manifest_key(root) else { self.manifest_done = true; return true };
+        // what earlier spills of this run wrote: the image takes those entries too
+        self.index_written();
         let mut list: Vec<(Vec<u8>, u128)> = Vec::with_capacity(order.len());
         let mut before_present = 0;
         let mut present_ids = Vec::new();
@@ -2937,6 +2939,7 @@ impl Spill {
         pack::ensure_private_dir(&self.dir)?;
         let mut n = 0;
         for (path, stale, mut entries) in self.files {
+            let code: Vec<u128> = entries.iter().filter(|e| e.kind == KIND_CODE || e.kind == KIND_DATA).map(|e| e.key).collect();
             let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let cname = name.rsplit_once('-').map_or("", |x| x.0).to_string();
             let mut e = E::default();
@@ -2951,8 +2954,46 @@ impl Spill {
             n += entries.len();
             entries.insert(0, NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload: e.0 }.into());
             append_store(&path, entries, stale, &self.marks)?;
+            if !code.is_empty() {
+                WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).push((self.dir.clone(), path, code));
+            }
         }
         Ok(n)
+    }
+}
+
+/// Code and data entries this run's spills wrote, by store file (cache dir, store, keys): the
+/// owning cache indexes them (`Cache::index_written`) so the startup image is built from every code
+/// entry the store has, not only the ones still pending. A cold run's first mid-run write spills
+/// its code before the manifest window closes: its image covered 23-392 of ~45k slots, and the
+/// first warm run rewrote the whole image (~435 ms on the owner) and started unprelinked.
+static WRITTEN: relax_session::sync::Mutex<Vec<(PathBuf, PathBuf, Vec<u128>)>> = relax_session::sync::Mutex::new(Vec::new());
+
+impl Cache {
+    /// Indexes the code and data entries this run's spills wrote to this cache's stores
+    /// (WRITTEN): the store file is opened again (mapped) and its new entries replace what the
+    /// index had for their keys, as the file's own index does.
+    fn index_written(&mut self) {
+        let mine: Vec<(PathBuf, Vec<u128>)> = {
+            let mut w = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+            let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *w).into_iter().partition(|x| x.0 == self.dir);
+            *w = rest;
+            mine.into_iter().map(|x| (x.1, x.2)).collect()
+        };
+        for (path, keys) in mine {
+            let Some(st) = Store::open(&path) else { continue };
+            let keys: HashSet<u128> = keys.into_iter().collect();
+            let si = self.stores.len() as u32;
+            let mut n = 0;
+            for (e, ix) in st.index.iter().enumerate() {
+                let key = ix.key;
+                if keys.contains(&key) {
+                    self.index.insert(key, (si, e as u32));
+                    n += 1;
+                }
+            }
+            if n != 0 { self.stores.push(std::sync::Arc::new(st)); }
+        }
     }
 }
 
@@ -5451,6 +5492,9 @@ mod cold_tests {
         again.loaded_in(&mut prog, 2, dir.clone());
         assert_fingerprints(&again, &prog);
         assert!(again.pending.is_empty());
+        // its writers write the three records again; they finish before the folder goes
+        again.finish_in(&mut prog, dir.clone());
+        assert_eq!(again.records, 3);
         // Repeated completion/finalization must not write a crate's record twice.
         cold.loaded_in(&mut prog, 0, dir.clone());
         cold.finish_in(&mut prog, dir.clone());
