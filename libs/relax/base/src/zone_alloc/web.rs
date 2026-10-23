@@ -139,9 +139,7 @@ unsafe fn resize(p: *mut u8, l: Layout, size: usize) -> *mut u8 {
 unsafe extern "C" fn web_alloc(size: usize, align: usize) -> *mut u8 {
     arena::alloc(Layout::from_size_align_unchecked(size, align))
 }
-/// Zeroed storage in linear memory, also for runtime-owned data accessed by program code.
-/// The web arena must be active and `(size, align)` must form a valid allocation layout.
-pub unsafe extern "C" fn web_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
+unsafe extern "C" fn web_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
     arena::alloc_zeroed(Layout::from_size_align_unchecked(size, align))
 }
 unsafe extern "C" fn web_dealloc(p: *mut u8, size: usize, align: usize) {

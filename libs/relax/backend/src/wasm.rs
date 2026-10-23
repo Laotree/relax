@@ -2789,6 +2789,7 @@ impl<'a> Fx<'a> {
                 self.lget(t);
                 self.set(*d);
             }
+            Inst::Coverage { .. } => return Err("native coverage probe in wasm output".into()),
             Inst::Fence(..) => {}
             Inst::FpEnv(false, d) => {
                 self.i64c(0);
