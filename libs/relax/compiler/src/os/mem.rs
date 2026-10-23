@@ -104,6 +104,53 @@ pub unsafe fn patch_code_u32(addr: u64, w: u32) {
     fill_code(addr, 4, |b| (*(b.as_mut_ptr() as *const std::sync::atomic::AtomicU32)).store(w, std::sync::atomic::Ordering::Release));
 }
 
+/// The OS page size (mprotect's granularity): 4 KB on x86-64, 16 KB on Apple arm64.
+pub fn page_size() -> u64 {
+    static PAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let p = PAGE.load(std::sync::atomic::Ordering::Relaxed);
+    if p != 0 {
+        return p;
+    }
+    #[cfg(unix)]
+    let p = {
+        extern "C" {
+            fn sysconf(name: i32) -> i64;
+        }
+        #[cfg(target_os = "macos")]
+        const SC_PAGESIZE: i32 = 29;
+        #[cfg(target_os = "android")]
+        const SC_PAGESIZE: i32 = 0x27;
+        #[cfg(not(any(target_os = "macos", target_os = "android")))]
+        const SC_PAGESIZE: i32 = 30;
+        let v = unsafe { sysconf(SC_PAGESIZE) };
+        if v > 0 { v as u64 } else { 4096 }
+    };
+    #[cfg(not(unix))]
+    let p = 4096u64;
+    PAGE.store(p, std::sync::atomic::Ordering::Relaxed);
+    p
+}
+
+/// Makes invalidated code [addr, addr + len) (whole pages that hold nothing else, invalid.rs)
+/// inaccessible for good: any fetch, read or write there faults (a stale access). Its addresses
+/// stay taken. A failure is fatal: the code would stay runnable.
+pub fn invalidate_code(addr: u64, len: usize) {
+    if no_codegen() {
+        return;
+    }
+    #[cfg(unix)]
+    let ok = unsafe { unix::mprotect(addr as *mut u8, len, 0) } == 0;
+    #[cfg(windows)]
+    let ok = {
+        let mut old = 0u32;
+        unsafe { crate::os::win32::VirtualProtect(addr as *mut u8, len, crate::os::win32::PAGE_NOACCESS, &mut old) != 0 }
+    };
+    if !ok {
+        eprintln!("makepad run: invalidated code at {:#x} ({} bytes) could not be made inaccessible", addr, len);
+        std::process::abort();
+    }
+}
+
 #[cfg(unix)]
 mod unix {
     extern "C" {

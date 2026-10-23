@@ -898,7 +898,7 @@ pub(crate) fn pick_threads(sel: &str) -> Box<dyn Fn(&threads::Thread) -> bool> {
     })
 }
 
-fn cmd_stacks(req: &Req, out: &mut Out) {
+pub(crate) fn cmd_stacks(req: &Req, out: &mut Out) {
     let sel = req.get("thread").or(req.pos.first().map(String::as_str)).unwrap_or("all");
     let depth = req.num("depth", 12) as usize;
     let caps = match capture_all(&*pick_threads(sel)) {

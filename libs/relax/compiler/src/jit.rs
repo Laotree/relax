@@ -461,6 +461,8 @@ pub struct Unit {
     code_next: AtomicU64,
     /// branch veneers in the code area by target (`Unit::veneer`): the last one placed for each
     pub(crate) veneers: relax_session::sync::Mutex<HashMap<u64, u64>>,
+    /// invalidatable code (invalid.rs): per group, its own page-aligned chunks of the code area
+    pub(crate) code_groups: relax_session::sync::Mutex<HashMap<crate::invalid::Group, crate::invalid::GroupCode>>,
     data_next: AtomicU64,
     /// (bytes, align) of str / byte-string / C-string literals and promoted constants -> their
     /// one read-only copy
@@ -1943,6 +1945,136 @@ pub(crate) fn stale_report(message: &str, frames: &[u64], addr: u64) -> String {
     owner::call_within(owner::Class::Job, 2000, || unsafe { (&*UNIT).report(&info) }).unwrap_or_else(|| format!("{{\"message\":\"(the owner did not answer: raw frames {:x?})\"}}", frames))
 }
 
+/// A stale access into invalidated code (stale.rs, invalid.rs): how the thread got there and who
+/// stored the address it used -- the return address of a frame live at the invalidation, a direct
+/// call linked to it, a thunk head racing the slot word's update, a slot word, a vtable entry or a
+/// raw fn pointer value -- with the code versions involved. `sp_top` / `sp_below`: the words at
+/// [sp] and [sp - 8] at the fault (x86-64), `lr`: the link register (arm64). Second: the return
+/// address into the caller when the thread was entering the code (a frame the walk misses).
+pub(crate) fn stale_code_how(pc: u64, sp_top: u64, sp_below: u64, lr: u64) -> (String, Option<u64>) {
+    if unsafe { UNIT.is_null() } {
+        return ("(no unit)".to_string(), None);
+    }
+    let up = unsafe { UNIT } as usize;
+    owner::call_within(owner::Class::Job, 2000, move || unsafe { stale_how_in(&*(up as *const Unit), pc, sp_top, sp_below, lr) })
+        .unwrap_or_else(|| (format!("(the owner did not answer: pc {:#x}, [sp] {:#x}, [sp-8] {:#x}, lr {:#x})", pc, sp_top, sp_below, lr), None))
+}
+
+/// "fn `f` v3 (O1 patch gen 2) at 0x..+0x24", or what else the address is.
+fn describe_code(u: &Unit, pc: u64) -> Option<String> {
+    let mut r = crate::inspect::codever::Resolver::new();
+    let c = crate::inspect::codever::describe_pc(u, &mut r, pc)?;
+    let version = crate::invalid::why_at(c.start, |w| w.installs.iter().find(|i| i.at == c.start).map(|i| i.version)).flatten();
+    let v = version.map(|v| format!(" v{}", v)).unwrap_or_default();
+    let gen = if c.gen > 0 { format!(" gen {}", c.gen) } else { String::new() };
+    let dead = if crate::stale::lookup(c.start).is_some() { ", invalidated" } else { "" };
+    Some(format!("fn `{}`{} ({} {}, {}{}{}) {:#x}+{:#x} at {}", short_name(&u.fns[c.slot as usize].name), v, c.kind.tier_name(), c.kind.origin_name(), c.state, gen, dead, c.start, pc - c.start, c.at))
+}
+
+enum CallKind {
+    Direct(u64),
+    Indirect,
+    Unknown,
+}
+
+/// The call instruction ending at return address `ret`.
+fn call_before(ret: u64) -> CallKind {
+    if !in_jit_code(ret.wrapping_sub(8)) || crate::stale::overlaps(ret.wrapping_sub(8), ret) {
+        return CallKind::Unknown;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let i = unsafe { std::ptr::read_volatile((ret - 4) as *const u32) };
+        if i & 0xfc00_0000 == 0x9400_0000 {
+            let imm = (((i & 0x03ff_ffff) << 6) as i32 >> 6) as i64 * 4;
+            return CallKind::Direct((ret - 4).wrapping_add(imm as u64));
+        }
+        if i & 0xffff_fc1f == 0xd63f_0000 {
+            return CallKind::Indirect;
+        }
+        CallKind::Unknown
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let b = |k: u64| unsafe { std::ptr::read_volatile((ret - k) as *const u8) };
+        if b(5) == 0xe8 {
+            let rel = unsafe { std::ptr::read_unaligned((ret - 4) as *const i32) } as i64;
+            return CallKind::Direct(ret.wrapping_add(rel as u64));
+        }
+        // FF /2: call r/m64 (register, [reg+disp8], [rip/reg+disp32], with or without REX)
+        if [2u64, 3, 4, 6, 7].iter().any(|&k| b(k) == 0xff && (b(k - 1) >> 3) & 7 == 2) {
+            return CallKind::Indirect;
+        }
+        CallKind::Unknown
+    }
+}
+
+/// Where the program keeps the address `pc` as a value: slot table words, vtable entries.
+fn stored_where(u: &Unit, pc: u64) -> Vec<String> {
+    let mut out = Vec::new();
+    for id in 0..u.fns.len() as u32 {
+        if slot_word(u, id) == pc {
+            out.push(format!("slot `{}`'s table word", short_name(&u.fns[id as usize].name)));
+        }
+    }
+    for ((t, d), at) in u.vtables.snapshot() {
+        // (vtables are read-only data objects: words up to the data area's end only)
+        for k in (0..40u64).take_while(|k| at >= u.ro_base && at + 8 * k + 8 <= u.data_end) {
+            let w = unsafe { std::ptr::read_volatile((at + 8 * k) as *const u64) };
+            if w == pc {
+                out.push(format!("vtable of `{}` as `{}` (word {})", crate::typeck::ty_to_string(false, &u.prog, &u.tcx, t), crate::typeck::ty_to_string(false, &u.prog, &u.tcx, d), k));
+            }
+        }
+    }
+    out
+}
+
+unsafe fn stale_how_in(u: &Unit, pc: u64, sp_top: u64, sp_below: u64, lr: u64) -> (String, Option<u64>) {
+    let here = describe_code(u, pc).unwrap_or_else(|| format!("{:#x} (no code body recorded there)", pc));
+    // the slot word's history: what the slot runs now, and when this version went in
+    let mut history = String::new();
+    if let Some((start, _, id)) = u.code.read().unwrap_or_else(|e| e.into_inner()).entry_at(pc) {
+        let f = &u.fns[id as usize];
+        let rec = crate::invalid::why_at(start, |w| (w.installs.iter().find(|i| i.at == start).copied(), w.by_gen, w.group));
+        if let Some((ins, by, g)) = rec {
+            let age = ins.map(|i| format!("installed {} ms before as v{}", crate::clock::wall_ns().saturating_sub(i.t_ns) / 1_000_000, i.version)).unwrap_or_default();
+            history = format!("; slot `{}`: this code ({:?}) {}, invalidated by {}; the slot now runs v{} at {:#x}", short_name(&f.name), g, age, if by > 0 { format!("patch gen {}", by) } else { "the module's unload".to_string() }, f.version, slot_word(u, id));
+        }
+    }
+    let returned = if cfg!(target_arch = "aarch64") { lr == pc } else { sp_below == pc };
+    if returned {
+        return (format!("RETURNED into {}: a return address pushed by this version's own call while it was current (its frame was on the stack when the code was invalidated; the callee returned into it){}", here, history), None);
+    }
+    let start = u.code.read().unwrap_or_else(|e| e.into_inner()).entry_at(pc).map(|e| e.0);
+    let ret = if cfg!(target_arch = "aarch64") { lr } else { sp_top };
+    let caller = describe_code(u, ret.wrapping_sub(1));
+    if start != Some(pc) {
+        return (format!("JUMPED into the middle of {} (not a call or a return){}", here, history), None);
+    }
+    let Some(caller) = caller else {
+        return (format!("ENTERED {} from {:#x} (not JIT code: a host callback or a stored fn pointer called by host code){}", here, ret, history), Some(ret));
+    };
+    let how = match call_before(ret) {
+        CallKind::Direct(t) if t == pc => format!("CALLED DIRECTLY by {}: that code was linked to this version's address when it was built (the caller's code version stored it)", caller),
+        CallKind::Direct(t) => match u.slots.find(0, t) {
+            Some((slot, _)) if slot_word(u, slot) == pc => format!("CALLED through slot `{}`'s thunk by {}: the slot still names this code (a fn pointer the program kept is the slot's thunk; its code was invalidated and nothing replaced it)", short_name(&u.fns[slot as usize].name), caller),
+            Some((slot, _)) => format!("CALLED through slot `{}`'s thunk by {}: the thunk head still jumped to this version (a call racing the slot word's update; the word is now {:#x})", short_name(&u.fns[slot as usize].name), caller, slot_word(u, slot)),
+            None if u.veneers.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(_, &v)| v == t) => format!("CALLED through a veneer at {:#x} by {}: the veneer was placed for this version's address", t, caller),
+            None => format!("CALLED by {} through {:#x}", caller, t),
+        },
+        CallKind::Indirect => {
+            let w = stored_where(u, pc);
+            if w.is_empty() {
+                format!("CALLED INDIRECTLY by {} through a fn pointer value that no slot word or vtable holds: a raw code address the program kept (a closure's or a copied vtable entry, a host callback)", caller)
+            } else {
+                format!("CALLED INDIRECTLY by {} (a fn pointer value: a slot's thunk jumps through its table word); this code's address is stored in: {} -- the slot still names invalidated code", caller, w.join(", "))
+            }
+        }
+        CallKind::Unknown => format!("ENTERED from {} (the instruction before the return address is no call)", caller),
+    };
+    (format!("{} -> {}{}", how, here, history), Some(ret))
+}
+
 fn frames_from_raw(pc: u64, pc_is_ret: bool, raw: &[u64]) -> Vec<u64> {
     let mut frames = vec![pc.wrapping_sub(pc_is_ret as u64)];
     if unsafe { UNIT.is_null() } {
@@ -3168,6 +3300,7 @@ impl Unit {
             leave: 0,
             code_next: AtomicU64::new(misc),
             veneers: Default::default(),
+            code_groups: Default::default(),
             data_next: AtomicU64::new(data_base),
             lit_data: Default::default(),
             data_end: data_base + data_size,
@@ -3516,6 +3649,40 @@ impl Unit {
         unsafe { os::mem::write_code(at, &c) };
         crate::coverage::installed(self, at, relocs);
         Ok(at)
+    }
+
+    /// `emit_linked` into group `g`'s own pages (invalid.rs), or bump-shared code for None.
+    pub(crate) fn emit_grouped(&self, g: Option<crate::invalid::Group>, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Result<u64, String> {
+        let Some(g) = g else { return self.emit_linked(code, relocs) };
+        let end = self.exec_base + self.exec_size - os::mem::CODE_TAIL;
+        // a chunk is page-aligned and page-sized: no other code shares its pages
+        let at = crate::invalid::alloc(self, g, code.len() as u64, |size, page| bump(&self.code_next, size, page, end, "out of code memory"))?;
+        let mut c = code.to_vec();
+        self.link_code(&mut c, at, relocs)?;
+        unsafe { os::mem::write_code(at, &c) };
+        crate::coverage::installed(self, at, relocs);
+        Ok(at)
+    }
+
+    /// Slot `id`'s code is in invalidated memory (invalid.rs): it goes back to its lazy stub and
+    /// builds again from the source it runs now (a rollback restoring a version a layout patch
+    /// invalidated, a lazily built twin of a rolled-back generation).
+    pub(crate) fn stub_if_invalidated(&mut self, id: u32) {
+        let f = &self.fns[id as usize];
+        if !f.compiled || f.code_len == 0 || crate::stale::lookup(f.code).is_none() {
+            return;
+        }
+        let stub = self.slots.stub(id);
+        let f = &mut self.fns[id as usize];
+        let old_map = std::mem::take(&mut f.pc_map);
+        crate::zone_alloc::kept_with(|| f.history.get_or_insert_with(Default::default).retired.push((f.code, f.code_len, old_map)));
+        f.code = stub;
+        f.code_len = 0;
+        f.compiled = false;
+        f.rir = None;
+        f.o3.store(false, Ordering::Relaxed);
+        f.version += 1;
+        SlotWord::of(&self.slots, id).store(stub, Ordering::SeqCst);
     }
 
     /// A block of `len` bytes of code memory, 16-byte aligned, not written (the startup image:
@@ -5747,10 +5914,12 @@ impl Unit {
         let code = &code[..n];
         let twin = matches!(self.fns[id as usize].key, FnKey::Sandbox(_));
         let redirect = if interp || options.no_codegen { Some(self.no_codegen_target(code, relocs, &self.fns[id as usize].name)?) } else { None };
-        // (code is append-only: a replaced version stays mapped, twins' too)
+        // (code is append-only: a replaced version stays mapped, twins' too; code that may be
+        // invalidated -- a patch generation's, a module's -- has pages of its own: invalid.rs)
+        let group = if redirect.is_none() { crate::invalid::group_of(self, id, gen) } else { None };
         let at = match redirect {
             Some(t) => t,
-            None => self.emit_linked(code, relocs)?,
+            None => self.emit_grouped(group, code, relocs)?,
         };
         if redirect.is_none() {
             self.index_code(at, code.len() as u32, id, info);
@@ -5775,6 +5944,10 @@ impl Unit {
         let first = !f.compiled;
         f.compiled = true;
         f.version += 1;
+        if let Some(g) = group {
+            crate::invalid::note_install(self, g, id, at, code.len() as u32, self.fns[id as usize].version);
+        }
+        let f = &mut self.fns[id as usize];
         if gen > 0 {
             f.patch_gen = gen;
             crate::zone_alloc::kept_with(|| self.patch_log.push((id, gen)));
@@ -6040,7 +6213,12 @@ impl Unit {
             let f = &mut self.fns[id as usize];
             f.version += 1;
             let at = f.code;
-            SlotWord::of(&self.slots, id).store(at, Ordering::SeqCst);
+            // (a version a layout patch invalidated never runs again: built anew)
+            if crate::stale::lookup(at).is_none() {
+                SlotWord::of(&self.slots, id).store(at, Ordering::SeqCst);
+            } else {
+                self.stub_if_invalidated(id);
+            }
         }
     }
 
@@ -6069,7 +6247,12 @@ impl Unit {
             if prev.1 == 0 {
                 f.compiled = false;
             }
-            SlotWord::of(&self.slots, id as u32).store(prev.0, Ordering::SeqCst);
+            // (a version a layout patch invalidated never runs again: built anew)
+            if crate::stale::lookup(prev.0).is_none() {
+                SlotWord::of(&self.slots, id as u32).store(prev.0, Ordering::SeqCst);
+            } else {
+                self.stub_if_invalidated(id as u32);
+            }
             self.frequency_profiles.remove(&(id as u32));
             out.push(id as u32);
         }
@@ -15456,7 +15639,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         u.stats.tier1_locked_ns += owner_ns.get();
         u.stats.tier1_free_ns += t2 - t1;
         let ok = match built {
-            Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, frame_size, self_call, nounwind_used, profile_entry)))) if PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && (!crate::inspect::instrument::active(id) || inspect_o3_on()) && {
+            Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, frame_size, self_call, nounwind_used, profile_entry)))) if PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && (!crate::inspect::instrument::active(id) || inspect_o3_on())
+                // (code of an invalidated group -- an unloaded module's -- is never built again)
+                && crate::invalid::group_of(u, id, 0).map_or(true, |g| !crate::invalid::is_dead(u, g)) && {
                 let n = if relax_codegen::interp::blob::is_blob(&code) { code.len() } else { relax_backend::rir::split_unwind_info(&code).0 };
                 let tl = cpu_ns();
                 let ok = u.link_check(&code[..n], &relocs);
@@ -15538,10 +15723,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 let code = code[..n].to_vec();
                 let u = &mut *up;
                 let te = cpu_ns();
+                let o3_group = if blob { None } else { crate::invalid::group_of(u, id, 0) };
                 let at = if blob {
                     u.emit_or_redirect(&code, &relocs, "O3").expect("O3 interpreted code installs")
                 } else {
-                    u.emit_linked(&code, &relocs).expect("O3 code links (checked)")
+                    u.emit_grouped(o3_group, &code, &relocs).expect("O3 code links (checked)")
                 };
                 if !blob {
                     code_growth(if sandboxed { GROW_MODULE } else if u.retiers.contains_key(&id) { GROW_REOPT } else { GROW_TIERUP }, code.len());
@@ -15564,6 +15750,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 f.code_len = code.len() as u32;
                 f.pc_map = PcMap::new(&map);
                 f.version += 1;
+                if let Some(g) = o3_group {
+                    crate::invalid::note_install(u, g, id, at, code.len() as u32, u.fns[id as usize].version);
+                }
                 crate::inspect::patches::code_installed(u, id);
                 let slot = SlotWord::of(&u.slots, id);
                 slot.store(at, Ordering::SeqCst);

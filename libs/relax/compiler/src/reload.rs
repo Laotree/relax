@@ -441,12 +441,16 @@ fn publish_reload(u: &mut Unit, versions: &[(u32, u32)], full: bool, scope: Opti
 /// Rolls back an installed patch group (a panic or fault in its code, M7): the slots return
 /// to their previous code, the files to their previous versions, the consts to their previous
 /// values. Returns the rolled-back functions' names. The caller makes a unit call.
-pub unsafe fn rollback(up: *mut Unit, undo: Undo) -> Vec<String> {
+/// The group's code is invalidated (`why`: what rejected it): it never runs again (invalid.rs), its
+/// O3 code and unverified-mode twins included; a thread still in it parks at its next instruction.
+pub unsafe fn rollback(up: *mut Unit, undo: Undo, why: &str) -> Vec<String> {
     crate::owner::call(crate::owner::Class::Program, || {
         let u = &mut *up;
         u.flush_cache_records();
         jit::bump_patch_epoch();
         let ids = u.rollback_gen(undo.group);
+        let group = undo.group;
+        crate::invalid::invalidate(u, |g| g.gen() == group, group, "invalidated code", None, &format!("patch gen {} rolled back: {}", group, why));
         let names = ids.iter().map(|id| u.fns[*id as usize].name.to_string()).collect();
         {
             let fw = jit::front_write();
@@ -3308,6 +3312,22 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
     }
     let u = &mut *up;
+    // the patch event (flight recorder `reload.patch`; inspect `stale` names it)
+    let layout_names: Vec<String> = saved_adts.iter().map(|(d, _)| def_name(&u.prog, *d)).collect();
+    {
+        let mut shown: Vec<&str> = out.names.iter().take(4).map(String::as_str).collect();
+        if out.names.len() > 4 { shown.push(".."); }
+        crate::invalid::patch_event(gen, format!("gen {}: {} fn(s) [{}]{}", gen, out.names.len(), shown.join(", "), if layout_names.is_empty() { String::new() } else { format!("; layout of {}", layout_names.join(", ")) }));
+    }
+    // a layout-changing patch: the earlier patch versions of the slots it rebuilt were built for the
+    // old fields or variants and never run again (invalid.rs; a slot's first code shares pages with
+    // other code and is not invalidated: only frames live at the patch can still reach it)
+    if !layout_names.is_empty() {
+        let rebuilt: std::collections::HashSet<u32> = u.patch_log.iter().filter(|(_, g)| *g == gen).map(|(id, _)| *id).collect();
+        let why = format!("layout-changing patch gen {} (fields or variants of {}) replaced it: code built for the old layout never runs again", gen, layout_names.join(", "));
+        crate::invalid::invalidate(u, |g| matches!(g, crate::invalid::Group::Patch { slot, gen: g0 } if g0 < gen && rebuilt.contains(&slot)), gen, "invalidated code", None, &why);
+    }
+    let u = &mut *up;
     u.reload_rir = None;
     // Keep the historical conservative invalidation, but touch only cached failures
     // and speculative results that actually exist, not every slot in the program.
@@ -3581,7 +3601,7 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                 while let Some(undo) = undos.pop() {
                     let g = undo.group;
                     let versions = undo.versions.clone();
-                    let rolled = unsafe { rollback(up, undo) };
+                    let rolled = unsafe { rollback(up, undo, "the borrow checker rejected it after it ran (SPEC-V)") };
                     names.extend(rolled);
                     back.extend(versions);
                     reverted.push(g);
@@ -4546,7 +4566,7 @@ mod round32_tests {
         assert_eq!(unit.stats.ctfe_code, runs, "{case}: the transaction must not run an initializer");
         if accept {
             assert_eq!(&values(&unit)[..2], before);
-            unsafe { rollback(up, outcome.undo.unwrap()); }
+            unsafe { rollback(up, outcome.undo.unwrap(), "test"); }
         }
         assert_eq!(values(&unit), before, "running values restored");
         assert_eq!(unit.layout_of(ty).size, layout.size);

@@ -464,6 +464,11 @@ pub(crate) fn frame_fields(u: &Unit, c: &PcCode) -> (String, String, String, Str
     if super::patches::active(c.slot) {
         code.push_str(",\"inspect\":\"instrumented or pinned by makepad inspect (probes)\"");
     }
+    // code made inaccessible for good (invalid.rs): a frame in it parks at its next instruction
+    if let Some(r) = crate::stale::lookup(c.start) {
+        module.push_str(" INVALIDATED");
+        code.push_str(&format!(",\"invalidated\":{}", json_str(&r.reason)));
+    }
     let name = match &c.inlined {
         Some(i) => {
             code.push_str(&format!(",\"inlined_into\":{}", json_str(&short(&slot_name, 140))));
@@ -603,6 +608,7 @@ pub fn cmd_code(req: &Req, out: &mut Out) {
         by.push(format!("{} {:.2} MB / {} installs", crate::jit::GROW_NAMES[k], crate::jit::CODE_GROWTH[k].load(Ordering::Relaxed) as f64 / 1048576.0, crate::jit::CODE_INSTALLS[k].load(Ordering::Relaxed)));
     }
     out.line(&format!("code installed {:.2} MB (append-only, never freed): {}", total as f64 / 1048576.0, by.join(", ")));
+    out.line(&crate::invalid::stats_line());
     let up = crate::jit::current_unit();
     if up.is_null() {
         return;

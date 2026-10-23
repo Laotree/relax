@@ -698,7 +698,7 @@ fn round50_initializer_reload_policy() {
         // no storage, not literal, no scalar fold: the round-51 CTFE-relevant path (full publication)
         assert!(!std::sync::Arc::ptr_eq(&other_before, &u.tcx.typeck(&u.prog, unrelated)), "an unfoldable static without storage took the per-file path");
     }
-    if let Some(undo) = outcome.undo { unsafe { crate::reload::rollback(up, undo); } }
+    if let Some(undo) = outcome.undo { unsafe { crate::reload::rollback(up, undo, "test"); } }
     unsafe { call_jit(up, entry, &mut result as *mut u32 as u64).unwrap_or_else(|p| panic!("{}", p.message)); }
     assert_eq!(result, 3);
     assert_eq!(u.const_addr(value, vec![]), Some(old_addr));
@@ -739,7 +739,7 @@ fn round50_opaque_body_invalidates_solver_answer() {
     let outcome = unsafe { crate::reload::apply(up, vec![crate::reload::Edit { file: u.prog.def(owner).file, path: path.to_string_lossy().into_owned(), src: source.replace("1u8", "2u32").into_bytes() }]) };
     assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{:?}", outcome.lines);
     assert_eq!(hidden(&u), u.tcx.tys.u32_);
-    unsafe { crate::reload::rollback(up, outcome.undo.unwrap()); }
+    unsafe { crate::reload::rollback(up, outcome.undo.unwrap(), "test"); }
     assert_eq!(hidden(&u), u.tcx.tys.u8_);
     std::fs::remove_file(path).unwrap();
 }

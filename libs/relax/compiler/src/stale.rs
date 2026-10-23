@@ -67,6 +67,19 @@ pub fn lookup(addr: u64) -> Option<&'static Range> {
     None
 }
 
+/// Whether [lo, hi) touches a retired range (code readers -- disassembly, stub following -- skip
+/// such bytes: reading them faults like any stale access).
+pub fn overlaps(lo: u64, hi: u64) -> bool {
+    let n = N.load(Ordering::Acquire).min(CAP);
+    RANGES[..n].iter().any(|r| {
+        let p = r.load(Ordering::Acquire);
+        !p.is_null() && {
+            let r: &Range = unsafe { &*p };
+            lo < r.hi && hi > r.lo
+        }
+    })
+}
+
 /// Retired ranges registered.
 pub fn count() -> usize {
     N.load(Ordering::Acquire).min(CAP)
@@ -86,6 +99,11 @@ struct Rec {
     os_id: AtomicU64,
     domain_base: AtomicU64,
     range: AtomicPtr<Range>,
+    /// a fetch from retired code (pc in the range): the words at [sp] and [sp - 8] (x86-64: a
+    /// call's return address, the address a `ret` just popped) and the link register (arm64)
+    sp_top: AtomicU64,
+    sp_below: AtomicU64,
+    lr: AtomicU64,
     n: AtomicUsize,
     raw: [AtomicU64; FRAMES],
 }
@@ -100,6 +118,9 @@ static REC: [Rec; RECS] = [const {
         os_id: AtomicU64::new(0),
         domain_base: AtomicU64::new(0),
         range: AtomicPtr::new(std::ptr::null_mut()),
+        sp_top: AtomicU64::new(0),
+        sp_below: AtomicU64::new(0),
+        lr: AtomicU64::new(0),
         n: AtomicUsize::new(0),
         raw: [const { AtomicU64::new(0) }; FRAMES],
     }
@@ -130,6 +151,12 @@ pub unsafe fn on_fault(f: &crate::os::fault::Fault, r: &'static Range, walk: imp
         rec.os_id.store(os_id, Ordering::Relaxed);
         rec.domain_base.store(base, Ordering::Relaxed);
         rec.range.store(r as *const Range as *mut Range, Ordering::Relaxed);
+        // (the faulting thread's own stack: both words were just written or read by the call or
+        // `ret` that led here)
+        let code = f.pc >= r.lo && f.pc < r.hi && f.sp >= 8;
+        rec.sp_top.store(if code { std::ptr::read_volatile(f.sp as *const u64) } else { 0 }, Ordering::Relaxed);
+        rec.sp_below.store(if code { std::ptr::read_volatile((f.sp - 8) as *const u64) } else { 0 }, Ordering::Relaxed);
+        rec.lr.store(f.lr, Ordering::Relaxed);
         let mut raw = [0u64; FRAMES];
         let n = walk(&mut raw);
         for (k, w) in raw[..n].iter().enumerate() {
@@ -238,9 +265,24 @@ fn decidable() -> bool {
 fn handle(rec: &Rec) {
     let r: &Range = unsafe { &*rec.range.load(Ordering::Relaxed) };
     let (pc, addr, sig) = (rec.pc.load(Ordering::Relaxed), rec.addr.load(Ordering::Relaxed), rec.sig.load(Ordering::Relaxed));
-    let raw: Vec<u64> = rec.raw[..rec.n.load(Ordering::Relaxed)].iter().map(|w| w.load(Ordering::Relaxed)).collect();
+    let mut raw: Vec<u64> = rec.raw[..rec.n.load(Ordering::Relaxed)].iter().map(|w| w.load(Ordering::Relaxed)).collect();
+    // a fetch from retired code: how the thread got there and who stored the address (jit.rs)
+    let code = pc >= r.lo && pc < r.hi;
+    let how = if code {
+        let (how, caller) = crate::jit::stale_code_how(pc, rec.sp_top.load(Ordering::Relaxed), rec.sp_below.load(Ordering::Relaxed), rec.lr.load(Ordering::Relaxed));
+        // entering the code: the caller's frame is not on the frame-pointer chain yet
+        if let Some(c) = caller.filter(|c| raw.first() != Some(c)) {
+            raw.insert(0, c);
+        }
+        Some(how)
+    } else {
+        None
+    };
     let frames = crate::jit::stale_frames(pc, &raw);
-    let message = format!("stale access into the {} `{}` at {:#x}: its memory is never reused (a stale pointer); the thread is parked, nothing unwound", r.kind, r.name, addr);
+    let message = match &how {
+        Some(_) => format!("stale access into the {} `{}` at {:#x}: code that never runs again (it was invalidated: {}); the thread is parked, nothing unwound", r.kind, r.name, addr, r.reason),
+        None => format!("stale access into the {} `{}` at {:#x}: its memory is never reused (a stale pointer); the thread is parked, nothing unwound", r.kind, r.name, addr),
+    };
     let report = crate::jit::stale_report(&message, &frames, addr);
     eprintln!("makepad: {}\n  report: {}", message, report);
     crate::inspect::flightrec::fault_dump(&format!("stale.access {} {} at {:#x} pc {:#x}", r.kind, r.name, addr, pc));
@@ -249,10 +291,19 @@ fn handle(rec: &Rec) {
     let thread = crate::inspect::threads::list().into_iter().find(|t| t.os_id == os_id).map(|t| t.name.clone()).unwrap_or_else(|| os_id.to_string());
     let into = where_in(r, addr);
     let age_ms = crate::clock::wall_ns().saturating_sub(r.retired_ns) / 1_000_000;
-    let verdict = format!(
-        "stale access: thread `{}` (tid {}) read/wrote {:#x} = {} `{}` v{} + {:#x} ({}), retired {} ms before ({}; flightrec stale.retire at {} ns); the faulting frame is the first of the report's backtrace (fn, tier, code version); its thread is parked, the app paused",
-        thread, os_id, addr, r.kind, r.name, r.version, addr - r.lo, into, age_ms, r.reason, r.retired_ns
-    );
+    let verdict = match &how {
+        Some(how) => format!(
+            "stale access: thread `{}` (tid {}) ran code at {:#x} = {} `{}` v{} + {:#x} ({}), invalidated {} ms before ({}; flightrec stale.retire at {} ns). HOW: {}. Its thread is parked, the app paused",
+            thread, os_id, pc, r.kind, r.name, r.version, pc - r.lo, into, age_ms, r.reason, r.retired_ns, how
+        ),
+        None => format!(
+            "stale access: thread `{}` (tid {}) read/wrote {:#x} = {} `{}` v{} + {:#x} ({}), retired {} ms before ({}; flightrec stale.retire at {} ns); the faulting frame is the first of the report's backtrace (fn, tier, code version); its thread is parked, the app paused",
+            thread, os_id, addr, r.kind, r.name, r.version, addr - r.lo, into, age_ms, r.reason, r.retired_ns
+        ),
+    };
+    if let Some(h) = &how {
+        eprintln!("makepad: stale access: {}", h);
+    }
     crate::zone_alloc::kept_with(|| ANSWERS.lock().unwrap_or_else(|e| e.into_inner()).push((verdict.clone(), report.clone())));
     if !decidable() {
         eprintln!("makepad: nobody can decide on the stale access (no Run panel, inspect watcher or agent; MAKEPAD_RUN_STALE_PARK=1 parks): the process ends");
@@ -262,10 +313,13 @@ fn handle(rec: &Rec) {
     crate::inspect::start("stale-access");
     let paused = crate::inspect::instrument::pause_program();
     eprintln!("makepad: the app is paused ({} threads held) -- decide: makepad inspect {} resume <id> restart | stop (the Run panel offers both)", paused, std::process::id());
-    let stop = crate::inspect::events::park_stale(rec.os_id.load(Ordering::Relaxed), domain, &message, &frames);
-    if stop {
+    let decision = crate::inspect::events::park_stale(rec.os_id.load(Ordering::Relaxed), domain, &message, &frames);
+    if decision == crate::inspect::events::StaleDecision::Stop {
         eprintln!("makepad: stale access: stopped");
         crate::os::fault::die_by(sig);
+    }
+    if decision == crate::inspect::events::StaleDecision::RestartProcess {
+        restart_process();
     }
     // restarted (the domain relaunched): the program runs again; the faulting thread stays parked
     crate::inspect::instrument::resume_program();
@@ -275,12 +329,48 @@ fn handle(rec: &Rec) {
 /// What the watcher told, for `makepad inspect <pid> stale`: (verdict line, report JSON).
 static ANSWERS: relax_session::sync::Mutex<Vec<(String, String)>> = relax_session::sync::Mutex::new(Vec::new());
 
-/// Where in a retired range `addr` was (what kind of data the stale pointer pointed to).
+/// Where in a retired range `addr` was (what kind of data the stale pointer pointed to; for
+/// code, which fn's code version and what invalidated it: invalid.rs).
 fn where_in(r: &Range, addr: u64) -> String {
+    if let Some(s) = crate::invalid::why_at(addr, |w| {
+        let i = w.installs.iter().rev().find(|i| addr >= i.at && addr < i.at + i.len as u64).copied();
+        let what = match i {
+            Some(i) => format!("code of slot #{} `{}` v{} +{:#x}", i.slot, crate::jit::slot_name(i.slot).unwrap_or_default(), i.version, addr - i.at),
+            None => format!("{:?} chunk +{:#x} (between code bodies)", w.group, addr - w.lo),
+        };
+        let made = match w.group {
+            crate::invalid::Group::Patch { gen, .. } | crate::invalid::Group::Module { gen, .. } if gen > 0 => {
+                crate::invalid::patch_event_of(gen).map(|(t, e)| format!("; made by flightrec reload.patch at {} ns: {}", t, e)).unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        let by = if w.by_gen > 0 { crate::invalid::patch_event_of(w.by_gen).map(|(t, e)| format!("; invalidated by flightrec reload.patch at {} ns: {}", t, e)).unwrap_or_default() } else { String::new() };
+        format!("{} [{:?}]{}{}", what, w.group, made, by)
+    }) {
+        return s;
+    }
     match r.kind {
         "unloaded module" => crate::sandbox::describe_window_offset(addr - r.lo),
         _ => format!("{:#x} bytes in", addr - r.lo),
     }
+}
+
+/// `resume <id> restart` of a program that runs in no app domain: the process starts again with
+/// its own command line (the current sources; its state is not carried over). Never returns.
+fn restart_process() {
+    eprintln!("makepad: stale access: restarting the process (its sources as they are now)");
+    // (the inspect reply goes out first)
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        if let Ok(exe) = std::env::current_exe() {
+            let e = std::process::Command::new(exe).args(&args[1..]).exec();
+            eprintln!("makepad: stale access: restart failed: {}", e);
+        }
+    }
+    crate::os::fault::die_by(11);
 }
 
 /// `stale`: answer first -- the parked stale accesses (verdict, then the report), then the retired
@@ -293,6 +383,12 @@ pub fn cmd(req: &crate::inspect::Req, out: &mut crate::inspect::Out) {
     for (v, rep) in &answers {
         out.line(v);
         out.line(&format!("  report: {}", rep));
+    }
+    // a parked access into code: every thread's stack with the tier and version per frame (an
+    // INVALIDATED frame is code that parks at its next instruction)
+    if answers.iter().any(|(v, _)| v.contains(" HOW: ")) {
+        out.line("every thread's stack (frames: fn, tier, code version; a parked thread shows its recorded frames):");
+        crate::inspect::cmd_stacks(req, out);
     }
     let n = req.num("n", 8) as usize;
     let total = count();
