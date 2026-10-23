@@ -556,22 +556,51 @@ pub mod obligations {
             // under the item's outlives environment and the types it may assume well formed.
             if fulfilled {
                 let outlives = self.outlives_environment();
-                let mut region_failed = false;
-                for e in self.infcx.resolve_regions_with_outlives_env(self.prog, &outlives) {
-                    if let crate::infer::lexical_region_resolve::RegionResolutionError::GenericBoundFailure(ty, sub, span) = e {
-                        if let Some(msg) = self.generic_bound_failure(ty, sub) {
-                            let span = if span == 0 { self.prog.files[file as usize].ast.item(self.prog.def(self.at).item).lo } else { span };
-                            if seen.insert((span, msg.clone())) { out.push(self.prog.record_error(file, span, "typeck", msg)); }
-                        }
-                    } else if !region_failed {
-                        // report_region_errors: a region the item's constraints cannot give a value (two
-                        // regions equated or ordered that its outlives environment does not relate). Relax's
-                        // constraints carry no SubregionOrigin, so the error is reported once per item,
-                        // without the origin's code (E0308 lifetime mismatch, E0478, E0491, E0803 ..)
-                        region_failed = true;
-                        let span = self.prog.files[file as usize].ast.item(self.prog.def(self.at).item).lo;
-                        out.push(self.prog.record_error(file, span, "typeck", "lifetime mismatch: the item's region constraints cannot be satisfied".to_string()));
+                let errors = self.infcx.resolve_regions_with_outlives_env(self.prog, &outlives);
+                if !errors.is_empty() && !self.infcx.tainted_by_errors() {
+                    for (span, msg) in self.region_error_messages(errors) {
+                        let span = if span == 0 { self.prog.files[file as usize].ast.item(self.prog.def(self.at).item).lo } else { span };
+                        if seen.insert((span, msg.clone())) { out.push(self.prog.record_error(file, span, "typeck", msg)); }
                     }
+                }
+            }
+            out
+        }
+
+        /// error_reporting/infer/region.rs report_region_errors (without the "nice" region errors of
+        /// try_report_nice_region_error): process_errors drops the generic bound failures when there
+        /// are other errors and orders them by span; each is reported by its origin
+        /// (report_concrete_failure, report_placeholder_failure, report_sub_sup_conflict).
+        fn region_error_messages(&self, errors: Vec<crate::infer::lexical_region_resolve::RegionResolutionError>) -> Vec<(u32, String)> {
+            use crate::infer::lexical_region_resolve::RegionResolutionError as E;
+            use crate::infer::region_constraints::SubregionOrigin as O;
+            let tys = &self.tcx.tys;
+            let placeholder = |r| matches!(tys.region_kind(r), crate::types::RegionKind::RePlaceholder { .. });
+            let bound_failure = |e: &E| matches!(e, E::GenericBoundFailure(..));
+            let mut errors: Vec<E> = if errors.iter().all(bound_failure) { errors } else { errors.into_iter().filter(|e| !bound_failure(e)).collect() };
+            errors.sort_by_key(|e| match *e {
+                E::ConcreteFailure(o, ..) => o.span(),
+                E::GenericBoundFailure(_, _, span) => span,
+                E::SubSupConflict(_, var_span, ..) | E::UpperBoundUniverseConflict(_, var_span, ..) => var_span,
+            });
+            // report_concrete_failure (report_placeholder_failure gives the same codes for these origins)
+            let concrete = |o: O| -> (u32, String) {
+                let msg = match o {
+                    O::Subtype(_) => "E0308: lifetime mismatch".to_string(),
+                    O::RelateParamBound(_, ty) => format!("E0477: the type `{}` does not fulfill the required lifetime", crate::typeck::ty_to_string(false, self.prog, self.tcx, self.infcx.deeply_resolve_ignoring_regions(ty))),
+                    O::RelateRegionParamBound(_) | O::Misc => "E0478: lifetime bound not satisfied".to_string(),
+                };
+                (o.span(), msg)
+            };
+            let mut out = Vec::new();
+            for e in errors {
+                match e {
+                    E::ConcreteFailure(o, ..) => out.push(concrete(o)),
+                    E::GenericBoundFailure(ty, sub, span) => { if let Some(msg) = self.generic_bound_failure(ty, sub) { out.push((span, msg)); } }
+                    E::SubSupConflict(_, _, sub_origin, sub_r, _, _) if placeholder(sub_r) => out.push(concrete(sub_origin)),
+                    E::SubSupConflict(_, _, _, _, sup_origin, sup_r) if placeholder(sup_r) => out.push(concrete(sup_origin)),
+                    E::SubSupConflict(_, var_span, ..) => out.push((var_span, "E0803: cannot infer an appropriate lifetime due to conflicting requirements".to_string())),
+                    E::UpperBoundUniverseConflict(_, _, _, sup_origin, _) => out.push(concrete(sup_origin)),
                 }
             }
             out
