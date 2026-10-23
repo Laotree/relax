@@ -12616,6 +12616,68 @@ const SLOW_RETIRE: u64 = 4;
 const CODE_BYTES: u64 = (1 << SLOW_SHIFT) - 1;
 /// count stubs taken out of their slots after SLOW_RETIRE slow windows
 pub static STUBS_RETIRED: AtomicU64 = AtomicU64::new(0);
+/// ... and put back (rearm_retired)
+pub static STUBS_REARMED: AtomicU64 = AtomicU64::new(0);
+/// Tier record word 5, bits 52..56: how often the slot's stub was retired (rt_hot)
+const RETIRE_SHIFT: u64 = 52;
+/// A retired stub goes back into its slot this long after its retirement, doubled per retirement
+/// (at most RETIRE_BACKOFF_NS << RETIRE_BACKOFF_MAX): a fn that turned hot later is counted again
+/// within seconds; one that stays lukewarm pays SLOW_RETIRE slow windows of stub calls per period.
+const RETIRE_BACKOFF_NS: u64 = 2_000_000_000;
+const RETIRE_BACKOFF_MAX: u64 = 5;
+/// Slots whose count stub rt_hot retired (rearm_retired); capacity reserved by the poll, so rt_hot
+/// never grows it.
+static RETIRED: relax_session::sync::Mutex<Vec<u32>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// The first O3 worker's poll: retired count stubs whose backoff is over go back into their slots
+/// (counter and window fresh, the slow-window count reset); a slot that left counting meanwhile
+/// (queued by its loops, or other code with its own stub installed: rearm_counter) is dropped.
+fn rearm_retired() {
+    let up = TIER_UNIT.load(Ordering::Acquire);
+    if up.is_null() {
+        return;
+    }
+    let u = unsafe { &*up };
+    let Some(calls) = u.tier1.as_ref().map(|t| t.calls) else { return };
+    let now = wall_ns();
+    let mut r = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    if r.capacity() - r.len() < 256 {
+        crate::zone_alloc::kept_with(|| r.reserve(1024));
+    }
+    if r.is_empty() {
+        return;
+    }
+    let mut n = 0u64;
+    r.retain(|&id| unsafe {
+        if id as usize >= u.fns.len() {
+            return false;
+        }
+        let rec = tier_rec(&u.slots, id);
+        if (*rec.add(3)).load(Ordering::Acquire) != T_COUNTING {
+            return false;
+        }
+        let w = (*rec.add(5)).load(Ordering::Relaxed);
+        let level = ((w >> RETIRE_SHIFT) & 0xf).max(1);
+        if now.saturating_sub((*rec.add(4)).load(Ordering::Relaxed)) < RETIRE_BACKOFF_NS << (level - 1).min(RETIRE_BACKOFF_MAX) {
+            return true;
+        }
+        let code = (*rec.add(1)).load(Ordering::Relaxed);
+        let stub = (*rec.add(2)).load(Ordering::Relaxed);
+        (*rec).store(calls, Ordering::Relaxed);
+        (*rec.add(4)).store(now, Ordering::Relaxed);
+        (*rec.add(5)).store(w & !(0xf << SLOW_SHIFT), Ordering::Relaxed);
+        if SlotWord::of(&u.slots, id).compare_exchange(code, stub, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            n += 1;
+        }
+        false
+    });
+    if n > 0 {
+        STUBS_REARMED.fetch_add(n, Ordering::Relaxed);
+        if tier1_trace() {
+            eprintln!("O3q @{:.3} {} retired count stubs back in their slots", now as f64 / 1e9, n);
+        }
+    }
+}
 /// A calls / loop entry older than this is counted again (tier_revalidate).
 const REVALIDATE_NS: u64 = 1_000_000_000;
 /// O3 queue entries counted again (they had gone cold before their build)
@@ -13010,7 +13072,7 @@ pub(crate) fn tier1_stats_report() {
     let s = g.as_ref().unwrap_or(&empty);
     let ms = |ns: u64| ns as f64 / 1e6;
     eprintln!("makepad-run o3-stats: builds={} cpu_ms={:.3} max_threads={} in_flight={} (completed attempts; Windows CPU is cycle-estimated)", s.builds, ms(s.cpu), s.max_active, s.active);
-    eprintln!("makepad-run o3-stats: pgo counted_builds={} counted_cpu_ms={:.3} counted_dropped={} not_counted_no_rir_off_owner={} stubs_retired={}", PGO_STATS[0].load(Ordering::Relaxed), ms(PGO_STATS[1].load(Ordering::Relaxed)), PGO_STATS[2].load(Ordering::Relaxed), PGO_STATS[3].load(Ordering::Relaxed), STUBS_RETIRED.load(Ordering::Relaxed));
+    eprintln!("makepad-run o3-stats: pgo counted_builds={} counted_cpu_ms={:.3} counted_dropped={} not_counted_no_rir_off_owner={} stubs_retired={} stubs_rearmed={}", PGO_STATS[0].load(Ordering::Relaxed), ms(PGO_STATS[1].load(Ordering::Relaxed)), PGO_STATS[2].load(Ordering::Relaxed), PGO_STATS[3].load(Ordering::Relaxed), STUBS_RETIRED.load(Ordering::Relaxed), STUBS_REARMED.load(Ordering::Relaxed));
     eprintln!("makepad-run o3-stats: phases_cpu_ms snapshot={:.3} backend={:.3} install={:.3}", ms(s.phases[0]), ms(s.phases[1]), ms(s.phases[2]));
     let passes: Vec<String> = relax_backend::stats::PASS_NAMES.iter().enumerate().map(|(i, n)| format!("{}={:.3}", n, ms(s.passes[i]))).collect();
     eprintln!("makepad-run o3-stats: backend_pass_ms {} (pass slots can overlap; MAKEPAD_RUN_PASS_TIMES=wall selects wall time)", passes.join(" "));
@@ -13641,9 +13703,19 @@ fn rt_hot(slot: u64) -> u64 {
             let slow = (w >> SLOW_SHIFT) & 0xf;
             crate::inspect::tierlog::note(slot as u32, crate::inspect::tierlog::ev::SLOW, (slow + 1).min(255) as u8, took, code);
             if slow + 1 >= SLOW_RETIRE {
-                if s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                    STUBS_RETIRED.fetch_add(1, Ordering::Relaxed);
-                    crate::inspect::tierlog::note(slot as u32, crate::inspect::tierlog::ev::RETIRE, (slow + 1).min(255) as u8, 0, code);
+                // retired for a while, not for good: rearm_retired puts the stub back after a
+                // backoff. Retired for good, a fn lukewarm early stayed uncounted when it turned hot
+                // later (cold race: DrawVars::set_uniform, called through its twin until its
+                // callers' verdicts came, then ~500k calls/s at baseline / O2 for the session).
+                // (try_lock and no growth: rt_hot waits for nothing; busy or full, it stays armed)
+                if let Ok(mut r) = RETIRED.try_lock() {
+                    if r.len() < r.capacity() && s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                        r.push(slot as u32);
+                        let level = ((w >> RETIRE_SHIFT) & 0xf).min(14) + 1;
+                        (*rec.add(5)).store((w & !(0xf << RETIRE_SHIFT)) | level << RETIRE_SHIFT, Ordering::Relaxed);
+                        STUBS_RETIRED.fetch_add(1, Ordering::Relaxed);
+                        crate::inspect::tierlog::note(slot as u32, crate::inspect::tierlog::ev::RETIRE, (slow + 1).min(255) as u8, 0, code);
+                    }
                 }
             } else {
                 (*rec.add(5)).store((w & !(0xf << SLOW_SHIFT)) | (slow + 1) << SLOW_SHIFT, Ordering::Relaxed);
@@ -13734,6 +13806,8 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
                     pgo_poll();
                     // baseline code that ran slowly but long: its O2 builds
                     drain_slow_base();
+                    // retired count stubs whose backoff is over: counted again
+                    rearm_retired();
                 }
                 q = tier_queue().unwrap();
             }
