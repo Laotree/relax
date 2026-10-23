@@ -8563,7 +8563,7 @@ pub unsafe fn settle_drop(up: *mut Unit) -> SettleDrops {
     // rebuilt that RIR on the owner (lane SETTLE: Sandbox's O3 tail, the owner 38% in settle_drop
     // and its rebuilds while the workers waited)
     if let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) {
-        let now = wall_ns();
+        let now = tier_clock();
         for id in 0..u.fns.len() as u32 {
             let rec = tier_rec(&u.slots, id);
             let st = (*rec.add(3)).load(Ordering::Relaxed);
@@ -12333,7 +12333,7 @@ fn rt_loop_hot(counter: u64, fp: u64) {
         }
         tier_charge(rec, chunk);
         let w5 = (*rec.add(5)).load(Ordering::Relaxed);
-        if w5 & LOOP_CHARGED != 0 || tier_cost_now(rec, threshold, wall_ns()).0 < threshold {
+        if w5 & LOOP_CHARGED != 0 || tier_cost_now(rec, threshold, tier_clock()).0 < threshold {
             return;
         }
         (*rec.add(5)).fetch_or(LOOP_CHARGED, Ordering::Relaxed);
@@ -13247,7 +13247,7 @@ fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
             }
             let code = (*rec.add(1)).load(Ordering::Relaxed);
             let stub = (*rec.add(2)).load(Ordering::Relaxed);
-            tier_count_fresh(rec, threshold, now);
+            tier_count_fresh(rec, threshold, tier_clock());
             (*rec.add(5)).store((len & !LOOP_CHARGED) | REARMED, Ordering::Relaxed);
             (*rec.add(3)).store(T_COUNTING, Ordering::Release);
             let s = SlotWord::of(&u.slots, id);
@@ -13341,7 +13341,7 @@ pub(crate) fn tier_explain(u: &Unit, id: u32) -> (String, Vec<(String, String)>)
     let (state, code, stub, last_check, w5, loop_left, rate_q, (cost, spent)) = unsafe {
         let rec = tier_rec(&u.slots, id);
         let w = |i: usize| (*rec.add(i)).load(Ordering::Relaxed);
-        (w(3), w(1), w(2), w(4), w(5), w(8), w(7), tier_cost_now(rec, threshold, now))
+        (w(3), w(1), w(2), w(4), w(5), w(8), w(7), tier_cost_now(rec, threshold, tier_clock()))
     };
     let word = slot_word(u, id);
     let weight = call_weight(w5 & CODE_BYTES);
@@ -13358,7 +13358,7 @@ pub(crate) fn tier_explain(u: &Unit, id: u32) -> (String, Vec<(String, String)>)
     rows.push(("count stub".into(), format!("{}; weight {} per call ({} code bytes); re-arms {}{}", stub_state, weight, w5 & CODE_BYTES, n(tl::ev::ARM), last_s(tl::ev::ARM).map_or(String::new(), |t| format!(" (last {t})")))));
     let st = match state { 0 => "not armed", T_COUNTING => "counting", T_QUEUED => "queued / tiered (calls not counted)", T_REPLAY => "replay", _ => "?" };
     let half_s = COST_HALF_LIFE_NS / 1e9;
-    rows.push(("tier record".into(), format!("{}; decayed cost {} of {} ({} spent since the last check {} ago; half-life {:.1} s: O3 needs a steady ~{:.0} units/s = ~{:.0} calls/s at this weight); rearmed once {}; hot loop charged {}", st, cost, threshold, spent, ms(now.saturating_sub(last_check)), half_s, threshold as f64 * std::f64::consts::LN_2 / half_s, threshold as f64 * std::f64::consts::LN_2 / half_s / weight.max(1) as f64, w5 & REARMED != 0, w5 & LOOP_CHARGED != 0)));
+    rows.push(("tier record".into(), format!("{}; decayed cost {} of {} ({} spent since the last check {} ago in program time (wall less foreground compiles); half-life {:.1} s: O3 needs a steady ~{:.0} units/s = ~{:.0} calls/s at this weight); rearmed once {}; hot loop charged {}", st, cost, threshold, spent, ms(tier_clock().saturating_sub(last_check)), half_s, threshold as f64 * std::f64::consts::LN_2 / half_s, threshold as f64 * std::f64::consts::LN_2 / half_s / weight.max(1) as f64, w5 & REARMED != 0, w5 & LOOP_CHARGED != 0)));
     if loop_left != 0 {
         rows.push(("loop counter".into(), format!("{} back edges left of {} (each chunk's cost goes to the budget)", loop_left, (threshold / LOOP_CHUNK_DIV).max(1))));
     }
@@ -13623,6 +13623,21 @@ static STARTUP_COMPILES: AtomicU64 = AtomicU64::new(0);
 // missing-RIR reconstruction included, waits for it.
 static DEMAND_COMPILES: AtomicU64 = AtomicU64::new(0);
 static DEMAND_LAST: AtomicU64 = AtomicU64::new(0);
+/// Wall ns during which a foreground (demand) compile ran, summed over the closed stretches, and
+/// the start of the open one (tier_clock)
+static DEMAND_BUSY_NS: AtomicU64 = AtomicU64::new(0);
+static DEMAND_SINCE: AtomicU64 = AtomicU64::new(0);
+
+/// The clock tier-up costs decay by (tier record word 4): wall time less the time a foreground
+/// compile ran. A cold run waits seconds for its lazy compiles where a warm run of the same work
+/// does not; on wall time the same calls decayed further in cold, and cold and warm tiered the
+/// same code differently (PGO8: warm built O2 over baseline for core generics cold left baseline).
+/// On this clock both see the program's own time.
+fn tier_clock() -> u64 {
+    let now = wall_ns();
+    let open = if DEMAND_COMPILES.load(Ordering::Relaxed) > 0 { now.saturating_sub(DEMAND_SINCE.load(Ordering::Relaxed)) } else { 0 };
+    now.saturating_sub(DEMAND_BUSY_NS.load(Ordering::Relaxed).saturating_add(open))
+}
 
 struct StartupCompile { foreground: bool }
 impl StartupCompile {
@@ -13631,7 +13646,9 @@ impl StartupCompile {
         Self { foreground: false }
     }
     fn foreground() -> Self {
-        DEMAND_COMPILES.fetch_add(1, Ordering::SeqCst);
+        if DEMAND_COMPILES.fetch_add(1, Ordering::SeqCst) == 0 {
+            DEMAND_SINCE.store(wall_ns(), Ordering::Relaxed);
+        }
         STARTUP_COMPILES.fetch_add(1, Ordering::SeqCst);
         Self { foreground: true }
     }
@@ -13643,7 +13660,9 @@ impl Drop for StartupCompile {
         STARTUP_COMPILES.fetch_sub(1, Ordering::SeqCst);
         if self.foreground {
             DEMAND_LAST.store(now, Ordering::SeqCst);
-            DEMAND_COMPILES.fetch_sub(1, Ordering::SeqCst);
+            if DEMAND_COMPILES.fetch_sub(1, Ordering::SeqCst) == 1 {
+                DEMAND_BUSY_NS.fetch_add(now.saturating_sub(DEMAND_SINCE.load(Ordering::Relaxed)), Ordering::Relaxed);
+            }
         }
     }
 }
@@ -13704,7 +13723,7 @@ impl Unit {
             }
             return;
         }
-        let now = wall_ns();
+        let now = tier_clock();
         // the block's place first: each stub jumps to its O1 code pc-relatively
         let cs = x64::COUNT_STUB_SIZE;
         let at = bump(&self.code_next, (ids.len() * cs) as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
@@ -13789,7 +13808,7 @@ impl Unit {
             if (*rec.add(3)).load(Ordering::Relaxed) != 0 {
                 return;
             }
-            tier_count_fresh(rec, threshold, wall_ns());
+            tier_count_fresh(rec, threshold, tier_clock());
             // a recorded instance (profile replay) builds at its first call
             if recorded {
                 (*rec).store(1, Ordering::Relaxed);
@@ -14218,7 +14237,7 @@ fn rt_hot(slot: u64) -> u64 {
         }
         // from here on atomics only (rule I-CALL; the T_REPLAY build above is the named exception)
         let _no_wait = owner::NoWait::enter();
-        let now = wall_ns();
+        let now = tier_clock();
         let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) else { return code };
         let mut rate = 0;
         if (*rec.add(3)).load(Ordering::Relaxed) == T_COUNTING {
