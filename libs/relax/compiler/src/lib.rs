@@ -7,6 +7,42 @@
 //!   makepad clean [-p <package>]           remove the workspace's <target>/relax (or one app's files)
 //!   makepad run [opts] <package> [cargo flags] [-- args]   boot a cargo package from source (run.rs)
 
+// Diagnostics never panic: std's print macros panic when a write fails (ENOSPC on the session
+// log in a full tmpfs /tmp aborted a fleet Sandbox inside a lazy compile, 2026-10-23), so in this
+// crate every print is a write whose error is dropped. Test builds keep std's captured macros.
+#[cfg(not(test))]
+#[allow(unused_macros)]
+macro_rules! eprintln {
+    ($($t:tt)*) => { stderr_line!($($t)*) };
+}
+/// One stderr line that never panics; for modules whose own `eprintln!` gates on diag::enabled.
+#[cfg(not(test))]
+#[allow(unused_macros)]
+macro_rules! stderr_line {
+    () => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_all(b"\n"); }};
+    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_fmt(format_args!("{}\n", format_args!($($t)+))); }};
+}
+#[cfg(test)]
+macro_rules! stderr_line {
+    ($($t:tt)*) => { ::std::eprintln!($($t)*) };
+}
+#[cfg(not(test))]
+#[allow(unused_macros)]
+macro_rules! eprint {
+    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_fmt(format_args!($($t)+)); }};
+}
+#[cfg(not(test))]
+#[allow(unused_macros)]
+macro_rules! println {
+    () => {{ use ::std::io::Write as _; let _ = ::std::io::stdout().write_all(b"\n"); }};
+    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stdout().write_fmt(format_args!("{}\n", format_args!($($t)+))); }};
+}
+#[cfg(not(test))]
+#[allow(unused_macros)]
+macro_rules! print {
+    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stdout().write_fmt(format_args!($($t)+)); }};
+}
+
 /// First statement of a test that builds, runs or drops a JIT unit: the test runs alone in a
 /// child process of this test binary, and the calling process only checks its verdict. The JIT
 /// runtime's state is process-wide by design (one program per process): the unit a lazy compile
@@ -96,39 +132,6 @@ pub mod mainprof;
 pub mod inspect;
 pub mod memreport;
 pub mod registry_net;
-
-/// Compiler statics held for rollback; forget them before destroying their generations.
-pub struct ZoneTaken {
-    native_macros: native_macros::ZoneTaken,
-    cache: cache::ZoneTaken,
-    jit: jit::ZoneTaken,
-    run: run::ZoneTaken,
-    tui: tui::ZoneTaken,
-}
-
-/// Takes this crate's compiler statics while every compiler thread is quiesced.
-/// None, taking nothing, when the owner has requests queued.
-pub fn zone_take() -> Option<ZoneTaken> {
-    if !owner::queue_empty() {
-        return None;
-    }
-    Some(ZoneTaken {
-        native_macros: native_macros::zone_take(),
-        cache: cache::zone_take(),
-        jit: jit::zone_take(),
-        run: run::zone_take(),
-        tui: tui::zone_take(),
-    })
-}
-
-/// Restores the statics after an aborted swap, forgetting the new generation's values.
-pub fn zone_put_back(taken: ZoneTaken) {
-    native_macros::zone_put_back(taken.native_macros);
-    cache::zone_put_back(taken.cache);
-    jit::zone_put_back(taken.jit);
-    run::zone_put_back(taken.run);
-    tui::zone_put_back(taken.tui);
-}
 
 #[cfg(test)]
 mod parse_work_bench;
@@ -1180,12 +1183,6 @@ mod lazy_reload_tests;
 
 #[cfg(test)]
 mod calls_tests;
-
-#[cfg(test)]
-mod vfs_bind_tests;
-
-#[cfg(test)]
-mod warm_zone_tests;
 
 #[cfg(test)]
 #[test]
