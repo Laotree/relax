@@ -21759,8 +21759,9 @@ unsafe fn realtime_step(up: *mut Unit) {
     let t0 = wall_ns();
     // before the startup release a mark's reach waits for it (the first present comes first);
     // a reach a real-time thread is waiting on does not
+    // (the phase is read again under the lock: realtime_release takes it after the phase moved)
     if startup_phase() && with_rt(|rt| {
-        let hold = !rt.urgent;
+        let hold = !rt.urgent && startup_phase();
         if hold {
             rt.scheduled = false;
             rt.parked = true;
