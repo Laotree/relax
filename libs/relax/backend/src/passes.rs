@@ -7911,8 +7911,8 @@ pub fn split_branch_conditions(options: &relax_session::Options, f: &mut Func) -
             continue;
         }
         // the new block is the branch's false target (relayout lays it out next): for `&`, x's
-        // integer compare is negated (`!x -> e`); a float compare's negation is not its
-        // opposite (NaN), so `&` of a float x is left alone
+        // compare is negated (`!x -> e`); of float compares only `==` / `!=` negate each other
+        // (`!=` is true for NaN), so `&` of an ordered float x is left alone
         let neg = |c: Cond| match c {
             Cond::Eq => Cond::Ne,
             Cond::Ne => Cond::Eq,
@@ -7924,6 +7924,7 @@ pub fn split_branch_conditions(options: &relax_session::Options, f: &mut Func) -
         let xneg = match b.insts[px] {
             Inst::ICmp(cc, sg, d, a1, a2) => Inst::ICmp(neg(cc), sg, d, a1, a2),
             Inst::ICmpI(cc, sg, d, a1, k1) => Inst::ICmpI(neg(cc), sg, d, a1, k1),
+            Inst::FCmp(cc @ (Cond::Eq | Cond::Ne), w, d, a1, a2) => Inst::FCmp(neg(cc), w, d, a1, a2),
             _ if !or => continue,
             _ => b.insts[px].clone(),
         };
