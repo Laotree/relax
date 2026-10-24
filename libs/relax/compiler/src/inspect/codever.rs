@@ -289,11 +289,13 @@ pub(crate) struct Inlined {
 /// them; O1 code its slot's body_deps), else any fn item of the file spanning the line.
 pub(crate) struct Resolver {
     by_file: std::collections::HashMap<u32, Vec<(u32, u32, crate::program::DefId)>>,
+    /// a file's fn items by byte span (lo, hi, def)
+    by_file_bytes: std::collections::HashMap<u32, Vec<(u32, u32, crate::program::DefId)>>,
 }
 
 impl Resolver {
     pub fn new() -> Resolver {
-        Resolver { by_file: Default::default() }
+        Resolver { by_file: Default::default(), by_file_bytes: Default::default() }
     }
 
     fn file_fns(&mut self, u: &Unit, file: u32) -> &[(u32, u32, crate::program::DefId)] {
@@ -313,6 +315,27 @@ impl Resolver {
         })
     }
 
+    /// Every fn item of a file by its byte span (expansions included: their bytes follow the source).
+    fn file_fn_bytes(&mut self, u: &Unit, file: u32) -> &[(u32, u32, crate::program::DefId)] {
+        self.by_file_bytes.entry(file).or_insert_with(|| {
+            let mut v = Vec::new();
+            for &d in u.prog.defs_in_file(file) {
+                let d = crate::program::DefId(d);
+                let def = u.prog.def(d);
+                if !matches!(def.kind, crate::program::DefKind::Fn | crate::program::DefKind::AssocFn) {
+                    continue;
+                }
+                if let Some(f) = u.prog.files.get(def.file as usize) {
+                    let item = f.ast.item(def.item);
+                    if matches!(item.kind, crate::ast::ItemKind::Fn(..)) {
+                        v.push((item.lo, item.hi, d));
+                    }
+                }
+            }
+            v
+        })
+    }
+
     /// The fn a position inside slot `id`'s code at `start` comes from, when not its own.
     /// The innermost fn item spanning a position (by its file's fn items).
     pub fn fn_at(&mut self, u: &Unit, p: u64) -> Option<crate::program::DefId> {
@@ -323,6 +346,18 @@ impl Resolver {
     /// (a `#[derive(..)]`'s impls all sit on the derive: Clone::clone, PartialEq::eq, Debug::fmt, ..).
     fn fns_at(&mut self, u: &Unit, p: u64) -> Vec<crate::program::DefId> {
         let Some((pf, pl)) = pos_line(u, p) else { return Vec::new() };
+        // by bytes first: a macro's or derive's expansion has bytes of its own past the source (its
+        // fns share the call's LINES, not their bytes), so the innermost item holding the byte is exact
+        let b = p as u32;
+        let mut by_byte: Option<(u32, crate::program::DefId)> = None;
+        for &(lo, hi, d) in self.file_fn_bytes(u, pf) {
+            if b >= lo && b < hi && by_byte.map_or(true, |x| hi - lo < x.0) {
+                by_byte = Some((hi - lo, d));
+            }
+        }
+        if let Some((_, d)) = by_byte {
+            return vec![d];
+        }
         let mut best = u32::MAX;
         let mut out = Vec::new();
         for &(lo, hi, d) in self.file_fns(u, pf) {
@@ -342,26 +377,41 @@ impl Resolver {
     /// The fn an inlined level's position names: the innermost fn item spanning it; among fns that
     /// share that span (derived impls), the one the body at `start` inlined, else all of them named
     /// as one ambiguous level (never a wrong single name).
-    fn level_fn(&mut self, u: &Unit, start: u64, p: u64) -> (Option<crate::program::DefId>, Option<String>) {
+    fn level_fn(&mut self, u: &Unit, id: u32, start: u64, p: u64) -> (Option<crate::program::DefId>, Option<String>) {
         let ds = self.fns_at(u, p);
         if ds.len() <= 1 {
             return (ds.first().copied(), None);
         }
-        let inlined: Vec<crate::program::DefId> = u.code.read().unwrap_or_else(|e| e.into_inner()).inlined_at(start).map_or_else(Vec::new, |s| {
-            s.iter().filter(|&&c| (c as usize) < u.fns.len()).filter_map(|&c| match u.fns[c as usize].key { FnKey::Inst(d, _) => Some(d), _ => None }).collect()
-        });
+        // what the body took in: its inlined slots (O3) and, transitively, what their RIR (and the
+        // slot's own) took in at O1 (a derived impl inlined into an O1 callee the O3 body inlined)
+        let mut slots: Vec<u32> = u.code.read().unwrap_or_else(|e| e.into_inner()).inlined_at(start).map_or_else(Vec::new, |s| s.to_vec());
+        slots.push(id);
+        let mut seen = std::collections::HashSet::new();
+        let mut inlined: Vec<crate::program::DefId> = Vec::new();
+        while let Some(c) = slots.pop() {
+            if !seen.insert(c) || seen.len() > 4096 || (c as usize) >= u.fns.len() {
+                continue;
+            }
+            if let FnKey::Inst(d, _) = u.fns[c as usize].key {
+                inlined.push(d);
+            }
+            if let Some(deps) = u.body_deps.get(&c) {
+                slots.extend(deps.iter().copied());
+            }
+        }
         let hit: Vec<crate::program::DefId> = ds.iter().copied().filter(|d| inlined.contains(d)).collect();
         if hit.len() == 1 {
             return (Some(hit[0]), None);
         }
         let pick = if hit.is_empty() { &ds } else { &hit };
-        let names: Vec<String> = pick.iter().map(|&d| crate::lower::display_path(&u.prog, d)).collect();
-        // `T::{clone|eq|fmt} (derived, one of)`: the shared path once, the fn names listed
-        let prefix = names[0].rsplit_once("::").map_or("", |x| x.0).to_string();
-        let tails: Vec<&str> = names.iter().map(|n| n.rsplit("::").next().unwrap_or(n)).collect();
-        let same = names.iter().all(|n| n.rsplit_once("::").map_or("", |x| x.0) == prefix);
-        let name = if same { format!("{}::{{{}}} (one of these derived fns)", prefix, tails.join("|")) } else { format!("{{{}}} (one of these derived fns)", names.join(" | ")) };
-        (None, Some(name))
+        // `Vec3f::{clone|eq|fmt}`: the type once (generics and trait qualifiers dropped), the fns listed
+        // without `::` inside the braces, so keys that take a name's last two segments keep it whole
+        let plain: Vec<String> = pick.iter().map(|&d| super::asm_plain(&crate::lower::display_path(&u.prog, d))).collect();
+        let ty = plain[0].rsplit_once("::").map_or(plain[0].as_str(), |x| x.0).rsplit("::").next().unwrap_or("").to_string();
+        let mut fns: Vec<&str> = plain.iter().map(|n| n.rsplit("::").next().unwrap_or(n)).collect();
+        fns.sort();
+        fns.dedup();
+        (None, Some(format!("{}::{{{}}} (derived, not resolved)", ty, fns.join("|"))))
     }
 
     /// The inline stack of position `p` in a body whose pc map is `map` (its inline entries,
@@ -394,9 +444,9 @@ impl Resolver {
             let (call, anchor) = (table[(c as usize - 1) * 2], table[(c as usize - 1) * 2 + 1]);
             // the callee's anchor (a position in its own body), else this level's own position
             // (where the pc is in that fn: it lies in its body too)
-            let (mut def, mut amb) = self.level_fn(u, start, anchor);
+            let (mut def, mut amb) = self.level_fn(u, id, start, anchor);
             if def.is_none() && amb.is_none() {
-                (def, amb) = self.level_fn(u, start, cur);
+                (def, amb) = self.level_fn(u, id, start, cur);
             }
             let name = match (def, amb) {
                 (Some(d), _) => crate::lower::display_path(&u.prog, d),
