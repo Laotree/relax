@@ -316,19 +316,57 @@ impl Resolver {
     /// The fn a position inside slot `id`'s code at `start` comes from, when not its own.
     /// The innermost fn item spanning a position (by its file's fn items).
     pub fn fn_at(&mut self, u: &Unit, p: u64) -> Option<crate::program::DefId> {
-        let (pf, pl) = pos_line(u, p)?;
-        let mut inner: Option<(u32, crate::program::DefId)> = None;
+        self.fns_at(u, p).first().copied()
+    }
+
+    /// Every fn item tied for the innermost span holding `p`: one, except where fns share a span
+    /// (a `#[derive(..)]`'s impls all sit on the derive: Clone::clone, PartialEq::eq, Debug::fmt, ..).
+    fn fns_at(&mut self, u: &Unit, p: u64) -> Vec<crate::program::DefId> {
+        let Some((pf, pl)) = pos_line(u, p) else { return Vec::new() };
+        let mut best = u32::MAX;
+        let mut out = Vec::new();
         for &(lo, hi, d) in self.file_fns(u, pf) {
-            if pl >= lo && pl <= hi && inner.map_or(true, |x| hi - lo < x.0) {
-                inner = Some((hi - lo, d));
+            if pl >= lo && pl <= hi {
+                if hi - lo < best {
+                    best = hi - lo;
+                    out.clear();
+                }
+                if hi - lo == best {
+                    out.push(d);
+                }
             }
         }
-        inner.map(|x| x.1)
+        out
+    }
+
+    /// The fn an inlined level's position names: the innermost fn item spanning it; among fns that
+    /// share that span (derived impls), the one the body at `start` inlined, else all of them named
+    /// as one ambiguous level (never a wrong single name).
+    fn level_fn(&mut self, u: &Unit, start: u64, p: u64) -> (Option<crate::program::DefId>, Option<String>) {
+        let ds = self.fns_at(u, p);
+        if ds.len() <= 1 {
+            return (ds.first().copied(), None);
+        }
+        let inlined: Vec<crate::program::DefId> = u.code.read().unwrap_or_else(|e| e.into_inner()).inlined_at(start).map_or_else(Vec::new, |s| {
+            s.iter().filter(|&&c| (c as usize) < u.fns.len()).filter_map(|&c| match u.fns[c as usize].key { FnKey::Inst(d, _) => Some(d), _ => None }).collect()
+        });
+        let hit: Vec<crate::program::DefId> = ds.iter().copied().filter(|d| inlined.contains(d)).collect();
+        if hit.len() == 1 {
+            return (Some(hit[0]), None);
+        }
+        let pick = if hit.is_empty() { &ds } else { &hit };
+        let names: Vec<String> = pick.iter().map(|&d| crate::lower::display_path(&u.prog, d)).collect();
+        // `T::{clone|eq|fmt} (derived, one of)`: the shared path once, the fn names listed
+        let prefix = names[0].rsplit_once("::").map_or("", |x| x.0).to_string();
+        let tails: Vec<&str> = names.iter().map(|n| n.rsplit("::").next().unwrap_or(n)).collect();
+        let same = names.iter().all(|n| n.rsplit_once("::").map_or("", |x| x.0) == prefix);
+        let name = if same { format!("{}::{{{}}} (one of these derived fns)", prefix, tails.join("|")) } else { format!("{{{}}} (one of these derived fns)", names.join(" | ")) };
+        (None, Some(name))
     }
 
     /// The inline stack of position `p` in a body whose pc map is `map` (its inline entries,
     /// rir::inline_pc_entries): None when `p` is the body's own code.
-    pub fn inline_stack(&mut self, u: &Unit, id: u32, map: &PcMap, p: u64) -> Option<Inlined> {
+    pub fn inline_stack(&mut self, u: &Unit, id: u32, start: u64, map: &PcMap, p: u64) -> Option<Inlined> {
         use relax_backend::rir::{pos_ctx, POS_CTX_LOST};
         if pos_ctx(p) == 0 {
             return None;
@@ -356,8 +394,15 @@ impl Resolver {
             let (call, anchor) = (table[(c as usize - 1) * 2], table[(c as usize - 1) * 2 + 1]);
             // the callee's anchor (a position in its own body), else this level's own position
             // (where the pc is in that fn: it lies in its body too)
-            let def = self.fn_at(u, anchor).or_else(|| self.fn_at(u, cur));
-            let name = def.map_or_else(|| "(inlined fn)".to_string(), |d| crate::lower::display_path(&u.prog, d));
+            let (mut def, mut amb) = self.level_fn(u, start, anchor);
+            if def.is_none() && amb.is_none() {
+                (def, amb) = self.level_fn(u, start, cur);
+            }
+            let name = match (def, amb) {
+                (Some(d), _) => crate::lower::display_path(&u.prog, d),
+                (None, Some(n)) => n,
+                (None, None) => "(inlined fn)".to_string(),
+            };
             stack.push((name, def, pstr(cur)));
             cur = call;
         }
@@ -437,7 +482,7 @@ pub(crate) fn describe_pc(u: &Unit, r: &mut Resolver, pc: u64) -> Option<PcCode>
         None => u.prog.file_paths.get(u.fns[id as usize].file as usize).cloned().unwrap_or_default(),
     };
     // the line table's inline stack, else (older code) the fn whose span holds the position
-    let inlined = pos.and_then(|p| map.and_then(|m| r.inline_stack(u, id, m, p)).or_else(|| r.inlined_fn(u, id, start, p)));
+    let inlined = pos.and_then(|p| map.and_then(|m| r.inline_stack(u, id, start, m, p)).or_else(|| r.inlined_fn(u, id, start, p)));
     Some(PcCode { slot: id, start, len, kind, state, gen, at, inlined })
 }
 
