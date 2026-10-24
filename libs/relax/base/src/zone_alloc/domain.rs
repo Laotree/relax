@@ -602,6 +602,62 @@ mod tests {
         }
     }
 
+    /// A program thread's current chunk left sparse by a burst gives its whole free pages back
+    /// while attached (`owned_tick`), once per trim epoch, and its blocks stay usable.
+    #[test]
+    fn sparse_current_chunk_gives_free_pages_back() {
+        symbol(b"relax_alloc");
+        let heap = DomainHeap::new().unwrap();
+        unsafe {
+            enter(&*heap);
+            // a burst: 1.2 MB of 64-byte blocks in this thread's current chunk of the class
+            let mut v: Vec<*mut u8> = (0..20_000).map(|_| program_alloc(64, 8)).collect();
+            for &p in &v {
+                std::ptr::write_bytes(p, 7, 64);
+            }
+            let free_mb = |h: &DomainHeap| h.states()[24];
+            assert_eq!(free_mb(&heap), 0);
+            // all but every 1000th go; the survivors are under a quarter of what was carved
+            let keep: Vec<*mut u8> = v.iter().copied().step_by(1000).collect();
+            for (i, p) in v.drain(..).enumerate() {
+                if i % 1000 != 0 {
+                    program_dealloc(p, 64, 8);
+                }
+            }
+            let before = free_mb(&heap);
+            assert!(before > 1 << 20, "the burst left free pages in the current chunk: {before}");
+            // the next epoch: a free that leaves a power of two of live blocks trims
+            heap.inner.arena.densify(0);
+            let extra: Vec<*mut u8> = (0..4).map(|_| program_alloc(64, 8)).collect();
+            for p in extra {
+                program_dealloc(p, 64, 8);
+            }
+            let x = program_alloc(64, 8);
+            program_dealloc(x, 64, 8);
+            // 20 survivors: freeing down to 16 reaches a power of two
+            for &p in &keep[16..] {
+                program_dealloc(p, 64, 8);
+            }
+            let after = free_mb(&heap);
+            assert!(after < before / 4, "the current chunk kept its free pages: {before} -> {after}");
+            // the survivors and new blocks still work
+            for &p in &keep[..16] {
+                assert_eq!(*p, 7);
+            }
+            let fresh: Vec<*mut u8> = (0..30_000).map(|_| program_alloc(64, 8)).collect();
+            for &p in &fresh {
+                std::ptr::write_bytes(p, 9, 64);
+            }
+            for p in fresh {
+                program_dealloc(p, 64, 8);
+            }
+            for &p in &keep[..16] {
+                program_dealloc(p, 64, 8);
+            }
+            enter(std::ptr::null());
+        }
+    }
+
     #[test]
     fn ended_threads_hand_their_chunks_back() {
         // A program thread that ends inside its domain heap (no leave) gives its chunks back
