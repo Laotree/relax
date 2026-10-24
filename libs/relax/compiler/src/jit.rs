@@ -6152,8 +6152,12 @@ impl Unit {
                 }
             }
             FnKey::Closure(_, _, parent) => self.verdict_state(*parent),
-            // the unverified-mode twin is never promoted: it exists to run under aliasing
-            FnKey::Plain(_) => Verdict::Unverifiable("unverified-mode twin".into()),
+            // the unverified-mode twin is never promoted: it exists to run under aliasing; its base's
+            // rejection is its own (code that inlined the twin is built again without it)
+            FnKey::Plain(b) => match self.verdict_state(*b) {
+                Verdict::Failed(e) => Verdict::Failed(e),
+                _ => Verdict::Unverifiable("unverified-mode twin".into()),
+            },
             _ => Verdict::Clean,
         }
     }
@@ -7753,7 +7757,9 @@ pub fn src_size(u: &Unit, id: u32) -> u32 {
             let b = u.prog.files[*file as usize].ast.block(crate::ast::BlockId(*ce & !crate::tcx::ASYNC_FN_BODY));
             (*file, b.lo, b.hi)
         }
-        FnKey::Sandbox(_) | FnKey::Plain(_) => return u32::MAX,
+        // (an unverified-mode twin is its base's body)
+        FnKey::Plain(b) => return src_size(u, *b),
+        FnKey::Sandbox(_) => return u32::MAX,
         FnKey::Closure(file, ce, _) => {
             let e = u.prog.files[*file as usize].ast.expr(crate::ast::ExprId(*ce));
             (*file, e.lo, e.hi)
@@ -7826,7 +7832,14 @@ fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &cra
         // binary_search_by: 48% of text_shape_raster)
         FnKey::Shim(_) if core_hint => relax_codegen::opt::ATTR_HINT,
         FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Closure(..) => 0,
-        // twins are never inlined into anything (their callers are twins built from RIR)
+        // SPEC-V: an unverified-mode twin is its base's body lowered as unverified code; unverified
+        // code calls it where it passes `&mut` next to another pointer. Inlined into an unverified
+        // build it is that same code (no `noalias`, its own calls still to twins), so it inlines as
+        // its base would (rustc inlines the callee there: `set_material`'s 15 `set_uniform` calls).
+        // The build holds it as unverified code (O3Assembled::unverified_in): a failed verdict of
+        // the base builds it again. Never into verified code (which never calls twins).
+        FnKey::Plain(b) if into_unverified => return callee_attrs(prog, tcx, fns, core_crate, *b, inline_all, core_hint, true),
+        // sandbox twins are never inlined into anything (their callers are twins built from RIR)
         FnKey::Sandbox(_) | FnKey::Plain(_) => return None,
     })
 }
@@ -15321,7 +15334,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // its const_drain): fronted again in the next round, each up to REFRONTS times
     let mut refronted: HashMap<u32, u8> = Default::default();
     const REFRONTS: u8 = 3;
-    let fronts: std::cell::RefCell<Vec<(u32, DefId, Vec<TyId>)>> = Default::default();
+    // (slot, def, args, the base of an unverified-mode twin: its body is the base's, lowered as unverified code)
+    let fronts: std::cell::RefCell<Vec<(u32, DefId, Vec<TyId>, Option<u32>)>> = Default::default();
     // O1 builds a round's walk met that this thread prepares through a take and optimises itself
     // (o3_candidates_begin / o3_candidates_finish), not on the owner: upgrades of baseline RIR to
     // normal RIR (the root's and the candidates'), and the root's own RIR. Each slot once per
@@ -15527,9 +15541,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
         let u = &mut *up;
         let f = &u.fns[c as usize];
-        let attr = match &f.key {
+        // (an unverified-mode twin: its base's body, lowered as unverified code)
+        let base_key = match &f.key { FnKey::Plain(b) => &u.fns[*b as usize].key, k => k };
+        let attr = match base_key {
             FnKey::Inst(d, _) if u.prog.def(*d).kind != DefKind::ForeignFn => inline_attrs(&u.prog, *d),
-            FnKey::Shim(_) | FnKey::Glue(..) => 0,
+            FnKey::Shim(_) | FnKey::Glue(..) if !matches!(f.key, FnKey::Plain(_)) => 0,
             FnKey::Closure(cf, _, parent) if u.has_body(*parent, *cf) => 0,
             _ => return,
         };
@@ -15543,9 +15559,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         if force || cached_code || source_size <= src_toks || attr & relax_codegen::opt::ATTR_ALWAYS != 0
             || (single && source_size <= TIER1_SINGLE_SRC_TOKS) {
             if prefront && !fronted.contains(&c) {
-                if let FnKey::Inst(d, args) = &u.fns[c as usize].key {
+                let twin_of = match u.fns[c as usize].key { FnKey::Plain(b) => Some(b), _ => None };
+                if let FnKey::Inst(d, args) = &u.fns[twin_of.unwrap_or(c) as usize].key {
                     if matches!(u.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn) {
-                        fronts.borrow_mut().push((c, *d, args.clone()));
+                        fronts.borrow_mut().push((c, *d, args.clone(), twin_of));
                         return;
                     }
                 }
@@ -15745,10 +15762,14 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let tf = cpu_ns();
     TIER1_SNAP_FRONTS[0].fetch_add(more.len() as u64, Ordering::Relaxed);
     let mut ids = Vec::with_capacity(more.len() + ups.len());
-    for (c, d, args) in more {
+    for (c, d, args, twin_of) in more {
         fronted.insert(c);
         split_tried.borrow_mut().insert((c, false));
         ids.push((c, RirMode::Tier0));
+        if let Some(base) = twin_of {
+            prefront_twin(&front, c, base);
+            continue;
+        }
         let _preemptible = crate::preempt::Preemptible::on();
         typeck_ahead(&front, d, args, 1, false, true);
         let _want = WantConsts::on();
@@ -16230,7 +16251,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 {
                     let mut a = UNVERIFIED_IN.lock().unwrap_or_else(|e| e.into_inner());
                     a.retain(|&(k, _, r)| k != up as usize || r != id);
-                    crate::zone_alloc::kept_with(|| for &c in &unverified_inl { a.push((up as usize, c, id)); });
+                    // (a twin by its base: the base's verdict decides)
+                    crate::zone_alloc::kept_with(|| for &c in &unverified_inl { a.push((up as usize, match u.fns[c as usize].key { FnKey::Plain(b) => b, _ => c }, id)); });
                 }
                 u.fns[id as usize].o3.store(true, Ordering::Relaxed);
                 if o3_first() {
@@ -17734,7 +17756,7 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &cr
                     snap_counts.push((c, ck, cc));
                 }
             }
-            if root_unverified && fns[c as usize].unverified.load(Ordering::Relaxed) {
+            if root_unverified && (fns[c as usize].unverified.load(Ordering::Relaxed) || matches!(fns[c as usize].key, FnKey::Plain(_))) {
                 unverified_in.push(c);
             }
             snap.push((c, r.clone(), attrs));
