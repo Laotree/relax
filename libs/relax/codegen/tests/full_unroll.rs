@@ -3,9 +3,10 @@
 //! the block after the header test, a second test there leaves for the header's exit block (the
 //! loaded Option's tag), the body has a `continue` (two latches) and an invoked call with an unwind
 //! edge. The loop must be fully unrolled, and the RIR before and after must agree on an evaluator
-//! that records every call (callee argument) in order. The body reads the array (a stack slot) at
-//! `slot + k * 8`: that fixed-address gain is what lets the general rule unroll it. The same loop
-//! over memory behind a pointer (box3d's `c.points[point_index]`) stays rolled.
+//! that records every call (callee argument) in order. The body reads the array (a stack slot of
+//! borrows: another slot's address is stored in it) at `slot + k * 8`: unrolled, those reads forward
+//! and the borrowed slot stops escaping, the gain that lets the general rule unroll it. The same loop
+//! over memory behind a pointer, or over a slot of plain values (box3d's scatter_bodies), stays rolled.
 use relax_backend::regalloc::reachable;
 use relax_backend::rir::*;
 
@@ -29,6 +30,7 @@ fn eval(f: &Func, args: &[u64]) -> (Vec<u64>, Vec<u64>) {
             match *i {
                 Inst::Iconst(d, k) => r[d.0 as usize] = k as u64,
                 Inst::SlotAddr(d, s) => r[d.0 as usize] = 0x1000 + 0x100 * s as u64,
+                Inst::Store(..) => {}
                 Inst::Mov(d, s) => r[d.0 as usize] = r[s.0 as usize],
                 Inst::IBin(IOp::Add, _, d, a, c) => r[d.0 as usize] = r[a.0 as usize].wrapping_add(r[c.0 as usize]),
                 Inst::IBinI(IOp::Add, _, d, a, k) => r[d.0 as usize] = r[a.0 as usize].wrapping_add(k as u64),
@@ -57,11 +59,21 @@ fn eval(f: &Func, args: &[u64]) -> (Vec<u64>, Vec<u64>) {
 /// b2: k = c; c = c + 1; tag = (seed & 1) == 0 || k != 2 (the "loaded Some"); -> b3 : b7
 /// b3: skip = (k + seed) & 1 -> b1 (continue: latch 1) : b4
 /// b4: call host(k * 10 + seed + base + k * 8) -> invoke b5, unwind b8 (base: the array slot's
-///     address, or the parameter `p` when `slot` is false)
+///     address, or the parameter `p` for `Base::Pointer`)
 /// b5: acc = acc + k -> b1 (latch 2)
 /// b7: ret acc
 /// b8: (cleanup) ret acc
-fn array_loop(slot: bool) -> Func {
+#[derive(Clone, Copy, PartialEq)]
+enum Base {
+    /// a slot holding another slot's address (an array of borrows)
+    Borrows,
+    /// a slot holding a plain value
+    Values,
+    /// a pointer parameter
+    Pointer,
+}
+
+fn array_loop(kind: Base) -> Func {
     let mut f = Func::new("arr".into(), 0);
     let seed = f.vreg(Cls::I);
     f.params.push(seed);
@@ -77,11 +89,19 @@ fn array_loop(slot: bool) -> Func {
     let (c, acc, done, k, t0, t1, tag, s1, skip, arg, t2, t3) = (v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]);
     push(&mut f, 0, Inst::Iconst(c, 0));
     push(&mut f, 0, Inst::Iconst(acc, 0));
-    if slot {
+    if kind == Base::Pointer {
+        push(&mut f, 0, Inst::Mov(base, p));
+    } else {
         let s = f.slot(32, 8);
         push(&mut f, 0, Inst::SlotAddr(base, s));
-    } else {
-        push(&mut f, 0, Inst::Mov(base, p));
+        let x = f.vreg(Cls::I);
+        if kind == Base::Borrows {
+            let s2 = f.slot(8, 8);
+            push(&mut f, 0, Inst::SlotAddr(x, s2));
+        } else {
+            push(&mut f, 0, Inst::Iconst(x, 5));
+        }
+        push(&mut f, 0, Inst::Store(Mem::Int(8, false), base, 0, x));
     }
     f.blocks[0].term = Term::Jump(1);
     push(&mut f, 1, Inst::ICmpI(Cond::Eq, false, done, c, 3));
@@ -117,7 +137,7 @@ fn array_loop(slot: bool) -> Func {
 
 #[test]
 fn a_loop_with_calls_two_latches_and_a_split_exit_test_unrolls() {
-    let f = array_loop(true);
+    let f = array_loop(Base::Borrows);
     f.verify().unwrap();
     let o = relax_session::Options::default();
     let mut g = f.clone();
@@ -140,9 +160,11 @@ fn a_loop_with_calls_two_latches_and_a_split_exit_test_unrolls() {
 }
 
 #[test]
-fn the_same_loop_over_memory_behind_a_pointer_stays_rolled() {
-    let f = array_loop(false);
-    f.verify().unwrap();
-    let mut g = f.clone();
-    assert!(!relax_codegen::loops::unroll_const_loops(&relax_session::Options::default(), &mut g), "unrolled:\n{}", g.dump());
+fn the_same_loop_over_a_pointer_or_a_slot_of_values_stays_rolled() {
+    for kind in [Base::Pointer, Base::Values] {
+        let f = array_loop(kind);
+        f.verify().unwrap();
+        let mut g = f.clone();
+        assert!(!relax_codegen::loops::unroll_const_loops(&relax_session::Options::default(), &mut g), "unrolled:\n{}", g.dump());
+    }
 }

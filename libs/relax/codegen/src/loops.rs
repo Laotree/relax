@@ -2300,15 +2300,14 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
             continue;
         }
         // The two generalisations (several latches, an exit split over two blocks) pay only where
-        // the copies turn the counter's indexing of a stack slot or of static data into fixed
-        // addresses: reconcile's `[(&mut entry.a, ..), (..)]` array read by its IntoIter (`data +
-        // start * stride`) becomes constant-offset loads that forward, and the array and the
-        // borrowed `entry` stop escaping (LLVM's full-unroll analysis grants the same bonus for
-        // SROA-able allocas and constant-array loads). A counted loop over memory behind a pointer
-        // (box3d solve_contacts_convex's `for point_index in 0..4` over `c.points[point_index]`)
-        // only trades an index add per access for 4 copies of a 150-inst body and more register
-        // pressure: +277 static insts, +1.8..11% instructions on box3d_physics (GAPB2). The
-        // copies of such loops also stay within a tighter budget.
+        // the copies remove an escape: reconcile's `[(&mut entry.a, ..), (..)]` array read by its
+        // IntoIter (`data + start * stride`) becomes constant-offset loads that forward the
+        // borrows, and `entry` stops escaping (LLVM's full-unroll analysis grants the same bonus
+        // for allocas SROA can then split). box3d's scatter_bodies (`for lane in 0..4` with a
+        // `continue`, reading `simd_body.v.x.get(lane)` from a slot of floats, inlined twice in
+        // solve_contacts_convex) only saves an index add per access: unrolled, it cost +277
+        // static insts and +1.8..11% instructions on box3d_physics (GAPB2). The copies of such
+        // loops also stay within a tighter budget.
         let general = multi || split_used;
         if general {
             let gain = counter_indexes_fixed_memory(f, &members, c, &ndef);
@@ -2525,28 +2524,29 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
     changed
 }
 
-/// Whether some address in the loop is a stack slot's or a static symbol's address plus a value
-/// computed from the counter `c` (not through memory): the copies make it a fixed address
-/// (`SlotAddr + j*stride`), so the slot's accesses can forward and promote. Memory behind a pointer
-/// the loop reads is not counted: there the copies save only the index add.
+/// Whether the loop reads, at `slot + (value of the counter c)`, a stack slot that holds addresses of
+/// other slots (stored there, or copied in from such a slot): an array of borrows (`[(&mut e.a, ..),
+/// (..)]`) walked by its IntoIter. The copies make those reads fixed-offset loads that forward the
+/// stored addresses, so the borrowed slots stop escaping and their copies can join (SROA's bonus in
+/// LLVM's full-unroll analysis). A counter indexing memory behind a pointer, or a slot of plain
+/// values (box3d scatter_bodies' `simd_body.v.x.get(lane)`), gains only an index add per access.
 fn counter_indexes_fixed_memory(f: &Func, members: &[u32], c: VReg, ndef: &[u32]) -> bool {
+    const NONE: u32 = u32::MAX;
     let nv = f.vregs.len();
-    // fixed bases: single-definition vregs holding a slot or symbol address, plus constant offsets
-    let mut fixed = vec![false; nv];
+    // the slot a single-definition vreg points into (its address plus constant offsets)
+    let mut root = vec![NONE; nv];
     loop {
         let mut grew = false;
         for b in &f.blocks {
             for i in &b.insts {
-                let d = match *i {
-                    Inst::SlotAddr(d, _) | Inst::Addr(d, _) => Some(d),
-                    Inst::Mov(d, a) | Inst::IBinI(IOp::Add | IOp::Sub, _, d, a, _) if fixed[a.0 as usize] => Some(d),
-                    _ => None,
+                let (d, r) = match *i {
+                    Inst::SlotAddr(d, s) => (d, s),
+                    Inst::Mov(d, a) | Inst::IBinI(IOp::Add | IOp::Sub, _, d, a, _) if root[a.0 as usize] != NONE => (d, root[a.0 as usize]),
+                    _ => continue,
                 };
-                if let Some(d) = d {
-                    if ndef[d.0 as usize] == 1 && !fixed[d.0 as usize] {
-                        fixed[d.0 as usize] = true;
-                        grew = true;
-                    }
+                if ndef[d.0 as usize] == 1 && root[d.0 as usize] == NONE {
+                    root[d.0 as usize] = r;
+                    grew = true;
                 }
             }
         }
@@ -2554,7 +2554,28 @@ fn counter_indexes_fixed_memory(f: &Func, members: &[u32], c: VReg, ndef: &[u32]
             break;
         }
     }
-    // values computed from a counter inside the loop (not through memory)
+    // slots holding slot addresses
+    let mut holds = vec![false; f.slots.len()];
+    loop {
+        let mut grew = false;
+        for b in &f.blocks {
+            for i in &b.insts {
+                let (to, yes) = match *i {
+                    Inst::Store(_, base, _, src) => (root[base.0 as usize], root[src.0 as usize] != NONE),
+                    Inst::Copy(dst, src, _) => (root[dst.0 as usize], root[src.0 as usize] != NONE && holds[root[src.0 as usize] as usize]),
+                    _ => continue,
+                };
+                if yes && to != NONE && !holds[to as usize] {
+                    holds[to as usize] = true;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    // values computed from the counter inside the loop (not through memory)
     let mut ctr = vec![false; nv];
     ctr[c.0 as usize] = true;
     loop {
@@ -2562,15 +2583,13 @@ fn counter_indexes_fixed_memory(f: &Func, members: &[u32], c: VReg, ndef: &[u32]
         for &b in members {
             for i in &f.blocks[b as usize].insts {
                 let d = match *i {
-                    Inst::Mov(d, a) | Inst::IBinI(_, _, d, a, _) | Inst::Conv(Conv::IntToInt(_), d, a) | Inst::INeg(_, d, a) if ctr[a.0 as usize] => Some(d),
-                    Inst::IBin(_, _, d, a, x) if ctr[a.0 as usize] || ctr[x.0 as usize] => Some(d),
-                    _ => None,
+                    Inst::Mov(d, a) | Inst::IBinI(_, _, d, a, _) | Inst::Conv(Conv::IntToInt(_), d, a) | Inst::INeg(_, d, a) if ctr[a.0 as usize] => d,
+                    Inst::IBin(_, _, d, a, x) if ctr[a.0 as usize] || ctr[x.0 as usize] => d,
+                    _ => continue,
                 };
-                if let Some(d) = d {
-                    if !ctr[d.0 as usize] && !fixed[d.0 as usize] {
-                        ctr[d.0 as usize] = true;
-                        grew = true;
-                    }
+                if !ctr[d.0 as usize] {
+                    ctr[d.0 as usize] = true;
+                    grew = true;
                 }
             }
         }
@@ -2578,9 +2597,10 @@ fn counter_indexes_fixed_memory(f: &Func, members: &[u32], c: VReg, ndef: &[u32]
             break;
         }
     }
+    let held = |v: VReg| root[v.0 as usize] != NONE && holds[root[v.0 as usize] as usize];
     members.iter().any(|&b| {
         f.blocks[b as usize].insts.iter().any(|i| match *i {
-            Inst::IBin(IOp::Add | IOp::Sub, _, _, a, x) => (fixed[a.0 as usize] && ctr[x.0 as usize]) || (ctr[a.0 as usize] && fixed[x.0 as usize]),
+            Inst::IBin(IOp::Add, _, _, a, x) => (held(a) && ctr[x.0 as usize]) || (ctr[a.0 as usize] && held(x)),
             _ => false,
         })
     })
