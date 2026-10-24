@@ -1191,7 +1191,8 @@ impl<'a> Lcx<'a> {
             Some(leaves) => {
                 // a pointer-sized leaf the type's niche keeps from 0 (references, Box, NonNull,
                 // a Vec's buffer pointer): codegen folds its null tests (Func::nonnull)
-                let nn = l.niche.filter(|n| n.bytes == 8 && n.start >= 1 && n.start <= n.end).map(|n| n.off);
+                let pb = self.pb();
+                let nn = l.niche.filter(|n| n.bytes == pb && n.start >= 1 && n.start <= n.end).map(|n| n.off);
                 // an unsigned scalar leaf the niche limits to start..=end (char, bool, enum
                 // tags): value ranges decide its niche tests (Func::ranged)
                 let rg = l.niche.filter(|n| n.bytes < 8 && n.start <= n.end && (n.start > 0 || n.end < (1u128 << (8 * n.bytes)) - 1));
@@ -7976,6 +7977,11 @@ impl<'a> Lcx<'a> {
         matches!(self.u.tcx.tys.kind(t), TyKind::Int(Prim::I128))
     }
 
+    /// The unsigned integer type of an address (u64; wasm32: u32, its arithmetic wraps there).
+    fn ptr_ty(&self) -> IntTy {
+        if self.pb() == 4 { relax_backend::rir::U32 } else { U64 }
+    }
+
     fn ibin(&mut self, op: IOp, signed: bool, a: VReg, b: VReg) -> VReg {
         let d = self.f.vreg(Cls::I);
         self.emit(Inst::IBin(op, IntTy { bits: 64, signed }, d, a, b));
@@ -10573,10 +10579,12 @@ impl<'a> Lcx<'a> {
                 let n = leaf(self, 1);
                 let (sz, al) = elem(self);
                 let stride = crate::layout::round_up(sz, al) as i64;
+                // address arithmetic at the pointer's width (wasm32: i32, as rustc's)
+                let pt = self.ptr_ty();
                 let off = self.f.vreg(Cls::I);
-                self.emit(Inst::IBinI(IOp::Mul, U64, off, n[0], stride));
+                self.emit(Inst::IBinI(IOp::Mul, pt, off, n[0], stride));
                 let d = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Add, U64, d, p[0], off));
+                self.emit(Inst::IBin(IOp::Add, pt, d, p[0], off));
                 Val::L(vec![d])
             }
             // `p - n * stride` (core's in-bounds `sub`)
@@ -10586,10 +10594,11 @@ impl<'a> Lcx<'a> {
                 let (sz, al) = elem(self);
                 let stride = crate::layout::round_up(sz, al) as i64;
                 let k = self.iconst(stride);
+                let pt = self.ptr_ty();
                 let off = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Mul, U64, off, n[0], k));
+                self.emit(Inst::IBin(IOp::Mul, pt, off, n[0], k));
                 let d = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Sub, U64, d, p[0], off));
+                self.emit(Inst::IBin(IOp::Sub, pt, d, p[0], off));
                 Val::L(vec![d])
             }
             // wrapping element offset (two's complement: the same instructions as ptr_add)
@@ -10598,10 +10607,11 @@ impl<'a> Lcx<'a> {
                 let n = leaf(self, 1);
                 let (sz, al) = elem(self);
                 let stride = crate::layout::round_up(sz, al) as i64;
+                let pt = self.ptr_ty();
                 let off = self.f.vreg(Cls::I);
-                self.emit(Inst::IBinI(IOp::Mul, U64, off, n[0], stride));
+                self.emit(Inst::IBinI(IOp::Mul, pt, off, n[0], stride));
                 let d = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Add, U64, d, p[0], off));
+                self.emit(Inst::IBin(IOp::Add, pt, d, p[0], off));
                 Val::L(vec![d])
             }
             // (p - origin) / stride, exact by contract (signed)

@@ -1288,6 +1288,23 @@ fn single_thread(name: &str) -> Option<HostBind> {
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum O3Policy {
+    Off,
+    Hot,
+    All,
+}
+
+/// MAKEPAD_RUN_WASM_EXPORT_O3=hot|all|0: shipping bodies built by the JIT's O3 pipeline.
+pub(crate) fn o3_policy() -> O3Policy {
+    static P: std::sync::OnceLock<O3Policy> = std::sync::OnceLock::new();
+    *P.get_or_init(|| match std::env::var("MAKEPAD_RUN_WASM_EXPORT_O3").as_deref() {
+        Ok("0") | Ok("off") => O3Policy::Off,
+        Ok("all") => O3Policy::All,
+        _ => O3Policy::Hot,
+    })
+}
+
 /// One profile switch for capture, closure, emission and gate semantics.
 fn block_profile() -> bool {
     std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_BLOCKS").is_some_and(|v| v != "0")

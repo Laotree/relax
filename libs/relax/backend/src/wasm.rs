@@ -1157,6 +1157,229 @@ enum Want {
     Inverted,
     /// the address type, with this much added (the result is the memarg offset)
     Addr(i64),
+    /// i32: the value's low 32 bits (wasm32 narrow values: `Fx::nk`)
+    Low,
+}
+
+/// narrow kinds of an integer vreg (`narrow_kinds`): its 64-bit value is the zero- (KZ) or
+/// sign-extension (KS) of its low 32 bits, so it lives in an i32 local
+const KZ: u8 = 1;
+const KS: u8 = 2;
+/// narrow by demand: every use reads only the low 32 bits (addresses, narrow stores, the
+/// operands of narrow add / sub / mul / bitwise ops); the upper bits are unknown
+const KL: u8 = 4;
+
+fn const_kind(v: i64) -> u8 {
+    (if (0..1i64 << 32).contains(&v) { KZ } else { 0 }) | (if (-(1i64 << 31)..1i64 << 31).contains(&v) { KS } else { 0 })
+}
+
+fn ty_kind(it: IntTy) -> u8 {
+    match (it.bits, it.signed) {
+        (b, false) if b < 32 => KZ | KS,
+        (32, false) => KZ,
+        (b, true) if b <= 32 => KS,
+        _ => 0,
+    }
+}
+
+/// Per vreg: the narrow kind of every definition's value (0: none, a wide i64). wasm32 only.
+/// Copies, selects and bitwise ops take their operands' kinds (optimistic over cycles: a loop
+/// variable enters its cycle from a definition outside it).
+fn narrow_kinds(f: &Func, o: &Options, link: &dyn Link) -> Vec<u8> {
+    let nv = f.vregs.len();
+    if o.memory64 {
+        return vec![0; nv];
+    }
+    const UNSET: u8 = 0xFF;
+    let mut k = vec![UNSET; nv];
+    for p in &f.params {
+        k[p.0 as usize] = 0;
+    }
+    let top = |k: &[u8], v: VReg| if k[v.0 as usize] == UNSET { KZ | KS } else { k[v.0 as usize] };
+    for _ in 0..32 {
+        let mut n = vec![UNSET; nv];
+        for p in &f.params {
+            n[p.0 as usize] = 0;
+        }
+        let put = |n: &mut Vec<u8>, d: VReg, x: u8| {
+            let d = d.0 as usize;
+            n[d] = if n[d] == UNSET { x } else { n[d] & x };
+        };
+        for b in &f.blocks {
+            for i in &b.insts {
+                let load = |m: Mem| match m {
+                    Mem::Int(1 | 2, false) => KZ | KS,
+                    Mem::Int(1 | 2, true) | Mem::Int(4, true) => KS,
+                    Mem::Int(4, false) => KZ,
+                    _ => 0,
+                };
+                match *i {
+                    Inst::Iconst(d, v) => put(&mut n, d, const_kind(v)),
+                    Inst::Load(m, d, ..) | Inst::LoadX(m, d, ..) | Inst::AtomicLoad(m, _, d, _) => put(&mut n, d, load(m)),
+                    Inst::IBin(op @ (IOp::And | IOp::Or | IOp::Xor), _, d, a, x) => {
+                        let (ka, kx) = (top(&k, a), top(&k, x));
+                        put(&mut n, d, if op == IOp::And { (ka | kx) & KZ | ka & kx & KS } else { ka & kx })
+                    }
+                    Inst::IBinI(op @ (IOp::And | IOp::Or | IOp::Xor), _, d, a, imm) => {
+                        let (ka, kx) = (top(&k, a), const_kind(imm));
+                        put(&mut n, d, if op == IOp::And { (ka | kx) & KZ | ka & kx & KS } else { ka & kx })
+                    }
+                    Inst::IBin(op, it, d, ..) | Inst::IBinI(op, it, d, ..) => put(&mut n, d, match op {
+                        IOp::MulHi | IOp::Bzhi => 0,
+                        _ => ty_kind(it),
+                    }),
+                    Inst::INeg(it, d, _) | Inst::INot(it, d, _) => put(&mut n, d, ty_kind(it)),
+                    Inst::ICmp(_, _, d, ..) | Inst::ICmpI(_, _, d, ..) | Inst::FCmp(_, _, d, ..) => put(&mut n, d, KZ | KS),
+                    Inst::Conv(Conv::IntToInt(it), d, x) => put(&mut n, d, if it.bits >= 64 { top(&k, x) } else { ty_kind(it) }),
+                    Inst::Conv(Conv::FToInt(_, it), d, _) => put(&mut n, d, ty_kind(it)),
+                    Inst::Conv(Conv::FToBits(false), d, _) => put(&mut n, d, KZ),
+                    Inst::Conv(_, d, _) => put(&mut n, d, 0),
+                    Inst::SlotAddr(d, _) => put(&mut n, d, KZ),
+                    Inst::Addr(d, s) | Inst::TlsAddr(d, s) | Inst::TlsStatic(d, s) => put(&mut n, d, const_kind(link.sym(s.id).wrapping_add(s.off as u64) as i64) & KZ),
+                    Inst::FnAddr(d, _) => put(&mut n, d, KZ),
+                    Inst::Sel(d, _, a, x) if f.vregs[d.0 as usize] == Cls::I => put(&mut n, d, top(&k, a) & top(&k, x)),
+                    Inst::Mov(d, a) if f.vregs[d.0 as usize] == Cls::I => put(&mut n, d, top(&k, a)),
+                    Inst::VExtract(d, _, _) if f.vregs[d.0 as usize] == Cls::I => put(&mut n, d, KS),
+                    _ => i.defs(|d| put(&mut n, d, 0)),
+                }
+            }
+        }
+        if n == k {
+            break;
+        }
+        k = n;
+    }
+    for v in 0..nv {
+        if k[v] == UNSET || f.vregs[v] != Cls::I {
+            k[v] = 0;
+        }
+    }
+    // narrow by demand (KL): candidates are the other integer vregs every definition of which is
+    // an expression (not a call, not a parameter); a use that needs more than the low half removes
+    // one, to a fixed point (whether an operand use is narrow depends on its result's form)
+    let mut defs_ok = vec![true; nv];
+    let mut has_def = vec![false; nv];
+    for p in &f.params {
+        defs_ok[p.0 as usize] = false;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            let expr = tree_def(i).is_some() && !matches!(i, Inst::Call(..));
+            i.defs(|d| {
+                has_def[d.0 as usize] = true;
+                if !expr {
+                    defs_ok[d.0 as usize] = false;
+                }
+            });
+        }
+    }
+    for v in 0..nv {
+        if k[v] == 0 && f.vregs[v] == Cls::I && defs_ok[v] && has_def[v] {
+            k[v] = KL;
+        }
+    }
+    let mut uses: Vec<VReg> = Vec::new();
+    let mut low: Vec<VReg> = Vec::new();
+    loop {
+        let mut changed = false;
+        for b in &f.blocks {
+            for i in &b.insts {
+                uses.clear();
+                let mut ds: Vec<VReg> = Vec::new();
+                i.defs(|d| ds.push(d));
+                let mut x = i.clone();
+                x.vregs_mut(|v| uses.push(*v));
+                for d in &ds {
+                    if let Some(p) = uses.iter().position(|v| v == d) {
+                        uses.remove(p);
+                    }
+                }
+                if let Inst::VInsert(_, v, _, _) = i {
+                    if !uses.contains(v) {
+                        uses.push(*v);
+                    }
+                }
+                low.clear();
+                low_uses(i, &k, &mut low);
+                for u in &uses {
+                    if k[u.0 as usize] != KL {
+                        continue;
+                    }
+                    match low.iter().position(|l| l == u) {
+                        Some(p) => {
+                            low.swap_remove(p);
+                        }
+                        None => {
+                            k[u.0 as usize] = 0;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            let mut tu: Vec<VReg> = Vec::new();
+            match &b.term {
+                Term::Branch(c, ..) | Term::Switch(c, _) => tu.push(*c),
+                Term::Ret(v) => tu.extend(v.iter().copied()),
+                _ => {}
+            }
+            for u in tu {
+                if k[u.0 as usize] == KL {
+                    k[u.0 as usize] = 0;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    k
+}
+
+/// The operands instruction `i` reads as their low 32 bits (wasm32 addresses, narrow stores and
+/// vector lanes, and the operands `Fx::expr32` reads for a narrow result), given the narrow kinds.
+fn low_uses(i: &Inst, k: &[u8], out: &mut Vec<VReg>) {
+    let narrow = |d: VReg| k[d.0 as usize] != 0;
+    let small = |m: Mem| matches!(m, Mem::Int(1 | 2 | 4, _));
+    match *i {
+        Inst::Load(_, d, base, _) => {
+            out.push(base);
+            let _ = d;
+        }
+        Inst::VLoad(_, base, _) | Inst::AtomicLoad(_, _, _, base) | Inst::AtomicStore(_, _, base, _) | Inst::AtomicRmw(_, _, _, _, base, _) | Inst::AtomicCas(_, _, _, _, base, _, _) | Inst::VStore(base, _, _) => out.push(base),
+        Inst::LoadX(_, _, base, idx, _, _) | Inst::VLoadX(_, base, idx, _, _) | Inst::VStoreX(base, idx, _, _, _) => out.extend([base, idx]),
+        Inst::Store(m, base, _, src) => {
+            out.push(base);
+            if small(m) {
+                out.push(src);
+            }
+        }
+        Inst::StoreX(m, base, idx, _, _, src) => {
+            out.extend([base, idx]);
+            if small(m) {
+                out.push(src);
+            }
+        }
+        Inst::Copy(dst, src, _) => out.extend([dst, src]),
+        Inst::VSplat(_, x) | Inst::VInsert(_, _, _, x) => out.push(x),
+        Inst::VX(VX::Splat(w), _, x, _) if w != VW::D => out.push(x),
+        Inst::VX(VX::Insert(w, _), _, _, y) if w != VW::D => out.push(y),
+        Inst::Conv(Conv::BitsToF(false), _, x) => out.push(x),
+        Inst::Call(Callee::Indirect(x) | Callee::CIndirect(x, _), _, _) => out.push(x),
+        _ => {}
+    }
+    let Some(d) = tree_def(i) else { return };
+    if !narrow(d) {
+        return;
+    }
+    let low_op = |op: IOp| matches!(op, IOp::Add | IOp::Sub | IOp::Mul | IOp::And | IOp::Or | IOp::Xor);
+    match *i {
+        Inst::Mov(_, a) | Inst::INeg(_, _, a) | Inst::INot(_, _, a) | Inst::Conv(Conv::IntToInt(_), _, a) => out.push(a),
+        Inst::IBin(op, it, _, a, x) if low_op(op) || (it.bits == 32 && !it.signed && matches!(op, IOp::Shl | IOp::Shr | IOp::Rotl)) => out.extend([a, x]),
+        Inst::IBinI(op, it, _, a, imm) if low_op(op) || (it.bits == 32 && !it.signed && matches!(op, IOp::Shl | IOp::Shr | IOp::Rotl)) || (op == IOp::Shl && (0..32).contains(&imm)) => out.push(a),
+        Inst::Sel(_, _, x, y) => out.extend([x, y]),
+        _ => {}
+    }
 }
 
 const NONE: u32 = u32::MAX;
@@ -1192,6 +1415,8 @@ struct Fx<'a> {
     /// (end, opcode position, local, vreg) of the last `local.set`
     last_set: (usize, usize, u32, u32),
     sp0: u32,
+    /// per vreg: its narrow kind (KZ / KS; 0: a wide i64): narrow values live in i32 locals
+    nk: Vec<u8>,
 }
 
 fn lower_func(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &HashMap<u32, u32>, funcs: &[(u32, &Func)], link: &dyn Link, sh: &mut Shared) -> Result<Body, String> {
@@ -1237,8 +1462,10 @@ fn lower_func(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &
         last_ret: usize::MAX,
         last_set: (usize::MAX, 0, 0, 0),
         sp0: NONE,
+        nk: Vec::new(),
     };
     fx.check()?;
+    fx.nk = narrow_kinds(f, o, link);
     fx.plan_folds();
     let (slot_at, end) = crate::frame::slot_layout(f, 0, true);
     let frame = ((end + 15) & !15) as u32;
@@ -1370,6 +1597,17 @@ fn simd_op(op: VX) -> Option<u32> {
         VX::FDiv(D, _) => 243,
         _ => return None,
     })
+}
+
+/// i32 load of an n-byte integer (n <= 4): (opcode, alignment exponent)
+fn load32_op(n: u8, signed: bool) -> (u8, u32) {
+    match (n, signed) {
+        (1, true) => (0x2C, 0),
+        (1, false) => (0x2D, 0),
+        (2, true) => (0x2E, 1),
+        (2, false) => (0x2F, 1),
+        _ => (0x28, 2),
+    }
 }
 
 fn icmp_op(c: Cond, signed: bool) -> u8 {
@@ -1687,8 +1925,10 @@ impl<'a> Fx<'a> {
         let mut pref: Vec<Vec<u32>> = vec![Vec::new(); nv];
         let mut touched = vec![false; nv];
         let mut ucount = vec![0u32; nv];
+        let nk = &self.nk;
+        let vty = |v: usize| -> Result<Val, String> { if nk[v] != 0 { Ok(Val::I32) } else { val_of(f.vregs[v]) } };
         let add_edge = |adj: &mut Vec<Vec<u32>>, a: u32, b: u32| {
-            if a != b && f.vregs[a as usize] == f.vregs[b as usize] {
+            if a != b && f.vregs[a as usize] == f.vregs[b as usize] && (nk[a as usize] != 0) == (nk[b as usize] != 0) {
                 adj[a as usize].push(b);
                 adj[b as usize].push(a);
             }
@@ -1787,7 +2027,7 @@ impl<'a> Fx<'a> {
         order.sort_by(|a, b| ucount[*b as usize].cmp(&ucount[*a as usize]).then(a.cmp(b)));
         let mut busy: Vec<bool> = Vec::new();
         for v in order {
-            let t = val_of(f.vregs[v as usize])?;
+            let t = vty(v as usize)?;
             busy.clear();
             busy.resize(ctype.len(), false);
             for n in &adj[v as usize] {
@@ -1988,7 +2228,11 @@ impl<'a> Fx<'a> {
                 self.out[at] = LTEE;
             }
             self.last_set.0 = usize::MAX;
-            return self.from_nat(want);
+            return self.from_kind(self.nk[v.0 as usize], want);
+        }
+        if l != NONE && self.nk[v.0 as usize] != 0 {
+            self.lget(l);
+            return self.from_kind(self.nk[v.0 as usize], want);
         }
         if l == NONE {
             // never written: zero of its class
@@ -2013,10 +2257,45 @@ impl<'a> Fx<'a> {
         self.from_nat(want)
     }
 
+    /// Converts the value on the stack to `want`: an i32 of narrow kind `k` (its low 32 bits), or
+    /// a natural i64 (k = 0).
+    fn from_kind(&mut self, k: u8, want: Want) -> Result<u64, String> {
+        if k == 0 {
+            return self.from_nat(want);
+        }
+        if k == KL && matches!(want, Want::Nat | Want::Truthy | Want::Inverted) {
+            return Err(format!("a narrow-by-demand value read as {:?}", want));
+        }
+        match want {
+            Want::Low | Want::Truthy => Ok(0),
+            Want::Nat => {
+                self.op(if k & KZ != 0 { EXT_U } else { EXT_S });
+                Ok(0)
+            }
+            Want::Inverted => {
+                self.op(I32_EQZ);
+                Ok(0)
+            }
+            Want::Addr(off) => {
+                if (0..=u32::MAX as i64).contains(&off) {
+                    Ok(off as u64)
+                } else {
+                    self.i32c(off as i32);
+                    self.op(I32_ADD);
+                    Ok(0)
+                }
+            }
+        }
+    }
+
     /// Converts a natural i64 on the stack to `want`.
     fn from_nat(&mut self, want: Want) -> Result<u64, String> {
         match want {
             Want::Nat => Ok(0),
+            Want::Low => {
+                self.op(WRAP);
+                Ok(0)
+            }
             Want::Truthy => {
                 self.op(I64_EQZ);
                 self.op(I32_EQZ);
@@ -2055,6 +2334,17 @@ impl<'a> Fx<'a> {
 
     /// Pushes the address `base + (idx << sh)` and returns the offset (`off` added).
     fn addr_x(&mut self, b: u32, base: VReg, idx: VReg, sh: u8, off: i32) -> Result<u64, String> {
+        if !self.o.memory64 && (self.nk[base.0 as usize] != 0 || self.nk[idx.0 as usize] != 0) {
+            // wasm32: the address is the low 32 bits of base + (idx << sh)
+            self.value(b, base, Want::Low)?;
+            self.value(b, idx, Want::Low)?;
+            if sh > 0 {
+                self.i32c(sh as i32);
+                self.op(0x74);
+            }
+            self.op(I32_ADD);
+            return self.from_kind(KZ, Want::Addr(off as i64));
+        }
         self.value(b, base, Want::Nat)?;
         self.value(b, idx, Want::Nat)?;
         if sh > 0 {
@@ -2075,6 +2365,19 @@ impl<'a> Fx<'a> {
             Mem::F64 => (0x2B, 3),
             Mem::Int(n, _) => return Err(format!("{}-byte integer access", n)),
         })
+    }
+
+    /// Pushes a store's source and returns the store (opcode, alignment): a narrow source of an
+    /// integer of at most 4 bytes is stored by an i32 store.
+    fn store_src(&mut self, b: u32, m: Mem, src: VReg) -> Result<(u8, u32), String> {
+        if let Mem::Int(n @ (1 | 2 | 4), _) = m {
+            if self.nk[src.0 as usize] != 0 {
+                self.value(b, src, Want::Low)?;
+                return Ok(match n { 1 => (0x3A, 0), 2 => (0x3B, 1), _ => (0x36, 2) });
+            }
+        }
+        self.value(b, src, Want::Nat)?;
+        self.store_op(m)
     }
 
     fn store_op(&mut self, m: Mem) -> Result<(u8, u32), String> {
@@ -2117,6 +2420,219 @@ impl<'a> Fx<'a> {
 
     /// Emits instruction (b, i) leaving its single result on the stack as `want`.
     fn expr(&mut self, b: u32, i: usize, want: Want) -> Result<u64, String> {
+        let f = self.f;
+        let inst = &f.blocks[b as usize].insts[i];
+        if let Some(d) = tree_def(inst) {
+            let k = self.nk[d.0 as usize];
+            if k != 0 {
+                // a compare's i32 is its narrow value; branch forms keep their inverted compares
+                if matches!(inst, Inst::ICmp(..) | Inst::ICmpI(..) | Inst::FCmp(..)) && matches!(want, Want::Truthy | Want::Inverted) {
+                    return self.expr_wide(b, i, want);
+                }
+                self.expr32(b, i)?;
+                return self.from_kind(k, want);
+            }
+        }
+        self.expr_wide(b, i, want)
+    }
+
+    /// Re-extends the low 32 bits on the stack (i32) to integer type `it` (8 / 16 bits; 32 and
+    /// 64 need nothing in the low half).
+    fn ext32(&mut self, it: IntTy) {
+        match (it.bits, it.signed) {
+            (8, true) => self.op(0xC0),
+            (16, true) => self.op(0xC1),
+            (b, false) if b < 32 => {
+                self.i32c(((1u64 << b) - 1) as i32);
+                self.op(0x71);
+            }
+            _ => {}
+        }
+    }
+
+    /// A compare of `a` with `x` (or `imm`) leaving i32 0/1: in 32 bits when both operands
+    /// extend the same way from their low halves (the order of zero- or sign-extended values
+    /// is their low halves' unsigned order; sign-extended ones also keep the signed order).
+    fn icmp(&mut self, b: u32, c: Cond, signed: bool, a: VReg, x: Option<VReg>, imm: i64) -> Result<(), String> {
+        let ka = self.nk[a.0 as usize] & (KZ | KS);
+        let kx = match x {
+            Some(x) => self.nk[x.0 as usize] & (KZ | KS),
+            None => const_kind(imm),
+        };
+        let k = ka & kx;
+        let w32 = ka != 0 && if signed && !matches!(c, Cond::Eq | Cond::Ne) { k & KS != 0 } else { k != 0 };
+        if w32 {
+            self.value(b, a, Want::Low)?;
+            match x {
+                Some(x) => {
+                    self.value(b, x, Want::Low)?;
+                }
+                None if imm == 0 && c == Cond::Eq => {
+                    self.op(I32_EQZ);
+                    return Ok(());
+                }
+                None => self.i32c(imm as i32),
+            }
+            self.op(icmp_op(c, signed) - 11);
+            return Ok(());
+        }
+        self.value(b, a, Want::Nat)?;
+        match x {
+            Some(x) => {
+                self.value(b, x, Want::Nat)?;
+            }
+            None if imm == 0 && c == Cond::Eq => {
+                self.op(I64_EQZ);
+                return Ok(());
+            }
+            None => self.i64c(imm),
+        }
+        self.op(icmp_op(c, signed));
+        Ok(())
+    }
+
+    /// Emits instruction (b, i), whose result is a narrow vreg, leaving its low 32 bits (i32).
+    fn expr32(&mut self, b: u32, i: usize) -> Result<(), String> {
+        let inst = self.f.blocks[b as usize].insts[i].clone();
+        let kz = |s: &Self, v: VReg| s.nk[v.0 as usize] & KZ != 0;
+        let ks = |s: &Self, v: VReg| s.nk[v.0 as usize] & KS != 0;
+        // add, sub, mul and the bitwise ops: the result's low half is the op of the low halves
+        let low_op = |op: IOp| -> Option<u8> {
+            Some(match op {
+                IOp::Add => 0x6A,
+                IOp::Sub => 0x6B,
+                IOp::Mul => 0x6C,
+                IOp::And => 0x71,
+                IOp::Or => 0x72,
+                IOp::Xor => 0x73,
+                _ => return None,
+            })
+        };
+        let bitwise = |op: IOp| matches!(op, IOp::And | IOp::Or | IOp::Xor);
+        match &inst {
+            Inst::Iconst(_, v) => self.i32c(*v as i32),
+            Inst::Mov(_, a) => {
+                self.value(b, *a, Want::Low)?;
+            }
+            Inst::IBin(op, it, _, a, x) if low_op(*op).is_some() => {
+                self.value(b, *a, Want::Low)?;
+                self.value(b, *x, Want::Low)?;
+                self.op(low_op(*op).unwrap());
+                if !bitwise(*op) {
+                    self.ext32(*it);
+                }
+            }
+            Inst::IBinI(op, it, _, a, imm) if low_op(*op).is_some() => {
+                self.value(b, *a, Want::Low)?;
+                self.i32c(*imm as i32);
+                self.op(low_op(*op).unwrap());
+                if !bitwise(*op) {
+                    self.ext32(*it);
+                }
+            }
+            // unsigned 32-bit shifts and rotates: i32 ops (the count mod 32), as the wide form
+            Inst::IBin(op @ (IOp::Shl | IOp::Shr | IOp::Rotl), it, _, a, x) if it.bits == 32 && !it.signed => {
+                self.value(b, *a, Want::Low)?;
+                self.value(b, *x, Want::Low)?;
+                self.op(match op { IOp::Shl => 0x74, IOp::Shr => 0x76, _ => 0x77 });
+            }
+            Inst::IBinI(op @ (IOp::Shl | IOp::Shr | IOp::Rotl), it, _, a, imm) if it.bits == 32 && !it.signed => {
+                self.value(b, *a, Want::Low)?;
+                self.i32c(*imm as i32);
+                self.op(match op { IOp::Shl => 0x74, IOp::Shr => 0x76, _ => 0x77 });
+            }
+            Inst::IBinI(IOp::Shl, it, _, a, imm) if (0..32).contains(imm) => {
+                self.value(b, *a, Want::Low)?;
+                self.i32c(*imm as i32);
+                self.op(0x74);
+                self.ext32(*it);
+            }
+            Inst::IBinI(IOp::Shr, it, _, a, imm) if it.signed && it.bits == 32 && (0..32).contains(imm) && ks(self, *a) => {
+                self.value(b, *a, Want::Low)?;
+                self.i32c(*imm as i32);
+                self.op(0x75);
+            }
+            Inst::IBin(op @ (IOp::Div | IOp::Rem), it, _, a, x) if it.bits == 32 && !it.signed && kz(self, *a) && kz(self, *x) => {
+                self.value(b, *a, Want::Low)?;
+                self.value(b, *x, Want::Low)?;
+                self.op(if *op == IOp::Div { 0x6E } else { 0x70 });
+            }
+            Inst::IBinI(op @ (IOp::Div | IOp::Rem), it, _, a, imm) if it.bits == 32 && !it.signed && kz(self, *a) && (1..1i64 << 32).contains(imm) => {
+                self.value(b, *a, Want::Low)?;
+                self.i32c(*imm as i32);
+                self.op(if *op == IOp::Div { 0x6E } else { 0x70 });
+            }
+            Inst::INeg(it, _, a) => {
+                self.i32c(0);
+                self.value(b, *a, Want::Low)?;
+                self.op(I32_SUB);
+                self.ext32(*it);
+            }
+            Inst::INot(it, _, a) => {
+                self.value(b, *a, Want::Low)?;
+                self.i32c(-1);
+                self.op(0x73);
+                self.ext32(*it);
+            }
+            Inst::ICmp(c, sg, _, a, x) => self.icmp(b, *c, *sg, *a, Some(*x), 0)?,
+            Inst::ICmpI(c, sg, _, a, imm) => self.icmp(b, *c, *sg, *a, None, *imm)?,
+            Inst::Load(Mem::Int(n, sg), _, base, off) if *n <= 4 => {
+                let o = self.value(b, *base, Want::Addr(*off as i64))?;
+                let (op, al) = load32_op(*n, *sg);
+                self.op(op);
+                self.memarg(al, o);
+            }
+            Inst::LoadX(Mem::Int(n, sg), _, base, idx, sh, off) if *n <= 4 => {
+                let o = self.addr_x(b, *base, *idx, *sh, *off)?;
+                let (op, al) = load32_op(*n, *sg);
+                self.op(op);
+                self.memarg(al, o);
+            }
+            Inst::SlotAddr(_, sl) => {
+                let so = self.slot_off(*sl);
+                self.lget(self.fp);
+                if so != 0 {
+                    self.i32c(so as i32);
+                    self.op(I32_ADD);
+                }
+            }
+            Inst::Addr(_, sy) | Inst::TlsAddr(_, sy) | Inst::TlsStatic(_, sy) => {
+                let v = self.sym_val(*sy);
+                self.i32c(v as i32);
+            }
+            Inst::FnAddr(_, id) => {
+                let t = table_index(self.sh, self.fn_ix, *id);
+                self.i32c(t as i32);
+            }
+            Inst::Sel(_, c, x, y) => {
+                self.value(b, *y, Want::Low)?;
+                self.value(b, *x, Want::Low)?;
+                self.value(b, *c, Want::Inverted)?;
+                self.op(SELECT);
+            }
+            Inst::Conv(Conv::IntToInt(it), _, x) => {
+                self.value(b, *x, Want::Low)?;
+                self.ext32(*it);
+            }
+            Inst::Conv(Conv::FToInt(from64, it), _, x) if it.bits == 32 => {
+                self.value(b, *x, Want::Nat)?;
+                self.fc(if *from64 { if it.signed { 2 } else { 3 } } else if it.signed { 0 } else { 1 });
+            }
+            Inst::Conv(Conv::FToBits(false), _, x) => {
+                self.value(b, *x, Want::Nat)?;
+                self.op(0xBC);
+            }
+            _ => {
+                self.expr_wide(b, i, Want::Nat)?;
+                self.op(WRAP);
+            }
+        }
+        Ok(())
+    }
+
+    /// Emits instruction (b, i) leaving its single result on the stack as `want` (a wide result;
+    /// narrow operands are extended where an op needs the whole value).
+    fn expr_wide(&mut self, b: u32, i: usize, want: Want) -> Result<u64, String> {
         let inst = self.f.blocks[b as usize].insts[i].clone();
         let last = i + 1 == self.f.blocks[b as usize].insts.len();
         let d64 = |f: &Self, v: VReg| f.f.vregs[v.0 as usize] == Cls::F64;
@@ -2176,20 +2692,12 @@ impl<'a> Fx<'a> {
             }
             Inst::ICmp(c, s, _, a, x) => {
                 let c = if want == Want::Inverted { inv(*c) } else { *c };
-                self.value(b, *a, Want::Nat)?;
-                self.value(b, *x, Want::Nat)?;
-                self.op(icmp_op(c, *s));
+                self.icmp(b, c, *s, *a, Some(*x), 0)?;
                 self.cmp_result(want)
             }
             Inst::ICmpI(c, s, _, a, imm) => {
                 let c = if want == Want::Inverted { inv(*c) } else { *c };
-                self.value(b, *a, Want::Nat)?;
-                if *imm == 0 && c == Cond::Eq {
-                    self.op(I64_EQZ);
-                } else {
-                    self.i64c(*imm);
-                    self.op(icmp_op(c, *s));
-                }
+                self.icmp(b, c, *s, *a, None, *imm)?;
                 self.cmp_result(want)
             }
             Inst::FCmp(c, d, _, a, x) => {
@@ -2265,6 +2773,22 @@ impl<'a> Fx<'a> {
                     self.op(0xA0);
                     self.op(F32_DEMOTE);
                 }
+                Ok(0)
+            }
+            // a narrow source's low half: i32 conversions
+            Inst::Conv(Conv::IntToF(from, to64), _, s) if from.bits <= 32 && self.nk[s.0 as usize] & (KZ | KS) != 0 => {
+                self.value(b, *s, Want::Low)?;
+                self.op(match (to64, from.signed) {
+                    (true, true) => 0xB7,
+                    (true, false) => 0xB8,
+                    (false, true) => 0xB2,
+                    (false, false) => 0xB3,
+                });
+                Ok(0)
+            }
+            Inst::Conv(Conv::BitsToF(false), _, s) if self.nk[s.0 as usize] != 0 => {
+                self.value(b, *s, Want::Low)?;
+                self.op(0xBE);
                 Ok(0)
             }
             Inst::Conv(cv, _, s) => {
@@ -2416,9 +2940,8 @@ impl<'a> Fx<'a> {
             }
             Inst::VSplat(_, s) => {
                 let i = self.f.vregs[s.0 as usize] == Cls::I;
-                self.value(b, *s, Want::Nat)?;
+                self.value(b, *s, if i { Want::Low } else { Want::Nat })?;
                 if i {
-                    self.op(WRAP);
                     self.simd(17);
                 } else {
                     self.simd(19);
@@ -2441,9 +2964,8 @@ impl<'a> Fx<'a> {
             Inst::VInsert(_, v, lane, s) => {
                 let i = self.f.vregs[s.0 as usize] == Cls::I;
                 self.value(b, *v, Want::Nat)?;
-                self.value(b, *s, Want::Nat)?;
+                self.value(b, *s, if i { Want::Low } else { Want::Nat })?;
                 if i {
-                    self.op(WRAP);
                     self.simd(28);
                 } else {
                     self.simd(32);
@@ -2500,11 +3022,10 @@ impl<'a> Fx<'a> {
             Inst::VX(op, d, x, y) => {
                 match op {
                     VX::Splat(w) => {
-                        self.value(b, *x, Want::Nat)?;
+                        self.value(b, *x, if *w == VW::D { Want::Nat } else { Want::Low })?;
                         if *w == VW::D {
                             self.simd(18);
                         } else {
-                            self.op(WRAP);
                             self.simd(match w { VW::B => 15, VW::H => 16, _ => 17 });
                         }
                         Ok(0)
@@ -2535,11 +3056,10 @@ impl<'a> Fx<'a> {
                     }
                     VX::Insert(w, k) => {
                         self.value(b, *x, Want::Nat)?;
-                        self.value(b, *y, Want::Nat)?;
+                        self.value(b, *y, if *w == VW::D { Want::Nat } else { Want::Low })?;
                         match w {
                             VW::D => self.simd(30),
                             _ => {
-                                self.op(WRAP);
                                 self.simd(match w { VW::B => 23, VW::H => 26, _ => 28 });
                             }
                         }
@@ -2562,7 +3082,7 @@ impl<'a> Fx<'a> {
     /// The i32 0/1 of a compare on the stack, as `want`.
     fn cmp_result(&mut self, want: Want) -> Result<u64, String> {
         match want {
-            Want::Truthy | Want::Inverted => Ok(0),
+            Want::Truthy | Want::Inverted | Want::Low => Ok(0),
             _ => {
                 self.op(EXT_U);
                 self.from_nat(want)
@@ -2712,8 +3232,9 @@ impl<'a> Fx<'a> {
                     }
                     let i = self.sh.import(&m, &f, ty);
                     for (a, p) in args.iter().zip(&t.params) {
-                        self.value(b, *a, Want::Nat)?;
-                        if *p == Val::I32 { self.op(WRAP); }
+                        let narrow = *p == Val::I32 && self.f.vregs[a.0 as usize] == Cls::I;
+                        self.value(b, *a, if narrow { Want::Low } else { Want::Nat })?;
+                        if *p == Val::I32 && !narrow { self.op(WRAP); }
                     }
                     self.call(FRef::Import(i));
                     if t.results == [Val::I32] {
@@ -2736,8 +3257,7 @@ impl<'a> Fx<'a> {
                 let t = sig(self)?;
                 let ty = self.sh.ty(t);
                 push_args(self)?;
-                self.value(b, *v, Want::Nat)?;
-                self.op(WRAP);
+                self.value(b, *v, Want::Low)?;
                 self.op(CALL_INDIRECT);
                 self.fix.push((self.out.len() as u32, Fix::Type(ty)));
                 self.op(0);
@@ -2798,15 +3318,15 @@ impl<'a> Fx<'a> {
                     return Ok(());
                 }
             }
-            self.expr(b, i, Want::Nat)?;
+            let w = if self.nk[d.0 as usize] != 0 { Want::Low } else { Want::Nat };
+            self.expr(b, i, w)?;
             self.set(d);
             return Ok(());
         }
         match &inst {
             Inst::Store(m, base, off, src) => {
                 let o = self.value(b, *base, Want::Addr(*off as i64))?;
-                self.value(b, *src, Want::Nat)?;
-                let (op, al) = self.store_op(*m)?;
+                let (op, al) = self.store_src(b, *m, *src)?;
                 self.op(op);
                 self.memarg(al, o);
             }
@@ -2819,8 +3339,7 @@ impl<'a> Fx<'a> {
             }
             Inst::StoreX(m, base, idx, sh, off, src) => {
                 let o = self.addr_x(b, *base, *idx, *sh, *off)?;
-                self.value(b, *src, Want::Nat)?;
-                let (op, al) = self.store_op(*m)?;
+                let (op, al) = self.store_src(b, *m, *src)?;
                 self.op(op);
                 self.memarg(al, o);
             }
@@ -3130,7 +3649,17 @@ impl<'a> Fx<'a> {
         }
         let len = tab.targets.len() as i64;
         let tree = self.fold_def[v.0 as usize].0 != NONE;
-        if tab.min == 0 && !tree {
+        if tab.min == 0 && !tree && self.nk[v.0 as usize] & (KZ | KS) != 0 {
+            // a narrow index: an unsigned i32 bound check (the wide value's low half orders as
+            // the value; extended values past u32 are out of range either way)
+            let l = self.loc[v.0 as usize];
+            self.lget(l);
+            self.i32c(len as i32);
+            self.lget(l);
+            self.i32c(len as i32);
+            self.op(0x49);
+            self.op(SELECT);
+        } else if tab.min == 0 && !tree {
             let l = self.loc[v.0 as usize];
             self.lget(l);
             self.op(WRAP);
@@ -3151,8 +3680,10 @@ impl<'a> Fx<'a> {
             self.lget(t);
             self.i64c(len);
         }
-        self.op(0x54);
-        self.op(SELECT);
+        if !(tab.min == 0 && !tree && self.nk[v.0 as usize] & (KZ | KS) != 0) {
+            self.op(0x54);
+            self.op(SELECT);
+        }
         let depth_of = |s: &Self, t: u32| -> u32 {
             match inl.iter().position(|x| *x == t) {
                 Some(k) => k as u32,
