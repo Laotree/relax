@@ -10281,6 +10281,11 @@ impl<'a> Lcx<'a> {
                 };
                 Val::L(vec![self.iconst(c as i64)])
             }
+            // Primitive scalar values have no padding or inactive enum storage.
+            "is_primitive_scalar" => {
+                let c = g0.is_some_and(|g| matches!(self.kind_ref(g), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char));
+                Val::L(vec![self.iconst(c as i64)])
+            }
             // `T: Freeze` of this instance (no UnsafeCell inline: std's sort keeps copies)
             "is_freeze" => {
                 let c = match g0 {
