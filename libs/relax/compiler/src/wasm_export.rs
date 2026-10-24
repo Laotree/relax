@@ -1333,11 +1333,23 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Resul
     }
     work.extend(funcs.keys().copied());
     work.retain(|id| (*id as usize) < u.fns.len() && (whole || crate::jit::keep_reachable(u, *id)));
+    // The embedder's callback contract is independent of which callbacks the
+    // training workload happened to invoke. Compile their complete closure too.
+    let mut required = std::collections::BTreeSet::new();
+    if let Ok(names) = std::env::var("MAKEPAD_RUN_WASM_EXPORT_ROOTS") {
+        let roots = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+        for name in names.split(',').filter(|s| !s.is_empty()) {
+            let id = roots.iter().find(|(_, n)| n.as_deref() == Some(name)).map(|(id, _)| *id)
+                .ok_or_else(|| format!("required glue export {name} is not defined"))?;
+            required.insert(id);
+            work.push(id);
+        }
+    }
     let mut kept = std::collections::BTreeSet::new();
     let mut visited = std::collections::BTreeSet::new();
     let mut data_seen = std::collections::HashSet::new();
     let mut failed = 0;
-    let original: std::collections::BTreeSet<u32> = funcs.keys().copied().collect();
+    let original: std::collections::BTreeSet<u32> = funcs.keys().copied().chain(required).collect();
     let mut origins = CLOSURE_ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
     origins.clear();
     let mut parents = CLOSURE_PARENTS.lock().unwrap_or_else(|e| e.into_inner());

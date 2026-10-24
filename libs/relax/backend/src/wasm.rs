@@ -728,6 +728,7 @@ impl<'a> Module<'a> {
         // base "h", tag "t", then the functions
         let mut s = Vec::new();
         let mut n = 2u64 + self.exports.len() as u64;
+        if tlen > 1 || self.sh.uses_table { n += 1; }
         if tag_ty.is_some() && opts.export_tag {
             n += 1;
         }
@@ -736,6 +737,10 @@ impl<'a> Module<'a> {
         s.extend_from_slice(&[2, 0]);
         name(&mut s, "h");
         s.extend_from_slice(&[3, 1]);
+        if tlen > 1 || self.sh.uses_table {
+            name(&mut s, "__indirect_function_table");
+            s.extend_from_slice(&[1, 0]);
+        }
         if tag_ty.is_some() && opts.export_tag {
             name(&mut s, "t");
             s.extend_from_slice(&[4, 0]);
