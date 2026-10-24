@@ -1489,6 +1489,56 @@ fn ids_report(up: *mut Unit) {
 /// O3 jobs that panicked outside their build's recovery (slot left at O1)
 pub static TIER1_PANICS: AtomicU64 = AtomicU64::new(0);
 
+/// optimize_tree runs of O3 candidates built off the owner that panicked: [0] panics, [1] the
+/// preemption/bail payloads (control flow, not bugs). Each is dropped as a failed build (its
+/// candidate stays without an optimised body); a panic used to be dropped without a word, which
+/// hid piano_render's out-of-range unroll check (GAPB2).
+pub static O3_OPT_PANICS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// slots whose optimize_tree panic was printed (once per slot)
+static O3_OPT_PANICKED: relax_session::sync::Mutex<std::collections::BTreeSet<u32>> = relax_session::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// A caught panic's message, and whether its payload is one of the preemption/bail payloads
+/// (control flow: the build gave way, nothing went wrong).
+fn panic_payload(p: &(dyn std::any::Any + Send)) -> (String, bool) {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        return (s.to_string(), false);
+    }
+    if let Some(s) = p.downcast_ref::<String>() {
+        return (s.clone(), false);
+    }
+    if let Some(e) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() {
+        return (format!("fatal error: {}", e.0), false);
+    }
+    if let Some(b) = p.downcast_ref::<crate::preempt::PublishBail>() {
+        return (format!("publish bail ({}, {} slots)", b.what, b.slots.len()), true);
+    }
+    let bail = if p.is::<crate::preempt::Preempted>() {
+        "preempted"
+    } else if p.is::<crate::preempt::OwnerBusy>() {
+        "owner busy"
+    } else if p.is::<crate::preempt::NeedsLoad>() {
+        "needs load"
+    } else if p.is::<crate::preempt::NeedsUnit>() {
+        "needs the unit"
+    } else {
+        return ("panic".to_string(), false);
+    };
+    (bail.to_string(), true)
+}
+
+/// An O3 candidate's optimize_tree panicked (off the owner): counted, printed once per slot
+/// (bails only counted), and handed on as a failed build.
+fn optimize_tree_panicked(up: *mut Unit, id: u32, p: Box<dyn std::any::Any + Send>) -> Deferred {
+    let (msg, bail) = panic_payload(&*p);
+    O3_OPT_PANICS[bail as usize].fetch_add(1, Ordering::Relaxed);
+    if !bail && O3_OPT_PANICKED.lock().unwrap().insert(id) {
+        crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_PANIC, 0, 0, 0);
+        let name = owner::publish(|| unsafe { let u = &*up; if (id as usize) < u.fns.len() { u.fns[id as usize].name.to_string() } else { String::new() } });
+        eprintln!("makepad: O3 optimisation of slot {} ({}) panicked: {} -- O3 dropped for it", id, name, msg);
+    }
+    (id, Err(format!("optimize_tree panicked: {}", msg)))
+}
+
 /// fork() in a program run by Relax: the child has only the forking thread, and may go on
 /// running JIT code (a lazy compile in the child). The loader hands programs its own `fork`
 /// (loader_symbol): before the fork every compile job finishes or waits at its start, and the
@@ -15262,14 +15312,7 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
         }
         if let Err(p) = r {
             crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_PANIC, 0, 0, 0);
-            let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned())
-                .or_else(|| p.downcast_ref::<crate::preempt::PublishBail>().map(|b| format!("publish bail ({}, {} slots)", b.what, b.slots.len())))
-                .or_else(|| p.downcast_ref::<crate::infer::diagnostics::FatalError>().map(|e| format!("fatal error: {}", e.0)))
-                .or_else(|| p.is::<crate::preempt::Preempted>().then(|| "preempted".to_string()))
-                .or_else(|| p.is::<crate::preempt::OwnerBusy>().then(|| "owner busy".to_string()))
-                .or_else(|| p.is::<crate::preempt::NeedsLoad>().then(|| "needs load".to_string()))
-                .or_else(|| p.is::<crate::preempt::NeedsUnit>().then(|| "needs the unit".to_string()))
-                .unwrap_or_else(|| "panic".to_string());
+            let msg = panic_payload(&*p).0;
             let n = TIER1_PANICS.fetch_add(1, Ordering::Relaxed);
             if n < 3 {
                 eprintln!("makepad: O3 build of slot {} panicked: {} -- O3 dropped for it", id, msg);
@@ -16212,9 +16255,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let mut done: Vec<Deferred> = Vec::new();
         for (c, prep) in preps {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize_tree(options, c, prep, &mut done)));
-            if let Ok(r) = r { done.push((c, r)); }
+            done.push(match r { Ok(r) => (c, r), Err(p) => optimize_tree_panicked(up, c, p) });
         }
-        TIER1_SNAP_OFF[0].fetch_add(done.len() as u64, Ordering::Relaxed);
+        TIER1_SNAP_OFF[0].fetch_add(done.iter().filter(|d| d.1.is_ok()).count() as u64, Ordering::Relaxed);
         TIER1_SNAP_OFF[1].fetch_add(cpu_ns() - to, Ordering::Relaxed);
         owner::publish(|| o3_candidates_finish(up, epoch0, done));
     }
@@ -18339,7 +18382,7 @@ unsafe fn build_off_owner(up: *mut Unit, ids: &[(u32, RirMode)]) {
             let mut done: Vec<Deferred> = Vec::new();
             for (c, prep) in preps {
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize_tree(options, c, prep, &mut done)));
-                if let Ok(r) = r { done.push((c, r)); }
+                done.push(match r { Ok(r) => (c, r), Err(p) => optimize_tree_panicked(up, c, p) });
             }
             owner::publish(|| o3_candidates_finish(up, epoch0, done));
         }
