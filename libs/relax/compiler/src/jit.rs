@@ -130,6 +130,10 @@ pub struct FnEntry {
     pub unverified: AtomicBool,
     /// Relaxed Rust D3: the slot's RIR was lowered with its verdict's run-time disjoint-index checks.
     pub d3_lowered: AtomicBool,
+    /// a startup-image slot (or a callee its image code inlined): it ran in an earlier session, so
+    /// before its first install here it is not never-run code (O3's walk builds its RIR, and keeps
+    /// no call to it waiting for a first run that only a lazy install makes)
+    pub ran_before: AtomicBool,
 }
 
 /// SPEC-V: a body's standing with the borrow checker.
@@ -4824,7 +4828,7 @@ impl Unit {
         // most slots (the startup image's thousands) are never asked.
         let entry_ref = matches!(key, FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_)) && !matches!(key, FnKey::Glue(GLUE_UNNAMED, _));
         let name = crate::zone_alloc::kept_with(|| name.into_boxed_str());
-        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), calls: Box::default() }
+        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), ran_before: AtomicBool::new(false), calls: Box::default() }
     }
 
     /// Slot `id` has its key: the front's slot keys and its ahead check (before the slot is
@@ -6904,6 +6908,23 @@ unsafe fn compile_wall_add(up: *mut Unit, w0: u64) {
 unsafe fn cached_tier1(up: *mut Unit, id: u32, inlined: &[u32]) {
     let u = &mut *up;
     u.fns[id as usize].o3.store(true, Ordering::Relaxed);
+    // SPEC-V: a twin's stored O3 code may hold callees without a clean verdict (unverified-mode
+    // code by kind): registered as a fresh build registers them (UNVERIFIED_IN), so a failed
+    // verdict builds it again without them; one failed already: built again now
+    if matches!(u.fns[id as usize].key, FnKey::Plain(_)) {
+        let pending: Vec<u32> = inlined.iter().copied().filter(|&c| c != id && u.verdict_owner(c).is_some() && !u.verdict_clean(c)).collect();
+        if !pending.is_empty() {
+            let failed = pending.iter().any(|&c| matches!(u.verdict_state(c), Verdict::Failed(_)));
+            {
+                let mut a = UNVERIFIED_IN.lock().unwrap_or_else(|e| e.into_inner());
+                a.retain(|&(k, _, r)| k != up as usize || r != id);
+                crate::zone_alloc::kept_with(|| for &c in &pending { a.push((up as usize, c, id)); });
+            }
+            if failed {
+                u.retier(id);
+            }
+        }
+    }
     if u.tier1.is_some() {
         let rec = tier_rec(&u.slots, id);
         (*rec.add(3)).store(T_QUEUED, Ordering::Release);
@@ -14599,6 +14620,23 @@ impl Unit {
 }
 
 impl Unit {
+    /// Whether slot `id` has run: compiled in this process, or (before its first install here) in
+    /// an earlier session -- a startup-image slot, or a slot with a stored code entry (looked up
+    /// once by its key, on the owner). Such a slot is not never-run code for the O3 walk.
+    pub(crate) fn ran_before(&mut self, id: u32) -> bool {
+        let f = &self.fns[id as usize];
+        if f.compiled || f.ran_before.load(Ordering::Relaxed) {
+            return true;
+        }
+        let Some(mut c) = self.cache.take() else { return false };
+        let r = c.has_stored_entry(self, id);
+        self.cache = Some(c);
+        if r {
+            self.fns[id as usize].ran_before.store(true, Ordering::Relaxed);
+        }
+        r
+    }
+
     /// Queues O3 slot `id` to be built again (a callee it kept as a never-run call has
     /// run since); at most RETIERS times per slot.
     fn retier(&mut self, id: u32) {
@@ -15832,8 +15870,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             _ => return,
         };
         // a callee that ran with code from the disk cache has no RIR: in a cold run its own
-        // compile left one (inlinable whatever its size), so build it here as well
-        let cached_code = f.compiled;
+        // compile left one (inlinable whatever its size), so build it here as well (a lazy
+        // startup-image slot not installed yet, or one with a stored entry, too: it ran before)
+        let cached_code = (&mut *up).ran_before(c);
+        let u = &mut *up;
         let single = relax_codegen::opt::single_on(options) && u.single_ref(c)
             && (u.fns[id as usize].rir_refs.contains(&c)
                 || callers.iter().any(|p| u.fns[*p as usize].rir.is_some() && u.fns[*p as usize].rir_refs.contains(&c)));
@@ -16446,7 +16486,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                             notes.push((c, "not inlinable (build error or attributes)"));
                             continue;
                         }
-                        if !f.compiled && f.rir.is_none() {
+                        if !f.compiled && !f.ran_before.load(Ordering::Relaxed) && f.rir.is_none() {
                             crate::zone_alloc::kept_with(|| {
                                 let v = u.cold_users.entry(c).or_default();
                                 if !v.contains(&id) { v.push(id); }
@@ -16513,10 +16553,14 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // (a SPEC-V twin's O3 code is kept as its entry: the twin is unverified-mode code by
                 // kind, as its cached baseline is; warm runs whose callers call the twin built its O3
                 // again every launch)
-                let unverified_now = u.fns[id as usize].unverified.load(Ordering::Relaxed) && !matches!(u.fns[id as usize].key, FnKey::Plain(_));
+                let twin = matches!(u.fns[id as usize].key, FnKey::Plain(_));
+                let unverified_now = u.fns[id as usize].unverified.load(Ordering::Relaxed) && !twin;
                 let unverified_inl: Vec<u32> = unverified_in.iter().copied().filter(|c| inlined.contains(c)).collect();
-                // (a twin is unverified by kind: its own O3 code is treated as before)
-                let built_unverified = root_unverified && !matches!(u.fns[id as usize].key, FnKey::Plain(_)) || !unverified_inl.is_empty();
+                // (a twin is unverified-mode code by kind, the unverified callees it took in too:
+                // its O3 code is kept as its entry as well; a warm link registers those callees
+                // again (cached_tier1), so a failed verdict of one builds it again as here.
+                // Uncached, every warm launch built ~150 twins' O3 again.)
+                let built_unverified = !twin && (root_unverified || !unverified_inl.is_empty());
                 let unverified = unverified_now || built_unverified;
                 // speculative code holds this run's site records (crate::guards): never cached
                 let speculative = spec_ctx.as_ref().is_some_and(|c| c.emitted.get());
@@ -17938,15 +17982,16 @@ const WALK_ITEMS: usize = 128;
 /// the owner when the build is prefronted (o3_next_level, o3_assemble).
 struct O3View {
     rir: Option<std::sync::Arc<relax_backend::rir::Func>>,
-    compiled: bool,
-    /// no O3 build inlined it yet (with !compiled: never ran)
+    /// it has run: compiled in this process, or a startup-image slot of an earlier session's
+    ran: bool,
+    /// no O3 build inlined it yet (with !ran: never ran)
     uninlined: bool,
 }
 
 /// The owner's copy of slot `c` for the walk (O(1), in the walk's publish).
 fn o3_view(u: &Unit, c: u32) -> O3View {
     let f = &u.fns[c as usize];
-    O3View { rir: f.rir.clone(), compiled: f.compiled, uninlined: f.history().inlined_into.is_empty() }
+    O3View { rir: f.rir.clone(), ran: f.compiled || f.ran_before.load(Ordering::Relaxed), uninlined: f.history().inlined_into.is_empty() }
 }
 
 /// The next level of an O3 snapshot's walk: the calls (and taken addresses) in the frontier's RIR
@@ -17962,7 +18007,7 @@ unsafe fn o3_next_level(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &
             // Cost-model admissions also expose calls in never-run bodies.
             let never_run = match t1_rec {
                 Some((cold, _, _)) => cold.contains(&t1_key(up, c)),
-                None => !v.compiled && v.uninlined,
+                None => !v.ran && v.uninlined,
             };
             let cost_admits = !relax_backend::stats::opt_off(options, "-costmodel")
                 && callee_attrs(prog, tcx, fns, core, c, inline_all, true, unverified_root(fns, id))
@@ -18058,7 +18103,7 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &cr
                 continue;
             }
         };
-        let live_cold = !v.compiled && v.uninlined;
+        let live_cold = !v.ran && v.uninlined;
         if let Some(r) = &v.rir {
             let cold = match t1key {
                 Some(k) => {
