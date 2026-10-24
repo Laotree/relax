@@ -485,6 +485,9 @@ impl<'a> Lcx<'a> {
         let ret = u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), b.ret);
         let mut closure_storage = HashMap::default();
         for &ce in b.min_captures.keys() { closure_storage.insert(ce, crate::layout::ClosureStorage::for_codegen(&u.prog, &u.tcx, b, ce)); }
+        // this body's version is the truth for its closures' environments, also once a live edit
+        // replaced the version (their generic instances may be built only then)
+        u.lay.note_closure_storages(&u.prog, &u.tcx, b, closure_storage.iter().map(|(ce, s)| (*ce, s)));
         // the verdict's disjoint-index checks belong in verified code only (unverified code and its
         // twins run as written, SPEC-V)
         let d3 = if plain_calls || (cur_fn as usize) >= u.fns.len() { None } else { u.disjoint_checks(cur_fn) };
@@ -10276,6 +10279,11 @@ impl<'a> Lcx<'a> {
                     Some(g) => self.u.is_copy(g),
                     None => false,
                 };
+                Val::L(vec![self.iconst(c as i64)])
+            }
+            // Primitive scalar values have no padding or inactive enum storage.
+            "is_primitive_scalar" => {
+                let c = g0.is_some_and(|g| matches!(self.kind_ref(g), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char));
                 Val::L(vec![self.iconst(c as i64)])
             }
             // `T: Freeze` of this instance (no UnsafeCell inline: std's sort keeps copies)

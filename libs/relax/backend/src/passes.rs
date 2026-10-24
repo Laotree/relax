@@ -386,24 +386,32 @@ pub fn lower_coverage(f: &Func) -> Option<Func> {
     for bi in 0..out.blocks.len() {
         let mut k = 0;
         while k < out.blocks[bi].insts.len() {
-            let Inst::Coverage { word, mask } = out.blocks[bi].insts[k] else {
+            let Inst::Coverage { word, mask, disabled } = out.blocks[bi].insts[k] else {
                 k += 1;
                 continue;
             };
             let addr = out.vreg(Cls::I);
             let bits = out.vreg(Cls::I);
             let old = out.vreg(Cls::I);
+            let gate_addr = out.vreg(Cls::I);
+            let gate = out.vreg(Cls::I);
+            let enabled = out.vreg(Cls::I);
+            let active_bits = out.vreg(Cls::I);
             let b = &mut out.blocks[bi];
             if b.pos.len() == b.insts.len() {
                 let pos = b.pos[k];
-                b.pos.splice(k..=k, [pos; 3]);
+                b.pos.splice(k..=k, [pos; 7]);
             }
             b.insts.splice(k..=k, [
                 Inst::Iconst(addr, word as i64),
                 Inst::Iconst(bits, mask as i64),
-                Inst::AtomicRmw(RmwOp::Or, Mem::Int(8, false), AtomOrd::Relaxed, old, addr, bits),
+                Inst::TlsAddr(gate_addr, disabled),
+                Inst::Load(Mem::Int(8, false), gate, gate_addr, 0),
+                Inst::INot(U64, enabled, gate),
+                Inst::IBin(IOp::And, U64, active_bits, bits, enabled),
+                Inst::AtomicRmw(RmwOp::Or, Mem::Int(8, false), AtomOrd::Relaxed, old, addr, active_bits),
             ]);
-            k += 3;
+            k += 7;
         }
     }
     Some(out)
