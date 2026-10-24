@@ -7510,7 +7510,19 @@ impl<'a> Lcx<'a> {
             }
             ExprKind::Index(a, i) => {
                 let derefs = self.b.index_derefs(e.0);
-                let (mut pl, mut pt) = self.lower_place(*a);
+                // `CONST[i]` read: the constant's own immutable allocation (rustc reads a promoted
+                // constant's memory), not a copy of the whole array on the stack per use
+                let promoted = if derefs == 0 && !self.want_mut && matches!(self.ast().expr(strip_paren(self.ast(), *a)).kind, ExprKind::Path(_))
+                    && matches!(self.kind(self.body_ty(*a)), TyKind::Array(..)) && self.promotable(*a)
+                    && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), self.body_ty(*a)) {
+                    self.promote_rvalue(*a, true).map(|p| (Place::Mem(p, 0), self.body_ty(*a)))
+                } else {
+                    None
+                };
+                let (mut pl, mut pt) = match promoted {
+                    Some(x) => x,
+                    None => self.lower_place(*a),
+                };
                 for k in 0..derefs {
                     let (a2, b2) = self.deref_place(e.0, k, pl, pt);
                     pl = a2;
@@ -7554,10 +7566,12 @@ impl<'a> Lcx<'a> {
                 let el = self.layout(elem);
                 let stride = crate::layout::round_up(el.size, el.align);
                 let s = self.iconst(stride as i64);
+                // address arithmetic at the pointer's width (wasm32: i32, as rustc's)
+                let pt = self.ptr_ty();
                 let off = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Mul, U64, off, iv[0], s));
+                self.emit(Inst::IBin(IOp::Mul, pt, off, iv[0], s));
                 let addr = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Add, U64, addr, base, off));
+                self.emit(Inst::IBin(IOp::Add, pt, addr, base, off));
                 (Place::Mem(addr, 0), elem)
             }
             _ => {

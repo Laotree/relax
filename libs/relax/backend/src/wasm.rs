@@ -1513,6 +1513,8 @@ struct Fx<'a> {
     /// every function's signature facts (by function index), and this function's index
     sigs: &'a [Sig],
     me: usize,
+    /// per vreg: every definition is below 32 (a 5-bit mask or such a constant): a shift count
+    small5: Vec<bool>,
 }
 
 /// The body a function is emitted from: untraced/trap calls end their blocks, vector ops wasm has
@@ -1590,8 +1592,26 @@ fn lower_func(o: &Options, options: &relax_session::Options, f: &Func, me: usize
         nk: Vec::new(),
         sigs,
         me,
+        small5: Vec::new(),
     };
     fx.check()?;
+    {
+        let mut sm = vec![true; nv];
+        let mut seen = vec![false; nv];
+        for p in &f.params {
+            sm[p.0 as usize] = false;
+        }
+        for b in &f.blocks {
+            for i in &b.insts {
+                let ok = matches!(i, Inst::IBinI(IOp::And, _, _, _, m) if (0..32).contains(m)) || matches!(i, Inst::Iconst(_, k) if (0..32).contains(k));
+                i.defs(|d| {
+                    seen[d.0 as usize] = true;
+                    sm[d.0 as usize] &= ok;
+                });
+            }
+        }
+        fx.small5 = (0..nv).map(|v| sm[v] && seen[v]).collect();
+    }
     {
         let csig = |id: u32| fn_ix.get(&id).map(|&u| &sigs[u as usize]);
         fx.nk = narrow_kinds(f, o, link, &sigs[me].params, &csig);
@@ -2559,6 +2579,12 @@ impl<'a> Fx<'a> {
         let inst = &f.blocks[b as usize].insts[i];
         if let Some(d) = tree_def(inst) {
             let k = self.nk[d.0 as usize];
+            // a constant offset into an address: the access's memarg offset
+            if let (Inst::IBinI(IOp::Add, it, _, a, imm), Want::Addr(off)) = (inst, want) {
+                if it.bits == 64 {
+                    return self.value(b, *a, Want::Addr(off.wrapping_add(*imm)));
+                }
+            }
             if k != 0 {
                 // a compare's i32 is its narrow value; branch forms keep their inverted compares
                 if matches!(inst, Inst::ICmp(..) | Inst::ICmpI(..) | Inst::FCmp(..)) && matches!(want, Want::Truthy | Want::Inverted) {
@@ -2626,6 +2652,11 @@ impl<'a> Fx<'a> {
         Ok(())
     }
 
+    /// `x` is a shift count below 32: every definition masks it to 5 bits or is such a constant.
+    fn small_count(&self, x: VReg) -> bool {
+        self.small5[x.0 as usize]
+    }
+
     /// Emits instruction (b, i), whose result is a narrow vreg, leaving its low 32 bits (i32).
     fn expr32(&mut self, b: u32, i: usize) -> Result<(), String> {
         let inst = self.f.blocks[b as usize].insts[i].clone();
@@ -2675,6 +2706,15 @@ impl<'a> Fx<'a> {
                 self.value(b, *a, Want::Low)?;
                 self.i32c(*imm as i32);
                 self.op(match op { IOp::Shl => 0x74, IOp::Shr => 0x76, _ => 0x77 });
+            }
+            // a count known below 32 (masked by the front end): the i32 shift's
+            Inst::IBin(op @ (IOp::Shl | IOp::Shr), it, _, a, x) if self.small_count(*x) && (*op == IOp::Shl || it.signed && it.bits == 32 && ks(self, *a)) => {
+                self.value(b, *a, Want::Low)?;
+                self.value(b, *x, Want::Low)?;
+                self.op(if *op == IOp::Shl { 0x74 } else { 0x75 });
+                if *op == IOp::Shl {
+                    self.ext32(*it);
+                }
             }
             Inst::IBinI(IOp::Shl, it, _, a, imm) if (0..32).contains(imm) => {
                 self.value(b, *a, Want::Low)?;

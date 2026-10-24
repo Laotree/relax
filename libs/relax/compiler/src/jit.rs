@@ -8130,7 +8130,7 @@ pub unsafe fn export_rir(up: *mut Unit, id: u32, optimized: bool) -> Result<rela
     let o3 = optimized && match crate::wasm_export::o3_policy() {
         crate::wasm_export::O3Policy::Off => false,
         crate::wasm_export::O3Policy::All => true,
-        crate::wasm_export::O3Policy::Hot => trace_o3(&*up, id),
+        crate::wasm_export::O3Policy::Hot => trace_o3(&*up, id) || crate::wasm_export::o3_crate(&*up, id),
     };
     let o3_body = if o3 { export_o3_rir(up, id) } else { None };
     let u = &*up;
