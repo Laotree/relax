@@ -4,7 +4,7 @@
 //! [host.149]
 //! via = "ssh"
 //! ssh = "arch@192.0.2.16"
-//! relax = "[path]/bin/makepad"   # optional: the makepad binary on that host
+//! makepad = "[path]/bin/makepad" # optional: the makepad command on that host (a shell word list: `env TMPDIR=/x /path/makepad` sets the relay's TMPDIR, where it finds apps)
 //! env = { DISPLAY = ":0" }          # optional: environment of the sessions launched there
 //!
 //! [host.phone]
