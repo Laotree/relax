@@ -18,7 +18,7 @@ use crate::tls::{TlsServer, TlsStream};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -43,10 +43,17 @@ const BAN: Duration = Duration::from_secs(15 * 60);
 /// `(role, method, path)`; the path may carry a query.
 pub type RoutePolicy = Arc<dyn Fn(Role, &str, &str) -> bool + Send + Sync>;
 
+/// Which of the service's loopback servers serves a path (a service may
+/// split its routes over several planes).
+pub type InnerRoute = Arc<dyn Fn(&str) -> SocketAddr + Send + Sync>;
+
 pub struct FrontConfig {
     pub listen: SocketAddr,
-    /// The service's own HTTP server, on loopback.
-    pub inner: SocketAddr,
+    /// The service's own HTTP server(s), on loopback, by request path.
+    pub inner: InnerRoute,
+    /// Extra header lines (`Name: value`) for every request the front hands
+    /// on, e.g. the service's own credential for front-admitted callers.
+    pub inner_headers: Vec<String>,
     pub tls: TlsServer,
     pub verifier: Arc<Verifier>,
     /// Per-process secret proving a request came through a front.
@@ -139,8 +146,34 @@ fn audit(label: &str, peer: &SocketAddr, what: &str) {
     eprintln!("{label} {peer}: {what}");
 }
 
-pub fn start_front(config: FrontConfig) -> io::Result<std::thread::JoinHandle<()>> {
+/// A running front. Dropping it leaves the front running (a service's whole
+/// life); [`FrontHandle::stop`] closes the listener and joins its thread.
+/// Connections already admitted finish on their own threads.
+pub struct FrontHandle {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FrontHandle {
+    /// The bound address (the port is the OS's when `listen` asked for 0).
+    pub fn local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    pub fn stop(&mut self) {
+        let Some(join) = self.join.take() else { return };
+        self.stop.store(true, Ordering::SeqCst);
+        // The acceptor blocks in accept (no polling while idle): one local
+        // connection wakes it to see the flag.
+        let _ = TcpStream::connect_timeout(&self.addr, Duration::from_secs(1));
+        let _ = join.join();
+    }
+}
+
+pub fn start_front(config: FrontConfig) -> io::Result<FrontHandle> {
     let listener = TcpListener::bind(config.listen)?;
+    let addr = listener.local_addr()?;
     let (max_total, max_per_ip) = (config.max_total, config.max_per_ip);
     let limits = Arc::new(Limits {
         per_ip: Mutex::new(HashMap::new()),
@@ -150,10 +183,15 @@ pub fn start_front(config: FrontConfig) -> io::Result<std::thread::JoinHandle<()
         max_per_ip,
     });
     let config = Arc::new(config);
-    std::thread::Builder::new()
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = stop.clone();
+    let join = std::thread::Builder::new()
         .name(format!("fleet-{}", config.label))
         .spawn(move || {
             for tcp in listener.incoming() {
+                if stopping.load(Ordering::SeqCst) {
+                    return;
+                }
                 let Ok(tcp) = tcp else { continue };
                 let Ok(peer) = tcp.peer_addr() else { continue };
                 let ip = normalize(peer.ip());
@@ -180,7 +218,8 @@ pub fn start_front(config: FrontConfig) -> io::Result<std::thread::JoinHandle<()
                     }
                 });
             }
-        })
+        })?;
+    Ok(FrontHandle { addr, stop, join: Some(join) })
 }
 
 pub fn normalize(ip: IpAddr) -> IpAddr {
@@ -276,9 +315,9 @@ pub fn parse_head(head: &[u8]) -> Option<ParsedHead> {
 }
 
 impl ParsedHead {
-    pub fn rewrite(&self, secret: &str, client: &str, role: Role, peer: IpAddr) -> Vec<u8> {
+    pub fn rewrite(&self, secret: &str, extra: &[String], client: &str, role: Role, peer: IpAddr) -> Vec<u8> {
         let mut out = String::new();
-        for line in &self.lines {
+        for line in self.lines.iter().chain(extra) {
             out.push_str(line);
             out.push_str("\r\n");
         }
@@ -336,11 +375,11 @@ fn serve(config: &FrontConfig, tcp: TcpStream, peer: SocketAddr) -> Result<(), R
         respond(&mut tls, 403, "not allowed for this credential");
         return Err(Refusal::Other(format!("{} {} {} refused for role {}", cred.client_id, parsed.method, parsed.path, cred.role.as_str())));
     }
-    let mut inner = TcpStream::connect_timeout(&config.inner, Duration::from_secs(5))
+    let mut inner = TcpStream::connect_timeout(&(config.inner)(&parsed.path), Duration::from_secs(5))
         .map_err(|e| Refusal::Other(format!("inner connect: {e}")))?;
     let _ = inner.set_nodelay(true);
     inner
-        .write_all(&parsed.rewrite(&config.front_secret, &cred.client_id, cred.role, normalize(peer.ip())))
+        .write_all(&parsed.rewrite(&config.front_secret, &config.inner_headers, &cred.client_id, cred.role, normalize(peer.ip())))
         .and_then(|_| inner.write_all(&rest))
         .map_err(|e| Refusal::Other(format!("inner write: {e}")))?;
     pump(&mut tls, &mut inner);
@@ -465,8 +504,9 @@ mod tests {
         assert_eq!(p.method, "POST");
         assert_eq!(p.path, "/generate");
         assert_eq!(p.authorization.as_deref(), Some("MKC2 a.lan.9.ff"));
-        let out = String::from_utf8(p.rewrite("s3cret", "rik-mac", Role::Lan, "192.0.2.5".parse().unwrap())).unwrap();
-        assert!(!out.to_ascii_lowercase().contains("authorization"));
+        let out = String::from_utf8(p.rewrite("s3cret", &["Authorization: Bearer inner".to_string()], "rik-mac", Role::Lan, "192.0.2.5".parse().unwrap())).unwrap();
+        assert!(!out.contains("MKC2"));
+        assert!(out.contains("Authorization: Bearer inner\r\n"));
         assert!(!out.contains("guess") && !out.contains("admin"));
         assert!(out.contains("X-Makepad-Client: rik-mac\r\n"));
         assert!(out.ends_with("\r\n\r\n"));
