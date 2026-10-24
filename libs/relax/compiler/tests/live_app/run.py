@@ -74,7 +74,7 @@ def step(name, ok):
 
 step("starts", wait(lambda: last_value() == 1 and os.path.exists(ready), 120))
 if warm:
-    step("live start restored the collected graph", any(l.startswith("makepad-run collected: restored") for l in err))
+    step("live start restored the collected graph", wait(lambda: any(l.startswith("makepad-run collected: restored") for l in err)))
 t = time.time()
 save(base.replace("conf().base\n", "conf().base + 1\n"))
 ok = wait(lambda: last_value() == 2)
