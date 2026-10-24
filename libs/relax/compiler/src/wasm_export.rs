@@ -36,6 +36,8 @@ pub fn new_unit() -> usize {
 static ENTRY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CLOSURE_ORIGINS: Mutex<BTreeMap<u32, &'static str>> = Mutex::new(BTreeMap::new());
+static CLOSURE_PARENTS: Mutex<BTreeMap<u32, u32>> = Mutex::new(BTreeMap::new());
+static POSTOPT_EFFECTS: [std::sync::atomic::AtomicUsize; 5] = [const { std::sync::atomic::AtomicUsize::new(0) }; 5];
 
 /// Process start (the loader's main): `MAKEPAD_RUN_WASM_EXPORT_BLOCKS=1` turns block coverage on
 /// before the program loads (code cache off), so the export drops the blocks the run never entered.
@@ -435,6 +437,45 @@ fn data_refs(u: &Unit, id: u32, bytes: &[u8]) -> Vec<(usize, Sym)> {
     }).collect()
 }
 
+/// Export-time constants include immutable statics' initial images, never the
+/// trace host's current storage. Mutable statics, UnsafeCell and unknown layouts
+/// are deliberately not constants, even in the single-thread profile.
+pub(crate) fn ro_read(ctx: usize, s: Sym, n: u32) -> relax_backend::passes::RoRead {
+    use relax_backend::passes::RoRead;
+    let u = unsafe { &*(ctx as *const Unit) };
+    let Some(SymKind::Static(d)) = u.syms.kind(s.id) else {
+        return crate::syms::ro_read(ctx, s, n);
+    };
+    let def = u.prog.def(d);
+    if !matches!(u.prog.files[def.file as usize].ast.item(def.item).kind,
+        crate::ast::ItemKind::Static(false, _, e) if e.is_some()) { return RoRead::No; }
+    let Some(ty) = u.tcx.const_ty(&u.prog, d) else { return RoRead::No };
+    if !u.tcx.is_freeze(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), ty) { return RoRead::No; }
+    let image = u.syms.initial_data.lock().unwrap_or_else(|e| e.into_inner()).get(&s.id).cloned();
+    let Some(image) = image else { return RoRead::No };
+    let Ok(off) = usize::try_from(s.off) else { return RoRead::No };
+    if off > image.len() || n as usize > image.len() - off { return RoRead::No; }
+    if n == 0 { return RoRead::Range((image.len() - off) as u64); }
+    let Some(ptrs) = crate::syms::pointer_offsets(u, u.syms.addr(Sym::new(s.id)), &image) else { return RoRead::No };
+    let pw = u.ptr_bytes() as usize;
+    for p in ptrs {
+        let p = p as usize;
+        if p < off + n as usize && off < p + pw {
+            return if p == off && n as usize == pw {
+                u.syms.symbol_at(crate::syms::word_in(u, &image, p), u).map(|s| {
+                    POSTOPT_EFFECTS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    RoRead::Ptr(s)
+                }).unwrap_or(RoRead::No)
+            } else { RoRead::No };
+        }
+    }
+    if !matches!(n, 1 | 2 | 4 | 8) { return RoRead::No; }
+    let mut bytes = [0u8; 8];
+    bytes[..n as usize].copy_from_slice(&image[off..off + n as usize]);
+    POSTOPT_EFFECTS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RoRead::Bytes(u64::from_le_bytes(bytes))
+}
+
 /// Functions and source blocks executed by the training runs in the same build
 /// configuration. A malformed or incomplete union must not produce a module.
 fn read_union() -> Result<HashMap<String, std::collections::HashSet<(usize, usize)>>, String> {
@@ -538,9 +579,17 @@ pub fn finish(u: &Unit) {
     // the trace: slots whose code was installed (called); a build made ahead of a call that
     // never came is not part of it
     let n_cap = funcs.len();
-    funcs.retain(|id, _| (*id as usize) < u.fns.len() && (u.fns[*id as usize].code != 0 || forced.contains(id)));
+    let n_initializers = funcs.keys().filter(|id| (**id as usize) < u.fns.len()
+        && !forced.contains(*id) && !crate::coverage::runtime_function(u, **id)).count();
+    // New slots already have a nonzero lazy-stub address. Only `compiled`
+    // distinguishes installed program code from an unused ahead compilation.
+    // Const/static initializer slots run only in the compiler. Their declared
+    // images are linked as data; their evaluator bodies are not runtime roots.
+    // Use the coverage collector's same distinction, keeping every union root.
+    funcs.retain(|id, _| (*id as usize) < u.fns.len() && (forced.contains(id)
+        || u.fns[*id as usize].compiled && crate::coverage::runtime_function(u, *id)));
     if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
-        eprintln!("wasm export: {} slots captured, {} installed (of {} slots in the unit)", n_cap, funcs.len(), u.fns.len());
+        eprintln!("wasm export: {} slots captured, {} installed runtime/union roots (of {} slots in the unit); {} compiler initializer roots excluded", n_cap, funcs.len(), u.fns.len(), n_initializers);
     }
     if let Ok(pat) = std::env::var("MAKEPAD_RUN_WASM_EXPORT_DUMP") {
         for (id, f) in &funcs {
@@ -980,6 +1029,22 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
         }
         let fl = fl.replace("%p", &std::process::id().to_string());
         let _ = std::fs::write(&fl, txt);
+        let parents = CLOSURE_PARENTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut provenance = String::from("slot\tbytes\tparent\tcrate\tkey\n");
+        for (id, _, bytes) in &out.stats.fn_sizes {
+            let parent = parents.get(id).map(u32::to_string).unwrap_or_default();
+            let mut owner = *id;
+            let krate = loop {
+                match &u.fns[owner as usize].key {
+                    crate::jit::FnKey::Inst(d, _) => break u.prog.syms.str(u.prog.crates[u.prog.def(*d).krate as usize].name),
+                    crate::jit::FnKey::Closure(_, _, p) | crate::jit::FnKey::Plain(p) | crate::jit::FnKey::Sandbox(p)
+                        if *p != owner && (*p as usize) < u.fns.len() => owner = *p,
+                    _ => break "<generated>",
+                }
+            };
+            provenance.push_str(&format!("{id}\t{bytes}\t{parent}\t{krate}\t{}\n", crate::jit::slot_key(u, *id)));
+        }
+        let _ = std::fs::write(format!("{}.parents", fl), provenance);
         // and the data objects: bytes, what it is, its name or first bytes
         let mut dt = String::new();
         for (b, n) in &data_top {
@@ -1154,10 +1219,100 @@ fn block_profile() -> bool {
     std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_BLOCKS").is_some_and(|v| v != "0")
 }
 
+/// Apply only semantics shared by every requested emission variant. These are
+/// the same abort/thread bindings used by emit(), not observations of a run.
+/// In particular, unwind-only cleanup edges cannot execute in panic=abort.
+pub(crate) fn prepare_shipping(u: &Unit, f: &mut Func) {
+    use relax_backend::rir::{Callee, Term};
+    static PROFILE: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    let &(abort, single) = PROFILE.get_or_init(|| {
+        let variants = std::env::var("MAKEPAD_RUN_WASM_EXPORT_VARIANTS").ok();
+        let opts: Vec<String> = match variants {
+            Some(v) => v.split(';').filter(|v| !v.is_empty()).map(|v| v.split_once('=').map_or("", |x| x.1).to_string()).collect(),
+            None => vec![std::env::var("MAKEPAD_RUN_WASM_OPT").unwrap_or_default()],
+        };
+        opts.iter().map(|o| {
+            let (mut abort, mut single) = (true, true);
+            for t in o.split(',') {
+                match t { "abort" => abort = true, "-abort" => abort = false, "st" => single = true, "-st" => single = false, _ => {} }
+            }
+            (abort, single)
+        }).fold((true, true), |a, b| (a.0 && b.0, a.1 && b.1))
+    });
+    for b in &mut f.blocks {
+        if abort {
+            b.term = match b.term {
+                Term::Invoke(next, _) => {
+                    POSTOPT_EFFECTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Term::Jump(next)
+                }
+                Term::Resume => Term::Unreachable,
+                ref t => t.clone(),
+            };
+        }
+        let mut insts = Vec::with_capacity(b.insts.len());
+        let old_pos = std::mem::take(&mut b.pos);
+        for (at, i) in std::mem::take(&mut b.insts).into_iter().enumerate() {
+            if matches!(i, Inst::Coverage { .. }) { continue; }
+            let pos = old_pos.get(at).copied().unwrap_or(b.term_pos);
+            let binding = match &i {
+                Inst::Call(Callee::Host(s) | Callee::CHost(s, _), _, _) => match u.syms.kind(s.id) {
+                    Some(SymKind::Foreign(n)) if single => single_thread(&n),
+                    Some(SymKind::Rt("panicking")) if abort => Some(HostBind::Builtin(Builtin::Nop)),
+                    Some(SymKind::Rt("rethrow")) if abort => Some(HostBind::Trap),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match (&i, binding) {
+                (Inst::Call(_, _, rets), Some(HostBind::Builtin(builtin @ (Builtin::Nop | Builtin::One))))
+                    if rets.iter().all(|r| f.vregs[r.0 as usize] == relax_backend::rir::Cls::I) => {
+                    // The web binding returns a constant integer and has no
+                    // effects. Argument computations still execute normally.
+                    let one = builtin == Builtin::One;
+                    POSTOPT_EFFECTS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    insts.extend(rets.iter().map(|r| Inst::Iconst(*r, i64::from(one))));
+                }
+                (_, Some(HostBind::Trap)) => {
+                    // A specified host trap cannot return or observe its
+                    // arguments. This is a semantic trap, never a cold stub.
+                    b.term = Term::Unreachable;
+                    b.term_pos = pos;
+                    POSTOPT_EFFECTS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+                _ => insts.push(i),
+            }
+            b.pos.resize(insts.len(), pos);
+        }
+        b.insts = insts;
+    }
+}
+
+/// A folded vtable load names a thunk symbol; represent its exact target as
+/// FnAddr so the normal simplifier can devirtualize local calls. If that was the
+/// last use of a vtable, DCE removes the table address and its unrelated methods
+/// never enter the closure. Escaping tables keep all of their described edges.
+pub(crate) fn shipping_fn_addresses(u: &Unit, f: &mut Func) -> bool {
+    let mut changed = false;
+    for i in f.blocks.iter_mut().flat_map(|b| &mut b.insts) {
+        if let Inst::Addr(d, s) = i {
+            if s.off != 0 { continue; }
+            if let Some(SymKind::Thunk(slot)) = u.syms.kind(s.id) {
+                *i = Inst::FnAddr(*d, slot);
+                POSTOPT_EFFECTS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// Shipping closes all captured roots. Size mode closes only annotated roots.
-/// export_rir uses the same tier0_codegen_rir pipeline as captured baseline bodies,
-/// and build_rir registers monomorphic calls and vtables on demand. The worklist
-/// follows those new slots until no static edge remains. A shipping build never
+/// Shipping upgrades every body to normal O1, then follows only edges in that
+/// exact emitted body. Lowering registers monomorphic calls and vtables on demand;
+/// registration alone does not retain them. The worklist reaches a fixpoint over
+/// optimized calls and data pointers. A shipping build never
 /// substitutes a trap for a body that fails to lower or emit.
 fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Result<(std::collections::BTreeSet<u32>, usize), String> {
     use relax_backend::rir::Callee;
@@ -1171,8 +1326,10 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Resul
         }
     };
     let mut work: Vec<u32> = Vec::new();
-    for f in funcs.values() {
-        callees(f, &mut work);
+    if !whole {
+        for f in funcs.values() {
+            callees(f, &mut work);
+        }
     }
     work.extend(funcs.keys().copied());
     work.retain(|id| (*id as usize) < u.fns.len() && (whole || crate::jit::keep_reachable(u, *id)));
@@ -1183,13 +1340,18 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Resul
     let original: std::collections::BTreeSet<u32> = funcs.keys().copied().collect();
     let mut origins = CLOSURE_ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
     origins.clear();
-    let mut expand = |f: &Func, work: &mut Vec<u32>, data_seen: &mut std::collections::HashSet<u32>| {
+    let mut parents = CLOSURE_PARENTS.lock().unwrap_or_else(|e| e.into_inner());
+    parents.clear();
+    let mut removed_edges = Vec::new();
+    let mut expand = |parent: u32, f: &Func, work: &mut Vec<u32>, data_seen: &mut std::collections::HashSet<u32>| {
         let start = work.len();
-        callees(f, work);
-        for id in &work[start..] { if !original.contains(id) { origins.entry(*id).or_insert("direct-call"); } }
+        for i in f.blocks.iter().flat_map(|b| &b.insts) {
+            if let Inst::Call(Callee::Fn(t) | Callee::CFn(t, _), _, _) = i { work.push(*t); }
+        }
+        for id in &work[start..] { if !original.contains(id) { origins.entry(*id).or_insert("direct-call"); parents.entry(*id).or_insert(parent); } }
         let start = work.len();
         address_taken(u, std::iter::once(f), work, data_seen);
-        for id in &work[start..] { if !original.contains(id) { origins.insert(*id, "function-pointer/vtable"); } }
+        for id in &work[start..] { if !original.contains(id) { origins.entry(*id).or_insert("function-pointer/vtable"); parents.entry(*id).or_insert(parent); } }
     };
     let up = crate::jit::current_unit();
     while let Some(id) = work.pop() {
@@ -1202,17 +1364,28 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Resul
         }
         // A traced root still needs its unexecuted grow/error branches and their
         // full call closure. Previously only untraced roots were expanded.
-        if let Some(f) = funcs.get(&id) {
-            expand(f, &mut work, &mut data_seen);
-            kept.insert(id);
-            continue;
+        if !whole {
+            if let Some(f) = funcs.get(&id) {
+                expand(id, f, &mut work, &mut data_seen);
+                kept.insert(id);
+                continue;
+            }
         }
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
-            crate::owner::call(crate::owner::Class::Program, || crate::zone_alloc::kept_with(|| unsafe { crate::jit::export_rir(up, id) }))
+            crate::owner::call(crate::owner::Class::Program, || crate::zone_alloc::kept_with(|| unsafe { crate::jit::export_rir(up, id, whole) }))
         )).unwrap_or_else(|_| Err("compiler panicked".into()));
         match r {
             Ok(f) => {
-                expand(&f, &mut work, &mut data_seen);
+                if let Some(before) = funcs.get(&id) {
+                    let mut old = Vec::new();
+                    let mut new = Vec::new();
+                    callees(before, &mut old);
+                    callees(&f, &mut new);
+                    old.sort_unstable(); old.dedup();
+                    let new: std::collections::HashSet<_> = new.into_iter().collect();
+                    removed_edges.extend(old.into_iter().filter(|c| !new.contains(c)).map(|c| (id, c)));
+                }
+                expand(id, &f, &mut work, &mut data_seen);
                 funcs.insert(id, f);
                 kept.insert(id);
             }
@@ -1221,6 +1394,19 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Resul
                 failed += 1;
             }
         }
+    }
+    if let Ok(path) = std::env::var("MAKEPAD_RUN_WASM_EXPORT_FNLIST") {
+        let mut rows = String::from("caller\tcallee\n");
+        for (caller, callee) in &removed_edges {
+            rows.push_str(&format!("{}\t{}\n", crate::jit::slot_key(u, *caller), crate::jit::slot_key(u, *callee)));
+        }
+        let _ = std::fs::write(format!("{}.removed-edges", path.replace("%p", &std::process::id().to_string())), rows);
+    }
+    if whole && std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
+        eprintln!("wasm export: postopt: {} captured call/address edges eliminated before closure; {} optimized bodies", removed_edges.len(), kept.len());
+        let n = POSTOPT_EFFECTS.each_ref().map(|x| x.load(std::sync::atomic::Ordering::Relaxed));
+        eprintln!("wasm export: postopt semantics: {} abort unwind edges, {} constant host bindings, {} semantic trap tails, {} immutable static reads resolved", n[0], n[1], n[2], n[3]);
+        eprintln!("wasm export: postopt: {} symbolic function addresses exposed to devirtualization", n[4]);
     }
     Ok((kept, failed))
 }

@@ -7706,16 +7706,47 @@ pub fn keep_reachable(u: &Unit, id: u32) -> bool {
     marked(d) || (def.parent.0 != u32::MAX && (def.parent.0 as usize) < u.prog.defs.len() && u.prog.def(def.parent).kind == DefKind::Impl && marked(def.parent))
 }
 
-/// The RIR a wasm export takes for slot `id` (built now if the run never built it): what its
-/// baseline code would be compiled from.
-pub unsafe fn export_rir(up: *mut Unit, id: u32) -> Result<relax_backend::rir::Func, String> {
-    if (&*up).fns[id as usize].rir.is_none() {
-        build_rir(up, id)?;
+/// The RIR a wasm export emits for slot `id`, built even if tracing never called
+/// it. Shipping uses normal O1; explicit block mode retains its captured tier.
+pub unsafe fn export_rir(up: *mut Unit, id: u32, optimized: bool) -> Result<relax_backend::rir::Func, String> {
+    // Shipping is an AOT consumer: even a cold, baseline-only trace body needs
+    // normal O1 inlining, constant propagation and DCE before its edges are read.
+    // Normal upgrades inline candidates too; it never specializes from trace hits.
+    if optimized && !(&*up).verdict_clean(id) {
+        // A captured body's RIR may have been retired while its lazy verdict
+        // became stale as more modules loaded. Export cannot defer the upgrade
+        // to a future frame: run the existing synchronous check-before-run gate.
+        let mut owner = id;
+        while let FnKey::Closure(_, _, parent) = (&*up).fns[owner as usize].key {
+            owner = parent;
+        }
+        if let Some(error) = (&mut *up).refused_by_check(owner) { return Err(error); }
+    }
+    if optimized || (&*up).fns[id as usize].rir.is_none() {
+        build_rir_mode(up, id, if optimized { RirMode::Normal } else { RirMode::Tier0 })?;
     }
     let u = &*up;
     let session = u.prog.session.clone();
     let rir = u.fns[id as usize].rir.clone().ok_or("no RIR for this slot")?;
-    Ok(tier0_codegen_rir(&session.options, &rir, u.opt.fold, u.opt.layout).into_owned())
+    let mut f = tier0_codegen_rir(&session.options, &rir, u.opt.fold, u.opt.layout).into_owned();
+    if optimized {
+        // Instrumentation is not program semantics. Remove it before the final
+        // simplification, so unused addresses and constant branches cannot seed
+        // the shipping closure. This exact body is also the emitted body.
+        crate::wasm_export::prepare_shipping(u, &mut f);
+        let ro = Some(relax_backend::passes::RoReader::new(crate::wasm_export::ro_read, up as usize));
+        relax_backend::passes::simplify(&session.options, &mut f, ro, true, true);
+        while crate::wasm_export::shipping_fn_addresses(u, &mut f) {
+            relax_backend::passes::simplify(&session.options, &mut f, ro, true, true);
+        }
+        relax_backend::passes::live_dce(&mut f);
+        relax_backend::passes::dce(&mut f);
+        // DCE ignores unreachable blocks; relayout physically removes them so
+        // neither the linker nor the closure sees their residual instructions.
+        relax_backend::passes::relayout(&mut f);
+        f.verify().map_err(|e| format!("shipping RIR: {e}"))?;
+    }
+    Ok(f)
 }
 
 thread_local! {
