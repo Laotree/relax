@@ -2103,8 +2103,8 @@ fn retarget(t: &mut Term, mut m: impl FnMut(u32) -> u32) {
 
 /// Full unrolling of loops with a small constant trip count (`for _ in 0..3`, deflate's hash-chain
 /// probes): an innermost loop with one latch whose counter `c` is set once outside the loop by a
-/// constant and stepped once in the latch by `c = c + s` (c read nowhere outside the loop, no
-/// calls in the loop) and whose latch decides "again" by `c' cmp k` with constants, runs T <= 4
+/// constant and stepped once in the latch by `c = c + s` (c read nowhere outside the loop; calls
+/// in the body are copied with it) and whose latch decides "again" by `c' cmp k` with constants, runs T <= 4
 /// times; it gets T copies in front of it, copy j reading c as the constant c0 + j*s (a fresh
 /// vreg each, so constant folding sees single definitions). Copy j's back edge enters copy j+1;
 /// the last copy's back edge enters the original loop with c restored (never taken: its compare
@@ -2177,27 +2177,41 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         if size > 160 {
             continue;
         }
-        if core.iter().any(|b| f.blocks[*b as usize].insts.iter().any(|i| matches!(i, Inst::Call(..))) || matches!(f.blocks[*b as usize].term, Term::Invoke(..) | Term::Resume)) {
-            continue;
-        }
+        // Calls in the body are copied with it, as LLVM's full unroll does (a call is part of the
+        // body's cost, not a bar): reconcile's `for (shape, applied, wanted, solid) in [(&mut
+        // entry.a, ..), (..)]` holds the shape calls of the rare changed case, and only unrolled
+        // do the array's borrows become constant-offset stores that forward, so `entry` stops
+        // escaping and its copies join (GAPB). An invoke's unwind edge leaves for the shared
+        // cleanup: each copy keeps it, it is no early exit.
         let latches: Vec<u32> = members.iter().copied().filter(|b| f.blocks[*b as usize].term.succs().any(|s| s == h)).collect();
         // only loops that leave from the header or the latch: a body with early exits (a search
         // loop returning from inside) grows by every copy of its exit paths for little gain
         // (deflate's probe loop measured slower unrolled on x64)
-        let early_exit = members.iter().any(|b| *b != h && !latches.contains(b) && f.blocks[*b as usize].term.succs().any(|s| !m.get(s as usize).copied().unwrap_or(false)));
+        // An edge to the block the header leaves for is no early exit: it is the loop's own end,
+        // tested in two steps (a `for` over an array: the header's `start == end`, then the
+        // loaded Option's tag in the next block, which only the copies' constant loads fold).
+        let h_exit: Vec<u32> = f.blocks[h as usize].term.succs().filter(|s| !m.get(*s as usize).copied().unwrap_or(false)).collect();
+        let early_exit = members.iter().any(|b| *b != h && !latches.contains(b) && {
+            let t = &f.blocks[*b as usize].term;
+            let unwind = if let Term::Invoke(_, u) = *t { Some(u) } else { None };
+            t.succs().any(|s| Some(s) != unwind && !h_exit.contains(&s) && !m.get(s as usize).copied().unwrap_or(false))
+        });
         if early_exit {
             if tr {
-                eprintln!("  early exits from the body");
+                eprintln!("  early exits from the body (header b{}, latches {:?})", h, latches);
+                for &b in &members {
+                    eprintln!("    b{}: {:?} -> {:?}", b, f.blocks[b as usize].insts, f.blocks[b as usize].term);
+                }
             }
             continue;
         }
-        if latches.len() != 1 {
-            if tr {
-                eprintln!("  {} latches", latches.len());
-            }
+        // Several latches (a `continue` in the body) are fine when the header decides and the
+        // counter's step dominates every latch: each back edge enters the next copy.
+        if latches.is_empty() {
             continue;
         }
         let l = latches[0];
+        let multi = latches.len() > 1;
         let outside: Vec<u32> = preds[h as usize].iter().copied().filter(|p| !m[*p as usize]).collect();
         if outside.is_empty() {
             continue;
@@ -2207,7 +2221,7 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         let lb = &f.blocks[l as usize];
         let mut found = None;
         // (block, k, type, counter, step, the step's value made at k is a constant in each copy)
-        for &sb in std::iter::once(&l).chain(members.iter().filter(|b| **b != l)) {
+        for &sb in std::iter::once(&l).filter(|_| !multi).chain(members.iter().filter(|b| multi || **b != l)) {
             if found.is_some() {
                 break;
             }
@@ -2237,6 +2251,12 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         };
         // a step outside the latch: it must dominate the latch, and blocks it dominates read the
         // stepped counter in the copies
+        if multi && latches.contains(&sb) {
+            if tr {
+                eprintln!("  {} latches and the step in latch b{}", latches.len(), sb);
+            }
+            continue;
+        }
         let idom = if sb != l { relax_backend::dom::idoms(f) } else { Vec::new() };
         let dominated = |b: u32| -> bool {
             if sb == l {
@@ -2255,9 +2275,9 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
             }
             false
         };
-        if sb != l && (sb == h || !dominated(l)) {
+        if sb != l && (sb == h || !latches.iter().all(|&x| dominated(x))) {
             if tr {
-                eprintln!("  step in b{} does not dominate the latch b{}", sb, l);
+                eprintln!("  step in b{} does not dominate the latches {:?}", sb, latches);
             }
             continue;
         }
@@ -2285,8 +2305,8 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
             }
             cmp
         };
-        let latch_cmp = if sb == l && matches!(lb.term, Term::Branch(_, a, b) if a == h || b == h) { find_cmp(lb, ak + 1) } else { None };
-        let header_cmp = if latch_cmp.is_none() && h != l {
+        let latch_cmp = if !multi && sb == l && matches!(lb.term, Term::Branch(_, a, b) if a == h || b == h) { find_cmp(lb, ak + 1) } else { None };
+        let header_cmp = if latch_cmp.is_none() && !latches.contains(&h) {
             let hb = &f.blocks[h as usize];
             if hb.insts.iter().any(|i| { let mut r = false; for_defs(i, |d| r |= d == c); r }) { None } else { find_cmp(hb, 0) }
         } else {
@@ -2402,7 +2422,7 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
             }
             for (q, &b) in idx.iter().enumerate() {
                 let mut blk = f.blocks[b as usize].clone();
-                let latch = b == l;
+                let latch = latches.contains(&b);
                 // the block holding the step: after it, the copy's next counter; blocks the step
                 // dominates: the next counter throughout
                 let step_blk = b == sb;
@@ -2440,10 +2460,12 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
                     }
                 });
                 if latch && last {
-                    // the original loop continues from the counter this copy reached
+                    // the original loop continues from the counter this copy reached (in front of
+                    // an invoke's call, which ends its block; nothing in the copy reads c)
                     let p = blk.term_pos;
-                    blk.insts.push(Inst::Mov(c, rj2));
-                    blk.pos.push(p);
+                    let at = blk.insts.len() - usize::from(matches!(blk.term, Term::Invoke(..)) && !blk.insts.is_empty());
+                    blk.insts.insert(at, Inst::Mov(c, rj2));
+                    if blk.pos.len() >= at { blk.pos.insert(at, p); }
                 }
                 if b == h {
                     let p = blk.pos.first().copied().unwrap_or(blk.term_pos);
