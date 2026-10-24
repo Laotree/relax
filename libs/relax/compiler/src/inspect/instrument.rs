@@ -1151,6 +1151,25 @@ pub fn pause_program() -> usize {
     n
 }
 
+/// A layout-changing patch's pause (reload.rs step 6, invalid.rs `hold_old_frames`): the program
+/// threads are held while the patch installs and their stacks are read. True: this call paused
+/// them (`resume_program` ends it); false: they were paused already (by `pause` or a stale
+/// access), and stay so.
+pub fn pause_for_patch() -> bool {
+    if PAUSED.swap(true, SeqCst) {
+        return false;
+    }
+    pause_imp::pause(&program_thread);
+    true
+}
+
+/// Thread `t` (a program thread) stays held for good, past any `resume`: it has a frame in code
+/// that never runs again (stale.rs `park_held`). A thread the pause did not hold (blocked in a
+/// system call) is held now. False: it could not be held (it ended, or this platform cannot).
+pub fn hold_for_good(t: &super::threads::Thread) -> bool {
+    pause_imp::keep(t)
+}
+
 /// Ends a pause (as `resume`).
 pub fn resume_program() -> usize {
     PAUSED.store(false, SeqCst);
@@ -1169,7 +1188,7 @@ pub fn stopped(t: &super::threads::Thread) -> bool {
 }
 
 /// Program threads (main and the threads the program started; not Relax's own, not inspect's).
-fn program_thread(t: &super::threads::Thread) -> bool {
+pub(crate) fn program_thread(t: &super::threads::Thread) -> bool {
     let main = crate::jit::MAIN_TID.load(Relaxed);
     if (t.handle != 0 && t.handle == main) || t.os_id == std::process::id() as u64 {
         return true;
@@ -1250,6 +1269,28 @@ mod pause_imp {
         }
         n
     }
+    /// Out of the pause's set: never resumed (its Mach suspension stays); suspended now when the
+    /// pause did not hold it.
+    pub fn keep(t: &crate::inspect::threads::Thread) -> bool {
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(k) = held.iter().position(|h| h.os_id == t.os_id) {
+            // (its port stays with this never-dropped entry)
+            std::mem::forget(held.remove(k));
+            return true;
+        }
+        drop(held);
+        let list = crate::inspect::threads::list();
+        let ok = list.iter().find(|x| x.os_id == t.os_id).is_some_and(|x| crate::inspect::threads::suspend(x));
+        if ok {
+            // (the listed original owns the port: kept, never released)
+            for x in list {
+                if x.os_id == t.os_id {
+                    std::mem::forget(x);
+                }
+            }
+        }
+        ok
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1277,7 +1318,7 @@ mod pause_imp {
         let mut list = crate::inspect::threads::list();
         crate::inspect::name_handles(&mut list);
         for t in list {
-            if skip.contains(&t.os_id) || t.name.starts_with("run-inspect") || t.name.starts_with("makepad-remote") || !want(&t) || held.iter().any(|h| h.0 == t.os_id) || t.state != "running" {
+            if skip.contains(&t.os_id) || t.name.starts_with("run-inspect") || t.name.starts_with("makepad-remote") || !want(&t) || held.iter().any(|h| h.0 == t.os_id) || !holdable(&t) || crate::inspect::threads::is_held(t.os_id) {
                 continue;
             }
             if let Ok(slot) = crate::inspect::threads::hold_paused(t.os_id) {
@@ -1286,6 +1327,16 @@ mod pause_imp {
         }
         held.len()
     }
+    /// A thread the sweep holds: one that runs, or one that waits in a futex or sleeps (their
+    /// callers retry an interrupted wait: std's locks, condvars, parking and sleep, glibc's).
+    /// Threads blocked in other system calls (reads, polls: third-party code may not retry an
+    /// EINTR) are held once they run. Holding only running threads held none of a program that
+    /// mostly sleeps between short bursts (a 5 ms sweep rarely sees it running): SAFE2's
+    /// "0 threads held" under `makepad run`, the program ran on.
+    fn holdable(t: &crate::inspect::threads::Thread) -> bool {
+        // x86_64: nanosleep 35, futex 202, clock_nanosleep 230
+        t.state == "running" || (t.state == "waiting" && t.syscall.is_some_and(|s| matches!(s.0, 35 | 202 | 230)))
+    }
     pub fn resume() -> usize {
         let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
         let n = held.len();
@@ -1293,6 +1344,17 @@ mod pause_imp {
             crate::inspect::threads::release_hold(s);
         }
         n
+    }
+    /// Out of the pause's set, held for good (signalled now when the pause did not hold it).
+    pub fn keep(t: &crate::inspect::threads::Thread) -> bool {
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(k) = held.iter().position(|h| h.0 == t.os_id) {
+            let (_, s) = held.remove(k);
+            crate::inspect::threads::keep_held(s);
+            return true;
+        }
+        drop(held);
+        crate::inspect::threads::hold_for_good(t.os_id).is_ok()
     }
 }
 
@@ -1303,6 +1365,9 @@ mod pause_imp {
     }
     pub fn resume() -> usize {
         0
+    }
+    pub fn keep(_t: &crate::inspect::threads::Thread) -> bool {
+        false
     }
 }
 

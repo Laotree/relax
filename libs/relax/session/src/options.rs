@@ -306,6 +306,11 @@ pub struct Options {
     /// `MAKEPAD_RUN_RA_QUICK_COALESCE`; default `false`: the quick allocation round (no live-range
     /// splitting) also coalesces copies. Compute kernels set it.
     pub ra_quick_coalesce: bool,
+    /// `MAKEPAD_RUN_NAN_EXACT`; default `false`: float identities that would return a NaN operand
+    /// unquieted (`x * 1.0`, `x / 1.0`, `x - 0.0`, `x + -0.0` -> x; the hardware op quiets a
+    /// signaling NaN) stay ops. Compute kernels set it: their results are bit-specified (the
+    /// interpreter's), and Rust leaves the payload unspecified, so Relax's tiers fold them.
+    pub nan_exact: bool,
     /// `MAKEPAD_RUN_SPEC_ORDER`; default `false`.
     pub spec_order: bool,
     /// `MAKEPAD_RUN_O3_PROFILE`; default `None`.
@@ -407,6 +412,7 @@ impl Default for Options {
             ra_prio: Priority::References,
             ra_order: false,
             ra_quick_coalesce: false,
+            nan_exact: false,
             spec_order: false,
             tier1_profile: None,
             tier1_profile_data: None,
@@ -525,6 +531,7 @@ impl Options {
             ra_prio: { let os = get("MAKEPAD_RUN_RA_PRIO"); let v = os.and_then(|v| v.into_string().ok()); match v.as_deref() { Some("len") => Priority::Length, Some("sqrt") => Priority::Sqrt, _ => Priority::References } },
             ra_order: { let os = get("MAKEPAD_RUN_RA_ORDER"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() == Some("start") },
             ra_quick_coalesce: { let os = get("MAKEPAD_RUN_RA_QUICK_COALESCE"); os.is_some() },
+            nan_exact: { let os = get("MAKEPAD_RUN_NAN_EXACT"); os.is_some() },
             spec_order: { let os = get("MAKEPAD_RUN_SPEC_ORDER"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() == Some("lifo") },
             tier1_profile: { let os = get("MAKEPAD_RUN_O3_PROFILE"); os },
             tier1_profile_data: None,
@@ -623,6 +630,7 @@ impl Options {
             ra_prio,
             ra_order,
             ra_quick_coalesce,
+            nan_exact,
             spec_order,
             tier1_profile,
             tier1_profile_data, cfgs, target, cpu,
@@ -803,6 +811,11 @@ impl Options {
         h.u8(*ra_order as u8);
         h.str("ra_quick_coalesce");
         h.u8(*ra_quick_coalesce as u8);
+        // (only when set: the default key stays the key it was before the option existed)
+        if *nan_exact {
+            h.str("nan_exact");
+            h.u8(1);
+        }
         h.str("spec_order");
         h.u8(*spec_order as u8);
         h.str("o3_profile");
