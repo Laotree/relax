@@ -21673,9 +21673,13 @@ unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64, ticket: 
     let u = &mut *up;
     let mut roots = Vec::new();
     let mut dyns = Vec::new();
+    // the types of the values the code works on: the root's own, and for a trait object the
+    // concrete type behind its vtable
+    let mut values = Vec::new();
     if let Some(FnKey::Inst(_, args)) = u.thunk_slot(root).map(|r| u.fns[r as usize].key.clone()) {
         if let Some(&t) = args.first() {
             let t = u.tcx.tys.erase_regions(t);
+            values.push(t);
             match u.tcx.tys.kind(t).clone() {
                 TyKind::Dyn(..) => dyns.push(t.0),
                 TyKind::Closure(..) => roots.extend(u.closure_fn_id(t)),
@@ -21691,16 +21695,15 @@ unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64, ticket: 
     // a trait object (or a struct ending in one): the methods of its vtable
     if meta != 0 {
         crate::syms::data_thunks(u, meta, &mut roots);
+        values.extend(u.vtables.snapshot().into_iter().filter(|(_, a)| *a == meta).map(|((t, _), _)| t));
     }
-    // the program's wake is called on a thread of its own: its code is compiled with the reach
-    if wake != 0 {
-        roots.extend(u.thunk_slot(wake as u64));
-    }
+    // the trait objects those values hold (fields, boxes, vectors, closures' captures): every
+    // vtable of those types, now and as the program makes more, is real-time code too. Trait
+    // objects the code only makes itself are followed through the vtables its code names.
+    dyns.extend(realtime_value_dyns(u, &values));
     with_rt(|rt| {
-        for d in dyns {
-            rt.dyns.insert(d);
-            RT_DYNS.store(true, Ordering::Release);
-        }
+        // (their vtables are followed when the walk has done the roots' slots)
+        rt.new_dyns.extend(dyns);
         rt.added = rt.added.max(ticket);
         if wake != 0 {
             rt.wakes.push((ticket, scope, wake));
@@ -21816,6 +21819,10 @@ unsafe fn realtime_step(up: *mut Unit) {
                 }
             }
             Next::Walk(id) => {
+                // a diverging fn (a panic, an abort) ends the callback's normal path: it stays lazy
+                if (id as usize) < (&*up).fns.len() && realtime_cut(&*up, id) {
+                    continue;
+                }
                 if !realtime_take(id) {
                     continue;
                 }
@@ -21823,14 +21830,11 @@ unsafe fn realtime_step(up: *mut Unit) {
                     continue;
                 }
                 let was = (&*up).fns[id as usize].compiled;
-                let (slots, dyns) = realtime_refs(up, id);
+                let slots = realtime_refs(up, id);
                 if !was && (&*up).fns[id as usize].compiled {
                     compiled += 1;
                 }
-                with_rt(|rt| {
-                    rt.todo.extend(slots);
-                    rt.new_dyns.extend(dyns);
-                });
+                with_rt(|rt| rt.todo.extend(slots));
             }
             // trait-object types newly called through: every vtable of each, now and later
             Next::Dyns(new_dyns) => {
@@ -21945,6 +21949,49 @@ unsafe fn realtime_miss_caller(up: *mut Unit, id: u32, frames: &[u64]) {
     eprintln!("makepad-run rt: miss `{}` called by {} (caller in the real-time set: {})", short_name(&u.fns[id as usize].name), who, if inset { "yes" } else { "no" });
 }
 
+/// The trait-object types values of `types` can hold: through struct, enum, tuple, array and slice
+/// fields, closures' captures, and what pointers point at (Box, Vec, Arc behind their raw
+/// pointers and markers).
+fn realtime_value_dyns(u: &Unit, types: &[TyId]) -> Vec<u32> {
+    let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
+    let mut todo: Vec<TyId> = types.to_vec();
+    let mut seen = crate::fxhash::HashSet::default();
+    let mut out = Vec::new();
+    while let Some(t) = todo.pop() {
+        let t = u.tcx.tys.erase_regions(t);
+        if !seen.insert(t) {
+            continue;
+        }
+        match u.tcx.tys.kind(t) {
+            TyKind::Dyn(..) => out.push(t.0),
+            TyKind::Adt(d, args, _) => {
+                let adt = &u.tcx.adts[d];
+                for (vi, v) in adt.variants.iter().enumerate() {
+                    for fi in 0..v.fields.len() {
+                        todo.push(u.tcx.field_ty(&u.prog, env, *d, vi as u32, fi as u32, u.tcx.tys.list(*args)));
+                    }
+                }
+                // PhantomData<T> (Vec's element type): T's values are behind the raw pointer
+                todo.extend_from_slice(u.tcx.tys.list(*args));
+            }
+            TyKind::Tuple(fields) => todo.extend_from_slice(u.tcx.tys.list(*fields)),
+            TyKind::Array(elem, _) | TyKind::Slice(elem) => todo.push(*elem),
+            TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty, .. }) => todo.push(*tupled_upvars_ty),
+            TyKind::Ref(_, p, _) | TyKind::Ptr(_, p) => todo.push(*p),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A diverging slot (a fn returning `!`: a panic, an abort, an exit): the walk stops there.
+fn realtime_cut(u: &Unit, id: u32) -> bool {
+    match &u.fns[id as usize].key {
+        FnKey::Inst(d, _) => u.tcx.fn_sig(&u.prog, *d).is_some_and(|s| s.ret == u.tcx.tys.never),
+        _ => false,
+    }
+}
+
 /// Slot `id` joins the set (false: it was in it).
 fn realtime_take(id: u32) -> bool {
     with_rt(|rt| {
@@ -22027,7 +22074,7 @@ unsafe fn realtime_top_tier(up: *mut Unit, ids: &[u32]) {
 /// Compiles slot `id` (if it has no code) and returns what its code can reach: slots, and the
 /// trait-object types it calls through. From its RIR when it has one (a build here keeps it),
 /// else from its disk cache entry, else from a fresh build of its RIR.
-unsafe fn realtime_refs(up: *mut Unit, id: u32) -> (Vec<u32>, Vec<u32>) {
+unsafe fn realtime_refs(up: *mut Unit, id: u32) -> Vec<u32> {
     let was = RT_KEEP.with(|k| k.replace(true));
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if !(&*up).fns[id as usize].compiled {
@@ -22043,12 +22090,11 @@ unsafe fn realtime_refs(up: *mut Unit, id: u32) -> (Vec<u32>, Vec<u32>) {
         }
         let u = &*up;
         let mut slots = Vec::new();
-        let mut dyns = Vec::new();
         if u.fns[id as usize].rir.is_none() && !u.fns[id as usize].compiled {
-            return (slots, dyns);
+            return slots;
         }
         if let Some(r) = u.fns[id as usize].rir.clone() {
-            realtime_rir_refs(u, &r, &mut slots, &mut dyns);
+            realtime_rir_refs(u, &r, &mut slots);
         } else if let Some(c) = u.cache.as_ref().filter(|c| !c.last_callees.is_empty() || !c.last_thunks.is_empty() || !c.last_data.is_empty()) {
             slots.extend(c.last_callees.iter().copied());
             slots.extend(c.last_thunks.iter().copied());
@@ -22058,20 +22104,20 @@ unsafe fn realtime_refs(up: *mut Unit, id: u32) -> (Vec<u32>, Vec<u32>) {
         } else if matches!(u.fns[id as usize].key, FnKey::Inst(..) | FnKey::Closure(..)) && build_rir(up, id).is_ok() {
             let u = &*up;
             if let Some(r) = u.fns[id as usize].rir.clone() {
-                realtime_rir_refs(u, &r, &mut slots, &mut dyns);
+                realtime_rir_refs(u, &r, &mut slots);
             }
         }
-        // bodies inlined into it: their trait-object calls are its calls now
+        // bodies inlined into it: what they call is what it calls now
         if let Some(deps) = (&*up).body_deps.get(&id) {
             slots.extend(deps.iter().copied());
         }
-        (slots, dyns)
+        slots
     }));
     RT_KEEP.with(|k| k.set(was));
     r.unwrap_or_default()
 }
 
-fn realtime_rir_refs(u: &Unit, f: &relax_backend::rir::Func, slots: &mut Vec<u32>, dyns: &mut Vec<u32>) {
+fn realtime_rir_refs(u: &Unit, f: &relax_backend::rir::Func, slots: &mut Vec<u32>) {
     use relax_backend::rir::{Callee, Inst};
     for b in &f.blocks {
         for i in &b.insts {
@@ -22086,7 +22132,6 @@ fn realtime_rir_refs(u: &Unit, f: &relax_backend::rir::Func, slots: &mut Vec<u32
             }
         }
     }
-    dyns.extend(f.dyn_calls.iter().copied());
 }
 
 /// A vtable was made (Unit::vtable): one of a trait-object type real-time code calls through is
