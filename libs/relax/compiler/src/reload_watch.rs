@@ -375,9 +375,10 @@ mod tests {
         let mut watch = super::Watch::new(std::iter::once(source.to_str().unwrap())).unwrap();
         if !cfg!(target_os = "linux") {
             // FSEvents may still report the write just before the stream started (fseventsd
-            // had not processed it yet); a stray event costs the caller one stat.
+            // had not processed it yet), or may not: drain it either way (a stray event costs
+            // the caller one stat)
             std::thread::sleep(std::time::Duration::from_millis(300));
-            assert!(watch.changed().is_some());
+            watch.changed();
         }
         std::fs::write(&unrelated, "unrelated").unwrap();
         if !cfg!(target_os = "linux") { std::thread::sleep(std::time::Duration::from_millis(300)); }
