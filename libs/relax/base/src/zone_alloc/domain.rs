@@ -176,6 +176,11 @@ pub fn before_wait() {
     unsafe { compiler::domain_wait() }
 }
 
+/// The wait `before_wait` announced has ended.
+pub fn after_wait() {
+    compiler::domain_wait_done()
+}
+
 /// Every live domain heap returns its free pages (warm chunks, all-free granules of detached
 /// chunks; memstat::trim): a program heap is trimmed like the compiler's (Scope: 100 MB in use,
 /// 226 MB resident). The heaps are leased under the registry lock and trimmed outside it.
@@ -704,6 +709,61 @@ mod tests {
             program_dealloc(stay, 200, 8);
             enter(std::ptr::null());
         }
+    }
+
+    fn heap_epoch_bump(addr: usize) {
+        let heap: &DomainHeap = unsafe { &*(addr as *const DomainHeap) };
+        heap.inner.arena.densify(0);
+    }
+
+    /// A thread blocked in a wait keeps its current chunks; what other threads free into them
+    /// meanwhile is settled for it by the monitor (`densify`), and the owner, waking, goes on
+    /// allocating from them.
+    #[test]
+    fn the_monitor_settles_a_waiting_owners_chunk() {
+        symbol(b"relax_alloc");
+        let heap = DomainHeap::new().unwrap();
+        let addr = &*heap as *const DomainHeap as usize;
+        let (to_owner, owner_rx) = std::sync::mpsc::channel::<()>();
+        let (blocks_tx, blocks_rx) = std::sync::mpsc::channel::<Vec<usize>>();
+        let owner = std::thread::spawn(move || unsafe {
+            enter(addr as *const DomainHeap);
+            let blocks: Vec<usize> = (0..6000).map(|_| program_alloc(200, 8) as usize).collect();
+            let stay = program_alloc(200, 8);
+            std::ptr::write_bytes(stay, 5, 200);
+            // a wait: announced (its own pass runs now, before the frees), then blocked until
+            // the test lets it go (the channels are the native heap's)
+            heap_epoch_bump(addr);
+            before_wait();
+            blocks_tx.send(blocks).unwrap();
+            owner_rx.recv().unwrap();
+            after_wait();
+            assert_eq!(*stay, 5);
+            let again: Vec<*mut u8> = (0..6000).map(|_| program_alloc(200, 8)).collect();
+            for &p in &again {
+                std::ptr::write_bytes(p, 6, 200);
+            }
+            for p in again {
+                assert_eq!(*p, 6);
+                program_dealloc(p, 200, 8);
+            }
+            program_dealloc(stay, 200, 8);
+            enter(std::ptr::null());
+        });
+        unsafe {
+            enter(&*heap);
+            for p in blocks_rx.recv().unwrap() {
+                program_dealloc(p as *mut u8, 200, 8);
+            }
+            enter(std::ptr::null());
+        }
+        let pending = |h: &DomainHeap| h.states()[27];
+        assert!(pending(&heap) >= 6000 * 200, "the frees wait on the owner's remote list: {}", pending(&heap));
+        heap.inner.arena.densify(0);
+        assert_eq!(pending(&heap), 0, "the monitor settled the waiting owner's chunk");
+        assert!(heap.states()[24] < 64 << 10, "its free pages went back: {}", heap.states()[24]);
+        to_owner.send(()).unwrap();
+        owner.join().unwrap();
     }
 
     #[test]

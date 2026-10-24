@@ -1324,6 +1324,7 @@ pub extern "C" fn relax_wait_enter(kind: u32, addr: usize, holder: usize) {
 }
 
 pub extern "C" fn relax_wait_leave() {
+    crate::zone_alloc::domain::after_wait();
     crate::waits::leave();
 }
 

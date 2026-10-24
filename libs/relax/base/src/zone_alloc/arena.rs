@@ -168,7 +168,7 @@ thread_local! {
     static DOMAIN_EXIT_GUARD: DomainExitGuard = const { DomainExitGuard };
     /// The domain arena this thread is inside and its chunk cache of it (`DomainTls`).
     static DOMAIN: DomainTls = const {
-        DomainTls { arena: Cell::new(std::ptr::null()), id: Cell::new(0), current: Cell::new([NO_CURRENT; CLASSES]), pass: Cell::new(0) }
+        DomainTls { arena: Cell::new(std::ptr::null()), id: Cell::new(0), current: Cell::new([NO_CURRENT; CLASSES]), pass: Cell::new(0), quiet: AtomicU8::new(QUIET_RUNNING) }
     };
 }
 
@@ -184,7 +184,14 @@ struct DomainTls {
     current: Cell<[Current; CLASSES]>,
     /// The trim epoch of the thread's last pass over all its current chunks (`owner_pass`)
     pass: Cell<usize>,
+    /// Whether the thread is blocked in a wait (`domain_wait` .. `domain_wait_done`) and so does
+    /// not touch its current chunks: QUIET_WAITING lets the monitor take one (QUIET_SETTLING) and
+    /// settle it for the owner (`densify`); the owner, waking, waits until it is handed back.
+    quiet: AtomicU8,
 }
+const QUIET_RUNNING: u8 = 0;
+const QUIET_WAITING: u8 = 1;
+const QUIET_SETTLING: u8 = 2;
 /// The calling thread's `DomainTls`. A const thread-local without drop glue cannot fail.
 #[inline(always)]
 fn domain_tls() -> &'static DomainTls {
@@ -481,7 +488,12 @@ struct Chunk {
     /// RMW, a detached chunk adds under the lock. Live bytes = account - remote_bytes.
     account: AtomicUsize,
     owned: UnsafeCell<Owned>,
-    _line: [usize; 2],
+    /// Program heaps, while the chunk is attached: the owner thread's `DomainTls::quiet` (0: none).
+    /// Set at attach and cleared at handoff, both under the chunk's lock, so a thread holding the
+    /// lock may read it: the owner's thread-local record outlives its attached chunks (a thread
+    /// hands every chunk back before its thread-locals go, DomainExitGuard).
+    owner_quiet: AtomicUsize,
+    _line: [usize; 1],
     remote: AtomicUsize, // NONE: detached (and closes publication during handoff)
     remote_bytes: AtomicUsize,
     live: AtomicUsize,
@@ -867,7 +879,8 @@ impl Arena {
                 Chunk {
                     account: AtomicUsize::new(0),
                     owned: UnsafeCell::new(Owned { free: 0, bump: AtomicUsize::new(0), stride: 0, live: AtomicUsize::new(0), trim_seen: 0 }),
-                    _line: [0; 2],
+                    owner_quiet: AtomicUsize::new(0),
+                    _line: [0; 1],
                     remote: AtomicUsize::new(NONE),
                     remote_bytes: AtomicUsize::new(0),
                     live: AtomicUsize::new(0),
@@ -1039,6 +1052,10 @@ impl Arena {
     unsafe fn attach(&self, h: &Chunk, s: &State) {
         // (a chunk taken from the lists had its free pages released there: no trim before the next epoch)
         *h.owned.get() = Owned { free: s.free, bump: AtomicUsize::new(s.bump), stride: s.stride, live: AtomicUsize::new(h.live.load(Ordering::Relaxed)), trim_seen: self.trim_epoch.load(Ordering::Relaxed) };
+        if self.dynamic {
+            let q = DOMAIN.try_with(|t| &t.quiet as *const AtomicU8 as usize).unwrap_or(0);
+            h.owner_quiet.store(q, Ordering::Relaxed);
+        }
         h.remote.store(0, Ordering::Release);
     }
     /// Takes the blocks other threads freed into the owner's free list.
@@ -1056,6 +1073,7 @@ impl Arena {
     unsafe fn handoff(&self, index: usize, s: &mut State) {
         let h = &self.headers[index];
         self.drain(h, h.remote.swap(NONE, Ordering::AcqRel));
+        h.owner_quiet.store(0, Ordering::Relaxed);
         let o = &*h.owned.get();
         s.free = o.free;
         s.bump = o.bump.load(Ordering::Relaxed);
@@ -1134,6 +1152,33 @@ impl Arena {
         if let Some(head) = self.drop_free_granules(index, chunk, o.stride, bump, o.free) {
             o.free = head;
         }
+    }
+    /// The monitor (`densify`, chunk `index` attached, its lock held) settles a current chunk whose
+    /// owner is blocked in a wait, as the owner's own pass would: the blocks other threads freed
+    /// into it are its free list's again, and, sparse, it gives its whole free pages back. A pool
+    /// worker that did a job and now waits for the next kept what the others freed of its blocks
+    /// (Scope: 25-55 MB on the remote lists of waiting workers). The owner's `quiet` word makes it
+    /// safe: taken from QUIET_WAITING, the owner, waking, waits for it to be handed back.
+    unsafe fn settle_for_waiting_owner(&self, index: usize, h: &Chunk, epoch: usize) {
+        let q = h.owner_quiet.load(Ordering::Relaxed);
+        if !COMPILER || q == 0 || h.remote.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let q = &*(q as *const AtomicU8);
+        if q.compare_exchange(QUIET_WAITING, QUIET_SETTLING, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            return;
+        }
+        self.drain(h, h.remote.swap(0, Ordering::Acquire));
+        let o = &mut *h.owned.get();
+        let (live, bump) = (o.live.load(Ordering::Relaxed), o.bump.load(Ordering::Relaxed));
+        if bump >= OWNED_TRIM_MIN && live * o.stride * 4 < bump && o.trim_seen != epoch {
+            o.trim_seen = epoch;
+            let chunk = self.base.load(Ordering::Relaxed) + index * CHUNK;
+            if let Some(head) = self.drop_free_granules(index, chunk, o.stride, bump, o.free) {
+                o.free = head;
+            }
+        }
+        q.store(QUIET_WAITING, Ordering::Release);
     }
     /// The owner thread `t` of this program heap settles its current chunks (`domain_wait`, the
     /// first tick of an epoch): what other threads freed into them is its own again, an emptied
@@ -1334,14 +1379,17 @@ impl Arena {
             return 0;
         }
         // (the pass is the monitor's second: the threads' current chunks may trim again)
-        self.trim_epoch.fetch_add(1, Ordering::Relaxed);
-        if !os::THP {
-            return 0;
-        }
+        let epoch = self.trim_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         let mut done = 0;
         for (index, h) in self.headers.iter().enumerate() {
             let s = lock(&h.state);
             if s.committed == 0 || s.released {
+                continue;
+            }
+            if s.attached && s.stride != 0 {
+                unsafe { self.settle_for_waiting_owner(index, h, epoch) };
+            }
+            if !os::THP {
                 continue;
             }
             let address = base + index * CHUNK;
@@ -2558,6 +2606,20 @@ pub unsafe fn domain_wait() {
                 t.pass.set(epoch);
                 a.owner_pass(t);
             }
+            // from here until `domain_wait_done` the thread does not touch its chunks
+            t.quiet.store(QUIET_WAITING, Ordering::Release);
+        }
+    });
+}
+/// The wait `domain_wait` announced has ended: the thread takes its chunks back (it waits while
+/// the monitor settles one of them, a bounded pass under that chunk's lock).
+pub fn domain_wait_done() {
+    let _ = DOMAIN.try_with(|t| {
+        while t.quiet.load(Ordering::Relaxed) != QUIET_RUNNING {
+            if t.quiet.compare_exchange(QUIET_WAITING, QUIET_RUNNING, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                break;
+            }
+            std::hint::spin_loop();
         }
     });
 }
