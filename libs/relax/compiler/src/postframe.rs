@@ -227,7 +227,7 @@ fn short_fn(name: &str) -> String {
             depth == 0
         });
         if let Some((e, _)) = end {
-            path.push_str(inner[..e].split(" as ").next().unwrap_or(""));
+            path.push_str(inner[..e].split(" as ").next().unwrap_or("").trim_start_matches('<'));
             rest = &inner[e + 1..];
         }
     }
@@ -268,7 +268,7 @@ mod tests {
         assert_eq!(short_fn("<a::Foo<u8> as core::Bar>::baz [unverified]"), "Foo::baz [unverified]");
         assert_eq!(short_fn("x::Vec<T>::push"), "Vec::push");
         assert_eq!(short_fn("main"), "main");
-        assert_eq!(short_fn("<<T as Tr>::X>::f"), "f");
+        assert_eq!(short_fn("<<T as Tr>::X>::f"), "T::f");
         assert!(!short_fn("<{closure}> [unverified]").starts_with(' '));
     }
 }
