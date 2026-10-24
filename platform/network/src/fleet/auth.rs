@@ -236,11 +236,7 @@ impl Keyring {
     /// else a node's, in its hub cache (`$MAKEPAD_ASSET_AI_CACHE/fleet`, default
     /// `~/.makepad/weights/fleet`). The two places `ai-fleet` puts it.
     pub fn load_local() -> Result<Self, String> {
-        let cache = std::env::var_os("MAKEPAD_ASSET_AI_CACHE")
-            .filter(|dir| !dir.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| super::makepad_home().join("weights"));
-        let dirs = [client_dir().join("admin"), cache.join("fleet")];
+        let dirs = [client_dir().join("admin"), node_fleet_dir()];
         for dir in &dirs {
             if dir.join(FLEET_KEY).exists() {
                 return Self::load(dir);
@@ -320,13 +316,26 @@ pub fn set_node_credential(text: Option<String>) {
     let _ = NODE_CREDENTIAL_TEXT.set(text);
 }
 
-/// This process's credential: a node's own, else `MAKEPAD_AI_HUB_CREDENTIAL`,
-/// else `~/.makepad/ai-hub/client.credential`.
+/// A node's fleet directory: its hub cache's `fleet` (`$MAKEPAD_ASSET_AI_CACHE/fleet`,
+/// default `~/.makepad/weights/fleet`), where `ai-fleet node-files` puts `fleet.key`
+/// and `node.credential`.
+pub fn node_fleet_dir() -> PathBuf {
+    std::env::var_os("MAKEPAD_ASSET_AI_CACHE")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| super::makepad_home().join("weights"))
+        .join("fleet")
+}
+
+/// This process's credential: a node's own (set at start, else the node fleet
+/// dir's `node.credential`), else `MAKEPAD_AI_HUB_CREDENTIAL`, else
+/// `~/.makepad/ai-hub/client.credential`.
 pub fn own_credential() -> Option<Credential> {
     let text = NODE_CREDENTIAL_TEXT
         .get()
         .cloned()
         .flatten()
+        .or_else(|| fs::read_to_string(node_fleet_dir().join(NODE_CREDENTIAL)).ok())
         .or_else(|| std::env::var("MAKEPAD_AI_HUB_CREDENTIAL").ok())
         .or_else(|| fs::read_to_string(client_dir().join(CLIENT_CREDENTIAL)).ok())?;
     Credential::parse(&text)
