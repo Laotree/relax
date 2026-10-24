@@ -3906,17 +3906,10 @@ impl Unit {
             _ => return,
         };
         let (Some(sn), Some(cs)) = (self.syms.find_foreign(sin), self.syms.find_foreign(cos)) else { return };
-        let p = if cfg!(target_vendor = "apple") {
-            unsafe { os::proc::find(format!("{}\0", both).as_ptr()) }
-        } else if wide {
-            sincos_pair as *mut u8
-        } else {
-            sincosf_pair as *mut u8
-        };
-        if p.is_null() {
-            return;
-        }
-        relax_codegen::opt::set_sincos(wide, sn, cs, self.syms.intern(crate::syms::SymKind::Foreign(both.to_string()), p as u64));
+        let Some(p) = sincos_addr(both) else { return };
+        // a runtime symbol, named in the disk cache by its name (a foreign one is named by its
+        // declaration, which this routine has none of: code calling it was never stored)
+        relax_codegen::opt::set_sincos(wide, sn, cs, self.syms.intern(crate::syms::SymKind::Rt(both), p));
     }
 
     /// Whether `func` calls std's `sin` and `cos` methods (before inlining): such a function is
@@ -11441,6 +11434,18 @@ fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(re
 /// (`note_sincos`): Darwin arm64 and x86-64 glibc.
 const SINCOS_TARGET: bool = cfg!(any(all(target_vendor = "apple", target_arch = "aarch64"), all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")));
 
+/// The combined sin/cos routine `name` (note_sincos's names: Darwin's libm `__sincos_stret` /
+/// `__sincosf_stret`, else the pair wrappers here), for its runtime symbol (cache links too).
+pub(crate) fn sincos_addr(name: &str) -> Option<u64> {
+    let p = match name {
+        "__sincos_stret" | "__sincosf_stret" if cfg!(target_vendor = "apple") => unsafe { os::proc::find(format!("{}\0", name).as_ptr()) },
+        "relax_sincos_pair" if !cfg!(target_vendor = "apple") => sincos_pair as *mut u8,
+        "relax_sincosf_pair" if !cfg!(target_vendor = "apple") => sincosf_pair as *mut u8,
+        _ => return None,
+    };
+    (!p.is_null()).then_some(p as u64)
+}
+
 /// glibc's `sincos` with both results returned in registers: a struct of two doubles comes back
 /// in xmm0 and xmm1 (SysV), where the optimiser's combined call reads them.
 #[repr(C)]
@@ -15220,6 +15225,10 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
         // was gone (`makepad check makepad-example-uizoo` hung ~1 run in 20-50; the panic was
         // silent: build_rir's hook)
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { compile_tier1(up, id) }));
+        if tier1_trace() {
+            let name = owner::publish(|| unsafe { (&*up).fns[id as usize].name.to_string() });
+            eprintln!("O3 done #{} ({}) {}: {}", id, Q_WHY.get(why as usize).copied().unwrap_or("?"), name, match &r { Ok(true) => "installed", Ok(false) => "dropped", Err(_) => "panicked" });
+        }
         if let Err(p) = r {
             crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_PANIC, 0, 0, 0);
             let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned())
@@ -16493,9 +16502,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // never run -> built again at its first run (cold_users), as the snapshot's
                 // never-run candidates are; its RIR being built on another thread at the walk ->
                 // built again when its RIR is set (body_users; at once when it is set already);
-                // unverified -> UNVERIFIED_LEFT. Those make the build incomplete: it depends on
-                // which build finished first, so it is not cached (the warm image would keep the
-                // missing inline forever).
+                // unverified -> UNVERIFIED_LEFT. Those make the build incomplete (this run builds
+                // it again when the body comes), yet its code is valid as built: it is stored like
+                // any other build. A stored O3 entry is valid iff its inputs are unchanged -- the
+                // key (its own body, the loader build id) and the certificate of the slots it
+                // inlined (record_deps) -- so a warm launch installs it as it is, whatever that
+                // launch has loaded or run yet: a callee kept as a call stays a call.
                 let mut incomplete = !unverified_left.is_empty();
                 let mut body_again = false;
                 // (inspect why-tier: per kept callee its state and what builds this slot again)
@@ -16551,7 +16563,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                             None => agg.push((w, 1, short_name(&u.fns[c as usize].name).to_string())),
                         }
                     }
-                    let txt = format!("at {:.2} s: {}; root {}; {}", wall_ns() as f64 / 1e9, if incomplete { "INCOMPLETE (not cached)" } else { "complete" },
+                    let txt = format!("at {:.2} s: {}; root {}; {}", wall_ns() as f64 / 1e9, if incomplete { "incomplete (built again when the bodies come)" } else { "complete" },
                         if root_unverified { "unverified" } else { "verified" },
                         if agg.is_empty() { "no kept callee notes".to_string() } else { agg.iter().map(|(w, n, e)| format!("{} x{} (e.g. {})", w, n, e)).collect::<Vec<_>>().join("; ") });
                     let mut m = O3_BUILD_NOTES.lock().unwrap_or_else(|e| e.into_inner());
@@ -16573,7 +16585,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                         if !callees.contains(&c) { s.push('-'); }
                         s
                     };
-                    eprintln!("O3 #{} {}: incomplete build, not cached; calls kept without a body: {}", id, short_name(&u.fns[id as usize].name),
+                    eprintln!("O3 #{} {}: incomplete build; calls kept without a body: {}", id, short_name(&u.fns[id as usize].name),
                         absent.iter().map(|&c| format!("#{} {}[{}]", c, short_name(&u.fns[c as usize].name), st(c))).collect::<Vec<_>>().join(", "));
                 }
                 let frame_max = if recursive { TIER1_CACHE_FRAME_MAX } else { TIER1_CACHE_FRAME_MAX_FLAT };
@@ -16599,9 +16611,13 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     use crate::cache::warm_count as wc;
                     wc::add(if unverified { wc::O3_UNVERIFIED } else if speculative || inspect_o3_on() { wc::O3_SPEC } else if frame_size > frame_max { wc::O3_FRAME } else { wc::O3_QUEUED }, 1);
                 }
+                if tier1_trace() {
+                    eprintln!("O3 keep #{} {}: {}", id, short_name(&u.fns[id as usize].name),
+                        if unverified { "no (unverified)" } else if speculative || inspect_o3_on() { "no (speculative/inspect)" } else if frame_size > frame_max { "no (frame)" } else if t1prof_on(options) { "no (deterministic O3)" } else if incomplete { "entry (incomplete)" } else { "entry" });
+                }
                 // (deterministic O3 runs cache no O3 code: a later record or replay links none, every O3
                 // slot of theirs is a recorded build)
-                if frame_size <= frame_max && !unverified && !speculative && !incomplete && !inspect_o3_on() && !t1prof_on(options) {
+                if frame_size <= frame_max && !unverified && !speculative && !inspect_o3_on() && !t1prof_on(options) {
                     // its key and certificate encoding in the bounded record batches (records_due),
                     // not in this publish
                     if let Some(mut c) = u.cache.take() {
