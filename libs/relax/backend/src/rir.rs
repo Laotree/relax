@@ -1165,12 +1165,20 @@ pub struct Slot {
     pub ret: bool,
 }
 
-/// The bytes a callee may read or write through a pointer argument, relative to that pointer:
-/// `[lo, hi)` (`lo == hi`: none), or None when not known (anywhere it can reach). LLVM gets the
-/// same from `dereferenceable` + memory-access attributes after FunctionAttrs; `Arc::drop_slow`
-/// touches only `[0, 8)` of the `&mut Arc` it gets, so the caller's other bytes around that field
-/// stay its own (coalesce_slot_copies).
-pub type Extent = Option<(i32, i32)>;
+/// The bytes a callee may read and the bytes it may write through a pointer argument, relative
+/// to that pointer: `[lo, hi)` each (`lo == hi`: none). LLVM gets the same from FunctionAttrs'
+/// memory effects (`readonly` / `writeonly` params) and `dereferenceable`: `Arc::drop_slow` only
+/// reads `[0, 8)` of the `&mut Arc` it gets, so the caller's bytes of a value around that field,
+/// and that field itself, stay as they were (coalesce_slot_copies).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Access {
+    pub read: (i32, i32),
+    pub write: (i32, i32),
+}
+
+/// A callee's `Access` through a pointer argument; None when not known (anywhere it can reach,
+/// read and written).
+pub type Extent = Option<Access>;
 
 #[derive(Clone)]
 pub struct Func {

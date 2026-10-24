@@ -348,11 +348,12 @@ fn nocapture_call_writing_a_slot_while_its_partner_lives_keeps_them_apart() {
     assert_eq!(copies(&f), 1);
 }
 
-/// B = (n, 1); g(&B.0); C = B; g(&B.1); return C.0 -- `g` keeps no copy of its argument and
-/// touches `ext` of it. With [0, 8) the second call writes only B.1, whose bytes in C are dead
-/// after it (only C.0 is read): B and C join. Not knowing the extent, the call may write B.0
-/// while C.0 is live: apart (Arc::drop_slow's `&mut Arc` in reconcile's entry tuple).
-fn nocapture_ext_build(ext: Extent) -> Func {
+/// B = (n, 1); g(&B.0); C = B; g(&B.1); return C.0 + C.1 (`tail`: C.0 only) -- `g` keeps no copy
+/// of its argument and touches `ext` of it. Writing [0, 8), the second call writes only B.1,
+/// whose bytes in C are dead after it when only C.0 is read: B and C join. Only reading, it writes
+/// nothing: they join with C.1 read too (Arc::drop_slow reads the `&mut Arc` of reconcile's entry
+/// tuple). Not knowing its access, the call may write B.0 while C.0 is live: apart.
+fn nocapture_ext_build(ext: Extent, tail: bool) -> Func {
     let mut f = Func::new("slot_coalesce_nocapture_ext".into(), 0);
     let n = f.vreg(Cls::I);
     f.params.push(n);
@@ -360,7 +361,7 @@ fn nocapture_ext_build(ext: Extent) -> Func {
     let (sb, sc_) = (f.slot(16, 8), f.slot(16, 8));
     f.block();
     let v = |f: &mut Func| f.vreg(Cls::I);
-    let (pb, pb8, pc, one, a) = (v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f));
+    let (pb, pb8, pc, one, a, b, s) = (v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f));
     let g = Callee::Fn(5);
     push(&mut f, 0, Inst::SlotAddr(pb, sb));
     push(&mut f, 0, Inst::IBinI(IOp::Add, U64, pb8, pb, 8));
@@ -372,21 +373,44 @@ fn nocapture_ext_build(ext: Extent) -> Func {
     push(&mut f, 0, Inst::Copy(pc, pb, 16));
     push(&mut f, 0, Inst::Call(g.clone(), vec![pb8], vec![]));
     push(&mut f, 0, Inst::Load(Mem::Int(8, false), a, pc, 0));
-    f.blocks[0].term = Term::Ret(vec![a]);
+    if tail {
+        f.blocks[0].term = Term::Ret(vec![a]);
+    } else {
+        push(&mut f, 0, Inst::Load(Mem::Int(8, false), b, pc, 8));
+        push(&mut f, 0, Inst::IBin(IOp::Add, U64, s, a, b));
+        f.blocks[0].term = Term::Ret(vec![s]);
+    }
     f.nocapture.push((g, 0, false, ext));
     f
 }
 
+const RW8: Access = Access { read: (0, 8), write: (0, 8) };
+const R8: Access = Access { read: (0, 8), write: (0, 0) };
+
 #[test]
-fn nocapture_call_touching_only_dead_bytes_joins() {
-    let mut f = nocapture_ext_build(Some((0, 8)));
+fn nocapture_call_writing_only_dead_bytes_joins() {
+    let mut f = nocapture_ext_build(Some(RW8), true);
     assert!(opt::coalesce_slot_copies(&mut f, true), "{}", f.dump());
     assert_eq!(copies(&f), 0);
 }
 
 #[test]
-fn nocapture_call_of_unknown_extent_keeps_them_apart() {
-    let mut f = nocapture_ext_build(None);
+fn nocapture_call_writing_live_bytes_keeps_them_apart() {
+    let mut f = nocapture_ext_build(Some(RW8), false);
+    assert!(!opt::coalesce_slot_copies(&mut f, true));
+    assert_eq!(copies(&f), 1);
+}
+
+#[test]
+fn nocapture_call_only_reading_joins() {
+    let mut f = nocapture_ext_build(Some(R8), false);
+    assert!(opt::coalesce_slot_copies(&mut f, true), "{}", f.dump());
+    assert_eq!(copies(&f), 0);
+}
+
+#[test]
+fn nocapture_call_of_unknown_access_keeps_them_apart() {
+    let mut f = nocapture_ext_build(None, true);
     assert!(!opt::coalesce_slot_copies(&mut f, true));
     assert_eq!(copies(&f), 1);
 }
@@ -417,13 +441,14 @@ fn extent_callee(variable: bool) -> Func {
 
 #[test]
 fn param_extent_from_accesses_and_calls() {
-    let sub = |c: &Callee, _k: usize| matches!(c, Callee::Fn(9)).then_some((false, Some((-2, 6))));
-    assert_eq!(opt::param_escape(&extent_callee(false), 0, &sub), Some((false, Some((0, 22)))));
+    let sub = |c: &Callee, _k: usize| matches!(c, Callee::Fn(9)).then_some((false, Some(Access { read: (-2, 6), write: (0, 0) })));
+    // reads: [0, 8) and the call's [14, 22); writes: [12, 16)
+    assert_eq!(opt::param_escape(&extent_callee(false), 0, &sub), Some((false, Some(Access { read: (0, 22), write: (12, 16) }))));
     assert_eq!(opt::param_escape(&extent_callee(true), 0, &sub), Some((false, None)));
     let unknown = |c: &Callee, _k: usize| matches!(c, Callee::Fn(9)).then_some((false, None));
     assert_eq!(opt::param_escape(&extent_callee(false), 0, &unknown), Some((false, None)));
     // the second parameter is not used here: nothing is touched through it
-    assert_eq!(opt::param_escape(&extent_callee(false), 1, &sub), Some((false, Some((0, 0)))));
+    assert_eq!(opt::param_escape(&extent_callee(false), 1, &sub), Some((false, Some(Access { read: (0, 0), write: (0, 0) }))));
 }
 
 /// f(n): A = (n, 2n); C = A (a move); flag = `moved`; C.0 = n + 5; then `if flag == 0 { A.0 }
