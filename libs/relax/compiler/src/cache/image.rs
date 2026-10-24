@@ -1420,7 +1420,14 @@ impl Linker {
         // left lazy, the first call links the entry (O2 code, marked: no build of it again).
         // Prelinking the image's lower-tier code would run it and build the entry's code again
         // on every launch (the image is made again past 2% of such slots: record_manifest).
-        if matches!(s.tier, TIER_O1 | TIER_BASE) && self.cache().entry_tier(s.entry).is_some_and(|t| t == TIER_O2 || t == TIER_O3) {
+        // PGO9 EXPERIMENT (MAKEPAD_RUN_IMG_RANK=1): any higher tier, verified O1 over baseline too
+        static RANK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let rank = *RANK.get_or_init(|| std::env::var("MAKEPAD_RUN_IMG_RANK").is_ok_and(|v| v == "1"));
+        if rank {
+            if self.cache().entry_tier(s.entry).is_some_and(|t| super::tier_rank(t) > super::tier_rank(s.tier)) {
+                return false;
+            }
+        } else if matches!(s.tier, TIER_O1 | TIER_BASE) && self.cache().entry_tier(s.entry).is_some_and(|t| t == TIER_O2 || t == TIER_O3) {
             return false;
         }
         let nk = need.len();
