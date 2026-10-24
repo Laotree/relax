@@ -141,7 +141,17 @@ const STRIDE: [usize; CLASSES] = {
     }
     t
 };
+/// Compiler arena: bumped by every trim. A thread whose current chunks predate the last trim
+/// hands them all back on its next allocation slow path (`alloc_slow`), so the trim after that
+/// can release their free pages: a busy thread (the owner, the UI thread, an O3 worker) never
+/// goes idle and would otherwise keep its chunks attached, out of every trim's reach, and the
+/// frees other threads queued on them unapplied. At most one hand-back per thread per trim.
+static HAND_BACK: AtomicU64 = AtomicU64::new(0);
 thread_local! {
+    /// The `HAND_BACK` epoch this thread's current chunks were last handed back at.
+    static HAND_SEEN: Cell<u64> = const { Cell::new(0) };
+    /// This thread takes only fresh chunks, never ones listed with free slots (`fresh_chunks`).
+    static FRESH: Cell<bool> = const { Cell::new(false) };
     static DEPTH: Cell<usize> = const { Cell::new(0) };
     static CURRENT: Cell<[Current; CLASSES]> = const { Cell::new([NO_CURRENT; CLASSES]) };
     /// The thread's TLS destructors have started: its chunks are handed back and it takes no new
@@ -411,6 +421,22 @@ pub fn scratch(runtime: &crate::options::RuntimeOptions) -> ScratchGuard {
     enter_scratch()
 }
 
+/// Until the guard drops, this thread's compiler-arena blocks come from fresh chunks only: state
+/// built to replace old state (a settle rebuild's restore and replace) is not scattered into the
+/// old state's partly free chunks, which would then hold it -- one live block per page -- once the
+/// old state is dropped. The thread's current chunks are handed back at both ends.
+pub struct FreshGuard(bool, PhantomData<*mut ()>);
+impl Drop for FreshGuard {
+    fn drop(&mut self) {
+        DEFAULT.detach_thread();
+        let _ = FRESH.try_with(|f| f.set(self.0));
+    }
+}
+pub fn fresh_chunks() -> FreshGuard {
+    DEFAULT.detach_thread();
+    FreshGuard(FRESH.try_with(|f| f.replace(true)).unwrap_or(false), PhantomData)
+}
+
 /// A guard that enters nothing (the job arena is off).
 pub fn no_scratch() -> ScratchGuard {
     ScratchGuard(false, PhantomData)
@@ -454,6 +480,12 @@ struct Chunk {
     live: AtomicUsize,
     /// Mirrors membership of the PARTIAL list (compiler arena); written under the PARTIAL lock.
     in_part: AtomicBool,
+    /// Domain heaps: the chunk's pages are marked for huge pages (`densify`). The mark belongs to
+    /// the address range, not to one use of the chunk: it is cleared when the pages go back.
+    huge: AtomicBool,
+    /// Committed before the last `mark_old` (a settle rebuild): `states` counts what such chunks
+    /// still hold apart (the cold state's survivors). Cleared when the chunk is carved anew.
+    old: AtomicBool,
     state: Mutex<State>,
 }
 unsafe impl Sync for Chunk {}
@@ -576,7 +608,13 @@ impl Partial {
     }
 }
 
-/// Granule of the page release: a multiple of every OS page size in use (4 KB, 16 KB).
+/// Granule of the page release: the OS page on x86-64 (4 KB), else a multiple of every page
+/// size in use there (4 KB, 16 KB). A chunk that keeps a few scattered blocks pins one granule
+/// each: after a settle rebuild the compiler arena held 120-220 MB live in 575-720 MB resident
+/// (Sandbox race) at 16 KB.
+#[cfg(target_arch = "x86_64")]
+const GRANULE: usize = 4 << 10;
+#[cfg(not(target_arch = "x86_64"))]
 const GRANULE: usize = 16 << 10;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
@@ -621,6 +659,23 @@ mod os {
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let _ = (base, size);
     }
+    /// Huge pages for program heaps are managed per chunk (`Arena::densify`).
+    pub const THP: bool = cfg!(any(target_os = "linux", target_os = "android"));
+    /// Marks `[base, base + size)` for huge pages and collapses it into them now (`on`), or takes
+    /// the mark away (khugepaged then leaves the range alone). Linux only.
+    pub unsafe fn huge_pages(base: usize, size: usize, on: bool) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            if on {
+                madvise(base as *mut c_void, size, 14); // MADV_HUGEPAGE
+                madvise(base as *mut c_void, size, 25); // MADV_COLLAPSE (6.1+; EINVAL before: khugepaged does it)
+            } else {
+                madvise(base as *mut c_void, size, 15); // MADV_NOHUGEPAGE
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let _ = (base, size, on);
+    }
     /// Reserves exactly `[at, at + size)`, or nothing (0): never moved, never over a mapping.
     pub unsafe fn reserve_at(at: usize, size: usize, label: &'static std::ffi::CStr) -> usize {
         // Linux: MAP_FIXED_NOREPLACE; macOS has none: the hint, kept only when it was honoured
@@ -641,6 +696,31 @@ mod os {
     }
     pub unsafe fn unreserve(base: usize, size: usize) {
         munmap(base as *mut c_void, size);
+    }
+    /// Resident bytes of `[at, at + size)` (mincore; diagnostics only).
+    pub unsafe fn resident(at: usize, size: usize) -> usize {
+        extern "C" {
+            fn mincore(addr: *mut c_void, len: usize, vec: *mut u8) -> i32;
+        }
+        const P: usize = 4096;
+        let mut v = [0u8; 512];
+        let (mut n, mut off) = (0, 0);
+        while off < size {
+            let len = (size - off).min(512 * P);
+            if mincore((at + off) as *mut c_void, len, v.as_mut_ptr()) != 0 {
+                return n;
+            }
+            let pages = (len + page_size() - 1) / page_size();
+            n += v[..pages.min(512)].iter().filter(|&&b| b & 1 != 0).count() * page_size();
+            off += len;
+        }
+        n
+    }
+    fn page_size() -> usize {
+        #[cfg(target_os = "macos")]
+        return 16 << 10;
+        #[cfg(not(target_os = "macos"))]
+        return 4 << 10;
     }
     pub unsafe fn commit(p: *mut u8, size: usize) -> bool {
         if mprotect(p.cast(), size, 1 | 2) != 0 {
@@ -687,6 +767,11 @@ mod os {
 mod os {
     use relax_session::win32::{MemoryBasicInformation, VirtualAlloc, VirtualFree, VirtualQuery};
     pub unsafe fn no_huge_pages(_base: usize, _size: usize) {}
+    pub const THP: bool = false;
+    pub unsafe fn huge_pages(_base: usize, _size: usize, _on: bool) {}
+    pub unsafe fn resident(_at: usize, _size: usize) -> usize {
+        0
+    }
     pub unsafe fn reserve(size: usize, align: usize, _label: &'static std::ffi::CStr) -> usize {
         let raw = VirtualAlloc(std::ptr::null_mut(), size + align, 0x2000, 1) as usize;
         if raw == 0 {
@@ -775,6 +860,8 @@ impl Arena {
                     remote_bytes: AtomicUsize::new(0),
                     live: AtomicUsize::new(0),
                     in_part: AtomicBool::new(false),
+                    huge: AtomicBool::new(false),
+                    old: AtomicBool::new(false),
                     state: Mutex::new(State {
                         released: true,
                         generation: 0,
@@ -1006,6 +1093,7 @@ impl Arena {
         }
         event(E_DECOMMIT);
         let address = self.base.load(Ordering::Relaxed) + index * CHUNK;
+        self.unhuge(index, address, s.committed);
         if os::decommit(address as *mut u8, s.committed, COMPILER) {
             self.committed.fetch_sub(s.committed, Ordering::Relaxed);
             self.chunks.fetch_sub((s.committed + CHUNK - 1) / CHUNK, Ordering::Relaxed);
@@ -1033,11 +1121,11 @@ impl Arena {
                         os::reserve(RESERVE, CHUNK, if self.dynamic { c"makepad-run-domain" } else { LABEL })
                     }
                 };
-                // the compiler and burst arenas. A domain heap (the program's heap, as its malloc
-                // would be) keeps them: without, Sandbox race warm frames took +4% UI-thread CPU
-                // and cold start +5 s node (timed A/B, JITMEM.REPORT.md); Scope's domain heap is
-                // then ~1 GB resident for 100 MB in use on such a Linux box
-                if base != 0 && !self.dynamic {
+                // every arena. A domain heap (the program's heap, as its malloc would be) gets
+                // them back per chunk once a chunk is dense (`densify`): huge pages everywhere cost
+                // Scope 2-2.4 GB resident for 100 MB in use, none at all cost Sandbox race warm
+                // frames +4% UI-thread CPU and cold start +5 s node (JITMEM.REPORT.md)
+                if base != 0 {
                     unsafe { os::no_huge_pages(base, RESERVE) };
                 }
                 self.base.store(base, Ordering::Release);
@@ -1123,6 +1211,129 @@ impl Arena {
             c[3] += live * s.stride;
             if live <= 4 {
                 c[4] += bump;
+            }
+        }
+        c
+    }
+    /// Domain heaps: the chunk's huge-page mark goes (its pages are going back, or it turned
+    /// sparse): khugepaged would otherwise fill a sparse chunk's holes back to 2 MB.
+    unsafe fn unhuge(&self, index: usize, address: usize, len: usize) {
+        if self.dynamic && self.headers[index].huge.swap(false, Ordering::Relaxed) {
+            os::huge_pages(address, len, false);
+        }
+    }
+    /// Domain heaps (Linux with transparent huge pages): a program heap's chunks are reserved
+    /// without huge pages, and only dense ones get them. A thread keeps a current chunk per size
+    /// class, so a program with 37 threads held 1212 chunks with 166 MB carved (Scope); with huge
+    /// pages everywhere, khugepaged turned every one of them into 2 MB resident (2-2.4 GB for 100
+    /// MB in use), while huge pages are worth having on dense heap data (Sandbox race UI-thread
+    /// CPU). Each pass marks for huge pages, and collapses at once: a thread's current chunk carved
+    /// at least half way, another small chunk at least half full of live blocks, a large block of a
+    /// whole 2 MB or more. A marked chunk no thread allocates in that fell under 1/8 live loses its
+    /// mark (the trim's page release then shrinks it). At most `budget` collapses per pass.
+    /// Returns the collapses done.
+    pub fn densify(&self, budget: usize) -> usize {
+        let base = self.base.load(Ordering::Relaxed);
+        if !self.dynamic || base == 0 || !os::THP {
+            return 0;
+        }
+        let mut done = 0;
+        for (index, h) in self.headers.iter().enumerate() {
+            let s = lock(&h.state);
+            if s.committed == 0 || s.released {
+                continue;
+            }
+            let address = base + index * CHUNK;
+            let huge = h.huge.load(Ordering::Relaxed);
+            if s.stride == 0 {
+                let whole = s.committed & !(CHUNK - 1);
+                if !huge && index == s.run && whole != 0 && done < budget {
+                    h.huge.store(true, Ordering::Relaxed);
+                    unsafe { os::huge_pages(address, whole, true) };
+                    done += 1;
+                }
+                continue;
+            }
+            // a thread's current chunk is hot whatever is live in it at this moment (a frame's
+            // temporaries come and go there): carved half way, it is dense enough
+            let attached = s.attached && COMPILER;
+            let dense = if attached {
+                // the owner thread updates it without the lock: a racy, approximate read
+                unsafe { (*h.owned.get()).bump.load(Ordering::Relaxed) >= CHUNK / 2 }
+            } else {
+                h.live.load(Ordering::Relaxed) * s.stride >= CHUNK / 2
+            };
+            if !huge && s.committed == CHUNK && dense && done < budget {
+                h.huge.store(true, Ordering::Relaxed);
+                unsafe { os::huge_pages(address, CHUNK, true) };
+                done += 1;
+            } else if huge && !attached && h.live.load(Ordering::Relaxed) * s.stride < CHUNK / 8 {
+                h.huge.store(false, Ordering::Relaxed);
+                unsafe { os::huge_pages(address, CHUNK, false) };
+            }
+        }
+        done
+    }
+    /// Where the committed bytes of the small chunks are, by chunk state, with what is resident
+    /// (mincore): rows [attached to a thread, listed for reuse, released (warm), detached and
+    /// unlisted (full)], columns [chunks, touched bytes, live slot bytes, resident bytes]; then
+    /// [large runs, committed, resident]; then [sparse chunks (live slots under 1/8 of touched),
+    /// their resident bytes]; then [chunks committed before the last `mark_old`, their live slot
+    /// bytes, their resident bytes] (`memory`'s arena states).
+    /// Does block `p` (of this arena) lie in a chunk marked old (`mark_old`)?
+    pub fn is_old(&self, p: *const u8) -> bool {
+        let base = self.base.load(Ordering::Relaxed);
+        let off = (p as usize).wrapping_sub(base);
+        base != 0 && off < RESERVE && self.headers[off / CHUNK].old.load(Ordering::Relaxed)
+    }
+    /// Every committed chunk is old from now on (`states`' last row; a settle rebuild calls it).
+    pub fn mark_old(&self) {
+        for h in self.headers.iter() {
+            let s = lock(&h.state);
+            h.old.store(s.committed != 0, Ordering::Relaxed);
+        }
+    }
+    pub fn states(&self) -> [usize; 24] {
+        let mut c = [0usize; 24];
+        let base = self.base.load(Ordering::Relaxed);
+        if base == 0 {
+            return c;
+        }
+        for (index, h) in self.headers.iter().enumerate() {
+            let s = lock(&h.state);
+            if s.committed == 0 {
+                continue;
+            }
+            let res = unsafe { os::resident(base + index * CHUNK, s.committed) };
+            if s.stride == 0 {
+                c[16] += 1;
+                c[17] += s.committed;
+                c[18] += res;
+                continue;
+            }
+            let (row, bump, live) = if s.released {
+                (2, s.bump.min(CHUNK), 0)
+            } else if s.attached {
+                // the owner thread updates these without the lock: a racy, approximate read
+                let o = h.owned.get();
+                unsafe { (0, (*o).bump.load(Ordering::Relaxed).min(CHUNK), (*o).live.load(Ordering::Relaxed)) }
+            } else if h.in_part.load(Ordering::Relaxed) {
+                (1, s.bump.min(CHUNK), h.live.load(Ordering::Relaxed))
+            } else {
+                (3, s.bump.min(CHUNK), h.live.load(Ordering::Relaxed))
+            };
+            c[row * 4] += 1;
+            c[row * 4 + 1] += bump;
+            c[row * 4 + 2] += live * s.stride;
+            c[row * 4 + 3] += res;
+            if row != 2 && live * s.stride * 8 < bump {
+                c[19] += 1;
+                c[20] += res;
+            }
+            if row != 2 && h.old.load(Ordering::Relaxed) {
+                c[21] += 1;
+                c[22] += live * s.stride;
+                c[23] += res;
             }
         }
         c
@@ -1255,6 +1466,10 @@ impl Arena {
     #[cold]
     #[inline(never)]
     unsafe fn pop_owned_slow(&self, index: usize, class: usize, accounted: usize) -> *mut u8 {
+        if self.hand_back_due() {
+            // alloc_slow hands every current chunk back (this one included) and allocates anew
+            return null_mut();
+        }
         let h = self.headers.get_unchecked(index);
         let o = &mut *h.owned.get();
         if h.remote.load(Ordering::Relaxed) != 0 {
@@ -1383,8 +1598,17 @@ impl Arena {
         if !self.dynamic {
             return;
         }
+        #[cfg(unix)]
         extern "C" {
             fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+        }
+        // (stderr without allocation; Windows has no C `write` to link against)
+        #[cfg(windows)]
+        unsafe fn write(_fd: i32, buf: *const u8, n: usize) -> isize {
+            use relax_session::win32::{GetStdHandle, WriteFile};
+            let mut done = 0u32;
+            WriteFile(GetStdHandle(-12i32 as u32), buf, n as u32, &mut done, std::ptr::null_mut());
+            done as isize
         }
         let mut b = [0u8; 900];
         let mut k = 0;
@@ -1471,14 +1695,23 @@ impl Arena {
         put(b"\n");
         unsafe { write(2, b.as_ptr(), k) };
     }
+    /// A trim ran since this thread last handed its current chunks back (compiler arena).
+    #[inline]
+    fn hand_back_due(&self) -> bool {
+        COMPILER && !self.dynamic && HAND_SEEN.try_with(|e| e.get()).map_or(false, |e| e != HAND_BACK.load(Ordering::Relaxed))
+    }
     #[cold]
     unsafe fn alloc_slow(&self, l: Layout, small: bool, class: usize, requested: usize) -> *mut u8 {
+        if self.hand_back_due() {
+            let _ = HAND_SEEN.try_with(|e| e.set(HAND_BACK.load(Ordering::Relaxed)));
+            self.detach_thread();
+        }
         let stride = if small { STRIDE[class] } else { 0 };
         let cache = small && self.cache_here();
         if cache && COMPILER && !self.dynamic {
             self.register_exit();
         }
-        if small && COMPILER {
+        if small && COMPILER && !(!self.dynamic && FRESH.try_with(|f| f.get()).unwrap_or(false)) {
             while let Some(i) = self.partial_pop(class) {
                 let p = self.from_partial(i, stride, class, requested, cache);
                 if !p.is_null() {
@@ -1561,6 +1794,7 @@ impl Arena {
                 dirty: warm_large.is_some(),
             };
             h.live.store(1, Ordering::Relaxed);
+            h.old.store(false, Ordering::Relaxed);
             if warm.is_none() {
                 self.committed.fetch_add(committed, Ordering::Relaxed);
                 self.chunks.fetch_add((committed + CHUNK - 1) / CHUNK, Ordering::Relaxed);
@@ -1849,6 +2083,7 @@ impl Arena {
         // the calling thread's own current chunks go back first (the lists are what the trim walks)
         if COMPILER && !self.dynamic {
             self.detach_thread();
+            let _ = HAND_SEEN.try_with(|e| e.set(HAND_BACK.fetch_add(1, Ordering::Relaxed) + 1));
         }
         self.warm_drain();
         // burst arena too: blocks that outlived their compile pin the chunks they were carved
@@ -1871,6 +2106,7 @@ impl Arena {
             let mut s = lock(&self.headers[e.0].state);
             let address = self.base.load(Ordering::Relaxed) + e.0 * CHUNK;
             event(E_DECOMMIT);
+            unsafe { self.unhuge(e.0, address, s.committed) };
             if !unsafe { os::decommit(address as *mut u8, s.committed, COMPILER) } {
                 continue;
             }
@@ -1887,6 +2123,7 @@ impl Arena {
             let address = self.base.load(Ordering::Relaxed) + index * CHUNK;
             // Released, and not reachable from an owner cache: safe to drop pages.
             event(E_DECOMMIT);
+            unsafe { self.unhuge(index, address, s.committed) };
             if !unsafe { os::decommit(address as *mut u8, s.committed, COMPILER) } {
                 continue; // quarantined, as in dealloc
             }
@@ -1955,6 +2192,7 @@ impl Arena {
             if released == 0 {
                 continue;
             }
+            unsafe { self.unhuge(index, chunk, CHUNK) };
             // pass 2: relink the free slots that do not touch a dropped granule
             let dropped = |k: usize| {
                 let (g0, g1) = (k * stride / GRANULE, ((k + 1) * stride - 1) / GRANULE);
@@ -2211,6 +2449,15 @@ pub fn detail() -> (usize, usize, usize, usize) {
 }
 pub fn census() -> [usize; 11] {
     DEFAULT.census()
+}
+pub fn states() -> [usize; 24] {
+    DEFAULT.states()
+}
+pub fn mark_old() {
+    DEFAULT.mark_old()
+}
+pub fn is_old(p: *const u8) -> bool {
+    DEFAULT.is_old(p)
 }
 #[inline(always)]
 pub unsafe fn alloc(l: Layout) -> *mut u8 {
