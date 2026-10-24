@@ -168,7 +168,7 @@ thread_local! {
     static DOMAIN_EXIT_GUARD: DomainExitGuard = const { DomainExitGuard };
     /// The domain arena this thread is inside and its chunk cache of it (`DomainTls`).
     static DOMAIN: DomainTls = const {
-        DomainTls { arena: Cell::new(std::ptr::null()), id: Cell::new(0), current: Cell::new([NO_CURRENT; CLASSES]) }
+        DomainTls { arena: Cell::new(std::ptr::null()), id: Cell::new(0), current: Cell::new([NO_CURRENT; CLASSES]), pass: Cell::new(0) }
     };
 }
 
@@ -182,6 +182,8 @@ struct DomainTls {
     arena: Cell<*const Arena>,
     id: Cell<usize>,
     current: Cell<[Current; CLASSES]>,
+    /// The trim epoch of the thread's last pass over all its current chunks (`owner_wait`)
+    pass: Cell<usize>,
 }
 /// The calling thread's `DomainTls`. A const thread-local without drop glue cannot fail.
 #[inline(always)]
@@ -1101,13 +1103,29 @@ impl Arena {
             self.release_emptied(index, class);
             return;
         }
-        let o = &mut *h.owned.get();
-        let bump = o.bump.load(Ordering::Relaxed);
-        if !self.dynamic || bump < OWNED_TRIM_MIN || live * o.stride * 4 >= bump {
+        if !self.dynamic {
             return;
         }
         let epoch = self.trim_epoch.load(Ordering::Relaxed);
-        if o.trim_seen == epoch {
+        // once per epoch the thread looks at all its current chunks, not only this one: the
+        // classes it stopped using keep what other threads freed into them (a thread that never
+        // waits in std, as a UI thread in its event loop, has no other moment for it). The pass
+        // looks at this chunk too.
+        let passed = DOMAIN.try_with(|t| {
+            if t.pass.get() != epoch && std::ptr::eq(t.arena.get(), self) {
+                t.pass.set(epoch);
+                self.owner_wait(t);
+                true
+            } else {
+                false
+            }
+        });
+        if passed == Ok(true) {
+            return;
+        }
+        let o = &mut *h.owned.get();
+        let bump = o.bump.load(Ordering::Relaxed);
+        if bump < OWNED_TRIM_MIN || live * o.stride * 4 >= bump || o.trim_seen == epoch {
             return;
         }
         o.trim_seen = epoch;
