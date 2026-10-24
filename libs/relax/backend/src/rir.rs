@@ -543,6 +543,10 @@ impl SlotTable {
         self.callable_ctx.store(ctx, std::sync::atomic::Ordering::Relaxed);
         self.callable_hook.store(hook as usize, std::sync::atomic::Ordering::Release);
     }
+    /// The embedder answers slot addresses as values (set_callable_hook).
+    pub fn has_callable_hook(&self) -> bool {
+        self.callable_hook.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
     /// The address of the slot as a value: its thunk, unless the embedder's hook says otherwise.
     pub fn callable(&self, id: u32) -> u64 {
         let thunk = self.thunk(id);

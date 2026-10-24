@@ -20,7 +20,7 @@
 //! hook prints its startup line from the MAKEPAD_RUN_* metadata published before main.
 
 macro_rules! eprintln {
-    ($($arg:tt)*) => { if !crate::diag::enabled() { std::eprintln!($($arg)*); } };
+    ($($arg:tt)*) => { if !crate::diag::enabled() { stderr_line!($($arg)*); } };
 }
 
 // Callbacks without a session use the verbosity frozen by cmd_run_inner, never the environment.
@@ -2235,6 +2235,8 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         // growth relief (below): the resident size after the last trim and when it ran
         // burst relief (below): the compile count at the last pass, and when it ran
         let (mut burst_seen, mut burst_at) = (0u64, Instant::now());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let mut densify_at = Instant::now();
         let (mut grown_from, mut grown_at) = (0u64, std::time::Instant::now().checked_sub(std::time::Duration::from_millis(500)).unwrap_or_else(std::time::Instant::now));
         // mid-run cache writes once main ran 3 s and something new was compiled: after 2 s without
         // compiles (5 s after the last write), or every 10 s while compiles go on
@@ -2444,13 +2446,13 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 let up = unsafe { RUN_UNIT };
                 if !up.is_null() {
                     rebuild_tries += 1;
-                    match jit::settle_rebuild::run(up) {
+                    match jit::settle_rebuild::run(up, settle_stress.is_none() && rebuild_tries <= jit::settle_rebuild::TAIL_WAIT) {
                         jit::settle_rebuild::Outcome::Done => rebuild_done = true,
                         jit::settle_rebuild::Outcome::Refused(why) => { verbose!("makepad-run settle rebuild refused: {why}"); rebuild_over = true; }
                         jit::settle_rebuild::Outcome::Retry(why) => {
                             if why != rebuild_said { verbose!("makepad-run settle rebuild deferred (try {rebuild_tries}): {why}"); rebuild_said = why; }
                             rebuild_next = Instant::now() + std::time::Duration::from_secs(1);
-                            if rebuild_tries >= 40 { rebuild_done = true; }
+                            if rebuild_tries >= jit::settle_rebuild::TAIL_WAIT + 40 { rebuild_done = true; }
                         }
                     }
                 }
@@ -2479,6 +2481,13 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             // are never handed out again; every 5 s in which something was compiled, the free
             // granules around them go back (a walk of the chunk headers under each chunk's lock,
             // a few ms; Scope cold: 450 MB that waited for a quiet trim the O3 tail never gave)
+            // the program heaps' dense chunks get huge pages, sparse ones lose them (arena.rs
+            // `densify`): once a second, at most 64 collapses per heap
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if densify_at.elapsed() >= std::time::Duration::from_secs(1) {
+                densify_at = Instant::now();
+                crate::zone_alloc::domain::densify_all(64);
+            }
             if runtime.mem_trim && burst_at.elapsed() >= std::time::Duration::from_secs(5) {
                 let n = jit::COMPILED_FNS.load(Ordering::Relaxed) + jit::TIER1_INSTALLS.load(Ordering::Relaxed);
                 if n != burst_seen {
