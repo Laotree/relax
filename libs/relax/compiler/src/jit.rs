@@ -22001,6 +22001,9 @@ fn realtime_value_dyns(u: &Unit, types: &[TyId]) -> Vec<u32> {
 /// one or the other as verdicts land (a verified rebuild, a warm image's O3 code calls the body
 /// where the walked lowering called the twin): real-time code needs both.
 fn realtime_partner(u: &Unit, id: u32) -> Option<u32> {
+    if (id as usize) >= u.fns.len() {
+        return None;
+    }
     match u.fns[id as usize].key {
         FnKey::Plain(b) => Some(b),
         FnKey::Inst(..) | FnKey::Closure(..) => u.plain_twin_of(id),
