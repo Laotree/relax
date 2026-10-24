@@ -1383,8 +1383,17 @@ impl Arena {
         if !self.dynamic {
             return;
         }
+        #[cfg(unix)]
         extern "C" {
             fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+        }
+        // (stderr without allocation; Windows has no C `write` to link against)
+        #[cfg(windows)]
+        unsafe fn write(_fd: i32, buf: *const u8, n: usize) -> isize {
+            use relax_session::win32::{GetStdHandle, WriteFile};
+            let mut done = 0u32;
+            WriteFile(GetStdHandle(-12i32 as u32), buf, n as u32, &mut done, std::ptr::null_mut());
+            done as isize
         }
         let mut b = [0u8; 900];
         let mut k = 0;

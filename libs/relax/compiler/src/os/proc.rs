@@ -63,6 +63,39 @@ pub fn symbol_at(pc: u64) -> Option<(String, u64, String)> {
     symbol_at_imp(pc)
 }
 
+/// From a fault handler (no allocation): the image holding `a` (its file name's last part and
+/// load base) and the nearest symbol dladdr knows (empty when none, with its address). Unix:
+/// dladdr, which the handler calls only on the way to the end of the process. Windows: None.
+pub fn image_at_raw(a: u64) -> Option<(&'static [u8], u64, &'static [u8], u64)> {
+    #[cfg(unix)]
+    {
+        #[repr(C)]
+        struct DlInfo {
+            fname: *const std::ffi::c_char,
+            fbase: *mut u8,
+            sname: *const std::ffi::c_char,
+            saddr: *mut u8,
+        }
+        extern "C" {
+            fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32;
+        }
+        let mut info = DlInfo { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() };
+        if unsafe { dladdr(a as *const u8, &mut info) } == 0 || info.fname.is_null() {
+            return None;
+        }
+        // SAFETY: dladdr's strings belong to the loaded image (they live as long as it stays loaded)
+        let file: &'static [u8] = unsafe { std::ffi::CStr::from_ptr(info.fname) }.to_bytes();
+        let base = file.iter().rposition(|&c| c == b'/').map_or(file, |k| &file[k + 1..]);
+        let sym: &'static [u8] = if info.sname.is_null() { b"" } else { unsafe { std::ffi::CStr::from_ptr(info.sname) }.to_bytes() };
+        Some((base, info.fbase as u64, sym, info.saddr as u64))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = a;
+        None
+    }
+}
+
 #[cfg(unix)]
 fn symbol_at_imp(pc: u64) -> Option<(String, u64, String)> {
     #[repr(C)]
