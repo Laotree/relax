@@ -2227,7 +2227,10 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         }
         let l = latches[0];
         let multi = latches.len() > 1;
-        let outside: Vec<u32> = preds[h as usize].iter().copied().filter(|p| !m[*p as usize]).collect();
+        // the loop's entries now: `preds` predates the copies of loops unrolled earlier in this
+        // pass, and a copy that leaves into this loop must enter its first copy too (else the
+        // copies are dead and the loop stays rolled)
+        let outside: Vec<u32> = (0..f.blocks.len() as u32).filter(|p| !m.get(*p as usize).copied().unwrap_or(false) && f.blocks[*p as usize].term.succs().any(|s| s == h)).collect();
         if outside.is_empty() {
             continue;
         }
@@ -2310,7 +2313,7 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         // loops also stay within a tighter budget.
         let general = multi || split_used;
         if general {
-            let gain = counter_indexes_fixed_memory(f, &members, c, &ndef);
+            let gain = counter_indexes_fixed_memory(f, &members, c);
             if tr {
                 eprintln!("  several latches {} / split exit {}: fixed-address gain {}", multi, split_used, gain);
             }
@@ -2530,9 +2533,21 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
 /// stored addresses, so the borrowed slots stop escaping and their copies can join (SROA's bonus in
 /// LLVM's full-unroll analysis). A counter indexing memory behind a pointer, or a slot of plain
 /// values (box3d scatter_bodies' `simd_body.v.x.get(lane)`), gains only an index add per access.
-fn counter_indexes_fixed_memory(f: &Func, members: &[u32], c: VReg, ndef: &[u32]) -> bool {
+fn counter_indexes_fixed_memory(f: &Func, members: &[u32], c: VReg) -> bool {
     const NONE: u32 = u32::MAX;
     let nv = f.vregs.len();
+    // definitions counted now: the pass's own counts predate the copies of loops it already
+    // unrolled in this function (their fresh vregs: an out-of-range index that panicked the O3
+    // build and dropped it -- piano_render's render_chunk stayed below O3, +7.6%)
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+        }
+    }
     // the slot a single-definition vreg points into (its address plus constant offsets)
     let mut root = vec![NONE; nv];
     loop {
