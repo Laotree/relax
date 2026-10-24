@@ -1319,7 +1319,7 @@ pub extern "C" fn relax_wait_enter(kind: u32, addr: usize, holder: usize) {
     // settled first (the blocks other threads freed into them, their free pages; a pass over
     // its classes, small next to the futex call)
     crate::zone_alloc::domain::before_wait();
-    const LABELS: [&str; 7] = ["futex", "mutex", "condvar", "rwlock read", "rwlock write", "park", "once"];
+    const LABELS: [&str; 9] = ["futex", "mutex", "condvar", "rwlock read", "rwlock write", "park", "once", "join", "sleep"];
     crate::waits::enter(crate::waits::Kind::Futex, addr as u64, holder as u64, LABELS.get(kind as usize).copied().unwrap_or("futex"));
 }
 
