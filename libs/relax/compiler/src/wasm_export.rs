@@ -1049,6 +1049,11 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
         }
         let fl = fl.replace("%p", &std::process::id().to_string());
         let _ = std::fs::write(&fl, txt);
+        let mut aliases = String::from("slot\toffset\tbytes\n");
+        for (id, offset, len) in &out.stats.fn_alias_ranges {
+            aliases.push_str(&format!("{id}\t{offset}\t{len}\n"));
+        }
+        let _ = std::fs::write(format!("{}.aliases", fl), aliases);
         let parents = CLOSURE_PARENTS.lock().unwrap_or_else(|e| e.into_inner());
         let origins = CLOSURE_ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
         let via = CLOSURE_VIA.lock().unwrap_or_else(|e| e.into_inner());
@@ -1502,13 +1507,15 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Resul
     let mut vtables = CLOSURE_VTABLES.lock().unwrap_or_else(|e| e.into_inner());
     vtables.clear();
     if let Ok(path) = std::env::var("MAKEPAD_RUN_WASM_EXPORT_FNLIST") {
-        let mut inline_rows = String::from("emitted\tcontext\tparent_context\tinlined\n");
+        // Printed closure-type arguments can coincide across owner instances.
+        // Join evidence to module ranges by slot, never by the display key.
+        let mut inline_rows = String::from("emitted_slot\temitted\tcontext\tparent_context\tinlined_slot\tinlined\n");
         let mut inline_keys = HashMap::new();
         for (id, f) in funcs.iter() {
             let emitted = crate::jit::slot_key(u, *id);
             for (index, (slot, (call, _))) in f.inl_slots.iter().zip(&f.inl).enumerate() {
                 let key = inline_keys.entry(*slot).or_insert_with(|| crate::jit::slot_key(u, *slot));
-                inline_rows.push_str(&format!("{emitted}\t{}\t{}\t{key}\n", index + 1,
+                inline_rows.push_str(&format!("{id}\t{emitted}\t{}\t{}\t{slot}\t{key}\n", index + 1,
                     relax_backend::rir::pos_ctx(*call)));
             }
         }
