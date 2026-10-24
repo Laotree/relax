@@ -14,14 +14,16 @@
 //!   Program request, which no pump serves (owner.rs `keeps_job`), so it never runs nested in one.
 //!
 //! Steps (driver: the run monitor, after a settle; retried while preconditions fail):
-//! 1. the collected image of the program as it is now, encoded under a front read (compiles go on)
-//!    and committed to the store;
+//! 1. the entries the cache recorded are written to its stores (off the owner); the collected
+//!    image of the program as it is now, encoded under a front read (compiles go on) and committed
+//!    to the store;
 //! 2. the image restored into a new program and type context, on the monitor thread (it reads
 //!    only the image and the stores);
 //! 3. one owner request under a front write: the counts must be those of the encode (only the
 //!    interners may have grown: the new interner is topped up from the live one, so type ids stay
-//!    identical), the cache is opened as a warm start opens it and inherits what the old one
-//!    learned, and the Unit's compile fields are replaced; the old ones are returned;
+//!    identical), what the old cache recorded since step 1 is written to its stores, the cache is
+//!    opened as a warm start opens it and inherits what the old one learned, and the Unit's
+//!    compile fields are replaced; the old ones are returned;
 //! 4. the old values are dropped on the monitor's thread, then the heap is trimmed.
 //! `MAKEPAD_RUN_SETTLE_REBUILD=0` turns it off.
 
@@ -48,6 +50,9 @@ static REBUILDS: AtomicU32 = AtomicU32::new(0);
 pub(crate) fn rebuilds() -> u32 {
     REBUILDS.load(Ordering::Relaxed)
 }
+
+/// How many monitor tries (one a second) a rebuild waits for the tier-up tail before it runs anyway.
+pub(crate) const TAIL_WAIT: u32 = 60;
 
 pub(crate) enum Outcome {
     Done,
@@ -203,12 +208,23 @@ struct Fresh {
 
 /// Runs the rebuild. Called by the monitor thread once the run has settled and its collected
 /// image is current; `up` is the run's unit.
-pub(crate) fn run(up: *mut Unit) -> Outcome {
+/// `patient`: the rebuild may still wait for the tier-up tail (`TAIL_WAIT`).
+pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     if let Some(why) = refuse(up) {
         return Outcome::Refused(why);
     }
     if let Some(why) = not_now() {
         return Outcome::Retry(why);
+    }
+    // the tier-up tail first: a rebuild drops every slot's RIR, and each O3 build still queued
+    // then lowers its callees again, which stay pinned while they tier up (Sandbox race rebuilt
+    // during the tail: 18-22k RIR bodies and 190k query nodes regrown, 400 MB live, against 2k
+    // and 250 MB after a rebuild behind it)
+    if patient {
+        let queued = tier_queue().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len());
+        if queued > 0 {
+            return Outcome::Retry("O3 builds are queued".into());
+        }
     }
     // the recipe, the session, the images: process state
     let _k = crate::zone_alloc::kept();
@@ -218,6 +234,22 @@ pub(crate) fn run(up: *mut Unit) -> Outcome {
     let sess = unsafe { unit_session(up) };
     let Some(mode) = crate::cache::mode_from_env(&sess.options) else { return Outcome::Refused("the cache mode is off".into()) };
 
+    // a slot being built would defer the replace: ask before paying for the encode and restore
+    if let Some(i) = owner::publish(|| unsafe { (*up).fns.iter().position(|f| f.building || f.inflight) }) {
+        return Outcome::Retry(format!("slot {i} is being built"));
+    }
+    // the recorded entries go to the stores now, off the owner: the new cache opens the stores
+    // as they are, and an entry recorded but not yet written would be unknown to it (every slot
+    // such entries hold compiled again: Sandbox's settled state grew back to 18k RIR bodies)
+    let spill = owner::publish(|| unsafe {
+        (*up).flush_cache_records();
+        (*up).cache.as_mut().and_then(|c| c.spill_take())
+    });
+    if let Some(s) = spill {
+        if let Err(e) = s.write() {
+            return Outcome::Retry(format!("the cache spill failed: {e}"));
+        }
+    }
     // 1. the collected image of the program now, under a front read (compiles go on)
     let t = Instant::now();
     let Some(inputs) = owner::publish(|| unsafe { (*up).cache.as_ref().map(|c| c.collected_inputs()) }) else {
@@ -245,8 +277,13 @@ pub(crate) fn run(up: *mut Unit) -> Outcome {
 
     // 2. the restore (the image and the stores only)
     let t = Instant::now();
+    // what the old state's chunks still hold after the rebuild is counted apart (`memory` arena
+    // states: "old"); the new state goes into chunks carved from here on
+    crate::zone_alloc::compiler_mark_old();
     let fresh = {
         let _c = crate::zone_alloc::compiler();
+        // the new state in fresh chunks: compact, not in the old state's partly free ones
+        let _f = crate::zone_alloc::compiler_fresh();
         let restored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let images = crate::cache::FrontImages::open(&sess.options)?;
             images.restore_collected(&sess, &pre)
@@ -295,6 +332,7 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     let Some(_front) = super::front_write_within(1000) else {
         return Err("a front reader held on for 1 s".into());
     };
+    let _f = crate::zone_alloc::compiler_fresh();
     let u = &mut *up;
     let now = Counts::of(&u.prog, &u.tcx);
     if !before.same_program(&now) {
@@ -305,15 +343,16 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
             return Err(format!("slot {i} is being built"));
         }
     }
-    u.flush_cache_records();
-    let pending = u.cache.as_ref().map_or(0, |c| c.pending_entries());
-    if pending > 0 {
-        return Err(format!("the cache has {pending} entries to spill"));
-    }
     let Fresh { prog, mut tcx, collected } = fresh;
     // the types interned since the encode, copied from the live interner: ids stay identical
     tcx.tys.top_up_from(&u.tcx.tys).ok_or("the image holds more types than the program")?;
     compare((&u.prog, &u.tcx), (&prog, &tcx))?;
+    // what was recorded since the spill before the encode (a few entries) is written before the
+    // new cache opens the stores: a rebuild never waits for spills
+    u.flush_cache_records();
+    if let Some(s) = u.cache.as_mut().and_then(|c| c.spill_take()) {
+        s.write().map_err(|e| format!("the cache spill failed: {e}"))?;
+    }
     // the cache, as the warm start opens it, and what the old one learned
     let root = crate::layout::root_crate();
     let mut cache = crate::cache::Cache::open_collected(u, mode, Some(&collected)).map_err(|e| format!("the cache did not open: {e}"))?;
@@ -323,6 +362,7 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     }
     let mut front = FrontShared::new(sess);
     front.census_id = u.front.census_id;
+    front.checker_id = u.front.checker_id;
     front.warm_cache.store(u.front.warm_cache.load(Ordering::Relaxed), Ordering::Relaxed);
     for (i, f) in u.fns.iter().enumerate() {
         front.slot_keys.insert(i as u32, f.key.clone());
@@ -331,6 +371,7 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     lay.opaque = u.lay.opaque.clone();
     let const_failed = u.const_failed.clone();
     let query_errors = tcx.dcx.clone();
+    let checked_epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
     // the replace: nothing can fail from here
     u.front.retire_memos();
     let mut rir = Vec::new();
@@ -364,6 +405,8 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     });
     u.prog.body_memos.store(true, Ordering::Relaxed);
     u.tcx.publish_collected();
+    // the background borrow checker keeps every verdict and queued check (the same program)
+    crate::borrowck::lazy::carry_whole(u.front.checker_id, checked_epoch, u.tcx.collect_epoch.load(Ordering::SeqCst));
     set_shared_front(u, u.core_crate);
     crate::run::set_diagnostics(u.tcx.dcx.clone());
     // every thread's compiler memos go at its next access (dropped there, by value)
