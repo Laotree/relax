@@ -408,3 +408,83 @@ fn a_read_behind_a_clear_drop_flag_keeps_the_slots_apart() {
     assert_eq!(copies(&g), 1);
     assert_eq!(run(&g, 10), want);
 }
+
+/// f(n): acc = 0; for i in 0..n { if i odd { H = Some(i) (tag 1, payload at 8) } else { H.tag = `none` }
+/// T = H; if T.tag != 2 { T.payload += 100; acc += T.payload } } -- an Option built in place and
+/// matched through a copy. `none` = 2: the None path's tag is known at the match, so the payload
+/// bytes the copy takes on that path are never read and H and T join (the payload write meets no
+/// live byte of H). `none` = 3: the "None" path reaches the payload too (it reads the previous
+/// iteration's payload of H), so they stay apart.
+fn build_tagged(none: i64) -> Func {
+    let mut f = Func::new("slot_coalesce_tag".into(), 0);
+    let n = f.vreg(Cls::I);
+    f.params.push(n);
+    f.rets.push(Cls::I);
+    let (sh, st) = (f.slot(16, 8), f.slot(16, 8));
+    for _ in 0..9 {
+        f.block();
+    }
+    let v = |f: &mut Func| f.vreg(Cls::I);
+    let (ph, pt, acc, i, c, r, one, k_none, x, c2, p, p2, i2, z) =
+        (v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f), v(&mut f));
+    push(&mut f, 0, Inst::SlotAddr(ph, sh));
+    push(&mut f, 0, Inst::SlotAddr(pt, st));
+    push(&mut f, 0, Inst::Iconst(acc, 0));
+    push(&mut f, 0, Inst::Iconst(i, 0));
+    push(&mut f, 0, Inst::Iconst(one, 1));
+    push(&mut f, 0, Inst::Iconst(k_none, none));
+    // H starts as None with a zero payload (the payload of a never-Some H is read when none = 3)
+    push(&mut f, 0, Inst::Iconst(z, 0));
+    push(&mut f, 0, Inst::Store(Mem::Int(8, false), ph, 8, z));
+    f.blocks[0].term = Term::Jump(1);
+    push(&mut f, 1, Inst::ICmp(Cond::Lt, false, c, i, n));
+    f.blocks[1].term = Term::Branch(c, 2, 8);
+    push(&mut f, 2, Inst::IBinI(IOp::And, U64, r, i, 1));
+    f.blocks[2].term = Term::Branch(r, 3, 4);
+    // Some(i)
+    push(&mut f, 3, Inst::Store(Mem::Int(4, false), ph, 0, one));
+    push(&mut f, 3, Inst::Store(Mem::Int(8, false), ph, 8, i));
+    f.blocks[3].term = Term::Jump(5);
+    // "None": the tag only
+    push(&mut f, 4, Inst::Store(Mem::Int(4, false), ph, 0, k_none));
+    f.blocks[4].term = Term::Jump(5);
+    // T = H; match T.tag
+    push(&mut f, 5, Inst::Copy(pt, ph, 16));
+    push(&mut f, 5, Inst::Load(Mem::Int(4, false), x, pt, 0));
+    push(&mut f, 5, Inst::ICmpI(Cond::Ne, false, c2, x, 2));
+    f.blocks[5].term = Term::Branch(c2, 6, 7);
+    push(&mut f, 6, Inst::Load(Mem::Int(8, false), p, pt, 8));
+    push(&mut f, 6, Inst::IBinI(IOp::Add, U64, p2, p, 100));
+    push(&mut f, 6, Inst::Store(Mem::Int(8, false), pt, 8, p2));
+    push(&mut f, 6, Inst::IBin(IOp::Add, U64, acc, acc, p2));
+    f.blocks[6].term = Term::Jump(7);
+    push(&mut f, 7, Inst::IBinI(IOp::Add, U64, i2, i, 1));
+    push(&mut f, 7, Inst::Mov(i, i2));
+    f.blocks[7].term = Term::Jump(1);
+    f.blocks[8].term = Term::Ret(vec![acc]);
+    f
+}
+
+#[test]
+fn a_known_tag_on_the_none_path_lets_the_option_and_its_match_copy_join() {
+    let f = build_tagged(2);
+    f.verify().unwrap();
+    let want = run(&f, 10);
+    assert_eq!(want, (1 + 3 + 5 + 7 + 9) + 5 * 100);
+    let mut g = f.clone();
+    assert!(opt::coalesce_slot_copies(&mut g, true));
+    g.verify().unwrap();
+    assert_eq!(copies(&g), 0);
+    assert_eq!(run(&g, 10), want);
+}
+
+#[test]
+fn a_tag_that_reaches_the_payload_keeps_the_option_and_its_copy_apart() {
+    let f = build_tagged(3);
+    f.verify().unwrap();
+    let want = run(&f, 10);
+    let mut g = f.clone();
+    opt::coalesce_slot_copies(&mut g, true);
+    assert_eq!(copies(&g), 1);
+    assert_eq!(run(&g, 10), want);
+}
