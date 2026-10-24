@@ -2537,11 +2537,19 @@ pub unsafe fn enter_domain(a: *const Arena) {
 /// pages of its sparse current chunks back (`owned_tick`, once per trim epoch). What other
 /// threads free into them during the wait waits for the owner's next wait or tick (handing the
 /// chunks back at a wait instead made Scope's threads carve 2-3x more: measured, dropped).
+///
+/// At most once per trim epoch (a second) per thread: a pass reads the header of every current
+/// chunk (a cache miss each), and threads that wait thousands of times a second paid 20-30 ms/s
+/// of CPU for it at every wait (Scope).
 pub unsafe fn domain_wait() {
     // (a wait inside the thread's thread-local destructors finds no record: nothing to do)
     let _ = DOMAIN.try_with(|t| {
         if let Some(a) = t.arena.get().as_ref() {
-            a.owner_wait(t);
+            let epoch = a.trim_epoch.load(Ordering::Relaxed);
+            if t.pass.get() != epoch {
+                t.pass.set(epoch);
+                a.owner_wait(t);
+            }
         }
     });
 }

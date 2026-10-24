@@ -687,6 +687,8 @@ mod tests {
             .join()
             .unwrap();
             assert!(pending(&heap) >= 4000 * 200, "the frees wait on the remote list: {}", pending(&heap));
+            // (a pass at a wait runs once per trim epoch: the next one)
+            heap.inner.arena.densify(0);
             before_wait();
             assert_eq!(pending(&heap), 0, "the owner took them");
             // their slots are reused: 4000 new blocks carve nothing new (touched bytes of the
