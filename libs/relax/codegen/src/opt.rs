@@ -5882,6 +5882,30 @@ mod inline_priority_tests {
     }
 
     #[test]
+    fn inline_provenance_copies_exact_nested_instances() {
+        let options = &relax_session::Options::default();
+        let leaf = callee(1);
+        let mut middle = callee(1);
+        middle.blocks[0].insts[0] = Inst::Call(Callee::Fn(7), vec![], vec![]);
+        let get = |id: u32| (id == 7).then_some((&leaf as *const Func, ATTR_ALWAYS));
+        inline_calls(options, &mut middle, 1, &get, &|_| false, &InlineLimits::tier1());
+        assert_eq!(middle.inl_slots, vec![7]);
+        let mut outer = callee(1);
+        outer.blocks[0].insts[0] = Inst::Call(Callee::Fn(2), vec![], vec![]);
+        let get = |id: u32| (id == 2).then_some((&middle as *const Func, ATTR_ALWAYS));
+        inline_calls(options, &mut outer, 0, &get, &|_| false, &InlineLimits::tier1());
+        assert_eq!(outer.inl_slots, vec![2, 7]);
+        assert_eq!(outer.inl_slots.len(), outer.inl.len());
+        // An older copied body keeps its provenance after its source changes.
+        middle.inl_slots.clear();
+        assert_eq!(outer.inl_slots, vec![2, 7]);
+        let before = outer.clone();
+        outer.fn_slots_mut(&mut |slot| *slot += 10);
+        assert_eq!(outer.inl_slots, vec![12, 17]);
+        assert!(before.same_body_mapped(&mut |slot| slot + 10, &outer, &mut |slot| slot));
+    }
+
+    #[test]
     fn hot_nonleaf_and_exposed_calls() {
         let options = &relax_session::Options::default();
         let mut c = callee(30);
