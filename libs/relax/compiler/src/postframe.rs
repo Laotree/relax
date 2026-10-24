@@ -127,25 +127,116 @@ pub fn ahead_progress() -> (u64, u64) {
     (AHEAD_DONE.load(Relaxed), crate::jit::ahead_queued() + AHEAD_RUNNING.load(Relaxed))
 }
 
-/// The JIT's work in flight, for the run's JIT ring (a look, not a measurement).
+/// The JIT's work: what is queued and running now, and what it has finished so far (monotonic,
+/// so two looks give the work rate). For the run's JIT ring and makepad inspect `jit`: a look,
+/// not a measurement (two queue locks, each alone; the rest atomics).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Activity {
-    /// O3 builds queued or running now
+    /// O3 builds queued, and running now (with the slot of one)
     pub o3: u64,
-    /// functions queued or building ahead now
+    pub o3_running: u64,
+    pub o3_slot: Option<u32>,
+    /// O2 builds and verified O1 rebuilds queued; the O2 worker builds one now
+    pub o2: u64,
+    pub o2_running: bool,
+    /// functions queued or building ahead now, and of them building
     pub ahead: u64,
+    pub ahead_running: u64,
+    /// the UI thread waits on the JIT now (a lazy compile, an owner request)
+    pub ui_waiting: bool,
     /// ns the UI thread has spent in JIT waits so far, its open one included (monotonic: the
     /// difference between two looks over their interval is its JIT duty cycle)
     pub ui_wait_ns: u64,
+    /// the settle rebuild runs
+    pub settling: bool,
+    /// finished so far: first compiles (lazy and ahead), O2 / verified O1 builds, O3 builds
+    /// (installed, dropped or failed), warm-cache links
+    pub compiled: u64,
+    pub o2_done: u64,
+    pub o3_done: u64,
+    pub linked: u64,
 }
 
-/// What the JIT is doing now (one lock of the O3 queue; the rest atomics).
+impl Activity {
+    /// Work finished so far, all kinds (one unit: a function's build or link).
+    pub fn finished(&self) -> u64 {
+        self.compiled + self.o2_done + self.o3_done + self.linked
+    }
+
+    /// Something is being built right now.
+    pub fn running(&self) -> bool {
+        self.o3_running > 0 || self.o2_running || self.ahead_running > 0 || self.ui_waiting || self.settling
+    }
+
+    /// Builds waiting or running, all queues.
+    pub fn pending(&self) -> u64 {
+        self.ahead + self.o2 + self.o3 + self.o3_running
+    }
+
+    /// Only background work (O2 / O3 / verified O1, the settle rebuild): nothing the program waits for.
+    pub fn background(&self) -> bool {
+        self.ahead == 0 && !self.ui_waiting
+    }
+
+    /// The job running now, in words ("" when none).
+    pub fn current(&self) -> String {
+        if self.ui_waiting {
+            "UI thread compiling".into()
+        } else if self.settling {
+            "settle rebuild".into()
+        } else if let Some(slot) = self.o3_slot {
+            match crate::jit::slot_name(slot) {
+                Some(n) => format!("O3 {}", short_fn(&n)),
+                None => "O3 build".into(),
+            }
+        } else if self.ahead_running > 0 {
+            "building ahead".into()
+        } else if self.o2_running {
+            "O2 build".into()
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// A fn's path without its leading crates and generics (the last two segments), for one line.
+fn short_fn(name: &str) -> String {
+    let base = name.split('<').next().unwrap_or(name);
+    let parts: Vec<&str> = base.rsplit("::").take(2).collect();
+    let mut s = parts.into_iter().rev().collect::<Vec<_>>().join("::");
+    let n = s.chars().count();
+    if n > 40 {
+        s = format!("…{}", s.chars().skip(n - 39).collect::<String>());
+    }
+    s
+}
+
+/// What the JIT is doing now and has done so far.
 pub fn activity() -> Activity {
+    let ui_waiting = UI_WAITING.load(Relaxed) > 0;
     let mut ui_wait_ns = UI_WAIT_SUM.load(Relaxed);
-    if UI_WAITING.load(Relaxed) > 0 {
+    if ui_waiting {
         ui_wait_ns += wall_ns().saturating_sub(UI_WAIT_START.load(Relaxed));
     }
-    Activity { o3: crate::jit::o3_pending(), ahead: ahead_progress().1, ui_wait_ns }
+    let (o3, o3_running, o3_slot) = crate::jit::o3_counts();
+    let (o2, o2_running, o2_done) = crate::jit::o2_counts();
+    let ahead_running = AHEAD_RUNNING.load(Relaxed);
+    Activity {
+        o3,
+        o3_running,
+        o3_slot,
+        o2,
+        o2_running,
+        ahead: ahead_progress().1,
+        ahead_running,
+        ui_waiting,
+        ui_wait_ns,
+        settling: crate::jit::settle_rebuild::running(),
+        compiled: crate::jit::COMPILED_FNS.load(Relaxed),
+        o2_done,
+        o3_done: crate::jit::o3_finished(),
+        linked: crate::cache::warm_count::get(crate::cache::warm_count::HIT),
+    }
 }
 
 /// The app is ready after its first present (false before it): the UI thread has not waited on the JIT for
