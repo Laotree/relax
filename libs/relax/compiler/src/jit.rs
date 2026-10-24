@@ -16342,7 +16342,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // SPEC-V: unverified O3 code is never the slot's entry (it is built again once verified)
                 // (an unverified root's build, or one that took in unverified callees, is unverified
                 // code even when the root's verdict came while it was built: built again then)
-                let unverified_now = u.fns[id as usize].unverified.load(Ordering::Relaxed);
+                // (a SPEC-V twin's O3 code is kept as its entry: the twin is unverified-mode code by
+                // kind, as its cached baseline is; warm runs whose callers call the twin built its O3
+                // again every launch)
+                let unverified_now = u.fns[id as usize].unverified.load(Ordering::Relaxed) && !matches!(u.fns[id as usize].key, FnKey::Plain(_));
                 let unverified_inl: Vec<u32> = unverified_in.iter().copied().filter(|c| inlined.contains(c)).collect();
                 // (a twin is unverified by kind: its own O3 code is treated as before)
                 let built_unverified = root_unverified && !matches!(u.fns[id as usize].key, FnKey::Plain(_)) || !unverified_inl.is_empty();

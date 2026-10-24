@@ -1416,18 +1416,12 @@ impl Linker {
         if !in_range || !im.flat[s.crates.0..s.crates.1].iter().all(|&c| im.crate_ok.get(c as usize) == Some(&true)) || !self.cache().has_index(&s.entry) {
             return false;
         }
-        // an O2/O3 build of the slot replaced its entry after this image was made: the slot is
-        // left lazy, the first call links the entry (O2 code, marked: no build of it again).
-        // Prelinking the image's lower-tier code would run it and build the entry's code again
-        // on every launch (the image is made again past 2% of such slots: record_manifest).
-        // PGO9 EXPERIMENT (MAKEPAD_RUN_IMG_RANK=1): any higher tier, verified O1 over baseline too
-        static RANK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let rank = *RANK.get_or_init(|| std::env::var("MAKEPAD_RUN_IMG_RANK").is_ok_and(|v| v == "1"));
-        if rank {
-            if self.cache().entry_tier(s.entry).is_some_and(|t| super::tier_rank(t) > super::tier_rank(s.tier)) {
-                return false;
-            }
-        } else if matches!(s.tier, TIER_O1 | TIER_BASE) && self.cache().entry_tier(s.entry).is_some_and(|t| t == TIER_O2 || t == TIER_O3) {
+        // a build of the slot at a higher tier replaced its entry after this image was made (O3 over
+        // the image's O2 code too, a verified O1 rebuild over its baseline): the slot is left lazy,
+        // the first call links the entry (O2 code, marked: no build of it again). Prelinking the
+        // image's lower-tier code would run it and build the entry's code again on every launch
+        // (the image is made again past 2% of such slots: record_manifest).
+        if self.cache().entry_tier(s.entry).is_some_and(|t| super::tier_rank(t) > super::tier_rank(s.tier)) {
             return false;
         }
         let nk = need.len();
