@@ -54,6 +54,7 @@ pub mod reload;
 pub mod modules;
 pub mod sandbox;
 pub mod stale;
+pub mod invalid;
 pub mod domain;
 pub(crate) mod domain_threads;
 pub mod jit;
