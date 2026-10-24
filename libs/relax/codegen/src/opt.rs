@@ -1055,6 +1055,10 @@ fn release_arg_copies(f: &mut Func, args: &[VReg]) {
 }
 
 fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg], rets: &[VReg], nounwind: &dyn Fn(u32) -> bool) {
+    let id = match &f.blocks[bi].insts[ii] {
+        Inst::Call(Callee::Fn(id) | Callee::CFn(id, _), _, _) => *id,
+        _ => unreachable!("inline site must name a function instance"),
+    };
     release_arg_copies(f, args);
     for c in &callee.sret_callees {
         if !f.sret_callees.contains(c) {
@@ -1092,6 +1096,8 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
     let root = f.inl.len() as u64 + 1;
     let anchor = callee.blocks.iter().flat_map(|b| b.pos.iter().copied().chain(std::iter::once(b.term_pos))).find(|&p| p != 0 && pos_ctx(p) == 0).unwrap_or(0);
     f.inl.push((call_pos, anchor));
+    f.inl_slots.push(id);
+    f.inl_slots.extend_from_slice(&callee.inl_slots);
     let base = f.inl.len() as u64;
     // a callee position in the caller: its own body (context 0) under the new context, its
     // context c (callee.inl[c - 1]) at f.inl[base + c - 1]
@@ -5873,6 +5879,30 @@ mod inline_priority_tests {
         c.verify().unwrap();
         let mut c = site(None);
         assert!(inline_calls_ordered(options, &mut c, 0, &get, &|_| None, &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None).is_empty());
+    }
+
+    #[test]
+    fn inline_provenance_copies_exact_nested_instances() {
+        let options = &relax_session::Options::default();
+        let leaf = callee(1);
+        let mut middle = callee(1);
+        middle.blocks[0].insts[0] = Inst::Call(Callee::Fn(7), vec![], vec![]);
+        let get = |id: u32| (id == 7).then_some((&leaf as *const Func, ATTR_ALWAYS));
+        inline_calls(options, &mut middle, 1, &get, &|_| false, &InlineLimits::tier1());
+        assert_eq!(middle.inl_slots, vec![7]);
+        let mut outer = callee(1);
+        outer.blocks[0].insts[0] = Inst::Call(Callee::Fn(2), vec![], vec![]);
+        let get = |id: u32| (id == 2).then_some((&middle as *const Func, ATTR_ALWAYS));
+        inline_calls(options, &mut outer, 0, &get, &|_| false, &InlineLimits::tier1());
+        assert_eq!(outer.inl_slots, vec![2, 7]);
+        assert_eq!(outer.inl_slots.len(), outer.inl.len());
+        // An older copied body keeps its provenance after its source changes.
+        middle.inl_slots.clear();
+        assert_eq!(outer.inl_slots, vec![2, 7]);
+        let before = outer.clone();
+        outer.fn_slots_mut(&mut |slot| *slot += 10);
+        assert_eq!(outer.inl_slots, vec![12, 17]);
+        assert!(before.same_body_mapped(&mut |slot| slot + 10, &outer, &mut |slot| slot));
     }
 
     #[test]
