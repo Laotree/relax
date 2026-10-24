@@ -11683,7 +11683,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     // its stores of borrows die, and the slots they borrowed no longer escape -- the copies of
     // those slots can join now (reconcile's `[(&mut entry.a, ..), (..)]`: the entry's moves
     // through the match tuple; GAPB)
-    if unrolled && cfg.sroa && !relax_backend::stats::opt_off(options, "-postinline") {
+    if unrolled && cfg.sroa && !relax_backend::stats::opt_off(options, "-postinline") && !relax_backend::stats::opt_off(options, "-unrollclean") {
         relax_codegen::loops::clear_unreachable(func);
         relax_backend::passes::live_dce(func);
         slot_cleanup(options, func, ro, cfg);

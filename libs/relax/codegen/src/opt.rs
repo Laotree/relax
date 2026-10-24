@@ -7855,7 +7855,7 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
         // `out.push(entry)` hands the entry to an outlined push as such a copy (GAPB).
         let owned = |c: &Callee, k: u32, s2: usize, at: i64| -> Option<((i64, i64), (i64, i64))> {
             let size = f.slots[s2].size as i64;
-            if at != 0 {
+            if at != 0 || relax_backend::stats::opt_env_off("-ownedslots") {
                 return None;
             }
             if k == 0 && matches!(c, Callee::Fn(id) if f.sret_callees.contains(id)) {

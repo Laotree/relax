@@ -2174,7 +2174,8 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         // capped by `all` (sandbox reconcile's loop over two borrowed shape fields: 330 insts with
         // its never-taken create/destroy arms, about 100 that run; GAPB)
         let all: usize = members.iter().map(|b| f.blocks[*b as usize].insts.len() + 1).sum();
-        let size: usize = members.iter().filter(|b| f.blocks[**b as usize].count != 0.0).map(|b| f.blocks[*b as usize].insts.len() + 1).sum();
+        let run_only = !relax_backend::stats::opt_off(options, "-unrollrun");
+        let size: usize = members.iter().filter(|b| !run_only || f.blocks[**b as usize].count != 0.0).map(|b| f.blocks[*b as usize].insts.len() + 1).sum();
         if tr {
             eprintln!("full-unroll {}: loop b{} {} blocks {} insts ({} run)", f.name, h, members.len(), all, size);
         }
@@ -2206,7 +2207,8 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         let early_exit = members.iter().any(|b| *b != h && !latches.contains(b) && {
             let t = &f.blocks[*b as usize].term;
             let unwind = if let Term::Invoke(_, u) = *t { Some(u) } else { None };
-            t.succs().any(|s| Some(s) != unwind && !h_exit.contains(&s) && !m.get(s as usize).copied().unwrap_or(false))
+            let split_ok = !relax_backend::stats::opt_off(options, "-unrollmulti");
+            t.succs().any(|s| Some(s) != unwind && !(split_ok && h_exit.contains(&s)) && !m.get(s as usize).copied().unwrap_or(false))
         });
         if early_exit {
             if tr {
@@ -2219,7 +2221,7 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         }
         // Several latches (a `continue` in the body) are fine when the header decides and the
         // counter's step dominates every latch: each back edge enters the next copy.
-        if latches.is_empty() {
+        if latches.is_empty() || (latches.len() > 1 && relax_backend::stats::opt_off(options, "-unrollmulti")) {
             continue;
         }
         let l = latches[0];
