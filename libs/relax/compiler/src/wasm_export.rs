@@ -366,7 +366,7 @@ pub fn capture(unit: usize, id: u32, f: &Func) {
         }
         unsafe { atexit(at_exit) };
     }
-    // on the kept heap: a zone swap frees the compile arenas while the run goes on
+    // process state: on the kept heap
     crate::zone_alloc::kept_with(|| {
         g.get_or_insert_with(BTreeMap::new).entry(unit)
             .or_insert_with(|| Captured { entry: id, funcs: BTreeMap::new() })
