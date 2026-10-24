@@ -3,7 +3,9 @@
 //! the block after the header test, a second test there leaves for the header's exit block (the
 //! loaded Option's tag), the body has a `continue` (two latches) and an invoked call with an unwind
 //! edge. The loop must be fully unrolled, and the RIR before and after must agree on an evaluator
-//! that records every call (callee argument) in order.
+//! that records every call (callee argument) in order. The body reads the array (a stack slot) at
+//! `slot + k * 8`: that fixed-address gain is what lets the general rule unroll it. The same loop
+//! over memory behind a pointer (box3d's `c.points[point_index]`) stays rolled.
 use relax_backend::regalloc::reachable;
 use relax_backend::rir::*;
 
@@ -26,6 +28,7 @@ fn eval(f: &Func, args: &[u64]) -> (Vec<u64>, Vec<u64>) {
         for i in &f.blocks[b].insts {
             match *i {
                 Inst::Iconst(d, k) => r[d.0 as usize] = k as u64,
+                Inst::SlotAddr(d, s) => r[d.0 as usize] = 0x1000 + 0x100 * s as u64,
                 Inst::Mov(d, s) => r[d.0 as usize] = r[s.0 as usize],
                 Inst::IBin(IOp::Add, _, d, a, c) => r[d.0 as usize] = r[a.0 as usize].wrapping_add(r[c.0 as usize]),
                 Inst::IBinI(IOp::Add, _, d, a, k) => r[d.0 as usize] = r[a.0 as usize].wrapping_add(k as u64),
@@ -53,14 +56,19 @@ fn eval(f: &Func, args: &[u64]) -> (Vec<u64>, Vec<u64>) {
 /// b1 (header): done = c == 3 -> b7 : b2
 /// b2: k = c; c = c + 1; tag = (seed & 1) == 0 || k != 2 (the "loaded Some"); -> b3 : b7
 /// b3: skip = (k + seed) & 1 -> b1 (continue: latch 1) : b4
-/// b4: call host(k * 10 + seed) -> invoke b5, unwind b8
+/// b4: call host(k * 10 + seed + base + k * 8) -> invoke b5, unwind b8 (base: the array slot's
+///     address, or the parameter `p` when `slot` is false)
 /// b5: acc = acc + k -> b1 (latch 2)
 /// b7: ret acc
 /// b8: (cleanup) ret acc
-fn array_loop() -> Func {
+fn array_loop(slot: bool) -> Func {
     let mut f = Func::new("arr".into(), 0);
     let seed = f.vreg(Cls::I);
     f.params.push(seed);
+    let p = f.vreg(Cls::I);
+    f.params.push(p);
+    let base = f.vreg(Cls::I);
+    let (sc, ad) = (f.vreg(Cls::I), f.vreg(Cls::I));
     f.rets.push(Cls::I);
     for _ in 0..9 {
         f.block();
@@ -69,6 +77,12 @@ fn array_loop() -> Func {
     let (c, acc, done, k, t0, t1, tag, s1, skip, arg, t2, t3) = (v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]);
     push(&mut f, 0, Inst::Iconst(c, 0));
     push(&mut f, 0, Inst::Iconst(acc, 0));
+    if slot {
+        let s = f.slot(32, 8);
+        push(&mut f, 0, Inst::SlotAddr(base, s));
+    } else {
+        push(&mut f, 0, Inst::Mov(base, p));
+    }
     f.blocks[0].term = Term::Jump(1);
     push(&mut f, 1, Inst::ICmpI(Cond::Eq, false, done, c, 3));
     f.blocks[1].term = Term::Branch(done, 7, 2);
@@ -85,6 +99,9 @@ fn array_loop() -> Func {
     f.blocks[3].term = Term::Branch(skip, 1, 4);
     push(&mut f, 4, Inst::IBinI(IOp::Mul, U64, arg, k, 10));
     push(&mut f, 4, Inst::IBin(IOp::Add, U64, arg, arg, seed));
+    push(&mut f, 4, Inst::IBinI(IOp::Mul, U64, sc, k, 8));
+    push(&mut f, 4, Inst::IBin(IOp::Add, U64, ad, base, sc));
+    push(&mut f, 4, Inst::IBin(IOp::Add, U64, arg, arg, ad));
     push(&mut f, 4, Inst::Call(Callee::Host(Sym::new(7)), vec![arg], vec![]));
     f.blocks[4].term = Term::Invoke(5, 8);
     push(&mut f, 5, Inst::IBin(IOp::Add, U64, acc, acc, k));
@@ -100,14 +117,14 @@ fn array_loop() -> Func {
 
 #[test]
 fn a_loop_with_calls_two_latches_and_a_split_exit_test_unrolls() {
-    let f = array_loop();
+    let f = array_loop(true);
     f.verify().unwrap();
     let o = relax_session::Options::default();
     let mut g = f.clone();
     assert!(relax_codegen::loops::unroll_const_loops(&o, &mut g), "not unrolled");
     g.verify().unwrap();
     for seed in 0..8u64 {
-        assert_eq!(eval(&f, &[seed]), eval(&g, &[seed]), "seed {}", seed);
+        assert_eq!(eval(&f, &[seed, 0x5000]), eval(&g, &[seed, 0x5000]), "seed {}", seed);
     }
     // folded, the original loop is unreachable: every call left is in a copy, one per trip
     relax_backend::passes::simplify(&o, &mut g, None, true, true);
@@ -118,6 +135,14 @@ fn a_loop_with_calls_two_latches_and_a_split_exit_test_unrolls() {
     let calls = g.blocks.iter().enumerate().filter(|(bi, b)| reach[*bi] && b.insts.iter().any(|i| matches!(i, Inst::Call(..)))).count();
     assert_eq!(calls, 3, "one call per trip:\n{}", g.dump());
     for seed in 0..8u64 {
-        assert_eq!(eval(&f, &[seed]), eval(&g, &[seed]), "seed {} after simplify", seed);
+        assert_eq!(eval(&f, &[seed, 0x5000]), eval(&g, &[seed, 0x5000]), "seed {} after simplify", seed);
     }
+}
+
+#[test]
+fn the_same_loop_over_memory_behind_a_pointer_stays_rolled() {
+    let f = array_loop(false);
+    f.verify().unwrap();
+    let mut g = f.clone();
+    assert!(!relax_codegen::loops::unroll_const_loops(&relax_session::Options::default(), &mut g), "unrolled:\n{}", g.dump());
 }

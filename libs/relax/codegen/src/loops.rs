@@ -2204,12 +2204,13 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         // tested in two steps (a `for` over an array: the header's `start == end`, then the
         // loaded Option's tag in the next block, which only the copies' constant loads fold).
         let h_exit: Vec<u32> = f.blocks[h as usize].term.succs().filter(|s| !m.get(*s as usize).copied().unwrap_or(false)).collect();
+        let split_ok = !relax_backend::stats::opt_off(options, "-unrollmulti");
         let early_exit = members.iter().any(|b| *b != h && !latches.contains(b) && {
             let t = &f.blocks[*b as usize].term;
             let unwind = if let Term::Invoke(_, u) = *t { Some(u) } else { None };
-            let split_ok = !relax_backend::stats::opt_off(options, "-unrollmulti");
             t.succs().any(|s| Some(s) != unwind && !(split_ok && h_exit.contains(&s)) && !m.get(s as usize).copied().unwrap_or(false))
         });
+        let split_used = !early_exit && members.iter().any(|b| *b != h && !latches.contains(b) && f.blocks[*b as usize].term.succs().any(|s| h_exit.contains(&s)));
         if early_exit {
             if tr {
                 eprintln!("  early exits from the body (header b{}, latches {:?})", h, latches);
@@ -2297,6 +2298,26 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         }
         if !f.vregs.get(c.0 as usize).map_or(false, |x| *x == Cls::I) {
             continue;
+        }
+        // The two generalisations (several latches, an exit split over two blocks) pay only where
+        // the copies turn the counter's indexing of a stack slot or of static data into fixed
+        // addresses: reconcile's `[(&mut entry.a, ..), (..)]` array read by its IntoIter (`data +
+        // start * stride`) becomes constant-offset loads that forward, and the array and the
+        // borrowed `entry` stop escaping (LLVM's full-unroll analysis grants the same bonus for
+        // SROA-able allocas and constant-array loads). A counted loop over memory behind a pointer
+        // (box3d solve_contacts_convex's `for point_index in 0..4` over `c.points[point_index]`)
+        // only trades an index add per access for 4 copies of a 150-inst body and more register
+        // pressure: +277 static insts, +1.8..11% instructions on box3d_physics (GAPB2). The
+        // copies of such loops also stay within a tighter budget.
+        let general = multi || split_used;
+        if general {
+            let gain = counter_indexes_fixed_memory(f, &members, c, &ndef);
+            if tr {
+                eprintln!("  several latches {} / split exit {}: fixed-address gain {}", multi, split_used, gain);
+            }
+            if !gain {
+                continue;
+            }
         }
         // the decision: in the latch after the step (`Branch(c' cmp k, h, exit)`: iteration j
         // runs again iff cmp(c0 + (j+1)s)), or in the header before anything redefines c
@@ -2405,7 +2426,7 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
                 continue 'next;
             }
         }
-        if size * t > budget || all * t > 2400 {
+        if size * t > budget || all * t > 2400 || (general && size * t > 400) {
             if tr {
                 eprintln!("  {} copies of {} insts over the budget {}", t, size, budget);
             }
@@ -2502,6 +2523,67 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         changed = true;
     }
     changed
+}
+
+/// Whether some address in the loop is a stack slot's or a static symbol's address plus a value
+/// computed from the counter `c` (not through memory): the copies make it a fixed address
+/// (`SlotAddr + j*stride`), so the slot's accesses can forward and promote. Memory behind a pointer
+/// the loop reads is not counted: there the copies save only the index add.
+fn counter_indexes_fixed_memory(f: &Func, members: &[u32], c: VReg, ndef: &[u32]) -> bool {
+    let nv = f.vregs.len();
+    // fixed bases: single-definition vregs holding a slot or symbol address, plus constant offsets
+    let mut fixed = vec![false; nv];
+    loop {
+        let mut grew = false;
+        for b in &f.blocks {
+            for i in &b.insts {
+                let d = match *i {
+                    Inst::SlotAddr(d, _) | Inst::Addr(d, _) => Some(d),
+                    Inst::Mov(d, a) | Inst::IBinI(IOp::Add | IOp::Sub, _, d, a, _) if fixed[a.0 as usize] => Some(d),
+                    _ => None,
+                };
+                if let Some(d) = d {
+                    if ndef[d.0 as usize] == 1 && !fixed[d.0 as usize] {
+                        fixed[d.0 as usize] = true;
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    // values computed from a counter inside the loop (not through memory)
+    let mut ctr = vec![false; nv];
+    ctr[c.0 as usize] = true;
+    loop {
+        let mut grew = false;
+        for &b in members {
+            for i in &f.blocks[b as usize].insts {
+                let d = match *i {
+                    Inst::Mov(d, a) | Inst::IBinI(_, _, d, a, _) | Inst::Conv(Conv::IntToInt(_), d, a) | Inst::INeg(_, d, a) if ctr[a.0 as usize] => Some(d),
+                    Inst::IBin(_, _, d, a, x) if ctr[a.0 as usize] || ctr[x.0 as usize] => Some(d),
+                    _ => None,
+                };
+                if let Some(d) = d {
+                    if !ctr[d.0 as usize] && !fixed[d.0 as usize] {
+                        ctr[d.0 as usize] = true;
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    members.iter().any(|&b| {
+        f.blocks[b as usize].insts.iter().any(|i| match *i {
+            Inst::IBin(IOp::Add | IOp::Sub, _, _, a, x) => (fixed[a.0 as usize] && ctr[x.0 as usize]) || (ctr[a.0 as usize] && fixed[x.0 as usize]),
+            _ => false,
+        })
+    })
 }
 
 /// `c = conv(conv(c) + s)` ending in `Mov(c, x)` at `k` of block `b`: the counter step of a
