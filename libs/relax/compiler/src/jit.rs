@@ -9654,14 +9654,14 @@ unsafe fn tail_nocapture_facts(up: *mut Unit, id: u32, func: &mut relax_backend:
             }
             let r = match &c {
                 Callee::Fn(x) => known_nocapture(up, *x, k, 3, &|c| rir_for_fact(up, c, mode), &mut memo, &mut reads),
-                Callee::Host(s) => host_nocapture(&*up, *s).then_some(false),
+                Callee::Host(s) => host_nocapture(&*up, *s).then_some((false, None)),
                 _ => None,
             };
-            let Some(returns) = r else {
+            let Some((returns, ext)) = r else {
                 // an escape is left: no sibling call here, the other answers are not needed
                 return;
             };
-            f.nocapture.push((c, k as u32, returns));
+            f.nocapture.push((c, k as u32, returns, ext));
             new = true;
         }
         if !new {
@@ -9680,9 +9680,10 @@ fn host_nocapture(u: &Unit, s: relax_backend::rir::Sym) -> bool {
 }
 
 /// Whether callee `c` keeps no copy of its pointer argument `k` (Some: and whether it may return
-/// it), from its RIR (`rir`; None: not known, it may), calls it passes the pointer to asked in
-/// turn `depth` deep. The bodies read go to `reads` (dependencies of the asking body).
-unsafe fn known_nocapture(up: *mut Unit, c: u32, k: usize, depth: u32, rir: &dyn Fn(u32) -> Option<std::sync::Arc<relax_backend::rir::Func>>, memo: &mut Vec<(u32, usize, Option<bool>)>, reads: &mut Vec<u32>) -> Option<bool> {
+/// it, and the bytes it touches through it -- `Extent`), from its RIR (`rir`; None: not known, it
+/// may), calls it passes the pointer to asked in turn `depth` deep. The bodies read go to `reads`
+/// (dependencies of the asking body).
+unsafe fn known_nocapture(up: *mut Unit, c: u32, k: usize, depth: u32, rir: &dyn Fn(u32) -> Option<std::sync::Arc<relax_backend::rir::Func>>, memo: &mut Vec<(u32, usize, Option<(bool, relax_backend::rir::Extent)>)>, reads: &mut Vec<u32>) -> Option<(bool, relax_backend::rir::Extent)> {
     if let Some(&(_, _, v)) = memo.iter().find(|x| x.0 == c && x.1 == k) {
         return v;
     }
@@ -9695,7 +9696,7 @@ unsafe fn known_nocapture(up: *mut Unit, c: u32, k: usize, depth: u32, rir: &dyn
             let reads_c = std::cell::RefCell::new(std::mem::take(reads));
             let v = relax_codegen::opt::param_escape(&r, k, &|c2, k2| match c2 {
                 relax_backend::rir::Callee::Fn(x) if depth > 0 => known_nocapture(up, *x, k2, depth - 1, rir, &mut memo_c.borrow_mut(), &mut reads_c.borrow_mut()),
-                relax_backend::rir::Callee::Host(s) => host_nocapture(&*up, *s).then_some(false),
+                relax_backend::rir::Callee::Host(s) => host_nocapture(&*up, *s).then_some((false, None)),
                 _ => None,
             });
             *memo = memo_c.into_inner();
@@ -9758,7 +9759,7 @@ fn o3_nocapture_asks(root: &relax_backend::rir::Func, snap: &[(u32, std::sync::A
 /// them off the owner and asks again). coalesce_slot_copies joins the slots handed only to such
 /// calls (reconcile's entries reached Arc::drop_slow, which never runs, on the cold path of an
 /// `Option<Arc>` field; LLVM knows it nocapture from FunctionAttrs).
-unsafe fn o3_nocapture_facts(up: *mut Unit, id: u32, asks: &[(u32, u32)]) -> (Vec<(relax_backend::rir::Callee, u32, bool)>, Vec<u32>) {
+unsafe fn o3_nocapture_facts(up: *mut Unit, id: u32, asks: &[(u32, u32)]) -> (Vec<(relax_backend::rir::Callee, u32, bool, relax_backend::rir::Extent)>, Vec<u32>) {
     let missing = std::cell::RefCell::new(Vec::new());
     let have = |c: u32| -> Option<std::sync::Arc<relax_backend::rir::Func>> {
         let u = &*up;
@@ -9779,8 +9780,8 @@ unsafe fn o3_nocapture_facts(up: *mut Unit, id: u32, asks: &[(u32, u32)]) -> (Ve
     let (mut memo, mut reads) = (Vec::new(), Vec::new());
     let mut facts = Vec::new();
     for &(c, k) in asks {
-        if let Some(returns) = known_nocapture(up, c, k as usize, 3, &have, &mut memo, &mut reads) {
-            facts.push((relax_backend::rir::Callee::Fn(c), k, returns));
+        if let Some((returns, ext)) = known_nocapture(up, c, k as usize, 3, &have, &mut memo, &mut reads) {
+            facts.push((relax_backend::rir::Callee::Fn(c), k, returns, ext));
         }
     }
     reads.sort_unstable();

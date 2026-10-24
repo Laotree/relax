@@ -1404,57 +1404,137 @@ pub fn param_nocapture(f: &Func, k: usize, sub: &dyn Fn(&Callee, usize) -> bool)
     true
 }
 
-/// How `f` uses the pointer it gets as parameter `k`, as LLVM's capture tracking with `returned`:
-/// None when it may keep a copy (a derived value stored to memory, used as an indirect callee, or
-/// passed to a call `sub` cannot vouch for); Some(r) when it keeps none, `r` when a value derived
-/// from it may be returned. `sub(callee, arg)` answers the same for the calls it is passed to: a
-/// call that may return it gives a derived result. Loads, stores and copies through it are fine.
-pub fn param_escape(f: &Func, k: usize, sub: &dyn Fn(&Callee, usize) -> Option<bool>) -> Option<bool> {
+/// How `f` uses the pointer it gets as parameter `k`, as LLVM's capture tracking with `returned`
+/// plus the bytes it touches through it: None when it may keep a copy (a derived value stored to
+/// memory, used as an indirect callee, or passed to a call `sub` cannot vouch for); Some((r, e))
+/// when it keeps none, `r` when a value derived from it may be returned, `e` the extent it may
+/// read or write through it (`Extent`: from loads, stores, copies and atomics at known offsets
+/// from it, and the extents `sub` gives for the calls it is passed to, shifted by the offset it
+/// is passed at; None as soon as one access is at an offset not known). `sub(callee, arg)`
+/// answers the same for those calls: a call that may return it gives a derived result.
+pub fn param_escape(f: &Func, k: usize, sub: &dyn Fn(&Callee, usize) -> Option<(bool, Extent)>) -> Option<(bool, Extent)> {
+    // a derived value's offset from the parameter: not seen yet, known, or not known
+    #[derive(Clone, Copy, PartialEq)]
+    enum Off { Unset, At(i64), Any }
+    fn join(o: &mut Off, n: Off) -> bool {
+        let j = match (*o, n) {
+            (Off::Unset, x) => x,
+            (x, Off::Unset) => x,
+            (Off::At(a), Off::At(b)) if a == b => Off::At(a),
+            _ => Off::Any,
+        };
+        let changed = j != *o;
+        *o = j;
+        changed
+    }
     let &p = f.params.get(k)?;
-    let mut t = vec![false; f.vregs.len()];
-    t[p.0 as usize] = true;
+    let mut off = vec![Off::Unset; f.vregs.len()];
+    off[p.0 as usize] = Off::At(0);
+    let t = |off: &[Off], v: VReg| off[v.0 as usize] != Off::Unset;
     let mut returned = false;
+    let mut calls: Vec<(usize, usize, usize, Extent)> = Vec::new();
+    let mut settled = false;
     for _ in 0..16 {
         let mut more = false;
-        for b in &f.blocks {
-            for i in &b.insts {
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for (ii, i) in b.insts.iter().enumerate() {
                 let from = match i {
-                    Inst::Mov(_, x) | Inst::IBinI(_, _, _, x, _) | Inst::Conv(_, _, x) => t[x.0 as usize],
-                    Inst::IBin(_, _, _, x, y) | Inst::Sel(_, _, x, y) => t[x.0 as usize] || t[y.0 as usize],
-                    Inst::Store(_, _, _, v) | Inst::StoreX(_, _, _, _, _, v) | Inst::VStore(_, _, v) | Inst::AtomicStore(_, _, _, v) | Inst::AtomicRmw(_, _, _, _, _, v) if t[v.0 as usize] => return None,
-                    Inst::AtomicCas(_, _, _, _, _, e, n) if t[e.0 as usize] || t[n.0 as usize] => return None,
+                    Inst::Mov(_, x) if t(&off, *x) => off[x.0 as usize],
+                    Inst::IBinI(IOp::Add, _, _, x, c) if t(&off, *x) => match off[x.0 as usize] { Off::At(o) => Off::At(o.wrapping_add(*c)), o => o },
+                    Inst::IBinI(IOp::Sub, _, _, x, c) if t(&off, *x) => match off[x.0 as usize] { Off::At(o) => Off::At(o.wrapping_sub(*c)), o => o },
+                    Inst::IBinI(_, _, _, x, _) | Inst::Conv(_, _, x) if t(&off, *x) => Off::Any,
+                    Inst::IBin(_, _, _, x, y) | Inst::Sel(_, _, x, y) if t(&off, *x) || t(&off, *y) => Off::Any,
+                    Inst::Store(_, _, _, v) | Inst::StoreX(_, _, _, _, _, v) | Inst::VStore(_, _, v) | Inst::AtomicStore(_, _, _, v) | Inst::AtomicRmw(_, _, _, _, _, v) if t(&off, *v) => return None,
+                    Inst::AtomicCas(_, _, _, _, _, e, n) if t(&off, *e) || t(&off, *n) => return None,
                     Inst::Call(c, args, _) => {
-                        if matches!(c, Callee::Indirect(v) | Callee::CIndirect(v, _) if t[v.0 as usize]) || matches!(c, Callee::Asm(_)) && args.iter().any(|a| t[a.0 as usize]) {
+                        if matches!(c, Callee::Indirect(v) | Callee::CIndirect(v, _) if t(&off, *v)) || matches!(c, Callee::Asm(_)) && args.iter().any(|a| t(&off, *a)) {
                             return None;
                         }
                         let mut r = false;
                         for (j, a) in args.iter().enumerate() {
-                            if t[a.0 as usize] {
-                                r |= sub(c, j)?;
+                            if t(&off, *a) {
+                                let (rj, ej) = sub(c, j)?;
+                                r |= rj;
+                                if !calls.iter().any(|x| (x.0, x.1, x.2) == (bi, ii, j)) {
+                                    calls.push((bi, ii, j, ej));
+                                }
                             }
                         }
-                        r
+                        if r { Off::Any } else { Off::Unset }
                     }
-                    _ => false,
+                    _ => Off::Unset,
                 };
-                if from {
+                if from != Off::Unset {
                     i.defs(|d| {
-                        if !t[d.0 as usize] {
-                            t[d.0 as usize] = true;
+                        if join(&mut off[d.0 as usize], from) {
                             more = true;
                         }
                     });
                 }
             }
             if let Term::Ret(vals) = &b.term {
-                returned |= vals.iter().any(|v| t[v.0 as usize]);
+                returned |= vals.iter().any(|v| t(&off, *v));
             }
         }
         if !more {
-            return Some(returned);
+            settled = true;
+            break;
         }
     }
-    None
+    if !settled {
+        return None;
+    }
+    // the bytes touched through it, now that every derived value's offset is final:
+    // (base, offset, size) of each access and of each call's extent
+    let mut acc: Vec<(VReg, i64, i64)> = Vec::new();
+    let mut known = true;
+    let vw = |v: VReg| if f.vregs[v.0 as usize] == Cls::V256 { 32 } else { 16 };
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (ii, i) in b.insts.iter().enumerate() {
+            match *i {
+                Inst::Mov(..) | Inst::IBinI(..) | Inst::Conv(..) | Inst::IBin(..) | Inst::Sel(..) | Inst::ICmp(..) | Inst::ICmpI(..) => {}
+                Inst::Load(m, _, b, o) | Inst::Store(m, b, o, _) => acc.push((b, o as i64, mem_size(m) as i64)),
+                Inst::VLoad(d, b, o) => acc.push((b, o as i64, vw(d))),
+                Inst::VStore(b, o, v) => acc.push((b, o as i64, vw(v))),
+                Inst::AtomicLoad(m, _, _, a) | Inst::AtomicStore(m, _, a, _) | Inst::AtomicRmw(_, m, _, _, a, _) | Inst::AtomicCas(m, _, _, _, a, _, _) => acc.push((a, 0, mem_size(m) as i64)),
+                Inst::Copy(d, s2, n) => {
+                    acc.push((d, 0, n as i64));
+                    acc.push((s2, 0, n as i64));
+                }
+                Inst::Call(_, ref args, _) => {
+                    for (j, a) in args.iter().enumerate() {
+                        if !t(&off, *a) {
+                            continue;
+                        }
+                        match calls.iter().find(|x| (x.0, x.1, x.2) == (bi, ii, j)).and_then(|x| x.3) {
+                            Some((lo, hi)) => acc.push((*a, lo as i64, hi as i64 - lo as i64)),
+                            None => known = false,
+                        }
+                    }
+                }
+                _ => for_uses(i, |v| if t(&off, v) { known = false }),
+            }
+        }
+    }
+    let mut ext: Option<(i64, i64)> = None;
+    for (v, o, n) in acc {
+        match off[v.0 as usize] {
+            Off::Unset => {}
+            Off::At(b) if n > 0 => {
+                let lo = b.wrapping_add(o);
+                let hi = lo.wrapping_add(n);
+                ext = Some(ext.map_or((lo, hi), |(x, y)| (x.min(lo), y.max(hi))));
+            }
+            Off::At(_) => {}
+            Off::Any => known = false,
+        }
+    }
+    let ext = match ext {
+        _ if !known => None,
+        None => Some((0, 0)),
+        Some((lo, hi)) => (lo >= i32::MIN as i64 && hi <= i32::MAX as i64).then_some((lo as i32, hi as i32)),
+    };
+    Some((returned, ext))
 }
 
 /// Keep addressable 16-byte SIMD values in vector registers, including the
@@ -7734,19 +7814,32 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
         // a slot whose address goes only to calls that keep no copy of it and do not return it
         // (`f.nocapture`: LLVM's nocapture from FunctionAttrs; reconcile's entries reached
         // Arc::drop_slow on the cold path of their `Option<Arc>` field): tracked, each such call
-        // reading the whole slot and maybe writing any of it
-        let nocap = |c: &Callee, k: u32| f.nocapture.iter().any(|x| x.0 == *c && x.1 == k && !x.2);
+        // reading and maybe writing the bytes of the slot its extent covers from where the slot is
+        // passed (all of them when the extent is not known)
+        let nocap_ext = |c: &Callee, k: u32| f.nocapture.iter().find(|x| x.0 == *c && x.1 == k && !x.2).map(|x| x.3);
+        let nocap = |c: &Callee, k: u32| nocap_ext(c, k).is_some();
         let nc_only: Vec<bool> = (0..ns).map(|s2| sc.esc[s2] && !sc.esc_other[s2] && sret_call[s2].is_none()
             && sc.call_args[s2].iter().all(|&(bi, ii, k)| matches!(&f.blocks[bi].insts[ii], Inst::Call(c, _, _) if nocap(c, k)))).collect();
         let tracked: Vec<bool> = (0..ns).map(|s2| f.slots[s2].size > 0 && (!sc.esc[s2] || sret_call[s2].is_some() || nc_only[s2])).collect();
-        // (block, inst) of a nocapture call -> the tracked slots it is passed
-        let mut nc_at: std::collections::HashMap<(usize, usize), Vec<u32>> = std::collections::HashMap::new();
+        // (block, inst) of a nocapture call -> the tracked slots' bytes it may read and write
+        // (slot, lo, hi; hi = i64::MAX: anywhere in the slot); a call touching none of a slot's
+        // bytes through its argument does not access the slot
+        let mut nc_at: std::collections::HashMap<(usize, usize), Vec<(u32, i64, i64)>> = std::collections::HashMap::new();
         for s2 in 0..ns {
             if nc_only[s2] && tracked[s2] {
-                for &(bi, ii, _) in &sc.call_args[s2] {
+                for &(bi, ii, k) in &sc.call_args[s2] {
+                    let Inst::Call(c, args, _) = &f.blocks[bi].insts[ii] else { continue };
+                    let r = match nocap_ext(c, k).flatten() {
+                        Some((lo, hi)) if lo == hi => continue,
+                        Some((lo, hi)) => {
+                            let at = vs[args[k as usize].0 as usize].1;
+                            (s2 as u32, at + lo as i64, at + hi as i64)
+                        }
+                        None => (s2 as u32, 0, i64::MAX),
+                    };
                     let v = nc_at.entry((bi, ii)).or_default();
-                    if !v.contains(&(s2 as u32)) {
-                        v.push(s2 as u32);
+                    if !v.contains(&r) {
+                        v.push(r);
                     }
                 }
             }
@@ -7940,7 +8033,7 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
         let is_cand = |s2: u32| cands.iter().any(|c| c.2 == s2 || c.3 == s2);
         let cand_read: Vec<bool> = f.blocks.iter().enumerate().map(|(bi, b)| (0..b.insts.len()).any(|ii| {
             let (rd, _) = acc(&b.insts[ii], bi, ii);
-            rd.is_some_and(|r| is_cand(r.0)) || nc_at.get(&(bi, ii)).is_some_and(|v| v.iter().any(|&s2| is_cand(s2)))
+            rd.is_some_and(|r| is_cand(r.0)) || nc_at.get(&(bi, ii)).is_some_and(|v| v.iter().any(|&(s2, _, _)| is_cand(s2)))
         })).collect();
         let near = |bi: usize| -> bool {
             let mut todo: Vec<(usize, u32)> = f.blocks[bi].term.succs().map(|t| (t as usize, 0)).collect();
@@ -7958,7 +8051,7 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
         let (conds, branch_cond) = slot_conds(f, &tr_slot, &near, &|bi: usize, ii: usize| {
             let (_, wr) = acc(&f.blocks[bi].insts[ii], bi, ii);
             let mut ws: Vec<(u32, i64, i64)> = wr.into_iter().collect();
-            if let Some(v) = nc_at.get(&(bi, ii)) { ws.extend(v.iter().map(|&s2| (s2, 0, i64::MAX))); }
+            if let Some(v) = nc_at.get(&(bi, ii)) { ws.extend(v.iter().copied()); }
             ws
         });
         let nf = conds.len();
@@ -7996,7 +8089,7 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
                         _ => {
                             let (_, wr) = acc(i, bi, ii);
                             let killed = wr.is_some_and(|(s2, lo, hi)| hit(s2, lo, hi))
-                                || nc_at.get(&(bi, ii)).is_some_and(|v| v.contains(&slot));
+                                || nc_at.get(&(bi, ii)).is_some_and(|v| v.iter().any(|&(s2, lo, hi)| hit(s2, lo, hi)));
                             if killed { CondEff::Kill } else { CondEff::Same }
                         }
                     }
@@ -8113,8 +8206,8 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
                 xfer(live, rd, wr);
             }
             if let Some(v) = nc_at.get(&(bi, ii)) {
-                for &s2 in v {
-                    xfer(live, Some((s2, 0, i64::MAX)), None);
+                for &r in v {
+                    xfer(live, Some(r), None);
                 }
             }
         };
@@ -8193,7 +8286,7 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
             for (ii, i) in b.insts.iter().enumerate() {
                 let (_, wr) = acc(i, bi, ii);
                 let mut ws: Vec<(u32, i64, i64)> = wr.into_iter().collect();
-                if let Some(v) = nc_at.get(&(bi, ii)) { ws.extend(v.iter().map(|&s2| (s2, 0, i64::MAX))); }
+                if let Some(v) = nc_at.get(&(bi, ii)) { ws.extend(v.iter().copied()); }
                 for (s2, lo, hi) in ws {
                     match bits(s2, lo, hi) {
                         Some((over, _)) => setb(&mut written, over.0, over.1),
@@ -8236,8 +8329,8 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
                     }
                 }
                 let (_, wr) = acc(&f.blocks[bi].insts[ii], bi, ii);
-                // a nocapture call may write any byte of the slots it is passed
-                let ncw: Vec<(u32, i64, i64)> = nc_at.get(&(bi, ii)).map_or(Vec::new(), |v| v.iter().map(|&s2| (s2, 0, i64::MAX)).collect());
+                // a nocapture call may write any byte of its extent in the slots it is passed
+                let ncw: Vec<(u32, i64, i64)> = nc_at.get(&(bi, ii)).cloned().unwrap_or_default();
                 // `cur` is live after this instruction: a write of one candidate slot needs the
                 // partner's same bytes dead here
                 for (s2, lo, hi) in wr.into_iter().chain(ncw.iter().copied()) {

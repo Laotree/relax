@@ -1165,6 +1165,13 @@ pub struct Slot {
     pub ret: bool,
 }
 
+/// The bytes a callee may read or write through a pointer argument, relative to that pointer:
+/// `[lo, hi)` (`lo == hi`: none), or None when not known (anywhere it can reach). LLVM gets the
+/// same from `dereferenceable` + memory-access attributes after FunctionAttrs; `Arc::drop_slow`
+/// touches only `[0, 8)` of the `&mut Arc` it gets, so the caller's other bytes around that field
+/// stay its own (coalesce_slot_copies).
+pub type Extent = Option<(i32, i32)>;
+
 #[derive(Clone)]
 pub struct Func {
     pub name: String,
@@ -1203,8 +1210,9 @@ pub struct Func {
     /// (callee, argument index, may return it) of calls whose callee keeps no copy of that
     /// pointer argument (codegen opt::param_escape over its body): a frame address passed there
     /// does not escape for sibling calls (tail.rs), the call's result is one when it may be
-    /// returned. Filled by the front end for bodies with tail-shaped calls.
-    pub nocapture: Vec<(Callee, u32, bool)>,
+    /// returned. Filled by the front end for bodies with tail-shaped calls. The fourth field is
+    /// the callee's access extent through that pointer (`Extent`).
+    pub nocapture: Vec<(Callee, u32, bool, Extent)>,
     /// Nounwind query answers consulted by this body's optimization, including false.
     /// They travel with the immutable O1 body, not with a mutable function slot.
     pub nounwind_inputs: Vec<(u32, bool)>,
@@ -1300,7 +1308,7 @@ impl Func {
         for c in &mut self.sret_callees {
             f(c);
         }
-        for (c, _, _) in &mut self.nocapture {
+        for (c, _, _, _) in &mut self.nocapture {
             if let Callee::Fn(c) | Callee::CFn(c, _) = c {
                 f(c);
             }
@@ -1352,7 +1360,7 @@ impl Func {
             && sret_callees.len() == o.sret_callees.len()
             && sret_callees.iter().zip(&o.sret_callees).all(|(x, y)| ma(*x) == mb(*y))
             && nocapture.len() == o.nocapture.len()
-            && nocapture.iter().zip(&o.nocapture).all(|(x, y)| x.1 == y.1 && x.2 == y.2 && callee_eq(&x.0, ma, &y.0, mb))
+            && nocapture.iter().zip(&o.nocapture).all(|(x, y)| x.1 == y.1 && x.2 == y.2 && x.3 == y.3 && callee_eq(&x.0, ma, &y.0, mb))
             && nounwind_inputs.len() == o.nounwind_inputs.len()
             && nounwind_inputs.iter().zip(&o.nounwind_inputs).all(|(x, y)| x.1 == y.1 && ma(x.0) == mb(y.0))
             && *baseline == o.baseline
@@ -1420,9 +1428,9 @@ impl Func {
             m(*x).hash(h);
         }
         nocapture.len().hash(h);
-        for (c, i, r) in nocapture {
+        for (c, i, r, e) in nocapture {
             callee(c, h, m);
-            (i, r).hash(h);
+            (i, r, e).hash(h);
         }
         nounwind_inputs.len().hash(h);
         for (x, v) in nounwind_inputs {
