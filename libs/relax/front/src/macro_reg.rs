@@ -61,6 +61,9 @@ pub struct UnitInfo {
     pub features: Vec<String>,
     pub deps: Vec<(usize, String)>,
     pub proc_macro: bool,
+    /// a registry/git package (CrateUnit::registry): third-party, sandboxed under a strict
+    /// proc-macro policy (pmhost::Policy)
+    pub registry: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -328,19 +331,19 @@ fn register(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], std_dir:
     let mut fresh = Vec::new();
     for (i, u) in units.iter().enumerate() {
         let same = if additive {
-            reg.units.iter().position(|r| r.name == u.name && r.src_path == u.src_path && r.edition == u.edition && r.features == u.features && r.proc_macro == u.proc_macro)
+            reg.units.iter().position(|r| r.name == u.name && r.src_path == u.src_path && r.edition == u.edition && r.features == u.features && r.proc_macro == u.proc_macro && r.registry == u.registry)
         } else {
             None
         };
         map[i] = same.unwrap_or_else(|| {
-            reg.units.push(UnitInfo { name: String::new(), src_path: String::new(), edition: 0, features: Vec::new(), deps: Vec::new(), proc_macro: false });
+            reg.units.push(UnitInfo { name: String::new(), src_path: String::new(), edition: 0, features: Vec::new(), deps: Vec::new(), proc_macro: false, registry: false });
             fresh.push(i);
             reg.units.len() - 1
         });
     }
     for &i in &fresh {
         let u = &units[i];
-        reg.units[map[i]] = UnitInfo { name: u.name.clone(), src_path: u.src_path.clone(), edition: u.edition, features: u.features.clone(), deps: u.deps.iter().map(|(d, n)| (map[*d], n.clone())).collect(), proc_macro: u.proc_macro };
+        reg.units[map[i]] = UnitInfo { name: u.name.clone(), src_path: u.src_path.clone(), edition: u.edition, features: u.features.clone(), deps: u.deps.iter().map(|(d, n)| (map[*d], n.clone())).collect(), proc_macro: u.proc_macro, registry: u.registry };
     }
     for &i in &fresh {
         let u = reg.units[map[i]].clone();
