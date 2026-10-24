@@ -665,7 +665,8 @@ mod tests {
     }
 
     /// Blocks another thread freed into a quiet owner's current chunk wait on its remote list; the
-    /// owner takes them when it is about to block (`before_wait`), and reuses their slots.
+    /// owner takes them when it is about to block (`before_wait`), and the chunk, sparse now,
+    /// gives their pages back.
     #[test]
     fn a_waiting_owner_takes_the_remote_frees() {
         symbol(b"relax_alloc");
@@ -691,12 +692,12 @@ mod tests {
             heap.inner.arena.densify(0);
             before_wait();
             assert_eq!(pending(&heap), 0, "the owner took them");
-            // their slots are reused: 4000 new blocks carve nothing new (touched bytes of the
-            // attached, listed and full chunks)
-            let touched = |h: &DomainHeap| { let a = h.states(); a[1] + a[5] + a[13] };
-            let before = touched(&heap);
+            // the chunk, sparse now, gave its whole free pages back with them
+            assert!(heap.states()[24] < 64 << 10, "free pages kept: {}", heap.states()[24]);
             let again: Vec<*mut u8> = (0..4000).map(|_| program_alloc(200, 8)).collect();
-            assert_eq!(touched(&heap), before);
+            for &p in &again {
+                std::ptr::write_bytes(p, 3, 200);
+            }
             for p in again {
                 program_dealloc(p, 200, 8);
             }

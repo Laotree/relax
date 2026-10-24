@@ -182,7 +182,7 @@ struct DomainTls {
     arena: Cell<*const Arena>,
     id: Cell<usize>,
     current: Cell<[Current; CLASSES]>,
-    /// The trim epoch of the thread's last pass over all its current chunks (`owner_wait`)
+    /// The trim epoch of the thread's last pass over all its current chunks (`owner_pass`)
     pass: Cell<usize>,
 }
 /// The calling thread's `DomainTls`. A const thread-local without drop glue cannot fail.
@@ -1091,15 +1091,8 @@ impl Arena {
     /// rewrite its free list. The released slots leave the list until the chunk is handed back.
     #[inline]
     unsafe fn owned_tick(&self, index: usize, class: usize, live: usize) {
-        let h = self.headers.get_unchecked(index);
-        // (what other threads freed here meanwhile is the owner's again: program heaps)
-        let live = if self.dynamic && h.remote.load(Ordering::Relaxed) != 0 {
-            self.drain(h, h.remote.swap(0, Ordering::Acquire));
-            (*h.owned.get()).live.load(Ordering::Relaxed)
-        } else {
-            live
-        };
         if live == 0 {
+            // (no free of another thread waits on its remote list: those count as live)
             self.release_emptied(index, class);
             return;
         }
@@ -1107,14 +1100,15 @@ impl Arena {
             return;
         }
         let epoch = self.trim_epoch.load(Ordering::Relaxed);
-        // once per epoch the thread looks at all its current chunks, not only this one: the
-        // classes it stopped using keep what other threads freed into them (a thread that never
-        // waits in std, as a UI thread in its event loop, has no other moment for it). The pass
-        // looks at this chunk too.
+        // once per epoch the thread settles all its current chunks, not only this one: the blocks
+        // other threads freed into them wait on their remote lists, and the classes it stopped
+        // using have no other moment for it (a thread that never waits in std, as a UI thread in
+        // its event loop). The pass looks at this chunk too. (Only the pass reads the remote
+        // lists: other threads write that line.)
         let passed = DOMAIN.try_with(|t| {
             if t.pass.get() != epoch && std::ptr::eq(t.arena.get(), self) {
                 t.pass.set(epoch);
-                self.owner_wait(t);
+                self.owner_pass(t);
                 true
             } else {
                 false
@@ -1123,6 +1117,12 @@ impl Arena {
         if passed == Ok(true) {
             return;
         }
+        self.trim_owned(index, live, epoch);
+    }
+    /// A sparse current chunk `index` of the calling owner (`live` blocks) gives its whole free
+    /// granules back, once per trim epoch.
+    unsafe fn trim_owned(&self, index: usize, live: usize, epoch: usize) {
+        let h = self.headers.get_unchecked(index);
         let o = &mut *h.owned.get();
         let bump = o.bump.load(Ordering::Relaxed);
         if bump < OWNED_TRIM_MIN || live * o.stride * 4 >= bump || o.trim_seen == epoch {
@@ -1135,23 +1135,31 @@ impl Arena {
             o.free = head;
         }
     }
-    /// `domain_wait`: the owner thread `t` of this program heap drains the remote lists of its
-    /// current chunks and looks at each of them (`owned_tick`).
-    unsafe fn owner_wait(&self, t: &DomainTls) {
+    /// The owner thread `t` of this program heap settles its current chunks (`domain_wait`, the
+    /// first tick of an epoch): what other threads freed into them is its own again, an emptied
+    /// one goes back, a sparse one gives its whole free pages back.
+    unsafe fn owner_pass(&self, t: &DomainTls) {
         if !COMPILER || !self.dynamic {
             return;
         }
+        let epoch = self.trim_epoch.load(Ordering::Relaxed);
         for class in 0..CLASSES {
             let c = t.current.as_ptr().cast::<Current>().add(class).read();
             if c.index == NONE {
                 continue;
             }
             let h = self.headers.get_unchecked(c.index);
-            let o = &*h.owned.get();
-            if o.bump.load(Ordering::Relaxed) > OWNED_KEEP_MAX {
-                self.owned_tick(c.index, class, o.live.load(Ordering::Relaxed));
-            } else if h.remote.load(Ordering::Relaxed) != 0 {
+            if h.remote.load(Ordering::Relaxed) != 0 {
                 self.drain(h, h.remote.swap(0, Ordering::Acquire));
+            }
+            let (live, bump) = {
+                let o = &*h.owned.get();
+                (o.live.load(Ordering::Relaxed), o.bump.load(Ordering::Relaxed))
+            };
+            if live == 0 && bump > OWNED_KEEP_MAX {
+                self.release_emptied(c.index, class);
+            } else if live != 0 {
+                self.trim_owned(c.index, live, epoch);
             }
         }
     }
@@ -2548,7 +2556,7 @@ pub unsafe fn domain_wait() {
             let epoch = a.trim_epoch.load(Ordering::Relaxed);
             if t.pass.get() != epoch {
                 t.pass.set(epoch);
-                a.owner_wait(t);
+                a.owner_pass(t);
             }
         }
     });
