@@ -327,17 +327,18 @@ pub fn node_fleet_dir() -> PathBuf {
         .join("fleet")
 }
 
-/// This process's credential: a node's own (set at start, else the node fleet
-/// dir's `node.credential`), else `MAKEPAD_AI_HUB_CREDENTIAL`, else
-/// `~/.makepad/ai-hub/client.credential`.
+/// This process's credential: a node's own (set at start), else
+/// `MAKEPAD_AI_HUB_CREDENTIAL`, else `~/.makepad/ai-hub/client.credential`, else
+/// the node fleet dir's `node.credential` (a machine whose only credential is its
+/// node one; a person's lan credential wins, since roles reach different routes).
 pub fn own_credential() -> Option<Credential> {
     let text = NODE_CREDENTIAL_TEXT
         .get()
         .cloned()
         .flatten()
-        .or_else(|| fs::read_to_string(node_fleet_dir().join(NODE_CREDENTIAL)).ok())
         .or_else(|| std::env::var("MAKEPAD_AI_HUB_CREDENTIAL").ok())
-        .or_else(|| fs::read_to_string(client_dir().join(CLIENT_CREDENTIAL)).ok())?;
+        .or_else(|| fs::read_to_string(client_dir().join(CLIENT_CREDENTIAL)).ok())
+        .or_else(|| fs::read_to_string(node_fleet_dir().join(NODE_CREDENTIAL)).ok())?;
     Credential::parse(&text)
 }
 
