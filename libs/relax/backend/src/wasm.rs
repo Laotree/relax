@@ -449,7 +449,7 @@ impl<'a> Module<'a> {
     /// rounds: a parameter's uses as a narrow argument of another function count from the second.
     fn signatures(&self, funcs: &[(u32, &Func)], body_of: &dyn Fn(usize) -> &'a Func, link: &dyn Link) -> Vec<Sig> {
         let n = funcs.len();
-        let mut sigs: Vec<Sig> = funcs.iter().map(|(_, f)| Sig { params: vec![0; f.params.len()], ret: 0 }).collect();
+        let mut sigs: Vec<Sig> = funcs.iter().map(|(_, f)| Sig { params: vec![0; f.params.len()], ret: vec![0; f.rets.len()] }).collect();
         if self.opts.memory64 {
             return sigs;
         }
@@ -498,12 +498,11 @@ impl<'a> Module<'a> {
                 }).collect();
                 let k = narrow_kinds(f, &self.opts, link, &seeds, &csig);
                 let params: Vec<u8> = f.params.iter().map(|p| k[p.0 as usize]).collect();
-                let mut ret = 0u8;
-                if f.rets.len() == 1 && f.rets[0] == Cls::I {
-                    ret = KZ | KS;
-                    for b in &f.blocks {
-                        if let Term::Ret(vs) = &b.term {
-                            ret &= vs.first().map_or(0, |v| k[v.0 as usize] & (KZ | KS));
+                let mut ret: Vec<u8> = f.rets.iter().map(|c| if *c == Cls::I { KZ | KS } else { 0 }).collect();
+                for b in &f.blocks {
+                    if let Term::Ret(vs) = &b.term {
+                        for (r, v) in ret.iter_mut().zip(vs) {
+                            *r &= k[v.0 as usize] & (KZ | KS);
                         }
                     }
                 }
@@ -1318,8 +1317,13 @@ fn narrow_kinds<'s>(f: &Func, o: &Options, link: &dyn Link, pk: &[u8], csig: &dy
                     Inst::Sel(d, _, a, x) if f.vregs[d.0 as usize] == Cls::I => put(&mut n, d, top(&k, a) & top(&k, x)),
                     Inst::Mov(d, a) if f.vregs[d.0 as usize] == Cls::I => put(&mut n, d, top(&k, a)),
                     Inst::VExtract(d, _, _) if f.vregs[d.0 as usize] == Cls::I => put(&mut n, d, KS),
+                    Inst::Call(Callee::Fn(id) | Callee::CFn(id, _), _, ref rets) if rets.len() > 1 => {
+                        for (k, r) in rets.iter().enumerate() {
+                            put(&mut n, *r, csig(id).map_or(0, |s| s.ret.get(k).copied().unwrap_or(0)));
+                        }
+                    }
                     Inst::Call(Callee::Fn(id) | Callee::CFn(id, _), _, ref rets) if rets.len() == 1 => {
-                        put(&mut n, rets[0], csig(id).map_or(0, |s| s.ret))
+                        put(&mut n, rets[0], csig(id).map_or(0, |s| s.ret[0]))
                     }
                     _ => i.defs(|d| put(&mut n, d, 0)),
                 }
@@ -1541,7 +1545,7 @@ fn prepare(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &Has
 #[derive(Clone, Debug, Default)]
 struct Sig {
     params: Vec<u8>,
-    ret: u8,
+    ret: Vec<u8>,
 }
 
 fn func_type_sig(f: &Func, sig: &Sig) -> Result<FnType, String> {
@@ -1551,8 +1555,10 @@ fn func_type_sig(f: &Func, sig: &Sig) -> Result<FnType, String> {
             *p = Val::I32;
         }
     }
-    if sig.ret != 0 {
-        t.results[0] = Val::I32;
+    for (r, k) in t.results.iter_mut().zip(&sig.ret) {
+        if *k != 0 {
+            *r = Val::I32;
+        }
     }
     Ok(t)
 }
@@ -3395,8 +3401,8 @@ impl<'a> Fx<'a> {
                     }
                     self.call(FRef::User(u));
                     // a narrow result into a wide vreg: extended here (the value's whole form)
-                    if cs.ret != 0 && rets.len() == 1 && self.nk[rets[0].0 as usize] == 0 {
-                        self.op(if cs.ret & KZ != 0 { EXT_U } else { EXT_S });
+                    if rets.len() == 1 && cs.ret[0] != 0 && self.nk[rets[0].0 as usize] == 0 {
+                        self.op(if cs.ret[0] & KZ != 0 { EXT_U } else { EXT_S });
                     }
                 }
                 None => {
@@ -3492,7 +3498,18 @@ impl<'a> Fx<'a> {
             if self.last_transfer != before && self.last_transfer == self.out.len() {
                 return Ok(()); // a trap
             }
-            for r in rets.iter().rev() {
+            // a callee's narrow results into wide vregs: extended as each leaves the stack (a single
+            // result was extended by call_inst)
+            let rk: Vec<u8> = match &inst {
+                Inst::Call(Callee::Fn(id) | Callee::CFn(id, _), _, _) if rets.len() > 1 => {
+                    self.fn_ix.get(id).map_or_else(|| vec![0; rets.len()], |&u| self.sigs[u as usize].ret.clone())
+                }
+                _ => vec![0; rets.len()],
+            };
+            for (k, r) in rets.iter().enumerate().rev() {
+                if rk.get(k).is_some_and(|x| *x != 0) && self.nk[r.0 as usize] == 0 {
+                    self.op(if rk[k] & KZ != 0 { EXT_U } else { EXT_S });
+                }
                 self.set(*r);
             }
             return Ok(());
@@ -3692,8 +3709,8 @@ impl<'a> Fx<'a> {
             Term::Jump(x) => self.do_branch(b, *x)?,
             Term::Branch(c, x, y) => self.branch(b, *c, *x, *y)?,
             Term::Ret(vs) => {
-                let narrow = self.sigs[self.me].ret != 0;
-                for v in vs {
+                for (k, v) in vs.iter().enumerate() {
+                    let narrow = self.sigs[self.me].ret.get(k).is_some_and(|x| *x != 0);
                     self.value(b, *v, if narrow { Want::Low } else { Want::Nat })?;
                 }
                 self.restore_sp();
