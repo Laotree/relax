@@ -967,7 +967,12 @@ fn x64_defers(b: &Block, k: usize, uses: &[u32]) -> bool {
             _ => false,
         },
         Inst::IBinI(IOp::And, _, t, x, _) if x != t && once(t) => matches!(*next, Inst::ICmpI(Cond::Eq | Cond::Ne, _, c, t2, 0) if t2 == t && branch_on(c)),
-        Inst::Load(Mem::Int(..), t, base, _) if base != t && once(t) => matches!(*next, Inst::ICmpI(_, _, c, t2, _) if t2 == t && branch_on(c)),
+        // (or against a register: cmp [p + o], r -- a 64-bit load: ICmp compares whole registers)
+        Inst::Load(Mem::Int(sz, _), t, base, _) if base != t && once(t) => match *next {
+            Inst::ICmpI(_, _, c, t2, _) => t2 == t && branch_on(c),
+            Inst::ICmp(_, _, c, x, y) => sz == 8 && (x == t) != (y == t) && branch_on(c),
+            _ => false,
+        },
         Inst::IBin(IOp::Shr, it, s, m, t) if it.bits == 64 && !it.signed && m != s && t != s && once(s) => matches!(*next, Inst::IBinI(IOp::And, _, d, s2, 1) if s2 == s && branch_on(d)),
         _ => false,
     }
@@ -1033,6 +1038,12 @@ struct Gen<'a> {
     /// `t = load [base + off]; c = t cmp K` feeding the branch (t used once): cmp [base + off], K
     /// in the load's width -- (base, off, bytes, K)
     load_fuse: Option<(VReg, i32, u8, i64)>,
+    /// `t = load64 [base + off]; c = t cmp r` (or `r cmp t`) feeding the branch (t used once):
+    /// cmp [base + off], r / cmp r, [base + off] -- (base, off, r, the load is the left operand)
+    load_cmp: Option<(VReg, i32, VReg, bool)>,
+    /// per block: its loop depth (a branch whose targets are both laid out above jumps
+    /// conditionally to the deeper one: the loop's back edge)
+    depth: Vec<u32>,
     /// the last spill store emitted: (rbp displacement, register, position right after it)
     last_spill: Option<(i32, u8, usize)>,
     /// spill windows (Alloc::windows): vreg -> (first use pos, last use pos, register); and the
@@ -1455,6 +1466,7 @@ impl<'a> Gen<'a> {
 
     fn gen(&mut self, options: &relax_session::Options) {
         let reach = regalloc::reachable(self.f);
+        self.depth = regalloc::loop_depths(self.f, &reach);
         // a naked fn is its asm block only
         if self.f.naked {
             self.blocks_and_pool(options, reach);
@@ -1651,6 +1663,14 @@ impl<'a> Gen<'a> {
                     }
                 }
             }
+            self.load_cmp = None;
+            if fused && n >= 2 && self.test_fuse.is_none() && self.load_fuse.is_none() && !crate::stats::opt_off(options, "-loadcmp") {
+                if let (Inst::Load(Mem::Int(8, _), t, base, off), Inst::ICmp(_, _, _, x, y)) = (&b.insts[n - 2], &b.insts[n - 1]) {
+                    if (x == t) != (y == t) && base != t && self.al.uses[t.0 as usize] == 1 && x64_defers(b, n - 2, &self.al.uses) {
+                        self.load_cmp = Some((*base, *off, if x == t { *y } else { *x }, x == t));
+                    }
+                }
+            }
             // a branch on bit t of m: bt m, t (CF = bit t mod 64, as the 64-bit shift reads t)
             self.bt_fuse = None;
             if !fused && n >= 2 {
@@ -1699,7 +1719,7 @@ impl<'a> Gen<'a> {
                 if fused && ii == n - 1 {
                     break;
                 }
-                if (self.test_fuse.is_some() || self.load_fuse.is_some() && !load_branch) && ii == n - 2 {
+                if (self.test_fuse.is_some() || self.load_cmp.is_some() || self.load_fuse.is_some() && !load_branch) && ii == n - 2 {
                     continue;
                 }
                 if load_branch && ii == n - 1 {
@@ -2896,6 +2916,16 @@ impl<'a> Gen<'a> {
                 let next = self.next_block[bi];
                 // integer condition code for `c` true
                 let icond: Option<u8> = match &fused {
+                    Some(Inst::ICmp(cond, signed, _, _, _)) if self.load_cmp.is_some() => {
+                        let (base, off, other, load_lhs) = self.load_cmp.take().unwrap();
+                        let ro = self.use_i(options, other, R10);
+                        let (rb, disp) = self.base_disp(options, base, R11, off);
+                        // REX.W 39 /r: cmp r/m64, r64 (load - r); REX.W 3B /r: cmp r64, r/m64 (r - load)
+                        self.a.rex(true, ro, 0, rb, false);
+                        self.a.byte(if load_lhs { 0x39 } else { 0x3b });
+                        self.a.modrm_mem(ro, rb, disp);
+                        Some(icc(*cond, *signed))
+                    }
                     Some(Inst::ICmp(cond, signed, _, x, y)) => {
                         self.cmp_vregs(options, *x, *y);
                         Some(icc(*cond, *signed))
@@ -2981,7 +3011,10 @@ impl<'a> Gen<'a> {
                 if self.thru(*tt) == self.thru(next) {
                     // fall into the true block: branch on the inverted condition
                     self.jcc_to(cc ^ 1, *ff);
-                } else if self.thru(*ff) != self.thru(next) && back(self, *ff) && (!back(self, *tt) || (self.thru(*ff) == bi as u32 && self.thru(*tt) != bi as u32)) {
+                } else if self.thru(*ff) != self.thru(next) && back(self, *ff) && (!back(self, *tt) || (self.thru(*ff) == bi as u32 && self.thru(*tt) != bi as u32)
+                    // both laid out above (a latch whose exit is a shared epilogue): the jcc takes
+                    // the loop's back edge, the deeper target (cmp; jne loop -- not je exit; jmp loop)
+                    || self.thru(*tt) != bi as u32 && self.depth.get(self.thru(*ff) as usize) > self.depth.get(self.thru(*tt) as usize)) {
                     // neither falls through and the false edge loops: the conditional jump takes the
                     // back edge (one taken branch per iteration instead of a not-taken jcc + jmp)
                     self.jcc_to(cc ^ 1, *ff);
@@ -6458,6 +6491,8 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         test_fuse: None,
         bt_fuse: None,
         load_fuse: None,
+        load_cmp: None,
+        depth: Vec::new(),
         jt_fix: Vec::new(),
         last_spill: None,
         win,

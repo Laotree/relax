@@ -362,6 +362,7 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     }
     let mut front = FrontShared::new(sess);
     front.census_id = u.front.census_id;
+    front.checker_id = u.front.checker_id;
     front.warm_cache.store(u.front.warm_cache.load(Ordering::Relaxed), Ordering::Relaxed);
     for (i, f) in u.fns.iter().enumerate() {
         front.slot_keys.insert(i as u32, f.key.clone());
@@ -370,6 +371,7 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     lay.opaque = u.lay.opaque.clone();
     let const_failed = u.const_failed.clone();
     let query_errors = tcx.dcx.clone();
+    let checked_epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
     // the replace: nothing can fail from here
     u.front.retire_memos();
     let mut rir = Vec::new();
@@ -403,6 +405,8 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     });
     u.prog.body_memos.store(true, Ordering::Relaxed);
     u.tcx.publish_collected();
+    // the background borrow checker keeps every verdict and queued check (the same program)
+    crate::borrowck::lazy::carry_whole(u.front.checker_id, checked_epoch, u.tcx.collect_epoch.load(Ordering::SeqCst));
     set_shared_front(u, u.core_crate);
     crate::run::set_diagnostics(u.tcx.dcx.clone());
     // every thread's compiler memos go at its next access (dropped there, by value)
