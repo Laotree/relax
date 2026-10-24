@@ -1090,12 +1090,19 @@ impl Arena {
     #[inline]
     unsafe fn owned_tick(&self, index: usize, class: usize, live: usize) {
         let h = self.headers.get_unchecked(index);
-        let o = &mut *h.owned.get();
-        let bump = o.bump.load(Ordering::Relaxed);
+        // (what other threads freed here meanwhile is the owner's again: program heaps)
+        let live = if self.dynamic && h.remote.load(Ordering::Relaxed) != 0 {
+            self.drain(h, h.remote.swap(0, Ordering::Acquire));
+            (*h.owned.get()).live.load(Ordering::Relaxed)
+        } else {
+            live
+        };
         if live == 0 {
             self.release_emptied(index, class);
             return;
         }
+        let o = &mut *h.owned.get();
+        let bump = o.bump.load(Ordering::Relaxed);
         if !self.dynamic || bump < OWNED_TRIM_MIN || live * o.stride * 4 >= bump {
             return;
         }
@@ -1122,12 +1129,11 @@ impl Arena {
                 continue;
             }
             let h = self.headers.get_unchecked(c.index);
-            if h.remote.load(Ordering::Relaxed) != 0 {
-                self.drain(h, h.remote.swap(0, Ordering::Acquire));
-            }
             let o = &*h.owned.get();
             if o.bump.load(Ordering::Relaxed) > OWNED_KEEP_MAX {
                 self.owned_tick(c.index, class, o.live.load(Ordering::Relaxed));
+            } else if h.remote.load(Ordering::Relaxed) != 0 {
+                self.drain(h, h.remote.swap(0, Ordering::Acquire));
             }
         }
     }
