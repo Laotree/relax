@@ -1662,9 +1662,9 @@ mod ice_scope_tests {
     #[test]
     fn ice_scope_is_per_thread_and_the_hook_is_never_swapped() {
         super::install_ice_hook();
-        let _s = super::IceScope::enter();
+        let s = super::IceScope::enter();
         crate::lifeline::clear_panic_at();
-        assert!(super::ICE_SCOPE.with(|c| c.get()) > 0);
+        let entered = super::ICE_SCOPE.with(|c| c.get()) > 0;
         let other = std::thread::spawn(|| {
             let in_scope = super::ICE_SCOPE.with(|c| c.get()) > 0;
             let r = std::panic::catch_unwind(|| panic!("ice-scope test panic"));
@@ -1672,11 +1672,17 @@ mod ice_scope_tests {
         })
         .join()
         .unwrap();
+        // the build thread's own record is untouched by the other thread's panic
+        let own = crate::lifeline::panic_at();
+        // out of the silent scope before asserting: a failed assert here must print
+        drop(s);
+        assert!(entered);
         assert!(!other.0, "another thread inherited the build's silent scope");
         assert!(other.1);
-        assert!(other.2.starts_with("jit.rs:"), "the hook recorded no position: {:?}", other.2);
-        // the build thread's own record is untouched by the other thread's panic
-        assert_eq!(crate::lifeline::panic_at(), "");
+        // the position as the panic reports it (file!(): workspace-relative under cargo), its tail
+        // when longer than the record
+        assert!(other.2.rsplit_once(':').is_some_and(|(f, _)| !f.is_empty() && file!().ends_with(f)), "the hook recorded no position in this file: {:?}", other.2);
+        assert_eq!(own, "");
     }
 }
 
