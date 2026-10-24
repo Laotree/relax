@@ -7874,6 +7874,9 @@ pub(crate) fn inline_attrs(prog: &crate::program::Program, d: DefId) -> u8 {
     let it = f.ast.item(def.item);
     let mut r = 0;
     for a in f.ast.list(it.attrs) {
+        if a.toks.hi > a.toks.lo && f.tok_text(a.toks.lo) == "cold" {
+            r |= relax_codegen::opt::ATTR_COLD_SRC;
+        }
         if a.toks.hi > a.toks.lo && f.tok_text(a.toks.lo) == "inline" {
             if (a.toks.lo..a.toks.hi).any(|i| f.tok_text(i) == "never") {
                 return 0;

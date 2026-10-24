@@ -93,6 +93,10 @@ pub const ATTR_COLD: u8 = 8;
 /// a small leaf that cannot unwind (rustc_mir_transform/src/cross_crate_inline.rs: no calls, no
 /// landing pads or resumes, <= 100 statements)
 pub const ATTR_XCRATE: u8 = 16;
+/// `#[cold]` in the source: rustc's MIR inliner never inlines it (check_inline.rs: "cold") and
+/// LLVM only within its cold-callsite threshold, so it stays a call unless no bigger than the free
+/// size (the slow paths std keeps out of line: Vec's do_reserve_and_handle, capacity_overflow)
+pub const ATTR_COLD_SRC: u8 = 32;
 /// size limit of rule 4 (fused chains; the callee may call: its callees were inlined bottom-up)
 pub const INLINE_CHAIN_INSTS: usize = 120;
 pub const INLINE_SINGLE_INSTS: usize = 3000;
@@ -319,7 +323,7 @@ pub fn inline_calls(options: &relax_session::Options, f: &mut Func, self_id: u32
             // growth, and inlining them shrinks the caller (LLVM's inline cost for a callee
             // below the call penalty); a big caller would otherwise keep its tiny calls
             let free = size <= INLINE_FREE_INSTS && size <= free_budget;
-            let rule = if attrs & ATTR_COLD != 0 && !free { None } else { rule };
+            let rule = if attrs & (ATTR_COLD | ATTR_COLD_SRC) != 0 && !free { None } else { rule };
             let rule = match rule {
                 Some(r) if (free || size <= budget) && callee.params.len() == args.len() && callee.rets.len() == rets.len() => r,
                 _ => {
@@ -860,6 +864,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
             let refused = matches!(f.blocks[bi].term, Term::Unreachable | Term::Resume)
                 || ancestry[bi].contains(&id) || rule.is_none()
                 || attrs & ATTR_COLD != 0 && !free && rule != Some(RULE_COST)
+                || attrs & ATTR_COLD_SRC != 0 && !free
                 || callee.params.len() != args.len() || callee.rets.len() != rets.len()
                 || match rule.unwrap() {
                     _ if no_growth => false,
@@ -877,7 +882,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
                     mk(WHY_RECURSIVE, 0, 0)
                 } else if rule.is_none() {
                     mk(WHY_NO_RULE, attrs as usize, 0)
-                } else if attrs & ATTR_COLD != 0 && !free && rule != Some(RULE_COST) {
+                } else if attrs & ATTR_COLD != 0 && !free && rule != Some(RULE_COST) || attrs & ATTR_COLD_SRC != 0 && !free {
                     mk(WHY_COLD_ATTR, 0, 0)
                 } else if callee.params.len() != args.len() || callee.rets.len() != rets.len() {
                     mk(WHY_ARITY, 0, 0)
@@ -994,7 +999,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
                     let rule = site_rule(options, c, *id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), *id), ancestry[bi].len() - 1, multi_depths[bi], &lim_b);
                     if ancestry[bi].contains(id) || rule.is_none() {
                         2
-                    } else if attrs & ATTR_COLD != 0 && rule != Some(RULE_COST) && !(inline_inst_count(c) <= INLINE_FREE_INSTS && inline_inst_count(c) <= free_budget) {
+                    } else if (attrs & ATTR_COLD != 0 && rule != Some(RULE_COST) || attrs & ATTR_COLD_SRC != 0) && !(inline_inst_count(c) <= INLINE_FREE_INSTS && inline_inst_count(c) <= free_budget) {
                         0
                     } else if c.params.len() != args.len() || c.rets.len() != rets.len() {
                         4
