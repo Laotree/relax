@@ -2835,8 +2835,8 @@ impl Cache {
     /// over what the old one learned about this process: which data objects and slots were
     /// linked from which entries (a second link of the same data object must find its address,
     /// not place a copy), the entries it rejected, the counters, and that the collected program
-    /// was committed (the exit does not encode it again). The old cache has nothing pending
-    /// (`pending_entries`).
+    /// was committed (the exit does not encode it again). The old cache's recorded entries were
+    /// written to the stores before this one opened them (`spill_take`).
     pub(crate) fn inherit_run_state(&mut self, old: &Cache) {
         self.data_addr = old.data_addr.clone();
         self.const_copy = old.const_copy.clone();
@@ -2850,11 +2850,6 @@ impl Cache {
         self.manifest_done = old.manifest_done;
         self.collected_committed = true;
         self.stats = old.stats.clone();
-    }
-
-    /// Entries recorded and not yet spilled (the settle rebuild waits for none).
-    pub(crate) fn pending_entries(&self) -> usize {
-        self.pending.len()
     }
 
     /// Reads the newest startup manifest of the program rooted at crate `root` (and its

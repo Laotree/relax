@@ -5634,21 +5634,21 @@ pub fn veneer(target: u64) -> Vec<u8> {
 /// Bytes per count stub (`count_stub`; the stubs of a block are this far apart).
 pub const COUNT_STUB_SIZE: usize = 80;
 
-/// Per-slot call counter (tier-up) at `at` (0: not known yet): while a function runs at O1 its
-/// table slot points here. `*counter -= 1`; on reaching 0 jumps to `hot` (a lazy_entry-style
-/// glue: x16 = slot, returns the address to continue at), else to the O1 code: `b` when in reach,
-/// else through x16. Argument registers, sp and lr are untouched; only x16/x17 (the AAPCS veneer
-/// registers) are used.
-pub fn count_stub(at: u64, counter: u64, slot: u32, code: u64, hot: u64) -> Vec<u8> {
+/// Per-slot cost budget (tier-up) at `at` (0: not known yet): while a function runs below O3 its
+/// table slot points here. `*budget -= weight` (the call's estimated cost, at most 4095); at or
+/// below 0 (signed) jumps to `hot` (a lazy_entry-style glue: x16 = slot, returns the address to
+/// continue at), else to the code: `b` when in reach, else through x16. Argument registers, sp and
+/// lr are untouched; only x16/x17 (the AAPCS veneer registers) are used.
+pub fn count_stub(at: u64, counter: u64, slot: u32, code: u64, hot: u64, weight: u32) -> Vec<u8> {
     let mut a = Asm { w: Vec::with_capacity(COUNT_STUB_SIZE / 4) };
     a.mov_imm64_fixed(IP0, counter);
     a.ldst(LDRX, 8, IP1, IP0, 0);
-    // subs x17, x17, #1
-    a.e(0xF100_0000 | 1 << 10 | (IP1 as u32) << 5 | IP1 as u32);
+    // subs x17, x17, #weight
+    a.e(0xF100_0000 | weight.clamp(1, 4095) << 10 | (IP1 as u32) << 5 | IP1 as u32);
     a.ldst(STRX, 8, IP1, IP0, 0);
-    // b.eq hot (patched below)
+    // b.le hot (patched below)
     let beq = a.pos();
-    a.e(0x5400_0000);
+    a.e(0x5400_000D);
     let pc = at + 4 * a.pos() as u64;
     let d = code.wrapping_sub(pc) as i64;
     if at != 0 && d & 3 == 0 && (-(1i64 << 27)..1i64 << 27).contains(&d) {
