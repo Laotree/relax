@@ -16885,8 +16885,6 @@ pub fn startup_main(runtime: &crate::options::RuntimeOptions) {
         relax_codegen::exec_census::startup_release(FIRST_PRESENT.load(Ordering::Acquire));
         STARTUP_PHASE.store(2, Ordering::Release);
         SPEC_WAKE.notify_all();
-        // the real-time reach held for the release (its marks came before it)
-        realtime_release();
         set_worker();
         // the cache entries of the installs made before the present; nothing of the unit is kept
         // in between
@@ -21573,8 +21571,9 @@ fn present_files() -> bool {
 // too (after the request that made them). New code installed later for a slot of the set (an O2 or
 // O3 build, a verdict's rebuild that calls the verified bodies instead of their SPEC-V twins) has
 // its new callees walked too. The marking thread never waits for this: the reach runs in bounded
-// owner steps between the program's requests, after the startup release (the first present), and
-// the mark's ticket says when it is done (the platform hands the HAL its audio entry then). The
+// owner steps between the program's requests, and the mark's ticket says when it is done or has
+// waited long enough (RT_WAIT: the platform hands the HAL its audio entry then; audio never waits
+// longer for its code, what is still missing then compiles on its first call). The
 // slots this reaches are recorded in the disk cache (rt-<crate>.keys) and compiled first at the
 // next run's mark. A lazy compile a real-time thread still meets is reported, compiles everything
 // its slot reaches at once and is recorded too.
@@ -21606,11 +21605,8 @@ struct RealTime {
     link: Vec<u32>,
     todo: Vec<u32>,
     new_dyns: Vec<u32>,
-    /// a step is posted to the owner / the reach waits for the startup release
+    /// a step is posted to the owner
     scheduled: bool,
-    parked: bool,
-    /// a real-time thread runs this code already: the reach is not held for the startup release
-    urgent: bool,
     /// the newest ticket whose roots are in the reach, and the wakes of tickets not done yet
     added: u64,
     wakes: Vec<(u64, Option<crate::domain::Callback>, usize)>,
@@ -21659,15 +21655,41 @@ extern "C" fn __relax_realtime(root: usize, data: usize, meta: usize, wake: usiz
     }
     let ticket = RT_TICKET.fetch_add(1, Ordering::AcqRel) + 1;
     let scope = crate::domain::callback();
+    let due = wall_ns() + rt_wait_ns();
+    crate::zone_alloc::kept_with(|| RT_DUE.lock().unwrap_or_else(|e| e.into_inner()).push((ticket, due)));
+    // the wake also comes when the ticket is due (the reach may still run)
+    if wake != 0 {
+        let wait = rt_wait_ns();
+        let _ = std::thread::Builder::new().name("run-rt-wake".into()).spawn(move || {
+            std::thread::sleep(std::time::Duration::from_nanos(wait));
+            if RT_DONE.load(Ordering::Acquire) < ticket {
+                if rt_trace() {
+                    eprintln!("makepad-run rt: ticket {} due after {} ms with the reach still running: the callback starts now", ticket, wait / 1_000_000);
+                }
+                call_wake(scope, wake);
+            }
+        });
+    }
     let upn = up as usize;
     owner::call(owner::Class::Program, move || unsafe { realtime_mark(upn as *mut Unit, root as u64, data as u64, meta as u64, ticket, scope, wake) });
     ticket
 }
 
-/// std::relax::realtime's ticket is done: everything its mark reaches is compiled.
+/// std::relax::realtime's ticket is ready: everything its mark reaches is compiled, or the caller
+/// waited RT_WAIT_NS for it (audio starts promptly; what is not compiled yet then compiles on its
+/// first call there, reported: a click beats no audio).
 extern "C" fn __relax_realtime_ready(ticket: u64) -> bool {
-    RT_DONE.load(Ordering::Acquire) >= ticket
+    RT_DONE.load(Ordering::Acquire) >= ticket || RT_DUE.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(t, at)| t == ticket && wall_ns() >= at)
 }
+
+/// How long a real-time callback waits for its code at most (MAKEPAD_RUN_RT_WAIT_MS, default 300).
+fn rt_wait_ns() -> u64 {
+    static NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *NS.get_or_init(|| std::env::var("MAKEPAD_RUN_RT_WAIT_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(300) * 1_000_000)
+}
+
+/// Tickets not done and when they are due anyway (wall ns).
+static RT_DUE: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
 
 unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64, ticket: u64, scope: Option<crate::domain::Callback>, wake: usize) {
     let u = &mut *up;
@@ -21702,7 +21724,7 @@ unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64, ticket: 
     // objects the code only makes itself are followed through the vtables its code names.
     dyns.extend(realtime_value_dyns(u, &values));
     // (the step it schedules runs after this owner request)
-    realtime_reach_queued(up, roots, "mark", false);
+    realtime_reach_queued(up, roots, "mark");
     with_rt(|rt| {
         // (their vtables are followed when the walk has done the roots' slots)
         rt.new_dyns.extend(dyns);
@@ -21713,41 +21735,19 @@ unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64, ticket: 
     });
 }
 
-/// Adds `roots` to the reach and schedules its next owner step. `urgent`: a real-time thread is
-/// running this code already (a miss, a new vtable, new code): not held for the startup release.
-pub(crate) unsafe fn realtime_reach_queued(up: *mut Unit, roots: Vec<u32>, why: &'static str, urgent: bool) {
+/// Adds `roots` to the reach and schedules its next owner step.
+pub(crate) unsafe fn realtime_reach_queued(up: *mut Unit, roots: Vec<u32>, why: &'static str) {
     RT_ANY.store(true, Ordering::Release);
     let post = with_rt(|rt| {
-        if rt.todo.is_empty() && rt.link.is_empty() && rt.new_dyns.is_empty() && !rt.scheduled && !rt.parked {
+        if rt.todo.is_empty() && rt.link.is_empty() && rt.new_dyns.is_empty() && !rt.scheduled {
             rt.n0 = rt.set.len();
             rt.compiled = 0;
             rt.ns = 0;
             rt.why = why;
         }
         rt.todo.extend(roots);
-        if urgent {
-            rt.urgent = true;
-            rt.parked = false;
-        }
-        let post = !rt.scheduled && !rt.parked;
-        rt.scheduled |= post;
-        post
-    });
-    if post {
-        let upn = up as usize;
-        owner::post_queued(owner::Class::Program, move || unsafe { realtime_step(upn as *mut Unit) });
-    }
-}
-
-/// The startup release (startup_main): a reach held for it gets its owner steps now.
-pub(crate) fn realtime_release() {
-    let up = unsafe { UNIT };
-    if up.is_null() {
-        return;
-    }
-    let post = with_rt(|rt| {
-        let post = std::mem::replace(&mut rt.parked, false) && !rt.scheduled;
-        rt.scheduled |= post;
+        let post = !rt.scheduled;
+        rt.scheduled = true;
         post
     });
     if post {
@@ -21761,19 +21761,6 @@ pub(crate) fn realtime_release() {
 /// behind the program's requests. Done: the set's top tier, its disk cache record, the tickets.
 unsafe fn realtime_step(up: *mut Unit) {
     let t0 = wall_ns();
-    // before the startup release a mark's reach waits for it (the first present comes first);
-    // a reach a real-time thread is waiting on does not
-    // (the phase is read again under the lock: realtime_release takes it after the phase moved)
-    if startup_phase() && with_rt(|rt| {
-        let hold = !rt.urgent && startup_phase();
-        if hold {
-            rt.scheduled = false;
-            rt.parked = true;
-        }
-        hold
-    }) {
-        return;
-    }
     // the earlier runs' set, once, first: on a warm run most of it links from the disk cache
     // (their code is compiled, their references are not walked again: what they reached then is
     // in the set; an edited slot's key no longer resolves and is walked from what calls it)
@@ -21818,6 +21805,9 @@ unsafe fn realtime_step(up: *mut Unit) {
                     let _ = compile_slot_locked(up, id, false);
                     compiled += 1;
                 }
+                if let Some(p) = realtime_partner(&*up, id) {
+                    with_rt(|rt| rt.todo.push(p));
+                }
             }
             Next::Walk(id) => {
                 // a diverging fn (a panic, an abort) ends the callback's normal path: it stays lazy
@@ -21831,7 +21821,8 @@ unsafe fn realtime_step(up: *mut Unit) {
                     continue;
                 }
                 let was = (&*up).fns[id as usize].compiled;
-                let slots = realtime_refs(up, id);
+                let mut slots = realtime_refs(up, id);
+                slots.extend(realtime_partner(&*up, id));
                 if !was && (&*up).fns[id as usize].compiled {
                     compiled += 1;
                 }
@@ -21923,25 +21914,35 @@ unsafe fn realtime_step(up: *mut Unit) {
 fn realtime_done() {
     let wakes = with_rt(|rt| {
         rt.scheduled = false;
-        rt.urgent = false;
         RT_DONE.fetch_max(rt.added, Ordering::AcqRel);
         let done = rt.added;
         let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut rt.wakes).into_iter().partition(|w| w.0 <= done);
         rt.wakes = later;
+        RT_DUE.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(t, due)| {
+            if t <= done && rt_trace() {
+                eprintln!("makepad-run rt: ticket {} ready {:.1} ms after its mark", t, (wall_ns() + rt_wait_ns()).saturating_sub(due) as f64 / 1e6);
+            }
+            t > done
+        });
         now
     });
     if !wakes.is_empty() {
         let _ = std::thread::Builder::new().name("run-rt-wake".into()).spawn(move || {
             for (_, scope, wake) in wakes {
-                let wake: extern "C" fn() = unsafe { std::mem::transmute(wake) };
-                match scope {
-                    Some(s) => {
-                        let _ = s.call(|| wake());
-                    }
-                    None => wake(),
-                }
+                call_wake(scope, wake);
             }
         });
+    }
+}
+
+/// Calls the program's wake (std::relax::realtime) in its domain.
+fn call_wake(scope: Option<crate::domain::Callback>, wake: usize) {
+    let wake: extern "C" fn() = unsafe { std::mem::transmute(wake) };
+    match scope {
+        Some(s) => {
+            let _ = s.call(|| wake());
+        }
+        None => wake(),
     }
 }
 
@@ -21996,6 +21997,17 @@ fn realtime_value_dyns(u: &Unit, types: &[TyId]) -> Vec<u32> {
     out
 }
 
+/// SPEC-V: a body's other slot -- its unverified-mode twin, or a twin's verified body. Code calls
+/// one or the other as verdicts land (a verified rebuild, a warm image's O3 code calls the body
+/// where the walked lowering called the twin): real-time code needs both.
+fn realtime_partner(u: &Unit, id: u32) -> Option<u32> {
+    match u.fns[id as usize].key {
+        FnKey::Plain(b) => Some(b),
+        FnKey::Inst(..) | FnKey::Closure(..) => u.plain_twin_of(id),
+        _ => None,
+    }
+}
+
 /// A diverging slot (a fn returning `!`: a panic, an abort, an exit): the walk stops there.
 fn realtime_cut(u: &Unit, id: u32) -> bool {
     match &u.fns[id as usize].key {
@@ -22017,7 +22029,7 @@ fn realtime_take(id: u32) -> bool {
 
 /// Compiles everything `roots` reach, now (owner): a real-time thread met a lazy stub (`why`).
 pub(crate) unsafe fn realtime_reach(up: *mut Unit, roots: Vec<u32>, why: &'static str) {
-    realtime_reach_queued(up, roots, why, true);
+    realtime_reach_queued(up, roots, why);
 }
 
 /// New code for slot `id` was installed (Unit::install_unchecked): when `id` is real-time code, the

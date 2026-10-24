@@ -43,7 +43,9 @@ fn __realtime_root<T: ?Sized>(_: &T) {}
 pub struct Realtime(u64);
 
 impl Realtime {
-    /// Everything the mark reaches is compiled: the real-time thread may start calling it.
+    /// Hand the code to the real-time thread now: everything the mark reaches is compiled, or the
+    /// wait for it reached its bound (a few hundred ms: audio starts promptly, what is still
+    /// missing compiles on its first call there).
     pub fn ready(&self) -> bool {
         self.0 == 0 || unsafe { __relax_realtime_ready(self.0) }
     }
@@ -54,7 +56,7 @@ impl Realtime {
 /// it can reach -- the closure or fn's body, what that calls, the methods of the trait objects
 /// it calls through, now and as new ones are made -- is compiled ahead of the first call, in the
 /// background: the caller does not wait. Hand the code to the real-time thread once the ticket
-/// is `ready`; `wake` (if any) is called on a thread of its own when it is. Pass the closure or fn
+/// is `ready`; `wake` (if any) is called on a thread of its own then. Pass the closure or fn
 /// itself, or `&*boxed` for a trait object; `x` is only read during this call.
 pub fn realtime<T: ?Sized>(x: &T, wake: Option<extern "C" fn()>) -> Realtime {
     let p: *const T = x;
