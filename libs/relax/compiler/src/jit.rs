@@ -11749,10 +11749,12 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     }
     // loops with a small constant trip count: fully unrolled (each copy's counter a constant);
     // a second round reaches the loop around an unrolled inner one
+    let mut unrolled = false;
     for _ in 0..2 {
         if !(cfg.fold && relax_codegen::loops::unroll_const_loops(options, func)) {
             break;
         }
+        unrolled = true;
         relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
         // the original loops the copies replaced: unreachable now, emptied for the passes below
         relax_codegen::loops::clear_unreachable(func);
@@ -11774,6 +11776,15 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
             relax_backend::passes::live_dce(func);
             relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
         }
+    }
+    // Unrolled copies read a loop's array at constant offsets: once those loads are forwarded
+    // its stores of borrows die, and the slots they borrowed no longer escape -- the copies of
+    // those slots can join now (reconcile's `[(&mut entry.a, ..), (..)]`: the entry's moves
+    // through the match tuple; GAPB)
+    if unrolled && cfg.sroa && !relax_backend::stats::opt_off(options, "-postinline") && !relax_backend::stats::opt_off(options, "-unrollclean") {
+        relax_codegen::loops::clear_unreachable(func);
+        relax_backend::passes::live_dce(func);
+        slot_cleanup(options, func, ro, cfg);
     }
     // a copy of a stepped pointer's previous value (partition's gap, insertion's hole) read as
     // the pointer minus its step: accesses through both share one base (load forwarding)
@@ -12256,15 +12267,26 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
             }
         }
     }
-    // post-inline cleanup (codegen2's copy-elimination finding + LLVM SROA's whole-slot slicing):
-    // small aggregate temporaries the inlined bodies copy through (Option payloads, sret results)
-    // are forwarded from 32 bytes up, then groups copied in and out are tiled into registers;
-    // later wider loads of narrower stores otherwise fail store forwarding (layout_widgets)
     if cfg.sroa && !relax_backend::stats::opt_off(options, "-postinline") {
+        slot_cleanup(options, func, ro, cfg);
+    }
+    inlined
+}
+
+/// Post-inline cleanup (codegen2's copy-elimination finding + LLVM SROA's whole-slot slicing):
+/// small aggregate temporaries the inlined bodies copy through (Option payloads, sret results)
+/// are forwarded from 32 bytes up, then groups copied in and out are tiled into registers;
+/// later wider loads of narrower stores otherwise fail store forwarding (layout_widgets). Runs
+/// after inlining and again after full unrolling.
+fn slot_cleanup(options: &crate::options::Options, func: &mut relax_backend::rir::Func, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg) {
+    {
         for _ in 0..3 {
+            // field-wise copies (a derived Clone's loads and stores) as one copy, which the
+            // passes below forward and join along; MAKEPAD_RUN_OPT=-copyruns
+            let ch = !relax_backend::stats::opt_off(options, "-copyruns") && relax_codegen::opt::merge_copy_runs(func);
             // zero fills a copy overwrites before any read go first: the copy's stores are
             // then the only writes of those bytes, so the reads after it can be forwarded
-            let ch = relax_codegen::opt::dead_slot_stores(func);
+            let ch = ch | relax_codegen::opt::dead_slot_stores(func);
             let ch = ch | relax_codegen::opt::forward_slot_dests(func) | relax_codegen::opt::forward_slot_dests_x(options, func, 32);
             // slots joined along whole copies by byte liveness (loops too); MAKEPAD_RUN_OPT=-slotcoal
             let ch = ch | (!relax_backend::stats::opt_off(options, "-slotcoal") && relax_codegen::opt::coalesce_slot_copies(func, !relax_backend::stats::opt_off(options, "-slotprefix")));
@@ -12278,7 +12300,6 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
             relax_backend::passes::simplify(options, func, ro, cfg.imm, false);
         }
     }
-    inlined
 }
 
 // ---- the on-demand PC sampler (MAKEPAD_RUN_PROFILE; not part of tier-up)
