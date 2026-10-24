@@ -3630,6 +3630,21 @@ impl<'a> Gen<'a> {
                 }
                 let rd = self.use_i(options, *dst, R10);
                 let rs = self.use_i(options, *src, R11);
+                // overlapping bytes of the frame (frame::copy_overlap; a verify build fails on it,
+                // compile_freq): memmove order, each piece loaded whole before it is stored
+                let delta = crate::frame::copy_overlap(&self.slot_pos, *dst, *src, *size);
+                if delta != 0 {
+                    for (o, w) in crate::frame::copy_pieces(*size, 16, delta > 0) {
+                        if w == 16 {
+                            self.a.sse_rm(0, 0x10, XS, rs, o);
+                            self.a.sse_rm(0, 0x11, XS, rd, o);
+                        } else {
+                            self.a.load_ext(RAX, rs, o, w, false);
+                            self.a.store_n(rd, o, RAX, w);
+                        }
+                    }
+                    return;
+                }
                 if *size >= 32 && *size <= 512 {
                     // 16-byte movups through the float scratch (rep movsb's start-up costs
                     // ~30 cycles: Option<T> moves of a few hundred bytes in hot paths)
@@ -6554,6 +6569,13 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         g.switch_in_range = crate::switch::switch_in_range(g.f);
     }
     g.gen(options);
+    // a copy between overlapping frame bytes is a bug of a pass or of the frame layout: a build
+    // error where passes are verified (it is emitted in memmove order otherwise)
+    if crate::rir::verify_passes_on() {
+        if let Some(e) = crate::frame::overlapping_copy_at(g.f, &g.slot_pos) {
+            return Err(format!("x64 frame layout: {}", e));
+        }
+    }
     // unwind info for the runtime's frame walk (rir::unwind_info_words), 4-byte aligned
     while g.a.b.len() % 4 != 0 {
         g.a.byte(0xcc);
