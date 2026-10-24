@@ -970,7 +970,8 @@ fn jit_line(a: &crate::postframe::Activity, b: &crate::postframe::Activity, ms: 
     let built = d(a.finished(), b.finished());
     let duty = d(a.ui_wait_ns, b.ui_wait_ns) as f64 / (ms as f64 * 1e6);
     let busy = built > 0 || b.running() || duty > 0.02;
-    let mut parts = vec![if busy { if b.background() { "busy (background)" } else { "busy" } } else { "idle" }.to_string()];
+    let background = b.background() && duty <= 0.02 && b.demand() == a.demand();
+    let mut parts = vec![if busy { if background { "busy (background)" } else { "busy" } } else { "idle" }.to_string()];
     let current = b.current();
     let mut running = Vec::new();
     if !current.is_empty() {
@@ -989,12 +990,13 @@ fn jit_line(a: &crate::postframe::Activity, b: &crate::postframe::Activity, ms: 
     parts.push(format!("queued: ahead {}, O2 {}, O3 {}", k(b.ahead), k(b.o2), k(b.o3)));
     let rate = built as f64 * 1000.0 / ms as f64;
     parts.push(format!(
-        "finished {} (+{} in {} ms = {:.0}/s: compiled {}, O2 {}, O3 {}, linked {})",
+        "finished {} (+{} in {} ms = {:.0} fns/s: lazy {}, ahead {}, O2 {}, O3 {}, linked {})",
         k(b.finished()),
         built,
         ms,
         rate,
-        d(a.compiled, b.compiled),
+        d(a.demand(), b.demand()),
+        d(a.ahead_done, b.ahead_done),
         d(a.o2_done, b.o2_done),
         d(a.o3_done, b.o3_done),
         d(a.linked, b.linked)

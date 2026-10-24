@@ -149,9 +149,10 @@ pub struct Activity {
     pub ui_wait_ns: u64,
     /// the settle rebuild runs
     pub settling: bool,
-    /// finished so far: first compiles (lazy and ahead), O2 / verified O1 builds, O3 builds
-    /// (installed, dropped or failed), warm-cache links
+    /// finished so far: first compiles (lazy and ahead; of them built ahead), O2 / verified O1
+    /// builds, O3 builds (installed, dropped or failed), warm-cache links
     pub compiled: u64,
+    pub ahead_done: u64,
     pub o2_done: u64,
     pub o3_done: u64,
     pub linked: u64,
@@ -171,6 +172,16 @@ impl Activity {
     /// Builds waiting or running, all queues.
     pub fn pending(&self) -> u64 {
         self.ahead + self.o2 + self.o3 + self.o3_running
+    }
+
+    /// Builds finished out of the queues (ahead, O2, O3): with `pending`, the queues' progress.
+    pub fn queue_done(&self) -> u64 {
+        self.ahead_done + self.o2_done + self.o3_done
+    }
+
+    /// First compiles a program thread asked for (lazy stubs hit), finished so far.
+    pub fn demand(&self) -> u64 {
+        self.compiled.saturating_sub(self.ahead_done)
     }
 
     /// Only background work (O2 / O3 / verified O1, the settle rebuild): nothing the program waits for.
@@ -199,16 +210,58 @@ impl Activity {
     }
 }
 
-/// A fn's path without its leading crates and generics (the last two segments), for one line.
+/// A fn's path for one line: its last two segments without generics (`<T as Tr>::f` -> `T::f`),
+/// a trailing ` [..]` note kept, at most 40 chars.
 fn short_fn(name: &str) -> String {
-    let base = name.split('<').next().unwrap_or(name);
-    let parts: Vec<&str> = base.rsplit("::").take(2).collect();
+    let (name, note) = match name.find(" [") {
+        Some(i) => (&name[..i], &name[i..]),
+        None => (name, ""),
+    };
+    // a qualified path's self type stands for it: `<T as Tr>::f` -> `T::f`
+    let mut path = String::new();
+    let mut rest = name;
+    if let Some(inner) = name.strip_prefix('<') {
+        let mut depth = 1;
+        let end = inner.char_indices().find(|&(_, c)| {
+            depth += (c == '<') as i32 - (c == '>') as i32;
+            depth == 0
+        });
+        if let Some((e, _)) = end {
+            path.push_str(inner[..e].split(" as ").next().unwrap_or(""));
+            rest = &inner[e + 1..];
+        }
+    }
+    path.push_str(rest);
+    // generics out
+    let mut flat = String::new();
+    let mut depth = 0;
+    for c in path.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            _ if depth == 0 => flat.push(c),
+            _ => {}
+        }
+    }
+    let parts: Vec<&str> = flat.rsplit("::").filter(|p| !p.is_empty()).take(2).collect();
     let mut s = parts.into_iter().rev().collect::<Vec<_>>().join("::");
     let n = s.chars().count();
     if n > 40 {
         s = format!("…{}", s.chars().skip(n - 39).collect::<String>());
     }
-    s
+    s + note
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn short_fn_names() {
+        use super::short_fn;
+        assert_eq!(short_fn("a::b::Cx::hal_intake"), "Cx::hal_intake");
+        assert_eq!(short_fn("<a::Foo<u8> as core::Bar>::baz [unverified]"), "Foo::baz [unverified]");
+        assert_eq!(short_fn("x::Vec<T>::push"), "Vec::push");
+        assert_eq!(short_fn("main"), "main");
+    }
 }
 
 /// What the JIT is doing now and has done so far.
@@ -233,6 +286,7 @@ pub fn activity() -> Activity {
         ui_wait_ns,
         settling: crate::jit::settle_rebuild::running(),
         compiled: crate::jit::COMPILED_FNS.load(Relaxed),
+        ahead_done: AHEAD_DONE.load(Relaxed),
         o2_done,
         o3_done: crate::jit::o3_finished(),
         linked: crate::cache::warm_count::get(crate::cache::warm_count::HIT),
