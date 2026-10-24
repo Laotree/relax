@@ -2191,6 +2191,10 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         // do the array's borrows become constant-offset stores that forward, so `entry` stops
         // escaping and its copies join (GAPB). An invoke's unwind edge leaves for the shared
         // cleanup: each copy keeps it, it is no early exit.
+        // MAKEPAD_RUN_OPT=-unrollcalls: loops with calls stay rolled
+        if relax_backend::stats::opt_off(options, "-unrollcalls") && core.iter().any(|b| f.blocks[*b as usize].insts.iter().any(|i| matches!(i, Inst::Call(..))) || matches!(f.blocks[*b as usize].term, Term::Invoke(..) | Term::Resume)) {
+            continue;
+        }
         let latches: Vec<u32> = members.iter().copied().filter(|b| f.blocks[*b as usize].term.succs().any(|s| s == h)).collect();
         // only loops that leave from the header or the latch: a body with early exits (a search
         // loop returning from inside) grows by every copy of its exit paths for little gain

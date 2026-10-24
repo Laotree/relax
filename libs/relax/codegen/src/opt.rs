@@ -647,6 +647,7 @@ fn site_rule(options: &relax_session::Options, callee: &Func, id: u32, nargs: us
     // reconcile's derived `MirrorEntry::clone`, 138 insts, in the per-entity loop: inlined in one
     // O3 build, a call in the next; GAPB).
     let mut lim = *lim;
+    let in_loop = in_loop && !opt_off(options, "-loopinline");
     if !hot && !in_loop && attrs & ATTR_CHAIN == 0 { lim.hint_insts = lim.hint_insts.min(120); }
     inline_rule(callee, id, nargs, nrets, attrs, &lim).or_else(|| {
         (hot && inline_inst_count(callee) <= lim.hot_insts).then_some(RULE_SMALL_LEAF)
