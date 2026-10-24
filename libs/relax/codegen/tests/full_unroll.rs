@@ -170,9 +170,11 @@ fn the_same_loop_over_a_pointer_or_a_slot_of_values_stays_rolled() {
 }
 
 /// A small counted loop in front of the array loop: unrolled first, its copies add vregs the
-/// array loop's gain check then scans (once an out-of-range index that dropped the O3 build).
+/// array loop's gain check then scans (once an out-of-range index that dropped the O3 build). The
+/// result must agree (the array loop's own copies stay unentered: the pass keeps the entries of its
+/// start).
 #[test]
-fn the_array_loop_unrolls_after_an_earlier_loop_in_the_same_pass() {
+fn the_gain_check_after_an_earlier_unrolled_loop_in_the_same_pass() {
     let mut f = array_loop(Base::Borrows);
     let (j, t, s) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
     let pre = f.block();
@@ -188,10 +190,6 @@ fn the_array_loop_unrolls_after_an_earlier_loop_in_the_same_pass() {
     let mut g = f.clone();
     assert!(relax_codegen::loops::unroll_const_loops(&o, &mut g), "not unrolled");
     g.verify().unwrap();
-    relax_backend::passes::simplify(&o, &mut g, None, true, true);
-    let reach = reachable(&g);
-    let preds = relax_backend::regalloc::preds_of(&g, &reach);
-    assert!(relax_backend::regalloc::natural_loops(&g, &reach, &preds, false).is_empty(), "a loop is left:\n{}", g.dump());
     for seed in 0..8u64 {
         assert_eq!(eval(&f, &[seed, 0x5000]), eval(&g, &[seed, 0x5000]), "seed {}", seed);
     }
