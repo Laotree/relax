@@ -12564,7 +12564,7 @@ fn progress_start() {
 /// for a benchmark that times only once the optimised code has settled: `pending` = builds queued or
 /// running or counting (PGO), plus one while the startup phase holds the workers; `installs` = O3 installs so far.
 /// The file exists from the first write on; a program that never reads it pays nothing.
-/// O3 builds queued or running now (postframe::activity, the run's activity badge).
+/// O3 builds queued or running now (postframe::activity, the run's JIT ring).
 pub(crate) fn o3_pending() -> u64 {
     (tier_queue().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len())) as u64
 }
