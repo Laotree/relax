@@ -314,7 +314,9 @@ pub struct Options {
     pub nan_exact: bool,
     /// `MAKEPAD_RUN_SPEC_ORDER`; default `false`.
     pub spec_order: bool,
-    /// `MAKEPAD_RUN_O3_PROFILE`; default `None`.
+    /// `MAKEPAD_RUN_O3_PROFILE`; default `None`. Deterministic O3: a missing/empty file records the
+    /// run's O3 decisions (each installed build's inputs and inline set), a recorded one replays them
+    /// strictly (only its slots build O3 code, each once at its first call); both runs are check-first.
     pub tier1_profile: Option<std::ffi::OsString>,
     /// Profile replay contents frozen by the driver, separately from its environment path.
     pub tier1_profile_data: Option<String>,

@@ -15182,6 +15182,8 @@ struct T1Entry {
     /// the decisions the installed build took: the keys of the callees it inlined (sorted, one per
     /// inlined body); replay checks its own build against them (inline-differ)
     inlined: Vec<String>,
+    /// the input bodies' hashes (O3Assembled::rir_hashes): root first
+    rirs: Vec<(String, u64)>,
 }
 struct T1Profile {
     replay: bool,
@@ -15209,7 +15211,7 @@ fn t1prof_on(options: &crate::options::Options) -> bool {
             Some(t) if !t.is_empty() => {
                 for l in t.lines() {
                     let x: Vec<&str> = l.split('\t').collect();
-                    if x.len() != 13 {
+                    if x.len() != 14 {
                         continue;
                     }
                     let list = |t: &str| -> Vec<String> { if t.is_empty() { Vec::new() } else { t.split('\u{1f}').map(|c| c.to_string()).collect() } };
@@ -15222,7 +15224,7 @@ fn t1prof_on(options: &crate::options::Options) -> bool {
                     let hot = x[9] == "1";
                     let counts = x.get(10).and_then(|v| parse_freq(v));
                     let callee_counts = x.get(11).map_or_else(Vec::new, |v| v.split('\u{1e}').filter_map(|e| e.split_once('\u{1d}')).filter_map(|(k, c)| Some((k.to_string(), parse_freq(c)?))).collect());
-                    map.insert(x[0].to_string(), T1Entry { cold: list(x[1]), snap: list(x[2]), single, freq, inline_freq, hot, counts, callee_counts, input: u64::from_str_radix(x[4], 16).unwrap_or(0), code: u64::from_str_radix(x[5], 16).unwrap_or(0), inlined: list(x[12]) });
+                    map.insert(x[0].to_string(), T1Entry { cold: list(x[1]), snap: list(x[2]), single, freq, inline_freq, hot, counts, callee_counts, input: u64::from_str_radix(x[4], 16).unwrap_or(0), code: u64::from_str_radix(x[5], 16).unwrap_or(0), inlined: list(x[12]), rirs: x[13].split('\u{1e}').filter_map(|e| e.split_once('\u{1d}')).filter_map(|(k, h)| Some((k.to_string(), u64::from_str_radix(h, 16).ok()?))).collect() });
                 }
                 true
             }
@@ -15377,7 +15379,7 @@ fn t1prof_finish() {
         };
         let inline = e.inline_freq.as_ref().expect("recorded inlining frequencies");
         let callees = e.callee_counts.iter().map(|(k, c)| format!("{}\u{1d}{}", k, fmt_freq(&Some(c.clone())))).collect::<Vec<_>>().join("\u{1e}");
-        out.push_str(&format!("{}\t{}\t{}\t{}\t{:016x}\t{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", k, e.cold.join("\u{1f}"), e.snap.join("\u{1f}"), fmt_freq(&e.freq), e.input, e.code, fmt_freq(&inline[0]), fmt_freq(&inline[1]), e.single.join("\u{1f}"), if e.hot { "1" } else { "0" }, fmt_freq(&e.counts), callees, e.inlined.join("\u{1f}")));
+        out.push_str(&format!("{}\t{}\t{}\t{}\t{:016x}\t{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", k, e.cold.join("\u{1f}"), e.snap.join("\u{1f}"), fmt_freq(&e.freq), e.input, e.code, fmt_freq(&inline[0]), fmt_freq(&inline[1]), e.single.join("\u{1f}"), if e.hot { "1" } else { "0" }, fmt_freq(&e.counts), callees, e.inlined.join("\u{1f}"), e.rirs.iter().map(|(k, h)| format!("{}\u{1d}{:x}", k, h)).collect::<Vec<_>>().join("\u{1e}")));
     }
     let _ = std::fs::write(&p.path, out);
     if !p.differ.is_empty() {
@@ -16065,7 +16067,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         owner::publish(|| o3_assemble_owner(up, options, &mut a, &t1key, &t1_rec));
         a
     });
-    let O3Assembled { mut snap, singles, cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: t1_single_keys, snap_counts, unverified_left, root_unverified, unverified_in, .. } = assembled;
+    let O3Assembled { mut snap, singles, cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: t1_single_keys, rir_hashes: t1_rir_hashes, snap_counts, unverified_left, root_unverified, unverified_in, .. } = assembled;
     // nocapture facts for the calls the build keeps (coalesce_slot_copies); the callees the answers
     // need RIR of are built off the owner first (a foreground build takes what exists)
     let nocapture = if relax_backend::stats::opt_off(options, "-o3nocap") { Vec::new() } else {
@@ -16206,12 +16208,23 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             let mut g = T1PROF.lock().unwrap();
             let p = g.as_mut().unwrap();
             match p.map.get(k) {
-                Some(e) if p.replay && e.input != input => p.differ.push(format!("input-differ {} (cold {}/{}, snapshot {}/{})", k, t1_cold_keys.len(), e.cold.len(), t1_snap_keys.len(), e.snap.len())),
+                Some(e) if p.replay && e.input != input => {
+                    p.differ.push(format!("input-differ {} (cold {}/{}, snapshot {}/{})", k, t1_cold_keys.len(), e.cold.len(), t1_snap_keys.len(), e.snap.len()));
+                    // where the inputs first differ: the root's body or which candidates' bodies
+                    if e.rirs.first() != t1_rir_hashes.first() {
+                        p.differ.push(format!("root-differ {}", k));
+                    }
+                    let rec: std::collections::HashMap<&str, u64> = e.rirs.iter().skip(1).map(|(k, h)| (k.as_str(), *h)).collect();
+                    let bad: Vec<&str> = t1_rir_hashes.iter().skip(1).filter(|(c, h)| rec.get(c.as_str()).is_some_and(|r| r != h)).map(|(c, _)| c.as_str()).collect();
+                    if !bad.is_empty() {
+                        p.differ.push(format!("callee-differ {} ({} of {}: {})", k, bad.len(), rec.len(), bad.iter().take(3).map(|c| short_name(c)).collect::<Vec<_>>().join(", ")));
+                    }
+                }
                 Some(e) if e.input == input && e.code != code => p.differ.push(format!("output-differ {}", k)),
                 _ => {}
             }
             if !p.replay {
-                profile_entry = Some(T1Entry { cold: t1_cold_keys.clone(), snap: t1_snap_keys.clone(), single: t1_single_keys.clone(), freq: freq.clone(), inline_freq: Some(inline_freq.clone()), hot: hot_root, counts: counts.clone(), callee_counts: snap_counts.iter().filter_map(|(_, k, c)| Some((k.clone()?, c.clone()))).collect(), input, code, inlined: Vec::new() });
+                profile_entry = Some(T1Entry { cold: t1_cold_keys.clone(), snap: t1_snap_keys.clone(), single: t1_single_keys.clone(), freq: freq.clone(), inline_freq: Some(inline_freq.clone()), hot: hot_root, counts: counts.clone(), callee_counts: snap_counts.iter().filter_map(|(_, k, c)| Some((k.clone()?, c.clone()))).collect(), input, code, inlined: Vec::new(), rirs: t1_rir_hashes.clone() });
             }
         }
         note_frame(id, c.frame_size, slot_bytes(&func), true);
@@ -17927,6 +17940,10 @@ struct O3Assembled {
     cold_keys: Vec<String>,
     snap_keys: Vec<String>,
     single_keys: Vec<String>,
+    /// deterministic O3 (profiling only): (key, hash) of the input bodies, the root's first (key
+    /// "", with its verified state), then each candidate's (with its attrs): where a replayed
+    /// build's inputs first differ from the recorded ones
+    rir_hashes: Vec<(String, u64)>,
     snap_counts: Vec<(u32, Option<String>, Vec<f32>)>,
     /// SPEC-V: callees left out as unverified (never inlined before their verdict): the build is
     /// queued again once they are verified (UNVERIFIED_LEFT, owner part), their verdicts first
@@ -17963,6 +17980,10 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &cr
     let mut unverified_left: Vec<u32> = Vec::new();
     let mut unverified_in: Vec<u32> = Vec::new();
     let root_unverified = unverified_root(fns, id);
+    let mut rir_hashes: Vec<(String, u64)> = Vec::new();
+    if t1key.is_some() {
+        rir_hashes.push((String::new(), t1_norm_hash(rir) ^ root_unverified as u64));
+    }
     for &c in callees {
         let Some(v) = views.get(&c) else { continue };
         let attrs = match callee_attrs(prog, tcx, fns, core, c, inline_all, true, root_unverified) {
@@ -18014,9 +18035,14 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &cr
             if root_unverified && (fns[c as usize].unverified.load(Ordering::Relaxed) || matches!(fns[c as usize].key, FnKey::Plain(_))) {
                 unverified_in.push(c);
             }
+            if t1key.is_some() {
+                rir_hashes.push((t1_key(up, c), t1_norm_hash(r) ^ ((attrs as u64) << 56)));
+            }
             snap.push((c, r.clone(), attrs));
         }
     }
+    let from = rir_hashes.len().min(1);
+    rir_hashes[from..].sort();
     t1_cold_keys.sort();
     t1_cold_keys.dedup();
     t1_snap_keys.sort();
@@ -18043,7 +18069,7 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &cr
         _ => None,
     }).collect();
     TIER1_TAKE_PARTS[5].fetch_add(cpu_ns() - ta, Ordering::Relaxed);
-    O3Assembled { snap, single_cands, singles: HashMap::new(), cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: Vec::new(), snap_counts, unverified_left, root_unverified, unverified_in, root: id }
+    O3Assembled { snap, single_cands, singles: HashMap::new(), cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: Vec::new(), rir_hashes, snap_counts, unverified_left, root_unverified, unverified_in, root: id }
 }
 
 /// The owner part of a snapshot (a publish: O(candidates), recursive_fn walks a candidate's calls):
