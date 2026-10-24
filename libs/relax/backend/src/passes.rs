@@ -7521,6 +7521,8 @@ pub fn rotate_loops(f: &mut Func) {
     // latches ending in a branch whose false edge goes to the header get a new block with the
     // header's copy there (laid out after the latch below)
     let mut added = false;
+    // the blocks added below (index n + k): the (latch, header) edge each one sits on
+    let mut made: Vec<(u32, u32)> = Vec::new();
     for l in 0..n {
         let (h, branch_latch) = match f.blocks[l].term {
             Term::Jump(h) if idom[l] != u32::MAX && dominates(h, l as u32) => (h as usize, false),
@@ -7537,9 +7539,16 @@ pub fn rotate_loops(f: &mut Func) {
         // loop has two entries and is no natural loop any more -- the loop splitter, the
         // cold-call split and loop depths no longer see it
         let Term::Branch(_, ht, he) = hb.term else { unreachable!() };
-        // (a header whose own branch an earlier latch rotation sent to a new block is left alone)
+        // (a header whose own branch an earlier latch rotation sent to a new block: that block
+        // sits on the edge latch -> outer header, inside a loop when both ends are)
+        let inside = |m: &[bool], x: u32| -> bool {
+            match (x as usize).checked_sub(n) {
+                None => m[x as usize],
+                Some(k) => m[made[k].0 as usize] && m[made[k].1 as usize],
+            }
+        };
         match loops.iter().find(|(x, _)| *x as usize == h) {
-            Some((_, m)) if (ht as usize) < n && (he as usize) < n && m[ht as usize] != m[he as usize] => {}
+            Some((_, m)) if inside(m, ht) != inside(m, he) => {}
             _ if crate::stats::opt_env_off("-rotexit") => {}
             _ => continue,
         }
@@ -7605,6 +7614,7 @@ pub fn rotate_loops(f: &mut Func) {
         if branch_latch {
             let nb = f.blocks.len() as u32;
             f.blocks.push(Block { insts, pos: hb.pos.clone(), term, term_pos: hb.term_pos, count: hb.count });
+            made.push((l as u32, h as u32));
             if let Term::Branch(_, _, ref mut e) = f.blocks[l].term {
                 *e = nb;
             }
