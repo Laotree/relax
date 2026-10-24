@@ -689,10 +689,12 @@ mod tests {
             assert!(pending(&heap) >= 4000 * 200, "the frees wait on the remote list: {}", pending(&heap));
             before_wait();
             assert_eq!(pending(&heap), 0, "the owner took them");
-            // their slots are the owner's again: 4000 new blocks carve nothing new
-            let touched = heap.states()[1];
+            // their slots are reused: 4000 new blocks carve nothing new (touched bytes of the
+            // attached, listed and full chunks)
+            let touched = |h: &DomainHeap| { let a = h.states(); a[1] + a[5] + a[13] };
+            let before = touched(&heap);
             let again: Vec<*mut u8> = (0..4000).map(|_| program_alloc(200, 8)).collect();
-            assert_eq!(heap.states()[1], touched);
+            assert_eq!(touched(&heap), before);
             for p in again {
                 program_dealloc(p, 200, 8);
             }

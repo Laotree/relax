@@ -2530,11 +2530,13 @@ pub unsafe fn enter_domain(a: *const Arena) {
         a.enter_thread();
     }
 }
-/// The calling program thread is about to block (a condvar or park wait): it takes the blocks
-/// other threads freed into its current chunks (they wait on the remote lists for the owner,
-/// which drains them only when its own free list of the class runs dry: a thread that went quiet
-/// kept them for good -- Scope: 69 MB of 115 MB of attached chunks' slots), and gives the free
-/// pages of its sparse current chunks back (`owned_tick`, once per trim epoch).
+/// The calling program thread is about to block (a wait of std's wait registry: lock, condvar,
+/// park, sleep): it takes the blocks other threads freed into its current chunks (they wait on
+/// the remote lists for the owner, which drained them only when its own free list of the class
+/// ran dry: Scope had 69 MB of its attached chunks' 115 MB of slots there), and gives the free
+/// pages of its sparse current chunks back (`owned_tick`, once per trim epoch). What other
+/// threads free into them during the wait waits for the owner's next wait or tick (handing the
+/// chunks back at a wait instead made Scope's threads carve 2-3x more: measured, dropped).
 pub unsafe fn domain_wait() {
     // (a wait inside the thread's thread-local destructors finds no record: nothing to do)
     let _ = DOMAIN.try_with(|t| {

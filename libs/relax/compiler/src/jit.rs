@@ -14706,7 +14706,14 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { compile_tier1(up, id) }));
         if let Err(p) = r {
             crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_PANIC, 0, 0, 0);
-            let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".to_string());
+            let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned())
+                .or_else(|| p.downcast_ref::<crate::preempt::PublishBail>().map(|b| format!("publish bail ({}, {} slots)", b.what, b.slots.len())))
+                .or_else(|| p.downcast_ref::<crate::infer::diagnostics::FatalError>().map(|e| format!("fatal error: {}", e.0)))
+                .or_else(|| p.is::<crate::preempt::Preempted>().then(|| "preempted".to_string()))
+                .or_else(|| p.is::<crate::preempt::OwnerBusy>().then(|| "owner busy".to_string()))
+                .or_else(|| p.is::<crate::preempt::NeedsLoad>().then(|| "needs load".to_string()))
+                .or_else(|| p.is::<crate::preempt::NeedsUnit>().then(|| "needs the unit".to_string()))
+                .unwrap_or_else(|| "panic".to_string());
             let n = TIER1_PANICS.fetch_add(1, Ordering::Relaxed);
             if n < 3 {
                 eprintln!("makepad: O3 build of slot {} panicked: {} -- O3 dropped for it", id, msg);
