@@ -3690,6 +3690,24 @@ fn note_restart_pending(why: &str) {
 }
 
 /// The edits that wait for a relaunch, oldest first (cleared by a relaunch).
+/// `session relaunch`: applies the edits waiting for a restart. A hosted app relaunches its domain
+/// (window kept); a directly running program that restarts itself (std::relax::restart_supported)
+/// is asked to, at its next safe point, carrying its state over. Returns how.
+pub fn relaunch_pending() -> Result<&'static str, String> {
+    if crate::run::app_domain().is_some() {
+        crate::run::relaunch()?;
+        return Ok("domain relaunch");
+    }
+    if !RESTART_SUPPORTED.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("no hosted app domain, and the program does not restart itself (std::relax::restart_supported): stop and start it".into());
+    }
+    let why = RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).join("; ");
+    *RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = why;
+    RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    wake_program();
+    Ok("program restart with state")
+}
+
 pub fn restart_pending() -> Vec<String> {
     RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
