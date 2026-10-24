@@ -1293,8 +1293,8 @@ impl Arena {
             h.old.store(s.committed != 0, Ordering::Relaxed);
         }
     }
-    pub fn states(&self) -> [usize; 24] {
-        let mut c = [0usize; 24];
+    pub fn states(&self) -> [usize; 26] {
+        let mut c = [0usize; 26];
         let base = self.base.load(Ordering::Relaxed);
         if base == 0 {
             return c;
@@ -1335,8 +1335,45 @@ impl Arena {
                 c[22] += live * s.stride;
                 c[23] += res;
             }
+            // whole free granules in the carved part (what a page release could give back): an
+            // attached chunk's owned list is read racily (bounded, every link checked)
+            if row == 0 || row == 1 {
+                let head = if row == 0 && COMPILER { unsafe { (*h.owned.get()).free } } else { s.free };
+                c[24 + row] += Self::free_granule_bytes(base + index * CHUNK, bump, s.stride, head);
+            }
         }
         c
+    }
+    /// Bytes of the granules of `[chunk, chunk + carved)` whose slots are all on the free list
+    /// starting at `head` (`states`' census; the list may change under a racy read: a link
+    /// outside the carved slots ends the walk).
+    fn free_granule_bytes(chunk: usize, carved: usize, stride: usize, head: usize) -> usize {
+        if stride == 0 || carved == 0 {
+            return 0;
+        }
+        let nslots = carved / stride;
+        // (no allocation: the caller holds the chunk's lock)
+        let mut free = [0u64; (CHUNK / 16) / 64];
+        let mut p = head;
+        let mut steps = 0;
+        while p != 0 && steps < nslots {
+            if p < chunk || p >= chunk + nslots * stride || (p - chunk) % stride != 0 {
+                break;
+            }
+            let k = (p - chunk) / stride;
+            free[k / 64] |= 1 << (k % 64);
+            p = unsafe { std::ptr::read_volatile(p as *const usize) };
+            steps += 1;
+        }
+        let is_free = |k: usize| free[k / 64] >> (k % 64) & 1 == 1;
+        let mut bytes = 0;
+        for g in 0..carved / GRANULE {
+            let (lo, hi) = (g * GRANULE, (g + 1) * GRANULE);
+            if (lo / stride..=(hi - 1) / stride).all(|k| k < nslots && is_free(k)) {
+                bytes += GRANULE;
+            }
+        }
+        bytes
     }
     fn partial_push(&self, i: usize, class: usize) {
         let mut p = lock(&self.partial);
@@ -2450,7 +2487,7 @@ pub fn detail() -> (usize, usize, usize, usize) {
 pub fn census() -> [usize; 11] {
     DEFAULT.census()
 }
-pub fn states() -> [usize; 24] {
+pub fn states() -> [usize; 26] {
     DEFAULT.states()
 }
 pub fn mark_old() {

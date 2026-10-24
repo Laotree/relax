@@ -362,6 +362,7 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     }
     let mut front = FrontShared::new(sess);
     front.census_id = u.front.census_id;
+    front.gandalf_id = u.front.gandalf_id;
     front.warm_cache.store(u.front.warm_cache.load(Ordering::Relaxed), Ordering::Relaxed);
     for (i, f) in u.fns.iter().enumerate() {
         front.slot_keys.insert(i as u32, f.key.clone());
@@ -372,6 +373,10 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     let query_errors = tcx.dcx.clone();
     // the replace: nothing can fail from here
     u.front.retire_memos();
+    // the old front state names the old program: no reader may reach it after the replace (a
+    // reader checks `alive` under its front read, and this runs under the front write)
+    u.front.alive.store(false, Ordering::SeqCst);
+    let epoch_from = u.tcx.collect_epoch.load(Ordering::SeqCst);
     let mut rir = Vec::new();
     for e in u.fns.iter_mut() {
         if let Some(r) = e.rir.take() {
@@ -402,8 +407,16 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
         context: u.self_ptr.0 as usize, evaluate: const_eval_to_valtree,
     });
     u.prog.body_memos.store(true, Ordering::Relaxed);
+    // the same program: its collect epochs go on from the old one's, and the borrow checker's
+    // verdicts and queued checks (keyed by front identity and epoch) carry over to the new state
+    u.tcx.collect_epoch.fetch_max(epoch_from, Ordering::SeqCst);
     u.tcx.publish_collected();
     set_shared_front(u, u.core_crate);
+    let epoch_to = u.tcx.collect_epoch.load(Ordering::SeqCst);
+    crate::borrowck::lazy::carry_epoch(u.front.gandalf_id, epoch_from, epoch_to, &|_| true);
+    let src: std::sync::Arc<dyn crate::borrowck::lazy::FrontSource> = std::sync::Arc::new(BorrowckFront(u.front.clone()));
+    let moved = crate::borrowck::lazy::rehome(&src);
+    trace(&format!("{moved} queued borrow checks moved to the new front state (epoch {epoch_from} -> {epoch_to})"));
     crate::run::set_diagnostics(u.tcx.dcx.clone());
     // every thread's compiler memos go at its next access (dropped there, by value)
     relax_session::memo_local::retire_all();

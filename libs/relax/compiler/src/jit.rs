@@ -165,6 +165,10 @@ pub struct SlotHistory {
 }
 
 impl FnEntry {
+    /// The slots this body's RIR references (placement census).
+    pub(crate) fn rir_refs(&self) -> &[u32] {
+        &self.rir_refs
+    }
     /// Reading an untouched slot's history never allocates.
     pub fn history(&self) -> &SlotHistory {
         static EMPTY: SlotHistory = SlotHistory { prev: Vec::new(), retired: Vec::new(), inlined_into: Vec::new() };
@@ -5794,7 +5798,7 @@ impl Unit {
             FnKey::Inst(d, args) => {
                 if !crate::borrowck::event::admit(&self.prog, self.prog.def(*d).krate) || crate::borrowck::body::CheckedBody::item(&self.prog, *d).is_none() { return Verdict::Clean; }
                 let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
-                let pending = match crate::borrowck::lazy::verdict(std::sync::Arc::as_ptr(&self.front) as usize, *d, args, epoch) {
+                let pending = match crate::borrowck::lazy::verdict(self.front.gandalf_id, *d, args, epoch) {
                     FnVerdict::Clean => return Verdict::Clean,
                     FnVerdict::Errors(events) => return Verdict::Failed(events),
                     FnVerdict::Pending => Verdict::Pending,
@@ -5840,7 +5844,7 @@ impl Unit {
         match &self.fns[id as usize].key {
             FnKey::Inst(d, _) => {
                 let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
-                crate::borrowck::lazy::disjoint_checks(std::sync::Arc::as_ptr(&self.front) as usize, *d, epoch)
+                crate::borrowck::lazy::disjoint_checks(self.front.gandalf_id, *d, epoch)
             }
             FnKey::Closure(_, _, parent) => self.disjoint_checks(*parent),
             _ => None,
@@ -6203,6 +6207,13 @@ pub fn reclaim_generation() -> u64 {
 /// The disk cache opened with no code store: no code entry can be linked in this run (run.rs).
 pub static CODE_CACHE_EMPTY: AtomicBool = AtomicBool::new(false);
 pub static MAIN_COMPILES: relax_session::sync::Mutex<Vec<MainCompile>> = relax_session::sync::Mutex::new(Vec::new());
+/// Whether the main thread's compiles are kept for MAKEPAD_RUN_MAIN_COMPILE_LOG (its only reader):
+/// otherwise every lazy call on main grew MAIN_COMPILES for the whole run (Sandbox: 18 MB after
+/// 2 min, pinning compiler-arena chunks across the settle rebuild).
+pub fn main_compile_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_MAIN_COMPILE_LOG").is_some())
+}
 
 /// One compile the main thread waited for (MAKEPAD_RUN_MAIN_COMPILE_LOG): wall interval, the slot,
 /// how it was satisfied and where its wall time went (ns).
@@ -6360,7 +6371,9 @@ unsafe fn compile_slot_on_stack_rt(up: *mut Unit, id: u32) -> u64 {
         if let Some(mut rec) = MAIN_REC.with(|c| c.take()) {
             rec.end = wall_ns();
             crate::postframe::main_compile(&(&*up).fns[id as usize].name, &rec);
-            MAIN_COMPILES.lock().unwrap().push(rec);
+            if main_compile_log() {
+                MAIN_COMPILES.lock().unwrap().push(rec);
+            }
         }
     }
     r
@@ -13020,7 +13033,7 @@ unsafe fn prioritize_verdicts(up: *mut Unit, ids: &[u32]) {
     let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
     let ranks: Vec<(DefId, Vec<TyId>, u32)> = ids.iter().filter_map(|&c| Some((u.verdict_owner(c)?, Vec::new(), 0))).collect();
     if !ranks.is_empty() {
-        crate::borrowck::lazy::set_ranks(std::sync::Arc::as_ptr(&u.front) as usize, epoch, &ranks);
+        crate::borrowck::lazy::set_ranks(u.front.gandalf_id, epoch, &ranks);
     }
 }
 
@@ -18628,6 +18641,10 @@ mod front_ptrs {
 
 pub struct FrontShared {
     census_id: usize,
+    /// The borrow checker's identity of this front end (`FrontSource::identity`, the first part of
+    /// every verdict key): a settle rebuild's new front state takes its predecessor's, so verdicts
+    /// and queued checks carry over (borrowck::lazy::rehome).
+    pub(crate) gandalf_id: usize,
     session: std::sync::Arc<crate::Session>,
     /// the unit's program and type context: read only through a front read (`FrontRead::of`)
     ptrs: front_ptrs::FrontPtrs,
@@ -18720,6 +18737,10 @@ impl FrontShared {
         let options = &sess.options;
         FrontShared {
             census_id: relax_codegen::exec_census::new_unit(),
+            gandalf_id: {
+                static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            },
             session: sess.clone(),
             ptrs: front_ptrs::FrontPtrs::default(),
             unit: Default::default(),
@@ -18908,8 +18929,11 @@ fn ahead_helper(f: std::sync::Arc<FrontShared>, index: u32) {
                         drop(q);
                         if ahead_trace() {
                             let r = front_read("ahead_trace");
-                            let (prog, _) = r.of(&f);
-                            for (d, _) in &unused { eprintln!("ahead-dropped {}", prog.def_path(*d)); }
+                            // (a front state a settle rebuild replaced names a dropped program)
+                            if f.alive.load(Ordering::SeqCst) {
+                                let (prog, _) = r.of(&f);
+                                for (d, _) in &unused { eprintln!("ahead-dropped {}", prog.def_path(*d)); }
+                            }
                         }
                         drop(unused);
                         q = f.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -19960,7 +19984,7 @@ impl crate::borrowck::lazy::FrontSource for BorrowckFront {
         }
     }
     fn identity(&self) -> usize {
-        std::sync::Arc::as_ptr(&self.0) as usize
+        self.0.gandalf_id
     }
     fn with_front(&self, f: &mut dyn FnMut(&Program, &Tcx, &crate::tcx::EvalCx<'_>)) -> bool {
         let _job = compile_job();

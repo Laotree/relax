@@ -67,7 +67,7 @@ impl DomainHeap {
         self.inner.arena.detail()
     }
     /// Chunk states with resident bytes (arena.rs `states`).
-    pub fn states(&self) -> [usize; 24] {
+    pub fn states(&self) -> [usize; 26] {
         self.inner.arena.states()
     }
     pub fn range(&self) -> (usize, usize) {
