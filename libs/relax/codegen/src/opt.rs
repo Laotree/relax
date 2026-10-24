@@ -8646,6 +8646,53 @@ mod rotate_tests {
         assert!(matches!(f.blocks[body].insts.last(), Some(Inst::ICmp(Cond::Lt, false, d, a, b)) if *d == c && *a == i && *b == m));
         assert!(matches!(f.blocks[e as usize].insts[..], [Inst::ICmp(Cond::Eq, false, _, a, b)] if a == p && b == end));
     }
+
+    /// `if (lo <= hi) & (hi <= len) { a } else { b }`: a branch on x, then one on y; `|` likewise
+    #[test]
+    fn branch_on_and_or_of_compares_splits() {
+        for or in [false, true] {
+            let mut f = Func::new("splitbr".into(), 0);
+            let (lo, hi, len) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+            f.params.extend([lo, hi, len]);
+            f.rets.push(Cls::I);
+            let (x, y, c, r1, r2) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+            for _ in 0..3 {
+                f.block();
+            }
+            f.blocks[0].insts = vec![Inst::ICmp(Cond::Le, false, x, lo, hi), Inst::ICmp(Cond::Le, false, y, hi, len), Inst::IBin(if or { IOp::Or } else { IOp::And }, U64T, c, x, y)];
+            f.blocks[0].term = Term::Branch(c, 1, 2);
+            f.blocks[1].insts = vec![Inst::Iconst(r1, 1)];
+            f.blocks[1].term = Term::Ret(vec![r1]);
+            f.blocks[2].insts = vec![Inst::Iconst(r2, 2)];
+            f.blocks[2].term = Term::Ret(vec![r2]);
+            for b in &mut f.blocks {
+                b.pos = vec![0; b.insts.len()];
+            }
+            let opts = relax_session::Options::default();
+            assert!(relax_backend::passes::split_branch_conditions(&opts, &mut f));
+            f.verify().unwrap();
+            // the entry tests x alone; its other edge goes to a block testing y alone
+            let b0 = &f.blocks[0];
+            assert!(!b0.insts.iter().any(|i| matches!(i, Inst::IBin(IOp::And | IOp::Or, ..))));
+            let Term::Branch(cx, t0, e0) = b0.term else { panic!() };
+            assert_eq!(cx, x);
+            let yb = e0;
+            assert!(matches!(f.blocks[yb as usize].insts[..], [Inst::ICmp(Cond::Le, false, d, a, b)] if d == y && a == hi && b == len));
+            let ret_of = |b: u32| match &f.blocks[b as usize].term { Term::Ret(v) => v[0], _ => panic!() };
+            let Term::Branch(cy, ty, ey) = f.blocks[yb as usize].term else { panic!() };
+            assert_eq!(cy, y);
+            assert_eq!((ret_of(ty), ret_of(ey)), (r1, r2));
+            if or {
+                // x true -> taken, as `x | y`
+                assert!(matches!(b0.insts[0], Inst::ICmp(Cond::Le, ..)));
+                assert_eq!(ret_of(t0), r1);
+            } else {
+                // x negated (`lo > hi` -> not taken), y's block next
+                assert!(matches!(b0.insts[0], Inst::ICmp(Cond::Gt, ..)));
+                assert_eq!(ret_of(t0), r2);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
