@@ -245,6 +245,13 @@ fn short_fn(name: &str) -> String {
     }
     let parts: Vec<&str> = flat.rsplit("::").filter(|p| !p.is_empty()).take(2).collect();
     let mut s = parts.into_iter().rev().collect::<Vec<_>>().join("::");
+    if s.is_empty() {
+        // nothing nameable left (a path of generics only): the name as it is
+        s = flat.trim().to_string();
+        if s.is_empty() {
+            s = name.to_string();
+        }
+    }
     let n = s.chars().count();
     if n > 40 {
         s = format!("…{}", s.chars().skip(n - 39).collect::<String>());
@@ -261,6 +268,8 @@ mod tests {
         assert_eq!(short_fn("<a::Foo<u8> as core::Bar>::baz [unverified]"), "Foo::baz [unverified]");
         assert_eq!(short_fn("x::Vec<T>::push"), "Vec::push");
         assert_eq!(short_fn("main"), "main");
+        assert_eq!(short_fn("<<T as Tr>::X>::f"), "f");
+        assert!(!short_fn("<{closure}> [unverified]").starts_with(' '));
     }
 }
 

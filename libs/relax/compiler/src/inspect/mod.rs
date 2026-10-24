@@ -956,9 +956,12 @@ fn cmd_waits(out: &mut Out) {
 fn cmd_jit(req: &Req, out: &mut Out) {
     use crate::postframe::activity;
     let ms = req.num("ms", 250).clamp(20, 10_000);
+    let t0 = std::time::Instant::now();
     let a = activity();
     std::thread::sleep(std::time::Duration::from_millis(ms));
     let b = activity();
+    // the window as it was (a loaded machine oversleeps)
+    let ms = (t0.elapsed().as_millis() as u64).max(1);
     out.measured("JIT compile activity", "postframe::activity (atomics + O2/O3 queue locks), two looks", &[]);
     out.line(&jit_line(&a, &b, ms));
 }
