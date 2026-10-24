@@ -346,6 +346,11 @@ struct SiteLife {
     seen: AtomicU32,
     fit: AtomicU64,
     over: AtomicU64,
+    /// freed by the allocating physical frame itself (alloc and free in one compiled body)
+    same_body: AtomicU64,
+    /// smallest and largest final size (equal: one fixed size at this site)
+    size_min: AtomicU64,
+    size_max: AtomicU64,
 }
 
 /// One tracker: the program's heap (veneers) or Relax's own (memstat's allocator).
@@ -442,6 +447,7 @@ fn life_free(t: &Tables, id: usize, rec: (&[u64; LIFE_FRAMES], u64, u64), fp: u6
     let n = (st.n.load(Relaxed) as usize).saturating_sub(1).min(LIFE_FRAMES);
     // the freeing thread's JIT activations (frame record, return address into the caller)
     let mut class = usize::MAX;
+    let mut same_body = false;
     let same_ui_frame = super::timeline::FRAMES.load(Relaxed) == frame;
     if fp != 0 && ra != 0 && same_ui_frame {
         let mut f = fp;
@@ -458,6 +464,7 @@ fn life_free(t: &Tables, id: usize, rec: (&[u64; LIFE_FRAMES], u64, u64), fp: u6
                 if fps[d] == f && st.frames[d + 1].load(Relaxed) == r {
                     class = class.min(d);
                     if d == 0 {
+                        same_body = k == 0;
                         break 'walk;
                     }
                 }
@@ -475,6 +482,11 @@ fn life_free(t: &Tables, id: usize, rec: (&[u64; LIFE_FRAMES], u64, u64), fp: u6
     }
     let sl = &sites[id];
     sl.class[class].fetch_add(1, Relaxed);
+    if same_body {
+        sl.same_body.fetch_add(1, Relaxed);
+    }
+    sl.size_min.fetch_min(size, Relaxed);
+    sl.size_max.fetch_max(size, Relaxed);
     sl.hist[class][life_bucket(size)].fetch_add(1, Relaxed);
     sl.bytes.fetch_add(size, Relaxed);
     let seen = sl.seen.fetch_add(1, Relaxed);
@@ -912,6 +924,9 @@ fn new_tables_inner(rate: u64, life: Option<u64>) -> *mut Tables {
                     seen: AtomicU32::new(0),
                     fit: AtomicU64::new(0),
                     over: AtomicU64::new(0),
+                    same_body: AtomicU64::new(0),
+                    size_min: AtomicU64::new(u64::MAX),
+                    size_max: AtomicU64::new(0),
                 })
                 .collect()
         }),
@@ -1355,8 +1370,8 @@ pub fn cmd_heap(req: &Req, out: &mut Out) {
                 if j < n {
                     let h = |r: usize| hist[r].iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
                     lines.push(format!(
-                        "{{\"id\":\"H{}\",\"allocs\":{},\"per_frame\":{:.2},\"k\":{},\"local\":{},\"ret1\":{},\"ret2p\":{},\"esc_same_frame\":{},\"esc_later\":{},\"live\":{},\"reallocs\":{},\"bytes\":{},\"guess\":{},\"fit\":{},\"over\":{},\"hist_local\":\"{}\",\"hist_ret1\":\"{}\",\"hist_ret2p\":\"{}\",\"hist_esc_same\":\"{}\",\"hist_esc_later\":\"{}\",{}}}",
-                        id, allocs, allocs as f64 / frames as f64, k, rel[0], rel[1], rel[2], rel[3], rel[4], rel[5], re, sl.bytes.load(Relaxed), sl.guess.load(Relaxed), fit, over, h(0), h(1), h(2), h(3), h(4), site
+                        "{{\"id\":\"H{}\",\"allocs\":{},\"per_frame\":{:.2},\"k\":{},\"local\":{},\"ret1\":{},\"ret2p\":{},\"esc_same_frame\":{},\"esc_later\":{},\"live\":{},\"reallocs\":{},\"bytes\":{},\"guess\":{},\"fit\":{},\"over\":{},\"same_body\":{},\"size_min\":{},\"size_max\":{},\"hist_local\":\"{}\",\"hist_ret1\":\"{}\",\"hist_ret2p\":\"{}\",\"hist_esc_same\":\"{}\",\"hist_esc_later\":\"{}\",{}}}",
+                        id, allocs, allocs as f64 / frames as f64, k, rel[0], rel[1], rel[2], rel[3], rel[4], rel[5], re, sl.bytes.load(Relaxed), sl.guess.load(Relaxed), fit, over, sl.same_body.load(Relaxed), sl.size_min.load(Relaxed).min(sl.size_max.load(Relaxed)), sl.size_max.load(Relaxed), h(0), h(1), h(2), h(3), h(4), site
                     ));
                 }
             }
