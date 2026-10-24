@@ -2169,12 +2169,20 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         let mut members = core.clone();
         members.extend(tails.iter().copied());
         members.sort_unstable();
-        let size: usize = members.iter().map(|b| f.blocks[*b as usize].insts.len() + 1).sum();
+        // The size that runs: a counted build's blocks the counts never saw run (the rare arms of
+        // a loop body, inlined) are copied but cost no time; the copies' code is O3 tier growth,
+        // capped by `all` (sandbox reconcile's loop over two borrowed shape fields: 330 insts with
+        // its never-taken create/destroy arms, about 100 that run; GAPB)
+        let all: usize = members.iter().map(|b| f.blocks[*b as usize].insts.len() + 1).sum();
+        let size: usize = members.iter().filter(|b| f.blocks[**b as usize].count != 0.0).map(|b| f.blocks[*b as usize].insts.len() + 1).sum();
         if tr {
-            eprintln!("full-unroll {}: loop b{} {} blocks {} insts", f.name, h, members.len(), size);
+            eprintln!("full-unroll {}: loop b{} {} blocks {} insts ({} run)", f.name, h, members.len(), all, size);
         }
         // (the function's budget below bounds the total growth)
-        if size > 160 {
+        if size > 160 || all > 640 {
+            if tr {
+                eprintln!("  too large");
+            }
             continue;
         }
         // Calls in the body are copied with it, as LLVM's full unroll does (a call is part of the
@@ -2391,7 +2399,7 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
                 continue 'next;
             }
         }
-        if size * t > budget {
+        if size * t > budget || all * t > 2400 {
             if tr {
                 eprintln!("  {} copies of {} insts over the budget {}", t, size, budget);
             }
