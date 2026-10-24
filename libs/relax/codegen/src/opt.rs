@@ -609,7 +609,7 @@ impl InlineLimits {
     }
 }
 
-fn site_rule(options: &relax_session::Options, callee: &Func, id: u32, nargs: usize, nrets: usize, attrs: u8, hot: bool, unsampled: bool, single: bool, depth: usize, multi_depth: usize, lim: &InlineLimits) -> Option<usize> {
+fn site_rule(options: &relax_session::Options, callee: &Func, id: u32, nargs: usize, nrets: usize, attrs: u8, hot: bool, in_loop: bool, unsampled: bool, single: bool, depth: usize, multi_depth: usize, lim: &InlineLimits) -> Option<usize> {
     // Unlike the leaf heuristic, recursion on a panic path still forbids inlining.
     if callee.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Call(Callee::Fn(c), _, _) if *c == id)))
         || !callee.blocks.iter().any(|b| matches!(b.term, Term::Ret(_))) {
@@ -641,9 +641,13 @@ fn site_rule(options: &relax_session::Options, callee: &Func, id: u32, nargs: us
     // Keep ordinary low-priority sites inlinable, but reserve expansive
     // hinted bodies for hot sites and closure chains. This bound also applies
     // before samples exist, preventing structural builds from spending their
-    // growth allowance on large peripheral helpers.
+    // growth allowance on large peripheral helpers. A site in a loop is no peripheral helper:
+    // rustc inlines an #[inline] body there by its cost alone (LLVM's inline-hint threshold), and
+    // which loop block the samples or counts call hot varies from build to build (sandbox
+    // reconcile's derived `MirrorEntry::clone`, 138 insts, in the per-entity loop: inlined in one
+    // O3 build, a call in the next; GAPB).
     let mut lim = *lim;
-    if !hot && attrs & ATTR_CHAIN == 0 { lim.hint_insts = lim.hint_insts.min(120); }
+    if !hot && !in_loop && attrs & ATTR_CHAIN == 0 { lim.hint_insts = lim.hint_insts.min(120); }
     inline_rule(callee, id, nargs, nrets, attrs, &lim).or_else(|| {
         (hot && inline_inst_count(callee) <= lim.hot_insts).then_some(RULE_SMALL_LEAF)
     })
@@ -856,7 +860,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
             let no_growth = cost == 0;
             let attrs = found.unwrap().1;
             let lim_b = pgo_site_limits(lim, counted, priorities[bi].0, shape);
-            let rule = site_rule(options, shape, id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), id), ancestry[bi].len() - 1, multi_depths[bi], &lim_b);
+            let rule = site_rule(options, shape, id, args.len(), rets.len(), attrs, priorities[bi].1, loop_sites[bi], priorities[bi].2, single(*ancestry[bi].last().unwrap(), id), ancestry[bi].len() - 1, multi_depths[bi], &lim_b);
             // New admissions respect the actual growth ceiling, including ABI moves.
             let growth = size.saturating_add(args.len()).saturating_add(
                 shape.blocks.iter().filter(|b| matches!(b.term, Term::Ret(_))).count().saturating_mul(rets.len())
@@ -996,7 +1000,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
                 } else if let Some((_, attrs)) = found {
                     let c = callee.unwrap();
                     let lim_b = pgo_site_limits(lim, counted, priorities[bi].0, c);
-                    let rule = site_rule(options, c, *id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), *id), ancestry[bi].len() - 1, multi_depths[bi], &lim_b);
+                    let rule = site_rule(options, c, *id, args.len(), rets.len(), attrs, priorities[bi].1, loop_sites[bi], priorities[bi].2, single(*ancestry[bi].last().unwrap(), *id), ancestry[bi].len() - 1, multi_depths[bi], &lim_b);
                     if ancestry[bi].contains(id) || rule.is_none() {
                         2
                     } else if (attrs & ATTR_COLD != 0 && rule != Some(RULE_COST) || attrs & ATTR_COLD_SRC != 0) && !(inline_inst_count(c) <= INLINE_FREE_INSTS && inline_inst_count(c) <= free_budget) {
@@ -6228,7 +6232,7 @@ mod inline_priority_tests {
         let options = &relax_session::Options::default();
         let mut c = cheap_callee(30); // too large for the unsampled free rule
         let lim = InlineLimits::tier1();
-        let rule = |c: &Func, depth, multi_depth| site_rule(options, c, 1, 0, 0, 0, false, true, false, depth, multi_depth, &lim);
+        let rule = |c: &Func, depth, multi_depth| site_rule(options, c, 1, 0, 0, 0, false, false, true, false, depth, multi_depth, &lim);
         assert_eq!(rule(&c, HISTORY_DEPTH_LIMIT - 1, 0), Some(RULE_COST));
         assert_eq!(rule(&c, HISTORY_DEPTH_LIMIT, 0), None);
         c.blocks[0].insts.extend(vec![Inst::IBinI(IOp::Add, I64, VReg(0), VReg(0), 1); 6]);
