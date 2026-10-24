@@ -8284,6 +8284,10 @@ fn note_slow_base(u: &Unit, id: u32) {
 /// the parked counting entries whose counted code is gone.
 fn drain_slow_base() {
     static LAST_FORGET: AtomicU64 = AtomicU64::new(0);
+    // (profile replay: no O2 builds from this run's timing; T1PROF is set only when profiling)
+    if T1PROF.lock().unwrap().as_ref().is_some_and(|p| p.replay) {
+        return;
+    }
     let ids = std::mem::take(&mut *SLOW_BASE.lock().unwrap_or_else(|e| e.into_inner()));
     let now = wall_ns();
     let forget = now.saturating_sub(LAST_FORGET.load(Ordering::Relaxed)) >= PGO_WORK_NS
@@ -14529,9 +14533,16 @@ impl Unit {
         if !counted {
             return;
         }
-        let recorded = t1prof_replay(&self.prog.session.options) && unsafe {
+        let replay = t1prof_replay(&self.prog.session.options);
+        let recorded = replay && unsafe {
             T1PROF.lock().unwrap().as_ref().unwrap().map.contains_key(&t1_key(self, id))
         };
+        // strict replay: only the recorded decisions build O3 code. A slot the profile does not
+        // name keeps the code it has, without a count stub: no tier-up from this run's timing
+        // (hotness rates, sampler, counted windows), no rt_hot on the program's threads.
+        if replay && !recorded {
+            return;
+        }
         let rec = tier_rec(&self.slots, id);
         unsafe {
             if (*rec.add(3)).load(Ordering::Relaxed) != 0 {
@@ -15094,6 +15105,10 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
         if up.is_null() || TIER_STOP.load(Ordering::SeqCst) {
             continue;
         }
+        // strict replay: a slot the profile does not name is not built (whatever queued it)
+        if owner::publish(|| unsafe { t1prof_refuse(up, id) }) {
+            continue;
+        }
         let _job = compile_job();
         if why == Q_CALLS || why == Q_LOOP {
             owner::publish(|| unsafe { o2_hot(up, id) });
@@ -15164,6 +15179,9 @@ struct T1Entry {
     hot: bool,
     input: u64,
     code: u64,
+    /// the decisions the installed build took: the keys of the callees it inlined (sorted, one per
+    /// inlined body); replay checks its own build against them (inline-differ)
+    inlined: Vec<String>,
 }
 struct T1Profile {
     replay: bool,
@@ -15174,6 +15192,9 @@ struct T1Profile {
     differ: Vec<String>,
     /// replay: keys installed already (later hot triggers do not rebuild them)
     done: std::collections::HashSet<String>,
+    /// replay: hot slots the profile does not name, kept at their code (strict: only the
+    /// recorded decisions build O3 code)
+    refused: std::collections::BTreeSet<String>,
 }
 static T1PROF: relax_session::sync::Mutex<Option<T1Profile>> = relax_session::sync::Mutex::new(None);
 
@@ -15188,7 +15209,7 @@ fn t1prof_on(options: &crate::options::Options) -> bool {
             Some(t) if !t.is_empty() => {
                 for l in t.lines() {
                     let x: Vec<&str> = l.split('\t').collect();
-                    if x.len() != 12 {
+                    if x.len() != 13 {
                         continue;
                     }
                     let list = |t: &str| -> Vec<String> { if t.is_empty() { Vec::new() } else { t.split('\u{1f}').map(|c| c.to_string()).collect() } };
@@ -15201,14 +15222,14 @@ fn t1prof_on(options: &crate::options::Options) -> bool {
                     let hot = x[9] == "1";
                     let counts = x.get(10).and_then(|v| parse_freq(v));
                     let callee_counts = x.get(11).map_or_else(Vec::new, |v| v.split('\u{1e}').filter_map(|e| e.split_once('\u{1d}')).filter_map(|(k, c)| Some((k.to_string(), parse_freq(c)?))).collect());
-                    map.insert(x[0].to_string(), T1Entry { cold: list(x[1]), snap: list(x[2]), single, freq, inline_freq, hot, counts, callee_counts, input: u64::from_str_radix(x[4], 16).unwrap_or(0), code: u64::from_str_radix(x[5], 16).unwrap_or(0) });
+                    map.insert(x[0].to_string(), T1Entry { cold: list(x[1]), snap: list(x[2]), single, freq, inline_freq, hot, counts, callee_counts, input: u64::from_str_radix(x[4], 16).unwrap_or(0), code: u64::from_str_radix(x[5], 16).unwrap_or(0), inlined: list(x[12]) });
                 }
                 true
             }
             _ => false,
         };
         eprintln!("makepad: O3 profile {} ({}, {} entries)", p, if replay { "replay" } else { "record" }, map.len());
-        *T1PROF.lock().unwrap() = Some(T1Profile { replay, path: p, map, installed: 0, live: std::collections::HashSet::new(), differ: Vec::new(), done: std::collections::HashSet::new() });
+        *T1PROF.lock().unwrap() = Some(T1Profile { replay, path: p, map, installed: 0, live: std::collections::HashSet::new(), differ: Vec::new(), done: std::collections::HashSet::new(), refused: Default::default() });
         true
     })
 }
@@ -15290,6 +15311,22 @@ fn t1prof_replay(options: &crate::options::Options) -> bool {
     t1prof_on(options) && T1PROF.lock().unwrap().as_ref().is_some_and(|p| p.replay)
 }
 
+/// Strict replay: slot `id` turned hot (a queue pop) but the profile does not name it: it gets
+/// no O3 (or O2) build; noted in the summary (REFUSED). False outside replay.
+unsafe fn t1prof_refuse(up: *const Unit, id: u32) -> bool {
+    if !t1prof_replay(&(&*up).prog.session.options) {
+        return false;
+    }
+    let k = t1_key(up, id);
+    let mut g = T1PROF.lock().unwrap();
+    let p = g.as_mut().unwrap();
+    if p.map.contains_key(&k) {
+        return false;
+    }
+    crate::zone_alloc::kept_with(|| p.refused.insert(k));
+    true
+}
+
 fn t1prof_divergence(kind: &str, key: &str) {
     if let Some(p) = T1PROF.lock().unwrap().as_mut() {
         crate::zone_alloc::kept_with(|| p.differ.push(format!("{} {}", kind, key)));
@@ -15303,11 +15340,12 @@ fn t1prof_summary(p: &T1Profile) -> String {
     live.sort();
     let mut kinds = std::collections::BTreeMap::new();
     for d in &p.differ { *kinds.entry(d.split(' ').next().unwrap_or("unknown")).or_insert(0usize) += 1; }
-    let mut out = format!("installed {} / recorded {} / unrecorded-live {} / divergences {}\n",
-        p.installed, p.map.len(), p.live.len(), p.differ.len());
+    let mut out = format!("installed {} / recorded {} / unrecorded-live {} / refused {} / divergences {}\n",
+        p.installed, p.map.len(), p.live.len(), p.refused.len(), p.differ.len());
     for (kind, count) in kinds { out.push_str(&format!("{} {}\n", kind, count)); }
     for k in missing { out.push_str(&format!("MISSING {}\n", k)); }
     for k in live { out.push_str(&format!("UNRECORDED-LIVE {}\n", k)); }
+    for k in &p.refused { out.push_str(&format!("REFUSED {}\n", k)); }
     for d in &p.differ { out.push_str(&format!("{}\n", d)); }
     out
 }
@@ -15339,7 +15377,7 @@ fn t1prof_finish() {
         };
         let inline = e.inline_freq.as_ref().expect("recorded inlining frequencies");
         let callees = e.callee_counts.iter().map(|(k, c)| format!("{}\u{1d}{}", k, fmt_freq(&Some(c.clone())))).collect::<Vec<_>>().join("\u{1e}");
-        out.push_str(&format!("{}\t{}\t{}\t{}\t{:016x}\t{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\n", k, e.cold.join("\u{1f}"), e.snap.join("\u{1f}"), fmt_freq(&e.freq), e.input, e.code, fmt_freq(&inline[0]), fmt_freq(&inline[1]), e.single.join("\u{1f}"), if e.hot { "1" } else { "0" }, fmt_freq(&e.counts), callees));
+        out.push_str(&format!("{}\t{}\t{}\t{}\t{:016x}\t{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", k, e.cold.join("\u{1f}"), e.snap.join("\u{1f}"), fmt_freq(&e.freq), e.input, e.code, fmt_freq(&inline[0]), fmt_freq(&inline[1]), e.single.join("\u{1f}"), if e.hot { "1" } else { "0" }, fmt_freq(&e.counts), callees, e.inlined.join("\u{1f}")));
     }
     let _ = std::fs::write(&p.path, out);
     if !p.differ.is_empty() {
@@ -15633,7 +15671,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             }
         };
         // deterministic O3 (MAKEPAD_RUN_O3_PROFILE): recorded fns replay once;
-        // unrecorded fns still tier on live hotness.
+        // only the recorded ones build at all (strict: t1prof_refuse, arm_counter_as).
         let t1key: Option<String> = if t1prof_on(options) { Some(t1_key(up, id)) } else { None };
         if let Some(k) = &t1key {
             let g = T1PROF.lock().unwrap();
@@ -16173,7 +16211,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 _ => {}
             }
             if !p.replay {
-                profile_entry = Some(T1Entry { cold: t1_cold_keys.clone(), snap: t1_snap_keys.clone(), single: t1_single_keys.clone(), freq: freq.clone(), inline_freq: Some(inline_freq.clone()), hot: hot_root, counts: counts.clone(), callee_counts: snap_counts.iter().filter_map(|(_, k, c)| Some((k.clone()?, c.clone()))).collect(), input, code });
+                profile_entry = Some(T1Entry { cold: t1_cold_keys.clone(), snap: t1_snap_keys.clone(), single: t1_single_keys.clone(), freq: freq.clone(), inline_freq: Some(inline_freq.clone()), hot: hot_root, counts: counts.clone(), callee_counts: snap_counts.iter().filter_map(|(_, k, c)| Some((k.clone()?, c.clone()))).collect(), input, code, inlined: Vec::new() });
             }
         }
         note_frame(id, c.frame_size, slot_bytes(&func), true);
@@ -16519,6 +16557,13 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 slot.store(at, Ordering::SeqCst);
                 o3_owner(3, tx);
                 let tn = cpu_ns();
+                // deterministic O3: the decisions this build took (its inlined callees by key)
+                let inl_keys: Option<Vec<String>> = t1key.as_ref().map(|_| {
+                    let _k = crate::zone_alloc::kept();
+                    let mut v: Vec<String> = inlined.iter().map(|&c| t1_key(up, c)).collect();
+                    v.sort();
+                    v
+                });
                 // a patch of an inlined callee recompiles this slot (live.rs)
                 let n_inl = inlined.len();
                 for c in inlined {
@@ -16529,9 +16574,27 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 }
                 // Publish only installed builds. A rejected/stale build must not
                 // replace the profile of the code the program actually executes.
-                if let (Some(k), Some(entry)) = (&t1key, profile_entry) {
+                if let (Some(k), Some(mut entry)) = (&t1key, profile_entry) {
+                    entry.inlined = inl_keys.clone().unwrap_or_default();
                     crate::zone_alloc::kept_with(|| T1PROF.lock().unwrap().as_mut().unwrap().map.insert(k.clone(), entry));
                     t1prof_finish();
+                }
+                // replay: the same inline decisions as the recorded build, else name the difference
+                if let (Some(k), Some(keys)) = (&t1key, &inl_keys) {
+                    let _k = crate::zone_alloc::kept();
+                    let mut g = T1PROF.lock().unwrap();
+                    if let Some(p) = g.as_mut().filter(|p| p.replay) {
+                        if let Some(e) = p.map.get(k) {
+                            if &e.inlined != keys {
+                                let (mut add, mut del) = (0usize, 0usize);
+                                let mut rec: std::collections::HashMap<&str, isize> = Default::default();
+                                for x in &e.inlined { *rec.entry(x.as_str()).or_default() += 1; }
+                                for x in keys { *rec.entry(x.as_str()).or_default() -= 1; }
+                                for v in rec.values() { if *v > 0 { del += *v as usize } else { add += (-*v) as usize } }
+                                p.differ.push(format!("inline-differ {} (+{} -{} of {} recorded)", k, add, del, e.inlined.len()));
+                            }
+                        }
+                    }
                 }
                 o3_owner(4, tn);
                 let tr = cpu_ns();
