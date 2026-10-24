@@ -2230,7 +2230,12 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         // the loop's entries now: `preds` predates the copies of loops unrolled earlier in this
         // pass, and a copy that leaves into this loop must enter its first copy too (else the
         // copies are dead and the loop stays rolled)
-        let outside: Vec<u32> = (0..f.blocks.len() as u32).filter(|p| !m.get(*p as usize).copied().unwrap_or(false) && f.blocks[*p as usize].term.succs().any(|s| s == h)).collect();
+        // (MAKEPAD_RUN_OPT=-unrollentries: the entries of the pass start, as before GAPB2)
+        let outside: Vec<u32> = if relax_backend::stats::opt_off(options, "-unrollentries") {
+            preds[h as usize].iter().copied().filter(|p| !m[*p as usize]).collect()
+        } else {
+            (0..f.blocks.len() as u32).filter(|p| !m.get(*p as usize).copied().unwrap_or(false) && f.blocks[*p as usize].term.succs().any(|s| s == h)).collect()
+        };
         if outside.is_empty() {
             continue;
         }
