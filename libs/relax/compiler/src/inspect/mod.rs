@@ -137,7 +137,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("path", "<H<n>|R<n>>", "the full stack of a heap site id"),
     ("count", "<fn> [time=1] [tier=o1]", "exact call counts (and inclusive time) of every slot of a fn: its code is rebuilt with probes at the tier of the code it replaces (O3 code gets an O3 instrumented build; tier=o1 asks for O1) and installed as a probe group G<n>; every slot whose code holds an inlined copy of the fn is rebuilt at its tier without that inlining, so it calls the counted code; each row names the code version replaced and the one now, later installs with an inlined copy are rebuilt too (a `probe` event)"),
     ("asm", "<fn|@slot> [vs=rustc] [native=<binary>] [s=2] [ev=cpu|cycles|instructions|branch-misses|cache-misses] [view=summary|lines|listing|code] [line=<n>] [at=<off> [n=24]] | top vs=rustc [s=3] [n=15]", "the JIT's machine code of a fn next to rustc's for the same fn (native=: a release build with line tables), aligned by source line, with CPU samples and PGO counts per line and a diff summary first: excess instructions, spill traffic, kept bounds checks, calls rustc inlined, loops rustc vectorised; at=: the n instructions either side of one code offset (a fault's `off` in decimal, or 0x hex), the one at it marked; `asm top vs=rustc` ranks the hottest fns by the time their excess instructions cost"),
-    ("vsnative", "[native=<bin>] [args=a,b] [s=5] [warm_ms=3000] [ev=instructions|cycles|cpu] [n=20] | pid=<native pid> [s=10] [hz=1000] [threads=main] [nthreads=<name>|busy] [roots=a,b] [tree=<depth>] [min=0.1] [save=1]", "the program's rustc release build run next to this process for the same window, both sampled with the same event, diffed per fn: events/s here and native, ratio, shares, the JIT tier (Linux); pid=: an already-running native build sampled WITH STACKS (its CFI + DWARF inline tree) next to this process: self and inclusive time per source fn on both sides, cut at roots= (what a meter times), a merged call tree -- the JIT-vs-native attribution table (x86_64 Linux)"),
+    ("vsnative", "[native=<bin>] [args=a,b] [s=5] [warm_ms=3000] [ev=instructions|cycles|cpu] [n=20] | pid=<native pid> [s=10] [hz=1000] [threads=main] [nthreads=<name>|busy] [roots=a,b] [tree=<depth>] [min=0.1] [save=1] | file=<native raw samples> [native=<bin>] [s=] [threads=main] [roots=a,b] [save=1]", "the program's rustc release build run next to this process for the same window, both sampled with the same event, diffed per fn: events/s here and native, ratio, shares, the JIT tier (Linux); pid=: an already-running native build sampled WITH STACKS (its CFI + DWARF inline tree) next to this process: self and inclusive time per source fn on both sides, cut at roots= (what a meter times), a merged call tree -- the JIT-vs-native attribution table (x86_64 Linux); file=: the same tables against the native app's own recorded samples (its `prof threads=main raw=<file>`; macOS and Linux), this process sampled now for deterministic work"),
     ("ab", "<fn|@slot> b=<base|o1|opt:<tok>,..|inline:<callee>|noinline:<callee>> [a=base] [rounds=5] [s=1] [metric=incl|self] [per=s|frame|call] [ev=cpu|cycles|instructions] [keep=a|b]", "a live A/B of one fn: the variants' builds installed in turn (ABAB rounds), each round's cost rate of the fn measured alike; answer: medians, spread, permutation-test p, verdict (real / no difference beyond noise)"),
     ("contention", "[s=3] [n=15]", "lock / condvar / park / owner waits grouped by what was waited on: total and longest wait, per frame, waiting threads, who ended them (records s seconds of timeline first; alias of timeline waits)"),
     ("counters", "[s=1] [n=12]", "hardware counters over a window: Linux per thread (cycles, instructions, IPC, branch and cache misses); macOS the process's instructions and cycles (all a non-root process gets)"),
@@ -164,6 +164,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("hal", "pump", "HAL pump loop per session: turns and wake causes, totals and per second since the last call (an idle app shows none)"),
     ("writes", "<Type::field> | (none: the watches) | W<n> [n=20] | rm <W<n>|all>", "who writes a struct field: the compiled fns that assign `x.field` (`=`, `op=`) are rebuilt to record every write: its site (fn, file:line), the value written and the field's address; `writes W<n>` reads the sites and the latest writes"),
     ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
+    ("jit", "[ms=250]", "live compile activity in one line (what the JIT ring shows): busy or idle, the jobs running now, the queues per tier (ahead, O2, O3), builds finished and their rate over ms, the UI thread's JIT duty"),
     ("threads", "", "every thread: name, role, state, CPU time, what it waits on; JIT threads: alive/restarting/dead, panics, heartbeat"),
     ("stacks", "[thread=<name|tid|main|owner|all>] [depth=12]", "symbolised stacks (identical stacks folded)"),
     ("waits", "", "the wait registry: who waits for what, held by whom"),
@@ -203,6 +204,7 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "pf" => out.err("pf is answered by the client: makepad inspect <app> pf <query> (it attaches to the app's prof stream)"),
         "ping" => out.line(&format!("{{\"pid\":{},\"app\":{},\"ms\":{}}}", std::process::id(), json_str(&APP.lock().unwrap()), now_ms())),
         "threads" => cmd_threads(out),
+        "jit" => cmd_jit(req, out),
         "stacks" => cmd_stacks(req, out),
         "waits" => cmd_waits(out),
         "owner" => cmd_owner(out),
@@ -950,6 +952,68 @@ fn cmd_waits(out: &mut Out) {
     }
 }
 
+/// `jit`: the JIT's compile activity over a short window, one line, answer first.
+fn cmd_jit(req: &Req, out: &mut Out) {
+    use crate::postframe::activity;
+    let ms = req.num("ms", 250).clamp(20, 10_000);
+    let t0 = std::time::Instant::now();
+    let a = activity();
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+    let b = activity();
+    // the window as it was (a loaded machine oversleeps)
+    let ms = (t0.elapsed().as_millis() as u64).max(1);
+    out.measured("JIT compile activity", "postframe::activity (atomics + O2/O3 queue locks), two looks", &[]);
+    out.line(&jit_line(&a, &b, ms));
+}
+
+/// The `jit` answer from two looks `ms` apart.
+fn jit_line(a: &crate::postframe::Activity, b: &crate::postframe::Activity, ms: u64) -> String {
+    let k = |n: u64| if n >= 10_000 { format!("{:.1}k", n as f64 / 1e3) } else { n.to_string() };
+    let d = |x: u64, y: u64| y.saturating_sub(x);
+    let built = d(a.finished(), b.finished());
+    let duty = d(a.ui_wait_ns, b.ui_wait_ns) as f64 / (ms as f64 * 1e6);
+    let busy = built > 0 || b.running() || duty > 0.02;
+    let background = b.background() && duty <= 0.02 && b.demand() == a.demand();
+    let mut parts = vec![if busy { if background { "busy (background)" } else { "busy" } } else { "idle" }.to_string()];
+    let current = b.current();
+    let mut running = Vec::new();
+    if !current.is_empty() {
+        running.push(current);
+    }
+    if b.o3_running > 1 || (b.o3_running > 0 && b.o3_slot.is_none()) {
+        running.push(format!("{} O3 builds", b.o3_running));
+    }
+    if b.ahead_running > 0 && !b.ui_waiting {
+        running.push(format!("{} ahead", b.ahead_running));
+    }
+    if b.o2_running && b.o3_slot.is_some() {
+        running.push("O2 build".into());
+    }
+    parts.push(format!("running: {}", if running.is_empty() { "nothing".into() } else { running.join(", ") }));
+    parts.push(format!("queued: ahead {}, O2 {}, O3 {}", k(b.ahead), k(b.o2), k(b.o3)));
+    let rate = built as f64 * 1000.0 / ms as f64;
+    parts.push(format!(
+        "finished {} (+{} in {} ms = {:.0} fns/s: lazy {}, ahead {}, O2 {}, O3 {}, linked {})",
+        k(b.finished()),
+        built,
+        ms,
+        rate,
+        d(a.demand(), b.demand()),
+        d(a.ahead_done, b.ahead_done),
+        d(a.o2_done, b.o2_done),
+        d(a.o3_done, b.o3_done),
+        d(a.linked, b.linked)
+    ));
+    parts.push(format!("UI JIT duty {:.0}%", duty * 100.0));
+    if b.settling {
+        parts.push("settle rebuild running".into());
+    }
+    if !busy && b.pending() > 0 {
+        parts.push(format!("{} queued but nothing building", k(b.pending())));
+    }
+    parts.join(" · ")
+}
+
 fn cmd_owner(out: &mut Out) {
     out.measured("owner thread", "owner counters (no owner)", &[]);
     out.line(&format!("{{\"serving\":{},\"queued\":{},\"pure_census\":{}}}", json_str(&crate::owner::serving_note()), crate::owner::queued_note(), crate::owner::pure_note_json()));
@@ -1315,11 +1379,16 @@ pub extern "C" fn relax_wait_enter(kind: u32, addr: usize, holder: usize) {
         crate::waits::enter(crate::waits::Kind::Join, 0, holder as u64, "join");
         return;
     }
-    const LABELS: [&str; 7] = ["futex", "mutex", "condvar", "rwlock read", "rwlock write", "park", "once"];
+    // a wait is where a program thread may go quiet: its program heap's current chunks are
+    // settled first (the blocks other threads freed into them, their free pages; a pass over
+    // its classes, small next to the futex call)
+    crate::zone_alloc::domain::before_wait();
+    const LABELS: [&str; 9] = ["futex", "mutex", "condvar", "rwlock read", "rwlock write", "park", "once", "join", "sleep"];
     crate::waits::enter(crate::waits::Kind::Futex, addr as u64, holder as u64, LABELS.get(kind as usize).copied().unwrap_or("futex"));
 }
 
 pub extern "C" fn relax_wait_leave() {
+    crate::zone_alloc::domain::after_wait();
     crate::waits::leave();
 }
 

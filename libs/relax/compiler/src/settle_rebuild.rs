@@ -51,6 +51,20 @@ pub(crate) fn rebuilds() -> u32 {
     REBUILDS.load(Ordering::Relaxed)
 }
 
+/// A rebuild is running now (its preconditions held; postframe::activity).
+static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn running() -> bool {
+    RUNNING.load(Ordering::Relaxed)
+}
+
+struct Running;
+impl Drop for Running {
+    fn drop(&mut self) {
+        RUNNING.store(false, Ordering::Relaxed);
+    }
+}
+
 /// How many monitor tries (one a second) a rebuild waits for the tier-up tail before it runs anyway.
 pub(crate) const TAIL_WAIT: u32 = 60;
 
@@ -228,6 +242,8 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     }
     // the recipe, the session, the images: process state
     let _k = crate::zone_alloc::kept();
+    RUNNING.store(true, Ordering::Relaxed);
+    let _running = Running;
     let t_all = Instant::now();
     let rss0 = crate::memstat::resident();
     let pre = BOOT.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap();
@@ -374,12 +390,19 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     let checked_epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
     // the replace: nothing can fail from here
     u.front.retire_memos();
+    // the old front state names the old program: no reader may reach it after the replace (a
+    // reader checks `alive` under its front read, and this runs under the front write)
+    u.front.alive.store(false, Ordering::SeqCst);
     let mut rir = Vec::new();
     for e in u.fns.iter_mut() {
         if let Some(r) = e.rir.take() {
             rir.push(r);
         }
         e.build_err = None;
+        // the slots' call lists stay; made during the cold start, they are scattered over the
+        // old state's chunks (a few bytes each, 200k slots): copied into the fresh chunks, the old
+        // ones go with the rest (only the owner reads a slot's fields: this runs on it)
+        e.rehome_lists();
     }
     let old = Old {
         _prog: std::mem::replace(&mut u.prog, prog),
@@ -404,10 +427,19 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
         context: u.self_ptr.0 as usize, evaluate: const_eval_to_valtree,
     });
     u.prog.body_memos.store(true, Ordering::Relaxed);
+    // the same program: its collect epochs go on from the old one's (the checker's epochs only
+    // advance: a restored context counting from its image would put every later epoch behind)
+    u.tcx.collect_epoch.fetch_max(checked_epoch, Ordering::SeqCst);
     u.tcx.publish_collected();
     // the background borrow checker keeps every verdict and queued check (the same program)
-    crate::borrowck::lazy::carry_whole(u.front.checker_id, checked_epoch, u.tcx.collect_epoch.load(Ordering::SeqCst));
+    let epoch_to = u.tcx.collect_epoch.load(Ordering::SeqCst);
+    crate::borrowck::lazy::carry_whole(u.front.checker_id, checked_epoch, epoch_to);
     set_shared_front(u, u.core_crate);
+    // ... and reads them from the new front state: the old one (dead now) is not kept alive by
+    // the queue or the worker (its memos pinned the cold state's chunks)
+    let src: std::sync::Arc<dyn crate::borrowck::lazy::FrontSource> = std::sync::Arc::new(BorrowckFront(u.front.clone()));
+    let moved = crate::borrowck::lazy::rehome(&src);
+    trace(&format!("{moved} queued borrow checks moved to the new front state (epoch {checked_epoch} -> {epoch_to})"));
     crate::run::set_diagnostics(u.tcx.dcx.clone());
     // every thread's compiler memos go at its next access (dropped there, by value)
     relax_session::memo_local::retire_all();
