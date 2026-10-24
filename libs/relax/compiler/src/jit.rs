@@ -21701,6 +21701,8 @@ unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64, ticket: 
     // vtable of those types, now and as the program makes more, is real-time code too. Trait
     // objects the code only makes itself are followed through the vtables its code names.
     dyns.extend(realtime_value_dyns(u, &values));
+    // (the step it schedules runs after this owner request)
+    realtime_reach_queued(up, roots, "mark", false);
     with_rt(|rt| {
         // (their vtables are followed when the walk has done the roots' slots)
         rt.new_dyns.extend(dyns);
@@ -21709,7 +21711,6 @@ unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64, ticket: 
             rt.wakes.push((ticket, scope, wake));
         }
     });
-    realtime_reach_queued(up, roots, "mark", false);
 }
 
 /// Adds `roots` to the reach and schedules its next owner step. `urgent`: a real-time thread is
