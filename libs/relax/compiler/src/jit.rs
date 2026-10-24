@@ -12173,9 +12173,12 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
 fn slot_cleanup(options: &crate::options::Options, func: &mut relax_backend::rir::Func, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg) {
     {
         for _ in 0..3 {
+            // field-wise copies (a derived Clone's loads and stores) as one copy, which the
+            // passes below forward and join along; MAKEPAD_RUN_OPT=-copyruns
+            let ch = !relax_backend::stats::opt_off(options, "-copyruns") && relax_codegen::opt::merge_copy_runs(func);
             // zero fills a copy overwrites before any read go first: the copy's stores are
             // then the only writes of those bytes, so the reads after it can be forwarded
-            let ch = relax_codegen::opt::dead_slot_stores(func);
+            let ch = ch | relax_codegen::opt::dead_slot_stores(func);
             let ch = ch | relax_codegen::opt::forward_slot_dests(func) | relax_codegen::opt::forward_slot_dests_x(options, func, 32);
             // slots joined along whole copies by byte liveness (loops too); MAKEPAD_RUN_OPT=-slotcoal
             let ch = ch | (!relax_backend::stats::opt_off(options, "-slotcoal") && relax_codegen::opt::coalesce_slot_copies(func, !relax_backend::stats::opt_off(options, "-slotprefix")));
