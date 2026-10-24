@@ -990,7 +990,15 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
         return;
     }
     if let Ok(manifest) = std::env::var("MAKEPAD_RUN_WASM_EXPORT_FUNCTIONS") {
-        let keys = reached.iter().map(|id| crate::jit::slot_key(u, *id)).collect::<Vec<_>>();
+        // A shipping body includes its inline instances even when those instances
+        // need no standalone wasm entry. Use provenance from these exact bodies,
+        // not historical inline/dependency lists (which also include nounwind
+        // queries), registered slots, or observed coverage.
+        let mut included: std::collections::BTreeSet<u32> = reached.iter().copied().collect();
+        if !block_profile() {
+            for id in &reached { included.extend(funcs[id].inl_slots.iter().copied()); }
+        }
+        let keys = included.iter().map(|id| crate::jit::slot_key(u, *id)).collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
         if let Err(error) = std::fs::write(&manifest, format!("makepad-shipped-functions/1\n{}\n", keys.join("\n"))) {
             eprintln!("wasm export: function manifest {manifest}: {error}");
             FAILED.store(true, std::sync::atomic::Ordering::Release);
@@ -1494,6 +1502,17 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Resul
     let mut vtables = CLOSURE_VTABLES.lock().unwrap_or_else(|e| e.into_inner());
     vtables.clear();
     if let Ok(path) = std::env::var("MAKEPAD_RUN_WASM_EXPORT_FNLIST") {
+        let mut inline_rows = String::from("emitted\tcontext\tparent_context\tinlined\n");
+        let mut inline_keys = HashMap::new();
+        for (id, f) in funcs.iter() {
+            let emitted = crate::jit::slot_key(u, *id);
+            for (index, (slot, (call, _))) in f.inl_slots.iter().zip(&f.inl).enumerate() {
+                let key = inline_keys.entry(*slot).or_insert_with(|| crate::jit::slot_key(u, *slot));
+                inline_rows.push_str(&format!("{emitted}\t{}\t{}\t{key}\n", index + 1,
+                    relax_backend::rir::pos_ctx(*call)));
+            }
+        }
+        let _ = std::fs::write(format!("{}.inlines", path.replace("%p", &std::process::id().to_string())), inline_rows);
         // A later retained constructor can materialize a table first discovered
         // through data. Classify after the entire optimized-body fixpoint.
         let mut code_data = BTreeMap::new();

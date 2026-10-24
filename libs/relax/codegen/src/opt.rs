@@ -1055,6 +1055,10 @@ fn release_arg_copies(f: &mut Func, args: &[VReg]) {
 }
 
 fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg], rets: &[VReg], nounwind: &dyn Fn(u32) -> bool) {
+    let id = match &f.blocks[bi].insts[ii] {
+        Inst::Call(Callee::Fn(id) | Callee::CFn(id, _), _, _) => *id,
+        _ => unreachable!("inline site must name a function instance"),
+    };
     release_arg_copies(f, args);
     for c in &callee.sret_callees {
         if !f.sret_callees.contains(c) {
@@ -1092,6 +1096,8 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
     let root = f.inl.len() as u64 + 1;
     let anchor = callee.blocks.iter().flat_map(|b| b.pos.iter().copied().chain(std::iter::once(b.term_pos))).find(|&p| p != 0 && pos_ctx(p) == 0).unwrap_or(0);
     f.inl.push((call_pos, anchor));
+    f.inl_slots.push(id);
+    f.inl_slots.extend_from_slice(&callee.inl_slots);
     let base = f.inl.len() as u64;
     // a callee position in the caller: its own body (context 0) under the new context, its
     // context c (callee.inl[c - 1]) at f.inl[base + c - 1]
