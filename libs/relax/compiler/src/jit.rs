@@ -11778,6 +11778,10 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         verify_pass(func, "promote_loop_memory");
     }
     if cfg.layout && layout_for(options, name) {
+        // branches on `x & y` / `x | y` of compares (version guards): two compare-and-branches
+        if relax_backend::passes::split_branch_conditions(options, func) {
+            verify_pass(func, "split_branch_conditions");
+        }
         relax_backend::passes::rotate_loops(func);
     }
     // hot code: small counted single-block loops unrolled (rotation made them single blocks;
