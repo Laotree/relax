@@ -6881,6 +6881,23 @@ unsafe fn compile_wall_add(up: *mut Unit, w0: u64) {
 unsafe fn cached_tier1(up: *mut Unit, id: u32, inlined: &[u32]) {
     let u = &mut *up;
     u.fns[id as usize].o3.store(true, Ordering::Relaxed);
+    // SPEC-V: a twin's stored O3 code may hold callees without a clean verdict (unverified-mode
+    // code by kind): registered as a fresh build registers them (UNVERIFIED_IN), so a failed
+    // verdict builds it again without them; one failed already: built again now
+    if matches!(u.fns[id as usize].key, FnKey::Plain(_)) {
+        let pending: Vec<u32> = inlined.iter().copied().filter(|&c| c != id && u.verdict_owner(c).is_some() && !u.verdict_clean(c)).collect();
+        if !pending.is_empty() {
+            let failed = pending.iter().any(|&c| matches!(u.verdict_state(c), Verdict::Failed(_)));
+            {
+                let mut a = UNVERIFIED_IN.lock().unwrap_or_else(|e| e.into_inner());
+                a.retain(|&(k, _, r)| k != up as usize || r != id);
+                crate::zone_alloc::kept_with(|| for &c in &pending { a.push((up as usize, c, id)); });
+            }
+            if failed {
+                u.retier(id);
+            }
+        }
+    }
     if u.tier1.is_some() {
         let rec = tier_rec(&u.slots, id);
         (*rec.add(3)).store(T_QUEUED, Ordering::Release);
@@ -16393,10 +16410,14 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // (a SPEC-V twin's O3 code is kept as its entry: the twin is unverified-mode code by
                 // kind, as its cached baseline is; warm runs whose callers call the twin built its O3
                 // again every launch)
-                let unverified_now = u.fns[id as usize].unverified.load(Ordering::Relaxed) && !matches!(u.fns[id as usize].key, FnKey::Plain(_));
+                let twin = matches!(u.fns[id as usize].key, FnKey::Plain(_));
+                let unverified_now = u.fns[id as usize].unverified.load(Ordering::Relaxed) && !twin;
                 let unverified_inl: Vec<u32> = unverified_in.iter().copied().filter(|c| inlined.contains(c)).collect();
-                // (a twin is unverified by kind: its own O3 code is treated as before)
-                let built_unverified = root_unverified && !matches!(u.fns[id as usize].key, FnKey::Plain(_)) || !unverified_inl.is_empty();
+                // (a twin is unverified-mode code by kind, the unverified callees it took in too:
+                // its O3 code is kept as its entry as well; a warm link registers those callees
+                // again (cached_tier1), so a failed verdict of one builds it again as here.
+                // Uncached, every warm launch built ~150 twins' O3 again.)
+                let built_unverified = !twin && (root_unverified || !unverified_inl.is_empty());
                 let unverified = unverified_now || built_unverified;
                 // speculative code holds this run's site records (crate::guards): never cached
                 let speculative = spec_ctx.as_ref().is_some_and(|c| c.emitted.get());
