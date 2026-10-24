@@ -7596,13 +7596,13 @@ fn single_consts(f: &Func) -> Vec<Option<i64>> {
     (0..nv).map(|v| if n[v] == 1 { c[v] } else { None }).collect()
 }
 
-/// The branch conditions of `f` coalesce_slot_copies follows (at most 6) and per block the one its
-/// branch tests. Drop flags: vregs defined only by integer constants. Slot integers: the branch
+/// The branch conditions of `f` coalesce_slot_copies follows (at most 12; branches `near` reads of
+/// the slots it may join) and per block the one its branch tests. Drop flags: vregs defined only by integer constants. Slot integers: the branch
 /// tests `ICmpI(Eq|Ne, c, x, k)` of `x = Load(Int)` from a tracked slot (`slot_of`: slot and offset
 /// of an address vreg) in the same block, with no write of that slot (`writes`) after the load; the
 /// conditions on the slots copied into such a place are added (a copy carries the value).
-fn slot_conds(f: &Func, slot_of: &dyn Fn(VReg) -> Option<(u32, i64)>, writes: &dyn Fn(usize, usize) -> Vec<(u32, i64, i64)>) -> (Vec<SlotCond>, Vec<Option<usize>>) {
-    const MAX: usize = 6;
+fn slot_conds(f: &Func, slot_of: &dyn Fn(VReg) -> Option<(u32, i64)>, near: &dyn Fn(usize) -> bool, writes: &dyn Fn(usize, usize) -> Vec<(u32, i64, i64)>) -> (Vec<SlotCond>, Vec<Option<usize>>) {
+    const MAX: usize = 12;
     let nv = f.vregs.len();
     // 0 no def, 1 constants only, 2 another def; definition sites
     let mut kind = vec![0u8; nv];
@@ -7631,7 +7631,7 @@ fn slot_conds(f: &Func, slot_of: &dyn Fn(VReg) -> Option<(u32, i64)>, writes: &d
     };
     for (bi, b) in f.blocks.iter().enumerate() {
         let Term::Branch(c, t, e) = b.term else { continue };
-        if t == e {
+        if t == e || !near(bi) {
             continue;
         }
         if kind[c.0 as usize] == 1 && f.vregs[c.0 as usize] == Cls::I {
@@ -7822,13 +7822,18 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
         if cands.is_empty() {
             return any;
         }
-        // byte liveness of the tracked slots (bits of up to 256 per slot, as dead_slot_stores)
+        // byte liveness of the candidates' slots (bits of up to 256 per slot, as dead_slot_stores;
+        // the other tracked slots get no bits: only the candidates' bytes decide interference)
         let mut base = vec![NONE; ns];
         let mut gran = vec![1i64; ns];
         let mut nbits = vec![0i64; ns];
         let mut tot = 0usize;
         for s2 in 0..ns {
             if !tracked[s2] {
+                continue;
+            }
+            if !cands.iter().any(|c| c.2 as usize == s2 || c.3 as usize == s2) {
+                base[s2] = tot as u32;
                 continue;
             }
             let size = f.slots[s2].size as i64;
@@ -7871,6 +7876,9 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
         let bits = |s2: u32, lo: i64, hi: i64| -> Option<((usize, usize), (usize, usize))> {
             let s2 = s2 as usize;
             let (b0, g, n) = (base[s2] as i64, gran[s2], nbits[s2]);
+            if n == 0 {
+                return Some(((0, 0), (0, 0)));
+            }
             if hi == i64::MAX || lo < 0 || hi > f.slots[s2].size as i64 || lo >= hi {
                 return None;
             }
@@ -7927,7 +7935,27 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
         // Mode 0 is plain liveness, mode 1 + 2j: condition j is false, 2 + 2j: true.
         let consts = single_consts(f);
         let tr_slot = |v: VReg| { let s2 = sl(v); (s2 != NONE && tracked[s2 as usize]).then_some((s2, vs[v.0 as usize].1)) };
-        let (conds, branch_cond) = slot_conds(f, &tr_slot, &|bi: usize, ii: usize| {
+        // blocks reading a candidate slot, and whether one is a few blocks after a branch: only
+        // branches near such reads are followed (the conditions are capped)
+        let is_cand = |s2: u32| cands.iter().any(|c| c.2 == s2 || c.3 == s2);
+        let cand_read: Vec<bool> = f.blocks.iter().enumerate().map(|(bi, b)| (0..b.insts.len()).any(|ii| {
+            let (rd, _) = acc(&b.insts[ii], bi, ii);
+            rd.is_some_and(|r| is_cand(r.0)) || nc_at.get(&(bi, ii)).is_some_and(|v| v.iter().any(|&s2| is_cand(s2)))
+        })).collect();
+        let near = |bi: usize| -> bool {
+            let mut todo: Vec<(usize, u32)> = f.blocks[bi].term.succs().map(|t| (t as usize, 0)).collect();
+            let mut seen: Vec<usize> = Vec::new();
+            while let Some((b, d)) = todo.pop() {
+                if seen.contains(&b) { continue; }
+                seen.push(b);
+                if cand_read[b] { return true; }
+                if d < 8 && seen.len() < 64 {
+                    todo.extend(f.blocks[b].term.succs().map(|t| (t as usize, d + 1)));
+                }
+            }
+            false
+        };
+        let (conds, branch_cond) = slot_conds(f, &tr_slot, &near, &|bi: usize, ii: usize| {
             let (_, wr) = acc(&f.blocks[bi].insts[ii], bi, ii);
             let mut ws: Vec<(u32, i64, i64)> = wr.into_iter().collect();
             if let Some(v) = nc_at.get(&(bi, ii)) { ws.extend(v.iter().map(|&s2| (s2, 0, i64::MAX))); }
@@ -8069,7 +8097,7 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
             if let Inst::Copy(d, s2v, n) = *i {
                 if let (Some((ds, dat)), Some((ss, sat))) = (tr_slot(d), tr_slot(s2v)) {
                     let n = n as i64;
-                    if gran[ds as usize] == 1 && gran[ss as usize] == 1 && dat >= 0 && sat >= 0
+                    if gran[ds as usize] == 1 && gran[ss as usize] == 1 && nbits[ds as usize] > 0 && nbits[ss as usize] > 0 && dat >= 0 && sat >= 0
                         && dat + n <= f.slots[ds as usize].size as i64 && sat + n <= f.slots[ss as usize].size as i64 {
                         let (db, sb) = (base[ds as usize] as usize + dat as usize, base[ss as usize] as usize + sat as usize);
                         let mask: Vec<bool> = (0..n as usize).map(|x| live[(db + x) / 64] >> ((db + x) % 64) & 1 != 0).collect();
@@ -8101,6 +8129,14 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
                 return;
             }
             for j in 0..nf { effs[j] = effect(bi, ii, j); }
+            // (the usual case: the instruction leaves every condition as it is; each mode then
+            // goes on from its own after-state)
+            if effs.iter().all(|e| matches!(e, CondEff::Same)) {
+                for m in 0..nm {
+                    xfer_inst(&mut cur[m * w..m * w + w], i, bi, ii);
+                }
+                return;
+            }
             for m in 0..nm {
                 let (mc, mv) = if m == 0 { (usize::MAX, false) } else { ((m - 1) / 2, (m - 1) % 2 == 1) };
                 let t = &mut tmp[m * w..m * w + w];
