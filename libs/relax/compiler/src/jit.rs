@@ -21731,7 +21731,7 @@ pub(crate) unsafe fn realtime_reach_queued(up: *mut Unit, roots: Vec<u32>, why: 
     });
     if post {
         let upn = up as usize;
-        owner::post(owner::Class::Program, move || unsafe { realtime_step(upn as *mut Unit) });
+        owner::post_queued(owner::Class::Program, move || unsafe { realtime_step(upn as *mut Unit) });
     }
 }
 
@@ -21748,7 +21748,7 @@ pub(crate) fn realtime_release() {
     });
     if post {
         let upn = up as usize;
-        owner::post(owner::Class::Program, move || unsafe { realtime_step(upn as *mut Unit) });
+        owner::post_queued(owner::Class::Program, move || unsafe { realtime_step(upn as *mut Unit) });
     }
 }
 
@@ -21841,8 +21841,17 @@ unsafe fn realtime_step(up: *mut Unit) {
                     if fresh > 0 {
                         RT_DYNS.store(true, Ordering::Release);
                     }
-                    let addrs: Vec<u64> = snapshot.into_iter().filter(|((_, dy), a)| rt.dyns.contains(&dy.0) && !rt.vtables.contains(a)).map(|(_, a)| a).collect();
-                    for a in addrs {
+                    let addrs: Vec<(u32, u64)> = snapshot.into_iter().filter(|((_, dy), a)| rt.dyns.contains(&dy.0) && !rt.vtables.contains(a)).map(|((_, dy), a)| (dy.0, a)).collect();
+                    if rt_trace() {
+                        let mut by: crate::fxhash::HashMap<u32, usize> = Default::default();
+                        for (d, _) in &addrs {
+                            *by.entry(*d).or_default() += 1;
+                        }
+                        for (d, n) in by {
+                            eprintln!("makepad-run rt: trait objects `{}` called through: {} vtables followed", crate::typeck::ty_to_string(false, &u.prog, &u.tcx, TyId(d)), n);
+                        }
+                    }
+                    for (_, a) in addrs {
                         rt.vtables.insert(a);
                         crate::syms::data_thunks(u, a, &mut rt.todo);
                     }
@@ -21862,7 +21871,7 @@ unsafe fn realtime_step(up: *mut Unit) {
     if !done {
         // the program's requests that queued meanwhile go first
         let upn = up as usize;
-        owner::post(owner::Class::Program, move || unsafe { realtime_step(upn as *mut Unit) });
+        owner::post_queued(owner::Class::Program, move || unsafe { realtime_step(upn as *mut Unit) });
         return;
     }
     let set = with_rt(|rt| rt.set.clone());
@@ -21877,6 +21886,19 @@ unsafe fn realtime_step(up: *mut Unit) {
             c.rt_set_store(u, crate::layout::root_crate(), &set);
             u.cache = Some(c);
         }
+    }
+    if rt_trace() && set.len() > n0 {
+        // what the new part of the set is, by crate (an unexpectedly large reach shows here)
+        let mut by: crate::fxhash::HashMap<u32, usize> = Default::default();
+        for &id in &set[n0..] {
+            if let Some(k) = slot_crate(&u.prog, &u.fns, id) {
+                *by.entry(k).or_default() += 1;
+            }
+        }
+        let mut v: Vec<(u32, usize)> = by.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        let top: Vec<String> = v.iter().take(12).map(|(k, n)| format!("{} {}", u.prog.syms.str(u.prog.crates[*k as usize].name), n)).collect();
+        eprintln!("makepad-run rt: {}: the new slots by crate: {}", why, top.join(", "));
     }
     if crate::run::VERBOSE.load(Ordering::Relaxed) || rt_trace() {
         eprintln!("makepad-run rt: {}: real-time code reaches {} slots ({} new), {} compiled now, {:.1} ms on the owner", why, set.len(), set.len() - n0, total_compiled, ns as f64 / 1e6);
