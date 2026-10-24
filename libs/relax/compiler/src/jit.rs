@@ -8123,7 +8123,12 @@ pub unsafe fn export_rir(up: *mut Unit, id: u32, optimized: bool) -> Result<rela
         if let Some(error) = (&mut *up).refused_by_check(owner) { return Err(error); }
     }
     if optimized || (&*up).fns[id as usize].rir.is_none() {
-        build_rir_mode(up, id, if optimized { RirMode::Normal } else { RirMode::Tier0 })?;
+        // MAKEPAD_RUN_WASM_EXPORT_FULL=0: shipping bodies as the trace's O1 (A/B)
+        let full = optimized && crate::wasm_export::full_o1();
+        let was = EXPORT_FULL.with(|c| c.replace(full));
+        let r = build_rir_mode(up, id, if optimized { RirMode::Normal } else { RirMode::Tier0 });
+        EXPORT_FULL.with(|c| c.set(was));
+        r?;
     }
     // MAKEPAD_RUN_WASM_EXPORT_O3: which shipping bodies take the JIT's O3 pipeline: `hot`
     // (default: the slots the trace ran at O3), `all`, `0` (none: normal O1 only)
@@ -8245,6 +8250,17 @@ fn o2_release_later() {
 
 fn o2_build() -> bool {
     O2_BUILD.try_with(|c| c.get()).unwrap_or(false)
+}
+
+thread_local! {
+    /// a wasm export's shipping build on this thread (export_rir): normal RIR is built as O1 builds
+    /// without O3 (`Func::full`: the whole O1 pipeline, Relax core's helpers inlined everywhere),
+    /// its inline candidates too -- an AOT build, not a tier below a JIT's O3
+    static EXPORT_FULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn export_full() -> bool {
+    EXPORT_FULL.try_with(|c| c.get()).unwrap_or(false)
 }
 
 /// `#[relax(O2)]` slots waiting for their O2 build: (unit, slot)
@@ -9356,7 +9372,7 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
     {
         let u = &mut *up;
         if let Some(r) = &u.fns[id as usize].rir {
-            let to_o2 = normal && o2_build() && !r.full;
+            let to_o2 = normal && (o2_build() || export_full()) && !r.full;
             if !normal || !(upgradable(r) || to_o2) || u.fns[id as usize].building || u.fns[id as usize].inflight {
                 return Ok(());
             }
@@ -9567,7 +9583,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     }
     // O2: a `#[relax(O2)]` fn built by the O2 worker (o2_thread) compiles as O1 does without
     // O3; its on-demand builds on the program's threads stay O1
-    let full = !baseline && o2_build() && marked_hot(u, id);
+    let full = !baseline && (o2_build() && marked_hot(u, id) || export_full());
     func.full = full;
     let mut cfg = u.opt;
     if baseline {

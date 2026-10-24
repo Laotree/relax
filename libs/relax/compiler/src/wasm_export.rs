@@ -1309,6 +1309,12 @@ pub(crate) enum O3Policy {
     All,
 }
 
+/// MAKEPAD_RUN_WASM_EXPORT_FULL (default on): shipping bodies take O1's whole pipeline.
+pub(crate) fn full_o1() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_WASM_EXPORT_FULL").map_or(true, |v| v != "0"))
+}
+
 /// MAKEPAD_RUN_WASM_EXPORT_INLINE=1: the shipping module's own inlining (module_inline) and
 /// static reachability from the entry, exports and taken addresses.
 fn module_inline_on() -> bool {
@@ -1378,8 +1384,13 @@ fn module_inline(u: &Unit, funcs: &mut BTreeMap<u32, Func>, kept: &std::collecti
     let mut taken: Vec<u32> = Vec::new();
     address_taken(u, funcs.values(), &mut taken, &mut std::collections::HashSet::new());
     let taken: std::collections::HashSet<u32> = taken.into_iter().collect();
+    // ... a loop-free one only: a browser engine tiers a function up when it is called again (no
+    // on-stack replacement), so a callee's loop moved into a caller that runs once (a decode
+    // driver) stays in baseline code (mp3 decode: first run 3.3x slower when merged)
+    let loop_free = |f: &Func| relax_backend::regalloc::loop_depths(f, &relax_backend::regalloc::reachable(f)).iter().all(|d| *d == 0);
     let single: std::collections::HashSet<u32> = site_count.iter().filter(|(c, n)| **n == 1 && !taken.contains(c)
-        && !((**c as usize) < u.fns.len() && crate::jit::keep_reachable(u, **c))).map(|(c, _)| *c).collect();
+        && !((**c as usize) < u.fns.len() && crate::jit::keep_reachable(u, **c))
+        && funcs.get(c).is_some_and(|f| loop_free(f) && relax_codegen::opt::inst_count(f) <= 400)).map(|(c, _)| *c).collect();
     let lim = relax_codegen::opt::InlineLimits { budget: usize::MAX / 4, leaf_insts: 0, leaf_blocks: 0, hint_insts: 0, chain_insts: 0, always_insts: 4000, free_any: false, ordered: false, hot_insts: 0, growth_limit: None };
     let (mut sites, mut bodies) = (0usize, 0usize);
     for id in order {
