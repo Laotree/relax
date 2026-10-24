@@ -2063,6 +2063,9 @@ extern "C" {
     pub fn IOSurfaceLookupFromMachPort(port: mach_port_t) -> IOSurfaceRef;
     pub fn IOSurfaceGetWidth(surface: IOSurfaceRef) -> usize;
     pub fn IOSurfaceGetHeight(surface: IOSurfaceRef) -> usize;
+    pub fn IOSurfaceGetPlaneCount(surface: IOSurfaceRef) -> usize;
+    pub fn IOSurfaceGetWidthOfPlane(surface: IOSurfaceRef, plane: usize) -> usize;
+    pub fn IOSurfaceGetHeightOfPlane(surface: IOSurfaceRef, plane: usize) -> usize;
     pub fn IOSurfaceIncrementUseCount(surface: IOSurfaceRef);
     pub fn IOSurfaceDecrementUseCount(surface: IOSurfaceRef);
 }
