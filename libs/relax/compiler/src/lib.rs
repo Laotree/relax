@@ -386,8 +386,12 @@ pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
     // deterministic O3 (record and replay): every body is borrow-checked before its first code
     // (--check-first), so no code is lowered unverified (SPEC-V baseline code and twins depend on
     // when verdicts arrive) and both runs lower the same verified bodies
+    // ... and no baseline startup tier (MAKEPAD_RUN_O1=0): whether a body's first code is baseline or
+    // O1 depends on when it is first compiled (before or after the first present), and baseline
+    // code's O2 upgrade on this run's cost checks; first code is O1, O2/O3 as recorded
     if options.tier1_profile.is_some() {
         crate::jit::CHECK_FIRST.store(true, std::sync::atomic::Ordering::Relaxed);
+        options.t0_baseline = crate::options::Tier0Baseline::Off;
     }
     let mut session = crate::Session { options, runtime: crate::options::RuntimeOptions::from_env() };
     session.options.target = match session.options.check_target {

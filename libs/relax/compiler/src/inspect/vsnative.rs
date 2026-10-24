@@ -385,6 +385,16 @@ mod stacks {
         segs[k..].join("::")
     }
 
+    /// This process's samples as expanded stacks, outermost first: (name, code) where code is the
+    /// tier and build version of JIT code (`O3 v2`), `inl` for an inlined level, else the frame kind.
+    fn jit_frames(run: &crate::inspect::prof::Run, partial: &mut Vec<String>) -> Vec<(Vec<(String, String)>, u64)> {
+        crate::inspect::calltree::expanded_raw(run, partial).into_iter().map(|(_, _, f, w)| (f.into_iter().map(|x| {
+            let jit = !matches!(x.tier.as_str(), "inl" | "native" | "glue" | "jit" | "?");
+            let code = if jit { format!("{} v{}", x.tier, x.gen) } else { x.tier };
+            (x.name, code)
+        }).collect(), w)).collect()
+    }
+
     /// The JIT-vs-native tables of `ours` (this process's run, expanded) and `theirs` (the native
     /// build's stacks over `tn` s, named by its DWARF inline tree), keyed alike, cut at `roots=`.
     /// Returns (unit, native all, native under roots, JIT all, JIT under roots, JIT secs).
@@ -398,7 +408,9 @@ mod stacks {
         let roots: Vec<String> = req.get("roots").map(|r| r.split(',').map(key).collect()).unwrap_or_default();
         // keyed stacks under the roots (cut at the outermost root), weights in ms of CPU (cpu) or events
         let unit_ms = if ev == crate::inspect::prof::Ev::Cpu { 1000.0 / hz as f64 } else { 1.0 };
-        let keyed = |v: &[(Vec<(String, String)>, u64)], tiers: &mut HashMap<String, HashMap<String, u64>>| -> (Vec<(Vec<String>, f64)>, f64) {
+        // per leaf key: the physical code it ran in (itself, or the fn it is inlined into) with that code's tier
+        let mut owners: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        let mut keyed = |v: &[(Vec<(String, String)>, u64)], tiers: &mut HashMap<String, HashMap<String, u64>>, own: bool| -> (Vec<(Vec<String>, f64)>, f64) {
             let mut outv = Vec::new();
             let mut all = 0.0;
             for (fr, w) in v {
@@ -412,14 +424,20 @@ mod stacks {
                         *tiers.entry(k.clone()).or_default().entry(f.1.clone()).or_default() += w as u64;
                     }
                 }
+                if own {
+                    let leaf = ks.len() - 1;
+                    let phys = (at..=leaf).rev().find(|&p| fr[p].1 != "inl").unwrap_or(at);
+                    let desc = if phys == leaf { format!("own code {}", fr[phys].1) } else { format!("inl in {} [{}]", ks[phys], fr[phys].1) };
+                    *owners.entry(ks[leaf].clone()).or_default().entry(desc).or_default() += w;
+                }
                 outv.push((ks[at..].to_vec(), w));
             }
             (outv, all)
         };
         let mut jt: HashMap<String, HashMap<String, u64>> = HashMap::new();
         let mut nt = HashMap::new();
-        let (j, jall) = keyed(ours, &mut jt);
-        let (nv, nall) = keyed(theirs, &mut nt);
+        let (j, jall) = keyed(ours, &mut jt, true);
+        let (nv, nall) = keyed(theirs, &mut nt, false);
         let (tj, tn) = (run.secs.max(0.01), secs);
         let tables = |v: &[(Vec<String>, f64)]| {
             let mut selfm: HashMap<String, f64> = HashMap::new();
@@ -461,12 +479,18 @@ mod stacks {
         ));
         out.line("");
         out.line(&format!("self time per fn ({}), sorted by JIT - native; cum = running share of the gap", unit));
-        out.line("| fn | JIT tier | JIT | native | delta | cum % |");
-        out.line("|---|---|---:|---:|---:|---:|");
+        out.line("| fn | JIT tier | JIT code it ran in | JIT | native | delta | cum % |");
+        out.line("|---|---|---|---:|---:|---:|---:|");
+        let owner_of = |k: &str| owners.get(k).map(|m| {
+            let mut v: Vec<(&String, &f64)> = m.iter().collect();
+            v.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(b.0)));
+            let t: f64 = v.iter().map(|x| *x.1).sum();
+            v.iter().take(2).map(|(d, w)| if **w == t { d.to_string() } else { format!("{} {:.0}%", d, **w * 100.0 / t.max(1e-9)) }).collect::<Vec<_>>().join("; ")
+        }).unwrap_or_else(|| "-".into());
         let mut cum = 0.0;
         for (d, k) in srows.iter().take(n) {
             cum += d;
-            out.line(&format!("| {} | {} | {:.2} | {:.2} | {:+.2} | {:.0} |", short(&k.replace('|', "/"), 70), tier_of(k), js.get(k).copied().unwrap_or(0.0) / tj, ns.get(k).copied().unwrap_or(0.0) / tn, d, cum * 100.0 / gap.abs().max(1e-9)));
+            out.line(&format!("| {} | {} | {} | {:.2} | {:.2} | {:+.2} | {:.0} |", short(&k.replace('|', "/"), 70), tier_of(k), short(&owner_of(k).replace('|', "/"), 90), js.get(k).copied().unwrap_or(0.0) / tj, ns.get(k).copied().unwrap_or(0.0) / tn, d, cum * 100.0 / gap.abs().max(1e-9)));
         }
         let neg: Vec<String> = srows.iter().rev().take(6).filter(|r| r.0 < 0.0).map(|r| format!("{} {:+.2}", r.1, r.0)).collect();
         if !neg.is_empty() {
@@ -575,7 +599,7 @@ mod stacks {
             return;
         }
         let mut partial = Vec::new();
-        let ours: Vec<(Vec<(String, String)>, u64)> = crate::inspect::calltree::expanded_raw(&run, &mut partial).into_iter().map(|(_, _, f, w)| (f.into_iter().map(|x| (x.name, x.tier)).collect(), w)).collect();
+        let ours: Vec<(Vec<(String, String)>, u64)> = jit_frames(&run, &mut partial);
         // native frames, innermost first in the file: `@<file vaddr>` in the executable, `!<name>` elsewhere
         let mut theirs: Vec<(Vec<(String, String)>, u64)> = Vec::new();
         let named = crate::inspect::asm::with_native_bin(&native, |nb| {
@@ -707,7 +731,7 @@ mod stacks {
         }
         // ours: expanded (inline levels as frames), outermost first
         let mut partial = Vec::new();
-        let ours: Vec<(Vec<(String, String)>, u64)> = crate::inspect::calltree::expanded_raw(&run, &mut partial).into_iter().map(|(_, _, f, w)| (f.into_iter().map(|x| (x.name, x.tier)).collect(), w)).collect();
+        let ours: Vec<(Vec<(String, String)>, u64)> = jit_frames(&run, &mut partial);
         // native: each pc by the binary's symbols and inline tree
         let map = super::imp::Map::of(pid, &exe);
         let mut names: HashMap<u64, Vec<String>> = HashMap::new();

@@ -3683,6 +3683,9 @@ impl Unit {
     pub(crate) fn index_code(&mut self, at: u64, len: u32, id: u32, unwind: Option<relax_backend::rir::UnwindInfo>) {
         let kind = code_as_now().unwrap_or_else(|| self.default_code_kind(id));
         self.code.write().unwrap_or_else(|e| e.into_inner()).add(at, len, id, unwind, kind);
+        if kind.tier == tier::O2 && t1prof_on(&self.prog.session.options) {
+            t1prof_note_o2(self, id);
+        }
         crate::inspect::flightrec::jit_install(id, len, kind.tier, kind.origin);
         if crate::inspect::pstream::viewing() {
             let src = crate::inspect::codever::fn_lines(self, id).and_then(|(f, lo, _)| self.prog.file_paths.get(f as usize).map(|p| format!("{}:{}", p, lo))).unwrap_or_default();
@@ -14541,6 +14544,18 @@ impl Unit {
         // name keeps the code it has, without a count stub: no tier-up from this run's timing
         // (hotness rates, sampler, counted windows), no rt_hot on the program's threads.
         if replay && !recorded {
+            // ... its recorded O2 decision is replayed: the O2 build, queued once
+            let o2 = unsafe {
+                let k = t1_key(self, id);
+                let mut g = T1PROF.lock().unwrap();
+                let p = g.as_mut().unwrap();
+                let want = p.o2.contains(&k);
+                if want { crate::zone_alloc::kept_with(|| p.o2_queued.insert(k)); }
+                want
+            };
+            if o2 {
+                unsafe { o2_enqueue(self as *mut Unit, id) };
+            }
             return;
         }
         let rec = tier_rec(&self.slots, id);
@@ -15197,6 +15212,11 @@ struct T1Profile {
     /// replay: hot slots the profile does not name, kept at their code (strict: only the
     /// recorded decisions build O3 code)
     refused: std::collections::BTreeSet<String>,
+    /// slots that got O2 code (record: installed in the run; replay: the recorded set, queued for
+    /// their O2 build when first armed) -- the run's tier decisions below O3
+    o2: std::collections::BTreeSet<String>,
+    /// replay: recorded O2 slots queued for their O2 build
+    o2_queued: std::collections::HashSet<String>,
 }
 static T1PROF: relax_session::sync::Mutex<Option<T1Profile>> = relax_session::sync::Mutex::new(None);
 
@@ -15207,10 +15227,15 @@ fn t1prof_on(options: &crate::options::Options) -> bool {
         let Some(p) = options.tier1_profile.as_ref().and_then(|p| p.to_str()) else { return false };
         let p = p.to_string();
         let mut map = std::collections::HashMap::new();
+        let mut o2 = std::collections::BTreeSet::new();
         let replay = match options.tier1_profile_data.as_deref() {
             Some(t) if !t.is_empty() => {
                 for l in t.lines() {
                     let x: Vec<&str> = l.split('\t').collect();
+                    if x.len() == 2 && x[0] == "o2" {
+                        o2.insert(x[1].to_string());
+                        continue;
+                    }
                     if x.len() != 14 {
                         continue;
                     }
@@ -15230,8 +15255,8 @@ fn t1prof_on(options: &crate::options::Options) -> bool {
             }
             _ => false,
         };
-        eprintln!("makepad: O3 profile {} ({}, {} entries)", p, if replay { "replay" } else { "record" }, map.len());
-        *T1PROF.lock().unwrap() = Some(T1Profile { replay, path: p, map, installed: 0, live: std::collections::HashSet::new(), differ: Vec::new(), done: std::collections::HashSet::new(), refused: Default::default() });
+        eprintln!("makepad: O3 profile {} ({}, {} entries, {} O2)", p, if replay { "replay" } else { "record" }, map.len(), o2.len());
+        *T1PROF.lock().unwrap() = Some(T1Profile { replay, path: p, map, installed: 0, live: std::collections::HashSet::new(), differ: Vec::new(), done: std::collections::HashSet::new(), refused: Default::default(), o2, o2_queued: Default::default() });
         true
     })
 }
@@ -15313,6 +15338,38 @@ fn t1prof_replay(options: &crate::options::Options) -> bool {
     t1prof_on(options) && T1PROF.lock().unwrap().as_ref().is_some_and(|p| p.replay)
 }
 
+/// MAKEPAD_RUN_O3_PROFILE_DUMP=<substring of a key>: the O3 snapshot's input bodies of matching
+/// candidates as hashed (t1_norm_hash), to <profile>.dump/<record|replay>/<hash of key>.<hash>.rir
+/// (diff a record's against a replay's to see why their inputs differ).
+fn t1prof_dump(key: &str, f: &relax_backend::rir::Func, attrs: u8) {
+    static W: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(want) = W.get_or_init(|| std::env::var("MAKEPAD_RUN_O3_PROFILE_DUMP").ok()) else { return };
+    if !key.contains(want.as_str()) {
+        return;
+    }
+    let Some((path, replay)) = T1PROF.lock().unwrap().as_ref().map(|p| (p.path.clone(), p.replay)) else { return };
+    let dir = format!("{}.dump/{}", path, if replay { "replay" } else { "record" });
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(format!("{}/{:016x}.{:016x}.rir", dir, t1_hash(key), t1_norm_hash(f)), format!("{}\nattrs {}\n{}", key, attrs, f.dump()));
+}
+
+/// Deterministic O3, record: slot `id` got O2 code (fresh or from the cache); the profile file is
+/// rewritten at most every 2 s for these (each O3 install rewrites it too).
+fn t1prof_note_o2(u: &Unit, id: u32) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let k = unsafe { t1_key(u, id) };
+    let write = {
+        let mut g = T1PROF.lock().unwrap();
+        let Some(p) = g.as_mut().filter(|p| !p.replay) else { return };
+        let new = crate::zone_alloc::kept_with(|| p.o2.insert(k));
+        let now = wall_ns();
+        new && now.saturating_sub(LAST.load(Ordering::Relaxed)) >= 2_000_000_000 && { LAST.store(now, Ordering::Relaxed); true }
+    };
+    if write {
+        t1prof_finish();
+    }
+}
+
 /// Strict replay: slot `id` turned hot (a queue pop) but the profile does not name it: it gets
 /// no O3 (or O2) build; noted in the summary (REFUSED). False outside replay.
 unsafe fn t1prof_refuse(up: *const Unit, id: u32) -> bool {
@@ -15342,8 +15399,8 @@ fn t1prof_summary(p: &T1Profile) -> String {
     live.sort();
     let mut kinds = std::collections::BTreeMap::new();
     for d in &p.differ { *kinds.entry(d.split(' ').next().unwrap_or("unknown")).or_insert(0usize) += 1; }
-    let mut out = format!("installed {} / recorded {} / unrecorded-live {} / refused {} / divergences {}\n",
-        p.installed, p.map.len(), p.live.len(), p.refused.len(), p.differ.len());
+    let mut out = format!("installed {} / recorded {} / unrecorded-live {} / refused {} / divergences {} / O2 queued {} of {}\n",
+        p.installed, p.map.len(), p.live.len(), p.refused.len(), p.differ.len(), p.o2_queued.len(), p.o2.len());
     for (kind, count) in kinds { out.push_str(&format!("{} {}\n", kind, count)); }
     for k in missing { out.push_str(&format!("MISSING {}\n", k)); }
     for k in live { out.push_str(&format!("UNRECORDED-LIVE {}\n", k)); }
@@ -15380,6 +15437,9 @@ fn t1prof_finish() {
         let inline = e.inline_freq.as_ref().expect("recorded inlining frequencies");
         let callees = e.callee_counts.iter().map(|(k, c)| format!("{}\u{1d}{}", k, fmt_freq(&Some(c.clone())))).collect::<Vec<_>>().join("\u{1e}");
         out.push_str(&format!("{}\t{}\t{}\t{}\t{:016x}\t{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", k, e.cold.join("\u{1f}"), e.snap.join("\u{1f}"), fmt_freq(&e.freq), e.input, e.code, fmt_freq(&inline[0]), fmt_freq(&inline[1]), e.single.join("\u{1f}"), if e.hot { "1" } else { "0" }, fmt_freq(&e.counts), callees, e.inlined.join("\u{1f}"), e.rirs.iter().map(|(k, h)| format!("{}\u{1d}{:x}", k, h)).collect::<Vec<_>>().join("\u{1e}")));
+    }
+    for k in &p.o2 {
+        out.push_str(&format!("o2\t{}\n", k));
     }
     let _ = std::fs::write(&p.path, out);
     if !p.differ.is_empty() {
@@ -15498,7 +15558,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // unit call (its back end too), so it cannot race a caller's first-call build. The named
     // exception to rule I-PUB (OWNERARCH.DESIGN.md: deterministic A/Bs only): a program-class
     // request, not a publish.
-    if t1prof_replay(options) && !owner::is_owner() {
+    // (deterministic O3, record too: both runs build the same way, their inputs on one path)
+    if t1prof_on(options) && !owner::is_owner() {
         return owner::call(owner::Class::Program, || compile_tier1(up, id));
     }
     // SPEC-V: unverified code gets O3 code too, built as it is (Unit::o3_allowed)
@@ -15532,7 +15593,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         f.compiled && f.rir.is_none() && f.build_err.is_none() && !f.building
     };
     let (needs, front) = owner::publish(|| refront_settled(up, id, needs_rir(up)));
-    if needs && !t1prof_replay(options) && !owner::is_owner() {
+    if needs && !t1prof_on(options) && !owner::is_owner() {
         while !tier1_workers_ready() {
             job_sleep(TIER1_POLL);
         }
@@ -15549,7 +15610,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // off the unit (typeck_ahead, lower_ahead) and asks again, one traversal level per round.
     // The owner's build then only takes the lowered RIR (O1 optimisation and the candidate's own
     // small inline candidates stay there). Warm Stage: single snapshots of 100-680 ms on the owner.
-    let prefront = !owner::is_owner() && !t1prof_replay(options) && pipelined();
+    let prefront = !owner::is_owner() && !t1prof_on(options) && pipelined();
     let mut fronted: std::collections::HashSet<u32> = Default::default();
     // slots whose front named a constant or thread-local the owner had not made yet (noted for
     // its const_drain): fronted again in the next round, each up to REFRONTS times
@@ -18036,7 +18097,9 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &cr
                 unverified_in.push(c);
             }
             if t1key.is_some() {
-                rir_hashes.push((t1_key(up, c), t1_norm_hash(r) ^ ((attrs as u64) << 56)));
+                let ck = t1_key(up, c);
+                t1prof_dump(&ck, r, attrs);
+                rir_hashes.push((ck, t1_norm_hash(r) ^ ((attrs as u64) << 56)));
             }
             snap.push((c, r.clone(), attrs));
         }
