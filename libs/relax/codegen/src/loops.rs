@@ -2227,10 +2227,10 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         }
         let l = latches[0];
         let multi = latches.len() > 1;
-        // the loop's entries now: `preds` predates the copies of loops unrolled earlier in this
-        // pass, and a copy that leaves into this loop must enter its first copy too (else the
-        // copies are dead and the loop stays rolled)
-        let outside: Vec<u32> = (0..f.blocks.len() as u32).filter(|p| !m.get(*p as usize).copied().unwrap_or(false) && f.blocks[*p as usize].term.succs().any(|s| s == h)).collect();
+        // (the entries of the pass start: a copy of an earlier loop that leaves into this one keeps
+        // entering the original. Taking the current entries instead made the race's draw +11..30%
+        // instructions: the newly live copies of consecutive loops; GAPB2 racebisect)
+        let outside: Vec<u32> = preds[h as usize].iter().copied().filter(|p| !m[*p as usize]).collect();
         if outside.is_empty() {
             continue;
         }
