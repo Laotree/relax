@@ -24,6 +24,28 @@ struct Module {
 
 static MODULES: relax_session::sync::Mutex<Vec<Module>> = relax_session::sync::Mutex::new(Vec::new());
 
+/// The crates of run-time modules (from their front end on, before their code compiles): their code
+/// goes into the module's own code group (invalid.rs), made inaccessible when it is unloaded.
+static MODULE_CRATES: relax_session::sync::Mutex<Vec<u32>> = relax_session::sync::Mutex::new(Vec::new());
+static ANY_MODULE_CRATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn note_module_crate(krate: u32) {
+    let mut v = MODULE_CRATES.lock().unwrap_or_else(|e| e.into_inner());
+    if !v.contains(&krate) {
+        crate::zone_alloc::kept_with(|| v.push(krate));
+    }
+    ANY_MODULE_CRATE.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether any module crate exists (one atomic load: this sits on every install's path).
+pub(crate) fn any_module_crate() -> bool {
+    ANY_MODULE_CRATE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn is_module_crate(krate: u32) -> bool {
+    MODULE_CRATES.lock().unwrap_or_else(|e| e.into_inner()).contains(&krate)
+}
+
 thread_local! {
     static LAST_ERROR: std::cell::RefCell<String> = Default::default();
 }
@@ -410,6 +432,7 @@ fn root_fns(u: &Unit, defs: &[DefId]) -> Vec<DefId> {
 /// Loads a trusted module (MAKEPAD_RUN_MODULES_TRUSTED=1; on the owner thread): it runs as host code.
 unsafe fn load(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox: bool) -> Result<(u32, u32, Vec<DefId>), Vec<String>> {
     let (krate, root_file, defs) = front(up, name, path, deps, sandbox)?;
+    note_module_crate(krate);
     let u = &mut *up;
     let roots: Vec<u32> = root_fns(u, &defs).into_iter().map(|d| u.fn_id(FnKey::Inst(d, Vec::new()))).collect();
     let mine = |u: &Unit, id: u32| match &u.fns[id as usize].key {
@@ -785,6 +808,7 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
     let check = !options.sandbox_nocheck;
     let t0 = std::time::Instant::now();
     let (krate, root_file, mut defs) = front(up, name, path, deps, check)?;
+    note_module_crate(krate);
     let t_front = t0.elapsed();
     let fail = |up: *mut Unit, defs: &[DefId], e: Vec<String>| -> Vec<String> {
         drop_defs(up, defs);
@@ -1098,11 +1122,13 @@ pub extern "C" fn __relax_module_replace(h: u64, src: *const u8, slen: usize) ->
 pub extern "C" fn __relax_module_unload(h: u64) {
     crate::reload::forget_module_stream(jit::current_unit(), h);
     let module_crate;
+    let module_name;
     let mut defs = {
         let mut ms = MODULES.lock().unwrap_or_else(|e| e.into_inner());
         match unhandle(h).and_then(|(i, g)| ms.get_mut(i).filter(|m| m.gen == g && m.alive)) {
             Some(m) => {
                 module_crate = m.krate;
+                module_name = m.name.clone();
                 m.alive = false;
                 m.gen += 1;
                 if let Some(a) = m.arena.take() {
@@ -1116,6 +1142,16 @@ pub extern "C" fn __relax_module_unload(h: u64) {
     let up = jit::current_unit();
     crate::owner::call(crate::owner::Class::Program, || {
         let u = unsafe { &mut *up };
+        // its code never runs again (invalid.rs): a stored fn pointer, a return into it, a frame
+        // still in it is a stale access
+        crate::invalid::invalidate(
+            u,
+            |g| matches!(g, crate::invalid::Group::Module { krate, .. } if krate == module_crate),
+            0,
+            "unloaded module",
+            Some(&module_name),
+            &format!("Module::unload of `{}`: an unloaded module's code never runs again", module_name),
+        );
         defs.extend((0..u.prog.defs.len()).filter(|&i| u.prog.defs[i].krate == module_crate).map(|i| DefId(i as u32)));
         defs.sort_unstable_by_key(|d| d.0);
         defs.dedup();

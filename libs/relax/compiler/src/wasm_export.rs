@@ -1395,7 +1395,10 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Resul
     work.extend(funcs.keys().copied());
     work.retain(|id| (*id as usize) < u.fns.len() && (whole || crate::jit::keep_reachable(u, *id)));
     // The embedder's callback contract is independent of which callbacks the
-    // training workload happened to invoke. Compile their complete closure too.
+    // training workload happened to invoke. Shipping compiles their complete
+    // closure. Block mode still validates the names, but preserves its traced
+    // bodies and annotated keep_reachable closure instead of making every web
+    // callback (and effectively the application) a whole-function root.
     let mut required = std::collections::BTreeSet::new();
     if let Ok(names) = std::env::var("MAKEPAD_RUN_WASM_EXPORT_ROOTS") {
         let roots = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1403,7 +1406,18 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Resul
             let id = roots.iter().find(|(_, n)| n.as_deref() == Some(name)).map(|(id, _)| *id)
                 .ok_or_else(|| format!("required glue export {name} is not defined"))?;
             required.insert(id);
-            work.push(id);
+            if whole {
+                work.push(id);
+            } else if !funcs.contains_key(&id) {
+                // Keep the exported body even when no training input entered it.
+                // It goes through normal block shaking, not the whole-body set.
+                let up = crate::jit::current_unit();
+                let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                    crate::owner::call(crate::owner::Class::Program, || crate::zone_alloc::kept_with(|| unsafe { crate::jit::export_rir(up, id, false) }))
+                )).unwrap_or_else(|_| Err("compiler panicked".into()))
+                    .map_err(|error| format!("required glue export {name} cannot compile: {error}"))?;
+                funcs.insert(id, body);
+            }
         }
     }
     let mut kept = std::collections::BTreeSet::new();
