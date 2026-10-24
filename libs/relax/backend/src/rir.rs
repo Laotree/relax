@@ -711,7 +711,8 @@ pub enum Reloc {
     /// a slot as a call target: its thunk (`SlotTable::thunk`), which jumps to the slot's current
     /// code (a direct branch the runtime keeps in step with the table word)
     Call(u32),
-    /// the thread-local block key / cell offset (`Env::tls_key`, pre-scaled as the backend loads it)
+    /// the thread-local block key / cell offset (`Env::tls_key`, pre-scaled as the backend loads it;
+    /// x64 Windows: `x64::win_tls_key`)
     TlsKey,
     /// `Env::tls_slow`
     TlsSlow,
