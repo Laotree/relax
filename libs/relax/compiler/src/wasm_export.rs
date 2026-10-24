@@ -37,6 +37,10 @@ static ENTRY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u
 static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CLOSURE_ORIGINS: Mutex<BTreeMap<u32, &'static str>> = Mutex::new(BTreeMap::new());
 static CLOSURE_PARENTS: Mutex<BTreeMap<u32, u32>> = Mutex::new(BTreeMap::new());
+// Diagnostics for the first retaining data edge and the vtables actually
+// reached by the optimized closure. Never seed reachability from this ledger.
+static CLOSURE_VIA: Mutex<BTreeMap<u32, u32>> = Mutex::new(BTreeMap::new());
+static CLOSURE_VTABLES: Mutex<BTreeMap<u32, (Option<u32>, Vec<u32>, String)>> = Mutex::new(BTreeMap::new());
 static POSTOPT_EFFECTS: [std::sync::atomic::AtomicUsize; 5] = [const { std::sync::atomic::AtomicUsize::new(0) }; 5];
 
 /// Process start (the loader's main): `MAKEPAD_RUN_WASM_EXPORT_BLOCKS=1` turns block coverage on
@@ -935,6 +939,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
         data_top.push((bytes.len(), format!("{} {}", k, name)));
     }
     data_top.sort_by(|a, b| b.0.cmp(&a.0));
+    let image_ids: Vec<_> = images.iter().map(|(id, _)| *id).collect();
     for (id, bytes) in images {
         let a = placed[&id].0;
         m.data_at(a, bytes);
@@ -1030,7 +1035,12 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
         let fl = fl.replace("%p", &std::process::id().to_string());
         let _ = std::fs::write(&fl, txt);
         let parents = CLOSURE_PARENTS.lock().unwrap_or_else(|e| e.into_inner());
+        let origins = CLOSURE_ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
+        let via = CLOSURE_VIA.lock().unwrap_or_else(|e| e.into_inner());
+        let vtables = CLOSURE_VTABLES.lock().unwrap_or_else(|e| e.into_inner());
+        let ranges: HashMap<_, _> = out.stats.fn_ranges.iter().map(|(id, offset, len)| (*id, (*offset, *len))).collect();
         let mut provenance = String::from("slot\tbytes\tparent\tcrate\tkey\n");
+        let mut reachability = String::from("slot\toffset\tbytes\tedge\tgeneric\tparent\tvia\tcrate\tkey\n");
         for (id, _, bytes) in &out.stats.fn_sizes {
             let parent = parents.get(id).map(u32::to_string).unwrap_or_default();
             let mut owner = *id;
@@ -1043,8 +1053,45 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
                 }
             };
             provenance.push_str(&format!("{id}\t{bytes}\t{parent}\t{krate}\t{}\n", crate::jit::slot_key(u, *id)));
+            let edge = match origins.get(id).copied() {
+                None => "captured/required roots",
+                Some("direct-call") if parents.get(id).is_some_and(|p| origins.contains_key(p)) => "direct calls from closure functions",
+                Some("direct-call") => "direct calls from roots",
+                Some(_) => match via.get(id) {
+                    None => "function addresses in code",
+                    Some(symbol) => match vtables.get(symbol) {
+                        Some((Some(_), _, _)) => "vtable methods (code materialized)",
+                        Some((None, _, _)) => "vtable methods (data only)",
+                        None => "function pointers in data",
+                    },
+                },
+            };
+            let generic = matches!(&u.fns[*id as usize].key, crate::jit::FnKey::Inst(_, args) if !args.is_empty());
+            let data = via.get(id).map(u32::to_string).unwrap_or_default();
+            let (offset, len) = ranges[id];
+            reachability.push_str(&format!("{id}\t{offset}\t{len}\t{edge}\t{generic}\t{parent}\t{data}\t{krate}\t{}\n", crate::jit::slot_key(u, *id)));
         }
         let _ = std::fs::write(format!("{}.parents", fl), provenance);
+        let _ = std::fs::write(format!("{}.reachability", fl), reachability);
+        let mut table_rows = String::from("symbol\tevidence\towner\tmethods\tname\n");
+        let mut method_rows = String::from("symbol\tslot\n");
+        // Audit the tables actually placed in the module, independently of the
+        // closure ledger. An unexpected table stays visible as unproven data.
+        for symbol in &image_ids {
+            let Some(SymKind::Data(index)) = u.syms.kind(*symbol) else { continue };
+            let Some(name) = u.syms.obj_name(index).filter(|n| n.starts_with("vtable:")) else { continue };
+            if let Some((owner, methods, _)) = vtables.get(symbol) {
+                let evidence = if owner.is_some() { "code-address" } else { "initial-data-pointer" };
+                table_rows.push_str(&format!("{symbol}\t{evidence}\t{}\t{}\t{name}\n", owner.map(|id| crate::jit::slot_key(u, id)).unwrap_or_default(), methods.len()));
+                for method in methods { method_rows.push_str(&format!("{symbol}\t{method}\n")); }
+            } else {
+                let methods: Vec<_> = data_of(u, *symbol).map(|(bytes, _, _)| data_refs(u, *symbol, &bytes).iter().filter_map(|(_, s)| match u.syms.kind(s.id) { Some(SymKind::Thunk(slot)) => Some(slot), _ => None }).collect()).unwrap_or_default();
+                table_rows.push_str(&format!("{symbol}\tunproven\t\t{}\t{name}\n", methods.len()));
+                for method in methods { method_rows.push_str(&format!("{symbol}\t{method}\n")); }
+            }
+        }
+        let _ = std::fs::write(format!("{}.vtables", fl), table_rows);
+        let _ = std::fs::write(format!("{}.vtable-methods", fl), method_rows);
         // and the data objects: bytes, what it is, its name or first bytes
         let mut dt = String::new();
         for (b, n) in &data_top {
@@ -1105,14 +1152,21 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
 /// Slots whose address the captured code takes: `FnAddr`, thunk addresses, and function pointers
 /// in the data those functions name (vtables, statics), followed through data pointers.
 fn address_taken<'a>(u: &Unit, funcs: impl IntoIterator<Item = &'a Func>, out: &mut Vec<u32>, data_seen: &mut std::collections::HashSet<u32>) {
+    address_edges(u, funcs, &mut |slot, _| out.push(slot), data_seen);
+}
+
+/// The immediate data container of a function pointer, or None for an address
+/// materialized directly in code. The traversal is the same closure walk used
+/// by emission; provenance does not add edges or inspect execution traces.
+fn address_edges<'a>(u: &Unit, funcs: impl IntoIterator<Item = &'a Func>, visit: &mut impl FnMut(u32, Option<u32>), data_seen: &mut std::collections::HashSet<u32>) {
     let mut dwork: Vec<u32> = Vec::new();
     for f in funcs {
         for b in &f.blocks {
             for i in &b.insts {
                 match i {
-                    Inst::FnAddr(_, t) => out.push(*t),
+                    Inst::FnAddr(_, t) => visit(*t, None),
                     Inst::Addr(_, s) | Inst::TlsAddr(_, s) => match u.syms.kind(s.id) {
-                        Some(SymKind::Thunk(t)) => out.push(t),
+                        Some(SymKind::Thunk(t)) => visit(t, None),
                         Some(SymKind::Data(_) | SymKind::Rw(_) | SymKind::Static(_)) => dwork.push(s.id),
                         _ => {}
                     },
@@ -1128,7 +1182,7 @@ fn address_taken<'a>(u: &Unit, funcs: impl IntoIterator<Item = &'a Func>, out: &
         let Some((bytes, _, _)) = data_of(u, d) else { continue };
         for (_, s) in data_refs(u, d, &bytes) {
             match u.syms.kind(s.id) {
-                Some(SymKind::Thunk(t)) => out.push(t),
+                Some(SymKind::Thunk(t)) => visit(t, Some(d)),
                 Some(SymKind::Data(_) | SymKind::Rw(_) | SymKind::Static(_)) => dwork.push(s.id),
                 _ => {}
             }
@@ -1354,6 +1408,8 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Resul
     origins.clear();
     let mut parents = CLOSURE_PARENTS.lock().unwrap_or_else(|e| e.into_inner());
     parents.clear();
+    let mut via = CLOSURE_VIA.lock().unwrap_or_else(|e| e.into_inner());
+    via.clear();
     let mut removed_edges = Vec::new();
     let mut expand = |parent: u32, f: &Func, work: &mut Vec<u32>, data_seen: &mut std::collections::HashSet<u32>| {
         let start = work.len();
@@ -1361,9 +1417,16 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Resul
             if let Inst::Call(Callee::Fn(t) | Callee::CFn(t, _), _, _) = i { work.push(*t); }
         }
         for id in &work[start..] { if !original.contains(id) { origins.entry(*id).or_insert("direct-call"); parents.entry(*id).or_insert(parent); } }
-        let start = work.len();
-        address_taken(u, std::iter::once(f), work, data_seen);
-        for id in &work[start..] { if !original.contains(id) { origins.entry(*id).or_insert("function-pointer/vtable"); parents.entry(*id).or_insert(parent); } }
+        address_edges(u, std::iter::once(f), &mut |id, data| {
+            work.push(id);
+            if !original.contains(&id) {
+                if let std::collections::btree_map::Entry::Vacant(entry) = origins.entry(id) {
+                    entry.insert("function-pointer/vtable");
+                    parents.insert(id, parent);
+                    if let Some(data) = data { via.insert(id, data); }
+                }
+            }
+        }, data_seen);
     };
     let up = crate::jit::current_unit();
     while let Some(id) = work.pop() {
@@ -1407,7 +1470,24 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Resul
             }
         }
     }
+    let mut vtables = CLOSURE_VTABLES.lock().unwrap_or_else(|e| e.into_inner());
+    vtables.clear();
     if let Ok(path) = std::env::var("MAKEPAD_RUN_WASM_EXPORT_FNLIST") {
+        // A later retained constructor can materialize a table first discovered
+        // through data. Classify after the entire optimized-body fixpoint.
+        let mut code_data = BTreeMap::new();
+        for (id, f) in funcs.iter() {
+            for i in f.blocks.iter().flat_map(|b| &b.insts) {
+                if let Inst::Addr(_, s) | Inst::TlsAddr(_, s) = i { code_data.entry(s.id).or_insert(*id); }
+            }
+        }
+        for symbol in &data_seen {
+            let Some(SymKind::Data(index)) = u.syms.kind(*symbol) else { continue };
+            let Some(name) = u.syms.obj_name(index).filter(|n| n.starts_with("vtable:")) else { continue };
+            let methods = data_of(u, *symbol).map(|(bytes, _, _)| data_refs(u, *symbol, &bytes).iter()
+                .filter_map(|(_, s)| match u.syms.kind(s.id) { Some(SymKind::Thunk(slot)) => Some(slot), _ => None }).collect()).unwrap_or_default();
+            vtables.insert(*symbol, (code_data.get(symbol).copied(), methods, name));
+        }
         let mut rows = String::from("caller\tcallee\n");
         for (caller, callee) in &removed_edges {
             rows.push_str(&format!("{}\t{}\n", crate::jit::slot_key(u, *caller), crate::jit::slot_key(u, *callee)));

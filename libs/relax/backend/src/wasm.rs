@@ -244,6 +244,9 @@ pub struct Stats {
     pub n_folded: usize,
     /// (slot id, function name, body bytes) of every chosen function
     pub fn_sizes: Vec<(u32, String, usize)>,
+    /// (slot id, absolute module offset, encoded body length), including final
+    /// relocation encodings. Folded aliases own no bytes: (slot, 0, 0).
+    pub fn_ranges: Vec<(u32, usize, usize)>,
 }
 
 pub struct Output {
@@ -779,6 +782,7 @@ impl<'a> Module<'a> {
         let mut s = Vec::new();
         uleb(&mut s, dord.len() as u64);
         let mut fb = Vec::new();
+        let mut body_ranges = vec![(0, 0); ni + all.len()];
         for g in &dord {
             let b = all[*g - ni];
             fb.clear();
@@ -793,10 +797,17 @@ impl<'a> Module<'a> {
             }
             fb.extend_from_slice(&b.bytes[at..]);
             uleb(&mut s, fb.len() as u64);
+            body_ranges[*g] = (s.len(), fb.len());
             s.extend_from_slice(&fb);
         }
         let b0 = out.len();
         section(&mut out, 10, &s);
+        let code_start = out.len() - s.len();
+        st.fn_ranges = funcs.iter().enumerate().map(|(k, (id, _))| {
+            if canon[ni + k] != ni + k { return (*id, 0, 0); }
+            let (offset, len) = body_ranges[ni + k];
+            (*id, code_start + offset, len)
+        }).collect();
         sz(&mut st, &out, b0, 10);
         if !segs.is_empty() {
             let mut s = Vec::new();
