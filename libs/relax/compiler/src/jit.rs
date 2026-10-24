@@ -16525,7 +16525,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     use crate::cache::warm_count as wc;
                     wc::add(if unverified { wc::O3_UNVERIFIED } else if speculative || inspect_o3_on() { wc::O3_SPEC } else if frame_size > frame_max { wc::O3_FRAME } else { wc::O3_QUEUED }, 1);
                 }
-                if frame_size <= frame_max && !unverified && !speculative && !incomplete && !inspect_o3_on() {
+                // (deterministic O3 runs cache no O3 code: a later record or replay links none, every O3
+                // slot of theirs is a recorded build)
+                if frame_size <= frame_max && !unverified && !speculative && !incomplete && !inspect_o3_on() && !t1prof_on(options) {
                     // its key and certificate encoding in the bounded record batches (records_due),
                     // not in this publish
                     if let Some(mut c) = u.cache.take() {
@@ -18042,7 +18044,8 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &cr
     let mut unverified_in: Vec<u32> = Vec::new();
     let root_unverified = unverified_root(fns, id);
     let mut rir_hashes: Vec<(String, u64)> = Vec::new();
-    if t1key.is_some() {
+    if let Some(k) = t1key {
+        t1prof_dump(&format!("root:{}", k), rir, 255);
         rir_hashes.push((String::new(), t1_norm_hash(rir) ^ root_unverified as u64));
     }
     for &c in callees {
