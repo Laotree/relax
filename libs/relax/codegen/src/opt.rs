@@ -7845,8 +7845,28 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
         // writing those it writes (all of them, both ways, when its access is not known)
         let nocap_ext = |c: &Callee, k: u32| f.nocapture.iter().find(|x| x.0 == *c && x.1 == k && !x.2).map(|x| x.3);
         let nocap = |c: &Callee, k: u32| nocap_ext(c, k).is_some();
+        // A call's own memory, at the slot's start: the result buffer of a call returning in
+        // memory (written whole, never read: it is uninitialised to the callee) and a by-value
+        // argument copy lowering made for one call and nothing reads (the callee owns it: it reads
+        // and may write all of it). Neither is reached through a kept pointer after the return
+        // (rustc: indirect arguments and the indirect return place are `noalias
+        // captures(address)`), as frame::slot_sets reads them. (read, write) byte ranges.
+        // `out.push(entry)` hands the entry to an outlined push as such a copy (GAPB).
+        let owned = |c: &Callee, k: u32, s2: usize, at: i64| -> Option<((i64, i64), (i64, i64))> {
+            let size = f.slots[s2].size as i64;
+            if at != 0 {
+                return None;
+            }
+            if k == 0 && matches!(c, Callee::Fn(id) if f.sret_callees.contains(id)) {
+                return Some(((0, 0), (0, size)));
+            }
+            (f.slots[s2].arg && sc.call_args[s2].len() == 1 && sc.reads[s2] == 0).then_some(((0, size), (0, size)))
+        };
+        let arg_at = |bi: usize, ii: usize, k: u32| -> i64 {
+            match &f.blocks[bi].insts[ii] { Inst::Call(_, args, _) => vs[args[k as usize].0 as usize].1, _ => -1 }
+        };
         let nc_only: Vec<bool> = (0..ns).map(|s2| sc.esc[s2] && !sc.esc_other[s2] && sret_call[s2].is_none()
-            && sc.call_args[s2].iter().all(|&(bi, ii, k)| matches!(&f.blocks[bi].insts[ii], Inst::Call(c, _, _) if nocap(c, k)))).collect();
+            && sc.call_args[s2].iter().all(|&(bi, ii, k)| matches!(&f.blocks[bi].insts[ii], Inst::Call(c, _, _) if nocap(c, k) || owned(c, k, s2, arg_at(bi, ii, k)).is_some()))).collect();
         let tracked: Vec<bool> = (0..ns).map(|s2| f.slots[s2].size > 0 && (!sc.esc[s2] || sret_call[s2].is_some() || nc_only[s2])).collect();
         // (block, inst) of a nocapture call -> the tracked slots' bytes it may read (`nc_rd`) and
         // write (`nc_wr`): (slot, lo, hi; hi = i64::MAX: anywhere in the slot)
@@ -7857,11 +7877,13 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
                 for &(bi, ii, k) in &sc.call_args[s2] {
                     let Inst::Call(c, args, _) = &f.blocks[bi].insts[ii] else { continue };
                     let at = vs[args[k as usize].0 as usize].1;
-                    let (rd, wr) = match nocap_ext(c, k).flatten() {
-                        Some(e) => (e.read, e.write),
-                        None => ((0, 0), (0, 0)),
+                    let own = if nocap(c, k) { None } else { owned(c, k, s2, at) };
+                    let (rd, wr) = match (own, nocap_ext(c, k).flatten()) {
+                        (Some((r, w)), _) => ((r.0 as i32, r.1 as i32), (w.0 as i32, w.1 as i32)),
+                        (None, Some(e)) => (e.read, e.write),
+                        (None, None) => ((0, 0), (0, 0)),
                     };
-                    let known = nocap_ext(c, k).flatten().is_some();
+                    let known = own.is_some() || nocap_ext(c, k).flatten().is_some();
                     for ((lo, hi), map) in [(rd, &mut nc_rd), (wr, &mut nc_wr)] {
                         let r = if !known { (s2 as u32, 0, i64::MAX) } else if lo == hi { continue } else { (s2 as u32, at + lo as i64, at + hi as i64) };
                         let v = map.entry((bi, ii)).or_default();
