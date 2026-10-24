@@ -111,8 +111,8 @@ mod disabled {
     pub fn census() -> [usize; 11] {
         [0; 11]
     }
-    pub fn states() -> [usize; 26] {
-        [0; 26]
+    pub fn states() -> [usize; 28] {
+        [0; 28]
     }
     pub fn mark_old() {}
     pub fn is_old(_: *const u8) -> bool {
@@ -282,7 +282,7 @@ pub fn arena_census() -> ([usize; 11], [usize; 11]) {
 }
 
 /// The compiler and burst arenas' chunk states with resident bytes (arena.rs `states`).
-pub fn arena_states() -> ([usize; 26], [usize; 26]) {
+pub fn arena_states() -> ([usize; 28], [usize; 28]) {
     (compiler::states(), burst::states())
 }
 

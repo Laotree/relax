@@ -67,7 +67,7 @@ impl DomainHeap {
         self.inner.arena.detail()
     }
     /// Chunk states with resident bytes (arena.rs `states`).
-    pub fn states(&self) -> [usize; 26] {
+    pub fn states(&self) -> [usize; 28] {
         self.inner.arena.states()
     }
     pub fn range(&self) -> (usize, usize) {
@@ -168,6 +168,12 @@ unsafe fn owner(p: *mut u8) -> Option<Arc<Heap>> {
         h = *heap.next.get();
     }
     None
+}
+
+/// The calling program thread is about to block in a condvar or park wait (std's wait registry):
+/// it settles its current chunks of its program heap (arena.rs `domain_wait`).
+pub fn before_wait() {
+    unsafe { compiler::domain_wait() }
 }
 
 /// Every live domain heap returns its free pages (warm chunks, all-free granules of detached
@@ -654,6 +660,43 @@ mod tests {
             for &p in &keep[..16] {
                 program_dealloc(p, 64, 8);
             }
+            enter(std::ptr::null());
+        }
+    }
+
+    /// Blocks another thread freed into a quiet owner's current chunk wait on its remote list; the
+    /// owner takes them when it is about to block (`before_wait`), and reuses their slots.
+    #[test]
+    fn a_waiting_owner_takes_the_remote_frees() {
+        symbol(b"relax_alloc");
+        let heap = DomainHeap::new().unwrap();
+        let addr = &*heap as *const DomainHeap as usize;
+        unsafe {
+            enter(&*heap);
+            let blocks: Vec<usize> = (0..4000).map(|_| program_alloc(200, 8) as usize).collect();
+            // (one block stays: the chunk stays this thread's)
+            let stay = program_alloc(200, 8);
+            let pending = |h: &DomainHeap| h.states()[27];
+            std::thread::spawn(move || {
+                enter(addr as *const DomainHeap);
+                for p in blocks {
+                    program_dealloc(p as *mut u8, 200, 8);
+                }
+                enter(std::ptr::null());
+            })
+            .join()
+            .unwrap();
+            assert!(pending(&heap) >= 4000 * 200, "the frees wait on the remote list: {}", pending(&heap));
+            before_wait();
+            assert_eq!(pending(&heap), 0, "the owner took them");
+            // their slots are the owner's again: 4000 new blocks carve nothing new
+            let touched = heap.states()[1];
+            let again: Vec<*mut u8> = (0..4000).map(|_| program_alloc(200, 8)).collect();
+            assert_eq!(heap.states()[1], touched);
+            for p in again {
+                program_dealloc(p, 200, 8);
+            }
+            program_dealloc(stay, 200, 8);
             enter(std::ptr::null());
         }
     }

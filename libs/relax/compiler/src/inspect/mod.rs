@@ -1315,6 +1315,11 @@ pub extern "C" fn relax_wait_enter(kind: u32, addr: usize, holder: usize) {
         crate::waits::enter(crate::waits::Kind::Join, 0, holder as u64, "join");
         return;
     }
+    // a condvar or park wait is where a program thread goes quiet: its program heap's current
+    // chunks are settled first (the blocks other threads freed into them, their free pages)
+    if kind == 2 || kind == 5 {
+        crate::zone_alloc::domain::before_wait();
+    }
     const LABELS: [&str; 7] = ["futex", "mutex", "condvar", "rwlock read", "rwlock write", "park", "once"];
     crate::waits::enter(crate::waits::Kind::Futex, addr as u64, holder as u64, LABELS.get(kind as usize).copied().unwrap_or("futex"));
 }

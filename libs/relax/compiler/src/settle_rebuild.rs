@@ -383,6 +383,10 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
             rir.push(r);
         }
         e.build_err = None;
+        // the slots' call lists stay; made during the cold start, they are scattered over the
+        // old state's chunks (a few bytes each, 200k slots): copied into the fresh chunks, the old
+        // ones go with the rest (only the owner reads a slot's fields: this runs on it)
+        e.rehome_lists();
     }
     let old = Old {
         _prog: std::mem::replace(&mut u.prog, prog),

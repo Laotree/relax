@@ -169,6 +169,17 @@ impl FnEntry {
     pub(crate) fn rir_refs(&self) -> &[u32] {
         &self.rir_refs
     }
+    /// A settle rebuild's replace (on the owner, under the front write, in fresh compiler chunks):
+    /// the call lists that lie in the old state's chunks are copied, so they stop pinning them.
+    pub(crate) fn rehome_lists(&mut self) {
+        let old = |b: &[u32]| !b.is_empty() && crate::zone_alloc::placement(b.as_ptr().cast()) == 0;
+        if old(&self.calls) {
+            self.calls = self.calls.to_vec().into_boxed_slice();
+        }
+        if old(&self.rir_refs) {
+            self.rir_refs = self.rir_refs.to_vec().into_boxed_slice();
+        }
+    }
     /// Reading an untouched slot's history never allocates.
     pub fn history(&self) -> &SlotHistory {
         static EMPTY: SlotHistory = SlotHistory { prev: Vec::new(), retired: Vec::new(), inlined_into: Vec::new() };
