@@ -260,7 +260,7 @@ mod imp {
 
     pub(super) fn physical_memory() -> usize {
         extern "C" {
-            fn sysconf(name: i32) -> isize;
+            fn sysconf(name: i32) -> i64;
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         const PAGES: (i32, i32) = (85, 30); // _SC_PHYS_PAGES, _SC_PAGESIZE
