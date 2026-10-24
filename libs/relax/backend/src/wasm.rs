@@ -442,6 +442,77 @@ impl<'a> Module<'a> {
         self.data_end
     }
 
+    /// Every function's signature facts. A function the table, an export or a C ABI names keeps
+    /// the plain one (indirect callers and hosts know only that); the others pass a reference
+    /// parameter (an address in the 4 GB memory) and a parameter the body reads only the low
+    /// half of as an i32, and return an i32 when every return value extends from one. Two
+    /// rounds: a parameter's uses as a narrow argument of another function count from the second.
+    fn signatures(&self, funcs: &[(u32, &Func)], body_of: &dyn Fn(usize) -> &'a Func, link: &dyn Link) -> Vec<Sig> {
+        let n = funcs.len();
+        let mut sigs: Vec<Sig> = funcs.iter().map(|(_, f)| Sig { params: vec![0; f.params.len()], ret: 0 }).collect();
+        if self.opts.memory64 {
+            return sigs;
+        }
+        let mut fixed = vec![false; n];
+        for (&id, _) in &self.sh.table_ix {
+            if let Some(&u) = self.fn_ix.get(&id) {
+                fixed[u as usize] = true;
+            }
+        }
+        for (_, id) in &self.exports {
+            if let Some(&u) = self.fn_ix.get(id) {
+                fixed[u as usize] = true;
+            }
+        }
+        for u in 0..n {
+            let f = body_of(u);
+            if funcs[u].1.cabi.is_some() {
+                fixed[u] = true;
+            }
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if let Inst::FnAddr(_, t) = i {
+                        if let Some(&c) = self.fn_ix.get(t) {
+                            fixed[c as usize] = true;
+                        }
+                    }
+                }
+            }
+        }
+        for _round in 0..2 {
+            let prev = sigs.clone();
+            let csig = |id: u32| self.fn_ix.get(&id).map(|&u| &prev[u as usize]);
+            for u in 0..n {
+                if fixed[u] {
+                    continue;
+                }
+                let f = body_of(u);
+                let seeds: Vec<u8> = f.params.iter().map(|p| {
+                    if f.vregs[p.0 as usize] != Cls::I {
+                        0
+                    } else if f.nonnull.contains(p) || f.deref.iter().any(|(d, _)| d == p) {
+                        KZ
+                    } else {
+                        KL
+                    }
+                }).collect();
+                let k = narrow_kinds(f, &self.opts, link, &seeds, &csig);
+                let params: Vec<u8> = f.params.iter().map(|p| k[p.0 as usize]).collect();
+                let mut ret = 0u8;
+                if f.rets.len() == 1 && f.rets[0] == Cls::I {
+                    ret = KZ | KS;
+                    for b in &f.blocks {
+                        if let Term::Ret(vs) = &b.term {
+                            ret &= vs.first().map_or(0, |v| k[v.0 as usize] & (KZ | KS));
+                        }
+                    }
+                }
+                sigs[u] = Sig { params, ret };
+            }
+        }
+        sigs
+    }
+
     /// Lowers every function and assembles the module.
     pub fn finish(mut self, options: &relax_session::Options, link: &dyn Link) -> Output {
         let opts = self.opts.clone();
@@ -450,15 +521,18 @@ impl<'a> Module<'a> {
         let mut failed = Vec::new();
         let mut untraced_calls = Vec::new();
         let funcs = std::mem::take(&mut self.funcs);
-        for (id, f) in &funcs {
+        let prepared: Vec<Option<Func>> = funcs.iter().map(|(_, f)| prepare(&opts, options, f, &self.fn_ix, link)).collect();
+        let body_of = |u: usize| prepared[u].as_ref().unwrap_or(funcs[u].1);
+        let sigs = self.signatures(&funcs, &body_of, link);
+        for (u, (id, f)) in funcs.iter().enumerate() {
             let first = self.sh.untraced_targets.len();
-            let r = lower_func(&opts, options, f, &self.fn_ix, &funcs, link, &mut self.sh);
+            let r = lower_func(&opts, options, body_of(u), u, &self.fn_ix, &funcs, &sigs, link, &mut self.sh);
             untraced_calls.extend(self.sh.untraced_targets[first..].iter().map(|target| (*id, *target)));
             match r {
                 Ok(b) => bodies.push(b),
                 Err(e) => {
                     failed.push((*id, e));
-                    let ty = func_type(f).map(|t| self.sh.ty(t)).unwrap_or_else(|_| self.sh.ty(FnType { params: vec![], results: vec![] }));
+                    let ty = func_type_sig(f, &sigs[u]).map(|t| self.sh.ty(t)).unwrap_or_else(|_| self.sh.ty(FnType { params: vec![], results: vec![] }));
                     bodies.push(Body { bytes: vec![0, 0x00, 0x0B], fix: vec![], ty });
                 }
             }
@@ -1185,21 +1259,25 @@ fn ty_kind(it: IntTy) -> u8 {
 /// Per vreg: the narrow kind of every definition's value (0: none, a wide i64). wasm32 only.
 /// Copies, selects and bitwise ops take their operands' kinds (optimistic over cycles: a loop
 /// variable enters its cycle from a definition outside it).
-fn narrow_kinds(f: &Func, o: &Options, link: &dyn Link) -> Vec<u8> {
+/// `pk`: per parameter its signature kind (0 wide; KZ; KL: a candidate the body's uses decide);
+/// `csig`: a direct callee's signature (its narrow parameters read only the low half of an
+/// argument; its narrow result defines a narrow value).
+fn narrow_kinds<'s>(f: &Func, o: &Options, link: &dyn Link, pk: &[u8], csig: &dyn Fn(u32) -> Option<&'s Sig>) -> Vec<u8> {
     let nv = f.vregs.len();
     if o.memory64 {
         return vec![0; nv];
     }
     const UNSET: u8 = 0xFF;
     let mut k = vec![UNSET; nv];
-    for p in &f.params {
-        k[p.0 as usize] = 0;
+    let pkind = |i: usize| pk.get(i).copied().unwrap_or(0) & (KZ | KS);
+    for (i, p) in f.params.iter().enumerate() {
+        k[p.0 as usize] = pkind(i);
     }
     let top = |k: &[u8], v: VReg| if k[v.0 as usize] == UNSET { KZ | KS } else { k[v.0 as usize] };
     for _ in 0..32 {
         let mut n = vec![UNSET; nv];
-        for p in &f.params {
-            n[p.0 as usize] = 0;
+        for (i, p) in f.params.iter().enumerate() {
+            n[p.0 as usize] = pkind(i);
         }
         let put = |n: &mut Vec<u8>, d: VReg, x: u8| {
             let d = d.0 as usize;
@@ -1240,6 +1318,9 @@ fn narrow_kinds(f: &Func, o: &Options, link: &dyn Link) -> Vec<u8> {
                     Inst::Sel(d, _, a, x) if f.vregs[d.0 as usize] == Cls::I => put(&mut n, d, top(&k, a) & top(&k, x)),
                     Inst::Mov(d, a) if f.vregs[d.0 as usize] == Cls::I => put(&mut n, d, top(&k, a)),
                     Inst::VExtract(d, _, _) if f.vregs[d.0 as usize] == Cls::I => put(&mut n, d, KS),
+                    Inst::Call(Callee::Fn(id) | Callee::CFn(id, _), _, ref rets) if rets.len() == 1 => {
+                        put(&mut n, rets[0], csig(id).map_or(0, |s| s.ret))
+                    }
                     _ => i.defs(|d| put(&mut n, d, 0)),
                 }
             }
@@ -1259,15 +1340,17 @@ fn narrow_kinds(f: &Func, o: &Options, link: &dyn Link) -> Vec<u8> {
     // one, to a fixed point (whether an operand use is narrow depends on its result's form)
     let mut defs_ok = vec![true; nv];
     let mut has_def = vec![false; nv];
-    for p in &f.params {
-        defs_ok[p.0 as usize] = false;
+    for (i, p) in f.params.iter().enumerate() {
+        // a parameter: a candidate only when its signature may be narrowed (KL)
+        defs_ok[p.0 as usize] = pk.get(i).is_some_and(|x| *x == KL);
+        has_def[p.0 as usize] = true;
     }
     for b in &f.blocks {
         for i in &b.insts {
             let expr = tree_def(i).is_some() && !matches!(i, Inst::Call(..));
             i.defs(|d| {
                 has_def[d.0 as usize] = true;
-                if !expr {
+                if !expr || f.params.contains(&d) {
                     defs_ok[d.0 as usize] = false;
                 }
             });
@@ -1301,6 +1384,16 @@ fn narrow_kinds(f: &Func, o: &Options, link: &dyn Link) -> Vec<u8> {
                 }
                 low.clear();
                 low_uses(i, &k, &mut low);
+                // the arguments of a callee's narrow parameters
+                if let Inst::Call(Callee::Fn(id) | Callee::CFn(id, _), args, _) = i {
+                    if let Some(s) = csig(*id) {
+                        for (a, p) in args.iter().zip(&s.params) {
+                            if *p != 0 {
+                                low.push(*a);
+                            }
+                        }
+                    }
+                }
                 for u in &uses {
                     if k[u.0 as usize] != KL {
                         continue;
@@ -1417,22 +1510,54 @@ struct Fx<'a> {
     sp0: u32,
     /// per vreg: its narrow kind (KZ / KS; 0: a wide i64): narrow values live in i32 locals
     nk: Vec<u8>,
+    /// every function's signature facts (by function index), and this function's index
+    sigs: &'a [Sig],
+    me: usize,
 }
 
-fn lower_func(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &HashMap<u32, u32>, funcs: &[(u32, &Func)], link: &dyn Link, sh: &mut Shared) -> Result<Body, String> {
-    // vector ops wasm has no instruction for: per-lane scalar code; switches: br_table
+/// The body a function is emitted from: untraced/trap calls end their blocks, vector ops wasm has
+/// no instruction for become per-lane scalar code, switches br_table forms. None: `f0` itself.
+fn prepare(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &HashMap<u32, u32>, link: &dyn Link) -> Option<Func> {
     let native = |op: VX| vx_native(op);
     let pruned: Option<Func> = prune(o, f0, fn_ix, link);
-    let f0: &Func = pruned.as_ref().unwrap_or(f0);
-    let legal: Option<Func> = crate::legal::needed(f0, &native, true).then(|| {
-        let mut g = f0.clone();
+    let f1: &Func = pruned.as_ref().unwrap_or(f0);
+    let legal: Option<Func> = crate::legal::needed(f1, &native, true).then(|| {
+        let mut g = f1.clone();
         crate::legal::legalize(&mut g, &native, true);
         g
     });
-    let f0: &Func = legal.as_ref().unwrap_or(f0);
-    let switched = crate::switch::lower_switches(options, f0, crate::switch::MIN_TABLE_CLUSTERS);
-    let f: &Func = switched.as_ref().map(|s| &s.0).unwrap_or(f0);
-    let ft = func_type(f)?;
+    let f2: &Func = legal.as_ref().unwrap_or(f1);
+    match crate::switch::lower_switches(options, f2, crate::switch::MIN_TABLE_CLUSTERS) {
+        Some(s) => Some(s.0),
+        None => legal.or(pruned),
+    }
+}
+
+/// A function's wasm signature facts: per parameter its narrow kind (0: i64; KZ: an i32 the
+/// value zero-extends from; KL: an i32 of the low half, all the body reads), and its single
+/// integer result's (0: i64; KZ / KS: an i32 that extends to the value).
+#[derive(Clone, Debug, Default)]
+struct Sig {
+    params: Vec<u8>,
+    ret: u8,
+}
+
+fn func_type_sig(f: &Func, sig: &Sig) -> Result<FnType, String> {
+    let mut t = func_type(f)?;
+    for (k, p) in t.params.iter_mut().enumerate() {
+        if sig.params.get(k).is_some_and(|x| *x != 0) {
+            *p = Val::I32;
+        }
+    }
+    if sig.ret != 0 {
+        t.results[0] = Val::I32;
+    }
+    Ok(t)
+}
+
+fn lower_func(o: &Options, options: &relax_session::Options, f: &Func, me: usize, fn_ix: &HashMap<u32, u32>, funcs: &[(u32, &Func)], sigs: &[Sig], link: &dyn Link, sh: &mut Shared) -> Result<Body, String> {
+    let _ = options;
+    let ft = func_type_sig(f, &sigs[me])?;
     let ty = sh.ty(ft.clone());
     let cfg = analyse(f);
     let nv = f.vregs.len();
@@ -1463,9 +1588,19 @@ fn lower_func(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &
         last_set: (usize::MAX, 0, 0, 0),
         sp0: NONE,
         nk: Vec::new(),
+        sigs,
+        me,
     };
     fx.check()?;
-    fx.nk = narrow_kinds(f, o, link);
+    {
+        let csig = |id: u32| fn_ix.get(&id).map(|&u| &sigs[u as usize]);
+        fx.nk = narrow_kinds(f, o, link, &sigs[me].params, &csig);
+    }
+    for (k, p) in f.params.iter().enumerate() {
+        if fx.nk[p.0 as usize] != sigs[me].params[k] {
+            return Err(format!("parameter {} narrowed to {} in the body, {} in the signature", k, fx.nk[p.0 as usize], sigs[me].params[k]));
+        }
+    }
     fx.plan_folds();
     let (slot_at, end) = crate::frame::slot_layout(f, 0, true);
     let frame = ((end + 15) & !15) as u32;
@@ -2020,7 +2155,7 @@ impl<'a> Fx<'a> {
                 return Err("a vreg is two parameters".into());
             }
             colour[p.0 as usize] = k as u32;
-            ctype.push(val_of(f.vregs[p.0 as usize])?);
+            ctype.push(vty(p.0 as usize)?);
             cuse.push(ucount[p.0 as usize] as u64);
         }
         let mut order: Vec<u32> = (0..nv as u32).filter(|v| touched[*v as usize] && colour[*v as usize] == NONE).collect();
@@ -2622,6 +2757,11 @@ impl<'a> Fx<'a> {
                 self.value(b, *x, Want::Nat)?;
                 self.op(0xBC);
             }
+            // a narrow call result is a callee's narrow return (call_inst leaves the i32)
+            Inst::Call(..) => {
+                let last = i + 1 == self.f.blocks[b as usize].insts.len();
+                self.call_inst(b, &inst, last)?;
+            }
             _ => {
                 self.expr_wide(b, i, Want::Nat)?;
                 self.op(WRAP);
@@ -3208,8 +3348,16 @@ impl<'a> Fx<'a> {
                     if want != have {
                         return Err(format!("call of slot {} ({}) with a signature unlike its body's: call {:?}, body {:?}", id, self.funcs[u as usize].1.name, want, have));
                     }
-                    push_args(self)?;
+                    let cs = &self.sigs[u as usize];
+                    for (k, a) in args.iter().enumerate() {
+                        let narrow = cs.params.get(k).is_some_and(|x| *x != 0);
+                        self.value(b, *a, if narrow { Want::Low } else { Want::Nat })?;
+                    }
                     self.call(FRef::User(u));
+                    // a narrow result into a wide vreg: extended here (the value's whole form)
+                    if cs.ret != 0 && rets.len() == 1 && self.nk[rets[0].0 as usize] == 0 {
+                        self.op(if cs.ret & KZ != 0 { EXT_U } else { EXT_S });
+                    }
                 }
                 None => {
                     self.untraced(*id);
@@ -3504,8 +3652,9 @@ impl<'a> Fx<'a> {
             Term::Jump(x) => self.do_branch(b, *x)?,
             Term::Branch(c, x, y) => self.branch(b, *c, *x, *y)?,
             Term::Ret(vs) => {
+                let narrow = self.sigs[self.me].ret != 0;
                 for v in vs {
-                    self.value(b, *v, Want::Nat)?;
+                    self.value(b, *v, if narrow { Want::Low } else { Want::Nat })?;
                 }
                 self.restore_sp();
                 self.op(RETURN);
