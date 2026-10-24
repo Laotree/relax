@@ -21845,17 +21845,20 @@ unsafe fn realtime_step(up: *mut Unit) {
                     if fresh > 0 {
                         RT_DYNS.store(true, Ordering::Release);
                     }
-                    let addrs: Vec<(u32, u64)> = snapshot.into_iter().filter(|((_, dy), a)| rt.dyns.contains(&dy.0) && !rt.vtables.contains(a)).map(|((_, dy), a)| (dy.0, a)).collect();
+                    let addrs: Vec<(u32, u64, TyId)> = snapshot.into_iter().filter(|((_, dy), a)| rt.dyns.contains(&dy.0) && !rt.vtables.contains(a)).map(|((t, dy), a)| (dy.0, a, t)).collect();
                     if rt_trace() {
                         let mut by: crate::fxhash::HashMap<u32, usize> = Default::default();
-                        for (d, _) in &addrs {
+                        for (d, _, _) in &addrs {
                             *by.entry(*d).or_default() += 1;
                         }
                         for (d, n) in by {
                             eprintln!("makepad-run rt: trait objects `{}` called through: {} vtables followed", crate::typeck::ty_to_string(false, &u.prog, &u.tcx, TyId(d)), n);
                         }
                     }
-                    for (_, a) in addrs {
+                    // the values behind those vtables hold trait objects of their own
+                    let behind: Vec<TyId> = addrs.iter().map(|x| x.2).collect();
+                    rt.new_dyns.extend(realtime_value_dyns(u, &behind).into_iter().filter(|d| !rt.dyns.contains(d)));
+                    for (_, a, _) in addrs {
                         rt.vtables.insert(a);
                         crate::syms::data_thunks(u, a, &mut rt.todo);
                     }
@@ -21879,6 +21882,10 @@ unsafe fn realtime_step(up: *mut Unit) {
         return;
     }
     let set = with_rt(|rt| rt.set.clone());
+    if set.len() == n0 && total_compiled == 0 {
+        realtime_done();
+        return;
+    }
     // the top tier for all of it: an O2 build replaces whatever code it has (baseline or O1 code
     // made before it was known to be real-time; the sampler never sees a device's thread, so
     // nothing else would) and is the slot's disk cache entry, so later runs link O2 code at the
@@ -21907,8 +21914,12 @@ unsafe fn realtime_step(up: *mut Unit) {
     if crate::run::VERBOSE.load(Ordering::Relaxed) || rt_trace() {
         eprintln!("makepad-run rt: {}: real-time code reaches {} slots ({} new), {} compiled now, {:.1} ms on the owner", why, set.len(), set.len() - n0, total_compiled, ns as f64 / 1e6);
     }
-    // the tickets whose roots were in: done; their wakes run on a thread of their own (program
-    // code, not on the owner)
+    realtime_done();
+}
+
+/// The reach is done: the tickets whose roots were in are; their wakes run on a thread of their own
+/// (program code, not on the owner).
+fn realtime_done() {
     let wakes = with_rt(|rt| {
         rt.scheduled = false;
         rt.urgent = false;
@@ -22032,7 +22043,7 @@ fn realtime_installed(u: &Unit, id: u32, relocs: &[relax_backend::rir::RelocAt])
     let new: Vec<u32> = {
         let g = REALTIME.lock().unwrap_or_else(|e| e.into_inner());
         let Some(rt) = g.as_ref().filter(|rt| rt.seen.contains(&id)) else { return };
-        refs.into_iter().filter(|c| !rt.seen.contains(c)).collect()
+        refs.into_iter().filter(|c| !rt.seen.contains(c) && (*c as usize) < u.fns.len() && !realtime_cut(u, *c)).collect()
     };
     if !new.is_empty() {
         if rt_trace() {
