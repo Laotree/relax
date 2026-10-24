@@ -1458,7 +1458,11 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                                     };
                                     Some((*d, k))
                                 }
-                                RoRead::Ptr(p) if matches!(m, Mem::Int(8, _)) => Some((*d, K::A(p))),
+                                // The reader only returns Ptr for an exact
+                                // pointer-width read. wasm32's unsigned pointer
+                                // loads are symbolic addresses too; a signed
+                                // 32-bit integer read still needs sign extension.
+                                RoRead::Ptr(p) if matches!(m, Mem::Int(8, _) | Mem::Int(4, false)) => Some((*d, K::A(p))),
                                 _ => None,
                             }
                         }
