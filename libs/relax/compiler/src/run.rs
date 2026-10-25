@@ -406,7 +406,7 @@ pub(crate) fn resolve_package(
             // `--allow-c`: cargo builds the native dependencies (front native.rs); a build
             // script's own child run never builds them again
             let triple = crate::cfg::CfgSet::host(sess, &[]).triple();
-            let native_request = (options.allow_c && !check_only && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none()).then(|| crate::native::Request { workspace, package, cargo_flags, relax_dir: target_dir, triple });
+            let native_request = (options.allow_c && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none()).then(|| crate::native::Request { workspace, package, cargo_flags, relax_dir: target_dir, triple });
             let scripts = unitgraph::run_build_scripts(sess, &mut g, target_dir, native_request.as_ref());
             let scripts_ms = t_scripts.elapsed().as_secs_f64() * 1e3;
             let t_wait = Instant::now();
@@ -421,6 +421,7 @@ pub(crate) fn resolve_package(
         }
         if let Some((checked, _)) = sources { checked?; }
         scripts?;
+        crate::macro_reg::set_build_outputs(sess, &g.crates, &g.cfgs, &g.env);
     }
     if crate::preload::trace() {
         eprintln!("boot-trace: unit graph (resolve) {:.1} ms, graph {:.1} ms (load {:.1}, watch inputs {:.1}, substitutes {:.1})", (t_load - t).as_secs_f64() * 1e3, t_load.elapsed().as_secs_f64() * 1e3,
@@ -751,6 +752,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let workspace = workspace_dir();
     // everything this run writes: the workspace's <target>/relax (dirs.rs)
     let target_dir = crate::dirs::relax_dir().display().to_string();
+    // the relax dir is made private before anything writes into it: the build scripts' out dirs
+    // (and the host's window state) created it with create_dir_all, so on Windows it inherited the
+    // checkout's ACL and the cache's own check then turned the cache off ("writable by
+    // NT SERVICE\MakepadTunnel" on a tunnel box). The verdict stays the cache's (cache.rs).
+    let _ = crate::pack::ensure_private_dir(std::path::Path::new(&target_dir));
     crate::source_context::set_output_dir(&target_dir);
     // std is the std the program runs on, unless MAKEPAD_RUN_STD says otherwise
     if crate::vfs::is_virtual(&workspace) {
@@ -1185,7 +1191,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // provider Unit::new registers). A run checks coherence in the background; a check needs its errors now: the app
         // check its own crates' impls (cargo check), every other check all of them.
         let t = Instant::now();
-        if selftest || watch || root_only || session.is_some() { u.tcx.check_coherence(&u.prog); }
+        if selftest || watch || session.is_some() { u.tcx.check_coherence(&u.prog); }
         else { u.tcx.check_coherence_of(&u.prog, Some(&checked)); }
         phase("coherence", t);
         for k in checked {
@@ -1193,12 +1199,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             pre.extend(crate::check::own_errors(&u.prog, k, &u.tcx.errors, "typeck"));
         }
         // every body is checked, so the files the selection skipped load first: all of them for
-        // selftest, a watch session or --root-only; the checked (app) crates' for the app check
+        // selftest or a watch session; the checked crates' for --root-only or the app check
         let t = Instant::now();
-        if selftest || watch || root_only || session.is_some() {
+        if selftest || watch || session.is_some() {
             unsafe { jit::load_all_skipped(&mut *u) };
         } else {
-            let crates = if workspace_check { crate::check::workspace_crates(&u.prog, root) } else { crate::check::app_crates(&u.prog, root) };
+            let crates = if root_only { vec![root] } else if workspace_check { crate::check::workspace_crates(&u.prog, root) } else { crate::check::app_crates(&u.prog, root) };
             unsafe { jit::load_skipped_of(&mut *u, &crates) };
         }
         phase("load checked files", t);
@@ -2841,6 +2847,8 @@ fn quit_mark() {
         if r.is_some() { crate::cache::retire_replaced_in_use(); }
         verbose!("makepad-run cache: quit write at t={:.0} ms: {:?} (entries, front images), collected {} in {:.1} ms",
             crate::clock::ms_since_start(), r, COLLECTED_CURRENT.load(Ordering::Relaxed), t.elapsed().as_secs_f64() * 1e3);
+        // MAKEPAD_RUN_CACHE_TRACE: written here too (the exit's write may never run)
+        crate::cache::write_trace();
     });
     }
 }
@@ -3310,7 +3318,7 @@ fn summary_inner(why: &str) {
         let q = jit::TIER_QUEUED.load(Ordering::Relaxed);
         if q > 0 {
             verbose!(
-                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); snapshots {:.0} ms cpu on the owner (root {:.0}, candidates {:.0}, take tails {:.0}, singles + counts {:.0} ms; callee scans {:.0}, assembly {:.0} ms off it; {} inline candidates built there, {:.0} ms; {} fronts off it, {:.0} ms cpu; {} optimised off it, {:.0} ms cpu), back ends {:.0} ms cpu off it; bottom-up preparation {:.0} ms cpu ({} bodies simplified, {} kept, {} shared, {} of the simplified had disagreeing shared ones: body {} attrs {} presence {} preparation {} single {}); {} code bytes",
+                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); snapshots {:.0} ms cpu on the owner (root {:.0}, candidates {:.0}, take tails {:.0}, singles + counts {:.0} ms; callee scans {:.0}, assembly {:.0} ms off it; {} inline candidates built there, {:.0} ms; {} fronts off it, {:.0} ms cpu; {} optimised off it, {:.0} ms cpu, {} panics, {} bails), back ends {:.0} ms cpu off it; bottom-up preparation {:.0} ms cpu ({} bodies simplified, {} kept, {} shared, {} of the simplified had disagreeing shared ones: body {} attrs {} presence {} preparation {} single {}); {} code bytes",
                 jit::ahead_level().name(),
                 q,
                 jit::TIER_REVALIDATED.load(Ordering::Relaxed),
@@ -3333,6 +3341,8 @@ fn summary_inner(why: &str) {
                 jit::TIER1_SNAP_FRONTS[1].load(Ordering::Relaxed) as f64 / 1e6,
                 jit::TIER1_SNAP_OFF[0].load(Ordering::Relaxed),
                 jit::TIER1_SNAP_OFF[1].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::O3_OPT_PANICS[0].load(Ordering::Relaxed),
+                jit::O3_OPT_PANICS[1].load(Ordering::Relaxed),
                 s.tier1_free_ns as f64 / 1e6,
                 jit::TIER1_PREP[0].load(Ordering::Relaxed) as f64 / 1e6,
                 jit::TIER1_PREP[1].load(Ordering::Relaxed),

@@ -485,6 +485,9 @@ impl<'a> Lcx<'a> {
         let ret = u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), b.ret);
         let mut closure_storage = HashMap::default();
         for &ce in b.min_captures.keys() { closure_storage.insert(ce, crate::layout::ClosureStorage::for_codegen(&u.prog, &u.tcx, b, ce)); }
+        // this body's version is the truth for its closures' environments, also once a live edit
+        // replaced the version (their generic instances may be built only then)
+        u.lay.note_closure_storages(&u.prog, &u.tcx, b, closure_storage.iter().map(|(ce, s)| (*ce, s)));
         // the verdict's disjoint-index checks belong in verified code only (unverified code and its
         // twins run as written, SPEC-V)
         let d3 = if plain_calls || (cur_fn as usize) >= u.fns.len() { None } else { u.disjoint_checks(cur_fn) };
@@ -1191,7 +1194,8 @@ impl<'a> Lcx<'a> {
             Some(leaves) => {
                 // a pointer-sized leaf the type's niche keeps from 0 (references, Box, NonNull,
                 // a Vec's buffer pointer): codegen folds its null tests (Func::nonnull)
-                let nn = l.niche.filter(|n| n.bytes == 8 && n.start >= 1 && n.start <= n.end).map(|n| n.off);
+                let pb = self.pb();
+                let nn = l.niche.filter(|n| n.bytes == pb && n.start >= 1 && n.start <= n.end).map(|n| n.off);
                 // an unsigned scalar leaf the niche limits to start..=end (char, bool, enum
                 // tags): value ranges decide its niche tests (Func::ranged)
                 let rg = l.niche.filter(|n| n.bytes < 8 && n.start <= n.end && (n.start > 0 || n.end < (1u128 << (8 * n.bytes)) - 1));
@@ -1696,14 +1700,26 @@ impl<'a> Lcx<'a> {
         let b = self.b;
         for (k, m) in &b.methods {
             if m.autoref != 0 {
-                if let ExprKind::MethodCall(recv, _) = &ast.expr(ExprId(*k)).kind {
-                    self.mark_root(*recv);
+                match &ast.expr(ExprId(*k)).kind {
+                    ExprKind::MethodCall(recv, _) => self.mark_root(*recv),
+                    ExprKind::Mac(row) => {
+                        let mac = ast.row(*row);
+                        if mac.args != NO_MAC_ARGS {
+                            let args = ast.mac_arg(mac.args);
+                            if let Some(&recv) = ast.list(args.exprs).first() {
+                                self.mark_root(recv);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
+        let mut blocks: std::collections::HashSet<u32> = b.body.into_iter().map(|bl| bl.0).collect();
         for i in 0..b.expr_ty.len() {
             let e = b.expr_at(i);
-            match &ast.expr(e).kind {
+            let kind = &ast.expr(e).kind;
+            match kind {
                 ExprKind::AddrOf(_, _, x) => self.mark_root(*x),
                 // `a op= b` through an op-assign trait takes `&mut a`
                 ExprKind::AssignOp(_, x, _) if b.binops.contains_key(&e.0) => self.mark_root(*x),
@@ -1714,7 +1730,60 @@ impl<'a> Lcx<'a> {
                 // overloaded index / deref take `&self` / `&mut self` of the base
                 ExprKind::Index(x, _) if b.ov_index.contains_key(&e.0) => self.mark_root(*x),
                 ExprKind::Unary(UnOp::Deref, x) if b.ov_deref(e.0, 0).is_some() => self.mark_root(*x),
+                // patterns that bind by reference (`ref`, `ref mut`, match ergonomics) take the
+                // scrutinee place's address in place
+                ExprKind::Let(p, x) if self.pat_binds_by_ref(*p) => self.mark_root(*x),
+                ExprKind::Match(x, arms) if ast.list(*arms).iter().any(|a| self.pat_binds_by_ref(a.pat)) => self.mark_root(*x),
+                ExprKind::Mac(row) => {
+                    let mac = ast.row(*row);
+                    if mac.args != NO_MAC_ARGS {
+                        let args = ast.mac_arg(mac.args);
+                        if args.pat.is_some_and(|p| self.pat_binds_by_ref(p)) {
+                            if let Some(&x) = ast.list(args.exprs).first() {
+                                self.mark_root(x);
+                            }
+                        }
+                        if let Some(asm) = args.asm {
+                            for op in ast.list(asm.ops) {
+                                if let Some(out) = op.output {
+                                    self.mark_root(out);
+                                }
+                            }
+                        }
+                    }
+                }
                 _ => {}
+            }
+            match kind {
+                ExprKind::Block(bl, _) | ExprKind::Unsafe(bl) | ExprKind::Async(_, bl)
+                | ExprKind::ConstBlock(bl) | ExprKind::Loop(bl, _) | ExprKind::If(_, bl, _) => {
+                    blocks.insert(bl.0);
+                }
+                ExprKind::While(row) => {
+                    blocks.insert(ast.row(*row).body.0);
+                }
+                ExprKind::For(row) => {
+                    blocks.insert(ast.row(*row).body.0);
+                }
+                _ => {}
+            }
+        }
+        let mut pending: Vec<BlockId> = blocks.iter().map(|&bl| BlockId(bl)).collect();
+        while let Some(bl) = pending.pop() {
+            for stmt in ast.stmts(bl) {
+                if let Stmt::Let(row) = *stmt {
+                    let decl = ast.row(row);
+                    if let Some(init) = decl.init {
+                        if self.pat_binds_by_ref(decl.pat) {
+                            self.mark_root(init);
+                        }
+                    }
+                    if let Some(els) = decl.else_ {
+                        if blocks.insert(els.0) {
+                            pending.push(els);
+                        }
+                    }
+                }
             }
         }
         // locals captured by reference live in memory
@@ -2651,6 +2720,17 @@ impl<'a> Lcx<'a> {
         self.ret_val(v, t);
     }
 
+    /// Whether `d` is an impl's `Clone::clone` and its result type `t` is `TrivialClone`.
+    fn trivial_clone(&self, d: DefId, t: TyId) -> bool {
+        let tcx = &self.u.tcx;
+        let (Some(clone), Some(trivial)) = (tcx.lang_items.get(LangItem::Clone), tcx.lang_items.get(LangItem::TrivialClone)) else { return false };
+        let def = self.u.prog.def(d);
+        if def.kind != DefKind::AssocFn || self.u.prog.def(def.parent).kind != DefKind::Impl || tcx.impl_trait.get(&def.parent) != Some(&clone) || self.u.prog.name(d) != "clone" {
+            return false;
+        }
+        tcx.type_implements_trait(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), TraitRef { def_id: trivial, args: vec![GenericArg::Type(t)] }).must_apply_modulo_regions()
+    }
+
     fn clone_shim_fields(&mut self, pa: &Place, t: TyId, vi: u32, n: usize) -> Vec<(Val, TyId)> {
         // rustc_mir_transform/src/shim.rs:662-702: only initialized clones
         // participate in the unwind chain, in reverse initialization order.
@@ -3016,7 +3096,22 @@ impl<'a> Lcx<'a> {
                                 self.extend_ops.insert(*x);
                             }
                             let sc_mark = self.scope_temps.last().map_or(0, |v| v.len());
-                            let v = if self.unsized_ty(t) && self.is_place_expr(*e) {
+                            let place_else = if else_.is_some()
+                                && self.is_place_expr(*e)
+                                && !self.b.coerce(e.0).is_some()
+                                && self.pat_binds_by_ref(*pat)
+                                && !self.pat_moves_droppable(*pat)
+                            {
+                                self.want_mut = self.pat_binds_mut_ref(*pat);
+                                let (place, _) = self.lower_place(*e);
+                                self.want_mut = false;
+                                Some(place)
+                            } else {
+                                None
+                            };
+                            let v = if place_else.is_some() {
+                                self.unit()
+                            } else if self.unsized_ty(t) && self.is_place_expr(*e) {
                                 // A let-else slice initializer is a place, just like a match
                                 // scrutinee. Keep its fat pointer (including the length), rather
                                 // than loading an unsized value through only its data pointer.
@@ -3076,7 +3171,8 @@ impl<'a> Lcx<'a> {
                                 None => self.bind_pat(*pat, v, t),
                                 Some(eb) => {
                                     let fail = self.f.block();
-                                    let place = self.val_to_place(v);
+                                    let has_place = place_else.is_some();
+                                    let place = place_else.unwrap_or_else(|| self.val_to_place(v));
                                     // the initializer's temporaries get drop flags: the failing
                                     // path drops them before the else block (whose own exits must
                                     // not drop them again)
@@ -3105,7 +3201,7 @@ impl<'a> Lcx<'a> {
                                     self.switch(fail);
                                     // a value that did not match is dropped before the else block runs
                                     // (rustc: the scrutinee temporary ends with the failed match)
-                                    let owned = self.needs_drop_glue(t) && self.rvalue_rooted(*e);
+                                    let owned = !has_place && self.needs_drop_glue(t) && self.rvalue_rooted(*e);
                                     if owned {
                                         let a = self.place_addr(&place, t);
                                         self.drop_at(a, t);
@@ -3299,10 +3395,11 @@ impl<'a> Lcx<'a> {
         };
         let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), def, &args);
 
-        let addr = self.place_addr(&pl, pt);
+        // `&self`: the fat pointer when the place is unsized (`W<dyn Trait>`, `W<[T]>`)
+        let selfv = self.ref_to_place(&pl, pt);
         let self_t = self.u.tcx.tys.intern(TyKind::Ref(mutbl, pt, crate::types::RegionId::ERASED));
         let ret_t = self.u.tcx.tys.intern(TyKind::Ref(mutbl, target, crate::types::RegionId::ERASED));
-        let r = self.emit_instance(instance, vec![(Val::L(vec![addr]), self_t)], ret_t);
+        let r = self.emit_instance(instance, vec![(Val::L(selfv), self_t)], ret_t);
         let r = self.to_leaves(r, ret_t);
         if self.unsized_ty(target) {
             (Place::Regs(r), target)
@@ -5862,19 +5959,25 @@ impl<'a> Lcx<'a> {
 
     /// Assigns the parts of the value at `pl: t` to the assignee expression `a` (tuple, array,
     /// struct literal, `_`, `..` in a destructuring assignment; a place expression otherwise).
-    fn assign_parts(&mut self, a: ExprId, pl: &Place, t: TyId) {
+    /// Assigns the parts of the value at `pl` (type `t`) to assignee expression `a`. `src` is
+    /// None for a temporary (parts matched by `_` / `..` or not mentioned are dropped here),
+    /// Some(root) for a place (never dropped by the assignment; `root` is the local and field
+    /// path the place is in, when it is one, so a moved-out leaf clears that part's drop flag).
+    fn assign_parts(&mut self, a: ExprId, pl: &Place, t: TyId, src: Option<Option<(u32, Vec<(u32, u32)>)>>) {
         let ast = self.ast();
+        let temp = src.is_none();
+        let sub = |src: &Option<Option<(u32, Vec<(u32, u32)>)>>, vi: u32, fi: u32| src.as_ref().map(|r| r.as_ref().map(|(li, p)| { let mut p = p.clone(); p.push((vi, fi)); (*li, p) }));
         let is_rest = |x: ExprId| matches!(ast.expr(x).kind, ExprKind::Range(crate::ast::OptExprId::NONE, crate::ast::OptExprId::NONE, false));
         match &ast.expr(a).kind {
             ExprKind::Paren(x) if matches!(ast.expr(*x).kind, ExprKind::Range(crate::ast::OptExprId::NONE, crate::ast::OptExprId::NONE, false)) => {
-                if self.needs_drop_glue(t) {
+                if temp && self.needs_drop_glue(t) {
                     let ad = self.place_addr(pl, t);
                     self.drop_at(ad, t);
                 }
             }
-            ExprKind::Paren(x) => self.assign_parts(*x, pl, t),
+            ExprKind::Paren(x) => self.assign_parts(*x, pl, t, src),
             ExprKind::Underscore => {
-                if self.needs_drop_glue(t) {
+                if temp && self.needs_drop_glue(t) {
                     let ad = self.place_addr(pl, t);
                     self.drop_at(ad, t);
                 }
@@ -5901,10 +6004,10 @@ impl<'a> Lcx<'a> {
                     }
                     used[fi] = true;
                     let (fp, ft) = self.project(pl, t, 0, fi as u32);
-                    self.assign_parts(*x, &fp, ft);
+                    self.assign_parts(*x, &fp, ft, sub(&src, 0, fi as u32));
                 }
                 for fi in 0..m {
-                    if !used[fi] {
+                    if temp && !used[fi] {
                         let (fp, ft) = self.project(pl, t, 0, fi as u32);
                         if self.needs_drop_glue(ft) {
                             let ad = self.place_addr(&fp, ft);
@@ -5940,10 +6043,12 @@ impl<'a> Lcx<'a> {
                     }
                     used[fi] = true;
                     let ea = self.addr_add(base, (fi as u32 * stride) as i32);
-                    self.assign_parts(*x, &Place::Mem(ea, 0), et);
+                    // an array element is not a tracked field path: a leaf that would move a
+                    // droppable element out of a place is rejected by the move checker (E0508)
+                    self.assign_parts(*x, &Place::Mem(ea, 0), et, src.as_ref().map(|_| None));
                 }
                 for fi in 0..m {
-                    if !used[fi] && self.needs_drop_glue(et) {
+                    if temp && !used[fi] && self.needs_drop_glue(et) {
                         let ea = self.addr_add(base, (fi as u32 * stride) as i32);
                         self.drop_at(ea, et);
                     }
@@ -5975,10 +6080,10 @@ impl<'a> Lcx<'a> {
                     }
                     used[fi] = true;
                     let (fp, ft) = self.project(pl, t, vi, fi as u32);
-                    self.assign_parts(*x, &fp, ft);
+                    self.assign_parts(*x, &fp, ft, sub(&src, vi, fi as u32));
                 }
                 for fi in 0..nf {
-                    if !used[fi] {
+                    if temp && !used[fi] {
                         let (fp, ft) = self.project(pl, t, vi, fi as u32);
                         if self.needs_drop_glue(ft) {
                             let ad = self.place_addr(&fp, ft);
@@ -6011,11 +6116,11 @@ impl<'a> Lcx<'a> {
                             used[fi as usize] = true;
                         }
                         let (fp, ft) = self.project(pl, t, vi, fi);
-                        self.assign_parts(fe.expr, &fp, ft);
+                        self.assign_parts(fe.expr, &fp, ft, sub(&src, vi, fi));
                     }
                 }
                 for fi in 0..nf {
-                    if !used[fi] {
+                    if temp && !used[fi] {
                         let (fp, ft) = self.project(pl, t, vi, fi as u32);
                         if self.needs_drop_glue(ft) {
                             let ad = self.place_addr(&fp, ft);
@@ -6026,6 +6131,13 @@ impl<'a> Lcx<'a> {
             }
             _ => {
                 let v = self.read_place(pl, t);
+                // moved out of a place: that part of the root local is not dropped again
+                if let Some(Some((li, path))) = &src {
+                    if self.needs_drop_glue(t) {
+                        let (li, path) = (*li, path.clone());
+                        self.moved_field(li, &path);
+                    }
+                }
                 self.assign_to(a, v);
             }
         }
@@ -6443,11 +6555,21 @@ impl<'a> Lcx<'a> {
                 if is_assignee_pattern(self.ast(), *a) {
                     // destructuring assignment (rustc desugars `(a, b) = e` to
                     // `{ let (x, y) = e; a = x; b = y; }`): the value first, then each part is
-                    // assigned left to right; parts matched by `_` / `..` drop with the value
+                    // assigned left to right. A place `e` is matched in place, as the `let`
+                    // initializer is: parts matched by `_` / `..` or not mentioned neither move
+                    // nor drop, a leaf assignee moves its part out (tracked per field through
+                    // the root local's drop flags). Only a temporary drops its unmatched parts.
+                    if self.is_place_expr(*b) && self.b.coerce(b.0).is_none() {
+                        self.pos = self.ast().expr(*b).lo;
+                        let (pl, bt) = self.lower_place(*b);
+                        let root = self.field_move_path(*b);
+                        self.assign_parts(*a, &pl, bt, Some(root));
+                        return self.unit();
+                    }
                     let bt = self.body_ty(*b);
                     let v = self.lower_expr(*b);
                     let pl = self.val_to_place(v);
-                    self.assign_parts(*a, &pl, bt);
+                    self.assign_parts(*a, &pl, bt, None);
                     return self.unit();
                 }
                 let at = self.body_ty(*a);
@@ -6461,14 +6583,15 @@ impl<'a> Lcx<'a> {
                 self.want_mut = true;
                 let (pl, pt) = self.lower_place(*a);
                 self.want_mut = false;
-                let addr = self.place_addr(&pl, pt);
+                // `&mut self`: the fat pointer when the place is unsized
+                let selfv = self.ref_to_place(&pl, pt);
                 let bt = self.body_ty(*b);
                 let bt = m.args.get(1).copied().unwrap_or(bt);
                 let bv = self.lower_expr_coerced(*b, bt);
                 let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), m.def, &m.args);
 
                 let rt = self.u.tcx.tys.intern(TyKind::Ref(true, pt, crate::types::RegionId::ERASED));
-                self.emit_instance(instance, vec![(Val::L(vec![addr]), rt), (bv, bt)], t);
+                self.emit_instance(instance, vec![(Val::L(selfv), rt), (bv, bt)], t);
                 self.unit()
             }
             ExprKind::AssignOp(op, a, b) => {
@@ -7482,7 +7605,19 @@ impl<'a> Lcx<'a> {
             }
             ExprKind::Index(a, i) => {
                 let derefs = self.b.index_derefs(e.0);
-                let (mut pl, mut pt) = self.lower_place(*a);
+                // `CONST[i]` read: the constant's own immutable allocation (rustc reads a promoted
+                // constant's memory), not a copy of the whole array on the stack per use
+                let promoted = if derefs == 0 && !self.want_mut && matches!(self.ast().expr(strip_paren(self.ast(), *a)).kind, ExprKind::Path(_))
+                    && matches!(self.kind(self.body_ty(*a)), TyKind::Array(..)) && self.promotable(*a)
+                    && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), self.body_ty(*a)) {
+                    self.promote_rvalue(*a, true).map(|p| (Place::Mem(p, 0), self.body_ty(*a)))
+                } else {
+                    None
+                };
+                let (mut pl, mut pt) = match promoted {
+                    Some(x) => x,
+                    None => self.lower_place(*a),
+                };
                 for k in 0..derefs {
                     let (a2, b2) = self.deref_place(e.0, k, pl, pt);
                     pl = a2;
@@ -7526,10 +7661,12 @@ impl<'a> Lcx<'a> {
                 let el = self.layout(elem);
                 let stride = crate::layout::round_up(el.size, el.align);
                 let s = self.iconst(stride as i64);
+                // address arithmetic at the pointer's width (wasm32: i32, as rustc's)
+                let pt = self.ptr_ty();
                 let off = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Mul, U64, off, iv[0], s));
+                self.emit(Inst::IBin(IOp::Mul, pt, off, iv[0], s));
                 let addr = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Add, U64, addr, base, off));
+                self.emit(Inst::IBin(IOp::Add, pt, addr, base, off));
                 (Place::Mem(addr, 0), elem)
             }
             _ => {
@@ -7947,6 +8084,11 @@ impl<'a> Lcx<'a> {
 
     fn wide_signed(&self, t: TyId) -> bool {
         matches!(self.u.tcx.tys.kind(t), TyKind::Int(Prim::I128))
+    }
+
+    /// The unsigned integer type of an address (u64; wasm32: u32, its arithmetic wraps there).
+    fn ptr_ty(&self) -> IntTy {
+        if self.pb() == 4 { relax_backend::rir::U32 } else { U64 }
     }
 
     fn ibin(&mut self, op: IOp, signed: bool, a: VReg, b: VReg) -> VReg {
@@ -9790,6 +9932,14 @@ impl<'a> Lcx<'a> {
                 }
                 self.emit_call(Callee::Fn(self.u.instance_fn_id(instance)), vals, ret)
             }
+            InstanceKind::Item(d) if vals.len() == 1 && self.trivial_clone(d, ret) => {
+                // `Clone::clone` of a `TrivialClone` type is a bitwise copy by that trait's contract
+                // (core relies on it: slice clone_from_slice / to_vec copy such elements): a
+                // derived clone's `Option<Copy>` fields read as one copy, not a match per field
+                // (rustc gets there by inlining the match and folding it through undef; GAPB2)
+                let p = self.to_leaves(vals[0].0.clone(), vals[0].1);
+                self.read_place(&Place::Mem(p[0], 0), ret)
+            }
             InstanceKind::Item(d) => {
                 let sig = self.u.tcx.fn_item_sig(&self.u.prog, d).expect("item signature");
                 let foreign = self.u.prog.def(d).kind == DefKind::ForeignFn;
@@ -10242,6 +10392,11 @@ impl<'a> Lcx<'a> {
                 };
                 Val::L(vec![self.iconst(c as i64)])
             }
+            // Primitive scalar values have no padding or inactive enum storage.
+            "is_primitive_scalar" => {
+                let c = g0.is_some_and(|g| matches!(self.kind_ref(g), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char));
+                Val::L(vec![self.iconst(c as i64)])
+            }
             // `T: Freeze` of this instance (no UnsafeCell inline: std's sort keeps copies)
             "is_freeze" => {
                 let c = match g0 {
@@ -10532,10 +10687,12 @@ impl<'a> Lcx<'a> {
                 let n = leaf(self, 1);
                 let (sz, al) = elem(self);
                 let stride = crate::layout::round_up(sz, al) as i64;
+                // address arithmetic at the pointer's width (wasm32: i32, as rustc's)
+                let pt = self.ptr_ty();
                 let off = self.f.vreg(Cls::I);
-                self.emit(Inst::IBinI(IOp::Mul, U64, off, n[0], stride));
+                self.emit(Inst::IBinI(IOp::Mul, pt, off, n[0], stride));
                 let d = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Add, U64, d, p[0], off));
+                self.emit(Inst::IBin(IOp::Add, pt, d, p[0], off));
                 Val::L(vec![d])
             }
             // `p - n * stride` (core's in-bounds `sub`)
@@ -10545,10 +10702,11 @@ impl<'a> Lcx<'a> {
                 let (sz, al) = elem(self);
                 let stride = crate::layout::round_up(sz, al) as i64;
                 let k = self.iconst(stride);
+                let pt = self.ptr_ty();
                 let off = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Mul, U64, off, n[0], k));
+                self.emit(Inst::IBin(IOp::Mul, pt, off, n[0], k));
                 let d = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Sub, U64, d, p[0], off));
+                self.emit(Inst::IBin(IOp::Sub, pt, d, p[0], off));
                 Val::L(vec![d])
             }
             // wrapping element offset (two's complement: the same instructions as ptr_add)
@@ -10557,10 +10715,11 @@ impl<'a> Lcx<'a> {
                 let n = leaf(self, 1);
                 let (sz, al) = elem(self);
                 let stride = crate::layout::round_up(sz, al) as i64;
+                let pt = self.ptr_ty();
                 let off = self.f.vreg(Cls::I);
-                self.emit(Inst::IBinI(IOp::Mul, U64, off, n[0], stride));
+                self.emit(Inst::IBinI(IOp::Mul, pt, off, n[0], stride));
                 let d = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Add, U64, d, p[0], off));
+                self.emit(Inst::IBin(IOp::Add, pt, d, p[0], off));
                 Val::L(vec![d])
             }
             // (p - origin) / stride, exact by contract (signed)
@@ -14597,6 +14756,11 @@ pub(crate) fn intern_lazy_rt(u: &mut Unit, name: &str) -> Option<relax_backend::
         "divrem128" => { let f: rt_fn_ty!(fn(u64, u64, u64, u64, u64) -> WideRet) = rt_divrem128; ("divrem128", f as usize as u64) }
         // the loop counters' helper (a trampoline in the code area)
         "loop_hot" => return Some(crate::jit::loop_hot_sym(u)),
+        // the combined sin/cos routine the optimiser pairs sin and cos calls into (note_sincos)
+        "__sincos_stret" | "__sincosf_stret" | "relax_sincos_pair" | "relax_sincosf_pair" => {
+            let k = ["__sincos_stret", "__sincosf_stret", "relax_sincos_pair", "relax_sincosf_pair"].into_iter().find(|k| *k == name)?;
+            (k, crate::jit::sincos_addr(k)?)
+        }
         _ => return None,
     };
     Some(u.syms.intern(crate::syms::SymKind::Rt(kind), addr))

@@ -210,6 +210,16 @@ pub fn current_thread() -> usize {
 /// An owned thread: joining consumes it; dropping it detaches.
 pub struct NativeThread(pthread_t);
 
+impl NativeThread {
+    pub fn raw(&self) -> usize {
+        self.0
+    }
+    pub fn into_raw(self) -> usize {
+        let t = core::mem::ManuallyDrop::new(self);
+        t.0
+    }
+}
+
 struct StartArg {
     f: fn(*mut u8),
     arg: *mut u8,
@@ -219,6 +229,7 @@ struct StartArg {
 }
 
 extern "C" {
+    fn __relax_on_program_stack(f: extern "C" fn(*mut u8), arg: *mut u8);
     fn __relax_domain_base() -> u64;
     fn __relax_domain_enter(base: u64, token: u64);
     fn __relax_domain_reserve(base: u64) -> u64;
@@ -228,9 +239,15 @@ extern "C" {
 extern "C" fn posix_thread_start(p: *mut c_void) -> *mut c_void {
     // first, before anything that may name a static
     unsafe { __relax_domain_enter((*(p as *const StartArg)).domain, (*(p as *const StartArg)).token) };
+    // the thread's body runs on a program stack (a large lazily committed reservation with a guard;
+    // relax_base::stack::on_program_stack)
+    unsafe { __relax_on_program_stack(start_body, p as *mut u8) };
+    core::ptr::null_mut()
+}
+
+extern "C" fn start_body(p: *mut u8) {
     let a = unsafe { alloc::boxed::Box::from_raw(p as *mut StartArg) };
     (a.f)(a.arg);
-    core::ptr::null_mut()
 }
 
 /// Starts a thread running `f(arg)` with a stack of at least `stack_size` bytes; Err(os error).

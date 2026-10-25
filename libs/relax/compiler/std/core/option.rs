@@ -14,6 +14,9 @@ pub enum Option<T> {
 
 pub use Option::{None, Some};
 
+// library/core/src/option.rs:2290-2295 (const effects are outside this port)
+unsafe impl<T: crate::clone::TrivialClone> crate::clone::TrivialClone for Option<T> {}
+
 impl<T> Option<T> {
     pub const fn is_some(&self) -> bool {
         matches!(*self, Some(_))
@@ -344,6 +347,7 @@ impl<'a, T> From<&'a Option<T>> for Option<&'a T> {
 
 // ---------------------------------------------------------------- iterators
 
+#[derive(Debug)]
 pub struct Iter<'a, T> {
     inner: Option<&'a T>,
 }
@@ -380,6 +384,7 @@ impl<'a, T> Clone for Iter<'a, T> {
 impl<'a, T> ExactSizeIterator for Iter<'a, T> {}
 impl<'a, T> crate::iter::FusedIterator for Iter<'a, T> {}
 
+#[derive(Debug)]
 pub struct IterMut<'a, T> {
     pub(crate) inner: Option<&'a mut T>,
 }
@@ -404,6 +409,7 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
 impl<'a, T> ExactSizeIterator for IterMut<'a, T> {}
 impl<'a, T> crate::iter::FusedIterator for IterMut<'a, T> {}
 
+#[derive(Clone, Debug)]
 pub struct IntoIter<T> {
     inner: Option<T>,
 }

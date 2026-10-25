@@ -4218,6 +4218,23 @@ impl<'a> Gen<'a> {
             Inst::Call(c, args, rets) => self.call(c, args, rets),
             // a slot copied onto its own storage (frame::slot_addr_positions): nothing moves
             Inst::Copy(dst, src, _) if self.slot_pos[dst.0 as usize] != i64::MIN && self.slot_pos[dst.0 as usize] == self.slot_pos[src.0 as usize] => {}
+            // overlapping bytes of the frame (frame::copy_overlap; a verify build fails on it,
+            // compile_freq): memmove order, each piece loaded whole before it is stored
+            Inst::Copy(dst, src, size) if crate::frame::copy_overlap(&self.slot_pos, *dst, *src, *size) != 0 => {
+                let delta = crate::frame::copy_overlap(&self.slot_pos, *dst, *src, *size);
+                let rd = self.use_i(*dst, S0);
+                let rs = self.use_i(*src, S1);
+                for (o, w) in crate::frame::copy_pieces(*size, 0, delta > 0) {
+                    let (ld, st) = match w {
+                        8 => (LDRX, STRX),
+                        4 => (LDRW, STRW),
+                        2 => (LDRH, STRH),
+                        _ => (LDRB, STRB),
+                    };
+                    self.a.ldst(ld, w as u32, IP0, rs, o as i64);
+                    self.a.ldst(st, w as u32, IP0, rd, o as i64);
+                }
+            }
             Inst::Copy(dst, src, size) if *size > 256 => {
                 // x8 = dst, x17 = src, x16 = 16-byte chunks: ldp/stp post-index loop
                 let rd = self.use_i(*dst, S0);
@@ -4306,19 +4323,24 @@ impl<'a> Gen<'a> {
                     o += 1;
                 }
             }
-            Inst::Coverage { word, mask } => {
+            Inst::Coverage { word, mask, disabled } => {
                 // Reserved scratch registers: coverage adds no program live
                 // ranges or spills. The NOP is patched only after this bit
                 // has been observed set; an in-flight old probe is harmless.
                 assert!(mask.is_power_of_two());
                 let at = (self.a.pos() * 4) as u32;
                 self.a.e(0xD503_201F);
+                self.tls_block_ip0();
+                self.ldr_reloc(IP1, Reloc::Sym(*disabled));
+                self.a.e(0xF860_6800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
+                let skip = self.a.cbnz(IP0);
                 self.a.mov_imm64_fixed(IP0, *word);
                 self.a.mov_imm(IP1, *mask as i64);
                 // stset x17, [x16] (the unused old value goes to xzr).
                 self.a.e(0xF820_3000 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | ZR as u32);
-                assert_eq!(self.a.pos() * 4, at as usize + 28);
-                self.relocs.push(RelocAt { at, kind: RelocKind::A64CoverageBit(mask.trailing_zeros() as u8), target: Reloc::Value(*word) });
+                let end = self.a.pos();
+                self.a.patch(skip, end);
+                self.relocs.push(RelocAt { at, kind: RelocKind::A64CoverageBit { bit: mask.trailing_zeros() as u8, words: end as u32 - at / 4 }, target: Reloc::Value(*word) });
             }
             Inst::AtomicLoad(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..) => self.atomic(i),
             Inst::TlsAddr(d, off) => self.tls_addr(*d, *off),
@@ -5510,6 +5532,13 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     BRANCH_RANGE.with(|c| c.set(false));
     TBZ_RANGE.with(|c| c.set(false));
     g.gen(options);
+    // a copy between overlapping frame bytes is a bug of a pass or of the frame layout: a build
+    // error where passes are verified (it is emitted in memmove order otherwise)
+    if crate::rir::verify_passes_on() {
+        if let Some(e) = crate::frame::overlapping_copy_at(g.f, &g.slot_pos) {
+            return Err(format!("arm64 frame layout: {}", e));
+        }
+    }
     if TBZ_RANGE.with(|c| c.replace(false)) && g.tbz && !BRANCH_RANGE.with(|c| c.get()) {
         // a tbz past +-32 KB: emit again with tst + b.cond (from the same allocation)
         tbz = false;

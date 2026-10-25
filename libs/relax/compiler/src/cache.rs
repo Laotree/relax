@@ -346,7 +346,7 @@ pub fn warm_summary() -> String {
         s.push_str(&format!("; fresh builds over the stored entry (none/baseline/O1/O2/O3): O3 {}, O2 {}", over(RETIER_O3_OVER), over(RETIER_O2_OVER)));
     }
     if g(REC_UNVERIFIED) + g(SPECV_LATE) > 0 {
-        s.push_str(&format!("; SPEC-V: {} records of unverified lowerings, {} compiled slots below O3 verified after their build", k(g(REC_UNVERIFIED)), k(g(SPECV_LATE))));
+        s.push_str(&format!("; SPEC-V: {} records of unverified lowerings, {} compiled slots below O3 verified after their build, {} base slots ran their twins' code until their own build (none compiled on a program thread for it), {} of them have their own code now, {} callees built ahead of a replacement's install", k(g(REC_UNVERIFIED)), k(g(SPECV_LATE)), k(crate::jit::SPECV_BORROWS.load(std::sync::atomic::Ordering::Relaxed)), k(crate::jit::SPECV_BORROWS_OWN.load(std::sync::atomic::Ordering::Relaxed)), k(crate::jit::SPECV_PREBUILT.load(std::sync::atomic::Ordering::Relaxed))));
     }
     if g(O3_QUEUED) + g(O3_UNVERIFIED) + g(O3_FRAME) + g(O3_SPEC) > 0 {
         s.push_str(&format!("; O3 installs kept as entries: {} queued (written {}, same as stored {}, not encodable {}, stale {}, dropped {}; {} deferred records waiting, last drain {} with {}), not kept: unverified {}, frame too big {}, speculative/inspect {}; O2 entries written {}",
@@ -1147,6 +1147,11 @@ impl Cache {
         self.index.get(&key).copied().or_else(|| self.mapped_index.as_ref()?.get(key))
     }
     fn has_index(&self, key: &u128) -> bool { self.index_at(*key).is_some() }
+
+    /// Whether slot `id` has a stored code entry (any tier): it ran in an earlier session.
+    pub(crate) fn has_stored_entry(&mut self, u: &Unit, id: u32) -> bool {
+        self.has_code_entries() && self.slot_key(u, id).is_some_and(|k| self.entry_tier(k).is_some())
+    }
 
     /// The tier of code entry `key` as stored (its payload's tier byte).
     fn entry_tier(&self, key: u128) -> Option<u8> {
@@ -2203,7 +2208,10 @@ impl Cache {
     /// in the same order gives every reloc to one block (a slice iterator's pointer and its end
     /// pointer) the one block, not a fresh block per reloc.
     fn enc_sym(&mut self, u: &Unit, s: Sym, e: &mut E, rw: &mut Vec<u32>) -> Option<()> {
-        let k = u.syms.kind(s.id)?;
+        let Some(k) = u.syms.kind(s.id) else {
+            self.why("symbol without a kind");
+            return None;
+        };
         match k {
             SymKind::Rt(n) => {
                 e.u8(1);
@@ -2230,7 +2238,11 @@ impl Cache {
             }
             SymKind::Foreign(_) => {
                 // by its definition: the address comes from the same lookup a fresh compile makes
-                let d = self.canon_foreign(u, foreign_def_of(u, s)?);
+                let Some(d) = foreign_def_of(u, s) else {
+                    self.why("foreign symbol without a definition");
+                    return None;
+                };
+                let d = self.canon_foreign(u, d);
                 e.u8(4);
                 let mut cr = Vec::new();
                 self.enc_def(u, d, e, &mut cr);
@@ -2784,6 +2796,7 @@ impl Cache {
                 if trace_on() {
                     let w = match r {
                         Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => format!("slot/thunk key {}", crate::syms::stable_fn_name(u, *x)),
+                        Reloc::Sym(s) => format!("{} ({})", self.last_why, crate::syms::describe(u, *s)),
                         _ => self.last_why.to_string(),
                     };
                     trace_lookup(u, id, &format!("unstorable:{}", w));
@@ -3814,7 +3827,8 @@ pub fn write_trace() {
     if let Ok(p) = std::env::var("MAKEPAD_RUN_CACHE_TRACE") {
         // ({pid}: one file per process -- a program's build scripts run under the same env)
         let p = p.replace("{pid}", &std::process::id().to_string());
-        if let Some(t) = TRACE.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        // (the whole trace each time: the quit write and the exit both write it)
+        if let Some(t) = TRACE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let _ = std::fs::write(p, t);
         }
     }
@@ -3959,7 +3973,7 @@ fn kind_code(k: RelocKind) -> u8 {
         RelocKind::A64LdrLo12X => 4,
         RelocKind::Imm32 => 5,
         RelocKind::A64MovzMovk => 6,
-        RelocKind::A64CoverageBit(_) => unreachable!("coverage disables the code cache"),
+        RelocKind::A64CoverageBit { .. } => unreachable!("coverage disables the code cache"),
         RelocKind::X64Branch32 => 7,
         RelocKind::A64Branch26 => 8,
     }
