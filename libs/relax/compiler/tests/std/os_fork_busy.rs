@@ -50,10 +50,27 @@ fn busy(id: usize) {
     }
 }
 
-/// The code the child runs between fork and exec: fresh per instantiation.
+extern "C" {
+    fn getppid() -> i32;
+    fn getpid() -> i32;
+    #[cfg(target_os = "linux")]
+    fn prctl(op: i32, a: usize, b: usize, c: usize, d: usize) -> i32;
+}
+
+/// The code the child runs between fork and exec: fresh per instantiation; C calls as the AI
+/// hub's (PR_SET_PDEATHSIG, then a parent check).
 #[inline(never)]
 fn in_child<const K: usize>() -> std::io::Result<()> {
     SINK.fetch_add(K, Ordering::Relaxed);
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if prctl(1, 9, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    if unsafe { getppid() == getpid() } {
+        return Err(std::io::Error::from_raw_os_error(3));
+    }
     Ok(())
 }
 
