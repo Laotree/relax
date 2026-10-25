@@ -1671,10 +1671,24 @@ pub(crate) extern "C" fn relax_precompile(addr: u64) -> u64 {
         }
         // the lowered body's callees (before inlining: an inlined callee's own calls are among
         // its callees') and its call / fn-address sites
-        let next: Vec<u32> = owner::publish(|| unsafe {
+        let mut next: Vec<u32> = owner::publish(|| unsafe {
             let f = &(&*up).fns[id as usize];
             f.calls.iter().chain(f.rir_refs.iter()).copied().collect()
         });
+        if next.is_empty() {
+            // code linked from the disk cache or the startup image has no lowered body here: its
+            // cache entry's relocations name what it calls
+            next = owner::call(owner::Class::Program, || unsafe {
+                cache_lookup(up, id).map_or(Vec::new(), |c| {
+                    c.2.iter()
+                        .filter_map(|r| match r.target {
+                            relax_backend::rir::Reloc::Slot(c) | relax_backend::rir::Reloc::Thunk(c) | relax_backend::rir::Reloc::Call(c) => Some(c),
+                            _ => None,
+                        })
+                        .collect()
+                })
+            });
+        }
         todo.extend(next.into_iter().filter(|c| !seen.contains(c)));
     }
     built
