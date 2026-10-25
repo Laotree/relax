@@ -3814,12 +3814,37 @@ impl Unit {
     }
 
     pub(crate) fn emit_linked(&self, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Result<u64, String> {
-        let at = bump(&self.code_next, code.len() as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+        let at = self.code_at(code.len() as u64);
         let mut c = code.to_vec();
         self.link_code(&mut c, at, relocs)?;
         unsafe { os::mem::write_code(at, &c) };
         crate::coverage::installed(self, at, relocs);
         Ok(at)
+    }
+
+    /// Where the next body of `len` bytes goes: the shared bump. ARMIPC A/B knobs (MAKEPAD_RUN_OPT):
+    /// `+o3area` puts O3 (and guarded) bodies into their own 4 MB chunks of the bump, so hot code
+    /// is dense; `+falign64` aligns O3 bodies to 64 bytes (a cache line / fetch block).
+    fn code_at(&self, len: u64) -> u64 {
+        let end = self.exec_base + self.exec_size - os::mem::CODE_TAIL;
+        let hot = code_as_now().is_some_and(|k| k.tier == tier::O3 || k.tier == tier::GUARDED);
+        let align = if hot && relax_backend::stats::opt_env_off("+falign64") { 64 } else { 16 };
+        if !hot || !relax_backend::stats::opt_env_off("+o3area") {
+            return bump(&self.code_next, len, align, end, "out of code memory");
+        }
+        const CHUNK: u64 = 4 << 20;
+        static AREA: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+        let mut a = AREA.lock().unwrap_or_else(|e| e.into_inner());
+        let at = (a.0 + align - 1) / align * align;
+        if a.0 == 0 || at + len > a.1 {
+            let size = CHUNK.max((len + 4095) & !4095);
+            let c = bump(&self.code_next, size, 1 << 14, end, "out of code memory");
+            *a = (c, c + size);
+            a.0 = c + len;
+            return c;
+        }
+        a.0 = at + len;
+        at
     }
 
     /// `emit_linked` into group `g`'s own pages (invalid.rs), or bump-shared code for None.
@@ -16851,6 +16876,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 let at = if blob {
                     u.emit_or_redirect(&code, &relocs, "O3").expect("O3 interpreted code installs")
                 } else {
+                    let _as = code_as(CodeKind::new(if speculative { tier::GUARDED } else { tier::O3 }, origin::FRESH));
                     u.emit_grouped(o3_group, &code, &relocs).expect("O3 code links (checked)")
                 };
                 if !blob {
