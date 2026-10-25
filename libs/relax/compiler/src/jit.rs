@@ -15266,7 +15266,7 @@ fn rt_hot(slot: u64) -> u64 {
                     // ARMIPC A/B knob +park: once the sampler has settled (no compile / install
                     // for SETTLED_AFTER), a lukewarm slot stops counting: its calls go straight to
                     // its code (no count stub). Measures what the counting costs in steady state.
-                    if armipc_knob("+park") && SAMPLER_SETTLED.load(Ordering::Relaxed) {
+                    if armipc_knob("+park") && SAMPLER_SETTLED.load(Ordering::Relaxed) && !(armipc_knob("+settleo2") && u.fns[slot as usize].base_code.load(Ordering::Relaxed)) {
                         if (*rec.add(3)).compare_exchange(T_COUNTING, T_PARKED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                             let _ = s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
                         }
@@ -15276,7 +15276,8 @@ fn rt_hot(slot: u64) -> u64 {
                     // running (a quarter of the threshold's cost, decayed) gets its O2 build: the
                     // cache's entry then links optimised code for it
                     let cost = (*rec.add(9)).load(Ordering::Relaxed);
-                    if cost >= threshold / 4 {
+                    // (ARMIPC knob +settleo2: once settled, any baseline code still being called)
+                    if cost >= threshold / 4 || armipc_knob("+settleo2") && SAMPLER_SETTLED.load(Ordering::Relaxed) {
                         note_slow_base(u, slot as u32);
                     }
                     crate::inspect::tierlog::note(slot as u32, crate::inspect::tierlog::ev::CHECK, 0, cost, code);
