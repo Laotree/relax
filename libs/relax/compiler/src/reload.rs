@@ -3432,23 +3432,23 @@ pub fn domain_stopping(id: u32) {
 }
 
 pub(crate) fn domain_loaded(inputs: Option<Inputs>) {
-    *DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner()) = DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).take();
+    // the first domain of a process that restarted into a rebuilt makepad gets the state the
+    // previous process left (MAKEPAD_RUN_RESTORE, read once)
+    static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    let mut restored = DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if FIRST.swap(false, std::sync::atomic::Ordering::AcqRel) && restored.is_none() {
+        if let Some(path) = std::env::var_os("MAKEPAD_RUN_RESTORE") {
+            let _k = crate::zone_alloc::kept();
+            restored = std::fs::read_to_string(&path).ok();
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    *DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner()) = restored;
     *DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = inputs;
     DOMAIN_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
     DOMAIN_LOADING.store(false, std::sync::atomic::Ordering::Release);
 }
 
-fn restart_domain(reason: String) -> bool {
-    if crate::run::app_domain().is_none() { return false; }
-    *RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = reason;
-    if RESTART_SUPPORTED.load(std::sync::atomic::Ordering::SeqCst) {
-        RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
-        wake_program();
-    } else if let Err(e) = crate::run::relaunch() {
-        eprintln!("makepad live: relaunch: {e}");
-    }
-    true
-}
 
 pub extern "C" fn __relax_live_edit_enabled() -> bool {
     crate::layout::LIVE_SESSION.load(std::sync::atomic::Ordering::Relaxed)
@@ -3517,6 +3517,8 @@ pub extern "C" fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize {
 /// A directly running program writes MAKEPAD_RUN_RESTORE and replaces its process as before.
 pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
     let st = unsafe { if state.is_null() { &[][..] } else { std::slice::from_raw_parts(state, len) } };
+    // a rebuilt makepad waits: the process restarts into it (or this returns, said why)
+    if host::restart_now(st) { return; }
     if crate::domain::current_app_domain().is_some() && crate::domain::current_app_domain() == crate::run::app_domain() {
         *DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(String::from_utf8_lossy(st).into_owned());
         RESTART_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -3539,6 +3541,9 @@ pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
         // the run's end as at exit: compiles stop and this run's code goes into the disk cache,
         // so the restarted run links it instead of compiling it again (exec skips the exit handlers)
         crate::run::summary("restart");
+        // a restart is a clean end of this process (its transcript is not kept)
+        crate::tui::exit_code(0);
+        crate::tui::finish(false);
         eprintln!("makepad live: restarting with the program's state ({})", RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()));
         let t0 = RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed);
         let e = std::process::Command::new(exe).args(&args[1..]).env("MAKEPAD_RUN_RESTORE", &path).env("MAKEPAD_RUN_RESTART_T0", t0.to_string()).exec();
@@ -3677,10 +3682,15 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
     back
 }
 
-/// MAKEPAD_RUN_AUTO_RELAUNCH=1: a change that cannot apply live relaunches the app domain at once
-/// (the old default). Off: it waits for `session relaunch`.
-fn auto_relaunch() -> bool {
-    std::env::var("MAKEPAD_RUN_AUTO_RELAUNCH").is_ok_and(|v| v == "1")
+/// An edit that needs a restart: makepad restarts for real into a current binary (host::request;
+/// cargo's check is a no-op when makepad is up to date). Where this run cannot restart itself
+/// (no cargo-built loader, Windows) the edit waits for `session relaunch`.
+fn restart_for_edit(what: &str, lines: &[String], inputs: &Inputs) {
+    let why = format!("{}: {}", what, lines.first().cloned().unwrap_or_default());
+    if let Err(e) = host::request(format!("{why} (needs a restart)"), inputs.process_paths()) {
+        note_restart_pending(&why);
+        eprintln!("makepad live: {what}: restart to apply (reasons below); the app keeps running the previous code -- `makepad inspect <app> session relaunch` applies it ({e})");
+    }
 }
 
 /// Edits waiting for a relaunch (`session` in inspect lists them).
@@ -4084,6 +4094,9 @@ pub extern "C" fn __relax_live_stream(p: *const u8, n: usize, t: *const u8, len:
 #[path = "reload_inputs.rs"]
 mod inputs;
 pub use inputs::Inputs;
+#[path = "reload_host.rs"]
+pub mod host;
+pub use host::set_loader_package;
 
 pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
     let session = unsafe { crate::jit::unit_session(up) };
@@ -4119,6 +4132,7 @@ fn gate_note(g: u8) {
 }
 
 unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
+    inputs.add_runner();
     let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
     // (path, running file index, last stamp)
     // the program's own source files (not std, registry or git dependencies), loaded so far
@@ -4187,6 +4201,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             revision = latest;
             if let Some(next) = DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 inputs = next;
+                inputs.add_runner();
             }
             let loaded = crate::owner::call_quick(crate::owner::Class::Program, || own_files(&*up));
             files = inputs.paths.iter().map(|(p, (s, _))| (p.clone(), u32::MAX, *s)).collect();
@@ -4258,7 +4273,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 log_edit(&f.0, &o, f.2.map(|s| s.0), seen);
                 match o.rung {
                     Rung::Refuse => eprintln!("makepad live: {}: NOT applied (errors below); the app runs the previous code", f.0),
-                    _ => eprintln!("makepad live: {}: needs a restart (reasons below); the app runs the previous code", f.0),
+                    _ => restart_for_edit(&f.0, &o.lines, &inputs),
                 }
                 for l in &o.lines { eprintln!("makepad live:   {}", l); }
                 patch_refused_event(&f.0, o.rung == Rung::Refuse, &o.lines);
@@ -4360,11 +4375,19 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 .then_some("sources outside the loaded program changed")
         });
         if let Some(reason) = reason {
-            if auto_relaunch() && !inputs.host_restart_required(changed.iter().map(|&k| files[k].0.as_str())) && restart_domain(reason.to_string()) {
-                eprintln!("makepad live: {reason}; relaunching the app domain (window kept)");
-                restart_required = true;
-                stalled.clear();
-                continue;
+            // a change the running process cannot take: makepad rebuilds itself in the background
+            // and restarts into the new binary; the app keeps running (and patching) meanwhile
+            let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
+            // the last two path parts say which crate and file
+            let short = |p: &str| -> String { let v: Vec<&str> = p.rsplit('/').take(2).collect(); v.into_iter().rev().collect::<Vec<_>>().join("/") };
+            let names: Vec<String> = changed.iter().take(3).map(|&k| short(&files[k].0)).collect();
+            let why = format!("{} {what} changed ({}{}): {reason}", changed.len(), names.join(", "), if changed.len() > 3 { ", ..." } else { "" });
+            match host::request(why, inputs.process_paths()) {
+                Ok(()) => {
+                    for &k in &changed { files[k].2 = stamp(&files[k].0); stalled.remove(&k); }
+                    continue;
+                }
+                Err(e) => eprintln!("makepad live: cannot rebuild and restart makepad here: {e}"),
             }
             let package = std::env::var("MAKEPAD_RUN_PACKAGE").unwrap_or_else(|_| "<pkg>".into());
             let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
@@ -4457,23 +4480,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 o.ms.iter().sum::<f64>()
             ),
             Rung::Refuse => eprintln!("makepad live: {}: NOT applied (errors below); the app runs the previous code", what),
-            // a change that cannot apply live never relaunches on its own (a relaunch lost the
-            // user's session): the old code keeps running until a relaunch is asked for
-            // (`session relaunch`, or MAKEPAD_RUN_AUTO_RELAUNCH=1)
-            Rung::Restart if auto_relaunch() && restart_domain(format!("{}: {}", what, o.lines.first().cloned().unwrap_or_default())) => {
-                restart_required = true;
-                eprintln!("makepad live: {what}: relaunching the app domain (window kept)");
-            }
-            Rung::Restart if auto_relaunch() && RESTART_SUPPORTED.load(std::sync::atomic::Ordering::SeqCst) => {
-                // the program restarts itself at its next safe point, carrying its state over
-                *RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = format!("{}: {}", what, o.lines.first().cloned().unwrap_or_default());
-                RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
-                eprintln!("makepad live: {}: restarting with state at the app's next safe point (reasons below)", what);
-            }
-            Rung::Restart => {
-                note_restart_pending(&format!("{}: {}", what, o.lines.first().cloned().unwrap_or_default()));
-                eprintln!("makepad live: {}: restart to apply (reasons below); the app keeps running the previous code -- `makepad inspect <app> session relaunch` applies it", what)
-            }
+            // an edit the patcher cannot absorb: makepad restarts for real (the app is asked at its
+            // next safe point and keeps its state); it runs the previous code until then
+            Rung::Restart => restart_for_edit(&what, &o.lines, &inputs),
         }
         for l in &o.lines {
             eprintln!("makepad live:   {}", l);

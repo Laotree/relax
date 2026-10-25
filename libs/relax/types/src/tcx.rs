@@ -44,6 +44,9 @@ pub enum TyKey {
     FnPtr,
     /// trait objects by principal trait (`impl Debug for dyn ActionTrait`)
     Dyn(DefId),
+    /// a self type that failed to resolve (rustc fast_reject's SimplifiedType::Error): its
+    /// impls are no blanket impls, so they never answer another type's goals
+    Error,
     Other,
 }
 
@@ -388,6 +391,7 @@ pub fn ty_key(tys: &Types, t: TyId) -> TyKey {
         TyKind::Tuple(_) => TyKey::Tuple,
         TyKind::FnPtr(..) => TyKey::FnPtr,
         TyKind::Dyn(d, ..) => TyKey::Dyn(*d),
+        TyKind::Error => TyKey::Error,
         _ => TyKey::Other,
     }
 }
@@ -1987,17 +1991,25 @@ impl Tcx {
         let mut tyb = Vec::new();
         let f = &prog.files[file as usize];
         // (and the enclosing impl's: `impl<A: Array> SmallVec<A> where A::Item: Clone`)
-        let impl_where: &[ast::WherePred] = if prog.def(def.parent).kind == DefKind::Impl {
+        let (impl_where, impl_where_lo): (&[ast::WherePred], u32) = if prog.def(def.parent).kind == DefKind::Impl {
             let im = &prog.impls[prog.def(def.parent).sub as usize];
             match prog.files[im.file as usize].ast.as_impl(&prog.files[im.file as usize].ast.item(im.item).kind) {
-                Some(ImplItem { generics, .. }) if im.file == file => f.ast.list(generics.where_),
-                _ => &[],
+                Some(ImplItem { generics, .. }) if im.file == file => (f.ast.list(generics.where_), generics.where_.lo),
+                _ => (&[], 0),
             }
         } else {
-            &[]
+            (&[], 0)
         };
-        for w in f.ast.list(sig.generics.where_).iter().chain(impl_where.iter()) {
+        let sig_where = f.ast.list(sig.generics.where_);
+        for (wi, w) in sig_where.iter().chain(impl_where.iter()).enumerate() {
             if let ast::WherePred::Bound { ty, bounds, .. } = w {
+                let (base_env, where_id) = match &parent_env {
+                    Some(penv) if wi >= sig_where.len() => (penv, impl_where_lo + (wi - sig_where.len()) as u32),
+                    _ => (&env, sig.generics.where_.lo + wi as u32),
+                };
+                let mut wenv = base_env.clone();
+                wenv.regions = base_env.regions.with_binder(Some(resolve_bound_vars::BinderId::Where(where_id)));
+                let env = &wenv;
                 let simple = match f.ast.ty(*ty) {
                     ast::Ty::Path(p) => p.no_qself() && p.segs.len() == 1 && f.ast.segs(p.segs)[0].args().is_none(),
                     _ => false,
@@ -2021,7 +2033,7 @@ impl Tcx {
                 // a self type Relax cannot lower here (`M::Item` through a where-clause
                 // supertrait) only loses this inference aid: its errors are not the program's
                 let nerr = self.captured_len(cx).unwrap_or(0);
-                let st = self.lower_ty(cx, prog, file, module, &env, *ty);
+                let st = self.lower_ty(cx, prog, file, module, env, *ty);
                 if st == self.tys.error || self.captured_len(cx).unwrap_or(0) != nerr {
                     {
                         if let Some(v) = cx.state.errors.borrow_mut().as_mut() {
@@ -2031,7 +2043,7 @@ impl Tcx {
                     continue;
                 }
                 for (td, path) in tds {
-                    let targs = self.lower_generic_args(cx, prog, file, module, &env, path);
+                    let targs = self.lower_generic_args(cx, prog, file, module, env, path);
                     tyb.push((st, td, targs));
                 }
             }
