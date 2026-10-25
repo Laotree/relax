@@ -16491,6 +16491,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             inline_freq[round] = freq.clone();
             freq
         };
+        // MAKEPAD_RUN_OPT=-exporthot: a wasm export's counted O3 bodies take the cold growth ceiling (A/B)
+        let hot_root = hot_root && !(export_o3_mode() && relax_backend::stats::opt_off(options, "-exporthot"));
         let queries = crate::nounwind::QueryCx::new(&snap);
         let optimize = || queries.optimize(id, func, &mut |func, nounwind| {
             Ok(tier1_optimize(options, func, id, &name, &snap, &get, &single, ro, &cfg, nounwind, &mut frequencies, hot_root))
