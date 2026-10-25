@@ -4684,7 +4684,7 @@ mod tests {
     }
 
     #[test]
-    fn sroa_option_float_and_integer_payload_subfields_stay_in_memory() {
+    fn sroa_option_float_and_integer_payload_subfields_promote() {
         let (mut f, base) = sroa_fixture(16);
         let cond = f.vreg(Cls::I);
         let value = f.vreg(Cls::F64);
@@ -4707,11 +4707,15 @@ mod tests {
         f.blocks[2].term = Term::Jump(3);
         f.blocks[3].insts = vec![Inst::Load(Mem::Int(1, false), tag, base, 0), Inst::Load(Mem::F64, payload, base, 8), Inst::Load(Mem::Int(1, true), high, base, 15)];
         f.blocks[3].term = Term::Ret(vec![tag, payload, high]);
-        sroa_rejects(&mut f, SroaReject::KindMix);
+        // the payload word is one 8-byte cell: the f64 its bits, the byte at 15 a part of it
+        sroa_promote(&mut f);
+        assert!(!f.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i, Inst::Load(..) | Inst::Store(..))));
+        assert!(f.blocks[3].insts.iter().any(|i| matches!(*i, Inst::Conv(Conv::BitsToF(true), d, _) if d == payload)));
+        assert!(f.blocks[3].insts.iter().any(|i| matches!(*i, Inst::Conv(Conv::IntToInt(t), d, _) if d == high && t == IntTy { bits: 8, signed: true })));
     }
 
     #[test]
-    fn sroa_u32_read_as_two_u16_halves_stays_in_memory() {
+    fn sroa_u32_read_as_two_u16_halves_promotes() {
         let (mut f, base) = sroa_fixture(4);
         let value = f.vreg(Cls::I);
         let low = f.vreg(Cls::I);
@@ -4723,7 +4727,11 @@ mod tests {
             Inst::Load(Mem::Int(2, false), low, base, 0), Inst::Load(Mem::Int(2, false), high, base, 2),
         ]);
         f.blocks[0].term = Term::Ret(vec![low, high]);
-        sroa_rejects(&mut f, SroaReject::KindMix);
+        // one 4-byte cell; the high half is the cell shifted down 16 bits, narrowed
+        sroa_promote(&mut f);
+        let insts = &f.blocks[0].insts;
+        assert!(!insts.iter().any(|i| matches!(i, Inst::Load(..) | Inst::Store(..))));
+        assert!(insts.iter().any(|i| matches!(i, Inst::IBinI(IOp::Shr, _, _, _, 16))));
     }
 
     #[test]
@@ -4753,7 +4761,7 @@ mod tests {
     }
 
     #[test]
-    fn sroa_f32_subfield_stays_in_memory() {
+    fn sroa_f32_subfield_promotes() {
         let (mut f, base) = sroa_fixture(8);
         let bits = f.vreg(Cls::I);
         let value = f.vreg(Cls::F32);
@@ -4766,7 +4774,12 @@ mod tests {
             Inst::Load(Mem::F32, result, base, 4), Inst::Load(Mem::Int(8, false), whole, base, 0),
         ]);
         f.blocks[0].term = Term::Ret(vec![result, whole]);
-        sroa_rejects(&mut f, SroaReject::Overlap);
+        // the f32 at 4 is the high half of the 8-byte cell: written as a masked merge of its bits
+        sroa_promote(&mut f);
+        let insts = &f.blocks[0].insts;
+        assert!(!insts.iter().any(|i| matches!(i, Inst::Load(..) | Inst::Store(..))));
+        assert!(insts.iter().any(|i| matches!(i, Inst::Conv(Conv::FToBits(false), ..))));
+        assert!(insts.iter().any(|i| matches!(*i, Inst::Conv(Conv::BitsToF(false), d, _) if d == result)));
     }
 
     #[test]
@@ -4898,7 +4911,7 @@ mod tests {
     }
 
     #[test]
-    fn sroa_copy_in_out_group_with_offset_members_requires_matching_sizes() {
+    fn sroa_copy_in_out_group_with_offset_members() {
         for n in [4, 8] {
             let (mut f, base) = sroa_fixture(24);
             let other = f.vreg(Cls::I);
@@ -4916,22 +4929,23 @@ mod tests {
                 Inst::Copy(part, base, 24), Inst::Load(Mem::F64, float, other, 16), Inst::Copy(dst, part, 24),
             ]);
             f.blocks[0].term = Term::Ret(vec![word, float]);
-            if n != 8 {
-                sroa_rejects(&mut f, SroaReject::KindMix);
-                continue;
-            }
+            // n == 4: the word at 8 is a part (its low half) of the cell the f64 reads whole
             sroa_promote(&mut f);
             let insts = &f.blocks[0].insts;
             assert_eq!(insts.iter().filter(|i| matches!(i, Inst::Load(Mem::Int(8, false), ..))).count(), 3);
             assert_eq!(insts.iter().filter(|i| matches!(i, Inst::Store(Mem::Int(8, false), ..))).count(), 3);
             assert!(insts.iter().any(|i| matches!(i, Inst::Conv(Conv::BitsToF(true), ..))));
-            assert!(insts.iter().any(|i| matches!(*i, Inst::Mov(d, _) if d == word)));
+            if n == 8 {
+                assert!(insts.iter().any(|i| matches!(*i, Inst::Mov(d, _) if d == word)));
+            } else {
+                assert!(insts.iter().any(|i| matches!(*i, Inst::Conv(Conv::IntToInt(t), d, _) if d == word && t == IntTy { bits: 32, signed: true })));
+            }
         }
     }
 
     #[test]
     fn sroa_partial_access_or_copy_cut_stays_in_memory() {
-        for (m, off, why) in [(Mem::Int(2, false), 2, SroaReject::Overlap), (Mem::Int(8, true), 0, SroaReject::CopyCut)] {
+        for (m, off, why) in [(Mem::Int(2, false), 2, SroaReject::CopyCut), (Mem::Int(8, true), 0, SroaReject::CopyCut)] {
             let (mut f, base) = sroa_fixture(8);
             let dst = f.vreg(Cls::I);
             let value = f.vreg(Cls::I);
@@ -4969,10 +4983,7 @@ mod tests {
             }
             f.blocks[0].insts.push(Inst::Copy(dst, other, 64));
             f.blocks[0].term = Term::Ret(rets);
-            if field_off != 0 {
-                sroa_rejects(&mut f, SroaReject::Overlap);
-                continue;
-            }
+            // field_off 2: each load is a part of its word's cell (a shift and a narrowing)
             sroa_promote(&mut f);
             assert_eq!(f.blocks[0].insts.iter().filter(|i| matches!(i, Inst::Store(Mem::Int(8, false), ..))).count(), 8);
             assert!(!f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Load(..))));
