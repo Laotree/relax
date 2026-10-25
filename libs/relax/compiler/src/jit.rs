@@ -6165,7 +6165,9 @@ impl Unit {
             self.note_first_borrowck(id, (gen > 0).then_some(0));
         }
         // (SPEC-V: a slot that ran its twin's code runs its own now)
-        self.fns[id as usize].borrowed = false;
+        if std::mem::take(&mut self.fns[id as usize].borrowed) {
+            SPECV_BORROWS_OWN.fetch_add(1, Ordering::Relaxed);
+        }
         SlotWord::of(&self.slots, id).store(at, Ordering::SeqCst);
         // SPEC-V: a base borrowing this twin follows it; this code's uncompiled callees whose twins
         // ran borrow their twins' code (its first calls never compile on the calling thread)
@@ -6399,7 +6401,9 @@ impl Unit {
         f.compiled = true;
         f.version += 1;
         crate::inspect::patches::code_installed(self, id);
-        self.fns[id as usize].borrowed = false;
+        if std::mem::take(&mut self.fns[id as usize].borrowed) {
+            SPECV_BORROWS_OWN.fetch_add(1, Ordering::Relaxed);
+        }
         SlotWord::of(&self.slots, id).store(at, Ordering::SeqCst);
         if matches!(self.fns[id as usize].key, FnKey::Plain(_)) {
             self.follow_twin(id);
@@ -8594,6 +8598,12 @@ unsafe fn o1v_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     let t0 = cpu_ns();
     let epoch = PATCH_EPOCH.load(Ordering::SeqCst);
     let dropped = || { wc::add(wc::O1V_DROPPED, 1); None };
+    // (the repro hook holds the verdicts: the rebuild waits for their release, as a run whose
+    // verdicts came in time builds it)
+    if specv_held() {
+        crate::zone_alloc::kept_with(|| O1V_HELD.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id)));
+        return None;
+    }
     if !(&*up).refresh_verified(id) {
         return dropped();
     }
@@ -13762,10 +13772,19 @@ pub(crate) fn specv_held() -> bool {
     }
 }
 
+/// verified O1 rebuilds that met held verdicts (o1v_begin): queued again at the release
+static O1V_HELD: relax_session::sync::Mutex<Vec<(usize, u32)>> = relax_session::sync::Mutex::new(Vec::new());
+
 /// SPEC-V repro hook: the held verdicts are released (once per hold).
 pub(crate) fn specv_release() {
     let s = SPECV_HOLD.load(Ordering::Relaxed);
     if (s == 1 || s == 2) && SPECV_HOLD.compare_exchange(s, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        let held = std::mem::take(&mut *O1V_HELD.lock().unwrap_or_else(|e| e.into_inner()));
+        if !held.is_empty() {
+            let _q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+            crate::zone_alloc::kept_with(|| O1V_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).extend(held));
+            O2_WAKE.notify_one();
+        }
         SPECV_RELEASES.fetch_add(1, Ordering::Relaxed);
         SWEPT.store(u64::MAX, Ordering::Relaxed);
         crate::inspect::flightrec::event("specv.release", "SPEC-V repro hook: the held verdicts are released", 0, 0);
@@ -13993,6 +14012,8 @@ const SWEEP_CHUNK: usize = 4096;
 /// SPEC-V: base slots that borrowed their twins' code (borrow_twin), twins that got code, and
 /// lazy compiles that reached their front end on a program thread (inspect, tests)
 pub(crate) static SPECV_BORROWS: AtomicU64 = AtomicU64::new(0);
+/// ... of which got their own code since
+pub(crate) static SPECV_BORROWS_OWN: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TWINS_RAN: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAZY_FRONTS: AtomicU64 = AtomicU64::new(0);
 
