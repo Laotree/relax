@@ -109,13 +109,6 @@ impl Drop for DomainHeap {
 /// The domain registry owns the pointer and keeps it alive through this thread's TLS destructors.
 /// The thread allocates in its arena from now on (null: the system heap).
 pub unsafe fn enter(heap: *const DomainHeap) {
-    // ARMIPC A/B knob +sysheap (ARMIPC_KNOBS): the program's threads allocate from the system
-    // heap (libmalloc), to compare data locality with the arena
-    static SYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *SYS.get_or_init(|| std::env::var("ARMIPC_KNOBS").is_ok_and(|v| v.split(',').any(|t| t.trim() == "+sysheap"))) {
-        compiler::enter_domain(std::ptr::null());
-        return;
-    }
     compiler::enter_domain(heap.as_ref().map_or(std::ptr::null(), |h| &*h.inner.arena as *const Arena));
 }
 

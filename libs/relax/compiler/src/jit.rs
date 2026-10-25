@@ -600,12 +600,6 @@ impl Drop for CodeAs {
         let _ = CODE_AS.try_with(|c| c.set(p));
     }
 }
-/// ARMIPC measurement knob `tok` in ARMIPC_KNOBS (comma list; not part of the options or any cache key).
-pub(crate) fn armipc_knob(tok: &str) -> bool {
-    static T: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    T.get_or_init(|| std::env::var("ARMIPC_KNOBS").map(|v| v.split(',').map(|t| t.trim().to_string()).collect()).unwrap_or_default()).iter().any(|t| t == tok)
-}
-
 fn code_as_now() -> Option<CodeKind> {
     CODE_AS.try_with(|c| c.get()).ok().flatten()
 }
@@ -3820,38 +3814,12 @@ impl Unit {
     }
 
     pub(crate) fn emit_linked(&self, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Result<u64, String> {
-        let at = self.code_at(code.len() as u64);
+        let at = bump(&self.code_next, code.len() as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
         let mut c = code.to_vec();
         self.link_code(&mut c, at, relocs)?;
         unsafe { os::mem::write_code(at, &c) };
         crate::coverage::installed(self, at, relocs);
         Ok(at)
-    }
-
-    /// Where the next body of `len` bytes goes: the shared bump. ARMIPC A/B knobs (ARMIPC_KNOBS, an env
-    /// var outside the options so a warm cache stays valid):
-    /// `+o3area` puts O3 (and guarded) bodies into their own 4 MB chunks of the bump, so hot code
-    /// is dense; `+falign64` aligns O3 bodies to 64 bytes (a cache line / fetch block).
-    fn code_at(&self, len: u64) -> u64 {
-        let end = self.exec_base + self.exec_size - os::mem::CODE_TAIL;
-        let hot = code_as_now().is_some_and(|k| k.tier == tier::O3 || k.tier == tier::GUARDED);
-        let align = if hot && armipc_knob("+falign64") { 64 } else { 16 };
-        if !hot || !armipc_knob("+o3area") {
-            return bump(&self.code_next, len, align, end, "out of code memory");
-        }
-        const CHUNK: u64 = 4 << 20;
-        static AREA: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
-        let mut a = AREA.lock().unwrap_or_else(|e| e.into_inner());
-        let at = (a.0 + align - 1) / align * align;
-        if a.0 == 0 || at + len > a.1 {
-            let size = CHUNK.max((len + 4095) & !4095);
-            let c = bump(&self.code_next, size, 1 << 14, end, "out of code memory");
-            *a = (c, c + size);
-            a.0 = c + len;
-            return c;
-        }
-        a.0 = at + len;
-        at
     }
 
     /// `emit_linked` into group `g`'s own pages (invalid.rs), or bump-shared code for None.
@@ -12887,9 +12855,6 @@ fn sampler_thread() {
         let settled = settle_on && active_at.elapsed() >= SETTLED_AFTER;
         if settled != SAMPLER_SETTLED.load(Ordering::Relaxed) {
             SAMPLER_SETTLED.store(settled, Ordering::Relaxed);
-            if settled && armipc_knob("+parkall") {
-                park_lukewarm();
-            }
             let ms = if settled { SETTLED_MS } else { SAMPLE_MS };
             for (_, _, h) in SAMPLED.lock().unwrap().iter() {
                 os::sample::set_period(h, ms);
@@ -13455,39 +13420,6 @@ const T_COUNTING: u64 = 1;
 const T_QUEUED: u64 = 2;
 // A loop counter cannot queue a recorded instance before its first call.
 const T_REPLAY: u64 = 3;
-/// ARMIPC knob +park: a lukewarm slot that stopped counting (rt_hot)
-const T_PARKED: u64 = 4;
-
-/// ARMIPC knob +parkall: on settling, every slot still counting (lukewarm) stops counting: its
-/// slot word goes back to its code (no count stub on its calls). On the owner, with the unit.
-fn park_lukewarm() {
-    owner::publish(|| unsafe {
-        let up = TIER_UNIT.load(Ordering::Acquire);
-        if up.is_null() {
-            return;
-        }
-        let u = &*up;
-        let mut n = 0u32;
-        for id in 0..u.fns.len() as u32 {
-            if !u.slots.has_seg(relax_backend::rir::SlotTable::locate(id).0) {
-                break;
-            }
-            let rec = tier_rec(&u.slots, id);
-            if (*rec.add(3)).load(Ordering::Acquire) != T_COUNTING {
-                continue;
-            }
-            let (code, stub) = ((*rec.add(1)).load(Ordering::Relaxed), (*rec.add(2)).load(Ordering::Relaxed));
-            if code == 0 || stub == 0 {
-                continue;
-            }
-            if (*rec.add(3)).compare_exchange(T_COUNTING, T_PARKED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                let _ = SlotWord::of(&u.slots, id).compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
-                n += 1;
-            }
-        }
-        eprintln!("armipc: parked {} lukewarm slots on settling", n);
-    });
-}
 
 thread_local! {
     /// makepad inspect's O3 build on this thread (compile_tier1_inspect): the edit putting its
@@ -15297,21 +15229,11 @@ fn rt_hot(slot: u64) -> u64 {
             match tier_check(rec, threshold, now) {
                 Some(r) => rate = r,
                 None => {
-                    // ARMIPC A/B knob +park: once the sampler has settled (no compile / install
-                    // for SETTLED_AFTER), a lukewarm slot stops counting: its calls go straight to
-                    // its code (no count stub). Measures what the counting costs in steady state.
-                    if armipc_knob("+park") && SAMPLER_SETTLED.load(Ordering::Relaxed) && !(armipc_knob("+settleo2") && u.fns[slot as usize].base_code.load(Ordering::Relaxed)) {
-                        if (*rec.add(3)).compare_exchange(T_COUNTING, T_PARKED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                            let _ = s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
-                        }
-                        return code;
-                    }
                     // under the threshold: the stub stays, counting on. Baseline code that keeps
                     // running (a quarter of the threshold's cost, decayed) gets its O2 build: the
                     // cache's entry then links optimised code for it
                     let cost = (*rec.add(9)).load(Ordering::Relaxed);
-                    // (ARMIPC knob +settleo2: once settled, any baseline code still being called)
-                    if cost >= threshold / 4 || armipc_knob("+settleo2") && SAMPLER_SETTLED.load(Ordering::Relaxed) {
+                    if cost >= threshold / 4 {
                         note_slow_base(u, slot as u32);
                     }
                     crate::inspect::tierlog::note(slot as u32, crate::inspect::tierlog::ev::CHECK, 0, cost, code);
@@ -15350,9 +15272,7 @@ pub fn lower_this_thread_priority(runtime: &crate::options::RuntimeOptions) {
 
 fn lower_worker_priority(runtime: &crate::options::RuntimeOptions) {
     // aot-min: every background compile thread in the OS background class
-    // (ARMIPC knob +bgworkers: the same for every level, to A/B the UI thread's IPC with the
-    // compile threads off the performance cluster)
-    if ahead_policy().background_class || armipc_knob("+bgworkers") {
+    if ahead_policy().background_class {
         os::thread::background();
         return;
     }
@@ -16931,7 +16851,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 let at = if blob {
                     u.emit_or_redirect(&code, &relocs, "O3").expect("O3 interpreted code installs")
                 } else {
-                    let _as = code_as(CodeKind::new(if speculative { tier::GUARDED } else { tier::O3 }, origin::FRESH));
                     u.emit_grouped(o3_group, &code, &relocs).expect("O3 code links (checked)")
                 };
                 if !blob {
