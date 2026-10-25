@@ -1499,7 +1499,11 @@ impl Linker {
     /// Places the code of resolved slots `keep` (that still have no code) in one block of code
     /// memory, each 16-byte aligned without its unwind trailer, links it there in one pass and
     /// writes the block with one write.
-    fn img_place(&mut self, u: &mut Unit, im: &mut Img, keep: Vec<(usize, u32)>) -> Vec<PrelinkedSlot> {
+    fn img_place(&mut self, u: &mut Unit, im: &mut Img, mut keep: Vec<(usize, u32)>) -> Vec<PrelinkedSlot> {
+        // ARMIPC knob +imgo3: the image's O3 bodies first, contiguous (hot code dense)
+        if crate::jit::armipc_knob("+imgo3") {
+            keep.sort_by_key(|&(si, _)| im.slots[si].tier != TIER_O3);
+        }
         let mut out = Vec::new();
         let mut layout = Vec::with_capacity(keep.len());
         let mut total = 0usize;
