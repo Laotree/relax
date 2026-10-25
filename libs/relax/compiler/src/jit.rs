@@ -12316,9 +12316,11 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
         let freqs = frequencies(0, func);
         for (c, rule) in relax_codegen::opt::inline_calls_ordered(options, func, id, get, prepared, single, nounwind, &limits, freqs.as_deref(), inline_stats.as_deref_mut()) {
             // a single-caller body moved into this fn: the second round's ceiling includes it
+            // and its own room (opt::single_room)
             if rule == relax_codegen::opt::RULE_SINGLE {
                 if let (Some(g), Some((p, _))) = (limits.growth_limit.as_mut(), get(c)) {
-                    *g = g.saturating_add(relax_codegen::opt::inst_count(unsafe { &*p }));
+                    let n = relax_codegen::opt::inst_count(unsafe { &*p });
+                    *g = g.saturating_add(n).saturating_add(relax_codegen::opt::single_room(options, n));
                 }
             }
             if !inlined.iter().any(|x| x.0 == c) {

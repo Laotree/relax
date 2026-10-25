@@ -481,6 +481,13 @@ impl InlineStats {
 /// made that room usable, max(2x, +4000) refused html_parse's and maps' hot sites for budget
 /// (html 0.66, maps 0.97) --; every other caller max(2x, +4000): Stage's lukewarm UI functions
 /// grew 3x in code with the big room and its O3 compile CPU went up 4x.
+/// The inlining room a single-caller body of `size` instructions brings when it moves into its
+/// caller: what its own (cold) growth ceiling allowed it compiled alone (MAKEPAD_RUN_OPT=-singleroom:
+/// none, the body's size only).
+pub fn single_room(options: &relax_session::Options, size: usize) -> usize {
+    if opt_off(options, "-singleroom") { 0 } else { growth_ceiling(size, false) - size }
+}
+
 pub fn growth_ceiling(size: usize, hot: bool) -> usize {
     if hot {
         size.saturating_mul(4).max(size.saturating_add(8000))
@@ -956,9 +963,13 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
         let callee = Some(callee);
         let rule = Some(rule);
         match rule.unwrap() {
-            // the body moves here (its one caller): the ceiling grows with it, so the calls
-            // around it (Vec::push in the absorbed loop) still fit
-            RULE_SINGLE => growth_limit = growth_limit.saturating_add(growth),
+            // the body moves here (its one caller): the ceiling grows by the ceiling the body
+            // had compiled alone (its size and its own room), so the calls around it (Vec::push
+            // in the absorbed loop) and in it (an absorbed VM handler's #[inline] stack pops)
+            // still fit -- moving a body in never shrinks the inlining it would have got on its
+            // own (P(DOOM)'s run_core: 25 single-caller opcode handlers moved in with their
+            // sizes only, and 47 pop_stack_resolved calls stayed calls on the growth ceiling)
+            RULE_SINGLE => growth_limit = growth_limit.saturating_add(growth).saturating_add(single_room(options, size)),
             _ if no_growth => {}
             RULE_COST => free_budget -= size,
             _ if free => free_budget -= size,
