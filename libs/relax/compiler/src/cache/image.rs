@@ -43,6 +43,13 @@ impl Cache {
                 chosen.push((id, k, crates));
             }
         }
+        // SPEC-V: the image sends a verified-clean caller's calls to a twin to the twin's base when the
+        // base's code is in the image too (a twin's key is its base's key behind tag 4): the code is
+        // the caller's earlier (unverified) lowering, sound to call verified code once the caller's
+        // own verdict is clean. Later warm launches then never run the cold launch's twins (the race's
+        // draw path: draw_view .. set_uniform), at no link cost (twin_link_target for the lazy path).
+        let twinlink = !relax_backend::stats::opt_off(&u.prog.session.options, "-twinlink");
+        let in_image: std::collections::HashSet<Vec<u8>> = if twinlink { chosen.iter().filter_map(|(id, _, _)| self.slot_bytes_known(*id)).collect() } else { Default::default() };
         let mut tab = ImageTables::default();
         let mut slots = E::default();
         let mut blob: Vec<u8> = Vec::new();
@@ -52,7 +59,10 @@ impl Cache {
             let Some(payload) = self.image_payload(*k, &pend) else { continue };
             let Some(bytes) = self.slot_bytes_known(*id) else { continue };
             let mut cr: Vec<u32> = crates.clone();
-            if image_slot(&mut tab, &mut slots, &mut blob, *k, bytes, payload, &mut cr, &self.crate_by_ident).is_some() {
+            let body = match u.fns[*id as usize].key { crate::jit::FnKey::Plain(b) => b, _ => *id };
+            let clean = twinlink && u.verdict_clean(body);
+            let retarget = |t: &[u8]| -> bool { clean && t.first() == Some(&4) && in_image.contains(&t[1..]) };
+            if image_slot(&mut tab, &mut slots, &mut blob, *k, bytes, payload, &mut cr, &self.crate_by_ident, &retarget).is_some() {
                 n += 1;
             }
         }
@@ -519,7 +529,7 @@ const IMG_CALL: u8 = 6;
 /// decode, or names a crate this program does not have. `crates`:
 /// the crates its key names (the certificate's are added).
 #[allow(clippy::too_many_arguments)]
-fn image_slot(tab: &mut ImageTables, out: &mut E, blob: &mut Vec<u8>, entry_key: u128, key: Vec<u8>, payload: &[u8], crates: &mut Vec<u32>, crate_by_ident: &HashMap<u128, u32>) -> Option<()> {
+fn image_slot(tab: &mut ImageTables, out: &mut E, blob: &mut Vec<u8>, entry_key: u128, key: Vec<u8>, payload: &[u8], crates: &mut Vec<u32>, crate_by_ident: &HashMap<u128, u32>, retarget: &dyn Fn(&[u8]) -> bool) -> Option<()> {
     let mut d = D { b: payload, p: 0 };
     if d.u32()? != ENTRY_VERSION {
         return None;
@@ -557,7 +567,9 @@ fn image_slot(tab: &mut ImageTables, out: &mut E, blob: &mut Vec<u8>, entry_key:
         match tag {
             20 | 21 | 25 => {
                 d.u8()?;
-                rel.push((at, kind, match tag { 20 => IMG_SLOT, 25 => IMG_CALL, _ => IMG_THUNK }, tab.keys.id(d.bytes()?)));
+                let t = d.bytes()?;
+                let t = if retarget(t) { crate::jit::TWIN_RETARGETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); &t[1..] } else { t };
+                rel.push((at, kind, match tag { 20 => IMG_SLOT, 25 => IMG_CALL, _ => IMG_THUNK }, tab.keys.id(t)));
             }
             22..=24 => {
                 d.u8()?;
@@ -1474,14 +1486,6 @@ impl Linker {
                 im.failed += 1;
                 return Resolved::Lazy;
             };
-            // SPEC-V: code that calls a twin (lowered before its verdict in an earlier run) is linked lazily
-            // instead: the image slots are not named yet, so only the lookup can send its calls to the
-            // twins' bases once its verdict is clean (twin_link_target)
-            if matches!(t, IMG_SLOT | IMG_THUNK | IMG_CALL) && im.keys.get(ix as usize).and_then(|k| k.first()) == Some(&4)
-                && !relax_backend::stats::opt_off(&u.prog.session.options, "-twinlink") {
-                crate::jit::TWIN_IMG_LAZY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Resolved::Lazy;
-            }
             let ok = match t {
                 IMG_SLOT | IMG_THUNK | IMG_CALL => im.slot_of(ix).is_some(),
                 IMG_SYM if !statics && im.syms.get(ix as usize).map_or(false, |b| is_static_sym(b)) => {
@@ -1535,7 +1539,7 @@ impl Linker {
             unsafe {
                 crate::os::mem::fill_code(at, total, |buf| {
                     let mut rl: Vec<RelocAt> = Vec::new();
-                    for (k, &(si, caller, off, n, _)) in layout.iter().enumerate() {
+                    for (k, &(si, _, off, n, _)) in layout.iter().enumerate() {
                         let s = &im.slots[si];
                         buf[off..off + n].copy_from_slice(&im.blob[s.code.0..s.code.0 + n]);
                         rl.clear();
@@ -1546,7 +1550,7 @@ impl Linker {
                                 break;
                             };
                             let v = match t {
-                                IMG_SLOT | IMG_THUNK | IMG_CALL => im.slot_of(ix).map(|x| u.twin_link_target(caller, x)).map(|x| env.reloc_value(match t { IMG_SLOT => Reloc::Slot(x), IMG_CALL => Reloc::Call(x), _ => Reloc::Thunk(x) })),
+                                IMG_SLOT | IMG_THUNK | IMG_CALL => im.slot_of(ix).map(|x| env.reloc_value(match t { IMG_SLOT => Reloc::Slot(x), IMG_CALL => Reloc::Call(x), _ => Reloc::Thunk(x) })),
                                 IMG_SYM => im.fresh.get(&ri).copied().or_else(|| im.sym_sym.get(ix as usize).copied().flatten().flatten()).map(|s| syms.value(s)),
                                 IMG_TLS_KEY => Some(env.reloc_value(Reloc::TlsKey)),
                                 IMG_TLS_SLOW => Some(env.reloc_value(Reloc::TlsSlow)),

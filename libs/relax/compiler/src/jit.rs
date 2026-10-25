@@ -6432,7 +6432,8 @@ impl Unit {
     /// A twin exists for callers whose aliasing is not known yet; cached code lowered in an earlier run
     /// before its verdict still names twins. When the caller's own body is verified clean now (a warm
     /// launch knows the stored verdict before the first link), its calls go to the twin's base: the
-    /// verified body, sound for a caller that passes no aliased `&mut`. Without it every warm launch
+    /// verified body, sound for a caller that passes no aliased `&mut` (the image does the same when it
+    /// is written: build_image). Without it every warm launch
     /// ran the race's draw path (draw_view .. set_uniform, find_appendable_drawcall) as twins built at
     /// O3 again in the background each launch (x64 live warm draw +10% over --check-first).
     /// MAKEPAD_RUN_OPT=-twinlink keeps the twins (A/B).
@@ -6441,7 +6442,8 @@ impl Unit {
         if target as usize >= n || caller as usize >= n { return target }
         let FnKey::Plain(base) = self.fns[target as usize].key else { return target };
         let body = match self.fns[caller as usize].key { FnKey::Plain(b) => b, _ => caller };
-        if (base as usize) < self.fns.len() && self.verdict_clean(body) && !matches!(self.verdict_state(base), Verdict::Failed(_))
+        // (a base without code would compile on the program thread at its first call: the twin it is)
+        if (base as usize) < self.fns.len() && self.fns[base as usize].compiled && self.verdict_clean(body) && !matches!(self.verdict_state(base), Verdict::Failed(_))
             && !relax_backend::stats::opt_off(&self.prog.session.options, "-twinlink") {
             TWIN_RETARGETS.fetch_add(1, Ordering::Relaxed);
             base
@@ -14273,8 +14275,6 @@ unsafe fn borrow_build_enqueue(up: *mut Unit, id: u32) {
 const PREBUILD_MAX: usize = 256;
 /// SPEC-V: calls of linked code sent to a twin's base instead of the twin (twin_link_target)
 pub(crate) static TWIN_RETARGETS: AtomicU64 = AtomicU64::new(0);
-/// SPEC-V: startup image slots left to the lazy lookup because their code calls a twin
-pub(crate) static TWIN_IMG_LAZY: AtomicU64 = AtomicU64::new(0);
 /// callees built ahead of a replacement's install (inspect stats)
 pub(crate) static SPECV_PREBUILT: AtomicU64 = AtomicU64::new(0);
 
