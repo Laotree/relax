@@ -3689,7 +3689,19 @@ impl<'a> Fx<'a> {
                 }
             }
             let w = if self.nk[d.0 as usize] != 0 { Want::Low } else { Want::Nat };
+            let at = self.out.len();
             self.expr(b, i, w)?;
+            // the value is its own local already (a move or a no-op narrow conversion of a
+            // coalesced register): no code
+            let l = self.loc[d.0 as usize];
+            if l != NONE && self.uses[d.0 as usize] != 0 && self.out.len() > at && self.out[at] == LGET {
+                let mut one = vec![LGET];
+                uleb(&mut one, l as u64);
+                if self.out[at..] == one[..] {
+                    self.out.truncate(at);
+                    return Ok(());
+                }
+            }
             self.set(d);
             return Ok(());
         }
