@@ -1554,6 +1554,8 @@ struct Fx<'a> {
     last_br0: usize,
     /// (start, end, depth) of the last unconditional `br`
     last_br: (usize, usize, u32),
+    /// per vreg: the slot whose SlotAddr is its one definition
+    slot_addr: Vec<Option<u32>>,
     last_transfer: usize,
     last_ret: usize,
     /// (end, opcode position, local, vreg) of the last `local.set`
@@ -1641,6 +1643,18 @@ fn lower_func(o: &Options, options: &relax_session::Options, f: &Func, me: usize
         exit_vals: false,
         last_br0: usize::MAX,
         last_br: (usize::MAX, usize::MAX, 0),
+        slot_addr: {
+            let mut n = vec![0u32; f.vregs.len()];
+            let mut sa = vec![None; f.vregs.len()];
+            for p in &f.params { n[p.0 as usize] += 1; }
+            for b in &f.blocks {
+                for i in &b.insts {
+                    i.defs(|d| n[d.0 as usize] += 1);
+                    if let Inst::SlotAddr(d, sl) = i { sa[d.0 as usize] = Some(*sl); }
+                }
+            }
+            sa.iter().zip(&n).map(|(s, n)| if *n == 1 { *s } else { None }).collect()
+        },
         last_transfer: usize::MAX,
         last_ret: usize::MAX,
         last_set: (usize::MAX, 0, 0, 0),
@@ -2421,6 +2435,18 @@ impl<'a> Fx<'a> {
         }
         self.transfer();
     }
+    /// The frame slot whose address `v` is, when its one definition is that slot's SlotAddr.
+    fn slot_of(&self, v: VReg) -> Option<u32> {
+        let (fb, fi) = self.fold_def[v.0 as usize];
+        if fb != NONE {
+            return match self.f.blocks[fb as usize].insts[fi as usize] {
+                Inst::SlotAddr(_, sl) => Some(sl),
+                _ => None,
+            };
+        }
+        self.slot_addr[v.0 as usize]
+    }
+
     /// The unconditional `br` the code emitted so far ends with: (start, depth).
     fn tail_br(&self) -> Option<(usize, u32)> {
         (self.last_br.1 == self.out.len()).then_some((self.last_br.0, self.last_br.2))
@@ -3646,7 +3672,17 @@ impl<'a> Fx<'a> {
                 return Ok(());
             }
             if let Inst::Mov(d, a) = &inst {
-                if self.fold_def[a.0 as usize].0 == NONE && self.loc[d.0 as usize] == self.loc[a.0 as usize] {
+                // through folded moves: `d = a = x` with x in d's local is no code
+                let mut src = *a;
+                loop {
+                    let (fb, fi) = self.fold_def[src.0 as usize];
+                    if fb == NONE { break; }
+                    match self.f.blocks[fb as usize].insts[fi as usize] {
+                        Inst::Mov(_, x) => src = x,
+                        _ => break,
+                    }
+                }
+                if self.fold_def[src.0 as usize].0 == NONE && self.loc[d.0 as usize] == self.loc[src.0 as usize] && self.loc[d.0 as usize] != NONE {
                     return Ok(());
                 }
             }
@@ -3688,7 +3724,9 @@ impl<'a> Fx<'a> {
                 self.memarg(0, o);
             }
             Inst::Copy(dst, src, n) => {
-                if *n > 0 {
+                // a copy of a frame slot onto itself (a result forwarded into the slot it came
+                // from) is no code
+                if *n > 0 && !(dst == src || self.slot_of(*dst).is_some_and(|x| Some(x) == self.slot_of(*src))) {
                     self.addr_exact(b, *dst)?;
                     self.addr_exact(b, *src)?;
                     self.aconst(*n as i64);

@@ -1385,11 +1385,12 @@ pub(crate) fn o3_cold_tiny() -> bool {
     *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_WASM_EXPORT_O3_COLD").map_or(true, |v| v != "0"))
 }
 
-/// MAKEPAD_RUN_WASM_EXPORT_INLINE=1: the shipping module's own inlining (module_inline) and
-/// static reachability from the entry, exports and taken addresses.
+/// MAKEPAD_RUN_WASM_EXPORT_INLINE (default on; `0` off): the shipping module's own inlining
+/// (module_inline) and static reachability from the entry, exports and taken addresses. P(DOOM)
+/// (WASMCG runs A/B, both gated): 10.29 MB br11 with it, 10.79 without, CPU equal.
 fn module_inline_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_WASM_EXPORT_INLINE").is_ok_and(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_WASM_EXPORT_INLINE").map_or(true, |v| v != "0"))
 }
 
 /// The shipping module's inlining, as a size-first AOT compiler's: bottom-up over the direct-call
