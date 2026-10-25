@@ -1695,13 +1695,48 @@ fn sink_trees(f: &Func, direct: &dyn Fn(&Callee) -> bool) -> Option<Func> {
             invoke: bool,
             moved: &'a mut bool,
         }
-        fn place(s: &mut S, op: VReg, ip: &mut usize, direct: &dyn Fn(&Callee) -> bool, movable: &dyn Fn(&Inst) -> Option<bool>) {
-            if s.defs[op.0 as usize] != 1 || s.uses[op.0 as usize] != 1 || *ip == 0 {
+        /// `first`: op is the first value the root statement pushes (the first operand of a
+        /// chain of first operands): a value read again later moves right before the statement,
+        /// so its `local.set` and this read become one `local.tee`
+        fn place(s: &mut S, op: VReg, first: bool, ip: &mut usize, direct: &dyn Fn(&Callee) -> bool, movable: &dyn Fn(&Inst) -> Option<bool>) {
+            let multi = s.uses[op.0 as usize] > 1;
+            if s.defs[op.0 as usize] != 1 || (multi && !first) || *ip == 0 {
                 return;
             }
             let lo = ip.saturating_sub(SINK_WINDOW);
             let Some(j) = (lo..*ip).rev().find(|&k| tree_def(&s.insts[k]) == Some(op)) else { return };
-            let Some(barrier) = movable(&s.insts[j]) else {
+            let movable_j = movable(&s.insts[j]);
+            if multi {
+                // stays a statement of its own: only moved, never part of this tree
+                let Some(barrier) = movable_j else { return };
+                if j + 1 == *ip {
+                    return;
+                }
+                let mut ops: Vec<VReg> = Vec::new();
+                reads(&s.insts[j], &mut ops);
+                let mut rd: Vec<VReg> = Vec::new();
+                for k in j + 1..*ip {
+                    let x = &s.insts[k];
+                    if barrier && crate::passes::is_mem_effect(x) {
+                        return;
+                    }
+                    let mut clash = false;
+                    x.defs(|d| clash |= ops.contains(&d));
+                    reads(x, &mut rd);
+                    if clash || rd.contains(&op) {
+                        return;
+                    }
+                }
+                let i = s.insts.remove(j);
+                s.insts.insert(*ip - 1, i);
+                if !s.pos.is_empty() {
+                    let p = s.pos.remove(j);
+                    s.pos.insert(*ip - 1, p);
+                }
+                *s.moved = true;
+                return;
+            }
+            let Some(barrier) = movable_j else {
                 if j + 1 != *ip {
                     return;
                 }
@@ -1709,8 +1744,8 @@ fn sink_trees(f: &Func, direct: &dyn Fn(&Callee) -> bool) -> Option<Func> {
                 *ip = j;
                 let sub = push_operands(&s.insts[j], s.invoke && j + 1 == s.n, direct);
                 let mut ip2 = j;
-                for o in sub.iter().rev() {
-                    place(s, *o, &mut ip2, direct, movable);
+                for (k, o) in sub.iter().enumerate().rev() {
+                    place(s, *o, first && k == 0, &mut ip2, direct, movable);
                 }
                 *ip = ip2;
                 return;
@@ -1741,24 +1776,24 @@ fn sink_trees(f: &Func, direct: &dyn Fn(&Callee) -> bool) -> Option<Func> {
             let at = *ip;
             let sub = push_operands(&s.insts[at], false, direct);
             let mut ip2 = at;
-            for o in sub.iter().rev() {
-                place(s, *o, &mut ip2, direct, movable);
+            for (k, o) in sub.iter().enumerate().rev() {
+                place(s, *o, first && k == 0, &mut ip2, direct, movable);
             }
             *ip = ip2;
         }
         let mut s = S { insts: &mut insts, pos: &mut pos, defs: &defs, uses: &uses, n, invoke, moved: &mut moved };
         let mut ip = n;
         if !invoke {
-            for op in term_operands(&blk.term).iter().rev() {
-                place(&mut s, *op, &mut ip, direct, &movable);
+            for (k, op) in term_operands(&blk.term).iter().enumerate().rev() {
+                place(&mut s, *op, k == 0, &mut ip, direct, &movable);
             }
         }
         while ip > 0 {
             let c = ip - 1;
             let ops = push_operands(&s.insts[c], invoke && c + 1 == n, direct);
             let mut ip2 = c;
-            for op in ops.iter().rev() {
-                place(&mut s, *op, &mut ip2, direct, &movable);
+            for (k, op) in ops.iter().enumerate().rev() {
+                place(&mut s, *op, k == 0, &mut ip2, direct, &movable);
             }
             ip = ip2;
         }
