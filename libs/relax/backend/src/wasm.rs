@@ -211,6 +211,8 @@ pub struct Options {
     pub tee: bool,
     /// cheap single-definition constants are recomputed at each use instead of living in a local
     pub remat: bool,
+    /// single-use values move down to their reader (`sink_trees`): pushed there, not via a local
+    pub sink: bool,
     /// the same for frame addresses used mostly as memory bases (the frame offset folds into
     /// the access)
     pub remat_slots: bool,
@@ -230,7 +232,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { memory64: false, shared_max_pages: None, stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, remat_slots: true, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true, order_by_bytes: true }
+        Options { memory64: false, shared_max_pages: None, stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, sink: true, remat_slots: true, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true, order_by_bytes: true }
     }
 }
 
@@ -1570,6 +1572,226 @@ struct Fx<'a> {
     small5: Vec<bool>,
 }
 
+/// Whether a call's arguments are pushed for the call itself (a direct call of a module
+/// function, a bound host symbol, an indirect call): only then may they be expression trees.
+fn direct_callee(c: &Callee, fn_ix: &HashMap<u32, u32>, link: &dyn Link) -> bool {
+    match c {
+        Callee::Fn(id) | Callee::CFn(id, _) => fn_ix.contains_key(id),
+        Callee::Host(s) | Callee::CHost(s, _) => !matches!(link.host(s.id), HostBind::Trap),
+        Callee::Indirect(_) | Callee::CIndirect(..) => true,
+        Callee::Asm(_) => false,
+    }
+}
+
+/// An instruction's operands in wasm push order, for the ones an expression tree may supply
+/// (`invoke_call`: the call an invoke block ends with, whose arguments are not trees).
+fn push_operands(i: &Inst, invoke_call: bool, direct: &dyn Fn(&Callee) -> bool) -> Vec<VReg> {
+    match i {
+        Inst::Mov(_, a) | Inst::INeg(_, _, a) | Inst::INot(_, _, a) | Inst::IBit(_, _, a) | Inst::IBinI(_, _, _, a, _) | Inst::ICmpI(_, _, _, a, _) | Inst::FUnary(_, _, _, a) | Inst::Conv(_, _, a) | Inst::Load(_, _, a, _) | Inst::AtomicLoad(_, _, _, a) => vec![*a],
+        Inst::IBin(_, _, _, a, b) | Inst::ICmp(_, _, _, a, b) | Inst::FBin(_, _, _, a, b) | Inst::FCmp(_, _, _, a, b) => vec![*a, *b],
+        Inst::Store(_, a, _, s) | Inst::AtomicStore(_, _, a, s) => vec![*a, *s],
+        Inst::Copy(d, s, _) => vec![*d, *s],
+        Inst::LoadX(_, _, a, x, _, _) => vec![*a, *x],
+        Inst::StoreX(_, a, x, _, _, s) => vec![*a, *x, *s],
+        Inst::Sel(_, c, a, b) => vec![*b, *a, *c],
+        Inst::FMulAdd(_, _, _, _, a, b, c) => vec![*a, *b, *c],
+        Inst::VSplat(_, a) | Inst::VExtract(_, a, _) | Inst::VLoad(_, a, _) | Inst::VAny(_, a) => vec![*a],
+        Inst::VInsert(_, v, _, s) => vec![*v, *s],
+        Inst::VStore(a, _, s) => vec![*a, *s],
+        Inst::VLoadX(_, a, x, _, _) => vec![*a, *x],
+        Inst::VStoreX(a, x, _, _, s) => vec![*a, *x, *s],
+        Inst::VSel(_, m, a, b) => vec![*a, *b, *m],
+        Inst::VShuffle(_, a, b, _) => vec![*a, *b],
+        Inst::VX(op, _, a, b) => match op {
+            VX::Splat(_) | VX::Extract(..) | VX::FromLo64 => vec![*a],
+            _ if simd_op(*op).is_some() || matches!(op, VX::Insert(..)) => vec![*a, *b],
+            _ => vec![],
+        },
+        Inst::Call(c, args, _) if !invoke_call => {
+            if !direct(c) {
+                return vec![];
+            }
+            let mut v = args.clone();
+            if let Callee::Indirect(x) | Callee::CIndirect(x, _) = c {
+                v.push(*x);
+            }
+            v
+        }
+        _ => vec![],
+    }
+}
+
+/// The terminator operands an expression tree may supply.
+fn term_operands(t: &Term) -> Vec<VReg> {
+    match t {
+        Term::Branch(c, ..) => vec![*c],
+        Term::Ret(v) => v.clone(),
+        _ => vec![],
+    }
+}
+
+/// How far back (instructions) `sink_trees` looks for an operand's definition.
+const SINK_WINDOW: usize = 256;
+
+/// Expression-tree scheduling (the stackifier's step before `plan_folds`, as LLVM's
+/// WebAssemblyRegStackify): in each block, a value defined once and read once -- by a later
+/// instruction of the same block -- moves down to just before its reader's other tree operands,
+/// so it is pushed where it is read instead of going through a local. Readers are taken from the
+/// block's end, operands in reverse push order (the tree's last operand sits right before its
+/// reader). A definition moves past an instruction only when that one writes none of its
+/// operands; a load, an integer division or remainder (wasm traps) moves past no call, store or
+/// other memory effect; calls, TLS addresses and memory effects never move. Order of effects
+/// is unchanged. None: nothing moved.
+fn sink_trees(f: &Func, direct: &dyn Fn(&Callee) -> bool) -> Option<Func> {
+    let nv = f.vregs.len();
+    let mut defs = vec![0u32; nv];
+    let mut uses = vec![0u32; nv];
+    for p in &f.params {
+        defs[p.0 as usize] += 2;
+    }
+    let mut rd: Vec<VReg> = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            i.defs(|d| defs[d.0 as usize] += 1);
+            reads(i, &mut rd);
+            for u in &rd {
+                uses[u.0 as usize] += 1;
+            }
+        }
+        match &b.term {
+            Term::Branch(c, ..) | Term::Switch(c, _) => uses[c.0 as usize] += 1,
+            Term::Ret(v) => v.iter().for_each(|r| uses[r.0 as usize] += 1),
+            _ => {}
+        }
+    }
+    let movable = |i: &Inst| -> Option<bool> {
+        // Some(barrier-sensitive): may move; true: not past a memory effect
+        match i {
+            Inst::Call(..) | Inst::TlsAddr(..) | Inst::TlsStatic(..) | Inst::AtomicLoad(..) | Inst::Coverage { .. } => None,
+            _ if crate::passes::is_mem_effect(i) => None,
+            Inst::Load(..) | Inst::LoadX(..) | Inst::VLoad(..) | Inst::VLoadX(..) | Inst::VGather(..) => Some(true),
+            Inst::IBin(IOp::Div | IOp::Rem, ..) | Inst::IBinI(IOp::Div | IOp::Rem, ..) => Some(true),
+            _ => Some(false),
+        }
+    };
+    let mut out: Option<Func> = None;
+    for bi in 0..f.blocks.len() {
+        let blk = &f.blocks[bi];
+        let n = blk.insts.len();
+        if n < 2 {
+            continue;
+        }
+        let invoke = matches!(blk.term, Term::Invoke(..));
+        let mut insts: Vec<Inst> = blk.insts.clone();
+        let has_pos = blk.pos.len() == n;
+        let mut pos: Vec<u64> = if has_pos { blk.pos.clone() } else { Vec::new() };
+        let mut moved = false;
+        struct S<'a> {
+            insts: &'a mut Vec<Inst>,
+            pos: &'a mut Vec<u64>,
+            defs: &'a [u32],
+            uses: &'a [u32],
+            n: usize,
+            invoke: bool,
+            moved: &'a mut bool,
+        }
+        fn place(s: &mut S, op: VReg, ip: &mut usize, direct: &dyn Fn(&Callee) -> bool, movable: &dyn Fn(&Inst) -> Option<bool>) {
+            if s.defs[op.0 as usize] != 1 || s.uses[op.0 as usize] != 1 || *ip == 0 {
+                return;
+            }
+            let lo = ip.saturating_sub(SINK_WINDOW);
+            let Some(j) = (lo..*ip).rev().find(|&k| tree_def(&s.insts[k]) == Some(op)) else { return };
+            let Some(barrier) = movable(&s.insts[j]) else {
+                if j + 1 != *ip {
+                    return;
+                }
+                // a call (or other effect) right before its reader is a tree as it stands
+                *ip = j;
+                let sub = push_operands(&s.insts[j], s.invoke && j + 1 == s.n, direct);
+                let mut ip2 = j;
+                for o in sub.iter().rev() {
+                    place(s, *o, &mut ip2, direct, movable);
+                }
+                *ip = ip2;
+                return;
+            };
+            if j + 1 != *ip {
+                let mut ops: Vec<VReg> = Vec::new();
+                reads(&s.insts[j], &mut ops);
+                for k in j + 1..*ip {
+                    let x = &s.insts[k];
+                    if barrier && crate::passes::is_mem_effect(x) {
+                        return;
+                    }
+                    let mut clash = false;
+                    x.defs(|d| clash |= ops.contains(&d));
+                    if clash {
+                        return;
+                    }
+                }
+                let i = s.insts.remove(j);
+                s.insts.insert(*ip - 1, i);
+                if !s.pos.is_empty() {
+                    let p = s.pos.remove(j);
+                    s.pos.insert(*ip - 1, p);
+                }
+                *s.moved = true;
+            }
+            *ip -= 1;
+            let at = *ip;
+            let sub = push_operands(&s.insts[at], false, direct);
+            let mut ip2 = at;
+            for o in sub.iter().rev() {
+                place(s, *o, &mut ip2, direct, movable);
+            }
+            *ip = ip2;
+        }
+        let mut s = S { insts: &mut insts, pos: &mut pos, defs: &defs, uses: &uses, n, invoke, moved: &mut moved };
+        let mut ip = n;
+        if !invoke {
+            for op in term_operands(&blk.term).iter().rev() {
+                place(&mut s, *op, &mut ip, direct, &movable);
+            }
+        }
+        while ip > 0 {
+            let c = ip - 1;
+            let ops = push_operands(&s.insts[c], invoke && c + 1 == n, direct);
+            let mut ip2 = c;
+            for op in ops.iter().rev() {
+                place(&mut s, *op, &mut ip2, direct, &movable);
+            }
+            ip = ip2;
+        }
+        if moved {
+            let g = out.get_or_insert_with(|| f.clone());
+            g.blocks[bi].insts = insts;
+            if has_pos {
+                g.blocks[bi].pos = pos;
+            }
+        }
+    }
+    out
+}
+
+/// The vregs instruction `i` reads (its operands; a vector lane insert reads its vector too).
+fn reads(i: &Inst, out: &mut Vec<VReg>) {
+    out.clear();
+    let mut ds: Vec<VReg> = Vec::new();
+    i.defs(|d| ds.push(d));
+    let mut x = i.clone();
+    x.vregs_mut(|v| out.push(*v));
+    for d in &ds {
+        if let Some(p) = out.iter().position(|v| v == d) {
+            out.remove(p);
+        }
+    }
+    if let Inst::VInsert(_, v, _, _) = i {
+        if !out.contains(v) {
+            out.push(*v);
+        }
+    }
+}
+
 /// The body a function is emitted from: untraced/trap calls end their blocks, vector ops wasm has
 /// no instruction for become per-lane scalar code, switches br_table forms. None: `f0` itself.
 fn prepare(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &HashMap<u32, u32>, link: &dyn Link) -> Option<Func> {
@@ -1584,10 +1806,15 @@ fn prepare(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &Has
     let f2: &Func = legal.as_ref().unwrap_or(f1);
     // shipping O1 (`full`: the code outside a wasm export's hot set) keeps sparse chains: their
     // binary search is more compares than the chain
-    match crate::switch::lower_switches_sized(options, f2, crate::switch::MIN_TABLE_CLUSTERS, f2.full) {
+    let f3: Option<Func> = match crate::switch::lower_switches_sized(options, f2, crate::switch::MIN_TABLE_CLUSTERS, f2.full) {
         Some(s) => Some(s.0),
         None => legal.or(pruned),
+    };
+    if !o.sink {
+        return f3;
     }
+    let base: &Func = f3.as_ref().unwrap_or(f0);
+    sink_trees(base, &|c| direct_callee(c, fn_ix, link)).or(f3)
 }
 
 /// A function's wasm signature facts: per parameter its narrow kind (0: i64; KZ: an i32 the
@@ -1922,45 +2149,7 @@ impl<'a> Fx<'a> {
     /// Operands in wasm push order, for the ones an expression tree may supply.
     fn push_order(&self, b: u32, i: &Inst, last: bool) -> Vec<VReg> {
         let invoke_call = last && matches!(self.f.blocks[b as usize].term, Term::Invoke(..));
-        match i {
-            Inst::Mov(_, a) | Inst::INeg(_, _, a) | Inst::INot(_, _, a) | Inst::IBit(_, _, a) | Inst::IBinI(_, _, _, a, _) | Inst::ICmpI(_, _, _, a, _) | Inst::FUnary(_, _, _, a) | Inst::Conv(_, _, a) | Inst::Load(_, _, a, _) | Inst::AtomicLoad(_, _, _, a) => vec![*a],
-            Inst::IBin(_, _, _, a, b) | Inst::ICmp(_, _, _, a, b) | Inst::FBin(_, _, _, a, b) | Inst::FCmp(_, _, _, a, b) => vec![*a, *b],
-            Inst::Store(_, a, _, s) | Inst::AtomicStore(_, _, a, s) => vec![*a, *s],
-            Inst::Copy(d, s, _) => vec![*d, *s],
-            Inst::LoadX(_, _, a, x, _, _) => vec![*a, *x],
-            Inst::StoreX(_, a, x, _, _, s) => vec![*a, *x, *s],
-            Inst::Sel(_, c, a, b) => vec![*b, *a, *c],
-            Inst::FMulAdd(_, _, _, _, a, b, c) => vec![*a, *b, *c],
-            Inst::VSplat(_, a) | Inst::VExtract(_, a, _) | Inst::VLoad(_, a, _) | Inst::VAny(_, a) => vec![*a],
-            Inst::VInsert(_, v, _, s) => vec![*v, *s],
-            Inst::VStore(a, _, s) => vec![*a, *s],
-            Inst::VLoadX(_, a, x, _, _) => vec![*a, *x],
-            Inst::VStoreX(a, x, _, _, s) => vec![*a, *x, *s],
-            Inst::VSel(_, m, a, b) => vec![*a, *b, *m],
-            Inst::VShuffle(_, a, b, _) => vec![*a, *b],
-            Inst::VX(op, _, a, b) => match op {
-                VX::Splat(_) | VX::Extract(..) | VX::FromLo64 => vec![*a],
-                _ if simd_op(*op).is_some() || matches!(op, VX::Insert(..)) => vec![*a, *b],
-                _ => vec![],
-            },
-            Inst::Call(c, args, _) if !invoke_call => {
-                let direct = match c {
-                    Callee::Fn(id) | Callee::CFn(id, _) => self.fn_ix.contains_key(id),
-                    Callee::Host(s) | Callee::CHost(s, _) => !matches!(self.link.host(s.id), HostBind::Trap),
-                    Callee::Indirect(_) | Callee::CIndirect(..) => true,
-                    Callee::Asm(_) => false,
-                };
-                if !direct {
-                    return vec![];
-                }
-                let mut v = args.clone();
-                if let Callee::Indirect(x) | Callee::CIndirect(x, _) = c {
-                    v.push(*x);
-                }
-                v
-            }
-            _ => vec![],
-        }
+        push_operands(i, invoke_call, &|c| direct_callee(c, self.fn_ix, self.link))
     }
 
     fn term_order(&self, t: &Term) -> Vec<VReg> {
