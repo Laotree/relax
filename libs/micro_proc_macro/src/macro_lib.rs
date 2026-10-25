@@ -879,42 +879,6 @@ impl TokenParser {
         None
     }
 
-    /// Named Rust fields for opt-in derives. Unlike the legacy field parser,
-    /// preserve qualified/generic/function types as opaque tokens for rustc.
-    /// Groups shield commas in tuple/array types; angle depth shields generics.
-    #[cfg(feature = "relax-tokens")]
-    pub fn eat_all_rust_struct_fields(&mut self) -> Option<Vec<StructField>> {
-        if !self.open_brace() { return None; }
-        let mut fields = Vec::new();
-        while !self.eat_eot() {
-            let attrs = self.eat_attributes();
-            if self.eat_ident("pub") && self.open_paren() { self.eat_level(); }
-            let name = self.eat_any_ident()?;
-            if !self.eat_punct_alone(':') { return None; }
-            let mut ty = Vec::new();
-            let mut depth = 0usize;
-            let mut arrow = false;
-            while let Some(token) = self.current.clone() {
-                if let TokenTree::Punct(punct) = &token {
-                    match punct.as_char() {
-                        ',' if depth == 0 => break,
-                        '<' => depth += 1,
-                        '>' if !arrow => depth = depth.checked_sub(1)?,
-                        _ => {}
-                    }
-                    arrow = punct.as_char() == '-';
-                } else { arrow = false; }
-                ty.push(token);
-                self.advance();
-            }
-            if ty.is_empty() || depth != 0 { return None; }
-            fields.push(StructField { name, attrs, ty: ty.into_iter().collect() });
-            // Generated text can print `f32,#[cfg(..)]`, where the comma is Joint.
-            self.eat_punct_any(',');
-        }
-        Some(fields)
-    }
-
     pub fn eat_generic(&mut self) -> Option<TokenStream> {
         let mut tb = TokenBuilder::new();
         // if we have a <, keep running and keep a < stack
@@ -1023,35 +987,3 @@ impl TokenParser {
     }
 }
 
-#[cfg(all(test, feature = "relax-tokens"))]
-mod tests {
-    use super::*;
-    use std::str::FromStr;
-
-    /// The JIT's token model (also the one a rustc build unifies in when relax-native-macros is in
-    /// the same build, e.g. `cargo check --workspace`) and rustc's take the same field types: path
-    /// types at a field's top level once failed derive(Script) with "Unexpected field form".
-    #[test]
-    fn struct_fields_take_path_types() {
-        let src = "{ #[rust] a: crate::pad_routing::TickHold, #[rust] b: ::std::collections::BTreeMap<u32, self::x::Y>, \
-                   #[live] c: Vec<crate::x::Y>, #[rust] d: Option<(String, String)>, #[rust] e: m::Wrap<T>::Inner }";
-        // the host compiler installs the lexer behind `str::parse` (relax-front's builtins)
-        fn lex(s: &str) -> Option<TokenStream> {
-            let mut toks = Vec::new();
-            relax_lex::lexer::lex(s.as_bytes(), 2021, &mut toks).ok()?;
-            relax_lex::tokens::from_toks(s.as_bytes(), &toks, &|_, _| Span::call_site()).ok()
-        }
-        relax_lex::tokens::set_lexer(lex);
-        let mut p = TokenParser::new(TokenStream::from_str(src).unwrap());
-        let fields = p.eat_all_struct_fields().expect("fields parse");
-        let got: Vec<(String, String)> = fields.iter().map(|f| (f.name.clone(), f.ty.to_string().replace(' ', ""))).collect();
-        let want = [
-            ("a", "crate::pad_routing::TickHold"),
-            ("b", "::std::collections::BTreeMap<u32,self::x::Y>"),
-            ("c", "Vec<crate::x::Y>"),
-            ("d", "Option<(String,String)>"),
-            ("e", "m::Wrap<T>::Inner"),
-        ];
-        assert_eq!(got, want.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>());
-    }
-}
