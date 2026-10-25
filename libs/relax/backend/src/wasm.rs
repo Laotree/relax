@@ -51,6 +51,13 @@ pub fn sleb(out: &mut Vec<u8>, mut v: i64) {
     }
 }
 
+/// The bytes of `v` as an unsigned LEB128.
+fn uleb_len(v: u64) -> usize {
+    let mut out = Vec::new();
+    uleb(&mut out, v);
+    out.len()
+}
+
 /// The bytes of `v` as a signed LEB128.
 fn sleb_len(v: i64) -> i64 {
     let mut out = Vec::new();
@@ -1249,6 +1256,9 @@ enum Ctx {
     Loop(u32),
     Block(u32),
     Plain,
+    /// the function's shared exit (Fx::exit): returns branch here, its end restores the stack
+    /// pointer once
+    Exit,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1536,7 +1546,14 @@ struct Fx<'a> {
     tmp64: u32,
     lbl: u32,
     dispatch: bool,
+    /// returns branch to one exit block that restores the shadow stack pointer (a frame and two
+    /// or more returns): `br` instead of each return's `global.set` + `return`
+    exit: bool,
+    /// ... and its branches carry the function's result
+    exit_vals: bool,
     last_br0: usize,
+    /// (start, end, depth) of the last unconditional `br`
+    last_br: (usize, usize, u32),
     last_transfer: usize,
     last_ret: usize,
     /// (end, opcode position, local, vreg) of the last `local.set`
@@ -1620,7 +1637,10 @@ fn lower_func(o: &Options, options: &relax_session::Options, f: &Func, me: usize
         fp: NONE,
         tmp64: NONE,
         lbl: NONE,
+        exit: false,
+        exit_vals: false,
         last_br0: usize::MAX,
+        last_br: (usize::MAX, usize::MAX, 0),
         last_transfer: usize::MAX,
         last_ret: usize::MAX,
         last_set: (usize::MAX, 0, 0, 0),
@@ -1701,6 +1721,15 @@ fn lower_func(o: &Options, options: &relax_session::Options, f: &Func, me: usize
         let fp = fx.fp;
         uleb(&mut fx.out, fp as u64);
     }
+    // one exit for every return of a function with a frame (results of at most one value: a
+    // block type is a value type then)
+    fx.exit = frame > 0 && fx.sp0 == NONE && n_ret >= 2 && ft.results.len() <= 1;
+    if fx.exit {
+        fx.exit_vals = !ft.results.is_empty();
+        fx.op(BLOCK);
+        fx.op(ft.results.first().map_or(0x40, |v| *v as u8));
+        fx.ctx.push(Ctx::Exit);
+    }
     if fx.dispatch {
         fx.emit_dispatch()?;
     } else {
@@ -1708,6 +1737,15 @@ fn lower_func(o: &Options, options: &relax_session::Options, f: &Func, me: usize
     }
     if !ft.results.is_empty() && fx.last_transfer != fx.out.len() {
         fx.out.push(0x00);
+    }
+    if fx.exit {
+        // the last return's branch is the fallthrough
+        if fx.last_br0 == fx.out.len() {
+            fx.out.truncate(fx.out.len() - 2);
+        }
+        fx.ctx.pop();
+        fx.op(END);
+        fx.restore_sp();
     }
     // a trailing `return` is the function's end
     if fx.last_ret == fx.out.len() && fx.ctx.is_empty() {
@@ -2374,13 +2412,46 @@ impl<'a> Fx<'a> {
         self.ctx.iter().rev().position(|x| *x == c).map(|p| p as u32)
     }
     fn br(&mut self, d: u32) {
+        let start = self.out.len();
         self.op(BR);
         self.u(d as u64);
+        self.last_br = (start, self.out.len(), d);
         if d == 0 {
             self.last_br0 = self.out.len();
         }
         self.transfer();
     }
+    /// The unconditional `br` the code emitted so far ends with: (start, depth).
+    fn tail_br(&self) -> Option<(usize, u32)> {
+        (self.last_br.1 == self.out.len()).then_some((self.last_br.0, self.last_br.2))
+    }
+
+    /// Removes the emitted bytes `start..end` (an instruction that turned out redundant), keeping
+    /// the call fixups and the end markers of what follows in place.
+    fn cut(&mut self, start: usize, end: usize) {
+        let n = end - start;
+        self.out.drain(start..end);
+        for (p, _) in &mut self.fix {
+            if *p as usize >= end {
+                *p -= n as u32;
+            }
+        }
+        let shift = |m: &mut usize| {
+            if *m != usize::MAX && *m >= end {
+                *m -= n;
+            } else if *m != usize::MAX && *m > start {
+                *m = usize::MAX;
+            }
+        };
+        shift(&mut self.last_br0);
+        shift(&mut self.last_transfer);
+        shift(&mut self.last_ret);
+        shift(&mut self.last_set.0);
+        shift(&mut self.last_set.1);
+        shift(&mut self.last_br.0);
+        shift(&mut self.last_br.1);
+    }
+
     fn open(&mut self, op: u8, c: Ctx) {
         self.op(op);
         self.op(0x40);
@@ -3769,10 +3840,15 @@ impl<'a> Fx<'a> {
                     let narrow = self.sigs[self.me].ret.get(k).is_some_and(|x| *x != 0);
                     self.value(b, *v, if narrow { Want::Low } else { Want::Nat })?;
                 }
-                self.restore_sp();
-                self.op(RETURN);
-                self.transfer();
-                self.last_ret = self.out.len();
+                if self.exit {
+                    let d = self.depth(Ctx::Exit).unwrap();
+                    self.br(d);
+                } else {
+                    self.restore_sp();
+                    self.op(RETURN);
+                    self.transfer();
+                    self.last_ret = self.out.len();
+                }
             }
             Term::Unreachable => {
                 self.op(0x00);
@@ -3894,10 +3970,25 @@ impl<'a> Fx<'a> {
                 self.value(b, c, w)?;
                 self.open(IF, Ctx::If);
                 self.do_tree(first)?;
+                let then_br = self.tail_br();
                 self.op(ELSE);
                 self.do_tree(second)?;
+                let else_br = self.tail_br();
                 self.ctx.pop();
-                self.op(END);
+                // both arms leave for the same label beyond the `if` (a merge): one branch after
+                // it instead (a fallthrough when the label's block ends there: `close`)
+                // (not a return's branch with its result on the stack)
+                let carries = |s: &Self, d: u32| s.exit_vals && s.ctx.len() >= d as usize && s.ctx[s.ctx.len() - d as usize] == Ctx::Exit;
+                match (then_br, else_br) {
+                    (Some((ts, d)), Some((es, d2))) if d == d2 && d >= 1 && !carries(self, d) => {
+                        let te = ts + 1 + uleb_len(d as u64);
+                        self.out.truncate(es);
+                        self.cut(ts, te);
+                        self.op(END);
+                        self.br(d - 1);
+                    }
+                    _ => self.op(END),
+                }
             }
         }
         Ok(())
