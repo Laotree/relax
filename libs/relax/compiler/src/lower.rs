@@ -5647,8 +5647,10 @@ impl<'a> Lcx<'a> {
         // read-only allocation per content (rustc interns constant allocations; `&0u8` twice is
         // one address), written at compile time
         if shared && l.size > 0 && self.cur == blk0 && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), xt) {
-            if let Some(buf) = self.const_bytes(&v, l, blk0, at0) {
-                let addr = self.u.data_dedup(&buf, l.align.max(1) as u64);
+            if let Some((buf, ptrs)) = self.const_bytes(&v, l, blk0, at0) {
+                // with pointers to data objects (the `&str` pieces of `format_args!`): an object
+                // of the value's type, its pointer words found and linked by walking the type
+                let addr = if ptrs { self.u.data(&buf, l.align.max(1) as u64, crate::syms::DataKind::Typed(xt)) } else { self.u.data_dedup(&buf, l.align.max(1) as u64) };
                 let addr = self.u.data_sym(addr);
                 let p = self.f.vreg(Cls::I);
                 self.emit(Inst::Addr(p, addr));
@@ -5664,10 +5666,22 @@ impl<'a> Lcx<'a> {
 
     /// The bytes of value `v` (layout `l`) when the instructions emitted for it (block `blk`
     /// from `at`) only make constants: register leaves defined by constants, or a fresh slot
-    /// written only by stores of constants (array / aggregate literals). None otherwise.
-    fn const_bytes(&self, v: &Val, l: &Layout, blk: u32, at: usize) -> Option<Vec<u8>> {
+    /// written only by stores of constants (array / aggregate literals). None otherwise. The
+    /// constants include addresses of data objects (string literals, constant allocations):
+    /// the flag says whether a pointer-sized word holds one (the bytes then hold the address).
+    fn const_bytes(&self, v: &Val, l: &Layout, blk: u32, at: usize) -> Option<(Vec<u8>, bool)> {
         let insts = &self.f.blocks[blk as usize].insts[at..];
         let mut consts: HashMap<VReg, u64> = HashMap::default();
+        // vregs holding a data object's address (+ offset): constants only as whole pointer words
+        let mut ptr_regs: Vec<VReg> = Vec::new();
+        let mut ptrs = false;
+        let pw = self.u.ptr_bytes() as usize;
+        let data_addr = |s: &relax_backend::rir::Sym| -> Option<u64> {
+            match self.u.syms.kind(s.id) {
+                Some(crate::syms::SymKind::Data(_)) => Some(self.u.syms.addr(*s)),
+                _ => None,
+            }
+        };
         let width = |m: Mem| match m {
             Mem::Int(n, _) => n as usize,
             Mem::F32 => 4,
@@ -5692,15 +5706,27 @@ impl<'a> Lcx<'a> {
                         Inst::Fconst(d, b, _) => {
                             consts.insert(*d, *b);
                         }
+                        Inst::Addr(d, s) => {
+                            if let Some(a) = data_addr(s) {
+                                consts.insert(*d, a);
+                                ptr_regs.push(*d);
+                            }
+                        }
                         _ => {}
                     }
                 }
                 for (r, lf) in regs.iter().zip(leaves.iter()) {
                     let b = *consts.get(r)?;
                     let (o, n) = (lf.off as usize, width(lf.mem));
+                    if ptr_regs.contains(r) {
+                        if n != pw || o % pw != 0 {
+                            return None;
+                        }
+                        ptrs = true;
+                    }
                     buf.get_mut(o..o + n)?.copy_from_slice(&b.to_le_bytes()[..n]);
                 }
-                Some(buf)
+                Some((buf, ptrs))
             }
             Val::M(base, off0) => {
                 // addresses derived from the fresh slot: vreg -> offset in it
@@ -5713,6 +5739,13 @@ impl<'a> Lcx<'a> {
                         Inst::Fconst(d, b, _) => {
                             consts.insert(*d, *b);
                         }
+                        Inst::Addr(d, s) => match data_addr(s) {
+                            Some(a) => {
+                                consts.insert(*d, a);
+                                ptr_regs.push(*d);
+                            }
+                            None => return None,
+                        },
                         Inst::SlotAddr(d, _) => {
                             addrs.insert(*d, 0);
                         }
@@ -5727,6 +5760,12 @@ impl<'a> Lcx<'a> {
                             if at < 0 {
                                 return None;
                             }
+                            if ptr_regs.contains(src) {
+                                if n != pw || at as usize % pw != 0 {
+                                    return None;
+                                }
+                                ptrs = true;
+                            }
                             buf.get_mut(at as usize..at as usize + n)?.copy_from_slice(&val.to_le_bytes()[..n]);
                         }
                         // anything else touching a slot address (calls, copies, moves) or any
@@ -5737,7 +5776,7 @@ impl<'a> Lcx<'a> {
                 if !addrs.contains_key(base) {
                     return None;
                 }
-                Some(buf)
+                Some((buf, ptrs))
             }
         }
     }

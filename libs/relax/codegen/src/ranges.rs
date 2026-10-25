@@ -553,8 +553,7 @@ fn decide_rel(st: &State, c: Cond, signed: bool, x: u32, y: Opnd) -> Option<bool
     // in a loop that tested `i < out.len()` (i >= 1)
     {
         let order = |a: &[u32], bs: &[Opnd], strict: bool| -> Option<bool> {
-            // x' <= a-value, b-value <= y': does a-value < / <= b-value hold?
-            let mut res = None;
+            // x <= (or <) an a-value, a b-value <= y: an order of a-value and b-value decides x vs y
             for &(rc, rs, rx, ry) in &st.rel {
                 if rs != signed || !a.contains(&rx) || !bs.contains(&ry) {
                     continue;
@@ -570,7 +569,7 @@ fn decide_rel(st: &State, c: Cond, signed: bool, x: u32, y: Opnd) -> Option<bool
                     _ => {}
                 }
             }
-            res
+            None
         };
         let no_wrap_down = |s0: u32, k: i64| -> bool {
             st.get(s0).is_some_and(|r| r.lo as i128 + k as i128 >= 0 && (!signed || r.hi <= i64::MAX as u64))
