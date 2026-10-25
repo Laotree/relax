@@ -15556,7 +15556,8 @@ unsafe fn t1_key(up: *const Unit, id: u32) -> String {
 /// replay builds O3 at the first call, before an O2 worker would have, so the snapshot took the O1
 /// RIR: a different input (root-differ / callee-differ), whose recorded block frequencies no longer
 /// fit it (frequency-shape: they were dropped, and the hot sites of set_uniform, set_material,
-/// reconcile inlined nothing). A body whose O2 RIR could not be made is a divergence ("o2-first").
+/// reconcile inlined nothing). A body whose O2 RIR could not be made is a divergence ("o2-first";
+/// "o2-first-noslot": its slot was not armed in this run yet).
 unsafe fn t1prof_o2_first(up: *mut Unit, id: u32) {
     let key = t1_key(up, id);
     let ids: Vec<(u32, String)> = {
@@ -15578,14 +15579,19 @@ unsafe fn t1prof_o2_first(up: *mut Unit, id: u32) {
                 }
             }));
         }
-        if c == u32::MAX || !has_o2(c) {
+        if c == u32::MAX {
+            // (not armed in this run yet: a closure, glue, or a body not compiled before this build)
+            t1prof_divergence("o2-first-noslot", &k);
+        } else if !has_o2(c) {
             t1prof_divergence("o2-first", &k);
         }
     }
 }
 
 /// Hash of a RIR dump without fn slot numbers, symbol ids and host addresses (they differ
-/// between runs).
+/// between runs), its virtual registers numbered by first appearance (two lowerings of one body can
+/// number them differently, e.g. core::heap::from_size_align: an O1 build's and an O2 front's: the
+/// same code, which read as callee-differ in every replay).
 fn t1_norm_hash(rir: &relax_backend::rir::Func) -> u64 {
     let d = rir.dump();
     // The key already identifies the instance. Closure display names include the
@@ -15593,14 +15599,33 @@ fn t1_norm_hash(rir: &relax_backend::rir::Func) -> u64 {
     let d = d.find(" params ").map_or(d.as_str(), |i| &d[i..]);
     let b = d.as_bytes();
     let mut norm: Vec<u8> = Vec::with_capacity(b.len());
+    let mut vregs: HashMap<u64, u64> = HashMap::new();
+    let mut fn_addr = false;
     let mut i = 0;
     while i < b.len() {
-        // FnAddr(VReg(v), slot): the slot
-        if b[i..].starts_with(b"FnAddr(VReg(") {
-            while i < b.len() && b[i] != b')' {
-                norm.push(b[i]);
+        // VReg(n): numbered by first appearance
+        if b[i..].starts_with(b"VReg(") {
+            norm.extend_from_slice(b"VReg(");
+            i += 5;
+            let mut n = 0u64;
+            while i < b.len() && b[i].is_ascii_digit() {
+                n = n * 10 + (b[i] - b'0') as u64;
                 i += 1;
             }
+            let k = vregs.len() as u64;
+            let k = *vregs.entry(n).or_insert(k);
+            norm.extend_from_slice(k.to_string().as_bytes());
+            continue;
+        }
+        // FnAddr(VReg(v), slot): the slot (v as every register)
+        if b[i..].starts_with(b"FnAddr(VReg(") {
+            norm.extend_from_slice(b"FnAddr(");
+            i += 7;
+            fn_addr = true;
+            continue;
+        }
+        if fn_addr && b[i..].starts_with(b"), ") {
+            fn_addr = false;
             norm.extend_from_slice(b"), ");
             i += 3;
             while i < b.len() && b[i].is_ascii_digit() {
