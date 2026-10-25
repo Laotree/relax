@@ -14219,6 +14219,8 @@ static BORROW_QUEUE: relax_session::sync::Mutex<std::collections::VecDeque<(usiz
 /// SPEC-V: slot `id` runs borrowed twin code: its own build in the background (O2 worker: the
 /// cache's entry when it has one, else an O2 build). Owner thread.
 unsafe fn borrow_build_enqueue(up: *mut Unit, id: u32) {
+    // (an O2 build: marked hot, as o2_base marks the slots it queues)
+    (&*up).fns[id as usize].hot_hint.store(true, Ordering::Relaxed);
     O2_SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((up as usize, id));
     {
         let _q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
@@ -14275,14 +14277,20 @@ unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt]
             }
             seen.push(c);
             built += 1;
-            let front = owner::publish(|| (&*up).front.clone());
+            // (an O2 build: marked hot, as o2_base marks the slots it queues)
+            let front = owner::publish(|| {
+                (&*up).fns[c as usize].hot_hint.store(true, Ordering::Relaxed);
+                (&*up).front.clone()
+            });
             let Some(w) = take_prefronted(&front, || o2_begin(up, c)).flatten() else { continue };
             let done = w.run();
             if let Ok(Ok((_, _, cc))) = &done.built {
                 todo.extend(calls(&cc.relocs));
             }
             owner::publish(|| o2_finish(up, done));
-            SPECV_PREBUILT.fetch_add(1, Ordering::Relaxed);
+            if owner::publish(|| (&*up).fns[c as usize].compiled) {
+                SPECV_PREBUILT.fetch_add(1, Ordering::Relaxed);
+            }
             if specv_trace() {
                 let n = owner::publish(|| short_name(&(&*up).fns[c as usize].name).to_string());
                 eprintln!("specv @{:.3} #{} {} built ahead of a replacement that calls it (it ran inside twin code)", wall_ns() as f64 / 1e9, c, n);
