@@ -1126,6 +1126,10 @@ fn launch_main(upn: usize, id: DomainId, base: u64, target: u64, arg: u64, packa
         crate::jit::ensure_altstack();
         if crate::run::app_domain() == Some(id) {
             crate::jit::MAIN_TID.store(crate::jit::current_thread_id(), std::sync::atomic::Ordering::Relaxed);
+            // ARMIPC A/B knob: the app's main thread at the QoS of a native app's main thread
+            if relax_backend::stats::opt_env_off("+uiqos") {
+                crate::os::thread::interactive();
+            }
         }
         let up = upn as *mut Unit;
         relax_domain_enter(base, token);
