@@ -3552,6 +3552,7 @@ pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
         // the run's end as at exit: compiles stop and this run's code goes into the disk cache,
         // so the restarted run links it instead of compiling it again (exec skips the exit handlers)
         crate::run::summary("restart");
+        crate::tui::finish(false);
         eprintln!("makepad live: restarting with the program's state ({})", RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()));
         let t0 = RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed);
         let e = std::process::Command::new(exe).args(&args[1..]).env("MAKEPAD_RUN_RESTORE", &path).env("MAKEPAD_RUN_RESTART_T0", t0.to_string()).exec();

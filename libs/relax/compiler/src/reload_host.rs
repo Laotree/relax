@@ -278,8 +278,11 @@ fn restart(h: Handover, state: Option<&[u8]>) {
         }
         let reason = super::RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()).clone();
         cmd.env("MAKEPAD_RUN_RESTART_T0", super::RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed).to_string());
-        // the run ends as at exit (exec skips the exit handlers)
+        // the run ends as at exit (exec skips the exit handlers); fd 2 goes back to the terminal
+        // now (the transcript tee is a thread of this process: the new one starts its own), so
+        // the line below and the new process's output are not lost in the old pipe
         crate::run::summary("restart");
+        crate::tui::finish(false);
         eprintln!("makepad live: restarting: {reason}");
         let e = cmd.exec();
         fail(format!("restart into the rebuilt makepad failed: {e}; the app runs the previous code"));
