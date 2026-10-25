@@ -216,10 +216,6 @@ pub struct Options {
     /// parameters of a declared narrow integer or pointer type (Func::param_ints) are i32
     /// whatever their callers pass (else only when every direct call passes a narrow value)
     pub narrow_declared: bool,
-    /// a constant copy of at most four 8/4/2/1-byte pieces is those loads and stores, not a
-    /// memory.copy (LLVM's memcpy expansion, MaxStoresPerMemcpyOptSize = 4; an engine runs a
-    /// memory.copy as a bounds-checked call into its runtime)
-    pub small_copies: bool,
     /// the same for frame addresses used mostly as memory bases (the frame offset folds into
     /// the access)
     pub remat_slots: bool,
@@ -239,7 +235,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { memory64: false, shared_max_pages: None, stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, sink: true, narrow_declared: true, small_copies: true, remat_slots: true, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true, order_by_bytes: true }
+        Options { memory64: false, shared_max_pages: None, stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, sink: true, narrow_declared: true, remat_slots: true, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true, order_by_bytes: true }
     }
 }
 
@@ -3996,25 +3992,6 @@ impl<'a> Fx<'a> {
                 // a copy of a frame slot onto itself (a result forwarded into the slot it came
                 // from) is no code
                 if *n > 0 && !(dst == src || self.slot_of(*dst).is_some_and(|x| Some(x) == self.slot_of(*src))) {
-                    if let Some(pieces) = self.copy_pieces(*dst, *src, *n) {
-                        // each address is read once per piece: a value just set stays in its local
-                        self.last_set.0 = usize::MAX;
-                        let mut at = 0u32;
-                        for m in pieces {
-                            let w = match m { Mem::Int(w, _) => w as u32, _ => unreachable!() };
-                            let od = self.value(b, *dst, Want::Addr(at as i64))?;
-                            let os = self.value(b, *src, Want::Addr(at as i64))?;
-                            let (lop, lal) = self.load_op(m)?;
-                            self.op(lop);
-                            self.memarg(lal, os);
-                            let (sop, sal) = self.store_op(m)?;
-                            self.op(sop);
-                            self.memarg(sal, od);
-                            self.last_set.0 = usize::MAX;
-                            at += w;
-                        }
-                        return Ok(());
-                    }
                     self.addr_exact(b, *dst)?;
                     self.addr_exact(b, *src)?;
                     self.aconst(*n as i64);
@@ -4121,31 +4098,6 @@ impl<'a> Fx<'a> {
     }
 
     /// Pushes `v` as an address with no memarg offset left over.
-    /// The pieces (widest first) a constant copy of `n` bytes is as loads and stores: at most four,
-    /// both addresses safe to read once per piece (a local, or a constant / symbol / frame-slot
-    /// address re-made at each read; never a moved-down tree, which may load or run once only).
-    fn copy_pieces(&self, dst: VReg, src: VReg, n: u32) -> Option<Vec<Mem>> {
-        if !self.o.small_copies || n > 32 {
-            return None;
-        }
-        let again = |v: VReg| {
-            let (fb, fi) = self.fold_def[v.0 as usize];
-            fb == NONE || matches!(self.f.blocks[fb as usize].insts[fi as usize], Inst::SlotAddr(..) | Inst::Addr(..) | Inst::Iconst(..))
-        };
-        if !again(dst) || !again(src) {
-            return None;
-        }
-        let mut pieces = Vec::new();
-        let mut left = n;
-        for w in [8u32, 4, 2, 1] {
-            while left >= w {
-                pieces.push(Mem::Int(w as u8, false));
-                left -= w;
-            }
-        }
-        (pieces.len() <= 4).then_some(pieces)
-    }
-
     fn addr_exact(&mut self, b: u32, v: VReg) -> Result<(), String> {
         let o = self.value(b, v, Want::Addr(0))?;
         if o != 0 {

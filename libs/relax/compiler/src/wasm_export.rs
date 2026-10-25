@@ -744,7 +744,6 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
                 "remat" => opts.remat = on,
                 "sink" => opts.sink = on,
                 "declared" => opts.narrow_declared = on,
-                "copies" => opts.small_copies = on,
                 "rematslots" => opts.remat_slots = on,
                 "datafirst" => opts.data_first = on,
                 "sp0" => opts.sp0 = on,
