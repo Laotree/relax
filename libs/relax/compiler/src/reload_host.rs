@@ -31,17 +31,21 @@ pub(crate) fn loader() -> Option<PathBuf> {
     }).clone()
 }
 
-/// The cargo target directory the loader was built into (the one holding CACHEDIR.TAG), and the
-/// `--target` triple between it and the profile directory, if any.
+/// The cargo target directory the loader was built into (cargo keeps `.rustc_info.json` at its
+/// root, and `.fingerprint` in each profile directory), and the `--target` triple between it and
+/// the profile directory, if any.
 fn layout(exe: &Path) -> Option<(PathBuf, String, Option<String>)> {
     let profile_dir = exe.parent()?;
+    if !profile_dir.join(".fingerprint").is_dir() { return None; }
     let profile = profile_dir.file_name()?.to_string_lossy().into_owned();
+    let root = |d: &Path| d.join(".rustc_info.json").is_file() || d.join("CACHEDIR.TAG").is_file();
     let up = profile_dir.parent()?;
-    if up.join("CACHEDIR.TAG").is_file() {
+    if root(up) {
         return Some((up.to_path_buf(), profile, None));
     }
-    let root = up.parent()?;
-    if !root.join("CACHEDIR.TAG").is_file() { return None; }
+    let root_dir = up.parent()?;
+    if !root(root_dir) { return None; }
+    let root = root_dir;
     Some((root.to_path_buf(), profile, Some(up.file_name()?.to_string_lossy().into_owned())))
 }
 
