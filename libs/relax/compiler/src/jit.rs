@@ -14836,7 +14836,7 @@ fn spawn_tier1_threads(runtime: &crate::options::RuntimeOptions, options: &crate
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     let cap = cores.saturating_sub(1).max(1);
     let forced = runtime.tier1_threads;
-    let (normal, max) = if t1prof_serial(options) {
+    let (normal, max) = if options.tier1_profile.is_some() {
         (1, 1)
     } else if let Some(n) = forced {
         let n = n.clamp(1, cap);
@@ -16063,16 +16063,6 @@ fn t1prof_replay(options: &crate::options::Options) -> bool {
     t1prof_on(options) && T1PROF.lock().unwrap().as_ref().is_some_and(|p| p.replay)
 }
 
-/// Deterministic O3 builds one at a time on the owner, without speculative builds or off-owner
-/// fronts: the replay only. A record builds on the live path (the level's O3 workers and burst
-/// workers, prefronts, pipelining) and only writes down what each build took: a one-builder
-/// record took a tick root's O3 build before its callees' counted / O2 bodies existed, and its
-/// replay ran the race tick +15% over live warm (RACEREC open 1; live with MAKEPAD_RUN_O3_THREADS=1
-/// gave the same). MAKEPAD_RUN_OPT=-liverec records one at a time again (A/B).
-fn t1prof_serial(options: &crate::options::Options) -> bool {
-    t1prof_on(options) && (t1prof_replay(options) || relax_backend::stats::opt_off(options, "-liverec"))
-}
-
 /// MAKEPAD_RUN_O3_PROFILE_DUMP=<substring of a key>: the O3 snapshot's input bodies of matching
 /// candidates as hashed (t1_norm_hash), to <profile>.dump/<record|replay>/<hash of key>.<hash>.rir
 /// (diff a record's against a replay's to see why their inputs differ).
@@ -16294,7 +16284,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // exception to rule I-PUB (OWNERARCH.DESIGN.md: deterministic A/Bs only): a program-class
     // request, not a publish.
     // (deterministic O3, record too: both runs build the same way, their inputs on one path)
-    if t1prof_serial(options) && !owner::is_owner() {
+    if t1prof_on(options) && !owner::is_owner() {
         return owner::call(owner::Class::Program, || compile_tier1(up, id));
     }
     // replay: the O2 builds whose RIR the recorded build took, first (MAKEPAD_RUN_OPT=-o2first: not; A/B)
@@ -16332,7 +16322,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         f.compiled && f.rir.is_none() && f.build_err.is_none() && !f.building
     };
     let (needs, front) = owner::publish(|| refront_settled(up, id, needs_rir(up)));
-    if needs && !t1prof_serial(options) && !owner::is_owner() {
+    if needs && !t1prof_on(options) && !owner::is_owner() {
         while !tier1_workers_ready() {
             job_sleep(TIER1_POLL);
         }
@@ -16349,7 +16339,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // off the unit (typeck_ahead, lower_ahead) and asks again, one traversal level per round.
     // The owner's build then only takes the lowered RIR (O1 optimisation and the candidate's own
     // small inline candidates stay there). Warm Stage: single snapshots of 100-680 ms on the owner.
-    let prefront = !owner::is_owner() && !t1prof_serial(options) && pipelined();
+    let prefront = !owner::is_owner() && !t1prof_on(options) && pipelined();
     let mut fronted: std::collections::HashSet<u32> = Default::default();
     // slots whose front named a constant or thread-local the owner had not made yet (noted for
     // its const_drain): fronted again in the next round, each up to REFRONTS times
@@ -17864,7 +17854,7 @@ pub fn enable_pipelining(options: &crate::options::Options) {
     // deterministic O3 (MAKEPAD_RUN_O3_PROFILE): no speculative builds -- a caller prepared while a
     // callee's build is in flight on a speculative worker does not inline it at O1, so O1
     // RIR (O3's input) would depend on the worker race
-    PIPELINE.store(options.spec && !t1prof_serial(options), Ordering::SeqCst);
+    PIPELINE.store(options.spec && options.tier1_profile.is_none(), Ordering::SeqCst);
 }
 
 fn pipelined() -> bool {
