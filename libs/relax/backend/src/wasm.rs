@@ -2983,6 +2983,10 @@ impl<'a> Fx<'a> {
                 if matches!(inst, Inst::ICmp(..) | Inst::ICmpI(..) | Inst::FCmp(..)) && matches!(want, Want::Truthy | Want::Inverted) {
                     return self.expr_wide(b, i, want);
                 }
+                // a narrow constant wanted whole: its i64 form directly, not an i32 extended
+                if let (Inst::Iconst(..), Want::Nat) = (inst, want) {
+                    return self.expr_wide(b, i, want);
+                }
                 self.expr32(b, i)?;
                 return self.from_kind(k, want);
             }
