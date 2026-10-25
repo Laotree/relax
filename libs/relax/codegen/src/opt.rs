@@ -3562,6 +3562,7 @@ pub fn forward_slot_dests_x(options: &relax_session::Options, f: &mut Func, min:
     let mut any = false;
     for _round in 0..8 {
         let Some((der, esc)) = slot_derivation(f) else { return any };
+        let esc_pts = slot_escape_points(f, &der, &esc);
         let ns = f.slots.len();
         let nb = f.blocks.len();
         // values that are the result buffer plus a constant (single definitions)
@@ -3832,7 +3833,25 @@ pub fn forward_slot_dests_x(options: &relax_session::Options, f: &mut Func, min:
                     }
                 }
             }
-            let c_esc = !to_sret && esc[c as usize];
+            // C's address escapes (stored, returned): its other pointers can see C only from an
+            // escape on, so only an escape that can come before B's live region ends -- earlier in
+            // cb, in a block with a path into the region (to_cb: the blocks reaching B's accesses
+            // or the copy), or anywhere in cb when cb is in a loop -- makes unknown memory accesses
+            // in that region a clash
+            let c_esc = !to_sret && esc[c as usize] && match &esc_pts[c as usize] {
+                None => true,
+                Some(pts) => {
+                    let mut back = vec![false; nb];
+                    st.extend(preds[cb].iter().copied());
+                    while let Some(x) = st.pop() {
+                        if !back[x as usize] {
+                            back[x as usize] = true;
+                            st.extend(preds[x as usize].iter().copied());
+                        }
+                    }
+                    pts.iter().any(|&(pb, pi)| if pb as usize == cb { (pi as usize) < ci || back[cb] } else { to_cb[pb as usize] })
+                }
+            };
             let c_acc = |x: usize| if to_sret { sret_blocks[x] } else { acc[c as usize].contains(&(x as u32)) };
             let mut clash = (0..nb).any(|x| x != cb && from_b[x] && to_cb[x] && (c_acc(x) || (c_esc && unknown_mem[x])));
             if !clash && to_sret {
@@ -4100,6 +4119,86 @@ fn slot_derivation(f: &Func) -> Option<(Vec<u32>, Vec<bool>)> {
         }
     }
     Some((der, esc))
+}
+
+/// Where each escaping slot's address escapes (slot_derivation's `esc`): the instructions that
+/// store a value derived from it, and the blocks returning one, as (block, instruction; a
+/// returning block's terminator is its length). None: an escape slot_derivation found
+/// elsewhere (an ambiguous join, a parameter): everywhere.
+fn slot_escape_points(f: &Func, der: &[u32], esc: &[bool]) -> Vec<Option<Vec<(u32, u32)>>> {
+    const NONE: u32 = u32::MAX;
+    const MULTI: u32 = u32::MAX - 1;
+    let ns = f.slots.len();
+    let mut pts: Vec<Option<Vec<(u32, u32)>>> = (0..ns).map(|s| if esc[s] { Some(Vec::new()) } else { None }).collect();
+    let mut seen = vec![false; ns];
+    let dslot = |v: VReg| der[v.0 as usize];
+    let mut add = |pts: &mut Vec<Option<Vec<(u32, u32)>>>, seen: &mut Vec<bool>, v: VReg, b: usize, k: usize| {
+        let d = dslot(v);
+        if d != NONE && d != MULTI {
+            seen[d as usize] = true;
+            if let Some(p) = &mut pts[d as usize] {
+                p.push((b as u32, k as u32));
+            }
+        }
+    };
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            match i {
+                Inst::Store(_, _, _, v) | Inst::StoreX(_, _, _, _, _, v) | Inst::AtomicStore(_, _, _, v) | Inst::AtomicRmw(_, _, _, _, _, v) => add(&mut pts, &mut seen, *v, bi, k),
+                Inst::AtomicCas(_, _, _, _, _, e, n) => {
+                    add(&mut pts, &mut seen, *e, bi, k);
+                    add(&mut pts, &mut seen, *n, bi, k);
+                }
+                _ => {}
+            }
+        }
+        if let Term::Ret(vs) = &b.term {
+            for v in vs {
+                add(&mut pts, &mut seen, *v, bi, b.insts.len());
+            }
+        }
+    }
+    // an escape these points do not explain (a join of two slots' addresses, a parameter)
+    for s in 0..ns {
+        if esc[s] && !seen[s] {
+            pts[s] = None;
+        }
+    }
+    let mut multi = vec![false; ns];
+    for b in &f.blocks {
+        for i in &b.insts {
+            let mut srcs: Vec<u32> = Vec::new();
+            for_uses(i, |v| {
+                let d = dslot(v);
+                if d != NONE && d != MULTI && !srcs.contains(&d) {
+                    srcs.push(d);
+                }
+            });
+            let mut defs_multi = false;
+            for_defs(i, |d| defs_multi |= dslot(d) == MULTI);
+            if defs_multi || srcs.len() > 1 {
+                let mut has_def = false;
+                for_defs(i, |_| has_def = true);
+                if has_def {
+                    for s in srcs {
+                        multi[s as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+    for p in &f.params {
+        let d = dslot(*p);
+        if d != NONE && d != MULTI {
+            multi[d as usize] = true;
+        }
+    }
+    for s in 0..ns {
+        if multi[s] {
+            pts[s] = None;
+        }
+    }
+    pts
 }
 
 /// Sinks a pure single-definition, single-use arithmetic result into the block that uses it when
@@ -4508,6 +4607,45 @@ mod tests {
         assert!(forward_slot_dests_x(&relax_session::Options::default(), &mut f, 32));
         let left = f.blocks.iter().flat_map(|b| &b.insts).filter(|i| matches!(i, Inst::SlotAddr(..))).count();
         assert!(left >= 1, "both slots were moved into the result buffer");
+    }
+
+    /// `let s = format!(..); for w in s.split(' ') {..}`: the call's result buffer B is copied into
+    /// the variable C, whose address escapes only after the copy (a call result derived from it is
+    /// stored): B is built in C. With C's address stored before B's call, the call may see C
+    /// through that pointer: B stays.
+    fn dests_x_escape_fixture(escape_first: bool) -> Func {
+        let mut f = Func::new("escape_after".into(), 0);
+        let (q, g) = (f.vreg(Cls::I), f.vreg(Cls::I));
+        f.params.extend([q, g]);
+        let (b, c) = (f.slot(12, 4), f.slot(12, 4));
+        let v: Vec<VReg> = (0..8).map(|_| f.vreg(Cls::I)).collect();
+        f.block();
+        f.sret_callees.push(7);
+        let mut insts = vec![Inst::SlotAddr(v[0], b), Inst::SlotAddr(v[1], c)];
+        if escape_first {
+            insts.push(Inst::Store(Mem::Int(8, false), g, 0, v[1]));
+        }
+        insts.extend([
+            Inst::Call(Callee::Fn(7), vec![v[0], q], vec![]),
+            Inst::Copy(v[1], v[0], 12),
+            Inst::Call(Callee::Fn(8), vec![v[1]], vec![v[2]]),
+            Inst::Store(Mem::Int(8, false), g, 8, v[2]),
+            Inst::Call(Callee::Fn(9), vec![v[1]], vec![]),
+        ]);
+        f.blocks[0].insts = insts;
+        f.blocks[0].term = Term::Ret(vec![]);
+        for bl in &mut f.blocks { bl.pos = vec![0; bl.insts.len()]; }
+        f.verify().unwrap();
+        f
+    }
+
+    #[test]
+    fn dests_x_builds_in_a_variable_whose_address_escapes_after_the_copy() {
+        let mut f = dests_x_escape_fixture(false);
+        assert!(forward_slot_dests_x(&relax_session::Options::default(), &mut f, 8));
+        assert!(!f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Copy(..))), "{}", f.dump());
+        let mut f = dests_x_escape_fixture(true);
+        assert!(!forward_slot_dests_x(&relax_session::Options::default(), &mut f, 8), "built in a variable a pointer already names:\n{}", f.dump());
     }
 
     #[test]
