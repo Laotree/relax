@@ -6437,9 +6437,10 @@ impl Unit {
     /// O3 again in the background each launch (x64 live warm draw +10% over --check-first).
     /// MAKEPAD_RUN_OPT=-twinlink keeps the twins (A/B).
     pub(crate) fn twin_link_target(&self, caller: u32, target: u32) -> u32 {
-        let (Some(t), Some(c)) = (self.fns.get(target as usize), self.fns.get(caller as usize)) else { return target };
-        let FnKey::Plain(base) = t.key else { return target };
-        let body = match c.key { FnKey::Plain(b) => b, _ => caller };
+        let n = self.fns.len();
+        if target as usize >= n || caller as usize >= n { return target }
+        let FnKey::Plain(base) = self.fns[target as usize].key else { return target };
+        let body = match self.fns[caller as usize].key { FnKey::Plain(b) => b, _ => caller };
         if (base as usize) < self.fns.len() && self.verdict_clean(body) && !matches!(self.verdict_state(base), Verdict::Failed(_))
             && !relax_backend::stats::opt_off(&self.prog.session.options, "-twinlink") {
             TWIN_RETARGETS.fetch_add(1, Ordering::Relaxed);

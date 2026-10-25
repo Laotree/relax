@@ -7312,7 +7312,8 @@ impl Linker {
                 20 | 21 | 25 => {
                     d.u8()?;
                     let b = d.bytes()?;
-                    let sid = u.twin_link_target(id, self.slot_of_bytes(u, b)?);
+                    let sid = self.slot_of_bytes(u, b)?;
+                    let sid = u.twin_link_target(id, sid);
                     if tag == 21 {
                         thunks.push(sid);
                     } else {
