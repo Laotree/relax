@@ -25,7 +25,7 @@ pub fn allowed() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
     *ALLOWED.get_or_init(|| {
         let lan = std::env::var("MAKEPAD_LAN").ok();
-        let hidden = std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_some_and(|v| !v.is_empty());
+        let hidden = std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_some();
         let on = decide(lan.as_deref(), hidden);
         if !on {
             crate::socket_audit::start_if_enabled();
