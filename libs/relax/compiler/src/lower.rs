@@ -12242,6 +12242,7 @@ pub fn glue_func(u: &mut Unit, kind: u8, t: TyId) -> Func {
     let entry = f.block();
     let p = f.vreg(Cls::I);
     f.params.push(p);
+    f.param_ints.push((p, u.ptr_bytes() as u8, false));
     let mut cur = entry;
     // a provided crate's opaque type: rustc's drop_in_place, through its drop shim
     let opaque_drop = match u.tcx.tys.kind(t) {
