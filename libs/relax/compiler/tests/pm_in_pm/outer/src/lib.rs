@@ -7,6 +7,7 @@ use proc_macro::TokenStream;
 struct Helper;
 
 #[derive(pmpm_inner::Hello)]
+#[allow(dead_code)]
 enum Other { A }
 
 #[proc_macro]

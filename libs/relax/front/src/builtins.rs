@@ -866,8 +866,13 @@ fn expand_buf(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: 
             return Ok(one(T::Int, &if b == Builtin::Line { format!("{}u32", lc.line) } else { format!("{}u32", lc.column) }));
         }
         Builtin::ModulePath => {
+            // the package's crate name first, also for a crate renamed to tell two versions of it
+            // apart (crates.rs disambiguate_multi_version_crates; the module keys keep that name)
             let mut m = match ctx {
-                Some(c) => c.module_path.clone(),
+                Some(c) => match c.module_path.split_once("::") {
+                    Some((head, rest)) => format!("{}::{}", crate::crates::base_crate_name(head), rest),
+                    None => crate::crates::base_crate_name(&c.module_path).to_string(),
+                },
                 None => crate::crates::base_crate_name(&p.krate).to_string(),
             };
             for s in &p.mod_stack {
