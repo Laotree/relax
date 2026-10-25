@@ -18287,6 +18287,9 @@ unsafe fn o3_next_level(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &
                         relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(x), _, _) | relax_backend::rir::Inst::FnAddr(_, x) => x,
                         _ => continue,
                     };
+                    if *x != id && callees.len() >= 1024 && !seen.contains(x) && relax_codegen::opt::inline_trace(&fns[id as usize].name) {
+                        eprintln!("inline-trace-snap {}: out fn#{} {} (1024 candidates)", fns[id as usize].name, x, fns[*x as usize].name);
+                    }
                     if *x != id && callees.len() < 1024 && seen.insert(*x) {
                         callees.push(*x);
                         next.push(*x);
@@ -18354,17 +18357,30 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &cr
         t1prof_dump(&format!("root:{}", k), rir, 255);
         rir_hashes.push((String::new(), t1_norm_hash(rir) ^ root_unverified as u64));
     }
+    // MAKEPAD_RUN_INLINE_TRACE: the candidates this snapshot leaves out, and why (the inliner's
+    // trace names them only as fn#<slot>)
+    let trace = relax_codegen::opt::inline_trace(&fns[id as usize].name);
+    if trace {
+        eprintln!("inline-trace-snap {}: {} candidates", fns[id as usize].name, callees.len());
+    }
     for &c in callees {
-        let Some(v) = views.get(&c) else { continue };
+        let Some(v) = views.get(&c) else {
+            if trace { eprintln!("inline-trace-snap {}: out fn#{} {} (no view)", fns[id as usize].name, c, fns[c as usize].name); }
+            continue;
+        };
         let attrs = match callee_attrs(prog, tcx, fns, core, c, inline_all, true, root_unverified) {
             Some(a) if xcrate_unavailable(prog, fns, core, id, c) => (a & !relax_codegen::opt::ATTR_HINT) | relax_codegen::opt::ATTR_XCRATE,
             Some(a) => a,
             None => {
+                if trace { eprintln!("inline-trace-snap {}: out fn#{} {} (not inlinable)", fns[id as usize].name, c, fns[c as usize].name); }
                 if fns[c as usize].unverified.load(Ordering::Relaxed) { unverified_left.push(c); }
                 continue;
             }
         };
         let live_cold = !v.ran && v.uninlined;
+        if trace && v.rir.is_none() {
+            eprintln!("inline-trace-snap {}: out fn#{} {} (no RIR)", fns[id as usize].name, c, fns[c as usize].name);
+        }
         if let Some(r) = &v.rir {
             let cold = match t1key {
                 Some(k) => {

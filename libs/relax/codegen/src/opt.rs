@@ -709,7 +709,8 @@ fn pgo_site_limits(lim: &InlineLimits, counted: bool, priority: u32, callee: &Fu
     }
 }
 
-fn inline_trace(name: &str) -> bool {
+/// MAKEPAD_RUN_INLINE_TRACE=<suffix>: the callers whose site decisions (and O3 snapshot) are traced
+pub fn inline_trace(name: &str) -> bool {
     static T: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     relax_session::phase::env_once(&T, "MAKEPAD_RUN_INLINE_TRACE").is_some_and(|t| name.ends_with(t))
 }
