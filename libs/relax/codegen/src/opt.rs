@@ -216,23 +216,27 @@ pub struct InlineLimits {
     /// caller (no bigger than the call, or within the free size) and single-caller bodies --
     /// LLVM's cold-callsite threshold with `minsize` (-Oz) on cold code
     pub cold_tiny: bool,
+    /// A whole-program build (a wasm export; rustc's fat LTO): a cross-crate callee inlines as a
+    /// local one, and a single caller takes its callee's body whatever its size (LLVM's last call
+    /// to a local function: the body moves, nothing is duplicated)
+    pub lto: bool,
 }
 
 impl InlineLimits {
     /// O1 ("obviously inline"); MAKEPAD_RUN_INLINE_LEAF=insts,blocks overrides the leaf rule
     pub fn tier0(options: &relax_session::Options) -> InlineLimits {
         let (leaf_insts, leaf_blocks) = leaf_budget(options);
-        InlineLimits { budget: INLINE_BUDGET, leaf_insts, leaf_blocks, hint_insts: INLINE_HINT_INSTS, chain_insts: INLINE_CHAIN_INSTS, always_insts: 200, free_any: false, ordered: false, hot_insts: 0, growth_limit: None, cold_tiny: false }
+        InlineLimits { budget: INLINE_BUDGET, leaf_insts, leaf_blocks, hint_insts: INLINE_HINT_INSTS, chain_insts: INLINE_CHAIN_INSTS, always_insts: 200, free_any: false, ordered: false, hot_insts: 0, growth_limit: None, cold_tiny: false, lto: false }
     }
     /// O1 (startup code, no opt pipeline): only Relax core callees whose optimised
     /// body is about as small as the call that reaches them (accessors, index, len, next, the
     /// checked/wrapping integer helpers); jit.rs base_inline_wanted picks the candidates
     pub fn baseline() -> InlineLimits {
-        InlineLimits { budget: 400, leaf_insts: 16, leaf_blocks: 3, hint_insts: 24, chain_insts: 0, always_insts: 24, free_any: true, ordered: false, hot_insts: 0, growth_limit: None, cold_tiny: false }
+        InlineLimits { budget: 400, leaf_insts: 16, leaf_blocks: 3, hint_insts: 24, chain_insts: 0, always_insts: 24, free_any: true, ordered: false, hot_insts: 0, growth_limit: None, cold_tiny: false, lto: false }
     }
     /// O3 (hot functions): rustc --release-like reach
     pub fn tier1() -> InlineLimits {
-        InlineLimits { budget: 4000, leaf_insts: 150, leaf_blocks: 24, hint_insts: 250, chain_insts: 300, always_insts: 600, free_any: true, ordered: true, hot_insts: 80, growth_limit: None, cold_tiny: false }
+        InlineLimits { budget: 4000, leaf_insts: 150, leaf_blocks: 24, hint_insts: 250, chain_insts: 300, always_insts: 600, free_any: true, ordered: true, hot_insts: 80, growth_limit: None, cold_tiny: false, lto: false }
     }
 }
 
@@ -623,7 +627,10 @@ fn site_rule(options: &relax_session::Options, callee: &Func, id: u32, nargs: us
         || !callee.blocks.iter().any(|b| matches!(b.term, Term::Ret(_))) {
         return None;
     }
-    if attrs & ATTR_XCRATE != 0 {
+    if single && lim.lto && attrs & ATTR_COLD == 0 {
+        return Some(RULE_SINGLE);
+    }
+    if attrs & ATTR_XCRATE != 0 && !lim.lto {
         let (n, leaf, _) = callee_shape(callee, id);
         if n <= nargs + nrets + 2 && callee.blocks.len() <= 2 {
             return Some(RULE_TINY);
@@ -883,7 +890,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
                 || match rule.unwrap() {
                     _ if no_growth => false,
                     RULE_COST => size > free_budget || !tiny && priced.saturating_add(growth) > growth_limit,
-                    RULE_SINGLE => priced.saturating_add(growth) > growth_limit,
+                    RULE_SINGLE => !lim.lto && priced.saturating_add(growth) > growth_limit,
                     _ => !free && (cost > budget || !tiny && priced > growth_limit),
                 };
             if !refused {

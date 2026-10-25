@@ -1384,6 +1384,14 @@ pub(crate) fn full_o1() -> bool {
     *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_WASM_EXPORT_FULL").map_or(true, |v| v != "0"))
 }
 
+/// MAKEPAD_RUN_WASM_EXPORT_O3_LTO (default on; `0` off): shipping O3 bodies inline as a fat-LTO
+/// build does (InlineLimits::lto: cross-crate callees as local ones, single callers take their
+/// callee's body: the Splash VM's opcode dispatch into run_core, as LLVM has it)
+pub(crate) fn o3_lto() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_WASM_EXPORT_O3_LTO").map_or(true, |v| v != "0"))
+}
+
 /// MAKEPAD_RUN_WASM_EXPORT_O3_COLD (default `tiny`): a shipping O3 body's sites that are neither
 /// hot nor in a loop inline only callees that do not grow it (InlineLimits::cold_tiny); `0`: O3's
 /// own reach everywhere (A/B)
@@ -1473,7 +1481,7 @@ fn module_inline(u: &Unit, funcs: &mut BTreeMap<u32, Func>, kept: &std::collecti
         crate::jit::FnKey::Inst(d, _) => crate::jit::inline_never(&u.prog, *d),
         _ => false,
     }).collect();
-    let lim = relax_codegen::opt::InlineLimits { budget: usize::MAX / 4, leaf_insts: 0, leaf_blocks: 0, hint_insts: 0, chain_insts: 0, always_insts: 4000, free_any: false, ordered: false, hot_insts: 0, growth_limit: None, cold_tiny: false };
+    let lim = relax_codegen::opt::InlineLimits { budget: usize::MAX / 4, leaf_insts: 0, leaf_blocks: 0, hint_insts: 0, chain_insts: 0, always_insts: 4000, free_any: false, ordered: false, hot_insts: 0, growth_limit: None, cold_tiny: false, lto: false };
     let (mut sites, mut bodies) = (0usize, 0usize);
     for id in order {
         let Some(mut f) = funcs.remove(&id) else { continue };

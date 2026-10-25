@@ -12279,6 +12279,7 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
     let mut limits = relax_codegen::opt::InlineLimits::tier1_for(func, hot);
     // a wasm export's O3 body ships: size-first at its cold sites
     limits.cold_tiny = export_o3_mode() && crate::wasm_export::o3_cold_tiny();
+    limits.lto = export_o3_mode() && crate::wasm_export::o3_lto();
     if let (Some(cap), Some(g)) = (growth_cap, limits.growth_limit.as_mut()) {
         *g = (*g).min(cap.max(relax_codegen::opt::inst_count(func)));
     }
