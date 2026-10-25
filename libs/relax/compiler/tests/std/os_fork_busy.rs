@@ -4,7 +4,8 @@
 // held at the fork and never reached exec (makepad-app-aihub: GpuCache -> nvidia-smi with a
 // PR_SET_PDEATHSIG pre_exec, 2026-10-24). Every pre_exec closure here is a fresh instantiation
 // (not compiled before its fork) so that the child is where its code is first reached.
-// Lines starting with "| " must equal real std's (os_diff.sh / core_diff.sh).
+// Lines starting with "| " must equal real std's (os_diff.sh / core_diff.sh). The same file is the
+// `makepad run relax-fork-busy` program (tools/run/fixture/src/fork_busy.rs, fork_busy.sh).
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -88,6 +89,7 @@ macro_rules! forks {
 
 #[test]
 fn a01_fork_while_jit_busy() {
+    STOP.store(false, Ordering::Relaxed);
     let workers: Vec<_> = (0..6).map(|i| std::thread::spawn(move || busy(i))).collect();
     let mut ok = 0usize;
     for _ in 0..4 {
