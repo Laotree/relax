@@ -328,16 +328,17 @@ pub fn fetch_source(cache: &Path, url: &str, r: &GitRef, locked: Option<Oid>) ->
     let adv = match advertisement(url) {
         Ok(a) => a,
         Err(e) => {
-            // a full commit id needs no remote when the store has it
-            if let GitRef::Rev(rev) = r {
-                if let (Some(c), Some(s)) = (store::from_hex(&rev.to_ascii_lowercase()), &existing) {
-                    if s.index.table(&c).is_some() {
-                        return Ok(c);
-                    }
+            // a commit id (or an abbreviation of one) the store holds needs no remote; a ref is the
+            // store's newest fetch of it
+            let kept = existing.as_ref().and_then(|s| match r {
+                GitRef::Rev(rev) if is_hex(rev) && rev.len() >= 4 => {
+                    let want = rev.to_ascii_lowercase();
+                    let found: Vec<Oid> = s.index.tables.iter().map(|(c, _)| *c).filter(|c| store::hex(c).starts_with(&want)).collect();
+                    (found.len() == 1).then(|| found[0])
                 }
-            }
-            let kept = existing.as_ref().and_then(|s| s.index.refs.iter().filter(|x| x.key == key).max_by_key(|x| x.time).map(|x| x.commit));
-            let c = kept.ok_or_else(|| format!("{url}: {e} (and the store keeps no fetch of {})", key))?;
+                _ => s.index.refs.iter().filter(|x| x.key == key).max_by_key(|x| x.time).map(|x| x.commit),
+            });
+            let c = kept.ok_or_else(|| format!("{e} (and the store keeps no fetch of {key})"))?;
             crate::progress::note(&format!("{} unreachable ({e}): {} {} from the store", host(url), url, &store::hex(&c)[..12]));
             return Ok(c);
         }

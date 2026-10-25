@@ -518,7 +518,7 @@ impl Resolver {
         match &self.vendor {
             Some((Vendor::Dir(vdir), config)) => return self.vendored_dir(vdir, config, name),
             // the repository's package of that name (cargo's discovery, as for a git dependency)
-            Some((Vendor::Git(src), config)) => return self.git_dir(src, name, req).map_err(|e| format!("{} (crates-io's replacement, {})", e, config)),
+            Some((Vendor::Git(src), config)) => return self.git_dir(src, name).map_err(|e| format!("{} (crates-io's replacement, {})", e, config)),
             None => {}
         }
         let Some(vers) = self.ws.lock.get(name) else {
@@ -897,18 +897,18 @@ impl Resolver {
             });
         }
         if let Some(src) = &d.git {
-            return self.git_dir(src, &d.package, &d.req).map(|r| (r, Source::Git(src.clone())));
+            return self.git_dir(src, &d.package).map(|r| (r, Source::Git(src.clone())));
         }
         self.registry_dir(&d.package, &d.req).map(|r| (r, Source::Registry))
     }
 
     /// The folder of package `package` in the git source `src` (fetched and mounted once).
-    fn git_dir(&self, src: &GitSrc, package: &str, req: &str) -> Result<String, String> {
+    fn git_dir(&self, src: &GitSrc, package: &str) -> Result<String, String> {
         if let Some(d) = self.git.borrow().found.get(&(src.clone(), package.to_string())) {
             return Ok(d.clone());
         }
         let (root, commit, manifests) = self.git_mount(src)?;
-        let mut found: Option<(String, String)> = None;
+        let mut found: Option<String> = None;
         for rel in &manifests {
             let dir = if rel.is_empty() { root.clone() } else { format!("{}/{}", root, rel) };
             let path = format!("{}/Cargo.toml", dir);
@@ -920,20 +920,12 @@ impl Resolver {
             let Ok(t) = parse_toml(&text).map(|d| d.root) else { continue };
             let Some(pkg) = table(&t, "package") else { continue };
             if s(pkg, "name").as_deref() == Some(package) {
-                found = Some((dir, s(pkg, "version").unwrap_or_default()));
+                found = Some(dir);
                 break;
             }
         }
         let at = format!("{} at {}", src.id(), &crate::gitstore::hex(&commit)[..12]);
-        let (dir, version) = found.ok_or_else(|| format!("no package named `{}` in the git repository {}", package, at))?;
-        // a version requirement the package must meet (an inherited `version.workspace`: not checked)
-        if req != "*" && !version.is_empty() {
-            if let Some(v) = crate::registry::Version::parse(&version) {
-                if !crate::registry::matches(req, &v) {
-                    return Err(format!("git package `{}` {} ({}) does not satisfy the requirement `{}`", package, version, at, req));
-                }
-            }
-        }
+        let dir = found.ok_or_else(|| format!("no package named `{}` in the git repository {}", package, at))?;
         self.git.borrow_mut().found.insert((src.clone(), package.to_string()), dir.clone());
         Ok(dir)
     }
@@ -1470,6 +1462,13 @@ impl<'a> Feat<'a> {
         if self.r.manifests[t].name != d.package {
             return Err(format!("{}/Cargo.toml: dependency `{}` names package `{}`, but {} holds `{}`", self.r.manifests[k.0].dir, d.key, d.package, dir, self.r.manifests[t].name));
         }
+        // a git package must meet the entry's version requirement (cargo's resolution checks it)
+        if let (Some(g), true) = (&d.git, d.req != "*") {
+            let m = &self.r.manifests[t];
+            if crate::registry::Version::parse(&m.version).is_some_and(|v| !crate::registry::matches(&d.req, &v)) {
+                return Err(format!("{}/Cargo.toml: git package `{}` {} ({}) does not satisfy the requirement `{}`", self.r.manifests[k.0].dir, m.name, m.version, g.id(), d.req));
+            }
+        }
         let host = k.1 || d.build || self.r.manifests[t].proc_macro;
         let tk = (t, host);
         self.node(k).edges.push((di, tk));
@@ -1938,6 +1937,31 @@ mod root_tests {
         assert!(units(sess, &format!("{root}/solo"), "solo").iter().any(|n| n == "solo"));
         let _ = std::fs::remove_dir_all(&root);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn git_sources_as_cargo_spells_them() {
+    use crate::git::fetch::GitRef;
+    assert_eq!(canonical_url("https://github.com/Foo/Bar.git/"), "https://github.com/foo/bar");
+    assert_eq!(canonical_url("https://example.com/Foo/bar.git"), "https://example.com/Foo/bar");
+    let c = "0123456789abcdef0123456789abcdef01234567";
+    let (g, commit) = parse_git_source(&format!("git+https://github.com/a/b?branch=feature%2Fx#{c}")).unwrap();
+    assert_eq!((g.reference.clone(), crate::gitstore::hex(&commit)), (GitRef::Branch("feature/x".into()), c.to_string()));
+    assert!(g.same(&GitSrc { url: "https://github.com/A/b.git".into(), reference: GitRef::Branch("feature/x".into()) }));
+    assert_eq!(parse_git_source(&format!("git+https://h/r#{c}")).unwrap().0.reference, GitRef::DefaultBranch);
+    assert_eq!(parse_git_source(&format!("git+https://h/r?rev=abc#{c}")).unwrap().0.id(), "git+https://h/r?rev=abc");
+    assert!(parse_git_source("registry+https://github.com/rust-lang/crates.io-index").is_none());
+    let t = |text: &str| parse_toml(text).unwrap().root;
+    assert!(git_src(&t("git = \"https://h/r\"\nbranch = \"a\"\ntag = \"b\"\n"), "x", "d").is_err());
+    assert!(git_src(&t("git = \"https://h/r\"\npath = \"p\"\n"), "x", "d").is_err());
+    assert!(git_src(&t("git = \"git@github.com:a/b\"\n"), "x", "d").unwrap_err().contains("https only"));
+    assert_eq!(git_src(&t("git = \"https://h/r\"\ntag = \"v1\"\n"), "x", "d").unwrap().unwrap().reference, GitRef::Tag("v1".into()));
+    // cargo's package discovery: root first, depth-first by name; hidden folders, target folders
+    // beside a manifest and nested repositories skipped
+    let e = |p: &str| crate::gitstore::Entry { path: p.into(), mode: 0o100644, oid: [0; 20] };
+    let table: Vec<_> = ["Cargo.toml", "a-b/Cargo.toml", "a/Cargo.toml", "a/target/x/Cargo.toml", "a/z/Cargo.toml", ".github/Cargo.toml", "n/.git", "n/m/Cargo.toml", "target/Cargo.toml", "xCargo.toml"].iter().map(|p| e(p)).collect();
+    assert_eq!(manifest_dirs(&table), vec!["", "a", "a/z", "a-b"]);
 }
 
 #[cfg(test)]
