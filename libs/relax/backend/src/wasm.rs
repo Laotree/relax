@@ -3822,6 +3822,21 @@ impl<'a> Fx<'a> {
                         self.op(if cs.and_then(|s| s.ret_narrow).is_some_and(|it| it.signed) { EXT_S } else { EXT_U });
                     }
                 }
+                // a memcpy / memmove / memset whose result goes unused: the bulk instruction at the
+                // call (memory.copy / memory.fill), its operands at the address width, instead of a
+                // call of the helper taking 64-bit arguments
+                HostBind::Builtin(bi @ (Builtin::Memcpy | Builtin::Memmove | Builtin::Memset)) if rets.is_empty() && args.len() == 3 => {
+                    let aw = if self.o.memory64 { Want::Nat } else { Want::Low };
+                    self.value(b, args[0], aw)?;
+                    self.value(b, args[1], if bi == Builtin::Memset { Want::Low } else { aw })?;
+                    self.value(b, args[2], aw)?;
+                    self.out.push(0xFC);
+                    if bi == Builtin::Memset {
+                        self.out.extend_from_slice(&[11, 0]);
+                    } else {
+                        self.out.extend_from_slice(&[10, 0, 0]);
+                    }
+                }
                 HostBind::Builtin(bi) => {
                     let t = sig(self)?;
                     let ty = self.sh.ty(t);
