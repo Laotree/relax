@@ -1582,7 +1582,9 @@ fn prepare(o: &Options, options: &relax_session::Options, f0: &Func, fn_ix: &Has
         g
     });
     let f2: &Func = legal.as_ref().unwrap_or(f1);
-    match crate::switch::lower_switches(options, f2, crate::switch::MIN_TABLE_CLUSTERS) {
+    // shipping O1 (`full`: the code outside a wasm export's hot set) keeps sparse chains: their
+    // binary search is more compares than the chain
+    match crate::switch::lower_switches_sized(options, f2, crate::switch::MIN_TABLE_CLUSTERS, f2.full) {
         Some(s) => Some(s.0),
         None => legal.or(pruned),
     }

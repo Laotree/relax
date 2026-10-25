@@ -1462,13 +1462,21 @@ fn module_inline(u: &Unit, funcs: &mut BTreeMap<u32, Func>, kept: &std::collecti
     let single: std::collections::HashSet<u32> = site_count.iter().filter(|(c, n)| **n == 1 && !taken.contains(c)
         && !((**c as usize) < u.fns.len() && crate::jit::keep_reachable(u, **c))
         && funcs.get(c).is_some_and(|f| loop_free(f) && relax_codegen::opt::inst_count(f) <= 400)).map(|(c, _)| *c).collect();
+    let never: std::collections::HashSet<u32> = funcs.keys().copied().filter(|&c| (c as usize) < u.fns.len() && match &u.fns[c as usize].key {
+        crate::jit::FnKey::Inst(d, _) => crate::jit::inline_never(&u.prog, *d),
+        _ => false,
+    }).collect();
     let lim = relax_codegen::opt::InlineLimits { budget: usize::MAX / 4, leaf_insts: 0, leaf_blocks: 0, hint_insts: 0, chain_insts: 0, always_insts: 4000, free_any: false, ordered: false, hot_insts: 0, growth_limit: None, cold_tiny: false };
     let (mut sites, mut bodies) = (0usize, 0usize);
     for id in order {
         let Some(mut f) = funcs.remove(&id) else { continue };
         let calls_any = f.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i, Inst::Call(Callee::Fn(_), _, _)));
         if calls_any {
+            // `#[inline(never)]` stays a call, as rustc's and LLVM's inliners keep it
             let get = |c: u32| -> Option<(*const Func, u8)> {
+                if never.contains(&c) {
+                    return None;
+                }
                 funcs.get(&c).map(|g| (g as *const Func, if single.contains(&c) { relax_codegen::opt::ATTR_ALWAYS } else { 0u8 }))
             };
             let n = relax_codegen::opt::inline_calls(&options, &mut f, id, &get, &|_| true, &lim).len();
