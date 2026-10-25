@@ -10756,7 +10756,9 @@ fn optimize_rir_inner(options: &crate::options::Options, id: u32, prep: Prep) ->
         if cfg.inline {
             let get = |c: u32| -> Option<(*const relax_backend::rir::Func, u8)> { callees.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const relax_backend::rir::Func, x.2)) };
             let ti = relax_backend::stats::pass_clock();
-            inlined = relax_codegen::opt::inline_calls(options, func, id, &get, nounwind, &relax_codegen::opt::InlineLimits::tier0(options));
+            let lim = relax_codegen::opt::InlineLimits::tier0(options);
+            let lim = if export_full() { crate::wasm_export::o1_inline_limits(lim) } else { lim };
+            inlined = relax_codegen::opt::inline_calls(options, func, id, &get, nounwind, &lim);
             relax_backend::stats::pass_time(5, ti);
         }
         static HIST_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

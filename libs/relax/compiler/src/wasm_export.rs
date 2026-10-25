@@ -1405,6 +1405,22 @@ pub(crate) fn full_o1() -> bool {
     *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_WASM_EXPORT_FULL").map_or(true, |v| v != "0"))
 }
 
+/// MAKEPAD_RUN_WASM_EXPORT_O1_INLINE=hint,leaf,leaf_blocks,chain (A/B): a shipping O1 body's
+/// inline limits for `#[inline]` callees, small leaves and closure-chain adapters (RIR
+/// instructions); unset: the JIT's O1 limits
+pub(crate) fn o1_inline_limits(lim: relax_codegen::opt::InlineLimits) -> relax_codegen::opt::InlineLimits {
+    static L: std::sync::OnceLock<Option<[usize; 4]>> = std::sync::OnceLock::new();
+    let l = L.get_or_init(|| {
+        let v = std::env::var("MAKEPAD_RUN_WASM_EXPORT_O1_INLINE").ok()?;
+        let n: Vec<usize> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        (n.len() == 4).then(|| [n[0], n[1], n[2], n[3]])
+    });
+    match l {
+        Some([hint, leaf, leaf_blocks, chain]) => relax_codegen::opt::InlineLimits { hint_insts: *hint, leaf_insts: *leaf, leaf_blocks: *leaf_blocks, chain_insts: *chain, ..lim },
+        None => lim,
+    }
+}
+
 /// MAKEPAD_RUN_WASM_EXPORT_O1_FOLDS (default on; `0` off): shipping O1 bodies also take the O3
 /// folds that only remove code (value-range compares, small-set compares)
 pub(crate) fn o1_folds() -> bool {
