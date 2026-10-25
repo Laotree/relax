@@ -2846,6 +2846,8 @@ fn quit_mark() {
         if r.is_some() { crate::cache::retire_replaced_in_use(); }
         verbose!("makepad-run cache: quit write at t={:.0} ms: {:?} (entries, front images), collected {} in {:.1} ms",
             crate::clock::ms_since_start(), r, COLLECTED_CURRENT.load(Ordering::Relaxed), t.elapsed().as_secs_f64() * 1e3);
+        // MAKEPAD_RUN_CACHE_TRACE: written here too (the exit's write may never run)
+        crate::cache::write_trace();
     });
     }
 }
@@ -3315,7 +3317,7 @@ fn summary_inner(why: &str) {
         let q = jit::TIER_QUEUED.load(Ordering::Relaxed);
         if q > 0 {
             verbose!(
-                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); snapshots {:.0} ms cpu on the owner (root {:.0}, candidates {:.0}, take tails {:.0}, singles + counts {:.0} ms; callee scans {:.0}, assembly {:.0} ms off it; {} inline candidates built there, {:.0} ms; {} fronts off it, {:.0} ms cpu; {} optimised off it, {:.0} ms cpu), back ends {:.0} ms cpu off it; bottom-up preparation {:.0} ms cpu ({} bodies simplified, {} kept, {} shared, {} of the simplified had disagreeing shared ones: body {} attrs {} presence {} preparation {} single {}); {} code bytes",
+                "makepad-run: O3 (ahead {}): {} hot, {} counted again before their build (gone cold), {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); snapshots {:.0} ms cpu on the owner (root {:.0}, candidates {:.0}, take tails {:.0}, singles + counts {:.0} ms; callee scans {:.0}, assembly {:.0} ms off it; {} inline candidates built there, {:.0} ms; {} fronts off it, {:.0} ms cpu; {} optimised off it, {:.0} ms cpu, {} panics, {} bails), back ends {:.0} ms cpu off it; bottom-up preparation {:.0} ms cpu ({} bodies simplified, {} kept, {} shared, {} of the simplified had disagreeing shared ones: body {} attrs {} presence {} preparation {} single {}); {} code bytes",
                 jit::ahead_level().name(),
                 q,
                 jit::TIER_REVALIDATED.load(Ordering::Relaxed),
@@ -3338,6 +3340,8 @@ fn summary_inner(why: &str) {
                 jit::TIER1_SNAP_FRONTS[1].load(Ordering::Relaxed) as f64 / 1e6,
                 jit::TIER1_SNAP_OFF[0].load(Ordering::Relaxed),
                 jit::TIER1_SNAP_OFF[1].load(Ordering::Relaxed) as f64 / 1e6,
+                jit::O3_OPT_PANICS[0].load(Ordering::Relaxed),
+                jit::O3_OPT_PANICS[1].load(Ordering::Relaxed),
                 s.tier1_free_ns as f64 / 1e6,
                 jit::TIER1_PREP[0].load(Ordering::Relaxed) as f64 / 1e6,
                 jit::TIER1_PREP[1].load(Ordering::Relaxed),
