@@ -1097,6 +1097,20 @@ pub fn reassert_signals() {
     os::fault::reassert();
 }
 
+/// The calling thread moved to or from a program stack (relax_base::stack::on_program_stack):
+/// the stack bounds cached per thread (fault reports, frame walks, heap samples) are read again.
+pub(crate) fn program_stack_changed() {
+    let _ = STACK_HI.try_with(|c| if c.get() != 0 { c.set(os::fault::stack_hi_of_self()) });
+    crate::inspect::heap::stack_changed();
+}
+
+/// Runs `f(arg)` (a program thread's body: Relax std's thread start) on a program stack: a large
+/// lazily committed reservation with a guard (relax_base::stack::on_program_stack), so deep
+/// recursion and big stack buffers fit, and an overrun faults on the guard as a stack overflow.
+extern "C" fn relax_on_program_stack(f: extern "C" fn(*mut u8), arg: *mut u8) {
+    crate::stack::on_program_stack(program_stack_changed, || f(arg));
+}
+
 /// Gives the calling thread its fault stack (once), so a stack overflow in JIT code on a thread
 /// the program started is still reported. Called on the thread's first lazy compile /
 /// thread-local block and from the fault handler.
@@ -1474,6 +1488,56 @@ fn ids_report(up: *mut Unit) {
 
 /// O3 jobs that panicked outside their build's recovery (slot left at O1)
 pub static TIER1_PANICS: AtomicU64 = AtomicU64::new(0);
+
+/// optimize_tree runs of O3 candidates built off the owner that panicked: [0] panics, [1] the
+/// preemption/bail payloads (control flow, not bugs). Each is dropped as a failed build (its
+/// candidate stays without an optimised body); a panic used to be dropped without a word, which
+/// hid piano_render's out-of-range unroll check (GAPB2).
+pub static O3_OPT_PANICS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// slots whose optimize_tree panic was printed (once per slot)
+static O3_OPT_PANICKED: relax_session::sync::Mutex<std::collections::BTreeSet<u32>> = relax_session::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// A caught panic's message, and whether its payload is one of the preemption/bail payloads
+/// (control flow: the build gave way, nothing went wrong).
+fn panic_payload(p: &(dyn std::any::Any + Send)) -> (String, bool) {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        return (s.to_string(), false);
+    }
+    if let Some(s) = p.downcast_ref::<String>() {
+        return (s.clone(), false);
+    }
+    if let Some(e) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() {
+        return (format!("fatal error: {}", e.0), false);
+    }
+    if let Some(b) = p.downcast_ref::<crate::preempt::PublishBail>() {
+        return (format!("publish bail ({}, {} slots)", b.what, b.slots.len()), true);
+    }
+    let bail = if p.is::<crate::preempt::Preempted>() {
+        "preempted"
+    } else if p.is::<crate::preempt::OwnerBusy>() {
+        "owner busy"
+    } else if p.is::<crate::preempt::NeedsLoad>() {
+        "needs load"
+    } else if p.is::<crate::preempt::NeedsUnit>() {
+        "needs the unit"
+    } else {
+        return ("panic".to_string(), false);
+    };
+    (bail.to_string(), true)
+}
+
+/// An O3 candidate's optimize_tree panicked (off the owner): counted, printed once per slot
+/// (bails only counted), and handed on as a failed build.
+fn optimize_tree_panicked(up: *mut Unit, id: u32, p: Box<dyn std::any::Any + Send>) -> Deferred {
+    let (msg, bail) = panic_payload(&*p);
+    O3_OPT_PANICS[bail as usize].fetch_add(1, Ordering::Relaxed);
+    if !bail && O3_OPT_PANICKED.lock().unwrap().insert(id) {
+        crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_PANIC, 0, 0, 0);
+        let name = owner::publish(|| unsafe { let u = &*up; if (id as usize) < u.fns.len() { u.fns[id as usize].name.to_string() } else { String::new() } });
+        eprintln!("makepad: O3 optimisation of slot {} ({}) panicked: {} -- O3 dropped for it", id, name, msg);
+    }
+    (id, Err(format!("optimize_tree panicked: {}", msg)))
+}
 
 /// fork() in a program run by Relax: the child has only the forking thread, and may go on
 /// running JIT code (a lazy compile in the child). The loader hands programs its own `fork`
@@ -3918,17 +3982,10 @@ impl Unit {
             _ => return,
         };
         let (Some(sn), Some(cs)) = (self.syms.find_foreign(sin), self.syms.find_foreign(cos)) else { return };
-        let p = if cfg!(target_vendor = "apple") {
-            unsafe { os::proc::find(format!("{}\0", both).as_ptr()) }
-        } else if wide {
-            sincos_pair as *mut u8
-        } else {
-            sincosf_pair as *mut u8
-        };
-        if p.is_null() {
-            return;
-        }
-        relax_codegen::opt::set_sincos(wide, sn, cs, self.syms.intern(crate::syms::SymKind::Foreign(both.to_string()), p as u64));
+        let Some(p) = sincos_addr(both) else { return };
+        // a runtime symbol, named in the disk cache by its name (a foreign one is named by its
+        // declaration, which this routine has none of: code calling it was never stored)
+        relax_codegen::opt::set_sincos(wide, sn, cs, self.syms.intern(crate::syms::SymKind::Rt(both), p));
     }
 
     /// Whether `func` calls std's `sin` and `cos` methods (before inlining): such a function is
@@ -8269,6 +8326,20 @@ static O2_QUEUE: relax_session::sync::Mutex<Vec<(usize, u32)>> = relax_session::
 static O2_SEEN: relax_session::sync::Mutex<Option<std::collections::HashSet<(usize, u32)>>> = relax_session::sync::Mutex::new(None);
 static O2_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
 static O2_THREAD: std::sync::Once = std::sync::Once::new();
+/// the O2 worker is building one (O2 or a verified O1 rebuild) now
+static O2_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// O2 builds and verified O1 rebuilds queued, whether the O2 worker builds one now, and the
+/// worker's builds finished so far (installed or dropped; postframe::activity). Each queue's lock
+/// is taken alone, never nested.
+pub(crate) fn o2_counts() -> (u64, bool, u64) {
+    use crate::cache::warm_count as wc;
+    let queued = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).len()
+        + O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).len()
+        + O1V_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let done = O2_STATS[0].load(Ordering::Relaxed) + O2_STATS[2].load(Ordering::Relaxed) + wc::get(wc::O1V_BUILT) + wc::get(wc::O1V_DROPPED);
+    (queued as u64, O2_RUNNING.load(Ordering::Relaxed), done)
+}
 /// O2 builds installed, their worker CPU ns (front + back end), dropped builds, the main
 /// thread's unit-lock wait ns while the O2 worker held it, and the number of such waits
 pub static O2_STATS: [AtomicU64; 5] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
@@ -8587,6 +8658,7 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
             }
         };
         let _job = compile_job();
+        O2_RUNNING.store(true, Ordering::Relaxed);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let live = || {
                 let up = SPEC_UNIT.load(Ordering::Acquire);
@@ -8610,6 +8682,7 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
                 owner::publish(|| o2_finish(up, done));
             }
         }));
+        O2_RUNNING.store(false, Ordering::Relaxed);
         if r.is_err() {
             if o1 { crate::cache::warm_count::add(crate::cache::warm_count::O1V_DROPPED, 1) } else { O2_STATS[2].fetch_add(1, Ordering::Relaxed); }
         }
@@ -11493,6 +11566,18 @@ fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(re
 /// (`note_sincos`): Darwin arm64 and x86-64 glibc.
 const SINCOS_TARGET: bool = cfg!(any(all(target_vendor = "apple", target_arch = "aarch64"), all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")));
 
+/// The combined sin/cos routine `name` (note_sincos's names: Darwin's libm `__sincos_stret` /
+/// `__sincosf_stret`, else the pair wrappers here), for its runtime symbol (cache links too).
+pub(crate) fn sincos_addr(name: &str) -> Option<u64> {
+    let p = match name {
+        "__sincos_stret" | "__sincosf_stret" if cfg!(target_vendor = "apple") => unsafe { os::proc::find(format!("{}\0", name).as_ptr()) },
+        "relax_sincos_pair" if !cfg!(target_vendor = "apple") => sincos_pair as *mut u8,
+        "relax_sincosf_pair" if !cfg!(target_vendor = "apple") => sincosf_pair as *mut u8,
+        _ => return None,
+    };
+    (!p.is_null()).then_some(p as u64)
+}
+
 /// glibc's `sincos` with both results returned in registers: a struct of two doubles comes back
 /// in xmm0 and xmm1 (SysV), where the optimiser's combined call reads them.
 #[repr(C)]
@@ -11719,10 +11804,12 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     }
     // loops with a small constant trip count: fully unrolled (each copy's counter a constant);
     // a second round reaches the loop around an unrolled inner one
+    let mut unrolled = false;
     for _ in 0..2 {
         if !(cfg.fold && relax_codegen::loops::unroll_const_loops(options, func)) {
             break;
         }
+        unrolled = true;
         relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
         // the original loops the copies replaced: unreachable now, emptied for the passes below
         relax_codegen::loops::clear_unreachable(func);
@@ -11744,6 +11831,15 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
             relax_backend::passes::live_dce(func);
             relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
         }
+    }
+    // Unrolled copies read a loop's array at constant offsets: once those loads are forwarded
+    // its stores of borrows die, and the slots they borrowed no longer escape -- the copies of
+    // those slots can join now (reconcile's `[(&mut entry.a, ..), (..)]`: the entry's moves
+    // through the match tuple; GAPB)
+    if unrolled && cfg.sroa && !relax_backend::stats::opt_off(options, "-postinline") && !relax_backend::stats::opt_off(options, "-unrollclean") {
+        relax_codegen::loops::clear_unreachable(func);
+        relax_backend::passes::live_dce(func);
+        slot_cleanup(options, func, ro, cfg);
     }
     // a copy of a stepped pointer's previous value (partition's gap, insertion's hole) read as
     // the pointer minus its step: accesses through both share one base (load forwarding)
@@ -11812,6 +11908,10 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         verify_pass(func, "promote_loop_memory");
     }
     if cfg.layout && layout_for(options, name) {
+        // branches on `x & y` / `x | y` of compares (version guards): two compare-and-branches
+        if relax_backend::passes::split_branch_conditions(options, func) {
+            verify_pass(func, "split_branch_conditions");
+        }
         relax_backend::passes::rotate_loops(func);
     }
     // hot code: small counted single-block loops unrolled (rotation made them single blocks;
@@ -12222,15 +12322,26 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
             }
         }
     }
-    // post-inline cleanup (codegen2's copy-elimination finding + LLVM SROA's whole-slot slicing):
-    // small aggregate temporaries the inlined bodies copy through (Option payloads, sret results)
-    // are forwarded from 32 bytes up, then groups copied in and out are tiled into registers;
-    // later wider loads of narrower stores otherwise fail store forwarding (layout_widgets)
     if cfg.sroa && !relax_backend::stats::opt_off(options, "-postinline") {
+        slot_cleanup(options, func, ro, cfg);
+    }
+    inlined
+}
+
+/// Post-inline cleanup (codegen2's copy-elimination finding + LLVM SROA's whole-slot slicing):
+/// small aggregate temporaries the inlined bodies copy through (Option payloads, sret results)
+/// are forwarded from 32 bytes up, then groups copied in and out are tiled into registers;
+/// later wider loads of narrower stores otherwise fail store forwarding (layout_widgets). Runs
+/// after inlining and again after full unrolling.
+fn slot_cleanup(options: &crate::options::Options, func: &mut relax_backend::rir::Func, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg) {
+    {
         for _ in 0..3 {
+            // field-wise copies (a derived Clone's loads and stores) as one copy, which the
+            // passes below forward and join along; MAKEPAD_RUN_OPT=-copyruns
+            let ch = !relax_backend::stats::opt_off(options, "-copyruns") && relax_codegen::opt::merge_copy_runs(func);
             // zero fills a copy overwrites before any read go first: the copy's stores are
             // then the only writes of those bytes, so the reads after it can be forwarded
-            let ch = relax_codegen::opt::dead_slot_stores(func);
+            let ch = ch | relax_codegen::opt::dead_slot_stores(func);
             let ch = ch | relax_codegen::opt::forward_slot_dests(func) | relax_codegen::opt::forward_slot_dests_x(options, func, 32);
             // slots joined along whole copies by byte liveness (loops too); MAKEPAD_RUN_OPT=-slotcoal
             let ch = ch | (!relax_backend::stats::opt_off(options, "-slotcoal") && relax_codegen::opt::coalesce_slot_copies(func, !relax_backend::stats::opt_off(options, "-slotprefix")));
@@ -12244,7 +12355,6 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
             relax_backend::passes::simplify(options, func, ro, cfg.imm, false);
         }
     }
-    inlined
 }
 
 // ---- the on-demand PC sampler (MAKEPAD_RUN_PROFILE; not part of tier-up)
@@ -12666,9 +12776,17 @@ fn progress_start() {
 /// for a benchmark that times only once the optimised code has settled: `pending` = builds queued or
 /// running or counting (PGO), plus one while the startup phase holds the workers; `installs` = O3 installs so far.
 /// The file exists from the first write on; a program that never reads it pays nothing.
-/// O3 builds queued or running now (postframe::activity, the run's JIT ring).
-pub(crate) fn o3_pending() -> u64 {
-    (tier_queue().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len())) as u64
+/// O3 builds queued, and running now, with the slot of one running (postframe::activity: the
+/// run's JIT ring, makepad inspect `jit`).
+pub(crate) fn o3_counts() -> (u64, u64, Option<u32>) {
+    let queued = tier_queue().map_or(0, |q| q.len()) as u64;
+    let active = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+    (queued, active.len() as u64, active.first().copied())
+}
+
+/// O3 builds finished so far (installed, dropped or failed: a worker's job ended).
+pub(crate) fn o3_finished() -> u64 {
+    TIER1_FINISHED.load(Ordering::Relaxed)
 }
 
 fn o3_progress_write(last: &mut std::time::Instant) {
@@ -15264,16 +15382,13 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
         // was gone (`makepad check makepad-example-uizoo` hung ~1 run in 20-50; the panic was
         // silent: build_rir's hook)
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { compile_tier1(up, id) }));
+        if tier1_trace() {
+            let name = owner::publish(|| unsafe { (&*up).fns[id as usize].name.to_string() });
+            eprintln!("O3 done #{} ({}) {}: {}", id, Q_WHY.get(why as usize).copied().unwrap_or("?"), name, match &r { Ok(true) => "installed", Ok(false) => "dropped", Err(_) => "panicked" });
+        }
         if let Err(p) = r {
             crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_PANIC, 0, 0, 0);
-            let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned())
-                .or_else(|| p.downcast_ref::<crate::preempt::PublishBail>().map(|b| format!("publish bail ({}, {} slots)", b.what, b.slots.len())))
-                .or_else(|| p.downcast_ref::<crate::infer::diagnostics::FatalError>().map(|e| format!("fatal error: {}", e.0)))
-                .or_else(|| p.is::<crate::preempt::Preempted>().then(|| "preempted".to_string()))
-                .or_else(|| p.is::<crate::preempt::OwnerBusy>().then(|| "owner busy".to_string()))
-                .or_else(|| p.is::<crate::preempt::NeedsLoad>().then(|| "needs load".to_string()))
-                .or_else(|| p.is::<crate::preempt::NeedsUnit>().then(|| "needs the unit".to_string()))
-                .unwrap_or_else(|| "panic".to_string());
+            let msg = panic_payload(&*p).0;
             let n = TIER1_PANICS.fetch_add(1, Ordering::Relaxed);
             if n < 3 {
                 eprintln!("makepad: O3 build of slot {} panicked: {} -- O3 dropped for it", id, msg);
@@ -16216,9 +16331,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let mut done: Vec<Deferred> = Vec::new();
         for (c, prep) in preps {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize_tree(options, c, prep, &mut done)));
-            if let Ok(r) = r { done.push((c, r)); }
+            done.push(match r { Ok(r) => (c, r), Err(p) => optimize_tree_panicked(up, c, p) });
         }
-        TIER1_SNAP_OFF[0].fetch_add(done.len() as u64, Ordering::Relaxed);
+        TIER1_SNAP_OFF[0].fetch_add(done.iter().filter(|d| d.1.is_ok()).count() as u64, Ordering::Relaxed);
         TIER1_SNAP_OFF[1].fetch_add(cpu_ns() - to, Ordering::Relaxed);
         owner::publish(|| o3_candidates_finish(up, epoch0, done));
     }
@@ -16546,9 +16661,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // never run -> built again at its first run (cold_users), as the snapshot's
                 // never-run candidates are; its RIR being built on another thread at the walk ->
                 // built again when its RIR is set (body_users; at once when it is set already);
-                // unverified -> UNVERIFIED_LEFT. Those make the build incomplete: it depends on
-                // which build finished first, so it is not cached (the warm image would keep the
-                // missing inline forever).
+                // unverified -> UNVERIFIED_LEFT. Those make the build incomplete (this run builds
+                // it again when the body comes), yet its code is valid as built: it is stored like
+                // any other build. A stored O3 entry is valid iff its inputs are unchanged -- the
+                // key (its own body, the loader build id) and the certificate of the slots it
+                // inlined (record_deps) -- so a warm launch installs it as it is, whatever that
+                // launch has loaded or run yet: a callee kept as a call stays a call.
                 let mut incomplete = !unverified_left.is_empty();
                 let mut body_again = false;
                 // (inspect why-tier: per kept callee its state and what builds this slot again)
@@ -16604,7 +16722,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                             None => agg.push((w, 1, short_name(&u.fns[c as usize].name).to_string())),
                         }
                     }
-                    let txt = format!("at {:.2} s: {}; root {}; {}", wall_ns() as f64 / 1e9, if incomplete { "INCOMPLETE (not cached)" } else { "complete" },
+                    let txt = format!("at {:.2} s: {}; root {}; {}", wall_ns() as f64 / 1e9, if incomplete { "incomplete (built again when the bodies come)" } else { "complete" },
                         if root_unverified { "unverified" } else { "verified" },
                         if agg.is_empty() { "no kept callee notes".to_string() } else { agg.iter().map(|(w, n, e)| format!("{} x{} (e.g. {})", w, n, e)).collect::<Vec<_>>().join("; ") });
                     let mut m = O3_BUILD_NOTES.lock().unwrap_or_else(|e| e.into_inner());
@@ -16626,7 +16744,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                         if !callees.contains(&c) { s.push('-'); }
                         s
                     };
-                    eprintln!("O3 #{} {}: incomplete build, not cached; calls kept without a body: {}", id, short_name(&u.fns[id as usize].name),
+                    eprintln!("O3 #{} {}: incomplete build; calls kept without a body: {}", id, short_name(&u.fns[id as usize].name),
                         absent.iter().map(|&c| format!("#{} {}[{}]", c, short_name(&u.fns[c as usize].name), st(c))).collect::<Vec<_>>().join(", "));
                 }
                 let frame_max = if recursive { TIER1_CACHE_FRAME_MAX } else { TIER1_CACHE_FRAME_MAX_FLAT };
@@ -16652,9 +16770,13 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     use crate::cache::warm_count as wc;
                     wc::add(if unverified { wc::O3_UNVERIFIED } else if speculative || inspect_o3_on() { wc::O3_SPEC } else if frame_size > frame_max { wc::O3_FRAME } else { wc::O3_QUEUED }, 1);
                 }
+                if tier1_trace() {
+                    eprintln!("O3 keep #{} {}: {}", id, short_name(&u.fns[id as usize].name),
+                        if unverified { "no (unverified)" } else if speculative || inspect_o3_on() { "no (speculative/inspect)" } else if frame_size > frame_max { "no (frame)" } else if t1prof_on(options) { "no (deterministic O3)" } else if incomplete { "entry (incomplete)" } else { "entry" });
+                }
                 // (deterministic O3 runs cache no O3 code: a later record or replay links none, every O3
                 // slot of theirs is a recorded build)
-                if frame_size <= frame_max && !unverified && !speculative && !incomplete && !inspect_o3_on() && !t1prof_on(options) {
+                if frame_size <= frame_max && !unverified && !speculative && !inspect_o3_on() && !t1prof_on(options) {
                     // its key and certificate encoding in the bounded record batches (records_due),
                     // not in this publish
                     if let Some(mut c) = u.cache.take() {
@@ -18345,7 +18467,7 @@ unsafe fn build_off_owner(up: *mut Unit, ids: &[(u32, RirMode)]) {
             let mut done: Vec<Deferred> = Vec::new();
             for (c, prep) in preps {
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize_tree(options, c, prep, &mut done)));
-                if let Ok(r) = r { done.push((c, r)); }
+                done.push(match r { Ok(r) => (c, r), Err(p) => optimize_tree_panicked(up, c, p) });
             }
             owner::publish(|| o3_candidates_finish(up, epoch0, done));
         }
@@ -18866,6 +18988,10 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_domain_failed" => Some(crate::domain::thread_finished as *const () as usize),
         b"__relax_domain_name" => Some(crate::domain::relax_domain_name as *const () as usize),
         b"__relax_tls_fixed" => Some(os::tls::relax_tls_fixed as *const () as usize),
+        b"__relax_on_program_stack" => Some(relax_on_program_stack as *const () as usize),
+        b"__relax_sstack" => Some(crate::sstack::relax_sstack as *const () as usize),
+        b"__relax_sstack_grow" => Some(crate::sstack::relax_sstack_grow as *const () as usize),
+        b"__relax_sstack_trim" => Some(crate::sstack::relax_sstack_trim as *const () as usize),
         b"__relax_key_create" => Some(crate::domain_threads::key_create as *const () as usize),
         b"__relax_key_delete" => Some(crate::domain_threads::key_delete as *const () as usize),
         b"__relax_key_get" => Some(crate::domain_threads::key_get as *const () as usize),

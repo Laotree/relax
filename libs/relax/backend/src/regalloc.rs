@@ -1046,6 +1046,8 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         }
         let equal: std::collections::HashSet<(u32, u32)> = equal.iter().map(|x| (x.1, x.2)).collect();
         pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        // the members of each unit (by root), for the equal-copy joins below
+        let mut unit_of: HashMap<u32, Vec<u32>> = HashMap::new();
         for (_, a, b) in pairs {
             let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
             if ra == rb || f.vregs[ra as usize] != f.vregs[rb as usize] || remat[a as usize].is_some() || remat[b as usize].is_some() || remat[ra as usize].is_some() || remat[rb as usize].is_some() || is_low(a) || is_low(b) {
@@ -1053,9 +1055,16 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             }
             let x = merged.get(&ra).map(|v| v.as_slice()).unwrap_or(ranges.of(ra));
             let y = merged.get(&rb).map(|v| v.as_slice()).unwrap_or(ranges.of(rb));
-            // overlapping ranges join only for a copy of one value (equal_copies) between two
-            // values not yet in a unit: wherever both are live they hold the same bits
-            let same = (ra, rb) == (a, b) && !merged.contains_key(&ra) && !merged.contains_key(&rb) && equal.contains(&(a, b));
+            // overlapping ranges join only for a copy of one value (equal_copies): wherever both
+            // are live they hold the same bits. A value not yet in a unit joins its copy's unit
+            // when it meets no other member there (`old = i` of a counter whose step `i = t`
+            // already joined i and t: the register holds i wherever old is live)
+            let lone = |r: u32, v: u32| r == v && !merged.contains_key(&r);
+            let same = equal.contains(&(a, b))
+                && ((lone(ra, a) && lone(rb, b))
+                    || [(a, ra, b, rb), (b, rb, a, ra)].iter().any(|&(l, rl, o, ro)| {
+                        lone(rl, l) && unit_of.get(&ro).map_or(true, |m| m.iter().all(|&u| u == o || !ranges_meet(ranges.of(l), ranges.of(u))))
+                    }));
             if x.is_empty() || y.is_empty() || (ranges_meet(x, y) && !same) {
                 continue;
             }
@@ -1063,6 +1072,9 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             merged.remove(&rb);
             merged.insert(ra, u);
             parent[rb as usize] = ra;
+            let mut m = unit_of.remove(&rb).unwrap_or_else(|| vec![rb]);
+            let e = unit_of.entry(ra).or_insert_with(|| vec![ra]);
+            e.append(&mut m);
         }
         for v in 0..nv {
             let r = find(&mut parent, v);
@@ -5611,28 +5623,45 @@ pub fn copy_reuse(options: &relax_session::Options, f: &Func, al: &Alloc) -> Has
         if !reach[bi] || !b.insts.iter().any(|i| matches!(i, Inst::Mov(..))) {
             continue;
         }
-        // last read of each vreg in the block (the terminator reads at index n)
-        let mut last: HashMap<u32, usize> = HashMap::new();
+        // the reads and the definitions of each vreg in the block, by index (the terminator reads
+        // at index n)
+        let mut reads: HashMap<u32, Vec<usize>> = HashMap::new();
+        let mut defs: HashMap<u32, Vec<usize>> = HashMap::new();
         for (ii, i) in b.insts.iter().enumerate() {
             uses_defs(i, &mut us, &mut ds);
             for u in &us {
-                last.insert(u.0, ii);
+                let r = reads.entry(u.0).or_default();
+                if r.last() != Some(&ii) {
+                    r.push(ii);
+                }
+            }
+            for d in &ds {
+                defs.entry(d.0).or_default().push(ii);
             }
         }
         term_uses(&b.term, &mut tu);
         for u in &tu {
-            last.insert(u.0, b.insts.len());
+            reads.entry(u.0).or_default().push(b.insts.len());
         }
-        // last definition of each vreg in the block: a copy defined again later in the block is not
-        // what is live out (`u = v; ..read v..; u = w`: the allocator gives u's register away
-        // between the two definitions, the deflate counted-code fault of PGO3, 10-22)
-        let mut last_def: HashMap<u32, usize> = HashMap::new();
-        for (ii, i) in b.insts.iter().enumerate() {
-            uses_defs(i, &mut us, &mut ds);
-            for d in &ds {
-                last_def.insert(d.0, ii);
+        // the copy c holds its value in its register at index ii only while that value is live:
+        // its next read at or after ii comes no later than its next definition (a read and a
+        // definition in one instruction read first). `u = v; t = ..; ..read v..; u = w; ..read u..`
+        // with u's first value dead: u's register is given away between the two definitions, and
+        // a read of v served from it reads t (FUZZ 475f7b26c8316268). Some(true): read again in
+        // the block; Some(false): neither read nor defined again (live out if a successor reads
+        // it); None: redefined first (the deflate counted-code fault of PGO3, 10-22, live out)
+        let next = |m: &HashMap<u32, Vec<usize>>, c: u32, ii: usize| -> Option<usize> {
+            let v = m.get(&c)?;
+            v.get(v.partition_point(|&k| k < ii)).copied()
+        };
+        let holds = |c: u32, ii: usize| -> Option<bool> {
+            match (next(&reads, c, ii), next(&defs, c, ii)) {
+                (Some(r), Some(d)) if r > d => None,
+                (Some(_), _) => Some(true),
+                (None, Some(_)) => None,
+                (None, None) => Some(false),
             }
-        }
+        };
         // spilled vreg -> (its register copy, that register)
         let mut have: Vec<(u32, u32, u8)> = Vec::new();
         for (ii, i) in b.insts.iter().enumerate() {
@@ -5640,12 +5669,14 @@ pub fn copy_reuse(options: &relax_session::Options, f: &Func, al: &Alloc) -> Has
             if !have.is_empty() {
                 for u in &us {
                     if let Some(&(_, c, r)) = have.iter().find(|h| h.0 == u.0) {
-                        if last.get(&c).map_or(false, |&l| l >= ii) {
-                            out.insert((al.inst_pos(bi, ii), u.0), r);
-                        } else if !no_live_out && last_def.get(&c).map_or(true, |&d| d < ii) {
+                        match holds(c, ii) {
+                            Some(true) => {
+                                out.insert((al.inst_pos(bi, ii), u.0), r);
+                            }
                             // not read again in the block: its register still holds it when the
                             // copy is live out of the block (not redefined since: `have` drops it)
-                            pending.push((bi as u32, al.inst_pos(bi, ii), u.0, c, r));
+                            Some(false) if !no_live_out => pending.push((bi as u32, al.inst_pos(bi, ii), u.0, c, r)),
+                            _ => {}
                         }
                     }
                 }
