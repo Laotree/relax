@@ -611,7 +611,14 @@ fn force_union(up: *mut Unit, hits: &HashMap<String, std::collections::HashSet<(
                 eprintln!("wasm export: missing union key {key}: slots (id, compiled, tried) {slots:?}");
             }
         }
-        return Err(format!("union: {} training functions were not captured:\n{}", missing.len(), missing.join("\n")));
+        // MAKEPAD_RUN_WASM_EXPORT_UNION_LENIENT=1: a size A/B that replays an older export's training
+        // union with a compiler whose std renamed some functions (local/wasmcg/recap.sh); never a
+        // shipping export (the replay gate needs every trained function)
+        if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_UNION_LENIENT").is_some_and(|v| v != "0") {
+            eprintln!("wasm export: union: {} training keys absent in this build (lenient A/B replay)", missing.len());
+        } else {
+            return Err(format!("union: {} training functions were not captured:\n{}", missing.len(), missing.join("\n")));
+        }
     }
     // Ahead/inlined bodies can already have RIR without installed native code.
     for id in captured.funcs.keys() {
