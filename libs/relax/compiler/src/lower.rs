@@ -10359,6 +10359,14 @@ impl<'a> Lcx<'a> {
                 };
                 Val::L(vec![self.iconst(c as i64)])
             }
+            // `T: TrustedLen` of this instance (real alloc specializes Vec's extend on it)
+            "is_trusted_len" => {
+                let c = match (g0, self.u.core_path(&["iter", "TrustedLen"])) {
+                    (Some(g), Some(td)) => self.u.tcx.type_implements_trait(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), TraitRef { def_id: td, args: vec![GenericArg::Type(g)] }).must_apply_modulo_regions(),
+                    _ => false,
+                };
+                Val::L(vec![self.iconst(c as i64)])
+            }
             // Primitive scalar values have no padding or inactive enum storage.
             "is_primitive_scalar" => {
                 let c = g0.is_some_and(|g| matches!(self.kind_ref(g), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char));

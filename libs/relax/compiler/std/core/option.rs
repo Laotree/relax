@@ -429,6 +429,7 @@ impl<T> DoubleEndedIterator for IntoIter<T> {
 }
 
 impl<T> ExactSizeIterator for IntoIter<T> {}
+unsafe impl<T> crate::iter::TrustedLen for IntoIter<T> {}
 impl<T> crate::iter::FusedIterator for IntoIter<T> {}
 
 impl<T> IntoIterator for Option<T> {
