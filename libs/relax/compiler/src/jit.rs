@@ -10648,13 +10648,16 @@ fn opt_pipeline_inner(options: &crate::options::Options, func: &mut relax_backen
             // link per forwarding, and the drop-flag tests the moves left behind fold only once
             // the copies sit in one block (Score: SamplerBackend::new kept its 108 KB value in a
             // slot, copied into the result buffer, on the CoreAudio IO thread's 512 KB stack)
+            // A wasm export's shipping body does this for every aggregate: each copy through a
+            // temporary is code (a memory.copy) in the module, at any size
+            let dests_min = if export_full() { EXPORT_DEST_SLOT } else { BIG_SLOT };
             for _ in 0..3 {
-                if !(cfg.sroa && func.slots.iter().any(|s| s.size >= BIG_SLOT)) {
+                if !(cfg.sroa && func.slots.iter().any(|s| s.size >= dests_min)) {
                     break;
                 }
                 let mut ch = relax_codegen::opt::forward_slot_dests(func);
                 verify_pass(func, "forward_slot_dests");
-                ch |= relax_codegen::opt::forward_slot_dests_x(options, func, BIG_SLOT);
+                ch |= relax_codegen::opt::forward_slot_dests_x(options, func, dests_min);
                 verify_pass(func, "forward_slot_dests_x");
                 if !full {
                     ch |= relax_codegen::opt::forward_slot_copies(func);
@@ -10735,6 +10738,9 @@ fn opt_pipeline_inner(options: &crate::options::Options, func: &mut relax_backen
 
 /// slots from this size up make O1 forward big copies too
 const BIG_SLOT: u32 = 4096;
+/// The smallest slot a wasm export's shipping O1 builds in its copy's destination
+/// (forward_slot_dests_x): a whole copy of one is a `memory.copy` in the module
+const EXPORT_DEST_SLOT: u32 = 8;
 
 /// MAKEPAD_RUN_VERIFY_PASSES=1: verify the RIR after every pass (names the pass that broke it).
 /// Fatal: a broken function panics with the pass's name (an ICE for the build: the body is
