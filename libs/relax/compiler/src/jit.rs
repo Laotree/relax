@@ -12887,6 +12887,9 @@ fn sampler_thread() {
         let settled = settle_on && active_at.elapsed() >= SETTLED_AFTER;
         if settled != SAMPLER_SETTLED.load(Ordering::Relaxed) {
             SAMPLER_SETTLED.store(settled, Ordering::Relaxed);
+            if settled && armipc_knob("+parkall") {
+                park_lukewarm();
+            }
             let ms = if settled { SETTLED_MS } else { SAMPLE_MS };
             for (_, _, h) in SAMPLED.lock().unwrap().iter() {
                 os::sample::set_period(h, ms);
@@ -13454,6 +13457,37 @@ const T_QUEUED: u64 = 2;
 const T_REPLAY: u64 = 3;
 /// ARMIPC knob +park: a lukewarm slot that stopped counting (rt_hot)
 const T_PARKED: u64 = 4;
+
+/// ARMIPC knob +parkall: on settling, every slot still counting (lukewarm) stops counting: its
+/// slot word goes back to its code (no count stub on its calls). On the owner, with the unit.
+fn park_lukewarm() {
+    owner::publish(|| unsafe {
+        let up = TIER_UNIT.load(Ordering::Acquire);
+        if up.is_null() {
+            return;
+        }
+        let u = &*up;
+        let mut n = 0u32;
+        for id in 0..u.fns.len() as u32 {
+            if !u.slots.has_seg(relax_backend::rir::SlotTable::locate(id).0) {
+                break;
+            }
+            let rec = tier_rec(&u.slots, id);
+            if (*rec.add(3)).load(Ordering::Acquire) != T_COUNTING {
+                continue;
+            }
+            let (code, stub) = ((*rec.add(1)).load(Ordering::Relaxed), (*rec.add(2)).load(Ordering::Relaxed));
+            if code == 0 || stub == 0 {
+                continue;
+            }
+            if (*rec.add(3)).compare_exchange(T_COUNTING, T_PARKED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                let _ = SlotWord::of(&u.slots, id).compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
+                n += 1;
+            }
+        }
+        eprintln!("armipc: parked {} lukewarm slots on settling", n);
+    });
+}
 
 thread_local! {
     /// makepad inspect's O3 build on this thread (compile_tier1_inspect): the edit putting its
