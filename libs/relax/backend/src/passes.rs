@@ -2054,6 +2054,10 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
             dce(f);
         }
     }
+    // two 32-bit words copied to two consecutive words: one 8-byte load and store
+    if !opt_off(options, "-wordpair") && pair_word_copies(f) {
+        dce(f);
+    }
     // four 32-bit lane loads of consecutive addresses inserted into one vector: one 16-byte load
     if !opt_off(options, "-lanevload") && f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::VInsert(..)))) && combine_lane_loads(f) {
         dce(f);
@@ -3747,6 +3751,116 @@ pub fn combine_lane_loads(f: &mut Func) -> bool {
             f.blocks[bi].insts[k] = i;
             changed = true;
         }
+    }
+    changed
+}
+
+/// Whether `i` reads or writes memory (any load, store, call or copy).
+fn touches_mem(i: &Inst) -> bool {
+    is_mem_effect(i) || matches!(i, Inst::Load(..) | Inst::LoadX(..) | Inst::VLoad(..) | Inst::VLoadX(..) | Inst::VGather(..) | Inst::VTbl(..))
+}
+
+/// Paired word copies: two 32-bit values loaded from `[a + o]` and `[a + o + 4]` and stored only to
+/// `[b + p]` and `[b + p + 4]` (a `Vec3` / `Vec2` field move, f32 or integer lanes) become one
+/// 8-byte load and one 8-byte store (x64 has no load/store pair: 2 x movss each way became one mov
+/// each way; arm64 makes the same ldp/stp of it either way). The second load and the later store
+/// keep their places: no memory write may lie between the loads, and no memory access between the
+/// stores (all in one block); each loaded value has one definition and that one use, and the
+/// bases one definition. The 8-byte accesses need no alignment on either target.
+pub fn pair_word_copies(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    let mut nuse = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut tu = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            for_uses(i, |u| nuse[u.0 as usize] += 1);
+        }
+        term_uses(&b.term, &mut tu);
+        for u in &tu {
+            nuse[u.0 as usize] += 1;
+        }
+    }
+    let word = |m: Mem| matches!(m, Mem::F32 | Mem::Int(4, _));
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        let n = f.blocks[bi].insts.len();
+        if n < 4 {
+            continue;
+        }
+        // per single-use loaded word: the index of its store in this block
+        let mut store_of: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for (k, i) in f.blocks[bi].insts.iter().enumerate() {
+            if let Inst::Store(m, _, _, s) = i {
+                if word(*m) && nuse[s.0 as usize] == 1 {
+                    store_of.insert(s.0, k);
+                }
+            }
+        }
+        if store_of.len() < 2 {
+            continue;
+        }
+        let mut dead = vec![false; n];
+        // instructions a pair took (removed or replaced)
+        let mut taken = vec![false; n];
+        // (load index, store index) -> replacement
+        let mut repl: Vec<(usize, Inst)> = Vec::new();
+        for i in 0..n {
+            if taken[i] {
+                continue;
+            }
+            let Inst::Load(m0, x0, a, o) = f.blocks[bi].insts[i] else { continue };
+            if !word(m0) || ndef[x0.0 as usize] != 1 || ndef[a.0 as usize] != 1 {
+                continue;
+            }
+            let Some(&k0) = store_of.get(&x0.0) else { continue };
+            // the partner load: the next instruction that touches memory, a word at o + 4
+            let mut j = i + 1;
+            while j < n && !touches_mem(&f.blocks[bi].insts[j]) {
+                j += 1;
+            }
+            if j >= n || taken[j] {
+                continue;
+            }
+            let Inst::Load(m1, x1, a1, o1) = f.blocks[bi].insts[j] else { continue };
+            if a1 != a || o1 as i64 != o as i64 + 4 || !word(m1) || ndef[x1.0 as usize] != 1 || x1 == x0 {
+                continue;
+            }
+            let Some(&k1) = store_of.get(&x1.0) else { continue };
+            let (Inst::Store(_, b0, p0, _), Inst::Store(_, b1, p1, _)) = (&f.blocks[bi].insts[k0], &f.blocks[bi].insts[k1]) else { continue };
+            if b0 != b1 || *p1 as i64 != *p0 as i64 + 4 || ndef[b0.0 as usize] != 1 || k0 <= j || k1 <= j || taken[k0] || taken[k1] {
+                continue;
+            }
+            let (lo, hi) = (k0.min(k1), k0.max(k1));
+            if f.blocks[bi].insts[lo + 1..hi].iter().any(touches_mem) {
+                continue;
+            }
+            let (b, p) = (*b0, *p0);
+            let t = f.vreg(Cls::I);
+            for x in [i, j, k0, k1] {
+                taken[x] = true;
+            }
+            dead[i] = true;
+            dead[lo] = true;
+            repl.push((j, Inst::Load(Mem::Int(8, false), t, a, o)));
+            repl.push((hi, Inst::Store(Mem::Int(8, false), b, p, t)));
+        }
+        if repl.is_empty() {
+            continue;
+        }
+        for (k, i) in repl {
+            f.blocks[bi].insts[k] = i;
+        }
+        let blk = &mut f.blocks[bi];
+        let mut k = 0;
+        blk.insts.retain(|_| { k += 1; !dead[k - 1] });
+        let mut k = 0;
+        blk.pos.retain(|_| { k += 1; !dead[k - 1] });
+        changed = true;
     }
     changed
 }

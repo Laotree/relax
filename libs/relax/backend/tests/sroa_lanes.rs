@@ -220,3 +220,70 @@ fn combined_lane_loads_compute_the_same_bits() {
         }
     }
 }
+
+/// fn(src, dst): three Vec3 moves src -> dst: loads first then stores (in order, then with the
+/// stores reversed), and one interleaved load/store/load/store move that must stay as it is (its
+/// store may write what the next load reads).
+fn word_copy_func() -> Func {
+    let mut f = Func::new("word_copy".into(), 0);
+    let (ps, pd) = (f.vreg(Cls::I), f.vreg(Cls::I));
+    f.params = vec![ps, pd];
+    f.block();
+    let mut insts = Vec::new();
+    for v in 0..2 {
+        let xs: Vec<VReg> = (0..3).map(|_| f.vreg(Cls::F32)).collect();
+        for (j, x) in xs.iter().enumerate() {
+            insts.push(Inst::Load(Mem::F32, *x, ps, (12 * v + 4 * j) as i32));
+        }
+        let order: [usize; 3] = if v == 0 { [0, 1, 2] } else { [2, 1, 0] };
+        for j in order {
+            insts.push(Inst::Store(Mem::F32, pd, (12 * v + 4 * j) as i32, xs[j]));
+        }
+    }
+    for j in 0..3 {
+        let x = f.vreg(Cls::F32);
+        insts.push(Inst::Load(Mem::F32, x, ps, 24 + 4 * j));
+        insts.push(Inst::Store(Mem::F32, pd, 24 + 4 * j, x));
+    }
+    f.blocks[0].pos = vec![0; insts.len()];
+    f.blocks[0].insts = insts;
+    f.blocks[0].term = Term::Ret(vec![]);
+    f.verify().unwrap();
+    f
+}
+
+#[test]
+fn word_copies_pair_into_eight_byte_moves() {
+    let mut f = word_copy_func();
+    assert!(relax_backend::passes::pair_word_copies(&mut f));
+    relax_backend::passes::dce(&mut f);
+    f.verify().unwrap();
+    let ins = || f.blocks.iter().flat_map(|b| b.insts.iter());
+    assert_eq!(ins().filter(|i| matches!(i, Inst::Load(Mem::Int(8, _), ..))).count(), 2, "{}", f.dump());
+    assert_eq!(ins().filter(|i| matches!(i, Inst::Store(Mem::Int(8, _), ..))).count(), 2, "{}", f.dump());
+    assert_eq!(ins().filter(|i| matches!(i, Inst::Load(Mem::F32, ..))).count(), 2 + 3, "{}", f.dump());
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
+fn paired_word_copies_move_the_same_bytes() {
+    use relax_backend::exec::Code;
+    type Entry = extern "sysv64" fn(*const u8, *mut u8);
+    let mut o = relax_session::Options::default();
+    o.cpu = relax_backend::x64::detect_cpu(&o);
+    let env = relax_backend::x64::Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
+    let src: Vec<u32> = (0..9).map(|k| 0x3f80_0000 + k * 0x1234_5).collect();
+    for pair in [false, true] {
+        let mut f = word_copy_func();
+        if pair {
+            assert!(relax_backend::passes::pair_word_copies(&mut f));
+            relax_backend::passes::dce(&mut f);
+        }
+        let c = relax_backend::x64::compile(&o, &f, &env).unwrap();
+        let code = Code::new(&c.code).unwrap();
+        let run: Entry = unsafe { std::mem::transmute(code.ptr()) };
+        let mut dst = vec![0u32; 9];
+        run(src.as_ptr() as *const u8, dst.as_mut_ptr() as *mut u8);
+        assert_eq!(dst, src, "pair {}", pair);
+    }
+}
