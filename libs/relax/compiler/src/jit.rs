@@ -8670,6 +8670,15 @@ thread_local! {
     static EXPORT_FULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// The O1 inliner's limits: a wasm export's shipping build takes its own (wasm_export::o1_inline_limits);
+/// MAKEPAD_RUN_O1_INLINE=hint,leaf,leaf_blocks,chain overrides every O1 build (tests of the inliner's
+/// callers under other limits: diff_fast, the tier fuzzer)
+fn o1_inline_limits(options: &crate::options::Options) -> relax_codegen::opt::InlineLimits {
+    let lim = relax_codegen::opt::InlineLimits::tier0(options);
+    let lim = if export_full() { crate::wasm_export::o1_inline_limits(lim, "MAKEPAD_RUN_WASM_EXPORT_O1_INLINE") } else { lim };
+    crate::wasm_export::o1_inline_limits(lim, "MAKEPAD_RUN_O1_INLINE")
+}
+
 fn export_full() -> bool {
     EXPORT_FULL.try_with(|c| c.get()).unwrap_or(false)
 }
@@ -10365,7 +10374,7 @@ unsafe fn tail_nocapture_facts(up: *mut Unit, id: u32, func: &mut relax_backend:
     if inline && !snap.is_empty() {
         let options = &(&*up).prog.session.options;
         let get = |c: u32| -> Option<(*const relax_backend::rir::Func, u8)> { snap.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const relax_backend::rir::Func, x.2)) };
-        let lim = if mode == RirMode::Baseline { relax_codegen::opt::InlineLimits::baseline() } else { relax_codegen::opt::InlineLimits::tier0(options) };
+        let lim = if mode == RirMode::Baseline { relax_codegen::opt::InlineLimits::baseline() } else { o1_inline_limits(options) };
         relax_codegen::opt::inline_calls(options, f, id, &get, &|c| nounwind.iter().any(|x| x.0 == c && x.1), &lim);
     }
     relax_codegen::opt::demote_invokes(f, &|c| nounwind.iter().any(|x| x.0 == c && x.1));
@@ -10756,9 +10765,7 @@ fn optimize_rir_inner(options: &crate::options::Options, id: u32, prep: Prep) ->
         if cfg.inline {
             let get = |c: u32| -> Option<(*const relax_backend::rir::Func, u8)> { callees.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const relax_backend::rir::Func, x.2)) };
             let ti = relax_backend::stats::pass_clock();
-            let lim = relax_codegen::opt::InlineLimits::tier0(options);
-            let lim = if export_full() { crate::wasm_export::o1_inline_limits(lim) } else { lim };
-            inlined = relax_codegen::opt::inline_calls(options, func, id, &get, nounwind, &lim);
+            inlined = relax_codegen::opt::inline_calls(options, func, id, &get, nounwind, &o1_inline_limits(options));
             relax_backend::stats::pass_time(5, ti);
         }
         static HIST_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
