@@ -1474,6 +1474,14 @@ impl Linker {
                 im.failed += 1;
                 return Resolved::Lazy;
             };
+            // SPEC-V: code that calls a twin (lowered before its verdict in an earlier run) is linked lazily
+            // instead: the image slots are not named yet, so only the lookup can send its calls to the
+            // twins' bases once its verdict is clean (twin_link_target)
+            if matches!(t, IMG_SLOT | IMG_THUNK | IMG_CALL) && im.keys.get(ix as usize).and_then(|k| k.first()) == Some(&4)
+                && !relax_backend::stats::opt_off(&u.prog.session.options, "-twinlink") {
+                crate::jit::TWIN_IMG_LAZY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Resolved::Lazy;
+            }
             let ok = match t {
                 IMG_SLOT | IMG_THUNK | IMG_CALL => im.slot_of(ix).is_some(),
                 IMG_SYM if !statics && im.syms.get(ix as usize).map_or(false, |b| is_static_sym(b)) => {
@@ -1527,7 +1535,7 @@ impl Linker {
             unsafe {
                 crate::os::mem::fill_code(at, total, |buf| {
                     let mut rl: Vec<RelocAt> = Vec::new();
-                    for (k, &(si, _, off, n, _)) in layout.iter().enumerate() {
+                    for (k, &(si, caller, off, n, _)) in layout.iter().enumerate() {
                         let s = &im.slots[si];
                         buf[off..off + n].copy_from_slice(&im.blob[s.code.0..s.code.0 + n]);
                         rl.clear();
@@ -1538,7 +1546,7 @@ impl Linker {
                                 break;
                             };
                             let v = match t {
-                                IMG_SLOT | IMG_THUNK | IMG_CALL => im.slot_of(ix).map(|x| env.reloc_value(match t { IMG_SLOT => Reloc::Slot(x), IMG_CALL => Reloc::Call(x), _ => Reloc::Thunk(x) })),
+                                IMG_SLOT | IMG_THUNK | IMG_CALL => im.slot_of(ix).map(|x| u.twin_link_target(caller, x)).map(|x| env.reloc_value(match t { IMG_SLOT => Reloc::Slot(x), IMG_CALL => Reloc::Call(x), _ => Reloc::Thunk(x) })),
                                 IMG_SYM => im.fresh.get(&ri).copied().or_else(|| im.sym_sym.get(ix as usize).copied().flatten().flatten()).map(|s| syms.value(s)),
                                 IMG_TLS_KEY => Some(env.reloc_value(Reloc::TlsKey)),
                                 IMG_TLS_SLOW => Some(env.reloc_value(Reloc::TlsSlow)),

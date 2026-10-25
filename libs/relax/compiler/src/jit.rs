@@ -6428,6 +6428,27 @@ impl Unit {
         self.fn_map.get(&FnKey::Plain(id))
     }
 
+    /// SPEC-V: where linked (cached) code of slot `caller` sends its call / reference to slot `target`.
+    /// A twin exists for callers whose aliasing is not known yet; cached code lowered in an earlier run
+    /// before its verdict still names twins. When the caller's own body is verified clean now (a warm
+    /// launch knows the stored verdict before the first link), its calls go to the twin's base: the
+    /// verified body, sound for a caller that passes no aliased `&mut`. Without it every warm launch
+    /// ran the race's draw path (draw_view .. set_uniform, find_appendable_drawcall) as twins built at
+    /// O3 again in the background each launch (x64 live warm draw +10% over --check-first).
+    /// MAKEPAD_RUN_OPT=-twinlink keeps the twins (A/B).
+    pub(crate) fn twin_link_target(&self, caller: u32, target: u32) -> u32 {
+        let (Some(t), Some(c)) = (self.fns.get(target as usize), self.fns.get(caller as usize)) else { return target };
+        let FnKey::Plain(base) = t.key else { return target };
+        let body = match c.key { FnKey::Plain(b) => b, _ => caller };
+        if (base as usize) < self.fns.len() && self.verdict_clean(body) && !matches!(self.verdict_state(base), Verdict::Failed(_))
+            && !relax_backend::stats::opt_off(&self.prog.session.options, "-twinlink") {
+            TWIN_RETARGETS.fetch_add(1, Ordering::Relaxed);
+            base
+        } else {
+            target
+        }
+    }
+
     /// SPEC-V: whether slot `id` may get O3 code. Verified code does; so does unverified code (twins,
     /// bodies whose verdict is pending or will never come), built from its unverified lowering as it
     /// is: `noalias` withheld, its aliasing-prone calls still going to twins, never inlined, never
@@ -14249,6 +14270,10 @@ unsafe fn borrow_build_enqueue(up: *mut Unit, id: u32) {
 
 /// SPEC-V: at most this many callees are built ahead of one replacement's install (prebuild_callees)
 const PREBUILD_MAX: usize = 256;
+/// SPEC-V: calls of linked code sent to a twin's base instead of the twin (twin_link_target)
+pub(crate) static TWIN_RETARGETS: AtomicU64 = AtomicU64::new(0);
+/// SPEC-V: startup image slots left to the lazy lookup because their code calls a twin
+pub(crate) static TWIN_IMG_LAZY: AtomicU64 = AtomicU64::new(0);
 /// callees built ahead of a replacement's install (inspect stats)
 pub(crate) static SPECV_PREBUILT: AtomicU64 = AtomicU64::new(0);
 
