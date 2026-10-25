@@ -206,9 +206,29 @@ fn fetch_remote(cache: &Path, repo: &Repo, existing: Option<&store::Store>, path
 /// whole history of its branches and tags instead, which must hold it.
 fn fetch_commit(path: &Path, existing: Option<&store::Store>, url: &str, adv: &Advertisement, commit: Oid, key: &str) -> Result<(), String> {
     let caps = &adv.capabilities;
-    let haves: Vec<ObjectId> = existing.map(|s| s.index.refs.iter().map(|r| ObjectId(r.commit)).collect()).unwrap_or_default();
-    let shallow = caps.iter().any(|c| c == "shallow");
-    let req = build_upload_pack_request(url, &[ObjectId(commit)], caps, &haves, shallow.then_some(1)).map_err(|e| e.to_string())?;
+    let can_deepen = caps.iter().any(|c| c == "shallow");
+    // the store's kept commits as haves; the ones held without their parents (a depth-1 fetch)
+    // are named shallow, else the service would take their history as had and leave out an
+    // ancestor that is wanted now (a tag behind a fetched branch)
+    let mut haves: Vec<ObjectId> = Vec::new();
+    let mut shallow: Vec<ObjectId> = Vec::new();
+    if let Some(s) = existing {
+        for r in &s.index.refs {
+            let o = ObjectId(r.commit);
+            if haves.contains(&o) {
+                continue;
+            }
+            let is_shallow = !has_parents(s, &r.commit);
+            if is_shallow && !can_deepen {
+                continue;
+            }
+            haves.push(o);
+            if is_shallow {
+                shallow.push(o);
+            }
+        }
+    }
+    let req = build_upload_pack_request(url, &[ObjectId(commit)], caps, &haves, &shallow, can_deepen.then_some(1)).map_err(|e| e.to_string())?;
     eprintln!("makepad: fetching {} ({})", url, &store::hex(&commit)[..12]);
     let t0 = std::time::Instant::now();
     let pack = http(&req, Duration::from_secs(600)).and_then(|r| extract_pack_from_response(&r).map_err(|e| e.to_string())?.ok_or_else(|| "the server sent no pack".to_string()));
@@ -226,7 +246,7 @@ fn fetch_commit(path: &Path, existing: Option<&store::Store>, url: &str, adv: &A
             }
             eprintln!("makepad: {url}: {} is no branch or tag tip ({first}): fetching the history", &store::hex(&commit)[..12]);
             // no haves: the store holds shallow commits, whose parents the service would take as had
-            let req = build_upload_pack_request(url, &tips, caps, &[], None).map_err(|e| e.to_string())?;
+            let req = build_upload_pack_request(url, &tips, caps, &[], &[], None).map_err(|e| e.to_string())?;
             let r = http(&req, Duration::from_secs(1800))?;
             extract_pack_from_response(&r).map_err(|e| format!("{url}: {e}"))?.ok_or_else(|| format!("{url}: the server sent no pack"))?
         }
@@ -237,6 +257,23 @@ fn fetch_commit(path: &Path, existing: Option<&store::Store>, url: &str, adv: &A
         eprintln!("makepad: {}: download {:.2} s, unpack {:.2} s ({} objects), store {:.2} s", url, t_dl.as_secs_f64(), t_unpack, n, t_store);
     }
     Ok(())
+}
+
+/// Does the store hold every parent of `commit` (a root commit: yes)?
+fn has_parents(s: &store::Store, commit: &Oid) -> bool {
+    let Ok(Some((_, data))) = s.object(commit) else { return false };
+    let text = String::from_utf8_lossy(&data);
+    for line in text.lines() {
+        if line.is_empty() {
+            break;
+        }
+        if let Some(p) = line.strip_prefix("parent ").and_then(store::from_hex) {
+            if !s.contains(&p) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// A pack's objects (deltas resolved against the pack and the store) appended to the store with
@@ -407,7 +444,7 @@ fn fetch_short_rev(path: &Path, existing: Option<&store::Store>, url: &str, adv:
         return Err(format!("{url}: no branches or tags to look for rev `{rev}` in"));
     }
     eprintln!("makepad: fetching {url} (the history, for rev {rev})");
-    let req = build_upload_pack_request(url, &heads, &adv.capabilities, &[], None).map_err(|e| e.to_string())?;
+    let req = build_upload_pack_request(url, &heads, &adv.capabilities, &[], &[], None).map_err(|e| e.to_string())?;
     let r = http(&req, Duration::from_secs(1800))?;
     let pack = extract_pack_from_response(&r).map_err(|e| format!("{url}: {e}"))?.ok_or_else(|| format!("{url}: the server sent no pack"))?;
     let (objects, _) = unpack(existing, &pack, url)?;

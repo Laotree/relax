@@ -140,10 +140,11 @@ pub fn parse_info_refs_response(response: &Response, branch: Option<&str>) -> Re
 }
 
 /// POST <url>/git-upload-pack: a want per `targets` (the first with the capabilities we use that
-/// the remote has), `deepen <depth>` when asked (needs `shallow`), a `have` per commit we hold, done.
-pub fn build_upload_pack_request(remote_url: &str, targets: &[ObjectId], capabilities: &[String], have: &[ObjectId], depth: Option<u32>) -> Result<Request, GitError> {
+/// the remote has), a `shallow` line per commit we hold without its parents and `deepen <depth>`
+/// when asked (both need `shallow`), a `have` per commit we hold, done.
+pub fn build_upload_pack_request(remote_url: &str, targets: &[ObjectId], capabilities: &[String], have: &[ObjectId], shallow: &[ObjectId], depth: Option<u32>) -> Result<Request, GitError> {
     let has_cap = |name: &str| capabilities.iter().any(|c| c == name || c.strip_prefix(name).is_some_and(|r| r.starts_with('=')));
-    if depth.is_some() && !has_cap("shallow") {
+    if (depth.is_some() || !shallow.is_empty()) && !has_cap("shallow") {
         return Err(GitError::InvalidRef("remote does not advertise shallow capability".into()));
     }
     let mut want_caps = Vec::new();
@@ -166,6 +167,9 @@ pub fn build_upload_pack_request(remote_url: &str, targets: &[ObjectId], capabil
         write_pkt_line(&mut body, want.as_bytes())?;
     }
     // part of the want list: before the first flush
+    for oid in shallow {
+        write_pkt_line(&mut body, format!("shallow {}\n", oid.to_hex()).as_bytes())?;
+    }
     if let Some(depth) = depth {
         write_pkt_line(&mut body, format!("deepen {depth}\n").as_bytes())?;
     }
@@ -346,7 +350,7 @@ mod tests {
     fn upload_pack_request_wants_deepens_then_haves() {
         let oid = ObjectId::from_hex("0123456789012345678901234567890123456789").unwrap();
         let caps = ["shallow".to_string(), "ofs-delta".to_string(), "side-band-64k".to_string()];
-        let req = build_upload_pack_request("https://example.com/repo/", &[oid], &caps, &[oid], Some(1)).unwrap();
+        let req = build_upload_pack_request("https://example.com/repo/", &[oid], &caps, &[oid], &[oid], Some(1)).unwrap();
         assert_eq!(req.url, "https://example.com/repo/git-upload-pack");
         let want = format!("want {oid} side-band-64k ofs-delta\n");
         let mut rd = PktLineReader::new(&req.body);
@@ -357,7 +361,7 @@ mod tests {
                 PktLine::Data(d) => String::from_utf8(d.to_vec()).unwrap(),
             });
         }
-        assert_eq!(lines, [want, "deepen 1\n".into(), "<flush>".into(), format!("have {oid}\n"), "done\n".into()]);
-        assert!(build_upload_pack_request("https://example.com/repo", &[oid], &[], &[], Some(1)).is_err());
+        assert_eq!(lines, [want, format!("shallow {oid}\n"), "deepen 1\n".into(), "<flush>".into(), format!("have {oid}\n"), "done\n".into()]);
+        assert!(build_upload_pack_request("https://example.com/repo", &[oid], &[], &[], &[], Some(1)).is_err());
     }
 }
