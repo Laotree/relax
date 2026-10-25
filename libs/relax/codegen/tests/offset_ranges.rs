@@ -109,3 +109,53 @@ fn loop_test_decides_the_previous_index() {
         }
     }
 }
+
+/// A rotated counting loop whose body indexes with the copy of the counter taken before its step
+/// (`t = j; j = j + 1; j < 576` at the latch, `t < 576` checked in the body): the copy is a loop
+/// variable of the counter's range, so the body's check folds. p[t] = t for t in 0..576 (n words).
+fn build_rotated(n: i64) -> Func {
+    let mut f = Func::new("rotated_copy".into(), 0);
+    let p = f.vreg(Cls::I);
+    f.params = vec![p];
+    f.rets = vec![Cls::I];
+    let v: Vec<VReg> = (0..10).map(|_| f.vreg(Cls::I)).collect();
+    let (t, j) = (v[0], v[1]);
+    let b: Vec<u32> = (0..5).map(|_| f.block()).collect();
+    push(&mut f, b[0], Inst::Iconst(t, 0));
+    push(&mut f, b[0], Inst::Iconst(j, 1));
+    push(&mut f, b[0], Inst::ICmpI(Cond::Lt, false, v[2], j, n));
+    f.blocks[b[0] as usize].term = Term::Branch(v[2], b[1], b[3]);
+    push(&mut f, b[1], Inst::ICmpI(Cond::Lt, false, v[3], t, n));
+    f.blocks[b[1] as usize].term = Term::Branch(v[3], b[2], b[4]);
+    push(&mut f, b[2], Inst::StoreX(Mem::Int(8, false), p, t, 3, 0, t));
+    push(&mut f, b[2], Inst::Mov(t, j));
+    push(&mut f, b[2], Inst::IBinI(IOp::Add, U32, j, j, 1));
+    push(&mut f, b[2], Inst::ICmpI(Cond::Lt, false, v[4], j, n));
+    f.blocks[b[2] as usize].term = Term::Branch(v[4], b[1], b[3]);
+    push(&mut f, b[3], Inst::Iconst(v[5], 0));
+    f.blocks[b[3] as usize].term = Term::Ret(vec![v[5]]);
+    push(&mut f, b[4], Inst::Iconst(v[6], 999));
+    f.blocks[b[4] as usize].term = Term::Ret(vec![v[6]]);
+    f.verify().unwrap();
+    f
+}
+
+#[test]
+fn rotated_loop_copy_of_the_counter_is_in_range() {
+    let o = relax_session::Options::default();
+    let mut f = build_rotated(576);
+    relax_codegen::ranges::fold_ranges(&o, &mut f);
+    relax_backend::passes::simplify(&o, &mut f, None, true, true);
+    f.verify().unwrap();
+    let reach = relax_backend::regalloc::reachable(&f);
+    // the body's check of t (VReg 1) is gone: only the counter's own tests remain
+    assert!(!f.blocks.iter().enumerate().any(|(bi, b)| reach[bi] && b.insts.iter().any(|i| matches!(i, Inst::ICmpI(_, _, _, x, 576) if *x == VReg(1)))), "{}", f.dump());
+    for g in [build_rotated(576), f] {
+        let code = Code::new(&compile(&g)).unwrap();
+        let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
+        let mut a = vec![7u64; 576];
+        assert_eq!(run(a.as_mut_ptr()), 0);
+        // t runs 0..575 (the step that makes j 576 leaves the loop)
+        assert!(a.iter().enumerate().all(|(k, x)| if k < 575 { *x == k as u64 } else { *x == 7 }), "{:?}", &a[570..]);
+    }
+}

@@ -4132,7 +4132,7 @@ fn slot_escape_points(f: &Func, der: &[u32], esc: &[bool]) -> Vec<Option<Vec<(u3
     let mut pts: Vec<Option<Vec<(u32, u32)>>> = (0..ns).map(|s| if esc[s] { Some(Vec::new()) } else { None }).collect();
     let mut seen = vec![false; ns];
     let dslot = |v: VReg| der[v.0 as usize];
-    let mut add = |pts: &mut Vec<Option<Vec<(u32, u32)>>>, seen: &mut Vec<bool>, v: VReg, b: usize, k: usize| {
+    let add = |pts: &mut Vec<Option<Vec<(u32, u32)>>>, seen: &mut Vec<bool>, v: VReg, b: usize, k: usize| {
         let d = dslot(v);
         if d != NONE && d != MULTI {
             seen[d as usize] = true;

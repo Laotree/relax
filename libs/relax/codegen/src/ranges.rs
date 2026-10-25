@@ -668,7 +668,7 @@ pub fn fold_ranges(options: &relax_session::Options, f: &mut Func) -> bool {
     }
     // hypotheses found not to hold, per (header, vreg): left out of the next round
     let mut off: HashMap<(u32, u32), u8> = HashMap::default();
-    for round in 0..3 {
+    for round in 0..4 {
         let mut g = f.clone();
         res.clear();
         let mut ed = Edges::default();
@@ -683,9 +683,10 @@ pub fn fold_ranges(options: &relax_session::Options, f: &mut Func) -> bool {
         let mut weaker = false;
         for (key, ok) in &res {
             if !ok {
-                // a strong hypothesis that failed gets the weak one next round; a weak one goes
+                // a failed hypothesis gets the next weaker one next round (the test bound, then
+                // max - step, then max); the weakest that fails goes
                 let e = off.entry(*key).or_insert(0);
-                *e = if *e == 0 { weaker = true; 2 } else { 1 };
+                *e = match *e { 0 => { weaker = true; 3 } 3 => { weaker = true; 2 } _ => 1 };
             }
         }
         if res.iter().all(|r| !r.1) && !weaker {
@@ -828,6 +829,8 @@ fn run(f: &mut Func, lv: &HashMap<(u32, u32), u8>, spec: bool, res: &mut Vec<((u
             // loop variables: v -> (type, largest step); `bad`: some other definition
             let mut ivk: HashMap<u32, (IntTy, i64)> = HashMap::default();
             let mut bad: Vec<u32> = Vec::new();
+            let mut copies: Vec<(u32, u32)> = Vec::new();
+            let mut loop_defs: HashMap<u32, u32> = HashMap::default();
             for (x, blk) in f.blocks.iter().enumerate() {
                 if inl[x] {
                     for (k, i) in blk.insts.iter().enumerate() {
@@ -850,17 +853,37 @@ fn run(f: &mut Func, lv: &HashMap<(u32, u32), u8>, spec: bool, res: &mut Vec<((u
                                     e.1 = e.1.max(c);
                                 }
                             }
+                            Inst::Mov(d, s0) => {
+                                copies.push((d.0, s0.0));
+                                bad.push(d.0);
+                            }
                             _ => for_defs(i, |d| bad.push(d.0)),
                         }
+                        for_defs(i, |d| *loop_defs.entry(d.0).or_insert(0) += 1);
                     }
                 }
             }
+            // copies of a loop variable taken before its step (`t = i; i += 1` with the latch's
+            // `i < n`, the body's `t < n` check): each a variable of the same range, when the loop
+            // defines it only by such copies
+            let mut derived: HashMap<u32, u32> = HashMap::default();
+            for &(d, s0) in &copies {
+                if ivk.contains_key(&s0) && !ivk.contains_key(&d) {
+                    derived.insert(d, s0);
+                }
+            }
+            derived.retain(|d, _| copies.iter().filter(|c| c.0 == *d && ivk.contains_key(&c.1)).count() == loop_defs.get(d).copied().unwrap_or(0) as usize);
+            bad.retain(|d| !derived.contains_key(d));
             let mut add: Vec<(u32, R)> = Vec::new();
             if spec && !ivk.is_empty() {
                 // a loop variable is bounded when the loop compares it (or its sum v + k) with a
                 // constant or with a value the loop does not define and whose interval is known
                 // on entry; others would fail the check and cost a round
                 let mut bounded: Vec<u32> = Vec::new();
+                // per variable: the largest value an unsigned `v < y` / `v <= y` test in the loop lets
+                // through (y a constant or a value the loop does not define): the first hypothesis
+                // tried, [entry minimum, that]
+                let mut test_hi: HashMap<u32, u64> = HashMap::default();
                 for (x, blk) in f.blocks.iter().enumerate() {
                     if !inl[x] {
                         continue;
@@ -874,8 +897,27 @@ fn run(f: &mut Func, lv: &HashMap<(u32, u32), u8>, spec: bool, res: &mut Vec<((u
                         if !ok {
                             continue;
                         }
+                        let lim = match *i {
+                            Inst::ICmpI(Cond::Lt, false, _, _, c) if c > 0 => Some(c as u64 - 1),
+                            Inst::ICmpI(Cond::Le, false, _, _, c) if c >= 0 => Some(c as u64),
+                            Inst::ICmp(Cond::Lt, false, _, _, y) => st.get(y.0).and_then(|r| r.hi.checked_sub(1)),
+                            Inst::ICmp(Cond::Le, false, _, _, y) => st.get(y.0).map(|r| r.hi),
+                            _ => None,
+                        };
+                        if let Some(h) = lim {
+                            let e = test_hi.entry(a.0).or_insert(h);
+                            *e = (*e).max(h);
+                        }
                         if ivk.contains_key(&a.0) {
                             bounded.push(a.0);
+                        } else if let Some(&s0) = derived.get(&a.0) {
+                            // the copy and the variable it copies: both bounded by the test
+                            bounded.push(a.0);
+                            bounded.push(s0);
+                            if let Some(h) = lim {
+                                let e = test_hi.entry(s0).or_insert(h);
+                                *e = (*e).max(h);
+                            }
                         } else {
                             // its sum v + k, or a copy of v taken before the step (the Range
                             // iterator's `t = i; i = i + 1; t < n`)
@@ -891,7 +933,8 @@ fn run(f: &mut Func, lv: &HashMap<(u32, u32), u8>, spec: bool, res: &mut Vec<((u
                         }
                     }
                 }
-                for (&v, &(it, kmax)) in &ivk {
+                let cands: Vec<(u32, (IntTy, i64))> = ivk.iter().map(|(v, k)| (*v, *k)).chain(derived.iter().filter_map(|(d, s0)| ivk.get(s0).map(|k| (*d, *k)))).collect();
+                for &(v, (it, kmax)) in &cands {
                     let level = lv.get(&(b, v)).copied().unwrap_or(0);
                     if bad.contains(&v) || !bounded.contains(&v) || level == 1 || f.vregs.get(v as usize) != Some(&Cls::I) {
                         continue;
@@ -901,10 +944,15 @@ fn run(f: &mut Func, lv: &HashMap<(u32, u32), u8>, spec: bool, res: &mut Vec<((u
                     if m < kmax as u64 {
                         continue;
                     }
-                    // first [entry minimum, max - step] (the step never wraps); when that fails
-                    // (the loop tests the value before its step: `t = i; i += 1; t < n` leaves i
-                    // at most n), the weaker [entry minimum, max]: the lower bound alone
-                    let hi = if level == 2 { m } else { m - kmax as u64 };
+                    // first [entry minimum, the loop's own test bound]; then [entry minimum, max -
+                    // step] (the step never wraps); when that fails (the loop tests the value before
+                    // its step: `t = i; i += 1; t < n` leaves i at most n), the weaker [entry
+                    // minimum, max]: the lower bound alone
+                    let hi = match level {
+                        0 => test_hi.get(&v).copied().filter(|h| *h >= e.lo && *h <= m - kmax as u64).unwrap_or(m - kmax as u64),
+                        2 => m,
+                        _ => m - kmax as u64,
+                    };
                     if e.hi > hi {
                         continue;
                     }
@@ -1105,6 +1153,22 @@ fn step(st: &mut State, i: &mut Inst, marks: &HashMap<u32, (u8, R)>) -> bool {
         *i = Inst::Iconst(d, k);
         changed = true;
     }
+    // `x = x + k` in place: afterwards x is its old value's copy plus k (`t = i; i = i + 1`: the
+    // step's result relates to t), when an exact copy of the old value survives the redefinition
+    let step_of_copy = match &*i {
+        Inst::IBinI(IOp::Add, it, d, x, k) if d == x && (bits(*it) == 64 || !it.signed) => st.lin.iter().find_map(|&(a, b, k0, w)| {
+            if k0 != 0 || w < 64 {
+                None
+            } else if b == x.0 && a != x.0 {
+                Some(a)
+            } else if a == x.0 && b != x.0 {
+                Some(b)
+            } else {
+                None
+            }
+        }).map(|w| (d.0, w, *k, bits(*it) as u8)),
+        _ => None,
+    };
     let mut ds: Vec<u32> = Vec::new();
     for_defs(i, |d| ds.push(d.0));
     // a copy `d = s` holds what is known of s's order against other values: a later
@@ -1131,6 +1195,9 @@ fn step(st: &mut State, i: &mut Inst, marks: &HashMap<u32, (u8, R)>) -> bool {
     }
     for c in copied {
         push_capped(&mut st.rel, c);
+    }
+    if let Some(l) = step_of_copy {
+        push_capped(&mut st.lin, l);
     }
     if let [d] = ds[..] {
         if let Some(l) = sel_min {
