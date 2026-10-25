@@ -1654,7 +1654,19 @@ pub(crate) extern "C" fn relax_precompile(addr: u64) -> u64 {
         let u = &*up;
         u.find_fn(addr).or_else(|| (0..2).find_map(|k| u.slots.find(k, addr).map(|x| x.0))).filter(|&id| (id as usize) < u.fns.len())
     });
-    let Some(root) = root else { return 0 };
+    match root {
+        Some(root) => precompile_from(root),
+        None => 0,
+    }
+}
+
+/// `relax_precompile` from slot `root`.
+#[cfg(unix)]
+pub(crate) fn precompile_from(root: u32) -> u64 {
+    let up = unsafe { UNIT };
+    if up.is_null() {
+        return 0;
+    }
     let mut todo = vec![root];
     let mut seen = std::collections::HashSet::new();
     let mut built = 0u64;

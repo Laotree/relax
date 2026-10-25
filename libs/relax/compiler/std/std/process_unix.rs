@@ -706,13 +706,14 @@ impl Command {
     /// child reported through the CLOEXEC pipe (the child is reaped then).
     #[cfg(not(target_os = "android"))]
     unsafe fn fork_exec(&mut self, prog: &CString, argv: &Vec<*const c_char>, envp: *const *const c_char, cwd: &Option<CString>, stdin_child: &Option<OwnedFd>, stdout_child: &Option<OwnedFd>, stderr_child: &Option<OwnedFd>) -> io::Result<sys::pid_t> {
-        let (err_r, err_w) = anon_pipe()?;
         // Under the JIT the child must find its code built: it has only this thread, and a
         // compile there would wait for locks other threads of this process held at the fork
         // (POSIX: only async-signal-safe work between fork and exec). The loader builds the
         // child's half and the closures, with what they call, now; its fork marks the child
         // (a stub reached there anyway ends it with the function's name, never a hang).
         // Under rustc (std/check_os) there is no loader: plain fork.
+        // A child that reached code built only now (a vtable's fn) ended before its exec, with
+        // none of its effects left: the loader built that code, and the fork goes again.
         let loader = ForkLoader::get();
         if let Some(pre) = loader.precompile {
             pre(Self::fork_child_half as usize);
@@ -720,22 +721,30 @@ impl Command {
                 pre(p.run as usize);
             }
         }
-        let pid = match loader.fork_exec {
-            Some(f) => f(),
-            None => fork(),
-        };
-        if pid < 0 {
-            return Err(io::Error::last_os_error());
+        let mut again = 0;
+        loop {
+            let (err_r, err_w) = anon_pipe()?;
+            let pid = match loader.fork_exec {
+                Some(f) => f(),
+                None => fork(),
+            };
+            if pid < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if pid == 0 {
+                self.fork_child_half(err_w.as_raw_fd(), prog, argv, envp, cwd, stdin_child, stdout_child, stderr_child);
+            }
+            drop(err_w);
+            let r = self.fork_exec_wait(pid, err_r);
+            match loader.fork_exec_done {
+                Some(done) if done(pid) != 0 && again < 64 => {
+                    let mut status: c_int = 0;
+                    while sys::waitpid(pid, &mut status as *mut c_int, 0) < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {}
+                    again += 1;
+                }
+                _ => return r,
+            }
         }
-        if pid == 0 {
-            self.fork_child_half(err_w.as_raw_fd(), prog, argv, envp, cwd, stdin_child, stdout_child, stderr_child);
-        }
-        drop(err_w);
-        let r = self.fork_exec_wait(pid, err_r);
-        if let Some(done) = loader.fork_exec_done {
-            done(pid);
-        }
-        r
     }
 
     /// The child's half of fork_exec: stdio, cwd, process group, SIGPIPE default, the
@@ -834,7 +843,7 @@ pub(crate) unsafe fn run_pre_exec<F: FnMut() -> io::Result<()>>(f: *mut u8) -> i
 struct ForkLoader {
     precompile: Option<extern "C" fn(usize) -> u64>,
     fork_exec: Option<extern "C" fn() -> sys::pid_t>,
-    fork_exec_done: Option<extern "C" fn(sys::pid_t)>,
+    fork_exec_done: Option<extern "C" fn(sys::pid_t) -> u32>,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -852,7 +861,7 @@ impl ForkLoader {
             ForkLoader {
                 precompile: (p != 0).then(|| core::mem::transmute::<usize, extern "C" fn(usize) -> u64>(p)),
                 fork_exec: (f != 0).then(|| core::mem::transmute::<usize, extern "C" fn() -> sys::pid_t>(f)),
-                fork_exec_done: (d != 0).then(|| core::mem::transmute::<usize, extern "C" fn(sys::pid_t)>(d)),
+                fork_exec_done: (d != 0).then(|| core::mem::transmute::<usize, extern "C" fn(sys::pid_t) -> u32>(d)),
             }
         }
     }

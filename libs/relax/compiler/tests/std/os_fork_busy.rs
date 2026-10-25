@@ -124,3 +124,33 @@ pub fn fork_while_jit_busy() {
     }
     println!("| forks that reached exec: {} of 200", ok);
 }
+
+trait Probe: Sync {
+    fn go(&self) -> i32;
+}
+
+struct ParentCheck(i32);
+
+impl Probe for ParentCheck {
+    #[inline(never)]
+    fn go(&self) -> i32 {
+        let p = unsafe { getppid() };
+        p + self.0
+    }
+}
+
+/// A closure that reaches a fn only through a vtable made at run time (nothing the closure's
+/// code names): under the JIT the child ends before exec at the unbuilt fn, the spawn builds it
+/// and forks again -- the spawn succeeds as with real std, and never hangs.
+#[test]
+fn a02_pre_exec_through_a_vtable() {
+    let o: &'static dyn Probe = Box::leak(Box::new(ParentCheck(std::env::args().count() as i32)));
+    for round in 0..2 {
+        let st = unsafe {
+            Command::new("true")
+                .pre_exec(move || if o.go() == i32::MIN { Err(std::io::Error::from_raw_os_error(1)) } else { Ok(()) })
+                .status()
+        };
+        println!("| round {} status {:?}", round, st.map(|s| s.code()));
+    }
+}

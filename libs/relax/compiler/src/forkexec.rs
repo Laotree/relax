@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// This process is a forked child on its way to exec (set in the child only).
 static EXEC_CHILD: AtomicBool = AtomicBool::new(false);
+/// MAKEPAD_RUN_VERBOSE: a child that reached unbuilt code says which on its stderr
+static VERBOSE: AtomicBool = AtomicBool::new(false);
 
 pub fn exec_child() -> bool {
     EXEC_CHILD.load(Ordering::Relaxed)
@@ -60,6 +62,8 @@ thread_local! {
 /// relax_fork: compile jobs and the owner parked, the child's own copy of the code memory), and
 /// the child is marked and recorded.
 pub(crate) extern "C" fn relax_fork_exec() -> i32 {
+    static ENV: std::sync::Once = std::sync::Once::new();
+    ENV.call_once(|| VERBOSE.store(std::env::var_os("MAKEPAD_RUN_VERBOSE").is_some_and(|v| v != "0"), Ordering::Relaxed));
     let t = table();
     let k = t.and_then(|t| t.iter().position(|e| e[0].compare_exchange(0, CLAIMED, Ordering::SeqCst, Ordering::SeqCst).is_ok()));
     if let (Some(t), Some(k)) = (t, k) {
@@ -87,19 +91,35 @@ pub(crate) extern "C" fn relax_fork_exec() -> i32 {
     pid
 }
 
-/// `__relax_fork_exec_done(pid)`: the parent learnt that child `pid` exec'd or failed.
-pub(crate) extern "C" fn relax_fork_exec_done(pid: i32) {
-    if let Some(t) = table() {
-        for e in t.iter().filter(|e| e[0].load(Ordering::Acquire) == pid as u64 && pid > 0) {
-            e[0].store(0, Ordering::Release);
+/// `__relax_fork_exec_done(pid)`: the parent learnt that child `pid` exec'd or ended. 1: the
+/// child ended at code that was not built before the fork (a function reached only through a
+/// vtable or a pointer made at run time): that code is built now, and std forks again (the
+/// child's effects ended with it); 0: done.
+pub(crate) extern "C" fn relax_fork_exec_done(pid: i32) -> u32 {
+    let _keep = crate::os::proc::KeepLastError::new();
+    let Some(t) = table() else { return 0 };
+    let mut unbuilt = None;
+    for e in t.iter().filter(|e| pid > 0 && e[0].load(Ordering::Acquire) == pid as u64) {
+        let st = e[3].load(Ordering::Acquire);
+        if st & 0xffff_ffff == STATE_UNBUILT {
+            unbuilt = Some((st >> 32) as u32);
         }
+        e[0].store(0, Ordering::Release);
+    }
+    match unbuilt {
+        Some(slot) => {
+            crate::jit::precompile_from(slot);
+            1
+        }
+        None => 0,
     }
 }
 
 /// A lazy stub reached in a forked child before its exec (jit.rs rt_compile): the code was not
 /// built before the fork. Compiling here could wait for good on a lock another thread held at
-/// the fork, so the child ends at once (exit 127, as a failed exec), with the function's name on
-/// its stderr and in its entry (why-hung). Async-signal-safe: atomics, write, _exit.
+/// the fork, so the child ends at once (exit 127), with the function's name in its entry: the
+/// parent builds it and std forks again (`relax_fork_exec_done`). Async-signal-safe: atomics,
+/// _exit; the name goes to stderr only with MAKEPAD_RUN_VERBOSE (read before the fork).
 pub(crate) fn child_reached_unbuilt(slot: u32) -> ! {
     let k = ENTRY.try_with(|e| e.get()).unwrap_or(usize::MAX);
     if let Some(t) = table().filter(|_| k < ENTRIES) {
@@ -111,9 +131,12 @@ pub(crate) fn child_reached_unbuilt(slot: u32) -> ! {
     let put = |b: &[u8]| unsafe {
         write(2, b.as_ptr(), b.len());
     };
+    if !VERBOSE.load(Ordering::Relaxed) {
+        crate::os::thread::exit_now(127)
+    }
     put(b"makepad run: a forked child reached `");
     crate::jit::with_slot_name(slot, &mut |n| put(&n[..n.len().min(300)]));
-    put(b"` before its exec, and it was not built before the fork: the child of a spawn never compiles (it has only the forking thread; locks other threads held stay held) -- the spawn fails (exit 127); makepad run bug, report it\n");
+    put(b"` before its exec, and it was not built before the fork: the child of a spawn never compiles (it has only the forking thread; locks other threads held stay held) -- it ends (exit 127), and the spawn builds it and forks again\n");
     crate::os::thread::exit_now(127)
 }
 
