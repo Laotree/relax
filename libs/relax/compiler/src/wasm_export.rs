@@ -1139,6 +1139,25 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
             aliases.push_str(&format!("{id}\t{offset}\t{len}\n"));
         }
         let _ = std::fs::write(format!("{}.aliases", fl), aliases);
+        // .ctxbytes: each body's code bytes by inline context of the module's final bodies:
+        // slot, context, depth, the context's inlined slot, its depth-1 root's inlined slot (the
+        // callee whose site brought it in; the body itself for context 0), bytes
+        let mut ctxb = String::from("slot\tctx\tdepth\tinlined\troot\tbytes\n");
+        for (id, rows) in &out.stats.fn_ctx_bytes {
+            let f = &funcs[id];
+            for (ctx, bytes) in rows {
+                let (mut c, mut depth, mut root) = (*ctx as usize, 0usize, *id);
+                let inlined = if c == 0 { *id } else { f.inl_slots.get(c - 1).copied().unwrap_or(u32::MAX) };
+                while c != 0 && depth < 256 {
+                    let Some(slot) = f.inl_slots.get(c - 1) else { root = u32::MAX; break };
+                    root = *slot;
+                    c = f.inl.get(c - 1).map_or(0, |(call, _)| relax_backend::rir::pos_ctx(*call) as usize);
+                    depth += 1;
+                }
+                ctxb.push_str(&format!("{id}\t{ctx}\t{depth}\t{inlined}\t{root}\t{bytes}\n"));
+            }
+        }
+        let _ = std::fs::write(format!("{}.ctxbytes", fl), ctxb);
         let parents = CLOSURE_PARENTS.lock().unwrap_or_else(|e| e.into_inner());
         let origins = CLOSURE_ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
         let via = CLOSURE_VIA.lock().unwrap_or_else(|e| e.into_inner());

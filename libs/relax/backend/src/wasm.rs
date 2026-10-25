@@ -263,6 +263,8 @@ pub struct Stats {
     pub n_folded: usize,
     /// (slot id, function name, body bytes) of every chosen function
     pub fn_sizes: Vec<(u32, String, usize)>,
+    /// MAKEPAD_RUN_WASM_EXPORT_FNLIST: (slot id, [(inline context, code bytes)]) of every chosen body
+    pub fn_ctx_bytes: Vec<(u32, Vec<(u64, i64)>)>,
     /// (slot id, absolute module offset, encoded body length), including final
     /// relocation encodings. Folded aliases own no bytes: (slot, 0, 0).
     pub fn_ranges: Vec<(u32, usize, usize)>,
@@ -313,6 +315,8 @@ struct Body {
     bytes: Vec<u8>,
     fix: Vec<(u32, Fix)>,
     ty: u32,
+    /// (inline context, code bytes) when ctx_bytes_on
+    ctx: Vec<(u64, i64)>,
 }
 
 struct DataSeg {
@@ -579,7 +583,7 @@ impl<'a> Module<'a> {
                 Err(e) => {
                     failed.push((*id, e));
                     let ty = func_type_sig(f, &sigs[u]).map(|t| self.sh.ty(t)).unwrap_or_else(|_| self.sh.ty(FnType { params: vec![], results: vec![] }));
-                    bodies.push(Body { bytes: vec![0, 0x00, 0x0B], fix: vec![], ty });
+                    bodies.push(Body { bytes: vec![0, 0x00, 0x0B], fix: vec![], ty, ctx: vec![] });
                 }
             }
         }
@@ -618,7 +622,7 @@ impl<'a> Module<'a> {
                     if t.results == [Val::I32] { bytes.push(0xA7); }
                     bytes.push(0x0B);
                     export_ix.insert(*id, bodies.len() as u32);
-                    bodies.push(Body { bytes, fix, ty: self.sh.ty(t) });
+                    bodies.push(Body { bytes, fix, ty: self.sh.ty(t), ctx: vec![] });
                 }
                 Err(e) => { failed.push((*id, e)); export_ix.insert(*id, u); }
             }
@@ -991,6 +995,9 @@ impl<'a> Module<'a> {
         st.untraced_calls = untraced_calls;
         // a folded copy emits no body: 0 bytes
         st.fn_sizes = funcs.iter().zip(bodies.iter()).enumerate().map(|(k, ((id, f), b))| (*id, f.name.clone(), if canon[ni + k] == ni + k { b.bytes.len() } else { 0 })).collect();
+        if ctx_bytes_on() {
+            st.fn_ctx_bytes = funcs.iter().zip(bodies.iter_mut()).enumerate().filter(|(k, _)| canon[ni + k] == ni + k).map(|(_, ((id, _), b))| (*id, std::mem::take(&mut b.ctx))).collect();
+        }
         let imports = self.sh.imports.iter().map(|(module, name, _)| (module.clone(), name.clone())).collect();
         Output { bytes: out, stats: st, imports }
     }
@@ -1578,6 +1585,15 @@ struct Fx<'a> {
     me: usize,
     /// per vreg: every definition is below 32 (a 5-bit mask or such a constant): a shift count
     small5: Vec<bool>,
+    /// MAKEPAD_RUN_WASM_EXPORT_FNLIST: code bytes per inline context (rir::pos_ctx of the
+    /// statement's position; a block's terminator counts with its last statement)
+    ctx_bytes: Option<HashMap<u64, i64>>,
+}
+
+/// Whether bodies attribute their bytes to inline contexts (size analysis only).
+fn ctx_bytes_on() -> bool {
+    static T: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    relax_session::phase::env_once(&T, "MAKEPAD_RUN_WASM_EXPORT_FNLIST").is_some()
 }
 
 /// Whether a call's arguments are pushed for the call itself (a direct call of a module
@@ -1935,6 +1951,7 @@ fn lower_func(o: &Options, options: &relax_session::Options, f: &Func, me: usize
         sigs,
         me,
         small5: Vec::new(),
+        ctx_bytes: ctx_bytes_on().then(HashMap::new),
     };
     fx.check()?;
     {
@@ -2040,7 +2057,9 @@ fn lower_func(o: &Options, options: &relax_session::Options, f: &Func, me: usize
     fx.out.push(END);
     body.extend_from_slice(&fx.out);
     let fix = fx.fix.iter().map(|(p, x)| (p + hdr, *x)).collect();
-    Ok(Body { bytes: body, fix, ty })
+    let mut ctx: Vec<(u64, i64)> = fx.ctx_bytes.take().map_or_else(Vec::new, |m| m.into_iter().collect());
+    ctx.sort();
+    Ok(Body { bytes: body, fix, ty, ctx })
 }
 
 /// A call that never returns here (untraced, or bound to a trap) ends its block; with
@@ -4115,10 +4134,22 @@ impl<'a> Fx<'a> {
                 break;
             }
             if !self.folded[b as usize][i] {
+                let at = self.out.len();
                 self.stmt(b, i)?;
+                self.note_ctx(b, i, at);
             }
         }
-        self.term(b)
+        let at = self.out.len();
+        let r = self.term(b);
+        self.note_ctx(b, n.saturating_sub(1), at);
+        r
+    }
+
+    fn note_ctx(&mut self, b: u32, i: usize, at: usize) {
+        if let Some(m) = self.ctx_bytes.as_mut() {
+            let ctx = self.f.blocks[b as usize].pos.get(i).map_or(0, |p| crate::rir::pos_ctx(*p));
+            *m.entry(ctx).or_insert(0) += self.out.len() as i64 - at as i64;
+        }
     }
 
     fn restore_sp(&mut self) {
@@ -4916,5 +4947,5 @@ fn helper_body(o: &Options, h: Helper, sh: &mut Shared, fn_ix: &HashMap<u32, u32
     }
     let hdr = body.len() as u32;
     body.extend_from_slice(&c);
-    Body { bytes: body, fix: fix.into_iter().map(|(p, x)| (p + hdr, x)).collect(), ty }
+    Body { bytes: body, fix: fix.into_iter().map(|(p, x)| (p + hdr, x)).collect(), ty, ctx: vec![] }
 }
