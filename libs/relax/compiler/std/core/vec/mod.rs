@@ -170,6 +170,12 @@ impl<T> Vec<T> {
         }
     }
 
+    /// The layout of an existing buffer of `cap` elements (real alloc's RawVecInner::current_memory:
+    /// the buffer was allocated with it, so its size cannot overflow -- no check, no panic path)
+    pub(crate) fn current_layout(cap: usize) -> Layout {
+        unsafe { Layout::from_size_align_unchecked(cap.wrapping_mul(crate::mem::size_of::<T>()), crate::mem::align_of::<T>()) }
+    }
+
     /// Reallocates to exactly `new_cap` (>= len). Not for ZSTs.
     fn grow_to(&mut self, new_cap: usize) {
         if self.try_grow_to(new_cap).is_err() {
@@ -244,7 +250,7 @@ impl<T> Vec<T> {
             return;
         }
         if target == 0 {
-            heap::free(self.ptr.as_ptr() as *mut u8, Vec::<T>::layout_for(self.cap.get()));
+            heap::free(self.ptr.as_ptr() as *mut u8, Vec::<T>::current_layout(self.cap.get()));
             self.ptr = crate::ptr::NonNull::dangling();
             self.cap = Cap::ZERO;
         } else {
@@ -738,7 +744,7 @@ unsafe impl<#[may_dangle] T> Drop for Vec<T> {
             }
         }
         if !is_zst::<T>() && self.cap.get() != 0 {
-            heap::free(self.ptr.as_ptr() as *mut u8, Vec::<T>::layout_for(self.cap.get()));
+            heap::free(self.ptr.as_ptr() as *mut u8, Vec::<T>::current_layout(self.cap.get()));
         }
     }
 }
@@ -1153,7 +1159,7 @@ impl<T, const N: usize> TryFrom<Vec<T>> for [T; N] {
         let me = crate::mem::ManuallyDrop::new(vec);
         let arr = unsafe { im::ptr_read(me.ptr.as_ptr() as *const [T; N]) };
         if !is_zst::<T>() && me.cap.get() != 0 {
-            heap::free(me.ptr.as_ptr() as *mut u8, Vec::<T>::layout_for(me.cap.get()));
+            heap::free(me.ptr.as_ptr() as *mut u8, Vec::<T>::current_layout(me.cap.get()));
         }
         Ok(arr)
     }

@@ -104,7 +104,7 @@ unsafe impl<#[may_dangle] T> Drop for IntoIter<T> {
             self.start += 1;
         }
         if crate::mem::size_of::<T>() != 0 && self.cap != 0 {
-            heap::free(self.buf.as_ptr() as *mut u8, Vec::<T>::layout_for(self.cap));
+            heap::free(self.buf.as_ptr() as *mut u8, Vec::<T>::current_layout(self.cap));
         }
     }
 }
