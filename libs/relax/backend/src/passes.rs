@@ -2054,6 +2054,10 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
             dce(f);
         }
     }
+    // four 32-bit lane loads of consecutive addresses inserted into one vector: one 16-byte load
+    if !opt_off(options, "-lanevload") && f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::VInsert(..)))) && combine_lane_loads(f) {
+        dce(f);
+    }
     // x << k | x >> (w - k): one rotate (rol / ror)
     if f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::IBin(IOp::Or, ..)))) && combine_rotates(f) {
         dce(f);
@@ -3629,6 +3633,118 @@ pub fn div_by_const(f: &mut Func, kn: &[Option<K>], nv: usize) -> bool {
             f.blocks[bi].insts.splice(k..k + 1, seq);
             f.blocks[bi].pos.splice(k..k + 1, std::iter::repeat(pos).take(n));
             k += n;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// A vector built lane by lane from four 32-bit loads of consecutive addresses (`VInsert` chain
+/// over lanes 0..3 whose sources are `Load`s of `[base + off + 4 * lane]`: a `Quat` / `[f32; 4]`
+/// moved through SROA-promoted fields) becomes one 16-byte `VLoad` of `[base + off]` (x64: one
+/// movups for a movss + 3 vinsertps; arm64: one ldr q for a ldr + 3 ins). The chain's
+/// intermediate vectors and the loaded lanes must have no other use, every vreg one definition,
+/// and no memory write or call may lie between the first load and the last insert (all in one
+/// block). The VLoad replaces the last insert; dce removes the rest.
+pub fn combine_lane_loads(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    let mut nuse = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut tu = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            for_uses(i, |u| nuse[u.0 as usize] += 1);
+        }
+        term_uses(&b.term, &mut tu);
+        for u in &tu {
+            nuse[u.0 as usize] += 1;
+        }
+    }
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        if !f.blocks[bi].insts.iter().any(|i| matches!(i, Inst::VInsert(..))) {
+            continue;
+        }
+        // single-def vregs defined in this block: their index
+        let mut at: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for (k, i) in f.blocks[bi].insts.iter().enumerate() {
+            for_defs(i, |d| {
+                if ndef[d.0 as usize] == 1 {
+                    at.insert(d.0, k);
+                }
+            });
+        }
+        let mut edits: Vec<(usize, Inst)> = Vec::new();
+        'chains: for k in 0..f.blocks[bi].insts.len() {
+            let insts = &f.blocks[bi].insts;
+            let Inst::VInsert(d, _, _, _) = insts[k] else { continue };
+            if ndef[d.0 as usize] != 1 {
+                continue;
+            }
+            // walk the chain back from its last insert; its head may be a VSplat of the lane the
+            // inserts leave (`movss` + `pshufd` + 3 `vinsertps`)
+            let mut lanes: [Option<(VReg, i32, usize)>; 4] = [None; 4];
+            let mut cur = k;
+            let mut first = k;
+            let lane_load = |s: VReg, before: usize| -> Option<(VReg, i32, usize)> {
+                if ndef[s.0 as usize] != 1 || nuse[s.0 as usize] != 1 {
+                    return None;
+                }
+                let li = *at.get(&s.0)?;
+                match insts[li] {
+                    Inst::Load(Mem::F32 | Mem::Int(4, _), _, base, off) if li < before => Some((base, off, li)),
+                    _ => None,
+                }
+            };
+            loop {
+                let (v, lane, s) = match insts[cur] {
+                    Inst::VInsert(_, v, lane, s) => (v, lane, s),
+                    _ => continue 'chains,
+                };
+                if lane > 3 || lanes[lane as usize].is_some() {
+                    continue 'chains;
+                }
+                let Some(x) = lane_load(s, cur) else { continue 'chains };
+                lanes[lane as usize] = Some(x);
+                first = first.min(x.2);
+                if lanes.iter().all(|x| x.is_some()) {
+                    break;
+                }
+                // the vector inserted into is the previous link: one definition, used only here
+                if ndef[v.0 as usize] != 1 || nuse[v.0 as usize] != 1 {
+                    continue 'chains;
+                }
+                let Some(&p) = at.get(&v.0) else { continue 'chains };
+                if p >= cur {
+                    continue 'chains;
+                }
+                match insts[p] {
+                    Inst::VInsert(..) => cur = p,
+                    Inst::VSplat(_, s) if lanes.iter().filter(|x| x.is_none()).count() == 1 => {
+                        let Some(x) = lane_load(s, p) else { continue 'chains };
+                        let l = lanes.iter().position(|x| x.is_none()).unwrap();
+                        lanes[l] = Some(x);
+                        first = first.min(x.2);
+                        break;
+                    }
+                    _ => continue 'chains,
+                }
+            }
+            let Some((base, off0, _)) = lanes[0] else { continue };
+            if ndef[base.0 as usize] != 1 || !lanes.iter().enumerate().all(|(l, x)| x.is_some_and(|(b, o, _)| b == base && o as i64 == off0 as i64 + 4 * l as i64)) {
+                continue;
+            }
+            if insts[first..k].iter().any(is_mem_effect) {
+                continue;
+            }
+            edits.push((k, Inst::VLoad(d, base, off0)));
+        }
+        for (k, i) in edits {
+            f.blocks[bi].insts[k] = i;
             changed = true;
         }
     }
