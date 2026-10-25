@@ -1939,6 +1939,7 @@ impl<'a> Lcx<'a> {
         if !ret_regs {
             let p = self.f.vreg(Cls::I);
             self.f.params.push(p);
+            self.f.param_ints.push((p, self.u.ptr_bytes() as u8, false));
             self.sret = Some(p);
             self.f.sret = Some(p);
         }
@@ -1959,6 +1960,7 @@ impl<'a> Lcx<'a> {
         if self.u.tcx.fn_sig(&self.u.prog, def).map_or(false, |s| s.track_caller) {
             let p = self.f.vreg(Cls::I);
             self.f.params.push(p);
+            self.f.param_ints.push((p, self.u.ptr_bytes() as u8, false));
             self.caller_loc = Some(p);
         }
         for (li, pat, t, regs, by_ptr) in param_vals {
@@ -2089,6 +2091,7 @@ impl<'a> Lcx<'a> {
         if !ret_regs {
             let p = self.f.vreg(Cls::I);
             self.f.params.push(p);
+            self.f.param_ints.push((p, self.u.ptr_bytes() as u8, false));
             self.sret = Some(p);
             self.f.sret = Some(p);
         }
@@ -2105,6 +2108,7 @@ impl<'a> Lcx<'a> {
             } else {
                 let env = self.f.vreg(Cls::I);
                 self.f.params.push(env);
+                self.f.param_ints.push((env, self.u.ptr_bytes() as u8, false));
                 env
             };
             let up = match self.kind(ct) {
@@ -2285,6 +2289,7 @@ impl<'a> Lcx<'a> {
         if !ret_regs {
             let p = self.f.vreg(Cls::I);
             self.f.params.push(p);
+            self.f.param_ints.push((p, self.u.ptr_bytes() as u8, false));
             self.sret = Some(p);
             self.f.sret = Some(p);
         }
@@ -2616,6 +2621,7 @@ impl<'a> Lcx<'a> {
         if !ret_regs {
             let p = self.f.vreg(Cls::I);
             self.f.params.push(p);
+            self.f.param_ints.push((p, self.u.ptr_bytes() as u8, false));
             self.sret = Some(p);
             self.f.sret = Some(p);
         }
@@ -2717,6 +2723,11 @@ impl<'a> Lcx<'a> {
                 for r in &regs {
                     self.f.params.push(*r);
                 }
+                for (r, lf) in regs.iter().zip(leaves.iter()) {
+                    if let Mem::Int(n, signed) = lf.mem {
+                        self.f.param_ints.push((*r, n, signed));
+                    }
+                }
                 // rustc marks `&mut T` noalias only for T: Unpin (a !Unpin value, e.g. a
                 // self-referential future, may be aliased through itself)
                 if let TyKind::Ref(true, inner, _) = self.kind(t) {
@@ -2755,6 +2766,7 @@ impl<'a> Lcx<'a> {
             None => {
                 let p = self.f.vreg(Cls::I);
                 self.f.params.push(p);
+                self.f.param_ints.push((p, self.u.ptr_bytes() as u8, false));
                 // by-pointer aggregate params point to the caller's private copy, which this
                 // function owns (Func::owned)
                 self.f.noalias.push(p);

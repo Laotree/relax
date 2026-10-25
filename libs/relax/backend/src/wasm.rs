@@ -213,6 +213,9 @@ pub struct Options {
     pub remat: bool,
     /// single-use values move down to their reader (`sink_trees`): pushed there, not via a local
     pub sink: bool,
+    /// parameters of a declared narrow integer or pointer type (Func::param_ints) are i32
+    /// whatever their callers pass (else only when every direct call passes a narrow value)
+    pub narrow_declared: bool,
     /// the same for frame addresses used mostly as memory bases (the frame offset folds into
     /// the access)
     pub remat_slots: bool,
@@ -232,7 +235,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { memory64: false, shared_max_pages: None, stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, sink: true, remat_slots: true, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true, order_by_bytes: true }
+        Options { memory64: false, shared_max_pages: None, stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, sink: true, narrow_declared: true, remat_slots: true, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true, order_by_bytes: true }
     }
 }
 
@@ -513,6 +516,11 @@ impl<'a> Module<'a> {
                         0
                     } else if f.nonnull.contains(p) || f.deref.iter().any(|(d, _)| d == p) {
                         KZ
+                    } else if let Some(&(_, _, signed)) = f.param_ints.iter().find(|x| x.0 == *p).filter(|x| x.1 <= 4 && self.opts.narrow_declared) {
+                        // a declared integer or pointer of at most 32 bits (a wasm32 usize, u32,
+                        // i32, bool, pointer): an i32 as rustc's wasm32 ABI passes it, whatever the
+                        // callers computed it from (a wide value is wrapped at the call)
+                        if signed { KS } else { KZ }
                     } else if passed[u][i] != UNSET && passed[u][i] & (KZ | KS) != 0 {
                         passed[u][i] & (KZ | KS)
                     } else {
