@@ -89,6 +89,11 @@ macro_rules! forks {
 
 #[test]
 fn a01_fork_while_jit_busy() {
+    fork_while_jit_busy();
+}
+
+/// The test's body (also the main of `relax-fork-busy`).
+pub fn fork_while_jit_busy() {
     STOP.store(false, Ordering::Relaxed);
     let workers: Vec<_> = (0..6).map(|i| std::thread::spawn(move || busy(i))).collect();
     let mut ok = 0usize;
