@@ -1588,6 +1588,8 @@ struct Fx<'a> {
     /// MAKEPAD_RUN_WASM_EXPORT_FNLIST: code bytes per inline context (rir::pos_ctx of the
     /// statement's position; a block's terminator counts with its last statement)
     ctx_bytes: Option<HashMap<u64, i64>>,
+    /// bytes attributed so far (a terminator emits its nested blocks: they claim their own)
+    ctx_claimed: i64,
 }
 
 /// Whether bodies attribute their bytes to inline contexts (size analysis only).
@@ -1952,6 +1954,7 @@ fn lower_func(o: &Options, options: &relax_session::Options, f: &Func, me: usize
         me,
         small5: Vec::new(),
         ctx_bytes: ctx_bytes_on().then(HashMap::new),
+        ctx_claimed: 0,
     };
     fx.check()?;
     {
@@ -4134,21 +4137,25 @@ impl<'a> Fx<'a> {
                 break;
             }
             if !self.folded[b as usize][i] {
-                let at = self.out.len();
+                let at = (self.out.len(), self.ctx_claimed);
                 self.stmt(b, i)?;
                 self.note_ctx(b, i, at);
             }
         }
-        let at = self.out.len();
+        let at = (self.out.len(), self.ctx_claimed);
         let r = self.term(b);
         self.note_ctx(b, n.saturating_sub(1), at);
         r
     }
 
-    fn note_ctx(&mut self, b: u32, i: usize, at: usize) {
+    /// Attributes the bytes emitted since `at` (output length, bytes claimed then), less what
+    /// nested blocks claimed meanwhile, to the inline context of statement `i` of block `b`.
+    fn note_ctx(&mut self, b: u32, i: usize, at: (usize, i64)) {
         if let Some(m) = self.ctx_bytes.as_mut() {
             let ctx = self.f.blocks[b as usize].pos.get(i).map_or(0, |p| crate::rir::pos_ctx(*p));
-            *m.entry(ctx).or_insert(0) += self.out.len() as i64 - at as i64;
+            let own = (self.out.len() as i64 - at.0 as i64) - (self.ctx_claimed - at.1);
+            *m.entry(ctx).or_insert(0) += own;
+            self.ctx_claimed += own;
         }
     }
 
