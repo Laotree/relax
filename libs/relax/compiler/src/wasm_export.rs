@@ -1662,6 +1662,22 @@ pub(crate) fn shipping_fn_addresses(u: &Unit, f: &mut Func) -> bool {
     changed
 }
 
+thread_local! {
+    /// keep_closure's first pass: Some(ids) while O3 builds wait (export_rir notes them here)
+    static DEFERRED_O3: std::cell::RefCell<Option<Vec<u32>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Whether export_rir's O3 build of `id` waits for the whole closure (noting `id`).
+pub(crate) fn defer_o3(id: u32) -> bool {
+    DEFERRED_O3.with(|d| match d.borrow_mut().as_mut() {
+        Some(v) => {
+            v.push(id);
+            true
+        }
+        None => false,
+    })
+}
+
 /// Shipping closes all captured roots. Size mode closes only annotated roots.
 /// Shipping upgrades every body to normal O1, then follows only edges in that
 /// exact emitted body. Lowering registers monomorphic calls and vtables on demand;
@@ -1743,6 +1759,20 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Resul
         }, data_seen);
     };
     let up = crate::jit::current_unit();
+    // pass 1: O1 bodies for the whole closure (O3 candidates noted); pass 2: their O3 builds,
+    // then whatever new callees those reach
+    struct ClearDeferred;
+    impl Drop for ClearDeferred {
+        fn drop(&mut self) {
+            DEFERRED_O3.with(|d| *d.borrow_mut() = None);
+        }
+    }
+    let _clear = ClearDeferred;
+    if whole {
+        DEFERRED_O3.with(|d| *d.borrow_mut() = Some(Vec::new()));
+    }
+    let mut deferred_done = !whole;
+    loop {
     while let Some(id) = work.pop() {
         if !visited.insert(id) {
             continue;
@@ -1783,6 +1813,24 @@ fn keep_closure(funcs: &mut BTreeMap<u32, Func>, u: &Unit, whole: bool) -> Resul
                 failed += 1;
             }
         }
+    }
+    if deferred_done {
+        break;
+    }
+    deferred_done = true;
+    let ids = DEFERRED_O3.with(|d| d.borrow_mut().take()).unwrap_or_default();
+    for id in ids {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+            crate::owner::call(crate::owner::Class::Program, || crate::zone_alloc::kept_with(|| unsafe { crate::jit::export_rir(up, id, true) }))
+        )).unwrap_or_else(|_| Err("compiler panicked".into()));
+        match r {
+            Ok(f) => {
+                expand(id, &f, &mut work, &mut data_seen);
+                funcs.insert(id, f);
+            }
+            Err(error) => return Err(format!("shipping closure cannot compile {} at export O3: {error}", crate::jit::slot_key(u, id))),
+        }
+    }
     }
     let mut vtables = CLOSURE_VTABLES.lock().unwrap_or_else(|e| e.into_inner());
     vtables.clear();

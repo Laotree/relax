@@ -8195,6 +8195,11 @@ pub unsafe fn export_rir(up: *mut Unit, id: u32, optimized: bool) -> Result<rela
         crate::wasm_export::O3Policy::All => true,
         crate::wasm_export::O3Policy::Hot => (trace_o3(&*up, id) || crate::wasm_export::o3_crate(&*up, id)) && crate::wasm_export::sampled_hot(id),
     };
+    // the closure's first pass ships O1 everywhere and notes the O3 candidates: their O3 builds
+    // wait until every shipped body is lowered (wasm_export::keep_closure), so the inliner's
+    // single-caller rule sees the module's references, not the trace's (a 74 KB parser step
+    // copied into its one traced caller while two O1 callers kept calling it)
+    let o3 = o3 && !crate::wasm_export::defer_o3(id);
     let o3_body = if o3 { export_o3_rir(up, id) } else { None };
     let shipped_o3 = o3_body.is_some();
     if shipped_o3 {
