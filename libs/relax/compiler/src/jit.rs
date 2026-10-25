@@ -1588,7 +1588,7 @@ extern "C" fn relax_fork() -> i32 {
 }
 
 #[cfg(unix)]
-fn fork_prepare() {
+pub(crate) fn fork_prepare() {
     pause_compile_jobs(false);
     owner::fork_prepare();
     // (every code writer paused: the child's copy of the W^X code views is consistent)
@@ -1597,7 +1597,7 @@ fn fork_prepare() {
 }
 
 #[cfg(unix)]
-fn fork_parent() {
+pub(crate) fn fork_parent() {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     os::mem::fork_parent();
     owner::fork_parent();
@@ -1605,13 +1605,17 @@ fn fork_parent() {
 }
 
 #[cfg(unix)]
-fn fork_child() {
+pub(crate) fn fork_child() {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     os::mem::fork_child();
     owner::fork_child();
     PIPELINE.store(false, Ordering::SeqCst);
     SPEC_STOP.store(true, Ordering::SeqCst);
-    SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    // no lock in the child (another thread may have held it at the fork, for good): nothing
+    // takes from the queue once SPEC_STOP is set, so a queue that is busy is just left
+    if let Ok(mut q) = SPEC_Q.try_lock() {
+        q.clear();
+    }
     unsafe {
         if !UNIT.is_null() {
             for f in (&mut *UNIT).fns.iter_mut() {
@@ -1627,6 +1631,54 @@ fn fork_child() {
     end_pause_turn();
 }
 
+
+/// Most functions one `__relax_precompile` builds (a pre_exec closure reaching a large library
+/// stops there; the rest compiles in the parent on first use, and a forked child that reaches
+/// it ends with its name: forkexec.rs).
+#[cfg(unix)]
+const FORK_PRECOMPILE_MAX: usize = 4096;
+
+/// `__relax_precompile(addr)` (Relax std's fork_exec, before its fork): builds the function at
+/// `addr` (its code, thunk or lazy stub) and every function its code calls or takes the address
+/// of, transitively, on the calling thread as its lazy compiles would. Returns how many were
+/// built. A forked child runs only code built before the fork (forkexec.rs).
+#[cfg(unix)]
+pub(crate) extern "C" fn relax_precompile(addr: u64) -> u64 {
+    let _keep = os::proc::KeepLastError::new();
+    let up = unsafe { UNIT };
+    if up.is_null() || addr == 0 || crate::forkexec::exec_child() {
+        return 0;
+    }
+    ensure_altstack();
+    let root = owner::publish(|| unsafe {
+        let u = &*up;
+        u.find_fn(addr).or_else(|| (0..2).find_map(|k| u.slots.find(k, addr).map(|x| x.0))).filter(|&id| (id as usize) < u.fns.len())
+    });
+    let Some(root) = root else { return 0 };
+    let mut todo = vec![root];
+    let mut seen = std::collections::HashSet::new();
+    let mut built = 0u64;
+    while let Some(id) = todo.pop() {
+        if seen.len() >= FORK_PRECOMPILE_MAX {
+            break;
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        if !owner::publish(|| unsafe { (&*up).fns[id as usize].compiled }) {
+            unsafe { compile_slot(up, id) };
+            built += 1;
+        }
+        // the lowered body's callees (before inlining: an inlined callee's own calls are among
+        // its callees') and its call / fn-address sites
+        let next: Vec<u32> = owner::publish(|| unsafe {
+            let f = &(&*up).fns[id as usize];
+            f.calls.iter().chain(f.rir_refs.iter()).copied().collect()
+        });
+        todo.extend(next.into_iter().filter(|c| !seen.contains(c)));
+    }
+    built
+}
 
 /// A thread-local of the runtime that program code reaches (format buffers, the panic being
 /// raised). Program code runs during thread exit -- its thread-locals' destructors (tls_exit),
@@ -2814,6 +2866,11 @@ fn rt_compile(slot: u64) -> u64 {
     // (a stub sits between a failing OS call and the fn that reads its error): the compiler's
     // own OS calls must not change it
     let _keep = os::proc::KeepLastError::new();
+    // a forked child on its way to exec never compiles (forkexec.rs): it ends, naming the fn
+    #[cfg(unix)]
+    if crate::forkexec::exec_child() {
+        crate::forkexec::child_reached_unbuilt(slot as u32);
+    }
     ensure_altstack();
     // a destructor of the program's thread-locals, first called at thread exit: this thread's
     // compiler thread-locals are gone, so the whole build runs on the owner (only the request
@@ -2883,6 +2940,16 @@ pub(crate) fn slot_name(id: u32) -> Option<String> {
         }
         let u = &*UNIT;
         ((id as usize) < u.fns.len()).then(|| u.fns[id as usize].name.to_string())
+    }
+}
+
+/// `f` gets slot `id`'s name (nothing when none): no lock, no allocation (a forked child's
+/// report, forkexec.rs).
+pub(crate) fn with_slot_name(id: u32, f: &mut dyn FnMut(&[u8])) {
+    unsafe {
+        if !UNIT.is_null() && (id as usize) < (&*UNIT).fns.len() {
+            f((&*UNIT).fns[id as usize].name.as_bytes());
+        }
     }
 }
 
@@ -15592,6 +15659,11 @@ fn rt_hot(slot: u64) -> u64 {
     let up = TIER_UNIT.load(Ordering::Acquire);
     unsafe {
         let u = &*up;
+        // a forked child on its way to exec queues no tier-up (forkexec.rs): its code runs on
+        #[cfg(unix)]
+        if crate::forkexec::exec_child() {
+            return (*tier_rec(&u.slots, slot as u32).add(1)).load(Ordering::Relaxed);
+        }
         u.exec_event(slot as u32, "call");
         let rec = tier_rec(&u.slots, slot as u32);
         let code = (*rec.add(1)).load(Ordering::Relaxed);
@@ -19448,6 +19520,12 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"exit" => Some(recorded_exit as *const () as usize),
         #[cfg(unix)]
         b"fork" => Some(relax_fork as *const () as usize),
+        #[cfg(unix)]
+        b"__relax_precompile" => Some(relax_precompile as *const () as usize),
+        #[cfg(unix)]
+        b"__relax_fork_exec" => Some(crate::forkexec::relax_fork_exec as *const () as usize),
+        #[cfg(unix)]
+        b"__relax_fork_exec_done" => Some(crate::forkexec::relax_fork_exec_done as *const () as usize),
         b"relax_allocator_swap" => Some(relax_allocator_swap as *const () as usize),
         b"relax_first_present" => Some(relax_first_present as *const () as usize),
         b"relax_frame_done" => Some(crate::postframe::relax_frame_done as *const () as usize),
