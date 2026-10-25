@@ -1700,14 +1700,26 @@ impl<'a> Lcx<'a> {
         let b = self.b;
         for (k, m) in &b.methods {
             if m.autoref != 0 {
-                if let ExprKind::MethodCall(recv, _) = &ast.expr(ExprId(*k)).kind {
-                    self.mark_root(*recv);
+                match &ast.expr(ExprId(*k)).kind {
+                    ExprKind::MethodCall(recv, _) => self.mark_root(*recv),
+                    ExprKind::Mac(row) => {
+                        let mac = ast.row(*row);
+                        if mac.args != NO_MAC_ARGS {
+                            let args = ast.mac_arg(mac.args);
+                            if let Some(&recv) = ast.list(args.exprs).first() {
+                                self.mark_root(recv);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
+        let mut blocks: std::collections::HashSet<u32> = b.body.into_iter().map(|bl| bl.0).collect();
         for i in 0..b.expr_ty.len() {
             let e = b.expr_at(i);
-            match &ast.expr(e).kind {
+            let kind = &ast.expr(e).kind;
+            match kind {
                 ExprKind::AddrOf(_, _, x) => self.mark_root(*x),
                 // `a op= b` through an op-assign trait takes `&mut a`
                 ExprKind::AssignOp(_, x, _) if b.binops.contains_key(&e.0) => self.mark_root(*x),
@@ -1718,7 +1730,60 @@ impl<'a> Lcx<'a> {
                 // overloaded index / deref take `&self` / `&mut self` of the base
                 ExprKind::Index(x, _) if b.ov_index.contains_key(&e.0) => self.mark_root(*x),
                 ExprKind::Unary(UnOp::Deref, x) if b.ov_deref(e.0, 0).is_some() => self.mark_root(*x),
+                // patterns that bind by reference (`ref`, `ref mut`, match ergonomics) take the
+                // scrutinee place's address in place
+                ExprKind::Let(p, x) if self.pat_binds_by_ref(*p) => self.mark_root(*x),
+                ExprKind::Match(x, arms) if ast.list(*arms).iter().any(|a| self.pat_binds_by_ref(a.pat)) => self.mark_root(*x),
+                ExprKind::Mac(row) => {
+                    let mac = ast.row(*row);
+                    if mac.args != NO_MAC_ARGS {
+                        let args = ast.mac_arg(mac.args);
+                        if args.pat.is_some_and(|p| self.pat_binds_by_ref(p)) {
+                            if let Some(&x) = ast.list(args.exprs).first() {
+                                self.mark_root(x);
+                            }
+                        }
+                        if let Some(asm) = args.asm {
+                            for op in ast.list(asm.ops) {
+                                if let Some(out) = op.output {
+                                    self.mark_root(out);
+                                }
+                            }
+                        }
+                    }
+                }
                 _ => {}
+            }
+            match kind {
+                ExprKind::Block(bl, _) | ExprKind::Unsafe(bl) | ExprKind::Async(_, bl)
+                | ExprKind::ConstBlock(bl) | ExprKind::Loop(bl, _) | ExprKind::If(_, bl, _) => {
+                    blocks.insert(bl.0);
+                }
+                ExprKind::While(row) => {
+                    blocks.insert(ast.row(*row).body.0);
+                }
+                ExprKind::For(row) => {
+                    blocks.insert(ast.row(*row).body.0);
+                }
+                _ => {}
+            }
+        }
+        let mut pending: Vec<BlockId> = blocks.iter().map(|&bl| BlockId(bl)).collect();
+        while let Some(bl) = pending.pop() {
+            for stmt in ast.stmts(bl) {
+                if let Stmt::Let(row) = *stmt {
+                    let decl = ast.row(row);
+                    if let Some(init) = decl.init {
+                        if self.pat_binds_by_ref(decl.pat) {
+                            self.mark_root(init);
+                        }
+                    }
+                    if let Some(els) = decl.else_ {
+                        if blocks.insert(els.0) {
+                            pending.push(els);
+                        }
+                    }
+                }
             }
         }
         // locals captured by reference live in memory
@@ -3043,7 +3108,22 @@ impl<'a> Lcx<'a> {
                                 self.extend_ops.insert(*x);
                             }
                             let sc_mark = self.scope_temps.last().map_or(0, |v| v.len());
-                            let v = if self.unsized_ty(t) && self.is_place_expr(*e) {
+                            let place_else = if else_.is_some()
+                                && self.is_place_expr(*e)
+                                && !self.b.coerce(e.0).is_some()
+                                && self.pat_binds_by_ref(*pat)
+                                && !self.pat_moves_droppable(*pat)
+                            {
+                                self.want_mut = self.pat_binds_mut_ref(*pat);
+                                let (place, _) = self.lower_place(*e);
+                                self.want_mut = false;
+                                Some(place)
+                            } else {
+                                None
+                            };
+                            let v = if place_else.is_some() {
+                                self.unit()
+                            } else if self.unsized_ty(t) && self.is_place_expr(*e) {
                                 // A let-else slice initializer is a place, just like a match
                                 // scrutinee. Keep its fat pointer (including the length), rather
                                 // than loading an unsized value through only its data pointer.
@@ -3103,7 +3183,8 @@ impl<'a> Lcx<'a> {
                                 None => self.bind_pat(*pat, v, t),
                                 Some(eb) => {
                                     let fail = self.f.block();
-                                    let place = self.val_to_place(v);
+                                    let has_place = place_else.is_some();
+                                    let place = place_else.unwrap_or_else(|| self.val_to_place(v));
                                     // the initializer's temporaries get drop flags: the failing
                                     // path drops them before the else block (whose own exits must
                                     // not drop them again)
@@ -3132,7 +3213,7 @@ impl<'a> Lcx<'a> {
                                     self.switch(fail);
                                     // a value that did not match is dropped before the else block runs
                                     // (rustc: the scrutinee temporary ends with the failed match)
-                                    let owned = self.needs_drop_glue(t) && self.rvalue_rooted(*e);
+                                    let owned = !has_place && self.needs_drop_glue(t) && self.rvalue_rooted(*e);
                                     if owned {
                                         let a = self.place_addr(&place, t);
                                         self.drop_at(a, t);
@@ -9872,15 +9953,6 @@ impl<'a> Lcx<'a> {
         let args = instance.compact_args(&self.u.tcx);
         match instance.def {
             InstanceKind::Virtual(d, index) => {
-                // the trait-object type called through (real-time reach: jit.rs realtime)
-                let dy = match self.kind(vals[0].1) {
-                    TyKind::Ref(_, t, _) | TyKind::Ptr(_, t) => t,
-                    _ => vals[0].1,
-                };
-                let dy = self.u.tcx.tys.erase_regions(dy);
-                if matches!(self.kind(dy), TyKind::Dyn(..)) && !self.f.dyn_calls.contains(&dy.0) {
-                    self.f.dyn_calls.push(dy.0);
-                }
                 let receiver = self.to_leaves(vals[0].0.clone(), vals[0].1);
                 assert_eq!(receiver.len(), 2, "virtual receiver metadata");
                 let ptr = self.f.vreg(Cls::I);
