@@ -8673,9 +8673,15 @@ thread_local! {
 /// The O1 inliner's limits: a wasm export's shipping build takes its own (wasm_export::o1_inline_limits);
 /// MAKEPAD_RUN_O1_INLINE=hint,leaf,leaf_blocks,chain overrides every O1 build (tests of the inliner's
 /// callers under other limits: diff_fast, the tier fuzzer)
-fn o1_inline_limits(options: &crate::options::Options) -> relax_codegen::opt::InlineLimits {
+/// (MAKEPAD_RUN_O1_INLINE_FN=a,b: ... only in callers whose name contains one of them: bisection)
+fn o1_inline_limits(options: &crate::options::Options, caller: &str) -> relax_codegen::opt::InlineLimits {
     let lim = relax_codegen::opt::InlineLimits::tier0(options);
     let lim = if export_full() { crate::wasm_export::o1_inline_limits(lim, "MAKEPAD_RUN_WASM_EXPORT_O1_INLINE") } else { lim };
+    static FNS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let fns = FNS.get_or_init(|| std::env::var("MAKEPAD_RUN_O1_INLINE_FN").map(|v| v.split(',').filter(|x| !x.is_empty()).map(String::from).collect()).unwrap_or_default());
+    if !fns.is_empty() && !fns.iter().any(|p| caller.contains(p.as_str())) {
+        return lim;
+    }
     crate::wasm_export::o1_inline_limits(lim, "MAKEPAD_RUN_O1_INLINE")
 }
 
@@ -10374,7 +10380,7 @@ unsafe fn tail_nocapture_facts(up: *mut Unit, id: u32, func: &mut relax_backend:
     if inline && !snap.is_empty() {
         let options = &(&*up).prog.session.options;
         let get = |c: u32| -> Option<(*const relax_backend::rir::Func, u8)> { snap.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const relax_backend::rir::Func, x.2)) };
-        let lim = if mode == RirMode::Baseline { relax_codegen::opt::InlineLimits::baseline() } else { o1_inline_limits(options) };
+        let lim = if mode == RirMode::Baseline { relax_codegen::opt::InlineLimits::baseline() } else { o1_inline_limits(options, &f.name) };
         relax_codegen::opt::inline_calls(options, f, id, &get, &|c| nounwind.iter().any(|x| x.0 == c && x.1), &lim);
     }
     relax_codegen::opt::demote_invokes(f, &|c| nounwind.iter().any(|x| x.0 == c && x.1));
@@ -10765,7 +10771,7 @@ fn optimize_rir_inner(options: &crate::options::Options, id: u32, prep: Prep) ->
         if cfg.inline {
             let get = |c: u32| -> Option<(*const relax_backend::rir::Func, u8)> { callees.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const relax_backend::rir::Func, x.2)) };
             let ti = relax_backend::stats::pass_clock();
-            inlined = relax_codegen::opt::inline_calls(options, func, id, &get, nounwind, &o1_inline_limits(options));
+            inlined = relax_codegen::opt::inline_calls(options, func, id, &get, nounwind, &o1_inline_limits(options, &func.name));
             relax_backend::stats::pass_time(5, ti);
         }
         static HIST_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
