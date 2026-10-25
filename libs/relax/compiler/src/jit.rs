@@ -819,7 +819,10 @@ pub(crate) fn domain_callback<R>(base: u64, token: u64, f: impl FnOnce() -> R) -
 }
 
 thread_local! {
-    static ALTSTACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The thread's fault stack (os::fault::this_thread's pointer; 1 while it is being made, 0
+    /// none): freed when the thread ends (every program thread has one -- they leaked, 80 KB and
+    /// two mappings per thread, until a thread-spawning program ran out of mappings).
+    static ALTSTACK: AltStack = const { AltStack(std::cell::Cell::new(0)) };
     /// the top of this thread's stack (recorded by ensure_altstack; 0: unknown): frame walks
     /// read only [sp, STACK_HI)
     static STACK_HI: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -1120,11 +1123,24 @@ extern "C" fn relax_on_program_stack(f: extern "C" fn(*mut u8), arg: *mut u8) {
 /// the program started is still reported. Called on the thread's first lazy compile /
 /// thread-local block and from the fault handler.
 pub(crate) fn ensure_altstack() {
-    if ALTSTACK.with(|a| a.replace(true)) {
+    // (none once the thread's thread-locals are gone: its exit)
+    if ALTSTACK.try_with(|a| a.0.get() != 0 || { a.0.set(1); false }).unwrap_or(true) {
         return;
     }
     STACK_HI.with(|c| c.set(os::fault::stack_hi_of_self()));
-    os::fault::this_thread();
+    let sp = os::fault::this_thread();
+    let _ = ALTSTACK.try_with(|a| a.0.set(sp.max(1)));
+}
+
+struct AltStack(std::cell::Cell<u64>);
+
+impl Drop for AltStack {
+    fn drop(&mut self) {
+        let sp = self.0.get();
+        if sp > 1 {
+            os::fault::this_thread_done(sp);
+        }
+    }
 }
 
 rt_fn! {
