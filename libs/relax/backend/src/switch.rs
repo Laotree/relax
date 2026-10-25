@@ -120,7 +120,6 @@ struct Chain<'a> {
     /// per block: it holds only its test (the compare, and the constant it compares with when
     /// that does not fit an immediate: a 64-bit `LiveId` hash)
     lone: &'a [bool],
-    f: &'a Func,
     x: VReg,
     signed: bool,
     /// the order of the compares was fixed by a signed or unsigned relation
@@ -498,7 +497,7 @@ pub fn lower_switches_sized(options: &relax_session::Options, f: &Func, min_tabl
         if is_link[head] {
             continue;
         }
-        let mut chain = Chain { tests: &tests, lone: &lone, f, x: h.x, signed: false, fixed: false, budget: 600, leaves: Vec::new() };
+        let mut chain = Chain { tests: &tests, lone: &lone, x: h.x, signed: false, fixed: false, budget: 600, leaves: Vec::new() };
         let mut tries = 0;
         let ok = loop {
             chain.leaves.clear();
