@@ -14916,12 +14916,11 @@ impl Unit {
 // block weights. Counts live in this process only (no profile files).
 
 /// MAKEPAD_RUN_PGO=0: no counted tier (hot slots go straight to O3 with static frequencies; A/B).
-/// Never for a W32 web program (codegen web32.rs): it addresses only its window, and the block
-/// counters (profile::instrument) are host memory its masked loads/stores would miss.
+/// A W32 web program (codegen web32.rs) addresses only its window: its block counters live there
+/// (web32::alloc_counters), so a wasm export's O3 bodies are built from the trace's counts.
 fn pgo_on(options: &crate::options::Options) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_PGO").map_or(true, |v| v != "0")) && !options.no_block_freq && !t1prof_replay(options)
-        && relax_codegen::web32::cfg().is_none()
 }
 
 /// MAKEPAD_RUN_PGO_HOLD=1: counted code stays installed (no counting window ends): with
@@ -15158,7 +15157,12 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
         return false;
     };
     let n = rir.blocks.len();
-    let counters: &'static [AtomicU64] = crate::zone_alloc::kept_with(|| Box::leak((0..n).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice()));
+    // (a W32 program's code reaches only its window: its counters are window words)
+    let counters: &'static [AtomicU64] = if relax_codegen::web32::cfg().is_some() {
+        unsafe { std::slice::from_raw_parts(crate::web32::alloc_counters(n) as *const AtomicU64, n) }
+    } else {
+        crate::zone_alloc::kept_with(|| Box::leak((0..n).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice()))
+    };
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _arena = crate::zone_alloc::job("counted codegen", session.runtime.burst_arena);
         let mut func = (*rir).clone();
