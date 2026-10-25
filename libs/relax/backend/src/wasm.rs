@@ -51,6 +51,13 @@ pub fn sleb(out: &mut Vec<u8>, mut v: i64) {
     }
 }
 
+/// The bytes of `v` as a signed LEB128.
+fn sleb_len(v: i64) -> i64 {
+    let mut out = Vec::new();
+    sleb(&mut out, v);
+    out.len() as i64
+}
+
 fn name(out: &mut Vec<u8>, s: &str) {
     uleb(out, s.len() as u64);
     out.extend_from_slice(s.as_bytes());
@@ -216,7 +223,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { memory64: false, shared_max_pages: None, stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, remat_slots: false, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true, order_by_bytes: true }
+        Options { memory64: false, shared_max_pages: None, stack_size: 1 << 20, heap_pages: 16, untraced_import: true, names: false, export_tag: true, exnref: false, data_first: false, tee: true, remat: true, remat_slots: true, sp0: false, panic_abort: false, order_by_name: true, fold_identical: true, order_by_bytes: true }
     }
 }
 
@@ -1627,11 +1634,12 @@ fn lower_func(o: &Options, options: &relax_session::Options, f: &Func, me: usize
             return Err(format!("parameter {} narrowed to {} in the body, {} in the signature", k, fx.nk[p.0 as usize], sigs[me].params[k]));
         }
     }
-    fx.plan_folds();
+    // the frame first: rematerialising a slot address prices its offset (plan_remat)
     let (slot_at, end) = crate::frame::slot_layout(f, 0, true);
     let frame = ((end + 15) & !15) as u32;
     fx.slot_at = slot_at;
     fx.frame = frame;
+    fx.plan_folds();
     let has_invoke = f.blocks.iter().any(|b| matches!(b.term, Term::Invoke(..)));
     let n_ret = fx.cfg.rpo.iter().filter(|b| matches!(f.blocks[**b as usize].term, Term::Ret(_))).count();
     let want_sp0 = o.sp0 && frame > 0 && n_ret >= 2;
@@ -1963,7 +1971,24 @@ impl<'a> Fx<'a> {
                 let d = match x {
                     Inst::Iconst(d, k) if self.o.remat && small(*k) => *d,
                     Inst::Addr(d, s) | Inst::TlsAddr(d, s) | Inst::TlsStatic(d, s) if self.o.remat && small(self.link.sym(s.id).wrapping_add(s.off as u64) as i64) => *d,
-                    Inst::SlotAddr(d, _) if self.o.remat_slots && self.uses[d.0 as usize] <= 2 * base_uses[d.0 as usize] + 1 => *d,
+                    // a frame address (merge_slot_addr_defs puts one definition at the entry, for
+                    // the native allocators to rematerialise): recomputed at each use when that is
+                    // no bigger than a local -- at a memory access it is the frame pointer and the
+                    // access's offset, elsewhere `fp + offset`, against its definition, local.set
+                    // and a local.get per use
+                    Inst::SlotAddr(d, sl) if self.o.remat_slots && defs[d.0 as usize] == 1 => {
+                        let so = self.slot_off(*sl);
+                        let add = if so == 0 { 0 } else { 1 + sleb_len(so) };
+                        let (uses, base) = (self.uses[d.0 as usize] as i64, base_uses[d.0 as usize] as i64);
+                        let local = 2 + add + 2 + 2 * uses;
+                        let remat = 2 * uses + (uses - base) * add;
+                        if remat > local {
+                            continue;
+                        }
+                        self.folded[b as usize][i] = true;
+                        self.fold_def[d.0 as usize] = (b, i as u32);
+                        continue;
+                    }
                     _ => continue,
                 };
                 if defs[d.0 as usize] != 1 || self.uses[d.0 as usize] < 2 {
@@ -2589,6 +2614,14 @@ impl<'a> Fx<'a> {
             if let (Inst::IBinI(IOp::Add, it, _, a, imm), Want::Addr(off)) = (inst, want) {
                 if it.bits == 64 {
                     return self.value(b, *a, Want::Addr(off.wrapping_add(*imm)));
+                }
+            }
+            // a frame address (narrow or not) at an access: the frame pointer, its offset in the memarg
+            if let (Inst::SlotAddr(_, sl), Want::Addr(off)) = (inst, want) {
+                let t = self.slot_off(*sl) + off;
+                if (0..=u32::MAX as i64).contains(&t) {
+                    self.lget(self.fp);
+                    return Ok(t as u64);
                 }
             }
             if k != 0 {
