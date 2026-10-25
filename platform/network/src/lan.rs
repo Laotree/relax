@@ -14,7 +14,7 @@
 //! - otherwise a hidden instance (`MAKEPAD_HIDE_WINDOWS` set: tests, agent captures, harness runs)
 //!   is off, and a visible run is on.
 //!
-//! `MAKEPAD_NET_AUDIT=1` logs every decision (`[net-audit] lan ...`) and, from
+//! `MAKEPAD_NET_AUDIT=1` logs every decision (`[net-audit] lan allow-lan|refuse|pass <site> <target>`) and, from
 //! [`crate::socket_audit`], every socket the process holds.
 
 use std::net::{IpAddr, SocketAddr};
@@ -71,19 +71,14 @@ pub fn may_reach(ip: IpAddr) -> bool {
 /// May this process reach `host` (a literal address, or a name; `.local` names are mDNS, i.e.
 /// the local network)? Other names are checked again once resolved ([`check`]).
 pub fn may_reach_host(host: &str) -> bool {
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = bare.parse::<IpAddr>() {
-        return may_reach(ip);
-    }
-    let name = bare.trim_end_matches('.').to_ascii_lowercase();
-    !(name.ends_with(".local") || name == "local") || allowed()
+    may_reach_host_when_off(host) || allowed()
 }
 
 /// `Ok` when `addr` may be reached; else a `PermissionDenied` naming `site` and the opt-in.
 /// Call it right before a connect or send to an address that may be a LAN host.
 pub fn check(site: &str, addr: SocketAddr) -> std::io::Result<()> {
     let ok = may_reach(addr.ip());
-    audit(site, &addr.to_string(), ok);
+    audit(site, &addr.to_string(), is_local_network(addr.ip()), ok);
     if ok {
         Ok(())
     } else {
@@ -120,7 +115,7 @@ pub fn connect_host(site: &str, host: &str, port: u16, timeout: Option<std::time
 /// [`check`] for a host name or literal (before resolving it).
 pub fn check_host(site: &str, host: &str) -> std::io::Result<()> {
     let ok = may_reach_host(host);
-    audit(site, host, ok);
+    audit(site, host, !may_reach_host_when_off(host), ok);
     if ok {
         Ok(())
     } else {
@@ -149,7 +144,7 @@ pub fn check_url(site: &str, url: &str) -> std::io::Result<()> {
 /// `site` start at all? Logs the decision under `MAKEPAD_NET_AUDIT=1`.
 pub fn service(site: &str) -> bool {
     let ok = allowed();
-    audit(site, "lan service", ok);
+    audit(site, "lan service", true, ok);
     ok
 }
 
@@ -160,10 +155,22 @@ fn refusal(site: &str, target: &str) -> std::io::Error {
     )
 }
 
-fn audit(site: &str, target: &str, ok: bool) {
+/// Whether `host` would pass with the local network off (not a LAN literal, not `.local`).
+fn may_reach_host_when_off(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return !is_local_network(ip);
+    }
+    let name = bare.trim_end_matches('.').to_ascii_lowercase();
+    !(name.ends_with(".local") || name == "local")
+}
+
+/// `[net-audit] lan allow-lan|refuse|pass <site> <target>`: `pass` = not the local network.
+fn audit(site: &str, target: &str, local: bool, ok: bool) {
     if crate::socket_audit::enabled() {
         crate::socket_audit::start_if_enabled();
-        eprintln!("[net-audit] lan {} {site} {target}", if ok { "allow" } else { "refuse" });
+        let verdict = if !ok { "refuse" } else if local { "allow-lan" } else { "pass" };
+        eprintln!("[net-audit] lan {verdict} {site} {target}");
     }
 }
 
