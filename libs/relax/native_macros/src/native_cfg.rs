@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn behaviour_gated_on_the_token_model_is_refused() {
         // the shape of work's eat_type before 10-25: a parse step only the linked copy had
-        let src = "impl P { fn eat_type(&mut self) { #[cfg(feature = \"relax-tokens\")]\n while self.colons() {} } }";
+        let src = "impl P { fn eat_type(&mut self) {\n #[cfg(feature = \"relax-tokens\")] while self.colons() {} } }";
         let errs = check_package("makepad_micro_proc_macro", &files("src/macro_lib.rs", src));
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].contains("src/macro_lib.rs:2") && errs[0].contains("relax-tokens"), "{errs:?}");
