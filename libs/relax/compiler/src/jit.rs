@@ -12322,6 +12322,9 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
                     let n = relax_codegen::opt::inst_count(unsafe { &*p });
                     *g = g.saturating_add(n).saturating_add(relax_codegen::opt::single_room(options, n));
                 }
+                if !relax_backend::stats::opt_off(options, "-singleroom") {
+                    limits.budget = limits.budget.saturating_add(relax_codegen::opt::InlineLimits::tier1().budget);
+                }
             }
             if !inlined.iter().any(|x| x.0 == c) {
                 inlined.push((c, rule));

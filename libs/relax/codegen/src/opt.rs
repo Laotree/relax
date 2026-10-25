@@ -483,7 +483,7 @@ impl InlineStats {
 /// grew 3x in code with the big room and its O3 compile CPU went up 4x.
 /// The inlining room a single-caller body of `size` instructions brings when it moves into its
 /// caller: what its own (cold) growth ceiling allowed it compiled alone (MAKEPAD_RUN_OPT=-singleroom:
-/// none, the body's size only).
+/// none, the body's size only). The body brings its paid allowance (`InlineLimits::budget`) too.
 pub fn single_room(options: &relax_session::Options, size: usize) -> usize {
     if opt_off(options, "-singleroom") { 0 } else { growth_ceiling(size, false) - size }
 }
@@ -969,7 +969,13 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
             // still fit -- moving a body in never shrinks the inlining it would have got on its
             // own (P(DOOM)'s run_core: 25 single-caller opcode handlers moved in with their
             // sizes only, and 47 pop_stack_resolved calls stayed calls on the growth ceiling)
-            RULE_SINGLE => growth_limit = growth_limit.saturating_add(growth).saturating_add(single_room(options, size)),
+            // ... and its paid allowance (the budget it had compiled alone)
+            RULE_SINGLE => {
+                growth_limit = growth_limit.saturating_add(growth).saturating_add(single_room(options, size));
+                if !opt_off(options, "-singleroom") {
+                    budget = budget.saturating_add(lim.budget);
+                }
+            }
             _ if no_growth => {}
             RULE_COST => free_budget -= size,
             _ if free => free_budget -= size,
