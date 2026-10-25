@@ -13452,6 +13452,8 @@ const T_COUNTING: u64 = 1;
 const T_QUEUED: u64 = 2;
 // A loop counter cannot queue a recorded instance before its first call.
 const T_REPLAY: u64 = 3;
+/// ARMIPC knob +park: a lukewarm slot that stopped counting (rt_hot)
+const T_PARKED: u64 = 4;
 
 thread_local! {
     /// makepad inspect's O3 build on this thread (compile_tier1_inspect): the edit putting its
@@ -15261,6 +15263,15 @@ fn rt_hot(slot: u64) -> u64 {
             match tier_check(rec, threshold, now) {
                 Some(r) => rate = r,
                 None => {
+                    // ARMIPC A/B knob +park: once the sampler has settled (no compile / install
+                    // for SETTLED_AFTER), a lukewarm slot stops counting: its calls go straight to
+                    // its code (no count stub). Measures what the counting costs in steady state.
+                    if armipc_knob("+park") && SAMPLER_SETTLED.load(Ordering::Relaxed) {
+                        if (*rec.add(3)).compare_exchange(T_COUNTING, T_PARKED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                            let _ = s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
+                        }
+                        return code;
+                    }
                     // under the threshold: the stub stays, counting on. Baseline code that keeps
                     // running (a quarter of the threshold's cost, decayed) gets its O2 build: the
                     // cache's entry then links optimised code for it
