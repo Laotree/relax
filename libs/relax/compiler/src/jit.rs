@@ -600,6 +600,12 @@ impl Drop for CodeAs {
         let _ = CODE_AS.try_with(|c| c.set(p));
     }
 }
+/// ARMIPC measurement knob `tok` in ARMIPC_KNOBS (comma list; not part of the options or any cache key).
+pub(crate) fn armipc_knob(tok: &str) -> bool {
+    static T: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    T.get_or_init(|| std::env::var("ARMIPC_KNOBS").map(|v| v.split(',').map(|t| t.trim().to_string()).collect()).unwrap_or_default()).iter().any(|t| t == tok)
+}
+
 fn code_as_now() -> Option<CodeKind> {
     CODE_AS.try_with(|c| c.get()).ok().flatten()
 }
@@ -3822,14 +3828,15 @@ impl Unit {
         Ok(at)
     }
 
-    /// Where the next body of `len` bytes goes: the shared bump. ARMIPC A/B knobs (MAKEPAD_RUN_OPT):
+    /// Where the next body of `len` bytes goes: the shared bump. ARMIPC A/B knobs (ARMIPC_KNOBS, an env
+    /// var outside the options so a warm cache stays valid):
     /// `+o3area` puts O3 (and guarded) bodies into their own 4 MB chunks of the bump, so hot code
     /// is dense; `+falign64` aligns O3 bodies to 64 bytes (a cache line / fetch block).
     fn code_at(&self, len: u64) -> u64 {
         let end = self.exec_base + self.exec_size - os::mem::CODE_TAIL;
         let hot = code_as_now().is_some_and(|k| k.tier == tier::O3 || k.tier == tier::GUARDED);
-        let align = if hot && relax_backend::stats::opt_env_off("+falign64") { 64 } else { 16 };
-        if !hot || !relax_backend::stats::opt_env_off("+o3area") {
+        let align = if hot && armipc_knob("+falign64") { 64 } else { 16 };
+        if !hot || !armipc_knob("+o3area") {
             return bump(&self.code_next, len, align, end, "out of code memory");
         }
         const CHUNK: u64 = 4 << 20;
@@ -15297,7 +15304,9 @@ pub fn lower_this_thread_priority(runtime: &crate::options::RuntimeOptions) {
 
 fn lower_worker_priority(runtime: &crate::options::RuntimeOptions) {
     // aot-min: every background compile thread in the OS background class
-    if ahead_policy().background_class {
+    // (ARMIPC knob +bgworkers: the same for every level, to A/B the UI thread's IPC with the
+    // compile threads off the performance cluster)
+    if ahead_policy().background_class || armipc_knob("+bgworkers") {
         os::thread::background();
         return;
     }
