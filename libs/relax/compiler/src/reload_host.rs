@@ -282,6 +282,8 @@ fn restart(h: Handover, state: Option<&[u8]>) {
         // now (the transcript tee is a thread of this process: the new one starts its own), so
         // the line below and the new process's output are not lost in the old pipe
         crate::run::summary("restart");
+        // a restart is a clean end of this process (its transcript is not kept)
+        crate::tui::exit_code(0);
         crate::tui::finish(false);
         eprintln!("makepad live: restarting: {reason}");
         let e = cmd.exec();
