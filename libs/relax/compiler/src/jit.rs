@@ -8219,7 +8219,8 @@ pub unsafe fn export_rir(up: *mut Unit, id: u32, optimized: bool) -> Result<rela
         }
         // an O1 body ships as the module's only code for it: the O3 folds that only remove
         // code -- compares the value ranges decide (bounds checks of a loop's own index, a
-        // check a dominating one implies) and compares of small value sets -- run on it too
+        // check a dominating one implies), compares of small value sets, adjacent constant
+        // stores merged -- run on it too
         // (LLVM -Oz runs its correlated value propagation and InstCombine everywhere)
         if !shipped_o3 && crate::wasm_export::o1_folds() {
             if relax_codegen::ranges::fold_ranges(&session.options, &mut f) {
@@ -8228,6 +8229,8 @@ pub unsafe fn export_rir(up: *mut Unit, id: u32, optimized: bool) -> Result<rela
             if relax_codegen::opt::fold_small_sets(&mut f) {
                 relax_backend::passes::simplify(&session.options, &mut f, ro, true, true);
             }
+            // constant stores side by side (zeroed fields, a tag and its payload's zeros): fewer, wider stores
+            relax_codegen::loops::merge_stores(&session.options, &mut f);
         }
         relax_backend::passes::live_dce(&mut f);
         relax_backend::passes::dce(&mut f);
