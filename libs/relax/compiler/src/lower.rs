@@ -1194,7 +1194,8 @@ impl<'a> Lcx<'a> {
             Some(leaves) => {
                 // a pointer-sized leaf the type's niche keeps from 0 (references, Box, NonNull,
                 // a Vec's buffer pointer): codegen folds its null tests (Func::nonnull)
-                let nn = l.niche.filter(|n| n.bytes == 8 && n.start >= 1 && n.start <= n.end).map(|n| n.off);
+                let pb = self.pb();
+                let nn = l.niche.filter(|n| n.bytes == pb && n.start >= 1 && n.start <= n.end).map(|n| n.off);
                 // an unsigned scalar leaf the niche limits to start..=end (char, bool, enum
                 // tags): value ranges decide its niche tests (Func::ranged)
                 let rg = l.niche.filter(|n| n.bytes < 8 && n.start <= n.end && (n.start > 0 || n.end < (1u128 << (8 * n.bytes)) - 1));
@@ -2652,6 +2653,17 @@ impl<'a> Lcx<'a> {
         }
         let v = self.read_place(&pa, t);
         self.ret_val(v, t);
+    }
+
+    /// Whether `d` is an impl's `Clone::clone` and its result type `t` is `TrivialClone`.
+    fn trivial_clone(&self, d: DefId, t: TyId) -> bool {
+        let tcx = &self.u.tcx;
+        let (Some(clone), Some(trivial)) = (tcx.lang_items.get(LangItem::Clone), tcx.lang_items.get(LangItem::TrivialClone)) else { return false };
+        let def = self.u.prog.def(d);
+        if def.kind != DefKind::AssocFn || self.u.prog.def(def.parent).kind != DefKind::Impl || tcx.impl_trait.get(&def.parent) != Some(&clone) || self.u.prog.name(d) != "clone" {
+            return false;
+        }
+        tcx.type_implements_trait(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), TraitRef { def_id: trivial, args: vec![GenericArg::Type(t)] }).must_apply_modulo_regions()
     }
 
     fn clone_shim_fields(&mut self, pa: &Place, t: TyId, vi: u32, n: usize) -> Vec<(Val, TyId)> {
@@ -7512,7 +7524,19 @@ impl<'a> Lcx<'a> {
             }
             ExprKind::Index(a, i) => {
                 let derefs = self.b.index_derefs(e.0);
-                let (mut pl, mut pt) = self.lower_place(*a);
+                // `CONST[i]` read: the constant's own immutable allocation (rustc reads a promoted
+                // constant's memory), not a copy of the whole array on the stack per use
+                let promoted = if derefs == 0 && !self.want_mut && matches!(self.ast().expr(strip_paren(self.ast(), *a)).kind, ExprKind::Path(_))
+                    && matches!(self.kind(self.body_ty(*a)), TyKind::Array(..)) && self.promotable(*a)
+                    && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), self.body_ty(*a)) {
+                    self.promote_rvalue(*a, true).map(|p| (Place::Mem(p, 0), self.body_ty(*a)))
+                } else {
+                    None
+                };
+                let (mut pl, mut pt) = match promoted {
+                    Some(x) => x,
+                    None => self.lower_place(*a),
+                };
                 for k in 0..derefs {
                     let (a2, b2) = self.deref_place(e.0, k, pl, pt);
                     pl = a2;
@@ -7556,10 +7580,12 @@ impl<'a> Lcx<'a> {
                 let el = self.layout(elem);
                 let stride = crate::layout::round_up(el.size, el.align);
                 let s = self.iconst(stride as i64);
+                // address arithmetic at the pointer's width (wasm32: i32, as rustc's)
+                let pt = self.ptr_ty();
                 let off = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Mul, U64, off, iv[0], s));
+                self.emit(Inst::IBin(IOp::Mul, pt, off, iv[0], s));
                 let addr = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Add, U64, addr, base, off));
+                self.emit(Inst::IBin(IOp::Add, pt, addr, base, off));
                 (Place::Mem(addr, 0), elem)
             }
             _ => {
@@ -7977,6 +8003,11 @@ impl<'a> Lcx<'a> {
 
     fn wide_signed(&self, t: TyId) -> bool {
         matches!(self.u.tcx.tys.kind(t), TyKind::Int(Prim::I128))
+    }
+
+    /// The unsigned integer type of an address (u64; wasm32: u32, its arithmetic wraps there).
+    fn ptr_ty(&self) -> IntTy {
+        if self.pb() == 4 { relax_backend::rir::U32 } else { U64 }
     }
 
     fn ibin(&mut self, op: IOp, signed: bool, a: VReg, b: VReg) -> VReg {
@@ -9829,6 +9860,14 @@ impl<'a> Lcx<'a> {
                 }
                 self.emit_call(Callee::Fn(self.u.instance_fn_id(instance)), vals, ret)
             }
+            InstanceKind::Item(d) if vals.len() == 1 && self.trivial_clone(d, ret) => {
+                // `Clone::clone` of a `TrivialClone` type is a bitwise copy by that trait's contract
+                // (core relies on it: slice clone_from_slice / to_vec copy such elements): a
+                // derived clone's `Option<Copy>` fields read as one copy, not a match per field
+                // (rustc gets there by inlining the match and folding it through undef; GAPB2)
+                let p = self.to_leaves(vals[0].0.clone(), vals[0].1);
+                self.read_place(&Place::Mem(p[0], 0), ret)
+            }
             InstanceKind::Item(d) => {
                 let sig = self.u.tcx.fn_item_sig(&self.u.prog, d).expect("item signature");
                 let foreign = self.u.prog.def(d).kind == DefKind::ForeignFn;
@@ -10576,10 +10615,12 @@ impl<'a> Lcx<'a> {
                 let n = leaf(self, 1);
                 let (sz, al) = elem(self);
                 let stride = crate::layout::round_up(sz, al) as i64;
+                // address arithmetic at the pointer's width (wasm32: i32, as rustc's)
+                let pt = self.ptr_ty();
                 let off = self.f.vreg(Cls::I);
-                self.emit(Inst::IBinI(IOp::Mul, U64, off, n[0], stride));
+                self.emit(Inst::IBinI(IOp::Mul, pt, off, n[0], stride));
                 let d = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Add, U64, d, p[0], off));
+                self.emit(Inst::IBin(IOp::Add, pt, d, p[0], off));
                 Val::L(vec![d])
             }
             // `p - n * stride` (core's in-bounds `sub`)
@@ -10589,10 +10630,11 @@ impl<'a> Lcx<'a> {
                 let (sz, al) = elem(self);
                 let stride = crate::layout::round_up(sz, al) as i64;
                 let k = self.iconst(stride);
+                let pt = self.ptr_ty();
                 let off = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Mul, U64, off, n[0], k));
+                self.emit(Inst::IBin(IOp::Mul, pt, off, n[0], k));
                 let d = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Sub, U64, d, p[0], off));
+                self.emit(Inst::IBin(IOp::Sub, pt, d, p[0], off));
                 Val::L(vec![d])
             }
             // wrapping element offset (two's complement: the same instructions as ptr_add)
@@ -10601,10 +10643,11 @@ impl<'a> Lcx<'a> {
                 let n = leaf(self, 1);
                 let (sz, al) = elem(self);
                 let stride = crate::layout::round_up(sz, al) as i64;
+                let pt = self.ptr_ty();
                 let off = self.f.vreg(Cls::I);
-                self.emit(Inst::IBinI(IOp::Mul, U64, off, n[0], stride));
+                self.emit(Inst::IBinI(IOp::Mul, pt, off, n[0], stride));
                 let d = self.f.vreg(Cls::I);
-                self.emit(Inst::IBin(IOp::Add, U64, d, p[0], off));
+                self.emit(Inst::IBin(IOp::Add, pt, d, p[0], off));
                 Val::L(vec![d])
             }
             // (p - origin) / stride, exact by contract (signed)

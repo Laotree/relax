@@ -768,9 +768,9 @@ extern "C" fn tls_exit(p: *mut u8) {
 /// of a native worker's callback: domain_callback).
 fn tls_dtor(p: *mut u8) {
     // pthread clears its key before calling us. Reinstall it while Relax std destructors run.
-    os::tls::set(tls_key(), p);
+    set_tls_block(p);
     let registrations = unsafe { crate::domain_threads::finish(p as u64) };
-    os::tls::set(tls_key(), std::ptr::null_mut());
+    set_tls_block(std::ptr::null_mut());
     if crate::web32::on() {
         // its shadow stack (web32.rs) goes back with it
         crate::web32::thread_exit(p as u64);
@@ -804,12 +804,12 @@ pub(crate) fn domain_callback<R>(base: u64, token: u64, f: impl FnOnce() -> R) -
     impl Drop for Restore {
         fn drop(&mut self) {
             tls_dtor(os::tls::get(tls_key()));
-            os::tls::set(tls_key(), self.0 as *mut u8);
+            set_tls_block(self.0 as *mut u8);
             os::tls::static_tls_swap(&mut self.1);
             crate::domain::enter(unsafe { *(self.0 as *const u64) });
         }
     }
-    os::tls::set(tls_key(), std::ptr::null_mut());
+    set_tls_block(std::ptr::null_mut());
     // the program's thread-locals in static TLS start fresh too (the thread's come back after)
     let mut saved = Vec::new();
     os::tls::static_tls_swap(&mut saved);
@@ -1132,9 +1132,9 @@ rt_fn! {
 fn rt_tls_block() -> u64 {
     let _keep = os::proc::KeepLastError::new();
     ensure_altstack();
-    let key = tls_key();
-    let b = os::tls::get(key);
+    let b = os::tls::get(tls_key());
     if !b.is_null() {
+        TLS_BLOCK_COPY.with(|c| c.set(b as u64));
         return b as u64;
     }
     // the wasm32 program's thread-local blocks are in its window (`&THREAD_LOCAL` is an offset)
@@ -1142,7 +1142,7 @@ fn rt_tls_block() -> u64 {
     // a thread nothing assigned a domain to (one native code started, or the first use of a
     // thread JIT code started before its start put it in its parent's domain): the default
     unsafe { *(b as *mut u64) = crate::domain::default_base() };
-    os::tls::set(key, b as *mut u8);
+    set_tls_block(b as *mut u8);
     b
 }
 }
@@ -1493,6 +1493,56 @@ fn ids_report(up: *mut Unit) {
 
 /// O3 jobs that panicked outside their build's recovery (slot left at O1)
 pub static TIER1_PANICS: AtomicU64 = AtomicU64::new(0);
+
+/// optimize_tree runs of O3 candidates built off the owner that panicked: [0] panics, [1] the
+/// preemption/bail payloads (control flow, not bugs). Each is dropped as a failed build (its
+/// candidate stays without an optimised body); a panic used to be dropped without a word, which
+/// hid piano_render's out-of-range unroll check (GAPB2).
+pub static O3_OPT_PANICS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// slots whose optimize_tree panic was printed (once per slot)
+static O3_OPT_PANICKED: relax_session::sync::Mutex<std::collections::BTreeSet<u32>> = relax_session::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// A caught panic's message, and whether its payload is one of the preemption/bail payloads
+/// (control flow: the build gave way, nothing went wrong).
+fn panic_payload(p: &(dyn std::any::Any + Send)) -> (String, bool) {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        return (s.to_string(), false);
+    }
+    if let Some(s) = p.downcast_ref::<String>() {
+        return (s.clone(), false);
+    }
+    if let Some(e) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() {
+        return (format!("fatal error: {}", e.0), false);
+    }
+    if let Some(b) = p.downcast_ref::<crate::preempt::PublishBail>() {
+        return (format!("publish bail ({}, {} slots)", b.what, b.slots.len()), true);
+    }
+    let bail = if p.is::<crate::preempt::Preempted>() {
+        "preempted"
+    } else if p.is::<crate::preempt::OwnerBusy>() {
+        "owner busy"
+    } else if p.is::<crate::preempt::NeedsLoad>() {
+        "needs load"
+    } else if p.is::<crate::preempt::NeedsUnit>() {
+        "needs the unit"
+    } else {
+        return ("panic".to_string(), false);
+    };
+    (bail.to_string(), true)
+}
+
+/// An O3 candidate's optimize_tree panicked (off the owner): counted, printed once per slot
+/// (bails only counted), and handed on as a failed build.
+fn optimize_tree_panicked(up: *mut Unit, id: u32, p: Box<dyn std::any::Any + Send>) -> Deferred {
+    let (msg, bail) = panic_payload(&*p);
+    O3_OPT_PANICS[bail as usize].fetch_add(1, Ordering::Relaxed);
+    if !bail && O3_OPT_PANICKED.lock().unwrap().insert(id) {
+        crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_PANIC, 0, 0, 0);
+        let name = owner::publish(|| unsafe { let u = &*up; if (id as usize) < u.fns.len() { u.fns[id as usize].name.to_string() } else { String::new() } });
+        eprintln!("makepad: O3 optimisation of slot {} ({}) panicked: {} -- O3 dropped for it", id, name, msg);
+    }
+    (id, Err(format!("optimize_tree panicked: {}", msg)))
+}
 
 /// fork() in a program run by Relax: the child has only the forking thread, and may go on
 /// running JIT code (a lazy compile in the child). The loader hands programs its own `fork`
@@ -1998,8 +2048,28 @@ pub fn thunk_size() -> usize {
     THUNK_SIZE
 }
 
+thread_local! {
+    /// The runtime's copy of this thread's block pointer (the OS key's value, kept in step by
+    /// `set_tls_block`): `tls_block` reads it with one thread-local load. The OS key read
+    /// costs a pthread_getspecific / TlsGetValue plus the last-error save around it, and the
+    /// runtime asks for the block on every JIT entry (`domain::current`, twice per
+    /// catch_unwind).
+    static TLS_BLOCK_COPY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Sets this thread's block in the OS key (what JIT code reads) and in the runtime's copy.
+fn set_tls_block(b: *mut u8) {
+    os::tls::set(tls_key(), b);
+    TLS_BLOCK_COPY.with(|c| c.set(b as u64));
+}
+
 /// This thread's thread-local block (allocated on first use).
+#[inline]
 pub fn tls_block() -> u64 {
+    let b = TLS_BLOCK_COPY.with(|c| c.get());
+    if b != 0 {
+        return b;
+    }
     rt_tls_block()
 }
 
@@ -2709,8 +2779,7 @@ rt_fn! {
 pub(crate) fn rt_catch_panic(f: u64, data: u64) -> u64 {
     ensure_altstack();
     let u = unsafe { UNIT };
-    // a recovery point inside running code: the domain of that code, not the unit's own
-    match unsafe { call_jit_in(u, crate::domain::current(), f, data) } {
+    match unsafe { call_jit_nested(u, f, data) } {
         Ok(_) => 0,
         Err(p) => {
             let r = owner::call(owner::Class::Job, || unsafe { (&*u).report(&p) });
@@ -6533,6 +6602,34 @@ pub unsafe fn call_jit(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, PanicI
     call_jit_in(u, (&*u).syms.dom0(), entry, arg)
 }
 
+/// A recovery point inside running JIT code (core::intrinsics_rt::catch_panic: std's
+/// catch_unwind, every script VM call): `entry(arg)` runs in the unit, domain and heap phase of
+/// the code around it, which an entry through `call_jit_in` set up and noted (owner diagnostics,
+/// sampler) already; only the recovery context is new. A panic or fault that ends here unwound
+/// past the restores of the nested calls it crossed (`call_jit_in` into another unit or domain):
+/// their unit and domain are put back from what this point saw.
+unsafe fn call_jit_nested(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, PanicInfo> {
+    let _kept = crate::zone_alloc::kept();
+    // MAKEPAD_RUN_PROFILE's sampler counts the thread's entries: one native code made (a callback
+    // thread) has no enclosing entry
+    let sampled = (&*u).tier1.is_some();
+    if sampled {
+        sampler_enter((&*u).exec_base, (&*u).exec_size);
+    }
+    let here = crate::domain::current();
+    let r = call_jit_inner(u, entry, arg);
+    if r.is_err() {
+        if crate::domain::current() != here {
+            crate::domain::enter(here);
+        }
+        UNIT = u;
+    }
+    if sampled {
+        sampler_leave();
+    }
+    r
+}
+
 /// `call_jit` in the domain whose static block is at `domain` (domain.rs): the code runs on the
 /// calling thread, whose domain comes back after the call.
 pub unsafe fn call_jit_in(u: *mut Unit, domain: u64, entry: u64, arg: u64) -> Result<u64, PanicInfo> {
@@ -6548,10 +6645,20 @@ pub unsafe fn call_jit_in(u: *mut Unit, domain: u64, entry: u64, arg: u64) -> Re
     if sampled {
         sampler_enter((&*u).exec_base, (&*u).exec_size);
     }
-    // a nested call (into another unit's world) leaves the thread's domain as it found it
-    let prev_domain = crate::domain::enter(domain);
+    // a nested call (into another unit's world) leaves the thread's domain as it found it. A call
+    // in the domain the thread is in does not enter it again (that re-registers the thread and
+    // re-selects the same heap under the registry lock). A call that returned put back whatever
+    // it switched; after a panic or fault the domain is checked, not assumed: it unwound past the
+    // restores of the nested calls it crossed.
+    let here = crate::domain::current();
+    let switch = domain != here;
+    if switch {
+        crate::domain::enter(domain);
+    }
     let r = call_jit_inner(u, entry, arg);
-    crate::domain::enter(prev_domain);
+    if switch || (r.is_err() && crate::domain::current() != here) {
+        crate::domain::enter(here);
+    }
     if sampled {
         sampler_leave();
     }
@@ -8245,12 +8352,28 @@ pub unsafe fn export_rir(up: *mut Unit, id: u32, optimized: bool) -> Result<rela
         if let Some(error) = (&mut *up).refused_by_check(owner) { return Err(error); }
     }
     if optimized || (&*up).fns[id as usize].rir.is_none() {
-        build_rir_mode(up, id, if optimized { RirMode::Normal } else { RirMode::Tier0 })?;
+        // MAKEPAD_RUN_WASM_EXPORT_FULL=0: shipping bodies as the trace's O1 (A/B)
+        let full = optimized && crate::wasm_export::full_o1();
+        let was = EXPORT_FULL.with(|c| c.replace(full));
+        let r = build_rir_mode(up, id, if optimized { RirMode::Normal } else { RirMode::Tier0 });
+        EXPORT_FULL.with(|c| c.set(was));
+        r?;
     }
+    // MAKEPAD_RUN_WASM_EXPORT_O3: which shipping bodies take the JIT's O3 pipeline: `hot`
+    // (default: the slots the trace ran at O3), `all`, `0` (none: normal O1 only)
+    let o3 = optimized && match crate::wasm_export::o3_policy() {
+        crate::wasm_export::O3Policy::Off => false,
+        crate::wasm_export::O3Policy::All => true,
+        crate::wasm_export::O3Policy::Hot => trace_o3(&*up, id) || crate::wasm_export::o3_crate(&*up, id),
+    };
+    let o3_body = if o3 { export_o3_rir(up, id) } else { None };
     let u = &*up;
     let session = u.prog.session.clone();
     let rir = u.fns[id as usize].rir.clone().ok_or("no RIR for this slot")?;
-    let mut f = tier0_codegen_rir(&session.options, &rir, u.opt.fold, u.opt.layout).into_owned();
+    let mut f = match o3_body {
+        Some(f) => f,
+        None => tier0_codegen_rir(&session.options, &rir, u.opt.fold, u.opt.layout).into_owned(),
+    };
     if optimized {
         // Instrumentation is not program semantics. Remove it before the final
         // simplification, so unused addresses and constant branches cannot seed
@@ -8269,6 +8392,34 @@ pub unsafe fn export_rir(up: *mut Unit, id: u32, optimized: bool) -> Result<rela
         f.verify().map_err(|e| format!("shipping RIR: {e}"))?;
     }
     Ok(f)
+}
+
+thread_local! {
+    /// export_o3_rir on this thread: Some(None) while compile_tier1 runs for it, Some(Some(f))
+    /// once it took the optimised RIR
+    static EXPORT_O3: std::cell::RefCell<Option<Option<relax_backend::rir::Func>>> = const { std::cell::RefCell::new(None) };
+}
+const EXPORT_O3_TAKEN: &str = "wasm export: O3 RIR taken";
+
+fn export_o3_mode() -> bool {
+    EXPORT_O3.try_with(|c| c.borrow().is_some()).unwrap_or(false)
+}
+
+/// The O3 RIR of slot `id` for a wasm export: the JIT's O3 build (its inline snapshot, PGO
+/// counts, the whole pipeline) without speculation guards or probes and without native code.
+/// None when O3 does not build it (no tier, refused, failed): the caller keeps normal RIR.
+pub unsafe fn export_o3_rir(up: *mut Unit, id: u32) -> Option<relax_backend::rir::Func> {
+    if (&*up).tier1.is_none() {
+        return None;
+    }
+    EXPORT_O3.with(|c| *c.borrow_mut() = Some(None));
+    let _ = compile_tier1(up, id);
+    EXPORT_O3.with(|c| c.borrow_mut().take().flatten())
+}
+
+/// The trace ran slot `id` hot enough for O3 code (or its source asks for O3 always).
+pub fn trace_o3(u: &Unit, id: u32) -> bool {
+    u.fns[id as usize].o3.load(Ordering::Relaxed)
 }
 
 thread_local! {
@@ -8328,6 +8479,17 @@ fn o2_release_later() {
 
 fn o2_build() -> bool {
     O2_BUILD.try_with(|c| c.get()).unwrap_or(false)
+}
+
+thread_local! {
+    /// a wasm export's shipping build on this thread (export_rir): normal RIR is built as O1 builds
+    /// without O3 (`Func::full`: the whole O1 pipeline, Relax core's helpers inlined everywhere),
+    /// its inline candidates too -- an AOT build, not a tier below a JIT's O3
+    static EXPORT_FULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn export_full() -> bool {
+    EXPORT_FULL.try_with(|c| c.get()).unwrap_or(false)
 }
 
 /// `#[relax(O2)]` slots waiting for their O2 build: (unit, slot)
@@ -9480,7 +9642,7 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
     {
         let u = &mut *up;
         if let Some(r) = &u.fns[id as usize].rir {
-            let to_o2 = normal && o2_build() && !r.full;
+            let to_o2 = normal && (o2_build() || export_full()) && !r.full;
             if !normal || !(upgradable(r) || to_o2) || u.fns[id as usize].building || u.fns[id as usize].inflight {
                 return Ok(());
             }
@@ -9691,7 +9853,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     }
     // O2: a `#[relax(O2)]` fn built by the O2 worker (o2_thread) compiles as O1 does without
     // O3; its on-demand builds on the program's threads stay O1
-    let full = !baseline && o2_build() && marked_hot(u, id);
+    let full = !baseline && (o2_build() && marked_hot(u, id) || export_full());
     func.full = full;
     let mut cfg = u.opt;
     if baseline {
@@ -11839,10 +12001,12 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     }
     // loops with a small constant trip count: fully unrolled (each copy's counter a constant);
     // a second round reaches the loop around an unrolled inner one
+    let mut unrolled = false;
     for _ in 0..2 {
         if !(cfg.fold && relax_codegen::loops::unroll_const_loops(options, func)) {
             break;
         }
+        unrolled = true;
         relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
         // the original loops the copies replaced: unreachable now, emptied for the passes below
         relax_codegen::loops::clear_unreachable(func);
@@ -11864,6 +12028,15 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
             relax_backend::passes::live_dce(func);
             relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
         }
+    }
+    // Unrolled copies read a loop's array at constant offsets: once those loads are forwarded
+    // its stores of borrows die, and the slots they borrowed no longer escape -- the copies of
+    // those slots can join now (reconcile's `[(&mut entry.a, ..), (..)]`: the entry's moves
+    // through the match tuple; GAPB)
+    if unrolled && cfg.sroa && !relax_backend::stats::opt_off(options, "-postinline") && !relax_backend::stats::opt_off(options, "-unrollclean") {
+        relax_codegen::loops::clear_unreachable(func);
+        relax_backend::passes::live_dce(func);
+        slot_cleanup(options, func, ro, cfg);
     }
     // a copy of a stepped pointer's previous value (partition's gap, insertion's hole) read as
     // the pointer minus its step: accesses through both share one base (load forwarding)
@@ -12346,15 +12519,26 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
             }
         }
     }
-    // post-inline cleanup (codegen2's copy-elimination finding + LLVM SROA's whole-slot slicing):
-    // small aggregate temporaries the inlined bodies copy through (Option payloads, sret results)
-    // are forwarded from 32 bytes up, then groups copied in and out are tiled into registers;
-    // later wider loads of narrower stores otherwise fail store forwarding (layout_widgets)
     if cfg.sroa && !relax_backend::stats::opt_off(options, "-postinline") {
+        slot_cleanup(options, func, ro, cfg);
+    }
+    inlined
+}
+
+/// Post-inline cleanup (codegen2's copy-elimination finding + LLVM SROA's whole-slot slicing):
+/// small aggregate temporaries the inlined bodies copy through (Option payloads, sret results)
+/// are forwarded from 32 bytes up, then groups copied in and out are tiled into registers;
+/// later wider loads of narrower stores otherwise fail store forwarding (layout_widgets). Runs
+/// after inlining and again after full unrolling.
+fn slot_cleanup(options: &crate::options::Options, func: &mut relax_backend::rir::Func, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg) {
+    {
         for _ in 0..3 {
+            // field-wise copies (a derived Clone's loads and stores) as one copy, which the
+            // passes below forward and join along; MAKEPAD_RUN_OPT=-copyruns
+            let ch = !relax_backend::stats::opt_off(options, "-copyruns") && relax_codegen::opt::merge_copy_runs(func);
             // zero fills a copy overwrites before any read go first: the copy's stores are
             // then the only writes of those bytes, so the reads after it can be forwarded
-            let ch = relax_codegen::opt::dead_slot_stores(func);
+            let ch = ch | relax_codegen::opt::dead_slot_stores(func);
             let ch = ch | relax_codegen::opt::forward_slot_dests(func) | relax_codegen::opt::forward_slot_dests_x(options, func, 32);
             // slots joined along whole copies by byte liveness (loops too); MAKEPAD_RUN_OPT=-slotcoal
             let ch = ch | (!relax_backend::stats::opt_off(options, "-slotcoal") && relax_codegen::opt::coalesce_slot_copies(func, !relax_backend::stats::opt_off(options, "-slotprefix")));
@@ -12368,7 +12552,6 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
             relax_backend::passes::simplify(options, func, ro, cfg.imm, false);
         }
     }
-    inlined
 }
 
 // ---- the on-demand PC sampler (MAKEPAD_RUN_PROFILE; not part of tier-up)
@@ -15500,14 +15683,7 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
         }
         if let Err(p) = r {
             crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_PANIC, 0, 0, 0);
-            let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned())
-                .or_else(|| p.downcast_ref::<crate::preempt::PublishBail>().map(|b| format!("publish bail ({}, {} slots)", b.what, b.slots.len())))
-                .or_else(|| p.downcast_ref::<crate::infer::diagnostics::FatalError>().map(|e| format!("fatal error: {}", e.0)))
-                .or_else(|| p.is::<crate::preempt::Preempted>().then(|| "preempted".to_string()))
-                .or_else(|| p.is::<crate::preempt::OwnerBusy>().then(|| "owner busy".to_string()))
-                .or_else(|| p.is::<crate::preempt::NeedsLoad>().then(|| "needs load".to_string()))
-                .or_else(|| p.is::<crate::preempt::NeedsUnit>().then(|| "needs the unit".to_string()))
-                .unwrap_or_else(|| "panic".to_string());
+            let msg = panic_payload(&*p).0;
             let n = TIER1_PANICS.fetch_add(1, Ordering::Relaxed);
             if n < 3 {
                 eprintln!("makepad: O3 build of slot {} panicked: {} -- O3 dropped for it", id, msg);
@@ -16108,7 +16284,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
         // speculation: sites of this slot that finished profiling are decided now; the guessed
         // targets join the snapshot (their RIR inlines into the guarded call)
-        if crate::guards::enabled() && !sandboxed && !(&*up).fns[id as usize].unverified.load(Ordering::Relaxed) {
+        if crate::guards::enabled() && !sandboxed && !export_o3_mode() && !(&*up).fns[id as usize].unverified.load(Ordering::Relaxed) {
             let u = &*up;
             let slots = crate::guards::decide(id, &|a| u.thunk_slot(a));
             for &(_, s) in &slots {
@@ -16450,9 +16626,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let mut done: Vec<Deferred> = Vec::new();
         for (c, prep) in preps {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize_tree(options, c, prep, &mut done)));
-            if let Ok(r) = r { done.push((c, r)); }
+            done.push(match r { Ok(r) => (c, r), Err(p) => optimize_tree_panicked(up, c, p) });
         }
-        TIER1_SNAP_OFF[0].fetch_add(done.len() as u64, Ordering::Relaxed);
+        TIER1_SNAP_OFF[0].fetch_add(done.iter().filter(|d| d.1.is_ok()).count() as u64, Ordering::Relaxed);
         TIER1_SNAP_OFF[1].fetch_add(cpu_ns() - to, Ordering::Relaxed);
         owner::publish(|| o3_candidates_finish(up, epoch0, done));
     }
@@ -16574,6 +16750,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let verified = func.verify();
         relax_backend::stats::pass_time(13, tv);
         verified.map_err(|e| format!("RIR verify after O3: {}", e))?;
+        // a wasm export's O3 body (export_o3_rir): the optimised RIR is the result, no native code
+        if export_o3_mode() {
+            let f = crate::zone_alloc::kept_with(|| func.clone());
+            EXPORT_O3.with(|c| *c.borrow_mut() = Some(Some(f)));
+            return Err(EXPORT_O3_TAKEN.to_string());
+        }
         let freq = match &t1_freq {
             Some(_) if counts.is_some() => {
                 counted_freqs(&mut func)
@@ -16728,6 +16910,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let (left, cold_left, absent, inlined, nounwind_used) = crate::zone_alloc::copy_out(|| (left.clone(), cold_left.clone(), absent.clone(), inlined.clone(), nounwind_used.clone()));
         Ok((c.code, c.pc_map, c.relocs, (inlined, left, cold_left, absent, c.frame_size, self_call, nounwind_used, profile_entry)))
     }));
+    if export_o3_mode() {
+        return false;
+    }
     let t2 = cpu_ns();
     if let Some(m) = measure.as_mut() { m.phase(2, t2); }
     trace_tier1_phase(id, "built");
@@ -18577,7 +18762,7 @@ unsafe fn build_off_owner(up: *mut Unit, ids: &[(u32, RirMode)]) {
             let mut done: Vec<Deferred> = Vec::new();
             for (c, prep) in preps {
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize_tree(options, c, prep, &mut done)));
-                if let Ok(r) = r { done.push((c, r)); }
+                done.push(match r { Ok(r) => (c, r), Err(p) => optimize_tree_panicked(up, c, p) });
             }
             owner::publish(|| o3_candidates_finish(up, epoch0, done));
         }
