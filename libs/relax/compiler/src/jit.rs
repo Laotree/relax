@@ -8196,7 +8196,8 @@ pub unsafe fn export_rir(up: *mut Unit, id: u32, optimized: bool) -> Result<rela
         crate::wasm_export::O3Policy::Hot => (trace_o3(&*up, id) || crate::wasm_export::o3_crate(&*up, id)) && crate::wasm_export::sampled_hot(id),
     };
     let o3_body = if o3 { export_o3_rir(up, id) } else { None };
-    if o3_body.is_some() {
+    let shipped_o3 = o3_body.is_some();
+    if shipped_o3 {
         crate::wasm_export::note_o3_body(id);
     }
     let u = &*up;
@@ -8216,12 +8217,30 @@ pub unsafe fn export_rir(up: *mut Unit, id: u32, optimized: bool) -> Result<rela
         while crate::wasm_export::shipping_fn_addresses(u, &mut f) {
             relax_backend::passes::simplify(&session.options, &mut f, ro, true, true);
         }
+        // an O1 body ships as the module's only code for it: the O3 folds that only remove
+        // code -- compares the value ranges decide (bounds checks of a loop's own index, a
+        // check a dominating one implies) and compares of small value sets -- run on it too
+        // (LLVM -Oz runs its correlated value propagation and InstCombine everywhere)
+        if !shipped_o3 && crate::wasm_export::o1_folds() {
+            if relax_codegen::ranges::fold_ranges(&session.options, &mut f) {
+                relax_backend::passes::simplify(&session.options, &mut f, ro, true, true);
+            }
+            if relax_codegen::opt::fold_small_sets(&mut f) {
+                relax_backend::passes::simplify(&session.options, &mut f, ro, true, true);
+            }
+        }
         relax_backend::passes::live_dce(&mut f);
         relax_backend::passes::dce(&mut f);
         // DCE ignores unreachable blocks; relayout physically removes them so
         // neither the linker nor the closure sees their residual instructions.
         relax_backend::passes::relayout(&mut f);
         f.verify().map_err(|e| format!("shipping RIR: {e}"))?;
+        // MAKEPAD_RUN_DUMP_SHIP=<name suffix | ~text>: the shipping RIR (what the module emits)
+        if let Ok(w) = std::env::var("MAKEPAD_RUN_DUMP_SHIP") {
+            if dump_rir_match(&f.name, &w) {
+                eprintln!("shipping {}", f.dump());
+            }
+        }
     }
     Ok(f)
 }

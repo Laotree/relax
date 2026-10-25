@@ -1385,6 +1385,13 @@ pub(crate) fn full_o1() -> bool {
     *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_WASM_EXPORT_FULL").map_or(true, |v| v != "0"))
 }
 
+/// MAKEPAD_RUN_WASM_EXPORT_O1_FOLDS (default on; `0` off): shipping O1 bodies also take the O3
+/// folds that only remove code (value-range compares, small-set compares)
+pub(crate) fn o1_folds() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_WASM_EXPORT_O1_FOLDS").map_or(true, |v| v != "0"))
+}
+
 /// MAKEPAD_RUN_WASM_EXPORT_O3_LTO (default on; `0` off): shipping O3 bodies inline as a fat-LTO
 /// build does (InlineLimits::lto: cross-crate callees as local ones, single callers take their
 /// callee's body: the Splash VM's opcode dispatch into run_core, as LLVM has it)
