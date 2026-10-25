@@ -15882,8 +15882,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     if t1prof_on(options) && !owner::is_owner() {
         return owner::call(owner::Class::Program, || compile_tier1(up, id));
     }
-    // replay: the O2 builds whose RIR the recorded build took, first
-    if t1prof_replay(options) {
+    // replay: the O2 builds whose RIR the recorded build took, first (MAKEPAD_RUN_OPT=-o2first: not; A/B)
+    if t1prof_replay(options) && !relax_backend::stats::opt_off(options, "-o2first") {
         t1prof_o2_first(up, id);
     }
     // SPEC-V: unverified code gets O3 code too, built as it is (Unit::o3_allowed)
