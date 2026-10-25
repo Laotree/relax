@@ -486,24 +486,46 @@ impl<'a> Module<'a> {
                 }
             }
         }
-        for _round in 0..2 {
+        // per function, per parameter: what every direct call passes (the meet of the arguments'
+        // kinds over the module's call sites, from the previous round's kinds; UNSET: no call
+        // seen). A parameter every caller passes zero- or sign-extended from its low 32 bits (a
+        // usize, u32 or i32 of a wasm32 program: their values are always extended) is that kind
+        // in the callee -- an i32 -- as rustc's wasm32 ABI passes them.
+        const UNSET: u8 = 0xFF;
+        let mut passed: Vec<Vec<u8>> = funcs.iter().map(|(_, f)| vec![UNSET; f.params.len()]).collect();
+        for _round in 0..4 {
             let prev = sigs.clone();
             let csig = |id: u32| self.fn_ix.get(&id).map(|&u| &prev[u as usize]);
+            let mut next: Vec<Vec<u8>> = funcs.iter().map(|(_, f)| vec![UNSET; f.params.len()]).collect();
             for u in 0..n {
-                if fixed[u] {
-                    continue;
-                }
                 let f = body_of(u);
-                let seeds: Vec<u8> = f.params.iter().map(|p| {
-                    if f.vregs[p.0 as usize] != Cls::I {
+                let seeds: Vec<u8> = f.params.iter().enumerate().map(|(i, p)| {
+                    if fixed[u] || f.vregs[p.0 as usize] != Cls::I {
                         0
                     } else if f.nonnull.contains(p) || f.deref.iter().any(|(d, _)| d == p) {
                         KZ
+                    } else if passed[u][i] != UNSET && passed[u][i] & (KZ | KS) != 0 {
+                        passed[u][i] & (KZ | KS)
                     } else {
                         KL
                     }
                 }).collect();
                 let k = narrow_kinds(f, &self.opts, link, &seeds, &csig);
+                for b in &f.blocks {
+                    for i in &b.insts {
+                        if let Inst::Call(Callee::Fn(id), args, _) = i {
+                            if let Some(&c) = self.fn_ix.get(id) {
+                                let acc = &mut next[c as usize];
+                                for (j, a) in args.iter().enumerate().take(acc.len()) {
+                                    acc[j] &= k[a.0 as usize] & (KZ | KS);
+                                }
+                            }
+                        }
+                    }
+                }
+                if fixed[u] {
+                    continue;
+                }
                 let params: Vec<u8> = f.params.iter().map(|p| k[p.0 as usize]).collect();
                 let mut ret: Vec<u8> = f.rets.iter().map(|c| if *c == Cls::I { KZ | KS } else { 0 }).collect();
                 for b in &f.blocks {
@@ -515,6 +537,7 @@ impl<'a> Module<'a> {
                 }
                 sigs[u] = Sig { params, ret };
             }
+            passed = next;
         }
         sigs
     }
