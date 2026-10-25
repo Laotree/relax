@@ -203,8 +203,15 @@ fn world(sess: &std::sync::Arc<crate::Session>) -> Option<std::sync::Arc<Result<
     world_inner(sess, false)
 }
 
+thread_local! {
+    /// this thread holds BUILDING (it builds the world). Its boot-world loads clear IN_WORLD to
+    /// expand macros, so a macro the boot world lacks must not wait for BUILDING here: that wait
+    /// would be on itself.
+    static BUILDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn world_inner(sess: &std::sync::Arc<crate::Session>, prewarm: bool) -> Option<std::sync::Arc<Result<World, String>>> {
-    if in_world() {
+    if in_world() || BUILDER.with(|b| b.get()) {
         return None;
     }
     if let Some(w) = world_now() {
@@ -225,10 +232,11 @@ fn world_inner(sess: &std::sync::Arc<crate::Session>, prewarm: bool) -> Option<s
     // restored also when build_world panics (the thread may be a pool worker that goes on)
     struct InWorld;
     impl Drop for InWorld {
-        fn drop(&mut self) { set_in_world(false); }
+        fn drop(&mut self) { set_in_world(false); BUILDER.with(|b| b.set(false)); }
     }
     let w = {
         set_in_world(true);
+        BUILDER.with(|b| b.set(true));
         let _in_world = InWorld;
         std::sync::Arc::new(build_world(sess))
     };
@@ -322,10 +330,10 @@ pub fn policy() -> Policy {
     if POLICY.load(std::sync::atomic::Ordering::Relaxed) == 1 { Policy::Open } else { Policy::Sandboxed }
 }
 
-/// Trusted crates may use unsafe/FFI: all of them under `Policy::Open` or `--allow-c`; else the
-/// path packages (and std): a registry/git package is sandboxed by what it is, not by where it is stored.
-fn trusted(sess: &std::sync::Arc<crate::Session>, unit: &crate::macro_reg::UnitInfo) -> bool {
-    policy() == Policy::Open || sess.options.allow_c || !unit.registry
+/// Trusted crates may use unsafe/FFI: all of them under `Policy::Open`; else the path packages
+/// (and std): a registry/git package is sandboxed by what it is, not by where it is stored.
+fn trusted(unit: &crate::macro_reg::UnitInfo) -> bool {
+    policy() == Policy::Open || !unit.registry
 }
 
 /// The sandbox's dialect-level refusal for an untrusted macro crate's files.
@@ -394,7 +402,7 @@ fn build_world(sess: &std::sync::Arc<crate::Session>) -> Result<World, String> {
     // world; its macros report the reason at their call sites
     let mut refused: Vec<Option<String>> = vec![None; units.len()];
     for i in 0..units.len() {
-        if need[i] && !trusted(sess, &units[i]) {
+        if need[i] && !trusted(&units[i]) {
             if let Err(e) = sandbox_check(&units[i].src_path, units[i].edition) {
                 refused[i] = Some(e);
             }

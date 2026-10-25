@@ -142,8 +142,8 @@ impl<T: BitAnd<Output = T> + Copy> BitAndAssign for Wrapping<T> {
     }
 }
 
-/// Saturating<T> (rare in client programs): operations through the integer's saturating methods are
-/// written per use site; only the container and formatting are provided.
+/// Saturating<T>: the operator impls of core::num::saturating (binops with a `Saturating` rhs, the
+/// `op=` impls with either rhs, Not), through the integer's saturating methods.
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default, Hash)]
 #[repr(transparent)]
 pub struct Saturating<T>(pub T);
@@ -167,12 +167,6 @@ macro_rules! saturating_impl {
                 Saturating(self.0.saturating_add(rhs.0))
             }
         }
-        impl Add<$t> for Saturating<$t> {
-            type Output = Saturating<$t>;
-            fn add(self, rhs: $t) -> Saturating<$t> {
-                Saturating(self.0.saturating_add(rhs))
-            }
-        }
         impl AddAssign for Saturating<$t> {
             fn add_assign(&mut self, rhs: Saturating<$t>) {
                 self.0 = self.0.saturating_add(rhs.0);
@@ -187,12 +181,6 @@ macro_rules! saturating_impl {
             type Output = Saturating<$t>;
             fn sub(self, rhs: Saturating<$t>) -> Saturating<$t> {
                 Saturating(self.0.saturating_sub(rhs.0))
-            }
-        }
-        impl Sub<$t> for Saturating<$t> {
-            type Output = Saturating<$t>;
-            fn sub(self, rhs: $t) -> Saturating<$t> {
-                Saturating(self.0.saturating_sub(rhs))
             }
         }
         impl SubAssign for Saturating<$t> {
@@ -211,12 +199,6 @@ macro_rules! saturating_impl {
                 Saturating(self.0.saturating_mul(rhs.0))
             }
         }
-        impl Mul<$t> for Saturating<$t> {
-            type Output = Saturating<$t>;
-            fn mul(self, rhs: $t) -> Saturating<$t> {
-                Saturating(self.0.saturating_mul(rhs))
-            }
-        }
         impl MulAssign for Saturating<$t> {
             fn mul_assign(&mut self, rhs: Saturating<$t>) {
                 self.0 = self.0.saturating_mul(rhs.0);
@@ -231,12 +213,6 @@ macro_rules! saturating_impl {
             type Output = Saturating<$t>;
             fn div(self, rhs: Saturating<$t>) -> Saturating<$t> {
                 Saturating(self.0.saturating_div(rhs.0))
-            }
-        }
-        impl Div<$t> for Saturating<$t> {
-            type Output = Saturating<$t>;
-            fn div(self, rhs: $t) -> Saturating<$t> {
-                Saturating(self.0.saturating_div(rhs))
             }
         }
         impl DivAssign for Saturating<$t> {
@@ -255,12 +231,6 @@ macro_rules! saturating_impl {
                 Saturating(self.0 % rhs.0)
             }
         }
-        impl Rem<$t> for Saturating<$t> {
-            type Output = Saturating<$t>;
-            fn rem(self, rhs: $t) -> Saturating<$t> {
-                Saturating(self.0 % rhs)
-            }
-        }
         impl RemAssign for Saturating<$t> {
             fn rem_assign(&mut self, rhs: Saturating<$t>) {
                 self.0 = self.0 % rhs.0;
@@ -275,12 +245,6 @@ macro_rules! saturating_impl {
             type Output = Saturating<$t>;
             fn bitxor(self, rhs: Saturating<$t>) -> Saturating<$t> {
                 Saturating(self.0 ^ rhs.0)
-            }
-        }
-        impl BitXor<$t> for Saturating<$t> {
-            type Output = Saturating<$t>;
-            fn bitxor(self, rhs: $t) -> Saturating<$t> {
-                Saturating(self.0 ^ rhs)
             }
         }
         impl BitXorAssign for Saturating<$t> {
@@ -299,12 +263,6 @@ macro_rules! saturating_impl {
                 Saturating(self.0 | rhs.0)
             }
         }
-        impl BitOr<$t> for Saturating<$t> {
-            type Output = Saturating<$t>;
-            fn bitor(self, rhs: $t) -> Saturating<$t> {
-                Saturating(self.0 | rhs)
-            }
-        }
         impl BitOrAssign for Saturating<$t> {
             fn bitor_assign(&mut self, rhs: Saturating<$t>) {
                 self.0 = self.0 | rhs.0;
@@ -319,12 +277,6 @@ macro_rules! saturating_impl {
             type Output = Saturating<$t>;
             fn bitand(self, rhs: Saturating<$t>) -> Saturating<$t> {
                 Saturating(self.0 & rhs.0)
-            }
-        }
-        impl BitAnd<$t> for Saturating<$t> {
-            type Output = Saturating<$t>;
-            fn bitand(self, rhs: $t) -> Saturating<$t> {
-                Saturating(self.0 & rhs)
             }
         }
         impl BitAndAssign for Saturating<$t> {
