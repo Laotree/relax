@@ -4381,7 +4381,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             // a change the running process cannot take: makepad rebuilds itself in the background
             // and restarts into the new binary; the app keeps running (and patching) meanwhile
             let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
-            let names: Vec<&str> = changed.iter().take(3).map(|&k| files[k].0.as_str()).collect();
+            // the last two path parts say which crate and file
+            let short = |p: &str| -> String { let v: Vec<&str> = p.rsplit('/').take(2).collect(); v.into_iter().rev().collect::<Vec<_>>().join("/") };
+            let names: Vec<String> = changed.iter().take(3).map(|&k| short(&files[k].0)).collect();
             let why = format!("{} {what} changed ({}{}): {reason}", changed.len(), names.join(", "), if changed.len() > 3 { ", ..." } else { "" });
             match host::request(why, inputs.process_paths()) {
                 Ok(()) => {
