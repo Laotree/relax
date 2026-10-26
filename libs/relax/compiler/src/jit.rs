@@ -8779,7 +8779,7 @@ fn note_slow_base(u: &Unit, id: u32) {
             crate::zone_alloc::kept_with(|| g.push(id));
             drop(g);
             // an idle first worker polls once a second: it builds this now
-            TIER_SLEEPERS.wake_one();
+            w0_wake();
         }
     }
     TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime, &u.prog.session.options));
@@ -15233,6 +15233,16 @@ const TIER1_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 const W0_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 const W0_QUIET: u32 = 40;
 
+/// The first O3 worker is in its once-a-second polls (w0_wake wakes it; a busy one is not woken
+/// per entry: its 50 ms polls take the entries in batches).
+static W0_IDLING: AtomicBool = AtomicBool::new(false);
+
+fn w0_wake() {
+    if W0_IDLING.swap(false, Ordering::SeqCst) {
+        TIER_SLEEPERS.wake_one();
+    }
+}
+
 /// What the first O3 worker's polls serve: when none of it moves, they find nothing to do.
 fn w0_activity() -> [u64; 8] {
     [
@@ -15789,7 +15799,7 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
                     COUNTING.lock().unwrap_or_else(|e| e.into_inner()).push(Counting { id, counters, weights, at, lukewarm, mark: (0, at), parked: false, credited: false });
                 });
                 // the counted window starts: an idle first worker goes back to its PGO polls
-                TIER_SLEEPERS.wake_one();
+                w0_wake();
                 true
             }
             Err(_) => false,
@@ -15983,7 +15993,9 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
                 } else if k == 0 {
                     let now = w0_activity();
                     if now == w0_seen { w0_still = w0_still.saturating_add(1) } else { (w0_seen, w0_still) = (now, 0) }
-                    if w0_still >= W0_QUIET { W0_IDLE } else { TIER1_POLL }
+                    let idle = w0_still >= W0_QUIET;
+                    W0_IDLING.store(idle, Ordering::SeqCst);
+                    if idle { W0_IDLE } else { TIER1_POLL }
                 } else { TIER1_POLL };
                 if parked { TIER_SLEEPERS.sleep(k, ready) } else { TIER_SLEEPERS.sleep_timeout(k, poll, ready) }
                 if k == 0 {
