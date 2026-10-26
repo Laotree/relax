@@ -342,9 +342,9 @@ impl Asm {
         self.byte(0x90 | cc);
         self.modrm_rr(0, r);
     }
-    /// movzx r64, r8
+    /// movzx r32, r8 (a 32-bit write zero-extends: the r64 form's REX.W is a wasted byte)
     fn movzx8(&mut self, dst: u8, src: u8) {
-        self.rex(true, dst, 0, src, src >= 4);
+        self.rex(false, dst, 0, src, src >= 4);
         self.byte(0x0f);
         self.byte(0xb6);
         self.modrm_rr(dst, src);
@@ -371,7 +371,8 @@ impl Asm {
                 self.modrm_rr(d, s);
             }
             (16, false) => {
-                self.rex(true, d, 0, s, false);
+                // movzx r32, r16 (zero-extends to 64)
+                self.rex(false, d, 0, s, false);
                 self.byte(0x0f);
                 self.byte(0xb7);
                 self.modrm_rr(d, s);
@@ -393,14 +394,15 @@ impl Asm {
     }
     fn load_ext(&mut self, dst: u8, base: u8, disp: i32, bytes: u8, signed: bool) {
         match (bytes, signed) {
+            // (zero extension: the 32-bit form, which zero-extends to 64, needs no REX.W)
             (1, s) => {
-                self.rex(true, dst, 0, base, false);
+                self.rex(s, dst, 0, base, false);
                 self.byte(0x0f);
                 self.byte(if s { 0xbe } else { 0xb6 });
                 self.modrm_mem(dst, base, disp);
             }
             (2, s) => {
-                self.rex(true, dst, 0, base, false);
+                self.rex(s, dst, 0, base, false);
                 self.byte(0x0f);
                 self.byte(if s { 0xbf } else { 0xb7 });
                 self.modrm_mem(dst, base, disp);
@@ -469,9 +471,15 @@ impl Asm {
             return;
         }
         self.byte(0x48);
-        self.byte(0x81);
-        self.modrm_rr(5, RSP);
-        self.u32(n);
+        if n < 128 {
+            self.byte(0x83);
+            self.modrm_rr(5, RSP);
+            self.byte(n as u8);
+        } else {
+            self.byte(0x81);
+            self.modrm_rr(5, RSP);
+            self.u32(n);
+        }
     }
     fn call_r(&mut self, r: u8) {
         self.rex(false, 0, 0, r, false);
