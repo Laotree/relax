@@ -2901,12 +2901,14 @@ impl<'a> Gen<'a> {
     /// The loop heads aligned to 16 bytes (LLVM MachineBlockPlacement::alignBlocks, x86's 16-byte
     /// loop alignment): a block that a later block jumps back to, not cold next to the entry
     /// (frequency >= entry / 5), entered mostly by its back edges: the block laid out before it
-    /// does not fall into it, or what falls in is at most a fifth of its frequency. Without
-    /// frequencies every such head.
+    /// does not fall into it, or what falls in is at most a fifth of its frequency. Only with
+    /// frequencies.
     fn loop_heads(&self, reach: &[bool]) -> Vec<bool> {
         let nb = self.f.blocks.len();
         let mut a = vec![false; nb];
-        if !self.align_loops {
+        // (no frequencies, e.g. after the allocator split loops: no padding -- aligning every head
+        // of every loop, cold ones included, cost reconcile 3.5% of its bytes in nops)
+        if !self.align_loops || self.freq.is_none() {
             return a;
         }
         for bj in 0..nb {
