@@ -269,8 +269,8 @@ impl PlainWebSocket {
 
     #[cfg(not(target_arch = "wasm32"))]
     /// `wss://` to a fleet endpoint ([`crate::tls::mark_fleet_endpoint`]):
-    /// self-signed TLS checked against the fleet known-hosts record, with
-    /// the fleet authorization bound to the certificate presented. Other
+    /// the server's certificate checked against the fleet root, with this
+    /// machine's proof bound to the certificate presented. Other
     /// TLS endpoints are refused (no CA validation here).
     fn open_pinned(request: HttpRequest, rx_sender: Sender<WebSocketMessage>) -> PlainWebSocket {
         let failed = |rx: &Sender<WebSocketMessage>, msg: String| {
