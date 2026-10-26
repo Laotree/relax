@@ -116,7 +116,8 @@ pub struct FnEntry {
     pub spec_state: u8,
     /// speculation depth this slot was queued at (u8::MAX: not queued)
     pub spec_depth: u8,
-    /// Explicit trace/hint seed: use baseline even if its build starts after present.
+    /// Explicit trace/hint seed (spec_seed): use baseline even if its build starts after present;
+    /// its result built ahead never expires (note_spec_built).
     pub baseline_hint: AtomicBool,
     /// a Relax core fn called by `// relax: hot` code: compiled like it (marked_hot)
     pub hot_hint: AtomicBool,
@@ -19957,7 +19958,15 @@ static SPEC_BUILT: relax_session::sync::Mutex<Vec<(u32, u64)>> = relax_session::
 /// (results dropped, bytes of code + RIR freed)
 pub static SPEC_EXPIRED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
-fn note_spec_built(options: &crate::options::Options, id: u32) {
+/// A speculative result of slot `id` is ready: it expires if not called within the TTL -- unless
+/// the slot was seeded (`spec_seed`: the previous run's post-present manifest, a live edit's
+/// pending slots): that code ran before and is kept until its call, however late (JITLOOP-B: a
+/// warm Sandbox's Play 30 s after the launch re-linked ~16k expired manifest slots on the UI
+/// thread, 0.5-0.9 s blocks).
+fn note_spec_built(options: &crate::options::Options, u: &Unit, id: u32) {
+    if u.fns[id as usize].baseline_hint.load(Ordering::Relaxed) {
+        return;
+    }
     if spec_ttl_ns(options) != 0 && ahead_policy().spec_expire {
         SPEC_BUILT.lock().unwrap().push((id, wall_ns()));
     }
@@ -20862,7 +20871,7 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
                 u.fns[id as usize].spec = Some(Box::new(SpecCode { code, map, relocs: crelocs, record: false }));
                 u.fns[id as usize].spec_state = 1;
                 u.exec_note(id, crate::exec_profile::SPEC);
-                note_spec_built(options, id);
+                note_spec_built(options, &*up, id);
             }
             let u = &mut *up;
             let d = u.fns[id as usize].spec_depth;
@@ -21080,7 +21089,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
                     u.fns[id as usize].spec = Some(Box::new(SpecCode { code, map, relocs, record: true }));
                     u.fns[id as usize].spec_state = 1;
                     u.exec_note(id, crate::exec_profile::SPEC);
-                    note_spec_built(options, id);
+                    note_spec_built(options, &*up, id);
                     let d = u.fns[id as usize].spec_depth;
                     spec_enqueue(up, id, d);
                 }
