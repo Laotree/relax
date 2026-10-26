@@ -5333,15 +5333,14 @@ impl Unit {
         // had taken the address of -- Result::unwrap's `&dyn Debug`, the hash map's -- bailed the
         // lowering, and its O3 candidates were left out.)
         if id as usize >= self.fns.len() || !self.fns[id as usize].entry_ref.load(Ordering::Relaxed) && self.slots.has_callable_hook() {
-            // a background build's front: the owner takes the address between two requests
-            // (const_drain), and the take's next round finds it taken (a warm run's code comes from
-            // the disk cache, so no lowering of this run took it: vtables of `dyn` methods dropped
-            // ~90 warm O2 builds of Code per session)
-            if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) && WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
-                let key = if (id as usize) < self.fns.len() { Some(self.fns[id as usize].key.clone()) } else { lower_ahead_fn_key(id) };
-                if let Some(key) = key {
-                    want(Wanted::Entry(key), self.tcx.collect_epoch.load(Ordering::SeqCst));
-                }
+            // a background build's front, a slot whose address nobody took in this run: the owner
+            // takes it between two requests (const_drain), and the take's next round finds it taken
+            // (a warm run's code comes from the disk cache, so no lowering of this run took it:
+            // vtables of `dyn` methods dropped ~90 warm O2 builds of Code per session). A
+            // temporary identity is not: its key is the lowering's own (named by fn_id on the
+            // owner, it made slots of open generic keys)
+            if (id as usize) < self.fns.len() && LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) && WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
+                want(Wanted::Entry(id), self.tcx.collect_epoch.load(Ordering::SeqCst));
             }
             lower_ahead_needs_unit();
         }
@@ -21181,13 +21180,27 @@ fn prefront_closure(front: &FrontShared, id: u32) -> bool {
     if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(true) {
         return prefront_fail(AF_NESTED);
     }
+    // the parent's checked body is gone (dropped once its own code was complete, or its code came
+    // from the disk cache): checked ahead into the shared table (typeck_ahead), so this lowering and
+    // a take that needs the parent's body (ensure_parent_body: take_ahead) use one body -- a body
+    // made here alone differed from the one the take put, and the take refused this lowering
+    let shared = match (&kept, front.slot_keys.get(&parent)) {
+        (None, Some(FnKey::Inst(d, args))) => {
+            {
+                let _preemptible = crate::preempt::Preemptible::on();
+                typeck_ahead(front, d, args.clone(), 0, false, false);
+            }
+            front.ahead.get(&(d, args)).filter(|(_, b)| b.file == cfile)
+        }
+        _ => None,
+    };
     let r = front_read("lower_ahead");
     let u = r.unit_of(front);
-    // the parent's checked body is gone (dropped once its own code was complete, or its code came
-    // from the disk cache): made again here, as lower_ahead_as makes an instance's. The closures of
-    // a parent built long ago are what turns hot later (a benchmark's or a frame's callback): their
-    // O3 builds bailed on this for the whole run and the closure ran baseline code
-    let body = match kept {
+    let shared = shared.filter(|(e, _)| *e == u.tcx.collect_epoch.load(Ordering::SeqCst)).map(|(_, b)| b);
+    // (else made here, as lower_ahead_as makes an instance's. The closures of a parent built long
+    // ago are what turns hot later (a benchmark's or a frame's callback): their O3 builds bailed on
+    // this for the whole run and the closure ran baseline code)
+    let body = match kept.or(shared) {
         Some(b) => b,
         None => {
             let Some(FnKey::Inst(d, args)) = front.slot_keys.get(&parent) else {
@@ -24265,9 +24278,8 @@ enum Wanted {
     Const(DefId, Vec<TyId>),
     Tls(DefId),
     Static(DefId),
-    /// a slot's callable address (Unit::entry: its first escape, a callable hook's), by key: a
-    /// lowering ahead may name it by a temporary identity only
-    Entry(FnKey),
+    /// a slot's callable address (Unit::entry: its first escape, a callable hook's)
+    Entry(u32),
 }
 
 /// Owner, before each request: the constants CONSTS_WANTED names, evaluated into FrontShared::consts
@@ -24291,8 +24303,7 @@ pub(crate) fn const_drain() {
             continue;
         }
         let (d, ok) = match w {
-            Wanted::Entry(key) => {
-                let id = u.fn_id(key);
+            Wanted::Entry(id) => {
                 let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.entry(id))).is_ok();
                 if ahead_trace() {
                     eprintln!("const-drain: entry of {} {}", u.fns[id as usize].name, if ok { "taken" } else { "failed" });
