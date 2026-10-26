@@ -123,6 +123,7 @@ impl Env {
     }
 }
 
+#[derive(Clone)]
 struct Asm {
     b: Vec<u8>,
     /// pending scaled index (index reg, shift) for the next memory operand
@@ -995,6 +996,7 @@ fn x64_defers(b: &Block, k: usize, uses: &[u32]) -> bool {
 
 // ------------------------------------------------------------ code generation
 
+#[derive(Clone)]
 struct Gen<'a> {
     /// the function has 256-bit vectors (vzeroupper before calls and returns)
     ymm: bool,
@@ -1114,6 +1116,16 @@ struct Gen<'a> {
     unwind_tab: Vec<(u32, u32)>,
     /// (instruction position, return offset) of every call: the variable table's sites (dbgloc)
     var_calls: Vec<(u32, u32)>,
+    /// forward block jumps (jump_to / jcc_to to a block not placed yet), in emission order: where
+    /// each started -- the first pass of a two-pass emit records them (short_jumps)
+    fwd_at: Vec<usize>,
+    /// the second pass: the first pass's forward-jump starts and block positions. A jump whose
+    /// first-pass distance fits rel8 is emitted short (code between only shrinks in this pass)
+    fwd_hint: Option<std::rc::Rc<(Vec<usize>, Vec<usize>)>>,
+    /// rel8 fields of short forward jumps: (byte position, target block)
+    fixups8: Vec<(usize, u32)>,
+    /// a short forward jump that did not reach (the first pass's code is used)
+    short_miss: bool,
 }
 
 impl<'a> Gen<'a> {
@@ -1908,6 +1920,12 @@ impl<'a> Gen<'a> {
         for (at, t) in std::mem::take(&mut self.fixups) {
             let target = self.block_pos[t as usize];
             self.a.patch(at, target);
+        }
+        for (at, t) in std::mem::take(&mut self.fixups8) {
+            match i8::try_from(self.block_pos[t as usize] as i64 - (at as i64 + 1)) {
+                Ok(rel) => self.a.b[at] = rel as u8,
+                Err(_) => self.short_miss = true,
+            }
         }
         for (at, start, t) in std::mem::take(&mut self.jt_fix) {
             let rel = self.block_pos[t as usize] as i64 - start as i64;
@@ -2850,6 +2868,12 @@ impl<'a> Gen<'a> {
                 self.a.byte(rel as u8);
                 return;
             }
+            if self.short_fwd(target) {
+                self.a.byte(0xeb);
+                self.fixups8.push((self.a.pos(), target));
+                self.a.byte(0);
+                return;
+            }
             let p = self.a.jmp32();
             self.fixups.push((p, target));
         }
@@ -2862,8 +2886,28 @@ impl<'a> Gen<'a> {
             self.a.byte(rel as u8);
             return;
         }
+        if self.short_fwd(target) {
+            self.a.byte(0x70 | cc);
+            self.fixups8.push((self.a.pos(), target));
+            self.a.byte(0);
+            return;
+        }
         let p = self.a.jcc32(cc);
         self.fixups.push((p, target));
+    }
+
+    /// A forward jump to `target` (not placed yet) starts here: recorded for the second pass; in
+    /// the second pass, whether it fits rel8. Between the jump and its target the second pass
+    /// emits the same instructions as the first, some jumps shorter, none longer, so the
+    /// first pass's distance bounds this one (the patch checks it: `short_miss`).
+    fn short_fwd(&mut self, target: u32) -> bool {
+        let k = self.fwd_at.len();
+        self.fwd_at.push(self.a.pos());
+        let Some(h) = &self.fwd_hint else { return false };
+        match (h.0.get(k), h.1.get(target as usize)) {
+            (Some(&c1), Some(&t1)) if t1 != usize::MAX && t1 > c1 => t1 - c1 - 2 <= 127,
+            _ => false,
+        }
     }
 
     /// rel8 of a two-byte jump emitted here to an already placed block, when it fits (forward
@@ -6609,6 +6653,10 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         pads: Vec::new(),
         unwind_tab: Vec::new(),
         var_calls: Vec::new(),
+        fwd_at: Vec::new(),
+        fwd_hint: None,
+        fixups8: Vec::new(),
+        short_miss: false,
     };
     g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
     if env.opt_regs || g.f.full {
@@ -6617,7 +6665,21 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     if !crate::stats::opt_off(options, "-swrange") {
         g.switch_in_range = crate::switch::switch_in_range(g.f);
     }
+    // optimised code is emitted twice (GAPX6: x64 front end): the first pass places the blocks,
+    // the second emits each forward jump whose first-pass distance fits in rel8 as a 2-byte jump
+    // (jcc rel32 is 6 bytes, jmp 5) -- denser hot code. MAKEPAD_RUN_OPT=-shortjmp: one pass
+    let two_pass = env.opt_regs && !crate::stats::opt_off(options, "-shortjmp");
+    let first = two_pass.then(|| g.clone());
     g.gen(options);
+    if let Some(mut g2) = first {
+        if !g.fwd_at.is_empty() {
+            g2.fwd_hint = Some(std::rc::Rc::new((std::mem::take(&mut g.fwd_at), g.block_pos.clone())));
+            g2.gen(options);
+            if !g2.short_miss {
+                g = g2;
+            }
+        }
+    }
     // a copy between overlapping frame bytes is a bug of a pass or of the frame layout: a build
     // error where passes are verified (it is emitted in memmove order otherwise)
     if crate::rir::verify_passes_on() {
