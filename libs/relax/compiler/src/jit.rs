@@ -18083,7 +18083,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // unverified -> UNVERIFIED_LEFT. Those make the build incomplete (this run builds
                 // it again when the body comes), yet its code is valid as built: it is stored like
                 // any other build. A stored O3 entry is valid iff its inputs are unchanged -- the
-                // key (its own body, the loader build id) and the certificate of the slots it
+                // key (its own body, the codegen identity) and the certificate of the slots it
                 // inlined (record_deps) -- so a warm launch installs it as it is, whatever that
                 // launch has loaded or run yet: a callee kept as a call stays a call.
                 let mut incomplete = !unverified_left.is_empty();
