@@ -9720,14 +9720,22 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
         }
         let next = {
             let mut q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+            // each pop is its own statement: a lock guard in an `if let` chain's condition
+            // lives to the end of the chain (it was held across the wait below, and the owner
+            // waited for BORROW_QUEUE forever)
+            let borrowed = if q.is_empty() { BORROW_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).pop_front() } else { None };
+            let base = if q.is_empty() && borrowed.is_none() { O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).pop_front() } else { None };
+            let o1v = if q.is_empty() && borrowed.is_none() && base.is_none() && FIRST_PRESENT.load(Ordering::Acquire) {
+                O1V_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
+            } else { None };
             if !q.is_empty() {
                 Some((q.remove(0), false, false))
-            } else if let Some(x) = BORROW_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).pop_front() {
+            } else if let Some(x) = borrowed {
                 // (SPEC-V: base slots running their twins' code get their own)
                 Some((x, false, true))
-            } else if let Some(x) = O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).pop_front() {
+            } else if let Some(x) = base {
                 Some((x, false, false))
-            } else if let Some(x) = FIRST_PRESENT.load(Ordering::Acquire).then(|| O1V_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).pop_front()).flatten() {
+            } else if let Some(x) = o1v {
                 // verified O1 rebuilds last, and never before the first frame
                 Some((x, true, false))
             } else {
