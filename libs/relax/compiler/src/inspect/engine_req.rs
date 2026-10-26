@@ -114,12 +114,11 @@ pub fn post(text: &str) -> Result<String, String> {
     let pid = std::process::id();
     let seq = SEQ.fetch_add(1, Relaxed) + 1;
     let id = format!("{node}.{pid}.{seq}");
+    // the event's envelope already names the pid and app (and its own seq / at_ms)
     let fields = format!(
-        "\"id\":{},\"app\":{},\"node\":{},\"pid\":{},\"game\":{},\"summary\":{},\"details\":{},\"context\":{},\"route\":{},\"posted_ms\":{}",
+        "\"id\":{},\"node\":{},\"game\":{},\"summary\":{},\"details\":{},\"context\":{},\"route\":{},\"posted_ms\":{}",
         json_str(&id),
-        json_str(&app),
         json_str(&node),
-        pid,
         json_str(&game),
         json_str(&summary),
         json_str(&details),
@@ -132,7 +131,7 @@ pub fn post(text: &str) -> Result<String, String> {
         if q.len() >= KEEP_REQUESTS {
             q.pop_front();
         }
-        q.push_back(Request { seq, id: id.clone(), summary: summary.clone(), json: format!("{{\"seq\":{seq},{fields}}}") });
+        q.push_back(Request { seq, id: id.clone(), summary: summary.clone(), json: format!("{{\"seq\":{seq},\"app\":{},\"pid\":{pid},{fields}}}", json_str(&app)) });
     }
     record(&id, "posted", &summary, "");
     // the observation channel: `events`, `watch` and `--agent` see it like any other event
@@ -149,13 +148,19 @@ pub fn reply(id: &str, status: &str, message: &str) -> Result<u64, String> {
         Some(r) => r.summary.clone(),
         None => return Err(format!("no engine request {id} in this process")),
     };
-    let (seq, json) = record(id, status, &summary, &cut(message, MAX_MESSAGE));
-    super::events::emit("engine_reply", &format!("{id}#{seq}"), &json[1..json.len() - 1]);
+    let message = cut(message, MAX_MESSAGE);
+    let seq = record(id, status, &summary, &message);
+    super::events::emit("engine_reply", &format!("{id}#{seq}"), &event_fields(seq, id, status, &summary, &message));
     Ok(seq)
 }
 
-/// One record of the program's reply stream.
-fn record(id: &str, status: &str, summary: &str, message: &str) -> (u64, String) {
+/// A stream record as event fields (the envelope has its own `seq` and `at_ms`).
+fn event_fields(seq: u64, id: &str, status: &str, summary: &str, message: &str) -> String {
+    format!("\"id\":{},\"status\":{},\"summary\":{},\"message\":{},\"stream_seq\":{seq},\"wall_ms\":{}", json_str(id), json_str(status), json_str(summary), json_str(message), wall_ms())
+}
+
+/// One record of the program's reply stream; returns its seq.
+fn record(id: &str, status: &str, summary: &str, message: &str) -> u64 {
     let seq = SEQ.fetch_add(1, Relaxed) + 1;
     let json = format!(
         "{{\"seq\":{seq},\"id\":{},\"status\":{},\"summary\":{},\"message\":{},\"at_ms\":{}}}",
@@ -169,8 +174,8 @@ fn record(id: &str, status: &str, summary: &str, message: &str) -> (u64, String)
     if q.len() >= KEEP_REPLIES {
         q.pop_front();
     }
-    q.push_back(Reply { seq, json: json.clone() });
-    (seq, json)
+    q.push_back(Reply { seq, json });
+    seq
 }
 
 /// A live edit was applied to this process (`how`: `patched`, or `restart` when it applies by
@@ -180,8 +185,8 @@ pub fn code_update(how: &str, what: &str, changed: u64) {
         return;
     }
     let message = cut(&format!("{how}: {what} ({changed} item{})", if changed == 1 { "" } else { "s" }), MAX_MESSAGE);
-    let (seq, json) = record("", "code_update", "", &message);
-    super::events::emit("engine_code_update", &format!("code#{seq}"), &json[1..json.len() - 1]);
+    let seq = record("", "code_update", "", &message);
+    super::events::emit("engine_code_update", &format!("code#{seq}"), &event_fields(seq, "", "code_update", "", &message));
 }
 
 /// The replies after `after`, one JSON object per line.
