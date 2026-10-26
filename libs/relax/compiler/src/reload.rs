@@ -3918,7 +3918,7 @@ pub fn restart_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_restart_now" => __relax_restart_now as *const () as usize,
         b"__relax_live_stream" => __relax_live_stream as *const () as usize,
         b"__relax_live_log" => __relax_live_log as *const () as usize,
-        _ => return None,
+        _ => return crate::inspect::engine_req::symbol(name),
     })
 }
 
