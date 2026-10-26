@@ -8553,8 +8553,14 @@ pub unsafe fn export_rir(up: *mut Unit, id: u32, optimized: bool) -> Result<rela
         crate::wasm_export::O3Policy::All => true,
         crate::wasm_export::O3Policy::Hot => (trace_o3(&*up, id) || crate::wasm_export::o3_crate(&*up, id)) && crate::wasm_export::sampled_hot(id),
     };
+    // the closure's first pass ships O1 everywhere and notes the O3 candidates: their O3 builds
+    // wait until every shipped body is lowered (wasm_export::keep_closure), so the inliner's
+    // single-caller rule sees the module's references, not the trace's (a 74 KB parser step
+    // copied into its one traced caller while two O1 callers kept calling it)
+    let o3 = o3 && !crate::wasm_export::defer_o3(id);
     let o3_body = if o3 { export_o3_rir(up, id) } else { None };
-    if o3_body.is_some() {
+    let shipped_o3 = o3_body.is_some();
+    if shipped_o3 {
         crate::wasm_export::note_o3_body(id);
     }
     let u = &*up;
@@ -8574,12 +8580,33 @@ pub unsafe fn export_rir(up: *mut Unit, id: u32, optimized: bool) -> Result<rela
         while crate::wasm_export::shipping_fn_addresses(u, &mut f) {
             relax_backend::passes::simplify(&session.options, &mut f, ro, true, true);
         }
+        // an O1 body ships as the module's only code for it: the O3 folds that only remove
+        // code -- compares the value ranges decide (bounds checks of a loop's own index, a
+        // check a dominating one implies), compares of small value sets, adjacent constant
+        // stores merged -- run on it too
+        // (LLVM -Oz runs its correlated value propagation and InstCombine everywhere)
+        if !shipped_o3 && crate::wasm_export::o1_folds() {
+            if relax_codegen::ranges::fold_ranges(&session.options, &mut f) {
+                relax_backend::passes::simplify(&session.options, &mut f, ro, true, true);
+            }
+            if relax_codegen::opt::fold_small_sets(&mut f) {
+                relax_backend::passes::simplify(&session.options, &mut f, ro, true, true);
+            }
+            // constant stores side by side (zeroed fields, a tag and its payload's zeros): fewer, wider stores
+            relax_codegen::loops::merge_stores(&session.options, &mut f);
+        }
         relax_backend::passes::live_dce(&mut f);
         relax_backend::passes::dce(&mut f);
         // DCE ignores unreachable blocks; relayout physically removes them so
         // neither the linker nor the closure sees their residual instructions.
         relax_backend::passes::relayout(&mut f);
         f.verify().map_err(|e| format!("shipping RIR: {e}"))?;
+        // MAKEPAD_RUN_DUMP_SHIP=<name suffix | ~text>: the shipping RIR (what the module emits)
+        if let Ok(w) = std::env::var("MAKEPAD_RUN_DUMP_SHIP") {
+            if dump_rir_match(&f.name, &w) {
+                eprintln!("shipping {}", f.dump());
+            }
+        }
     }
     Ok(f)
 }
@@ -8676,6 +8703,21 @@ thread_local! {
     /// without O3 (`Func::full`: the whole O1 pipeline, Relax core's helpers inlined everywhere),
     /// its inline candidates too -- an AOT build, not a tier below a JIT's O3
     static EXPORT_FULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The O1 inliner's limits: a wasm export's shipping build takes its own (wasm_export::o1_inline_limits);
+/// MAKEPAD_RUN_O1_INLINE=hint,leaf,leaf_blocks,chain overrides every O1 build (tests of the inliner's
+/// callers under other limits: diff_fast, the tier fuzzer)
+/// (MAKEPAD_RUN_O1_INLINE_FN=a,b: ... only in callers whose name contains one of them: bisection)
+fn o1_inline_limits(options: &crate::options::Options, caller: &str) -> relax_codegen::opt::InlineLimits {
+    let lim = relax_codegen::opt::InlineLimits::tier0(options);
+    let lim = if export_full() { crate::wasm_export::o1_inline_limits(lim, "MAKEPAD_RUN_WASM_EXPORT_O1_INLINE") } else { lim };
+    static FNS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let fns = FNS.get_or_init(|| std::env::var("MAKEPAD_RUN_O1_INLINE_FN").map(|v| v.split(',').filter(|x| !x.is_empty()).map(String::from).collect()).unwrap_or_default());
+    if !fns.is_empty() && !fns.iter().any(|p| caller.contains(p.as_str())) {
+        return lim;
+    }
+    crate::wasm_export::o1_inline_limits(lim, "MAKEPAD_RUN_O1_INLINE")
 }
 
 fn export_full() -> bool {
@@ -8814,6 +8856,9 @@ fn note_slow_base(u: &Unit, id: u32) {
     if let Ok(mut g) = SLOW_BASE.try_lock() {
         if !g.contains(&id) {
             crate::zone_alloc::kept_with(|| g.push(id));
+            drop(g);
+            // an idle first worker polls once a second: it builds this now
+            w0_wake();
         }
     }
     TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime, &u.prog.session.options));
@@ -8829,8 +8874,16 @@ fn drain_slow_base() {
     }
     let ids = std::mem::take(&mut *SLOW_BASE.lock().unwrap_or_else(|e| e.into_inner()));
     let now = wall_ns();
+    // (counted code goes only with an install, a patch or a reclaim: none since the last look, no
+    // owner request)
+    static FORGET_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+    let code = COMPILED_FNS.load(Ordering::Relaxed) + TIER1_INSTALLS.load(Ordering::Relaxed) + PATCH_EPOCH.load(Ordering::Relaxed) + reclaim_generation();
     let forget = now.saturating_sub(LAST_FORGET.load(Ordering::Relaxed)) >= PGO_WORK_NS
+        && FORGET_SEEN.load(Ordering::Relaxed) != code
         && COUNTING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|e| e.parked);
+    if forget {
+        FORGET_SEEN.store(code, Ordering::Relaxed);
+    }
     let up = TIER_UNIT.load(Ordering::Acquire);
     let twins = !TWIN_PENDING.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
     if ids.is_empty() && !forget && !twins || up.is_null() {
@@ -10380,7 +10433,7 @@ unsafe fn tail_nocapture_facts(up: *mut Unit, id: u32, func: &mut relax_backend:
     if inline && !snap.is_empty() {
         let options = &(&*up).prog.session.options;
         let get = |c: u32| -> Option<(*const relax_backend::rir::Func, u8)> { snap.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const relax_backend::rir::Func, x.2)) };
-        let lim = if mode == RirMode::Baseline { relax_codegen::opt::InlineLimits::baseline() } else { relax_codegen::opt::InlineLimits::tier0(options) };
+        let lim = if mode == RirMode::Baseline { relax_codegen::opt::InlineLimits::baseline() } else { o1_inline_limits(options, &f.name) };
         relax_codegen::opt::inline_calls(options, f, id, &get, &|c| nounwind.iter().any(|x| x.0 == c && x.1), &lim);
     }
     relax_codegen::opt::demote_invokes(f, &|c| nounwind.iter().any(|x| x.0 == c && x.1));
@@ -10771,7 +10824,7 @@ fn optimize_rir_inner(options: &crate::options::Options, id: u32, prep: Prep) ->
         if cfg.inline {
             let get = |c: u32| -> Option<(*const relax_backend::rir::Func, u8)> { callees.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const relax_backend::rir::Func, x.2)) };
             let ti = relax_backend::stats::pass_clock();
-            inlined = relax_codegen::opt::inline_calls(options, func, id, &get, nounwind, &relax_codegen::opt::InlineLimits::tier0(options));
+            inlined = relax_codegen::opt::inline_calls(options, func, id, &get, nounwind, &o1_inline_limits(options, &func.name));
             relax_backend::stats::pass_time(5, ti);
         }
         static HIST_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -11378,6 +11431,8 @@ unsafe fn load_modules(up: *mut Unit, mods: &[u32], why: &str) {
         if !f.compiled { f.build_err = None; }
     }
     DEFERRED_LOADS.fetch_add(loaded as u64, Ordering::Relaxed);
+    // the live watcher watches the new files from now on
+    crate::reload::watch_kick();
     if std::env::var_os("MAKEPAD_RUN_DEFERRED_TRACE").is_some() {
         eprintln!("makepad-run deferred: {} loaded {} module(s) ({} defs, {} errored signatures reset) in {:.1} ms on {}{}: {}", why, loaded, defs.len(), resigned,
             (wall_ns() - t) as f64 / 1e6, if MAIN_TID.load(Ordering::Relaxed) == me() { "main" } else { "worker" },
@@ -12682,9 +12737,11 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
         let freqs = frequencies(0, func);
         for (c, rule) in relax_codegen::opt::inline_calls_ordered(options, func, id, get, prepared, single, nounwind, &limits, freqs.as_deref(), inline_stats.as_deref_mut()) {
             // a single-caller body moved into this fn: the second round's ceiling includes it
+            // and its own room (opt::single_room)
             if rule == relax_codegen::opt::RULE_SINGLE {
                 if let (Some(g), Some((p, _))) = (limits.growth_limit.as_mut(), get(c)) {
-                    *g = g.saturating_add(relax_codegen::opt::inst_count(unsafe { &*p }));
+                    let n = relax_codegen::opt::inst_count(unsafe { &*p });
+                    *g = g.saturating_add(n).saturating_add(relax_codegen::opt::single_room(options, n));
                 }
             }
             if !inlined.iter().any(|x| x.0 == c) {
@@ -13176,9 +13233,11 @@ fn progress_start() {
         let _k = crate::zone_alloc::kept();
         let _ = std::thread::Builder::new().name("run-progress".to_string()).spawn(|| {
             let mut last = std::time::Instant::now();
+            // every 100 ms while the state moves, once a second after 5 s without a change
+            let mut still = 0u32;
             while !TIER_STOP.load(Ordering::SeqCst) {
-                o3_progress_write(&mut last);
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                if o3_progress_write(&mut last) { still = 0 } else { still = still.saturating_add(1) }
+                std::thread::sleep(std::time::Duration::from_millis(if still >= 50 { 1000 } else { 100 }));
             }
         });
     });
@@ -13201,21 +13260,30 @@ pub(crate) fn o3_finished() -> u64 {
     TIER1_FINISHED.load(Ordering::Relaxed)
 }
 
-fn o3_progress_write(last: &mut std::time::Instant) {
+/// True when it wrote a changed state.
+fn o3_progress_write(last: &mut std::time::Instant) -> bool {
     static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let Some(path) = relax_session::phase::env_once(&PATH, "MAKEPAD_RUN_O3_PROGRESS") else { return };
+    let Some(path) = relax_session::phase::env_once(&PATH, "MAKEPAD_RUN_O3_PROGRESS") else { return false };
     if last.elapsed() < std::time::Duration::from_millis(100) {
-        return;
+        return false;
     }
     *last = std::time::Instant::now();
     // (PGO: slots in their counting window are O3 builds to come)
     let pending = tier_queue().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len()) + usize::from(startup_holds_tier1())
         + COUNTING.lock().map_or(0, |c| c.iter().filter(|e| !e.parked).count());
     let line = format!("{} {}\n", pending, TIER1_INSTALLS.load(Ordering::Relaxed));
+    // an unchanged state is not written again (a reader sees the same file)
+    static WRITTEN: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
+    let mut written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if *written == line {
+        return false;
+    }
     let tmp = format!("{}.tmp", path);
-    if std::fs::write(&tmp, line).is_ok() {
+    if std::fs::write(&tmp, &line).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
+    crate::zone_alloc::kept_with(|| *written = line);
+    true
 }
 
 fn sampler_thread() {
@@ -15240,6 +15308,35 @@ impl Drop for StartupCompile {
 // Recheck for every job: renewed foreground compilation immediately throttles new builds
 // back to worker zero. In-flight builds always finish and install, even during startup.
 const TIER1_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+/// The first O3 worker's poll once W0_QUIET polls in a row saw nothing move (w0_activity): its
+/// duties (verdict sweep, slow baseline, PGO windows, record encoding) have nothing new, and a
+/// queue push still wakes it at once. Parked PGO entries are looked at once a second anyway.
+const W0_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
+const W0_QUIET: u32 = 40;
+
+/// The first O3 worker is in its once-a-second polls (w0_wake wakes it; a busy one is not woken
+/// per entry: its 50 ms polls take the entries in batches).
+static W0_IDLING: AtomicBool = AtomicBool::new(false);
+
+fn w0_wake() {
+    if W0_IDLING.swap(false, Ordering::SeqCst) {
+        TIER_SLEEPERS.wake_one();
+    }
+}
+
+/// What the first O3 worker's polls serve: when none of it moves, they find nothing to do.
+fn w0_activity() -> [u64; 8] {
+    [
+        TIER_GEN.load(Ordering::Relaxed),
+        TIER1_FINISHED.load(Ordering::Relaxed),
+        crate::borrowck::lazy::RECORDED.load(Ordering::Relaxed),
+        PATCH_EPOCH.load(Ordering::Relaxed),
+        crate::reload::UNVERIFIED_PATCHES.load(Ordering::Relaxed) as u64,
+        SPECV_RELEASES.load(Ordering::Relaxed),
+        PENDING_RECORDS.load(Ordering::Relaxed) as u64,
+        (SLOW_BASE.lock().unwrap_or_else(|e| e.into_inner()).len() + TWIN_PENDING.lock().unwrap_or_else(|e| e.into_inner()).len() + COUNTING.lock().unwrap_or_else(|e| e.into_inner()).len()) as u64,
+    ]
+}
 fn tier1_workers_ready() -> bool {
     DEMAND_COMPILES.load(Ordering::SeqCst) == 0
         && wall_ns().saturating_sub(DEMAND_LAST.load(Ordering::SeqCst)) >= TIER1_POLL.as_nanos() as u64
@@ -15485,12 +15582,11 @@ impl Unit {
 // block weights. Counts live in this process only (no profile files).
 
 /// MAKEPAD_RUN_PGO=0: no counted tier (hot slots go straight to O3 with static frequencies; A/B).
-/// Never for a W32 web program (codegen web32.rs): it addresses only its window, and the block
-/// counters (profile::instrument) are host memory its masked loads/stores would miss.
+/// A W32 web program (codegen web32.rs) addresses only its window: its block counters live there
+/// (web32::alloc_counters), so a wasm export's O3 bodies are built from the trace's counts.
 fn pgo_on(options: &crate::options::Options) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_PGO").map_or(true, |v| v != "0")) && !options.no_block_freq && !t1prof_replay(options)
-        && relax_codegen::web32::cfg().is_none()
 }
 
 /// MAKEPAD_RUN_PGO_HOLD=1: counted code stays installed (no counting window ends): with
@@ -15774,7 +15870,12 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
         return false;
     };
     let n = rir.blocks.len();
-    let counters: &'static [AtomicU64] = crate::zone_alloc::kept_with(|| Box::leak((0..n).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice()));
+    // (a W32 program's code reaches only its window: its counters are window words)
+    let counters: &'static [AtomicU64] = if relax_codegen::web32::cfg().is_some() {
+        unsafe { std::slice::from_raw_parts(crate::web32::alloc_counters(n) as *const AtomicU64, n) }
+    } else {
+        crate::zone_alloc::kept_with(|| Box::leak((0..n).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice()))
+    };
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _arena = crate::zone_alloc::job("counted codegen", session.runtime.burst_arena);
         let mut func = (*rir).clone();
@@ -15832,6 +15933,8 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
                     let at = wall_ns();
                     COUNTING.lock().unwrap_or_else(|e| e.into_inner()).push(Counting { id, counters, weights, at, lukewarm, mark: (0, at), parked: false, credited: false, image: fell_back });
                 });
+                // the counted window starts: an idle first worker goes back to its PGO polls
+                w0_wake();
                 true
             }
             Err(_) => false,
@@ -15973,6 +16076,8 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
     ensure_altstack();
     lower_worker_priority(runtime);
     TIER_SLEEPERS.register(k);
+    // the first worker's idle look: what its polls serve, and polls in a row it stayed the same
+    let (mut w0_seen, mut w0_still) = (w0_activity(), 0u32);
     loop {
         if k == 0 {
             crate::lifeline::beat();
@@ -16012,13 +16117,24 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
                 // worker): the next push wakes it, no 50 ms polls of an idle app; the first worker
                 // polls on for the verdict sweep below
                 let parked = k != 0 && (q.is_empty() || k >= normal && !tier1_burst_admits(k - normal, q.len()));
-                // the first worker polls faster while the PGO counted window is open
-                let poll = if k == 0 && pgo_counting() { PGO_POLL } else { TIER1_POLL };
+                // the first worker polls faster while the PGO counted window is open, and once a
+                // second when nothing its polls serve has moved for W0_QUIET polls (an idle app)
+                let counting = k == 0 && pgo_counting();
                 // (the queue counter read under the lock: a push after it wakes this worker)
                 let seen = TIER_GEN.load(Ordering::SeqCst);
                 drop(q);
                 crate::zone_alloc::compiler_hand_back_idle();
                 let ready = || TIER_GEN.load(Ordering::SeqCst) != seen || TIER_STOP.load(Ordering::SeqCst);
+                // (the activity read takes other locks: after the queue's is dropped)
+                let poll = if counting {
+                    PGO_POLL
+                } else if k == 0 {
+                    let now = w0_activity();
+                    if now == w0_seen { w0_still = w0_still.saturating_add(1) } else { (w0_seen, w0_still) = (now, 0) }
+                    let idle = w0_still >= W0_QUIET;
+                    W0_IDLING.store(idle, Ordering::SeqCst);
+                    if idle { W0_IDLE } else { TIER1_POLL }
+                } else { TIER1_POLL };
                 if parked { TIER_SLEEPERS.sleep(k, ready) } else { TIER_SLEEPERS.sleep_timeout(k, poll, ready) }
                 if k == 0 {
                     crate::lifeline::beat();
@@ -19034,6 +19150,9 @@ unsafe fn o3_next_level(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &
                         relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(x), _, _) | relax_backend::rir::Inst::FnAddr(_, x) => x,
                         _ => continue,
                     };
+                    if *x != id && callees.len() >= 1024 && !seen.contains(x) && relax_codegen::opt::inline_trace(&fns[id as usize].name) {
+                        eprintln!("inline-trace-snap {}: out fn#{} {} (1024 candidates)", fns[id as usize].name, x, fns[*x as usize].name);
+                    }
                     if *x != id && callees.len() < 1024 && seen.insert(*x) {
                         callees.push(*x);
                         next.push(*x);
@@ -19101,17 +19220,30 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &cr
         t1prof_dump(&format!("root:{}", k), rir, 255);
         rir_hashes.push((String::new(), t1_norm_hash(rir) ^ root_unverified as u64));
     }
+    // MAKEPAD_RUN_INLINE_TRACE: the candidates this snapshot leaves out, and why (the inliner's
+    // trace names them only as fn#<slot>)
+    let trace = relax_codegen::opt::inline_trace(&fns[id as usize].name);
+    if trace {
+        eprintln!("inline-trace-snap {}: {} candidates", fns[id as usize].name, callees.len());
+    }
     for &c in callees {
-        let Some(v) = views.get(&c) else { continue };
+        let Some(v) = views.get(&c) else {
+            if trace { eprintln!("inline-trace-snap {}: out fn#{} {} (no view)", fns[id as usize].name, c, fns[c as usize].name); }
+            continue;
+        };
         let attrs = match callee_attrs(prog, tcx, fns, core, c, inline_all, true, root_unverified) {
             Some(a) if xcrate_unavailable(prog, fns, core, id, c) => (a & !relax_codegen::opt::ATTR_HINT) | relax_codegen::opt::ATTR_XCRATE,
             Some(a) => a,
             None => {
+                if trace { eprintln!("inline-trace-snap {}: out fn#{} {} (not inlinable)", fns[id as usize].name, c, fns[c as usize].name); }
                 if fns[c as usize].unverified.load(Ordering::Relaxed) { unverified_left.push(c); }
                 continue;
             }
         };
         let live_cold = !v.ran && v.uninlined;
+        if trace && v.rir.is_none() {
+            eprintln!("inline-trace-snap {}: out fn#{} {} (no RIR)", fns[id as usize].name, c, fns[c as usize].name);
+        }
         if let Some(r) = &v.rir {
             let cold = match t1key {
                 Some(k) => {
