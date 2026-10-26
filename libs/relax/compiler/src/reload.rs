@@ -3457,7 +3457,9 @@ pub(crate) fn watch_kick() {
 
 
 pub extern "C" fn __relax_live_edit_enabled() -> bool {
-    crate::layout::LIVE_SESSION.load(std::sync::atomic::Ordering::Relaxed)
+    crate::jit::host_boundary("__relax_live_edit_enabled", move || {
+        crate::layout::LIVE_SESSION.load(std::sync::atomic::Ordering::Relaxed)
+    })
 }
 
 /// The program's wake for its event loop (std::relax::on_patch): called from the watcher
@@ -3466,8 +3468,10 @@ pub extern "C" fn __relax_live_edit_enabled() -> bool {
 static PATCH_WAKER: relax_session::sync::Mutex<Option<(crate::domain::Callback, extern "C" fn())>> = relax_session::sync::Mutex::new(None);
 
 pub extern "C" fn __relax_on_patch(f: usize) {
-    let wake = if f == 0 { None } else { crate::domain::callback().map(|scope| (scope, unsafe { std::mem::transmute(f) })) };
-    *PATCH_WAKER.lock().unwrap_or_else(|e| e.into_inner()) = wake;
+    crate::jit::host_boundary("__relax_on_patch", move || {
+        let wake = if f == 0 { None } else { crate::domain::callback().map(|scope| (scope, unsafe { std::mem::transmute(f) })) };
+        *PATCH_WAKER.lock().unwrap_or_else(|e| e.into_inner()) = wake;
+    })
 }
 
 fn wake_program() {
@@ -3476,11 +3480,15 @@ fn wake_program() {
 }
 
 pub extern "C" fn __relax_restart_supported() {
-    RESTART_SUPPORTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    crate::jit::host_boundary("__relax_restart_supported", move || {
+        RESTART_SUPPORTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    })
 }
 
 pub extern "C" fn __relax_restart_requested() -> u32 {
-    RESTART_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) as u32
+    crate::jit::host_boundary("__relax_restart_requested", move || {
+        RESTART_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) as u32
+    })
 }
 
 fn copy_out(s: &str, buf: *mut u8, cap: usize) -> usize {
@@ -3492,69 +3500,75 @@ fn copy_out(s: &str, buf: *mut u8, cap: usize) -> usize {
 }
 
 pub extern "C" fn __relax_restart_reason(buf: *mut u8, cap: usize) -> usize {
-    let r = RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    copy_out(&r, buf, cap)
+    crate::jit::host_boundary("__relax_restart_reason", move || {
+        let r = RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        copy_out(&r, buf, cap)
+    })
 }
 
 /// The state the previous process left for this one (MAKEPAD_RUN_RESTORE), read once.
 pub extern "C" fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize {
-    if crate::domain::current_app_domain().is_some() && crate::domain::current_app_domain() == crate::run::app_domain() {
-        let state = DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner());
-        return state.as_ref().map_or(usize::MAX, |s| copy_out(s, buf, cap));
-    }
-    let up = jit::current_unit();
-    if up.is_null() { return usize::MAX; }
-    let session = unsafe { crate::jit::unit_session(up) };
-    let runtime = &session.runtime;
-    static STATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let s = STATE.get_or_init(|| {
-        let p = runtime.restore.clone()?;
-        let t = std::fs::read_to_string(&p).ok();
-        let _ = std::fs::remove_file(&p);
-        t
-    });
-    match s {
-        Some(t) => copy_out(t, buf, cap),
-        None => usize::MAX,
-    }
+    crate::jit::host_boundary("__relax_restored_state", move || {
+        if crate::domain::current_app_domain().is_some() && crate::domain::current_app_domain() == crate::run::app_domain() {
+            let state = DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner());
+            return state.as_ref().map_or(usize::MAX, |s| copy_out(s, buf, cap));
+        }
+        let up = jit::current_unit();
+        if up.is_null() { return usize::MAX; }
+        let session = unsafe { crate::jit::unit_session(up) };
+        let runtime = &session.runtime;
+        static STATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let s = STATE.get_or_init(|| {
+            let p = runtime.restore.clone()?;
+            let t = std::fs::read_to_string(&p).ok();
+            let _ = std::fs::remove_file(&p);
+            t
+        });
+        match s {
+            Some(t) => copy_out(t, buf, cap),
+            None => usize::MAX,
+        }
+    })
 }
 
 /// A hosted app queues a fresh domain with this state and returns for cooperative shutdown.
 /// A directly running program writes MAKEPAD_RUN_RESTORE and replaces its process as before.
 pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
-    let st = unsafe { if state.is_null() { &[][..] } else { std::slice::from_raw_parts(state, len) } };
-    // a rebuilt makepad waits: the process restarts into it (or this returns, said why)
-    if host::restart_now(st) { return; }
-    if crate::domain::current_app_domain().is_some() && crate::domain::current_app_domain() == crate::run::app_domain() {
-        *DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(String::from_utf8_lossy(st).into_owned());
-        RESTART_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
-        if let Err(e) = crate::run::relaunch() { eprintln!("makepad live: relaunch: {e}"); }
-        // The queued HAL quit runs the app's normal cleanup after this event returns.
-        return;
-    }
-    let dir = std::env::temp_dir().join(format!("relax-restart-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("state");
-    if let Err(e) = std::fs::write(&path, st) {
-        eprintln!("makepad live: restart: cannot write the state: {}", e);
-        return;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-        let Some(exe) = std::env::current_exe().ok() else { return };
-        // the run's end as at exit: compiles stop and this run's code goes into the disk cache,
-        // so the restarted run links it instead of compiling it again (exec skips the exit handlers)
-        crate::run::summary("restart");
-        // a restart is a clean end of this process (its transcript is not kept)
-        crate::tui::exit_code(0);
-        crate::tui::finish(false);
-        eprintln!("makepad live: restarting with the program's state ({})", RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()));
-        let t0 = RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed);
-        let e = std::process::Command::new(exe).args(&args[1..]).env("MAKEPAD_RUN_RESTORE", &path).env("MAKEPAD_RUN_RESTART_T0", t0.to_string()).exec();
-        eprintln!("makepad live: restart failed: {}", e);
-    }
+    crate::jit::host_boundary("__relax_restart_now", move || {
+        let st = unsafe { if state.is_null() { &[][..] } else { std::slice::from_raw_parts(state, len) } };
+        // a rebuilt makepad waits: the process restarts into it (or this returns, said why)
+        if host::restart_now(st) { return; }
+        if crate::domain::current_app_domain().is_some() && crate::domain::current_app_domain() == crate::run::app_domain() {
+            *DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(String::from_utf8_lossy(st).into_owned());
+            RESTART_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+            if let Err(e) = crate::run::relaunch() { eprintln!("makepad live: relaunch: {e}"); }
+            // The queued HAL quit runs the app's normal cleanup after this event returns.
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("relax-restart-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("state");
+        if let Err(e) = std::fs::write(&path, st) {
+            eprintln!("makepad live: restart: cannot write the state: {}", e);
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+            let Some(exe) = std::env::current_exe().ok() else { return };
+            // the run's end as at exit: compiles stop and this run's code goes into the disk cache,
+            // so the restarted run links it instead of compiling it again (exec skips the exit handlers)
+            crate::run::summary("restart");
+            // a restart is a clean end of this process (its transcript is not kept)
+            crate::tui::exit_code(0);
+            crate::tui::finish(false);
+            eprintln!("makepad live: restarting with the program's state ({})", RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()));
+            let t0 = RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed);
+            let e = std::process::Command::new(exe).args(&args[1..]).env("MAKEPAD_RUN_RESTORE", &path).env("MAKEPAD_RUN_RESTART_T0", t0.to_string()).exec();
+            eprintln!("makepad live: restart failed: {}", e);
+        }
+    })
 }
 
 /// makepad inspect: an edit that did not reach the running program is an agent's event (refused:
@@ -3903,11 +3917,13 @@ pub(crate) fn session_summary() -> Option<String> {
 
 /// std::relax::live_log: the program adds a record to the session log (the restart's kept/lost).
 pub extern "C" fn __relax_live_log(p: *const u8, n: usize) {
-    if p.is_null() {
-        return;
-    }
-    let s = unsafe { std::slice::from_raw_parts(p, n) };
-    live_log(&String::from_utf8_lossy(s));
+    crate::jit::host_boundary("__relax_live_log", move || {
+        if p.is_null() {
+            return;
+        }
+        let s = unsafe { std::slice::from_raw_parts(p, n) };
+        live_log(&String::from_utf8_lossy(s));
+    })
 }
 
 /// The restart entries by name (jit::loader_symbol).
@@ -4087,19 +4103,21 @@ unsafe fn drain_streams(up: *mut Unit) {
 }
 
 pub extern "C" fn __relax_live_stream(p: *const u8, n: usize, t: *const u8, len: usize) -> u32 {
-    if p.is_null() || t.is_null() { return 3; }
-    unsafe {
-        if jit::UNIT.is_null() { return 3; }
-        let Ok(path) = std::str::from_utf8(std::slice::from_raw_parts(p, n)) else { return 3; };
-        let o = apply_stream(jit::UNIT, path, std::slice::from_raw_parts(t, len).to_vec());
-        match o.rung {
-            Rung::Patch if o.changed == 0 && o.lines.iter().any(|l| l.starts_with("incomplete:")) => 1,
-            Rung::Patch => 0,
-            Rung::Restart => 2,
-            Rung::Refuse if o.lines.iter().any(|l| l.starts_with("incomplete:")) => 1,
-            Rung::Refuse => 3,
+    crate::jit::host_boundary("__relax_live_stream", move || {
+        if p.is_null() || t.is_null() { return 3; }
+        unsafe {
+            if jit::UNIT.is_null() { return 3; }
+            let Ok(path) = std::str::from_utf8(std::slice::from_raw_parts(p, n)) else { return 3; };
+            let o = apply_stream(jit::UNIT, path, std::slice::from_raw_parts(t, len).to_vec());
+            match o.rung {
+                Rung::Patch if o.changed == 0 && o.lines.iter().any(|l| l.starts_with("incomplete:")) => 1,
+                Rung::Patch => 0,
+                Rung::Restart => 2,
+                Rung::Refuse if o.lines.iter().any(|l| l.starts_with("incomplete:")) => 1,
+                Rung::Refuse => 3,
+            }
         }
-    }
+    })
 }
 
 // ------------------------------------------------------------------ the live driver in apps

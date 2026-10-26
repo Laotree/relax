@@ -1646,20 +1646,22 @@ const FORK_PRECOMPILE_MAX: usize = 4096;
 /// built. A forked child runs only code built before the fork (forkexec.rs).
 #[cfg(unix)]
 pub(crate) extern "C" fn relax_precompile(addr: u64) -> u64 {
-    let _keep = os::proc::KeepLastError::new();
-    let up = unsafe { UNIT };
-    if up.is_null() || addr == 0 || crate::forkexec::exec_child() {
-        return 0;
-    }
-    ensure_altstack();
-    let root = owner::publish(|| unsafe {
-        let u = &*up;
-        u.find_fn(addr).or_else(|| (0..2).find_map(|k| u.slots.find(k, addr).map(|x| x.0))).filter(|&id| (id as usize) < u.fns.len())
-    });
-    match root {
-        Some(root) => precompile_from(root),
-        None => 0,
-    }
+    crate::jit::host_boundary("relax_precompile", move || {
+        let _keep = os::proc::KeepLastError::new();
+        let up = unsafe { UNIT };
+        if up.is_null() || addr == 0 || crate::forkexec::exec_child() {
+            return 0;
+        }
+        ensure_altstack();
+        let root = owner::publish(|| unsafe {
+            let u = &*up;
+            u.find_fn(addr).or_else(|| (0..2).find_map(|k| u.slots.find(k, addr).map(|x| x.0))).filter(|&id| (id as usize) < u.fns.len())
+        });
+        match root {
+            Some(root) => precompile_from(root),
+            None => 0,
+        }
+    })
 }
 
 /// `relax_precompile` from slot `root`.
@@ -2475,6 +2477,17 @@ pub(crate) fn payload_text(p: &(dyn std::any::Any + Send)) -> String {
         return "the process is ending (ExitParked)".to_string();
     }
     "(a panic payload of another type)".to_string()
+}
+
+/// Runs the body of a native entry JIT code calls (rt_fn!, and the `extern "C"` hooks std::relax
+/// and the runtime glue call) so that a native panic never unwinds into the JIT frames above it:
+/// rt_boundary_panic.
+#[inline(always)]
+pub(crate) fn host_boundary<R>(entry: &'static str, f: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(p) => rt_boundary_panic(entry, p),
+    }
 }
 
 /// The frame pointer of this native frame (frame pointers are kept on every target Relax runs on).
@@ -7412,8 +7425,9 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
             (Compiled::Back(w), w0) => (w, w0),
         };
         let done = work.run();
+        let in_flight = done.slots.clone();
         let t = wall_ns();
-        let r = owner::publish(|| {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner::publish(|| {
             let t1 = wall_ns();
             SPLIT_NS[2].fetch_add(t1 - t, Ordering::Relaxed);
             main_rec(|r| r.ns[4] += t1 - t);
@@ -7423,7 +7437,21 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
                 compile_note(up, id, w0);
             }
             r
-        });
+        })));
+        let r = match r {
+            Ok(r) => r,
+            Err(p) => {
+                // the finish failed: its slots are no longer in flight (else the next call of any
+                // of them waits for a build that never ends), then the failure goes on to rt_compile
+                owner::publish(|| {
+                    let u = &mut *up;
+                    for &x in &in_flight {
+                        u.fns[x as usize].inflight = false;
+                    }
+                });
+                std::panic::resume_unwind(p)
+            }
+        };
         match r {
             Split::Installed(a) => return a,
             Split::Restart => continue,
@@ -18732,41 +18760,43 @@ pub fn first_present_seen() -> bool { FIRST_PRESENT.load(Ordering::Acquire) }
 
 /// Notify the loader that the application or its embedder presented a frame.
 pub extern "C" fn relax_first_present() {
-    crate::domain::first_present();
-    if !FIRST_PRESENT.swap(true, Ordering::AcqRel) {
-        if EXEC_CHECK.load(Ordering::Relaxed) {
-            exec_check_now("first frame");
+    crate::jit::host_boundary("relax_first_present", move || {
+        crate::domain::first_present();
+        if !FIRST_PRESENT.swap(true, Ordering::AcqRel) {
+            if EXEC_CHECK.load(Ordering::Relaxed) {
+                exec_check_now("first frame");
+            }
+            FIRST_PRESENT_NS.store(wall_ns(), Ordering::Release);
+            // burst O3 workers wait for the present (tier1_burst_admits)
+            tier_wake_all();
+            for i in 0..8 { AHEAD_AT_PRESENT[i].store(AHEAD_STATS[i].load(Ordering::Relaxed), Ordering::Relaxed); }
+            owner::pure_mark_present();
+            crate::solver_work::report();
+            relax_codegen::exec_census::first_present();
+            crate::tcx::Tcx::report_declaration_counters();
+            if profile_path().is_some() { crate::exec_profile::first_present(); }
+            // the startup manifest's window ends 1 s after the first present at the latest, so the
+            // run's warm record is written soon after it (run.rs), not 5 s after main
+            ORDER_UNTIL_NS.fetch_min(wall_ns() + 1_000_000_000, Ordering::Relaxed);
+            crate::tui::finish(true);
+            crate::tui::print_slowest();
+            relax_codegen::fncost::mark("first present");
+            o2_release_later();
+            if o2_trace() {
+                let n = |k: usize| O2_STATS[k].load(Ordering::Relaxed);
+                let hit = BASE.lock().map_or(0, |g| g.hit.len());
+                eprintln!("makepad-run O2 at first present: {} installed ({:.1} ms worker cpu), {} dropped; main thread waited {:.2} ms in {} unit-lock waits on the O2 worker; {} baseline slots sampled (queued)", n(0), n(1) as f64 / 1e6, n(2), n(3) as f64 / 1e6, n(4), hit);
+            }
+            relax_codegen::warm::first_present();
+            // the boot's crate records and front graph (cold front end: queued, not written, at load)
+            crate::cache::start_deferred_front();
+            if let Some(t) = STARTUP_THREAD.get() {
+                t.unpark();
+            }
+            relax_codegen::exec_census::report();
+            if profile_path().is_some() { crate::exec_profile::report(true); }
         }
-        FIRST_PRESENT_NS.store(wall_ns(), Ordering::Release);
-        // burst O3 workers wait for the present (tier1_burst_admits)
-        tier_wake_all();
-        for i in 0..8 { AHEAD_AT_PRESENT[i].store(AHEAD_STATS[i].load(Ordering::Relaxed), Ordering::Relaxed); }
-        owner::pure_mark_present();
-        crate::solver_work::report();
-        relax_codegen::exec_census::first_present();
-        crate::tcx::Tcx::report_declaration_counters();
-        if profile_path().is_some() { crate::exec_profile::first_present(); }
-        // the startup manifest's window ends 1 s after the first present at the latest, so the
-        // run's warm record is written soon after it (run.rs), not 5 s after main
-        ORDER_UNTIL_NS.fetch_min(wall_ns() + 1_000_000_000, Ordering::Relaxed);
-        crate::tui::finish(true);
-        crate::tui::print_slowest();
-        relax_codegen::fncost::mark("first present");
-        o2_release_later();
-        if o2_trace() {
-            let n = |k: usize| O2_STATS[k].load(Ordering::Relaxed);
-            let hit = BASE.lock().map_or(0, |g| g.hit.len());
-            eprintln!("makepad-run O2 at first present: {} installed ({:.1} ms worker cpu), {} dropped; main thread waited {:.2} ms in {} unit-lock waits on the O2 worker; {} baseline slots sampled (queued)", n(0), n(1) as f64 / 1e6, n(2), n(3) as f64 / 1e6, n(4), hit);
-        }
-        relax_codegen::warm::first_present();
-        // the boot's crate records and front graph (cold front end: queued, not written, at load)
-        crate::cache::start_deferred_front();
-        if let Some(t) = STARTUP_THREAD.get() {
-            t.unpark();
-        }
-        relax_codegen::exec_census::report();
-        if profile_path().is_some() { crate::exec_profile::report(true); }
-    }
+    })
 }
 
 /// Deferred cache records encoded per publish (rule I-PUB: bounded by an item count). A publish is
@@ -20453,7 +20483,9 @@ pub fn allocator_swap(phase: u32) {
 static SWAP_T0: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn relax_allocator_swap(phase: u32) {
-    allocator_swap(phase);
+    crate::jit::host_boundary("relax_allocator_swap", move || {
+        allocator_swap(phase);
+    })
 }
 
 /// What `makepad run` does at exit (its summary: background compilers stopped, cache written);
@@ -20593,33 +20625,37 @@ crate::memo_local! {
 /// std::relax::guard: enters a guarded call (faults inside it are contained), with a deadline
 /// in ms (0: none) after which the hang watchdog unwinds the call. Returns the guard deadline token.
 pub extern "C" fn __relax_guard_enter(deadline_ms: u64) -> u64 {
-    GUARD_DEPTH.with(|g| g.set(g.get() + 1));
-    let m = crate::modules::guard_mark();
-    GUARD_MARKS.with(|g| g.borrow_mut().push(m));
-    watchdog(deadline_ms)
+    crate::jit::host_boundary("__relax_guard_enter", move || {
+        GUARD_DEPTH.with(|g| g.set(g.get() + 1));
+        let m = crate::modules::guard_mark();
+        GUARD_MARKS.with(|g| g.borrow_mut().push(m));
+        watchdog(deadline_ms)
+    })
 }
 
 pub extern "C" fn __relax_guard_leave(token: u64) {
-    GUARD_DEPTH.with(|g| g.set(g.get().saturating_sub(1)));
-    // the sandbox state as it was at the guard's start (a fault or deadline left no wrapper)
-    if let Some(m) = GUARD_MARKS.with(|g| g.borrow_mut().pop()) {
-        crate::modules::guard_reset(m);
-    }
-    watchdog_remove(token);
-    if WATCHDOG_EXPIRED.with(|t| t.get() != 0) {
-        // The nearest recovery point belonged to an inner guard. It has now restored
-        // its arena and deadline stack; continue to the guard whose deadline expired.
-        // This uses the same contained exit as the watchdog, without skipping guard
-        // bookkeeping or falsely returning an inner timeout to its caller.
-        PANIC.with(|p| *p.borrow_mut() = Some(PanicInfo {
-            kind: "hang".to_string(), message: "watchdog: the call did not return in time".to_string(),
-            site: u64::MAX, frames: Vec::new(), fault_addr: 0, location: String::new(),
-        }));
-        unsafe {
-            let leave: rt_fn_ty!(fn(*mut u64, u64) -> !) = std::mem::transmute((&*UNIT).leave as usize);
-            leave(ctx_ptr(), 3)
+    crate::jit::host_boundary("__relax_guard_leave", move || {
+        GUARD_DEPTH.with(|g| g.set(g.get().saturating_sub(1)));
+        // the sandbox state as it was at the guard's start (a fault or deadline left no wrapper)
+        if let Some(m) = GUARD_MARKS.with(|g| g.borrow_mut().pop()) {
+            crate::modules::guard_reset(m);
         }
-    }
+        watchdog_remove(token);
+        if WATCHDOG_EXPIRED.with(|t| t.get() != 0) {
+            // The nearest recovery point belonged to an inner guard. It has now restored
+            // its arena and deadline stack; continue to the guard whose deadline expired.
+            // This uses the same contained exit as the watchdog, without skipping guard
+            // bookkeeping or falsely returning an inner timeout to its caller.
+            PANIC.with(|p| *p.borrow_mut() = Some(PanicInfo {
+                kind: "hang".to_string(), message: "watchdog: the call did not return in time".to_string(),
+                site: u64::MAX, frames: Vec::new(), fault_addr: 0, location: String::new(),
+            }));
+            unsafe {
+                let leave: rt_fn_ty!(fn(*mut u64, u64) -> !) = std::mem::transmute((&*UNIT).leave as usize);
+                leave(ctx_ptr(), 3)
+            }
+        }
+    })
 }
 
 /// The unit the program runs in (run-time module loading, modules.rs).
@@ -20652,13 +20688,15 @@ extern "system" fn relax_get_proc_address(module: os::win32::HANDLE, name: *cons
 }
 
 extern "C" fn relax_dlsym(handle: *mut u8, name: *const u8) -> *mut u8 {
-    if !name.is_null() {
-        let n = unsafe { std::ffi::CStr::from_ptr(name as *const std::ffi::c_char) }.to_bytes();
-        if let Some(a) = loader_symbol(n) {
-            return a as *mut u8;
+    crate::jit::host_boundary("relax_dlsym", move || {
+        if !name.is_null() {
+            let n = unsafe { std::ffi::CStr::from_ptr(name as *const std::ffi::c_char) }.to_bytes();
+            if let Some(a) = loader_symbol(n) {
+                return a as *mut u8;
+            }
         }
-    }
-    unsafe { os::proc::lookup(handle, name) }
+        unsafe { os::proc::lookup(handle, name) }
+    })
 }
 
 
@@ -23808,37 +23846,41 @@ fn with_rt<R>(f: impl FnOnce(&mut RealTime) -> R) -> R {
 /// read during this call), the reach is compiled in owner steps: the caller does not wait for it.
 /// The ticket (0: nothing to wait for) is done when __relax_realtime_ready says so.
 extern "C" fn __relax_realtime(root: usize, data: usize, meta: usize, wake: usize) -> u64 {
-    let up = unsafe { UNIT };
-    if up.is_null() || !realtime_on() {
-        return 0;
-    }
-    let ticket = RT_TICKET.fetch_add(1, Ordering::AcqRel) + 1;
-    let scope = crate::domain::callback();
-    let due = wall_ns() + rt_wait_ns();
-    crate::zone_alloc::kept_with(|| RT_DUE.lock().unwrap_or_else(|e| e.into_inner()).push((ticket, due)));
-    // the wake also comes when the ticket is due (the reach may still run)
-    if wake != 0 {
-        let wait = rt_wait_ns();
-        let _ = std::thread::Builder::new().name("run-rt-wake".into()).spawn(move || {
-            std::thread::sleep(std::time::Duration::from_nanos(wait));
-            if RT_DONE.load(Ordering::Acquire) < ticket {
-                if rt_trace() {
-                    eprintln!("makepad-run rt: ticket {} due after {} ms with the reach still running: the callback starts now", ticket, wait / 1_000_000);
+    crate::jit::host_boundary("__relax_realtime", move || {
+        let up = unsafe { UNIT };
+        if up.is_null() || !realtime_on() {
+            return 0;
+        }
+        let ticket = RT_TICKET.fetch_add(1, Ordering::AcqRel) + 1;
+        let scope = crate::domain::callback();
+        let due = wall_ns() + rt_wait_ns();
+        crate::zone_alloc::kept_with(|| RT_DUE.lock().unwrap_or_else(|e| e.into_inner()).push((ticket, due)));
+        // the wake also comes when the ticket is due (the reach may still run)
+        if wake != 0 {
+            let wait = rt_wait_ns();
+            let _ = std::thread::Builder::new().name("run-rt-wake".into()).spawn(move || {
+                std::thread::sleep(std::time::Duration::from_nanos(wait));
+                if RT_DONE.load(Ordering::Acquire) < ticket {
+                    if rt_trace() {
+                        eprintln!("makepad-run rt: ticket {} due after {} ms with the reach still running: the callback starts now", ticket, wait / 1_000_000);
+                    }
+                    call_wake(scope, wake);
                 }
-                call_wake(scope, wake);
-            }
-        });
-    }
-    let upn = up as usize;
-    owner::call(owner::Class::Program, move || unsafe { realtime_mark(upn as *mut Unit, root as u64, data as u64, meta as u64, ticket, scope, wake) });
-    ticket
+            });
+        }
+        let upn = up as usize;
+        owner::call(owner::Class::Program, move || unsafe { realtime_mark(upn as *mut Unit, root as u64, data as u64, meta as u64, ticket, scope, wake) });
+        ticket
+    })
 }
 
 /// std::relax::realtime's ticket is ready: everything its mark reaches is compiled, or the caller
 /// waited RT_WAIT_NS for it (audio starts promptly; what is not compiled yet then compiles on its
 /// first call there, reported: a click beats no audio).
 extern "C" fn __relax_realtime_ready(ticket: u64) -> bool {
-    RT_DONE.load(Ordering::Acquire) >= ticket || RT_DUE.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(t, at)| t == ticket && wall_ns() >= at)
+    crate::jit::host_boundary("__relax_realtime_ready", move || {
+        RT_DONE.load(Ordering::Acquire) >= ticket || RT_DUE.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(t, at)| t == ticket && wall_ns() >= at)
+    })
 }
 
 /// How long a real-time callback waits for its code at most (MAKEPAD_RUN_RT_WAIT_MS, default 300).

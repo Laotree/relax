@@ -9,7 +9,7 @@
 /// A native panic never leaves an entry: the JIT frames above it have no native unwind tables, so
 /// the unwinder's search ends at them (_URC_END_OF_STACK: "failed to initiate panic, error 5") and
 /// the process aborts without a message. Each entry runs its body under catch_unwind and turns a
-/// panic into a Relax panic of the JIT code that called it (jit.rs rt_boundary_panic: printed with
+/// panic into a Relax panic of the JIT code that called it (jit.rs host_boundary: printed with
 /// its payload, then unwound to that code's recovery point). `leaf fn` declares an entry that
 /// cannot panic (pure arithmetic and memory moves on the hot paths): no guard.
 #[cfg(target_arch = "x86_64")]
@@ -29,10 +29,7 @@ macro_rules! rt_fn_abi {
     };
     ($abi:literal $(#[$m:meta])* $v:vis fn $name:ident ($($a:ident : $t:ty),* $(,)?) $(-> $r:ty)? $body:block) => {
         $(#[$m])* $v extern $abi fn $name($($a: $t),*) $(-> $r)? {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || $body)) {
-                Ok(r) => r,
-                Err(p) => crate::jit::rt_boundary_panic(stringify!($name), p),
-            }
+            crate::jit::host_boundary(stringify!($name), move || $body)
         }
     };
 }
