@@ -8796,7 +8796,7 @@ fn o2_drop(why: usize, up: *mut Unit, id: u32) {
     O2_STATS[2].fetch_add(1, Ordering::Relaxed);
     O2_DROPS[why].fetch_add(1, Ordering::Relaxed);
     if o2_trace() {
-        let name = if up.is_null() { String::new() } else { unsafe { (&*up).fns.get(id as usize).map(|f| f.name.to_string()).unwrap_or_default() } };
+        let name = if up.is_null() { String::new() } else { unsafe { let u = &*up; if (id as usize) < u.fns.len() { u.fns[id as usize].name.to_string() } else { String::new() } } };
         eprintln!("makepad-run O2: #{} {} dropped: {}", id, name, O2_DROP_NAMES[why]);
     }
 }
@@ -8814,12 +8814,13 @@ fn o2_take_dropped(up: *mut Unit, id: u32) {
         let (name, sname, skey) = if up.is_null() { Default::default() } else {
             owner::publish(|| unsafe {
                 let u = &*up;
-                let n = |x: u32| u.fns.get(x as usize).map(|f| f.name.to_string()).unwrap_or_default();
-                let k = u.fns.get(slot as usize).map(|f| match f.key { FnKey::Inst(..) => "inst", FnKey::Closure(..) => "closure", FnKey::Plain(_) => "twin", FnKey::Glue(..) => "glue", _ => "other" }).unwrap_or("");
+                let n = |x: u32| if (x as usize) < u.fns.len() { u.fns[x as usize].name.to_string() } else { String::new() };
+                let k = if (slot as usize) < u.fns.len() { match u.fns[slot as usize].key { FnKey::Inst(..) => "inst", FnKey::Closure(..) => "closure", FnKey::Plain(_) => "twin", FnKey::Glue(..) => "glue", _ => "other" } } else { "" };
                 (n(id), n(slot), k)
             })
         };
-        eprintln!("makepad-run O2: #{} {} dropped: take {} {} (slot #{} {} {})", id, name, TD_NAMES[td as usize], if td == TD_FRONT { PREFRONT_FAIL_NAMES[af as usize] } else { "" }, slot, skey, sname);
+        let at = if af == AF_NEEDS_UNIT { NEEDS_UNIT_AT.try_with(|a| a.get()).ok().flatten().map(|l| format!(" at {}:{}", l.file(), l.line())).unwrap_or_default() } else { String::new() };
+        eprintln!("makepad-run O2: #{} {} dropped: take {} {}{} (slot #{} {} {})", id, name, TD_NAMES[td as usize], if td == TD_FRONT { PREFRONT_FAIL_NAMES[af as usize] } else { "" }, at, slot, skey, sname);
     }
 }
 
@@ -9508,7 +9509,7 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
                             job_sleep(TIER1_POLL);
                         }
                     }
-                    let b = take_prefronted(&front, || live().and_then(|up| if o1 { o1v_begin(up, id) } else if borrowed { borrow_begin(up, id) } else { o2_begin(up, id) }.map(|w| (up, w))));
+                    let b = take_prefronted(&front, !o1, || live().and_then(|up| if o1 { o1v_begin(up, id) } else if borrowed { borrow_begin(up, id) } else { o2_begin(up, id) }.map(|w| (up, w))));
                     if b.is_none() {
                         if o1 { crate::cache::warm_count::add(crate::cache::warm_count::O1V_DROPPED, 1) } else { o2_take_dropped(live().unwrap_or(std::ptr::null_mut()), id) }
                     }
@@ -9655,7 +9656,7 @@ impl O2Work {
 unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
     let O2Done { id, epoch, snapshot, o1, t0, built, done } = d;
     use crate::cache::warm_count as wc;
-    let dropped = |why: usize| if o1 { wc::add(wc::O1V_DROPPED, 1) } else { o2_drop(why, up, id) };
+    let dropped = move |why: usize| if o1 { wc::add(wc::O1V_DROPPED, 1) } else { o2_drop(why, up, id) };
     let stale = PATCH_EPOCH.load(Ordering::SeqCst) != epoch;
     if !stale {
         // the inline candidates' RIR, where no program thread built it meanwhile
@@ -10767,7 +10768,10 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     if owner::bailing() {
         bail_for_fronts(Vec::new());
     }
-    give_back.2 = None;
+    // (a later bail of the same take gives it back too: TakenBack)
+    if let Some(f) = give_back.2.take() {
+        TakenBack::note(up, id, f);
+    }
     let u = &*up;
     Ok((Prep { func, cfg, callees: snap, ro: u.ro_reader(), relayout, name, deferred, facts }, prep_ns))
 }
@@ -15010,7 +15014,7 @@ unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt]
                 (&*up).fns[c as usize].hot_hint.store(true, Ordering::Relaxed);
                 (&*up).front.clone()
             });
-            let Some(w) = take_prefronted(&front, || o2_begin(up, c)).unwrap_or_else(|| { o2_take_dropped(up, c); None }) else { continue };
+            let Some(w) = take_prefronted(&front, true, || o2_begin(up, c)).unwrap_or_else(|| { o2_take_dropped(up, c); None }) else { continue };
             let done = w.run();
             if let Ok(Ok((_, _, cc))) = &done.built {
                 todo.extend(calls(&cc.relocs));
@@ -16239,7 +16243,7 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
             }
         }
     }
-    let begin = take_prefronted(&front, || {
+    let begin = take_prefronted(&front, false, || {
         let u = &mut *up;
         if !u.o3_allowed(id) {
             return None;
@@ -21041,7 +21045,7 @@ unsafe fn spec_build(up: *mut Unit, id: u32) -> bool {
     };
     let Some(front) = owner::publish(|| fresh(up).then(|| (&*up).front.clone())) else { return true };
     prefront_slot(&front, id);
-    let b = take_prefronted(&front, || {
+    let b = take_prefronted(&front, false, || {
         if !fresh(up) {
             return Begin::Done(Split::Spec);
         }
@@ -21214,36 +21218,68 @@ pub static PREFRONTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// The take of a background build (rules I-PUB, I-PURE): `take` runs as a publish that may run no
 /// front; a slot it needed a front for is fronted here (`prefront_slot`) and `take` runs again.
-/// None: the build bails (a front lowering ahead cannot make, an initializer, JIT code, a wait;
-/// counted in owner::BAILS), and is dropped whole.
+/// A slot is fronted again when its front failed only for constants the owner evaluates between
+/// two requests (want_notes), or when its lowering was taken and is needed again (each slot at
+/// most FRONT_TRIES times). `leave_out` (O2 builds): once an inline candidate's front cannot be
+/// made, a last round builds without the candidates that still need fronts (they stay calls,
+/// FRONTS_DONE, as O3's snapshot leaves them out). None: the build bails (a front lowering ahead
+/// cannot make, an initializer, JIT code, a wait; counted in owner::BAILS and, with its cause, in
+/// TAKE_DROP), and is dropped whole.
 #[track_caller]
-fn take_prefronted<R>(front: &FrontShared, mut take: impl FnMut() -> R) -> Option<R> {
-    let mut fronted: Vec<u32> = Vec::new();
+fn take_prefronted<R>(front: &FrontShared, leave_out: bool, mut take: impl FnMut() -> R) -> Option<R> {
+    let mut fronted: Vec<(u32, u8)> = Vec::new();
     let mut why = (TD_ROUNDS, AF_OK, u32::MAX);
+    let mut last = false;
     for _ in 0..PREFRONT_ROUNDS {
-        match owner::publish_or_bail(&mut take) {
+        let r = owner::publish_or_bail(|| {
+            // (on the owner, for this take only) lowerings this round takes go back if it bails
+            let _back = TakenBack::start();
+            let _done = FrontsDone::set(last);
+            let r = take();
+            TakenBack::keep();
+            r
+        });
+        match r {
             Ok(r) => return Some(r),
             Err(b) => {
                 if b.slots.is_empty() {
                     why = (match b.what { "front" => TD_NO_SLOT, "initializer" => TD_INITIALIZER, "jit" => TD_JIT, _ => TD_WAIT }, AF_OK, u32::MAX);
                     break;
                 }
-                // a slot fronted already and needed again: lowering ahead could not make it
-                if let Some(&s) = b.slots.iter().find(|s| fronted.contains(s)) {
-                    why = (TD_REFRONT, AF_OK, s);
+                // (the last round left out the candidates: what still bails is the root's own)
+                if last {
                     break;
                 }
                 let mut failed = None;
                 for s in b.slots {
-                    fronted.push(s);
+                    let tries = match fronted.iter_mut().find(|x| x.0 == s) {
+                        Some(x) => { x.1 += 1; x.1 }
+                        None => { fronted.push((s, 1)); 1 }
+                    };
+                    if tries > FRONT_TRIES {
+                        failed.get_or_insert((s, AF_OK, false));
+                        why = (TD_REFRONT, AF_OK, s);
+                        continue;
+                    }
                     let _ = PREFRONT_WHY.try_with(|w| w.set(AF_OK));
-                    if !prefront_slot(front, s) && failed.is_none() {
-                        failed = Some((s, PREFRONT_WHY.try_with(|w| w.get()).unwrap_or(AF_OK)));
+                    let notes = want_notes();
+                    if !prefront_slot(front, s) {
+                        let af = PREFRONT_WHY.try_with(|w| w.get()).unwrap_or(AF_OK);
+                        // constants noted for the owner's drain: the next round's front can make it
+                        let retry = af == AF_NEEDS_UNIT && want_notes() != notes;
+                        if !retry && failed.is_none() {
+                            failed = Some((s, af, true));
+                        }
                     }
                 }
-                if let Some((s, af)) = failed {
-                    why = (TD_FRONT, af, s);
-                    break;
+                if let Some((s, af, front_failed)) = failed {
+                    if front_failed {
+                        why = (TD_FRONT, af, s);
+                    }
+                    if !leave_out {
+                        break;
+                    }
+                    last = true;
                 }
             }
         }
@@ -21251,6 +21287,59 @@ fn take_prefronted<R>(front: &FrontShared, mut take: impl FnMut() -> R) -> Optio
     owner::BAILS[owner::BAIL_DROPPED].fetch_add(1, Ordering::Relaxed);
     let _ = TAKE_DROP.try_with(|d| d.set(why));
     None
+}
+
+/// Fronts of one slot a take may ask for (take_prefronted)
+const FRONT_TRIES: u8 = 3;
+
+/// (owner, inside a take) FRONTS_DONE for this take only
+struct FrontsDone(bool);
+impl FrontsDone {
+    fn set(on: bool) -> FrontsDone {
+        FrontsDone(FRONTS_DONE.with(|f| f.replace(on)))
+    }
+}
+impl Drop for FrontsDone {
+    fn drop(&mut self) {
+        let _ = FRONTS_DONE.try_with(|f| f.set(self.0));
+    }
+}
+
+thread_local! {
+    /// (owner, inside a take) the lowerings ahead its preparations took and finished with (an inline
+    /// candidate's, made by a front of an earlier round): a take that bails after them gives them
+    /// back (give_back_lowered), so the next round takes them again instead of needing their fronts
+    /// once more (warm race: 600 of 1000 O2 builds dropped per session on "fronted again")
+    /// (None: no take_prefronted take runs)
+    static TAKEN_BACK: std::cell::RefCell<Option<Vec<(*mut Unit, u32, relax_backend::rir::Func)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// TAKEN_BACK for one take: what is left in it when the take ends gives back (a bail's unwind)
+struct TakenBack;
+impl TakenBack {
+    fn start() -> TakenBack {
+        let _ = TAKEN_BACK.try_with(|t| *t.borrow_mut() = Some(Vec::new()));
+        TakenBack
+    }
+    /// the take ends without bailing: its lowerings stay taken
+    fn keep() {
+        let _ = TAKEN_BACK.try_with(|t| *t.borrow_mut() = None);
+    }
+    /// a preparation inside a take finished with lowering `func` of slot `id` (taken ahead)
+    fn note(up: *mut Unit, id: u32, func: relax_backend::rir::Func) {
+        let _ = TAKEN_BACK.try_with(|t| if let Some(v) = t.borrow_mut().as_mut() { v.push((up, id, func)) });
+    }
+}
+impl Drop for TakenBack {
+    fn drop(&mut self) {
+        let back = TAKEN_BACK.try_with(|t| t.borrow_mut().take()).ok().flatten().unwrap_or_default();
+        for (up, id, func) in back {
+            // (a candidate whose RIR the take stored keeps that: nothing to take again)
+            if unsafe { (&*up).fns[id as usize].rir.is_none() } {
+                give_back_lowered(unsafe { &*up }, id, func);
+            }
+        }
+    }
 }
 
 /// Why a take_prefronted dropped its build (TAKE_DROP: the cause, the AF_* reason of a failed
@@ -21931,11 +22020,17 @@ pub(crate) fn lower_ahead_needs_unit() {
 /// lower_ahead_needs_unit for the site that asked (an owner request's caller)
 pub(crate) fn lower_ahead_needs_unit_at(site: &'static std::panic::Location<'static>) {
     if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) {
+        let _ = NEEDS_UNIT_AT.try_with(|a| a.set(Some(site)));
         if ahead_trace() {
             eprintln!("ahead-lower needs the unit at {}", site);
         }
         std::panic::resume_unwind(Box::new(crate::preempt::NeedsUnit));
     }
+}
+
+thread_local! {
+    /// where this thread's last lowering ahead needed the unit (O2 drop trace)
+    static NEEDS_UNIT_AT: std::cell::Cell<Option<&'static std::panic::Location<'static>>> = const { std::cell::Cell::new(None) };
 }
 
 /// Lowers slot `id`'s checked body off the unit (its build takes the RIR, take_lowered_ahead): the
