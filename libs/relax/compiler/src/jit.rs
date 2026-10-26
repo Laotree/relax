@@ -8951,6 +8951,8 @@ fn settle_trace() -> bool {
 
 /// slots whose tier decision is final (T_FINAL) now
 static FINAL_SLOTS: AtomicU64 = AtomicU64::new(0);
+/// (trace) the settle's O2 builds by the slot's stored entry: no key, no entry, baseline, O1, O2, O3
+static SETTLE_ENTRY_RANKS: [AtomicU64; 6] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 struct SettleTier {
     seen: [u64; 2],
@@ -9047,6 +9049,8 @@ fn settle_tier_tick() {
     }
     if settle_trace() {
         eprintln!("makepad-run settle-tier: epoch {} round {} at t={:.1} s: {} running slots, {} O2 builds queued, {} made final ({} final in all){}", epoch, round, wall_ns() as f64 / 1e9, running, queued, finalized, FINAL_SLOTS.load(Ordering::Relaxed), if st.final_at != 0 { " -- final" } else { "" });
+        let r: Vec<u64> = SETTLE_ENTRY_RANKS.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+        eprintln!("makepad-run settle-tier: O2 builds so far by stored entry (no key/none/baseline/O1/O2/O3): {:?}", r);
     }
 }
 
@@ -9096,6 +9100,16 @@ unsafe fn settle_sweep(up: *mut Unit) -> (u64, u64, u64) {
         // stub for the O2 code: rearm_counter); the next round makes it final
         if u.fns[id as usize].base_code.swap(false, Ordering::Relaxed) && o2_base(up, id) {
             queued += 1;
+            // (trace: the stored entry of a slot that ran baseline code -- an O2 entry here means
+            // an earlier session's O2 build was stored but not linked)
+            if settle_trace() {
+                if let Some(mut c) = (&mut *up).cache.take() {
+                    let r = c.slot_entry_rank(&*up, id);
+                    (&mut *up).cache = Some(c);
+                    let k = match r { None => 0, Some(None) => 1, Some(Some(t)) => 2 + t.min(3) as usize };
+                    SETTLE_ENTRY_RANKS[k].fetch_add(1, Ordering::Relaxed);
+                }
+            }
             continue;
         }
         if settle_final(u, id) {
