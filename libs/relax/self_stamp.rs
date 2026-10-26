@@ -40,7 +40,7 @@ pub fn write(extra: &[(String, Vec<u8>)]) {
     let mut list = Vec::new();
     files(&dir, "", &mut list);
     let mut buf = Vec::new();
-    let mut put = |b: &[u8], buf: &mut Vec<u8>| {
+    let put = |b: &[u8], buf: &mut Vec<u8>| {
         buf.extend_from_slice(&(b.len() as u64).to_le_bytes());
         buf.extend_from_slice(b);
     };

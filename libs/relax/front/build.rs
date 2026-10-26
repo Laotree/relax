@@ -9,7 +9,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../self_stamp.rs");
     // an input outside the package (src includes it)
-    let extra = "../../platform/build_gen.rs";
+    let extra = "../../../platform/build_gen.rs";
     println!("cargo:rerun-if-changed={}", extra);
     self_stamp::write(&[(extra.to_string(), std::fs::read(extra).expect("read included file"))]);
 }
