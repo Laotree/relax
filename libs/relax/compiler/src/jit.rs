@@ -20867,6 +20867,18 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
                     cached_tier1(up, id, inl);
                 }
                 let u = &mut *up;
+                // a seeded slot (spec_seed: the previous run's manifest -- code that ran there)
+                // is installed now, as its first call would: that call then finds it ready instead
+                // of installing it on the UI thread (JITLOOP-B: a warm Sandbox's Play installed
+                // ~24k staged links there, 1.2 s of UI blocks)
+                if u.fns[id as usize].baseline_hint.load(Ordering::Relaxed) {
+                    u.exec_note(id, crate::exec_profile::SPEC);
+                    install_compiled(up, id, &code, map, &crelocs, false);
+                    let u = &mut *up;
+                    let d = u.fns[id as usize].spec_depth;
+                    spec_enqueue_cached(up, &callees, d);
+                    return Begin::Done(Split::Spec);
+                }
                 u.reload_specs.insert(id);
                 u.fns[id as usize].spec = Some(Box::new(SpecCode { code, map, relocs: crelocs, record: false }));
                 u.fns[id as usize].spec_state = 1;
