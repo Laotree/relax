@@ -45,7 +45,6 @@ static UI_WAIT_START: AtomicU64 = AtomicU64::new(0);
 static UI_WAIT_END: AtomicU64 = AtomicU64::new(0);
 /// ns the UI thread spent in (outermost) JIT waits so far
 static UI_WAIT_SUM: AtomicU64 = AtomicU64::new(0);
-static UI_WAIT_SUM_AT_FRAME: AtomicU64 = AtomicU64::new(0);
 /// builds ahead (speculative / prepared) finished after the first present, and running now
 pub(crate) static AHEAD_DONE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static AHEAD_RUNNING: AtomicU64 = AtomicU64::new(0);
@@ -169,24 +168,6 @@ pub fn ui_stall_ns() -> u64 {
         return 0;
     }
     wall_ns().saturating_sub(UI_WAIT_START.load(Relaxed))
-}
-
-/// How long the UI has been hanging on the JIT: the time since its last frame (or the first present)
-/// when the UI thread spent at least half of it in JIT waits (one long lazy compile, or a level
-/// load's thousands of short ones back to back: no frame either way); 0 otherwise. Atomics only.
-pub fn ui_hang_ns() -> u64 {
-    let fp = present_ns();
-    if fp == 0 {
-        return 0;
-    }
-    let now = wall_ns();
-    let last = LAST_FRAME.load(Relaxed).max(fp);
-    let span = now.saturating_sub(last);
-    let mut waited = UI_WAIT_SUM.load(Relaxed).saturating_sub(UI_WAIT_SUM_AT_FRAME.load(Relaxed));
-    if UI_WAITING.load(Relaxed) > 0 {
-        waited += now.saturating_sub(UI_WAIT_START.load(Relaxed).max(last));
-    }
-    if span > 0 && waited.saturating_mul(2) >= span { span } else { 0 }
 }
 
 /// ns since the UI thread last waited on the JIT: 0 while it waits, u64::MAX before the first
@@ -383,10 +364,13 @@ pub fn activity() -> Activity {
     }
 }
 
-/// The app is ready after its first present (false before it): the UI thread has not waited on the JIT for
-/// `quiet_ns` and nothing is left to build ahead.
+/// The app is ready after its first present (false before it): its UI has not been blocked on the
+/// JIT (an episode of BLOCK_SHOW_NS or more, `ui_blocked_ns`) for `quiet_ns`. Short first compiles
+/// and the builds and links still queued ahead do not hold it: the warm-up veil, like the JIT ring,
+/// shows only past a real wait.
 pub fn ready(quiet_ns: u64) -> bool {
-    present_ns() != 0 && ui_idle_ns() >= quiet_ns && ahead_progress().1 == 0
+    let fp = present_ns();
+    fp != 0 && ui_blocked_ns() < BLOCK_SHOW_NS && wall_ns().saturating_sub(EP_BLOCKED_AT.load(Relaxed).max(fp)) >= quiet_ns
 }
 
 fn present_ns() -> u64 {
@@ -551,7 +535,6 @@ pub(crate) extern "C" fn relax_frame_done() {
         episode_at(EP_SUM.load(Relaxed) + dt, now);
     }
     let last = LAST_FRAME.swap(now, Relaxed);
-    UI_WAIT_SUM_AT_FRAME.store(UI_WAIT_SUM.load(Relaxed), Relaxed);
     episode_end();
     let compiled = MAIN_COMPILE_NS.load(Relaxed);
     static COMPILED_AT_LAST: AtomicU64 = AtomicU64::new(0);
