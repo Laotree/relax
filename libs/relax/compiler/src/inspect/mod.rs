@@ -1005,7 +1005,9 @@ fn jit_line(a: &crate::postframe::Activity, b: &crate::postframe::Activity, ms: 
     let duty = d(a.ui_wait_ns, b.ui_wait_ns) as f64 / (ms as f64 * 1e6);
     let busy = built > 0 || b.running() || duty > 0.02;
     let background = b.background() && duty <= 0.02 && b.demand() == a.demand();
-    let mut parts = vec![if busy { if background { "busy (background)" } else { "busy" } } else { "idle" }.to_string()];
+    // only warm-cache links finished, nothing waited on the JIT: installing stored code ahead
+    let linking = built > 0 && d(a.finished() - a.linked, b.finished() - b.linked) == 0 && duty <= 0.02 && !b.ui_waiting && b.demand() == a.demand();
+    let mut parts = vec![if busy { if background { "busy (background)" } else if linking { "busy (warm install)" } else { "busy" } } else { "idle" }.to_string()];
     let current = b.current();
     let mut running = Vec::new();
     if !current.is_empty() {

@@ -7646,13 +7646,21 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                         PENDING_RECORDS.fetch_add(1, Ordering::Relaxed);
                         crate::cache::warm_count::add(crate::cache::warm_count::RECORDS_WAITING, 1);
                     }
+                    // (A/B, MAKEPAD_RUN_CALLEE_ENTRIES=all|small: first builds' uncalled callees too)
+                    match callee_entries() {
+                        1 => enqueue_uncompiled_callees(up, id, relocs, false),
+                        2 => enqueue_uncompiled_small(up, id, relocs),
+                        _ => {}
+                    }
                 }
             }
             let u = &mut *up;
-            // the startup set: everything installed before the first present, then what the
-            // first seconds after main install
+            // the session's install order (the manifest): everything installed before the first
+            // present (the startup image's slots), then every first install of the session, so a
+            // warm launch links all of it ahead after its first present, not on a program thread
+            // at its first call (a Play's ~30,000 lazy links in the click frame)
             let before_present = !FIRST_PRESENT.load(Ordering::Acquire);
-            if (before_present || wall_ns() < ORDER_UNTIL_NS.load(Ordering::Relaxed)) && u.fns[id as usize].patch_gen == 0 && !u.fns[id as usize].compiled {
+            if u.fns[id as usize].patch_gen == 0 && !u.fns[id as usize].compiled {
                 crate::zone_alloc::kept_with(|| u.start_order.push(id));
                 // MAKEPAD_RUN_PRESENT_FILES=1: the source file of every fn installed before the first
                 // present (what startup executes, per file)
@@ -8990,6 +8998,30 @@ unsafe fn enqueue_uncompiled_callees(up: *mut Unit, id: u32, relocs: &[relax_bac
             continue;
         }
         if glue_only && !matches!(u.fns[c as usize].key, FnKey::Glue(..)) {
+            continue;
+        }
+        todo.push(c);
+    }
+    for c in todo {
+        o1v_enqueue(up, c, true);
+    }
+}
+
+/// MAKEPAD_RUN_CALLEE_ENTRIES (A/B): 0 = replacement builds' callees only (default), 1 = all = first
+/// builds' too, 2 = small = first builds' drop glue and closures
+fn callee_entries() -> u8 {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("MAKEPAD_RUN_CALLEE_ENTRIES").as_deref() { Ok("all") => 1, Ok("small") => 2, _ => 0 })
+}
+
+/// enqueue_uncompiled_callees for drop glue and closures only (A/B: callee_entries 2)
+unsafe fn enqueue_uncompiled_small(up: *mut Unit, id: u32, relocs: &[relax_backend::rir::RelocAt]) {
+    use relax_backend::rir::Reloc;
+    let mut todo = Vec::new();
+    for r in relocs {
+        let c = match r.target { Reloc::Slot(c) | Reloc::Call(c) => c, _ => continue };
+        let u = &*up;
+        if c == id || (c as usize) >= u.fns.len() || u.fns[c as usize].compiled || todo.contains(&c) || !matches!(u.fns[c as usize].key, FnKey::Glue(..) | FnKey::Closure(..)) {
             continue;
         }
         todo.push(c);

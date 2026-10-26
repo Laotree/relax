@@ -621,6 +621,9 @@ pub struct Cache {
     /// record_manifest ran this run (the mid-run write): the exit writes the manifest again only
     /// if `image_rewrite` was set since (an O2/O3 entry replaced code the image may hold)
     manifest_done: bool,
+    /// the slot count of the order this run's manifest was last made from: a longer one (the
+    /// session's later installs) is recorded again
+    manifest_len: usize,
     /// the loaded image's slots, and how many of them this run found stale (left lazy: a crate
     /// changed, an identity did not resolve) -- past 2% (as for the manifest) the next manifest
     /// carries a fresh image
@@ -856,6 +859,7 @@ impl Cache {
             image_ids: None,
             image_rewrite: true,
             manifest_done: false,
+            manifest_len: 0,
             image_slots: 0,
             image_stale: 0,
             rec_tier: HashMap::new(),
@@ -2919,6 +2923,7 @@ impl Cache {
         self.rec_tier = old.rec_tier.clone();
         self.pending_verdicts = old.pending_verdicts.clone();
         self.manifest_done = old.manifest_done;
+        self.manifest_len = old.manifest_len;
         self.collected_committed = true;
         self.stats = old.stats.clone();
     }
@@ -2992,7 +2997,7 @@ impl Cache {
             }
         }
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
-        if self.mode == Mode::ReadOnly || order.is_empty() || (self.manifest_done && !self.image_rewrite && self.stats.rewrite_why[1] as usize * 50 <= self.image_slots) {
+        if self.mode == Mode::ReadOnly || order.is_empty() || (self.manifest_done && order.len() <= self.manifest_len && !self.image_rewrite && self.stats.rewrite_why[1] as usize * 50 <= self.image_slots) {
             return true;
         }
         // at exit the slots' keys can no longer be made: after the mid-run manifest the exit
@@ -3002,7 +3007,7 @@ impl Cache {
         if self.manifest_done && crate::preempt::is_stopped() && !self.image_bad {
             return true;
         }
-        let Some(key) = self.manifest_key(root) else { self.manifest_done = true; return true };
+        let Some(key) = self.manifest_key(root) else { self.manifest_done = true; self.manifest_len = order.len(); return true };
         // what earlier spills of this run wrote: the image takes those entries too
         self.index_written();
         let mut list: Vec<(Vec<u8>, u128)> = Vec::with_capacity(order.len());
@@ -3030,7 +3035,7 @@ impl Cache {
         let image_current = !self.image_rewrite
             && (self.image_slots == 0 || ((self.image_stale + self.stats.rewrite_why[1] as usize) * 50 <= self.image_slots && self.image_slots * 50 >= self.manifest_present_cached * 49));
         if self.startup_manifest_valid() && new * 50 <= list.len() && image_current {
-            self.manifest_done = true;
+            self.manifest_done = true; self.manifest_len = order.len();
             return true;
         }
         if self.verbose {
@@ -3040,7 +3045,7 @@ impl Cache {
         let img = if self.mode != Mode::Verify && !self.image_bad {
             match self.build_image(u, &present_ids, stop) { Err(()) => return false, Ok(img) => img }
         } else { None };
-        self.manifest_done = true;
+        self.manifest_done = true; self.manifest_len = order.len();
         // at exit no key can be made any more (slot_key): slots no lookup or record keyed this
         // run fall out of the image. A rewrite then (O2/O3 code replaced startup code since the
         // mid-run write) must not replace the loaded image with one covering fewer slots: the
