@@ -7646,6 +7646,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                         PENDING_RECORDS.fetch_add(1, Ordering::Relaxed);
                         crate::cache::warm_count::add(crate::cache::warm_count::RECORDS_WAITING, 1);
                     }
+                    enqueue_uncompiled_callees(up, id, relocs);
                 }
             }
             let u = &mut *up;
@@ -8943,6 +8944,10 @@ fn o1v_on() -> bool {
 /// unverified lowering: baseline, calls to twins; cached callers kept calling the twins on every
 /// warm launch); true: O3 inlined it and it has no standalone code (warm launches whose lower-tier
 /// callers call it compiled it). Once per slot; owner thread (a unit call).
+/// Slots queued for a standalone entry (o1v_enqueue `inlined`): they have no code of their own, so
+/// any entry (a stored one, or one recorded since) is all they need
+static O1V_STANDALONE: relax_session::sync::Mutex<Option<std::collections::HashSet<(usize, u32)>>> = relax_session::sync::Mutex::new(None);
+
 unsafe fn o1v_enqueue(up: *mut Unit, id: u32, inlined: bool) {
     let u = &*up;
     if !o1v_on() || (id as usize) >= u.fns.len() || matches!(u.fns[id as usize].key, FnKey::Sandbox(_) | FnKey::Plain(_)) || u.cache.is_none() {
@@ -8953,6 +8958,9 @@ unsafe fn o1v_enqueue(up: *mut Unit, id: u32, inlined: bool) {
         if !crate::zone_alloc::kept_with(|| seen.get_or_insert_with(Default::default).insert((up as usize, id))) {
             return;
         }
+    }
+    if inlined {
+        crate::zone_alloc::kept_with(|| O1V_STANDALONE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((up as usize, id)));
     }
     crate::cache::warm_count::add(if inlined { crate::cache::warm_count::O1V_INLINED } else { crate::cache::warm_count::O1V_LATE }, 1);
     {
@@ -8965,10 +8973,12 @@ unsafe fn o1v_enqueue(up: *mut Unit, id: u32, inlined: bool) {
     o2_start(up);
 }
 
-/// The slots the code of slot `id` calls (`relocs`' slot and call targets) that have no code and
-/// no stored entry: each gets a standalone verified O1 build in the background, recorded as its
-/// entry (o1v_enqueue's inlined-only path), so the code recorded with them runs without lazy
-/// compiles in a later session. Owner thread.
+/// The slots the code of slot `id` calls (`relocs`' slot and call targets) that have no code: each
+/// gets a standalone verified O1 build in the background, recorded as its entry (o1v_enqueue's
+/// standalone path; o1v_begin drops a slot that has an entry), so the code recorded with them runs
+/// without lazy compiles in a later session whose path through it differs (a warm session runs
+/// faster: other branches, other drops). One level only: called for code that was installed to
+/// run (first builds, O2, O3), never for these standalone builds. Owner thread.
 unsafe fn enqueue_uncompiled_callees(up: *mut Unit, id: u32, relocs: &[relax_backend::rir::RelocAt]) {
     use relax_backend::rir::Reloc;
     let mut todo = Vec::new();
@@ -8981,13 +8991,7 @@ unsafe fn enqueue_uncompiled_callees(up: *mut Unit, id: u32, relocs: &[relax_bac
         todo.push(c);
     }
     for c in todo {
-        let u = &mut *up;
-        let Some(mut cache) = u.cache.take() else { return };
-        let stored = cache.has_stored_entry(u, c);
-        u.cache = Some(cache);
-        if !stored {
-            o1v_enqueue(up, c, true);
-        }
+        o1v_enqueue(up, c, true);
     }
 }
 
@@ -9041,8 +9045,10 @@ unsafe fn o1v_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
         u.cache = Some(cache);
         r
     };
-    // no storable key, or the entry is verified code at O1 or above already
-    if rank.is_none_or(|r| r.is_some_and(|t| t >= 1)) {
+    // no storable key, or the entry is verified code at O1 or above already (a standalone entry's
+    // slot: any entry)
+    let standalone = O1V_STANDALONE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&(up as usize, id)));
+    if rank.is_none_or(|r| r.is_some_and(|t| t >= 1 || standalone)) {
         return dropped();
     }
     let u = &*up;
@@ -9316,6 +9322,7 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
         cache.note_retier_over(u, id, crate::cache::warm_count::RETIER_O2_OVER);
         cache.record_o2(u, id, &c.code, &c.relocs, &c.pc_map);
         u.cache = Some(cache);
+        enqueue_uncompiled_callees(up, id, &c.relocs);
     }
     // an O3 build of the slot is running (queued with this one: tier1_thread's o2_hot): this install
     // would change the slot under it, and it would be dropped and built again (cold Stage: 1.8k O3
@@ -19537,7 +19544,9 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions, options: &crate::option
         crate::postframe::AHEAD_RUNNING.fetch_add(1, Ordering::Relaxed);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { spec_build(up, id) }));
         crate::postframe::AHEAD_RUNNING.fetch_sub(1, Ordering::Relaxed);
-        if FIRST_PRESENT.load(Ordering::Relaxed) && matches!(r, Ok(true)) {
+        // (compiles only: a warm-cache link ahead is not a function built -- the warm-up hint and
+        // the ring said "N functions" for a warm start's manifest links)
+        if FIRST_PRESENT.load(Ordering::Relaxed) && matches!(r, Ok(true)) && SPEC_BACK_RAN.with(|b| b.get()) {
             crate::postframe::AHEAD_DONE.fetch_add(1, Ordering::Relaxed);
         }
         match r {
@@ -20553,6 +20562,11 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
     }
 }
 
+thread_local! {
+    /// The last spec_build on this thread compiled (its back end ran), not a warm-cache link
+    static SPEC_BACK_RAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// A speculative build of slot `id` driven from a background thread (rules I-PUB, I-PURE): its
 /// type checks and lowering run here, off the owner (`take_prefronted`), the owner's part is the
 /// take of that RIR (a publish), the back end runs here, the finish is a publish. A build that
@@ -20560,6 +20574,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
 /// lazy compile (O1 code stays deterministic for the cache). Nothing when the slot needs no build
 /// any more. False: the process is ending on another thread (the caller queues it again).
 unsafe fn spec_build(up: *mut Unit, id: u32) -> bool {
+    SPEC_BACK_RAN.with(|b| b.set(false));
     let fresh = |up: *mut Unit| {
         let f = &(&*up).fns[id as usize];
         if f.building { SEED_RECURSIVE_SKIPPED.fetch_add(1, Ordering::Relaxed); }
@@ -20580,6 +20595,7 @@ unsafe fn spec_build(up: *mut Unit, id: u32) -> bool {
             let d = w.run();
             owner::publish(|| split_finish(up, d));
             COMPILE_LAST.store(wall_ns(), Ordering::Relaxed);
+            SPEC_BACK_RAN.with(|b| b.set(true));
             true
         }
         Some(Begin::Done(Split::Failed(e))) if e == YIELDED => false,
