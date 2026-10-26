@@ -22378,9 +22378,10 @@ fn give_back_lowered(u: &Unit, id: u32, func: relax_backend::rir::Func) {
 fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func> {
     let mut lowered = u.front.lowered.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)??;
     // (MAKEPAD_RUN_O2_TRACE: why a take could not use a lowering made ahead for it)
+    let name = if o2_trace() && owner::bailing() { Some(u.fns[id as usize].name.to_string()) } else { None };
     let refuse = |why: &str| {
-        if o2_trace() && owner::bailing() {
-            eprintln!("makepad-run O2: lowering ahead of #{} {} not taken: {}", id, u.fns[id as usize].name, why);
+        if let Some(name) = &name {
+            eprintln!("makepad-run O2: lowering ahead of #{} {} not taken: {}", id, name, why);
         }
     };
     if crate::boundary::on()
