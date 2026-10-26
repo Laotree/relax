@@ -8800,6 +8800,16 @@ const D_KEPT: usize = 7;
 const D_INSTALL: usize = 8;
 const O2_DROP_NAMES: [&str; 9] = ["panic", "verdict wait", "error/key", "build open", "front", "take", "stale/link", "stored, not installed", "install"];
 pub static O2_DROPS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// O2 jobs that built nothing and dropped nothing (N_*): the slot got code meanwhile, the job went
+/// back to a queue, the process is ending
+const N_HAS_CODE: usize = 0;
+const N_REQUEUED: usize = 1;
+const N_ENDING: usize = 2;
+const O2_NOOP_NAMES: [&str; 3] = ["has code", "requeued", "process ending"];
+static O2_NOOPS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+fn o2_noop(why: usize) {
+    O2_NOOPS[why].fetch_add(1, Ordering::Relaxed);
+}
 /// O2 builds begun: the O2 worker's jobs (one requeued while a lazy compile of its slot runs counts
 /// again) and prebuild_callees' builds
 static O2_TAKEN: AtomicU64 = AtomicU64::new(0);
@@ -8844,8 +8854,8 @@ pub fn o2_drop_census() -> String {
     let mut fail_names = PREFRONT_FAIL_NAMES;
     fail_names[AF_OK as usize] = "fronted 3 times";
     let n = |a: &[AtomicU64], names: &[&str]| -> String { a.iter().zip(names).filter_map(|(x, nm)| { let v = x.load(Ordering::Relaxed); (v > 0).then(|| format!("{} {}", nm, v)) }).collect::<Vec<_>>().join(", ") };
-    format!("O2 builds: {} jobs, {} installed, {} dropped ({}); takes dropped by cause ({}); fronts not made off the owner, own slot ({}), candidates left out ({})",
-        O2_TAKEN.load(Ordering::Relaxed), O2_STATS[0].load(Ordering::Relaxed), O2_STATS[2].load(Ordering::Relaxed), n(&O2_DROPS, &O2_DROP_NAMES), n(&O2_TAKE_DROPS, &TD_NAMES),
+    format!("O2 builds: {} jobs, {} installed, {} dropped ({}), {} not built ({}); takes dropped by cause ({}); fronts not made off the owner, own slot ({}), candidates left out ({})",
+        O2_TAKEN.load(Ordering::Relaxed), O2_STATS[0].load(Ordering::Relaxed), O2_STATS[2].load(Ordering::Relaxed), n(&O2_DROPS, &O2_DROP_NAMES), O2_NOOPS.iter().map(|x| x.load(Ordering::Relaxed)).sum::<u64>(), n(&O2_NOOPS, &O2_NOOP_NAMES), n(&O2_TAKE_DROPS, &TD_NAMES),
         n(&O2_FRONT_FAILS[0], &fail_names), n(&O2_FRONT_FAILS[1], &fail_names))
 }
 
@@ -9394,10 +9404,8 @@ unsafe fn enqueue_uncompiled_callees(up: *mut Unit, id: u32, relocs: &[relax_bac
 /// O2 build. None: linked, or nothing to do (it got code meanwhile).
 unsafe fn borrow_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     let f = &(&*up).fns[id as usize];
-    if f.compiled || !f.borrowed {
-        return None;
-    }
-    if ready_code_locked(up, id).is_some() {
+    if f.compiled || !f.borrowed || ready_code_locked(up, id).is_some() {
+        o2_noop(N_HAS_CODE);
         return None;
     }
     o2_begin(up, id)
@@ -9522,7 +9530,12 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
             // a lazy compile's back end for the slot runs now: that build first (a wait here, off
             // the owner; the take never waits)
             let begin = match owner::publish(|| live().map(|up| ((&*up).fns[id as usize].inflight, (&*up).front.clone()))) {
-                None => None,
+                None => {
+                    if !o1 {
+                        o2_noop(N_ENDING);
+                    }
+                    None
+                }
                 Some((inflight, front)) => {
                     if inflight {
                         while owner::publish(|| live().is_some_and(|up| (&*up).fns[id as usize].inflight)) {
@@ -9580,11 +9593,13 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
         // no RIR to copy yet (or a build open, or SPEC-V: an unverified lowering that calls twins,
         // which is lowered again): its full build after the present
         crate::zone_alloc::kept_with(|| O2_LATER.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id)));
+        o2_noop(N_REQUEUED);
         return None;
     }
     // a lazy compile's back end for the slot started since o2_thread looked: again later
     if (&*up).fns[id as usize].inflight {
         crate::zone_alloc::kept_with(|| O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id)));
+        o2_noop(N_REQUEUED);
         return None;
     }
     let f = &(&*up).fns[id as usize];
@@ -9610,7 +9625,10 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     let prep = match r {
         Ok(Ok((p, _))) if p.func.full => p,
         // the process ends on another thread
-        Ok(Err(e)) if e == YIELDED => return None,
+        Ok(Err(e)) if e == YIELDED => {
+            o2_noop(N_ENDING);
+            return None;
+        }
         Err(p) if p.is::<crate::preempt::OwnerBusy>() || p.is::<crate::preempt::PublishBail>() => std::panic::resume_unwind(p),
         _ => {
             o2_drop(D_FRONT, up, id);
@@ -21313,9 +21331,13 @@ fn take_prefronted<R>(front: &FrontShared, leave_out: Option<u32>, mut take: imp
                     let Some(root) = leave_out else { break };
                     // (O2 census: the front that sent the build to its last round)
                     O2_FRONT_FAILS[(s != root) as usize][if front_failed { af } else { AF_OK } as usize].fetch_add(1, Ordering::Relaxed);
-                    if o2_trace() && s == root {
+                    if o2_trace() {
                         let at = if af == AF_NEEDS_UNIT { NEEDS_UNIT_AT.try_with(|a| a.get()).ok().flatten().map(|l| format!(" at {}:{}", l.file(), l.line())).unwrap_or_default() } else { String::new() };
-                        eprintln!("makepad-run O2: #{} own front not made off the owner: {}{}", root, if front_failed { PREFRONT_FAIL_NAMES[af as usize] } else { "fronted 3 times" }, at);
+                        let whose = if s == root { "own front".to_string() } else {
+                            let kind = match front.slot_keys.get(&s) { Some(FnKey::Inst(..)) => "inst", Some(FnKey::Closure(..)) => "closure", Some(FnKey::Plain(_)) => "twin", Some(FnKey::Glue(..)) => "glue", _ => "other" };
+                            format!("candidate #{} ({}) front", s, kind)
+                        };
+                        eprintln!("makepad-run O2: #{} {} not made off the owner: {}{}", root, whose, if front_failed { PREFRONT_FAIL_NAMES[af as usize] } else { "fronted 3 times" }, at);
                     }
                     last = true;
                 }
