@@ -4651,27 +4651,36 @@ impl<'a> Fcx<'a> {
             None => return None,
         };
         let args = self.seg_args(path, n - 1, d, 0);
+        let has_args = args.is_some();
         match prog.def(d).kind {
             DefKind::Prim(p) => Some(self.tcx.tys.prim(p)),
             DefKind::Struct | DefKind::Enum | DefKind::Union => {
                 let ng = self.tcx.adts.get(&d).map_or(0, |a| a.n_generics);
                 let mut a = args.unwrap_or_default();
-                while a.len() < ng as usize {
-                    a.push(self.fresh_arg(d, a.len()));
-                }
                 let mut regions = Vec::new();
                 for _ in &self.tcx.generic_indices_of(prog, d).lifetimes { regions.push(self.fresh_region()); }
                 // the lifetimes written on the prefix segment (`A::<'a>::new`)
                 let written = self.seg_lifetimes(path, n - 1);
                 if written.len() == regions.len() { regions = written; }
-                Some(self.tcx.tys.intern(TyKind::Adt(d, self.tcx.tys.mk_list(&a), self.tcx.tys.intern_region_args(&regions))))
+                let regions = self.tcx.tys.intern_region_args(&regions);
+                if has_args && a.len() < ng as usize {
+                    let _ = self.tcx.fill_type_defaults(&self.cx.with_infcx(&self.infcx), prog, d, &mut a, Some(regions));
+                }
+                while a.len() < ng as usize {
+                    a.push(self.fresh_arg(d, a.len()));
+                }
+                Some(self.tcx.tys.intern(TyKind::Adt(d, self.tcx.tys.mk_list(&a), regions)))
             }
             DefKind::TypeAlias => {
                 let t = self.tcx.alias_ty(&self.cx.with_infcx(&self.infcx), prog, d);
                 let mut a = args.unwrap_or_default();
+                // `Alias::<A>::f`: trailing parameters with defaults take their defaults;
                 // `Alias::f` without generic args: the alias's parameters are inferred like a
                 // struct's (`FxHashSet::default()`)
                 let need = self.tcx.item_env(prog, d).names.len();
+                if has_args && a.len() < need {
+                    let _ = self.tcx.fill_type_defaults(&self.cx.with_infcx(&self.infcx), prog, d, &mut a, None);
+                }
                 while a.len() < need {
                     a.push(self.fresh_arg(d, a.len()));
                 }
@@ -5019,9 +5028,10 @@ impl<'a> Fcx<'a> {
                 let ta = self.check_expr(*a, None);
                 self.check_lhs_assignable(*a, true);
                 let sa = self.shallow(ta);
-                // rustc_hir_typeck/src/op.rs:29-44: parameters and aliases keep
-                // the overloaded decision, even when an instance is primitive.
-                if matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Param(_) | TyKind::Alias(..)) {
+                let sa = if matches!(self.tcx.tys.kind(sa), TyKind::Infer(_)) { self.retry_goals(false); self.shallow(sa) } else { sa };
+                // rustc_hir_typeck/src/op.rs:29-44: parameters, aliases, and unresolved type
+                // variables keep the overloaded decision, even when an instance is primitive.
+                if matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Param(_) | TyKind::Alias(..) | TyKind::Infer(_)) {
                     // `a op= b` on a non-primitive: core::ops::<Op>Assign
                     self.cur_binop = e.0;
                     self.check_op_trait(*op, sa, *b, lo, true);
@@ -5029,6 +5039,15 @@ impl<'a> Fcx<'a> {
                 }
                 let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
                 let tb = self.check_expr(*b, if is_shift { None } else { Some(ta) });
+                // a primitive place with a non-primitive right operand is an `<Op>Assign` call
+                // (`n /= NonZero<u32>`; rustc is_builtin_binop needs both sides primitive)
+                let sb0 = self.shallow(tb);
+                if matches!(self.tcx.tys.kind(sb0), TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..)) {
+                    self.cur_binop = e.0;
+                    if self.prim_lhs_op(*op, e, sa, sb0, lo, true).is_some() {
+                        return unit;
+                    }
+                }
                 // `sum += &i` with i still open and sum a literal: only core's primitive
                 // `OpAssign<&T> for T` impls take a reference here, so the referent is sum's type
                 let tb = match self.tcx.tys.kind(self.shallow(tb)).clone() {
@@ -5470,8 +5489,13 @@ impl<'a> Fcx<'a> {
                 self.tcx.tys.never
             }
             ExprKind::Tuple(v) => {
+                // expr.rs check_expr_tuple: the expectation is resolved with the pending
+                // obligations selected (resolve_vars_with_obligations): `map.get(&(&s, w))` with
+                // `K = (&str, W)` learns `Q = (&str, W)` from `K: Borrow<Q>` (one impl), so
+                // `&s` coerces to `&str`
                 let exp_elems = match expected {
                     Some(t) => {
+                        let t = self.deeply_resolve_ignoring_regions_with_obligations(t);
                         let s = self.shallow(t);
                         match self.tcx.tys.kind(s).clone() {
                             TyKind::Tuple(x) if self.tcx.tys.list(x).len() == v.len() => Some(x),
@@ -5495,7 +5519,8 @@ impl<'a> Fcx<'a> {
                         None if matches!(self.tcx.tys.kind(self.shallow(t)), TyKind::Never) => self.fresh(0),
                         None => t,
                     };
-                    if et != t { self.coerce_or_unify(t, et, Some(*x), lo); }
+                    // (check_expr_coercible_to_type: a mismatch is reported at the element)
+                    if et != t { let xlo = self.ast().expr(*x).lo; self.coerce_or_unify(t, et, Some(*x), xlo); }
                     ts.push(et);
                 }
                 self.tcx.tys.intern(TyKind::Tuple(self.tcx.tys.mk_list(&ts)))
@@ -5636,6 +5661,8 @@ impl<'a> Fcx<'a> {
                         },
                     }
                 }
+                // expr.rs check_expr_field: a base that is already an error reports nothing more
+                if matches!(self.tcx.tys.kind(cur), TyKind::Error) { return error; }
                 let s = self.ty_str(t);
                 self.err(lo, format!("E0609: no field `{}` on type `{}`", idx, s));
                 error
@@ -6264,9 +6291,10 @@ impl<'a> Fcx<'a> {
                 let sa0 = self.shallow(ta);
                 let ta = self.peel_prim_refs(sa0);
                 let sa = self.shallow(ta);
+                let sa = if matches!(self.tcx.tys.kind(sa), TyKind::Infer(_)) { self.retry_goals(false); self.shallow(sa) } else { sa };
                 // parameters and aliases are operator trait calls (rustc op.rs is_builtin_binop:
                 // only primitive operands are built in), as for `a op= b` below
-                if matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Param(_) | TyKind::Alias(..)) {
+                if matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Param(_) | TyKind::Alias(..) | TyKind::Infer(_)) {
                     self.cur_binop = e.0;
                     return self.check_op_trait(op, sa, b, lo, false);
                 }
@@ -6309,7 +6337,7 @@ impl<'a> Fcx<'a> {
                 // needs both sides primitive)
                 if matches!(self.tcx.tys.kind(sb0), TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..) | TyKind::Infer(_)) {
                     let sa = self.shallow(ta);
-                    if let Some(r) = self.prim_lhs_op(op, e, sa, sb0, lo) {
+                    if let Some(r) = self.prim_lhs_op(op, e, sa, sb0, lo, false) {
                         return r;
                     }
                 }
@@ -6410,6 +6438,9 @@ impl<'a> Fcx<'a> {
                 None => break,
             }
         }
+        // expr.rs check_expr_field: the autoderef's final type is an error type (an earlier error
+        // made it): no further error, as rustc (`if let ty::Error(_) = final_ty.kind()`)
+        if matches!(self.tcx.tys.kind(cur), TyKind::Error) { return self.tcx.tys.error; }
         let ts = self.ty_str(t);
         // expr.rs check_expr_field: a method of that name is E0615, a primitive has no fields (E0610)
         if !self.tcx.tys.has_error(cur) && matches!(self.pick_all_method(e, t, s, lo), Ok(Some(_))) {
@@ -7193,17 +7224,29 @@ impl<'a> Fcx<'a> {
 
     /// `prim op adt`: the operator trait impl of the primitive for the right type. A literal
     /// left operand takes the type of the single primitive impl with that right type.
-    fn prim_lhs_op(&mut self, op: BinOp, e: ExprId, sa: TyId, sb: TyId, lo: u32) -> Option<TyId> {
-        let (tr, m) = match op {
-            BinOp::Add => ("Add", "add"),
-            BinOp::Sub => ("Sub", "sub"),
-            BinOp::Mul => ("Mul", "mul"),
-            BinOp::Div => ("Div", "div"),
-            BinOp::Rem => ("Rem", "rem"),
-            BinOp::BitAnd => ("BitAnd", "bitand"),
-            BinOp::BitOr => ("BitOr", "bitor"),
-            BinOp::BitXor => ("BitXor", "bitxor"),
-            _ => return None,
+    /// With `assign`, `prim op= adt` through the `<Op>Assign` impl (`n /= NonZero<u32>`).
+    fn prim_lhs_op(&mut self, op: BinOp, e: ExprId, sa: TyId, sb: TyId, lo: u32, assign: bool) -> Option<TyId> {
+        let (tr, m) = match (op, assign) {
+            (BinOp::Add, true) => ("AddAssign", "add_assign"),
+            (BinOp::Sub, true) => ("SubAssign", "sub_assign"),
+            (BinOp::Mul, true) => ("MulAssign", "mul_assign"),
+            (BinOp::Div, true) => ("DivAssign", "div_assign"),
+            (BinOp::Rem, true) => ("RemAssign", "rem_assign"),
+            (BinOp::BitAnd, true) => ("BitAndAssign", "bitand_assign"),
+            (BinOp::BitOr, true) => ("BitOrAssign", "bitor_assign"),
+            (BinOp::BitXor, true) => ("BitXorAssign", "bitxor_assign"),
+            (_, true) => return None,
+            (op, false) => match op {
+                BinOp::Add => ("Add", "add"),
+                BinOp::Sub => ("Sub", "sub"),
+                BinOp::Mul => ("Mul", "mul"),
+                BinOp::Div => ("Div", "div"),
+                BinOp::Rem => ("Rem", "rem"),
+                BinOp::BitAnd => ("BitAnd", "bitand"),
+                BinOp::BitOr => ("BitOr", "bitor"),
+                BinOp::BitXor => ("BitXor", "bitxor"),
+                _ => return None,
+            },
         };
         let td = self.lang_item(&["ops", tr])?;
         let db = self.infcx.deeply_resolve_ignoring_regions(sb);

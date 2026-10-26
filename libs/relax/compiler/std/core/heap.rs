@@ -126,6 +126,37 @@ impl Layout {
         let layout = Layout::from_size_align(new_size, new_align)?;
         Ok((layout, offset))
     }
+    pub const fn extend_packed(&self, next: Layout) -> Result<Layout, LayoutError> {
+        let new_size = match self.size.checked_add(next.size) {
+            Some(s) => s,
+            None => return Err(LayoutError),
+        };
+        Layout::from_size_align(new_size, self.align())
+    }
+    // library/core/src/alloc/layout.rs repeat: n-1 padded elements, then the last one unpadded
+    pub const fn repeat(&self, n: usize) -> Result<(Layout, usize), LayoutError> {
+        let padded = self.pad_to_align();
+        let result = if let Some(k) = n.checked_sub(1) {
+            let repeated = match padded.repeat_packed(k) {
+                Ok(r) => r,
+                Err(e) => return Err(e),
+            };
+            repeated.extend_packed(*self)
+        } else {
+            self.repeat_packed(0)
+        };
+        match result {
+            Ok(l) => Ok((l, padded.size)),
+            Err(e) => Err(e),
+        }
+    }
+    pub const fn repeat_packed(&self, n: usize) -> Result<Layout, LayoutError> {
+        let size = match self.size.checked_mul(n) {
+            Some(s) => s,
+            None => return Err(LayoutError),
+        };
+        Layout::from_size_align(size, self.align())
+    }
     pub fn dangling(&self) -> crate::ptr::NonNull<u8> {
         unsafe { crate::ptr::NonNull::new_unchecked(self.align() as *mut u8) }
     }

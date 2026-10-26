@@ -138,6 +138,12 @@ impl<T> NonNull<T> {
     pub const fn dangling() -> NonNull<T> {
         NonNull { pointer: dangling::<T>() }
     }
+    pub const fn without_provenance(addr: crate::num::NonZeroUsize) -> NonNull<T> {
+        NonNull { pointer: without_provenance(addr.get()) }
+    }
+    pub const fn with_exposed_provenance(addr: crate::num::NonZeroUsize) -> NonNull<T> {
+        NonNull { pointer: with_exposed_provenance(addr.get()) }
+    }
     pub const unsafe fn add(self, count: usize) -> NonNull<T> {
         NonNull { pointer: im::ptr_add(self.pointer, count) }
     }
@@ -218,6 +224,18 @@ impl<T: crate::marker::PointeeSized> NonNull<T> {
     }
     pub fn addr(self) -> crate::num::NonZeroUsize {
         unsafe { crate::num::NonZeroUsize::new_unchecked(self.pointer as *const u8 as usize) }
+    }
+    pub fn expose_provenance(self) -> crate::num::NonZeroUsize {
+        self.addr()
+    }
+    pub fn with_addr(self, addr: crate::num::NonZeroUsize) -> Self {
+        // real core: `self.as_ptr().with_addr(addr.get())`, i.e. a wrapping byte offset (keeps provenance)
+        let p = self.pointer as *const u8;
+        let delta = (addr.get() as isize).wrapping_sub(p as usize as isize);
+        NonNull { pointer: p.wrapping_offset(delta) as *const T }
+    }
+    pub fn map_addr(self, f: impl FnOnce(crate::num::NonZeroUsize) -> crate::num::NonZeroUsize) -> Self {
+        self.with_addr(f(self.addr()))
     }
     pub const unsafe fn new_unchecked(ptr: *mut T) -> NonNull<T> {
         NonNull { pointer: ptr as *const T }
