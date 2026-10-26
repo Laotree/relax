@@ -15684,6 +15684,33 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
                 build_off_owner(up, &[(id, RirMode::Normal)]);
             }
         }
+        // (GAPX6) a warm-image slot whose RIR the off-owner build gave up on (each round needed
+        // new fronts): built on the owner as the O3 snapshot's fallback builds its root (ensure_rir),
+        // its fronts made here between rounds. Without it the race's hottest slots (reconcile,
+        // View::handle_event, set_uniform, ...) went to O3 with static frequencies every warm
+        // launch: no PGO layout, inlining or register weights for the code that runs the most.
+        // The O3 build that follows finds the RIR built (no second build).
+        let missing = |up: *mut Unit| needs_rir(up) || (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| upgradable(r));
+        if owner::publish(|| missing(up)) {
+            for _ in 0..PREFRONT_ROUNDS {
+                let Ok((left, needs)) = owner::publish_or_bail(|| {
+                    let _ = owner::take_needs();
+                    if needs_rir(up) {
+                        let _ = build_rir_or_skip(up, id, RirMode::Tier0);
+                    }
+                    if !needs_rir(up) && (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| upgradable(r)) {
+                        let _ = build_rir_or_skip(up, id, RirMode::Normal);
+                    }
+                    (missing(up), owner::take_needs())
+                }) else { break };
+                if !left || needs.is_empty() {
+                    break;
+                }
+                for s in needs {
+                    prefront_slot(&front, s);
+                }
+            }
+        }
     }
     let begin = take_prefronted(&front, || {
         let u = &mut *up;
@@ -15693,6 +15720,9 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
         let f = &u.fns[id as usize];
         if !matches!(f.key, FnKey::Inst(..) | FnKey::Closure(..)) || !f.compiled || f.o3.load(Ordering::Relaxed) || f.build_err.is_some()
             || f.building || f.inflight || f.unverified.load(Ordering::Relaxed) || u.frequency_profiles.contains_key(&id) || crate::inspect::instrument::active(id) {
+            if tier1_trace() {
+                eprintln!("O3c-refused #{} {}: key {} compiled {} o3 {} err {} building {} inflight {} unverified {} profiled {}", id, f.name, matches!(f.key, FnKey::Inst(..) | FnKey::Closure(..)), f.compiled, f.o3.load(Ordering::Relaxed), f.build_err.is_some(), f.building, f.inflight, f.unverified.load(Ordering::Relaxed), u.frequency_profiles.contains_key(&id));
+            }
             return None;
         }
         // the RIR O3 will start from (normal RIR, as compile_tier1's snapshot upgrades baseline RIR)
@@ -15701,11 +15731,17 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
         // and its O3 build goes ahead
         if needs_rir(up) || f.rir.as_ref().is_some_and(|r| upgradable(r)) {
             PGO_STATS[3].fetch_add(1, Ordering::Relaxed);
+            if tier1_trace() {
+                eprintln!("O3c-refused #{} {}: no normal RIR (needs front {}, upgradable {})", id, f.name, needs_rir(up), f.rir.as_ref().is_some_and(|r| upgradable(r)));
+            }
             return None;
         }
         let u = &*up;
         let f = &u.fns[id as usize];
         // (a naked fn is its assembly alone: a counter would clobber its argument registers)
+        if tier1_trace() && f.rir.as_ref().filter(|r| !r.plain_calls && !r.naked && !r.blocks.is_empty()).is_none() {
+            eprintln!("O3c-refused #{} {}: rir {} plain_calls {}", id, f.name, f.rir.is_some(), f.rir.as_ref().is_some_and(|r| r.plain_calls));
+        }
         let rir = f.rir.as_ref().filter(|r| !r.plain_calls && !r.naked && !r.blocks.is_empty())?.clone();
         let e = &u.env;
         let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class, near: e.near };
@@ -15737,6 +15773,9 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
     }));
     let Ok(Ok((c, counted))) = built else {
         PGO_STATS[2].fetch_add(1, Ordering::Relaxed);
+        if tier1_trace() {
+            eprintln!("O3c-refused #{}: counted codegen failed ({})", id, match &built { Ok(Err(e)) => e.as_str(), _ => "panic" });
+        }
         return false;
     };
     let installed = owner::publish(|| {
