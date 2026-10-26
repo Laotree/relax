@@ -7634,6 +7634,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                     } else {
                         startup_phase() && owner::for_main()
                     };
+                    if foreground { crate::cache::trace_lookup(u, id, "fg-compile"); }
                     let deferred = if foreground {
                         c.defer_record(u, id, code, relocs, &map)
                     } else {
@@ -7645,12 +7646,6 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                         u.pending_cache_records.push(Some(p));
                         PENDING_RECORDS.fetch_add(1, Ordering::Relaxed);
                         crate::cache::warm_count::add(crate::cache::warm_count::RECORDS_WAITING, 1);
-                    }
-                    // (A/B, MAKEPAD_RUN_CALLEE_ENTRIES=all|small: first builds' uncalled callees too)
-                    match callee_entries() {
-                        1 => enqueue_uncompiled_callees(up, id, relocs, false),
-                        2 => enqueue_uncompiled_small(up, id, relocs),
-                        _ => {}
                     }
                 }
             }
@@ -8998,30 +8993,6 @@ unsafe fn enqueue_uncompiled_callees(up: *mut Unit, id: u32, relocs: &[relax_bac
             continue;
         }
         if glue_only && !matches!(u.fns[c as usize].key, FnKey::Glue(..)) {
-            continue;
-        }
-        todo.push(c);
-    }
-    for c in todo {
-        o1v_enqueue(up, c, true);
-    }
-}
-
-/// MAKEPAD_RUN_CALLEE_ENTRIES (A/B): 0 = replacement builds' callees only (default), 1 = all = first
-/// builds' too, 2 = small = first builds' drop glue and closures
-fn callee_entries() -> u8 {
-    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *M.get_or_init(|| match std::env::var("MAKEPAD_RUN_CALLEE_ENTRIES").as_deref() { Ok("all") => 1, Ok("small") => 2, _ => 0 })
-}
-
-/// enqueue_uncompiled_callees for drop glue and closures only (A/B: callee_entries 2)
-unsafe fn enqueue_uncompiled_small(up: *mut Unit, id: u32, relocs: &[relax_backend::rir::RelocAt]) {
-    use relax_backend::rir::Reloc;
-    let mut todo = Vec::new();
-    for r in relocs {
-        let c = match r.target { Reloc::Slot(c) | Reloc::Call(c) => c, _ => continue };
-        let u = &*up;
-        if c == id || (c as usize) >= u.fns.len() || u.fns[c as usize].compiled || todo.contains(&c) || !matches!(u.fns[c as usize].key, FnKey::Glue(..) | FnKey::Closure(..)) {
             continue;
         }
         todo.push(c);
