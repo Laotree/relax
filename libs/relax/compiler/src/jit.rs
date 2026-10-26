@@ -431,6 +431,8 @@ pub struct Unit {
     pub(crate) veneers: relax_session::sync::Mutex<HashMap<u64, u64>>,
     /// invalidatable code (invalid.rs): per group, its own page-aligned chunks of the code area
     pub(crate) code_groups: relax_session::sync::Mutex<HashMap<crate::invalid::Group, crate::invalid::GroupCode>>,
+    /// the O3 code chunk (`emit_hot`): next free byte, end
+    hot_code: relax_session::sync::Mutex<(u64, u64)>,
     data_next: AtomicU64,
     /// (bytes, align) of str / byte-string / C-string literals and promoted constants -> their
     /// one read-only copy
@@ -3603,6 +3605,7 @@ impl Unit {
             code_next: AtomicU64::new(misc),
             veneers: Default::default(),
             code_groups: Default::default(),
+            hot_code: Default::default(),
             data_next: AtomicU64::new(data_base),
             lit_data: Default::default(),
             data_end: data_base + data_size,
@@ -3948,6 +3951,33 @@ impl Unit {
 
     pub(crate) fn emit_linked(&self, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Result<u64, String> {
         let at = bump(&self.code_next, code.len() as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+        let mut c = code.to_vec();
+        self.link_code(&mut c, at, relocs)?;
+        unsafe { os::mem::write_code(at, &c) };
+        crate::coverage::installed(self, at, relocs);
+        Ok(at)
+    }
+
+    /// O3 code (GAPX6, x64 front-end stalls): fresh O3 installs bump in their own chunks of the
+    /// code area (HOT_CHUNK each, taken from the shared bump), so the hot code lies together, not
+    /// between lazy first compiles, glue, count stubs and lower tiers. MAKEPAD_RUN_OPT=-hotcode:
+    /// shared bump.
+    pub(crate) fn emit_hot(&self, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Result<u64, String> {
+        if relax_backend::stats::opt_env_off("-hotcode") {
+            return self.emit_linked(code, relocs);
+        }
+        let need = (code.len() as u64 + 15) & !15;
+        let at = {
+            let mut h = self.hot_code.lock().unwrap_or_else(|e| e.into_inner());
+            if h.0 + need > h.1 {
+                let size = need.max(HOT_CHUNK);
+                let c = bump(&self.code_next, size, 64, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+                *h = (c, c + size);
+            }
+            let at = h.0;
+            h.0 += need;
+            at
+        };
         let mut c = code.to_vec();
         self.link_code(&mut c, at, relocs)?;
         unsafe { os::mem::write_code(at, &c) };
@@ -17552,7 +17582,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 let at = if blob {
                     u.emit_or_redirect(&code, &relocs, "O3").expect("O3 interpreted code installs")
                 } else {
-                    u.emit_grouped(o3_group, &code, &relocs).expect("O3 code links (checked)")
+                    match o3_group {
+                        Some(_) => u.emit_grouped(o3_group, &code, &relocs),
+                        None => u.emit_hot(&code, &relocs),
+                    }.expect("O3 code links (checked)")
                 };
                 if !blob {
                     code_growth(if sandboxed { GROW_MODULE } else if u.retiers.contains_key(&id) { GROW_REOPT } else { GROW_TIERUP }, code.len());
@@ -21928,6 +21961,9 @@ fn code_full(size: u64) -> ! {
     eprintln!("{}", msg);
     std::process::abort();
 }
+
+/// the size of one O3 code chunk (`Unit::emit_hot`)
+const HOT_CHUNK: u64 = 1 << 20;
 
 fn bump(next: &AtomicU64, size: u64, align: u64, end: u64, full: &str) -> u64 {
     let a = align.max(1);
