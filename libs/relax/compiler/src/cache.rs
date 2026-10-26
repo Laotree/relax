@@ -346,7 +346,7 @@ pub fn warm_summary() -> String {
         s.push_str(&format!("; fresh builds over the stored entry (none/baseline/O1/O2/O3): O3 {}, O2 {}", over(RETIER_O3_OVER), over(RETIER_O2_OVER)));
     }
     if g(REC_UNVERIFIED) + g(SPECV_LATE) > 0 {
-        s.push_str(&format!("; SPEC-V: {} records of unverified lowerings, {} compiled slots below O3 verified after their build, {} base slots ran their twins' code until their own build (none compiled on a program thread for it), {} of them have their own code now, {} callees built ahead of a replacement's install, {} calls of linked code sent to a twin's base", k(g(REC_UNVERIFIED)), k(g(SPECV_LATE)), k(crate::jit::SPECV_BORROWS.load(std::sync::atomic::Ordering::Relaxed)), k(crate::jit::SPECV_BORROWS_OWN.load(std::sync::atomic::Ordering::Relaxed)), k(crate::jit::SPECV_PREBUILT.load(std::sync::atomic::Ordering::Relaxed)), k(crate::jit::TWIN_RETARGETS.load(std::sync::atomic::Ordering::Relaxed))));
+        s.push_str(&format!("; SPEC-V: {} records of unverified lowerings, {} compiled slots below O3 verified after their build, {} base slots ran their twins' code until their own build (none compiled on a program thread for it), {} of them have their own code now, {} callees built ahead of a replacement's install, {} calls of linked code sent to a twin's base, {} bases of hot twins built for their own entry", k(g(REC_UNVERIFIED)), k(g(SPECV_LATE)), k(crate::jit::SPECV_BORROWS.load(std::sync::atomic::Ordering::Relaxed)), k(crate::jit::SPECV_BORROWS_OWN.load(std::sync::atomic::Ordering::Relaxed)), k(crate::jit::SPECV_PREBUILT.load(std::sync::atomic::Ordering::Relaxed)), k(crate::jit::TWIN_RETARGETS.load(std::sync::atomic::Ordering::Relaxed)), k(crate::jit::TWIN_BASE_BUILDS.load(std::sync::atomic::Ordering::Relaxed))));
     }
     if g(O3_QUEUED) + g(O3_UNVERIFIED) + g(O3_FRAME) + g(O3_SPEC) > 0 {
         s.push_str(&format!("; O3 installs kept as entries: {} queued (written {}, same as stored {}, not encodable {}, stale {}, dropped {}; {} deferred records waiting, last drain {} with {}), not kept: unverified {}, frame too big {}, speculative/inspect {}; O2 entries written {}",
@@ -1208,10 +1208,12 @@ impl Cache {
 
     fn push_pending(&mut self, krate: u32, e: NewEntry) {
         self.pending_bytes += e.payload.len() + 32;
+        RECORDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.pending.push((krate, e.into()));
     }
 
-    /// Payload bytes recorded but not yet written to the store files.
+    /// Payload bytes recorded but not yet written to the store files (`RECORDS` counts the
+    /// records: a reader that saw no new one need not look again).
     pub fn pending_bytes(&self) -> usize {
         self.pending_bytes
     }
@@ -7313,7 +7315,10 @@ impl Linker {
                     d.u8()?;
                     let b = d.bytes()?;
                     let sid = self.slot_of_bytes(u, b)?;
-                    let sid = u.twin_link_target(id, sid);
+                    let sid = {
+                        let c = self.cache();
+                        u.twin_link_target(id, sid, |b| c.has_stored_entry(u, b))
+                    };
                     if tag == 21 {
                         thunks.push(sid);
                     } else {
@@ -7729,3 +7734,7 @@ mod prune_tests {
 /// (trace) thunk symbols whose fn key was not an image key: decoded, and the time
 pub(crate) static THUNK_DECODED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static THUNK_DECODE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Entries recorded so far, in every store (a reader that saw no new one need not ask the owner
+/// for `pending_bytes` again: run.rs spill_cache).
+pub static RECORDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
