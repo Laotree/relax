@@ -5333,6 +5333,16 @@ impl Unit {
         // had taken the address of -- Result::unwrap's `&dyn Debug`, the hash map's -- bailed the
         // lowering, and its O3 candidates were left out.)
         if id as usize >= self.fns.len() || !self.fns[id as usize].entry_ref.load(Ordering::Relaxed) && self.slots.has_callable_hook() {
+            // a background build's front: the owner takes the address between two requests
+            // (const_drain), and the take's next round finds it taken (a warm run's code comes from
+            // the disk cache, so no lowering of this run took it: vtables of `dyn` methods dropped
+            // ~90 warm O2 builds of Code per session)
+            if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) && WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
+                let key = if (id as usize) < self.fns.len() { Some(self.fns[id as usize].key.clone()) } else { lower_ahead_fn_key(id) };
+                if let Some(key) = key {
+                    want(Wanted::Entry(key), self.tcx.collect_epoch.load(Ordering::SeqCst));
+                }
+            }
             lower_ahead_needs_unit();
         }
         self.fns[id as usize].entry_ref.store(true, Ordering::Relaxed);
@@ -22367,22 +22377,30 @@ fn give_back_lowered(u: &Unit, id: u32, func: relax_backend::rir::Func) {
 /// publication, and this build uses the already checked body through the ordinary path.
 fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func> {
     let mut lowered = u.front.lowered.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)??;
+    // (MAKEPAD_RUN_O2_TRACE: why a take could not use a lowering made ahead for it)
+    let refuse = |why: &str| {
+        if o2_trace() && owner::bailing() {
+            eprintln!("makepad-run O2: lowering ahead of #{} {} not taken: {}", id, u.fns[id as usize].name, why);
+        }
+    };
     if crate::boundary::on()
         || lowered.epoch != u.tcx.collect_epoch.load(Ordering::SeqCst)
         || lowered.file != u.fns[id as usize].file
-    { return None; }
+    { refuse("epoch/file"); return None; }
     // the constants it read, as the unit has them now (and this build noted as their reader, as
     // its own lowering would): a value that changed since (a patch) discards the lowering. A
     // constant the unit lost meanwhile is evaluated again here, as the build would have.
     for (d, args, a) in std::mem::take(&mut lowered.consts) {
         let same = if u.prog.def(d).kind == DefKind::Static { u.static_ready(d, a) } else { u.const_addr(d, args) == Some(a) };
         if !same {
+            refuse("constant changed");
             return None;
         }
     }
     // the thread-local places it read, as the unit has them now (a reset since: the build lowers
     // its own)
     if lowered.tls.iter().any(|(d, p)| u.tls_places.get(d) != Some(p)) {
+        refuse("thread-local place");
         return None;
     }
     // a closure lowered off the owner (prefront_closure): from the body its parent has now, and
@@ -22390,12 +22408,13 @@ fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func>
     // (a parent whose body was gone: prefront_closure made it again for this epoch -- the epoch is
     // checked above -- and it is the parent's body from now on)
     if let FnKey::Closure(cfile, ce, parent) = u.fns[id as usize].key {
-        let Some(b) = lowered.body.take() else { return None };
+        let Some(b) = lowered.body.take() else { refuse("closure without body"); return None };
         let same = match u.body_of(parent, cfile) {
             Some(p) => std::sync::Arc::ptr_eq(p, &b),
             None => b.file == cfile && (parent as usize) < u.fns.len(),
         };
         if !same || !crate::cache::closure_identity_ok(u, cfile, ce) {
+            refuse(if same { "closure identity" } else { "closure parent body differs" });
             return None;
         }
         if u.body_of(parent, cfile).is_none() {
@@ -24245,6 +24264,9 @@ enum Wanted {
     Const(DefId, Vec<TyId>),
     Tls(DefId),
     Static(DefId),
+    /// a slot's callable address (Unit::entry: its first escape, a callable hook's), by key: a
+    /// lowering ahead may name it by a temporary identity only
+    Entry(FnKey),
 }
 
 /// Owner, before each request: the constants CONSTS_WANTED names, evaluated into FrontShared::consts
@@ -24268,6 +24290,14 @@ pub(crate) fn const_drain() {
             continue;
         }
         let (d, ok) = match w {
+            Wanted::Entry(key) => {
+                let id = u.fn_id(key);
+                let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.entry(id))).is_ok();
+                if ahead_trace() {
+                    eprintln!("const-drain: entry of {} {}", u.fns[id as usize].name, if ok { "taken" } else { "failed" });
+                }
+                continue;
+            }
             Wanted::Const(d, args) => {
                 if u.front.consts.get(&(d, args.clone())).is_some() {
                     continue;
