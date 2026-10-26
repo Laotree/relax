@@ -93,7 +93,7 @@ pub fn start(app: &str) {
     // SPEC-V: every answer says whether the code it observed has its borrow-check verdict
     endpoint.set_end_fields(|s| s.push_str(if crate::reload::observations_verified() { ",\"verified\":true" } else { ",\"verified\":false" }));
     let _ = WATCH.set(endpoint.register_watch_with(events::remote_watcher_opened, events::remote_watcher_closed));
-    // the same events for an observer that is not a watcher (relaxhub): reading them never
+    // the same events for an observer that is not a watcher (devhub): reading them never
     // parks a panic or arms the detectors a watcher pays for
     endpoint.register("observe", 1, makepad_remote::watch::service(endpoint.ring().clone()));
     pstream::register(&endpoint);

@@ -23,7 +23,7 @@ pub enum Via {
     Ssh { ssh: String, relax: String, env: Vec<(String, String)> },
     /// dials in; `key` and `fingerprint` are hex
     Dial { key: String, fingerprint: String },
-    /// a relaxhub node at `addr` (`host:port`), dialled with this hub's fleet credential
+    /// a devhub node at `addr` (`host:port`), dialled with this hub's fleet credential
     Fleet { addr: String },
 }
 
