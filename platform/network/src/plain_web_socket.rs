@@ -282,8 +282,8 @@ impl PlainWebSocket {
         if !crate::tls::is_fleet_endpoint(&host_port) {
             return failed(&rx_sender, format!("{host_port} is not a known fleet TLS endpoint"));
         }
-        let (mut stream, authorization) = match crate::tls::connect_fleet(split.host, split.port) {
-            Ok(s) => s,
+        let (mut stream, authorization) = match crate::fleet::id::connect(split.host, split.port) {
+            Ok((stream, _server, authorization)) => (stream, Some(authorization)),
             Err(err) => return failed(&rx_sender, format!("Error connecting websocket stream: {err}")),
         };
         let path = if split.file.is_empty() { "/".to_string() } else { format!("/{}", split.file) };
