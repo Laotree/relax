@@ -2637,8 +2637,10 @@ struct ExitSummary {
 }
 static EXIT_SUMMARY: std::sync::OnceLock<ExitSummary> = std::sync::OnceLock::new();
 static RUN_PANIC: std::sync::OnceLock<jit::PanicInfo> = std::sync::OnceLock::new();
-/// The exit worker has not finished the cache write yet (finish_run waits for it).
-static EXIT_PERSIST: AtomicBool = AtomicBool::new(false);
+/// The exit worker's cache write: not begun (0), under way (1), done (2). finish_run waits for
+/// it to begin and to end: a worker not yet scheduled when a fixed wait ran out lost the whole
+/// write (the quit's last code: Sandbox's ~4,000 teardown fns, built again by every session).
+static EXIT_STAGE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 /// How long the exit waits for background compiles to finish (they are abandoned
 /// at their next safe point). Not getting it means no cache write at all.
 const EXIT_QUIESCE_MS: u64 = 200;
@@ -2655,7 +2657,7 @@ fn start_exit_summary() {
     let (request, receive) = std::sync::mpsc::sync_channel::<(&'static str, Option<i32>)>(1);
     let worker = std::thread::Builder::new().name("run-exit".into()).spawn(move || {
         let Ok((why, code)) = receive.recv() else { return };
-        EXIT_PERSIST.store(true, Ordering::SeqCst);
+        EXIT_STAGE.store(1, Ordering::SeqCst);
         exit_mark("start");
         remove_present_report();
         if let Some(code) = code { report("exit", &code.to_string()); }
@@ -2677,7 +2679,7 @@ fn start_exit_summary() {
         }
         exit_mark("errors");
         summary_inner(why);
-        EXIT_PERSIST.store(false, Ordering::SeqCst);
+        EXIT_STAGE.store(2, Ordering::SeqCst);
         if let Some(dcx) = RUN_DIAGNOSTICS.lock().unwrap().as_ref() { dcx.flush_delayed(); }
         exit_mark("summary tail");
         exit_report();
@@ -2704,13 +2706,14 @@ fn finish_run(why: &'static str, code: Option<i32>) {
         eprintln!("makepad-run: {}", l);
     }
     if exit.request.try_send((why, code)).is_err() { return; }
-    // 100 ms for the cleanup, counted from the end of the cache write; the write itself only
-    // has a hang guard (a store on a stalled disk must not keep the process forever)
+    // 100 ms for the cleanup, counted from the end of the cache write; the write (and the
+    // worker's start before it) only has a hang guard (a store on a stalled disk must not keep
+    // the process forever)
     let start = Instant::now();
     let mut deadline = start + std::time::Duration::from_millis(100);
     while !exit.worker.is_finished() {
         let now = Instant::now();
-        if EXIT_PERSIST.load(Ordering::SeqCst) && now.duration_since(start).as_secs() < 30 {
+        if EXIT_STAGE.load(Ordering::SeqCst) < 2 && now.duration_since(start).as_secs() < 30 {
             deadline = now + std::time::Duration::from_millis(100);
         }
         if now >= deadline { break; }

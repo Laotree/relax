@@ -8965,6 +8965,32 @@ unsafe fn o1v_enqueue(up: *mut Unit, id: u32, inlined: bool) {
     o2_start(up);
 }
 
+/// The slots the code of slot `id` calls (`relocs`' slot and call targets) that have no code and
+/// no stored entry: each gets a standalone verified O1 build in the background, recorded as its
+/// entry (o1v_enqueue's inlined-only path), so the code recorded with them runs without lazy
+/// compiles in a later session. Owner thread.
+unsafe fn enqueue_uncompiled_callees(up: *mut Unit, id: u32, relocs: &[relax_backend::rir::RelocAt]) {
+    use relax_backend::rir::Reloc;
+    let mut todo = Vec::new();
+    for r in relocs {
+        let c = match r.target { Reloc::Slot(c) | Reloc::Call(c) => c, _ => continue };
+        let u = &*up;
+        if c == id || (c as usize) >= u.fns.len() || u.fns[c as usize].compiled || todo.contains(&c) {
+            continue;
+        }
+        todo.push(c);
+    }
+    for c in todo {
+        let u = &mut *up;
+        let Some(mut cache) = u.cache.take() else { return };
+        let stored = cache.has_stored_entry(u, c);
+        u.cache = Some(cache);
+        if !stored {
+            o1v_enqueue(up, c, true);
+        }
+    }
+}
+
 /// SPEC-V: the own build of a base slot running its twin's code (borrow_build_enqueue; a unit
 /// call, like o2_begin): the cache's entry linked when it has one (or code built ahead), else an
 /// O2 build. None: linked, or nothing to do (it got code meanwhile).
@@ -17629,6 +17655,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                                     o1v_enqueue(up, c, true);
                                 }
                             }
+                            // ... and the slots it calls that have no standalone code: the code that
+                            // ran before this one inlined them, so this session never called them,
+                            // and a warm launch running this code from its first frame compiled
+                            // each on the program's thread (glue and small helpers, a new set every
+                            // session as more O3 code was stored)
+                            enqueue_uncompiled_callees(up, id, &relocs);
                         }
                         O3_INSTALL_REC[0].fetch_add(1, Ordering::Relaxed);
                         O3_INSTALL_REC[1].fetch_add(cpu_ns() - tr, Ordering::Relaxed);
