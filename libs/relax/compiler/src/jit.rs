@@ -3000,7 +3000,7 @@ fn compile_failed_stub(slot: u32, p: &(dyn std::any::Any + Send)) -> u64 {
     let text = payload_text(p);
     owner::call(owner::Class::Program, || unsafe {
         let u = &mut *UNIT;
-        let name = u.fns.get(slot as usize).map_or_else(|| format!("slot {}", slot), |f| f.name.clone());
+        let name = if (slot as usize) < u.fns.len() { u.fns[slot as usize].name.clone() } else { format!("slot {}", slot) };
         let message = format!("internal compiler error compiling `{}` (slot {}) on its first call: {}", name, slot, text);
         eprintln!("makepad-run: {}", message);
         crate::inspect::flightrec::event("compile.ice", &message, slot as u64, 0);
