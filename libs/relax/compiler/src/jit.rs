@@ -7113,7 +7113,23 @@ unsafe fn compile_slot_on_stack(up: *mut Unit, id: u32) -> u64 {
         }
         return a;
     }
+    // MAKEPAD_RUN_CACHE_TRACE: which code version a program thread's lazy call came from (the
+    // trace says whether the slot then linked or compiled)
+    if crate::cache::trace_on() && !owner::is_owner() && !(&*up).fns[id as usize].compiled {
+        let mut frames = [0u64; crate::inspect::heap::DEPTH];
+        let n = crate::inspect::heap::capture_host(&mut frames) as usize;
+        let upn = up as usize;
+        owner::post(owner::Class::Publish, move || unsafe { trace_lazy_caller(upn as *mut Unit, id, &frames[..n]) });
+    }
     compile_slot_on_stack_rt(up, id)
+}
+
+/// The cache trace's `caller` line of a lazy call of slot `id` (owner thread).
+unsafe fn trace_lazy_caller(up: *mut Unit, id: u32, frames: &[u64]) {
+    let u = &*up;
+    let who = frames.iter().map(|r| r.wrapping_sub(1)).find(|pc| u.find_fn(*pc).is_some())
+        .map_or("no JIT frame".to_string(), |pc| describe_code(u, pc).unwrap_or_else(|| format!("{:#x}", pc)));
+    crate::cache::trace_lookup(u, id, &format!("caller {}", who.replace(['\t', '\n'], " ")));
 }
 
 unsafe fn compile_slot_on_stack_rt(up: *mut Unit, id: u32) -> u64 {
