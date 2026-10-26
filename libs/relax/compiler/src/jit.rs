@@ -14576,14 +14576,16 @@ fn ran_in_twin_code(u: &Unit, c: u32) -> bool {
     u.plain_twin_of(c).is_some_and(|t| u.fns[t as usize].rir.is_some() && !u.fns[t as usize].compiled)
 }
 
-/// SPEC-V: a background replacement (O3 build, O2 worker build) about to be installed calls, through
-/// `relocs`, base slots that have no code yet. Those whose twins have code borrow it (borrow_twin);
-/// those that ran only inlined into twin code (ran_in_twin_code) get an O2 build here, on this
-/// worker, before the swap -- and so do theirs, up to PREBUILD_MAX -- so the program's first calls
-/// into the new code never compile on its threads. After the first present only (startup stays
-/// lazy). Called off the owner, between a build and its install.
+/// A background replacement (O3 build, O2 worker build) about to be installed calls, through
+/// `relocs`, slots that have no code yet but ran inside the code it replaces (inlined there, or in
+/// twin code: an O3 build whose callees' bodies were not there yet keeps them as calls). SPEC-V
+/// bases whose twins have code borrow it (borrow_twin); the others link their stored entry, or get
+/// an O2 build here, on this worker, before the swap -- and so do theirs, up to PREBUILD_MAX -- so
+/// the program's first calls into the new code never compile on its threads (a warm session's
+/// first O3 tier-ups compiled ~100 such helpers on the UI thread). After the first present only
+/// (startup stays lazy). Called off the owner, between a build and its install.
 unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt]) {
-    if !borrow_on() || !FIRST_PRESENT.load(Ordering::Acquire) || TWINS_RAN.load(Ordering::Relaxed) == 0 {
+    if !FIRST_PRESENT.load(Ordering::Acquire) {
         return;
     }
     let calls = |relocs: &[relax_backend::rir::RelocAt]| -> Vec<u32> {
@@ -14601,9 +14603,12 @@ unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt]
             let u = &mut *up;
             cands.into_iter().filter(|&c| {
                 (c as usize) < u.fns.len() && !u.fns[c as usize].compiled && u.fns[c as usize].build_err.is_none()
-                    && matches!(u.fns[c as usize].key, FnKey::Inst(..) | FnKey::Closure(..))
-                    && (!u.fns[c as usize].twin_ran.load(Ordering::Relaxed) || u.borrow_twin(c).is_none())
-                    && ran_in_twin_code(u, c)
+                    && matches!(u.fns[c as usize].key, FnKey::Inst(..) | FnKey::Closure(..) | FnKey::Glue(..))
+                    && (!borrow_on() || !u.fns[c as usize].twin_ran.load(Ordering::Relaxed) || u.borrow_twin(c).is_none())
+                    // ran inside other code (inlined there, or in twin code), so the replacement's
+                    // first calls reach it: its stored entry is linked now, else it is built below
+                    && (ran_in_twin_code(u, c) || !u.fns[c as usize].history().inlined_into.is_empty())
+                    && ready_code_locked(up, c).is_none()
             }).collect()
         });
         for c in need {

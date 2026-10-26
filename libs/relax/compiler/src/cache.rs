@@ -7409,6 +7409,16 @@ impl Linker {
         self.cache().last_callees = callees;
         self.cache().last_thunks = thunks;
         self.cache().last_data = data;
+        if !is_o3 {
+            // the slots this code took in run inside it: a replacement that calls one instead
+            // (an O3 build missing its body) has it built before its swap (jit prebuild_callees);
+            // O3 entries register theirs at install (cached_tier1)
+            for &c in &inl {
+                if c != id && (c as usize) < u.fns.len() && !u.fns[c as usize].history().inlined_into.contains(&id) {
+                    crate::zone_alloc::kept_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(id));
+                }
+            }
+        }
         self.cache().last_tier1 = if is_o3 { Some(inl) } else { None };
         self.cache().last_o2 = tier == TIER_O2;
         self.cache().last_base = tier == TIER_BASE;
