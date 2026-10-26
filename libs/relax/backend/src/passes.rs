@@ -665,6 +665,12 @@ pub fn compact_vregs(f: &mut Func) {
     for p in f.nonnull.iter_mut() {
         *p = m(*p);
     }
+    // (the declared parameter types follow their vregs: a stale number names another parameter, and
+    // the wasm backend narrows a declared <= 32-bit one to i32 -- a u64 LiveId lost its high half)
+    f.param_ints.retain(|r| (r.0 .0 as usize) < map.len() && map[r.0 .0 as usize] != NONE);
+    for r in f.param_ints.iter_mut() {
+        r.0 = m(r.0);
+    }
     f.ranged.retain(|r| (r.0 .0 as usize) < map.len() && map[r.0 .0 as usize] != NONE);
     for r in f.ranged.iter_mut() {
         r.0 = m(r.0);
