@@ -2200,7 +2200,7 @@ fn rt_fmt_print(stream: u64) {
 }
 
 rt_fn! {
-pub(crate) fn rt_str_eq(p1: *const u8, l1: u64, p2: *const u8, l2: u64) -> u64 {
+pub(crate) leaf fn rt_str_eq(p1: *const u8, l1: u64, p2: *const u8, l2: u64) -> u64 {
     if l1 != l2 {
         return 0;
     }
@@ -2211,12 +2211,12 @@ pub(crate) fn rt_str_eq(p1: *const u8, l1: u64, p2: *const u8, l2: u64) -> u64 {
 }
 
 rt_fn! {
-fn rt_fmod(a: f64, b: f64) -> f64 {
+leaf fn rt_fmod(a: f64, b: f64) -> f64 {
     a % b
 }
 }
 rt_fn! {
-fn rt_fmodf(a: f32, b: f32) -> f32 {
+leaf fn rt_fmodf(a: f32, b: f32) -> f32 {
     a % b
 }
 }
@@ -2446,6 +2446,66 @@ fn raise_with(kind: &str, message: String, site: u64, fault: u64, rbp: u64, ret:
         let leave: rt_fn_ty!(fn(*mut u64, u64) -> !) = std::mem::transmute((&*UNIT).leave as usize);
         leave(ctx_ptr(), 1)
     }
+}
+
+/// The text of a native panic payload: its message, or what a control payload means.
+pub(crate) fn payload_text(p: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        return s.to_string();
+    }
+    if let Some(s) = p.downcast_ref::<String>() {
+        return s.clone();
+    }
+    if let Some(b) = p.downcast_ref::<crate::preempt::PublishBail>() {
+        return format!("a publish to the compiler's owner bailed (rule I-PUB: {} for slots {:?})", b.what, b.slots);
+    }
+    if p.is::<crate::preempt::OwnerBusy>() {
+        return "the compiler's owner was busy with an earlier request (OwnerBusy)".to_string();
+    }
+    if p.is::<crate::preempt::Preempted>() {
+        return "the work was preempted (Preempted)".to_string();
+    }
+    if p.is::<crate::preempt::NeedsLoad>() {
+        return "a build needs a module the lazy selection skipped (NeedsLoad)".to_string();
+    }
+    if p.is::<crate::preempt::NeedsUnit>() {
+        return "lowering ahead needs the unit lock (NeedsUnit)".to_string();
+    }
+    if p.is::<owner::ExitParked>() {
+        return "the process is ending (ExitParked)".to_string();
+    }
+    "(a panic payload of another type)".to_string()
+}
+
+/// The frame pointer of this native frame (frame pointers are kept on every target Relax runs on).
+#[inline(always)]
+fn own_frame_pointer() -> u64 {
+    let fp: u64;
+    #[cfg(target_arch = "x86_64")]
+    unsafe { std::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags)) };
+    #[cfg(target_arch = "aarch64")]
+    unsafe { std::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags)) };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    { fp = 0; }
+    fp
+}
+
+/// A native panic reached a runtime entry JIT code called (rt_fn!, rt_abi.rs). It must not unwind
+/// on: the JIT frames above have no native unwind tables, so the unwinder's search fails at them
+/// ("failed to initiate panic, error 5") and aborts, and the owner's silent hook printed nothing.
+/// It is printed here with its payload and continues as a Relax panic of the calling JIT code: to
+/// that code's recovery point (its catch_unwind, its thread's start); without one, an abort with
+/// the message (raise_with).
+#[cold]
+#[inline(never)]
+pub(crate) fn rt_boundary_panic(entry: &str, p: Box<dyn std::any::Any + Send>) -> ! {
+    let message = format!("internal error in the JIT runtime entry `{}`: {}", entry, payload_text(&*p));
+    eprintln!("makepad-run: {}", message);
+    crate::inspect::flightrec::event("rt.boundary", &message, 0, 0);
+    drop(p);
+    let fp = own_frame_pointer();
+    let ret = if fp == 0 { 0 } else { unsafe { *((fp + 8) as *const u64) } };
+    raise_with("panic", message, 0, 0, fp, ret, std::ptr::null())
 }
 
 /// Loop iterations one constant's evaluation may run before rustc's `long_running_const_eval`
@@ -2907,12 +2967,46 @@ fn rt_compile(slot: u64) -> u64 {
         return owner::call(owner::Class::Program, || unsafe { compile_slot(UNIT, slot as u32) });
     }
     let _frame = crate::inspect::timeline::CompileMark::begin();
-    unsafe {
-        let _exec_call = profile_path().map(|_| crate::exec_profile::call(UNIT as usize, slot as u32));
-        if profile_path().is_some() { (&*UNIT).exec_event(slot as u32, "call"); }
-        compile_slot(UNIT, slot as u32)
+    // a compile that fails with a native panic must not unwind into the JIT frames that called
+    // (rt_abi.rs): work the owner cancelled is compiled again; a failure gives this call a stub
+    // that panics in JIT code with the payload (its frames unwind as any panic does), and the
+    // slot stays lazy, so the next call compiles again
+    let mut cancelled = 0u32;
+    loop {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            let _exec_call = profile_path().map(|_| crate::exec_profile::call(UNIT as usize, slot as u32));
+            if profile_path().is_some() { (&*UNIT).exec_event(slot as u32, "call"); }
+            compile_slot(UNIT, slot as u32)
+        }));
+        match r {
+            Ok(a) => return a,
+            Err(p) if crate::preempt::is_cancelled(&*p) && cancelled < COMPILE_CANCEL_RETRIES => cancelled += 1,
+            Err(p) => return compile_failed_stub(slot as u32, &*p),
+        }
     }
 }
+}
+
+/// Cancelled compiles of one lazy call (a preemption, the owner busy with an earlier request) are
+/// redone this many times before the call gets a failure stub: a count, not a clock.
+const COMPILE_CANCEL_RETRIES: u32 = 1000;
+
+/// The code a lazy call of `slot` runs when its compile failed with native panic `p`: a stub that
+/// panics with the payload in JIT code (not installed: the next call compiles again). Printed with
+/// the fn's name here, since the owner's panic hook is silent.
+#[cold]
+#[inline(never)]
+fn compile_failed_stub(slot: u32, p: &(dyn std::any::Any + Send)) -> u64 {
+    let text = payload_text(p);
+    owner::call(owner::Class::Program, || unsafe {
+        let u = &mut *UNIT;
+        let name = u.fns.get(slot as usize).map_or_else(|| format!("slot {}", slot), |f| f.name.clone());
+        let message = format!("internal compiler error compiling `{}` (slot {}) on its first call: {}", name, slot, text);
+        eprintln!("makepad-run: {}", message);
+        crate::inspect::flightrec::event("compile.ice", &message, slot as u64, 0);
+        let (code, relocs) = error_stub(u, &message);
+        u.emit_or_redirect(&code, &relocs, "error stub").unwrap_or_else(|e| panic!("{}; and its error stub was not emitted: {}", message, e))
+    })
 }
 
 // ------------------------------------------------------------ compiler stack
@@ -7323,6 +7417,7 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
             let t1 = wall_ns();
             SPLIT_NS[2].fetch_add(t1 - t, Ordering::Relaxed);
             main_rec(|r| r.ns[4] += t1 - t);
+            test_compile_panic(up, id);
             let r = split_finish(up, done);
             if let Split::Installed(_) = r {
                 compile_note(up, id, w0);
@@ -7333,6 +7428,19 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
             Split::Installed(a) => return a,
             Split::Restart => continue,
             Split::Spec | Split::Failed(_) => unreachable!("a lazy compile's finish installs"),
+        }
+    }
+}
+
+/// MAKEPAD_RUN_TEST_COMPILE_PANIC=<name part>: the owner panics while it finishes the lazy compile
+/// of a fn whose name contains it (tools/run/fixture/compile_panic.sh: a native panic in the
+/// compile a JIT call started reaches rt_compile, which must not unwind into JIT frames).
+unsafe fn test_compile_panic(up: *mut Unit, id: u32) {
+    static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if let Some(w) = WANT.get_or_init(|| std::env::var("MAKEPAD_RUN_TEST_COMPILE_PANIC").ok().filter(|w| !w.is_empty())) {
+        let name = &(&*up).fns[id as usize].name;
+        if name.contains(w.as_str()) {
+            panic!("MAKEPAD_RUN_TEST_COMPILE_PANIC: forced owner panic finishing the compile of `{}`", name);
         }
     }
 }
