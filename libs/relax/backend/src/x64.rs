@@ -517,6 +517,25 @@ impl Asm {
         self.u32(0);
         p
     }
+    /// `n` bytes of padding as multi-byte nops (the recommended 1..9-byte forms)
+    fn nops(&mut self, mut n: usize) {
+        const NOPS: [&[u8]; 9] = [
+            &[0x90],
+            &[0x66, 0x90],
+            &[0x0f, 0x1f, 0x00],
+            &[0x0f, 0x1f, 0x40, 0x00],
+            &[0x0f, 0x1f, 0x44, 0x00, 0x00],
+            &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
+            &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
+            &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+            &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        ];
+        while n > 0 {
+            let k = n.min(9);
+            self.b.extend_from_slice(NOPS[k - 1]);
+            n -= k;
+        }
+    }
     fn patch(&mut self, at: usize, target: usize) {
         let rel = target as i64 - (at as i64 + 4);
         // rel32 (jmp / jcc / rip-relative pool loads): +-2 GB, never truncated
@@ -1129,11 +1148,19 @@ struct Gen<'a> {
     fwd_at: Vec<usize>,
     /// the second pass: the first pass's forward-jump starts and block positions. A jump whose
     /// first-pass distance fits rel8 is emitted short (code between only shrinks in this pass)
-    fwd_hint: Option<std::rc::Rc<(Vec<usize>, Vec<usize>)>>,
+    fwd_hint: Option<std::rc::Rc<(Vec<usize>, Vec<usize>, Vec<u32>, Vec<u32>)>>,
     /// rel8 fields of short forward jumps: (byte position, target block)
     fixups8: Vec<(usize, u32)>,
     /// a short forward jump that did not reach (the first pass's code is used)
     short_miss: bool,
+    /// align loop heads to 16 bytes (optimised code), and the block frequencies that pick them
+    align_loops: bool,
+    freq: Option<Vec<f32>>,
+    /// per forward jump (fwd_at): loop-head paddings emitted before it; per block: before its start
+    /// (a padding may grow by up to 15 bytes in the second pass: short_fwd's bound counts them)
+    fwd_pads: Vec<u32>,
+    block_pads: Vec<u32>,
+    pads_n: u32,
 }
 
 impl<'a> Gen<'a> {
@@ -1654,10 +1681,18 @@ impl<'a> Gen<'a> {
             }
         }
         self.thru_blocks(&reach);
+        let align = self.loop_heads(&reach);
+        self.block_pads = vec![0; nb];
         for bi in 0..nb {
             if !reach[bi] {
                 continue;
             }
+            if align.get(bi) == Some(&true) {
+                let pad = (16 - self.a.pos() % 16) % 16;
+                self.a.nops(pad);
+                self.pads_n += 1;
+            }
+            self.block_pads[bi] = self.pads_n;
             self.block_pos[bi] = self.a.pos();
             if bi != 0 && self.dom_read.get(bi) == Some(&true) {
                 // a value live into this block may be in rax (keeps_rax): the TLS read's slow path
@@ -2863,6 +2898,49 @@ impl<'a> Gen<'a> {
             .collect();
     }
 
+    /// The loop heads aligned to 16 bytes (LLVM MachineBlockPlacement::alignBlocks, x86's 16-byte
+    /// loop alignment): a block that a later block jumps back to, not cold next to the entry
+    /// (frequency >= entry / 5), entered mostly by its back edges: the block laid out before it
+    /// does not fall into it, or what falls in is at most a fifth of its frequency. Without
+    /// frequencies every such head.
+    fn loop_heads(&self, reach: &[bool]) -> Vec<bool> {
+        let nb = self.f.blocks.len();
+        let mut a = vec![false; nb];
+        if !self.align_loops {
+            return a;
+        }
+        for bj in 0..nb {
+            if !reach[bj] {
+                continue;
+            }
+            for s in self.f.blocks[bj].term.succs() {
+                let t = self.thru(s) as usize;
+                if t <= bj && t > 0 && reach[t] {
+                    a[t] = true;
+                }
+            }
+        }
+        if let Some(fr) = &self.freq {
+            let entry = fr.first().copied().unwrap_or(0.0);
+            let mut prev: Option<usize> = None;
+            for b in 0..nb {
+                if !reach[b] {
+                    continue;
+                }
+                if a[b] {
+                    let h = fr[b];
+                    let fall = prev.map_or(0.0, |p| {
+                        let into = self.f.blocks[p].term.succs().filter(|&x| self.thru(x) as usize == b).count();
+                        if into == 0 { 0.0 } else { fr[p] * into as f32 / self.f.blocks[p].term.succs().count().max(1) as f32 }
+                    });
+                    a[b] = h >= entry * 0.2 && fall <= h * 0.2;
+                }
+                prev = Some(b);
+            }
+        }
+        a
+    }
+
     fn thru(&self, b: u32) -> u32 {
         self.thru.get(b as usize).copied().unwrap_or(b)
     }
@@ -2911,9 +2989,10 @@ impl<'a> Gen<'a> {
     fn short_fwd(&mut self, target: u32) -> bool {
         let k = self.fwd_at.len();
         self.fwd_at.push(self.a.pos());
+        self.fwd_pads.push(self.pads_n);
         let Some(h) = &self.fwd_hint else { return false };
-        match (h.0.get(k), h.1.get(target as usize)) {
-            (Some(&c1), Some(&t1)) if t1 != usize::MAX && t1 > c1 => t1 - c1 - 2 <= 127,
+        match (h.0.get(k), h.1.get(target as usize), h.2.get(k), h.3.get(target as usize)) {
+            (Some(&c1), Some(&t1), Some(&p1), Some(&pt)) if t1 != usize::MAX && t1 > c1 => t1 - c1 - 2 + 15 * pt.saturating_sub(p1) as usize <= 127,
             _ => false,
         }
     }
@@ -6665,6 +6744,11 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         fwd_hint: None,
         fixups8: Vec::new(),
         short_miss: false,
+        align_loops: env.opt_regs && !crate::stats::opt_off(options, "-alignloops"),
+        freq: freq.filter(|fr| fr.len() == f.blocks.len()).map(|fr| fr.to_vec()),
+        fwd_pads: Vec::new(),
+        block_pads: Vec::new(),
+        pads_n: 0,
     };
     g.zero_above = crate::passes::zero_above(options, g.f, &g.low_only);
     if env.opt_regs || g.f.full {
@@ -6681,7 +6765,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     g.gen(options);
     if let Some(mut g2) = first {
         if !g.fwd_at.is_empty() {
-            g2.fwd_hint = Some(std::rc::Rc::new((std::mem::take(&mut g.fwd_at), g.block_pos.clone())));
+            g2.fwd_hint = Some(std::rc::Rc::new((std::mem::take(&mut g.fwd_at), g.block_pos.clone(), std::mem::take(&mut g.fwd_pads), std::mem::take(&mut g.block_pads))));
             g2.gen(options);
             if !g2.short_miss {
                 g = g2;
