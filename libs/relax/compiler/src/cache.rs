@@ -306,7 +306,9 @@ pub mod warm_count {
     pub const O1V_BUILT: usize = 42;
     pub const O1V_WRITTEN: usize = 43;
     pub const O1V_DROPPED: usize = 44;
-    pub static N: [AtomicU64; 45] = [const { AtomicU64::new(0) }; 45];
+    /// SPEC-V: bodies with no entry of their own that linked their twin's stored entry
+    pub const TWIN_ENTRY: usize = 45;
+    pub static N: [AtomicU64; 46] = [const { AtomicU64::new(0) }; 46];
     #[inline]
     pub fn add(k: usize, n: u64) {
         N[k].fetch_add(n, Relaxed);
@@ -336,6 +338,9 @@ pub fn warm_summary() -> String {
         why.push(format!("did not decode/link {}", k(g(LINK_FAIL))));
         why.push(format!("fn not storable {}", k(g(NO_KEY))));
         s.push_str(&format!(" ({})", why.join(", ")));
+    }
+    if g(TWIN_ENTRY) > 0 {
+        s.push_str(&format!("; {} bodies without an entry of their own ran their twin's stored code", k(g(TWIN_ENTRY))));
     }
     if g(IMG_PLACED) + g(IMG_STALE) + g(IMG_FAILED) > 0 {
         s.push_str(&format!("; startup image: {} slots placed, {} stale, {} failed, {} had code", k(g(IMG_PLACED)), k(g(IMG_STALE)), k(g(IMG_FAILED)), k(g(IMG_HAD_CODE))));
@@ -7202,6 +7207,36 @@ impl Linker {
                 found = true;
                 trace_lookup(u, id, "hit");
                 r = self.link_entry(u, id, payload);
+            }
+        }
+        // SPEC-V: a body with no entry of its own whose unverified-mode twin has one (an earlier
+        // session ran the twin: its callers' code was lowered before their verdicts) runs the
+        // twin's stored code, as borrow_twin lends a twin's code within a session: the same body,
+        // built for unverified callers, sound for every caller. Verified code recorded since
+        // (a caller's O2/O3 rebuild) calls the base directly; without this its first call compiled
+        // the base on the program's thread, then the base's callees, one session deeper each time.
+        // It tiers up from here like any linked entry (its O3 build is recorded under its own key).
+        if !found && matches!(u.fns[id as usize].key, FnKey::Inst(..) | FnKey::Closure(..)) && u.fns[id as usize].build_err.is_none() {
+            if let Some((tk, _, _)) = self.cache().code_key_bytes(u, &FnKey::Plain(id)) {
+                let at = self.cache().index_at(tk);
+                let pack = at.map(|(p, _)| self.cache().stores[p as usize].clone());
+                if let Some((KIND_CODE, payload)) = pack.as_ref().and_then(|pk| pk.get_checked_at(at.map_or(0, |a| a.1) as usize, tk)).filter(|(_, p)| !p.is_empty()) {
+                    if self.cert_valid(u, payload) != Some(false) {
+                        if let Some(x) = self.link_entry(u, id, payload) {
+                            trace_keyed(u, id, "hit:twin", Some(tk));
+                            warm_count::add(warm_count::TWIN_ENTRY, 1);
+                            self.cache().stats.hits += 1;
+                            warm_count::add(warm_count::HIT, 1);
+                            if std::mem::take(&mut self.cache().last_base) {
+                                self.cache().base_linked.insert(id);
+                            }
+                            self.cache().linked.insert(id);
+                            self.cache().linked_key.insert(id, tk);
+                            self.cache().stats.link_ns += crate::jit::wall_ns() - t0;
+                            return Some(x);
+                        }
+                    }
+                }
             }
         }
         if !found {

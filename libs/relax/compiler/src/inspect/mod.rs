@@ -984,6 +984,17 @@ fn cmd_jit(req: &Req, out: &mut Out) {
     let ms = (t0.elapsed().as_millis() as u64).max(1);
     out.measured("JIT compile activity", "postframe::activity (atomics + O2/O3 queue locks), two looks", &[]);
     out.line(&jit_line(&a, &b, ms));
+    // the session so far (cumulative): what was compiled -- first compiles the program waited for,
+    // first compiles ahead, O2 / verified O1 builds, O3 builds -- and what came from the disk cache
+    out.line(&format!(
+        "session: compiled {} first (program threads {}, ahead {}), O2 {}, O3 {}; warm links {}",
+        b.compiled,
+        crate::jit::demand_compiled(),
+        crate::jit::SPEC_FNS.load(std::sync::atomic::Ordering::Relaxed),
+        b.o2_done,
+        b.o3_done,
+        b.linked
+    ));
 }
 
 /// The `jit` answer from two looks `ms` apart.
