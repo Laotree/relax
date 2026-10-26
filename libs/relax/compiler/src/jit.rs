@@ -7646,7 +7646,6 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                         PENDING_RECORDS.fetch_add(1, Ordering::Relaxed);
                         crate::cache::warm_count::add(crate::cache::warm_count::RECORDS_WAITING, 1);
                     }
-                    enqueue_uncompiled_callees(up, id, relocs);
                 }
             }
             let u = &mut *up;
@@ -8973,19 +8972,24 @@ unsafe fn o1v_enqueue(up: *mut Unit, id: u32, inlined: bool) {
     o2_start(up);
 }
 
-/// The slots the code of slot `id` calls (`relocs`' slot and call targets) that have no code: each
-/// gets a standalone verified O1 build in the background, recorded as its entry (o1v_enqueue's
-/// standalone path; o1v_begin drops a slot that has an entry), so the code recorded with them runs
-/// without lazy compiles in a later session whose path through it differs (a warm session runs
-/// faster: other branches, other drops). One level only: called for code that was installed to
-/// run (first builds, O2, O3), never for these standalone builds. Owner thread.
-unsafe fn enqueue_uncompiled_callees(up: *mut Unit, id: u32, relocs: &[relax_backend::rir::RelocAt]) {
+/// A background build (O2, O3, a verified O1 rebuild) replaces the code that ran and becomes the
+/// slot's entry: the slots it calls (`relocs`' slot and call targets) that have no code get a
+/// standalone verified O1 build in the background, recorded as their entry (o1v_enqueue's
+/// standalone path; o1v_begin drops a slot that has an entry). The code that ran reached them
+/// another way (inlined, through a twin, an unverified lowering), so this session never called
+/// them; the next one runs the replacement from its first frame and compiled each on the
+/// program's thread. `glue_only`: from a standalone build itself only its drop glue (a dropped
+/// value's whole drop runs; its other callees stay lazy: no walk of the call graph). Owner thread.
+unsafe fn enqueue_uncompiled_callees(up: *mut Unit, id: u32, relocs: &[relax_backend::rir::RelocAt], glue_only: bool) {
     use relax_backend::rir::Reloc;
     let mut todo = Vec::new();
     for r in relocs {
         let c = match r.target { Reloc::Slot(c) | Reloc::Call(c) => c, _ => continue };
         let u = &*up;
         if c == id || (c as usize) >= u.fns.len() || u.fns[c as usize].compiled || todo.contains(&c) {
+            continue;
+        }
+        if glue_only && !matches!(u.fns[c as usize].key, FnKey::Glue(..)) {
             continue;
         }
         todo.push(c);
@@ -9311,6 +9315,8 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
             cache.record_o1_verified(u, id, &c.code, &c.relocs, &c.pc_map);
             u.cache = Some(cache);
         }
+        let standalone = O1V_STANDALONE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&(up as usize, id)));
+        enqueue_uncompiled_callees(up, id, &c.relocs, standalone);
         // a slot with no code of its own (only inlined so far) gets only the entry: its first call
         // links it
         if !u.fns[id as usize].compiled {
@@ -9322,7 +9328,7 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
         cache.note_retier_over(u, id, crate::cache::warm_count::RETIER_O2_OVER);
         cache.record_o2(u, id, &c.code, &c.relocs, &c.pc_map);
         u.cache = Some(cache);
-        enqueue_uncompiled_callees(up, id, &c.relocs);
+        enqueue_uncompiled_callees(up, id, &c.relocs, false);
     }
     // an O3 build of the slot is running (queued with this one: tier1_thread's o2_hot): this install
     // would change the slot under it, and it would be dropped and built again (cold Stage: 1.8k O3
@@ -17667,7 +17673,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                             // and a warm launch running this code from its first frame compiled
                             // each on the program's thread (glue and small helpers, a new set every
                             // session as more O3 code was stored)
-                            enqueue_uncompiled_callees(up, id, &relocs);
+                            enqueue_uncompiled_callees(up, id, &relocs, false);
                         }
                         O3_INSTALL_REC[0].fetch_add(1, Ordering::Relaxed);
                         O3_INSTALL_REC[1].fetch_add(cpu_ns() - tr, Ordering::Relaxed);
