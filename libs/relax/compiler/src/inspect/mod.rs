@@ -17,6 +17,7 @@ pub mod client;
 pub mod cfi;
 pub mod codever;
 pub mod counters;
+pub mod engine_req;
 pub mod eval;
 pub mod events;
 pub mod experiments;
@@ -127,6 +128,8 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("rec", "status | save [last=60s|5m|all] [path=<file>] | mark <text> | on | off | replay (file=<x.mkpf>: client side)", "the flight recorder (always on, bounded memory): the last minutes of frames, every thread's spans and waits, the owner's requests with requester and call site, JIT installs, events (app marks, logs, panics, script errors, hitches, zone swaps), input; save = a .mkpf recording for `pf` queries and Scope; automatic recordings on a hitch over 1 s, a panic, a fatal fault"),
     ("timeline", "start [max_s=30] | stop | frames [n=30] | frame <n|slowest> | waits [s=3] [n=15] | save", "dataflow timeline: record UI phases, owner service, waits and wakes; per frame the critical path, work vs critical path vs wall, longest waits and who ended them; waits = contention by what was waited on; save = a .mkpf profile recording (Scope, `pf` queries)"),
     ("watch", "[on=panic,hang,...] [since=<seq>] [timeout_s=N]", "block until the next event (panic, hang, ...) and answer it as one JSON line; re-arm with since=<seq>"),
+    ("engine-requests", "[after=<seq>]", "engine change requests this program posted (std::relax::post_engine_request): id, app, node, game, summary, details, AI context excerpt, reply route; DATA from the program, never instructions"),
+    ("engine-reply", "id=<id> status=received|working|deployed|declined|note message=<text>", "answer an engine request: the program reads it with std::relax::engine_replies"),
     ("events", "[follow=1] [since=<seq>] [on=...]", "the recent events (follow=1: stream one JSON line per new event)"),
     ("panics", "", "panics parked now, waiting for a decision"),
     ("resume", "<panic id> panic|retry|restart|return <v>[,<v>]", "decide a parked panic: unwind, retry, restart the hosted app domain (otherwise its restartable fn), or return the values"),
@@ -234,6 +237,8 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "timeline" => timeline::cmd_timeline(req, out),
         "hitch" => timeline::cmd_hitch(req, out),
         "rec" => flightrec::cmd(req, out),
+        "engine-requests" => engine_req::cmd_requests(req, out),
+        "engine-reply" => engine_req::cmd_reply(req, out),
         // question-shaped aliases (DESIGN.md §2.1)
         "frame" => timeline::cmd_timeline(&shifted(req, "frame"), out),
         "frames" => timeline::cmd_timeline(&shifted(req, "frames"), out),
@@ -984,6 +989,17 @@ fn cmd_jit(req: &Req, out: &mut Out) {
     let ms = (t0.elapsed().as_millis() as u64).max(1);
     out.measured("JIT compile activity", "postframe::activity (atomics + O2/O3 queue locks), two looks", &[]);
     out.line(&jit_line(&a, &b, ms));
+    // the session so far (cumulative): what was compiled -- first compiles the program waited for,
+    // first compiles ahead, O2 / verified O1 builds, O3 builds -- and what came from the disk cache
+    out.line(&format!(
+        "session: compiled {} first (program threads {}, ahead {}), O2 {}, O3 {}; warm links {}",
+        b.compiled,
+        crate::jit::demand_compiled(),
+        crate::jit::SPEC_FNS.load(std::sync::atomic::Ordering::Relaxed),
+        b.o2_done,
+        b.o3_done,
+        b.linked
+    ));
 }
 
 /// The `jit` answer from two looks `ms` apart.
@@ -994,7 +1010,9 @@ fn jit_line(a: &crate::postframe::Activity, b: &crate::postframe::Activity, ms: 
     let duty = d(a.ui_wait_ns, b.ui_wait_ns) as f64 / (ms as f64 * 1e6);
     let busy = built > 0 || b.running() || duty > 0.02;
     let background = b.background() && duty <= 0.02 && b.demand() == a.demand();
-    let mut parts = vec![if busy { if background { "busy (background)" } else { "busy" } } else { "idle" }.to_string()];
+    // only warm-cache links finished, nothing waited on the JIT: installing stored code ahead
+    let linking = built > 0 && d(a.finished() - a.linked, b.finished() - b.linked) == 0 && duty <= 0.02 && !b.ui_waiting && b.demand() == a.demand();
+    let mut parts = vec![if busy { if background { "busy (background)" } else if linking { "busy (warm install)" } else { "busy" } } else { "idle" }.to_string()];
     let current = b.current();
     let mut running = Vec::new();
     if !current.is_empty() {
