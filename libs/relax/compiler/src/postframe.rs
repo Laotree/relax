@@ -43,18 +43,85 @@ static UI_WAITING: AtomicU64 = AtomicU64::new(0);
 static UI_WAIT_START: AtomicU64 = AtomicU64::new(0);
 /// wall ns the last UI-thread JIT wait ended
 static UI_WAIT_END: AtomicU64 = AtomicU64::new(0);
-/// ns the UI thread spent in (outermost) JIT waits so far, and that sum at its last frame
+/// ns the UI thread spent in (outermost) JIT waits so far
 static UI_WAIT_SUM: AtomicU64 = AtomicU64::new(0);
 static UI_WAIT_SUM_AT_FRAME: AtomicU64 = AtomicU64::new(0);
 /// builds ahead (speculative / prepared) finished after the first present, and running now
 pub(crate) static AHEAD_DONE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static AHEAD_RUNNING: AtomicU64 = AtomicU64::new(0);
 
+// ------------------------------------------------------------ UI blocks (the JIT ring's rule)
+
+/// The JIT's indicator (the run's ring, the warm-up veil) shows only past a real wait: one
+/// episode of the UI thread blocked on the JIT for this long. An episode is the UI thread's JIT
+/// waits with no frame between them and no gap of EPISODE_GAP_NS or more between two of them (one
+/// long compile, or a load's thousands of short ones back to back); its blocked time is the sum of
+/// those waits, not the episode's wall span.
+pub const BLOCK_SHOW_NS: u64 = 100_000_000;
+const EPISODE_GAP_NS: u64 = 50_000_000;
+/// ns of the current episode's ended waits; the episode reached BLOCK_SHOW_NS (counted once)
+static EP_SUM: AtomicU64 = AtomicU64::new(0);
+static EP_SHOWN: AtomicBool = AtomicBool::new(false);
+/// after the first present, until the quit: the longest episode's blocked ns, the blocked ns of
+/// all episodes, the episodes that reached BLOCK_SHOW_NS (the indicator showed), and the wall ns
+/// the last of those last blocked
+static EP_MAX: AtomicU64 = AtomicU64::new(0);
+static EP_ALL: AtomicU64 = AtomicU64::new(0);
+static EP_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static EP_BLOCKED_AT: AtomicU64 = AtomicU64::new(0);
+
+/// An episode's blocked time so far is `sum` ns at `now` (counts it once it is a block).
+fn episode_at(sum: u64, now: u64) {
+    if crate::jit::QUIT_SEEN.load(Relaxed) {
+        return;
+    }
+    EP_MAX.fetch_max(sum, Relaxed);
+    if sum >= BLOCK_SHOW_NS {
+        EP_BLOCKED_AT.store(now, Relaxed);
+        if !EP_SHOWN.swap(true, Relaxed) {
+            EP_BLOCKS.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// The current episode ends (a frame, or a gap between two waits).
+fn episode_end() {
+    EP_SUM.store(0, Relaxed);
+    EP_SHOWN.store(false, Relaxed);
+}
+
+/// How long the UI thread has been blocked on the JIT in its current episode (its open wait
+/// included; 0 before the first present, or when the last episode has ended). Atomics only.
+pub fn ui_blocked_ns() -> u64 {
+    if present_ns() == 0 {
+        return 0;
+    }
+    let now = wall_ns();
+    if UI_WAITING.load(Relaxed) > 0 {
+        let start = UI_WAIT_START.load(Relaxed).max(LAST_FRAME.load(Relaxed));
+        return EP_SUM.load(Relaxed) + now.saturating_sub(start);
+    }
+    if now.saturating_sub(UI_WAIT_END.load(Relaxed)) >= EPISODE_GAP_NS {
+        return 0;
+    }
+    EP_SUM.load(Relaxed)
+}
+
+/// The UI blocks so far after the first present: the longest episode's blocked ns, all episodes'
+/// blocked ns, and the episodes of BLOCK_SHOW_NS or more (the JIT indicator showed for each).
+pub fn ui_blocks() -> (u64, u64, u64) {
+    (EP_MAX.load(Relaxed), EP_ALL.load(Relaxed), EP_BLOCKS.load(Relaxed))
+}
+
 /// The UI (main) thread begins / ends a wait on the JIT (jit.rs lazy compiles, owner.rs requests).
 pub(crate) fn ui_wait_begin() {
     let outer = UI_WAITING.load(Relaxed) == 0;
     if outer {
-        UI_WAIT_START.store(wall_ns(), Relaxed);
+        let now = wall_ns();
+        if now.saturating_sub(UI_WAIT_END.load(Relaxed)) >= EPISODE_GAP_NS {
+            episode_end();
+        }
+        UI_WAIT_START.store(now, Relaxed);
     }
     UI_WAITING.fetch_add(1, Relaxed);
     if outer {
@@ -80,7 +147,18 @@ pub(crate) fn ui_wait_end() {
     let now = wall_ns();
     UI_WAIT_END.store(now, Relaxed);
     if UI_WAITING.fetch_sub(1, Relaxed) == 1 {
-        UI_WAIT_SUM.fetch_add(now.saturating_sub(UI_WAIT_START.load(Relaxed)), Relaxed);
+        let start = UI_WAIT_START.load(Relaxed);
+        UI_WAIT_SUM.fetch_add(now.saturating_sub(start), Relaxed);
+        let fp = present_ns();
+        if fp != 0 {
+            // (a wait open across the first present or a frame counts from it)
+            let dt = now.saturating_sub(start.max(fp).max(LAST_FRAME.load(Relaxed)));
+            let sum = EP_SUM.fetch_add(dt, Relaxed) + dt;
+            if !crate::jit::QUIT_SEEN.load(Relaxed) {
+                EP_ALL.fetch_add(dt, Relaxed);
+            }
+            episode_at(sum, now);
+        }
     }
 }
 
@@ -463,8 +541,18 @@ pub(crate) extern "C" fn relax_frame_done() {
     FRAMES.fetch_add(1, Relaxed);
     let now = wall_ns();
     let fp = present_ns();
+    // an open UI wait's part so far belongs to the episode this frame ends
+    if UI_WAITING.load(Relaxed) > 0 && fp != 0 {
+        let start = UI_WAIT_START.load(Relaxed).max(fp).max(LAST_FRAME.load(Relaxed));
+        let dt = now.saturating_sub(start);
+        if !crate::jit::QUIT_SEEN.load(Relaxed) {
+            EP_ALL.fetch_add(dt, Relaxed);
+        }
+        episode_at(EP_SUM.load(Relaxed) + dt, now);
+    }
     let last = LAST_FRAME.swap(now, Relaxed);
     UI_WAIT_SUM_AT_FRAME.store(UI_WAIT_SUM.load(Relaxed), Relaxed);
+    episode_end();
     let compiled = MAIN_COMPILE_NS.load(Relaxed);
     static COMPILED_AT_LAST: AtomicU64 = AtomicU64::new(0);
     let compiled_before = COMPILED_AT_LAST.swap(compiled, Relaxed);
