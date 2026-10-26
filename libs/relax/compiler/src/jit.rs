@@ -8785,8 +8785,8 @@ const D_KEPT: usize = 7;
 const D_INSTALL: usize = 8;
 const O2_DROP_NAMES: [&str; 9] = ["panic", "verdict wait", "error/key", "build open", "front", "take", "stale/link", "stored, not installed", "install"];
 pub static O2_DROPS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
-/// O2 jobs the O2 worker took from its queues (a job requeued while a lazy compile of its slot runs
-/// counts again)
+/// O2 builds begun: the O2 worker's jobs (one requeued while a lazy compile of its slot runs counts
+/// again) and prebuild_callees' builds
 static O2_TAKEN: AtomicU64 = AtomicU64::new(0);
 /// O2 takes dropped by take_prefronted, by cause (TD_*), and for failed fronts by AF_* reason
 /// (own slot, a candidate's)
@@ -15019,6 +15019,7 @@ unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt]
                 (&*up).fns[c as usize].hot_hint.store(true, Ordering::Relaxed);
                 (&*up).front.clone()
             });
+            O2_TAKEN.fetch_add(1, Ordering::Relaxed);
             let Some(w) = take_prefronted(&front, Some(c), || o2_begin(up, c)).unwrap_or_else(|| { o2_take_dropped(up, c); None }) else { continue };
             let done = w.run();
             if let Ok(Ok((_, _, cc))) = &done.built {

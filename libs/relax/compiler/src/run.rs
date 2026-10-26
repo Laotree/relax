@@ -2627,6 +2627,8 @@ extern "C" fn at_exit() {
         verbose!("makepad-run quit: {} lazy compiles after the quit request, {:.0} ms",
             jit::QUIT_COMPILES[0].load(Ordering::Relaxed), jit::QUIT_COMPILES[1].load(Ordering::Relaxed) as f64 / 1e6);
     }
+    // (here, not in the run summary: every exit passes this point)
+    verbose!("makepad-run: {}", jit::o2_drop_census());
     finish_run("exit", EXIT_SUMMARY.get().and_then(|exit| exit.code.get().copied()));
 }
 
@@ -3335,7 +3337,6 @@ fn summary_inner(why: &str) {
             let fail: Vec<String> = (1..jit::PREFRONT_FAIL.len()).map(|i| format!("{} {}", jit::PREFRONT_FAIL_NAMES[i], jit::PREFRONT_FAIL[i].load(Ordering::Relaxed))).collect();
             verbose!("makepad-run: background takes (rule I-PURE): {} fronts run off the owner ({:.0} ms cpu; made nothing: {}); bails: front {}, initializer {}, jit {}, wait {}; builds dropped {}",
                 pf(0), pf(1) as f64 / 1e6, fail.join(", "), b(0), b(1), b(2), b(3), b(crate::owner::BAIL_DROPPED));
-            verbose!("makepad-run: {}", jit::o2_drop_census());
             let m = |i: usize| crate::owner::MAIN_ACC[i].load(Ordering::Relaxed);
             verbose!("makepad-run: main thread's {} owner requests: waited {:.0} ms (queue delay before service {:.0} ms, wake delay after completion {:.0} ms); by wait length <20us {} ({:.0} ms), <200us {} ({:.0} ms), <2ms {} ({:.0} ms), longer {} ({:.0} ms)",
                 m(0), m(1) as f64 / 1e6, m(2) as f64 / 1e6, m(3) as f64 / 1e6, m(4), m(5) as f64 / 1e6, m(6), m(7) as f64 / 1e6, m(8), m(9) as f64 / 1e6, m(10), m(11) as f64 / 1e6);
