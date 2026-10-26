@@ -605,18 +605,23 @@ impl Me {
     }
 }
 
-static LOCAL: OnceLock<Option<Me>> = OnceLock::new();
+static LOCAL: OnceLock<Me> = OnceLock::new();
 
 /// This process's machine identity: installed with [`install_local`], else
-/// loaded once from [`dir`]. None: this machine has no fleet credential.
+/// loaded from [`dir`] (kept once found; a machine without one is looked at
+/// again on the next call, so an identity installed later is picked up).
 pub fn me() -> Option<&'static Me> {
-    LOCAL.get_or_init(|| Me::load(&dir()).ok()).as_ref()
+    if let Some(me) = LOCAL.get() {
+        return Some(me);
+    }
+    let me = Me::load(&dir()).ok()?;
+    Some(LOCAL.get_or_init(|| me))
 }
 
-/// Sets this process's identity (tests, or a process with an explicit
-/// fleet dir). First call wins, as does a load by [`me`] before it.
+/// Sets this process's identity (tests, pairing, or a process with an
+/// explicit fleet dir). First identity wins.
 pub fn install_local(me: Me) {
-    let _ = LOCAL.set(Some(me));
+    let _ = LOCAL.set(me);
 }
 
 /// Why [`me`] is None, for messages.
@@ -627,16 +632,20 @@ pub fn why_no_identity() -> String {
     }
 }
 
-static FLEET: OnceLock<Option<Fleet>> = OnceLock::new();
+static FLEET: OnceLock<Fleet> = OnceLock::new();
 
-/// This machine's fleet (root + revocations), loaded once.
+/// This machine's fleet (root + revocations), kept once found.
 pub fn fleet() -> Option<&'static Fleet> {
-    FLEET.get_or_init(|| Fleet::load_local().ok()).as_ref()
+    if let Some(fleet) = FLEET.get() {
+        return Some(fleet);
+    }
+    let fleet = Fleet::load_local().ok()?;
+    Some(FLEET.get_or_init(|| fleet))
 }
 
-/// Sets this process's fleet (tests). First call wins.
+/// Sets this process's fleet (tests, pairing). First one wins.
 pub fn install_fleet(fleet: Fleet) {
-    let _ = FLEET.set(Some(fleet));
+    let _ = FLEET.set(fleet);
 }
 
 // --- connecting to a fleet server -------------------------------------------------
