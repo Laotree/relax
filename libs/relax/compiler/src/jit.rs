@@ -8797,6 +8797,13 @@ unsafe fn base_running(up: *mut Unit, id: u32) {
     o2_base(up, id);
 }
 
+/// The share of the O3 threshold's (decayed) cost at which running baseline code gets its O2 build
+/// (rt_hot): 1/64 (MAKEPAD_RUN_BASE_O2_DIV=<n>: 1/n; 4 was the rule before GAPX6).
+fn base_o2_div() -> u64 {
+    static D: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var("MAKEPAD_RUN_BASE_O2_DIV").ok().and_then(|v| v.parse().ok()).filter(|&n: &u64| n > 0).unwrap_or(64))
+}
+
 /// baseline slots whose cost check found them running but under the threshold (rt_hot, no unit lock): their
 /// O2 builds, queued by the first O3 worker (drain_slow_base)
 static SLOW_BASE: relax_session::sync::Mutex<Vec<u32>> = relax_session::sync::Mutex::new(Vec::new());
@@ -15905,10 +15912,13 @@ fn rt_hot(slot: u64) -> u64 {
                 Some(r) => rate = r,
                 None => {
                     // under the threshold: the stub stays, counting on. Baseline code that keeps
-                    // running (a quarter of the threshold's cost, decayed) gets its O2 build: the
-                    // cache's entry then links optimised code for it
+                    // running (base_o2_div: a 64th of the threshold's cost, decayed) gets its O2
+                    // build: the cache's entry then links optimised code for it. (GAPX6: at a
+                    // quarter, the settled race ran 8% of its UI cycles in baseline code -- per-frame
+                    // UI fns each under the bar -- and 5% more in the count stubs of the tiny
+                    // callees baseline code calls without inlining; both front-end heavy.)
                     let cost = (*rec.add(9)).load(Ordering::Relaxed);
-                    if cost >= threshold / 4 {
+                    if cost >= threshold / base_o2_div() {
                         note_slow_base(u, slot as u32);
                     }
                     crate::inspect::tierlog::note(slot as u32, crate::inspect::tierlog::ev::CHECK, 0, cost, code);
