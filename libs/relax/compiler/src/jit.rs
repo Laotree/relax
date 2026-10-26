@@ -3411,6 +3411,21 @@ fn const_eval_to_valtree(context: usize, _env: crate::tcx::TypingEnv, def: DefId
     }
     let ty = u.tcx.type_of(&u.prog, def).map_err(|_| evaluation_error())?;
     let ty = u.tcx.instantiate_ty(&u.prog, def, args, ty);
+    // lowering ahead (off the owner): a constant the owner evaluated, from the shared table (the
+    // take checks it as const_addr_shared's); one nobody evaluated is noted for the owner's
+    // const_drain, and the request below ends the lowering (NeedsUnit) until the next round. A
+    // warm run evaluates none of them on its own (its code comes from the disk cache): every
+    // background build whose body names `[T; N]` with N a constant item bailed for the run (warm
+    // race: 200 O2 builds per session dropped on their own front at this request)
+    if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) {
+        if let Some(addr) = u.front.consts.get(&(def, compact.clone())) {
+            LOWER_AHEAD_IDS.with(|x| x.borrow_mut().consts.push((def, compact.clone(), addr)));
+            return crate::valtrees::const_to_valtree(u, addr, ty);
+        }
+        if WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
+            want(Wanted::Const(def, compact.clone()), u.tcx.collect_epoch.load(Ordering::SeqCst));
+        }
+    }
     // a unit call: the value, and whether this evaluation (not an earlier one of the same
     // build) deferred -- the flag belongs to the evaluation's own frame
     let (value, deferred) = owner::call(owner::Class::Job, || {
@@ -21193,28 +21208,40 @@ fn prefront_closure(front: &FrontShared, id: u32) -> bool {
         Ok::<_, String>(LoweredAhead { epoch, file: u.fns[id as usize].file, func, body: Some(body.clone()), callees, consts, tls })
     }));
     let missing = !crate::program::take_missing().is_empty();
+    let mut why = AF_OK;
     let ready = match r {
         Ok(Ok(r)) if !missing => Some(r),
         Err(p) if !p.is::<crate::preempt::NeedsUnit>() && !crate::preempt::is_cancelled(&*p) => std::panic::resume_unwind(p),
         Err(_) => {
             owner::pure_note(owner::PURE_AHEAD_BAIL);
-            prefront_fail(AF_NEEDS_UNIT);
+            why = AF_NEEDS_UNIT;
             None
         }
-        other => {
+        Ok(Ok(_)) => {
+            why = AF_MISSING;
+            None
+        }
+        Ok(Err(e)) => {
             if ahead_trace() {
-                let why = match &other { Ok(Err(e)) => e.clone(), _ => "a callee or constant the lowering named is missing".to_string() };
-                eprintln!("ahead-lower of closure #{} made nothing: {}", id, why);
+                eprintln!("ahead-lower of closure #{} made nothing: {}", id, e);
             }
-            prefront_fail(AF_OTHER);
+            why = AF_OTHER;
             None
         }
     };
     PREFRONTS[0].fetch_add(1, Ordering::Relaxed);
     PREFRONTS[1].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
     let ok = ready.is_some();
-    if let Some(slot) = front.lowered.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
-        *slot = ready;
+    {
+        let mut pending = front.lowered.lock().unwrap_or_else(|e| e.into_inner());
+        if transient_ahead_fail(why) {
+            pending.remove(&id);
+        } else if let Some(slot) = pending.get_mut(&id) {
+            *slot = ready;
+        }
+    }
+    if !ok {
+        prefront_fail(why);
     }
     ok
 }
@@ -21271,8 +21298,9 @@ fn take_prefronted<R>(front: &FrontShared, leave_out: Option<u32>, mut take: imp
                     let notes = want_notes();
                     if !prefront_slot(front, s) {
                         let af = PREFRONT_WHY.try_with(|w| w.get()).unwrap_or(AF_OK);
-                        // constants noted for the owner's drain: the next round's front can make it
-                        let retry = af == AF_NEEDS_UNIT && want_notes() != notes;
+                        // constants or statics noted for the owner's drain (between two requests):
+                        // the next round's front can make it
+                        let retry = want_notes() != notes;
                         if !retry && failed.is_none() {
                             failed = Some((s, af, true));
                         }
@@ -22073,12 +22101,20 @@ fn lower_ahead(f: &FrontShared, id: u32, own: bool) -> u8 {
     let r = lower_ahead_as(u, id, id, d, &key.1, epoch, None);
     let why = r.as_ref().err().copied().unwrap_or(AF_OK);
     let mut pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
-    if f.is_built(&key) {
+    if f.is_built(&key) || transient_ahead_fail(why) {
         pending.remove(&id);
     } else if let Some(slot) = pending.get_mut(&id) {
         *slot = r.ok();
     }
     why
+}
+
+/// A lowering ahead that failed only for what the owner makes between two requests (a constant, a
+/// static, an item named for the first time): its slot keeps no failed entry in
+/// FrontShared::lowered, so a later front (a take's next round, after const_drain) lowers it again
+/// instead of finding "failed before" for the rest of the run
+fn transient_ahead_fail(why: u8) -> bool {
+    why == AF_NEEDS_UNIT || why == AF_MISSING
 }
 
 /// Why a background build's front off the owner made nothing (prefront_slot; run summary)
@@ -22276,12 +22312,18 @@ fn prefront_twin(front: &FrontShared, twin: u32, base: u32) -> bool {
     };
     PREFRONTS[0].fetch_add(1, Ordering::Relaxed);
     PREFRONTS[1].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
-    if let Err(why) = ready {
-        prefront_fail(why);
-    }
+    let why = ready.as_ref().err().copied();
     let ok = ready.is_ok();
-    if let Some(slot) = front.lowered.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&twin) {
-        *slot = ready.ok();
+    {
+        let mut pending = front.lowered.lock().unwrap_or_else(|e| e.into_inner());
+        if why.is_some_and(transient_ahead_fail) {
+            pending.remove(&twin);
+        } else if let Some(slot) = pending.get_mut(&twin) {
+            *slot = ready.ok();
+        }
+    }
+    if let Some(why) = why {
+        prefront_fail(why);
     }
     ok
 }
