@@ -9142,7 +9142,7 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
             if let Some((up, w)) = begin {
                 let done = w.run();
                 if let Ok(Ok((_, _, c))) = &done.built {
-                    prebuild_callees(up, &c.relocs);
+                    prebuild_callees(up, &c.relocs, &[]);
                 }
                 owner::publish(|| o2_finish(up, done));
             }
@@ -14578,13 +14578,14 @@ fn ran_in_twin_code(u: &Unit, c: u32) -> bool {
 
 /// A background replacement (O3 build, O2 worker build) about to be installed calls, through
 /// `relocs`, slots that have no code yet but ran inside the code it replaces (inlined there, or in
-/// twin code: an O3 build whose callees' bodies were not there yet keeps them as calls). SPEC-V
+/// twin code), or that an O3 build kept as calls because their bodies were not there yet
+/// (`absent`: inline candidates of a warm session, whose code came from the disk cache). SPEC-V
 /// bases whose twins have code borrow it (borrow_twin); the others link their stored entry, or get
 /// an O2 build here, on this worker, before the swap -- and so do theirs, up to PREBUILD_MAX -- so
 /// the program's first calls into the new code never compile on its threads (a warm session's
 /// first O3 tier-ups compiled ~100 such helpers on the UI thread). After the first present only
 /// (startup stays lazy). Called off the owner, between a build and its install.
-unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt]) {
+unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt], absent: &[u32]) {
     if !FIRST_PRESENT.load(Ordering::Acquire) {
         return;
     }
@@ -14607,7 +14608,7 @@ unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt]
                     && (!borrow_on() || !u.fns[c as usize].twin_ran.load(Ordering::Relaxed) || u.borrow_twin(c).is_none())
                     // ran inside other code (inlined there, or in twin code), so the replacement's
                     // first calls reach it: its stored entry is linked now, else it is built below
-                    && (ran_in_twin_code(u, c) || !u.fns[c as usize].history().inlined_into.is_empty())
+                    && (ran_in_twin_code(u, c) || !u.fns[c as usize].history().inlined_into.is_empty() || absent.contains(&c))
                     && ready_code_locked(up, c).is_none()
             }).collect()
         });
@@ -17495,8 +17496,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // SPEC-V: callees this replacement calls that have no code yet but ran inside twin code get
     // theirs before the swap (prebuild_callees)
     // (not for an O3-always first build: that is a program thread's lazy compile)
-    if let (Ok(Ok((_, _, relocs, _))), false) = (&built, o3_first()) {
-        prebuild_callees(up, relocs);
+    if let (Ok(Ok((_, _, relocs, extra))), false) = (&built, o3_first()) {
+        prebuild_callees(up, relocs, &extra.3);
     }
     // (an O3-always first build is a program thread's lazy compile: its finish is foreground)
     let ok = owner::publish(|| {
