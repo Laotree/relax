@@ -8785,6 +8785,9 @@ const D_KEPT: usize = 7;
 const D_INSTALL: usize = 8;
 const O2_DROP_NAMES: [&str; 9] = ["panic", "verdict wait", "error/key", "build open", "front", "take", "stale/link", "stored, not installed", "install"];
 pub static O2_DROPS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// O2 jobs the O2 worker took from its queues (a job requeued while a lazy compile of its slot runs
+/// counts again)
+static O2_TAKEN: AtomicU64 = AtomicU64::new(0);
 /// O2 takes dropped by take_prefronted, by cause (TD_*), and for failed fronts by AF_* reason
 /// (own slot, a candidate's)
 static O2_TAKE_DROPS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
@@ -8805,9 +8808,6 @@ fn o2_drop(why: usize, up: *mut Unit, id: u32) {
 fn o2_take_dropped(up: *mut Unit, id: u32) {
     let (td, af, slot) = TAKE_DROP.try_with(|d| d.get()).unwrap_or((TD_ROUNDS, AF_OK, u32::MAX));
     O2_TAKE_DROPS[td as usize].fetch_add(1, Ordering::Relaxed);
-    if td == TD_FRONT {
-        O2_FRONT_FAILS[(slot != id) as usize][af as usize].fetch_add(1, Ordering::Relaxed);
-    }
     O2_STATS[2].fetch_add(1, Ordering::Relaxed);
     O2_DROPS[D_TAKE].fetch_add(1, Ordering::Relaxed);
     if o2_trace() {
@@ -8826,10 +8826,12 @@ fn o2_take_dropped(up: *mut Unit, id: u32) {
 
 /// The O2 drop census line (run summary, settle trace).
 pub fn o2_drop_census() -> String {
+    let mut fail_names = PREFRONT_FAIL_NAMES;
+    fail_names[AF_OK as usize] = "fronted 3 times";
     let n = |a: &[AtomicU64], names: &[&str]| -> String { a.iter().zip(names).filter_map(|(x, nm)| { let v = x.load(Ordering::Relaxed); (v > 0).then(|| format!("{} {}", nm, v)) }).collect::<Vec<_>>().join(", ") };
-    format!("O2 builds: {} installed, {} dropped ({}); takes dropped by cause ({}); failed fronts, own slot ({}), candidates ({})",
-        O2_STATS[0].load(Ordering::Relaxed), O2_STATS[2].load(Ordering::Relaxed), n(&O2_DROPS, &O2_DROP_NAMES), n(&O2_TAKE_DROPS, &TD_NAMES),
-        n(&O2_FRONT_FAILS[0], &PREFRONT_FAIL_NAMES), n(&O2_FRONT_FAILS[1], &PREFRONT_FAIL_NAMES))
+    format!("O2 builds: {} jobs, {} installed, {} dropped ({}); takes dropped by cause ({}); fronts not made off the owner, own slot ({}), candidates left out ({})",
+        O2_TAKEN.load(Ordering::Relaxed), O2_STATS[0].load(Ordering::Relaxed), O2_STATS[2].load(Ordering::Relaxed), n(&O2_DROPS, &O2_DROP_NAMES), n(&O2_TAKE_DROPS, &TD_NAMES),
+        n(&O2_FRONT_FAILS[0], &fail_names), n(&O2_FRONT_FAILS[1], &fail_names))
 }
 
 fn o2_trace() -> bool {
@@ -9493,6 +9495,9 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
             }
         };
         let _job = compile_job();
+        if !o1 {
+            O2_TAKEN.fetch_add(1, Ordering::Relaxed);
+        }
         O2_RUNNING.store(true, Ordering::Relaxed);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let live = || {
@@ -9509,7 +9514,7 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
                             job_sleep(TIER1_POLL);
                         }
                     }
-                    let b = take_prefronted(&front, !o1, || live().and_then(|up| if o1 { o1v_begin(up, id) } else if borrowed { borrow_begin(up, id) } else { o2_begin(up, id) }.map(|w| (up, w))));
+                    let b = take_prefronted(&front, (!o1).then_some(id), || live().and_then(|up| if o1 { o1v_begin(up, id) } else if borrowed { borrow_begin(up, id) } else { o2_begin(up, id) }.map(|w| (up, w))));
                     if b.is_none() {
                         if o1 { crate::cache::warm_count::add(crate::cache::warm_count::O1V_DROPPED, 1) } else { o2_take_dropped(live().unwrap_or(std::ptr::null_mut()), id) }
                     }
@@ -15014,7 +15019,7 @@ unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt]
                 (&*up).fns[c as usize].hot_hint.store(true, Ordering::Relaxed);
                 (&*up).front.clone()
             });
-            let Some(w) = take_prefronted(&front, true, || o2_begin(up, c)).unwrap_or_else(|| { o2_take_dropped(up, c); None }) else { continue };
+            let Some(w) = take_prefronted(&front, Some(c), || o2_begin(up, c)).unwrap_or_else(|| { o2_take_dropped(up, c); None }) else { continue };
             let done = w.run();
             if let Ok(Ok((_, _, cc))) = &done.built {
                 todo.extend(calls(&cc.relocs));
@@ -16243,7 +16248,7 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
             }
         }
     }
-    let begin = take_prefronted(&front, false, || {
+    let begin = take_prefronted(&front, None, || {
         let u = &mut *up;
         if !u.o3_allowed(id) {
             return None;
@@ -21045,7 +21050,7 @@ unsafe fn spec_build(up: *mut Unit, id: u32) -> bool {
     };
     let Some(front) = owner::publish(|| fresh(up).then(|| (&*up).front.clone())) else { return true };
     prefront_slot(&front, id);
-    let b = take_prefronted(&front, false, || {
+    let b = take_prefronted(&front, None, || {
         if !fresh(up) {
             return Begin::Done(Split::Spec);
         }
@@ -21224,9 +21229,9 @@ pub static PREFRONTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// made, a last round builds without the candidates that still need fronts (they stay calls,
 /// FRONTS_DONE, as O3's snapshot leaves them out). None: the build bails (a front lowering ahead
 /// cannot make, an initializer, JIT code, a wait; counted in owner::BAILS and, with its cause, in
-/// TAKE_DROP), and is dropped whole.
+/// TAKE_DROP), and is dropped whole. `leave_out`: the O2 build's slot.
 #[track_caller]
-fn take_prefronted<R>(front: &FrontShared, leave_out: bool, mut take: impl FnMut() -> R) -> Option<R> {
+fn take_prefronted<R>(front: &FrontShared, leave_out: Option<u32>, mut take: impl FnMut() -> R) -> Option<R> {
     let mut fronted: Vec<(u32, u8)> = Vec::new();
     let mut why = (TD_ROUNDS, AF_OK, u32::MAX);
     let mut last = false;
@@ -21276,8 +21281,12 @@ fn take_prefronted<R>(front: &FrontShared, leave_out: bool, mut take: impl FnMut
                     if front_failed {
                         why = (TD_FRONT, af, s);
                     }
-                    if !leave_out {
-                        break;
+                    let Some(root) = leave_out else { break };
+                    // (O2 census: the front that sent the build to its last round)
+                    O2_FRONT_FAILS[(s != root) as usize][if front_failed { af } else { AF_OK } as usize].fetch_add(1, Ordering::Relaxed);
+                    if o2_trace() && s == root {
+                        let at = if af == AF_NEEDS_UNIT { NEEDS_UNIT_AT.try_with(|a| a.get()).ok().flatten().map(|l| format!(" at {}:{}", l.file(), l.line())).unwrap_or_default() } else { String::new() };
+                        eprintln!("makepad-run O2: #{} own front not made off the owner: {}{}", root, if front_failed { PREFRONT_FAIL_NAMES[af as usize] } else { "fronted 3 times" }, at);
                     }
                     last = true;
                 }
