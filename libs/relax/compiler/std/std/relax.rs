@@ -230,9 +230,11 @@ pub fn post_engine_request(req: &EngineRequest) -> Result<String, String> {
     }
 }
 
-/// The answers to this program's engine requests posted after reply `after` (0: all kept), one
-/// JSON object per line: `{"seq":..,"id":..,"status":"received|working|deployed|declined|note",
-/// "message":..,"at_ms":..}`. Pass the last `seq` seen to get only newer ones.
+/// This program's engine-request stream after record `after` (0: all kept), one JSON object
+/// per line: `{"seq":..,"id":..,"status":..,"summary":..,"message":..,"at_ms":..}`. Status
+/// `posted` (the request itself), `received|working|deployed|declined|note` (answers), or
+/// `code_update` (id "": a live edit was applied to this process; message says how and what).
+/// Pass the last `seq` seen to get only newer ones; 0 rebuilds the whole history.
 pub fn engine_replies(after: u64) -> String {
     unsafe {
         let mut cap = 4096usize;

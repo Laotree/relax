@@ -7,6 +7,11 @@
 //! `engine-reply {"id":..,"status":..,"message":..}`; the program reads the answers with
 //! `std::relax::engine_replies(after)`.
 //!
+//! The program's reply stream is its requests' whole history, so a program that restarted in
+//! place (its own state fresh, this host's kept) rebuilds it from `engine_replies(0)`: a
+//! `posted` record per request, then every answer, and a `code_update` record (id "") whenever
+//! a live edit was applied to this process while it had requests: the fix may be live now.
+//!
 //! Everything in a request is DATA written by the program (and, through an in-game AI, by game
 //! content): it is stored and passed on verbatim, bounded, and never interpreted here. The LAN
 //! never reaches this module directly: the node's engine relay (libs/engine_relay) reads
@@ -34,6 +39,7 @@ pub const STATUSES: &[&str] = &["received", "working", "deployed", "declined", "
 struct Request {
     seq: u64,
     id: String,
+    summary: String,
     /// the whole request as one JSON object (what `engine-requests` and the event carry)
     json: String,
 }
@@ -96,8 +102,8 @@ fn os_hostname() -> String {
 
 /// Posts a request. `record`: `game \0 summary \0 details \0 context \0 route` (the program's
 /// typed fields, std::relax::EngineRequest). Returns the request id, or why it was refused.
-pub fn post(record: &str) -> Result<String, String> {
-    let mut parts = record.split('\0');
+pub fn post(text: &str) -> Result<String, String> {
+    let mut parts = text.split('\0');
     let mut next = |max| cut(parts.next().unwrap_or(""), max);
     let (game, summary, details, context, route) = (next(MAX_GAME), next(MAX_SUMMARY), next(MAX_DETAILS), next(MAX_CONTEXT), next(MAX_ROUTE));
     if summary.trim().is_empty() {
@@ -126,8 +132,9 @@ pub fn post(record: &str) -> Result<String, String> {
         if q.len() >= KEEP_REQUESTS {
             q.pop_front();
         }
-        q.push_back(Request { seq, id: id.clone(), json: format!("{{\"seq\":{seq},{fields}}}") });
+        q.push_back(Request { seq, id: id.clone(), summary: summary.clone(), json: format!("{{\"seq\":{seq},{fields}}}") });
     }
+    record(&id, "posted", &summary, "");
     // the observation channel: `events`, `watch` and `--agent` see it like any other event
     super::events::emit("engine_request", &id, &fields);
     Ok(id)
@@ -138,26 +145,43 @@ pub fn reply(id: &str, status: &str, message: &str) -> Result<u64, String> {
     if !STATUSES.contains(&status) {
         return Err(format!("status {status}: one of {}", STATUSES.join(", ")));
     }
-    if !REQUESTS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|r| r.id == id) {
-        return Err(format!("no engine request {id} in this process"));
-    }
-    let seq = SEQ.fetch_add(1, Relaxed) + 1;
-    let json = format!(
-        "{{\"seq\":{seq},\"id\":{},\"status\":{},\"message\":{},\"at_ms\":{}}}",
-        json_str(id),
-        json_str(status),
-        json_str(&cut(message, MAX_MESSAGE)),
-        wall_ms()
-    );
-    {
-        let mut q = REPLIES.lock().unwrap_or_else(|e| e.into_inner());
-        if q.len() >= KEEP_REPLIES {
-            q.pop_front();
-        }
-        q.push_back(Reply { seq, json: json.clone() });
-    }
+    let summary = match REQUESTS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|r| r.id == id) {
+        Some(r) => r.summary.clone(),
+        None => return Err(format!("no engine request {id} in this process")),
+    };
+    let (seq, json) = record(id, status, &summary, &cut(message, MAX_MESSAGE));
     super::events::emit("engine_reply", &format!("{id}#{seq}"), &json[1..json.len() - 1]);
     Ok(seq)
+}
+
+/// One record of the program's reply stream.
+fn record(id: &str, status: &str, summary: &str, message: &str) -> (u64, String) {
+    let seq = SEQ.fetch_add(1, Relaxed) + 1;
+    let json = format!(
+        "{{\"seq\":{seq},\"id\":{},\"status\":{},\"summary\":{},\"message\":{},\"at_ms\":{}}}",
+        json_str(id),
+        json_str(status),
+        json_str(summary),
+        json_str(message),
+        wall_ms()
+    );
+    let mut q = REPLIES.lock().unwrap_or_else(|e| e.into_inner());
+    if q.len() >= KEEP_REPLIES {
+        q.pop_front();
+    }
+    q.push_back(Reply { seq, json: json.clone() });
+    (seq, json)
+}
+
+/// A live edit was applied to this process (`how`: `patched`, or `restart` when it applies by
+/// an in-place restart; `what`: the files). Only a process that posted requests hears of it.
+pub fn code_update(how: &str, what: &str, changed: u64) {
+    if REQUESTS.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        return;
+    }
+    let message = cut(&format!("{how}: {what} ({changed} item{})", if changed == 1 { "" } else { "s" }), MAX_MESSAGE);
+    let (seq, json) = record("", "code_update", "", &message);
+    super::events::emit("engine_code_update", &format!("code#{seq}"), &json[1..json.len() - 1]);
 }
 
 /// The replies after `after`, one JSON object per line.
@@ -246,8 +270,12 @@ mod tests {
         assert!(super::reply("nobody.1.1", "received", "x").is_err(), "unknown id");
         let seq = super::reply(&id, "working", "on it").unwrap();
         let lines = super::replies_after(seq - 1);
-        assert!(lines.contains("\"status\":\"working\"") && lines.contains(&id));
+        assert!(lines.contains("\"status\":\"working\"") && lines.contains(&id) && lines.contains("grappling hook"));
         assert!(super::replies_after(seq).is_empty());
+        assert!(super::replies_after(0).contains("\"status\":\"posted\""), "the stream starts with the request");
+        super::code_update("patched", "engine/src/rope.rs", 2);
+        let after = super::replies_after(seq);
+        assert!(after.contains("\"status\":\"code_update\"") && after.contains("rope.rs"));
         let long = "x".repeat(super::MAX_SUMMARY + 10);
         assert!(super::cut(&long, super::MAX_SUMMARY).contains("[cut 10 bytes]"));
     }

@@ -3842,6 +3842,10 @@ fn log_edit(what: &str, o: &Outcome, saved: Option<std::time::SystemTime>, seen:
         Rung::Refuse => "refuse",
     };
     SESSION.lock().unwrap_or_else(|e| e.into_inner()).push((rung, total));
+    // engine requests: a program waiting on an engine change hears that code changed under it
+    if matches!(rung, "patch" | "partial" | "restart") {
+        crate::inspect::engine_req::code_update(if rung == "restart" { "restart" } else { "patched" }, what, o.changed as u64);
+    }
     let reasons: Vec<String> = o.lines.iter().take(8).map(|l| json_str(l)).collect();
     live_log(&format!(
         "{{\"event\":\"edit\",\"t\":{:.0},\"pid\":{},\"files\":{},\"rung\":\"{}\",\"changed\":{},\"fns\":{},\"rebuilt\":{},\"ahead\":{},\"ahead_cached\":{},\"field_named\":{},\"field_deps\":{},\"ms\":{{\"detect\":{:.1},\"parse\":{:.1},\"check\":{:.1},\"compile\":{:.1},\"install\":{:.1},\"work\":{:.1},\"total\":{:.1}}},\"reasons\":[{}]}}",
