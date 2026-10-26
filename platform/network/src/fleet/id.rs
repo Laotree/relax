@@ -43,7 +43,6 @@
 //! **Announcements** (LAN beacons, room ads) are signed by the sender's
 //! key with its credential attached ([`Me::announce`], [`Fleet::check_announcement`]).
 
-use crate::digest::sha256_hash;
 use crate::tls::{self, from_hex, to_hex, X963_KEY_LEN};
 use std::collections::HashSet;
 use std::fs;
