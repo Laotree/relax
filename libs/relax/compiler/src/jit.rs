@@ -8949,6 +8949,8 @@ fn settle_trace() -> bool {
     *T.get_or_init(|| std::env::var_os("MAKEPAD_RUN_SETTLE_TRACE").is_some()) || crate::run::VERBOSE.load(Ordering::Relaxed)
 }
 
+/// O2 builds that waited for a borrow-check verdict (o2_begin: dropped, re-queued by the verdict)
+static O2_VERDICT_WAITS: AtomicU64 = AtomicU64::new(0);
 /// slots whose tier decision is final (T_FINAL) now
 static FINAL_SLOTS: AtomicU64 = AtomicU64::new(0);
 /// (trace) the settle's O2 builds by the slot's stored entry: no key, no entry, baseline, O1, O2, O3
@@ -9050,7 +9052,7 @@ fn settle_tier_tick() {
     if settle_trace() {
         eprintln!("makepad-run settle-tier: epoch {} round {} at t={:.1} s: {} running slots, {} O2 builds queued, {} made final ({} final in all){}", epoch, round, wall_ns() as f64 / 1e9, running, queued, finalized, FINAL_SLOTS.load(Ordering::Relaxed), if st.final_at != 0 { " -- final" } else { "" });
         let r: Vec<u64> = SETTLE_ENTRY_RANKS.iter().map(|x| x.load(Ordering::Relaxed)).collect();
-        eprintln!("makepad-run settle-tier: O2 builds so far by stored entry (no key/none/baseline/O1/O2/O3): {:?}", r);
+        eprintln!("makepad-run settle-tier: O2 builds so far by stored entry (no key/none/baseline/O1/O2/O3): {:?}; O2 worker: {} installed, {} dropped ({} waiting for a verdict)", r, O2_STATS[0].load(Ordering::Relaxed), O2_STATS[2].load(Ordering::Relaxed), O2_VERDICT_WAITS.load(Ordering::Relaxed));
     }
 }
 
@@ -9425,6 +9427,7 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     if !(&*up).refresh_verified(id) {
         await_verdict(id, Await::O2);
         O2_STATS[2].fetch_add(1, Ordering::Relaxed);
+        O2_VERDICT_WAITS.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let f = &(&*up).fns[id as usize];
