@@ -215,6 +215,16 @@ pub fn generate_p256() -> io::Result<[u8; X963_KEY_LEN]> {
     platform::generate_p256()
 }
 
+/// Raw P-256 ECDH shared secret (the 32-byte big-endian x coordinate), using the OS.
+/// `key` is an X9.63 private key; `peer_point` must be an uncompressed P-256
+/// point (65 bytes, 0x04 || X || Y) on the curve. No KDF is applied.
+pub fn ecdh_p256(key: &[u8; X963_KEY_LEN], peer_point: &[u8]) -> io::Result<[u8; 32]> {
+    if peer_point.len() != 65 || peer_point[0] != 0x04 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected an uncompressed P-256 point"));
+    }
+    platform::ecdh_p256(key, peer_point)
+}
+
 /// DER ECDSA-SHA256 signature by an X9.63 P-256 key, made by the OS.
 pub fn sign_p256_sha256(key: &[u8; X963_KEY_LEN], msg: &[u8]) -> io::Result<Vec<u8>> {
     platform::sign_p256_sha256(key, msg)
@@ -695,6 +705,9 @@ mod platform {
     pub fn generate_p256() -> io::Result<[u8; 97]> {
         Err(unsupported())
     }
+    pub fn ecdh_p256(_key: &[u8; 97], _peer_point: &[u8]) -> io::Result<[u8; 32]> {
+        Err(unsupported())
+    }
     pub fn sign_p256_sha256(_key: &[u8; 97], _msg: &[u8]) -> io::Result<Vec<u8>> {
         Err(unsupported())
     }
@@ -830,6 +843,47 @@ mod server_tests {
         assert_eq!(x509::ecdsa_sig_from_raw(&raw), sig);
     }
 
+    #[test]
+    fn ecdh_agreement_and_invalid_points() {
+        let a = generate_p256().unwrap();
+        let b = generate_p256().unwrap();
+        let c = generate_p256().unwrap();
+        let shared = ecdh_p256(&a, &b[..65]).unwrap();
+        assert_eq!(shared, ecdh_p256(&b, &a[..65]).unwrap());
+        assert_ne!(shared, ecdh_p256(&a, &c[..65]).unwrap());
+        assert!(ecdh_p256(&a, &[]).is_err());
+        assert!(ecdh_p256(&a, &b[..64]).is_err());
+        assert!(ecdh_p256(&a, &b[..66]).is_err());
+        let mut bad = b[..65].to_vec();
+        bad[0] = 0x02;
+        assert!(ecdh_p256(&a, &bad).is_err());
+        // Correct encoding, but (0, 0) is not on P-256.
+        bad.fill(0);
+        bad[0] = 0x04;
+        assert!(ecdh_p256(&a, &bad).is_err());
+    }
+
+    #[test]
+    fn ecdh_fixed_vector() {
+        // Generated with Python cryptography on Linux (SECP256R1, ECDH).
+        // Private scalars: 0x123456789abcdef and 0xfedcba987654321.
+        let a: [u8; X963_KEY_LEN] = from_hex(concat!(
+            "043988322ab9f52c7f11d5d1aa92a2ac0b00275bcad8e934682257323fda6724828",
+            "55b7389f116c19c0014311c3d57dc02001e3a0ec8bd90c797732034aacd9918",
+            "0000000000000000000000000000000000000000000000000123456789abcdef",
+        )).unwrap();
+        let b: [u8; X963_KEY_LEN] = from_hex(concat!(
+            "0453c5a47b0f3273d7333320d3dc363b241a99928781b9d8827d9660a01dcdf9e9",
+            "8024c87efd5c1388f0a6c3d274467f4824d89218ce12550c298f6a9b393efe20",
+            "0000000000000000000000000000000000000000000000000fedcba987654321",
+        )).unwrap();
+        let expected: [u8; 32] = from_hex(
+            "af63d94b658133fdfcf48a473d136e30e075bc1eb943a38f55c7a445367ffe5a",
+        ).unwrap();
+        assert_eq!(ecdh_p256(&a, &b[..65]).unwrap(), expected);
+        assert_eq!(ecdh_p256(&b, &a[..65]).unwrap(), expected);
+    }
+
     /// A server that writes with a short send timeout to a client that reads slowly, retrying
     /// each `WouldBlock`/`TimedOut` as Desk Link's `write_all` does: every byte arrives once, in
     /// order (Windows: a send that ran into SO_SNDTIMEO had sent part of a record that was then
@@ -895,6 +949,7 @@ mod server_tests {
         let dir = temp_dir("server");
         let identity = TlsIdentity::load_or_create(&dir, "makepad tunnel test").unwrap();
         let pin = identity.fingerprint;
+        let certificate = identity.cert_der.clone();
         let server = TlsServer::new(identity).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port().to_string();
@@ -920,7 +975,8 @@ mod server_tests {
             outcomes
         });
         let (mut client, seen) = crate::SocketStream::connect_capture("127.0.0.1", &port).unwrap();
-        assert_eq!(seen, pin, "the captured fingerprint is the server certificate's");
+        assert_eq!(seen, certificate, "the captured DER is the server leaf certificate");
+        assert_eq!(fingerprint(&seen), pin, "the captured fingerprint is the server certificate's");
         client.write_all(b"hello").unwrap();
         let mut echo = [0u8; 5];
         client.read_exact(&mut echo).unwrap();
@@ -930,7 +986,8 @@ mod server_tests {
         assert!(big.iter().all(|b| *b == 0x42));
 
         let (mut second, again) = crate::SocketStream::connect_capture("127.0.0.1", &port).unwrap();
-        assert_eq!(again, pin);
+        assert_eq!(again, certificate);
+        assert_eq!(fingerprint(&again), pin);
         second.shutdown();
         let outcomes = handle.join().unwrap();
         assert!(outcomes[0]);
