@@ -398,6 +398,10 @@ pub enum Need {
     /// This machine's own credential: another process of the machine the
     /// service runs on (its own WM), never another machine, admin or not.
     ThisMachine,
+    /// A headset viewing an XR session (remote rendering): the admin Mac, or a paired device
+    /// the fleet root signed (a Quest). The service admits it to that XR session only: no
+    /// desktop, and its input reaches only the XR app, as headset data.
+    XrViewer,
 }
 
 /// The one policy check: `require(&peer, Need::Admin)?`.
@@ -407,6 +411,7 @@ pub fn require(peer: &Peer, need: Need) -> Result<(), String> {
         Need::Machine => peer.machine(),
         Need::Node => peer.node(),
         Need::ThisMachine => peer.this_machine(),
+        Need::XrViewer => peer.admin() || peer.role == Role::Paired,
     };
     if ok {
         return Ok(());
@@ -417,6 +422,7 @@ pub fn require(peer: &Peer, need: Need) -> Result<(), String> {
         Need::Machine => format!("{} ({}) is not a fleet machine", peer.name, peer.role.as_str()),
         Need::Node => format!("{} ({}) is not a node credential", peer.name, peer.role.as_str()),
         Need::ThisMachine => format!("{} ({}) is not this machine", peer.name, peer.role.as_str()),
+        Need::XrViewer => format!("{} ({}) is neither the admin nor a paired headset", peer.name, peer.role.as_str()),
     })
 }
 
