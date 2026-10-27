@@ -129,7 +129,7 @@ mod imp {
                     continue;
                 }
                 let ep = ep.clone();
-                let _ = std::thread::Builder::new().name("makepad-remoteH-hello".into()).spawn(move || {
+                let _ = std::thread::Builder::new().name("makepad-remote-hello".into()).spawn(move || {
                     let (hooks, keep) = (ep.hooks(), conn.try_clone());
                     (hooks.enter)();
                     let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(1)));

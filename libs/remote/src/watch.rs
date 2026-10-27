@@ -39,7 +39,7 @@ pub fn service_with(ring: Arc<Ring>, opened: fn(), closed: fn()) -> Factory {
         let ring = ring.clone();
         let hooks = conn.hooks();
         std::thread::Builder::new()
-            .name("makepad-remoteW-watch".into())
+            .name("makepad-remote-watch".into())
             .spawn(move || {
                 (hooks.enter)();
                 opened();

@@ -337,7 +337,7 @@ fn route_factory(hub: Hub) -> Factory {
         let channel = open.channel;
         let live = hub.0.routes_in.clone();
         std::thread::Builder::new()
-            .name("makepad-remoteR-route".into())
+            .name("makepad-remote-route".into())
             .spawn(move || route(link, channel, spec, service, args, live))
             .map(|_| ())
             .map_err(|e| (CLOSE_REFUSED, format!("cannot start the route thread: {e}")))
@@ -413,7 +413,7 @@ fn route(link: Arc<HostLink>, client: Channel, spec: Option<String>, service: St
         let (slot, done) = (up_slot.clone(), done.clone());
         live.fetch_add(1, Relaxed);
         let gone = live.clone();
-        let started = std::thread::Builder::new().name("makepad-remoteI-route-in".into()).spawn(move || {
+        let started = std::thread::Builder::new().name("makepad-remote-route-in".into()).spawn(move || {
             loop {
                 match client.recv() {
                     Some(Event::Data(d)) => {

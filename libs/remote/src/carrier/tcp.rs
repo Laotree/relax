@@ -157,7 +157,7 @@ fn io_loop<S: Read + Write>(mut s: S, pipe: Arc<Pipe>, close: impl FnOnce(&mut S
 pub fn carrier<S: Read + Write + Send + 'static>(s: S, hooks: crate::conn::Hooks, close: impl FnOnce(&mut S) + Send + 'static) -> Carrier {
     let pipe = Arc::new(Pipe::default());
     let p = pipe.clone();
-    let _ = std::thread::Builder::new().name("makepad-remoteO-io".into()).spawn(move || {
+    let _ = std::thread::Builder::new().name("makepad-remote-io".into()).spawn(move || {
         (hooks.enter)();
         io_loop(s, p, close);
         (hooks.exit)();
@@ -225,7 +225,7 @@ pub fn listen(endpoint: &Endpoint, bind: &str, identity: TlsIdentity, keys: KeyS
         for tcp in listener.incoming() {
             let Ok(tcp) = tcp else { continue };
             let (ep, tls, keys, bound) = (ep.clone(), tls.clone(), keys.clone(), bound.clone());
-            let _ = std::thread::Builder::new().name("makepad-remoteH-hello".into()).spawn(move || {
+            let _ = std::thread::Builder::new().name("makepad-remote-hello".into()).spawn(move || {
                 let hooks = ep.hooks();
                 (hooks.enter)();
                 let peer = tcp.peer_addr().map(|a| a.to_string()).unwrap_or_default();
