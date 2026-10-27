@@ -229,12 +229,12 @@ impl Conn {
         let conn = Conn(shared);
         let (c1, c2) = (conn.clone(), conn.clone());
         let writer = io.writer;
-        let _ = std::thread::Builder::new().name("makepad-remote-rx".into()).spawn(move || {
+        let _ = std::thread::Builder::new().name("makepad-remoteX-rx".into()).spawn(move || {
             (c1.0.hooks.enter)();
             c1.read_loop(reader);
             (c1.0.hooks.exit)();
         });
-        let _ = std::thread::Builder::new().name("makepad-remote-tx".into()).spawn(move || {
+        let _ = std::thread::Builder::new().name("makepad-remoteT-tx".into()).spawn(move || {
             (c2.0.hooks.enter)();
             c2.write_loop(writer);
             (c2.0.hooks.exit)();

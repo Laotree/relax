@@ -275,7 +275,7 @@ pub fn service(dispatch: fn(&Req, &mut Out), end_fields: EndFields) -> Factory {
         let hooks = conn.hooks();
         let end_fields = end_fields.clone();
         std::thread::Builder::new()
-            .name("makepad-remote-cmd".into())
+            .name("makepad-remoteC-cmd".into())
             .spawn(move || {
                 (hooks.enter)();
                 serve(open.channel, dispatch, end_fields);

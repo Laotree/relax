@@ -74,7 +74,7 @@ pub fn service(ring: Arc<Ring>) -> Factory {
         let ring = ring.clone();
         let hooks = conn.hooks();
         std::thread::Builder::new()
-            .name("makepad-remote-stream".into())
+            .name("makepad-remoteS-stream".into())
             .spawn(move || {
                 (hooks.enter)();
                 serve_feed(&ring, Kind::Stream, open.channel, cur, drop_chunk);

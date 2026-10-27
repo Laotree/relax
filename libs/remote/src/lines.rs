@@ -15,7 +15,7 @@ pub fn service(name: &'static str, handler: Arc<Handler>) -> Factory {
         let hooks = conn.hooks();
         let handler = handler.clone();
         std::thread::Builder::new()
-            .name(format!("makepad-remote-{name}"))
+            .name(format!("makepad-remoteL-{name}"))
             .spawn(move || {
                 (hooks.enter)();
                 let ch = open.channel;
