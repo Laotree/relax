@@ -286,18 +286,23 @@ pub(crate) fn take_boot_resolved() -> Option<Resolved> {
 }
 
 
-/// rustc's crate locator finds `extern crate proc_macro;` in the sysroot for any crate (a
-/// `#![crate_type = "proc-macro"]` file checked on its own, a test's helper). Relax's sysroot is
-/// its std dir, whose `proc_macro` the app graph otherwise never loads (proc-macro crates run in the
-/// macro host): a check whose root unit declares the crate gets it as a dependency unit.
+/// rustc's crate locator finds `extern crate proc_macro;` in the sysroot for any crate, of any
+/// crate type (rustc_metadata locator.rs / creader.rs `resolve_crate` on an `extern crate` item:
+/// sysroot crates need no `--extern`). Relax's sysroot is its std dir, whose `proc_macro` the app
+/// graph otherwise never loads (proc-macro crates run in the macro host with their own copy): every
+/// other unit that declares the crate gets it as a dependency unit, in check and run alike. That is
+/// how proc-macro2 is a plain library in a build script (string_cache_codegen in web_atoms'): there
+/// `proc_macro::is_available()` is false (no macro call on the thread) and it takes its fallback.
 fn with_sysroot_proc_macro(mut units: unitgraph::Units, std_dir: &str) -> unitgraph::Units {
     let pm_root = format!("{}/proc_macro/lib.rs", std_dir);
     if units.units.iter().any(|u| u.name == "proc_macro") || !crate::vfs::exists(&pm_root) { return units; }
     let wants = |u: &unitgraph::GraphUnit| crate::vfs::read_shared(&u.src_path).is_ok_and(|src| {
+        // the crate root's `extern crate proc_macro` (not `proc_macro2`): a cheap byte scan, where
+        // the item is in practice; a declaration in a submodule is not seen
         const NEEDLE: &[u8] = b"extern crate proc_macro";
-        src.windows(NEEDLE.len()).any(|w| w == NEEDLE)
+        src.windows(NEEDLE.len()).enumerate().any(|(i, w)| w == NEEDLE && !src.get(i + NEEDLE.len()).is_some_and(|&c| c == b'_' || c.is_ascii_alphanumeric()))
     });
-    let roots: Vec<usize> = units.roots.iter().copied().filter(|&r| r < units.units.len() && !units.units[r].kind.iter().any(|k| k == "proc-macro") && wants(&units.units[r])).collect();
+    let roots: Vec<usize> = (0..units.units.len()).filter(|&r| !units.units[r].kind.iter().any(|k| k == "proc-macro") && wants(&units.units[r])).collect();
     if roots.is_empty() { return units; }
     let pm = units.units.len();
     units.units.push(unitgraph::GraphUnit {
@@ -341,7 +346,7 @@ pub(crate) fn resolve_package(
     } else {
         std::fs::read(units_json).map_err(|e| format!("{}: {}", units_json, e)).and_then(|d| unitgraph::Units::from_json(&d))
     }?;
-    let units = if check_only { with_sysroot_proc_macro(units, std_dir) } else { units };
+    let units = with_sysroot_proc_macro(units, std_dir);
     let t_load = Instant::now();
     let mut g = unitgraph::load(&units, check_only)?;
     let t_loaded = Instant::now();
