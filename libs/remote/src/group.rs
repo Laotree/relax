@@ -20,8 +20,8 @@ pub fn signal(pid: u32, hard: bool) -> bool {
     pid > 1 && pid != std::process::id() && imp::signal(pid, hard)
 }
 
-/// The process's start time (Linux: clock ticks since boot; macOS: µs since the epoch; Windows:
-/// 100 ns since 1601), None when there is no such (live) process.
+/// The process's start time (Linux: clock ticks since boot; macOS and Windows: µs since the
+/// epoch), None when there is no such (live) process.
 pub fn start_time(pid: u32) -> Option<u64> {
     imp::start_time(pid)
 }
@@ -73,6 +73,7 @@ mod imp {
         }
     }
 
+    /// µs since the Unix epoch (as macOS: a ledger's JSON number holds it exactly).
     pub fn start_time(pid: u32) -> Option<u64> {
         let h = Owned(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?);
         let mut code = 0u32;
@@ -82,7 +83,8 @@ mod imp {
         }
         let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
         unsafe { GetProcessTimes(h.0, &mut c, &mut e, &mut k, &mut u) }.ok()?;
-        Some(ft(&c))
+        // FILETIME: 100 ns since 1601
+        Some(ft(&c).saturating_sub(116_444_736_000_000_000) / 10)
     }
 
     /// (pid, parent pid) of every process.
