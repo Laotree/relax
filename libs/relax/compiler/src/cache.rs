@@ -5963,7 +5963,7 @@ mod cold_tests {
         std::fs::write(&pre[5].root, "pub fn top() -> u32 { mid::mid() + 2 }").unwrap();
         let (kept, _, proof) = images.restore_collected(sess, &pre).expect("prefix restore");
         assert_eq!(kept.crates.len(), 5, "crates below the edited one");
-        assert!(proof.is_none(), "a partial restore has no whole-graph proof");
+        assert!(proof.is_some_and(|p| p.kept.is_some_and(|(k, _)| k == 5)), "a partial restore keeps only the kept crates' definition tables");
         // the next run after recording the edited sources restores everything again
         record(&images);
         assert_eq!(images.restore_collected(sess, &pre).unwrap().0.crates.len(), names.len());
