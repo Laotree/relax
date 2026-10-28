@@ -2945,6 +2945,7 @@ fn quit_mark() {
         // the generations the write replaced go now: the exit summary may never run (a harness
         // kills the app, a framework ends the process)
         if r.is_some() { crate::cache::retire_replaced_in_use(); }
+        if std::env::var_os("MAKEPAD_RUN_JC6_POOL").is_some() { eprint!("{}", crate::pool::jc6_report()); }
         verbose!("makepad-run cache: quit write at t={:.0} ms: {:?} (entries, front images), collected {} in {:.1} ms",
             crate::clock::ms_since_start(), r, COLLECTED_CURRENT.load(Ordering::Relaxed), t.elapsed().as_secs_f64() * 1e3);
         // MAKEPAD_RUN_CACHE_TRACE: written here too (the exit's write may never run)

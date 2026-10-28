@@ -100,6 +100,24 @@ impl FrontImages {
         }).collect())
     }
 
+    /// The demand plan `graph` recorded, when this load can take it as it is (DemandPlan::carried):
+    /// for these crates in this order, the last crate's files are unchanged and the plan selected
+    /// all of them.
+    fn carried_demand(&self, graph: &crate::crate_image::GraphImage, pre: &[crate::preload::PreCrate]) -> Option<Arc<crate::preload::DemandImage>> {
+        let no = |why: &str| { if crate::preload::trace() { eprintln!("makepad-run collected: demand plan not carried: {why}"); } None };
+        if pre.iter().any(|c| c.cfg.session.runtime.lazy_verify) { return no("verify"); }
+        let Some(image) = graph.demand_image.clone() else { return no("no stored plan") };
+        let last = pre.len().checked_sub(1)?;
+        if image.graph != crate::preload::demand_recipe_identity(pre) || image.parts.len() != pre.len() { return no("another graph"); }
+        if !image.files.iter().filter(|f| f.ci == last).all(|f| image.reached.contains(&(last, f.path.clone()))) { return no("the last crate was selected in part"); }
+        // (its own files: the record of a package's bin also lists the lib's)
+        let hashes: HashMap<&str, u128> = image.inputs.iter().map(|(p, h)| (p.as_str(), *h)).collect();
+        let own: Vec<(&str, u128)> = image.files.iter().filter(|f| f.ci == last)
+            .map(|f| hashes.get(f.path.as_str()).map(|h| (f.path.as_str(), *h))).collect::<Option<_>>()?;
+        if own.is_empty() || !self.inputs_current(&own) { return no("the last crate changed"); }
+        Some(image)
+    }
+
     /// prefix_records of `graph` for a load whose first `common` crates are `pre`'s (the
     /// others: "load order"), the ones load_order read when it read this graph.
     fn records_for(&self, graph: &crate::crate_image::GraphImage, pre: &[crate::preload::PreCrate], common: usize, opened: Option<&[Arc<Store>]>) -> Option<PrefixRecords> {
@@ -237,24 +255,28 @@ impl FrontImages {
                 stale = graph;
                 base = b;
                 if !session.options.source_eager && session.options.rs_lazy {
-                    // Restore the immutable Program/Tcx while the demand worker
-                    // computes the new selection. Nothing is retained or exposed
-                    // to collection until that selection has been validated.
                     let contexts = crate::source_context::Context::for_crates(pre, Arc::default(), session);
-                    let pending = Arc::new(crate::preload::DemandPlan::new(pre, contexts, Some(self), true));
-                    *self.pending_plan.lock().unwrap() = Some((GraphRecipe::new(pre).identity, pending.clone()));
-                    let worker = pending.clone();
-                    let in_world = crate::macro_reg::in_world();
-                    let release = release_after.clone();
-                    // (detached: the restore takes its prefix as soon as the plan's early
-                    // selection covers it, and the load goes on while the plan completes)
-                    std::thread::Builder::new().name("run-demand".into()).spawn(move || {
-                        crate::macro_reg::set_in_world(in_world);
-                        worker.complete();
-                        let mut r = release.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(prefix) = r.take() { for context in &worker.contexts()[..prefix] { context.release_prescan(); } }
-                    }).ok()?;
-                    plan = Some(pending);
+                    if let Some(image) = base.is_none().then(|| self.carried_demand(&stale, pre)).flatten() {
+                        plan = Some(Arc::new(crate::preload::DemandPlan::carried(pre, contexts, image)));
+                    } else {
+                        // Restore the immutable Program/Tcx while the demand worker
+                        // computes the new selection. Nothing is retained or exposed
+                        // to collection until that selection has been validated.
+                        let pending = Arc::new(crate::preload::DemandPlan::new(pre, contexts, Some(self), true));
+                        *self.pending_plan.lock().unwrap() = Some((GraphRecipe::new(pre).identity, pending.clone()));
+                        let worker = pending.clone();
+                        let in_world = crate::macro_reg::in_world();
+                        let release = release_after.clone();
+                        // (detached: the restore takes its prefix as soon as the plan's early
+                        // selection covers it, and the load goes on while the plan completes)
+                        std::thread::Builder::new().name("run-demand".into()).spawn(move || {
+                            crate::macro_reg::set_in_world(in_world);
+                            worker.complete();
+                            let mut r = release.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(prefix) = r.take() { for context in &worker.contexts()[..prefix] { context.release_prescan(); } }
+                        }).ok()?;
+                        plan = Some(pending);
+                    }
                 }
                 let prefix = if plan.is_some() { 0 } else {
                     let (rpre, common) = base.as_ref().map_or((pre, pre.len()), |(p, n): &(Vec<_>, usize)| (p.as_slice(), *n));

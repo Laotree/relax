@@ -4656,7 +4656,8 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
     // Selection reads even skipped files and negative module candidates. Keep
     // that global proof in the graph, not in any crate's input certificate.
     // Replacing this record also refreshes demand when the final crate is clean.
-    if let Some(demand) = &graph.demand_image {
+    // (a carried plan's proof is the earlier load's: its parts carry their own inputs)
+    if let Some(demand) = graph.demand_image.as_ref().filter(|_| !job.demand.as_ref().is_some_and(|p| p.is_carried())) {
         for (path, hash) in &demand.inputs {
             if inputs.insert(path.clone(), *hash).is_some_and(|old| old != *hash) { return None; }
         }
