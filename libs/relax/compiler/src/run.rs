@@ -192,16 +192,19 @@ pub fn cmd_run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
 /// The graph resolved here is the boot's (BOOT_UNITS): the resolve does not run twice.
 fn hosted_program(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> bool {
     let mut i = 0;
+    let mut flags = Vec::new();
+    let mut workspace = workspace_dir();
     while i < args.len() && args[i].starts_with("--") {
         match args[i].as_str() {
             // a build script's child (a saved graph) or a re-run: not a host decision made here
             "--units" => return true,
-            "--report-to" | "--run-dir" | "--workspace-dir" | "--cfg" | "--boundary" => i += 2,
+            "--offline" | "--frozen" => { flags.push(args[i].clone()); i += 1; }
+            "--workspace-dir" => { let Some(dir) = args.get(i + 1) else { return false }; workspace = dir.clone(); i += 2; }
+            "--report-to" | "--run-dir" | "--cfg" | "--boundary" => i += 2,
             _ => i += 1,
         }
     }
     let Some(package) = args.get(i).cloned() else { return false };
-    let mut flags = Vec::new();
     let mut words = args[i + 1..].iter().take_while(|a| a.as_str() != "--");
     while let Some(w) = words.next() {
         match w.as_str() {
@@ -211,7 +214,7 @@ fn hosted_program(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> boo
             _ => flags.push(w.clone()),
         }
     }
-    let Ok(units) = unitgraph::unit_graph(sess, &workspace_dir(), &package, &flags) else { return false };
+    let Ok(units) = unitgraph::unit_graph(sess, &workspace, &package, &flags) else { return false };
     let hal = units.units.iter().any(|u| u.name.replace('-', "_") == "makepad_hal");
     *BOOT_UNITS.lock().unwrap() = Some((package, flags, units));
     hal
@@ -513,6 +516,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // `makepad test <package>` (lib.rs): the program is the package's test harness, not its main
     let mut harness = false;
     let mut no_fail_fast = false;
+    let mut cargo_flags = Vec::new();
     let mut i = 0;
     while i < args.len() && args[i].starts_with("--") {
         match args[i].as_str() {
@@ -520,6 +524,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 units_json = args[i + 1].clone();
                 i += 1;
             }
+            "--offline" | "--frozen" => cargo_flags.push(args[i].clone()),
             // how much is compiled ahead of the program's calls (jit::AheadPolicy); the
             // environment carries it to processes this one starts
             a if a.starts_with("--ahead=") => match crate::options::AheadLevel::parse(&a[8..]) {
@@ -728,7 +733,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if !check && session.is_none() && !hosted && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() {
         crate::inspect::start(&package);
     }
-    let mut cargo_flags = Vec::new();
     let mut prog_args: Vec<Vec<u8>> = vec![package.clone().into_bytes()];
     let mut k = i + 1;
     while k < args.len() && args[k] != "--" {
