@@ -91,12 +91,12 @@ impl FrontImages {
             };
             let (kind, bytes) = store.get(front_crate_key(&c.name, &c.root)).ok_or("record")?;
             if kind != KIND_FRONT_CRATE { return Err("record"); }
-            let rec: crate::crate_image::Record = crate::crate_image::decode(bytes).ok_or("record")?;
-            let inputs: Vec<_> = rec.ahead.inputs.iter().map(|(p, h)| (p.as_str(), *h))
-                .chain(rec.files.iter().map(|f| (f.path.as_str(), f.hash))).collect();
-            if !(self.inputs_current(&inputs) && rec.ahead.probes.iter().all(|(p, e)| self.probe_current(p, *e))
+            // (its head: the inputs and the selection, not its tables and file images)
+            let rec = crate::crate_image::decode_record_head(bytes).ok_or("record")?;
+            let inputs: Vec<_> = rec.inputs.iter().chain(&rec.files).map(|(p, h)| (p.as_str(), *h)).collect();
+            if !(self.inputs_current(&inputs) && rec.probes.iter().all(|(p, e)| self.probe_current(p, *e))
                 && ledger_current(store, &present, &mut late)) { return Err("inputs"); }
-            Ok((rec.ahead.demand_plan, rec.ahead.deferred))
+            Ok((rec.demand_plan, rec.deferred))
         }).collect())
     }
 

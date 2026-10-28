@@ -4603,12 +4603,12 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
         let store = Store::open(&dir.join(front_store_name(&job.options, &key.0, fp)))?;
         let (kind, bytes) = store.get(front_crate_key(&key.0, &key.1))?;
         if kind != KIND_FRONT_CRATE { return None; }
-        let rec: crate::crate_image::Record = crate::crate_image::decode(bytes)?;
-        if !rec.ahead.complete || rec.name != key.0 || rec.root != key.1 { return None; }
-        for (path, hash) in rec.ahead.inputs.into_iter().chain(rec.files.into_iter().map(|f| (f.path, f.hash))) {
+        let rec = crate::crate_image::decode_record_head(bytes)?;
+        if !rec.complete || rec.name != key.0 || rec.root != key.1 { return None; }
+        for (path, hash) in rec.inputs.into_iter().chain(rec.files) {
             if inputs.insert(path, hash).is_some_and(|old| old != hash) { return None; }
         }
-        for (path, exists) in rec.ahead.probes {
+        for (path, exists) in rec.probes {
             if probes.insert(path, exists).is_some_and(|old| old != exists) { return None; }
         }
         graph.crates.push((key.clone(), fp));
