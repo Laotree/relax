@@ -414,6 +414,10 @@ pub struct CacheStats {
     /// already; wall ns of the whole prelink
     pub prelinked: u64,
     pub prelink_changed: u64,
+    /// image slots naming a changed crate prelinked after all (their key and certificate as
+    /// recorded), and the ns their check took
+    pub prelink_rekeyed: u64,
+    pub prelink_check_ns: u64,
     pub prelink_failed: u64,
     pub prelink_had_code: u64,
     pub prelink_ns: u64,
@@ -621,11 +625,16 @@ pub struct Cache {
     pub manifest_uncached: usize,
     /// of the slots before the first present: how many had a code entry when it was recorded
     manifest_present_cached: usize,
-    /// the loaded manifest's code keys by the hash of their slot's identity bytes, when the
-    /// manifest was recorded from exactly this run's sources (manifest_sources_key): a slot's
-    /// code key is then taken as recorded instead of hashing the bodies it is made from again
-    /// (code_key_bytes). Empty otherwise.
+    /// the loaded manifest's code keys by the hash of their slot's identity bytes: a slot's code
+    /// key is taken as recorded instead of hashing the bodies it is made from again
+    /// (code_key_bytes) when every crate its identity names is as the manifest was recorded
+    /// from (`manifest_key_crates`). Empty without a manifest whose entries are all here.
     manifest_keys: HashMap<u128, u128>,
+    /// per crate: unchanged since the manifest was recorded (its fingerprint, which covers its
+    /// dependencies, is the one in the manifest's startup image); None: every crate (the manifest
+    /// was recorded from exactly this run's sources, manifest_sources_key). A slot whose crates
+    /// are all unchanged has its recorded key -- the startup image's rule for prelinking its code.
+    manifest_key_crates: Option<Vec<bool>>,
     /// the loaded manifest's code keys, in `manifest`'s order (0: none): a slot whose key this
     /// run's manifest changes had its old entry superseded (record_manifest removes it)
     manifest_old_keys: Vec<u128>,
@@ -877,6 +886,7 @@ impl Cache {
             manifest_missing: 0,
             manifest_uncached: 0,
             manifest_keys: HashMap::new(),
+            manifest_key_crates: None,
             manifest_old_keys: Vec::new(),
             manifest_present_cached: 0,
             image: None,
@@ -2071,6 +2081,21 @@ impl Cache {
         Some((k, bytes))
     }
 
+    /// Whether the slot identity `b` (enc_fnkey bytes) names only crates unchanged since the
+    /// loaded manifest was recorded (`manifest_key_crates`): its code key is then the recorded
+    /// one, as for every slot of those crates (a closure, named by its file: no).
+    pub(super) fn identity_unchanged(&self, b: &[u8]) -> bool {
+        if self.manifest_keys.is_empty() || !crate::reload::edited_crates().is_empty() { return false; }
+        let Some(ok) = &self.manifest_key_crates else { return true };
+        let mut all = true;
+        let mut d = D { b, p: 0 };
+        let read = image::skip_fnkey(&mut d, 0, &mut |a| all &= match a {
+            image::Atom::Crate(ident) => self.crate_by_ident.get(&ident).is_some_and(|&c| ok.get(c as usize) == Some(&true)),
+            image::Atom::File(_) => false,
+        });
+        read.is_some() && d.p == b.len() && all
+    }
+
     fn code_key_bytes(&mut self, u: &Unit, key: &FnKey) -> Option<(u128, Vec<u32>, Vec<u8>)> {
         let mut e = E::default();
         let mut crates = Vec::new();
@@ -2098,9 +2123,11 @@ impl Cache {
         crates.sort_unstable();
         crates.dedup();
         let dom = self.dominant(&crates);
-        // a slot of the startup manifest, recorded from these sources and none edited since:
-        // its key as recorded (the bodies below hash to what they hashed to then)
-        let recorded = if self.manifest_keys.is_empty() || !crate::reload::edited_crates().is_empty() { None } else { self.manifest_keys.get(&identity_hash(&e.0)).copied() };
+        // a slot of the startup manifest whose crates are as it was recorded from and none
+        // edited since: its key as recorded (the bodies below hash to what they hashed to then)
+        let unchanged = |c: &u32| self.manifest_key_crates.as_ref().is_none_or(|ok| ok.get(*c as usize) == Some(&true));
+        let recorded = if self.manifest_keys.is_empty() || !crate::reload::edited_crates().is_empty() || !crates.iter().all(unchanged) { None }
+            else { self.manifest_keys.get(&identity_hash(&e.0)).copied() };
         let k = match recorded {
             Some(k) => k,
             None => {
@@ -3218,10 +3245,24 @@ impl Cache {
                     Some(present.min(n))
                 })();
                 if let Some(present) = ok {
-                    // recorded from these very sources: its keys are this run's keys
+                    // the image section after the slot list (the store keeps the mapping alive)
+                    if d.u32() == Some(IMAGE_MAGIC) {
+                        let rest = &p[d.p..];
+                        self.image = Some(ManifestImage { _store: pk.clone(), at: rest.as_ptr() as usize, len: rest.len() });
+                    }
+                    // recorded from these very sources: its keys are this run's keys; else those
+                    // of the slots whose crates its image records with this run's fingerprints
                     let sources = self.manifest_sources_key(key);
-                    if missing == 0 && self.mode != Mode::Verify && pk.get(sources).is_some_and(|(kind, p)| kind == KIND_MANIFEST && D { b: p, p: 0 }.u128() == Some(self.sources_fp())) {
+                    let same = pk.get(sources).is_some_and(|(kind, p)| kind == KIND_MANIFEST && D { b: p, p: 0 }.u128() == Some(self.sources_fp()));
+                    let crates = if same { Some(None) } else {
+                        self.image.as_ref().and_then(|im| image::image_crates(im.bytes())).map(|recorded| {
+                            let recorded: HashMap<u128, u128> = recorded.into_iter().collect();
+                            Some(self.crate_ident.iter().zip(&self.fps).map(|(id, fp)| recorded.get(id) == Some(fp)).collect())
+                        })
+                    };
+                    if let Some(crates) = crates.filter(|_| missing == 0 && self.mode != Mode::Verify) {
                         self.manifest_keys = out.iter().zip(&keys).filter(|(_, k)| **k != 0).map(|(b, k)| (identity_hash(b), *k)).collect();
+                        self.manifest_key_crates = crates;
                     }
                     self.manifest = out;
                     self.manifest_old_keys = keys;
@@ -3229,11 +3270,6 @@ impl Cache {
                     self.manifest_missing = missing;
                     self.manifest_uncached = uncached;
                     self.manifest_present_cached = present_cached;
-                    // the image section after the slot list (the store keeps the mapping alive)
-                    if d.u32() == Some(IMAGE_MAGIC) {
-                        let rest = &p[d.p..];
-                        self.image = Some(ManifestImage { _store: pk.clone(), at: rest.as_ptr() as usize, len: rest.len() });
-                    }
                     self.image_rewrite = self.image.is_none();
                 }
                 return;
@@ -7573,6 +7609,18 @@ impl Linker {
         }
     }
 
+    /// cert_valid of the code entry `key` (None: no such code entry, or it does not decode).
+    pub(super) fn entry_cert_valid(&mut self, u: &mut Unit, key: u128) -> Option<bool> {
+        let (p, i) = self.cache().index_at(key)?;
+        let pack = self.cache().stores[p as usize].clone();
+        let (kind, payload) = pack.get_checked_at(i as usize, key)?;
+        if kind != KIND_CODE || payload.is_empty() { return None; }
+        let t0 = relax_backend::cpu_ns();
+        let r = self.cert_valid_inner(u, payload);
+        self.cache().stats.cert_check_ns += relax_backend::cpu_ns() - t0;
+        r
+    }
+
     /// Whether every slot a code entry's certificate names still has the recorded key. None:
     /// the payload does not decode.
     fn cert_valid(&mut self, u: &mut Unit, payload: &[u8]) -> Option<bool> {
@@ -7601,6 +7649,8 @@ impl Linker {
         for _ in 0..n {
             let b = d.bytes()?;
             let want = d.u128()?;
+            // (a slot of the crates unchanged since the manifest keeps its recorded key)
+            if self.cache().identity_unchanged(b) { continue; }
             let Some(s) = self.slot_of_bytes(u, b) else { return Some(false) };
             if self.cache().slot_key(u, s) != Some(want) {
                 return Some(false);
@@ -8080,3 +8130,4 @@ pub(crate) static THUNK_DECODE_NS: std::sync::atomic::AtomicU64 = std::sync::ato
 /// Entries recorded so far, in every store (a reader that saw no new one need not ask the owner
 /// for `pending_bytes` again: run.rs spill_cache).
 pub static RECORDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
