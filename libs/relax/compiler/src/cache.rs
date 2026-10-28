@@ -5014,6 +5014,73 @@ impl FrontImages {
     }
 }
 impl FrontImages {
+    /// CrateImages::previous_files: the newest record of crate `c` (among its stores) whose
+    /// identity is `c`'s -- name, root, edition, cfg, kind, dependencies and their fingerprints,
+    /// parser options -- with a complete scan and current late inputs (include!/env!): its files'
+    /// images by path, source hash and module path, each taken at most once, with its replay data
+    /// (a file recorded without it is parsed). Taking one maps it as a crate image's file is
+    /// (its lazily parsed part is not taken: the bodies are parsed on demand in this crate's
+    /// scope). The record's late inputs are noted for the crate's next record.
+    fn previous_files_of(&self, c: &crate::preload::PreCrate, deps: &[u128]) -> Option<crate::crate_image::PreviousFiles> {
+        use crate::crate_image::{decode, FileMeta, Record};
+        let deps = self.full_deps(c, deps)?;
+        let options = &c.cfg.session.options;
+        let mut cfg = c.cfg.set.clone();
+        cfg.sort();
+        let prefix = format!("{}-", c.name);
+        let mut paths: Vec<_> = crate::store::stores_with_prefix(&self.dir, &prefix).into_iter()
+            .filter(|p| p.file_name().is_some_and(|n| n.len() == prefix.len() + 20))
+            .filter_map(|p| Some((std::fs::metadata(&p).and_then(|m| m.modified()).ok()?, p))).collect();
+        paths.sort_by(|a, b| b.0.cmp(&a.0));
+        let present: HashSet<String> = std::iter::once(c.name.clone()).collect();
+        for (_, path) in paths {
+            let Some(st) = Store::open_unmarked(&path) else { continue };
+            let st = std::sync::Arc::new(st);
+            let Some((KIND_FRONT_CRATE, b)) = st.get(front_crate_key(&c.name, &c.root)) else { continue };
+            let Some(rec) = decode::<Record>(b) else { continue };
+            let same = rec.name == c.name && rec.root == c.root && rec.edition == c.edition && rec.cfg == cfg && rec.proc_macro == c.proc_macro
+                && rec.deps == c.image_dep_names && rec.dep_fps == deps && rec.lazy_auto == crate::parser::lazy_auto()
+                && rec.parse_options == crate::crate_image::parse_options(options) && rec.ahead.complete;
+            if !same || !ledger_current(&st, &present, &mut HashMap::new()) { continue; }
+            let mut files: HashMap<(String, u128), (FileMeta, usize)> = HashMap::new();
+            for f in rec.files {
+                if f.replay.0.is_empty() { continue; }
+                let key = Cache::front_key(&f.path, f.hash);
+                let Ok(ix) = st.index.binary_search_by_key(&key, |e| e.key) else { continue };
+                if !matches!(st.get_at(ix, key), Some((KIND_FRONT_REF, _))) { continue; }
+                files.insert((f.path.clone(), f.hash), (f, ix));
+            }
+            if files.is_empty() { continue; }
+            replay_front_ledger(&st)?;
+            st.mark_used();
+            let sink = self.sink();
+            let files = std::sync::Mutex::new(files);
+            if crate::preload::trace() {
+                eprintln!("boot-trace: {}: parsed, unchanged files' images from {}", c.name, path.display());
+            }
+            return Some(std::sync::Arc::new(move |path: &str, hash: u128, module: &str| {
+                let (mut f, ix) = files.lock().unwrap().remove(&(path.to_string(), hash))?;
+                if f.module != module { return None; }
+                let key = Cache::front_key(&f.path, f.hash);
+                let (loc, img) = front_file_entry(&st, ix, key)?;
+                let mut pf = crate::front::restore(&mut f, img)?;
+                pf.image = Some(loc);
+                pf.sink = sink.clone();
+                if f.prep.idents.iter().any(|&(lo, hi)| lo > hi || hi as usize > pf.src.len()) { return None; }
+                let used = crate::macros::MacroUse::from_replay(f.used.local, f.used.uses, &f.replay.0)?;
+                Some(crate::preload::Preparsed {
+                    error: None,
+                    parsed: Some((pf, used)),
+                    prep: Some(f.prep),
+                    mod_path: f.module,
+                    src_len: f.src_len as usize,
+                    verify: crate::front::verify().then_some(crate::front::verify_file),
+                })
+            }));
+        }
+        None
+    }
+
     /// Crate `c`'s dependency fingerprints in its record's order: `deps` are those of its
     /// dependencies loaded in this batch; the ones a partial collected restore kept are not
     /// in the batch (run.rs drops them from `image_deps`), their fingerprints come from the
@@ -5269,6 +5336,9 @@ impl crate::crate_image::CrateImages for FrontImages {
 
     fn crate_image(&self, c: &crate::preload::PreCrate, deps: &[u128]) -> Option<crate::crate_image::CrateImage> {
         self.selected_image(c, deps, None)
+    }
+    fn previous_files(&self, c: &crate::preload::PreCrate, deps: &[u128]) -> Option<crate::crate_image::PreviousFiles> {
+        self.previous_files_of(c, deps)
     }
     fn crate_image_selected(&self, c: &crate::preload::PreCrate, deps: &[u128], plan: u128, deferred: &[String]) -> Option<crate::crate_image::CrateImage> {
         self.selected_image(c, deps, Some((plan, deferred)))

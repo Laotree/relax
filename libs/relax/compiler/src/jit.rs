@@ -21527,6 +21527,7 @@ fn prefront_slot(front: &FrontShared, id: u32) -> bool {
         return false;
     };
     let t0 = cpu_ns();
+    if front.ahead.contains_key(&(d, args.clone())) { PREFRONTS[4].fetch_add(1, Ordering::Relaxed); }
     let why = {
         let _preemptible = crate::preempt::Preemptible::on();
         typeck_ahead(front, d, args, 0, false, false);
@@ -21652,8 +21653,9 @@ fn prefront_closure(front: &FrontShared, id: u32) -> bool {
     ok
 }
 
-/// Background fronts run off the owner by `take_prefronted` (count, cpu ns, of it type checks ns, distinct slots)
-pub static PREFRONTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Background fronts run off the owner by `take_prefronted` (count, cpu ns, of it type checks ns, distinct slots,
+/// fronts that found the body checked already)
+pub static PREFRONTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// (instrument) the slots fronted (PREFRONTS[3] counts them)
 static PREFRONTED: std::sync::Mutex<Option<std::collections::HashSet<u32>>> = std::sync::Mutex::new(None);
 fn prefronted(id: u32) {

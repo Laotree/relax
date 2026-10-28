@@ -11,7 +11,7 @@ use crate::{
 use std::sync::Arc;
 
 // Demand certificates belong to the graph; crate records keep only their own selection.
-pub const VERSION: u32 = 21;
+pub const VERSION: u32 = 22;
 
 pub(crate) mod strings;
 
@@ -448,8 +448,25 @@ pub struct FileMeta {
     pub lazy: crate::parser::FileLazy,
     pub used: MacroUse,
     pub prep: FilePrep,
+    /// the parse's macro lookups for a replay (MacroUse::replay_bytes; empty: none): an edited
+    /// crate's unchanged file takes its image when they replay in the loader's scope
+    pub replay: Blob,
 }
-fields!(FileMeta, path, module, hash, shared, edition, src_len, token_input, lazy, used, prep);
+fields!(FileMeta, path, module, hash, shared, edition, src_len, token_input, lazy, used, prep, replay);
+
+/// Bytes, encoded as a length and the bytes (one copy, not a decode per byte)
+#[derive(Clone, Default)]
+pub struct Blob(pub Vec<u8>);
+impl Codec for Blob {
+    fn put(&self, w: &mut Vec<u8>) {
+        self.0.len().put(w);
+        w.extend_from_slice(&self.0);
+    }
+    fn get(r: &mut Decode<'_>) -> Option<Self> {
+        let n = usize::get(r)?;
+        Some(Blob(r.take(n)?.to_vec()))
+    }
+}
 pub fn file_meta(path: &str, module: &str, pf: &ParsedFile, used: &MacroUse, prep: &FilePrep, shared: bool) -> Vec<u8> {
     let _mem = crate::memstat::tag(crate::memstat::Tag::FrontRecord);
     let mut w = Vec::new();
@@ -463,6 +480,7 @@ pub fn file_meta(path: &str, module: &str, pf: &ParsedFile, used: &MacroUse, pre
     pf.lazy.put(&mut w);
     used.put(&mut w);
     prep.put(&mut w);
+    Blob(used.replay_bytes().unwrap_or_default()).put(&mut w);
     w
 }
 pub fn file_hash(path: &str, src: &[u8]) -> u128 {
@@ -621,6 +639,10 @@ pub trait DemandWriter {
     fn surface(&mut self, path: &str, hash: u128, src: &[u8], toks: &[crate::lexer::Tok]) -> Option<(DemandSlice, DemandSlice)>;
     fn definition(&mut self, def: &MacroDef) -> Option<(u128, usize)>;
 }
+/// An edited crate's unchanged files' images (CrateImages::previous_files): the image of the file
+/// at (path, source hash) as preparsed at that module path, when one is recorded
+pub type PreviousFiles = Arc<dyn Fn(&str, u128, &str) -> Option<crate::preload::Preparsed> + Send + Sync>;
+
 pub trait CrateImages {
     /// Validation is shared only during this immutable preload, never across edits.
     fn begin_load(&self, _crates: &[crate::preload::PreCrate]) {}
@@ -629,6 +651,10 @@ pub trait CrateImages {
     fn take_demand_plan(&self, _crates: &[crate::preload::PreCrate]) -> Option<Arc<crate::preload::DemandPlan>> { None }
     fn demand_parts(&self, _crates: &[crate::preload::PreCrate], _graph: u128) -> Option<DemandParts> { None }
     fn crate_image(&self, c: &crate::preload::PreCrate, dep_fps: &[u128]) -> Option<CrateImage>;
+    /// A crate that is parsed (no valid image): the images of its files from an earlier record
+    /// made with the same identity and dependency fingerprints (only its own sources differ),
+    /// with their macro lookups to replay. None: no such record.
+    fn previous_files(&self, _c: &crate::preload::PreCrate, _dep_fps: &[u128]) -> Option<PreviousFiles> { None }
     fn crate_image_selected(&self, c: &crate::preload::PreCrate, dep_fps: &[u128], plan: u128, deferred: &[String]) -> Option<CrateImage> {
         self.crate_image(c, dep_fps).filter(|image| image.ahead.demand_plan == plan && image.ahead.deferred == deferred)
     }
