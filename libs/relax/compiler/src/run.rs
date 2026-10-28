@@ -442,7 +442,18 @@ pub(crate) fn resolve_package(
         *CRATE_DIRS.lock().unwrap() = g.crates.iter().zip(g.pkg.iter()).map(|(c, (dir, _, _))| (c.name.clone(), dir.clone())).collect();
     }
     // every crate's cfg set (its env!() environment is set when it is loaded: `set_crate_env`)
-    let order = crate::crates::topo_order(&g.crates);
+    // the root package's crates, and whatever depends on them, load last: the crates an edit
+    // of the app reaches are a suffix from the first start on (FrontImages::load_order keeps
+    // that for the crates edited later)
+    let order = {
+        let topo = crate::crates::topo_order(&g.crates);
+        let root_dir = &g.pkg[g.root].0;
+        let mut late: Vec<bool> = g.pkg.iter().map(|(dir, _, _)| dir == root_dir).collect();
+        for &ci in &topo { if !late[ci] && g.crates[ci].deps.iter().any(|(d, _)| late.get(*d).copied().unwrap_or(false)) { late[ci] = true; } }
+        let (mut first, last): (Vec<usize>, Vec<usize>) = topo.into_iter().partition(|&ci| !late[ci]);
+        first.extend(last);
+        first
+    };
     let mut cfgs: Vec<crate::cfg::CfgSet> = Vec::with_capacity(g.crates.len());
     for (ci, c) in g.crates.iter().enumerate() {
         let mut cs = crate::program_cfg(sess, &c.features);
