@@ -823,9 +823,8 @@ thread_local! {
     /// none): freed when the thread ends (every program thread has one -- they leaked, 80 KB and
     /// two mappings per thread, until a thread-spawning program ran out of mappings).
     static ALTSTACK: AltStack = const { AltStack(std::cell::Cell::new(0)) };
-    /// the top of this thread's stack (recorded by ensure_altstack; 0: unknown): frame walks
-    /// read only [sp, STACK_HI)
-    static STACK_HI: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// This thread's stack (recorded by ensure_altstack; (0, 0): unknown).
+    static STACK_BOUNDS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
     /// inside our fault handler on this thread: a second fault there is fatal, never handled again
     static IN_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// host code that may fault and holds nothing a fault could leave behind (no lock, no
@@ -881,11 +880,12 @@ impl Drop for FaultSafe {
     }
 }
 
-/// The frame-pointer chain from `fp`, bounded to this thread's stack [lo, STACK_HI): only
+/// The frame-pointer chain from `fp`, bounded to this thread's stack above `lo`: only
 /// aligned, strictly rising frame addresses inside it are read, so a corrupt chain ends the walk
 /// instead of faulting (signal-safe: no allocation, no lock). Returns the count written.
 fn walk_fp_bounded(mut fp: u64, lo: u64, out: &mut [u64]) -> usize {
-    let hi = STACK_HI.try_with(|c| c.get()).unwrap_or(0);
+    let (bottom, hi) = STACK_BOUNDS.try_with(|c| c.get()).unwrap_or((0, 0));
+    let lo = lo.max(bottom);
     let mut n = 0;
     while n < out.len() {
         if hi == 0 || fp & 7 != 0 || fp < lo || fp.saturating_add(16) > hi {
@@ -909,8 +909,8 @@ fn walk_fp_bounded(mut fp: u64, lo: u64, out: &mut [u64]) -> usize {
 /// still at [sp]. arm64: the link register returns into JIT code and the function made no frame
 /// record of its own (a non-leaf stores x30 in its record, so [fp+8] would equal it).
 fn leaf_of_jit(f: &os::fault::Fault) -> bool {
-    let hi = STACK_HI.try_with(|c| c.get()).unwrap_or(0);
-    if hi == 0 || f.sp & 7 != 0 || f.sp.saturating_add(8) > hi {
+    let (lo, hi) = STACK_BOUNDS.try_with(|c| c.get()).unwrap_or((0, 0));
+    if hi == 0 || f.sp < lo || f.sp & 7 != 0 || f.sp.saturating_add(8) > hi {
         return false;
     }
     if cfg!(target_arch = "aarch64") {
@@ -922,6 +922,28 @@ fn leaf_of_jit(f: &os::fault::Fault) -> bool {
     } else {
         in_jit_code(unsafe { *(f.sp as *const u64) })
     }
+}
+
+/// A bad indirect jump can lose the frame chain. These are candidate JIT return addresses,
+/// nearest the interrupted sp first; bounded by the recorded stack and the report's frame count.
+fn scan_jit_stack(f: &os::fault::Fault, out: &mut [u64]) -> usize {
+    let (lo, hi) = STACK_BOUNDS.try_with(|c| c.get()).unwrap_or((0, 0));
+    if f.sp < lo || f.sp >= hi || f.sp & 7 != 0 { return 0; }
+    let mut n = 0;
+    if !out.is_empty() && in_jit_code(f.lr.wrapping_sub(1)) {
+        out[n] = f.lr;
+        n += 1;
+    }
+    let mut p = f.sp;
+    while n < out.len() && p.saturating_add(8) <= hi {
+        let ret = unsafe { (p as *const u64).read() };
+        if in_jit_code(ret.wrapping_sub(1)) {
+            out[n] = ret;
+            n += 1;
+        }
+        p += 8;
+    }
+    n
 }
 
 /// A fault report line built on the stack (fault handlers: no allocation, no lock).
@@ -1032,8 +1054,8 @@ unsafe fn raw_name(l: &mut RawLine, a: u64, sp: u64) {
         l.put(b"the burst (scratch) arena");
         return;
     }
-    let hi = STACK_HI.try_with(|c| c.get()).unwrap_or(0);
-    if hi != 0 && a < hi && a.saturating_add(8 << 20) >= hi {
+    let (lo, hi) = STACK_BOUNDS.try_with(|c| c.get()).unwrap_or((0, 0));
+    if hi != 0 && a >= lo && a < hi {
         l.put(b"this thread's stack");
         if a < sp {
             l.put(b" below sp");
@@ -1055,18 +1077,37 @@ unsafe fn raw_name(l: &mut RawLine, a: u64, sp: u64) {
 }
 
 /// A fault that ends the process (or a nested one), from the fault handler with no allocation:
-/// one line with every number (pc, faulting address, sp/fp/lr, the raw frames), then one line
-/// per address naming it (raw_name: the JIT fn and its code version, glue, unit areas, host
-/// symbols).
+/// The fault's numbers reach stderr before stack reads, then candidate return addresses and
+/// their names (raw_name: the JIT fn and its code version, glue, unit areas, host symbols).
 fn raw_report(f: &os::fault::Fault, what: &str) {
-    let mut l = RawLine::new();
-    l.put(b"makepad-run: ").put(what.as_bytes()).put(b" (signal ").dec(f.sig as u64).put(b") on thread ").hex(os::thread::current());
-    l.put(b" pc ").hex(f.pc).put(b" addr ").hex(f.addr).put(b" sp ").hex(f.sp).put(b" fp ").hex(f.fp).put(b" lr ").hex(f.lr).put(b" frames");
     let mut raw = [0u64; 16];
-    let k = walk_fp_bounded(f.fp, f.sp, &mut raw);
-    for r in &raw[..k] {
+    // Print the header before touching the interrupted stack or naming any address.
+    raw_fault_line(f, what, &[], false);
+    let scanned = !in_jit_code(f.pc);
+    let k = if scanned { scan_jit_stack(f, &mut raw) } else { walk_fp_bounded(f.fp, f.sp, &mut raw) };
+    raw_report_frames(f, &raw[..k], scanned);
+}
+
+fn raw_fault_line(f: &os::fault::Fault, what: &str, raw: &[u64], scanned: bool) {
+    let mut l = RawLine::new();
+    l.put(b"makepad-run: ").put(what.as_bytes());
+    if cfg!(windows) { l.put(b" (exception ").hex(f.sig as u32 as u64); }
+    else { l.put(b" (signal ").dec(f.sig as u64); }
+    l.put(b") on thread ").hex(os::thread::current());
+    l.put(b" pc ").hex(f.pc).put(b" addr ").hex(f.addr).put(b" sp ").hex(f.sp).put(b" fp ").hex(f.fp).put(b" lr ").hex(f.lr).put(b" frames");
+    if scanned { l.put(b" (stack scan, candidates)"); }
+    for r in raw {
         l.put(b" ").hex(*r);
     }
+    l.flush();
+}
+
+/// Also used after recovery: the interrupted stack has already been unwound there.
+fn raw_report_frames(f: &os::fault::Fault, raw: &[u64], scanned: bool) {
+    let mut l = RawLine::new();
+    l.put(b"makepad-run:   frames");
+    if scanned { l.put(b" (stack scan, candidates)"); }
+    for r in &raw[..raw.len().min(16)] { l.put(b" ").hex(*r); }
     l.flush();
     unsafe {
         let kind: &[u8] = match f.kind {
@@ -1091,7 +1132,7 @@ fn raw_report(f: &os::fault::Fault, what: &str) {
             raw_name(&mut l, f.lr, f.sp);
             l.flush();
         }
-        for (i, r) in raw[..k].iter().enumerate() {
+        for (i, r) in raw.iter().enumerate() {
             l.put(b"makepad-run:   frame ").dec(i as u64).put(b" ").hex(*r).put(b" in ");
             raw_name(&mut l, r.wrapping_sub(1), f.sp);
             l.flush();
@@ -1108,7 +1149,7 @@ pub fn reassert_signals() {
 /// The calling thread moved to or from a program stack (relax_base::stack::on_program_stack):
 /// the stack bounds cached per thread (fault reports, frame walks, heap samples) are read again.
 pub(crate) fn program_stack_changed() {
-    let _ = STACK_HI.try_with(|c| if c.get() != 0 { c.set(os::fault::stack_hi_of_self()) });
+    let _ = STACK_BOUNDS.try_with(|c| if c.get().1 != 0 { c.set(os::fault::stack_bounds_of_self()) });
     crate::inspect::heap::stack_changed();
 }
 
@@ -1127,7 +1168,7 @@ pub(crate) fn ensure_altstack() {
     if ALTSTACK.try_with(|a| a.0.get() != 0 || { a.0.set(1); false }).unwrap_or(true) {
         return;
     }
-    STACK_HI.with(|c| c.set(os::fault::stack_hi_of_self()));
+    STACK_BOUNDS.with(|c| c.set(os::fault::stack_bounds_of_self()));
     let sp = os::fault::this_thread();
     let _ = ALTSTACK.try_with(|a| a.0.set(sp.max(1)));
 }
@@ -2240,8 +2281,8 @@ pub(crate) fn collect_frames(rbp: u64, pc: u64, pc_is_ret: bool) -> Vec<u64> {
     // the chain is read only inside this thread's stack (from here up): a corrupt frame pointer
     // ends the walk instead of faulting
     let here = &rbp as *const u64 as u64;
-    if STACK_HI.try_with(|c| c.get()).unwrap_or(0) == 0 {
-        let _ = STACK_HI.try_with(|c| c.set(os::fault::stack_hi_of_self()));
+    if STACK_BOUNDS.try_with(|c| c.get().1).unwrap_or(0) == 0 {
+        let _ = STACK_BOUNDS.try_with(|c| c.set(os::fault::stack_bounds_of_self()));
     }
     let mut raw = [0u64; FAULT_FRAMES + 16];
     let n = walk_fp_bounded(rbp, here.min(rbp), &mut raw);
@@ -3195,7 +3236,7 @@ unsafe fn on_fault_locked(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os:
         Containment::FatalReport => fatal_report(f),
         Containment::PassOn => {
             // not ours: the handler we replaced (a library's), else the default action
-            if !hooks.chained && f.kind != Kind::Trap {
+            if !hooks.chained {
                 raw_report(f, "fault outside JIT code, not contained: the process ends");
                 // MAKEPAD_RUN_FAULT_REGS (opt-in; allocates): after the raw lines
                 (hooks.debug)();
@@ -3321,13 +3362,7 @@ unsafe fn record_fault(f: &os::fault::Fault, code: u8) {
         r.addr = f.addr;
         r.guard_depth = GUARD_DEPTH.try_with(|g| g.get()).unwrap_or(0);
         r.const_eval_depth = CONST_EVAL_DEPTH.try_with(|g| g.get()).unwrap_or(0);
-        // a fault in a leaf JIT code called: its caller is the JIT frame the fp chain misses
-        let mut k = 0;
-        if !in_jit_code(f.pc) && leaf_of_jit(f) {
-            r.raw[0] = if cfg!(target_arch = "aarch64") { f.lr } else { *(f.sp as *const u64) };
-            k = 1;
-        }
-        r.n = k + walk_fp_bounded(f.fp, f.sp, &mut r.raw[k..]);
+        r.n = if in_jit_code(f.pc) { walk_fp_bounded(f.fp, f.sp, &mut r.raw) } else { scan_jit_stack(f, &mut r.raw) };
     });
 }
 
@@ -3341,12 +3376,18 @@ unsafe fn materialize_fault() {
         _ => return,
     };
     ensure_altstack();
+    // Fatal runs need a direct report before symbolication or any owner call can fail.
+    let f = os::fault::Fault { kind: rec.kind, sig: rec.sig, pc: rec.pc, sp: rec.sp, fp: rec.fp, addr: rec.addr, lr: 0 };
+    if rec.pending != 3 && rec.guard_depth == 0 && !(rec.const_eval_depth > 0 && (&*UNIT).prog.session.options.const_fuel)
+        && FAULTS_FATAL.load(Ordering::Relaxed) && !crate::domain::in_app_domain() {
+        raw_fault_line(&f, "fatal fault in program code: the process ends", &rec.raw[..rec.n.min(16)], !in_jit_code(rec.pc));
+        raw_report_frames(&f, &rec.raw[..rec.n], !in_jit_code(rec.pc));
+    }
     let frames = frames_from_raw(rec.pc, false, &rec.raw[..rec.n]);
     if rec.pending == 3 {
         PANIC.with(|p| *p.borrow_mut() = Some(PanicInfo { kind: "hang".to_string(), message: "watchdog: the call did not return in time".to_string(), site: u64::MAX, frames, fault_addr: 0, location: String::new() }));
         return;
     }
-    let f = os::fault::Fault { kind: rec.kind, sig: rec.sig, pc: rec.pc, sp: rec.sp, fp: rec.fp, addr: rec.addr, lr: 0 };
     let kind = match rec.kind {
         Kind::Segv | Kind::Bus if is_stack_fault(rec.addr, rec.sp) => "stack overflow",
         Kind::Segv => "segfault",
@@ -5855,6 +5896,46 @@ impl Unit {
     /// as const_addr_shared).
     pub fn const_block_shared(&self, body: &crate::typeck::Body, bl: crate::ast::BlockId, t: TyId) -> Option<Vec<u8>> {
         owner::call(owner::Class::Job, || unsafe { crate::ctfe::eval_const_block(&mut *self.self_ptr.0, body, bl, t) })
+    }
+
+    /// rustc_mir_transform/src/promote_consts.rs: Promoter::promote_temp. Evaluate the
+    /// extracted expression once; unsupported CTFE uses a compiled initializer, never runtime stores.
+    pub fn promoted_addr_shared(&self, body: &Body, e: crate::ast::ExprId, t: TyId, parent: u32) -> Result<u64, String> {
+        owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).eval_promoted(body, e, t, parent) })
+    }
+
+    fn eval_promoted(&mut self, body: &Body, e: crate::ast::ExprId, t: TyId, parent: u32) -> Result<u64, String> {
+        owner::pure_note(owner::PURE_BG_EVAL);
+        owner::forbid_in_publish("promoted initializer", parent);
+        let l = self.layout_of(t);
+        let bytes = match crate::ctfe::eval_promoted(self, body, e, t) {
+            Some(v) => v,
+            None => {
+                let mut cx = Lcx::new(self, body, format!("promoted {}:{}", body.file, e.0), parent);
+                cx.lower_promoted(e, t);
+                cx.finish();
+                if let Some(err) = cx.errors.first() { return Err(err.clone()); }
+                cx.f.verify()?;
+                let code = relax_codegen::native::compile(&self.prog.session.options, &cx.f, &self.env)?;
+                let entry = self.emit_or_redirect(&code.code, &code.relocs, "promoted initializer")?;
+                let buf = self.rw_data(l.size.max(1) as u64, l.align.max(8) as u64);
+                let result = {
+                    let _scope = ConstEvalScope::enter(&self.prog, body.def);
+                    unsafe { call_jit(self as *mut Unit, entry, buf) }
+                };
+                if BUSY_PENDING.with(|b| b.replace(false)) {
+                    std::panic::resume_unwind(Box::new(crate::preempt::OwnerBusy));
+                }
+                if let Err(p) = result {
+                    if p.message.contains(DEFERRED_RETRY) { DEFERRED_ABORT.with(|a| a.set(true)); }
+                    return Err(format!("E0080: promoted initializer: {}", p.message));
+                }
+                crate::ctfe::zero_undefined(self, t, buf);
+                unsafe { std::slice::from_raw_parts(buf as *const u8, l.size as usize) }.to_vec()
+            }
+        };
+        // Typed data preserves function-entry relocations in cached code, as for const items.
+        Ok(self.data(&bytes, l.align.max(1) as u64, crate::syms::DataKind::Typed(t)))
     }
 
     /// static_addr from shared lowering (a unit call, as const_addr_shared; lowering ahead reads an
