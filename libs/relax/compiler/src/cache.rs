@@ -43,6 +43,7 @@ mod image;
 use image::{ManifestImage, IMAGE_MAGIC};
 pub(crate) use image::{complete_identities_unit, ids_report_unit, image_broken_unit, image_slot_by_key_unit, name_unnamed_unit, prelink_unit, PrelinkedSlot};
 mod items;
+mod deps;
 mod demand;
 mod front_run;
 pub use front_run::FrontSink;
@@ -145,6 +146,12 @@ const KIND_FRONT_GRAPH: u32 = 8;
 const KIND_DEMAND_PART: u32 = 13;
 /// a graph store's list of the crate stores its demand parts take images from (prune keeps them)
 const KIND_DEMAND_STORES: u32 = 16;
+/// the names a fn body's macro expansions produced (cache/deps.rs exp_names), keyed by the code
+/// key the fn has without them: a later run keys the fn's code without parsing its body
+const KIND_EXP_NAMES: u32 = 17;
+/// the program's item graph (cache/deps.rs Deps::encode), one per program (its root crate's code
+/// store, under a key of the program's view: replaced when the program changes)
+const KIND_DEPS: u32 = 18;
 const KIND_CONST: u32 = 9;
 const KIND_WARM_OUTCOME: u32 = 10;
 /// stores a front image was mapped from: kept for the rest of the process (the arrays point
@@ -518,6 +525,15 @@ pub struct Cache {
     /// the same without the bound crates: what a collected image stores (run, check and
     /// check --boundary of one program bind different sets, the image is shared by all)
     iface_plain: Vec<u128>,
+    /// per crate: its view (items.rs crate_views, bound crates folded in): what code keys and
+    /// store names take from the crate besides its items
+    view: Vec<u128>,
+    /// the program's item graph (cache/deps.rs), built on the first key that needs it
+    deps: Option<std::sync::Arc<deps::Deps>>,
+    /// (crate, name) -> what the name finds from the crate (deps.rs name_closure)
+    name_memo: HashMap<(u32, deps::Name), u128>,
+    /// per definition: its body's names, as one closure hash (code keys)
+    body_names: HashMap<DefId, u128>,
     /// per file: its interface hash and the fn bodies outside it
     digests: Vec<Option<std::sync::Arc<items::FileDigest>>>,
     /// per definition: its body (when a hole) and position digest, hashed (code keys)
@@ -610,6 +626,9 @@ pub struct Cache {
     /// code key is then taken as recorded instead of hashing the bodies it is made from again
     /// (code_key_bytes). Empty otherwise.
     manifest_keys: HashMap<u128, u128>,
+    /// the loaded manifest's code keys, in `manifest`'s order (0: none): a slot whose key this
+    /// run's manifest changes had its old entry superseded (record_manifest removes it)
+    manifest_old_keys: Vec<u128>,
     /// the manifest's prelinked startup image (the code of its slots before the first present,
     /// stored once relocatable against a table of this run's identities: `prelink`)
     image: Option<ManifestImage>,
@@ -814,6 +833,10 @@ impl Cache {
             fps,
             iface: Vec::new(),
             iface_plain: Vec::new(),
+            view: Vec::new(),
+            deps: None,
+            name_memo: HashMap::new(),
+            body_names: HashMap::new(),
             digests: Vec::new(),
             def_bodies: HashMap::new(),
             code_path: Vec::new(),
@@ -854,6 +877,7 @@ impl Cache {
             manifest_missing: 0,
             manifest_uncached: 0,
             manifest_keys: HashMap::new(),
+            manifest_old_keys: Vec::new(),
             manifest_present_cached: 0,
             image: None,
             image_ids: None,
@@ -908,13 +932,17 @@ impl Cache {
         }
         let provided: Vec<(u32, u64)> = u.provided.iter().map(|(k, pc)| (*k, pc.binding)).collect();
         c.iface = items::apply_bound(prog, &c.iface_plain, &provided);
+        // the views (a restored collected program digests no file: its interfaces are restored)
+        let mut view = items::crate_views(prog, &c.iface_plain, &deps::atomic_crates(prog, ncr));
+        view.truncate(ncr);
+        c.view = items::apply_bound(prog, &view, &provided);
         c.stats.iface_ns = t_if.elapsed().as_nanos() as u64;
         // MAKEPAD_RUN_CACHE_IFACE=<file>: every file's interface hash and crate's interface
         // fingerprint (which file made an edit's crate recompile)
         if let Ok(path) = std::env::var("MAKEPAD_RUN_CACHE_IFACE") {
             let mut out = String::new();
             for (ci, v) in c.iface.iter().enumerate() {
-                out.push_str(&format!("crate\t{}\t{:032x}\n", prog.syms.str(prog.crates[ci].name), v));
+                out.push_str(&format!("crate\t{}\t{:032x}\t{:032x}\n", prog.syms.str(prog.crates[ci].name), v, c.view.get(ci).copied().unwrap_or(0)));
             }
             for (i, d) in c.digests.iter().enumerate() {
                 if let Some(d) = d {
@@ -931,8 +959,10 @@ impl Cache {
                 }
             }
         }
+        // named by the view: an edit of the crate's items keeps its store (the entries' keys say
+        // which code still holds)
         for ci in 0..ncr {
-            c.code_path.push(dir.join(code_store_name(options, prog.syms.str(prog.crates[ci].name), c.iface[ci])));
+            c.code_path.push(dir.join(code_store_name(options, prog.syms.str(prog.crates[ci].name), c.view[ci])));
         }
         c.depth = crate_depths(prog);
         c.stale = vec![false; ncr];
@@ -2074,25 +2104,248 @@ impl Cache {
         let k = match recorded {
             Some(k) => k,
             None => {
+                let g = self.deps_graph(u);
                 let mut h = Sip128::new();
-                h.str("code");
+                h.str("code-deps");
                 h.u128(self.cfg);
                 h.write(&e.0);
                 h.write(&shim.0);
+                // what the crates give besides their items (deps.rs): name, cfg, dependencies,
+                // bound crates, the whole fingerprints of the sysroot, and the items every node of
+                // the crate sees (inner attributes, glob imports)
                 for &c in &crates {
-                    h.u128(*self.iface.get(c as usize)?);
+                    h.u128(*self.view.get(c as usize)?);
+                    h.u128(g.always(c));
+                }
+                // the items the identity names (the definition, the types of its arguments): what
+                // they reach of the program's interfaces; one with no node (an item a fn body
+                // defines) by its crate's whole interface fingerprint
+                let mut defs = named.clone();
+                defs.sort_unstable_by_key(|d| d.0);
+                defs.dedup();
+                for d in defs {
+                    match g.def_closure(&u.prog, d) {
+                        Some(x) => h.u128(x),
+                        None if g.in_graph(&u.prog, d) => {
+                            h.str("coarse");
+                            h.u128(*self.iface.get(u.prog.def(d).krate as usize)?);
+                        }
+                        None => {}
+                    }
                 }
                 // the bodies the code is made from: the definition's, a closure's enclosing fns'
-                for d in key_defs(u, key) {
+                // -- their text and position, and what the names in them find
+                let kd = key_defs(u, key);
+                for &d in &kd {
                     h.u128(self.def_body(u, d));
+                    h.u128(self.body_names_of(u, d, &g));
                 }
                 // types defined in a fn body (their text is that body's)
                 self.local_bodies(u, &named, &mut h);
+                let k0 = h.finish128();
+                // and what the names of their macro expansions find (unknown until the body is
+                // parsed or an earlier run recorded them: no key yet, none remembered)
+                let mut h = Sip128::new();
+                h.str("code-exp");
+                h.u128(k0);
+                for &d in &kd {
+                    match self.exp_closure(u, d, k0, dom, &g) {
+                        Some(x) => h.u128(x),
+                        None => {
+                            self.key_waits = true;
+                            return None;
+                        }
+                    }
+                }
                 h.finish128()
             }
         };
         self.key_crate.insert(k, dom);
         Some((k, crates, e.0))
+    }
+
+    /// The item graph (cache/deps.rs), on the first need: the stored one when it was built from
+    /// this program's very sources (a warm start maps it), else built over it -- the rows of the
+    /// crates whose sources and dependencies are as it was built from are taken over, only the
+    /// other crates' boot files are digested and walked (a restored collected program digests
+    /// files lazily) -- and recorded for the next start. MAKEPAD_RUN_DEPS_VERIFY=1: a graph built
+    /// over a stored one is checked against one built from scratch.
+    fn deps_graph(&mut self, u: &Unit) -> std::sync::Arc<deps::Deps> {
+        if let Some(g) = &self.deps {
+            return g.clone();
+        }
+        let t0 = std::time::Instant::now();
+        let prog = &u.prog;
+        let ncr = self.iface.len();
+        let valid = deps::Deps::valid(prog, self.cfg, &self.fps);
+        let root = self.manifest_root.unwrap_or(ncr.saturating_sub(1) as u32);
+        let key = self.deps_key(root);
+        let stored = key.and_then(|k| {
+            let (si, _) = self.index_at(k)?;
+            let store = self.stores.get(si as usize)?.clone();
+            let (kind, p) = self.get_checked(k)?;
+            if kind != KIND_DEPS { return None; }
+            // SAFETY: `store` (kept by the graph) holds the mapping
+            let p: &'static [u8] = unsafe { std::slice::from_raw_parts(p.as_ptr(), p.len()) };
+            deps::Deps::read(prog, ncr, p, store)
+        });
+        if stored.as_ref().is_some_and(|g| g.built_from() == valid && g.crate_count() == prog.crates.len()) {
+            let g = std::sync::Arc::new(stored.unwrap());
+            if self.verbose {
+                eprintln!("makepad-run cache: item graph: {} nodes mapped in {:.1} ms", g.nodes_n, t0.elapsed().as_secs_f64() * 1e3);
+            }
+            self.deps = Some(g.clone());
+            return g;
+        }
+        if self.digests.len() < prog.files.len() {
+            self.digests.resize(prog.files.len(), None);
+        }
+        let atomic = deps::atomic_crates(prog, ncr);
+        let digest = |clean: &[bool], digests: &mut Vec<Option<std::sync::Arc<items::FileDigest>>>| {
+            let want: Vec<usize> = (0..prog.boot_files.min(prog.files.len()))
+                .filter(|&f| digests[f].is_none() && prog.file_crate.get(f).is_some_and(|&c| !atomic.get(c as usize).copied().unwrap_or(true) && !clean.get(c as usize).copied().unwrap_or(false)))
+                .collect();
+            items::file_digests_of(prog, &want, digests);
+            want.len()
+        };
+        // (a graph whose component ids ran far is not built over: the next one starts them again)
+        let stored = stored.filter(|g| g.ids_left());
+        let clean = deps::Deps::clean_crates(prog, &self.iface_plain, &self.fps, stored.as_ref());
+        let mut digested = digest(&clean, &mut self.digests);
+        let t_dg = t0.elapsed();
+        let built = deps::Deps::build(prog, &self.digests, &self.iface_plain, &self.fps, valid, stored.as_ref());
+        let over = built.is_some() && clean.iter().any(|&c| c);
+        let g = match built {
+            Some(g) => g,
+            None => {
+                // the alias or macro names changed: every crate is walked
+                digested += digest(&[], &mut self.digests);
+                deps::Deps::build(prog, &self.digests, &self.iface_plain, &self.fps, valid, None).expect("a graph built from scratch")
+            }
+        };
+        if self.verbose {
+            eprintln!("makepad-run cache: item graph: {} nodes ({} walked, {} of {} crates taken over), {} edges, {} coarse, built in {:.1} ms (digests of {} files {:.1} ms; files to {:.1}, edges to {:.1}, components to {:.1}, hashed to {:.1})",
+                g.nodes_n, g.walked, if over { clean.iter().filter(|&&c| c).count() } else { 0 }, clean.len(), g.edges, g.coarse, t0.elapsed().as_secs_f64() * 1e3,
+                digested, t_dg.as_secs_f64() * 1e3, g.phases[0], g.phases[1], g.phases[2], g.phases[3]);
+        }
+        if over && std::env::var("MAKEPAD_RUN_DEPS_VERIFY").is_ok_and(|v| v == "1") {
+            digest(&[], &mut self.digests);
+            let scratch = deps::Deps::build(prog, &self.digests, &self.iface_plain, &self.fps, valid, None).expect("a graph built from scratch");
+            match g.same_closures(&scratch) {
+                Ok(()) => eprintln!("makepad-run cache: item graph verified: built over the stored graph = built from scratch"),
+                Err(e) => eprintln!("makepad-run cache: item graph verify FAILED: {e}"),
+            }
+        }
+        if let Some(k) = key.filter(|_| self.mode != Mode::ReadOnly && (root as usize) < ncr) {
+            // (one slot per root: the newest graph replaces the one it was built over)
+            self.pending_keys.insert(k);
+            self.push_pending(root, NewEntry { key: k, kind: KIND_DEPS, payload: g.encode() });
+        }
+        let g = std::sync::Arc::new(g);
+        self.deps = Some(g.clone());
+        g
+    }
+
+    /// The key of the stored item graph of the program rooted at crate `root`: one per root and
+    /// Relax build (a newer graph replaces it; Deps::valid says what it was built from).
+    fn deps_key(&self, root: u32) -> Option<u128> {
+        let mut h = Sip128::new();
+        h.str("deps-graph-v2");
+        h.u128(self.cfg);
+        h.u128(*self.crate_ident.get(root as usize)?);
+        Some(h.finish128())
+    }
+
+    /// File `f`'s digest (made on the first need).
+    fn digest_of(&mut self, u: &Unit, f: usize) -> Option<std::sync::Arc<items::FileDigest>> {
+        let pf = u.prog.files.get(f)?;
+        if self.digests.len() <= f {
+            self.digests.resize(u.prog.files.len(), None);
+        }
+        Some(self.digests[f].get_or_insert_with(|| std::sync::Arc::new(items::file_digest(pf))).clone())
+    }
+
+    /// What name `n` finds from crate `c` (memo of deps.rs name_closure).
+    fn name_closure(&mut self, g: &deps::Deps, c: u32, n: deps::Name) -> u128 {
+        *self.name_memo.entry((c, n)).or_insert_with(|| g.name_closure(c, n))
+    }
+
+    /// Definition `d`'s body (when a hole: deps.rs): what the names written in it find.
+    fn body_names_of(&mut self, u: &Unit, d: DefId, g: &deps::Deps) -> u128 {
+        if let Some(&k) = self.body_names.get(&d) {
+            return k;
+        }
+        let def = u.prog.def(d);
+        let (f, item, c) = (def.file as usize, def.item, def.krate);
+        let mut h = Sip128::new();
+        h.str("body-names");
+        if let Some(dg) = self.digest_of(u, f) {
+            if let Some((lo, hi)) = dg.body_span(item) {
+                let (mut names, mut invoked) = (Vec::new(), Vec::new());
+                deps::scan(&u.prog.files[f].src, &[(lo, hi)], &[], &mut names, &mut invoked);
+                names.sort_unstable();
+                names.dedup();
+                let mut v: Vec<u128> = names.iter().map(|&n| self.name_closure(g, c, n)).filter(|&x| x != 0).collect();
+                v.sort_unstable();
+                v.dedup();
+                h.u32(v.len() as u32);
+                for x in v { h.u128(x); }
+            }
+        }
+        let k = h.finish128();
+        self.body_names.insert(d, k);
+        k
+    }
+
+    /// What the names of the macro expansions in definition `d`'s body find (0: its body invokes
+    /// no macro that can name anything; deps.rs). The names come from the body's parse in this run
+    /// (then recorded under `k0`, the code key without them, for a later run) or from that record.
+    /// None: the body is not parsed and nothing was recorded (the key is not known yet).
+    fn exp_closure(&mut self, u: &Unit, d: DefId, k0: u128, dom: u32, g: &deps::Deps) -> Option<u128> {
+        let def = u.prog.def(d);
+        let (f, item, c) = (def.file as usize, def.item, def.krate);
+        let Some(dg) = self.digest_of(u, f) else { return Some(0) };
+        let Some((lo, hi)) = dg.body_span(item) else { return Some(0) };
+        let pf = &u.prog.files[f];
+        let (mut names, mut invoked) = (Vec::new(), Vec::new());
+        deps::scan(&pf.src, &[(lo, hi)], &[], &mut names, &mut invoked);
+        if !invoked.iter().any(|&m| g.loud(m)) {
+            return Some(0);
+        }
+        let mut kh = Sip128::new();
+        kh.str("exp-names");
+        kh.u128(k0);
+        kh.u128(self.def_key(u, d));
+        let ekey = kh.finish128();
+        let owner = dg.hole_owner(item);
+        let lazy = matches!(pf.ast.items.get(owner as usize).map(|it| &it.kind), Some(crate::ast::ItemKind::Fn(_, None, _)));
+        let names = match deps::exp_names(pf, lo, hi, lazy) {
+            Some(n) => {
+                if self.mode != Mode::ReadOnly && !self.has_index(&ekey) && self.pending_keys.insert(ekey) {
+                    let mut p = Vec::with_capacity(4 + n.len() * 8);
+                    p.extend_from_slice(&(n.len() as u32).to_le_bytes());
+                    for x in &n { p.extend_from_slice(&x.to_le_bytes()); }
+                    self.push_pending(dom, NewEntry { key: ekey, kind: KIND_EXP_NAMES, payload: p });
+                }
+                n
+            }
+            None => match self.get_checked(ekey) {
+                Some((KIND_EXP_NAMES, p)) => {
+                    let n = u32::from_le_bytes(p.get(0..4)?.try_into().ok()?) as usize;
+                    if p.len() != 4 + n * 8 { return None; }
+                    (0..n).map(|i| u64::from_le_bytes(p[4 + i * 8..12 + i * 8].try_into().unwrap())).collect()
+                }
+                _ => return None,
+            },
+        };
+        let mut v: Vec<u128> = names.iter().map(|&n| self.name_closure(g, c, n)).filter(|&x| x != 0).collect();
+        v.sort_unstable();
+        v.dedup();
+        let mut h = Sip128::new();
+        h.str("exp-closure");
+        h.u32(v.len() as u32);
+        for x in v { h.u128(x); }
+        Some(h.finish128())
     }
 
     /// The bodies that define any of `named` (local items), into a key.
@@ -2881,7 +3134,9 @@ impl Cache {
         let mut h = Sip128::new();
         h.str("startup slots");
         h.u128(self.cfg);
-        h.u128(*self.iface.get(root as usize)?);
+        // the program's view, not its interface: the manifest names each slot's key, which says
+        // whether its entry holds after an edit (load_manifest)
+        h.u128(*self.view.get(root as usize)?);
         Some(h.finish128())
     }
 
@@ -2926,6 +3181,10 @@ impl Cache {
         self.manifest_len = old.manifest_len;
         self.collected_committed = true;
         self.stats = old.stats.clone();
+        // the same program (settle_rebuild compares it): the same item graph and definitions
+        self.deps = old.deps.clone();
+        self.name_memo = old.name_memo.clone();
+        self.body_names = old.body_names.clone();
     }
 
     /// Reads the newest startup manifest of the program rooted at crate `root` (and its
@@ -2965,6 +3224,7 @@ impl Cache {
                         self.manifest_keys = out.iter().zip(&keys).filter(|(_, k)| **k != 0).map(|(b, k)| (identity_hash(b), *k)).collect();
                     }
                     self.manifest = out;
+                    self.manifest_old_keys = keys;
                     self.manifest_present = present;
                     self.manifest_missing = missing;
                     self.manifest_uncached = uncached;
@@ -3056,6 +3316,25 @@ impl Cache {
                 eprintln!("makepad-run cache: startup manifest kept: at exit the image would cover {} of the {} slots the loaded one has", n_img, self.image_slots);
             }
             return true;
+        }
+        // the code entries this manifest supersedes: a slot of the loaded manifest whose key
+        // changed (an edit reached what its code is made from) left its old entry behind under a
+        // key nothing names any more (code stores are named by the crate's view, which an edit
+        // keeps). Removed with this manifest's write, its bytes are dead space: the store
+        // rewrite drops them once they outgrow a quarter of the live ones (store.rs append).
+        if self.manifest.len() == self.manifest_old_keys.len() {
+            let old_keys: HashMap<&[u8], u128> = self.manifest.iter().zip(&self.manifest_old_keys)
+                .filter(|(_, k)| **k != 0).map(|(b, k)| (b.as_slice(), *k)).collect();
+            let gone: Vec<u128> = list.iter().filter_map(|(b, k)| old_keys.get(b.as_slice())
+                .filter(|o| *k != 0 && **o != *k && !self.pending_keys.contains(o)).copied()).collect();
+            let mut removed = 0;
+            for o in gone {
+                let Some((p, _)) = self.index_at(o) else { continue };
+                let Some(c) = self.code_path.iter().position(|cp| *cp == self.stores[p as usize].path) else { continue };
+                self.push_pending(c as u32, NewEntry { key: o, kind: crate::store::KIND_REMOVED, payload: Vec::new() });
+                removed += 1;
+            }
+            if self.verbose && removed != 0 { eprintln!("makepad-run cache: {} code entries superseded by this manifest: removed", removed); }
         }
         let mut e = E::default();
         e.u32(ENTRY_VERSION);
@@ -4159,7 +4438,8 @@ struct FrontGraphWrite {
     options: crate::options::Options,
     recipe: crate::crate_image::GraphRecipe,
     fps: Vec<Option<u128>>,
-    demand: Option<std::sync::Arc<crate::preload::DemandImage>>,
+    /// the load's demand plan: its image is taken on the writer (a plan still planning is not waited for here)
+    demand: Option<std::sync::Arc<crate::preload::DemandPlan>>,
     profile: bool,
 }
 static FRONT_GRAPH_WRITES: relax_session::sync::Mutex<Vec<FrontGraphWrite>> = relax_session::sync::Mutex::new(Vec::new());
@@ -4170,7 +4450,7 @@ impl FrontGraphWrite {
         if recipe.crates.len() != prog.crates.len() || recipe.crates.iter().zip(&prog.crates)
             .any(|(key, c)| prog.syms.str(c.name) != key.0 || c.root_path() != key.1) { return None; }
         Some(Self { dir: dir.to_owned(), options: prog.session.options.clone(), recipe: recipe.clone(),
-            fps: fps.to_vec(), demand: prog.demand_plan.as_ref().map(|p| p.image.clone()), profile: prog.session.runtime.profile })
+            fps: fps.to_vec(), demand: prog.demand_plan.clone(), profile: prog.session.runtime.profile })
     }
 }
 
@@ -4256,7 +4536,7 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
     let (dir, recipe, fps) = (&job.dir, &job.recipe, &job.fps);
     let mut graph = crate::crate_image::GraphImage {
         identity: recipe.identity, crates: Vec::new(), inputs: Vec::new(), stamps: Vec::new(), probes: Vec::new(),
-        demand_image: job.demand.clone(),
+        demand_image: job.demand.as_ref().map(|p| p.image.clone()),
     };
     let mut inputs = std::collections::BTreeMap::new();
     let mut probes = std::collections::BTreeMap::new();
@@ -4353,7 +4633,7 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
         let parts: Vec<String> = marks.iter().map(|&(n, t)| { let d = t - prev; prev = t; format!("{}={:.0}", n, d) }).collect();
         eprintln!("makepad-run front: graph recorded ({} crates, {} inputs) in {:.0} ms: {}", graph.crates.len(), graph.inputs.len(), prev, parts.join(" "));
     }
-    if let (Some(source), Some(written)) = (&job.demand, &graph.demand_image) { source.recording_written(written.parts.clone()); }
+    if let (Some(source), Some(written)) = (&job.demand, &graph.demand_image) { source.image.recording_written(written.parts.clone()); }
     Some(())
 }
 
@@ -4369,7 +4649,10 @@ pub struct FrontImages {
     content_hashes: std::sync::atomic::AtomicU64,
     probes: relax_session::sync::Mutex<Option<HashMap<String, bool>>>,
     stores: relax_session::sync::Mutex<HashMap<(String, String), PathBuf>>,
-    certificate: relax_session::sync::Mutex<Option<crate::crate_image::GraphImage>>,
+    certificate: relax_session::sync::Mutex<Option<std::sync::Arc<crate::crate_image::GraphImage>>>,
+    /// the begun load's graph as read from its store (begin_load), certified or not: the restore and
+    /// the demand plan's lookups read it once
+    graph_read: relax_session::sync::Mutex<Option<std::sync::Arc<crate::crate_image::GraphImage>>>,
     begun: relax_session::sync::Mutex<Option<u128>>,
     /// the crates a partial collected restore kept (name, fingerprint): the crates loaded after
     /// them name them as dependencies (restore_collected, full_deps)
@@ -4380,6 +4663,11 @@ pub struct FrontImages {
     sink: Option<std::sync::Arc<FrontSink>>,
 }
 impl FrontImages {
+    /// Graph `identity` as its store holds it: the begun load's read when it is that graph.
+    pub(crate) fn front_graph(&self, identity: u128) -> Option<std::sync::Arc<crate::crate_image::GraphImage>> {
+        if let Some(g) = self.graph_read.lock().unwrap().as_ref().filter(|g| g.identity == identity) { return Some(g.clone()); }
+        read_front_graph(&self.dir, identity).map(std::sync::Arc::new)
+    }
     pub fn open(options: &crate::options::Options) -> Option<Self> {
         // A build script's run (its own small world: std plus the script's crates) keeps no
         // front images: they are read only when a script runs again, which a cached build
@@ -4666,7 +4954,8 @@ impl crate::crate_image::CrateImages for FrontImages {
         let rejected = |why: &str| if crate::preload::trace() {
             eprintln!("makepad-run front: graph certificate not restored: {}", why);
         };
-        let Some(graph) = read_front_graph(&self.dir, recipe.identity) else { rejected("store"); return; };
+        let Some(graph) = read_front_graph(&self.dir, recipe.identity).map(std::sync::Arc::new) else { rejected("store"); return; };
+        *self.graph_read.lock().unwrap() = Some(graph.clone());
         if graph.identity != recipe.identity || graph.crates.len() != recipe.crates.len()
             || !graph.crates.iter().zip(&recipe.crates).all(|((key, _), expected)| key == expected)
             { rejected("recipe"); return; }
@@ -4725,13 +5014,14 @@ impl crate::crate_image::CrateImages for FrontImages {
         *self.probes.lock().unwrap() = None;
         self.stores.lock().unwrap().clear();
         *self.certificate.lock().unwrap() = None;
+        *self.graph_read.lock().unwrap() = None;
         *self.begun.lock().unwrap() = None;
     }
     fn demand_image(&self, crates: &[crate::preload::PreCrate], graph: u128) -> Option<std::sync::Arc<crate::preload::DemandImage>> {
         let recipe = crate::crate_image::GraphRecipe::new(crates);
-        let saved = read_front_graph(&self.dir, recipe.identity)?;
+        let saved = self.front_graph(recipe.identity)?;
         if saved.identity != recipe.identity || saved.crates.iter().map(|(key, _)| key).ne(recipe.crates.iter()) { return None; }
-        let image = saved.demand_image?;
+        let image = saved.demand_image.clone()?;
         if image.graph != graph || image.eager_prefix > crates.len() { return None; }
         let indexed: std::collections::BTreeSet<_> = image.files.iter().map(|f| (f.ci, f.path.as_str())).collect();
         if indexed.iter().any(|(ci, _)| *ci >= crates.len())
@@ -4769,9 +5059,9 @@ impl crate::crate_image::CrateImages for FrontImages {
     }
     fn demand_parts(&self, crates: &[crate::preload::PreCrate], graph: u128) -> Option<crate::crate_image::DemandParts> {
         let recipe = crate::crate_image::GraphRecipe::new(crates);
-        let Some(saved) = read_front_graph(&self.dir, recipe.identity) else { return None; };
+        let Some(saved) = self.front_graph(recipe.identity) else { return None; };
         if saved.identity != recipe.identity || saved.crates.iter().map(|(key, _)| key).ne(recipe.crates.iter()) { return None; }
-        let Some(image) = saved.demand_image.filter(|image| image.graph == graph && image.parts.len() == crates.len()) else { return None; };
+        let Some(image) = saved.demand_image.clone().filter(|image| image.graph == graph && image.parts.len() == crates.len()) else { return None; };
         let path = front_graph_path(&self.dir, recipe.identity);
         let store = Store::open(&path)?;
         let profile = crates.first().is_some_and(|c| c.cfg.session.runtime.profile);
@@ -4801,7 +5091,6 @@ impl crate::crate_image::CrateImages for FrontImages {
             Some(part.key)
         }).collect::<Vec<_>>();
         let valid = keys.iter().map(Option::is_some).collect::<Vec<_>>();
-        let eager_prefix = valid.iter().take(image.eager_prefix).take_while(|v| **v).count();
         // Stale parts are comparison evidence only, never reusable input. Keep
         // their old demand-out/export sets to validate an edited local selection.
         let keys = image.parts.iter().map(|p| Some(p.key)).collect::<Vec<_>>();
@@ -4809,7 +5098,9 @@ impl crate::crate_image::CrateImages for FrontImages {
         let crates_profile = crates.first().is_some_and(|c| c.cfg.session.runtime.profile);
         let crate_names = crates.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
         let image_dir = self.dir.clone();
-        Some(crate::crate_image::DemandParts { eager_prefix, valid, load: std::sync::Arc::new(move || {
+        let last = crates.len().saturating_sub(1);
+        let last_selected = image.files.iter().filter(|f| f.ci == last).all(|f| image.reached.contains(&(last, f.path.clone())));
+        Some(crate::crate_image::DemandParts { valid, last_selected, load: std::sync::Arc::new(move || {
             let _profile = crate::load_profile::span(crates_profile, "rust-demand-parts", "load");
             let store = Store::open(&path);
             let chunk = keys.len().div_ceil(crate::preload::jobs().max(1)).max(1);
@@ -6087,7 +6378,8 @@ mod data_tests {
             slots.push(id);
         }
         assert_eq!(cache.stats.recorded, fixtures.len() as u64);
-        assert_eq!(cache.flush().unwrap(), fixtures.len());
+        // and the program's item graph (cache/deps.rs), recorded with the first key
+        assert_eq!(cache.flush().unwrap(), fixtures.len() + 1);
         drop(cache);
         let mut warm = open_test_cache(&u, &root.join("cache"));
         for id in slots {

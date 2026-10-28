@@ -110,20 +110,37 @@ impl Program {
     /// again by its resolve in the same order (Relink), with the ids a fresh build gives them.
     pub fn retain_collected_prefix(&mut self, crates: usize) -> Option<usize> {
         let s = *self.collected_starts.get(crates)?;
-        if s.mods > self.mods.len() || self.mods.iter().skip(s.mods).any(|m| (m.krate as usize) < crates)
-            || self.file_crate.get(s.files..)?.iter().any(|k| (*k as usize) < crates) { return None; }
-        let relink = self.on_demand_tail(crates, s.defs)?;
+        let no = |why: &str| { if crate::preload::trace() { eprintln!("makepad-run collected: prefix of {crates} crates not retained: {why}"); } };
+        if s.mods > self.mods.len() || self.mods.iter().skip(s.mods).any(|m| (m.krate as usize) < crates) { no("a module of a retained crate after the suffix start"); return None; }
+        if self.file_crate.get(s.files..)?.iter().any(|k| (*k as usize) < crates) {
+            if crate::preload::trace() {
+                let late: Vec<_> = self.file_crate[s.files..].iter().enumerate().filter(|(_, k)| (**k as usize) < crates).take(5).map(|(i, _)| self.file_paths[s.files + i].clone()).collect();
+                eprintln!("makepad-run collected: late files of retained crates: {late:?}");
+            }
+            no("a file of a retained crate after the suffix start"); return None;
+        }
+        let Some(relink) = self.on_demand_tail(crates, s.defs) else {
+            if crate::preload::trace() {
+                let bad: Vec<_> = self.defs.get(s.defs..).unwrap_or_default().iter().filter(|d| (d.krate as usize) < crates).take(5).map(|d| format!("{:?} {}", d.kind, self.syms.str(d.name))).collect();
+                eprintln!("makepad-run collected: tail definitions of retained crates: {bad:?}");
+            }
+            no("on-demand tail"); return None;
+        };
         let names: crate::fxhash::HashSet<String> = self.crates[..crates].iter().map(|c| self.syms.str(c.name).to_string()).collect();
         // A library and its binary can share a name; their macro-table shadowing requires
         // the ordinary loader if either changes.
-        if self.crates[crates..].iter().any(|c| names.contains(self.syms.str(c.name))) { return None; }
+        if let Some(c) = self.crates[crates..].iter().find(|c| names.contains(self.syms.str(c.name))) {
+            no(&format!("a name shared with a dropped crate: {}", self.syms.str(c.name))); return None;
+        }
         self.node_id_to_def_id.retain(|(f, _), d| (*f as usize) < s.files && (d.0 as usize) < s.defs);
-        self.legacy_const_args.retain(|d, _| (d.0 as usize) < s.defs);
+        // (a table keyed by the definitions or files drops the dropped ones without decoding the
+        // retained rows of its image: ImageMap::remove_from)
+        self.legacy_const_args.remove_from(s.defs as u128);
         for owner in &relink.owners { self.legacy_const_args.remove(owner); }
         Arc::make_mut(&mut self.legacy_const_attrs).retain(|d, _| (d.0 as usize) < s.defs);
-        self.def_id_to_node_id.retain(|d, _| (d.0 as usize) < s.defs);
+        self.def_id_to_node_id.remove_from(s.defs as u128);
         let kept = |d: &DefId| (d.0 as usize) < s.defs;
-        self.impl_trait_in_trait_data.retain(|d, _| kept(d));
+        self.impl_trait_in_trait_data.remove_from(s.defs as u128);
         self.associated_types_for_impl_traits.retain(|d, v| kept(d) && v.iter().all(kept));
         self.opaque_to_rpitit.retain(|d, v| kept(d) && kept(v));
         self.opaque_types_defined_by.retain(|d, v| { v.retain(kept); kept(d) });
@@ -132,10 +149,10 @@ impl Program {
         // synthesizes them again
         for &ti in &relink.traits { self.traits.get_mut(ti)?.retain(kept); }
         for &ii in &relink.impls { self.impls.get_mut(ii)?.items.retain(kept); }
-        self.repeat_expr_counts.retain(|d| (d.0 as usize) < s.defs);
-        self.collected_definitions.retain(|d| (d.0 as usize) < s.defs);
+        self.repeat_expr_counts.remove_from(s.defs as u128);
+        self.collected_definitions.remove_from(s.defs as u128);
         self.legacy_call_names.retain(|d, _| (d.0 as usize) < s.defs);
-        self.def_disambiguators.retain(|(d, _, _), _| (d.0 as usize) < s.defs);
+        self.def_disambiguators.remove_from((s.defs as u128) << 64);
         for &(parent, first) in &relink.ordinals {
             let key = (parent, DefKind::AnonConst, None);
             if first == 0 { self.def_disambiguators.remove(&key); } else { self.def_disambiguators.insert(key, first); }
@@ -155,8 +172,8 @@ impl Program {
         self.lines_loaded = s.lines;
         self.reload = OnceLock::new();
         self.block_mods.retain(|(f, _), m| (*f as usize) < s.files && (*m as usize) < s.mods);
-        self.block_owner.retain(|m, _| (*m as usize) < s.mods);
-        self.item_defs.retain(|(f, _), _| (*f as usize) < s.files);
+        self.block_owner.remove_from(s.mods as u128);
+        self.item_defs.remove_from((s.files as u128) << 64);
         self.imports_of_module.retain(|m, _| (*m as usize) < s.mods);
         self.part_interned.get_mut().ok()?.retain(|(f, _)| (*f as usize) < s.files);
         self.front_ahead.truncate(crates); self.front_restored.truncate(crates);
