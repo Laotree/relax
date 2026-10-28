@@ -485,8 +485,8 @@ fn build_world(sess: &std::sync::Arc<crate::Session>) -> Result<World, String> {
             let mut progress = true;
             while progress {
                 progress = false;
-                for i in (0..n).filter(|&i| stage_need[i] && !stage_uses[i]) {
-                    if units[i].deps.iter().any(|&(d, _)| (boot_root[d] && have[d]) || stage_uses[d]) {
+                for i in 0..n {
+                    if stage_need[i] && !stage_uses[i] && units[i].deps.iter().any(|&(d, _)| (boot_root[d] && have[d]) || stage_uses[d]) {
                         stage_uses[i] = true;
                         progress = true;
                     }
