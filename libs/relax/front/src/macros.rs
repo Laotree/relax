@@ -293,7 +293,9 @@ pub(crate) const LIT_FRAG: u32 = 1 << 29;
 pub(crate) const META_ONLY: u32 = 1 << 28;
 /// A `$b:block` fragment (rustc's `MetaVarKind::Block`): no labeled / unsafe block or closure body.
 pub(crate) const BLOCK_FRAG: u32 = 1 << 27;
-pub(crate) const FRAG_FLAGS: u32 = TY_FRAG | EXPR_FRAG | LIT_FRAG | META_ONLY | BLOCK_FRAG;
+/// A `$p:path` fragment, reparsed with type-mode generic arguments.
+pub(crate) const PATH_FRAG: u32 = 1 << 26;
+pub(crate) const FRAG_FLAGS: u32 = TY_FRAG | EXPR_FRAG | LIT_FRAG | META_ONLY | BLOCK_FRAG | PATH_FRAG;
 
 const GLOB_ID: Name = Name(0);
 const GLOB_SEP_ID: Name = Name(1);
@@ -2750,8 +2752,11 @@ impl<'a> Parser<'a> {
                         // (a `$t:ty` is a type nonterminal even when it is one token: where a bound is
                         // expected, it is not a trait -- rustc `parse_trait_bound`; the end carries TY_FRAG)
                         let ty_frag = *f == Frag::Ty && !wrap;
-                        let kind_flag = match f { Frag::Expr if !wrap => EXPR_FRAG, Frag::Literal => LIT_FRAG, Frag::Block if !wrap => BLOCK_FRAG, _ => 0 };
-                        let group = opaque && out.s.len() > group_start && (hi - lo + usize::from(taken.is_some()) > 1 || ty_frag);
+                        // rustc_expand mbe/transcribe.rs: transcribe_pnr wraps even a
+                        // one-token path in MetaVarKind::Path invisible delimiters.
+                        let path_frag = *f == Frag::Path;
+                        let kind_flag = match f { Frag::Expr if !wrap => EXPR_FRAG, Frag::Literal => LIT_FRAG, Frag::Block if !wrap => BLOCK_FRAG, Frag::Path => PATH_FRAG, _ => 0 };
+                        let group = opaque && out.s.len() > group_start && (hi - lo + usize::from(taken.is_some()) > 1 || ty_frag || path_frag);
                         if group || (kind_flag != 0 && out.s.len() > group_start) {
                             out.groups.push((group_start as u32, out.s.len() as u32 | if ty_frag { TY_FRAG } else { 0 } | kind_flag | if group { 0 } else { META_ONLY }));
                         }

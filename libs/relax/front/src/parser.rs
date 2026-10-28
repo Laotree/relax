@@ -120,6 +120,8 @@ pub struct Parser<'a> {
     pub frag_groups: crate::fxhash::HashMap<u32, u32>,
     /// starts of the `$t:ty` substitutions of expansion text (not a trait where a bound is expected)
     ty_frags: crate::fxhash::HashSet<u32>,
+    /// starts of the `$p:path` substitutions (type-mode arguments even in expressions/patterns)
+    path_frags: crate::fxhash::HashSet<u32>,
     /// starts of the `$e:expr` / `$l:literal` substitutions of expansion text (check only): the kind
     meta_frags: crate::fxhash::HashMap<u32, &'static str>,
     /// starts of the `$b:block` substitutions of expansion text (check only)
@@ -211,6 +213,7 @@ impl<'a> Parser<'a> {
             tok_undo: Vec::new(),
             frag_groups: Default::default(),
             ty_frags: Default::default(),
+            path_frags: Default::default(),
             meta_frags: Default::default(),
             block_frags: Default::default(),
             synth_parens: Default::default(),
@@ -583,9 +586,10 @@ impl<'a> Parser<'a> {
         let mut i = self.pos + 1;
         while i < self.toks.len() {
             let k = self.toks.kind_at(i);
-            // parse_part has no invisible type-fragment boundaries (rustc_parse
-            // parser/ty.rs: parse_ty_common); consume these with their expansion.
-            if !self.ty_frags.is_empty() && self.ty_frags.contains(&{ self.toks.at(i).lo }) {
+            // parse_part has no invisible type/path-fragment boundaries (rustc_parse
+            // parser/{ty,path}.rs: parse_ty_common/parse_path); consume these with their expansion.
+            if (!self.ty_frags.is_empty() && self.ty_frags.contains(&{ self.toks.at(i).lo }))
+                || (!self.path_frags.is_empty() && self.path_frags.contains(&{ self.toks.at(i).lo })) {
                 return BodyOutline::Eager(5);
             }
             match k {
@@ -1851,8 +1855,14 @@ impl<'a> Parser<'a> {
             self.tok_origin.push((base + off, o, n));
         }
         for (a, b) in groups {
+            // Nested groups with the same start are emitted inner first; keep the outer kind.
             if b & crate::macros::TY_FRAG != 0 {
                 self.ty_frags.insert(base + a);
+                self.path_frags.remove(&(base + a));
+            }
+            if b & crate::macros::PATH_FRAG != 0 {
+                self.path_frags.insert(base + a);
+                self.ty_frags.remove(&(base + a));
             }
             if b & crate::macros::BLOCK_FRAG != 0 && crate::lexer::validation_enabled() {
                 self.block_frags.insert(base + a);
@@ -3511,6 +3521,25 @@ impl<'a> Parser<'a> {
 
     /// Path in expression mode (`expr == true`: generics need `::<`) or type mode.
     pub fn path(&mut self, expr: bool) -> PResult<Path> {
+        // rustc_parse parser/path.rs: parse_path_inner; parser/mod.rs: eat_metavar_seq.
+        // A captured path uses type syntax only inside its invisible delimiters.
+        if let Some(hi) = self.path_fragment_end(self.tok().lo) {
+            if let Some(last) = (self.pos..self.toks.len()).find(|&i| self.toks.at(i).hi == hi) {
+                let end = last + 1;
+                let next = self.toks.at(end);
+                self.toks.edit(end, |t| *t = Tok { kind: T::Eof, lo: hi, hi });
+                let result = self.path_unfragmented(false);
+                let complete = self.pos == end;
+                self.toks.edit(end, |t| *t = next);
+                let path = result?;
+                if !complete { return self.err("unexpected token in path fragment"); }
+                return Ok(path);
+            }
+        }
+        self.path_unfragmented(expr)
+    }
+
+    fn path_unfragmented(&mut self, expr: bool) -> PResult<Path> {
         let lo = self.lo();
         let mut qself = QSelfId::NONE;
         let mut global = self.at_dollar_crate();
@@ -3751,10 +3780,15 @@ impl<'a> Parser<'a> {
         if self.ty_frags.contains(&lo) { self.frag_groups.get(&lo).copied() } else { None }
     }
 
+    fn path_fragment_end(&self, lo: u32) -> Option<u32> {
+        if self.path_frags.contains(&lo) { self.frag_groups.get(&lo).copied() } else { None }
+    }
+
     pub(super) fn fragment_group(&self, lo: u32) -> Option<(u32, u32)> {
         let end = *self.frag_groups.get(&lo)?;
         let mut flags = 0;
         if self.ty_frags.contains(&lo) { flags |= crate::macros::TY_FRAG; }
+        if self.path_frags.contains(&lo) { flags |= crate::macros::PATH_FRAG; }
         if self.block_frags.contains(&lo) { flags |= crate::macros::BLOCK_FRAG; }
         match self.meta_frags.get(&lo) {
             Some(&"expr") => flags |= crate::macros::EXPR_FRAG,
@@ -4161,7 +4195,9 @@ impl<'a> Parser<'a> {
                     { let m = self.ast.push_row(MacCall { path, delim, toks, args }); Pat::Mac(m) }
                 } else {
                     let lo = self.lo();
-                    let simple = matches!(self.kind(), T::Ident | T::RawIdent) && !matches!(self.nth(1), T::PathSep | T::OpenParen | T::OpenBrace);
+                    // rustc_parse parser/pat.rs: can_be_ident_pat excludes path metavariables.
+                    let simple = !self.path_frags.contains(&{ self.tok().lo })
+                        && matches!(self.kind(), T::Ident | T::RawIdent) && !matches!(self.nth(1), T::PathSep | T::OpenParen | T::OpenBrace);
                     if simple && !matches!(self.nth(1), T::DotDot | T::DotDotEq | T::DotDotDot) {
                         let name = self.ident_tok()?;
                         let sub = if self.eat(T::At) { Some(self.pat_no_or()?) } else { None };
@@ -4640,6 +4676,11 @@ impl<'a> Parser<'a> {
 
     fn unary(&mut self, r: u8) -> PResult<ExprId> {
         let lo = self.lo();
+        // rustc_parse parser/mod.rs: maybe_recover_from_interpolated_ty_qpath
+        // diagnoses `$t::f`; a type fragment needs `<$t>::f` in an expression.
+        if self.ty_frags.contains(&{ self.tok().lo }) {
+            return self.err("expected expression, found type metavariable");
+        }
         match self.kind() {
             T::Minus => {
                 self.pos += 1;
@@ -4876,6 +4917,12 @@ impl<'a> Parser<'a> {
 
     fn primary(&mut self, r: u8) -> PResult<ExprId> {
         let lo = self.lo();
+        // rustc_parse parser/expr.rs: parse_expr_bottom returns a Path expression
+        // for MetaVarKind::Path; calls follow, but `{ .. }` and `::` do not extend it.
+        if self.path_frags.contains(&{ self.tok().lo }) {
+            let path = self.path(true)?;
+            return Ok(self.mk_expr(ExprKind::Path(path), lo));
+        }
         // rustc parse_expr_bottom: only `let` and a parenthesised expression see ALLOW_LET
         let let_ok = r & ALLOW_LET != 0;
         let r = if matches!(self.kind(), T::KwLet | T::OpenParen) { r } else { r & !ALLOW_LET };
