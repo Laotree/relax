@@ -517,7 +517,7 @@ fn obj_ptrs(u: &Unit, idx: u32) -> Option<(u64, u64, std::sync::Arc<Vec<(u32, Op
             // from any compile thread (an O3 worker's simplify): off the owner the walk runs under
             // a front read -- the one the thread holds, or its own. (Without it an O3 worker read a
             // freed chunk in Types::flags during a cold run's adopt: SIGSEGV, JITCOLD3.)
-            let _front = (!crate::owner::is_owner() && !crate::jit::front_read_held()).then(|| crate::jit::front_read("ro data walk"));
+            let _front = (!crate::owner::is_owner() && crate::jit::front_reads_held() == 0).then(|| crate::jit::front_read("ro data walk"));
             let mut words = Vec::new();
             if walk(u, *t, start, 0, &mut words, 0, &mut Vec::new()).is_none() {
                 opaque = true;
