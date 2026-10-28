@@ -5940,7 +5940,9 @@ mod cold_tests {
         std::fs::write(&called, "pub fn value() -> u32 { 8 }").unwrap();
         std::fs::File::options().write(true).open(&called).unwrap().set_modified(mtime).unwrap();
         let edited = load(Some(&images), false);
-        assert!(edited.files.iter().all(|f| !f.src.is_mapped()), "an edit with the same size and mtime is detected");
+        // (the edited file is parsed; the unchanged root may take its earlier image: previous_files)
+        let parsed = |p: &crate::program::Program| p.files.iter().zip(&p.file_paths).find(|(_, path)| path.ends_with("called.rs")).is_some_and(|(f, _)| !f.src.is_mapped());
+        assert!(parsed(&edited), "an edit with the same size and mtime is detected");
         assert!(images.content_hashes.load(std::sync::atomic::Ordering::Relaxed) > 0);
         // a graph recorded within the racy window of the edit carries no stat for that file
         let mut edited = edited;
@@ -5951,7 +5953,7 @@ mod cold_tests {
         std::fs::write(&called, "pub fn value() -> u32 { 9 }").unwrap();
         std::fs::File::options().write(true).open(&called).unwrap().set_modified(mtime).unwrap();
         let again = load(Some(&images), false);
-        assert!(again.files.iter().all(|f| !f.src.is_mapped()), "the racy case: same size, restored mtime");
+        assert!(parsed(&again), "the racy case: same size, restored mtime");
     }
 
 
