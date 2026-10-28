@@ -301,14 +301,11 @@ where
 
 impl<'scope, 'env> Scope<'scope, 'env> {
     /// Starts `f` on an idle worker (or a new one) and returns at once.
-    #[track_caller]
     pub fn spawn<F, T>(&'scope self, f: F) -> ScopedJoinHandle<'scope, T>
     where
         F: FnOnce() -> T + Send + 'scope,
         T: Send + 'scope,
     {
-        let jc6_at = std::panic::Location::caller();
-        let f = move || { let t0 = jc6_cpu(); let r = f(); jc6_add(jc6_at, jc6_cpu() - t0); r };
         let packet = zone_alloc::kept_with(|| Arc::new(Packet { result: Mutex::new(None), ready: Condvar::new(), scope: self.data.clone() }));
         self.data.pending.fetch_add(1, Ordering::Relaxed);
         let (p, data) = (packet.clone(), self.data.clone());
@@ -554,25 +551,4 @@ mod tests {
         assert_eq!(survived.load(Ordering::Relaxed), 0);
         retire_idle();
     }
-}
-
-// JC6 TEMP: pool task CPU by spawn site
-static JC6: std::sync::Mutex<Vec<(&'static std::panic::Location<'static>, u64, u64)>> = std::sync::Mutex::new(Vec::new());
-fn jc6_cpu() -> u64 {
-    #[repr(C)] struct Ts { s: i64, n: i64 }
-    extern "C" { fn clock_gettime(c: i32, t: *mut Ts) -> i32; }
-    let mut t = Ts { s: 0, n: 0 };
-    unsafe { clock_gettime(3, &mut t); }
-    t.s as u64 * 1_000_000_000 + t.n as u64
-}
-fn jc6_add(at: &'static std::panic::Location<'static>, ns: u64) {
-    let _k = zone_alloc::kept();
-    let mut v = JC6.lock().unwrap_or_else(|e| e.into_inner());
-    match v.iter_mut().find(|e| std::ptr::eq(e.0, at)) { Some(e) => { e.1 += ns; e.2 += 1; } None => v.push((at, ns, 1)) }
-}
-/// JC6 TEMP
-pub fn jc6_report() -> String {
-    let mut v = JC6.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    v.sort_by_key(|e| std::cmp::Reverse(e.1));
-    v.iter().take(25).map(|(at, ns, n)| format!("JC6POOL {:8.1} ms {:6} {}:{}\n", *ns as f64 / 1e6, n, at.file(), at.line())).collect()
 }
