@@ -1713,7 +1713,6 @@ impl Linker {
             }
         }
         im.t_check = crate::jit::wall_ns() - t_check;
-        { let p = |i: usize| super::JC5K[i].load(std::sync::atomic::Ordering::Relaxed); eprintln!("JC5K after check: keys {} cpu {:.1} ms, enc {:.1}, recorded {}, graph {:.1}, bodies {:.1} (names {:.1})", p(1), p(0) as f64 / 1e6, p(2) as f64 / 1e6, p(3), p(4) as f64 / 1e6, p(5) as f64 / 1e6, p(6) as f64 / 1e6); }
         im.changed += live.iter().filter(|&&l| !l).count() as u64;
         // every slot the image names ran in the session that made it, and so did the callees its
         // code inlined: not never-run code for O3's walk before their first (lazy) install here
