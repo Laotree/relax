@@ -831,6 +831,21 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         pre_index[ci] = pre.len();
         pre.push(crate::preload::PreCrate { name: c.name.clone(), root: c.src_path.clone(), edition: c.edition, cfg: cfgs[ci].clone(), deps,  proc_macro: c.proc_macro, image_deps, image_dep_names });
     }
+    let front_images = crate::cache::FrontImages::open(options);
+    // the load order the stored image was recorded in, with the changed crates and their
+    // dependents last (FrontImages::load_order): the restore keeps every crate before them
+    let order = match front_images.as_ref().filter(|_| !check).and_then(|images| images.load_order(&pre, std_count)) {
+        Some(perm) => match crate::preload::reorder(&pre, &perm) {
+            Some(reordered) => {
+                let order: Vec<usize> = perm[std_count..].iter().map(|&k| order[k - std_count]).collect();
+                for (k, &ci) in order.iter().enumerate() { pre_index[ci] = std_count + k; }
+                pre = reordered;
+                order
+            }
+            None => order,
+        },
+        None => order,
+    };
     let tp = Instant::now();
     let root_dir = crate::unitgraph::manifest_dir_of(&g.crates[g.root].src_path);
     // the one app-crate rule (borrowck::event): check, serve and run share it
@@ -844,7 +859,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // `makepad check` borrow-checks every crate it loads: all keep their user-written types
     if check { crate::borrowck::event::set_check_scope(); }
     jit::settle_rebuild::remember_boot(&pre);
-    let front_images = crate::cache::FrontImages::open(options);
     prog.record_front = front_images.is_some();
     prog.front_sink = front_images.as_ref().and_then(|images| images.sink());
     if front_images.is_none() && (crate::preload::trace() || crate::memstat::enabled()) {

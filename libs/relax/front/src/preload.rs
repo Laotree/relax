@@ -34,6 +34,19 @@ pub struct PreCrate {
     pub image_dep_names: Vec<(String, String)>,
 }
 
+/// `crates` in the load order `order` (positions in `crates`, each once), the dependency indices
+/// renumbered; None when that order puts a crate before one of its dependencies.
+pub fn reorder(crates: &[PreCrate], order: &[usize]) -> Option<Vec<PreCrate>> {
+    let mut at = vec![usize::MAX; crates.len()];
+    for (j, &i) in order.iter().enumerate() { *at.get_mut(i)? = j; }
+    if order.len() != crates.len() || at.contains(&usize::MAX) { return None; }
+    order.iter().enumerate().map(|(j, &i)| {
+        let mut c = crates[i].clone();
+        c.image_deps = c.image_deps.iter().map(|&d| at.get(d).copied().filter(|&k| k < j)).collect::<Option<_>>()?;
+        Some(c)
+    }).collect()
+}
+
 /// What load_crate takes for one crate.
 pub struct CrateAhead {
     pub name: String,

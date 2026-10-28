@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 mod collected;
-pub use collected::{CollectedCache, CollectedRecord, CollectedWritten};
+pub use collected::{CollectedCache, CollectedDest, CollectedRecord, CollectedWritten};
 mod image;
 use image::{ManifestImage, IMAGE_MAGIC};
 pub(crate) use image::{complete_identities_unit, ids_report_unit, image_broken_unit, image_slot_by_key_unit, name_unnamed_unit, prelink_unit, PrelinkedSlot};
@@ -152,6 +152,9 @@ const KIND_EXP_NAMES: u32 = 17;
 /// the program's item graph (cache/deps.rs Deps::encode), one per program (its root crate's code
 /// store, under a key of the program's view: replaced when the program changes)
 const KIND_DEPS: u32 = 18;
+/// a program's last load order (cache.rs load_order): its crates (name, root), in order, keyed by
+/// the graph's crate set (GraphRecipe::set)
+const KIND_FRONT_ORDER: u32 = 19;
 const KIND_CONST: u32 = 9;
 const KIND_WARM_OUTCOME: u32 = 10;
 /// stores a front image was mapped from: kept for the rest of the process (the arrays point
@@ -4472,6 +4475,43 @@ fn front_graph_key(identity: u128) -> u128 {
     h.u128(identity);
     h.finish128()
 }
+fn front_order_key(set: u128) -> u128 {
+    let mut h = Sip128::new();
+    h.str("front-order");
+    h.u128(crate::codegen_id::id());
+    h.str(std::env::consts::ARCH); h.str(std::env::consts::OS);
+    h.u128(set);
+    h.finish128()
+}
+fn front_order_path(dir: &std::path::Path, set: u128) -> PathBuf {
+    dir.join(format!("front_order-{:016x}.rcs", front_order_key(set) as u64))
+}
+/// The load order the last collected image of a program with these crates was recorded in.
+fn read_front_order(dir: &std::path::Path, set: u128) -> Option<Vec<(String, String)>> {
+    let store = Store::open(&front_order_path(dir, set))?;
+    let (kind, bytes) = store.get(front_order_key(set))?;
+    if kind != KIND_FRONT_ORDER { return None; }
+    crate::crate_image::decode(bytes)
+}
+/// Records `recipe`'s order as its crate set's last one (after its collected image is written:
+/// the next start loads in this order and restores that image). Unchanged: nothing written.
+pub(crate) fn write_front_order(dir: &std::path::Path, recipe: &crate::crate_image::GraphRecipe) {
+    if read_front_order(dir, recipe.set).as_ref() == Some(&recipe.crates) { return; }
+    let entry = NewEntry { key: front_order_key(recipe.set), kind: KIND_FRONT_ORDER, payload: crate::crate_image::encode(&recipe.crates) };
+    let _ = crate::store::append(&front_order_path(dir, recipe.set), vec![entry], true);
+}
+
+/// The stored graph a reordered load restores its leading crates from (FrontImages::load_order):
+/// the last recorded order of the same crates, of which this load keeps the first `common`.
+pub(crate) struct BaseOrder {
+    pub(crate) set: u128,
+    pub(crate) identity: u128,
+    pub(crate) pre: Vec<crate::preload::PreCrate>,
+    pub(crate) common: usize,
+}
+/// Each crate's recorded front record as FrontImages::prefix_records reads it.
+pub(crate) type PrefixRecords = Vec<Result<(u128, Vec<String>), &'static str>>;
+
 fn demand_stores_key(identity: u128) -> u128 {
     let mut h = Sip128::new();
     h.str("demand-stores");
@@ -4714,6 +4754,10 @@ pub struct FrontImages {
     /// the crates a partial collected restore kept (name, fingerprint): the crates loaded after
     /// them name them as dependencies (restore_collected, full_deps)
     retained: relax_session::sync::Mutex<Vec<(String, u128)>>,
+    /// a reordered load's stored graph (load_order): the restore keeps its leading crates
+    base: relax_session::sync::Mutex<Option<BaseOrder>>,
+    /// the records load_order read of graph `.0` (the restore reads them once)
+    records: relax_session::sync::Mutex<Option<(u128, PrefixRecords)>>,
     // A failed collected restore must hand its completed plan to ordinary preload.
     pending_plan: relax_session::sync::Mutex<Option<(u128, std::sync::Arc<crate::preload::DemandPlan>)>>,
     /// writes the images of the files this run parses (None: a read-only cache)
@@ -5067,6 +5111,8 @@ impl crate::crate_image::CrateImages for FrontImages {
         }
     }
     fn end_load(&self) {
+        *self.base.lock().unwrap() = None;
+        *self.records.lock().unwrap() = None;
         self.hashes.lock().unwrap().take();
         *self.probes.lock().unwrap() = None;
         self.stores.lock().unwrap().clear();
