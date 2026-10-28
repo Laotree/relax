@@ -21530,10 +21530,12 @@ fn prefront_slot(front: &FrontShared, id: u32) -> bool {
     let why = {
         let _preemptible = crate::preempt::Preemptible::on();
         typeck_ahead(front, d, args, 0, false, false);
+        PREFRONTS[2].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
         lower_ahead(front, id, true)
     };
     PREFRONTS[0].fetch_add(1, Ordering::Relaxed);
     PREFRONTS[1].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
+    prefronted(id);
     let ok = front.lowered.lock().unwrap_or_else(|e| e.into_inner()).get(&id).is_some_and(|x| x.is_some());
     if !ok {
         let why = if why == AF_OK { AF_OTHER } else { why };
@@ -21650,8 +21652,14 @@ fn prefront_closure(front: &FrontShared, id: u32) -> bool {
     ok
 }
 
-/// Background fronts run off the owner by `take_prefronted` (count, cpu ns)
-pub static PREFRONTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Background fronts run off the owner by `take_prefronted` (count, cpu ns, of it type checks ns, distinct slots)
+pub static PREFRONTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// (instrument) the slots fronted (PREFRONTS[3] counts them)
+static PREFRONTED: std::sync::Mutex<Option<std::collections::HashSet<u32>>> = std::sync::Mutex::new(None);
+fn prefronted(id: u32) {
+    let mut s = PREFRONTED.lock().unwrap_or_else(|e| e.into_inner());
+    if crate::zone_alloc::kept_with(|| s.get_or_insert_with(Default::default).insert(id)) { PREFRONTS[3].fetch_add(1, Ordering::Relaxed); }
+}
 
 /// The take of a background build (rules I-PUB, I-PURE): `take` runs as a publish that may run no
 /// front; a slot it needed a front for is fronted here (`prefront_slot`) and `take` runs again.
