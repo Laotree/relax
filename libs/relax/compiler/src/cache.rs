@@ -784,7 +784,9 @@ impl Cache {
         let dir = root.join("cache");
         pack::ensure_private_dir(&dir)?;
         let prog = &u.prog;
-        let collected = collected.filter(|c| c.fps.len() <= prog.crates.len()
+        // a partial restore's (an edited start): the kept crates' definition tables
+        let kept = collected.filter(|c| c.kept.is_some_and(|(k, _)| k <= prog.crates.len() && k <= c.fps.len()));
+        let collected = collected.filter(|c| c.kept.is_none() && c.fps.len() <= prog.crates.len()
             && c.defs == prog.defs.len() && c.files == prog.files.len());
         let fps = collected.map_or_else(|| crate::stable::crate_fingerprints(prog), |c| c.fps.clone());
         // A swap preserves the original cache prefix; runtime crates stay outside boot stores.
@@ -935,6 +937,8 @@ impl Cache {
                 c.iface_plain = cc.ifaces.clone();
             }
             None => {
+                // (every file, on several threads: an edited start's keys read the kept crates'
+                // bodies too -- digested one by one on the owner they cost more)
                 c.digests = items::file_digests(prog);
                 c.iface_plain = items::crate_ifaces(prog, &c.fps, &c.digests);
                 c.iface_plain.truncate(ncr);
@@ -1112,7 +1116,11 @@ impl Cache {
         let t_packs = t0.elapsed();
         // Load-time front writes make a cold cache nonempty, but need no code definition maps.
         if c.has_code_entries() && !collected.is_some_and(|graph| c.restore_collected_definitions(&u.prog, graph.definitions)) {
-            c.build_def_maps(u);
+            match kept.and_then(|cc| cc.kept.map(|(k, d)| (cc, k, d))) {
+                // the kept crates' tables mapped, the others' maps built
+                Some((cc, k, d)) if c.restore_kept_definitions(&u.prog, cc.definitions, cc.defs, cc.fps.len(), k, d) => c.build_def_maps_from(u, k),
+                _ => c.build_def_maps(u),
+            }
         }
         c.stats.open_ns = t0.elapsed().as_nanos() as u64;
         if crate::preload::trace() {
@@ -1312,6 +1320,11 @@ impl Cache {
     /// open, before main: nothing changes the program meanwhile). A warm start decodes
     /// definitions of most crates; building their maps lazily on the main thread cost ~30 ms.
     fn build_def_maps(&mut self, u: &Unit) {
+        self.build_def_maps_from(u, 0);
+    }
+
+    /// build_def_maps of the crates from `first` on (the ones before have mapped tables).
+    fn build_def_maps_from(&mut self, u: &Unit, first: usize) {
         let mut by = vec![Vec::new(); u.prog.crates.len()];
         for i in 0..u.prog.defs.len() {
             let d = DefId(i as u32);
@@ -1320,7 +1333,7 @@ impl Cache {
             }
         }
         self.crate_defs_n = u.prog.defs.len();
-        let mut order: Vec<usize> = (0..by.len()).filter(|c| !by[*c].is_empty()).collect();
+        let mut order: Vec<usize> = (first..by.len()).filter(|c| !by[*c].is_empty()).collect();
         order.sort_by_key(|c| std::cmp::Reverse(by[*c].len()));
         let n = std::thread::available_parallelism().map_or(4, |x| x.get()).clamp(1, 8);
         let next = std::sync::atomic::AtomicUsize::new(0);
@@ -1365,7 +1378,9 @@ impl Cache {
             self.def_maps.insert(c, m);
             self.def_keys.extend(memo);
         }
-        self.crate_defs = vec![Vec::new(); u.prog.crates.len()];
+        // the crates before `first` keep their lists: dec_def builds such a map on its first miss
+        for v in by.iter_mut().skip(first) { *v = Vec::new(); }
+        self.crate_defs = by;
     }
 
     /// A file version in an entry: its path and source hash (see file_ids).
@@ -1470,7 +1485,13 @@ impl Cache {
             self.mapped_definitions = None;
         }
         if let Some(mapped) = &self.mapped_definitions {
-            return mapped.definition(c, k);
+            // (a partial restore's tables hold for its kept crates' definitions before its suffix;
+            // the rest -- the other crates, a kept crate's on-demand tail -- go by the maps)
+            match mapped.definition(c, k) {
+                Some(d) => return Some(d),
+                None if !mapped.partial() => return None,
+                None => {}
+            }
         }
         if !self.def_maps.contains_key(&c) {
             let t0 = relax_backend::cpu_ns();
