@@ -741,6 +741,9 @@ impl<'a> Drop for SetLenOnDrop<'a> {
 
 unsafe impl<#[may_dangle] T> Drop for Vec<T> {
     fn drop(&mut self) {
+        // library/alloc/src/vec/mod.rs: Vec::drop leaves deallocation to RawVec's
+        // field drop, including on unwind. A zero-sized layout has no allocation.
+        let _guard = heap::DeallocGuard(self.ptr.as_ptr() as *mut u8, Vec::<T>::current_layout(self.cap.get()));
         unsafe {
             if crate::mem::needs_drop::<T>() {
                 // one drop_in_place of the slice: an element whose drop panics does not stop
@@ -748,9 +751,6 @@ unsafe impl<#[may_dangle] T> Drop for Vec<T> {
                 let s = im::slice_from_raw_mut(self.ptr.as_ptr(), self.len) as *mut [T];
                 im::drop_in_place(s);
             }
-        }
-        if !is_zst::<T>() && self.cap.get() != 0 {
-            heap::free(self.ptr.as_ptr() as *mut u8, Vec::<T>::current_layout(self.cap.get()));
         }
     }
 }

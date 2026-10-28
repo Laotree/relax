@@ -2,8 +2,30 @@
 // Keep Drop on the payload: Drop on each node would stop drop_may_unwind at the root.
 // rustc_mir_transform/src/shim.rs: build_drop_shim; elaborate_drop.rs: open_drop_for_adt
 // drops owned fields on both the normal and unwind paths.
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct WatchAlloc;
+static WATCHED: AtomicUsize = AtomicUsize::new(0);
+static FREED: AtomicUsize = AtomicUsize::new(0);
+
+#[global_allocator]
+static ALLOC: WatchAlloc = WatchAlloc;
+
+unsafe impl GlobalAlloc for WatchAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // Clear before freeing: another test may immediately reuse the address.
+        if WATCHED.compare_exchange(ptr as usize, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            FREED.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
 
 macro_rules! node {
     ($name:ident, $next:ident, $other:ident) => {
@@ -67,6 +89,99 @@ impl Drop for Count<'_> {
         self.0.set(self.0.get() + 1);
         if self.1 { panic!("recursive drop"); }
     }
+}
+
+#[test]
+fn struct_field_panic_drops_the_rest() {
+    struct Pair<'a> { _first: Count<'a>, _second: Count<'a> }
+    let drops = Cell::new(0);
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        drop(Pair { _first: Count(&drops, true), _second: Count(&drops, false) });
+    }));
+    assert!(result.is_err());
+    assert_eq!(drops.get(), 2);
+}
+
+#[test]
+fn enum_field_panic_drops_the_rest() {
+    enum Pair<'a> { Empty, Fields { _first: Count<'a>, _second: Count<'a> } }
+    let drops = Cell::new(0);
+    drop(Pair::Empty);
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        drop(Pair::Fields { _first: Count(&drops, true), _second: Count(&drops, false) });
+    }));
+    assert!(result.is_err());
+    assert_eq!(drops.get(), 2);
+}
+
+#[test]
+fn enum_destructor_panic_drops_the_active_variant() {
+    enum Value<'a> { Empty, Fields { _first: Count<'a>, _second: Count<'a> } }
+    impl Drop for Value<'_> {
+        fn drop(&mut self) { panic!("enum drop"); }
+    }
+    let drops = Cell::new(0);
+    let empty = catch_unwind(AssertUnwindSafe(|| drop(Value::Empty)));
+    assert!(empty.is_err());
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        drop(Value::Fields { _first: Count(&drops, false), _second: Count(&drops, false) });
+    }));
+    assert!(result.is_err());
+    assert_eq!(drops.get(), 2);
+}
+
+#[test]
+fn slice_element_panic_drops_the_rest_and_the_caller_guard() {
+    let drops = Cell::new(0);
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let _guard = Count(&drops, false);
+        let mut values = std::mem::ManuallyDrop::new([
+            Count(&drops, true), Count(&drops, false), Count(&drops, false),
+        ]);
+        let slice: &mut [Count<'_>] = &mut *values;
+        unsafe { std::ptr::drop_in_place(slice); }
+    }));
+    assert!(result.is_err());
+    assert_eq!(drops.get(), 4);
+}
+
+#[test]
+fn vec_element_panic_drops_the_rest() {
+    for panic_at in 0..3 {
+        let drops = Cell::new(0);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            drop(vec![Count(&drops, panic_at == 0), Count(&drops, panic_at == 1), Count(&drops, panic_at == 2)]);
+        }));
+        assert!(result.is_err());
+        assert_eq!(drops.get(), 3);
+    }
+}
+
+#[test]
+fn panicking_heap_drops_free_the_allocation() {
+    // rustc_mir_transform/src/elaborate_drop.rs: open_drop_for_adt frees Box on unwind;
+    // library/alloc/src/vec/mod.rs: Vec::drop drops the slice, then RawVec frees the buffer.
+    let drops = Cell::new(0);
+    let boxed = Box::new(Count(&drops, true));
+    WATCHED.store(&*boxed as *const Count<'_> as usize, Ordering::SeqCst);
+    let result = catch_unwind(AssertUnwindSafe(|| drop(boxed)));
+    assert!(result.is_err());
+    assert_eq!(drops.get(), 1);
+    assert_eq!(FREED.load(Ordering::SeqCst), 1);
+
+    let values = vec![Count(&drops, true), Count(&drops, false), Count(&drops, false)];
+    WATCHED.store(values.as_ptr() as usize, Ordering::SeqCst);
+    let result = catch_unwind(AssertUnwindSafe(|| drop(values)));
+    assert!(result.is_err());
+    assert_eq!(drops.get(), 4);
+    assert_eq!(FREED.load(Ordering::SeqCst), 2);
+
+    let slice = vec![Count(&drops, true), Count(&drops, false), Count(&drops, false)].into_boxed_slice();
+    WATCHED.store(slice.as_ptr() as usize, Ordering::SeqCst);
+    let result = catch_unwind(AssertUnwindSafe(|| drop(slice)));
+    assert!(result.is_err());
+    assert_eq!(drops.get(), 7);
+    assert_eq!(FREED.load(Ordering::SeqCst), 3);
 }
 
 #[test]
