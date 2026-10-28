@@ -254,6 +254,9 @@ thread_local! {
     /// this thread builds the world, or parses its crates (the builder's parse pool): a hosted
     /// macro met there is left alone (it would wait for the world being built)
     static IN_WORLD: Cell<bool> = const { Cell::new(false) };
+    /// this thread works for the macro world's build (the builder, or a parse worker on one of
+    /// the world's crates): a macro the boot world lacks must not wait for that build (pmhost)
+    static WORLD_BUILDER: Cell<bool> = const { Cell::new(false) };
     /// the invoking crate name during a proc-macro expansion (`run_derive_in`, `run_attr`, `run_bang_in`)
     static CALL_KRATE: RefCell<String> = const { RefCell::new(String::new()) };
 }
@@ -343,6 +346,14 @@ pub fn in_world() -> bool {
 
 pub fn set_in_world(v: bool) {
     IN_WORLD.with(|w| w.set(v));
+}
+
+pub fn world_builder() -> bool {
+    WORLD_BUILDER.with(|w| w.get())
+}
+
+pub fn set_world_builder(v: bool) {
+    WORLD_BUILDER.with(|w| w.set(v));
 }
 
 /// Index of function-like proc macro `name` of the registered graph (builtins' HOSTED ids).
