@@ -21833,8 +21833,21 @@ pub struct FrontRead {
     _g: std::sync::RwLockReadGuard<'static, ()>,
     traced: Option<(&'static str, std::time::Instant)>,
 }
+thread_local! {
+    /// The front reads this thread holds (FrontRead): a reader that may already hold one asks
+    /// `front_read_held` instead of taking another (a second read can wait behind a writer that
+    /// waits for the first).
+    static FRONT_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// This thread holds a front read (`front_read`).
+pub(crate) fn front_read_held() -> bool {
+    FRONT_READS.with(|c| c.get() != 0)
+}
+
 impl Drop for FrontRead {
     fn drop(&mut self) {
+        FRONT_READS.with(|c| c.set(c.get() - 1));
         if let Some((site, t)) = self.traced {
             let ms = t.elapsed().as_secs_f64() * 1e3;
             if ms > 50.0 {
@@ -21877,6 +21890,7 @@ unsafe fn owner_front<'u>(up: *const Unit) -> (&'u Program, &'u Tcx) {
 
 pub fn front_read(site: &'static str) -> FrontRead {
     let g = FRONT_RW.read().unwrap_or_else(|e| e.into_inner());
+    FRONT_READS.with(|c| c.set(c.get() + 1));
     FrontRead { _g: g, traced: front_trace().then(|| (site, std::time::Instant::now())) }
 }
 /// What type checks ahead need of a unit, reachable without its lock: the program and type
