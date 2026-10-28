@@ -1009,6 +1009,11 @@ pub use import_SysFreeString::call as SysFreeString_raw;
 #[inline]
 pub unsafe fn SysFreeString(bstrString: Option<*mut u16>) -> () {
 import_SysFreeString::call(bstrString.unwrap_or(unsafe { ::core::mem::zeroed() }))}
+mod import_SysStringLen { #[link(name = "OLEAUT32", kind = "raw-dylib")] extern "system" { #[link_name = "SysStringLen"] pub fn call(pbstr: *mut u16) -> u32; } }
+pub use import_SysStringLen::call as SysStringLen_raw;
+#[inline]
+pub unsafe fn SysStringLen(pbstr: Option<*mut u16>) -> u32 {
+import_SysStringLen::call(pbstr.unwrap_or(unsafe { ::core::mem::zeroed() }))}
 pub const TRUE: crate::core::BOOL = crate::core::BOOL(1i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -24719,13 +24724,17 @@ impl ::core::ops::Not for TreeScope { type Output = Self; fn not(self) -> Self {
 pub const UIA_AcceleratorKeyPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30006i64 as _);
 pub const UIA_AccessKeyPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30007i64 as _);
 pub const UIA_ActiveTextPositionChangedEventId: crate::Win32::UI::Accessibility::UIA_EVENT_ID = crate::Win32::UI::Accessibility::UIA_EVENT_ID(20036i64 as _);
+pub const UIA_AfterParagraphSpacingAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40042i64 as _);
+pub const UIA_AnimationStyleAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40000i64 as _);
 pub const UIA_AnnotationAnnotationTypeIdPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30113i64 as _);
 pub const UIA_AnnotationAnnotationTypeNamePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30114i64 as _);
 pub const UIA_AnnotationAuthorPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30115i64 as _);
 pub const UIA_AnnotationDateTimePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30116i64 as _);
+pub const UIA_AnnotationObjectsAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40032i64 as _);
 pub const UIA_AnnotationObjectsPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30156i64 as _);
 pub const UIA_AnnotationPatternId: crate::Win32::UI::Accessibility::UIA_PATTERN_ID = crate::Win32::UI::Accessibility::UIA_PATTERN_ID(10023i64 as _);
 pub const UIA_AnnotationTargetPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30117i64 as _);
+pub const UIA_AnnotationTypesAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40031i64 as _);
 pub const UIA_AnnotationTypesPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30155i64 as _);
 pub const UIA_AppBarControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50040i64 as _);
 pub const UIA_AriaPropertiesPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30102i64 as _);
@@ -24734,7 +24743,10 @@ pub const UIA_AsyncContentLoadedEventId: crate::Win32::UI::Accessibility::UIA_EV
 pub const UIA_AutomationFocusChangedEventId: crate::Win32::UI::Accessibility::UIA_EVENT_ID = crate::Win32::UI::Accessibility::UIA_EVENT_ID(20005i64 as _);
 pub const UIA_AutomationIdPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30011i64 as _);
 pub const UIA_AutomationPropertyChangedEventId: crate::Win32::UI::Accessibility::UIA_EVENT_ID = crate::Win32::UI::Accessibility::UIA_EVENT_ID(20004i64 as _);
+pub const UIA_BackgroundColorAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40001i64 as _);
+pub const UIA_BeforeParagraphSpacingAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40041i64 as _);
 pub const UIA_BoundingRectanglePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30001i64 as _);
+pub const UIA_BulletStyleAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40002i64 as _);
 pub const UIA_ButtonControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50000i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -24749,6 +24761,9 @@ impl ::core::ops::BitAnd for UIA_CONTROLTYPE_ID { type Output = Self; fn bitand(
 impl ::core::ops::BitXor for UIA_CONTROLTYPE_ID { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for UIA_CONTROLTYPE_ID { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const UIA_CalendarControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50001i64 as _);
+pub const UIA_CapStyleAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40003i64 as _);
+pub const UIA_CaretBidiModeAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40039i64 as _);
+pub const UIA_CaretPositionAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40038i64 as _);
 pub const UIA_CenterPointPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30165i64 as _);
 pub const UIA_ChangesEventId: crate::Win32::UI::Accessibility::UIA_EVENT_ID = crate::Win32::UI::Accessibility::UIA_EVENT_ID(20034i64 as _);
 pub const UIA_CheckBoxControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50002i64 as _);
@@ -24757,6 +24772,7 @@ pub const UIA_ClickablePointPropertyId: crate::Win32::UI::Accessibility::UIA_PRO
 pub const UIA_ComboBoxControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50003i64 as _);
 pub const UIA_ControlTypePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30003i64 as _);
 pub const UIA_ControllerForPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30104i64 as _);
+pub const UIA_CultureAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40004i64 as _);
 pub const UIA_CulturePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30015i64 as _);
 pub const UIA_CustomControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50025i64 as _);
 pub const UIA_CustomNavigationPatternId: crate::Win32::UI::Accessibility::UIA_PATTERN_ID = crate::Win32::UI::Accessibility::UIA_PATTERN_ID(10033i64 as _);
@@ -24806,6 +24822,10 @@ pub const UIA_FillColorPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY
 pub const UIA_FillTypePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30162i64 as _);
 pub const UIA_FlowsFromPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30148i64 as _);
 pub const UIA_FlowsToPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30106i64 as _);
+pub const UIA_FontNameAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40005i64 as _);
+pub const UIA_FontSizeAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40006i64 as _);
+pub const UIA_FontWeightAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40007i64 as _);
+pub const UIA_ForegroundColorAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40008i64 as _);
 pub const UIA_FrameworkIdPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30024i64 as _);
 pub const UIA_FullDescriptionPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30159i64 as _);
 pub const UIA_GridColumnCountPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30063i64 as _);
@@ -24823,14 +24843,19 @@ pub const UIA_HeaderControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLT
 pub const UIA_HeaderItemControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50035i64 as _);
 pub const UIA_HeadingLevelPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30173i64 as _);
 pub const UIA_HelpTextPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30013i64 as _);
+pub const UIA_HorizontalTextAlignmentAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40009i64 as _);
 pub const UIA_HostedFragmentRootsInvalidatedEventId: crate::Win32::UI::Accessibility::UIA_EVENT_ID = crate::Win32::UI::Accessibility::UIA_EVENT_ID(20025i64 as _);
 pub const UIA_HyperlinkControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50005i64 as _);
 pub const UIA_ImageControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50006i64 as _);
+pub const UIA_IndentationFirstLineAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40010i64 as _);
+pub const UIA_IndentationLeadingAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40011i64 as _);
+pub const UIA_IndentationTrailingAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40012i64 as _);
 pub const UIA_InputDiscardedEventId: crate::Win32::UI::Accessibility::UIA_EVENT_ID = crate::Win32::UI::Accessibility::UIA_EVENT_ID(20022i64 as _);
 pub const UIA_InputReachedOtherElementEventId: crate::Win32::UI::Accessibility::UIA_EVENT_ID = crate::Win32::UI::Accessibility::UIA_EVENT_ID(20021i64 as _);
 pub const UIA_InputReachedTargetEventId: crate::Win32::UI::Accessibility::UIA_EVENT_ID = crate::Win32::UI::Accessibility::UIA_EVENT_ID(20020i64 as _);
 pub const UIA_InvokePatternId: crate::Win32::UI::Accessibility::UIA_PATTERN_ID = crate::Win32::UI::Accessibility::UIA_PATTERN_ID(10000i64 as _);
 pub const UIA_Invoke_InvokedEventId: crate::Win32::UI::Accessibility::UIA_EVENT_ID = crate::Win32::UI::Accessibility::UIA_EVENT_ID(20009i64 as _);
+pub const UIA_IsActiveAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40036i64 as _);
 pub const UIA_IsAnnotationPatternAvailablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30118i64 as _);
 pub const UIA_IsContentElementPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30017i64 as _);
 pub const UIA_IsControlElementPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30016i64 as _);
@@ -24844,7 +24869,9 @@ pub const UIA_IsEnabledPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY
 pub const UIA_IsExpandCollapsePatternAvailablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30028i64 as _);
 pub const UIA_IsGridItemPatternAvailablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30029i64 as _);
 pub const UIA_IsGridPatternAvailablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30030i64 as _);
+pub const UIA_IsHiddenAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40013i64 as _);
 pub const UIA_IsInvokePatternAvailablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30031i64 as _);
+pub const UIA_IsItalicAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40014i64 as _);
 pub const UIA_IsItemContainerPatternAvailablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30108i64 as _);
 pub const UIA_IsKeyboardFocusablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30009i64 as _);
 pub const UIA_IsLegacyIAccessiblePatternAvailablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30090i64 as _);
@@ -24854,6 +24881,7 @@ pub const UIA_IsOffscreenPropertyId: crate::Win32::UI::Accessibility::UIA_PROPER
 pub const UIA_IsPasswordPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30019i64 as _);
 pub const UIA_IsPeripheralPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30150i64 as _);
 pub const UIA_IsRangeValuePatternAvailablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30033i64 as _);
+pub const UIA_IsReadOnlyAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40015i64 as _);
 pub const UIA_IsRequiredForFormPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30025i64 as _);
 pub const UIA_IsScrollItemPatternAvailablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30035i64 as _);
 pub const UIA_IsScrollPatternAvailablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30034i64 as _);
@@ -24863,6 +24891,8 @@ pub const UIA_IsSelectionPatternAvailablePropertyId: crate::Win32::UI::Accessibi
 pub const UIA_IsSpreadsheetItemPatternAvailablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30132i64 as _);
 pub const UIA_IsSpreadsheetPatternAvailablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30128i64 as _);
 pub const UIA_IsStylesPatternAvailablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30127i64 as _);
+pub const UIA_IsSubscriptAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40016i64 as _);
+pub const UIA_IsSuperscriptAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40017i64 as _);
 pub const UIA_IsSynchronizedInputPatternAvailablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30110i64 as _);
 pub const UIA_IsTableItemPatternAvailablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30039i64 as _);
 pub const UIA_IsTablePatternAvailablePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30038i64 as _);
@@ -24894,12 +24924,18 @@ pub const UIA_LegacyIAccessibleSelectionPropertyId: crate::Win32::UI::Accessibil
 pub const UIA_LegacyIAccessibleStatePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30096i64 as _);
 pub const UIA_LegacyIAccessibleValuePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30093i64 as _);
 pub const UIA_LevelPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30154i64 as _);
+pub const UIA_LineSpacingAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40040i64 as _);
+pub const UIA_LinkAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40035i64 as _);
 pub const UIA_ListControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50008i64 as _);
 pub const UIA_ListItemControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50007i64 as _);
 pub const UIA_LiveRegionChangedEventId: crate::Win32::UI::Accessibility::UIA_EVENT_ID = crate::Win32::UI::Accessibility::UIA_EVENT_ID(20024i64 as _);
 pub const UIA_LiveSettingPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30135i64 as _);
 pub const UIA_LocalizedControlTypePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30004i64 as _);
 pub const UIA_LocalizedLandmarkTypePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30158i64 as _);
+pub const UIA_MarginBottomAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40018i64 as _);
+pub const UIA_MarginLeadingAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40019i64 as _);
+pub const UIA_MarginTopAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40020i64 as _);
+pub const UIA_MarginTrailingAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40021i64 as _);
 pub const UIA_MenuBarControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50010i64 as _);
 pub const UIA_MenuClosedEventId: crate::Win32::UI::Accessibility::UIA_EVENT_ID = crate::Win32::UI::Accessibility::UIA_EVENT_ID(20007i64 as _);
 pub const UIA_MenuControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50009i64 as _);
@@ -24917,7 +24953,10 @@ pub const UIA_ObjectModelPatternId: crate::Win32::UI::Accessibility::UIA_PATTERN
 pub const UIA_OptimizeForVisualContentPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30111i64 as _);
 pub const UIA_OrientationPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30023i64 as _);
 pub const UIA_OutlineColorPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30161i64 as _);
+pub const UIA_OutlineStylesAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40022i64 as _);
 pub const UIA_OutlineThicknessPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30164i64 as _);
+pub const UIA_OverlineColorAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40023i64 as _);
+pub const UIA_OverlineStyleAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40024i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct UIA_PATTERN_ID(pub i32);
@@ -24957,6 +24996,7 @@ pub const UIA_RangeValueSmallChangePropertyId: crate::Win32::UI::Accessibility::
 pub const UIA_RangeValueValuePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30047i64 as _);
 pub const UIA_RotationPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30166i64 as _);
 pub const UIA_RuntimeIdPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30000i64 as _);
+pub const UIA_SayAsInterpretAsAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40043i64 as _);
 pub const UIA_ScrollBarControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50014i64 as _);
 pub const UIA_ScrollHorizontalScrollPercentPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30053i64 as _);
 pub const UIA_ScrollHorizontalViewSizePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30054i64 as _);
@@ -24970,6 +25010,7 @@ pub const UIA_Selection2CurrentSelectedItemPropertyId: crate::Win32::UI::Accessi
 pub const UIA_Selection2FirstSelectedItemPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30169i64 as _);
 pub const UIA_Selection2ItemCountPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30172i64 as _);
 pub const UIA_Selection2LastSelectedItemPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30170i64 as _);
+pub const UIA_SelectionActiveEndAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40037i64 as _);
 pub const UIA_SelectionCanSelectMultiplePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30060i64 as _);
 pub const UIA_SelectionIsSelectionRequiredPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30061i64 as _);
 pub const UIA_SelectionItemIsSelectedPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30079i64 as _);
@@ -24994,7 +25035,11 @@ pub const UIA_SpreadsheetItemFormulaPropertyId: crate::Win32::UI::Accessibility:
 pub const UIA_SpreadsheetItemPatternId: crate::Win32::UI::Accessibility::UIA_PATTERN_ID = crate::Win32::UI::Accessibility::UIA_PATTERN_ID(10027i64 as _);
 pub const UIA_SpreadsheetPatternId: crate::Win32::UI::Accessibility::UIA_PATTERN_ID = crate::Win32::UI::Accessibility::UIA_PATTERN_ID(10026i64 as _);
 pub const UIA_StatusBarControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50017i64 as _);
+pub const UIA_StrikethroughColorAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40025i64 as _);
+pub const UIA_StrikethroughStyleAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40026i64 as _);
 pub const UIA_StructureChangedEventId: crate::Win32::UI::Accessibility::UIA_EVENT_ID = crate::Win32::UI::Accessibility::UIA_EVENT_ID(20002i64 as _);
+pub const UIA_StyleIdAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40034i64 as _);
+pub const UIA_StyleNameAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40033i64 as _);
 pub const UIA_StylesExtendedPropertiesPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30126i64 as _);
 pub const UIA_StylesFillColorPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30122i64 as _);
 pub const UIA_StylesFillPatternColorPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30125i64 as _);
@@ -25027,11 +25072,14 @@ pub const UIA_TableItemRowHeaderItemsPropertyId: crate::Win32::UI::Accessibility
 pub const UIA_TablePatternId: crate::Win32::UI::Accessibility::UIA_PATTERN_ID = crate::Win32::UI::Accessibility::UIA_PATTERN_ID(10012i64 as _);
 pub const UIA_TableRowHeadersPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30081i64 as _);
 pub const UIA_TableRowOrColumnMajorPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30083i64 as _);
+pub const UIA_TabsAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40027i64 as _);
 pub const UIA_TextChildPatternId: crate::Win32::UI::Accessibility::UIA_PATTERN_ID = crate::Win32::UI::Accessibility::UIA_PATTERN_ID(10029i64 as _);
 pub const UIA_TextControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50020i64 as _);
 pub const UIA_TextEditPatternId: crate::Win32::UI::Accessibility::UIA_PATTERN_ID = crate::Win32::UI::Accessibility::UIA_PATTERN_ID(10032i64 as _);
 pub const UIA_TextEdit_ConversionTargetChangedEventId: crate::Win32::UI::Accessibility::UIA_EVENT_ID = crate::Win32::UI::Accessibility::UIA_EVENT_ID(20033i64 as _);
 pub const UIA_TextEdit_TextChangedEventId: crate::Win32::UI::Accessibility::UIA_EVENT_ID = crate::Win32::UI::Accessibility::UIA_EVENT_ID(20032i64 as _);
+pub const UIA_TextFlowDirectionsAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40028i64 as _);
+pub const UIA_TextPattern2Id: crate::Win32::UI::Accessibility::UIA_PATTERN_ID = crate::Win32::UI::Accessibility::UIA_PATTERN_ID(10024i64 as _);
 pub const UIA_TextPatternId: crate::Win32::UI::Accessibility::UIA_PATTERN_ID = crate::Win32::UI::Accessibility::UIA_PATTERN_ID(10014i64 as _);
 pub const UIA_Text_TextChangedEventId: crate::Win32::UI::Accessibility::UIA_EVENT_ID = crate::Win32::UI::Accessibility::UIA_EVENT_ID(20015i64 as _);
 pub const UIA_Text_TextSelectionChangedEventId: crate::Win32::UI::Accessibility::UIA_EVENT_ID = crate::Win32::UI::Accessibility::UIA_EVENT_ID(20014i64 as _);
@@ -25053,6 +25101,8 @@ pub const UIA_TransformCanRotatePropertyId: crate::Win32::UI::Accessibility::UIA
 pub const UIA_TransformPatternId: crate::Win32::UI::Accessibility::UIA_PATTERN_ID = crate::Win32::UI::Accessibility::UIA_PATTERN_ID(10016i64 as _);
 pub const UIA_TreeControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50023i64 as _);
 pub const UIA_TreeItemControlTypeId: crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID = crate::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID(50024i64 as _);
+pub const UIA_UnderlineColorAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40029i64 as _);
+pub const UIA_UnderlineStyleAttributeId: crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID = crate::Win32::UI::Accessibility::UIA_TEXTATTRIBUTE_ID(40030i64 as _);
 pub const UIA_ValueIsReadOnlyPropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30046i64 as _);
 pub const UIA_ValuePatternId: crate::Win32::UI::Accessibility::UIA_PATTERN_ID = crate::Win32::UI::Accessibility::UIA_PATTERN_ID(10002i64 as _);
 pub const UIA_ValueValuePropertyId: crate::Win32::UI::Accessibility::UIA_PROPERTY_ID = crate::Win32::UI::Accessibility::UIA_PROPERTY_ID(30045i64 as _);
@@ -25087,6 +25137,14 @@ pub use import_UiaDisconnectProvider::call as UiaDisconnectProvider_raw;
 pub unsafe fn UiaDisconnectProvider(pProvider: &crate::Win32::UI::Accessibility::IRawElementProviderSimple) -> Result<(), crate::core::HRESULT> {
 let hr__ = import_UiaDisconnectProvider::call(pProvider.as_raw()); hr__.ok()?;
 Ok(())
+}
+mod import_UiaGetReservedNotSupportedValue { #[link(name = "UIAutomationCore", kind = "raw-dylib")] extern "system" { #[link_name = "UiaGetReservedNotSupportedValue"] pub fn call(punkNotSupportedValue: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT; } }
+pub use import_UiaGetReservedNotSupportedValue::call as UiaGetReservedNotSupportedValue_raw;
+#[inline]
+pub unsafe fn UiaGetReservedNotSupportedValue() -> Result<crate::Win32::System::Com::IUnknown, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = import_UiaGetReservedNotSupportedValue::call(&mut result__); hr__.ok()?;
+crate::Win32::System::Com::IUnknown::from_raw(result__)
 }
 mod import_UiaHostProviderFromHwnd { #[link(name = "UIAutomationCore", kind = "raw-dylib")] extern "system" { #[link_name = "UiaHostProviderFromHwnd"] pub fn call(hwnd: crate::Win32::Foundation::HWND,ppProvider: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT; } }
 pub use import_UiaHostProviderFromHwnd::call as UiaHostProviderFromHwnd_raw;
