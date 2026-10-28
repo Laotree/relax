@@ -101,8 +101,10 @@ impl FrontImages {
     }
 
     /// The demand plan `graph` recorded, when this load can take it as it is (DemandPlan::carried):
-    /// for these crates in this order, the last crate's files are unchanged and the plan selected
-    /// all of them.
+    /// for these crates in this order, it selected every file of the last crate (it deferred
+    /// nothing: the load takes every crate in full, which is always sound), and its module probes
+    /// hold. Edits of file contents do not plan again; a module file that comes or goes does (a
+    /// selection can become partial again only after such a change or a load without a plan).
     fn carried_demand(&self, graph: &crate::crate_image::GraphImage, pre: &[crate::preload::PreCrate]) -> Option<Arc<crate::preload::DemandImage>> {
         let no = |why: &str| { if crate::preload::trace() { eprintln!("makepad-run collected: demand plan not carried: {why}"); } None };
         if pre.iter().any(|c| c.cfg.session.runtime.lazy_verify) { return no("verify"); }
@@ -110,11 +112,8 @@ impl FrontImages {
         let last = pre.len().checked_sub(1)?;
         if image.graph != crate::preload::demand_recipe_identity(pre) || image.parts.len() != pre.len() { return no("another graph"); }
         if !image.files.iter().filter(|f| f.ci == last).all(|f| image.reached.contains(&(last, f.path.clone()))) { return no("the last crate was selected in part"); }
-        // (its own files: the record of a package's bin also lists the lib's)
-        let hashes: HashMap<&str, u128> = image.inputs.iter().map(|(p, h)| (p.as_str(), *h)).collect();
-        let own: Vec<(&str, u128)> = image.files.iter().filter(|f| f.ci == last)
-            .map(|f| hashes.get(f.path.as_str()).map(|h| (f.path.as_str(), *h))).collect::<Option<_>>()?;
-        if own.is_empty() || !self.inputs_current(&own) { return no("the last crate changed"); }
+        // the module files it chose between are as they were: no module came or went
+        if !image.probes.iter().all(|(p, e)| self.probe_current(p, *e)) { return no("a module probe changed"); }
         Some(image)
     }
 
