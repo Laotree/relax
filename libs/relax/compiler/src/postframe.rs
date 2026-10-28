@@ -523,6 +523,14 @@ static FRAMES_AFTER_PRESENT: AtomicU64 = AtomicU64::new(0);
 /// How long after the first present the startup image's window stays open at most
 const IMAGE_WINDOW_NS: u64 = 1_000_000_000;
 
+/// The UI thread's first frames after the first present are on: the present is less than a second
+/// old, or the UI thread is still in the burst of JIT waits that began with them (jit::ui_burst).
+/// False before any present (a program that presents nothing has no first frames).
+pub fn in_first_frames() -> bool {
+    let fp = present_ns();
+    fp != 0 && (wall_ns() < fp + 1_000_000_000 || crate::jit::ui_burst() && wall_ns() < fp + 10_000_000_000)
+}
+
 /// The startup image's window: until the first present, and then until the frame after it is
 /// presented (at most IMAGE_WINDOW_NS). The slots installed in it are the next start's image
 /// (jit.rs ORDER_PRESENT_LEN): the first frames after the present call hundreds of fns no earlier
