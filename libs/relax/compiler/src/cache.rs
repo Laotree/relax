@@ -2118,10 +2118,19 @@ impl Cache {
     }
 
     fn code_key_bytes(&mut self, u: &Unit, key: &FnKey) -> Option<(u128, Vec<u32>, Vec<u8>)> {
+        let jt = relax_backend::cpu_ns();
+        let r = self.code_key_bytes_jc5(u, key);
+        JC5K[0].fetch_add(relax_backend::cpu_ns() - jt, std::sync::atomic::Ordering::Relaxed);
+        JC5K[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        r
+    }
+    fn code_key_bytes_jc5(&mut self, u: &Unit, key: &FnKey) -> Option<(u128, Vec<u32>, Vec<u8>)> {
         let mut e = E::default();
         let mut crates = Vec::new();
         let outer = self.enc_defs.replace(Vec::new());
+        let jt = relax_backend::cpu_ns();
         let r = self.enc_fnkey(u, key, &mut e, &mut crates, 0);
+        JC5K[2].fetch_add(relax_backend::cpu_ns() - jt, std::sync::atomic::Ordering::Relaxed);
         // the allocator shim's callers call the program's #[global_allocator] (or the default):
         // their code depends on it, which the fn's own identity does not show
         let mut shim = E::default();
@@ -2149,10 +2158,13 @@ impl Cache {
         let unchanged = |c: &u32| self.manifest_key_crates.as_ref().is_none_or(|ok| ok.get(*c as usize) == Some(&true));
         let recorded = if self.manifest_keys.is_empty() || !crate::reload::edited_crates().is_empty() || !crates.iter().all(unchanged) { None }
             else { self.manifest_keys.get(&identity_hash(&e.0)).copied() };
+        if recorded.is_some() { JC5K[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        let jt = relax_backend::cpu_ns();
         let k = match recorded {
             Some(k) => k,
             None => {
                 let g = self.deps_graph(u);
+                JC5K[4].fetch_add(relax_backend::cpu_ns() - jt, std::sync::atomic::Ordering::Relaxed);
                 let mut h = Sip128::new();
                 h.str("code-deps");
                 h.u128(self.cfg);
@@ -2184,10 +2196,14 @@ impl Cache {
                 // the bodies the code is made from: the definition's, a closure's enclosing fns'
                 // -- their text and position, and what the names in them find
                 let kd = key_defs(u, key);
+                let jt = relax_backend::cpu_ns();
                 for &d in &kd {
                     h.u128(self.def_body(u, d));
+                    let jb = relax_backend::cpu_ns();
                     h.u128(self.body_names_of(u, d, &g));
+                    JC5K[6].fetch_add(relax_backend::cpu_ns() - jb, std::sync::atomic::Ordering::Relaxed);
                 }
+                JC5K[5].fetch_add(relax_backend::cpu_ns() - jt, std::sync::atomic::Ordering::Relaxed);
                 // types defined in a fn body (their text is that body's)
                 self.local_bodies(u, &named, &mut h);
                 let k0 = h.finish128();
@@ -2258,17 +2274,17 @@ impl Cache {
         };
         // (a graph whose component ids ran far is not built over: the next one starts them again)
         let stored = stored.filter(|g| g.ids_left());
-        let clean = deps::Deps::clean_crates(prog, &self.iface_plain, &self.fps, stored.as_ref());
+        let clean = deps::Deps::clean_crates(prog, &self.iface_plain, stored.as_ref());
         let mut digested = digest(&clean, &mut self.digests);
         let t_dg = t0.elapsed();
-        let built = deps::Deps::build(prog, &self.digests, &self.iface_plain, &self.fps, valid, stored.as_ref());
+        let built = deps::Deps::build(prog, &self.digests, &self.iface_plain, valid, stored.as_ref());
         let over = built.is_some() && clean.iter().any(|&c| c);
         let g = match built {
             Some(g) => g,
             None => {
                 // the alias or macro names changed: every crate is walked
                 digested += digest(&[], &mut self.digests);
-                deps::Deps::build(prog, &self.digests, &self.iface_plain, &self.fps, valid, None).expect("a graph built from scratch")
+                deps::Deps::build(prog, &self.digests, &self.iface_plain, valid, None).expect("a graph built from scratch")
             }
         };
         if self.verbose {
@@ -2278,7 +2294,7 @@ impl Cache {
         }
         if over && std::env::var("MAKEPAD_RUN_DEPS_VERIFY").is_ok_and(|v| v == "1") {
             digest(&[], &mut self.digests);
-            let scratch = deps::Deps::build(prog, &self.digests, &self.iface_plain, &self.fps, valid, None).expect("a graph built from scratch");
+            let scratch = deps::Deps::build(prog, &self.digests, &self.iface_plain, valid, None).expect("a graph built from scratch");
             match g.same_closures(&scratch) {
                 Ok(()) => eprintln!("makepad-run cache: item graph verified: built over the stored graph = built from scratch"),
                 Err(e) => eprintln!("makepad-run cache: item graph verify FAILED: {e}"),
@@ -8152,3 +8168,5 @@ pub(crate) static THUNK_DECODE_NS: std::sync::atomic::AtomicU64 = std::sync::ato
 /// for `pending_bytes` again: run.rs spill_cache).
 pub static RECORDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+
+pub static JC5K: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
