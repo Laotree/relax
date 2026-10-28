@@ -791,7 +791,13 @@ impl Cache {
         let kept = collected.filter(|c| c.kept.is_some_and(|(k, _)| k <= prog.crates.len() && k <= c.fps.len()));
         let collected = collected.filter(|c| c.kept.is_none() && c.fps.len() <= prog.crates.len()
             && c.defs == prog.defs.len() && c.files == prog.files.len());
-        let fps = collected.map_or_else(|| crate::stable::crate_fingerprints(prog), |c| c.fps.clone());
+        // a partial restore's kept crates: the fingerprints and interfaces of the image (their
+        // inputs are the certified ones); only the crates loaded after them are hashed
+        let kept_n = kept.and_then(|c| c.kept).map_or(0, |(k, _)| k);
+        let fps = match collected {
+            Some(c) => c.fps.clone(),
+            None => crate::stable::crate_fingerprints_from(prog, kept.map_or(&[][..], |c| &c.fps[..kept_n])),
+        };
         // A swap preserves the original cache prefix; runtime crates stay outside boot stores.
         let ncr = fps.len();
         let t_fp = t0.elapsed();
@@ -939,13 +945,23 @@ impl Cache {
                 c.digests = vec![None; prog.files.len()];
                 c.iface_plain = cc.ifaces.clone();
             }
-            None => {
-                // (every file, on several threads: an edited start's keys read the kept crates'
-                // bodies too -- digested one by one on the owner they cost more)
-                c.digests = items::file_digests(prog);
-                c.iface_plain = items::crate_ifaces(prog, &c.fps, &c.digests);
-                c.iface_plain.truncate(ncr);
-            }
+            None => match kept.filter(|k| k.ifaces.len() >= kept_n && std::env::var_os("MAKEPAD_RUN_CACHE_IFACE").is_none()) {
+                // the crates loaded after the kept ones: their files, on several threads (a kept
+                // file is digested when a key needs it, def_body)
+                Some(kc) => {
+                    c.digests = vec![None; prog.files.len()];
+                    let want: Vec<usize> = (0..prog.files.len()).filter(|&f| prog.file_crate.get(f).is_some_and(|&k| k as usize >= kept_n)).collect();
+                    items::file_digests_of(prog, &want, &mut c.digests);
+                    c.iface_plain = items::crate_ifaces_from(prog, &c.fps, &c.digests, &kc.ifaces[..kept_n]);
+                    c.iface_plain.truncate(ncr);
+                }
+                None => {
+                    // (every file, on several threads)
+                    c.digests = items::file_digests(prog);
+                    c.iface_plain = items::crate_ifaces(prog, &c.fps, &c.digests);
+                    c.iface_plain.truncate(ncr);
+                }
+            },
         }
         let provided: Vec<(u32, u64)> = u.provided.iter().map(|(k, pc)| (*k, pc.binding)).collect();
         c.iface = items::apply_bound(prog, &c.iface_plain, &provided);
