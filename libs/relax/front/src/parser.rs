@@ -583,6 +583,11 @@ impl<'a> Parser<'a> {
         let mut i = self.pos + 1;
         while i < self.toks.len() {
             let k = self.toks.kind_at(i);
+            // parse_part has no invisible type-fragment boundaries (rustc_parse
+            // parser/ty.rs: parse_ty_common); consume these with their expansion.
+            if !self.ty_frags.is_empty() && self.ty_frags.contains(&{ self.toks.at(i).lo }) {
+                return BodyOutline::Eager(5);
+            }
             match k {
                 T::OpenParen | T::OpenBracket | T::OpenBrace => stack.push(k),
                 T::CloseParen | T::CloseBracket | T::CloseBrace => {
@@ -2473,7 +2478,7 @@ impl<'a> Parser<'a> {
             T::KwUse => {
                 let use_lo = self.lo();
                 self.pos += 1;
-                let global = self.eat(T::PathSep);
+                let global = self.eat(T::PathSep) || self.at_dollar_crate();
                 let tree = self.use_tree()?;
                 self.expect(T::Semi)?;
                 // imports a macro expansion wrote (the file's own are in the prescan's tree)
@@ -3502,11 +3507,17 @@ impl<'a> Parser<'a> {
 
     // ------------------------------------------------------------ paths
 
+    // rustc_resolve ident.rs: resolve_path sends `$crate` to resolve_crate_root,
+    // including under no_implicit_prelude. Its spelling remains one macro token.
+    fn at_dollar_crate(&self) -> bool {
+        self.kind() == T::Ident && self.tok_text(self.tok()).starts_with(b"__relax_crate_")
+    }
+
     /// Path in expression mode (`expr == true`: generics need `::<`) or type mode.
     pub fn path(&mut self, expr: bool) -> PResult<Path> {
         let lo = self.lo();
         let mut qself = QSelfId::NONE;
-        let mut global = false;
+        let mut global = self.at_dollar_crate();
         let mut segs = Vec::new();
         if self.kind() == T::Lt || self.kind() == T::Shl {
             self.eat_lt();
@@ -3740,7 +3751,30 @@ impl<'a> Parser<'a> {
         self.ty_inner(true)
     }
 
+    pub(super) fn ty_fragment_end(&self, lo: u32) -> Option<u32> {
+        if self.ty_frags.contains(&lo) { self.frag_groups.get(&lo).copied() } else { None }
+    }
+
     fn ty_inner(&mut self, plus: bool) -> PResult<TyId> {
+        // rustc_parse parser/ty.rs: parse_ty_common; parser/mod.rs: eat_metavar_seq.
+        // Reparse a captured type inside invisible delimiters (`as $t << n`).
+        if let Some(hi) = self.ty_fragment_end(self.tok().lo) {
+            if let Some(last) = (self.pos..self.toks.len()).find(|&i| self.toks.at(i).hi == hi) {
+                let end = last + 1;
+                let next = self.toks.at(end);
+                self.toks.edit(end, |t| *t = Tok { kind: T::Eof, lo: hi, hi });
+                let result = self.ty_unfragmented(true);
+                let complete = self.pos == end;
+                self.toks.edit(end, |t| *t = next);
+                let ty = result?;
+                if !complete { return self.err("unexpected token in type fragment"); }
+                return Ok(ty);
+            }
+        }
+        self.ty_unfragmented(plus)
+    }
+
+    fn ty_unfragmented(&mut self, plus: bool) -> PResult<TyId> {
         let t = match self.kind() {
             T::OpenParen => {
                 self.pos += 1;

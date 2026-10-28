@@ -49,10 +49,11 @@ mod facade {
     pub use mac::test;
 }
 
-mod globbed {
-    use crate::facade::*;
+// a glob bringing `test` is ambiguous with the prelude's builtin (rustc E0659): not tested here
+mod via_facade {
+    use crate::facade::test;
     #[test]
-    fn globbed() { panic!("attribute did not expand"); }
+    fn via_facade() { panic!("attribute did not expand"); }
 }
 
 mod unrelated_glob {
@@ -82,7 +83,7 @@ fn main() {
     qualified::by_path();
     grouped::grouped();
     aliased::aliased();
-    globbed::globbed();
+    via_facade::via_facade();
     block_import();
     other_builtins::bench_alias();
     other_builtins::test_case_alias();

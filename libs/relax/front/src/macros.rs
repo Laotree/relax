@@ -1513,10 +1513,13 @@ impl MacroScope {
         if let Some(u) = uses.iter().find(|u| u.bind.as_deref() == Some(name)) {
             return Some(self.attr_path(cur, module, &u.path, &mut seen));
         }
+        // a glob that brings the name conflicts with the prelude's builtin: rustc reports E0659
+        // (rustc_resolve ident.rs: AmbiguityKind::GlobVsOuter for macros). The builtin is kept
+        // (a check gap, not a choice of the macro)
         for u in uses.iter().filter(|u| u.bind.is_none()) {
             let mut path = u.path.clone();
             path.push(name.into());
-            if let Some(e) = self.attr_path(cur, module, &path, &mut seen) { return Some(Some(e)); }
+            if self.attr_path(cur, module, &path, &mut seen).is_some() { return Some(None); }
         }
         None
     }
@@ -2699,11 +2702,9 @@ impl<'a> Parser<'a> {
         for (ni, n) in nodes.iter().enumerate() {
             match n {
                 TNode::Tok(t) => out.push(t.kind, &t.text, None, t.pos),
-                // `crate`, or `::__relax_crate_<name>` (two adjacent tokens)
-                TNode::Crate => match krate_path.strip_prefix("::") {
-                    Some(name) => out.push_run(krate_path, &[(T::PathSep, 2), (T::Ident, name.len())]),
-                    None => out.push(T::KwCrate, krate_path, None, u32::MAX),
-                },
+                // rustc_expand mbe/quoted.rs: parse_tree keeps `$crate` one Ident;
+                // rustc_parse parser/nonterminal.rs: get_macro_ident accepts it.
+                TNode::Crate => out.push(T::Ident, krate_path, None, u32::MAX),
                 TNode::Group(o, c, inner) => {
                     out.push(o.kind, &o.text, None, o.pos);
                     self.transcribe(inner, binds, idx, krate_path, out)?;
@@ -2722,9 +2723,19 @@ impl<'a> Parser<'a> {
                             out.push(T::OpenParen, "(", None, u32::MAX);
                         }
                         let group_start = out.s.len() + 1;
+                        let mut ty_groups = Vec::new();
                         for k in *lo..*hi {
                             let t = self.toks.at(k);
+                            // rustc_expand mbe/transcribe.rs: transcribe_pnr preserves
+                            // invisible groups when forwarding a tt, including nested types.
+                            if let Some(end) = self.ty_fragment_end(t.lo) {
+                                ty_groups.push((end, out.s.len() as u32 + 1));
+                            }
                             out.push(t.kind, &String::from_utf8_lossy(self.tok_text(t)), Some(t.lo), u32::MAX);
+                            while ty_groups.last().is_some_and(|&(end, _)| end == t.hi) {
+                                let (_, start) = ty_groups.pop().unwrap();
+                                out.groups.push((start, out.s.len() as u32 | TY_FRAG));
+                            }
                         }
                         if let Some((a, b)) = *taken {
                             let part = self.bytes(a, b);
@@ -2860,7 +2871,7 @@ impl<'a> Parser<'a> {
                 // tokens can become the body of a macro another crate expands (a nested
                 // `macro_rules!`, or tokens passed on to a macro that defines one). `crate` would
                 // name the crate expanding that macro.
-                let krate_path = format!("::__relax_crate_{}", def.krate);
+                let krate_path = format!("__relax_crate_{}", def.krate);
                 let mut out = Transcript { edition: self.edition, ..Default::default() };
                 let result = self.transcribe(body, &binds, &mut Vec::new(), &krate_path, &mut out);
                 self.restore_match_tokens(undo);
@@ -2905,16 +2916,6 @@ impl Transcript {
         }
         self.s.push_str(t);
         self.toks.push(Tok { kind, lo: at, hi: at + t.len() as u32 });
-    }
-    /// One run of text (one leading space) that is several adjacent tokens: (kind, byte length).
-    fn push_run(&mut self, text: &str, pieces: &[(T, usize)]) {
-        self.s.push(' ');
-        let mut at = self.s.len() as u32;
-        self.s.push_str(text);
-        for &(kind, n) in pieces {
-            self.toks.push(Tok { kind, lo: at, hi: at + n as u32 });
-            at += n as u32;
-        }
     }
 }
 

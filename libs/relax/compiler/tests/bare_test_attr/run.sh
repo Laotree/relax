@@ -8,7 +8,7 @@ EXPECTED='macro: picked
 macro: by_path
 macro: grouped
 macro: aliased
-macro: globbed
+macro: via_facade
 macro: in_block
 macro: bench_alias
 macro: test_case_alias
