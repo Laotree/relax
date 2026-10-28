@@ -538,7 +538,9 @@ impl<'a> Parser<'a> {
             if self.pos >= hi {
                 break;
             }
-            if matches!(self.kind(), T::Ident | T::RawIdent) && self.nth(1) == T::Eq {
+            // rustc_builtin_macros/src/format.rs: parse_args uses Token::ident(),
+            // including keywords (rustc_ast/src/token.rs), for named arguments.
+            if self.kind().is_ident_like() && self.nth(1) == T::Eq {
                 let n = self.tok();
                 self.pos += 2;
                 let mut name = String::from_utf8_lossy(self.tok_text(n)).into_owned();
