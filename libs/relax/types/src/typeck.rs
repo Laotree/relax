@@ -7541,7 +7541,8 @@ impl<'a> Fcx<'a> {
             // #[rustc_on_unimplemented] messages) for an unmet trait bound
             if let PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(p)) = &predicate.kind {
                 let (prog, tcx) = (self.prog, self.tcx);
-                let msg = trait_error_message(prog, tcx, code, p, &mut |t| self.ty_str(t));
+                let mut msg = trait_error_message(prog, tcx, code, p, &mut |t| self.ty_str(t));
+                if code == "E0277" { msg.push_str(&crate::next_solver::diagnostics::auto_trait_failure_notes(&self.infcx, prog, &obligation.goal, Some(&self.b))); }
                 self.err(obligation.cause.span, format!("{code}: {msg}"));
                 continue;
             }
