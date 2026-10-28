@@ -80,3 +80,10 @@ pub fn greet_plain() -> u32 { Plain.greet() }
 pub fn apply(f: impl Fn(u32) -> u32) -> u32 { f(2) } // EDIT apit
 
 pub fn wrap<T: Default + std::fmt::Debug>() -> usize { format!("{:?}", T::default()).len() }
+
+// Values a static's or constant's initializer computes through const fns of this crate (cache.rs
+// record_const: the value entry is certified by the bodies CTFE ran)
+pub const fn cval(x: u32) -> u32 { x * 3 } // EDIT cval
+pub const fn cval_outer(x: u32) -> u32 { cval(x) + 1 }
+pub const FW_CONST: u32 = cval_outer(5);
+pub static FW_STATIC: u32 = cval(7) + 1;

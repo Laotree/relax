@@ -71,6 +71,13 @@ SCENARIOS = {
                   hit=PLAIN, compiled=["greet_plain"], observable=True),
     "apit": dict(first="app_a", second="app_a", edits=[(FW, "pub fn apply(f: impl Fn(u32) -> u32) -> u32 { f(2) } // EDIT apit", "pub fn apply(f: impl Fn(u32) -> u32) -> u32 { f(3) } // EDIT apit")],
                  hit=PLAIN, compiled=["apply"], observable=True),
+    # JITCOLD7: a static's/constant's value entry holds while the bodies its evaluation ran keep their code keys:
+    # an edit of a const fn another crate's static (or a constant it reads, or a static it points to) ran must
+    # evaluate it again; an edit of the app's own const fn too
+    "const_fn": dict(first="app_a", second="app_a", edits=[(FW, "pub const fn cval(x: u32) -> u32 { x * 3 } // EDIT cval", "pub const fn cval(x: u32) -> u32 { x * 5 } // EDIT cval")],
+                     hit=PLAIN, observable=True),
+    "own_const_fn": dict(first="app_a", second="app_a", edits=[("app_a/src/main.rs", "const fn own_c(x: u32) -> u32 { x + 4 } // EDIT own_c", "const fn own_c(x: u32) -> u32 { x + 40 } // EDIT own_c")],
+                         hit=PLAIN, observable=True),
     # an app's own new item: the framework and the app's other fns stay linked
     "own_item": dict(first="app_a", second="app_a", edits=[("app_a/src/main.rs", "fn own_a(x: u32) -> u32 { x * 9 + 2 }", "fn own_a(x: u32) -> u32 { x * 9 + 2 }\nfn own_b() -> u32 { 3 }")],
                      hit=PLAIN + ["own_a", "uses_which", "sink_len"]),
