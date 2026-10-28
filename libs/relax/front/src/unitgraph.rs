@@ -7,7 +7,7 @@
 //! build-dependencies and the script as a bin, run_one), with cargo's environment; its `cargo:`
 //! lines are read like cargo does, the output kept with cargo's rerun rules. No rustc.
 
-use crate::crates::CrateUnit;
+use crate::crates::{CrateUnit, HostUnit};
 pub use crate::resolve::{GraphUnit, Units};
 use relax_session::sync::Mutex;
 
@@ -142,8 +142,9 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
     let mut run_build: Vec<Option<(String, u16, Vec<String>, usize)>> = vec![None; n_units];
     let mut raw: Vec<RawUnit> = vec![RawUnit { name: String::new(), src_path: String::new(), edition: 2015, features: Vec::new(), proc_macro: false, deps: Vec::new(), run_script: false, pkg: Default::default() }; n_units];
     // a crate used on both sides (normal dependency and build-dependency / proc-macro side) is one
-    // crate here: the target side's unit decides its features (target units first; host units
-    // are cargo's opt-level 0 copies, or Relax's resolver marks them)
+    // crate here: keep the target side for the app and the host side for the macro world.
+    // Cargo reference features.md#feature-resolver-version-2 keeps their features separate;
+    // rustc compiler/rustc_metadata/src/creader.rs::CStore::load_proc_macro loads the host artifact.
     let mut order: Vec<usize> = (0..n_units).filter(|&ui| !units[ui].host).collect();
     order.extend((0..n_units).filter(|&ui| units[ui].host));
     for &ui in &order {
@@ -193,6 +194,9 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
         let norm = crate::vfs::normalize_path(&src_path);
         if let Some(i) = crate_paths.iter().position(|p| *p == norm) {
             map[ui] = i;
+            if u.host {
+                crates[i].host = Some(HostUnit { features, deps: udeps });
+            }
             if is_root_bin || (root == usize::MAX && roots.contains(&ui)) { root = i; }
             continue;
         }
@@ -214,7 +218,7 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
         if mode == "test" {
             test_crates.push(crates.len());
         }
-        crates.push(CrateUnit { name: tname, src_path, edition, features, deps: udeps,  proc_macro: pm, bin, build_script: false, version: ver.clone(), registry: !u.pkg_id.starts_with("path+") });
+        crates.push(CrateUnit { name: tname, src_path, edition, features, deps: udeps, host: None, proc_macro: pm, bin, build_script: false, version: ver.clone(), registry: !u.pkg_id.starts_with("path+") });
         crate_paths.push(norm);
         pkg.push((pkg_dir, pname, ver));
     }
@@ -269,6 +273,11 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
             }
         }
         c.deps = nd;
+        if let Some(h) = &mut c.host {
+            h.deps = h.deps.iter().filter_map(|(i, n)| {
+                map.get(*i).filter(|&&ci| ci != usize::MAX).map(|&ci| (ci, n.clone()))
+            }).collect();
+        }
     }
 
     let n = crates.len();

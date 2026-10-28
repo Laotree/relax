@@ -1963,6 +1963,15 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
             deps,
         });
     }
+    if std::env::var("MAKEPAD_RUN_TRACE").is_ok_and(|v| v.split(',').any(|x| x == "units")) {
+        for (i, u) in out.iter().enumerate() {
+            let (k, _) = &units[i];
+            let m = &r.manifests[k.0];
+            let deps: Vec<&str> = u.deps.iter().map(|(d, _)| out[*d].name.as_str()).collect();
+            eprintln!("units: {} {} {} unit={} mode={} features=[{}] deps=[{}]", m.name, m.version,
+                if u.host { "host" } else { "target" }, u.name, u.mode, u.features.join(","), deps.join(","));
+        }
+    }
     Ok(Units { units: out, roots, bins })
 }
 
@@ -1983,6 +1992,64 @@ mod root_tests {
     /// the names of the package's units
     fn units(sess: &std::sync::Arc<crate::Session>, dir: &str, pkg: &str) -> Vec<String> {
         unit_graph(sess, dir, pkg, &[]).unwrap_or_else(|e| panic!("{dir} {pkg}: {e}")).units.into_iter().map(|u| u.name).collect()
+    }
+
+    #[test]
+    fn resolver_2_host_features() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let root = tree("host-features", &[
+            ("Cargo.toml", "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\nexclude = [\"macros\"]\n"),
+            ("app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\na-macro = { path = \"../macros/a\" }\nb-macro = { path = \"../macros/b\" }\nshared = { path = \"../macros/shared\", optional = true, default-features = false, features = [\"target\"] }\n[build-dependencies]\nshared = { path = \"../macros/shared\", default-features = false, features = [\"build\"] }\n[dev-dependencies]\nshared = { path = \"../macros/shared\", features = [\"dev\"] }\n[features]\ntarget-side = [\"dep:shared\"]\n"),
+            ("app/src/main.rs", "fn main() {}\n"),
+            ("app/build.rs", "fn main() {}\n"),
+            ("macros/Cargo.toml", "[workspace]\nresolver = \"2\"\nmembers = [\"a\", \"b\", \"shared\", \"optional\", \"unused\"]\n[workspace.dependencies]\nshared = { path = \"shared\", default-features = false, features = [\"parsing\"] }\n"),
+            ("macros/a/Cargo.toml", "[package]\nname = \"a-macro\"\nversion = \"0.1.0\"\n[lib]\nproc-macro = true\n[dependencies]\nshared = { workspace = true, features = [\"full\"] }\n"),
+            ("macros/a/src/lib.rs", ""),
+            ("macros/b/Cargo.toml", "[package]\nname = \"b-macro\"\nversion = \"0.1.0\"\n[lib]\nproc-macro = true\n[dependencies]\nshared = { workspace = true, features = [\"visit\"] }\n[features]\ndefault = [\"shared/extra-traits\", \"shared?/fold\"]\n"),
+            ("macros/b/src/lib.rs", ""),
+            ("macros/shared/Cargo.toml", "[package]\nname = \"shared\"\nversion = \"0.1.0\"\n[dependencies]\noptional = { path = \"../optional\", optional = true, default-features = false }\nunused = { path = \"../unused\", optional = true }\n[features]\ndefault = [\"std\"]\nstd = []\nparsing = []\nfull = [\"optional?/walk\", \"unused?/walk\"]\nvisit = [\"dep:optional\"]\nextra-traits = []\nfold = []\nbuild = []\ndev = []\ntarget = []\n"),
+            ("macros/shared/src/lib.rs", ""),
+            ("macros/optional/Cargo.toml", "[package]\nname = \"optional\"\nversion = \"0.1.0\"\n[features]\nwalk = []\n"),
+            ("macros/optional/src/lib.rs", ""),
+            ("macros/unused/Cargo.toml", "[package]\nname = \"unused\"\nversion = \"0.1.0\"\n[features]\nwalk = []\n"),
+            ("macros/unused/src/lib.rs", ""),
+        ]);
+        // Cargo reference features.md#feature-resolver-version-2: union on each side, no dev
+        // features for a build. rustc compiler/rustc_attr_parsing/src/attributes/cfg.rs::eval_config_entry
+        // tests the resulting feature cfg in this compilation's session.
+        for target in [false, true] {
+            let flags = if target { vec!["--features".to_string(), "target-side".to_string()] } else { Vec::new() };
+            let g = unit_graph(sess, &root, "app", &flags).unwrap();
+            let shared: Vec<_> = g.units.iter().filter(|u| u.name == "shared").collect();
+            assert_eq!(shared.len(), if target { 2 } else { 1 });
+            let host = shared.iter().find(|u| u.host).unwrap();
+            assert_eq!(host.features, ["build", "extra-traits", "fold", "full", "parsing", "visit"]);
+            let optional = &g.units[host.deps.iter().find(|(_, n)| n == "optional").unwrap().0];
+            assert!(optional.host);
+            assert_eq!(optional.features, ["walk"]);
+            assert!(!g.units.iter().any(|u| u.name == "unused"));
+            assert_eq!(g.units.iter().filter(|u| u.kind.iter().any(|k| k == "proc-macro")).count(), 2);
+            for pm in g.units.iter().filter(|u| u.kind.iter().any(|k| k == "proc-macro")) {
+                assert!(pm.host);
+                let dep = &g.units[pm.deps.iter().find(|(_, n)| n == "shared").unwrap().0];
+                assert!(dep.host);
+                assert_eq!(dep.features, host.features);
+            }
+            if target {
+                let app = shared.iter().find(|u| !u.host).unwrap();
+                assert_eq!(app.features, ["target"]);
+                assert!(app.deps.is_empty());
+            }
+        }
+        // A git member inherits from its repository's workspace too, with member features added.
+        let mut r = Resolver::new(sess, &root).unwrap();
+        let source = Source::Git(GitSrc { url: "https://example.invalid/macros".to_string(), reference: crate::git::fetch::GitRef::DefaultBranch });
+        let i = r.load(&format!("{root}/macros/b"), source).unwrap();
+        let d = &r.manifests[i].deps[0];
+        assert_eq!(d.features, ["parsing", "visit"]);
+        assert!(!d.default_features);
+        assert_eq!(d.path.as_deref(), Some(normalize(&format!("{root}/macros/shared")).as_str()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -445,8 +445,9 @@ fn register(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], std_dir:
     let mut map = vec![usize::MAX; units.len()];
     let mut fresh = Vec::new();
     for (i, u) in units.iter().enumerate() {
+        let features = u.host.as_ref().map_or(&u.features, |h| &h.features);
         let same = if additive {
-            reg.units.iter().position(|r| r.name == u.name && r.src_path == u.src_path && r.edition == u.edition && r.features == u.features && r.proc_macro == u.proc_macro && r.registry == u.registry)
+            reg.units.iter().position(|r| r.name == u.name && r.src_path == u.src_path && r.edition == u.edition && &r.features == features && r.proc_macro == u.proc_macro && r.registry == u.registry)
         } else {
             None
         };
@@ -458,7 +459,8 @@ fn register(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], std_dir:
     }
     for &i in &fresh {
         let u = &units[i];
-        reg.units[map[i]] = UnitInfo { name: u.name.clone(), src_path: u.src_path.clone(), edition: u.edition, features: u.features.clone(), deps: u.deps.iter().map(|(d, n)| (map[*d], n.clone())).collect(), proc_macro: u.proc_macro, registry: u.registry, cfgs: Vec::new(), env: Vec::new() };
+        let (features, deps) = u.host.as_ref().map_or((&u.features, &u.deps), |h| (&h.features, &h.deps));
+        reg.units[map[i]] = UnitInfo { name: u.name.clone(), src_path: u.src_path.clone(), edition: u.edition, features: features.clone(), deps: deps.iter().map(|(d, n)| (map[*d], n.clone())).collect(), proc_macro: u.proc_macro, registry: u.registry, cfgs: Vec::new(), env: Vec::new() };
     }
     for &i in &fresh {
         let u = reg.units[map[i]].clone();
@@ -484,6 +486,60 @@ fn register(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], std_dir:
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn merged_host_units_keep_features_and_dependencies() {
+    use crate::resolve::{GraphUnit, Units};
+    let root = std::env::temp_dir().join(format!("relax-host-units-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("proc_macro")).unwrap();
+    std::fs::write(root.join("proc_macro/empty.rs"), "").unwrap();
+    let dir = root.display().to_string();
+    let unit = |name: &str, kind: &str, host, features: &[&str], deps: &[(usize, &str)]| GraphUnit {
+        pkg_id: format!("path+file://{dir}/{name}#0.1.0"),
+        name: name.to_string(), kind: vec![kind.to_string()],
+        src_path: format!("{dir}/{name}/src/lib.rs"), edition: "2021".to_string(),
+        host, mode: "build".to_string(), features: features.iter().map(|s| s.to_string()).collect(),
+        deps: deps.iter().map(|(d, n)| (*d, n.to_string())).collect(),
+    };
+    let units = Units { units: vec![
+        unit("app", "bin", false, &[], &[(1, "shared"), (2, "macros")]),
+        unit("shared", "lib", false, &["target"], &[(3, "target_helper")]),
+        unit("macros", "proc-macro", true, &[], &[(4, "shared")]),
+        unit("target_helper", "lib", false, &[], &[]),
+        unit("shared", "lib", true, &["full", "visit"], &[(5, "host_helper")]),
+        unit("host_helper", "lib", true, &["walk"], &[]),
+    ], roots: vec![0], bins: Vec::new() };
+    let mut g = crate::unitgraph::load(&units, false).unwrap();
+    let sess = &std::sync::Arc::new(crate::Session::default());
+    let saved = REG.with(|r| r.borrow_mut().take());
+    register_and_strip(sess, &mut g.crates, &dir, false).unwrap();
+    let shared = g.crates.iter().find(|u| u.name == "shared").unwrap();
+    assert_eq!(shared.features, ["target"]);
+    assert_eq!(shared.deps.len(), 1);
+    assert_eq!(g.crates[shared.deps[0].0].name, "target_helper");
+    let helper = g.crates.iter().find(|u| u.name == "host_helper").unwrap();
+    assert_eq!(helper.src_path, format!("{dir}/proc_macro/empty.rs"));
+    // Re-registering the original graph matches the host feature set, not the app's.
+    let again = crate::unitgraph::load(&units, false).unwrap();
+    register(sess, &again.crates, &dir, true).unwrap();
+    REG.with(|r| {
+        let r = r.borrow();
+        let reg = r.as_ref().unwrap();
+        assert_eq!(reg.units.len(), 5);
+        let shared = reg.units.iter().find(|u| u.name == "shared").unwrap();
+        assert_eq!(shared.features, ["full", "visit"]);
+        assert_eq!(shared.deps.len(), 1);
+        let helper = &reg.units[shared.deps[0].0];
+        assert_eq!(helper.name, "host_helper");
+        assert_eq!(helper.features, ["walk"]);
+        assert_eq!(helper.src_path, format!("{dir}/host_helper/src/lib.rs"));
+        let pm = reg.units.iter().find(|u| u.name == "macros").unwrap();
+        assert_eq!(reg.units[pm.deps[0].0].features, shared.features);
+    });
+    REG.with(|r| *r.borrow_mut() = saved);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Updates registered units with build-script `cfgs` and `env` outputs (`run.rs` after
@@ -551,7 +607,7 @@ pub fn register_and_strip(sess: &std::sync::Arc<crate::Session>, units: &mut [Cr
     // proc-macro crate
     let mut is_dep = vec![false; n];
     for u in units.iter() {
-        for (d, _) in &u.deps {
+        for (d, _) in u.deps.iter().chain(u.host.iter().flat_map(|h| &h.deps)) {
             is_dep[*d] = true;
         }
     }
@@ -570,6 +626,7 @@ pub fn register_and_strip(sess: &std::sync::Arc<crate::Session>, units: &mut [Cr
             units[i].src_path = empty.clone();
             units[i].deps.clear();
             units[i].features.clear();
+            units[i].host = None;
         }
     }
     Ok(())
