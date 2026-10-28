@@ -642,6 +642,9 @@ pub struct GraphRecipe {
     /// the key of the graph's last load order (cache.rs load_order)
     pub set: u128,
     pub crates: Vec<(String, String)>,
+    /// a reordered load's base graph (cache.rs load_order): the graph store its retained demand
+    /// parts are read from when this graph is recorded
+    pub base: Option<u128>,
 }
 impl GraphRecipe {
     pub fn new(crates: &[crate::preload::PreCrate]) -> Self {
@@ -677,7 +680,7 @@ impl GraphRecipe {
         s.u8(crate::parser::lazy_auto() as u8);
         s.u32(set.len() as u32);
         for k in set { s.u128(k); }
-        Self { identity: h.finish128(), set: s.finish128(), crates: crates.iter().map(|c| (c.name.clone(), c.root.clone())).collect() }
+        Self { identity: h.finish128(), set: s.finish128(), crates: crates.iter().map(|c| (c.name.clone(), c.root.clone())).collect(), base: None }
     }
 }
 

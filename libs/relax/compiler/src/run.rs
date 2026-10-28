@@ -923,7 +923,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if collected_restored {
         core = prog.prelude_crate.expect("collected graph prelude");
     } else {
-        let recipe = crate::crate_image::GraphRecipe::new(&pre);
+        // (a reordered load's base graph: the restore's)
+        let recipe = crate::crate_image::GraphRecipe { base: prog.front_graph.as_ref().and_then(|r| r.base), ..crate::crate_image::GraphRecipe::new(&pre) };
         let replay = (restored_crates != 0).then(|| pre.clone());
         let mut remaining: Vec<_> = pre.into_iter().skip(restored_crates).collect();
         for c in &mut remaining {

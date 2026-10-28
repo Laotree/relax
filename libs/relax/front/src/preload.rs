@@ -13,7 +13,7 @@ use relax_session::sync::{Condvar, Mutex};
 mod lazy;
 pub use lazy::PendingPlan as DemandPlan;
 pub(crate) use lazy::items as rs_items;
-pub use lazy::{DemandPart, DemandImage, FileIndex as FileIndex};
+pub use lazy::{DemandPart, DemandImage, FileIndex as FileIndex, recipe_identity as demand_recipe_identity};
 
 pub(crate) fn configured_tokens(src: &[u8], tokens: &[Tok], cfg: &CfgSet) -> Vec<Tok> {
     lazy::demand::active_tokens(src, tokens, cfg)

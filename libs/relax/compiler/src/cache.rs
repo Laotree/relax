@@ -4680,7 +4680,8 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
     let path = front_graph_path(dir, recipe.identity);
     let mut entries = Vec::new();
     if let Some(demand) = &graph.demand_image {
-        let previous = Store::open(&path);
+        // retained parts: this graph's store, or a reordered load's base graph's
+        let previous = [Some(path.clone()), recipe.base.map(|b| front_graph_path(dir, b))].into_iter().flatten().filter_map(|p| Store::open(&p)).collect::<Vec<_>>();
         let mut header = (**demand).clone();
         let recorded = { let _r = crate::load_profile::span(job.profile, "front-graph-demand-record", "graph writer"); demand.recorded_parts() };
         mark("demand-record");
@@ -4704,7 +4705,7 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
             let (key, payload) = match body? {
                 Some(body) => body,
                 None => {
-                    let (kind, bytes) = previous.as_ref()?.get(part.key)?;
+                    let (kind, bytes) = previous.iter().find_map(|st| st.get(part.key))?;
                     if kind != KIND_DEMAND_PART { return None; }
                     (part.key, bytes.to_vec())
                 }
@@ -5162,13 +5163,24 @@ impl crate::crate_image::CrateImages for FrontImages {
     }
     fn demand_parts(&self, crates: &[crate::preload::PreCrate], graph: u128) -> Option<crate::crate_image::DemandParts> {
         let recipe = crate::crate_image::GraphRecipe::new(crates);
-        let Some(saved) = self.front_graph(recipe.identity) else { return None; };
-        if saved.identity != recipe.identity || saved.crates.iter().map(|(key, _)| key).ne(recipe.crates.iter()) { return None; }
+        // a reordered load (load_order): the base graph's parts of the crates it keeps in place
+        // (a crate's part covers it and the crates before it); the others are planned again
+        let (identity, graph, common) = match self.front_graph(recipe.identity) {
+            Some(_) => (recipe.identity, graph, crates.len()),
+            None => {
+                let base = self.base.lock().unwrap();
+                let base = base.as_ref().filter(|b| b.set == recipe.set)?;
+                (base.identity, crate::preload::demand_recipe_identity(&base.pre), base.common)
+            }
+        };
+        let Some(saved) = self.front_graph(identity) else { return None; };
+        if saved.identity != identity || saved.crates.len() != crates.len()
+            || saved.crates.iter().map(|(key, _)| key).take(common).ne(recipe.crates.iter().take(common)) { return None; }
         let Some(image) = saved.demand_image.clone().filter(|image| image.graph == graph && image.parts.len() == crates.len()) else { return None; };
-        let path = front_graph_path(&self.dir, recipe.identity);
+        let path = front_graph_path(&self.dir, identity);
         let store = Store::open(&path)?;
         let profile = crates.first().is_some_and(|c| c.cfg.session.runtime.profile);
-        let keys = image.parts.iter().zip(crates).map(|(part, c)| {
+        let keys = image.parts.iter().zip(crates).take(common).map(|(part, c)| {
             let (kind, bytes) = store.get(part.key)?;
             if kind != KIND_DEMAND_PART { return None; }
             let part = crate::preload::DemandPart::read_header(part.key, bytes)?;
@@ -5193,16 +5205,18 @@ impl crate::crate_image::CrateImages for FrontImages {
             for (c, kind, name, _, content) in late { crate::sip::note_late_input(c, kind, name, content.as_deref()); }
             Some(part.key)
         }).collect::<Vec<_>>();
-        let valid = keys.iter().map(Option::is_some).collect::<Vec<_>>();
+        let valid = (0..crates.len()).map(|ci| keys.get(ci).is_some_and(Option::is_some)).collect::<Vec<_>>();
         // Stale parts are comparison evidence only, never reusable input. Keep
         // their old demand-out/export sets to validate an edited local selection.
-        let keys = image.parts.iter().map(|p| Some(p.key)).collect::<Vec<_>>();
-        let path = front_graph_path(&self.dir, recipe.identity);
+        let keys = image.parts.iter().enumerate().map(|(ci, p)| (ci < common).then_some(p.key)).collect::<Vec<_>>();
+        let path = front_graph_path(&self.dir, identity);
         let crates_profile = crates.first().is_some_and(|c| c.cfg.session.runtime.profile);
         let crate_names = crates.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
         let image_dir = self.dir.clone();
         let last = crates.len().saturating_sub(1);
-        let last_selected = image.files.iter().filter(|f| f.ci == last).all(|f| image.reached.contains(&(last, f.path.clone())));
+        // (a reordered load takes its new last crate in full: always sound, and nothing waits for
+        // the closure, which records what it would defer for the next start)
+        let last_selected = common < crates.len() || image.files.iter().filter(|f| f.ci == last).all(|f| image.reached.contains(&(last, f.path.clone())));
         Some(crate::crate_image::DemandParts { valid, last_selected, load: std::sync::Arc::new(move || {
             let _profile = crate::load_profile::span(crates_profile, "rust-demand-parts", "load");
             let store = Store::open(&path);
@@ -6017,6 +6031,89 @@ mod cold_tests {
         std::fs::write(&pre[3].root, "pub fn value() -> u64 { 7 }").unwrap();
         let (kept, _, _) = images.restore_collected(sess, &pre).expect("prefix restore");
         assert_eq!(kept.crates.len(), 3, "only the crates below the changed one");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn load_order_moves_changed_crates_last() {
+        isolated_test!(load_order_moves_changed_crates_last);
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let dir = std::env::temp_dir().join(format!("relax-load-order-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::cfg::CfgSet::host(sess, &[]);
+        // three padding crates stand where std's are; `late` depends on nothing but loads after `top`
+        let names = ["pad0", "pad1", "pad2", "low", "mid", "top", "late"];
+        let mut pre = Vec::new();
+        for (i, name) in names.iter().enumerate() {
+            let package = dir.join(name);
+            std::fs::create_dir(&package).unwrap();
+            let root = package.join("lib.rs").to_string_lossy().into_owned();
+            let (text, deps): (String, Vec<usize>) = match *name {
+                "low" => ("pub fn value() -> u32 { 7 }".into(), vec![]),
+                "mid" => ("pub fn mid() -> u32 { low::value() as u32 + 1 }".into(), vec![3]),
+                "top" => ("pub fn top() -> u32 { mid::mid() + 1 }".into(), vec![4]),
+                _ => (format!("pub fn f{i}() -> u32 {{ {i} }}"), vec![]),
+            };
+            std::fs::write(&root, text).unwrap();
+            pre.push(crate::preload::PreCrate {  name: name.to_string(), root, edition: 2021, cfg: cfg.clone(),
+                deps: deps.iter().map(|&d| (names[d].to_string(), names[d].to_string())).collect(), proc_macro: false,
+                image_deps: deps.clone(), image_dep_names: deps.iter().map(|&d| (names[d].to_string(), names[d].to_string())).collect() });
+        }
+        let store = dir.join("cache");
+        let load = |pre: &[crate::preload::PreCrate], images: &FrontImages| {
+            let mut prog = crate::program::Program::new(sess);
+            prog.record_front = true;
+            prog.front_sink = Some(FrontSink::for_dir(&store));
+            prog.preload_images(pre.to_vec(), Some(images));
+            for c in pre {
+                let deps = c.image_deps.iter().map(|&d| (prog.syms.intern(&pre[d].name), d as u32)).collect();
+                prog.load_crate(&c.name, &c.root, c.edition, c.cfg.clone(), deps).unwrap();
+            }
+            prog.resolve_imports();
+            assert!(prog.errors.is_empty(), "{:?}", prog.errors);
+            prog
+        };
+        let images = FrontImages { dir: store.clone(), ..Default::default() };
+        // a run that loads in `pre`'s order and records its collected graph (and with it the order)
+        let record = |pre: &[crate::preload::PreCrate]| {
+            let mut prog = load(pre, &images);
+            ColdFront::default().finish_in(&mut prog, store.clone());
+            let prog = load(pre, &images);
+            let mut tcx = crate::tcx::Tcx::new();
+            tcx.collect(&prog);
+            let unit = Unit::new(prog, tcx, 0);
+            let mut cache = Cache::open_in(&unit, Mode::On, dir.join("collected")).unwrap();
+            cache.dir = store.clone();
+            cache.crate_path = unit.prog.crates.iter().enumerate().map(|(i, c)|
+                store.join(front_store_name(&sess.options, unit.prog.syms.str(c.name), cache.fps[i]))).collect();
+            cache.record_collected(&unit.prog, &unit.tcx).expect("record collected graph");
+        };
+        let ordered = |pre: &[crate::preload::PreCrate]| -> Vec<crate::preload::PreCrate> {
+            match images.load_order(pre, 3) { Some(order) => crate::preload::reorder(pre, &order).unwrap(), None => pre.to_vec() }
+        };
+        let order_names = |pre: &[crate::preload::PreCrate]| pre.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(" ");
+        record(&pre);
+        // unchanged: the recorded order, everything restored
+        let now = ordered(&pre);
+        assert_eq!(order_names(&now), order_names(&pre));
+        assert_eq!(images.restore_collected(sess, &now).unwrap().0.crates.len(), names.len());
+        // an edit of `low`: it and its dependents load last; the restore keeps the crates before it
+        std::fs::write(&pre[3].root, "pub fn value() -> u32 { 8 }").unwrap();
+        let now = ordered(&pre);
+        assert_eq!(order_names(&now), "pad0 pad1 pad2 late low mid top");
+        let (kept, _, _) = images.restore_collected(sess, &now).expect("prefix restore");
+        assert_eq!(kept.crates.len(), 3, "the crates the stored order keeps in place");
+        record(&now);
+        // the next edit of `low`: the order holds, and `late` is kept too
+        std::fs::write(&pre[3].root, "pub fn value() -> u32 { 9 }").unwrap();
+        let again = ordered(&pre);
+        assert_eq!(order_names(&again), "pad0 pad1 pad2 late low mid top");
+        let (kept, _, _) = images.restore_collected(sess, &again).expect("prefix restore");
+        assert_eq!(kept.crates.len(), 4, "every crate the edit cannot reach");
+        // a restore of the reordered graph is the same program as loading it
+        record(&again);
+        let (whole, _, _) = images.restore_collected(sess, &ordered(&pre)).expect("unchanged sources restore");
+        assert_eq!(whole.crates.iter().map(|c| whole.syms.str(c.name).to_string()).collect::<Vec<_>>().join(" "), "pad0 pad1 pad2 late low mid top");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

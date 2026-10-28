@@ -380,7 +380,7 @@ impl FrontImages {
         why = "ledger replay";
         for store in stores.iter().take(prefix) { replay_front_ledger(store)?; }
         phase("ledger replayed");
-        prog.front_graph = Some(GraphRecipe::new(pre));
+        prog.front_graph = Some(GraphRecipe { base: base.is_some().then_some(graph.identity), ..GraphRecipe::new(pre) });
         let image_defs = prog.defs.len();
         let mut kept = None;
         if prefix != pre.len() {
