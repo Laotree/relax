@@ -400,9 +400,6 @@ pub struct Unit {
     pub coro_relower: relax_session::sync::Mutex<Vec<u32>>,
     /// drop_may_unwind answers
     pub unwind_drop_cache: crate::conc::MemoMap<TyId, bool>,
-    /// types whose drop_may_unwind / is_unpin answer is being computed, per thread
-    /// (0 drop, 1 unwind, 2 unpin): a recursive type meets its own placeholder on its own thread only
-    cycle_inprog: crate::conc::ShardMap<(u8, TyId, u32), ()>,
     /// (concrete type, dyn type) -> vtable address
     pub vtables: crate::conc::MemoMap<(TyId, TyId), u64>,
     /// static `Location` data per (file, line, col) (#[track_caller] arguments)
@@ -3457,53 +3454,89 @@ impl Unit {
 
 // ------------------------------------------------------------ the unit
 
-crate::memo_local! {
-    /// The memoized recursive type queries in progress on this thread (drop_may_unwind 1,
-    /// is_unpin 2; outermost first) and the outermost entry a cycle was cut
-    /// at (usize::MAX: none). An answer computed below a cut of an entry still in progress
-    /// further out is provisional (it misses what that entry's other parts contribute) and is not
-    /// memoized: memoizing it made the answer depend on which type was asked first, and with it
-    /// the lowered code (Call vs Invoke, drop glue) -- O1 RIR that depended on build order.
-    static CYC_AT: std::cell::RefCell<Vec<(u8, TyId)>>;
-}
-thread_local! {
-    static CYC_CUT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+/// Query-local SCCs: rustc_data_structures/src/graph/scc/mod.rs,
+/// SccsConstruction::walk_unvisited_node. Keep returned provisional members on the stack
+/// until their root completes; every member then has the root's answer. These queries
+/// combine with OR (drop, cycle = false) or AND (Unpin, cycle = true).
+#[derive(Default)]
+struct TypeCycle {
+    at: crate::fxhash::HashMap<TyId, usize>,
+    stack: Vec<(TyId, usize)>, // type, lowlink
+    current: Option<usize>,
 }
 
-// try_with: CYC_AT has a destructor, and a thread's TLS destructors may run compiled code that
-// is compiled right then (std's key_dtor): after CYC_AT is gone every answer counts as provisional.
-
-/// A cycle met (kind, t) in progress: note how far out it reaches.
-fn cyc_cut(kind: u8, t: TyId) {
-    let at = CYC_AT.try_with(|m| m.borrow().iter().rposition(|x| *x == (kind, t)).unwrap_or(0)).unwrap_or(0);
-    CYC_CUT.with(|c| c.set(c.get().min(at)));
-}
-
-/// Enters query (kind, t): its depth (usize::MAX: no record, the thread's TLS is being torn down).
-fn cyc_enter(kind: u8, t: TyId) -> usize {
-    CYC_AT
-        .try_with(|m| {
-            let mut m = m.borrow_mut();
-            m.push((kind, t));
-            m.len() - 1
-        })
-        .unwrap_or(usize::MAX)
-}
-
-/// Leaves the query at `depth`: whether its answer is provisional (not to be memoized).
-fn cyc_leave(depth: usize) -> bool {
-    if depth == usize::MAX {
-        return true;
-    }
-    let _ = CYC_AT.try_with(|m| m.borrow_mut().truncate(depth));
-    CYC_CUT.with(|c| {
-        let cut = c.get();
-        if cut >= depth {
-            // a cut of this query itself (or none): its answer is final
-            c.set(usize::MAX);
+impl TypeCycle {
+    fn query(&mut self, t: TyId, cache: &crate::conc::MemoMap<TyId, bool>, seed: bool, f: impl FnOnce(&mut Self) -> bool) -> bool {
+        if let Some(r) = cache.get(&t) { return r; }
+        if let Some(&at) = self.at.get(&t) {
+            let current = self.current.unwrap();
+            self.stack[current].1 = self.stack[current].1.min(at);
+            return seed;
         }
-        cut < depth
-    })
+        let depth = self.stack.len();
+        self.at.insert(t, depth);
+        self.stack.push((t, depth));
+        let parent = self.current.replace(depth);
+        let r = f(self);
+        self.current = parent;
+        let low = self.stack[depth].1;
+        if low == depth {
+            for (t, _) in self.stack.drain(depth..) {
+                self.at.remove(&t);
+                cache.insert(t, r);
+            }
+        } else if let Some(parent) = parent {
+            self.stack[parent].1 = self.stack[parent].1.min(low);
+        }
+        r
+    }
+}
+
+#[cfg(test)]
+mod type_cycle_tests {
+    use super::{TypeCycle, TyId};
+    use crate::conc::MemoMap;
+
+    fn walk(t: TyId, cycle: &mut TypeCycle, cache: &MemoMap<TyId, bool>, seed: bool, decisive: bool, visits: &mut [usize; 32]) -> bool {
+        cycle.query(t, cache, seed, |cycle| {
+            visits[t.0 as usize] += 1;
+            if t.0 == 30 { return if decisive { !seed } else { seed }; }
+            if t.0 == 31 { return seed; }
+            let mut changed = false;
+            for next in [(t.0 + 1) % 30, (t.0 + 2) % 30, 0] {
+                changed |= walk(TyId(next), cycle, cache, seed, decisive, visits) != seed;
+            }
+            if t.0 == 0 {
+                // The SCC is still provisional, including members whose calls returned.
+                for i in 0..30 { assert_eq!(cache.get(&TyId(i)), None); }
+                // An independent component below a cycle must keep its own answer.
+                changed |= walk(TyId(31), cycle, cache, seed, decisive, visits) != seed;
+                assert_eq!(cache.get(&TyId(31)), Some(seed));
+                changed |= walk(TyId(30), cycle, cache, seed, decisive, visits) != seed;
+            }
+            if changed { !seed } else { seed }
+        })
+    }
+
+    #[test]
+    fn recursive_types_are_computed_once_and_published_at_the_root() {
+        for seed in [false, true] {
+            for decisive in [false, true] {
+                for root in [0, 15, 29] {
+                    let cache = MemoMap::with_bits(4);
+                    let mut visits = [0; 32];
+                    let answer = if decisive { !seed } else { seed };
+                    assert_eq!(walk(TyId(root), &mut TypeCycle::default(), &cache, seed, decisive, &mut visits), answer);
+                    for i in 0..31 {
+                        assert_eq!(cache.get(&TyId(i)), Some(answer));
+                        assert_eq!(walk(TyId(i), &mut TypeCycle::default(), &cache, seed, decisive, &mut visits), answer);
+                    }
+                    assert_eq!(cache.get(&TyId(31)), Some(seed));
+                    assert_eq!(visits, [1; 32]);
+                }
+            }
+        }
+    }
 }
 
 /// A unit's data and statics parts of its reservation.
@@ -3720,7 +3753,6 @@ impl Unit {
             coro_selfref: Default::default(),
             coro_relower: Default::default(),
             unwind_drop_cache: Default::default(),
-            cycle_inprog: Default::default(),
             vtables: crate::conc::MemoMap::new_kept(16),
             locations: Default::default(),
             const_failed: std::collections::HashSet::new(),
@@ -4615,54 +4647,44 @@ impl Unit {
     /// `PhantomPinned` is not). Uncertain cases (trait objects without `+ Unpin`, opaque types,
     /// closures over them) answer false: the safe side for noalias.
     pub fn is_unpin(&self, t: TyId) -> bool {
+        self.is_unpin_inner(t, &mut TypeCycle::default())
+    }
+
+    fn is_unpin_inner(&self, t: TyId, cycle: &mut TypeCycle) -> bool {
         let t = self.tcx.tys.erase_regions(t);
         // a field's associated-type projection (`<A as Allocator<u8>>::AllocatedMemory`) names
         // the type it normalises to, as rustc's auto-trait selection sees it
         let t = self.tcx.try_normalize_erasing_regions(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), t).unwrap_or(t);
-        if let Some(b) = self.unpin_cache.get(&t) {
-            return b;
-        }
-        // a recursive type is Unpin unless something else says no
-        let ik = (2u8, t, crate::conc::thread_id());
-        if self.cycle_inprog.contains(&ik) {
-            cyc_cut(2, t);
-            return true;
-        }
-        self.cycle_inprog.insert(ik, ());
-        let my_depth = cyc_enter(2, t);
-        let r = match self.tcx.tys.kind(t).clone() {
-            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::Str => true,
-            TyKind::Ref(..) | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::FnDef(..) => true,
-            TyKind::Tuple(v) => self.tcx.tys.list(v).iter().all(|x| self.is_unpin(*x)),
-            TyKind::Array(e, _) | TyKind::Slice(e) => self.is_unpin(e),
-            // an async block / fn body is !Unpin (rustc: it may hold references into itself)
-            TyKind::Closure(file, ce, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) => !self.tcx.coroutines.contains(&(file, ce)) && self.is_unpin(up),
-            TyKind::Adt(d, args, _) => {
-                if self.prog.name(d) == "PhantomPinned" {
-                    false
-                } else {
-                    let fields: Vec<TyId> = match self.tcx.adts.get(&d) {
-                        Some(a) => a.variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect(),
-                        None => Vec::new(),
-                    };
-                    let mut ok = true;
-                    for f in fields {
-                        let ft = self.tcx.tys.subst_erasing_regions(f, self.tcx.tys.list(args));
-                        if !self.is_unpin(ft) {
-                            ok = false;
-                            break;
+        cycle.query(t, &self.unpin_cache, true, |cycle| {
+            match self.tcx.tys.kind(t).clone() {
+                TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::Str => true,
+                TyKind::Ref(..) | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::FnDef(..) => true,
+                TyKind::Tuple(v) => self.tcx.tys.list(v).iter().all(|x| self.is_unpin_inner(*x, cycle)),
+                TyKind::Array(e, _) | TyKind::Slice(e) => self.is_unpin_inner(e, cycle),
+                // an async block / fn body is !Unpin (rustc: it may hold references into itself)
+                TyKind::Closure(file, ce, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) => !self.tcx.coroutines.contains(&(file, ce)) && self.is_unpin_inner(up, cycle),
+                TyKind::Adt(d, args, _) => {
+                    if self.prog.name(d) == "PhantomPinned" {
+                        false
+                    } else {
+                        let fields: Vec<TyId> = match self.tcx.adts.get(&d) {
+                            Some(a) => a.variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect(),
+                            None => Vec::new(),
+                        };
+                        let mut ok = true;
+                        for f in fields {
+                            let ft = self.tcx.tys.subst_erasing_regions(f, self.tcx.tys.list(args));
+                            if !self.is_unpin_inner(ft, cycle) {
+                                ok = false;
+                                break;
+                            }
                         }
+                        ok
                     }
-                    ok
                 }
+                _ => false,
             }
-            _ => false,
-        };
-        self.cycle_inprog.remove(&ik);
-        if !cyc_leave(my_depth) {
-            self.unpin_cache.insert(t, r);
-        }
-        r
+        })
     }
 
     /// The program's `#[global_allocator]` static and its type (rustc_metadata creader
@@ -4876,85 +4898,79 @@ impl Unit {
     }
 
     /// Whether dropping a `t` can unwind: some Drop impl in it outside Relax's std (core /
-    /// alloc / std), or a trait object (its vtable's drop is unknown). std's Drop impls only
-    /// free memory and drop the values they own (their type arguments): a Vec<String> drop
+    /// alloc / std), or a trait object (its vtable's drop is unknown). std's Drop impls are
+    /// approximated as freeing memory and dropping their type arguments: a Vec<String> drop
     /// cannot unwind, a Vec<UserType> drop can if UserType's Drop is user code. A drop that
     /// cannot unwind is a plain call (no cleanup pad behind it).
     pub fn drop_may_unwind(&self, t: TyId) -> bool {
+        self.drop_may_unwind_inner(t, &mut TypeCycle::default())
+    }
+
+    fn drop_may_unwind_inner(&self, t: TyId, cycle: &mut TypeCycle) -> bool {
         let t = self.tcx.tys.erase_regions(t);
-        if let Some(b) = self.unwind_drop_cache.get(&t) {
-            return b;
-        }
-        if !self.tcx.needs_drop(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), t) {
-            return false;
-        }
-        // recursive types: assume no while computing (a cycle only goes through pointers); answers
-        // below such a cut are not memoized (cyc_leave)
-        let ik = (1u8, t, crate::conc::thread_id());
-        if self.cycle_inprog.contains(&ik) {
-            cyc_cut(1, t);
-            return false;
-        }
-        self.cycle_inprog.insert(ik, ());
-        let my_depth = cyc_enter(1, t);
-        let k = self.tcx.tys.kind(t).clone();
-        let r = match k {
-            TyKind::Adt(d, args, _) => {
-                let imp = self.tcx.adt_destructor(d).map(|dtor| self.prog.def(dtor.did).parent);
-                let user_impl = match imp {
-                    Some(i) if i != crate::program::NO_DEF => {
-                        let kr = self.prog.def(i).krate as usize;
-                        let name = self.prog.syms.str(self.prog.crates[kr].name);
-                        !matches!(name, "core" | "alloc" | "std")
-                    }
-                    Some(_) => true,
-                    None => false,
-                };
-                if user_impl {
-                    true
-                } else {
-                    let mut any = false;
-                    if imp.is_some() {
-                        // a std Drop impl drops what its type arguments own
-                        for a in self.tcx.tys.list(args.clone()).iter().copied() {
-                            if self.drop_may_unwind(a) {
-                                any = true;
+        cycle.query(t, &self.unwind_drop_cache, false, |cycle| {
+            // rustc_middle/src/ty/util.rs: Ty::needs_drop / needs_drop_components;
+            // rustc_mir_transform/src/shim.rs: build_drop_shim keeps unwind edges for
+            // destructor calls and field drops. Std destructor bodies are approximated below.
+            if !self.tcx.needs_drop(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), t) {
+                return false;
+            }
+            let k = self.tcx.tys.kind(t).clone();
+            match k {
+                TyKind::Adt(d, args, _) => {
+                    let imp = self.tcx.adt_destructor(d).map(|dtor| self.prog.def(dtor.did).parent);
+                    let user_impl = match imp {
+                        Some(i) if i != crate::program::NO_DEF => {
+                            let kr = self.prog.def(i).krate as usize;
+                            let name = self.prog.syms.str(self.prog.crates[kr].name);
+                            !matches!(name, "core" | "alloc" | "std")
+                        }
+                        Some(_) => true,
+                        None => false,
+                    };
+                    if user_impl {
+                        true
+                    } else {
+                        let mut any = false;
+                        if imp.is_some() {
+                            // Approximate std Drop through owned type arguments. This misses
+                            // callbacks: library/alloc/src/io/buffered/bufwriter.rs,
+                            // BufWriter::drop / flush_buf can unwind in Write::write.
+                            for a in self.tcx.tys.list(args.clone()).iter().copied() {
+                                if self.drop_may_unwind_inner(a, cycle) {
+                                    any = true;
+                                }
                             }
                         }
-                    }
-                    if let Some(adt) = self.tcx.adts.get(&d) {
-                        if !adt.is_union {
-                            for (vi, v) in adt.variants.iter().enumerate() {
-                                for fi in 0..v.fields.len() {
-                                    let ft = self.tcx.field_ty(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), d, vi as u32, fi as u32, self.tcx.tys.list(args));
-                                    if self.drop_may_unwind(ft) {
-                                        any = true;
+                        if let Some(adt) = self.tcx.adts.get(&d) {
+                            if !adt.is_union {
+                                for (vi, v) in adt.variants.iter().enumerate() {
+                                    for fi in 0..v.fields.len() {
+                                        let ft = self.tcx.field_ty(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), d, vi as u32, fi as u32, self.tcx.tys.list(args));
+                                        if self.drop_may_unwind_inner(ft, cycle) {
+                                            any = true;
+                                        }
                                     }
                                 }
                             }
                         }
+                        any
+                    }
+                }
+                TyKind::Tuple(v) => {
+                    let mut any = false;
+                    for x in self.tcx.tys.list(v).iter().copied() {
+                        if self.drop_may_unwind_inner(x, cycle) {
+                            any = true;
+                        }
                     }
                     any
                 }
+                TyKind::Array(e, n) => n.try_to_target_usize(&self.tcx.tys) != Some(0) && self.drop_may_unwind_inner(e, cycle),
+                TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) => self.drop_may_unwind_inner(up, cycle),
+                _ => true,
             }
-            TyKind::Tuple(v) => {
-                let mut any = false;
-                for x in self.tcx.tys.list(v).iter().copied() {
-                    if self.drop_may_unwind(x) {
-                        any = true;
-                    }
-                }
-                any
-            }
-            TyKind::Array(e, n) => n.try_to_target_usize(&self.tcx.tys) != Some(0) && self.drop_may_unwind(e),
-            TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) => self.drop_may_unwind(up),
-            _ => true,
-        };
-        self.cycle_inprog.remove(&ik);
-        if !cyc_leave(my_depth) {
-            self.unwind_drop_cache.insert(t, r);
-        }
-        r
+        })
     }
 
     /// The function of a closure type (its body is lowered from the owner instance's).
@@ -10189,8 +10205,6 @@ pub(crate) struct Frame {
     o2_snapshot: bool,
     o3_first: bool,
     o3_first_at: u64,
-    cyc_at: Vec<(u8, TyId)>,
-    cyc_cut: usize,
     missing: (Vec<(u32, String)>, usize),
     rec: *const std::cell::Cell<Option<MainCompile>>,
     tainted: bool,
@@ -10224,8 +10238,6 @@ pub(crate) fn frame_enter(rec: *const ()) -> Frame {
         o2_snapshot: O2_SNAPSHOT.with(|c| c.replace(false)),
         o3_first: O3_FIRST.with(|c| c.replace(false)),
         o3_first_at: O3_FIRST_AT.with(|c| c.replace(0)),
-        cyc_at: CYC_AT.with(|m| std::mem::take(&mut *m.borrow_mut())),
-        cyc_cut: CYC_CUT.with(|c| c.replace(usize::MAX)),
         missing: crate::program::missing_save(),
         rec: MAIN_REC_AT.with(|r| r.replace(rec as *const std::cell::Cell<Option<MainCompile>>)),
         tainted: TAINTED.with(|t| t.replace(false)),
@@ -10257,8 +10269,6 @@ pub(crate) fn frame_leave(f: Frame) -> bool {
     O2_SNAPSHOT.with(|c| c.set(f.o2_snapshot));
     O3_FIRST.with(|c| c.set(f.o3_first));
     O3_FIRST_AT.with(|c| c.set(f.o3_first_at));
-    CYC_AT.with(|m| *m.borrow_mut() = f.cyc_at);
-    CYC_CUT.with(|c| c.set(f.cyc_cut));
     crate::program::missing_restore(f.missing);
     MAIN_REC_AT.with(|r| r.set(f.rec));
     // what a tainted request built is not kept for others to inline

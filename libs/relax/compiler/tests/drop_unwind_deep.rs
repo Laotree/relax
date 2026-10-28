@@ -1,0 +1,110 @@
+// Shared recursive successors used to be walked again below every cycle cut.
+// Keep Drop on the payload: Drop on each node would stop drop_may_unwind at the root.
+// rustc_mir_transform/src/shim.rs: build_drop_shim; elaborate_drop.rs: open_drop_for_adt
+// drops owned fields on both the normal and unwind paths.
+use std::cell::Cell;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
+macro_rules! node {
+    ($name:ident, $next:ident, $other:ident) => {
+        enum $name<T> {
+            End,
+            Link {
+                _next: Box<$next<T>>,
+                _other: Vec<$other<T>>,
+                _back: Option<Box<N00<T>>>,
+                _value: T,
+            },
+        }
+        impl<T> $name<T> {
+            fn chain<F: FnMut() -> T>(depth: usize, make: &mut F) -> Self {
+                if depth == 0 { return Self::End; }
+                Self::Link {
+                    _next: Box::new($next::chain(depth - 1, make)),
+                    _other: Vec::new(),
+                    _back: None,
+                    _value: make(),
+                }
+            }
+        }
+    };
+}
+
+node!(N00, N01, N02);
+node!(N01, N02, N03);
+node!(N02, N03, N04);
+node!(N03, N04, N05);
+node!(N04, N05, N06);
+node!(N05, N06, N07);
+node!(N06, N07, N08);
+node!(N07, N08, N09);
+node!(N08, N09, N10);
+node!(N09, N10, N11);
+node!(N10, N11, N12);
+node!(N11, N12, N13);
+node!(N12, N13, N14);
+node!(N13, N14, N15);
+node!(N14, N15, N16);
+node!(N15, N16, N17);
+node!(N16, N17, N18);
+node!(N17, N18, N19);
+node!(N18, N19, N20);
+node!(N19, N20, N21);
+node!(N20, N21, N22);
+node!(N21, N22, N23);
+node!(N22, N23, N24);
+node!(N23, N24, N25);
+node!(N24, N25, N26);
+node!(N25, N26, N27);
+node!(N26, N27, N28);
+node!(N27, N28, N29);
+node!(N28, N29, N00);
+node!(N29, N00, N01);
+
+struct Count<'a>(&'a Cell<usize>, bool);
+impl Drop for Count<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+        if self.1 { panic!("recursive drop"); }
+    }
+}
+
+#[test]
+fn recursive_without_unwinding() {
+    // An entire SCC with no unwinding payload still needs Box/Vec drop glue.
+    let mut make = || ();
+    drop(N00::chain(30, &mut make));
+    drop(N15::chain(30, &mut make));
+    println!("| recursive no unwind");
+}
+
+#[test]
+fn recursive_drop_counts_and_unwinds() {
+    let drops = Cell::new(0);
+    let mut make = || Count(&drops, false);
+    drop(N00::chain(30, &mut make));
+    assert_eq!(drops.get(), 30);
+    drop(N00::Link {
+        _next: Box::new(N01::chain(3, &mut make)),
+        _other: vec![N02::chain(3, &mut make)],
+        _back: Some(Box::new(N00::chain(3, &mut make))),
+        _value: make(),
+    });
+    assert_eq!(drops.get(), 40);
+
+    // Query another member after the root. Its provisional false must not escape
+    // into the cache: a panic in the deepest payload also drops every ancestor.
+    let mut first = true;
+    let mut make = || {
+        let panic = first;
+        first = false;
+        Count(&drops, panic)
+    };
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let _guard = Count(&drops, false);
+        drop(N15::chain(30, &mut make));
+    }));
+    assert!(result.is_err());
+    assert_eq!(drops.get(), 71);
+    println!("| recursive drops {}", drops.get());
+}
