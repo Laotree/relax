@@ -772,7 +772,7 @@ struct Scanned {
 }
 
 /// The bindings of a `use` tree in tokens `lo..hi` (after `use`, before `;`) under `prefix`.
-fn use_tree(text: &dyn Fn(usize) -> String, toks: &[Tok], lo: usize, hi: usize, prefix: &[String], module: &str, is_pub: bool, out: &mut Vec<crate::macros::UseItem>) {
+pub(crate) fn use_tree(text: &dyn Fn(usize) -> String, toks: &[Tok], lo: usize, hi: usize, prefix: &[String], module: &str, is_pub: bool, out: &mut Vec<crate::macros::UseItem>) {
     let mut path: Vec<String> = prefix.to_vec();
     let mut i = lo;
     if i < hi && toks[i].kind == T::PathSep && prefix.is_empty() {

@@ -1506,6 +1506,55 @@ impl MacroScope {
         self.resolve(names.id(name), names.id(cur), &path, names.id(module), true)
     }
 
+    /// An explicit binding, or an attribute exported through a glob. The outer Option keeps
+    /// an explicit import of the builtin from falling through to an outer scope's proc macro.
+    pub(crate) fn attr_import(&self, cur: &str, module: &str, uses: &[UseItem], name: &str) -> Option<Option<crate::macro_reg::Entry>> {
+        let mut seen = crate::fxhash::HashSet::default();
+        if let Some(u) = uses.iter().find(|u| u.bind.as_deref() == Some(name)) {
+            return Some(self.attr_path(cur, module, &u.path, &mut seen));
+        }
+        for u in uses.iter().filter(|u| u.bind.is_none()) {
+            let mut path = u.path.clone();
+            path.push(name.into());
+            if let Some(e) = self.attr_path(cur, module, &path, &mut seen) { return Some(Some(e)); }
+        }
+        None
+    }
+
+    fn attr_path(&self, cur: &str, module: &str, path: &[String], seen: &mut crate::fxhash::HashSet<(String, String, String)>) -> Option<crate::macro_reg::Entry> {
+        let (name, prefix) = path.split_last()?;
+        let r = Res { table: &self.table };
+        let (k, m) = if prefix.is_empty() { (cur, module) } else { r.resolve_mod(cur, module, prefix)? };
+        self.attr_in(k, m, name, k != cur, seen)
+    }
+
+    fn attr_in(&self, k: &str, m: &str, name: &str, public: bool, seen: &mut crate::fxhash::HashSet<(String, String, String)>) -> Option<crate::macro_reg::Entry> {
+        if !seen.insert((k.into(), m.into(), name.into())) { return None; }
+        let r = Res { table: &self.table };
+        if r.crate_root(k).1 == m {
+            if let Some(e) = crate::macro_reg::exported_attr(krate_name(k), name) { return Some(e); }
+        }
+        let uses = self.table.crates.get(k)?.uses.get(m)?;
+        if let Some(u) = uses.iter().find(|u| (!public || u.is_pub) && u.bind.as_deref() == Some(name)) {
+            return self.attr_path(k, m, &u.path, seen);
+        }
+        for u in uses.iter().filter(|u| (!public || u.is_pub) && u.bind.is_none()) {
+            let mut path = u.path.clone();
+            path.push(name.into());
+            if let Some(e) = self.attr_path(k, m, &path, seen) { return Some(e); }
+        }
+        None
+    }
+
+    pub(crate) fn attr_macro_use(&self, cur: &str, name: &str) -> Option<crate::macro_reg::Entry> {
+        let r = Res { table: &self.table };
+        for dep in self.table.macro_use.get(cur)?.iter().rev() {
+            let Some((k, m)) = r.extern_crate(cur, dep) else { continue };
+            if let Some(e) = self.attr_in(k, m, name, true, &mut Default::default()) { return Some(e); }
+        }
+        None
+    }
+
     pub fn finish(self) -> MacroUse {
         let names = self.table.names.clone();
         let uses = std::sync::Arc::unwrap_or_clone(self.local_uses.into_inner()).bindings.into_iter()
@@ -2524,6 +2573,7 @@ impl<'a> Parser<'a> {
                 // fragment took is its source span (rustc_parse break_and_eat / break_last_token)
                 let ok = r.is_ok() && e <= end && e > i;
                 let mut taken = None;
+                let mut split = None;
                 while self.tok_undo.len() > undo {
                     let (k, t) = self.tok_undo.pop().unwrap();
                     if !ok || (k as usize) < e {
@@ -2531,8 +2581,11 @@ impl<'a> Parser<'a> {
                     } else if k as usize == e {
                         // the earliest entry holds the unsplit token
                         taken = Some((t.lo, self.toks.at(e).lo));
+                        split = Some((k, t));
                     }
                 }
+                // Keep the remainder for this matcher, but restore it if the arm fails.
+                if let Some(s) = split { self.tok_undo.push(s); }
                 if ok { Some((e, taken, bare)) } else { None }
             }
         }
@@ -2550,6 +2603,20 @@ impl<'a> Parser<'a> {
     }
 
     fn match_seq(&mut self, nodes: &[MNode], i: &mut usize, end: usize, binds: &mut HashMap<String, Bind>) -> bool {
+        let undo = self.tok_undo.len();
+        let matched = self.match_seq_inner(nodes, i, end, binds);
+        if !matched { self.restore_match_tokens(undo); }
+        matched
+    }
+
+    fn restore_match_tokens(&mut self, undo: usize) {
+        while self.tok_undo.len() > undo {
+            let (k, t) = self.tok_undo.pop().unwrap();
+            self.toks.edit(k as usize, |x| *x = t);
+        }
+    }
+
+    fn match_seq_inner(&mut self, nodes: &[MNode], i: &mut usize, end: usize, binds: &mut HashMap<String, Bind>) -> bool {
         for n in nodes {
             match n {
                 MNode::Tok(m) => {
@@ -2782,6 +2849,9 @@ impl<'a> Parser<'a> {
         for (arm, (matcher, body)) in def.arms.iter().enumerate() {
             let mut binds = HashMap::default();
             let mut i = lo;
+            // rustc_expand mbe/macro_rules.rs: try_match_macro starts each arm with
+            // a fresh parser. A failed arm must not leave grammar-split tokens behind.
+            let undo = self.tok_undo.len();
             if self.match_seq(matcher, &mut i, hi, &mut binds) && i == hi {
                 uses::used(def, arm as u32);
                 // `$crate` names the defining crate by identity (rustc: the `$crate` token keeps the
@@ -2792,10 +2862,13 @@ impl<'a> Parser<'a> {
                 // name the crate expanding that macro.
                 let krate_path = format!("::__relax_crate_{}", def.krate);
                 let mut out = Transcript { edition: self.edition, ..Default::default() };
-                self.transcribe(body, &binds, &mut Vec::new(), &krate_path, &mut out)?;
+                let result = self.transcribe(body, &binds, &mut Vec::new(), &krate_path, &mut out);
+                self.restore_match_tokens(undo);
+                result?;
                 out.s.push(' ');
                 return Ok((out.s, out.toks, out.origins, out.bodies, out.groups));
             }
+            self.restore_match_tokens(undo);
         }
         Err(format!("no rule of `{}!` matches these arguments -- check the macro's patterns", def.name))
     }

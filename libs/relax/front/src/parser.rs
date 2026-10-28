@@ -113,7 +113,7 @@ pub struct Parser<'a> {
     /// macro_rules body tokens -> their position in the definition: (expansion position,
     /// definition position, length), ascending
     pub body_origin: OSeg<'a, Maps>,
-    /// tokens split by `eat_gt` (`>>` -> `>`), with their old value
+    /// compound tokens split by the grammar, with their old value
     pub tok_undo: Vec<(u32, Tok)>,
     /// opaque macro fragments a transcription forwarded (start of the first token -> end of the
     /// last): a `$t:tt` matches one whole (rustc's interpolated nonterminal tokens)
@@ -497,31 +497,31 @@ impl<'a> Parser<'a> {
         matches!(self.kind(), T::Ident | T::RawIdent)
     }
 
-    /// Split a compound token so its first char is consumed: `>>` -> `>` etc.
+    // rustc_parse parser/mod.rs: Parser::break_and_eat; rustc_ast token.rs:
+    // TokenKind::break_two_token_op. Speculative fragment parses restore every split.
+    fn break_and_eat(&mut self, expected: T) -> bool {
+        if self.eat(expected) { return true; }
+        let rest = match (expected, self.kind()) {
+            (T::Lt, T::Shl) => T::Lt,
+            (T::Lt, T::Le) => T::Eq,
+            (T::Lt, T::ShlEq) => T::Le,
+            (T::Lt, T::LArrow) => T::Minus,
+            (T::Gt, T::Shr) => T::Gt,
+            (T::Gt, T::Ge) => T::Eq,
+            (T::Gt, T::ShrEq) => T::Ge,
+            (T::And, T::AndAnd) => T::And,
+            (T::And, T::AndEq) => T::Eq,
+            (T::Or, T::OrOr) => T::Or,
+            (T::Or, T::OrEq) => T::Eq,
+            (T::Plus, T::PlusEq) => T::Eq,
+            _ => return false,
+        };
+        self.tok_undo.push((self.pos as u32, self.toks.at(self.pos)));
+        self.toks.edit(self.pos, |t| { t.kind = rest; t.lo += 1; });
+        true
+    }
     fn eat_gt(&mut self) -> bool {
-        if matches!(self.kind(), T::Shr | T::Ge | T::ShrEq) {
-            // a speculative parse (macro fragment matching) restores the split tokens
-            self.tok_undo.push((self.pos as u32, self.toks.at(self.pos)));
-        }
-        match self.kind() {
-            T::Gt => {
-                self.pos += 1;
-                true
-            }
-            T::Shr => {
-                self.toks.edit(self.pos, |t| { t.kind = T::Gt; t.lo += 1; });
-                true
-            }
-            T::Ge => {
-                self.toks.edit(self.pos, |t| { t.kind = T::Eq; t.lo += 1; });
-                true
-            }
-            T::ShrEq => {
-                self.toks.edit(self.pos, |t| { t.kind = T::Ge; t.lo += 1; });
-                true
-            }
-            _ => false,
-        }
+        self.break_and_eat(T::Gt)
     }
     fn expect_gt(&mut self) -> PResult<()> {
         if self.eat_gt() {
@@ -531,56 +531,13 @@ impl<'a> Parser<'a> {
         }
     }
     fn eat_lt(&mut self) -> bool {
-        match self.kind() {
-            T::Lt => {
-                self.pos += 1;
-                true
-            }
-            T::Shl => {
-                self.toks.edit(self.pos, |t| { t.kind = T::Lt; t.lo += 1; });
-                true
-            }
-            T::Le => {
-                self.toks.edit(self.pos, |t| { t.kind = T::Eq; t.lo += 1; });
-                true
-            }
-            T::ShlEq => {
-                self.toks.edit(self.pos, |t| { t.kind = T::Le; t.lo += 1; });
-                true
-            }
-            // rustc_parse break_and_eat: `<-` splits into `<` `-` (`f::<-1>()`)
-            T::LArrow => {
-                self.toks.edit(self.pos, |t| { t.kind = T::Minus; t.lo += 1; });
-                true
-            }
-            _ => false,
-        }
+        self.break_and_eat(T::Lt)
     }
     fn eat_amp(&mut self) -> bool {
-        match self.kind() {
-            T::And => {
-                self.pos += 1;
-                true
-            }
-            T::AndAnd => {
-                self.toks.edit(self.pos, |t| { t.kind = T::And; t.lo += 1; });
-                true
-            }
-            _ => false,
-        }
+        self.break_and_eat(T::And)
     }
     fn eat_or(&mut self) -> bool {
-        match self.kind() {
-            T::Or => {
-                self.pos += 1;
-                true
-            }
-            T::OrOr => {
-                self.toks.edit(self.pos, |t| { t.kind = T::Or; t.lo += 1; });
-                true
-            }
-            _ => false,
-        }
+        self.break_and_eat(T::Or)
     }
 
     // ------------------------------------------------------------ arenas
@@ -2170,9 +2127,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// A `$s:stmt` fragment (no trailing `;` required).
+    /// rustc_parse parser/stmt.rs: parse_stmt_nonterminal/parse_stmt_without_recovery:
+    /// leave a let/expression's trailing `;`; a lone `;` is StmtKind::Empty.
     pub fn stmt_fragment(&mut self) -> PResult<()> {
         let attrs = self.outer_attrs()?;
+        if self.eat(T::Semi) {
+            if !attrs.is_empty() { return self.err("attributes without statement"); }
+            return Ok(());
+        }
         if self.kind() == T::KwLet {
             self.pos += 1;
             self.pat_top()?;
@@ -2264,10 +2226,10 @@ impl<'a> Parser<'a> {
             // an attribute macro (`#[proc_macro_attribute]` of the graph) replaces the item with
             // its output: the item is parsed for its extent only (no expansion), then dropped
             if !attrs.is_empty() && self.macros.is_some() && self.cfg_out == 0 {
-                if let Some(k) = crate::builtins::attr_macro_at(self, &attrs) {
+                if let Some((k, entry)) = crate::builtins::attr_macro_at(self, &attrs) {
                     let attr = attrs[k].clone();
                     self.parse_cfg_out(attrs)?;
-                    let x = crate::builtins::expand_attr_macro(self, &attr, item_tok, self.pos).map_err(|(pos, msg)| PErr { pos, msg })?;
+                    let x = crate::builtins::expand_attr_macro(self, &attr, &entry, item_tok, self.pos).map_err(|(pos, msg)| PErr { pos, msg })?;
                     self.append_origins(&x, self.toks.at(item_tok).lo);
                     let start = self.expand_toks(&x.text, &x.toks, self.toks.at(item_tok).lo);
                     let v = self.in_expansion(start, |p| p.items_until(T::Eof))?;
@@ -3481,18 +3443,7 @@ impl<'a> Parser<'a> {
 
     /// `+`, or the `+` of a `+=` (`<T: Clone += ()>`: a trailing bound `+` before a default's `=`).
     fn eat_plus(&mut self) -> bool {
-        match self.kind() {
-            T::Plus => {
-                self.pos += 1;
-                true
-            }
-            T::PlusEq => {
-                self.tok_undo.push((self.pos as u32, self.toks.at(self.pos)));
-                self.toks.edit(self.pos, |t| { t.kind = T::Eq; t.lo += 1; });
-                true
-            }
-            _ => false,
-        }
+        self.break_and_eat(T::Plus)
     }
 
     fn bounds(&mut self) -> PResult<List<Bound>> {
@@ -3651,9 +3602,10 @@ impl<'a> Parser<'a> {
                     GenericArg::Constraint(name, GenericArgsId::NONE, self.bounds()?)
                 }
                 // `Item<'a> = T` / `Item<'a>: Bound`; a path segment's `::<` form too
-                // (rustc parse_angle_arg reads a type, then reinterprets a one-segment path
+                // (rustc_parse parser/path.rs: parse_angle_arg reads a type, then reinterprets a one-segment path
                 // before `=` / `:` as the associated item with its generic arguments)
-                T::Ident | T::RawIdent if (self.nth(1) == T::Lt || (self.nth(1) == T::PathSep && self.nth(2) == T::Lt)) && self.gat_binding_ahead() => {
+                T::Ident | T::RawIdent if (matches!(self.nth(1), T::Lt | T::Shl | T::LArrow)
+                    || (self.nth(1) == T::PathSep && matches!(self.nth(2), T::Lt | T::Shl | T::LArrow))) && self.gat_binding_ahead() => {
                     let name = self.ident_tok()?;
                     self.eat(T::PathSep);
                     let ga = self.generic_args_angle()?;
@@ -3696,12 +3648,15 @@ impl<'a> Parser<'a> {
         let mut depth = 0i32;
         loop {
             match self.toks.kind_at(i) {
-                T::Lt => depth += 1,
+                T::Lt | T::LArrow => depth += 1,
                 T::Shl => depth += 2,
                 T::Gt => depth -= 1,
                 T::Shr => depth -= 2,
                 // `Item<'a>=T`: the `>=` closes the arguments and is the binding's `=`
                 T::Ge if depth == 1 => return true,
+                T::ShrEq if depth == 2 => return true,
+                T::Ge => depth -= 1,
+                T::ShrEq => depth -= 2,
                 T::Eof | T::Semi => return false,
                 // a const argument block `{ .. }`: skip to its end
                 T::OpenBrace => {
@@ -4303,6 +4258,20 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::Empty);
         }
         if active && !self.pending_shape.is_empty() { self.check_pending_attrs()?; }
+        if active && self.at_item_start() && self.macros.is_some() && self.cfg_out == 0 {
+            if let Some((k, entry)) = crate::builtins::attr_macro_at(self, &attrs) {
+                let attr = attrs[k].clone();
+                self.parse_cfg_out(attrs)?;
+                let x = crate::builtins::expand_attr_macro(self, &attr, &entry, item_tok, self.pos).map_err(|(pos, msg)| PErr { pos, msg })?;
+                self.append_origins(&x, self.toks.at(item_tok).lo);
+                let start = self.expand_toks(&x.text, &x.toks, self.toks.at(item_tok).lo);
+                let outer = std::mem::take(&mut self.extra_items);
+                let items = self.in_expansion(start, |p| p.items_until(T::Eof));
+                self.extra_items = outer;
+                self.extra_items.extend(items?);
+                return Ok(Stmt::Empty);
+            }
+        }
         let s = self.with_cfg_active(active, pend0, |p| p.stmt_after_attrs(attrs.clone(), item_tok))?;
         if matches!(s, Stmt::Item(_)) {
             if !active {

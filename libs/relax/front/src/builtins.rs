@@ -1764,15 +1764,15 @@ fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo:
 }
 
 /// The attribute macro on an item (`attrs`, as parsed): the index of the first attribute naming
-/// a registered `#[proc_macro_attribute]` (last path segment) that is not a helper attribute of
+/// a registered `#[proc_macro_attribute]` and its entry, excluding a helper attribute of
 /// one of the item's derives (rustc: an attribute in scope as both would be ambiguous; makepad's
 /// derives own many plain names). Only attributes written as `#[..]` (not cfg_attr output).
-pub fn attr_macro_at(p: &crate::parser::Parser, attrs: &[crate::ast::Attr]) -> Option<usize> {
+pub fn attr_macro_at(p: &crate::parser::Parser, attrs: &[crate::ast::Attr]) -> Option<(usize, crate::macro_reg::Entry)> {
     let buf = Buf { src: p.src, ext: p.ext.view() };
     let toks = &p.toks;
     let text = |i: usize| std::str::from_utf8(buf.get(toks.at(i).lo, toks.at(i).hi)).unwrap_or("").trim_start_matches("r#").to_string();
     let mut derives: Vec<String> = Vec::new();
-    let mut cand: Option<(usize, String)> = None;
+    let mut cand = None;
     for (k, a) in attrs.iter().enumerate() {
         let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
         if hi <= lo || hi > toks.len() {
@@ -1807,15 +1807,89 @@ pub fn attr_macro_at(p: &crate::parser::Parser, attrs: &[crate::ast::Attr]) -> O
         if last == "relax" && (relax_level_toks(&text, toks, i, hi).is_some() || relax_keep_toks(&text, toks, i, hi)) {
             continue;
         }
-        if !last.is_empty() && crate::macro_reg::has_attr_for(&p.krate, &last) {
-            cand = Some((k, last));
+        let entry = if i == lo + 1 && matches!(last.as_str(), "test" | "bench" | "test_case") {
+            test_attr_entry(p, lo, &last)
+        } else {
+            crate::macro_reg::attr_entry_for(&p.krate, &last)
+        };
+        if let Some(entry) = entry {
+            cand = Some((k, last, entry));
         }
     }
-    let (k, name) = cand?;
+    let (k, name, entry) = cand?;
     if crate::macro_reg::is_derive_helper(&name, &derives) {
         return None;
     }
-    Some(k)
+    Some((k, entry))
+}
+
+/// compiler/rustc_resolve/src/ident.rs `visit_scopes` / `hygienic_lexical_parent`:
+/// module/block imports, then macro_use, then the std prelude. library/core/src/macros/mod.rs
+/// defines test, bench and test_case as builtins; library/core/src/prelude/v1.rs exports them.
+fn test_attr_entry(p: &crate::parser::Parser, mut at: usize, name: &str) -> Option<crate::macro_reg::Entry> {
+    if crate::macro_reg::in_world() { return None; }
+    let scope = p.macros.as_ref()?;
+    let module = p.cur_module();
+    // The prescan's CrateMods flattens block imports into modules. Scan the enclosing
+    // ranges instead, including later uses (Reference names/scopes.md: item scopes),
+    // skipping sibling blocks/modules and stopping at the nearest module boundary.
+    let mut ranges = Vec::new();
+    loop {
+        let start = (0..at).rev().find(|&i| p.toks.at(i).kind == T::Eof).map_or(0, |i| i + 1);
+        let end = (at..p.toks.len()).find(|&i| p.toks.at(i).kind == T::Eof).unwrap_or(p.toks.len());
+        let mut local = vec![(start, end)];
+        let mut module_boundary = false;
+        let mut i = start;
+        while i < at {
+            if matches!(p.toks.at(i).kind, T::OpenBrace | T::OpenParen | T::OpenBracket) {
+                let close = p.tok_close_of(i, end)?;
+                if close >= at && p.toks.at(i).kind == T::OpenBrace {
+                    if i >= 2 && p.toks.at(i - 2).kind == T::KwMod {
+                        local.clear();
+                        module_boundary = true;
+                    }
+                    local.push((i + 1, close));
+                    i += 1;
+                } else {
+                    i = close + 1;
+                }
+            } else { i += 1; }
+        }
+        ranges.extend(local.into_iter().rev());
+        if module_boundary { break; }
+        // Expansion tokens are appended after EOF; their outer scopes are at the call.
+        let pos = p.toks.at(at).lo;
+        let Some((_, (lo, hi, call))) = p.exp_map.floor(pos) else { break };
+        if pos < lo || pos >= hi { break; }
+        let Some(call_at) = (0..start).rev().find(|&i| p.toks.at(i).lo <= call && call < p.toks.at(i).hi) else { break };
+        at = call_at;
+    }
+    let view = crate::parser::lazy_bodies::TokView::new(p.src, &p.toks, &p.ext);
+    for (start, end) in ranges {
+        let mut uses = Vec::new();
+        let mut i = start;
+        while i < end {
+            match p.toks.at(i).kind {
+                T::KwUse => {
+                    let stop = (i + 1..end).find(|&j| p.toks.at(j).kind == T::Semi)?;
+                    let active = p.bctx.as_ref().map_or(true, |ctx| {
+                        let attrs = crate::cfg::attrs_before(view.src(), i, &ctx.cfg);
+                        crate::cfg::active(view.src(), &attrs, &ctx.cfg)
+                    });
+                    if active {
+                        let toks = p.toks.range(i + 1, stop);
+                        let text = |k: usize| String::from_utf8_lossy(p.tok_text(toks[k])).trim_start_matches("r#").to_string();
+                        crate::preload::use_tree(&text, &toks, 0, toks.len(), &[], &module, false, &mut uses);
+                    }
+                    i = stop + 1;
+                }
+                T::OpenBrace | T::OpenParen | T::OpenBracket => i = p.tok_close_of(i, end)? + 1,
+                _ => i += 1,
+            }
+        }
+        if let Some(entry) = scope.attr_import(&p.krate, &module, &uses, name) { return entry; }
+    }
+    scope.attr_macro_use(&p.krate, name)
 }
 
 /// Optimisation level of a `relax(..)` attribute's arguments at tokens [i, hi) (i at the `(`):
@@ -1842,7 +1916,7 @@ pub fn relax_keep_toks(text: &dyn Fn(usize) -> String, toks: &(impl TokSeq + ?Si
 /// attributes included, that one removed): its output replaces the item. The arguments are the
 /// tokens of the attribute's delimited group after the path (none for a bare `#[name]`). A
 /// failed expansion leaves a `compile_error!` item and is a reported failure (derive_failed).
-pub fn expand_attr_macro(p: &crate::parser::Parser, attr: &crate::ast::Attr, lo: usize, hi: usize) -> Result<Expansion, (u32, String)> {
+pub fn expand_attr_macro(p: &crate::parser::Parser, attr: &crate::ast::Attr, entry: &crate::macro_reg::Entry, lo: usize, hi: usize) -> Result<Expansion, (u32, String)> {
     let _timing = crate::parse_work::time(3);
     let buf = Buf { src: p.src, ext: p.ext.view() };
     let toks = &p.toks;
@@ -1868,8 +1942,8 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attr: &crate::ast::Attr, lo:
     };
     // a pure attribute macro's expansion is a function of the item's tokens and spans
     // (the derive reuse rule; the key covers the attribute, its arguments and the item)
-    let key = if crate::macro_reg::reusable_attr(&name) {
-        crate::parse_work::key_tokens(p, &format!("hosted-attr-{name}"), item_lo, item_hi, lo..hi, item_location(p, item_lo))
+    let key = if crate::macro_reg::reusable_attr(entry) {
+        crate::parse_work::key_tokens(p, &format!("hosted-attr-{}-{}", entry.unit, entry.fname), item_lo, item_hi, lo..hi, item_location(p, item_lo))
     } else { None };
     let reused = crate::parse_work::get(&key);
     // MAKEPAD_RUN_REUSE_VERIFY=1: every reused expansion is recomputed and must be identical.
@@ -1892,7 +1966,7 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attr: &crate::ast::Attr, lo:
     let item_ts = stream(&item, &|a| if a <= before { item_lo + a } else { cut_hi + a - before - 1 })?;
     let call = span_of(item_lo, item_hi);
     let mut out = Expansion { text: String::from(" "), toks: Vec::new(), origins: Vec::new() };
-    match crate::macro_reg::run_attr(p.session, &p.krate, &name, &attr_ts, &item_ts, call) {
+    match crate::macro_reg::run_attr(p.session, &p.krate, entry, &attr_ts, &item_ts, call) {
         Ok(ts) => {
             emit_tokens(&ts.trees, p.edition, &mut out, &mut Vec::new()).map_err(|m| (item_lo, m))?;
             if trace_on("expand:attr") {

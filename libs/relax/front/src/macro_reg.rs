@@ -148,19 +148,22 @@ fn resolve_entry(reg: &mut Reg, krate: &str, name: &str, kind: Kind) -> Option<E
 /// whose closure holds no proc-macro crate, such as std's own crates, has no attribute macros
 /// at all: core's inert `#[unstable]` stays an attribute when the graph holds the
 /// `instability` crate, which exports an attribute macro of that name.
-fn attr_entry_for(krate: &str, name: &str) -> Option<Entry> {
+pub(crate) fn attr_entry_for(krate: &str, name: &str) -> Option<Entry> {
+    if in_world() { return None; }
     REG.with(|r| {
         let mut b = r.borrow_mut();
         resolve_entry(b.as_mut()?, krate, name, Kind::Attr)
     })
 }
 
-/// Is `name` an attribute macro crate `krate` can use (attr_entry_for)?
-pub fn has_attr_for(krate: &str, name: &str) -> bool {
-    if in_world() {
-        return false;
-    }
-    attr_entry_for(krate, name).is_some()
+/// An attribute exported by this crate itself, not by one of its dependencies.
+pub(crate) fn exported_attr(krate: &str, name: &str) -> Option<Entry> {
+    if in_world() { return None; }
+    REG.with(|r| {
+        let r = r.borrow();
+        let r = r.as_ref()?;
+        r.macros.iter().find(|(n, e)| n == name && e.kind == Kind::Attr && r.units[e.unit].name == krate).map(|(_, e)| e.clone())
+    })
 }
 
 /// Boot cost of the host (for the measurements in builtins-lane.md).
@@ -384,11 +387,10 @@ pub fn reusable_derive(name: &str) -> bool {
     pure || entry.as_ref().is_some_and(|e| RUNNER.get().is_some_and(|r| r.reusable(e)))
 }
 
-/// Is attribute macro `name` (as run_attr finds it) a pure token transform (derive rule)?
-pub fn reusable_attr(name: &str) -> bool {
-    let (entry, pure) = REG.with(|r| r.borrow().as_ref().and_then(|r| r.macros.iter().find(|(n, e)| n == name && e.kind == Kind::Attr)
-        .map(|(_, e)| (Some(e.clone()), PURE_DERIVE_UNITS.contains(&r.units[e.unit].name.as_str())))).unwrap_or((None, false)));
-    pure || entry.as_ref().is_some_and(|e| RUNNER.get().is_some_and(|r| r.reusable(e)))
+/// Is the resolved attribute a pure token transform (derive rule)?
+pub fn reusable_attr(entry: &Entry) -> bool {
+    let pure = REG.with(|r| r.borrow().as_ref().is_some_and(|r| PURE_DERIVE_UNITS.contains(&r.units[entry.unit].name.as_str())));
+    pure || RUNNER.get().is_some_and(|r| r.reusable(entry))
 }
 
 /// Runs function-like proc macro `i` (bang_index) on `input` in crate `krate`.
@@ -578,7 +580,11 @@ pub fn outline_native(name: &str, kind: Kind) -> bool {
     let entry = REG.with(|r| r.borrow().as_ref().and_then(|r| {
         r.derives.iter().chain(&r.macros).find(|(n, e)| n == name && e.kind == kind).map(|(_, e)| e.clone())
     }));
-    entry.as_ref().is_some_and(|e| RUNNER.get().is_some_and(|r| if declaring() { r.declaration_surface(e) } else { r.native(e) }))
+    entry.as_ref().is_some_and(outline_native_entry)
+}
+
+pub(crate) fn outline_native_entry(entry: &Entry) -> bool {
+    RUNNER.get().is_some_and(|r| if declaring() { r.declaration_surface(entry) } else { r.native(entry) })
 }
 
 /// The outline can run only source-matched native entries. A source edit can
@@ -607,18 +613,17 @@ pub fn is_derive_helper(name: &str, derives: &[String]) -> bool {
     REG.with(|r| r.borrow().as_ref().map_or(false, |r| r.helpers.iter().any(|(d, hs)| derives.contains(d) && hs.iter().any(|h| h == name))))
 }
 
-/// Runs attribute macro `name`, as crate `krate` sees it (attr_entry_for), on its arguments
+/// Runs the resolved attribute macro, with `krate` as the calling crate, on its arguments
 /// and item (any thread but the world's).
-pub fn run_attr(sess: &std::sync::Arc<crate::Session>, krate: &str, name: &str, attr: &TokenStream, item: &TokenStream, call_span: Span) -> Result<TokenStream, String> {
+pub fn run_attr(sess: &std::sync::Arc<crate::Session>, krate: &str, e: &Entry, attr: &TokenStream, item: &TokenStream, call_span: Span) -> Result<TokenStream, String> {
     if in_world() {
         return Err("an attribute macro used while the macro world itself is being built".to_string());
     }
-    let e = attr_entry_for(krate, name).ok_or("unknown attribute macro")?;
     let _krate = with_call_krate(krate);
     match RUNNER.get() {
-        Some(r) if declaring() => r.declare(sess, &e, Some(attr), item, call_span),
-        Some(r) => r.call_attr(sess, &e, attr, item, call_span),
-        None => Err(no_runner(&e)),
+        Some(r) if declaring() => r.declare(sess, e, Some(attr), item, call_span),
+        Some(r) => r.call_attr(sess, e, attr, item, call_span),
+        None => Err(no_runner(e)),
     }
 }
 
