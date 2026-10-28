@@ -2,7 +2,7 @@
 
 macro_rules! mk_fn {
     ($name:ident = $v:expr) => {
-        pub fn $name() -> u32 { $v + 1 }
+        pub fn $name() -> u32 { $v + 1 } // EDIT mk_fn
     };
 }
 
@@ -54,7 +54,7 @@ pub fn data() -> usize { include_str!("../data.txt").len() }
 
 #[path = "alt.rs"]
 mod alt;
-pub fn alt_val() -> u32 { alt::val() + 1 }
+pub fn alt_val() -> u32 { alt::val() + alt::alt_made() }
 
 // What a code key must see of other items through names (cache/deps.rs): a glob import shadowed by a
 // new item, a method a macro's expansion calls (`write!` -> `write_fmt`), a macro's definition, a trait

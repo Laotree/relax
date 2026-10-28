@@ -1802,9 +1802,9 @@ impl MacroUse {
     pub fn replay_bytes(&self) -> Option<Vec<u8>> {
         if let Some(b) = &self.replay_image { return Some(b.to_vec()); }
         let names = self.names.as_ref()?;
-        let mut strs: Vec<&str> = Vec::new();
+        let mut strs: Vec<String> = Vec::new();
         let mut ix: HashMap<Name, u32> = HashMap::default();
-        let mut id = |n: Name, strs: &mut Vec<&str>| *ix.entry(n).or_insert_with(|| { strs.push(names.str(n)); strs.len() as u32 - 1 });
+        let mut id = |n: Name, strs: &mut Vec<String>| *ix.entry(n).or_insert_with(|| { strs.push(names.str(n).to_string()); strs.len() as u32 - 1 });
         let mut w = Vec::new();
         let put = |w: &mut Vec<u8>, x: u32| w.extend_from_slice(&x.to_le_bytes());
         let put_s = |w: &mut Vec<u8>, s: &str| { w.extend_from_slice(&(s.len() as u32).to_le_bytes()); w.extend_from_slice(s.as_bytes()); };
@@ -1828,7 +1828,7 @@ impl MacroUse {
                 }
             }
         }
-        let mut bindings = |w: &mut Vec<u8>, strs: &mut Vec<&str>, it: &mut dyn Iterator<Item = (&(Name, Name), &Vec<Name>)>, n: usize| {
+        let mut bindings = |w: &mut Vec<u8>, strs: &mut Vec<String>, it: &mut dyn Iterator<Item = (&(Name, Name), &Vec<Name>)>, n: usize| {
             put(w, n as u32);
             for ((m, b), path) in it {
                 put(w, id(*m, strs)); put(w, id(*b, strs));
@@ -1884,7 +1884,7 @@ impl MacroUse {
             };
             looked.push(Looked { name: nm, path, module, nlocal, nuses, got: None, inputs: inputs.clone(), was: Some(was) });
         }
-        let mut bindings = |r: &mut R| -> Option<Vec<((Name, Name), Vec<Name>)>> {
+        let bindings = |r: &mut R| -> Option<Vec<((Name, Name), Vec<Name>)>> {
             let n = r.u32()? as usize;
             if n > bytes.len() { return None; }
             (0..n).map(|_| {

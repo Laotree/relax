@@ -78,6 +78,10 @@ SCENARIOS = {
                      hit=PLAIN, observable=True),
     "own_const_fn": dict(first="app_a", second="app_a", edits=[("app_a/src/main.rs", "const fn own_c(x: u32) -> u32 { x + 4 } // EDIT own_c", "const fn own_c(x: u32) -> u32 { x + 40 } // EDIT own_c")],
                          hit=PLAIN, observable=True),
+    # JITCOLD7: an edited crate's unchanged file takes its earlier image only while its macro lookups replay to the
+    # same rules: the macro's rules change in another file (alt.rs uses mk_fn! of lib.rs)
+    "macro_rules_other_file": dict(first="app_a", second="app_a", edits=[(FW, "pub fn $name() -> u32 { $v + 1 } // EDIT mk_fn", "pub fn $name() -> u32 { $v + 2 } // EDIT mk_fn")],
+                                   hit=["unrelated", "area", "sum_to", "add"], observable=True),
     # an app's own new item: the framework and the app's other fns stay linked
     "own_item": dict(first="app_a", second="app_a", edits=[("app_a/src/main.rs", "fn own_a(x: u32) -> u32 { x * 9 + 2 }", "fn own_a(x: u32) -> u32 { x * 9 + 2 }\nfn own_b() -> u32 { 3 }")],
                      hit=PLAIN + ["own_a", "uses_which", "sink_len"]),

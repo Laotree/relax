@@ -1281,7 +1281,7 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         let plan = demand_plan.as_ref().and_then(|p| p.ready());
         let deferred = plan.map(|p| p.deferred(ci + plan_offset)).unwrap_or_default();
         let plan_id = plan.map_or(0, |p| p.selection_identity(ci + plan_offset));
-        let image = deps.and_then(|d| images.and_then(|i| {
+        let image = deps.as_ref().and_then(|d| images.and_then(|i| {
             let image = i.crate_image_selected(c, &d, plan_id, &deferred);
             if planning { image.or_else(|| i.crate_image(c, &d)) } else { image }
         }));
@@ -1292,6 +1292,9 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         fps[ci] = image.as_ref().map(|i| i.fingerprint);
         let image = if planning { image } else { image.filter(|i| !i.fp_only) };
         previous.push(if image.is_none() { deps.as_ref().and_then(|d| images.and_then(|i| i.previous_files(c, d))) } else { None });
+        if trace() && image.is_none() && images.is_some() {
+            eprintln!("boot-trace: {}: parsed; earlier images: {}", c.name, if deps.is_none() { "dependencies not restored" } else if previous.last().is_some_and(|p| p.is_some()) { "yes" } else { "none" });
+        }
         restored.push(image);
     }
     if let Some(images) = images { images.end_load(); }

@@ -5023,62 +5023,69 @@ impl FrontImages {
     /// scope). The record's late inputs are noted for the crate's next record.
     fn previous_files_of(&self, c: &crate::preload::PreCrate, deps: &[u128]) -> Option<crate::crate_image::PreviousFiles> {
         use crate::crate_image::{decode, FileMeta, Record};
-        let deps = self.full_deps(c, deps)?;
+        let tr = |path: &std::path::Path, why: &str| if crate::preload::trace() { eprintln!("boot-trace: {}: earlier record {} not taken: {}", c.name, path.display(), why); };
+        let Some(deps) = self.full_deps(c, deps) else {
+            tr(&self.dir, "dependency fingerprints");
+            return None;
+        };
         let options = &c.cfg.session.options;
         let mut cfg = c.cfg.set.clone();
         cfg.sort();
         let prefix = format!("{}-", c.name);
-        let mut paths: Vec<_> = crate::store::stores_with_prefix(&self.dir, &prefix).into_iter()
-            .filter(|p| p.file_name().is_some_and(|n| n.len() == prefix.len() + 20))
-            .filter_map(|p| Some((std::fs::metadata(&p).and_then(|m| m.modified()).ok()?, p))).collect();
-        paths.sort_by(|a, b| b.0.cmp(&a.0));
+        let paths: Vec<_> = crate::store::stores_with_prefix(&self.dir, &prefix).into_iter()
+            .filter(|p| p.file_name().is_some_and(|n| n.len() == prefix.len() + 20)).collect();
         let present: HashSet<String> = std::iter::once(c.name.clone()).collect();
-        for (_, path) in paths {
-            let Some(st) = Store::open_unmarked(&path) else { continue };
-            let st = std::sync::Arc::new(st);
+        // every such record's files, the newest record's first (any one at a path and source hash
+        // is the same parse)
+        let mut stores: Vec<_> = paths.iter().filter_map(|p| { let st = Store::open_unmarked(p); if st.is_none() { tr(p, "open"); } st })
+            .map(|st| (st.modified(), std::sync::Arc::new(st))).collect();
+        stores.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut files: HashMap<(String, u128), (FileMeta, std::sync::Arc<Store>, usize)> = HashMap::new();
+        for (_, st) in stores {
+            let path = st.path.clone();
             let Some((KIND_FRONT_CRATE, b)) = st.get(front_crate_key(&c.name, &c.root)) else { continue };
-            let Some(rec) = decode::<Record>(b) else { continue };
+            let Some(rec) = decode::<Record>(b) else { tr(&path, "decode"); continue };
             let same = rec.name == c.name && rec.root == c.root && rec.edition == c.edition && rec.cfg == cfg && rec.proc_macro == c.proc_macro
                 && rec.deps == c.image_dep_names && rec.dep_fps == deps && rec.lazy_auto == crate::parser::lazy_auto()
                 && rec.parse_options == crate::crate_image::parse_options(options) && rec.ahead.complete;
-            if !same || !ledger_current(&st, &present, &mut HashMap::new()) { continue; }
-            let mut files: HashMap<(String, u128), (FileMeta, usize)> = HashMap::new();
+            if !same { tr(&path, "identity"); continue; }
+            if !ledger_current(&st, &present, &mut HashMap::new()) { tr(&path, "late inputs"); continue; }
+            let before = files.len();
             for f in rec.files {
-                if f.replay.0.is_empty() { continue; }
+                if f.replay.0.is_empty() || files.contains_key(&(f.path.clone(), f.hash)) { continue; }
                 let key = Cache::front_key(&f.path, f.hash);
                 let Ok(ix) = st.index.binary_search_by_key(&key, |e| e.key) else { continue };
                 if !matches!(st.get_at(ix, key), Some((KIND_FRONT_REF, _))) { continue; }
-                files.insert((f.path.clone(), f.hash), (f, ix));
+                files.insert((f.path.clone(), f.hash), (f, st.clone(), ix));
             }
-            if files.is_empty() { continue; }
+            if files.len() == before { tr(&path, "no file with replay data"); continue; }
             replay_front_ledger(&st)?;
-            st.mark_used();
-            let sink = self.sink();
-            let files = std::sync::Mutex::new(files);
-            if crate::preload::trace() {
-                eprintln!("boot-trace: {}: parsed, unchanged files' images from {}", c.name, path.display());
-            }
-            return Some(std::sync::Arc::new(move |path: &str, hash: u128, module: &str| {
-                let (mut f, ix) = files.lock().unwrap().remove(&(path.to_string(), hash))?;
-                if f.module != module { return None; }
-                let key = Cache::front_key(&f.path, f.hash);
-                let (loc, img) = front_file_entry(&st, ix, key)?;
-                let mut pf = crate::front::restore(&mut f, img)?;
-                pf.image = Some(loc);
-                pf.sink = sink.clone();
-                if f.prep.idents.iter().any(|&(lo, hi)| lo > hi || hi as usize > pf.src.len()) { return None; }
-                let used = crate::macros::MacroUse::from_replay(f.used.local, f.used.uses, &f.replay.0)?;
-                Some(crate::preload::Preparsed {
-                    error: None,
-                    parsed: Some((pf, used)),
-                    prep: Some(f.prep),
-                    mod_path: f.module,
-                    src_len: f.src_len as usize,
-                    verify: crate::front::verify().then_some(crate::front::verify_file),
-                })
-            }));
+            if crate::preload::trace() { eprintln!("boot-trace: {}: parsed, unchanged files' images from {}", c.name, path.display()); }
         }
-        None
+        if files.is_empty() { return None; }
+        let sink = self.sink();
+        let files = std::sync::Mutex::new(files);
+        Some(std::sync::Arc::new(move |path: &str, hash: u128, module: &str| {
+            let (mut f, st, ix) = files.lock().unwrap().remove(&(path.to_string(), hash))?;
+            if f.module != module { return None; }
+            let key = Cache::front_key(&f.path, f.hash);
+            let (loc, img) = front_file_entry(&st, ix, key)?;
+            let mut pf = crate::front::restore(&mut f, img)?;
+            pf.image = Some(loc);
+            pf.sink = sink.clone();
+            if f.prep.idents.iter().any(|&(lo, hi)| lo > hi || hi as usize > pf.src.len()) { return None; }
+            let used = crate::macros::MacroUse::from_replay(f.used.local, f.used.uses, &f.replay.0)?;
+            // (a store an image is taken from is in use: the cap keeps it)
+            st.mark_used();
+            Some(crate::preload::Preparsed {
+                error: None,
+                parsed: Some((pf, used)),
+                prep: Some(f.prep),
+                mod_path: f.module,
+                src_len: f.src_len as usize,
+                verify: crate::front::verify().then_some(crate::front::verify_file),
+            })
+        }))
     }
 
     /// Crate `c`'s dependency fingerprints in its record's order: `deps` are those of its
@@ -5708,8 +5715,14 @@ impl ColdFront {
         let _profile = crate::load_profile::span(prog.session.runtime.profile, "front-record-enqueue", prog.syms.str(prog.crates[ci].name));
         // a crate loaded from its image (or a collected graph): its store has its record and
         // its files' references
-        if prog.front_ahead.get(ci).is_some_and(|a| a.is_empty()) { return; }
-        let Some(view) = FrontRecordView::new(prog, ci, |k| self.fps.get(k).copied().flatten()) else { return };
+        if prog.front_ahead.get(ci).is_some_and(|a| a.is_empty()) {
+            if crate::preload::trace() { eprintln!("boot-trace: {}: no crate record: loaded from an image", prog.syms.str(prog.crates[ci].name)); }
+            return;
+        }
+        let Some(view) = FrontRecordView::new(prog, ci, |k| self.fps.get(k).copied().flatten()) else {
+            if crate::preload::trace() { eprintln!("boot-trace: {}: no crate record: no view", prog.syms.str(prog.crates[ci].name)); }
+            return;
+        };
         let path = dir.join(front_store_name(&prog.session.options, &view.name, self.fps[ci].unwrap()));
         let late = crate::sip::late_inputs();
         let marks = front_run::run_marks();
@@ -5856,6 +5869,7 @@ fn write_front_record(job: FrontWrite) -> Result<Option<usize>, String> {
         front_record_from(&prog)
     };
     let recorded = rec.is_some();
+    if crate::preload::trace() { eprintln!("boot-trace: {}: crate record {} to {}", name, if recorded { "written" } else { "not written" }, path.display()); }
     if let Some(rec) = rec {
         entries.push(NewEntry { key: front_crate_key(&rec.name, &rec.root), kind: KIND_FRONT_CRATE, payload: crate::crate_image::encode(&rec) });
     }
