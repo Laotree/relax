@@ -6013,13 +6013,19 @@ impl Unit {
         // Restore the initial value into this run's writable storage. The cached
         // object is an immutable snapshot taken immediately after pure CTFE,
         // never the static's later (possibly mutated) contents.
+        let t_trace = static_trace().then(cpu_ns);
         let cached = unsafe { crate::cache::const_value(self.self_ptr.0, d, &[]) };
+        let ctfe_code = self.stats.ctfe_code;
         let ran = cached.is_none().then(|| {
             let pending = PendingInit::arm(d);
             let r = self.run_init(d, Vec::new(), buf);
             pending.disarm();
             r
         });
+        if let Some(t0) = t_trace {
+            let how = if cached.is_some() { "cached" } else if self.stats.ctfe_code != ctfe_code { "code" } else { "ctfe" };
+            eprintln!("static-trace: {} {} {} {:.0} us", how, self.prog.syms.str(self.prog.crates[self.prog.def(d).krate as usize].name), self.prog.def_path(d), (cpu_ns() - t0) as f64 / 1e3);
+        }
         if let Some(initial) = cached {
             unsafe { std::ptr::copy_nonoverlapping(initial as *const u8, buf as *mut u8, l.size as usize); }
         } else if ran.flatten().is_none() {
@@ -24781,4 +24787,10 @@ impl Unit {
             let _ = self.provided_shared.set(set);
         }
     }
+}
+
+/// MAKEPAD_RUN_STATIC_TRACE=1: one line per static initialized (cached value, CTFE or code; CPU time)
+fn static_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_STATIC_TRACE").is_some())
 }
