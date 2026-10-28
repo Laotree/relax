@@ -461,6 +461,8 @@ struct Encoder<'a> {
     crate_ident: &'a [u128],
     boot: Option<&'a CollectedBoot>,
     committed: bool,
+    /// the definition tables the cache restored, with the definition count they were restored for
+    mapped: Option<(&'a MappedDefinitions, usize)>,
 }
 
 
@@ -475,6 +477,7 @@ pub(crate) struct CollectedInputs {
     iface_plain: Vec<u128>,
     crate_path: Vec<PathBuf>,
     crate_ident: Vec<u128>,
+    mapped: Option<(MappedDefinitions, usize)>,
 }
 
 impl CollectedInputs {
@@ -483,7 +486,8 @@ impl CollectedInputs {
     /// added since the first encode (the settle rebuild restores from it, and compares the counts).
     pub(crate) fn encode_now(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool) -> CollectedRecord {
         Encoder { mode: self.mode, dir: &self.dir, fps: &self.fps, iface_plain: &self.iface_plain,
-            crate_path: &self.crate_path, crate_ident: &self.crate_ident, boot: None, committed: false }
+            crate_path: &self.crate_path, crate_ident: &self.crate_ident, boot: None, committed: false,
+            mapped: self.mapped.as_ref().map(|(m, n)| (m, *n)) }
             .encode_as(prog, tcx, stop, true)
     }
 }
@@ -491,13 +495,14 @@ impl CollectedInputs {
 impl Cache {
     pub(crate) fn collected_inputs(&self) -> CollectedInputs {
         CollectedInputs { mode: self.mode, dir: self.dir.clone(), fps: self.fps.clone(), iface_plain: self.iface_plain.clone(),
-            crate_path: self.crate_path.clone(), crate_ident: self.crate_ident.clone() }
+            crate_path: self.crate_path.clone(), crate_ident: self.crate_ident.clone(),
+            mapped: self.mapped_definitions.clone().map(|m| (m, self.crate_defs_n)) }
     }
 
     fn encoder(&self) -> Encoder<'_> {
         Encoder { mode: self.mode, dir: &self.dir, fps: &self.fps, iface_plain: &self.iface_plain,
             crate_path: &self.crate_path, crate_ident: &self.crate_ident, boot: self.collected_boot.as_ref(),
-            committed: self.collected_committed }
+            committed: self.collected_committed, mapped: self.mapped_definitions.as_ref().map(|m| (m, self.crate_defs_n)) }
     }
 
 
@@ -598,23 +603,28 @@ impl Encoder<'_> {
     }
 
     fn definitions(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool) -> Option<crate::image::Writer<'static>> {
+        // The keys the cache restored hold while the program has the definitions they were
+        // restored for (Cache::def_key): taken as they are below `dk` (a partial restore's kept
+        // definitions); only the definitions after them are keyed here.
+        let reuse = self.mapped.filter(|(m, n)| *n == prog.defs.len() && m.keys.len() <= prog.defs.len()).map(|(m, _)| m);
+        let dk = reuse.map_or(0, |m| m.defs());
         let mut memo = HashMap::new();
         let mut files = HashMap::new();
-        let mut maps = vec![std::collections::BTreeMap::new(); prog.crates.len()];
-        let mut duplicates = HashSet::new();
-        for i in 0..prog.defs.len() {
+        let mut keys: Vec<MappedKey> = Vec::with_capacity(prog.defs.len());
+        if let Some(m) = reuse { keys.extend_from_slice(&m.keys[..dk]); }
+        for i in dk..prog.defs.len() {
             if i % 1024 == 1023 && stop() { return None; }
-            let d = DefId(i as u32);
-            let c = prog.def(d).krate as usize;
-            let k = def_key_in(prog, tcx, self.crate_ident, &mut memo, &mut files, d);
-            if maps[c].insert(k, d).is_some() { duplicates.insert((c, k)); }
+            keys.push(MappedKey::new(def_key_in(prog, tcx, self.crate_ident, &mut memo, &mut files, DefId(i as u32))));
         }
-        for (c, k) in duplicates { maps[c].remove(&k); }
+        // per crate: its definitions by key, without the keys two of them have
+        let mut maps: Vec<Vec<(u128, u32)>> = vec![Vec::new(); prog.crates.len()];
+        for (i, k) in keys.iter().enumerate() { maps[prog.def(DefId(i as u32)).krate as usize].push((k.get(), i as u32)); }
         let mut image = crate::image::Writer::default();
-        let keys: Vec<MappedKey> = (0..prog.defs.len()).map(|i| MappedKey::new(memo[&DefId(i as u32)])).collect();
         image.add_owned(0, &keys);
-        for (c, map) in maps.into_iter().enumerate() {
-            let (keys, defs): (Vec<MappedKey>, Vec<u32>) = map.into_iter().map(|(k, d)| (MappedKey::new(k), d.0)).unzip();
+        for (c, mut map) in maps.into_iter().enumerate() {
+            map.sort_unstable();
+            let unique = |i: usize| (i == 0 || map[i - 1].0 != map[i].0) && map.get(i + 1).is_none_or(|n| n.0 != map[i].0);
+            let (keys, defs): (Vec<MappedKey>, Vec<u32>) = (0..map.len()).filter(|&i| unique(i)).map(|i| (MappedKey::new(map[i].0), map[i].1)).unzip();
             image.add_owned(1 + c as u32 * 2, &keys);
             image.add_owned(2 + c as u32 * 2, &defs);
         }
@@ -738,6 +748,7 @@ pub enum CollectedRecord {
 
 /// Tables produced by this build and covered by the collected store checksum and input
 /// certificate. Only the small section directory is decoded at boot; keys stay mapped.
+#[derive(Clone)]
 pub(super) struct MappedDefinitions {
     keys: &'static [MappedKey],
     crates: Vec<(&'static [MappedKey], &'static [u32])>,
