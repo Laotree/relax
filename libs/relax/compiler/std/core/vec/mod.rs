@@ -1,9 +1,11 @@
 //! Vec<T>: a contiguous growable array (alloc::vec).
 
 mod drain;
+mod extract_if;
 mod into_iter;
 
 pub use drain::Drain;
+pub use extract_if::ExtractIf;
 pub use into_iter::IntoIter;
 
 use crate::borrow::{Borrow, BorrowMut, Cow, ToOwned};
@@ -531,6 +533,17 @@ impl<T> Vec<T> {
     pub fn drain<R: RangeBounds<usize>>(&mut self, range: R) -> Drain<'_, T> {
         let (start, end) = crate::slice::range(&range, self.len);
         drain::new(self, start, end)
+    }
+
+    /// library/alloc/src/vec/mod.rs `Vec::extract_if` (stable 1.87): removes and yields the
+    /// elements of `range` the filter selects.
+    pub fn extract_if<F, R>(&mut self, range: R, filter: F) -> ExtractIf<'_, T, F>
+    where
+        F: FnMut(&mut T) -> bool,
+        R: RangeBounds<usize>,
+    {
+        let (start, end) = crate::slice::range(&range, self.len);
+        extract_if::new(self, filter, start, end)
     }
 
     pub fn clear(&mut self) {
