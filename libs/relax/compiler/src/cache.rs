@@ -555,6 +555,12 @@ pub struct Cache {
     verdict_rejected: HashSet<u128>,
     /// per slot: the crates its key names (a certificate's fast path)
     slot_crates: HashMap<u32, Vec<u32>>,
+    /// value entries (record_const) whose stored certificate no longer holds: recorded again
+    const_stale: HashSet<u128>,
+    /// value entries this run validated or recorded: the startup image takes only these
+    const_live: HashSet<u128>,
+    /// the code keys of the bodies value certificates name (code_key_bytes by identity)
+    const_body_keys: HashMap<FnKey, Option<(u128, Vec<u32>, Vec<u8>)>>,
     /// while a key is encoded: the definitions it names (their local bodies join the key)
     enc_defs: Option<Vec<DefId>>,
     /// crate identity hash -> crate index
@@ -864,6 +870,9 @@ impl Cache {
             cert_rejected: HashSet::new(),
             verdict_rejected: HashSet::new(),
             slot_crates: HashMap::new(),
+            const_stale: HashSet::new(),
+            const_live: HashSet::new(),
+            const_body_keys: HashMap::new(),
             enc_defs: None,
             crate_by_ident,
             crate_ident,
@@ -7982,29 +7991,89 @@ pub(crate) unsafe fn slot_for_bytes_unit(up: *mut Unit, bytes: &[u8]) -> Option<
 }
 
 impl Cache {
-    /// Constants (including generated array lengths) use the same dependency
-    /// fingerprints as code, with a separate namespace for their evaluated value.
-    fn const_key(&mut self, u: &Unit, def: DefId, args: &[TyId]) -> Option<(u128, u32)> {
+    /// The value entry of a constant (including generated array lengths) or static: keyed by its
+    /// identity alone (one entry per value; a newer one replaces it), certified by what the value
+    /// was computed from (`ConstCert`, checked by `const_entry`). Also the crate whose store the
+    /// entry goes to and the crates the identity names.
+    fn const_key(&mut self, u: &Unit, def: DefId, args: &[TyId]) -> Option<(u128, u32, Vec<u32>)> {
         // Fingerprints describe startup inputs. Live edits can change a value's
         // transitive initializer dependencies before the next patch is installed.
         if !crate::reload::edited_crates().is_empty() { return None; }
         let mut e = E::default();
         let mut crates = Vec::new();
         if self.enc_fnkey(u, &FnKey::Inst(def, args.to_vec()), &mut e, &mut crates, 0).is_none() { return None; }
+        if crates.iter().any(|&c| c as usize >= self.crate_ident.len()) { return None; }
         crates.sort_unstable();
         crates.dedup();
         let mut h = Sip128::new();
-        h.str("const-value");
+        h.str("const-value-v2");
         h.u128(self.cfg);
         h.write(&e.0);
-        for &c in &crates { h.u128(*self.fps.get(c as usize)?); h.u128(*self.iface.get(c as usize)?); }
-        Some((h.finish128(), self.dominant(&crates)))
+        let dom = self.dominant(&crates);
+        Some((h.finish128(), dom, crates))
     }
 
-    pub fn record_const(&mut self, u: &Unit, def: DefId, args: &[TyId], addr: u64) -> Option<()> {
+    /// The code key, crates and identity bytes of body `key` (memo for the run)
+    fn const_body_key(&mut self, u: &Unit, key: &FnKey) -> Option<(u128, Vec<u32>, Vec<u8>)> {
+        if let Some(k) = self.const_body_keys.get(key) {
+            return k.clone();
+        }
+        let outer = std::mem::replace(&mut self.key_waits, false);
+        let k = self.code_key_bytes(u, key);
+        if !self.key_waits { self.const_body_keys.insert(key.clone(), k.clone()); }
+        self.key_waits |= outer;
+        k
+    }
+
+    /// A value entry's certificate: complete (u8), the crates of its fast path (their idents and
+    /// a hash of their whole fingerprints now: while it is the same, nothing the bodies are made
+    /// of changed), and for a complete one each body by its identity with its code key. An
+    /// incomplete certificate (the value ran code, or read one that did) holds only by the fast
+    /// path over the crates its identity names (whose fingerprints cover their dependencies).
+    fn const_cert_bytes(&mut self, u: &Unit, own: &[u32], cert: &crate::jit::ConstCert) -> Option<Vec<u8>> {
+        let mut complete = cert.complete;
+        let mut items: Vec<(Vec<u8>, u128)> = Vec::new();
+        let mut crates: Vec<u32> = own.to_vec();
+        let mut idents: Vec<u128> = Vec::new();
+        if complete {
+            for k in &cert.keys {
+                match self.const_body_key(u, k) {
+                    Some((key, cr, bytes)) => {
+                        crates.extend(cr);
+                        items.push((bytes, key));
+                    }
+                    None => { complete = false; break; }
+                }
+            }
+        }
+        if complete {
+            items.extend(cert.items.iter().cloned());
+            idents.extend(cert.idents.iter().copied());
+            items.sort_unstable();
+            items.dedup();
+        } else {
+            items.clear();
+        }
+        for &c in &crates { idents.push(*self.crate_ident.get(c as usize)?); }
+        idents.sort_unstable();
+        idents.dedup();
+        let mut e = E::default();
+        e.u8(complete as u8);
+        e.u32(idents.len() as u32);
+        for &i in &idents { e.u128(i); }
+        e.u128(self.cert_fps(&idents)?);
+        e.u32(items.len() as u32);
+        for (b, k) in items {
+            e.bytes(&b);
+            e.u128(k);
+        }
+        Some(e.0)
+    }
+
+    pub fn record_const(&mut self, u: &Unit, def: DefId, args: &[TyId], addr: u64, cert: &crate::jit::ConstCert) -> Option<()> {
         if self.mode == Mode::ReadOnly { return None; }
-        let (key, krate) = self.const_key(u, def, args)?;
-        if self.has_index(&key) || self.pending_keys.contains(&key) { return Some(()); }
+        let (key, krate, own) = self.const_key(u, def, args)?;
+        if self.pending_keys.contains(&key) || (self.has_index(&key) && !self.const_stale.contains(&key)) { return Some(()); }
         let SymKind::Data(idx) = u.syms.kind(u.data_sym(addr).id)? else { return None; };
         // A recursive compile can inspect this object before its initializer finishes.
         self.data_key.remove(&idx);
@@ -8014,23 +8083,64 @@ impl Cache {
         let data = self.data_entry(u, idx);
         self.cur_crate = previous;
         let data = data?;
+        let mut payload = self.const_cert_bytes(u, &own, cert)?;
+        payload.extend_from_slice(&data.to_le_bytes());
         self.pending_keys.insert(key);
-        self.push_pending(krate, NewEntry { key, kind: KIND_CONST, payload: data.to_le_bytes().to_vec() });
+        self.const_live.insert(key);
+        self.push_pending(krate, NewEntry { key, kind: KIND_CONST, payload });
         Some(())
+    }
+
+    /// Value entry `payload`'s data key, when its certificate holds (fast path, or every body it
+    /// names has the code key it had), with the certificate a reader takes in. None: it does
+    /// not hold or does not decode.
+    fn const_entry(&mut self, u: &mut Unit, payload: &[u8]) -> Option<(u128, crate::jit::ConstCert)> {
+        let mut d = D { b: payload, p: 0 };
+        let complete = d.u8()? == 1;
+        let nc = d.u32()? as usize;
+        let mut idents = Vec::with_capacity(nc.min(64));
+        for _ in 0..nc { idents.push(d.u128()?); }
+        let fps = d.u128()?;
+        let fast = self.cert_fps(&idents) == Some(fps);
+        if !fast && !complete { return None; }
+        let n = d.u32()? as usize;
+        let mut items = Vec::with_capacity(n.min(256));
+        for _ in 0..n {
+            let b = d.bytes()?;
+            let want = d.u128()?;
+            if !fast && !self.identity_unchanged(b) {
+                let key = unsafe { Linker::new(self) }.dec_fnkey(u, &mut D { b, p: 0 }, 0)?;
+                if self.const_body_key(u, &key).map(|k| k.0) != Some(want) { return None; }
+            }
+            items.push((b.to_vec(), want));
+        }
+        let data = u128::from_le_bytes(d.b.get(d.p..d.p + 16)?.try_into().ok()?);
+        (d.p + 16 == payload.len()).then(|| (data, crate::jit::ConstCert { keys: Vec::new(), items, idents, complete }))
     }
 }
 
 /// Hydrate a completed immutable value, including relocations, with the cache
-/// available to any initializer needed to resolve its symbols.
+/// available to any initializer needed to resolve its symbols. The evaluation reading it (if
+/// any) takes in its certificate; this run keeps it for later readers.
 pub(crate) unsafe fn const_value(up: *mut Unit, def: DefId, args: &[TyId]) -> Option<u64> {
     let c = (&*up).cache.as_ref()?.get();
-    let (key, _) = (&mut *c).const_key(&*up, def, args)?;
-    let data = {
+    let (key, _, _) = (&mut *c).const_key(&*up, def, args)?;
+    let payload = {
         let (kind, payload) = (&*c).get(key)?;
         if kind != KIND_CONST { return None; }
-        u128::from_le_bytes(payload.try_into().ok()?)
+        // (the store's mapping outlives this lookup: the payload is read before any write)
+        std::slice::from_raw_parts(payload.as_ptr(), payload.len())
     };
-    Linker::new(c).link_data(&mut *up, data)
+    let Some((data, cert)) = (&mut *c).const_entry(&mut *up, payload) else {
+        (&mut *c).const_stale.insert(key);
+        return None;
+    };
+    let a = Linker::new(c).link_data(&mut *up, data)?;
+    (&mut *c).const_live.insert(key);
+    crate::jit::cert_take_in(&cert);
+    let u = &mut *up;
+    crate::zone_alloc::kept_with(|| u.const_certs.insert((def, args.to_vec()), cert));
+    Some(a)
 }
 
 impl Cache {
