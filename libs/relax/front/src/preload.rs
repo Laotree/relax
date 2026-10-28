@@ -1194,10 +1194,8 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
                         i = close + 1;
                         continue;
                     }
-                    let mt: Vec<crate::macros::MTok> = toks[open + 1..close.min(toks.len())]
-                        .iter()
-                        .map(|t| crate::macros::MTok { kind: t.kind, text: String::from_utf8_lossy(&src[t.lo as usize..t.hi as usize]).into_owned(), pos: t.lo })
-                        .collect();
+                    let mt = crate::macros::definition_tokens(&toks[open + 1..close.min(toks.len())],
+                        |lo, hi| &src[lo as usize..hi as usize]);
                     if let Ok(mut def) = crate::macros::parse_def(&name, krate, edition, &mt) {
                         def.exported = attrs.exported;
                         if attrs.local_inner {

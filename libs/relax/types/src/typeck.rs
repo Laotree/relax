@@ -6503,7 +6503,9 @@ impl<'a> Fcx<'a> {
         if f.is_pub {
             return true;
         }
-        let target = self.prog.def(d).scope;
+        // rustc_resolve build_reduced_graph.rs: try_resolve_visibility restricts
+        // inherited visibility to nearest_parent_mod, not an anonymous block.
+        let target = self.prog.mods[self.prog.def(d).scope as usize].normal;
         let mut m = Some(self.module);
         let mut guard = 0;
         while let Some(cur) = m {

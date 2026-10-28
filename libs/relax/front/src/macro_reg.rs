@@ -674,10 +674,8 @@ fn collect_macro_rules_defs(root: &str, krate: &str, edition: u16) -> Vec<crate:
                 close += 1;
             }
             if close > open {
-                let mt: Vec<crate::macros::MTok> = toks[open + 1..close.min(toks.len())]
-                    .iter()
-                    .map(|t| crate::macros::MTok { kind: t.kind, text: String::from_utf8_lossy(&src[t.lo as usize..t.hi as usize]).into_owned(), pos: t.lo })
-                    .collect();
+                let mt = crate::macros::definition_tokens(&toks[open + 1..close.min(toks.len())],
+                    |lo, hi| &src[lo as usize..hi as usize]);
                 if let Ok(def) = crate::macros::parse_def(&name, krate, edition, &mt) {
                     defs.push(def);
                 }

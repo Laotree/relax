@@ -1786,14 +1786,10 @@ impl<'a> Parser<'a> {
     }
 
     fn expand_call_inner(&mut self, def: &crate::macros::MacroDef, toks: TokRange, call_lo: u32) -> PResult<usize> {
-        // rustc_expand expand_invoc: the crate's `#![recursion_limit = ".."]` bounds the expansion depth (a top-level call
-        // is at depth 1); the written limit is the root file's, other files keep the built-in bound
-        if let Some(limit) = self.written_recursion_limit() {
-            if self.exp_depth + 1 > limit {
-                return Err(PErr { pos: call_lo, msg: format!("recursion limit reached while expanding `{}!`", def.name) });
-            }
-        } else if self.exp_depth > 256 {
-            return Err(PErr { pos: call_lo, msg: format!("`{}!` expands more than 256 levels deep -- add a base case", def.name) });
+        // rustc_expand expand.rs: expand_invoc checks nested expansion depth (top-level: 1).
+        // rustc_interface limits.rs: get_recursion_limit defaults to 128.
+        if self.exp_depth + 1 > self.written_recursion_limit().unwrap_or(128) {
+            return Err(PErr { pos: call_lo, msg: format!("recursion limit reached while expanding `{}!`", def.name) });
         }
         let trace = crate::preload::relax_trace().map_or(false, |t| t.split(',').any(|p| p.strip_prefix("expand:").map_or(false, |n| def.name.contains(n))));
         use crate::builtins::Builtin as B;
@@ -3753,6 +3749,19 @@ impl<'a> Parser<'a> {
 
     pub(super) fn ty_fragment_end(&self, lo: u32) -> Option<u32> {
         if self.ty_frags.contains(&lo) { self.frag_groups.get(&lo).copied() } else { None }
+    }
+
+    pub(super) fn fragment_group(&self, lo: u32) -> Option<(u32, u32)> {
+        let end = *self.frag_groups.get(&lo)?;
+        let mut flags = 0;
+        if self.ty_frags.contains(&lo) { flags |= crate::macros::TY_FRAG; }
+        if self.block_frags.contains(&lo) { flags |= crate::macros::BLOCK_FRAG; }
+        match self.meta_frags.get(&lo) {
+            Some(&"expr") => flags |= crate::macros::EXPR_FRAG,
+            Some(&"literal") => flags |= crate::macros::LIT_FRAG,
+            _ => {}
+        }
+        Some((end, flags))
     }
 
     fn ty_inner(&mut self, plus: bool) -> PResult<TyId> {

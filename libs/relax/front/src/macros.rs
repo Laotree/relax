@@ -2164,6 +2164,8 @@ fn parse_matcher(toks: &[MTok], edition: u16) -> Result<Vec<MNode>, String> {
     let mut i = 0;
     while i < toks.len() {
         let t = &toks[i];
+        // rustc_expand mbe/macro_parser.rs: TtParser::match_one ignores matcher docs.
+        if t.kind == T::DocComment { i += 1; continue; }
         if t.kind == T::Dollar && i + 1 < toks.len() {
             let n = &toks[i + 1];
             if n.kind == T::OpenParen {
@@ -2723,18 +2725,19 @@ impl<'a> Parser<'a> {
                             out.push(T::OpenParen, "(", None, u32::MAX);
                         }
                         let group_start = out.s.len() + 1;
-                        let mut ty_groups = Vec::new();
+                        let mut groups = Vec::new();
                         for k in *lo..*hi {
                             let t = self.toks.at(k);
                             // rustc_expand mbe/transcribe.rs: transcribe_pnr preserves
-                            // invisible groups when forwarding a tt, including nested types.
-                            if let Some(end) = self.ty_fragment_end(t.lo) {
-                                ty_groups.push((end, out.s.len() as u32 + 1));
+                            // invisible groups inside every captured fragment, including
+                            // a path inside a type-macro call subsequently matched as tt.
+                            if let Some((end, flags)) = self.fragment_group(t.lo) {
+                                groups.push((end, out.s.len() as u32 + 1, flags));
                             }
                             out.push(t.kind, &String::from_utf8_lossy(self.tok_text(t)), Some(t.lo), u32::MAX);
-                            while ty_groups.last().is_some_and(|&(end, _)| end == t.hi) {
-                                let (_, start) = ty_groups.pop().unwrap();
-                                out.groups.push((start, out.s.len() as u32 | TY_FRAG));
+                            while groups.last().is_some_and(|&(end, _, _)| end == t.hi) {
+                                let (_, start, flags) = groups.pop().unwrap();
+                                out.groups.push((start, out.s.len() as u32 | flags));
                             }
                         }
                         if let Some((a, b)) = *taken {
@@ -2800,16 +2803,15 @@ impl<'a> Parser<'a> {
     /// doc comments the range is returned as it is; otherwise a copy is appended to the token
     /// list and its range returned.
     fn desugar_doc_comments(&mut self, lo: usize, hi: usize) -> (usize, usize) {
-        let base = self.src.len() as u32;
-        if lo == 0 || hi < lo || self.toks.at(hi).lo >= base {
+        if lo == 0 || hi < lo {
             return (lo, hi);
         }
         // (index of the token the docs precede, inner, text)
         let mut docs: Vec<(usize, bool, Vec<u8>)> = Vec::new();
         for j in lo..=hi {
             let (prev, t) = (self.toks.at(j - 1), self.toks.at(j));
-            if prev.hi < t.lo && t.lo <= base {
-                let gap = &self.src[prev.hi as usize..t.lo as usize];
+            if prev.hi < t.lo {
+                let gap = self.bytes(prev.hi, t.lo);
                 if gap.windows(2).any(|w| w == b"//" || w == b"/*") {
                     crate::pm_tokens::for_each_gap_doc(gap, |d| docs.push((j, d.inner, d.text.to_vec())));
                 }
@@ -2915,7 +2917,14 @@ impl Transcript {
             self.bodies.push((at, bp, t.len() as u32));
         }
         self.s.push_str(t);
-        self.toks.push(Tok { kind, lo: at, hi: at + t.len() as u32 });
+        // rustc_expand mbe/transcribe.rs: transcribe retains DocComment tokens.
+        // Keep ours as lexer trivia until parser_from_cx desugars the next call;
+        // a generated macro definition must still ignore docs in its matcher.
+        if kind == T::DocComment {
+            self.s.push('\n');
+        } else {
+            self.toks.push(Tok { kind, lo: at, hi: at + t.len() as u32 });
+        }
     }
 }
 
@@ -2931,7 +2940,25 @@ fn lexed_kind(part: &[u8]) -> T {
 
 /// Owned tokens of a token range (definition bodies outlive the parse of their file).
 pub fn mtoks(p: &Parser, toks: &[Tok]) -> Vec<MTok> {
-    toks.iter().map(|t| MTok { kind: t.kind, text: String::from_utf8_lossy(p.tok_text(*t)).into_owned(), pos: t.lo }).collect()
+    definition_tokens(toks, |lo, hi| p.bytes(lo, hi))
+}
+
+/// rustc_expand mbe/quoted.rs: parse_tree retains DocComment tokens in definitions.
+/// Recover the lexer trivia for both the prescan and the parser's definitions.
+pub(crate) fn definition_tokens<'a>(toks: &[Tok], bytes: impl Fn(u32, u32) -> &'a [u8]) -> Vec<MTok> {
+    let mut out = Vec::with_capacity(toks.len());
+    let mut prev = toks.first().map_or(0, |t| t.lo);
+    for t in toks {
+        if prev < t.lo {
+            let gap = bytes(prev, t.lo);
+            crate::pm_tokens::for_each_gap_doc(gap, |d| out.push(MTok {
+                kind: T::DocComment, text: String::from_utf8_lossy(&gap[d.lo..d.hi]).into_owned(), pos: prev + d.lo as u32,
+            }));
+        }
+        out.push(MTok { kind: t.kind, text: String::from_utf8_lossy(bytes(t.lo, t.hi)).into_owned(), pos: t.lo });
+        prev = t.hi;
+    }
+    out
 }
 
 #[cfg(test)]
