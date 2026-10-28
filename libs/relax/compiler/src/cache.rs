@@ -60,7 +60,7 @@ const KIND_BORROWCK: u32 = 4;
 /// the checker's own version: bump when its rules change (old verdicts are then ignored)
 pub const BORROWCK_VERSION: u32 = 2;
 /// the coherence check's own version: bump when its rules change
-const COHERENCE_VERSION: u32 = 1;
+const COHERENCE_VERSION: u32 = 2;
 
 /// Immutable driver view for Gandalf's generic owner discovery. No Unit/cache
 /// callbacks under the front read lock, and no need to construct an instance key
@@ -2466,17 +2466,19 @@ impl Cache {
 
     /// The key of the run's coherence verdict (orphan rules, overlapping impls: Tcx::report_coherence):
     /// the checker version, the cache configuration (Relax build, options), every crate's
-    /// fingerprint (all its files' text, cfg, dependencies) and the files the program's impls come
-    /// from (the selection loads a subset of files). A clean verdict under this key is stored
+    /// interface fingerprint (its items outside fn bodies, cfg, dependencies) and the files the
+    /// program's impls come from (the selection loads a subset of files). A clean verdict under this key is stored
     /// as a borrowck-kind entry with an empty payload. None after a live edit.
     pub fn coherence_key(&self, prog: &crate::program::Program) -> Option<u128> {
-        if !crate::reload::edited_crates().is_empty() || self.fps.len() != prog.crates.len() { return None; }
+        if !crate::reload::edited_crates().is_empty() || self.iface_plain.len() != prog.crates.len() { return None; }
         let mut h = Sip128::new();
         h.str("coherence-verdict");
         h.u32(COHERENCE_VERSION);
         h.u128(self.cfg);
-        h.u32(self.fps.len() as u32);
-        for fp in &self.fps { h.u128(*fp); }
+        // by the crates' interfaces (their impls and every item they can name; a fn body is
+        // interface when it declares an impl), not their whole texts: a body edit checks nothing
+        h.u32(self.iface_plain.len() as u32);
+        for i in &self.iface_plain { h.u128(*i); }
         let mut from = vec![false; prog.files.len()];
         for im in &prog.impls {
             *from.get_mut(prog.def(im.def).file as usize)? = true;
