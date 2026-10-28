@@ -549,8 +549,8 @@ pub(crate) extern "C" fn relax_frame_done() {
         episode_at(EP_SUM.load(Relaxed) + dt, now);
     }
     let last = LAST_FRAME.swap(now, Relaxed);
-    if fp != 0 && last >= fp {
-        FRAMES_AFTER_PRESENT.fetch_add(1, Relaxed);
+    if fp != 0 && last >= fp && FRAMES_AFTER_PRESENT.fetch_add(1, Relaxed) == 0 && crate::run::VERBOSE.load(Relaxed) {
+        eprintln!("makepad-run startup image window closed at +{:.0} ms after the first present ({} startup slots)", ms(now - fp), crate::jit::ORDER_PRESENT_LEN.load(Relaxed));
     }
     episode_end();
     let compiled = MAIN_COMPILE_NS.load(Relaxed);

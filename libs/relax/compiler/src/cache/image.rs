@@ -43,6 +43,13 @@ impl Cache {
                 chosen.push((id, k, crates));
             }
         }
+        // the fns the chosen code calls (directly, transitively) that ran this session -- as their
+        // own code, or inlined into code -- with a code entry: the image places them too. Startup
+        // code a later tier replaced (O2/O3 over the O1 code that inlined them) calls them as fns
+        // of their own; without them in the image every such call was a lazy link on the thread
+        // that made it, the UI thread's first frames after the present (Sandbox: ~200 back to back
+        // on the first warm start after a cold one, 50-90 ms: the JIT indicator).
+        self.add_called(u, &mut chosen, &pend, stop)?;
         // SPEC-V: the image sends a verified-clean caller's calls to a twin to the twin's base when the
         // base's code is in the image too (a twin's key is its base's key behind tag 4): the code is
         // the caller's earlier (unverified) lowering, sound to call verified code once the caller's
@@ -324,6 +331,47 @@ impl Cache {
         valid(key0).then_some(key0)
     }
 
+    /// build_image: appends to `chosen` the slots its code calls (call and slot-word relocations,
+    /// transitively) that ran this session and have an image entry.
+    fn add_called(&mut self, u: &Unit, chosen: &mut Vec<(u32, u128, Vec<u32>)>, pend: &HashMap<u128, usize>, stop: &dyn Fn() -> bool) -> Result<(), ()> {
+        let mut by_bytes: HashMap<Vec<u8>, u32> = self.fnkey_bytes.iter().filter_map(|(&id, b)| Some((b.clone()?, id))).collect();
+        if let Some(ids) = self.image_ids.as_ref() {
+            for id in ids.first..ids.first + ids.pending.len() as u32 {
+                if let Some(b) = ids.bytes_of(id) { by_bytes.entry(b.to_vec()).or_insert(id); }
+            }
+        }
+        let mut have: HashSet<u32> = chosen.iter().map(|c| c.0).collect();
+        let ran = |c: u32| {
+            let f = &u.fns[c as usize];
+            (f.compiled && f.spec_state != 1) || !f.history().inlined_into.is_empty()
+        };
+        let mut i = 0;
+        let mut added = 0;
+        while i < chosen.len() {
+            if i % 256 == 255 && stop() { return Err(()); }
+            let k = chosen[i].1;
+            i += 1;
+            let callees: Vec<u32> = match self.image_payload(k, pend).and_then(call_targets) {
+                Some(t) => t.into_iter().filter_map(|b| by_bytes.get(b).copied()).collect(),
+                None => continue,
+            };
+            for c in callees {
+                if (c as usize) >= u.fns.len() || have.contains(&c) || !ran(c) || relax_codegen::interp::is_entry(u.fns[c as usize].code) { continue; }
+                have.insert(c);
+                let Some(key0) = self.slot_key(u, c) else { continue };
+                let crates = self.slot_crates.get(&c).cloned().unwrap_or_default();
+                if let Some(k) = self.image_entry(c, key0, pend) {
+                    chosen.push((c, k, crates));
+                    added += 1;
+                }
+            }
+        }
+        if self.verbose && added > 0 {
+            eprintln!("makepad-run cache: startup image: {} slots its code calls added", added);
+        }
+        Ok(())
+    }
+
     /// A code entry's payload: recorded this run (not yet written), or in the index.
     fn image_payload<'a>(&'a self, k: u128, pend: &HashMap<u128, usize>) -> Option<&'a [u8]> {
         if let Some(&i) = pend.get(&k) {
@@ -545,6 +593,40 @@ const IMG_CALL: u8 = 6;
 /// decode, or names a crate this program does not have. `crates`:
 /// the crates its key names (the certificate's are added).
 #[allow(clippy::too_many_arguments)]
+/// The callee identities (key encodings) of code entry `payload`'s call and slot-word relocations.
+fn call_targets(payload: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut d = D { b: payload, p: 0 };
+    if d.u32()? != ENTRY_VERSION {
+        return None;
+    }
+    d.str()?;
+    d.u8()?;
+    let ni = d.u32()?;
+    for _ in 0..ni { d.bytes()?; }
+    let n = d.u32()?;
+    for _ in 0..n { d.bytes()?; d.u8()?; }
+    let nc = d.u32()?;
+    for _ in 0..nc { d.u128()?; }
+    d.u128()?;
+    let n = d.u32()?;
+    for _ in 0..n { d.bytes()?; d.u128()?; }
+    d.bytes()?;
+    let nr = d.u32()? as usize;
+    let mut out = Vec::new();
+    let mut scratch = ImageTables::default();
+    for _ in 0..nr {
+        d.u32()?;
+        kind_of(d.u8()?)?;
+        match d.b.get(d.p).copied()? {
+            20 | 25 => { d.u8()?; out.push(d.bytes()?); }
+            21 => { d.u8()?; d.bytes()?; }
+            22..=24 => { d.u8()?; }
+            _ => { scratch.sym(&mut d)?; }
+        }
+    }
+    Some(out)
+}
+
 fn image_slot(tab: &mut ImageTables, out: &mut E, blob: &mut Vec<u8>, entry_key: u128, key: Vec<u8>, payload: &[u8], crates: &mut Vec<u32>, crate_by_ident: &HashMap<u128, u32>, retarget: &dyn Fn(&[u8]) -> bool) -> Option<()> {
     let mut d = D { b: payload, p: 0 };
     if d.u32()? != ENTRY_VERSION {
