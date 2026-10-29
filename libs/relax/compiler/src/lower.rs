@@ -12504,7 +12504,16 @@ pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>,
     use crate::layout::TagEnc;
     if l.uninhabited { return None; }
     Some(match l.enc {
-        TagEnc::Direct => raw,
+        TagEnc::Direct => match l.tag {
+            // rustc_codegen_ssa/src/mir/operand.rs::OperandRef::codegen_get_discr:
+            // intcast the tag scalar, not the whole register carrying it.
+            Some((_, Mem::Int(bytes, signed))) if bytes < 8 && raw.len() == 1 => {
+                let d = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::Conv(Conv::IntToInt(IntTy { bits: bytes * 8, signed }), d, raw[0]));
+                vec![d]
+            }
+            _ => raw,
+        },
         TagEnc::Single(v) => {
             let d = f.vreg(Cls::I);
             let discr = adt.discriminant_for_variant(&u.tcx, &u.prog, v)?;
