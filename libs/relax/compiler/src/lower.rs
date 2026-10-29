@@ -13279,6 +13279,11 @@ fn rt_divrem128(mode: u64, alo: u64, ahi: u64, blo: u64, bhi: u64) -> WideRet {
 /// runs the drops of its suspension point.
 fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32) -> Result<(u32, u32, u64), String> {
     use relax_backend::regalloc::{term_uses, uses_defs};
+    // MAKEPAD_RUN_TRACE=coro: the transform's sizes and phase times (coro-transform line)
+    let tr = std::env::var("MAKEPAD_RUN_TRACE").is_ok_and(|v| v.split(',').any(|x| x == "coro"));
+    let t_start = std::time::Instant::now();
+    let mut t_ph: Vec<(&str, f64)> = Vec::new();
+    let mut mark = |name: &'static str| if tr { t_ph.push((name, t_start.elapsed().as_secs_f64() * 1e3)); };
     // drop flags whose value is known where they are tested (a value moved out before a
     // suspension point: rustc's maybe-initialized analysis) -- the dead drop would keep the
     // value's slot saved across it
@@ -13570,6 +13575,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32) -> Result<(u32, u
             }
         }
     }
+    mark("points-to");
     // vreg liveness (backward, to a fixpoint)
     let words = (nv + 63) / 64;
     let mut gen = vec![0u64; nb * words];
@@ -13793,6 +13799,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32) -> Result<(u32, u
         }
         seen
     };
+    mark("gen/kill");
     for (k, &(pend, resume, cancel)) in c.suspends.iter().enumerate() {
         let mut vs = Vec::new();
         let mut sv = vec![0u64; wd];
@@ -13849,6 +13856,11 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32) -> Result<(u32, u
         }
         live_at.push(vs);
         const_at.push(consts);
+    }
+    mark("per-suspension");
+    if tr {
+        eprintln!("coro-transform\tblocks {} vregs {} slots {} suspends {} insts {}\t{}", nb, nv, ns, c.suspends.len(), f.blocks.iter().map(|b| b.insts.len()).sum::<usize>(),
+            t_ph.iter().map(|(n, t)| format!("{} {:.0}", n, t)).collect::<Vec<_>>().join(", "));
     }
     // an awaited future is used only between its creation and its drop, around its own
     // suspension point; its poll's result is dead at it
