@@ -792,10 +792,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2AcceleratorKeyPressedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2AcceleratorKeyPressedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2AcceleratorKeyPressedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2AcceleratorKeyPressedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2Controller>, args: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2AcceleratorKeyPressedEventArgs>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2AcceleratorKeyPressedEventHandler: ICoreWebView2AcceleratorKeyPressedEventHandler_Vtbl = ICoreWebView2AcceleratorKeyPressedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2AcceleratorKeyPressedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2AcceleratorKeyPressedEventHandler: ICoreWebView2AcceleratorKeyPressedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2AcceleratorKeyPressedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2AcceleratorKeyPressedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2AcceleratorKeyPressedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -805,8 +807,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2AcceleratorKeyPressedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2AcceleratorKeyPressedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2AcceleratorKeyPressedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2AcceleratorKeyPressedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2AcceleratorKeyPressedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2AcceleratorKeyPressedEventHandler as *const ICoreWebView2AcceleratorKeyPressedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2AcceleratorKeyPressedEventHandler, iids); } } }
-impl ICoreWebView2AcceleratorKeyPressedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2AcceleratorKeyPressedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2AcceleratorKeyPressedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2AcceleratorKeyPressedEventHandler(mut self, implementation: Box<dyn ICoreWebView2AcceleratorKeyPressedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2AcceleratorKeyPressedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2AcceleratorKeyPressedEventHandler as *const ICoreWebView2AcceleratorKeyPressedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2AcceleratorKeyPressedEventHandler, iids); } self } }
+impl ICoreWebView2AcceleratorKeyPressedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2AcceleratorKeyPressedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2AcceleratorKeyPressedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler: crate::core::GUID = crate::core::GUID { data1: 3113445875, data2: 39697, data3: 18357, data4: [188,111,142,120,149,252,234,23,] };
 #[repr(C)]
 pub struct ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler_Vtbl {
@@ -841,10 +843,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandlerImpl {
 fn Invoke(&self, errorCode: crate::core::HRESULT, result: crate::core::PCWSTR) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler: ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler_Vtbl = ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler: ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler_Invoke(this: *mut ::core::ffi::c_void,errorCode: crate::core::HRESULT,result: crate::core::PCWSTR) -> crate::core::HRESULT {
@@ -852,8 +856,8 @@ let implementation = &*((* (this as *const crate::core::ObjectSlot)).implementat
 match implementation.Invoke(errorCode,result) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler(&mut self, implementation: Box<dyn ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler as *const ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler, iids); } } }
-impl ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler { pub fn implement(implementation: Box<dyn ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler(mut self, implementation: Box<dyn ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler as *const ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler, iids); } self } }
+impl ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler { pub fn implement(implementation: Box<dyn ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2CallDevToolsProtocolMethodCompletedHandler: crate::core::GUID = crate::core::GUID { data1: 1548257776, data2: 24310, data3: 19546, data4: [149,44,216,241,185,45,5,116,] };
 #[repr(C)]
 pub struct ICoreWebView2CallDevToolsProtocolMethodCompletedHandler_Vtbl {
@@ -888,10 +892,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2CallDevToolsProtocolMethodCompletedHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2CallDevToolsProtocolMethodCompletedHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2CallDevToolsProtocolMethodCompletedHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2CallDevToolsProtocolMethodCompletedHandlerImpl {
 fn Invoke(&self, errorCode: crate::core::HRESULT, result: crate::core::PCWSTR) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2CallDevToolsProtocolMethodCompletedHandler: ICoreWebView2CallDevToolsProtocolMethodCompletedHandler_Vtbl = ICoreWebView2CallDevToolsProtocolMethodCompletedHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2CallDevToolsProtocolMethodCompletedHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2CallDevToolsProtocolMethodCompletedHandler: ICoreWebView2CallDevToolsProtocolMethodCompletedHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2CallDevToolsProtocolMethodCompletedHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2CallDevToolsProtocolMethodCompletedHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2CallDevToolsProtocolMethodCompletedHandler_Invoke(this: *mut ::core::ffi::c_void,errorCode: crate::core::HRESULT,result: crate::core::PCWSTR) -> crate::core::HRESULT {
@@ -899,8 +905,8 @@ let implementation = &*((* (this as *const crate::core::ObjectSlot)).implementat
 match implementation.Invoke(errorCode,result) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2CallDevToolsProtocolMethodCompletedHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2CallDevToolsProtocolMethodCompletedHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2CallDevToolsProtocolMethodCompletedHandler(&mut self, implementation: Box<dyn ICoreWebView2CallDevToolsProtocolMethodCompletedHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2CallDevToolsProtocolMethodCompletedHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2CallDevToolsProtocolMethodCompletedHandler as *const ICoreWebView2CallDevToolsProtocolMethodCompletedHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2CallDevToolsProtocolMethodCompletedHandler, iids); } } }
-impl ICoreWebView2CallDevToolsProtocolMethodCompletedHandler { pub fn implement(implementation: Box<dyn ICoreWebView2CallDevToolsProtocolMethodCompletedHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2CallDevToolsProtocolMethodCompletedHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2CallDevToolsProtocolMethodCompletedHandler(mut self, implementation: Box<dyn ICoreWebView2CallDevToolsProtocolMethodCompletedHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2CallDevToolsProtocolMethodCompletedHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2CallDevToolsProtocolMethodCompletedHandler as *const ICoreWebView2CallDevToolsProtocolMethodCompletedHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2CallDevToolsProtocolMethodCompletedHandler, iids); } self } }
+impl ICoreWebView2CallDevToolsProtocolMethodCompletedHandler { pub fn implement(implementation: Box<dyn ICoreWebView2CallDevToolsProtocolMethodCompletedHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2CallDevToolsProtocolMethodCompletedHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2CapturePreviewCompletedHandler: crate::core::GUID = crate::core::GUID { data1: 1769866729, data2: 15759, data3: 17914, data4: [150,244,143,254,30,222,218,245,] };
 #[repr(C)]
 pub struct ICoreWebView2CapturePreviewCompletedHandler_Vtbl {
@@ -935,10 +941,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2CapturePreviewCompletedHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2CapturePreviewCompletedHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2CapturePreviewCompletedHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2CapturePreviewCompletedHandlerImpl {
 fn Invoke(&self, errorCode: crate::core::HRESULT) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2CapturePreviewCompletedHandler: ICoreWebView2CapturePreviewCompletedHandler_Vtbl = ICoreWebView2CapturePreviewCompletedHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2CapturePreviewCompletedHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2CapturePreviewCompletedHandler: ICoreWebView2CapturePreviewCompletedHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2CapturePreviewCompletedHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2CapturePreviewCompletedHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2CapturePreviewCompletedHandler_Invoke(this: *mut ::core::ffi::c_void,errorCode: crate::core::HRESULT) -> crate::core::HRESULT {
@@ -946,8 +954,8 @@ let implementation = &*((* (this as *const crate::core::ObjectSlot)).implementat
 match implementation.Invoke(errorCode) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2CapturePreviewCompletedHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2CapturePreviewCompletedHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2CapturePreviewCompletedHandler(&mut self, implementation: Box<dyn ICoreWebView2CapturePreviewCompletedHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2CapturePreviewCompletedHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2CapturePreviewCompletedHandler as *const ICoreWebView2CapturePreviewCompletedHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2CapturePreviewCompletedHandler, iids); } } }
-impl ICoreWebView2CapturePreviewCompletedHandler { pub fn implement(implementation: Box<dyn ICoreWebView2CapturePreviewCompletedHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2CapturePreviewCompletedHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2CapturePreviewCompletedHandler(mut self, implementation: Box<dyn ICoreWebView2CapturePreviewCompletedHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2CapturePreviewCompletedHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2CapturePreviewCompletedHandler as *const ICoreWebView2CapturePreviewCompletedHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2CapturePreviewCompletedHandler, iids); } self } }
+impl ICoreWebView2CapturePreviewCompletedHandler { pub fn implement(implementation: Box<dyn ICoreWebView2CapturePreviewCompletedHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2CapturePreviewCompletedHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2CompositionController: crate::core::GUID = crate::core::GUID { data1: 1039775539, data2: 47534, data3: 18965, data4: [134,180,235,158,233,130,100,105,] };
 #[repr(C)]
 pub struct ICoreWebView2CompositionController_Vtbl {
@@ -1142,10 +1150,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2ContainsFullScreenElementChangedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2ContainsFullScreenElementChangedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2ContainsFullScreenElementChangedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2ContainsFullScreenElementChangedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2>, args: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2ContainsFullScreenElementChangedEventHandler: ICoreWebView2ContainsFullScreenElementChangedEventHandler_Vtbl = ICoreWebView2ContainsFullScreenElementChangedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2ContainsFullScreenElementChangedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2ContainsFullScreenElementChangedEventHandler: ICoreWebView2ContainsFullScreenElementChangedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2ContainsFullScreenElementChangedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2ContainsFullScreenElementChangedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2ContainsFullScreenElementChangedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -1155,8 +1165,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2ContainsFullScreenElementChangedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2ContainsFullScreenElementChangedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2ContainsFullScreenElementChangedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2ContainsFullScreenElementChangedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2ContainsFullScreenElementChangedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2ContainsFullScreenElementChangedEventHandler as *const ICoreWebView2ContainsFullScreenElementChangedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2ContainsFullScreenElementChangedEventHandler, iids); } } }
-impl ICoreWebView2ContainsFullScreenElementChangedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2ContainsFullScreenElementChangedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2ContainsFullScreenElementChangedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2ContainsFullScreenElementChangedEventHandler(mut self, implementation: Box<dyn ICoreWebView2ContainsFullScreenElementChangedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2ContainsFullScreenElementChangedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2ContainsFullScreenElementChangedEventHandler as *const ICoreWebView2ContainsFullScreenElementChangedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2ContainsFullScreenElementChangedEventHandler, iids); } self } }
+impl ICoreWebView2ContainsFullScreenElementChangedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2ContainsFullScreenElementChangedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2ContainsFullScreenElementChangedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2ContentLoadingEventArgs: crate::core::GUID = crate::core::GUID { data1: 210375285, data2: 39787, data3: 18689, data4: [135,173,112,223,37,186,250,110,] };
 #[repr(C)]
 pub struct ICoreWebView2ContentLoadingEventArgs_Vtbl {
@@ -1233,10 +1243,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2ContentLoadingEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2ContentLoadingEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2ContentLoadingEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2ContentLoadingEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2>, args: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2ContentLoadingEventArgs>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2ContentLoadingEventHandler: ICoreWebView2ContentLoadingEventHandler_Vtbl = ICoreWebView2ContentLoadingEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2ContentLoadingEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2ContentLoadingEventHandler: ICoreWebView2ContentLoadingEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2ContentLoadingEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2ContentLoadingEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2ContentLoadingEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -1246,8 +1258,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2ContentLoadingEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2ContentLoadingEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2ContentLoadingEventHandler(&mut self, implementation: Box<dyn ICoreWebView2ContentLoadingEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2ContentLoadingEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2ContentLoadingEventHandler as *const ICoreWebView2ContentLoadingEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2ContentLoadingEventHandler, iids); } } }
-impl ICoreWebView2ContentLoadingEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2ContentLoadingEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2ContentLoadingEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2ContentLoadingEventHandler(mut self, implementation: Box<dyn ICoreWebView2ContentLoadingEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2ContentLoadingEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2ContentLoadingEventHandler as *const ICoreWebView2ContentLoadingEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2ContentLoadingEventHandler, iids); } self } }
+impl ICoreWebView2ContentLoadingEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2ContentLoadingEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2ContentLoadingEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2Controller: crate::core::GUID = crate::core::GUID { data1: 1291894993, data2: 37940, data3: 20150, data4: [128,120,134,151,165,96,51,79,] };
 #[repr(C)]
 pub struct ICoreWebView2Controller_Vtbl {
@@ -1843,10 +1855,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandlerImpl {
 fn Invoke(&self, errorCode: crate::core::HRESULT, result: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2CompositionController>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler: ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler_Vtbl = ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler: ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler_Invoke(this: *mut ::core::ffi::c_void,errorCode: crate::core::HRESULT,result: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -1855,8 +1869,8 @@ let result_borrow = if result.is_null() { None } else { Some(::core::mem::Manual
 match implementation.Invoke(errorCode,match &result_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler(&mut self, implementation: Box<dyn ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler as *const ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler, iids); } } }
-impl ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler { pub fn implement(implementation: Box<dyn ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler(mut self, implementation: Box<dyn ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler as *const ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler, iids); } self } }
+impl ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler { pub fn implement(implementation: Box<dyn ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler: crate::core::GUID = crate::core::GUID { data1: 1816664563, data2: 51639, data3: 16992, data4: [129,39,201,245,189,231,246,140,] };
 #[repr(C)]
 pub struct ICoreWebView2CreateCoreWebView2ControllerCompletedHandler_Vtbl {
@@ -1891,10 +1905,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2CreateCoreWebView2ControllerCompletedHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2CreateCoreWebView2ControllerCompletedHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2CreateCoreWebView2ControllerCompletedHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2CreateCoreWebView2ControllerCompletedHandlerImpl {
 fn Invoke(&self, errorCode: crate::core::HRESULT, result: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2Controller>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler: ICoreWebView2CreateCoreWebView2ControllerCompletedHandler_Vtbl = ICoreWebView2CreateCoreWebView2ControllerCompletedHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler: ICoreWebView2CreateCoreWebView2ControllerCompletedHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2CreateCoreWebView2ControllerCompletedHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler_Invoke(this: *mut ::core::ffi::c_void,errorCode: crate::core::HRESULT,result: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -1903,8 +1919,8 @@ let result_borrow = if result.is_null() { None } else { Some(::core::mem::Manual
 match implementation.Invoke(errorCode,match &result_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2CreateCoreWebView2ControllerCompletedHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler(&mut self, implementation: Box<dyn ICoreWebView2CreateCoreWebView2ControllerCompletedHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler as *const ICoreWebView2CreateCoreWebView2ControllerCompletedHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler, iids); } } }
-impl ICoreWebView2CreateCoreWebView2ControllerCompletedHandler { pub fn implement(implementation: Box<dyn ICoreWebView2CreateCoreWebView2ControllerCompletedHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler(mut self, implementation: Box<dyn ICoreWebView2CreateCoreWebView2ControllerCompletedHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2CreateCoreWebView2ControllerCompletedHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler as *const ICoreWebView2CreateCoreWebView2ControllerCompletedHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler, iids); } self } }
+impl ICoreWebView2CreateCoreWebView2ControllerCompletedHandler { pub fn implement(implementation: Box<dyn ICoreWebView2CreateCoreWebView2ControllerCompletedHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler: crate::core::GUID = crate::core::GUID { data1: 1317680009, data2: 51672, data3: 19410, data4: [182,181,18,79,238,108,193,77,] };
 #[repr(C)]
 pub struct ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler_Vtbl {
@@ -1939,10 +1955,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandlerImpl {
 fn Invoke(&self, errorCode: crate::core::HRESULT, result: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2Environment>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler: ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler_Vtbl = ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler: ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler_Invoke(this: *mut ::core::ffi::c_void,errorCode: crate::core::HRESULT,result: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -1951,8 +1969,8 @@ let result_borrow = if result.is_null() { None } else { Some(::core::mem::Manual
 match implementation.Invoke(errorCode,match &result_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler(&mut self, implementation: Box<dyn ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler as *const ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler, iids); } } }
-impl ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler { pub fn implement(implementation: Box<dyn ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler(mut self, implementation: Box<dyn ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler as *const ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler, iids); } self } }
+impl ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler { pub fn implement(implementation: Box<dyn ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2CursorChangedEventHandler: crate::core::GUID = crate::core::GUID { data1: 2644786380, data2: 9953, data3: 19885, data4: [181,108,216,150,28,148,197,113,] };
 #[repr(C)]
 pub struct ICoreWebView2CursorChangedEventHandler_Vtbl {
@@ -1987,10 +2005,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2CursorChangedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2CursorChangedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2CursorChangedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2CursorChangedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2CompositionController>, args: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2CursorChangedEventHandler: ICoreWebView2CursorChangedEventHandler_Vtbl = ICoreWebView2CursorChangedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2CursorChangedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2CursorChangedEventHandler: ICoreWebView2CursorChangedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2CursorChangedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2CursorChangedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2CursorChangedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -2000,8 +2020,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2CursorChangedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2CursorChangedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2CursorChangedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2CursorChangedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2CursorChangedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2CursorChangedEventHandler as *const ICoreWebView2CursorChangedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2CursorChangedEventHandler, iids); } } }
-impl ICoreWebView2CursorChangedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2CursorChangedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2CursorChangedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2CursorChangedEventHandler(mut self, implementation: Box<dyn ICoreWebView2CursorChangedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2CursorChangedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2CursorChangedEventHandler as *const ICoreWebView2CursorChangedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2CursorChangedEventHandler, iids); } self } }
+impl ICoreWebView2CursorChangedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2CursorChangedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2CursorChangedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2Deferral: crate::core::GUID = crate::core::GUID { data1: 3238952827, data2: 46469, data3: 18160, data4: [166,35,139,239,191,62,78,224,] };
 #[repr(C)]
 pub struct ICoreWebView2Deferral_Vtbl {
@@ -2105,10 +2125,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2DevToolsProtocolEventReceivedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2DevToolsProtocolEventReceivedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2DevToolsProtocolEventReceivedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2DevToolsProtocolEventReceivedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2>, args: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2DevToolsProtocolEventReceivedEventArgs>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2DevToolsProtocolEventReceivedEventHandler: ICoreWebView2DevToolsProtocolEventReceivedEventHandler_Vtbl = ICoreWebView2DevToolsProtocolEventReceivedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2DevToolsProtocolEventReceivedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2DevToolsProtocolEventReceivedEventHandler: ICoreWebView2DevToolsProtocolEventReceivedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2DevToolsProtocolEventReceivedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2DevToolsProtocolEventReceivedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2DevToolsProtocolEventReceivedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -2118,8 +2140,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2DevToolsProtocolEventReceivedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2DevToolsProtocolEventReceivedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2DevToolsProtocolEventReceivedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2DevToolsProtocolEventReceivedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2DevToolsProtocolEventReceivedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2DevToolsProtocolEventReceivedEventHandler as *const ICoreWebView2DevToolsProtocolEventReceivedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2DevToolsProtocolEventReceivedEventHandler, iids); } } }
-impl ICoreWebView2DevToolsProtocolEventReceivedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2DevToolsProtocolEventReceivedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2DevToolsProtocolEventReceivedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2DevToolsProtocolEventReceivedEventHandler(mut self, implementation: Box<dyn ICoreWebView2DevToolsProtocolEventReceivedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2DevToolsProtocolEventReceivedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2DevToolsProtocolEventReceivedEventHandler as *const ICoreWebView2DevToolsProtocolEventReceivedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2DevToolsProtocolEventReceivedEventHandler, iids); } self } }
+impl ICoreWebView2DevToolsProtocolEventReceivedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2DevToolsProtocolEventReceivedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2DevToolsProtocolEventReceivedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2DevToolsProtocolEventReceiver: crate::core::GUID = crate::core::GUID { data1: 3006047514, data2: 33649, data3: 17897, data4: [147,23,175,2,29,8,3,103,] };
 #[repr(C)]
 pub struct ICoreWebView2DevToolsProtocolEventReceiver_Vtbl {
@@ -2195,10 +2217,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2DocumentTitleChangedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2DocumentTitleChangedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2DocumentTitleChangedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2DocumentTitleChangedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2>, args: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2DocumentTitleChangedEventHandler: ICoreWebView2DocumentTitleChangedEventHandler_Vtbl = ICoreWebView2DocumentTitleChangedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2DocumentTitleChangedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2DocumentTitleChangedEventHandler: ICoreWebView2DocumentTitleChangedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2DocumentTitleChangedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2DocumentTitleChangedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2DocumentTitleChangedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -2208,8 +2232,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2DocumentTitleChangedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2DocumentTitleChangedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2DocumentTitleChangedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2DocumentTitleChangedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2DocumentTitleChangedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2DocumentTitleChangedEventHandler as *const ICoreWebView2DocumentTitleChangedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2DocumentTitleChangedEventHandler, iids); } } }
-impl ICoreWebView2DocumentTitleChangedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2DocumentTitleChangedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2DocumentTitleChangedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2DocumentTitleChangedEventHandler(mut self, implementation: Box<dyn ICoreWebView2DocumentTitleChangedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2DocumentTitleChangedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2DocumentTitleChangedEventHandler as *const ICoreWebView2DocumentTitleChangedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2DocumentTitleChangedEventHandler, iids); } self } }
+impl ICoreWebView2DocumentTitleChangedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2DocumentTitleChangedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2DocumentTitleChangedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2Environment: crate::core::GUID = crate::core::GUID { data1: 3110958430, data2: 793, data3: 20114, data4: [162,150,35,67,111,70,161,252,] };
 #[repr(C)]
 pub struct ICoreWebView2Environment_Vtbl {
@@ -2492,6 +2516,7 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2EnvironmentOptions { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2EnvironmentOptions { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2EnvironmentOptions { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2EnvironmentOptionsImpl {
 fn get_AdditionalBrowserArguments(&self) -> Result<crate::core::PWSTR, crate::core::HRESULT>;
 fn put_AdditionalBrowserArguments(&self, arg0: crate::core::PCWSTR) -> Result<(), crate::core::HRESULT>;
@@ -2502,7 +2527,8 @@ fn put_TargetCompatibleBrowserVersion(&self, arg0: crate::core::PCWSTR) -> Resul
 fn get_AllowSingleSignOnUsingOSPrimaryAccount(&self) -> Result<i32, crate::core::HRESULT>;
 fn put_AllowSingleSignOnUsingOSPrimaryAccount(&self, arg0: i32) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2EnvironmentOptions: ICoreWebView2EnvironmentOptions_Vtbl = ICoreWebView2EnvironmentOptions_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2EnvironmentOptions_Vtbl>() == 11 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2EnvironmentOptions: ICoreWebView2EnvironmentOptions_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2EnvironmentOptions_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 get_AdditionalBrowserArguments: thunk_ICoreWebView2EnvironmentOptions_get_AdditionalBrowserArguments,
 put_AdditionalBrowserArguments: thunk_ICoreWebView2EnvironmentOptions_put_AdditionalBrowserArguments,
 get_Language: thunk_ICoreWebView2EnvironmentOptions_get_Language,
@@ -2553,8 +2579,8 @@ let implementation = &*((* (this as *const crate::core::ObjectSlot)).implementat
 match implementation.put_AllowSingleSignOnUsingOSPrimaryAccount(arg0) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2EnvironmentOptions(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2EnvironmentOptionsImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2EnvironmentOptions(&mut self, implementation: Box<dyn ICoreWebView2EnvironmentOptionsImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2EnvironmentOptions); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2EnvironmentOptions as *const ICoreWebView2EnvironmentOptions_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2EnvironmentOptions, iids); } } }
-impl ICoreWebView2EnvironmentOptions { pub fn implement(implementation: Box<dyn ICoreWebView2EnvironmentOptionsImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2EnvironmentOptions(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2EnvironmentOptions(mut self, implementation: Box<dyn ICoreWebView2EnvironmentOptionsImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2EnvironmentOptions::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2EnvironmentOptions as *const ICoreWebView2EnvironmentOptions_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2EnvironmentOptions, iids); } self } }
+impl ICoreWebView2EnvironmentOptions { pub fn implement(implementation: Box<dyn ICoreWebView2EnvironmentOptionsImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2EnvironmentOptions(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2ExecuteScriptCompletedHandler: crate::core::GUID = crate::core::GUID { data1: 1230049650, data2: 52327, data3: 19402, data4: [153,35,19,113,18,244,196,204,] };
 #[repr(C)]
 pub struct ICoreWebView2ExecuteScriptCompletedHandler_Vtbl {
@@ -2589,10 +2615,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2ExecuteScriptCompletedHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2ExecuteScriptCompletedHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2ExecuteScriptCompletedHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2ExecuteScriptCompletedHandlerImpl {
 fn Invoke(&self, errorCode: crate::core::HRESULT, result: crate::core::PCWSTR) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2ExecuteScriptCompletedHandler: ICoreWebView2ExecuteScriptCompletedHandler_Vtbl = ICoreWebView2ExecuteScriptCompletedHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2ExecuteScriptCompletedHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2ExecuteScriptCompletedHandler: ICoreWebView2ExecuteScriptCompletedHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2ExecuteScriptCompletedHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2ExecuteScriptCompletedHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2ExecuteScriptCompletedHandler_Invoke(this: *mut ::core::ffi::c_void,errorCode: crate::core::HRESULT,result: crate::core::PCWSTR) -> crate::core::HRESULT {
@@ -2600,8 +2628,8 @@ let implementation = &*((* (this as *const crate::core::ObjectSlot)).implementat
 match implementation.Invoke(errorCode,result) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2ExecuteScriptCompletedHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2ExecuteScriptCompletedHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2ExecuteScriptCompletedHandler(&mut self, implementation: Box<dyn ICoreWebView2ExecuteScriptCompletedHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2ExecuteScriptCompletedHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2ExecuteScriptCompletedHandler as *const ICoreWebView2ExecuteScriptCompletedHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2ExecuteScriptCompletedHandler, iids); } } }
-impl ICoreWebView2ExecuteScriptCompletedHandler { pub fn implement(implementation: Box<dyn ICoreWebView2ExecuteScriptCompletedHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2ExecuteScriptCompletedHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2ExecuteScriptCompletedHandler(mut self, implementation: Box<dyn ICoreWebView2ExecuteScriptCompletedHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2ExecuteScriptCompletedHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2ExecuteScriptCompletedHandler as *const ICoreWebView2ExecuteScriptCompletedHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2ExecuteScriptCompletedHandler, iids); } self } }
+impl ICoreWebView2ExecuteScriptCompletedHandler { pub fn implement(implementation: Box<dyn ICoreWebView2ExecuteScriptCompletedHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2ExecuteScriptCompletedHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2FocusChangedEventHandler: crate::core::GUID = crate::core::GUID { data1: 99230909, data2: 25682, data3: 18726, data4: [144,20,75,130,180,152,19,93,] };
 #[repr(C)]
 pub struct ICoreWebView2FocusChangedEventHandler_Vtbl {
@@ -2636,10 +2664,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2FocusChangedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2FocusChangedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2FocusChangedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2FocusChangedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2Controller>, args: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2FocusChangedEventHandler: ICoreWebView2FocusChangedEventHandler_Vtbl = ICoreWebView2FocusChangedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2FocusChangedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2FocusChangedEventHandler: ICoreWebView2FocusChangedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2FocusChangedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2FocusChangedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2FocusChangedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -2649,8 +2679,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2FocusChangedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2FocusChangedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2FocusChangedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2FocusChangedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2FocusChangedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2FocusChangedEventHandler as *const ICoreWebView2FocusChangedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2FocusChangedEventHandler, iids); } } }
-impl ICoreWebView2FocusChangedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2FocusChangedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2FocusChangedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2FocusChangedEventHandler(mut self, implementation: Box<dyn ICoreWebView2FocusChangedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2FocusChangedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2FocusChangedEventHandler as *const ICoreWebView2FocusChangedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2FocusChangedEventHandler, iids); } self } }
+impl ICoreWebView2FocusChangedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2FocusChangedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2FocusChangedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2HistoryChangedEventHandler: crate::core::GUID = crate::core::GUID { data1: 3348775436, data2: 61401, data3: 16472, data4: [146,149,62,139,75,202,182,69,] };
 #[repr(C)]
 pub struct ICoreWebView2HistoryChangedEventHandler_Vtbl {
@@ -2685,10 +2715,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2HistoryChangedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2HistoryChangedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2HistoryChangedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2HistoryChangedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2>, args: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2HistoryChangedEventHandler: ICoreWebView2HistoryChangedEventHandler_Vtbl = ICoreWebView2HistoryChangedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2HistoryChangedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2HistoryChangedEventHandler: ICoreWebView2HistoryChangedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2HistoryChangedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2HistoryChangedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2HistoryChangedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -2698,8 +2730,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2HistoryChangedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2HistoryChangedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2HistoryChangedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2HistoryChangedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2HistoryChangedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2HistoryChangedEventHandler as *const ICoreWebView2HistoryChangedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2HistoryChangedEventHandler, iids); } } }
-impl ICoreWebView2HistoryChangedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2HistoryChangedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2HistoryChangedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2HistoryChangedEventHandler(mut self, implementation: Box<dyn ICoreWebView2HistoryChangedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2HistoryChangedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2HistoryChangedEventHandler as *const ICoreWebView2HistoryChangedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2HistoryChangedEventHandler, iids); } self } }
+impl ICoreWebView2HistoryChangedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2HistoryChangedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2HistoryChangedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2HttpHeadersCollectionIterator: crate::core::GUID = crate::core::GUID { data1: 117636144, data2: 62523, data3: 18363, data4: [171,82,164,44,181,82,173,159,] };
 #[repr(C)]
 pub struct ICoreWebView2HttpHeadersCollectionIterator_Vtbl {
@@ -2960,10 +2992,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2MoveFocusRequestedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2MoveFocusRequestedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2MoveFocusRequestedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2MoveFocusRequestedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2Controller>, args: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2MoveFocusRequestedEventArgs>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2MoveFocusRequestedEventHandler: ICoreWebView2MoveFocusRequestedEventHandler_Vtbl = ICoreWebView2MoveFocusRequestedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2MoveFocusRequestedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2MoveFocusRequestedEventHandler: ICoreWebView2MoveFocusRequestedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2MoveFocusRequestedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2MoveFocusRequestedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2MoveFocusRequestedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -2973,8 +3007,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2MoveFocusRequestedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2MoveFocusRequestedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2MoveFocusRequestedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2MoveFocusRequestedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2MoveFocusRequestedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2MoveFocusRequestedEventHandler as *const ICoreWebView2MoveFocusRequestedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2MoveFocusRequestedEventHandler, iids); } } }
-impl ICoreWebView2MoveFocusRequestedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2MoveFocusRequestedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2MoveFocusRequestedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2MoveFocusRequestedEventHandler(mut self, implementation: Box<dyn ICoreWebView2MoveFocusRequestedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2MoveFocusRequestedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2MoveFocusRequestedEventHandler as *const ICoreWebView2MoveFocusRequestedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2MoveFocusRequestedEventHandler, iids); } self } }
+impl ICoreWebView2MoveFocusRequestedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2MoveFocusRequestedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2MoveFocusRequestedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2NavigationCompletedEventArgs: crate::core::GUID = crate::core::GUID { data1: 819366781, data2: 8409, data3: 18258, data4: [169,202,236,132,72,251,181,193,] };
 #[repr(C)]
 pub struct ICoreWebView2NavigationCompletedEventArgs_Vtbl {
@@ -3058,10 +3092,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2NavigationCompletedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2NavigationCompletedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2NavigationCompletedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2NavigationCompletedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2>, args: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2NavigationCompletedEventArgs>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2NavigationCompletedEventHandler: ICoreWebView2NavigationCompletedEventHandler_Vtbl = ICoreWebView2NavigationCompletedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2NavigationCompletedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2NavigationCompletedEventHandler: ICoreWebView2NavigationCompletedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2NavigationCompletedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2NavigationCompletedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2NavigationCompletedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -3071,8 +3107,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2NavigationCompletedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2NavigationCompletedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2NavigationCompletedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2NavigationCompletedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2NavigationCompletedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2NavigationCompletedEventHandler as *const ICoreWebView2NavigationCompletedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2NavigationCompletedEventHandler, iids); } } }
-impl ICoreWebView2NavigationCompletedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2NavigationCompletedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2NavigationCompletedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2NavigationCompletedEventHandler(mut self, implementation: Box<dyn ICoreWebView2NavigationCompletedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2NavigationCompletedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2NavigationCompletedEventHandler as *const ICoreWebView2NavigationCompletedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2NavigationCompletedEventHandler, iids); } self } }
+impl ICoreWebView2NavigationCompletedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2NavigationCompletedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2NavigationCompletedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2NavigationStartingEventArgs: crate::core::GUID = crate::core::GUID { data1: 1531532393, data2: 57625, data3: 17290, data4: [155,24,118,4,242,95,46,73,] };
 #[repr(C)]
 pub struct ICoreWebView2NavigationStartingEventArgs_Vtbl {
@@ -3183,10 +3219,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2NavigationStartingEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2NavigationStartingEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2NavigationStartingEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2NavigationStartingEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2>, args: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2NavigationStartingEventArgs>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2NavigationStartingEventHandler: ICoreWebView2NavigationStartingEventHandler_Vtbl = ICoreWebView2NavigationStartingEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2NavigationStartingEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2NavigationStartingEventHandler: ICoreWebView2NavigationStartingEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2NavigationStartingEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2NavigationStartingEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2NavigationStartingEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -3196,8 +3234,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2NavigationStartingEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2NavigationStartingEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2NavigationStartingEventHandler(&mut self, implementation: Box<dyn ICoreWebView2NavigationStartingEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2NavigationStartingEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2NavigationStartingEventHandler as *const ICoreWebView2NavigationStartingEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2NavigationStartingEventHandler, iids); } } }
-impl ICoreWebView2NavigationStartingEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2NavigationStartingEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2NavigationStartingEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2NavigationStartingEventHandler(mut self, implementation: Box<dyn ICoreWebView2NavigationStartingEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2NavigationStartingEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2NavigationStartingEventHandler as *const ICoreWebView2NavigationStartingEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2NavigationStartingEventHandler, iids); } self } }
+impl ICoreWebView2NavigationStartingEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2NavigationStartingEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2NavigationStartingEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2NewBrowserVersionAvailableEventHandler: crate::core::GUID = crate::core::GUID { data1: 4188182382, data2: 54094, data3: 17660, data4: [173,238,129,182,181,124,169,20,] };
 #[repr(C)]
 pub struct ICoreWebView2NewBrowserVersionAvailableEventHandler_Vtbl {
@@ -3232,10 +3270,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2NewBrowserVersionAvailableEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2NewBrowserVersionAvailableEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2NewBrowserVersionAvailableEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2NewBrowserVersionAvailableEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2Environment>, args: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2NewBrowserVersionAvailableEventHandler: ICoreWebView2NewBrowserVersionAvailableEventHandler_Vtbl = ICoreWebView2NewBrowserVersionAvailableEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2NewBrowserVersionAvailableEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2NewBrowserVersionAvailableEventHandler: ICoreWebView2NewBrowserVersionAvailableEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2NewBrowserVersionAvailableEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2NewBrowserVersionAvailableEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2NewBrowserVersionAvailableEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -3245,8 +3285,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2NewBrowserVersionAvailableEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2NewBrowserVersionAvailableEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2NewBrowserVersionAvailableEventHandler(&mut self, implementation: Box<dyn ICoreWebView2NewBrowserVersionAvailableEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2NewBrowserVersionAvailableEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2NewBrowserVersionAvailableEventHandler as *const ICoreWebView2NewBrowserVersionAvailableEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2NewBrowserVersionAvailableEventHandler, iids); } } }
-impl ICoreWebView2NewBrowserVersionAvailableEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2NewBrowserVersionAvailableEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2NewBrowserVersionAvailableEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2NewBrowserVersionAvailableEventHandler(mut self, implementation: Box<dyn ICoreWebView2NewBrowserVersionAvailableEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2NewBrowserVersionAvailableEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2NewBrowserVersionAvailableEventHandler as *const ICoreWebView2NewBrowserVersionAvailableEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2NewBrowserVersionAvailableEventHandler, iids); } self } }
+impl ICoreWebView2NewBrowserVersionAvailableEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2NewBrowserVersionAvailableEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2NewBrowserVersionAvailableEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2NewWindowRequestedEventArgs: crate::core::GUID = crate::core::GUID { data1: 883732764, data2: 64567, data3: 17432, data4: [145,50,249,194,29,30,175,185,] };
 #[repr(C)]
 pub struct ICoreWebView2NewWindowRequestedEventArgs_Vtbl {
@@ -3363,10 +3403,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2NewWindowRequestedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2NewWindowRequestedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2NewWindowRequestedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2NewWindowRequestedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2>, args: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2NewWindowRequestedEventArgs>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2NewWindowRequestedEventHandler: ICoreWebView2NewWindowRequestedEventHandler_Vtbl = ICoreWebView2NewWindowRequestedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2NewWindowRequestedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2NewWindowRequestedEventHandler: ICoreWebView2NewWindowRequestedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2NewWindowRequestedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2NewWindowRequestedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2NewWindowRequestedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -3376,8 +3418,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2NewWindowRequestedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2NewWindowRequestedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2NewWindowRequestedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2NewWindowRequestedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2NewWindowRequestedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2NewWindowRequestedEventHandler as *const ICoreWebView2NewWindowRequestedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2NewWindowRequestedEventHandler, iids); } } }
-impl ICoreWebView2NewWindowRequestedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2NewWindowRequestedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2NewWindowRequestedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2NewWindowRequestedEventHandler(mut self, implementation: Box<dyn ICoreWebView2NewWindowRequestedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2NewWindowRequestedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2NewWindowRequestedEventHandler as *const ICoreWebView2NewWindowRequestedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2NewWindowRequestedEventHandler, iids); } self } }
+impl ICoreWebView2NewWindowRequestedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2NewWindowRequestedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2NewWindowRequestedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2PermissionRequestedEventArgs: crate::core::GUID = crate::core::GUID { data1: 2537218799, data2: 65304, data3: 18580, data4: [143,178,60,117,143,4,104,16,] };
 #[repr(C)]
 pub struct ICoreWebView2PermissionRequestedEventArgs_Vtbl {
@@ -3481,10 +3523,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2PermissionRequestedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2PermissionRequestedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2PermissionRequestedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2PermissionRequestedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2>, args: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2PermissionRequestedEventArgs>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2PermissionRequestedEventHandler: ICoreWebView2PermissionRequestedEventHandler_Vtbl = ICoreWebView2PermissionRequestedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2PermissionRequestedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2PermissionRequestedEventHandler: ICoreWebView2PermissionRequestedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2PermissionRequestedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2PermissionRequestedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2PermissionRequestedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -3494,8 +3538,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2PermissionRequestedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2PermissionRequestedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2PermissionRequestedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2PermissionRequestedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2PermissionRequestedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2PermissionRequestedEventHandler as *const ICoreWebView2PermissionRequestedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2PermissionRequestedEventHandler, iids); } } }
-impl ICoreWebView2PermissionRequestedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2PermissionRequestedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2PermissionRequestedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2PermissionRequestedEventHandler(mut self, implementation: Box<dyn ICoreWebView2PermissionRequestedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2PermissionRequestedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2PermissionRequestedEventHandler as *const ICoreWebView2PermissionRequestedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2PermissionRequestedEventHandler, iids); } self } }
+impl ICoreWebView2PermissionRequestedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2PermissionRequestedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2PermissionRequestedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2PointerInfo: crate::core::GUID = crate::core::GUID { data1: 3868809351, data2: 53517, data3: 20317, data4: [147,89,76,228,110,79,150,185,] };
 #[repr(C)]
 pub struct ICoreWebView2PointerInfo_Vtbl {
@@ -3957,10 +4001,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2ProcessFailedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2ProcessFailedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2ProcessFailedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2ProcessFailedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2>, args: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2ProcessFailedEventArgs>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2ProcessFailedEventHandler: ICoreWebView2ProcessFailedEventHandler_Vtbl = ICoreWebView2ProcessFailedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2ProcessFailedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2ProcessFailedEventHandler: ICoreWebView2ProcessFailedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2ProcessFailedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2ProcessFailedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2ProcessFailedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -3970,8 +4016,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2ProcessFailedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2ProcessFailedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2ProcessFailedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2ProcessFailedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2ProcessFailedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2ProcessFailedEventHandler as *const ICoreWebView2ProcessFailedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2ProcessFailedEventHandler, iids); } } }
-impl ICoreWebView2ProcessFailedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2ProcessFailedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2ProcessFailedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2ProcessFailedEventHandler(mut self, implementation: Box<dyn ICoreWebView2ProcessFailedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2ProcessFailedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2ProcessFailedEventHandler as *const ICoreWebView2ProcessFailedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2ProcessFailedEventHandler, iids); } self } }
+impl ICoreWebView2ProcessFailedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2ProcessFailedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2ProcessFailedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2RasterizationScaleChangedEventHandler: crate::core::GUID = crate::core::GUID { data1: 2627258545, data2: 44115, data3: 17022, data4: [163,69,48,73,181,82,75,190,] };
 #[repr(C)]
 pub struct ICoreWebView2RasterizationScaleChangedEventHandler_Vtbl {
@@ -4006,10 +4052,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2RasterizationScaleChangedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2RasterizationScaleChangedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2RasterizationScaleChangedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2RasterizationScaleChangedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2Controller>, args: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2RasterizationScaleChangedEventHandler: ICoreWebView2RasterizationScaleChangedEventHandler_Vtbl = ICoreWebView2RasterizationScaleChangedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2RasterizationScaleChangedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2RasterizationScaleChangedEventHandler: ICoreWebView2RasterizationScaleChangedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2RasterizationScaleChangedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2RasterizationScaleChangedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2RasterizationScaleChangedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -4019,8 +4067,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2RasterizationScaleChangedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2RasterizationScaleChangedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2RasterizationScaleChangedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2RasterizationScaleChangedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2RasterizationScaleChangedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2RasterizationScaleChangedEventHandler as *const ICoreWebView2RasterizationScaleChangedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2RasterizationScaleChangedEventHandler, iids); } } }
-impl ICoreWebView2RasterizationScaleChangedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2RasterizationScaleChangedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2RasterizationScaleChangedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2RasterizationScaleChangedEventHandler(mut self, implementation: Box<dyn ICoreWebView2RasterizationScaleChangedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2RasterizationScaleChangedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2RasterizationScaleChangedEventHandler as *const ICoreWebView2RasterizationScaleChangedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2RasterizationScaleChangedEventHandler, iids); } self } }
+impl ICoreWebView2RasterizationScaleChangedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2RasterizationScaleChangedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2RasterizationScaleChangedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2ScriptDialogOpeningEventArgs: crate::core::GUID = crate::core::GUID { data1: 1938865008, data2: 44000, data3: 18499, data4: [149,41,241,67,179,27,3,214,] };
 #[repr(C)]
 pub struct ICoreWebView2ScriptDialogOpeningEventArgs_Vtbl {
@@ -4137,10 +4185,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2ScriptDialogOpeningEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2ScriptDialogOpeningEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2ScriptDialogOpeningEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2ScriptDialogOpeningEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2>, args: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2ScriptDialogOpeningEventArgs>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2ScriptDialogOpeningEventHandler: ICoreWebView2ScriptDialogOpeningEventHandler_Vtbl = ICoreWebView2ScriptDialogOpeningEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2ScriptDialogOpeningEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2ScriptDialogOpeningEventHandler: ICoreWebView2ScriptDialogOpeningEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2ScriptDialogOpeningEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2ScriptDialogOpeningEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2ScriptDialogOpeningEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -4150,8 +4200,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2ScriptDialogOpeningEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2ScriptDialogOpeningEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2ScriptDialogOpeningEventHandler(&mut self, implementation: Box<dyn ICoreWebView2ScriptDialogOpeningEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2ScriptDialogOpeningEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2ScriptDialogOpeningEventHandler as *const ICoreWebView2ScriptDialogOpeningEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2ScriptDialogOpeningEventHandler, iids); } } }
-impl ICoreWebView2ScriptDialogOpeningEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2ScriptDialogOpeningEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2ScriptDialogOpeningEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2ScriptDialogOpeningEventHandler(mut self, implementation: Box<dyn ICoreWebView2ScriptDialogOpeningEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2ScriptDialogOpeningEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2ScriptDialogOpeningEventHandler as *const ICoreWebView2ScriptDialogOpeningEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2ScriptDialogOpeningEventHandler, iids); } self } }
+impl ICoreWebView2ScriptDialogOpeningEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2ScriptDialogOpeningEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2ScriptDialogOpeningEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2Settings: crate::core::GUID = crate::core::GUID { data1: 3848463600, data2: 55290, data3: 17324, data4: [141,113,192,81,80,73,159,0,] };
 #[repr(C)]
 pub struct ICoreWebView2Settings_Vtbl {
@@ -4366,10 +4416,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2SourceChangedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2SourceChangedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2SourceChangedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2SourceChangedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2>, args: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2SourceChangedEventArgs>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2SourceChangedEventHandler: ICoreWebView2SourceChangedEventHandler_Vtbl = ICoreWebView2SourceChangedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2SourceChangedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2SourceChangedEventHandler: ICoreWebView2SourceChangedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2SourceChangedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2SourceChangedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2SourceChangedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -4379,8 +4431,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2SourceChangedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2SourceChangedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2SourceChangedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2SourceChangedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2SourceChangedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2SourceChangedEventHandler as *const ICoreWebView2SourceChangedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2SourceChangedEventHandler, iids); } } }
-impl ICoreWebView2SourceChangedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2SourceChangedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2SourceChangedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2SourceChangedEventHandler(mut self, implementation: Box<dyn ICoreWebView2SourceChangedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2SourceChangedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2SourceChangedEventHandler as *const ICoreWebView2SourceChangedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2SourceChangedEventHandler, iids); } self } }
+impl ICoreWebView2SourceChangedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2SourceChangedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2SourceChangedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2WebMessageReceivedEventArgs: crate::core::GUID = crate::core::GUID { data1: 261727244, data2: 59746, data3: 16903, data4: [158,146,227,213,66,239,248,73,] };
 #[repr(C)]
 pub struct ICoreWebView2WebMessageReceivedEventArgs_Vtbl {
@@ -4464,10 +4516,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2WebMessageReceivedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2WebMessageReceivedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2WebMessageReceivedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2WebMessageReceivedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2>, args: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2WebMessageReceivedEventArgs>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2WebMessageReceivedEventHandler: ICoreWebView2WebMessageReceivedEventHandler_Vtbl = ICoreWebView2WebMessageReceivedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2WebMessageReceivedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2WebMessageReceivedEventHandler: ICoreWebView2WebMessageReceivedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2WebMessageReceivedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2WebMessageReceivedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2WebMessageReceivedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -4477,8 +4531,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2WebMessageReceivedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2WebMessageReceivedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2WebMessageReceivedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2WebMessageReceivedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2WebMessageReceivedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2WebMessageReceivedEventHandler as *const ICoreWebView2WebMessageReceivedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2WebMessageReceivedEventHandler, iids); } } }
-impl ICoreWebView2WebMessageReceivedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2WebMessageReceivedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2WebMessageReceivedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2WebMessageReceivedEventHandler(mut self, implementation: Box<dyn ICoreWebView2WebMessageReceivedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2WebMessageReceivedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2WebMessageReceivedEventHandler as *const ICoreWebView2WebMessageReceivedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2WebMessageReceivedEventHandler, iids); } self } }
+impl ICoreWebView2WebMessageReceivedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2WebMessageReceivedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2WebMessageReceivedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2WebResourceRequest: crate::core::GUID = crate::core::GUID { data1: 2533711060, data2: 20780, data3: 16996, data4: [139,95,227,244,70,206,166,165,] };
 #[repr(C)]
 pub struct ICoreWebView2WebResourceRequest_Vtbl {
@@ -4649,10 +4703,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2WebResourceRequestedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2WebResourceRequestedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2WebResourceRequestedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2WebResourceRequestedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2>, args: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2WebResourceRequestedEventArgs>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2WebResourceRequestedEventHandler: ICoreWebView2WebResourceRequestedEventHandler_Vtbl = ICoreWebView2WebResourceRequestedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2WebResourceRequestedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2WebResourceRequestedEventHandler: ICoreWebView2WebResourceRequestedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2WebResourceRequestedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2WebResourceRequestedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2WebResourceRequestedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -4662,8 +4718,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2WebResourceRequestedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2WebResourceRequestedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2WebResourceRequestedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2WebResourceRequestedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2WebResourceRequestedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2WebResourceRequestedEventHandler as *const ICoreWebView2WebResourceRequestedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2WebResourceRequestedEventHandler, iids); } } }
-impl ICoreWebView2WebResourceRequestedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2WebResourceRequestedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2WebResourceRequestedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2WebResourceRequestedEventHandler(mut self, implementation: Box<dyn ICoreWebView2WebResourceRequestedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2WebResourceRequestedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2WebResourceRequestedEventHandler as *const ICoreWebView2WebResourceRequestedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2WebResourceRequestedEventHandler, iids); } self } }
+impl ICoreWebView2WebResourceRequestedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2WebResourceRequestedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2WebResourceRequestedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2WebResourceResponse: crate::core::GUID = crate::core::GUID { data1: 2868693327, data2: 64039, data3: 18685, data4: [151,223,131,14,247,90,174,201,] };
 #[repr(C)]
 pub struct ICoreWebView2WebResourceResponse_Vtbl {
@@ -4772,10 +4828,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2WindowCloseRequestedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2WindowCloseRequestedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2WindowCloseRequestedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2WindowCloseRequestedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2>, args: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2WindowCloseRequestedEventHandler: ICoreWebView2WindowCloseRequestedEventHandler_Vtbl = ICoreWebView2WindowCloseRequestedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2WindowCloseRequestedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2WindowCloseRequestedEventHandler: ICoreWebView2WindowCloseRequestedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2WindowCloseRequestedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2WindowCloseRequestedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2WindowCloseRequestedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -4785,8 +4843,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2WindowCloseRequestedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2WindowCloseRequestedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2WindowCloseRequestedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2WindowCloseRequestedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2WindowCloseRequestedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2WindowCloseRequestedEventHandler as *const ICoreWebView2WindowCloseRequestedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2WindowCloseRequestedEventHandler, iids); } } }
-impl ICoreWebView2WindowCloseRequestedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2WindowCloseRequestedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2WindowCloseRequestedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2WindowCloseRequestedEventHandler(mut self, implementation: Box<dyn ICoreWebView2WindowCloseRequestedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2WindowCloseRequestedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2WindowCloseRequestedEventHandler as *const ICoreWebView2WindowCloseRequestedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2WindowCloseRequestedEventHandler, iids); } self } }
+impl ICoreWebView2WindowCloseRequestedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2WindowCloseRequestedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2WindowCloseRequestedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub const IID_ICoreWebView2WindowFeatures: crate::core::GUID = crate::core::GUID { data1: 1588549023, data2: 46190, data3: 17303, data4: [136,96,228,34,242,135,255,30,] };
 #[repr(C)]
 pub struct ICoreWebView2WindowFeatures_Vtbl {
@@ -4919,10 +4977,12 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for ICoreWebView2ZoomFactorChangedEventHandler { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for ICoreWebView2ZoomFactorChangedEventHandler { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for ICoreWebView2ZoomFactorChangedEventHandler { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+/// Callback methods may receive raw ABI pointers; validate them before use.
 pub trait ICoreWebView2ZoomFactorChangedEventHandlerImpl {
 fn Invoke(&self, sender: Option<&crate::system_web_view::TypeLibrary::ICoreWebView2Controller>, args: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT>;
 }
-static IMPLEMENT_VTABLE_ICoreWebView2ZoomFactorChangedEventHandler: ICoreWebView2ZoomFactorChangedEventHandler_Vtbl = ICoreWebView2ZoomFactorChangedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
+const _: () = assert!(::core::mem::size_of::<ICoreWebView2ZoomFactorChangedEventHandler_Vtbl>() == 4 * ::core::mem::size_of::<unsafe extern "system" fn()>());
+static IMPLEMENT_VTABLE_ICoreWebView2ZoomFactorChangedEventHandler: ICoreWebView2ZoomFactorChangedEventHandler_Vtbl = crate::system_web_view::TypeLibrary::ICoreWebView2ZoomFactorChangedEventHandler_Vtbl { base__: crate::core::IUnknown_Vtbl { QueryInterface: crate::core::object_query, AddRef: crate::core::object_add_ref, Release: crate::core::object_release },
 Invoke: thunk_ICoreWebView2ZoomFactorChangedEventHandler_Invoke,
 };
 unsafe extern "system" fn thunk_ICoreWebView2ZoomFactorChangedEventHandler_Invoke(this: *mut ::core::ffi::c_void,sender: *mut ::core::ffi::c_void,args: *mut ::core::ffi::c_void) -> crate::core::HRESULT {
@@ -4932,8 +4992,8 @@ let args_borrow = if args.is_null() { None } else { Some(::core::mem::ManuallyDr
 match implementation.Invoke(match &sender_borrow { Some(p) => Some(&**p), None => None },match &args_borrow { Some(p) => Some(&**p), None => None }) { Ok(value__) => { let _ = value__; crate::core::HRESULT(0) }, Err(error) => error }
 }
 unsafe fn destroy_ICoreWebView2ZoomFactorChangedEventHandler(raw: *mut ::core::ffi::c_void) { drop(Box::from_raw(raw as *mut Box<dyn ICoreWebView2ZoomFactorChangedEventHandlerImpl>)); }
-impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2ZoomFactorChangedEventHandler(&mut self, implementation: Box<dyn ICoreWebView2ZoomFactorChangedEventHandlerImpl>) { let mut iids = Vec::new(); iids.push(IID_ICoreWebView2ZoomFactorChangedEventHandler); unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2ZoomFactorChangedEventHandler as *const ICoreWebView2ZoomFactorChangedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2ZoomFactorChangedEventHandler, iids); } } }
-impl ICoreWebView2ZoomFactorChangedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2ZoomFactorChangedEventHandlerImpl>) -> Self { let mut object = crate::core::ObjectBuilder::new(); object.add_ICoreWebView2ZoomFactorChangedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("one COM interface")).expect("allocated COM interface") } } }
+impl crate::core::ObjectBuilder { pub fn add_ICoreWebView2ZoomFactorChangedEventHandler(mut self, implementation: Box<dyn ICoreWebView2ZoomFactorChangedEventHandlerImpl>) -> Self { let iids = vec![crate::system_web_view::TypeLibrary::ICoreWebView2ZoomFactorChangedEventHandler::IID,]; unsafe { self.add(&IMPLEMENT_VTABLE_ICoreWebView2ZoomFactorChangedEventHandler as *const ICoreWebView2ZoomFactorChangedEventHandler_Vtbl as *const ::core::ffi::c_void, Box::into_raw(Box::new(implementation)) as *mut ::core::ffi::c_void, destroy_ICoreWebView2ZoomFactorChangedEventHandler, iids); } self } }
+impl ICoreWebView2ZoomFactorChangedEventHandler { pub fn implement(implementation: Box<dyn ICoreWebView2ZoomFactorChangedEventHandlerImpl>) -> Self { let object = crate::core::ObjectBuilder::new().add_ICoreWebView2ZoomFactorChangedEventHandler(implementation); unsafe { Self::from_raw(object.finish().expect("COM object")).expect("allocated COM interface") } } }
 pub type CreateEnvironment = unsafe extern "system" fn(bool,u32,crate::core::PCWSTR,*mut ::core::ffi::c_void,*mut ::core::ffi::c_void) -> crate::core::HRESULT;
 }
 pub mod Win32 {
