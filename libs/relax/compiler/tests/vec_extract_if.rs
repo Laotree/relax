@@ -22,3 +22,13 @@ fn extract_if_dropped_early_keeps_the_rest() {
     assert_eq!(v, ["a", "c", "dd", "e"]);
     println!("| extract_if {:?}", v);
 }
+
+// alloc vec/cow.rs From<&[T; N]> for Cow<[T]> (Robrix room_display_filter.rs `(&[]).into()`)
+#[test]
+fn cow_from_array_ref() {
+    use std::borrow::Cow;
+    let empty: Cow<'_, [String]> = (&[]).into();
+    assert!(empty.is_empty() && matches!(empty, Cow::Borrowed(_)));
+    let three: Cow<'_, [u8]> = Cow::from(&[1u8, 2, 3]);
+    assert_eq!(&*three, &[1, 2, 3]);
+}

@@ -1036,6 +1036,13 @@ impl<'a, T: Clone> From<&'a [T]> for Cow<'a, [T]> {
         Cow::Borrowed(s)
     }
 }
+/// library/alloc/src/vec/cow.rs (stable 1.77, cow_from_array_ref): `(&[]).into()` (Robrix)
+#[cfg(not(relax_check))]
+impl<'a, T: Clone, const N: usize> From<&'a [T; N]> for Cow<'a, [T]> {
+    fn from(s: &'a [T; N]) -> Cow<'a, [T]> {
+        Cow::Borrowed(s as &[_])
+    }
+}
 
 impl<T> FromIterator<T> for Vec<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Vec<T> {
