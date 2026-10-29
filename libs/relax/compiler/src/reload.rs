@@ -3845,6 +3845,15 @@ fn restart_in_place(why: String) -> Result<&'static str, String> {
     exec_restart(None).map(|_| "process restart")
 }
 
+/// A hosted app's relaunch in place could not happen (its previous run did not hand its domain
+/// over): the process starts again instead, same binary and command line, with the state the app
+/// left for the relaunch (std::relax::restart_now) when it left one. Returns only on failure.
+pub fn restart_process(why: &str) -> Result<(), String> {
+    let state = DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).take();
+    *RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = format!("the relaunch in place failed: {why}");
+    exec_restart(state.as_deref().map(str::as_bytes))
+}
+
 /// The process starts again: the loader binary with the same command line, `state` handed to the
 /// new run (MAKEPAD_RUN_RESTORE). Returns only on failure.
 fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
