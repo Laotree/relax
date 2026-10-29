@@ -3436,7 +3436,6 @@ fn summary_inner(why: &str) {
             verbose!("makepad-run: publish O1 on the owner by kind: {}", jit::publish_opt_summary());
             verbose!("makepad-run: O3 candidate takes: {}", jit::cand_skip_summary());
             verbose!("makepad-run: fronts off the owner by job: {}", jit::prefront_site_summary());
-            if let Some(c) = jit::candstat_summary() { verbose!("makepad-run: O3 cached candidates: {}", c); }
             verbose!("makepad-run: O3 install records on the owner: {}x {:.0} ms", jit::O3_INSTALL_REC[0].load(std::sync::atomic::Ordering::Relaxed), jit::O3_INSTALL_REC[1].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6);
             verbose!("makepad-run: O3 owner cpu by part: {}", jit::o3_owner_summary());
         }

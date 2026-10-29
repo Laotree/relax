@@ -16275,14 +16275,6 @@ impl Unit {
     /// Whether slot `id` has run: compiled in this process, or (before its first install here) in
     /// an earlier session -- a startup-image slot, or a slot with a stored code entry (looked up
     /// once by its key, on the owner). Such a slot is not never-run code for the O3 walk.
-    /// (instrument) slot `id`'s stored code entry: tier byte and code bytes.
-    pub(crate) fn stored_code_shape(&mut self, id: u32) -> Option<(u8, u32)> {
-        let mut c = self.cache.take()?;
-        let r = c.stored_code_shape(self, id);
-        self.cache = Some(c);
-        r
-    }
-
     pub(crate) fn ran_before(&mut self, id: u32) -> bool {
         let f = &self.fns[id as usize];
         if f.compiled || f.ran_before.load(Ordering::Relaxed) {
@@ -17508,10 +17500,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // assembly read these, off the owner when prefronted; and "the publish stopped at a level end"
     let views: std::cell::RefCell<HashMap<u32, O3View>> = Default::default();
     let scan = std::cell::Cell::new(false);
-    // (instrument, MAKEPAD_RUN_O3_CANDSTAT) candidates fronted only because their code came from the
-    // disk cache, and the front cpu per fronted slot
-    let cached_only: std::cell::RefCell<HashMap<u32, Option<(u8, u32)>>> = Default::default();
-    let front_ns: std::cell::RefCell<HashMap<u32, u64>> = Default::default();
     let snapped = loop {
     if !resume.replace(false) {
     fronts.borrow_mut().clear();
@@ -17710,13 +17698,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             && (u.fns[id as usize].rir_refs.contains(&c)
                 || callers.iter().any(|p| u.fns[*p as usize].rir.is_some() && u.fns[*p as usize].rir_refs.contains(&c)));
         let source_size = src_size(u, c);
-        let by_source = force || source_size <= src_toks || attr & relax_codegen::opt::ATTR_ALWAYS != 0
-            || (single && source_size <= TIER1_SINGLE_SRC_TOKS);
-        if cached_code && !by_source && candstat_on() && !cached_only.borrow().contains_key(&c) {
-            let shape = (&mut *up).stored_code_shape(c);
-            cached_only.borrow_mut().insert(c, shape);
-        }
-        if by_source || cached_code {
+        if force || cached_code || source_size <= src_toks || attr & relax_codegen::opt::ATTR_ALWAYS != 0
+            || (single && source_size <= TIER1_SINGLE_SRC_TOKS) {
             if prefront && !fronted.contains(&c) {
                 let twin_of = match u.fns[c as usize].key { FnKey::Plain(b) => Some(b), _ => None };
                 if let FnKey::Inst(d, args) = &u.fns[twin_of.unwrap_or(c) as usize].key {
@@ -17929,12 +17912,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             prefront_twin(&front, c, base);
             continue;
         }
-        let tc = if candstat_on() { cpu_ns() } else { 0 };
         let _preemptible = crate::preempt::Preemptible::on();
         typeck_ahead(&front, d, args, 1, false, true);
         let _want = WantConsts::on();
         lower_ahead(&front, c, true);
-        if tc != 0 { *front_ns.borrow_mut().entry(c).or_insert(0) += cpu_ns() - tc; }
     }
     TIER1_SNAP_FRONTS[1].fetch_add(cpu_ns() - tf, Ordering::Relaxed);
     ids.extend(ups);
@@ -18105,9 +18086,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
         let mut inlined = Vec::with_capacity(inline_rules.len());
         for (c, _) in inline_rules { inlined.push(c); }
-        if candstat_on() {
-            candstat_note(&snap, &inlined, &cached_only.borrow(), &front_ns.borrow());
-        }
         let nounwind_used = func.nounwind_inputs.clone();
         if let Some(w) = debug_env().0.as_deref() {
             if dump_rir_match(&name, w) {
@@ -19691,51 +19669,6 @@ pub static TIER1_SNAP_BUILT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new
 /// (o3_view, incl. recursive_fn); off it when prefronted the levels' callee scans and the assembly
 pub static TIER1_TAKE_PARTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 pub static TIER1_SNAP_FRONTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-/// (instrument) MAKEPAD_RUN_O3_CANDSTAT=1: O3 snapshot candidates fronted only because their code
-/// came from the disk cache, by O1 size bucket x attrs class: [snapshot, inlined, front cpu ns],
-/// and the largest inlined O1 body per attrs class
-fn candstat_on() -> bool {
-    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *T.get_or_init(|| std::env::var_os("MAKEPAD_RUN_O3_CANDSTAT").is_some())
-}
-const CANDSTAT_EDGES: [usize; 9] = [24, 60, 80, 150, 250, 300, 600, 1200, usize::MAX];
-static CANDSTAT: relax_session::sync::Mutex<Option<(HashMap<(usize, usize), [u64; 4]>, [usize; 4], u64, u64)>> = relax_session::sync::Mutex::new(None);
-fn candstat_note(snap: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], inlined: &[u32], cached_only: &HashMap<u32, Option<(u8, u32)>>, front_ns: &HashMap<u32, u64>) {
-    static ROWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let rows = *ROWS.get_or_init(|| std::env::var("MAKEPAD_RUN_O3_CANDSTAT").is_ok_and(|v| v == "rows"));
-    let mut g = CANDSTAT.lock().unwrap_or_else(|e| e.into_inner());
-    let (m, max, fronted, fronted_ns) = g.get_or_insert_with(|| (HashMap::new(), [0; 4], 0, 0));
-    for &c in cached_only.keys() {
-        if front_ns.contains_key(&c) { *fronted += 1; *fronted_ns += front_ns[&c]; }
-    }
-    for (c, r, attrs) in snap {
-        let Some(shape) = cached_only.get(c) else { continue };
-        if rows {
-            let (tier, code) = shape.unwrap_or((255, 0));
-            eprintln!("candstat-row {} {} {} {} {} {} {} {}", tier, code, relax_codegen::opt::inst_count(r), relax_codegen::opt::rustc_inline_cost(r, *c), relax_codegen::opt::rustc_inline_threshold(r, *attrs), attrs, inlined.contains(c) as u8, front_ns.get(c).copied().unwrap_or(0) / 1000);
-        }
-        let n = relax_codegen::opt::inst_count(r);
-        let b = CANDSTAT_EDGES.iter().position(|e| n <= *e).unwrap();
-        let k = if attrs & relax_codegen::opt::ATTR_ALWAYS != 0 { 3 } else if attrs & relax_codegen::opt::ATTR_CHAIN != 0 { 2 } else if attrs & relax_codegen::opt::ATTR_HINT != 0 { 1 } else { 0 };
-        let e = m.entry((k, b)).or_insert([0; 4]);
-        e[0] += 1;
-        e[2] += front_ns.get(c).copied().unwrap_or(0);
-        let cost = relax_codegen::opt::rustc_inline_cost(r, *c);
-        if cost <= relax_codegen::opt::rustc_inline_threshold(r, *attrs) { e[3] += 1; }
-        if inlined.contains(c) {
-            e[1] += 1;
-            max[k] = max[k].max(n);
-        }
-    }
-}
-pub(crate) fn candstat_summary() -> Option<String> {
-    let g = CANDSTAT.lock().unwrap_or_else(|e| e.into_inner());
-    let (m, max, fronted, fronted_ns) = g.as_ref()?;
-    let mut keys: Vec<_> = m.keys().copied().collect();
-    keys.sort();
-    let rows: Vec<String> = keys.iter().map(|k| { let e = m[k]; format!("{}<={} {}/{} cheap {} {:.0}ms", ["plain", "hint", "chain", "always"][k.0], CANDSTAT_EDGES[k.1] as i64, e[1], e[0], e[3], e[2] as f64 / 1e6) }).collect();
-    Some(format!("cached-only fronted {} ({:.0} ms); inlined/snapshot by O1 insts: {}; max inlined {:?}", fronted, *fronted_ns as f64 / 1e6, rows.join(", "), max))
-}
 /// O3 snapshots: inline candidates whose O1 optimisation ran on the O3 thread (count, cpu ns)
 pub static TIER1_SNAP_OFF: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
@@ -21579,9 +21512,6 @@ unsafe fn refront_settled(up: *mut Unit, id: u32, needs: bool) -> (bool, std::sy
 /// inline depth
 const PREFRONT_ROUNDS: usize = 24;
 
-/// Type-checks and lowers slot `id` on this thread, off the owner (its build takes the RIR,
-/// take_lowered_ahead). False: nothing to take (not a plain instance, or lowering ahead refused
-/// it: a body that names constants, a trait shim, a provided crate's function).
 thread_local! {
     /// (instrument) the background job whose fronts this thread runs (PREFRONT_SITE_NAMES)
     static FRONT_SITE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
@@ -21609,6 +21539,9 @@ pub(crate) fn prefront_site_summary() -> String {
         .map(|(k, n)| format!("{} {} ({:.0} ms)", n, PREFRONT_SITE[k][0].load(Ordering::Relaxed), PREFRONT_SITE[k][1].load(Ordering::Relaxed) as f64 / 1e6)).collect::<Vec<_>>().join(", ")
 }
 
+/// Type-checks and lowers slot `id` on this thread, off the owner (its build takes the RIR,
+/// take_lowered_ahead). False: nothing to take (not a plain instance, or lowering ahead refused
+/// it: a body that names constants, a trait shim, a provided crate's function).
 fn prefront_slot(front: &FrontShared, id: u32) -> bool {
     if owner::is_owner() {
         return prefront_fail(AF_OTHER);

@@ -101,19 +101,41 @@ impl FrontImages {
     }
 
     /// The demand plan `graph` recorded, when this load can take it as it is (DemandPlan::carried):
-    /// for these crates in this order, it selected every file of the last crate (it deferred
-    /// nothing: the load takes every crate in full, which is always sound), and its module probes
-    /// hold. Edits of file contents do not plan again; a module file that comes or goes does (a
-    /// selection can become partial again only after such a change or a load without a plan).
-    fn carried_demand(&self, graph: &crate::crate_image::GraphImage, pre: &[crate::preload::PreCrate]) -> Option<Arc<crate::preload::DemandImage>> {
+    /// for these crates, it selected every file of the last crate (it deferred nothing: the load
+    /// takes every crate in full, which is always sound), and its module probes hold. Edits of
+    /// file contents do not plan again; a module file that comes or goes does (a selection can
+    /// become partial again only after such a change or a load without a plan). A reordered load
+    /// (`base`: the stored graph's crates in its order, load_order) takes the plan with its crate
+    /// positions moved to this load's: a plan names crates by position only (its files, its
+    /// reached set, its parts; DemandPart::read takes a part at any position).
+    fn carried_demand(&self, graph: &crate::crate_image::GraphImage, pre: &[crate::preload::PreCrate], base: Option<&[crate::preload::PreCrate]>) -> Option<Arc<crate::preload::DemandImage>> {
         let no = |why: &str| { if crate::preload::trace() { eprintln!("makepad-run collected: demand plan not carried: {why}"); } None };
         if pre.iter().any(|c| c.cfg.session.runtime.lazy_verify) { return no("verify"); }
-        let Some(image) = graph.demand_image.clone() else { return no("no stored plan") };
+        let Some(stored) = graph.demand_image.clone() else { return no("no stored plan") };
         let last = pre.len().checked_sub(1)?;
-        if image.graph != crate::preload::demand_recipe_identity(pre) || image.parts.len() != pre.len() { return no("another graph"); }
+        if stored.graph != crate::preload::demand_recipe_identity(base.unwrap_or(pre)) || stored.parts.len() != pre.len() { return no("another graph"); }
+        let image = match base {
+            None => stored,
+            Some(base) => {
+                // this load's crate k is the stored plan's crate from[k]
+                if base.len() != pre.len() { return no("another graph"); }
+                let at: HashMap<(&str, &str), usize> = base.iter().enumerate().map(|(j, c)| ((c.name.as_str(), c.root.as_str()), j)).collect();
+                let Some(from) = pre.iter().map(|c| at.get(&(c.name.as_str(), c.root.as_str())).copied()).collect::<Option<Vec<usize>>>() else { return no("another crate set") };
+                let mut to = vec![0; from.len()];
+                for (k, &j) in from.iter().enumerate() { to[j] = k; }
+                let mut image = (*stored).clone();
+                image.graph = crate::preload::demand_recipe_identity(pre);
+                for f in &mut image.files { f.ci = to[f.ci]; }
+                image.files.sort_by_key(|f| f.ci);
+                image.reached = stored.reached.iter().map(|(ci, p)| (to[*ci], p.clone())).collect();
+                image.parts = from.iter().map(|&j| stored.parts[j].clone()).collect();
+                Arc::new(image)
+            }
+        };
         if !image.files.iter().filter(|f| f.ci == last).all(|f| image.reached.contains(&(last, f.path.clone()))) { return no("the last crate was selected in part"); }
         // the module files it chose between are as they were: no module came or went
         if !image.probes.iter().all(|(p, e)| self.probe_current(p, *e)) { return no("a module probe changed"); }
+        if crate::preload::trace() && base.is_some() { eprintln!("makepad-run collected: demand plan carried into the reordered load"); }
         Some(image)
     }
 
@@ -255,7 +277,7 @@ impl FrontImages {
                 base = b;
                 if !session.options.source_eager && session.options.rs_lazy {
                     let contexts = crate::source_context::Context::for_crates(pre, Arc::default(), session);
-                    if let Some(image) = base.is_none().then(|| self.carried_demand(&stale, pre)).flatten() {
+                    if let Some(image) = self.carried_demand(&stale, pre, base.as_ref().map(|(p, _)| p.as_slice())) {
                         plan = Some(Arc::new(crate::preload::DemandPlan::carried(pre, contexts, image)));
                     } else {
                         // Restore the immutable Program/Tcx while the demand worker

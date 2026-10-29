@@ -1283,19 +1283,6 @@ impl Cache {
         self.has_code_entries() && self.slot_key(u, id).is_some_and(|k| self.entry_tier(k).is_some())
     }
 
-    /// (instrument) slot `id`'s stored code entry: its tier byte and machine code bytes.
-    pub(crate) fn stored_code_shape(&mut self, u: &Unit, id: u32) -> Option<(u8, u32)> {
-        let k = self.slot_key(u, id)?;
-        let (kind, p) = self.get(k)?;
-        if kind != KIND_CODE { return None; }
-        let mut d = D { b: p, p: 0 };
-        if d.u32()? != ENTRY_VERSION { return None; }
-        d.str()?;
-        let tier = d.b.get(d.p).copied()?;
-        skip_build_inputs(&mut d)?;
-        Some((tier, d.bytes()?.len() as u32))
-    }
-
     /// The tier of code entry `key` as stored (its payload's tier byte).
     fn entry_tier(&self, key: u128) -> Option<u8> {
         let (kind, p) = self.get(key)?;
