@@ -4824,6 +4824,12 @@ impl Unit {
                     // so far (its state without the saved locals) answers this lowering; the
                     // lowering is repeated once the frame is known (coro_frame)
                     if self.coro_busy.lock().unwrap_or_else(|e| e.into_inner()).contains(&self.tcx.tys.erase_regions(ct)) {
+                        // a lowering ahead on a helper thread meanwhile: the layout so far is the
+                        // owner's poll lowering's alone; code made from it (an `async fn` returning
+                        // only its state byte, its callers passing 16 bytes) breaks the ABI. The
+                        // build is redone on the owner once the frame is known (r_spawn_e: tokio's
+                        // yield_now resumed after completion).
+                        lower_ahead_needs_unit();
                         let mut s = self.coro_selfref.lock().unwrap_or_else(|e| e.into_inner());
                         let ct = self.tcx.tys.erase_regions(ct);
                         if !s.contains(&ct) { let _k = crate::zone_alloc::kept(); s.push(ct); }

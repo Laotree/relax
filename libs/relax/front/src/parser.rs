@@ -1564,6 +1564,12 @@ impl<'a> Parser<'a> {
                 .unwrap_or(&self.krate);
             crate::builtins::macro_def_for(scope_krate, &name)
         };
+        // MAKEPAD_RUN_TRACE=macmiss: a qualified macro path that resolves to nothing (the call stays
+        // unexpanded and its body's check reports it as not supported)
+        if r.is_none() && bdef.is_none() && qual.is_some() && crate::preload::relax_trace().is_some_and(|t| t.split(',').any(|x| x == "macmiss")) {
+            eprintln!("macmiss {}! in crate {} module {:?} path {:?} lazy_part {} externs {:?}", name, self.krate, module, mpath, self.lazy_part,
+                qual.as_deref().and_then(|q| m.table.crates.get(&self.krate).and_then(|c| c.externs.get(q))));
+        }
         match r {
             Some(d) => Some(crate::builtins::override_rules(&self.session.options, d)),
             None => bdef.or_else(|| {

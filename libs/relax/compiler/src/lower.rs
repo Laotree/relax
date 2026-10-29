@@ -2509,7 +2509,26 @@ impl<'a> Lcx<'a> {
             // whose normalisation failed: name both so the hole is found from the report
             let raw = self.b.ty(x);
             let what = if self.u.tcx.tys.has_error(raw) { "the type check left it as" } else { "its instantiation normalised to" };
-            let msg = format!("`.await` of a value with no type: {what} `{}` (checked type `{}`) in {}",
+            // the opaque types in it: an owner whose check had errors reveals no hidden type
+            fn opaques(tys: &crate::types::Types, t: TyId, out: &mut Vec<crate::program::DefId>, depth: u32) {
+                if depth > 8 { return; }
+                match tys.kind(t) {
+                    TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id }, .. }) => { if !out.contains(def_id) { out.push(*def_id); } }
+                    TyKind::Ref(_, x, _) => opaques(tys, *x, out, depth + 1),
+                    TyKind::Adt(_, v, _) | TyKind::Tuple(v) => for &a in tys.list(*v).iter() { opaques(tys, a, out, depth + 1) },
+                    _ => {}
+                }
+            }
+            let mut ops = Vec::new();
+            opaques(&self.u.tcx.tys, raw, &mut ops, 0);
+            let mut why = String::new();
+            for o in ops {
+                let owner = self.u.prog.opaque_owner(o);
+                let b = self.u.tcx.typeck(&self.u.prog, owner);
+                why.push_str(&format!("; its opaque type is defined by {}{}", self.u.prog.def_path(owner),
+                    b.errors.first().map_or(" (checked without errors)".to_string(), |e| format!(", whose check failed: {e}"))));
+            }
+            let msg = format!("`.await` of a value with no type: {what} `{}` (checked type `{}`) in {}{why}",
                 crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, xt), crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, raw), self.f.name);
             self.err(self.ast().expr(x).lo, msg);
             return self.unit();
