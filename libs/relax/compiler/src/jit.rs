@@ -1619,6 +1619,12 @@ fn optimize_tree_panicked(up: *mut Unit, id: u32, p: Box<dyn std::any::Any + Sen
 /// pthread_atfork did, and deadlocked: a domain loader holds its compile job while it waits for
 /// its build-script threads, and a script thread's fork waited for that job (Pixel WM: every
 /// app not yet running hung at 'compiling: build scripts' on a cold cache).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+extern "C" {
+    #[link_name = "pthread_atfork"]
+    fn host_pthread_atfork(prepare: Option<unsafe extern "C" fn()>, parent: Option<unsafe extern "C" fn()>, child: Option<unsafe extern "C" fn()>) -> i32;
+}
+
 #[cfg(unix)]
 extern "C" fn relax_fork() -> i32 {
     fork_prepare();
@@ -20703,6 +20709,11 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"exit" => Some(recorded_exit as *const () as usize),
         #[cfg(unix)]
         b"fork" => Some(relax_fork as *const () as usize),
+        // glibc keeps pthread_atfork in libc_nonshared.a (a static wrapper of __register_atfork that
+        // every C program links): dlsym never finds it, so the loader's own linked copy answers
+        // (rand 0.8's ReseedingRng registers its fork handler at its first use)
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        b"pthread_atfork" => Some(host_pthread_atfork as *const () as usize),
         #[cfg(unix)]
         b"__relax_precompile" => Some(relax_precompile as *const () as usize),
         #[cfg(unix)]
