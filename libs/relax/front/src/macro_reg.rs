@@ -577,6 +577,23 @@ pub fn set_build_outputs(sess: &std::sync::Arc<crate::Session>, units: &[CrateUn
     });
 }
 
+/// Whether a proc-macro crate of the registered graph depends (directly or not) on a crate named
+/// in `names`: the macro world built before those crates' build outputs are known would lack them.
+pub fn macro_closure_reaches(names: &[&str]) -> bool {
+    REG.with(|r| {
+        let b = r.borrow();
+        let Some(reg) = b.as_ref() else { return false };
+        let mut seen = vec![false; reg.units.len()];
+        let mut stack: Vec<usize> = (0..reg.units.len()).filter(|&i| reg.units[i].proc_macro).collect();
+        while let Some(i) = stack.pop() {
+            if std::mem::replace(&mut seen[i], true) { continue; }
+            if names.contains(&reg.units[i].name.as_str()) { return true; }
+            stack.extend(reg.units[i].deps.iter().map(|(d, _)| *d));
+        }
+        false
+    })
+}
+
 /// The boot driver's load will expand macros (it is not a warm restore of the whole program):
 /// the runner starts building what it needs now. Without this call the world is built on the
 /// first expansion (a warm start's first live edit that adds a derive).
