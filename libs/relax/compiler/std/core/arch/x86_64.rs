@@ -3389,3 +3389,82 @@ pub unsafe fn _mm_cmp_ps<const IMM5: i32>(a: __m128, b: __m128) -> __m128 {
 pub unsafe fn _mm256_cmp_ps<const IMM5: i32>(a: __m256, b: __m256) -> __m256 {
     ps_join(_mm_cmp_ps::<IMM5>(ps_lo(&a), ps_lo(&b)), _mm_cmp_ps::<IMM5>(ps_hi(&a), ps_hi(&b)))
 }
+
+// ppv-lite86 0.2.21 / rand_chacha 0.3.1 (Robrix's rand 0.8 ChaCha): the SSE2 / SSE4.1 / AVX2
+// integer intrinsics they use, lane by lane (core_arch x86 sse2.rs, sse41.rs, avx2.rs semantics)
+pub unsafe fn _mm256_andnot_si256(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_andnot_si128(i_lo(&a), i_lo(&b)), _mm_andnot_si128(i_hi(&a), i_hi(&b)))
+}
+
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+pub unsafe fn _mm256_inserti128_si256<const IMM1: i32>(a: __m256i, b: __m128i) -> __m256i {
+    let mut r = a;
+    let h = (IMM1 & 1) as usize;
+    r.0[h * 2] = b.0[0];
+    r.0[h * 2 + 1] = b.0[1];
+    r
+}
+
+pub unsafe fn _mm_cmpeq_epi64(a: __m128i, b: __m128i) -> __m128i {
+    __m128i([if a.0[0] == b.0[0] { -1 } else { 0 }, if a.0[1] == b.0[1] { -1 } else { 0 }])
+}
+
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm_extract_epi64<const IMM1: i32>(a: __m128i) -> i64 {
+    a.0[(IMM1 & 1) as usize]
+}
+
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+pub unsafe fn _mm_insert_epi32<const IMM8: i32>(a: __m128i, i: i32) -> __m128i {
+    let mut l = lanes128_i32(a);
+    l[(IMM8 & 3) as usize] = i;
+    from128_i32(l)
+}
+
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+pub unsafe fn _mm_insert_epi64<const IMM1: i32>(a: __m128i, i: i64) -> __m128i {
+    let mut r = a;
+    r.0[(IMM1 & 1) as usize] = i;
+    r
+}
+
+pub unsafe fn _mm_move_epi64(a: __m128i) -> __m128i {
+    __m128i([a.0[0], 0])
+}
+
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm_shufflehi_epi16<const IMM8: i32>(a: __m128i) -> __m128i {
+    let l = lanes128_i16(a);
+    let mut r = l;
+    let mut i = 0;
+    while i < 4 {
+        r[4 + i] = l[4 + ((IMM8 >> (2 * i)) & 3) as usize];
+        i += 1;
+    }
+    from128_i16(r)
+}
+
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm_shufflelo_epi16<const IMM8: i32>(a: __m128i) -> __m128i {
+    let l = lanes128_i16(a);
+    let mut r = l;
+    let mut i = 0;
+    while i < 4 {
+        r[i] = l[((IMM8 >> (2 * i)) & 3) as usize];
+        i += 1;
+    }
+    from128_i16(r)
+}
+
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm_slli_si128<const IMM8: i32>(a: __m128i) -> __m128i {
+    let l = lanes128_u8(a);
+    let n = (IMM8 & 0xff) as usize;
+    let mut r = [0u8; 16];
+    let mut i = n;
+    while i < 16 {
+        r[i] = l[i - n];
+        i += 1;
+    }
+    from128_u8(r)
+}
