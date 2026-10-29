@@ -21,14 +21,14 @@
 //! [`KnownHosts`] (first contact, warns loudly on a change). TLS 1.2 is the
 //! floor everywhere;
 //! TLS 1.3 is used where both stacks have it (OpenSSL, Schannel on recent
-//! Windows). SecureTransport stops at TLS 1.2: its server takes ECDHE-ECDSA
-//! AEAD suites only, its captured client also ECDHE-RSA AEAD suites (LAN
-//! devices with RSA certificates).
+//! Windows). SecureTransport stops at TLS 1.2, with ECDHE AEAD suites only
+//! (RSA or ECDSA certificates).
 //!
 //! [`crate::SocketStream::connect_capture_resuming`] opens a second
 //! connection that resumes an earlier one's TLS session (FTPS data
-//! channels). Devices whose certificate comes from a private CA the app
-//! stores are checked with [`issued_by`] plus a pin.
+//! channels need it). Schannel does not resume sessions of servers without
+//! the extended master secret (RFC 7627); that connection fails with
+//! `Unsupported` rather than going on unresumed.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -37,8 +37,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::digest::sha256_hash;
-
-mod rsa;
 
 pub const KEY_FILE: &str = "tls-key.x963";
 pub const CERT_FILE: &str = "tls-cert.der";
@@ -245,74 +243,6 @@ pub fn verify_p256_sha256(point: &[u8], msg: &[u8], sig_der: &[u8]) -> bool {
         return false;
     }
     platform::verify_p256_sha256(point, msg, sig_der)
-}
-
-/// Whether the certificate `cert_der` names `issuer_der` as its issuer
-/// and carries a valid signature by the issuer's key: sha256WithRSAEncryption
-/// (RSA keys of 2048+ bits) or ecdsa-with-SHA256 (P-256 keys).
-///
-/// This is the signature link only, for pinning a device certificate to a
-/// private CA that is stored with the app: no validity dates (LAN devices
-/// often have no reliable clock), key usage, basic constraints or names are
-/// checked, so CAs without a keyUsage extension pass. Callers check names
-/// and pins themselves.
-pub fn issued_by(cert_der: &[u8], issuer_der: &[u8]) -> bool {
-    use x509::read_tlv;
-    const OID_RSA_ENCRYPTION: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
-    const OID_SHA256_WITH_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B];
-    const OID_EC_PUBLIC_KEY: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
-    const OID_PRIME256V1: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
-    const OID_ECDSA_SHA256: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02];
-
-    /// The TBSCertificate's whole TLV, the signature algorithm OID, the
-    /// signature bits and the TBS fields as whole TLVs.
-    fn parts(der: &[u8]) -> Option<(&[u8], &[u8], &[u8], Vec<&[u8]>)> {
-        let (0x30, cert, b"") = read_tlv(der)? else { return None };
-        let (0x30, tbs, after_tbs) = read_tlv(cert)? else { return None };
-        let tbs_whole = &cert[..cert.len() - after_tbs.len()];
-        let (0x30, alg, after_alg) = read_tlv(after_tbs)? else { return None };
-        let (0x06, oid, _) = read_tlv(alg)? else { return None };
-        let (0x03, bits, b"") = read_tlv(after_alg)? else { return None };
-        let (&0, signature) = bits.split_first()? else { return None };
-        let mut fields = Vec::new();
-        let mut rest = tbs;
-        while !rest.is_empty() {
-            let (_, _, next) = read_tlv(rest)?;
-            fields.push(&rest[..rest.len() - next.len()]);
-            rest = next;
-        }
-        // version [0] is optional: serial, signature alg, issuer, validity, subject, spki
-        if fields.first()?.first() == Some(&0xA0) {
-            fields.remove(0);
-        }
-        (fields.len() >= 6).then_some((tbs_whole, oid, signature, fields))
-    }
-
-    let check = || -> Option<bool> {
-        let (tbs, sig_oid, signature, fields) = parts(cert_der)?;
-        let (_, _, _, issuer_fields) = parts(issuer_der)?;
-        // The issuer Name must be the issuer's subject Name, byte for byte.
-        if fields[2] != issuer_fields[4] {
-            return Some(false);
-        }
-        let (0x30, spki, _) = read_tlv(issuer_fields[5])? else { return None };
-        let (0x30, key_alg, after) = read_tlv(spki)? else { return None };
-        let (0x06, key_oid, key_params) = read_tlv(key_alg)? else { return None };
-        let (0x03, key_bits, _) = read_tlv(after)? else { return None };
-        let (&0, key) = key_bits.split_first()? else { return None };
-        if key_oid == OID_RSA_ENCRYPTION && sig_oid == OID_SHA256_WITH_RSA {
-            let (0x30, rsa_key, _) = read_tlv(key)? else { return None };
-            let (0x02, modulus, rest) = read_tlv(rsa_key)? else { return None };
-            let (0x02, exponent, _) = read_tlv(rest)? else { return None };
-            Some(rsa::verify_pkcs1_sha256(modulus, exponent, tbs, signature))
-        } else if key_oid == OID_EC_PUBLIC_KEY && sig_oid == OID_ECDSA_SHA256 {
-            let (0x06, curve, _) = read_tlv(key_params)? else { return None };
-            Some(curve == OID_PRIME256V1 && verify_p256_sha256(key, tbs, signature))
-        } else {
-            Some(false)
-        }
-    };
-    check() == Some(true)
 }
 
 /// r||s (32 bytes each) out of a DER ECDSA-Sig-Value.
@@ -1136,9 +1066,9 @@ mod server_tests {
             }
             outcomes
         });
-        let (mut client, seen) = crate::SocketStream::connect_capture("127.0.0.1", &port).unwrap();
-        assert_eq!(seen, certificate, "the captured DER is the server leaf certificate");
-        assert_eq!(fingerprint(&seen), pin, "the captured fingerprint is the server certificate's");
+        let (mut client, chain) = crate::SocketStream::connect_capture_chain("127.0.0.1", &port).unwrap();
+        assert_eq!(chain.first(), Some(&certificate), "chain capture returns the server leaf first");
+        assert_eq!(fingerprint(&chain[0]), pin, "the captured fingerprint is the server certificate's");
         client.write_all(b"hello").unwrap();
         let mut echo = [0u8; 5];
         client.read_exact(&mut echo).unwrap();
