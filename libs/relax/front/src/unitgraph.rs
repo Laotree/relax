@@ -557,7 +557,16 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
 /// The scripts' `cargo:` lines into the graph: cfgs, link libraries, env (OUT_DIR included).
 fn apply_script_results(g: &mut Graph, results: Vec<(Vec<usize>, Result<String, String>, String)>, check_only: bool) -> Result<(), String> {
     for (krates, r, out_dir) in results {
-        let stdout = r?;
+        let stdout = match r {
+            Ok(s) => s,
+            // a check without `--allow-c`: a script that needed a skipped C package (aws-lc-rs reads
+            // aws-lc-sys's DEP_ metadata) leaves its crate unconfigured, said once, not fatal
+            Err(e) if check_only => {
+                eprintln!("makepad check: {} (its crate is checked without the script's cfgs)", e.lines().next().unwrap_or(""));
+                String::new()
+            }
+            Err(e) => return Err(e),
+        };
         for k in krates { apply_script_output(g, k, &stdout, out_dir.clone(), check_only)?; }
     }
     Ok(())

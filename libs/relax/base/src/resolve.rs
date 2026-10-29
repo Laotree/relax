@@ -514,7 +514,9 @@ impl Resolver {
     pub fn with(sess: &std::sync::Arc<crate::Session>, dir: &str, git: GitPlaces) -> Result<Resolver, String> {
         let offline = crate::git::cargo::offline(std::path::Path::new(dir))?;
         let git = std::cell::RefCell::new(GitDeps { places: git, pins: None, mounts: Vec::new(), found: HashMap::new() });
-        Ok(Resolver { ws: std::rc::Rc::new(Workspace::load(&find_root(dir)?)?), git, offline, owners: HashMap::new(), vendor: vendor_dir(dir)?, fetched: Default::default(), manifests: Vec::new(), by_dir: HashMap::new(), cfg: crate::cfg::CfgSet::host(sess, &[]), allow_c: sess.options.allow_c })
+        Ok(Resolver { ws: std::rc::Rc::new(Workspace::load(&find_root(dir)?)?), git, offline, owners: HashMap::new(), vendor: vendor_dir(dir)?, fetched: Default::default(), manifests: Vec::new(), by_dir: HashMap::new(), cfg: crate::cfg::CfgSet::host(sess, &[]), // a check resolves C-compiling packages too: their scripts are not run without --allow-c
+            // (unitgraph::run_build_scripts) and a check links nothing (`const_fuel` is check-only)
+            allow_c: sess.options.allow_c || sess.options.const_fuel })
     }
 
     fn registry_dir(&self, name: &str, req: &str) -> Result<String, String> {
