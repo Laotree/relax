@@ -936,3 +936,47 @@ impl crate::store::Entry for CollectedEntry<'_> {
         self.payload.write_to(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reordered load (load_order) takes the stored plan with its crate positions moved: files,
+    /// reached set and parts follow each crate to its new position; a plan whose new last crate was
+    /// selected in part is not carried.
+    #[test]
+    fn reordered_load_carries_demand_plan() {
+        let sess = std::sync::Arc::new(crate::Session::default());
+        let cfg = crate::cfg::CfgSet::host(&sess, &[]);
+        let krate = |name: &str| crate::preload::PreCrate { name: name.into(), root: format!("/w/{name}/lib.rs"), edition: 2021, cfg: cfg.clone(),
+            deps: Vec::new(), proc_macro: false, image_deps: Vec::new(), image_dep_names: Vec::new() };
+        let base = vec![krate("a"), krate("b"), krate("c")];
+        let pre = vec![krate("a"), krate("c"), krate("b")];
+        let file = |ci: usize, path: &str| crate::preload::FileIndex { ci, path: path.into(), module: String::new(), names: Default::default(),
+            glob_names: Default::default(), impls: Vec::new(), blankets: Default::default(), force: false };
+        let files = vec![file(0, "/w/a/lib.rs"), file(1, "/w/b/lib.rs"), file(1, "/w/b/x.rs"), file(2, "/w/c/lib.rs")];
+        let part = |key: u128| { let mut p = crate::preload::DemandPart::default(); p.key = key; Arc::new(p) };
+        let stored = |reached: &[(usize, &str)]| {
+            let mut image = crate::preload::DemandImage::default();
+            image.graph = crate::preload::demand_recipe_identity(&base);
+            image.files = files.clone();
+            image.reached = reached.iter().map(|(ci, p)| (*ci, p.to_string())).collect();
+            image.eager_prefix = 2;
+            image.parts = vec![part(10), part(11), part(12)];
+            crate::crate_image::GraphImage { identity: 1, crates: Vec::new(), inputs: Vec::new(), stamps: Vec::new(), probes: Vec::new(), demand_image: Some(Arc::new(image)) }
+        };
+        let images = FrontImages::default();
+        let all = [(0, "/w/a/lib.rs"), (1, "/w/b/lib.rs"), (1, "/w/b/x.rs"), (2, "/w/c/lib.rs")];
+        let image = images.carried_demand(&stored(&all), &pre, Some(&base)).expect("a full selection is carried");
+        assert_eq!(image.graph, crate::preload::demand_recipe_identity(&pre));
+        let at: Vec<(usize, &str)> = image.files.iter().map(|f| (f.ci, f.path.as_str())).collect();
+        assert_eq!(at, [(0, "/w/a/lib.rs"), (1, "/w/c/lib.rs"), (2, "/w/b/lib.rs"), (2, "/w/b/x.rs")]);
+        assert!(image.reached.contains(&(2, "/w/b/x.rs".to_string())) && image.reached.contains(&(1, "/w/c/lib.rs".to_string())));
+        assert_eq!(image.parts.iter().map(|p| p.key).collect::<Vec<_>>(), [10, 12, 11]);
+        // `b` (last now) had a file the stored plan deferred: the load plans again
+        let partial = [(0, "/w/a/lib.rs"), (1, "/w/b/lib.rs"), (2, "/w/c/lib.rs")];
+        assert!(images.carried_demand(&stored(&partial), &pre, Some(&base)).is_none());
+        // the stored order itself: carried as it is
+        assert!(images.carried_demand(&stored(&all), &base, None).is_some_and(|i| i.files.iter().map(|f| f.ci).eq([0, 1, 1, 2])));
+    }
+}

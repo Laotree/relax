@@ -25,7 +25,7 @@ pub struct FileIndex {
 
 /// A certified demand closure. Per-file index projections are retained beside
 /// their paths; a warm load decodes these rather than indexing again.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct DemandImage {
     pub graph: u128,
     pub fingerprint: u128,
