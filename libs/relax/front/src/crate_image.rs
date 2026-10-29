@@ -483,6 +483,17 @@ pub fn file_meta(path: &str, module: &str, pf: &ParsedFile, used: &MacroUse, pre
     Blob(used.replay_bytes().unwrap_or_default()).put(&mut w);
     w
 }
+/// The proc-macro crates among a crate's dependencies (transitively), by name and fingerprint:
+/// what a parse of its files reads of its dependencies besides the macro lookups a replay
+/// checks. None: one's fingerprint is not known.
+pub fn proc_fps(crates: impl Iterator<Item = (String, Option<u128>)>) -> Option<u128> {
+    let mut v: Vec<(String, u128)> = crates.map(|(n, f)| Some((n, f?))).collect::<Option<_>>()?;
+    v.sort();
+    let mut h = crate::sip::Sip128::new();
+    h.str("proc-macro-deps");
+    for (n, f) in &v { h.str(n); h.u128(*f); }
+    Some(h.finish128())
+}
 pub fn file_hash(path: &str, src: &[u8]) -> u128 {
     let mut h = crate::sip::Sip128::new();
     h.str(path);
@@ -541,6 +552,10 @@ pub struct Record {
     pub ahead: CrateAhead,
     pub files: Vec<FileMeta>,
     pub selection_hash: u128,
+    /// proc_fps of the crate's dependencies when it was recorded (None: one was not known): an
+    /// edited dependency changes dep_fps, but a file's parse depends on it only through its macro
+    /// lookups (replayed) and proc macros (this)
+    pub proc_fps: Option<u128>,
 }
 // The fields a restore validates come first (RecordHead): the files' paths and hashes, then the
 // crate's own inputs and demand selection (CrateAhead's leading fields); the macro and module
@@ -551,13 +566,13 @@ impl Codec for Record {
         self.deps.put(w); self.dep_fps.put(w); self.lazy_auto.put(w); self.parse_options.put(w); self.selection_hash.put(w);
         self.files.len().put(w);
         for f in &self.files { f.path.put(w); f.hash.put(w); }
-        self.ahead.put(w); self.files.put(w);
+        self.ahead.put(w); self.files.put(w); self.proc_fps.put(w);
     }
     fn get(r: &mut Decode<'_>) -> Option<Self> {
         let (name, root, edition, cfg, proc_macro) = (Codec::get(r)?, Codec::get(r)?, Codec::get(r)?, Codec::get(r)?, Codec::get(r)?);
         let (deps, dep_fps, lazy_auto, parse_options, selection_hash) = (Codec::get(r)?, Codec::get(r)?, Codec::get(r)?, Codec::get(r)?, Codec::get(r)?);
         let _hashes: Vec<(String, u128)> = Codec::get(r)?;
-        Some(Self { name, root, edition, cfg, proc_macro, deps, dep_fps, lazy_auto, parse_options, ahead: Codec::get(r)?, files: Codec::get(r)?, selection_hash })
+        Some(Self { name, root, edition, cfg, proc_macro, deps, dep_fps, lazy_auto, parse_options, ahead: Codec::get(r)?, files: Codec::get(r)?, selection_hash, proc_fps: Codec::get(r)? })
     }
 }
 /// What validating a crate's record reads (`decode_record_head`): not its macro and module tables
@@ -654,7 +669,9 @@ pub trait CrateImages {
     /// A crate that is parsed (no valid image): the images of its files from an earlier record
     /// made with the same identity and dependency fingerprints (only its own sources differ),
     /// with their macro lookups to replay. None: no such record.
-    fn previous_files(&self, _c: &crate::preload::PreCrate, _dep_fps: &[u128]) -> Option<PreviousFiles> { None }
+    /// `proc_fps`: proc_fps of its dependencies now (None: not known): a record whose dependency
+    /// fingerprints differ is taken when that is the same.
+    fn previous_files(&self, _c: &crate::preload::PreCrate, _dep_fps: &[u128], _proc_fps: Option<u128>) -> Option<PreviousFiles> { None }
     fn crate_image_selected(&self, c: &crate::preload::PreCrate, dep_fps: &[u128], plan: u128, deferred: &[String]) -> Option<CrateImage> {
         self.crate_image(c, dep_fps).filter(|image| image.ahead.demand_plan == plan && image.ahead.deferred == deferred)
     }

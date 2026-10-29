@@ -5021,7 +5021,7 @@ impl FrontImages {
     /// (a file recorded without it is parsed). Taking one maps it as a crate image's file is
     /// (its lazily parsed part is not taken: the bodies are parsed on demand in this crate's
     /// scope). The record's late inputs are noted for the crate's next record.
-    fn previous_files_of(&self, c: &crate::preload::PreCrate, deps: &[u128]) -> Option<crate::crate_image::PreviousFiles> {
+    fn previous_files_of(&self, c: &crate::preload::PreCrate, deps: &[u128], proc_fps: Option<u128>) -> Option<crate::crate_image::PreviousFiles> {
         use crate::crate_image::{decode, FileMeta, Record};
         let tr = |path: &std::path::Path, why: &str| if crate::preload::trace() { eprintln!("boot-trace: {}: earlier record {} not taken: {}", c.name, path.display(), why); };
         let Some(deps) = self.full_deps(c, deps) else {
@@ -5046,7 +5046,7 @@ impl FrontImages {
             let Some((KIND_FRONT_CRATE, b)) = st.get(front_crate_key(&c.name, &c.root)) else { continue };
             let Some(rec) = decode::<Record>(b) else { tr(&path, "decode"); continue };
             let same = rec.name == c.name && rec.root == c.root && rec.edition == c.edition && rec.cfg == cfg && rec.proc_macro == c.proc_macro
-                && rec.deps == c.image_dep_names && rec.dep_fps == deps && rec.lazy_auto == crate::parser::lazy_auto()
+                && rec.deps == c.image_dep_names && (rec.dep_fps == deps || proc_fps.is_some() && rec.proc_fps == proc_fps) && rec.lazy_auto == crate::parser::lazy_auto()
                 && rec.parse_options == crate::crate_image::parse_options(options) && rec.ahead.complete;
             if !same { tr(&path, "identity"); continue; }
             if !ledger_current(&st, &present, &mut HashMap::new()) { tr(&path, "late inputs"); continue; }
@@ -5344,8 +5344,8 @@ impl crate::crate_image::CrateImages for FrontImages {
     fn crate_image(&self, c: &crate::preload::PreCrate, deps: &[u128]) -> Option<crate::crate_image::CrateImage> {
         self.selected_image(c, deps, None)
     }
-    fn previous_files(&self, c: &crate::preload::PreCrate, deps: &[u128]) -> Option<crate::crate_image::PreviousFiles> {
-        self.previous_files_of(c, deps)
+    fn previous_files(&self, c: &crate::preload::PreCrate, deps: &[u128], proc_fps: Option<u128>) -> Option<crate::crate_image::PreviousFiles> {
+        self.previous_files_of(c, deps, proc_fps)
     }
     fn crate_image_selected(&self, c: &crate::preload::PreCrate, deps: &[u128], plan: u128, deferred: &[String]) -> Option<crate::crate_image::CrateImage> {
         self.selected_image(c, deps, Some((plan, deferred)))
@@ -5415,6 +5415,7 @@ struct FrontRecordView {
     dep_fps: Option<Vec<u128>>,
     fingerprint: Option<u128>,
     selection_hash: u128,
+    proc_fps: Option<u128>,
 }
 
 struct FrontRecordFile {
@@ -5456,6 +5457,19 @@ impl FrontRecordView {
                 }
             }).collect(),
             deps, dep_fps, fingerprint: fingerprint(ci), selection_hash: c.context.fingerprint(),
+            proc_fps: {
+                // (the proc-macro crates among its dependencies, transitively: preload proc_fps_of)
+                let mut seen = vec![false; prog.crates.len()];
+                let mut stack: Vec<usize> = c.deps.iter().map(|&(_, k)| k as usize).filter(|&k| k != ci).collect();
+                let mut out = Vec::new();
+                while let Some(d) = stack.pop() {
+                    if d >= prog.crates.len() || std::mem::replace(&mut seen[d], true) { continue; }
+                    let dc = &prog.crates[d];
+                    if dc.proc_macro { out.push((prog.syms.str(dc.name).to_owned(), fingerprint(d))); }
+                    stack.extend(dc.deps.iter().map(|&(_, k)| k as usize).filter(|&k| k != d));
+                }
+                crate::crate_image::proc_fps(out.into_iter())
+            },
         })
     }
 }
@@ -5523,6 +5537,7 @@ fn front_record_from(prog: &FrontRecordView) -> Option<crate::crate_image::Recor
         ahead,
         files,
         selection_hash: prog.selection_hash,
+        proc_fps: prog.proc_fps,
     };
     let canon = crate::crate_image::canon_deps(rec.deps.iter().map(|x| x.1.clone()).zip(rec.dep_fps.iter().copied()).collect());
     let fp = crate::crate_image::fingerprint(&name, &rec.root, rec.edition, rec.proc_macro, &rec.cfg, rec.file_hashes().into_iter(), &canon, rec.selection_hash);

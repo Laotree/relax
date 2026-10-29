@@ -88,6 +88,20 @@ pub struct Preparsed {
     pub src_len: usize,
 }
 
+/// crate_image::proc_fps of crate `ci`'s dependencies (transitively, by image_deps) from the
+/// fingerprints known so far
+fn proc_fps_of(crates: &[PreCrate], ci: usize, fps: &[Option<u128>]) -> Option<u128> {
+    let mut seen = vec![false; crates.len()];
+    let mut stack: Vec<usize> = crates[ci].image_deps.clone();
+    let mut out = Vec::new();
+    while let Some(d) = stack.pop() {
+        if d >= crates.len() || std::mem::replace(&mut seen[d], true) { continue; }
+        if crates[d].proc_macro { out.push((crates[d].name.clone(), fps.get(d).copied().flatten())); }
+        stack.extend(crates[d].image_deps.iter().copied());
+    }
+    crate::crate_image::proc_fps(out.into_iter())
+}
+
 /// Files of parsed crates taken from an earlier record's images (Pool::previous), for the summary
 pub static PREVIOUS_FILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1291,7 +1305,8 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         }
         fps[ci] = image.as_ref().map(|i| i.fingerprint);
         let image = if planning { image } else { image.filter(|i| !i.fp_only) };
-        previous.push(if image.is_none() { deps.as_ref().and_then(|d| images.and_then(|i| i.previous_files(c, d))) } else { None });
+        let proc = if image.is_none() && deps.is_some() { proc_fps_of(&crates, ci, &fps) } else { None };
+        previous.push(if image.is_none() { deps.as_ref().and_then(|d| images.and_then(|i| i.previous_files(c, d, proc))) } else { None });
         if trace() && image.is_none() && images.is_some() {
             eprintln!("boot-trace: {}: parsed; earlier images: {}", c.name, if deps.is_none() { "dependencies not restored" } else if previous.last().is_some_and(|p| p.is_some()) { "yes" } else { "none" });
         }
