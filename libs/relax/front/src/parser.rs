@@ -2879,7 +2879,8 @@ impl<'a> Parser<'a> {
                 unsafe_,
                 abi,
                 generics,
-                self_param,
+                self_param: self_param.map(|(param, _)| param),
+                self_param_pos: self_param.map_or(0, |(_, pos)| pos),
                 params: self.ast.push_list(params),
                 variadic,
                 ret,
@@ -2893,7 +2894,7 @@ impl<'a> Parser<'a> {
         self.ty()
     }
 
-    fn fn_params(&mut self) -> PResult<(Option<SelfParam>, Vec<Param>, bool)> {
+    fn fn_params(&mut self) -> PResult<(Option<(SelfParam, u32)>, Vec<Param>, bool)> {
         self.expect(T::OpenParen)?;
         let mut self_param = None;
         let mut params = Vec::new();
@@ -2978,29 +2979,33 @@ impl<'a> Parser<'a> {
         Ok((pat, ty))
     }
 
-    fn self_param(&mut self) -> PResult<Option<SelfParam>> {
+    // rustc_parse/src/parser/function.rs::parse_self_param keeps the `self` token's span.
+    fn self_param(&mut self) -> PResult<Option<(SelfParam, u32)>> {
         let end = |k: T| matches!(k, T::Comma | T::CloseParen | T::Colon);
         match self.kind() {
             T::KwSelfValue if end(self.nth(1)) => {
+                let pos = self.tok().lo;
                 self.pos += 1;
                 if self.eat(T::Colon) {
                     let ty = self.ty()?;
-                    return Ok(Some(SelfParam::Typed(false, ty)));
+                    return Ok(Some((SelfParam::Typed(false, ty), pos)));
                 }
-                Ok(Some(SelfParam::Value(false)))
+                Ok(Some((SelfParam::Value(false), pos)))
             }
             T::KwMut if self.nth(1) == T::KwSelfValue && end(self.nth(2)) => {
+                let pos = self.toks.at(self.pos + 1).lo;
                 self.pos += 2;
                 if self.eat(T::Colon) {
                     let ty = self.ty()?;
-                    return Ok(Some(SelfParam::Typed(true, ty)));
+                    return Ok(Some((SelfParam::Typed(true, ty), pos)));
                 }
-                Ok(Some(SelfParam::Value(true)))
+                Ok(Some((SelfParam::Value(true), pos)))
             }
             T::And => {
                 let (lt, n) = if self.nth(1) == T::Lifetime { (Some(self.toks.at(self.pos + 1)), 2) } else { (None, 1) };
                 let (m, n2) = if self.nth(n) == T::KwMut { (true, n + 1) } else { (false, n) };
                 if self.nth(n2) == T::KwSelfValue && matches!(self.nth(n2 + 1), T::Comma | T::CloseParen) {
+                    let pos = self.toks.at(self.pos + n2).lo;
                     self.pos += n2 + 1;
                     let lt = match lt {
                         Some(t) => {
@@ -3012,7 +3017,7 @@ impl<'a> Parser<'a> {
                         }
                         None => None,
                     };
-                    Ok(Some(SelfParam::Ref(lt, m)))
+                    Ok(Some((SelfParam::Ref(lt, m), pos)))
                 } else {
                     Ok(None)
                 }
@@ -5710,25 +5715,6 @@ impl ParsedFile {
     }
 
     /// Token `i`: the file's, then its lazily parsed bodies' expansion tokens.
-    /// The position of the `self` receiver token of the function item starting at `item_lo` (the
-    /// item's start when it has none in its parameter list): its hygiene context is the receiver's
-    /// own, which a macro may have passed in from the call site.
-    pub fn self_param_pos(&self, item_lo: u32) -> u32 {
-        let mut i = self.toks.partition_point(|t| t.lo < item_lo) as u32;
-        let mut depth = 0i32;
-        while (i as usize) < self.toks.len() {
-            match self.tok(i).kind {
-                T::OpenParen => depth += 1,
-                T::CloseParen => { depth -= 1; if depth <= 0 { break; } }
-                T::KwSelfValue if depth == 1 => return self.tok(i).lo,
-                T::OpenBrace | T::Semi if depth == 0 => break,
-                _ => {}
-            }
-            i += 1;
-        }
-        item_lo
-    }
-
     pub fn tok(&self, i: u32) -> Tok {
         match self.toks.get(i as usize) {
             Some(t) => t,

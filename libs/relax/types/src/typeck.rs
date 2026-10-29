@@ -875,9 +875,10 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         let s = prog.syms.get("self").unwrap_or(0);
         let li = fcx.b.locals.len() as u32;
         fcx.b.locals.push(Local { name: s, ty: params[0], mutable, pat: u32::MAX });
-        // `self` is hygienic like any local: a macro defined before the fn does not see it
+        // rustc_resolve/src/late.rs::fresh_binding and ident.rs::resolve_ident_in_lexical_scope:
+        // `self` is a local with the receiver token's context, including a captured macro ident.
         fcx.local_hyg.resize(li as usize + 1, (Some(Vec::new()), 0));
-        let at = prog.files[file as usize].self_param_pos(ast.item(d.item).lo);
+        let at = fsig.self_param_pos;
         fcx.local_hyg[li as usize] = (Some(prog.files[file as usize].hyg_ctxt(at)), at);
         fcx.scopes.push((s, li));
         pi = 1;
