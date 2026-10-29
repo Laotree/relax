@@ -668,16 +668,21 @@ impl MacroTable {
     /// `use Base as alias;`, `pub use self::m::ancestry as Name;`) join its prescanned ones, with
     /// the modules they sit in, so the crates loaded after it resolve macro paths through them
     /// (rustc resolves expansion-made imports like any other, rustc_resolve ident.rs). Its scope is
-    /// computed afresh on next use.
+    /// computed afresh on next use, including the macros its expansions defined.
     pub fn seal_crate(&mut self, k: &str) {
         self.sealed.insert(k.to_string());
-        let (Some(eu), Some(old)) = (self.exp_uses.get(k).cloned(), self.crates.get(k).cloned()) else { return };
+        let Some(old) = self.crates.get(k).cloned() else { return };
+        // rustc_resolve/src/build_reduced_graph.rs::define_macro puts every #[macro_export]
+        // in the root, including expansion output. A scope computed before file publication
+        // lacks those definitions; rebuild it before a dependent crate starts parsing.
+        let mut added = old.scope.get().is_some();
+        let eu = self.exp_uses.get(k);
+        if !added && eu.is_none() { return; }
         let mut uses = old.uses.clone();
         let mut renames = old.renames.clone();
         let mut mods = old.mods.clone();
         let mut externs = old.externs.clone();
-        let mut added = false;
-        let mut binds: Vec<(&(String, String), &Vec<String>)> = eu.iter().collect();
+        let mut binds: Vec<(&(String, String), &Vec<String>)> = eu.into_iter().flat_map(|u| u.iter()).collect();
         binds.sort();
         for ((m, b), path) in binds {
             // Glob-only generated modules need their parent bindings too.
