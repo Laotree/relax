@@ -87,3 +87,8 @@ pub const fn cval(x: u32) -> u32 { x * 3 } // EDIT cval
 pub const fn cval_outer(x: u32) -> u32 { cval(x) + 1 }
 pub const FW_CONST: u32 = cval_outer(5);
 pub static FW_STATIC: u32 = cval(7) + 1;
+
+// an exported macro another crate's file uses (JITCOLD7: that file's image is taken after an edit
+// here only while its lookup replays to the same rules)
+#[macro_export]
+macro_rules! fw_twice { ($e:expr) => { $e * 2 } } // EDIT fw_twice

@@ -82,6 +82,10 @@ SCENARIOS = {
     # same rules: the macro's rules change in another file (alt.rs uses mk_fn! of lib.rs)
     "macro_rules_other_file": dict(first="app_a", second="app_a", edits=[(FW, "pub fn $name() -> u32 { $v + 1 } // EDIT mk_fn", "pub fn $name() -> u32 { $v + 2 } // EDIT mk_fn")],
                                    hit=["unrelated", "area", "sum_to", "add"], observable=True),
+    # JITCOLD7: a dependency's edit keeps a dependent crate's unchanged files from their images only while their
+    # macro lookups replay: the rules of an exported macro app_a uses change in fw
+    "dep_macro_rules": dict(first="app_a", second="app_a", edits=[(FW, "macro_rules! fw_twice { ($e:expr) => { $e * 2 } } // EDIT fw_twice", "macro_rules! fw_twice { ($e:expr) => { $e * 3 } } // EDIT fw_twice")],
+                            hit=["unrelated", "area", "sum_to", "add"], observable=True),
     # an app's own new item: the framework and the app's other fns stay linked
     "own_item": dict(first="app_a", second="app_a", edits=[("app_a/src/main.rs", "fn own_a(x: u32) -> u32 { x * 9 + 2 }", "fn own_a(x: u32) -> u32 { x * 9 + 2 }\nfn own_b() -> u32 { 3 }")],
                      hit=PLAIN + ["own_a", "uses_which", "sink_len"]),
