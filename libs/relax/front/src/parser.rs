@@ -935,39 +935,40 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// `#[name = m!(..)]`: rustc expands the macro of an attribute's value, so `m` must resolve at the
-    /// attribute (a macro_rules! defined further down does not).
+    /// rustc_expand expand.rs: fully_expand_fragment visits attribute value expressions;
+    /// rustc_attr_parsing parser.rs: expr_to_lit checks the expanded value.
     fn attr_value_macro(&mut self, toks: TokRange) -> PResult<()> {
         let (lo, hi) = (toks.lo as usize, toks.hi as usize);
-        if self.macros.is_none() || self.lazy_part || !crate::lexer::validation_enabled() || hi <= lo + 3 || hi > self.toks.len() { return Ok(()); }
-        // the path of the attribute (idents and `::`), then `=`, then one identifier and `!`
+        if !crate::lexer::validation_enabled() || hi <= lo + 3 || hi > self.toks.len() { return Ok(()); }
+        // the attribute's path, then `=`, then its expression
         let mut i = lo;
         while i < hi && matches!(self.toks.at(i).kind, T::Ident | T::RawIdent | T::PathSep) { i += 1; }
-        if i == lo || i + 3 >= hi || self.toks.at(i).kind != T::Eq || self.toks.at(i + 1).kind != T::Ident || self.toks.at(i + 2).kind != T::Not
-            || !matches!(self.toks.at(i + 3).kind, T::OpenParen | T::OpenBracket | T::OpenBrace) || (self.toks.at(i + 1).lo as usize) >= self.src.len() {
-            return Ok(());
-        }
-        let name = String::from_utf8_lossy(self.tok_text(self.toks.at(i + 1))).into_owned();
-        if crate::program::BUILTIN_MACROS.contains(&name.as_str()) || crate::builtins::macro_def(&name).is_some() || crate::macro_reg::has_macro(&name) || fmtmac::is_builtin(name.as_bytes()) {
-            return Ok(());
-        }
+        if i == lo || i + 3 >= hi || self.toks.at(i).kind != T::Eq { return Ok(()); }
         let (save, err_pos) = (self.pos, self.toks.at(i + 1).lo);
         self.pos = i + 1;
+        let call = self.mac_ahead();
+        if !call { self.pos = save; return Ok(()); }
         let path = self.path(true);
         self.pos = save;
         let path = path?;
-        let Some(def) = self.rules_macro(&path) else {
-            if self.name_imported(&name) { return Ok(()); }
-            return Err(PErr { pos: err_pos, msg: format!("cannot find macro `{name}` in this scope") });
-        };
-        // the call expands now: its arguments must match a rule
-        if def.builtin == 0 {
-            self.pos = i + 3;
-            let group = self.delim_tt();
-            self.pos = save;
-            let (_, args) = group?;
-            self.expand_call(&def, args, err_pos)?;
+        // rustc_expand module.rs: mod_file_path_from_attr rejects macros before loading modules.
+        if i == lo + 1 && self.tok_text(self.toks.at(lo)) == b"path" {
+            return Ok(());
         }
+        let seg = self.ast.segs(path.segs).last().unwrap();
+        let name = String::from_utf8_lossy(self.bytes(seg.name.lo, seg.name.hi)).into_owned();
+        if name == "compile_error" && i + 4 < hi && self.toks.at(i + 4).kind == T::Str {
+            let msg = crate::lit::unescape_str(&String::from_utf8_lossy(self.tok_text(self.toks.at(i + 4))));
+            return Err(PErr { pos: err_pos, msg });
+        }
+        if self.macros.is_none() || self.lazy_part {
+            if crate::builtins::builtin_macro_def(&name).is_none() { return Ok(()); }
+        } else if self.rules_macro(&path).is_none() {
+            if self.name_imported(&name) || crate::program::BUILTIN_MACROS.contains(&name.as_str()) || fmtmac::is_builtin(name.as_bytes()) { return Ok(()); }
+            return Err(PErr { pos: err_pos, msg: format!("cannot find macro `{name}` in this scope") });
+        }
+        let value = self.eager_macro_arg(TokRange { lo: (i + 1) as u32, hi: hi as u32 })?;
+        crate::builtins::eval_lit_range(self, value.lo as usize, value.hi as usize).map_err(|msg| PErr { pos: err_pos, msg })?;
         Ok(())
     }
 
@@ -1012,41 +1013,6 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// `#[doc = include_str!(..)]`: the value is a literal-producing macro call; it is expanded
-    /// (and so checked) like any other macro call (rustc expands macros in attribute values).
-    fn check_doc_value(&mut self, lo: usize, hi: usize) -> PResult<()> {
-        let kind = |p: &Self, i: usize| if i < hi { p.toks.at(i).kind } else { T::Eof };
-        if kind(self, lo + 1) != T::Eq || kind(self, lo + 2) != T::Ident || kind(self, lo + 3) != T::Not { return Ok(()); }
-        let mname = match self.tok_text(self.toks.at(lo + 2)) {
-            // the macro's own message is the error
-            b"compile_error" if kind(self, lo + 5) == T::Str => {
-                let msg = crate::lit::unescape_str(&String::from_utf8_lossy(self.tok_text(self.toks.at(lo + 5))));
-                return Err(PErr { pos: self.toks.at(lo + 2).lo, msg });
-            }
-            b"include_str" => "include_str",
-            b"include_bytes" => "include_bytes",
-            b"concat" => "concat",
-            b"env" => "env",
-            b"stringify" => "stringify",
-            _ => return Ok(()),
-        };
-        let call_lo = self.toks.at(lo + 2).lo;
-        if hi >= lo + 6 && matches!(self.toks.at(lo + 4).kind, T::OpenParen | T::OpenBracket | T::OpenBrace) {
-            if let Some((text, rtoks)) = self.builtin_with_rules_expanded(mname, TokRange { lo: (lo + 5) as u32, hi: (hi - 1) as u32 })? {
-                let start = self.expand_toks(&text, &rtoks, call_lo);
-                let end = self.toks.len() - 1;
-                if let Err(m) = crate::builtins::eval_lit_range(self, start, end) {
-                    return Err(PErr { pos: call_lo, msg: m });
-                }
-                return Ok(());
-            }
-        }
-        if let Err(m) = crate::builtins::eval_lit_range(self, lo + 2, hi) {
-            return Err(PErr { pos: call_lo, msg: m });
-        }
-        Ok(())
-    }
-
     fn check_attr_shape(&mut self, toks: TokRange) -> PResult<()> {
         let (lo, hi) = (toks.lo as usize, toks.hi as usize);
         if hi <= lo || hi > self.toks.len() || self.toks.kind_at(lo) != T::Ident {
@@ -1065,7 +1031,6 @@ impl<'a> Parser<'a> {
             b"cfg" => 0,
             b"cfg_attr" => 1,
             b"derive" => 2,
-            b"doc" => return self.check_doc_value(lo, hi),
             _ => return Ok(()),
         };
         let bad = |this: &Self, at: usize, what: &str| -> PResult<()> {
@@ -1657,13 +1622,45 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `name!(args)` of a built-in that takes literal arguments (`concat!`, `include!`, `env!`,
-    /// ...) with every argument that is a `macro_rules!` call replaced by its expansion text,
-    /// or None when no argument is one (the built-in then reads the arguments as they are).
-    /// rustc expands such arguments eagerly (rustc_builtin_macros `expr_to_spanned_string`).
-    fn builtin_with_rules_expanded(&mut self, name: &str, toks: TokRange) -> PResult<Option<(String, Vec<Tok>)>> {
+    /// rustc_builtin_macros util.rs: get_exprs_from_tts / expr_to_spanned_string fully expand
+    /// each expression before inspecting its literal. stringify! keeps its input unexpanded.
+    fn eager_macro_arg(&mut self, toks: TokRange) -> PResult<TokRange> {
+        let save = self.pos;
+        self.pos = toks.lo as usize;
+        let r = (|| {
+            if toks.lo == toks.hi || !self.mac_ahead() { return Ok(toks); }
+            let call_lo = self.lo();
+            let path = self.path(true)?;
+            self.expect(T::Not)?;
+            let (_, args) = self.delim_tt()?;
+            if self.pos != toks.hi as usize { return Ok(toks); }
+            let def = self.rules_macro(&path).or_else(|| {
+                if self.macros.is_some() { return None; }
+                let seg = self.ast.segs(path.segs).last()?;
+                crate::builtins::builtin_macro_def(&String::from_utf8_lossy(self.bytes(seg.name.lo, seg.name.hi)))
+            });
+            let Some(def) = def else { return Ok(toks); };
+            let save_expr = self.include_as_expr;
+            self.include_as_expr = true;
+            let start = self.expand_call(&def, args, call_lo);
+            self.include_as_expr = save_expr;
+            let start = start?;
+            let end = self.toks.len() - 1;
+            // in_expansion keeps every call in the chain on expand_call_inner's depth check
+            // (rustc_expand expand.rs: MacroExpander::expand_invoc).
+            self.in_expansion(start, |p| {
+                let value = p.eager_macro_arg(TokRange { lo: start as u32, hi: end as u32 })?;
+                p.pos = end;
+                Ok(value)
+            })
+        })();
+        self.pos = save;
+        r
+    }
+
+    /// Expand literal arguments before the built-in folds them, without another synthetic call.
+    fn eager_builtin_args(&mut self, toks: TokRange, call_lo: u32) -> PResult<TokRange> {
         let (lo, hi) = (toks.lo as usize, toks.hi as usize);
-        // top-level arguments
         let mut args = Vec::new();
         let mut depth = 0i32;
         let mut s = lo;
@@ -1678,94 +1675,26 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
         }
-        if hi > s {
-            args.push((s, hi));
-        }
+        if hi > s { args.push((s, hi)); }
         let mut any = false;
-        let mut out: Vec<(String, Vec<Tok>)> = Vec::new();
-        for (a, z) in args {
-            // `path ! (..)`: idents and `::` up to the `!`, then one delimited group to the end
-            let mut i = a;
-            while i < z && matches!(self.toks.kind_at(i), T::Ident | T::PathSep | T::KwCrate | T::Dollar) {
-                i += 1;
-            }
-            let call = i > a && i + 2 < z + 1 && self.toks.kind_at(i) == T::Not && matches!(self.toks.kind_at(i + 1), T::OpenParen | T::OpenBracket | T::OpenBrace) && matches!(self.toks.kind_at(z - 1), T::CloseParen | T::CloseBracket | T::CloseBrace);
-            let def = if call {
-                let name = String::from_utf8_lossy(self.tok_text(self.toks.at(i - 1))).trim_start_matches("r#").to_string();
-                let first = String::from_utf8_lossy(self.tok_text(self.toks.at(a))).into_owned();
-                let _ = first;
-                // the path's module part (idents, `crate`, `$crate` spelt `__relax_crate_x`)
-                let mut mpath: Vec<String> = Vec::new();
-                if self.toks.kind_at(a) == T::PathSep {
-                    mpath.push(String::new());
-                }
-                for k in a..i.saturating_sub(1) {
-                    if matches!(self.toks.kind_at(k), T::Ident | T::KwCrate) {
-                        mpath.push(String::from_utf8_lossy(self.tok_text(self.toks.at(k))).trim_start_matches("r#").to_string());
-                    }
-                }
-                if mpath.len() >= 2 && mpath[0].is_empty() && mpath[1].starts_with("__relax_crate_") {
-                    mpath.remove(0);
-                }
-                let module = self.cur_module();
-                match &self.macros {
-                    Some(m) => m.lookup(&name, &self.krate, &mpath, &module).filter(|d| d.builtin == 0),
-                    None => None,
-                }
-            } else {
-                None
-            };
-            // a nested `concat!(..)` with macro_rules calls inside: the same, recursively
-            let nested = if call && def.is_none() && self.tok_text(self.toks.at(i - 1)) == b"concat" {
-                self.builtin_with_rules_expanded("concat", TokRange { lo: (i + 2) as u32, hi: (z - 1) as u32 })?
-            } else {
-                None
-            };
-            match def {
-                Some(d) => {
-                    let (text, rtoks, _, _, _) = self.expand_rules(&d, i + 2, z - 1).map_err(|m| PErr { pos: self.toks.at(a).lo, msg: m })?;
-                    // its own output may hold more calls: concat! re-expands it as an argument
-                    if name == "concat" {
-                        out.push((text, rtoks));
-                    } else {
-                        let mut w = TokText::default();
-                        w.word(T::Ident, "concat");
-                        w.word(T::Not, "!");
-                        w.word(T::OpenParen, "(");
-                        w.append(&text, &rtoks);
-                        w.word(T::CloseParen, ")");
-                        out.push((w.s, w.toks));
-                    }
-                    any = true;
-                }
-                None if nested.is_some() => {
-                    out.push(nested.unwrap());
-                    any = true;
-                }
-                None => {
-                    let lo = self.toks.at(a).lo;
-                    let hi = self.toks.at(z - 1).hi;
-                    let toks: Vec<Tok> = (a..z).map(|k| { let t = self.toks.at(k); Tok { kind: t.kind, lo: t.lo - lo, hi: t.hi - lo } }).collect();
-                    out.push((String::from_utf8_lossy(self.bytes(lo, hi)).into_owned(), toks));
-                }
-            }
+        for (a, z) in &mut args {
+            let value = self.eager_macro_arg(TokRange { lo: *a as u32, hi: *z as u32 })?;
+            any |= value.lo as usize != *a;
+            (*a, *z) = (value.lo as usize, value.hi as usize);
         }
-        if !any {
-            return Ok(None);
-        }
+        if !any { return Ok(toks); }
         let mut w = TokText::default();
-        w.word(T::Ident, name);
-        w.word(T::Not, "!");
-        w.word(T::OpenParen, "(");
-        for (k, (text, toks)) in out.iter().enumerate() {
-            if k > 0 {
-                w.word(T::Comma, ",");
-                w.s.push(' ');
-            }
-            w.append(text, toks);
+        for (k, &(a, z)) in args.iter().enumerate() {
+            if k > 0 { w.word(T::Comma, ","); w.s.push(' '); }
+            if a == z { continue; }
+            let lo = self.toks.at(a).lo;
+            let hi = self.toks.at(z - 1).hi;
+            let rtoks: Vec<Tok> = (a..z).map(|i| { let t = self.toks.at(i); Tok { kind: t.kind, lo: t.lo - lo, hi: t.hi - lo } }).collect();
+            w.append(&String::from_utf8_lossy(self.bytes(lo, hi)), &rtoks);
         }
-        w.word(T::CloseParen, ")");
-        Ok(Some((w.s, w.toks)))
+        if hi > lo && self.toks.kind_at(hi - 1) == T::Comma { w.word(T::Comma, ","); }
+        let start = self.expand_toks(&w.s, &w.toks, call_lo);
+        Ok(TokRange { lo: start as u32, hi: (self.toks.len() - 1) as u32 })
     }
 
     /// Expands a call: appends the expansion's tokens (ending in Eof) and returns their start.
@@ -1797,16 +1726,15 @@ impl<'a> Parser<'a> {
         }
         let trace = crate::preload::relax_trace().map_or(false, |t| t.split(',').any(|p| p.strip_prefix("expand:").map_or(false, |n| def.name.contains(n))));
         use crate::builtins::Builtin as B;
-        if def.builtin < crate::builtins::HOSTED && matches!(crate::builtins::from_u8(def.builtin), B::Concat | B::Env | B::OptionEnv | B::Include | B::IncludeStr | B::IncludeBytes) {
-            // the arguments are expanded first (rustc expands macro calls among them
-            // eagerly: `concat!("{", asset_ref!("x"), "}")` with a user macro_rules)
-            if let Some((text, rtoks)) = self.builtin_with_rules_expanded(&def.name, toks)? {
-                return Ok(self.expand_toks(&text, &rtoks, call_lo));
-            }
-        }
+        let call_hi = self.toks.at(toks.hi as usize).hi;
+        let toks = if def.builtin < crate::builtins::HOSTED && matches!(crate::builtins::from_u8(def.builtin), B::Concat | B::Env | B::OptionEnv | B::Include | B::IncludeStr | B::IncludeBytes) {
+            self.exp_depth += 1;
+            let args = self.eager_builtin_args(toks, call_lo);
+            self.exp_depth -= 1;
+            args?
+        } else { toks };
         if def.builtin != 0 {
             // built-in / hosted proc macro: tokens (its output is not re-lexed)
-            let call_hi = self.toks.at(toks.hi as usize).hi;
             let b = def.builtin;
             let x = match crate::preload::timed_named(4, &def.name, || crate::builtins::expand(self, b, toks.lo as usize, toks.hi as usize, call_lo, call_hi)) {
                 Ok(x) => x,
