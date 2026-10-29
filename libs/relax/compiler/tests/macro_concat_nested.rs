@@ -34,7 +34,7 @@ macro_rules! unit {
     ($t:ty, $larger:ty, [$($int_output:ty),+], [$($float_output:ty),+]) => {
         #[doc = concat!("  - `", stringify!($t), "::per(", stringify!($larger),
             ")` (returns ", stringify_outputs!($($int_output),+, $($float_output),+), ")")]
-        fn generated_doc() -> &str { stringify_outputs!($($int_output),+, $($float_output),+) }
+        fn generated_doc() -> &'static str { stringify_outputs!($($int_output),+, $($float_output),+) }
     };
 }
 unit!(u8, u16, [u8, u16], [f32, f64]);
