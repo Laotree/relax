@@ -727,8 +727,15 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
     // the runtime's process-wide UNIT and TLS machinery. Preserve the original reload
     // serialization for this step. Cached script expansions never enter the host.
     let call_krate = crate::macro_reg::current_call_krate();
+    // While the program's crates load (no program unit yet: no program code runs) and the call is
+    // into the final world, the expansion runs on the asking thread: the runtime's unit is that
+    // world's for every such call at once, and its lazy compiles are owner requests as any thread's.
+    // Expansions of a parse workers' pool then run side by side instead of one at a time on the
+    // owner. Later ones (hot reload, a lazy body parsed while the program runs, a stage world's
+    // macro while the world is built) keep the owner's serialization.
+    let off_owner = crate::run::running_unit().is_null() && wa.as_ref().zip(world_now()).is_some_and(|(a, b)| std::sync::Arc::ptr_eq(a, &b));
     let wait = crate::load_profile::span(sess.runtime.profile, "wait-macro-unit", &entry.fname);
-    crate::owner::call(crate::owner::Class::Program, || -> Result<TokenStream, String> {
+    let body = || -> Result<TokenStream, String> {
     drop(wait);
     let _krate = crate::macro_reg::with_call_krate(&call_krate);
     let _held = crate::load_profile::span(sess.runtime.profile, "macro-unit-held", &entry.fname);
@@ -814,7 +821,8 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
     });
     PH[2].fetch_add(tz.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     Ok(ts)
-    })
+    };
+    if off_owner { body() } else { crate::owner::call(crate::owner::Class::Program, body) }
 }
 
 
