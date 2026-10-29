@@ -188,3 +188,63 @@ fn non_promotable_calls_keep_distinct_temporaries() {
     dynamic_vtable(w_clone, None);
     ordinary_temporary(None);
 }
+
+// tokio task/coop/mod.rs with_budget exactly: the guard comes back from a thread-local
+// try_with as Result<ResetGuard, AccessError>, and the closure's value is a Poll<()> (one byte,
+// no payload). Relax lost the Ready of `rt.block_on(tokio::task::yield_now())`: block_on parked
+// and polled the finished yield_now again ("`async fn` resumed after completion").
+#[derive(Clone, Copy)]
+struct Budget2(Option<u8>);
+thread_local! {
+    static BUDGET2: Cell<Budget2> = const { Cell::new(Budget2(None)) };
+}
+fn budget_cell<R>(f: impl FnOnce(&Cell<Budget2>) -> R) -> Result<R, std::thread::AccessError> {
+    BUDGET2.try_with(f)
+}
+#[inline(always)]
+fn with_budget2<R>(budget: Budget2, f: impl FnOnce() -> R) -> R {
+    struct ResetGuard { prev: Budget2 }
+    impl Drop for ResetGuard {
+        fn drop(&mut self) { let _ = budget_cell(|cell| cell.set(self.prev)); }
+    }
+    #[allow(unused_variables)]
+    let maybe_guard = budget_cell(|cell| {
+        let prev = cell.get();
+        cell.set(budget);
+        ResetGuard { prev }
+    });
+    f()
+}
+
+async fn yield_flag() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded { return Poll::Ready(()); }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
+}
+
+fn block_on_budget<F: Future>(f: F) -> (F::Output, u32) {
+    let waker = unsafe { Waker::from_raw(RawWaker::new(Box::into_raw(Box::new(1u64)) as *const (), &VT)) };
+    let mut cx = Context::from_waker(&waker);
+    let mut f = pin!(f);
+    let mut polls = 0;
+    loop {
+        polls += 1;
+        assert!(polls < 5, "polled after completion");
+        if let Poll::Ready(v) = with_budget2(Budget2(Some(128)), || f.as_mut().poll(&mut cx)) {
+            return (v, polls);
+        }
+    }
+}
+
+#[test]
+fn unit_poll_through_budget_guard() {
+    let ((), polls) = block_on_budget(yield_flag());
+    assert_eq!(polls, 2);
+    let (v, polls) = block_on_budget(async { yield_flag().await; 5u8 });
+    assert_eq!((v, polls), (5, 2));
+}

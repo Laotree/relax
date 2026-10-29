@@ -13380,13 +13380,10 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32) -> Result<(u32, u
                         }
                     }
                     Inst::Copy(dst, src, _) => {
-                        // pointers into the source itself do not travel with its bytes: a
-                        // value referenced from inside cannot be moved (borrowck), so a moved
-                        // copy's self-pointers are never used
-                        let mut r = read_through(&pts, &content, &uset, *src);
-                        for w in 0..wd {
-                            r[w] &= !pts[src.0 as usize * wd + w];
-                        }
+                        // A copied field can borrow a sibling in the source slot. Keep that
+                        // borrow (rustc_mir_transform/src/coroutine/layout.rs::locals_live_across_suspend_points;
+                        // rustc_mir_dataflow/src/impls/borrowed_locals.rs::MaybeBorrowedLocals::gen_statement).
+                        let r = read_through(&pts, &content, &uset, *src);
                         let pd = pts[dst.0 as usize * wd..][..wd].to_vec();
                         if empty(&pd) {
                             changed |= or(&mut uset, &r);
