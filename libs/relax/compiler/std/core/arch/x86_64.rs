@@ -192,8 +192,11 @@ pub const fn _MM_SHUFFLE(z: u32, y: u32, x: u32, w: u32) -> i32 {
     ((z << 6) | (y << 4) | (x << 2) | w) as i32
 }
 
+// rustc library/stdarch/crates/core_arch/src/x86/avx2.rs: _mm256_blend_epi32.
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]
 #[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
 pub unsafe fn _mm256_blend_epi32<const IMM8: i32>(a: __m256i, b: __m256i) -> __m256i {
+    const { assert!(IMM8 >= 0 && IMM8 < 256) };
     let a = lanes256_i32(a);
     let b = lanes256_i32(b);
     let mut r = [0i32; 8];
@@ -203,6 +206,37 @@ pub unsafe fn _mm256_blend_epi32<const IMM8: i32>(a: __m256i, b: __m256i) -> __m
         i += 1;
     }
     from256_i32(r)
+}
+
+// rustc library/stdarch/crates/core_arch/src/x86/avx2.rs: _mm256_shuffle_epi32.
+// Repeat the selector within each 128-bit half; immediates are unsigned 8-bit values.
+// Gate target_feature by architecture: this module is also mounted on non-x86 hosts.
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm256_shuffle_epi32<const MASK: i32>(a: __m256i) -> __m256i {
+    const { assert!(MASK >= 0 && MASK < 256) };
+    i_join(_mm_shuffle_epi32::<MASK>(i_lo(&a)), _mm_shuffle_epi32::<MASK>(i_hi(&a)))
+}
+
+// rustc library/stdarch/crates/core_arch/src/x86/avx2.rs: _mm256_permutevar8x32_epi32.
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]
+pub unsafe fn _mm256_permutevar8x32_epi32(a: __m256i, b: __m256i) -> __m256i {
+    let a = lanes256_i32(a);
+    let b = lanes256_i32(b);
+    let mut r = [0i32; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = a[(b[i] as u32 & 7) as usize];
+        i += 1;
+    }
+    from256_i32(r)
+}
+
+// rustc library/stdarch/crates/core_arch/src/x86/avx2.rs: _mm256_mul_epu32.
+// Only the low unsigned dword in each qword participates in the 64-bit product.
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]
+pub unsafe fn _mm256_mul_epu32(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_mul_epu32(i_lo(&a), i_lo(&b)), _mm_mul_epu32(i_hi(&a), i_hi(&b)))
 }
 
 pub unsafe fn _mm256_castsi256_si128(a: __m256i) -> __m128i {
@@ -599,6 +633,15 @@ pub unsafe fn _mm256_add_epi16(a: __m256i, b: __m256i) -> __m256i {
 pub unsafe fn _mm256_add_epi32(a: __m256i, b: __m256i) -> __m256i {
     i_join(_mm_add_epi32(i_lo(&a), i_lo(&b)), _mm_add_epi32(i_hi(&a), i_hi(&b)))
 }
+// rustc library/stdarch/crates/core_arch/src/x86/avx2.rs: _mm256_add_epi64 / _mm256_sub_epi64.
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]
+pub unsafe fn _mm256_add_epi64(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_add_epi64(i_lo(&a), i_lo(&b)), _mm_add_epi64(i_hi(&a), i_hi(&b)))
+}
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]
+pub unsafe fn _mm256_sub_epi64(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_sub_epi64(i_lo(&a), i_lo(&b)), _mm_sub_epi64(i_hi(&a), i_hi(&b)))
+}
 pub unsafe fn _mm256_sub_epi16(a: __m256i, b: __m256i) -> __m256i {
     i_join(_mm_sub_epi16(i_lo(&a), i_lo(&b)), _mm_sub_epi16(i_hi(&a), i_hi(&b)))
 }
@@ -699,6 +742,28 @@ pub unsafe fn _mm256_slli_epi16<const IMM8: i32>(a: __m256i) -> __m256i {
 #[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 pub unsafe fn _mm256_slli_epi32<const IMM8: i32>(a: __m256i) -> __m256i {
     i_join(_mm_slli_epi32::<IMM8>(i_lo(&a)), _mm_slli_epi32::<IMM8>(i_hi(&a)))
+}
+// rustc library/stdarch/crates/core_arch/src/x86/avx2.rs: _mm256_slli_epi64 / _mm256_srli_epi64.
+// Counts >= 64 zero every lane, rather than wrapping the count modulo 64.
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm256_slli_epi64<const IMM8: i32>(a: __m256i) -> __m256i {
+    const { assert!(IMM8 >= 0 && IMM8 < 256) };
+    if IMM8 >= 64 {
+        _mm256_setzero_si256()
+    } else {
+        i_join(_mm_slli_epi64::<IMM8>(i_lo(&a)), _mm_slli_epi64::<IMM8>(i_hi(&a)))
+    }
+}
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm256_srli_epi64<const IMM8: i32>(a: __m256i) -> __m256i {
+    const { assert!(IMM8 >= 0 && IMM8 < 256) };
+    if IMM8 >= 64 {
+        _mm256_setzero_si256()
+    } else {
+        i_join(_mm_srli_epi64::<IMM8>(i_lo(&a)), _mm_srli_epi64::<IMM8>(i_hi(&a)))
+    }
 }
 #[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 pub unsafe fn _mm256_srai_epi16<const IMM8: i32>(a: __m256i) -> __m256i {
@@ -3200,6 +3265,12 @@ pub unsafe fn _mm256_setr_epi32(
     e7: i32,
 ) -> __m256i {
     from256_i32([e0, e1, e2, e3, e4, e5, e6, e7])
+}
+
+// rustc library/stdarch/crates/core_arch/src/x86/avx.rs: _mm256_set1_epi64x.
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+pub unsafe fn _mm256_set1_epi64x(a: i64) -> __m256i {
+    __m256i([a; 4])
 }
 
 pub unsafe fn _mm256_setr_ps(e0: f32, e1: f32, e2: f32, e3: f32, e4: f32, e5: f32, e6: f32, e7: f32) -> __m256 {
