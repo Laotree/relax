@@ -4955,4 +4955,185 @@ pub const RRF_RT_REG_SZ: crate::Win32::System::Registry::REG_ROUTINE_FLAGS = cra
 pub const RRF_SUBKEY_WOW6432KEY: crate::Win32::System::Registry::REG_ROUTINE_FLAGS = crate::Win32::System::Registry::REG_ROUTINE_FLAGS(131072u64 as _);
 }
 }
+pub mod UI {
+pub mod Input {
+pub mod KeyboardAndMouse {
+mod import_SetFocus { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "SetFocus"] pub fn call(hWnd: crate::Win32::Foundation::HWND) -> crate::Win32::Foundation::HWND; } }
+pub use import_SetFocus::call as SetFocus_raw;
+#[inline]
+pub unsafe fn SetFocus(hWnd: Option<crate::Win32::Foundation::HWND>) -> crate::Win32::Foundation::HWND {
+import_SetFocus::call(hWnd.unwrap_or(unsafe { ::core::mem::zeroed() }))}
+}
+pub mod Pointer {
+mod import_GetPointerDeviceRects { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetPointerDeviceRects"] pub fn call(device: crate::Win32::Foundation::HANDLE,pointerDeviceRect: *mut crate::Win32::Foundation::RECT,displayRect: *mut crate::Win32::Foundation::RECT) -> crate::core::BOOL; } }
+pub use import_GetPointerDeviceRects::call as GetPointerDeviceRects_raw;
+#[inline]
+pub unsafe fn GetPointerDeviceRects(device: crate::Win32::Foundation::HANDLE,pointerDeviceRect: *mut crate::Win32::Foundation::RECT,displayRect: *mut crate::Win32::Foundation::RECT) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_GetPointerDeviceRects::call(device,pointerDeviceRect,displayRect); hr__.ok()?;
+Ok(())
+}
+mod import_GetPointerInfo { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetPointerInfo"] pub fn call(pointerId: u32,pointerInfo: *mut crate::system_web_view::Win32::UI::Input::Pointer::POINTER_INFO) -> crate::core::BOOL; } }
+pub use import_GetPointerInfo::call as GetPointerInfo_raw;
+#[inline]
+pub unsafe fn GetPointerInfo(pointerId: u32,pointerInfo: *mut crate::system_web_view::Win32::UI::Input::Pointer::POINTER_INFO) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_GetPointerInfo::call(pointerId,pointerInfo); hr__.ok()?;
+Ok(())
+}
+mod import_GetPointerPenInfo { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetPointerPenInfo"] pub fn call(pointerId: u32,penInfo: *mut crate::system_web_view::Win32::UI::Input::Pointer::POINTER_PEN_INFO) -> crate::core::BOOL; } }
+pub use import_GetPointerPenInfo::call as GetPointerPenInfo_raw;
+#[inline]
+pub unsafe fn GetPointerPenInfo(pointerId: u32,penInfo: *mut crate::system_web_view::Win32::UI::Input::Pointer::POINTER_PEN_INFO) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_GetPointerPenInfo::call(pointerId,penInfo); hr__.ok()?;
+Ok(())
+}
+mod import_GetPointerTouchInfo { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetPointerTouchInfo"] pub fn call(pointerId: u32,touchInfo: *mut crate::system_web_view::Win32::UI::Input::Pointer::POINTER_TOUCH_INFO) -> crate::core::BOOL; } }
+pub use import_GetPointerTouchInfo::call as GetPointerTouchInfo_raw;
+#[inline]
+pub unsafe fn GetPointerTouchInfo(pointerId: u32,touchInfo: *mut crate::system_web_view::Win32::UI::Input::Pointer::POINTER_TOUCH_INFO) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_GetPointerTouchInfo::call(pointerId,touchInfo); hr__.ok()?;
+Ok(())
+}
+mod import_GetPointerType { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetPointerType"] pub fn call(pointerId: u32,pointerType: *mut crate::system_web_view::Win32::UI::WindowsAndMessaging::POINTER_INPUT_TYPE) -> crate::core::BOOL; } }
+pub use import_GetPointerType::call as GetPointerType_raw;
+#[inline]
+pub unsafe fn GetPointerType(pointerId: u32,pointerType: *mut crate::system_web_view::Win32::UI::WindowsAndMessaging::POINTER_INPUT_TYPE) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_GetPointerType::call(pointerId,pointerType); hr__.ok()?;
+Ok(())
+}
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct POINTER_BUTTON_CHANGE_TYPE(pub i32);
+impl POINTER_BUTTON_CHANGE_TYPE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for POINTER_BUTTON_CHANGE_TYPE { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for POINTER_BUTTON_CHANGE_TYPE { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for POINTER_BUTTON_CHANGE_TYPE {}
+impl ::core::fmt::Debug for POINTER_BUTTON_CHANGE_TYPE { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for POINTER_BUTTON_CHANGE_TYPE { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for POINTER_BUTTON_CHANGE_TYPE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for POINTER_BUTTON_CHANGE_TYPE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for POINTER_BUTTON_CHANGE_TYPE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const POINTER_CHANGE_FIFTHBUTTON_DOWN: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE(9i64 as _);
+pub const POINTER_CHANGE_FIFTHBUTTON_UP: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE(10i64 as _);
+pub const POINTER_CHANGE_FIRSTBUTTON_DOWN: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE(1i64 as _);
+pub const POINTER_CHANGE_FIRSTBUTTON_UP: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE(2i64 as _);
+pub const POINTER_CHANGE_FOURTHBUTTON_DOWN: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE(7i64 as _);
+pub const POINTER_CHANGE_FOURTHBUTTON_UP: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE(8i64 as _);
+pub const POINTER_CHANGE_NONE: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE(0i64 as _);
+pub const POINTER_CHANGE_SECONDBUTTON_DOWN: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE(3i64 as _);
+pub const POINTER_CHANGE_SECONDBUTTON_UP: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE(4i64 as _);
+pub const POINTER_CHANGE_THIRDBUTTON_DOWN: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE(5i64 as _);
+pub const POINTER_CHANGE_THIRDBUTTON_UP: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE(6i64 as _);
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct POINTER_FLAGS(pub u32);
+impl POINTER_FLAGS { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for POINTER_FLAGS { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for POINTER_FLAGS { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for POINTER_FLAGS {}
+impl ::core::fmt::Debug for POINTER_FLAGS { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for POINTER_FLAGS { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for POINTER_FLAGS { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for POINTER_FLAGS { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for POINTER_FLAGS { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const POINTER_FLAG_CANCELED: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(32768u64 as _);
+pub const POINTER_FLAG_CAPTURECHANGED: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(2097152u64 as _);
+pub const POINTER_FLAG_CONFIDENCE: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(16384u64 as _);
+pub const POINTER_FLAG_DOWN: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(65536u64 as _);
+pub const POINTER_FLAG_FIFTHBUTTON: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(256u64 as _);
+pub const POINTER_FLAG_FIRSTBUTTON: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(16u64 as _);
+pub const POINTER_FLAG_FOURTHBUTTON: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(128u64 as _);
+pub const POINTER_FLAG_HASTRANSFORM: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(4194304u64 as _);
+pub const POINTER_FLAG_HWHEEL: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(1048576u64 as _);
+pub const POINTER_FLAG_INCONTACT: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(4u64 as _);
+pub const POINTER_FLAG_INRANGE: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(2u64 as _);
+pub const POINTER_FLAG_NEW: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(1u64 as _);
+pub const POINTER_FLAG_NONE: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(0u64 as _);
+pub const POINTER_FLAG_PRIMARY: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(8192u64 as _);
+pub const POINTER_FLAG_SECONDBUTTON: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(32u64 as _);
+pub const POINTER_FLAG_THIRDBUTTON: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(64u64 as _);
+pub const POINTER_FLAG_UP: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(262144u64 as _);
+pub const POINTER_FLAG_UPDATE: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(131072u64 as _);
+pub const POINTER_FLAG_WHEEL: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS = crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS(524288u64 as _);
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct POINTER_INFO {
+pub pointerType: crate::system_web_view::Win32::UI::WindowsAndMessaging::POINTER_INPUT_TYPE,
+pub pointerId: u32,
+pub frameId: u32,
+pub pointerFlags: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_FLAGS,
+pub sourceDevice: crate::Win32::Foundation::HANDLE,
+pub hwndTarget: crate::Win32::Foundation::HWND,
+pub ptPixelLocation: crate::Win32::Foundation::POINT,
+pub ptHimetricLocation: crate::Win32::Foundation::POINT,
+pub ptPixelLocationRaw: crate::Win32::Foundation::POINT,
+pub ptHimetricLocationRaw: crate::Win32::Foundation::POINT,
+pub dwTime: u32,
+pub historyCount: u32,
+pub InputData: i32,
+pub dwKeyStates: u32,
+pub PerformanceCount: u64,
+pub ButtonChangeType: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_BUTTON_CHANGE_TYPE,
+}
+impl POINTER_INFO { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for POINTER_INFO { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct POINTER_PEN_INFO {
+pub pointerInfo: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_INFO,
+pub penFlags: u32,
+pub penMask: u32,
+pub pressure: u32,
+pub rotation: u32,
+pub tiltX: i32,
+pub tiltY: i32,
+}
+impl POINTER_PEN_INFO { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for POINTER_PEN_INFO { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct POINTER_TOUCH_INFO {
+pub pointerInfo: crate::system_web_view::Win32::UI::Input::Pointer::POINTER_INFO,
+pub touchFlags: u32,
+pub touchMask: u32,
+pub rcContact: crate::Win32::Foundation::RECT,
+pub rcContactRaw: crate::Win32::Foundation::RECT,
+pub orientation: u32,
+pub pressure: u32,
+}
+impl POINTER_TOUCH_INFO { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for POINTER_TOUCH_INFO { fn default() -> Self {Self::default()} }
+}
+}
+pub mod WindowsAndMessaging {
+mod import_IsChild { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "IsChild"] pub fn call(hWndParent: crate::Win32::Foundation::HWND,hWnd: crate::Win32::Foundation::HWND) -> crate::core::BOOL; } }
+pub use import_IsChild::call as IsChild_raw;
+#[inline]
+pub unsafe fn IsChild(hWndParent: crate::Win32::Foundation::HWND,hWnd: crate::Win32::Foundation::HWND) -> crate::core::BOOL {
+import_IsChild::call(hWndParent,hWnd)}
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct POINTER_INPUT_TYPE(pub i32);
+impl POINTER_INPUT_TYPE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for POINTER_INPUT_TYPE { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for POINTER_INPUT_TYPE { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for POINTER_INPUT_TYPE {}
+impl ::core::fmt::Debug for POINTER_INPUT_TYPE { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for POINTER_INPUT_TYPE { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for POINTER_INPUT_TYPE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for POINTER_INPUT_TYPE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for POINTER_INPUT_TYPE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const PT_MOUSE: crate::system_web_view::Win32::UI::WindowsAndMessaging::POINTER_INPUT_TYPE = crate::system_web_view::Win32::UI::WindowsAndMessaging::POINTER_INPUT_TYPE(4i64 as _);
+pub const PT_PEN: crate::system_web_view::Win32::UI::WindowsAndMessaging::POINTER_INPUT_TYPE = crate::system_web_view::Win32::UI::WindowsAndMessaging::POINTER_INPUT_TYPE(3i64 as _);
+pub const PT_POINTER: crate::system_web_view::Win32::UI::WindowsAndMessaging::POINTER_INPUT_TYPE = crate::system_web_view::Win32::UI::WindowsAndMessaging::POINTER_INPUT_TYPE(1i64 as _);
+pub const PT_TOUCH: crate::system_web_view::Win32::UI::WindowsAndMessaging::POINTER_INPUT_TYPE = crate::system_web_view::Win32::UI::WindowsAndMessaging::POINTER_INPUT_TYPE(2i64 as _);
+pub const PT_TOUCHPAD: crate::system_web_view::Win32::UI::WindowsAndMessaging::POINTER_INPUT_TYPE = crate::system_web_view::Win32::UI::WindowsAndMessaging::POINTER_INPUT_TYPE(5i64 as _);
+pub const WM_PAINT: u32 = 15;
+pub const WM_POINTERCAPTURECHANGED: u32 = 588;
+pub const WM_POINTERDOWN: u32 = 582;
+pub const WM_POINTERENTER: u32 = 585;
+pub const WM_POINTERLEAVE: u32 = 586;
+pub const WM_POINTERUP: u32 = 583;
+pub const WM_POINTERUPDATE: u32 = 581;
+}
+}
 }

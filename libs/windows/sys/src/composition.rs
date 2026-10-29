@@ -444,6 +444,9 @@ let mut result__ = ::core::mem::zeroed();
 let hr__ = import_DCompositionCreateDevice3::call(match renderingDevice { Some(v) => v.as_raw(), None => ::core::ptr::null_mut() },iid,&mut result__); hr__.ok()?;
 Ok(result__)
 }
+pub type DCompositionWaitForCompositorClock = unsafe extern "system" fn(count: u32,handles: *const crate::Win32::Foundation::HANDLE,timeoutInMs: u32) -> u32;
+/// The library and NUL-terminated export name of [`DCompositionWaitForCompositorClock`].
+pub const DCompositionWaitForCompositorClock_EXPORT: (&str, &str) = ("dcomp.dll", "DCompositionWaitForCompositorClock\u{0}");
 pub const IID_IDCompositionAffineTransform2DEffect: crate::core::GUID = crate::core::GUID { data1: 192199144, data2: 52694, data3: 18735, data4: [187,188,94,211,33,87,2,109,] };
 #[repr(C)]
 pub struct IDCompositionAffineTransform2DEffect_Vtbl {
