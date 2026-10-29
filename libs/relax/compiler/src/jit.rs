@@ -16280,12 +16280,18 @@ impl Unit {
         if f.compiled || f.ran_before.load(Ordering::Relaxed) {
             return true;
         }
-        let Some(mut c) = self.cache.take() else { return false };
-        let r = c.has_stored_entry(self, id);
-        self.cache = Some(c);
+        let r = self.has_stored_entry(id);
         if r {
             self.fns[id as usize].ran_before.store(true, Ordering::Relaxed);
         }
+        r
+    }
+
+    /// Whether slot `id` has a stored code entry (its key names one in the cache).
+    pub(crate) fn has_stored_entry(&mut self, id: u32) -> bool {
+        let Some(mut c) = self.cache.take() else { return false };
+        let r = c.has_stored_entry(self, id);
+        self.cache = Some(c);
         r
     }
 
@@ -21470,7 +21476,7 @@ unsafe fn spec_build(up: *mut Unit, id: u32) -> bool {
     // a slot with a stored code entry links it (split_begin looks the disk cache up first): its
     // type check and lowering are not made ahead. One whose entry no longer links (a dependency
     // was edited) needs its front in the take, which bails for it (take_prefronted).
-    let Some((front, stored)) = owner::publish(|| fresh(up).then(|| ((&*up).front.clone(), (&mut *up).ran_before(id)))) else { return true };
+    let Some((front, stored)) = owner::publish(|| fresh(up).then(|| ((&*up).front.clone(), (&mut *up).has_stored_entry(id)))) else { return true };
     if !stored {
         prefront_slot(&front, id);
     }
