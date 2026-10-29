@@ -501,7 +501,16 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
             })),
             _ => None,
         };
-        let results = relax_scripts(sess, gr, target_dir, &native_krates, &check_skipped);
+        // with the hook: the scripts of the proc-macro world's crates first (the hook starts the
+        // world from their outputs), the others beside the world's build
+        let world: Vec<bool> = match (&native_job, scripts_done) {
+            (Some(_), Some(_)) => {
+                let names = crate::macro_reg::macro_closure_names();
+                gr.crates.iter().map(|c| names.contains(&c.name)).collect()
+            }
+            _ => Vec::new(),
+        };
+        let mut results = relax_scripts(sess, gr, target_dir, &native_krates, &check_skipped, &|k| world.is_empty() || world[k]);
         let mut _kept = None;
         if let (Some(job), Some(done)) = (&native_job, scripts_done) {
             if !job.is_finished() {
@@ -515,6 +524,9 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
                 }
                 if ok { _kept = done(gr, &native_krates, &cfgs, &env); }
             }
+        }
+        if !world.is_empty() {
+            results.extend(relax_scripts(sess, gr, target_dir, &native_krates, &check_skipped, &|k| !world[k]));
         }
         (native_job.map(|j| j.join().unwrap_or_else(|_| Err("--allow-c: the native build panicked".to_string()))), results)
     });
@@ -540,11 +552,11 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
 
 /// The scripts Relax runs itself (every one but the native packages' and a check's skipped
 /// ones), on the pool: (crates, stdout or error, OUT_DIR) per script.
-fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &str, native_krates: &[usize], check_skipped: &[usize]) -> Vec<(Vec<usize>, Result<String, String>, String)> {
+fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &str, native_krates: &[usize], check_skipped: &[usize], only: &(dyn Fn(usize) -> bool + Sync)) -> Vec<(Vec<usize>, Result<String, String>, String)> {
     let results: Mutex<Vec<(Vec<usize>, Result<String, String>, String)>> = Mutex::new(Vec::new());
     crate::pool::scope(|s| {
         for bs in &g.build_scripts {
-            if native_krates.contains(&bs.krate) {
+            if native_krates.contains(&bs.krate) || !only(bs.krate) {
                 continue;
             }
             if check_skipped.contains(&bs.krate) {
