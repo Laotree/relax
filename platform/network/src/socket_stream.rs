@@ -31,6 +31,14 @@ impl SocketStream {
         Ok((Self { inner }, der))
     }
 
+    /// Like [`Self::connect_capture`], resuming the TLS session of `session_of`, an earlier
+    /// captured connection to the same host (an FTPS data channel resumes its control
+    /// connection's session; servers may refuse a data channel that does not).
+    pub fn connect_capture_resuming(host: &str, port: &str, session_of: &Self) -> io::Result<(Self, Vec<u8>)> {
+        let (inner, der) = crate::backend::linux::socket_stream::SocketStream::connect_capture_resuming(host, port, &session_of.inner)?;
+        Ok((Self { inner }, der))
+    }
+
     pub fn into_tls(self, host: &str, ignore_ssl_cert: bool) -> io::Result<Self> {
         Ok(Self {
             inner: self.inner.into_tls(host, ignore_ssl_cert)?,
@@ -97,6 +105,14 @@ impl SocketStream {
         Ok((Self { inner }, der))
     }
 
+    /// Like [`Self::connect_capture`], resuming the TLS session of `session_of`, an earlier
+    /// captured connection to the same host (an FTPS data channel resumes its control
+    /// connection's session; servers may refuse a data channel that does not).
+    pub fn connect_capture_resuming(host: &str, port: &str, session_of: &Self) -> io::Result<(Self, Vec<u8>)> {
+        let (inner, der) = apple_impl::SocketStream::connect_capture_resuming(host, port, &session_of.inner)?;
+        Ok((Self { inner }, der))
+    }
+
     pub fn into_tls(self, host: &str, ignore_ssl_cert: bool) -> io::Result<Self> {
         Ok(Self {
             inner: self.inner.into_tls(host, ignore_ssl_cert)?,
@@ -160,6 +176,14 @@ impl SocketStream {
     /// leaf certificate DER. Hash it with [`crate::tls::fingerprint`] for a known-hosts check.
     pub fn connect_capture(host: &str, port: &str) -> io::Result<(Self, Vec<u8>)> {
         let (inner, der) = windows_impl::SocketStream::connect_capture(host, port)?;
+        Ok((Self { inner }, der))
+    }
+
+    /// Like [`Self::connect_capture`], resuming the TLS session of `session_of`, an earlier
+    /// captured connection to the same host (an FTPS data channel resumes its control
+    /// connection's session; servers may refuse a data channel that does not).
+    pub fn connect_capture_resuming(host: &str, port: &str, session_of: &Self) -> io::Result<(Self, Vec<u8>)> {
+        let (inner, der) = windows_impl::SocketStream::connect_capture_resuming(host, port, &session_of.inner)?;
         Ok((Self { inner }, der))
     }
 
@@ -233,6 +257,13 @@ impl SocketStream {
         Ok((Self { inner }, der))
     }
 
+    pub fn connect_capture_resuming(_host: &str, _port: &str, _session_of: &Self) -> io::Result<(Self, Vec<u8>)> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TLS session resumption is not available on this target",
+        ))
+    }
+
     pub fn into_tls(self, _host: &str, _ignore_ssl_cert: bool) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -289,6 +320,13 @@ impl SocketStream {
     }
 
     pub fn connect_capture(_host: &str, _port: &str) -> io::Result<(Self, Vec<u8>)> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "self-signed TLS is not available on this target",
+        ))
+    }
+
+    pub fn connect_capture_resuming(_host: &str, _port: &str, _session_of: &Self) -> io::Result<(Self, Vec<u8>)> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "self-signed TLS is not available on this target",
