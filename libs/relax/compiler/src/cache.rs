@@ -4782,6 +4782,8 @@ pub struct FrontImages {
     /// the crates a partial collected restore kept (name, fingerprint): the crates loaded after
     /// them name them as dependencies (restore_collected, full_deps)
     retained: relax_session::sync::Mutex<Vec<(String, u128)>>,
+    /// of them, the proc-macro crates (CrateImages::retained_proc_macros)
+    retained_proc: relax_session::sync::Mutex<Vec<(String, u128)>>,
     /// a reordered load's stored graph (load_order): the restore keeps its leading crates
     base: relax_session::sync::Mutex<Option<BaseOrder>>,
     /// the records load_order read of graph `.0` (the restore reads them once)
@@ -5021,13 +5023,14 @@ impl FrontImages {
     /// (a file recorded without it is parsed). Taking one maps it as a crate image's file is
     /// (its lazily parsed part is not taken: the bodies are parsed on demand in this crate's
     /// scope). The record's late inputs are noted for the crate's next record.
-    fn previous_files_of(&self, c: &crate::preload::PreCrate, deps: &[u128], proc_fps: Option<u128>) -> Option<crate::crate_image::PreviousFiles> {
+    fn previous_files_of(&self, c: &crate::preload::PreCrate, deps: Option<&[u128]>, proc_fps: Option<u128>) -> Option<crate::crate_image::PreviousFiles> {
         use crate::crate_image::{decode, FileMeta, Record};
         let tr = |path: &std::path::Path, why: &str| if crate::preload::trace() { eprintln!("boot-trace: {}: earlier record {} not taken: {}", c.name, path.display(), why); };
-        let Some(deps) = self.full_deps(c, deps) else {
+        let deps = deps.and_then(|d| self.full_deps(c, d));
+        if deps.is_none() && proc_fps.is_none() {
             tr(&self.dir, "dependency fingerprints");
             return None;
-        };
+        }
         let options = &c.cfg.session.options;
         let mut cfg = c.cfg.set.clone();
         cfg.sort();
@@ -5046,9 +5049,16 @@ impl FrontImages {
             let Some((KIND_FRONT_CRATE, b)) = st.get(front_crate_key(&c.name, &c.root)) else { continue };
             let Some(rec) = decode::<Record>(b) else { tr(&path, "decode"); continue };
             let same = rec.name == c.name && rec.root == c.root && rec.edition == c.edition && rec.cfg == cfg && rec.proc_macro == c.proc_macro
-                && rec.deps == c.image_dep_names && (rec.dep_fps == deps || proc_fps.is_some() && rec.proc_fps == proc_fps) && rec.lazy_auto == crate::parser::lazy_auto()
+                && rec.deps == c.image_dep_names && (deps.as_ref().is_some_and(|d| rec.dep_fps == *d) || proc_fps.is_some() && rec.proc_fps == proc_fps) && rec.lazy_auto == crate::parser::lazy_auto()
                 && rec.parse_options == crate::crate_image::parse_options(options) && rec.ahead.complete;
-            if !same { tr(&path, "identity"); continue; }
+            if !same {
+                if crate::preload::trace() {
+                    let checks = [rec.name == c.name, rec.root == c.root, rec.edition == c.edition, rec.cfg == cfg, rec.proc_macro == c.proc_macro, rec.deps == c.image_dep_names,
+                        deps.as_ref().is_some_and(|d| rec.dep_fps == *d), proc_fps.is_some() && rec.proc_fps == proc_fps, rec.lazy_auto == crate::parser::lazy_auto(), rec.ahead.complete];
+                    eprintln!("boot-trace: {}: earlier record {} not taken: identity {:?} (proc {:?} recorded {:?})", c.name, path.display(), checks, proc_fps.map(|x| x as u64), rec.proc_fps.map(|x| x as u64));
+                }
+                continue;
+            }
             if !ledger_current(&st, &present, &mut HashMap::new()) { tr(&path, "late inputs"); continue; }
             let before = files.len();
             for f in rec.files {
@@ -5344,8 +5354,11 @@ impl crate::crate_image::CrateImages for FrontImages {
     fn crate_image(&self, c: &crate::preload::PreCrate, deps: &[u128]) -> Option<crate::crate_image::CrateImage> {
         self.selected_image(c, deps, None)
     }
-    fn previous_files(&self, c: &crate::preload::PreCrate, deps: &[u128], proc_fps: Option<u128>) -> Option<crate::crate_image::PreviousFiles> {
+    fn previous_files(&self, c: &crate::preload::PreCrate, deps: Option<&[u128]>, proc_fps: Option<u128>) -> Option<crate::crate_image::PreviousFiles> {
         self.previous_files_of(c, deps, proc_fps)
+    }
+    fn retained_proc_macros(&self) -> Vec<(String, u128)> {
+        self.retained_proc.lock().unwrap().clone()
     }
     fn crate_image_selected(&self, c: &crate::preload::PreCrate, deps: &[u128], plan: u128, deferred: &[String]) -> Option<crate::crate_image::CrateImage> {
         self.selected_image(c, deps, Some((plan, deferred)))
@@ -5457,19 +5470,8 @@ impl FrontRecordView {
                 }
             }).collect(),
             deps, dep_fps, fingerprint: fingerprint(ci), selection_hash: c.context.fingerprint(),
-            proc_fps: {
-                // (the proc-macro crates among its dependencies, transitively: preload proc_fps_of)
-                let mut seen = vec![false; prog.crates.len()];
-                let mut stack: Vec<usize> = c.deps.iter().map(|&(_, k)| k as usize).filter(|&k| k != ci).collect();
-                let mut out = Vec::new();
-                while let Some(d) = stack.pop() {
-                    if d >= prog.crates.len() || std::mem::replace(&mut seen[d], true) { continue; }
-                    let dc = &prog.crates[d];
-                    if dc.proc_macro { out.push((prog.syms.str(dc.name).to_owned(), fingerprint(d))); }
-                    stack.extend(dc.deps.iter().map(|&(_, k)| k as usize).filter(|&k| k != d));
-                }
-                crate::crate_image::proc_fps(out.into_iter())
-            },
+            proc_fps: crate::crate_image::proc_fps(prog.crates.iter().enumerate().filter(|(_, d)| d.proc_macro)
+                .map(|(k, d)| (prog.syms.str(d.name).to_owned(), fingerprint(k)))),
         })
     }
 }

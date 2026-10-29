@@ -88,20 +88,6 @@ pub struct Preparsed {
     pub src_len: usize,
 }
 
-/// crate_image::proc_fps of crate `ci`'s dependencies (transitively, by image_deps) from the
-/// fingerprints known so far
-fn proc_fps_of(crates: &[PreCrate], ci: usize, fps: &[Option<u128>]) -> Option<u128> {
-    let mut seen = vec![false; crates.len()];
-    let mut stack: Vec<usize> = crates[ci].image_deps.clone();
-    let mut out = Vec::new();
-    while let Some(d) = stack.pop() {
-        if d >= crates.len() || std::mem::replace(&mut seen[d], true) { continue; }
-        if crates[d].proc_macro { out.push((crates[d].name.clone(), fps.get(d).copied().flatten())); }
-        stack.extend(crates[d].image_deps.iter().copied());
-    }
-    crate::crate_image::proc_fps(out.into_iter())
-}
-
 /// Files of parsed crates taken from an earlier record's images (Pool::previous), for the summary
 pub static PREVIOUS_FILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1285,6 +1271,7 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
     let mut fps = vec![None; n];
     let mut restored = Vec::with_capacity(n);
     let mut previous = Vec::with_capacity(n);
+    let mut wants_previous = Vec::new();
     let mut valid = Vec::with_capacity(n);
     for (ci, c) in crates.iter().enumerate() {
         let deps: Option<Vec<u128>> = c.image_deps.iter().map(|&d| fps.get(d).copied().flatten()).collect();
@@ -1305,12 +1292,23 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         }
         fps[ci] = image.as_ref().map(|i| i.fingerprint);
         let image = if planning { image } else { image.filter(|i| !i.fp_only) };
-        let proc = if image.is_none() && deps.is_some() { proc_fps_of(&crates, ci, &fps) } else { None };
-        previous.push(if image.is_none() { deps.as_ref().and_then(|d| images.and_then(|i| i.previous_files(c, d, proc))) } else { None });
-        if trace() && image.is_none() && images.is_some() {
-            eprintln!("boot-trace: {}: parsed; earlier images: {}", c.name, if deps.is_none() { "dependencies not restored" } else if previous.last().is_some_and(|p| p.is_some()) { "yes" } else { "none" });
-        }
+        previous.push(None);
+        if image.is_none() { wants_previous.push((ci, deps)); }
         restored.push(image);
+    }
+    // a parsed crate's unchanged files: earlier records' images (the proc-macro crates of the
+    // whole program known by now: those this load restores and those a partial restore kept)
+    if let Some(i) = images {
+        let mut procs: Vec<(String, Option<u128>)> = crates.iter().enumerate().filter(|(_, c)| c.proc_macro).map(|(k, c)| (c.name.clone(), fps[k])).collect();
+        procs.extend(i.retained_proc_macros().into_iter().map(|(n, f)| (n, Some(f))));
+        let proc = crate::crate_image::proc_fps(procs.into_iter());
+        for (ci, deps) in wants_previous {
+            let c = &crates[ci];
+            previous[ci] = if deps.is_some() || proc.is_some() { i.previous_files(c, deps.as_deref(), proc) } else { None };
+            if trace() {
+                eprintln!("boot-trace: {}: parsed; earlier images: {}", c.name, if previous[ci].is_some() { "yes" } else if deps.is_none() && proc.is_none() { "dependencies not restored" } else { "none" });
+            }
+        }
     }
     if let Some(images) = images { images.end_load(); }
     if sess.options.verbose && images.is_some() && (trace() || crate::memstat::enabled()) {
