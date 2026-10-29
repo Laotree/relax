@@ -2238,9 +2238,9 @@ impl<'a> Parser<'a> {
             // its output: the item is parsed for its extent only (no expansion), then dropped
             if !attrs.is_empty() && self.macros.is_some() && self.cfg_out == 0 {
                 if let Some((k, entry)) = crate::builtins::attr_macro_at(self, &attrs) {
-                    let attr = attrs[k].clone();
-                    self.parse_cfg_out(attrs)?;
-                    let x = crate::builtins::expand_attr_macro(self, &attr, &entry, item_tok, self.pos).map_err(|(pos, msg)| PErr { pos, msg })?;
+                    let head = self.pos;
+                    self.parse_cfg_out(attrs.clone())?;
+                    let x = crate::builtins::expand_attr_macro(self, &attrs, k, &entry, item_tok, head, self.pos).map_err(|(pos, msg)| PErr { pos, msg })?;
                     self.append_origins(&x, self.toks.at(item_tok).lo);
                     let start = self.expand_toks(&x.text, &x.toks, self.toks.at(item_tok).lo);
                     let v = self.in_expansion(start, |p| p.items_until(T::Eof))?;
@@ -4339,9 +4339,9 @@ impl<'a> Parser<'a> {
         if active && !self.pending_shape.is_empty() { self.check_pending_attrs()?; }
         if active && self.at_item_start() && self.macros.is_some() && self.cfg_out == 0 {
             if let Some((k, entry)) = crate::builtins::attr_macro_at(self, &attrs) {
-                let attr = attrs[k].clone();
-                self.parse_cfg_out(attrs)?;
-                let x = crate::builtins::expand_attr_macro(self, &attr, &entry, item_tok, self.pos).map_err(|(pos, msg)| PErr { pos, msg })?;
+                let head = self.pos;
+                self.parse_cfg_out(attrs.clone())?;
+                let x = crate::builtins::expand_attr_macro(self, &attrs, k, &entry, item_tok, head, self.pos).map_err(|(pos, msg)| PErr { pos, msg })?;
                 self.append_origins(&x, self.toks.at(item_tok).lo);
                 let start = self.expand_toks(&x.text, &x.toks, self.toks.at(item_tok).lo);
                 let outer = std::mem::take(&mut self.extra_items);
