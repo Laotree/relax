@@ -179,10 +179,16 @@ impl<'a> Parser<'a> {
                 self.gen_args(&mut g, c, Vec::new(), Vec::new(), "")?;
             }
             "format" => {
+                // alloc's macro: `must_use({ let res = $crate::fmt::format(format_args!(..)); res })`
+                // -- the format temporaries (the Argument array, which is not Send) die at the
+                // `let`'s end inside the block, not at the end of the caller's statement (an
+                // `.await` later in that statement keeps a future Send: Robrix logout_state_machine)
                 let c = self.fmt_call(hi, false)?;
-                tg!(&mut g; #core() :: fmt :: format #open());
+                g.open_brace();
+                tg!(&mut g; let __relax_format_res = #core() :: fmt :: format #open());
                 self.gen_args(&mut g, c, Vec::new(), Vec::new(), "")?;
-                tg!(&mut g; #close());
+                tg!(&mut g; #close() ; __relax_format_res);
+                g.close_brace();
             }
             "print" | "println" | "eprint" | "eprintln" => {
                 // std's macros: `{ $crate::io::_print($crate::format_args!(..)); }` -- the statement

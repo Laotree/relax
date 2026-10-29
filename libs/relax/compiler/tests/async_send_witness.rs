@@ -145,3 +145,32 @@ fn generic_witness_keeps_argument_regions() {
     let future = generic(&mut value);
     assert_send(&future);
 }
+
+// Robrix logout_state_machine.rs: `self.transition_to(state, format!("..{}", e), 0).await?` --
+// format!'s Argument array (not Send: it holds pointers) dies inside the macro's block (alloc
+// `{ let res = fmt::format(format_args!(..)); res }`), so the future stays Send.
+struct Machine;
+impl Machine {
+    async fn transition_to(&self, _state: u8, msg: String, _pct: u8) -> Result<usize, ()> {
+        std::future::ready(()).await;
+        Ok(msg.len())
+    }
+    async fn execute(&self, e: &str) -> Result<usize, ()> {
+        let n = self.transition_to(1, format!("Precheck failed: {}", e), 0).await?;
+        Ok(n + self.transition_to(2, format!("{e}{e}"), 0).await?)
+    }
+}
+
+#[test]
+fn format_temporaries_end_inside_the_macro() {
+    fn assert_send<T: Send>(_: &T) {}
+    let m = Machine;
+    let f = m.execute("disk");
+    assert_send(&f);
+    let mut f = Box::pin(f);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let r = loop {
+        if let std::task::Poll::Ready(r) = f.as_mut().poll(&mut cx) { break r; }
+    };
+    assert_eq!(r, Ok(21 + 8));
+}
