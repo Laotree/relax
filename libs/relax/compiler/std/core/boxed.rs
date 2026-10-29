@@ -262,6 +262,14 @@ impl<T> From<T> for Box<T> {
         Box::new(t)
     }
 }
+
+// alloc/src/boxed.rs: `impl<T: ?Sized, A: Allocator> From<Box<T, A>> for Pin<Box<T, A>>`
+// (futures' join_all: `collect::<Box<[_]>>().into()`)
+impl<T: ?Sized> From<Box<T>> for crate::pin::Pin<Box<T>> {
+    fn from(boxed: Box<T>) -> Self {
+        Box::into_pin(boxed)
+    }
+}
 impl<'a, T: Clone> From<&'a [T]> for Box<[T]> {
     fn from(s: &'a [T]) -> Box<[T]> {
         crate::slice::to_vec(s).into_boxed_slice()

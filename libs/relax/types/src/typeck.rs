@@ -5430,7 +5430,24 @@ impl<'a> Fcx<'a> {
                         Some(v) => v,
                         None => unit,
                     };
-                    if matches!(self.loops[i].kind, LoopKind::Loop | LoopKind::Block) {
+                    // a value of type `!` coerces to any break type (rustc CoerceMany::coerce ->
+                    // Coerce::coerce: `a.is_never()` is NeverToAny into the target): it fixes no
+                    // type of its own (async-stream's `break '__check (loop {})` in every yield)
+                    let never_value = t.is_some_and(|v| self.shallow(v) == self.tcx.tys.never);
+                    if never_value && matches!(self.loops[i].kind, LoopKind::Loop | LoopKind::Block) {
+                        // no break type yet: the target is a fresh variable, which falls back
+                        // like any variable a `!` flowed into (`let x = loop { break panic!() };`)
+                        let target = match self.loops[i].break_ty {
+                            Some(prev) => prev,
+                            None => {
+                                let v = self.fresh(0);
+                                self.diverging.push(v);
+                                self.loops[i].break_ty = Some(v);
+                                v
+                            }
+                        };
+                        if let Some(v) = x.get() { self.set_coerce(v.0, Coerce::Never, target); }
+                    } else if matches!(self.loops[i].kind, LoopKind::Loop | LoopKind::Block) {
                         match self.loops[i].break_ty {
                             Some(prev) => {
                                 // rustc check_expr_break: every `break` coerces to the loop's type

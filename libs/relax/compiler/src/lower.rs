@@ -2504,6 +2504,16 @@ impl<'a> Lcx<'a> {
             }
         };
         let xt = self.body_ty(x);
+        if self.u.tcx.tys.has_error(xt) {
+            // a type check that left the operand untyped without an error, or an instantiation
+            // whose normalisation failed: name both so the hole is found from the report
+            let raw = self.b.ty(x);
+            let what = if self.u.tcx.tys.has_error(raw) { "the type check left it as" } else { "its instantiation normalised to" };
+            let msg = format!("`.await` of a value with no type: {what} `{}` (checked type `{}`) in {}",
+                crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, xt), crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, raw), self.f.name);
+            self.err(self.ast().expr(x).lo, msg);
+            return self.unit();
+        }
         let v = self.lower_expr(x);
         let (itf, fut_t) = {
             let u = self.u;

@@ -4891,6 +4891,11 @@ impl Unit {
             Ok(f) => u.coro_rir.insert(id, f),
             Err(e) => {
                 if u.fns[id as usize].build_err.is_none() {
+                    // its compile error surfaces when the body is first polled; say it now
+                    // (verbose): a frame without a layout is where a body's error is first met
+                    if crate::run::VERBOSE.load(Ordering::Relaxed) {
+                        eprintln!("makepad-run: coroutine frame of {} not built: {}", u.fns[id as usize].name, e.lines().next().unwrap_or(""));
+                    }
                     u.reload_errors.insert(id);
                     u.fns[id as usize].build_err = Some(e.into_boxed_str());
                 }
@@ -23096,7 +23101,7 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
         if std::env::var_os("MAKEPAD_RUN_AHEAD_TRACE").is_some() {
             match &r {
                 Err(p) => eprintln!("ahead-panic {} : {}", prog.def_path(key.0), p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default()),
-                Ok(b) if !b.errors.is_empty() => eprintln!("ahead-error {} : {}", prog.def_path(key.0), b.errors[0].chars().take(160).collect::<String>()),
+                Ok(b) if !b.errors.is_empty() => eprintln!("ahead-error {} {:?} : {}", prog.def_path(key.0), key.1, b.errors.join(" | ").chars().take(1500).collect::<String>()),
                 _ => {}
             }
         }
