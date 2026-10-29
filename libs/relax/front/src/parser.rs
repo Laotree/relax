@@ -1798,6 +1798,9 @@ impl<'a> Parser<'a> {
             if b & (crate::macros::EXPR_FRAG | crate::macros::LIT_FRAG) != 0 && crate::lexer::validation_enabled() {
                 self.meta_frags.insert(base + a, if b & crate::macros::EXPR_FRAG != 0 { "expr" } else { "literal" });
             }
+            if b & crate::macros::WRAP_PAREN != 0 {
+                self.synth_parens.insert(base + a);
+            }
             if b & crate::macros::META_ONLY == 0 {
                 self.frag_groups.insert(base + a, base + (b & !crate::macros::FRAG_FLAGS));
             }
@@ -4747,6 +4750,9 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
+                // a transcription's parentheses around an expression fragment are its invisible
+                // delimiters: an operand, never call arguments (rustc keeps the fragment opaque)
+                T::OpenParen if self.synth_parens.contains(&{ self.tok().lo }) => break,
                 T::OpenParen => {
                     let args = self.call_args()?;
                     let args = self.ast.push_list(args);

@@ -295,7 +295,10 @@ pub(crate) const META_ONLY: u32 = 1 << 28;
 pub(crate) const BLOCK_FRAG: u32 = 1 << 27;
 /// A `$p:path` fragment, reparsed with type-mode generic arguments.
 pub(crate) const PATH_FRAG: u32 = 1 << 26;
-pub(crate) const FRAG_FLAGS: u32 = TY_FRAG | EXPR_FRAG | LIT_FRAG | META_ONLY | BLOCK_FRAG | PATH_FRAG;
+/// the `(` a transcription puts around an expression fragment of several tokens (rustc's invisible
+/// delimiters): never a call's argument list (`!div $n / 2` with `$n` = `64 / 2` is no `div(..)`)
+pub(crate) const WRAP_PAREN: u32 = 1 << 25;
+pub(crate) const FRAG_FLAGS: u32 = TY_FRAG | EXPR_FRAG | LIT_FRAG | META_ONLY | BLOCK_FRAG | PATH_FRAG | WRAP_PAREN;
 
 const GLOB_ID: Name = Name(0);
 const GLOB_SEP_ID: Name = Name(1);
@@ -2899,7 +2902,9 @@ impl<'a> Parser<'a> {
                         let bare_macro = *f == Frag::Expr && taken.is_none() && ends && self.is_macro_call(*lo, *hi);
                         let wrap = *f == Frag::Expr && hi - lo + usize::from(taken.is_some()) > 1 && !*bare && !bare_macro;
                         if wrap {
-                            uses::synth_note(out.s.len() as u32 + 1);
+                            let at = out.s.len() as u32 + 1;
+                            uses::synth_note(at);
+                            out.groups.push((at, at | WRAP_PAREN | META_ONLY));
                             out.push(T::OpenParen, "(", None, u32::MAX);
                         }
                         let group_start = out.s.len() + 1;
