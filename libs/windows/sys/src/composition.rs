@@ -1127,6 +1127,200 @@ pub unsafe fn Release(&self) -> u32 {
 impl Clone for IDCompositionDesktopDevice { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
 impl Drop for IDCompositionDesktopDevice { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
 impl ::core::cmp::PartialEq for IDCompositionDesktopDevice { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+pub const IID_IDCompositionDevice: crate::core::GUID = crate::core::GUID { data1: 3279857978, data2: 59306, data3: 17677, data4: [177,111,151,70,203,4,7,243,] };
+#[repr(C)]
+pub struct IDCompositionDevice_Vtbl {
+pub base__: crate::Win32::System::Com::IUnknown_Vtbl,
+pub Commit: unsafe extern "system" fn(this: *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub WaitForCommitCompletion: unsafe extern "system" fn(this: *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub GetFrameStatistics: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,statistics: *mut crate::composition::Win32::Graphics::DirectComposition::DCOMPOSITION_FRAME_STATISTICS) -> crate::core::HRESULT,
+pub CreateTargetForHwnd: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,hwnd: crate::Win32::Foundation::HWND,topmost: crate::core::BOOL,target: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateVisual: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,visual: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateSurface: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,width: u32,height: u32,pixelFormat: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,alphaMode: crate::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE,surface: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateVirtualSurface: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,initialWidth: u32,initialHeight: u32,pixelFormat: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,alphaMode: crate::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE,virtualSurface: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateSurfaceFromHandle: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,handle: crate::Win32::Foundation::HANDLE,surface: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateSurfaceFromHwnd: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,hwnd: crate::Win32::Foundation::HWND,surface: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateTranslateTransform: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,translateTransform: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateScaleTransform: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,scaleTransform: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateRotateTransform: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,rotateTransform: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateSkewTransform: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,skewTransform: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateMatrixTransform: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,matrixTransform: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateTransformGroup: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,transforms: *const *mut ::core::ffi::c_void,elements: u32,transformGroup: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateTranslateTransform3D: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,translateTransform3D: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateScaleTransform3D: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,scaleTransform3D: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateRotateTransform3D: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,rotateTransform3D: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateMatrixTransform3D: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,matrixTransform3D: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateTransform3DGroup: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,transforms3D: *const *mut ::core::ffi::c_void,elements: u32,transform3DGroup: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateEffectGroup: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,effectGroup: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateRectangleClip: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,clip: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateAnimation: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,animation: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CheckDeviceState: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pfValid: *mut crate::core::BOOL) -> crate::core::HRESULT,
+}
+#[repr(transparent)]
+pub struct IDCompositionDevice(::core::ptr::NonNull<::core::ffi::c_void>);
+impl IDCompositionDevice {
+pub const IID: crate::core::GUID = IID_IDCompositionDevice;
+pub fn as_raw(&self) -> *mut ::core::ffi::c_void { self.0.as_ptr() }
+pub fn into_raw(self) -> *mut ::core::ffi::c_void { let p = self.as_raw(); ::core::mem::forget(self); p }
+pub unsafe fn from_raw(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { match ::core::ptr::NonNull::new(raw) { Some(p) => Ok(Self(p)), None => Err(crate::core::HRESULT(-2147467261)) } }
+pub unsafe fn query(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { Self::from_raw(crate::core::query(raw, &Self::IID)?) }
+pub fn vtable(&self) -> &IDCompositionDevice_Vtbl { unsafe { &**(self.as_raw() as *const *const IDCompositionDevice_Vtbl) } }
+pub fn as_IUnknown(&self) -> &crate::Win32::System::Com::IUnknown { unsafe { &*(self as *const Self as *const crate::Win32::System::Com::IUnknown) } }
+#[inline]
+pub unsafe fn Commit(&self) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().Commit)(self.as_raw()); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn WaitForCommitCompletion(&self) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().WaitForCommitCompletion)(self.as_raw()); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn GetFrameStatistics(&self) -> Result<crate::composition::Win32::Graphics::DirectComposition::DCOMPOSITION_FRAME_STATISTICS, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().GetFrameStatistics)(self.as_raw(),&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn CreateTargetForHwnd(&self,hwnd: crate::Win32::Foundation::HWND,topmost: bool) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionTarget, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateTargetForHwnd)(self.as_raw(),hwnd,crate::core::BOOL(topmost as i32),&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionTarget::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateVisual(&self) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionVisual, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateVisual)(self.as_raw(),&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionVisual::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateSurface(&self,width: u32,height: u32,pixelFormat: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,alphaMode: crate::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionSurface, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateSurface)(self.as_raw(),width,height,pixelFormat,alphaMode,&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionSurface::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateVirtualSurface(&self,initialWidth: u32,initialHeight: u32,pixelFormat: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,alphaMode: crate::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionVirtualSurface, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateVirtualSurface)(self.as_raw(),initialWidth,initialHeight,pixelFormat,alphaMode,&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionVirtualSurface::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateSurfaceFromHandle(&self,handle: crate::Win32::Foundation::HANDLE) -> Result<crate::Win32::System::Com::IUnknown, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateSurfaceFromHandle)(self.as_raw(),handle,&mut result__); hr__.ok()?;
+crate::Win32::System::Com::IUnknown::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateSurfaceFromHwnd(&self,hwnd: crate::Win32::Foundation::HWND) -> Result<crate::Win32::System::Com::IUnknown, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateSurfaceFromHwnd)(self.as_raw(),hwnd,&mut result__); hr__.ok()?;
+crate::Win32::System::Com::IUnknown::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateTranslateTransform(&self) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionTranslateTransform, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateTranslateTransform)(self.as_raw(),&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionTranslateTransform::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateScaleTransform(&self) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionScaleTransform, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateScaleTransform)(self.as_raw(),&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionScaleTransform::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateRotateTransform(&self) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionRotateTransform, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateRotateTransform)(self.as_raw(),&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionRotateTransform::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateSkewTransform(&self) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionSkewTransform, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateSkewTransform)(self.as_raw(),&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionSkewTransform::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateMatrixTransform(&self) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionMatrixTransform, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateMatrixTransform)(self.as_raw(),&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionMatrixTransform::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateTransformGroup(&self,transforms: &[Option<crate::composition::Win32::Graphics::DirectComposition::IDCompositionTransform>]) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionTransform, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateTransformGroup)(self.as_raw(),transforms.as_ptr() as _,transforms.len() as _,&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionTransform::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateTranslateTransform3D(&self) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionTranslateTransform3D, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateTranslateTransform3D)(self.as_raw(),&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionTranslateTransform3D::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateScaleTransform3D(&self) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionScaleTransform3D, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateScaleTransform3D)(self.as_raw(),&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionScaleTransform3D::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateRotateTransform3D(&self) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionRotateTransform3D, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateRotateTransform3D)(self.as_raw(),&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionRotateTransform3D::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateMatrixTransform3D(&self) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionMatrixTransform3D, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateMatrixTransform3D)(self.as_raw(),&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionMatrixTransform3D::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateTransform3DGroup(&self,transforms3D: &[Option<crate::composition::Win32::Graphics::DirectComposition::IDCompositionTransform3D>]) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionTransform3D, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateTransform3DGroup)(self.as_raw(),transforms3D.as_ptr() as _,transforms3D.len() as _,&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionTransform3D::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateEffectGroup(&self) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionEffectGroup, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateEffectGroup)(self.as_raw(),&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionEffectGroup::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateRectangleClip(&self) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionRectangleClip, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateRectangleClip)(self.as_raw(),&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionRectangleClip::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateAnimation(&self) -> Result<crate::composition::Win32::Graphics::DirectComposition::IDCompositionAnimation, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateAnimation)(self.as_raw(),&mut result__); hr__.ok()?;
+crate::composition::Win32::Graphics::DirectComposition::IDCompositionAnimation::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CheckDeviceState(&self) -> Result<crate::core::BOOL, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CheckDeviceState)(self.as_raw(),&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn QueryInterface(&self,riid: *const crate::core::GUID,ppvObject: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT {
+(self.vtable().base__.QueryInterface)(self.as_raw(),riid,ppvObject)}
+#[inline]
+pub unsafe fn AddRef(&self) -> u32 {
+(self.vtable().base__.AddRef)(self.as_raw())}
+#[inline]
+pub unsafe fn Release(&self) -> u32 {
+(self.vtable().base__.Release)(self.as_raw())}
+}
+impl Clone for IDCompositionDevice { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
+impl Drop for IDCompositionDevice { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
+impl ::core::cmp::PartialEq for IDCompositionDevice { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
 pub const IID_IDCompositionDevice2: crate::core::GUID = crate::core::GUID { data1: 1979074189, data2: 7054, data3: 17532, data4: [155,198,117,254,168,11,91,37,] };
 #[repr(C)]
 pub struct IDCompositionDevice2_Vtbl {

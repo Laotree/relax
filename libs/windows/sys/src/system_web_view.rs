@@ -5105,6 +5105,12 @@ impl ::core::default::Default for POINTER_TOUCH_INFO { fn default() -> Self {Sel
 }
 }
 pub mod WindowsAndMessaging {
+mod import_CopyIcon { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "CopyIcon"] pub fn call(hIcon: crate::Win32::UI::WindowsAndMessaging::HICON) -> crate::Win32::UI::WindowsAndMessaging::HICON; } }
+pub use import_CopyIcon::call as CopyIcon_raw;
+#[inline]
+pub unsafe fn CopyIcon(hIcon: crate::Win32::UI::WindowsAndMessaging::HICON) -> Result<crate::Win32::UI::WindowsAndMessaging::HICON, crate::core::HRESULT> {
+let hr__ = import_CopyIcon::call(hIcon); if hr__.is_invalid() {return Err(crate::core::HRESULT::from_thread());} return Ok(hr__);
+}
 mod import_IsChild { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "IsChild"] pub fn call(hWndParent: crate::Win32::Foundation::HWND,hWnd: crate::Win32::Foundation::HWND) -> crate::core::BOOL; } }
 pub use import_IsChild::call as IsChild_raw;
 #[inline]
