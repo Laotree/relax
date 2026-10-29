@@ -93,6 +93,11 @@ fn avx2_arithmetic() {
         }
         let zero: [u64; 4] = transmute(_mm256_setzero_si256());
         assert_eq!(zero, [0; 4]);
+        // rand_chacha's refill_wide: vzeroupper after the AVX2 rounds keeps values in variables
+        let kept = _mm256_set1_epi64x(7);
+        _mm256_zeroupper();
+        let kept: [i64; 4] = transmute(kept);
+        assert_eq!(kept, [7; 4]);
         let broadcast: [i64; 4] = transmute(_mm256_set1_epi64x(i64::MIN));
         assert_eq!(broadcast, [i64::MIN; 4]);
     }

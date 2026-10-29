@@ -796,6 +796,12 @@ pub unsafe fn _mm256_setzero_si256() -> __m256i {
     i_join(z, z)
 }
 
+// vzeroupper / vzeroall clear the upper halves of the ymm registers; a value held in a variable is
+// never one of them here (a __m256 is two halves in memory or xmm registers): no effect to model
+// (rand_chacha's refill_wide AVX2 path ends with _mm256_zeroupper)
+pub unsafe fn _mm256_zeroupper() {}
+pub unsafe fn _mm256_zeroall() {}
+
 pub unsafe fn _mm512_add_epi32(a: __m512i, b: __m512i) -> __m512i {
     let a = lanes512_i32(a);
     let b = lanes512_i32(b);
