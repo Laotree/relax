@@ -62,7 +62,7 @@ pub struct MacroDef {
     pub exported: bool,
     pub arms: Vec<(Vec<MNode>, Vec<TNode>)>,
     /// a Relax built-in (builtins.rs `Builtin` as u8; 0: a `macro_rules!` macro)
-    pub builtin: u8,
+    pub builtin: u16,
     /// where a `macro_rules!` is defined: (file path, source position) -- its expansions'
     /// identifiers resolve local variables there (definition-site hygiene)
     pub def_file: String,
@@ -2059,7 +2059,7 @@ fn expansion_hash(d: &MacroDef) -> u128 {
     }
     let mut h = crate::sip::Sip128::new();
     h.str("macro-expansion");
-    h.str(&d.name); h.str(&d.krate); h.u8(d.builtin);
+    h.str(&d.name); h.str(&d.krate); h.u32(d.builtin as u32);
     h.u32(d.arms.len() as u32);
     for (a, b) in &d.arms { m(&mut h, a); t(&mut h, b); }
     h.finish128()

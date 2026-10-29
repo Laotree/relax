@@ -367,14 +367,14 @@ pub fn override_rules(options: &crate::options::Options, d: crate::macros::Macro
         crate::memo_local! {
             static BF: std::cell::OnceCell<crate::macros::MacroRef>;
         }
-        return BF.with(|b| b.get_or_init(|| std::sync::Arc::new(crate::macros::MacroDef { name: "bitflags".to_string(), krate: "bitflags".to_string(), exported: true, arms: Vec::new(), builtin: Builtin::Bitflags as u8, def_file: String::new(), def_pos: 0, def_mod: String::new(), input: None })).clone());
+        return BF.with(|b| b.get_or_init(|| std::sync::Arc::new(crate::macros::MacroDef { name: "bitflags".to_string(), krate: "bitflags".to_string(), exported: true, arms: Vec::new(), builtin: Builtin::Bitflags as u16, def_file: String::new(), def_pos: 0, def_mod: String::new(), input: None })).clone());
     }
     d
 }
 
 /// `MacroDef.builtin` ids at and above this are function-like proc macros run by the JIT host
 /// (pmhost.rs index).
-pub const HOSTED: u8 = 200;
+pub const HOSTED: u16 = 200;
 
 /// Is `name` a built-in macro or one of the graph's proc macros (importing it is a no-op)?
 pub fn is_macro_name(name: &str) -> bool {
@@ -382,19 +382,19 @@ pub fn is_macro_name(name: &str) -> bool {
 }
 
 /// Built-ins that expand to items (an error there cannot stay with one fn).
-pub fn is_item_level(id: u8) -> bool {
+pub fn is_item_level(id: u16) -> bool {
     if id >= HOSTED {
         return false;
     }
-    matches!(from_u8(id), Builtin::Include | Builtin::Bitflags | Builtin::ThreadLocal | Builtin::CfgSelect)
+    matches!(from_id(id), Builtin::Include | Builtin::Bitflags | Builtin::ThreadLocal | Builtin::CfgSelect)
 }
 
-pub fn from_u8(x: u8) -> Builtin {
-    if x == Builtin::Bitflags as u8 {
+pub fn from_id(x: u16) -> Builtin {
+    if x == Builtin::Bitflags as u16 {
         return Builtin::Bitflags;
     }
     for (_, b) in TABLE {
-        if *b as u8 == x {
+        if *b as u16 == x {
             return *b;
         }
     }
@@ -405,7 +405,7 @@ crate::memo_local! {
     static DEFS: std::cell::RefCell<Vec<Option<crate::macros::MacroRef>>>;
 }
 
-fn def_for_id(name: &str, id: u8) -> crate::macros::MacroRef {
+fn def_for_id(name: &str, id: u16) -> crate::macros::MacroRef {
     DEFS.with(|d| {
         let mut d = d.borrow_mut();
         let i = id as usize;
@@ -423,7 +423,7 @@ fn def_for_id(name: &str, id: u8) -> crate::macros::MacroRef {
 pub fn builtin_macro_def(name: &str) -> Option<crate::macros::MacroRef> {
     match lookup(name) {
         Builtin::None => None,
-        b => Some(def_for_id(name, b as u8)),
+        b => Some(def_for_id(name, b as u16)),
     }
 }
 
@@ -431,10 +431,11 @@ pub fn builtin_macro_def(name: &str) -> Option<crate::macros::MacroRef> {
 pub fn macro_def_for(krate: &str, name: &str) -> Option<crate::macros::MacroRef> {
     let id = match lookup(name) {
         Builtin::None => match crate::macro_reg::bang_index_for(krate, name) {
-            Some(i) if i < (256 - HOSTED as usize) => HOSTED + i as u8,
+            // (u16 ids: a big graph has more than the 56 function-like proc macros a u8 left)
+            Some(i) if i < (u16::MAX - HOSTED) as usize => HOSTED + i as u16,
             _ => return None,
         },
-        b => b as u8,
+        b => b as u16,
     };
     Some(def_for_id(name, id))
 }
@@ -733,7 +734,7 @@ fn lit_str_value(text: &str) -> Option<String> {
 /// Expands built-in or hosted macro `id` called with the tokens `toks[lo..hi]` (inside the
 /// delimiters); `call_lo..call_hi` is the whole call. Linked proc macros' output tokens are
 /// passed on as tokens (no text round trip).
-pub fn expand(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: u32, call_hi: u32) -> Result<Expansion, String> {
+pub fn expand(p: &crate::parser::Parser, id: u16, lo: usize, hi: usize, call_lo: u32, call_hi: u32) -> Result<Expansion, String> {
     let _mem = crate::memstat::tag(crate::memstat::Tag::MacroOutput);
     let key = if id >= HOSTED && crate::macro_reg::reusable_bang((id - HOSTED) as usize) {
         crate::parse_work::key_tokens(p, &format!("hosted-bang-{id}"), call_lo, call_hi, lo..hi, item_location(p, call_lo))
@@ -747,7 +748,7 @@ pub fn expand(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: 
         crate::parse_work::put(key, &out);
         return Ok(out);
     }
-    if from_u8(id) == Builtin::Include {
+    if from_id(id) == Builtin::Include {
         let (path, data) = include_input(p, lo, hi, call_lo)?;
         let text = String::from_utf8(data).map_err(|_| format!("`{}` is not UTF-8", path))?;
         let sources = p.sources.as_ref().ok_or("include! requires a source registry")?;
@@ -834,8 +835,8 @@ fn include_input(p: &crate::parser::Parser, lo: usize, hi: usize, call_lo: u32) 
     Ok((path, data))
 }
 
-fn expand_buf(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: u32, call_hi: u32) -> Result<TokBuf, String> {
-    let b = from_u8(id);
+fn expand_buf(p: &crate::parser::Parser, id: u16, lo: usize, hi: usize, call_lo: u32, call_hi: u32) -> Result<TokBuf, String> {
+    let b = from_id(id);
     let one = |kind: T, text: &str| { let mut g = TokBuf::new(p.edition); g.put(kind, text); g };
     let one_str = |text: &str| { let mut g = TokBuf::new(p.edition); g.str_lit(text); g };
     let buf = Buf { src: p.src, ext: p.ext.view() };
@@ -1313,7 +1314,7 @@ fn eval_lit(p: &crate::parser::Parser, a: usize, z: usize) -> Result<(String, bo
         let name = text(i - 1);
         let b = lookup(&name);
         if b != Builtin::None && z >= i + 3 {
-            let out = expand_buf(p, b as u8, i + 2, z - 1, toks.at(a).lo, toks.at(z - 1).hi)?;
+            let out = expand_buf(p, b as u16, i + 2, z - 1, toks.at(a).lo, toks.at(z - 1).hi)?;
             if let Some(t0) = out.toks.first() {
                 let s = &out.s[t0.lo as usize..t0.hi as usize];
                 return match t0.kind {

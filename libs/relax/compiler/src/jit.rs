@@ -1606,6 +1606,12 @@ fn optimize_tree_panicked(up: *mut Unit, id: u32, p: Box<dyn std::any::Any + Sen
     (id, Err(format!("optimize_tree panicked: {}", msg)))
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+extern "C" {
+    #[link_name = "pthread_atfork"]
+    fn host_pthread_atfork(prepare: Option<unsafe extern "C" fn()>, parent: Option<unsafe extern "C" fn()>, child: Option<unsafe extern "C" fn()>) -> i32;
+}
+
 /// fork() in a program run by Relax: the child has only the forking thread, and may go on
 /// running JIT code (a lazy compile in the child). The loader hands programs its own `fork`
 /// (loader_symbol): before the fork every compile job finishes or waits at its start, and the
@@ -1619,12 +1625,6 @@ fn optimize_tree_panicked(up: *mut Unit, id: u32, p: Box<dyn std::any::Any + Sen
 /// pthread_atfork did, and deadlocked: a domain loader holds its compile job while it waits for
 /// its build-script threads, and a script thread's fork waited for that job (Pixel WM: every
 /// app not yet running hung at 'compiling: build scripts' on a cold cache).
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-extern "C" {
-    #[link_name = "pthread_atfork"]
-    fn host_pthread_atfork(prepare: Option<unsafe extern "C" fn()>, parent: Option<unsafe extern "C" fn()>, child: Option<unsafe extern "C" fn()>) -> i32;
-}
-
 #[cfg(unix)]
 extern "C" fn relax_fork() -> i32 {
     fork_prepare();

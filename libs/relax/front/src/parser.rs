@@ -1482,6 +1482,25 @@ impl<'a> Parser<'a> {
     }
 
     fn rules_macro(&self, path: &Path) -> Option<crate::macros::MacroRef> {
+        let r = self.rules_macro_inner(path);
+        // MAKEPAD_RUN_TRACE=macnone:<name>: every unresolved call of a macro whose name contains <name>
+        if r.is_none() {
+            if let Some(want) = crate::preload::relax_trace().and_then(|t| t.split(',').find_map(|x| x.strip_prefix("macnone:"))) {
+                if let Some(seg) = self.ast.segs(path.segs).last() {
+                    let name = String::from_utf8_lossy(self.bytes(seg.name.lo, seg.name.hi)).to_string();
+                    if name.contains(want) {
+                        let segs: Vec<String> = self.ast.segs(path.segs).iter().map(|s| String::from_utf8_lossy(self.bytes(s.name.lo, s.name.hi)).to_string()).collect();
+                        let externs = self.macros.as_ref().and_then(|m| m.table.crates.get(&self.krate).map(|c| c.externs.iter().filter(|(k, _)| k.contains("futures")).map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>()));
+                        eprintln!("macnone {}! path {:?} global {} crate {} lazy_part {} macros {} in_world {} builder {} externs {:?} bang(futures_util) {:?}", name, segs, path.global(), self.krate, self.lazy_part, self.macros.is_some(),
+                            crate::macro_reg::in_world(), crate::macro_reg::world_builder(), externs, crate::macro_reg::bang_index_for("futures_util", &name));
+                    }
+                }
+            }
+        }
+        r
+    }
+
+    fn rules_macro_inner(&self, path: &Path) -> Option<crate::macros::MacroRef> {
         let m = self.macros.as_ref()?;
         let seg = self.ast.segs(path.segs).last()?;
         let name = String::from_utf8_lossy(self.bytes(seg.name.lo, seg.name.hi)).trim_start_matches("r#").to_string();
@@ -1490,7 +1509,11 @@ impl<'a> Parser<'a> {
         }
         // a skipped body calls only built-ins (body_outline checked each call where it was)
         if self.lazy_part {
-            return crate::builtins::builtin_macro_def(&name);
+            let d = crate::builtins::builtin_macro_def(&name);
+            if d.is_none() && crate::preload::relax_trace().is_some_and(|t| t.split(',').any(|x| x == "macmiss")) {
+                eprintln!("macmiss {}! in a lazily parsed body of crate {} (only built-ins resolve there)", name, self.krate);
+            }
+            return d;
         }
         // `dep::m!` / `crate::m!` / `$crate::m!` (expanded as `::dep::m!` or `crate::m!`): the
         // module part, resolved like an item path
@@ -1733,7 +1756,7 @@ impl<'a> Parser<'a> {
         let trace = crate::preload::relax_trace().map_or(false, |t| t.split(',').any(|p| p.strip_prefix("expand:").map_or(false, |n| def.name.contains(n))));
         use crate::builtins::Builtin as B;
         let call_hi = self.toks.at(toks.hi as usize).hi;
-        let toks = if def.builtin < crate::builtins::HOSTED && matches!(crate::builtins::from_u8(def.builtin), B::Concat | B::Env | B::OptionEnv | B::Include | B::IncludeStr | B::IncludeBytes) {
+        let toks = if def.builtin < crate::builtins::HOSTED && matches!(crate::builtins::from_id(def.builtin), B::Concat | B::Env | B::OptionEnv | B::Include | B::IncludeStr | B::IncludeBytes) {
             self.exp_depth += 1;
             let args = self.eager_builtin_args(toks, call_lo);
             self.exp_depth -= 1;
@@ -1907,7 +1930,7 @@ impl<'a> Parser<'a> {
         self.include_as_expr = false;
         let start = start?;
         let rest = std::mem::take(&mut *self.cfg_select_rest.borrow_mut());
-        let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
+        let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_id(def.builtin) == crate::builtins::Builtin::Include;
         if trailing && def.builtin == 0 && crate::macros::uses::recording() {
             // a macro call ending a block is an expression (rustc_expand flat_map_stmt
             // `is_trailing_mac`): its expansion's `;` after the one expression is linted
@@ -4370,7 +4393,7 @@ impl<'a> Parser<'a> {
                     self.include_as_expr = false;
                     let start = start?;
                     let rest = std::mem::take(&mut *self.cfg_select_rest.borrow_mut());
-                    let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
+                    let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_id(def.builtin) == crate::builtins::Builtin::Include;
                     let e = self.in_expansion(start, |p| {
                         let e = p.expr()?;
                         if include { p.incomplete_include_check(); p.skip_to_eof(); }
@@ -5097,7 +5120,7 @@ impl<'a> Parser<'a> {
                         self.include_as_expr = false;
                         let start = start?;
                         let rest = std::mem::take(&mut *self.cfg_select_rest.borrow_mut());
-                        let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
+                        let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_id(def.builtin) == crate::builtins::Builtin::Include;
                         let e = self.in_expansion(start, |p| {
                             let e = p.expr()?;
                             if p.kind() == T::Semi && def.builtin == 0 && crate::macros::uses::recording() {
