@@ -632,8 +632,8 @@ pub(crate) fn check_fn(prog: &Program, tcx: &Tcx, def: DefId) -> Body {
         let incl = relax_backend::cpu_ns() - t0;
         let excl = incl.saturating_sub(NEST.with(|c| c.get()) - child0);
         NEST.with(|c| c.set(child0 + incl));
-        eprintln!("TYS\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}", def.0, args.len(), incl, b.expr_ty.len(), prog.def_path(def), args.iter().map(|a| a.0).collect::<Vec<u32>>(), crate::clock::TYS_ORIGIN.with(|o| o.get()),
-            excl, std::thread::current().name().unwrap_or("?"));
+        eprintln!("TYS\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{:.0}", def.0, args.len(), incl, b.expr_ty.len(), prog.def_path(def), args.iter().map(|a| a.0).collect::<Vec<u32>>(), crate::clock::TYS_ORIGIN.with(|o| o.get()),
+            excl, std::thread::current().name().unwrap_or("?"), crate::clock::ms_since_start());
     }
     b
 }
