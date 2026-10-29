@@ -183,12 +183,17 @@ impl<'a> Parser<'a> {
                 // -- the format temporaries (the Argument array, which is not Send) die at the
                 // `let`'s end inside the block, not at the end of the caller's statement (an
                 // `.await` later in that statement keeps a future Send: Robrix logout_state_machine)
+                // (core::fmt::__format_block is that call with a fixed String type; it keeps the
+                // caller's expected type out of the block, as in rustc:
+                // `input != format!(..)` with `input: &str` compares through PartialEq<String>)
                 let c = self.fmt_call(hi, false)?;
+                tg!(&mut g; #core() :: fmt :: __format_block #open());
                 g.open_brace();
                 tg!(&mut g; let __relax_format_res = #core() :: fmt :: format #open());
                 self.gen_args(&mut g, c, Vec::new(), Vec::new(), "")?;
                 tg!(&mut g; #close() ; __relax_format_res);
                 g.close_brace();
+                tg!(&mut g; #close());
             }
             "print" | "println" | "eprint" | "eprintln" => {
                 // std's macros: `{ $crate::io::_print($crate::format_args!(..)); }` -- the statement

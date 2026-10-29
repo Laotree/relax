@@ -364,12 +364,15 @@ pub(crate) fn resolve_package(
             (MAIN_HOST.get().expect("run host").open)(&package, &dir)
         })
     });
-    // provided crates bind only to their own source (before substitution rewrites deps)
+    // provided crates bind only to their own source (before substitution rewrites deps); the
+    // sysroot proc_macro (with_sysroot_proc_macro) is part of Relax's std, not of their identity
+    let pm_root = crate::vfs::normalize_path(&format!("{}/proc_macro/lib.rs", std_dir));
+    let sysroot_pm: Vec<bool> = g.crates.iter().map(|c| c.name == "proc_macro" && crate::vfs::normalize_path(&c.src_path) == pm_root).collect();
     let pkgs: Vec<crate::srchash::SrcPkg> = g
         .crates
         .iter()
         .zip(g.pkg.iter())
-        .map(|(c, (dir, name, ver))| crate::srchash::SrcPkg { name: name.clone(), version: ver.clone(), dir: dir.clone(), features: c.features.clone(), deps: c.deps.iter().map(|d| d.0).collect(), proc_macro: c.proc_macro })
+        .map(|(c, (dir, name, ver))| crate::srchash::SrcPkg { name: name.clone(), version: ver.clone(), dir: dir.clone(), features: c.features.clone(), deps: c.deps.iter().map(|d| d.0).filter(|&d| !sysroot_pm.get(d).copied().unwrap_or(false)).collect(), proc_macro: c.proc_macro })
         .collect();
     let watches = boot || matches!(who, ResolveFor::Domain(id) if app_domain() == Some(id));
     let t_inputs = Instant::now();

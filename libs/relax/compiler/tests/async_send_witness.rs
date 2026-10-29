@@ -174,3 +174,13 @@ fn format_temporaries_end_inside_the_macro() {
     };
     assert_eq!(r, Ok(21 + 8));
 }
+
+// story cut generate.rs: `input != format!(..)` with `input: &str` (PartialEq<String> for &str):
+// the caller's expected type must not reach format!'s inner block
+#[test]
+fn format_compared_with_str() {
+    let input: &str = "00000000000000ff";
+    assert!(!(input != format!("{:016x}", 255u64)));
+    let s: &str = &format!("{}-{}", 1, 2);
+    assert_eq!(s, "1-2");
+}
