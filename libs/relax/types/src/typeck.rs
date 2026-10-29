@@ -7702,7 +7702,20 @@ impl<'a> Fcx<'a> {
         }
         if name == "compile_error" && m.toks.hi > m.toks.lo {
             let f = &self.prog.files[self.file as usize];
-            let msg = crate::lit::unescape_str(f.tok_text(m.toks.lo));
+            // `compile_error!(concat!("..", $t))` (std's is_x86_feature_detected! fallback arm): the
+            // message is the literals' concatenation, as the eager concat! makes it
+            let first = f.tok_text(m.toks.lo);
+            let msg = if first.starts_with('"') || first.starts_with("r#") || first.starts_with("r\"") {
+                crate::lit::unescape_str(first)
+            } else {
+                let mut s = String::new();
+                for i in m.toks.lo..m.toks.hi {
+                    let t = f.tok_text(i);
+                    if t.starts_with('"') { s.push_str(&crate::lit::unescape_str(t)); }
+                    else if t.as_bytes().first().is_some_and(|c| c.is_ascii_digit()) { s.push_str(t); }
+                }
+                s
+            };
             self.err(lo, msg);
             return never;
         }

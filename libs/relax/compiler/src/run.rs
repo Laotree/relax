@@ -418,7 +418,7 @@ pub(crate) fn resolve_package(
             // script's own child run never builds them again
             let triple = crate::cfg::CfgSet::host(sess, &[]).triple();
             let native_request = (options.allow_c && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none()).then(|| crate::native::Request { workspace, package, cargo_flags, relax_dir: target_dir, triple });
-            let scripts = unitgraph::run_build_scripts(sess, &mut g, target_dir, native_request.as_ref());
+            let scripts = unitgraph::run_build_scripts(sess, &mut g, target_dir, native_request.as_ref(), check_only);
             let scripts_ms = t_scripts.elapsed().as_secs_f64() * 1e3;
             let t_wait = Instant::now();
             (sources.map(|h| h.join().expect("provided source check")), scripts, scripts_ms, t_wait.elapsed().as_secs_f64() * 1e3)

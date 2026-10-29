@@ -37,11 +37,29 @@ pub fn __get_cpuid_max(leaf: u32) -> (u32, u32) {
     (r.eax, r.ebx)
 }
 
+pub const _XCR_XFEATURE_ENABLED_MASK: u32 = 0;
+
 /// Read an extended control register. The caller must ensure XSAVE/OSXSAVE
 /// support and that `xcr` names an index supported by the processor.
 #[inline]
 pub unsafe fn _xgetbv(xcr: u32) -> u64 {
     crate::intrinsics_rt::xgetbv(xcr)
+}
+
+// There is no inline-assembly path in this module. Report failure so callers
+// use their entropy fallback; RDRAND also clears its destination on failure.
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "rdrand"))]
+pub unsafe fn _rdrand32_step(val: &mut u32) -> i32 {
+    *val = 0;
+    0
+}
+
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "rdrand"))]
+pub unsafe fn _rdrand64_step(val: &mut u64) -> i32 {
+    *val = 0;
+    0
 }
 
 #[derive(Copy, Clone)]
@@ -187,6 +205,15 @@ unsafe fn lanes512_i32(a: __m512i) -> [i32; 16] {
 unsafe fn from512_i32(a: [i32; 16]) -> __m512i {
     crate::ptr::read_unaligned(&a as *const [i32; 16] as *const __m512i)
 }
+
+unsafe fn lanes512_i128(a: __m512i) -> [__m128i; 4] {
+    crate::ptr::read_unaligned(&a as *const __m512i as *const [__m128i; 4])
+}
+unsafe fn from512_i128(a: [__m128i; 4]) -> __m512i {
+    crate::ptr::read_unaligned(&a as *const [__m128i; 4] as *const __m512i)
+}
+
+pub type _MM_PERM_ENUM = i32;
 
 pub const fn _MM_SHUFFLE(z: u32, y: u32, x: u32, w: u32) -> i32 {
     ((z << 6) | (y << 4) | (x << 2) | w) as i32
@@ -3467,4 +3494,450 @@ pub unsafe fn _mm_slli_si128<const IMM8: i32>(a: __m128i) -> __m128i {
         i += 1;
     }
     from128_u8(r)
+}
+
+// ---- AES-NI and VAES: FIPS-197 byte states, in column-major memory order.
+
+// Multiplication modulo x^8 + x^4 + x^3 + x + 1.
+const fn aes_gf_mul(mut a: u8, mut b: u8) -> u8 {
+    let mut r = 0;
+    while b != 0 {
+        if b & 1 != 0 {
+            r ^= a;
+        }
+        let high = a & 0x80;
+        a <<= 1;
+        if high != 0 {
+            a ^= 0x1b;
+        }
+        b >>= 1;
+    }
+    r
+}
+
+// Derive both tables at compile time: x^-1 = x^254 (with 0 mapped to 0),
+// followed by the AES affine map. Invert that permutation for InvSubBytes.
+const fn aes_sboxes() -> [[u8; 256]; 2] {
+    let mut tables = [[0u8; 256]; 2];
+    let mut x = 0;
+    while x < 256 {
+        let mut base = x as u8;
+        let mut exponent = 254;
+        let mut inverse = 1;
+        while exponent != 0 {
+            if exponent & 1 != 0 {
+                inverse = aes_gf_mul(inverse, base);
+            }
+            base = aes_gf_mul(base, base);
+            exponent >>= 1;
+        }
+        let s = inverse ^ inverse.rotate_left(1) ^ inverse.rotate_left(2)
+            ^ inverse.rotate_left(3) ^ inverse.rotate_left(4) ^ 0x63;
+        tables[0][x] = s;
+        tables[1][s as usize] = x as u8;
+        x += 1;
+    }
+    tables
+}
+
+const AES_SBOXES: [[u8; 256]; 2] = aes_sboxes();
+
+fn aes_mix_columns(a: [u8; 16], inverse: bool) -> [u8; 16] {
+    let coefficients = if inverse { [14, 11, 13, 9] } else { [2, 3, 1, 1] };
+    let mut r = [0u8; 16];
+    let mut column = 0;
+    while column < 4 {
+        let mut row = 0;
+        while row < 4 {
+            let mut k = 0;
+            while k < 4 {
+                r[column * 4 + row] ^=
+                    aes_gf_mul(a[column * 4 + (row + k) % 4], coefficients[k]);
+                k += 1;
+            }
+            row += 1;
+        }
+        column += 1;
+    }
+    r
+}
+
+unsafe fn aes_round(a: __m128i, round_key: __m128i, inverse: bool, last: bool) -> __m128i {
+    let a = lanes128_u8(a);
+    let key = lanes128_u8(round_key);
+    let mut r = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        let row = i % 4;
+        let column = if inverse { (i / 4 + 4 - row) % 4 } else { (i / 4 + row) % 4 };
+        r[i] = AES_SBOXES[inverse as usize][a[column * 4 + row] as usize];
+        i += 1;
+    }
+    if !last {
+        r = aes_mix_columns(r, inverse);
+    }
+    i = 0;
+    while i < 16 {
+        r[i] ^= key[i];
+        i += 1;
+    }
+    from128_u8(r)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "aes"))]
+pub unsafe fn _mm_aesenc_si128(a: __m128i, round_key: __m128i) -> __m128i {
+    aes_round(a, round_key, false, false)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "aes"))]
+pub unsafe fn _mm_aesenclast_si128(a: __m128i, round_key: __m128i) -> __m128i {
+    aes_round(a, round_key, false, true)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "aes"))]
+pub unsafe fn _mm_aesdec_si128(a: __m128i, round_key: __m128i) -> __m128i {
+    // AESDEC uses the equivalent inverse cipher: InvMixColumns precedes
+    // AddRoundKey, so intermediate decryption keys must already be transformed.
+    aes_round(a, round_key, true, false)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "aes"))]
+pub unsafe fn _mm_aesdeclast_si128(a: __m128i, round_key: __m128i) -> __m128i {
+    aes_round(a, round_key, true, true)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "aes"))]
+pub unsafe fn _mm_aesimc_si128(a: __m128i) -> __m128i {
+    from128_u8(aes_mix_columns(lanes128_u8(a), true))
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "aes"))]
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm_aeskeygenassist_si128<const IMM8: i32>(a: __m128i) -> __m128i {
+    const { assert!(IMM8 >= 0 && IMM8 < 256) };
+    let a = lanes128_u8(a);
+    let mut r = [0u8; 16];
+    let mut word = 0;
+    while word < 2 {
+        let mut byte = 0;
+        while byte < 4 {
+            // SubWord(X1), RotWord(SubWord(X1)) XOR RCON, then the same for X3.
+            r[word * 8 + byte] = AES_SBOXES[0][a[word * 8 + 4 + byte] as usize];
+            r[word * 8 + 4 + byte] = AES_SBOXES[0][a[word * 8 + 4 + (byte + 1) % 4] as usize];
+            byte += 1;
+        }
+        r[word * 8 + 4] ^= IMM8 as u8;
+        word += 1;
+    }
+    from128_u8(r)
+}
+
+unsafe fn aes_round256(a: __m256i, round_key: __m256i, inverse: bool, last: bool) -> __m256i {
+    i_join(
+        aes_round(i_lo(&a), i_lo(&round_key), inverse, last),
+        aes_round(i_hi(&a), i_hi(&round_key), inverse, last),
+    )
+}
+
+unsafe fn aes_round512(a: __m512i, round_key: __m512i, inverse: bool, last: bool) -> __m512i {
+    let mut a = lanes512_i128(a);
+    let key = lanes512_i128(round_key);
+    let mut i = 0;
+    while i < 4 {
+        a[i] = aes_round(a[i], key[i], inverse, last);
+        i += 1;
+    }
+    from512_i128(a)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "vaes"))]
+pub unsafe fn _mm256_aesenc_epi128(a: __m256i, round_key: __m256i) -> __m256i {
+    aes_round256(a, round_key, false, false)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "vaes"))]
+pub unsafe fn _mm256_aesenclast_epi128(a: __m256i, round_key: __m256i) -> __m256i {
+    aes_round256(a, round_key, false, true)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "vaes"))]
+pub unsafe fn _mm256_aesdec_epi128(a: __m256i, round_key: __m256i) -> __m256i {
+    aes_round256(a, round_key, true, false)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "vaes"))]
+pub unsafe fn _mm256_aesdeclast_epi128(a: __m256i, round_key: __m256i) -> __m256i {
+    aes_round256(a, round_key, true, true)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "vaes,avx512f"))]
+pub unsafe fn _mm512_aesenc_epi128(a: __m512i, round_key: __m512i) -> __m512i {
+    aes_round512(a, round_key, false, false)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "vaes,avx512f"))]
+pub unsafe fn _mm512_aesenclast_epi128(a: __m512i, round_key: __m512i) -> __m512i {
+    aes_round512(a, round_key, false, true)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "vaes,avx512f"))]
+pub unsafe fn _mm512_aesdec_epi128(a: __m512i, round_key: __m512i) -> __m512i {
+    aes_round512(a, round_key, true, false)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "vaes,avx512f"))]
+pub unsafe fn _mm512_aesdeclast_epi128(a: __m512i, round_key: __m512i) -> __m512i {
+    aes_round512(a, round_key, true, true)
+}
+
+// ---- Integer broadcasts, lane selection, arithmetic and unaligned memory.
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]
+pub unsafe fn _mm256_broadcastsi128_si256(a: __m128i) -> __m256i {
+    i_join(a, a)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f,avx512vl"))]
+pub unsafe fn _mm256_broadcast_i32x4(a: __m128i) -> __m256i {
+    i_join(a, a)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f"))]
+pub unsafe fn _mm512_broadcast_i32x4(a: __m128i) -> __m512i {
+    from512_i128([a; 4])
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]
+pub unsafe fn _mm256_broadcastd_epi32(a: __m128i) -> __m256i {
+    from256_i32([a.0[0] as i32; 8])
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm256_extract_epi32<const INDEX: i32>(a: __m256i) -> i32 {
+    const { assert!(INDEX >= 0 && INDEX < 8) };
+    lanes256_i32(a)[INDEX as usize]
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm256_extract_epi64<const INDEX: i32>(a: __m256i) -> i64 {
+    const { assert!(INDEX >= 0 && INDEX < 4) };
+    a.0[INDEX as usize]
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+pub unsafe fn _mm256_setr_epi64x(a: i64, b: i64, c: i64, d: i64) -> __m256i {
+    __m256i([a, b, c, d])
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f"))]
+pub unsafe fn _mm512_setr_epi64(
+    e0: i64,
+    e1: i64,
+    e2: i64,
+    e3: i64,
+    e4: i64,
+    e5: i64,
+    e6: i64,
+    e7: i64,
+) -> __m512i {
+    __m512i([e0, e1, e2, e3, e4, e5, e6, e7])
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+pub unsafe fn _mm256_set_m128i(hi: __m128i, lo: __m128i) -> __m256i {
+    i_join(lo, hi)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+pub unsafe fn _mm256_insertf128_si256<const IMM1: i32>(a: __m256i, b: __m128i) -> __m256i {
+    const { assert!(IMM1 >= 0 && IMM1 < 2) };
+    if IMM1 == 0 { i_join(b, i_hi(&a)) } else { i_join(i_lo(&a), b) }
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f,avx512vl"))]
+pub unsafe fn _mm256_permutex2var_epi64(a: __m256i, idx: __m256i, b: __m256i) -> __m256i {
+    let mut r = [0i64; 4];
+    let mut i = 0;
+    while i < 4 {
+        let selector = (idx.0[i] as u64 & 7) as usize;
+        r[i] = if selector < 4 { a.0[selector] } else { b.0[selector - 4] };
+        i += 1;
+    }
+    __m256i(r)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f"))]
+pub unsafe fn _mm512_permutex2var_epi64(a: __m512i, idx: __m512i, b: __m512i) -> __m512i {
+    let mut r = [0i64; 8];
+    let mut i = 0;
+    while i < 8 {
+        let selector = (idx.0[i] as u64 & 15) as usize;
+        r[i] = if selector < 8 { a.0[selector] } else { b.0[selector - 8] };
+        i += 1;
+    }
+    __m512i(r)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f"))]
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm512_shuffle_epi32<const MASK: _MM_PERM_ENUM>(a: __m512i) -> __m512i {
+    const { assert!(MASK >= 0 && MASK < 256) };
+    let a = lanes512_i32(a);
+    let mut r = [0i32; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = a[(i / 4) * 4 + ((MASK >> (2 * (i % 4))) & 3) as usize];
+        i += 1;
+    }
+    from512_i32(r)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f"))]
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+pub unsafe fn _mm512_shuffle_i32x4<const MASK: i32>(a: __m512i, b: __m512i) -> __m512i {
+    const { assert!(MASK >= 0 && MASK < 256) };
+    let a = lanes512_i128(a);
+    let b = lanes512_i128(b);
+    from512_i128([
+        a[(MASK & 3) as usize],
+        a[((MASK >> 2) & 3) as usize],
+        b[((MASK >> 4) & 3) as usize],
+        b[((MASK >> 6) & 3) as usize],
+    ])
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f"))]
+pub unsafe fn _mm512_add_epi64(a: __m512i, b: __m512i) -> __m512i {
+    let mut r = [0i64; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = a.0[i].wrapping_add(b.0[i]);
+        i += 1;
+    }
+    __m512i(r)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f,avx512vl"))]
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm_rol_epi32<const IMM8: i32>(a: __m128i) -> __m128i {
+    const { assert!(IMM8 >= 0 && IMM8 < 256) };
+    let mut r = lanes128_u32(a);
+    let mut i = 0;
+    while i < 4 {
+        r[i] = r[i].rotate_left(IMM8 as u32);
+        i += 1;
+    }
+    from128_u32(r)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f,avx512vl"))]
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm256_rol_epi32<const IMM8: i32>(a: __m256i) -> __m256i {
+    const { assert!(IMM8 >= 0 && IMM8 < 256) };
+    i_join(_mm_rol_epi32::<IMM8>(i_lo(&a)), _mm_rol_epi32::<IMM8>(i_hi(&a)))
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f"))]
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm512_rol_epi32<const IMM8: i32>(a: __m512i) -> __m512i {
+    const { assert!(IMM8 >= 0 && IMM8 < 256) };
+    let mut r = lanes512_i32(a);
+    let mut i = 0;
+    while i < 16 {
+        r[i] = (r[i] as u32).rotate_left(IMM8 as u32) as i32;
+        i += 1;
+    }
+    from512_i32(r)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f,avx512vl"))]
+pub unsafe fn _mm_loadu_epi32(mem_addr: *const i32) -> __m128i {
+    crate::ptr::read_unaligned(mem_addr as *const __m128i)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f,avx512vl"))]
+pub unsafe fn _mm_storeu_epi32(mem_addr: *mut i32, a: __m128i) {
+    crate::ptr::write_unaligned(mem_addr as *mut __m128i, a);
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f,avx512vl"))]
+pub unsafe fn _mm256_storeu_epi32(mem_addr: *mut i32, a: __m256i) {
+    crate::ptr::write_unaligned(mem_addr as *mut __m256i, a);
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f"))]
+pub unsafe fn _mm512_storeu_si512(mem_addr: *mut __m512i, a: __m512i) {
+    crate::ptr::write_unaligned(mem_addr, a);
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse2"))]
+pub unsafe fn _mm_storel_epi64(mem_addr: *mut __m128i, a: __m128i) {
+    crate::ptr::write_unaligned(mem_addr as *mut i64, a.0[0]);
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]
+pub unsafe fn _mm256_mulhi_epu16(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_mulhi_epu16(i_lo(&a), i_lo(&b)), _mm_mulhi_epu16(i_hi(&a), i_hi(&b)))
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]
+pub unsafe fn _mm256_sllv_epi32(a: __m256i, count: __m256i) -> __m256i {
+    i_join(_mm_sllv_epi32(i_lo(&a), i_lo(&count)), _mm_sllv_epi32(i_hi(&a), i_hi(&count)))
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]
+pub unsafe fn _mm256_srlv_epi64(a: __m256i, count: __m256i) -> __m256i {
+    let mut r = [0i64; 4];
+    let mut i = 0;
+    while i < 4 {
+        let n = count.0[i] as u64;
+        r[i] = if n < 64 { ((a.0[i] as u64) >> n) as i64 } else { 0 };
+        i += 1;
+    }
+    __m256i(r)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse2"))]
+pub unsafe fn _mm_set_epi16(
+    e7: i16,
+    e6: i16,
+    e5: i16,
+    e4: i16,
+    e3: i16,
+    e2: i16,
+    e1: i16,
+    e0: i16,
+) -> __m128i {
+    from128_i16([e0, e1, e2, e3, e4, e5, e6, e7])
+}
+
+// IFMA ignores the top 12 bits of each multiplicand, but retains all 64
+// accumulator bits. Only the addition wraps; the product has 104 bits.
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512ifma,avx512vl"))]
+pub unsafe fn _mm256_madd52lo_epu64(a: __m256i, b: __m256i, c: __m256i) -> __m256i {
+    let mask = (1u64 << 52) - 1;
+    let mut r = [0i64; 4];
+    let mut i = 0;
+    while i < 4 {
+        let product = ((b.0[i] as u64 & mask) as u128) * ((c.0[i] as u64 & mask) as u128);
+        r[i] = (a.0[i] as u64).wrapping_add(product as u64 & mask) as i64;
+        i += 1;
+    }
+    __m256i(r)
+}
+
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512ifma,avx512vl"))]
+pub unsafe fn _mm256_madd52hi_epu64(a: __m256i, b: __m256i, c: __m256i) -> __m256i {
+    let mask = (1u64 << 52) - 1;
+    let mut r = [0i64; 4];
+    let mut i = 0;
+    while i < 4 {
+        let product = ((b.0[i] as u64 & mask) as u128) * ((c.0[i] as u64 & mask) as u128);
+        r[i] = (a.0[i] as u64).wrapping_add((product >> 52) as u64) as i64;
+        i += 1;
+    }
+    __m256i(r)
 }
