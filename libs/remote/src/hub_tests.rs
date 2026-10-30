@@ -439,9 +439,13 @@ fn closed_clients_are_let_go() {
     }
     let t = std::time::Instant::now();
     // the server side sees each close a moment later
-    while t.elapsed() < WAIT && hub.0.clients.lock().unwrap().iter().any(|c| !c.is_closed()) {
+    while t.elapsed() < WAIT && hub.kept_clients().1 > 0 {
         std::thread::sleep(Duration::from_millis(5));
     }
     let _live = pair(&ep);
-    assert!(hub.0.clients.lock().unwrap().len() <= 1, "{} kept", hub.0.clients.lock().unwrap().len());
+    let t = std::time::Instant::now();
+    while t.elapsed() < WAIT && hub.kept_clients().1 == 0 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(hub.kept_clients(), (1, 1));
 }

@@ -210,6 +210,13 @@ impl Hub {
         c.len()
     }
 
+    /// (kept, still open) clients, without pruning (tests).
+    #[cfg(test)]
+    pub(crate) fn kept_clients(&self) -> (usize, usize) {
+        let c = self.0.clients.lock().unwrap();
+        (c.len(), c.iter().filter(|c| !c.is_closed()).count())
+    }
+
     /// The endpoint local clients talk to: `route` and `hosts`.
     pub fn client_endpoint(&self) -> Endpoint {
         let ep = Endpoint::new("makepad-run-hub");
