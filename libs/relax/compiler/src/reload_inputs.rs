@@ -16,9 +16,28 @@ pub(super) enum Kind {
     Runner,
 }
 
+/// How the app's Cargo graph was resolved at boot, and what it resolved to.
+#[derive(Clone)]
+struct ResolvedGraph {
+    workspace: String,
+    package: String,
+    flags: Vec<String>,
+    shape: u64,
+}
+
 #[derive(Default, Clone)]
 pub struct Inputs {
     pub(super) paths: BTreeMap<String, (Stamp, Kind)>,
+    graph: Option<ResolvedGraph>,
+}
+
+/// What a resolved graph is: its units (packages with their versions, targets, features and
+/// dependency edges). A lockfile or manifest change that leaves this alone is not this app's.
+fn graph_shape(units: &crate::unitgraph::Units) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    format!("{units:?}").hash(&mut h);
+    h.finish()
 }
 
 impl Inputs {
@@ -80,6 +99,23 @@ impl Inputs {
         crate::srchash::files(Path::new(std_dir), "", &mut files);
         for (_, path) in files { inputs.protected(&path, Path::new(std_dir), Kind::Std); }
         inputs
+    }
+
+    /// The graph `units` the app was resolved to (`graph_moved` resolves it again).
+    pub fn set_graph(&mut self, workspace: &str, package: &str, flags: &[String], units: &crate::unitgraph::Units) {
+        self.graph = Some(ResolvedGraph { workspace: workspace.into(), package: package.into(), flags: flags.to_vec(), shape: graph_shape(units) });
+    }
+
+    /// Whether `path` is a manifest or lockfile of the app's graph.
+    pub(super) fn is_manifest(&self, path: &str) -> bool {
+        matches!(self.paths.get(path).map(|x| &x.1), Some(Kind::Manifest))
+    }
+
+    /// Whether the app's resolved graph differs from the one it runs (resolved again from the
+    /// manifests and the lockfile as they are now; one that does not resolve differs).
+    pub(super) fn graph_moved(&self, sess: &std::sync::Arc<crate::Session>) -> bool {
+        let Some(g) = &self.graph else { return true };
+        crate::unitgraph::unit_graph(sess, &g.workspace, &g.package, &g.flags).map_or(true, |units| graph_shape(&units) != g.shape)
     }
 
     /// The loader binary's own sources (cargo's dep-info `<exe>.d` next to it, which lists every
