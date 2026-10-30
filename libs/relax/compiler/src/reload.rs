@@ -3766,21 +3766,9 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
     back
 }
 
-/// An edit the patcher cannot absorb lands by restarting the program in place, at once
-/// (restart_in_place). Only where that is impossible does it wait for `session relaunch`.
+/// An edit the patcher cannot absorb waits for the person: a running app never restarts by itself.
 fn restart_for_edit(what: &str, lines: &[String]) {
-    let why = format!("{}: {}", what, lines.first().cloned().unwrap_or_default());
-    if dock_app() {
-        // a dock app restarts when the person says so (the WM's toast, or `session relaunch`)
-        return offer_restart(&why);
-    }
-    match restart_in_place(why.clone()) {
-        Ok(how) => eprintln!("makepad live: {what}: restarting in place to apply it ({how}); reasons below"),
-        Err(e) => {
-            note_restart_pending(&why);
-            eprintln!("makepad live: {what}: restart to apply (reasons below); the app keeps running the previous code -- `makepad inspect <app> session relaunch` applies it ({e})");
-        }
-    }
+    offer_restart(&format!("{}: {}", what, lines.first().cloned().unwrap_or_default()));
 }
 
 /// How long a patch's old code may stay on a program thread's stack before the edit counts as
@@ -3916,18 +3904,11 @@ fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
     }
 }
 
-/// A WM dock app (`MAKEPAD_RUN_DOCK_REVISION`): its changes come from devhub syncs of landed
-/// work, and a restart they need is offered to the person (the WM's toast says "restart to
-/// apply", and its Restart is `session relaunch`), never done unasked.
-pub(crate) fn dock_app() -> bool {
-    std::env::var_os("MAKEPAD_RUN_DOCK_REVISION").is_some_and(|p| !p.is_empty())
-}
-
-/// A restart is ready for a dock app: noted for `session relaunch`, and in the live log for the
-/// toast (devhub follows it).
+/// A restart is ready: noted for `session relaunch` (the JIT ring's Update ready notice, a click
+/// on it asks for it), and in the live log for the WM's toast (devhub follows it).
 pub(crate) fn offer_restart(why: &str) {
     note_restart_pending(why);
-    eprintln!("makepad live: {why}: a restart applies it; offered (the WM's toast, or `makepad inspect <app> session relaunch`); the app keeps running meanwhile");
+    eprintln!("makepad live: {why}: a restart applies it; offered (Update ready on the JIT ring, the WM's toast, or `makepad inspect <app> session relaunch`); the app keeps running meanwhile");
     live_log(&format!("{{\"event\":\"restart_offered\",\"pid\":{},\"why\":{}}}", std::process::id(), json_str(why)));
 }
 
@@ -4723,11 +4704,23 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 continue;
             }
         }
-        let reason = if synced { None } else { inputs.restart_reason(changed.iter().map(|&k| files[k].0.as_str())).or_else(|| {
-            changed.iter().any(|&k| files[k].1 == u32::MAX && !crate::native_macros::owns_path(&files[k].0))
-                .then_some("sources outside the loaded program changed")
-        }) };
+        // sources the program has not loaded are read when it loads them (another OS's: never)
+        if !synced {
+            let (unloaded, rest): (Vec<usize>, Vec<usize>) = changed.iter().partition(|&&k| files[k].1 == u32::MAX && !inputs.process_input(&files[k].0) && !inputs.is_manifest(&files[k].0) && !crate::native_macros::owns_path(&files[k].0));
+            for &k in &unloaded { files[k].2 = stamp(&files[k].0); stalled.remove(&k); }
+            changed = rest;
+            if changed.is_empty() {
+                continue;
+            }
+        }
+        let reason = if synced { None } else { inputs.restart_reason(changed.iter().map(|&k| files[k].0.as_str())) };
         if let Some(reason) = reason {
+            // nothing of makepad's own moved (a bulk change of the program's sources): no rebuild
+            if !changed.iter().any(|&k| inputs.process_input(&files[k].0)) {
+                offer_restart(&format!("{} files changed: {reason}", changed.len()));
+                for &k in &changed { files[k].2 = stamp(&files[k].0); stalled.remove(&k); }
+                continue;
+            }
             // a change the running process cannot take: makepad rebuilds itself in the background
             // and restarts into the new binary; the app keeps running (and patching) meanwhile
             let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };

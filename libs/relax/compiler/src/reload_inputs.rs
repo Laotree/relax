@@ -138,6 +138,11 @@ impl Inputs {
             }
             out
         });
+        // a provided crate's file this binary is not built from (another OS's) is no input of it
+        if !runner.is_empty() {
+            let built: BTreeSet<&Path> = runner.iter().flat_map(|(path, _)| Path::new(path).ancestors()).collect();
+            self.paths.retain(|path, (_, kind)| *kind != Kind::Provided || built.contains(Path::new(path)));
+        }
         for (path, stamp) in runner {
             self.paths.entry(path.clone()).or_insert((*stamp, Kind::Runner));
         }

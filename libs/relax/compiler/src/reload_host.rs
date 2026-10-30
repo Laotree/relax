@@ -257,8 +257,8 @@ fn build_loop() {
         if asked {
             super::RESTART_CONFIRMED.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        if super::dock_app() && !asked {
-            // a dock app restarts into it when the person says so (`session relaunch`)
+        if !asked {
+            // a running app restarts into it when the person says so (`session relaunch`)
             *super::RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = reason.clone();
             super::offer_restart(&reason);
             return;
@@ -290,10 +290,10 @@ pub(super) fn restart_now(state: &[u8]) -> bool {
         return false;
     }
     match take() {
-        Some(h) if super::dock_app() && !super::RESTART_CONFIRMED.swap(false, std::sync::atomic::Ordering::SeqCst) => {
-            // a dock app's restart into a rebuilt makepad waits for the person (`session relaunch`)
+        Some(h) if !super::RESTART_CONFIRMED.swap(false, std::sync::atomic::Ordering::SeqCst) => {
+            // a restart into a rebuilt makepad waits for the person (`session relaunch`)
             *HANDOVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
-            eprintln!("makepad live: the app reached a restart point; the rebuilt makepad waits for `session relaunch` (dock app)");
+            eprintln!("makepad live: the app reached a restart point; the rebuilt makepad waits for `session relaunch`");
             false
         }
         Some(h) => { restart(h, Some(state)); true }
@@ -303,6 +303,9 @@ pub(super) fn restart_now(state: &[u8]) -> bool {
 
 /// Unpinned: a rebuilt makepad that waited takes over now.
 pub(super) fn unpinned() {
+    if !super::RESTART_CONFIRMED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     if let Some(h) = take() {
         restart(h, None);
     }
