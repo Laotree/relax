@@ -4044,7 +4044,8 @@ static SESSION: relax_session::sync::Mutex<Vec<(&'static str, f64)>> = relax_ses
 /// One edit's record. `saved`: the newest edited file's modification time (the save).
 fn log_edit(what: &str, o: &Outcome, saved: Option<std::time::SystemTime>, seen: std::time::Instant) {
     if crate::run_state::observed() {
-        let applied = o.rung == Rung::Patch && !o.pending
+        // an edit waiting for a restart is no failure: the app runs on, the restart is offered
+        let applied = o.rung == Rung::Restart || o.rung == Rung::Patch && !o.pending
             && !o.lines.iter().any(|l| l.starts_with("incomplete:"));
         let records = if applied { Vec::new() } else {
             o.lines.iter().map(|line| crate::diag::from_legacy(line, "typeck")).collect()
@@ -4804,7 +4805,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let names: Vec<String> = edits.iter().map(|e| e.path.rsplit('/').next().unwrap_or("").to_string()).collect();
         let originals: Vec<_> = edits.iter().map(|e| e.src.clone()).collect();
         trace_input(watch_ms, ms(read_started), scanned);
-        let o = apply(up, edits);
+        let mut o = apply(up, edits);
+        // landed code the patcher refuses is nobody's error here: a restart takes it
+        if synced && o.rung == Rung::Refuse { o.rung = Rung::Restart; }
         let incomplete = o.rung == Rung::Refuse || o.lines.iter().any(|l| l.starts_with("incomplete:"));
         if incomplete {
             for (&k, src) in which.iter().zip(originals) { stalled.insert(k, (Instant::now(), src, if o.rung == Rung::Refuse { o.lines.clone() } else { Vec::new() })); }
