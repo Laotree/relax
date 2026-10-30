@@ -4271,9 +4271,9 @@ pub extern "C" fn __relax_live_stream(p: *const u8, n: usize, t: *const u8, len:
     crate::jit::host_boundary("__relax_live_stream", move || {
         if p.is_null() || t.is_null() { return 3; }
         unsafe {
-            if jit::UNIT.is_null() { return 3; }
+            if jit::cur_unit().is_null() { return 3; }
             let Ok(path) = std::str::from_utf8(std::slice::from_raw_parts(p, n)) else { return 3; };
-            let o = apply_stream(jit::UNIT, path, std::slice::from_raw_parts(t, len).to_vec());
+            let o = apply_stream(jit::cur_unit(), path, std::slice::from_raw_parts(t, len).to_vec());
             match o.rung {
                 Rung::Patch if o.changed == 0 && o.lines.iter().any(|l| l.starts_with("incomplete:")) => 1,
                 Rung::Patch => 0,
