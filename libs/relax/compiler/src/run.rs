@@ -820,11 +820,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         crate::std_source::select(&workspace, std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/std")));
     }
     if std::env::var_os("MAKEPAD_RUN_STD").is_none() {
-        let mut d = std::env::current_exe().unwrap_or_default();
-        for _ in 0..3 {
-            d.pop();
-        }
-        let mut candidates = vec![format!("{}/libs/relax/compiler/std", workspace), format!("{}/src/libs/relax/compiler/std", d.display())];
+        // the build scripts' child runs inherit it (a CARGO_TARGET_DIR outside the checkout left
+        // them looking beside the target dir)
+        let mut candidates = crate::std_candidates(Some(workspace.as_str()));
         candidates.retain(|c| std::path::Path::new(c).join("std/lib.rs").exists());
         if let Some(c) = candidates.first() {
             std::env::set_var("MAKEPAD_RUN_STD", c);

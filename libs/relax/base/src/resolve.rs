@@ -214,6 +214,10 @@ struct Manifest {
     tests: Vec<Target>,
     features: BTreeMap<String, Vec<String>>,
     deps: Vec<Dep>,
+    /// the keys of a registry package's dev-dependencies, which are not read (never built): a
+    /// feature value `x/f` naming one enables nothing, as under cargo (features.rs
+    /// activate_dep_feature finds no activated dependency `x`)
+    dev_keys: Vec<String>,
     proc_macro: bool,
     source: Source,
 }
@@ -861,23 +865,31 @@ impl Resolver {
         };
         add(&mut deps, table(&t, "dependencies"), false, false, None)?;
         add(&mut deps, table(&t, "build-dependencies").or_else(|| table(&t, "build_dependencies")), true, false, None)?;
-        // a registry package's dev-dependencies are never built (only the root package's tests are)
+        // a registry package's dev-dependencies are never built (only the root package's tests are):
+        // only their keys are kept
+        let mut dev_keys: Vec<String> = Vec::new();
+        let dev_tbl = table(&t, "dev-dependencies").or_else(|| table(&t, "dev_dependencies"));
         if !registry {
-            add(&mut deps, table(&t, "dev-dependencies").or_else(|| table(&t, "dev_dependencies")), false, true, None)?;
+            add(&mut deps, dev_tbl, false, true, None)?;
+        } else if let Some(d) = dev_tbl {
+            dev_keys.extend(d.keys().cloned());
         }
         if let Some(tt) = table(&t, "target") {
             for (plat, v) in tt {
                 if let Some(v) = v.as_table() {
                     add(&mut deps, table(v, "dependencies"), false, false, Some(plat.clone()))?;
                     add(&mut deps, table(v, "build-dependencies").or_else(|| table(v, "build_dependencies")), true, false, Some(plat.clone()))?;
+                    let dev_tbl = table(v, "dev-dependencies").or_else(|| table(v, "dev_dependencies"));
                     if !registry {
-                        add(&mut deps, table(v, "dev-dependencies").or_else(|| table(v, "dev_dependencies")), false, true, Some(plat.clone()))?;
+                        add(&mut deps, dev_tbl, false, true, Some(plat.clone()))?;
+                    } else if let Some(d) = dev_tbl {
+                        dev_keys.extend(d.keys().cloned());
                     }
                 }
             }
         }
         let i = self.manifests.len();
-        self.manifests.push(Manifest { dir: dir.clone(), name, version, edition, links, build, lib, bins, tests, features, deps, proc_macro, source });
+        self.manifests.push(Manifest { dir: dir.clone(), name, version, edition, links, build, lib, bins, tests, features, deps, dev_keys, proc_macro, source });
         self.by_dir.insert(dir, i);
         Ok(i)
     }
@@ -1592,6 +1604,12 @@ impl<'a> Feat<'a> {
                 }
                 Req::Dep(d) => self.switch_dep(k, &d)?,
                 Req::DepFeature(d, f, weak) => {
+                    if !has && self.r.manifests[k.0].dev_keys.iter().any(|x| *x == d) {
+                        // `x/f` on a dev-dependency of a package whose tests are not built: no
+                        // dependency `x` is activated, so nothing is enabled (vsss-rs 6.0.1's
+                        // `rand/alloc` with rand a dev-dependency)
+                        continue;
+                    }
                     if !has {
                         // `x/f` where x is a feature, not a dependency: cargo reads it as a dependency only
                         return Err(format!("package `{}`: feature value `{}/{}` names no dependency", mname, d, f));
@@ -2051,6 +2069,32 @@ mod root_tests {
         assert_eq!(d.features, ["parsing", "visit"]);
         assert!(!d.default_features);
         assert_eq!(d.path.as_deref(), Some(normalize(&format!("{root}/macros/shared")).as_str()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A registry package's feature value `x/f` naming one of its dev-dependencies (vsss-rs 6.0.1:
+    /// `alloc = ["rand/alloc"]` with rand a dev-dependency): cargo accepts it and enables nothing
+    /// (cargo core/resolver/features.rs activate_dep_feature: no activated dependency `x`).
+    #[test]
+    fn registry_feature_on_a_dev_dependency() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let root = tree("devfeat", &[
+            ("Cargo.toml", "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\n"),
+            (".cargo/config.toml", "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"vendor\"\n"),
+            ("app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nshares = \"6\"\n"),
+            ("app/src/lib.rs", ""),
+            ("vendor/shares/Cargo.toml", "[package]\nname = \"shares\"\nversion = \"6.0.1\"\nedition = \"2021\"\n[features]\ndefault = [\"alloc\"]\nalloc = [\"rand/alloc\"]\nstd = [\"alloc\", \"rand/std\"]\n[dev-dependencies]\nrand = \"0.8\"\n[target.'cfg(unix)'.dev-dependencies]\nrand_unix = \"0.1\"\n"),
+            ("vendor/shares/.cargo-checksum.json", "{\"files\":{},\"package\":null}"),
+            ("vendor/shares/src/lib.rs", ""),
+        ]);
+        let g = unit_graph(sess, &root, "app", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let shares = g.units.iter().find(|u| u.name == "shares").unwrap();
+        assert_eq!(shares.features, ["alloc", "default"]);
+        assert!(!g.units.iter().any(|u| u.name == "rand"));
+        // a value naming neither a dependency nor a dev-dependency stays an error
+        let _ = std::fs::write(format!("{root}/vendor/shares/Cargo.toml"), "[package]\nname = \"shares\"\nversion = \"6.0.1\"\nedition = \"2021\"\n[features]\ndefault = [\"nope/alloc\"]\n");
+        let e = unit_graph(sess, &root, "app", &[]).err().unwrap();
+        assert!(e.contains("names no dependency"), "{e}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
