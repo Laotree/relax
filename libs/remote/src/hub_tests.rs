@@ -424,3 +424,24 @@ fn host_env_round_trips_in_hosts_toml() {
     assert_eq!(Hosts::parse(&h.to_text()).unwrap(), h);
     assert!(Hosts::parse("[host.d]\nvia = \"dial\"\nkey = \"00\"\nenv = { A = \"b\" }\n").is_err());
 }
+
+/// The hub keeps only its live clients: each closed one goes when a new one comes (the devhub
+/// master's control socket kept every CLI call's sockets open, ~13k after an hour, until git
+/// could no longer be spawned).
+#[test]
+fn closed_clients_are_let_go() {
+    let hub = Hub::new(&hosts());
+    let ep = hub.client_endpoint();
+    for _ in 0..5 {
+        let c = pair(&ep);
+        c.close("done");
+        c.wait_closed();
+    }
+    let t = std::time::Instant::now();
+    // the server side sees each close a moment later
+    while t.elapsed() < WAIT && hub.0.clients.lock().unwrap().iter().any(|c| !c.is_closed()) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _live = pair(&ep);
+    assert!(hub.0.clients.lock().unwrap().len() <= 1, "{} kept", hub.0.clients.lock().unwrap().len());
+}
