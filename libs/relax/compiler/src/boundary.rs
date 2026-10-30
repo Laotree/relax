@@ -273,6 +273,9 @@ pub fn run(up: *mut Unit) -> (String, usize) {
     }
     let mut done = 0usize;
     let mut lowered = 0usize;
+    // the body whose lowering first made each slot: a violation row names the way JIT code
+    // got into the provided crate (the app's fn, then each provided fn compiled from source)
+    let mut made_by: Vec<u32> = vec![u32::MAX; u.fns.len()];
     loop {
         let n = u.fns.len();
         if done == n {
@@ -309,6 +312,10 @@ pub fn run(up: *mut Unit) -> (String, usize) {
             }
             lowered += 1;
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::jit::lower_for_audit(up, id as u32) }));
+            let now = u.fns.len();
+            if made_by.len() < now {
+                made_by.resize(now, id as u32);
+            }
             if !matches!(r, Ok(Ok(()))) {
                 failed += 1;
                 let msg = match &r {
@@ -343,6 +350,19 @@ pub fn run(up: *mut Unit) -> (String, usize) {
     let _ = writeln!(out, "# provided-crate violations (JIT-compiled code reaching into a provided crate the way it cannot): {} in the audited crates, {} in others", failing, a.violations.len() - failing);
     for (k, body, e) in &a.violations {
         let _ = writeln!(out, "violation\t{}\t{}\t{}\t{}", if a.crates.contains(k) { "FAIL" } else { "other" }, crate_name(*k), body, e);
+        // the way in: from the app's body to this one, each a body compiled from source
+        if let Some(mut id) = (0..u.fns.len()).find(|i| *u.fns[*i].name == **body) {
+            let mut path = vec![u.fns[id].name.to_string()];
+            while let Some(&p) = made_by.get(id).filter(|p| **p != u32::MAX && path.len() < 24) {
+                path.push(u.fns[p as usize].name.to_string());
+                id = p as usize;
+                if !matches!(&u.fns[id].key, FnKey::Inst(d, _) if u.provided.iter().any(|(pk, _)| *pk == u.prog.def(*d).krate)) {
+                    break;
+                }
+            }
+            path.reverse();
+            let _ = writeln!(out, "  reached\t{}", path.join(" -> "));
+        }
     }
     // every `#[relax_api]` op names a fn of this source with the signature rustc built: an entry
     // whose key no fn has (Relax reads the item's path differently, or the source moved on) or
