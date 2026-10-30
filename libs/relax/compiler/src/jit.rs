@@ -4082,6 +4082,7 @@ impl Unit {
     fn crossing_of(&self, ks: &[u32]) -> std::collections::HashSet<TyId> {
         let pt = &self.provided_types;
         let provided = &self.provided;
+        let opaque = &self.lay.opaque;
         // A bound fn has a shim under its key, and a key ends in the fn's own name. Only the
         // fns of those names are keyed, and only the ones a shim names get their signature
         // worked out (it drags in lifetime resolution): the provided crates have thousands of
@@ -4095,7 +4096,7 @@ impl Unit {
             let key = crate::provided::key(&self.prog, &self.tcx, d);
             provided.iter().any(|(pk, pc)| *pk == def.krate && pc.shims.contains_key(key.as_str()))
                 && crate::provided::unbound_reason(&self.prog, &self.tcx, def.krate, d, &|a| pt.contains_key(&a)).is_none()
-        })
+        }, &|d| opaque.contains_key(&d))
     }
 
 

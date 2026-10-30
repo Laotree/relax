@@ -239,19 +239,31 @@ fn c_representable(s: &str) -> bool {
         || s.starts_with('&') && !s.starts_with("&dyn") && !s.starts_with("&other")
 }
 
-/// Lowers every JIT-side body reachable from the non-generic fns of crates other than the
-/// provided ones and std, to a fixpoint; then the report and the number of violations (bodies
-/// that reach into a provided crate the way JIT-compiled code cannot).
-pub fn run(up: *mut Unit) -> (String, usize) {
+/// Lowers every JIT-side body a run of package `root` reaches from its `main` (a library: from
+/// the non-generic fns of the crates JIT code is made of, the package and its dependencies, not
+/// entering a provided crate or std: a crate only a provided crate depends on, wayland-client
+/// under the HAL, is rustc's), to a fixpoint;
+/// then the report and the number of violations (bodies that reach into a provided crate the
+/// way JIT-compiled code cannot).
+pub fn run(up: *mut Unit, root: u32) -> (String, usize) {
     AUDIT_ON.store(true, std::sync::atomic::Ordering::Relaxed);
     let u = unsafe { &mut *up };
     let std_crates: Vec<u32> = ["core", "alloc", "std"].iter().filter_map(|n| u.prog.crates.iter().position(|c| u.prog.syms.str(c.name) == *n).map(|i| i as u32)).collect();
     // the audited crate(s) and every crate registered as provided (makepad-script's census)
     let mut provided_crates = AUDIT.lock().unwrap().as_ref().unwrap().crates.clone();
     provided_crates.extend(u.provided.iter().map(|(k, _)| *k).filter(|k| !provided_crates.contains(k)).collect::<Vec<_>>());
+    let mut jit_crates = vec![false; u.prog.crates.len()];
+    let mut stack = vec![root];
+    while let Some(c) = stack.pop() {
+        if jit_crates[c as usize] || std_crates.contains(&c) || provided_crates.contains(&c) {
+            continue;
+        }
+        jit_crates[c as usize] = true;
+        stack.extend(u.prog.crates[c as usize].deps.iter().map(|(_, d)| *d));
+    }
     let mut roots = Vec::new();
     for (di, d) in u.prog.defs.iter().enumerate() {
-        if !matches!(d.kind, DefKind::Fn | DefKind::AssocFn) || std_crates.contains(&d.krate) || provided_crates.contains(&d.krate) {
+        if !matches!(d.kind, DefKind::Fn | DefKind::AssocFn) || !jit_crates[d.krate as usize] {
             continue;
         }
         let it = u.prog.files[d.file as usize].ast.item(d.item);
@@ -265,6 +277,11 @@ pub fn run(up: *mut Unit) -> (String, usize) {
         if !generic && !in_trait {
             roots.push(DefId(di as u32));
         }
+    }
+    // a program: what its run reaches, from its `main` (calls, fn pointers, vtables, closures
+    // and drop glue are followed to the fixpoint); a library: every fn of the JIT-side crates
+    if let Some(main) = crate::run::find_main(&u.prog, root) {
+        roots = vec![main];
     }
     let mut failed = 0usize;
     let mut fails: Vec<String> = Vec::new();

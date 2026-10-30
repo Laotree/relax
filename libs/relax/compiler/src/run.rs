@@ -1337,7 +1337,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             let up: *mut Unit = &mut *u;
             let (rep, violations) = {
                 let _job = jit::compile_job();
-                crate::owner::call(crate::owner::Class::Program, || crate::boundary::run(up))
+                crate::owner::call(crate::owner::Class::Program, || crate::boundary::run(up, root))
             };
             print!("{}", rep);
             std::mem::forget(u);
