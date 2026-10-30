@@ -1078,13 +1078,14 @@ impl Resolver {
 /// The test programs of the workspace member `package`: whether it has a lib target, its bin
 /// targets with `harness = true`, and its integration test targets by name with their source paths
 /// (cargo test's order: the lib's unit tests, the bins' unit tests, then the test targets by name).
-pub fn test_targets(sess: &std::sync::Arc<crate::Session>, dir: &str, package: &str) -> Result<(Option<String>, Vec<(String, String)>, Vec<(String, String)>), String> {
+/// The package's lib path, bins and integration tests: (name, path, harness) each.
+pub fn test_targets(sess: &std::sync::Arc<crate::Session>, dir: &str, package: &str) -> Result<(Option<String>, Vec<(String, String, bool)>, Vec<(String, String, bool)>), String> {
     let mut r = Resolver::new(sess, dir)?;
     let i = r.find_member(package)?;
     let m = &r.manifests[i];
-    let mut bins: Vec<(String, String)> = m.bins.iter().filter(|t| t.harness).map(|t| (t.name.clone(), t.path.clone())).collect();
+    let mut bins: Vec<(String, String, bool)> = m.bins.iter().map(|t| (t.name.clone(), t.path.clone(), t.harness)).collect();
     bins.sort();
-    let mut tests: Vec<(String, String)> = m.tests.iter().map(|t| (t.name.clone(), t.path.clone())).collect();
+    let mut tests: Vec<(String, String, bool)> = m.tests.iter().map(|t| (t.name.clone(), t.path.clone(), t.harness)).collect();
     tests.sort();
     Ok((m.lib.as_ref().map(|l| l.path.clone()), bins, tests))
 }
@@ -1837,13 +1838,10 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
                 if !bt.required_features.iter().all(|f| rn.features.contains(f)) {
                     continue;
                 }
-                // `harness = false` bins (no libtest main): only an explicit `--bin <name>` is an error;
-                // `--bins` runs the harness ones (test_targets lists the same set)
-                if !bt.harness {
-                    if names.is_empty() {
-                        continue;
-                    }
-                    return Err(format!("bin target `{}` of package `{}` has `harness = false`: makepad test runs libtest-harness targets only", bt.name, rm.name));
+                // `harness = false` bins (no libtest main): `--bins` builds the harness ones; `makepad
+                // test` runs each of the others as a program of its own (`--bin <name>`, test_targets)
+                if !bt.harness && names.is_empty() {
+                    continue;
                 }
                 roots.push(add((root, false), UKind::BinTest(bi), &mut units));
             }
@@ -1861,8 +1859,10 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
                 if !tt.required_features.iter().all(|f| rn.features.contains(f)) {
                     continue;
                 }
-                if !tt.harness {
-                    return Err(format!("test target `{}` of package `{}` has `harness = false`: makepad test runs libtest-harness targets only", tt.name, rm.name));
+                // `harness = false` (cargo: `--cfg test`, no `--test`, run as a plain program): `--tests`
+                // builds the harness ones; `makepad test` runs each of the others alone (`--test <name>`)
+                if !tt.harness && names.is_empty() {
+                    continue;
                 }
                 roots.push(add((root, false), UKind::Test(ti), &mut units));
             }

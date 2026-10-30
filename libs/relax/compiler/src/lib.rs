@@ -16,11 +16,14 @@ macro_rules! eprintln {
     ($($t:tt)*) => { stderr_line!($($t)*) };
 }
 /// One stderr line that never panics; for modules whose own `eprintln!` gates on diag::enabled.
+/// The line (newline included) is formatted first and written in one call: stderr is
+/// unbuffered, and a `write_fmt` there is one write per piece, so another thread's stdout line
+/// (a test's `... FAILED`) landed inside a multi-line `report:` message in a shared log.
 #[cfg(not(test))]
 #[allow(unused_macros)]
 macro_rules! stderr_line {
     () => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_all(b"\n"); }};
-    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_fmt(format_args!("{}\n", format_args!($($t)+))); }};
+    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_all(::std::fmt::format(format_args!("{}\n", format_args!($($t)+))).as_bytes()); }};
 }
 #[cfg(test)]
 macro_rules! stderr_line {
