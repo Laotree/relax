@@ -2795,7 +2795,13 @@ impl<'a> Lcx<'a> {
                 TyKind::Closure(..) => self.u.closure_storage(up).fields.len(),
                 _ => 0,
             };
-            let vals = self.clone_shim_fields(&pa, up, 0, n);
+            // a closure's `&mut T` field it only reads through holds rustc's `&` capture of the
+            // place behind it: copied, as that capture's Clone (layout/closure.rs shared_reborrow)
+            let copied: Vec<bool> = match self.kind(up) {
+                TyKind::Closure(..) => { let s = self.u.closure_storage(up); (0..n).map(|i| s.shared_reborrow.get(i).copied().unwrap_or(false)).collect() }
+                _ => vec![false; n],
+            };
+            let vals = self.clone_shim_fields(&pa, up, 0, n, &copied);
             let v = if self.layout(t).leaves.is_none() {
                 let s = self.new_slot_for(t);
                 let place = Place::Mem(s, 0);
@@ -2825,7 +2831,7 @@ impl<'a> Lcx<'a> {
         tcx.type_implements_trait(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), TraitRef { def_id: trivial, args: vec![GenericArg::Type(t)] }).must_apply_modulo_regions()
     }
 
-    fn clone_shim_fields(&mut self, pa: &Place, t: TyId, vi: u32, n: usize) -> Vec<(Val, TyId)> {
+    fn clone_shim_fields(&mut self, pa: &Place, t: TyId, vi: u32, n: usize, copied: &[bool]) -> Vec<(Val, TyId)> {
         // rustc_mir_transform/src/shim.rs:662-702: only initialized clones
         // participate in the unwind chain, in reverse initialization order.
         let mut vals = Vec::new();
@@ -2837,6 +2843,7 @@ impl<'a> Lcx<'a> {
             let (fa, ft) = self.project(pa, t, vi, fi as u32);
             let v = match self.kind(ft) {
                 TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::Ref(false, _, _) => self.read_place(&fa, ft),
+                TyKind::Ref(true, _, _) if copied.get(fi).copied().unwrap_or(false) => self.read_place(&fa, ft),
                 _ => {
                     let td = self.u.tcx.lang_items.get(LangItem::Clone);
                     let m = self.u.tcx.lang_items.get(LangItem::CloneFn);
