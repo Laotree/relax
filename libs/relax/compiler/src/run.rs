@@ -349,6 +349,7 @@ pub(crate) fn resolve_package(
     } else {
         std::fs::read(units_json).map_err(|e| format!("{}: {}", units_json, e)).and_then(|d| unitgraph::Units::from_json(&d))
     }?;
+    let resolved_units = units.clone();
     let units = with_sysroot_proc_macro(units, std_dir);
     let t_load = Instant::now();
     let mut g = unitgraph::load(&units, check_only)?;
@@ -376,7 +377,11 @@ pub(crate) fn resolve_package(
         .collect();
     let watches = boot || matches!(who, ResolveFor::Domain(id) if app_domain() == Some(id));
     let t_inputs = Instant::now();
-    let live_inputs = (watches && options.live).then(|| crate::reload::Inputs::collect(&g, std_dir, workspace));
+    let live_inputs = (watches && options.live).then(|| {
+        let mut inputs = crate::reload::Inputs::collect(&g, std_dir, workspace);
+        inputs.set_graph(workspace, package, cargo_flags, &resolved_units);
+        inputs
+    });
     let t_subst = Instant::now();
     // Validate native macros before any overlapping provided-crate identity error.
     crate::crates::apply_substitutes(sess, &mut g.crates, std_dir, !boot).map_err(|e| format!("crate substitution: {e}"))?;

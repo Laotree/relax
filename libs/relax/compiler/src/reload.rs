@@ -4384,7 +4384,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     };
     // (the watcher's holds read the program's files only: lock_unit_quick)
     let mut files: Vec<(String, u32, Option<(std::time::SystemTime, u64)>)> = {
-        crate::owner::call_quick(crate::owner::Class::Program, || {
+        crate::owner::call(crate::owner::Class::Program, || {
             let loaded: std::collections::HashMap<_, _> = own_files(&*up).into_iter().collect();
             let mut v: Vec<_> = inputs.paths.iter().map(|(p, (stamp, _))| (p.clone(), loaded.get(p).copied().unwrap_or(u32::MAX), *stamp)).collect();
             for (p, i) in loaded {
@@ -4415,7 +4415,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     // the hot set: the program's own package (its root crate's directory) and every file saved
     // this session, polled every 5 ms (a few stats); every file is polled every 100 ms
     let mut hot: Vec<usize> = {
-        let dir = crate::owner::call_quick(crate::owner::Class::Program, || {
+        let dir = crate::owner::call(crate::owner::Class::Program, || {
             let u = &*up;
             let root = crate::layout::root_crate() as usize;
             u.prog.crates.get(root).and_then(|c| u.prog.mods.get(c.root_mod as usize)).and_then(|m| u.prog.file_paths.get(m.file as usize)).and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_string_lossy().into_owned()))
@@ -4459,7 +4459,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 inputs = next;
                 inputs.add_runner();
             }
-            let loaded = crate::owner::call_quick(crate::owner::Class::Program, || own_files(&*up));
+            let loaded = crate::owner::call(crate::owner::Class::Program, || own_files(&*up));
             files = inputs.paths.iter().map(|(p, (s, _))| (p.clone(), u32::MAX, *s)).collect();
             for (path, file) in loaded {
                 if let Some(f) = files.iter_mut().find(|f| f.0 == path) { f.1 = file; }
@@ -4492,7 +4492,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if loads != loads_seen || rewatched {
             loads_seen = loads;
             let t_own = Instant::now();
-            let loaded = crate::owner::call_quick(crate::owner::Class::Program, || own_files(&*up));
+            let loaded = crate::owner::call(crate::owner::Class::Program, || own_files(&*up));
             if std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() { eprintln!("makepad live: rewatch (loads {loads}, startup scan {rewatched}): own files in {:.1} ms at t={:.0} ms", t_own.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
             let known: std::collections::HashMap<_, _> = files.iter().enumerate().map(|(i, f)| (f.0.clone(), i)).collect();
             let mut added = Vec::new();
@@ -4657,6 +4657,17 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             last = changed.iter().map(|&k| stamp(&files[k].0)).collect();
             if seen.elapsed().as_millis() > 2000 {
                 break;
+            }
+        }
+        // A moved lockfile or manifest (any landing moves the checkout's) is this app's only when
+        // its own resolved graph moved; else there is nothing to rebuild or restart.
+        let manifests: Vec<usize> = changed.iter().copied().filter(|&k| inputs.is_manifest(&files[k].0)).collect();
+        if !manifests.is_empty() && !inputs.graph_moved(&(*up).prog.session) {
+            eprintln!("makepad live: {} manifest(s) changed, this app's Cargo graph did not", manifests.len());
+            for &k in &manifests { files[k].2 = stamp(&files[k].0); stalled.remove(&k); }
+            changed.retain(|k| !manifests.contains(k));
+            if changed.is_empty() {
+                continue;
             }
         }
         if synced {
