@@ -31,6 +31,18 @@ pub struct Inputs {
     graph: Option<ResolvedGraph>,
 }
 
+/// Whether `path` lies in another OS's source tree (`src/backend/linux/..`, `src/os/windows/..`):
+/// such a file is no input of this app. Build scripts declare whole crates as their inputs, so
+/// cargo's dep-info lists these too; only the directory names tell them apart.
+fn other_os(path: &Path) -> bool {
+    const OURS: &[&str] = if cfg!(target_vendor = "apple") { &["apple", "macos", "ios"] }
+        else if cfg!(target_os = "windows") { &["windows"] }
+        else if cfg!(target_os = "android") { &["android", "linux"] }
+        else { &["linux"] };
+    path.iter().filter_map(|c| c.to_str()).skip_while(|c| *c != "src")
+        .any(|c| matches!(c, "apple" | "macos" | "ios" | "linux" | "windows" | "android") && !OURS.contains(&c))
+}
+
 /// What a resolved graph is: its units (packages with their versions, targets, features and
 /// dependency edges). A lockfile or manifest change that leaves this alone is not this app's.
 fn graph_shape(units: &crate::unitgraph::Units) -> u64 {
@@ -42,6 +54,7 @@ fn graph_shape(units: &crate::unitgraph::Units) -> u64 {
 
 impl Inputs {
     fn insert(&mut self, path: &Path, kind: Kind) {
+        if other_os(path) { return; }
         let path = path.to_string_lossy().into_owned();
         let stamp = super::stamp(&path);
         self.paths.insert(path, (stamp, kind));
@@ -138,12 +151,8 @@ impl Inputs {
             }
             out
         });
-        // a provided crate's file this binary is not built from (another OS's) is no input of it
-        if !runner.is_empty() {
-            let built: BTreeSet<&Path> = runner.iter().flat_map(|(path, _)| Path::new(path).ancestors()).collect();
-            self.paths.retain(|path, (_, kind)| *kind != Kind::Provided || built.contains(Path::new(path)));
-        }
         for (path, stamp) in runner {
+            if other_os(Path::new(path)) { continue; }
             self.paths.entry(path.clone()).or_insert((*stamp, Kind::Runner));
         }
     }
