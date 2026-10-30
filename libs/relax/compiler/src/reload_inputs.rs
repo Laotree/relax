@@ -146,6 +146,9 @@ impl Inputs {
             let mut out = Vec::new();
             for path in dep_info_paths(&text) {
                 if target.as_ref().is_some_and(|t| Path::new(&path).starts_with(t)) { continue; }
+                // the devhub linked into the binary (its CLI) is no part of a running app: no
+                // "Update ready" on every app for a devhub landing
+                if path.contains("/libs/devhub/") { continue; }
                 let stamp = super::stamp(&path).filter(|s| built.is_none_or(|b| s.0 <= b));
                 out.push((path, stamp));
             }
