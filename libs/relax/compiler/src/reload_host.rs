@@ -286,6 +286,9 @@ fn take() -> Option<Handover> {
 /// restarts into it with `state`, and does not return. False: no binary waits (the caller
 /// restarts as before), or the restart did not happen (said why; the app keeps running).
 pub(super) fn restart_now(state: &[u8]) -> bool {
+    if super::pinned() {
+        return false;
+    }
     match take() {
         Some(h) if super::dock_app() && !super::RESTART_CONFIRMED.swap(false, std::sync::atomic::Ordering::SeqCst) => {
             // a dock app's restart into a rebuilt makepad waits for the person (`session relaunch`)
@@ -298,7 +301,19 @@ pub(super) fn restart_now(state: &[u8]) -> bool {
     }
 }
 
+/// Unpinned: a rebuilt makepad that waited takes over now.
+pub(super) fn unpinned() {
+    if let Some(h) = take() {
+        restart(h, None);
+    }
+}
+
 fn restart(h: Handover, state: Option<&[u8]>) {
+    // pinned: the binary waits for the unpin
+    if super::pinned() {
+        *HANDOVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+        return;
+    }
     let _k = crate::zone_alloc::kept();
     super::RESTART_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
     // changed since the build: that binary is already stale (a provided crate would refuse it)

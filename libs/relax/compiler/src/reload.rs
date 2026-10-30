@@ -3368,6 +3368,25 @@ fn ms(t0: Instant) -> f64 {
 static RESTART_SUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// A restart is due (an edit needs one); the program polls this at its safe point.
 static RESTART_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The app is pinned: the live watch stands still and a rebuilt makepad waits.
+static PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Unpinned: the watch's next round looks at every file.
+static CATCH_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `inspect pin on|off`: while on, no edit or landing reaches the running app and it does not
+/// restart; off, it catches up (patches, or the rebuilt makepad that waited). Returns the state.
+pub(crate) fn set_pinned(on: bool) -> bool {
+    let was = PINNED.swap(on, std::sync::atomic::Ordering::AcqRel);
+    if was && !on {
+        CATCH_UP.store(true, std::sync::atomic::Ordering::Release);
+        host::unpinned();
+    }
+    on
+}
+
+pub(crate) fn pinned() -> bool {
+    PINNED.load(std::sync::atomic::Ordering::Acquire)
+}
 static RESTART_REASON: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
 /// When the edit that asked for the restart was saved (unix ms): the restarted run's report
 /// measures save -> back on screen from it (MAKEPAD_RUN_RESTART_T0).
@@ -4438,6 +4457,12 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     let mut restart_required = false;
     let mut revision = 0;
     loop {
+        // pinned (`inspect pin on`, an operation runs on this app): no edit or landing reaches it
+        // and it does not restart; on unpin one whole scan catches up
+        if PINNED.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
+        }
         // native file events: sleep on them while nothing else is in flight (startup, a domain
         // loading, verdicts pending, a refused edit to retry, an open stream); else the 5 ms
         // poll. Other inputs wake it (watch_events::kick); one look a second regardless.
@@ -4577,7 +4602,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if lost { events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str())); }
         // a sync moved the dock app's checkout: every file is compared with what runs
         let synced = dock.as_mut().is_some_and(DockGate::synced);
-        let all = lost || rewatched || synced || (events.is_none() && tick % 20 == 0);
+        let caught_up = CATCH_UP.swap(false, std::sync::atomic::Ordering::AcqRel);
+        let all = lost || rewatched || synced || caught_up || (events.is_none() && tick % 20 == 0);
         let t_round = std::time::Instant::now();
         let mut changed: Vec<usize> = Vec::new();
         let mut scanned = 0;
