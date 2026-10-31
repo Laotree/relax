@@ -1959,7 +1959,7 @@ static HARNESS_RUN: AtomicBool = AtomicBool::new(false);
 /// them first: an unresolved import or a type error anywhere in them fails the run, not only the
 /// test that reaches it (a test whose body did not compile used to fail alone at run time while
 /// the others passed). Prints the errors as `makepad check` does; returns their count.
-fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], harness: bool) -> usize {
+pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], harness: bool) -> usize {
     u.tcx.check_coherence_of(&u.prog, Some(subjects));
     let mut pre: Vec<String> = Vec::new();
     let derive = crate::macro_reg::derive_failures();

@@ -976,7 +976,7 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     pa.extend(args[1..].iter().filter(|a| a.as_str() != "--").map(|a| a.clone().into_bytes()));
     jit::set_program_args(pa);
     let t0 = Instant::now();
-    let (prog, core, krate) = match load_with_std(sess, root, "test_crate", true) {
+    let (mut prog, core, krate) = match load_with_std(sess, root, "test_crate", true) {
         Ok(x) => x,
         Err(e) => {
             for m in e {
@@ -988,9 +988,20 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     // the crate under test is the program's own crate (run.rs): its #![recursion_limit] and
     // #![type_length_limit] govern monomorphization (TypingEnv::fully_monomorphized)
     crate::layout::set_root_crate(krate);
+    // the file is checked whole before any test runs, as `rustc --test` compiles it first (the
+    // package form's up-front check, run.rs test_subjects); marked before collection
+    crate::borrowck::event::set_check_scope();
+    let mut own = vec![false; prog.crates.len()];
+    own[krate as usize] = true;
+    prog.crates[krate as usize].validate = true;
+    prog.own_crates = own.clone();
+    relax_types::lint::enable();
+    prog.run_import_sim(&own);
     let t1 = Instant::now();
     let mut tcx = tcx::Tcx::new();
-    tcx.collect(&prog);
+    // (coherence evaluates the constants of impl headers, which needs the unit's evaluator: it runs
+    // in the up-front check below, as in the package form)
+    tcx.collect_declarations(&prog);
     if !tcx.errors.is_empty() {
         for m in &tcx.errors {
             eprintln!("error: {}", m);
@@ -1004,6 +1015,11 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     if !enum_errors.is_empty() {
         for error in enum_errors { eprintln!("error: {}", error); }
         return 1;
+    }
+    let check_errors = run::check_test_subjects(&mut u, krate, &[krate], true);
+    if check_errors > 0 {
+        eprintln!("error: could not compile `{root}` (test) due to {check_errors} previous error{}: no test ran", if check_errors == 1 { "" } else { "s" });
+        return 101;
     }
     jit::enable_pipelining(options);
     println!(
