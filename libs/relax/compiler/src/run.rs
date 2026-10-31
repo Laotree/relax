@@ -3628,6 +3628,12 @@ fn summary_inner(why: &str) {
             }
             let _ = std::fs::write(path, out);
         }
+        // (rwbench's run.py reads this line)
+        if VERBOSE.load(Ordering::Relaxed) && u.tier1.is_some() {
+            let stuck = jit::tier_stuck(u);
+            let why: Vec<String> = jit::tier_stuck_reasons(&stuck).iter().take(4).map(|(w, ids)| format!("{} x {} (e.g. {})", ids.len(), w, u.fns[ids[0] as usize].name)).collect();
+            verbose!("makepad-run: O3 stuck: {} hot fns below O3 with nothing pending{}{}", stuck.len(), if why.is_empty() { "" } else { ": " }, why.join("; "));
+        }
         let q = jit::TIER_QUEUED.load(Ordering::Relaxed);
         if q > 0 {
             verbose!(

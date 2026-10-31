@@ -5867,16 +5867,51 @@ impl Unit {
         owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).const_addr(d, args) })
     }
 
-    /// An inline const block's value from shared lowering (ctfe::eval_const_block, a unit call
-    /// as const_addr_shared).
-    pub fn const_block_shared(&self, body: &crate::typeck::Body, bl: crate::ast::BlockId, t: TyId) -> Option<Vec<u8>> {
-        owner::call(owner::Class::Job, || unsafe { crate::ctfe::eval_const_block(&mut *self.self_ptr.0, body, bl, t) })
+    /// An inline const block's value from shared lowering (ctfe::eval_const_block): evaluated once
+    /// per instance (FrontShared::body_consts). None: lowered as code; in a background build's
+    /// front, one the owner has not evaluated yet (want_body_const).
+    pub fn const_block_shared(&self, body: &crate::typeck::Body, bl: crate::ast::BlockId, t: TyId, parent: u32) -> Option<Vec<u8>> {
+        let what = BodyConst::Block(bl, t);
+        if let Some(v) = self.front.body_consts.get(&what.key(self, parent)) {
+            return (v.0 != 0).then(|| unsafe { std::slice::from_raw_parts(v.0 as *const u8, v.1 as usize) }.to_vec());
+        }
+        if want_body_const(self, body, parent, what) {
+            return None;
+        }
+        owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).const_block(body, bl, t, parent) })
+    }
+
+    fn const_block(&mut self, body: &Body, bl: crate::ast::BlockId, t: TyId, parent: u32) -> Option<Vec<u8>> {
+        let bytes = crate::ctfe::eval_const_block(self, body, bl, t);
+        let _k = crate::zone_alloc::kept();
+        let v = bytes.as_ref().map_or((0, 0), |b| (Box::leak(b.clone().into_boxed_slice()).as_ptr() as u64, b.len() as u32));
+        self.front.body_consts.insert(BodyConst::Block(bl, t).key(self, parent), v);
+        bytes
     }
 
     /// rustc_mir_transform/src/promote_consts.rs: Promoter::promote_temp. Evaluate the
     /// extracted expression once; unsupported CTFE uses a compiled initializer, never runtime stores.
-    pub fn promoted_addr_shared(&self, body: &Body, e: crate::ast::ExprId, t: TyId, parent: u32) -> Result<u64, String> {
-        owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).eval_promoted(body, e, t, parent) })
+    /// None: a background build's front, whose lowering goes on without the value (want_body_const).
+    pub fn promoted_addr_shared(&self, body: &Body, e: crate::ast::ExprId, t: TyId, parent: u32) -> Result<Option<u64>, String> {
+        let what = BodyConst::Promoted(e, t);
+        if let Some(v) = self.front.body_consts.get(&what.key(self, parent)) {
+            return Ok(Some(v.0));
+        }
+        if want_body_const(self, body, parent, what) {
+            return Ok(None);
+        }
+        owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).promoted_addr(body, e, t, parent) }).map(Some)
+    }
+
+    fn promoted_addr(&mut self, body: &Body, e: crate::ast::ExprId, t: TyId, parent: u32) -> Result<u64, String> {
+        let key = BodyConst::Promoted(e, t).key(self, parent);
+        if let Some(v) = self.front.body_consts.get(&key) {
+            return Ok(v.0);
+        }
+        let a = self.eval_promoted(body, e, t, parent)?;
+        let _k = crate::zone_alloc::kept();
+        self.front.body_consts.insert(key, (a, 0));
+        Ok(a)
     }
 
     fn eval_promoted(&mut self, body: &Body, e: crate::ast::ExprId, t: TyId, parent: u32) -> Result<u64, String> {
@@ -12782,6 +12817,10 @@ fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(re
         FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) => {}
     }
     lcx.finish();
+    // (every value it was missing is noted now: the front makes it again after the owner's drain)
+    if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) && LOWER_AHEAD_IDS.with(|a| a.borrow().wanted) {
+        lower_ahead_needs_unit();
+    }
     u.fns[id as usize].d3_lowered.store(lcx.lowers_disjoint_checks(), Ordering::Relaxed);
     // A branch on a known constant was folded (check only) on the strength of registers written
     // once so far; registers are not SSA, so a later write (a loop assigning the variable) voids
@@ -15766,6 +15805,48 @@ pub(crate) fn tier_uncounted(u: &Unit) -> Vec<u32> {
     v
 }
 
+/// The slots stuck below O3 (tier_explain's STUCK verdicts): their calls turned hot and stopped
+/// being counted, their code is not O3, and nothing will build it: no queue, build, counted window
+/// or verdict is pending. With each its verdict. Unit read (owner job).
+pub(crate) fn tier_stuck(u: &Unit) -> Vec<(u32, String)> {
+    if u.tier1.is_none() {
+        return Vec::new();
+    }
+    let mut v = Vec::new();
+    for id in 0..u.fns.len() as u32 {
+        let f = &u.fns[id as usize];
+        if !f.compiled || f.code_len == 0 || unsafe { (*tier_rec(&u.slots, id).add(3)).load(Ordering::Relaxed) } != T_QUEUED {
+            continue;
+        }
+        if matches!(crate::inspect::codever::kind_at(u, f.code).tier, tier::O3 | tier::GUARDED | tier::INSTRUMENTED_O3) {
+            continue;
+        }
+        let (verdict, _) = tier_explain(u, id);
+        if verdict.starts_with(STUCK_VERDICT) {
+            v.push((id, verdict));
+        }
+    }
+    v
+}
+
+/// The stuck slots of `tier_stuck` by reason: the most common first (reason, slots, first slots)
+pub(crate) fn tier_stuck_reasons(stuck: &[(u32, String)]) -> Vec<(String, Vec<u32>)> {
+    let mut by: Vec<(String, Vec<u32>)> = Vec::new();
+    for (id, verdict) in stuck {
+        // (the reason names no slot: the verdict's own text)
+        let why = verdict.trim_start_matches(STUCK_VERDICT).trim_start_matches(": ").to_string();
+        match by.iter_mut().find(|x| x.0 == why) {
+            Some(x) => x.1.push(*id),
+            None => by.push((why, vec![*id])),
+        }
+    }
+    by.sort_by_key(|x| std::cmp::Reverse(x.1.len()));
+    by
+}
+
+/// How tier_explain's verdict starts for a slot nothing will build at O3 (tier_stuck)
+const STUCK_VERDICT: &str = "STUCK below O3";
+
 /// makepad inspect `why-tier`: slot `id`'s tier-up state now, in one verdict (why it is or is not at
 /// O3, answer first) and the evidence rows `(what, state)`: the tier record (count stub armed,
 /// its call weight, the decayed cost against the threshold, the loop counter), the O3 queue, the
@@ -15890,7 +15971,7 @@ pub(crate) fn tier_explain(u: &Unit, id: u32) -> (String, Vec<(String, String)>)
         match last_drop {
             Some(e) if retiers >= 4 => format!("STUCK below O3: its last O3 build was {} and its 4 retiers are used up; marked queued, so its calls are not counted again", tl::describe(&e, &kind).trim_start_matches("O3 build ")),
             Some(e) => format!("STUCK below O3: marked queued (calls not counted) but in no queue; its last O3 attempt: {}", tl::describe(&e, &kind)),
-            None if n(tl::ev::O3_INSTALLED) > 0 => "was at O3; its code now is not (a patch, pin or rebuild replaced it) and it is marked queued, so its calls are not counted".into(),
+            None if n(tl::ev::O3_INSTALLED) > 0 => "STUCK below O3: was at O3; its code now is not (a patch, pin or rebuild replaced it) and it is marked queued, so its calls are not counted".into(),
             None => "STUCK below O3: marked queued (calls not counted) but in no queue, and no O3 attempt recorded".into(),
         }
     } else {
@@ -17559,10 +17640,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // small inline candidates stay there). Warm Stage: single snapshots of 100-680 ms on the owner.
     let prefront = !owner::is_owner() && !t1prof_on(options) && pipelined();
     let mut fronted: std::collections::HashSet<u32> = Default::default();
-    // slots whose front named a constant or thread-local the owner had not made yet (noted for
-    // its const_drain): fronted again in the next round, each up to REFRONTS times
-    let mut refronted: HashMap<u32, u8> = Default::default();
-    const REFRONTS: u8 = 3;
     // (slot, def, args, the base of an unverified-mode twin: its body is the base's, lowered as unverified code)
     let fronts: std::cell::RefCell<Vec<(u32, DefId, Vec<TyId>, Option<u32>)>> = Default::default();
     // O1 builds a round's walk met that this thread prepares through a take and optimises itself
@@ -17948,25 +18025,13 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         // is needed again after it: lowering ahead refused it) is left out of the snapshot; only
         // the root's own front failing drops the build. (Dropping the root for a candidate kept
         // warm-image code -- every body without its checked body -- at baseline: MICKEYGAP.)
-        // A front that named a constant or thread-local nobody made in this run yet noted it for the
-        // owner, who makes it before its next request (const_drain): that front is tried once more
-        // in the next round instead of leaving the candidate a call (or dropping the root) for the
-        // build -- nothing rebuilds a root for a callee that becomes inlinable later.
         Err(b) if rounds < O3_TAKE_ROUNDS && !b.slots.is_empty() && b.slots.iter().fold(true, |ok, &s| {
-            let noted = want_notes();
             let made = fronted.insert(s) && prefront_slot(&front, s);
-            let again = !made && want_notes() != noted && {
-                let n = refronted.entry(s).or_insert(0);
-                *n += 1;
-                *n <= REFRONTS
-            };
-            if again {
-                fronted.remove(&s);
-            } else if !made && s != id {
+            if !made && s != id {
                 // from the next round on, a candidate needing a front is left out (bail_for_fronts)
                 fronts_done.set(true);
             }
-            ok && (made || again || s != id)
+            ok && (made || s != id)
         }) => {
             continue;
         }
@@ -21659,15 +21724,36 @@ pub(crate) fn prefront_site_summary() -> String {
         .map(|(k, n)| format!("{} {} ({:.0} ms)", n, PREFRONT_SITE[k][0].load(Ordering::Relaxed), PREFRONT_SITE[k][1].load(Ordering::Relaxed) as f64 / 1e6)).collect::<Vec<_>>().join(", ")
 }
 
+/// Fronts of one slot prefront_slot makes around the owner's evaluations: what one lowering could
+/// not note until an earlier value was there (a static a promoted's lowering names), and a value
+/// that does not evaluate, which leaves the front failed (a build's own lowering reports it)
+const WANT_ROUNDS: usize = 4;
+
 /// Type-checks and lowers slot `id` on this thread, off the owner (its build takes the RIR,
 /// take_lowered_ahead). False: nothing to take (not a plain instance, or lowering ahead refused
-/// it: a body that names constants, a trait shim, a provided crate's function).
+/// it: a trait shim, a provided crate's function). What its lowering finds unevaluated (constants,
+/// statics, a body's promoted constants) goes to the owner, which evaluates it (rule I-PURE:
+/// const_drain, this thread holding nothing while it waits), and the front is made again. Every
+/// path to a build's front comes here: no build gives up on a value only the owner can make.
 fn prefront_slot(front: &FrontShared, id: u32) -> bool {
     if owner::is_owner() {
         return prefront_fail(AF_OTHER);
     }
-    // (constants its lowering finds unevaluated go to the owner: const_drain)
     let _want = WantConsts::on();
+    for _ in 0..WANT_ROUNDS {
+        let noted = want_notes();
+        if prefront_slot_once(front, id) {
+            return true;
+        }
+        if want_notes() == noted {
+            return false;
+        }
+        owner::call(owner::Class::Job, const_drain);
+    }
+    false
+}
+
+fn prefront_slot_once(front: &FrontShared, id: u32) -> bool {
     match front.slot_keys.get(&id) {
         Some(FnKey::Closure(..)) => return prefront_closure(front, id),
         Some(FnKey::Plain(base)) => return prefront_twin(front, id, base),
@@ -21693,7 +21779,7 @@ fn prefront_slot(front: &FrontShared, id: u32) -> bool {
         prefront_fail(why);
         if tier1_trace() {
             let r = front_read("O3 front trace");
-            eprintln!("O3 front of #{} not made off the owner: {} ({})", id, PREFRONT_FAIL_NAMES[why as usize], r.unit_of(front).prog.def_path(d));
+            eprintln!("O3 front of #{} not made off the owner: {} ({}) at {:?}", id, PREFRONT_FAIL_NAMES[why as usize], r.unit_of(front).prog.def_path(d), NEEDS_UNIT_AT.try_with(|a| a.get()).ok().flatten().map(|l| (l.file(), l.line())));
         }
     }
     ok
@@ -21760,6 +21846,7 @@ fn prefront_closure(front: &FrontShared, id: u32) -> bool {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         LOWERING_AHEAD.with(|a| a.set(true));
         let _guard = LowerAheadGuard;
+        LOWER_AHEAD_IDS.with(|a| a.borrow_mut().body = Some(body.clone()));
         let (func, _) = lower_checked_body(u, id, &key, &body)?;
         let (callees, consts, tls) = LOWER_AHEAD_IDS.with(|a| { let mut a = a.borrow_mut(); (std::mem::take(&mut a.keys), std::mem::take(&mut a.consts), std::mem::take(&mut a.tls)) });
         Ok::<_, String>(LoweredAhead { epoch, file: u.fns[id as usize].file, func, body: Some(body.clone()), callees, consts, tls })
@@ -21814,9 +21901,8 @@ fn prefronted(id: u32) {
 
 /// The take of a background build (rules I-PUB, I-PURE): `take` runs as a publish that may run no
 /// front; a slot it needed a front for is fronted here (`prefront_slot`) and `take` runs again.
-/// A slot is fronted again when its front failed only for constants the owner evaluates between
-/// two requests (want_notes), or when its lowering was taken and is needed again (each slot at
-/// most FRONT_TRIES times). `leave_out` (O2 builds): once an inline candidate's front cannot be
+/// A slot is fronted again when its lowering was taken and is needed again (each slot at most
+/// FRONT_TRIES times). `leave_out` (O2 builds): once an inline candidate's front cannot be
 /// made, a last round builds without the candidates that still need fronts (they stay calls,
 /// FRONTS_DONE, as O3's snapshot leaves them out). None: the build bails (a front lowering ahead
 /// cannot make, an initializer, JIT code, a wait; counted in owner::BAILS and, with its cause, in
@@ -21858,13 +21944,9 @@ fn take_prefronted<R>(front: &FrontShared, leave_out: Option<u32>, mut take: imp
                         continue;
                     }
                     let _ = PREFRONT_WHY.try_with(|w| w.set(AF_OK));
-                    let notes = want_notes();
                     if !prefront_slot(front, s) {
                         let af = PREFRONT_WHY.try_with(|w| w.get()).unwrap_or(AF_OK);
-                        // constants or statics noted for the owner's drain (between two requests):
-                        // the next round's front can make it
-                        let retry = want_notes() != notes;
-                        if !retry && failed.is_none() {
+                        if failed.is_none() {
                             failed = Some((s, af, true));
                         }
                     }
@@ -22309,6 +22391,10 @@ pub struct FrontShared {
     /// `#[thread_local]` statics the owner placed (Unit::thread_local_place), read by lowering
     /// ahead as `consts` (checked at the take against Unit::tls_places)
     tls: crate::conc::MemoMap<DefId, TlsPlace>,
+    /// What the owner evaluated once for a body (BodyConst::key: its promoted constants' data, its
+    /// inline const blocks' bytes): any thread's lowering reads it here, the tiers of one instance
+    /// share one value. A source change bumps the epoch in the key, so nothing stale is read.
+    body_consts: crate::conc::MemoMap<(u64, u32, u32, bool), (u64, u32)>,
     /// Until the first present, `helpers` threads type-check every new slot's body ahead (queue
     /// of slots): a cold start's main thread finds most bodies it calls checked
     /// (MAKEPAD_RUN_AHEAD_HELPERS=n; default ahead_helpers()). After it they serve the UI
@@ -22390,6 +22476,7 @@ impl FrontShared {
             // (`makepad check` (const_fuel) only reports diagnostics: no lowering ahead -- an ahead
             // helper's lowering of main raced the exit with its layout errors, limits/issue-55878)
             tls: crate::conc::MemoMap::with_bits(8),
+            body_consts: crate::conc::MemoMap::with_bits(12),
             helpers: if options.tyck_ahead && !options.const_fuel { options.ahead_helpers.unwrap_or_else(ahead_helpers) } else { 0 },
             live_helpers: std::sync::atomic::AtomicU32::new(0),
             ahead_post: Default::default(),
@@ -22647,6 +22734,10 @@ struct AheadFnIds {
     consts: Vec<(DefId, Vec<TyId>, u64)>,
     /// thread-local places read from FrontShared::tls (LoweredAhead::tls)
     tls: Vec<(DefId, TlsPlace)>,
+    /// the checked body being lowered (want_body_const hands it to the owner)
+    body: Option<std::sync::Arc<Body>>,
+    /// a value of the body's the owner evaluates (want_body_const): the lowering is thrown away
+    wanted: bool,
 }
 
 struct LowerAheadGuard;
@@ -22877,6 +22968,7 @@ fn lower_ahead_as(u: &Unit, into: u32, base: u32, d: DefId, args: &[TyId], epoch
         // an instance that does not normalize is the locked build's to report
         let Some(body) = crate::typeck::try_codegen_body(&u.prog, &u.tcx, d, args) else { return Err("body does not normalize".to_string()) };
         if plain.is_some() && !lowers_ahead(u, d, &body, true) { return Err("not lowered ahead".to_string()) }
+        LOWER_AHEAD_IDS.with(|a| a.borrow_mut().body = Some(body.clone()));
         let (func, closures) = lower_checked_body(u, base, &fn_key, &body)?;
         let (callees, consts, tls) = LOWER_AHEAD_IDS.with(|a| { let mut a = a.borrow_mut(); (std::mem::take(&mut a.keys), std::mem::take(&mut a.consts), std::mem::take(&mut a.tls)) });
         // a twin's closures are its base's (their bodies come with the base's own lowering)
@@ -24095,6 +24187,9 @@ mod settle_tests;
 #[cfg(test)]
 #[path = "inspect_tiers_tests.rs"]
 mod inspect_tiers_tests;
+#[cfg(test)]
+#[path = "tier_stuck_tests.rs"]
+mod tier_stuck_tests;
 
 #[cfg(test)]
 mod allocator_swap_tests {
@@ -24932,8 +25027,8 @@ thread_local! {
     static WANT_CONSTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 thread_local! {
-    /// wants this thread noted (CONSTS_WANTED pushes): a front that failed for one is worth a retry
-    /// once the owner drained them
+    /// wants this thread noted (CONSTS_WANTED pushes): a front that failed for one is made again
+    /// after the owner's drain (prefront_slot)
     static WANT_NOTES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 fn want_notes() -> u32 {
@@ -24994,6 +25089,58 @@ enum Wanted {
     /// a slot's callable address (Unit::entry: a vtable's method, a callable hook's first escape),
     /// by key: a lowering ahead names a new slot by a temporary identity only
     Entry(FnKey),
+    /// a value of a body (BodyConst): slot, what, the checked body it is evaluated in
+    Body(u32, BodyConst, BodyArc),
+}
+
+/// A value the lowering of a body evaluates once: a promoted constant, an inline const block.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum BodyConst {
+    Promoted(crate::ast::ExprId, TyId),
+    Block(crate::ast::BlockId, TyId),
+}
+
+impl BodyConst {
+    /// FrontShared::body_consts's key for slot `slot`'s body: a slot is one instance, and its
+    /// expressions keep their meaning until a source change, which bumps the epoch
+    fn key(self, u: &Unit, slot: u32) -> (u64, u32, u32, bool) {
+        let (at, block) = match self {
+            BodyConst::Promoted(e, _) => (e.0, false),
+            BodyConst::Block(b, _) => (b.0, true),
+        };
+        (u.tcx.collect_epoch.load(Ordering::SeqCst), slot, at, block)
+    }
+}
+
+/// The body of a Wanted::Body: compared by address (one slot's value is noted under its one body)
+#[derive(Clone)]
+struct BodyArc(std::sync::Arc<Body>);
+impl PartialEq for BodyArc {
+    fn eq(&self, o: &BodyArc) -> bool { std::sync::Arc::ptr_eq(&self.0, &o.0) }
+}
+impl Eq for BodyArc {}
+impl std::hash::Hash for BodyArc {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) { std::sync::Arc::as_ptr(&self.0).hash(h) }
+}
+
+/// A background build's front (WANT_CONSTS, lowering ahead) reached value `what` of slot `slot`'s
+/// body, not evaluated yet: noted for the owner, and the lowering goes on without it so one lowering
+/// notes every such value of the body (a fn with ten panics names ten promoted format pieces); it
+/// ends at lower_checked_body. False: not such a lowering: the caller asks the owner, which ends a
+/// helper's speculative lowering.
+fn want_body_const(u: &Unit, body: &Body, slot: u32, what: BodyConst) -> bool {
+    if !LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) || !WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
+        return false;
+    }
+    let held = LOWER_AHEAD_IDS.with(|a| {
+        let mut a = a.borrow_mut();
+        let b = a.body.as_ref().filter(|b| std::ptr::eq(std::sync::Arc::as_ptr(b), body)).cloned();
+        a.wanted |= b.is_some();
+        b
+    });
+    let Some(b) = held else { return false };
+    want(Wanted::Body(slot, what, BodyArc(b)), u.tcx.collect_epoch.load(Ordering::SeqCst));
+    true
 }
 
 /// Owner, before each request: the constants CONSTS_WANTED names, evaluated into FrontShared::consts
@@ -25022,6 +25169,25 @@ pub(crate) fn const_drain() {
                 let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.entry(id))).is_ok();
                 if ahead_trace() {
                     eprintln!("const-drain: entry of {} {}", u.fns[id as usize].name, if ok { "taken" } else { "failed" });
+                }
+                continue;
+            }
+            Wanted::Body(slot, what, body) => {
+                if u.front.body_consts.get(&what.key(u, slot)).is_some() {
+                    continue;
+                }
+                // as the slot's own lowering: its reader of the constants this evaluation reads
+                // (a patch of one rebuilds the slot), a deferred retry of this evaluation only
+                let depth = BUILD_STACK.with(|s| { let mut s = s.borrow_mut(); s.push(slot); s.len() - 1 });
+                let deferred = DEFERRED_ABORT.with(|a| a.replace(false));
+                let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match what {
+                    BodyConst::Promoted(e, t) => u.promoted_addr(&body.0, e, t, slot).is_ok(),
+                    BodyConst::Block(bl, t) => { u.const_block(&body.0, bl, t, slot); true }
+                })).unwrap_or(false);
+                DEFERRED_ABORT.with(|a| a.set(deferred));
+                BUILD_STACK.with(|s| s.borrow_mut().truncate(depth));
+                if ahead_trace() {
+                    eprintln!("const-drain: a value of the body of {} {}", u.fns[slot as usize].name, if ok { "evaluated" } else { "failed" });
                 }
                 continue;
             }

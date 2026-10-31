@@ -5844,10 +5844,16 @@ impl<'a> Lcx<'a> {
         // the initializer; it never runs again in the borrowing function.
         if shared && !self.const_init && self.layout(xt).size > 0 && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), xt) {
             match self.u.promoted_addr_shared(self.b, x, xt, self.cur_fn) {
-                Ok(addr) => {
+                Ok(Some(addr)) => {
                     let s = self.u.data_sym(addr);
                     let p = self.f.vreg(Cls::I);
                     self.emit(Inst::Addr(p, s));
+                    return Some(p);
+                }
+                // a front that goes on to note the body's other values; this lowering is dropped
+                Ok(None) => {
+                    let p = self.f.vreg(Cls::I);
+                    self.emit(Inst::Iconst(p, 1));
                     return Some(p);
                 }
                 Err(e) => {
