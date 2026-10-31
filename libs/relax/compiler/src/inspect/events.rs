@@ -342,7 +342,7 @@ pub fn release_domain(domain: crate::domain::DomainId) {
 pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
     let unwinds = !regs.is_null();
     let _k = crate::zone_alloc::kept();
-    if !super::STARTED.load(Relaxed) || crate::owner::is_owner() || super::probes::in_probe() || super::eval::in_eval() {
+    if !super::STARTED.load(Relaxed) || super::TEST_RUN.load(Relaxed) || crate::owner::is_owner() || super::probes::in_probe() || super::eval::in_eval() {
         return;
     }
     let domain = crate::domain::current_app_domain();
