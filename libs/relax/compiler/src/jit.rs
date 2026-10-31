@@ -1616,6 +1616,7 @@ pub(crate) fn fork_child() {
     // the child has no workers: nothing waits at the job gate, no job is running elsewhere
     TIER_STOP.store(true, Ordering::SeqCst);
     BG_ACTIVE.store(JOB_DEPTH.with(|d| (d.get() > 0) as u32), Ordering::SeqCst);
+    BG_DRAINED.store(false, Ordering::SeqCst);
     BG_PAUSE.store(false, Ordering::SeqCst);
     BG_PAUSER.store(0, Ordering::SeqCst);
     end_pause_turn();
@@ -20467,6 +20468,8 @@ pub fn begin_exit() {
 // After the swap Relax allocates from the new allocator like every library in the process
 // (Chromium forwards frees of earlier pointers to their original zone).
 
+/// The pause has drained: nothing compiles until it ends (`BG_PAUSE` alone: new jobs wait, running ones finish).
+static BG_DRAINED: AtomicBool = AtomicBool::new(false);
 static BG_PAUSE: AtomicBool = AtomicBool::new(false);
 /// thread id (me()) of the thread that paused the jobs (0: none)
 static BG_PAUSER: AtomicU64 = AtomicU64::new(0);
@@ -20569,10 +20572,22 @@ impl JobIdle {
 
 impl Drop for JobIdle {
     fn drop(&mut self) {
-        if self.0 {
-            // back through the job gate: a pause that began meanwhile holds this job too
-            JOB_DEPTH.with(|d| d.set(d.get() - 1));
-            std::mem::forget(job_gate());
+        if !self.0 {
+            return;
+        }
+        // A job that began goes on while a pause only drains: what it holds (a function's
+        // in-flight mark) may be what the owner waits for, and the pause waits for the owner
+        // (the allocator swap hung for good on that, 10-31). Only a pause that has drained holds it.
+        loop {
+            BG_ACTIVE.fetch_add(1, Ordering::SeqCst);
+            if !BG_DRAINED.load(Ordering::SeqCst) || BG_PAUSER.load(Ordering::SeqCst) == me() || owner::is_owner() {
+                return;
+            }
+            BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            let mut g = BG_MX.lock().unwrap_or_else(|e| e.into_inner());
+            while BG_DRAINED.load(Ordering::SeqCst) {
+                g = BG_CV.wait_timeout(g, std::time::Duration::from_millis(50)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
+            }
         }
     }
 }
@@ -20624,7 +20639,18 @@ fn pause_compile_jobs(trace: bool) {
     // long wait is logged (the jobs, what they wait for), never cut short.
     let mut next_log = 5000u128;
     let mut told = false;
-    while BG_ACTIVE.load(Ordering::SeqCst) > mine || owner::busy_for_other(me()) {
+    let busy = || BG_ACTIVE.load(Ordering::SeqCst) > mine || owner::busy_for_other(me());
+    loop {
+        if !busy() {
+            // nothing runs: from here a job that comes back from waiting holds too (JobIdle),
+            // and one that came back just now is seen by the second look
+            BG_DRAINED.store(true, Ordering::SeqCst);
+            if !busy() {
+                break;
+            }
+            BG_DRAINED.store(false, Ordering::SeqCst);
+            BG_CV.notify_all();
+        }
         if t0.elapsed().as_millis() >= next_log {
             next_log += 5000;
             if t0.elapsed().as_secs() >= 30 && !std::mem::replace(&mut told, true) {
@@ -20643,6 +20669,7 @@ fn pause_compile_jobs(trace: bool) {
 fn resume_compile_jobs(_trace: bool) {
     {
         let _g = BG_MX.lock().unwrap_or_else(|e| e.into_inner());
+        BG_DRAINED.store(false, Ordering::SeqCst);
         BG_PAUSE.store(false, Ordering::SeqCst);
         BG_PAUSER.store(0, Ordering::SeqCst);
     }
