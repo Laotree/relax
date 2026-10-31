@@ -531,15 +531,15 @@ mod tests {
         assert_eq!(p.path, "/generate");
         assert_eq!(p.authorization.as_deref(), Some("MKID mkid1.a.node.9.-.00.00.1.ff"));
         let mac: IpAddr = "192.0.2.14".parse().unwrap();
-        let peer = Peer { name: "rik-mac".into(), role: Role::Device, addr: mac, from: Some(mac), point: [4; 65], this_machine: false };
+        let peer = Peer { name: "my-mac".into(), role: Role::Device, addr: mac, from: Some(mac), point: [4; 65], this_machine: false };
         let out = String::from_utf8(p.rewrite("s3cret", &["Authorization: Bearer inner".to_string()], &peer)).unwrap();
         assert!(!out.contains("MKID"));
         assert!(out.contains("Authorization: Bearer inner\r\n"));
         assert!(!out.contains("guess") && !out.contains("admin\r\n"));
-        assert!(out.contains("X-Makepad-Client: rik-mac\r\n"));
+        assert!(out.contains("X-Makepad-Client: my-mac\r\n"));
         assert!(out.ends_with("\r\n\r\n"));
         let lines: Vec<String> = out.split("\r\n").map(String::from).collect();
-        assert_eq!(caller_from_headers(&lines, "s3cret"), Some(Caller { client_id: "rik-mac".into(), role: Role::Device, admin: true, this_machine: false, app: None }));
+        assert_eq!(caller_from_headers(&lines, "s3cret"), Some(Caller { client_id: "my-mac".into(), role: Role::Device, admin: true, this_machine: false, app: None }));
         assert_eq!(caller_from_headers(&lines, "other"), None);
         // The same credential from elsewhere is not admin behind the front either.
         let away = Peer { addr: "10.77.0.9".parse().unwrap(), ..peer };

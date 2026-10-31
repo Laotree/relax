@@ -787,10 +787,10 @@ mod tests {
     #[test]
     fn credential_text_round_trip() {
         let root = Root::generate().unwrap();
-        let mac = machine(&root, "rik-mac", Role::Device, Some("192.0.2.14".parse().unwrap()));
+        let mac = machine(&root, "my-mac", Role::Device, Some("192.0.2.14".parse().unwrap()));
         let text = mac.cred.text();
         assert_eq!(Credential::parse(&text), Some(mac.cred.clone()));
-        assert!(text.starts_with("mkid1.rik-mac.device.4000000000.0a0000de."));
+        assert!(text.starts_with("mkid1.my-mac.device.4000000000.0a4d00de."));
         let six = machine(&root, "n6", Role::Node, Some("fd00::1".parse().unwrap()));
         assert_eq!(Credential::parse(&six.cred.text()), Some(six.cred.clone()));
         assert!(Credential::parse("mkc2.a.lan.1.00").is_none());
@@ -803,11 +803,11 @@ mod tests {
         let root = Root::generate().unwrap();
         let fleet = Fleet::new(root.point(), ["stolen".to_string()].into_iter().collect());
         let mac_ip: IpAddr = "192.0.2.14".parse().unwrap();
-        let mac = machine(&root, "rik-mac", Role::Device, Some(mac_ip));
+        let mac = machine(&root, "my-mac", Role::Device, Some(mac_ip));
         let fp = [7u8; 32];
         let now = now_secs();
         let peer = fleet.check_proof(&mac.authorization(&fp), &fp, mac_ip, now).unwrap();
-        assert_eq!((peer.name.as_str(), peer.role), ("rik-mac", Role::Device));
+        assert_eq!((peer.name.as_str(), peer.role), ("my-mac", Role::Device));
         assert!(peer.admin());
         assert!(require(&peer, Need::Admin).is_ok());
         // The same credential from another address is no admin.
@@ -821,7 +821,7 @@ mod tests {
         assert_eq!(fleet.check_proof(&mac.authorization(&fp), &[8; 32], mac_ip, now), Err(Rejection::BadProof));
         assert_eq!(fleet.check_proof(&mac.authorization(&fp), &fp, mac_ip, now + PROOF_WINDOW + 5), Err(Rejection::Stale));
         let other = Root::generate().unwrap();
-        let forged = machine(&other, "rik-mac", Role::Device, Some(mac_ip));
+        let forged = machine(&other, "my-mac", Role::Device, Some(mac_ip));
         assert_eq!(fleet.check_proof(&forged.authorization(&fp), &fp, mac_ip, now), Err(Rejection::NotFleet));
         let stolen = machine(&root, "stolen", Role::Node, None);
         assert_eq!(fleet.check_proof(&stolen.authorization(&fp), &fp, mac_ip, now), Err(Rejection::Revoked));
@@ -861,7 +861,7 @@ mod tests {
         assert!(!verifier.check(&twin.authorization(&fp), ip, now).unwrap().this_machine());
         // The admin Mac is admin, not this machine.
         let mac_ip: IpAddr = "192.0.2.14".parse().unwrap();
-        let mac = machine(&root, "rik-mac", Role::Device, Some(mac_ip));
+        let mac = machine(&root, "my-mac", Role::Device, Some(mac_ip));
         let admin = verifier.check(&mac.authorization(&fp), mac_ip, now).unwrap();
         assert!(admin.admin() && !admin.this_machine());
         // Fleet-level checks never claim it.
