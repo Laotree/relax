@@ -20681,6 +20681,10 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         // (rand 0.8's ReseedingRng registers its fork handler at its first use)
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         b"pthread_atfork" => Some(host_pthread_atfork as *const () as usize),
+        // (glibc's atexit is there too; and a handler in libc's list would run after this thread's
+        // locals are gone, where a lazy compile of it cannot run: makepad-remote's socket cleanup)
+        #[cfg(unix)]
+        b"atexit" => Some(os::proc::program_atexit as *const () as usize),
         #[cfg(unix)]
         b"__relax_precompile" => Some(relax_precompile as *const () as usize),
         #[cfg(unix)]

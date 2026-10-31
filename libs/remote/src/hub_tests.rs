@@ -217,6 +217,7 @@ fn session_launch_and_kill_only_own_pids() {
 
 #[test]
 fn a_dropped_link_resumes_the_watch_feed_with_a_gap_marker() {
+    let _turn = crate::tests::WATCH_TURN.lock().unwrap_or_else(|e| e.into_inner());
     let (_, watch) = shared();
     let hub = Hub::new(&hosts());
     let relay_ep = relay_endpoint();
