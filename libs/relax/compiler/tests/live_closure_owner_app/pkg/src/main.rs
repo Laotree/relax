@@ -49,8 +49,8 @@ fn main() {
             let v: u64 = DESIGN.lock().unwrap().iter().map(|h| h(n)).sum();
             println!("out val {} {}", n, v);
         }
-        let go = std::path::Path::new("go").exists();
-        if go {
+        // (its own file: the warm-up run opens `go`, which would put `apply<closure>` in the cache)
+        if std::path::Path::new("late").exists() {
             println!("out late {} {}", n, late(true, n));
         } else {
             late(false, n);
