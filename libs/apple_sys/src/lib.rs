@@ -184,6 +184,8 @@ extern "C" {
     pub static NSPasteboardTypeFileURL: ObjcId;
     pub static NSPasteboardTypeURL: ObjcId;
     pub static NSPasteboardTypeString: ObjcId;
+    pub static NSAppearanceNameAqua: ObjcId;
+    pub static NSAppearanceNameDarkAqua: ObjcId;
 }
 
 #[link(name = "Vision", kind = "framework")]
