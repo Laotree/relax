@@ -6384,7 +6384,9 @@ impl<'a> Fcx<'a> {
                     self.cur_binop = e.0;
                     return self.check_op_trait(op, sa0, b, lo, false);
                 }
-                let tb0 = self.check_expr(b, Some(ta));
+                // No expectation: the right operand's type is `?R` of `L: Op<?R>` until it is known
+                // (rustc op.rs), so a branch of `len * if c { a } else { b }` may be a `Vec3`.
+                let tb0 = self.check_expr(b, None);
                 let sb0 = self.shallow(tb0);
                 // a primitive left operand with a non-primitive right one is an operator trait
                 // call too (`3u32 * duration`: `impl Mul<Duration> for u32`; rustc is_builtin_binop
