@@ -2119,11 +2119,6 @@ impl Cache {
         b
     }
 
-    /// The slot an encoded key names in this run (memo by the bytes).
-    fn slot_of_bytes(&mut self, u: &mut Unit, b: &[u8]) -> Option<u32> {
-        unsafe { Linker::new(self).slot_of_bytes(u, b) }
-    }
-
     /// Whether slot `id` has an entry (speculative linking only follows cached callees).
     pub fn has(&mut self, u: &Unit, id: u32) -> bool {
         match self.slot_key(u, id) {

@@ -16324,7 +16324,6 @@ impl Unit {
 /// A W32 web program (codegen web32.rs) addresses only its window: its block counters live there
 /// (web32::alloc_counters), so a wasm export's O3 bodies are built from the trace's counts.
 fn pgo_on(options: &crate::options::Options) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     !options.no_block_freq && !t1prof_replay(options)
 }
 
@@ -17618,7 +17617,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         };
     // (no TIER_ACTIVE pins for the callees: the walk and the snapshot's Arc clones are one publish,
     // and what reads TIER_ACTIVE to keep RIR (settle_drop, the O2 install) are publishes too)
-    let ensure_rir = |c: u32, force: bool, callers: &[u32]| {
+    let ensure_rir = |c: u32, force: bool| {
         let u = &mut *up;
         u.sync_entry_ref(c);
         if u.fns[c as usize].rir.as_ref().is_some_and(|r| upgradable(r)) {
@@ -17705,7 +17704,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             let c = frontier[idx];
             let force = t1_rec.as_ref().is_some_and(|(_, snap, _)| snap.contains(&t1_key(up, c)));
             let te = cpu_ns();
-            ensure_rir(c, force, &callees);
+            ensure_rir(c, force);
             views.borrow_mut().insert(c, o3_view(&*up, c));
             TIER1_TAKE_PARTS[1].fetch_add(cpu_ns() - te, Ordering::Relaxed);
             idx += 1;
@@ -17733,7 +17732,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             let end = (&*up).fns.len();
             for c in done..end {
                 if recorded.contains(&t1_key(up, c as u32)) {
-                    ensure_rir(c as u32, true, &callees);
+                    ensure_rir(c as u32, true);
                     views.borrow_mut().insert(c as u32, o3_view(&*up, c as u32));
                     if seen.insert(c as u32) { callees.push(c as u32); }
                 }
