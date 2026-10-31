@@ -9,5 +9,5 @@ export MAKEPAD_HIDE_WINDOWS=1 MAKEPAD_HAL_BACKEND=offscreen SANDBOX_MUTE=1 MAKEP
 if [ "$MODE" = interp ]; then export MAKEPAD_RUN_INTERP=all; fi
 # nocodegen: no machine code at all (precompiled glue, every function interpreted, cache off)
 if [ "$MODE" = nocodegen ]; then export MAKEPAD_RUN_NO_CODEGEN=1; fi
-cd [path]/wt.noindex/ios-interp && /usr/bin/time -l nice -n 5 "$M" run --quiet "$P" > "$OUT" 2>&1
+cd /Users/me/wt.noindex/ios-interp && /usr/bin/time -l nice -n 5 "$M" run --quiet "$P" > "$OUT" 2>&1
 echo "rc=$?"
