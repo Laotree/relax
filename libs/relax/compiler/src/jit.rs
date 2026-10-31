@@ -551,7 +551,7 @@ pub mod tier {
     /// makepad inspect's instrumented build at O3: the probes are in the fn's RIR before the O3
     /// pipeline (the same tier as the O3 code it replaced)
     pub const INSTRUMENTED_O3: u8 = 8;
-    pub const NAMES: [&str; 9] = ["?", "baseline", "O1", "O2", "O3", "O3-guarded", "instrumented", "error-stub", "O3-instrumented"];
+    pub const NAMES: [&str; 9] = ["?", "baseline", "O1", "O2", "O3", "?", "instrumented", "error-stub", "O3-instrumented"];
 }
 
 /// Origins (CodeKind::origin).
@@ -15768,7 +15768,7 @@ pub(crate) fn tier_explain(u: &Unit, id: u32) -> (String, Vec<(String, String)>)
     }
     // the verdict, most specific first
     let last_drop = hist.as_ref().and_then(|h| h.recent.iter().rev().find(|e| e.ev == tl::ev::O3_DROPPED || e.ev == tl::ev::O3_REFUSED).copied());
-    let at_o3 = installed.is_some_and(|k| matches!(k.tier, tier::O3 | tier::GUARDED | tier::INSTRUMENTED_O3));
+    let at_o3 = installed.is_some_and(|k| matches!(k.tier, tier::O3 | tier::INSTRUMENTED_O3));
     let verdict = if at_o3 {
         format!("runs {} code", crate::inspect::codever::label(installed.unwrap()))
     } else if let Some(p) = pin.filter(|p| p.contains("o1")) {
@@ -18374,11 +18374,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 }
                 if tier1_trace() {
                     eprintln!("O3 keep #{} {}: {}", id, short_name(&u.fns[id as usize].name),
-                        if unverified { "no (unverified)" } else if speculative || inspect_o3_on() { "no (speculative/inspect)" } else if frame_size > frame_max { "no (frame)" } else if t1prof_on(options) { "no (deterministic O3)" } else if incomplete { "entry (incomplete)" } else { "entry" });
+                        if unverified { "no (unverified)" } else if inspect_o3_on() { "no (inspect)" } else if frame_size > frame_max { "no (frame)" } else if t1prof_on(options) { "no (deterministic O3)" } else if incomplete { "entry (incomplete)" } else { "entry" });
                 }
                 // (deterministic O3 runs cache no O3 code: a later record or replay links none, every O3
                 // slot of theirs is a recorded build)
-                if frame_size <= frame_max && !unverified && !speculative && !inspect_o3_on() && !t1prof_on(options) {
+                if frame_size <= frame_max && !unverified && !inspect_o3_on() && !t1prof_on(options) {
                     // its key and certificate encoding in the bounded record batches (records_due),
                     // not in this publish
                     if let Some(mut c) = u.cache.take() {
@@ -18438,7 +18438,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     // generation, invalid::group_of)
                     note_body_deps(u, id, inlined.iter().copied());
                     let a = {
-                        let _as = code_as(CodeKind::new(if speculative { tier::GUARDED } else { tier::O3 }, origin::FRESH));
+                        let _as = code_as(CodeKind::new(tier::O3, origin::FRESH));
                         install_compiled(up, id, &code, map, &relocs, false)
                     };
                     {
@@ -18471,7 +18471,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 let tx = cpu_ns();
                 // Twin spaces can precede the last host code in the address index.
                 if !blob {
-                    let _as = code_as(inspect_o3_kind().unwrap_or(CodeKind::new(if speculative { tier::GUARDED } else { tier::O3 }, origin::FRESH)));
+                    let _as = code_as(inspect_o3_kind().unwrap_or(CodeKind::new(tier::O3, origin::FRESH)));
                     u.index_code(at, code.len() as u32, id, info);
                     u.code.write().unwrap_or_else(|e| e.into_inner()).note_inlined(at, &inlined);
                 }
@@ -19374,7 +19374,7 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, id: u32, func: &relax_backend::rir::
             for k in 0..spec_jobs(options) {
                 let session = session.clone();
             { let _k = crate::zone_alloc::kept();
-            crate::lifeline::spawn(format!("run-spec{}", k), crate::lifeline::OnPanic::Restart, None, move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime, &session.options) });
+            crate::lifeline::spawn(format!("run-spec{}", k), crate::lifeline::OnPanic::Restart, None, move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime) });
             }
             }
         });
@@ -19440,7 +19440,7 @@ pub unsafe fn spec_seed(up: *mut Unit, ids: &[u32]) {
         for k in 0..spec_jobs(options) {
             let session = session.clone();
             { let _k = crate::zone_alloc::kept();
-            crate::lifeline::spawn(format!("run-spec{}", k), crate::lifeline::OnPanic::Restart, None, move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime, &session.options) });
+            crate::lifeline::spawn(format!("run-spec{}", k), crate::lifeline::OnPanic::Restart, None, move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime) });
             }
         }
     });
@@ -20236,7 +20236,7 @@ fn expire_spec_now(now: u64, ttl: u64) {
     SPEC_EXPIRED[1].fetch_add(bytes, Ordering::Relaxed);
 }
 
-fn spec_worker(runtime: &crate::options::RuntimeOptions, options: &crate::options::Options) {
+fn spec_worker(runtime: &crate::options::RuntimeOptions) {
     ensure_altstack();
     lower_worker_priority(runtime);
     set_worker();
@@ -23622,7 +23622,7 @@ unsafe fn spec_enqueue_cached(up: *mut Unit, ids: &[u32], depth: u8) {
         for k in 0..spec_jobs(options) {
             let session = session.clone();
             { let _k = crate::zone_alloc::kept();
-            crate::lifeline::spawn(format!("run-spec{}", k), crate::lifeline::OnPanic::Restart, None, move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime, &session.options) });
+            crate::lifeline::spawn(format!("run-spec{}", k), crate::lifeline::OnPanic::Restart, None, move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime) });
             }
         }
     });
