@@ -3700,11 +3700,7 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                 UNVERIFIED_PATCHES.fetch_sub(1, Ordering::AcqRel);
                 let seqs = crate::inspect::events::unverified_seqs_since(p.event_seq);
                 let seqs: Vec<String> = seqs.iter().map(|s| s.to_string()).collect();
-                crate::inspect::events::emit(
-                    "patchverified",
-                    &format!("{}", p.group),
-                    &format!("\"edit\":{},\"group\":{},\"verified_events\":[{}]", json_str(&p.what), p.group, seqs.join(",")),
-                );
+                patch_verified_event(&p.what, p.group, &seqs);
             }
             Some(Some(events)) => {
                 let group = pending[i].group;
@@ -3948,6 +3944,17 @@ pub fn restart_pending() -> Vec<String> {
 
 pub fn clear_restart_pending() {
     RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// An applied edit's one verdict: every patch reports it, also one with nothing left to check.
+fn patch_verified_event(what: &str, group: u32, seqs: &[String]) {
+    // (a key of its own: events with one key within 30 s are one event, and each edit has a verdict)
+    static PATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    crate::inspect::events::emit(
+        "patchverified",
+        &format!("{}.{}", group, PATCH.fetch_add(1, Ordering::Relaxed)),
+        &format!("\"edit\":{},\"group\":{},\"verified_events\":[{}]", json_str(what), group, seqs.join(",")),
+    );
 }
 
 fn patch_refused_event(what: &str, refused: bool, lines: &[String]) {
@@ -4579,6 +4586,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 if o.group != 0 { landing.push((Instant::now() + LANDING, o.group, what.clone())); }
                 for l in &o.lines { eprintln!("makepad live:   {}", l); }
                 if let Some(&file) = o.files.first() { f.1 = file; }
+                patch_verified_event(&what, o.group, &[]);
             }
         }
         tick = tick.wrapping_add(1);
@@ -4798,6 +4806,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             let what: Vec<String> = changed.iter().map(|&k| files[k].0.rsplit('/').next().unwrap_or("").to_string()).collect();
             log_edit(&what.join(", "), &o, saved, seen);
             eprintln!("makepad live: {}: patched (0 item(s) changed, 0 fn(s) installed) in 0.0 ms", what.join(", "));
+            patch_verified_event(&what.join(", "), 0, &[]);
             continue;
         }
         let names: Vec<String> = edits.iter().map(|e| e.path.rsplit('/').next().unwrap_or("").to_string()).collect();
@@ -4861,6 +4870,10 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         for (j, &k) in which.iter().enumerate() {
             files[k].1 = o.files[j];
         }
+        // what is left unverified reports when the borrow checker answers; else the verdict is now
+        let patched = o.rung == Rung::Patch;
+        let group = o.group;
+        let mut awaits_check = false;
         if let Some(u) = o.undo {
             // SPEC-V: the slots this group installed without a clean verdict (all of them, unless
             // --check-first refused what failed before the install)
@@ -4872,12 +4885,16 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             if !ids.is_empty() {
                 UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
                 pending.push(PendingPatch { group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq() });
+                awaits_check = true;
             }
             undos.push(u);
             // rollback by patch group arrives with the runtime panic boundaries (M7)
             if undos.len() > 64 {
                 undos.remove(0);
             }
+        }
+        if patched && !awaits_check {
+            patch_verified_event(&what, group, &[]);
         }
     }
 }
