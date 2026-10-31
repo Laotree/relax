@@ -1669,10 +1669,14 @@ pub(crate) fn precompile_from(root: u32) -> u64 {
             // code linked from the disk cache or the startup image has no lowered body here: its
             // cache entry's relocations name what it calls
             next = owner::call(owner::Class::Program, || unsafe {
+                let u = &*up;
+                let slot_at = |addr: u64| u.find_fn(addr).or_else(|| (0..2).find_map(|k| u.slots.find(k, addr).map(|x| x.0))).filter(|&id| (id as usize) < u.fns.len());
                 cache_lookup(up, id).map_or(Vec::new(), |c| {
                     c.2.iter()
                         .filter_map(|r| match r.target {
                             relax_backend::rir::Reloc::Slot(c) | relax_backend::rir::Reloc::Thunk(c) | relax_backend::rir::Reloc::Call(c) => Some(c),
+                            // the linker has resolved it: a callee's thunk or stub by address
+                            relax_backend::rir::Reloc::Value(addr) => slot_at(addr),
                             _ => None,
                         })
                         .collect()

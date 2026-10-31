@@ -93,8 +93,10 @@ pub(crate) extern "C" fn relax_fork_exec() -> i32 {
 
 /// `__relax_fork_exec_done(pid)`: the parent learnt that child `pid` exec'd or ended. 1: the
 /// child ended at code that was not built before the fork (a function reached only through a
-/// vtable or a pointer made at run time): that code is built now, and std forks again (the
-/// child's effects ended with it); 0: done.
+/// vtable or a pointer made at run time): that code is built now, and std forks again; 0: done.
+/// Not every effect ends with the child: a pre_exec child that took a pty as its controlling tty
+/// and died there seems to leave that pty revoked (EBADF in the next child), so the walk before the
+/// fork has to find this code; the line below says when it did not.
 pub(crate) extern "C" fn relax_fork_exec_done(pid: i32) -> u32 {
     let _keep = crate::os::proc::KeepLastError::new();
     let Some(t) = table() else { return 0 };
