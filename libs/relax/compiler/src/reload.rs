@@ -2844,7 +2844,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         trace_count("typecheck_items", uniq.len());
         for (d, a) in uniq {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::instantiate_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, d, &a)));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::checked_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, d, &a)));
             match r {
                 Ok(b) => {
                     for e in &b.errors {
@@ -2854,7 +2854,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     // the same body again)
                     checked_bodies.push(b);
                 }
-                Err(_) => errs.push(format!("internal compiler error type-checking {} -- makepad run bug, report it", u.prog.def_path(d))),
+                Err(p) => errs.push(format!("internal compiler error type-checking {} ({}) -- makepad run bug, report it", u.prog.def_path(d), crate::jit::payload_text(&*p))),
             }
         }
     }
@@ -3904,6 +3904,11 @@ fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
     }
 }
 
+/// Whether a refusal's lines hold a failure of makepad itself, not of the edit.
+fn internal_failure(lines: &[String]) -> bool {
+    lines.iter().any(|l| l.contains("internal compiler error") || l.starts_with("internal:"))
+}
+
 /// A restart is ready: noted for `session relaunch` (the JIT ring's Update ready notice, a click
 /// on it asks for it), and in the live log for the WM's toast (devhub follows it).
 pub(crate) fn offer_restart(why: &str) {
@@ -4799,6 +4804,16 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let originals: Vec<_> = edits.iter().map(|e| e.src.clone()).collect();
         trace_input(watch_ms, ms(read_started), scanned);
         let mut o = apply(up, edits);
+        // the patcher's own failure is no error in the edit: nothing goes over the running app,
+        // which keeps its code; a restart compiles the edit fresh
+        if o.rung == Rung::Refuse && internal_failure(&o.lines) {
+            let what = names.join(", ");
+            o.rung = Rung::Restart;
+            log_edit(&what, &o, saved, seen);
+            for l in &o.lines { eprintln!("makepad live:   {}", l); }
+            offer_restart(&format!("{what}: makepad could not patch it in (its own error)"));
+            continue;
+        }
         // landed code the patcher refuses is nobody's error here: a restart takes it
         if synced && o.rung == Rung::Refuse { o.rung = Rung::Restart; }
         let incomplete = o.rung == Rung::Refuse || o.lines.iter().any(|l| l.starts_with("incomplete:"));

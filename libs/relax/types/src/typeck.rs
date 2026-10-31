@@ -569,6 +569,16 @@ pub fn try_codegen_body(prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) ->
     instantiate::try_instantiate_mir_and_normalize_erasing_regions(prog, tcx, body, args).ok()
 }
 
+/// The body at `args` for a check, not for code: identity arguments (a generic fn's own
+/// parameters, `borrowck::identity_args`) are the polymorphic body as typeck left it. Normalizing
+/// it for codegen has no answer: a monomorphic environment cannot solve `<I as IntoIterator>::IntoIter`.
+pub fn checked_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Body {
+    if !args.is_empty() && crate::borrowck::identity_args(tcx, prog, def).as_deref() == Some(args) {
+        return (*tcx.typeck(prog, def)).clone();
+    }
+    instantiate_body(cx, prog, tcx, def, args)
+}
+
 pub fn instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Body {
     try_instantiate_body(cx, prog, tcx, def, args).expect("failed to normalize body for codegen")
 }
