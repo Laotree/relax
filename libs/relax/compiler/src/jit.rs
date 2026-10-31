@@ -544,8 +544,6 @@ pub mod tier {
     pub const O1: u8 = 2;
     pub const O2: u8 = 3;
     pub const O3: u8 = 4;
-    /// O3 code with speculative guards (crate::guards): guessed call targets inlined behind checks
-    pub const GUARDED: u8 = 5;
     /// makepad inspect's instrumented build: O1 code generation of the slot's RIR with probe calls
     pub const INSTRUMENTED: u8 = 6;
     /// a compile error's stub (the call panics)
@@ -13549,11 +13547,6 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
         relax_backend::passes::renumber_rpo(func);
         relax_backend::stats::pass_time(5, ti);
     }
-    // speculation (the root build only): probes / guards on the indirect calls the first round
-    // left or exposed; the second round inlines the guarded direct calls
-    if inlined_only.is_none() {
-        crate::guards::apply(func, id);
-    }
     if let Some(raw) = inlined_only {
         *raw = (func.clone(), inlined.clone());
     }
@@ -14234,7 +14227,6 @@ fn sampler_thread() {
 /// holding the lock from here on (never released: the process is ending) stops them.
 impl Drop for Unit {
     fn drop(&mut self) {
-        crate::guards::dump(&|id| if (id as usize) < self.fns.len() { self.fns[id as usize].name.to_string() } else { String::new() });
         crate::domain::forget_tls_keys(self.syms.dom0());
         let options = &self.prog.session.clone().options;
         if !self.retired {
@@ -15722,15 +15714,6 @@ fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
     }
 }
 
-/// A speculation site of slot `id` changed state (crate::guards): rebuild its O3 code. Called
-/// from program threads (no unit lock), as rt_hot queues.
-pub(crate) fn guard_relink(id: u32) {
-    // one rebuild decides every ready site of the slot: no second entry while one waits
-    if tier_queue().unwrap_or_else(|e| e.into_inner()).iter().any(|e| e.0 == id && e.1 == Q_RETIER) {
-        return;
-    }
-    tier_push(id, Q_RETIER, 0);
-}
 
 /// O3 queue pushes so far (any reason): the sampler's settled test (sampler_thread)
 static TIER_PUSHES: AtomicU64 = AtomicU64::new(0);
@@ -16695,14 +16678,10 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
         let rir = f.rir.as_ref().filter(|r| !r.plain_calls && !r.naked && !r.blocks.is_empty())?.clone();
         let e = &u.env;
         let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class, near: e.near };
-        // BEYOND2's dyn-target profile runs in the counted code too: its O3 build then decides
-        // the guards from the start (no PROFILE O3 build and relink)
-        let gctx = (crate::guards::enabled() && !f.unverified.load(Ordering::Relaxed))
-            .then(|| crate::guards::Ctx { root: id, syms: crate::guards::syms(u), slots: Vec::new(), emitted: std::cell::Cell::new(false) });
-        Some((rir, env, u.opt.fold, u.opt.layout, PATCH_EPOCH.load(Ordering::SeqCst), f.version, gctx))
+        Some((rir, env, u.opt.fold, u.opt.layout, PATCH_EPOCH.load(Ordering::SeqCst), f.version))
     }).flatten();
     drop(front);
-    let Some((rir, env, fold, layout, epoch, version, gctx)) = begin else {
+    let Some((rir, env, fold, layout, epoch, version)) = begin else {
         return false;
     };
     let n = rir.blocks.len();
@@ -16716,10 +16695,7 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
         let _arena = crate::zone_alloc::job("counted codegen", session.runtime.burst_arena);
         let mut func = (*rir).clone();
         let counted = relax_backend::profile::instrument(&mut func, counters.as_ptr() as u64);
-        if let Some(g) = &gctx {
-            crate::guards::probe(g, &mut func);
-        }
-        func.verify_after("profile::instrument / guards::probe")?;
+        func.verify_after("profile::instrument")?;
         let cg = tier0_codegen_rir(options, &func, fold, layout);
         relax_codegen::native::compile(options, &cg, &env).map(|c| {
             dump_o1(&cg, &c);
@@ -17551,7 +17527,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         // A front-end writer (live patch) preempts it.
         prefront_slot(&front, id);
     }
-    let mut spec_ctx: Option<crate::guards::Ctx> = None;
     // The inline candidates' front ends (type check, lowering) run on this thread, not on the
     // owner: a snapshot that meets a candidate without RIR whose front this build has not run
     // yet hands it back (`fronts`) instead of building it; this thread checks and lowers those
@@ -17716,18 +17691,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     }
                 }
             }
-        }
-        // speculation: sites of this slot that finished profiling are decided now; the guessed
-        // targets join the snapshot (their RIR inlines into the guarded call)
-        if crate::guards::enabled() && !sandboxed && !export_o3_mode() && !(&*up).fns[id as usize].unverified.load(Ordering::Relaxed) {
-            let u = &*up;
-            let slots = crate::guards::decide(id, &|a| u.thunk_slot(a));
-            for &(_, s) in &slots {
-                if s != id && !callees.contains(&s) {
-                    callees.push(s);
-                }
-            }
-            spec_ctx = Some(crate::guards::Ctx { root: id, syms: crate::guards::syms(u), slots, emitted: std::cell::Cell::new(false) });
         }
         // callees the O3 policy wants inlinable get their RIR built, one per lock hold;
         // then their callees (outside cold blocks), 16 levels (a binary search closure sits ~10 deep), built the same way: an inlined
@@ -18175,14 +18138,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         });
         // makepad inspect remarks of this build: the vectorisers' loops, then the allocator's spills
         let remarks = relax_backend::remark::begin();
-        let (optimized, inline_rules) = match &spec_ctx {
-            Some(ctx) => crate::guards::with_ctx(ctx, optimize),
-            None => optimize(),
-        }?;
+        let (optimized, inline_rules) = optimize()?;
         func = optimized;
-        if let Some(ctx) = &spec_ctx {
-            crate::guards::probe(ctx, &mut func);
-        }
         let mut inlined = Vec::with_capacity(inline_rules.len());
         for (c, _) in inline_rules { inlined.push(c); }
         let nounwind_used = func.nounwind_inputs.clone();
@@ -18509,12 +18466,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // Uncached, every warm launch built ~150 twins' O3 again.)
                 let built_unverified = !twin && (root_unverified || !unverified_inl.is_empty());
                 let unverified = unverified_now || built_unverified;
-                // speculative code holds this run's site records (crate::guards): never cached
-                let speculative = spec_ctx.as_ref().is_some_and(|c| c.emitted.get());
                 // (inspect's builds are this session's: never cached)
                 {
                     use crate::cache::warm_count as wc;
-                    wc::add(if unverified { wc::O3_UNVERIFIED } else if speculative || inspect_o3_on() { wc::O3_SPEC } else if frame_size > frame_max { wc::O3_FRAME } else { wc::O3_QUEUED }, 1);
+                    wc::add(if unverified { wc::O3_UNVERIFIED } else if inspect_o3_on() { wc::O3_SPEC } else if frame_size > frame_max { wc::O3_FRAME } else { wc::O3_QUEUED }, 1);
                 }
                 if tier1_trace() {
                     eprintln!("O3 keep #{} {}: {}", id, short_name(&u.fns[id as usize].name),
