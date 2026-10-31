@@ -3946,22 +3946,27 @@ pub fn clear_restart_pending() {
     RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
+/// A key of its own per verdict: events with one key within 30 s are one event, and every edit has
+/// its verdict (a save that gets the same answer again too).
+fn verdict_key(what: &str) -> String {
+    static VERDICT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!("{}.{}", what, VERDICT.fetch_add(1, Ordering::Relaxed))
+}
+
 /// An applied edit's one verdict: every patch reports it, also one with nothing left to check.
-fn patch_verified_event(what: &str, group: u32, seqs: &[String]) {
-    // (a key of its own: events with one key within 30 s are one event, and each edit has a verdict)
-    static PATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) fn patch_verified_event(what: &str, group: u32, seqs: &[String]) {
     crate::inspect::events::emit(
         "patchverified",
-        &format!("{}.{}", group, PATCH.fetch_add(1, Ordering::Relaxed)),
+        &verdict_key(&group.to_string()),
         &format!("\"edit\":{},\"group\":{},\"verified_events\":[{}]", json_str(what), group, seqs.join(",")),
     );
 }
 
-fn patch_refused_event(what: &str, refused: bool, lines: &[String]) {
+pub(crate) fn patch_refused_event(what: &str, refused: bool, lines: &[String]) {
     let reasons: Vec<String> = lines.iter().take(6).map(|l| crate::inspect::json_str(l)).collect();
     crate::inspect::events::emit(
         "patchrefused",
-        &format!("{}|{}", what, lines.first().cloned().unwrap_or_default()),
+        &verdict_key(&format!("{}|{}", what, lines.first().cloned().unwrap_or_default())),
         &format!("\"edit\":{},\"outcome\":\"{}\",\"reasons\":[{}]", crate::inspect::json_str(what), if refused { "refused" } else { "restart" }, reasons.join(",")),
     );
 }
@@ -4688,6 +4693,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             for &k in &manifests { files[k].2 = stamp(&files[k].0); stalled.remove(&k); }
             changed.retain(|k| !manifests.contains(k));
             if changed.is_empty() {
+                // nothing to do is the edit's verdict: the app already runs what it means
+                patch_verified_event(&format!("{} manifest(s)", manifests.len()), 0, &[]);
                 continue;
             }
         }
@@ -4730,7 +4737,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if let Some(reason) = reason {
             // nothing of makepad's own moved (a bulk change of the program's sources): no rebuild
             if !changed.iter().any(|&k| inputs.process_input(&files[k].0)) {
-                offer_restart(&format!("{} files changed: {reason}", changed.len()));
+                let why = format!("{} files changed: {reason}", changed.len());
+                offer_restart(&why);
+                patch_refused_event(&why, false, std::slice::from_ref(&why));
                 for &k in &changed { files[k].2 = stamp(&files[k].0); stalled.remove(&k); }
                 continue;
             }
@@ -4821,6 +4830,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             log_edit(&what, &o, saved, seen);
             for l in &o.lines { eprintln!("makepad live:   {}", l); }
             offer_restart(&format!("{what}: makepad could not patch it in (its own error)"));
+            patch_refused_event(&what, false, &o.lines);
             continue;
         }
         // landed code the patcher refuses is nobody's error here: a restart takes it

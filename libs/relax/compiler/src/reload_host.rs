@@ -237,6 +237,7 @@ fn build_loop() {
         // build), so there is nothing to restart into
         if LOADED.get().copied().flatten().is_some_and(|id| identity(&loader).is_some_and(|now| now == id)) {
             eprintln!("makepad live: {why}: makepad is unchanged (built in {secs:.0} s); no restart");
+            super::patch_verified_event(&why, 0, &[]);
             super::live_log(&format!("{{\"event\":\"host_rebuild\",\"ok\":true,\"s\":{secs:.1},\"unchanged\":true}}"));
             let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
             if st.again { drop(st); continue; }
@@ -261,6 +262,7 @@ fn build_loop() {
             // a running app restarts into it when the person says so (`session relaunch`)
             *super::RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = reason.clone();
             super::offer_restart(&reason);
+            super::patch_refused_event(&reason, false, std::slice::from_ref(&reason));
             return;
         }
         if super::RESTART_SUPPORTED.load(std::sync::atomic::Ordering::SeqCst) {
