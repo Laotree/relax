@@ -683,7 +683,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if driver_options.verbose { crate::tui::track_for_verbose(); }
     // the boot progress line (tui.rs): a terminal run of a program, with nothing asking for plain output
     unsafe { std::env::remove_var("MAKEPAD_RUN_PROGRESS") };
-    // a test harness is a terminal program: no progress line, no inspect socket, no live session
+    // a test harness is a terminal program: no progress line, no live session
     let hosted = !entries.is_empty() || !export_names.is_empty() || harness || plain_test.is_some();
     // the `unused_macros` lints need the macro uses of the whole load
     if check { relax_types::macros::uses::record(true); relax_front::program::set_record_import_uses(true); }
@@ -772,8 +772,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     let package = args[i].clone();
     // makepad inspect: the program answers questions from now on (compiles included)
-    if !check && session.is_none() && !hosted && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() {
-        crate::inspect::start(&package);
+    if !check && session.is_none() && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() {
+        if harness || plain_test.is_some() {
+            // a run that hangs answers `devhub inspect <node>/<pid> why-hung`
+            crate::inspect::start_for_test(&package);
+        } else if !hosted {
+            crate::inspect::start(&package);
+        }
     }
     let mut prog_args: Vec<Vec<u8>> = vec![package.clone().into_bytes()];
     let mut k = i + 1;

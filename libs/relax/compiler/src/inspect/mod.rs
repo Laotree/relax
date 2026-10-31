@@ -78,6 +78,26 @@ fn server_thread_exit() {
     SERVER_TIDS.lock().unwrap().retain(|t| *t != me);
 }
 
+/// A test harness's endpoint: there to answer when the run hangs. A test's panic is the test's
+/// (nothing parks), and its output says nothing about the endpoint.
+static TEST_RUN: AtomicBool = AtomicBool::new(false);
+
+/// [`start`] for a test run.
+pub fn start_for_test(app: &str) {
+    TEST_RUN.store(true, Relaxed);
+    start(app);
+}
+
+/// `why-hung` on stderr: for a wait that should not last, whether or not anyone can attach.
+pub fn say_why_hung(what: &str) {
+    fn answer(req: &Req, out: &mut Out) {
+        hang::why_hung(req, out);
+    }
+    let _k = crate::zone_alloc::kept();
+    let (bytes, _) = makepad_remote::cmd::answer(answer, "why-hung");
+    eprintln!("makepad: {what}: where the threads wait:\n{}", String::from_utf8_lossy(&bytes));
+}
+
 /// Starts the inspect thread for program `app` (once per process; MAKEPAD_RUN_INSPECT=0: off).
 pub fn start(app: &str) {
     if std::env::var("MAKEPAD_RUN_INSPECT").map_or(false, |v| v == "0") || STARTED.swap(true, Relaxed) {
@@ -112,7 +132,9 @@ pub fn start(app: &str) {
             return;
         }
     };
-    eprintln!("makepad-remote: pid {} app {} socket {} (makepad inspect {} help)", pid, app, sock.display(), pid);
+    if !TEST_RUN.load(Relaxed) {
+        eprintln!("makepad-remote: pid {} app {} socket {} (makepad inspect {} help)", pid, app, sock.display(), pid);
+    }
     events::start();
     timeline::hitch_init();
     flightrec::init();

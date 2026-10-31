@@ -20623,9 +20623,13 @@ fn pause_compile_jobs(trace: bool) {
     // while the zone is re-registered corrupts the heap. Waiting is the only safe answer, so a
     // long wait is logged (the jobs, what they wait for), never cut short.
     let mut next_log = 5000u128;
+    let mut told = false;
     while BG_ACTIVE.load(Ordering::SeqCst) > mine || owner::busy_for_other(me()) {
         if t0.elapsed().as_millis() >= next_log {
             next_log += 5000;
+            if t0.elapsed().as_secs() >= 30 && !std::mem::replace(&mut told, true) {
+                crate::inspect::say_why_hung("the allocator swap waits");
+            }
             eprintln!("makepad: the allocator swap waits for compile jobs ({:.0} s): jobs active {}, owner busy for another thread {} ({}); queued: {}",
                 t0.elapsed().as_secs_f64(), BG_ACTIVE.load(Ordering::SeqCst), owner::busy_for_other(me()), owner::serving_note(), owner::queued_detail());
         }
