@@ -20594,8 +20594,8 @@ fn pause_compile_jobs(trace: bool) {
     while BG_ACTIVE.load(Ordering::SeqCst) > mine || owner::busy_for_other(me()) {
         if t0.elapsed().as_millis() >= next_log {
             next_log += 5000;
-            eprintln!("makepad: the allocator swap waits for compile jobs ({:.0} s): jobs active {}, owner busy for another thread {}; queued: {}",
-                t0.elapsed().as_secs_f64(), BG_ACTIVE.load(Ordering::SeqCst), owner::busy_for_other(me()), owner::queued_detail());
+            eprintln!("makepad: the allocator swap waits for compile jobs ({:.0} s): jobs active {}, owner busy for another thread {} ({}); queued: {}",
+                t0.elapsed().as_secs_f64(), BG_ACTIVE.load(Ordering::SeqCst), owner::busy_for_other(me()), owner::serving_note(), owner::queued_detail());
         }
         std::thread::sleep(std::time::Duration::from_micros(200));
     }
