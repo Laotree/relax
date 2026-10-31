@@ -35,12 +35,6 @@ thread_local! {
     static DECLARATIONS: Cell<bool> = const { Cell::new(false) };
 }
 pub(crate) fn declaring() -> bool { DECLARATIONS.with(Cell::get) }
-pub(crate) fn with_declarations<T>(f: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore { fn drop(&mut self) { DECLARATIONS.with(|v| v.set(self.0)); } }
-    let _restore = Restore(DECLARATIONS.with(|v| v.replace(true)));
-    f()
-}
 
 static RUNNER: std::sync::OnceLock<&'static dyn MacroRunner> = std::sync::OnceLock::new();
 

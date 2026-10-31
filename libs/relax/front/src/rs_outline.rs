@@ -3,7 +3,6 @@
 use crate::cfg::CfgSet;
 use crate::lexer::{Tok, T};
 use crate::rs_index::NameIndex;
-use std::sync::Arc;
 
 /// What declaration discovery keeps of a file: its name index. The tokens it is built from
 /// (the file's lex, its cfg-active tokens) belong to the scan that needs them.

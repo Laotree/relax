@@ -3306,7 +3306,7 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
 /// depth for blocks no sample hit; without, 8^loop depth (capped).
 fn block_weights(options: &relax_session::Options, f: &Func, reach: &[bool], freq: Option<&[f32]>) -> Vec<f32> {
     let depth = loop_depths(f, reach);
-    let st = static_weights(options, f, reach, &depth);
+    let st = static_weights(f, reach, &depth);
     match freq {
         // static estimate as the base, samples raise a block up to 8x: tier-up happens after a
         // handful of samples (glyph_cache: 9 of 176 blocks sampled, values 0.5 / 1.0), too
@@ -3318,7 +3318,7 @@ fn block_weights(options: &relax_session::Options, f: &Func, reach: &[bool], fre
 
 /// Static block weights: 8^loop depth (capped), panic / unwind paths (blocks that can only end in
 /// Unreachable or Resume, and landing pads) ~0.
-fn static_weights(options: &relax_session::Options, f: &Func, reach: &[bool], depth: &[u32]) -> Vec<f32> {
+fn static_weights(f: &Func, reach: &[bool], depth: &[u32]) -> Vec<f32> {
     let nb = f.blocks.len();
     let mut cold = vec![false; nb];
     for b in &f.blocks {
