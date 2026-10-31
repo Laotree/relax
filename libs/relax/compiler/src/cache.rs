@@ -2018,11 +2018,6 @@ impl Cache {
         }
     }
 
-    /// The slot a key encoding names in this run (startup manifest).
-    pub fn slot_for_bytes(&mut self, u: &mut Unit, b: &[u8]) -> Option<u32> {
-        self.slot_of_bytes(u, b)
-    }
-
     /// The key encodings of the slots real-time threads of the program rooted at crate `root`
     /// reached in earlier runs (jit.rs realtime; resolve them with slot_for_bytes_unit): compiled
     /// ahead when the program marks its real-time code.

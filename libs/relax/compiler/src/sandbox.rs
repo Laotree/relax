@@ -1796,8 +1796,3 @@ pub fn stats() -> (usize, usize, usize) {
     let g = SB.lock().unwrap_or_else(|e| e.into_inner());
     g.as_ref().map_or((0, 0, 0), |s| (s.ro.len(), s.rw.len(), s.arenas.len()))
 }
-
-/// Heap bytes a module's arena has handed out.
-pub fn heap_used(a: &Arena) -> u64 {
-    a.heap.lock().unwrap_or_else(|e| e.into_inner()).used
-}
