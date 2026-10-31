@@ -911,7 +911,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     drop(live_in);
     let ranges = build_ranges(f, &reach, &tab, &block_start, &block_end, &live_out);
     drop(live_out);
-    let wts = block_weights(options, f, &reach, freq);
+    let wts = block_weights(f, &reach, freq);
     let aff = affinities(f, &reach, &block_start, &ranges, &wts);
     let (mut remat, base_only) = remat_values(options, f, &reach, cfg);
     // base + k is recomputed at its uses: the base must be live (hold its one value) at each of
@@ -3304,7 +3304,7 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
 /// How often each block runs, relative: with measured frequencies (O3: samples of the code
 /// the block's instructions came from, 0..=1 of the hottest block) mostly those, a sliver of loop
 /// depth for blocks no sample hit; without, 8^loop depth (capped).
-fn block_weights(options: &relax_session::Options, f: &Func, reach: &[bool], freq: Option<&[f32]>) -> Vec<f32> {
+fn block_weights(f: &Func, reach: &[bool], freq: Option<&[f32]>) -> Vec<f32> {
     let depth = loop_depths(f, reach);
     let st = static_weights(f, reach, &depth);
     match freq {

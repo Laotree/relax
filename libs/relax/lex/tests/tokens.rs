@@ -109,9 +109,6 @@ fn doc_gaps_are_attributes_and_explicit_trivia_does_not_duplicate_them() {
     assert_eq!(stream("///leading\nx ///trailing", true).to_string(), "#[doc = \"leading\"] x #[doc = \"trailing\"]");
 }
 
-    assert_eq!(p.span().hi - p.span().lo, 2);
-}
-
 #[test]
 fn span_join_rejects_distinct_files_and_keeps_outer_endpoints() {
     let index = LineIndex::new(b"a\nbc\ndef");
