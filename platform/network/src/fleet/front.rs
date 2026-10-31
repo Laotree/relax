@@ -542,12 +542,12 @@ mod tests {
         assert_eq!(caller_from_headers(&lines, "s3cret"), Some(Caller { client_id: "rik-mac".into(), role: Role::Device, admin: true, this_machine: false, app: None }));
         assert_eq!(caller_from_headers(&lines, "other"), None);
         // The same credential from elsewhere is not admin behind the front either.
-        let away = Peer { addr: "192.0.2.9".parse().unwrap(), ..peer };
+        let away = Peer { addr: "10.77.0.9".parse().unwrap(), ..peer };
         let lines: Vec<String> = String::from_utf8(p.rewrite("s3cret", &[], &away)).unwrap().split("\r\n").map(String::from).collect();
         assert_eq!(caller_from_headers(&lines, "s3cret").map(|c| c.admin), Some(false));
         // A client cannot claim to be this machine: its own header is stripped, the front's stamp says.
         let spoof = b"GET /control HTTP/1.1\r\nX-Makepad-This-Machine: 1\r\n\r\n";
-        let node = Peer { name: "n166".into(), role: Role::Node, addr: "192.0.2.15".parse().unwrap(), from: None, point: [5; 65], this_machine: false };
+        let node = Peer { name: "n4".into(), role: Role::Node, addr: "192.0.2.15".parse().unwrap(), from: None, point: [5; 65], this_machine: false };
         let lines: Vec<String> = String::from_utf8(parse_head(spoof).unwrap().rewrite("s3cret", &[], &node)).unwrap().split("\r\n").map(String::from).collect();
         assert_eq!(caller_from_headers(&lines, "s3cret").map(|c| c.this_machine), Some(false));
         let own = Peer { this_machine: true, ..node };

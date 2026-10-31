@@ -26,7 +26,7 @@ use std::time::Duration;
 pub struct Config {
     /// the endpoint name the relay reports in its hello (the host name for a dial relay)
     pub name: String,
-    /// the launcher's argv before the app, e.g. `["[path]/bin/makepad", "run"]`
+    /// the launcher's argv before the app, e.g. `["/home/me/bin/makepad", "run"]`
     pub launch: Vec<String>,
     /// environment of launched sessions (hidden windows, muted audio)
     pub env: Vec<(String, String)>,

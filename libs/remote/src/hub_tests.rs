@@ -148,7 +148,7 @@ fn requests_to_an_unreachable_fleet_host_leave_no_route_threads() {
         std::thread::sleep(Duration::from_millis(50));
         Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "down"))
     }));
-    hub.sync(&Hosts { hosts: vec![Host { name: "gone".into(), via: Via::Fleet { addr: "192.0.2.1:1".into() } }] });
+    hub.sync(&Hosts { hosts: vec![Host { name: "gone".into(), via: Via::Fleet { addr: "10.77.0.1:1".into() } }] });
     let c = client(&hub);
     for _ in 0..10 {
         let ch = c.open("route", "gone peers").unwrap();
