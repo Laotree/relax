@@ -154,7 +154,7 @@ fn tl_set_once(i: usize, v: f64) {
 }
 
 fn tl_add(i: usize, v: f64) {
-    let _ = TL[i].fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |x| Some((f64::from_bits(x) + v).to_bits()));
+    TL[i].update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |x| (f64::from_bits(x) + v).to_bits());
 }
 
 pub fn timeline() -> [f64; 6] {
