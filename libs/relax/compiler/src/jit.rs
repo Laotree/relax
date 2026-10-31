@@ -23531,6 +23531,30 @@ pub(crate) unsafe fn preserve_closure_bodies(up: *mut Unit, files: &[u32]) -> Re
     owners.dedup();
     let n_slotted = owners.len();
     let mut done: std::collections::HashSet<(u32, u32)> = owners.iter().copied().collect();
+    // Fns of these files that hold closures and have a slot, with no closure slot yet: code from the
+    // disk cache names their closures in callees not built yet (`spawn<closure, ()>`), which may be
+    // built first after the edit. The file's def index finds them without checking the other fns.
+    {
+        let u = &*up;
+        let mut holders: std::collections::HashMap<DefId, u32> = Default::default();
+        for &file in files {
+            for &d in u.prog.defs_in_file(file) {
+                let mut d = DefId(d);
+                if u.prog.def(d).kind != DefKind::Closure { continue; }
+                while u.prog.def(d).kind == DefKind::Closure { d = u.prog.def(d).parent; }
+                holders.insert(d, file);
+            }
+        }
+        if !holders.is_empty() {
+            for (id, slot) in u.fns.iter().enumerate() {
+                if let FnKey::Inst(d, _) = &slot.key {
+                    if let Some(&file) = holders.get(d) {
+                        if done.insert((id as u32, file)) { owners.push((id as u32, file)); }
+                    }
+                }
+            }
+        }
+    }
     let mut seen_tys: std::collections::HashSet<TyId> = Default::default();
     let mut i = 0;
     while i < owners.len() {

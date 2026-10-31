@@ -240,6 +240,9 @@ impl<'p> LayoutCx<'p> {
 /// instead of freeing it, since references into it may still be held).
 pub struct Layouts {
     closure_storage: crate::conc::MemoMap<TyId, ClosureStorage>,
+    /// The environments every checked or lowered version gave its closures. Unlike the layouts they
+    /// outlive `clear`: once a version is replaced nothing can derive them again.
+    version_storage: crate::conc::MemoMap<TyId, ClosureStorage>,
     table: std::sync::atomic::AtomicPtr<LTable>,
     retired: relax_session::sync::Mutex<Vec<Box<LTable>>>,
     /// the distinct layouts, never freed before the Layouts (`of` hands out 'static references)
@@ -366,7 +369,7 @@ fn tz(x: u64) -> u64 {
 
 impl Layouts {
     pub fn new() -> Layouts {
-        Layouts { closure_storage: Default::default(), table: std::sync::atomic::AtomicPtr::new(Box::into_raw(LTable::new())), retired: Default::default(), ents: crate::conc::AppendVec::with_capacity(1 << 24), pool: Default::default(), opaque: Default::default(), lenient_fields: false }
+        Layouts { closure_storage: Default::default(), version_storage: Default::default(), table: std::sync::atomic::AtomicPtr::new(Box::into_raw(LTable::new())), retired: Default::default(), ents: crate::conc::AppendVec::with_capacity(1 << 24), pool: Default::default(), opaque: Default::default(), lenient_fields: false }
     }
 
     /// Layouts of types whose parameters were erased (see `lenient_fields`).
@@ -396,6 +399,7 @@ impl Layouts {
         let TyKind::FnDef(def, args, _) = tcx.tys.kind(*owner) else { panic!("closure owner") };
         let body = crate::typeck::codegen_body(prog, tcx, *def, tcx.tys.list(*args));
         if body.file != *file {
+            if let Some(storage) = self.version_storage.get(&ty) { return storage; }
             panic!("the environment of a closure of a replaced version of {} (expression {}) is unknown: no body of that version was lowered in this process",
                 prog.file_paths.get(*file as usize).map_or("?", |p| p.as_str()), ce & !crate::tcx::ASYNC_FN_BODY);
         }
@@ -418,6 +422,9 @@ impl Layouts {
             }
             if self.closure_storage.get(&ty).as_ref() != Some(storage) {
                 self.closure_storage.insert(ty, storage.clone());
+            }
+            if self.version_storage.get(&ty).as_ref() != Some(storage) {
+                self.version_storage.insert(ty, storage.clone());
             }
         }
     }
