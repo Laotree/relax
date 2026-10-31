@@ -11697,11 +11697,6 @@ unsafe fn store_rir(up: *mut Unit, id: u32, func: relax_backend::rir::Func, inli
     }
 }
 
-/// The passes after inlining (O1 and O3; `ro`: the read-only data loads fold from).
-fn pipeline_variant(options: &crate::options::Options) -> u32 {
-    options.pipe
-}
-
 /// `full`: the second SROA round (after the first simplify) -- O3, or O1 when it is
 /// the only tier; with O3 on, O1 runs one round (counter opt CPU -20%)
 /// MAKEPAD_RUN_COMPILE_WATCH=<seconds>: a watcher thread prints every optimisation that has been
@@ -11834,103 +11829,85 @@ fn opt_pipeline_inner(options: &crate::options::Options, func: &mut relax_backen
         verify_pass(func, "forward_const_slots");
     }
     if cfg.fold {
-        if pipeline_variant(options) >= 1 {
-            // SROA on the lowered code first: one simplify (with CSE) then sees the scalars
+        // SROA on the lowered code first: one simplify (with CSE) then sees the scalars
+        let t = relax_backend::stats::pass_clock();
+        if full && cfg.sroa {
+            relax_codegen::opt::forward_slot_copies(func);
+            verify_pass(func, "forward_slot_copies");
+            relax_codegen::opt::forward_slot_loads(func);
+            verify_pass(func, "forward_slot_loads");
+        }
+        let s1 = cfg.sroa && relax_backend::passes::sroa(func);
+        relax_backend::stats::pass_time(8, t);
+        verify_pass(func, "sroa");
+        if s1 {
             let t = relax_backend::stats::pass_clock();
-            if full && cfg.sroa {
-                relax_codegen::opt::forward_slot_copies(func);
+            relax_backend::passes::live_dce(func);
+            relax_backend::stats::pass_time(9, t);
+            verify_pass(func, "live_dce");
+        }
+        relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
+        verify_pass(func, "simplify");
+        // big values moved through temporaries (a struct literal with a large array, then
+        // Box::new): build them in place, at every tier -- these frames overflow threads'
+        // stacks, not only O3's
+        // Rounds: a chain of whole copies (slot -> temp -> temp -> result buffer, as lowering
+        // moves a struct literal through `Self { .. }`, a let and the return) collapses one
+        // link per forwarding, and the drop-flag tests the moves left behind fold only once
+        // the copies sit in one block (Score: SamplerBackend::new kept its 108 KB value in a
+        // slot, copied into the result buffer, on the CoreAudio IO thread's 512 KB stack)
+        // A wasm export's shipping body does this for every aggregate: each copy through a
+        // temporary is code (a memory.copy) in the module, at any size
+        let dests_min = if export_full() { EXPORT_DEST_SLOT } else { BIG_SLOT };
+        for _ in 0..3 {
+            if !(cfg.sroa && func.slots.iter().any(|s| s.size >= dests_min)) {
+                break;
+            }
+            let mut ch = relax_codegen::opt::forward_slot_dests(func);
+            verify_pass(func, "forward_slot_dests");
+            ch |= relax_codegen::opt::forward_slot_dests_x(options, func, dests_min);
+            verify_pass(func, "forward_slot_dests_x");
+            if !full {
+                ch |= relax_codegen::opt::forward_slot_copies(func);
                 verify_pass(func, "forward_slot_copies");
-                relax_codegen::opt::forward_slot_loads(func);
-                verify_pass(func, "forward_slot_loads");
             }
-            let s1 = cfg.sroa && relax_backend::passes::sroa(func);
-            relax_backend::stats::pass_time(8, t);
-            verify_pass(func, "sroa");
-            if s1 {
-                let t = relax_backend::stats::pass_clock();
-                relax_backend::passes::live_dce(func);
-                relax_backend::stats::pass_time(9, t);
-                verify_pass(func, "live_dce");
+            if !ch {
+                break;
             }
-            relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
+            relax_backend::passes::simplify(options, func, ro, cfg.imm, false);
             verify_pass(func, "simplify");
-            // big values moved through temporaries (a struct literal with a large array, then
-            // Box::new): build them in place, at every tier -- these frames overflow threads'
-            // stacks, not only O3's
-            // Rounds: a chain of whole copies (slot -> temp -> temp -> result buffer, as lowering
-            // moves a struct literal through `Self { .. }`, a let and the return) collapses one
-            // link per forwarding, and the drop-flag tests the moves left behind fold only once
-            // the copies sit in one block (Score: SamplerBackend::new kept its 108 KB value in a
-            // slot, copied into the result buffer, on the CoreAudio IO thread's 512 KB stack)
-            // A wasm export's shipping body does this for every aggregate: each copy through a
-            // temporary is code (a memory.copy) in the module, at any size
-            let dests_min = if export_full() { EXPORT_DEST_SLOT } else { BIG_SLOT };
-            for _ in 0..3 {
-                if !(cfg.sroa && func.slots.iter().any(|s| s.size >= dests_min)) {
-                    break;
-                }
-                let mut ch = relax_codegen::opt::forward_slot_dests(func);
-                verify_pass(func, "forward_slot_dests");
-                ch |= relax_codegen::opt::forward_slot_dests_x(options, func, dests_min);
-                verify_pass(func, "forward_slot_dests_x");
-                if !full {
-                    ch |= relax_codegen::opt::forward_slot_copies(func);
-                    verify_pass(func, "forward_slot_copies");
-                }
-                if !ch {
-                    break;
-                }
-                relax_backend::passes::simplify(options, func, ro, cfg.imm, false);
-                verify_pass(func, "simplify");
-            }
+        }
+        let t = relax_backend::stats::pass_clock();
+        // copy prop has merged the slot address copies: chains the first pass could not
+        // follow
+        let mut fw = cfg.sroa && relax_codegen::opt::forward_const_slots(func, ro);
+        verify_pass(func, "forward_const_slots");
+        if full && cfg.sroa {
+            fw |= relax_codegen::opt::forward_slot_copies(func);
+            verify_pass(func, "forward_slot_copies");
+            fw |= relax_codegen::opt::forward_slot_loads(func);
+            verify_pass(func, "forward_slot_loads");
+        }
+        let s2 = full && cfg.sroa && relax_backend::passes::sroa(func);
+        relax_backend::stats::pass_time(8, t);
+        verify_pass(func, "sroa");
+        if s2 {
             let t = relax_backend::stats::pass_clock();
-            // copy prop has merged the slot address copies: chains the first pass could not
-            // follow
-            let mut fw = cfg.sroa && relax_codegen::opt::forward_const_slots(func, ro);
-            verify_pass(func, "forward_const_slots");
-            if full && cfg.sroa {
-                fw |= relax_codegen::opt::forward_slot_copies(func);
-                verify_pass(func, "forward_slot_copies");
-                fw |= relax_codegen::opt::forward_slot_loads(func);
-                verify_pass(func, "forward_slot_loads");
-            }
-            let s2 = full && pipeline_variant(options) == 1 && cfg.sroa && relax_backend::passes::sroa(func);
-            relax_backend::stats::pass_time(8, t);
-            verify_pass(func, "sroa");
-            if s2 {
-                let t = relax_backend::stats::pass_clock();
-                relax_backend::passes::live_dce(func);
-                relax_backend::stats::pass_time(9, t);
-                verify_pass(func, "live_dce");
-            }
-            if s2 || fw {
-                relax_backend::passes::simplify(options, func, ro, cfg.imm, false);
-                verify_pass(func, "simplify");
-            }
-            let t = relax_backend::stats::pass_clock();
-            let l = cfg.licm && relax_backend::passes::licm(options, func);
-            relax_backend::stats::pass_time(10, t);
-            verify_pass(func, "licm");
-            if l {
-                relax_backend::passes::simplify(options, func, ro, cfg.imm, false);
-                verify_pass(func, "simplify");
-            }
-        } else {
-            relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
+            relax_backend::passes::live_dce(func);
+            relax_backend::stats::pass_time(9, t);
+            verify_pass(func, "live_dce");
+        }
+        if s2 || fw {
+            relax_backend::passes::simplify(options, func, ro, cfg.imm, false);
             verify_pass(func, "simplify");
-            if cfg.sroa && relax_backend::passes::sroa(func) {
-                verify_pass(func, "sroa");
-                // the cells' entry zeros that a write always precedes are dead by liveness only
-                relax_backend::passes::live_dce(func);
-                verify_pass(func, "live_dce");
-                relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
-                verify_pass(func, "simplify");
-            }
-            if cfg.licm && relax_backend::passes::licm(options, func) {
-                verify_pass(func, "licm");
-                relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
-                verify_pass(func, "simplify");
-            }
+        }
+        let t = relax_backend::stats::pass_clock();
+        let l = cfg.licm && relax_backend::passes::licm(options, func);
+        relax_backend::stats::pass_time(10, t);
+        verify_pass(func, "licm");
+        if l {
+            relax_backend::passes::simplify(options, func, ro, cfg.imm, false);
+            verify_pass(func, "simplify");
         }
     }
     let ts = relax_backend::stats::pass_clock();
@@ -12933,18 +12910,12 @@ impl Tier1Cfg {
     }
 }
 
-/// The O3 optimisation of a function (backend lane): `func` is a copy of its O1
-/// RIR, `get` gives the callees' RIR (snapshot). Returns the inlined callees.
-/// MAKEPAD_RUN_O3_QUICK_RA=1: O3 allocates registers as O1 does (no thorough allocation, block
-/// frequencies, loop splitting) -- the on/off switch for measuring that allocation's compile cost.
-fn t1_quick_ra(options: &crate::options::Options) -> bool {
-    options.t1_quick_ra
-}
-
 /// How many calls deep the O3 nocapture oracle follows a parameter: at 4, `self.members.push(c)`
 /// captured `self` and kept every `self.spectra` load in decode_spectra's loops (MAKEPAD_RUN_OPT=-nocap8: 4).
 const NOCAP_DEPTH: u32 = 8;
 
+/// The O3 optimisation of a function (backend lane): `func` is a copy of its O1
+/// RIR, `get` gives the callees' RIR (snapshot). Returns the inlined callees.
 fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, snap: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, hot: bool) -> Vec<(u32, usize)> {
     let _cost_opt = relax_codegen::fncost::phase(4);
     relax_codegen::fncost::size(true, func);
@@ -17870,7 +17841,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         if p.replay { p.map.get(k).map(|e| e.inline_freq.clone()) } else { None }
     });
     let ro = u.ro_reader();
-    let env = x64::Env { slots: u.env.slots, tls_key: u.env.tls_key, tls_slow: u.env.tls_slow, resume: u.env.resume, opt_regs: !t1_quick_ra(options), syms: u.env.syms, sym_class: u.env.sym_class, near: u.env.near };
+    let env = x64::Env { slots: u.env.slots, tls_key: u.env.tls_key, tls_slow: u.env.tls_slow, resume: u.env.resume, opt_regs: true, syms: u.env.syms, sym_class: u.env.sym_class, near: u.env.near };
     let cfg = u.tier1.as_ref().unwrap().opt;
     let name = u.fns[id as usize].name.to_string();
     // PGO: the counted build's block counts for the O3 input (they go onto its blocks; the
@@ -19185,11 +19156,6 @@ pub(crate) fn borrowck_discovery() -> bool {
     ahead_policy().borrowck_discovery
 }
 
-/// MAKEPAD_RUN_SPEC_ORDER=lifo: newest queued first (the callees of the latest compile)
-fn spec_lifo(options: &crate::options::Options) -> bool {
-    options.spec_order
-}
-
 /// MAKEPAD_RUN_SPEC_HOT=1: speculate only on the fall-through path's calls
 /// Default: fall-through only while the machine runs on battery (less work built ahead that
 /// is never called), every warm call on mains power. MAKEPAD_RUN_SPEC_HOT=1/0 overrides.
@@ -20352,7 +20318,7 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions, options: &crate::option
                 if SPEC_STOP.load(Ordering::SeqCst) {
                     return;
                 }
-                let next = if spec_lifo(options) { q.pop_back() } else { q.pop_front() };
+                let next = q.pop_front();
                 if let Some(id) = next {
                     break id;
                 }

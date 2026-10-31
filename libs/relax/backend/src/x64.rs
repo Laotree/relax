@@ -5219,9 +5219,9 @@ impl<'a> Gen<'a> {
                 self.a.movf_rr(true, xd, XS);
                 self.fin_f(d, xd);
             }
-            Inst::VGather(d, base, idx) if !use_gather(options) => {
+            Inst::VGather(d, base, idx) => {
                 // per lane: pextrd + a load into the lane (faster than vpgatherdd for four lanes on
-                // the CPUs measured; MAKEPAD_RUN_GATHER=1 selects the gather). Lane 0 is a movd load,
+                // the CPUs measured). Lane 0 is a movd load,
                 // which writes the whole register: no dependency on xmm1's last (unrelated) value.
                 let rb = self.use_i(options, base, R11);
                 let xi = self.use_f(idx, XS2);
@@ -5235,31 +5235,6 @@ impl<'a> Gen<'a> {
                         self.a.sse_ext_m(0x66, 0x3a, 0x22, 1, rb, 0); // pinsrd xmm1, [rb + rax*4], l
                         self.a.byte(l);
                     }
-                }
-                let xd = self.def_f(d, XS);
-                self.a.movf_rr(true, xd, 1);
-                self.fin_f(d, xd);
-            }
-            Inst::VGather(d, base, idx) => {
-                // vpgatherdd xmm1, [rb + xmm_idx*4], xmm0 (mask: all lanes; the instruction
-                // clears it): VEX.128.66.0F38.W0 90 /r with a VSIB address
-                let rb = self.use_i(options, base, R11);
-                let xi = self.use_f(idx, XS2);
-                self.a.sse_rr(0x66, 0x76, 0, 0, false); // pcmpeqd xmm0, xmm0
-                self.a.sse_rr(0x66, 0xef, 1, 1, false); // pxor xmm1, xmm1 (no stale lanes)
-                // C4 RXB.00010 W0.vvvv(xmm0).0.01 90 modrm(reg=xmm1, rm=100) sib(scale 4, index xi, base rb)
-                self.a.byte(0xc4);
-                self.a.byte((1 << 7) | ((!(xi >> 3) & 1) << 6) | ((!(rb >> 3) & 1) << 5) | 0b00010);
-                self.a.byte((0b1111 << 3) | 0b01);
-                self.a.byte(0x90);
-                if rb & 7 == 5 {
-                    // rbp/r13 base needs a disp8
-                    self.a.byte(0x40 | (1 << 3) | 4);
-                    self.a.byte((2 << 6) | ((xi & 7) << 3) | (rb & 7));
-                    self.a.byte(0);
-                } else {
-                    self.a.byte((1 << 3) | 4);
-                    self.a.byte((2 << 6) | ((xi & 7) << 3) | (rb & 7));
                 }
                 let xd = self.def_f(d, XS);
                 self.a.movf_rr(true, xd, 1);
@@ -6390,9 +6365,6 @@ impl<'a> Gen<'a> {
     }
 }
 
-fn use_gather(options: &relax_session::Options) -> bool {
-    options.gather
-}
 
 /// The vreg a compare defines.
 /// Can `load (sz bytes, sx: sign-extended) cmp k` read the memory in the load's width
@@ -6694,7 +6666,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         },
         // off: pinned on a pool node it costs 12% on the parity test and nothing elsewhere; code/pool
         // cache-line separation does not change that (tested). Cause not proven.
-        memconst: options.memconst || host_avx(options),
+        memconst: host_avx(options),
         avx: host_avx(options),
         byte_masks: crate::bitops::vector_byte_masks(f),
         sel_cmp: None,

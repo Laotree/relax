@@ -520,17 +520,6 @@ impl Ranges {
     }
 }
 
-/// MAKEPAD_RUN_RA_PRIO: allocation order by weighted references (default: the values whose spilling
-/// costs most go first; live-range splitting keeps long ones from blocking whole functions),
-/// `len` (per position of live range), `sqrt` (per square root of the length)
-fn ra_prio(options: &relax_session::Options) -> u8 {
-    options.ra_prio as u8
-}
-
-fn ra_order_by_start(options: &relax_session::Options) -> bool {
-    options.ra_order
-}
-
 /// Any bit set in positions a..=b
 #[inline]
 fn bits_any(o: &[u64], a: u32, b: u32) -> bool {
@@ -1087,11 +1076,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         }
     }
     let first: Vec<u32> = (0..nv).map(|v| rng(v).first().map_or(0, |x| x.0)).collect();
-    if ra_order_by_start(options) {
-        order.sort_by_key(|a| first[*a as usize]);
-    } else {
-        order.sort_by(|a, b| weight[*b as usize].partial_cmp(&weight[*a as usize]).unwrap_or(std::cmp::Ordering::Equal).then(first[*a as usize].cmp(&first[*b as usize])));
-    }
+    order.sort_by(|a, b| weight[*b as usize].partial_cmp(&weight[*a as usize]).unwrap_or(std::cmp::Ordering::Equal).then(first[*a as usize].cmp(&first[*b as usize])));
     call_pos.sort();
     // weight of each call's block (call_pos order)
     let call_w: Vec<f32> = call_pos.iter().map(|&p| wts[block_start.partition_point(|&s| s <= p) - 1]).collect();
@@ -3321,24 +3306,14 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
 /// depth for blocks no sample hit; without, 8^loop depth (capped).
 fn block_weights(options: &relax_session::Options, f: &Func, reach: &[bool], freq: Option<&[f32]>) -> Vec<f32> {
     let depth = loop_depths(f, reach);
-    match (freq, freq_mode(options)) {
-        (Some(fr), 0) if fr.len() == f.blocks.len() => depth.iter().zip(fr).map(|(d, x)| 0.02 * 8f32.powi((*d).min(2) as i32) + 64.0 * x).collect(),
-        (Some(fr), 2) if fr.len() == f.blocks.len() => {
-            // static estimate as the base, samples raise a block up to 8x: tier-up happens after a
-            // handful of samples (glyph_cache: 9 of 176 blocks sampled, values 0.5 / 1.0), too
-            // few to rank the blocks of a hot loop on their own
-            let st = static_weights(options, f, reach, &depth);
-            st.iter().zip(fr).map(|(s, x)| s * (1.0 + 7.0 * x)).collect()
-        }
-        (_, 0) => depth.iter().map(|d| 8f32.powi((*d).min(depth_cap(options)) as i32)).collect(),
-        _ => static_weights(options, f, reach, &depth),
+    let st = static_weights(options, f, reach, &depth);
+    match freq {
+        // static estimate as the base, samples raise a block up to 8x: tier-up happens after a
+        // handful of samples (glyph_cache: 9 of 176 blocks sampled, values 0.5 / 1.0), too
+        // few to rank the blocks of a hot loop on their own
+        Some(fr) if fr.len() == f.blocks.len() => st.iter().zip(fr).map(|(s, x)| s * (1.0 + 7.0 * x)).collect(),
+        _ => st,
     }
-}
-
-/// MAKEPAD_RUN_FREQ_MODE: how block weights use sampled frequencies -- sampled (0: samples dominate),
-/// static (1: loop depth + cold paths, samples ignored), blend (2, default: static x up to 8 by samples)
-fn freq_mode(options: &relax_session::Options) -> u8 {
-    options.freq_mode as u8
 }
 
 /// Static block weights: 8^loop depth (capped), panic / unwind paths (blocks that can only end in
@@ -3380,7 +3355,7 @@ fn static_weights(options: &relax_session::Options, f: &Func, reach: &[bool], de
             break;
         }
     }
-    (0..nb).map(|b| if cold[b] { 0.001 } else { 8f32.powi(depth[b].min(depth_cap(options)) as i32) }).collect()
+    (0..nb).map(|b| if cold[b] { 0.001 } else { 8f32.powi(depth[b].min(DEPTH_CAP) as i32) }).collect()
 }
 
 /// Loop depth per block: the number of loops holding it. Loops from a depth-first search: an
@@ -3692,12 +3667,13 @@ fn spill_weights(f: &Func, reach: &[bool], tab: &OpTab, ranges: &Ranges, wts: &[
     (refs, lens)
 }
 
-/// Allocation priority from weighted references and live-range length (MAKEPAD_RUN_RA_PRIO).
+/// Allocation priority: weighted references (the values whose spilling costs most go first;
+/// live-range splitting keeps long ones from blocking whole functions), or per square root of the
+/// live range's length (compute kernels, Options::ra_prio).
 fn prio(options: &relax_session::Options, refs: f32, len: u32) -> f32 {
-    match ra_prio(options) {
-        1 => refs,
-        2 => refs / (len.max(1) as f32).sqrt(),
-        _ => refs / len.max(1) as f32,
+    match options.ra_prio {
+        relax_session::options::Priority::References => refs,
+        relax_session::options::Priority::Sqrt => refs / (len.max(1) as f32).sqrt(),
     }
 }
 
@@ -5066,9 +5042,8 @@ fn const_vreg(g: &mut Func, consts: &mut Vec<(i64, u32, VReg)>, v: i64, home: u3
     }
 }
 
-fn depth_cap(options: &relax_session::Options) -> u32 {
-    options.ra_depthcap
-}
+/// Loop depths above this weigh as this one (8^depth block weights).
+const DEPTH_CAP: u32 = 5;
 
 /// Indexed accesses of one base and index in a block, some with displacements (unrolled copies:
 /// [b + i*4 + 4], [b + i*4 + 8], ...): one address `p = b + (i << s)` before the first and plain
