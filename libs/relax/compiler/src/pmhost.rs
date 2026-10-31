@@ -83,12 +83,10 @@ impl crate::macro_reg::MacroRunner for JitRunner {
         native.declarations(attr, input, span)
     }
     fn reusable(&self, entry: &Entry) -> bool { crate::native_macros::find(entry).is_ok_and(|n| n.is_some()) }
-    fn registered(&self, sess: &std::sync::Arc<crate::Session>) -> Result<(), String> {
-        sess.runtime.validate_native_macros()?;
+    fn registered(&self, _sess: &std::sync::Arc<crate::Session>) -> Result<(), String> {
         crate::native_macros::prepare()
     }
     fn prewarm(&self, sess: &std::sync::Arc<crate::Session>) -> Result<(), String> {
-        sess.runtime.validate_native_macros()?;
         crate::native_macros::verdict()?;
         prewarm(sess)
     }

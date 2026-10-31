@@ -515,10 +515,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut driver_options = sess.options.clone();
     crate::registry_net::install();
     crate::pmhost::install();
-    if let Err(e) = sess.runtime.validate_native_macros() {
-        eprintln!("makepad-run: {e}");
-        return 1;
-    }
     jit::COMPILE_ERRORS_FATAL.store(true, Ordering::Relaxed);
     jit::FAULTS_FATAL.store(true, Ordering::Relaxed);
     crate::clock::mark_start();

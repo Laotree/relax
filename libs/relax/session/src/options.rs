@@ -147,8 +147,6 @@ pub struct Options {
     pub no_block_freq: bool,
     /// `MAKEPAD_RUN_NO_BMI2`; default `false`.
     pub no_bmi2: bool,
-    /// `MAKEPAD_RUN_NO_BOUND_INFER`; default `false`.
-    pub no_bound_infer: bool,
     /// `MAKEPAD_RUN_NO_COALESCE`; default `false`.
     pub no_coalesce: bool,
     /// `MAKEPAD_RUN_NO_FULL_UNROLL`; default `false`.
@@ -343,7 +341,6 @@ impl Default for Options {
             no_bitops: false,
             no_block_freq: false,
             no_bmi2: false,
-            no_bound_infer: false,
             no_coalesce: false,
             no_full_unroll: false,
             no_iv_ranges: false,
@@ -453,7 +450,6 @@ impl Options {
             no_bitops: { let os = get("MAKEPAD_RUN_NO_BITOPS"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
             no_block_freq: { let os = get("MAKEPAD_RUN_NO_BLOCK_FREQ"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
             no_bmi2: { let os = get("MAKEPAD_RUN_NO_BMI2"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
-            no_bound_infer: { let os = get("MAKEPAD_RUN_NO_BOUND_INFER"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
             no_coalesce: { let os = get("MAKEPAD_RUN_NO_COALESCE"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
             no_full_unroll: { let os = get("MAKEPAD_RUN_NO_FULL_UNROLL"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
             no_iv_ranges: { let os = get("MAKEPAD_RUN_NO_IV_RANGES"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
@@ -561,7 +557,6 @@ impl Options {
             no_bitops,
             no_block_freq,
             no_bmi2,
-            no_bound_infer,
             no_coalesce,
             no_full_unroll,
             no_iv_ranges,
@@ -659,8 +654,6 @@ impl Options {
         h.u8(*no_block_freq as u8);
         h.str("no_bmi2");
         h.u8(*no_bmi2 as u8);
-        h.str("no_bound_infer");
-        h.u8(*no_bound_infer as u8);
         h.str("no_coalesce");
         h.u8(*no_coalesce as u8);
         h.str("no_full_unroll");
@@ -841,10 +834,6 @@ pub fn default_parse_jobs() -> usize {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeOptions {
-    /// Legacy switch retained to diagnose MAKEPAD_RUN_NATIVE_MACROS=0 as a policy error.
-    pub native_macros: bool,
-    /// Legacy differential switch; MAKEPAD_RUN_NATIVE_VERIFY=1 conflicts with native-only macros.
-    pub native_verify: bool,
     /// Reparse accepted worker files in collection scope and compare their complete ASTs.
     pub parse_verify: bool,
     /// Frozen execution options for the source lowering core.
@@ -890,8 +879,6 @@ pub struct RuntimeOptions {
 impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
-            native_macros: true,
-            native_verify: false,
             parse_verify: false,
             profile: false,
             parse_jobs: default_parse_jobs(),
@@ -916,24 +903,12 @@ impl Default for RuntimeOptions {
 }
 
 impl RuntimeOptions {
-    pub fn validate_native_macros(&self) -> Result<(), String> {
-        if !self.native_macros {
-            return Err("MAKEPAD_RUN_NATIVE_MACROS=0 conflicts with native-only Makepad proc macros; unset it and rebuild makepad to use changed macro sources".into());
-        }
-        if self.native_verify {
-            return Err("MAKEPAD_RUN_NATIVE_VERIFY=1 conflicts with native-only Makepad proc macros; unset it (hosted differential expansion is not supported)".into());
-        }
-        Ok(())
-    }
-
     pub fn from_env() -> Self {
         Self::read(&|name| std::env::var_os(name))
     }
 
     fn read(get: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Self {
         Self {
-            native_macros: get("MAKEPAD_RUN_NATIVE_MACROS").as_deref() != Some(std::ffi::OsStr::new("0")),
-            native_verify: get("MAKEPAD_RUN_NATIVE_VERIFY").as_deref() == Some(std::ffi::OsStr::new("1")),
             parse_verify: get("MAKEPAD_RUN_PARSE_VERIFY").as_deref() == Some(std::ffi::OsStr::new("1")),
             profile: get("MAKEPAD_RUN_PROFILE").is_some(),
             parse_jobs: get("MAKEPAD_RUN_JOBS").and_then(|v| v.into_string().ok()).and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(default_parse_jobs).clamp(1, 32),
@@ -987,13 +962,11 @@ mod tests {
             "MAKEPAD_RUN_OPT" => Some(" -thread,-ifconv".into()),
             "MAKEPAD_RUN_BORROWCK_ALL" => Some("0".into()),
             "MAKEPAD_RUN_CORE_HINT" => Some("0".into()),
-            "MAKEPAD_RUN_NO_BOUND_INFER" => Some("0".into()),
             _ => None,
         });
         assert_eq!(opts.inline_leaf, (40, 17));
         assert_eq!(opts.inline_src, None);
         assert_eq!(opts.core_hint, Some(false));
-        assert!(opts.no_bound_infer);
         assert_eq!(opts.borrowck_all, BorrowckAll::All);
         assert_eq!(opts.opt, [" -thread", "-ifconv"]);
         assert_ne!(empty.fingerprint(), opts.fingerprint());
@@ -1004,9 +977,6 @@ mod tests {
         let base = Options::default();
         let fingerprint = base.fingerprint();
         let mut changed = base.clone();
-        changed.no_bound_infer = true;
-        assert_ne!(fingerprint, changed.fingerprint());
-        changed = base.clone();
         changed.live = true;
         assert_ne!(fingerprint, changed.fingerprint());
         changed = base.clone();

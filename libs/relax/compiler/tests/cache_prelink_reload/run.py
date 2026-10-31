@@ -25,7 +25,7 @@ base = open(helper).read()
 # the live driver writes this file once it watches the sources (MAKEPAD_RUN_LIVE_READY)
 ready = os.path.join(tmp, "live-ready")
 env = dict(os.environ, MAKEPAD_RUN_LIVE="1", MAKEPAD_RUN_LIVE_READY=ready, MAKEPAD_RUN_CACHE_DIR=os.path.join(tmp, "cache"))
-for k in ("MAKEPAD_RUN_CACHE", "MAKEPAD_RUN_PRELINK", "MAKEPAD_RUN_HINTS_RECORD"):
+for k in ("MAKEPAD_RUN_CACHE", "MAKEPAD_RUN_PRELINK"):
     env.pop(k, None)
 cmd = [relax, "run", "--verbose", "cache-prelink-reload"]
 

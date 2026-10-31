@@ -1434,7 +1434,7 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
 /// stay lazy. MAKEPAD_RUN_PRELINK=0 turns it off. Returns the slots installed.
 pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
     // (--check-first: every slot passes the borrow checker before its first code, cached or not)
-    if CHECK_FIRST.load(Ordering::Relaxed) || std::env::var_os("MAKEPAD_RUN_PRELINK").map_or(false, |v| v == "0") || std::env::var_os("MAKEPAD_RUN_HINTS_RECORD").is_some() {
+    if CHECK_FIRST.load(Ordering::Relaxed) || std::env::var_os("MAKEPAD_RUN_PRELINK").map_or(false, |v| v == "0") {
         return 0;
     }
     let prelinked = owner::call(owner::Class::Program, || {
