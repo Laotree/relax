@@ -843,6 +843,7 @@ impl<'a> Parser<'a> {
                         b"inout" => AsmDir::InOut,
                         b"inlateout" => AsmDir::InLateOut,
                         b"sym" => AsmDir::Sym,
+                        b"label" => AsmDir::Label,
                         _ => return self.err("expected an asm! operand"),
                     },
                     _ => return self.err("expected an asm! operand"),
@@ -851,6 +852,10 @@ impl<'a> Parser<'a> {
                 let mut op = AsmOp { name, dir, reg: Ident { lo: 0, hi: 0 }, explicit: false, input: None, output: None };
                 match dir {
                     AsmDir::Const | AsmDir::Sym => op.input = Some(self.expr()?),
+                    AsmDir::Label => {
+                        if self.kind() != T::OpenBrace { return self.err("expected a block after `label`"); }
+                        op.input = Some(self.expr()?);
+                    }
                     _ => {
                         self.expect(T::OpenParen)?;
                         op.explicit = self.kind() == T::Str;
@@ -1348,6 +1353,22 @@ impl<'a> Parser<'a> {
     }
 
     /// The module the parser is in (`module_path!` form: the file's module and inline `mod`s).
+    /// Whether a macro path's module part names the crate root from the current module.
+    fn names_crate_root(&self, mpath: &[String]) -> bool {
+        let module = self.cur_module();
+        let mut depth = module.split("::").count() - 1;
+        for s in mpath {
+            match s.as_str() {
+                "" | "crate" => depth = 0,
+                "self" => {}
+                "super" => depth = depth.saturating_sub(1),
+                s if s.strip_prefix("__relax_crate_") == Some(self.krate.as_str()) => depth = 0,
+                _ => return false,
+            }
+        }
+        depth == 0
+    }
+
     pub fn cur_module(&self) -> String {
         let mut m = match &self.bctx {
             Some(c) => c.module_path.clone(),
@@ -1569,7 +1590,9 @@ impl<'a> Parser<'a> {
         // a macro-expanded one is the lint macro_expanded_macro_exports_accessed_by_absolute_paths (lint_early)
         if qual.is_some() || path.global() {
             if let (Some(d), Some(c)) = (r.as_ref(), self.bctx.as_ref()) {
-                if d.builtin == 0 && d.exported && d.krate == self.krate {
+                // (rustc: the binding found in the module is the macro's own, in the crate root; a path
+                // through an import of it finds the import)
+                if d.builtin == 0 && d.exported && d.krate == self.krate && d.name == name && self.names_crate_root(&mpath) {
                     crate::macros::uses::abs_path_macro_call(&c.path, seg.name.lo, d);
                 }
             }
@@ -3087,7 +3110,11 @@ impl<'a> Parser<'a> {
             let ty_lo = self.lo();
             let ty = self.ty_plus()?;
             let ty_span = (ty_lo, self.prev_hi());
-            let default = if self.eat(T::Eq) { Some(self.expr()?) } else { None };
+            let default = if self.kind() == T::Eq {
+                self.ast.gated_syntax.push(("default_field_values", self.tok().lo));
+                self.pos += 1;
+                Some(self.expr()?)
+            } else { None };
             v.push(FieldDef { attrs: self.ast.push_list(attrs), vis, name: Some(name), ty, default, ty_span });
             if self.kind() == T::Comma && self.doc_before() {
                 return self.err("E0585: found a documentation comment that doesn't document anything");

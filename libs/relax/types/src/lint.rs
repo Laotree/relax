@@ -433,7 +433,7 @@ pub fn check_literals(prog: &Program, tcx: &crate::tcx::Tcx, body: &crate::typec
                     let ty = crate::typeck::ty_to_string(false, prog, tcx, t);
                     let lit = if neg { format!("-{}", text) } else { text.to_string() };
                     let range = if signed { format!("-{}..={}", min_abs, max) } else { format!("0..={}", max) };
-                    emit(prog, body.def, &OVERFLOWING_LITERALS, body.file, ex.lo,
+                    emit_in(prog, body.def, &attrs_around_expr(prog, body.def, body.file, e), &OVERFLOWING_LITERALS, body.file, ex.lo,
                         &format!("literal out of range for `{}` -- the literal `{}` does not fit into the type `{}` whose range is `{}`", ty, lit, ty, range));
                 }
             }
@@ -447,7 +447,7 @@ pub fn check_literals(prog: &Program, tcx: &crate::tcx::Tcx, body: &crate::typec
                     _ => false,
                 };
                 if inf {
-                    emit(prog, body.def, &OVERFLOWING_LITERALS, body.file, ex.lo,
+                    emit_in(prog, body.def, &attrs_around_expr(prog, body.def, body.file, e), &OVERFLOWING_LITERALS, body.file, ex.lo,
                         &format!("literal out of range for `{}` -- the literal `{}` does not fit into the type `{}` and will be converted to `{}::INFINITY`", ty, text, ty, ty));
                 }
             }
@@ -540,6 +540,44 @@ fn stmt_attrs_around(prog: &Program, owner: DefId, file: u32, item: crate::ast::
     let ast = &prog.files[od.file as usize].ast;
     if od.file != file { return Vec::new(); }
     let mut f = Find { ast, item, stack: Vec::new(), found: None };
+    match ast.item(od.item).kind {
+        ItemKind::Fn(..) => {
+            if let Ok(Some(b)) = prog.fn_body(od.file, od.item) { f.block(b); }
+        }
+        ItemKind::Const(..) | ItemKind::Static(..) => {
+            if let Ok(Some(e)) = prog.const_body(od.file, od.item) { f.expr(e); }
+        }
+        _ => {}
+    }
+    f.found.unwrap_or_default()
+}
+
+/// The attributes of the statements, arms and blocks around expression `target` in the body that
+/// holds `def` (outermost first): rustc's lint level builder has a level per HIR node.
+fn attrs_around_expr(prog: &Program, def: DefId, file: u32, target: crate::ast::ExprId) -> Vec<Attr> {
+    use crate::ast::*;
+    use crate::ast_visit::{self, Visitor};
+    struct Find<'a> { ast: &'a Ast, target: ExprId, stack: Vec<Attr>, found: Option<Vec<Attr>> }
+    impl<'a> Visitor<'a> for Find<'a> {
+        fn ast(&self) -> &'a Ast { self.ast }
+        fn enter_attrs(&mut self, attrs: List<Attr>) { self.stack.extend_from_slice(self.ast.list(attrs)); }
+        fn leave_attrs(&mut self, attrs: List<Attr>) {
+            let n = self.ast.list(attrs).len();
+            self.stack.truncate(self.stack.len() - n);
+        }
+        fn expr(&mut self, e: ExprId) {
+            if self.found.is_some() { return; }
+            if e == self.target { self.found = Some(self.stack.clone()); return; }
+            ast_visit::walk_expr(self, e);
+        }
+    }
+    let mut owner = def;
+    while owner != NO_DEF && matches!(prog.def(owner).kind, DefKind::Closure | DefKind::AnonConst) { owner = prog.def(owner).parent; }
+    if owner == NO_DEF { return Vec::new(); }
+    let od = prog.def(owner);
+    if od.file != file || od.item.0 == u32::MAX { return Vec::new(); }
+    let ast = &prog.files[od.file as usize].ast;
+    let mut f = Find { ast, target, stack: Vec::new(), found: None };
     match ast.item(od.item).kind {
         ItemKind::Fn(..) => {
             if let Ok(Some(b)) = prog.fn_body(od.file, od.item) { f.block(b); }

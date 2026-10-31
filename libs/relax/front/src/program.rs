@@ -5775,7 +5775,7 @@ fn strip_cfg_stmts(ast: &mut Ast, src: Src, cfg: &CfgSet, b: BlockId) {
                     out.push(Stmt::Expr(expr, semi));
                     // the statement's attributes are kept for the lint passes (lint levels, and the
                     // fact that a value had attributes: `#[cfg(..)] { x }` is not an unused-braces case)
-                    kept_attrs.push((expr, attrs));
+                    kept_attrs.push(AttrsStmt { attrs, expr, semi });
                 }
             }
             Stmt::Let(r) if { let attrs = ast.row(*r).attrs; !attrs.is_empty() && !crate::cfg::active(src, ast.list(attrs), cfg) } => {}
@@ -5784,7 +5784,7 @@ fn strip_cfg_stmts(ast: &mut Ast, src: Src, cfg: &CfgSet, b: BlockId) {
     }
     let l = ast.push_list(out);
     ast.block_mut(b).stmts = l;
-    ast.stmt_attrs.extend(kept_attrs);
+    ast.stmt_attrs.extend_from_slice(&kept_attrs);
 }
 
 /// Closures in an owner's expression ranges, including its lazily materialized body.
