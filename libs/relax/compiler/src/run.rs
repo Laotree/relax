@@ -550,7 +550,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // `makepad test <package>` (lib.rs): the program is the package's test harness, not its main
     let mut harness = false;
     let mut plain_test: Option<String> = None;
-    let mut no_fail_fast = false;
     let mut cargo_flags = Vec::new();
     let mut i = 0;
     while i < args.len() && args[i].starts_with("--") {
@@ -578,7 +577,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 // a test whose code Relax cannot compile fails as that test; the others still run
                 jit::COMPILE_ERRORS_FATAL.store(false, Ordering::Relaxed);
             }
-            "--no-fail-fast" => no_fail_fast = true,
+            "--no-fail-fast" => {}
             // `makepad test`'s run of one `harness = false` target (test_pkg.rs): cargo builds it
             // with `--cfg test` but no `--test` and runs it as a plain program, its exit status
             // the verdict; the value is the target's source path
@@ -1784,7 +1783,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             }
         }
         groups.sort();
-        let code = crate::harness::run(&mut u, up, &groups, no_fail_fast);
+        let code = crate::harness::run(&mut u, up, &groups);
         flush_errors(true);
         std::mem::forget(u);
         return code;
