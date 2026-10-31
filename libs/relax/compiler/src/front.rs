@@ -3,8 +3,7 @@
 //! ParsedFile::part publishes it), into the run's image store (cache/front_run.rs), and from
 //! then on read through the mapping -- clean file pages instead of heap. Warm runs map the same
 //! images (crate stores refer to them) and read them through the same functions (restore,
-//! apply_part). MAKEPAD_RUN_FRONT=0 disables front images; MAKEPAD_RUN_FRONT_VERIFY=1 compares every
-//! section with the parse it replaces.
+//! apply_part). MAKEPAD_RUN_FRONT_VERIFY=1 compares every section with the parse it replaces.
 
 use crate::arena::Arena;
 use crate::image::{Reader, Writer};
@@ -45,11 +44,6 @@ fn mismatch(path: &str, section: &str) -> bool {
         eprintln!("makepad-run front mismatch: {} {}", path, section);
     }
     false
-}
-
-pub fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_FRONT").map_or(true, |v| v != "0"))
 }
 
 pub fn verify() -> bool {

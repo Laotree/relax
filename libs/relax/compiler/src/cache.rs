@@ -4929,7 +4929,7 @@ impl FrontImages {
         // A build script's run (its own small world: std plus the script's crates) keeps no
         // front images: they are read only when a script runs again, which a cached build
         // result makes rare, while they cost a second copy of the std world on disk.
-        if !crate::front::enabled() || mode_from_env(options).is_none() || std::env::var_os("MAKEPAD_RUN_BUILD_SCRIPT").is_some() {
+        if mode_from_env(options).is_none() || std::env::var_os("MAKEPAD_RUN_BUILD_SCRIPT").is_some() {
             return None;
         }
         let root = crate::dirs::relax_dir();
@@ -5740,7 +5740,7 @@ pub struct ColdFront {
 }
 impl ColdFront {
     pub fn enabled(options: &crate::options::Options) -> bool {
-        crate::front::enabled() && matches!(mode_from_env(options), Some(Mode::On | Mode::Verify))
+        matches!(mode_from_env(options), Some(Mode::On | Mode::Verify))
     }
 
     pub fn loaded(&mut self, prog: &crate::program::Program, krate: u32) {

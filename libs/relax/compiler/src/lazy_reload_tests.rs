@@ -452,18 +452,14 @@ fn specv_aliased_call_from_unverified_body() {
 /// (the Sandbox's frame path: ~550 lazy installs in one 70-560 ms frame). Now they run their twins'
 /// code until their own builds (background) are installed: no lazy compile on the program thread.
 /// The verdicts are held (SPECV_HOLD) so the first run is unverified whatever the checker's speed;
-/// case `off` (MAKEPAD_RUN_SPECV_BORROW=0) is the old behaviour: the repro makes the lazy compiles.
 #[test]
 fn specv_verified_rebuild_runs_twin_code_not_lazy_compiles() {
     const CHILD: &str = "MAKEPAD_RUN_SPECV_BORROW_TEST";
     let Ok(case) = std::env::var(CHILD) else {
-        for case in ["borrow", "off"] {
+        for case in ["borrow"] {
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
             cmd.args(["--exact", "lazy_reload_tests::specv_verified_rebuild_runs_twin_code_not_lazy_compiles", "--nocapture", "--test-threads=1", "--format=terse"])
                 .env(CHILD, case).env("MAKEPAD_RUN_GANDALF_ALL", "0");
-            if case == "off" {
-                cmd.env("MAKEPAD_RUN_SPECV_BORROW", "0");
-            }
             let output = cmd.output().unwrap();
             assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         }
@@ -533,15 +529,11 @@ fn specv_verified_rebuild_runs_twin_code_not_lazy_compiles() {
     let lazy0 = crate::jit::LAZY_FRONTS.load(Ordering::Relaxed);
     run("verified");
     let lazy = crate::jit::LAZY_FRONTS.load(Ordering::Relaxed) - lazy0;
-    if case == "off" {
-        assert!(lazy >= 1, "the old behaviour: the base slots compile on the calling thread");
-    } else {
-        assert_eq!(lazy, 0, "no lazy compile on the calling thread: mid runs its twin's code");
-        assert!(u.fns[mid as usize].borrowed || u.fns[mid as usize].compiled, "mid borrows its twin's code (or got its own build)");
-        // a patch-free rerun stays on code
-        run("again");
-        assert_eq!(crate::jit::LAZY_FRONTS.load(Ordering::Relaxed) - lazy0, 0);
-    }
+    assert_eq!(lazy, 0, "no lazy compile on the calling thread: mid runs its twin's code");
+    assert!(u.fns[mid as usize].borrowed || u.fns[mid as usize].compiled, "mid borrows its twin's code (or got its own build)");
+    // a patch-free rerun stays on code
+    run("again");
+    assert_eq!(crate::jit::LAZY_FRONTS.load(Ordering::Relaxed) - lazy0, 0);
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
