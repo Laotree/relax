@@ -412,16 +412,15 @@ pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
     let p = std::sync::Arc::new(Parked { id, seq, os_id: super::threads::self_os_id(), domain, decision: AtomicU32::new(0), words: Mutex::new(Vec::new()), event, what: (thread.clone(), info.message.clone(), location.clone()), frames: info.frames.iter().copied().take(64).collect(), regs: if unwinds { unsafe { std::slice::from_raw_parts(regs, crate::jit::REG_WORDS) }.to_vec() } else { Vec::new() }, stale: false });
     list.push(p.clone());
     parked_changed();
-    if !watched {
-        eprintln!(
-            "makepad: panic parked on thread {} ({}) for {} s -- attach: makepad inspect {} panics (resume P{} panic)",
-            thread,
-            super::short(&info.message, 120),
-            wait_s,
-            std::process::id(),
-            id
-        );
-    }
+    // said watched or not: what reads the app's output (a CI smoke) is no watcher of the event stream
+    eprintln!(
+        "makepad: panic parked on thread {} ({}) for {} s -- attach: makepad inspect {} panics (resume P{} panic)",
+        thread,
+        super::short(&info.message, 120),
+        wait_s,
+        std::process::id(),
+        id
+    );
     let t0 = std::time::Instant::now();
     while p.decision.load(SeqCst) == 0 && t0.elapsed().as_secs() < wait_s {
         // an unwatched park ends early once nobody could still attach in time
