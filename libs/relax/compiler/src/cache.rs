@@ -1195,6 +1195,7 @@ impl Cache {
         let mut h = Sip128::new();
         h.str("front");
         h.u32(crate::image::VERSION);
+        h.u128(crate::codegen_id::front_id());
         h.str(path);
         h.u128(source_hash);
         h.finish128()
@@ -1204,6 +1205,7 @@ impl Cache {
         let mut h = Sip128::new();
         h.str("front-part");
         h.u32(crate::image::VERSION);
+        h.u128(crate::codegen_id::front_id());
         h.str(path);
         h.u128(source_hash);
         h.finish128()
@@ -4602,6 +4604,7 @@ fn front_crate_key(name: &str, root: &str) -> u128 {
     let mut h = Sip128::new();
     h.str("front-crate");
     h.u32(crate::crate_image::VERSION);
+    h.u128(crate::codegen_id::front_id());
     h.str(name);
     h.str(root);
     h.finish128()
