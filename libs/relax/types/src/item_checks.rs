@@ -776,7 +776,21 @@ pub fn entry_point(prog: &Program, root: u32) -> Vec<String> {
     if !sig.generics.where_.is_empty() {
         return err("E0646: `main` function is not allowed to have a `where` clause");
     }
-    Vec::new()
+    // rustc_hir_analysis check/entry.rs check_main: the entry point only, a `main` of a library or
+    // under the test harness is a function like any other
+    let p = prog.src(def.file);
+    let mut errors = Vec::new();
+    for a in ast.list(item.attrs) {
+        let lo = a.toks.lo as usize;
+        if a.toks.hi as usize <= lo || p.tok(lo).lo >= prog.files[def.file as usize].src_len { continue; }
+        let what = match crate::cfg::tok_str(p, lo) {
+            b"track_caller" => "be `#[track_caller]`",
+            b"target_feature" => "have `#[target_feature]`",
+            _ => continue,
+        };
+        errors.push(prog.record_uncoded_error(def.file, p.tok(lo).lo, "typeck", format!("`main` function is not allowed to {what}")));
+    }
+    errors
 }
 
 fn no_main_error(prog: &Program, root: u32, file: u32) -> String {
@@ -1143,10 +1157,6 @@ pub fn attribute_safety(prog: &Program, d: DefId) -> Vec<String> {
                 errors.push(prog.record_uncoded_error(def.file, pos, "typeck", format!("`{}` is not an unsafe attribute", String::from_utf8_lossy(&name))));
             }
             continue;
-        }
-        if from_source && matches!(name.as_slice(), b"track_caller" | b"target_feature") && def.kind == DefKind::Fn && prog.syms.str(def.name) == "main" && prog.def(def.parent).kind == DefKind::Mod && prog.mods[prog.def(def.parent).sub as usize].parent_mod.is_none() && crate::wfcheck::obligations::is_entry_main(prog, d) {
-            let what = if name == b"track_caller" { "be `#[track_caller]`" } else { "have `#[target_feature]`" };
-            errors.push(prog.record_uncoded_error(def.file, pos, "typeck", format!("`main` function is not allowed to {what}")));
         }
         if from_source && name == b"deprecated" && ast.list(ast.item(def.item).attrs).iter().take_while(|b| b.toks.lo != a.toks.lo).any(|b| b.toks.hi > b.toks.lo && crate::cfg::tok_str(p, b.toks.lo as usize) == b"deprecated") {
             errors.push(prog.record_uncoded_error(def.file, pos, "typeck", "multiple `deprecated` attributes".to_string()));
@@ -1836,6 +1846,7 @@ pub fn gated_syntax(prog: &Program, own: &[bool]) -> Vec<String> {
                 "coroutines" => "coroutine syntax is experimental",
                 "async_trait_bounds" => "`async` trait bounds are unstable",
                 "closure_track_caller" => "`#[track_caller]` on closures is currently unstable",
+                "default_field_values" => "default values on fields are experimental",
                 _ => continue,
             };
             errors.push(prog.record_error(f as u32, pos, "typeck", format!("E0658: {msg}")));

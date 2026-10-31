@@ -4921,8 +4921,31 @@ impl<'a> Fcx<'a> {
         let ast = self.ast();
         let margs = ast.mac_arg(m.args);
         let Some(spec) = margs.asm else { return self.tcx.tys.error };
-        for op in ast.list(spec.ops) {
+        let mut diverge = spec.options & ASM_NORETURN != 0;
+        let ops = ast.list(spec.ops);
+        // rustc_ast_lowering asm.rs: `asm_goto_with_outputs`
+        if let Some(label) = ops.iter().find(|op| op.dir == AsmDir::Label) {
+            let outputs = ops.iter().any(|op| matches!(op.dir, AsmDir::Out | AsmDir::LateOut | AsmDir::InOut | AsmDir::InLateOut) && op.output.is_some());
+            if outputs && !self.prog.crates[self.prog.def(self.b.def).krate as usize].features(self.prog).has("asm_goto_with_outputs") {
+                let at = label.input.map_or(self.last_lo, |x| ast.expr(x).lo);
+                self.err(at, "E0658: using both label and output operands for inline assembly is unstable".into());
+            }
+        }
+        for op in ops {
             match op.dir {
+                // rustc check_expr_asm: a label block has unit type or diverges; its divergence is
+                // not the asm's unless every path out of it diverges
+                AsmDir::Label => {
+                    let Some(x) = op.input else { continue };
+                    let previous = self.diverges;
+                    let unit = self.tcx.tys.unit;
+                    let t = self.check_expr(x, Some(unit));
+                    if self.shallow(t) != self.tcx.tys.never {
+                        self.coerce_or_unify(t, unit, Some(x), ast.expr(x).lo);
+                        diverge = false;
+                    }
+                    self.diverges = previous;
+                }
                 AsmDir::Sym | AsmDir::Const => {
                     if let Some(x) = op.input {
                         self.check_expr(x, None);
@@ -4943,11 +4966,7 @@ impl<'a> Fcx<'a> {
                 }
             }
         }
-        if spec.options & ASM_NORETURN != 0 {
-            self.tcx.tys.never
-        } else {
-            self.tcx.tys.unit
-        }
+        if diverge { self.tcx.tys.never } else { self.tcx.tys.unit }
     }
 
     pub fn check_expr(&mut self, e: ExprId, expected: Option<TyId>) -> TyId {

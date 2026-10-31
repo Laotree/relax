@@ -1045,6 +1045,8 @@ pub enum AsmDir {
     InLateOut,
     Const,
     Sym,
+    /// `label <block>`: the block runs when the template jumps to this operand
+    Label,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1500,7 +1502,7 @@ pub struct Ast {
     pub vis_paths: crate::arena::Arena<Path>,
     /// lint-level attributes (`#[allow(..)]` ..) of expression statements: cfg stripping drops the
     /// statement wrapper, this keeps the attributes for the lint passes (expression -> attributes)
-    pub stmt_attrs: Vec<(ExprId, List<Attr>)>,
+    pub stmt_attrs: crate::arena::Arena<AttrsStmt>,
     /// syntax the parser met that a feature gates, wherever it is written (cfg'd-out code and
     /// macro arguments included; rustc ParseSess::gated_spans): (feature, position)
     pub gated_syntax: Vec<(&'static str, u32)>,
@@ -1797,7 +1799,7 @@ impl Ast {
     }
     /// The lint-level attributes an expression statement was written with.
     pub fn stmt_attrs(&self, e: ExprId) -> List<Attr> {
-        if let Some((_, l)) = self.stmt_attrs.iter().find(|(x, _)| *x == e) { return *l; }
+        if let Some(s) = self.stmt_attrs.iter().find(|s| s.expr == e) { return s.attrs; }
         match self.part.get() {
             Some(p) => p.stmt_attrs(e),
             None => List::EMPTY,
@@ -1905,6 +1907,7 @@ impl Ast {
         self.ident_lists.shrink_to_fit();
         self.attrs.shrink_to_fit();
         self.asm_ops.shrink_to_fit();
+        self.stmt_attrs.shrink_to_fit();
         self.fn_sigs.shrink_to_fit();
         self.params.shrink_to_fit();
         self.field_defs.shrink_to_fit();
