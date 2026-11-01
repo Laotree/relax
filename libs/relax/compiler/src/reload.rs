@@ -1645,17 +1645,18 @@ fn def_name(prog: &crate::program::Program, d: DefId) -> String {
     prog.syms.str(prog.def(d).name).to_string()
 }
 
-/// RELOAD' (lead design, round 33): whether the running value of executable discriminant
-/// `anon` may change with this transaction, decided without running it. Its dependencies are
+/// RELOAD' (lead design, round 33): whether the running value an initializer slot made (an
+/// executable discriminant, a constant whose value a type uses) may change with this
+/// transaction, decided without running it. Its dependencies are
 /// the transitive static callee set of its initializer slot -- each slot's direct calls before
 /// inlining and the calls, fn values and thunks of its built RIR -- plus the constants a slot's
 /// build read (their initializer slots, walked the same way), the statics it addresses and
 /// the type arguments of every instance (a field-list edit of one changes what size_of and
 /// field offsets fold to). Ok(true): one of them is in `changed`. Err: the set is not exactly
 /// computable (an indirect call, a trait's associated constant, a RIR build failure).
-unsafe fn discriminant_deps_changed(up: *mut Unit, anon: DefId, changed: &[DefId], layout_defs: &[DefId]) -> Result<bool, String> {
+unsafe fn initializer_deps_changed(up: *mut Unit, root: u32, changed: &[DefId], layout_defs: &[DefId]) -> Result<bool, String> {
     use relax_backend::rir::{Callee, Inst};
-    let mut todo = vec![(&*up).fn_id(FnKey::Inst(anon, Vec::new()))];
+    let mut todo = vec![root];
     let mut seen: Vec<u32> = Vec::new();
     while let Some(s) = todo.pop() {
         if seen.contains(&s) { continue; }
@@ -2445,7 +2446,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 continue;
             }
             for c in code {
-                match discriminant_deps_changed(up, c, &changed, &layout_defs) {
+                match initializer_deps_changed(up, (&*up).fn_id(FnKey::Inst(c, Vec::new())), &changed, &layout_defs) {
                     Ok(false) => {}
                     Ok(true) => discr_restart.push(format!("enum `{}`: a discriminant is computed by code this edit changes -- restart the app", def_name(&(*up).prog, d))),
                     Err(e) => discr_restart.push(format!("enum `{}`: a discriminant is computed by code whose dependencies are not known exactly ({}) -- restart the app", def_name(&(*up).prog, d), e)),
@@ -2454,6 +2455,32 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
     }
     trace_sub("gp_discriminants");
+    // RELOAD' for constants: a constant a type uses whose value its initializer's code made
+    // (not folded) is never evaluated again in a transaction; when what that code depends on
+    // changes, the edit lands by a restart (the types sized by it hold the old value).
+    {
+        let mut changed: Vec<DefId> = body_defs.iter().chain(&consts_hit).chain(&static_defs).chain(&layout_defs).copied().collect();
+        for (_, plan) in &versions { changed.extend_from_slice(&plan.removed); }
+        let u = &*up;
+        let mut ran: Vec<(DefId, u32)> = Vec::new();
+        for (d, args) in u.consts.keys() {
+            if !matches!(u.prog.def(*d).kind, DefKind::Const | DefKind::AssocConst) || !visible_crates[u.prog.def(*d).krate as usize] || changed.contains(d) { continue; }
+            for s in u.slots_of_defs([*d]) {
+                if matches!(&u.fns[s as usize].key, FnKey::Inst(x, a) if x == d && a == args) && u.fns[s as usize].compiled { ran.push((*d, s)); }
+            }
+        }
+        ran.sort_unstable_by_key(|r| r.1);
+        ran.dedup();
+        for (c, s) in ran {
+            if !(&*up).tcx.const_was_evaluated(c) { continue; }
+            match initializer_deps_changed(up, s, &changed, &layout_defs) {
+                Ok(false) => {}
+                Ok(true) => discr_restart.push(format!("const `{}` is used in a type and its value is computed by code this edit changes -- restart the app", def_name(&(*up).prog, c))),
+                Err(e) => discr_restart.push(format!("const `{}` is used in a type and its value is computed by code whose dependencies are not known exactly ({}) -- restart the app", def_name(&(*up).prog, c), e)),
+            }
+        }
+    }
+    trace_sub("gp_const_code");
     if !discr_restart.is_empty() {
         out.rung = Rung::Restart;
         out.lines = discr_restart;

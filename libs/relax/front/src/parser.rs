@@ -5,7 +5,7 @@
 use crate::ast::*;
 use crate::lexer::{T, Tok};
 use crate::source::{SourceSpan, TokenOrigin, SourceRegistry};
-use crate::origin_table::{Table, OSeg, OSegRef, Regions, Maps, Origins};
+use crate::origin_table::{Table, OSeg, OSegRef, Regions, Rules, Maps, Origins};
 
 #[path = "fmtmac.rs"]
 mod fmtmac;
@@ -109,7 +109,7 @@ pub struct Parser<'a> {
     rec_limit: std::cell::Cell<Option<Option<u32>>>,
     /// macro_rules expansions: (text lo, text hi, the macro's definition position in this
     /// file; 0 when defined elsewhere) -- the hygiene marks (ParsedFile::hyg_ctxt)
-    pub rules_exp: OSeg<'a, Regions>,
+    pub rules_exp: OSeg<'a, Rules>,
     /// macro_rules body tokens -> their position in the definition: (expansion position,
     /// definition position, length), ascending
     pub body_origin: OSeg<'a, Maps>,
@@ -1886,7 +1886,9 @@ impl<'a> Parser<'a> {
         let here = self.bctx.as_ref().map(|c| c.path.as_str()).unwrap_or("");
         let same_file = !def.def_file.is_empty() && def.def_file == here;
         let def_pos = if same_file { def.def_pos } else { u32::MAX };
-        self.rules_exp.push((base, base + text.len() as u32, def_pos));
+        // the definition's edition (rustc ExpnData::edition); a built-in has none of its own
+        let edition = if def.edition == 0 { self.edition } else { def.edition };
+        self.rules_exp.push((base, base + text.len() as u32, def_pos, edition));
         // a body token's position in the definition (same file only): its own context is the
         // parent of the expansion's mark (macros defined by macros)
         if same_file {
@@ -1925,7 +1927,7 @@ impl<'a> Parser<'a> {
 
     /// Parses an expansion that starts at token `start`; it must consume it all.
     fn in_expansion<X>(&mut self, start: usize, f: impl FnOnce(&mut Self) -> PResult<X>) -> PResult<X> {
-        let rules = self.session.runtime.profile && self.rules_exp.last().map_or(false, |(lo, hi, _)| lo <= self.toks.at(start).lo && self.toks.at(start).lo < hi);
+        let rules = self.session.runtime.profile && self.rules_exp.last().map_or(false, |(lo, hi, _, _)| lo <= self.toks.at(start).lo && self.toks.at(start).lo < hi);
         let _profile = crate::load_profile::span(rules, "macro-rules-parse", self.bctx.as_ref().map_or("", |c| c.path.as_str()));
         let save = self.pos;
         self.pos = start;
@@ -5547,8 +5549,8 @@ pub struct ParsedFile {
     pub token_input: bool,
     pub sources: Option<std::sync::Arc<SourceRegistry>>,
     /// macro_rules expansion regions with their macro's definition position (Parser::rules_exp;
-    /// u32::MAX: defined in another file)
-    pub rules_exp: Table<Regions>,
+    /// u32::MAX: defined in another file) and the definition's edition
+    pub rules_exp: Table<Rules>,
     /// macro_rules body tokens -> definition positions (Parser::body_origin)
     pub body_origin: Table<Maps>,
     /// the fn bodies this parse skipped (FnSig::lazy_body) and what parsing them later needs
@@ -5634,7 +5636,7 @@ pub struct FilePart {
     pub src_base: u32,
     pub tok_base: u32,
     pub rules_base: u32,
-    pub rules_exp: Table<Regions>,
+    pub rules_exp: Table<Rules>,
     pub body_origin: Table<Maps>,
     pub next: std::sync::OnceLock<Box<FilePart>>,
     pub ext: crate::arena::Arena<u8>,
@@ -5943,6 +5945,34 @@ impl ParsedFile {
             return ExpnKind::Builtin;
         }
         ExpnKind::Root
+    }
+
+    /// The edition of the token at `pos` (rustc `Span::edition`: the ExpnData edition of its
+    /// context's outer expansion, hygiene.rs): the file's for its own text and for fragments
+    /// substituted from it, a `macro_rules!` definition's for the tokens its body wrote, and the
+    /// invoking text's for built-in, derive and proc-macro output.
+    pub fn edition_at(&self, mut pos: u32) -> u16 {
+        for _ in 0..4096 {
+            if pos < self.src_len {
+                return self.edition;
+            }
+            let (to, em) = self.tables(pos);
+            if let Some(o) = origin_of(to, pos) {
+                pos = o;
+                continue;
+            }
+            let rules = self.part_at(pos).map_or(&self.rules_exp, |p| &p.rules_exp);
+            if let Some((_, r)) = OSegRef::from(rules).floor(pos) {
+                if pos < r.1 {
+                    return r.3;
+                }
+            }
+            match region_of(em, pos) {
+                Some(c) if c != pos => pos = c,
+                _ => return self.edition,
+            }
+        }
+        self.edition
     }
 
     /// An identity for the expansion whose text holds `pos`: 0 for the file's own text, the start

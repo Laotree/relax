@@ -10610,6 +10610,13 @@ impl<'a> Lcx<'a> {
             s.to_leaves(v, ty)
         };
         Some(match name {
+            // (a type of 4 GiB or more has its exact size; its values cannot be lowered yet)
+            "size_of" | "align_of" if g0.is_some_and(|g| self.u.is_too_big(g)) => match g0.and_then(|g| self.u.saturated_size(g)) {
+                Some(size) if name == "size_of" => Val::L(vec![self.iconst(size as i64)]),
+                Some(_) => { let g = self.u.tcx.tys.erase_regions(g0.unwrap()); Val::L(vec![self.iconst(self.u.layout_of(g).align as i64)]) }
+                // a SizeOverflow: the layout's error
+                None => { let _ = elem(self); Val::L(vec![self.iconst(0)]) }
+            },
             "size_of" => {
                 let (sz, al) = elem(self);
                 Val::L(vec![self.iconst(crate::layout::round_up(sz, al) as i64)])

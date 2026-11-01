@@ -203,11 +203,11 @@ fields!(MTok, kind, text, pos);
 impl Codec for MacroDef {
     fn put(&self, w: &mut Vec<u8>) {
         self.name.put(w); self.krate.put(w); self.exported.put(w); self.arms.put(w);
-        self.builtin.put(w); self.def_file.put(w); self.def_pos.put(w); self.def_mod.put(w);
+        self.builtin.put(w); self.def_file.put(w); self.def_pos.put(w); self.def_mod.put(w); self.edition.put(w);
     }
     fn get(r: &mut Decode<'_>) -> Option<Self> {
         Some(Self { name: Codec::get(r)?, krate: Codec::get(r)?, exported: Codec::get(r)?, arms: Codec::get(r)?,
-            builtin: Codec::get(r)?, def_file: Codec::get(r)?, def_pos: Codec::get(r)?, def_mod: Codec::get(r)?, input: None })
+            builtin: Codec::get(r)?, def_file: Codec::get(r)?, def_pos: Codec::get(r)?, def_mod: Codec::get(r)?, edition: Codec::get(r)?, input: None })
     }
 }
 fields!(UseItem, module, path, bind, is_pub);

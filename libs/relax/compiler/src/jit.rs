@@ -4786,6 +4786,21 @@ impl Unit {
         self.lay.closure_storage(&self.prog, &self.tcx, ty)
     }
 
+    /// `size_of::<t>()` of a type of 4 GiB or more (layout::Layouts::saturated_size); None for any
+    /// other type (its layout holds the size) and for a SizeOverflow.
+    pub fn saturated_size(&self, t: TyId) -> Option<u64> {
+        let t = self.tcx.normalize_erasing_regions(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), t);
+        let lcx = crate::layout::LayoutCx::new(&self.prog);
+        self.lay.saturated_size(&lcx, &self.tcx, t)
+    }
+
+    /// Is `t` 4 GiB or larger (its u32 layout saturated)? Cheap: the layout table.
+    pub fn is_too_big(&self, t: TyId) -> bool {
+        let t = self.tcx.normalize_erasing_regions(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), t);
+        let _ = self.layout_of(t);
+        self.lay.is_too_big(t)
+    }
+
     /// rustc's `LayoutError::SizeOverflow` for `t` (layout::Layouts::size_overflows).
     pub fn size_overflows(&self, t: TyId) -> bool {
         let t = self.tcx.normalize_erasing_regions(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), t);
