@@ -359,7 +359,9 @@ pub fn run(opts: Options) -> Result<(), String> {
         };
         let before = files.len();
         files.retain(|f| {
-            if !is_font(f) || read_only.contains(f) {
+            // (the check probes a font's path when it registers it as a resource: that is no
+            // read of it; a native bundle of the app carries the font set's files alone too)
+            if !is_font(f) {
                 return true;
             }
             let Some(p) = package_of(f, &pkgs) else { return true };
