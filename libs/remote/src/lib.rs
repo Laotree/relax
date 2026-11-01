@@ -45,6 +45,7 @@ pub mod frames;
 pub mod group;
 pub mod procs;
 pub mod hello;
+pub mod jit;
 pub mod hosts;
 pub mod hub;
 pub mod hot;

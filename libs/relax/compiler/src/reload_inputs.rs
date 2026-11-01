@@ -209,6 +209,26 @@ impl Inputs {
         self.paths.iter().filter(|(_, (_, k))| !matches!(k, Kind::Source | Kind::SourceDirectory(_))).map(|(p, _)| p.clone()).collect()
     }
 
+    /// Files that can produce a reload event: unloaded sources are read only when loaded.
+    /// Keep absent inputs too (a deleted source or a lockfile that has not been created yet).
+    pub(super) fn source_paths(&self, loaded: impl Iterator<Item = String>) -> Vec<String> {
+        let workspace = self.graph.as_ref().map(|g| g.workspace.clone()).unwrap_or_else(crate::run::workspace_dir);
+        let workspace = crate::vfs::normalize_path(&workspace);
+        let roots: Vec<_> = Path::new(&workspace).ancestors().map(|p| p.to_string_lossy().into_owned()).collect();
+        let paths = self.process_paths().into_iter().chain(loaded).chain(crate::native_macros::paths());
+        paths.filter(|p| !crate::vfs::is_dir(p)).map(|p| {
+            // Dependencies outside the workspace use ../; another drive has no relative path.
+            roots.iter().enumerate().find_map(|(up, root)| {
+                crate::vfs::relative_path(&p, root).map(|rel| format!("{}{rel}", "../".repeat(up)))
+            }).unwrap_or_else(|| crate::vfs::normalize_path(&p))
+        }).collect::<BTreeSet<_>>().into_iter().collect()
+    }
+
+    /// More source files than this in one settled batch is a bulk change.
+    pub(super) const BULK_SOURCES: usize = 16;
+    /// Sources of more packages than this in one settled batch is a bulk change.
+    pub(super) const BULK_PACKAGES: usize = 4;
+
     /// Native bindings and the compile unit's std are shared by every domain. A fresh app
     /// domain cannot replace them; keep the current app and report the host restart instead.
     /// An input of makepad's own process (not a program source a patch can take).

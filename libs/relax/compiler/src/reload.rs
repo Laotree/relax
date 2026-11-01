@@ -3542,6 +3542,8 @@ static DOMAIN_RESTORED: relax_session::sync::Mutex<Option<String>> = relax_sessi
 static DOMAIN_SNAPSHOT: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
 static DOMAIN_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DOMAIN_INPUTS: relax_session::sync::Mutex<Option<Inputs>> = relax_session::sync::Mutex::new(None);
+/// The watcher's reload inputs, also readable while it waits for a live test verdict.
+static WATCH_INPUTS: relax_session::sync::Mutex<Option<std::sync::Arc<Inputs>>> = relax_session::sync::Mutex::new(None);
 static DOMAIN_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// End native callbacks into the outgoing domain before its static block can be reclaimed.
@@ -4570,6 +4572,23 @@ pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
         });
 }
 
+/// Inspect takes the loaded paths on the owner: tests can load more files while the watcher
+/// waits for their verdict. No inputs lock survives that request or the path formatting.
+pub(crate) fn input_paths() -> Result<Vec<String>, String> {
+    let inputs = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or("the live watcher has not started")?;
+    let up = crate::run::running_unit();
+    if up.is_null() { return Err("no running program".into()); }
+    let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
+    let loaded = crate::owner::call(crate::owner::Class::Program, || unsafe {
+        (*up).prog.current_source_files().into_keys().filter(|p| own_source(p, &std_dir)).collect::<Vec<_>>()
+    });
+    Ok(inputs.source_paths(loaded.into_iter()))
+}
+
+fn own_source(path: &str, std_dir: &str) -> bool {
+    !(path.is_empty() || (!std_dir.is_empty() && crate::vfs::relative_path(path, std_dir).is_some()) || path.contains("/.cargo/registry/") || path.contains("/.cargo/git/") || path.contains("/rustlib/"))
+}
+
 pub(crate) fn stamp(path: &str) -> Option<(std::time::SystemTime, u64)> {
     // a file of a mounted store changes only by an edit (its file in the edits folder: a device's
     // devhub push); the store under a run never changes, and is not read to stat it
@@ -4653,13 +4672,14 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
 
 unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     inputs.add_runner();
+    let snapshot = crate::zone_alloc::kept_with(|| std::sync::Arc::new(inputs.clone()));
+    *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
     let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
     // (path, running file index, last stamp)
     // the program's own source files (not std, registry or git dependencies), loaded so far
     let own_files = |u: &Unit| -> Vec<(String, u32)> {
         u.prog.current_source_files().into_iter().filter(|(p, _)| {
-            !(p.is_empty() || (!std_dir.is_empty() && crate::vfs::relative_path(p, &std_dir).is_some()) || p.contains("/.cargo/registry/") || p.contains("/.cargo/git/") || p.contains("/rustlib/"))
-                && crate::vfs::is_file(p)
+            own_source(p, &std_dir) && crate::vfs::is_file(p)
         }).collect()
     };
     // (the watcher's holds read the program's files only: lock_unit_quick)
@@ -4754,6 +4774,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             if let Some(next) = DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 inputs = next;
                 inputs.add_runner();
+                let snapshot = crate::zone_alloc::kept_with(|| std::sync::Arc::new(inputs.clone()));
+                *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
             }
             let loaded = crate::owner::call(crate::owner::Class::Program, || own_files(&*up));
             files = inputs.paths.iter().map(|(p, (s, _))| (p.clone(), u32::MAX, *s)).collect();
