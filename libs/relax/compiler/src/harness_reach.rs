@@ -2,7 +2,6 @@
 
 use crate::jit::{FnKey, Unit};
 use crate::program::{DefId, DefKind};
-use relax_backend::rir::{Func, Sym};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
@@ -79,42 +78,19 @@ pub(super) fn reset(len: usize) {
 }
 
 /// Publish banks before any code naming their slots can run.
-pub(crate) fn slot_sym(u: &Unit, id: u32) -> Sym {
+pub(crate) fn slot(id: u32) {
     let _k = crate::zone_alloc::kept();
     let mut s = state().lock().unwrap();
     let bank = id as usize / BANK;
     if s.banks.insert(bank) {
         for thread in s.threads.values_mut() { thread.bitmap.grow(bank); }
     }
-    drop(s);
-    u.syms.intern(crate::syms::SymKind::TestSlot(id), id as u64)
-}
-
-pub(crate) fn instrument(u: &Unit, id: u32, f: &mut Func) {
-    if !super::live::enabled() || u.aux { return; }
-    f.entry_mark = Some((u.syms.intern(crate::syms::SymKind::Rt("test_entered"), TLS_ENTERED as u64), slot_sym(u, id)));
-    note(id, f.inl_slots.iter().copied());
 }
 
 pub(crate) fn note(id: u32, deps: impl Iterator<Item = u32>) {
     if !super::live::enabled() { return; }
     let _k = crate::zone_alloc::kept();
     state().lock().unwrap().inlined.entry(id).or_default().extend(deps.filter(|&c| c != id));
-}
-
-/// Transitive inline inputs travel with a cached entry mark.
-pub(crate) fn dependencies(id: u32) -> Vec<u32> {
-    let s = state().lock().unwrap();
-    let mut seen = HashSet::from([id]);
-    let mut todo = vec![id];
-    let mut deps = Vec::new();
-    while let Some(c) = todo.pop() {
-        for &d in s.inlined.get(&c).into_iter().flatten() {
-            if seen.insert(d) { deps.push(d); todo.push(d); }
-        }
-    }
-    deps.sort_unstable();
-    deps
 }
 
 pub(crate) fn init(block: u64) {

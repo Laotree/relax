@@ -1737,6 +1737,7 @@ impl Linker {
             let s = &im.slots[si];
             let (pcs, tier, inl, entry, key) = (s.pc, s.tier, s.inl, s.entry, s.key);
             let pc = crate::jit::PcMap::mapped(&im.bytes[pcs.0..pcs.1], files);
+            if !u.aux { crate::harness::reach::note(id, im.flat[inl.0..inl.1].iter().filter_map(|&k| im.slot_of(k))); }
             let inlined = (tier == TIER_O3).then(|| im.flat[inl.0..inl.1].iter().filter_map(|&k| im.slot_of(k)).collect());
             let kind = im.keys[key as usize].first().copied().unwrap_or(u8::MAX);
             let c = self.cache();
