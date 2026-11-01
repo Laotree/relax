@@ -14855,7 +14855,8 @@ impl Drop for TierActive {
     }
 }
 
-/// queued O3 builds: (slot, why: Q_*, queued at wall_ns, calls/sec at enqueue). The workers' ordered
+/// queued O3 builds: (slot, why: Q_*, queued at wall_ns, rate at enqueue: cost units per second, or a
+/// counted window's RIR instructions per second for Q_PROFILED). The workers' ordered
 /// set (OWNERARCH.DESIGN.md §5.3): program threads never take it -- a count stub (rt_hot) pushes
 /// onto TIER_INBOX, which every holder drains first (tier_queue).
 static TIER_QUEUE: relax_session::sync::Mutex<Vec<(u32, u8, u64, u64)>> = relax_session::sync::Mutex::new(Vec::new());
@@ -15887,7 +15888,7 @@ fn tier_push_locked(q: &mut Vec<(u32, u8, u64, u64)>, id: u32, why: u8, rate: u6
 }
 
 /// The highest rate first (cost units per second since the slot's last check; a
-/// counted window's entries per second), then the oldest. One scan: O(queue), ~1,000 cheap
+/// counted window's work, RIR instructions per second), then the oldest. One scan: O(queue), ~1,000 cheap
 /// compares for a build that takes milliseconds.
 fn tier_pop(q: &mut Vec<(u32, u8, u64, u64)>) -> Option<(u32, u8, u64, u64)> {
     let best = q.iter().enumerate().max_by_key(|(k, e)| (e.3, std::cmp::Reverse(e.2), std::cmp::Reverse(*k))).map(|(k, _)| k)?;
@@ -16503,9 +16504,17 @@ fn pgo_poll() {
             let entries = ctr.first().map_or(0, |c| c.load(Ordering::Relaxed));
             let el = now.saturating_sub(e.at);
             let rate = (entries as u128 * 1_000_000_000 / el.max(1) as u128).min(u64::MAX as u128) as u64;
+            // the O3 queue's order for the slot: the work its counted code did per second of the
+            // window, not its entries (a layer kernel entered 50 times a second whose loops run
+            // millions of instructions waited behind thousands of small fns: Fab's slicer ran
+            // counted code for 3-5 s of a cold slice)
+            let work_rate = || {
+                let work: u64 = ctr.iter().zip(e.weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
+                (work as u128 * 1_000_000_000 / el.max(1) as u128).min(u64::MAX as u128) as u64
+            };
             if e.lukewarm && e.credited {
                 crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, crate::inspect::tierlog::WIN_CREDITED, rate, 0);
-                ready.push((e.id, rate));
+                ready.push((e.id, work_rate()));
                 return false;
             }
             if e.lukewarm {
@@ -16518,12 +16527,12 @@ fn pgo_poll() {
                 let per_s = ((work - e.mark.0.min(work)) as u128 * 1_000_000_000 / win as u128) as u64;
                 if per_s >= PGO_MIN_WORK {
                     crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, crate::inspect::tierlog::WIN_WORK, rate, 0);
-                    ready.push((e.id, rate));
+                    ready.push((e.id, per_s));
                     return false;
                 }
                 if win >= PGO_WORK_NS && e.image {
                     crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, crate::inspect::tierlog::WIN_DONE, rate, 0);
-                    ready.push((e.id, rate));
+                    ready.push((e.id, per_s));
                     return false;
                 }
                 if win >= PGO_WORK_NS {
@@ -16544,7 +16553,7 @@ fn pgo_poll() {
             let done = !pgo_hold() && (entries >= PGO_ENTRIES || sum >= PGO_BLOCKS || (sum > 0 && el >= PGO_MS * 1_000_000) || el >= PGO_IDLE_MS * 1_000_000);
             if done {
                 crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, if entries >= PGO_ENTRIES || sum >= PGO_BLOCKS || sum > 0 { crate::inspect::tierlog::WIN_DONE } else { crate::inspect::tierlog::WIN_IDLE }, rate, 0);
-                ready.push((e.id, rate));
+                ready.push((e.id, work_rate()));
             }
             !done
         });
