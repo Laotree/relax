@@ -2744,6 +2744,10 @@ fn coalesce(f: &Func) -> (Vec<u32>, std::collections::HashSet<(u32, u32)>) {
 }
 
 fn lower(options: &relax_session::Options, f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<(IFunc, Persist), &'static str> {
+    // a naked fn is its asm block alone: machine code only
+    if f.naked {
+        return Err("inline assembly");
+    }
     let covered = relax_backend::passes::lower_coverage(f);
     let f = covered.as_ref().unwrap_or(f);
     // calls in tail position become jumps, as the arm64 back end makes them (the same analysis:
