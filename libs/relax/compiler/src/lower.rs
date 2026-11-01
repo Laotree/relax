@@ -3350,11 +3350,15 @@ impl<'a> Lcx<'a> {
                             }
                         }
                         None => {
-                            // declared, assigned later
-                            if let Pat::Ident { .. } = ast.pat(*pat) {
-                                if let Some(&li) = self.b.pat_local.get(&pat.0) {
-                                    self.alloc_local(li);
-                                }
+                            // declared, assigned later: every binding's storage begins here
+                            // (rustc: StorageLive at the `let`), so its slot address dominates
+                            // every later assignment and use. `let (a, b);` binds a tuple
+                            // pattern's idents: allocated lazily at the first assignment, one
+                            // branch's SlotAddr would be the address the other branches use.
+                            let mut lis = Vec::new();
+                            self.pat_binding_locals(*pat, &mut lis);
+                            for li in lis {
+                                self.alloc_local(li);
                             }
                         }
                     }
@@ -12245,10 +12249,6 @@ fn strip_num(text: &str) -> String {
     }
     // integer-typed suffixes never reach floats; strip anyway
     s
-}
-
-pub fn closure_map(_b: &Body) -> HashMap<u32, u32> {
-    HashMap::default()
 }
 
 // ---------------------------------------------------------------- glue

@@ -15,7 +15,7 @@ const BLOCK: usize = 64;
 const ESCAPE: u32 = 0x80;
 
 // the kind shares its byte with the escape bit
-const _: () = assert!((T::OtherPunct as u8) < 0x80);
+const _: () = assert!((T::DocComment as u8) < 0x80);
 
 pub struct PackedToks {
     store: Store,
@@ -168,7 +168,7 @@ mod tests {
             let mut toks = Vec::new();
             let mut pos = 0u32;
             for _ in 0..n {
-                let kind = unsafe { std::mem::transmute::<u8, T>(next(T::OtherPunct as u64 + 1) as u8) };
+                let kind = unsafe { std::mem::transmute::<u8, T>(next(T::DocComment as u64 + 1) as u8) };
                 pos += next(4);
                 let len = match next(20) { 0 => 256 + next(70000), 1 => 255, 2 => 0, _ => next(12) };
                 let lo = match next(30) { 0 => next(1 << 31), 1 => pos.saturating_sub(next(100000)), 2 => pos + 70000, _ => pos };

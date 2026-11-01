@@ -525,6 +525,12 @@ pub struct Cache {
     mapped_index: Option<collected::MappedIndexes>,
     /// crate fingerprints (stable.rs), per crate index
     fps: Vec<u128>,
+    /// crate names, and per crate its dependency closure (itself included; a bitset over crate
+    /// indices): a code store's late-input ledger lists the include!/env! inputs of its whole
+    /// closure (`code_ledger`), so a changed input makes the code of every crate that can have
+    /// folded it (a const, an inlined body) stale with the crate that read it
+    crate_names: Vec<String>,
+    crate_closure: Vec<Vec<u64>>,
     /// interface fingerprints (cache/items.rs), per crate index: what code keys name; the bound
     /// crates of this program folded in (items::apply_bound)
     iface: Vec<u128>,
@@ -884,6 +890,8 @@ impl Cache {
             index: KeyMap::default(),
             mapped_index: None,
             fps,
+            crate_names: (0..ncr).map(|ci| prog.syms.str(prog.crates[ci].name).to_string()).collect(),
+            crate_closure: dep_closures(prog, ncr),
             iface: Vec::new(),
             iface_plain: Vec::new(),
             view: Vec::new(),
@@ -1098,6 +1106,7 @@ impl Cache {
                 warm_count::add(warm_count::STORES_REJECTED, 1);
                 continue;
             }
+            replay_store_ledger(&st, &present, &late);
             let si = c.stores.len() as u32;
             if mapped_index.is_none() { for (e, ix) in st.index.iter().enumerate() {
                 if ix.kind == KIND_FRONT || ix.kind == KIND_FRONT_REF || ix.kind == KIND_FRONT_CRATE {
@@ -1158,6 +1167,7 @@ impl Cache {
                 c.code_stale[ci] = true;
                 continue;
             }
+            replay_store_ledger(&st, &present, &late);
             let si = c.stores.len() as u32;
             for (e, ix) in st.index.iter().enumerate() {
                 if ix.kind != KIND_LEDGER && ix.kind != KIND_MANIFEST && ix.kind != KIND_FRONT && ix.kind != KIND_FRONT_REF && ix.kind != KIND_FRONT_CRATE {
@@ -1356,8 +1366,12 @@ impl Cache {
         let pending = std::mem::take(&mut self.pending);
         self.pending_bytes = 0;
         let marks = front_run::run_marks();
+        let late = crate::sip::late_inputs();
         let mut files = Vec::new();
-        for ((c, front), entries) in by_store(pending) {
+        for ((c, front), mut entries) in by_store(pending) {
+            if !front {
+                entries.insert(0, NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload: self.code_ledger(c, &late) }.into());
+            }
             let Some((path, stale)) = self.store_of(c, front) else { continue };
             let stale = std::mem::replace(stale, false);
             files.push((path, stale, entries));
@@ -2018,11 +2032,6 @@ impl Cache {
         }
     }
 
-    /// The slot a key encoding names in this run (startup manifest).
-    pub fn slot_for_bytes(&mut self, u: &mut Unit, b: &[u8]) -> Option<u32> {
-        self.slot_of_bytes(u, b)
-    }
-
     /// The key encodings of the slots real-time threads of the program rooted at crate `root`
     /// reached in earlier runs (jit.rs realtime; resolve them with slot_for_bytes_unit): compiled
     /// ahead when the program marks its real-time code.
@@ -2122,11 +2131,6 @@ impl Cache {
         if !self.key_waits { self.fnkey_bytes.insert(id, b.clone()); }
         self.key_waits |= outer;
         b
-    }
-
-    /// The slot an encoded key names in this run (memo by the bytes).
-    fn slot_of_bytes(&mut self, u: &mut Unit, b: &[u8]) -> Option<u32> {
-        unsafe { Linker::new(self).slot_of_bytes(u, b) }
     }
 
     /// Whether slot `id` has an entry (speculative linking only follows cached callees).
@@ -2428,40 +2432,52 @@ impl Cache {
         let pf = &u.prog.files[f];
         let (mut names, mut invoked) = (Vec::new(), Vec::new());
         deps::scan(&pf.src, &[(lo, hi)], &[], &mut names, &mut invoked);
-        if !invoked.iter().any(|&m| g.loud(m)) {
+        let loud = invoked.iter().any(|&m| g.loud(m));
+        let late_mac = invoked.iter().any(|&m| deps::late_builtin(m));
+        if !loud && !late_mac {
             return Some(0);
         }
         let mut kh = Sip128::new();
-        kh.str("exp-names");
+        kh.str("exp-names-v2");
         kh.u128(k0);
         kh.u128(self.def_key(u, d));
         let ekey = kh.finish128();
         let owner = dg.hole_owner(item);
         let lazy = matches!(pf.ast.items.get(owner as usize).map(|it| &it.kind), Some(crate::ast::ItemKind::Fn(_, None, _)));
-        let names = match deps::exp_names(pf, lo, hi, lazy) {
-            Some(n) => {
+        let (text_hash, names) = match deps::exp_body(pf, lo, hi, lazy) {
+            Some((th, n)) => {
                 if self.mode != Mode::ReadOnly && !self.has_index(&ekey) && self.pending_keys.insert(ekey) {
-                    let mut p = Vec::with_capacity(4 + n.len() * 8);
+                    let mut p = Vec::with_capacity(20 + n.len() * 8);
+                    p.extend_from_slice(&th.to_le_bytes());
                     p.extend_from_slice(&(n.len() as u32).to_le_bytes());
                     for x in &n { p.extend_from_slice(&x.to_le_bytes()); }
                     self.push_pending(dom, NewEntry { key: ekey, kind: KIND_EXP_NAMES, payload: p });
                 }
-                n
+                (th, n)
             }
             None => match self.get_checked(ekey) {
                 Some((KIND_EXP_NAMES, p)) => {
-                    let n = u32::from_le_bytes(p.get(0..4)?.try_into().ok()?) as usize;
-                    if p.len() != 4 + n * 8 { return None; }
-                    (0..n).map(|i| u64::from_le_bytes(p[4 + i * 8..12 + i * 8].try_into().unwrap())).collect()
+                    let th = u128::from_le_bytes(p.get(0..16)?.try_into().ok()?);
+                    let n = u32::from_le_bytes(p.get(16..20)?.try_into().ok()?) as usize;
+                    if p.len() != 20 + n * 8 { return None; }
+                    let names = (0..n).map(|i| u64::from_le_bytes(p[20 + i * 8..28 + i * 8].try_into().unwrap())).collect();
+                    (th, names)
                 }
                 _ => return None,
             },
         };
-        let mut v: Vec<u128> = names.iter().map(|&n| self.name_closure(g, c, n)).filter(|&x| x != 0).collect();
+        let mut v: Vec<u128> = if loud {
+            names.iter().map(|&n| self.name_closure(g, c, n)).filter(|&x| x != 0).collect()
+        } else {
+            Vec::new()
+        };
         v.sort_unstable();
         v.dedup();
         let mut h = Sip128::new();
         h.str("exp-closure");
+        if late_mac {
+            h.u128(text_hash);
+        }
         h.u32(v.len() as u32);
         for x in v { h.u128(x); }
         Some(h.finish128())
@@ -3324,7 +3340,8 @@ impl Cache {
     }
 
     /// Every crate's fingerprint (sources, cfg, dependencies) and the code configuration: equal
-    /// in two runs, the code key of every slot is equal too.
+    /// in two runs, the code key of every slot is equal too. (A changed late input makes the
+    /// root's code store, which holds the manifest, stale: `code_ledger`.)
     fn sources_fp(&self) -> u128 {
         let mut h = Sip128::new();
         h.str("sources");
@@ -3587,21 +3604,13 @@ impl Cache {
         pack::ensure_private_dir(&self.dir)?;
         let _io = SPILL_IO.write().unwrap_or_else(|e| e.into_inner());
         for ((c, front), mut entries) in by_store(pending) {
+            // the ledger: the include!/env! inputs as this run saw them -- the crate's own for its
+            // front store, its dependency closure's for its code store
+            let ledger = if front { None } else { Some(self.code_ledger(c, &late)) };
             let Some((path, stale)) = self.store_of(c, front) else { continue };
             let stale = std::mem::replace(stale, false);
-            // the crate's ledger: the include!/env! inputs it read, as this run saw them
-            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            let cname = name.rsplit_once('-').map_or("", |x| x.0).to_string();
-            let mut e = E::default();
-            let mine: Vec<_> = late.iter().filter(|x| x.0 == cname).collect();
-            e.u32(mine.len() as u32);
-            for (c, k, name, h) in mine {
-                e.str(c);
-                e.u8(*k);
-                e.str(name);
-                e.u128(*h);
-            }
-            entries.insert(0, NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload: e.0 }.into());
+            let payload = ledger.unwrap_or_else(|| own_ledger(&path, &late));
+            entries.insert(0, NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload }.into());
             append_store(&path, entries, stale, &marks)?;
         }
         if let Some(root) = self.dir.parent() {
@@ -3689,19 +3698,13 @@ impl Spill {
         let mut n = 0;
         for (path, stale, mut entries) in self.files {
             let code: Vec<u128> = entries.iter().filter(|e| e.kind == KIND_CODE || e.kind == KIND_DATA).map(|e| e.key).collect();
-            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            let cname = name.rsplit_once('-').map_or("", |x| x.0).to_string();
-            let mut e = E::default();
-            let mine: Vec<_> = late.iter().filter(|x| x.0 == cname).collect();
-            e.u32(mine.len() as u32);
-            for (c, k, name, h) in mine {
-                e.str(c);
-                e.u8(*k);
-                e.str(name);
-                e.u128(*h);
+            // a code store's spill carries its closure ledger (spill_take); a front store gets its own
+            if entries.first().is_some_and(|e| e.kind == KIND_LEDGER) {
+                n += entries.len() - 1;
+            } else {
+                n += entries.len();
+                entries.insert(0, NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload: own_ledger(&path, late) }.into());
             }
-            n += entries.len();
-            entries.insert(0, NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload: e.0 }.into());
             append_store(&path, entries, stale, &self.marks)?;
             if !code.is_empty() {
                 // process state: kept heap
@@ -3809,6 +3812,75 @@ fn ledger_current(p: &Store, present: &HashSet<String>, memo: &mut HashMap<(u8, 
         }
     }
     true
+}
+
+/// Replays a validated pack's `KIND_LEDGER` into `sip` (with the hashes `ledger_current` just
+/// verified), so a later write's ledger still lists the inputs this run took from the cache.
+fn replay_store_ledger(p: &Store, present: &HashSet<String>, memo: &HashMap<(u8, String, String), u128>) {
+    let Some((KIND_LEDGER, payload)) = p.get(LEDGER_KEY) else { return };
+    let mut d = D { b: payload, p: 0 };
+    let Some(n) = d.u32() else { return };
+    for _ in 0..n {
+        let (Some(c), Some(k), Some(name), Some(h)) = (d.str(), d.u8(), d.str(), d.u128()) else { return };
+        if !present.contains(c) {
+            continue;
+        }
+        let cur = memo.get(&(k, c.to_string(), name.to_string())).copied().unwrap_or(h);
+        crate::sip::note_late_hash(c, k, name, cur);
+    }
+}
+
+fn encode_ledger<'a>(inputs: impl Iterator<Item = &'a (String, u8, String, u128)>) -> Vec<u8> {
+    let inputs: Vec<_> = inputs.collect();
+    let mut e = E::default();
+    e.u32(inputs.len() as u32);
+    for (c, k, name, h) in inputs {
+        e.str(c);
+        e.u8(*k);
+        e.str(name);
+        e.u128(*h);
+    }
+    e.0
+}
+
+/// A front store's ledger: the late inputs of its own crate (named by the store's file name).
+fn own_ledger(path: &std::path::Path, late: &[(String, u8, String, u128)]) -> Vec<u8> {
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let cname = name.rsplit_once('-').map_or("", |x| x.0);
+    encode_ledger(late.iter().filter(|x| x.0 == cname))
+}
+
+/// Per crate, the crates it can see through its dependencies, itself included (bitsets).
+fn dep_closures(prog: &crate::program::Program, ncr: usize) -> Vec<Vec<u64>> {
+    fn visit(c: usize, prog: &crate::program::Program, ncr: usize, out: &mut Vec<Option<Vec<u64>>>) {
+        if out[c].is_some() { return; }
+        let words = ncr.div_ceil(64);
+        // in progress: a cycle (a crate graph has none) ends at the crate itself
+        out[c] = Some(vec![0; words]);
+        let mut set = vec![0u64; words];
+        set[c / 64] |= 1 << (c % 64);
+        for &(_, d) in &prog.crates[c].deps {
+            let d = d as usize;
+            if d >= ncr || d == c { continue; }
+            visit(d, prog, ncr, out);
+            for (w, x) in set.iter_mut().zip(out[d].as_deref().unwrap_or(&[])) { *w |= *x; }
+        }
+        out[c] = Some(set);
+    }
+    let mut out: Vec<Option<Vec<u64>>> = vec![None; ncr];
+    for c in 0..ncr { visit(c, prog, ncr, &mut out); }
+    out.into_iter().map(Option::unwrap_or_default).collect()
+}
+
+impl Cache {
+    /// Crate `c`'s code store ledger: the late inputs of every crate in its dependency closure.
+    fn code_ledger(&self, c: u32, late: &[(String, u8, String, u128)]) -> Vec<u8> {
+        let Some(set) = self.crate_closure.get(c as usize) else { return encode_ledger(std::iter::empty()) };
+        let index: HashMap<&str, usize> = self.crate_names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+        encode_ledger(late.iter().filter(|x| {
+            index.get(x.0.as_str()).is_some_and(|&i| set.get(i / 64).is_some_and(|w| w >> (i % 64) & 1 == 1))
+        }))
+    }
 }
 
 /// The definitions whose bodies a fn key's code is made from: an instance's definition, and a
@@ -4934,7 +5006,7 @@ impl FrontImages {
         // A build script's run (its own small world: std plus the script's crates) keeps no
         // front images: they are read only when a script runs again, which a cached build
         // result makes rare, while they cost a second copy of the std world on disk.
-        if !crate::front::enabled() || mode_from_env(options).is_none() || std::env::var_os("MAKEPAD_RUN_BUILD_SCRIPT").is_some() {
+        if mode_from_env(options).is_none() || std::env::var_os("MAKEPAD_RUN_BUILD_SCRIPT").is_some() {
             return None;
         }
         let root = crate::dirs::relax_dir();
@@ -5745,7 +5817,7 @@ pub struct ColdFront {
 }
 impl ColdFront {
     pub fn enabled(options: &crate::options::Options) -> bool {
-        crate::front::enabled() && matches!(mode_from_env(options), Some(Mode::On | Mode::Verify))
+        matches!(mode_from_env(options), Some(Mode::On | Mode::Verify))
     }
 
     pub fn loaded(&mut self, prog: &crate::program::Program, krate: u32) {

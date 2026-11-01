@@ -635,21 +635,6 @@ pub fn unbound_reason(prog: &Program, tcx: &Tcx, krate: u32, d: DefId, opaque: &
     None
 }
 
-/// Is ADT `d` of crate `krate` one that may be marked `#[relax_api(handle)]` (rustc's size/align, drop shim):
-/// a public non-generic struct or enum that is not `trusted` by value.
-pub fn opaque_candidate(prog: &Program, tcx: &Tcx, krate: u32, d: DefId) -> bool {
-    let def = prog.def(d);
-    if def.krate != krate || !def.is_pub || !matches!(def.kind, DefKind::Struct | DefKind::Enum) {
-        return false;
-    }
-    match tcx.adts.get(&d) {
-        Some(a) if a.n_generics == 0 && !a.is_union => {}
-        _ => return false,
-    }
-    let t = tcx.tys.intern(TyKind::Adt(d, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
-    !trusted(prog, tcx, krate, t, 0)
-}
-
 /// The types whose values cross between the provided crates' rustc code and JIT-compiled code:
 /// reachable from the signatures of the bound fns (`bound`) through references, arrays, tuples,
 /// type arguments and the fields of provided-crate types (and Option/Box/PhantomData). The walk

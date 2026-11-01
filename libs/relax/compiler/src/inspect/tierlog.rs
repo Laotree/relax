@@ -221,12 +221,6 @@ pub fn history(id: u32) -> (Option<Hist>, u64, u64) {
     }
 }
 
-/// Every tracked slot's counts of kind `k` (why-tier over many slots; `top` lists).
-pub fn count_of(id: u32, k: u8) -> u32 {
-    let g = STORE.lock().unwrap_or_else(|e| e.into_inner());
-    g.as_ref().and_then(|st| st.by.get(&id)).map_or(0, |h| h.n[k as usize])
-}
-
 /// The words the inspect answer prints for one event (`code` names a code address: tier origin).
 pub fn describe(e: &Ev, code: &dyn Fn(u64) -> String) -> String {
     let ms = |ns: u64| format!("{:.1} ms", ns as f64 / 1e6);

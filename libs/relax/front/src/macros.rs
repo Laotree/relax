@@ -3118,9 +3118,10 @@ impl Transcript {
 /// part of): what lexing that text gives.
 fn lexed_kind(part: &[u8]) -> T {
     let mut v = Vec::new();
+    // a part of `>>`/`>>=` always lexes
     match crate::lexer::lex(part, 2021, &mut v) {
-        Ok(()) => v.first().map_or(T::OtherPunct, |t| t.kind),
-        Err(_) => T::OtherPunct,
+        Ok(()) => v.first().map_or(T::Gt, |t| t.kind),
+        Err(_) => T::Gt,
     }
 }
 
