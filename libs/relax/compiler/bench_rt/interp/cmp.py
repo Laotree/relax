@@ -17,7 +17,8 @@ modes = {
     "jit-o3": dict(BENCH_WARM_MS="2500"),
     "interp": dict(MAKEPAD_RUN_INTERP="all", MAKEPAD_RUN_INTERP_STATS="1", MAKEPAD_RUN_O3="0", MAKEPAD_RUN_O1="0"),
     # no machine code at all: precompiled glue, every function interpreted
-    "nocodegen": dict(MAKEPAD_RUN_NO_CODEGEN="1", MAKEPAD_RUN_INTERP_STATS="1"),
+    # (it tiers up as the JIT does: O3 builds as threaded code, so it warms up as jit-o3 does)
+    "nocodegen": dict(MAKEPAD_RUN_NO_CODEGEN="1", MAKEPAD_RUN_INTERP_STATS="1", BENCH_WARM_MS="2500"),
     # A/B of the lowering's own clean-ups: no constant-branch folding and no loop-constant preload
     "interp-plain": dict(MAKEPAD_RUN_INTERP="all", MAKEPAD_RUN_INTERP_STATS="1", MAKEPAD_RUN_O3="0", MAKEPAD_RUN_O1="0", MAKEPAD_RUN_INTERP_NOFOLD="1"),
 }
