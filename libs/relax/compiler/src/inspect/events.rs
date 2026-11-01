@@ -346,8 +346,10 @@ pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
         return;
     }
     let domain = crate::domain::current_app_domain();
+    // the run window shows the app's parked panic (resume, restart) in a live session; a run that
+    // is none (a test's child) ends as its panic ends it
     let watched = WATCHERS.load(SeqCst) > 0 || super::AGENT.load(Relaxed)
-        || (RUN_STATE_AVAILABLE.load(SeqCst) && domain.is_some() && domain == crate::run::app_domain());
+        || (RUN_STATE_AVAILABLE.load(SeqCst) && domain.is_some() && domain == crate::run::app_domain() && crate::run::live_session());
     let key = format!("{}|{}|{}", info.site, info.location, info.message);
     super::flightrec::panic(&super::short(&info.message, 120), if info.location.is_empty() { "?" } else { &info.location });
     if !watched {
