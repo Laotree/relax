@@ -129,10 +129,10 @@ pub(crate) fn child_reached_unbuilt(slot: u32) -> ! {
         t[k][3].store(STATE_UNBUILT | (slot as u64) << 32, Ordering::Release);
     }
     extern "C" {
-        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+        fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
     }
     let put = |b: &[u8]| unsafe {
-        write(2, b.as_ptr(), b.len());
+        write(2, b.as_ptr().cast(), b.len());
     };
     if !VERBOSE.load(Ordering::Relaxed) {
         crate::os::thread::exit_now(127)

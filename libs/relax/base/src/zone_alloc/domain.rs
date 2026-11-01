@@ -361,12 +361,13 @@ pub unsafe extern "C" fn program_resize(p: *mut u8, old: usize, align: usize, si
 }
 
 extern "C" {
-    fn malloc(size: usize) -> *mut u8;
-    fn calloc(n: usize, size: usize) -> *mut u8;
-    fn realloc(p: *mut u8, size: usize) -> *mut u8;
-    fn free(p: *mut u8);
+    // the C runtime's own signatures (rustc checks them against the symbols std uses)
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn calloc(n: usize, size: usize) -> *mut core::ffi::c_void;
+    fn realloc(p: *mut core::ffi::c_void, size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
     #[cfg(unix)]
-    fn posix_memalign(out: *mut *mut u8, align: usize, size: usize) -> i32;
+    fn posix_memalign(out: *mut *mut core::ffi::c_void, align: usize, size: usize) -> i32;
     #[cfg(windows)]
     fn _aligned_malloc(size: usize, align: usize) -> *mut u8;
     #[cfg(windows)]
@@ -375,7 +376,7 @@ extern "C" {
 pub unsafe extern "C" fn program_malloc(size: usize) -> *mut u8 {
     match compiler::domain_here() {
         Some(a) => allocate(a, size, 16, false),
-        None => malloc(size),
+        None => malloc(size).cast(),
     }
 }
 pub unsafe extern "C" fn program_calloc(n: usize, size: usize) -> *mut u8 {
@@ -384,12 +385,12 @@ pub unsafe extern "C" fn program_calloc(n: usize, size: usize) -> *mut u8 {
     };
     match compiler::domain_here() {
         Some(a) => allocate(a, total, 16, true),
-        None => calloc(n, size),
+        None => calloc(n, size).cast(),
     }
 }
 pub unsafe extern "C" fn program_free(p: *mut u8) {
     if !p.is_null() && !dealloc(p) {
-        free(p);
+        free(p.cast());
     }
 }
 pub unsafe extern "C" fn program_realloc(p: *mut u8, size: usize) -> *mut u8 {
@@ -401,7 +402,7 @@ pub unsafe extern "C" fn program_realloc(p: *mut u8, size: usize) -> *mut u8 {
         return std::ptr::null_mut();
     }
     // Shared blocks stay shared even when a domain happens to grow them.
-    realloc_owned(p, size).unwrap_or_else(|| realloc(p, size))
+    realloc_owned(p, size).unwrap_or_else(|| realloc(p.cast(), size).cast())
 }
 pub unsafe extern "C" fn program_memalign(out: *mut *mut u8, align: usize, size: usize) -> i32 {
     if !align.is_power_of_two() || align < std::mem::size_of::<usize>() {
@@ -417,7 +418,7 @@ pub unsafe extern "C" fn program_memalign(out: *mut *mut u8, align: usize, size:
     }
     #[cfg(unix)]
     {
-        posix_memalign(out, align, size)
+        posix_memalign(out.cast(), align, size)
     }
     #[cfg(windows)]
     {
