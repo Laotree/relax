@@ -534,3 +534,49 @@ fn foreign_thread_callback_sees_domain_statics() {
     drop(u);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+// An app's `process::exit` from inside its event handler: the event loop runs each turn under
+// catch_unwind (as the HAL's turn guard does), here two deep, with a RefCell borrowed across the
+// exit. The exit is no panic: neither catch_unwind contains it, no later turn runs (each would
+// panic on the borrow left behind), and the domain ends Exited with the program's code.
+const EXIT_FIXTURE: &str = r#"
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+fn exit_in_handler(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let view = std::cell::RefCell::new(0u64);
+    for turn in 0..8u64 {
+        let outer = catch_unwind(AssertUnwindSafe(|| {
+            let inner = catch_unwind(AssertUnwindSafe(|| {
+                let mut v = view.borrow_mut();
+                *v += 1;
+                a[0].fetch_add(1, Ordering::SeqCst);
+                if turn == 2 { std::process::exit(7); }
+            }));
+            if inner.is_err() { a[1].fetch_add(1, Ordering::SeqCst); }
+        }));
+        if outer.is_err() { a[1].fetch_add(1, Ordering::SeqCst); }
+    }
+    a[2].store(1, Ordering::SeqCst);
+}
+"#;
+
+#[test]
+fn process_exit_in_a_caught_handler_ends_the_domain_with_its_code() {
+    isolated_test!(process_exit_in_a_caught_handler_ends_the_domain_with_its_code);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(EXIT_FIXTURE, "exit_in_handler");
+    let flags = [const { AtomicU64::new(0) }; 4];
+    let (domain, _base, main) = launch(&mut u, entry, None, &flags);
+    main.join().unwrap();
+    let state = info(domain).unwrap().state;
+    assert!(matches!(state, DomainState::Exited(7)), "the domain ended {state:?}");
+    assert_eq!(flags[0].load(Ordering::SeqCst), 3, "turns ran after the exit");
+    assert_eq!(flags[1].load(Ordering::SeqCst), 0, "a catch_unwind contained the exit");
+    assert_eq!(flags[2].load(Ordering::SeqCst), 0, "the event loop went on past the exit");
+    wait(|| info(domain).unwrap().threads == 0);
+    stop_for(domain, Duration::from_secs(30)).unwrap();
+    domains().retain(|d| d.info.id != domain);
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -2967,6 +2967,10 @@ pub(crate) fn rt_catch_panic(f: u64, data: u64) -> u64 {
     let u = cur_unit();
     match unsafe { call_jit_nested(u, f, data) } {
         Ok(_) => 0,
+        // `process::exit` in an app domain (domain.rs exit_current) is no panic: catch_unwind
+        // does not stop it, it leaves for the next recovery point out to the thread's start
+        // (the exiting thread of a rustc build never comes back either)
+        Err(p) if p.kind == crate::domain::EXIT_KIND => leave_thread(crate::domain::EXIT_KIND, p.message),
         Err(p) => {
             let r = owner::call(owner::Class::Job, || unsafe { (&*u).report(&p) });
             fatal_compile_error(&p, &r);

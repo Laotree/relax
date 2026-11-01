@@ -1348,9 +1348,17 @@ pub(crate) fn current_app_domain() -> Option<DomainId> {
 
 /// `std::process::exit(code)` on a thread of an app domain ends that domain, not the process:
 /// the domain is Exited(code) and the thread leaves its run (the frames' cleanups do not run, as
-/// for an exit). False on any other thread: the caller exits the process.
+/// for an exit). Every recovery point on the way (the program's catch_unwind, rt_catch_panic)
+/// passes the exit on to the next one, up to the thread's start: an exit is never contained. The
+/// run's own app domain ending ends the process from the host (with `code`), so the program's
+/// atexit handlers run here first, as exit() runs them. False on any other thread: the caller
+/// exits the process.
 pub(crate) fn exit_current(code: i32) -> bool {
     let Some(id) = current_app_domain() else { return false };
+    #[cfg(unix)]
+    if crate::run::app_domain() == Some(id) {
+        crate::os::proc::run_program_atexit();
+    }
     end(id, DomainState::Exited(code));
     crate::jit::leave_thread(EXIT_KIND, code.to_string())
 }
