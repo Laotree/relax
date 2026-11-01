@@ -77,7 +77,7 @@ mod unix {
     pub const SIGSEGV: i32 = 11;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub const SIGBUS: i32 = 7;
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     pub const SIGBUS: i32 = 10;
 
     pub fn kind(sig: i32) -> super::Kind {
@@ -453,7 +453,7 @@ mod imp {
 
 /// macOS (Apple Silicon): the Darwin arm64 ucontext; handlers a library installed over ours
 /// (Chromium's in CefInitialize) stay chained.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod imp {
     use super::unix::{kind, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
     use super::{Action, Fault, Hooks};
@@ -923,7 +923,7 @@ pub fn stack_bounds_of_self() -> (u64, u64) {
     if let Some((lo, hi)) = crate::stack::program_stack_bounds() {
         return (lo as u64, hi as u64);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     unsafe {
         extern "C" {
             fn pthread_self() -> usize;

@@ -157,7 +157,7 @@ fn classify_path(path: &str, home: &str) -> String {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn os_regions(s: &mut Snap) {
     extern "C" {
         static mach_task_self_: u32;
@@ -254,7 +254,7 @@ fn os_regions(s: &mut Snap) {
 }
 
 /// A macOS VM region tag (mach/vm_statistics.h VM_MEMORY_*) as a category.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn tag_name(t: u32) -> &'static str {
     match t {
         0 => "untagged (makepad run JIT code/data, burst arena, mapped files)",
@@ -306,7 +306,7 @@ fn malloc_stats(s: &mut Snap) {
     s.add("malloc/held free", m.fordblks as u64);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn malloc_stats(s: &mut Snap) {
     #[repr(C)]
     #[derive(Default)]

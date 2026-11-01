@@ -335,7 +335,7 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         // JIT-owned Rust buffers have unprefixed slots, never a native tag header.
         // A provided crate may take ownership of one and drop it through this allocator.
-        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
         if on() && crate::zone_alloc::domain::dealloc_layout(p, l) { return; }
         if !on() {
             if TRACK.load(Relaxed) {
@@ -356,7 +356,7 @@ unsafe impl GlobalAlloc for Counting {
 
     #[inline(always)]
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
-        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
         if on() {
             if let Some(q) = crate::zone_alloc::domain::realloc_layout(p, l, new) { return q; }
         }
@@ -466,7 +466,7 @@ pub fn start_sampler() {
 /// The process's physical footprint in bytes where the OS reports one (macOS `phys_footprint`,
 /// the figure Activity Monitor shows: resident private memory plus compressed); None elsewhere.
 pub fn footprint() -> Option<u64> {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
         extern "C" {
             static mach_task_self_: u32;
@@ -478,7 +478,7 @@ pub fn footprint() -> Option<u64> {
         let r = unsafe { task_info(mach_task_self_, 22, buf.as_mut_ptr(), &mut count) };
         if r == 0 { Some(buf[18]) } else { None }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_vendor = "apple"))]
     {
         None
     }
@@ -500,7 +500,7 @@ pub fn resident() -> u64 {
         let page = unsafe { sysconf(30) }; // _SC_PAGESIZE
         pages * if page > 0 { page as u64 } else { 4096 }
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
         extern "C" {
             static mach_task_self_: u32;
@@ -512,7 +512,7 @@ pub fn resident() -> u64 {
         let r = unsafe { task_info(mach_task_self_, 22, buf.as_mut_ptr(), &mut count) };
         if r != 0 { 0 } else { buf[2] }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
     {
         process_rss().0
     }
@@ -578,7 +578,7 @@ pub fn process_rss() -> (u64, u64, String) {
         };
         (kb("VmRSS:"), kb("VmHWM:"), format!("anon {} MB, file {} MB", mb(kb("RssAnon:")), mb(kb("RssFile:"))))
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
         extern "C" {
             static mach_task_self_: u32;
@@ -625,7 +625,7 @@ pub fn process_rss() -> (u64, u64, String) {
         }
         (c[2] as u64, c[1] as u64, format!("private {} MB", c[9] / (1024 * 1024)))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android", windows)))]
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple", target_os = "android", windows)))]
     {
         (0, 0, String::new())
     }
@@ -833,7 +833,7 @@ pub fn trim() {
     LAST_TRIM_MS.store(crate::clock::ms_since_start() as u64, Relaxed);
     crate::zone_alloc::burst_trim();
     crate::zone_alloc::compiler_trim();
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
     crate::zone_alloc::domain::trim_all();
     #[cfg(target_os = "linux")]
     {
@@ -842,7 +842,7 @@ pub fn trim() {
         }
         unsafe { malloc_trim(0) };
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
         extern "C" {
             fn malloc_zone_pressure_relief(zone: *const u8, goal: usize) -> usize;

@@ -170,7 +170,7 @@ fn stack_lo() -> usize {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn stack_lo() -> usize {
     extern "C" {
         fn pthread_self() -> usize;

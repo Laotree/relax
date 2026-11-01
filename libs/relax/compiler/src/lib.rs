@@ -284,6 +284,7 @@ pub fn print_as_rustc(sess: &std::sync::Arc<crate::Session>, args: &[String], in
                 C::LinuxX64 => crate::cfg::CfgSet::linux_x64(sess, &[]),
                 C::WindowsX64 => crate::cfg::CfgSet::windows_x64(sess, &[]),
                 C::AndroidArm64 => crate::cfg::CfgSet::android_arm64(sess, &[]),
+                C::IosArm64 => crate::cfg::CfgSet::ios_arm64(sess, &[]),
                 C::Web(w) => crate::cfg::CfgSet::web(sess, w, &[]),
                 C::Host => unreachable!("from_triple names a target"),
             }
@@ -302,7 +303,7 @@ pub fn print_as_rustc(sess: &std::sync::Arc<crate::Session>, args: &[String], in
     // rustc_target spec: (dll prefix, dll suffix, exe suffix, staticlib prefix, staticlib suffix,
     // split-debuginfo kinds, only_cdylib)
     let (dll_pre, dll_suf, exe_suf, st_pre, st_suf, split, only_cdylib): (&str, &str, &str, &str, &str, &[&str], bool) = match triple {
-        "aarch64-apple-darwin" => ("lib", ".dylib", "", "lib", ".a", &["off", "packed", "unpacked"], false),
+        "aarch64-apple-darwin" | "aarch64-apple-ios" => ("lib", ".dylib", "", "lib", ".a", &["off", "packed", "unpacked"], false),
         "x86_64-unknown-linux-gnu" | "aarch64-linux-android" => ("lib", ".so", "", "lib", ".a", &["off", "packed", "unpacked"], false),
         "x86_64-pc-windows-gnu" => ("", ".dll", ".exe", "lib", ".a", &["off"], false),
         "wasm32-unknown-unknown" | "wasm64-unknown-unknown" => ("", ".wasm", ".wasm", "lib", ".a", &["off"], true),
@@ -408,9 +409,11 @@ pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
         crate::options::CheckTarget::MacosArm64 => "aarch64-apple-darwin",
         crate::options::CheckTarget::LinuxX64 => "x86_64-unknown-linux-gnu",
         crate::options::CheckTarget::AndroidArm64 => "aarch64-linux-android",
+        crate::options::CheckTarget::IosArm64 => "aarch64-apple-ios",
         crate::options::CheckTarget::Web(w) => crate::options::CheckTarget::web_triple(w),
         _ if cfg!(target_os = "android") => "aarch64-linux-android",
         _ if cfg!(all(target_os = "macos", target_arch = "aarch64")) => "aarch64-apple-darwin",
+        _ if cfg!(target_os = "ios") => "aarch64-apple-ios",
         _ if cfg!(windows) => "x86_64-pc-windows-gnu",
         _ => "x86_64-unknown-linux-gnu",
     }.to_string();
