@@ -25208,6 +25208,18 @@ fn static_trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_STATIC_TRACE").is_some())
 }
 
+/// The `#[global_allocator]` static binary crate `krate` links (rustc_metadata creader
+/// inject_allocator_crate: its own, else its dependencies'): None, the default allocator.
+pub fn global_allocator_linked_by(prog: &crate::program::Program, krate: u32) -> Option<DefId> {
+    (0..prog.defs.len() as u32).map(DefId).find(|&d| {
+        let def = prog.def(d);
+        def.kind == DefKind::Static && prog.crate_sees(krate, def.krate) && prog.item_defs.get(&(def.file, def.item.0)) == Some(&d) && {
+            let ast = &prog.files[def.file as usize].ast;
+            crate::lang_items::has_attr(prog, def.file, ast.list(ast.item(def.item).attrs), "global_allocator")
+        }
+    })
+}
+
 /// The `#[global_allocator]` static of program `prog`
 pub fn global_allocator_static_of(prog: &crate::program::Program) -> Option<DefId> {
     (0..prog.defs.len() as u32).map(DefId).find(|&d| {

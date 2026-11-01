@@ -1258,6 +1258,15 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     } else {
         Vec::new()
     };
+    // Every test target is a binary of its own (cargo builds and runs each apart), and a process
+    // has one global allocator: targets that link different `#[global_allocator]`s cannot share
+    // this program, so each runs as a `makepad test` run of its own
+    if harness && test_subjects.len() > 1 {
+        let first = jit::global_allocator_linked_by(&prog, test_subjects[0]);
+        if test_subjects.iter().any(|&k| jit::global_allocator_linked_by(&prog, k) != first) {
+            return run_targets_apart(&g, &units, &crate_of, root);
+        }
+    }
     if !test_subjects.is_empty() {
         let mut own = vec![false; prog.crates.len()];
         for &k in &test_subjects { prog.crates[k as usize].validate = true; own[k as usize] = true; }
@@ -1964,6 +1973,65 @@ static MAIN_HOST: std::sync::OnceLock<MainHost> = std::sync::OnceLock::new();
 static HOSTED_RUN: AtomicBool = AtomicBool::new(false);
 /// `makepad run --harness` (`makepad test`): the program is a test harness.
 static HARNESS_RUN: AtomicBool = AtomicBool::new(false);
+
+/// `makepad run --harness` over targets that link different global allocators: each test or bin
+/// target of the graph again in a run of its own (this command line with that one target
+/// selected), one after the other; their combined verdict. The root lib (an integration test
+/// graph's plain lib) has no tests of its own and is not run.
+fn run_targets_apart(g: &unitgraph::Graph, units: &unitgraph::Units, crate_of: &[u32], root: u32) -> i32 {
+    let raw: Vec<String> = crate::os::proc::args_bytes().iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    let dash = raw.iter().position(|a| a == "--").unwrap_or(raw.len());
+    // the command line without its target selection
+    let mut base: Vec<String> = Vec::new();
+    let mut i = 1;
+    while i < dash {
+        let a = raw[i].as_str();
+        if matches!(a, "--lib" | "--bins" | "--tests") || a.starts_with("--test=") || a.starts_with("--bin=") {
+        } else if matches!(a, "--test" | "--bin") {
+            i += 1;
+        } else {
+            base.push(raw[i].clone());
+        }
+        i += 1;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("makepad test: the loader's own path is unknown");
+        return 101;
+    };
+    let mut code = 0;
+    let mut cis: Vec<usize> = std::iter::once(g.root).chain(g.bins.iter().copied()).collect();
+    cis.dedup();
+    for ci in cis {
+        let k = crate_of[ci];
+        let p = &g.crates[ci].src_path;
+        let Some(unit) = units.units.iter().find(|u| &u.src_path == p && u.kind.iter().any(|t| t == "test" || t == "bin")) else {
+            // the lib: a run of its unit tests is its own `--lib` selection
+            if k != root || !raw[1..dash].iter().any(|a| a == "--lib") { continue }
+            code = code.max(run_apart(&exe, &base, &["--lib".to_string()], &raw[dash..]));
+            continue;
+        };
+        let sel = if unit.kind.iter().any(|t| t == "test") {
+            vec!["--test".to_string(), unit.name.clone()]
+        } else {
+            vec!["--bins".to_string(), "--bin".to_string(), unit.name.clone()]
+        };
+        code = code.max(run_apart(&exe, &base, &sel, &raw[dash..]));
+    }
+    code
+}
+
+fn run_apart(exe: &std::path::Path, base: &[String], sel: &[String], tail: &[String]) -> i32 {
+    let status = std::process::Command::new(exe).args(base).args(sel).args(tail)
+        .env_remove("MAKEPAD_RUN_SELF_EXEC").env_remove("MAKEPAD_RUN_SELF_EXEC_SILENT_ADDED").status();
+    match status {
+        Ok(s) if s.success() => 0,
+        Ok(_) => 101,
+        Err(e) => {
+            eprintln!("makepad test: starting {}: {e}", exe.display());
+            101
+        }
+    }
+}
 
 /// `makepad test`: the crates under test (the lib or bins built cfg(test), the integration test
 /// targets) are type- and borrow-checked whole before any test runs, as `cargo test` compiles
