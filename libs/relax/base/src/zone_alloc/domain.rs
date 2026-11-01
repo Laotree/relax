@@ -855,7 +855,7 @@ mod tests {
     /// `heap_check_child` (the check is read once per process).
     fn heap_check_run(mode: &str) -> std::process::Output {
         std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "zone_alloc::domain::tests::heap_check_child", "--ignored", "--nocapture", "--test-threads=1"])
+            .args(["--exact", "zone_alloc::domain::tests::heap_check_child", "--nocapture", "--test-threads=1"])
             .env("MAKEPAD_RUN_HEAP_CHECK", "1")
             .env("RELAX_HEAP_CHECK_CHILD", mode)
             .output()
@@ -863,7 +863,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "run by heap_check_* in a child process"]
     fn heap_check_child() {
         let Ok(mode) = std::env::var("RELAX_HEAP_CHECK_CHILD") else { return };
         assert!(compiler::heap_check_on());
