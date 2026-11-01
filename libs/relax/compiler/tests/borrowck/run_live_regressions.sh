@@ -38,7 +38,7 @@ PY
             exit 1
         fi
         if "$BIN" check --no-serve --units "$TMP/units.json" "$name" > "$TMP/check.log" 2>&1 ||
-           ! grep -q "must outlive" "$TMP/check.log" ||
+           ! grep -q 'lifetime may not live long enough' "$TMP/check.log" ||
            grep -Eq 'panicked at|internal error in the borrow checker' "$TMP/check.log"; then
             cat "$TMP/check.log"
             exit 1
@@ -51,9 +51,9 @@ PY
         # or an unchecked body is never a rejection.
         case "$name" in
             closure_iter_*_static_reject) rustc_err='E0521'; relax_err='must outlive' ;;
-            closure_iter_*_reject) rustc_err='E0621'; relax_err='must outlive' ;;
+            closure_iter_*_reject) rustc_err='E0621'; relax_err='error[E0621]' ;;
             closure_annotated_free_named_reject) rustc_err='E0597'; relax_err='error[E0597]' ;;
-            closure_annotated_hr_dyn_named_reject) rustc_err='E0621'; relax_err='must outlive' ;;
+            closure_annotated_hr_dyn_named_reject) rustc_err='E0621'; relax_err='error[E0621]' ;;
         esac
         if rustc --edition 2021 "$HERE/$name.rs" -o "$TMP/rustc" > "$TMP/rustc.log" 2>&1 ||
            ! grep -q "$rustc_err" "$TMP/rustc.log"; then
