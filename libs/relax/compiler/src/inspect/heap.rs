@@ -1026,7 +1026,7 @@ fn rows(t: &Tables) -> Vec<Row> {
         .collect()
 }
 
-/// The live samples whose block lies in one arena (`heap top host=1 zone=burst|compiler|old|new`), per
+/// The live samples whose block lies in one arena (`heap top host=1 zone=burst|compiler|slots|old|new`), per
 /// stack: what survives there (a few surviving blocks pin a whole chunk of the burst arena).
 fn zone_rows(t: &Tables, zone: &str) -> Vec<Row> {
     let mut r: Vec<Row> = rows(t).into_iter().map(|x| (x.0, 0, 0, x.3, x.4, x.5, x.6)).collect();
@@ -1038,10 +1038,11 @@ fn zone_rows(t: &Tables, zone: &str) -> Vec<Row> {
         let inside = match zone {
             "burst" => crate::zone_alloc::burst_owns(a as *const u8),
             "compiler" => crate::zone_alloc::compiler_owns(a as *const u8),
+            "slots" => crate::zone_alloc::slots_owns(a as *const u8),
             // the compiler arena's chunks from before the last settle rebuild, and those after
             "old" | "cold" => crate::zone_alloc::placement(a as *const u8) == 0,
             "new" => crate::zone_alloc::placement(a as *const u8) == 1,
-            _ => !crate::zone_alloc::burst_owns(a as *const u8) && !crate::zone_alloc::compiler_owns(a as *const u8),
+            _ => crate::zone_alloc::placement(a as *const u8) == 3,
         };
         if !inside {
             continue;
@@ -1123,7 +1124,7 @@ fn tag_name(t: &Tables, id: usize) -> &'static str {
 }
 
 /// `heap start [host=1] [rate=65536] [ttl_s=600]` | `heap stop [host=1]` | `heap status` |
-/// `heap top [host=1] [by=live|alloc|freed|peak] [n=15] [depth=5] [group=stack|tag] [zone=burst|compiler|old|cold|new|other]` (cold: in old chunks, sampled before the settle rebuild) |
+/// `heap top [host=1] [by=live|alloc|freed|peak] [n=15] [depth=5] [group=stack|tag] [zone=burst|compiler|slots|old|cold|new|other]` (cold: in old chunks, sampled before the settle rebuild) |
 /// `heap snap <name> [host=1]` | `heap diff <a> <b|now>` | `heap path H<id> [host=1]`
 pub fn cmd_heap(req: &Req, out: &mut Out) {
     let host = req.get("host") == Some("1");

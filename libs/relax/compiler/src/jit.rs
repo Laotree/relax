@@ -66,17 +66,16 @@ pub const GLUE_CTOR: u8 = 16;
 /// whose key did not decode: never built
 pub const GLUE_UNNAMED: u8 = 15;
 
-/// A slot. Heaps (placement only, MEMSAFE.DESIGN.md): identity fields are KEPT (built and grown
-/// under `zone_alloc::kept`): key, name, code/code_len, pc_map, file, history, compiled, patch_gen,
-/// refs, entry_ref*, version, the flags, unverified, spec_state/spec_depth, build_ns/cg_ns. Compile
-/// fields live in the compiler arena: rir, rir_refs, build_err, spec, calls, building, inflight.
+/// A slot. Its own heap data lives in the unit-lifetime slot arena, separately from the
+/// front-end state a settle rebuild drops. RIR is disposable compiler state; slot call lists,
+/// identities, maps, history and speculative code never pin its chunks (placement only).
 pub struct FnEntry {
     pub key: FnKey,
     /// Fixed after naming; an unnamed startup slot gets its whole name replaced on decode.
     pub name: Box<str>,
     pub code: u64,
     pub pc_map: PcMap,
-    /// Allocated on the kept heap only when code history or an inlining caller is recorded.
+    /// Allocated in the slot arena only when code history or an inlining caller is recorded.
     pub history: Option<Box<SlotHistory>>,
     /// optimised RIR (input to inlining into callers, tier-up, recompiles)
     /// shared: O3 builds snapshot callees' RIR and optimise off the unit
@@ -163,7 +162,15 @@ pub struct SpecCode {
     pub record: bool,
 }
 
-/// Kept state needed only by slots with replaced code or inlining callers.
+impl SpecCode {
+    fn new(code: &[u8], map: &[(u32, u64)], relocs: &[relax_backend::rir::RelocAt], record: bool) -> Box<Self> {
+        crate::zone_alloc::slots_with(|| Box::new(Self {
+            code: code.to_vec(), map: map.to_vec(), relocs: relocs.to_vec(), record,
+        }))
+    }
+}
+
+/// Unit-lifetime state needed only by slots with replaced code or inlining callers.
 #[derive(Default)]
 pub struct SlotHistory {
     /// previous code versions (for rollback), newest last
@@ -178,17 +185,6 @@ impl FnEntry {
     /// The slots this body's RIR references (placement census).
     pub(crate) fn rir_refs(&self) -> &[u32] {
         &self.rir_refs
-    }
-    /// A settle rebuild's replace (on the owner, under the front write, in fresh compiler chunks):
-    /// the call lists that lie in the old state's chunks are copied, so they stop pinning them.
-    pub(crate) fn rehome_lists(&mut self) {
-        let old = |b: &[u32]| !b.is_empty() && crate::zone_alloc::placement(b.as_ptr().cast()) == 0;
-        if old(&self.calls) {
-            self.calls = self.calls.to_vec().into_boxed_slice();
-        }
-        if old(&self.rir_refs) {
-            self.rir_refs = self.rir_refs.to_vec().into_boxed_slice();
-        }
     }
     /// Reading an untouched slot's history never allocates.
     pub fn history(&self) -> &SlotHistory {
@@ -3753,7 +3749,7 @@ impl Unit {
             provided,
             provided_types,
             lay: { let mut l = crate::layout::Layouts::new(); l.opaque = opaque_layouts; l },
-            fns: crate::conc::AppendVec::new_kept(u32::MAX as usize + 1),
+            fns: crate::conc::AppendVec::new_slots(u32::MAX as usize + 1),
             reload_slots: Default::default(),
             reload_rir: None,
             reload_errors: Default::default(),
@@ -4274,7 +4270,7 @@ impl Unit {
         let stub = self.slots.stub(id);
         let f = &mut self.fns[id as usize];
         let old_map = std::mem::take(&mut f.pc_map);
-        crate::zone_alloc::kept_with(|| f.history.get_or_insert_with(Default::default).retired.push((f.code, f.code_len, old_map)));
+        crate::zone_alloc::slots_with(|| f.history.get_or_insert_with(Default::default).retired.push((f.code, f.code_len, old_map)));
         f.code = stub;
         f.code_len = 0;
         f.compiled = false;
@@ -4910,7 +4906,7 @@ impl Unit {
                         eprintln!("makepad-run: coroutine frame of {} not built: {}", u.fns[id as usize].name, e.lines().next().unwrap_or(""));
                     }
                     u.reload_errors.insert(id);
-                    u.fns[id as usize].build_err = Some(e.into_boxed_str());
+                    u.fns[id as usize].build_err = Some(crate::zone_alloc::slots_with(|| Box::from(e.as_str())));
                 }
             }
         }
@@ -5280,12 +5276,7 @@ impl Unit {
     fn fn_create_locked(&self, key: &FnKey, name: String) -> u32 {
         let id = self.fns.len() as u32;
         self.ensure_slots(id, 1);
-        // identity state: the slot's key and name (and the map's copy of the key) are the
-        // program's, not the compiler arena's
-        let (entry_key, map_key) = {
-            let _k = crate::zone_alloc::kept();
-            (key.clone(), key.clone())
-        };
+        let map_key = crate::zone_alloc::kept_clone(key);
         let file = self.key_file(key);
         let stub_addr = self.slots.stub(id);
         let stub = x64::stub(id, self.lazy_entry);
@@ -5300,7 +5291,7 @@ impl Unit {
             *(slot_addr as *mut u64) = stub_addr;
         }
         self.slot_named(id, key);
-        self.fns.push(Self::new_entry(entry_key, name, file, stub_addr, stub.len() as u32));
+        self.fns.push(Self::new_entry(key, &name, file, stub_addr, stub.len() as u32));
         if let Some(index) = self.reload_slots.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             index.insert(key, id);
         }
@@ -5345,12 +5336,14 @@ impl Unit {
     }
 
     /// A new slot's entry: no code yet (its table word points at its lazy stub `stub_addr`).
-    fn new_entry(key: FnKey, name: String, file: u32, stub_addr: u64, stub_len: u32) -> FnEntry {
+    fn new_entry(key: &FnKey, name: &str, file: u32, stub_addr: u64, stub_len: u32) -> FnEntry {
         // Generated glue and sandbox entries are conservatively not local-linkage. A
         // definition's own entry/export markers are read only by single_ref (declared_entry):
         // most slots (the startup image's thousands) are never asked.
         let entry_ref = matches!(key, FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_)) && !matches!(key, FnKey::Glue(GLUE_UNNAMED, _));
-        let name = crate::zone_alloc::kept_with(|| name.into_boxed_str());
+        // Copy explicitly: converting an existing String can keep its old allocation.
+        // Clone also copies both Inst's and Shim's owned type arguments.
+        let (key, name) = crate::zone_alloc::slots_with(|| (key.clone(), Box::<str>::from(name)));
         FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), ran_before: AtomicBool::new(false), twin_ran: AtomicBool::new(false), borrowed: false, calls: Box::default() }
     }
 
@@ -5520,7 +5513,7 @@ impl Unit {
             let id = first + i;
             let stub_addr = self.slots.stub(id);
             unsafe { *(self.slots.table(id) as *mut u64) = stub_addr };
-            self.fns.push(Self::new_entry(unnamed.clone(), String::new(), 0, stub_addr, stub_len as u32));
+            self.fns.push(Self::new_entry(&unnamed, "", 0, stub_addr, stub_len as u32));
         }
         first
     }
@@ -5530,12 +5523,13 @@ impl Unit {
     /// function (its code and callers stay; the reload index finds both), the map the first.
     pub(crate) fn name_slot(&mut self, id: u32, key: FnKey) -> bool {
         let key = self.slot_key_form(key);
-        let name = crate::zone_alloc::kept_with(|| fn_name(self, &key).into_boxed_str());
+        let name = fn_name(self, &key);
+        let name = crate::zone_alloc::slots_with(|| Box::<str>::from(name.as_str()));
         let file = self.key_file(&key);
         self.slot_named(id, &key);
         self.slot_ahead(id, &key);
         let f = &mut self.fns[id as usize];
-        f.key = crate::zone_alloc::kept_clone(&key);
+        f.key = crate::zone_alloc::slots_with(|| key.clone());
         f.name = name;
         f.file = file;
         if let Some(index) = self.reload_slots.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -5656,10 +5650,10 @@ impl Unit {
                 self.sync_entry_ref(c);
             }
         }
-        let refs = func.blocks.iter().flat_map(|b| &b.insts).filter_map(|i| match i {
+        let refs = crate::zone_alloc::slots_with(|| func.blocks.iter().flat_map(|b| &b.insts).filter_map(|i| match i {
             relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) | relax_backend::rir::Inst::FnAddr(_, c) => Some(*c),
             _ => None,
-        }).collect::<Vec<_>>().into_boxed_slice();
+        }).collect::<Vec<_>>().into_boxed_slice());
         // SPEC-V: calls to twins its lowering did not make (in bodies it inlined) are recorded as
         // the lowering's are, so a twin's install finds every caller in TWIN_USERS (twin_callers)
         if func.plain_calls {
@@ -6696,11 +6690,11 @@ impl Unit {
         let f = &mut self.fns[id as usize];
         if f.compiled {
             let old_map = std::mem::take(&mut f.pc_map);
-            crate::zone_alloc::kept_with(|| f.history.get_or_insert_with(Default::default).prev.push((f.code, f.code_len, old_map, f.patch_gen)));
+            crate::zone_alloc::slots_with(|| f.history.get_or_insert_with(Default::default).prev.push((f.code, f.code_len, old_map, f.patch_gen)));
         } else if gen > 0 {
             // a patch group's first code for a slot: rolling it back restores the lazy stub
             // (length 0 marks it), so the slot builds again from the restored source
-            crate::zone_alloc::kept_with(|| f.history.get_or_insert_with(Default::default).prev.push((f.code, 0, PcMap::default(), 0)));
+            crate::zone_alloc::slots_with(|| f.history.get_or_insert_with(Default::default).prev.push((f.code, 0, PcMap::default(), 0)));
         }
         f.code = at;
         f.code_len = code.len() as u32;
@@ -6986,7 +6980,7 @@ impl Unit {
         let f = &mut self.fns[id as usize];
         f.code = at;
         f.code_len = len;
-        f.pc_map = pc_map;
+        f.pc_map = pc_map.into_slots();
         f.compiled = true;
         f.version += 1;
         crate::inspect::patches::code_installed(self, id);
@@ -7011,8 +7005,8 @@ impl Unit {
         {
             let f = &mut self.fns[id as usize];
             if f.patch_gen >= first && f.patch_gen > 0 && f.code_len > 0 {
-                let m = f.pc_map.clone();
-                crate::zone_alloc::kept_with(|| f.history.get_or_insert_with(Default::default).retired.push((f.code, f.code_len, m)));
+                let m = crate::zone_alloc::slots_with(|| f.pc_map.clone());
+                crate::zone_alloc::slots_with(|| f.history.get_or_insert_with(Default::default).retired.push((f.code, f.code_len, m)));
             }
         }
         loop {
@@ -7737,7 +7731,7 @@ unsafe fn cached_tier1(up: *mut Unit, id: u32, inlined: &[u32]) {
     for &c in inlined {
         u.exec_event(c, "inline");
         if c != id && !u.fns[c as usize].history().inlined_into.contains(&id) {
-            crate::zone_alloc::kept_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(id));
+            crate::zone_alloc::slots_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(id));
         }
     }
     u.stats.tier1_cached += 1;
@@ -10888,7 +10882,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     }
     if let Err(e) = &r {
         (&mut *up).reload_errors.insert(id);
-        (&mut *up).fns[id as usize].build_err = Some(e.as_str().into());
+        (&mut *up).fns[id as usize].build_err = Some(crate::zone_alloc::slots_with(|| e.as_str().into()));
     }
     let mut func = r?;
     crate::harness::reach::instrument(&*up, id, &mut func);
@@ -10964,7 +10958,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             }
         }
     }
-    (&mut *up).fns[id as usize].calls = callees.as_slice().into();
+    (&mut *up).fns[id as usize].calls = crate::zone_alloc::slots_with(|| callees.as_slice().into());
     // inline candidates come from warm blocks only: a callee called only on a panic / error
     // path stays a call and its RIR is not built for it
     let warm: Vec<u32> = if cfg.inline {
@@ -11737,7 +11731,7 @@ unsafe fn store_rir(up: *mut Unit, id: u32, func: relax_backend::rir::Func, inli
         }
         u.stats.inline_rules[rule] += 1;
         if !u.fns[c as usize].history().inlined_into.contains(&id) {
-            crate::zone_alloc::kept_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(id));
+            crate::zone_alloc::slots_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(id));
         }
     }
     u.stats.opt_ns += opt_ns;
@@ -18616,7 +18610,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     for &c in &inlined {
                         u.exec_event(c, "inline");
                         if c != id && !u.fns[c as usize].history().inlined_into.contains(&id) {
-                            crate::zone_alloc::kept_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(id));
+                            crate::zone_alloc::slots_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(id));
                         }
                     }
                     u.stats.tier1_installed += 1;
@@ -18668,7 +18662,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 }
                 let f = &mut u.fns[id as usize];
                 let old_map = std::mem::take(&mut f.pc_map);
-                crate::zone_alloc::kept_with(|| f.history.get_or_insert_with(Default::default).retired.push((f.code, f.code_len, old_map)));
+                crate::zone_alloc::slots_with(|| f.history.get_or_insert_with(Default::default).retired.push((f.code, f.code_len, old_map)));
                 f.code = at;
                 f.code_len = code.len() as u32;
                 f.pc_map = PcMap::new(&map);
@@ -18701,7 +18695,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 for c in inlined {
                     u.exec_event(c, "inline");
                     if !u.fns[c as usize].history().inlined_into.contains(&id) {
-                        crate::zone_alloc::kept_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(id));
+                        crate::zone_alloc::slots_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(id));
                     }
                 }
                 // Publish only installed builds. A rejected/stale build must not
@@ -21227,7 +21221,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                 }
                 Err(e) => {
                     (&mut *up).reload_errors.insert(c);
-                    (&mut *up).fns[c as usize].build_err = Some(e.into_boxed_str());
+                    (&mut *up).fns[c as usize].build_err = Some(crate::zone_alloc::slots_with(|| Box::from(e.as_str())));
                 },
             }
         }
@@ -21432,7 +21426,7 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
                     return Begin::Done(Split::Spec);
                 }
                 u.reload_specs.insert(id);
-                u.fns[id as usize].spec = Some(Box::new(SpecCode { code, map, relocs: crelocs, record: false }));
+                u.fns[id as usize].spec = Some(SpecCode::new(&code, &map, &crelocs, false));
                 u.fns[id as usize].spec_state = 1;
                 u.exec_note(id, crate::exec_profile::SPEC);
                 note_spec_built(options, &*up, id);
@@ -21604,7 +21598,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
                 }
                 Err(e) => {
                     (&mut *up).reload_errors.insert(c);
-                    (&mut *up).fns[c as usize].build_err = Some(e.into_boxed_str());
+                    (&mut *up).fns[c as usize].build_err = Some(crate::zone_alloc::slots_with(|| Box::from(e.as_str())));
                 },
             }
         }
@@ -21650,7 +21644,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
                 let u = &mut *up;
                 if u.fns[id as usize].spec.is_none() {
                     u.reload_specs.insert(id);
-                    u.fns[id as usize].spec = Some(Box::new(SpecCode { code, map, relocs, record: true }));
+                    u.fns[id as usize].spec = Some(SpecCode::new(&code, &map, &relocs, true));
                     u.fns[id as usize].spec_state = 1;
                     u.exec_note(id, crate::exec_profile::SPEC);
                     note_spec_built(options, &*up, id);
@@ -24058,10 +24052,21 @@ pub struct PcFiles {
 }
 
 impl PcMap {
-    /// An installed code body's map: identity state, built in the kept heap.
+    /// An installed code body's map: unit-lifetime state in the slot arena.
     pub fn new(v: &[(u32, u64)]) -> PcMap {
-        let _k = crate::zone_alloc::kept();
+        let _s = crate::zone_alloc::slots();
         PcMap::encode(v.len(), v.iter().copied())
+    }
+
+    /// Own maps handed in from another phase are copied at installation. Mapped bytes
+    /// belong to the startup image; their shared keeper is allocated in the slot arena.
+    fn into_slots(self) -> Self {
+        match &self.0 {
+            PcBytes::Own(b) if !b.is_empty() && !crate::zone_alloc::slots_owns(b.as_ptr()) => {
+                crate::zone_alloc::slots_with(|| self.clone())
+            }
+            _ => self,
+        }
     }
 
     /// The map of `n` entries (a capacity hint) from `v`, encoded as they come.
