@@ -144,9 +144,6 @@ pub mod inspect;
 pub mod memreport;
 pub mod registry_net;
 
-#[cfg(test)]
-mod parse_work_bench;
-
 /// The system allocator (Relax's own malloc zone once a program swaps the default zone:
 /// zone_alloc.rs), with per-subsystem accounting when MAKEPAD_RUN_MEM_REPORT is set (memstat.rs).
 #[global_allocator]

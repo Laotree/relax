@@ -15,7 +15,7 @@ pub struct PatId(pub u32);
 pub struct TyId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ItemId(pub u32);
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockId(pub u32);
 
 /// ExprKind::Async capture modes: by use, all by value, and an async closure's body (the
