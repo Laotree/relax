@@ -316,6 +316,65 @@ const RB_WORDS: usize = 26;
 
 static FUNCS: [AtomicPtr<IFunc>; POOL] = [const { AtomicPtr::new(std::ptr::null_mut()) }; POOL];
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// A count stub's work, for an entry made by `count_entry`: the slot's tier record (its word 0 is
+/// the budget each call's weight comes off), the slot, the weight.
+pub struct CountInfo {
+    rec: *const AtomicU64,
+    slot: u32,
+    weight: u64,
+}
+/// per pool entry: the count stub it is (null: none)
+static COUNTERS: [AtomicPtr<CountInfo>; POOL] = [const { AtomicPtr::new(std::ptr::null_mut()) }; POOL];
+/// the runtime's hot path (jit.rs rt_hot: queues the slot for its O3 build)
+static HOT: AtomicUsize = AtomicUsize::new(0);
+
+/// No-codegen mode's tier-up: the runtime's hot path, called with the slot whose budget ran out.
+pub fn set_hot(f: extern "C" fn(u64) -> u64) {
+    HOT.store(f as usize, Ordering::Release);
+}
+
+/// No-codegen mode's count stub (the arm64 back end's `count_stub`): an entry of its own that runs
+/// the interpreted function at `code` (its entry) after taking `weight` off the budget at `rec`;
+/// at or below zero it calls the hot path with `slot` first. The slot's word holds it while the
+/// slot counts, as it holds a count stub's code.
+pub fn count_entry(rec: u64, slot: u32, code: u64, weight: u32) -> Result<u64, String> {
+    let p = pool_base();
+    if !(code >= p && code < p + 8 * POOL as u64) {
+        return Err(format!("makepad run interp: count stub for slot {} at {:#x}, which is no interpreted function", slot, code));
+    }
+    let f = FUNCS[((code - p) / 8) as usize].load(Ordering::Acquire);
+    let k = NEXT.fetch_add(1, Ordering::Relaxed);
+    if k >= POOL {
+        return Err(format!("makepad run interp: more than {} interpreted entries (the entry thunk pool)", POOL));
+    }
+    let c = Box::new(CountInfo { rec: rec as *const AtomicU64, slot, weight: weight.clamp(1, 4095) as u64 });
+    COUNTERS[k].store(Box::into_raw(c), Ordering::Release);
+    FUNCS[k].store(f, Ordering::Release);
+    Ok(p + 8 * k as u64)
+}
+
+/// A count stub's call: the weight off the budget (as the stub does: not atomically), the hot path
+/// when it runs out.
+#[inline(always)]
+unsafe fn tick(c: *const CountInfo) {
+    let c = &*c;
+    let r = &*c.rec;
+    let b = (r.load(Ordering::Relaxed) as i64).wrapping_sub(c.weight as i64);
+    r.store(b as u64, Ordering::Relaxed);
+    if b <= 0 {
+        hot(c.slot);
+    }
+}
+
+#[inline(never)]
+unsafe fn hot(slot: u32) {
+    let h = HOT.load(Ordering::Acquire);
+    if h != 0 {
+        let f: extern "C" fn(u64) -> u64 = std::mem::transmute(h);
+        f(slot as u64);
+    }
+}
 static TLS_GLUE: AtomicU64 = AtomicU64::new(0);
 /// the runtime's resume (`Env::resume`): continues an unwind from the frame that calls it
 static RESUME: AtomicU64 = AtomicU64::new(0);
@@ -596,6 +655,10 @@ unsafe fn run(f: &IFunc, fp: *mut u64, cx: *mut Cx) {
 /// Returns 0, or 1 when the function ended by unwinding (the entry glue continues the unwind in
 /// the native caller).
 unsafe extern "C" fn relax_interp_enter(k: u32, regs: *mut u64, stack: *const u8) -> u64 {
+    let c = COUNTERS[k as usize].load(Ordering::Acquire);
+    if !c.is_null() {
+        tick(c);
+    }
     let f = &*FUNCS[k as usize].load(Ordering::Acquire);
     let cx = cx_ptr();
     if TRACE.load(Ordering::Relaxed) {
@@ -2087,6 +2150,8 @@ struct Ic {
     /// a lazy stub, patched), so the entry holds only while that word does
     via: u64,
     via_word: u64,
+    /// the entry is a count stub (count_entry): its counting
+    count: *const CountInfo,
 }
 
 struct CallDesc {
@@ -2105,12 +2170,14 @@ struct CallDesc {
 /// The interpreted function a native code address leads to: a pool thunk, a jump to one
 /// (the slot's code), or a slot thunk whose table word is one of those.
 /// `via`: the table word's address the address led through (0: none).
-unsafe fn decode(mut a: u64, via: &mut u64) -> *const IFunc {
+unsafe fn decode(mut a: u64, via: &mut u64, count: &mut *const CountInfo) -> *const IFunc {
     let pool = pool_base();
     let sbase = STATIC_THUNKS[0].load(Ordering::Acquire);
     for _ in 0..3 {
         if a >= pool && a < pool + 8 * POOL as u64 {
-            return FUNCS[((a - pool) / 8) as usize].load(Ordering::Acquire);
+            let k = ((a - pool) / 8) as usize;
+            *count = COUNTERS[k].load(Ordering::Acquire);
+            return FUNCS[k].load(Ordering::Acquire);
         }
         if sbase != 0 {
             let stride = STATIC_THUNKS[1].load(Ordering::Relaxed);
@@ -2151,17 +2218,18 @@ unsafe fn decode(mut a: u64, via: &mut u64) -> *const IFunc {
 }
 
 #[inline(always)]
-unsafe fn resolve(d: &CallDesc, word: u64) -> *const IFunc {
+unsafe fn resolve(d: &CallDesc, word: u64) -> (*const IFunc, *const CountInfo) {
     let ic = d.ic.load(Ordering::Acquire);
     if !ic.is_null() && (*ic).word == word && ((*ic).via == 0 || *((*ic).via as *const u64) == (*ic).via_word) {
-        return (*ic).f;
+        return ((*ic).f, (*ic).count);
     }
     let mut via = 0u64;
-    let f = decode(word, &mut via);
+    let mut count = std::ptr::null();
+    let f = decode(word, &mut via, &mut count);
     let via_word = if via != 0 { *(via as *const u64) } else { 0 };
     // the replaced cache entry is leaked (another thread may still read it)
-    d.ic.store(Box::into_raw(Box::new(Ic { word, f, via, via_word })), Ordering::Release);
-    f
+    d.ic.store(Box::into_raw(Box::new(Ic { word, f, via, via_word, count })), Ordering::Release);
+    (f, count)
 }
 
 /// [h, desc, unwind block or 0]
@@ -2205,8 +2273,11 @@ unsafe fn tail_enter(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> *const IFunc {
         Target::Addr(a) => a,
     };
     if direct_ok(d) {
-        let f = resolve(d, word);
+        let (f, count) = resolve(d, word);
         if !f.is_null() && same_abi(d, &*f) {
+            if !count.is_null() {
+                tick(count);
+            }
             if COUNT {
                 (*cx).n[1] += 1;
             }
@@ -2339,8 +2410,11 @@ unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> bool {
     let saved_top = (*cx).top;
     let fp2 = fp.add(d.frame_words);
     if direct_ok(d) {
-        let f = resolve(d, word);
+        let (f, count) = resolve(d, word);
         if !f.is_null() && same_abi(d, &*f) {
+            if !count.is_null() {
+                tick(count);
+            }
             // interpreted -> interpreted: same stack, arguments cell to cell
             if COUNT {
                 (*cx).n[1] += 1;

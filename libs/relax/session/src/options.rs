@@ -225,8 +225,9 @@ pub struct Options {
     /// `MAKEPAD_RUN_NO_CODEGEN=1`: the process makes no machine code (the platforms without
     /// writable+executable memory, iOS): every function runs in the threaded interpreter
     /// (codegen interp.rs), the runtime glue is the precompiled set (jit/static_glue.rs), and any
-    /// write to code memory is an error. Implies no O3; the code cache holds the interpreter's
-    /// relocatable form (codegen interp/blob.rs). Default `false`.
+    /// write to code memory is an error. The code cache holds the interpreter's
+    /// relocatable form (codegen interp/blob.rs); O3 builds are threaded code too (the interpreter's
+    /// count stubs and loop counters queue them). Default `false`.
     pub no_codegen: bool,
     /// A live session (hot reload, watcher): `makepad run` of a working tree, `makepad live`; never
     /// from the environment. Default `false`.
@@ -471,7 +472,7 @@ impl Options {
             pre_derives: { let os = get("MAKEPAD_RUN_PRE_DERIVES"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             sandbox_fuel: { let os = get("MAKEPAD_RUN_SANDBOX_FUEL"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             spec: { let os = get("MAKEPAD_RUN_SPEC"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
-            tier1: { let os = get("MAKEPAD_RUN_O3"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") && !no_codegen_env(get) },
+            tier1: { let os = get("MAKEPAD_RUN_O3"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             tyck_ahead: { let os = get("MAKEPAD_RUN_TYCK_AHEAD"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             unwind: { let os = get("MAKEPAD_RUN_UNWIND"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             no_codegen: no_codegen_env(get),

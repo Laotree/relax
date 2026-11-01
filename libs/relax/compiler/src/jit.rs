@@ -3720,6 +3720,8 @@ impl Unit {
             let tier = os::mem::alloc_rw(static_glue::SLOTS * TIER_REC);
             slots.install(0, g.thunks, g.stubs, g.table, tier);
             relax_codegen::interp::set_static_thunks(g.thunks, NC_STRIDE as u64, static_glue::SLOTS as u64, g.table);
+            // tier-up: the interpreter's count stubs call the hot path directly
+            relax_codegen::interp::set_hot(rt_hot);
             relax_codegen::interp::set_tls_fn(static_glue::tls_block_c);
         }
         let slots_ptr = relax_backend::rir::SlotsPtr(&*slots);
@@ -16129,6 +16131,13 @@ impl Unit {
             return;
         }
         let now = tier_clock();
+        // no-codegen: each count stub is an interpreter entry of its own (interp::count_entry)
+        if self.prog.session.options.no_codegen {
+            for &(id, code) in ids {
+                self.arm_counter_as(id, code, true);
+            }
+            return;
+        }
         // the block's place first: each stub jumps to its O1 code pc-relatively
         let cs = x64::COUNT_STUB_SIZE;
         let at = bump(&self.code_next, (ids.len() * cs) as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
@@ -16183,9 +16192,20 @@ impl Unit {
             if (*rec.add(3)).load(Ordering::Acquire) != T_COUNTING {
                 return;
             }
-            let at = bump(&self.code_next, x64::COUNT_STUB_SIZE as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
             let bytes = self.fns[id as usize].code_len as u64;
-            os::mem::write_code(at, &x64::count_stub(at, rec as u64, id, code, self.hot_entry, call_weight(bytes)));
+            let at = if self.prog.session.options.no_codegen {
+                match relax_codegen::interp::count_entry(rec as u64, id, code, call_weight(bytes)) {
+                    Ok(at) => at,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return;
+                    }
+                }
+            } else {
+                let at = bump(&self.code_next, x64::COUNT_STUB_SIZE as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+                os::mem::write_code(at, &x64::count_stub(at, rec as u64, id, code, self.hot_entry, call_weight(bytes)));
+                at
+            };
             (*rec.add(1)).store(code, Ordering::Relaxed);
             (*rec.add(5)).store(((*rec.add(5)).load(Ordering::Relaxed) & (REARMED | LOOP_CHARGED)) | bytes, Ordering::Relaxed);
             (*rec.add(2)).store(at, Ordering::Release);
@@ -16249,9 +16269,23 @@ impl Unit {
             (*rec.add(1)).store(code, Ordering::Relaxed);
             // Once the threshold-one stub has fired, another caller must also enter
             // rt_hot and wait for the build, rather than underflowing into O1.
-            let fallback = if recorded { self.emit_code(&x64::stub(id, self.hot_entry), "relax::hot_stub") } else { code };
-            let at = bump(&self.code_next, x64::COUNT_STUB_SIZE as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
-            os::mem::write_code(at, &x64::count_stub(at, rec as u64, id, fallback, self.hot_entry, call_weight(bytes)));
+            let at = if self.prog.session.options.no_codegen {
+                // no-codegen: an interpreter entry of its own counts (interp::count_entry); a
+                // recorded instance (profile replay) builds at its first call: its budget is 1
+                match relax_codegen::interp::count_entry(rec as u64, id, code, call_weight(bytes)) {
+                    Ok(at) => at,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        (*rec.add(3)).store(0, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            } else {
+                let fallback = if recorded { self.emit_code(&x64::stub(id, self.hot_entry), "relax::hot_stub") } else { code };
+                let at = bump(&self.code_next, x64::COUNT_STUB_SIZE as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+                os::mem::write_code(at, &x64::count_stub(at, rec as u64, id, fallback, self.hot_entry, call_weight(bytes)));
+                at
+            };
             if perf_map_on() {
                 perf_map(at, x64::COUNT_STUB_SIZE, &format!("count {}", perf_name(self, id)));
             }
