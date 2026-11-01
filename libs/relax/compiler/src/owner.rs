@@ -423,8 +423,6 @@ impl Drop for NoWait {
 
 thread_local! {
     static IS_OWNER: Cell<bool> = const { Cell::new(false) };
-    /// requests this thread waits for (0: none): a watchdog kick then is ignored
-    static IN_CALL: Cell<u32> = const { Cell::new(0) };
     /// owner: the request being served (class, requester) and how many are open on its stack
     static SERVING: Cell<(Class, u64)> = const { Cell::new((Class::Program, 0)) };
     static DEPTH: Cell<u32> = const { Cell::new(0) };
@@ -616,15 +614,6 @@ pub fn publish<R>(f: impl FnOnce() -> R) -> R {
     .unwrap()
 }
 
-/// Posts `f` as a publish (it runs later; nobody waits for it).
-#[track_caller]
-pub fn post_publish(f: impl FnOnce() + Send + 'static) {
-    post_queued(Class::Publish, move || {
-        let _p = Publishing::enter(PUB_STRICT);
-        f()
-    })
-}
-
 /// `publish` for the take of a background build (rule I-PURE): Err when `f` reached an operation
 /// a publish may not run (`PublishBail`: what, and the slot it needed a front for). On the owner
 /// itself `f` is the owner's own work (`#[relax(O3, always)]`'s first build, inspect served
@@ -728,15 +717,6 @@ pub fn serving_request() -> bool {
 
 pub fn is_owner() -> bool {
     IS_OWNER.try_with(|o| o.get()).unwrap_or(false)
-}
-
-/// Is this thread waiting for a request?
-pub fn in_call() -> bool {
-    IN_CALL.try_with(|c| c.get() > 0).unwrap_or(false)
-}
-
-fn in_call_add(d: i32) {
-    let _ = IN_CALL.try_with(|c| c.set((c.get() as i32 + d) as u32));
 }
 
 /// The request being served on the owner: (class, requester).
@@ -905,7 +885,6 @@ fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadli
     let behind_site = unsafe { NOW_SITE.load(Ordering::Relaxed).as_ref() };
     let t_req = std::time::Instant::now();
     let t0 = if main_wait { crate::jit::wall_ns() } else { 0 };
-    in_call_add(1);
     if req.t_push != 0 {
         crate::postframe::ui_wait_begin();
     }
@@ -914,7 +893,6 @@ fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadli
         let _w = crate::waits::begin(crate::waits::Kind::Owner, class as u64, OWNER_TID.load(Ordering::Relaxed), CLASS_NAMES[class as usize]);
         wait(&req, deadline)
     };
-    in_call_add(-1);
     if req.t_push != 0 {
         crate::postframe::ui_wait_end();
         let now = crate::jit::wall_ns();

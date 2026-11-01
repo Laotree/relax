@@ -1690,7 +1690,7 @@ fn is_text_flow_control(c: char) -> bool {
 /// doc comments and string / char literals containing characters that change the visible
 /// direction of text. Reported while lexing, at the crate root's lint level.
 fn text_direction(prog: &Program, own: &[bool]) {
-    use crate::lexer::{LexOptions, Mode, T};
+    use crate::lexer::{LexOptions, T};
     let mut seen = std::collections::HashSet::new();
     for m in &prog.mods {
         if !own.get(m.krate as usize).copied().unwrap_or(false) { continue; }
@@ -1705,7 +1705,7 @@ fn text_direction(prog: &Program, own: &[bool]) {
         if !std::str::from_utf8(src).map_or(false, |s| s.chars().any(is_text_flow_control)) { continue; }
         let root = prog.mods[prog.crates[m.krate as usize].root_mod as usize].def;
         let mut toks = Vec::new();
-        let opts = LexOptions { edition: pf.edition, mode: Mode::Rust, trivia: true };
+        let opts = LexOptions { edition: pf.edition, trivia: true };
         if crate::lexer::lex_with(src, &opts, &mut toks).is_err() { continue; }
         for t in &toks {
             let flow = |s: &[u8]| std::str::from_utf8(s).map_or(false, |s| s.chars().any(is_text_flow_control));
