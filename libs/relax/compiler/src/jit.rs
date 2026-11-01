@@ -745,9 +745,9 @@ unsafe fn write_bytes(addr: u64, b: &[u8]) {
 const TLS_CAP: usize = 1 << 20;
 /// Offset of the first thread-local variable: slot 0 is the domain base; slot 1 owns runtime
 /// thread registrations and Relax std TLS values, drained before the block is freed;
-/// slot 2 separates compiler initializer execution from runtime coverage.
+/// slot 2 separates compiler initializer execution from runtime coverage; slot 3 holds entry marks.
 const TLS_COVERAGE_DISABLED: u32 = 16;
-const TLS_FIRST_FREE: u32 = 24;
+const TLS_FIRST_FREE: u32 = 32;
 static TLS_KEY: AtomicU64 = AtomicU64::new(u64::MAX);
 
 thread_local! {
@@ -778,6 +778,7 @@ fn tls_dtor(p: *mut u8) {
     // pthread clears its key before calling us. Reinstall it while Relax std destructors run.
     set_tls_block(p);
     let registrations = unsafe { crate::domain_threads::finish(p as u64) };
+    crate::harness::reach::exit(p as u64);
     set_tls_block(std::ptr::null_mut());
     if crate::web32::on() {
         // its shadow stack (web32.rs) goes back with it
@@ -1207,6 +1208,7 @@ fn rt_tls_block() -> u64 {
     // a thread nothing assigned a domain to (one native code started, or the first use of a
     // thread JIT code started before its start put it in its parent's domain): the default
     unsafe { *(b as *mut u64) = crate::domain::default_base() };
+    crate::harness::reach::init(b);
     set_tls_block(b as *mut u8);
     b
 }
@@ -1915,6 +1917,7 @@ pub(crate) unsafe fn fault_policy(label: &str, info: &PanicInfo, guard_depth: u3
         eprintln!("makepad: {} ({}, address {:#x}) inside a guarded module call on thread '{}' at {}: contained, the call returns an error", info.kind, label, info.fault_addr, tname, at);
         return false;
     }
+    crate::harness::live::fault(cur_unit(), info);
     // (a fault in an app domain is that domain's crash: the others go on)
     if FAULTS_FATAL.load(Ordering::Relaxed) && !crate::domain::in_app_domain() {
         let r = owner::call(owner::Class::Job, || u.report(info));
@@ -3055,7 +3058,7 @@ fn compile_failed_stub(up: usize, slot: u32, p: &(dyn std::any::Any + Send)) -> 
         let message = format!("internal compiler error compiling `{}` (slot {}) on its first call: {}", name, slot, text);
         eprintln!("makepad-run: {}", message);
         crate::inspect::flightrec::event("compile.ice", &message, slot as u64, 0);
-        let (code, relocs) = error_stub(u, &message);
+        let (code, relocs) = error_stub(u, slot, &message);
         u.emit_or_redirect(&code, &relocs, "error stub").unwrap_or_else(|e| panic!("{}; and its error stub was not emitted: {}", message, e))
     })
 }
@@ -5591,7 +5594,8 @@ impl Unit {
     }
 
     /// All O1 RIR installations, including sandbox twins, pass through here.
-    fn set_rir(&mut self, id: u32, func: relax_backend::rir::Func) {
+    fn set_rir(&mut self, id: u32, mut func: relax_backend::rir::Func) {
+        crate::harness::reach::instrument(self, id, &mut func);
         if func.cabi.is_some() {
             self.fns[id as usize].entry_ref.store(true, Ordering::Relaxed);
         }
@@ -5986,6 +5990,7 @@ impl Unit {
                 cx.finish();
                 if let Some(err) = cx.errors.first() { return Err(err.clone()); }
                 cx.f.verify()?;
+                crate::harness::reach::instrument(self, parent, &mut cx.f);
                 let code = relax_codegen::native::compile(&self.prog.session.options, &cx.f, &self.env)?;
                 let entry = self.emit_or_redirect(&code.code, &code.relocs, "promoted initializer")?;
                 let buf = self.rw_data(l.size.max(1) as u64, l.align.max(8) as u64);
@@ -7544,7 +7549,7 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
             Err(p) if p.is::<crate::preempt::OwnerBusy>() => {
                 BUSY_PENDING.with(|b| b.set(true));
                 let u = &mut *up;
-                let (code, relocs) = error_stub(u, "the compiler's owner thread is busy with an earlier request (the request is cancelled)");
+                let (code, relocs) = error_stub(u, id, "the compiler's owner thread is busy with an earlier request (the request is cancelled)");
                 u.emit_or_redirect(&code, &relocs, "error stub").unwrap_or(0)
             }
             Err(p) => std::panic::resume_unwind(p),
@@ -7922,7 +7927,7 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
         // the call fails with DEFERRED_RETRY and the outer compile retries after the load
         Err(e) if !outer && e.starts_with(DEFERRED_RETRY) => {
             let u = &mut *up;
-            let (code, relocs) = error_stub(u, DEFERRED_RETRY);
+            let (code, relocs) = error_stub(u, id, DEFERRED_RETRY);
             u.emit_or_redirect(&code, &relocs, "error stub").unwrap_or(0)
         }
         Err(e) => install_error(up, id, &e),
@@ -8150,6 +8155,7 @@ pub(crate) fn note_body_deps(u: &mut Unit, id: u32, deps: impl Iterator<Item = u
     if v.is_empty() {
         return;
     }
+    if !u.aux { crate::harness::reach::note(id, v.iter().copied()); }
     let _k = crate::zone_alloc::kept();
     let e = u.body_deps.entry(id).or_default();
     v.retain(|c| !e.contains(c));
@@ -8217,7 +8223,7 @@ unsafe fn install_error(up: *mut Unit, id: u32, e: &str) -> u64 {
             }
             // a body that failed to compile panics when called, with the error's first line
             let msg = format!("compile error in {}: {}", name, e.lines().next().unwrap_or(""));
-            let (code, relocs) = error_stub(u, &msg);
+            let (code, relocs) = error_stub(u, id, &msg);
             let _as = code_as(CodeKind::new(tier::STUB, origin::FRESH));
             u.install_unchecked(id, &code, &relocs, Vec::new(), 0).expect("error stub links")
         }
@@ -8247,9 +8253,10 @@ pub(crate) fn perf_map(addr: u64, len: usize, name: &str) {
     }
 }
 
-fn error_stub(u: &mut Unit, msg: &str) -> (Vec<u8>, Vec<relax_backend::rir::RelocAt>) {
+fn error_stub(u: &mut Unit, id: u32, msg: &str) -> (Vec<u8>, Vec<relax_backend::rir::RelocAt>) {
     let options = &u.prog.session.clone().options;
     let mut f = relax_backend::rir::Func::new("error".to_string(), 0);
+    crate::harness::reach::instrument(u, id, &mut f);
     let b = f.block();
     let addr = u.data(msg.as_bytes(), 1, crate::syms::DataKind::Bytes);
     let addr = u.data_sym(addr);
@@ -8308,7 +8315,8 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
     // a sandboxed twin: its base slot's RIR, transformed (sandbox.rs)
     let twin_func = match (&*up).fns[id as usize].key {
         FnKey::Sandbox(base) => {
-            let f = crate::sandbox::twin_rir(up, id, base)?;
+            let mut f = crate::sandbox::twin_rir(up, id, base)?;
+            crate::harness::reach::instrument(&*up, id, &mut f);
             // O3 must start from confined RIR, never from the base slot's host RIR.
             (&mut *up).set_rir(id, f.clone());
             Some(f)
@@ -8402,6 +8410,7 @@ pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, base
         }
     };
     edit(&mut f, u);
+    crate::harness::reach::instrument(u, id, &mut f);
     let cg = tier0_codegen_rir(options, &f, u.opt.fold, u.opt.layout);
     let c = {
         let _arena = crate::zone_alloc::job("instrumented codegen", runtime.burst_arena);
@@ -10895,6 +10904,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
         (&mut *up).fns[id as usize].build_err = Some(e.as_str().into());
     }
     let mut func = r?;
+    crate::harness::reach::instrument(&*up, id, &mut func);
     // inside a take its lowering came from lowering ahead (a take runs no front): given back if the
     // take bails after this point (its candidates' fronts, its build budget), so the next round
     // takes it again instead of needing it fronted again
@@ -18230,6 +18240,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         func = optimized;
         let mut inlined = Vec::with_capacity(inline_rules.len());
         for (c, _) in inline_rules { inlined.push(c); }
+        if func.entry_mark.is_some() { crate::harness::reach::note(id, func.inl_slots.iter().copied()); }
         let nounwind_used = func.nounwind_inputs.clone();
         if let Some(w) = debug_env().0.as_deref() {
             if dump_rir_match(&name, w) {
@@ -20852,6 +20863,9 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_domain_reserve" => Some(crate::domain::relax_domain_reserve as *const () as usize),
         b"__relax_domain_failed" => Some(crate::domain::thread_finished as *const () as usize),
         b"__relax_domain_name" => Some(crate::domain::relax_domain_name as *const () as usize),
+        b"__relax_test_inherit" => Some(crate::harness::reach::inherit as *const () as usize),
+        b"__relax_test_adopt" => Some(crate::harness::reach::adopt as *const () as usize),
+        b"__relax_test_cancel" => Some(crate::harness::reach::cancel as *const () as usize),
         b"__relax_tls_fixed" => Some(os::tls::relax_tls_fixed as *const () as usize),
         b"__relax_on_program_stack" => Some(relax_on_program_stack as *const () as usize),
         b"__relax_sstack" => Some(crate::sstack::relax_sstack as *const () as usize),

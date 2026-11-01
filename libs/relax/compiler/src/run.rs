@@ -560,6 +560,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut workspace_check = false;
     // `makepad test <package>` (lib.rs): the program is the package's test harness, not its main
     let mut harness = false;
+    let mut live_tests = false;
+    let mut test_restart = None;
     let mut plain_test: Option<String> = None;
     let mut cargo_flags = Vec::new();
     let mut i = 0;
@@ -587,6 +589,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 HARNESS_RUN.store(true, Ordering::Release);
                 // a test whose code Relax cannot compile fails as that test; the others still run
                 jit::COMPILE_ERRORS_FATAL.store(false, Ordering::Relaxed);
+            }
+            "--live" => live_tests = true,
+            "--harness-restart" if i + 1 < args.len() => {
+                i += 1;
+                test_restart = Some(args[i].as_str());
             }
             "--no-fail-fast" => {}
             // `makepad test`'s run of one `harness = false` target (test_pkg.rs): cargo builds it
@@ -694,7 +701,15 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if driver_options.verbose { crate::tui::track_for_verbose(); }
     // the boot progress line (tui.rs): a terminal run of a program, with nothing asking for plain output
     unsafe { std::env::remove_var("MAKEPAD_RUN_PROGRESS") };
-    // a test harness is a terminal program: no progress line, no live session
+    if (live_tests && (!harness || no_live || check)) || (test_restart.is_some() && !live_tests) { return usage(); }
+    if live_tests {
+        if let Err(e) = crate::harness::live::start(test_restart) {
+            eprintln!("makepad test: {e}");
+            return 2;
+        }
+        jit::FAULTS_FATAL.store(false, Ordering::Relaxed);
+    }
+    // a test harness is a terminal program: no progress line
     let hosted = !entries.is_empty() || !export_names.is_empty() || harness || plain_test.is_some();
     // the `unused_macros` lints need the macro uses of the whole load
     if check { relax_types::macros::uses::record(true); relax_front::program::set_record_import_uses(true); }
@@ -710,7 +725,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // A store run whose embedder writes pushed sources into its edits folder (the Android host's
     // devhub store applier) asks for a live session with MAKEPAD_RUN_STORE_LIVE=1.
     let store_live = std::env::var_os("MAKEPAD_RUN_STORE_LIVE").is_some_and(|v| v == "1") && crate::vfs::edits_enabled();
-    if !check && !harness && plain_test.is_none() && !no_live && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() && !SILENT.load(Ordering::Relaxed)
+    if live_tests || !check && !harness && plain_test.is_none() && !no_live && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() && !SILENT.load(Ordering::Relaxed)
         && (store_live || !crate::vfs::is_virtual(&workspace_dir())) {
         driver_options.live = true;
     }
@@ -818,6 +833,15 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let mut pre: Vec<String> = crate::os::proc::args_bytes().iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
         if let Some(d) = pre.iter().position(|a| a == "--") {
             pre.truncate(d);
+        }
+        // A test spawning its own binary needs a one-shot child; only this harness watches edits.
+        if live_tests {
+            let mut words = pre.into_iter();
+            pre = Vec::new();
+            while let Some(w) = words.next() {
+                if w == "--harness-restart" { words.next(); }
+                else if w != "--live" { pre.push(w); }
+            }
         }
         pre[0] = exe.display().to_string();
         // the re-run is silent: its stderr is the program's (rustc's binary prints nothing else)
@@ -1264,6 +1288,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     } else {
         Vec::new()
     };
+    if live_tests && test_subjects.len() != 1 {
+        eprintln!("makepad test --live: select exactly one target (--lib or --test <name>)");
+        return 2;
+    }
     // Every test target is a binary of its own (cargo builds and runs each apart), and a process
     // has one global allocator: targets that link different `#[global_allocator]`s cannot share
     // this program, so each runs as a `makepad test` run of its own
@@ -1699,7 +1727,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         crate::reload::start_watcher(up, live_inputs.unwrap_or_default());
     }
     jit::start_completion(up, runtime);
-    jit::live_needs_present(u.prog.crates.iter().any(|c| u.prog.syms.str(c.name) == "makepad_platform"));
+    jit::live_needs_present(!live_tests && u.prog.crates.iter().any(|c| u.prog.syms.str(c.name) == "makepad_platform"));
     jit::startup_main(runtime);
     relax_codegen::fncost::mark("boot done, calling main");
     let main_ms = crate::clock::ms_since_start();
@@ -1802,6 +1830,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         return 0;
     }
     if harness {
+        if live_tests { crate::owner::call(crate::owner::Class::Program, || u.patch_gen = crate::harness::live::group()); }
         // the root crate and, in an integration test graph, every test target
         let pkg_dir = &g.pkg[g.root].0;
         let label = |ci: usize| {

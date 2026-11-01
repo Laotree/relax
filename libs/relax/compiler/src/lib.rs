@@ -500,7 +500,8 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
         }
         // `makepad test <file.rs>`: one file's tests; `makepad test <package>`: the package's
         // lib and integration tests, each a harness program (run.rs `--harness`)
-        "test" if !args[2..].iter().any(|a| a.ends_with(".rs")) => {
+        "test" if args[2..].iter().take_while(|a| a.as_str() != "--").any(|a| a == "--live")
+            || !args[2..].iter().any(|a| a.ends_with(".rs")) => {
             let code = test_pkg::cmd_test_package(&args[2..]);
             os::proc::exit(code);
         }

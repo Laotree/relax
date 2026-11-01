@@ -45,6 +45,8 @@ pub enum SymKind {
     /// a function slot's loop counter (its tier record's back-edge word: jit.rs `loop_counter`),
     /// which the slot's own baseline / O1 / O2 code decrements per loop iteration
     TierRec(u32),
+    /// Live-test entry byte, indexed by slot and relocated in every session.
+    TestSlot(u32),
     /// an anonymous mutable block (a promoted temporary lowering placed in static memory):
     /// index into `Syms::rw_blocks` (size, align)
     Rw(u32),
@@ -890,6 +892,7 @@ pub fn describe(u: &Unit, s: Sym) -> String {
             }
         }
         Some(SymKind::Thunk(id)) => format!("thunk:{}", stable_fn_name(u, id)),
+        Some(SymKind::TestSlot(id)) => format!("test-slot:{}", stable_fn_name(u, id)),
         Some(SymKind::TierRec(id)) => format!("loop-counter:{}", stable_fn_name(u, id)),
         Some(SymKind::Provided(n)) => format!("provided:{}", n),
         Some(SymKind::Rw(k)) => {
@@ -1155,6 +1158,6 @@ pub fn class_of(k: &SymKind) -> relax_backend::rir::SymClass {
         SymKind::Data(_) | SymKind::Thunk(_) | SymKind::Missing(_) => SymClass::Near,
         // (the tier records are a reservation of their own, outside the code area)
         SymKind::Foreign(_) | SymKind::Provided(_) | SymKind::StaticAddr(_) | SymKind::TierRec(_) => SymClass::Far,
-        SymKind::Site(_) | SymKind::ThreadLocal(_) => SymClass::Imm,
+        SymKind::Site(_) | SymKind::ThreadLocal(_) | SymKind::TestSlot(_) => SymClass::Imm,
     }
 }

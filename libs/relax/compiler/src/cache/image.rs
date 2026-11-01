@@ -502,6 +502,10 @@ impl ImageTables {
                 d.str()?;
             }
             7 | 12 => skip_fnkey(d, 0, &mut no_atoms)?,
+            13 => {
+                skip_fnkey(d, 0, &mut no_atoms)?;
+                for _ in 0..d.u32()? { skip_fnkey(d, 0, &mut no_atoms)?; }
+            }
             8 => {
                 d.u64()?;
                 d.u64()?;
