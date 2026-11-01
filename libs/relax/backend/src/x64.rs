@@ -7221,7 +7221,7 @@ mod tests {
             (IOp::Xor, 0xffff_ffff, |x, k| x ^ k),
             (IOp::Mul, 0x1_0000_0001, |x, k| x.wrapping_mul(k)),
         ];
-        for (op, k, want) in cases {
+        for (op, k, _want) in cases {
             // p = p op k in place (the result register is the operand's), returned
             let mut f = Func::new("wide".to_string(), 0);
             let p = f.vreg(Cls::I);
@@ -7246,7 +7246,7 @@ mod tests {
                 let c = crate::exec::Code::new(code).expect("executable memory");
                 let run: extern "sysv64" fn(u64) -> u64 = unsafe { std::mem::transmute(c.ptr()) };
                 for x in [0u64, 1, 0xffff_ffff, u64::MAX, 0x1234_5678_9abc_def0] {
-                    assert_eq!(run(x), want(x, k as u64), "{op:?} {x:#x} {k:#x}");
+                    assert_eq!(run(x), _want(x, k as u64), "{op:?} {x:#x} {k:#x}");
                 }
             }
         }
