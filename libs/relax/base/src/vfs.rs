@@ -279,7 +279,7 @@ fn save_deleted(dir: &std::path::Path, deleted: &BTreeSet<String>) -> io::Result
 }
 
 fn deleted_paths(dir: &std::path::Path) -> Arc<BTreeSet<String>> {
-    let stat = file_stat(&dir.join(".makepad-run-deleted").to_string_lossy());
+    let stat = disk_stat(&dir.join(".makepad-run-deleted").to_string_lossy());
     let cache = WHITEOUTS.read().unwrap();
     if let Some((_, _, paths)) = cache.as_ref().filter(|(at, held, _)| at == dir && *held == stat) {
         return paths.clone();
@@ -776,6 +776,10 @@ pub fn file_stat(path: &str) -> Option<FileStat> {
     if ANY.load(Ordering::Acquire) && find(path).is_some() {
         return None;
     }
+    disk_stat(path)
+}
+
+fn disk_stat(path: &str) -> Option<FileStat> {
     let m = std::fs::metadata(path).ok()?;
     let ns = |t: std::io::Result<std::time::SystemTime>| t.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos() as u64);
     #[cfg(unix)]
