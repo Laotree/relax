@@ -2082,6 +2082,11 @@ enum Target {
 struct Ic {
     word: u64,
     f: *const IFunc,
+    /// the slot table word the address led through (a slot thunk's), 0 for none, and its value
+    /// then: a function pointer keeps its address while its slot's code changes (compiled after
+    /// a lazy stub, patched), so the entry holds only while that word does
+    via: u64,
+    via_word: u64,
 }
 
 struct CallDesc {
@@ -2099,7 +2104,8 @@ struct CallDesc {
 
 /// The interpreted function a native code address leads to: a pool thunk, a jump to one
 /// (the slot's code), or a slot thunk whose table word is one of those.
-unsafe fn decode(mut a: u64) -> *const IFunc {
+/// `via`: the table word's address the address led through (0: none).
+unsafe fn decode(mut a: u64, via: &mut u64) -> *const IFunc {
     let pool = pool_base();
     let sbase = STATIC_THUNKS[0].load(Ordering::Acquire);
     for _ in 0..3 {
@@ -2110,7 +2116,8 @@ unsafe fn decode(mut a: u64) -> *const IFunc {
             let stride = STATIC_THUNKS[1].load(Ordering::Relaxed);
             if a >= sbase && a < sbase + stride * STATIC_THUNKS[2].load(Ordering::Relaxed) {
                 // a precompiled slot thunk: its slot's table word
-                a = *((STATIC_THUNKS[3].load(Ordering::Relaxed) + 8 * ((a - sbase) / stride)) as *const u64);
+                *via = STATIC_THUNKS[3].load(Ordering::Relaxed) + 8 * ((a - sbase) / stride);
+                a = *(*via as *const u64);
                 continue;
             }
         }
@@ -2134,6 +2141,7 @@ unsafe fn decode(mut a: u64) -> *const IFunc {
             a = v;
         } else if w[4] == 0xF940_0210 && w[5] == 0xD61F_0200 {
             // ldr x16, [x16]; br x16: a slot thunk through table word v
+            *via = v;
             a = *(v as *const u64);
         } else {
             return std::ptr::null();
@@ -2145,12 +2153,14 @@ unsafe fn decode(mut a: u64) -> *const IFunc {
 #[inline(always)]
 unsafe fn resolve(d: &CallDesc, word: u64) -> *const IFunc {
     let ic = d.ic.load(Ordering::Acquire);
-    if !ic.is_null() && (*ic).word == word {
+    if !ic.is_null() && (*ic).word == word && ((*ic).via == 0 || *((*ic).via as *const u64) == (*ic).via_word) {
         return (*ic).f;
     }
-    let f = decode(word);
+    let mut via = 0u64;
+    let f = decode(word, &mut via);
+    let via_word = if via != 0 { *(via as *const u64) } else { 0 };
     // the replaced cache entry is leaked (another thread may still read it)
-    d.ic.store(Box::into_raw(Box::new(Ic { word, f })), Ordering::Release);
+    d.ic.store(Box::into_raw(Box::new(Ic { word, f, via, via_word })), Ordering::Release);
     f
 }
 
