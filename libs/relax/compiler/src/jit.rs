@@ -24257,7 +24257,7 @@ static NC_WINDOWS: relax_session::sync::Mutex<Vec<(u32, u32, usize)>> = relax_se
 const NC_AUX_SLOTS: u32 = 1 << 16;
 
 /// A free window: NC_AUX_SLOTS for an auxiliary unit (the first free range that holds it), the
-/// largest free range for a program's unit.
+/// largest free range less one auxiliary window for a program's unit.
 #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
 fn nc_window_take(aux: bool) -> Option<(u32, u32)> {
     let mut w = NC_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
@@ -24272,7 +24272,12 @@ fn nc_window_take(aux: bool) -> Option<(u32, u32)> {
     if (at as usize) < static_glue::SLOTS {
         free.push((at, static_glue::SLOTS as u32 - at));
     }
-    let pick = if aux { free.into_iter().find(|f| f.1 >= NC_AUX_SLOTS).map(|f| (f.0, NC_AUX_SLOTS)) } else { free.into_iter().max_by_key(|f| f.1) };
+    // a program leaves room for one macro world beside it (a rebuild under the running program)
+    let pick = if aux {
+        free.into_iter().find(|f| f.1 >= NC_AUX_SLOTS).map(|f| (f.0, NC_AUX_SLOTS))
+    } else {
+        free.into_iter().max_by_key(|f| f.1).map(|(off, len)| (off, if len >= 2 * NC_AUX_SLOTS { len - NC_AUX_SLOTS } else { len }))
+    };
     let (off, len) = pick?;
     w.push((off, len, 0));
     w.sort_unstable();
