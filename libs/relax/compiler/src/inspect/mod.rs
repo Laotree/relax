@@ -133,7 +133,7 @@ pub fn start(app: &str) {
         }
     };
     // (a `--silent` run's stderr is the program's: a test reading it sees only the program)
-    if !TEST_RUN.load(Relaxed) && !crate::run::silent() {
+    if crate::harness::live::enabled() || !TEST_RUN.load(Relaxed) && !crate::run::silent() {
         eprintln!("makepad-remote: pid {} app {} socket {} (makepad inspect {} help)", pid, app, sock.display(), pid);
     }
     events::start();

@@ -481,6 +481,21 @@ impl Asm {
             self.u32(n);
         }
     }
+    fn add_rsp(&mut self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        self.byte(0x48);
+        if n < 128 {
+            self.byte(0x83);
+            self.modrm_rr(0, RSP);
+            self.byte(n as u8);
+        } else {
+            self.byte(0x81);
+            self.modrm_rr(0, RSP);
+            self.u32(n);
+        }
+    }
     fn call_r(&mut self, r: u8) {
         self.rex(false, 0, 0, r, false);
         self.byte(0xff);
@@ -1514,6 +1529,7 @@ impl<'a> Gen<'a> {
         self.depth = regalloc::loop_depths(self.f, &reach);
         // a naked fn is its asm block only
         if self.f.naked {
+            self.entry_mark();
             self.blocks_and_pool(options, reach);
             return;
         }
@@ -1607,6 +1623,7 @@ impl<'a> Gen<'a> {
         }
         self.stack_probe(frame);
         self.a.sub_rsp(frame as u32);
+        self.entry_mark();
         if self.dom_read.first() == Some(&true) {
             self.dom_base();
         }
@@ -2612,14 +2629,36 @@ impl<'a> Gen<'a> {
             self.a.test_rr(R11, R11);
             self.a.jcc32(CC_NE)
         };
+        let align = self.frameless || self.f.naked;
+        if align { self.a.sub_rsp(8); }
         if self.near {
             self.call_reloc(Reloc::TlsSlow);
         } else {
             self.mov_reloc(RAX, Reloc::TlsSlow);
             self.a.call_r(RAX);
         }
+        if align { self.a.add_rsp(8); }
         let skip = self.a.pos();
         self.a.patch(p, skip);
+    }
+
+    /// One relaxed byte store through this thread's bank table; no call after TLS exists.
+    fn entry_mark(&mut self) {
+        let Some((tls, slot)) = self.f.entry_mark else { return; };
+        self.a.mov_rr(R10, RAX);
+        self.tls_block_r11();
+        self.mov_reloc(RAX, Reloc::Sym(tls));
+        self.a.sib = Some((RAX, 0));
+        self.a.load64(R11, R11, 0);
+        self.mov_reloc(RAX, Reloc::Sym(slot));
+        self.a.b.extend_from_slice(&[0x48, 0xc1, 0xe8, 16]); // shr rax, 16
+        self.a.sib = Some((RAX, 3));
+        self.a.load64(R11, R11, 0);
+        self.mov_reloc(RAX, Reloc::Sym(slot));
+        self.a.b.extend_from_slice(&[0x25, 0xff, 0xff, 0, 0]); // and eax, 65535
+        self.a.sib = Some((RAX, 0));
+        self.a.store_imm(R11, 0, 1, 1);
+        self.a.mov_rr(RAX, R10);
     }
 
     /// d = this thread's thread-local block + off.
@@ -6829,21 +6868,21 @@ pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
     for r in regs {
         a.push(r);
     }
-    // 16 xmm registers + 8 bytes to realign
-    a.sub_rsp(136);
+    // Full vector arguments survive the first entry mark, including the host allocation.
+    a.sub_rsp(264);
     for x in 0..16u8 {
-        a.storef(true, RSP, 8 * x as i32, x);
+        a.sse_rm(0, 0x11, x, RSP, 16 * x as i32);
     }
     a.mov_ri(RAX, host as i64);
     a.call_r(RAX);
     a.mov_rr(R11, RAX);
     for x in 0..16u8 {
-        a.loadf(true, x, RSP, 8 * x as i32);
+        a.sse_rm(0, 0x10, x, RSP, 16 * x as i32);
     }
     a.byte(0x48);
     a.byte(0x81);
     a.modrm_rr(0, RSP);
-    a.u32(136);
+    a.u32(264);
     let mut i = regs.len();
     while i > 0 {
         i -= 1;

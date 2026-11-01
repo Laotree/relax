@@ -779,6 +779,7 @@ pub struct OpenFrom<'a> {
     pub tcx: &'a crate::tcx::Tcx,
     pub opt: relax_codegen::opt::OptCfg,
     pub tier1: bool,
+    pub live_tests: bool,
     pub global_allocator: Option<DefId>,
     pub provided: Vec<(u32, u64)>,
 }
@@ -789,7 +790,7 @@ impl<'a> OpenFrom<'a> {
     /// `u`'s settings with program `prog` and types `tcx` (the same program: a settle rebuild's
     /// new state)
     pub fn with(u: &Unit, prog: &'a crate::program::Program, tcx: &'a crate::tcx::Tcx) -> Self {
-        OpenFrom { prog, tcx, opt: u.opt.clone(), tier1: u.tier1.is_some(), global_allocator: crate::jit::global_allocator_static_of(prog),
+        OpenFrom { prog, tcx, opt: u.opt.clone(), tier1: u.tier1.is_some(), live_tests: crate::harness::live::enabled() && !u.aux, global_allocator: crate::jit::global_allocator_static_of(prog),
             provided: u.provided.iter().map(|(k, pc)| (*k, pc.binding)).collect() }
     }
 }
@@ -864,6 +865,7 @@ impl Cache {
             cfgh.u8(b as u8);
         }
         cfgh.u8(from.tier1 as u8);
+        cfgh.u8(from.live_tests as u8);
         // which crates are bound to the loader's rustc build (provided.rs) is in the interface
         // fingerprints (items::apply_bound), so only the code that can reach a bound crate is keyed by it
         cfgh.u128(from.prog.session.options.fingerprint());
@@ -2730,6 +2732,14 @@ impl Cache {
                     self.why("thunk key");
                     return None;
                 }
+            }
+            SymKind::TestSlot(id) => {
+                e.u8(13);
+                let mut cr = Vec::new();
+                self.enc_fnkey(u, &u.fns[id as usize].key, e, &mut cr, 0)?;
+                let deps = crate::harness::reach::dependencies(id);
+                e.u32(deps.len() as u32);
+                for c in deps { self.enc_fnkey(u, &u.fns[c as usize].key, e, &mut cr, 0)?; }
             }
             SymKind::TierRec(id) => {
                 e.u8(12);
@@ -7864,7 +7874,24 @@ impl Linker {
         let mut s = match tag {
             // runtime helpers the lowering interns on first use (ext_get / ext_free / divrem128) are interned here the
             // same way: a warm start links the entry before any lowering has asked for them
-            1 => { let n = d.str()?; match u.syms.find_rt(n) { Some(s) => s, None => crate::lower::intern_lazy_rt(u, n)? } }
+            1 => {
+                let n = d.str()?;
+                if n == "test_entered" {
+                    u.syms.intern(SymKind::Rt("test_entered"), crate::harness::reach::TLS_ENTERED as u64)
+                } else { match u.syms.find_rt(n) { Some(s) => s, None => crate::lower::intern_lazy_rt(u, n)? } }
+            }
+            13 => {
+                if !crate::harness::live::enabled() || u.aux { return None; }
+                let key = self.dec_fnkey(u, d, 0)?;
+                let id = u.fn_id(key);
+                let mut deps = Vec::new();
+                for _ in 0..d.u32()? {
+                    let key = self.dec_fnkey(u, d, 0)?;
+                    deps.push(u.fn_id(key));
+                }
+                crate::harness::reach::note(id, deps.into_iter());
+                crate::harness::reach::slot_sym(u, id)
+            }
             2 => {
                 let k = d.u128()?;
                 let a = self.link_data(u, k)?;

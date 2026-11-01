@@ -2822,6 +2822,35 @@ fn lower(options: &relax_session::Options, f: &Func, slots: SlotsPtr, syms: u64,
     if f.naked {
         return Err("inline assembly");
     }
+    // Entry metadata becomes ordinary RIR for the interpreter; native backends emit a prologue.
+    let marked = f.entry_mark.map(|(tls, slot)| {
+        let mut g = f.clone();
+        g.entry_mark = None;
+        let p = g.vreg(Cls::I);
+        let bank = g.vreg(Cls::I);
+        let index = g.vreg(Cls::I);
+        let one = g.vreg(Cls::I);
+        let mut insts = vec![
+            Inst::TlsAddr(p, tls),
+            Inst::Load(Mem::Int(8, false), p, p, 0),
+            Inst::Addr(index, slot),
+            Inst::IBinI(IOp::Shr, U64, bank, index, 16),
+            Inst::IBinI(IOp::Shl, U64, bank, bank, 3),
+            Inst::IBin(IOp::Add, U64, p, p, bank),
+            Inst::AtomicLoad(Mem::Int(8, false), AtomOrd::Acquire, p, p),
+            Inst::IBinI(IOp::And, U64, index, index, 65535),
+            Inst::IBin(IOp::Add, U64, p, p, index),
+            Inst::Iconst(one, 1),
+            Inst::AtomicStore(Mem::Int(1, false), AtomOrd::Relaxed, p, one),
+        ];
+        let mut pos = vec![0; insts.len()];
+        insts.append(&mut g.blocks[0].insts);
+        pos.append(&mut g.blocks[0].pos);
+        g.blocks[0].insts = insts;
+        g.blocks[0].pos = pos;
+        g
+    });
+    let f = marked.as_ref().unwrap_or(f);
     let covered = relax_backend::passes::lower_coverage(f);
     let f = covered.as_ref().unwrap_or(f);
     // calls in tail position become jumps, as the arm64 back end makes them (the same analysis:

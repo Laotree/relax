@@ -241,6 +241,8 @@ pub struct Outcome {
     pub names: Vec<String>,
     /// changed items (functions, consts, statics)
     pub changed: usize,
+    /// Body definitions, including uninstantiated fns; None requires a full test run.
+    pub test_changes: Option<Vec<DefId>>,
     pub group: u32,
     /// ms: parse + classify, check, compile, install
     pub ms: [f64; 4],
@@ -1991,7 +1993,7 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, partial: u8, module: bool)
                 }
                 stale += 1;
                 if stale == 3 {
-                    return Ok(Outcome { kept: 0, pending: false, rung: Rung::Refuse, files: files.clone(), lines: vec!["program context changed while parsing -- retry the edit; running code is unchanged".into()], names: Vec::new(), changed: 0, group: 0, ms: [ms(t0), 0.0, 0.0, 0.0], undo: None, work: [0; 5] });
+                    return Ok(Outcome { kept: 0, pending: false, rung: Rung::Refuse, files: files.clone(), lines: vec!["program context changed while parsing -- retry the edit; running code is unchanged".into()], names: Vec::new(), changed: 0, test_changes: None, group: 0, ms: [ms(t0), 0.0, 0.0, 0.0], undo: None, work: [0; 5] });
                 }
                 let cur = snap(&edits);
                 Err((edits, cur))
@@ -2005,7 +2007,7 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, partial: u8, module: bool)
         Ok(r) => r,
         Err(p) => {
             let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
-            Outcome { kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("internal compiler error applying the edit: {} -- makepad run bug, report it; restart the app", msg)], names: Vec::new(), changed: 0, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] }
+            Outcome { kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("internal compiler error applying the edit: {} -- makepad run bug, report it; restart the app", msg)], names: Vec::new(), changed: 0, test_changes: None, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] }
         }
     };
     crate::owner::call(crate::owner::Class::Program, || {
@@ -2043,7 +2045,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     u.flush_cache_records();
     note_edited_crates(u, &olds);
     let cache_ahead0 = jit::CACHE_AHEAD.load(std::sync::atomic::Ordering::Relaxed);
-    let mut out = Outcome { kept: 0, pending: false, rung: Rung::Refuse, files: olds.clone(), lines: Vec::new(), names: Vec::new(), changed: 0, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] };
+    let mut out = Outcome { kept: 0, pending: false, rung: Rung::Refuse, files: olds.clone(), lines: Vec::new(), names: Vec::new(), changed: 0, test_changes: None, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] };
     // 1-2: parse and classify every file; nothing changes yet
     let mut versions = Vec::new();
     let mut changes = Vec::new();
@@ -2135,6 +2137,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         out.lines = restart;
         out.ms[0] = ms(t0);
         return out;
+    }
+    if changes.iter().all(|c| matches!(c, Change::Body(_))) && versions.iter().all(|(_, p)|
+        p.added.is_empty() && p.removed.is_empty() && p.removed_uses.is_empty() && !p.attributes_changed) {
+        out.test_changes = Some(changes.iter().filter_map(|c| match c { Change::Body(d) => Some(*d), _ => None }).collect());
     }
     let visible_crates = crates_seeing_edit(&u.prog, versions.iter().map(|(v, _)| v.old));
     let mut body_defs: Vec<DefId> = changes.iter().filter_map(|c| if let Change::Body(d) = c { Some(*d) } else { None }).collect();
@@ -3906,7 +3912,7 @@ fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
         use std::os::unix::process::CommandExt;
         let exe = host::loader().ok_or("the makepad binary's path is unknown")?;
         let mut cmd = std::process::Command::new(exe);
-        cmd.args(std::env::args_os().skip(1));
+        cmd.args(crate::harness::live::restart_args(std::env::args_os().skip(1).collect()));
         match state {
             Some(st) => {
                 let dir = std::env::temp_dir().join(format!("relax-restart-{}", std::process::id()));
@@ -4207,7 +4213,7 @@ enum StreamTarget {
 static STREAMS: relax_session::sync::Mutex<Vec<(usize, StreamTarget, StreamFile)>> = relax_session::sync::Mutex::new(Vec::new());
 
 fn idle_outcome(file: Option<u32>, line: &str) -> Outcome {
-    Outcome { kept: 0, pending: false, rung: Rung::Patch, files: file.into_iter().collect(), lines: vec![line.to_string()], names: Vec::new(), changed: 0, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] }
+    Outcome { kept: 0, pending: false, rung: Rung::Patch, files: file.into_iter().collect(), lines: vec![line.to_string()], names: Vec::new(), changed: 0, test_changes: None, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] }
 }
 
 unsafe fn stream_file(up: *mut Unit, path: &str) -> Option<u32> {
@@ -4426,6 +4432,62 @@ fn gate_note(g: u8) {
 /// The live watcher's longest sleep on file events (a backstop: every input wakes it).
 const LIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// The harness is parked: verify this group, run its tests, then undo faulting code before another edit.
+unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &mut Vec<Undo>) -> Vec<(u32, u32)> {
+    use crate::harness::live;
+    let what = paths.join(", ");
+    let mut edit = live::Edit { paths, group: o.group, compile_ms: Some(o.ms[2]), restarted: false, changed: o.test_changes.clone() };
+    for line in &o.lines { eprintln!("makepad live:   {line}"); }
+    if o.rung != Rung::Patch {
+        patch_refused_event(&what, o.rung == Rung::Refuse, &o.lines);
+        if o.rung == Rung::Restart {
+            if edit.group == 0 { edit.group = crate::owner::call(crate::owner::Class::Program, || (*up).begin_patch()); }
+            live::restart(edit, &what);
+        }
+        return Vec::new();
+    }
+    eprintln!("makepad live: {what}: patched ({} item(s) changed, {} fn(s) installed) in {:.1} ms", o.changed, o.names.len(), o.ms.iter().sum::<f64>());
+    patch_landed(edit.paths.iter().cloned());
+    let mut pending = Vec::new();
+    if let Some(undo) = o.undo.take() {
+        let ids = crate::owner::call(crate::owner::Class::Program, || {
+            let u = &*up;
+            (0..u.fns.len() as u32).filter(|&id| u.fns[id as usize].patch_gen == o.group && u.fns[id as usize].unverified.load(Ordering::Relaxed)).collect::<Vec<_>>()
+        });
+        if !ids.is_empty() {
+            UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
+            pending.push(PendingPatch { group: o.group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq() });
+        }
+        undos.push(undo);
+    }
+    if pending.is_empty() { patch_verified_event(&what, o.group, &[]); }
+    while !pending.is_empty() {
+        let back = settle_verdicts(up, &mut pending, undos);
+        if !back.is_empty() { return back; }
+        if !pending.is_empty() { std::thread::sleep(std::time::Duration::from_millis(5)); }
+    }
+    let mut back = Vec::new();
+    loop {
+        let faults = live::rerun(&edit);
+        // A later group may depend on the faulting one: unwind newest first, as SPEC-V does.
+        let Some(first) = undos.iter().position(|u| faults.contains(&u.group)) else { break };
+        let mut groups = Vec::new();
+        let mut names = Vec::new();
+        for undo in undos.split_off(first).into_iter().rev() {
+            groups.push(undo.group);
+            back.extend_from_slice(&undo.versions);
+            names.extend(rollback(up, undo, "a fault in live test code"));
+        }
+        crate::inspect::events::emit("patchreverted", &verdict_key(&what), &format!(
+            "\"edit\":[{}],\"reverted\":true,\"groups\":{:?},\"fns\":[{}],\"error\":\"a fault in live test code\"",
+            edit.paths.iter().map(|p| json_str(p)).collect::<Vec<_>>().join(","), groups, names.iter().map(|n| json_str(n)).collect::<Vec<_>>().join(",")));
+        eprintln!("makepad live: {what}: reverted patch groups {groups:?}; rerunning tests");
+        edit.compile_ms = None;
+        edit.changed = None;
+    }
+    back
+}
+
 unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     inputs.add_runner();
     let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
@@ -4492,6 +4554,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     let mut startup_scan = true;
     let mut restart_required = false;
     let mut revision = 0;
+    crate::harness::live::wait_initial();
     loop {
         // pinned (`inspect pin on`, an operation runs on this app): no edit or landing reaches it
         // and it does not restart; on unpin one whole scan catches up
@@ -4502,7 +4565,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // native file events: sleep on them while nothing else is in flight (startup, a domain
         // loading, verdicts pending, a refused edit to retry, an open stream); else the 5 ms
         // poll. Other inputs wake it (watch_events::kick); one look a second regardless.
-        let quiet = jit::live_startup_done() && !DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire)
+        let quiet = (crate::harness::live::enabled() || jit::live_startup_done()) && !DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire)
             && pending.is_empty() && !streams_busy(up);
         match events.as_mut() {
             Some(w) if quiet => {
@@ -4537,7 +4600,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // Keep the original stamps and queued OS notifications intact until startup
         // finishes. In particular, do not acquire Reloading or drain streamed edits:
         // either can compete with the cold compiler before the first frame.
-        if !jit::live_startup_done() { gate_note(2); continue; }
+        if !crate::harness::live::enabled() && !jit::live_startup_done() { gate_note(2); continue; }
         // Once the tree no longer matches this session, later saves must not patch a
         // mixture of revisions into the old process. A fresh run restores live editing.
         if restart_required { gate_note(3); continue; }
@@ -4587,7 +4650,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             for (gen, what) in due {
                 if let Some(name) = crate::owner::call(crate::owner::Class::Program, || running_old_code(&*up, gen)) {
                     let lines = vec![format!("`{name}` still runs the code from before the edit: a call made before the patch has not returned (a loop) -- restart the app")];
-                    log_edit(&what, &Outcome { kept: 0, pending: false, rung: Rung::Restart, files: Vec::new(), lines: lines.clone(), names: Vec::new(), changed: 0, group: gen, ms: [0.0; 4], undo: None, work: [0; 5] }, None, Instant::now());
+                    log_edit(&what, &Outcome { kept: 0, pending: false, rung: Rung::Restart, files: Vec::new(), lines: lines.clone(), names: Vec::new(), changed: 0, test_changes: None, group: gen, ms: [0.0; 4], undo: None, work: [0; 5] }, None, Instant::now());
                     restart_for_edit(&what, &lines);
                     for l in &lines { eprintln!("makepad live:   {}", l); }
                     patch_refused_event(&what, false, &lines);
@@ -4606,6 +4669,13 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             let mut o = apply_mode(up, vec![Edit { file: f.1, path: f.0.clone(), src }], 0, false);
             if o.rung == Rung::Refuse {
                 // still refused: it was reported when it was saved
+                continue;
+            }
+            if crate::harness::live::enabled() {
+                log_edit(&f.0, &o, f.2.map(|s| s.0), seen);
+                if let Some(&file) = o.files.first() { f.1 = file; }
+                let back = test_edit(up, vec![f.0.clone()], &mut o, &mut undos);
+                for (old, new) in back { for f in &mut files { if f.1 == new { f.1 = old; } } }
                 continue;
             }
             if o.rung != Rung::Patch {
@@ -4731,7 +4801,11 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             changed.retain(|k| !manifests.contains(k));
             if changed.is_empty() {
                 // nothing to do is the edit's verdict: the app already runs what it means
-                patch_verified_event(&format!("{} manifest(s)", manifests.len()), 0, &[]);
+                if crate::harness::live::enabled() {
+                    let mut o = idle_outcome(None, "Cargo graph unchanged");
+                    let back = test_edit(up, manifests.iter().map(|&k| files[k].0.clone()).collect(), &mut o, &mut undos);
+                    for (old, new) in back { for f in &mut files { if f.1 == new { f.1 = old; } } }
+                } else { patch_verified_event(&format!("{} manifest(s)", manifests.len()), 0, &[]); }
                 continue;
             }
         }
@@ -4775,8 +4849,13 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             // nothing of makepad's own moved (a bulk change of the program's sources): no rebuild
             if !changed.iter().any(|&k| inputs.process_input(&files[k].0)) {
                 let why = format!("{} files changed: {reason}", changed.len());
-                offer_restart(&why);
                 patch_refused_event(&why, false, std::slice::from_ref(&why));
+                if crate::harness::live::enabled() {
+                    let group = crate::owner::call(crate::owner::Class::Program, || (*up).begin_patch());
+                    crate::harness::live::restart(crate::harness::live::Edit {
+                        paths: changed.iter().map(|&k| files[k].0.clone()).collect(), group, compile_ms: None, restarted: true, changed: None,
+                    }, &why);
+                } else { offer_restart(&why); }
                 for &k in &changed { files[k].2 = stamp(&files[k].0); stalled.remove(&k); }
                 continue;
             }
@@ -4848,9 +4927,15 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if edits.is_empty() {
             // saved back to the running text (e.g. the fix after a refused edit): the program
             // already runs it -- an edit applied in place for the scoreboard
-            let o = Outcome { kept: 0, pending: false, rung: Rung::Patch, files: Vec::new(), lines: Vec::new(), names: Vec::new(), changed: 0, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] };
+            let mut o = Outcome { kept: 0, pending: false, rung: Rung::Patch, files: Vec::new(), lines: Vec::new(), names: Vec::new(), changed: 0, test_changes: None, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] };
             let what: Vec<String> = changed.iter().map(|&k| files[k].0.rsplit('/').next().unwrap_or("").to_string()).collect();
             log_edit(&what.join(", "), &o, saved, seen);
+            if crate::harness::live::enabled() {
+                drop(_reloading);
+                let back = test_edit(up, changed.iter().map(|&k| files[k].0.clone()).collect(), &mut o, &mut undos);
+                for (old, new) in back { for f in &mut files { if f.1 == new { f.1 = old; } } }
+                continue;
+            }
             eprintln!("makepad live: {}: patched (0 item(s) changed, 0 fn(s) installed) in 0.0 ms", what.join(", "));
             patch_verified_event(&what.join(", "), 0, &[]);
             continue;
@@ -4865,6 +4950,11 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             let what = names.join(", ");
             o.rung = Rung::Restart;
             log_edit(&what, &o, saved, seen);
+            if crate::harness::live::enabled() {
+                drop(_reloading);
+                test_edit(up, which.iter().map(|&k| files[k].0.clone()).collect(), &mut o, &mut undos);
+                continue;
+            }
             for l in &o.lines { eprintln!("makepad live:   {}", l); }
             offer_restart(&format!("{what}: makepad could not patch it in (its own error)"));
             patch_refused_event(&what, false, &o.lines);
@@ -4896,6 +4986,13 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             RESTART_SAVED_MS.store(saved.map_or(0.0, unix_ms) as u64, std::sync::atomic::Ordering::Relaxed);
         }
         log_edit(&what, &o, saved, seen);
+        if crate::harness::live::enabled() {
+            for (j, &k) in which.iter().enumerate() { files[k].1 = o.files[j]; }
+            drop(_reloading);
+            let back = test_edit(up, which.iter().map(|&k| files[k].0.clone()).collect(), &mut o, &mut undos);
+            for (old, new) in back { for f in &mut files { if f.1 == new { f.1 = old; } } }
+            continue;
+        }
         match o.rung {
             Rung::Patch => eprintln!(
                 "makepad live: {}: patched ({} item(s) changed, {} fn(s) installed) in {:.1} ms",

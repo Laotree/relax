@@ -1278,6 +1278,7 @@ impl<'a> Gen<'a> {
             self.stack_probe(frame);
             self.a.add_any(SP, SP, -frame);
             self.callee_saves(true);
+            self.entry_mark();
             self.tail = crate::tail::sibling_calls(options, self.f, &reach, crate::tail::Arch::Arm64);
             if self.dom_read.first() == Some(&true) {
                 self.dom_base();
@@ -1288,6 +1289,8 @@ impl<'a> Gen<'a> {
                 self.params_prologue();
             }
         }
+
+        if self.f.naked { self.entry_mark(); }
 
         let nb = self.f.blocks.len();
         self.block_pos = vec![0; nb];
@@ -2172,14 +2175,33 @@ impl<'a> Gen<'a> {
         self.ldr_reloc(IP1, Reloc::TlsKey);
         self.a.e(0xF860_6800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
         let p = self.a.cbnz(IP0);
+        if self.f.naked { self.a.stp_pre(FP, LR, SP, -16); }
         if self.near {
             self.bl_reloc(Reloc::TlsSlow);
         } else {
             self.ldr_reloc(IP1, Reloc::TlsSlow);
             self.a.blr(IP1);
         }
+        if self.f.naked { self.a.ldp_post(FP, LR, SP, 16); }
         let skip = self.a.pos();
         self.a.patch(p, skip);
+    }
+
+    /// One relaxed byte store through this thread's bank table; x16/x17 are scratch.
+    fn entry_mark(&mut self) {
+        let Some((tls, slot)) = self.f.entry_mark else { return; };
+        self.tls_block_ip0();
+        self.ldr_reloc(IP1, Reloc::Sym(tls));
+        self.a.e(0xF860_6800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
+        self.ldr_reloc(IP1, Reloc::Sym(slot));
+        self.a.e(0xD350_FC00 | (IP1 as u32) << 5 | IP1 as u32); // lsr x17, x17, 16
+        self.a.e(0x8B00_0C00 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32); // add x16, x16, x17, lsl 3
+        self.a.e(0xC8DF_FC00 | (IP0 as u32) << 5 | IP0 as u32); // ldar x16, [x16]
+        self.ldr_reloc(IP1, Reloc::Sym(slot));
+        self.a.e(0xD340_3C00 | (IP1 as u32) << 5 | IP1 as u32); // and x17, x17, 65535
+        self.a.rrr(0x8B00_0000, IP0, IP0, IP1);
+        self.a.mov_imm(IP1, 1);
+        self.a.e(0x3900_0000 | (IP0 as u32) << 5 | IP1 as u32); // strb w17, [x16]
     }
 
     /// d = this thread's thread-local block + off.
@@ -5808,7 +5830,7 @@ pub fn jump_with_arg0(arg: u64, target: u64) -> Vec<u8> {
 }
 
 /// This thread's thread-local block in x16, preserving every other register JIT code may hold
-/// (x0-x15, d0-d7, d16-d29): the fast path `tls_addr` inlines (slot `key` of the thread's slot
+/// (x0-x15, q0-q31): the fast path `tls_addr` inlines (slot `key` of the thread's slot
 /// array), and when the slot is still null `host() -> block`. `tls_addr` calls it after its own
 /// fast path found null; a prologue that needs the domain base calls it directly.
 pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
@@ -5823,15 +5845,13 @@ pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
     a.ret();
     a.stp_pre(FP, LR, SP, -16);
     a.mov_sp(FP, SP);
-    a.sub_imm(SP, SP, 320);
+    a.sub_imm(SP, SP, 640);
     for k in 0..8u8 {
         a.stp(false, 2 * k, 2 * k + 1, SP, 16 * k as i32);
     }
-    for k in 0..4u8 {
-        a.stp(true, 2 * k, 2 * k + 1, SP, 128 + 16 * k as i32);
-    }
-    for k in 0..7u8 {
-        a.stp(true, 16 + 2 * k, 17 + 2 * k, SP, 192 + 16 * k as i32);
+    // Full vector arguments survive the first entry mark and its host allocation.
+    for k in 0..32u8 {
+        a.ldst(0x3D80_0000, 16, k, SP, 128 + 16 * k as i64); // str qK
     }
     a.mov_imm64_fixed(IP1, host);
     a.blr(IP1);
@@ -5839,11 +5859,8 @@ pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
     for k in 0..8u8 {
         a.ldp(false, 2 * k, 2 * k + 1, SP, 16 * k as i32);
     }
-    for k in 0..4u8 {
-        a.ldp(true, 2 * k, 2 * k + 1, SP, 128 + 16 * k as i32);
-    }
-    for k in 0..7u8 {
-        a.ldp(true, 16 + 2 * k, 17 + 2 * k, SP, 192 + 16 * k as i32);
+    for k in 0..32u8 {
+        a.ldst(0x3DC0_0000, 16, k, SP, 128 + 16 * k as i64); // ldr qK
     }
     a.mov_sp(SP, FP);
     a.ldp_post(FP, LR, SP, 16);
