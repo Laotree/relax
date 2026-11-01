@@ -880,11 +880,13 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         .env("CARGO_PKG_VERSION", ver)
         .env("CARGO_PKG_VERSION_PRE", version_parts(ver).1)
         .envs(crate::resolve::package_meta_env(dir))
-        // cargo gives scripts RUSTC; theirs is Relax itself, answering `--version` (relax_as_rustc).
+        // Both tools are the loader: RUSTC probes use its target model, CARGO metadata its
+        // resolver and VFS. The runner consumes `build-script` on entry, then marks tool calls.
         // RUSTDOC too (the `built` crate requires it); nothing documents here
         .env("RUSTC", &exe)
+        .env("CARGO", &exe)
         .env("RUSTDOC", "rustdoc")
-        .env("MAKEPAD_RUN_AS_RUSTC", "1")
+        .env("MAKEPAD_RUN_AS_RUSTC", "build-script")
         .env("MAKEPAD_RUN_SCRIPT_DEPTH", depth.to_string())
         .env_remove("MAKEPAD_RUN_SELF_EXEC")
         // the script is compiled and run for the machine (cargo: build scripts are host
