@@ -764,12 +764,7 @@ pub fn expand(p: &crate::parser::Parser, id: u16, lo: usize, hi: usize, call_lo:
         for t in &toks {
             // Proc macros split joint punctuation into smaller source ranges. Lifetimes
             // deliberately keep one full span for both the apostrophe and name, like rustc.
-            if t.kind == T::AtId {
-                origin(t.lo, t.lo + 1);
-                origin(t.lo + 1, t.hi);
-            } else if (T::Semi as u8..=T::LArrow as u8).contains(&(t.kind as u8))
-                || matches!(t.kind, T::ColonEq | T::PlusColon | T::OtherPunct)
-            {
+            if (T::Semi as u8..=T::LArrow as u8).contains(&(t.kind as u8)) {
                 for (i, ch) in text[t.lo as usize..t.hi as usize].char_indices() {
                     origin(t.lo + i as u32, t.lo + (i + ch.len_utf8()) as u32);
                 }
@@ -1966,7 +1961,7 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], 
     // Doc comments are attributes too, but are absent from the parser's Attr list.
     let prefix = buf.get(item_lo, body_lo);
     let mut leading = Vec::new();
-    let opts = crate::lexer::LexOptions { edition: p.edition, mode: crate::lexer::Mode::Rust, trivia: true };
+    let opts = crate::lexer::LexOptions { edition: p.edition, trivia: true };
     crate::lexer::lex_with(prefix, &opts, &mut leading).map_err(|_| (item_lo, format!("#[{}] input does not lex", name)))?;
     let mut docs = Vec::new();
     let mut depth = 0;

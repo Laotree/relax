@@ -515,10 +515,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut driver_options = sess.options.clone();
     crate::registry_net::install();
     crate::pmhost::install();
-    if let Err(e) = sess.runtime.validate_native_macros() {
-        eprintln!("makepad-run: {e}");
-        return 1;
-    }
     jit::COMPILE_ERRORS_FATAL.store(true, Ordering::Relaxed);
     jit::FAULTS_FATAL.store(true, Ordering::Relaxed);
     crate::clock::mark_start();
@@ -2450,8 +2446,6 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let mut mem_snapshot = std::env::var_os("MAKEPAD_RUN_MEM_SNAPSHOT").map(std::path::PathBuf::from);
         let mut last = u64::MAX;
         let settle_on = runtime.settle_drop;
-        // MAKEPAD_RUN_ADOPT=0: the heap tables stay (the cold run's footprint, for comparison)
-        let adopt_on = std::env::var("MAKEPAD_RUN_ADOPT").map_or(true, |v| v != "0");
         let mut memos_pending = true;
         let mut settle_watch = SettleWatch::default();
         let mut settle_present = 0;
@@ -2477,8 +2471,6 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let (mut grown_from, mut grown_at) = (0u64, std::time::Instant::now().checked_sub(std::time::Duration::from_millis(500)).unwrap_or_else(std::time::Instant::now));
         // mid-run cache writes once main ran 3 s and something new was compiled: after 2 s without
         // compiles (5 s after the last write), or every 10 s while compiles go on
-        // (MAKEPAD_RUN_CACHE_MID=0: off)
-        let mid_on = std::env::var("MAKEPAD_RUN_CACHE_MID").map_or(true, |v| v != "0");
         let (mut mid_quiet, mut mid_seen, mut mid_flushed, mut mid_last) = (0u32, u64::MAX, 0u64, 0u64);
         let mid_busy = std::sync::Arc::new(AtomicBool::new(false));
         let mut teardown_started = false;
@@ -2525,48 +2517,46 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                     mem_snapshot = None;
                 }
             }
-            if mid_on {
-                let n = jit::COMPILED_FNS.load(Ordering::Relaxed) + jit::TIER1_INSTALLS.load(Ordering::Relaxed);
-                if n != mid_seen {
-                    mid_seen = n;
-                    mid_quiet = 0;
-                } else {
-                    mid_quiet += 1;
-                }
-                let main_ms = (jit::wall_ns().saturating_sub(MAIN_START_WALL.load(Ordering::Relaxed))) / 1_000_000;
-                let start = MAIN_START_WALL.load(Ordering::Relaxed);
-                let since = main_ms.saturating_sub(mid_last);
-                // also with no new code: the manifest whose window closed, the collected program
-                let left = !MID_MANIFEST_DONE.load(Ordering::Relaxed) && jit::FIRST_PRESENT.load(Ordering::Acquire) && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed)
-                    || !COLLECTED_CURRENT.load(Ordering::Relaxed) && !MID_COLLECTED_TRIED.load(Ordering::Relaxed)
-                    || jit::FIRST_PRESENT.load(Ordering::Acquire) && crate::cache::front_graph_pending();
-                // the warm record (manifest, front graph, collected program) is written as soon
-                // as its pieces are ready after the first present, not after seconds of quiet
-                // (a cold run compiles O2 code for long after it): users close apps quickly, and
-                // a killed run that wrote nothing left every relaunch unrestored. At most once a
-                // second; the collected program's encode makes a unit call only when free.
-                let record = left && jit::FIRST_PRESENT.load(Ordering::Acquire) && since >= 1_000;
-                // a trickle of first compiles counts as quiet (SettleWatch: a game keeps reaching code)
-                let mid_still = mid_quiet >= 20 || settle_watch.slow(jit::demand_compiled());
-                let due = n != mid_flushed && ((mid_still && since >= 5_000) || since >= 10_000) || left && mid_still && since >= 5_000;
-                // not while the UI thread is in a burst of lazy compiles after the present: the
-                // write's unit calls cannot be interrupted once served (one held the owner 620 ms
-                // in front of a tab's first visit); it goes in the next pause
-                if start != 0 && (record || main_ms >= 3000 && due) && !jit::ui_burst() && !mid_busy.swap(true, Ordering::SeqCst) {
-                    mid_flushed = n;
-                    mid_last = main_ms;
-                    let busy = mid_busy.clone();
-                    let quiet = record || mid_still;
-                    let _ = std::thread::Builder::new().name("run-cache-write".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
-                        let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
-                        let t = Instant::now();
-                        let r = mid_flush(quiet, record);
-                        if crate::memstat::enabled() || std::env::var_os("MAKEPAD_RUN_CACHE_TRACE").is_some() {
-                            verbose!("makepad-run cache: mid-run write at t={:.0} ms: {:?} (entries, front images) in {:.1} ms", crate::clock::ms_since_start(), r, t.elapsed().as_secs_f64() * 1e3);
-                        }
-                        busy.store(false, Ordering::SeqCst);
-                    });
-                }
+            let n = jit::COMPILED_FNS.load(Ordering::Relaxed) + jit::TIER1_INSTALLS.load(Ordering::Relaxed);
+            if n != mid_seen {
+                mid_seen = n;
+                mid_quiet = 0;
+            } else {
+                mid_quiet += 1;
+            }
+            let main_ms = (jit::wall_ns().saturating_sub(MAIN_START_WALL.load(Ordering::Relaxed))) / 1_000_000;
+            let start = MAIN_START_WALL.load(Ordering::Relaxed);
+            let since = main_ms.saturating_sub(mid_last);
+            // also with no new code: the manifest whose window closed, the collected program
+            let left = !MID_MANIFEST_DONE.load(Ordering::Relaxed) && jit::FIRST_PRESENT.load(Ordering::Acquire) && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed)
+                || !COLLECTED_CURRENT.load(Ordering::Relaxed) && !MID_COLLECTED_TRIED.load(Ordering::Relaxed)
+                || jit::FIRST_PRESENT.load(Ordering::Acquire) && crate::cache::front_graph_pending();
+            // the warm record (manifest, front graph, collected program) is written as soon
+            // as its pieces are ready after the first present, not after seconds of quiet
+            // (a cold run compiles O2 code for long after it): users close apps quickly, and
+            // a killed run that wrote nothing left every relaunch unrestored. At most once a
+            // second; the collected program's encode makes a unit call only when free.
+            let record = left && jit::FIRST_PRESENT.load(Ordering::Acquire) && since >= 1_000;
+            // a trickle of first compiles counts as quiet (SettleWatch: a game keeps reaching code)
+            let mid_still = mid_quiet >= 20 || settle_watch.slow(jit::demand_compiled());
+            let due = n != mid_flushed && ((mid_still && since >= 5_000) || since >= 10_000) || left && mid_still && since >= 5_000;
+            // not while the UI thread is in a burst of lazy compiles after the present: the
+            // write's unit calls cannot be interrupted once served (one held the owner 620 ms
+            // in front of a tab's first visit); it goes in the next pause
+            if start != 0 && (record || main_ms >= 3000 && due) && !jit::ui_burst() && !mid_busy.swap(true, Ordering::SeqCst) {
+                mid_flushed = n;
+                mid_last = main_ms;
+                let busy = mid_busy.clone();
+                let quiet = record || mid_still;
+                let _ = std::thread::Builder::new().name("run-cache-write".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+                    let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
+                    let t = Instant::now();
+                    let r = mid_flush(quiet, record);
+                    if crate::memstat::enabled() || std::env::var_os("MAKEPAD_RUN_CACHE_TRACE").is_some() {
+                        verbose!("makepad-run cache: mid-run write at t={:.0} ms: {:?} (entries, front images) in {:.1} ms", crate::clock::ms_since_start(), r, t.elapsed().as_secs_f64() * 1e3);
+                    }
+                    busy.store(false, Ordering::SeqCst);
+                });
             }
             // the program's teardown is built ahead once the first frame has been up for 1 s
             // (jit::prepare_teardown): a quit then runs it instead of compiling it
@@ -2646,7 +2636,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 // it was encoded from become views of it (what a warm run maps), then the freed
                 // pages go back
                 let mut converged = false;
-                if settle_watch.settled.is_some() && runtime.mem_trim && adopt_on {
+                if settle_watch.settled.is_some() && runtime.mem_trim {
                     if memos_pending {
                         if COLLECTED_RESTORED.load(Ordering::Relaxed) { memos_pending = false; }
                         else if drop_program_memos() { memos_pending = false; converged = true; }
@@ -3026,7 +3016,7 @@ static MAIN_START_WALL: AtomicU64 = AtomicU64::new(0);
 /// from. A live session records them too, until its first edit: from then on the Program holds
 /// reloaded file versions that are not the crate versions its stores are named after.
 pub(crate) fn front_recordable() -> bool {
-    crate::front::enabled() && crate::reload::edited_crates().is_empty()
+    crate::reload::edited_crates().is_empty()
 }
 
 /// The app was asked to quit (SIGTERM, SIGINT, SIGHUP: platform termination_signal.rs): the

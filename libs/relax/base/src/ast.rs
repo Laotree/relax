@@ -1654,14 +1654,6 @@ impl Ast {
             None => self.part_or_panic("list", l.lo).list(l),
         }
     }
-    /// The `Use` payload of an item kind.
-    #[inline]
-    pub fn as_use(&self, k: &ItemKind) -> Option<&UseItem> {
-        match k {
-            ItemKind::Use(r) => Some(self.row(*r)),
-            _ => None,
-        }
-    }
     /// The `Struct` payload of an item kind.
     #[inline]
     pub fn as_struct(&self, k: &ItemKind) -> Option<&StructItem> {
@@ -1702,27 +1694,11 @@ impl Ast {
             _ => None,
         }
     }
-    /// The `TraitAlias` payload of an item kind.
-    #[inline]
-    pub fn as_trait_alias(&self, k: &ItemKind) -> Option<&TraitAliasItem> {
-        match k {
-            ItemKind::TraitAlias(r) => Some(self.row(*r)),
-            _ => None,
-        }
-    }
     /// The `Impl` payload of an item kind.
     #[inline]
     pub fn as_impl(&self, k: &ItemKind) -> Option<&ImplItem> {
         match k {
             ItemKind::Impl(r) => Some(self.row(*r)),
-            _ => None,
-        }
-    }
-    /// The `ForeignMod` payload of an item kind.
-    #[inline]
-    pub fn as_foreign_mod(&self, k: &ItemKind) -> Option<&ForeignModItem> {
-        match k {
-            ItemKind::ForeignMod(r) => Some(self.row(*r)),
             _ => None,
         }
     }

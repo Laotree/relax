@@ -489,11 +489,7 @@ mod imp {
     /// THP `always` but defrag `madvise` the code region stayed all 4-KB pages. A no-op where THP
     /// is off; costs up to one partly used 2-MB page per touched region in RSS. (A W^X memfd is
     /// shmem: its huge pages follow /sys/kernel/mm/transparent_hugepage/shmem_enabled.)
-    /// MAKEPAD_RUN_HUGE_CODE=0 keeps 4-KB pages (A/B).
     fn huge_code_pages(addr: u64, len: usize) {
-        if std::env::var_os("MAKEPAD_RUN_HUGE_CODE").is_some_and(|v| v == "0") {
-            return;
-        }
         extern "C" {
             fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
         }
