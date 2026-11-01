@@ -5370,7 +5370,7 @@ impl Unit {
 
     /// No-codegen mode: the unit's window of the precompiled slot pools, (first global slot,
     /// slots), installed as its segment 0 at the first call (an auxiliary unit -- the proc-macro
-    /// world -- takes NC_AUX_SLOTS, a program's unit the largest free range), so units live at the
+    /// world -- takes NC_AUX_SLOTS, a program's unit the largest free range less that), so units live at the
     /// same time (a macro world rebuilt under a running program) never share a slot's word.
     fn nc_window(&self) -> (u32, u32) {
         *self.nc_window.get_or_init(|| {
