@@ -2441,6 +2441,14 @@ pub fn forwarding_def(alias: &str, krate: &str, target: &str) -> Option<MacroRef
     parse_def(alias, krate, 2021, &mt).ok().map(|mut d| { d.edition = 0; std::sync::Arc::new(d) })
 }
 
+/// The edition the expansions of a `macro_rules!` of crate `krate` (written in `edition`) carry.
+/// Relax's std crates stand in for rustc's library, which is edition 2024
+/// (library/{core,alloc,std}/Cargo.toml): their macros' expansions are 2024 code, as rustc's
+/// are, though Relax's std source is written in 2021.
+fn expansion_edition(krate: &str, edition: u16) -> u16 {
+    if matches!(krate, "core" | "alloc" | "std") { 2024 } else { edition }
+}
+
 pub fn parse_def(name: &str, krate: &str, edition: u16, toks: &[MTok]) -> Result<MacroDef, String> {
     let mut arms = Vec::new();
     let mut i = 0;
@@ -2467,8 +2475,8 @@ pub fn parse_def(name: &str, krate: &str, edition: u16, toks: &[MTok]) -> Result
         i = bc + 1;
         arms.push((matcher, body));
     }
-    Ok(MacroDef { name: name.to_string(), krate: krate.to_string(), exported: false, arms, builtin: 0, def_file: String::new(), def_pos: 0, def_mod: String::new(), edition,
-        input: Some(std::sync::Arc::new(RuleInput { tokens: toks.to_vec(), local_inner: false })) })
+    Ok(MacroDef { name: name.to_string(), krate: krate.to_string(), exported: false, arms, builtin: 0, def_file: String::new(), def_pos: 0, def_mod: String::new(),
+        edition: expansion_edition(krate, edition), input: Some(std::sync::Arc::new(RuleInput { tokens: toks.to_vec(), local_inner: false })) })
 }
 
 /// What can come after a matcher fragment (rustc_expand mbe macro_rules.rs `check_matcher`).

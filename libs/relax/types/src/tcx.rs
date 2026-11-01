@@ -2145,7 +2145,11 @@ impl Tcx {
                 errors.push((attr_pos, format!("the target features {} must all be either enabled or disabled together", features.join(", "))));
             }
         }
-        for (pos, message) in errors { self.err(cx, prog, file, pos, message); }
+        // (rustc words these without a code, except the E0658 feature gates)
+        for (pos, message) in errors {
+            let coded = message.len() > 5 && message.starts_with('E') && message[1..5].bytes().all(|b| b.is_ascii_digit());
+            self.err(cx, prog, file, pos, if coded { message } else { format!("{}{}", relax_front::diagnostics::UNCODED_PREFIX, message) });
+        }
         out
     }
 
