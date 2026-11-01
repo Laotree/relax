@@ -44,7 +44,7 @@ fn table() -> Option<&'static [Entry; ENTRIES]> {
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     const MAP_SHARED_ANON: i32 = 0x01 | 0x20;
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     const MAP_SHARED_ANON: i32 = 0x01 | 0x1000;
     let a = *T.get_or_init(|| {
         let p = unsafe { mmap(std::ptr::null_mut(), std::mem::size_of::<[Entry; ENTRIES]>(), 3, MAP_SHARED_ANON, -1, 0) };

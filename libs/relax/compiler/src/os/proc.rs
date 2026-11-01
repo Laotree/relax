@@ -224,7 +224,7 @@ mod unix {
             #[cfg(target_os = "android")]
             #[link_name = "__errno"]
             fn __errno_location() -> *mut i32;
-            #[cfg(target_os = "macos")]
+            #[cfg(target_vendor = "apple")]
             #[link_name = "__error"]
             fn __errno_location() -> *mut i32;
         }
@@ -525,7 +525,7 @@ mod imp {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod imp {
     pub use super::unix::{program_atexit, os_args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
     use super::unix::{dlopen, dlsym};
@@ -555,6 +555,13 @@ mod imp {
         false
     }
 
+    /// iOS and tvOS: a phone or tablet runs on its battery (IOKit's power sources are macOS's)
+    #[cfg(not(target_os = "macos"))]
+    pub fn on_battery() -> bool {
+        true
+    }
+
+    #[cfg(target_os = "macos")]
     pub fn on_battery() -> bool {
         #[link(name = "IOKit", kind = "framework")]
         extern "C" {

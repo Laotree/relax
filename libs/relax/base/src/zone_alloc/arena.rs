@@ -226,29 +226,29 @@ fn thread_pointer() -> usize {
 /// thread-local destructors have started) takes the cold path, which reads `DOMAIN` the ordinary
 /// way and fills the slot. `SLOT_GUARD`'s destructor clears the slot in the thread's thread-local
 /// destructor round, before the thread-local storage it points into is released.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 static DOMAIN_KEY: AtomicUsize = AtomicUsize::new(0);
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 extern "C" {
     fn pthread_key_create(key: *mut usize, dtor: Option<extern "C" fn(*mut u8)>) -> i32;
     fn pthread_getspecific(key: usize) -> *mut u8;
     fn pthread_setspecific(key: usize, v: *const u8) -> i32;
 }
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 struct SlotGuard;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         unsafe { pthread_setspecific(DOMAIN_KEY.load(Ordering::Relaxed), std::ptr::null()) };
     }
 }
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 thread_local! {
     static SLOT_GUARD: SlotGuard = const { SlotGuard };
 }
 /// The calling thread's TSD slot `key` (macOS: tpidrro_el0 is the slot array, its low 3 bits the
 /// cpu number).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 #[inline(always)]
 fn tsd_slot(key: usize) -> usize {
     let v: usize;
@@ -262,7 +262,7 @@ fn tsd_slot(key: usize) -> usize {
 pub fn bind_program_tls() {
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(relax)))]
     DOMAIN_OFFSET.store((domain_tls() as *const DomainTls as usize).wrapping_sub(thread_pointer()), Ordering::Relaxed);
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
     {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| unsafe {
@@ -288,12 +288,12 @@ fn program_tls() -> Option<&'static DomainTls> {
     unsafe {
         Some(&*(thread_pointer().wrapping_add(DOMAIN_OFFSET.load(Ordering::Relaxed)) as *const DomainTls))
     }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
     {
         let p = tsd_slot(DOMAIN_KEY.load(Ordering::Relaxed));
         if p == 0 { None } else { Some(unsafe { &*(p as *const DomainTls) }) }
     }
-    #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64", not(relax)), all(target_os = "macos", target_arch = "aarch64"))))]
+    #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64", not(relax)), all(target_vendor = "apple", target_arch = "aarch64"))))]
     Some(domain_tls())
 }
 /// The thread's `DomainTls`, read the ordinary way; fills the fast paths' TSD slot (macOS arm64)
@@ -301,7 +301,7 @@ fn program_tls() -> Option<&'static DomainTls> {
 #[inline(always)]
 fn program_tls_fill() -> &'static DomainTls {
     let t = domain_tls();
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
     if SLOT_GUARD.try_with(|_| ()).is_ok() {
         unsafe { pthread_setspecific(DOMAIN_KEY.load(Ordering::Relaxed), t as *const DomainTls as *const u8) };
     }
@@ -636,10 +636,10 @@ const GRANULE: usize = 4 << 10;
 #[cfg(not(target_arch = "x86_64"))]
 const GRANULE: usize = 16 << 10;
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 mod os {
     use std::ffi::c_void;
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     const ANON: i32 = 0x1000;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     const ANON: i32 = 0x20;
@@ -700,7 +700,7 @@ mod os {
         // Linux: MAP_FIXED_NOREPLACE; macOS has none: the hint, kept only when it was honoured
         #[cfg(any(target_os = "linux", target_os = "android"))]
         const FLAGS: i32 = 2 | ANON | 0x100000;
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         const FLAGS: i32 = 2 | ANON;
         let p = mmap(at as *mut c_void, size, 0, FLAGS, -1, 0);
         if p as isize == -1 {
@@ -736,16 +736,16 @@ mod os {
         n
     }
     fn page_size() -> usize {
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         return 16 << 10;
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         return 4 << 10;
     }
     pub unsafe fn commit(p: *mut u8, size: usize) -> bool {
         if mprotect(p.cast(), size, 1 | 2) != 0 {
             return false;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         {
             madvise(p.cast(), size, 8);
         } // MADV_FREE_REUSE, balances FREE_REUSABLE
@@ -756,18 +756,18 @@ mod os {
     /// replaced by a fresh PROT_NONE mapping, which also drops its pages at once).
     /// Returns the pages to the OS and keeps the mapping readable and writable.
     pub unsafe fn release(p: *mut u8, size: usize) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         const ADVICE: i32 = 7; // MADV_FREE_REUSABLE
         #[cfg(any(target_os = "linux", target_os = "android"))]
         const ADVICE: i32 = 4; // MADV_DONTNEED
         madvise(p.cast(), size, ADVICE) == 0
     }
     pub unsafe fn decommit(p: *mut u8, size: usize, zero: bool) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         const ADVICE: i32 = 7; // MADV_FREE_REUSABLE: removed from task footprint now
         #[cfg(any(target_os = "linux", target_os = "android"))]
         const ADVICE: i32 = 4; // MADV_DONTNEED
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         if zero {
             // MAP_PRIVATE | MAP_ANON | MAP_FIXED
             return mmap(p.cast(), size, 0, 2 | ANON | 0x10, -1, 0) as usize == p as usize;
@@ -2471,7 +2471,7 @@ pub fn heap_check_on() -> bool {
 /// The live-bit map of one program heap: RESERVE / 16 bits, mapped readable and writable (the OS
 /// backs only the pages that are touched). 0 when the mapping is refused (the check stays off).
 fn os_bits_map() -> usize {
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     unsafe {
         let b = os::reserve(RESERVE / 128, GRANULE, c"makepad-run heap check");
         if b != 0 && !os::commit(b as *mut u8, RESERVE / 128) {
@@ -2480,7 +2480,7 @@ fn os_bits_map() -> usize {
         }
         b
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
     0
 }
 

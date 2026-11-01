@@ -165,7 +165,7 @@ unsafe fn mprotect(_addr: *mut u8, _len: usize, _prot: i32) -> i32 {
 const MAP_ANON_PRIV: i32 = 0;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const MAP_ANON_PRIV: i32 = 0x22 | 0x4000; // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const MAP_ANON_PRIV: i32 = 0x1002;
 
 fn map_rw(addr: u64, len: u64) -> bool {
@@ -598,7 +598,7 @@ pub fn free_arena(a: &Arc<Arena>) {
 fn retire_window(at: u64, len: u64) -> bool {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     const MAP_FIXED_NORESERVE: i32 = 0x10 | 0x4000;
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     const MAP_FIXED_NORESERVE: i32 = 0x10 | 0x40;
     #[cfg(windows)]
     const MAP_FIXED_NORESERVE: i32 = 0;

@@ -8,6 +8,12 @@ pub fn asm_blocked(krate: &str) -> String {
     format!("inline assembly (asm!, global_asm!, naked_asm!) in crate `{}` is blocked by `--no-asm` (MAKEPAD_RUN_NO_ASM=1)", krate)
 }
 /// The error a program whose dependencies compile C gets without `--allow-c`.
+/// No-codegen mode (`Options::no_codegen`) as the environment `get` asks for it: always on iOS and
+/// tvOS, where a signed app cannot map executable memory; `MAKEPAD_RUN_NO_CODEGEN=1` elsewhere.
+pub fn no_codegen_env(get: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    cfg!(any(target_os = "ios", target_os = "tvos")) || get("MAKEPAD_RUN_NO_CODEGEN").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 pub const C_GATE: &str = "is built only with `--allow-c` (or MAKEPAD_RUN_ALLOW_C=1): cargo and the system C compiler build it, and its library is linked into the run";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,7 +21,7 @@ pub enum Borrowck { Off, Moves, Full }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BorrowckAll { Default, Nongeneric, Std, All }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CheckTarget { Host, MacosArm64, LinuxX64, WindowsX64, AndroidArm64, Web(PtrWidth) }
+pub enum CheckTarget { Host, MacosArm64, LinuxX64, WindowsX64, AndroidArm64, IosArm64, Web(PtrWidth) }
 /// The web target's pointer width, a parameter of the target (`wasm32-unknown-unknown` /
 /// `wasm64-unknown-unknown`): usize, isize and pointers are 4 or 8 bytes, every layout is rustc's
 /// for that triple, and the trace host runs the program in that mode (32: pointers are offsets into
@@ -37,11 +43,12 @@ impl PtrWidth {
 }
 impl CheckTarget {
     /// The targets Relax runs on (and checks for), by triple: `MAKEPAD_RUN_CHECK_TARGET` and `makepad host-gen`.
-    pub const TRIPLES: [(&'static str, CheckTarget); 4] = [
+    pub const TRIPLES: [(&'static str, CheckTarget); 5] = [
         ("aarch64-apple-darwin", CheckTarget::MacosArm64),
         ("x86_64-unknown-linux-gnu", CheckTarget::LinuxX64),
         ("x86_64-pc-windows-gnu", CheckTarget::WindowsX64),
         ("aarch64-linux-android", CheckTarget::AndroidArm64),
+        ("aarch64-apple-ios", CheckTarget::IosArm64),
     ];
     /// The web targets, by pointer width: the program's crates are read as a web build reads
     /// them (cfg(target_family = "wasm"), the web platform backend), every layout is rustc's for
@@ -476,7 +483,7 @@ impl Options {
             // finding baseline machine code, and interpreted code has none, so it would stay
             // unoptimised for good
             t0_baseline: match get("MAKEPAD_RUN_O1").and_then(|v| v.into_string().ok()).as_deref() {
-                _ if get("MAKEPAD_RUN_NO_CODEGEN").is_some_and(|v| !v.is_empty() && v != "0") => Tier0Baseline::Off,
+                _ if no_codegen_env(get) => Tier0Baseline::Off,
                 Some("0") => Tier0Baseline::Off,
                 Some("always") => Tier0Baseline::Always,
                 _ => Tier0Baseline::Startup,
@@ -495,10 +502,10 @@ impl Options {
             pre_derives: { let os = get("MAKEPAD_RUN_PRE_DERIVES"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             sandbox_fuel: { let os = get("MAKEPAD_RUN_SANDBOX_FUEL"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             spec: { let os = get("MAKEPAD_RUN_SPEC"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
-            tier1: { let os = get("MAKEPAD_RUN_O3"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") && !get("MAKEPAD_RUN_NO_CODEGEN").is_some_and(|v| !v.is_empty() && v != "0") },
+            tier1: { let os = get("MAKEPAD_RUN_O3"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") && !no_codegen_env(get) },
             tyck_ahead: { let os = get("MAKEPAD_RUN_TYCK_AHEAD"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             unwind: { let os = get("MAKEPAD_RUN_UNWIND"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
-            no_codegen: { let os = get("MAKEPAD_RUN_NO_CODEGEN"); let v = os.and_then(|v| v.into_string().ok()); v.is_some_and(|v| !v.is_empty() && v != "0") },
+            no_codegen: no_codegen_env(get),
             live: false,
             modules_trusted: { let os = get("MAKEPAD_RUN_MODULES_TRUSTED"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() == Some("1") },
             sandbox_nocheck: { let os = get("MAKEPAD_RUN_SANDBOX_NOCHECK"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() == Some("1") },
@@ -802,6 +809,7 @@ impl Options {
             CheckTarget::AndroidArm64 => 4,
             CheckTarget::Web(PtrWidth::W32) => 5,
             CheckTarget::Web(PtrWidth::W64) => 6,
+            CheckTarget::IosArm64 => 7,
         });
         h.str("ctfe");
         h.u8(*ctfe as u8);

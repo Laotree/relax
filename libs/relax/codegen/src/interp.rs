@@ -13,7 +13,7 @@
 //! - interpreted -> native: `relax_interp_call`, one precompiled routine that loads x0-x7,
 //!   q0-q7, x8 and the stack arguments from a buffer, calls the target and stores the result
 //!   registers back. It serves every signature.
-//! - native -> interpreted: a fixed pool of precompiled entry thunks (`movz w17, #k; b common`).
+//! - native -> interpreted: a fixed pool of precompiled entry thunks (`adr x17, .; b common`).
 //!   Each interpreted function owns one pool index; the common entry spills the argument
 //!   registers and calls `relax_interp_enter(k, regs, incoming stack args)`. A slot's code is a
 //!   jump to its pool thunk, so native callers, function pointers and vtables reach it unchanged.
@@ -22,8 +22,9 @@
 //!   interpreter stack without leaving the interpreter.
 //!
 //! Selection: `MAKEPAD_RUN_INTERP=all` or a comma list of name substrings (`MAKEPAD_RUN_INTERP_SKIP` for
-//! exclusions). Functions using operations this prototype does not cover stay native (counted:
-//! `MAKEPAD_RUN_INTERP_STATS=1` prints a summary at exit).
+//! exclusions); `MAKEPAD_RUN_NO_CODEGEN=1` interprets everything. With a selection, a function using
+//! an operation the interpreter does not cover stays machine code (counted, with the first
+//! functions of each reason: `MAKEPAD_RUN_INTERP_STATS=1`); in no-codegen mode it is an error.
 //! Unwinding: a panic below an interpreted frame lands in `relax_interp_call` (the runtime's
 //! unwinder treats its return address as a frame with a landing, `unwind_boundary`); the call
 //! returns 1, the interpreter continues at the call's `Invoke` unwind block (the cleanup pad) or
@@ -31,7 +32,7 @@
 //! from native code that ends unwinding re-raises in its native caller through the runtime's
 //! resume (the entry glue restores the caller's frame first). Drop order equals the JIT's and
 //! rustc's (bench_rt/interp/unwind_cmp.py).
-//! Not covered: the lane-typed vector ops (`VX`, `VX3`), x86-only instructions.
+//! Not covered: x86-only instructions (`Cpuid`, `Xgetbv`).
 
 #![allow(clippy::missing_safety_doc)]
 
@@ -41,8 +42,11 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 pub type H = unsafe extern "C" fn(*const u64, *mut u64, *mut Cx);
 
-/// Number of entry thunks in the pool (each 8 bytes of code, in the binary's text).
-pub const POOL: usize = 32768;
+/// Number of entry thunks in the pool (each 8 bytes of code, in the binary's text; the `.rept`
+/// count of the glue below): one per interpreted function the process installs, which no-codegen
+/// mode bounds by the precompiled slot pools anyway (compiler static_glue.rs SLOTS, the same
+/// count). 32,768 ran out in Fab's boot (41,573 functions).
+pub const POOL: usize = 1 << 18;
 
 /// Per-thread interpreter state; its address is the third handler argument.
 #[repr(C)]
@@ -143,21 +147,32 @@ macro_rules! gsym {
     };
 }
 
+/// `x16 = &symbol` (page + offset), in the object format's syntax.
+#[cfg(target_vendor = "apple")]
+macro_rules! adrp_add_x16 {
+    ($s:literal) => {
+        concat!("  adrp x16, _", $s, "@PAGE\n  add x16, x16, _", $s, "@PAGEOFF")
+    };
+}
+#[cfg(not(target_vendor = "apple"))]
+macro_rules! adrp_add_x16 {
+    ($s:literal) => {
+        concat!("  adrp x16, ", $s, "\n  add x16, x16, :lo12:", $s)
+    };
+}
+
 #[cfg(target_arch = "aarch64")]
 std::arch::global_asm!(
     ".text",
+    // common entry: x17 = the entry thunk's own address, made the pool index here. Spill x0-x7, q0-q7, x8; call
+    // relax_interp_enter(k, regs, caller's stack arguments); load the result registers from the
+    // buffer.
     ".p2align 3",
-    concat!(".globl ", gsym!("relax_interp_pool")),
-    concat!(gsym!("relax_interp_pool"), ":"),
-    ".set rip_k, 0",
-    ".rept 32768",
-    "  movz w17, #rip_k",
-    "  b 2f",
-    ".set rip_k, rip_k + 1",
-    ".endr",
-    // common entry: x17 = pool index. Spill x0-x7, q0-q7, x8; call relax_interp_enter(k,
-    // regs, caller's stack arguments); load the result registers from the buffer.
-    "2:",
+    concat!(gsym!("relax_interp_pool_entry"), ":"),
+    // (adrp + add: Mach-O has no relocation for an `adr` to another symbol)
+    adrp_add_x16!("relax_interp_pool"),
+    "  sub x17, x17, x16",
+    "  lsr x17, x17, #3",
     "  stp x29, x30, [sp, #-16]!",
     "  mov x29, sp",
     "  sub sp, sp, #208",
@@ -189,6 +204,15 @@ std::arch::global_asm!(
     "  mov sp, x29",
     "  ldp x29, x30, [sp], #16",
     "  br x16",
+    // the entry thunks: thunk k (8 bytes at pool + 8k) passes its own address to the common
+    // entry (no immediate: the pool may hold more than 16 bits' worth)
+    ".p2align 3",
+    concat!(".globl ", gsym!("relax_interp_pool")),
+    concat!(gsym!("relax_interp_pool"), ":"),
+    ".rept 262144",
+    "  adr x17, .",
+    concat!("  b ", gsym!("relax_interp_pool_entry")),
+    ".endr",
     "",
     // relax_interp_call(target, regs, stack, nstack_words)
     ".p2align 2",
@@ -340,12 +364,22 @@ pub fn note_native(ns: u64, bytes: u64, insts: u64) {
 }
 static REFUSALS: relax_session::sync::Mutex<Vec<(String, u64)>> = relax_session::sync::Mutex::new(Vec::new());
 
-fn refuse(why: &str) {
+fn refuse(why: &str, name: &str) {
     N_REFUSED.fetch_add(1, Ordering::Relaxed);
     let mut g = REFUSALS.lock().unwrap_or_else(|e| e.into_inner());
-    match g.iter_mut().find(|x| x.0 == why) {
-        Some(x) => x.1 += 1,
-        None => g.push((why.to_string(), 1)),
+    let n = match g.iter_mut().find(|x| x.0 == why) {
+        Some(x) => {
+            x.1 += 1;
+            x.1
+        }
+        None => {
+            g.push((why.to_string(), 1));
+            1
+        }
+    };
+    // the first functions of each reason, by name (the summary only counts)
+    if n <= 4 && std::env::var_os("MAKEPAD_RUN_INTERP_STATS").is_some() {
+        eprintln!("makepad-run interp refused: {}: `{}`", why, name);
     }
 }
 
@@ -402,7 +436,7 @@ struct Sel {
 /// interpreter cannot run is an error, not a JIT fallback.
 pub fn no_codegen() -> bool {
     static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var_os("MAKEPAD_RUN_NO_CODEGEN").is_some_and(|v| !v.is_empty() && v != "0"))
+    *N.get_or_init(|| relax_session::options::no_codegen_env(&|n| std::env::var_os(n)))
 }
 
 fn selection() -> Option<&'static Sel> {
@@ -453,7 +487,7 @@ pub fn maybe_compile(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64, tls_s
             if no_codegen() {
                 panic!("makepad run: no-codegen mode: `{}` cannot run in the interpreter ({})", f.name, why);
             }
-            refuse(why);
+            refuse(why, &f.name);
             return None;
         }
     };
@@ -1942,6 +1976,21 @@ unsafe extern "C" fn h_vstore(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
     std::ptr::write_unaligned(a as *mut [u32; 4], vget(c(fp, w, 1)));
     next!(pc.add(2), fp, cx)
 }
+/// [h, d|base|idx|sh<<48, off]: base + (idx << sh) + off
+unsafe extern "C" fn h_vloadx(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
+    let w = *pc.add(1);
+    let a = (*c(fp, w, 1)).wrapping_add((*c(fp, w, 2)) << ((w >> 48) & 63)).wrapping_add(*pc.add(2));
+    let v = std::ptr::read_unaligned(a as *const [u32; 4]);
+    vput(c(fp, w, 0), v);
+    next!(pc.add(3), fp, cx)
+}
+/// [h, base|idx|src|sh<<48, off]
+unsafe extern "C" fn h_vstorex(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
+    let w = *pc.add(1);
+    let a = (*c(fp, w, 0)).wrapping_add((*c(fp, w, 1)) << ((w >> 48) & 63)).wrapping_add(*pc.add(2));
+    std::ptr::write_unaligned(a as *mut [u32; 4], vget(c(fp, w, 2)));
+    next!(pc.add(3), fp, cx)
+}
 unsafe extern "C" fn h_vany(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
     let w = *pc.add(1);
     let v = vget(c(fp, w, 1));
@@ -3221,8 +3270,14 @@ fn lower_inst(l: &mut Lw, i: &Inst, slots: SlotsPtr, sym_class: u64, sym_val: &d
             let w = l.w2(*base, *src) | (*off as u32 as u64) << 32;
             l.emit(h_vstore, &[w]);
         }
-        // made by addr_modes for native code only
-        Inst::VLoadX(..) | Inst::VStoreX(..) => return Err("indexed vector access"),
+        Inst::VLoadX(d, base, idx, sh, off) => {
+            let w = l.w3(*d, *base, *idx) | (*sh as u64) << 48;
+            l.emit(h_vloadx, &[w, *off as i64 as u64]);
+        }
+        Inst::VStoreX(base, idx, sh, off, src) => {
+            let w = l.w3(*base, *idx, *src) | (*sh as u64) << 48;
+            l.emit(h_vstorex, &[w, *off as i64 as u64]);
+        }
         Inst::VAny(d, v) => {
             let w = l.w2(*d, *v);
             l.emit(h_vany, &[w]);

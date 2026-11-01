@@ -1043,7 +1043,7 @@ unsafe fn raw_name(l: &mut RawLine, a: u64, sp: u64) {
             l.put(b"JIT code memory, no fn body (glue)");
             return;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         if let Some([exec, ro, rw, syms, end]) = unit_areas() {
             for (lo, hi, what) in [(exec, ro, &b"the unit's code reservation"[..]), (ro, rw, b"the unit's read-only data"), (rw, syms, b"the unit's statics"), (syms, end, b"the unit's symbol table")] {
                 if a >= lo && a < hi {
@@ -3070,7 +3070,7 @@ rt_fn! {
 }
 
 /// (exec, data, rw, syms, end) bases of the program unit's reservation (diagnostics: inspect memory).
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub(crate) fn unit_areas() -> Option<[u64; 5]> {
     unsafe {
         if cur_unit().is_null() { return None; }
@@ -3671,7 +3671,7 @@ impl Unit {
         // MAKEPAD_RUN_EXEC_CHECK=1 runs the same check in JIT mode (where it must find the JIT)
         if no_codegen || std::env::var_os("MAKEPAD_RUN_EXEC_CHECK").is_some() {
             EXEC_CHECK.store(true, Ordering::Relaxed);
-            #[cfg(target_os = "macos")]
+            #[cfg(target_vendor = "apple")]
             {
                 extern "C" fn at_exit_check() {
                     exec_check();
@@ -24289,7 +24289,7 @@ pub fn exec_check() {
 }
 
 fn exec_check_now(when: &str) {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
         let r = os::mem::anonymous_exec_regions();
         if r.is_empty() {
@@ -24298,7 +24298,7 @@ fn exec_check_now(when: &str) {
             eprintln!("makepad-run exec check ({}): {} executable regions no image backs: {}", when, r.len(), r.iter().map(|(a, n, p)| format!("{:#x}+{:#x} prot {}", a, n, p)).collect::<Vec<_>>().join(", "));
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_vendor = "apple"))]
     let _ = when;
 }
 
