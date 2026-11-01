@@ -184,6 +184,7 @@ pub fn start(app: &str) {
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("session", "view [open|dismiss]", "the run's view over the app (compile errors, a parked panic, the JIT's state): what it shows, or open / dismiss it (the caption's JIT ring is display only)"),
     ("pin", "[on|off]", "pin the running app while an operation runs: no edit or landing reaches it and it does not restart; off: it catches up"),
+    ("inputs", "[match=<path substring>]", "the live session's reload source files, workspace-relative, one path per line and a count; unloaded sources are excluded"),
     ("session", "relaunch", "apply the edits waiting for a restart: a hosted app relaunches its domain in this process (host window and GPU device kept); a program that restarts itself (std::relax::restart_supported) restarts with its state"),
     ("why-hung", "[probe_ms=200]", "is it stuck and why: verdict (deadlock / blocked / busy / idle), the wait chain or cycle, stacks of the threads in it"),
     ("why-slow", "[s=3]", "where the time goes: ranked findings -- the main thread's CPU split (program / compiles / makepad run runtime / system), its hot fns, the owner's service, other busy threads"),
@@ -298,6 +299,18 @@ fn dispatch_command(req: &Req, out: &mut Out) {
             out.line(&format!("{{\"pinned\":{on}}}"));
         }
         "help" => help(req, out),
+        "inputs" => match crate::reload::input_paths() {
+            Ok(paths) => {
+                let paths: Vec<_> = paths.into_iter().filter(|p| p.contains(req.get("match").unwrap_or(""))).collect();
+                // Callers use absence to skip a patch wait: never truncate this source list.
+                out.always(&format!("{{\"count\":{}}}", paths.len()));
+                for path in paths {
+                    if out.cancelled() { break; }
+                    out.always(&format!("{{\"path\":{}}}", json_str(&path)));
+                }
+            }
+            Err(e) => out.err(&e),
+        },
         "pf" => out.err("pf is answered by the client: makepad inspect <app> pf <query> (it attaches to the app's prof stream)"),
         "ping" => out.line(&format!("{{\"pid\":{},\"app\":{},\"ms\":{}}}", std::process::id(), json_str(&APP.lock().unwrap()), now_ms())),
         "threads" => cmd_threads(out),
