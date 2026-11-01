@@ -144,7 +144,6 @@ pub const LATE_FILE: u8 = 1;
 pub const LATE_ENV: u8 = 2;
 
 static LATE: crate::sync::Mutex<Option<std::collections::HashMap<(String, u8, String), u128>>> = crate::sync::Mutex::new(None);
-static LATE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// The content hash a late input is recorded with.
 pub fn late_hash(content: Option<&[u8]>) -> u128 {
@@ -163,17 +162,11 @@ pub fn late_hash(content: Option<&[u8]>) -> u128 {
 pub fn note_late_hash(krate: &str, kind: u8, name: &str, hash: u128) {
     let key = (krate.to_string(), kind, name.to_string());
     let mut g = LATE.lock().unwrap_or_else(|e| e.into_inner());
-    if g.get_or_insert_with(Default::default).insert(key, hash) != Some(hash) {
-        LATE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
+    g.get_or_insert_with(Default::default).insert(key, hash);
 }
 
 pub fn note_late_input(krate: &str, kind: u8, name: &str, content: Option<&[u8]>) {
     note_late_hash(krate, kind, name, late_hash(content));
-}
-
-pub fn late_gen() -> u64 {
-    LATE_GEN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The late inputs seen so far, sorted: (crate, kind, name, content hash).

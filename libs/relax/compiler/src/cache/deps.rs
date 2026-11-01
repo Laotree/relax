@@ -857,7 +857,7 @@ fn kind_code(k: &ItemKind) -> u32 {
 impl Deps {
     /// Per crate: what its rows are built from, besides the crates it can see (CrateRow without its
     /// own lists and always hash).
-    fn crate_inputs(prog: &Program, iface: &[u128], own_late: &[u128], atomic: &[bool]) -> Vec<CrateRow> {
+    fn crate_inputs(prog: &Program, iface: &[u128], atomic: &[bool]) -> Vec<CrateRow> {
         let mut files: Vec<Sip128> = (0..prog.crates.len()).map(|_| { let mut h = Sip128::new(); h.str("deps-crate-files"); h }).collect();
         let mut place = vec![0u32; prog.crates.len()];
         for f in 0..prog.boot_files.min(prog.files.len()) {
@@ -871,11 +871,7 @@ impl Deps {
             h.str(prog.file_paths.get(f).map_or("", |p| p.as_str()));
             h.u32(prog.files[f].ast.items.len() as u32);
         }
-        files.into_iter().enumerate().map(|(c, mut files)| {
-            if let Some(&late) = own_late.get(c).filter(|&&l| l != 0) {
-                files.str("deps-crate-late");
-                files.u128(late);
-            }
+        files.into_iter().enumerate().map(|(c, files)| {
             let ci = &prog.crates[c];
             let mut ident = Sip128::new();
             ident.str("crate-ident");
@@ -914,9 +910,9 @@ impl Deps {
     }
 
     /// The crates whose rows a build over `prev` takes over (`build`): their files need no digests.
-    pub(crate) fn clean_crates(prog: &Program, iface: &[u128], own_late: &[u128], prev: Option<&Deps>) -> Vec<bool> {
+    pub(crate) fn clean_crates(prog: &Program, iface: &[u128], prev: Option<&Deps>) -> Vec<bool> {
         let atomic = atomic_crates(prog, iface.len());
-        Self::clean_with(prev, &Self::crate_inputs(prog, iface, own_late, &atomic), &universes(prog))
+        Self::clean_with(prev, &Self::crate_inputs(prog, iface, &atomic), &universes(prog))
     }
 
     /// Builds the graph of the program's boot files; `iface`: the crates' interface fingerprints
@@ -927,12 +923,12 @@ impl Deps {
     /// closures and components are known. The result is the graph a build from scratch makes (the
     /// component ids aside). None: over `prev`, the names that decide clean crates' nodes (the
     /// program's alias and macro names) changed -- build without it.
-    pub(crate) fn build(prog: &Program, digests: &[Option<std::sync::Arc<super::items::FileDigest>>], iface: &[u128], own_late: &[u128], valid: u128, prev: Option<&Deps>) -> Option<Deps> {
+    pub(crate) fn build(prog: &Program, digests: &[Option<std::sync::Arc<super::items::FileDigest>>], iface: &[u128], valid: u128, prev: Option<&Deps>) -> Option<Deps> {
         let t0 = std::time::Instant::now();
         let n_crates = prog.crates.len();
         let atomic = atomic_crates(prog, iface.len());
         let universe = universes(prog);
-        let mut crates = Self::crate_inputs(prog, iface, own_late, &atomic);
+        let mut crates = Self::crate_inputs(prog, iface, &atomic);
         let clean = Self::clean_with(prev, &crates, &universe);
         let prev = prev.filter(|_| clean.iter().any(|&c| c));
         let file_crate = Self::file_crates(prog);
