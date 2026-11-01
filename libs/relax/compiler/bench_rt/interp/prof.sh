@@ -20,8 +20,14 @@ env "${env[@]}" MAKEPAD_HAL_SCRIPT="$work/stay.hal" perl -e 'alarm 900; exec @AR
 pid=$!
 # the app is the makepad process itself (perl execs it): its remote socket comes up at its start
 for i in $(seq 1 200); do grep -q "makepad-remote: pid $pid" "$work/warm.out" 2>/dev/null && break; sleep 0.05; done
+# what every thread does a second in (a start that waits shows it here), then the profile
+sleep 1
+"$M" inspect "$pid" stacks 2>&1 | cut -c1-200 | head -150
 "$M" inspect "$pid" prof s="$secs" threads=all n=40 2>&1 | cut -c1-220
 "$M" inspect "$pid" quit > /dev/null 2>&1
+for i in $(seq 1 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+# (the run this script started, by its recorded pid, when it did not quit)
+kill -0 "$pid" 2>/dev/null && { echo "the app did not quit: stopping pid $pid"; kill "$pid"; }
 wait "$pid"
 echo "warm run: rc $?"
 grep -a 'first frame at' "$work/warm.out"
