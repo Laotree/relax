@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn hub_off_refuses_lan_before_connect_or_resolution() {
-        for host in ["192.0.2.1", "192.0.2.2", "224.0.0.251", "hub.local", "HUB.LOCAL.", "fd00::1", "::ffff:192.0.2.2"] {
+        for host in ["192.0.2.11", "192.168.77.2", "224.0.0.251", "hub.local", "HUB.LOCAL.", "fd00::1", "::ffff:192.168.77.2"] {
             let error = hub_permission("test", host, !may_reach_host_when_off(host), false).unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
             assert!(error.to_string().contains(crate::netconfig::NETWORKED_AI_HUB_KEY));
