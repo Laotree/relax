@@ -14290,6 +14290,12 @@ impl Drop for Unit {
             // the slot segments: stubs first, then the table words and tier records (the thunks
             // went with the code area)
             for seg in 0..relax_backend::rir::SLOT_SEGS {
+                // no-codegen: segment 0 is the precompiled glue (pools in the binary, the static
+                // table) and the only segment; its tier records alone were mapped for this unit
+                if seg == 0 && self.prog.session.options.no_codegen {
+                    os::mem::free(self.slots.tier(0), relax_backend::rir::SlotTable::seg_slots(0) * TIER_REC);
+                    continue;
+                }
                 if self.slots.has_seg(seg) {
                     let count = relax_backend::rir::SlotTable::seg_slots(seg);
                     os::mem::release(self.slots.seg_base(1, seg), count * STUB_SIZE, count * (8 + TIER_REC));
