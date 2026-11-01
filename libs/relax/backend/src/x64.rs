@@ -7206,6 +7206,53 @@ mod tests {
         let jcc = next[0] & 0xf0 == 0x70 || (next[0] == 0x0f && next[1] & 0xf0 == 0x80);
         assert!(!jcc, "the merge block branches on the add's flags: {:02x?}", &code[k..(k + 12).min(code.len())]);
     }
+
+    /// A 64-bit ALU op whose constant does not fit a sign-extended imm32 applies the whole
+    /// constant. `x & 0xffff_ffff` in place was encoded `and r64, -1` (a no-op): a
+    /// sign-extended i32 niche read back as `0xffff_ffff_ffff_ffff` never matched its None
+    /// value, so csg_brep's `Option<PointClassLoc>` None was taken as Some under the JIT.
+    #[test]
+    fn wide_immediates_are_not_truncated() {
+        let options = &relax_session::Options::default();
+        let u64t = IntTy { bits: 64, signed: false };
+        let cases: [(IOp, i64, fn(u64, u64) -> u64); 6] = [
+            (IOp::And, 0xffff_ffff, |x, k| x & k),
+            (IOp::And, 0x1_0000_00ff, |x, k| x & k),
+            (IOp::Add, 1 << 40, |x, k| x.wrapping_add(k)),
+            (IOp::Sub, 0x8000_0000, |x, k| x.wrapping_sub(k)),
+            (IOp::Xor, 0xffff_ffff, |x, k| x ^ k),
+            (IOp::Mul, 0x1_0000_0001, |x, k| x.wrapping_mul(k)),
+        ];
+        for (op, k, want) in cases {
+            // p = p op k in place (the result register is the operand's), returned
+            let mut f = Func::new("wide".to_string(), 0);
+            let p = f.vreg(Cls::I);
+            f.params.push(p);
+            f.rets.push(Cls::I);
+            let b0 = f.block();
+            f.blocks[b0 as usize].insts.push(Inst::IBinI(op, u64t, p, p, k));
+            f.blocks[b0 as usize].pos.push(0);
+            f.blocks[b0 as usize].term = Term::Ret(vec![p]);
+            let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
+            let r = compile(options, &f, &env).expect("compiles");
+            let code = &r.code[..r.text_len as usize];
+            // no REX.W 81 /n with an imm32 that is not k (the truncated constant)
+            for i in 0..code.len().saturating_sub(6) {
+                if code[i] & 0xf8 == 0x48 && code[i + 1] == 0x81 && code[i + 2] & 0xc0 == 0xc0 {
+                    let imm = i32::from_le_bytes([code[i + 3], code[i + 4], code[i + 5], code[i + 6]]) as i64;
+                    assert_eq!(imm, k, "{op:?} {k:#x}: imm32 {imm:#x} sign-extends to another constant: {code:02x?}");
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            {
+                let c = crate::exec::Code::new(code).expect("executable memory");
+                let run: extern "sysv64" fn(u64) -> u64 = unsafe { std::mem::transmute(c.ptr()) };
+                for x in [0u64, 1, 0xffff_ffff, u64::MAX, 0x1234_5678_9abc_def0] {
+                    assert_eq!(run(x), want(x, k as u64), "{op:?} {x:#x} {k:#x}");
+                }
+            }
+        }
+    }
 }
 
 /// Detect the effective JIT capabilities before the driver freezes Options.
