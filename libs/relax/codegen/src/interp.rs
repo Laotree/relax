@@ -124,6 +124,8 @@ pub struct IFunc {
     pub name: String,
     /// the frame's alignment in bytes (64, or a stack slot's larger alignment)
     pub align: usize,
+    /// Loader metadata, never serialized: TLS offset (high word) and function slot (low word).
+    entry_mark: AtomicU64,
 }
 
 /// `p` rounded up to `align` bytes (a power of two).
@@ -570,6 +572,14 @@ pub fn is_entry(addr: u64) -> bool {
     cfg!(target_arch = "aarch64") && addr >= p && addr < p + 8 * POOL as u64
 }
 
+/// Attach an entry mark after linking the ordinary interpreter blob. Calls which stay on the
+/// interpreter stack run it too, without changing the blob or its cache key.
+pub fn set_entry_mark(addr: u64, tls: u32, id: u32) {
+    if !is_entry(addr) { return; }
+    let f = FUNCS[((addr - pool_base()) / 8) as usize].load(Ordering::Acquire);
+    unsafe { (*f).entry_mark.store((tls as u64) << 32 | id as u64, Ordering::Release) };
+}
+
 /// The runtime addresses the interpreter calls (the backends' Env): set before a function runs.
 pub fn set_runtime(tls_slow: u64, resume: u64) {
     TLS_GLUE.store(tls_slow, Ordering::Relaxed);
@@ -591,9 +601,10 @@ fn free_lowered(f: IFunc, p: &Persist) {
 
 /// An interpreted function's code as the runtime installs it: a blob whose relocated words the
 /// runtime has written (rir::link). Registers it and returns its entry.
-pub fn install_linked(code: &[u8], tls_slow: u64, resume: u64) -> Result<u64, String> {
+/// `body_offset`: the replaceable body word's offset from the relocated call table word.
+pub fn install_linked(code: &[u8], tls_slow: u64, resume: u64, body_offset: u64) -> Result<u64, String> {
     set_runtime(tls_slow, resume);
-    blob::install(code)
+    blob::install(code, body_offset)
 }
 
 // ---------------------------------------------------------------- thread state
@@ -646,8 +657,20 @@ fn overflow() -> ! {
 
 #[inline(always)]
 unsafe fn run(f: &IFunc, fp: *mut u64, cx: *mut Cx) {
+    mark_entry(f, cx);
     let h: H = std::mem::transmute(f.code[0]);
     h(f.code.as_ptr(), fp, cx)
+}
+
+#[inline(always)]
+unsafe fn mark_entry(f: &IFunc, cx: *mut Cx) {
+    let mark = f.entry_mark.load(Ordering::Acquire);
+    if mark == 0 { return; }
+    let block = tls_block(cx);
+    let table = *((block + (mark >> 32)) as *const u64);
+    let id = mark as u32;
+    let bank = (&*((table + ((id >> 16) * 8) as u64) as *const AtomicU64)).load(Ordering::Acquire);
+    (&*((bank + (id & 65535) as u64) as *const std::sync::atomic::AtomicU8)).store(1, Ordering::Relaxed);
 }
 
 /// Native -> interpreted (the pool's common entry).
@@ -1618,7 +1641,7 @@ pub fn const_call_entry(target: u64, arg0: u64) -> u64 {
     let code = vec![h_const_call as *const () as usize as u64, target, arg0, h_ret0 as *const () as usize as u64].into_boxed_slice();
     let k = NEXT.fetch_add(1, Ordering::Relaxed);
     assert!(k < POOL, "makepad run interp: entry thunk pool exhausted");
-    let f = IFunc { code, frame_words: 8, params: Vec::new(), cplan: None, name: format!("const_call {:#x}", target), align: 64 };
+    let f = IFunc { code, frame_words: 8, params: Vec::new(), cplan: None, name: format!("const_call {:#x}", target), align: 64, entry_mark: AtomicU64::new(0) };
     FUNCS[k].store(Box::into_raw(Box::new(f)), Ordering::Release);
     pool_base() + 8 * k as u64
 }
@@ -2133,7 +2156,7 @@ unsafe extern "C" fn h_trap(_pc: *const u64, _fp: *mut u64, _cx: *mut Cx) {
 // ---- calls
 
 enum Target {
-    /// a slot's table word (its current code)
+    /// a slot's call table word (its current code or entry wrapper)
     Table(u64),
     /// a function pointer in a cell
     Cell(u32),
@@ -2156,6 +2179,9 @@ struct Ic {
 
 struct CallDesc {
     target: Target,
+    /// Loader-only body word behind an entry wrapper (0: target already names the body).
+    /// Interpreted callees mark their own entry; native calls still go through `target`.
+    body: u64,
     /// argument cells and classes (C calls: ABI vregs, result address first)
     args: Vec<(u32, Cls)>,
     rets: Vec<(u32, Cls)>,
@@ -2219,6 +2245,7 @@ unsafe fn decode(mut a: u64, via: &mut u64, count: &mut *const CountInfo) -> *co
 
 #[inline(always)]
 unsafe fn resolve(d: &CallDesc, word: u64) -> (*const IFunc, *const CountInfo) {
+    let word = if d.body != 0 { (&*(d.body as *const AtomicU64)).load(Ordering::Acquire) } else { word };
     let ic = d.ic.load(Ordering::Acquire);
     if !ic.is_null() && (*ic).word == word && ((*ic).via == 0 || *((*ic).via as *const u64) == (*ic).via_word) {
         return ((*ic).f, (*ic).count);
@@ -2311,6 +2338,7 @@ unsafe fn tail_enter(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> *const IFunc {
                     n += 1;
                 }
             }
+            mark_entry(fr, cx);
             return f;
         }
     }
@@ -2822,35 +2850,6 @@ fn lower(options: &relax_session::Options, f: &Func, slots: SlotsPtr, syms: u64,
     if f.naked {
         return Err("inline assembly");
     }
-    // Entry metadata becomes ordinary RIR for the interpreter; native backends emit a prologue.
-    let marked = f.entry_mark.map(|(tls, slot)| {
-        let mut g = f.clone();
-        g.entry_mark = None;
-        let p = g.vreg(Cls::I);
-        let bank = g.vreg(Cls::I);
-        let index = g.vreg(Cls::I);
-        let one = g.vreg(Cls::I);
-        let mut insts = vec![
-            Inst::TlsAddr(p, tls),
-            Inst::Load(Mem::Int(8, false), p, p, 0),
-            Inst::Addr(index, slot),
-            Inst::IBinI(IOp::Shr, U64, bank, index, 16),
-            Inst::IBinI(IOp::Shl, U64, bank, bank, 3),
-            Inst::IBin(IOp::Add, U64, p, p, bank),
-            Inst::AtomicLoad(Mem::Int(8, false), AtomOrd::Acquire, p, p),
-            Inst::IBinI(IOp::And, U64, index, index, 65535),
-            Inst::IBin(IOp::Add, U64, p, p, index),
-            Inst::Iconst(one, 1),
-            Inst::AtomicStore(Mem::Int(1, false), AtomOrd::Relaxed, p, one),
-        ];
-        let mut pos = vec![0; insts.len()];
-        insts.append(&mut g.blocks[0].insts);
-        pos.append(&mut g.blocks[0].pos);
-        g.blocks[0].insts = insts;
-        g.blocks[0].pos = pos;
-        g
-    });
-    let f = marked.as_ref().unwrap_or(f);
     let covered = relax_backend::passes::lower_coverage(f);
     let f = covered.as_ref().unwrap_or(f);
     // calls in tail position become jumps, as the arm64 back end makes them (the same analysis:
@@ -3224,7 +3223,7 @@ fn lower(options: &relax_session::Options, f: &Func, slots: SlotsPtr, syms: u64,
         persist.targets.push(at);
     }
     let params = f.params.iter().map(|p| (l.cell[p.0 as usize], f.vregs[p.0 as usize])).collect();
-    Ok((IFunc { code, frame_words, params, cplan, name: f.name.clone(), align }, persist))
+    Ok((IFunc { code, frame_words, params, cplan, name: f.name.clone(), align, entry_mark: AtomicU64::new(0) }, persist))
 }
 
 fn lower_inst(l: &mut Lw, i: &Inst, slots: SlotsPtr, sym_class: u64, sym_val: &dyn Fn(Sym) -> u64) -> Result<(), &'static str> {
@@ -3439,6 +3438,7 @@ fn lower_inst(l: &mut Lw, i: &Inst, slots: SlotsPtr, sym_class: u64, sym_val: &d
             }
             let d = Box::new(CallDesc {
                 target,
+                body: 0,
                 args: args.iter().map(|v| (match l.frame_off(*v) {
                     Some(o) => ARG_FRAME | o,
                     None => l.cell[v.0 as usize],

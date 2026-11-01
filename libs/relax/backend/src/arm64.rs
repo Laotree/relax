@@ -1278,7 +1278,6 @@ impl<'a> Gen<'a> {
             self.stack_probe(frame);
             self.a.add_any(SP, SP, -frame);
             self.callee_saves(true);
-            self.entry_mark();
             self.tail = crate::tail::sibling_calls(options, self.f, &reach, crate::tail::Arch::Arm64);
             if self.dom_read.first() == Some(&true) {
                 self.dom_base();
@@ -1289,8 +1288,6 @@ impl<'a> Gen<'a> {
                 self.params_prologue();
             }
         }
-
-        if self.f.naked { self.entry_mark(); }
 
         let nb = self.f.blocks.len();
         self.block_pos = vec![0; nb];
@@ -2175,33 +2172,14 @@ impl<'a> Gen<'a> {
         self.ldr_reloc(IP1, Reloc::TlsKey);
         self.a.e(0xF860_6800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
         let p = self.a.cbnz(IP0);
-        if self.f.naked { self.a.stp_pre(FP, LR, SP, -16); }
         if self.near {
             self.bl_reloc(Reloc::TlsSlow);
         } else {
             self.ldr_reloc(IP1, Reloc::TlsSlow);
             self.a.blr(IP1);
         }
-        if self.f.naked { self.a.ldp_post(FP, LR, SP, 16); }
         let skip = self.a.pos();
         self.a.patch(p, skip);
-    }
-
-    /// One relaxed byte store through this thread's bank table; x16/x17 are scratch.
-    fn entry_mark(&mut self) {
-        let Some((tls, slot)) = self.f.entry_mark else { return; };
-        self.tls_block_ip0();
-        self.ldr_reloc(IP1, Reloc::Sym(tls));
-        self.a.e(0xF860_6800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
-        self.ldr_reloc(IP1, Reloc::Sym(slot));
-        self.a.e(0xD350_FC00 | (IP1 as u32) << 5 | IP1 as u32); // lsr x17, x17, 16
-        self.a.e(0x8B00_0C00 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32); // add x16, x16, x17, lsl 3
-        self.a.e(0xC8DF_FC00 | (IP0 as u32) << 5 | IP0 as u32); // ldar x16, [x16]
-        self.ldr_reloc(IP1, Reloc::Sym(slot));
-        self.a.e(0xD340_3C00 | (IP1 as u32) << 5 | IP1 as u32); // and x17, x17, 65535
-        self.a.rrr(0x8B00_0000, IP0, IP0, IP1);
-        self.a.mov_imm(IP1, 1);
-        self.a.e(0x3900_0000 | (IP0 as u32) << 5 | IP1 as u32); // strb w17, [x16]
     }
 
     /// d = this thread's thread-local block + off.
@@ -5628,6 +5606,33 @@ pub fn thunk(slot_addr: u64) -> Vec<u8> {
     while a.w.len() * 4 < THUNK_SIZE {
         a.udf();
     }
+    words_to_bytes(&a.w)
+}
+
+/// Loader-only entry mark, followed by a jump through the replaceable body word. Only the
+/// veneer scratch registers x16/x17 change; the slow TLS allocation preserves the arguments.
+pub fn entry_thunk(id: u32, tls: u32, key: u64, slow: u64, body: u64) -> Vec<u8> {
+    let mut a = Asm { w: Vec::new() };
+    a.e(MRS_SLOT_BASE | IP0 as u32);
+    a.e(0x9243_F000 | (IP0 as u32) << 5 | IP0 as u32);
+    a.mov_imm(IP1, (key * 8) as i64);
+    a.e(0xF860_6800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
+    let ready = a.cbnz(IP0);
+    a.stp_pre(FP, LR, SP, -16);
+    a.mov_imm64_fixed(IP1, slow);
+    a.blr(IP1);
+    a.ldp_post(FP, LR, SP, 16);
+    let at = a.pos();
+    a.patch(ready, at);
+    a.ldst(LDRX, 8, IP0, IP0, tls as i64);
+    a.add_any(IP0, IP0, ((id >> 16) * 8) as i64);
+    a.e(0xC8DF_FC00 | (IP0 as u32) << 5 | IP0 as u32); // ldar x16, [x16]
+    a.add_any(IP0, IP0, (id & 65535) as i64);
+    a.mov_imm(IP1, 1);
+    a.e(0x3900_0000 | (IP0 as u32) << 5 | IP1 as u32); // strb w17, [x16]
+    a.mov_imm64_fixed(IP0, body);
+    a.ldst(LDRX, 8, IP0, IP0, 0);
+    a.br(IP0);
     words_to_bytes(&a.w)
 }
 
