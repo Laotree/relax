@@ -6300,7 +6300,7 @@ impl<'a> Gen<'a> {
             0xffff_ffff => 32,
             _ => 0,
         };
-        if op == IOp::And && rd != ra && mask_bits != 0 && (w || mask_bits < 32) {
+        if op == IOp::And && mask_bits != 0 && (w || mask_bits < 32) {
             self.a.extend_from(rd, ra, mask_bits, false);
             self.fin_i(d, rd);
             return;
@@ -6348,12 +6348,34 @@ impl<'a> Gen<'a> {
             return;
         }
         match op {
-            IOp::Mul => {
+            IOp::Mul if k as i32 as i64 == k => {
                 // imul rd, ra, imm32
                 self.a.rex(true, rd, 0, ra, false);
                 self.a.byte(0x69);
                 self.a.modrm_rr(rd, ra);
                 self.a.u32(k as i32 as u32);
+            }
+            // a 64-bit operation's imm32 is sign-extended: a constant outside i32 (`x & 0xffff_ffff`
+            // in place, `x + (1 << 40)`) is applied from the scratch register, never truncated
+            IOp::Mul | IOp::Add | IOp::Sub | IOp::And | IOp::Or | IOp::Xor if k as i32 as i64 != k => {
+                self.a.mov_ri(R11, k);
+                self.a.mov_rr(rd, ra);
+                if op == IOp::Mul {
+                    // imul rd, r11
+                    self.a.rex(true, rd, 0, R11, false);
+                    self.a.byte(0x0f);
+                    self.a.byte(0xaf);
+                    self.a.modrm_rr(rd, R11);
+                } else {
+                    let opc = match op {
+                        IOp::Add => 0x01,
+                        IOp::Or => 0x09,
+                        IOp::And => 0x21,
+                        IOp::Sub => 0x29,
+                        _ => 0x31, // Xor
+                    };
+                    self.a.alu_rr(opc, rd, R11);
+                }
             }
             IOp::Rotl => {
                 // rol by k in the type's width (passes::rotl); narrow results are re-extended below
