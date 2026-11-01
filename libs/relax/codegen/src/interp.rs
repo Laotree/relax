@@ -465,7 +465,7 @@ fn selection() -> Option<&'static Sel> {
 
 /// The backends' hook: `Some(code)` when `f` runs in the interpreter -- the slot's code is then
 /// a jump to the function's entry thunk.
-pub fn maybe_compile(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64, tls_slow: u64, resume: u64) -> Option<(Vec<u8>, Vec<RelocAt>)> {
+pub fn maybe_compile(options: &relax_session::Options, f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64, tls_slow: u64, resume: u64) -> Option<(Vec<u8>, Vec<RelocAt>)> {
     let sel = selection()?;
     // a pattern matches a name containing it; `=name` matches that name only
     let m = |p: &String| match p.strip_prefix('=') {
@@ -479,7 +479,7 @@ pub fn maybe_compile(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64, tls_s
         return None;
     }
     let t0 = std::time::Instant::now();
-    let lowered = lower(f, slots, syms, sym_class);
+    let lowered = lower(options, f, slots, syms, sym_class);
     LOWER_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let (ifunc, persist) = match lowered {
         Ok(x) => x,
@@ -2170,6 +2170,88 @@ unsafe extern "C" fn h_call(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
     next!(pc.add(3), fp, cx)
 }
 
+/// [h, desc]: a call in tail position (`tail::sibling_calls`; no cleanup pad). An interpreted
+/// callee takes this frame's place on the interpreter stack and its code is jumped to, so a chain
+/// of tail calls runs in constant interpreter and native stack (its return is this frame's); any
+/// other callee is called, and its results are this frame's return.
+unsafe extern "C" fn h_tailcall(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
+    let d = &*(*pc.add(1) as *const CallDesc);
+    let f = tail_enter(d, fp, cx);
+    if f.is_null() {
+        return;
+    }
+    let f = &*f;
+    next!(f.code.as_ptr(), align_frame(fp, f.align), cx)
+}
+
+/// h_tailcall's work out of line (its argument buffer would cost the handler its tail jump): an
+/// interpreted callee's frame made in place of `fp`'s, its parameters set, returned; else the
+/// call made and its results put where a return puts them (null).
+#[inline(never)]
+unsafe fn tail_enter(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> *const IFunc {
+    let word = match d.target {
+        Target::Table(t) => *(t as *const u64),
+        Target::Cell(k) => *fp.add(k as usize),
+        Target::Addr(a) => a,
+    };
+    if d.csig.is_none() && !matches!(d.target, Target::Addr(_)) {
+        let f = resolve(d, word);
+        if !f.is_null() {
+            if COUNT {
+                (*cx).n[1] += 1;
+            }
+            let fr = &*f;
+            // the arguments first (they are read from the frame the callee's overwrites)
+            let mut buf = [0u64; 2 * 48];
+            let mut n = 0;
+            for &(cell, cls) in &d.args {
+                if cls == Cls::V128 {
+                    buf[n] = *fp.add(cell as usize);
+                    buf[n + 1] = *fp.add(cell as usize + 1);
+                    n += 2;
+                } else {
+                    buf[n] = arg_word(fp, cell);
+                    n += 1;
+                }
+            }
+            let fp2 = align_frame(fp, fr.align);
+            let top = fp2.add(fr.frame_words);
+            if top > (*cx).limit {
+                overflow();
+            }
+            (*cx).top = top;
+            let mut n = 0;
+            for (k, &(_, cls)) in d.args.iter().enumerate() {
+                let dst = fp2.add(fr.params[k].0 as usize);
+                *dst = buf[n];
+                n += 1;
+                if cls == Cls::V128 {
+                    *dst.add(1) = buf[n];
+                    n += 1;
+                }
+            }
+            return f;
+        }
+    }
+    if do_call(d, fp, cx) {
+        (*cx).unwinding = 1;
+        return std::ptr::null();
+    }
+    let (mut ni, mut nf) = (0usize, 0usize);
+    for &(cell, cls) in &d.rets {
+        let p = fp.add(cell as usize);
+        if cls == Cls::I {
+            (*cx).ret[ni] = *p;
+            ni += 1;
+        } else {
+            (*cx).ret[2 + 2 * nf] = *p;
+            (*cx).ret[3 + 2 * nf] = if cls == Cls::V128 { *p.add(1) } else { 0 };
+            nf += 1;
+        }
+    }
+    std::ptr::null()
+}
+
 /// Term::Resume: the cleanup pad is done; the frame unwinds into its caller
 unsafe extern "C" fn h_resume(_pc: *const u64, _fp: *mut u64, cx: *mut Cx) {
     (*cx).unwinding = 1;
@@ -2386,6 +2468,8 @@ struct Lw<'a> {
     /// memory base or a call argument read fp + offset; the SlotAddr itself is only lowered when
     /// another use needs the value in a cell)
     frame: Vec<Option<u32>>,
+    /// the call being lowered is in tail position (tail::sibling_calls): it ends the frame
+    tail_call: bool,
 }
 
 fn mem_load_kind(m: Mem) -> u8 {
@@ -2602,9 +2686,13 @@ fn coalesce(f: &Func) -> (Vec<u32>, std::collections::HashSet<(u32, u32)>) {
     (alias, skip)
 }
 
-fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<(IFunc, Persist), &'static str> {
+fn lower(options: &relax_session::Options, f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<(IFunc, Persist), &'static str> {
     let covered = relax_backend::passes::lower_coverage(f);
     let f = covered.as_ref().unwrap_or(f);
+    // calls in tail position become jumps, as the arm64 back end makes them (the same analysis:
+    // only moves of the results follow, no frame address escapes), so chains of calls run in
+    // constant interpreter and native stack
+    let tail = relax_backend::tail::sibling_calls(options, f, &relax_backend::regalloc::reachable(f), relax_backend::tail::Arch::Arm64);
     let (alias, skip) = coalesce(f);
     // frame: one cell per vreg (two for V128), then the stack slots, then C ABI buffers; an
     // aliased vreg shares its representative's cell
@@ -2809,7 +2897,7 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<(IFunc,
             }
         }
     }
-    let mut l = Lw { f, code: Vec::new(), fix: Vec::new(), cell, slot_off, frame_words, cur: String::new(), unwind_to: None, frame: frame_of, persist: Persist::default() };
+    let mut l = Lw { f, code: Vec::new(), fix: Vec::new(), cell, slot_off, frame_words, cur: String::new(), unwind_to: None, frame: frame_of, persist: Persist::default(), tail_call: false };
     let mut block_at = vec![0usize; f.blocks.len()];
     if !preload.is_empty() {
         let mut ws = vec![preload.len() as u64];
@@ -2870,7 +2958,15 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<(IFunc,
                 (Term::Invoke(_, u), true) => Some(*u),
                 _ => None,
             };
+            l.tail_call = tail.get(bi).copied().flatten() == Some(k);
             lower_inst(&mut l, i, slots, sym_class, &sym_val)?;
+            if l.tail_call {
+                break;
+            }
+        }
+        // a call in tail position ended the block: the moves and the return after it are its
+        if std::mem::take(&mut l.tail_call) {
+            continue;
         }
         if COUNT {
             l.cur = if fuse { "cmp+Branch (fused)".into() } else { format!("{:?}", b.term).split('(').next().unwrap_or("").to_string() };
@@ -3189,6 +3285,12 @@ fn lower_inst(l: &mut Lw, i: &Inst, slots: SlotsPtr, sym_class: u64, sym_val: &d
                 ic: AtomicPtr::new(std::ptr::null_mut()),
                 src,
             });
+            if l.tail_call {
+                l.emit(h_tailcall, &[Box::into_raw(d) as u64]);
+                let at = l.code.len() - 1;
+                l.persist.desc.push(at);
+                return Ok(());
+            }
             l.emit(h_call, &[Box::into_raw(d) as u64]);
             let at = l.code.len() - 1;
             l.persist.desc.push(at);
