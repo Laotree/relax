@@ -186,9 +186,9 @@ fn env_flag(name: &std::ffi::CStr, cell: &std::sync::atomic::AtomicU8, default: 
     #[cfg(unix)]
     let v = unsafe {
         extern "C" {
-            fn getenv(name: *const u8) -> *const u8;
+            fn getenv(name: *const core::ffi::c_char) -> *mut core::ffi::c_char;
         }
-        let p = getenv(name.as_ptr().cast());
+        let p = getenv(name.as_ptr()).cast::<u8>();
         if p.is_null() || *p.add(1) != 0 {
             default
         } else {
@@ -403,10 +403,10 @@ fn decide() -> bool {
     #[cfg(unix)]
     let off = unsafe {
         extern "C" {
-            fn getenv(name: *const u8) -> *const u8;
+            fn getenv(name: *const core::ffi::c_char) -> *mut core::ffi::c_char;
         }
         // std::env would allocate, and this runs inside the allocator's first routed call
-        let p = getenv(c"MAKEPAD_RUN_COMPILER_ARENA".as_ptr().cast());
+        let p = getenv(c"MAKEPAD_RUN_COMPILER_ARENA".as_ptr()).cast::<u8>();
         !p.is_null() && *p == b'0' && *p.add(1) == 0
     };
     #[cfg(not(unix))]
@@ -601,7 +601,7 @@ mod zone {
         fn malloc_zone_realloc(zone: *mut u8, p: *mut u8, size: usize) -> *mut u8;
         fn malloc_zone_memalign(zone: *mut u8, align: usize, size: usize) -> *mut u8;
         fn malloc_zone_free(zone: *mut u8, p: *mut u8);
-        fn free(p: *mut u8);
+        fn free(p: *mut core::ffi::c_void);
     }
 
     /// The head of libmalloc's `malloc_zone_t` (stable ABI): `size` answers 0 for a pointer the
@@ -653,7 +653,7 @@ mod zone {
         if owns(p) {
             malloc_zone_free(get(), p)
         } else {
-            free(p)
+            free(p.cast())
         }
     }
 
