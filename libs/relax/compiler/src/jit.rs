@@ -5382,6 +5382,7 @@ impl Unit {
                 let at = |base: u64| base + off as u64 * NC_STRIDE as u64;
                 self.slots.install(0, at(g.thunks), at(g.stubs), g.table + off as u64 * 8, tier);
                 nc_window_owner(off, self as *const Unit as usize);
+                verbose!("makepad-run no-codegen: {} unit takes slots {}..{} of the precompiled pool", if self.aux { "macro world" } else { "program" }, off, off + len);
                 (off, len)
             }
             #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
