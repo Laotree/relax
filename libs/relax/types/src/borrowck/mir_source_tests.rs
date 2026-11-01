@@ -441,18 +441,6 @@ fn a_tail_temporary_outlives_the_locals_before_edition_2024() {
     }
 }
 
-/// Probe: `UI_FILES=a.rs:b.rs cargo test zz_probe_files -- --nocapture` prints what the pipeline says about each.
-#[test]
-fn zz_probe_files() {
-    let Some(files) = std::env::var_os("UI_FILES") else { return };
-    for f in files.to_string_lossy().split(':') {
-        let src = std::fs::read_to_string(f).unwrap();
-        let r = std::panic::catch_unwind(|| borrowck_source(&src));
-        match r { Ok((e, u)) => eprintln!("PROBE {f}: errors {} {:?} unchecked {:?}", e.len(), e.iter().map(|x| x.chars().take(std::env::var("PROBE_W").ok().and_then(|w| w.parse().ok()).unwrap_or(60)).collect::<String>()).collect::<Vec<_>>(), u),
-                  Err(_) => eprintln!("PROBE {f}: harness panic (typeck/front errors?)") }
-    }
-}
-
 #[test]
 fn a_higher_ranked_where_clause_on_an_associated_type_is_a_verify_bound() {
     let (errors, unchecked) = borrowck_source("

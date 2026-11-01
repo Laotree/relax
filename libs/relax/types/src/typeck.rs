@@ -534,6 +534,9 @@ pub struct Fcx<'a> {
     forced_autoref: Option<u8>,
     /// the expected type of the method call being checked (check_method's expectation)
     method_expected: Option<TyId>,
+    /// where the name of the method being probed is written (its span's edition decides
+    /// `#[rustc_skip_during_method_dispatch]`, probe.rs:2018-2035); u32::MAX: no method name
+    method_name_lo: u32,
     /// coercions to a `dyn` pointer whose source pointee was still open: (expr, actual,
     /// expected, pos), decided in `finish`
     deferred_dyn: Vec<(ExprId, TyId, TyId, u32)>,
@@ -811,6 +814,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         stalled_coroutine_goals: Vec::new(),
         forced_autoref: None,
         method_expected: None,
+        method_name_lo: u32::MAX,
     };
     fcx.init_body_regions();
     let penv = tcx.param_env_id(prog, def);
@@ -6499,6 +6503,7 @@ impl<'a> Fcx<'a> {
         if matches!(self.tcx.tys.kind(cur), TyKind::Error) { return self.tcx.tys.error; }
         let ts = self.ty_str(t);
         // expr.rs check_expr_field: a method of that name is E0615, a primitive has no fields (E0610)
+        self.method_name_lo = name.lo;
         if !self.tcx.tys.has_error(cur) && matches!(self.pick_all_method(e, t, s, lo), Ok(Some(_))) {
             self.err(lo, format!("E0615: attempted to take value of method `{}` on type `{}`", self.text(name), ts));
         } else if matches!(self.tcx.tys.kind(self.shallow(t)), TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Int(_) | TyKind::Float(_) | TyKind::IntVar(_) | TyKind::FloatVar(_)) {
@@ -7030,16 +7035,17 @@ impl<'a> Fcx<'a> {
         // this call's expectation only (nested calls in the receiver set their own)
         let method_expected = self.method_expected.take();
         let s = self.sym(name);
-        self.check_method_sym(e, recv, s, turbofish, args, None, lo, method_expected)
+        self.check_method_sym(e, recv, s, name.lo, turbofish, args, None, lo, method_expected)
     }
 
     /// A method call by name; `extra` is the type of one more argument after `args` that has no
     /// expression (built-in macros: `write!(w, ..)` is `w.write_fmt(format_args!(..))`).
-    fn check_method_sym(&mut self, e: ExprId, recv: ExprId, s: Sym, turbofish: GenericArgsId, args: &[ExprId], extra: Option<TyId>, lo: u32, method_expected: Option<TyId>) -> TyId {
+    fn check_method_sym(&mut self, e: ExprId, recv: ExprId, s: Sym, name_lo: u32, turbofish: GenericArgsId, args: &[ExprId], extra: Option<TyId>, lo: u32, method_expected: Option<TyId>) -> TyId {
         self.extra_arg = extra;
         let rt = self.check_expr(recv, None);
         let error = self.tcx.tys.error;
         self.retry_goals(false);
+        self.method_name_lo = name_lo;
         let pick = match self.pick_all_method(e, rt, s, lo) {
             Ok(Some(pick)) => pick,
             Ok(None) => {

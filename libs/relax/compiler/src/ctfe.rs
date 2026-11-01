@@ -1451,6 +1451,8 @@ impl<'a> Ctx<'a> {
                 return Some(args[0].clone());
             }
             let value = match self.u.prog.name(d) {
+                // (a type of 4 GiB or more: its exact size; a SizeOverflow is the JIT path's error)
+                "size_of" if args.is_empty() && self.u.is_too_big(*gargs.first()?) => self.u.saturated_size(*gargs.first()?)?,
                 "size_of" if args.is_empty() => {
                     let l = self.layout(*gargs.first()?);
                     crate::layout::round_up(l.size, l.align) as u64
