@@ -1,3 +1,6 @@
+// Unit tests and documentation examples require the macOS runtime.
+#![cfg(any(target_os = "macos", not(any(test, doctest))))]
+
 mod malloc_buf;
 
 pub use encode::{Encode, EncodeArguments, Encoding};

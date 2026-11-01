@@ -86,6 +86,19 @@ struct Target {
     harness: bool,
 }
 
+impl Target {
+    fn enabled(&self, features: &BTreeSet<String>, explicit: bool) -> Result<bool, String> {
+        if self.required_features.iter().all(|f| features.contains(f)) {
+            return Ok(true);
+        }
+        if explicit {
+            return Err(format!("target `{}` requires the features: {}\nConsider enabling them by passing, e.g., `--features=\"{}\"`",
+                self.name, self.required_features.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", "), self.required_features.join(" ")));
+        }
+        Ok(false)
+    }
+}
+
 /// A git dependency's source: its repository (as the manifest spells the URL) and reference.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct GitSrc {
@@ -247,6 +260,10 @@ impl Manifest {
     }
     fn has_dep(&self, key: &str) -> bool {
         self.deps.iter().any(|d| d.key == key)
+    }
+    fn implicit_features(&self) -> BTreeSet<String> {
+        let hidden: BTreeSet<&str> = self.features.values().flatten().filter_map(|v| v.strip_prefix("dep:")).collect();
+        self.deps.iter().filter(|d| d.optional && !hidden.contains(d.key.as_str())).map(|d| d.key.clone()).collect()
     }
 }
 
@@ -1075,18 +1092,29 @@ impl Resolver {
     }
 }
 
-/// The test programs of the workspace member `package`: whether it has a lib target, its bin
-/// targets with `harness = true`, and its integration test targets by name with their source paths
+/// The enabled test programs of the workspace member `package`: its lib target, bin targets,
+/// and integration test targets by name with their source paths
 /// (cargo test's order: the lib's unit tests, the bins' unit tests, then the test targets by name).
-/// The package's lib path, bins and integration tests: (name, path, harness) each.
-pub fn test_targets(sess: &std::sync::Arc<crate::Session>, dir: &str, package: &str) -> Result<(Option<String>, Vec<(String, String, bool)>, Vec<(String, String, bool)>), String> {
+/// The package's lib path, bins and integration tests: (name, path, harness) each. Missing
+/// required features skip implicit targets and reject explicitly named targets before any run.
+pub fn test_targets(sess: &std::sync::Arc<crate::Session>, dir: &str, package: &str, flags: &[String], bin_names: &[String], test_names: &[String]) -> Result<(Option<String>, Vec<(String, String, bool)>, Vec<(String, String, bool)>), String> {
+    let o = parse_flags(flags)?;
     let mut r = Resolver::new(sess, dir)?;
     let i = r.find_member(package)?;
     let m = &r.manifests[i];
-    let mut bins: Vec<(String, String, bool)> = m.bins.iter().map(|t| (t.name.clone(), t.path.clone(), t.harness)).collect();
-    bins.sort();
-    let mut tests: Vec<(String, String, bool)> = m.tests.iter().map(|t| (t.name.clone(), t.path.clone(), t.harness)).collect();
-    tests.sort();
+    let features = enabled_features(&m.features, &m.implicit_features(), &o).map_err(|e| format!("package `{package}`: {e}"))?;
+    let enabled = |targets: &[Target], names: &[String]| -> Result<Vec<(String, String, bool)>, String> {
+        let mut out = Vec::new();
+        for t in targets {
+            if t.enabled(&features, names.contains(&t.name))? {
+                out.push((t.name.clone(), t.path.clone(), t.harness));
+            }
+        }
+        out.sort();
+        Ok(out)
+    };
+    let bins = enabled(&m.bins, bin_names)?;
+    let tests = enabled(&m.tests, test_names)?;
     Ok((m.lib.as_ref().map(|l| l.path.clone()), bins, tests))
 }
 
@@ -1390,6 +1418,58 @@ enum Req {
     DepFeature(String, String, bool),
 }
 
+impl Req {
+    fn parse(value: &str) -> Self {
+        if let Some(d) = value.strip_prefix("dep:") {
+            Self::Dep(d.to_string())
+        } else if let Some((d, f)) = value.split_once("?/") {
+            Self::DepFeature(d.to_string(), f.to_string(), true)
+        } else if let Some((d, f)) = value.split_once('/') {
+            Self::DepFeature(d.to_string(), f.to_string(), false)
+        } else {
+            Self::Feature(value.to_string())
+        }
+    }
+}
+
+fn feature_requests(features: &BTreeMap<String, Vec<String>>, implicit: &BTreeSet<String>, o: &Options) -> Vec<Req> {
+    let mut work = Vec::new();
+    if !o.no_default_features {
+        work.push(Req::Feature("default".to_string()));
+    }
+    if o.all_features {
+        work.extend(features.keys().chain(implicit).cloned().map(Req::Feature));
+    }
+    work.extend(o.features.iter().map(|f| Req::parse(f)));
+    work
+}
+
+/// Package-local feature closure for target selection, without resolving or fetching dependencies.
+/// Dependency features are not local features; a strong `dep/feature` can enable an implicit
+/// optional-dependency feature, while `dep:dep` and `dep?/feature` cannot.
+fn enabled_features(features: &BTreeMap<String, Vec<String>>, implicit: &BTreeSet<String>, o: &Options) -> Result<BTreeSet<String>, String> {
+    let mut enabled = BTreeSet::new();
+    let mut work = feature_requests(features, implicit, o);
+    while let Some(req) = work.pop() {
+        match req {
+            Req::Feature(f) => {
+                if enabled.contains(&f) { continue; }
+                if let Some(values) = features.get(&f) {
+                    enabled.insert(f);
+                    work.extend(values.iter().map(|v| Req::parse(v)));
+                } else if implicit.contains(&f) {
+                    enabled.insert(f);
+                } else if f != "default" {
+                    return Err(format!("has no feature `{f}`"));
+                }
+            }
+            Req::DepFeature(d, _, false) if implicit.contains(&d) => work.push(Req::Feature(d)),
+            _ => {}
+        }
+    }
+    Ok(enabled)
+}
+
 pub struct Options {
     pub offline: bool,
     pub no_default_features: bool,
@@ -1431,7 +1511,7 @@ pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
             "--all-features" => o.all_features = true,
             "--features" | "-F" => {
                 let v = value(&mut i)?;
-                o.features.extend(v.split([',', ' ']).filter(|x| !x.is_empty()).map(str::to_string));
+                o.features.extend(v.split(|c: char| c == ',' || c.is_whitespace()).filter(|x| !x.is_empty()).map(str::to_string));
             }
             "--bins" => bins = true,
             "--bin" => bin_names.push(value(&mut i)?),
@@ -1446,8 +1526,8 @@ pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
             "--release" => {}
             "--offline" | "--frozen" => o.offline = true,
             _ => {
-                if let Some(v) = f.strip_prefix("--features=") {
-                    o.features.extend(v.split([',', ' ']).filter(|x| !x.is_empty()).map(str::to_string));
+                if let Some(v) = f.strip_prefix("--features=").or_else(|| f.strip_prefix("-F").map(|v| v.trim_start_matches('='))) {
+                    o.features.extend(v.split(|c: char| c == ',' || c.is_whitespace()).filter(|x| !x.is_empty()).map(str::to_string));
                 } else if let Some(v) = f.strip_prefix("--bin=") {
                     bin_names.push(v.to_string());
                 } else if let Some(v) = f.strip_prefix("--test=") {
@@ -1584,16 +1664,7 @@ impl<'a> Feat<'a> {
                     if let Some(vals) = fvals {
                         self.node(k).features.insert(f);
                         for v in vals {
-                            let r = if let Some(d) = v.strip_prefix("dep:") {
-                                Req::Dep(d.to_string())
-                            } else if let Some((d, f2)) = v.split_once("?/") {
-                                Req::DepFeature(d.to_string(), f2.to_string(), true)
-                            } else if let Some((d, f2)) = v.split_once('/') {
-                                Req::DepFeature(d.to_string(), f2.to_string(), false)
-                            } else {
-                                Req::Feature(v)
-                            };
-                            self.work.push((k, r));
+                            self.work.push((k, Req::parse(&v)));
                         }
                     } else if opt && !syntax {
                         // the implicit feature of an optional dependency
@@ -1748,28 +1819,8 @@ pub fn unit_graph_with(sess: &std::sync::Arc<crate::Session>, workspace: &str, p
     let rk = (root, false);
     let mut f = Feat { r: &mut r, dev_of: o.test.as_ref().map(|_| rk), nodes: HashMap::new(), work: Vec::new(), order: Vec::new() };
     f.activate(rk)?;
-    if !o.no_default_features {
-        f.work.push((rk, Req::Feature("default".to_string())));
-    }
-    if o.all_features {
-        let m = &f.r.manifests[root];
-        let mut all: Vec<String> = m.features.keys().cloned().collect();
-        for d in &m.deps {
-            if d.optional && !m.dep_syntax(&d.key) {
-                all.push(d.key.clone());
-            }
-        }
-        for x in all {
-            f.work.push((rk, Req::Feature(x)));
-        }
-    }
-    for x in &o.features {
-        let req = match x.split_once('/') {
-            Some((d, ft)) => Req::DepFeature(d.to_string(), ft.to_string(), false),
-            None => Req::Feature(x.clone()),
-        };
-        f.work.push((rk, req));
-    }
+    let m = &f.r.manifests[root];
+    f.work.extend(feature_requests(&m.features, &m.implicit_features(), &o).into_iter().map(|req| (rk, req)));
     f.run()?;
     let (nodes, order) = (std::mem::take(&mut f.nodes), std::mem::take(&mut f.order));
     emit(&r, &nodes, &order, root, &o)
@@ -1835,7 +1886,7 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
                 if !names.is_empty() && !names.contains(&bt.name) {
                     continue;
                 }
-                if !bt.required_features.iter().all(|f| rn.features.contains(f)) {
+                if !bt.enabled(&rn.features, !names.is_empty())? {
                     continue;
                 }
                 // `harness = false` bins (no libtest main): `--bins` builds the harness ones; `makepad
@@ -1856,7 +1907,7 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
                 if !names.is_empty() && !names.contains(&tt.name) {
                     continue;
                 }
-                if !tt.required_features.iter().all(|f| rn.features.contains(f)) {
+                if !tt.enabled(&rn.features, !names.is_empty())? {
                     continue;
                 }
                 // `harness = false` (cargo: `--cfg test`, no `--test`, run as a plain program): `--tests`
@@ -1871,7 +1922,7 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
     }
     let mut bins = Vec::new();
     for (bi, bt) in r.manifests[root].bins.iter().enumerate() {
-        if !bt.required_features.iter().all(|f| rn.features.contains(f)) {
+        if !bt.enabled(&rn.features, o.test.is_none() && o.bin.as_ref() == Some(&bt.name))? {
             continue;
         }
         if o.test.is_some() {
@@ -1998,6 +2049,71 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
 #[cfg(test)]
 mod root_tests {
     use super::*;
+
+    #[test]
+    fn required_features_follow_package_feature_flags() {
+        let manifest = parse_toml(r#"
+[dependencies]
+optional = { version = "1", optional = true }
+hidden = { version = "1", optional = true }
+[features]
+default = ["a"]
+a = ["b"]
+b = ["a"]
+manual = []
+forwarded = ["dep:hidden", "optional?/foreign"]
+strong = ["optional/foreign"]
+[[test]]
+name = "gated"
+required-features = ["b", "manual"]
+"#).unwrap().root;
+        let definitions = table(&manifest, "features").unwrap();
+        let features = definitions.keys().map(|k| (k.clone(), strs(definitions, k))).collect();
+        let implicit = BTreeSet::from(["optional".to_string()]);
+        let target = &manifest.get("test").unwrap().as_array_of_tables().unwrap()[0];
+        let target = Target {
+            name: s(target, "name").unwrap(), path: String::new(), edition: "2021".into(),
+            kind: vec!["test".into()], required_features: strs(target, "required-features"), harness: true,
+        };
+        let enabled = |flags: &[&str]| {
+            let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            enabled_features(&features, &implicit, &parse_flags(&flags).unwrap()).unwrap()
+        };
+        assert_eq!(enabled(&[]), BTreeSet::from(["default".into(), "a".into(), "b".into()]));
+        assert!(enabled(&["--no-default-features"]).is_empty());
+        assert!(!target.enabled(&enabled(&[]), false).unwrap());
+        assert_eq!(target.enabled(&enabled(&[]), true).unwrap_err(),
+            "target `gated` requires the features: `b`, `manual`\nConsider enabling them by passing, e.g., `--features=\"b manual\"`");
+        for flags in [
+            vec!["--features", "manual"],
+            vec!["-F", "manual"],
+            vec!["--features=manual"],
+            vec!["-Fmanual"],
+            vec!["--no-default-features", "--features", "a,manual"],
+            vec!["--no-default-features", "-F", "a\tmanual"],
+            vec!["--no-default-features", "-F", "a", "--features", "manual"],
+            vec!["--no-default-features", "--all-features"],
+        ] {
+            let set = enabled(&flags);
+            assert!(target.enabled(&set, false).unwrap(), "{flags:?}");
+            assert!(target.enabled(&set, true).unwrap(), "{flags:?}");
+        }
+        assert!(!target.enabled(&enabled(&["--no-default-features", "-F", "manual"]), false).unwrap());
+        assert_eq!(enabled(&["--no-default-features", "-F", "forwarded"]), BTreeSet::from(["forwarded".into()]));
+        assert_eq!(enabled(&["--no-default-features", "-F", "strong"]), BTreeSet::from(["strong".into(), "optional".into()]));
+        assert_eq!(enabled(&["--no-default-features", "-F", "optional/foreign"]), BTreeSet::from(["optional".into()]));
+        let all = enabled(&["--all-features"]);
+        assert!(all.contains("default") && all.contains("optional"));
+        assert!(!all.contains("hidden") && !all.contains("foreign"));
+        let mut bin = target.clone();
+        bin.kind = vec!["bin".into()];
+        bin.harness = false;
+        assert!(!bin.enabled(&enabled(&[]), false).unwrap());
+        assert!(bin.enabled(&all, true).unwrap());
+        bin.required_features.clear();
+        assert!(bin.enabled(&BTreeSet::new(), false).unwrap());
+        assert!(bin.enabled(&BTreeSet::new(), true).unwrap());
+    }
 
     fn tree(name: &str, files: &[(&str, &str)]) -> String {
         let root = std::env::temp_dir().join(format!("relax-resolve-{}-{}", name, std::process::id()));

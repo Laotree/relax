@@ -1970,8 +1970,9 @@ impl<'a> Parser<'a> {
         }
         let trailing = delim != b'{' && (self.kind() == T::CloseBrace || (self.kind() == T::Eof && !self.expansion_semi));
         // rustc_parse `parse_stmt_mac`: a call ending its block without `;` is an expression statement,
-        // expanded as one expression (an `Eof` after it is the end of an enclosing expansion: a statement)
-        let tail_expr = delim != b'{' && self.kind() == T::CloseBrace && def.builtin == 0 && crate::lexer::validation_enabled() && (lo as usize) < self.src.len();
+        // expanded as one expression (an `Eof` after it is the end of an enclosing expansion: a statement),
+        // in a run as in a check: the block's value is the expression's
+        let tail_expr = delim != b'{' && self.kind() == T::CloseBrace && def.builtin == 0 && (lo as usize) < self.src.len();
         let had_semi = self.eat(T::Semi);
         self.include_as_expr = as_expr;
         self.cfg_select_rest.borrow_mut().clear();

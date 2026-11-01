@@ -45,6 +45,12 @@ static MAIN_START_MS: AtomicU64 = AtomicU64::new(0);
 static ERRORS_SEEN: AtomicU64 = AtomicU64::new(0);
 static QUIET: AtomicBool = AtomicBool::new(false);
 static SILENT: AtomicBool = AtomicBool::new(false);
+
+/// `--silent`: nothing of Relax's own on stderr but errors (a program re-running itself, a
+/// binary's wrapper script).
+pub(crate) fn silent() -> bool {
+    SILENT.load(Ordering::Relaxed)
+}
 /// This run is a live session (watcher and hot reload: a failed build is fixed by an edit).
 static LIVE_SESSION: AtomicBool = AtomicBool::new(false);
 
@@ -1258,6 +1264,15 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     } else {
         Vec::new()
     };
+    // Every test target is a binary of its own (cargo builds and runs each apart), and a process
+    // has one global allocator: targets that link different `#[global_allocator]`s cannot share
+    // this program, so each runs as a `makepad test` run of its own
+    if harness && test_subjects.len() > 1 {
+        let first = jit::global_allocator_linked_by(&prog, test_subjects[0]);
+        if test_subjects.iter().any(|&k| jit::global_allocator_linked_by(&prog, k) != first) {
+            return run_targets_apart(&g, &units, &crate_of, root);
+        }
+    }
     if !test_subjects.is_empty() {
         let mut own = vec![false; prog.crates.len()];
         for &k in &test_subjects { prog.crates[k as usize].validate = true; own[k as usize] = true; }
@@ -1412,7 +1427,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let want = canon(path);
         let Some(ci) = (0..g.crates.len()).find(|&ci| crate_of[ci] != u32::MAX && canon(&g.crates[ci].src_path) == want) else {
             // not in the graph: its `required-features` are off (cargo builds and runs nothing)
-            eprintln!("makepad-run: {path}: not built (its required features are off)");
+            verbose!("makepad-run: {path}: not built (its required features are off)");
             return 0;
         };
         match find_main(&prog, crate_of[ci]) {
@@ -1490,7 +1505,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if let Some((saved_prog, saved_tcx, _)) = verification_graph {
         saved_prog.verify_collected(&u.prog);
         saved_tcx.verify_collected(&saved_prog, &u.prog, &u.tcx);
-        eprintln!("makepad-run collected: verified restored graph against rebuilt graph");
+        verbose!("makepad-run collected: verified restored graph against rebuilt graph");
     }
     let enum_errors = u.tcx.check_enum_discriminants(&u.prog, root_crate);
     if !enum_errors.is_empty() {
@@ -1536,7 +1551,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 unsafe { std::env::set_var("MAKEPAD_RUN_CACHE_STATE", if c.has_startup_manifest() { "warm" } else { "cold" }) };
                 u.cache = Some(Box::new(crate::cache::CacheCell::new(c)));
             }
-            Err(e) => eprintln!("makepad-run cache: off ({})", e),
+            Err(e) => verbose!("makepad-run cache: off ({})", e),
         }
     }
     phase("image", t);
@@ -1548,7 +1563,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         phase("test check", t_check);
         if n > 0 {
             let names: Vec<String> = test_subjects.iter().map(|&k| u.prog.syms.str(u.prog.crates[k as usize].name).to_string()).collect();
-            eprintln!("error: could not compile {} (test) due to {} previous error{}: no test ran (rustc rejects this code; `makepad test` fails as `cargo test` does)",
+            eprintln!("error: could not compile {} (test) due to {} previous error{}: no test ran (`makepad test` fails as `cargo test` does on code rustc rejects; if `cargo test` builds it, this is a makepad run bug)",
                 names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", "), n, if n == 1 { "" } else { "s" });
             std::mem::forget(u);
             return 101;
@@ -1965,6 +1980,65 @@ static HOSTED_RUN: AtomicBool = AtomicBool::new(false);
 /// `makepad run --harness` (`makepad test`): the program is a test harness.
 static HARNESS_RUN: AtomicBool = AtomicBool::new(false);
 
+/// `makepad run --harness` over targets that link different global allocators: each test or bin
+/// target of the graph again in a run of its own (this command line with that one target
+/// selected), one after the other; their combined verdict. The root lib (an integration test
+/// graph's plain lib) has no tests of its own and is not run.
+fn run_targets_apart(g: &unitgraph::Graph, units: &unitgraph::Units, crate_of: &[u32], root: u32) -> i32 {
+    let raw: Vec<String> = crate::os::proc::args_bytes().iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    let dash = raw.iter().position(|a| a == "--").unwrap_or(raw.len());
+    // the command line without its target selection
+    let mut base: Vec<String> = Vec::new();
+    let mut i = 1;
+    while i < dash {
+        let a = raw[i].as_str();
+        if matches!(a, "--lib" | "--bins" | "--tests") || a.starts_with("--test=") || a.starts_with("--bin=") {
+        } else if matches!(a, "--test" | "--bin") {
+            i += 1;
+        } else {
+            base.push(raw[i].clone());
+        }
+        i += 1;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("makepad test: the loader's own path is unknown");
+        return 101;
+    };
+    let mut code = 0;
+    let mut cis: Vec<usize> = std::iter::once(g.root).chain(g.bins.iter().copied()).collect();
+    cis.dedup();
+    for ci in cis {
+        let k = crate_of[ci];
+        let p = &g.crates[ci].src_path;
+        let Some(unit) = units.units.iter().find(|u| &u.src_path == p && u.kind.iter().any(|t| t == "test" || t == "bin")) else {
+            // the lib: a run of its unit tests is its own `--lib` selection
+            if k != root || !raw[1..dash].iter().any(|a| a == "--lib") { continue }
+            code = code.max(run_apart(&exe, &base, &["--lib".to_string()], &raw[dash..]));
+            continue;
+        };
+        let sel = if unit.kind.iter().any(|t| t == "test") {
+            vec!["--test".to_string(), unit.name.clone()]
+        } else {
+            vec!["--bins".to_string(), "--bin".to_string(), unit.name.clone()]
+        };
+        code = code.max(run_apart(&exe, &base, &sel, &raw[dash..]));
+    }
+    code
+}
+
+fn run_apart(exe: &std::path::Path, base: &[String], sel: &[String], tail: &[String]) -> i32 {
+    let status = std::process::Command::new(exe).args(base).args(sel).args(tail)
+        .env_remove("MAKEPAD_RUN_SELF_EXEC").env_remove("MAKEPAD_RUN_SELF_EXEC_SILENT_ADDED").status();
+    match status {
+        Ok(s) if s.success() => 0,
+        Ok(_) => 101,
+        Err(e) => {
+            eprintln!("makepad test: starting {}: {e}", exe.display());
+            101
+        }
+    }
+}
+
 /// `makepad test`: the crates under test (the lib or bins built cfg(test), the integration test
 /// targets) are type- and borrow-checked whole before any test runs, as `cargo test` compiles
 /// them first: an unresolved import or a type error anywhere in them fails the run, not only the
@@ -2237,9 +2311,7 @@ fn spill_cache() {
         std::thread::spawn(move || { let _z = crate::zone_alloc::compiler_thread();
             let t = Instant::now();
             let r = s.write();
-            if !VERBOSE.load(Ordering::Relaxed) {
-                if let Err(e) = &r { eprintln!("makepad-run cache: spill: {}", e); }
-            }
+            if let Err(e) = &r { verbose!("makepad-run cache: spill: {}", e); }
             if crate::memstat::enabled() || crate::preload::trace() {
                 verbose!("makepad-run cache: spilled {:?} entries in {:.1} ms at t={:.0} ms", r, t.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start());
             }
@@ -3477,9 +3549,7 @@ fn summary_inner(why: &str) {
                         verbose!("makepad-run collected: not recorded at exit: the front end is still read by another thread");
                     }
                 }
-                if !options.verbose {
-                    if let Err(e) = &r { eprintln!("makepad-run cache: write: {}", e); }
-                }
+                if let Err(e) = &r { verbose!("makepad-run cache: write: {}", e); }
                 let st = &c.stats;
                 verbose!(
                     "makepad-run cache: {} hits, {} misses, {} link failures, {} refused by their dependency certificate (per-item cpu: body digests {:.1} ms, certificates written {:.1} ms, checked {:.1} ms) (link {:.1} ms wall with the lock; by speculative workers {} hits {:.1} ms), {} recorded, {} not storable {:?}; written {:?} in {:.1} ms",
