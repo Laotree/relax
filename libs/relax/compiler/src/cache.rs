@@ -2340,14 +2340,16 @@ impl Cache {
         let clean = deps::Deps::clean_crates(prog, &self.iface_plain, stored.as_ref());
         let mut digested = digest(&clean, &mut self.digests);
         let t_dg = t0.elapsed();
-        let built = deps::Deps::build(prog, &self.digests, &self.iface_plain, valid, stored.as_ref());
+        // the item graph lives as long as the program (a settle rebuild's new cache inherits
+        // it): built in the slot arena, it never pins the cold state's compiler chunks
+        let built = crate::zone_alloc::slots_with(|| deps::Deps::build(prog, &self.digests, &self.iface_plain, valid, stored.as_ref()));
         let over = built.is_some() && clean.iter().any(|&c| c);
         let g = match built {
             Some(g) => g,
             None => {
                 // the alias or macro names changed: every crate is walked
                 digested += digest(&[], &mut self.digests);
-                deps::Deps::build(prog, &self.digests, &self.iface_plain, valid, None).expect("a graph built from scratch")
+                crate::zone_alloc::slots_with(|| deps::Deps::build(prog, &self.digests, &self.iface_plain, valid, None)).expect("a graph built from scratch")
             }
         };
         if self.verbose {
@@ -2368,7 +2370,7 @@ impl Cache {
             self.pending_keys.insert(k);
             self.push_pending(root, NewEntry { key: k, kind: KIND_DEPS, payload: g.encode() });
         }
-        let g = std::sync::Arc::new(g);
+        let g = crate::zone_alloc::slots_with(|| std::sync::Arc::new(g));
         self.deps = Some(g.clone());
         g
     }
@@ -5870,7 +5872,7 @@ impl ColdFront {
     }
 
     #[cfg(test)]
-    fn finish_in(&mut self, prog: &mut crate::program::Program, dir: PathBuf) {
+    pub(crate) fn finish_in(&mut self, prog: &mut crate::program::Program, dir: PathBuf) {
         self.finish_mode(prog, dir, false);
     }
 
@@ -8299,7 +8301,7 @@ impl Linker {
             // O3 entries register theirs at install (cached_tier1)
             for &c in &inl {
                 if c != id && (c as usize) < u.fns.len() && !u.fns[c as usize].history().inlined_into.contains(&id) {
-                    crate::zone_alloc::kept_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(id));
+                    crate::zone_alloc::slots_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(id));
                 }
             }
         }

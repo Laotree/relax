@@ -652,8 +652,9 @@ pub fn report(label: &str) -> String {
     let (rss, hwm, extra) = process_rss();
     let (committed, live, chunks) = crate::zone_alloc::burst_stats();
     let (ccommitted, clive, cchunks) = crate::zone_alloc::compiler_stats();
+    let (scommitted, slive, schunks) = crate::zone_alloc::slots_stats();
     let mut out = format!(
-        "makepad-run mem: {}: rss {} MB (peak {} MB; {}); counted heap live {:.0} MB, peak {:.0} MB, {:.0} MB allocated in {} blocks; burst arena: committed {} MB, live {} MB, chunks {}; compiler arena: committed {} MB, live {} MB, chunks {}\n",
+        "makepad-run mem: {}: rss {} MB (peak {} MB; {}); counted heap live {:.0} MB, peak {:.0} MB, {:.0} MB allocated in {} blocks; burst arena: committed {} MB, live {} MB, chunks {}; compiler arena: committed {} MB, live {} MB, chunks {}; slot arena: committed {} MB, live {} MB, chunks {}\n",
         label,
         mb(rss),
         mb(hwm),
@@ -667,7 +668,10 @@ pub fn report(label: &str) -> String {
         chunks,
         mb(ccommitted as u64),
         mb(clive as u64),
-        cchunks
+        cchunks,
+        mb(scommitted as u64),
+        mb(slive as u64),
+        schunks
     );
     if !enabled() {
         return out;

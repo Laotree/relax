@@ -2875,6 +2875,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 if n != burst_seen {
                     burst_seen = n;
                     crate::zone_alloc::burst_trim();
+                    crate::zone_alloc::slots_trim();
                 }
                 burst_at = Instant::now();
             }
