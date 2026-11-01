@@ -111,8 +111,8 @@ fn heap_in_use() -> u64 {
 }
 
 #[test]
-fn teardown_fixture_cycles_and_leaked_thread() {
-    isolated_test!(teardown_fixture_cycles_and_leaked_thread);
+fn teardown_fixture_cycles_and_retiring_thread() {
+    isolated_test!(teardown_fixture_cycles_and_retiring_thread);
     let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (mut u, entry, root) = fixture();
     let mut id = None;
@@ -130,11 +130,13 @@ fn teardown_fixture_cycles_and_leaked_thread() {
         assert!(live.arena_in_use >= 2 * 1024 * 1024);
         assert!(live.arena_committed > 0 && live.static_committed > 0);
         let before = freed_by_teardown();
-        let stop = std::thread::spawn(move || stop_for(domain, Duration::from_secs(30)).unwrap());
+        let stop = std::thread::spawn(move || stop(domain, Stop::Quit).unwrap());
         wait(|| cancelled(domain));
         assert!(blocks().contains(&base));
         flags[1].store(1, Ordering::SeqCst);
         stop.join().unwrap();
+        // the worker outlives the app's main: its end (TLS drop, then teardown) completes the domain
+        wait_thread_done(domain);
         assert_eq!(flags[2].load(Ordering::SeqCst), 1, "TLS drop ran before teardown");
         let dead = info(domain).unwrap();
         assert_eq!(
@@ -163,19 +165,19 @@ fn teardown_fixture_cycles_and_leaked_thread() {
         let _ = cycle;
     }
 
-    // No cooperative completion: timeout must retain every allocation and the static block.
+    // No cooperative completion yet: retire without blocking the replacement,
+    // retain every allocation until the registered thread and its TLS end.
     let flags = [const { AtomicU64::new(0) }; 4];
     let (domain, base, main) = launch(&mut u, entry, id, &flags);
     main.join().unwrap();
     wait(|| flags[0].load(Ordering::SeqCst) != 0);
     let before = info(domain).unwrap();
     let freed = freed_by_teardown();
-    stop_for(domain, Duration::ZERO).unwrap();
-    let leaked = info(domain).unwrap();
-    assert_eq!(leaked.state, DomainState::Leaked { threads: 1 });
-    assert_eq!(leaked.arena_in_use, before.arena_in_use);
-    assert_eq!(leaked.arena_committed, before.arena_committed);
-    assert_eq!(leaked.base, base);
+    retire(domain).unwrap();
+    let retiring = info(domain).unwrap();
+    assert_eq!(retiring.arena_in_use, before.arena_in_use);
+    assert_eq!(retiring.arena_committed, before.arena_committed);
+    assert_eq!(retiring.base, base);
     assert_eq!(freed_by_teardown(), freed);
     assert!(prepare(&AppSpec {
         id: Some(domain),
@@ -183,22 +185,148 @@ fn teardown_fixture_cycles_and_leaked_thread() {
     })
     .is_err());
     assert!(still_owned(domain).is_some_and(|why| why.contains("1 threads still alive: fixture-worker")));
-    // A timeout's retained memory stays retained even after the thread subsequently ends; it
-    // must never be reclaimed by a delayed callback. The ended run hands its id over (a
-    // relaunch): the new run gets a block of its own, the retired one stays mapped.
+    let next_flags = [const { AtomicU64::new(0) }; 4];
+    let (replacement, next_base, next_main) = launch(&mut u, entry, None, &next_flags);
+    assert_ne!(replacement, domain);
+    assert_ne!(next_base, base);
+    next_main.join().unwrap();
+    wait(|| next_flags[0].load(Ordering::SeqCst) != 0);
+    assert!(blocks().contains(&base));
+    // The old thread still reads its own statics and runs its TLS destructor;
+    // only its final registration releases the old mapping.
     flags[1].store(1, Ordering::SeqCst);
-    wait(|| info(domain).unwrap().threads == 0);
-    assert!(wait_thread_done(domain, Duration::ZERO));
+    wait_thread_done(domain);
+    assert_eq!(flags[2].load(Ordering::SeqCst), 1);
     assert_eq!(still_owned(domain), None);
-    assert!(blocks().contains(&base));
-    assert_eq!(freed_by_teardown(), freed);
-    assert_eq!(prepare(&AppSpec { id: Some(domain), ..Default::default() }), Ok(domain));
-    let fresh = info(domain).unwrap();
-    assert_eq!((fresh.base, fresh.threads), (0, 0));
-    assert!(matches!(fresh.state, DomainState::Compiling(_)));
-    assert!(blocks().contains(&base));
-    assert_eq!(freed_by_teardown(), freed);
-    domains().retain(|d| d.info.id != domain);
+    assert!(!blocks().contains(&base));
+    assert!(blocks().contains(&next_base));
+    assert!(freed_by_teardown() > freed);
+    next_flags[1].store(1, Ordering::SeqCst);
+    stop(replacement, Stop::Quit).unwrap();
+    domains().retain(|d| d.info.id != domain && d.info.id != replacement);
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// Compile the production pool and stop_workers into the JIT fixture, with
+// only their UI/logging/priority adapters replaced. No GPU, package resolver,
+// external tools or copied implementation of the pool is involved.
+fn static_pool_fixture() -> String {
+    let source = include_str!("../../../../platform/src/thread.rs");
+    let network = source.split_once("pub use makepad_network::{").unwrap().1
+        .split_once("};").unwrap().0;
+    let runtime = source.replacen("pub mod ui_hang;", r#"
+        pub mod ui_hang {
+            pub struct UiPhase;
+            pub struct UiPhaseGuard;
+            pub fn ui_phase() {}
+            pub fn ui_event_phase() {}
+            pub mod relax_timeline {
+                pub struct Hooks {
+                    pub begin: fn(*const u8, usize),
+                    pub end: fn(*const u8, usize),
+                }
+                pub fn hooks() -> Option<&'static Hooks> { None }
+            }
+        }
+    "#, 1).replacen(&format!("pub use makepad_network::{{{network}}};"), r#"
+        pub struct SignalToUI;
+        impl SignalToUI {
+            pub fn set_ui_signal() {}
+            pub fn set_internal_signal() {}
+        }
+    "#, 1);
+    let restart = include_str!("../../../../platform/src/restart.rs");
+    let stop = restart.split_once("pub(crate) fn stop_workers(").unwrap().1
+        .split_once("\n}").unwrap().0;
+    let adapters = r#"
+        #[macro_export] macro_rules! log { ($($t:tt)*) => {} }
+        #[macro_export] macro_rules! error { ($($t:tt)*) => {} }
+        #[macro_export] macro_rules! trace { ($($t:tt)*) => {} }
+        mod os { pub fn wake_ui_event_loop() {} }
+        mod log { pub fn stop_sink() {} }
+        mod remote { pub fn stop_encoder() {} }
+        mod event {
+            #[derive(Clone, Copy)] pub struct Timer(pub u64);
+            pub struct TimerEvent { pub timer_id: u64 }
+            pub enum Event { Shutdown, Timer(TimerEvent) }
+        }
+        mod cx_api {
+            #[derive(Clone, Copy, Debug, Default)]
+            pub enum CxThreadPriority { #[default] Utility, UserInitiated, UserInteractive }
+        }
+        mod cx {
+            pub struct Cx {
+                pub thread_spawner: crate::thread::ThreadSpawner,
+                pub task_pool: std::cell::OnceCell<crate::thread::TaskPool>,
+                pub cpu_cores: usize,
+            }
+            impl Cx {
+                pub fn monotonic_now() -> f64 {
+                    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+                }
+                pub fn set_thread_priority(_: crate::cx_api::CxThreadPriority) -> crate::thread::PriorityStatus {
+                    crate::thread::PriorityStatus::Applied
+                }
+                pub fn stop_timer(&mut self, _: crate::event::Timer) {}
+                pub fn start_timeout(&mut self, _: f64) -> crate::event::Timer { crate::event::Timer(1) }
+            }
+        }
+    "#;
+    format!("{adapters}\nmod thread {{\n{runtime}\n}}\nmod restart {{\nstatic STOP_WAKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);\npub(crate) fn stop_workers({stop}\n}}\n}}\n{STATIC_POOL_APP}")
+}
+
+const STATIC_POOL_APP: &str = r#"
+use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
+use thread::{TaskPool, ThreadSpawner, PoolOptions, Lane};
+static POOL: OnceLock<TaskPool> = OnceLock::new();
+fn static_pool_app(p: *mut u64) {
+    let flags = unsafe { &*(p as *const [AtomicU64; 4]) };
+    assert!(POOL.get().is_none(), "relaunch must start from its own static image");
+    let spawner = ThreadSpawner::for_current_thread(4);
+    let pool = POOL.get_or_init(|| TaskPool::new(spawner.clone(), PoolOptions {
+        name: "static-pool".into(), ..PoolOptions::with_workers(3, 1)
+    }).unwrap());
+    while pool.idle_workers() != 3 { std::thread::yield_now(); }
+    flags[0].store(1, Ordering::SeqCst);
+    while flags[1].load(Ordering::SeqCst) == 0 { std::thread::yield_now(); }
+    restart::stop_workers(&spawner);
+    assert!(!pool.is_open());
+    assert!(pool.submit(Lane::Light, || ()).is_err());
+    assert!(POOL.get().is_some(), "the pool handle remains in the static");
+    flags[2].store(1, Ordering::SeqCst);
+}
+"#;
+
+#[test]
+fn static_task_pool_relaunches_in_place_without_live_threads() {
+    isolated_test!(static_task_pool_relaunches_in_place_without_live_threads);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(&static_pool_fixture(), "static_pool_app");
+    let mut id = None;
+    for _ in 0..3 {
+        let flags = [const { AtomicU64::new(0) }; 4];
+        let (domain, base, main) = launch(&mut u, entry, id, &flags);
+        if let Some(previous) = id { assert_eq!(domain, previous); }
+        id = Some(domain);
+        wait(|| flags[0].load(Ordering::SeqCst) != 0);
+        let live = info(domain).unwrap();
+        for index in 0..3 {
+            assert!(live.thread_names.contains(&format!("static-pool-{index}")));
+        }
+        flags[1].store(1, Ordering::SeqCst);
+        main.join().unwrap();
+        stop(domain, Stop::Quit).unwrap();
+        // stop returns once the app's main has; the closed pool's workers end on their own
+        wait_thread_done(domain);
+        assert_eq!(flags[2].load(Ordering::SeqCst), 1);
+        let dead = info(domain).unwrap();
+        assert_eq!((dead.threads, dead.base, dead.arena_committed), (0, 0, 0));
+        assert_eq!(still_owned(domain), None);
+        assert!(!blocks().contains(&base));
+    }
+    domains().retain(|d| Some(d.info.id) != id);
     drop(u);
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -215,7 +343,7 @@ fn cancel_during_compile_never_enters_main() {
         .unwrap();
         let loading = Loading(id);
         compile_phase(id, phase).unwrap();
-        stop_for(id, Duration::ZERO).unwrap();
+        retire(id).unwrap();
         assert!(compile_phase(id, "next").is_err());
         // Exercise the production loader entry: cancellation must return before it even
         // dereferences the unit, and therefore before resolve, linking or main can run.
@@ -351,7 +479,7 @@ fn a_domain_worker_with_large_allocations_and_borrowed_field_matches() {
     }
     assert_eq!(flags[0].load(Ordering::SeqCst), expected);
     wait(|| info(domain).unwrap().threads == 0);
-    stop_for(domain, Duration::from_secs(30)).unwrap();
+    stop(domain, Stop::Quit).unwrap();
     let dead = info(domain).unwrap();
     assert_eq!((dead.threads, dead.arena_in_use, dead.arena_committed), (0, 0, 0));
     domains().retain(|d| d.info.id != domain);
@@ -495,7 +623,7 @@ fn process_exit_in_a_caught_handler_ends_the_domain_with_its_code() {
     assert_eq!(flags[1].load(Ordering::SeqCst), 0, "a catch_unwind contained the exit");
     assert_eq!(flags[2].load(Ordering::SeqCst), 0, "the event loop went on past the exit");
     wait(|| info(domain).unwrap().threads == 0);
-    stop_for(domain, Duration::from_secs(30)).unwrap();
+    stop(domain, Stop::Quit).unwrap();
     domains().retain(|d| d.info.id != domain);
     drop(u);
     std::fs::remove_dir_all(root).unwrap();

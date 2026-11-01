@@ -3947,15 +3947,6 @@ fn restart_in_place(why: String) -> Result<&'static str, String> {
     exec_restart(None).map(|_| "process restart")
 }
 
-/// A hosted app's relaunch in place could not happen (its previous run did not hand its domain
-/// over): the process starts again instead, same binary and command line, with the state the app
-/// left for the relaunch (std::relax::restart_now) when it left one. Returns only on failure.
-pub fn restart_process(why: &str) -> Result<(), String> {
-    let state = DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).take();
-    *RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = format!("the relaunch in place failed: {why}");
-    exec_restart(state.as_deref().map(str::as_bytes))
-}
-
 /// What the host keeps across an exec of this process (the HAL's WM connection: the new image
 /// resumes on it, so the WM keeps the app's window): `prepare`, right before exec, readies what
 /// it hands over (no CLOEXEC) and returns the environment that names it to the new image;

@@ -98,6 +98,41 @@ pub fn say_why_hung(what: &str) {
     eprintln!("makepad: {what}: where the threads wait:\n{}", String::from_utf8_lossy(&bytes));
 }
 
+/// A retiring domain's outstanding threads, using the same wait registry and
+/// stack capture as `why-hung`. No timed probe decides their lifetime.
+pub fn say_teardown_threads(domain: u32, pending: &[(String, u64)]) {
+    let _kept = crate::zone_alloc::kept();
+    let captures = match capture_all(&|t| pending.iter().any(|(_, id)| *id != 0 && *id == t.os_id)) {
+        Ok(captures) => captures,
+        Err(error) => {
+            eprintln!("makepad-run domain: {domain}: teardown stacks unavailable: {error}");
+            return;
+        }
+    };
+    let waits = crate::waits::snapshot();
+    let threads: Vec<_> = captures.iter().map(|c| c.t.clone()).collect();
+    let frames: Vec<_> = captures.iter().map(|c| c.frames.clone()).collect();
+    let mut partial = Vec::new();
+    let symbols = symbolise_within(&frames, &mut partial, 300);
+    for (name, id) in pending {
+        let Some(index) = captures.iter().position(|c| *id != 0 && c.t.os_id == *id) else {
+            eprintln!("makepad-run domain: {domain}: thread {name}: {}", if *id == 0 { "reserved, not entered yet" } else { "exited during capture" });
+            continue;
+        };
+        let c = &captures[index];
+        let blocked = waits.iter().find(|w| w.thread == c.t.handle && w.kind != crate::waits::Kind::None)
+            .map(|w| wait_text(w, &threads)).unwrap_or_else(|| c.t.state.to_string());
+        eprintln!("makepad-run domain: {domain}: thread {name} ({}): {blocked}", c.t.os_id);
+        if let Some(error) = c.err {
+            eprintln!("  stack unavailable: {error}");
+        }
+        for frame in &symbols[index] {
+            eprintln!("  {} {}", frame.name, frame.at);
+        }
+    }
+    for note in partial { eprintln!("makepad-run domain: {domain}: {note}"); }
+}
+
 /// Starts the inspect thread for program `app` (once per process; MAKEPAD_RUN_INSPECT=0: off).
 pub fn start(app: &str) {
     if std::env::var("MAKEPAD_RUN_INSPECT").map_or(false, |v| v == "0") || STARTED.swap(true, Relaxed) {
