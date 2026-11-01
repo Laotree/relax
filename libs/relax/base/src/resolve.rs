@@ -369,6 +369,9 @@ pub struct Resolver {
     cfg: crate::cfg::CfgSet,
     /// `--allow-c`: registry packages that compile C are accepted (cargo builds them, native.rs)
     allow_c: bool,
+    /// Metadata describes packages without compiling them: keep their declared dev dependencies
+    /// and unify host/target features into the one node cargo metadata exposes per package.
+    metadata: bool,
 }
 
 fn read_toml(path: &str) -> Result<TomlTable, String> {
@@ -537,7 +540,7 @@ impl Resolver {
         let git = std::cell::RefCell::new(GitDeps { places: git, pins: None, mounts: Vec::new(), found: HashMap::new() });
         Ok(Resolver { ws: std::rc::Rc::new(Workspace::load(&find_root(dir)?)?), git, offline, owners: HashMap::new(), vendor: vendor_dir(dir)?, fetched: Default::default(), manifests: Vec::new(), by_dir: HashMap::new(), cfg: crate::cfg::CfgSet::host(sess, &[]), // a check resolves C-compiling packages too: their scripts are not run without --allow-c
             // (unitgraph::run_build_scripts) and a check links nothing (`const_fuel` is check-only)
-            allow_c: sess.options.allow_c || sess.options.const_fuel })
+            allow_c: sess.options.allow_c || sess.options.const_fuel, metadata: false })
     }
 
     fn registry_dir(&self, name: &str, req: &str) -> Result<String, String> {
@@ -882,11 +885,11 @@ impl Resolver {
         };
         add(&mut deps, table(&t, "dependencies"), false, false, None)?;
         add(&mut deps, table(&t, "build-dependencies").or_else(|| table(&t, "build_dependencies")), true, false, None)?;
-        // a registry package's dev-dependencies are never built (only the root package's tests are):
-        // only their keys are kept
+        // A registry package's dev-dependencies are never built (only the root package's tests
+        // are): keep just their keys, except when metadata needs the declared dependencies.
         let mut dev_keys: Vec<String> = Vec::new();
         let dev_tbl = table(&t, "dev-dependencies").or_else(|| table(&t, "dev_dependencies"));
-        if !registry {
+        if !registry || self.metadata {
             add(&mut deps, dev_tbl, false, true, None)?;
         } else if let Some(d) = dev_tbl {
             dev_keys.extend(d.keys().cloned());
@@ -897,7 +900,7 @@ impl Resolver {
                     add(&mut deps, table(v, "dependencies"), false, false, Some(plat.clone()))?;
                     add(&mut deps, table(v, "build-dependencies").or_else(|| table(v, "build_dependencies")), true, false, Some(plat.clone()))?;
                     let dev_tbl = table(v, "dev-dependencies").or_else(|| table(v, "dev_dependencies"));
-                    if !registry {
+                    if !registry || self.metadata {
                         add(&mut deps, dev_tbl, false, true, Some(plat.clone()))?;
                     } else if let Some(d) = dev_tbl {
                         dev_keys.extend(d.keys().cloned());
@@ -1557,8 +1560,10 @@ pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
 
 struct Feat<'a> {
     r: &'a mut Resolver,
-    /// the node whose dev-dependencies are part of the graph (the root of a test graph)
-    dev_of: Option<(usize, bool)>,
+    /// Test roots, or all workspace members for metadata.
+    dev_of: BTreeSet<(usize, bool)>,
+    /// Metadata without --filter-platform follows dependencies for every platform.
+    all_platforms: bool,
     nodes: HashMap<(usize, bool), Node>,
     work: Vec<((usize, bool), Req)>,
     order: Vec<(usize, bool)>,
@@ -1578,7 +1583,7 @@ impl<'a> Feat<'a> {
         self.order.push(k);
         let deps = self.r.manifests[k.0].deps.clone();
         for (di, d) in deps.iter().enumerate() {
-            if !d.optional && (!d.dev || self.dev_of == Some(k)) {
+            if !d.optional && (!d.dev || self.dev_of.contains(&k)) {
                 self.follow(k, di, d)?;
             }
         }
@@ -1587,7 +1592,7 @@ impl<'a> Feat<'a> {
 
     /// Follows dependency entry `di` of node `k`: the target node, its requested features.
     fn follow(&mut self, k: (usize, bool), di: usize, d: &Dep) -> Result<(), String> {
-        if !self.r.platform_ok(&d.platform) {
+        if !self.all_platforms && !self.r.platform_ok(&d.platform) {
             return Ok(());
         }
         if self.node(k).edges.iter().any(|e| e.0 == di) {
@@ -1616,7 +1621,7 @@ impl<'a> Feat<'a> {
                 return Err(format!("{}/Cargo.toml: git package `{}` {} ({}) does not satisfy the requirement `{}`", self.r.manifests[k.0].dir, m.name, m.version, g.id(), d.req));
             }
         }
-        let host = k.1 || d.build || self.r.manifests[t].proc_macro;
+        let host = !self.r.metadata && (k.1 || d.build || self.r.manifests[t].proc_macro);
         let tk = (t, host);
         self.node(k).edges.push((di, tk));
         self.activate(tk)?;
@@ -1805,6 +1810,205 @@ pub fn package_meta_env(dir: &str) -> Vec<(String, String)> {
     out
 }
 
+/// The cargo metadata subset used by build scripts, from the same manifests and VFS as the
+/// unit graph. No script is run and Cargo.lock is never written. `dir` is the caller's virtual cwd.
+pub fn cargo_metadata(sess: &std::sync::Arc<crate::Session>, dir: &str, flags: &[String]) -> Result<String, String> {
+    use crate::diag::quote as q;
+    let (mut manifest, mut platform) = (None, None);
+    let (mut offline, mut no_deps) = (false, false);
+    let mut i = 0;
+    while i < flags.len() {
+        let arg = flags[i].as_str();
+        let (flag, inline) = arg.split_once('=').map_or((arg, None), |(k, v)| (k, Some(v)));
+        let value = |i: &mut usize| -> Result<String, String> {
+            if let Some(v) = inline { return Ok(v.to_string()); }
+            *i += 1;
+            let v = flags.get(*i).ok_or_else(|| format!("metadata: {flag} needs a value"))?;
+            if v.starts_with('-') { return Err(format!("metadata: {flag} needs a value, found {v:?}")); }
+            Ok(v.clone())
+        };
+        match flag {
+            "--format-version" => {
+                let v = value(&mut i)?;
+                if v != "1" { return Err(format!("metadata: unsupported --format-version {v:?}")); }
+            }
+            "--manifest-path" => manifest = Some(join(dir, &value(&mut i)?)),
+            "--filter-platform" => platform = Some(value(&mut i)?),
+            "--offline" | "--frozen" if inline.is_none() => offline = true,
+            "--locked" if inline.is_none() => {}
+            "--no-deps" if inline.is_none() => no_deps = true,
+            _ => return Err(format!("metadata: unsupported argument {arg:?}")),
+        }
+        i += 1;
+    }
+    let manifest = match manifest {
+        Some(p) if p.ends_with("/Cargo.toml") => p,
+        Some(p) => return Err(format!("metadata: --manifest-path must name Cargo.toml: {p}")),
+        None => {
+            let mut cur = Some(normalize(dir));
+            loop {
+                let d = cur.ok_or_else(|| format!("no Cargo.toml in {dir} or any folder above it"))?;
+                let p = format!("{d}/Cargo.toml");
+                if crate::vfs::is_file(&p) { break p; }
+                cur = parent(&d);
+            }
+        }
+    };
+    let current = read_toml(&manifest)?;
+    let start = parent(&manifest).unwrap();
+    let mut r = Resolver::new(sess, &start)?;
+    r.offline |= offline;
+    r.metadata = true;
+    // C-compiling packages are valid metadata; no compilation is requested here.
+    r.allow_c = true;
+    if let Some(t) = &platform {
+        use crate::options::CheckTarget as C;
+        r.cfg = match C::from_triple(t).ok_or_else(|| format!("metadata: unsupported --filter-platform {t:?}"))? {
+            C::MacosArm64 => crate::cfg::CfgSet::macos_arm64(sess, &[]),
+            C::LinuxX64 => crate::cfg::CfgSet::linux_x64(sess, &[]),
+            C::WindowsX64 => crate::cfg::CfgSet::windows_x64(sess, &[]),
+            C::AndroidArm64 => crate::cfg::CfgSet::android_arm64(sess, &[]),
+            C::IosArm64 => crate::cfg::CfgSet::ios_arm64(sess, &[]),
+            C::Web(w) => crate::cfg::CfgSet::web(sess, w, &[]),
+            C::Host => unreachable!("from_triple names a target"),
+        };
+    }
+    let root = if current.contains_key("package") { Some(r.load(&start, Source::Path)?) } else { None };
+    // As in Workspace::has_member, membership follows every in-workspace path dependency,
+    // including optional, dev, build and inactive platform entries. --no-deps still lists them.
+    let mut todo = r.ws.member_dirs();
+    let mut members = BTreeSet::new();
+    if let Some(root) = root { todo.push(r.manifests[root].dir.clone()); }
+    while let Some(dir) = todo.pop() {
+        let p = r.load(&dir, Source::Path)?;
+        if !members.insert(p) { continue; }
+        for d in &r.manifests[p].deps {
+            if let Some(path) = &d.path {
+                if path.starts_with(&format!("{}/", r.ws.root)) && !r.ws.excluded(path) {
+                    todo.push(path.clone());
+                }
+            }
+        }
+    }
+    let nodes = if no_deps {
+        HashMap::new()
+    } else {
+        let mut f = Feat { r: &mut r, dev_of: members.iter().map(|p| (*p, false)).collect(), all_platforms: platform.is_none(), nodes: HashMap::new(), work: Vec::new(), order: Vec::new() };
+        for &p in &members {
+            let k = (p, false);
+            f.activate(k)?;
+            f.work.push((k, Req::Feature("default".to_string())));
+        }
+        f.run()?;
+        f.nodes
+    };
+    let ids: Vec<String> = r.manifests.iter().map(|m| {
+        if m.source != Source::Path { return m.pkg_id(); }
+        // Always include the name, including when the last directory component matches it.
+        let path = if m.dir.starts_with('/') { m.dir.clone() } else { format!("/{}", m.dir) };
+        let mut url = String::new();
+        for b in path.bytes() {
+            if b.is_ascii_alphanumeric() || b"/-._~:@!$&'()*+,;=".contains(&b) { url.push(b as char); }
+            else { url.push_str(&format!("%{b:02X}")); }
+        }
+        format!("path+file://{}#{}@{}", url, m.name, m.version)
+    }).collect();
+    let mut packages: Vec<usize> = if no_deps { members.iter().copied().collect() } else { nodes.keys().map(|k| k.0).collect() };
+    packages.sort_by(|a, b| ids[*a].cmp(&ids[*b]));
+    let mut pkgs = Vec::new();
+    let mut resolved = Vec::new();
+    for &p in &packages {
+        let m = &r.manifests[p];
+        let dependencies: Vec<String> = m.deps.iter().map(|d| format!("{{\"name\":{},\"kind\":{},\"optional\":{}}}", q(&d.package), metadata_dep_kind(d), d.optional)).collect();
+        pkgs.push(format!("{{\"id\":{},\"name\":{},\"version\":{},\"manifest_path\":{},\"targets\":[{}],\"dependencies\":[{}]}}",
+            q(&ids[p]), q(&m.name), q(&m.version), q(&format!("{}/Cargo.toml", m.dir)), metadata_targets(m)?.join(","), dependencies.join(",")));
+        let Some(node) = nodes.get(&(p, false)) else { continue };
+        let mut deps: BTreeMap<(String, usize), BTreeSet<(&str, Option<&str>)>> = BTreeMap::new();
+        for (di, (to, _)) in &node.edges {
+            let d = &m.deps[*di];
+            // A dependency names a library (including proc macros), never a binary target.
+            let Some(lib) = &r.manifests[*to].lib else { continue };
+            let name = if d.key != d.package { &d.key } else { &lib.name }.replace('-', "_");
+            deps.entry((name, *to)).or_default().insert((metadata_dep_kind(d), d.platform.as_deref()));
+        }
+        let deps: Vec<String> = deps.into_iter().map(|((name, to), kinds)| {
+            let kinds: Vec<String> = kinds.into_iter().map(|(kind, target)| format!("{{\"kind\":{},\"target\":{}}}", kind, target.map(q).unwrap_or_else(|| "null".into()))).collect();
+            format!("{{\"name\":{},\"pkg\":{},\"dep_kinds\":[{}]}}", q(&name), q(&ids[to]), kinds.join(","))
+        }).collect();
+        let features: Vec<String> = node.features.iter().map(|f| q(f)).collect();
+        resolved.push(format!("{{\"id\":{},\"deps\":[{}],\"features\":[{}]}}", q(&ids[p]), deps.join(","), features.join(",")));
+    }
+    let resolve = if no_deps { "null".to_string() } else {
+        format!("{{\"nodes\":[{}],\"root\":{}}}", resolved.join(","), root.map(|p| q(&ids[p])).unwrap_or_else(|| "null".into()))
+    };
+    let mut members: Vec<String> = members.iter().map(|p| q(&ids[*p])).collect();
+    members.sort();
+    // A relative target-dir environment value is relative to the script's virtual cwd, not
+    // the real cwd inherited by this native loader process.
+    let target = match ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"].iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty())) {
+        Some(t) => join(dir, &t),
+        None => target_dir(&start)?,
+    };
+    Ok(format!("{{\"packages\":[{}],\"resolve\":{},\"workspace_root\":{},\"workspace_members\":[{}],\"target_directory\":{},\"version\":1}}",
+        pkgs.join(","), resolve, q(&r.ws.root), members.join(","), q(&target)))
+}
+
+fn metadata_dep_kind(d: &Dep) -> &'static str {
+    if d.build { "\"build\"" } else if d.dev { "\"dev\"" } else { "null" }
+}
+
+fn metadata_targets(m: &Manifest) -> Result<Vec<String>, String> {
+    use crate::diag::quote as q;
+    let target = |kind: &[String], types: &[String], name: &str, path: &str| format!(
+        "{{\"kind\":[{}],\"crate_types\":[{}],\"name\":{},\"src_path\":{}}}",
+        kind.iter().map(|s| q(s)).collect::<Vec<_>>().join(","), types.iter().map(|s| q(s)).collect::<Vec<_>>().join(","), q(name), q(path));
+    let bin = vec!["bin".to_string()];
+    let mut targets = Vec::new();
+    if let Some(lib) = &m.lib { targets.push(target(&lib.kind, &lib.kind, &lib.name, &lib.path)); }
+    for t in m.bins.iter().chain(&m.tests) { targets.push(target(&t.kind, &bin, &t.name, &t.path)); }
+    // Examples and benches have no units in a normal run, but are still manifest targets.
+    let t = read_toml(&format!("{}/Cargo.toml", m.dir))?;
+    let pkg = table(&t, "package").unwrap();
+    for (kind, folder, auto) in [("example", "examples", "autoexamples"), ("bench", "benches", "autobenches")] {
+        let explicit = t.get(kind).and_then(|x| x.as_array_of_tables()).unwrap_or_default();
+        let mut found = Vec::new();
+        for e in explicit {
+            let Some(name) = s(e, "name") else { continue };
+            let path = match s(e, "path") {
+                Some(path) => join(&m.dir, &path),
+                None => {
+                    let paths = [format!("{}/{}/{}.rs", m.dir, folder, name), format!("{}/{}/{}/main.rs", m.dir, folder, name)];
+                    let Some(path) = paths.iter().find(|p| crate::vfs::is_file(p)) else { continue };
+                    path.clone()
+                }
+            };
+            let types = strs(e, "crate-type");
+            found.push((name, path, if types.is_empty() { bin.clone() } else { types }));
+        }
+        if b(pkg, auto).unwrap_or(m.edition != "2015" || explicit.is_empty()) {
+            if let Ok(entries) = crate::vfs::read_dir(format!("{}/{}", m.dir, folder)) {
+                for (name, is_dir) in entries {
+                    let (name, path) = if is_dir {
+                        let path = format!("{}/{}/{}/main.rs", m.dir, folder, name);
+                        if !crate::vfs::is_file(&path) { continue; }
+                        (name, path)
+                    } else if let Some(stem) = name.strip_suffix(".rs") {
+                        (stem.to_string(), format!("{}/{}/{}", m.dir, folder, name))
+                    } else { continue };
+                    if !found.iter().any(|(n, p, _)| *n == name || *p == path) { found.push((name, path, bin.clone())); }
+                }
+            }
+        }
+        found.sort();
+        for (name, path, types) in found { targets.push(target(&[kind.to_string()], &types, &name, &path)); }
+    }
+    if let Some(path) = &m.build {
+        let stem = path.rsplit('/').next().unwrap_or("build.rs").trim_end_matches(".rs");
+        targets.push(target(&["custom-build".to_string()], &bin, &format!("build-script-{stem}"), path));
+    }
+    Ok(targets)
+}
+
 /// The unit graph of `package` in the workspace at `workspace` (see the module comment).
 pub fn unit_graph(sess: &std::sync::Arc<crate::Session>, workspace: &str, package: &str, flags: &[String]) -> Result<Units, String> {
     unit_graph_with(sess, workspace, package, flags, GitPlaces::run())
@@ -1817,7 +2021,7 @@ pub fn unit_graph_with(sess: &std::sync::Arc<crate::Session>, workspace: &str, p
     r.offline |= o.offline;
     let root = r.find_member(package)?;
     let rk = (root, false);
-    let mut f = Feat { r: &mut r, dev_of: o.test.as_ref().map(|_| rk), nodes: HashMap::new(), work: Vec::new(), order: Vec::new() };
+    let mut f = Feat { r: &mut r, dev_of: o.test.as_ref().map(|_| rk).into_iter().collect(), all_platforms: false, nodes: HashMap::new(), work: Vec::new(), order: Vec::new() };
     f.activate(rk)?;
     let m = &f.r.manifests[root];
     f.work.extend(feature_requests(&m.features, &m.implicit_features(), &o).into_iter().map(|req| (rk, req)));
