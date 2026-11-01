@@ -102,12 +102,12 @@ thread_local! {
 }
 
 extern "C" {
-    fn getenv(name: *const u8) -> *const u8;
+    fn getenv(name: *const core::ffi::c_char) -> *mut core::ffi::c_char;
 }
 
 #[cold]
 fn decide() -> bool {
-    let v = unsafe { getenv(b"MAKEPAD_RUN_MEM_REPORT\0".as_ptr()) };
+    let v = unsafe { getenv(b"MAKEPAD_RUN_MEM_REPORT\0".as_ptr().cast()).cast::<u8>() };
     let on = !v.is_null() && unsafe { *v } != 0 && unsafe { *v } != b'0';
     STATE.store(if on { 2 } else { 1 }, Relaxed);
     on
@@ -921,8 +921,8 @@ mod sites {
 
     #[cold]
     fn decide() -> i64 {
-        extern "C" { fn getenv(name: *const u8) -> *const u8; }
-        let p = unsafe { getenv(b"MAKEPAD_RUN_MEM_SITES\0".as_ptr()) };
+        extern "C" { fn getenv(name: *const core::ffi::c_char) -> *mut core::ffi::c_char; }
+        let p = unsafe { getenv(b"MAKEPAD_RUN_MEM_SITES\0".as_ptr().cast()).cast::<u8>() };
         let mut v: i64 = 0;
         if !p.is_null() && cfg!(target_os = "linux") {
             let mut q = p;

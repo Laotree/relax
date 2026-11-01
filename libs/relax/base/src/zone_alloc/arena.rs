@@ -1758,14 +1758,14 @@ impl Arena {
         }
         #[cfg(unix)]
         extern "C" {
-            fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+            fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
         }
         // (stderr without allocation; Windows has no C `write` to link against)
         #[cfg(windows)]
-        unsafe fn write(_fd: i32, buf: *const u8, n: usize) -> isize {
+        unsafe fn write(_fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize {
             use relax_session::win32::{GetStdHandle, WriteFile};
             let mut done = 0u32;
-            WriteFile(GetStdHandle(-12i32 as u32), buf, n as u32, &mut done, std::ptr::null_mut());
+            WriteFile(GetStdHandle(-12i32 as u32), buf.cast(), n as u32, &mut done, std::ptr::null_mut());
             done as isize
         }
         let mut b = [0u8; 900];
@@ -1851,7 +1851,7 @@ impl Arena {
             }
         }
         put(b"\n");
-        unsafe { write(2, b.as_ptr(), k) };
+        unsafe { write(2, b.as_ptr().cast(), k) };
     }
     /// A trim ran since this thread last handed its current chunks back (compiler arena).
     #[inline]
@@ -2411,7 +2411,7 @@ pub fn heap_check_on() -> bool {
             #[cfg(unix)]
             let on = unsafe {
                 extern "C" {
-                    fn getenv(name: *const u8) -> *const u8;
+                    fn getenv(name: *const core::ffi::c_char) -> *mut core::ffi::c_char;
                 }
                 !getenv(c"MAKEPAD_RUN_HEAP_CHECK".as_ptr().cast()).is_null()
             };
@@ -2483,10 +2483,10 @@ fn heap_check_fail(what: &[u8], p: usize, index: usize, stride: usize) -> ! {
     #[cfg(unix)]
     unsafe {
         extern "C" {
-            fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+            fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
             fn abort() -> !;
         }
-        write(2, buf.as_ptr(), n);
+        write(2, buf.as_ptr().cast(), n);
         abort();
     }
     #[cfg(not(unix))]
