@@ -118,6 +118,13 @@ pub fn current() -> *const () {
     compiler::current_domain().cast()
 }
 
+/// The calling thread's domain heap as it accounts itself (`DomainHeap::stats`): (bytes in use,
+/// bytes committed); None on the system heap.
+pub fn current_stats() -> Option<(usize, usize)> {
+    let arena = unsafe { compiler::current_domain().as_ref() }?;
+    Some((arena.requested_bytes(), arena.committed()))
+}
+
 /// Puts the calling thread back in the heap `current` returned.
 pub unsafe fn restore(heap: *const ()) {
     compiler::enter_domain(heap.cast());

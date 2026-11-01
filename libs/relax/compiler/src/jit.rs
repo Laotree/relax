@@ -20861,6 +20861,15 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_key_delete" => Some(crate::domain_threads::key_delete as *const () as usize),
         b"__relax_key_get" => Some(crate::domain_threads::key_get as *const () as usize),
         b"__relax_key_set" => Some(crate::domain_threads::key_set as *const () as usize),
+        // the calling thread's stack and heap as the program runs on them (program_os.rs)
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        b"pthread_getattr_np" => Some(crate::program_os::pthread_getattr_np as *const () as usize),
+        #[cfg(target_vendor = "apple")]
+        b"pthread_get_stackaddr_np" => Some(crate::program_os::pthread_get_stackaddr_np as *const () as usize),
+        #[cfg(target_vendor = "apple")]
+        b"pthread_get_stacksize_np" => Some(crate::program_os::pthread_get_stacksize_np as *const () as usize),
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        b"mallinfo2" => Some(crate::program_os::mallinfo2 as *const () as usize),
         // the program's request for its allocator's free pages also trims its domain heap
         b"malloc_trim" | b"malloc_zone_pressure_relief" => crate::zone_alloc::domain::symbol(name),
         // the web target's runtime and its embedder's page side (web.rs), then run-time modules
@@ -25405,6 +25414,18 @@ impl Unit {
 fn static_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_STATIC_TRACE").is_some())
+}
+
+/// The `#[global_allocator]` static binary crate `krate` links (rustc_metadata creader
+/// inject_allocator_crate: its own, else its dependencies'): None, the default allocator.
+pub fn global_allocator_linked_by(prog: &crate::program::Program, krate: u32) -> Option<DefId> {
+    (0..prog.defs.len() as u32).map(DefId).find(|&d| {
+        let def = prog.def(d);
+        def.kind == DefKind::Static && prog.crate_sees(krate, def.krate) && prog.item_defs.get(&(def.file, def.item.0)) == Some(&d) && {
+            let ast = &prog.files[def.file as usize].ast;
+            crate::lang_items::has_attr(prog, def.file, ast.list(ast.item(def.item).attrs), "global_allocator")
+        }
+    })
 }
 
 /// The `#[global_allocator]` static of program `prog`

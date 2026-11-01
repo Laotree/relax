@@ -198,7 +198,9 @@ pub fn verify_front_images() {
             }
         }
         for p in bad {
-            eprintln!("makepad-run cache: a front image in {} does not match its checksum: the store is removed (the next run rebuilds it)", p.display());
+            if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("makepad-run cache: a front image in {} does not match its checksum: the store is removed (the next run rebuilds it)", p.display());
+            }
             let _ = std::fs::remove_file(crate::store::current(&p));
         }
     });
@@ -4154,7 +4156,7 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
         }
     }
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if total > cap && !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    if total > cap && crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) && !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         // what stayed over the cap, and why: this run's stores, then other running builds'
         // stores, then stores another run of this build stamped recently
         let (mut other_running, mut other_runs) = (0u64, 0u64);
@@ -6030,7 +6032,11 @@ impl FrontWriters {
                     match result {
                         Ok(Ok(Some(ci))) => recorded.push(ci),
                         Ok(Ok(None)) => {}
-                        Ok(Err(e)) => eprintln!("makepad-run front: crate record: {}", e),
+                        Ok(Err(e)) => {
+                            if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!("makepad-run front: crate record: {}", e);
+                            }
+                        }
                         Err(_) => eprintln!("makepad-run front: crate record writer panicked"),
                     }
                     queue.lock().unwrap_or_else(|e| e.into_inner()).active.remove(&path);
