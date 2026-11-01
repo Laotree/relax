@@ -16,7 +16,9 @@ for name in dyn_any_ptr_cast_accept never_deref_move_accept generic_call_once_ac
     closure_iter_annotated_unused_accept closure_iter_annotated_unused_reject \
     closure_iter_hr_dyn_named_accept closure_iter_hr_dyn_named_reject \
     closure_iter_inferred_named_accept closure_iter_inferred_named_reject \
-    closure_iter_inferred_static_accept closure_iter_inferred_static_reject; do
+    closure_iter_inferred_static_accept closure_iter_inferred_static_reject \
+    t12_adt_implied_outlives_accept t12_dyn_any_object_lifetime_accept t12_impl_method_callee_lifetime_accept \
+    t12_iterator_position_override_accept t12_or_pattern_binding_accept; do
     python3 - "$TMP" "$HERE" "$name" <<'PY'
 import json, pathlib, shutil, sys
 tmp, here, name = sys.argv[1:]
