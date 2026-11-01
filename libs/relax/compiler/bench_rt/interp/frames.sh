@@ -32,7 +32,7 @@ for pkg in $pkgs; do
             prof=()
             # FRAMES_PROFILE=1: the warm run's main thread sampled (mainprof.rs), its leaves summed
             [ "${FRAMES_PROFILE:-}" = 1 ] && [ $run = warm ] && prof=(MAKEPAD_RUN_PROFILE_MAIN=$d/prof.tsv MAKEPAD_RUN_PROFILE_MAIN_MS=8000)
-            env "${env[@]}" "${prof[@]}" MAKEPAD_HOME="$d/home" TMPDIR="$d/tmp" MAKEPAD_RUN_HOME="$d/runhome" MAKEPAD_RUN_CACHE_DIR="$d/cache" \
+            env "${env[@]}" ${prof[@]+"${prof[@]}"} MAKEPAD_HOME="$d/home" TMPDIR="$d/tmp" MAKEPAD_RUN_HOME="$d/runhome" MAKEPAD_RUN_CACHE_DIR="$d/cache" \
                 perl -e 'alarm 900; exec @ARGV' "$T/host/makepad" run "$pkg" > "$d/$run.out" 2>&1
             rc=$?
             t1=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
