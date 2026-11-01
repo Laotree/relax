@@ -354,7 +354,8 @@ impl Drop for ScratchGuard {
 // That recurses when used under a global allocator. These locks never allocate or park.
 struct Mutex<T> {
     held: AtomicBool,
-    id: usize,
+    /// the contention event's label (an atomic: the static arenas set theirs at their first use)
+    id: AtomicUsize,
     value: UnsafeCell<T>,
 }
 unsafe impl<T: Send> Sync for Mutex<T> {}
@@ -365,7 +366,7 @@ impl<T> Mutex<T> {
     const fn with_id(value: T, id: usize) -> Self {
         Self {
             held: AtomicBool::new(false),
-            id,
+            id: AtomicUsize::new(id),
             value: UnsafeCell::new(value),
         }
     }
@@ -398,7 +399,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
             return MutexGuard(m, PhantomData);
         }
         if spins == 0 {
-            event(m.id);
+            event(m.id.load(Ordering::Relaxed));
         }
         std::hint::spin_loop();
         spins += 1;
@@ -536,18 +537,6 @@ struct Pool {
     order: [u8; N],
 }
 impl Pool {
-    const fn new() -> Self {
-        let mut heads = [NONE; MAX_ORDER + 1];
-        heads[MAX_ORDER] = 0;
-        let mut order = [u8::MAX; N];
-        order[0] = MAX_ORDER as u8;
-        Self {
-            heads,
-            next: [NONE; N],
-            prev: [NONE; N],
-            order,
-        }
-    }
     fn remove(&mut self, i: usize, order: usize) {
         let (prev, next) = (self.prev[i], self.next[i]);
         if prev == NONE {
@@ -849,73 +838,29 @@ pub struct Arena {
     /// it, so the free pages of a thread's current chunks are released by the thread.
     trim_epoch: AtomicUsize,
 }
-static DEFAULT: Arena = Arena::new();
+// all zero: in the binary's zero-fill section, not 7 MB of initialised data in it (iOS); `init`
+// sets what is not zero at the first use (`init_zeroed`), as `create` does for a domain arena.
+// SAFETY: every field has a valid all-zero representation (create relies on it too).
+static DEFAULT: Arena = unsafe { std::mem::zeroed() };
 impl Arena {
-    const fn new() -> Self {
-        Self {
-            dynamic: false,
-            id: 0,
-            base: AtomicUsize::new(0),
-            init: Mutex::new(false),
-            committed: AtomicUsize::new(0),
-            chunks: AtomicUsize::new(0),
-            warm: Mutex::with_id(
-                Warm {
-                    runs: [(0, 0); WARM_MAX],
-                    len: 0,
-                    bytes: 0,
-                },
-                2,
-            ),
-            warm_large: Mutex::with_id(
-                WarmLarge {
-                    runs: [(0, 0, 0); WARM_LARGE_MAX],
-                    len: 0,
-                    bytes: 0,
-                },
-                2,
-            ),
-            headers: [const {
-                Chunk {
-                    account: AtomicUsize::new(0),
-                    owned: UnsafeCell::new(Owned { free: 0, bump: AtomicUsize::new(0), stride: 0, live: AtomicUsize::new(0), trim_seen: 0 }),
-                    owner_quiet: AtomicUsize::new(0),
-                    _line: [0; 1],
-                    remote: AtomicUsize::new(NONE),
-                    remote_bytes: AtomicUsize::new(0),
-                    live: AtomicUsize::new(0),
-                    in_part: AtomicBool::new(false),
-                    huge: AtomicBool::new(false),
-                    old: AtomicBool::new(false),
-                    state: Mutex::new(State {
-                        released: true,
-                        generation: 0,
-                        free: 0,
-                        bump: 0,
-                        stride: 0,
-                        class: 0,
-                        attached: false,
-                        committed: 0,
-                        run: 0,
-                        order: 0,
-                        bytes: 0,
-                        dirty: false,
-                    }),
-                }
-            }; N],
-            pool: Mutex::with_id(Pool::new(), 1),
-            partial: Mutex::with_id(
-                Partial {
-                    heads: [0; CLASSES],
-                    next: [0; N],
-                    prev: [0; N],
-                    class: [0; N],
-                },
-                3,
-            ),
-            live_bits: AtomicUsize::new(0),
-            trim_epoch: AtomicUsize::new(0),
+    /// The fields of an all-zero arena that are not zero: free-list and pool links (NONE), the
+    /// chunks released, the pool's one whole-reservation run, the locks' event labels.
+    unsafe fn init_zeroed(&self) {
+        for h in &self.headers {
+            h.remote.store(NONE, Ordering::Relaxed);
+            (*h.state.value.get()).released = true;
         }
+        let pool = &mut *self.pool.value.get();
+        pool.heads.fill(NONE);
+        pool.heads[MAX_ORDER] = 0;
+        pool.next.fill(NONE);
+        pool.prev.fill(NONE);
+        pool.order.fill(u8::MAX);
+        pool.order[0] = MAX_ORDER as u8;
+        self.pool.id.store(1, Ordering::Relaxed);
+        self.warm.id.store(2, Ordering::Relaxed);
+        self.warm_large.id.store(2, Ordering::Relaxed);
+        self.partial.id.store(3, Ordering::Relaxed);
     }
 
     pub fn create() -> Option<Box<Self>> {
@@ -929,17 +874,7 @@ impl Arena {
             let a = &mut *p;
             a.dynamic = true;
             a.id = NEXT_ARENA_ID.fetch_add(1, Ordering::Relaxed);
-            for h in &a.headers {
-                h.remote.store(NONE, Ordering::Relaxed);
-                (*h.state.value.get()).released = true;
-            }
-            let pool = &mut *a.pool.value.get();
-            pool.heads.fill(NONE);
-            pool.heads[MAX_ORDER] = 0;
-            pool.next.fill(NONE);
-            pool.prev.fill(NONE);
-            pool.order.fill(u8::MAX);
-            pool.order[0] = MAX_ORDER as u8;
+            a.init_zeroed();
             if heap_check_on() {
                 a.live_bits.store(os_bits_map(), Ordering::Relaxed);
             }
@@ -1255,6 +1190,10 @@ impl Arena {
             let mut tried = lock(&self.init);
             if !*tried {
                 *tried = true;
+                // the static arena's non-zero state (a domain arena's was set by `create`)
+                if !self.dynamic {
+                    unsafe { self.init_zeroed() };
+                }
                 let base = unsafe {
                     if WEB_AT != 0 {
                         os::reserve_at(WEB_AT, RESERVE, LABEL)
