@@ -601,7 +601,7 @@ mod zone {
         fn malloc_zone_realloc(zone: *mut u8, p: *mut u8, size: usize) -> *mut u8;
         fn malloc_zone_memalign(zone: *mut u8, align: usize, size: usize) -> *mut u8;
         fn malloc_zone_free(zone: *mut u8, p: *mut u8);
-        fn free(p: *mut u8);
+        fn free(p: *mut core::ffi::c_void);
     }
 
     /// The head of libmalloc's `malloc_zone_t` (stable ABI): `size` answers 0 for a pointer the
@@ -653,7 +653,7 @@ mod zone {
         if owns(p) {
             malloc_zone_free(get(), p)
         } else {
-            free(p)
+            free(p.cast())
         }
     }
 
