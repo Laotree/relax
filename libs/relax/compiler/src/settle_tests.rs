@@ -793,13 +793,12 @@ fn round50_opaque_body_invalidates_solver_answer() {
 
 // T11: reload evaluates candidates with running native code; owner: codegen2.
 #[test]
-#[ignore = "T11: candidate CTFE must be transaction-staged or restart; codegen2"]
 fn round50_foldable_const_with_native_dependent() {
     isolated_test!(round50_foldable_const_with_native_dependent);
     const CHILD: &str = "MAKEPAD_RUN_R50_FOLDED_DEPENDENT_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "jit::settle_tests::round50_foldable_const_with_native_dependent", "--ignored", "--nocapture", "--test-threads=1"])
+            .args(["--exact", "jit::settle_tests::round50_foldable_const_with_native_dependent", "--nocapture", "--test-threads=1"])
             .env(CHILD, "1").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0").output().unwrap();
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         return;
@@ -833,7 +832,6 @@ fn round50_foldable_const_with_native_dependent() {
 // T11: new inline constants reach native CTFE during the reload transaction.
 // Owner: codegen2; retained separately so ordinary body checks remain enabled.
 #[test]
-#[ignore = "T11: inline-const candidate CTFE must be transaction-staged or restart; codegen2"]
 fn round50_inline_const_reload() {
     isolated_test!(round50_inline_const_reload);
     let result = std::process::Command::new(std::env::current_exe().unwrap())

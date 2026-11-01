@@ -87,8 +87,11 @@ fn get_key(prev: u32, sorted: bool, r: &mut Cur) -> u32 {
 }
 
 /// `(lo, hi, call)`-shaped rows keyed by `lo` (`exp_map`: an expansion's text range and its call
-/// site; `rules_exp`: a macro_rules expansion's range and its definition position).
+/// site).
 pub struct Regions;
+/// `rules_exp`: a macro_rules expansion's range, its definition position (u32::MAX: another
+/// file's) and the edition of its definition (rustc ExpnData::edition, hygiene.rs).
+pub struct Rules;
 /// `(position, origin, length)` rows keyed by position (`tok_origin`, `body_origin`).
 pub struct Maps;
 /// A token's whole authored span (`token_origins`), keyed by `lo`.
@@ -109,6 +112,26 @@ impl Kind for Regions {
         let hi = key.wrapping_add(unzz(r.varint()));
         let call = prev.2.wrapping_add(unzz(r.varint()));
         (key, hi, call)
+    }
+}
+
+impl Kind for Rules {
+    type Item = (u32, u32, u32, u16);
+    #[inline]
+    fn key(r: &Self::Item) -> u32 { r.0 }
+    fn put(prev: &Self::Item, c: &Self::Item, first: bool, sorted: bool, out: &mut Vec<u8>) {
+        if !first { put_key(prev.0, c.0, sorted, out); }
+        put_varint(out, zz(c.1.wrapping_sub(c.0)));
+        put_varint(out, zz(c.2.wrapping_sub(prev.2)));
+        put_varint(out, zz((c.3 as u32).wrapping_sub(prev.3 as u32)));
+    }
+    #[inline]
+    fn get(prev: &Self::Item, first_key: Option<u32>, sorted: bool, r: &mut Cur) -> Self::Item {
+        let key = match first_key { Some(k) => k, None => get_key(prev.0, sorted, r) };
+        let hi = key.wrapping_add(unzz(r.varint()));
+        let def = prev.2.wrapping_add(unzz(r.varint()));
+        let edition = (prev.3 as u32).wrapping_add(unzz(r.varint())) as u16;
+        (key, hi, def, edition)
     }
 }
 
