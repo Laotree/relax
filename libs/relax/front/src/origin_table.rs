@@ -659,16 +659,15 @@ mod tests {
     }
 
     /// ns per lookup, plain rows (the old `origin_at` partition_point) against the table:
-    /// `cargo test --release -p relax-front origin_table::tests::bench -- --ignored --nocapture`
+    /// `cargo test --release -p relax-front origin_table::tests::bench -- --nocapture`
     #[test]
-    #[ignore]
     fn bench_lookup() {
         let mut rng = Rng(99);
         // macro expansion shaped rows: runs of copied fragment tokens, then call-site spans
         let mut rows = Vec::new();
         let mut lo = 0u32;
         let mut slo = 0u32;
-        while rows.len() < 2_000_000 {
+        while rows.len() < 4096 {
             let len = rng.next() % 9 + 1;
             if rng.next() % 5 == 0 { slo = rng.next() % 3_000_000; }
             slo += len + rng.next() % 2;
@@ -677,7 +676,7 @@ mod tests {
         }
         let t = Table::<Origins>::from_rows(&rows);
         println!("rows {} plain {} B encoded {} B ({:.2} B/row)", rows.len(), rows.len() * 20, t.bytes().len(), t.bytes().len() as f64 / rows.len() as f64);
-        let probes: Vec<u32> = (0..2_000_000).map(|_| rng.next() % lo).collect();
+        let probes: Vec<u32> = (0..4096).map(|_| rng.next() % lo).collect();
         let r: OSegRef<Origins> = (&t).into();
         for _ in 0..2 {
             let t0 = std::time::Instant::now();
