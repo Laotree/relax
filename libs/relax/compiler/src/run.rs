@@ -45,6 +45,12 @@ static MAIN_START_MS: AtomicU64 = AtomicU64::new(0);
 static ERRORS_SEEN: AtomicU64 = AtomicU64::new(0);
 static QUIET: AtomicBool = AtomicBool::new(false);
 static SILENT: AtomicBool = AtomicBool::new(false);
+
+/// `--silent`: nothing of Relax's own on stderr but errors (a program re-running itself, a
+/// binary's wrapper script).
+pub(crate) fn silent() -> bool {
+    SILENT.load(Ordering::Relaxed)
+}
 /// This run is a live session (watcher and hot reload: a failed build is fixed by an edit).
 static LIVE_SESSION: AtomicBool = AtomicBool::new(false);
 
@@ -1421,7 +1427,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let want = canon(path);
         let Some(ci) = (0..g.crates.len()).find(|&ci| crate_of[ci] != u32::MAX && canon(&g.crates[ci].src_path) == want) else {
             // not in the graph: its `required-features` are off (cargo builds and runs nothing)
-            eprintln!("makepad-run: {path}: not built (its required features are off)");
+            verbose!("makepad-run: {path}: not built (its required features are off)");
             return 0;
         };
         match find_main(&prog, crate_of[ci]) {
@@ -1499,7 +1505,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if let Some((saved_prog, saved_tcx, _)) = verification_graph {
         saved_prog.verify_collected(&u.prog);
         saved_tcx.verify_collected(&saved_prog, &u.prog, &u.tcx);
-        eprintln!("makepad-run collected: verified restored graph against rebuilt graph");
+        verbose!("makepad-run collected: verified restored graph against rebuilt graph");
     }
     let enum_errors = u.tcx.check_enum_discriminants(&u.prog, root_crate);
     if !enum_errors.is_empty() {
@@ -1545,7 +1551,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 unsafe { std::env::set_var("MAKEPAD_RUN_CACHE_STATE", if c.has_startup_manifest() { "warm" } else { "cold" }) };
                 u.cache = Some(Box::new(crate::cache::CacheCell::new(c)));
             }
-            Err(e) => eprintln!("makepad-run cache: off ({})", e),
+            Err(e) => verbose!("makepad-run cache: off ({})", e),
         }
     }
     phase("image", t);
@@ -1557,7 +1563,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         phase("test check", t_check);
         if n > 0 {
             let names: Vec<String> = test_subjects.iter().map(|&k| u.prog.syms.str(u.prog.crates[k as usize].name).to_string()).collect();
-            eprintln!("error: could not compile {} (test) due to {} previous error{}: no test ran (rustc rejects this code; `makepad test` fails as `cargo test` does)",
+            eprintln!("error: could not compile {} (test) due to {} previous error{}: no test ran (`makepad test` fails as `cargo test` does on code rustc rejects; if `cargo test` builds it, this is a makepad run bug)",
                 names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", "), n, if n == 1 { "" } else { "s" });
             std::mem::forget(u);
             return 101;
@@ -2305,9 +2311,7 @@ fn spill_cache() {
         std::thread::spawn(move || { let _z = crate::zone_alloc::compiler_thread();
             let t = Instant::now();
             let r = s.write();
-            if !VERBOSE.load(Ordering::Relaxed) {
-                if let Err(e) = &r { eprintln!("makepad-run cache: spill: {}", e); }
-            }
+            if let Err(e) = &r { verbose!("makepad-run cache: spill: {}", e); }
             if crate::memstat::enabled() || crate::preload::trace() {
                 verbose!("makepad-run cache: spilled {:?} entries in {:.1} ms at t={:.0} ms", r, t.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start());
             }
@@ -3545,9 +3549,7 @@ fn summary_inner(why: &str) {
                         verbose!("makepad-run collected: not recorded at exit: the front end is still read by another thread");
                     }
                 }
-                if !options.verbose {
-                    if let Err(e) = &r { eprintln!("makepad-run cache: write: {}", e); }
-                }
+                if let Err(e) = &r { verbose!("makepad-run cache: write: {}", e); }
                 let st = &c.stats;
                 verbose!(
                     "makepad-run cache: {} hits, {} misses, {} link failures, {} refused by their dependency certificate (per-item cpu: body digests {:.1} ms, certificates written {:.1} ms, checked {:.1} ms) (link {:.1} ms wall with the lock; by speculative workers {} hits {:.1} ms), {} recorded, {} not storable {:?}; written {:?} in {:.1} ms",
