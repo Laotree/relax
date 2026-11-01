@@ -295,6 +295,35 @@ pub(crate) struct Resolved {
     pub live_inputs: Option<crate::reload::Inputs>,
 }
 
+pub(crate) enum ResolveError {
+    Failed(String),
+    ProvidedChanged(crate::provided::ProvidedChange),
+}
+
+impl From<String> for ResolveError {
+    fn from(message: String) -> Self { Self::Failed(message) }
+}
+
+impl From<crate::provided::SourceCheckError> for ResolveError {
+    fn from(error: crate::provided::SourceCheckError) -> Self {
+        match error {
+            crate::provided::SourceCheckError::Changed(change) => Self::ProvidedChanged(change),
+            crate::provided::SourceCheckError::Invalid(message) => Self::Failed(message),
+        }
+    }
+}
+
+/// A boot that cannot bind its provided libraries keeps the run window for the update offer.
+fn offer_boot_update(change: crate::provided::ProvidedChange) -> i32 {
+    if let Err(e) = finish_window() {
+        report_failed(&e, 1);
+        eprintln!("makepad-run: {e}");
+        return 1;
+    }
+    crate::reload::host::offer_provided(change, None);
+    0
+}
+
 /// The boot's resolved package, handed to the app domain it starts (once: a relaunch resolves
 /// again, so an edited source or manifest is read).
 static HANDOFF: relax_session::sync::Mutex<Option<Resolved>> = relax_session::sync::Mutex::new(None);
@@ -342,7 +371,7 @@ pub(crate) fn resolve_package(
     std_dir: &str,
     who: ResolveFor,
     check_only: bool,
-) -> Result<Resolved, String> {
+) -> Result<Resolved, ResolveError> {
     let boot = who == ResolveFor::Boot;
     let checkpoint = |name: &str| match who {
         ResolveFor::Domain(id) => crate::domain::compile_phase(id, name),
@@ -380,6 +409,8 @@ pub(crate) fn resolve_package(
             (MAIN_HOST.get().expect("run host").open)(&package, &dir)
         })
     });
+    // Keep the window even when resolution ends with an update offer before loading.
+    if let Some(window) = window { *PENDING_WINDOW.lock().unwrap() = Some(window); }
     // provided crates bind only to their own source (before substitution rewrites deps); the
     // sysroot proc_macro (with_sysroot_proc_macro) is part of Relax's std, not of their identity
     let pm_root = crate::vfs::normalize_path(&format!("{}/proc_macro/lib.rs", std_dir));
@@ -510,7 +541,6 @@ pub(crate) fn resolve_package(
     }
     // The window is still opening: the load goes on beside it and `finish_window` joins it where
     // the run needs the host (before the program starts).
-    if let Some(window) = window { *PENDING_WINDOW.lock().unwrap() = Some(window); }
     Ok(Resolved { units, g, order, cfgs, live_inputs })
 }
 
@@ -865,7 +895,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
 
     let Resolved { units, g, order, cfgs, live_inputs } = match resolve_package(sess, &workspace, &package, &cargo_flags, &units_json, &target_dir, &std_dir, ResolveFor::Boot, check) {
         Ok(r) => r,
-        Err(e) => {
+        Err(ResolveError::ProvidedChanged(change)) => return offer_boot_update(change),
+        Err(ResolveError::Failed(e)) => {
             if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&e, "resolve")); }
             eprintln!("makepad-run: {e}");
             // a launcher following the start (--report-to) learns why it ended
@@ -1491,10 +1522,14 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // The provided crates bind in Unit::new: their source check has passed before it.
     {
         let t = Instant::now();
-        if let Err(e) = crate::provided::finish_sources() {
-            if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&e, "resolve")); }
-            eprintln!("makepad-run: {e}");
-            return 1;
+        match crate::provided::finish_sources() {
+            Err(crate::provided::SourceCheckError::Changed(change)) => return offer_boot_update(change),
+            Err(crate::provided::SourceCheckError::Invalid(e)) => {
+                if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&e, "resolve")); }
+                eprintln!("makepad-run: {e}");
+                return 1;
+            }
+            Ok(()) => {}
         }
         phase("provided sources", t);
     }

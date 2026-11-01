@@ -4052,6 +4052,7 @@ fn note_restart_pending(why: &str) {
 pub fn relaunch_pending() -> Result<&'static str, String> {
     let why = RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).join("; ");
     eprintln!("makepad live: session relaunch: {}", if why.is_empty() { "nothing waits" } else { why.as_str() });
+    if let Some(result) = host::relaunch() { return result; }
     restart_in_place(if why.is_empty() { "session relaunch".into() } else { why })
 }
 
