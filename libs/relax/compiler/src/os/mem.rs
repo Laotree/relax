@@ -270,7 +270,7 @@ mod imp {
         fn close(fd: i32) -> i32;
         fn lseek(fd: i32, off: i64, whence: i32) -> i64;
         fn pwrite(fd: i32, buf: *const u8, n: usize, off: i64) -> isize;
-        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+        fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
         fn _exit(code: i32) -> !;
     }
     #[cfg(target_arch = "x86_64")]
@@ -373,7 +373,7 @@ mod imp {
                     && mmap(rw as *mut u8, size as usize, PROT_RW, MAP_SHARED | MAP_FIXED, fd, 0) as u64 == rw;
                 if !ok {
                     let msg = b"makepad run: the forked child has no copy of its code memory, exiting\n";
-                    write(2, msg.as_ptr(), msg.len());
+                    write(2, msg.as_ptr().cast(), msg.len());
                     _exit(134);
                 }
                 close(fdc.swap(fd as i64, Ordering::Relaxed) as i32);
@@ -636,7 +636,7 @@ mod imp {
         #[allow(clippy::too_many_arguments)]
         fn mach_vm_remap(target: u32, addr: *mut u64, size: u64, mask: u64, flags: i32, src_task: u32, src_addr: u64, copy: i32, cur: *mut i32, max: *mut i32, inherit: u32) -> i32;
         fn pthread_atfork(prepare: Option<extern "C" fn()>, parent: Option<extern "C" fn()>, child: Option<extern "C" fn()>) -> i32;
-        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+        fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
         fn _exit(code: i32) -> !;
     }
 
@@ -666,7 +666,7 @@ mod imp {
                 let (mut cur, mut max) = (0i32, 0i32);
                 if mach_vm_remap(task, &mut at, size, 0, VM_FLAGS_FIXED, task, rw, 0, &mut cur, &mut max, VM_INHERIT_NONE) != 0 || at != context || mprotect(context as *mut u8, size as usize, 5) != 0 {
                     let msg = b"makepad: forked child cannot map its code memory, exiting\n";
-                    write(2, msg.as_ptr(), msg.len());
+                    write(2, msg.as_ptr().cast(), msg.len());
                     _exit(134);
                 }
             }

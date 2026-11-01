@@ -37,7 +37,7 @@ mod imp {
 
     extern "C" {
         fn syscall(n: i64, ...) -> i64;
-        fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
+        fn read(fd: i32, buf: *mut core::ffi::c_void, n: usize) -> isize;
         fn close(fd: i32) -> i32;
     }
 
@@ -62,7 +62,7 @@ mod imp {
     /// The count, scaled by enabled / running time (multiplexed counters).
     fn value(fd: i32) -> Option<f64> {
         let mut b = [0u64; 3];
-        let r = unsafe { read(fd, b.as_mut_ptr() as *mut u8, 24) };
+        let r = unsafe { read(fd, b.as_mut_ptr().cast(), 24) };
         if r != 24 || b[2] == 0 {
             return None;
         }

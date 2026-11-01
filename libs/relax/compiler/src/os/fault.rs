@@ -972,9 +972,9 @@ pub fn raw_stderr(b: &[u8]) {
     #[cfg(unix)]
     unsafe {
         extern "C" {
-            fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+            fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
         }
-        let _ = write(crate::tui::fault_fd(), b.as_ptr(), b.len());
+        let _ = write(crate::tui::fault_fd(), b.as_ptr().cast(), b.len());
     }
     #[cfg(windows)]
     {
