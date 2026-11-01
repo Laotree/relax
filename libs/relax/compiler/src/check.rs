@@ -202,7 +202,10 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     errors.extend(relax_types::item_checks::param_attributes(&u.prog, &own));
     errors.extend(relax_types::item_checks::foreign_blocks(&u.prog, &own));
     errors.extend(relax_types::item_checks::duplicate_symbols(&u.prog, &own));
-    errors.extend(relax_types::item_checks::global_allocators_and_lang_items(&u.prog, &own));
+    // the compiled binaries: `makepad test`'s subjects are each a test binary (cargo builds every
+    // target separately); a check's are its bin crates
+    let binaries: Vec<u32> = crates.iter().copied().filter(|&k| subjects_mode() != 0 || u.prog.crates[k as usize].is_bin).collect();
+    errors.extend(relax_types::item_checks::global_allocators_and_lang_items(&u.prog, &own, &binaries));
     errors.extend(relax_types::proc_macro_harness::check(&u.prog, &u.tcx, &own));
     let entry = u.prog.crates[root as usize].is_bin && subjects_mode() != 2;
     if entry { errors.extend(relax_types::item_checks::entry_point(&u.prog, root)); }
