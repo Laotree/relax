@@ -144,6 +144,17 @@ pub fn failed(outcome: Outcome, lines: &[String], group: Option<u32>) -> bool {
     true
 }
 
+/// devhub's lane verdict channel: the run could not get past a JIT failure (its hot load failed
+/// and the warm restart that follows it failed too; `record`: this ledger's id, `reason`: one
+/// line). A hot-load failure the warm restart recovers is `patchfailed` then `patchrestarted`,
+/// never this. The agent's run reads "JIT error, not your change" from devhub; the text verdict
+/// line is a log line only.
+fn jit_error(record: &str, reason: &str) {
+    let reason = reason.lines().next().unwrap_or("");
+    crate::inspect::events::emit("jiterror", record,
+        &format!("\"record\":{},\"reason\":{}", crate::inspect::json_str(record), crate::inspect::json_str(reason)));
+}
+
 pub fn recovering() -> bool { ACTIVE.load(Ordering::Acquire) }
 pub(crate) fn enable() { REPORTING.store(true, Ordering::Release); }
 pub fn has_error() -> bool { ERROR.load(Ordering::Acquire) }
@@ -179,7 +190,7 @@ pub fn pump() {
         if let Some(recovery) = recovery {
             let outcome = if error.is_some() { Outcome::RestartFailed } else { Outcome::Restarted };
             let reason = error.unwrap_or_else(|| "warm restart completed".into());
-            let r = record(&recovery.attempt, outcome, reason.clone(), recovery.failure, vec![reason]);
+            let r = record(&recovery.attempt, outcome, reason.clone(), recovery.failure, vec![reason.clone()]);
             let record_id = r.id.clone();
             let load_id = r.load.clone();
             state().pending.push_back(r);
@@ -190,8 +201,12 @@ pub fn pump() {
                 state().terminal = Some(record_id.clone());
                 ERROR.store(true, Ordering::Release);
             }
-            crate::inspect::events::emit(if outcome == Outcome::RestartFailed { "jiterror" } else { "patchrestarted" }, &record_id,
-                &format!("\"record\":{},\"load\":{}", crate::inspect::json_str(&record_id), crate::inspect::json_str(&load_id)));
+            if outcome == Outcome::RestartFailed {
+                jit_error(&record_id, &reason);
+            } else {
+                crate::inspect::events::emit("patchrestarted", &record_id,
+                    &format!("\"record\":{},\"load\":{}", crate::inspect::json_str(&record_id), crate::inspect::json_str(&load_id)));
+            }
         }
         ACTIVE.store(false, Ordering::Release);
         REPLACEMENT.store(false, Ordering::Release);
