@@ -160,6 +160,11 @@ fn usage() -> i32 {
 static GANDALF_CONSOLE: relax_session::sync::Mutex<Option<crate::gandalf_out::Console>> = relax_session::sync::Mutex::new(None);
 
 pub fn cmd_run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
+    // Restore before resolution so a failed replacement compile is a JIT verdict too.
+    if std::env::var_os("MAKEPAD_JIT_RECOVERY").is_some() {
+        crate::hot_failure::enable();
+        crate::hot_failure::restore();
+    }
     let json = args.iter().any(|a| a == "--json") && args.iter().any(|a| a == "--check");
     let start = std::time::Instant::now();
     if json { crate::diag::enable(); }
@@ -182,6 +187,11 @@ pub fn cmd_run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     } else {
         cmd_run_inner(sess, args, None)
     };
+    if crate::harness::live::enabled() && crate::hot_failure::recovering() {
+        crate::hot_failure::restart_failed(&format!("the replacement test harness ended before a verdict (exit {code})"));
+        crate::hot_failure::pump();
+    }
+    let code = crate::hot_failure::verdict(code).code();
     crate::tui::exit_code(code);
     if let Some(exit) = EXIT_SUMMARY.get() {
         // atexit runs after application TLS destructors. Do not quiesce earlier:
@@ -1774,7 +1784,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     unsafe {
         std::env::set_var("MAKEPAD_RUN_STARTUP_T0", crate::clock::process_start_epoch().to_string());
         std::env::set_var("MAKEPAD_RUN_MAIN_MS", crate::clock::ms_since_process_start().to_string());
-        if SILENT.load(Ordering::Relaxed) {
+        if SILENT.load(Ordering::Relaxed) && !live_tests {
             std::env::remove_var("MAKEPAD_RUN_PACKAGE");
         } else {
             std::env::set_var("MAKEPAD_RUN_PACKAGE", &package);

@@ -59,7 +59,7 @@ pub fn parked_events(domain: u32) -> Option<Vec<std::sync::Arc<str>>> {
         .map(|p| p.event.clone()).collect())
 }
 
-pub const KINDS: &[&str] = &["panic", "hang", "deadlock", "mem", "spike", "hitch", "rtstall", "scripterr", "patchrefused", "patchverified", "patchreverted", "engine_request", "engine_reply", "engine_code_update"];
+pub const KINDS: &[&str] = &["panic", "hang", "deadlock", "mem", "spike", "hitch", "rtstall", "scripterr", "patchrefused", "patchverified", "patchreverted", "patchfailed", "patchrestarted", "jiterror", "engine_request", "engine_reply", "engine_code_update"];
 
 /// Records an event (`fields`: the kind-specific JSON members, without braces). Returns its seq,
 /// or 0 when it repeated one sent in the last 30 s.
@@ -346,6 +346,12 @@ pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
         return;
     }
     let domain = crate::domain::current_app_domain();
+    if crate::hot_failure::recovering() && crate::hot_failure::replacement_running() && domain == crate::run::app_domain() {
+        // Recovery is an infrastructure attempt. Publish its failure to the
+        // watcher and unwind; parking it would ask the agent to repair the JIT.
+        crate::hot_failure::restart_failed(&format!("{}: {} at {}", info.kind, info.message, info.location));
+        return;
+    }
     // the run window shows the app's parked panic (resume, restart) in a live session; a run that
     // is none (a test's child) ends as its panic ends it
     let watched = WATCHERS.load(SeqCst) > 0 || super::AGENT.load(Relaxed)
