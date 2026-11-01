@@ -675,6 +675,7 @@ pub(crate) fn first_present() {
     {
         let mut d = domains();
         if let Some(x) = d.iter_mut().find(|x| x.info.base == base && x.info.first_frame_ms.is_none()) {
+            if crate::run::app_domain() == Some(x.info.id) || x.info.id == 0 && crate::run::app_domain().is_none() { crate::hot_failure::ready(); }
             x.info.first_frame_ms = Some(x.started.elapsed().as_secs_f64() * 1e3);
             crate::run::domain_present();
         }
@@ -1265,6 +1266,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     if cancelled(id) { return Ok(id); }
     if crate::run::app_domain() == Some(id) {
         crate::reload::domain_loaded(live_inputs);
+        crate::hot_failure::replacement_loaded();
     }
     // the domain's main thread (its name, its handle) is process state
     if crate::preload::trace() { eprintln!("boot-trace: domain {id} launching at t={:.1} ms", crate::clock::ms_since_start()); }
@@ -1331,6 +1333,9 @@ pub(crate) const EXIT_KIND: &str = "domain exit";
 
 /// The domain ends in `st` (exited or crashed); a domain that already ended keeps its first end.
 fn end(id: DomainId, st: DomainState) {
+    if crate::run::app_domain() == Some(id) && crate::hot_failure::replacement_running() {
+        if let DomainState::Crashed(why) = &st { crate::hot_failure::restart_failed(why); }
+    }
     if matches!(state(id), Some(DomainState::Compiling(_) | DomainState::Running)) {
         set_state(id, st);
     }

@@ -78,6 +78,10 @@ pub(super) struct Verdict {
 
 /// Park outside the compiler owner until the next verified edit.
 pub(super) fn complete(v: Verdict, ms: f64) -> Edit {
+    // A recovered test process proves readiness with its first completed test run.
+    crate::hot_failure::ready();
+    crate::hot_failure::pump();
+    if crate::hot_failure::has_error() { std::process::exit(crate::hot_failure::verdict(101).code()); }
     let (state, ready) = LIVE.get().unwrap();
     let mut s = state.lock().unwrap();
     s.runs += 1;
@@ -144,7 +148,12 @@ pub(super) extern "C" fn take_fault() -> u32 { FAULT.with(|f| f.replace(false)) 
 pub(crate) fn restart(mut edit: Edit, why: &str) {
     edit.restarted = true;
     LIVE.get().unwrap().0.lock().unwrap().edit = edit;
-    if let Err(e) = crate::reload::restart_process(why) { eprintln!("makepad test: {e}"); }
+    if let Err(e) = crate::reload::restart_process(why) {
+        eprintln!("makepad test: {e}");
+        crate::hot_failure::restart_failed(&e);
+        crate::hot_failure::pump();
+        if crate::hot_failure::has_error() { std::process::exit(crate::hot_failure::verdict(101).code()); }
+    }
 }
 
 /// Replace the previous exec marker before the package, preserving the libtest argv verbatim.
