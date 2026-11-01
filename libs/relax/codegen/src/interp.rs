@@ -148,13 +148,13 @@ macro_rules! gsym {
 }
 
 /// `x16 = &symbol` (page + offset), in the object format's syntax.
-#[cfg(target_vendor = "apple")]
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
 macro_rules! adrp_add_x16 {
     ($s:literal) => {
         concat!("  adrp x16, _", $s, "@PAGE\n  add x16, x16, _", $s, "@PAGEOFF")
     };
 }
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
 macro_rules! adrp_add_x16 {
     ($s:literal) => {
         concat!("  adrp x16, ", $s, "\n  add x16, x16, :lo12:", $s)
