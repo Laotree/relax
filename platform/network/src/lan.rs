@@ -225,21 +225,29 @@ pub fn service(site: &str) -> bool {
     ok
 }
 
-/// A hub's LAN service needs both the user setting and the process LAN permission.
+/// A hub's LAN service needs a fleet-server role or the user setting, plus process LAN permission.
 pub fn hub_service(site: &str) -> bool {
-    let on = crate::netconfig::networked_ai_hub();
-    let ok = on && service(site);
+    let on = crate::netconfig::hub_networked();
+    let ok = hub_service_with(on, || service(site));
     hub_audit(site, "lan service", true, ok, on);
     ok
 }
 
-/// Hub connections keep loopback and routed addresses available with the setting off.
+fn hub_service_with(on: bool, service: impl FnOnce() -> bool) -> bool {
+    on && service()
+}
+
+/// User-machine hub connections keep loopback and routed addresses available with the setting off.
 pub fn hub_check(site: &str, addr: SocketAddr) -> std::io::Result<()> {
-    let on = crate::netconfig::networked_ai_hub();
+    let on = crate::netconfig::hub_networked();
     let local = is_local_network(addr.ip());
-    let result = hub_permission(site, &addr.to_string(), local, on).and_then(|_| check(site, addr));
+    let result = hub_check_with(site, addr, on, || check(site, addr));
     hub_audit(site, &addr.to_string(), local, result.is_ok(), on);
     result
+}
+
+fn hub_check_with(site: &str, addr: SocketAddr, on: bool, check: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+    hub_permission(site, &addr.to_string(), is_local_network(addr.ip()), on).and_then(|_| check())
 }
 
 pub fn hub_connect_timeout(site: &str, addr: &SocketAddr, timeout: std::time::Duration) -> std::io::Result<std::net::TcpStream> {
@@ -253,7 +261,7 @@ pub fn hub_connect_host(site: &str, host: &str, port: u16, timeout: Option<std::
 
 /// Check before name resolution, so a `.local` name cannot trigger mDNS while off.
 pub fn hub_check_host(site: &str, host: &str) -> std::io::Result<()> {
-    let on = crate::netconfig::networked_ai_hub();
+    let on = crate::netconfig::hub_networked();
     let local = !may_reach_host_when_off(host);
     let result = hub_permission(site, host, local, on).and_then(|_| check_host(site, host));
     hub_audit(site, host, local, result.is_ok(), on);
@@ -265,23 +273,27 @@ pub fn hub_check_url(site: &str, url: &str) -> std::io::Result<()> {
 }
 
 pub fn hub_may_reach_host(host: &str) -> bool {
-    may_reach_host_when_off(host) || (crate::netconfig::networked_ai_hub() && may_reach_host(host))
+    may_reach_host_when_off(host) || (crate::netconfig::hub_networked() && may_reach_host(host))
 }
 
 /// Wildcard and other non-loopback listeners expose the hub to peers.
 pub fn hub_bind_ok(addr: SocketAddr) -> bool {
-    let on = crate::netconfig::networked_ai_hub();
+    let on = crate::netconfig::hub_networked();
     let local = !addr.ip().to_canonical().is_loopback();
-    let ok = !local || on;
+    let ok = hub_bind_ok_with(addr, on);
     hub_audit("ai-hub bind", &addr.to_string(), local, ok, on);
     ok
+}
+
+fn hub_bind_ok_with(addr: SocketAddr, on: bool) -> bool {
+    addr.ip().to_canonical().is_loopback() || on
 }
 
 fn hub_permission(site: &str, target: &str, local: bool, on: bool) -> std::io::Result<()> {
     if local && !on {
         Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("{site}: {target} needs Networked AI hub ({} = on in network.conf; toggle it in the runner's Settings)", crate::netconfig::NETWORKED_AI_HUB_KEY),
+            format!("{site}: {target} needs Networked AI hub ({} = on in network.conf) (this is a user machine; toggle in runner Settings or set {} = server for a fleet node)", crate::netconfig::NETWORKED_AI_HUB_KEY, crate::netconfig::AI_HUB_ROLE_KEY),
         ))
     } else {
         Ok(())
@@ -311,7 +323,15 @@ fn audit(site: &str, target: &str, local: bool, ok: bool) {
 }
 
 fn hub_audit(site: &str, target: &str, local: bool, ok: bool, on: bool) {
-    audit_rule("hub", site, target, local, ok, if on { " networked_ai_hub=on" } else { " networked_ai_hub=off" });
+    if crate::socket_audit::enabled() {
+        let role = match crate::netconfig::hub_role() {
+            crate::netconfig::HubRole::FleetServer => "fleet-server",
+            crate::netconfig::HubRole::UserMachine => "user",
+        };
+        let setting = if crate::netconfig::networked_ai_hub() { "on" } else { "off" };
+        let networked = if on { "on" } else { "off" };
+        audit_rule("hub", site, target, local, ok, &format!(" networked_ai_hub={setting} role={role} hub_networked={networked}"));
+    }
 }
 
 fn audit_rule(rule: &str, site: &str, target: &str, local: bool, ok: bool, setting: &str) {
@@ -325,6 +345,32 @@ fn audit_rule(rule: &str, site: &str, target: &str, local: bool, ok: bool, setti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hub_roles_with_user_setting_off() {
+        use crate::netconfig::{hub_networked_from, HubRole};
+
+        let wildcard = SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 8123));
+        let loopback = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 8123));
+        let lan = SocketAddr::from((std::net::Ipv4Addr::BROADCAST, 8123));
+        for role in [HubRole::FleetServer, HubRole::UserMachine] {
+            let server = role == HubRole::FleetServer;
+            let on = hub_networked_from(server, || false);
+            assert_eq!(hub_bind_ok_with(wildcard, on), server);
+            assert_eq!(hub_bind_ok_with(lan, on), server);
+            assert!(hub_bind_ok_with(loopback, on));
+            assert_eq!(hub_service_with(on, || true), server);
+            assert!(!hub_service_with(on, || false));
+            let result = hub_check_with("test", lan, on, || Ok(()));
+            assert_eq!(result.is_ok(), server);
+            if let Err(error) = result {
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(error.to_string().contains("this is a user machine"));
+            }
+            assert!(hub_check_with("test", loopback, on, || Ok(())).is_ok());
+            assert!(hub_check_with("test", lan, on, || Err(refusal("test", "LAN"))).is_err());
+        }
+    }
 
     #[test]
     fn hub_off_refuses_lan_before_connect_or_resolution() {
