@@ -47,7 +47,7 @@
 //! Native shims and runtime helpers use this global allocator and stay shared. Domain frees
 //! and reallocs find the owning range, including calls from native code and other threads.
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
 #[allow(dead_code)]
 mod burst {
     pub const COMPILER: bool = false;
@@ -57,7 +57,7 @@ mod burst {
     #[cfg(test)]
     include!("zone_alloc/arena_tests.rs");
 }
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
 #[allow(dead_code)]
 mod compiler {
     pub const COMPILER: bool = true;
@@ -65,11 +65,11 @@ mod compiler {
     const WEB_AT: usize = 0;
     include!("zone_alloc/arena.rs");
 }
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 pub mod web;
 
 // No TLS, reservation, environment read, or routing on wasm/unsupported targets.
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android", windows)))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows)))]
 #[allow(dead_code)]
 mod disabled {
     use std::alloc::Layout;
@@ -133,9 +133,9 @@ mod disabled {
         unreachable!()
     }
 }
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android", windows)))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows)))]
 use disabled as burst;
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android", windows)))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows)))]
 use disabled as compiler;
 
 pub use burst::{copy_out, stats as burst_stats, trim as burst_trim, ScratchGuard};
@@ -267,7 +267,7 @@ pub use relax_session::phase::{in_compiler, PhaseGuard};
 use relax_session::phase::ROUTING as MODE;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use std::sync::atomic::AtomicBool;
 
 /// (committed bytes, live requested bytes, committed 2 MB chunk equivalents) of the compiler arena.
@@ -440,18 +440,18 @@ pub fn burst_owns(p: *const u8) -> bool {
     burst::owns(p as *mut u8)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
 pub mod domain;
 
 pub struct RelaxAlloc;
 
 /// Set when the program announces a malloc-zone swap (before it happens).
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 static OWN_ZONE: AtomicBool = AtomicBool::new(false);
 
 /// From now on allocate from Relax's own zone (jit.rs allocator_swap, phase 0).
 pub fn use_own_zone() {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
         zone::get();
         OWN_ZONE.store(true, Ordering::Release);
@@ -460,14 +460,14 @@ pub fn use_own_zone() {
 
 /// Returns the free pages of Relax's own malloc zone to the system (macOS; nothing elsewhere).
 pub fn zone_relief() {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     if OWN_ZONE.load(Ordering::Relaxed) {
         extern "C" { fn malloc_zone_pressure_relief(zone: *const u8, goal: usize) -> usize; }
         unsafe { malloc_zone_pressure_relief(zone::get(), 0) };
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod zone {
     use std::sync::atomic::{AtomicPtr, Ordering};
 
@@ -567,7 +567,7 @@ unsafe impl GlobalAlloc for RelaxAlloc {
                 return p;
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         if OWN_ZONE.load(Ordering::Relaxed) {
             return zone::alloc(l.size(), l.align());
         }
@@ -591,7 +591,7 @@ unsafe impl GlobalAlloc for RelaxAlloc {
                 return p;
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         if OWN_ZONE.load(Ordering::Relaxed) {
             return zone::alloc_zeroed(l.size(), l.align());
         }
@@ -605,14 +605,14 @@ unsafe impl GlobalAlloc for RelaxAlloc {
             zap(p, l);
             return compiler::dealloc(p, l);
         }
-        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
         if domain::dealloc_layout(p, l) { return; }
         if burst::owns(p) {
             zap(p, l);
             job_count(-(l.size() as isize));
             return burst::dealloc(p, l);
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         if OWN_ZONE.load(Ordering::Relaxed) {
             return zone::dealloc(p);
         }
@@ -620,7 +620,7 @@ unsafe impl GlobalAlloc for RelaxAlloc {
     }
     #[inline]
     unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
-        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
         if let Some(q) = domain::realloc_layout(p, l, size) { return q; }
         let in_burst = burst::owns(p);
         // A job-arena block moves to wherever the scope and phase send it now. A block of another
@@ -647,7 +647,7 @@ unsafe impl GlobalAlloc for RelaxAlloc {
             }
             return n;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         if OWN_ZONE.load(Ordering::Relaxed) {
             return zone::realloc(p, l.size(), l.align(), size);
         }
@@ -664,7 +664,7 @@ pub(crate) fn test_serial() -> relax_session::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-#[cfg(all(test, any(target_os = "macos", target_os = "linux", target_os = "android", windows)))]
+#[cfg(all(test, any(target_vendor = "apple", target_os = "linux", target_os = "android", windows)))]
 mod routing_tests {
     use super::*;
 

@@ -450,7 +450,7 @@ pub unsafe extern "C" fn program_malloc_trim(pad: usize) -> i32 {
     }
     malloc_trim(pad)
 }
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub unsafe extern "C" fn program_pressure_relief(zone: *const u8, goal: usize) -> usize {
     extern "C" {
         fn malloc_zone_pressure_relief(zone: *const u8, goal: usize) -> usize;
@@ -476,7 +476,7 @@ pub fn symbol(name: &[u8]) -> Option<usize> {
         b"posix_memalign" => program_memalign as *const () as usize,
         #[cfg(target_os = "linux")]
         b"malloc_trim" => program_malloc_trim as *const () as usize,
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         b"malloc_zone_pressure_relief" => program_pressure_relief as *const () as usize,
         #[cfg(windows)]
         b"_aligned_malloc" => program_aligned_malloc as *const () as usize,

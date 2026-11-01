@@ -17,7 +17,7 @@
 
 // Sampling interposers exist on Linux x86-64 and macOS arm64. Other native targets bind the
 // same program allocator directly, so ownership does not depend on sampling support.
-#![cfg_attr(not(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64"))), allow(dead_code))]
+#![cfg_attr(not(any(all(target_os = "linux", target_arch = "x86_64"), all(target_vendor = "apple", target_arch = "aarch64"))), allow(dead_code))]
 
 use super::{json_str, now_ms, Out, Req};
 use std::cell::Cell;
@@ -48,7 +48,7 @@ fn targets() -> [&'static AtomicUsize; 9] {
 /// its veneer, with the word set to the program allocator on first use. Targets without
 /// sampling veneers bind that allocator directly. None: not an allocator symbol.
 pub fn veneer(name: &[u8]) -> Option<usize> {
-    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_vendor = "apple", target_arch = "aarch64")))]
     {
         let k = NAMES.iter().position(|n| n.as_bytes() == name)?;
         init_real();
@@ -65,7 +65,7 @@ pub fn veneer(name: &[u8]) -> Option<usize> {
         ];
         Some(v[k])
     }
-    #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64"))))]
+    #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), all(target_vendor = "apple", target_arch = "aarch64"))))]
     {
         crate::zone_alloc::domain::symbol(name)
     }
@@ -189,7 +189,7 @@ mod imp {
     }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 mod imp {
     use super::*;
     #[unsafe(naked)]
@@ -509,7 +509,7 @@ pub(crate) fn stack_changed() {
 /// progress may hold the loader lock and be allocating). Return addresses only.
 #[inline(never)]
 pub(crate) fn capture_host(out: &mut [u64; DEPTH]) -> u8 {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
     {
         let mut f: u64;
         unsafe { std::arch::asm!("mov {}, x29", out(reg) f) };
@@ -553,7 +553,7 @@ pub(crate) fn capture_host(out: &mut [u64; DEPTH]) -> u8 {
         out[..n].copy_from_slice(&buf[1..1 + n]);
         n as u8
     }
-    #[cfg(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))))]
+    #[cfg(not(any(all(target_vendor = "apple", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))))]
     {
         let _ = out;
         0
@@ -942,7 +942,7 @@ fn start(host: bool, rate: u64) -> Result<(), &'static str> {
 }
 
 fn start_life(host: bool, rate: u64, life: Option<u64>) -> Result<(), &'static str> {
-    let supported = cfg!(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")));
+    let supported = cfg!(any(all(target_os = "linux", target_arch = "x86_64"), all(target_vendor = "apple", target_arch = "aarch64")));
     if !supported {
         return Err("heap tracking needs macOS arm64 or Linux x86_64");
     }
@@ -955,7 +955,7 @@ fn start_life(host: bool, rate: u64, life: Option<u64>) -> Result<(), &'static s
         crate::memstat::set_tracker(Some((host_alloc, host_free)));
         return Ok(());
     }
-    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_vendor = "apple", target_arch = "aarch64")))]
     {
         if REAL[0].load(Relaxed) == 0 {
             return Err("the program has not called the allocator through makepad run yet: ask again in a second (it hooks the allocator on its first call)");
