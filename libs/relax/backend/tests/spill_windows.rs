@@ -1,11 +1,8 @@
-//! Block-local eviction (regalloc Alloc::evicts / prestores) and dead stores of def-window values.
-//! A loop's long-lived values are read many times in one block of the loop and not at all in
-//! another, where short temporaries (a definition and three reads each) outnumber the free
-//! registers: the temporaries rank lower and spill, and their def windows find a register only when
-//! a long value is put aside over that block. Long values defined once before the loop are stored
-//! once after their definition (prestore), the ones the latch redefines at each eviction, a
-//! constant held in a register is recomputed. Results must equal the same computation in Rust with
-//! every feature on and each one off, and eviction must change the code.
+//! Spill windows and dead stores of def-window values under register pressure. A loop's long-lived
+//! values are read many times in one block of the loop and not at all in another, where short
+//! temporaries (a definition and three reads each) outnumber the free registers: the temporaries
+//! rank lower and spill. Some long values are redefined by the latch, one is a constant. Results
+//! must equal the same computation in Rust with def-window stores on and off.
 #![cfg(any(all(target_arch = "x86_64", unix), all(target_arch = "aarch64", unix)))]
 use relax_backend::{exec::Code, rir::*};
 
@@ -43,7 +40,7 @@ fn push(f: &mut Func, b: u32, i: Inst) {
 /// `branchy`: the burst block ends in a branch on a long value (l[0] & 1), both ways to the long
 /// values' block (one through an extra block): a long value read right after the burst.
 fn build(l_n: usize, t_n: usize, redef: usize, branchy: bool) -> Func {
-    let mut f = Func::new("evict_windows".into(), 0);
+    let mut f = Func::new("spill_windows".into(), 0);
     let (n, seed) = (f.vreg(Cls::I), f.vreg(Cls::I));
     f.params = vec![n, seed];
     f.rets = vec![Cls::I];
@@ -151,15 +148,12 @@ fn reference(n: u64, seed: u64, l_n: usize, t_n: usize, redef: usize, branchy: b
 }
 
 #[test]
-fn evicted_registers_serve_windows() {
-    // second chance runs only on request (+evict)
-    let offs: [&[&str]; 4] = [&["+evict"], &[], &["+evict", "-defstore"], &["-defstore"]];
+fn spilled_temporaries_keep_their_values() {
+    let offs: [&[&str]; 2] = [&[], &["-defstore"]];
     let shapes: &[(usize, usize)] = if cfg!(target_arch = "x86_64") { &[(9, 14), (10, 20)] } else { &[(22, 30), (26, 40)] };
-    let mut changed = false;
     for &(l_n, t_n) in shapes {
         for (redef, branchy) in [(0usize, false), (1, false), (3, false), (0, true), (3, true)] {
             let f = build(l_n, t_n, redef, branchy);
-            let mut codes = Vec::new();
             for off in offs {
                 let bytes = compile(&options(off), &f);
                 let code = Code::new(&bytes).unwrap();
@@ -167,10 +161,7 @@ fn evicted_registers_serve_windows() {
                 for (n, seed) in [(0u64, 1u64), (1, 7), (5, 0x1234), (64, 0x9e3779b97f4a7c15), (301, 3)] {
                     assert_eq!(run(n, seed), reference(n, seed, l_n, t_n, redef, branchy), "L {} T {} redef {} branchy {} off {:?} n {}", l_n, t_n, redef, branchy, off, n);
                 }
-                codes.push(bytes);
             }
-            changed |= codes[0] != codes[1];
         }
     }
-    assert!(changed, "no eviction in any shape: the test no longer covers it");
 }

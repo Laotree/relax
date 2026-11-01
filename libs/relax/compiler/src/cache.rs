@@ -2043,11 +2043,6 @@ impl Cache {
         }
     }
 
-    /// The slot a key encoding names in this run (startup manifest).
-    pub fn slot_for_bytes(&mut self, u: &mut Unit, b: &[u8]) -> Option<u32> {
-        self.slot_of_bytes(u, b)
-    }
-
     /// The key encodings of the slots real-time threads of the program rooted at crate `root`
     /// reached in earlier runs (jit.rs realtime; resolve them with slot_for_bytes_unit): compiled
     /// ahead when the program marks its real-time code.
@@ -2147,11 +2142,6 @@ impl Cache {
         if !self.key_waits { self.fnkey_bytes.insert(id, b.clone()); }
         self.key_waits |= outer;
         b
-    }
-
-    /// The slot an encoded key names in this run (memo by the bytes).
-    fn slot_of_bytes(&mut self, u: &mut Unit, b: &[u8]) -> Option<u32> {
-        unsafe { Linker::new(self).slot_of_bytes(u, b) }
     }
 
     /// Whether slot `id` has an entry (speculative linking only follows cached callees).
@@ -5136,7 +5126,7 @@ impl FrontImages {
         // A build script's run (its own small world: std plus the script's crates) keeps no
         // front images: they are read only when a script runs again, which a cached build
         // result makes rare, while they cost a second copy of the std world on disk.
-        if !crate::front::enabled() || mode_from_env(options).is_none() || std::env::var_os("MAKEPAD_RUN_BUILD_SCRIPT").is_some() {
+        if mode_from_env(options).is_none() || std::env::var_os("MAKEPAD_RUN_BUILD_SCRIPT").is_some() {
             return None;
         }
         let root = crate::dirs::relax_dir();
@@ -5947,7 +5937,7 @@ pub struct ColdFront {
 }
 impl ColdFront {
     pub fn enabled(options: &crate::options::Options) -> bool {
-        crate::front::enabled() && matches!(mode_from_env(options), Some(Mode::On | Mode::Verify))
+        matches!(mode_from_env(options), Some(Mode::On | Mode::Verify))
     }
 
     pub fn loaded(&mut self, prog: &crate::program::Program, krate: u32) {

@@ -12244,10 +12244,6 @@ fn strip_num(text: &str) -> String {
     s
 }
 
-pub fn closure_map(_b: &Body) -> HashMap<u32, u32> {
-    HashMap::default()
-}
-
 // ---------------------------------------------------------------- glue
 
 /// Compiler-generated helper functions per type. GLUE_DROP: `fn(p: *mut T)` runs T's Drop
