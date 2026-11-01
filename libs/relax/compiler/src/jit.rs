@@ -17995,21 +17995,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         for p in &preps { so.insert(p.0, 2); }
         for c in &gave { so.insert(*c, 1); }
     }
-    // the fronts this round's builds asked for that no round made yet: the next round makes them
-    // (each slot once), so a candidate that gave back is tried again after them. One level of its
-    // inline candidates per round, as deep as they go: a bound on the tries left the deeper ones
-    // out, the build installed incomplete and was built again when their bodies came (Sandbox
-    // warm: 277 incomplete O3 builds, the big ones built 3-5 times)
-    let progress = needs.iter().any(|s| !fronted.contains(s));
     for c in gave {
         let mut l = left_out.borrow_mut();
         let n = l.entry(c).or_insert(0);
-        // (a try that made way for new fronts is not counted: SPLIT_TRIES bounds the tries that did not)
-        if !progress {
-            *n += 1;
-        }
-        // tried again after the fronts it needed, off the owner again: not built by the snapshot on
-        // the owner because its split was tried
+        *n += 1;
+        // tried once more after the fronts it needed (this round's `needs`), off the owner again:
+        // not built by the snapshot on the owner because its split was tried
         if *n < SPLIT_TRIES {
             fronted.remove(&c);
             split_tried.borrow_mut().remove(&(c, false));
@@ -20154,9 +20145,8 @@ unsafe fn o3_assemble_owner(up: *mut Unit, options: &crate::options::Options, a:
 /// O1 builds one take of an O3 snapshot prepares (o3_candidates_begin): a publish's item bound
 const CAND_TAKE: usize = 8;
 
-/// Takes of an O3 snapshot that give a candidate back without asking for a front no round made yet
-/// (each round fronts the level of inline candidates the last one revealed; one that asked for new
-/// fronts is tried again however deep its candidates go): then it is left out of the snapshot
+/// Takes an O3 snapshot gives a candidate whose preparation needed fronts: each round fronts the
+/// level of inline candidates the last one revealed (each round walks the frontier again)
 const SPLIT_TRIES: u8 = 2;
 
 /// O1 builds of `ids` off the owner (their fronts made ahead): prepared in a take (a publish), optimised on
