@@ -584,9 +584,9 @@ struct FutimensSpec {
     nsec: i64,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const UTIME_OMIT: i64 = -2;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 const UTIME_OMIT: i64 = (1 << 30) - 2;
 
 extern "C" {
