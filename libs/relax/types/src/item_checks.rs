@@ -1778,17 +1778,27 @@ fn precise_capture_lifetimes(prog: &Program, tcx: &Tcx, owner: DefId, opaque: De
     errors
 }
 
-/// rustc_builtin_macros global_allocator.rs / rustc_metadata allocator.rs / rustc_passes weak_lang_items.rs /
-/// check_attr.rs: `#[global_allocator]` is for statics and there is one per program; a `#[panic_handler]` of a
-/// crate that links `std` duplicates `std`'s; `#[no_mangle]` is not for the language items.
-pub fn global_allocators_and_lang_items(prog: &Program, own: &[bool]) -> Vec<String> {
+/// rustc_builtin_macros global_allocator.rs / rustc_metadata creader.rs inject_allocator_crate /
+/// rustc_passes weak_lang_items.rs / check_attr.rs: `#[global_allocator]` is for statics; a crate
+/// defines at most one ("cannot define multiple global allocators", at the second), and a compiled
+/// binary (`binaries`: a bin, or a test target of `makepad test`) links at most one across itself and
+/// its dependencies (ConflictingGlobalAlloc). Every test target of a package is its own binary, so
+/// two of them each defining one is no conflict. A `#[panic_handler]` of a crate that links `std`
+/// duplicates `std`'s; `#[no_mangle]` is not for the language items.
+pub fn global_allocators_and_lang_items(prog: &Program, own: &[bool], binaries: &[u32]) -> Vec<String> {
     use crate::program::DefKind as K;
     let mut errors = Vec::new();
-    let mut allocators = 0usize;
+    // the crates the binaries link: their allocators decide the conflicts
+    let linked = |k: u32| binaries.iter().any(|&b| prog.crate_sees(b, k));
+    // per crate: its first allocator seen (the def), so a second in the same crate is reported
+    let mut first_allocator: Vec<Option<DefId>> = vec![None; prog.crates.len()];
     for i in 0..prog.defs.len() {
         let d = DefId(i as u32);
         let def = prog.def(d);
-        if !own.get(def.krate as usize).copied().unwrap_or(false) || !matches!(def.kind, K::Fn | K::AssocFn | K::Static | K::Const | K::Struct | K::Enum | K::Impl | K::TypeAlias | K::Trait) { continue; }
+        let is_own = own.get(def.krate as usize).copied().unwrap_or(false);
+        // a dependency's items are only asked whether they are its global allocator
+        if !is_own && (def.kind != K::Static || !linked(def.krate)) { continue; }
+        if !matches!(def.kind, K::Fn | K::AssocFn | K::Static | K::Const | K::Struct | K::Enum | K::Impl | K::TypeAlias | K::Trait) { continue; }
         if prog.item_defs.get(&(def.file, def.item.0)) != Some(&d) { continue; }
         let pf = &prog.files[def.file as usize];
         let ast = &pf.ast;
@@ -1809,13 +1819,15 @@ pub fn global_allocators_and_lang_items(prog: &Program, own: &[bool]) -> Vec<Str
         if allocator.is_some() {
             if def.kind != K::Static {
                 errors.push(prog.record_uncoded_error(def.file, item.lo, "typeck", "allocators must be statics".to_string()));
-            } else {
-                allocators += 1;
-                if allocators > 1 {
+            } else if first_allocator[def.krate as usize].is_some() {
+                if is_own {
                     errors.push(prog.record_uncoded_error(def.file, item.lo, "typeck", "cannot define multiple global allocators".to_string()));
                 }
+            } else {
+                first_allocator[def.krate as usize] = Some(d);
             }
         }
+        if !is_own { continue; }
         if panic_handler.is_some() {
             let root_file = prog.mods[prog.crates[def.krate as usize].root_mod as usize].file;
             let no_std = prog.files[root_file as usize].ast.root_attrs.iter().any(|a| a.toks.hi > a.toks.lo && prog.files[root_file as usize].tok_text(a.toks.lo) == "no_std");
@@ -1824,6 +1836,22 @@ pub fn global_allocators_and_lang_items(prog: &Program, own: &[bool]) -> Vec<Str
             }
             if let Some(nm) = no_mangle {
                 errors.push(prog.record_uncoded_error(def.file, nm, "typeck", "`#[no_mangle]` cannot be used on internal language items".to_string()));
+            }
+        }
+    }
+    // per binary, as rustc's inject_allocator_crate: the binary's own allocator first ("this
+    // crate"), then its dependencies' in crate order; each further one conflicts with the first
+    for &b in binaries {
+        let mut first: Option<String> = first_allocator[b as usize].map(|_| "this crate".to_string());
+        for k in 0..prog.crates.len() as u32 {
+            if k == b || first_allocator[k as usize].is_none() || !prog.crate_sees(b, k) { continue; }
+            let name = prog.crates[k as usize].crate_name(prog).into_owned();
+            match &first {
+                Some(other) => {
+                    let file = prog.mods[prog.crates[b as usize].root_mod as usize].file;
+                    errors.push(prog.record_uncoded_error(file, 0, "typeck", format!("the `#[global_allocator]` in {other} conflicts with global allocator in: {name}")));
+                }
+                None => first = Some(name),
             }
         }
     }

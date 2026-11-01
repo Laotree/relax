@@ -97,6 +97,7 @@ pub mod invalid;
 pub mod domain;
 pub(crate) mod domain_threads;
 pub mod jit;
+pub mod program_os;
 pub mod web;
 pub mod web32;
 pub mod coverage;
