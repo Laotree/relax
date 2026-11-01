@@ -14327,8 +14327,17 @@ unsafe fn loop_syms(u: &Unit, id: u32) -> Option<(relax_backend::rir::Sym, relax
 /// use, also by a warm start's link: lower::intern_lazy_rt).
 pub(crate) fn loop_hot_sym(u: &Unit) -> relax_backend::rir::Sym {
     static TRAMP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let at = *TRAMP.get_or_init(|| u.emit_code(&loop_tramp(rt_loop_hot as *const () as usize as u64), "relax::loop_hot"));
+    // no-codegen: rt_loop_hot itself with no frame pointer (an interpreted frame has no frame
+    // record: its JIT callers are not charged)
+    let at = *TRAMP.get_or_init(|| if u.prog.session.options.no_codegen { rt_loop_hot_no_fp as *const () as usize as u64 } else { u.emit_code(&loop_tramp(rt_loop_hot as *const () as usize as u64), "relax::loop_hot") });
     u.syms.intern(crate::syms::SymKind::Rt("loop_hot"), at)
+}
+
+rt_fn! {
+/// No-codegen mode's loop counter call (loop_hot_sym): rt_loop_hot with no frame to walk.
+fn rt_loop_hot_no_fp(counter: u64) {
+    rt_loop_hot(counter, 0)
+}
 }
 
 /// `mov x1, x29; ldr x16, 8; br x16; .quad target` (the literal at pc + 8 from the ldr)
