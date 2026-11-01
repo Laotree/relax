@@ -6,7 +6,7 @@
 # frames, 30 resizes, each followed by a frame), hidden on the offscreen backend. Prints the
 # seconds each run took and, of the warm run, the Cx build time of the idle and the resize frames
 # (median / p90 / max, MAKEPAD_HAL_FRAME_LOG). Default package: makepad-app-calculator.
-# FRAMES_PHASES=1 also prints the warm run's boot phases.
+# FRAMES_PHASES=1 also prints the warm run's boot phases; FRAMES_PROFILE=1 samples its main thread.
 set -u
 export PATH=$HOME/.cargo/bin:$PATH CARGO_INCREMENTAL=0
 pkgs=${*:-makepad-app-calculator}
@@ -29,7 +29,10 @@ for pkg in $pkgs; do
         d=$work/$pkg.$mode; mkdir -p "$d/home" "$d/tmp"
         for run in cold warm; do
             t0=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
-            env "${env[@]}" MAKEPAD_HOME="$d/home" TMPDIR="$d/tmp" MAKEPAD_RUN_HOME="$d/runhome" MAKEPAD_RUN_CACHE_DIR="$d/cache" \
+            prof=()
+            # FRAMES_PROFILE=1: the warm run's main thread sampled (mainprof.rs), its leaves summed
+            [ "${FRAMES_PROFILE:-}" = 1 ] && [ $run = warm ] && prof=(MAKEPAD_RUN_PROFILE_MAIN=$d/prof.tsv MAKEPAD_RUN_PROFILE_MAIN_MS=8000)
+            env "${env[@]}" "${prof[@]}" MAKEPAD_HOME="$d/home" TMPDIR="$d/tmp" MAKEPAD_RUN_HOME="$d/runhome" MAKEPAD_RUN_CACHE_DIR="$d/cache" \
                 perl -e 'alarm 900; exec @ARGV' "$T/host/makepad" run "$pkg" > "$d/$run.out" 2>&1
             rc=$?
             t1=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
@@ -42,6 +45,11 @@ for pkg in $pkgs; do
         stats "$mode idle" "$d/idle"
         stats "$mode resize" "$d/resize"
         [ "${FRAMES_PHASES:-}" = 1 ] && grep -a -E 'makepad-run: .*[0-9.]+ ms|boot-trace|first (frame|present)' "$d/warm.out" | head -40 | cut -c1-200
+        if [ -s "$d/prof.tsv" ]; then
+            echo "  $mode main thread, warm: $(wc -l < "$d/prof.tsv" | tr -d ' ') samples; by role: $(cut -f4 "$d/prof.tsv" | sort | uniq -c | sort -rn | tr '\n' ' ')"
+            cut -f2 "$d/prof.tsv" | sort | uniq -c | sort -rn | head -25 | cut -c1-180
+            echo "  by first JIT frame:"; cut -f3 "$d/prof.tsv" | sort | uniq -c | sort -rn | head -15 | cut -c1-180
+        fi
         [ -s "$d/frames" ] || grep -a -v '^\s*$' "$d/warm.out" | tail -5 | cut -c1-200
     done
 done
